@@ -280,3 +280,74 @@ under Wine and this is a native arm64 Mach-O.
 * Present timing. On hardware the flip is paced by the vblank the runtime
   already delivers at 60Hz. Whether to drive Present from FLIP_STALL, from the
   vblank, or from both is undecided.
+
+
+================================================================================
+8. UPSTREAM (sp00nznet/xboxrecomp) - WHAT IT HAS THAT WE DO NOT
+================================================================================
+Checked 2026-09-02. We are 9 commits ahead of origin/main and 11 behind, and
+there is a large active branch, origin/work/v0.7.0-non-local (65 files,
++8,692 lines), which is where the interesting work is.
+
+TWO LIFTER CORRECTNESS BUGS ON THAT BRANCH ARE THE BEST LEAD WE HAVE.
+Both are the silent-corruption class this effort keeps losing time to -- the
+game runs, takes a wrong branch, and never announces anything:
+
+    aaf5eca  lifter: cmp must set the carry flag
+             A cmp that leaves CF wrong makes every jb/jae/ja/jbe/setb after
+             it wrong. Unsigned comparisons are everywhere in a game loop.
+    5156919  lifter: the direction flag decides which way a string instruction
+             walks. We already lost a week to string instructions once (the
+             repe cmpsd GUID compare, handover 4e).
+
+These fit our symptom exactly: a title that ticks at 60Hz, is not blocked on
+anything, and never enters its render path, is a title taking a branch the
+wrong way. TRY THESE BEFORE ANY MORE NV2A WORK.
+
+ALSO WORTH TAKING:
+    b010c42  recomp: don't rewind an icall's failure path over saved registers
+             THE SAME BUG WE FOUND INDEPENDENTLY (handover (t)). Two
+             independent discoveries of one defect is good evidence both are
+             right; reconcile rather than pick blind, and keep whichever
+             test suite is stricter.
+    008a7a6  lifter: bit scan -- we have our own (handover 4b). Pick one.
+    c2ec923  lifter: xlat -- JSRF emits none, verified. Free correctness.
+    3655761  fence_readable must accept the contiguous window. Directly fixes
+             the blind spot in our BACK_END_WRITE_SEMAPHORE_RELEASE bounds
+             check, which rejects anything above 0x08000000 -- and a fence
+             lives at XBOX_CONTIG_BASE 0x80000000 by definition, because
+             MmAllocateContiguousMemory is what allocates it.
+    c572d5a  worker stacks reclaimed; NtReleaseMutant routed (routing one half
+             of a lock pair is a deadlock generator).
+    b523cbb / 162e72b  memory layout: thread stacks off the image, heap serving
+             the mapped range.
+
+NEW TOOLING, all upstream-only:
+    tools/symbolize.py, tools/stackwalk.py   answer the handover's "lldb is
+             effectively UNUSABLE on this binary" gotcha directly.
+    tools/seed_from_log/                     automates OPEN ITEM 2 -- seeding
+             function pointers stored in structures from a runtime log, which
+             we have been doing by hand.
+    tools/rtti/                              RTTI-based identification.
+
+ONE UPSTREAM FINDING TESTED AND REJECTED FOR THIS TITLE:
+    c572d5a says DMA_PUT holds a PHYSICAL address -- D3D writes VA &
+    0x0FFFFFFF and reads position back as GET | 0x80000000 -- and that reading
+    it raw walks unrelated memory that merely decodes, producing the false
+    conclusion "this title submits no methods". That is exactly the conclusion
+    we had reached, so it looked decisive. It is not true here: feeding the
+    pusher from `cursor | XBOX_CONTIG_BASE` yields 3,939 dwords and ZERO
+    methods, while the raw address yields 2,734 with no bad headers. JSRF
+    publishes its ring through D3D8 globals, not the PFIFO USER channel, so
+    the cursor is a plain guest VA. Recorded so nobody re-tries it.
+
+ORDER OF WORK
+    1. Merge origin/main (11 commits). Conflicts expected in lifter.py,
+       translator.py and test_call_retaddr.py, all in code we changed.
+       Reconcile bit-scan and the icall failure path deliberately.
+    2. Regenerate, rerun, re-measure. Nothing should move; this is the
+       baseline that makes step 3 interpretable.
+    3. Cherry-pick aaf5eca and 5156919. Regenerate, rerun.
+       WATCH: does the title leave its 60Hz non-rendering tick?
+    4. If it does not, adopt tools/seed_from_log and tools/symbolize, then
+       trace what gates the render call inside sub_000659C0.

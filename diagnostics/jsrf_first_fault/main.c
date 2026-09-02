@@ -123,6 +123,16 @@ static void jsrf_pb_feed(uint32_t from, uint32_t to)
 {
     if (to <= from) return;
     if (to - from > 0x100000u) return;          /* implausible span */
+    /* The cursor is a plain guest VA for this title.
+     *
+     * Upstream found that DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
+     * VA & 0x0FFFFFFF and reads the position back as GET | 0x80000000 -- and
+     * that reading it raw walks unrelated memory that merely decodes. That is
+     * real, and it does NOT apply here: JSRF publishes its ring through D3D8
+     * globals rather than the PFIFO USER channel. Tested by feeding from
+     * `from | XBOX_CONTIG_BASE` instead: the contiguous view is all zeros,
+     * 3,939 dwords yielding 0 methods, while the raw view yields 2,734 with
+     * no bad headers. The raw address is the right one for this title. */
     nv2a_pusher_run((const uint32_t *)XBOX_PTR(from), (to - from) / 4u);
 }
 
