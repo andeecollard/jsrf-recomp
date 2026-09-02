@@ -53,10 +53,17 @@ PUSHBUF_MAX_COUNT = 64
 # value constant from the same header, not a method.
 NV097_METHOD_LIMIT = 0x2000
 
-# A bare method offset (no count) is only trusted above this. Below it the
-# values are small enough -- 0x100, 0x304 -- to collide with ordinary
-# arithmetic constants, so the encoded form is required instead.
-BARE_METHOD_MIN = 0x100
+# Only the ENCODED command word (count << 18 | method) counts as evidence.
+#
+# An earlier version also accepted a bare method offset, on the theory that
+# D3D8 sometimes computes the count at run time and ORs it in. Measured, that
+# was a bad trade: bare matching tagged 456 game.text functions against 58 for
+# encoded-only, because the offsets themselves are ordinary numbers -- 0x100
+# is NO_OPERATION and also just 256, and 0x40000 is SET_OBJECT with count 1
+# and also just 256 KB. It bought three D3DDevice_SetLight identifications,
+# all of which rested entirely on such a collision, and cost one real
+# misclassification: sub_00195F80's method set was inflated past the breadth
+# guard and demoted to StateBlock. Dropping it gains that back.
 
 
 def load_nv097_methods(header_path=None):
@@ -175,9 +182,8 @@ def decode_pushbuffer_methods(immediates, methods):
     """
     Map immediates to NV097 method names.
 
-    Accepts the encoded command word (count << 18 | method), which is the
-    strong form, and a bare method offset above BARE_METHOD_MIN for the cases
-    where D3D8 computes the count at run time and ORs it in.
+    Only the encoded command word (count << 18 | method) is accepted; see the
+    note on the constants above for why a bare offset is not evidence.
 
     Returns:
         set: NV097 name (str)
@@ -188,8 +194,6 @@ def decode_pushbuffer_methods(immediates, methods):
         method = value & PUSHBUF_METHOD_MASK
         if 0 < count <= PUSHBUF_MAX_COUNT and method in methods:
             found.add(methods[method])
-        elif value >= BARE_METHOD_MIN and value in methods:
-            found.add(methods[value])
     return found
 
 

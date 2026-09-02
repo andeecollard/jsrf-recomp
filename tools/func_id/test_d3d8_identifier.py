@@ -24,7 +24,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.func_id.d3d8_identifier import (  # noqa: E402
-    BARE_METHOD_MIN,
     STATE_BLOCK_NAME,
     WEAK_RULE_MAX_METHODS,
     classify_methods,
@@ -84,12 +83,13 @@ def test_encoded_command_word_matches_method():
     assert got == {"NV097_SET_BEGIN_END"}
 
 
-def test_bare_small_constant_is_not_matched():
-    # 0x304 is SET_BLEND_ENABLE but also an utterly ordinary constant. Only
-    # values at or above BARE_METHOD_MIN are trusted unencoded, and 0x304 is
-    # reached solely through the encoded form.
-    assert BARE_METHOD_MIN > 0
-    assert decode_pushbuffer_methods({0x304 - 1}, M) == set()
+def test_bare_method_offset_is_never_matched():
+    # A method offset on its own is just a number: 0x130 is FLIP_STALL and also
+    # 304, 0x100 is NO_OPERATION and also 256. Accepting bare offsets tagged
+    # 456 game.text functions against 58 for encoded-only. Only the encoded
+    # command word is evidence.
+    assert decode_pushbuffer_methods({0x130}, M) == set()
+    assert decode_pushbuffer_methods({0x304}, M) == set()
     assert decode_pushbuffer_methods({_encoded(0x304)}, M) == {"NV097_SET_BLEND_ENABLE"}
 
 

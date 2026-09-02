@@ -653,11 +653,15 @@ Two Python interpreters, and this WILL bite you:
     (sub_001564B0 alpha/blend, sub_00151200 blend/depth, sub_001511B0 stencil,
     ...). D3D8LTCG INLINED the SetRenderState calls into the game.
     CONSEQUENCE: overriding D3D8 entry points, the Burnout 3 route, will NOT
-    capture JSRF's render state -- there is no function there to override. But
-    it also means one primitive carries the whole state stream, so overriding
-    sub_0018E930 alone would route every state change into the D3D8 HLE layer:
-    ONE function instead of ~100. That is the cheapest interception point in
-    the title and should be evaluated before any per-entry-point work.
+    capture JSRF's render state -- there is no function there to override.
+    CORRECTION, measured afterwards: an earlier draft of this entry said one
+    primitive therefore carries the whole stream and overriding sub_0018E930
+    alone would be "one function instead of ~100". THAT WAS WRONG. The
+    primitive carries RENDER STATE ONLY -- 17 methods, all alpha/blend/depth/
+    stencil/dither/shade, and not one of them is exclusive to it. Geometry,
+    surfaces, textures, combiners, transforms and the flip -- 90 further
+    methods -- go the other way, written inline after a reserve by 69 D3D
+    functions. See (y).
     Note 0x19B200/0x19B204 are device +0x00/+0x04, which MATCHES the layout in
     docs/technical/d3d8ltcg-device-context.md (pb_put / pb_limit). JSRF uses
     the same D3D8LTCG device shape as Burnout 3, so that document's field map
@@ -670,6 +674,51 @@ Two Python interpreters, and this WILL bite you:
     instructions' encodings, and without requiring the target to be a known
     function start the scan produced a "push helper sub_24656186" that is not
     code at all.
+
+(y) THE TWO GPU PATHS, MEASURED -- and what it means for interception.
+    Every NV2A command word in the title reaches the ring one of two ways.
+
+      PATH A, through the fastcall primitive sub_0018E930:
+        15 game functions, 60 push sites, 17 distinct methods.
+        SET_ALPHA_{FUNC,REF,TEST_ENABLE}, SET_BLEND_{ENABLE,EQUATION,
+        FUNC_SFACTOR,FUNC_DFACTOR}, SET_DEPTH_{FUNC,MASK}, SET_DITHER_ENABLE,
+        SET_SHADE_MODE, SET_STENCIL_*.  RENDER STATE, and nothing else.
+        ZERO methods are exclusive to this path.
+
+      PATH B, reserve then write the command words inline:
+        131 functions -- 69 in the D3D section, 58 in game .text -- reaching
+        107 distinct methods, 90 of them unreachable by path A. This is the
+        geometry, the surfaces, the textures, the combiners, the transforms
+        and the flip.
+
+    So there is no single cheap interception point. Overriding sub_0018E930
+    buys render state; the rest of the pipeline still has to come from
+    somewhere. A D3D8-level intercept for JSRF means roughly 85 functions, and
+    a large share of them are in GAME code rather than the D3D section, so
+    they are title-specific work that does not amortise.
+
+    WORTH RECONSIDERING BECAUSE OF THIS: gap-analysis.md rates push-buffer
+    parsing "Low (D3D8 API intercept instead)". That premise holds for a title
+    that CALLS D3D8. JSRF inlines it, so for this title there is barely an API
+    boundary to intercept, and parsing the ring -- which needs no per-title
+    reverse engineering at all -- may well be the cheaper architecture. The
+    machinery is already in the tree: src/nv2a/nv2a_core.c parses push buffers
+    and nv2a_pgraph_d3d11.c translates methods, though the latter is a 653-line
+    menu-profile prototype and is D3D11-only. Decide this BEFORE writing
+    overrides; it is the fork the whole graphics effort hangs on.
+
+(z) PRECISION FIX in the identifier -- a bare method offset is NOT evidence.
+    decode_pushbuffer_methods originally also accepted a bare NV097 offset, on
+    the theory that D3D8 sometimes ORs a run-time count in. Measured across the
+    binary that was badly wrong: bare matching tagged 456 game .text functions
+    against 58 for encoded-only, because the offsets are ordinary numbers --
+    0x100 is NO_OPERATION and also 256, 0x40000 is SET_OBJECT with count 1 and
+    also 256 KB. It bought three D3DDevice_SetLight identifications that each
+    rested entirely on such a collision, and it COST a real one: sub_00195F80's
+    method set was inflated past the breadth guard and demoted to StateBlock.
+    Encoded-only is now the rule. JSRF drops 27 -> 24 identified, and every one
+    of the 24 is stronger for it. The census in (y) is measured after this fix;
+    an earlier count of 567 functions "writing command words" was this defect.
 
 --------------------------------------------------------------------------------
 5. FILES CHANGED
