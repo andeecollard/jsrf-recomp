@@ -151,6 +151,24 @@ static struct {
     uint32_t clear_color;
     uint32_t clear_rect_h;  /* (width << 16) | x */
     uint32_t clear_rect_v;  /* (height << 16) | y */
+    uint32_t clear_zstencil; /* (depth << 8) | stencil, depth format dependent */
+
+    /* Surface setup. Recorded rather than acted on: the backend owns its own
+     * framebuffer, so these describe where the GUEST thinks it is rendering.
+     * They matter for format decisions and for spotting a render-target
+     * switch, not as addresses to write through. */
+    uint32_t surface_format;
+    uint32_t surface_pitch;
+    uint32_t surface_color_offset;
+    uint32_t surface_zeta_offset;
+    uint32_t context_dma_color;
+    uint32_t context_dma_zeta;
+    uint32_t control0;
+
+    /* Flip tracking */
+    uint32_t flip_write;
+    unsigned long flips;
+    int frame_pending;      /* guest signalled end of frame; present is due */
 
     /* Render state cache */
     int depth_test;
@@ -498,6 +516,85 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         g_pg.clear_rect_v = param;
         return 1;
 
+    /* ── Surface setup ──
+     *
+     * The guest is describing its own framebuffer: which DMA object holds it,
+     * its format, stride and base offsets. The GL/D3D11 backend renders into a
+     * framebuffer it allocated itself, so none of these are followed as
+     * addresses -- they are recorded so a later phase can notice a
+     * render-target change and so the clear knows what it is clearing.
+     *
+     * Acknowledging them matters even while they are inert: an unhandled
+     * method stays on the pusher's miss list and hides the ones that are
+     * genuinely missing. These six are 119 of JSRF's misses on their own. */
+    case NV097_SET_CONTEXT_DMA_COLOR:
+        g_pg.context_dma_color = param;
+        return 1;
+
+    case NV097_SET_CONTEXT_DMA_ZETA:
+        g_pg.context_dma_zeta = param;
+        return 1;
+
+    case NV097_SET_SURFACE_FORMAT:
+        g_pg.surface_format = param;
+        return 1;
+
+    case NV097_SET_SURFACE_PITCH:
+        g_pg.surface_pitch = param;
+        return 1;
+
+    case NV097_SET_SURFACE_COLOR_OFFSET:
+        g_pg.surface_color_offset = param;
+        return 1;
+
+    case NV097_SET_SURFACE_ZETA_OFFSET:
+        g_pg.surface_zeta_offset = param;
+        return 1;
+
+    /* Depth/stencil control. Bits describe the zeta format among other
+     * things; recorded for the clear path to interpret the clear value. */
+    case NV097_SET_CONTROL0:
+        g_pg.control0 = param;
+        return 1;
+
+    /* Clear value for depth and stencil. Layout depends on the zeta format:
+     * D24S8 packs depth in the top 24 bits and stencil in the low 8, D16 uses
+     * the whole word as depth. Stored raw and decoded at clear time so this
+     * handler does not have to know the format ordering. */
+    case NV097_SET_ZSTENCIL_CLEAR_VALUE:
+        g_pg.clear_zstencil = param;
+        return 1;
+
+    /* ── Flip ──
+     *
+     * FLIP_INCREMENT_WRITE advances the buffer the guest is writing into;
+     * FLIP_STALL is its "do not run ahead of the display" barrier. Together
+     * they are the guest saying THE FRAME IS COMPLETE, which is the only
+     * signal in the ring that means present.
+     *
+     * Presenting is deliberately NOT done here -- see the note on
+     * pgraph_d3d11_flush(). This records the frame boundary; the owner of the
+     * rendering context acts on it. */
+    case NV097_FLIP_INCREMENT_WRITE:
+        g_pg.flip_write = param;
+        return 1;
+
+    case NV097_FLIP_STALL:
+        g_pg.flips++;
+        g_pg.stats.flips++;
+        g_pg.frame_pending = 1;
+        return 1;
+
+    /* ── Sync ──
+     *
+     * WAIT_FOR_IDLE is a pipeline barrier and NO_OPERATION is padding. Both
+     * are no-ops against a backend that submits synchronously, but they are
+     * 255 of JSRF's 1,448 declined methods, so acknowledging them clears a
+     * sixth of the miss list without changing any rendering behaviour. */
+    case NV097_WAIT_FOR_IDLE:
+    case NV097_NO_OPERATION:
+        return 1;
+
     case NV097_CLEAR_SURFACE:
     {
         IDirect3DDevice8 *dev = xbox_GetD3DDevice();
@@ -627,6 +724,20 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         g_pg.stats.methods_ignored++;
         return 0;  /* Truly unhandled */
     }
+}
+
+/* Consume the "guest finished a frame" signal, if one arrived.
+ *
+ * FLIP_STALL is the only thing in the ring that means present, but PGRAPH is
+ * not the right place to act on it: presenting needs the rendering context,
+ * and which thread holds that is the caller's business. So the flag is
+ * reported and cleared here, and the caller decides.
+ */
+int pgraph_d3d11_take_frame(void)
+{
+    int pending = g_pg.frame_pending;
+    g_pg.frame_pending = 0;
+    return pending;
 }
 
 void pgraph_d3d11_flush(void)

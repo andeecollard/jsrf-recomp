@@ -776,6 +776,9 @@ void xbox_d3d8_set_window_title(const char *title);
  * context. */
 void xbox_d3d8_make_current(void);
 
+/* Service the backend's window. Main thread only; safe to omit. */
+void xbox_d3d8_pump_events(void);
+
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
 
 /**

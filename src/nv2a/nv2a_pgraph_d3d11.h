@@ -50,7 +50,11 @@ typedef struct {
     uint32_t methods_handled;
     uint32_t methods_ignored;
     uint32_t clears;
+    uint32_t flips;      /* FLIP_STALL: guest-signalled frame boundaries */
 } PgraphD3D11Stats;
+
+/* Non-zero once since the last call if the guest signalled end of frame. */
+int pgraph_d3d11_take_frame(void);
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);
 

@@ -119,6 +119,19 @@ static void jsrf_pb_poll(void)
         jsrf_pb_feed(g_pb_ring_lo, now);
     }
     g_pb_last = now;
+
+    /* The guest's FLIP_STALL is the only "frame is complete" signal in the
+     * ring. Present here, on the thread holding the rendering context --
+     * pgraph deliberately does not do it itself. */
+    if (pgraph_d3d11_take_frame()) {
+        static unsigned long presented;
+        pgraph_d3d11_flush();
+        d3d8_PresentFrame();
+        if (++presented <= 3 || (presented % 300) == 0) {
+            fprintf(stderr, "  [PUSHER] presented frame %lu\n", presented);
+            fflush(stderr);
+        }
+    }
 }
 
 /* Periodic pusher report. Separate from the ADX tick so it survives that
@@ -134,9 +147,14 @@ static void jsrf_pusher_report(void)
     last = now;
 
     nv2a_pusher_get_stats(&st);
-    fprintf(stderr, "  [PUSHER] runs=%lu dwords=%lu methods=%lu "
-            "unhandled=%lu bad_headers=%lu\n",
-            st.runs, st.dwords, st.methods, st.unhandled, st.bad_headers);
+    {
+        PgraphD3D11Stats ps;
+        pgraph_d3d11_get_stats(&ps);
+        fprintf(stderr, "  [PUSHER] runs=%lu dwords=%lu methods=%lu "
+                "unhandled=%lu bad_headers=%lu | clears=%u flips=%u draws=%u\n",
+                st.runs, st.dwords, st.methods, st.unhandled, st.bad_headers,
+                ps.clears, ps.flips, ps.draw_calls);
+    }
     fflush(stderr);
     nv2a_pusher_dump_unhandled(20);
 }

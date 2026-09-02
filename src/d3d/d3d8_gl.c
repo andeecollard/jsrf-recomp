@@ -553,15 +553,15 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
                                      HWND hwnd, void *dirty)
 {
     (void)s;(void)src;(void)dst;(void)hwnd;(void)dirty;
+    /* Swap only.
+     *
+     * Event pumping used to happen here, which is wrong once the frame is
+     * presented from a render thread: SDL_PollEvent drives the platform's
+     * event loop and on macOS that belongs to the main thread, while
+     * SDL_GL_SwapWindow needs the thread holding the GL context. Those are
+     * two different threads. Splitting them lets each run where it is legal
+     * -- see xbox_d3d8_pump_events. */
     SDL_GL_SwapWindow(g.window);
-    /* Pump events so the window stays responsive. Quit closes the window
-     * but leaves the process running until the game's loop notices. */
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            fprintf(stderr, "[d3d8_gl] window close requested\n");
-        }
-    }
     return D3D_OK;
 }
 
@@ -1060,6 +1060,26 @@ static IDirect3D8 g_d3d8 = { &g_d3d8_vtbl };
  * releases it from wherever it was. That is correct while a single thread
  * does the drawing, which is the case today.
  */
+/* Service the window. MAIN THREAD ONLY.
+ *
+ * Separate from Present because the two have opposite threading rules: this
+ * must run on the thread that owns the platform event loop, Present must run
+ * on the thread that owns the rendering context. Safe to never call -- the
+ * window still draws, it just stops responding to the OS.
+ */
+void xbox_d3d8_pump_events(void)
+{
+    SDL_Event ev;
+    if (!g.window) {
+        return;
+    }
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) {
+            fprintf(stderr, "[d3d8_gl] window close requested\n");
+        }
+    }
+}
+
 void xbox_d3d8_make_current(void)
 {
     if (g.window && g.glctx) {

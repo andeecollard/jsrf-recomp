@@ -1284,6 +1284,11 @@ static const IDirect3D8Vtbl g_d3d8_vtbl = {
 
 /* D3D11 has no per-thread current context; the device context is shared and
  * the caller serialises. Present so the shared header links on both backends. */
+/* Win32 pumps its own message loop inside Present on this backend. */
+void xbox_d3d8_pump_events(void)
+{
+}
+
 void xbox_d3d8_make_current(void)
 {
 }

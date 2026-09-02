@@ -78,6 +78,13 @@ THE REAL WORK IN P1 IS NOT THE METHODS. It is these three:
 EXIT CRITERION: the window shows the clear colour, changing when the guest
 changes it, at ~60Hz. Screenshot it.
 
+STATUS: THE PATH WORKS, THE CADENCE DOES NOT. Measured with the twelve methods
+in and Present wired: clears=9, flips=4, presented=4, unhandled 1448 -> 1329,
+zero bad headers, frame loop unregressed. So ring -> pusher -> PGRAPH -> Clear
+-> flush -> Present runs end to end and the window is swapped. What is missing
+is repetition: the guest stops submitting after its startup burst. See
+section 7.
+
 RISK TO WATCH: the pusher's counters are STATIC after startup -- JSRF emits a
 burst of ~3,900 dwords and then stops. Either the title is waiting on
 something rendering-related, or it has finished initialising and will not
@@ -211,9 +218,24 @@ under Wine and this is a native arm64 Mach-O.
 ================================================================================
 7. OPEN QUESTIONS
 ================================================================================
-* Why does submission stop after ~3,900 dwords? Startup burst, or a stall
-  waiting on something the GPU is meant to do? This is the biggest unknown in
-  the plan and P1 should answer it.
+* ANSWERED IN PART: why submission stops after ~3,900 dwords. THE TITLE IS NOT
+  HUNG. Sampled with the P1 build, the main guest thread is running a 60Hz
+  poll loop -- sub_00013F80 calls sub_000659C0 and then sleeps 16ms through
+  sub_00145CA6/sub_00145C28 -- which is a normal main loop, not a deadlock.
+  The 14,955 samples inside bridge_KeDelayExecutionThread are that sleep, not
+  a spin. The alertable-retry path in sub_00145C28 (retry while the result is
+  0x101 STATUS_ALERTED) was investigated and is NOT firing: the only
+  QueueUserAPC producer is xbox_KeAlertThread, and ordinal 93 is unrouted.
+
+  So the game is alive and ticking and simply never re-enters its render path.
+  LEADING HYPOTHESIS, untested: the flip acknowledge. The guest raised
+  FLIP_INCREMENT_WRITE and FLIP_STALL four times and then stopped, which is
+  what a title does when it is waiting for the display to report the flip
+  retired. Nothing in this runtime advances a flip-read counter.
+  NEXT: find what the guest polls to decide a flip completed -- SET_FLIP_READ
+  (0x0120) / SET_FLIP_WRITE (0x0124) / SET_FLIP_MODULO (0x0128) are the
+  candidates, plus any notifier written back to guest memory -- and make it
+  follow flip_write. That is a graphics-domain question and belongs in P1.
 
 * Does JSRF ever wrap the ring? The bounds at device +0x24/+0x28 were accepted
   (0x010DD000-0x0115D000, cursor inside), and wrap handling is written, but it
