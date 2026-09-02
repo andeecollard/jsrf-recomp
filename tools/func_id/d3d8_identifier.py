@@ -281,6 +281,146 @@ def _any_prefix(names, prefix):
     return any(n.startswith(prefix) for n in names)
 
 
+# "mov ecx, imm32" / "mov edx, imm32" / "call rel32" -- the fastcall push.
+_OP_MOV_ECX = 0xB9
+_OP_CALL_REL32 = 0xE8
+
+# How far after the "mov ecx, <command word>" the call may sit. The argument
+# setup in between is a second mov and occasionally a load, so this only has
+# to span a few instructions; a wider window starts pairing a constant with an
+# unrelated later call.
+PUSH_CALL_WINDOW = 24
+
+
+def scan_pushed_methods(xbe_data, functions, methods, section=None):
+    """
+    Recover NV097 methods that a function pushes THROUGH A HELPER.
+
+    D3D8 does not always inline the command word next to the store. JSRF's
+    push primitive is fastcall -- sub_0018E930, "advance the ring cursor and
+    write ecx:edx" -- so the method lives in the CALLER as "mov ecx, imm32"
+    immediately before the call, and the callee holds no constant at all. That
+    is why a body scan alone finds so few functions: 27 of 264 here, while 61
+    separate call sites push state through the one primitive.
+
+    Anchoring on the constant rather than on the primitive keeps this general.
+    Any "mov ecx, <encoded command word>" shortly followed by a direct call is
+    recorded, and the primitive falls out as the most frequent target rather
+    than having to be recognised by shape.
+
+    Note the callers are usually NOT in the D3D section. JSRF's render state is
+    inlined into game code at 0x0015xxxx, which is a finding in its own right:
+    there is no D3DDevice_SetRenderState to override, because the game is the
+    state setter.
+
+    Args:
+        xbe_data: Raw bytes of the entire XBE file.
+        functions: List of function dicts.
+        methods: Method table from load_nv097_methods().
+        section: Optional (va_lo, va_hi) to restrict the callers considered.
+
+    Returns:
+        (pushed, primitives) where `pushed` maps func_addr -> set of NV097
+        names, and `primitives` maps call target -> number of method pushes
+        routed through it.
+    """
+    pushed = defaultdict(set)
+    primitives = defaultdict(int)
+
+    # A call target is only believed if it is a function start. The forward
+    # scan looks for an 0xE8 byte, and 0xE8 occurs inside other instructions'
+    # encodings all the time -- without this check a constant pairs with a
+    # displacement byte and yields an address like 0x24656186 that is not code
+    # at all. Requiring a known entry point costs nothing and removes them.
+    func_starts = {int(f["start"], 16) for f in functions}
+    sections = _parse_sections(xbe_data)
+
+    for func in functions:
+        addr = int(func["start"], 16)
+        if section and not (section[0] <= addr < section[1]):
+            continue
+        size = func.get("size") or 0
+        if size <= 0:
+            continue
+        off = _file_offset(sections, addr, size, len(xbe_data))
+        if off is None:
+            continue
+        body = xbe_data[off:off + size]
+        names, targets = scan_body_pushes(body, addr, methods, func_starts)
+        if names:
+            pushed[addr] |= names
+        for target, n in targets.items():
+            primitives[target] += n
+    return pushed, primitives
+
+
+def scan_body_pushes(body, base_va, methods, func_starts):
+    """
+    Find "mov ecx, <command word>" ... "call rel32" pairs in one function body.
+
+    Pure over bytes so it can be tested without an XBE around it.
+
+    Returns:
+        (set of NV097 names, dict of call target -> count)
+    """
+    names = set()
+    targets = defaultdict(int)
+    i = 0
+    while i + 5 <= len(body):
+        if body[i] != _OP_MOV_ECX:
+            i += 1
+            continue
+        value = struct.unpack_from("<I", body, i + 1)[0]
+        matched = decode_pushbuffer_methods({value}, methods)
+        if not matched:
+            i += 5
+            continue
+        j = i + 5
+        limit = min(len(body) - 5, j + PUSH_CALL_WINDOW)
+        while j <= limit:
+            if body[j] == _OP_CALL_REL32:
+                rel = struct.unpack_from("<i", body, j + 1)[0]
+                target = (base_va + j + 5 + rel) & 0xFFFFFFFF
+                if target in func_starts:
+                    names |= matched
+                    targets[target] += 1
+                    break
+            j += 1
+        i += 5
+    return names, dict(targets)
+
+
+def _file_offset(sections, addr, size, data_len):
+    """File offset of a function, or None if it is outside every section."""
+    for va, vend, raw in sections:
+        if va <= addr < vend:
+            off = raw + (addr - va)
+            return off if off + size <= data_len else None
+    return None
+
+
+def _parse_sections(xbe_data):
+    """All (va_start, va_end, raw_addr) triples from the XBE section table."""
+    out = []
+    try:
+        base = struct.unpack_from("<I", xbe_data, 0x104)[0]
+        count = struct.unpack_from("<I", xbe_data, 0x11C)[0]
+        table = struct.unpack_from("<I", xbe_data, 0x120)[0] - base
+    except struct.error:
+        return out
+    if table < 0 or count > 64:
+        return out
+    for i in range(count):
+        off = table + i * 0x38
+        if off + 0x38 > len(xbe_data):
+            break
+        va = struct.unpack_from("<I", xbe_data, off + 0x04)[0]
+        vsize = struct.unpack_from("<I", xbe_data, off + 0x08)[0]
+        raw = struct.unpack_from("<I", xbe_data, off + 0x0C)[0]
+        out.append((va, va + vsize, raw))
+    return out
+
+
 def find_d3d_section(xbe_data):
     """
     Locate the statically linked D3D section in an XBE.
@@ -372,6 +512,17 @@ def identify_d3d8_functions(xbe_data, functions, xrefs=None, verbose=False):
         names = decode_pushbuffer_methods(extract_immediates(body), methods)
         if names:
             per_func[addr] = names
+
+    # Second pass: methods this function pushes through a fastcall helper
+    # rather than storing itself. Without it the body scan sees only the
+    # functions that inline their own command words.
+    pushed, primitives = scan_pushed_methods(
+        xbe_data, functions, methods, section=(d3d_lo, d3d_hi))
+    for addr, names in pushed.items():
+        per_func.setdefault(addr, set()).update(names)
+    if verbose and primitives:
+        top = max(primitives.items(), key=lambda kv: kv[1])
+        print(f"  Push helper sub_{top[0]:08X} carries {top[1]} method pushes")
 
     callers = _call_graph(xrefs) if xrefs else {}
     func_starts = sorted(int(f["start"], 16) for f in functions)

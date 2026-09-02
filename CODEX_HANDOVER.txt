@@ -636,6 +636,41 @@ Two Python interpreters, and this WILL bite you:
     JSRF through the layer therefore means overriding those flat functions,
     the Burnout 3 route, which is what (v) exists to make tractable.
 
+(x) JSRF HAS NO D3DDevice_SetRenderState TO OVERRIDE.  Read this before
+    planning any D3D8 interception work; it invalidates the obvious plan.
+    Extending (v) to recover methods pushed THROUGH a helper turned this up.
+    JSRF's push primitive is sub_0018E930 -- 39 bytes, __fastcall, 61 game
+    call sites, the busiest D3D entry point in the title:
+        eax = MEM32(0x19B200)        ; PUT cursor   (device +0x00)
+        cmp  eax+8, MEM32(0x19B204)  ; limit        (device +0x04)
+        MEM32(0x19B200) = eax        ; advance
+        MEM32(eax-8) = ecx           ; the NV2A command word
+        MEM32(eax-4) = edx           ; its value
+    The command word is the CALLER's constant, so the state setters hold no
+    NV097 constant at all -- which is why a body scan finds 27 of 264.
+    Recovering the caller-side "mov ecx, imm32" shows where the setters live,
+    and it is NOT the D3D section: they are game functions at 0x0015xxxx
+    (sub_001564B0 alpha/blend, sub_00151200 blend/depth, sub_001511B0 stencil,
+    ...). D3D8LTCG INLINED the SetRenderState calls into the game.
+    CONSEQUENCE: overriding D3D8 entry points, the Burnout 3 route, will NOT
+    capture JSRF's render state -- there is no function there to override. But
+    it also means one primitive carries the whole state stream, so overriding
+    sub_0018E930 alone would route every state change into the D3D8 HLE layer:
+    ONE function instead of ~100. That is the cheapest interception point in
+    the title and should be evaluated before any per-entry-point work.
+    Note 0x19B200/0x19B204 are device +0x00/+0x04, which MATCHES the layout in
+    docs/technical/d3d8ltcg-device-context.md (pb_put / pb_limit). JSRF uses
+    the same D3D8LTCG device shape as Burnout 3, so that document's field map
+    is a real starting point here rather than a Burnout-only artefact.
+    + scan_pushed_methods()/scan_body_pushes() in the identifier, 4 more tests
+    (21 in tools/func_id). The raw-byte scanner was cross-checked against an
+    independent scan of the generated C: both report the same 60 pushes
+    through the same primitive and the same caller set.
+    The call-target validation matters -- 0xE8 occurs inside other
+    instructions' encodings, and without requiring the target to be a known
+    function start the scan produced a "push helper sub_24656186" that is not
+    code at all.
+
 --------------------------------------------------------------------------------
 5. FILES CHANGED
 --------------------------------------------------------------------------------
@@ -678,7 +713,7 @@ Two Python interpreters, and this WILL bite you:
 
   Added identifying D3D8:
     tools/func_id/d3d8_identifier.py        (v) NEW
-    tools/func_id/test_d3d8_identifier.py   (v) NEW, 13 checks
+    tools/func_id/test_d3d8_identifier.py   (v)(x) NEW, 21 checks
     tools/func_id/identify.py               (v) Phase 3c
     tools/func_id/output.py                 (v) name/methods through the
                                             propagated bucket

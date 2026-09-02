@@ -31,6 +31,7 @@ from tools.func_id.d3d8_identifier import (  # noqa: E402
     decode_pushbuffer_methods,
     extract_immediates,
     load_nv097_methods,
+    scan_body_pushes,
 )
 
 # A few real values, so the test does not depend on the whole header parsing.
@@ -168,6 +169,60 @@ def test_method_table_parses_and_excludes_enum_values():
     # band is where leaked enum values (1, 2, 5 ...) would show up.
     strays = sorted(k for k in methods if 0 < k < 0x100)
     assert not strays, [hex(k) for k in strays]
+
+
+def _pushing_body(command_word, call_rel):
+    """mov ecx, imm32 ; mov edx, 0 ; call rel32"""
+    return (bytes([0xB9]) + command_word.to_bytes(4, "little")
+            + bytes([0xBA, 0, 0, 0, 0])
+            + bytes([0xE8]) + call_rel.to_bytes(4, "little", signed=True))
+
+
+def test_method_pushed_through_a_helper_is_attributed_to_the_caller():
+    # The shape that matters: JSRF's push primitive is fastcall, so the command
+    # word sits in the CALLER and the callee holds no constant at all. A body
+    # scan alone therefore misses every state setter in the game.
+    base = 0x00150000
+    # call is at offset 10, next insn at 15; target = base + 15 + rel
+    rel = 0x1000
+    target = base + 15 + rel
+    body = _pushing_body(_encoded(0x17FC), rel)
+    names, targets = scan_body_pushes(body, base, M, {target})
+    assert names == {"NV097_SET_BEGIN_END"}, names
+    assert targets == {target: 1}, targets
+
+
+def test_call_target_must_be_a_known_function():
+    # 0xE8 turns up inside other instructions' encodings constantly. Without
+    # the function-start check a constant pairs with a displacement byte and
+    # produces an address that is not code -- 0x24656186 was the real one.
+    base = 0x00150000
+    body = _pushing_body(_encoded(0x17FC), 0x1000)
+    names, targets = scan_body_pushes(body, base, M, set())
+    assert names == set()
+    assert targets == {}
+
+
+def test_non_method_constant_in_ecx_is_ignored():
+    base = 0x00150000
+    rel = 0x1000
+    target = base + 15 + rel
+    body = _pushing_body(0xDEADBEEF, rel)
+    names, _ = scan_body_pushes(body, base, M, {target})
+    assert names == set()
+
+
+def test_call_beyond_the_window_is_not_paired():
+    # A constant separated from the call by a lot of unrelated code is not an
+    # argument to it.
+    base = 0x00150000
+    rel = 0x1000
+    filler = bytes([0x90]) * 64
+    body = (bytes([0xB9]) + _encoded(0x17FC).to_bytes(4, "little") + filler
+            + bytes([0xE8]) + rel.to_bytes(4, "little", signed=True))
+    target = base + 5 + len(filler) + 5 + rel
+    names, _ = scan_body_pushes(body, base, M, {target})
+    assert names == set()
 
 
 def _run():
