@@ -375,3 +375,47 @@ ORDER OF WORK
        --trace-functions on its callees and find the branch that never goes
        the drawing way. That is title-specific reverse engineering, not
        generic ring work, and it should be costed as such.
+
+
+================================================================================
+9. THE RENDER PATH, TRACED  (call-graph bisect against what actually executes)
+================================================================================
+Done by intersecting the static call graph with the functions a `sample` shows
+live, walking up from the push primitive. Cheap -- no regeneration, no tracing
+build -- and it found the boundary in one pass.
+
+    level 1  17 direct callers of the push primitive sub_0018E930   NONE live
+    level 2  7 callers of those                                     sub_00155380 LIVE
+    level 3                                                         sub_00192090 live
+
+So sub_00155380 runs every frame and its call to sub_001564B0 -- one of the
+render-state setters -- never happens. Its opening is:
+
+    eax = [0x2650DC]; test eax,eax; je  continue
+    eax = [0x2650E0]; test eax,eax; jne continue
+    return 0x800401F1              ; an HRESULT failure, no drawing
+
+CAREFUL, AND I GOT THIS WRONG FIRST TIME: [0x2650E0] is not persistent state.
+sub_00155050 sets it to 1, calls through a vtable slot [ecx+0x18], and clears
+it to 0 on the way out. It is a scoped "currently inside the render call"
+guard. Reading it as 0 from another thread says only that the scope is not
+active right now, which is exactly what a probe outside the scope must see.
+The gate is not broken; it is reporting that rendering is not in progress.
+
+THE REAL FINDING IS ONE LEVEL UP. sub_00155050 is the render entry -- it takes
+the scope, calls the virtual method, releases it -- and:
+
+    * it is NEVER executed, and
+    * it has ZERO callers in the static call graph.
+
+Which means it is reached only through an indirect call. That is the defect
+class this contract already names in OPEN ITEM 2: a function pointer stored in
+a structure, invisible to every discovery pass because there is no call site.
+
+NEXT, and it is now a narrow question rather than an open one:
+    Find which vtable slot or structure field holds 0x00155050, and which
+    object should be dispatching it. Two tools exist for this and neither has
+    been pointed at it yet -- the RECOMP_ICALL feedback database, which records
+    indirect targets observed at runtime, and upstream's tools/rtti, which
+    recovers class layouts. The question is no longer "why does JSRF not
+    render" but "who was supposed to call sub_00155050".
