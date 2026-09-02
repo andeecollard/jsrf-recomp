@@ -24,6 +24,64 @@ class CarryLifterTest(unittest.TestCase):
             generated,
         )
 
+    def test_cmp_sets_carry_for_a_following_sbb(self):
+        # MSVC's branchless tolower inside _stricmp:
+        #     sub al, 0x41 ; cmp al, 0x1A ; sbb cl, cl ; and cl, 0x20
+        # sbb wants the carry from the cmp (is-a-letter). When cmp left CF
+        # alone, sbb read the sub's carry instead, no uppercase letter was
+        # ever folded, and _stricmp behaved like strcmp.
+        sub = Instruction(0, 2, "sub", "al, 0x41", "2c41")
+        sub.operands = [
+            Operand(type="reg", reg="al"),
+            Operand(type="imm", imm=0x41),
+        ]
+        cmp = Instruction(2, 2, "cmp", "al, 0x1a", "3c1a")
+        cmp.operands = [
+            Operand(type="reg", reg="al"),
+            Operand(type="imm", imm=0x1A),
+        ]
+        sbb = Instruction(4, 2, "sbb", "cl, cl", "1ac9")
+        sbb.operands = [
+            Operand(type="reg", reg="cl"),
+            Operand(type="reg", reg="cl"),
+        ]
+
+        # needs_cf is what the translator sets for any function containing
+        # adc/sbb, which is exactly the case that reads CF.
+        lifter = Lifter()
+        lifter.needs_cf = True
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[sub, cmp, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertIn("_cf = (int)(_fa < _fb);", generated)
+        # and it must land between the cmp and the sbb, not before the cmp
+        cmp_at = generated.index("/* cmp ")
+        cf_at = generated.index("_cf = (int)(_fa < _fb);")
+        sbb_at = generated.index("sbb self (CF extend)")
+        self.assertLess(cmp_at, cf_at)
+        self.assertLess(cf_at, sbb_at)
+
+    def test_test_clears_carry_for_a_following_sbb(self):
+        tst = Instruction(0, 2, "test", "al, al", "84c0")
+        tst.operands = [
+            Operand(type="reg", reg="al"),
+            Operand(type="reg", reg="al"),
+        ]
+        sbb = Instruction(2, 2, "sbb", "cl, cl", "1ac9")
+        sbb.operands = [
+            Operand(type="reg", reg="cl"),
+            Operand(type="reg", reg="cl"),
+        ]
+
+        lifter = Lifter()
+        lifter.needs_cf = True
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[tst, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertIn("_cf = 0;", generated)
+
     def test_neg_carry_feeds_adjacent_adc(self):
         neg = Instruction(0, 2, "neg", "eax", "f7d8")
         neg.operands = [Operand(type="reg", reg="eax")]

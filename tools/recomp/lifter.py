@@ -1601,11 +1601,35 @@ class Lifter:
         sx = self._SNAP_SX[size]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [
+        out = [
             f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
             f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
         ]
+        # A cmp sets the carry flag too, and sbb/adc/setc/rcl read it directly
+        # rather than through _fa/_fb. Leaving CF alone here let those pick up
+        # whatever an earlier instruction had left in it.
+        #
+        # MSVC's branchless tolower, in the _stricmp every Source string
+        # compare goes through, is exactly that shape:
+        #
+        #     sub al, 0x41      ; CF = al < 'A'
+        #     cmp al, 0x1A      ; CF = "is a letter"  <- the one sbb wants
+        #     sbb cl, cl
+        #     and cl, 0x20
+        #     add al, cl        ; fold to lowercase
+        #
+        # With CF still coming from the sub, no uppercase letter was ever
+        # folded and _stricmp quietly became strcmp.
+        #
+        # _fa and _fb are already masked to the operand width, so their
+        # unsigned comparison is CF at that width.
+        if self.needs_cf:
+            if kind == "cmp":
+                out.append("_cf = (int)(_fa < _fb);")
+            else:
+                out.append("_cf = 0; /* test/cmp-logical clears CF */")
+        return out
 
     def _lift_cmp(self, insn, ops):
         if len(ops) < 2:
