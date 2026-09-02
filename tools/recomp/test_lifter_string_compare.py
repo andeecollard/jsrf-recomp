@@ -14,10 +14,10 @@ class StringCompareLifterTest(unittest.TestCase):
 
         self.assertIn("while (ecx != 0)", generated)
         self.assertIn("_flags = (LO8(eax) == MEM8(edi));", generated)
-        self.assertIn("edi++; ecx--;", generated)
+        self.assertIn("edi += _st; ecx--;", generated)
         self.assertIn("if (_flags) break;", generated)
         self.assertLess(
-            generated.index("edi++; ecx--;"),
+            generated.index("edi += _st; ecx--;"),
             generated.index("if (_flags) break;"),
         )
 
@@ -40,7 +40,7 @@ class StringCompareLifterTest(unittest.TestCase):
         generated = "\n".join(lifted)
 
         self.assertIn("_flags = (MEM8(esi) == MEM8(edi));", generated)
-        self.assertIn("esi++; edi++; ecx--;", generated)
+        self.assertIn("esi += _st; edi += _st; ecx--;", generated)
         self.assertIn("if (!_flags) break;", generated)
         self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
 
@@ -66,7 +66,9 @@ class StringCompareLifterTest(unittest.TestCase):
         self.assertNotIn("TODO", generated)
         self.assertNotIn("- string compare, ecx iterations", generated)
         self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", generated)
-        self.assertIn("esi += 4; edi += 4; ecx--;", generated)
+        self.assertIn("esi += _st; edi += _st; ecx--;", generated)
+        # The step is four bytes, in whichever direction EFLAGS.DF says.
+        self.assertIn("RECOMP_DF_STEP(4)", generated)
         self.assertIn("if (!_flags) break;", generated)
         self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
 
@@ -110,7 +112,12 @@ class StringCompareLifterTest(unittest.TestCase):
 
         self.assertNotIn("string scan, ecx iterations", generated)
         self.assertIn("_flags = (eax == MEM32(edi));", generated)
-        self.assertIn("edi += 4; ecx--;", generated)
+        # The stride is RECOMP_DF_STEP(4), not a literal 4: EFLAGS.DF decides
+        # which way a string instruction walks, and MSVC's strrchr scans
+        # backwards with `std; repne scas`. Asserting the literal would pin
+        # the forward-only bug back in place.
+        self.assertIn("int32_t _st = RECOMP_DF_STEP(4);", generated)
+        self.assertIn("edi += _st; ecx--;", generated)
         self.assertIn("if (_flags) break;", generated)
 
 

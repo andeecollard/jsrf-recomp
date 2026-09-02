@@ -151,6 +151,21 @@ extern RECOMP_TLS int g_fp_top;
 extern RECOMP_TLS uint32_t g_seh_ebp;
 extern RECOMP_TLS uint32_t g_ebp;
 
+/* EFLAGS.DF, and the signed step the string instructions take because of it.
+ *
+ * `cld`/`std` used to lift to a comment and every string instruction stepped
+ * forwards regardless. That is right almost everywhere -- DF is 0 by ABI and
+ * the compiler restores it -- but MSVC's strrchr is `std; repne scasb` from
+ * the terminator backwards, so it scanned forwards off the end of the string
+ * and returned a pointer into whatever followed. The Xbox Dashboard uses it to
+ * split "y:\default.xip" into a mount path; with strrchr wrong the archive
+ * registered itself under its own full filename, no resource in it could ever
+ * be found by name, and the dashboard rebooted rather than showing a UI.
+ * memmove's overlapping case is the same instruction and the same bug.
+ */
+extern RECOMP_TLS int g_df;
+#define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
+
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control

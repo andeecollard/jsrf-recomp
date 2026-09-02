@@ -851,6 +851,15 @@ static void *g_kernel_memory = NULL;
 ptrdiff_t g_xbox_mem_offset = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
+/* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
+ * ABI's resting state and what almost every one of them does -- so this is
+ * almost always 0 and costs a predictable branch. The exceptions are the ones
+ * that matter: MSVC's strrchr/wcsrchr scan backwards from the terminator with
+ * `std; repne scasb`, and memmove goes backwards when its regions overlap the
+ * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
+ * in different lifted bodies of the same guest routine. */
+RECOMP_TLS int g_df = 0;
+
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 RECOMP_TLS uint32_t g_fs_base = XBOX_PRIMARY_TIB_VA;
