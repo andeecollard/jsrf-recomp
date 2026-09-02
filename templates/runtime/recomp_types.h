@@ -203,6 +203,18 @@ extern volatile uint64_t g_icall_count;
  */
 void recomp_icall_fail_log(uint32_t va);
 
+/* An indirect call dropped because its target is not in a code range.
+ *
+ * Dropping it is right -- calling a data address is worse than not calling --
+ * but dropping it SILENTLY is not: eax = 0 and carry on is indistinguishable
+ * from a function that returned early, so a wild or null function pointer in a
+ * loop presents as a title that quietly does nothing.
+ *
+ * Rate-limited per address at 1, 10, 100, 1000. The progression is the point:
+ * one line says a pointer was skipped, the sequence says it is being skipped
+ * every frame, and those need different responses. */
+void recomp_icall_not_code_log(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen
@@ -845,6 +857,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
+        recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -869,6 +882,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
+        recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
