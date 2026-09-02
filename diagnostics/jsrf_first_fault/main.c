@@ -53,16 +53,98 @@ extern MCPXAPUState *g_apu_state;
 
 static volatile int g_pushbuf_ack_stop;
 
+/* TEMPORARY push-buffer capture, for the ring-parsing scope measurement. */
+#define JSRF_PB_CAP_MAX (8u * 1024u * 1024u)
+static FILE *g_pb_cap;
+static unsigned long g_pb_cap_bytes;
+static unsigned long g_pb_cap_ranges;
+
+/* The ring write cursor and its limit are the D3D device's first two fields
+ * -- device +0x00 / +0x04, which is what the push primitive sub_0018E930
+ * advances, and what d3d8ltcg-device-context.md calls pb_put / pb_limit. The
+ * +0x30 / +0x34 pair the ack thread uses are INDICES, not addresses. */
+#define JSRF_PB_PUT_VA    0x0019B200u
+#define JSRF_PB_LIMIT_VA  0x0019B204u
+
+static uint32_t g_pb_last;
+
+static void jsrf_pb_capture(uint32_t get, uint32_t put);
+
+/* Off unless JSRF_PB_CAPTURE is set. The capture answered "what methods does
+ * this title actually emit" -- 3939 dwords parsed with zero unparseable
+ * headers -- and is worth keeping for the next pass, but it should not write
+ * a file on every run. */
+static int jsrf_pb_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) state = getenv("JSRF_PB_CAPTURE") ? 1 : 0;
+    return state;
+}
+
+static void jsrf_pb_poll(void)
+{
+    uint32_t now;
+    if (!jsrf_pb_enabled()) return;
+    now = MEM32(JSRF_PB_PUT_VA);
+    if (!now) return;
+    if (!g_pb_last) {
+        fprintf(stderr, "  [PB-CAP] ring cursor starts at 0x%08X, limit 0x%08X\n",
+                now, MEM32(JSRF_PB_LIMIT_VA));
+        fflush(stderr);
+        g_pb_last = now;
+        return;
+    }
+    if (now > g_pb_last) {
+        jsrf_pb_capture(g_pb_last, now);
+    }
+    g_pb_last = now;            /* wrap or reset: just resynchronise */
+}
+
+static void jsrf_pb_capture(uint32_t get, uint32_t put)
+{
+    uint32_t n;
+    if (put <= get) return;
+    n = put - get;
+    if (n > 0x100000u) return;              /* implausible span */
+    if (g_pb_cap_bytes >= JSRF_PB_CAP_MAX) return;
+    if (!g_pb_cap) {
+        g_pb_cap = fopen("jsrf_pushbuffer.bin", "wb");
+        if (!g_pb_cap) return;
+    }
+    fwrite((const void *)XBOX_PTR(get), 1, n, g_pb_cap);
+    fflush(g_pb_cap);          /* the run is killed, never exited */
+    g_pb_cap_bytes += n;
+    g_pb_cap_ranges++;
+    if (g_pb_cap_ranges <= 3 || (g_pb_cap_ranges % 500) == 0) {
+        fprintf(stderr, "  [PB-CAP] range %lu: %u bytes (total %lu)\n",
+                g_pb_cap_ranges, n, g_pb_cap_bytes);
+        fflush(stderr);
+    }
+    if (g_pb_cap_bytes >= JSRF_PB_CAP_MAX) {
+        fflush(g_pb_cap);
+        fprintf(stderr, "  [PB-CAP] captured %lu bytes in %lu ranges; stopping\n",
+                g_pb_cap_bytes, g_pb_cap_ranges);
+        fflush(stderr);
+    }
+}
+
 static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
 {
     (void)unused;
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
+        jsrf_pb_poll();
         if (dev) {
             uint32_t getp = MEM32(dev + JSRF_D3D_GETPTR_OFFSET);
             if (getp) {
                 uint32_t put = MEM32(dev + JSRF_D3D_PUT_OFFSET);
-                if (MEM32(getp) != put) {
+                uint32_t get = MEM32(getp);
+                if (get != put) {
+                    /* TEMPORARY: capture the pending command range before
+                     * acking it, so the ring can be parsed offline. Bounded;
+                     * a forward (non-wrapping) range only, which is all that
+                     * is needed to answer "what methods does this title
+                     * emit". */
                     MEM32(getp) = put;
                 }
             }

@@ -720,6 +720,69 @@ Two Python interpreters, and this WILL bite you:
     of the 24 is stronger for it. The census in (y) is measured after this fix;
     an earlier count of 567 functions "writing command words" was this defect.
 
+(aa) RING-PARSING SCOPE, MEASURED.  The fork in (y) is now decided by numbers.
+
+    THE RING IS ALREADY PARSEABLE. Captured live from JSRF at runtime by
+    polling the ring write cursor -- device +0x00 (0x0019B200), NOT the
+    +0x30/+0x34 pair the ack thread uses, which are INDICES and yielded two
+    bytes a time until that was spotted. 15,756 bytes captured, ring at
+    0x010DD000-0x010E4DFC. Parsed with nv2a_pb_replay.c's own header logic:
+        3,939 dwords, 2,731 methods dispatched, ZERO unparseable headers.
+    replay_pushbuffer() is a complete and correct PFIFO pusher already -- it
+    handles increasing and non-increasing headers, counts and subchannels in
+    about 45 lines. gap-analysis.md's "Push buffer parsing | Stub" refers to
+    the PFIFO block in nv2a_core.c, not to this. It needs feeding from the
+    live ring instead of a captured array; that is the whole of the parser
+    work. Set JSRF_PB_CAPTURE=1 to re-capture.
+
+    WHAT JSRF EMITS: 135 distinct method families in ~30s of startup (array
+    strides folded into their base -- texture stage N, light N, combiner stage
+    N all reuse one handler). 21 implemented, 114 missing. Every one of the
+    translator's 21 is genuinely exercised; none of its coverage is wasted.
+
+    SMALLEST SET FOR A FIRST FRAME (clear + flip): 18 methods, 6 already done,
+    TWELVE TO WRITE -- SET_CONTEXT_DMA_COLOR/ZETA, SET_SURFACE_FORMAT/PITCH/
+    COLOR_OFFSET/ZETA_OFFSET, SET_ZSTENCIL_CLEAR_VALUE, FLIP_STALL,
+    FLIP_INCREMENT_WRITE, WAIT_FOR_IDLE, NO_OPERATION, SET_CONTROL0. Most are
+    plain state stores; two are no-ops.
+
+    THE FILE NAME nv2a_pgraph_d3d11.c IS MISLEADING AND IT MATTERS. It
+    contains ZERO ID3D11/D3D11_ references. All 34 of its emit calls go
+    through dev->lpVtbl-> on IDirect3DDevice8 -- it is a PGRAPH-to-D3D8
+    translator, and the D3D8 layer picks the backend. So the PGRAPH route
+    already runs on macOS through d3d8_gl.c today, and both routes converge on
+    the SAME interface.
+
+    METAL ATTACH BOUNDARY: the IDirect3DDevice8 vtable, already implemented
+    twice (d3d8_device.c on D3D11, d3d8_gl.c on GL). A d3d8_metal.m is a third
+    sibling and serves both routes. Nothing in the PGRAPH path needs to know.
+
+    REUSE BEHIND PGRAPH -- the two hardest pieces are NV2A-level, not
+    D3D8-level, so they sit behind either route:
+      d3d8_vsh.c       1470 lines  d3d8_vsh_create_shader(const DWORD *micro-
+                                   code, ...) takes RAW NV2A microcode, which
+                                   is exactly what SET_TRANSFORM_PROGRAM
+                                   carries (576 dwords observed).
+      d3d8_combiners.c 1057 lines  consumes combiner ICW/OCW register words,
+                                   exactly what SET_COMBINER_*_ICW/OCW carry.
+      d3d8_swizzle.h    246 lines  Morton unswizzle: NV2A-level by definition.
+    10 of the 114 missing methods are payload handoffs to these.
+
+    ROUTE COMPARISON, measured:
+      A  ~85 JSRF-specific D3D8 overrides.  Title-specific, hand-written, and
+         a large share are in GAME code at 0x0015xxxx rather than the D3D
+         section, so they do not amortise to the next title. Reuses src/d3d.
+      B  Ring parsing + PGRAPH.  Parser already written and proven on this
+         title's live ring. 114 methods to add, 12 of them for a first frame,
+         10 delegating to translators that already exist. TITLE-SPECIFIC WORK
+         IS ESSENTIALLY ZERO -- only the ring cursor address, already known.
+         Everything written is generic and carries to every other Xbox title.
+
+    RECOMMENDATION: B. It reaches a first frame sooner (12 methods vs ~85
+    functions), the work is general rather than per-title, and it converges on
+    the same backend boundary. Revisit only if a title turns out to bypass the
+    ring, which JSRF does not.
+
 --------------------------------------------------------------------------------
 5. FILES CHANGED
 --------------------------------------------------------------------------------
