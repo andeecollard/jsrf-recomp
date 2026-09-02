@@ -14,6 +14,7 @@
 #include "recomp_types.h"
 #include "guest_trace.h"
 #include "apu/apu.h"
+#include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 
 /* Defined in src/apu/apu_mmio_hook.c, outside its Win32 guard. The MMIO hook
  * itself is Windows-only; the state pointer is not. */
@@ -463,6 +464,29 @@ int main(int argc, char **argv)
     printf("Writable emulated HDD root: %s\n", JSRF_HDD_ROOT);
     xbox_path_init(game_dir, JSRF_HDD_ROOT);
     xbox_kernel_bridge_init();
+
+    /* PROBE: bring up the D3D8 HLE layer (src/d3d, OpenGL 3.3 backend on
+     * POSIX). Nothing in JSRF routes through it yet -- the title runs its own
+     * statically-linked D3D8 and talks to the NV2A model -- so this only
+     * answers whether the layer initialises natively on this host at all,
+     * which is the first half of the interception route. */
+    {
+        IDirect3D8 *d3d = xbox_Direct3DCreate8(0);
+        fprintf(stderr, "  [D3D8-HLE] xbox_Direct3DCreate8 -> %p\n", (void *)d3d);
+        if (d3d) {
+            IDirect3DDevice8 *dev = NULL;
+            D3DPRESENT_PARAMETERS pp;
+            HRESULT hr;
+            memset(&pp, 0, sizeof(pp));
+            pp.BackBufferWidth  = 640;
+            pp.BackBufferHeight = 480;
+            hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &dev);
+            fprintf(stderr, "  [D3D8-HLE] CreateDevice -> hr=0x%08X dev=%p\n",
+                    (unsigned)hr, (void *)dev);
+        }
+        fflush(stderr);
+    }
+
     CreateThread(NULL, 0, jsrf_pushbuffer_ack, NULL, 0, NULL);
     CreateThread(NULL, 0, jsrf_adx_watch, NULL, 0, NULL);
     g_esp = XBOX_STACK_TOP;

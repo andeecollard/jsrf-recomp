@@ -14,6 +14,7 @@ from . import config
 from .imm_scanner import scan_immediate_refs
 from .rw_identifier import identify_rw_functions
 from .crt_identifier import identify_crt_functions
+from .d3d8_identifier import identify_d3d8_functions
 from .stub_classifier import classify_stubs
 from .vtable_scanner import scan_vtables
 from .clustering import propagate_labels
@@ -108,6 +109,25 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
         if addr in rw_results or addr in crt_results:
             del stub_results[addr]
 
+    # ── Phase 3c: D3D8 identification ────────────────────────
+    # Runs on the statically linked Xbox D3D8, which has no symbols and, in a
+    # retail build, no strings -- so neither the RW nor the CRT axis reaches
+    # it. Keyed on the NV2A push-buffer method constants the functions emit.
+    if verbose:
+        print("\nPhase 3c: D3D8 identification...")
+    t3c = time.time()
+    d3d8_results = identify_d3d8_functions(
+        xbe_data, functions, xrefs=xrefs, verbose=verbose
+    )
+    if verbose:
+        print(f"  Done in {time.time() - t3c:.1f}s")
+
+    # Same precedence as the phases above: an earlier, more specific
+    # identification wins.
+    for addr in list(d3d8_results.keys()):
+        if addr in rw_results or addr in crt_results or addr in stub_results:
+            del d3d8_results[addr]
+
     # ── Phase 4: Label propagation ───────────────────────────
     if verbose:
         print("\nPhase 4: Label propagation...")
@@ -144,6 +164,10 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
 
     # Merge vtable results into propagated for output
     propagated.update(vtable_new)
+
+    # D3D8 evidence is direct -- the function emits the GPU method -- so it
+    # overrides a propagated guess rather than deferring to one.
+    propagated.update(d3d8_results)
 
     # Add discovered vtable thunks as new function entries
     func_starts = {int(f["start"], 16) for f in functions}

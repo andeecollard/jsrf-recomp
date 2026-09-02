@@ -152,6 +152,12 @@ def _build_enriched_db(functions, rw_results, crt_results, propagated,
             entry["subcategory"] = info.get("subcategory")
             entry["confidence"] = info["confidence"]
             entry["method"] = info["method"]
+            # Propagation and the vtable scanner classify without naming, but
+            # the D3D8 identifier shares this bucket and does produce a name.
+            if info.get("name"):
+                entry["identified_name"] = info["name"]
+            if info.get("nv2a_methods"):
+                entry["nv2a_methods"] = info["nv2a_methods"]
             if "vtable_addr" in info:
                 entry["vtable_addr"] = f"0x{info['vtable_addr']:08X}"
                 entry["vtable_index"] = info["vtable_index"]

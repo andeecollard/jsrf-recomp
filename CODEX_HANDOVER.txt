@@ -157,13 +157,17 @@ Two Python interpreters, and this WILL bite you:
           -> 15 passing
       /usr/bin/python3 tools/disasm/test_decode_at.py        -> 4 checks
       /usr/bin/python3 tools/disasm/test_seed_realign.py     -> 5 checks
-          (these two are plain scripts, so they RUN here despite needing
-           capstone; the rest of tools/disasm and tools/func_id are
-           pytest-style AND need capstone, so they remain unrunnable)
-      tools/disasm/ and tools/func_id/ tests are pytest-style AND need capstone,
-      so they are UNRUNNABLE in this environment. Pre-existing, not caused by
-      these changes. The strongest available signal that discovery is healthy is
-      a clean regeneration: "9335/9335 functions (0 failed)".
+          (plain scripts, so they RUN here despite needing capstone)
+      python3 -m pytest tools/func_id/ -q
+          -> 17 passing
+      CORRECTION: this contract previously said "tools/disasm/ and
+      tools/func_id/ tests are pytest-style AND need capstone, so they are
+      UNRUNNABLE". That is FALSE for tools/func_id -- the whole package is
+      byte-level and imports no disassembler, so its suite runs clean under
+      pytest on the interpreter that has no capstone. Only tools/disasm needs
+      capstone. Do not skip the func_id suite on the strength of the old note.
+      Beyond the suites, the strongest signal that discovery is healthy remains
+      a clean regeneration: "9406/9407 functions (0 failed)".
 
 
 --------------------------------------------------------------------------------
@@ -573,6 +577,65 @@ Two Python interpreters, and this WILL bite you:
     no call site and no prologue for any discovery pass to find.
     Regeneration converges in 7 rounds to 9406/9407 functions, 0 failed.
 
+(v) tools/func_id/d3d8_identifier.py - IDENTIFYING STATICALLY LINKED D3D8
+    Xbox titles link D3D8 statically and the linker strips it: no symbols, and
+    in a retail build no strings -- JSRF's D3D section (0x0018CB40-0x0019E338,
+    264 functions) holds exactly ZERO. Byte signatures do not travel between
+    titles either, because every XDK version compiles a different D3D8, so
+    crt_identifier.py's approach does not carry over. Burnout 3 solved this
+    with 117 HAND-WRITTEN overrides; that does not scale to a second title.
+    What survives stripping is what D3D8 is FOR. Every function that drives the
+    GPU builds NV2A push-buffer command words inline, and a command word is
+    (count << 18) | method where method is a documented NV097_* offset. Those
+    constants are hardware-defined, specific to the operation, and cannot be
+    optimised away. src/nv2a/nv2a_regs.h already carries 214 of them.
+    Two axes are combined: WHAT the function does (its method set) and WHETHER
+    it is public API (called from outside the D3D section). Internal
+    implementations are reported with the public entry that reaches them --
+    which is how the flip pair resolves to sub_00198F10.
+    JSRF: 27 functions identified, 13 public. 24 moved unknown -> game_render,
+    3 displaced weaker vtable-scan guesses; RW and CRT counts unchanged.
+        sub_00198BE0/DC0  D3DDevice_Swap                 0.90 via sub_00198F10
+        sub_001993A0      D3DDevice_DrawIndexedVertices  0.90 public
+        sub_00199060/1C0/300/6A0  D3DDevice_DrawVertices 0.80 public
+        sub_00193830      D3DDevice_Clear                0.65 public
+    sub_00198F10 is corroborated independently: it is in the live frame-loop
+    stack (sub_0014D090 -> sub_00198F10 -> sub_00198ED0 -> sub_00198670 ->
+    sub_0018CE50, the vblank wait).
+    THE RULE TABLE REFUSES TO GUESS, and that mattered: the first version
+    called sub_0018D0F0 "SetLight" at 0.65 on the strength of one incidental
+    SET_LIGHT_AMBIENT_COLOR, when the function is 1313 bytes writing 11 methods
+    across surface setup, depth/stencil and the flip. Rules now carry a
+    `decisive` flag -- unambiguous markers (the flip PAIR, SET_BEGIN_END, clear
+    rects) are trusted at any breadth; weak single-register rules are refused
+    above 6 methods and fall through to D3DDevice_StateBlock at 0.30. The cost
+    is precision: sub_00195F80, a genuine lighting cluster, is demoted too.
+    Conservative on purpose -- a confident wrong name is worse than no name.
+    + tools/func_id/test_d3d8_identifier.py (13 checks), deliberately
+    capstone-free so it actually runs here.
+    NOTE the 0xC7 /0 store decode is the load-bearing part: "mov dword ptr
+    [edi], imm32" is how a command word reaches the ring, and imm_scanner.py
+    explicitly skips that encoding because it only ever needed push/mov-reg.
+
+(w) The D3D8 HLE layer runs natively on macOS, unmodified.
+    src/d3d/ is ~8,800 lines implementing the Xbox D3D8 API against a backend:
+    D3D11 on Windows, OpenGL 3.3 via SDL2 + libepoxy on POSIX (d3d8_gl.c).
+    libxbox_d3d8.a was ALREADY building for macOS. Measured with a one-call
+    probe in diagnostics/jsrf_first_fault/main.c:
+        [D3D8-HLE] xbox_Direct3DCreate8 -> 0x101d38118
+        [d3d8_gl] GL 4.1 Metal - 90.5 / GLSL 4.10
+        [D3D8-HLE] CreateDevice -> hr=0x00000000 dev=0x101ea1cc0
+    Note the renderer string: Apple's GL driver is itself Metal-backed, so the
+    existing GL backend already runs on Metal. A native d3d8_metal.m is a
+    deprecation hedge and an optimisation, NOT a prerequisite for pixels.
+    JSRF does NOT reach the layer: it recompiles its OWN statically linked
+    D3D8 and talks to the NV2A model instead. There is no COM boundary to swap
+    -- no IDirect3DDevice8 vtable exists in the XBE (longest run of pointers
+    into the D3D section is 29, and both runs are internal dispatch tables),
+    and 102 D3D-section functions are called DIRECTLY by game code. Routing
+    JSRF through the layer therefore means overriding those flat functions,
+    the Burnout 3 route, which is what (v) exists to make tractable.
+
 --------------------------------------------------------------------------------
 5. FILES CHANGED
 --------------------------------------------------------------------------------
@@ -612,6 +675,14 @@ Two Python interpreters, and this WILL bite you:
     tools/recomp/translator.py              (t) caller-clean icall detection
     tools/recomp/test_call_retaddr.py       (t) +5 tests
     diagnostics/jsrf_first_fault/icall_seed.json  (u) +0x0015F9D0
+
+  Added identifying D3D8:
+    tools/func_id/d3d8_identifier.py        (v) NEW
+    tools/func_id/test_d3d8_identifier.py   (v) NEW, 13 checks
+    tools/func_id/identify.py               (v) Phase 3c
+    tools/func_id/output.py                 (v) name/methods through the
+                                            propagated bucket
+    diagnostics/jsrf_first_fault/main.c     (w) D3D8 HLE init probe
 
 The worktree had many OTHER pre-existing modifications before this work
 (tools/disasm/*, tools/func_id/*, src/platform/*, src/nv2a/*, several
