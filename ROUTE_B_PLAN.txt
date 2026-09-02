@@ -228,7 +228,43 @@ under Wine and this is a native arm64 Mach-O.
   QueueUserAPC producer is xbox_KeAlertThread, and ordinal 93 is unrouted.
 
   So the game is alive and ticking and simply never re-enters its render path.
-  LEADING HYPOTHESIS, untested: the flip acknowledge. The guest raised
+  RULED OUT SINCE, each by measurement:
+    - STUCK LOADING. Ordinals 277/294 freeze at 607 because they are
+      RtlEnter/LeaveCriticalSection and init finished. No file-I/O ordinal
+      appears in the hot set at all; the growing ordinals are purely frame
+      loop and thread churn (224/231 resume/suspend, 159 wait, 119 DPC,
+      99 delay, 143/124 priority).
+    - RING FLOW CONTROL. The index pair the guest waits on reads put=23
+      get=23 -- already equal, so it is not waiting for the GPU to catch up.
+      The ring cursor at device +0x00 is frozen at 0x010E0DA4: the guest has
+      simply stopped writing.
+    - A DRAW-SUBMISSION BUG. draws=0 is correct, not broken: INLINE_ARRAY
+      carried 48 dwords across 4 BEGIN/END pairs, about 2.4 vertices each at
+      stride 5, so submit_draw's "num_verts < 3" guard rightly declined. That
+      burst was GPU INITIALISATION, not a frame.
+    - THE GPU->CPU FENCE. BACK_END_WRITE_SEMAPHORE_RELEASE is the last
+      meaningful command before the guest goes quiet, which looked decisive.
+      Implemented it; SET_SEMAPHORE_OFFSET is 0, so the guest never nominated
+      a fence location and there is nothing to signal. The handler stays --
+      it is correct and a later title will need it -- but it is not this
+      blocker.
+
+  WHAT THE GUEST DID LAST, decoded from the pusher's recent-method ring:
+      SURFACE_CLIP_H/V, CONTROL0, DEPTH_TEST_ENABLE, STENCIL_TEST_ENABLE,
+      SURFACE_FORMAT, WINDOW_CLIP_TYPE/H/V, VIEWPORT_OFFSET x4,
+      CLIP_MIN, CLIP_MAX, TEXTURE_CONTROL0, ZSTENCIL_CLEAR_VALUE,
+      BACK_END_WRITE_SEMAPHORE_RELEASE, COLOR_CLEAR_VALUE x2
+  -- and that whole render-target setup block appears TWICE. This is the tail
+  of a completed D3D device initialisation, not a stalled frame. The title
+  finished setting up its GPU and never entered a render path.
+
+  SO THE REMAINING BLOCKER IS GAME STATE, NOT GRAPHICS PLUMBING. The next
+  technique is different in kind: trace what gates the render call inside
+  sub_000659C0 (the 60Hz tick), rather than adding NV2A methods. Use
+  --trace-functions on sub_000659C0's callees and find the branch that never
+  goes the drawing way.
+
+  SUPERSEDED HYPOTHESIS, kept for the reasoning: the flip acknowledge. The guest raised
   FLIP_INCREMENT_WRITE and FLIP_STALL four times and then stopped, which is
   what a title does when it is waiting for the display to report the flip
   retired. Nothing in this runtime advances a flip-read counter.

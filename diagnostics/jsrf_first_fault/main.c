@@ -80,6 +80,45 @@ static volatile int g_pushbuf_ack_stop;
 static uint32_t g_pb_last;
 static uint32_t g_pb_ring_lo, g_pb_ring_hi;
 
+/* Read-only render-suppression probe; generated-host-code call sites are
+ * temporary observations, never guest state or branch overrides. */
+void jsrf_render_probe(uint32_t pc)
+{
+    static unsigned loops, renders, clocks;
+    uint32_t root = MEM32(0x22FCE0u);
+    if (pc == 0x13F90u && ++loops > 8 && loops % 120 != 0) return;
+    if (pc == 0x13A80u) ++renders;
+    if (pc == 0x145560u && ++clocks > 60) return;
+    fprintf(stderr, "[RENDER-PROBE] t=%u pc=%08X root=%08X stop=%u "
+            "loops=%u renders=%u put=%08X eax=%08X ecx=%08X esi=%08X "
+            "esp=%08X ret=%08X args=%08X,%08X,%08X,%08X\n",
+            GetTickCount(), pc, root, root ? MEM32(root + 0x24) : 0,
+            loops, renders, MEM32(JSRF_PB_PUT_VA), g_eax, g_ecx, g_esi,
+            g_esp, MEM32(g_esp), MEM32(g_esp+4), MEM32(g_esp+8),
+            MEM32(g_esp+12), MEM32(g_esp+16));
+    if (pc == 0x25331u || pc == 0x25366u)
+        fprintf(stderr, "[TIMEOUT-PROBE] object=%08X active=%u slot=%u "
+                "start=%08X:%08X result=%08X:%08X freq=%08X:%08X\n",
+                g_esi, MEM32(g_esi+0x44), MEM32(g_esi+0x48),
+                MEM32(g_esi+0x194), MEM32(g_esi+0x190),
+                MEM32(g_esp+8), MEM32(g_esp+4),
+                MEM32(0x20CC54), MEM32(0x20CC50));
+    if (pc == 0x6EE5Cu)
+        fprintf(stderr, "[RENDER-PROBE] dialog=%08X flags=%08X text=%.240s\n",
+                g_esi, MEM32(g_esi + 0x98),
+                MEM32(g_esi + 0xA0) ? (char *)XBOX_PTR(MEM32(g_esi + 0xA0)) : "<null>");
+    if (pc == 0x6F450u)
+        fprintf(stderr, "[RENDER-PROBE] message=%.240s\n",
+                MEM32(g_esp+4) ? (char *)XBOX_PTR(MEM32(g_esp+4)) : "<null>");
+    if (pc == 0x12770u || pc == 0x6F730u) {
+        for (uint32_t va = g_esp; va < g_esp + 0x300; va += 4) {
+            uint32_t value = MEM32(va);
+            if (value >= 0x11000 && value < 0x1C4000)
+                fprintf(stderr, "[RENDER-STACK] %08X=%08X\n", va, value);
+        }
+    }
+}
+
 static void jsrf_pb_feed(uint32_t from, uint32_t to)
 {
     if (to <= from) return;
@@ -134,6 +173,21 @@ static void jsrf_pb_poll(void)
     }
 }
 
+/* The index pair the guest's own wait loop watches: [dev+0x30] is PUT and
+ * [[dev+0x34]] is GET. Distinct from the ring cursor at device +0x00 -- these
+ * are counters, not addresses, and this is what the guest blocks on. */
+static uint32_t jsrf_pb_index(uint32_t which)
+{
+    uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
+    uint32_t v;
+    if (!dev) return 0;
+    v = MEM32(dev + which);
+    if (which == JSRF_D3D_GETPTR_OFFSET) {
+        return v ? MEM32(v) : 0;
+    }
+    return v;
+}
+
 /* Periodic pusher report. Separate from the ADX tick so it survives that
  * probe being removed. */
 static void jsrf_pusher_report(void)
@@ -151,12 +205,25 @@ static void jsrf_pusher_report(void)
         PgraphD3D11Stats ps;
         pgraph_d3d11_get_stats(&ps);
         fprintf(stderr, "  [PUSHER] runs=%lu dwords=%lu methods=%lu "
-                "unhandled=%lu bad_headers=%lu | clears=%u flips=%u draws=%u\n",
+                "unhandled=%lu bad_headers=%lu | clears=%u flips=%u draws=%u"
+                " | put=0x%08X limit=0x%08X idx put=%u get=%u\n",
                 st.runs, st.dwords, st.methods, st.unhandled, st.bad_headers,
-                ps.clears, ps.flips, ps.draw_calls);
+                ps.clears, ps.flips, ps.draw_calls,
+                MEM32(JSRF_PB_PUT_VA), MEM32(JSRF_PB_LIMIT_VA),
+                jsrf_pb_index(JSRF_D3D_PUT_OFFSET),
+                jsrf_pb_index(JSRF_D3D_GETPTR_OFFSET));
     }
     fflush(stderr);
     nv2a_pusher_dump_unhandled(20);
+    {   /* Submission has gone quiet: show what it did last, once. */
+        static unsigned long prev_methods;
+        static int shown;
+        if (st.methods == prev_methods && st.methods && !shown) {
+            shown = 1;
+            nv2a_pusher_dump_recent(48);
+        }
+        prev_methods = st.methods;
+    }
 }
 
 static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)

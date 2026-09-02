@@ -15,6 +15,7 @@
 #include "nv2a_regs.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include <stdlib.h>
 #if defined(__linux__)
 #include <malloc.h>
@@ -164,6 +165,11 @@ static struct {
     uint32_t context_dma_color;
     uint32_t context_dma_zeta;
     uint32_t control0;
+
+    /* GPU->CPU fence */
+    uint32_t context_dma_semaphore;
+    uint32_t semaphore_offset;
+    unsigned long semaphore_writes;
 
     /* Flip tracking */
     uint32_t flip_write;
@@ -515,6 +521,58 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_SET_CLEAR_RECT_VERTICAL:
         g_pg.clear_rect_v = param;
         return 1;
+
+    /* ── GPU -> CPU fence ──
+     *
+     * BACK_END_WRITE_SEMAPHORE_RELEASE is how the GPU tells the CPU it has
+     * reached a point in the command stream: it writes the parameter to a
+     * location the driver nominated with SET_SEMAPHORE_OFFSET, and the CPU
+     * polls that word. Nothing here was writing it, so any guest that waits on
+     * a fence waits forever -- and it does so by POLLING, not by blocking in
+     * the kernel, which is why the title looks healthy while never advancing:
+     * a 60Hz tick loop that quietly never gets its answer.
+     *
+     * The offset is relative to the semaphore DMA object. That object is not
+     * resolved here, and on this title it addresses main RAM directly, so the
+     * offset is used as a guest address and sanity-checked before the write.
+     * If a title turns up whose semaphore DMA has a non-zero base this will
+     * write to the wrong place -- the bounds check below turns that into
+     * nothing happening rather than into corruption, and the log says so. */
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        g_pg.context_dma_semaphore = param;
+        return 1;
+
+    case NV097_SET_SEMAPHORE_OFFSET:
+        g_pg.semaphore_offset = param;
+        return 1;
+
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+    {
+        extern ptrdiff_t g_xbox_mem_offset;
+        uint32_t off = g_pg.semaphore_offset;
+
+        /* Xbox RAM is 64MB (128MB on a devkit). An offset outside that is not
+         * an address we can honour, and writing anyway would corrupt guest
+         * memory somewhere unrelated. */
+        if (off && (off & 3u) == 0 && off < 0x08000000u) {
+            *(volatile uint32_t *)((uintptr_t)off + g_xbox_mem_offset) = param;
+            g_pg.semaphore_writes++;
+            if (g_pg.semaphore_writes <= 4) {
+                fprintf(stderr, "[PGRAPH] semaphore release: [0x%08X] = 0x%08X\n",
+                        off, param);
+                fflush(stderr);
+            }
+        } else {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[PGRAPH] semaphore offset 0x%08X not usable "
+                        "as a guest address; fence not signalled\n", off);
+                fflush(stderr);
+            }
+        }
+        return 1;
+    }
 
     /* ── Surface setup ──
      *

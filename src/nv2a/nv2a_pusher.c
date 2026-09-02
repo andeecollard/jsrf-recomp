@@ -35,9 +35,23 @@
 static NV2APusherStats g_stats;
 static uint32_t g_unhandled[UNHANDLED_SLOTS];
 
+/* Ring of the most recently dispatched methods.
+ *
+ * "What was the guest doing when it stopped submitting" is not answerable from
+ * totals -- a histogram says what happened, never in what order. The tail of
+ * the command stream says which operation it had just finished, which is the
+ * difference between "it is mid-frame waiting on us" and "it finished
+ * initialising and moved on". */
+#define RECENT_SLOTS 64
+static struct { uint32_t method, param; } g_recent[RECENT_SLOTS];
+static unsigned long g_recent_idx;
+
 static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
 {
     g_stats.methods++;
+    g_recent[g_recent_idx % RECENT_SLOTS].method = method;
+    g_recent[g_recent_idx % RECENT_SLOTS].param = param;
+    g_recent_idx++;
     if (!pgraph_d3d11_method((int)subchannel, method, param)) {
         g_stats.unhandled++;
         if ((method / 4u) < UNHANDLED_SLOTS) {
@@ -179,6 +193,36 @@ void nv2a_pusher_dump_unhandled(int max_entries)
 
     if (!printed) {
         return;
+    }
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
+}
+
+void nv2a_pusher_dump_recent(int max_entries)
+{
+    char line[1024];
+    int off;
+    unsigned long total = g_recent_idx;
+    unsigned long start;
+    int n;
+
+    if (!total) {
+        return;
+    }
+    if (max_entries <= 0 || max_entries > RECENT_SLOTS) {
+        max_entries = RECENT_SLOTS;
+    }
+    n = (int)(total < (unsigned long)max_entries ? total : (unsigned long)max_entries);
+    start = total - (unsigned long)n;
+
+    off = snprintf(line, sizeof(line), "  [PUSHER] last %d methods:", n);
+    for (int i = 0; i < n; i++) {
+        unsigned long idx = (start + (unsigned long)i) % RECENT_SLOTS;
+        if (off <= 0 || off >= (int)sizeof(line) - 20) {
+            break;
+        }
+        off += snprintf(line + off, sizeof(line) - (size_t)off,
+                        " %04X", g_recent[idx].method);
     }
     fprintf(stderr, "%s\n", line);
     fflush(stderr);

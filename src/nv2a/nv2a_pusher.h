@@ -49,4 +49,11 @@ void nv2a_pusher_reset_stats(void);
  */
 void nv2a_pusher_dump_unhandled(int max_entries);
 
+/**
+ * Print the most recently dispatched method offsets, oldest first.
+ *
+ * Totals cannot say what the guest was doing when it stopped; order can.
+ */
+void nv2a_pusher_dump_recent(int max_entries);
+
 #endif /* XBOXRECOMP_NV2A_PUSHER_H */

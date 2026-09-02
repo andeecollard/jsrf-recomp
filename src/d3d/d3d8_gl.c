@@ -1010,7 +1010,19 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
         return D3DERR_INVALIDCALL;
     }
     SDL_GL_MakeCurrent(g.window, g.glctx);
-    SDL_GL_SetSwapInterval(1);
+    /* Swap immediately; do NOT wait for the display.
+     *
+     * Two reasons, and the second is fatal. The guest already paces itself:
+     * the runtime delivers a 60Hz vblank interrupt and the title's own vsync
+     * pump blocks on it, so waiting again here would pace the frame twice.
+     *
+     * And on macOS the vsync wait is serviced by the main thread's run loop.
+     * Present runs on the thread that owns the GL context, which is not the
+     * main thread, and the main thread is permanently inside guest code -- so
+     * SDL_GL_SwapWindow parked forever in pthread_cond_wait inside
+     * Cocoa_GL_SwapWindow and took the whole push-buffer pusher down with it.
+     * Measured: 9,954 of 9,963 samples in that wait. */
+    SDL_GL_SetSwapInterval(0);
 
     fprintf(stderr, "[d3d8_gl] GL %s / GLSL %s\n",
             glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
