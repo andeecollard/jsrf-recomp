@@ -419,3 +419,56 @@ NEXT, and it is now a narrow question rather than an open one:
     indirect targets observed at runtime, and upstream's tools/rtti, which
     recovers class layouts. The question is no longer "why does JSRF not
     render" but "who was supposed to call sub_00155050".
+
+
+================================================================================
+10. THE RENDERER CLASS, LOCATED  (and two of my own conclusions corrected)
+================================================================================
+DURABLE FACTS, worth having whoever picks this up next:
+
+    vtable            0x001E0F00, 121 slots
+    constructor       sub_0014CDB0 (installed by sub_0014CFB0; also written by
+                      sub_0014CF80 and sub_0014CFB0 on reset paths)
+    slot  6  +0x18    sub_00155380   the guarded entry
+    slot 10  +0x28    sub_00155050   the render entry: takes the scope flag,
+                                     calls the object's virtual method, releases
+    slots 98-104      sub_00151200 / 00151330 / 001511B0 / 001515D0 / 00151520 /
+                      00151670 ... the render-state setters that push NV2A
+                      methods through sub_0018E930
+
+That identification is solid: the class contains every render-state function
+the NV2A-method identifier found independently, which is two unrelated methods
+agreeing.
+
+NEITHER sub_00155380 NOR sub_00155050 HAS A STATIC CALLER. The whole class is
+dispatched through its vtable, so the call graph cannot see who drives it --
+the OPEN ITEM 2 defect class again, at class scale rather than one pointer.
+
+TWO CORRECTIONS TO EARLIER CONCLUSIONS IN THIS FILE. Both were mine and both
+looked convincing at the time:
+
+  1. "The gate fails, returning 0x800401F1." It does not. [0x2650E0] is a
+     SCOPED guard -- sub_00155050 sets it to 1, calls the virtual method, and
+     clears it to 0 on the way out -- so a probe reading it from another thread
+     sees 0 whenever rendering is not in progress, which from outside is
+     always. Reading a scoped flag out of scope tells you nothing.
+
+  2. "The render path is never entered." It is entered -- during INIT. A live
+     stack caught it:
+         sub_0005F2C0 -> sub_00155380 (+4944, deep in the body, past the early
+         return) -> sub_00156AB0 -> sub_0018E460
+     and sub_0018E460 is D3D device creation: it writes the device global
+     [0x19DCE0] = 0x19B200 and calls sub_00192090. So the gate passes and real
+     D3D work happens.
+
+  Whether it RECURS was then tested rather than assumed: three consecutive
+  6-second samples, and device creation plus the gate appear in the FIRST only.
+  Not a retry loop -- one-time initialisation. After init the renderer is never
+  dispatched again.
+
+WHERE THAT LEAVES THE BLOCKER: unchanged in substance but much better located.
+The game's 60Hz tick does not dispatch the renderer object it built. The next
+question is narrow and answerable: which object holds a pointer to the
+0x001E0F00 instance, and what decides whether the tick calls slot 10 on it.
+The RECOMP_ICALL feedback database records indirect targets observed at
+runtime and is the tool for that; it has still not been pointed at this.
