@@ -132,9 +132,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* Dashboard-configurable video flags use the AV_FLAGS_* encoding.
+         * Enable 480p for the emulated HDTV pack without claiming modes the
+         * current renderer does not need to advertise. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = XC_VIDEO_FLAGS_480p;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

@@ -43,7 +43,7 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
-    { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
+    { "\\Device\\Harddisk0\\Partition1\\",    1, NULL,         NULL          },
     { "D:\\",                                 0, NULL,         NULL          },
     { "d:\\",                                 0, NULL,         NULL          },
     /* Y: is the Xbox dashboard partition; the dashboard opens its assets

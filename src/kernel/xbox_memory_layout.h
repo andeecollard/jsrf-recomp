@@ -103,6 +103,12 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+/**
+ * Convert a host fault address back to a guest VA only when it lies in one of
+ * the memory layout's mappings. Intended for crash diagnostics; unlike raw
+ * offset subtraction, this rejects unrelated host addresses such as NULL.
+ */
+BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address);
 void xbox_ProtectMirrorsForDebug(void);
 
 /* ================================================================
@@ -190,6 +196,12 @@ typedef union RecompXmm {
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
+#define XBOX_THREAD_STACK_SIZE (512 * 1024)
+
+/* Primary-thread storage used by the title's own Xbox TLS bootstrap. */
+#define XBOX_PRIMARY_TIB_VA          0x00000000u
+#define XBOX_PRIMARY_TLS_CONTEXT_VA  0x00760000u
+#define XBOX_PRIMARY_TLS_DATA_VA     0x00700000u
 
 /* ================================================================
  * Worker stack slices (host-tick-driven titles)
@@ -247,6 +259,19 @@ typedef union RecompXmm {
  * Alignment must be a power of 2 (minimum 4).
  * Thread-safe: no (single-threaded recompiled code).
  */
+/* Install a sink for guest writes to the APU register aperture. The kernel does
+ * not link xbox_apu, so the host program wires this to mcpx_apu_mmio_write.
+ * Must be called before xbox_MemoryLayoutInit, which installs the trap. */
+/* Assert the NV2A display-engine vblank interrupt (PCRTC source + PMC summary),
+ * bypassing the write-1-to-clear guard so the raise is not mistaken for the
+ * guest's acknowledge. xbox_Nv2aVblankPending reports whether the guest has
+ * acknowledged the last one yet. */
+void xbox_Nv2aRaiseVblank(void);
+int  xbox_Nv2aVblankPending(void);
+
+void xbox_SetApuMmioWriteHook(void (*fn)(uint32_t offset, uint32_t value,
+                                         unsigned width));
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 /**
@@ -269,6 +294,12 @@ HANDLE xbox_GetMappingHandle(void);
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(void);
+
+/* Install the per-thread Xbox FS/TIB state used by generated FS_MEM accesses.
+ * tls_data_size is the value passed to PsCreateSystemThreadEx. */
+void xbox_SetupCurrentThreadTib(uint32_t tib_va, uint32_t tls_context_va,
+                               uint32_t tls_data_va, uint32_t tls_data_size,
+                               uint32_t stack_top, uint32_t stack_limit);
 
 /* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
  * docs/technical/burnout3-reunification.md). Additive; unused by default-model

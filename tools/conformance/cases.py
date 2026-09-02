@@ -49,6 +49,16 @@ _EDGES = [0x00000000, 0x00000001, 0x0000007F, 0x00000080, 0x000000FF,
 _PAIRS = [(a, b) for a in _EDGES for b in (0x00000001, 0x0000007F, 0x00000080,
                                            0x000000FF, 0xFFFFFFFF)]
 
+# Bit-scan inputs. _PAIRS deliberately never offers a zero second operand, but
+# zero is exactly the case bsf/bsr define differently from every other
+# instruction, so it has to be present here. The extra powers of two pin down
+# which end of the word each scan starts from -- bsf and bsr only disagree when
+# more than one bit is set.
+_SCAN_PAIRS = [(a, b) for a in _EDGES
+               for b in (0x00000000, 0x00000001, 0x00000080, 0x00008000,
+                         0x80000000, 0x00000003, 0x80000001, 0xFFFFFFFF,
+                         0x12345678)]
+
 # Doubles for the x87 cases. Ordinary values, the signed zeroes, a tie for
 # the rounding modes, and one pair that is only interesting in reverse
 # (fsubr/fdivr swap the operands, so a/b and b/a must differ).
@@ -152,6 +162,28 @@ CASES = [
          ["stc", "inc eax", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
     Case("bswap", "byte swap", ["bswap eax"], _PAIRS),
     Case("not_and", "bitwise", ["not eax", "and eax, ecx"], _PAIRS),
+
+    # -- XADD / LOCK XADD ---------------------------------------------------
+    # Keep the destination on the native stack so the case exercises a real
+    # memory RMW without depending on a fixed host address. Separate cases
+    # expose both architectural outputs: the updated destination and the old
+    # destination copied to the source register.
+    Case("xadd_mem_result", "memory destination receives old destination + source",
+         ["push ecx", "xadd dword ptr [esp], eax", "pop eax"], _PAIRS),
+    Case("xadd_source_old", "source register receives the old memory destination",
+         ["push ecx", "xadd dword ptr [esp], eax", "add esp, 4"], _PAIRS),
+    Case("lock_xadd_increment", "LOCK XADD increment updates memory atomically",
+         ["push ecx", "mov eax, 1", "lock xadd dword ptr [esp], eax",
+          "pop eax"], _PAIRS),
+    Case("lock_xadd_decrement", "LOCK XADD with source -1 performs a decrement",
+         ["push ecx", "or eax, -1", "lock xadd dword ptr [esp], eax",
+          "pop eax"], _PAIRS),
+    Case("lock_xadd_zf", "ZF reflects the ADD result for zero and nonzero sums",
+         ["push ecx", "lock xadd dword ptr [esp], eax", "sete al",
+          "movzx eax, al", "add esp, 4"], _PAIRS),
+    Case("lock_xadd_nzf", "the inverse ZF path used by JNE",
+         ["push ecx", "lock xadd dword ptr [esp], eax", "setne al",
+          "movzx eax, al", "add esp, 4"], _PAIRS),
 
     # ══ x87 ═════════════════════════════════════════════════════════════════
     #
@@ -307,6 +339,61 @@ CASES = [
     Case("btc_flip", "btc complements it", ["btc eax, 5"], _PAIRS),
     Case("btr_reg", "btr with a register bit index, which is taken mod 32",
          ["btr eax, ecx"], _PAIRS),
+
+    # bsf/bsr were unhandled for the same reason bt/btr were: nothing in the
+    # corpus reached them until JSRF's D3D library, whose Log2 helper is a bare
+    # `bsf eax, ecx`. It lifted to a comment, so the helper returned a stale
+    # eax and every surface size built from log2(w)+log2(h)+log2(d) was wrong.
+    #
+    # _PAIRS never passes zero as the second operand, and zero is the whole
+    # edge here: x86 sets ZF and leaves the DESTINATION UNMODIFIED, so a lift
+    # that writes any value at all -- 0, 32, -1 -- diverges. _SCAN_PAIRS puts
+    # ecx = 0 back in, against an eax that is different in every case so an
+    # unmodified destination is distinguishable from a written one.
+    Case("bsf_scan", "bsf returns the lowest set bit's index",
+         ["bsf eax, ecx"], _SCAN_PAIRS),
+    Case("bsr_scan", "bsr returns the highest set bit's index",
+         ["bsr eax, ecx"], _SCAN_PAIRS),
+    Case("bsf_zero_leaves_destination",
+         "a zero source sets ZF and must not write the destination",
+         ["bsf eax, ecx"], [(v, 0x00000000) for v in _EDGES]),
+    Case("bsr_zero_leaves_destination",
+         "same for the reverse scan",
+         ["bsr eax, ecx"], [(v, 0x00000000) for v in _EDGES]),
+    Case("bsf_zf_consumer",
+         "the ZF bsf sets is what callers branch on, not the index",
+         ["bsf eax, ecx", "sete al", "movzx eax, al"], _SCAN_PAIRS),
+
+    # repe cmpsd is memcmp, and the flags it leaves are the whole point. The
+    # dword width lifted to a comment while the byte width worked, so the
+    # following sete resolved its ZF against whatever came before -- which in
+    # a GUID compare is the xor that zeroes the result byte, i.e. "equal"
+    # every time. The scratch buffer holds A at [eax] and B at [eax+16].
+    Case("repe_cmpsd_equal",
+         "repe cmpsd over identical dwords leaves ZF set",
+         ["mov esi, eax", "mov edi, eax", "mov ecx, 4", "xor edx, edx",
+          "repe cmpsd", "sete dl", "movzx eax, dl"], _PAIRS),
+    Case("repe_cmpsd_differs",
+         "and clear when the blocks differ; the xor before it must not decide",
+         ["mov esi, eax", "lea edi, [eax+16]", "mov ecx, 4", "xor edx, edx",
+          "repe cmpsd", "sete dl", "movzx eax, dl"], _PAIRS),
+
+    # cmpxchg was lifted to a comment while its sibling xadd was implemented.
+    # The scratch buffer's dword at [eax+32] is the shared word; ecx is the
+    # value to swap in. Both the success and failure paths matter: on failure
+    # x86 loads the destination into the accumulator, and a retry loop that
+    # never gets that reload cannot terminate.
+    Case("cmpxchg_match",
+         "accumulator equals destination: the exchange happens and ZF is set",
+         ["mov dword ptr [eax+32], eax", "mov edx, ecx",
+          "push eax", "mov eax, dword ptr [eax+32]",
+          "cmpxchg dword ptr [esp], edx", "pop ecx",
+          "sete al", "movzx eax, al"], _PAIRS),
+    Case("cmpxchg_mismatch_reloads_accumulator",
+         "on failure the destination is loaded into eax, which is what makes "
+         "the standard retry loop terminate",
+         ["push ecx", "not eax", "cmpxchg dword ptr [esp], edx",
+          "add esp, 4"], _PAIRS),
 
     # An x87 compare against a NaN is unordered: C3, C2 and C0 all set. The
     # model reported "equal", so `fucompp; fnstsw ax; test ah,44h; jp` -- how

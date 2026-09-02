@@ -12,10 +12,29 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+/* ucontext_t is behind the X/Open guard on macOS, and the MCPX write trap
+ * below needs the signal context to read the faulting store's registers.
+ * Must precede every include, so it sits above them rather than with the
+ * trap. diagnostics/jsrf_first_fault/main.c does the same for its handler. */
+#if !defined(_WIN32) && !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 700
+#endif
+/* _XOPEN_SOURCE alone hides the BSD extensions this file already uses
+ * (MAP_ANONYMOUS); _DARWIN_C_SOURCE puts them back. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -36,6 +55,20 @@
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+#if defined(__APPLE__)
+/* Own the complete RAM + mirror span before MapViewOfFileEx uses MAP_FIXED. */
+static void *g_host_reservation = NULL;
+static size_t g_host_reservation_size = 0;
+
+static BOOL host_reservation_contains(uintptr_t target, size_t size)
+{
+    uintptr_t base = (uintptr_t)g_host_reservation;
+
+    if (!base || size > g_host_reservation_size || target < base)
+        return FALSE;
+    return target - base <= g_host_reservation_size - size;
+}
+#endif
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -106,13 +139,30 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
      * acknowledge, reads it back still pending, and recurses into a native
      * stack overflow.
      *
-     * Holding them at zero is correct rather than convenient: nothing here
-     * ever raises a GPU interrupt, so "none pending" is the truth. */
-    { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
+     * Holding an UNMODELLED engine's status at zero is correct rather than
+     * convenient: nothing raises those, so "none pending" is the truth.
+     *
+     * The DISPLAY engine is the exception, and the masks below carve it out.
+     * xbox_Nv2aRaiseVblank now genuinely raises a GPU interrupt once a frame --
+     * NV_PCRTC_INTR_0 bit 0 (VBLANK) and the NV_PMC_INTR_0 bit 24 summary that
+     * follows it -- and the guest acknowledges it through the write trap. This
+     * thread cannot tell that raise apart from a stale bit, so with the old
+     * 0xFFFFFFFF masks it raced the raise and won: PMC bit 24 was back to zero
+     * before D3D's DPC (sub_00194480) read it, the DPC therefore never
+     * dispatched to the vblank handler (sub_00193D90), the handler never
+     * acknowledged NV_PCRTC_INTR_0 and never signalled the device's vblank
+     * KEVENT, and bridge_vblank_poll's "do not re-raise while unacknowledged"
+     * gate then latched shut. Measured: exactly one ISR and one DPC per run,
+     * then every D3D thread blocked in sub_0018CE50 forever.
+     *
+     * Clearing PCRTC_INTR_0 was also pure overhead: the trap models it as
+     * write-1-to-clear, so this thread's store of 0 changed nothing while
+     * still taking a page fault on every loop iteration. */
+    { 0x000100, ~0x01000000u }, /* PMC_INTR_0, except the PCRTC summary  */
     { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
     { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
     { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
-    { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
+    { 0x600100, ~0x00000001u }, /* PCRTC_INTR_0, except VBLANK          */
 };
 
 /*
@@ -174,11 +224,545 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * paces audio off it yet. Derive it from a real clock if timing starts to
  * matter.
  */
+static void *g_mcpx_regs = NULL;
+
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
 
-static void *g_mcpx_regs = NULL;
+/*
+ * MCPX status bits that must always read as SET.
+ *
+ * The MCPX counterpart of NV2A_IDLE, and the same argument: a device that is
+ * present and finished resetting reports itself ready, and zeroed RAM reports
+ * it forever un-ready.
+ *
+ * DirectSound's AC97 bring-up is the case that needs it. JSRF stops here:
+ *
+ *   sub_001A6C94:                      ; AC97 codec-ready handshake
+ *     eax = [0xFEC0012C]               ; control
+ *     if (!(al & 2)) [0xFEC0012C] = eax | 2      ; de-assert cold reset
+ *     if (al & 8)    [0xFEC0012C] = eax & ~0xC   ; clear warm reset / shut off
+ *     edi = 0x3E8                                ; 1000 retries
+ *   L: if ([0xFEC00130] & 0x100) return 1        ; primary codec ready
+ *      if (edi-- == 0) return 0
+ *      KeStallExecutionProcessor(0x14)           ; 20 us
+ *      goto L
+ *
+ * Returning 0 makes sub_001A73C7 hand back DSERR_NODRIVER (0x88780078). That
+ * is the game object's construction status, stored at +0x10 by sub_00012210;
+ * sub_00012C10 tests it and returns immediately when negative, so the run loop
+ * never starts, main returns, and XAPI reboots to the dashboard. The title
+ * exits cleanly having never drawn a frame. Measured before this table
+ * existed: exactly 1000 KeStallExecutionProcessor calls from 0x001A6CD2, the
+ * whole retry budget, then the reboot.
+ *
+ * Holding the bit set is a model of the console, not a way past the check: on
+ * hardware the AC97 controller raises primary-codec-ready once the codec
+ * leaves reset and it stays raised. Nothing here clears it, and the bit is
+ * status, not state the title owns.
+ *
+ * ponytail: this says a codec is present, nothing more. Audio still goes
+ * through src/apu and src/audio; no AC97 register beyond this one is modelled.
+ */
+static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
+    /* AC97 GLOB_STA, 0xFEC00130. Bit 8 is primary codec ready. */
+    { 0x400130, 0x00000100u },
+};
+
+/*
+ * MCPX registers whose written bits do not stick.
+ *
+ * NV2A_ACK covers "software sets a bit, hardware clears it later, software
+ * spins re-reading". This table covers the harder shape: hardware clears the
+ * bit so fast that software never expects to see it set at all, so the
+ * compiler is free to hoist the read out of the loop -- and MSVC did.
+ *
+ * DirectSound's AC97 bus-master reset, sub_001A6F52, is the case:
+ *
+ *     MEM8(cr) = 2;                 // RR, "reset this box's registers"
+ *     cl = MEM8(cr) & 2;            // read back ONCE, outside the loop
+ *   L: if (cl) goto L;              // never re-reads memory
+ *
+ * Against plain RAM the 2 sticks, the single read returns it, and the title
+ * spins forever inside CDirectSound init. An acknowledging thread cannot help
+ * here: it would have to land in the few-instruction window between the write
+ * and the read, exactly once, and losing the race hangs the title permanently.
+ * The semantic that is actually missing is write suppression, so that is what
+ * this models -- the bit reads back clear because the reset already completed,
+ * which is what the hardware reports.
+ *
+ * AC97 bus-master registers live at 0xFEC00100, in boxes of 0x10, with the
+ * control byte at +0x0B and RR as bit 1. Every box is listed rather than the
+ * two JSRF happens to reset: the layout is the AC97 spec's, not a title's.
+ */
+#define MCPX_AC97_NABM   0x400100u   /* 0xFEC00100, relative to XBOX_MCPX_BASE */
+#define MCPX_AC97_BOX    0x10u
+#define MCPX_AC97_CR     0x0Bu
+#define MCPX_AC97_CR_RR  0x02u
+
+static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[] = {
+    { MCPX_AC97_NABM + 0 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 1 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 2 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 3 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 4 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 5 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 6 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+    { MCPX_AC97_NABM + 7 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
+};
+
+/* APU register aperture, as an offset window inside the MCPX span. The guest's
+ * statically linked DSOUND drives this hardware directly, so its writes have to
+ * reach the emulated APU rather than landing in plain RAM.
+ *
+ * Writes only. Reads stay ordinary loads against the mapped page, which keeps a
+ * polled register (the sample counter at +0x020010 is read in a spin loop) from
+ * becoming millions of signals. The cost is that a register with read side
+ * effects -- read-to-clear -- is not modelled; none is known to be needed here.
+ *
+ * Reached through a hook rather than a direct call so xbox_kernel keeps no link
+ * dependency on xbox_apu: targets that link the kernel alone must still build. */
+#define MCPX_APU_MMIO_OFFSET 0x000000u
+#define MCPX_APU_MMIO_SIZE   0x080000u   /* 512 KB */
+
+static void (*g_mcpx_apu_write)(uint32_t offset, uint32_t value,
+                                unsigned width) = NULL;
+
+void xbox_SetApuMmioWriteHook(void (*fn)(uint32_t, uint32_t, unsigned))
+{
+    g_mcpx_apu_write = fn;
+}
+
+/* Set while the write trap below is guarding those registers. When it is off
+ * (unsupported host, or install failed) the ack thread keeps re-applying
+ * MCPX_READY instead, which is all it could ever do for this aperture. */
+static int g_mcpx_trap_active = 0;
+
+/* Apply MCPX_READY to the aperture. Called once when the aperture is mapped so
+ * the first reader sees the bit without having to race the ack thread -- the
+ * poll above burns its 1000 retries in microseconds while
+ * KeStallExecutionProcessor is a no-op -- and again from the thread so the bit
+ * survives anything that clears it. */
+static void xbox_McpxApplyReady(void)
+{
+    if (!g_mcpx_regs) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(MCPX_READY) / sizeof(MCPX_READY[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_READY[i].offset);
+        if ((*r & MCPX_READY[i].ready_mask) != MCPX_READY[i].ready_mask) {
+            *r |= MCPX_READY[i].ready_mask;
+        }
+    }
+}
+
+/* ================================================================
+ * MCPX register write trap (POSIX / AArch64)
+ * ================================================================
+ *
+ * The Windows build decodes device-register accesses in a vectored exception
+ * handler (src/nv2a/nv2a_mmio_hook.c, src/apu/apu_mmio_hook.c). Both are
+ * x86-64 decoders behind #if defined(_WIN32), so on this host there was no
+ * mechanism at all -- and the APU one covers 0xFE800000+512K, which does not
+ * reach AC97 at 0xFEC00000 even on Windows.
+ *
+ * This is the same idea with far less machinery. Only the pages holding a
+ * MCPX_WRITE_CLEAR register are protected read-only, so reads stay ordinary
+ * loads against mapped RAM and only a write to one of those pages traps.
+ *
+ * The decoder is small because the faulting address does not have to be
+ * recovered from the instruction: the signal already carries it in si_addr.
+ * That leaves just two fields to read out of the instruction -- how wide the
+ * store was, and which register held the value -- and those sit in fixed bit
+ * positions across every AArch64 store addressing mode, so the addressing mode
+ * itself never has to be decoded.
+ *
+ * A store this cannot decode is reported and passed to the previous handler
+ * rather than skipped: continuing past a store whose value is unknown would
+ * corrupt state quietly, and a fault that is not ours belongs to whoever
+ * installed before us.
+ */
+#if !defined(_WIN32) && defined(__aarch64__)
+
+#include <signal.h>
+#include <ucontext.h>
+
+static struct sigaction g_mcpx_old_segv;
+static struct sigaction g_mcpx_old_bus;
+static uintptr_t g_mcpx_guard_page[8];
+
+/* NV2A display-engine interrupt, trapped for WRITE-1-TO-CLEAR.
+ *
+ * NV_PMC_INTR_0 is a read-only SUMMARY: bit 24 stays asserted while the display
+ * engine has an interrupt pending, and clears only when the driver
+ * acknowledges at the SOURCE, NV_PCRTC_INTR_0. JSRF's vblank handler depends
+ * on precisely that and spins on it:
+ *
+ *     mov  [nv2a+0x600100], ecx     ; ecx = 1  -- acknowledge
+ *     test [nv2a+0x100], 0x1000000  ; re-read the summary
+ *     jne  back                     ; spin until it clears
+ *     call KeSetEvent(...)          ; only then signal the vblank event
+ *
+ * The acknowledge WRITES 1 to clear (matching pcrtc_write in the in-tree NV2A
+ * model). Guest memory is ordinary RAM here, so that store leaves the bit set,
+ * the summary never clears, and the handler spins forever -- the event is never
+ * signalled and the frame loop never runs.
+ * Polling cannot fix it: "the guest acked" and "the runtime raised" both store
+ * a 1, so the write itself has to be observed. Hence the trap.
+ */
+#define XBOX_NV2A_PCRTC_INTR_0   (XBOX_NV2A_BASE + 0x600100u)
+#define XBOX_NV2A_PMC_INTR_0     (XBOX_NV2A_BASE + 0x000100u)
+#define XBOX_NV2A_PMC_INTR_PCRTC 0x01000000u
+
+static uintptr_t g_nv2a_guard_page;
+static int       g_nv2a_guarded;
+static size_t g_mcpx_guard_pages = 0;
+static size_t g_mcpx_page_size = 0;
+
+static int g_mcpx_apu_guarded = 0;
+
+/*
+ * Serialises the unprotect/write/reprotect dance between the trap handler and
+ * the ack thread. Both flip the same pages, and without this they interleave:
+ * one reprotects while the other is mid-write, and the write faults with the
+ * handler already inside itself. That crashed the ack thread about one run in
+ * four.
+ *
+ * A spin on __atomic rather than a mutex because one side is a signal handler,
+ * where taking a pthread mutex is not allowed. Deadlock is avoided by the
+ * discipline that neither side touches guarded memory while holding it: the
+ * ack thread has already unprotected, so its write cannot fault and re-enter.
+ */
+static volatile int g_mcpx_lock = 0;
+
+static void mcpx_lock(void)
+{
+    while (__atomic_test_and_set(&g_mcpx_lock, __ATOMIC_ACQUIRE)) {
+        /* spin: the holder only ever does two mprotects and one store */
+    }
+}
+
+static void mcpx_unlock(void)
+{
+    __atomic_clear(&g_mcpx_lock, __ATOMIC_RELEASE);
+}
+
+static int mcpx_guarded_page(uintptr_t host_addr, uintptr_t *page_out)
+{
+    uintptr_t page = host_addr & ~(uintptr_t)(g_mcpx_page_size - 1);
+    if (g_nv2a_guarded && page == g_nv2a_guard_page) {
+        if (page_out) *page_out = page;
+        return 1;
+    }
+    if (g_mcpx_apu_guarded && g_mcpx_regs) {
+        uintptr_t apu = (uintptr_t)g_mcpx_regs + MCPX_APU_MMIO_OFFSET;
+        if (host_addr >= apu && host_addr < apu + MCPX_APU_MMIO_SIZE) {
+            if (page_out) *page_out = page;
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < g_mcpx_guard_pages; i++) {
+        if (g_mcpx_guard_page[i] == page) {
+            if (page_out) *page_out = page;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Value the store would have written, after removing bits the hardware clears
+ * before software can observe them. Applied per byte so a wide store covering
+ * a control byte is handled the same as a byte store to it. */
+static uint64_t mcpx_apply_write_clear(uint32_t guest_va, uint64_t value,
+                                       unsigned width)
+{
+    for (unsigned b = 0; b < width; b++) {
+        uint32_t off = (guest_va - XBOX_MCPX_BASE) + b;
+        for (size_t i = 0; i < sizeof(MCPX_WRITE_CLEAR) / sizeof(MCPX_WRITE_CLEAR[0]); i++) {
+            if (MCPX_WRITE_CLEAR[i].offset == off) {
+                value &= ~((uint64_t)MCPX_WRITE_CLEAR[i].write_clear << (8 * b));
+            }
+        }
+    }
+    return value;
+}
+
+static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
+{
+    ucontext_t *uc = (ucontext_t *)context;
+    uintptr_t fault = si ? (uintptr_t)si->si_addr : 0;
+    uintptr_t page = 0;
+    uint32_t insn, rt;
+    unsigned width;
+    uint64_t value;
+    uint32_t guest_va;
+    DWORD old_prot;
+
+    if (!uc || !mcpx_guarded_page(fault, &page)) {
+        goto chain;
+    }
+
+    insn = *(const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+
+    /* Load/store, non-SIMD, opc == 00 (store). Bits 29:27 = 111 select the
+     * load/store group, bit 26 is the SIMD/FP flag, bit 25 separates the
+     * unsigned-offset form from the unscaled/register-offset/indexed forms,
+     * and bits 23:22 are the opcode. Everything the mask leaves out is the
+     * addressing mode, which si_addr has already resolved for us. */
+    if ((insn & 0x3EC00000u) != 0x38000000u) {
+        fprintf(stderr,
+                "  [MCPX] write trap: undecoded store 0x%08X at pc=0x%llX "
+                "(guest 0x%08X) - passing to previous handler\n",
+                insn, (unsigned long long)uc->uc_mcontext->__ss.__pc,
+                (uint32_t)((uintptr_t)fault - g_memory_offset));
+        fflush(stderr);
+        goto chain;
+    }
+
+    width = 1u << (insn >> 30);          /* size field: B, H, W, X */
+    rt = insn & 0x1Fu;                   /* source register */
+    if (rt < 29) {
+        value = uc->uc_mcontext->__ss.__x[rt];
+    } else if (rt == 29) {
+        value = uc->uc_mcontext->__ss.__fp;
+    } else if (rt == 30) {
+        value = uc->uc_mcontext->__ss.__lr;
+    } else {
+        value = 0;                       /* wzr / xzr, never SP for a store */
+    }
+
+    guest_va = (uint32_t)((uintptr_t)fault - g_memory_offset);
+    {
+        uint32_t off = guest_va - XBOX_MCPX_BASE;
+        if (g_mcpx_apu_write && off < MCPX_APU_MMIO_OFFSET + MCPX_APU_MMIO_SIZE) {
+            static unsigned long n = 0;
+            g_mcpx_apu_write(off, (uint32_t)value, width);
+            if (++n <= 8 || (n % 1000) == 0) {
+                fprintf(stderr, "  [APU-MMIO] write #%lu +0x%06X = 0x%08X (%u)\n",
+                        n, off, (uint32_t)value, width);
+                fflush(stderr);
+            }
+        }
+    }
+    /* NV_PCRTC_INTR_0 is write-1-to-clear. xbox_Nv2aRaiseVblank bypasses the
+     * guard, so every trapped write here is a guest acknowledge rather than a
+     * runtime assertion. Apply the same `pending &= ~value` operation as the
+     * in-tree NV2A model before performing the intercepted store. */
+    if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && width == 4) {
+        value = *(volatile uint32_t *)fault & ~(uint32_t)value;
+    } else {
+        value = mcpx_apply_write_clear(guest_va, value, width);
+    }
+
+    /* Perform the store the faulting instruction was going to perform, then
+     * re-arm the guard. */
+    mcpx_lock();
+    if (!VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
+        mcpx_unlock();
+        goto chain;
+    }
+    switch (width) {
+    case 1: *(volatile uint8_t  *)fault = (uint8_t)value;  break;
+    case 2: *(volatile uint16_t *)fault = (uint16_t)value; break;
+    case 4: *(volatile uint32_t *)fault = (uint32_t)value; break;
+    default: *(volatile uint64_t *)fault = value;          break;
+    }
+    if (guest_va == XBOX_NV2A_PCRTC_INTR_0) {
+        /* The summary follows its source. Different page, not guarded, so this
+         * is an ordinary store. */
+        if ((value & 0x1u) == 0) {
+            *(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset)
+                &= ~XBOX_NV2A_PMC_INTR_PCRTC;
+        }
+    } else {
+        xbox_McpxApplyReady();   /* the ack thread cannot reach a guarded page */
+    }
+    VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
+    mcpx_unlock();
+
+    uc->uc_mcontext->__ss.__pc += 4;   /* every AArch64 instruction is 4 bytes */
+    return;
+
+chain:
+    {
+        struct sigaction *old = (sig == SIGBUS) ? &g_mcpx_old_bus : &g_mcpx_old_segv;
+        if (old->sa_flags & SA_SIGINFO) {
+            if (old->sa_sigaction) {
+                old->sa_sigaction(sig, si, context);
+                return;
+            }
+        } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+            old->sa_handler(sig);
+            return;
+        }
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+static void xbox_McpxTrapInstall(void)
+{
+    struct sigaction sa;
+
+    if (!g_mcpx_regs) {
+        return;
+    }
+    g_mcpx_page_size = (size_t)sysconf(_SC_PAGESIZE);
+    if (g_mcpx_page_size == 0) {
+        return;
+    }
+
+    /* Only the pages that actually hold a register with semantics. */
+    for (size_t i = 0; i < sizeof(MCPX_WRITE_CLEAR) / sizeof(MCPX_WRITE_CLEAR[0]); i++) {
+        uintptr_t addr = (uintptr_t)g_mcpx_regs + MCPX_WRITE_CLEAR[i].offset;
+        uintptr_t page = addr & ~(uintptr_t)(g_mcpx_page_size - 1);
+        int seen = 0;
+        for (size_t j = 0; j < g_mcpx_guard_pages; j++) {
+            if (g_mcpx_guard_page[j] == page) { seen = 1; break; }
+        }
+        if (!seen && g_mcpx_guard_pages < 8) {
+            g_mcpx_guard_page[g_mcpx_guard_pages++] = page;
+        }
+    }
+    if (g_mcpx_guard_pages == 0 && !g_mcpx_apu_write) {
+        return;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = mcpx_trap_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &g_mcpx_old_segv) != 0 ||
+        sigaction(SIGBUS, &sa, &g_mcpx_old_bus) != 0) {
+        fprintf(stderr, "  WARNING: MCPX write trap: sigaction failed\n");
+        return;
+    }
+
+    for (size_t i = 0; i < g_mcpx_guard_pages; i++) {
+        DWORD old_prot;
+        if (!VirtualProtect((LPVOID)g_mcpx_guard_page[i], g_mcpx_page_size,
+                            PAGE_READONLY, &old_prot)) {
+            fprintf(stderr, "  WARNING: MCPX write trap: mprotect failed at %p\n",
+                    (void *)g_mcpx_guard_page[i]);
+            return;
+        }
+    }
+
+    /* The NV2A PCRTC interrupt register, for write-1-to-clear. Guarded after
+     * the handler is installed, for the same reason as the APU aperture. */
+    {
+        uintptr_t addr = (uintptr_t)(XBOX_NV2A_PCRTC_INTR_0 + g_memory_offset);
+        uintptr_t page = addr & ~(uintptr_t)(g_mcpx_page_size - 1);
+        DWORD old_prot;
+        if (VirtualProtect((LPVOID)page, g_mcpx_page_size,
+                           PAGE_READONLY, &old_prot)) {
+            g_nv2a_guard_page = page;
+            g_nv2a_guarded = 1;
+        } else {
+            fprintf(stderr, "  WARNING: NV2A write trap: mprotect failed on "
+                    "PCRTC; the vblank acknowledge will not be observed\n");
+        }
+    }
+
+    /* The APU aperture, as one range rather than a page list. Protected only
+     * after the handler is installed: between the mprotect and the sigaction
+     * there is no handler, and a write landing in that window would be fatal. */
+    if (g_mcpx_apu_write) {
+        uintptr_t apu = (uintptr_t)g_mcpx_regs + MCPX_APU_MMIO_OFFSET;
+        DWORD old_prot;
+        if (VirtualProtect((LPVOID)apu, MCPX_APU_MMIO_SIZE,
+                           PAGE_READONLY, &old_prot)) {
+            g_mcpx_apu_guarded = 1;
+        } else {
+            fprintf(stderr, "  WARNING: MCPX write trap: mprotect failed on the "
+                    "APU aperture; its registers will not reach the model\n");
+        }
+    }
+
+    g_mcpx_trap_active = 1;
+    fprintf(stderr, "  MCPX write trap: %zu page(s) guarded, %zu register(s) "
+            "with write-clear semantics; APU aperture %s\n",
+            g_mcpx_guard_pages,
+            sizeof(MCPX_WRITE_CLEAR) / sizeof(MCPX_WRITE_CLEAR[0]),
+            g_mcpx_apu_guarded ? "routed to the model" : "NOT routed");
+}
+
+
+/* Assert the display-engine vblank: raise the PCRTC source and the PMC summary.
+ *
+ * This must NOT be an ordinary store. The PCRTC page is write-protected for
+ * write-1-to-clear, so a plain `reg |= 1` from runtime code faults into
+ * mcpx_trap_handler and is indistinguishable from the guest acknowledging --
+ * it clears the very bit it was setting. Measured: every ack logged
+ * "pending=0x00000000", because the raise had already been eaten.
+ *
+ * So drop the guard for the store, exactly as the trap handler does, under the
+ * same lock. */
+void xbox_Nv2aRaiseVblank(void)
+{
+    volatile uint32_t *pcrtc =
+        (volatile uint32_t *)(uintptr_t)(XBOX_NV2A_PCRTC_INTR_0 + g_memory_offset);
+    volatile uint32_t *pmc =
+        (volatile uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset);
+
+    if (!g_nv2a_guarded) {
+        *pcrtc |= 0x1u;
+        *pmc   |= XBOX_NV2A_PMC_INTR_PCRTC;
+        return;
+    }
+    {
+        DWORD old_prot;
+        mcpx_lock();
+        if (VirtualProtect((LPVOID)g_nv2a_guard_page, g_mcpx_page_size,
+                           PAGE_READWRITE, &old_prot)) {
+            *pcrtc |= 0x1u;
+            VirtualProtect((LPVOID)g_nv2a_guard_page, g_mcpx_page_size,
+                           PAGE_READONLY, &old_prot);
+        }
+        mcpx_unlock();
+        *pmc |= XBOX_NV2A_PMC_INTR_PCRTC;   /* different page, not guarded */
+    }
+}
+
+/* Is a vblank still pending, i.e. has the guest not acknowledged the last one?
+ * Reads are permitted on the guarded page. */
+int xbox_Nv2aVblankPending(void)
+{
+    if (!g_memory_offset) return 0;
+    return (*(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_PCRTC_INTR_0 + g_memory_offset)
+            & 0x1u) != 0;
+}
+
+#else  /* Windows, or a host this decoder does not cover */
+
+/* No write trap on this host, so there is no guard to drop and no way to
+ * observe the guest's write-1-to-clear acknowledge either. The raise is a
+ * plain store; the acknowledge will not be seen, which is the same limitation
+ * this file already documents for the MCPX registers. */
+void xbox_Nv2aRaiseVblank(void)
+{
+    if (!g_memory_offset) return;
+    *(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + 0x600100u + g_memory_offset) |= 0x1u;
+    *(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + 0x000100u + g_memory_offset) |= 0x01000000u;
+}
+
+int xbox_Nv2aVblankPending(void)
+{
+    if (!g_memory_offset) return 0;
+    return (*(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + 0x600100u + g_memory_offset)
+            & 0x1u) != 0;
+}
+
+
+static void xbox_McpxTrapInstall(void)
+{
+    /* Windows routes device registers through the VEH hooks instead; other
+     * hosts get the ack thread only, which cannot model write suppression. */
+}
+
+#endif
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
@@ -211,7 +795,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
-                *c += 1;
+                if (g_mcpx_apu_guarded) {
+                    uintptr_t pg = (uintptr_t)c
+                                   & ~(uintptr_t)(g_mcpx_page_size - 1);
+                    DWORD op;
+                    mcpx_lock();
+                    if (VirtualProtect((LPVOID)pg, g_mcpx_page_size,
+                                       PAGE_READWRITE, &op)) {
+                        *c += 1;
+                        VirtualProtect((LPVOID)pg, g_mcpx_page_size,
+                                       PAGE_READONLY, &op);
+                    }
+                    mcpx_unlock();
+                } else {
+                    *c += 1;
+                }
+            }
+            /* Guarded pages cannot be written from here; the trap re-applies
+             * MCPX_READY after each intercepted write instead. */
+            if (!g_mcpx_trap_active) {
+                xbox_McpxApplyReady();
             }
         }
 
@@ -250,6 +853,7 @@ ptrdiff_t g_xbox_mem_offset = 0;
 /* Global registers for recompiled code (via recomp_types.h) */
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+RECOMP_TLS uint32_t g_fs_base = XBOX_PRIMARY_TIB_VA;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
@@ -262,6 +866,9 @@ RECOMP_TLS int g_fp_cmp = 0;
 
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+
+/* MMX register file. See recomp_types.h for why these exist. */
+RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3, g_mm4, g_mm5, g_mm6, g_mm7;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
@@ -317,6 +924,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         return FALSE;
     }
 
+#if defined(__APPLE__)
+    /* macOS has no safe MAP_FIXED_NOREPLACE equivalent for replacing a
+     * reservation with a file-backed view. Reserve the whole 29-view span at
+     * an OS-selected address first; subsequent MAP_FIXED calls may then only
+     * replace pages that this runtime already owns. */
+    g_host_reservation_size =
+        g_memory_size * (size_t)(XBOX_NUM_MIRRORS + 1);
+    g_host_reservation = mmap(NULL, g_host_reservation_size, PROT_NONE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_host_reservation == MAP_FAILED) {
+        g_host_reservation = NULL;
+        g_host_reservation_size = 0;
+        fprintf(stderr, "xbox_MemoryLayoutInit: host reservation failed\n");
+        CloseHandle(g_mapping_handle);
+        g_mapping_handle = NULL;
+        return FALSE;
+    }
+    fprintf(stderr, "Xbox host reservation:\n");
+    fprintf(stderr, "base = %p\n", g_host_reservation);
+    fprintf(stderr, "size = %zu\n", g_host_reservation_size);
+#endif
+
     /*
      * Map the base view at the desired virtual address.
      * Try the original Xbox base address first. If that fails (common on
@@ -324,6 +953,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * addresses upward until we find a free region.
      */
     {
+#if defined(__APPLE__)
+        uintptr_t target = (uintptr_t)g_host_reservation;
+        if (!host_reservation_contains(target, g_memory_size)) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: base RAM target outside host reservation\n");
+        } else {
+            g_memory_base = MapViewOfFileEx(
+                g_mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0,
+                g_memory_size, (LPVOID)target);
+            if (g_memory_base != (void *)target) {
+                fprintf(stderr, "xbox_MemoryLayoutInit: base RAM mapping failed inside reservation\n");
+                g_memory_base = NULL;
+            }
+        }
+#else
         static const uintptr_t try_bases[] = {
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
@@ -333,7 +976,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
+        /* macOS portability: iterate ALL entries including the trailing 0 (NULL)
+         * sentinel. On macOS the low fixed addresses (0x10000..0x10000000) are
+         * reserved and MAP_FIXED fails for every one of them, so the run only
+         * succeeds via the final NULL hint (OS chooses a high address). The old
+         * condition `try_bases[i] != 0 || i == 0` stopped at the sentinel without
+         * trying it, which masked fine on Linux (low VA is mappable there). */
+        for (size_t i = 0; i < sizeof(try_bases) / sizeof(try_bases[0]); i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
@@ -352,11 +1001,19 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 break;
             }
         }
+#endif
     }
 
     if (!g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
                 g_memory_size / 1024);
+#if defined(__APPLE__)
+        if (g_host_reservation) {
+            munmap(g_host_reservation, g_host_reservation_size);
+            g_host_reservation = NULL;
+            g_host_reservation_size = 0;
+        }
+#endif
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
         return FALSE;
@@ -371,6 +1028,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "xbox_MemoryLayoutInit: mapped %zu KB at 0x%p (offset %+td from Xbox base)\n",
                 g_memory_size / 1024, g_memory_base, g_memory_offset);
     }
+#if defined(__APPLE__)
+    fprintf(stderr, "guest 0x00000000 -> host %p\n", g_memory_base);
+#endif
 
     /*
      * Helper macro: convert Xbox VA to actual mapped address.
@@ -580,18 +1240,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * to its data area. We allocate a fake structure at 0x00760000
          * (in the BSS area) and a data buffer at 0x00700000.
          */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
-
-        MEM32_INIT(0x28, FAKE_TLS_VA);
+        MEM32_INIT(0x28, XBOX_PRIMARY_TLS_CONTEXT_VA);
         /* TLS[0x28] = pointer to RW data area */
-        MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
+        MEM32_INIT(XBOX_PRIMARY_TLS_CONTEXT_VA + 0x28,
+                   XBOX_PRIMARY_TLS_DATA_VA);
 
         fprintf(stderr, "  TIB: fake TIB at VA 0x0, TLS at 0x%08X, RW data at 0x%08X\n",
-                FAKE_TLS_VA, FAKE_RWDATA_VA);
+                XBOX_PRIMARY_TLS_CONTEXT_VA, XBOX_PRIMARY_TLS_DATA_VA);
 
-        #undef FAKE_TLS_VA
-        #undef FAKE_RWDATA_VA
         #undef MEM32_INIT
         #undef XBOX_VA
     }
@@ -701,9 +1357,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
+            xbox_McpxApplyReady();
+            xbox_McpxTrapInstall();
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
-                    "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
-                    XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
+                    "0x%08X (APU/AC97/USB/NIC, zeroed; %zu status bit(s) held "
+                    "ready)\n",
+                    XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE,
+                    sizeof(MCPX_READY) / sizeof(MCPX_READY[0]));
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
@@ -775,6 +1435,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
+#if defined(__APPLE__)
+            if (!host_reservation_contains(mirror_base, g_memory_size)) {
+                fprintf(stderr,
+                        "  Mirror %d: target %p outside host reservation\n",
+                        m + 1, (void *)mirror_base);
+                continue;
+            }
+#endif
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -856,6 +1524,13 @@ void xbox_MemoryLayoutShutdown(void)
         g_memory_base = NULL;
         g_memory_size = 0;
     }
+#if defined(__APPLE__)
+    if (g_host_reservation) {
+        munmap(g_host_reservation, g_host_reservation_size);
+        g_host_reservation = NULL;
+        g_host_reservation_size = 0;
+    }
+#endif
     /* Close file mapping handle */
     if (g_mapping_handle) {
         CloseHandle(g_mapping_handle);
@@ -878,6 +1553,33 @@ void *xbox_GetMemoryBase(void)
 ptrdiff_t xbox_GetMemoryOffset(void)
 {
     return g_memory_offset;
+}
+
+BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address)
+{
+    uintptr_t base;
+
+    if (!guest_address) return FALSE;
+
+#define MAP_HOST_RANGE(ptr, size, guest_base) do {                         \
+    base = (uintptr_t)(ptr);                                                \
+    if (base && host_address >= base && host_address - base < (size_t)(size)) { \
+        *guest_address = (uint32_t)((guest_base) + (host_address - base));   \
+        return TRUE;                                                        \
+    }                                                                       \
+} while (0)
+
+    MAP_HOST_RANGE(g_memory_base, g_memory_size, 0u);
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        MAP_HOST_RANGE(g_mirror_views[m], g_memory_size,
+                       (uint32_t)((m + 1) * g_memory_size));
+    }
+    MAP_HOST_RANGE(g_contig_memory, XBOX_CONTIG_SIZE, XBOX_CONTIG_BASE);
+    MAP_HOST_RANGE(g_nv2a_memory, XBOX_NV2A_SIZE, XBOX_NV2A_BASE);
+    MAP_HOST_RANGE(g_mcpx_memory, XBOX_MCPX_SIZE, XBOX_MCPX_BASE);
+
+#undef MAP_HOST_RANGE
+    return FALSE;
 }
 
 /* ── Dynamic heap allocator ────────────────────────────────
@@ -908,7 +1610,6 @@ static int g_heap_block_count = 0;
  * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
  * stack through MEM32() like any other Xbox pointer.
  */
-#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
 #define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
@@ -926,6 +1627,35 @@ uint32_t xbox_AllocThreadStack(void)
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
+}
+
+void xbox_SetupCurrentThreadTib(uint32_t tib_va, uint32_t tls_context_va,
+                               uint32_t tls_data_va, uint32_t tls_data_size,
+                               uint32_t stack_top, uint32_t stack_limit)
+{
+    uint8_t *tib = (uint8_t *)((uintptr_t)tib_va + g_memory_offset);
+    uint8_t *tls_context =
+        (uint8_t *)((uintptr_t)tls_context_va + g_memory_offset);
+
+    /* The Xbox executable's thread-start wrapper initializes the TLS payload
+     * itself. The kernel supplies the per-thread TIB fields and a pointer to
+     * that payload. In this ABI fs:[4] is the end of the TLS allocation: a
+     * negative XBE TLS index walks back to its leading pointer slot. */
+    memset(tib, 0, 0x30);
+    memset(tls_context, 0, 0x2C);
+    *(uint32_t *)(tib + 0x00) = 0xFFFFFFFFu;
+    *(uint32_t *)(tib + 0x04) = tls_data_va + tls_data_size;
+    *(uint32_t *)(tib + 0x08) = stack_limit;
+    *(uint32_t *)(tib + 0x18) = tib_va;
+    *(uint32_t *)(tib + 0x20) = 0;
+    *(uint32_t *)(tib + 0x28) = tls_context_va;
+    *(uint32_t *)(tls_context + 0x28) = tls_data_va;
+    g_fs_base = tib_va;
+
+    fprintf(stderr,
+            "  TIB: thread FS=0x%08X TLS=0x%08X..0x%08X stack=0x%08X..0x%08X\n",
+            tib_va, tls_data_va, tls_data_va + tls_data_size,
+            stack_limit, stack_top);
 }
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)

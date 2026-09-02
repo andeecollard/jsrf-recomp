@@ -34,6 +34,10 @@ extern "C" {
 #endif
 
 #define CREATE_SUSPENDED         0x00000004u
+
+/* Cooperative suspend safe point: parks the calling thread while its suspend
+ * count is non-zero. Called from the kernel thunk dispatch. */
+void w32_thread_suspend_point(void);
 #define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000u
 
 #define THREAD_PRIORITY_IDLE          (-15)
@@ -79,6 +83,10 @@ typedef VOID  (WINAPI *PTP_SIMPLE_CALLBACK)(PTP_CALLBACK_INSTANCE Instance, PVOI
 /* ---- Last-error -------------------------------------------------------- */
 DWORD GetLastError(void);
 VOID  SetLastError(DWORD dwErrCode);
+
+/* ---- Debug (macOS portability: from <windows.h> on Windows) ------------ */
+void  DebugBreak(void);
+BOOL  IsDebuggerPresent(void);
 
 /* ---- Interlocked atomics ---------------------------------------------- */
 LONG InterlockedIncrement(volatile LONG *Addend);
@@ -367,6 +375,8 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
 #define ERROR_COMMITMENT_LIMIT        1455u
 #define ERROR_DEVICE_NOT_CONNECTED    1167u
+/* macOS portability: present in <windows.h> on Windows; add for POSIX. */
+#define ERROR_NOT_OWNER               0x421u   /* 1057 */
 
 /* ---- COM HRESULT codes ------------------------------------------------ */
 #ifndef S_OK

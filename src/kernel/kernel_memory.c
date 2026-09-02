@@ -10,7 +10,12 @@
  */
 
 #include "kernel.h"
+#if defined(__linux__)
 #include <malloc.h>
+#else
+/* macOS portability: no <malloc.h>; stdlib provides malloc/free/aligned_alloc. */
+#include <stdlib.h>
+#endif
 
 /* ============================================================================
  * Helper: Xbox protect flags → Win32 protect flags

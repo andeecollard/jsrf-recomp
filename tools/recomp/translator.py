@@ -15,6 +15,7 @@ import bisect
 import json
 import glob
 import os
+import re
 import struct
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
@@ -88,18 +89,103 @@ def _fixup_icall_esp_save(lines):
 
         insert_before.add(first_push_idx)
 
+    # Sites where the CALLER cleans the arguments (__cdecl).
+    #
+    # RECOMP_ICALL_SAFE rewinds g_esp to the pre-argument value when the target
+    # does not resolve, which is exactly right for a callee-clean convention:
+    # stdcall/thiscall pop their own arguments, so a call that never happened
+    # leaves esp where a call that did would have.
+    #
+    # At a caller-clean site that rewind is one cleanup too many. The guest's
+    # own "add esp, N" follows the call and runs whether or not the lookup
+    # succeeded, so esp ends N bytes HIGH and every subsequent pop in the
+    # function reads one slot off. That is silent: the registers restored by the
+    # epilogue are garbage, and the corruption surfaces in the caller.
+    #
+    # Measured in JSRF: D3D's vblank handler (sub_00193D90) invokes a registered
+    # callback through [ctx+0x1C4] as cdecl. The callback (0x0015F9D0) was not a
+    # detected function, so the lookup failed, esp came back +4, and the
+    # handler's "pop ebx" read the wrong slot and returned ebx = 0. Its caller,
+    # the vblank DPC (sub_00194480), then did "mov eax,[ebx+0xB0]" to reload
+    # NV_PMC_INTR_EN_0 from the device context and reloaded it from address
+    # 0xB0 instead -- so the GPU interrupt was never re-enabled, the ISR bailed
+    # on every later vblank, and the frame loop stopped after one frame.
+    #
+    # Passing "saved_esp - N" gives the failure path the esp a SUCCESSFUL cdecl
+    # call would have left: return address gone, arguments still on the stack
+    # for the guest's own cleanup to remove. 77 of JSRF's 5293 indirect call
+    # sites are caller-clean; the rest keep the callee-clean behaviour.
+    caller_cleans = {}
+    for icall_idx in icall_indices:
+        n = _caller_cleanup_bytes(lines, icall_idx)
+        if n:
+            caller_cleans[icall_idx] = n
+
     # Build result with saves inserted
     for i, line in enumerate(lines):
         if i in insert_before:
             # Determine indentation from the current line
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
+        if i in caller_cleans:
+            line = line.replace(", _icall_esp)",
+                                f", _icall_esp - {caller_cleans[i]})")
         result.append(line)
         if 'RECOMP_ICALL_SAFE(' in line:
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
     return result
+
+
+# "add esp, N" as the lifter emits it, decimal or hex.
+_ESP_CLEANUP_RE = re.compile(r'^\s*esp = esp \+ (0x[0-9A-Fa-f]+|\d+);\s*$')
+
+
+def _caller_cleanup_bytes(lines, icall_idx):
+    """Bytes the caller pops after the indirect call at ``icall_idx``.
+
+    Returns 0 when the site is callee-clean (the common stdcall/thiscall case)
+    or when the answer is not unambiguous. Only the guest's own "add esp, N"
+    immediately following the call counts, reached across the return-address
+    label and any straight-line computation MSVC scheduled between the two --
+    "call eax; mov dl,[esp+0x17]; add esp,4" is the shape that motivated this.
+    Any control flow, stack push/pop, or other esp assignment ends the scan,
+    because past one the following cleanup is no longer certainly this call's.
+    """
+    seen_label = False
+    steps = 0
+    for j in range(icall_idx + 1, len(lines)):
+        if steps > 8:
+            return 0
+        stripped = lines[j].strip()
+        if not stripped or stripped == '}':
+            continue
+        if re.match(r'^loc_[0-9A-Fa-f]+: ;?$', stripped):
+            # The return-address label. A second label means another basic
+            # block reaches the cleanup, so it is not this call's alone.
+            if seen_label:
+                return 0
+            seen_label = True
+            continue
+        m = _ESP_CLEANUP_RE.match(lines[j])
+        if m:
+            n = int(m.group(1), 0)
+            # Plausible argument cleanup only: a multiple of the stack slot
+            # size, and small enough to be an argument list rather than a
+            # local frame teardown.
+            if n and n % 4 == 0 and n <= 64:
+                return n
+            return 0
+        if ('goto ' in stripped or 'return;' in stripped
+                or 'RECOMP_ICALL' in stripped or 'RECOMP_ITAIL' in stripped
+                or stripped.startswith('if (')
+                or stripped.startswith('PUSH32(')
+                or stripped.startswith('POP32(')
+                or re.match(r'^\s*esp (=|\+=|-=)', lines[j])):
+            return 0
+        steps += 1
+    return 0
 
 
 # The x87 stack accessors the lifter's output is written against. Module-level
@@ -281,7 +367,7 @@ class FunctionTranslator:
         return bool(func_info.get("has_prologue") or func_info.get("called_by"))
 
     def discover_cfg_ownership(self):
-        """Reassign weak seeds reached through a split computed-jump CFG."""
+        """Recover computed-jump CFGs that discovery split or truncated."""
         if self._ownership_ready:
             return
         self._ownership_ready = True
@@ -305,9 +391,9 @@ class FunctionTranslator:
                     continue
 
                 weak_index = bisect.bisect_left(weak_starts, original_end)
-                if (weak_index >= len(weak_starts)
-                        or weak_starts[weak_index] >= upper):
-                    continue
+                weak_in_range = [
+                    addr for addr in weak_starts[weak_index:] if addr < upper
+                ]
 
                 raw_prefix = self._read_func_bytes(start, original_end)
                 if not raw_prefix:
@@ -322,30 +408,65 @@ class FunctionTranslator:
                 }
                 has_indexed_jump = any(
                     insn.is_jump and insn.jump_target is None
-                    and insn.operands and insn.operands[0].type == "mem"
-                    and insn.operands[0].mem_index
+                        and insn.operands and insn.operands[0].type == "mem"
+                        and insn.operands[0].mem_index
                     for insn in prefix)
-                if not bridges or not has_indexed_jump:
+                if not has_indexed_jump:
+                    continue
+
+                # The ordinary function-end walk cannot follow an indirect
+                # jump.  If a local indexed table reached by the prefix points
+                # beyond the recorded end, that is direct evidence that the
+                # function was truncated even when no later block was guessed
+                # as a weak function entry.  Optimized CRT memcpy/memmove
+                # routines have exactly this shape: their only bridge to the
+                # out-of-line copy/epilogue blocks is the table itself.
+                escaping_table_targets = set()
+                for insn in prefix:
+                    if (not insn.is_jump or insn.jump_target is not None
+                            or not insn.operands
+                            or insn.operands[0].type != "mem"):
+                        continue
+                    operand = insn.operands[0]
+                    if not operand.mem_index or operand.mem_base:
+                        continue
+                    table_va = operand.mem_disp
+                    if not (start <= table_va < upper):
+                        continue
+                    escaping_table_targets.update(
+                        target for target in self._read_local_jump_table(
+                            table_va, start, upper)
+                        if original_end <= target < upper)
+
+                split_weak_cfg = bool(bridges and weak_in_range)
+                truncated_table_cfg = bool(escaping_table_targets)
+                if not split_weak_cfg and not truncated_table_cfg:
                     continue
 
                 stop_addresses = {
                     addr for addr in self.func_db if start < addr < upper
                 }
                 recovered = self._recover_cfg(
-                    start, upper, bridges, stop_addresses)
+                    start, upper, bridges | escaping_table_targets,
+                    stop_addresses)
                 if recovered is None:
                     continue
                 instructions, jump_tables, cfg_targets = recovered
                 owned = {
-                    addr for addr in weak_starts[weak_index:]
-                    if addr < upper and addr in cfg_targets
+                    addr for addr in weak_in_range if addr in cfg_targets
                 }
-                if not owned:
+                recovered_end = max(insn.end_address for insn in instructions)
+                recovered_epilogue = any(
+                    insn.is_ret and insn.address >= original_end
+                    for insn in instructions)
+                if (not owned and not (truncated_table_cfg
+                                       and recovered_end > original_end
+                                       and recovered_epilogue)):
                     continue
 
                 self.owned_function_starts.update(owned)
                 self._recovered_cfg[start] = {
-                    "end": max(insn.end_address for insn in instructions),
+                    "end": recovered_end,
                     "instructions": instructions,
                     "jump_tables": jump_tables,
                 }
@@ -395,26 +516,57 @@ class FunctionTranslator:
 
     def _read_local_jump_table(self, table_va, lower, upper,
                                max_entries=256):
-        """Read the contiguous pointer cluster around an indexed-jump base."""
-        def scan(step, first):
-            targets = []
-            for index in range(first, max_entries + first):
-                entry_va = table_va + step * index * 4
-                offset = va_to_file_offset(entry_va)
-                if offset is None or offset + 4 > len(self.xbe_data):
-                    break
-                target = struct.unpack_from('<I', self.xbe_data, offset)[0]
-                if not (lower <= target < upper):
-                    break
-                targets.append(target)
-            return targets
+        """Read a local indexed-jump table, including a biased origin.
 
-        backward = scan(-1, 1)
-        forward = scan(1, 0)
-        if len(backward) + len(forward) < 2:
+        The displacement in ``jmp [index*4 + disp]`` is an addressing origin,
+        not necessarily the first physical entry.  MSVC commonly proves that
+        index zero is impossible and stores entries at indices 1..N, or negates
+        the index and stores them at -N..0.  Requiring a valid pointer exactly
+        at ``disp`` therefore misses otherwise ordinary dispatch tables.
+        """
+        cache = {}
+
+        def slot(index):
+            if index < -max_entries or index > max_entries:
+                return None
+            if index in cache:
+                return cache[index]
+            entry_va = table_va + index * 4
+            offset = va_to_file_offset(entry_va)
+            target = None
+            if offset is not None and offset + 4 <= len(self.xbe_data):
+                value = struct.unpack_from('<I', self.xbe_data, offset)[0]
+                if lower <= value < upper:
+                    target = value
+            cache[index] = target
+            return target
+
+        # Prefer an ordinary zero-based table and do not grow it backwards:
+        # an unrelated pointer cluster immediately before it is not part of
+        # the dispatch.
+        high = -1
+        while high + 1 < max_entries and slot(high + 1) is not None:
+            high += 1
+        if high >= 1:
+            return [slot(index) for index in range(high + 1)]
+
+        # A zero-based run shorter than two entries is too weak.  Try the two
+        # biased forms, each of which must touch the addressing origin.
+        if slot(0) is not None:
+            low = high = 0
+        elif slot(1) is not None:
+            low = high = 1
+        elif slot(-1) is not None:
+            low = high = -1
+        else:
             return []
-        backward.reverse()
-        return backward + forward
+
+        while high + 1 <= max_entries and slot(high + 1) is not None:
+            high += 1
+        while low - 1 >= -max_entries and slot(low - 1) is not None:
+            low -= 1
+        targets = [slot(index) for index in range(low, high + 1)]
+        return targets if len(targets) >= 2 else []
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
@@ -660,7 +812,9 @@ class FunctionTranslator:
             insn.is_cond_jump or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
             for insn in instructions)
-        if has_conditionals:
+        has_xadd = any(insn.mnemonic in ("xadd", "lock xadd")
+                       for insn in instructions)
+        if has_conditionals or has_xadd:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,

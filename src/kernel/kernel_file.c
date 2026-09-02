@@ -18,11 +18,14 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <dirent.h>
@@ -36,6 +39,268 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
         !ObjectAttributes->ObjectName->Buffer)
         return NULL;
     return ObjectAttributes->ObjectName->Buffer;
+}
+
+/* Partition0 is the Xbox hard disk's fixed 512 KiB configuration area, not a
+ * FATX filesystem path.  Keep a small process-local backing store for that
+ * device instead of exposing a host raw disk or routing it through open(). */
+#define PARTITION0_CONFIG_SIZE (512u * 1024u)
+static unsigned char s_partition0_config[PARTITION0_CONFIG_SIZE];
+static ULONGLONG s_partition0_position;
+static unsigned char s_partition0_handle_tag;
+
+/* Partition5 is the 750 MiB cache volume normally mounted as Z:.  JSRF opens
+ * the device itself to format an empty cache, so keep sparse 4 KiB pages for
+ * the raw view instead of allocating the whole partition or parsing FATX. */
+#define PARTITION5_CACHE_SIZE (750ull * 1024ull * 1024ull)
+#define PARTITION5_PAGE_SIZE  4096u
+#define PARTITION5_PAGE_COUNT \
+    ((size_t)(PARTITION5_CACHE_SIZE / PARTITION5_PAGE_SIZE))
+static unsigned char** s_partition5_pages;
+static ULONGLONG s_partition5_position;
+static unsigned char s_partition5_handle_tag;
+
+static HANDLE partition0_handle(void)
+{
+    return (HANDLE)&s_partition0_handle_tag;
+}
+
+static BOOL is_partition0_handle(HANDLE handle)
+{
+    return handle == partition0_handle();
+}
+
+static HANDLE partition5_handle(void)
+{
+    return (HANDLE)&s_partition5_handle_tag;
+}
+
+static BOOL is_partition5_handle(HANDLE handle)
+{
+    return handle == partition5_handle();
+}
+
+static BOOL path_equals_ci(const char* left, const char* right)
+{
+    if (!left || !right) return FALSE;
+    while (*left && *right) {
+        if (tolower((unsigned char)*left) != tolower((unsigned char)*right))
+            return FALSE;
+        left++;
+        right++;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static BOOL is_partition0_path(const char* path)
+{
+    return path_equals_ci(path, "\\Device\\Harddisk0\\Partition0");
+}
+
+static BOOL is_partition5_path(const char* path)
+{
+    return path_equals_ci(path, "\\Device\\Harddisk0\\Partition5") ||
+           path_equals_ci(path, "\\Device\\Harddisk0\\Partition5\\");
+}
+
+/* NtOpenFile is implemented in terms of NtCreateFile throughout the kernel
+ * bridge.  Recognize device paths at that shared layer so direct NtCreateFile,
+ * IoCreateFile, and the NtOpenFile wrapper all get identical semantics. */
+static BOOL try_open_raw_partition(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition,
+    ULONG CreateOptions, NTSTATUS* Status)
+{
+    const char* xbox_path = get_xbox_path(ObjectAttributes);
+    BOOL partition0 = is_partition0_path(xbox_path);
+    BOOL partition5 = is_partition5_path(xbox_path);
+
+    if (!partition0 && !partition5)
+        return FALSE;
+
+    if (!FileHandle || CreateDisposition != XBOX_FILE_OPEN) {
+        *Status = STATUS_INVALID_PARAMETER;
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = *Status;
+            IoStatusBlock->Information = 0;
+        }
+        return TRUE;
+    }
+
+    if (partition0) {
+        *FileHandle = partition0_handle();
+        s_partition0_position = 0;
+    } else {
+        *FileHandle = partition5_handle();
+        s_partition5_position = 0;
+    }
+    *Status = STATUS_SUCCESS;
+    if (IoStatusBlock) {
+        IoStatusBlock->Status = *Status;
+        IoStatusBlock->Information = 1;
+    }
+    fprintf(stderr,
+            "%s NtCreateFile/open\n"
+            "ObjectAttributes: %p root=%p attributes=0x%08X\n"
+            "DesiredAccess: 0x%08X\n"
+            "ShareAccess: 0x%08X\n"
+            "CreateDisposition: 0x%08X\n"
+            "CreateOptions: 0x%08X\n"
+            "FileAttributes: 0x%08X\n"
+            "Xbox path: %s\n"
+            "Backing: %s\n"
+            "Open status: 0x%08X\n",
+            partition0 ? "PARTITION0" : "PARTITION5",
+            (void*)ObjectAttributes, ObjectAttributes->RootDirectory,
+            ObjectAttributes->Attributes, DesiredAccess, ShareAccess,
+            CreateDisposition, CreateOptions, FileAttributes, xbox_path,
+            partition0 ? "synthetic 512 KiB config-area device" :
+                         "synthetic sparse 750 MiB cache device",
+            (uint32_t)*Status);
+    return TRUE;
+}
+
+static NTSTATUS partition0_read(
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset, HANDLE Event)
+{
+    ULONGLONG offset = (ByteOffset && ByteOffset->QuadPart >= 0)
+        ? (ULONGLONG)ByteOffset->QuadPart : s_partition0_position;
+    ULONG transferred = 0;
+
+    if (!IoStatusBlock || (!Buffer && Length != 0))
+        return STATUS_INVALID_PARAMETER;
+    if (offset < PARTITION0_CONFIG_SIZE) {
+        ULONGLONG remaining = PARTITION0_CONFIG_SIZE - offset;
+        transferred = Length < remaining ? Length : (ULONG)remaining;
+        memcpy(Buffer, s_partition0_config + (size_t)offset, transferred);
+    }
+    s_partition0_position = offset + transferred;
+    IoStatusBlock->Information = transferred;
+    IoStatusBlock->Status = (transferred == 0 && Length != 0)
+        ? STATUS_END_OF_FILE : STATUS_SUCCESS;
+    fprintf(stderr,
+            "PARTITION0 NtReadFile: offset=0x%016llX length=0x%08X transferred=0x%08X status=0x%08X\n",
+            (unsigned long long)offset, Length, transferred,
+            (uint32_t)IoStatusBlock->Status);
+    if (Event && NT_SUCCESS(IoStatusBlock->Status)) SetEvent(Event);
+    return IoStatusBlock->Status;
+}
+
+static NTSTATUS partition0_write(
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset, HANDLE Event)
+{
+    ULONGLONG offset = (ByteOffset && ByteOffset->QuadPart >= 0)
+        ? (ULONGLONG)ByteOffset->QuadPart : s_partition0_position;
+    ULONG transferred = 0;
+
+    if (!IoStatusBlock || (!Buffer && Length != 0))
+        return STATUS_INVALID_PARAMETER;
+    if (offset < PARTITION0_CONFIG_SIZE) {
+        ULONGLONG remaining = PARTITION0_CONFIG_SIZE - offset;
+        transferred = Length < remaining ? Length : (ULONG)remaining;
+        memcpy(s_partition0_config + (size_t)offset, Buffer, transferred);
+    }
+    s_partition0_position = offset + transferred;
+    IoStatusBlock->Information = transferred;
+    IoStatusBlock->Status = transferred == Length
+        ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    fprintf(stderr,
+            "PARTITION0 NtWriteFile: offset=0x%016llX length=0x%08X transferred=0x%08X status=0x%08X\n",
+            (unsigned long long)offset, Length, transferred,
+            (uint32_t)IoStatusBlock->Status);
+    if (Event && NT_SUCCESS(IoStatusBlock->Status)) SetEvent(Event);
+    return IoStatusBlock->Status;
+}
+
+static NTSTATUS partition5_read(
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset, HANDLE Event)
+{
+    ULONGLONG offset = (ByteOffset && ByteOffset->QuadPart >= 0)
+        ? (ULONGLONG)ByteOffset->QuadPart : s_partition5_position;
+    ULONG transferred = 0;
+
+    if (!IoStatusBlock || (!Buffer && Length != 0))
+        return STATUS_INVALID_PARAMETER;
+    if (offset < PARTITION5_CACHE_SIZE) {
+        ULONGLONG remaining = PARTITION5_CACHE_SIZE - offset;
+        transferred = Length < remaining ? Length : (ULONG)remaining;
+        memset(Buffer, 0, transferred);
+        for (ULONG done = 0; done < transferred;) {
+            ULONGLONG current = offset + done;
+            size_t page_index = (size_t)(current / PARTITION5_PAGE_SIZE);
+            size_t page_offset = (size_t)(current % PARTITION5_PAGE_SIZE);
+            ULONG chunk = PARTITION5_PAGE_SIZE - (ULONG)page_offset;
+            if (chunk > transferred - done) chunk = transferred - done;
+            if (s_partition5_pages && s_partition5_pages[page_index])
+                memcpy((unsigned char*)Buffer + done,
+                       s_partition5_pages[page_index] + page_offset, chunk);
+            done += chunk;
+        }
+    }
+    s_partition5_position = offset + transferred;
+    IoStatusBlock->Information = transferred;
+    IoStatusBlock->Status = (transferred == 0 && Length != 0)
+        ? STATUS_END_OF_FILE : STATUS_SUCCESS;
+    fprintf(stderr,
+            "PARTITION5 NtReadFile: offset=0x%016llX length=0x%08X transferred=0x%08X status=0x%08X\n",
+            (unsigned long long)offset, Length, transferred,
+            (uint32_t)IoStatusBlock->Status);
+    if (Event && NT_SUCCESS(IoStatusBlock->Status)) SetEvent(Event);
+    return IoStatusBlock->Status;
+}
+
+static NTSTATUS partition5_write(
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset, HANDLE Event)
+{
+    ULONGLONG offset = (ByteOffset && ByteOffset->QuadPart >= 0)
+        ? (ULONGLONG)ByteOffset->QuadPart : s_partition5_position;
+    ULONG transferred = 0;
+
+    if (!IoStatusBlock || (!Buffer && Length != 0))
+        return STATUS_INVALID_PARAMETER;
+    if (offset < PARTITION5_CACHE_SIZE) {
+        ULONGLONG remaining = PARTITION5_CACHE_SIZE - offset;
+        ULONG target = Length < remaining ? Length : (ULONG)remaining;
+        if (!s_partition5_pages)
+            s_partition5_pages = (unsigned char**)calloc(
+                PARTITION5_PAGE_COUNT, sizeof(*s_partition5_pages));
+        if (!s_partition5_pages && target != 0) {
+            IoStatusBlock->Information = 0;
+            IoStatusBlock->Status = STATUS_NO_MEMORY;
+            return STATUS_NO_MEMORY;
+        }
+        while (transferred < target) {
+            ULONGLONG current = offset + transferred;
+            size_t page_index = (size_t)(current / PARTITION5_PAGE_SIZE);
+            size_t page_offset = (size_t)(current % PARTITION5_PAGE_SIZE);
+            ULONG chunk = PARTITION5_PAGE_SIZE - (ULONG)page_offset;
+            if (chunk > target - transferred) chunk = target - transferred;
+            if (!s_partition5_pages[page_index]) {
+                s_partition5_pages[page_index] =
+                    (unsigned char*)calloc(1, PARTITION5_PAGE_SIZE);
+                if (!s_partition5_pages[page_index])
+                    break;
+            }
+            memcpy(s_partition5_pages[page_index] + page_offset,
+                   (unsigned char*)Buffer + transferred, chunk);
+            transferred += chunk;
+        }
+    }
+    s_partition5_position = offset + transferred;
+    IoStatusBlock->Information = transferred;
+    IoStatusBlock->Status = transferred == Length
+        ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    fprintf(stderr,
+            "PARTITION5 NtWriteFile: offset=0x%016llX length=0x%08X transferred=0x%08X status=0x%08X\n",
+            (unsigned long long)offset, Length, transferred,
+            (uint32_t)IoStatusBlock->Status);
+    if (Event && NT_SUCCESS(IoStatusBlock->Status)) SetEvent(Event);
+    return IoStatusBlock->Status;
 }
 
 /* ======================================================================== */
@@ -105,10 +370,16 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    NTSTATUS device_status;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
+
+    if (try_open_raw_partition(FileHandle, DesiredAccess, ObjectAttributes,
+            IoStatusBlock, FileAttributes, ShareAccess, CreateDisposition,
+            CreateOptions, &device_status))
+        return device_status;
 
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
@@ -169,6 +440,11 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    if (is_partition0_handle(FileHandle))
+        return partition0_read(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+    if (is_partition5_handle(FileHandle))
+        return partition5_read(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -209,6 +485,11 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    if (is_partition0_handle(FileHandle))
+        return partition0_write(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+    if (is_partition5_handle(FileHandle))
+        return partition5_write(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -235,6 +516,8 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (is_partition0_handle(Handle) || is_partition5_handle(Handle))
+        return STATUS_SUCCESS;
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         CloseHandle(Handle);
         return STATUS_SUCCESS;
@@ -691,6 +974,12 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+static int is_partition1_tdata_path(const char* path)
+{
+    return path &&
+           strcasecmp(path, "\\Device\\Harddisk0\\Partition1\\TDATA") == 0;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -698,17 +987,44 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     char host_path[MAX_PATH];
+    NTSTATUS device_status;
     (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
+    if (try_open_raw_partition(FileHandle, DesiredAccess, ObjectAttributes,
+            IoStatusBlock, FileAttributes, ShareAccess, CreateDisposition,
+            CreateOptions, &device_status))
+        return device_status;
+
     const char* xbox_path = get_xbox_path(ObjectAttributes);
+    int trace_partition1 = is_partition1_tdata_path(xbox_path);
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+        if (trace_partition1) {
+            fprintf(stderr,
+                    "PARTITION1 NtCreateFile\n"
+                    "Xbox path: %s\n"
+                    "Host path: <translation failed>\n"
+                    "Create disposition: 0x%08X\n"
+                    "Create options: 0x%08X\n"
+                    "Result: 0x%08X\n",
+                    xbox_path, CreateDisposition, CreateOptions,
+                    (uint32_t)STATUS_OBJECT_PATH_NOT_FOUND);
+        }
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    if (trace_partition1) {
+        fprintf(stderr,
+                "PARTITION1 NtCreateFile\n"
+                "Xbox path: %s\n"
+                "Host path: %s\n"
+                "Create disposition: 0x%08X\n"
+                "Create options: 0x%08X\n",
+                xbox_path, host_path, CreateDisposition, CreateOptions);
+    }
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
@@ -720,12 +1036,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
+        NTSTATUS status = errno_to_status(e);
+        if (trace_partition1)
+            fprintf(stderr, "Result: 0x%08X\n", (uint32_t)status);
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return status;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
@@ -734,6 +1053,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p", host_path, *FileHandle);
+    if (trace_partition1)
+        fprintf(stderr, "Result: 0x%08X\n", (uint32_t)STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 
@@ -745,6 +1066,11 @@ NTSTATUS __stdcall xbox_NtReadFile(
     (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    if (is_partition0_handle(FileHandle))
+        return partition0_read(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+    if (is_partition5_handle(FileHandle))
+        return partition5_read(IoStatusBlock, Buffer, Length, ByteOffset, Event);
 
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0) {
@@ -782,6 +1108,11 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    if (is_partition0_handle(FileHandle))
+        return partition0_write(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+    if (is_partition5_handle(FileHandle))
+        return partition5_write(IoStatusBlock, Buffer, Length, ByteOffset, Event);
+
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
@@ -808,6 +1139,8 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (is_partition0_handle(Handle) || is_partition5_handle(Handle))
+        return STATUS_SUCCESS;
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         CloseHandle(Handle);
         return STATUS_SUCCESS;
@@ -1154,14 +1487,53 @@ NTSTATUS __stdcall xbox_IoCreateFile(
         AllocationSize, FileAttributes, ShareAccess, Disposition, CreateOptions);
 }
 
+#define XBOX_IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000u
+#define XBOX_IOCTL_DISK_GET_PARTITION_INFO 0x00074004u
+#define XBOX_FSCTL_DISMOUNT_VOLUME         0x00090020u
+
+typedef struct _XBOX_DISK_GEOMETRY {
+    LARGE_INTEGER Cylinders;
+    ULONG MediaType;
+    ULONG TracksPerCylinder;
+    ULONG SectorsPerTrack;
+    ULONG BytesPerSector;
+} XBOX_DISK_GEOMETRY;
+
+typedef struct _XBOX_PARTITION_INFORMATION {
+    LARGE_INTEGER StartingOffset;
+    LARGE_INTEGER PartitionLength;
+    ULONG HiddenSectors;
+    ULONG PartitionNumber;
+    UCHAR PartitionType;
+    UCHAR BootIndicator;
+    UCHAR RecognizedPartition;
+    UCHAR RewritePartition;
+} XBOX_PARTITION_INFORMATION;
+
+_Static_assert(sizeof(XBOX_DISK_GEOMETRY) == 24,
+               "Xbox DISK_GEOMETRY layout must be 24 bytes");
+_Static_assert(sizeof(XBOX_PARTITION_INFORMATION) == 32,
+               "Xbox PARTITION_INFORMATION layout must be 32 bytes");
+
 NTSTATUS __stdcall xbox_NtFsControlFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, ULONG FsControlCode,
     PVOID InputBuffer, ULONG InputBufferLength,
     PVOID OutputBuffer, ULONG OutputBufferLength)
 {
-    (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
+    (void)Event; (void)ApcRoutine; (void)ApcContext;
     (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
+    if (is_partition5_handle(FileHandle) &&
+        FsControlCode == XBOX_FSCTL_DISMOUNT_VOLUME) {
+        if (!IoStatusBlock)
+            return STATUS_INVALID_PARAMETER;
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        fprintf(stderr,
+                "PARTITION5 NtFsControlFile: FSCTL_DISMOUNT_VOLUME status=0x%08X\n",
+                (uint32_t)STATUS_SUCCESS);
+        return STATUS_SUCCESS;
+    }
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtFsControlFile(0x%X) - stub", FsControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
@@ -1176,8 +1548,46 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
     PVOID InputBuffer, ULONG InputBufferLength,
     PVOID OutputBuffer, ULONG OutputBufferLength)
 {
-    (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
-    (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
+    (void)Event; (void)ApcRoutine; (void)ApcContext;
+    (void)InputBuffer; (void)InputBufferLength;
+    if (is_partition5_handle(FileHandle)) {
+        ULONG information = 0;
+
+        if (!IoStatusBlock)
+            return STATUS_INVALID_PARAMETER;
+        if (IoControlCode == XBOX_IOCTL_DISK_GET_DRIVE_GEOMETRY &&
+            OutputBuffer && OutputBufferLength >= sizeof(XBOX_DISK_GEOMETRY)) {
+            XBOX_DISK_GEOMETRY* geometry = (XBOX_DISK_GEOMETRY*)OutputBuffer;
+            memset(geometry, 0, sizeof(*geometry));
+            geometry->Cylinders.QuadPart = 3000;
+            geometry->MediaType = 12; /* FixedMedia */
+            geometry->TracksPerCylinder = 16;
+            geometry->SectorsPerTrack = 32;
+            geometry->BytesPerSector = 512;
+            information = sizeof(*geometry);
+        } else if (IoControlCode == XBOX_IOCTL_DISK_GET_PARTITION_INFO &&
+                   OutputBuffer &&
+                   OutputBufferLength >= sizeof(XBOX_PARTITION_INFORMATION)) {
+            XBOX_PARTITION_INFORMATION* partition =
+                (XBOX_PARTITION_INFORMATION*)OutputBuffer;
+            memset(partition, 0, sizeof(*partition));
+            partition->PartitionLength.QuadPart = PARTITION5_CACHE_SIZE;
+            partition->PartitionNumber = 5;
+            partition->RecognizedPartition = TRUE;
+            information = sizeof(*partition);
+        } else {
+            IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+            IoStatusBlock->Information = 0;
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = information;
+        fprintf(stderr,
+                "PARTITION5 NtDeviceIoControlFile: code=0x%08X transferred=0x%08X status=0x%08X\n",
+                IoControlCode, information, (uint32_t)STATUS_SUCCESS);
+        return STATUS_SUCCESS;
+    }
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtDeviceIoControlFile(0x%X) - stub", IoControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;

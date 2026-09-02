@@ -38,6 +38,8 @@ class _Insn:
         self.is_jump = is_jump
         self.is_cond_jump = is_cond_jump
         self.is_branch = is_jump or is_cond_jump
+        self.is_terminator = is_ret or is_jump
+        self.is_nop = mnemonic == "nop"
 
 
 class _Engine:
@@ -96,6 +98,51 @@ def test_next_function_still_bounds_the_walk():
     det = _detector(TAIL)
     end = det._find_function_end(0x107F9F, next_func=0x107FB0, sec_end=0x108100)
     assert end <= 0x107FB0, f"walked past the next function: {end:#x}"
+
+
+def test_int3_ends_noreturn_function_before_padding():
+    # MSVC's noreturn-call shape: call, trap, alignment, next body. The trap
+    # belongs to the first function; the padding and body do not.
+    insns = [
+        _Insn(0x1000, 5, "call"),
+        _Insn(0x1005, 1, "int3"),
+        _Insn(0x1006, 1, "nop"),
+        _Insn(0x1007, 1, "nop"),
+        _Insn(0x1008, 1, "push"),
+        _Insn(0x1009, 1, "ret", is_ret=True),
+    ]
+    det = _detector(insns)
+    end = det._find_function_end(0x1000, next_func=None, sec_end=0x2000)
+    assert end == 0x1006, f"expected end after INT3, got {end:#x}"
+
+
+def test_forward_target_past_int3_is_still_included():
+    # A reachable out-of-line block remains authoritative. INT3 only ends the
+    # walk once every internal forward target has actually been decoded.
+    insns = [
+        _Insn(0x1000, 2, "jne", target=0x1008, is_cond_jump=True),
+        _Insn(0x1002, 1, "int3"),
+        _Insn(0x1003, 5, "nop"),
+        _Insn(0x1008, 1, "mov"),
+        _Insn(0x1009, 1, "ret", is_ret=True),
+    ]
+    det = _detector(insns)
+    end = det._find_function_end(0x1000, next_func=None, sec_end=0x2000)
+    assert end == 0x100A, f"forward target was cut off at {end:#x}"
+
+
+def test_inline_int3_before_epilogue_is_not_a_boundary():
+    # INT3 can be used as a resumable debug breakpoint. Without following NOP
+    # padding it remains part of the current function and its epilogue wins.
+    insns = [
+        _Insn(0x1000, 2, "int"),
+        _Insn(0x1002, 1, "int3"),
+        _Insn(0x1003, 1, "leave"),
+        _Insn(0x1004, 3, "ret", is_ret=True),
+    ]
+    det = _detector(insns)
+    end = det._find_function_end(0x1000, next_func=None, sec_end=0x2000)
+    assert end == 0x1007, f"inline INT3 cut off epilogue at {end:#x}"
 
 
 if __name__ == "__main__":

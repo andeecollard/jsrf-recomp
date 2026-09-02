@@ -86,14 +86,16 @@ def _fmt_imm(val):
     return f"0x{val:X}"
 
 
-def _mem_accessor(size):
+def _mem_accessor(size, segment=None):
     """Return the MEM macro name for a given operand size."""
-    return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
+    prefix = "FS_" if segment == "fs" else ""
+    return prefix + {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
 
 
-def _smem_accessor(size):
+def _smem_accessor(size, segment=None):
     """Return the signed MEM macro for a given operand size."""
-    return {
+    prefix = "FS_" if segment == "fs" else ""
+    return prefix + {
         1: "SMEM8", 2: "SMEM16", 4: "SMEM32", 8: "SMEM64",
     }.get(size, "SMEM32")
 
@@ -144,14 +146,14 @@ def _fmt_mem(op):
 
 def _fmt_mem_read(op):
     """Format reading from a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    accessor = _mem_accessor(op.mem_size, getattr(op, "mem_segment", None))
     addr = _fmt_mem(op)
     return f"{accessor}({addr})"
 
 
 def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    accessor = _mem_accessor(op.mem_size, getattr(op, "mem_segment", None))
     addr = _fmt_mem(op)
     return f"{accessor}({addr}) = {value_expr};"
 
@@ -186,6 +188,16 @@ def _fmt_operand_read(op):
     elif op.type == "mem":
         return _fmt_mem_read(op)
     return "/* unknown operand */"
+
+
+def _is_mmx_operand(op):
+    """An MMX register operand (mm0..mm7), not an XMM one."""
+    return (op.type == "reg" and op.reg
+            and op.reg.startswith("mm") and not op.reg.startswith("xmm"))
+
+
+def _has_mmx_operand(ops):
+    return any(_is_mmx_operand(o) for o in ops)
 
 
 def _fmt_operand_write(op, value_expr):
@@ -239,15 +251,15 @@ _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
     "bsf", "bsr",       # Bit scan sets ZF
     "bt", "bts", "btr", "btc",  # Bit test sets CF
-    "cmpxchg",           # Compare-and-exchange sets ZF
+    "cmpxchg", "lock cmpxchg",   # Compare-and-exchange sets ZF
     "xadd",              # Exchange-and-add sets flags
+    "lock xadd",         # LOCK changes atomicity, not arithmetic flags
 })
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -616,20 +628,50 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"!(({lhs} >> ({rhs} & 31)) & 1)", desc
         return None
 
-    # ── cmpxchg: compares accumulator with dest, sets ZF on match ──
-    if flag_setter == "cmpxchg":
+    # ── cmpxchg: ZF is "the exchange happened" ──
+    #
+    # This used to answer `({lhs} == eax)`, which reads the operands AFTER the
+    # instruction has already written them: on success the destination now
+    # holds the source, so the comparison is against the wrong value. The lift
+    # records the outcome in _flags instead, the way the string compares do.
+    #
+    # Only je/jne are answered. cmpxchg also sets CF/SF/OF/AF/PF from the
+    # comparison and those are not modelled, so anything else falls through to
+    # the generic path rather than being answered wrongly.
+    if flag_setter in ("cmpxchg", "lock cmpxchg"):
         if jcc in ("je", "jz"):
-            return f"({lhs} == eax)", desc
+            return "(_flags != 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != eax)", desc
+            return "(_flags == 0)", desc
         return None
 
     # ── xadd: exchange and add, flags from addition ──
-    if flag_setter == "xadd":
-        if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
-        if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+    if flag_setter in ("xadd", "lock xadd"):
+        flag = {
+            "je": "RECOMP_EFLAGS_ZF(_flags)",
+            "jz": "RECOMP_EFLAGS_ZF(_flags)",
+            "jne": "!RECOMP_EFLAGS_ZF(_flags)",
+            "jnz": "!RECOMP_EFLAGS_ZF(_flags)",
+            "jb": "RECOMP_EFLAGS_CF(_flags)",
+            "jnae": "RECOMP_EFLAGS_CF(_flags)",
+            "jae": "!RECOMP_EFLAGS_CF(_flags)",
+            "jnb": "!RECOMP_EFLAGS_CF(_flags)",
+            "jbe": "(RECOMP_EFLAGS_CF(_flags) || RECOMP_EFLAGS_ZF(_flags))",
+            "jna": "(RECOMP_EFLAGS_CF(_flags) || RECOMP_EFLAGS_ZF(_flags))",
+            "ja": "(!RECOMP_EFLAGS_CF(_flags) && !RECOMP_EFLAGS_ZF(_flags))",
+            "js": "RECOMP_EFLAGS_SF(_flags)",
+            "jns": "!RECOMP_EFLAGS_SF(_flags)",
+            "jo": "RECOMP_EFLAGS_OF(_flags)",
+            "jno": "!RECOMP_EFLAGS_OF(_flags)",
+            "jp": "RECOMP_EFLAGS_PF(_flags)",
+            "jnp": "!RECOMP_EFLAGS_PF(_flags)",
+            "jl": "(RECOMP_EFLAGS_SF(_flags) != RECOMP_EFLAGS_OF(_flags))",
+            "jge": "(RECOMP_EFLAGS_SF(_flags) == RECOMP_EFLAGS_OF(_flags))",
+            "jle": "(RECOMP_EFLAGS_ZF(_flags) || (RECOMP_EFLAGS_SF(_flags) != RECOMP_EFLAGS_OF(_flags)))",
+            "jg": "(!RECOMP_EFLAGS_ZF(_flags) && (RECOMP_EFLAGS_SF(_flags) == RECOMP_EFLAGS_OF(_flags)))",
+        }.get(jcc)
+        if flag:
+            return flag, desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -868,6 +910,18 @@ class Lifter:
             return self._lift_lea(insn, ops)
         if m == "xchg":
             return self._lift_xchg(insn, ops)
+        if m in ("emms", "femms"):
+            # Clears MMX/x87 tag state. We do not model the aliasing, so there
+            # is nothing to clear -- but say so rather than emit a bare TODO.
+            return [f"/* {m}: MMX state not aliased with x87 here */"]
+        if m in ("movq", "movntq") and nops >= 2 and _has_mmx_operand(ops):
+            return self._lift_mmx_move(insn, ops, nontemporal=(m == "movntq"))
+
+        if m in ("xadd", "lock xadd"):
+            return self._lift_xadd(insn, ops, locked=(m == "lock xadd"))
+        if m in ("cmpxchg", "lock cmpxchg"):
+            return self._lift_cmpxchg(insn, ops,
+                                      locked=(m == "lock cmpxchg"))
 
         # ── Stack ──
         if m == "push":
@@ -959,6 +1013,26 @@ class Lifter:
             elif not out:
                 out.append(f"/* bt {insn.op_str}: no CF consumer */")
             return out
+
+        # ── bsf/bsr: bit scan ──
+        # 386 instructions, and the Xbox D3D library leans on one: its Log2
+        # helper is a bare `bsf eax, ecx`. Unhandled it lifted to a comment,
+        # so the helper returned whatever eax happened to hold and every
+        # surface size computed from log2(w)+log2(h)+log2(d) was wrong -- JSRF
+        # asked MmAllocateContiguousMemoryEx for 0x08000000 bytes, twice the
+        # console's RAM, and D3D failed the create with E_OUTOFMEMORY.
+        #
+        # With a zero source x86 sets ZF and leaves the destination ALONE.
+        # That is what the guard reproduces; writing a sentinel instead would
+        # invent a value the hardware never produces. The ZF consumer is
+        # resolved separately, straight off the source operand -- see the
+        # bsf/bsr arm of _resolve_flag_condition.
+        if m in ("bsf", "bsr") and nops >= 2:
+            dst, src = ops[0], ops[1]
+            value = _fmt_operand_read(src)
+            helper = "BSF32" if m == "bsf" else "BSR32"
+            write = _fmt_operand_write(dst, f"{helper}({value})")
+            return [f"if (({value}) != 0) {write} /* {m} */"]
 
         if m == "int3":
             return ["__debugbreak(); /* int3 */"]
@@ -1067,7 +1141,8 @@ class Lifter:
             return [f"/* movsx: bad operands */"]
         src = _fmt_operand_read(ops[1])
         if ops[1].type == "mem":
-            accessor = _smem_accessor(ops[1].mem_size)
+            accessor = _smem_accessor(
+                ops[1].mem_size, getattr(ops[1], "mem_segment", None))
             addr = _fmt_mem(ops[1])
             src = f"(uint32_t)(int32_t){accessor}({addr})"
         elif ops[1].type == "reg":
@@ -1094,6 +1169,159 @@ class Lifter:
             _fmt_operand_write(ops[0], b),
             _fmt_operand_write(ops[1], "_tmp") + " }",
         ]
+
+    def _lift_mmx_move(self, insn, ops, nontemporal=False):
+        """movq / movntq where at least one operand is an MMX register.
+
+        `movq` was already in the SSE mnemonic list, so an MMX form fell
+        through that handler and came out as "/* SSE: movq mm0, ... */"; the
+        `movntq` store had no rule at all and came out as a TODO. The D3D block
+        copy at sub_00198FD0 is eight of each per iteration, so its 64-byte
+        inner loop copied NOTHING -- only the rep movsd/movsb prologue and
+        epilogue moved any bytes.
+
+        Non-temporal only describes cache behaviour, so movntq is the same
+        store; the distinction is recorded in the comment and nowhere else.
+        """
+        dst, src = ops[0], ops[1]
+        note = "movntq" if nontemporal else "movq"
+
+        def rd(op):
+            if _is_mmx_operand(op):
+                return op.reg
+            if op.type == "mem":
+                return f"MEM64({_fmt_mem(op)})"
+            return _fmt_operand_read(op)
+
+        if _is_mmx_operand(dst):
+            return [f"{dst.reg} = {rd(src)}; /* {note} */"]
+        if dst.type == "mem":
+            return [f"MEM64({_fmt_mem(dst)}) = {rd(src)}; /* {note} */"]
+        return [f"/* {note} {insn.op_str}: unsupported operand form */"]
+
+    def _lift_cmpxchg(self, insn, ops, locked=False):
+        """Compare-and-exchange.
+
+            TEMP = DEST
+            if (ACC == TEMP) { ZF = 1; DEST = SRC }
+            else             { ZF = 0; ACC = TEMP }
+
+        Left as a comment this was worse than a no-op. DSOUND's sub_001A1F31
+        uses the standard `mov eax,[m]; L: cmpxchg [m],edx; jne L` idiom to
+        atomically swap a pending-event mask to zero:
+
+            eax = [m]                  ; snapshot
+          L: cmpxchg [m], edx          ; swap in 0 if [m] is still eax
+            jne L                      ; retry with the reloaded eax
+            or  [acc], eax             ; drain what we took
+
+        With the exchange missing the mask is never cleared, and because
+        nothing reloads eax the retry loop spins forever the moment another
+        thread touches the word -- which is what JSRF does once real worker
+        threads run.
+
+        ACC is al/ax/eax by operand width. LOCK is only meaningful with a
+        memory destination and selects the runtime's sequentially-consistent
+        helper; unlocked memory cmpxchg stays a plain read/modify/write.
+        """
+        if len(ops) < 2:
+            return [f"/* {'lock ' if locked else ''}cmpxchg: bad operands */"]
+        dst, src = ops[0], ops[1]
+        width = _operand_width(dst) or _operand_width(src) or 4
+        if width not in (1, 2, 4):
+            return [f"/* {'lock ' if locked else ''}cmpxchg: "
+                    f"unsupported width {width} */"]
+        if locked and dst.type != "mem":
+            return ["/* lock cmpxchg: LOCK requires a memory destination */"]
+
+        bits = width * 8
+        ctype = f"uint{bits}_t"
+        acc_read = {1: "LO8(eax)", 2: "LO16(eax)", 4: "eax"}[width]
+        acc_write = {1: "SET_LO8(eax, _cx_old);",
+                     2: "SET_LO16(eax, _cx_old);",
+                     4: "eax = _cx_old;"}[width]
+        src_expr = _fmt_operand_read(src)
+
+        line = (f"{{ {ctype} _cx_acc = ({ctype})({acc_read}); "
+                f"{ctype} _cx_src = ({ctype})({src_expr}); "
+                f"int _cx_ok = 0; {ctype} _cx_old; ")
+
+        if dst.type == "mem":
+            accessor = _mem_accessor(width)
+            line += f"uint32_t _cx_addr = (uint32_t)({_fmt_mem(dst)}); "
+            if locked:
+                line += (f"_cx_old = RECOMP_ATOMIC_CMPXCHG{bits}"
+                         f"(_cx_addr, _cx_acc, _cx_src, &_cx_ok); ")
+            else:
+                line += (f"_cx_old = ({ctype}){accessor}(_cx_addr); "
+                         f"_cx_ok = (_cx_old == _cx_acc); "
+                         f"if (_cx_ok) {accessor}(_cx_addr) = _cx_src; ")
+        else:
+            line += (f"_cx_old = ({ctype})({_fmt_operand_read(dst)}); "
+                     f"_cx_ok = (_cx_old == _cx_acc); "
+                     f"if (_cx_ok) " + _fmt_operand_write(dst, "_cx_src") + " ")
+
+        line += f"if (!_cx_ok) {acc_write} _flags = _cx_ok; }}"
+        return [line + f" /* {'lock ' if locked else ''}cmpxchg */"]
+
+    def _lift_xadd(self, insn, ops, locked=False):
+        """Exchange-and-add for register or memory destinations.
+
+        Capture the effective address and source before either architectural
+        operand is written.  That ordering matters for forms such as
+        ``xadd [eax], eax``.  LOCK is only valid with a memory destination and
+        selects the runtime's sequentially-consistent atomic fetch-add helper;
+        ordinary memory XADD remains a single-threaded read/modify/write.
+        """
+        if len(ops) < 2:
+            return [f"/* {'lock ' if locked else ''}xadd: bad operands */"]
+        dst, src = ops[0], ops[1]
+        width = _operand_width(dst) or _operand_width(src) or 4
+        if width not in (1, 2, 4):
+            return [f"/* {'lock ' if locked else ''}xadd: unsupported width {width} */"]
+        if locked and dst.type != "mem":
+            return ["/* lock xadd: LOCK requires a memory destination */"]
+
+        bits = width * 8
+        ctype = f"uint{bits}_t"
+        src_expr = _fmt_operand_read(src)
+        result = []
+
+        if dst.type == "mem":
+            addr = _fmt_mem(dst)
+            result.append(f"{{ uint32_t _xadd_addr = (uint32_t)({addr}); ")
+            result[-1] += f"{ctype} _xadd_src = ({ctype})({src_expr}); "
+            if locked:
+                result[-1] += (
+                    f"{ctype} _xadd_old = RECOMP_ATOMIC_XADD{bits}"
+                    f"(_xadd_addr, _xadd_src); ")
+            else:
+                accessor = _mem_accessor(width)
+                result[-1] += f"{ctype} _xadd_old = {accessor}(_xadd_addr); "
+            result[-1] += (
+                f"{ctype} _xadd_result = ({ctype})(_xadd_old + _xadd_src); "
+                f"_flags = RECOMP_ADD_FLAGS{bits}"
+                f"(_xadd_old, _xadd_src, _xadd_result); ")
+            if not locked:
+                result[-1] += (
+                    f"{_mem_accessor(width)}(_xadd_addr) = _xadd_result; ")
+            result[-1] += _fmt_operand_write(src, "_xadd_old") + " }"
+            return result
+
+        if dst.type == "reg":
+            dst_expr = _fmt_operand_read(dst)
+            line = (
+                f"{{ {ctype} _xadd_old = ({ctype})({dst_expr}); "
+                f"{ctype} _xadd_src = ({ctype})({src_expr}); "
+                f"{ctype} _xadd_result = ({ctype})(_xadd_old + _xadd_src); "
+                f"_flags = RECOMP_ADD_FLAGS{bits}"
+                f"(_xadd_old, _xadd_src, _xadd_result); "
+                + _fmt_operand_write(src, "_xadd_old") + " "
+                + _fmt_operand_write(dst, "_xadd_result") + " }"
+            )
+            return [line]
+
+        return [f"/* {'lock ' if locked else ''}xadd: bad destination */"]
 
     # ── Stack ──
 
@@ -1622,10 +1850,41 @@ class Lifter:
                 f"    if ({stop_condition}) break;",
                 f"}} /* {m} */",
             ]
-        if "cmpsw" in m or "cmpsd" in m:
-            return [f"/* {m} - string compare, ecx iterations */"]
-        if "scasw" in m or "scasd" in m:
-            return [f"/* {m} - string scan, ecx iterations */"]
+        # The word and dword widths were left as comments while cmpsb/scasb
+        # above were implemented. A comment is worse than an unhandled
+        # instruction here: the compare never runs, so the following setcc or
+        # jcc resolves its ZF against whatever instruction came before -- and
+        # what comes before a GUID compare is the `xor edx, edx` that zeroes
+        # the result byte, which reads as "equal" every time.
+        #
+        # JSRF's CDirectSound QueryInterface (sub_00168310) is four of these in
+        # a row against candidate IIDs. The first always matched, so QI handed
+        # back the primary interface for every IID asked of it. The caller had
+        # asked for the second base, called ITS vtable slot 3, and reached a
+        # two-argument method with three arguments pushed: 4 bytes leaked, the
+        # enclosing `pop esi` read one slot low, and the game object's `this`
+        # came back as a TLS address. The title then exited to the dashboard.
+        for width, mem, stride in (("cmpsw", "MEM16", 2), ("cmpsd", "MEM32", 4)):
+            if width in m:
+                stop = "!_flags" if ("repne" not in m and "repnz" not in m) else "_flags"
+                return [
+                    "while (ecx != 0) {",
+                    f"    _flags = ({mem}(esi) == {mem}(edi));",
+                    f"    esi += {stride}; edi += {stride}; ecx--;",
+                    f"    if ({stop}) break;",
+                    f"}} /* {m} */",
+                ]
+        for width, mem, reg, stride in (("scasw", "MEM16", "LO16(eax)", 2),
+                                        ("scasd", "MEM32", "eax", 4)):
+            if width in m:
+                stop = "!_flags" if ("repne" not in m and "repnz" not in m) else "_flags"
+                return [
+                    "while (ecx != 0) {",
+                    f"    _flags = ({reg} == {mem}(edi));",
+                    f"    edi += {stride}; ecx--;",
+                    f"    if ({stop}) break;",
+                    f"}} /* {m} */",
+                ]
         return [f"/* {m} */"]
 
     def _lift_string_op(self, insn, m):
@@ -2053,14 +2312,16 @@ class Lifter:
 
         if m == "fild":
             if len(ops) >= 1 and ops[0].type == "mem":
-                smem = _smem_accessor(ops[0].mem_size)
+                smem = _smem_accessor(
+                    ops[0].mem_size, getattr(ops[0], "mem_segment", None))
                 return [f"fp_push((double){smem}({_fmt_mem(ops[0])})); /* fild */"]
             return [f"/* fild {insn.op_str} */"]
 
         if m in ("fist", "fistp"):
             if len(ops) >= 1 and ops[0].type == "mem":
                 size = ops[0].mem_size
-                mem_acc = _smem_accessor(size)
+                mem_acc = _smem_accessor(
+                    size, getattr(ops[0], "mem_segment", None))
                 int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
                     size, "int32_t")
                 pop = " fp_pop();" if m == "fistp" else ""
@@ -2456,10 +2717,12 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            _cmp_forms = ("cmpsb", "cmpsw", "cmpsd",
+                          "scasb", "scasw", "scasd")
+            if any(f in raw_m for f in _cmp_forms):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif any(f in rest for f in _cmp_forms):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

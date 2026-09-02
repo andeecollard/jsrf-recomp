@@ -10,6 +10,7 @@
 #include "kernel.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -34,7 +35,9 @@ VOID __stdcall xbox_RtlInitAnsiString(PXBOX_ANSI_STRING DestinationString, const
 VOID __stdcall xbox_RtlInitUnicodeString(PXBOX_UNICODE_STRING DestinationString, const WCHAR* SourceString)
 {
     if (SourceString) {
-        USHORT len = (USHORT)(wcslen(SourceString) * sizeof(WCHAR));
+        /* macOS portability: Xbox WCHAR is 16-bit; host wchar_t is 32-bit, so
+         * use the runtime's 16-bit-aware xbox_wcslen (standard wcslen miscounts). */
+        USHORT len = (USHORT)(xbox_wcslen(SourceString) * sizeof(WCHAR));
         DestinationString->Length = len;
         DestinationString->MaximumLength = len + sizeof(WCHAR);
         DestinationString->Buffer = (PWCHAR)SourceString;
@@ -157,35 +160,81 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * Critical Sections (direct 1:1 mapping)
  * ============================================================================ */
 
-/*
- * Critical section operations are no-ops for now.
+/* Xbox critical sections are 20-byte, 32-bit structures and cannot contain a
+ * host CRITICAL_SECTION (40 bytes on Win64 and larger in the POSIX shim).
+ * Keep the host lock in a shadow table keyed by the translated guest address.
  *
- * The Xbox CRITICAL_SECTION is a 20-byte 32-bit structure that's
- * incompatible with the Windows 64-bit CRITICAL_SECTION (40 bytes).
- * Passing Xbox memory pointers to native Windows CS functions would
- * corrupt memory. Since the recompiled game runs single-threaded
- * (all Xbox threads are called synchronously), there's no contention
- * and no-ops are correct.
- *
- * TODO: If multithreading is needed, implement a shadow CS mapping
- * (Xbox VA → native Windows CRITICAL_SECTION).
- */
+ * This used to be a no-op while every translated thread ran synchronously.
+ * Real guest workers make that actively unsafe: JSRF's shared RTL heap uses
+ * one of these locks, and concurrent allocate/free operations corrupt its
+ * intrusive free lists without it. */
+typedef struct XboxShadowCriticalSection {
+    PRTL_CRITICAL_SECTION guest;
+    CRITICAL_SECTION host;
+    struct XboxShadowCriticalSection *next;
+} XboxShadowCriticalSection;
+
+static XboxShadowCriticalSection *g_shadow_critical_sections;
+static volatile LONG g_shadow_critical_sections_guard;
+
+static void shadow_critical_sections_lock(void)
+{
+    while (InterlockedCompareExchange(&g_shadow_critical_sections_guard,
+                                      1, 0) != 0) {
+        Sleep(0);
+    }
+}
+
+static void shadow_critical_sections_unlock(void)
+{
+    InterlockedExchange(&g_shadow_critical_sections_guard, 0);
+}
+
+static XboxShadowCriticalSection *shadow_critical_section_get(
+    PRTL_CRITICAL_SECTION guest, BOOL create)
+{
+    XboxShadowCriticalSection *entry;
+
+    if (!guest)
+        return NULL;
+
+    shadow_critical_sections_lock();
+    for (entry = g_shadow_critical_sections; entry; entry = entry->next) {
+        if (entry->guest == guest)
+            break;
+    }
+    if (!entry && create) {
+        entry = (XboxShadowCriticalSection *)malloc(sizeof(*entry));
+        if (entry) {
+            entry->guest = guest;
+            InitializeCriticalSection(&entry->host);
+            entry->next = g_shadow_critical_sections;
+            g_shadow_critical_sections = entry;
+        }
+    }
+    shadow_critical_sections_unlock();
+    return entry;
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution, no contention */
+    XboxShadowCriticalSection *entry =
+        shadow_critical_section_get(CriticalSection, TRUE);
+    if (entry)
+        EnterCriticalSection(&entry->host);
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    XboxShadowCriticalSection *entry =
+        shadow_critical_section_get(CriticalSection, FALSE);
+    if (entry)
+        LeaveCriticalSection(&entry->host);
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    (void)shadow_critical_section_get(CriticalSection, TRUE);
 }
 
 /* ============================================================================

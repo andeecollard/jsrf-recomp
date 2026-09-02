@@ -1,0 +1,113 @@
+[
+ {
+  "start": "0x0013AF10",
+  "source": "icall-unresolved",
+  "observed": 2
+ },
+ {
+  "start": "0x0013B0A0",
+  "source": "icall-unresolved",
+  "observed": 3
+ },
+ {
+  "start": "0x0013B0E0",
+  "source": "icall-unresolved",
+  "observed": 3
+ },
+ {
+  "start": "0x0013B180",
+  "source": "icall-unresolved",
+  "observed": 1
+ },
+ {
+  "start": "0x0013B1C0",
+  "source": "icall-unresolved",
+  "observed": 1
+ },
+ {
+  "start": "0x0013B230",
+  "source": "icall-unresolved",
+  "observed": 1
+ },
+ {
+  "start": "0x0013B2A0",
+  "source": "icall-unresolved",
+  "observed": 1
+ },
+ {
+  "start": "0x00140B50",
+  "source": "icall-unresolved",
+  "observed": 1
+ },
+ {
+  "start": "0x00140CC0",
+  "source": "icall-unresolved",
+  "observed": 1
+ },
+ {
+  "start": "0x00141F10",
+  "source": "icall-unresolved",
+  "observed": 100
+ },
+ {
+  "start": "0x00181009",
+  "source": "icall-unresolved",
+  "observed": 8
+ },
+ {
+  "start": "0x001BF6A3",
+  "source": "icall-unresolved",
+  "observed": 19
+ },
+ {
+  "start": "0x00178E40",
+  "source": "apc-completion-routine",
+  "observed": 1
+ },
+ {
+  "start": "0x001A2301",
+  "source": "dsound-dpc-routine",
+  "note": "ret 0x10, KDEFERRED_ROUTINE shape; ptr at 0x1A26E7"
+ },
+ {
+  "start": "0x001A230D",
+  "source": "dsound-callback",
+  "note": "ret 4; ptr at 0x1A274E"
+ },
+ {
+  "start": "0x001A2497",
+  "source": "dsound-dpc-routine",
+  "note": "ret 0x10; ptr at 0x1A26C9; reaches the APU doorbell clear via sub_001A23CD"
+ },
+ {
+  "start": "0x001A2681",
+  "source": "dsound-isr-thunk",
+  "note": "ret 8, KSERVICE_ROUTINE shape; ptr at 0x1A2711 (KeInitializeInterrupt)"
+ },
+ {
+  "start": "0x001A6E4B",
+  "source": "dsound-callback",
+  "note": "ret 4; ptr at 0x1A728F (KeSynchronizeExecution)"
+ },
+ {
+  "start": "0x001A72E0",
+  "source": "dsound-callback",
+  "note": "ret 8; ptr at 0x1A7440"
+ },
+ {
+  "start": "0x001A72F1",
+  "source": "dsound-dpc-routine",
+  "note": "ret 0x10; ptr at 0x1A7416 (KeInitializeDpc)"
+ },
+ {
+  "start": "0x001A73AB",
+  "source": "dsound-callback",
+  "note": "ret 4; ptr at 0x1A7491"
+ },
+ {
+  "start": "0x0015F9D0",
+  "source": "icall-unresolved",
+  "observed": 1,
+  "note": "D3D vblank callback, invoked cdecl through [D3D ctx+0x1C4] by sub_00193D90; 7 bytes, 'inc [0x265174]; ret'. In the gap between 0x0015F9A0 (ends 0x0015F9C8, ret 4) and 0x0015F9E0, 16-aligned."
+ }
+]

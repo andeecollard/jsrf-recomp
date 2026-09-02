@@ -154,12 +154,42 @@ class Disassembler:
         self.func_detector = FunctionDetector(
             self.engine, self.image, self.xrefs, self.labels)
 
-        # Add seed functions from vtable scanner or other sources
+        # Add seed functions from vtable scanner or other sources.
+        #
+        # A candidate with no decoded instruction at its address is dropped by
+        # _build_functions (num_insns == 0), so a seed that lands where the
+        # linear sweep came out of phase is silently discarded -- the exact
+        # failure Engine.decode_at was written for, but until now only wired
+        # into _pass_call_targets and the tail-jump pass. Measured on JSRF:
+        # 0x0007BE30 is 16-aligned, preceded by four nop padding bytes, opens
+        # with the MSVC SEH prologue (push -1; push <handler>; mov eax, fs:[0];
+        # push eax; mov fs:[0], esp), was discovered by the vtable scanner AND
+        # observed as an unresolved indirect call 100 times at runtime -- and
+        # was thrown away because the data run before it put the sweep out of
+        # step. Realign there instead, exactly as the call-target pass does.
         if self.seed_functions:
+            realigned = unaligned = undecodable = 0
             for addr in self.seed_functions:
+                if addr not in self.engine.instructions:
+                    # Same corroboration rule as _pass_call_targets: decoding
+                    # at an address nothing decoded to is creating evidence
+                    # rather than reading it. Seeds that already decoded are
+                    # accepted whatever their alignment, as before.
+                    if addr % config.CALL_TARGET_REALIGN_ALIGNMENT:
+                        unaligned += 1
+                        continue
+                    if self.engine.decode_at(addr):
+                        realigned += 1
+                    else:
+                        undecodable += 1
+                        continue
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if self.verbose:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
+                if realigned or unaligned or undecodable:
+                    print(f"    realigned {realigned}, "
+                          f"skipped {unaligned} unaligned, "
+                          f"{undecodable} undecodable")
 
         num_funcs = self.func_detector.detect_all(sections)
         if self.verbose:

@@ -1,0 +1,820 @@
+================================================================================
+CODEX HANDOVER - JSRF bring-up on xboxrecomp (macOS / arm64)
+================================================================================
+Worktree : /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/
+           Jet Set Radio Future/upstream_xboxrecomp_clean
+Companion: QWEN_CONTEXT.md (regeneration paths, canonical XBE location)
+
+Everything below was MEASURED unless it says otherwise. Where a claim was later
+found wrong it is RETRACTED in section 8 rather than quietly deleted - read that
+section before building on anything.
+
+
+================================================================================
+0. STATUS IN ONE PAGE
+================================================================================
+The title boots, initialises DirectSound/APU (with one documented substitution),
+gets through the D3D push-buffer wait, walks its whole Z:\Cache\Media tree,
+does the UDATA/TDATA save-game metadata dance, opens and reads its assets from
+D:, creates its worker threads, connects its interrupts, and RUNS ITS FRAME
+LOOP AT 60Hz. The NV2A vblank handshake described in the old section 1 is
+FIXED -- see 4(s). Measured over a clean 50s run:
+
+    KeInsertQueueDpc (ord 119)   2,964     ~59/s
+    ADX vsync tick               3,226     ~64/s
+    vblank ISR                   TRUE every time, no run of FALSE
+    unresolved indirect calls    0
+    ISR/DPC stack imbalances     0
+
+It still does not put PIXELS ON SCREEN, but that is no longer a guest-side
+blocker: the frame loop runs and the title submits push-buffer work.
+diagnostics/jsrf_first_fault/main.c's jsrf_pushbuffer_ack reports that work
+CONSUMED WITHOUT EXECUTING IT, and src/nv2a/nv2a_pgraph_d3d11.c is a D3D11
+translator, so on macOS/arm64 there is no rasteriser at all. Getting a frame on
+this host is now a BACKEND job, not a recompiler or kernel job.
+
+Zero unresolved indirect calls at runtime. No fault suppression anywhere. One
+deliberate fake remains, documented: sub_001A1769 (see 4h) makes DirectSound's
+"submit APU command block and wait" return S_OK, so audio is silent.
+
+
+================================================================================
+1. THE VBLANK HANDSHAKE  -  RESOLVED.  What it actually was.
+================================================================================
+D3D's vsync pump is sub_0013B1C0:
+
+    loop:  sub_0018CE50()             ; wait for vblank
+           [0x25EFAC]++               ; vsync tick
+           sub_00141E50()
+           ResumeThread([0x27D0E8])   ; wake the ADX audio server, once a frame
+
+and the guest chain behind it (all confirmed, unchanged):
+
+    sub_00193C50  ISR   (vector 3)  - gated on ctx[0xA0] and NV_PMC_INTR_EN_0,
+                                      clears EN, queues its DPC, returns TRUE
+    sub_00194480  DPC               - dispatches per NV_PMC_INTR_0 bit, then
+                                      restores EN from ctx[0xb0]
+    sub_00193D90  vblank handler    - acks NV_PCRTC_INTR_0, SPINS until the
+                                      NV_PMC_INTR_0 summary clears, then
+                                      KeSetEvent(ctx+0x1C8)
+
+THE PREVIOUS CONTRACT SENT THE NEXT READER AT A CONTRADICTION THAT DID NOT
+EXIST. It said "the ISR returns TRUE, therefore it called KeInsertQueueDpc,
+yet the ordinal histogram records ZERO dispatches of ordinal 119". Both halves
+were misread:
+
+  * The ISR really does dispatch ordinal 119. Ordinal 119 was absent from the
+    histogram only because THE HISTOGRAM NEVER PRINTED: it is emitted from
+    kernel_thunk_dispatch, and by then every guest thread was blocked, so no
+    thunk was dispatched and no summary was produced. An absent histogram is
+    not a histogram of zeroes. (Section 2's warning about grepping for lines
+    that are never written applies to this instrument too.)
+  * Returning TRUE would not have proved the call happened anyway. In the
+    recompiled model a FAILED RECOMP_ICALL does not abort -- it sets eax = 0
+    and falls through to the next statement, which here is `SET_LO8(eax, 1)`.
+    Control-flow reasoning of the form "X is only reachable through the call"
+    holds on hardware and does NOT hold across a failed icall.
+
+THE TWO REAL DEFECTS ARE IN 4(s) AND 4(t). Both are measured and fixed.
+
+METHOD NOTE, because it cost the previous effort the most time: the fastest
+path to both was to STOP READING and take one `sample` of the hung process.
+It named every thread's blocking site in one shot, which immediately falsified
+the ordinal-119 story that six paragraphs of static reasoning had built up.
+
+================================================================================
+2. HOW TO SEE WHAT THE TITLE IS DOING  (read before trusting any measurement)
+================================================================================
+TWO TRAPS, each of which produced a confidently wrong conclusion in this effort:
+
+ 1. The stderr [FILE] lines carry a path for NtOpenFile but NOT for
+    NtCreateFile, and NtReadFile/NtWriteFile DO NOT LOG AT ALL. Grepping the
+    log for them returns 0 and means nothing. Two false conclusions came from
+    this: "the title never falls back to D:" and "the title issues zero reads".
+    Both were wrong.
+
+ 2. XBOX_LOG_LEVEL=5 slows the process about 13x. A logged run and an unlogged
+    run are NOT comparable. Same build, same ~50s:
+        unlogged     ord 246 = 15,958,552
+        LOG_LEVEL=5  ord 246 =  1,234,604
+    Always A/B at the same log level. A "16x improvement" was once reported
+    that was purely this.
+
+USE THE ORDINAL HISTOGRAM. Printed with the periodic summary:
+
+    [KERNEL] ordinals used (N): <ord>=<count> ...
+    [KERNEL]   ord <N> sites: 0x... 0x...
+
+The first line counts every dispatched ordinal - the only reliable answer to
+"does the title ever call X". The second gives the first few distinct GUEST
+RETURN ADDRESSES per ordinal, which is what turns "something calls this 70
+million times" into an address to disassemble. The entire ADX/D3D chain in
+section 1 was found with it. It is built into one buffer and written with a
+single fprintf on purpose: a per-entry loop interleaves with worker-thread
+logging and produces a line that reads as corrupt.
+
+XBOX_LOG_LEVEL=5 additionally puts full file paths in build/xbox_kernel.log.
+
+--------------------------------------------------------------------------------
+3. BUILD / RUN / REGENERATE  (exact commands)
+--------------------------------------------------------------------------------
+Two Python interpreters, and this WILL bite you:
+
+    /usr/bin/python3   has capstone,  has NO pytest
+    python3 (3.14)     has pytest,    has NO capstone
+
+  Regenerate (lifter/disasm changes)   - needs capstone, ~12 min:
+      PYTHON=/usr/bin/python3 sh diagnostics/jsrf_first_fault/regenerate.sh
+
+  regenerate.sh now ITERATES THE DISCOVERY LOOP TO A FIXPOINT (MAX_ROUNDS=8)
+  with an accumulator, build-macos/jsrf-first-fault/vtable_seeds_accum.json,
+  because func_id overwrites its per-run seed file each round. JSRF converges
+  after 7 rounds: +4578, +4, +2, +2, +1, +1, +0. It also passes
+  --exclude-manual, which it was MISSING - running the old script silently
+  discarded the sub_001A1769 override and reintroduced the audio blocker.
+
+  Recompiler stage only (lifter changed, disasm unchanged) - ~12s:
+      /usr/bin/python3 -m tools.recomp "../Jet Set Radio Future (US)/default.xbe" \
+        --all --split 1000 \
+        --disasm-dir build-macos/jsrf-first-fault/disasm \
+        --func-id-dir build-macos/jsrf-first-fault/func-id \
+        --gen-dir   build-macos/jsrf-first-fault/gen \
+        --output-dir build-macos/jsrf-first-fault/recomp-summary \
+        --trace-functions diagnostics/jsrf_first_fault/reach_trace.json \
+        --exclude-manual diagnostics/jsrf_first_fault/jsrf_manual_overrides.c
+
+  Build (~1 min kernel-only, ~4 min if recomp_types.h or gen/*.c changed):
+      cmake --build build-macos/jsrf-first-fault/build \
+            --target jsrf_first_fault --parallel
+
+  Run:
+      cd build-macos/jsrf-first-fault/build && ./jsrf_first_fault
+
+  Tests:
+      /usr/bin/python3 -m unittest discover -s tools/recomp -t . -p "test_*.py"
+          -> 80 tests, all passing
+      python3 -m pytest tools/kernel_audit/ -q
+          -> 15 passing
+      /usr/bin/python3 tools/disasm/test_decode_at.py        -> 4 checks
+      /usr/bin/python3 tools/disasm/test_seed_realign.py     -> 5 checks
+          (these two are plain scripts, so they RUN here despite needing
+           capstone; the rest of tools/disasm and tools/func_id are
+           pytest-style AND need capstone, so they remain unrunnable)
+      tools/disasm/ and tools/func_id/ tests are pytest-style AND need capstone,
+      so they are UNRUNNABLE in this environment. Pre-existing, not caused by
+      these changes. The strongest available signal that discovery is healthy is
+      a clean regeneration: "9335/9335 functions (0 failed)".
+
+
+--------------------------------------------------------------------------------
+4. WHAT WAS FIXED (all verified at runtime, tests added where the repo has a
+   convention for them)
+--------------------------------------------------------------------------------
+
+(a) src/kernel/kernel_bridge.c - IoCreateDevice / IoDeleteDevice (ord 65 / 68)
+    Ordinal 65 was unrouted; the generic fallback returned STATUS_SUCCESS
+    without writing the out-parameter. Routing it to the existing native
+    xbox_IoCreateDevice would have been worse - it HeapAllocs host memory and
+    writes a 64-bit host pointer through a 4-BYTE guest out-slot.
+    Implemented against the guest memory model instead: XboxGuestDeviceObject
+    (0x38 bytes, DeviceExtension at +0x18, _Static_assert'd), both allocations
+    from xbox_HeapAlloc, exactly 4 bytes written to the out-slot, host-side
+    table for extension lifetime. Proven at runtime: 8 devices (\Device\MU_0..7),
+    ext_size=0x170, out-slot neighbours unchanged, 0x170-byte clear lands.
+
+(b) tools/recomp/lifter.py - bsf / bsr were lifted to a comment
+    D3D's Log2 helper (sub_00192B10) is a bare `bsf eax, ecx`, so it returned a
+    stale eax and every surface size from log2(w)+log2(h)+log2(d) was garbage:
+    JSRF asked MmAllocateContiguousMemoryEx for 0x08000000 bytes (2x console
+    RAM) and D3D failed with E_OUTOFMEMORY.
+    Zero source leaves the destination UNMODIFIED (x86 semantics) - the guard
+    reproduces that; writing any sentinel would invent a value hardware never
+    produces. Helpers BSF32/BSR32 in templates/runtime/recomp_types.h.
+    + tools/recomp/test_lifter_bitscan.py (5 tests), conformance cases.
+
+(c) src/kernel/xbox_memory_layout.c - MCPX_READY (AC97 codec ready)
+    DirectSound polls AC97 GLOB_STA (0xFEC00130) bit 8 up to 1000 times, then
+    returns DSERR_NODRIVER (0x88780078). That is the game object's construction
+    status; sub_00012C10 sees it negative and the run loop never starts, so main
+    returns and XAPI reboots to the dashboard. Measured before the fix: exactly
+    1000 KeStallExecutionProcessor calls from 0x001A6CD2, the whole budget.
+    One table entry, applied at map time so the first reader cannot lose a race
+    with the ack thread.
+
+(d) src/kernel/xbox_memory_layout.c - AArch64 MMIO write trap
+    DirectSound's AC97 bus-master reset (sub_001A6F52) writes CR bit 1 (RR) and
+    spins - but MSVC hoisted the read OUT of the loop, so a polling ack thread
+    cannot help: it would have to win a few-instruction race exactly once and
+    losing hangs forever. The missing semantic is WRITE SUPPRESSION.
+    Both existing hooks (nv2a_mmio_hook.c, apu_mmio_hook.c) are x86-64 decoders
+    behind #if defined(_WIN32), and the APU one covers 0xFE800000+512K which
+    does not even reach AC97 on Windows.
+    Only the pages holding a MCPX_WRITE_CLEAR register are mprotect'd read-only.
+    The decoder is small because si_addr already gives the faulting address, so
+    only the store WIDTH and SOURCE REGISTER need decoding, and those sit at
+    fixed bit positions across every AArch64 store addressing mode:
+        if ((insn & 0x3EC00000u) != 0x38000000u) -> report + chain
+        width = 1u << (insn >> 30);  rt = insn & 0x1Fu;
+    An undecodable store is reported and chained to the previous handler, never
+    skipped. Runtime: "1 page(s) guarded, 8 register(s)", zero decode failures.
+
+(e) tools/recomp/lifter.py - repe cmpsw/cmpsd and scasw/scasd
+    THE BIG ONE. cmpsb/scasb were implemented; the word/dword widths lifted to a
+    comment. Worse, `repe cmpsd` matched no flag-tracking set, so a following
+    `sete` resolved its ZF against the PRECEDING instruction - which in a GUID
+    compare is the `xor edx,edx` that zeroes the result byte. It was therefore
+    always 1.
+    Consequence chain (each step measured):
+        CDirectSound QueryInterface (sub_00168310) matched its first candidate
+        IID always -> returned `this` (vtable A @0x1E3A70) instead of `this+4`
+        (vtable B @0x1E3A5C) -> caller invoked vtable A slot 3 = sub_00168480
+        (`ret 8`, 2 args) with 3 args pushed -> 4 bytes leaked -> the enclosing
+        sub_0005F350's `pop esi` read one slot low -> the game object's `this`
+        came back as a TLS address (0x00700010) -> run loop bailed -> exit.
+    Fix is two narrow changes, both inside the `rep`-prefixed branch so the SSE
+    `cmpsd` name collision cannot be hit.
+    + rewrote tools/recomp/test_lifter_string_compare.py (the old test asserted
+      the GAP: "unsupported dword compare does not claim byte flags") and added
+      a regression for the exact xor/repe cmpsd/sete shape. + conformance cases.
+
+(f) diagnostics/jsrf_first_fault/icall_seed.json - 21 seeded function entries
+    Was []. These are RUNTIME-OBSERVED targets, not heuristics. I measured the
+    heuristic alternatives and rejected them:
+        data_imm target, executable, outside all bodies        -> 781 candidates
+        + source is `push imm32` + decodes to a ret/jmp        -> 531
+    531 is still dominated by MSVC SEH scope tables (0x186bab-0x18ac98) pushed
+    into _SEH_prolog - i.e. DATA. A sweep would seed hundreds of data addresses
+    as code. Do not go down that road without much stronger discrimination.
+    Every seeded address was validated: executable section, in a GAP between
+    detected bodies (so seeding splits nothing), decodes to its own ret/jmp.
+    Result: 9313 -> 9326 functions, 0 failed. Four of them (0x0013B180/B1C0/
+    B230/B2A0) turned out to be the worker THREAD ENTRY routines, so this is
+    load-bearing for threading, not just for the APC.
+    NOTE: 0x00178E40 had to be added by hand - NtUserIoApcDispatcher resolves
+    via recomp_lookup directly, not RECOMP_ICALL, so the ICALL feedback loop
+    never sees it. That is a real hole in the feedback mechanism.
+
+(g) src/kernel/kernel_bridge.c - thread/handle contract  (NEWEST, least soaked)
+    Three coupled changes:
+      1. bridge_resolve_handle / bridge_read_handle: an UNTAGGED token now
+         resolves to NULL instead of (HANDLE)token. This is the mirror of the
+         IoCreateDevice rule: there a host pointer must not escape into the
+         guest ABI; here a guest value must not escape into a host pointer.
+         ResumeThread does ((w32_object*)h)->kind after only a NULL check, so a
+         guest address faulted the host inside xbox_NtResumeThread.
+      2. PsCreateSystemThreadEx now reads arg 7, CreateSuspended, which it had
+         been ignoring entirely (documented in docs/formats/kernel-exports.md).
+      3. bridge_spawn_thread always CreateThread(..., CREATE_SUSPENDED, ...);
+         the caller writes the guest handle slot and only then resumes. This
+         closes an ordering hole - a worker was running before
+         bridge_write_handle filled the slot, and one NtResumeThread was
+         measured arriving with token 0x00000000.
+    The untagged sentinels (0xDEAD0001 NtOpenSymbolicLinkObject, 0xBEEF0010
+    NtCreateDirectoryObject, 0xBEEF0001 inline thread) are only ever COMPARED -
+    bridge_NtClose tests the raw token before resolving - so NULL is correct for
+    them and turns an operation on one into an honest failure.
+    RESULT: the deterministic host crash in ResumeThread is gone; the title now
+    reaches the guest-side 0xFFFFFFF8 fault in section 1.
+
+
+(h) tools/recomp/lifter.py - cmpxchg / lock cmpxchg
+    Same shape as (e): the flag side was already wired (_EFLAGS_SETTERS, and
+    _resolve_flag_condition had a cmpxchg arm) but there was NO LIFT, so the
+    instruction was a comment. Two bugs:
+      - the exchange never happened, so DSOUND's sub_001A1F31 never cleared the
+        pending-event mask it atomically swaps to zero;
+      - nothing reloaded the accumulator on failure, so the standard
+        `mov eax,[m]; L: cmpxchg [m],edx; jne L` retry loop could not terminate
+        once another thread touched the word.
+    Also fixed the resolver arm, which answered `({dst} == eax)` - operands read
+    AFTER the instruction has written them, so it compared the wrong value. It
+    now consumes _flags like the string compares do. ZF only is modelled;
+    je/jne are answered and everything else falls through rather than being
+    answered wrongly.
+    + tools/recomp/test_lifter_cmpxchg.py (7 tests), 2 conformance cases.
+    NOTE: this did NOT fix the section-1 deadlock. It is still a real defect
+    worth having - it would spin forever under contention - but do not expect
+    it to have moved the blocker.
+
+(i) NtSuspendThread + a cooperative suspend safe point
+    src/kernel/kernel_bridge.c, src/platform/win32_compat.{c,h}
+    NtSuspendThread (ordinal 231) had an arg-size entry but NO BRIDGE WRAPPER
+    at all, so it fell to the generic stub and returned STATUS_SUCCESS without
+    suspending. A worker that suspends itself came straight back and asked
+    again. Wrapper written and routed (same bar as NtResumeThread: handle token
+    in, 4-byte count out, nothing allocated or handed back as a pointer).
+    Platform side, two halves:
+      - SELF-suspension now blocks on the same gate CREATE_SUSPENDED and
+        ResumeThread already use. That is the case POSIX supports exactly.
+      - CROSS-thread suspension is cooperative: SuspendThread sets the count and
+        the TARGET parks itself at a safe point, w32_thread_suspend_point(),
+        called from kernel_thunk_dispatch. POSIX has no primitive that stops
+        another running thread safely.
+    The safe-point design is not invented here: docs/technical/
+    ms-fusion-recompiler.md documents Microsoft's own Xbox recompiler polling a
+    per-thread preemption flag and calling out to the runtime, emitted at loop
+    back-edges (callout kind 0x1d, 26.7k sites). We do not control the
+    generated code, so the poll sits at the kernel dispatch instead. That is
+    COARSER: a guest thread spinning in a pure compute loop with no kernel calls
+    will not stop. Fast path is one relaxed read.
+    EFFECT: kernel call volume in a hung run 36.8M -> 21.0M. It did NOT unblock
+    the title - see the note below.
+
+(j) Timer / DPC delivery  -  src/kernel/kernel_bridge.c
+    bridge_KeSetTimer was a STUB that recorded nothing and scheduled nothing:
+        /* Timer functionality is not needed for basic execution. */
+        g_eax = 0;
+    so gap-analysis.md's "Timers and DPCs | DONE" was simply wrong. A driver's
+    periodic work runs from a timer DPC, and JSRF's DSOUND arms exactly that -
+    KeSetTimer(Timer=obj+0x720, DueTime, Dpc=obj+0x748) - to pump its APU
+    command ring.
+    Now implemented: a 32-entry timer table, relative (negative) LARGE_INTEGER
+    due times converted to a GetTickCount deadline with a wrap-safe compare,
+    KeSetTimerEx periods, KeCancelTimer, and KeInsertQueueDpc (ordinal 119,
+    previously unrouted) all delivering through one bridge_run_dpc() that calls
+    the guest DeferredRoutine with the __stdcall shape bridge_NtUserIoApcDispatcher
+    established. Delivery happens at the kernel-thunk-dispatch safe point added
+    in (i), guarded against re-entering a DPC on the same thread.
+    Absolute due times are NOT modelled (they need a system-clock epoch this
+    runtime does not carry); such a request is armed as "due now" and says so
+    once rather than being dropped silently.
+    STATUS: the timer IS armed at runtime (ordinal 149 appears in the traced
+    calls) but NO DPC has been delivered yet - bridge_run_dpc finds the
+    DeferredRoutine field at dpc+12 reading 0, i.e. that KDPC never went through
+    KeInitializeDpc. DSOUND has only ONE KeInitializeDpc call (0x001A741F) and
+    it initialises a different DPC (obj+0x1c, routine 0x001A72F1). Where
+    obj+0x748 gets initialised is the next thing to find.
+
+(k) APU brought up and its register writes routed to the model
+    diagnostics/jsrf_first_fault/main.c, src/kernel/xbox_memory_layout.{c,h}
+    src/apu (the xemu-derived MCPX APU, already built and linked as xbox_apu)
+    was never initialised by anything. It is now:
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+    and it comes up cleanly - "MCPX APU initialized (standalone)", RAM pointer
+    0x300000000, frame thread running. Audio stays silent: off Windows the
+    module's waveOut path is inert by design, which is fine, we need the
+    register model and the frame thread, not sound.
+    Guest writes to the APU aperture (0xFE800000 +512K) now reach
+    mcpx_apu_mmio_write, by extending the AArch64 write trap from (d) to guard
+    that range as well. Verified end to end: "APU aperture routed to the model"
+    and 12 register writes observed arriving (+0x001004, +0x001100, +0x002000,
+    +0x002054/58/60/6C ...).
+    Design notes worth keeping:
+      - WRITES ONLY. Reads stay ordinary loads against the mapped page, so a
+        polled register (the sample counter at +0x020010 is read in a spin
+        loop) does not become millions of signals. The cost is that a register
+        with READ side effects is not modelled; none is known to be needed yet.
+        Adding reads means PROT_NONE plus an AArch64 load decoder - the same
+        fixed-bit-position job as the store decoder, so not hard, just more.
+      - Routed through a HOOK (xbox_SetApuMmioWriteHook) rather than a direct
+        call, so xbox_kernel keeps no link dependency on xbox_apu. The
+        jsrf_av_encoder_option_test target links the kernel alone and must
+        still build - it does; check it if you change this.
+      - The APU mprotect happens AFTER sigaction is installed. Between the two
+        there is no handler, and a write landing in that window would be fatal.
+      - MCPX_COUNTERS live inside the now-guarded aperture, so the ack thread's
+        tick goes through an unprotect/reprotect pair. It ticks ~1000/s, not per
+        access, so the two extra syscalls do not matter.
+    STATUS: still hangs on the doorbell. Only 12 writes arrive before the guest
+    blocks, i.e. it programs some registers and then waits before writing
+    whatever would start the DSP. Next: find which register the guest is
+    waiting on, and whether the model needs the READ side to answer it.
+
+(l) MMX implemented - templates/runtime/recomp_types.h, src/kernel/
+    xbox_memory_layout.c, tools/recomp/lifter.py
+    MMX was absent from the recompiler entirely. Upstream's v0.6.0 closed the
+    SSE gap ("packed SSE was lifted as a scalar float", 18,439 moves) and never
+    touched MMX; there is no doc saying it was deliberate.
+    It was not harmless. D3D's block copy sub_00198FD0 is, per 64-byte
+    iteration, `movq mm0..mm7,[esi+n]` then `movntq [edi+n],mm0..mm7`. `movq`
+    was in the SSE mnemonic list so the MMX form fell out of that handler as an
+    "SSE: movq" comment, and `movntq` had no rule and became a TODO. THE MEMCPY
+    COPIED ONLY ITS rep-movsd PROLOGUE AND EPILOGUE AND SILENTLY DROPPED EVERY
+    64-BYTE BLOCK IN BETWEEN.
+    Added: g_mm0..g_mm7 (RECOMP_TLS uint64_t) with mm0..mm7 macros, MEM64(),
+    and lifts for movq/movntq with an MMX operand plus emms/femms as no-ops.
+    x87/MMX register aliasing is NOT modelled - nothing in the corpus
+    interleaves them. punpcklwd/punpcklbw/psrld (4 sites total) are still TODO;
+    doing them wrong would be worse than leaving them.
+    + tools/recomp/test_lifter_mmx.py (6 tests) and an MMX arm in
+    test_runtime_helpers_defined.py mirroring the XMM one. 80 tests pass.
+    NOTE: this did NOT fix the section-1 null. It is a real corruption bug that
+    needed fixing regardless.
+
+
+(l) tools/disasm/disasm.py - --seed-functions NEVER REALIGNED THE SWEEP
+    A seeded address went straight to FunctionDetector._add_candidate. A
+    candidate with no instruction decoded AT its address is dropped by
+    _build_functions (`if num_insns == 0: continue`), so any seed landing where
+    linear_sweep came out of phase was SILENTLY DISCARDED. That is exactly what
+    Engine.decode_at exists to fix, and it was already wired into
+    _pass_call_targets and the tail-jump pass -- just never into seeding.
+    JSRF's 0x0007BE30 is 16-aligned, preceded by four nop padding bytes, opens
+    with the MSVC SEH prologue, was found by the vtable scanner AND observed as
+    an unresolved indirect call 100 times at runtime, and still never became a
+    function because a 7-byte ljmp decoded out of data put the sweep out of
+    step. Seeding now calls decode_at, gated by the same
+    config.CALL_TARGET_REALIGN_ALIGNMENT == 16 corroboration the call-target
+    pass uses.
+    MEASURED: 70 seeds realigned per round, 31 refused as unaligned, 0
+    undecodable. Functions 9336 -> 9403, unresolved stubs 323 -> 319. The 31
+    refusals are correct: identified_functions.json is full of bogus
+    vtable_thunk entries (0x00014185/86/88 - overlapping, one byte apart) and
+    none became functions.
+    + tools/disasm/test_seed_realign.py (5 checks). NOTE the fixture has to work
+    to get the sweep out of phase: runs of 0x00 decode as 2-byte instructions
+    and pair up, so naive padding lands ON the 16-byte boundary and the bug does
+    not reproduce. It uses a 3-byte "add byte ptr [edx-1], ch" at +0x0F to
+    swallow the start at +0x10, and asserts that premise explicitly so the
+    fixture cannot rot into a test that passes for the wrong reason.
+
+(m) src/kernel/kernel_bridge.c - KfRaiseIrql / KfLowerIrql read the WRONG
+    ARGUMENT SOURCE. The "f" in a Kf/Iof/Obf export means __fastcall: the
+    argument arrives in ecx and never reaches the stack, which is why their
+    arg-size entries are 0. stdcall_args_for_ordinal even SAID SO in a comment
+    naming these two. Both bridges nevertheless read STACK_ARG(0), i.e. caller
+    residue. Symptom: "KfLowerIrql: attempt to raise IRQL from 2 to 144" every
+    ~24ms (144 is not a valid IRQL; HIGH_LEVEL is 31), driving the kernel's
+    tracked IRQL to garbage. Now 0 occurrences.
+    + tools/kernel_audit/test_bridge_stack_args.py (3 checks): asserts
+    mechanically that no bridge reads past its declared frame, pins the three
+    known fastcall bridges to g_ecx by name, and plants a fault to prove the
+    checker can actually fail. It found no other instances.
+
+(n) src/kernel/kernel_bridge.c - ObReferenceObjectByHandle returned a FAKE
+    SUCCESS: it wrote 0 into the guest's *Object out-parameter and returned
+    STATUS_SUCCESS. The guest passed that NULL to KeQueryBasePriorityThread /
+    KeSetBasePriorityThread / ObfDereferenceObject, all three of which were
+    UNROUTED and returned 0, so the title set a priority, read back a constant
+    0, and could not converge: 16,666,400 references / 11,110,930 sets /
+    5,555,465 queries in ~50s, an exact 3:2:1.
+    Now backed by a real guest-visible object (XboxGuestObject, 0x10 bytes,
+    xbox_HeapAlloc, one per handle token, tracked host-side in s_guest_objects).
+    Same rule as the guest DEVICE_OBJECT: the guest gets a GUEST VA, never a
+    host pointer, and the bridge acts only on pointers it issued. An unknown
+    handle returns STATUS_INVALID_HANDLE rather than lying. Ordinals 124, 143
+    and 250 are routed against it.
+    WHY 143 WAS UNROUTED AND NEEDED THIS FIRST: xbox_KeSetBasePriorityThread
+    does `HANDLE h = (HANDLE)Thread` and calls GetThreadPriority on it. Its
+    argument is a guest OBJECT POINTER, so routing it mechanically would have
+    handed a guest address to a host API.
+    NOTE: this did NOT reduce the spin (see section 8). It was still a real
+    defect and the fix is right; it just was not the cause.
+
+(o) src/kernel/kernel_bridge.c - the NtCurrentThread pseudo-handle (0xFFFFFFFE)
+    was unhandled. Once (n) stopped lying, every reference failed with
+    STATUS_INVALID_HANDLE and the title converted it via RtlNtStatusToDosError
+    1,686,905 times -- at exactly the reference-call rate, which is how it was
+    identified. The title adjusts its OWN priority, so this is the common case.
+    Handled by keying the object on THREAD ID (BRIDGE_TID_TOKEN_TAG) rather
+    than a handle, because win32_compat only has a real per-thread object for
+    threads it spawned (t_self_obj) -- the main thread has no handle to key on.
+
+(p) src/kernel/kernel_sync.c semantics, fixed in the bridge - THE CAUSE OF THE
+    ENTIRE SPIN. xbox_KeWaitForSingleObject and xbox_KeSetEvent both did
+    `HANDLE h = (HANDLE)Object`. The Ke* family takes a POINTER TO A DISPATCHER
+    OBJECT IN GUEST MEMORY, not a handle -- the same "guest value must not
+    escape into a host pointer" class the IoCreateDevice and
+    bridge_resolve_handle notes describe. D3D waits on a KEVENT embedded in its
+    own device (sub_0018CE50, dev+0x2430), which is guest memory, so the compat
+    layer rejected it and THE WAIT RETURNED INSTANTLY. The vsync pump above it
+    free-ran, and 68M waits, 77M NtResumeThread, the 3:2:1 Ob/Ke priority churn
+    and the ADX server ticking 73k/s instead of 60/s all hung off that one line.
+    Fixed at the bridge, where guest memory is addressable. DISPATCHER_HEADER:
+    +0x00 Type (0=Notification, 1=Synchronization i.e. auto-reset), +0x04
+    SignalState -- +0x04 confirmed by the guest itself clearing object+4 before
+    waiting. bridge_KeWaitForSingleObject polls SignalState, auto-resets a
+    synchronization object, honours the NT timeout, and pumps timers + vblank
+    while blocked so a title whose threads all wait still sees time pass.
+    RESULT: KeWaitForSingleObject and NtResumeThread dropped OUT of the hot set
+    entirely (68M and 77M -> under 30).
+
+(q) The NV2A vblank interrupt path - see section 1 for the full description.
+    KeConnectInterrupt now records which interrupt was connected (it used to
+    answer "yes" and discard it); bridge_vblank_poll raises vector 3 at 60Hz;
+    xbox_Nv2aRaiseVblank bypasses the write guard; the MMIO trap covers the
+    NV2A PCRTC page; a DPC queued from an ISR is deferred rather than refused;
+    bridge_run_isr/bridge_run_dpc save and restore the guest register file.
+    Observed registrations: vector 3 GPU routine=0x00193C50, vector 1 USB,
+    vector 6 ACI, vector 5 APU. Delivery measured at exactly 60Hz
+    (KeInsertQueueDpc = 3,130 calls in ~52s) before the latch described in
+    section 1.
+
+(r) src/kernel/kernel_bridge.c - per-ordinal histogram and per-ordinal call-site
+    capture in kernel_thunk_dispatch. See section 2; this is the instrument that
+    found (n), (o), (p) and the whole of section 1.
+
+
+(s) src/kernel/xbox_memory_layout.c - the ack thread ERASED THE INTERRUPT IT
+    WAS MEANT TO DELIVER.  NV2A_ACK held NV_PMC_INTR_0 (0x000100) and
+    NV_PCRTC_INTR_0 (0x600100) at zero with 0xFFFFFFFF masks. That was correct
+    when it was written -- its own comment says "nothing here ever raises a GPU
+    interrupt, so 'none pending' is the truth" -- and (q) falsified the premise
+    without updating the table.
+    The race: xbox_Nv2aRaiseVblank sets PCRTC bit 0 and the PMC bit-24 summary,
+    then the ISR queues its DPC; the ack thread zeroed PMC before D3D's DPC
+    (sub_00194480) read it at [ctx+0x100], so the DPC saw no pending source,
+    never dispatched to the vblank handler, and the handler therefore never
+    acked PCRTC and never signalled the device's vblank KEVENT. Then
+    bridge_vblank_poll's "do not re-raise while unacknowledged" gate latched
+    shut. Measured before: EXACTLY ONE ISR AND ONE DPC PER RUN, then every D3D
+    thread blocked in sub_0018CE50 forever.
+    Fixed by carving the display engine out of the two masks rather than
+    dropping the entries: PMC keeps ~0x01000000, PCRTC keeps ~0x00000001. The
+    other three engines (PBUS, PFIFO, PGRAPH) still get held down, which is
+    what the Halo ServiceGrInterrupt recursion in the same comment needs.
+    Clearing PCRTC was also pure overhead: the trap models it write-1-to-clear,
+    so the ack thread's store of 0 changed nothing while still taking a page
+    fault every loop iteration.
+    NOTE this supersedes the section-8 retraction "NV_PCRTC_INTR_0 is NOT
+    write-1-to-clear". IT IS W1C. sub_00193D90 reaches its acknowledge with
+    ecx = 1 on every path (loc_00193E1E and loc_00193E96 both set it) and
+    stores that to [ebx+0x600100]. The in-tree trap handler already implements
+    W1C and is right; only the retraction was wrong.
+
+(t) tools/recomp/translator.py - A FAILED INDIRECT CALL DOUBLE-CLEANED A
+    __cdecl CALL SITE.  This is the general defect, and it is silent.
+    RECOMP_ICALL_SAFE rewinds g_esp to the pre-argument value when the target
+    does not resolve. That is exactly right for a callee-clean convention --
+    stdcall/thiscall pop their own arguments -- and it is one cleanup too many
+    at a caller-clean site, because the guest's own `add esp, N` follows the
+    call and runs whether or not the lookup succeeded. esp ends N bytes HIGH
+    and every later pop in the function reads one slot off, so the epilogue
+    restores garbage into the caller-saved registers.
+    Concretely: sub_00193D90 invokes a registered callback through [ctx+0x1C4]
+    as cdecl. Its target 0x0015F9D0 was not a detected function, so the lookup
+    failed, esp came back +4 (measured: "DPC ret ... delta +4"), the handler's
+    four pops shifted, and it returned ebx = 0. Its caller, the vblank DPC,
+    then did `mov eax,[ebx+0xB0]` to reload NV_PMC_INTR_EN_0 from the device
+    context and read address 0xB0 instead -- so EN stayed 0, the ISR bailed at
+    its enable gate on every later vblank, and the frame loop stopped after one
+    frame. This is why fixing (s) alone moved delivery from 1 ISR to 2 and no
+    further.
+    Fix: _fixup_icall_esp_save now detects the caller-side cleanup and passes
+    `_icall_esp - N`, which is the esp a SUCCESSFUL cdecl call would have left
+    (return address gone, arguments still there for the guest to remove). The
+    scan crosses the return-address label and any straight-line computation
+    MSVC scheduled between call and cleanup -- "call eax; mov dl,[esp+0x17];
+    add esp,4" is the shape -- and refuses anything ambiguous: a second label
+    (another block reaches the cleanup), a non-multiple of 4, anything over 64
+    bytes (a local frame teardown, not an argument list), or any intervening
+    control flow, push/pop or other esp assignment. 199 of 5,293 sites are
+    caller-clean; the rest keep the callee-clean behaviour unchanged.
+    + 5 tests in tools/recomp/test_call_retaddr.py, including one pinning the
+    callee-clean default (the 98.5% case, where a regression would be worse
+    than the bug) and two proving the refusals.
+
+(u) diagnostics/jsrf_first_fault/icall_seed.json - seeded 0x0015F9D0, the D3D
+    vblank callback. 7 bytes, `inc dword ptr [0x265174]; ret`, i.e. a frame
+    counter. Validated on the same standard as the other entries: in .text, in
+    the GAP between 0x0015F9A0 (ends 0x0015F9C8, `ret 4`) and 0x0015F9E0 so
+    seeding splits nothing, 16-aligned, decodes to its own ret. It is another
+    instance of OPEN ITEM 2 -- a function pointer stored in a structure, with
+    no call site and no prologue for any discovery pass to find.
+    Regeneration converges in 7 rounds to 9406/9407 functions, 0 failed.
+
+--------------------------------------------------------------------------------
+5. FILES CHANGED
+--------------------------------------------------------------------------------
+    src/kernel/kernel_bridge.c              (a), (g), (i)
+    src/platform/win32_compat.c/.h          (i)
+    diagnostics/jsrf_first_fault/main.c     (k)
+    (j) is kernel_bridge.c as well
+    src/kernel/xbox_memory_layout.c         (c) and (d)
+    templates/runtime/recomp_types.h        BSF32/BSR32 helpers
+    tools/recomp/lifter.py                  (b) and (e)
+    tools/recomp/test_lifter_string_compare.py   rewritten
+    tools/recomp/test_lifter_bitscan.py     NEW
+    tools/recomp/test_lifter_cmpxchg.py     NEW
+    tools/recomp/test_lifter_mmx.py         NEW
+    tools/conformance/cases.py              bsf/bsr + repe cmpsd cases
+    diagnostics/jsrf_first_fault/icall_seed.json  12 seeds
+
+  Added later in the effort:
+    tools/disasm/disasm.py                  (l) seed realignment
+    tools/disasm/test_seed_realign.py       NEW, 5 checks
+    tools/kernel_audit/test_bridge_stack_args.py  NEW, 3 checks
+    diagnostics/jsrf_first_fault/regenerate.sh    fixpoint loop + --exclude-manual
+    diagnostics/jsrf_first_fault/thread_start_seed.json
+                                            + 0x0013B110 ADX manager
+                                            + 0x00193C50 D3D vblank ISR
+                                            + 0x001A72E0 ACI ISR
+                                            + 0x00194480 D3D vblank DPC
+    src/kernel/kernel_bridge.c              (m)(n)(o)(p)(q)(r)
+    src/kernel/xbox_memory_layout.c/.h      (q) xbox_Nv2aRaiseVblank,
+                                            xbox_Nv2aVblankPending, NV2A PCRTC
+                                            page added to the MMIO write trap
+    build-macos/jsrf-first-fault/vtable_seeds_accum.json   generated, do not
+                                            hand-edit; regenerate.sh rebuilds it
+
+  Added closing the vblank handshake:
+    src/kernel/xbox_memory_layout.c         (s) NV2A_ACK display-engine masks
+    tools/recomp/translator.py              (t) caller-clean icall detection
+    tools/recomp/test_call_retaddr.py       (t) +5 tests
+    diagnostics/jsrf_first_fault/icall_seed.json  (u) +0x0015F9D0
+
+The worktree had many OTHER pre-existing modifications before this work
+(tools/disasm/*, tools/func_id/*, src/platform/*, src/nv2a/*, several
+src/kernel/*). Those are not mine - do not attribute them to this effort.
+
+
+--------------------------------------------------------------------------------
+6. GOTCHAS THAT COST REAL TIME
+--------------------------------------------------------------------------------
+* lldb is effectively UNUSABLE on this binary now. The MMIO write trap (3d)
+  raises EXC_BAD_ACCESS on every write to the guarded AC97 page, and lldb
+  intercepts the Mach exception BEFORE the POSIX handler, so
+  `process handle SIGSEGV -p true -s false` cannot step past it. This is a real
+  cost of the guard-page design. Symbolize offline instead:
+
+      # 1. from the run's stdout:   Preflight recomp_lookup(0x00148023) = 0x<RT>
+      # 2. static addr:             nm ./jsrf_first_fault | grep _xbe_entry_point
+      # 3. slide = RT - static
+      # 4. static_pc = HOST_PC - slide, then look it up in `nm` output
+  Note the guest entry point is symbol `_xbe_entry_point`, NOT `_sub_00148023`.
+
+* `timeout` does not exist on macOS. To bound a run, background it and use
+  `sample <pid> <seconds>` as both the delay and the profiler:
+      ./jsrf_first_fault > out 2> err & P=$!
+      sample $P 15 -f /dev/null    # acts as a 15s wait
+      kill -0 $P && echo "still running (HANG)" || echo "exited"
+  `sample` is also how you tell a hang from a slow run - and its call graph
+  names the spinning guest function (grep -oE "sub_[0-9A-F]{8}").
+
+* Adding an fprintf changes thread timing enough to change the outcome now that
+  real workers run. Instrument, but re-verify without the probe before believing
+  a result.
+
+* The kernel call trace only logs the first 200 calls; HEAP logs are rate
+  limited. Bump the limit temporarily rather than assuming nothing happened.
+
+* g_kernel_watch_va only samples across a bridge CALL, so it cannot see a write
+  made by guest code between two calls. If you need that, carry the value across
+  calls in a static.
+
+
+--------------------------------------------------------------------------------
+7. METHOD THAT ACTUALLY WORKED
+--------------------------------------------------------------------------------
+The user's loop, and it earned its keep every single time:
+
+    guest failure -> identify subsystem -> inspect current upstream
+    implementation + gap analysis -> compare title requirement ->
+    PROVE the missing semantic -> smallest general fix -> rerun
+
+Concretely, the techniques that broke each blocker:
+  * `--trace-functions` (diagnostics/jsrf_first_fault/reach_trace.json) plus a
+    hook in main.c's recomp_trace_enter/exit printing g_esi/g_esp. Compare
+    enter vs exit per callee: the one that differs is the culprit. This is how
+    the esi clobber was localised in two passes.
+  * A stack-balance invariant on resolved ICALLs: for a stdcall vtable call,
+    g_esp after the call MUST equal the saved pre-argument esp. Logging only
+    the mismatches named sub_00168480 immediately.
+  * Guest stack walk at a chosen bridge (scan g_esp..+0x2000 for values in
+    [0x00011000,0x0028C000]) to recover a guest call chain when the generated
+    code keeps no frame pointer.
+  * Always verify a `ret N` against RAW XBE BYTES, not the .asm listing. Doing
+    that is what exposed the two-vtable / this+4 structure behind (3e).
+
+Restore reach_trace.json and main.c afterwards - both are checked in.
+
+
+--------------------------------------------------------------------------------
+8. RETRACTED CLAIMS  (I got these wrong; do not build on them)
+--------------------------------------------------------------------------------
+* "The kernel thunk stdcall arg-size table under-counts for several ordinals"
+  - FALSE. I read negative deltas (-4, -8, -660) off my own ICALL balance probe
+  and concluded the table was wrong. Checked against the documented signatures
+  in docs/formats/kernel-exports.md the entries are correct: RtlInitAnsiString
+  2 args = 8, NtAllocateVirtualMemory 5 = 20, ExAllocatePoolWithTag 2 = 8,
+  KeRaiseIrqlToDpcLevel 0 = 0, MmAllocateContiguousMemoryEx 5 = 20.
+  The deltas were an artifact of WHERE RECOMP_ICALL_SAFE captures saved_esp -
+  before the caller's own `sub esp, N` for locals. Not a defect class.
+
+* "0x0005F330 is the vtable[0] call at 0x0006FA4F"
+  - Overstated. [0x1C4458] is 0x00012BF0, so 0x0005F330 was reached from some
+  other indirect site. What stands: it is a scalar-deleting-destructor thunk by
+  its instruction shape and it fires during teardown. Its call site is unknown.
+
+
+
+* "The fake-success ObReferenceObjectByHandle was the cause of the spin, and
+  fixing it cut call volume ~16x"
+  - The DEFECT was real and the fix is right. The 16x was ENTIRELY the
+  XBOX_LOG_LEVEL measurement artefact in section 2. Measured properly,
+  unlogged before vs unlogged after: 15,958,552 vs 15,718,165 references, i.e.
+  UNCHANGED. The real cause of the spin was (p).
+
+* "Seeding sub_0013B110 will let the CRI ADX manager run"
+  - It is now translated and dispatched and is STILL never invoked: 0
+  occurrences across every sampled stack. Its address is stored at 0x0013B4DC
+  by a callback registrar (sub_00141D60 writes a table at 0x2616E0), and
+  NOTHING in the binary reads that table -- searched every section. Leave the
+  seed in (real untranslated code is worse than translated code) but do not
+  count it as a fix.
+
+* "NV_PCRTC_INTR_0 is write-1-to-clear"
+  - THIS RETRACTION WAS ITSELF WRONG; the original claim stands. IT IS W1C.
+  sub_00193D90 reaches its acknowledge with ecx = 1 on EVERY path into
+  loc_00193E40 -- loc_00193E1E sets ecx = 1 and loc_00193E96 falls in with the
+  ecx = 1 established at loc_00193DB4 -- and stores that to [ebx+0x600100].
+  The in-tree trap handler has implemented W1C throughout and is correct; the
+  retraction was written against it and never applied. Read the generated C
+  for the function rather than any listing: it makes every path into the store
+  visible at once, which is what settles a "which path sets this register"
+  question. See 4(s).
+
+* "The ISR's indirect call is not reaching kernel_thunk_dispatch, or the
+  histogram is not counting it" (the old section-1 blocker)
+  - NEITHER. It reaches dispatch and is counted. The histogram was ABSENT, not
+  zero: it prints from kernel_thunk_dispatch, and every guest thread was
+  blocked, so nothing dispatched and nothing printed. Six paragraphs of static
+  reasoning were built on a log line that was never written. One `sample` of
+  the hung process falsified the whole thing in seconds -- take it FIRST.
+  The corollary is worth keeping: "label X is only reachable through the call"
+  is a HARDWARE argument. Across a failed RECOMP_ICALL the generated code sets
+  eax = 0 and falls through to the next statement, so a return value proves
+  nothing about whether the callee ran.
+
+* "Nothing calls KeSetEvent" / "the ADX manager is dead code"
+  - The first was wrong: sub_00193D90 calls it at 0x00193E5C. My scan missed it
+  because it linear-swept from the section start and went out of phase. Search
+  for the 4-byte import-slot address as a BYTE PATTERN (phase-independent),
+  then decode backwards. This is the SAME defect Engine.decode_at exists to fix
+  (see 4l), committed in an analysis script instead of the tool. It cost two
+  wrong conclusions in one session.
+
+--------------------------------------------------------------------------------
+9. OPEN ITEMS
+--------------------------------------------------------------------------------
+* PRIMARY: A RASTERISER FOR THIS HOST. The frame loop now runs at 60Hz and the
+  title submits push-buffer work, but nothing executes it:
+  diagnostics/jsrf_first_fault/main.c's jsrf_pushbuffer_ack copies PUT to GET
+  so the guest sees its commands consumed, and src/nv2a/nv2a_pgraph_d3d11.c is
+  a D3D11 translator. On macOS/arm64 there is no backend. This is the first
+  thing on the path to a picture, and it is a graphics job rather than a
+  recompiler or kernel one.
+* The ordinal-119 contradiction is CLOSED - there was none. See section 1.
+* SECOND: automate the recurring defect class. Function pointers STORED IN
+  STRUCTURES are invisible to every discovery pass -- no call site, no prologue.
+  Three had to be hand-seeded this session after the runtime named them:
+      0x0013B110  CRI ADX manager   (callback table)
+      0x00193C50  D3D vblank ISR    ("ISR ... not in dispatch")
+      0x00194480  D3D vblank DPC    ("DPC routine ... not in dispatch")
+  Have KeInitializeInterrupt / KeInitializeDpc / the callback registrar append
+  their routine addresses to a generated seed file, the way icall_feedback
+  already does for indirect branches, so regenerate.sh picks them up on the
+  next fixpoint round. Upstream (sp00nznet/xboxrecomp) has no ISR/interrupt
+  discovery either -- this would be genuinely new.
+* TEMPORARY PROBES STILL IN THE TREE. Section 1 has landed, so these are now
+  removable; they are LEFT IN deliberately because they are the cheapest signal
+  that the frame loop is still alive, and the loop is new:
+      diagnostics/jsrf_first_fault/main.c   jsrf_adx_watch (ADX tick watcher)
+      kernel_bridge.c  bridge_run_isr       capped ISR result logging
+      kernel_bridge.c  bridge_run_dpc       capped DPC context logging
+  The ADX tick is the single best health check: ~60/s means the handshake is
+  working, and "STUCK at N" means it is not.
+  jsrf_pushbuffer_ack in main.c is NOT temporary - it is load-bearing.
+* The APU command-ring work is SUPERSEDED - the title is past it. The old
+  section-1 analysis that referred to it is history.
+* RESOLVED, kept for the reasoning: the four-worker "thread churn" was never an
+  independent bug and never a scheduler problem. It was entirely downstream of
+  (p) -- KeWaitForSingleObject returning instantly because it was handed a guest
+  dispatcher object as if it were a host handle. Several goals were spent
+  chasing it as scheduling, priorities, ADX and suspend/resume in turn. All four
+  were symptoms. If a future spin looks like a scheduler, check what the threads
+  are WAITING on before believing it.
+* ObfDereferenceObject (250), KeQueryBasePriorityThread (124) and
+  KeSetBasePriorityThread (143) are now ROUTED - see (n).
+* Still unrouted, each observed at least once and currently returning 0 with a
+  warning: ordinals 1, 17, 46, 100, 125, 137, 139, 144, 151, 175, 180, 305.
+* PROVENANCE WART, please read: icall_seed.json holds 13 entries, but the
+  seeding step in section 3(f) deliberately wrote 12. The extra one is
+  0x00141F10 (observed:100), and it exactly accounts for the translated count
+  moving 9325 -> 9326. I could not reconstruct how that entry got written -
+  the seeding run logged "icall_seed.json: 12 addresses". It was validated
+  after the fact on the same standard as the other twelve (decodes to 8 insns
+  ending in `ret`, now a 37-byte detected function, emitted once, in dispatch
+  once, and it WAS a genuine runtime-observed unresolved ICALL with 100 hits),
+  so it was kept rather than removed. Flagging it because an entry nobody can
+  account for is exactly the kind of thing that should not be inherited
+  silently. If you want a clean baseline, drop it and re-run - it is only
+  needed once the section-1 deadlock is past.
+* NtUserIoApcDispatcher resolves via recomp_lookup, bypassing RECOMP_ICALL, so
+  its failures never reach the ICALL feedback DB. Worth wiring up.
+* 0x001BF6A3 is now seeded and translated, but the DEFECT it exposed is not
+  fixed anywhere: without its constructor the XPP free list's terminator was
+  never written (last node .byte1 = 0 instead of 0x80), making the list a cycle.
+  Now that the ctor runs this should be correct - not re-verified.
+* The MMIO trap is #if !defined(_WIN32) && defined(__aarch64__). A POSIX x86-64
+  host still has no register semantics at all.
+* docs/technical/kernel-replacement.md is STALE: it still describes a
+  single-threaded model where "worker threads are deferred". The code has
+  XBOX_THREAD_MODE_SPAWN, real pthreads and per-thread RECOMP_TLS registers.
+  That staleness is exactly what left the 0xBEEF0001 sentinel in place. Worth
+  updating so the next person is not misled the way this contract was.
+* MCPX_WRITE_CLEAR lists all 8 AC97 boxes from the spec layout; JSRF exercises
+  two. AC97 register NAMES are inferred from the standard layout - the
+  behaviour is measured, and no fix depends on the naming.
+
+================================================================================

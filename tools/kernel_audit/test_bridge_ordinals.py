@@ -60,8 +60,9 @@ def test_every_route_matches_its_ordinal():
 
     # KeSetTimerEx is knowingly served by the KeSetTimer bridge; the extra
     # Period argument is dropped. Tracked, not silently accepted.
-    known = {"ordinal 150 -> bridge_KeSetTimer, but ordinal 150 is KeSetTimerEx"}
-    bad = [b for b in bad if b not in known]
+    # No standing waivers. Ordinal 150 used to share bridge_KeSetTimer and was
+    # excused here; it now has its own bridge_KeSetTimerEx, which the timer
+    # table needs anyway because only the Ex form carries a period.
 
     assert not bad, "misrouted kernel ordinals:\n  " + "\n  ".join(bad)
     print(f"ok  every_route_matches_its_ordinal ({len(load_routes())} routes)")
@@ -142,6 +143,24 @@ def test_every_routed_ordinal_has_an_arg_size():
     assert not missing, ("bridged ordinals fall through to `default: return 0` "
                          "and leak their args:\n  " + "\n  ".join(missing))
     print(f"ok  every_routed_ordinal_has_an_arg_size ({len(sized)} sized)")
+
+
+def test_avsendtvencoderoption_route_and_abi():
+    """Ordinal 2 must reach its output-writing bridge and pop four dwords."""
+    routes = dict(load_routes())
+    assert routes.get(2) == "AvSendTVEncoderOption", (
+        "ordinal 2 is not routed to bridge_AvSendTVEncoderOption")
+
+    src = open(BRIDGE_C, encoding="utf-8", errors="replace").read()
+    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    assert m and re.search(r"case\s+2:\s*return\s+16;", m.group(0)), (
+        "AvSendTVEncoderOption must pop four 32-bit stdcall arguments")
+
+    wrapper = re.search(
+        r"static void bridge_AvSendTVEncoderOption\(void\).*?\n\}", src, re.S)
+    assert wrapper and "XBOX_TO_NATIVE(STACK_ARG(3))" in wrapper.group(0), (
+        "AvSendTVEncoderOption result must be translated from a guest VA")
+    print("ok  avsendtvencoderoption_route_and_abi")
 
 
 def test_arg_sizes_are_dword_multiples():

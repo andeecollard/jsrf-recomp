@@ -29,3 +29,10 @@ build/
 bin/
 *.obj
 *.exe
+
+# Out-of-tree build + regeneration output (hundreds of MB, rebuilt by
+# diagnostics/jsrf_first_fault/regenerate.sh)
+build-macos/
+
+# Runtime logs
+xbox_kernel.log

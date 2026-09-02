@@ -1,0 +1,24 @@
+[
+  {
+    "start": "0x00147EBB"
+  },
+  {
+    "start": "0x00147FB4"
+  },
+  {
+    "start": "0x0013B110",
+    "_note": "CRI ADX manager. Reached only as data_imm from 0x0013B4DC (its address is stored, i.e. a thread entry point), so no call-target or prologue pass finds it and it was never translated. 16-aligned, preceded by 14 nop padding bytes, decodes to a coherent body ending in ret. It sets the handshake flag [0x25EFA4]=1 and waits for the ADX server (sub_0013B2A0) to clear it, reporting 'adxm_goto_mwidle_border' on timeout. Measured: the flag sits at 0 permanently and the server ticks ~73k/s with nothing to do, which is what an absent manager looks like."
+  },
+  {
+    "start": "0x00193C50",
+    "_note": "D3D vblank ISR. Registered via KeInitializeInterrupt as a FUNCTION POINTER for vector 3 (the NV2A), observed at runtime: kinterrupt=0x0019D47C routine=0x00193C50 context=0x0019D468. Nothing calls it directly, so no call-target or prologue pass finds it and it was never translated -- the runtime logged 'ISR 0x00193C50 not in dispatch'. It is the routine that signals the KEVENT at D3D device +0x2430 that sub_0018CE50 waits on."
+  },
+  {
+    "start": "0x001A72E0",
+    "_note": "ACI (audio codec) ISR, vector 6, same registration path: kinterrupt=0x001BA680 context=0x0145A900. Seeded alongside the GPU ISR because it is the same class of entry point; not yet delivered by the runtime."
+  },
+  {
+    "start": "0x00194480",
+    "_note": "D3D vblank DPC. Stored as DeferredRoutine inside the KDPC that the GPU ISR (sub_00193C50) queues, so like the ISR itself nothing calls it directly and no pass finds it: the runtime logged 'DPC routine 0x00194480 not in dispatch'. It is what re-enables NV_PMC_INTR_EN_0 after the ISR masks it, so without it the GPU interrupt fires exactly once."
+  }
+]

@@ -62,6 +62,17 @@ class RuntimeHelpersDefinedTest(unittest.TestCase):
             encoding="utf-8")
         self.assertIn("RecompXmm g_xmm0", main_c)
 
+    def test_mmx_registers_are_global_state(self):
+        """Same contract as the XMM file above: the generated code says `mm0`,
+        so the runtime has to name it and something has to define the storage."""
+        runtime = _RUNTIME.read_text(encoding="utf-8")
+        for i in range(8):
+            self.assertIn(f"#define mm{i} g_mm{i}", runtime)
+        self.assertIn("MEM64(addr)", runtime)
+        layout = (_ROOT / "src" / "kernel" / "xbox_memory_layout.c").read_text(
+            encoding="utf-8")
+        self.assertIn("RECOMP_TLS uint64_t g_mm0", layout)
+
 
 if __name__ == "__main__":
     unittest.main()

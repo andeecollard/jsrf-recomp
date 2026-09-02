@@ -21,9 +21,11 @@ Thunk pattern (after ret of previous function):
 """
 
 import struct
+import bisect
 from collections import defaultdict
 
 from . import config
+from tools.disasm.loader import DATA_SECTION_NAMES
 
 
 # Minimum number of consecutive code pointers to qualify as a vtable
@@ -56,7 +58,10 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Determine code and data ranges from section info
     if sections:
-        # Code ranges: only the main .text section (where lifted functions live)
+        # Use the same policy as the disassembler. Xbox linkers commonly mark
+        # .rdata and .data executable, so the flag alone is unsafe; named XDK
+        # code sections such as D3D, DSOUND, and XPP are valid targets.
+        code_ranges = _get_code_ranges_from_sections(sections)
         text_ranges = [(s["va"], s["va"] + s["size"])
                        for s in sections if s["name"] == ".text"]
         # Scan ALL sections with raw data for vtables.
@@ -67,17 +72,29 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
                          for s in sections
                          if s["raw"] > 0 and s.get("raw_size", s["size"]) > 0]
     else:
-        text_ranges = _get_code_ranges()
+        code_ranges = _get_code_ranges()
+        text_ranges = code_ranges
         data_sections = _get_data_sections()
 
     # Scan all data sections for vtable structures
-    raw_vtables = _find_vtables(xbe_data, func_starts, text_ranges, data_sections)
+    raw_vtables = _find_vtables(xbe_data, func_starts, code_ranges, data_sections)
+
+    # Preserve upstream's .text-only discovery set exactly. Widening a pointer
+    # run across an XDK target can expose adjacent integers that merely happen
+    # to point into .text; those were never accepted by the original scanner
+    # and must not become new seeds as a side effect of this repair.
+    legacy_raw_vtables = _find_vtables(
+        xbe_data, func_starts, text_ranges, data_sections)
 
     if verbose:
         print(f"  Raw vtable candidates: {len(raw_vtables)}")
 
     # Filter false positives
     vtables = _filter_vtables(raw_vtables)
+    legacy_vtables = _filter_vtables(legacy_raw_vtables)
+    legacy_entries = {
+        entry for vt in legacy_vtables for entry in vt["entries"]
+    }
 
     if verbose:
         total_entries = sum(len(vt["entries"]) for vt in vtables)
@@ -86,10 +103,21 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Find thunks: vtable entries not in func_starts
     discovered_thunks = set()
+    rejected_unanchored = 0
     for vt in vtables:
         for entry in vt["entries"]:
-            if entry not in func_starts:
+            if entry in func_starts:
+                continue
+            section_name = _get_section_name(entry, sections)
+            if section_name == ".text":
+                plausible = entry in legacy_entries
+            else:
+                plausible = _is_plausible_thunk_entry(
+                    entry, xbe_data, functions, sections)
+            if plausible:
                 discovered_thunks.add(entry)
+            else:
+                rejected_unanchored += 1
 
     if verbose and discovered_thunks:
         print(f"  Discovered vtable thunks (new functions): {len(discovered_thunks)}")
@@ -97,6 +125,9 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
             print(f"    0x{addr:08X}")
         if len(discovered_thunks) > 10:
             print(f"    ... and {len(discovered_thunks) - 10} more")
+    if verbose and rejected_unanchored:
+        print(f"  Rejected unanchored non-.text entries: "
+              f"{rejected_unanchored}")
 
     # Find constructors
     constructors = _find_constructors(vtables, xbe_data, functions)
@@ -111,6 +142,12 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
         vt["class_id"] = cls_id
 
         for idx, entry_addr in enumerate(vt["entries"]):
+            # Keep known functions and conservatively accepted discoveries.
+            # A raw address merely landing inside a mixed XDK code section is
+            # not sufficient evidence that it begins a function.
+            if (entry_addr not in func_starts
+                    and entry_addr not in discovered_thunks):
+                continue
             if entry_addr not in results:
                 is_thunk = entry_addr in discovered_thunks
                 results[entry_addr] = {
@@ -120,6 +157,7 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
                     "method": "vtable_thunk" if is_thunk else "vtable_scan",
                     "vtable_addr": vt["address"],
                     "vtable_index": idx,
+                    "section": _get_section_name(entry_addr, sections),
                 }
 
     # Add constructors
@@ -138,6 +176,86 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
         print(f"  Functions classified by vtable: {len(results)}")
 
     return results, vtables
+
+
+def _get_code_ranges_from_sections(sections):
+    """Return disassemblable ranges using the loader's section policy."""
+    return [
+        (s["va"], s["va"] + s["size"])
+        for s in sections
+        if (s.get("executable")
+            and s.get("raw_size", s["size"]) > 0
+            and s["name"] not in DATA_SECTION_NAMES)
+    ]
+
+
+def _get_section_name(va, sections):
+    """Return the actual containing section name for a target address."""
+    if sections:
+        for section in sections:
+            if section["va"] <= va < section["va"] + section["size"]:
+                return section["name"]
+    if hasattr(config, "SECTIONS"):
+        for name, start, size, _raw in config.SECTIONS:
+            if start <= va < start + size:
+                return name
+    return ".text"
+
+
+def _is_plausible_thunk_entry(va, xbe_data, functions, sections):
+    """Require boundary evidence for discoveries outside the main .text.
+
+    Named XDK sections are genuine code containers, but they can also contain
+    jump tables, constants, and other inline data. For a previously unknown
+    entry in one of those sections, accept only an address immediately after a
+    known function or after at most 16 bytes of compiler padding (NOP/INT3).
+
+    The long-standing .text scanner behavior is intentionally preserved. Its
+    discoveries predate section-aware scanning and changing their admission
+    rule here would silently discard existing title-specific results.
+    """
+    if not sections:
+        return True
+
+    section = next((s for s in sections
+                    if s["va"] <= va < s["va"] + s["size"]), None)
+    if section is None:
+        return False
+    if section["name"] == ".text":
+        return True
+
+    ranges = sorted(
+        (int(f["start"], 16), int(f["end"], 16))
+        for f in functions
+        if f.get("section") == section["name"] and "end" in f)
+    if not ranges:
+        return False
+
+    starts = [start for start, _end in ranges]
+    body_index = bisect.bisect_right(starts, va) - 1
+    if body_index >= 0:
+        body_start, body_end = ranges[body_index]
+        if body_start < va < body_end:
+            return False
+
+    preceding_ends = [end for _start, end in ranges if end <= va]
+    if not preceding_ends:
+        return False
+    previous_end = max(preceding_ends)
+    gap = va - previous_end
+    if gap > 16:
+        return False
+    if gap == 0:
+        return True
+
+    raw_size = section.get("raw_size", section["size"])
+    offset = section["raw"] + previous_end - section["va"]
+    if (offset < section["raw"]
+            or offset + gap > section["raw"] + raw_size
+            or offset + gap > len(xbe_data)):
+        return False
+    padding = xbe_data[offset:offset + gap]
+    return all(byte in (0x90, 0xCC) for byte in padding)
 
 
 def _get_code_ranges():
@@ -183,18 +301,18 @@ def _get_data_sections():
     return sections
 
 
-def _is_code_address(va, text_ranges):
-    """Check if VA falls within the .text section and looks like a valid function addr."""
+def _is_code_address(va, code_ranges):
+    """Check if VA falls within a code section and can be a function address."""
     # Reject obviously non-function addresses (misaligned or too small)
     if va < 0x10000:
         return False
-    for lo, hi in text_ranges:
+    for lo, hi in code_ranges:
         if lo <= va < hi:
             return True
     return False
 
 
-def _find_vtables(xbe_data, func_starts, text_ranges, data_sections):
+def _find_vtables(xbe_data, func_starts, code_ranges, data_sections):
     """
     Scan data sections for sequences of consecutive code pointers.
 
@@ -225,7 +343,7 @@ def _find_vtables(xbe_data, func_starts, text_ranges, data_sections):
             val = struct.unpack_from('<I', sec_bytes, i)[0]
 
             # Check if this looks like a code pointer
-            if not _is_code_address(val, text_ranges):
+            if not _is_code_address(val, code_ranges):
                 i += 4
                 continue
 
@@ -234,7 +352,7 @@ def _find_vtables(xbe_data, func_starts, text_ranges, data_sections):
             j = i
             while j < len(sec_bytes) - 4:
                 val = struct.unpack_from('<I', sec_bytes, j)[0]
-                if _is_code_address(val, text_ranges):
+                if _is_code_address(val, code_ranges):
                     entries.append(val)
                     j += 4
                 else:

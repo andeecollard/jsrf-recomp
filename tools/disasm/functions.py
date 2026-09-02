@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from . import config
 from .engine import DisasmEngine, Instruction
 from .loader import BinaryImage, SectionInfo
-from .xrefs import XRefTracker
+from .xrefs import XRefTracker, XRefType
 from .labels import LabelManager, Label, LabelType
 
 
@@ -115,7 +115,19 @@ class FunctionDetector:
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
 
-        # Pass 6: Tail-jump targets. A function reached only by "jmp" and never
+        # Pass 6: Global callback slots. Optimized code often installs a code
+        # address with `mov [absolute_slot], immediate` and reaches it only via
+        # a later `call [absolute_slot]`. Neither the ordinary direct-call pass
+        # nor prologue scanning can see such a function. Build once before this
+        # pass so a candidate that lands in an existing body can be rejected
+        # instead of truncating that body.
+        callback_count = self._pass_global_callback_targets(sections)
+        if callback_count:
+            print(f"  global-callback pass: +{callback_count} standalone")
+            self.functions.clear()
+            self._build_functions(sections)
+
+        # Pass 7: Tail-jump targets. A function reached only by "jmp" and never
         # by "call" is invisible to every pass above, so it is emitted as a stub
         # that returns without unwinding the frame its jumping caller built --
         # silently corrupting the simulated stack for everything upstream. Halo
@@ -291,6 +303,87 @@ class FunctionDetector:
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
                   f" ({unaligned} rejected as unaligned)")
+
+    def _pass_global_callback_targets(
+            self, sections: List[SectionInfo]) -> int:
+        """Discover code pointers installed in absolute indirect-call slots.
+
+        This deliberately does not promote arbitrary immediates that happen to
+        point into executable memory. A candidate needs one decoded ``mov``
+        instruction with both sides represented in the existing xref graph:
+
+        * a ``data_imm`` xref to the executable candidate, and
+        * a ``data_read`` xref to an absolute memory slot,
+
+        plus a later ``call`` xref through that exact slot. The instruction
+        shape makes the memory operand the destination (an immediate cannot be
+        a mov destination), while the matching indirect call proves the slot is
+        used as a function pointer.
+
+        Targets inside an already detected function body are not made ordinary
+        candidates: splitting a known body is riskier than omitting a possible
+        shared internal entry point. This pass handles standalone missed
+        callbacks, the representation for which it has boundary evidence.
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        body_starts = [start for start, _end in bodies]
+        added = 0
+
+        for insn in self.engine.instructions.values():
+            if (insn.mnemonic != "mov" or insn.memory_ref is None
+                    or insn.imm_ref is None):
+                continue
+
+            refs = self.xrefs.get_refs_from(insn.address)
+            has_slot_ref = any(
+                ref.xref_type == XRefType.DATA_READ
+                and ref.to_addr == insn.memory_ref
+                for ref in refs)
+            has_code_ref = any(
+                ref.xref_type == XRefType.DATA_IMM
+                and ref.to_addr == insn.imm_ref
+                for ref in refs)
+            if not (has_slot_ref and has_code_ref):
+                continue
+
+            # Require an indirect call through the same absolute slot after the
+            # store. Kernel thunks are KERNEL_CALL xrefs and do not qualify.
+            slot_is_called = any(
+                ref.xref_type == XRefType.CALL
+                and ref.from_addr > insn.address
+                for ref in self.xrefs.get_refs_to(insn.memory_ref))
+            if not slot_is_called:
+                continue
+
+            target = insn.imm_ref
+            if target in self._candidates:
+                continue
+            section = self.image.get_section_at_va(target)
+            if not (section and section.executable):
+                continue
+
+            # Do not split an existing body on dataflow evidence alone.
+            body_index = bisect.bisect_right(body_starts, target) - 1
+            if body_index >= 0:
+                body_start, body_end = bodies[body_index]
+                if body_start < target < body_end:
+                    continue
+
+            # The linear sweep can lose alignment after embedded data. The
+            # store/call chain is strong enough evidence to decode at the exact
+            # (possibly unaligned) target, unlike a bare immediate reference.
+            if (target not in self.engine.instructions
+                    and not self.engine.decode_at(target)):
+                continue
+
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_GLOBAL_CALLBACK,
+                "global_callback",
+            )
+            added += 1
+
+        return added
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
         """
@@ -499,7 +592,14 @@ class FunctionDetector:
                     # This jump goes forward within bounds, extend
                     max_target = target
 
-            if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
+            # MSVC places INT3 after a noreturn call and then aligns the next
+            # function with NOPs. INT3 is not universally a terminator (debug
+            # service calls can resume into an epilogue), so require at least
+            # two bytes of unmistakable NOP padding after it.
+            padded_trap = (insn.mnemonic == "int3"
+                           and self._starts_nop_padding(insn.end_address,
+                                                        upper))
+            if insn.is_terminator or padded_trap:
                 # Stop only once we have decoded *past* every internal branch
                 # target. A target is an address that must be inside the
                 # function, so landing exactly on it is not coverage -- the
@@ -520,6 +620,17 @@ class FunctionDetector:
             addr = insn.end_address
 
         return max_addr
+
+    def _starts_nop_padding(self, addr: int, upper: int) -> bool:
+        """Return true for at least two consecutive bytes of decoded NOPs."""
+        padding_bytes = 0
+        while addr < upper and padding_bytes < 16:
+            insn = self.engine.get_instruction(addr)
+            if insn is None or not insn.is_nop:
+                break
+            padding_bytes += insn.size
+            addr = insn.end_address
+        return padding_bytes >= 2
 
     def _build_call_graph(self) -> None:
         """Populate calls_to and called_by for all functions."""

@@ -44,7 +44,8 @@ class StringCompareLifterTest(unittest.TestCase):
         self.assertIn("if (!_flags) break;", generated)
         self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
 
-    def test_unsupported_dword_compare_does_not_claim_byte_flags(self):
+    def test_dword_compare_compares_dwords_and_feeds_equal_jump(self):
+        """The dword width used to lift to a comment while cmpsb worked."""
         compare = Instruction(
             0, 2, "repe cmpsd", "dword ptr [esi], dword ptr es:[edi]",
             "f3a7")
@@ -62,8 +63,55 @@ class StringCompareLifterTest(unittest.TestCase):
             lifter, BasicBlock(start=0, instructions=[compare, jump]))
         generated = "\n".join(lifted)
 
-        self.assertIn("repe cmpsd - string compare", generated)
-        self.assertNotIn("(_flags != 0)", generated)
+        self.assertNotIn("TODO", generated)
+        self.assertNotIn("- string compare, ecx iterations", generated)
+        self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", generated)
+        self.assertIn("esi += 4; edi += 4; ecx--;", generated)
+        self.assertIn("if (!_flags) break;", generated)
+        self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
+
+    def test_setcc_after_dword_compare_reads_the_compare_not_the_xor(self):
+        """The JSRF QueryInterface shape: xor / repe cmpsd / sete.
+
+        While `repe cmpsd` set no flag state, the `sete` resolved its ZF
+        against the preceding `xor edx, edx` and so was always 1 -- every GUID
+        compared equal, and CDirectSound::QueryInterface returned the primary
+        interface for every IID it was asked for.
+        """
+        clear = Instruction(0, 2, "xor", "edx, edx", "33d2")
+        clear.operands = [Operand(type="reg", reg="edx"),
+                          Operand(type="reg", reg="edx")]
+        compare = Instruction(
+            2, 2, "repe cmpsd", "dword ptr [esi], dword ptr es:[edi]", "f3a7")
+        compare.operands = [
+            Operand(type="mem", mem_base="esi", mem_size=4),
+            Operand(type="mem", mem_base="edi", mem_size=4),
+        ]
+        setcc = Instruction(4, 3, "sete", "dl", "0f94c2")
+        setcc.operands = [Operand(type="reg", reg="dl")]
+        lifter = Lifter()
+        lifter.func_start = 0
+        lifter.func_end = 0x20
+
+        lifted, _ = lift_basic_block(
+            lifter,
+            BasicBlock(start=0, instructions=[clear, compare, setcc]))
+        generated = "\n".join(lifted)
+
+        self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", generated)
+        self.assertNotIn("(edx == 0)", generated)
+        self.assertIn("SET_LO8(edx, ((_flags != 0)) ? 1 : 0); /* sete */",
+                      generated)
+
+    def test_dword_scan_is_implemented(self):
+        scan = Instruction(0, 2, "repne scasd", "eax, dword ptr es:[edi]",
+                           "f2af")
+        generated = "\n".join(Lifter().lift_instruction(scan))
+
+        self.assertNotIn("string scan, ecx iterations", generated)
+        self.assertIn("_flags = (eax == MEM32(edi));", generated)
+        self.assertIn("edi += 4; ecx--;", generated)
+        self.assertIn("if (_flags) break;", generated)
 
 
 if __name__ == "__main__":

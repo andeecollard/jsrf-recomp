@@ -26,7 +26,39 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__linux__)
 #include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+/* macOS portability: no <sys/sysinfo.h>; use sysctl + mach for memory status. */
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
+
+/* macOS portability shims for Linux/glibc-only primitives. The platform layer's
+ * POSIX implementation targets Linux; these make the same generic host
+ * primitives build on macOS. No Xbox semantics involved (category D). */
+#if defined(__APPLE__) && !defined(MAP_FIXED_NOREPLACE)
+#define MAP_FIXED_NOREPLACE MAP_FIXED
+#endif
+
+#if defined(__APPLE__) && !HAVE_EXPLICIT_BZERO
+static void explicit_bzero(void *p, size_t n) {
+    volatile unsigned char *b = (volatile unsigned char *)p;
+    while (n--) *b++ = 0;
+}
+#endif
+
+#if defined(__APPLE__)
+/* No memfd_create on macOS: create an anonymous file via mkstemp + unlink. */
+static int memfd_create(const char *name, int flags) {
+    (void)flags; (void)name;
+    char tmpl[] = "/tmp/xbox_map_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -1;
+    unlink(tmpl); /* anonymous: no path after creation */
+    return fd;
+}
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
@@ -655,15 +687,64 @@ DWORD ResumeThread(HANDLE h)
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+    /*
+     * Self-suspension blocks here, on the same gate CREATE_SUSPENDED and
+     * ResumeThread already use. That is the case POSIX can support exactly,
+     * and it is the one that matters: a thread that suspends itself and is not
+     * actually stopped comes straight back and asks again. JSRF's XAPI worker
+     * (sub_00147DAC, reached from its thread routines) did precisely that --
+     * a hung run logged 36.8 MILLION kernel calls, roughly 3M/second, which
+     * swamped every other measurement in the runtime.
+     *
+     * Suspending ANOTHER running thread cannot stop it here and now - POSIX
+     * has no safe primitive for that - so it is cooperative: the count is set
+     * and the target parks itself at its next safe point. See
+     * w32_thread_suspend_point below.
+     */
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (o == t_self_obj) {
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
+    }
+    /* Cross-thread: the count is set here and the TARGET honours it at its next
+     * safe point (w32_thread_suspend_point below). */
     pthread_mutex_unlock(&o->lock);
     return prev;
+}
+
+/*
+ * Cooperative suspend safe point.
+ *
+ * POSIX has no primitive that stops another running thread safely, so a
+ * suspended guest thread has to stop itself at a point where doing so cannot
+ * corrupt anything. That is the same answer Microsoft's own Xbox recompiler
+ * reached: it polls a per-thread preemption flag and calls out to the runtime,
+ * emitted at loop back-edges (docs/technical/ms-fusion-recompiler.md, callout
+ * kind 0x1d, 26.7k sites).
+ *
+ * We do not control the generated code, so the poll goes at the kernel thunk
+ * dispatch instead - the one choke point every guest kernel call passes
+ * through. That is coarser than a back-edge poll: a guest thread spinning in a
+ * pure compute loop with no kernel calls will not stop. It is enough here
+ * because the threads that get suspended are the ones making kernel calls, and
+ * they make a great many - a hung run logged tens of millions - so the target
+ * stops within microseconds of the request.
+ *
+ * The fast path is one relaxed read of the calling thread's own counter.
+ */
+void w32_thread_suspend_point(void)
+{
+    w32_object *o = t_self_obj;
+    if (!o || o->suspend_count <= 0)
+        return;   /* not one of our threads, or nothing pending */
+    pthread_mutex_lock(&o->lock);
+    while (o->suspend_count > 0)
+        pthread_cond_wait(&o->gate, &o->lock);
+    pthread_mutex_unlock(&o->lock);
 }
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
@@ -1004,6 +1085,10 @@ VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt) { explicit_bzero(ptr, cnt); }
 
+/* macOS portability: DebugBreak/IsDebuggerPresent come from <windows.h> on Windows. */
+void  DebugBreak(void) { __builtin_trap(); }
+BOOL  IsDebuggerPresent(void) { return FALSE; }
+
 unsigned int _clearfp(void)
 {
     feclearexcept(FE_ALL_EXCEPT);
@@ -1319,8 +1404,9 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
-    struct sysinfo si;
     if (!b) return FALSE;
+#if defined(__linux__)
+    struct sysinfo si;
     if (sysinfo(&si) != 0) return FALSE;
 
     ULONGLONG unit = si.mem_unit ? si.mem_unit : 1;
@@ -1328,6 +1414,20 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPhys     = (ULONGLONG)si.freeram   * unit;
     b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)si.totalswap * unit;
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)si.freeswap  * unit;
+#elif defined(__APPLE__)
+    /* macOS portability: report physical RAM via sysctl + mach vm stats. */
+    int64_t total = 0; size_t len = sizeof(total);
+    if (sysctlbyname("hw.memsize", &total, &len, NULL, 0) != 0) return FALSE;
+    vm_statistics64_data_t vm; mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return FALSE;
+    b->ullTotalPhys     = (ULONGLONG)total;
+    b->ullAvailPhys     = (ULONGLONG)((vm.free_count + vm.inactive_count) * vm_page_size);
+    b->ullTotalPageFile = b->ullTotalPhys;
+    b->ullAvailPageFile = b->ullAvailPhys;
+#else
+    return FALSE;
+#endif
     b->ullTotalVirtual  = b->ullTotalPhys;
     b->ullAvailVirtual  = b->ullAvailPhys;
     b->ullAvailExtendedVirtual = 0;

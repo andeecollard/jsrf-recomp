@@ -413,8 +413,8 @@ NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGE
  * Display / AV
  *
  * These are declared in kernel.h for the thunk table but will be fully
- * implemented by the D3D replacement layer. We provide realistic AV pack
- * detection so games can query display capabilities (480p, 720p, widescreen).
+ * implemented by the D3D replacement layer. We provide the packed AV state
+ * needed by Xbox D3D's display-mode selection.
  * ============================================================================ */
 
 static ULONG g_av_saved_data_address = 0;
@@ -438,50 +438,61 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         return;
 
     switch (Option) {
-    case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+    case AV_QUERY_AV_CAPABILITIES:
+        {
+            ULONG user_flags = 0;
+            ULONG type = 0;
+            ULONG length = 0;
+
+            if (xbox_ExQueryNonVolatileSetting(
+                    XC_VIDEO, &type, &user_flags, sizeof(user_flags), &length)
+                    != STATUS_SUCCESS || length != sizeof(user_flags)) {
+                user_flags = 0;
+            }
+
+            /* Xbox packs the attached AV pack, factory region/refresh, and
+             * dashboard video choices into one dword. This runtime models an
+             * NTSC-M console with an HDTV/component pack at 60 Hz. */
+            *Result = AV_PACK_HDTV
+                    | ((AV_STANDARD_NTSC_M | AV_FLAGS_60Hz)
+                       & (AV_STANDARD_MASK | AV_REFRESH_MASK))
+                    | (user_flags & ~(AV_STANDARD_MASK | AV_PACK_MASK));
+        }
         break;
 
     case AV_OPTION_QUERY_MODE:
-        /* Return current display mode */
         *Result = g_av_display_mode;
         break;
 
-    case AV_OPTION_QUERY_AV_CAPABILITIES:
-        /* Report support for 480i, 480p, 720p, and widescreen */
-        *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
-                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
-                | AV_FLAGS_60Hz;
-        break;
-
-    case AV_OPTION_QUERY_ENCODER_TYPE:
-        /* Conexant CX25871 (common in retail Xboxes) */
+    case AV_QUERY_ENCODER_TYPE:
+        /* Conexant CX25871 (common in retail Xboxes). */
         *Result = 4;
         break;
 
-    case AV_OPTION_QUERY_MODE_CAPS:
-        /* Same as capabilities for our purposes */
-        *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
-                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
-                | AV_FLAGS_60Hz;
+    case AV_QUERY_MODE_TABLE_VERSION:
+        *Result = 1;
         break;
 
-    case AV_OPTION_SET_MODE:
-        g_av_display_mode = Param;
-        *Result = 0;
-        break;
-
+    case AV_QUERY_CC_STATUS:
     case AV_OPTION_BLANK_SCREEN:
     case AV_OPTION_MACROVISION_MODE:
+    case AV_OPTION_MACROVISION_COMMIT:
     case AV_OPTION_FLICKER_FILTER:
     case AV_OPTION_ZERO_MODE:
+    case AV_OPTION_ENABLE_LUMA_FILTER:
+    case AV_OPTION_GUESS_FIELD:
+    case AV_OPTION_ENABLE_CC:
+    case AV_OPTION_DISABLE_CC:
+    case AV_OPTION_SEND_CC_DATA:
+    case AV_OPTION_CGMS:
+    case AV_OPTION_WIDESCREEN:
+        /* Accepted and ignored: these configure a TV encoder we do not have. */
         *Result = 0;
         break;
 
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "AvSendTVEncoderOption: unknown option 0x%02X", Option);
+            "AvSendTVEncoderOption: unknown option %u", Option);
         *Result = 0;
         break;
     }

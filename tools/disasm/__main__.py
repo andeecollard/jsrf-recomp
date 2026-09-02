@@ -73,7 +73,10 @@ def main():
         metavar="JSON",
         help="JSON file with additional function entry points to seed the detector. "
              "Format: array of objects with 'start' field (hex address string). "
-             "Use identified_functions.json from func_id to feed back vtable thunks, "
+             "Use vtable_thunk_seeds.json from func_id to feed back the vtable "
+             "thunks its scanner discovered (not identified_functions.json itself: "
+             "it also holds classifications of functions the detector already "
+             "found, and seeding those is a no-op at best), "
              "or icall_targets.json from tools.recomp.icall_feedback to feed back "
              "measured indirect-branch targets. "
              "Repeatable: pass it once per file. Hand-maintained seed lists and "

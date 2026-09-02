@@ -4,6 +4,7 @@ Output writers for function identification results.
 Produces JSON files and a human-readable summary.
 """
 
+import bisect
 import json
 import os
 from collections import Counter
@@ -15,7 +16,8 @@ def write_results(functions, rw_results, crt_results, propagated,
     Write all output files.
 
     Args:
-        functions: Original function list.
+        functions: Original function list (may include vtable thunks the
+            scanner discovered and appended; those carry "type": "vtable_thunk").
         rw_results: RW identification results.
         crt_results: CRT identification results.
         propagated: Clustering/propagation results.
@@ -38,6 +40,16 @@ def write_results(functions, rw_results, crt_results, propagated,
     _write_json(os.path.join(output_dir, "crt_functions.json"),
                 _serialize_crt(crt_results))
 
+    # Feed the discoveries back to the disassembler as function-detection
+    # seeds, in the format tools.disasm --seed-functions consumes. Without
+    # this file a vtable thunk exists only in identified_functions.json, and
+    # the recompiler builds its function database from functions.json -- so
+    # the thunk is never translated and gets no dispatch entry. Seeding it
+    # makes the detector re-disassemble the thunk with real boundaries, and
+    # it enters functions.json like any other detected function.
+    _write_seed_file(os.path.join(output_dir, "vtable_thunk_seeds.json"),
+                     functions, enriched, verbose)
+
     summary = _build_summary(enriched, rw_results, crt_results, propagated, rw_modules)
     _write_json(os.path.join(output_dir, "summary.json"), summary)
 
@@ -45,6 +57,66 @@ def write_results(functions, rw_results, crt_results, propagated,
         _print_summary(summary)
 
     return summary
+
+
+def _write_seed_file(path, functions, enriched, verbose=False):
+    """Write the discovered vtable thunks as a --seed-functions file.
+
+    Only entries the scanner *discovered* (method "vtable_thunk") qualify,
+    and only those that sit outside every function body the disassembler
+    already knew. A vtable entry landing inside a known function is evidence
+    the "vtable" is really a pointer array (a jump table, a callback list)
+    referencing mid-function locations; seeding it would truncate the host
+    function and manufacture a bogus body from its middle. Thunks in the gap
+    between functions are what the scanner's thunk pattern is defined for,
+    and those are safe to hand to the detector.
+
+    The estimated 32-byte end/size recorded for a discovered thunk is not
+    written: it is a placeholder the detector refines on re-disassembly, and
+    the seed loader only reads "start" anyway. Provenance fields are kept so
+    a reader can see which vtable and slot each seed came from.
+    """
+    # Bodies of the functions as the disassembler knew them, before this run
+    # appended its discoveries. The appended thunks carry "type":
+    # "vtable_thunk"; everything else came from functions.json. Their
+    # estimated bodies must not be used to filter each other.
+    original = [f for f in functions if f.get("type") != "vtable_thunk"]
+    starts = sorted(int(f["start"], 16) for f in original if "end" in f)
+    ends = [int(f["end"], 16) for f in sorted(
+        (f for f in original if "end" in f), key=lambda x: int(x["start"], 16))]
+
+    def inside_body(addr):
+        i = bisect.bisect_right(starts, addr) - 1
+        return i >= 0 and starts[i] < addr < ends[i]
+
+    seeds = []
+    excluded_inside_body = 0
+    for entry in enriched:
+        if entry.get("method") != "vtable_thunk":
+            continue
+        addr = int(entry["start"], 16)
+        if inside_body(addr):
+            excluded_inside_body += 1
+            continue
+        seed = {"start": entry["start"]}
+        for key in ("category", "subcategory", "confidence", "method",
+                    "vtable_addr", "vtable_index"):
+            if key in entry:
+                seed[key] = entry[key]
+        seed["source"] = "func_id-vtable-scanner"
+        seeds.append(seed)
+
+    _write_json(path, seeds)
+
+    if verbose:
+        print(f"  Vtable thunk seeds: {len(seeds)} written to "
+              f"{os.path.basename(path)}")
+        if excluded_inside_body:
+            print(f"    (excluded {excluded_inside_body} vtable entries that "
+                  f"land inside a known function body -- pointer arrays, not "
+                  f"function starts)")
+
+    return len(seeds)
 
 
 def _build_enriched_db(functions, rw_results, crt_results, propagated,

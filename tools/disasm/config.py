@@ -116,6 +116,7 @@ CALL_TARGET_REALIGN_ALIGNMENT = 16
 CONFIDENCE_KNOWN = 1.0       # Entry point, known addresses
 CONFIDENCE_PROLOGUE = 0.95   # Standard prologue pattern
 CONFIDENCE_CALL_TARGET = 0.90  # Destination of a call instruction
+CONFIDENCE_GLOBAL_CALLBACK = 0.89  # Code pointer stored in an indirect-call slot
 CONFIDENCE_TAIL_JUMP = 0.88   # Target of a jmp that leaves its function
 CONFIDENCE_CC_BOUNDARY = 0.85  # After CC padding run following ret
 

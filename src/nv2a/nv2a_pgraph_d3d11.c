@@ -16,7 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(__linux__)
 #include <malloc.h>
+#endif /* __linux__ */
 #include <math.h>
 
 /* D3D8 device — we include the full header for COM vtable access */

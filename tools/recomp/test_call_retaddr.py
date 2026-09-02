@@ -125,6 +125,88 @@ def test_icall_save_still_covers_a_plain_arg_run():
     assert save_idx < first_arg, "\n".join(out)
 
 
+def test_callee_clean_icall_keeps_the_full_rewind():
+    # No caller-side cleanup follows the call, so the site is stdcall/thiscall
+    # and a failed lookup must rewind past the arguments the callee would have
+    # popped. This is the overwhelmingly common shape -- 5216 of JSRF's 5293
+    # indirect call sites -- so a regression here is worse than the bug below.
+    lines = [
+        "    PUSH32(esp, eax);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
+        "loc_00120010: ;",
+        "    eax = MEM32(esi + 4);",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    call = next(l for l in out if "RECOMP_ICALL_SAFE" in l)
+    assert "_icall_esp)" in call and "_icall_esp -" not in call, call
+
+
+def test_caller_clean_icall_leaves_the_arguments_for_the_guest():
+    # "call eax; mov dl,[esp+0x17]; add esp,4" -- __cdecl, so the guest cleans
+    # its own argument after the call. Rewinding to the pre-argument esp on a
+    # failed lookup double-counts that cleanup and leaves esp 4 bytes high,
+    # which shifts every later pop in the function by one slot.
+    #
+    # This is the shape that broke JSRF's vblank handshake: sub_00193D90's
+    # unresolved callback left it returning ebx = 0, so the DPC above it
+    # reloaded NV_PMC_INTR_EN_0 from address 0xB0 and the GPU interrupt was
+    # never re-enabled.
+    lines = [
+        "    PUSH32(esp, ecx);",
+        "    PUSH32(esp, 0x00193EB7u); RECOMP_ICALL_SAFE(eax, _icall_esp); /* indirect call */",
+        "loc_00193EB7: ;",
+        "    SET_LO8(edx, MEM8(esp + 0x17));",
+        "    _cf = (int)((((uint64_t)(esp) + (uint64_t)(4)) >> 32) & 1);",
+        "    esp = esp + 4;",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    call = next(l for l in out if "RECOMP_ICALL_SAFE" in l)
+    assert "_icall_esp - 4)" in call, call
+
+
+def test_cleanup_behind_a_branch_is_not_attributed_to_the_call():
+    # A second label means another basic block also reaches the "add esp, N",
+    # so it is not certainly this call's cleanup. Guess callee-clean rather
+    # than trade one silent drift for another.
+    lines = [
+        "    PUSH32(esp, ecx);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(eax, _icall_esp); /* indirect call */",
+        "loc_00120010: ;",
+        "loc_00120014: ;",
+        "    esp = esp + 4;",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    call = next(l for l in out if "RECOMP_ICALL_SAFE" in l)
+    assert "_icall_esp -" not in call, call
+
+
+def test_local_frame_teardown_is_not_argument_cleanup():
+    # "add esp, 0x400" is a local frame being released, not an argument list.
+    lines = [
+        "    PUSH32(esp, ecx);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(eax, _icall_esp); /* indirect call */",
+        "loc_00120010: ;",
+        "    esp = esp + 0x400;",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    call = next(l for l in out if "RECOMP_ICALL_SAFE" in l)
+    assert "_icall_esp -" not in call, call
+
+
+def test_hex_argument_cleanup_is_recognised():
+    # The lifter emits "add esp, 16" as hex; a decimal-only match would miss it
+    # and the test above would pass for the wrong reason.
+    lines = [
+        "    PUSH32(esp, ecx);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(eax, _icall_esp); /* indirect call */",
+        "loc_00120010: ;",
+        "    esp = esp + 0x10;",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    call = next(l for l in out if "RECOMP_ICALL_SAFE" in l)
+    assert "_icall_esp - 16)" in call, call
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -61,6 +61,10 @@
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))
@@ -125,6 +129,11 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+
+/* Guest linear base loaded in the x86 FS segment register. Xbox uses FS for
+ * per-thread state, so flattening an fs:[offset] operand to MEM(offset) makes
+ * all guest threads share (and corrupt) low memory. */
+extern RECOMP_TLS uint32_t g_fs_base;
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
@@ -226,6 +235,103 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
 
+/** FS-segmented accesses retain their per-thread segment base. */
+#define FS_MEM8(addr)  MEM8(g_fs_base + (uint32_t)(addr))
+#define FS_MEM16(addr) MEM16(g_fs_base + (uint32_t)(addr))
+#define FS_MEM32(addr) MEM32(g_fs_base + (uint32_t)(addr))
+#define FS_SMEM8(addr)  SMEM8(g_fs_base + (uint32_t)(addr))
+#define FS_SMEM16(addr) SMEM16(g_fs_base + (uint32_t)(addr))
+#define FS_SMEM32(addr) SMEM32(g_fs_base + (uint32_t)(addr))
+#define FS_SMEM64(addr) SMEM64(g_fs_base + (uint32_t)(addr))
+
+/* LOCK XADD is an indivisible read/modify/write and returns the destination's
+ * old value. Sequential consistency matches x86's locked-instruction ordering
+ * and is available on every compiler supported by the runtime. */
+static inline uint8_t RECOMP_ATOMIC_XADD8(uint32_t addr, uint8_t value) {
+#if defined(_MSC_VER)
+    return (uint8_t)_InterlockedExchangeAdd8(
+        (volatile char *)XBOX_PTR(addr), (char)value);
+#else
+    return __atomic_fetch_add(
+        (volatile uint8_t *)XBOX_PTR(addr), value, __ATOMIC_SEQ_CST);
+#endif
+}
+
+static inline uint16_t RECOMP_ATOMIC_XADD16(uint32_t addr, uint16_t value) {
+#if defined(_MSC_VER)
+    return (uint16_t)_InterlockedExchangeAdd16(
+        (volatile short *)XBOX_PTR(addr), (short)value);
+#else
+    return __atomic_fetch_add(
+        (volatile uint16_t *)XBOX_PTR(addr), value, __ATOMIC_SEQ_CST);
+#endif
+}
+
+static inline uint32_t RECOMP_ATOMIC_XADD32(uint32_t addr, uint32_t value) {
+#if defined(_MSC_VER)
+    return (uint32_t)_InterlockedExchangeAdd(
+        (volatile long *)XBOX_PTR(addr), (long)value);
+#else
+    return __atomic_fetch_add(
+        (volatile uint32_t *)XBOX_PTR(addr), value, __ATOMIC_SEQ_CST);
+#endif
+}
+
+/* LOCK CMPXCHG. Returns the destination's OLD value and reports through *ok
+ * whether the exchange happened, which is the ZF the instruction leaves.
+ *
+ * On the GCC/Clang side __atomic_compare_exchange_n overwrites its expected
+ * operand with the actual value when it fails and leaves it alone when it
+ * succeeds, so `_exp` is the old value either way -- which is exactly what
+ * x86 loads into the accumulator on failure. */
+static inline uint8_t RECOMP_ATOMIC_CMPXCHG8(uint32_t addr, uint8_t expected,
+                                             uint8_t desired, int *ok) {
+#if defined(_MSC_VER)
+    uint8_t old = (uint8_t)_InterlockedCompareExchange8(
+        (volatile char *)XBOX_PTR(addr), (char)desired, (char)expected);
+    *ok = (old == expected);
+    return old;
+#else
+    uint8_t _exp = expected;
+    *ok = __atomic_compare_exchange_n((volatile uint8_t *)XBOX_PTR(addr),
+                                      &_exp, desired, 0,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return _exp;
+#endif
+}
+
+static inline uint16_t RECOMP_ATOMIC_CMPXCHG16(uint32_t addr, uint16_t expected,
+                                               uint16_t desired, int *ok) {
+#if defined(_MSC_VER)
+    uint16_t old = (uint16_t)_InterlockedCompareExchange16(
+        (volatile short *)XBOX_PTR(addr), (short)desired, (short)expected);
+    *ok = (old == expected);
+    return old;
+#else
+    uint16_t _exp = expected;
+    *ok = __atomic_compare_exchange_n((volatile uint16_t *)XBOX_PTR(addr),
+                                      &_exp, desired, 0,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return _exp;
+#endif
+}
+
+static inline uint32_t RECOMP_ATOMIC_CMPXCHG32(uint32_t addr, uint32_t expected,
+                                               uint32_t desired, int *ok) {
+#if defined(_MSC_VER)
+    uint32_t old = (uint32_t)_InterlockedCompareExchange(
+        (volatile long *)XBOX_PTR(addr), (long)desired, (long)expected);
+    *ok = (old == expected);
+    return old;
+#else
+    uint32_t _exp = expected;
+    *ok = __atomic_compare_exchange_n((volatile uint32_t *)XBOX_PTR(addr),
+                                      &_exp, desired, 0,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return _exp;
+#endif
+}
+
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
@@ -265,6 +371,21 @@ typedef union RecompXmm {
     uint64_t q[2];
 } RecompXmm;
 #endif
+
+/* MMX registers.
+ *
+ * Not modelled at all until now, which was not a harmless omission: the D3D
+ * block copy at sub_00198FD0 is `movq mm0..mm7, [esi+n]` followed by
+ * `movntq [edi+n], mm0..mm7`, 64 bytes an iteration. The loads fell out of the
+ * SSE handler as an "SSE: movq" comment and the stores were left as a "TODO:
+ * movntq" comment, so the memcpy copied its alignment prologue and epilogue and
+ * silently dropped every 64-byte block in between.
+ *
+ * Per-thread like the rest of the register file. The x87/MMX aliasing the real
+ * hardware has is NOT modelled: nothing in the corpus interleaves the two, and
+ * pretending otherwise would cost more than it buys. */
+extern RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3,
+                           g_mm4, g_mm5, g_mm6, g_mm7;
 
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
@@ -532,6 +653,50 @@ static inline int recomp_parity8(uint32_t x) {
 }
 #define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
 
+/* Architectural ADD flags used by XADD.  Keeping the six defined arithmetic
+ * flags in a compact EFLAGS-shaped value lets a later Jcc/SETcc/CMOVcc consume
+ * them even when it begins another translated basic block. */
+#define RECOMP_EFLAG_CF 0x00000001u
+#define RECOMP_EFLAG_PF 0x00000004u
+#define RECOMP_EFLAG_AF 0x00000010u
+#define RECOMP_EFLAG_ZF 0x00000040u
+#define RECOMP_EFLAG_SF 0x00000080u
+#define RECOMP_EFLAG_OF 0x00000800u
+
+#define RECOMP_EFLAGS_CF(f) (((uint32_t)(f) & RECOMP_EFLAG_CF) != 0)
+#define RECOMP_EFLAGS_PF(f) (((uint32_t)(f) & RECOMP_EFLAG_PF) != 0)
+#define RECOMP_EFLAGS_AF(f) (((uint32_t)(f) & RECOMP_EFLAG_AF) != 0)
+#define RECOMP_EFLAGS_ZF(f) (((uint32_t)(f) & RECOMP_EFLAG_ZF) != 0)
+#define RECOMP_EFLAGS_SF(f) (((uint32_t)(f) & RECOMP_EFLAG_SF) != 0)
+#define RECOMP_EFLAGS_OF(f) (((uint32_t)(f) & RECOMP_EFLAG_OF) != 0)
+
+static inline uint32_t recomp_add_eflags(uint32_t lhs, uint32_t rhs,
+                                         uint32_t result, unsigned bits) {
+    uint32_t mask = bits == 8 ? 0xFFu : bits == 16 ? 0xFFFFu : 0xFFFFFFFFu;
+    uint32_t sign = bits == 8 ? 0x80u : bits == 16 ? 0x8000u : 0x80000000u;
+    uint32_t flags = 0;
+    lhs &= mask;
+    rhs &= mask;
+    result &= mask;
+    if ((uint64_t)lhs + (uint64_t)rhs > (uint64_t)mask)
+        flags |= RECOMP_EFLAG_CF;
+    if (RECOMP_PARITY8(result))
+        flags |= RECOMP_EFLAG_PF;
+    if ((lhs ^ rhs ^ result) & 0x10u)
+        flags |= RECOMP_EFLAG_AF;
+    if (result == 0)
+        flags |= RECOMP_EFLAG_ZF;
+    if (result & sign)
+        flags |= RECOMP_EFLAG_SF;
+    if ((~(lhs ^ rhs) & (lhs ^ result) & sign) != 0)
+        flags |= RECOMP_EFLAG_OF;
+    return flags;
+}
+
+#define RECOMP_ADD_FLAGS8(a, b, r)  recomp_add_eflags((a), (b), (r), 8)
+#define RECOMP_ADD_FLAGS16(a, b, r) recomp_add_eflags((a), (b), (r), 16)
+#define RECOMP_ADD_FLAGS32(a, b, r) recomp_add_eflags((a), (b), (r), 32)
+
 /** Pop a 32-bit value from the simulated stack. */
 #define POP32(sp, dst) do { \
     (dst) = MEM32(sp); \
@@ -552,6 +717,32 @@ static inline uint32_t BSWAP32(uint32_t v) {
 
 static inline uint16_t BSWAP16(uint16_t v) {
     return (uint16_t)((v >> 8) | (v << 8));
+}
+
+/* ================================================================
+ * Bit scan (bsf/bsr)
+ *
+ * Index of the lowest (BSF32) or highest (BSR32) set bit. The Xbox D3D
+ * library's Log2 helper is a bare `bsf eax, ecx`, so a title's texture and
+ * surface sizes are computed through these.
+ *
+ * A zero operand is the caller's problem, not theirs: x86 leaves the
+ * destination register unmodified when the source is zero, so the lifted code
+ * guards the call and these are never reached with v == 0. Returning some
+ * stand-in value here instead would put a number in the destination that the
+ * hardware never puts there.
+ * ================================================================ */
+
+static inline uint32_t BSF32(uint32_t v) {
+    uint32_t i = 0;
+    while (!((v >> i) & 1u)) i++;
+    return i;
+}
+
+static inline uint32_t BSR32(uint32_t v) {
+    uint32_t i = 31;
+    while (!((v >> i) & 1u)) i--;
+    return i;
 }
 
 /* ================================================================
@@ -710,6 +901,18 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #define ebx g_ebx
 #define esi g_esi
 #define edi g_edi
+#define mm0 g_mm0
+#define mm1 g_mm1
+#define mm2 g_mm2
+#define mm3 g_mm3
+#define mm4 g_mm4
+#define mm5 g_mm5
+#define mm6 g_mm6
+#define mm7 g_mm7
+
+/** 64-bit memory access, for MMX loads and stores. */
+#define MEM64(addr) (*(volatile uint64_t *)XBOX_PTR(addr))
+
 #define xmm0 g_xmm0
 #define xmm1 g_xmm1
 #define xmm2 g_xmm2
