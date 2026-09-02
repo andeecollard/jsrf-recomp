@@ -783,6 +783,64 @@ Two Python interpreters, and this WILL bite you:
     the same backend boundary. Revisit only if a title turns out to bypass the
     ring, which JSRF does not.
 
+(ab) P0 OF THE RING ROUTE: the live pusher runs, and it found two real bugs.
+    src/nv2a/nv2a_pusher.{c,h} is the generic PFIFO pusher -- parse a run of
+    push-buffer dwords, dispatch every method to PGRAPH, count what PGRAPH
+    declines. It lives in src/nv2a, NOT the JSRF harness, because that is the
+    whole point of this route. Ring DISCOVERY is the one title-specific part
+    and stays in main.c: JSRF publishes its ring through D3D8 globals (device
+    +0x00 / +0x04) rather than the PFIFO USER area at 0xFD800040/44.
+    MEASURED: 3,939 dwords, 2,731 methods dispatched, ZERO bad headers, frame
+    loop unregressed (ADX tick ~1580 in 25s), process stable. The live pusher
+    reproduces the offline parse exactly.
+
+    BUG 1 -- EIGHT OF THE TRANSLATOR'S 21 METHOD CONSTANTS WERE WRONG.
+    nv2a_pgraph_d3d11.c #defined its own NV097_* values AFTER including
+    nv2a_regs.h, and a later #define silently wins:
+        CLEAR_SURFACE             0x01D0  should be 0x1D94
+        SET_COLOR_CLEAR_VALUE     0x01D4  should be 0x1D90
+        SET_CLEAR_RECT_HORIZONTAL 0x01D8  should be 0x1D98
+        SET_CLEAR_RECT_VERTICAL   0x01DC  should be 0x1D9C
+        SET_DEPTH_TEST_ENABLE     0x0354  should be 0x030C
+        SET_CULL_FACE_ENABLE      0x039C  should be 0x0308
+        SET_SHADE_MODE            0x0368  should be 0x037C
+        SET_TEXTURE_CONTROL0      0x1B08  should be 0x1B0C
+    So the entire clear path was wired to offsets the hardware never sends and
+    could not fire on a real ring -- while the wrong offsets it DID claim meant
+    JSRF's stencil writes were being applied as depth-test and cull state.
+    Undetectable until now because the only data this translator had ever seen
+    was a captured menu buffer replayed through the same wrong constants.
+    The local block is deleted; nv2a_regs.h is the authority.
+    The real "implemented" count is therefore 13, not the 21 in (aa).
+    NOTE nv2a_pb_replay.c passes literal 0x1B08 for TEXTURE_CONTROL0 and will
+    no longer match. That path is inert -- nv2a_pb_replay_frame() is defined
+    and never called -- but fix the literals if it is ever revived.
+
+    BUG 2 -- THE PUSHER THREAD OWNED NO GL CONTEXT. With the constants fixed
+    the clear path finally fired, and the process died instantly: SIGSEGV at
+    host 0x3B0, guest registers all zero, PC inside a dylib. SDL makes the
+    context current on the thread that created the device (the main thread),
+    GL entry points resolve per-context, and the pusher runs on the ack
+    thread -- so glClear went through a null dispatch slot. Added
+    xbox_d3d8_make_current(), called once by any thread that will draw; a
+    no-op on the D3D11 backend, which has no per-thread context.
+    CONSTRAINT THIS CREATES: only one thread may hold the context. Present
+    must move to the pusher thread too, or the drawing must move off it.
+    Decide that in P1 rather than discovering it again.
+
+    Unhandled after both fixes: 1,448 of 2,731. The pusher ranks them by
+    frequency every five seconds, so P1's worklist comes from the runtime
+    rather than from static guessing. Top entries: SET_WINDOW_CLIP_{TYPE,
+    HORIZONTAL,VERTICAL} (32 each), SET_SURFACE_{PITCH,COLOR_OFFSET,
+    ZETA_OFFSET} (26 each), SET_TRANSFORM_PROGRAM (24 per slot).
+
+(ac) The GL backend opened its window titled "Burnout 3: Takedown" -- a
+    hardcoded string in d3d8_gl.c left over from the extraction, in a layer
+    that is title-independent everywhere else. Now xbox_d3d8_set_window_title()
+    with a generic default; the harness names its own window. Cosmetic, but it
+    is the kind of thing that makes a measurement look like it came from the
+    wrong program.
+
 --------------------------------------------------------------------------------
 5. FILES CHANGED
 --------------------------------------------------------------------------------

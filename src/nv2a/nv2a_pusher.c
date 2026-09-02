@@ -1,0 +1,185 @@
+/**
+ * NV2A push-buffer command pusher. See nv2a_pusher.h.
+ */
+
+#include "nv2a_pusher.h"
+#include "nv2a_pgraph_d3d11.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/*
+ * Command header encoding.
+ *
+ *   bits 28:18  method count
+ *   bits 15:13  subchannel
+ *   bits 12:2   method offset (already a byte offset; bits 1:0 are zero)
+ *
+ * An INCREASING header advances the method by four per parameter, which is how
+ * a run of consecutive registers is written in one command. A NON-INCREASING
+ * header repeats the same method, which is how bulk data -- vertex elements,
+ * vertex program tokens -- is streamed into a single port.
+ */
+#define PB_INC_MASK      0xE0030003u
+#define PB_INC_MATCH     0x00000000u
+#define PB_NONINC_MASK   0xE0030003u
+#define PB_NONINC_MATCH  0x40000000u
+
+#define PB_COUNT(h)       (((h) >> 18) & 0x7FFu)
+#define PB_SUBCHANNEL(h)  (((h) >> 13) & 7u)
+#define PB_METHOD(h)      ((h) & 0x1FFCu)
+
+/* Method offsets are below 0x2000 and dword-aligned. */
+#define UNHANDLED_SLOTS (0x2000u / 4u)
+
+static NV2APusherStats g_stats;
+static uint32_t g_unhandled[UNHANDLED_SLOTS];
+
+static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
+{
+    g_stats.methods++;
+    if (!pgraph_d3d11_method((int)subchannel, method, param)) {
+        g_stats.unhandled++;
+        if ((method / 4u) < UNHANDLED_SLOTS) {
+            g_unhandled[method / 4u]++;
+        }
+    }
+}
+
+uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords)
+{
+    uint32_t pos = 0;
+    uint32_t dispatched = 0;
+
+    if (!data || !num_dwords) {
+        return 0;
+    }
+    g_stats.runs++;
+
+    while (pos < num_dwords) {
+        uint32_t header = data[pos];
+        uint32_t count, method, subchannel;
+        int increasing;
+
+        /* Padding between commands; the ring is not densely packed. */
+        if (header == 0) {
+            pos++;
+            g_stats.dwords++;
+            continue;
+        }
+
+        if ((header & PB_INC_MASK) == PB_INC_MATCH) {
+            increasing = 1;
+        } else if ((header & PB_NONINC_MASK) == PB_NONINC_MATCH) {
+            increasing = 0;
+        } else {
+            /* Jump/call headers and anything else this pusher does not model.
+             * Counted rather than ignored: a ring that is mostly unparseable
+             * means the caller handed over the wrong range, and silence there
+             * would look identical to an idle GPU. */
+            g_stats.bad_headers++;
+            pos++;
+            g_stats.dwords++;
+            continue;
+        }
+
+        count = PB_COUNT(header);
+        method = PB_METHOD(header);
+        subchannel = PB_SUBCHANNEL(header);
+
+        /* A count running past the end means this range was cut mid-command --
+         * the caller's window, not a malformed ring. Stop rather than read
+         * past it; the remainder arrives with the next run. */
+        if (count == 0 || pos + 1 + count > num_dwords) {
+            break;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            dispatch(subchannel, increasing ? method + i * 4u : method,
+                     data[pos + 1 + i]);
+            dispatched++;
+        }
+
+        pos += 1 + count;
+        g_stats.dwords += 1 + count;
+    }
+
+    return dispatched;
+}
+
+void nv2a_pusher_get_stats(NV2APusherStats *out)
+{
+    if (out) {
+        *out = g_stats;
+    }
+}
+
+void nv2a_pusher_reset_stats(void)
+{
+    memset(&g_stats, 0, sizeof(g_stats));
+    memset(g_unhandled, 0, sizeof(g_unhandled));
+}
+
+void nv2a_pusher_dump_unhandled(int max_entries)
+{
+    char line[1024];
+    int off;
+    int printed = 0;
+
+    if (max_entries <= 0) {
+        max_entries = 16;
+    }
+
+    /* Built into one buffer and emitted with a single write: worker threads
+     * log concurrently and a per-entry fprintf interleaves with them. */
+    off = snprintf(line, sizeof(line), "  [PUSHER] unhandled methods:");
+
+    /* A peek, not a drain. Zeroing each entry as it printed made every report
+     * show the NEXT twenty methods instead of the same top twenty, so the
+     * ranking appeared to change every five seconds while the counts behind it
+     * were static. A periodic instrument has to be stable to be readable.
+     *
+     * Ties are enumerated in ascending method order rather than collapsed:
+     * three methods at the same count is the normal case for a register block
+     * written together, and showing one of them hides the other two. */
+    {
+        uint32_t ceiling = 0xFFFFFFFFu;
+        uint32_t last_slot = 0;
+        int have_last = 0;
+
+        while (printed < max_entries) {
+            uint32_t best = 0, best_slot = 0;
+            int found = 0;
+
+            for (uint32_t i = 0; i < UNHANDLED_SLOTS; i++) {
+                uint32_t v = g_unhandled[i];
+                if (!v || v > ceiling) {
+                    continue;
+                }
+                if (v == ceiling && have_last && i <= last_slot) {
+                    continue;   /* already printed this rank */
+                }
+                if (!found || v > best || (v == best && i < best_slot)) {
+                    best = v;
+                    best_slot = i;
+                    found = 1;
+                }
+            }
+            if (!found || off <= 0 || off >= (int)sizeof(line) - 24) {
+                break;
+            }
+            off += snprintf(line + off, sizeof(line) - (size_t)off,
+                            " 0x%04X=%u", best_slot * 4u, best);
+            ceiling = best;
+            last_slot = best_slot;
+            have_last = 1;
+            printed++;
+        }
+    }
+
+    if (!printed) {
+        return;
+    }
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
+}

@@ -1282,6 +1282,12 @@ static const IDirect3D8Vtbl g_d3d8_vtbl = {
     d3d8_CreateDevice,
 };
 
+/* D3D11 has no per-thread current context; the device context is shared and
+ * the caller serialises. Present so the shared header links on both backends. */
+void xbox_d3d8_make_current(void)
+{
+}
+
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
 {
     (void)SDKVersion;

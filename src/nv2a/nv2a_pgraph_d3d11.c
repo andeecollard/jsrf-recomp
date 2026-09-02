@@ -71,33 +71,29 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * NV2A method constants (from nv2a_regs.h, subset for translator)
+ * NV2A method constants
+ *
+ * These were redefined locally here, after nv2a_regs.h was already included,
+ * and EIGHT of the twenty-one disagreed with it:
+ *
+ *   CLEAR_SURFACE              0x01D0  should be 0x1D94
+ *   SET_COLOR_CLEAR_VALUE      0x01D4  should be 0x1D90
+ *   SET_CLEAR_RECT_HORIZONTAL  0x01D8  should be 0x1D98
+ *   SET_CLEAR_RECT_VERTICAL    0x01DC  should be 0x1D9C
+ *   SET_DEPTH_TEST_ENABLE      0x0354  should be 0x030C
+ *   SET_CULL_FACE_ENABLE       0x039C  should be 0x0308
+ *   SET_SHADE_MODE             0x0368  should be 0x037C
+ *   SET_TEXTURE_CONTROL0       0x1B08  should be 0x1B0C
+ *
+ * A later #define silently wins over the header, so those eight handlers were
+ * wired to offsets the hardware never sends and could not fire on a real ring
+ * -- the whole clear path among them. It went unnoticed because the only data
+ * this translator had ever seen was a captured menu buffer replayed through
+ * the same wrong constants.
+ *
+ * nv2a_regs.h is the authority; it is already included above. Do not shadow it.
  * ══════════════════════════════════════════════════════════════════════ */
 
-#define NV097_SET_BEGIN_END             0x17FC
-#define NV097_INLINE_ARRAY              0x1818
-#define NV097_CLEAR_SURFACE             0x01D0
-#define NV097_SET_COLOR_CLEAR_VALUE     0x01D4
-#define NV097_SET_CLEAR_RECT_HORIZONTAL 0x01D8
-#define NV097_SET_CLEAR_RECT_VERTICAL   0x01DC
-
-#define NV097_SET_DEPTH_TEST_ENABLE     0x0354
-#define NV097_SET_BLEND_ENABLE          0x0304
-#define NV097_SET_BLEND_FUNC_SFACTOR    0x0344
-#define NV097_SET_BLEND_FUNC_DFACTOR    0x0348
-#define NV097_SET_CULL_FACE_ENABLE      0x039C
-#define NV097_SET_ALPHA_TEST_ENABLE     0x0300
-#define NV097_SET_COLOR_MASK            0x0358
-#define NV097_SET_SHADE_MODE            0x0368
-
-#define NV097_SET_VIEWPORT_OFFSET       0x0A20
-#define NV097_SET_VIEWPORT_SCALE        0x0AF0
-#define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
-#define NV097_SET_SURFACE_CLIP_VERTICAL 0x0204
-
-#define NV097_SET_TEXTURE_OFFSET        0x1B00  /* +0x40 per stage */
-#define NV097_SET_TEXTURE_FORMAT        0x1B04  /* +0x40 per stage */
-#define NV097_SET_TEXTURE_CONTROL0      0x1B08  /* +0x40 per stage */
 
 /* NV2A draw modes → D3D primitive types */
 static int nv2a_draw_mode_to_d3d(uint32_t mode) {

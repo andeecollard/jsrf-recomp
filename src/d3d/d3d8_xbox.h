@@ -767,6 +767,15 @@ struct IDirect3D8 {
  * Create the D3D8-compatible interface backed by D3D11.
  * This replaces the Xbox Direct3DCreate8() call.
  */
+/* Name the backend's window. Optional; defaults to a generic name. Call
+ * before creating the device. No-op on backends without a window. */
+void xbox_d3d8_set_window_title(const char *title);
+
+/* Bind the backend's rendering context to the calling thread. Call once from
+ * any thread that will issue draws. No-op where the backend has no per-thread
+ * context. */
+void xbox_d3d8_make_current(void);
+
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
 
 /**

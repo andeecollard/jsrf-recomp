@@ -31,6 +31,21 @@
 #include <string.h>
 #include <math.h>
 
+/* Window title.
+ *
+ * This defaulted to "Burnout 3: Takedown", left over from the extraction --
+ * which is how a JSRF run came up in a window named after another game. The
+ * backend is title-independent everywhere else; it should be here too.
+ */
+static const char *g_window_title = "xboxrecomp";
+
+void xbox_d3d8_set_window_title(const char *title)
+{
+    if (title && *title) {
+        g_window_title = title;
+    }
+}
+
 #ifndef D3D_OK
 #define D3D_OK ((HRESULT)0)
 #endif
@@ -979,7 +994,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow("Burnout 3: Takedown",
+    g.window = SDL_CreateWindow(g_window_title,
                                 SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                                 g.backbuf_w, g.backbuf_h,
                                 SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
@@ -1032,6 +1047,25 @@ static IDirect3D8 g_d3d8 = { &g_d3d8_vtbl };
 /* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
+
+/* Bind the GL context to the calling thread.
+ *
+ * SDL makes the context current on whichever thread created the device -- the
+ * main thread. The NV2A pusher runs on its own thread, and GL entry points
+ * resolve per-context, so issuing a draw from there dereferences a null
+ * dispatch slot and faults inside the driver with no guest frame to blame.
+ * A thread that will issue GL calls its this once.
+ *
+ * Only one thread may hold the context at a time; making it current here
+ * releases it from wherever it was. That is correct while a single thread
+ * does the drawing, which is the case today.
+ */
+void xbox_d3d8_make_current(void)
+{
+    if (g.window && g.glctx) {
+        SDL_GL_MakeCurrent(g.window, g.glctx);
+    }
+}
 
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
 {

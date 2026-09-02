@@ -14,6 +14,8 @@
 #include "recomp_types.h"
 #include "guest_trace.h"
 #include "apu/apu.h"
+#include "nv2a_pusher.h"
+#include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 
 /* Defined in src/apu/apu_mmio_hook.c, outside its Win32 guard. The MMIO hook
@@ -53,98 +55,107 @@ extern MCPXAPUState *g_apu_state;
 
 static volatile int g_pushbuf_ack_stop;
 
-/* TEMPORARY push-buffer capture, for the ring-parsing scope measurement. */
-#define JSRF_PB_CAP_MAX (8u * 1024u * 1024u)
-static FILE *g_pb_cap;
-static unsigned long g_pb_cap_bytes;
-static unsigned long g_pb_cap_ranges;
-
-/* The ring write cursor and its limit are the D3D device's first two fields
- * -- device +0x00 / +0x04, which is what the push primitive sub_0018E930
- * advances, and what d3d8ltcg-device-context.md calls pb_put / pb_limit. The
- * +0x30 / +0x34 pair the ack thread uses are INDICES, not addresses. */
+/*
+ * Drive the NV2A pusher from JSRF's live command ring.
+ *
+ * The ring write cursor and its limit are the D3D device's first two fields --
+ * device +0x00 / +0x04, which the push primitive sub_0018E930 advances, and
+ * which d3d8ltcg-device-context.md calls pb_put / pb_limit. The +0x30 / +0x34
+ * pair the ack below uses are INDICES, not addresses; reading them as
+ * addresses yields two-byte "ranges".
+ *
+ * RING DISCOVERY IS THE ONE TITLE-SPECIFIC PART of this route, and it lives
+ * here rather than in src/nv2a for that reason. JSRF does not use the PFIFO
+ * USER area at 0xFD800040/44, so there is nothing generic to read yet.
+ *
+ * The index ack is left exactly as it was and still runs. It is what the guest
+ * waits on, and replacing it with real consumption timing is a separate change
+ * -- this one only adds a reader alongside it.
+ */
 #define JSRF_PB_PUT_VA    0x0019B200u
 #define JSRF_PB_LIMIT_VA  0x0019B204u
+#define JSRF_PB_START_VA  0x0019B224u   /* pb_ring_start, per the BO3 map */
+#define JSRF_PB_END_VA    0x0019B228u   /* pb_ring_end */
 
 static uint32_t g_pb_last;
+static uint32_t g_pb_ring_lo, g_pb_ring_hi;
 
-static void jsrf_pb_capture(uint32_t get, uint32_t put);
-
-/* Off unless JSRF_PB_CAPTURE is set. The capture answered "what methods does
- * this title actually emit" -- 3939 dwords parsed with zero unparseable
- * headers -- and is worth keeping for the next pass, but it should not write
- * a file on every run. */
-static int jsrf_pb_enabled(void)
+static void jsrf_pb_feed(uint32_t from, uint32_t to)
 {
-    static int state = -1;
-    if (state < 0) state = getenv("JSRF_PB_CAPTURE") ? 1 : 0;
-    return state;
+    if (to <= from) return;
+    if (to - from > 0x100000u) return;          /* implausible span */
+    nv2a_pusher_run((const uint32_t *)XBOX_PTR(from), (to - from) / 4u);
 }
 
 static void jsrf_pb_poll(void)
 {
-    uint32_t now;
-    if (!jsrf_pb_enabled()) return;
-    now = MEM32(JSRF_PB_PUT_VA);
+    uint32_t now = MEM32(JSRF_PB_PUT_VA);
     if (!now) return;
+
     if (!g_pb_last) {
-        fprintf(stderr, "  [PB-CAP] ring cursor starts at 0x%08X, limit 0x%08X\n",
-                now, MEM32(JSRF_PB_LIMIT_VA));
+        g_pb_ring_lo = MEM32(JSRF_PB_START_VA);
+        g_pb_ring_hi = MEM32(JSRF_PB_END_VA);
+        /* Only trust the ring bounds if the cursor actually sits inside them;
+         * otherwise the +0x24/+0x28 fields are not what the BO3 map says for
+         * this title and a wrap has to be skipped rather than mis-parsed. */
+        if (!(g_pb_ring_lo < g_pb_ring_hi && g_pb_ring_lo <= now
+              && now <= g_pb_ring_hi)) {
+            g_pb_ring_lo = g_pb_ring_hi = 0;
+        }
+        fprintf(stderr, "  [PUSHER] ring cursor 0x%08X limit 0x%08X "
+                "bounds 0x%08X-0x%08X%s\n",
+                now, MEM32(JSRF_PB_LIMIT_VA), g_pb_ring_lo, g_pb_ring_hi,
+                g_pb_ring_lo ? "" : " (bounds rejected; wraps skipped)");
         fflush(stderr);
         g_pb_last = now;
         return;
     }
+
     if (now > g_pb_last) {
-        jsrf_pb_capture(g_pb_last, now);
+        jsrf_pb_feed(g_pb_last, now);
+    } else if (now < g_pb_last && g_pb_ring_lo) {
+        /* Wrapped: finish the tail, then take the head. */
+        jsrf_pb_feed(g_pb_last, g_pb_ring_hi);
+        jsrf_pb_feed(g_pb_ring_lo, now);
     }
-    g_pb_last = now;            /* wrap or reset: just resynchronise */
+    g_pb_last = now;
 }
 
-static void jsrf_pb_capture(uint32_t get, uint32_t put)
+/* Periodic pusher report. Separate from the ADX tick so it survives that
+ * probe being removed. */
+static void jsrf_pusher_report(void)
 {
-    uint32_t n;
-    if (put <= get) return;
-    n = put - get;
-    if (n > 0x100000u) return;              /* implausible span */
-    if (g_pb_cap_bytes >= JSRF_PB_CAP_MAX) return;
-    if (!g_pb_cap) {
-        g_pb_cap = fopen("jsrf_pushbuffer.bin", "wb");
-        if (!g_pb_cap) return;
-    }
-    fwrite((const void *)XBOX_PTR(get), 1, n, g_pb_cap);
-    fflush(g_pb_cap);          /* the run is killed, never exited */
-    g_pb_cap_bytes += n;
-    g_pb_cap_ranges++;
-    if (g_pb_cap_ranges <= 3 || (g_pb_cap_ranges % 500) == 0) {
-        fprintf(stderr, "  [PB-CAP] range %lu: %u bytes (total %lu)\n",
-                g_pb_cap_ranges, n, g_pb_cap_bytes);
-        fflush(stderr);
-    }
-    if (g_pb_cap_bytes >= JSRF_PB_CAP_MAX) {
-        fflush(g_pb_cap);
-        fprintf(stderr, "  [PB-CAP] captured %lu bytes in %lu ranges; stopping\n",
-                g_pb_cap_bytes, g_pb_cap_ranges);
-        fflush(stderr);
-    }
+    static DWORD last;
+    DWORD now = GetTickCount();
+    NV2APusherStats st;
+
+    if (last == 0) { last = now; return; }
+    if (now - last < 5000) return;
+    last = now;
+
+    nv2a_pusher_get_stats(&st);
+    fprintf(stderr, "  [PUSHER] runs=%lu dwords=%lu methods=%lu "
+            "unhandled=%lu bad_headers=%lu\n",
+            st.runs, st.dwords, st.methods, st.unhandled, st.bad_headers);
+    fflush(stderr);
+    nv2a_pusher_dump_unhandled(20);
 }
 
 static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
 {
     (void)unused;
+    /* This thread issues the PGRAPH draws, so it must own the GL context. */
+    xbox_d3d8_make_current();
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
         jsrf_pb_poll();
+        jsrf_pusher_report();
         if (dev) {
             uint32_t getp = MEM32(dev + JSRF_D3D_GETPTR_OFFSET);
             if (getp) {
                 uint32_t put = MEM32(dev + JSRF_D3D_PUT_OFFSET);
                 uint32_t get = MEM32(getp);
                 if (get != put) {
-                    /* TEMPORARY: capture the pending command range before
-                     * acking it, so the ring can be parsed offline. Bounded;
-                     * a forward (non-wrapping) range only, which is all that
-                     * is needed to answer "what methods does this title
-                     * emit". */
                     MEM32(getp) = put;
                 }
             }
@@ -553,7 +564,9 @@ int main(int argc, char **argv)
      * answers whether the layer initialises natively on this host at all,
      * which is the first half of the interception route. */
     {
-        IDirect3D8 *d3d = xbox_Direct3DCreate8(0);
+        IDirect3D8 *d3d;
+        xbox_d3d8_set_window_title("Jet Set Radio Future");
+        d3d = xbox_Direct3DCreate8(0);
         fprintf(stderr, "  [D3D8-HLE] xbox_Direct3DCreate8 -> %p\n", (void *)d3d);
         if (d3d) {
             IDirect3DDevice8 *dev = NULL;
@@ -565,6 +578,10 @@ int main(int argc, char **argv)
             hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &dev);
             fprintf(stderr, "  [D3D8-HLE] CreateDevice -> hr=0x%08X dev=%p\n",
                     (unsigned)hr, (void *)dev);
+            /* The PGRAPH translator emits through this device; without init
+             * every method returns "unhandled" and the pusher measures
+             * nothing. */
+            if (dev) pgraph_d3d11_init();
         }
         fflush(stderr);
     }
