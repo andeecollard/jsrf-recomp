@@ -347,7 +347,31 @@ ORDER OF WORK
        Reconcile bit-scan and the icall failure path deliberately.
     2. Regenerate, rerun, re-measure. Nothing should move; this is the
        baseline that makes step 3 interpretable.
-    3. Cherry-pick aaf5eca and 5156919. Regenerate, rerun.
-       WATCH: does the title leave its 60Hz non-rendering tick?
-    4. If it does not, adopt tools/seed_from_log and tools/symbolize, then
-       trace what gates the render call inside sub_000659C0.
+    3. DONE, AND THE ANSWER IS NO. Both fixes are in and both are live -- the
+       regenerated code carries 4,233 _cf assignments and 864
+       RECOMP_DF_STEP sites, JSRF's five `std` instructions now set g_df, and
+       the binary is newer than the sources. Discovery is unchanged at
+       9406/9407 functions, 0 failed.
+
+       Runtime is BYTE-IDENTICAL to before: dwords=3945, methods=2734,
+       clears=9, flips=4, draws=0, still frozen after the startup burst, still
+       ticking at 60Hz.
+
+       So the lead was wrong. JSRF's exposure was real -- 5 std sites, 318
+       sbb/adc reading CF -- but none of it is on the path that gates
+       rendering. The fixes are kept because they are correct and would bite
+       later; they are not progress on this blocker. Recorded rather than
+       quietly dropped, because "we tried the obvious thing and it did
+       nothing" is the expensive fact to rediscover.
+
+    4. NEXT, and now the only route left: trace what gates the render call
+       inside sub_000659C0. Adopt tools/seed_from_log and tools/symbolize from
+       the work branch first -- they exist to make exactly this tractable, and
+       the handover's "lldb is effectively UNUSABLE on this binary" gotcha is
+       what makes doing it by hand slow.
+
+       The shape of the question: sub_000659C0 is the 60Hz tick and it runs a
+       lot of code every frame without ever reaching the push primitive. Use
+       --trace-functions on its callees and find the branch that never goes
+       the drawing way. That is title-specific reverse engineering, not
+       generic ring work, and it should be costed as such.
