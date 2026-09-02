@@ -908,6 +908,7 @@ static void bridge_NtCreateEvent(void)
 #define DISPATCHER_SYNCHRONIZATION  1   /* auto-reset on acquisition */
 
 static void bridge_vblank_poll(void);
+static void bridge_device_irq_poll(void);
 static void bridge_timers_poll(void);
 static void bridge_run_dpc(uint32_t dpc_va, uint32_t sys1, uint32_t sys2);
 
@@ -1002,6 +1003,7 @@ static void bridge_KeWaitForSingleObject(void)
          * vblank or a timer again. Both are re-entrancy guarded. */
         bridge_timers_poll();
         bridge_vblank_poll();
+        bridge_device_irq_poll();
         w32_thread_suspend_point();
         Sleep(1);
     }
@@ -1452,7 +1454,7 @@ static void bridge_KeConnectInterrupt(void)
 /* Call a guest ISR: BOOLEAN (__stdcall *)(PKINTERRUPT, PVOID ServiceContext).
  * Same mechanism as bridge_run_dpc, and it reuses the same g_in_dpc guard so
  * an ISR cannot be entered from inside a DPC or another ISR. */
-static void bridge_run_isr(uint32_t interrupt_va)
+static uint32_t bridge_run_isr(uint32_t interrupt_va)
 {
     uint32_t routine, context;
     recomp_func_t fn;
@@ -1460,7 +1462,7 @@ static void bridge_run_isr(uint32_t interrupt_va)
 
     routine = BRIDGE_MEM32(interrupt_va + 0);
     context = BRIDGE_MEM32(interrupt_va + 4);
-    if (!routine) return;
+    if (!routine) return 0;
 
     fn = recomp_lookup(routine);
     if (!fn) fn = recomp_lookup_manual(routine);
@@ -1471,7 +1473,7 @@ static void bridge_run_isr(uint32_t interrupt_va)
             fprintf(stderr, "  [KERNEL] ISR 0x%08X not in dispatch\n", routine);
             fflush(stderr);
         }
-        return;
+        return 0;
     }
 
     {
@@ -1518,6 +1520,7 @@ static void bridge_run_isr(uint32_t interrupt_va)
         bridge_run_dpc(dpc, s1, s2);
     }
 
+    return isr_result;
 }
 
 /* Raise the GPU interrupt at the display refresh rate. */
@@ -1601,6 +1604,85 @@ static void bridge_vblank_poll(void)
 
             xbox_Nv2aRaiseVblank();
             bridge_run_isr(iv);
+        }
+    }
+
+done:
+    InterlockedExchange(&g_vblank_delivery_active, 0);
+}
+
+/* Device interrupts other than the GPU.
+ *
+ * KeConnectInterrupt records every interrupt a title connects, and JSRF
+ * connects four: vector 3 the NV2A, vector 1 USB (routine 0x001C288F, inside
+ * the XPP peripheral library), vector 6 ACI and vector 5 the APU. Only the
+ * NV2A was ever delivered -- bridge_vblank_poll filters on its vector -- so
+ * the other three were registered and starved.
+ *
+ * That is a plausible reason a title boots, initialises its GPU and then ticks
+ * forever without drawing: with no USB interrupt the controller is never
+ * enumerated, and the ordinal histogram shows JSRF making no input-related
+ * kernel calls at all. A device that never announces itself is
+ * indistinguishable from one that was never plugged in.
+ *
+ * These are delivered on a plain timer rather than off a modelled device.
+ * Nothing here models an OHCI controller, so an ISR that polls its status
+ * registers should find nothing pending and decline -- which is the honest
+ * outcome, and is visible in the log rather than being a fabricated event.
+ * Finding out which of those two happens is the point of raising them.
+ */
+#define BRIDGE_DEVICE_IRQ_PERIOD_MS 8
+
+static void bridge_device_irq_poll(void)
+{
+    static DWORD next_irq = 0;
+    DWORD now;
+    int i;
+
+    if (g_in_dpc || g_in_isr) return;
+
+    /* Shares the NV2A delivery interlock: one interrupt at a time across the
+     * process, for the same reason the vblank path needs it -- several blocked
+     * waiters pump this, and a guest ISR is not re-entrant. */
+    if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) != 0) {
+        return;
+    }
+
+    now = GetTickCount();
+    if (next_irq == 0) {
+        next_irq = now + BRIDGE_DEVICE_IRQ_PERIOD_MS;
+        goto done;
+    }
+    if ((int32_t)(now - next_irq) < 0) goto done;
+    next_irq = now + BRIDGE_DEVICE_IRQ_PERIOD_MS;
+
+    for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
+        uint32_t iv = g_interrupts[i];
+        uint32_t vector;
+        uint32_t result;
+
+        if (!iv) break;
+        vector = BRIDGE_MEM32(iv + 8);
+        if (vector == BRIDGE_NV2A_VECTOR) {
+            continue;   /* the GPU has its own handshake; see bridge_vblank_poll */
+        }
+
+        result = bridge_run_isr(iv);
+
+        /* Logged per vector, because one chatty device would otherwise spend a
+         * shared budget and hide the others. A run of FALSE means the routine
+         * declines at one of its gates, which is what to expect while nothing
+         * models the device -- worth seeing rather than assuming. */
+        {
+            static int logged[BRIDGE_MAX_INTERRUPTS];
+            if (logged[i] < 3) {
+                logged[i]++;
+                fprintf(stderr,
+                        "  [KERNEL] device ISR vector %u routine 0x%08X -> %s\n",
+                        vector, BRIDGE_MEM32(iv + 0),
+                        (result & 0xFF) ? "TRUE (handled)" : "FALSE (declined)");
+                fflush(stderr);
+            }
         }
     }
 
