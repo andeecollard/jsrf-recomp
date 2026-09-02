@@ -1,0 +1,224 @@
+================================================================================
+ROUTE B - NEXT STEPS
+Getting JSRF to render on macOS by executing its own NV2A command ring
+================================================================================
+Companion to CODEX_HANDOVER.txt, which holds the measurements this plan rests
+on. Sections (y), (z), (aa), (ab) and (ac) there are the evidence; this file is
+only the forward plan. Where the two disagree, the handover is the record of
+what was measured and this file is the guess about what to do next.
+
+
+================================================================================
+0. WHERE THIS STANDS
+================================================================================
+THE APP RUNS. It boots, initialises DirectSound and the APU, walks its media
+tree, loads assets from D:, creates its worker threads, connects its
+interrupts, and runs its frame loop at 60Hz. A window is open, backed by
+OpenGL 4.1 on Apple's Metal-backed driver.
+
+IT DOES NOT DRAW YET. The window is blank.
+
+The command ring is parsed and dispatched: 3,939 dwords, 2,731 methods, zero
+unparseable headers, frame loop unregressed. What is missing is the handlers
+those methods land in -- 1,448 of 2,731 are still declined by PGRAPH.
+
+DECIDED, and the reasoning is in handover (y): the ring route rather than ~85
+title-specific D3D8 overrides. JSRF inlines its D3D8 into game code, so there
+is barely an API surface to override; ring work is generic and carries to
+every other Xbox title.
+
+
+================================================================================
+1. P1 - FIRST FRAME  (clear the screen and show it)
+================================================================================
+GOAL: a cleared, flipping surface in the window at 60Hz, in the colour
+NV097_SET_COLOR_CLEAR_VALUE asks for.
+
+TWELVE METHODS TO WRITE. All are emitted by JSRF today; counts are from the
+captured ring. The other six of the eighteen needed already work.
+
+    NEED  SET_CONTEXT_DMA_COLOR       2    which DMA object the colour
+                                           surface lives in
+    NEED  SET_CONTEXT_DMA_ZETA        2    ditto for depth/stencil
+    NEED  SET_SURFACE_FORMAT         13    colour + zeta format, dimensions
+    NEED  SET_SURFACE_PITCH          26    row stride, colour and zeta packed
+                                           in one dword
+    NEED  SET_SURFACE_COLOR_OFFSET   26    colour surface base
+    NEED  SET_SURFACE_ZETA_OFFSET    26    depth surface base
+    NEED  SET_ZSTENCIL_CLEAR_VALUE   19    depth/stencil clear value
+    NEED  FLIP_STALL                  4    wait for the flip to retire
+    NEED  FLIP_INCREMENT_WRITE        4    advance the flip counter
+    NEED  WAIT_FOR_IDLE              85    pipeline barrier
+    NEED  NO_OPERATION              170    no-op; must return handled
+    NEED  SET_CONTROL0               16    depth format / colour-space control
+
+    HAVE  SET_SURFACE_CLIP_HORIZONTAL / _VERTICAL
+    HAVE  SET_COLOR_CLEAR_VALUE
+    HAVE  SET_CLEAR_RECT_HORIZONTAL / _VERTICAL
+    HAVE  CLEAR_SURFACE
+
+Most are plain state stores into the PGRAPH struct. WAIT_FOR_IDLE and
+NO_OPERATION are no-ops that only need to return 1 so they stop being counted
+as misses -- between them they are 255 of the 1,448.
+
+THE REAL WORK IN P1 IS NOT THE METHODS. It is these three:
+
+  1. PRESENT IS NOT WIRED. d3d8_PresentFrame() exists and nothing calls it.
+     A flip has to reach it or the window never updates.
+
+  2. CONTEXT OWNERSHIP. Only one thread may hold the GL context. The pusher
+     thread claims it today (xbox_d3d8_make_current), so Present must happen
+     on the pusher thread too, or the drawing must move off it. Decide this
+     deliberately -- it is what crashed the first run of P0.
+
+  3. macOS WANTS WINDOW EVENTS ON THE MAIN THREAD. SDL_PollEvent and window
+     resize belong there, not on the pusher. Expect to split "issue GL" from
+     "service the window".
+
+EXIT CRITERION: the window shows the clear colour, changing when the guest
+changes it, at ~60Hz. Screenshot it.
+
+RISK TO WATCH: the pusher's counters are STATIC after startup -- JSRF emits a
+burst of ~3,900 dwords and then stops. Either the title is waiting on
+something rendering-related, or it has finished initialising and will not
+submit again until it advances further. If the counters are still static once
+P1 lands, that is the next thing to chase, and it is more important than any
+remaining method.
+
+
+================================================================================
+2. P2 - GEOMETRY
+================================================================================
+GOAL: recognisable geometry on screen.
+
+    SET_VERTEX_DATA_ARRAY_FORMAT / _OFFSET   vertex stream layout
+    SET_BEGIN_END variants                    primitive type
+    DRAW_ARRAYS / ARRAY_ELEMENT16 / _32       indexed and non-indexed draws
+    INLINE_ARRAY                              already handled
+    SET_VIEWPORT_OFFSET / _SCALE              already handled
+    SET_CULL_FACE, polygon mode
+    SET_TRANSFORM_PROGRAM      24 per slot, 32 slots -- vertex microcode
+    SET_TRANSFORM_PROGRAM_LOAD / _START
+    SET_TRANSFORM_CONSTANT / _CONSTANT_LOAD
+    SET_TRANSFORM_EXECUTION_MODE
+
+THE VERTEX SHADER IS ALREADY WRITTEN. d3d8_vsh.c (1,470 lines) takes RAW NV2A
+MICROCODE -- d3d8_vsh_create_shader(const DWORD *microcode, int num_insns) --
+which is exactly what SET_TRANSFORM_PROGRAM streams. Accumulate the program
+into a buffer at _PROGRAM_LOAD offsets and hand the buffer over; do not write
+a second translator.
+
+EXIT CRITERION: geometry that moves with the camera and is recognisably the
+game rather than noise.
+
+
+================================================================================
+3. P3 - TEXTURES AND SHADING
+================================================================================
+GOAL: textured, correctly shaded output.
+
+    SET_TEXTURE_OFFSET / _FORMAT / _CONTROL0 / _CONTROL1 / _IMAGE_RECT
+        (+0x40 per stage, four stages)
+    SET_COMBINER_COLOR_ICW / _OCW, _ALPHA_ICW / _OCW, _FACTOR0 / _FACTOR1,
+    SET_COMBINER_CONTROL, SET_SHADER_STAGE_PROGRAM, SET_SHADER_OTHER_STAGE_INPUT
+    SET_TEXGEN_S / _T / _R / _Q
+
+BOTH HARD PARTS ARE ALREADY WRITTEN AND ARE NV2A-LEVEL, NOT D3D8-LEVEL:
+    d3d8_combiners.c  1,057 lines  consumes combiner ICW/OCW register words,
+                                   which is exactly what SET_COMBINER_* carries
+    d3d8_swizzle.h      246 lines  Morton unswizzle
+    d3d8_resources.c               texture format mapping
+
+EXIT CRITERION: textures appear with correct colours and no swizzle artefacts.
+
+
+================================================================================
+4. P4 - METAL
+================================================================================
+GOAL: a native Metal backend.
+
+THE ATTACH BOUNDARY IS THE IDirect3DDevice8 VTABLE, and it is already proven:
+nv2a_pgraph_d3d11.c contains ZERO ID3D11 references -- all 34 of its emit
+calls go through dev->lpVtbl->. It is a PGRAPH-to-D3D8 translator, not a D3D11
+one, and the file name misleads. So d3d8_metal.m is a third sibling of
+d3d8_device.c (D3D11) and d3d8_gl.c (GL). Nothing in the PGRAPH path changes.
+
+NOT URGENT. Apple's GL driver reports itself as "GL 4.1 Metal - 90.5", so the
+existing GL backend is already running on Metal. P4 is a deprecation hedge and
+an optimisation, not a prerequisite for pixels. Do P1-P3 first.
+
+For shaders there is a choice: retarget d3d8_vsh.c and d3d8_combiners.c to
+emit MSL, or keep them emitting HLSL and run it through Apple's Metal Shader
+Converter. The converter is the one piece of Apple's toolkit that fits this
+project -- Game Porting Toolkit does not, since it targets Windows PE binaries
+under Wine and this is a native arm64 Mach-O.
+
+
+================================================================================
+5. STANDING CONSTRAINTS
+================================================================================
+* THE PUSHER STAYS IN src/nv2a. If it drifts into diagnostics/, the route
+  stops being generic and the whole argument for choosing it collapses.
+
+* RING DISCOVERY IS THE ONE TITLE-SPECIFIC PART, and it is one constant, not
+  eighty-five functions. JSRF publishes its ring through D3D8 globals at
+  device +0x00 / +0x04 (0x0019B200 / 0x0019B204), not the PFIFO USER area at
+  0xFD800040/44. Deriving it from the channel/DMA object setup would remove
+  even that; worth doing when a second title needs it, not before.
+
+* nv2a_regs.h IS THE AUTHORITY ON METHOD OFFSETS. Eight constants shadowed it
+  and were wrong, which silently mis-wired the entire clear path and applied
+  JSRF's stencil writes as depth and cull state. Do not redefine NV097_* in a
+  translator.
+
+* AN UNHANDLED METHOD MUST STAY COUNTED. nv2a_pusher ranks declines by
+  frequency every five seconds. A silently dropped method is indistinguishable
+  from one that never arrived -- which is exactly how this effort previously
+  lost time to a histogram that was never printed being read as a histogram of
+  zeroes.
+
+* nv2a_pb_replay.c IS INERT. nv2a_pb_replay_frame() is defined and never
+  called. It also carries Burnout 3 menu data and literal method offsets, one
+  of which (0x1B08 for TEXTURE_CONTROL0) is now wrong. Fix the literals if it
+  is ever revived; ignore it otherwise.
+
+
+================================================================================
+6. HOW TO MEASURE, AT EVERY STEP
+================================================================================
+    cd build-macos/jsrf-first-fault/build && ./jsrf_first_fault
+
+    [PUSHER] runs=N dwords=N methods=N unhandled=N bad_headers=N
+    [PUSHER] unhandled methods: 0xNNNN=count ...      (ranked, every 5s)
+
+  bad_headers > 0            the ring range is wrong, not the parser
+  methods static after boot  the title has stopped submitting -- chase that
+                             before writing more handlers
+  unhandled falling          the handlers are landing
+
+  [ADX] tick ~60/s           the frame loop is alive; "STUCK at N" means it
+                             is not, and nothing else matters until it is
+
+  JSRF_PB_CAPTURE=1          dump the ring to jsrf_pushbuffer.bin for offline
+                             parsing
+
+  timeout does not exist on macOS. Bound a run with:
+      ./jsrf_first_fault > out 2> err & P=$!
+      sample $P 25 -f /dev/null
+      kill -0 $P && echo "still running" || echo "exited"
+
+
+================================================================================
+7. OPEN QUESTIONS
+================================================================================
+* Why does submission stop after ~3,900 dwords? Startup burst, or a stall
+  waiting on something the GPU is meant to do? This is the biggest unknown in
+  the plan and P1 should answer it.
+
+* Does JSRF ever wrap the ring? The bounds at device +0x24/+0x28 were accepted
+  (0x010DD000-0x0115D000, cursor inside), and wrap handling is written, but it
+  has not yet been observed firing.
+
+* Present timing. On hardware the flip is paced by the vblank the runtime
+  already delivers at 60Hz. Whether to drive Present from FLIP_STALL, from the
+  vblank, or from both is undecided.
