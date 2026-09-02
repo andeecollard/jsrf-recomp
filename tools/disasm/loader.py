@@ -199,9 +199,19 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
     # Find and load analysis JSON
     json_path = Path(analysis_json) if analysis_json else _find_analysis_json(xbe_file)
     if json_path is None or not json_path.exists():
+        # Name the file it wants and the command that writes it. The old
+        # message said only "run the XBE parser first", which left the reader
+        # to guess both the filename and where it goes -- one did, passed
+        # `--json JSON`, and then had to pass `--analysis-json JSON` here to
+        # get past it. Auto-detection needs the exact name.
+        wanted = xbe_file.parent / (xbe_file.stem + "_analysis.json")
         raise FileNotFoundError(
-            f"Analysis JSON not found. Run the XBE parser first, or specify "
-            f"--analysis-json path. Searched near: {xbe_file}"
+            f"Analysis JSON not found: {wanted}\n"
+            f"  Write it with:  py -3 -m tools.xbe_parser {xbe_file} "
+            f"--json {wanted}\n"
+            f"  The name matters -- this step looks for "
+            f"<xbe stem>_analysis.json beside the XBE. A file somewhere else, "
+            f"or under another name, needs --analysis-json <path>."
         )
 
     with open(json_path) as f:

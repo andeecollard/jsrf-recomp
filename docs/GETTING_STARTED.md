@@ -18,20 +18,24 @@ Optional but very helpful:
 
 ## Step 0: Set Up Your Project
 
+Two directories, and it matters which is which:
+
+- **`xboxrecomp/`** — this toolkit. Building it produces **static libraries only**. It has no `main()`, so it can never produce a game `.exe`, no matter how you invoke CMake.
+- **`my_xbox_game/`** — *your* project, copied from `templates/new-game/`. This is what builds the `.exe`; it links the toolkit's libraries and holds the generated code.
+
 ```bash
 # Clone the toolkit
 git clone https://github.com/sp00nznet/xboxrecomp.git
 
-# Create your game-specific repo
-mkdir my_xbox_game
+# Create your game-specific repo from the template
+cp -r xboxrecomp/templates/new-game my_xbox_game   # Windows cmd: xcopy /E /I xboxrecomp\templates\new-game my_xbox_game
 cd my_xbox_game
 git init
 
-# Build the runtime libraries
-cd ../xboxrecomp
-cmake -S . -B build
-cmake --build build --config Release
-cd ../my_xbox_game
+# Sanity-check the toolkit builds (optional -- your project builds it too,
+# via add_subdirectory). This yields libraries, not an executable.
+cmake -S ../xboxrecomp -B ../xboxrecomp/build
+cmake --build ../xboxrecomp/build --config Release
 ```
 
 ## Step 1: Extract the XBE
@@ -99,16 +103,62 @@ This classifies functions into categories:
 - **GAME** — Game-specific code — your main focus
 - **STUB** — Empty/trivial functions — safe to ignore
 
-## Step 5: Recompile
+## Step 4.5 (optional): Recover real names with Ghidra
+
+Everything is `sub_0004F8B5` by default, and reading a 500,000-line call graph
+of those is the slow part of every bring-up. If you have Ghidra, its Function ID
+databases recognise the statically linked MSVC CRT and XDK helpers and give a
+few hundred of them their real names — `malloc`, `_ftol`, `__SEH_prolog`,
+`memcpy`, the 64-bit math helpers. Those are exactly the functions you would
+otherwise waste a day identifying by hand.
+
+Do it **before** Step 5. The recompiler reads the `name` field out of
+`functions.json` and emits it as the C function name, so names applied now show
+up in the generated code, in crash traces, and in `RECOMP_ABI_CHECK` reports.
 
 ```bash
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000
+# Analyse the XBE headless and export what Ghidra found
+XBE=game_files/default.xbe tools/ghidra_naming/run_ghidra.sh
+
+# Turn the export into a clean {address: name} map, and write the names into
+# functions.json. Without --apply it only reports what it would do.
+py -3 tools/ghidra_naming/merge_names.py --apply
+```
+
+Only meaningful names survive the merge — Ghidra's own `FUN_*`/`LAB_*`/`DAT_*`
+placeholders are dropped, names are sanitised to valid C identifiers, and
+collisions get the address appended.
+
+Expect a few hundred names, not thousands: proprietary game code has no
+signatures to match, so it keeps `sub_`. On the Xbox Dashboard this recovered
+133 CRT/XDK names including the LZX and XIP decompressors, which is what made
+the asset loader legible at all.
+
+Ghidra 12.x has no XBE loader, so the pipeline flattens the XBE into a raw
+image at the right base address first — that is why the addresses line up with
+`functions.json` exactly. Set `GHIDRA_HOME` if yours is not at
+`/c/tools/ghidra/ghidra_12.0.3_PUBLIC`. Full detail, including optional
+decompilation and why function seeding is off by default, is in
+[tools/ghidra_naming/README.md](../tools/ghidra_naming/README.md).
+
+Re-run Step 3 after this and the names are lost — `tools.disasm` rewrites
+`functions.json` from scratch. Re-apply with `merge_names.py --apply`; the
+Ghidra export is cached, so it takes seconds.
+
+## Step 5: Recompile
+
+Steps 2-5 all run from inside the `xboxrecomp` clone (that's where `tools/` lives).
+Point the generated code at **your** project with `--gen-dir`:
+
+```bash
+py -3 -m tools.recomp game_files/default.xbe --all --split 1000 \
+    --gen-dir ../my_xbox_game/src/recomp/gen
 ```
 
 This is the big one — it can take 5-15 minutes for a large game. Output:
 
 ```
-src/game/recomp/gen/
+../my_xbox_game/src/recomp/gen/
 ├── recomp_0000.c          # Functions 0-999
 ├── recomp_0001.c          # Functions 1000-1999
 ├── ...                    # More splits
@@ -117,88 +167,80 @@ src/game/recomp/gen/
 └── recomp_stubs.c         # Stubs for unresolvable targets
 ```
 
-## Step 6: Set Up Your Build
+Without `--gen-dir` the code lands in `src/game/recomp/gen/` **inside the toolkit clone**,
+where no build target compiles it — which is why a plain toolkit build then still
+produces only libraries. `src/recomp/gen/` is the path the template's CMakeLists globs.
 
-Create `CMakeLists.txt` in your game project:
+## Step 6: Create Your Game Project
+
+**This is the step that produces the `.exe`.** The toolkit has no `main()`; your
+project does. If you copied `templates/new-game/` in Step 0 it is already in
+place, and there are exactly three things to fill in.
+
+`my_xbox_game/` now looks like:
+
+```
+my_xbox_game/
++-- CMakeLists.txt          # Builds the .exe, links the xboxrecomp libraries
++-- src/
+    +-- main.c              # Host entry: loads XBE, inits kernel, calls the guest
+    +-- recomp_manual.c     # Your hand-written function overrides
+    +-- recomp/gen/         # Generated code from Step 5, including:
+        +-- recomp_funcs.h     #   declarations for every lifted function
+        +-- recomp_types.h     #   the runtime register model, MEM/ICALL macros
+        +-- recomp_0000.c ...  #   the code itself
+```
+
+`recomp_types.h` is written there by Step 5, not something you supply. It used
+to live only in `templates/runtime/`, and the first sign of that was
+`error C1083: Cannot open include file: 'recomp_types.h'` at build time. If you
+see that error, Step 5 did not complete — check its output for the
+`wrote .../recomp_types.h` line. The pipeline never overwrites an existing copy,
+so an edited one survives regeneration; delete it to get the current one back.
+
+**1. `CMakeLists.txt`** — set the project name and the path to your toolkit clone:
 
 ```cmake
-cmake_minimum_required(VERSION 3.20)
-project(my_xbox_game C)
+project(my_game C)                                    # names the .exe
 
-set(CMAKE_C_STANDARD 11)
-
-# Common defines
-add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
-
-# xboxrecomp runtime libraries
-add_subdirectory(path/to/xboxrecomp)
-
-# Your game executable
-add_executable(my_game
-    src/main.c                          # Entry point, window, game loop
-    src/game/recomp/recomp_manual.c     # Manual function overrides
-    src/game/recomp/gen/recomp_0000.c   # Generated code
-    src/game/recomp/gen/recomp_0001.c
-    # ... all gen files
-    src/game/recomp/gen/recomp_dispatch.c
-    src/game/recomp/gen/recomp_stubs.c
-)
-
-# Suppress warnings in generated code (it's mechanical, not pretty)
-target_compile_options(my_game PRIVATE /w)
-
-# Link runtime libraries
-target_link_libraries(my_game PRIVATE xboxrecomp)
+set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
+    "Path to the xboxrecomp toolkit root directory")
 ```
 
-Create `src/main.c`:
+Everything else is already wired: it `add_subdirectory`s the toolkit (so you do
+not have to build it separately), globs `src/recomp/gen/*.c` with
+`CONFIGURE_DEPENDS`, links the `xboxrecomp` umbrella target plus the Windows
+SDK libraries, and sets `/bigobj` and `/LARGEADDRESSAWARE`.
+
+**2. `src/main.c`** — fill in the three constants from your Step 2 output:
 
 ```c
-#include "kernel.h"
-#include "xbox_memory_layout.h"
-#include "d3d8_xbox.h"
-
-// Generated code dispatch
-extern void (*recomp_func_t)(void);
-recomp_func_t recomp_lookup(uint32_t xbox_va);
-recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
-
-int main(int argc, char *argv[]) {
-    // Load XBE into memory
-    FILE *f = fopen("game_files/default.xbe", "rb");
-    fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
-    rewind(f);
-    void *xbe = malloc(size);
-    fread(xbe, 1, size, f);
-    fclose(f);
-
-    // Initialize Xbox memory layout
-    xbox_MemoryLayoutInit(xbe, size);
-
-    // Initialize kernel
-    xbox_kernel_init();
-    xbox_path_init("game_files", "saves");
-    xbox_kernel_bridge_init();
-
-    // Initialize graphics
-    xbox_Direct3DCreate8(0);
-
-    // Jump to entry point!
-    recomp_func_t entry = recomp_lookup(0x001D2807);  // YOUR entry point
-    if (entry) entry();
-
-    return 0;
-}
+#define YOUR_GAME_ENTRY_POINT   0x001D2807          /* XBE entry point VA */
+#define YOUR_GAME_XBE_PATH      "game/default.xbe"
+#define YOUR_GAME_DIR           "game"
 ```
 
+The template already does the rest of the boot in order: install the VEH crash
+handler, load the XBE, `xbox_MemoryLayoutInit`, `xbox_kernel_init`,
+`xbox_path_init`, `xbox_kernel_bridge_init`, set `g_esp = XBOX_STACK_TOP`, then
+call `xbe_entry_point()` — the generated function named after your entry point VA.
+
+**3. Game data** — put the extracted `default.xbe` and data files where
+`YOUR_GAME_DIR` points, relative to the `.exe`.
+
 ## Step 7: Build and Crash
+
+From `my_xbox_game/` — **not** from the toolkit clone:
 
 ```bash
 cmake -S . -B build
 cmake --build build --config Release
-bin\my_game.exe 2>stderr.txt
+build\Release\my_game.exe 2>stderr.txt      # named after project() in your CMakeLists
 ```
+
+This configure step builds the toolkit's libraries as a subdirectory *and* links
+them into your `.exe`. If you get libraries and no `.exe`, you are building the
+toolkit's `CMakeLists.txt` instead of your project's.
 
 **It will crash.** That's expected and normal. The stderr log tells you what happened.
 

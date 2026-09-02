@@ -7,6 +7,7 @@ __pycache__/
 tools/disasm/output/
 tools/func_id/output/
 tools/recomp/output/
+tools/abi_analysis/output/
 
 # Game files (user provides their own)
 game_files/

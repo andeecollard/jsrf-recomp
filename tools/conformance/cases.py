@@ -161,6 +161,12 @@ CASES = [
     Case("inc_dec", "inc/dec leave CF alone -- a classic place to get flags wrong",
          ["stc", "inc eax", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
     Case("bswap", "byte swap", ["bswap eax"], _PAIRS),
+    Case("bsf", "least-significant set bit, with a nonzero source",
+         ["or ecx, 1", "bsf eax, ecx"], _PAIRS),
+    Case("bsr", "most-significant set bit, with a nonzero source",
+         ["or ecx, 1", "bsr eax, ecx"], _PAIRS),
+    Case("bit_scan_zf", "bit scan sets ZF when its source is zero",
+         ["bsf edx, ecx", "setz al", "movzx eax, al"], _PAIRS),
     Case("not_and", "bitwise", ["not eax", "and eax, ecx"], _PAIRS),
 
     # -- XADD / LOCK XADD ---------------------------------------------------

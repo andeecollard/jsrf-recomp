@@ -77,6 +77,32 @@ wrong, with no lifter error or warning anywhere.
 *(The runtime half of the SSE work — the `RecompXmm` union and the 28 `XMM_*`
 helpers the lift emits — was not in the PRs and was added on integration.)*
 
+*Missing instructions and dispatch (#14, #15, #16)*
+- **`XLAT`/`XLATB` lifted to nothing**, so a guest table lookup left `AL`
+  unchanged. Now `AL = MEM8(EBX + zero_extend(AL))`, written through `SET_LO8`
+  so only the low byte moves, with the `0x67` address-size override using `BX`
+  and wrapping the offset at 16 bits.
+- **`BSF`/`BSR` were classified as flag setters but never lifted**, leaving an
+  unhandled-instruction comment where the result should be. The flag half is
+  the subtler fix: ZF was derived by re-reading the source operand at the
+  branch, so any flag-preserving write between the scan and the `jcc` silently
+  changed the answer. ZF is snapshotted where the scan runs, and the translator
+  omits the snapshot when nothing consumes it. A zero source leaves the
+  destination untouched, matching the architectural "undefined" instead of
+  inventing a value.
+- **`recomp_lookup_manual` was consulted on indirect calls only** — a direct
+  call or tail jump went straight to the generated body, so a hand-written
+  replacement worked through a function pointer and was quietly bypassed by
+  every direct caller. Now direct calls and both tail-jump forms route through
+  the manual set that `--manual-functions` and `--exclude-manual` already build.
+
+*Also raised: stored code pointers (#13).* The gap is real and was found
+independently while bringing up Half-Life 2 -- functions reachable only as an
+address in a table have no call site, no prologue and no padding boundary, so
+nothing else finds them. It is now covered by `_pass_imm_ref_targets` and
+`_pass_data_ptr_targets`, which reached the same conclusion from the other
+direction.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it

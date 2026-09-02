@@ -610,12 +610,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
     if flag_setter in ("bsf", "bsr"):
-        if rhs is None:
-            return None
         if jcc in ("je", "jz"):
-            return f"({rhs} == 0)", desc
+            return "_flags", desc
         if jcc in ("jne", "jnz"):
-            return f"({rhs} != 0)", desc
+            return "!_flags", desc
         return None
 
     # ── bt/bts/btr/btc: bit test, sets CF ──
@@ -714,6 +712,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if lifter and lifter._is_external_target(target):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
+        if target in lifter.manual_functions:
+            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+                    f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
+                    f" /* {jcc}: {desc}, manual tail */")
         name = lifter._call_target_name(target)
         return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
@@ -831,21 +833,24 @@ class Lifter:
     """Translates x86 instructions to C statements."""
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
-                 seh_prolog=None, seh_epilog=None):
+                 seh_prolog=None, seh_epilog=None, manual_functions=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
         abi_db: dict of addr → ABI info (for calling conventions)
         xbe_data: raw XBE file bytes (for reading jump tables)
         seh_prolog/seh_epilog: override the detected __SEH_prolog/__SEH_epilog
+        manual_functions: addresses replaced through recomp_lookup_manual
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
+        self.manual_functions = set(manual_functions or ())
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
+        self.needs_flags = True  # Translator disables snapshots with no consumer
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
@@ -954,6 +959,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("bsf", "bsr"):
+            return self._lift_bit_scan(ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1014,26 +1021,6 @@ class Lifter:
                 out.append(f"/* bt {insn.op_str}: no CF consumer */")
             return out
 
-        # ── bsf/bsr: bit scan ──
-        # 386 instructions, and the Xbox D3D library leans on one: its Log2
-        # helper is a bare `bsf eax, ecx`. Unhandled it lifted to a comment,
-        # so the helper returned whatever eax happened to hold and every
-        # surface size computed from log2(w)+log2(h)+log2(d) was wrong -- JSRF
-        # asked MmAllocateContiguousMemoryEx for 0x08000000 bytes, twice the
-        # console's RAM, and D3D failed the create with E_OUTOFMEMORY.
-        #
-        # With a zero source x86 sets ZF and leaves the destination ALONE.
-        # That is what the guard reproduces; writing a sentinel instead would
-        # invent a value the hardware never produces. The ZF consumer is
-        # resolved separately, straight off the source operand -- see the
-        # bsf/bsr arm of _resolve_flag_condition.
-        if m in ("bsf", "bsr") and nops >= 2:
-            dst, src = ops[0], ops[1]
-            value = _fmt_operand_read(src)
-            helper = "BSF32" if m == "bsf" else "BSR32"
-            write = _fmt_operand_write(dst, f"{helper}({value})")
-            return [f"if (({value}) != 0) {write} /* {m} */"]
-
         if m == "int3":
             return ["__debugbreak(); /* int3 */"]
         if m in ("leave",):
@@ -1054,6 +1041,15 @@ class Lifter:
             return [f"/* bt {insn.op_str} */"]
         if m == "emms":
             return ["/* emms - empty MMX state */"]
+        if m in ("xlat", "xlatb"):
+            # AL indexes the byte table at EBX. With an address-size override,
+            # the effective offset is calculated and wrapped at 16 bits.
+            raw_bytes = bytes.fromhex(insn.bytes_hex)
+            if 0x67 in raw_bytes[:-1]:
+                address = "(uint16_t)(LO16(ebx) + LO8(eax))"
+            else:
+                address = "ebx + LO8(eax)"
+            return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
         if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
                  "setl", "setge", "setle", "setg", "sets", "setns"):
             return self._lift_setcc(insn, ops, m)
@@ -1528,6 +1524,52 @@ class Lifter:
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
+    def _lift_bit_scan(self, ops, mnemonic):
+        """Lift bsf/bsr.
+
+        Why this matters, kept from the independent fix this replaced: the
+        Xbox D3D library's Log2 helper is a bare `bsf eax, ecx`. Unhandled it
+        lifted to a comment, so the helper returned whatever eax happened to
+        hold, and every surface size computed from log2(w)+log2(h)+log2(d) was
+        wrong -- JSRF asked MmAllocateContiguousMemoryEx for 0x08000000 bytes,
+        twice the console's RAM, and D3D failed the create with E_OUTOFMEMORY.
+
+        With a zero source x86 sets ZF and leaves the destination ALONE, which
+        is what the guard below reproduces; writing a sentinel instead would
+        invent a value the hardware never produces.
+        """
+        if len(ops) < 2:
+            return [f"/* {mnemonic}: bad operands */"]
+
+        src = _fmt_operand_read(ops[1])
+        width = _operand_width(ops[1]) or _operand_width(ops[0]) or 4
+        bits = width * 8
+        value = (f"(uint32_t)(uint16_t)({src})" if width == 2
+                 else f"(uint32_t)({src})")
+        if mnemonic == "bsr":
+            initial_index = bits - 1
+            step = "--_bs_index"
+        else:
+            initial_index = 0
+            step = "++_bs_index"
+        write = _fmt_operand_write(ops[0], "_bs_index")
+        statements = [
+            "{",
+            f"    uint32_t _bs_value = {value};",
+        ]
+        if self.needs_flags:
+            statements.append("    _flags = (_bs_value == 0);")
+        statements.extend([
+            "    if (_bs_value != 0) {",
+            f"        uint32_t _bs_index = {initial_index};",
+            "        while (((_bs_value >> _bs_index) & 1u) == 0u) "
+            f"{step};",
+            f"        {write}",
+            "    }",
+            f"}} /* {mnemonic} */",
+        ])
+        return statements
+
     # ── Compare / Test (standalone) ──
 
     # Widths for the flag snapshot below.
@@ -1612,7 +1654,6 @@ class Lifter:
         # value -- so writing the true address costs nothing at the return side.
         ret_va = insn.end_address
         if insn.call_target:
-            name = self._call_target_name(insn.call_target)
             lines = []
             # Re-publish this function's frame before every call, not just once
             # at `mov ebp, esp`. g_ebp is "the last frame established anywhere",
@@ -1624,9 +1665,17 @@ class Lifter:
             # [ebp-0xa0] onto Xbox VA 4 and 6: exactly the fs:[4] corruption.
             if self.publishes_ebp:
                 lines.append("g_ebp = ebp; /* frame stays current across calls */")
-            lines.append(
-                f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
-                f"/* call 0x{insn.call_target:08X} */")
+            if insn.call_target in self.manual_functions:
+                lines.append(
+                    f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
+                    "_icall_esp); "
+                    f"/* manual call 0x{insn.call_target:08X} */")
+            else:
+                name = self._call_target_name(insn.call_target)
+                lines.append(
+                    f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
+                    f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the
             # function containing them all.
@@ -1741,6 +1790,19 @@ class Lifter:
             if self._is_external_target(insn.jump_target):
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
+                if insn.jump_target in self.manual_functions:
+                    tail = (
+                        f"g_seh_ebp = ebp; "
+                        f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
+                        f"/* manual tail jmp 0x{insn.jump_target:08X} */"
+                    )
+                    if self.trace_exit_name:
+                        return [
+                            f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                            f'"tail 0x{insn.jump_target:08X}");',
+                            tail,
+                        ]
+                    return [tail]
                 name = self._call_target_name(insn.jump_target)
                 tail = (f"g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")

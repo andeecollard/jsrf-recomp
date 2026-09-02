@@ -110,6 +110,8 @@ cmake --build build --config Release
 
 This produces 6 static libraries in `build/src/*/Release/`. Link your game project against `xboxrecomp` (umbrella target) or individual libraries.
 
+**This repo builds libraries only — there is no game `.exe` here, and building it will never produce one.** The executable is built by *your* game project, which lives in its own directory and links these libraries. Start it by copying [`templates/new-game/`](templates/new-game/): it has the `CMakeLists.txt` that produces the `.exe` and the `main.c` that boots the guest. See [Getting Started, Step 6](docs/GETTING_STARTED.md#step-6-create-your-game-project).
+
 ### Integration Pattern
 
 Your recompiled game provides two callback functions that the kernel bridge calls to resolve function addresses:
@@ -164,6 +166,11 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 
 ### Step-by-Step
 
+The condensed version. [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) is
+the long one, and the one to read if a step here does not go as written — it
+explains *why* each flag is there, which is what you need when your title
+behaves differently from the example.
+
 ```bash
 # 1. Clone this repo
 git clone https://github.com/sp00nznet/xboxrecomp.git
@@ -175,12 +182,18 @@ mkdir game_files
 # copy default.xbe and game data into game_files/
 
 # 3. Parse the XBE — learn what you're working with
-py -3 -m tools.xbe_parser game_files/default.xbe
+#    --json is NOT optional: step 4 reads the section layout back out of it.
+#    The name matters too. Step 4 looks for <xbe stem>_analysis.json beside the
+#    XBE, so keep it there and keep the suffix.
+py -3 -m tools.xbe_parser game_files/default.xbe --json game_files/default_analysis.json
 #    Output: section map, kernel imports, entry point, XDK version
 
 # 4. Disassemble — find all functions
 py -3 -m tools.disasm game_files/default.xbe --text-only
 #    Output: tools/disasm/output/ (functions.json, xrefs.json, strings.json)
+#    --text-only does what it says: only .text. A title with code in its XDK
+#    library sections (D3D, DSOUND, XPP...) needs them named explicitly, e.g.
+#    --extra-sections XIPS,DOLBY. Drop --text-only to take every code section.
 
 # 5. Identify library functions
 py -3 -m tools.func_id game_files/default.xbe -v
@@ -192,20 +205,36 @@ py -3 -m tools.abi_analysis game_files/default.xbe -v
 #    Skipping this still "works", but every function falls back to
 #    cdecl / 0 params / int-or-void, so the generated signatures are guesses.
 
-# 7. Lift to C — the big one
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000
-#    Output: src/game/recomp/gen/ (millions of lines of C)
+# 6b. Optional: real names instead of sub_XXXXXXXX, if you have Ghidra.
+#     FidDb recognises the statically linked CRT/XDK helpers and names a few
+#     hundred of them. Do it BEFORE step 8: the recompiler emits whatever name
+#     is on the functions.json entry, so the names reach the generated C,
+#     crash traces and ABI reports. See docs/GETTING_STARTED.md step 4.5.
+XBE=game_files/default.xbe tools/ghidra_naming/run_ghidra.sh
+py -3 tools/ghidra_naming/merge_names.py --apply
 
-# 8. Set up runtime shims (see docs/runtime/ for templates)
-#    - Xbox kernel replacement (152 ordinals routed)
-#    - D3D8 -> D3D11 translation layer
-#    - Memory layout reproduction
-#    - Input system
+# 7. Create your game project — this is what becomes the .exe
+#    The toolkit is a library; the executable lives in your own project.
+cp -r templates/new-game ../mygame        # Windows cmd: xcopy /E /I templates\new-game ..\mygame
+#    Then edit:
+#      ../mygame/CMakeLists.txt  -> project name, XBOXRECOMP_DIR path
+#      ../mygame/src/main.c      -> YOUR_GAME_ENTRY_POINT / XBE path from step 3
 
-# 9. Build and run
+# 8. Lift to C — the big one
+#    --gen-dir writes the generated code into your game project, where the
+#    template's CMakeLists globs src/recomp/gen/*.c. Without it the output
+#    lands in this repo (src/game/recomp/gen/) and nothing compiles it.
+py -3 -m tools.recomp game_files/default.xbe --all --split 1000 --gen-dir ../mygame/src/recomp/gen
+#    Output: recomp_0000.c ... recomp_dispatch.c, recomp_funcs.h (millions of
+#    lines of C), plus recomp_types.h — the runtime register model the
+#    generated code includes. You do not supply that one; if the build says
+#    "Cannot open include file: 'recomp_types.h'", this step did not finish.
+
+# 9. Build and run — from the game project, not from xboxrecomp
+cd ../mygame
 cmake -S . -B build
 cmake --build build --config Release
-bin/your_game.exe
+build\Release\your_game_recomp.exe          # named after project() in your CMakeLists
 ```
 
 ### What To Expect
@@ -246,6 +275,9 @@ xboxrecomp/
 │   └── input/                   # xbox_input  - Gamepad → XInput
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
+│   ├── new-game/                # ** Copy this to start a game project **
+│   │   ├── CMakeLists.txt       # Builds the game .exe, links xboxrecomp
+│   │   └── src/main.c           # Host entry point: loads XBE, boots guest
 │   └── runtime/                 # Runtime shim templates
 │       ├── recomp_types.h       # Register model + ICALL macros
 │       ├── xbox_memory.h        # Memory layout helpers

@@ -816,6 +816,7 @@ class FunctionTranslator:
                        for insn in instructions)
         if has_conditionals or has_xadd:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        self.lifter.needs_flags = has_conditionals
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -1273,6 +1274,8 @@ class BatchTranslator:
         are still declared and still count as defined for stub purposes. This
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
+        Direct calls and tail jumps to these addresses use the same manual-first
+        lookup as indirect calls, so every call path reaches the override.
 
         Returns dict with stats and list of generated files.
         """
@@ -1283,6 +1286,7 @@ class BatchTranslator:
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
         manual = set(manual or ())
+        self.translator.lifter.manual_functions = manual
         manual_decls = {}
 
         # Translate all functions first, collecting results
@@ -1369,6 +1373,37 @@ class BatchTranslator:
 
         with open(header_path, "w", encoding="utf-8") as f:
             f.write("\n".join(header_lines))
+
+        # recomp_types.h goes with it.
+        #
+        # recomp_funcs.h includes it, and a quoted include searches the
+        # including file's own directory first, so putting it here is all it
+        # takes for the generated code to compile. It used to live only in
+        # templates/runtime/, which every new project discovered the same way:
+        # `error C1083: Cannot open include file: 'recomp_types.h'`, then a hunt
+        # through the tree. It is the runtime's register model, not something a
+        # project writes, so the pipeline should hand it over like everything
+        # else it generates.
+        #
+        # Never overwritten. A project that has edited this copy keeps its
+        # edits across a regen, which is the opposite of how the .c files
+        # behave -- but this is a header a project may reasonably touch, and
+        # silently reverting someone's change on every regen is worse than
+        # letting a stale one persist. Delete it to get the current one back.
+        types_dst = os.path.join(output_dir, "recomp_types.h")
+        if not os.path.exists(types_dst):
+            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                     "templates", "runtime", "recomp_types.h")
+            try:
+                with open(types_src, "r", encoding="utf-8") as src:
+                    with open(types_dst, "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+                print(f"  wrote {types_dst} (runtime register model)",
+                      file=sys.stderr)
+            except OSError as e:
+                print(f"  WARNING: could not write recomp_types.h ({e}); copy "
+                      f"it from templates/runtime/ by hand or the build will "
+                      f"not find it", file=sys.stderr)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
