@@ -198,6 +198,64 @@ static uint32_t jsrf_pb_index(uint32_t which)
     return v;
 }
 
+/* One-shot: locate live instances of the renderer class, and who points at
+ * them.
+ *
+ * The class was found by scanning the image for a stored pointer to its render
+ * entry: a 121-slot vtable at 0x001E0F00, constructor sub_0014CDB0, slot 10
+ * the render entry. Neither that slot nor the guarded slot 6 has a static
+ * caller, so the call graph cannot say who drives the object -- and JSRF ships
+ * with RTTI disabled (4 type descriptors, 0 vtables), so class recovery cannot
+ * either.
+ *
+ * What is left is the object itself. An instance carries the vtable address in
+ * its first word, so scanning guest RAM for 0x001E0F00 finds every live one;
+ * scanning again for pointers to those finds the global or structure field
+ * that owns it. That names the thing the tick would have to consult.
+ */
+#define JSRF_RENDERER_VTABLE 0x001E0F00u
+
+static void jsrf_find_renderer(void)
+{
+    static int done;
+    uint32_t found[8];
+    int n = 0;
+    uint32_t va;
+
+    if (done) return;
+    done = 1;
+
+    /* Guest RAM only; the scan is a diagnostic, so keep it to the mapped
+     * image and heap rather than probing apertures that fault. */
+    for (va = 0x00010000u; va < 0x02000000u; va += 4) {
+        if (MEM32(va) == JSRF_RENDERER_VTABLE) {
+            if (n < 8) found[n] = va;
+            n++;
+        }
+    }
+    fprintf(stderr, "  [RENDERER] %d live instance(s) of vtable 0x%08X\n",
+            n, JSRF_RENDERER_VTABLE);
+
+    for (int i = 0; i < n && i < 8; i++) {
+        uint32_t obj = found[i];
+        int refs = 0;
+        char line[256];
+        int off = snprintf(line, sizeof(line),
+                           "  [RENDERER]   instance 0x%08X referenced from:", obj);
+        for (va = 0x00010000u; va < 0x02000000u; va += 4) {
+            if (MEM32(va) == obj && va != obj) {
+                refs++;
+                if (off > 0 && off < (int)sizeof(line) - 16 && refs <= 8) {
+                    off += snprintf(line + off, sizeof(line) - (size_t)off,
+                                    " 0x%08X", va);
+                }
+            }
+        }
+        fprintf(stderr, "%s  (%d total)\n", line, refs);
+    }
+    fflush(stderr);
+}
+
 /* Periodic pusher report. Separate from the ADX tick so it survives that
  * probe being removed. */
 static void jsrf_pusher_report(void)
@@ -210,6 +268,7 @@ static void jsrf_pusher_report(void)
     if (now - last < 5000) return;
     last = now;
 
+    jsrf_find_renderer();
     nv2a_pusher_get_stats(&st);
     {
         PgraphD3D11Stats ps;
