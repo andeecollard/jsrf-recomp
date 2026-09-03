@@ -316,6 +316,70 @@ static const uint32_t MCPX_COUNTERS[] = {
  * ponytail: this says a codec is present, nothing more. Audio still goes
  * through src/apu and src/audio; no AC97 register beyond this one is modelled.
  */
+/* MCPX registers whose behaviour plain RAM cannot provide.
+ *
+ * The aperture is backed as ordinary memory so a read returns zero instead of
+ * faulting, which is right for everything nothing depends on. Two OHCI
+ * registers are not in that category, and both were measured with
+ * RECOMP_OHCI_DUMP rather than assumed:
+ *
+ *   HcCommandStatus (0xFED00008) bit 0, HostControllerReset, is SELF-CLEARING.
+ *   Hardware drops it when the reset completes. XPP sets it during init,
+ *   stalls, and on RAM it is still set afterwards -- a reset that never
+ *   finishes.
+ *
+ *   HcRhDescriptorA (0xFED00048) low byte, NDP, is the number of downstream
+ *   ports and is READ-ONLY. XPP writes the register to set NPS and NOCP, and
+ *   against RAM that write also lands on NDP, leaving it zero. A root hub with
+ *   no ports can never have anything attached, so no controller is ever found
+ *   however the rest of the stack behaves.
+ *
+ * Two ports is the conventional split for one Xbox OHCI; it is a choice, not a
+ * measurement, and RECOMP_OHCI_PORTS overrides it.
+ *
+ * This makes the root hub report itself honestly. It does NOT attach a device:
+ * HcRhPortStatus stays zero, which is a correct "nothing plugged in". Giving
+ * the title a pad needs real transfer emulation and is not this.
+ */
+static const struct { uint32_t offset; uint32_t clear_mask; } MCPX_ACK[] = {
+    { 0x500008, 0x00000001u },   /* OHCI HcCommandStatus, HCR self-clears */
+};
+
+static unsigned xbox_OhciPorts(void)
+{
+    static unsigned n;
+    if (!n) {
+        const char *e = getenv("RECOMP_OHCI_PORTS");
+        long v = e ? strtol(e, NULL, 0) : 2;
+        if (v < 0) v = 0;
+        if (v > 15) v = 15;
+        n = (unsigned)v | 0x100u;   /* 0x100 marks "resolved", not a port bit */
+    }
+    return n & 0xFFu;
+}
+
+/* Enforce the two above on the MCPX aperture. Cheap enough to run beside the
+ * NV2A table on every tick, which is where the existing note said this
+ * belonged. */
+static void xbox_McpxHoldRegisters(void)
+{
+    if (!g_mcpx_regs)
+        return;
+    for (size_t i = 0; i < sizeof(MCPX_ACK) / sizeof(MCPX_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_ACK[i].offset);
+        if (*r & MCPX_ACK[i].clear_mask)
+            *r &= ~MCPX_ACK[i].clear_mask;
+    }
+    {
+        volatile uint32_t *rh =
+            (volatile uint32_t *)((char *)g_mcpx_regs + 0x500048);
+        unsigned ndp = xbox_OhciPorts();
+        if ((*rh & 0xFFu) != ndp)
+            *rh = (*rh & ~0xFFu) | ndp;
+    }
+}
+
 static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
     /* AC97 GLOB_STA, 0xFEC00130. Bit 8 is primary codec ready. */
     { 0x400130, 0x00000100u },
@@ -1033,6 +1097,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *get = *put;
             }
         }
+        xbox_McpxHoldRegisters();
         fence_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();

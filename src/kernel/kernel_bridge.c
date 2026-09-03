@@ -2657,6 +2657,42 @@ static void bridge_RtlInitAnsiString(void)
  */
 #define DIALOG_VTABLE 0x001CC660u
 
+/* The OHCI root hub, as the title left it.
+ *
+ * XPP programs the USB host controller at 0xFED00000 directly: HcRhDescriptorA
+ * at +0x48, HcRhStatus at +0x50, a HostControllerReset through HcCommandStatus
+ * at +0x08, then HcControl at +0x04. The MCPX aperture behind those addresses
+ * is plain RAM with no register semantics, so every write sticks and every
+ * unwritten register reads zero.
+ *
+ * That matters most for HcRhDescriptorA: its low byte, NDP, is the number of
+ * downstream ports and is READ-ONLY on real hardware. On RAM the title's own
+ * write defines it. RECOMP_OHCI_DUMP=1 prints the block so the value it ends
+ * up with is a measurement rather than an inference.
+ */
+static void bridge_dump_ohci(void)
+{
+    static int done;
+    const uint32_t base = 0xFED00000u;
+    uint32_t i;
+
+    if (done || !getenv("RECOMP_OHCI_DUMP"))
+        return;
+    done = 1;
+
+    fprintf(stderr, "  [OHCI] root hub at 0x%08X\n", base);
+    for (i = 0; i <= 0x5C; i += 4)
+        fprintf(stderr, "  [OHCI]   +0x%02X = 0x%08X%s\n", i,
+                BRIDGE_MEM32(base + i),
+                i == 0x48 ? "   HcRhDescriptorA (low byte = NDP, port count)"
+              : i == 0x50 ? "   HcRhStatus"
+              : i == 0x54 ? "   HcRhPortStatus[0]"
+              : i == 0x58 ? "   HcRhPortStatus[1]"
+              : i == 0x04 ? "   HcControl"
+              : i == 0x08 ? "   HcCommandStatus" : "");
+    fflush(stderr);
+}
+
 static void bridge_scan_dialogs(void)
 {
     static int done;
@@ -4841,6 +4877,7 @@ static void kernel_thunk_dispatch(void)
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             bridge_scan_dialogs();
+            bridge_dump_ohci();
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             xbox_bridge_dump_ordinal_histogram();
