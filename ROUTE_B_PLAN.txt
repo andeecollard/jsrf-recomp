@@ -520,3 +520,70 @@ NEXT STEP, and static analysis is exhausted so it has to be runtime:
     dispatched. That answers directly whether slot 23 is ever called, and if it
     is, what calls it. Scanning for a live instance of vtable 0x001E1640 the
     same way as above is the cheaper half and worth doing first.
+
+
+================================================================================
+12. NEXT STEPS, ORDERED
+================================================================================
+Two tracks. They are independent, and the second is the one that produces a
+picture, so do not let the first block it.
+
+
+TRACK A -- FINISH THE DISPATCH QUESTION  (cheap first, then runtime)
+
+  A1. SCAN FOR A LIVE INSTANCE OF VTABLE 0x001E1640, exactly as was done for
+      the renderer: read guest RAM looking for the vtable address in an
+      object's first word, then look for pointers to whatever is found.
+      Reuses jsrf_find_renderer with one constant changed, so it is minutes.
+      IF THERE IS NO INSTANCE, that is the answer and it is upstream of
+      everything else: the object that owns the render dispatcher was never
+      constructed, and the question becomes why. If there is one, its owning
+      global names the next link.
+
+  A2. TURN ON RECOMP_ICALL_FEEDBACK. RECOMP_ICALL_OBSERVE is already compiled
+      into the macros behind that define and is a no-op without it. With it on,
+      every indirect target actually dispatched is recorded, which answers
+      directly whether slot 23 of 0x001E1640 is ever called and from where.
+      Static analysis is exhausted; this is the only instrument that sees
+      vtable dispatch.
+
+  A3. EXPECT THE ANSWER TO BE "THE GAME IS IN A STATE THAT DOES NOT RENDER",
+      and be ready for it. A 26-slot class whose slot 23 renders looks like a
+      scene or task object in a state machine. If the current state simply is
+      not the in-game one, the chain is working as designed and the real
+      question moves again -- to what the state machine is waiting for. Say so
+      plainly at that point rather than continuing to walk vtables; it would be
+      a different investigation with a different cost.
+
+
+TRACK B -- MAKE THE PIXELS THAT ARE ALREADY BEING ASKED FOR
+
+  B1. CONFIRM THE WINDOW ACTUALLY SHOWS THE CLEAR COLOUR. This has never been
+      checked visually. The guest issues 9 clears and 4 flips during init, the
+      pusher dispatches them, CLEAR_SURFACE reaches the backend and Present
+      swaps -- but nobody has looked at the window. P1's exit criterion was
+      "the window shows the clear colour" and it is still formally unmet.
+      If it is black, there is a bug in the clear path that is independent of
+      the whole dispatch question, and it is cheap to find.
+
+  B2. ADOPT nv2a_pb_exec FROM THE WORK BRANCH (f193457, "rasterise screen-space
+      geometry into the guest framebuffer"). Upstream has already built a
+      rasteriser for the ring route. It is worth having whether or not Track A
+      lands, because when the game does render there has to be something to
+      draw with, and building a second one here would be waste.
+
+
+STRATEGIC -- THE DIVERGENCE IS NOW COSTING REAL WORK
+
+  Three separate fixes have been discovered independently on both sides:
+  the icall failure-path rewind, deriving XDK section ranges from the XBE
+  rather than Burnout 3's constants, and bit-scan lifting. That is three times
+  the same work done twice, and the branch is 47 commits ahead with things we
+  want -- the rasteriser, seed_from_log, symbolize/stackwalk, the kernel memory
+  fixes, the APU doorbell.
+
+  Recommend merging origin/work/v0.7.0-non-local properly rather than
+  continuing to cherry-pick from it. It will conflict in lifter.py,
+  translator.py and the kernel, all places both sides have edited, so it is a
+  session's work on its own -- but the alternative is discovering a fourth and
+  fifth duplicate.
