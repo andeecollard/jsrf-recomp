@@ -1,0 +1,303 @@
+JSRF / xboxrecomp - CLAUDE TO CODEX HANDOVER
+3 September 2026 - startup, memory, return paths, and where the renderer
+actually stops
+
+WORKSPACE
+/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+Host macOS arm64. Branch main. This continues your
+CLAUDE_HANDOVER_2026-09-03_STARTUP.txt, which is still accurate about
+everything before this session.
+
+UNLIKE PREVIOUS HANDOVERS, THE TREE IS COMMITTED AND PUSHED. origin is
+andeecollard/upstream_xboxrecomp_clean. Three commits, in order:
+
+  9645601  Nothing was ever freed, and every return path that lied about it
+  e97c71c  Every batch was refused for one reason, and it was not the reason
+           we assumed
+  879fa2f  The vertex buffers were empty, and then the fragment stage ate the
+           rest
+
+9645601 also landed your uncommitted graphics/pushbuffer/startup work, because
+the build does not stand up without it. build-macos is still gitignored, so
+the hand-patched generated tree is NOT in the repo -- see section 6.
+
+Companion documents, all in the repo now:
+  JSRF_GOALS_2026-09-03_RENDERER.md         the current goal list
+  CLAUDE_HANDOVER_2026-09-03_HEAP.txt       memory and return paths, in detail
+  CLAUDE_HANDOVER_2026-09-03_RENDERER.txt   the renderer measurements, in detail
+This document is the summary of both plus what I would do next.
+
+==========================================================================
+1. WHERE THE TITLE GETS TO NOW
+==========================================================================
+
+A 300-second fresh-HDD run (render-investigation/claude-long-21):
+
+  no guest fault, no allocation failure, no 'epilogue never ran',
+  no unresolved stub executed, root pointer stable throughout
+  290 distinct asset paths
+  259 files / 117 MB written to the emulated HDD
+  Cache00-08.tbl, DmCache00-09.tbl, and nine
+  JSRF_CACHE_COMPLETE00..08.CMP markers
+  no JSRF_FATAL.ERR
+
+The first-boot cache BUILDS AND COMPLETES. Against your seh-04 baseline that
+was 38,840 allocation failures, ~30 asset paths and 27 files / 15 MB.
+
+Still no picture: 93 dumped frames, all byte-identical black, SHA-256
+9dc5cdcf2b4abd98a266b99496fa0062bec2c56e30b979a7cb5d033275eed1b3 -- the same
+value as your runs. No renderer behaviour was added this session beyond one
+vertex format; everything else was measurement.
+
+==========================================================================
+2. THE STAGE-LOAD ALLOCATION FAILURE - IT WAS NOT FRAGMENTATION
+==========================================================================
+
+Your goal A. The number in the message was a bump high-water mark, so I added
+accounting that says what is live. At the first failure:
+
+  live 997 blocks / 47,307,848 bytes; free 0 blocks / 0 bytes
+
+Nothing had ever been returned to the guest heap. Three separate causes, all
+in how kernel frees were routed:
+
+  ExFreePool (ordinal 17) had NO BRIDGE. The dispatch entry was commented out
+  on purpose -- the note in kernel_bridge.c says each of that group needs its
+  memory model checked, and it was right to stop: the existing wrapper called
+  the host HeapFree on a translated guest pointer. But bridge_ExAllocatePool
+  takes its block from xbox_HeapAlloc and returns a guest VA, so the free
+  belongs to the same allocator. Bridged now.
+
+  NtFreeVirtualMemory (199) went to the host VirtualFree on a guest address.
+  MEM_RELEASE was silently dropped -- the POSIX shim returns TRUE for size 0
+  -- and MEM_DECOMMIT would have mprotect(PROT_NONE)'d live guest RAM. 12,072
+  calls per 60s run. Now MEM_RELEASE goes to xbox_HeapFree and MEM_DECOMMIT
+  is a no-op, mirroring the MEM_COMMIT no-op on the allocate side.
+
+  MmFreeContiguousMemory (171) did reach xbox_HeapFree, but the title frees
+  through the physical mirror (0x80000000 + address) and the table matched on
+  the raw value. Every free in your logs is 0x81Exxxxx and matched nothing.
+  xbox_HeapFree and xbox_HeapBlockSize canonicalise the alias now.
+
+Repairing those exposed a second failure: 13.9 MB free, a 2.8 MB largest free
+block, and a 349,520-byte page-aligned request failing anyway. Reuse split a
+block at the end of the request, so remainders started at arbitrary addresses,
+and every caller that reaches this heap wants page alignment. Splits are now
+page-aligned. Two more defects went with it: reuse handed over whole blocks
+without splitting at all, and coalescing tested the adjacent table index, so a
+size-0 hole from an earlier merge made two adjacent free blocks permanently
+un-mergeable.
+
+Your note that a stale comment claims no reuse: the comment is gone, and
+jsrf_heap_alloc is a new ctest that drives the real allocator against a live
+memory layout and checks each of these behaviours.
+
+==========================================================================
+3. THE SECOND BLOCKER - YOUR SHARED-EPILOGUE BUG, ONE CLASS WIDER
+==========================================================================
+
+With memory available the title reached Stg10_05 and took SIGSEGV. I suspected
+my own frees; RECOMP_HEAP_POISON=0xAB fills every freed block and the fault
+was identical with the bad pointer 0x8508C483, not the poison. New code.
+
+It was your bug again. sub_0002D240 dispatches through the table at 0x0002D438
+and its default case 0x0002D3B3 was still a stub whose whole body is
+`g_esp += 4`. 220 such stubs remained after recover_shared_epilogues.py, which
+by design only repairs pure return sequences.
+
+diagnostics/jsrf_first_fault/recover_midfunction_entries.py repairs 208 of
+them, on the same principle you used for the mission entries but general:
+
+  - an address on an instruction boundary inside an already detected function
+    is real code, translated from there through the end of its owner
+  - an address in the gap between two detected functions is a whole function
+    discovery missed, translated through the next detected start; anything
+    past its return is unreachable and costs only compiled bytes
+  - a body that jumps backwards to another undetected entry pulls that entry
+    in too, with a declaration added to recomp_funcs.h
+
+149 in the first pass, 59 more once gap and backward-jump support existed,
+plus 13 entries they reference. The 12 that remain are printed with their
+reason when the script runs (5 not on an instruction boundary, 4 incomplete
+translation, 3 past the last detected function) and none of them executed.
+
+And a stub that runs now SAYS SO, once, both in tools/recomp/translator.py for
+fresh generation and via announce_unresolved_stubs.py for an existing
+checkout. That silence is how 0x000250C9 and 0x001185B0 survived a whole
+recovery pass. --remove reverses it.
+
+==========================================================================
+4. WHY THE SCREEN IS BLACK - MEASURED, NOT ARGUED
+==========================================================================
+
+Your goal B asked for the first distinct rejection with its reason before
+implementing more graphics. Here it is, and then the next one behind it.
+
+prepare_vertices had five ways to refuse a batch and one counter, which is why
+"38,472 rejected" stayed unexplained. Split apart, the answer was unanimous:
+
+  [VSH]  70228  vertex attribute could not be fetched (first detail 3)
+  [VSH] attribute 3 unfetchable: type=0 size=4 stride=32 offset=0x01BA2010
+
+Type 0 is UB_D3D, a packed D3DCOLOR stored B,G,R,A, and fetch_attr decoded
+only F and UB_OGL. It cannot share the UB_OGL case, which is presumably why it
+was left out. Seven lines; rejections went 70,228 to zero.
+
+That did not change a pixel, and the useful part is what it exposed:
+
+  [VSH]     executed batches=1370379 rejected=0
+  [TEXTURE] prepared=456799 rejected=913580
+  [TEXTURE] rejected draw 11: combiner / texture program
+
+TWO OF EVERY THREE DRAWS ARE NOW REFUSED BY THE FRAGMENT STAGE, all with the
+same reason. nv2a_texture_copy implements one measured RGB565 blit
+configuration and rejects every other combiner program by design -- correct
+while it was the only verified path, and now the thing in the way. The third
+that pass are that blit, whose source surface is all zeros.
+
+Four hypotheses died to measurements on the way, and they are worth knowing so
+you do not re-run them:
+
+  The executor is NOT missing a program switch. RECOMP_VSH_TRACE reports
+  distinct START and LOAD slots as 0x00000001 and 0x00000001, LOAD >= 32: 0,
+  with unique-hashes=1 over 19,442 decodes. One twelve-instruction program,
+  always slot 0. There is no switch to miss.
+
+  The pusher is NOT swallowing uploads. dispatch() calls nv2a_pb_exec_method
+  for every method under RECOMP_PB_EXEC. The "[PUSHER] unhandled" histogram
+  belongs to pgraph_d3d11_method, a different sink; its label now says so.
+
+  Vertex arrays are NOT DMA-relative in a way we get wrong. Resolving
+  SET_CONTEXT_DMA_VERTEX_A/B through your nv2a_dma_resolve gives base=0,
+  limit=0x07FFAFFF for both. fetch_attr's raw offset is correct. I record this
+  because the texture path does need the resolve and assuming the vertex path
+  does too is reasonable and wrong.
+
+  A loading-phase draw reads an all-zero vertex array from a block marked
+  "from a reused block", which is exactly what recycling live memory looks
+  like. It is not. RECOMP_HEAP_POISON=0xAB left the bytes 00, not AB;
+  RECOMP_HEAP_NO_FREE=1 restores the pre-repair heap and the buffer moves to a
+  never-recycled block from the same guest call site and is still all zero.
+  The title allocates 128 bytes -- four vertices at stride 32, a quad -- and
+  never fills it, because it is on its loading screen. After the cache
+  completes it switches to inline submission with real values:
+  in0=[-0.53125 -0.53125 0 1] in3=[1 1 1 1] inline=12.
+
+==========================================================================
+5. DIAGNOSTICS I ADDED - PLEASE USE THESE BEFORE REASONING
+==========================================================================
+
+xbox_HeapReport(why)            arena, bump high-water, live/free counts and
+                                totals, largest free block, retained-beyond-
+                                request, top owners by live bytes named by
+                                kernel ordinal and guest return address, and
+                                the 16 largest live blocks. Fires on the first
+                                allocation failure. This is what turned "the
+                                heap is full" into "nothing is ever freed".
+xbox_HeapDescribe(va, buf, n)   who owns an address: extent, requested size,
+                                owning ordinal and guest ra, live/free, and
+                                whether it came from a reused block.
+RECOMP_HEAP_TRACE=<n>           narrate the first n frees and reuses (dflt 64)
+RECOMP_HEAP_POISON=<byte>       fill freed blocks. Use before blaming the heap
+                                for a fault: if the bad pointer is not the
+                                poison, it did not come from freed memory.
+RECOMP_HEAP_NO_FREE=1           disable reclamation entirely, restoring the
+                                pre-repair build. Exhausts the heap; that is
+                                the point. The only honest A/B for a suspected
+                                use-after-free.
+RECOMP_VSH_SAMPLE=<batch>       late-batch sample, default 20000. Batch 1 is
+                                always the measured blit and tells you
+                                nothing. Prints attribute declarations, the
+                                constants, the values handed to the program,
+                                raw bytes behind the position array, resolved
+                                vertex DMA contexts, and the owning heap block.
+RECOMP_VSH_TRACE=1              uploads by subchannel, changed/dropped,
+                                loads/starts/modes, constants, decodes,
+                                unique program hashes, and distinct START and
+                                LOAD slot bitmaps.
+[VSH] reject histogram          prints with the periodic [VSH] line; the first
+                                failure of each kind names the record.
+[STUB] reports                  every unresolved stub announces itself once.
+
+==========================================================================
+6. BUILD, RUN, AND THE GENERATED TREE
+==========================================================================
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build        6/6
+  /usr/bin/python3 -m unittest tools.recomp.test_shared_epilogue   3/3
+  /usr/bin/python3 tools/recomp/test_call_retaddr.py         14 checks
+  PYTHONPATH=$PWD /usr/bin/python3 tools/recomp/test_manual_call_dispatch.py
+
+Run, new NAME each time; the executable creates the empty HDD:
+
+  RECOMP_STARTUP_TRACE=1 RECOMP_PB_EXEC=1 \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME-hdd" \
+  RECOMP_FB_DUMP="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME/frame" \
+  RECOMP_FB_DUMP_DRAW=1 \
+  /usr/bin/python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 300
+
+The cache is 117 MB per run now. Delete old *-hdd directories, and never
+reuse a completed run's HDD for a claimed fresh-HDD comparison. Five minutes
+is the useful length: the cache completes a little after sixty seconds.
+
+THE GENERATED TREE IS STILL IGNORED AND HAND-PATCHED. Your rdtsc timing fixes
+and probes are in it and are not in git. Applying the repairs to a restored
+pre-repair checkout, in order:
+
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_shared_epilogues.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_startup_entries.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_midfunction_entries.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/announce_unresolved_stubs.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/instrument_startup.py
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+
+recover_midfunction_entries.py takes --dry-run and prints why each remaining
+stub was not recovered. Checkpoint of the generated tree and manifests:
+  build-macos/jsrf-first-fault/checkpoints/claude-startup-heap-2026-09-03.tar.gz
+
+A full regeneration was NOT run. tools/recomp/translator.py now performs the
+stub announcement itself, and the recompiler's own shared-epilogue recovery is
+unchanged; whether a fresh full generation reproduces this state end to end is
+untested.
+
+==========================================================================
+7. WHAT I WOULD DO NEXT
+==========================================================================
+
+The goal list is JSRF_GOALS_2026-09-03_RENDERER.md. G1 (program uploads) and
+G4 (does the cache finish) are closed by section 4 and section 1.
+
+G6, and it is the whole game right now: GROUP THE COMBINER CONFIGURATIONS
+BEHIND THE 913,580 REJECTIONS. Capture the NV097_SET_COMBINER_* register set
+for the first rejections and count distinct configurations, the way the vertex
+rejections were grouped. Implement the one that accounts for most of them.
+Do not write a general combiner: the vertex-format fix took seven lines
+because the measurement said which seven.
+
+G7, and combiner work alone will not reach it: something has to write non-zero
+pixels. The draws that already pass copy a source surface that is all zeros,
+and the rasterised position range is still degenerate (x -0.5..-0.5 over
+6,851,877 indices). Worth understanding whether that range statistic is
+measuring what its name suggests before drawing conclusions from it.
+
+G3: 269 distinct methods still reach the executor unhandled. The frequent ones
+are SET_CLIP_MIN/MAX, the window clip, SET_TEXTURE_CONTROL0 and the zeta
+surface offset. Implement them when their absence is shown to matter, not
+before.
+
+G5, input: unchanged and untouched by me. Your OHCI root hub has ports and
+completes reset; nothing enumerates. That needs descriptors and control
+transfers through the HCCA. Also still unbridged and silent, from the ordinal
+histogram: HalReadWritePCISpace (46, 2 calls), KeSetDisableBoostThread (144,
+5), AvGetSavedDataAddress (1, 1) and KeSynchronizeExecution (153, 7,360). The
+last one is the interesting one -- it is meant to run a caller-supplied
+routine with an interrupt's lock held, and it is called constantly.
+
+Not done and not attempted: the upstream framebuffer image guard from
+0655e8e5, any Windows/D3D11 build, the full upstream test suite, sound.
+
+ONE THING TO BE CAREFUL OF: do not read "rejected=0" at the vertex stage as
+"the vertex path is correct". It means every batch is now accepted. Section 4
+is what those batches contain.
