@@ -2692,11 +2692,37 @@ static void bridge_file_backtrace(const char *path)
         if (v < 0x00200000u || v >= 0x04000000u || (v & 3))
             continue;
         flags = BRIDGE_MEM32(v + 0x98);
-        if (flags & 0x400000u)
+        if (flags & 0x400000u) {
+            int w;
             fprintf(stderr,
                     "      candidate this=0x%08X [+0x98]=0x%08X "
-                    "[+0x24]=0x%08X\n",
-                    v, flags, BRIDGE_MEM32(v + 0x24));
+                    "[+0x24]=0x%08X vtbl=0x%08X\n",
+                    v, flags, BRIDGE_MEM32(v + 0x24), BRIDGE_MEM32(v));
+            /* The header names the class: slot 0 is the vtable, and the few
+             * words after it are what distinguishes one instance from the
+             * next. Printed rather than guessed at, because the heap address
+             * itself moves between runs. */
+            for (w = 0; w < 8; w++)
+                fprintf(stderr, "        +0x%02X = 0x%08X\n",
+                        w * 4, BRIDGE_MEM32(v + (uint32_t)w * 4));
+            /* The constructor copies a string into +0xA0, so the object can
+             * say in its own words what it is. */
+            {
+                uint32_t sp2 = BRIDGE_MEM32(v + 0xA0);
+                if (sp2 >= 0x00010000u && sp2 < 0x04000000u) {
+                    char msg[160];
+                    int  k;
+                    for (k = 0; k < (int)sizeof(msg) - 1; k++) {
+                        char c = (char)(BRIDGE_MEM32((sp2 + (uint32_t)k) & ~3u)
+                                        >> (8 * ((sp2 + (uint32_t)k) & 3)));
+                        if (!c) break;
+                        msg[k] = (c >= 32 && c < 127) ? c : '.';
+                    }
+                    msg[k] = 0;
+                    fprintf(stderr, "        +0xA0 -> \"%s\"\n", msg);
+                }
+            }
+        }
     }
     fflush(stderr);
 }
