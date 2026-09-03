@@ -46,6 +46,7 @@ class StringCompareLifterTest(unittest.TestCase):
 
     def test_dword_compare_compares_dwords_and_feeds_equal_jump(self):
         """The dword width used to lift to a comment while cmpsb worked."""
+    def test_dword_compare_sets_the_flags_its_jcc_reads(self):
         compare = Instruction(
             0, 2, "repe cmpsd", "dword ptr [esi], dword ptr es:[edi]",
             "f3a7")
@@ -65,6 +66,9 @@ class StringCompareLifterTest(unittest.TestCase):
 
         self.assertNotIn("TODO", generated)
         self.assertNotIn("- string compare, ecx iterations", generated)
+        # Was a bare comment, so the jcc after it read whatever the previous
+        # instruction had left in the flags. It compares four bytes at a time
+        # and steps esi/edi by four, and the following je reads _flags.
         self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", generated)
         self.assertIn("esi += _st; edi += _st; ecx--;", generated)
         # The step is four bytes, in whichever direction EFLAGS.DF says.
@@ -108,7 +112,13 @@ class StringCompareLifterTest(unittest.TestCase):
     def test_dword_scan_is_implemented(self):
         scan = Instruction(0, 2, "repne scasd", "eax, dword ptr es:[edi]",
                            "f2af")
-        generated = "\n".join(Lifter().lift_instruction(scan))
+        jump = Instruction(2, 2, "je", "0x10", "740c")
+        jump.jump_target = 0x10
+        lifter = Lifter()
+        lifter.func_start, lifter.func_end = 0, 0x20
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[scan, jump]))
+        generated = "\n".join(lifted)
 
         self.assertNotIn("string scan, ecx iterations", generated)
         self.assertIn("_flags = (eax == MEM32(edi));", generated)
@@ -119,6 +129,12 @@ class StringCompareLifterTest(unittest.TestCase):
         self.assertIn("int32_t _st = RECOMP_DF_STEP(4);", generated)
         self.assertIn("edi += _st; ecx--;", generated)
         self.assertIn("if (_flags) break;", generated)
+        # The je reads the flag the loop set, in whichever equivalent form
+        # the emitter picks -- what matters is that it reads _flags and not
+        # a stale _fa/_fb snapshot left by some earlier compare.
+        jcc = generated.splitlines()[-1]
+        self.assertIn("_flags", jcc)
+        self.assertNotIn("_fa", jcc)
 
 
 if __name__ == "__main__":

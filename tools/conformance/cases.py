@@ -161,9 +161,47 @@ CASES = [
     Case("inc_dec", "inc/dec leave CF alone -- a classic place to get flags wrong",
          ["stc", "inc eax", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
     Case("bswap", "byte swap", ["bswap eax"], _PAIRS),
-    Case("bsf", "least-significant set bit, with a nonzero source",
+
+
+    # The dword string compares were emitted as a bare comment until the
+    # Wreckless bring-up: nothing compared, esi/edi never advanced, and the
+    # jcc reading the flags went wherever the previous instruction left them.
+    # Buffers come off the stack so the case needs no external symbol.
+    Case("repe_cmpsd_equal", "repe cmpsd over identical dwords sets ZF",
+         ["push 0x11111111", "push 0x11111111",
+          "mov esi, esp", "mov edi, esp", "mov ecx, 2", "repe cmpsd",
+          "setz al", "movzx eax, al", "add esp, 8"], _PAIRS),
+    Case("repe_cmpsd_differ", "and clears it when they differ",
+         ["push 0x22222222", "push 0x11111111",
+          "mov esi, esp", "lea edi, [esp+4]", "mov ecx, 1", "repe cmpsd",
+          "setz al", "movzx eax, al", "add esp, 8"], _PAIRS),
+    Case("repne_scasd", "repne scasd stops on a match and leaves edi past it",
+         ["push 0x44444444", "push 0x33333333",
+          "mov edi, esp", "mov eax, 0x44444444", "mov ecx, 2", "repne scasd",
+          "sub edi, esp", "mov eax, edi", "add esp, 8"], _PAIRS),
+
+    # bsf/bsr were emitted as TODO comments until the Wreckless bring-up.
+    # RtlAllocateHeap picks a free-list bucket by bsf-ing an in-use bitmap, so
+    # a bsf that does nothing returns its own argument and the allocator hands
+    # out the address of an empty list head. Both the value and the zero case
+    # (destination untouched, ZF set) are checked.
+    Case("bsf", "bit scan forward: index of the lowest set bit",
+         ["bsf eax, ecx"], _PAIRS),
+    Case("bsr", "bit scan reverse: index of the highest set bit",
+         ["bsr eax, ecx"], _PAIRS),
+    Case("bsf_zero_leaves_dest", "bsf with a zero source must not write dest",
+         ["xor ecx, ecx", "bsf eax, ecx"], _PAIRS),
+    Case("bsf_zf", "ZF after bsf is set exactly when the source was zero",
+         ["bsf eax, ecx", "setz al", "movzx eax, al"], _PAIRS),
+    Case("bsr_zf", "and the same for bsr",
+         ["bsr eax, ecx", "setz al", "movzx eax, al"], _PAIRS),
+
+    # Nonzero-forced variants and a scan into a different destination,
+    # contributed in #16. The cases above leave the source to the input
+    # pairs, so these pin the common path explicitly.
+    Case("bsf_nonzero", "least-significant set bit, with a nonzero source",
          ["or ecx, 1", "bsf eax, ecx"], _PAIRS),
-    Case("bsr", "most-significant set bit, with a nonzero source",
+    Case("bsr_nonzero", "most-significant set bit, with a nonzero source",
          ["or ecx, 1", "bsr eax, ecx"], _PAIRS),
     Case("bit_scan_zf", "bit scan sets ZF when its source is zero",
          ["bsf edx, ecx", "setz al", "movzx eax, al"], _PAIRS),
@@ -190,6 +228,69 @@ CASES = [
     Case("lock_xadd_nzf", "the inverse ZF path used by JNE",
          ["push ecx", "lock xadd dword ptr [esp], eax", "setne al",
           "movzx eax, al", "add esp, 4"], _PAIRS),
+
+    # ══ MMX ══════════════════════════════
+    #
+    # Every one of these was a TODO comment, which is a silent no-op: the
+    # destination kept its previous value. Wreckless's WMV decoder is 1796
+    # MMX instructions of IDCT and motion compensation and D3DX's texture
+    # converters another 900, so both wrote whatever was already there.
+    #
+    # The harness uses a 32-bit MSVC, so the host executes real MMX and is
+    # a true reference. Each case builds mm0/mm1 from the vector pair and
+    # reports one dword of the result.
+    Case("mmx_paddw", "packed word add wraps per lane",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'paddw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_paddd", "packed dword add",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'paddd mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_psubw", "packed word subtract",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'psubw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_paddsw", "saturating signed word add",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'paddsw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pmullw", "packed word multiply, low half",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pmullw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pmulhw", "packed word multiply, high half",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pmulhw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pmaddwd", "multiply words and add adjacent pairs",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pmaddwd mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_psraw", "arithmetic word shift right saturates its count",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'psraw mm0, 3', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_psrlw", "logical word shift right",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'psrlw mm0, 5', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pslld", "dword shift left",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pslld mm0, 7', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_psrlq", "whole-register shift right",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'psrlq mm0, 11', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_psraw_big", "a count past the lane width is a full sign fill",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'psraw mm0, 40', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_psrlw_big", "and zero for the logical form",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'psrlw mm0, 40', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_punpcklbw", "interleave low bytes",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'punpcklbw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_punpckhbw", "interleave high bytes",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'punpckhbw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_punpcklwd", "interleave low words",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'punpcklwd mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_punpckhdq", "interleave high dwords",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'punpckhdq mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_packuswb", "pack words to unsigned bytes with saturation",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'packuswb mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_packssdw", "pack dwords to signed words with saturation",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'packssdw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pcmpgtw", "packed signed word compare",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pcmpgtw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pand", "bitwise and",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pand mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pandn", "and-not is ~dst & src, not dst & ~src",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pandn mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pxor", "bitwise xor",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pxor mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pavgb", "unsigned byte average rounds up",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pavgb mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pshufw", "word shuffle by immediate",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pshufw mm0, mm1, 0x1B', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_paddw_hi", "the high lane too, not just lane 0",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'paddw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+4]', 'add esp, 8', 'emms'], _PAIRS),
 
     # ══ x87 ═════════════════════════════════════════════════════════════════
     #

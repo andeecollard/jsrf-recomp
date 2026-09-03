@@ -113,6 +113,79 @@ def test_icall_save_stops_at_a_completed_direct_call():
     assert save_idx < arg_idx, "\n".join(out)
 
 
+def test_icall_save_stops_at_a_callee_saved_register_save():
+    # sub_005A1700's shape: the function saves ebx and esi mid-body, then makes
+    # an indirect call taking its arguments in ecx/edx only. Two epilogues, so
+    # each register is popped twice against a single push -- the counts must
+    # compare as pops >= pushes, not equality.
+    # an indirect call that takes its arguments in ecx/edx only. Absorbing
+    # those saves into the "argument run" made the failure path rewind g_esp
+    # past them, and the epilogue popped edi off the return address.
+    lines = [
+        "    PUSH32(esp, ebx);",
+        "    ebx = MEM32(esp + 0x14);",
+        "    PUSH32(esp, esi);",
+        "    edx = esp + 0x14;",
+        "    ecx = ebx;",
+        "    PUSH32(esp, 0x005A173Fu); RECOMP_ICALL_SAFE(eax, _icall_esp); /* indirect call */",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ebx);",
+        "    POP32(esp, edi);",
+        "loc_005A178C: ;",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ebx);",
+        "    POP32(esp, edi);",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    icall_idx = next(i for i, l in enumerate(out) if "RECOMP_ICALL_SAFE" in l)
+    push_esi = next(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, esi);")
+    assert save_idx > push_esi, (
+        "the save must not rewind over the function's own register saves:\n"
+        + "\n".join(out))
+    assert save_idx == icall_idx - 1, "\n".join(out)
+
+
+def test_icall_save_still_covers_a_pushed_esi_argument():
+    # Same register, but the function never pops it -- so it is an argument
+    # and the run must still absorb it.
+    lines = [
+        "    PUSH32(esp, esi);",
+        "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    arg = next(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, esi);")
+    assert save_idx < arg, "\n".join(out)
+
+
+def test_icall_save_absorbs_a_saved_register_pushed_again_as_an_argument():
+    # sub_00135265's shape: edi is saved in the prologue AND pushed again as
+    # an argument to the virtual call, but popped only once. The extra push is
+    # an argument, so the run must absorb it -- leaving it behind shifts the
+    # epilogue and comes back with esi and edi swapped.
+    lines = [
+        "    PUSH32(esp, ecx);",
+        "    PUSH32(esp, esi);",
+        "    PUSH32(esp, edi);",
+        "    eax = MEM32(esi);",
+        "    PUSH32(esp, edi);",
+        "    ecx = esi;",
+        "    PUSH32(esp, 0x00135299u); RECOMP_ICALL_SAFE(MEM32(eax + 0x68), _icall_esp); /* indirect call */",
+        "    POP32(esp, edi);",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ecx);",
+    ]
+    out = _fixup_icall_esp_save(lines)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    arg_push = max(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, edi);")
+    assert save_idx < arg_push, (
+        "the argument push must be inside the rewind window:\n" + "\n".join(out))
+    # ...but not the prologue saves, which the epilogue still needs
+    prologue = next(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, esi);")
+    assert save_idx > prologue, "\n".join(out)
+
+
 def test_icall_save_still_covers_a_plain_arg_run():
     lines = [
         "    PUSH32(esp, ecx);",

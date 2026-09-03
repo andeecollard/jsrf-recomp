@@ -114,6 +114,42 @@ def test_decode_at_stops_at_a_terminator():
     assert eng.instructions[BASE].is_ret
 
 
+def test_probe_accepts_a_function_body_and_rejects_fill():
+    """
+    probes_as_function_body is the corroboration _pass_call_targets requires
+    before manufacturing a function at a call target the sweep stepped over.
+    It replaced a 16-byte alignment test that dropped Wreckless's _mtinitlocks
+    (unaligned, packed straight after a jump table) and accepted all-zero fill.
+    """
+    #  push esi / push edi / xor eax,eax / inc eax / pop edi / pop esi / ret
+    body = bytes.fromhex("5657 33c0 40 5f5e c3".replace(" ", ""))
+    #  two nops of padding put the body at an unaligned start -- the
+    #  _mtinitlocks shape exactly
+    eng, _ = _engine(BASE, bytes.fromhex("9090") + body)
+    assert eng.probes_as_function_body(BASE + 2),         "a body reaching a ret is a function start whatever its alignment"
+
+    #  all-zero fill decodes forever as `add [eax], al` and never terminates
+    eng2, _ = _engine(BASE, bytes(4096))
+    assert not eng2.probes_as_function_body(BASE),         "zero fill must not read as a function"
+
+    #  a lone 0xff at the end of the section: undecodable, runs off the end
+    eng3, _ = _engine(BASE, bytes.fromhex("ff"))
+    assert not eng3.probes_as_function_body(BASE)
+
+
+def test_probe_does_not_mutate_the_sweep():
+    eng, _ = _engine(BASE, bytes.fromhex("9090565733c0c3"))
+    before = dict(eng.instructions)
+    eng.probes_as_function_body(BASE + 2)
+    assert eng.instructions == before,         "probing must not record instructions the sweep did not produce"
+
+
+def test_probe_follows_a_tail_jump():
+    #  push esi / jmp $+2 -- a tail call is a legitimate function ending
+    eng, _ = _engine(BASE, bytes.fromhex("56eb00c3"))
+    assert eng.probes_as_function_body(BASE)
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

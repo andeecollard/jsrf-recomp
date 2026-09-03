@@ -5,6 +5,7 @@ Provides linear sweep and recursive descent disassembly of x86-32 code,
 with instruction classification and operand analysis.
 """
 
+import bisect
 import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -36,6 +37,7 @@ class Instruction:
     call_target: Optional[int] = None     # For direct calls
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
+    jump_table: Optional[int] = None      # For `jmp [reg*4 + table]`
     imm_ref: Optional[int] = None         # For `push offset x` / `mov reg, offset x`
 
     @property
@@ -88,6 +90,12 @@ class DisasmEngine:
         # Sorted address list (built lazily for range queries)
         self._sorted_addrs: Optional[List[int]] = None
 
+        # Embedded jump tables: table VA -> end VA (exclusive).
+        # Populated by resync_jump_tables() from the indexed indirect jumps
+        # recorded during the sweep.
+        self.jump_tables: Dict[int, int] = {}
+        self._jt_candidates: Set[int] = set()
+
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
         mnemonic = cs_insn.mnemonic
@@ -126,6 +134,16 @@ class DisasmEngine:
                     insn.jump_target = op.imm & 0xFFFFFFFF
                 elif op.type == CS_OP_MEM and op.mem.base == 0 and op.mem.index == 0:
                     insn.memory_ref = op.mem.disp & 0xFFFFFFFF
+                elif op.type == CS_OP_MEM and op.mem.index != 0:
+                    # `jmp dword ptr [reg*4 + disp]` -- a switch dispatch. disp
+                    # is the address of a table of code pointers, and MSVC
+                    # parks that table inside the function body, right after
+                    # this instruction. See resync_jump_tables().
+                    disp = op.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address + self.image.image_size):
+                        insn.jump_table = disp
+                        self._jt_candidates.add(disp)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -208,6 +226,80 @@ class DisasmEngine:
 
         return count
 
+    def resync_jump_tables(self, min_entries: int = 3,
+                           max_entries: int = 512) -> int:
+        """
+        Treat MSVC's embedded switch tables as data and realign after them.
+
+        `jmp dword ptr [reg*4 + disp]` dispatches through a table of code
+        pointers, and MSVC emits that table inline -- inside the function, on
+        the fall-through path, immediately after the jump. linear_sweep has no
+        way to know, so it decodes the pointers as instructions and comes out
+        the far side out of phase. Every byte after it belongs to an
+        instruction that does not exist, up to wherever the stream happens to
+        resync.
+
+        That is not a cosmetic loss. It routinely eats the function's own
+        epilogue, so the `pop esi / pop edi` balancing the prologue is never
+        lifted and **every caller silently loses those registers**. Half-Life 2
+        hits it in the CRT: memcpy and memmove both carry a tail-copy table, so
+        the C++ static-initialiser loop -- which walks its constructor array
+        with esi as the cursor and edi as the limit -- had both clobbered by
+        its own callees and stopped after 8% of the list, leaving Source with
+        no registered interfaces to hand CreateInterface.
+
+        Fix it where it starts: measure each table, drop the instructions the
+        sweep hallucinated over it, and decode_at() past the end to pick the
+        real code back up. A table entry must point into an executable section
+        for the table to keep growing, which is what bounds it.
+
+        Returns the number of tables resynced.
+        """
+        resynced = 0
+        for tbl in sorted(self._jt_candidates):
+            # XBEs mark .rdata and .data executable, so "points at an
+            # executable section" alone would let an array of data pointers
+            # pass as a jump table -- and resyncing over real instructions is
+            # far worse than missing a table. A switch never jumps out of its
+            # own section, so require that.
+            home = self.image.get_section_at_va(tbl)
+            if home is None:
+                continue
+            lo = home.virtual_addr
+            hi = lo + home.virtual_size
+            entries = 0
+            while entries < max_entries:
+                target = self.image.read_u32_at_va(tbl + entries * 4)
+                if target is None or not (lo <= target < hi):
+                    break
+                entries += 1
+            if entries < min_entries:
+                # Too short to distinguish from code that merely looks like
+                # pointers. Leaving it alone costs nothing; a wrong skip here
+                # would delete real instructions.
+                continue
+
+            end = tbl + entries * 4
+            for insn in self.get_instructions_in_range(
+                    tbl - 16, end):
+                if insn.end_address > tbl and insn.address < end:
+                    del self.instructions[insn.address]
+            self._sorted_addrs = None
+
+            self.jump_tables[tbl] = end
+            self.decode_at(end)
+            resynced += 1
+
+        return resynced
+
+    def jump_table_entries(self, tbl: int) -> List[int]:
+        """Code pointers held by a resynced jump table, or [] if unknown."""
+        end = self.jump_tables.get(tbl)
+        if end is None:
+            return []
+        return [self.image.read_u32_at_va(a) or 0
+                for a in range(tbl, end, 4)]
+
     def decode_at(self, addr: int, max_insns: int = 4096) -> int:
         """
         Decode a stream starting exactly at `addr`, realigning the sweep.
@@ -267,6 +359,174 @@ class DisasmEngine:
         if added:
             self._sorted_addrs = None
         return added
+
+    def probes_as_returning_body(self, addr: int,
+                                 max_insns: int = 64) -> bool:
+        """
+        Stricter sibling of probes_as_function_body: does the stream at `addr`
+        reach a `ret` without first hitting an unconditional `jmp`?
+
+        Used where the evidence that something is a function is weak -- an
+        address that merely appears as an immediate -- so the bar has to be
+        higher than "decodes to some terminator". Requiring a ret rejects data
+        that happens to disassemble, and stopping at an unconditional jmp keeps
+        this out of tail-call territory, which _pass_tail_jump_targets already
+        covers with better evidence. Conditional branches are fine: a real
+        function has them.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return False
+
+        limit = addr + len(data)
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return True
+            if mnemonic in config.JMP_MNEMONICS:
+                # An unconditional jump forward, still inside the window being
+                # probed, is ordinary control flow -- MSVC emits it constantly
+                # to skip an else-branch. Only a jump that leaves the window,
+                # or goes backwards, is tail-call shaped and ends the probe.
+                #
+                # Rejecting every jmp cost Half-Life 2 its CreateInterface list
+                # walk (0x00427F80): a clean 90-byte function that happens to
+                # contain one `jmp` over four instructions.
+                try:
+                    ops = decoded.operands
+                except Exception:
+                    return False
+                if not ops or ops[0].type != CS_OP_IMM:
+                    return False
+                target = ops[0].imm & 0xFFFFFFFF
+                if not (decoded.address < target < limit):
+                    return False
+            if count >= max_insns:
+                return False
+        return False
+
+    def probes_as_prologue(self, addr: int) -> bool:
+        """
+        Read-only: do the bytes at `addr` start with a recognisable MSVC
+        function prologue?
+
+        Weaker evidence than probes_as_function_body, and deliberately so:
+        this is asked about an address the linear sweep has already claimed as
+        the middle of an instruction, where a full-body probe would have to
+        decide which of two overlapping decodings is real. A prologue is the
+        one shape that does not occur by accident in the middle of another
+        instruction, so it is enough to say the sweep drifted rather than that
+        the address is wrong.
+
+        Recognises what MSVC actually emits at -O2 for the Xbox XDK: the
+        frame-pointer form, the register saves that start a frameless
+        function, the stack adjustment, and the two-byte hot-patch nop.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+        offset = addr - section.virtual_addr
+        if offset < 0 or offset >= len(data):
+            return False
+
+        # MSVC's inline SEH prologue starts with push -1; push <handler>;
+        # mov eax, fs:[0], rather than a register save. JSRF's seeded XPP
+        # entry 0x0007BE30 has this shape after a misaligned data sweep.
+        # Require the full sequence, not just a push-immediate instruction.
+        prefix = data[offset:offset + 13]
+        if (prefix[:3] == b"\x6a\xff\x68"
+                and prefix[7:] == b"\x64\xa1\x00\x00\x00\x00"):
+            return True
+
+        insns = list(self._cs.disasm(data[offset:offset + 16], addr, count=2))
+        if not insns:
+            return False
+
+        first = insns[0]
+        m, ops = first.mnemonic, first.op_str
+
+        if m == "push" and ops == "ebp":
+            # push ebp; mov ebp, esp  -- or lea ebp, [esp-N] for a frame the
+            # callee shifts, which is what default.xbe's XPP code uses.
+            if len(insns) > 1:
+                nxt = insns[1]
+                if nxt.mnemonic == "mov" and nxt.op_str.replace(" ", "") == "ebp,esp":
+                    return True
+                if nxt.mnemonic == "lea" and nxt.op_str.startswith("ebp,"):
+                    return True
+            return False
+
+        if m == "push" and ops in ("esi", "edi", "ebx"):
+            return True
+        if m == "sub" and ops.startswith("esp,"):
+            return True
+        if m == "mov" and ops.replace(" ", "") == "edi,edi":
+            return True   # hot-patch pad
+
+        return False
+
+    def probes_as_function_body(self, addr: int,
+                                max_insns: int = 8192) -> bool:
+        """
+        Read-only: does the instruction stream starting at `addr` look like a
+        function body -- i.e. does it reach a ret or a tail jump without
+        running into bytes that will not decode?
+
+        Corroboration for a direct call target the linear sweep stepped over.
+        Alignment used to serve that role, but a real MSVC function start is
+        only aligned when the linker had a reason to pad it; the CRT's
+        _mtinitlocks sits at Wreckless 0x000F211A, immediately after a jump
+        table, at no alignment at all. Decoding is the stronger evidence and
+        the one that actually distinguishes code from a plausible-looking
+        address read out of data.
+
+        Follows instructions the sweep already decoded where they exist, and
+        decodes the rest here without recording them, so calling this never
+        changes what the sweep produced.
+
+        max_insns only bounds the walk's cost -- leaving the section already
+        terminates it. Keep it well clear of the largest real function: Blood
+        Wake 0x0005E670 runs 537 instructions before its first ret, and a cap
+        of 512 rejected it.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+
+        for _ in range(max_insns):
+            insn = self.instructions.get(addr)
+            if insn is not None:
+                if insn.is_ret or insn.is_jump:
+                    return True
+                addr = insn.end_address
+            else:
+                offset = addr - section.virtual_addr
+                if offset < 0 or offset >= len(data):
+                    return False
+                decoded = next(self._cs.disasm(data[offset:], addr, count=1),
+                               None)
+                if decoded is None:
+                    return False  # undecodable: not code
+                mnemonic = decoded.mnemonic.lower()
+                if (mnemonic in config.RET_MNEMONICS
+                        or mnemonic in config.JMP_MNEMONICS):
+                    return True
+                addr += decoded.size
+            if not (section.virtual_addr <= addr
+                    < section.virtual_addr + section.virtual_size):
+                return False  # ran off the section without terminating
+        return False
 
     def recursive_descent(self, start_addresses: List[int],
                           section_bounds: List[Tuple[int, int]]) -> Set[int]:
@@ -347,6 +607,32 @@ class DisasmEngine:
         """Build sorted address list if not cached."""
         if self._sorted_addrs is None:
             self._sorted_addrs = sorted(self.instructions.keys())
+
+    def instruction_covering(self, addr: int) -> Optional[Instruction]:
+        """The decoded instruction whose bytes contain `addr` but do not start
+        at it, or None.
+
+        A hit means the sweep already has a coherent decode across this
+        address, so anything claiming a function starts here is claiming an
+        instruction boundary in the middle of an instruction. That is worth
+        distrusting: realigning there splits whatever the address sits in.
+        """
+        self._ensure_sorted_addrs()
+        # Scan back over the longest an x86 instruction can be, rather than
+        # looking only at the nearest preceding start. Overlapping decodes are
+        # allowed here -- decode_at leaves the stream it realigned over in
+        # place -- so `addr` can be a recorded boundary *and* sit inside an
+        # instruction the sweep decoded. Checking one neighbour misses exactly
+        # that case, which is the one worth catching.
+        i = bisect.bisect_left(self._sorted_addrs, addr)
+        j = bisect.bisect_left(self._sorted_addrs, addr - 15)
+        for k in range(i - 1, j - 1, -1):
+            if k < 0:
+                break
+            insn = self.instructions[self._sorted_addrs[k]]
+            if insn.address < addr < insn.address + insn.size:
+                return insn
+        return None
 
     def get_instructions_in_range(self, start: int, end: int) -> List[Instruction]:
         """Get all instructions in address range [start, end), sorted."""

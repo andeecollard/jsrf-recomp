@@ -124,6 +124,32 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
+        /* Starting the APU has to start the frame thread.
+         *
+         * The thread idles on pause_requested, which init sets and only the
+         * test tone ever cleared -- so a title that enabled the APU through
+         * these registers got an APU that stayed asleep. Nothing then advanced
+         * the front end, and a title waiting on a notify completion (the
+         * FEMEMDATA magic write, which is how completion reaches guest memory)
+         * waited forever. Wreckless hangs exactly there during DirectSound
+         * init, and because it initialises its whole engine behind a
+         * successful DirectSound create, that hang is not confined to audio.
+         *
+         * Resume whenever the write is not switching the block off; the thread
+         * re-checks FECTL itself and idles again if it is halted or trapped. */
+        {
+            uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+            uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            bool running =
+                ((sectl & NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF)
+                && ((fectl & NV_PAPU_FECTL_FEMETHMODE)
+                    != NV_PAPU_FECTL_FEMETHMODE_HALTED);
+            if (running && d->pause_requested) {
+                d->pause_requested = false;
+                fprintf(stderr, "[APU] started by the title"
+                                " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
+            }
+        }
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FEMEMDATA:

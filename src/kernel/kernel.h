@@ -529,6 +529,9 @@ typedef char  xbox_host_char;
  * Returns TRUE on success, FALSE if the path couldn't be translated.
  * host_path_buf must be at least MAX_PATH characters (not bytes).
  */
+/* Host path produced by the most recent xbox_translate_path call. */
+const wchar_t *xbox_LastHostPath(void);
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================
@@ -828,6 +831,9 @@ NTSTATUS __fastcall xbox_IofCallDriver(PVOID DeviceObject, PVOID Irp);
 VOID     __fastcall xbox_IofCompleteRequest(PVOID Irp, CCHAR PriorityBoost);
 
 NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName, PXBOX_ANSI_STRING DeviceName);
+/* Target of a link registered by xbox_IoCreateSymbolicLink, or NULL.
+ * Looked up by exact link name, e.g. "\\??\\Z:". */
+const char* xbox_LookupSymbolicLink(const char* link);
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
 
 /* ============================================================================
@@ -919,12 +925,21 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define AV_OPTION_CGMS                  18
 #define AV_OPTION_WIDESCREEN            19
 
+/* Standards are unshifted IDs; pack them once using AV_STANDARD_SHIFT.
+ * Option numbers and capability bit positions retain the Xbox wire ABI. */
+#define AV_STANDARD_SHIFT       8
+#define AV_OPTION_QUERY_AVPACK  AV_QUERY_AV_CAPABILITIES
+#define AV_OPTION_QUERY_AV_CAPABILITIES AV_QUERY_AV_CAPABILITIES
+#define AV_OPTION_QUERY_ENCODER_TYPE AV_QUERY_ENCODER_TYPE
+#define AV_REFRESH_60Hz         AV_FLAGS_60Hz
+#define AV_REFRESH_50Hz         AV_FLAGS_50Hz
+
 /* ---- AV capability word fields ---- */
 #define AV_PACK_MASK            0x000000FF
-#define AV_STANDARD_NTSC_M      0x00000100
-#define AV_STANDARD_NTSC_J      0x00000200
-#define AV_STANDARD_PAL_I       0x00000300
-#define AV_STANDARD_PAL_M       0x00000400
+#define AV_STANDARD_NTSC_M      0x01
+#define AV_STANDARD_NTSC_J      0x02
+#define AV_STANDARD_PAL_I       0x03
+#define AV_STANDARD_PAL_M       0x04
 #define AV_STANDARD_MASK        0x00000F00
 #define AV_FLAGS_HDTV_480i      0x00000000
 #define AV_FLAGS_WIDESCREEN     0x00010000

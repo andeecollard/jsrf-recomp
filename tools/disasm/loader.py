@@ -153,10 +153,18 @@ def _parse_hex(s: str) -> int:
 
 
 def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
-    """Auto-detect the analysis JSON file location.
+    """Auto-detect the analysis JSON for this XBE.
 
-    Matches any ``*_analysis.json`` written by ``tools.xbe_parser --json``,
-    so the name is per-game rather than hardcoded to one title.
+    Written by ``tools.xbe_parser --json``, so the name is per-game rather than
+    hardcoded to one title.
+
+    The exact ``<stem>_analysis.json`` always wins. A bare ``*_analysis.json``
+    glob is only accepted when the directory holds a single XBE: a disc that
+    ships one binary per region keeps them side by side -- Wreckless has seven
+    in one folder -- and taking the first sorted match there hands DSTEAL_JP.xbe
+    the analysis written for default.xbe. Different entry point, different
+    section layout, no warning. Data from the wrong binary is worse than none,
+    because everything downstream still runs.
     """
     search_dirs = [
         # Same directory as XBE
@@ -167,6 +175,16 @@ def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
         xbe_path.parent.parent / "tools" / "xbe_parser",
     ]
     for d in search_dirs:
+        exact = d / (xbe_path.stem + "_analysis.json")
+        if exact.exists():
+            return exact
+    for d in search_dirs:
+        try:
+            ambiguous = len(list(d.glob("*.xbe"))) > 1
+        except OSError:
+            continue
+        if ambiguous:
+            continue
         # sorted() so the pick is deterministic when a dir holds several
         for p in sorted(d.glob("*_analysis.json")):
             return p

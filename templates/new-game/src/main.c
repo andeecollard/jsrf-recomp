@@ -31,6 +31,7 @@
  */
 
 #include <windows.h>
+#include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +105,58 @@ extern void xbe_entry_point(void);
  *   - Add dumps of game-specific globals (heap handles, state flags)
  *   - Add SEH simulation if your game uses __try/__except
  */
+/* Name the guest function a fault happened in, and recover the call chain.
+ *
+ * Recompiled code faults as ordinary native code, so the exception record
+ * carries a host RIP and nothing else -- there is no guest program counter to
+ * report, and the host address changes every build. Two things recover the
+ * guest view:
+ *
+ *   - every generated function is a real symbol in the image (sub_005A03C0
+ *     and so on), so the linker's PDB already maps host address back to guest
+ *     function. dbghelp turns an anonymous RIP into that name.
+ *
+ *   - every lifted call pushes its guest return address onto the guest stack
+ *     before jumping, so the stack still holds the chain. Scanning up from esp
+ *     for values inside the code sections recovers it.
+ *
+ * ponytail: the stack scan is a scan, not a frame walk -- these are FPO frames
+ * with no reliable ebp chain, so there is nothing to walk. It over-reports,
+ * since addresses from returned-from calls linger below esp, but naming the
+ * guest function is the whole question at a fault.
+ *
+ * Requires linking dbghelp and keeping the .pdb beside the .exe.
+ */
+static void print_guest_context(void *rip)
+{
+    /* SYMBOL_INFO is variable-length: the name is written past the struct, so
+     * it must be over-allocated with MaxNameLen set to the slack. */
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    DWORD64 disp = 0;
+
+    memset(buf, 0, sizeof(buf));
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)rip, &disp, sym))
+        fprintf(stderr, "  in %s+0x%llX\n",
+                sym->Name, (unsigned long long)disp);
+
+    if (g_xbox_mem_offset && g_esp) {
+        const uint32_t *sp =
+            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+        int shown = 0, i;
+        fprintf(stderr, "  guest stack (return addresses, innermost first):\n");
+        for (i = 0; i < 256 && shown < 24; i++) {
+            uint32_t v = sp[i];
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "    [esp+%-4d] 0x%08X\n", i * 4, v);
+                shown++;
+            }
+        }
+    }
+}
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -130,6 +183,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+        print_guest_context((void *)ep->ContextRecord->Rip);
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:
@@ -180,6 +234,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
+    /* Load symbols up front rather than from inside the handler: at fault
+     * time the process is already in a bad way, and SymInitialize
+     * allocates. Failure is not fatal -- the handler prints no name. */
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
 
     /* Step 1: Load XBE */
@@ -238,6 +297,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("\n=== Initialization complete ===\n");
     printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
     printf("ESP: 0x%08X\n", g_esp);
+
+    /* Build the flat dispatch table before the guest runs.
+     *
+     * Without this recomp_lookup falls back to a binary search over the
+     * whole function table -- roughly log2(n) branches on *every*
+     * indirect call, which for a 45,000-function C++ title is about 16
+     * every time the game goes through a vtable. Half-Life 2 spent most
+     * of its static initialisation inside recomp_lookup for exactly this
+     * reason, and it read as a hang.
+     *
+     * Optional by design: if the allocation fails the search still works,
+     * so a failure is worth one line and not a fatal error. */
+    if (!recomp_dispatch_init())
+        fprintf(stderr, "[BOOT] flat dispatch unavailable; "
+                        "indirect calls will use the binary search\n");
+
+    /* Arm the hang watchdog. Does nothing unless RECOMP_WATCHDOG_SECS is set,
+     * and must be called from this thread -- the guest registers it samples are
+     * thread-local, so it has to be handed the copies belonging to the thread
+     * that runs guest code.
+     *
+     * Not optional boilerplate: without this call RECOMP_WATCHDOG_SECS is
+     * silently inert, and the one diagnostic that tells a hang from slowness
+     * does nothing while appearing to be set. */
+    xbox_WatchdogStart();
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

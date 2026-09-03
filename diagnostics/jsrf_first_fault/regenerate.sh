@@ -98,3 +98,7 @@ fi
     --trace-functions diagnostics/jsrf_first_fault/reach_trace.json \
     --exclude-manual diagnostics/jsrf_first_fault/jsrf_manual_overrides.c \
     --verbose
+
+# Generated C includes this local copy first. Keep its ABI synchronized with
+# the lifter (MMX unions, FS accessors and non-local jump helpers).
+cp templates/runtime/recomp_types.h "$OUT/gen/recomp_types.h"

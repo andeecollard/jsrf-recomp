@@ -45,15 +45,15 @@ class BitScanLifting(unittest.TestCase):
     def test_bsf_scans_upward_from_zero(self):
         out = _lift("bsf", "eax, ecx", [_reg("eax"), _reg("ecx")])
         self.assertNotIn("TODO", out)
-        self.assertIn("_bs_index = 0;", out)
-        self.assertIn("++_bs_index", out)
-        self.assertIn("eax = _bs_index;", out)
+        self.assertIn("_bs_i = 0;", out)
+        self.assertIn("_bs_i++", out)
+        self.assertIn("eax = (uint32_t)_bs_i;", out)
 
     def test_bsr_scans_downward_from_the_top_bit(self):
         out = _lift("bsr", "esi, edx", [_reg("esi"), _reg("edx")])
-        self.assertIn("_bs_index = 31;", out)
-        self.assertIn("--_bs_index", out)
-        self.assertIn("esi = _bs_index;", out)
+        self.assertIn("_bs_i = 31;", out)
+        self.assertIn("_bs_i--", out)
+        self.assertIn("esi = (uint32_t)_bs_i;", out)
 
     def test_zero_source_leaves_the_destination_alone(self):
         # x86 sets ZF and does NOT write the destination when the source is
@@ -62,9 +62,9 @@ class BitScanLifting(unittest.TestCase):
         # MmAllocateContiguousMemoryEx -- the original symptom was JSRF asking
         # for 0x08000000 bytes, twice the console's RAM.
         out = _lift("bsf", "eax, ecx", [_reg("eax"), _reg("ecx")])
-        self.assertIn("if (_bs_value != 0)", out)
-        write_pos = out.index("eax = _bs_index;")
-        guard_pos = out.index("if (_bs_value != 0)")
+        self.assertIn("if (_bs_v)", out)
+        write_pos = out.index("eax = (uint32_t)_bs_i;")
+        guard_pos = out.index("if (_bs_v)")
         self.assertLess(guard_pos, write_pos,
                         "the destination write must sit inside the zero guard")
 
@@ -72,16 +72,15 @@ class BitScanLifting(unittest.TestCase):
         # The reason upstream's implementation was kept over the local one:
         # a 16-bit scan must not see the high half of the register.
         out = _lift("bsr", "ax, cx", [_reg("ax"), _reg("cx")])
-        self.assertIn("(uint16_t)", out)
-        self.assertIn("_bs_index = 15;", out)
+        self.assertIn("LO16(ecx)", out)
+        self.assertIn("_bs_i = 15;", out)
 
     def test_zero_flag_is_published_for_a_following_branch(self):
         lifter = Lifter()
-        lifter.needs_flags = True
         insn = Instruction(0, 3, "bsf", "eax, ecx", "0fbcc1")
         insn.operands = [_reg("eax"), _reg("ecx")]
         out = "\n".join(lifter.lift_instruction(insn))
-        self.assertIn("_flags = (_bs_value == 0);", out)
+        self.assertIn("_fa = _bs_v; _fb = 0;", out)
 
 
 if __name__ == "__main__":

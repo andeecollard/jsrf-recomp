@@ -131,10 +131,20 @@ def test_realigned_seed_starts_a_walkable_chain():
     assert seen == ["push", "push", "mov", "push", "ret"], seen
 
 
-def test_alignment_rule_matches_the_call_target_pass():
-    """Seeding uses the same corroboration constant, so it must exist and be 16."""
-    assert config.CALL_TARGET_REALIGN_ALIGNMENT == 16
-    assert SEED % config.CALL_TARGET_REALIGN_ALIGNMENT == 0
+def test_prologue_evidence_recovers_the_jsrf_seed():
+    """Upstream replaces alignment alone with evidence of a real prologue."""
+    eng = _swept()
+    assert eng.instruction_covering(SEED) is not None
+    assert eng.probes_as_prologue(SEED)
+
+
+def test_interior_of_an_instruction_is_not_prologue_evidence():
+    # A seed inside this nine-byte MOV must not truncate the real function.
+    sec = _Section(BASE, bytes.fromhex("c784240001000044332211c3"))
+    eng = DisasmEngine(_Image(sec))
+    eng.linear_sweep(sec)
+    assert eng.instruction_covering(BASE + 6) is not None
+    assert not eng.probes_as_prologue(BASE + 6)
 
 
 def test_seeding_path_calls_decode_at_for_undecoded_addresses():
@@ -147,9 +157,8 @@ def test_seeding_path_calls_decode_at_for_undecoded_addresses():
     assert "decode_at" in seed_block, (
         "seeding no longer realigns the sweep; seeds that land in an "
         "out-of-phase run will be silently dropped again")
-    assert "CALL_TARGET_REALIGN_ALIGNMENT" in seed_block, (
-        "seeding must apply the same alignment corroboration as the "
-        "call-target pass")
+    assert "instruction_covering" in seed_block
+    assert "probes_as_prologue" in seed_block
 
 
 def _run():

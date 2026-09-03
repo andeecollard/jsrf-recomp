@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 /* ---- Constants --------------------------------------------------------- */
+#define MAXIMUM_WAIT_OBJECTS 64
 #define WAIT_OBJECT_0        0x00000000u
 #define WAIT_ABANDONED_0     0x00000080u
 #define WAIT_ABANDONED       0x00000080u

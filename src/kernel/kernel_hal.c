@@ -438,24 +438,19 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         return;
 
     switch (Option) {
-    case AV_QUERY_AV_CAPABILITIES:
+    case AV_OPTION_QUERY_AVPACK:
         {
-            ULONG user_flags = 0;
-            ULONG type = 0;
-            ULONG length = 0;
-
+            ULONG user_flags = 0, type = 0, length = 0;
             if (xbox_ExQueryNonVolatileSetting(
                     XC_VIDEO, &type, &user_flags, sizeof(user_flags), &length)
-                    != STATUS_SUCCESS || length != sizeof(user_flags)) {
+                    != STATUS_SUCCESS || length != sizeof(user_flags))
                 user_flags = 0;
-            }
 
-            /* Xbox packs the attached AV pack, factory region/refresh, and
-             * dashboard video choices into one dword. This runtime models an
-             * NTSC-M console with an HDTV/component pack at 60 Hz. */
+            /* One packed Xbox capability word: keep upstream's unshifted
+             * standard IDs, and retain the dashboard's video choices. */
             *Result = AV_PACK_HDTV
-                    | ((AV_STANDARD_NTSC_M | AV_FLAGS_60Hz)
-                       & (AV_STANDARD_MASK | AV_REFRESH_MASK))
+                    | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
+                    | AV_REFRESH_60Hz
                     | (user_flags & ~(AV_STANDARD_MASK | AV_PACK_MASK));
         }
         break;

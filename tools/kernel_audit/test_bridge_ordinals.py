@@ -78,6 +78,28 @@ def test_no_duplicate_ordinals():
     print("ok  no_duplicate_ordinals")
 
 
+def test_no_duplicate_arg_sizes():
+    """The same ordinal twice in the arg-size table is a compile error.
+
+    test_no_duplicate_ordinals covers the routing switch only. Argument sizes
+    are a second switch over the same values, and a duplicate there is a C2196
+    that surfaces only when something rebuilds the kernel library -- which is
+    not necessarily the build you are running when you add the entry.
+    """
+    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    match = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    assert match, "could not locate stdcall_args_for_ordinal"
+    seen, dupes = set(), []
+    for ordinal in re.findall(r"case\s+(\d+):\s*return\s+-?\d+;", match.group(0)):
+        ordinal = int(ordinal)
+        if ordinal in seen:
+            dupes.append("ordinal %d has two arg-size entries" % ordinal)
+        seen.add(ordinal)
+    assert not dupes, "\n  ".join(dupes)
+    print("ok  no_duplicate_arg_sizes (%d sized)" % len(seen))
+
+
 def test_arg_size_comments_match_their_ordinal():
     """The stdcall arg table names each function in a comment; check it.
 

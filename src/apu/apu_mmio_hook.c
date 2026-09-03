@@ -257,7 +257,26 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    return apu_decode_and_handle(ctx, mmio_offset, is_write);
+    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+
+    /* What the title actually asks the APU for. The DSPs are stubbed here, so
+     * a title that waits on one waits forever, and the only way to work out
+     * what it is waiting for is to see the register traffic that precedes the
+     * wait. */
+    if (getenv("RECOMP_APU_TRACE")) {
+        static unsigned n;
+        if (n++ < 400) {
+            /* The value as well as the offset: finding which register carries
+             * the command-block address means recognising the address when it
+             * goes past, and an offset alone never shows it. */
+            uint64_t v = g_apu_state
+                       ? mcpx_apu_mmio_read(g_apu_state, mmio_offset, 4) : 0;
+            fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
+                    is_write ? "write" : "read ", mmio_offset,
+                    (uint32_t)v, ok ? "" : "  (decode failed)");
+        }
+    }
+    return ok;
 }
 
 #endif /* _WIN32 */

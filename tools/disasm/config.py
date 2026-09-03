@@ -95,23 +95,21 @@ MIN_CC_RUN = 1
 # Function Detection Confidence Scores
 # ============================================================
 
-# Alignment required before decode_at will manufacture an instruction at a
+# Corroboration required before decode_at will manufacture an instruction at a
 # direct call target the linear sweep stepped over (see functions.py
-# _pass_call_targets, engine.py decode_at).
+# _pass_call_targets, engine.py probes_as_function_body).
 #
 # Only applies to targets with no decoded instruction. Realigning there is
 # creating evidence rather than reading it, so it demands corroboration; a
-# target that already decoded is accepted as before, whatever its alignment.
+# target that already decoded is accepted as before.
 #
-# 16 because that is what MSVC emits for a function start, and because two
-# independent measurements landed on it: seeding unaligned indirect-branch
-# targets made Halo 2276 crash earlier (see tools/recomp/icall_feedback.py
-# cmd_seeds), and on Steel Battalion LOC only 61 of 103 realigned targets were
-# 16-aligned while the rest carried the same signature as that garbage --
-# misdecoded call operands inside data, not functions.
-#
-# Set to 1 to disable the check.
-CALL_TARGET_REALIGN_ALIGNMENT = 16
+# This used to be a 16-byte alignment test. It is the weaker test in both
+# directions: it dropped Wreckless's _mtinitlocks at 0x000F211A (a CRT function
+# packed straight after a jump table) and accepted five all-zero fill regions
+# across the two Steel Battalion images. Decoding the bytes and asking whether
+# they reach a ret separates code from data directly; measured over seven
+# titles it accepts every target alignment did bar those five, plus 44 real
+# functions alignment was dropping.
 
 CONFIDENCE_KNOWN = 1.0       # Entry point, known addresses
 CONFIDENCE_PROLOGUE = 0.95   # Standard prologue pattern
@@ -119,6 +117,8 @@ CONFIDENCE_CALL_TARGET = 0.90  # Destination of a call instruction
 CONFIDENCE_GLOBAL_CALLBACK = 0.89  # Code pointer stored in an indirect-call slot
 CONFIDENCE_TAIL_JUMP = 0.88   # Target of a jmp that leaves its function
 CONFIDENCE_CC_BOUNDARY = 0.85  # After CC padding run following ret
+CONFIDENCE_IMM_REF = 0.86    # Address taken as an immediate, lands in a gap
+CONFIDENCE_DATA_PTR = 0.84   # Code pointer stored in a data section
 
 # ============================================================
 # Disassembly Engine Settings

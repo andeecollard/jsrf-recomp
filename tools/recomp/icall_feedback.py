@@ -124,6 +124,48 @@ def load_function_starts(path=None):
         return {int(fn["start"], 16) for fn in json.load(f)}
 
 
+def load_function_bodies(path=None):
+    """(start, end) for every known function, or None if there is no database.
+
+    Starts alone cannot answer "would seeding this address truncate something",
+    which is the one question that makes a seed actively harmful rather than
+    merely useless.
+    """
+    path = path or FUNCTIONS_PATH
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        fns = json.load(f)
+    bodies = []
+    for fn in fns:
+        start = int(fn["start"], 16)
+        size = fn.get("size") or 0
+        if size > 0:
+            bodies.append((start, start + size))
+    bodies.sort()
+    return bodies
+
+
+def _interior_of(va, bodies):
+    """The function va sits strictly inside, or None.
+
+    Strictly: an address equal to a function's start is that function, which is
+    the normal case for a target already known. Only an address *between* start
+    and end is the dangerous one.
+    """
+    lo, hi = 0, len(bodies)
+    while lo < hi:                       # rightmost body whose start <= va
+        mid = (lo + hi) // 2
+        if bodies[mid][0] <= va:
+            lo = mid + 1
+        else:
+            hi = mid
+    for start, end in reversed(bodies[max(0, lo - 8):lo]):
+        if start < va < end:
+            return start
+    return None
+
+
 def cmd_merge(args):
     db = load_db(args.db)
     before = dict(db)
@@ -185,6 +227,18 @@ def cmd_seeds(args):
     that is not really a function start produces a bogus function whose
     translation is wrong, and that is worse than the no-op stub it replaced.
 
+    Pass --xbe and the filter becomes the same one tools/disasm applies to a
+    direct call target it has to manufacture: decode the bytes and ask whether
+    they reach a ret or a tail jump. That answers "is this code" directly
+    instead of guessing from alignment, and it is what tools/disasm switched
+    to. On Wreckless all 63 observed unresolved targets decode clean, while
+    alignment drops four real functions -- among them 0x0012FB19, which is
+    `mov dword ptr [0x132384], 0x131C6C ; ret`, two instructions long and
+    reached only through a pointer table.
+
+    Without --xbe there is nothing to decode, and the filter falls back to
+    alignment.
+
     The alignment filter exists because of a measured regression on Halo 2276.
     Seeding all 25 observed unresolved targets made the title crash *earlier*
     (segfault before the render_cameras.c:458 assert it used to reach, 6
@@ -200,15 +254,35 @@ def cmd_seeds(args):
         print("empty or missing database: %s" % args.db, file=sys.stderr)
         return 1
 
-    # Deliberately NOT filtered against the current functions.json. Seeds are an
+    # Known function *starts* are deliberately NOT filtered out. Seeds are an
     # input to the pass that rewrites functions.json from scratch, so dropping
     # "already known" targets is circular: on the next run they are only known
     # *because* they were seeded, and an indirect-only target is one the detector
     # cannot re-derive on its own. A seed file must be a standalone statement of
     # what to seed, idempotent across runs.
+    #
+    # An address strictly *inside* a known body is a different question, and not
+    # circular -- a previously seeded target comes back as a start, never as an
+    # interior address. Seeding one clamps the end of the function containing
+    # it, and that function loses its epilogue: it returns without restoring
+    # ebx/esi/edi or popping its own arguments, and every caller is corrupted
+    # with nothing logged anywhere. That is how the Xbox Dashboard lost
+    # __heap_init. Decoding cleanly does not save it -- an interior address is
+    # by definition mid-function, so it decodes fine.
+    probe = _decode_probe(args.xbe)
+    bodies = load_function_bodies(args.functions)
     kept, dropped = {}, []
     for va, flags in sorted(db.items()):
-        if args.align and (va % args.align):
+        if bodies:
+            inside = _interior_of(va, bodies)
+            if inside is not None:
+                dropped.append((va, "inside sub_%08X -- would truncate it" % inside))
+                continue
+        if probe is not None:
+            if not probe(va):
+                dropped.append((va, "does not decode as a function body"))
+                continue
+        elif args.align and (va % args.align):
             dropped.append((va, "not %d-aligned" % args.align))
             continue
         kept[va] = flags
@@ -221,6 +295,23 @@ def cmd_seeds(args):
     for va, why in dropped:
         print("     0x%08X  %s" % (va, why))
     return 0
+
+
+def _decode_probe(xbe_path):
+    """Return a callable(va) -> bool backed by the disassembler's own probe.
+
+    None when no XBE was given, which leaves cmd_seeds on the alignment filter.
+    """
+    if not xbe_path:
+        return None
+    from tools.disasm.loader import load_image, DATA_SECTION_NAMES
+    from tools.disasm.engine import DisasmEngine
+    image = load_image(xbe_path)
+    engine = DisasmEngine(image)
+    for section in image.sections:
+        if section.executable and section.name not in DATA_SECTION_NAMES:
+            engine.linear_sweep(section)
+    return engine.probes_as_function_body
 
 
 def cmd_report(args):
@@ -268,6 +359,9 @@ def main(argv=None):
     s.add_argument("--out", required=True, metavar="JSON",
                    help="seed file to write (feed to tools.disasm "
                         "--seed-functions)")
+    s.add_argument("--xbe", default=None, metavar="XBE",
+                   help="decode each target and keep only those that read as a "
+                        "function body. Supersedes --align; strongly preferred.")
     s.add_argument("--align", type=int, default=16, metavar="N",
                    help="drop targets not N-byte aligned; 0 disables. Default "
                         "%(default)s, which is what MSVC emits for a function "

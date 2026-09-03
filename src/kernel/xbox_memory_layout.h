@@ -52,6 +52,47 @@ extern "C" {
  * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
  * mirror stride derive from this, not from the compile-time constant. */
 extern size_t g_xbox_total_ram;
+
+/* How much guest address space to map, when that must exceed RAM.
+ *
+ * These are not the same quantity and conflating them is a bug. RAM is what
+ * the console has and what the heap is carved out of; the mapped range is how
+ * much guest address space is backed by distinct host pages. The runtime
+ * mirrors RAM at intervals of the mapped size, because a real Xbox wraps
+ * addresses on a 26-bit bus -- so anything a title allocates above the mapped
+ * range silently shares storage with low memory.
+ *
+ * Half-Life 2 needs this: its allocator sub-allocates past the top of RAM, and
+ * at 64 MB its first commit past the boundary (0x04F80000) aliases the base of
+ * the live heap (0x00F80000). A CUtlRBTree element array landed at 0x0CB80000,
+ * aliasing 0x00B80000, and its links were overwritten between one insert and
+ * the next search.
+ *
+ * Raising g_xbox_total_ram instead does not work: the heap top and anything
+ * the guest is told about memory derive from that, so the title sizes itself
+ * differently and faults during CRT init. Growing only the mapping leaves both
+ * alone.
+ *
+ * Zero means "same as RAM", which is the existing behaviour for every title
+ * that does not ask. Set before xbox_MemoryLayoutInit(). */
+extern size_t g_xbox_map_size;
+void xbox_SetMapSize(size_t bytes);
+
+/* Carve a pure address-space reservation from the mapped range above RAM.
+ * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
+ * See the implementation for why reservations must not come from the heap. */
+uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
+
+/* Bounds of the guest's executable sections, derived from the XBE at load.
+ *
+ * recomp_types.h declares these too, for RECOMP_ICALL_IS_CODE. They are
+ * repeated here so hand-written host code -- a fault handler wanting to tell a
+ * guest return address on the stack from ordinary data, say -- can use them
+ * without including the generated-code header, which redefines `eax` and
+ * friends as macros.
+ */
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
 void xbox_SetTotalRam(size_t bytes);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
@@ -84,6 +125,52 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
 /**
  * Release the reserved Xbox memory layout.
  */
+/**
+ * Mirror a GPU completion fence the title spins on.
+ *
+ * The NV2A tables in xbox_memory_layout.c acknowledge handshakes that live at
+ * fixed aperture offsets. Some titles instead wait on a semaphore the GPU
+ * writes into contiguous memory: D3D seeds it, submits work, then spins until
+ * it reaches the submitted count. Wreckless does this at guest 0x000FE920,
+ * waiting on the 96-byte MmAllocateContiguousMemoryEx block its device struct
+ * points at.
+ *
+ * Nothing executes the push buffer -- the D3D11 layer draws -- so everything
+ * submitted is complete, and advancing the fence is the same honest
+ * acknowledgement the register tables make.
+ *
+ * The fence has no fixed address; it is reached through the title's device
+ * struct, so it is registered as the chain of indirections to follow:
+ *
+ *     device = MEM32(device_ptr_va)
+ *     fence  = MEM32(device + get_ptr_off)
+ *     MEM32(fence) = MEM32(device + put_off)
+ *
+ * Every step is bounds-checked each poll, so registering a chain that is not
+ * yet initialised (or never becomes valid) is harmless.
+ *
+ * Returns 0 on success, -1 if the table is full.
+ */
+/* Advance a frame/swap counter inside the D3D device at ~60 Hz.
+ *
+ * A title that waits a frame reads the device's swap count and spins until it
+ * moves. Nothing here presents, so without this the count never changes and
+ * the wait never ends. Followed through the device pointer, like the fence,
+ * because the device is allocated at runtime.
+ *
+ * Returns 0 on success, -1 if the table is full. */
+int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
+
+/* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
+void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
+
+/* Allocate GPU-compatible contiguous storage. Windows uses the high physical
+ * window; POSIX retains low guest-RAM backing. Returns a guest VA, or 0. */
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+
+int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
+                         uint32_t put_off, uint32_t get_ptr_off);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**
@@ -110,6 +197,11 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  */
 BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address);
 void xbox_ProtectMirrorsForDebug(void);
+
+/* Dump the guest call stack and abort if the title has not exited within
+ * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
+ * does nothing unless that variable is set. */
+void xbox_WatchdogStart(void);
 
 /* ================================================================
  * Xbox stack for recompiled code
@@ -157,6 +249,11 @@ void xbox_ProtectMirrorsForDebug(void);
 #define KDATA_DISK_SERIAL_STR   0x460  /* XBOX_ANSI_STRING (8 bytes) */
 #define KDATA_DISK_SERIAL_BUF   0x470  /* serial text (up to 32 bytes) */
 #define KDATA_DISK_CACHE_PARTS  0x4A0  /* HalDiskCachePartitionCount (4 bytes) */
+/* XeImageFileName's text. The exported symbol at KDATA_XE_IMAGE_FILENAME is
+ * an XBOX_ANSI_STRING, and a title dereferences its Buffer -- the CRT reads
+ * it to work out the running image's path. The struct was declared without
+ * anything to point at, so Buffer held whatever was in that page. */
+#define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
 
 /** Size of the simulated Xbox stack (8 MB).
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
@@ -178,6 +275,19 @@ void xbox_ProtectMirrorsForDebug(void);
  * including both, so the guard keeps that from being a redefinition. Keep the
  * two identical: the generated code and the runtime have to agree on the
  * layout, and nothing else checks. */
+#ifndef RECOMP_MMX_DEFINED
+#define RECOMP_MMX_DEFINED
+typedef union RecompMmx {
+    int8_t   b[8];
+    uint8_t  ub[8];
+    int16_t  w[4];
+    uint16_t uw[4];
+    int32_t  d[2];
+    uint32_t ud[2];
+    uint64_t q;
+} RecompMmx;
+#endif
+
 #ifndef RECOMP_XMM_DEFINED
 #define RECOMP_XMM_DEFINED
 typedef union RecompXmm {
@@ -192,6 +302,19 @@ typedef union RecompXmm {
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
+/* Where the fake TIB lives -- the linear address fs: is based at.
+ *
+ * Deliberately not 0. The TIB used to sit on page zero, because the lifter
+ * dropped the fs prefix and fs:[N] became linear [N]. That made a null
+ * dereference read or write the TIB instead of faulting: a null check of the
+ * form `cmp byte [ecx], 0` saw the exception-chain head's 0xFF and passed, and
+ * a store through a null pointer quietly overwrote that head. Both then
+ * surfaced somewhere else entirely. With the TIB up here, page zero is left
+ * unmapped and either mistake faults where it happens.
+ *
+ * Sits below every XBE's image base (0x00010000), so it displaces nothing. */
+#define XBOX_FS_BASE        0x00001000
+
 #define XBOX_STACK_BASE     0x00780000
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
@@ -199,7 +322,7 @@ typedef union RecompXmm {
 #define XBOX_THREAD_STACK_SIZE (512 * 1024)
 
 /* Primary-thread storage used by the title's own Xbox TLS bootstrap. */
-#define XBOX_PRIMARY_TIB_VA          0x00000000u
+#define XBOX_PRIMARY_TIB_VA          XBOX_FS_BASE
 #define XBOX_PRIMARY_TLS_CONTEXT_VA  0x00760000u
 #define XBOX_PRIMARY_TLS_DATA_VA     0x00700000u
 
@@ -244,7 +367,21 @@ typedef union RecompXmm {
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit
  *  128 MB). The total mapped region (data + stack + heap) equals RAM so the
  *  engine's memory probing stops at the correct boundary. */
-#define XBOX_HEAP_TOP       ((uint32_t)g_xbox_total_ram)   /* RAM maps from VA 0 */
+/* The heap runs to the end of the *mapped* range, not the end of RAM.
+ *
+ * When a title maps more address space than it has RAM, a large
+ * MEM_RESERVE has to come from somewhere. Carving it out of a separate
+ * arena above the heap looked tidy and was wrong: the guest CRT's own
+ * bookkeeping never learns about that region, so realloc's block lookup
+ * fails for a pointer in it and the copy is skipped -- a grown buffer
+ * comes back empty with the old one still intact. Half-Life 2 loses a
+ * 129-node CUtlRBTree that way, and the tree then self-cycles.
+ *
+ * Letting the ordinary heap serve the whole mapped range keeps every
+ * allocation inside one allocator the guest already understands.
+ */
+#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_map_size ? g_xbox_map_size \
+                                                        : g_xbox_total_ram))
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */
@@ -253,6 +390,12 @@ typedef union RecompXmm {
 
 /** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
 #define XBOX_NUM_MIRRORS    28
+
+/* Tiled / write-combined aperture. The NV2A shows physical RAM again here, and
+ * titles render through it: physical page P is at XBOX_TILED_BASE + P. Aliases
+ * the RAM mapping rather than getting its own storage, because a title writes a
+ * surface through the tiled address and reads it back through the normal one. */
+#define XBOX_TILED_BASE     0xF0000000u
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.
@@ -280,6 +423,14 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 void xbox_HeapFree(uint32_t xbox_va);
 
 /**
+ * Bytes remaining in the heap block containing this guest address, or 0 if the
+ * heap never handed it out. Backs MmQueryAllocationSize and
+ * ExQueryPoolBlockSize -- the host cannot answer either, since VirtualQuery on
+ * the translated address describes the whole guest mapping.
+ */
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+
+/**
  * Get the file mapping handle for the Xbox memory region.
  * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.
@@ -300,6 +451,14 @@ uint32_t xbox_AllocThreadStack(void);
 void xbox_SetupCurrentThreadTib(uint32_t tib_va, uint32_t tls_context_va,
                                uint32_t tls_data_va, uint32_t tls_data_size,
                                uint32_t stack_top, uint32_t stack_limit);
+/**
+ * Return a worker's stack when the worker ends. Takes the value
+ * xbox_AllocThreadStack returned. Without this the pool counts threads ever
+ * created rather than threads alive, and a title that cycles workers exhausts
+ * it -- after which PsCreateSystemThreadEx runs them inline, which deadlocks
+ * any caller that then waits for the worker it thought it had spawned.
+ */
+void xbox_FreeThreadStack(uint32_t stack_top);
 
 /* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
  * docs/technical/burnout3-reunification.md). Additive; unused by default-model

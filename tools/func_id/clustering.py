@@ -16,7 +16,7 @@ from . import config
 
 
 def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
-                     verbose=False):
+                     verbose=False, sections=None):
     """
     Propagate category labels through the call graph and by proximity.
 
@@ -27,6 +27,8 @@ def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
         imm_refs: Dict rdata_addr -> [func_addr, ...].
         strings: List of string dicts from strings.json.
         verbose: Print progress info.
+        sections: XBE section list from _parse_xbe_sections, for XDK-caller
+            classification. Without it that pass is skipped.
 
     Returns:
         dict: func_addr (int) -> {
@@ -158,7 +160,7 @@ def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
 
     # XDK library section caller detection
     xdk_caller_count = _classify_xdk_callers(
-        sorted_addrs, labels, propagated, callees
+        sorted_addrs, labels, propagated, callees, sections
     )
     if verbose:
         print(f"  XDK section callers: {xdk_caller_count} functions")
@@ -333,15 +335,34 @@ def _classify_rw_consumers(sorted_addrs, labels, propagated, callees):
     return count
 
 
-def _classify_xdk_callers(sorted_addrs, labels, propagated, callees):
+def _xdk_ranges(sections):
+    """[(lo, hi, category)] for the XDK sections this title actually has.
+
+    Derived from the XBE, never from a constant: these sections sit at
+    completely different addresses in every title, so a hardcoded VA table is
+    right for exactly one game and silently mislabels every other.
+    """
+    if not sections:
+        return []
+    return [(s["va"], s["va"] + s["size"], cat)
+            for s in sections
+            if (cat := config.XDK_SECTION_CATEGORIES.get(s.get("name")))]
+
+
+def _classify_xdk_callers(sorted_addrs, labels, propagated, callees, sections):
     """
     Classify unlabeled functions by which XDK library sections they call.
 
     Functions that call into D3D → game_render, DSOUND/WMADEC → game_audio,
     XMV → game_video, XONLINE/XNET → game_network, XPP → game_input.
+
+    With no section table there is nothing trustworthy to match against, so
+    this classifies nothing rather than guessing.
     """
     count = 0
-    xdk_sections = config.XDK_SECTIONS
+    xdk_ranges = _xdk_ranges(sections)
+    if not xdk_ranges:
+        return 0
 
     for addr in sorted_addrs:
         if addr in labels:
@@ -354,7 +375,7 @@ def _classify_xdk_callers(sorted_addrs, labels, propagated, callees):
         # Check which XDK sections this function calls
         xdk_cats = {}
         for target in callee_set:
-            for sec_name, (lo, hi, cat) in xdk_sections.items():
+            for lo, hi, cat in xdk_ranges:
                 if lo <= target < hi:
                     xdk_cats[cat] = xdk_cats.get(cat, 0) + 1
 

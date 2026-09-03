@@ -13,7 +13,7 @@ class FsSegmentLifterTest(unittest.TestCase):
     def test_disassembler_retains_fs_override(self):
         instruction = self._decode("64a128000000")  # mov eax, fs:[0x28]
 
-        self.assertEqual("fs", instruction.operands[1].mem_segment)
+        self.assertEqual("fs", instruction.operands[1].mem_seg)
         self.assertEqual(0x28, instruction.operands[1].mem_disp)
 
     def test_fs_read_uses_thread_segment_accessor(self):

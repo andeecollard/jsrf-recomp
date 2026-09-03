@@ -222,8 +222,9 @@ SDK libraries, and sets `/bigobj` and `/LARGEADDRESSAWARE`.
 
 The template already does the rest of the boot in order: install the VEH crash
 handler, load the XBE, `xbox_MemoryLayoutInit`, `xbox_kernel_init`,
-`xbox_path_init`, `xbox_kernel_bridge_init`, set `g_esp = XBOX_STACK_TOP`, then
-call `xbe_entry_point()` — the generated function named after your entry point VA.
+`xbox_path_init`, `xbox_kernel_bridge_init`, set `g_esp = XBOX_STACK_TOP`,
+`recomp_dispatch_init()`, then call `xbe_entry_point()` — the generated function
+named after your entry point VA.
 
 **3. Game data** — put the extracted `default.xbe` and data files where
 `YOUR_GAME_DIR` points, relative to the `.exe`.

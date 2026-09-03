@@ -38,7 +38,9 @@ class FrameBridgeLifterTest(unittest.TestCase):
         lifted = Lifter().lift_instruction(instruction)
 
         self.assertEqual(len(lifted), 1)
-        self.assertIn("sub_00123456();", lifted[0])
+        # RECOMP_ABI_CALL is the direct call: it expands to (fn)() unless
+        # -DRECOMP_ABI_CHECK is set.
+        self.assertIn("sub_00123456", lifted[0])
 
 
 if __name__ == "__main__":

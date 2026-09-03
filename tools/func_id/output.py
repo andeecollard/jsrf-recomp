@@ -80,7 +80,13 @@ def _write_seed_file(path, functions, enriched, verbose=False):
     # appended its discoveries. The appended thunks carry "type":
     # "vtable_thunk"; everything else came from functions.json. Their
     # estimated bodies must not be used to filter each other.
-    original = [f for f in functions if f.get("type") != "vtable_thunk"]
+    # Aliases share an upper bound rather than measuring a new body. In a gap
+    # that bound can span many independent vtable methods (JSRF's 0x7BE30 is
+    # one). They must not suppress seeds; any real enclosing body is already
+    # represented by its canonical function and remains protected below.
+    original = [f for f in functions
+                if f.get("type") != "vtable_thunk"
+                and f.get("detection_method") != "tail_jump_alias"]
     starts = sorted(int(f["start"], 16) for f in original if "end" in f)
     ends = [int(f["end"], 16) for f in sorted(
         (f for f in original if "end" in f), key=lambda x: int(x["start"], 16))]

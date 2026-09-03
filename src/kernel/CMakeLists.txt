@@ -21,9 +21,17 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     icall_feedback.c
+    recomp_trace.c
+    recomp_debug.c
+    nv2a_pb_scan.c
     nv2a_pb_exec.c
-    fb_window_stub.c
 )
+
+# Keep the portable kernel-only fallback without masking upstream's Win32
+# presenter, now supplied by xbox_video. RECOMP_FB_DUMP works on either host.
+if(NOT WIN32)
+    list(APPEND KERNEL_SOURCES fb_window_stub.c)
+endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 

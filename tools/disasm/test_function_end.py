@@ -28,12 +28,14 @@ from tools.disasm.functions import FunctionDetector  # noqa: E402
 
 class _Insn:
     def __init__(self, addr, size, mnemonic="mov", target=None,
-                 is_ret=False, is_jump=False, is_cond_jump=False):
+                 is_ret=False, is_jump=False, is_cond_jump=False,
+                 jump_table=None):
         self.address = addr
         self.size = size
         self.end_address = addr + size
         self.mnemonic = mnemonic
         self.jump_target = target
+        self.jump_table = jump_table
         self.is_ret = is_ret
         self.is_jump = is_jump
         self.is_cond_jump = is_cond_jump
@@ -43,16 +45,21 @@ class _Insn:
 
 
 class _Engine:
-    def __init__(self, insns):
+    def __init__(self, insns, jump_tables=None, entries=None):
         self.by_addr = {i.address: i for i in insns}
+        self.jump_tables = jump_tables or {}
+        self.entries = entries or {}
 
     def get_instruction(self, addr):
         return self.by_addr.get(addr)
 
+    def jump_table_entries(self, tbl):
+        return self.entries.get(tbl, [])
 
-def _detector(insns):
+
+def _detector(insns, jump_tables=None, entries=None):
     det = FunctionDetector.__new__(FunctionDetector)
-    det.engine = _Engine(insns)
+    det.engine = _Engine(insns, jump_tables, entries)
     return det
 
 
@@ -143,6 +150,34 @@ def test_inline_int3_before_epilogue_is_not_a_boundary():
     det = _detector(insns)
     end = det._find_function_end(0x1000, next_func=None, sec_end=0x2000)
     assert end == 0x1007, f"inline INT3 cut off epilogue at {end:#x}"
+def test_embedded_jump_table_is_stepped_over():
+    # MSVC's memcpy shape: a switch dispatch, the table inline right after it,
+    # then the tail-copy cases and the epilogue. resync_jump_tables() has
+    # already removed the instructions the sweep hallucinated over the table,
+    # so there is a hole at 0x2010 and the walk must jump it.
+    insns = [
+        _Insn(0x2000, 3),
+        _Insn(0x2003, 7, "jmp", is_jump=True, jump_table=0x2010),
+        # 0x2010..0x201F: four table entries, no instructions
+        _Insn(0x2020, 4),   # a case body, reached only through the table
+        _Insn(0x2024, 1, "pop"),
+        _Insn(0x2025, 1, "ret", is_ret=True),
+    ]
+    det = _detector(insns, jump_tables={0x2010: 0x2020},
+                    entries={0x2010: [0x2020, 0x2020, 0x2024, 0x2024]})
+    end = det._find_function_end(0x2000, next_func=None, sec_end=0x3000)
+    assert end == 0x2026, (
+        f"function ended at its own switch table instead of its epilogue: "
+        f"{end:#x}")
+
+
+def test_jump_table_past_next_function_is_ignored():
+    # A table recorded beyond the bounds must not drag the function over its
+    # neighbour.
+    insns = [_Insn(0x2000, 3), _Insn(0x2003, 1, "ret", is_ret=True)]
+    det = _detector(insns, jump_tables={0x2100: 0x2200})
+    end = det._find_function_end(0x2000, next_func=0x2050, sec_end=0x3000)
+    assert end == 0x2004, f"expected {0x2004:#x}, got {end:#x}"
 
 
 if __name__ == "__main__":

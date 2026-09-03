@@ -35,7 +35,11 @@ def test_unselected_direct_call_remains_direct():
     lifted = Lifter().lift_instruction(_direct_call())
     generated = "\n".join(lifted)
 
-    assert "sub_001E9100();" in generated
+    # A direct call goes through RECOMP_ABI_CALL, which expands to a plain
+    # (fn)() unless -DRECOMP_ABI_CHECK is set. What matters here is that it
+    # names the function rather than routing through the manual lookup.
+    assert "sub_001E9100" in generated
+    assert "RECOMP_ICALL_SAFE" not in generated
     assert "RECOMP_ICALL_SAFE" not in generated
 
 

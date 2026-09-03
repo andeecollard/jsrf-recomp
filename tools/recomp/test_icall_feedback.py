@@ -23,7 +23,8 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.recomp.icall_feedback import (  # noqa: E402
-    SEEN_RESOLVED, SEEN_UNRESOLVED, load_db, main, parse_dump, save_db)
+    SEEN_RESOLVED, SEEN_UNRESOLVED, _interior_of, load_db, main,
+    parse_dump, save_db)
 from tools.disasm.__main__ import _load_seed_functions  # noqa: E402
 
 
@@ -149,6 +150,30 @@ def _run():
         fn()
         print("  ok  %s" % fn.__name__)
     print("%d checks passed" % len(fns))
+
+
+def test_a_seed_inside_a_function_body_is_never_emitted():
+    """That seed truncates the function containing it.
+
+    This is what cost the Xbox Dashboard its boot: an address at a valid
+    instruction boundary inside __heap_init clamped that function's end, so it
+    returned without its `pop esi; ret`. The caller came back with its
+    callee-saved registers rotated, the CRT heap was never initialised, and
+    nothing was logged anywhere. Decoding cleanly does not catch it -- an
+    interior address is mid-function, so of course it decodes.
+    """
+    bodies = [(0x1000, 0x1100), (0x2000, 0x2010), (0x3000, 0x3400)]
+
+    assert _interior_of(0x1080, bodies) == 0x1000
+    assert _interior_of(0x33FF, bodies) == 0x3000
+    # A start is the function itself, not an interior address -- and it must
+    # stay seedable, or the loop stops being idempotent across runs.
+    assert _interior_of(0x1000, bodies) is None
+    # One past the end belongs to whatever comes next.
+    assert _interior_of(0x1100, bodies) is None
+    # Gaps are where the seeds worth keeping live.
+    assert _interior_of(0x1800, bodies) is None
+    assert _interior_of(0x0500, bodies) is None
 
 
 if __name__ == "__main__":

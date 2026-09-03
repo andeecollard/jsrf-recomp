@@ -85,6 +85,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxguid
     xinput
     winmm
+    # Lets the fault handler resolve the host RIP back to the generated
+    # function's symbol, i.e. to the guest function that faulted.
+    dbghelp
 )
 
 # MSVC-specific: large address aware, increase section limit for big generated files

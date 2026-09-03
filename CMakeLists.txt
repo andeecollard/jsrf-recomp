@@ -49,6 +49,9 @@ add_subdirectory(src/nv2a)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Shared FMV player (Media Foundation -> D3D8 texture)
+add_subdirectory(src/video)
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -60,5 +63,6 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_input
     xbox_apu
     xbox_nv2a
+    xbox_video
 )
 

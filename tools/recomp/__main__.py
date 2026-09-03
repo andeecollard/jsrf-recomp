@@ -120,6 +120,34 @@ def list_categories(translator):
         print(f"{cat:<30} {count:>8} {pct:>7.1f}%")
 
 
+def _report_unimplemented(stats):
+    """List the mnemonics that were emitted as TODO comments.
+
+    An unimplemented instruction is not a build error -- it is a comment, and
+    the generated function keeps running with whatever the destination already
+    held. That is the worst kind of failure: it looks like it worked. Wreckless
+    booted for weeks with `bsf eax, ecx` translated to nothing, which made the
+    CRT heap's free-list bitmap scan return its own argument and hand out the
+    address of an empty list head.
+
+    Sorted by count, with one example address each so the caller can go and
+    look at it.
+    """
+    unimplemented = stats.get("unimplemented") or {}
+    if not unimplemented:
+        return
+    total = sum(len(a) for a in unimplemented.values())
+    print(f"{total} instruction(s) unimplemented, emitted as no-op comments "
+          f"({len(unimplemented)} distinct mnemonics):", file=sys.stderr)
+    ranked = sorted(unimplemented.items(),
+                    key=lambda kv: (-len(kv[1]), kv[0]))
+    for mnemonic, addrs in ranked[:20]:
+        print(f"    {len(addrs):6d}  {mnemonic:<12} e.g. 0x{min(addrs):08X}",
+              file=sys.stderr)
+    if len(ranked) > 20:
+        print(f"    ... and {len(ranked) - 20} more", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Xbox x86 -> C Static Recompiler")
@@ -280,7 +308,8 @@ def main():
             funcs = translator.get_functions_by_category()
 
         header_path = os.path.join(output_dir, "recomp_functions.h")
-        generate_header(funcs, header_path, abi_db=translator.abi_db)
+        generate_header(funcs, header_path, abi_db=translator.abi_db,
+                        title=translator.title)
         print(f"Generated header: {header_path} ({len(funcs)} declarations)")
         return
 
@@ -408,6 +437,7 @@ def main():
             print(f"{stats['unresolved_stubs']} unresolved call targets stubbed "
                   f"(addresses called but not detected as functions)",
                   file=sys.stderr)
+        _report_unimplemented(stats)
         for f_path in stats.get("files", []):
             print(f"  {f_path}", file=sys.stderr)
     else:

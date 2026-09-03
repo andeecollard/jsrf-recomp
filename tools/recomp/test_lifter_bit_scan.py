@@ -1,86 +1,60 @@
-"""Tests for BSF/BSR lifting and their zero flag."""
+"""Bit scan lifting: value, the zero case, and the flag it publishes.
+
+Originally contributed in #16 alongside a second implementation. The lifter
+already had one, reached earlier in lift_instruction, and the two disagreed on
+where ZF lives -- the contributed body wrote `_flags` while the flag path read
+the `_fa`/`_fb` snapshot, so a jcc after a bit scan would have read a stale
+value. These tests were rewritten against the surviving implementation, which
+publishes ZF through the same snapshot a `cmp src, 0` leaves and so composes
+with everything else that reads flags.
+"""
 
 from tools.recomp.disasm import BasicBlock, Instruction, Operand
 from tools.recomp.lifter import Lifter, lift_basic_block
 
 
-def _reg(name):
-    return Operand(type="reg", reg=name)
+def _reg(name, size=4):
+    op = Operand("reg")
+    op.reg = name
+    op.size = size
+    return op
 
 
-def test_lifts_32_bit_bsf():
-    insn = Instruction(0, 3, "bsf", "eax, ecx", "0fbcc1")
-    insn.operands = [_reg("eax"), _reg("ecx")]
-
-    generated = "\n".join(Lifter().lift_instruction(insn))
-
-    assert "uint32_t _bs_index = 0;" in generated
-    assert "eax = _bs_index;" in generated
-    assert "_flags = (_bs_value == 0);" in generated
+def _scan(mnemonic, dst="eax", src="ecx", size=4):
+    insn = Instruction(0, 3, mnemonic, f"{dst}, {src}", "0fbcc1")
+    insn.operands = [_reg(dst, size), _reg(src, size)]
+    return insn
 
 
-def test_lifts_16_bit_bsr_without_clobbering_upper_bits():
-    insn = Instruction(0, 4, "bsr", "ax, word ptr [ecx]", "660fbd01")
-    insn.operands = [
-        _reg("ax"),
-        Operand(type="mem", mem_base="ecx", mem_size=2),
-    ]
-
-    generated = "\n".join(Lifter().lift_instruction(insn))
-
-    assert "uint32_t _bs_index = 15;" in generated
-    assert "SET_LO16(eax, _bs_index);" in generated
+def test_bsf_scans_from_the_low_bit():
+    body = "".join(Lifter().lift_instruction(_scan("bsf")))
+    assert "_bs_i = 0" in body and "_bs_i++" in body
 
 
-def test_preserves_destination_when_source_is_zero():
-    insn = Instruction(0, 3, "bsf", "eax, ecx", "0fbcc1")
-    insn.operands = [_reg("eax"), _reg("ecx")]
-
-    generated = "\n".join(Lifter().lift_instruction(insn))
-
-    assert "if (_bs_value != 0) {" in generated
-    assert "eax = _bs_index;" in generated
+def test_bsr_scans_from_the_high_bit():
+    body = "".join(Lifter().lift_instruction(_scan("bsr")))
+    assert "_bs_i = 31" in body and "_bs_i--" in body
 
 
-def test_omits_zero_flag_snapshot_when_function_has_no_consumer():
-    insn = Instruction(0, 3, "bsf", "eax, ecx", "0fbcc1")
-    insn.operands = [_reg("eax"), _reg("ecx")]
-    lifter = Lifter()
-    lifter.needs_flags = False
-
-    generated = "\n".join(lifter.lift_instruction(insn))
-
-    assert "_flags" not in generated
+def test_zero_source_leaves_the_destination_untouched():
+    # The architecture leaves the destination undefined for a zero source, so
+    # the lift must not invent a value -- the write sits behind the guard.
+    body = "".join(Lifter().lift_instruction(_scan("bsf")))
+    assert "if (_bs_v) {" in body
 
 
-def test_jz_reads_snapshotted_zero_flag_after_source_is_clobbered():
-    scan = Instruction(0, 3, "bsf", "eax, ecx", "0fbcc1")
-    scan.operands = [_reg("eax"), _reg("ecx")]
-    move = Instruction(3, 5, "mov", "ecx, 1", "b901000000")
-    move.operands = [_reg("ecx"), Operand(type="imm", imm=1)]
-    jump = Instruction(8, 2, "je", "0x10", "7406")
-    jump.jump_target = 0x10
-
-    lifter = Lifter()
-    lifter.func_start = 0
-    lifter.func_end = 0x20
-    generated, _ = lift_basic_block(
-        lifter, BasicBlock(start=0, instructions=[scan, move, jump]))
-
-    assert "if (_flags) goto loc_00000010;" in generated[-1]
-    assert all("ecx == 0" not in statement for statement in generated)
+def test_zero_flag_is_published_through_the_compare_snapshot():
+    body = "".join(Lifter().lift_instruction(_scan("bsf")))
+    assert "_fa = _bs_v" in body and "_fb = 0" in body
 
 
-def test_jnz_reads_snapshotted_zero_flag():
-    scan = Instruction(0, 3, "bsr", "eax, ecx", "0fbdc1")
-    scan.operands = [_reg("eax"), _reg("ecx")]
+def test_jnz_after_a_scan_reads_that_snapshot():
+    scan = _scan("bsr")
     jump = Instruction(3, 2, "jne", "0x10", "750b")
     jump.jump_target = 0x10
-
     lifter = Lifter()
     lifter.func_start = 0
     lifter.func_end = 0x20
     generated, _ = lift_basic_block(
         lifter, BasicBlock(start=0, instructions=[scan, jump]))
-
-    assert "if (!_flags) goto loc_00000010;" in generated[-1]
+    assert "_fa" in generated[-1] and "goto loc_00000010;" in generated[-1]

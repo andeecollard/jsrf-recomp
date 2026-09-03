@@ -48,7 +48,7 @@ class MmxLifterTest(unittest.TestCase):
 
         self.assertNotIn("TODO", generated)
         self.assertNotIn("SSE:", generated)
-        self.assertIn("mm0 = MEM64(esi);", generated)
+        self.assertIn("mm0 = MMX_MEM(esi);", generated)
 
     def test_movntq_stores_64_bits(self):
         generated = "\n".join(Lifter().lift_instruction(
@@ -56,7 +56,7 @@ class MmxLifterTest(unittest.TestCase):
                   "qword ptr [edi + 8], mm1")))
 
         self.assertNotIn("TODO", generated)
-        self.assertIn("MEM64(edi + 8) = mm1;", generated)
+        self.assertIn("MMX_STORE(edi + 8, mm1);", generated)
 
     def test_register_to_register_move(self):
         generated = "\n".join(Lifter().lift_instruction(

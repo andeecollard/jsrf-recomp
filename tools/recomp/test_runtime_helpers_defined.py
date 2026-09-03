@@ -68,10 +68,11 @@ class RuntimeHelpersDefinedTest(unittest.TestCase):
         runtime = _RUNTIME.read_text(encoding="utf-8")
         for i in range(8):
             self.assertIn(f"#define mm{i} g_mm{i}", runtime)
-        self.assertIn("MEM64(addr)", runtime)
+        self.assertIn("MMX_MEM(uint32_t addr)", runtime)
+        self.assertIn("MMX_STORE(uint32_t addr, RecompMmx v)", runtime)
         layout = (_ROOT / "src" / "kernel" / "xbox_memory_layout.c").read_text(
             encoding="utf-8")
-        self.assertIn("RECOMP_TLS uint64_t g_mm0", layout)
+        self.assertIn("RECOMP_TLS RecompMmx g_mm0", layout)
 
 
 if __name__ == "__main__":

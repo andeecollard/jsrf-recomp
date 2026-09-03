@@ -32,6 +32,9 @@
 #include <fnmatch.h>
 #endif
 
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -386,6 +389,30 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    /* A partition device opened as a directory.
+     *
+     * The path layer maps \Device\Harddisk0\PartitionN to a PartitionN.img
+     * backing file, but a title asking for free space opens the partition with
+     * FILE_DIRECTORY_FILE | FILE_OPEN_FOR_FREE_SPACE_QUERY -- it wants the
+     * volume, not the bytes. Opening a regular file as a directory fails, and
+     * the title reads STATUS_OBJECT_PATH_NOT_FOUND as "no such volume".
+     *
+     * Half-Life 2's CRT probes partition0 this way during startup and treats
+     * the failure as fatal. Redirecting to the directory that holds the image
+     * gives a handle that is valid for exactly what the caller is going to do
+     * with it, which is NtQueryVolumeInformationFile. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
+        !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
+        WCHAR *slash = wcsrchr(win_path, L'\\');
+        if (slash && slash != win_path) {
+            *slash = 0;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: directory open of a device image, "
+                     "using its containing directory instead");
+        }
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
@@ -404,7 +431,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+        /* A warning, not a compiled-out trace: a failed open is how a title
+         * silently decides a volume or asset is missing, and in a Release
+         * build that decision was invisible. */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                 "NtCreateFile FAILED: %S (err=%u)", win_path, err);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
@@ -712,6 +743,18 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* Xbox volume geometry.
+ *
+ * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
+ * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
+ * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
+ * product to equal the cluster size it was built for. Half-Life 2 checks for
+ * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
+ * aborts CRT init before main ever runs -- the process then exits cleanly,
+ * which reads as a title that did nothing rather than one that failed.
+ *
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
@@ -725,14 +768,14 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
-                info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
-                info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -1298,8 +1341,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
-            info->BytesPerSector = 512;
-            info->SectorsPerAllocationUnit = 8;
+            /* Xbox geometry, not the host's -- see the note on
+             * XBOX_SECTORS_PER_CLUSTER above. */
+            info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+            info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
@@ -1588,12 +1633,50 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
                 IoControlCode, information, (uint32_t)STATUS_SUCCESS);
         return STATUS_SUCCESS;
     }
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtDeviceIoControlFile(0x%X) - stub", IoControlCode);
-    if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
-        IoStatusBlock->Information = 0;
+    /* Upstream's raw-disk queries also apply to ordinary partition-image
+     * handles. Keep Partition5's sparse cache semantics above, and marshal
+     * completion through the common bridge for every device. */
+    if (!IoStatusBlock)
+        return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    IoStatusBlock->Status = STATUS_NOT_SUPPORTED;
+    if (IoControlCode == XBOX_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
+        if (!OutputBuffer || OutputBufferLength < sizeof(XBOX_DISK_GEOMETRY))
+            return IoStatusBlock->Status = ((NTSTATUS)0xC0000023u);
+        XBOX_DISK_GEOMETRY *geometry = OutputBuffer;
+        memset(geometry, 0, sizeof(*geometry));
+        geometry->Cylinders.QuadPart = 1216;
+        geometry->MediaType = 12; /* FixedMedia */
+        geometry->TracksPerCylinder = 255;
+        geometry->SectorsPerTrack = 63;
+        geometry->BytesPerSector = 512;
+        IoStatusBlock->Information = sizeof(*geometry);
+        IoStatusBlock->Status = STATUS_SUCCESS;
+    } else if (IoControlCode == XBOX_IOCTL_DISK_GET_PARTITION_INFO) {
+        if (!OutputBuffer || OutputBufferLength < sizeof(XBOX_PARTITION_INFORMATION))
+            return IoStatusBlock->Status = ((NTSTATUS)0xC0000023u);
+        XBOX_PARTITION_INFORMATION *partition = OutputBuffer;
+        LARGE_INTEGER size = {0};
+#if defined(_WIN32)
+        if (!GetFileSizeEx(FileHandle, &size))
+            return IoStatusBlock->Status = STATUS_INVALID_HANDLE;
+#else
+        struct stat st;
+        int fd = w32_handle_fd(FileHandle);
+        if (fd < 0 || fstat(fd, &st) != 0)
+            return IoStatusBlock->Status = STATUS_INVALID_HANDLE;
+        size.QuadPart = st.st_size;
+#endif
+        memset(partition, 0, sizeof(*partition));
+        partition->PartitionLength = size;
+        partition->PartitionNumber = 1;
+        partition->PartitionType = 6;
+        partition->BootIndicator = TRUE;
+        partition->RecognizedPartition = TRUE;
+        IoStatusBlock->Information = sizeof(*partition);
+        IoStatusBlock->Status = STATUS_SUCCESS;
     }
-    return STATUS_NOT_IMPLEMENTED;
+    return IoStatusBlock->Status;
 }
 
 NTSTATUS __stdcall xbox_NtOpenSymbolicLinkObject(

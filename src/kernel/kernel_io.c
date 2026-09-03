@@ -362,6 +362,16 @@ static XBOX_SYMLINK* xbox_find_symlink(const char* name)
     return NULL;
 }
 
+const char* xbox_LookupSymbolicLink(const char* link)
+{
+    XBOX_SYMLINK* entry;
+
+    if (!link)
+        return NULL;
+    entry = xbox_find_symlink(link);
+    return entry ? entry->target : NULL;
+}
+
 NTSTATUS __stdcall xbox_IoCreateSymbolicLink(
     PXBOX_ANSI_STRING SymbolicLinkName,
     PXBOX_ANSI_STRING DeviceName)
