@@ -261,9 +261,16 @@ static int fetch_inline(uint32_t a, uint32_t index, float out[4])
     return 1;
 }
 
-/* Read attribute `a` of vertex `index` as floats. Only the float and the
- * normalised-byte types appear in practice; anything else returns 0 so a
- * caller sees a degenerate vertex rather than reading past the array. */
+/* Read attribute `a` of vertex `index` as floats. Anything this does not
+ * decode returns 0, so a caller sees a degenerate vertex rather than reading
+ * past the array -- and the batch is refused, which is how UB_D3D was found:
+ * every draw JSRF submits declares its diffuse colour as
+ *
+ *     attribute 3 type=0 size=4 stride=32 offset=0x01BA2010
+ *
+ * and type 0 is UB_D3D, which was not decoded. That one gap refused 70,228 of
+ * 70,228 rejected batches. UB_D3D is a packed D3DCOLOR: the bytes are stored
+ * B, G, R, A, which is why it cannot share the UB_OGL case below it. */
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -277,15 +284,28 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     p = mem + a->offset + (size_t)index * a->stride;
 
     switch (a->type) {
-    case 2:                                  /* float */
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D:
+        /* Stored B, G, R, A. Only a 4-component D3DCOLOR is defined this way;
+         * a shorter one would be a different declaration and is refused. */
+        if (a->size != 4)
+            return 0;
+        out[0] = (float)p[2] / 255.0f;
+        out[1] = (float)p[1] / 255.0f;
+        out[2] = (float)p[0] / 255.0f;
+        out[3] = (float)p[3] / 255.0f;
+        return 1;
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F:
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = ((const float *)p)[i];
         return 1;
-    case 4:                                  /* unsigned byte, normalised */
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL:
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = (float)p[i] / 255.0f;
         return 1;
     default:
+        /* S1, CMP and the rest are undecoded. The rejection report names the
+         * type, so the next one that matters identifies itself rather than
+         * being guessed at. */
         return 0;
     }
 }
@@ -580,10 +600,54 @@ static uint32_t pack_color(const float c[4])
     return (n[3] << 24) | (n[0] << 16) | (n[1] << 8) | n[2];
 }
 
+/* Why the last batch was refused.
+ *
+ * prepare_vertices has five distinct ways to fail and the counter only said
+ * how often, so "38,472 rejected" named no cause and could not be acted on.
+ * These are the causes, counted separately, with the first offending detail
+ * kept for each -- which attribute could not be fetched, which output
+ * components the program left unwritten. Reason strings are literals and are
+ * compared by pointer, so the table stays a fixed size. */
+static struct { const char *reason; uint32_t n; uint32_t detail; }
+    s_vsh_reject[8];
+static const char *s_vsh_reason;
+static uint32_t s_vsh_reason_detail;
+
+#define VSH_REJECT(text, value) \
+    do { s_vsh_reason = (text); s_vsh_reason_detail = (uint32_t)(value); \
+         return 0; } while (0)
+
+static void note_vsh_reject(void)
+{
+    const char *reason = s_vsh_reason ? s_vsh_reason : "unrecorded";
+    for (size_t i = 0; i < sizeof s_vsh_reject / sizeof s_vsh_reject[0]; ++i) {
+        if (!s_vsh_reject[i].reason) {
+            s_vsh_reject[i].reason = reason;
+            s_vsh_reject[i].detail = s_vsh_reason_detail;
+        }
+        if (s_vsh_reject[i].reason == reason) { s_vsh_reject[i].n++; return; }
+    }
+}
+
+static uint32_t vsh_sample_batch(void)
+{
+    static long batch = -1;
+
+    if (batch < 0) {
+        const char *env = getenv("RECOMP_VSH_SAMPLE");
+        batch = env ? strtol(env, NULL, 0) : 20000;
+        if (batch < 4) batch = 4;
+    }
+    return (uint32_t)batch;
+}
+
 static int prepare_vertices(void)
 {
     int programmable = s_vsh.mode == 2;
-    if (s_vsh.mode != 0 && !programmable) return 0;
+    s_vsh_reason = NULL;
+    s_vsh_reason_detail = 0;
+    if (s_vsh.mode != 0 && !programmable)
+        VSH_REJECT("fixed-function transform mode is not implemented", s_vsh.mode);
     if (programmable && s_vsh.dirty) {
         uint32_t n = 0;
         while (s_vsh.start < NV2A_VS_MAX_INSTRUCTIONS
@@ -601,28 +665,63 @@ static int prepare_vertices(void)
             memcpy(inputs, s_vsh.current, sizeof(inputs));
             for (uint32_t a = 0; a < 16; ++a) {
                 if (!(s_vsh.decoded.inputs_read & (1u << a))) continue;
-                if (s_gpu.attr[a].size && !fetch_vertex(a, s_gpu.idx[i], inputs[a])) return 0;
+                if (s_gpu.attr[a].size && !fetch_vertex(a, s_gpu.idx[i], inputs[a])) {
+                    /* Name the record, once. "attribute 3 failed" is one step
+                     * from useless; the format byte is the answer, because
+                     * fetch_attr only decodes float and UB_OGL and a D3D8
+                     * title declares its diffuse colour as UB_D3D. */
+                    static uint32_t told;
+                    if (!(told & (1u << a))) {
+                        told |= 1u << a;
+                        fprintf(stderr, "  [VSH] attribute %u unfetchable: "
+                                "type=%u size=%u stride=%u offset=0x%08X "
+                                "inline=%u\n", a, s_gpu.attr[a].type,
+                                s_gpu.attr[a].size, s_gpu.attr[a].stride,
+                                s_gpu.attr[a].offset, s_gpu.inline_count);
+                        fflush(stderr);
+                    }
+                    VSH_REJECT("vertex attribute could not be fetched", a);
+                }
             }
-            if (!nv2a_vsh_execute(&s_vsh.decoded, inputs, s_vsh.constants, &result)
-                    || (result.written[0] & 12) != 12) return 0;
+            if (!nv2a_vsh_execute(&s_vsh.decoded, inputs, s_vsh.constants, &result))
+                VSH_REJECT("shader execution failed", s_vsh.decoded.length);
+            if ((result.written[0] & 12) != 12)
+                VSH_REJECT("program left oPos.zw unwritten", result.written[0]);
             memcpy(s_outputs[i], result.output, sizeof(s_outputs[i]));
             memcpy(s_positions[i], result.output[0], sizeof(s_positions[i]));
             s_colors[i] = pack_color(result.output[NV2A_VSH_OUT_D0]);
             /* NV2A programs include the viewport transform and perspective
              * division. Only screen subpixel quantisation remains here. */
             for (int k = 0; k < 2; ++k) {
-                if (!isfinite(s_positions[i][k])) return 0;
+                if (!isfinite(s_positions[i][k]))
+                    VSH_REJECT("oPos is not finite", k);
                 if (fabsf(s_positions[i][k]) < 0x1p20f)
                     s_positions[i][k] = truncf(s_positions[i][k] * 16.0f) / 16.0f;
                 s_outputs[i][0][k] = s_positions[i][k];
             }
-            if (s_vsh.batches < 4 && i < 3)
+            /* Sample a late batch as well as the first few. The early ones
+             * are the measured full-screen blit and always look the same;
+             * whether the title's own geometry transforms differently is a
+             * question about batch 20,000, not batch 1. RECOMP_VSH_SAMPLE
+             * moves the sample point. */
+            if (s_vsh.batches == vsh_sample_batch() && i < 3) {
+                fprintf(stderr, "  [VSH] late batch attrs:");
+                for (uint32_t k = 0; k < 16; ++k)
+                    if (s_gpu.attr[k].size)
+                        fprintf(stderr, " a%u(t%u s%u st%u @%08X)", k,
+                                s_gpu.attr[k].type, s_gpu.attr[k].size,
+                                s_gpu.attr[k].stride, s_gpu.attr[k].offset);
+                fprintf(stderr, " reads=%04X inline=%u\n",
+                        s_vsh.decoded.inputs_read, s_gpu.inline_count);
+            }
+            if ((s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()) && i < 3)
                 fprintf(stderr, "  [VSH] start=%u slots=%d vertex=%u oPos=(%.6g %.6g %.6g %.6g) color=%08X\n",
                         s_vsh.start, s_vsh.decoded.length, i,
                         result.output[0][0], result.output[0][1], result.output[0][2], result.output[0][3], s_colors[i]);
         } else {
             float color[4];
-            if (!fetch_vertex(0, s_gpu.idx[i], s_positions[i])) return 0;
+            if (!fetch_vertex(0, s_gpu.idx[i], s_positions[i]))
+                VSH_REJECT("position attribute could not be fetched", 0);
             int has_color = fetch_vertex(3, s_gpu.idx[i], color);
             s_colors[i] = has_color ? pack_color(color) : 0xFFFFFFFFu;
             memset(s_outputs[i], 0, sizeof(s_outputs[i]));
@@ -748,9 +847,12 @@ static void raster_batch(void)
         return;
     if (!prepare_vertices()) {
         s_vsh.rejected++;
+        note_vsh_reject();
         if (s_vsh.rejected <= 4)
-            fprintf(stderr, "  [VSH] rejected batch mode=%u start=%u valid=%d final=%d\n",
-                    s_vsh.mode, s_vsh.start, s_vsh.decoded.valid, s_vsh.decoded.has_final);
+            fprintf(stderr, "  [VSH] rejected batch mode=%u start=%u valid=%d final=%d: "
+                            "%s (%u)\n",
+                    s_vsh.mode, s_vsh.start, s_vsh.decoded.valid, s_vsh.decoded.has_final,
+                    s_vsh_reason ? s_vsh_reason : "unrecorded", s_vsh_reason_detail);
         return;
     }
     const char *copy_error = prepare_texture_copy();
@@ -1247,6 +1349,11 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     fprintf(stderr, "[VSH] executed batches=%u rejected=%u mode=%u start=%u slots=%d\n",
             s_vsh.batches, s_vsh.rejected, s_vsh.mode, s_vsh.start, s_vsh.decoded.length);
+    for (size_t i = 0; i < sizeof s_vsh_reject / sizeof s_vsh_reject[0]; ++i) {
+        if (!s_vsh_reject[i].reason) break;
+        fprintf(stderr, "[VSH]   %8u  %s (first detail %u)\n",
+                s_vsh_reject[i].n, s_vsh_reject[i].reason, s_vsh_reject[i].detail);
+    }
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {
