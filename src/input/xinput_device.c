@@ -119,6 +119,8 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <time.h>
+#include <stdlib.h>
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
@@ -146,10 +148,56 @@ void xbox_InputInit(void)
     open_controllers();
 }
 
+/* A pad that is present and pressing things, for bring-up without hardware.
+ *
+ * With no controller attached this backend reports ERROR_DEVICE_NOT_CONNECTED
+ * and there is no keyboard fallback, so a title that waits at a screen for a
+ * button waits for ever and looks identical to one that has hung. JSRF sits in
+ * a healthy frame loop after its cache stops, which is exactly that shape, and
+ * telling the two apart needs a pad that says yes.
+ *
+ * RECOMP_FAKE_PAD=1 reports port 0 connected and pulses A and START for 150 ms
+ * once a second, after a two-second settle. Diagnostic, not input support: it
+ * cannot steer anything, and a real keyboard mapping is the actual fix.
+ */
+static int fake_pad_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_FAKE_PAD") ? 1 : 0;
+    return on;
+}
+
+static double fake_pad_seconds(void)
+{
+    static struct timespec t0;
+    static int have_t0;
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!have_t0) { t0 = now; have_t0 = 1; }
+    return (double)(now.tv_sec - t0.tv_sec)
+         + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+
+    if (fake_pad_on()) {
+        if (dwPort != 0)
+            return ERROR_DEVICE_NOT_CONNECTED;
+        memset(pState, 0, sizeof(*pState));
+        pState->dwPacketNumber = ++g_packet[0];
+        {
+            double t = fake_pad_seconds();
+            if (t > 2.0 && (t - (double)(long)t) < 0.15) {
+                pState->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+                pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+            }
+        }
+        return ERROR_SUCCESS;
+    }
 
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
