@@ -636,3 +636,52 @@ whether slot 23 of 0x001E1640 is ever dispatched. If it is, something inside
 sub_001596B0 declines and that is readable. If it is not, the question is what
 selects the state -- and that is a game state machine, which should be costed
 as its own piece of work rather than continued on momentum.
+
+
+================================================================================
+14. SECOND UPSTREAM SWEEP  (two new commits; three hazards tested, all negative)
+================================================================================
+origin/work/v0.7.0-non-local moved to 342eb1f, two commits on:
+    342eb1f  Map flash, open the window from the executor, and arm the watchdog
+    31e120e  disasm: a mid-instruction seed that is a prologue means the sweep
+             drifted
+
+THE ONE ACTIONABLE CLUE, and it is a warning that saves a wasted cycle on A2.
+From bdaecf3:
+
+    "The indirect-call feedback dump never fired for a title that gave up
+     during boot. The firmware-exit path ends in ExitProcess, which does not
+     run atexit, so the host's registered dump was dead code exactly where the
+     header says it matters most. Dump from the bridge instead."
+
+Every run here is bounded with `sample` and then `kill -9`, so an atexit dump
+would never fire for us either -- for a different reason and with the same
+result. WHEN A2 IS DONE, DUMP THE ICALL FEEDBACK PERIODICALLY OR FROM THE
+BRIDGE, never at exit. Had this not been read first, A2 would have produced an
+empty file and looked like "no indirect calls observed", which is the same
+false conclusion this contract has already drawn twice from a missing
+instrument.
+
+THREE HAZARDS TESTED AGAINST JSRF, ALL NEGATIVE. Worth recording so nobody
+re-tests them:
+
+  * ec9564a, switch tables discarded because the table read overran into the
+    next function. Our lifter still has the exact `all(func_start <= t <
+    func_end)` test upstream fixed, so the exposure is real in principle. It
+    does not bite here: 210 indexed-jump sites, 210 resolved switches, ZERO
+    discarded. (55 report "entries != targets", which is shared arms
+    deduplicating, not an overrun.)
+
+  * 31e120e, a rejected seed leaving a call target stubbed, whose stub returns
+    without the callee's `ret N` -- esp walks off, and an object pointer slides
+    out from under the vtable its constructor wrote. JSRF has 319 unresolved
+    stubs and they pop the return address but NOT arguments, so the hazard is
+    real in principle here too. Instrumented all 319: ZERO are reached at
+    runtime. Not our bug.
+
+  * 963b425, indirect calls silently dropped as not-code. Already tested in
+    section 13's commit: zero skips.
+
+So the last three "it is secretly corrupting something" explanations are gone,
+which leaves the reading from section 13 standing on its own: the chain is
+intact and simply is not driven.
