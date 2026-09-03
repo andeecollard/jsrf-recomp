@@ -55,6 +55,8 @@ extern void xbox_FramebufferWindowStart(void);
 #define NV097_SET_BEGIN_END               0x17FC
 #define NV097_ARRAY_ELEMENT16             0x1800
 #define NV097_INLINE_ARRAY                0x1818
+#define NV097_SET_VIEWPORT_OFFSET         0x0A20   /* +i*4, 4 floats */
+#define NV097_SET_VIEWPORT_SCALE          0x0AF0   /* +i*4, 4 floats */
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -81,6 +83,8 @@ static struct {
     uint32_t   idx_count;
     uint32_t   inline_words[NV_MAX_INLINE_WORDS];
     uint32_t   inline_count;            /* dwords pushed this batch, 0 = none */
+    float      vp_offset[4], vp_scale[4];
+    int        vp_seen;                 /* the title programmed a viewport */
     uint32_t   draws, verts, nonzero_draws;
     float      min_x, max_x, min_y, max_y;
     uint32_t color_offset, pitch, format;
@@ -745,11 +749,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 inline_layout();
                 if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
                     static int shown_inline;
-                    if (shown_inline++ < 3) {
+                    if (shown_inline++ < 40) {
                         uint32_t a, k;
                         fprintf(stderr, "  [GPU] inline batch: prim %u, %u dwords,"
                                 " stride %u dw\n", s_gpu.prim,
                                 s_gpu.inline_count, s_inline_stride);
+                        fprintf(stderr, "  [GPU]   viewport seen=%d"
+                                " scale %.3f %.3f %.3f %.3f"
+                                " offset %.3f %.3f %.3f %.3f\n",
+                                s_gpu.vp_seen,
+                                s_gpu.vp_scale[0], s_gpu.vp_scale[1],
+                                s_gpu.vp_scale[2], s_gpu.vp_scale[3],
+                                s_gpu.vp_offset[0], s_gpu.vp_offset[1],
+                                s_gpu.vp_offset[2], s_gpu.vp_offset[3]);
                         for (a = 0; a < NV_VERTEX_ATTRS; a++)
                             if (s_gpu.attr[a].size)
                                 fprintf(stderr, "  [GPU]   attr%-2u type %u size %u"
@@ -798,6 +810,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
+        } else if (method >= NV097_SET_VIEWPORT_OFFSET
+                && method < NV097_SET_VIEWPORT_OFFSET + 16) {
+            memcpy(&s_gpu.vp_offset[(method - NV097_SET_VIEWPORT_OFFSET) / 4],
+                   &param, sizeof(float));
+            s_gpu.vp_seen = 1;
+        } else if (method >= NV097_SET_VIEWPORT_SCALE
+                && method < NV097_SET_VIEWPORT_SCALE + 16) {
+            memcpy(&s_gpu.vp_scale[(method - NV097_SET_VIEWPORT_SCALE) / 4],
+                   &param, sizeof(float));
+            s_gpu.vp_seen = 1;
         } else {
             note_unhandled(method);
         }
