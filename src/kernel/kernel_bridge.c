@@ -2644,6 +2644,63 @@ static void bridge_RtlInitAnsiString(void)
 }
 
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
+/* Guest backtrace for one file open, selected by path.
+ *
+ * A title that declares a fatal error writes a file and keeps running, so none
+ * of the usual signals fire -- no fault, no exit -- and the ordinal histogram
+ * only says that NtCreateFile was called. RECOMP_FILE_BACKTRACE=<substring>
+ * scans the guest stack at the call and prints everything that looks like a
+ * code address, which turns "something wrote JSRF_FATAL.ERR" into a list of
+ * guest functions to disassemble.
+ *
+ * A scan, not a frame walk: recompiled frames do not share a host frame
+ * layout, so following a saved EBP would be wrong more often than right. Some
+ * hits are stale stack garbage. The ones that repeat across runs are real.
+ */
+static void bridge_file_backtrace(const char *path)
+{
+    const char *want = getenv("RECOMP_FILE_BACKTRACE");
+    uint32_t   sp, limit;
+    int        printed = 0;
+
+    if (!want || !*want || !path || !strstr(path, want) || !g_esp)
+        return;
+
+    fprintf(stderr, "  [FILE] backtrace for %s (esp=0x%08X ret=0x%08X)\n",
+            path, g_esp, BRIDGE_MEM32(g_esp - 4));
+    limit = g_esp + 0x400;
+    for (sp = g_esp; sp < limit && printed < 40; sp += 4) {
+        uint32_t v = BRIDGE_MEM32(sp);
+        /* The XBE's code sits below .data at 0x001EB760. */
+        if (v >= 0x00011000u && v < 0x001EB760u) {
+            fprintf(stderr, "      esp+0x%03X = 0x%08X\n", sp - g_esp, v);
+            printed++;
+        }
+    }
+
+    /* The object whose flags caused this.
+     *
+     * JSRF decides to write the marker in sub_0006EC80 with
+     * "test [esi+0x98], 0x400000", and esi is a this-pointer several frames
+     * up. Rather than guess at frame layout, scan the same window for a value
+     * that looks like a heap object and actually has the bit set. The flag
+     * word it prints says which other bits are up alongside it, which is what
+     * names the condition. */
+    for (sp = g_esp; sp < limit; sp += 4) {
+        uint32_t v = BRIDGE_MEM32(sp);
+        uint32_t flags;
+        if (v < 0x00200000u || v >= 0x04000000u || (v & 3))
+            continue;
+        flags = BRIDGE_MEM32(v + 0x98);
+        if (flags & 0x400000u)
+            fprintf(stderr,
+                    "      candidate this=0x%08X [+0x98]=0x%08X "
+                    "[+0x24]=0x%08X\n",
+                    v, flags, BRIDGE_MEM32(v + 0x24));
+    }
+    fflush(stderr);
+}
+
 static void bridge_NtCreateFile(void)
 {
     uint32_t handle_va   = STACK_ARG(0);  /* PHANDLE */
@@ -2655,6 +2712,8 @@ static void bridge_NtCreateFile(void)
     uint32_t share       = STACK_ARG(6);  /* ShareAccess */
     uint32_t disposition = STACK_ARG(7);  /* CreateDisposition */
     uint32_t options     = STACK_ARG(8);  /* CreateOptions */
+
+    bridge_file_backtrace(bridge_get_xbox_path(obj_attrs));
 
     /* The out-parameter addresses matter as much as the result: this bridge
      * hands them to a real Win32 call, so a bogus one has Windows itself write
