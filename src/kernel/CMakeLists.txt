@@ -63,3 +63,5 @@ else()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+target_link_libraries(xbox_kernel PUBLIC xbox_vsh)

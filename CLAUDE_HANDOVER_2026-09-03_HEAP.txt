@@ -1,0 +1,284 @@
+JSRF / xboxrecomp - CLAUDE HANDOVER
+3 September 2026 - after the stage-load allocation failure and the
+remaining unresolved return paths
+
+WORKSPACE
+/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+This continues CLAUDE_HANDOVER_2026-09-03_STARTUP.txt, which remains accurate
+about everything before this session. Host macOS arm64, branch main, HEAD
+511e9ea. Nothing was committed, pushed or merged. The working tree is dirty
+and carries this and prior sessions' uncommitted work; do not reset it.
+
+==========================================================================
+1. WHAT CHANGED, AND WHAT IT MEASURABLY BOUGHT
+==========================================================================
+
+The previous handover's goal A was the measured allocation failure on
+D:\Media\Stage\Stg10_01.dat. It is resolved, and resolving it exposed and
+then resolved a second class of failure.
+
+Baseline for every comparison below: render-investigation/codex-startup-seh-04.
+Latest run: render-investigation/claude-verify-09, 60 seconds, renderer ON.
+
+                            seh-04 (before)      claude-verify-09 (after)
+  allocation failures       38,840               0
+  first guest fault         none in 20s          none in 60s
+  'epilogue never ran'      0 reported           0 reported
+  unresolved stubs executed not instrumented     0
+  distinct asset paths      ~30                  290
+  emulated HDD             27 files / 15 MB      259 files / 117 MB
+  root pointer              0x01053A70 to t30k   0x01053A70 to t60k
+
+The title now loads Stg00/Stg10/Stg12 stage data, stage objects, players,
+enemies, missions, effects, display, marks and sounds, and is writing its
+first-run cache: JSRF_CACHE_COMPLETE00.CMP / 01.CMP, Cache00-08.tbl,
+DmCache00-05.tbl and character archives (Beat, Corn, Combo, char01..char35).
+At the end of the run it is cycling NtReadFile / NtAllocateVirtualMemory /
+NtFreeVirtualMemory, which is cache construction, not a stall.
+
+It still does NOT display a recognisable screen and is NOT playable. All
+seven dumped frames are byte-identical black, SHA-256
+9dc5cdcf2b4abd98a266b99496fa0062bec2c56e30b979a7cb5d033275eed1b3, the same
+value as the previous session. No graphics behaviour was changed here.
+
+==========================================================================
+2. THE ALLOCATION FAILURE - WHAT IT ACTUALLY WAS
+==========================================================================
+
+It was not fragmentation, not retained capacity, and not a title asking for
+more RAM than the console has. New instrumentation (section 4) reported, at
+the first failure:
+
+  live 997 blocks / 47,307,848 bytes; free 0 blocks / 0 bytes
+
+Nothing had ever been returned to the guest heap, because every kernel free
+the title calls was routed somewhere that could not release a guest block:
+
+  ExFreePool (ordinal 17) had NO bridge at all. The dispatch table entry was
+    commented out, deliberately, because the existing wrapper called the host
+    HeapFree on a translated guest pointer -- but the matching allocations
+    (bridge_ExAllocatePool / WithTag) come from xbox_HeapAlloc and hand back
+    guest VAs, so the correct free is xbox_HeapFree. JSRF calls it.
+
+  NtFreeVirtualMemory (199) went to xbox_NtFreeVirtualMemory, which calls the
+    host VirtualFree on a guest address. MEM_RELEASE was silently dropped (the
+    POSIX shim returns TRUE for size 0), and MEM_DECOMMIT would have called
+    mprotect(PROT_NONE) on live guest RAM. 12,072 calls in the latest run.
+
+  MmFreeContiguousMemory (171) did reach xbox_HeapFree, but the title frees
+    through the physical-memory mirror (0x80000000 + address) and the table
+    was matched on the raw value, so no block ever matched. All eight frees
+    logged in the baseline are 0x81Exxxxx / 0x81Fxxxxx addresses.
+
+Repairing those three exposed a second, separate failure: 13.9 MB free, a
+2.8 MB largest free block, and a 349,520-byte page-aligned request failing
+anyway. xbox_HeapAlloc split a reused block at the end of the request, so the
+remainder started at an arbitrary address -- and every caller that reaches
+this heap asks for at least 4 KB alignment, so those remainders were
+unallocatable. Splitting on a page boundary fixed it.
+
+Two further allocator defects were repaired at the same time, both of which
+would have surfaced later rather than immediately:
+
+  Reuse handed over the whole free block without splitting, so a 16-byte
+  request could retire the rest of a 4 MB block permanently.
+
+  Coalescing tested the adjacent table index. Merging leaves a size-0 hole
+  behind, and a hole between two adjacent free blocks made them permanently
+  un-mergeable. It now skips holes.
+
+Files: src/kernel/kernel_bridge.c, src/kernel/xbox_memory_layout.{c,h}.
+
+==========================================================================
+3. THE SECOND BLOCKER - UNRESOLVED RETURN PATHS, GENERALISED
+==========================================================================
+
+With memory available the title reached Stg10_05 and then took SIGSEGV in
+sub_00177FE0 with a garbage object pointer, preceded by four
+'epilogue never ran' ABI reports.
+
+That was NOT a use-after-free introduced by the heap repair. Verified: a run
+with RECOMP_HEAP_POISON=0xAB, which fills every freed block, produced the
+identical fault with the identical bad pointer (0x8508C483, not the poison).
+It was new code territory, reached for the first time.
+
+The cause is the same class the previous session repaired for shared
+epilogues. sub_0002D240's switch dispatches through 0x0002D438, and its
+default case 0x0002D3B3 was still a placeholder stub whose whole body is
+`g_esp += 4`. That stub consumes the return address and nothing else, so the
+four registers sub_0002D240 pushed stayed on the guest stack.
+
+recover_shared_epilogues.py only repairs stubs that are pure return
+sequences. 220 placeholder stubs remained. The new
+diagnostics/jsrf_first_fault/recover_midfunction_entries.py repairs the rest
+of the same failure: an address at an instruction boundary inside an already
+detected function is real code, and translating it from there through the end
+of its owner produces the body it should have had. An address in the gap
+between two detected functions is a whole function discovery missed, and is
+translated through the start of the next detected function; anything past its
+return is unreachable and costs only compiled bytes. A body that jumps
+backwards to another undetected entry pulls that entry in too, with a
+declaration added to recomp_funcs.h.
+
+  208 of 220 recovered (149 in the first pass, 59 after gap and
+  backward-jump support was added), plus 13 entries they reference.
+  Manifest: build-macos/jsrf-first-fault/midfunction_entries.json
+  Backups: recomp_stubs_unresolved.c.before-midfunction[.N],
+           recomp_funcs.h.before-midfunction
+
+  12 were not recovered and are named by their skip reason when the script
+  runs: 5 not on an instruction boundary in their owner, 4 incomplete
+  translation, 3 past the last detected function. None of them executed in
+  the 60-second run. They are the honest remaining list, not a clean bill.
+
+The 13 pulled-in entries have declarations and bodies but no dispatch entry,
+because nothing calls them indirectly today. If a later indirect call lands on
+one, RECOMP_ICALL will report it unresolved rather than silently misbehaving.
+
+==========================================================================
+4. NEW DIAGNOSTICS - USE THESE BEFORE GUESSING
+==========================================================================
+
+xbox_HeapReport(const char *why)  [src/kernel/xbox_memory_layout.c]
+  Prints arena bounds, bump high-water, unreached bytes, live and free block
+  counts and totals, the largest free block, bytes retained beyond what
+  callers requested, and the top owners by live bytes -- each named by kernel
+  ordinal and guest return address -- plus the 16 largest live blocks. Called
+  automatically on the first allocation failure. This is what turned "the
+  heap is full" into "nothing is ever freed", and it names the guest call
+  sites: 0x00145A48 (the title's allocator), 0x0014903F, 0x0018E6E9,
+  0x00199789 were the four largest.
+
+xbox_HeapSetOwner(ordinal, guest_ra)
+  Called by kernel_thunk_dispatch around each bridge so blocks carry that
+  attribution. Zero means the runtime itself allocated, not a guest call.
+
+RECOMP_HEAP_TRACE=<n>    narrate the first n frees and reuses (default 64).
+RECOMP_HEAP_POISON=<byte> fill freed blocks. Use this before blaming a heap
+  repair for a fault: if the bad pointer is not the poison, it did not come
+  from a freed block.
+
+[STUB] reports  [tools/recomp/translator.py, and
+                 diagnostics/jsrf_first_fault/announce_unresolved_stubs.py]
+  Every unresolved stub now announces itself once when it runs. A stub that
+  runs is a return path this build got wrong, and it used to run in silence.
+  This is what identified 0x000250C9 and 0x001185B0 after the first recovery
+  pass. The generator emits this shape; the script applies it to a generated
+  checkout that must not be regenerated, and --remove reverses it.
+
+==========================================================================
+5. TESTS
+==========================================================================
+
+New: diagnostics/jsrf_first_fault/heap_alloc_test.c, registered as ctest
+jsrf_heap_alloc. It drives the real xbox_HeapAlloc/xbox_HeapFree against a
+live memory layout built from a minimal synthetic XBE, and checks each
+behaviour the two repairs depend on: a freed block comes back; a free through
+the physical mirror releases the block; a small request splits a large block
+and the remainder is page-aligned and reusable; an unaligned-size request
+still leaves an aligned remainder; four adjacent blocks freed in an order
+that produces a dead table entry still coalesce into one; block sizes read
+back correctly including through the mirror; a stray free does not corrupt
+the table.
+
+All passing on this checkout:
+  ctest --test-dir build-macos/jsrf-first-fault/build      6/6
+  /usr/bin/python3 -m unittest tools.recomp.test_shared_epilogue   3/3
+  /usr/bin/python3 tools/recomp/test_call_retaddr.py       14 checks
+  PYTHONPATH=$PWD /usr/bin/python3 tools/recomp/test_manual_call_dispatch.py
+
+Not run here: the full upstream suite, any Windows/D3D11 build, and a full
+JSRF regeneration.
+
+==========================================================================
+6. REPRODUCE
+==========================================================================
+
+Build:
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+
+Run (choose a NEW name each time; the executable creates the empty HDD):
+  RECOMP_STARTUP_TRACE=1 RECOMP_PB_EXEC=1 \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME-hdd" \
+  RECOMP_FB_DUMP="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME/frame" \
+  RECOMP_FB_DUMP_DRAW=1 \
+  /usr/bin/python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 60
+
+Do not reuse a completed run's HDD for a claimed fresh-HDD comparison. The
+cache the title now builds is 117 MB per run; delete old *-hdd directories.
+
+Applying the generated-code repairs to a restored pre-repair checkout, in
+order:
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_shared_epilogues.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_startup_entries.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_midfunction_entries.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/announce_unresolved_stubs.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/instrument_startup.py
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+recover_midfunction_entries.py takes --dry-run and prints why each remaining
+stub was not recovered.
+
+Checkpoint of this state (generated tree, manifests, diagnostics, the
+modified kernel and tools sources, and a tracked diff):
+  build-macos/jsrf-first-fault/checkpoints/claude-startup-heap-2026-09-03.tar.gz
+  build-macos/jsrf-first-fault/checkpoints/claude-startup-heap-2026-09-03.patch
+
+==========================================================================
+7. EVIDENCE TRAIL - PRESERVE THESE RUNS
+==========================================================================
+
+Under build-macos/jsrf-first-fault/render-investigation/, each with its own
+adjacent <name>-hdd:
+
+claude-heapattr-01   20s. Instrumentation only, no behaviour change. The run
+                     that established live 997 / free 0. Still fails on
+                     Stg10_01.dat exactly as the baseline did.
+claude-heapfree-02   20s. Frees routed to the guest heap. Stg10_01 through
+                     Stg10_05 load; SIGSEGV afterwards.
+claude-heaptrace-03  20s. Same, with free/reuse narration. Shows the split
+                     remainder problem: 13.9 MB free, 349 KB request fails.
+claude-heapsplit-04  20s. Page-aligned split remainders. Zero allocation
+                     failures. Same SIGSEGV -- proving it was never the OOM.
+claude-poison-05     20s. RECOMP_HEAP_POISON=0xAB. Identical fault and
+                     identical bad pointer: not a use-after-free.
+claude-midfunc-06    20s. First 149 mid-function entries recovered. Reaches
+                     JSRF_TEXSx0.JTX; two 'epilogue never ran' remain.
+claude-stubs-07      20s. Stub announcements identify exactly which two
+                     stubs run: 0x001185B0 and 0x000250C9.
+claude-recover-08    20s. All 208 recovered. No fault, no OOM, no ESP damage.
+claude-verify-09     60s. Current reference run. Counters in section 1.
+
+==========================================================================
+8. WHAT TO DO NEXT
+==========================================================================
+
+A. Establish what the title is waiting for once the cache is built.
+   Asset opens plateau at 290 distinct paths and the run then cycles reads
+   and allocations. That is consistent with cache construction still in
+   progress at 60 seconds, and equally consistent with a loop that never
+   completes. Distinguish those first: run longer, and watch whether
+   JSRF_CACHE_COMPLETE01.CMP is finished and whether the file set stops
+   growing. A completed cache is the precondition for anything after it.
+
+B. The graphics rejection from the previous handover is unchanged and is now
+   the clearest blocker to a visible screen. [VSH] still reports roughly two
+   rejected batches for every executed one (112,568 rejected against 56,294
+   executed in the 60-second run), and every dumped frame is still the same
+   black image. Capture the first distinct rejection with its inputs,
+   program, constants, output masks and reason before implementing more
+   graphics. Nothing here established that a shader opcode is missing.
+
+C. Input remains untouched and unproven, as does the upstream framebuffer
+   image guard noted in the previous handover's section 7.
+
+D. Three kernel exports JSRF calls still have no bridge and return 0:
+   HalReadWritePCISpace (46, 2 calls), KeSetDisableBoostThread (144, 5) and
+   KeSynchronizeExecution (153, 7,360). The last is the interesting one: it
+   is supposed to run a caller-supplied routine with an interrupt's lock
+   held, and it is called constantly. AvGetSavedDataAddress (1) also has no
+   bridge. None of these has been shown to be a blocker; they are named here
+   because they are silent today.
+
+Sound remains intentionally bypassed. There is still no reliable date or
+completion percentage for playable JSRF.

@@ -1,0 +1,415 @@
+JSRF / xboxrecomp - CODEX TO CLAUDE HANDOVER
+3 September 2026 - latest state after startup return-path repairs
+
+WORKSPACE
+/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+This is the latest handover. Earlier handovers and progress documents remain
+in place. The user asked for this .txt so Claude can continue. No external
+message, new Claude session, commit, push, merge or model handoff was performed.
+
+All relative paths and commands below are relative to the workspace above.
+Host: macOS arm64. Branch: main. HEAD:
+511e9ea82381f5a046066eddcbc2253eb1c7d099
+The working tree is dirty and contains substantial UNCOMMITTED work from this
+and prior sessions. Do not reset it to HEAD to establish a baseline.
+
+==========================================================================
+1. READ THIS FIRST: THE OLD STARTUP BLOCKER HAS BEEN IDENTIFIED AND REPAIRED
+==========================================================================
+
+The earlier claim that the game had a healthy main loop but loaded only
+jetfont.dat and se_sys.dat was incomplete. The loop continued executing with
+a corrupted root-object pointer. It was not evidence that startup awaited
+input. We reproduced this corruption with the CPU renderer DISABLED.
+
+The first cause was an untranslated shared epilogue at guest 0x0002C11E.
+Function discovery had split a switch into separate C functions. Branches to
+the common epilogue called a placeholder which only did g_esp += 4. The real
+instructions are:
+
+  0002C11E  5E       pop esi
+  0002C11F  33C0     xor eax,eax
+  0002C121  5D       pop ebp
+  0002C122  C3       ret
+
+Skipping those pops left saved registers on the guest stack and the caller
+then restored registers from the wrong slots. The error propagated through
+sub_00025310 -> sub_00011070 -> sub_000123E0 -> sub_00013A80. Around tick 7,
+the main loop changed its root pointer from 0x01053A70 to 0x00002EBE in the
+renderer-disabled baseline (0x00002E9E in an earlier renderer-enabled run).
+
+Fixing that one epilogue reached a second broken shared return in the cache
+scheduler, then additional omitted switch entries and an exception epilogue.
+These are now handled as described below. No artificial loader success,
+forced state transition, fake button press or fault suppression was added.
+
+LATEST RESULT: the game proceeds through logo/title/demo requests, mission,
+miscellaneous assets, objects, effects, people and stage data. The latest
+20-second fresh-HDD run keeps root 0x01053A70 through the last logged tick
+30,000. It has ZERO 'epilogue never ran' ESP reports, ZERO unresolved ICALL
+reports and no FIRST GUEST FAULT. It still does NOT display a recognisable
+screen and is NOT playable.
+
+CURRENT MEASURED LOADING BLOCKER: allocation failure while loading
+D:\Media\Stage\Stg10_01.dat. The first failure is stderr.log line 1533 in
+codex-startup-seh-04:
+
+  xbox_HeapAlloc: out of memory
+    requested 2222592, used 49371072/50855936
+
+The same stage-file request then repeats. 'used' here is the bump high-water
+mark minus heap base, NOT a measurement of all live allocated bytes. Do not
+conclude there is a proven leak merely from that number. The allocator DOES
+reuse free blocks and coalesce neighbours; a stale comment says otherwise.
+Why the required allocation cannot be satisfied remains uninvestigated.
+
+==========================================================================
+2. CURRENT PRODUCT READINESS AND RECOMMENDED NEXT GOALS
+==========================================================================
+
+Already established:
+  - The executable launches and executes substantial real game startup code.
+  - The captured full-screen vertex shader is decoded and executed correctly.
+  - Its specific RGB565 textured framebuffer copy is verified against replay
+    and independent expected pixels. Real captured source pixels were black.
+  - The two-asset startup stall is explained and repaired.
+  - Startup now reaches stage loading with its main root pointer intact.
+
+Next goals, in useful order:
+
+  A. Explain and resolve the measured stage-load allocation failure.
+     Instrument allocation/free sizes, alignment, guest call sites, total
+     live/free bytes, largest usable free block and retained block capacity.
+     Distinguish allocation leaks, internal fragmentation, missing releases,
+     alignment/metadata problems and genuinely excessive reserved memory.
+     Completion: Stg10_01.dat loads and the next expected stage transition
+     occurs with a stable root pointer in an isolated-HDD run.
+
+  B. Capture and explain the NEW rejected graphics batches.
+     The renderer now reaches logo/title-related work which fails
+     prepare_vertices(). The aggregate log does not identify whether the
+     failure is vertex fetch, shader execution, missing output components or
+     non-finite output. Capture the first distinct rejection with its inputs,
+     program, constants, output masks and failure reason before implementing
+     more graphics. Do not assume a missing shader opcode has been proved.
+     Completion: identifiable game-produced content, not a synthetic pattern.
+
+  C. Deliver real host input to the guest, then reach controllable gameplay.
+     The earlier OHCI/input work remains open. Loading a title asset does not
+     demonstrate a menu, and loading a mission does not demonstrate gameplay.
+
+Sound remains intentionally bypassed/silent in the existing bring-up path.
+There is no reliable date or completion percentage for playable JSRF.
+
+==========================================================================
+3. CODE CHANGES IN THIS STARTUP SESSION
+==========================================================================
+
+tools/recomp/shared_epilogue.py  [NEW]
+  recover_shared_epilogue() recognises instruction-aligned return sequences
+  inside already detected functions. It is bounded to 16 instructions / 64
+  bytes and requires a stack-restoring operation followed by a near return.
+  Handles register pops, stack cleanup, simple return values/state stores,
+  frame teardown, bounded stack loads and the observed FS:[0] restoration.
+  Rejects branches, calls, unsupported operations, missing returns and bad
+  instruction boundaries. Uses the normal lifter, with a separate instance,
+  and bridges EBP through g_seh_ebp. This is targeted recovery, not a complete
+  fix for arbitrary overlapping functions or omitted control-flow blocks.
+
+tools/recomp/translator.py  [MODIFIED]
+  Before creating unresolved stubs, attempts that recovery. Recovered bodies
+  join normal translations, declarations and the sorted dispatch table.
+  Reports recovered_epilogues in the returned statistics.
+
+tools/recomp/test_shared_epilogue.py  [NEW]
+  Three unittest tests, including a compiled C execution harness using the
+  real runtime header. Checks the actual JSRF loader/cache/SEH byte sequences,
+  caller stack balance, saved registers, state store, local cleanup, ret N,
+  frame teardown, exception-chain restoration, rejection boundaries and
+  generation of body/header/dispatch together.
+
+diagnostics/jsrf_first_fault/recover_shared_epilogues.py  [NEW]
+  Applies the same recovery to exact placeholder bodies in an EXISTING
+  generated checkout, preserving unrelated timing patches and observations.
+  Recovered 101 epilogues initially, then 10 more after adding the observed
+  SEH form: 111 total. Manifest:
+    build-macos/jsrf-first-fault/shared_epilogues.json
+  Previous generated files are retained beside the patched file under
+  .before-shared-epilogues suffixes. Re-running without new recoverable stubs
+  is a no-op. Subsequent recovery passes preserve numbered backups.
+
+diagnostics/jsrf_first_fault/startup_entries.json  [NEW]
+diagnostics/jsrf_first_fault/recover_startup_entries.py  [NEW]
+diagnostics/jsrf_first_fault/regenerate.sh  [MODIFIED]
+  Once returns worked, sub_000304F0 reached an unresolved indirect switch
+  target 0x00030592. The XBE table at 0x00030618 contains exactly:
+    0003050F, 00030592, 000305B9, 00030601
+  Only the first had a dispatch entry. The incremental script verifies the
+  original table slots, owner bounds and instruction boundaries, then lifts
+  the missing three entry points through existing end 0x00030618. It appends
+  bodies to recomp_stubs_unresolved.c and adds declarations/sorted dispatch
+  entries. Existing functions remain unchanged. Backups use
+  .before-startup-entries suffixes. The manifest also feeds --seed-functions
+  in regenerate.sh, so future discovery knows these entries.
+  The incremental script is specific to these verified entries, not an
+  unrestricted seed-every-pointer tool. Full regeneration was NOT run here.
+
+diagnostics/jsrf_first_fault/startup_probe.c  [NEW]
+diagnostics/jsrf_first_fault/instrument_startup.py  [NEW]
+diagnostics/jsrf_first_fault/guest_trace.h  [MODIFIED]
+diagnostics/jsrf_first_fault/CMakeLists.txt  [MODIFIED]
+  Read-only probes, enabled by RECOMP_STARTUP_TRACE, at:
+    0x00013A80: root object and relevant state fields
+    0x00011083: update-list objects and virtual update targets
+    0x00013220: render-list objects and virtual render targets
+    0x00025DD0: asset path and actual guest return address
+  instrument_startup.py installs/removes four calls in recomp_0000.c.
+  --remove reverses observations without regenerating game code.
+  Root observations print first ticks, changed state and every 10,000 ticks.
+  Asset path observations STOP AFTER 32 CALLS. Object states are deduplicated
+  and capped at 256. Their absence later is not proof no more work happened.
+
+  JSRF_STARTUP_ABI_CHECK is a new CMake option, default OFF, currently ON in
+  this build. It enables upstream RECOMP_ABI_CHECK on generated chunk 0000
+  plus the logger in xbox_kernel. It does not check every generated chunk.
+
+No production allocator, controller or additional renderer behaviour was
+changed during this startup session. Earlier graphics changes remain present.
+
+==========================================================================
+4. VALIDATION TRAIL - PRESERVE THE FAILED RUNS AS EVIDENCE
+==========================================================================
+
+Every run below has stdout.log and stderr.log under:
+  build-macos/jsrf-first-fault/render-investigation/<name>/
+Its independent emulated HDD is the adjacent <name>-hdd directory.
+
+codex-startup-state-01             12s, renderer ON
+  Root pointer becomes invalid after initial assets. Initial read-only probe.
+
+codex-startup-abi-no-render-01      8s, renderer OFF, ABI ON
+  Same corruption. Five ESP error reports. First boundary sub_0002C040.
+  This rules out our CPU renderer as the cause of that initial corruption.
+
+codex-startup-return-fix-01        exited with SIGSEGV before its 15s limit
+  Only 0x2C11E repaired. Passed former stall; next failure sub_00025040.
+  Shared epilogues 0x252B2/0x252B5/0x252B7 were still placeholders.
+
+codex-startup-shared-returns-02    20s, renderer OFF
+  101 recovered epilogues. Reaches logo/title/demo and mission .bin request.
+  Unresolved 0x30592 then causes a 260-byte stack deficit.
+
+codex-startup-entries-03           25s, renderer ON
+  Missing mission-switch entries registered. Reaches mssn0090.dat.
+  0x30AF6 is still an unhandled SEH epilogue. 292-byte stack deficit follows.
+
+codex-startup-seh-04               20s, renderer ON - CURRENT EXECUTABLE
+  All 111 epilogues + three mission entries. Main root remains 0x01053A70.
+  No unresolved ICALL, no 'epilogue never ran' ESP report, no first fault.
+  25 register-only ABI reports remain, mostly at split switch-case boundaries.
+  RECOMP_ITAIL also invokes RECOMP_ABI_CALL; a case fragment can legitimately
+  restore registers saved before its own entry. Therefore a fragment's ABI
+  report alone is not proof of corruption. Check the enclosing real function
+  and subsequent root/stack state. Do not disable reports just to look clean.
+
+  Requests include:
+    Progress.dat; jetfont.dat; se_sys.dat;
+    LogoE.dat; TitleE.dat; TitleE.bin; playdemo00.dat;
+    mssn0090.bin/.dat; Misc.bin/.dat; StgObj11.bin/.dat;
+    ptcl_ply.dat/.bin; ptcl01.dat/.bin; se_stg01.dat;
+    People01.dat/.bin; se_pple.dat; CarObj01.bin/.dat;
+    Stg10_.bin; Stg10_t.bin/.dat; Stg10_00.dat; Stg10_01.dat (retries).
+
+  HDD contains 27 files, 15,880,770 bytes total, including 22 nonempty cached
+  game assets and save metadata/image files. Title resources opened through
+  A: need not appear in Cache. A ZERO-BYTE Cache/Media/Cache/JSRF_FATAL.ERR
+  exists; do not describe this run as having no fatal-named file.
+
+  First allocation failure is on the Stg10_01.dat request; stderr includes
+  a live-block-size histogram immediately after the first failure. It has
+  repeated larger blocks, but allocation attribution has not been collected.
+
+  Last periodic graphics report:
+    [TEXTURE] prepared=38472 rejected=0
+    [VSH] executed batches=38472 rejected=76924 mode=2 start=0 slots=12
+  These are report-time counters, not frame rates or final exact totals.
+  The successful copy batches do not establish successful scene rendering.
+
+  Seven BMPs, frame000.bmp through frame006.bmp, have entirely zero RGB pixel
+  payloads. All have SHA-256:
+    9dc5cdcf2b4abd98a266b99496fa0062bec2c56e30b979a7cb5d033275eed1b3
+  No recognisable output was produced. Most previous screenshots/captures
+  document only the earlier, already verified, black framebuffer copy.
+
+All diagnostic children launched by this session have stopped. The latest
+run was terminated by its 20-second test limit, not a successful game exit.
+
+==========================================================================
+5. BUILD / TEST / REPRODUCE FROM THE CURRENT CHECKOUT
+==========================================================================
+
+Build configuration currently Debug, JSRF_STARTUP_ABI_CHECK=ON.
+/usr/bin/python3 has Capstone 5.0.7 available. It does not have pytest on its
+default path; the new regression uses unittest and needs no pytest package.
+
+Build:
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+
+Verified tests on the final SEH-recovery source/executable:
+  /usr/bin/python3 -m unittest tools.recomp.test_shared_epilogue
+    3/3 PASS, including compiled C execution and split-generation regression.
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+    5/5 PASS: AV encoder, vertex shader, method-to-framebuffer integration,
+    texture copy and pushbuffer stream boundaries.
+
+Also passed during this session:
+  /usr/bin/python3 tools/recomp/test_call_retaddr.py
+    14 checks.
+  Seven test_* functions in tools/recomp/test_manual_call_dispatch.py.
+
+A full upstream test suite, Windows/D3D11 build, full JSRF regeneration and
+long-duration run after the startup repairs were NOT performed. Earlier
+graphics sanitizer/differential checks are documented separately.
+
+Reproduce current run, choosing a NEW name each time:
+  RECOMP_STARTUP_TRACE=1 RECOMP_PB_EXEC=1 \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/claude-next-01-hdd" \
+  RECOMP_FB_DUMP="$PWD/build-macos/jsrf-first-fault/render-investigation/claude-next-01/frame" \
+  RECOMP_FB_DUMP_DRAW=1 \
+  python3 diagnostics/jsrf_first_fault/run_bounded.py claude-next-01 --seconds 20
+
+run_bounded.py creates the unique log directory and stops only its own child.
+The executable creates the selected empty HDD. Do not reuse a completed run's
+HDD for a claimed fresh-HDD comparison. Omitting RECOMP_PB_EXEC disables CPU
+rendering and is useful for isolating guest loading/stack failures.
+
+The latest log is about 28 MB because the allocation failure repeats. Short
+runs already reproduce it. There is no need to produce an enormous retry log.
+
+The probe/recovery scripts are ALREADY APPLIED. If inspecting a restored
+pre-startup generated checkout, the supported incremental sequence is:
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_shared_epilogues.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/recover_startup_entries.py
+  /usr/bin/python3 diagnostics/jsrf_first_fault/instrument_startup.py
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+
+==========================================================================
+6. GENERATED CODE AND CHECKPOINTS - EASY TO LOSE WITHOUT THIS CONTEXT
+==========================================================================
+
+build-macos/jsrf-first-fault/gen is ignored by Git and HAND-PATCHED. Earlier
+timing fixes at three rdtsc sites must be preserved. Do not regenerate the
+whole project merely to reproduce this result: that can discard timing fixes
+and probes and change many function boundaries at once.
+
+This session also changed these ignored generated files:
+  recomp_0000.c: four opt-in probe calls.
+  recomp_stubs_unresolved.c: 111 actual shared-return bodies, plus three
+    translated mission-switch entry bodies.
+  recomp_funcs.h: declarations for the three new entries.
+  recomp_dispatch.c: their sorted dispatch entries.
+
+Fresh full generation uses the recompiler's shared-epilogue recovery and the
+new startup seed manifest. Its result has not been end-to-end checked here.
+Unlike the full generator, the incremental epilogue script repairs existing
+direct-call stub bodies without adding all 111 epilogues to dispatch. The
+three runtime-observed mission entries ARE registered in dispatch. This
+distinction matters if a later indirect call lands on another shared tail.
+
+Existing intermediate backups are beside the generated files. A new combined
+handover checkpoint is saved under:
+  build-macos/jsrf-first-fault/checkpoints/codex-startup-handover-2026-09-03.tar.gz
+It contains the generated directory, recovery manifest and the current
+modified/untracked source and documentation files, plus a tracked diff. It
+does not contain the game disc assets, entire build tree or runtime logs.
+
+Older pre-texture checkpoint:
+  build-macos/jsrf-first-fault/checkpoints/before-textures-2026-09-03.tar.gz
+The new checkpoint is the relevant one for resuming this exact startup state.
+
+==========================================================================
+7. WHAT THE USER'S UPSTREAM LINK REVEALED
+==========================================================================
+
+User asked about https://github.com/sp00nznet/xboxrecomp.
+I compared fresh upstream Git objects, without merging or updating this
+checkout's remotes/branches. Temporary bare comparison repository:
+  /tmp/jsrf-upstream-current-20260903
+
+Fresh upstream heads observed during this session:
+  main: 0655e8e52bb341bed35ae7290672b69870f9ae97
+  work/v0.7.0-non-local: 208fc9d4a71acb1f85662dd19c47bd83c76c2fc1
+Our cached upstream/main was older; the GitHub README web cache also lagged.
+
+Most relevant new upstream commit:
+  https://github.com/sp00nznet/xboxrecomp/commit/0655e8e52bb341bed35ae7290672b69870f9ae97
+  Guards CPU framebuffer writes against overwriting the loaded XBE image.
+  Root upstream issue: surface colour offsets were treated as guest addresses
+  while ignoring DMA bases. A dashboard clear overwrote code/data/globals.
+
+That commit is NOT merged or ported here. Our new texture-copy path already
+resolves its observed DMA objects and mapped bounds, but the older flat
+triangle/clear paths still use raw offsets and lack this image guard. This
+is a useful follow-up before trusting newly reached untextured rendering.
+It is not the cause of the initial JSRF root corruption: renderer-OFF repro
+and the exact missing epilogue establish a different cause.
+
+Other upstream developments: PR 17 adds D3D8 texture resource translation;
+PR 18 corrects ReleaseMutex error handling. Neither was merged, and neither
+has been established as the current JSRF blocker. JSRF presently drives its
+statically linked graphics code into the NV2A path, rather than calling our
+D3D8 host wrappers. Upstream's ABI diagnostic, already present in our base,
+was immediately useful and is what exposed the silent register/stack damage.
+
+The inspected upstream input module still has no callers of xbox_InputInit /
+xbox_InputGetState outside that module and its documentation. There is no
+verified drop-in controller fix from this audit.
+
+==========================================================================
+8. PRIOR GRAPHICS WORK TO RETAIN / READ NEXT
+==========================================================================
+
+CODEX_PROGRESS_2026-09-03_VSH.md
+  Portable NV2A shader decode/execute, captured 12-slot shader, independent
+  reference checks on 128 inputs. Correct oPos: (0,0), (2560,0), (0,1920).
+  Do NOT reintroduce the old divide-by-four adjustment.
+
+CODEX_PROGRESS_2026-09-03_TEXTURE.md
+  Verified 640x480 RGB565 texture-copy path, DMA resolution, filtering,
+  projective coordinates, texture RGB / diffuse alpha, independent patterned
+  pixel checks and byte-for-byte live/offline capture replay. Source physical
+  0x01160000 was all black. Target initially 0x0128E000, later 0x011F8000.
+  This implements the measured copy state, not arbitrary NV2A rendering.
+
+  Also documents the pushbuffer reader repair: consume published DMA_PUT at
+  0xFD800040, not unfinished writer 0x0019B200; follow validated ring jumps,
+  retain partial packets, snapshot submissions, acknowledge consumed work.
+
+  Its 'only two files load' and 'startup gate not established' conclusions
+  describe the PRE-STARTUP-REPAIR checkpoint. This handover supersedes them.
+
+JSRF_GOALS_2026-09-03.md
+  Earlier roadmap. A short current-state note points to this handover; the
+  historical sections remain for context.
+
+CODEX_HANDOVER_2026-09-03.txt / CODEX_HANDOVER.txt / CLAUDE_HANDOVER.txt
+  Older background, including USB/input gaps, the intentionally bypassed APU
+  routine and prior mistaken hypotheses. Do not treat their 'healthy loop'
+  or 'no later asset requests' claims as descriptions of the current build.
+
+Useful exact code locations for the immediate next investigation:
+  src/kernel/xbox_memory_layout.c: xbox_HeapAlloc / xbox_HeapFree
+    Reuses a whole free block without splitting; free metadata retains that
+    block's capacity. Coalescing checks neighbouring table entries. Both are
+    investigation leads, not established causes of this allocation failure.
+  src/kernel/xbox_memory_layout.h: XBOX_HEAP_BASE / XBOX_HEAP_TOP / RAM layout
+  Guest return 0x000366BF: repeating Stg10_01.dat asset request
+  Guest 0x00025DD0: asset-open helper
+  src/kernel/nv2a_pb_exec.c: prepare_vertices / raster_batch
+  Original instructions: build-macos/jsrf-first-fault/disasm/asm/text.asm
+  Latest evidence: render-investigation/codex-startup-seh-04 (full path above)
+
+Resume from measured allocation failure and graphics rejection, preserving
+the now-demonstrated startup progression. No new input-dependent startup gate
+has been established.

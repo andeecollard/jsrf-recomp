@@ -884,14 +884,42 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
+/* The mirror image of bridge_NtAllocateVirtualMemory, and it has to be.
+ *
+ * The reserve came from xbox_HeapAlloc, so the release belongs to
+ * xbox_HeapFree. Handing the pair to xbox_NtFreeVirtualMemory instead put the
+ * host's VirtualFree on a guest address: a MEM_RELEASE was silently dropped
+ * (the POSIX shim returns TRUE for size 0, so nothing was ever reclaimed and
+ * the guest heap only grew), and a MEM_DECOMMIT called mprotect(PROT_NONE) on
+ * live guest RAM, which would fault the next time the title touched memory it
+ * still believed it owned.
+ *
+ * MEM_DECOMMIT is a no-op on this side for the same reason MEM_COMMIT is on
+ * the allocate side: the heap commits everything it hands out, and the
+ * reservation stays valid until it is released. */
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
-    uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+    uint32_t base_va = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    if (!base_ptr || !base_va) {
+        g_eax = 0xC000000Du;                /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    if (free_type & 0x8000u) {              /* MEM_RELEASE */
+        xbox_HeapFree(base_va);
+        BRIDGE_MEM32(base_ptr) = 0;
+    }
+
+    if (KERNEL_LOG_ON()) {
+        fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X type=0x%X\n",
+                base_va, free_type);
+        fflush(stderr);
+    }
+
+    g_eax = 0;                              /* STATUS_SUCCESS */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
@@ -3798,10 +3826,17 @@ static void bridge_AvSendTVEncoderOption(void)
 /* ── ExFreePool (ordinal 17, 1 arg)
  * Was resolving to a DATA address before the kernel_data_va_for_ordinal fix,
  * so the title was calling into kernel data. Even after that it was an
- * unbridged no-op, which leaks every pool block the title ever frees. */
+ * unbridged no-op, which leaks every pool block the title ever frees.
+ *
+ * The allocation side matters here: bridge_ExAllocatePool and
+ * bridge_ExAllocatePoolWithTag both take the block from xbox_HeapAlloc and
+ * hand back a guest VA. So the free has to go back to the same allocator.
+ * Routing it to xbox_ExFreePool -- which calls the host HeapFree on the
+ * translated pointer -- hands the host allocator an address it never issued,
+ * inside the guest mapping. */
 static void bridge_ExFreePool(void)
 {
-    xbox_ExFreePool(XBOX_TO_NATIVE(STACK_ARG(0)));
+    xbox_HeapFree(STACK_ARG(0));
     g_eax = 0;
 }
 
@@ -4506,6 +4541,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Pool */
     case  14: return bridge_ExAllocatePool;
     case  15: return bridge_ExAllocatePoolWithTag;
+    case  17: return bridge_ExFreePool;
     case  23: return bridge_ExQueryPoolBlockSize;
     case  24: return bridge_ExQueryNonVolatileSetting;
 
@@ -4624,7 +4660,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * marshalling, and re-deriving them is the easy half of the work.
      */
     /* case   1: bridge_AvGetSavedDataAddress */
-    /* case  17: bridge_ExFreePool */
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
     /* Routed. Both clear the memory-model bar above: neither allocates,
@@ -4926,6 +4961,12 @@ static void kernel_thunk_dispatch(void)
         }
     }
 
+    /* Attribute anything this bridge allocates to the export and the guest
+     * call site, so an exhausted heap can be read back to a caller instead of
+     * a size. g_esp has already had the dummy return address popped, so the
+     * guest return address is the dword just below it. */
+    xbox_HeapSetOwner(ordinal, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+
     if (bridge) {
         bridge();
     } else {
@@ -4961,6 +5002,8 @@ static void kernel_thunk_dispatch(void)
      * and N bytes of arguments. We already popped the dummy return address
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
+
+    xbox_HeapSetOwner(0, 0);
 
     if (g_kernel_watch_va) {
         uint32_t _after = BRIDGE_MEM32(g_kernel_watch_va);

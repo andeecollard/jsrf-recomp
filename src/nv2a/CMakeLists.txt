@@ -34,3 +34,11 @@ target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()
+
+# Platform-independent shader semantics shared by D3D11 and CPU rendering.
+add_library(xbox_vsh STATIC nv2a_vsh.c nv2a_vsh_hlsl.c nv2a_texture_copy.c)
+target_include_directories(xbox_vsh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT MSVC)
+    target_compile_options(xbox_vsh PRIVATE -Wall -Wextra -O2)
+    target_link_libraries(xbox_vsh PUBLIC m)
+endif()

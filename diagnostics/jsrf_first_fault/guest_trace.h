@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 void jsrf_trace_function(uint32_t guest_function);
+void jsrf_startup_probe(uint32_t pc, uint32_t object);
 void jsrf_trace_block(uint32_t guest_block);
 void recomp_trace_enter(const char *name, uint32_t guest_function);
 

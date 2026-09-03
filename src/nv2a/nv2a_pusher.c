@@ -76,13 +76,13 @@ static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
     }
 }
 
-uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords)
+NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwords)
 {
     uint32_t pos = 0;
-    uint32_t dispatched = 0;
+    NV2APusherResult result = {0};
 
     if (!data || !num_dwords) {
-        return 0;
+        return result;
     }
     g_stats.runs++;
 
@@ -98,19 +98,23 @@ uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords)
             continue;
         }
 
+        if ((header & 3u)==1u || (header & 0xe0000003u)==0x20000000u) {
+            result.jump_address = (header & 3u)==1u ? header & 0xfffffffcu : header & 0x1ffffffcu;
+            result.stop = NV2A_PUSHER_JUMP;
+            ++pos;
+            ++g_stats.dwords;
+            break;
+        }
         if ((header & PB_INC_MASK) == PB_INC_MATCH) {
             increasing = 1;
         } else if ((header & PB_NONINC_MASK) == PB_NONINC_MATCH) {
             increasing = 0;
         } else {
-            /* Jump/call headers and anything else this pusher does not model.
-             * Counted rather than ignored: a ring that is mostly unparseable
-             * means the caller handed over the wrong range, and silence there
-             * would look identical to an idle GPU. */
+            /* Never interpret data following unsupported control flow as
+             * another method packet. Calls/returns need a caller-owned stack. */
             g_stats.bad_headers++;
-            pos++;
-            g_stats.dwords++;
-            continue;
+            result.stop = NV2A_PUSHER_INVALID;
+            break;
         }
 
         count = PB_COUNT(header);
@@ -120,21 +124,33 @@ uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords)
         /* A count running past the end means this range was cut mid-command --
          * the caller's window, not a malformed ring. Stop rather than read
          * past it; the remainder arrives with the next run. */
-        if (count == 0 || pos + 1 + count > num_dwords) {
+        if (pos + 1 + count > num_dwords) {
+            result.stop = NV2A_PUSHER_PARTIAL;
+            break;
+        }
+        if (increasing && count && method + (count-1)*4 >= 0x2000) {
+            ++g_stats.bad_headers;
+            result.stop = NV2A_PUSHER_INVALID;
             break;
         }
 
         for (uint32_t i = 0; i < count; i++) {
             dispatch(subchannel, increasing ? method + i * 4u : method,
                      data[pos + 1 + i]);
-            dispatched++;
+            result.methods++;
         }
 
         pos += 1 + count;
         g_stats.dwords += 1 + count;
     }
 
-    return dispatched;
+    result.consumed = pos;
+    return result;
+}
+
+uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords)
+{
+    return nv2a_pusher_run_segment(data, num_dwords).methods;
 }
 
 void nv2a_pusher_get_stats(NV2APusherStats *out)

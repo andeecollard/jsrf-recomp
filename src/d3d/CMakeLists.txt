@@ -30,3 +30,5 @@ if(MSVC)
 else()
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
+
+target_link_libraries(xbox_d3d8 PUBLIC xbox_vsh)

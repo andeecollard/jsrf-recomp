@@ -38,6 +38,7 @@ while [ "$round" -le "$MAX_ROUNDS" ]; do
         --output "$OUT/disasm" \
         --seed-functions diagnostics/jsrf_first_fault/thread_start_seed.json \
         --seed-functions diagnostics/jsrf_first_fault/icall_seed.json \
+        --seed-functions diagnostics/jsrf_first_fault/startup_entries.json \
         --seed-functions "$ACCUM" \
         --force \
         --verbose

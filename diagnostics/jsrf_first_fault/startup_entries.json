@@ -1,0 +1,5 @@
+[
+  {"start": "0x00030592", "end": "0x00030618", "source": "icall-unresolved", "observed": 1, "table": "0x00030618", "index": 1},
+  {"start": "0x000305B9", "end": "0x00030618", "source": "same-verified-switch-table", "table": "0x00030618", "index": 2},
+  {"start": "0x00030601", "end": "0x00030618", "source": "same-verified-switch-table", "table": "0x00030618", "index": 3}
+]

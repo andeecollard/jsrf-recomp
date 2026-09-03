@@ -37,6 +37,17 @@ typedef struct {
  */
 uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords);
 
+typedef enum {
+    NV2A_PUSHER_END, NV2A_PUSHER_PARTIAL, NV2A_PUSHER_JUMP, NV2A_PUSHER_INVALID
+} NV2APusherStop;
+typedef struct {
+    uint32_t methods, consumed, jump_address;
+    NV2APusherStop stop;
+} NV2APusherResult;
+/* Stops at control flow or an incomplete packet. The caller preserves the
+ * unconsumed cursor and resolves jumps within its own guest memory mapping. */
+NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwords);
+
 void nv2a_pusher_get_stats(NV2APusherStats *out);
 void nv2a_pusher_reset_stats(void);
 

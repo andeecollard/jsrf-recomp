@@ -190,6 +190,10 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+/* Checked GPU surface access, plus the separately mapped NV2A registers.
+ * NULL indicates an unavailable mapping or an out-of-bounds range. */
+void *xbox_GpuMemoryRange(uint32_t address, size_t bytes);
+const uint8_t *xbox_Nv2aRegisterMemory(void);
 /**
  * Convert a host fault address back to a guest VA only when it lies in one of
  * the memory layout's mappings. Intended for crash diagnostics; unlike raw
@@ -416,6 +420,15 @@ void xbox_SetApuMmioWriteHook(void (*fn)(uint32_t offset, uint32_t value,
                                          unsigned width));
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+
+/* Record who the next heap allocations belong to. kernel_thunk_dispatch calls
+ * this before running a bridge so blocks carry the kernel ordinal and guest
+ * return address that asked for them; xbox_HeapReport attributes by both. */
+void xbox_HeapSetOwner(uint32_t ordinal, uint32_t guest_ra);
+
+/* Print live/free/largest-free/retained accounting plus the top owners. Called
+ * on the first allocation failure, and on demand from a diagnostic. */
+void xbox_HeapReport(const char *why);
 
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).

@@ -7,14 +7,11 @@
  * stream nv2a_pb_scan.c surveys and carries out the subset that decides what is
  * on screen: which surface is being drawn into, and clearing it.
  *
- * It also rasterises geometry, but only the part that can be drawn honestly:
- * batches whose attribute 0 is already in screen space, flat-shaded, straight
- * into the same guest framebuffer the clear writes. Titles draw their UI, HUD
- * and 2D overlays that way, so it is the first geometry to appear. Batches that
- * need a vertex program executed are counted and skipped rather than drawn
- * somewhere wrong -- see raster_batch(). Texturing, depth and vertex programs
- * are still a renderer, not a command decoder; the upgrade path is the D3D11
- * translator in src/nv2a/nv2a_pgraph_d3d11.c.
+ * Geometry uses either pre-transformed attributes or the title's uploaded
+ * NV2A vertex program. Shader positions and diffuse outputs feed the CPU
+ * rasteriser directly. The measured linear RGB565 texture-copy / colour
+ * program is supported; other configured fragment states are rejected.
+ * Depth, blending and general colour programs remain unsupported.
  *
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
@@ -24,6 +21,9 @@
  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
+#include "nv2a_vsh.h"
+#include "nv2a_texture_copy.h"
+#include "nv2a_regs.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -39,28 +39,10 @@
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern void *xbox_GpuMemoryRange(uint32_t address, size_t bytes);
+extern const uint8_t *xbox_Nv2aRegisterMemory(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
-
-/* NV097 methods this executor acts on. */
-#define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
-#define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
-#define NV097_SET_SURFACE_FORMAT          0x0208
-#define NV097_SET_SURFACE_PITCH           0x020C
-#define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
-#define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
-#define NV097_CLEAR_SURFACE               0x1D94
-#define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
-#define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
-#define NV097_SET_BEGIN_END               0x17FC
-#define NV097_ARRAY_ELEMENT16             0x1800
-#define NV097_INLINE_ARRAY                0x1818
-#define NV097_SET_VIEWPORT_OFFSET         0x0A20   /* +i*4, 4 floats */
-#define NV097_SET_VIEWPORT_SCALE          0x0AF0   /* +i*4, 4 floats */
-#define NV097_SET_TRANSFORM_PROGRAM       0x0B00   /* ..0x0B7C, 32 slots  */
-#define NV097_SET_TRANSFORM_CONSTANT      0x0B80   /* ..0x0BFC, 32 slots  */
-
-#define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
 /* One vertex attribute stream, as the title describes it. Attribute 0 is
  * position; the rest are colours, texture coordinates and so on. */
@@ -104,20 +86,70 @@ typedef struct { uint32_t method, count; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
 
-/* The title's vertex program and its constants, recorded verbatim.
- *
- * JSRF's vertices are neither screen space nor NDC: they are inputs to a
- * program uploaded through 0x0B00..0x0B7C, and nothing here can place them
- * without running it. Writing an interpreter needs the exact XVS instruction
- * encoding, which is not something to reconstruct from memory -- so this
- * records what the title actually uploads, in order, and leaves the decoding
- * to someone with the encoding in front of them.
- *
- * Constants print as floats because that is what they are, and because the
- * scale between the vertices (0..2560) and the surface (640 wide) should be
- * visible among them. Observation only: the writes are still passed to
- * note_unhandled, so the ranked list does not change.
- */
+/* Raw uploads remain available for diagnosis. Execution uses persistent
+ * program/constant banks and the hardware LOAD/START cursors below. */
+static struct {
+    uint32_t words[NV2A_VS_MAX_INSTRUCTIONS][4];
+    uint8_t loaded[NV2A_VS_MAX_INSTRUCTIONS];
+    float constants[NV2A_VS_MAX_CONSTANTS][4];
+    float current[16][4];
+    uint32_t load, start, constant_load, mode;
+    int dirty;
+    NV2AVshProgram decoded;
+    uint32_t batches, rejected;
+} s_vsh;
+static float s_positions[NV_MAX_INDICES][4];
+static uint32_t s_colors[NV_MAX_INDICES];
+/* Retain all shader outputs for texture interpolation and draw captures. */
+static float s_outputs[NV_MAX_INDICES][16][4];
+static uint32_t s_methods[0x2000 / 4];
+static uint8_t s_method_seen[0x2000 / 4];
+static int s_capture_selected;
+static struct {
+    NV2ATextureCopy state;
+    const uint8_t *texture;
+    uint8_t *target;
+    size_t texture_bytes, target_bytes;
+    uint32_t texture_address, target_address, batches, rejected;
+    int active;
+} s_copy;
+
+static const char *prepare_texture_copy(void)
+{
+    s_copy.active = 0;
+    /* Preserve the original diagnostic flat-colour path when no fragment
+     * state has been supplied. Once configured, unsupported states reject. */
+    if (!s_method_seen[0x1e60/4] && !s_method_seen[0x1b0c/4]) return NULL;
+    const char *error = nv2a_texture_copy_prepare(s_methods, &s_copy.state);
+    if (error) return error;
+    const uint8_t *regs = xbox_Nv2aRegisterMemory();
+    if (!regs) return "NV2A mapping unavailable";
+    uint32_t ramht, base, limit;
+    memcpy(&ramht, regs + 0x2210, 4);
+    NV2ATextureCopy *c = &s_copy.state;
+    s_copy.texture_bytes = (size_t)c->pitch*c->height;
+    s_copy.target_bytes = (size_t)c->target_pitch*(c->clip_y+c->clip_h);
+    if (!nv2a_dma_resolve(regs+0x700000, 0x100000, ramht, c->texture_handle, &base, &limit)
+            || (uint64_t)c->texture_offset+s_copy.texture_bytes > (uint64_t)limit+1
+            || (uint64_t)base+c->texture_offset > UINT32_MAX) return "texture DMA range";
+    s_copy.texture_address = base+c->texture_offset;
+    s_copy.texture = xbox_GpuMemoryRange(s_copy.texture_address, s_copy.texture_bytes);
+    if (!nv2a_dma_resolve(regs+0x700000, 0x100000, ramht, c->target_handle, &base, &limit)
+            || (uint64_t)c->target_offset+s_copy.target_bytes > (uint64_t)limit+1
+            || (uint64_t)base+c->target_offset > UINT32_MAX) return "target DMA range";
+    s_copy.target_address = base+c->target_offset;
+    s_copy.target = xbox_GpuMemoryRange(s_copy.target_address, s_copy.target_bytes);
+    if (!s_copy.texture || !s_copy.target) return "surface outside mapped RAM";
+    if ((uint64_t)s_copy.texture_address+s_copy.texture_bytes > s_copy.target_address
+            && (uint64_t)s_copy.target_address+s_copy.target_bytes > s_copy.texture_address)
+        return "overlapping texture and target";
+    s_copy.active = 1;
+    ++s_copy.batches;
+    return NULL;
+}
+
+
+
 #define PB_PROG_SLOTS 1024
 static struct { uint32_t method, param; } s_prog_log[PB_PROG_SLOTS];
 static int s_prog_logged;
@@ -260,13 +292,11 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
 static uint32_t surface_bpp(void)
 {
-    /* The pitch and the clip width together give the pixel size, which is more
-     * reliable than decoding the format field: the format's colour code is
-     * only meaningful alongside a type the title also sets, while the pitch is
-     * always exactly how many bytes a row occupies. */
-    if (!s_gpu.clip_w)
-        return 0;
-    return s_gpu.pitch / s_gpu.clip_w;
+    switch (s_gpu.format & 15) {
+    case 1: case 2: case 3: return 2;
+    case 4: case 5: case 6: case 7: case 8: return 4;
+    default: return s_gpu.clip_w ? s_gpu.pitch / s_gpu.clip_w : 0;
+    }
 }
 
 
@@ -276,8 +306,9 @@ static uint32_t surface_bpp(void)
  * this the only way to check what a title actually rendered on a machine you
  * are not sitting at -- and the only way to put a picture in a bug report.
  *
- * ponytail: bottom-up 24bpp BMP, no palette, no compression. That is the one
- * format every viewer reads and it is 30 lines; PNG would need a dependency.
+ * Programmable batches use guest shader outputs in NV2A screen space.
+ * The measured RGB565 copy uses the portable texture/colour path.
+ * Fixed-function batches retain the pre-transformed-position heuristic.
  */
 static void dump_surface_bmp(void)
 {
@@ -355,7 +386,7 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
-    if (!(param & NV097_CLEAR_COLOR_MASK))
+    if (!(param & (NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G | NV097_CLEAR_SURFACE_B | NV097_CLEAR_SURFACE_A)))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
@@ -506,15 +537,14 @@ static void raster_triangle(const float a[2], const float b[2],
     if (area == 0.0f)
         return;                            /* degenerate */
 
-    minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
-    maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
-    miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
-    maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
-
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (!isfinite(area) || !isfinite(a[0]) || !isfinite(a[1])
+            || !isfinite(b[0]) || !isfinite(b[1]) || !isfinite(c[0]) || !isfinite(c[1])) return;
+    float left = (float)s_gpu.clip_x, right = (float)(s_gpu.clip_x + s_gpu.clip_w);
+    float top = (float)s_gpu.clip_y, bottom = (float)(s_gpu.clip_y + s_gpu.clip_h);
+    minx = (int)floorf(fmaxf(left, fminf(right, fminf(a[0], fminf(b[0], c[0])))));
+    maxx = (int)ceilf(fmaxf(left, fminf(right, fmaxf(a[0], fmaxf(b[0], c[0])))));
+    miny = (int)floorf(fmaxf(top, fminf(bottom, fminf(a[1], fminf(b[1], c[1])))));
+    maxy = (int)ceilf(fmaxf(top, fminf(bottom, fmaxf(a[1], fmaxf(b[1], c[1])))));
     if (minx >= maxx || miny >= maxy) {
         s_gpu.tris_skipped_offscreen++;
         return;
@@ -533,9 +563,6 @@ static void raster_triangle(const float a[2], const float b[2],
     s_gpu.tris_drawn++;
 }
 
-/* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
- * white -- a visible wrong colour beats an invisible correct one during
- * bring-up. */
 /* One vertex source for both paths: a batch that pushed inline data reads from
  * it, anything else reads the arrays the title pointed at. */
 static int fetch_vertex(uint32_t a, uint32_t index, float out[4])
@@ -545,16 +572,126 @@ static int fetch_vertex(uint32_t a, uint32_t index, float out[4])
     return fetch_attr(&s_gpu.attr[a], index, out);
 }
 
-static uint32_t vertex_color(uint32_t index)
+static uint32_t pack_color(const float c[4])
 {
-    float c[4];
+    uint32_t n[4];
+    for (int k = 0; k < 4; ++k)
+        n[k] = (uint32_t)(fminf(fmaxf(c[k], 0.0f), 1.0f) * 255.0f);
+    return (n[3] << 24) | (n[0] << 16) | (n[1] << 8) | n[2];
+}
 
-    if (!fetch_vertex(3, index, c))
-        return 0xFFFFFFFFu;
-    return ((uint32_t)(c[3] * 255.0f) << 24)
-         | ((uint32_t)(c[0] * 255.0f) << 16)
-         | ((uint32_t)(c[1] * 255.0f) <<  8)
-         |  (uint32_t)(c[2] * 255.0f);
+static int prepare_vertices(void)
+{
+    int programmable = s_vsh.mode == 2;
+    if (s_vsh.mode != 0 && !programmable) return 0;
+    if (programmable && s_vsh.dirty) {
+        uint32_t n = 0;
+        while (s_vsh.start < NV2A_VS_MAX_INSTRUCTIONS
+                && n < NV2A_VS_MAX_INSTRUCTIONS - s_vsh.start
+                && s_vsh.loaded[s_vsh.start + n] == 15) {
+            if (s_vsh.words[s_vsh.start + n++][3] & 1) break;
+        }
+        nv2a_vsh_parse(n ? s_vsh.words[s_vsh.start] : NULL, (int)n, &s_vsh.decoded);
+        s_vsh.dirty = 0;
+    }
+    for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
+        if (programmable) {
+            float inputs[16][4];
+            NV2AVshResult result;
+            memcpy(inputs, s_vsh.current, sizeof(inputs));
+            for (uint32_t a = 0; a < 16; ++a) {
+                if (!(s_vsh.decoded.inputs_read & (1u << a))) continue;
+                if (s_gpu.attr[a].size && !fetch_vertex(a, s_gpu.idx[i], inputs[a])) return 0;
+            }
+            if (!nv2a_vsh_execute(&s_vsh.decoded, inputs, s_vsh.constants, &result)
+                    || (result.written[0] & 12) != 12) return 0;
+            memcpy(s_outputs[i], result.output, sizeof(s_outputs[i]));
+            memcpy(s_positions[i], result.output[0], sizeof(s_positions[i]));
+            s_colors[i] = pack_color(result.output[NV2A_VSH_OUT_D0]);
+            /* NV2A programs include the viewport transform and perspective
+             * division. Only screen subpixel quantisation remains here. */
+            for (int k = 0; k < 2; ++k) {
+                if (!isfinite(s_positions[i][k])) return 0;
+                if (fabsf(s_positions[i][k]) < 0x1p20f)
+                    s_positions[i][k] = truncf(s_positions[i][k] * 16.0f) / 16.0f;
+                s_outputs[i][0][k] = s_positions[i][k];
+            }
+            if (s_vsh.batches < 4 && i < 3)
+                fprintf(stderr, "  [VSH] start=%u slots=%d vertex=%u oPos=(%.6g %.6g %.6g %.6g) color=%08X\n",
+                        s_vsh.start, s_vsh.decoded.length, i,
+                        result.output[0][0], result.output[0][1], result.output[0][2], result.output[0][3], s_colors[i]);
+        } else {
+            float color[4];
+            if (!fetch_vertex(0, s_gpu.idx[i], s_positions[i])) return 0;
+            int has_color = fetch_vertex(3, s_gpu.idx[i], color);
+            s_colors[i] = has_color ? pack_color(color) : 0xFFFFFFFFu;
+            memset(s_outputs[i], 0, sizeof(s_outputs[i]));
+            memcpy(s_outputs[i][0], s_positions[i], sizeof(s_positions[i]));
+            for (int k=0;k<4;++k) s_outputs[i][NV2A_VSH_OUT_D0][k] = has_color ? color[k] : 1;
+            fetch_vertex(9, s_gpu.idx[i], s_outputs[i][NV2A_VSH_OUT_T0]);
+        }
+    }
+    if (programmable) s_vsh.batches++;
+    return 1;
+}
+
+/* Capture state at a draw boundary, not during a periodic interrupt report.
+ * The first draw and two later samples distinguish initial setup from steady
+ * state. Raw method values are included even when rendering does not support
+ * them yet. The snapshot format is deliberately independent of C structs. */
+static void capture_bytes(const char *extension, const void *data, size_t size)
+{
+    const char *prefix = getenv("RECOMP_DRAW_CAPTURE");
+    if (!prefix || !data || !s_capture_selected) return;
+    char path[768];
+    snprintf(path, sizeof(path), "%s%06u.%s", prefix, s_gpu.draws, extension);
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return; }
+    if (fwrite(data, 1, size, f) != size) perror(path);
+    if (fclose(f)) perror(path);
+}
+
+static void capture_draw(const char *error)
+{
+    const char *prefix = getenv("RECOMP_DRAW_CAPTURE");
+    s_capture_selected = prefix && (s_gpu.draws == 1 || s_gpu.draws == 128 || s_gpu.draws == 2048
+            || (error && s_copy.rejected < 2));
+    if (!s_capture_selected) return;
+    char path[768];
+    snprintf(path, sizeof(path), "%s%06u.json", prefix, s_gpu.draws);
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return; }
+    fprintf(f, "{\n\"version\":1,\"draw\":%u,\"primitive\":%u,\"registers\":{", s_gpu.draws, s_gpu.prim);
+    int comma = 0;
+    for (unsigned i = 0; i < 0x2000/4; ++i) if (s_method_seen[i]) {
+        fprintf(f, "%s\n\"%04x\":%u", comma ? "," : "", i*4, s_methods[i]); comma = 1;
+    }
+    fprintf(f, "},\n\"vertices\":[");
+    for (unsigned i = 0; i < s_gpu.idx_count; ++i) {
+        fprintf(f, "%s[", i ? "," : "");
+        for (int o = 0; o < 16; ++o) {
+            fprintf(f, "%s[", o ? "," : "");
+            for (int k = 0; k < 4; ++k) {
+                if (k) fputc(',', f);
+                if (isfinite(s_outputs[i][o][k])) fprintf(f, "%.9g", s_outputs[i][o][k]);
+                else fputs("null", f);
+            }
+            fputc(']', f);
+        }
+        fputc(']', f);
+    }
+    const uint8_t *regs = xbox_Nv2aRegisterMemory();
+    uint32_t ramht = 0;
+    if (regs) memcpy(&ramht, regs + 0x2210, 4);
+    fprintf(f, "],\"ramht\":%u,\"copy_supported\":%s,\"texture_address\":%u,\"target_address\":%u}\n",
+            ramht, s_copy.active ? "true" : "false", s_copy.texture_address, s_copy.target_address);
+    if (regs) capture_bytes("ramin", regs+0x700000, 0x100000);
+    if (s_copy.active) {
+        capture_bytes("texture", s_copy.texture, s_copy.texture_bytes);
+        capture_bytes("before", s_copy.target, s_copy.target_bytes);
+    }
+    if (fclose(f)) perror(path);
+    else fprintf(stderr, "[DRAW] captured %s\n", path);
 }
 
 /* Is attribute 0 already in screen space? Measured, not assumed: every vertex
@@ -582,20 +719,47 @@ static int batch_is_screen_space(void)
 }
 
 /* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+#define NV_PRIM_TRIANGLES      NV097_SET_BEGIN_END_OP_TRIANGLES
+#define NV_PRIM_TRIANGLE_STRIP NV097_SET_BEGIN_END_OP_TRIANGLE_STRIP
+#define NV_PRIM_TRIANGLE_FAN   NV097_SET_BEGIN_END_OP_TRIANGLE_FAN
+#define NV_PRIM_QUADS          NV097_SET_BEGIN_END_OP_QUADS
+#define NV_PRIM_QUAD_STRIP     NV097_SET_BEGIN_END_OP_QUAD_STRIP
+
+static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
+{
+    if (!s_copy.active) {
+        raster_triangle(s_positions[a], s_positions[b], s_positions[c], s_colors[a]);
+        return;
+    }
+    if (nv2a_texture_copy_triangle(&s_copy.state, s_copy.texture, s_copy.texture_bytes,
+            s_copy.target, s_copy.target_bytes, s_outputs[a], s_outputs[b], s_outputs[c]))
+        ++s_gpu.tris_drawn;
+    else {
+        if (++s_copy.rejected <= 4) fprintf(stderr, "[TEXTURE] rejected triangle geometry / bounds\n");
+    }
+}
 
 static void raster_batch(void)
 {
-    float p[3][4];
     uint32_t i;
+    uint32_t drawn_before = s_gpu.tris_drawn;
 
     if (s_gpu.idx_count < 3)
         return;
-    if (!batch_is_screen_space()) {
+    if (!prepare_vertices()) {
+        s_vsh.rejected++;
+        if (s_vsh.rejected <= 4)
+            fprintf(stderr, "  [VSH] rejected batch mode=%u start=%u valid=%d final=%d\n",
+                    s_vsh.mode, s_vsh.start, s_vsh.decoded.valid, s_vsh.decoded.has_final);
+        return;
+    }
+    const char *copy_error = prepare_texture_copy();
+    capture_draw(copy_error);
+    if (copy_error) {
+        if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s\n", s_gpu.draws, copy_error);
+        return;
+    }
+    if (s_vsh.mode == 0 && !batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         /* RECOMP_PB_EXEC_NOCLIPTEST: rasterise anyway, to tell "the vertices
          * were decoded but sit outside the clip rect" apart from "the vertices
@@ -609,36 +773,44 @@ static void raster_batch(void)
         }
     }
 
-#define VTX(slot, index) \
-    (fetch_vertex(0, (index), p[slot]) ? 1 : 0)
-
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
-            if (VTX(0, s_gpu.idx[i]) && VTX(1, s_gpu.idx[i+1])
-             && VTX(2, s_gpu.idx[i+2]))
-                raster_triangle(p[0], p[1], p[2], vertex_color(s_gpu.idx[i]));
+            raster_indices(i, i+1, i+2);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            if (VTX(0, s_gpu.idx[i]) && VTX(1, s_gpu.idx[i+1])
-             && VTX(2, s_gpu.idx[i+2]))
-                raster_triangle(p[0], p[1], p[2], vertex_color(s_gpu.idx[i]));
+            raster_indices(i, i+1, i+2);
         break;
     case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_QUADS:
-    case NV_PRIM_QUAD_STRIP:
-        /* A fan and a quad both rasterise as a triangle fan around index 0;
-         * for a quad that is exactly its two triangles. */
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
-            if (VTX(0, s_gpu.idx[0]) && VTX(1, s_gpu.idx[i])
-             && VTX(2, s_gpu.idx[i+1]))
-                raster_triangle(p[0], p[1], p[2], vertex_color(s_gpu.idx[0]));
+            raster_indices(0, i, i+1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            raster_indices(i, i+1, i+2);
+            raster_indices(i, i+2, i+3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            raster_indices(i, i+1, i+3);
+            raster_indices(i, i+3, i+2);
+        }
         break;
     default:
         break;                             /* points and lines: not yet */
     }
-#undef VTX
+    if (s_copy.active) capture_bytes("after", s_copy.target, s_copy.target_bytes);
+    /* Report-time snapshots may interrupt the clear or raster loops. Capture
+     * a few completed batches when inspecting the actual rendered result. */
+    if (s_gpu.tris_drawn != drawn_before) {
+        static unsigned captured;
+        if (captured < 3 && getenv("RECOMP_FB_DUMP_DRAW")) {
+            captured++;
+            dump_surface_bmp();
+        }
+    }
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
@@ -732,6 +904,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     static int inited;
     if (!inited) {
         inited = 1;
+        s_vsh.dirty = 1;
+        for (int i = 0; i < 16; ++i) s_vsh.current[i][3] = 1.0f;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
@@ -760,7 +934,48 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method);
         return;
     }
+    if (method < 0x2000 && !(method & 3)) {
+        s_methods[method/4] = param;
+        s_method_seen[method/4] = 1;
+    }
+    if ((method >= NV097_SET_TRANSFORM_PROGRAM && method < 0x0C00)
+            || (method >= NV097_SET_TRANSFORM_EXECUTION_MODE && method <= NV097_SET_TRANSFORM_CONSTANT_LOAD))
+        note_program_write(method, param);
+    if (method >= NV097_SET_TRANSFORM_PROGRAM && method < NV097_SET_TRANSFORM_CONSTANT) {
+        unsigned component = (method & 15) / 4;
+        if (s_vsh.load < NV2A_VS_MAX_INSTRUCTIONS) {
+            if (s_vsh.words[s_vsh.load][component] != param || !(s_vsh.loaded[s_vsh.load] & (1u << component)))
+                s_vsh.dirty = 1;
+            s_vsh.words[s_vsh.load][component] = param;
+            s_vsh.loaded[s_vsh.load] |= (uint8_t)(1u << component);
+        }
+        if (component == 3 && s_vsh.load < NV2A_VS_MAX_INSTRUCTIONS) s_vsh.load++;
+        return;
+    }
+    if (method >= NV097_SET_TRANSFORM_CONSTANT && method < 0x0C00) {
+        unsigned component = (method & 15) / 4;
+        if (s_vsh.constant_load < NV2A_VS_MAX_CONSTANTS)
+            memcpy(&s_vsh.constants[s_vsh.constant_load][component], &param, sizeof(float));
+        if (component == 3 && s_vsh.constant_load < NV2A_VS_MAX_CONSTANTS) s_vsh.constant_load++;
+        return;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4F_M && method < NV097_SET_VERTEX_DATA4F_M + 16*16) {
+        unsigned word = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
+        memcpy(&s_vsh.current[word / 4][word % 4], &param, sizeof(float));
+        return;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4UB && method < NV097_SET_VERTEX_DATA4UB + 16*4) {
+        unsigned a = (method - NV097_SET_VERTEX_DATA4UB) / 4;
+        for (int k = 0; k < 4; ++k) s_vsh.current[a][k] = ((param >> (8*k)) & 255) / 255.0f;
+        return;
+    }
     switch (method) {
+    case NV097_SET_TRANSFORM_EXECUTION_MODE: s_vsh.mode = param & 3; break;
+    case NV097_SET_TRANSFORM_PROGRAM_LOAD: s_vsh.load = param; break;
+    case NV097_SET_TRANSFORM_PROGRAM_START:
+        if (s_vsh.start != param) s_vsh.dirty = 1;
+        s_vsh.start = param; break;
+    case NV097_SET_TRANSFORM_CONSTANT_LOAD: s_vsh.constant_load = param; break;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;
@@ -869,9 +1084,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                    &param, sizeof(float));
             s_gpu.vp_seen = 1;
         } else {
-            if ((method >= NV097_SET_TRANSFORM_PROGRAM && method < 0x0C00)
-                    || (method >= 0x1E9C && method <= 0x1EA4))
-                note_program_write(method, param);
             note_unhandled(method);
         }
         break;
@@ -1032,6 +1244,9 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
+    fprintf(stderr, "[VSH] executed batches=%u rejected=%u mode=%u start=%u slots=%d\n",
+            s_vsh.batches, s_vsh.rejected, s_vsh.mode, s_vsh.start, s_vsh.decoded.length);
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {

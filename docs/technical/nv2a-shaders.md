@@ -69,12 +69,16 @@ way to get this subtly wrong.
 `d3d8_combiners.h` and `d3d8_swizzle.h` cite xemu as a reference for the
 hardware's behaviour; both are our own implementations. See [NOTICE](../../NOTICE).
 
-## A validation vector for the microcode parser
+## Captured JSRF program: decoder and CPU execution verified
 
-The vertex-microcode parser has never been checked against microcode a game
-actually uploaded, and it does not survive the check. Captured from Jet Set
-Radio Future at runtime with `RECOMP_PB_EXEC_PROGRAM=1`, first five instruction
-slots in upload order:
+On 2026-09-03 the old parser was found to read its opcodes from word 0 rather
+than word 1, and to misdecode source selectors and destination routing.
+The portable decoder now lives in `src/nv2a/nv2a_vsh.c`; the D3D11 entry point
+in `src/d3d/d3d8_vsh.c` delegates to it. CPU execution and HLSL generation share
+its representation, including separate temporary and output masks and paired
+MAC/ILU operand reads.
+
+The first five slots captured from JSRF, in upload order, are:
 
 ```
 00000000 0020001B 0836106C 2F100FF8
@@ -84,26 +88,64 @@ slots in upload order:
 00000000 0060201B 2436106C 3070F800
 ```
 
-with the only constants the title uploads:
+They decode as:
 
 ```
-c0  (1, 1, 16777215, 1)          c60 (0, 0.5, 1, 2)
-c1  (0.53125, 0.53125, 0, 0)     c61 (-1, 0, 1, 2)
-                                 c62 (0, 0, -1, 0)
+MOV R1, v0
+MOV oD0, v3          + RCP R1.w, R1.w
+                      RCP oFog, v0.w
+MUL R2, R1, c0       + MOV oD1, v4
+ADD oPos, R2, c1
 ```
 
-Against `src/d3d/d3d8_vsh.c` as it stands, every slot decodes to `MAC=NOP
-ILU=NOP` — the first uploaded dword is zero in all of them, and that is where
-the opcode fields are read from. Reversing the word order instead gives an ILU
-opcode of 8 on slot 2, which does not exist, and constant indices `c128` and
-`c143`, which the title never sets.
+The complete 12-slot capture is in
+`diagnostics/jsrf_first_fault/vsh_capture.h`. The remaining slots copy point
+size, back-face colours, and texture coordinates. Constant indices here are
+raw hardware indices into the 192-entry bank, without an SDK register bias.
 
-Note that `c0` is `(1, 1, ...)` and `c1` is `(0.53125, 0.53125, ...)`: the
-scale is one and the offset is the half-pixel bias, which is the NV2A viewport
-applied inside the shader. There is no scale constant anywhere in the program,
-so nothing outside it explains the factor of four between the title's vertex
-values and its 640x480 surface. That factor is inside these instructions.
+**Correction to the earlier analysis:** there is no divide-by-four instruction
+in this program. With captured c0=(1,1,16777215,1), c1=(0.53125,0.53125,0,0)
+and input w=1, the three vertices become (0,0), (2560,0), and (0,1920).
+NV2A programs output screen-space coordinates. An oversized triangle may
+cover a 640x480 surface; clipping it to that surface is valid. Applying the
+viewport again or dividing its coordinates by four would be incorrect.
 
-Fix the layout until it disassembles this, and the CPU executor in
-`src/kernel/nv2a_pb_exec.c` can run the program instead of rejecting every
-batch as not screen-space.
+The CPU pushbuffer executor now retains program and constant upload banks,
+honours LOAD/START cursors, executes the program in mode 2, and takes position
+and diffuse colour from its outputs. The method window can wrap during a long
+upload while the load cursor continues advancing. Invalid or incomplete
+programs are rejected. Primitive types now use `nv2a_regs.h`: 0x05 is triangles,
+0x06 is triangle strip. The old private values were off by one.
+
+Validation:
+
+- Captured instructions, upper constant indices, source-C split bits, masks,
+  paired reads, and R12/oPos alias: `jsrf_vsh_test`.
+- Real method-sink uploads at a nonzero START, window wrap, constant updates,
+  oversized clipping, invalid START rejection, and framebuffer pixel checks:
+  `jsrf_vsh_render_test`.
+- Optional `jsrf_vsh_reference_test`: the complete JSRF program agrees with an
+  independent CPU interpreter on 128 varied input/constant sets. Set the CMake
+  cache variable `JSRF_VSH_REFERENCE_DIR` to that project's `src` directory
+  to build this test. No reference code is linked into the game runtime.
+- Two isolated 25-second JSRF runs execute and rasterise the captured triangle.
+  Completed-draw captures are uniformly white. They do not show a menu.
+
+References consulted on 2026-09-03:
+
+- [xemu shader field mapping and execution semantics](https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/glsl/vsh-prog.c).
+- [xemu transform upload handlers](https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/pgraph.c).
+- [Independent NV2A CPU interpreter](https://github.com/abaire/nv2a_vsh_cpu).
+
+The subsequent captured-copy milestone adds linear RGB565 sampling,
+perspective/projective texture interpolation and the measured texture-RGB /
+vertex-alpha colour program in `nv2a_texture_copy.c`. The original white output
+above is superseded by black, matching the captured source image. See
+`CODEX_PROGRESS_2026-09-03_TEXTURE.md` for replay evidence and command-reader
+corrections. General combiner programs, blending, depth and full fixed-function
+rendering remain unsupported. Constant-writing
+programs are decoded but rejected by the interpreter and HLSL generator.
+Arithmetic uses host floats and is not hardware-bit-exact across all exceptional
+values. The Windows D3D11 runtime was not exercised in this macOS validation;
+its existing conversion of NV2A screen-space outputs to host clip space still
+needs separate validation.

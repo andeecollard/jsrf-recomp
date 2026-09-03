@@ -22,8 +22,13 @@ add_executable(jsrf_av_encoder_option_test av_encoder_option_test.c)
 target_link_libraries(jsrf_av_encoder_option_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_av_encoder_option COMMAND jsrf_av_encoder_option_test)
 
+add_executable(jsrf_heap_alloc_test heap_alloc_test.c)
+target_link_libraries(jsrf_heap_alloc_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_heap_alloc COMMAND jsrf_heap_alloc_test)
+
 add_executable(jsrf_first_fault
     main.c
+    startup_probe.c
     jsrf_manual_overrides.c
     "${JSRF_STOCK_DIR}/src/recomp_manual.c"
     ${RECOMP_GEN_SOURCES}
@@ -61,4 +66,44 @@ if(NOT WIN32)
     if(EPOXY_FOUND)
         target_link_directories(jsrf_first_fault PRIVATE ${EPOXY_LIBRARY_DIRS})
     endif()
+endif()
+
+add_executable(jsrf_vsh_test vsh_test.c)
+target_link_libraries(jsrf_vsh_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_vsh COMMAND jsrf_vsh_test)
+
+add_executable(jsrf_vsh_render_test vsh_render_test.c
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
+target_link_libraries(jsrf_vsh_render_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_vsh_render COMMAND jsrf_vsh_render_test)
+
+set(JSRF_VSH_REFERENCE_DIR "" CACHE PATH "Optional nv2a_vsh_cpu/src for differential validation")
+if(JSRF_VSH_REFERENCE_DIR)
+    add_executable(jsrf_vsh_reference_test vsh_reference_test.c
+        "${JSRF_VSH_REFERENCE_DIR}/nv2a_vsh_cpu.c"
+        "${JSRF_VSH_REFERENCE_DIR}/nv2a_vsh_disassembler.c"
+        "${JSRF_VSH_REFERENCE_DIR}/nv2a_vsh_emulator.c"
+        "${JSRF_VSH_REFERENCE_DIR}/nv2a_vsh_emulator_execution_state.c")
+    target_include_directories(jsrf_vsh_reference_test PRIVATE "${JSRF_VSH_REFERENCE_DIR}")
+    target_link_libraries(jsrf_vsh_reference_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_vsh_reference COMMAND jsrf_vsh_reference_test)
+endif()
+
+add_executable(jsrf_texture_copy_test texture_copy_test.c)
+target_link_libraries(jsrf_texture_copy_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_texture_copy COMMAND jsrf_texture_copy_test)
+
+add_executable(jsrf_texture_copy_replay texture_copy_replay.c)
+target_link_libraries(jsrf_texture_copy_replay PRIVATE xbox_vsh)
+
+add_executable(jsrf_pusher_stream_test pusher_stream_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c")
+target_include_directories(jsrf_pusher_stream_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_pusher_stream COMMAND jsrf_pusher_stream_test)
+
+option(JSRF_STARTUP_ABI_CHECK "Check guest register preservation at startup chunk calls" OFF)
+if(JSRF_STARTUP_ABI_CHECK)
+    set_source_files_properties("${RECOMP_GEN_DIR}/recomp_0000.c"
+        PROPERTIES COMPILE_DEFINITIONS RECOMP_ABI_CHECK)
+    target_compile_definitions(xbox_kernel PRIVATE RECOMP_ABI_CHECK)
 endif()

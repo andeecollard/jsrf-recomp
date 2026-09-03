@@ -981,6 +981,17 @@ static int fence_readable(uint32_t va, uint32_t bytes)
     return (size_t)va + bytes <= g_memory_size;
 }
 
+void *xbox_GpuMemoryRange(uint32_t address, size_t bytes)
+{
+    if (bytes > UINT32_MAX || !fence_readable(address, (uint32_t)bytes)) return NULL;
+    return (void *)((uintptr_t)g_memory_offset + address);
+}
+
+const uint8_t *xbox_Nv2aRegisterMemory(void)
+{
+    return (const uint8_t *)g_nv2a_memory;
+}
+
 /*
  * Frame counters the title polls to pace itself.
  *
@@ -2594,6 +2605,7 @@ BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address)
 static uint32_t g_heap_next = XBOX_HEAP_BASE;
 
 static int g_heap_alloc_count = 0;
+static int g_heap_reuse_count = 0;
 
 /* Block table backing xbox_HeapFree. A bump pointer alone never reclaims,
  * which is fine for a title that allocates once and fatal for a debug build
@@ -2601,9 +2613,83 @@ static int g_heap_alloc_count = 0;
  * in bump order, so index order is address order and coalescing is a
  * neighbour check. */
 #define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
-    g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
+/* Allocation granularity for splitting a reused block, and the smallest
+ * remainder worth recording as a separate free block. Both are one page
+ * because every kernel export that reaches this heap asks for at least page
+ * alignment. */
+#define XBOX_HEAP_PAGE       4096
+#define XBOX_HEAP_SPLIT_MIN  4096
+/* `req` is what the caller asked for; `size` is the block's capacity, which is
+ * larger whenever a reused block was not split. Keeping both is what turns
+ * "the heap is full" into "the heap is full of retained capacity" or "of live
+ * allocations", which are different bugs with different fixes.
+ *
+ * `ord` and `ra` name the kernel export and the guest call site that asked, so
+ * an exhausted heap can be attributed rather than guessed at. */
+static struct {
+    uint32_t addr;
+    uint32_t size;
+    uint32_t req;
+    uint32_t ra;
+    uint16_t ord;
+    uint8_t  free;
+    uint8_t  reused;
+} g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
+
+/* Who is allocating right now. kernel_thunk_dispatch sets this before each
+ * bridge runs, so a heap block records the export and the guest return address
+ * that produced it. Zero means "the runtime itself", not a guest call. */
+static uint32_t g_heap_owner_ord = 0;
+static uint32_t g_heap_owner_ra  = 0;
+
+/* How many individual heap events to narrate. The default is enough to see
+ * the shape of a title's alloc/free pattern without burying the log; raise it
+ * with RECOMP_HEAP_TRACE when chasing a specific block. */
+static int heap_trace_limit(void)
+{
+    static int limit = -1;
+
+    if (limit < 0) {
+        const char *env = getenv("RECOMP_HEAP_TRACE");
+        limit = env ? (int)strtol(env, NULL, 0) : 64;
+        if (limit < 0) limit = 0;
+    }
+    return limit;
+}
+
+/* RECOMP_HEAP_POISON=<byte> fills freed blocks with that byte; unset means no
+ * poison, which is the default because the fill costs a pass over the block. */
+static int heap_poison_byte(void)
+{
+    static int value = -2;
+
+    if (value == -2) {
+        const char *env = getenv("RECOMP_HEAP_POISON");
+        value = env ? (int)(strtol(env, NULL, 0) & 0xFF) : -1;
+    }
+    return value;
+}
+
+void xbox_HeapSetOwner(uint32_t ordinal, uint32_t guest_ra)
+{
+    g_heap_owner_ord = ordinal;
+    g_heap_owner_ra  = guest_ra;
+}
+
+/* Guest addresses in the physical-memory mirror name the same RAM as the
+ * ordinary address 0x80000000 below them: physical page P is visible at
+ * 0x80000000 + P. A title that allocates through the normal address and frees
+ * through the mirrored one is freeing the block it owns, so the table has to
+ * be matched on the underlying address rather than the alias. */
+static uint32_t heap_canonical_va(uint32_t va)
+{
+    uint32_t ram = (uint32_t)(g_xbox_total_ram ? g_xbox_total_ram
+                                               : XBOX_TOTAL_RAM);
+    if (va >= 0x80000000u && va < 0x80000000u + ram)
+        return va - 0x80000000u;
+    return va;
+}
 
 /*
  * Simulated stacks for spawned threads.
@@ -2752,6 +2838,119 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 #endif
 }
 
+/* Account for the whole heap and say who is holding it.
+ *
+ * "out of memory (used N/M)" reports the bump high-water mark, which says
+ * nothing about how much is actually live: a heap that has freed and reused
+ * everything reads the same as one that has leaked everything. This separates
+ * the four things that can be true at once -- bytes live, bytes free and
+ * reusable, the largest single free block (a large request can fail with
+ * megabytes free), and capacity retained beyond what callers asked for --
+ * and then attributes the live bytes to the kernel export and guest call site
+ * that requested them.
+ */
+void xbox_HeapReport(const char *why)
+{
+    struct heap_owner { uint32_t ord; uint32_t ra; uint32_t n; uint64_t bytes; };
+    struct heap_owner own[512];
+    int own_used = 0;
+    uint64_t live_bytes = 0, free_bytes = 0, retained = 0;
+    int live_n = 0, free_n = 0, dead_n = 0;
+    uint32_t largest_free = 0;
+    uint32_t top_addr[16], top_size[16], top_ord[16], top_ra[16];
+    int top_n = 0;
+    int i, j;
+
+    for (i = 0; i < g_heap_block_count; i++) {
+        uint32_t sz = g_heap_blocks[i].size;
+
+        if (!sz) { dead_n++; continue; }
+        if (g_heap_blocks[i].free) {
+            free_n++;
+            free_bytes += sz;
+            if (sz > largest_free) largest_free = sz;
+            continue;
+        }
+
+        live_n++;
+        live_bytes += sz;
+        if (sz > g_heap_blocks[i].req)
+            retained += sz - g_heap_blocks[i].req;
+
+        for (j = 0; j < own_used; j++) {
+            if (own[j].ord == g_heap_blocks[i].ord &&
+                own[j].ra  == g_heap_blocks[i].ra)
+                break;
+        }
+        if (j == own_used && own_used < (int)(sizeof own / sizeof own[0])) {
+            own[own_used].ord = g_heap_blocks[i].ord;
+            own[own_used].ra  = g_heap_blocks[i].ra;
+            own[own_used].n = 0;
+            own[own_used].bytes = 0;
+            own_used++;
+        }
+        if (j < own_used) {
+            own[j].n++;
+            own[j].bytes += sz;
+        }
+
+        /* Keep the 16 largest live blocks, insertion-sorted. */
+        {
+            int slot = top_n;
+            while (slot > 0 && top_size[slot - 1] < sz) slot--;
+            if (slot < 16) {
+                int k = (top_n < 16 ? top_n : 15);
+                for (; k > slot; k--) {
+                    top_addr[k] = top_addr[k - 1];
+                    top_size[k] = top_size[k - 1];
+                    top_ord[k]  = top_ord[k - 1];
+                    top_ra[k]   = top_ra[k - 1];
+                }
+                top_addr[slot] = g_heap_blocks[i].addr;
+                top_size[slot] = sz;
+                top_ord[slot]  = g_heap_blocks[i].ord;
+                top_ra[slot]   = g_heap_blocks[i].ra;
+                if (top_n < 16) top_n++;
+            }
+        }
+    }
+
+    fprintf(stderr, "  [HEAP] ---- report: %s ----\n", why ? why : "(no reason)");
+    fprintf(stderr, "  [HEAP] arena 0x%08X..0x%08X (%u bytes), bump high-water %u,"
+                    " unreached %u\n",
+            (unsigned)XBOX_HEAP_BASE, (unsigned)XBOX_HEAP_TOP,
+            (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE),
+            (unsigned)(g_heap_next - XBOX_HEAP_BASE),
+            (unsigned)(XBOX_HEAP_TOP - g_heap_next));
+    fprintf(stderr, "  [HEAP] live %d blocks / %llu bytes;"
+                    " free %d blocks / %llu bytes; largest free %u;"
+                    " retained-beyond-request %llu; table %d entries (%d dead)\n",
+            live_n, (unsigned long long)live_bytes,
+            free_n, (unsigned long long)free_bytes,
+            (unsigned)largest_free, (unsigned long long)retained,
+            g_heap_block_count, dead_n);
+
+    /* Owners, largest first. own_used is small; a selection sort is clearer
+     * here than dragging in qsort's comparator indirection. */
+    for (i = 0; i < own_used && i < 20; i++) {
+        int best = i;
+        for (j = i + 1; j < own_used; j++)
+            if (own[j].bytes > own[best].bytes) best = j;
+        if (best != i) {
+            struct heap_owner t = own[i]; own[i] = own[best]; own[best] = t;
+        }
+        if (own[i].bytes < 64 * 1024) break;
+        fprintf(stderr, "  [HEAP]   ordinal %-4u ra=0x%08X : %u blocks, %llu bytes\n",
+                own[i].ord, own[i].ra, own[i].n,
+                (unsigned long long)own[i].bytes);
+    }
+    for (i = 0; i < top_n; i++) {
+        fprintf(stderr, "  [HEAP]   live 0x%08X size %-9u ordinal %-4u ra=0x%08X\n",
+                top_addr[i], top_size[i], top_ord[i], top_ra[i]);
+    }
+    fflush(stderr);
+}
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -2772,13 +2971,69 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * with E_OUTOFMEMORY -- which the title reports by clearing
      * global_d3d_device, so the rasterizer asserts and startup stops. */
     for (int i = 0; i < g_heap_block_count; i++) {
+        uint32_t spare, capacity, kept;
+
         if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
             continue;
         }
         if (g_heap_blocks[i].addr & (alignment - 1)) {
             continue;   /* wrong alignment for this request */
         }
+
+        /* Split, rather than handing the whole block over.
+         *
+         * Taking a 4 MB free block to satisfy a 16-byte request and recording
+         * it at its original size retires the rest of it for good: the block
+         * is live, so nothing can reuse the remainder, and it never comes back
+         * separately because the free that follows returns one entry. A title
+         * that churns small allocations against a heap whose free blocks came
+         * from big ones loses the difference every time.
+         *
+         * The table is address-ordered by construction (bump order), and
+         * coalescing depends on that, so the remainder is inserted at i+1
+         * rather than appended. XBOX_HEAP_SPLIT_MIN keeps the table from
+         * filling with slivers -- below it the padding stays with the block,
+         * which is what an allocator's minimum granularity is for. */
+        capacity = g_heap_blocks[i].size;
+        /* The remainder starts on a page boundary, not at the end of the
+         * request. A split at an arbitrary offset leaves a free block at an
+         * arbitrary address, and every caller here asks for at least 4 KB
+         * alignment -- so those remainders are unusable, and the heap fills
+         * with free memory nothing can allocate. That is what exhaustion
+         * looked like: 13.9 MB free, a 2.8 MB largest free block, and a
+         * 349 KB request failing anyway. The bytes between the request and
+         * the boundary stay with the block, which is what allocation
+         * granularity means. */
+        kept = (size + XBOX_HEAP_PAGE - 1) & ~(uint32_t)(XBOX_HEAP_PAGE - 1);
+        if (kept < size) kept = capacity;         /* overflow: do not split */
+        spare = capacity > kept ? capacity - kept : 0;
+        if (spare >= XBOX_HEAP_SPLIT_MIN &&
+            g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+            memmove(&g_heap_blocks[i + 2], &g_heap_blocks[i + 1],
+                    (size_t)(g_heap_block_count - i - 1) *
+                        sizeof g_heap_blocks[0]);
+            g_heap_block_count++;
+            g_heap_blocks[i + 1].addr = g_heap_blocks[i].addr + kept;
+            g_heap_blocks[i + 1].size = spare;
+            g_heap_blocks[i + 1].req = 0;
+            g_heap_blocks[i + 1].ra = 0;
+            g_heap_blocks[i + 1].ord = 0;
+            g_heap_blocks[i + 1].reused = 0;
+            g_heap_blocks[i + 1].free = 1;
+            g_heap_blocks[i].size = kept;
+        }
+
         g_heap_blocks[i].free = 0;
+        g_heap_blocks[i].req = size;
+        g_heap_blocks[i].ord = (uint16_t)g_heap_owner_ord;
+        g_heap_blocks[i].ra = g_heap_owner_ra;
+        g_heap_blocks[i].reused = 1;
+        if (++g_heap_reuse_count <= heap_trace_limit())
+            fprintf(stderr, "  [HEAP] reuse #%d 0x%08X size=%u (of %u) align=%u"
+                            " ordinal %u ra=0x%08X\n",
+                    g_heap_reuse_count, g_heap_blocks[i].addr, size,
+                    capacity, alignment,
+                    g_heap_owner_ord, g_heap_owner_ra);
         result = g_heap_blocks[i].addr;
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
         return result;
@@ -2791,32 +3046,15 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
-        /* Who ate the heap? Group live blocks by size -- an exhausted heap is
-         * nearly always one request size repeated, and the count names it. */
+        /* Who ate the heap? The size histogram this used to print named the
+         * repeated request size and nothing else -- not whether those blocks
+         * were still live, and not who asked for them. The full report does
+         * both, once, because the failing request usually repeats. */
         {
             static int dumped = 0;
-            static struct { uint32_t size; int n; } hist[256];
             if (!dumped) {
-                int used = 0;
                 dumped = 1;
-                for (int i = 0; i < g_heap_block_count; i++) {
-                    int j = 0;
-                    if (g_heap_blocks[i].free || !g_heap_blocks[i].size) continue;
-                    while (j < used && hist[j].size != g_heap_blocks[i].size) j++;
-                    if (j == used) {
-                        if (used == 256) continue;   /* ponytail: 256 distinct sizes is plenty */
-                        hist[used].size = g_heap_blocks[i].size;
-                        hist[used++].n = 0;
-                    }
-                    hist[j].n++;
-                }
-                for (int j = 0; j < used; j++) {
-                    if ((uint64_t)hist[j].n * hist[j].size < 1024 * 1024) continue;
-                    fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
-                            hist[j].n, hist[j].size,
-                            (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
-                }
-                fflush(stderr);
+                xbox_HeapReport("allocation failed");
             }
         }
         return 0;
@@ -2830,7 +3068,11 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
         g_heap_blocks[g_heap_block_count].addr = result;
         g_heap_blocks[g_heap_block_count].size = size;
+        g_heap_blocks[g_heap_block_count].req = size;
+        g_heap_blocks[g_heap_block_count].ord = (uint16_t)g_heap_owner_ord;
+        g_heap_blocks[g_heap_block_count].ra = g_heap_owner_ra;
         g_heap_blocks[g_heap_block_count].free = 0;
+        g_heap_blocks[g_heap_block_count].reused = 0;
         g_heap_block_count++;
     }
 
@@ -2863,61 +3105,113 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  */
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 {
+    uint32_t va;
     int i;
 
     if (!xbox_va)
         return 0;
+    va = heap_canonical_va(xbox_va);
     for (i = 0; i < g_heap_block_count; i++) {
-        if (g_heap_blocks[i].free)
+        if (g_heap_blocks[i].free || !g_heap_blocks[i].size)
             continue;
-        if (xbox_va >= g_heap_blocks[i].addr &&
-            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
-            return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+        if (va >= g_heap_blocks[i].addr &&
+            va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
+            return g_heap_blocks[i].size - (va - g_heap_blocks[i].addr);
     }
     return 0;
 }
 
+/* Next/previous table entry that still describes a block.
+ *
+ * Coalescing used to test index i-1 and i+1 directly, which stops working the
+ * moment anything has been merged: a merged-away entry is left with size 0 as
+ * a hole, and a hole between two adjacent free blocks made them permanently
+ * un-mergeable. The heap then fragments in a way no amount of freeing undoes.
+ * Skipping holes costs a short scan and keeps address order intact. */
+static int heap_live_entry_after(int i)
+{
+    for (i++; i < g_heap_block_count; i++)
+        if (g_heap_blocks[i].size) return i;
+    return -1;
+}
+
+static int heap_live_entry_before(int i)
+{
+    for (i--; i >= 0; i--)
+        if (g_heap_blocks[i].size) return i;
+    return -1;
+}
+
 void xbox_HeapFree(uint32_t xbox_va)
 {
-    static int frees = 0, matched = 0;
+    static int frees = 0, matched = 0, missed = 0;
+    uint32_t va;
+    int next, prev;
 
     if (!xbox_va) {
         return;
     }
     frees++;
-    if (frees <= 8) {
-        fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
-                frees, xbox_va, g_heap_block_count);
-        fflush(stderr);
-    }
+    va = heap_canonical_va(xbox_va);
     for (int i = 0; i < g_heap_block_count; i++) {
-        if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
+        if (!g_heap_blocks[i].size || g_heap_blocks[i].addr != va ||
+            g_heap_blocks[i].free) {
             continue;
         }
+        /* Opt-in poison. Routing the title's frees to this heap means memory
+         * can now be handed to a second owner, so a stale guest pointer stops
+         * being harmless and starts reading someone else's data -- which looks
+         * like ordinary corruption from the fault site. Filling a freed block
+         * with a pattern no valid pointer or float has makes the read visible
+         * as itself: the faulting address is the poison. */
+        if (heap_poison_byte() >= 0)
+            memset((void *)((uintptr_t)g_heap_blocks[i].addr + g_memory_offset),
+                   heap_poison_byte(), g_heap_blocks[i].size);
+        if (frees <= heap_trace_limit())
+            fprintf(stderr, "  [HEAP] free #%d va=0x%08X size=%u ordinal %u "
+                            "ra=0x%08X\n",
+                    frees, xbox_va, g_heap_blocks[i].size,
+                    g_heap_owner_ord, g_heap_owner_ra);
         g_heap_blocks[i].free = 1;
+        g_heap_blocks[i].req = 0;
+        g_heap_blocks[i].ord = 0;
+        g_heap_blocks[i].ra = 0;
         if (++matched % 512 == 0) {
-            fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
-                    frees, matched, g_heap_block_count);
+            fprintf(stderr, "  [HEAP] frees=%d matched=%d missed=%d blocks=%d\n",
+                    frees, matched, missed, g_heap_block_count);
             fflush(stderr);
         }
 
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
-        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
-            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
-            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+        /* Coalesce with neighbours. Blocks are recorded in address order, so
+         * adjacency is a simple end==start test against the nearest entry that
+         * still describes a block. Keeps large contiguous requests satisfiable
+         * after a lot of small churn. */
+        next = heap_live_entry_after(i);
+        if (next >= 0 && g_heap_blocks[next].free &&
+            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[next].addr) {
+            g_heap_blocks[i].size += g_heap_blocks[next].size;
+            g_heap_blocks[next].size = 0;
+            g_heap_blocks[next].addr = 0;
         }
-        if (i > 0 && g_heap_blocks[i - 1].free &&
-            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
-            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
+        prev = heap_live_entry_before(i);
+        if (prev >= 0 && g_heap_blocks[prev].free &&
+            g_heap_blocks[prev].addr + g_heap_blocks[prev].size == g_heap_blocks[i].addr) {
+            g_heap_blocks[prev].size += g_heap_blocks[i].size;
             g_heap_blocks[i].size = 0;
             g_heap_blocks[i].addr = 0;
         }
         return;
+    }
+
+    /* A free that matches nothing is not automatically a bug -- pinned
+     * contiguous allocations never came from this table -- but it is exactly
+     * what a leak looks like from here, so say it rather than returning in
+     * silence. Bounded: a title that does it once does it constantly. */
+    if (++missed <= heap_trace_limit()) {
+        fprintf(stderr, "  [HEAP] free of 0x%08X (canonical 0x%08X) matched no "
+                        "block (miss #%d of %d frees, ordinal %u ra=0x%08X)\n",
+                xbox_va, va, missed, frees, g_heap_owner_ord, g_heap_owner_ra);
+        fflush(stderr);
     }
 }
 

@@ -1434,6 +1434,23 @@ class BatchTranslator:
             for addr, name in self.translator.lifter.referenced_calls.items()
             if name not in defined
         }
+        # Shared switch epilogues are often inside an already detected case.
+        # A bare-ret placeholder there silently leaves its saved registers on
+        # the stack. Recover only bounded, instruction-aligned return blocks.
+        from .shared_epilogue import recover_shared_epilogue
+        recovered_epilogues = []
+        for addr, name in sorted(unresolved.items()):
+            code = recover_shared_epilogue(self.translator, addr, name)
+            if code:
+                translations.append((addr, name, code))
+                recovered_epilogues.append(addr)
+                stats["translated"] += 1
+                stats["total_lines"] += code.count("\n")
+        for addr in recovered_epilogues:
+            del unresolved[addr]
+        if recovered_epilogues:
+            translations.sort(key=lambda item: item[0])
+        stats["recovered_epilogues"] = recovered_epilogues
         stats["unresolved_stubs"] = len(unresolved)
         stats["manual_functions"] = len(manual_decls)
         # Instructions the lifter has no translation for become a comment, and
@@ -1570,6 +1587,7 @@ class BatchTranslator:
                 "",
                 "#define RECOMP_GENERATED_CODE",
                 f'#include "{header_name}"',
+                "#include <stdio.h>",
                 "",
             ]
             stub_lines.append(
@@ -1589,11 +1607,34 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            stub_lines.append(
+                "/* A stub that runs is a return path this build got wrong, and it")
+            stub_lines.append(
+                " * used to run in silence -- the damage showed up frames later as")
+            stub_lines.append(
+                " * a caller with rotated callee-saved registers, with nothing")
+            stub_lines.append(
+                " * naming the address responsible. Say it once per address: the")
+            stub_lines.append(
+                " * first line is the one that matters, and a title that reaches a")
+            stub_lines.append(
+                " * stub in its main loop reaches it constantly. */")
+            stub_lines.append("static void recomp_stub_ran(unsigned address,")
+            stub_lines.append("                            const char *note)")
+            stub_lines.append("{")
+            stub_lines.append("    fprintf(stderr, \"  [STUB] unresolved target 0x%08X ran (%s); \"")
+            stub_lines.append("                    \"its caller's stack is off\\n\", address, note);")
+            stub_lines.append("    fflush(stderr);")
+            stub_lines.append("}")
+            stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ static int _seen; "
+                    f"if (!_seen) {{ _seen = 1; "
+                    f"recomp_stub_ran(0x{addr:08X}u, \"{note}\"); }} "
+                    f"g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")

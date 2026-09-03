@@ -57,22 +57,15 @@ extern MCPXAPUState *g_apu_state;
 
 static volatile int g_pushbuf_ack_stop;
 
-/*
- * Drive the NV2A pusher from JSRF's live command ring.
+/* Drive the NV2A pusher from completed JSRF submissions. Device +0 is
+ * the writer's allocation cursor, not a publication barrier. sub_001912EC
+ * publishes completed packets to the channel's DMA_PUT (0xFD800040).
+ * Reading +0 used to consume partly written packets and stale ring tails.
  *
- * The ring write cursor and its limit are the D3D device's first two fields --
- * device +0x00 / +0x04, which the push primitive sub_0018E930 advances, and
- * which d3d8ltcg-device-context.md calls pb_put / pb_limit. The +0x30 / +0x34
- * pair the ack below uses are INDICES, not addresses; reading them as
- * addresses yields two-byte "ranges".
- *
- * RING DISCOVERY IS THE ONE TITLE-SPECIFIC PART of this route, and it lives
- * here rather than in src/nv2a for that reason. JSRF does not use the PFIFO
- * USER area at 0xFD800040/44, so there is nothing generic to read yet.
- *
- * The index ack is left exactly as it was and still runs. It is what the guest
- * waits on, and replacing it with real consumption timing is a separate change
- * -- this one only adds a reader alongside it.
+ * Ring bounds remain title-specific: device +0x24/+0x28. The CPU path uses
+ * this title's low physical RAM backing; it does not add 0x80000000.
+ * The +0x30/+0x34 index acknowledgement is sampled before consumption, and
+ * only that sampled index is acknowledged after the published span is read.
  */
 #define JSRF_PB_PUT_VA    0x0019B200u
 #define JSRF_PB_LIMIT_VA  0x0019B204u
@@ -121,27 +114,26 @@ void jsrf_render_probe(uint32_t pc)
     }
 }
 
-static void jsrf_pb_feed(uint32_t from, uint32_t to)
+static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
 {
-    if (to <= from) return;
-    if (to - from > 0x100000u) return;          /* implausible span */
-    /* The cursor is a plain guest VA for this title.
-     *
-     * Upstream found that DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
-     * VA & 0x0FFFFFFF and reads the position back as GET | 0x80000000 -- and
-     * that reading it raw walks unrelated memory that merely decodes. That is
-     * real, and it does NOT apply here: JSRF publishes its ring through D3D8
-     * globals rather than the PFIFO USER channel. Tested by feeding from
-     * `from | XBOX_CONTIG_BASE` instead: the contiguous view is all zeros,
-     * 3,939 dwords yielding 0 methods, while the raw view yields 2,734 with
-     * no bad headers. The raw address is the right one for this title. */
-    nv2a_pusher_run((const uint32_t *)XBOX_PTR(from), (to - from) / 4u);
+    NV2APusherResult invalid = {0, 0, 0, NV2A_PUSHER_INVALID};
+    if (to <= from) return invalid;
+    if (to - from > 0x100000u) return invalid;          /* implausible span */
+    /* JSRF's DMA objects and allocations map this low physical range to
+     * guest RAM. The separate high contiguous window is not its backing. */
+    static uint32_t snapshot[0x100000/4];
+    memcpy(snapshot, (const void *)XBOX_PTR(from), to-from);
+    return nv2a_pusher_run_segment(snapshot, (to-from)/4u);
 }
 
-static void jsrf_pb_poll(void)
+static int jsrf_pb_poll(void)
 {
-    uint32_t now = MEM32(JSRF_PB_PUT_VA);
-    if (!now) return;
+    static int stream_fault;
+    if (stream_fault) return 0;
+    /* sub_001912EC publishes completed packets to the DMA channel. The
+     * device's +0 writer cursor can point past a header still being filled. */
+    uint32_t now = MEM32(0xFD800040u);
+    if (!now) return 0;
 
     if (!g_pb_last) {
         g_pb_ring_lo = MEM32(JSRF_PB_START_VA);
@@ -158,18 +150,37 @@ static void jsrf_pb_poll(void)
                 now, MEM32(JSRF_PB_LIMIT_VA), g_pb_ring_lo, g_pb_ring_hi,
                 g_pb_ring_lo ? "" : " (bounds rejected; wraps skipped)");
         fflush(stderr);
-        g_pb_last = now;
-        return;
+        g_pb_last = g_pb_ring_lo ? g_pb_ring_lo : now;
     }
 
-    if (now > g_pb_last) {
-        jsrf_pb_feed(g_pb_last, now);
-    } else if (now < g_pb_last && g_pb_ring_lo) {
-        /* Wrapped: finish the tail, then take the head. */
-        jsrf_pb_feed(g_pb_last, g_pb_ring_hi);
-        jsrf_pb_feed(g_pb_ring_lo, now);
+    /* A published cursor can split a packet. Advance only by the dwords
+     * actually consumed, and follow the ring's jump instead of parsing its
+     * unused tail as commands. Bounds come from the title's live device. */
+    for (unsigned segment=0; g_pb_last!=now && segment<8; ++segment) {
+        if (g_pb_ring_lo && (now<g_pb_ring_lo || now>g_pb_ring_hi)) break;
+        uint32_t end = now>g_pb_last ? now : g_pb_ring_hi;
+        if (!end || end<=g_pb_last) break;
+        NV2APusherResult result = jsrf_pb_feed(g_pb_last, end);
+        g_pb_last += result.consumed*4;
+        if (result.stop==NV2A_PUSHER_JUMP) {
+            if (g_pb_ring_lo && result.jump_address>=g_pb_ring_lo
+                    && result.jump_address<g_pb_ring_hi && !(result.jump_address&3)
+                    && result.jump_address!=g_pb_last-4) {
+                g_pb_last=result.jump_address;
+                continue;
+            }
+            stream_fault=1;
+            fprintf(stderr,"[PUSHER] rejected jump %08X at %08X\n",result.jump_address,g_pb_last-4);
+            break;
+        }
+        if (result.stop==NV2A_PUSHER_INVALID) {
+            stream_fault=1;
+            static unsigned errors;
+            if (++errors<=4) fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",MEM32(g_pb_last),g_pb_last);
+        }
+        if (result.stop!=NV2A_PUSHER_END || !result.consumed) break;
+        if (g_pb_last==g_pb_ring_hi && now<g_pb_last) g_pb_last=g_pb_ring_lo;
     }
-    g_pb_last = now;
 
     /* The guest's FLIP_STALL is the only "frame is complete" signal in the
      * ring. Present here, on the thread holding the rendering context --
@@ -183,6 +194,7 @@ static void jsrf_pb_poll(void)
             fflush(stderr);
         }
     }
+    return !stream_fault && g_pb_last==now;
 }
 
 /* The index pair the guest's own wait loop watches: [dev+0x30] is PUT and
@@ -399,18 +411,14 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
     xbox_d3d8_make_current();
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
-        jsrf_pb_poll();
+        /* Snapshot the fence before consuming its commands. Reading PUT again
+         * afterwards acknowledged newer, unconsumed work and allowed the
+         * producer to overwrite the ring underneath the parser. */
+        uint32_t getp = dev ? MEM32(dev + JSRF_D3D_GETPTR_OFFSET) : 0;
+        uint32_t submitted = dev ? MEM32(dev + JSRF_D3D_PUT_OFFSET) : 0;
+        int consumed = jsrf_pb_poll();
         jsrf_pusher_report();
-        if (dev) {
-            uint32_t getp = MEM32(dev + JSRF_D3D_GETPTR_OFFSET);
-            if (getp) {
-                uint32_t put = MEM32(dev + JSRF_D3D_PUT_OFFSET);
-                uint32_t get = MEM32(getp);
-                if (get != put) {
-                    MEM32(getp) = put;
-                }
-            }
-        }
+        if (getp && consumed && MEM32(getp)!=submitted) MEM32(getp)=submitted;
         Sleep(0);
     }
     return 0;
@@ -763,6 +771,7 @@ int main(int argc, char **argv)
 {
     const char *xbe_path = argc > 1 ? argv[1] : JSRF_XBE_PATH;
     const char *game_dir = argc > 2 ? argv[2] : JSRF_GAME_DIR;
+    const char *hdd_root = getenv("RECOMP_HDD_ROOT");
     void *xbe_data = NULL;
     size_t xbe_size = 0;
     recomp_func_t entry;
@@ -801,12 +810,13 @@ int main(int argc, char **argv)
     }
 
     xbox_kernel_init();
-    if (!ensure_directory(JSRF_HDD_ROOT)) {
-        fprintf(stderr, "failed to create emulated HDD root: %s\n", JSRF_HDD_ROOT);
+    if (!hdd_root || !*hdd_root) hdd_root = JSRF_HDD_ROOT;
+    if (!ensure_directory(hdd_root)) {
+        fprintf(stderr, "failed to create emulated HDD root: %s\n", hdd_root);
         return 1;
     }
-    printf("Writable emulated HDD root: %s\n", JSRF_HDD_ROOT);
-    xbox_path_init(game_dir, JSRF_HDD_ROOT);
+    printf("Writable emulated HDD root: %s\n", hdd_root);
+    xbox_path_init(game_dir, hdd_root);
     xbox_kernel_bridge_init();
 
     /* PROBE: bring up the D3D8 HLE layer (src/d3d, OpenGL 3.3 backend on

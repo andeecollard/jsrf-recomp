@@ -1,0 +1,351 @@
+================================================================================
+CODEX HANDOVER - JSRF bring-up on xboxrecomp (macOS / arm64)
+Written 2026-09-03. SUPERSEDES CODEX_HANDOVER.txt for anything they disagree on.
+================================================================================
+Worktree : /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/
+           Jet Set Radio Future/upstream_xboxrecomp_clean
+Companions: CLAUDE_HANDOVER.txt sections 6-15 (the long form of all of this),
+            QWEN_CONTEXT.md (regeneration paths), ROUTE_B_PLAN.txt (history)
+
+Same convention as the old CODEX handover: everything below was MEASURED unless
+it says otherwise. Claims later found wrong are RETRACTED in section 7 rather
+than quietly deleted. Read section 7 before building on anything, including
+anything in CODEX_HANDOVER.txt or ROUTE_B_PLAN.txt.
+
+
+================================================================================
+0. STATUS IN ONE PAGE
+================================================================================
+Two runtime bugs were found and fixed this session. Both also affected the
+pre-merge tree, so neither was a merge regression.
+
+  1. rdtsc lifted to "/* TODO: rdtsc */", which is NOT a no-op: EAX and EDX kept
+     whatever they held. JSRF times a startup step with rdtsc and concluded the
+     disc was damaged. It was sitting in its own disc-error dialog. FIXED.
+  2. The CPU executor did not decode NV097_INLINE_ARRAY, which is how JSRF
+     submits vertices. FIXED.
+
+Runtime now, from a pristine emulated HDD, stable between 25s and 120s:
+
+    JSRF_FATAL.ERR         not written        (was: written, every run)
+    file opens             12                 (was: 9)
+    cached assets          jetfont + se_sys   (was: none completed)
+    command dwords         ~188,000,000       (was: 3,151)
+    clears / flips         ~250,000 each      (was: 7 / 3)
+    real geometry draws    0                  (was: 0)
+
+The title now runs a healthy frame loop doing real per-frame float work. It
+draws ONE full-screen triangle, repeated - not a scene. It loads nothing after
+two assets. It shows no dialog. It is not blocked on a wait.
+
+TWO BLOCKERS REMAIN, both multi-session projects, both scoped in section 5:
+  A. the vertex program cannot be run, so no geometry can be placed
+  B. the title has no controller, and there is no path for one
+
+
+================================================================================
+1. BUILD, RUN, TEST
+================================================================================
+All from the worktree root.
+
+Build:
+  cmake --build build-macos/jsrf-first-fault/build \
+    --target jsrf_first_fault jsrf_av_encoder_option_test --parallel 6
+
+Tests (all green as of this handover):
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+  PYTHONPATH='/Users/andrewcollard/Library/Python/3.9/lib/python/site-packages' \
+    python3 -m pytest tools/recomp tools/disasm tools/func_id tools/kernel_audit \
+    --ignore=tools/recomp/test_config.py -q
+  /usr/bin/python3 tools/recomp/test_config.py            (fresh process, required)
+  /usr/bin/python3 tools/disasm/test_callback_targets.py
+
+Run, bounded, logs preserved (pick a NEW name each time):
+  /usr/bin/python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 25
+  -> build-macos/jsrf-first-fault/render-investigation/NAME/stderr.log
+
+RESET STATE BETWEEN RUNS. emulated-hdd is mutable and WILL change results if
+reused. A pristine copy is kept:
+  rm -rf build-macos/jsrf-first-fault/emulated-hdd
+  cp -a  build-macos/merge-audit/emulated-hdd-pristine \
+         build-macos/jsrf-first-fault/emulated-hdd
+
+Everything reproduces HEADLESS. No desktop needed. CLAUDE_HANDOVER section 4's
+claim that desktop access is essential is true only for window-backed clears.
+
+
+================================================================================
+2. COMMITS THIS SESSION (base 419c43a, newest first)
+================================================================================
+511e9ea  Knock on the root hub, and find out what else is missing
+1698432  A root hub with no ports, and a reset that never finished
+d03e5d7  Correction: the fake pad proved nothing, because nothing could read it
+19822d1  The microcode parser has never seen microcode, and does not survive it
+9595443  Record the vertex program instead of guessing at it
+69f3b24  A pad that says yes, and what it ruled out          [see 7.1, RETRACTED]
+e089140  The viewport is a normal 640x480 one, and the geometry is one triangle
+1b44943  INLINE_ARRAY: the geometry was always there, in the command stream
+296a0a2  rdtsc was not a no-op, and JSRF was reading two stale registers
+71dfab6  The game is not waiting. It is showing an error.
+10516c5  Find the instruction that gives up
+8b450d3  The cache the title could see but not use
+
+Each commit message carries its own evidence. They are long on purpose.
+
+
+================================================================================
+3. THE TWO FIXES, IN CASE YOU NEED TO REASON ABOUT THEM
+================================================================================
+3.1 rdtsc  (296a0a2)
+sub_00145560 is JSRF's QueryPerformanceCounter and is literally `rdtsc`.
+sub_00145571 is its QueryPerformanceFrequency and returns 0x2BB5C755 =
+733333333, the Xbox CPU clock. At 0x00025370 the title compares an elapsed
+value against 0xE4E1C0 = 15000000 ticks, about 20.5 ms. Over that it tail-jumps
+at 0x0002537E to sub_0006F730, which pushes 0x400000 - the exact bit tested at
+0x0006EE5C - and raises the disc-error dialog.
+
+Implemented in src/kernel/recomp_tsc.c as a monotonic host clock scaled to
+733333333, declared in templates/runtime/recomp_types.h, emitted by
+tools/recomp/lifter.py.
+
+*** build-macos/jsrf-first-fault/gen IS HAND-PATCHED at the three rdtsc sites
+*** (recomp_0006/0007/0009: sub_00145560, sub_0015FA20, sub_00193C40) so this
+*** could be tested WITHOUT resetting the seed accumulator. The committed
+*** lifter change emits the same code on the next regeneration. Carry nothing
+*** across by hand. gen/recomp_types.h was refreshed from templates/ likewise.
+
+3.2 The disk cache  (8b450d3)
+Upstream's Partition3/4/5 rules gave \Device\Harddisk0\Partition5 a mapping it
+did not have, so JSRF's cache probe started succeeding and the title began
+caching. Every cache write then failed: it writes through
+Z:\Media\Font\jetfont.dat~ without creating the directories above it, and Font
+is not among the directories it creates at startup. Fixed by creating parents
+on any disposition that creates, keyed on O_CREAT so it cannot drift from
+posix_open_flags.
+
+3.3 INLINE_ARRAY  (1b44943)
+JSRF pushes vertices with NV097_INLINE_ARRAY (0x1818), 1.2M times per 25s. The
+executor knew only ARRAY_ELEMENT16. Inline data has no offset or stride: the
+layout is implied by which attributes declare a non-zero size and what format
+each gives, packed in attribute order, recomputed per batch. fetch_vertex() is
+the single indirection; the rasteriser is unchanged.
+
+
+================================================================================
+4. WHERE IT ACTUALLY STOPS
+================================================================================
+4.1 GEOMETRY
+draws went 0 -> 103,924, but ALL FORTY sampled batches are BYTE-IDENTICAL:
+  prim 5, 12 dwords, stride 4 dw, attr0 position (2 floats), attr9 (2 floats)
+  v0 (  -0.53,   -0.53) uv (   0,    0)
+  v1 (2559.47,   -0.53) uv (2560,    0)
+  v2 (  -0.53, 1919.47) uv (   0, 1920)
+One full-screen triangle drawn 103,924 times. Not a scene.
+
+The viewport is a textbook 640x480 one - scale (320,-240,16777215,0), offset
+(320.531,240.531,0,0) - so the target really is 640x480 and the 4x is real.
+The vertices are neither screen space nor NDC (through that viewport v1 lands
+at x=819350). They are inputs to the title's VERTEX PROGRAM.
+
+DO NOT DIVIDE BY FOUR. It lands this one triangle and is a coincidence fit. The
+title uploads only c0 (1,1,16777215,1), c1 (0.53125,0.53125,0,0) and
+c60..c62 - c0.xy is 1, there is NO scale constant anywhere - so the factor of
+four is inside the instructions and cannot be recovered from outside them.
+
+Note also: nv2a_pb_exec.c assumes attr0 is position and attr3 is colour. That
+is a FIXED-FUNCTION assumption. In a programmable pipeline the semantics are
+whatever the program assigns, and this program has not been read. The
+"position" it plots may not be one.
+
+4.2 ASSETS
+sub_00025DD0 is the asset-open helper. Over 30s it is called EXACTLY THREE
+TIMES and never again:
+  #1 ret 0x00033AD7   a0 = a stack buffer
+  #2 ret 0x0002C08E   a0 = "D:\Media\Font\jetfont.dat"
+  #3 ret 0x0002C146   a0 = a runtime-built path (se_sys)
+Not looping, not retrying, not failing. NOTHING ASKS IT FOR A FOURTH ASSET. The
+stall is upstream of the loader, in whatever decides what to load.
+
+There IS a cache state machine at sub_00026170 (jump table 0x000261E8, state 2
+is a terminal "mov eax,1 / ret"), and it is NEVER CALLED. Do not start there.
+
+12-second stack sample (build-macos/merge-audit/claude-sample-steady.txt) puts
+the live work at sub_00151DD0 (heaviest, a domain-checked float routine),
+sub_0014CCA0 (a maxss/minss clamp), the sub_00013A80 / sub_00013930 main-loop
+chain, sub_000659C0, and a large cluster in the D3D section 0x0018D000-0x00198000.
+
+
+================================================================================
+5. THE TWO BLOCKERS, SCOPED
+================================================================================
+5.1 BLOCKER A - THE VERTEX PROGRAM
+Everything visual is behind this. Texturing does NOT substitute: all four
+texture units are programmed and src/d3d/d3d8_swizzle.h exists, but a texture
+cannot help until a batch can be placed.
+
+src/d3d/d3d8_vsh.c is a 1470-line NV2A microcode parser and it DOES NOT DECODE
+MICROCODE. Checked against a program captured from JSRF:
+  - insn[0] as bits 0..31 (what vsh_extract does): every slot is MAC=NOP ILU=NOP,
+    because the first uploaded dword is zero in all of them
+  - words reversed: ILU opcode 8 (the unit has 0..7) and constants c128/c143,
+    which the title never uploads
+The test vector is in that file and in docs/technical/nv2a-shaders.md. FIX THE
+LAYOUT UNTIL IT DISASSEMBLES THAT, then run it in nv2a_pb_exec.c.
+
+You need the real XVS encoding - xemu nv2a_vsh.c, envytools, or the SDK. Do NOT
+reconstruct it from memory: a wrong field position yields a plausible shader
+rather than an error, which is the worst outcome available. An empirical search
+over five instructions is underdetermined; too many offsets survive while the
+high word is zero.
+
+5.2 BLOCKER B - INPUT
+JSRF's XPP section is a USB stack. It drives the OHCI host controller at
+0xFED00000 DIRECTLY. Nothing in src/input is reachable from the guest, in this
+tree or upstream (see 6).
+
+Two register-semantics bugs were fixed (1698432), measured not assumed:
+  HcCommandStatus +0x08 bit 0 (HostControllerReset) is SELF-CLEARING; on plain
+    RAM the reset never finished
+  HcRhDescriptorA +0x48 low byte (NDP, port count) is READ-ONLY; XPP writes the
+    register for NPS/NOCP and on RAM that zeroed NDP, so the root hub reported
+    ZERO PORTS and nothing could ever attach
+Both are now held from the NV2A ack tick. Two ports is a CHOICE, not a
+measurement; RECOMP_OHCI_PORTS overrides it.
+
+Attaching a controller still needs, in order:
+  1. the connect announcement timed AFTER HcInterruptEnable has RHSC (0x40).
+     The current probe gates on HcControl and fires too early - fix this first.
+  2. an ISR path that accepts the interrupt. It currently declines.
+  3. service for the control transfers XPP issues through the HCCA at
+     0x01452000 - device/config/HID descriptors, ED/TD, completion writeback.
+That is device emulation, sized as its own project.
+
+WHETHER INPUT IS EVEN THE STALL IS UNPROVEN. See 7.1.
+
+
+================================================================================
+6. WHAT UPSTREAM DID ABOUT THESE (checked, not assumed)
+================================================================================
+sp00nznet/xboxrecomp does NOT solve either blocker, though its gap analysis
+marks both done. Verified against upstream/work/v0.7.0-non-local:
+
+  "USB/OHCI gamepad | N/A | Bypassed via XInput"
+  "Controller polling (4 ports) | DONE | XInput backend"
+    -> xbox_InputGetState / xbox_InputInit appear ONLY in src/input/* and its
+       README across the WHOLE tree. Nothing in src/kernel, src/d3d, the thunk
+       table, tools/, or generated code calls them. The XInputGetState in
+       win32_compat.c is a POSIX stub for the HOST api, not a guest bridge.
+       The bypass is an intention. The module is dead code there too - so this
+       defect is INHERITED, not introduced by the JSRF merge.
+
+  "Vertex shader microcode translation - DONE. d3d8_vsh.c/h: 1,868 lines"
+    -> their d3d8_vsh.c is BYTE-IDENTICAL to ours (1470 lines, not 1868) and
+       every VSH_FIELD_* offset matches. It fails the same vector.
+
+Fair caveat: upstream targets Windows/D3D11 and that path was not exercised
+here. But an uncalled function is uncalled on every platform, and the shader
+file is the same file.
+
+The test vector in docs/technical/nv2a-shaders.md is worth sending upstream.
+
+
+================================================================================
+7. RETRACTIONS - READ BEFORE TRUSTING ANYTHING
+================================================================================
+7.1 "Not waiting for a button" - WITHDRAWN
+Commit 69f3b24 added RECOMP_FAKE_PAD, saw no change, and concluded the title is
+not waiting on A/START. That is unsupported: xbox_InputGetState is unreachable
+from the guest, so the title could not read the pad and the test was vacuous.
+The hypothesis is OPEN. Do not re-run that test expecting it to mean anything
+until src/input is wired to the guest.
+
+7.2 "The 100k IRQL pairs are USB polling" - WRONG
+sub_001BD5FF is a generic interlocked read-and-reset helper called from all
+over the game code. The OHCI init sub_001BD14A runs EXACTLY ONCE (probed and
+counted). The USB stack initialised and went quiet.
+
+7.3 "readable geometry" (commit 1b44943) - OVERSTATED
+Corrected in e089140. It is one triangle repeated, not a scene.
+
+7.4 A DIAGNOSTIC IN THIS TREE HAS BEEN LYING
+The device-ISR log line prints en(+0x140) and intr(+0x100) - NV2A PMC offsets -
+against an OHCI regbase whose interrupt registers are +0x10 and +0x0C. EVERY
+"ISR ... -> FALSE ... en=0 intr=0" line about 0xFED00000 in every log in this
+tree reports the wrong registers and says nothing about USB. Worth fixing; it
+is small.
+
+7.5 STALE ELSEWHERE
+CODEX_HANDOVER.txt and ROUTE_B_PLAN.txt predate all of the above. In
+particular ROUTE_B_PLAN section 15 concludes the renderer "is never asked to
+draw" and costs the remainder as title-specific state-machine RE. That framing
+is wrong: the game was in an error dialog and the error was ours (3.1).
+
+7.6 A TRIED-AND-REVERTED IDEA, DO NOT REPEAT
+Padding a short read up to the requested length inside the file's last 512-byte
+sector, on the theory that JSRF treats a short read as damaged media. Removed
+every short read, changed nothing, and the premise was wrong twice: NT reports
+the true count at EOF, and an Xbox disc sector is 2048 bytes.
+
+
+================================================================================
+8. INSTRUMENTS (all env-gated, all off by default)
+================================================================================
+RECOMP_PATH_TRACE=1        path translation incl. symlink resolution. XBOX_TRACE
+                           is compiled out without _DEBUG, so the path layer is
+                           otherwise silent in a release build.
+RECOMP_FILE_BACKTRACE=SUB  guest stack scan at a file open whose path contains
+                           SUB, plus a candidate this-pointer and its +0xA0
+                           string. This is what identified the disc dialog.
+RECOMP_DIALOG_SCAN=1       live message-box objects by vtable 0x001CC660. A
+                           dialog that only sits on screen writes nothing and is
+                           invisible otherwise. Reports NONE at 25s.
+RECOMP_OHCI_DUMP=n         root-hub register block, n times.
+RECOMP_OHCI_ATTACH=1       announce a device on port 1 (see 5.2; fires too early)
+RECOMP_OHCI_PORTS=n        override the NDP the root hub reports (default 2)
+RECOMP_PB_EXEC=1           the CPU executor (second sink; default path untouched)
+RECOMP_PB_EXEC_VERBOSE=1   per-batch dump incl. inline layout and raw words
+RECOMP_PB_EXEC_PROGRAM=1   every write to 0x0B00..0x0BFC and 0x1E9C..0x1EA4
+RECOMP_PB_EXEC_TOP=n       raise the unhandled ranking past its top ten
+RECOMP_PB_EXEC_NOCLIPTEST=1 rasterise batches rejected as not screen-space
+RECOMP_FB_DUMP=prefix      framebuffer BMPs
+RECOMP_FAKE_PAD=1          synthetic pad - USELESS, see 7.1
+NV2A method names: src/nv2a/nv2a_regs.h, 469 authoritative NV097_ defines. USE
+IT. It confirmed 0x1E9C/0x1EA4 and identified 0x0840 (SET_TEXGEN_PLANE_S),
+0x0A50 (SET_EYE_POSITION), 0x0300 (SET_ALPHA_TEST_ENABLE).
+
+
+================================================================================
+9. THE TECHNIQUE THAT CRACKED MOST OF THIS
+================================================================================
+HAND-EDIT build-macos/jsrf-first-fault/gen AND REBUILD. It is git-ignored, it
+does not touch the seed accumulator, and a regeneration discards it. Printing
+MEM32(esp) at a function's entry names its caller, because each call site pushes
+a distinct return address. That is how the disc-error call site, the OHCI init
+count and the asset-loader count were all obtained.
+
+THE GUEST TRACE HOOKS CANNOT DO THIS. diagnostics/jsrf_first_fault/guest_trace.h
+declares jsrf_trace_function, but RECOMP_GUEST_FUNCTION appears NOWHERE in the
+generated code, so it is never called - verified against the main loop, which
+runs constantly. A hook placed there cannot fire for any function.
+
+Resolve addresses to functions with build-macos/jsrf-first-fault/disasm/
+functions.json; the per-section disassembly is in disasm/asm/ (text.asm, D3D.asm,
+XPP.asm, ...). XPP is the USB stack.
+
+
+================================================================================
+10. SUGGESTED ORDER
+================================================================================
+1. Fix d3d8_vsh.c against the vector (5.1). Everything visual waits on it, and
+   it is the only item where the missing piece is a document rather than work.
+2. Then run the program in nv2a_pb_exec.c and place the batches. Only then does
+   texturing (nv2a_regs.h formats + d3d8_swizzle.h) mean anything.
+3. Fix the lying ISR log line (7.4). Small, and it has been misleading readers
+   of this tree for a long time.
+4. What decides to request assets (4.2). Independent of 1-3.
+5. USB device emulation (5.2), if input is the goal.
+
+WHAT NOT TO DO: divide by four (4.1); trust d3d8_vsh.c (5.1); re-run the fake
+pad (7.1); start from sub_00026170 (4.2); pad short reads (7.6); regenerate
+just to repeat completed work - and if you DO regenerate, 3.1's hand-patch goes
+away and the lifter change replaces it, which is correct and expected.
