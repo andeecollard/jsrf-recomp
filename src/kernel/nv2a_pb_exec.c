@@ -54,6 +54,7 @@ extern void xbox_FramebufferWindowStart(void);
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
 #define NV097_SET_BEGIN_END               0x17FC
 #define NV097_ARRAY_ELEMENT16             0x1800
+#define NV097_INLINE_ARRAY                0x1818
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -68,12 +69,18 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
+/* Inline vertex data arrives as one dword per push, so a batch needs room for
+ * the whole primitive: 16384 dwords is 2048 vertices at a typical eight-dword
+ * layout, and the index array caps the batch at 4096 either way. */
+#define NV_MAX_INLINE_WORDS 16384
 
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
     uint16_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
+    uint32_t   inline_words[NV_MAX_INLINE_WORDS];
+    uint32_t   inline_count;            /* dwords pushed this batch, 0 = none */
     uint32_t   draws, verts, nonzero_draws;
     float      min_x, max_x, min_y, max_y;
     uint32_t color_offset, pitch, format;
@@ -107,6 +114,67 @@ static void note_unhandled(uint32_t method)
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled_count++;
     }
+}
+
+/* Where each attribute sits inside one inline vertex, in dwords.
+ *
+ * INLINE_ARRAY carries the vertices in the command stream instead of pointing
+ * at a buffer, so there is no offset or stride to read: the layout is implied
+ * by which attributes are enabled and what format each one declares, packed in
+ * attribute order. Recomputed per batch, because a title changes the format
+ * between batches and a stale layout silently misreads every vertex.
+ *
+ * s_inline_stride of 0 means the layout could not be derived -- an attribute
+ * declared a format this decoder does not know how to size -- and the batch is
+ * then left alone rather than guessed at. */
+static uint32_t s_inline_off[NV_VERTEX_ATTRS];
+static uint32_t s_inline_stride;
+
+#define INLINE_ATTR_ABSENT 0xFFFFFFFFu
+
+static void inline_layout(void)
+{
+    uint32_t a, n = 0;
+
+    s_inline_stride = 0;
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        s_inline_off[a] = INLINE_ATTR_ABSENT;
+        if (!at->size)
+            continue;
+        s_inline_off[a] = n;
+        if (at->type == 2)                  /* float per component */
+            n += at->size;
+        else if (at->type == 4)             /* four normalised bytes, one dword */
+            n += 1;
+        else
+            return;                         /* unknown packing: refuse the batch */
+    }
+    s_inline_stride = n;
+}
+
+/* Read attribute `a` of inline vertex `index`. Same contract as fetch_attr. */
+static int fetch_inline(uint32_t a, uint32_t index, float out[4])
+{
+    const uint32_t *w;
+    uint32_t i;
+
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    if (!s_inline_stride || a >= NV_VERTEX_ATTRS
+            || s_inline_off[a] == INLINE_ATTR_ABSENT
+            || (index + 1) * s_inline_stride > s_gpu.inline_count)
+        return 0;
+
+    w = &s_gpu.inline_words[index * s_inline_stride + s_inline_off[a]];
+    if (s_gpu.attr[a].type == 2) {
+        for (i = 0; i < s_gpu.attr[a].size && i < 4; i++)
+            memcpy(&out[i], &w[i], sizeof(float));
+        return 1;
+    }
+    for (i = 0; i < 4; i++)                 /* type 4 */
+        out[i] = (float)((w[0] >> (i * 8)) & 0xFFu) / 255.0f;
+    return 1;
 }
 
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
@@ -416,11 +484,20 @@ static void raster_triangle(const float a[2], const float b[2],
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
  * white -- a visible wrong colour beats an invisible correct one during
  * bring-up. */
+/* One vertex source for both paths: a batch that pushed inline data reads from
+ * it, anything else reads the arrays the title pointed at. */
+static int fetch_vertex(uint32_t a, uint32_t index, float out[4])
+{
+    if (s_gpu.inline_count)
+        return fetch_inline(a, index, out);
+    return fetch_attr(&s_gpu.attr[a], index, out);
+}
+
 static uint32_t vertex_color(uint32_t index)
 {
     float c[4];
 
-    if (!fetch_attr(&s_gpu.attr[3], index, c))
+    if (!fetch_vertex(3, index, c))
         return 0xFFFFFFFFu;
     return ((uint32_t)(c[3] * 255.0f) << 24)
          | ((uint32_t)(c[0] * 255.0f) << 16)
@@ -441,7 +518,7 @@ static int batch_is_screen_space(void)
     if (!s_gpu.clip_w || !s_gpu.clip_h)
         return 0;
     for (i = 0; i < s_gpu.idx_count; i++) {
-        if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
+        if (!fetch_vertex(0, s_gpu.idx[i], p))
             return 0;
         if (p[0] < (float)s_gpu.clip_x - 1.0f
          || p[0] > (float)(s_gpu.clip_x + s_gpu.clip_w) + 1.0f
@@ -468,11 +545,20 @@ static void raster_batch(void)
         return;
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
-        return;
+        /* RECOMP_PB_EXEC_NOCLIPTEST: rasterise anyway, to tell "the vertices
+         * were decoded but sit outside the clip rect" apart from "the vertices
+         * are not usable at all". Diagnostic only -- the test exists because
+         * untransformed vertices would otherwise paint nonsense. */
+        {
+            static int allow = -1;
+            if (allow < 0) allow = getenv("RECOMP_PB_EXEC_NOCLIPTEST") ? 1 : 0;
+            if (!allow)
+                return;
+        }
     }
 
 #define VTX(slot, index) \
-    (fetch_attr(&s_gpu.attr[0], (index), p[slot]) ? 1 : 0)
+    (fetch_vertex(0, (index), p[slot]) ? 1 : 0)
 
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -527,7 +613,7 @@ static void draw_primitive(void)
      * from one that never ran, unless the vertices themselves are measured. */
     {
         float p[4];
-        if (fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p)) {
+        if (fetch_vertex(0, s_gpu.idx[0], p)) {
             if (p[0] != 0.0f || p[1] != 0.0f || p[2] != 0.0f) {
                 s_gpu.nonzero_draws++;
                 if (p[0] < s_gpu.min_x) s_gpu.min_x = p[0];
@@ -651,10 +737,48 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (param) {
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
+            s_gpu.inline_count = 0;
         } else {
+            /* An inline batch names its vertices 0..n-1, so the topology code
+             * below is the same one the indexed path uses. */
+            if (s_gpu.inline_count) {
+                inline_layout();
+                if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+                    static int shown_inline;
+                    if (shown_inline++ < 3) {
+                        uint32_t a, k;
+                        fprintf(stderr, "  [GPU] inline batch: prim %u, %u dwords,"
+                                " stride %u dw\n", s_gpu.prim,
+                                s_gpu.inline_count, s_inline_stride);
+                        for (a = 0; a < NV_VERTEX_ATTRS; a++)
+                            if (s_gpu.attr[a].size)
+                                fprintf(stderr, "  [GPU]   attr%-2u type %u size %u"
+                                        " -> dw off %u\n", a, s_gpu.attr[a].type,
+                                        s_gpu.attr[a].size, s_inline_off[a]);
+                        fprintf(stderr, "  [GPU]   words:");
+                        for (k = 0; k < s_gpu.inline_count && k < 24; k++)
+                            fprintf(stderr, " %08X", s_gpu.inline_words[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+                if (s_inline_stride) {
+                    uint32_t nv = s_gpu.inline_count / s_inline_stride, k;
+                    if (nv > NV_MAX_INDICES)
+                        nv = NV_MAX_INDICES;
+                    for (k = 0; k < nv; k++)
+                        s_gpu.idx[k] = (uint16_t)k;
+                    s_gpu.idx_count = nv;
+                }
+            }
             draw_primitive();
             s_gpu.prim = 0;
+            s_gpu.inline_count = 0;    /* after the draw: fetch_vertex reads it */
         }
+        break;
+
+    case NV097_INLINE_ARRAY:
+        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE_WORDS)
+            s_gpu.inline_words[s_gpu.inline_count++] = param;
         break;
 
     case NV097_ARRAY_ELEMENT16:
