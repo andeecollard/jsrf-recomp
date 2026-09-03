@@ -2737,6 +2737,12 @@ static void bridge_NtOpenFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         0, share, 1 /* FILE_OPEN */, options);
+
+    /* Same result line NtCreateFile prints. Without it an NtOpenFile showed
+     * what was asked for and never whether it opened, which reads as a failed
+     * call whenever the next line is the title doing something drastic. */
+    fprintf(stderr, "  [FILE] -> 0x%08X%s\n", g_eax, g_eax ? " FAILED" : "");
+    fflush(stderr);
 }
 
 /*

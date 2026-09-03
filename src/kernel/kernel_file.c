@@ -1023,6 +1023,53 @@ static int is_partition1_tdata_path(const char* path)
            strcasecmp(path, "\\Device\\Harddisk0\\Partition1\\TDATA") == 0;
 }
 
+/* Create the directories above a host path.
+ *
+ * A title populating its own cache writes files several levels below the cache
+ * root -- JSRF caches through Z:\Media\Font\jetfont.dat~ -- without ever
+ * creating the intermediate directories. On a console it does not have to: the
+ * cache partition is a formatted volume it cleared itself, and it only creates
+ * the handful of directories it enumerates at startup. Font is not among them.
+ *
+ * Here the cache root is an ordinary host directory, so that open failed with
+ * ENOENT, JSRF retried once and then wrote Z:\Media\Cache\JSRF_FATAL.ERR.
+ * That is also why the merged runtime opened two fewer files than the tree
+ * before it: adding the Partition3/4/5 rules made the cache probe succeed, so
+ * the title started using a cache the path layer could not actually serve.
+ *
+ * Only called for a disposition that creates, so a read of a missing file
+ * still fails the way the title expects rather than leaving empty directories
+ * behind on every cache miss.
+ */
+static void ensure_parent_dirs(const char* path)
+{
+    char   tmp[MAX_PATH];
+    char*  last;
+    size_t n;
+
+    if (!path)
+        return;
+    n = strlen(path);
+    if (n == 0 || n >= sizeof(tmp))
+        return;
+    memcpy(tmp, path, n + 1);
+
+    last = strrchr(tmp, '/');
+    if (!last || last == tmp)
+        return;             /* no parent, or the parent is the root */
+    *last = '\0';
+
+    /* Walk the prefixes, making each in turn. EEXIST is the common case. */
+    for (char* p = tmp + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        mkdir(tmp, 0755);
+        *p = '/';
+    }
+    mkdir(tmp, 0755);
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -1070,11 +1117,18 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            ensure_parent_dirs(host_path);
             mkdir(host_path, 0755);   /* EEXIST is fine */
+        }
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+        int flags = posix_open_flags(DesiredAccess, CreateDisposition);
+        /* Keyed on O_CREAT rather than re-listing the dispositions, so this
+         * cannot drift away from posix_open_flags. */
+        if (flags & O_CREAT)
+            ensure_parent_dirs(host_path);
+        fd = open(host_path, flags, 0644);
     }
 
     if (fd < 0) {

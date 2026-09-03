@@ -14,6 +14,7 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -82,6 +83,17 @@ static const path_rule s_rules[] = {
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
 
+/* Opt-in path tracing. XBOX_TRACE is compiled out unless _DEBUG, which makes
+ * translation invisible in a release build -- and translation is exactly where
+ * a title's asset opens go wrong. Gated on RECOMP_PATH_TRACE so the default
+ * path is untouched. */
+static int path_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PATH_TRACE") ? 1 : 0;
+    return on;
+}
+
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
  *
@@ -129,6 +141,9 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     link[6] = '\0';
 
     target = xbox_LookupSymbolicLink(link);
+    if (path_trace_on())
+        fprintf(stderr, "  [PATH] symlink %s -> %s\n",
+                link, (target && target[0]) ? target : "(none)");
     if (!target || !target[0])
         return 0;
 
@@ -147,9 +162,16 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     out[tlen + rlen] = '\0';
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (match_prefix(out, s_rules[i].prefix))
+        if (match_prefix(out, s_rules[i].prefix)) {
+            if (path_trace_on())
+                fprintf(stderr, "  [PATH] resolve %s => %s (rule %s)\n",
+                        xbox_path, out, s_rules[i].prefix);
             return 1;           /* the target is somewhere we can place */
+        }
     }
+    if (path_trace_on())
+        fprintf(stderr, "  [PATH] resolve %s => %s (NO RULE, left alone)\n",
+                xbox_path, out);
     return 0;
 }
 
@@ -561,6 +583,9 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     snprintf(host_path_buf, buf_size, "%s", xbox_path);
     for (char* p = host_path_buf; *p; p++)
         if (*p == '\\') *p = '/';
+    if (path_trace_on())
+        fprintf(stderr, "  [PATH] %s -> %s (UNRECOGNIZED)\n",
+                xbox_path, host_path_buf);
     return TRUE;
 
 translate:
@@ -591,6 +616,8 @@ translate:
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+        if (path_trace_on())
+            fprintf(stderr, "  [PATH] %s -> %s\n", xbox_path, host_path_buf);
         return TRUE;
     }
 }
