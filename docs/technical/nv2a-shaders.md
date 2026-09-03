@@ -68,3 +68,42 @@ way to get this subtly wrong.
 
 `d3d8_combiners.h` and `d3d8_swizzle.h` cite xemu as a reference for the
 hardware's behaviour; both are our own implementations. See [NOTICE](../../NOTICE).
+
+## A validation vector for the microcode parser
+
+The vertex-microcode parser has never been checked against microcode a game
+actually uploaded, and it does not survive the check. Captured from Jet Set
+Radio Future at runtime with `RECOMP_PB_EXEC_PROGRAM=1`, first five instruction
+slots in upload order:
+
+```
+00000000 0020001B 0836106C 2F100FF8
+00000000 0420061B 083613FC 5011F818
+00000000 0400001B 083613FC 2070F82C
+00000000 0240081B 1436186C 2F20F824
+00000000 0060201B 2436106C 3070F800
+```
+
+with the only constants the title uploads:
+
+```
+c0  (1, 1, 16777215, 1)          c60 (0, 0.5, 1, 2)
+c1  (0.53125, 0.53125, 0, 0)     c61 (-1, 0, 1, 2)
+                                 c62 (0, 0, -1, 0)
+```
+
+Against `src/d3d/d3d8_vsh.c` as it stands, every slot decodes to `MAC=NOP
+ILU=NOP` — the first uploaded dword is zero in all of them, and that is where
+the opcode fields are read from. Reversing the word order instead gives an ILU
+opcode of 8 on slot 2, which does not exist, and constant indices `c128` and
+`c143`, which the title never sets.
+
+Note that `c0` is `(1, 1, ...)` and `c1` is `(0.53125, 0.53125, ...)`: the
+scale is one and the offset is the half-pixel bias, which is the NV2A viewport
+applied inside the shader. There is no scale constant anywhere in the program,
+so nothing outside it explains the factor of four between the title's vertex
+values and its 640x480 surface. That factor is inside these instructions.
+
+Fix the layout until it disassembles this, and the CPU executor in
+`src/kernel/nv2a_pb_exec.c` can run the program instead of rejecting every
+batch as not screen-space.

@@ -158,6 +158,35 @@ static inline uint32_t vsh_extract(const DWORD *insn, int start, int count)
 #define VSH_FIELD_SRC_B_SWZ_W_START 41
 #define VSH_FIELD_SRC_B_SWZ_W_SIZE  2
 
+/* ------------------------------------------------------------------
+ * UNVALIDATED. These offsets do not decode real microcode.
+ *
+ * Checked against a vertex program captured from Jet Set Radio Future at
+ * runtime (RECOMP_PB_EXEC_PROGRAM, first five instruction slots, in upload
+ * order through NV097_SET_TRANSFORM_PROGRAM):
+ *
+ *   00000000 0020001B 0836106C 2F100FF8
+ *   00000000 0420061B 083613FC 5011F818
+ *   00000000 0400001B 083613FC 2070F82C
+ *   00000000 0240081B 1436186C 2F20F824
+ *   00000000 0060201B 2436106C 3070F800
+ *
+ * Taking insn[0] as bits 0..31, as vsh_extract does, every slot decodes to
+ * MAC=NOP ILU=NOP, because the first uploaded dword is zero in all of them.
+ * Taking the words reversed gives MAC=DST ILU=LIT on slot 0 and an ILU opcode
+ * of 8 on slot 1 -- out of range, the unit has eight opcodes 0..7 -- with
+ * constant indices c128 and c143 that the title never uploads. It uploads only
+ * c0, c1 and c60..c62.
+ *
+ * So the word order, the bit offsets, or both are wrong, and this parser
+ * cannot be built on until it decodes that vector. It is Windows-only and the
+ * D3D11 path it feeds has not been exercised, so the error is invisible here:
+ * a wrong field yields a plausible shader rather than a failure.
+ *
+ * The vector above is the test. Fix the layout until it disassembles, then
+ * delete this note.
+ * ------------------------------------------------------------------ */
+
 /* Source C (word 1/2 boundary) */
 #define VSH_FIELD_SRC_C_NEG_START   40
 #define VSH_FIELD_SRC_C_NEG_SIZE    1
