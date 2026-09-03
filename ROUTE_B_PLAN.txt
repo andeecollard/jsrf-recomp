@@ -745,3 +745,57 @@ and the rest of the work branch. That is generic, it is 49 commits of fixes
 this tree keeps rediscovering independently, and it makes the renderer able to
 draw when the game does ask. Route B's value was never contingent on JSRF
 specifically reaching its scene.
+
+
+================================================================================
+16. PIXELS.  nv2a_pb_exec ADOPTED, AND THE WHOLE CHAIN IS PROVEN
+================================================================================
+Took upstream's CPU executor (src/kernel/nv2a_pb_exec.c, 881 lines). It decodes
+NV2A methods, tracks the surface, and rasterises screen-space triangles, strips,
+fans and quads straight into the GUEST framebuffer -- no device, no backend, no
+window required, which is exactly what makes it a bring-up tool.
+
+WIRED AS A SECOND SINK, not a replacement. nv2a_pusher's dispatch() feeds both
+it and pgraph_d3d11_method, gated on RECOMP_PB_EXEC so the default path is
+untouched. Verified: with the variable unset, the run is byte-identical to
+before and writes no files.
+
+THREE THINGS HAD TO BE PORTED:
+  * ptrdiff_t needed <stddef.h>; MSVC gets it via another header.
+  * strtok_s is MSVC's name for POSIX strtok_r -- same signature, so one alias
+    covers both call sites.
+  * xbox_FramebufferWindowSet/Start come from src/video/fb_present.c, which is
+    CreateWindowExA and therefore Win32 only. Stubbed in
+    src/kernel/fb_window_stub.c. STUBBING THE WINDOW DOES NOT STUB THE
+    RASTERISER: the executor still draws into guest memory, and RECOMP_FB_DUMP
+    writes the surface to a BMP, which answers "does it draw" without needing a
+    window at all.
+
+THE RESULT, and it is the first picture this effort has produced:
+
+    RECOMP_PB_EXEC=1 RECOMP_RASTER_TEST=1 RECOMP_FB_DUMP=fb ./jsrf_first_fault
+
+  writes fb000.bmp .. fbNNN.bmp, 640x480, and they contain a clean magenta
+  triangle on black -- the known test triangle, undistorted and centred.
+
+WHAT THAT ONE IMAGE PROVES, all at once:
+    the ring decodes                    (it reached the executor)
+    the surface ADDRESS is right        (the dump is the guest's own buffer)
+    the surface PITCH is right          (a wrong pitch shears the triangle;
+                                         this one is square)
+    the clear works                     (black background, not garbage)
+    the rasteriser works                (filled, correct winding)
+    640x480 matches the guest's mode
+
+So the path from JSRF's command ring to pixels in JSRF's framebuffer is now
+proven end to end. The ONLY missing piece is the game submitting geometry --
+which is section 15's state machine, and unchanged by this.
+
+NEXT, in order of value:
+  1. Blit the guest framebuffer into the existing SDL window, so this is live
+     rather than a BMP. The window exists (d3d8_gl.c) and the buffer address
+     and pitch are now known to be correct; it is a texture upload per frame.
+  2. Wire nv2a_pb_scan.c's driver too if the ring ever grows, though our own
+     pusher already covers that.
+  3. The state machine (section 15) remains the only thing between this and
+     JSRF's own geometry appearing.

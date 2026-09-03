@@ -6,7 +6,16 @@
 #include "nv2a_pgraph_d3d11.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Upstream's CPU executor: decodes the same methods, tracks the surface, and
+ * rasterises screen-space geometry straight into the guest framebuffer. It is
+ * a second sink rather than a replacement -- the PGRAPH translator emits
+ * through the D3D8 backend and needs a device, this one needs nothing and
+ * works before any device exists, which is what makes it useful for bring-up.
+ * Opt-in with RECOMP_PB_EXEC so the established path is untouched by default. */
+extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 
 /*
  * Command header encoding.
@@ -52,6 +61,13 @@ static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
     g_recent[g_recent_idx % RECENT_SLOTS].method = method;
     g_recent[g_recent_idx % RECENT_SLOTS].param = param;
     g_recent_idx++;
+
+    {
+        static int exec_on = -1;
+        if (exec_on < 0) exec_on = getenv("RECOMP_PB_EXEC") ? 1 : 0;
+        if (exec_on) nv2a_pb_exec_method(subchannel, method, param);
+    }
+
     if (!pgraph_d3d11_method((int)subchannel, method, param)) {
         g_stats.unhandled++;
         if ((method / 4u) < UNHANDLED_SLOTS) {

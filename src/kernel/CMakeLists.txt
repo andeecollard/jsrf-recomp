@@ -21,6 +21,8 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     icall_feedback.c
+    nv2a_pb_exec.c
+    fb_window_stub.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})

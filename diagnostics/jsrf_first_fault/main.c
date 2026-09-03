@@ -16,6 +16,7 @@
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
 #include "recomp_icall_feedback.h"
+extern void nv2a_pb_exec_report(void);
 #include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 
@@ -362,6 +363,7 @@ static void jsrf_pusher_report(void)
             fflush(stderr);
         }
         RECOMP_ICALL_FEEDBACK_DUMP();
+        if (getenv("RECOMP_PB_EXEC")) nv2a_pb_exec_report();
     }
 
     nv2a_pusher_get_stats(&st);
