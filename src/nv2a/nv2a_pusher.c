@@ -178,7 +178,7 @@ void nv2a_pusher_dump_unhandled(int max_entries)
 
     /* Built into one buffer and emitted with a single write: worker threads
      * log concurrently and a per-entry fprintf interleaves with them. */
-    off = snprintf(line, sizeof(line), "  [PUSHER] unhandled methods:");
+    off = snprintf(line, sizeof(line), "  [PUSHER] D3D11 sink unhandled methods (CPU executor counted separately):");
 
     /* A peek, not a drain. Zeroing each entry as it printed made every report
      * show the NEXT twenty methods instead of the same top twenty, so the

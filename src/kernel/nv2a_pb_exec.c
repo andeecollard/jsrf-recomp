@@ -41,6 +41,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_GpuMemoryRange(uint32_t address, size_t bytes);
 extern const uint8_t *xbox_Nv2aRegisterMemory(void);
+extern int xbox_HeapDescribe(uint32_t xbox_va, char *buf, size_t size);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 
@@ -98,6 +99,19 @@ static struct {
     NV2AVshProgram decoded;
     uint32_t batches, rejected;
 } s_vsh;
+/* RECOMP_VSH_TRACE measures delivery separately from the D3D11 sink's
+ * unhandled histogram. Compare actual selected words, not just START/length. */
+static struct {
+    int enabled;
+    uint64_t program_words[8], changed, dropped, constants, constant_dropped;
+    uint64_t loads, starts, modes, current4f, current4ub, decodes;
+    uint8_t current_written[16];
+    uint32_t hashes[32], unique;
+    uint32_t start_values, load_values;
+    uint64_t load_high;
+    struct { uint32_t method, param; } recent[2048];
+    uint64_t recent_count;
+} s_vsh_trace;
 static float s_positions[NV_MAX_INDICES][4];
 static uint32_t s_colors[NV_MAX_INDICES];
 /* Retain all shader outputs for texture interpolation and draw captures. */
@@ -641,6 +655,59 @@ static uint32_t vsh_sample_batch(void)
     return (uint32_t)batch;
 }
 
+static void trace_selected_program(void)
+{
+    if (!s_vsh_trace.enabled) return;
+    ++s_vsh_trace.decodes;
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < s_vsh.decoded.length; ++i)
+        for (int k = 0; k < 4; ++k)
+            hash = (hash ^ s_vsh.words[s_vsh.start+i][k]) * 16777619u;
+    for (uint32_t i = 0; i < s_vsh_trace.unique; ++i)
+        if (s_vsh_trace.hashes[i] == hash) return;
+    if (s_vsh_trace.unique == 32) return;
+    s_vsh_trace.hashes[s_vsh_trace.unique++] = hash;
+    fprintf(stderr, "[VSH-TRACE] selected hash=%08X draw=%u start=%u slots=%d reads=%04X valid=%d final=%d\n",
+            hash, s_gpu.draws, s_vsh.start, s_vsh.decoded.length,
+            s_vsh.decoded.inputs_read, s_vsh.decoded.valid, s_vsh.decoded.has_final);
+    for (int i = 0; i < s_vsh.decoded.length; ++i) {
+        const uint32_t *w = s_vsh.words[s_vsh.start+i];
+        fprintf(stderr, "[VSH-TRACE] slot=%u %08X %08X %08X %08X\n",
+                s_vsh.start+i, w[0], w[1], w[2], w[3]);
+    }
+}
+
+static void trace_vertex_inputs(const float inputs[16][4])
+{
+    if (!s_vsh_trace.enabled) return;
+    if (s_vsh.batches == vsh_sample_batch()) {
+        uint64_t first = s_vsh_trace.recent_count > 2048 ? s_vsh_trace.recent_count-2048 : 0;
+        for (uint64_t i = first; i < s_vsh_trace.recent_count; ++i)
+            fprintf(stderr, "[VSH-METHOD] %04X %08X\n",
+                    s_vsh_trace.recent[i%2048].method, s_vsh_trace.recent[i%2048].param);
+    }
+    for (unsigned a = 0; a < 16; ++a) {
+        if (!(s_vsh.decoded.inputs_read & (1u << a))) continue;
+        fprintf(stderr, "[VSH-TRACE] draw=%u input=%u array=%u current-written=%X value=(%.9g %.9g %.9g %.9g)\n",
+                s_gpu.draws, a, s_gpu.attr[a].size, s_vsh_trace.current_written[a],
+                inputs[a][0], inputs[a][1], inputs[a][2], inputs[a][3]);
+    }
+    uint8_t seen[NV2A_VS_MAX_CONSTANTS] = {0};
+    for (int i = 0; i < s_vsh.decoded.length; ++i) {
+        const NV2AVshInstruction *ins = &s_vsh.decoded.insns[i];
+        unsigned used = nv2a_vsh_mac_sources(ins->mac_op) | (ins->ilu_op ? 4 : 0);
+        for (int k = 0; k < 3; ++k) {
+            const NV2AVshSrcOperand *src = &ins->mac_src[k];
+            if (!(used & (1u << k)) || src->reg_type != NV2A_VSH_REG_CONST
+                    || src->reg_index >= NV2A_VS_MAX_CONSTANTS || seen[src->reg_index]) continue;
+            seen[src->reg_index] = 1;
+            const float *c = s_vsh.constants[src->reg_index];
+            fprintf(stderr, "[VSH-TRACE] draw=%u constant=%d relative=%d value=(%.9g %.9g %.9g %.9g)\n",
+                    s_gpu.draws, src->reg_index, src->rel_addr, c[0], c[1], c[2], c[3]);
+        }
+    }
+}
+
 static int prepare_vertices(void)
 {
     int programmable = s_vsh.mode == 2;
@@ -657,6 +724,7 @@ static int prepare_vertices(void)
         }
         nv2a_vsh_parse(n ? s_vsh.words[s_vsh.start] : NULL, (int)n, &s_vsh.decoded);
         s_vsh.dirty = 0;
+        trace_selected_program();
     }
     for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
         if (programmable) {
@@ -683,6 +751,8 @@ static int prepare_vertices(void)
                     VSH_REJECT("vertex attribute could not be fetched", a);
                 }
             }
+            if (i == 0 && (s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()))
+                trace_vertex_inputs(inputs);
             if (!nv2a_vsh_execute(&s_vsh.decoded, inputs, s_vsh.constants, &result))
                 VSH_REJECT("shader execution failed", s_vsh.decoded.length);
             if ((result.written[0] & 12) != 12)
@@ -705,14 +775,71 @@ static int prepare_vertices(void)
              * question about batch 20,000, not batch 1. RECOMP_VSH_SAMPLE
              * moves the sample point. */
             if (s_vsh.batches == vsh_sample_batch() && i < 3) {
-                fprintf(stderr, "  [VSH] late batch attrs:");
+                /* The constants matter as much as the attributes. A program
+                 * that produces an infinite w is dividing by something, and
+                 * the transform rows are where that something comes from. */
+                fprintf(stderr, "  [VSH] late batch c0..c7:");
+                for (uint32_t k = 0; k < 8; ++k)
+                    fprintf(stderr, " [%g %g %g %g]", s_vsh.constants[k][0],
+                            s_vsh.constants[k][1], s_vsh.constants[k][2],
+                            s_vsh.constants[k][3]);
+                fprintf(stderr, "\n  [VSH] late batch attrs:");
                 for (uint32_t k = 0; k < 16; ++k)
                     if (s_gpu.attr[k].size)
                         fprintf(stderr, " a%u(t%u s%u st%u @%08X)", k,
                                 s_gpu.attr[k].type, s_gpu.attr[k].size,
                                 s_gpu.attr[k].stride, s_gpu.attr[k].offset);
-                fprintf(stderr, " reads=%04X inline=%u\n",
-                        s_vsh.decoded.inputs_read, s_gpu.inline_count);
+                fprintf(stderr, " reads=%04X inline=%u idx=%u\n",
+                        s_vsh.decoded.inputs_read, s_gpu.inline_count,
+                        s_gpu.idx[i]);
+                /* The values actually handed to the program, and the raw
+                 * bytes behind them. A constant oPos has exactly two causes
+                 * -- the inputs are zero, or the transform is -- and these
+                 * two lines tell them apart. */
+                fprintf(stderr, "  [VSH] late batch in0=[%g %g %g %g]"
+                                " in3=[%g %g %g %g] in9=[%g %g %g %g]\n",
+                        inputs[0][0], inputs[0][1], inputs[0][2], inputs[0][3],
+                        inputs[3][0], inputs[3][1], inputs[3][2], inputs[3][3],
+                        inputs[9][0], inputs[9][1], inputs[9][2], inputs[9][3]);
+                {
+                    /* Vertex array offsets are relative to a DMA context, the
+                     * way texture and surface offsets are -- and unlike those,
+                     * fetch_attr treats them as absolute guest addresses. If
+                     * either vertex DMA object has a non-zero base, that
+                     * assumption is wrong and every array read lands in the
+                     * wrong place. Resolve them the same way the copy path
+                     * does and say what they are. */
+                    const uint8_t *regs = xbox_Nv2aRegisterMemory();
+                    uint32_t ramht = 0, base, limit;
+                    if (regs) memcpy(&ramht, regs + 0x2210, 4);
+                    for (int which = 0; which < 2; ++which) {
+                        uint32_t m = which ? NV097_SET_CONTEXT_DMA_VERTEX_B
+                                           : NV097_SET_CONTEXT_DMA_VERTEX_A;
+                        uint32_t handle = s_methods[m / 4];
+                        int seen = s_method_seen[m / 4];
+                        int ok = regs && seen && nv2a_dma_resolve(regs + 0x700000,
+                                0x100000, ramht, handle, &base, &limit);
+                        fprintf(stderr, "  [VSH] vertex DMA %c: seen=%d "
+                                        "handle=0x%08X resolved=%d base=0x%08X "
+                                        "limit=0x%08X\n", which ? 'B' : 'A',
+                                seen, handle, ok, ok ? base : 0,
+                                ok ? limit : 0);
+                    }
+                }
+                {
+                    char owner[192];
+                    xbox_HeapDescribe(s_gpu.attr[0].offset, owner, sizeof owner);
+                    fprintf(stderr, "  [VSH] array owner: %s\n", owner);
+                }
+                {
+                    const uint8_t *raw = (const uint8_t *)xbox_GetMemoryOffset()
+                            + s_gpu.attr[0].offset
+                            + (size_t)s_gpu.idx[i] * s_gpu.attr[0].stride;
+                    fprintf(stderr, "  [VSH] late batch bytes:");
+                    for (uint32_t k = 0; k < 32; ++k)
+                        fprintf(stderr, " %02X", raw[k]);
+                    fprintf(stderr, "\n");
+                }
             }
             if ((s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()) && i < 3)
                 fprintf(stderr, "  [VSH] start=%u slots=%d vertex=%u oPos=(%.6g %.6g %.6g %.6g) color=%08X\n",
@@ -1007,6 +1134,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (!inited) {
         inited = 1;
         s_vsh.dirty = 1;
+        s_vsh_trace.enabled = getenv("RECOMP_VSH_TRACE") != NULL;
         for (int i = 0; i < 16; ++i) s_vsh.current[i][3] = 1.0f;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
@@ -1032,6 +1160,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    if (s_vsh_trace.enabled && subch < 8
+            && method >= NV097_SET_TRANSFORM_PROGRAM && method < NV097_SET_TRANSFORM_CONSTANT)
+        ++s_vsh_trace.program_words[subch];
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method);
         return;
@@ -1040,21 +1171,32 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_methods[method/4] = param;
         s_method_seen[method/4] = 1;
     }
+    if (s_vsh_trace.enabled) {
+        unsigned i = (unsigned)(s_vsh_trace.recent_count++ % 2048);
+        s_vsh_trace.recent[i].method = method;
+        s_vsh_trace.recent[i].param = param;
+    }
     if ((method >= NV097_SET_TRANSFORM_PROGRAM && method < 0x0C00)
             || (method >= NV097_SET_TRANSFORM_EXECUTION_MODE && method <= NV097_SET_TRANSFORM_CONSTANT_LOAD))
         note_program_write(method, param);
     if (method >= NV097_SET_TRANSFORM_PROGRAM && method < NV097_SET_TRANSFORM_CONSTANT) {
         unsigned component = (method & 15) / 4;
         if (s_vsh.load < NV2A_VS_MAX_INSTRUCTIONS) {
-            if (s_vsh.words[s_vsh.load][component] != param || !(s_vsh.loaded[s_vsh.load] & (1u << component)))
+            if (s_vsh.words[s_vsh.load][component] != param || !(s_vsh.loaded[s_vsh.load] & (1u << component))) {
                 s_vsh.dirty = 1;
+                if (s_vsh_trace.enabled) ++s_vsh_trace.changed;
+            }
             s_vsh.words[s_vsh.load][component] = param;
             s_vsh.loaded[s_vsh.load] |= (uint8_t)(1u << component);
-        }
+        } else if (s_vsh_trace.enabled) ++s_vsh_trace.dropped;
         if (component == 3 && s_vsh.load < NV2A_VS_MAX_INSTRUCTIONS) s_vsh.load++;
         return;
     }
     if (method >= NV097_SET_TRANSFORM_CONSTANT && method < 0x0C00) {
+        if (s_vsh_trace.enabled) {
+            ++s_vsh_trace.constants;
+            if (s_vsh.constant_load >= NV2A_VS_MAX_CONSTANTS) ++s_vsh_trace.constant_dropped;
+        }
         unsigned component = (method & 15) / 4;
         if (s_vsh.constant_load < NV2A_VS_MAX_CONSTANTS)
             memcpy(&s_vsh.constants[s_vsh.constant_load][component], &param, sizeof(float));
@@ -1064,17 +1206,40 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method >= NV097_SET_VERTEX_DATA4F_M && method < NV097_SET_VERTEX_DATA4F_M + 16*16) {
         unsigned word = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
         memcpy(&s_vsh.current[word / 4][word % 4], &param, sizeof(float));
+        if (s_vsh_trace.enabled) {
+            ++s_vsh_trace.current4f;
+            s_vsh_trace.current_written[word/4] |= (uint8_t)(1u << (word%4));
+        }
         return;
     }
     if (method >= NV097_SET_VERTEX_DATA4UB && method < NV097_SET_VERTEX_DATA4UB + 16*4) {
         unsigned a = (method - NV097_SET_VERTEX_DATA4UB) / 4;
         for (int k = 0; k < 4; ++k) s_vsh.current[a][k] = ((param >> (8*k)) & 255) / 255.0f;
+        if (s_vsh_trace.enabled) {
+            ++s_vsh_trace.current4ub;
+            s_vsh_trace.current_written[a] = 15;
+        }
         return;
     }
     switch (method) {
-    case NV097_SET_TRANSFORM_EXECUTION_MODE: s_vsh.mode = param & 3; break;
-    case NV097_SET_TRANSFORM_PROGRAM_LOAD: s_vsh.load = param; break;
+    case NV097_SET_TRANSFORM_EXECUTION_MODE:
+        if (s_vsh_trace.enabled) ++s_vsh_trace.modes;
+        s_vsh.mode = param & 3; break;
+    case NV097_SET_TRANSFORM_PROGRAM_LOAD:
+        if (s_vsh_trace.enabled) {
+            ++s_vsh_trace.loads;
+            if (param < 32) s_vsh_trace.load_values |= 1u << param;
+            else s_vsh_trace.load_high++;
+        }
+        s_vsh.load = param; break;
     case NV097_SET_TRANSFORM_PROGRAM_START:
+        if (s_vsh_trace.enabled) {
+            ++s_vsh_trace.starts;
+            /* A final value of 0 does not mean the title never selected
+             * another program; it means the last selection was 0. Record
+             * every distinct one. */
+            if (param < 32) s_vsh_trace.start_values |= 1u << param;
+        }
         if (s_vsh.start != param) s_vsh.dirty = 1;
         s_vsh.start = param; break;
     case NV097_SET_TRANSFORM_CONSTANT_LOAD: s_vsh.constant_load = param; break;
@@ -1346,6 +1511,25 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    if (s_vsh_trace.enabled) {
+        fprintf(stderr, "[VSH-TRACE] upload words by subchannel:");
+        for (int i = 0; i < 8; ++i)
+            fprintf(stderr, " %d=%llu", i, (unsigned long long)s_vsh_trace.program_words[i]);
+        fprintf(stderr, " changed=%llu dropped=%llu loads=%llu starts=%llu modes=%llu constants=%llu constant-dropped=%llu current4f=%llu current4ub=%llu decodes=%llu unique-hashes=%u load=%u constant-load=%u\n",
+                (unsigned long long)s_vsh_trace.changed, (unsigned long long)s_vsh_trace.dropped,
+                (unsigned long long)s_vsh_trace.loads, (unsigned long long)s_vsh_trace.starts,
+                (unsigned long long)s_vsh_trace.modes, (unsigned long long)s_vsh_trace.constants,
+                (unsigned long long)s_vsh_trace.constant_dropped, (unsigned long long)s_vsh_trace.current4f,
+                (unsigned long long)s_vsh_trace.current4ub, (unsigned long long)s_vsh_trace.decodes,
+                s_vsh_trace.unique, s_vsh.load, s_vsh.constant_load);
+        /* Which program slots the title ever selected. A final start of 0 is
+         * only the last selection; the bitmaps say whether there was ever
+         * another one to miss. */
+        fprintf(stderr, "[VSH-TRACE] distinct START slots 0x%08X, LOAD slots"
+                        " 0x%08X, LOAD >= 32: %llu\n",
+                s_vsh_trace.start_values, s_vsh_trace.load_values,
+                (unsigned long long)s_vsh_trace.load_high);
+    }
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     fprintf(stderr, "[VSH] executed batches=%u rejected=%u mode=%u start=%u slots=%d\n",
             s_vsh.batches, s_vsh.rejected, s_vsh.mode, s_vsh.start, s_vsh.decoded.length);

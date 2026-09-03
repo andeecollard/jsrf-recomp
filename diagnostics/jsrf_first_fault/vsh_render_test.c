@@ -14,6 +14,15 @@ void *xbox_GpuMemoryRange(uint32_t address, size_t bytes) {
     return (uint64_t)address+bytes<=sizeof(ram) ? (uint8_t *)ram+address : NULL;
 }
 const uint8_t *xbox_Nv2aRegisterMemory(void) { return gpu_regs; }
+/* The renderer asks the guest heap who owns a vertex array when it samples a
+ * draw. There is no heap in this harness, and the answer does not affect what
+ * is rendered. */
+int xbox_HeapDescribe(uint32_t xbox_va, char *buf, size_t size)
+{
+    (void)xbox_va;
+    if (buf && size) snprintf(buf, size, "no heap in this harness");
+    return 0;
+}
 void xbox_FramebufferWindowSet(uint32_t a, uint32_t p) { (void)a; (void)p; }
 void xbox_FramebufferWindowStart(void) {}
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);

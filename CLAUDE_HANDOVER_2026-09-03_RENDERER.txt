@@ -1,0 +1,240 @@
+JSRF / xboxrecomp - CLAUDE HANDOVER
+3 September 2026 - the renderer question, measured
+
+WORKSPACE
+/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+Continues CLAUDE_HANDOVER_2026-09-03_HEAP.txt, which remains accurate. Host
+macOS arm64, branch main. Goals are in JSRF_GOALS_2026-09-03_RENDERER.md.
+
+Pushed to origin/main (andeecollard/upstream_xboxrecomp_clean) this session:
+  9645601  Nothing was ever freed, and every return path that lied about it
+  e97c71c  Every batch was refused for one reason, and it was not the reason
+           we assumed
+Work after e97c71c is in the tree and NOT yet committed.
+
+==========================================================================
+1. THE HEADLINE, AND IT IS NOT WHAT WE EXPECTED
+==========================================================================
+
+The screen is black because THE TITLE'S VERTEX BUFFERS ARE EMPTY. Not because
+the transform is wrong, not because a shader opcode is missing, and not
+because the wrong program is bound. There is nothing to draw.
+
+Sampling a draw at batch 20,000 (RECOMP_VSH_SAMPLE moves the sample point;
+batch 1 is always the measured full-screen blit and tells you nothing):
+
+  [VSH] late batch attrs: a0(t2 s4 st32 @01BA2000) a3(t0 s4 st32 @01BA2010)
+                          a4(t0 s4 st32 @01BA2014) a9(t2 s2 st32 @01BA2018)
+                          reads=1F9B inline=0 idx=0
+  [VSH] late batch in0=[0 0 0 0] in3=[0 0 0 0] in9=[0 0 0 1]
+  [VSH] late batch bytes: 00 00 00 00 ... (32 bytes, all zero)
+  [VSH] array owner: block 0x01BA2000+4096 (asked 128) ordinal 166
+                     ra=0x00199789 live, from a reused block
+
+The declaration is coherent: position float4, diffuse and specular UB_D3D,
+one float2 texcoord, interleaved at stride 32. The buffer is a 128-byte
+MmAllocateContiguousMemoryEx allocation from guest 0x00199789 -- exactly four
+vertices of 32 bytes, which is a quad. It is empty.
+
+I suspected my own heap work, twice, and both times the measurement said no:
+
+  - RECOMP_HEAP_POISON=0xAB fills freed blocks. The bytes stayed 00, not AB,
+    so the array is not sitting in freed memory.
+  - RECOMP_HEAP_NO_FREE=1 restores the pre-repair behaviour exactly, where
+    nothing is ever reclaimed. The buffer then lands at 0x01EC1000, a fresh
+    block that was never recycled, from the same guest call site -- and is
+    STILL all zero.
+
+So the title allocates a vertex buffer, points the arrays at it, issues the
+draw, and never fills it. That is the thing to explain.
+
+That reading was right, and a 300-second run (claude-long-21) settled it.
+
+JSRF was on its first-boot cache-building screen. The cache COMPLETES:
+Cache00-08.tbl, DmCache00-09.tbl, and nine JSRF_CACHE_COMPLETE00..08.CMP
+markers written a little after the 60-second mark. No JSRF_FATAL.ERR. The
+file set stops at 259 files / 117 MB and stays there, and the run has no
+fault, no allocation failure, no stack damage and no stub execution over five
+minutes. G4 is answered: the cache is not an endless loop.
+
+After it completes the title starts drawing differently, and the empty array
+stops being the story. Sampled at batch 120,000:
+
+  [VSH] late batch attrs: a0(t2 s2 st0 @01BA3000) a9(t2 s2 st0 @01BA3018)
+                          reads=1F9B inline=12 idx=0
+  [VSH] late batch in0=[-0.53125 -0.53125 0 1] in3=[1 1 1 1] in9=[0 0 0 1]
+
+inline=12: the title has switched to INLINE vertex submission, and the values
+are real -- a position and a white diffuse, not zeros. So the empty vertex
+array in the sample above belongs to the loading phase, and post-cache draws
+carry actual data.
+
+THE SCREEN IS STILL BLACK, AND THE STAGE THAT DROPS THE WORK HAS MOVED:
+
+  [VSH]     executed batches=1370379 rejected=0
+  [TEXTURE] prepared=456799 rejected=913580
+  [TEXTURE] rejected draw 11: combiner / texture program
+
+Two of every three draws are now refused by the FRAGMENT stage, not the
+vertex stage, and every one of them for the same reason: the register
+combiner / texture program is not the one configuration nv2a_texture_copy
+implements. That module reproduces a single measured RGB565 blit and rejects
+anything else by design -- which was correct while it was the only verified
+path, and is now the thing in the way. The third that do pass are that blit,
+whose source surface is itself all zeros.
+
+So the answer to "why is nothing displayed", as a chain of measurements:
+the vertex stage is fixed and accepts everything; the fragment stage
+implements exactly one program and drops two thirds of the work; and what
+survives is a copy of a black surface. All 93 dumped frames are byte-identical
+black, SHA-256 9dc5cdcf...5eed1b3, unchanged.
+
+==========================================================================
+2. WHAT WAS RULED OUT, AND HOW
+==========================================================================
+
+Each of these was a live hypothesis. Each died to a measurement, which is
+cheaper than the code that would have implemented the wrong fix.
+
+The vertex programs are not being missed.
+  RECOMP_VSH_TRACE=1 reports uploads by subchannel and every distinct program
+  slot the title selects:
+    upload words by subchannel: 0=13059744 1..7=0
+    changed=1399872 dropped=0 loads=272078 starts=77738 constants=2021100
+    constant-dropped=0 decodes=19442 unique-hashes=1 load=12 constant-load=2
+    distinct START slots 0x00000001, LOAD slots 0x00000001, LOAD >= 32: 0
+  Everything arrives on subchannel 0, nothing is dropped, and the title only
+  ever loads at slot 0 and starts at slot 0. There is one program, twelve
+  instructions, and 19,442 decodes produced one unique hash. The executor is
+  not missing a program switch, because there is no program switch.
+
+The pusher is not swallowing the uploads.
+  nv2a_pusher.c dispatch() calls nv2a_pb_exec_method for every method when
+  RECOMP_PB_EXEC is set. The "[PUSHER] unhandled 0x0B00-0x0B4C" histogram is
+  about pgraph_d3d11_method, a different consumer. The two layers were never
+  in disagreement; the previous handover's open question is answered no.
+
+Vertex arrays are not DMA-relative in a way we are getting wrong.
+  Resolving SET_CONTEXT_DMA_VERTEX_A/B through the same nv2a_dma_resolve the
+  texture-copy path uses:
+    vertex DMA A: seen=1 handle=0x00000003 resolved=1 base=0x00000000
+                  limit=0x07FFAFFF        (B identical)
+  Base is zero, so fetch_attr's raw-offset assumption is correct. This one is
+  worth recording because the texture path DOES need the resolve, and it
+  would have been reasonable to assume the vertex path does too.
+
+The transform constants are not obviously wrong.
+    late batch c0..c7: [1 1 1.67772e+07 1] [0.53125 0.53125 0 0]
+                       [0 0 0 0] x6
+  c0 and c1 are the screen-space scale/offset pair a 2D program uses -- note
+  16777216 is 2^24, the depth-range constant -- and the oPos we get back,
+  (0.53125 0.53125 0 inf), is literally c1.xy with an infinite w. That is what
+  this program does when handed a zero vertex. The constants are consistent
+  with the program; the input is not consistent with anything.
+
+==========================================================================
+3. WHAT CHANGED IN CODE
+==========================================================================
+
+Committed (e97c71c):
+  src/kernel/nv2a_pb_exec.c
+    fetch_attr decodes NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D. It is
+    a packed D3DCOLOR stored B,G,R,A and cannot share the UB_OGL case. This
+    took batch rejections from 70,228 to zero -- every batch JSRF submits now
+    completes the vertex stage. It did not change a single pixel, and I am not
+    claiming otherwise.
+
+    prepare_vertices records WHY it refused a batch. Five distinct failures
+    shared one counter before, which is how "38,472 rejected" stayed
+    unexplained across two handovers. The reason histogram prints with the
+    periodic [VSH] line, and the first failure of each kind names the record:
+    "attribute 3 unfetchable: type=0 size=4 stride=32 offset=0x01BA2010".
+
+Uncommitted, in the tree now:
+  src/kernel/nv2a_pb_exec.c
+    Late-batch sampling (RECOMP_VSH_SAMPLE, default batch 20000): attribute
+    declarations, the constants, the values handed to the program, the raw
+    bytes behind the position array, the resolved vertex DMA contexts, and
+    the owning heap block. This is the block that produced section 1.
+    RECOMP_VSH_TRACE gained distinct START/LOAD slot bitmaps.
+  src/kernel/xbox_memory_layout.{c,h}
+    xbox_HeapDescribe(va, buf, size) formats "who owns this address" -- block
+    extent, requested size, owning kernel ordinal and guest return address,
+    free/live, and whether it came from a reused block. Written because a
+    zero-filled buffer has two opposite causes and this separates them. It
+    formats into the caller's buffer so a consumer needs one extern and no
+    shared struct; nv2a_pb_exec.c cannot include xbox_memory_layout.h,
+    because platform/xbox_winnt.h is not on that target's include path.
+    RECOMP_HEAP_NO_FREE=1 makes xbox_HeapFree a no-op, restoring pre-repair
+    behaviour so a suspected use-after-free can be A/B'd against a build that
+    cannot have one. It exhausts the heap; that is the point.
+  diagnostics/jsrf_first_fault/vsh_render_test.c
+    Stubs xbox_HeapDescribe. That target links xbox_vsh, not xbox_kernel.
+
+6/6 ctest passing.
+
+==========================================================================
+4. HOW TO REPRODUCE ANY OF SECTION 1 OR 2
+==========================================================================
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+
+  RECOMP_VSH_TRACE=1 RECOMP_STARTUP_TRACE=1 RECOMP_PB_EXEC=1 \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME-hdd" \
+  /usr/bin/python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 30
+
+  grep "late batch\|array owner\|vertex DMA\|VSH-TRACE" .../NAME/stderr.log
+
+Choose a new NAME each time. The cache is 117 MB per run; delete old *-hdd
+directories. RECOMP_VSH_SAMPLE=<n> moves the sample point,
+RECOMP_HEAP_POISON=<byte> fills freed blocks, RECOMP_HEAP_NO_FREE=1 disables
+reclamation.
+
+Runs behind this document, all under render-investigation/:
+  claude-vshwhy-10    the reason histogram: 70,228 of 70,228, one cause
+  claude-attr-11      attribute 3 type=0, the record itself
+  claude-ubd3d-12     UB_D3D decoded, rejections to zero, still black
+  claude-late-13      late sampling: real geometry, wrong-looking output
+  claude-vshtrace-14  uploads by subchannel, unique-hashes=1
+  claude-progsel-15   distinct START/LOAD bitmaps, the constants
+  claude-inputs-16    inputs and raw bytes: the buffer is zero
+  claude-poisonvb-17  poison: not freed memory
+  claude-vtxdma-18    vertex DMA base is 0
+  claude-owner-19     who owns the array
+  claude-nofree-20    pre-repair heap, different address, still zero
+  claude-long-21      300s: cache completes, nine COMPLETE markers, no fatal
+                      file, inline vertices with real values, and the
+                      fragment stage refusing two draws in three
+
+==========================================================================
+5. NEXT
+==========================================================================
+
+The goal list is JSRF_GOALS_2026-09-03_RENDERER.md. Section 1 reorders it:
+
+G1 and G4 are both answered and can be closed. The program upload reaches the
+executor on subchannel 0, undropped, and the title selects exactly one
+program; the cache completes and the file set is stable.
+
+THE NEXT GOAL IS THE FRAGMENT STAGE. 913,580 of 1,370,379 draws are refused
+with "combiner / texture program". Capture the distinct combiner
+configurations the title actually uses -- the NV097_SET_COMBINER_* register
+set for the first few rejections, grouped, the way the vertex rejections were
+grouped -- before writing any combiner code. The right first target is
+whichever configuration accounts for most of those 913,580, not a general
+combiner implementation.
+
+Note the second half of the problem, which combiner work alone will not fix:
+the draws that DO pass produce a black result because their source surface is
+all zeros, and the rasterised position range is still degenerate
+(x -0.5..-0.5 over 6,851,877 indices). Something has to write non-zero pixels
+into a surface before a copy of one can show anything.
+
+G2 (unbacked shader inputs), G3 (the 269 unhandled state methods) and G5
+(input) are unchanged. G2 is now less urgent: post-cache draws use inline
+vertex data with real values.
+
+DO NOT conclude from "rejections are zero" that the vertex path is correct. It
+means every batch is now accepted; it says nothing about whether what those
+batches contain is right, and section 1 says it is not.

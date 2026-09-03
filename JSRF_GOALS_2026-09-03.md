@@ -1,5 +1,9 @@
 # JSRF goals and readiness — 3 September 2026
 
+> Superseded. The loading and startup goals below are met; the current
+> goal list is `JSRF_GOALS_2026-09-03_RENDERER.md`, and the evidence is in
+> `CLAUDE_HANDOVER_2026-09-03_HEAP.txt`. Kept for the history.
+
 ## Latest startup result — supersedes the earlier two-asset stall below
 
 See `CLAUDE_HANDOVER_2026-09-03_STARTUP.txt` for the current implementation,

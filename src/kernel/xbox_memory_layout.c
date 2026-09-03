@@ -3142,6 +3142,50 @@ static int heap_live_entry_before(int i)
     return -1;
 }
 
+/* Describe the block covering this address, and who asked for it.
+ *
+ * Written for one question the renderer could not otherwise answer: a vertex
+ * array that reads as all zeros is either a buffer the title has not filled or
+ * a buffer this heap handed to somebody else and zeroed underneath it, and
+ * those have opposite fixes. The owner's kernel ordinal and guest return
+ * address separate them.
+ *
+ * Formats into the caller's buffer rather than exposing the block table, so a
+ * consumer needs one extern and no shared struct. Returns 0, with `buf` set to
+ * a sentence saying so, when this heap never issued the address.
+ */
+int xbox_HeapDescribe(uint32_t xbox_va, char *buf, size_t size)
+{
+    uint32_t va;
+    int i;
+
+    if (!buf || !size)
+        return 0;
+    buf[0] = 0;
+    if (!xbox_va) {
+        snprintf(buf, size, "null address");
+        return 0;
+    }
+    va = heap_canonical_va(xbox_va);
+    for (i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].size)
+            continue;
+        if (va < g_heap_blocks[i].addr ||
+            va >= g_heap_blocks[i].addr + g_heap_blocks[i].size)
+            continue;
+        snprintf(buf, size,
+                 "block 0x%08X+%u (asked %u) ordinal %u ra=0x%08X %s%s",
+                 g_heap_blocks[i].addr, g_heap_blocks[i].size,
+                 g_heap_blocks[i].req, g_heap_blocks[i].ord,
+                 g_heap_blocks[i].ra,
+                 g_heap_blocks[i].free ? "FREE" : "live",
+                 g_heap_blocks[i].reused ? ", from a reused block" : "");
+        return 1;
+    }
+    snprintf(buf, size, "not a block this heap issued");
+    return 0;
+}
+
 void xbox_HeapFree(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0, missed = 0;
@@ -3150,6 +3194,16 @@ void xbox_HeapFree(uint32_t xbox_va)
 
     if (!xbox_va) {
         return;
+    }
+    /* RECOMP_HEAP_NO_FREE restores the behaviour this heap had before the
+     * kernel free bridges were wired up: nothing is ever reclaimed. It exists
+     * to A/B a suspected use-after-free against the build that could not have
+     * one, which is the only way to tell "we recycled memory the title still
+     * uses" from "the title never wrote there". It exhausts the heap. */
+    {
+        static int disabled = -1;
+        if (disabled < 0) disabled = getenv("RECOMP_HEAP_NO_FREE") ? 1 : 0;
+        if (disabled) return;
     }
     frees++;
     va = heap_canonical_va(xbox_va);

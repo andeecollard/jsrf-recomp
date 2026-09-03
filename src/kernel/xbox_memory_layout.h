@@ -430,6 +430,12 @@ void xbox_HeapSetOwner(uint32_t ordinal, uint32_t guest_ra);
  * on the first allocation failure, and on demand from a diagnostic. */
 void xbox_HeapReport(const char *why);
 
+/* Describe the heap block covering this guest address (mirror aliases
+ * accepted) into `buf`: extent, requested size, and the kernel ordinal and
+ * guest return address that asked for it. Returns 0, and says so in `buf`,
+ * when this heap never issued the address. */
+int xbox_HeapDescribe(uint32_t xbox_va, char *buf, size_t size);
+
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */
