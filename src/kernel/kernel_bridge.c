@@ -2644,6 +2644,56 @@ static void bridge_RtlInitAnsiString(void)
 }
 
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
+/* Every live message-box object, and what it says.
+ *
+ * The disc-error dialog was found because it wrote a file; a dialog that only
+ * sits on screen writes nothing and is invisible to every instrument here. But
+ * the class is known -- vtable 0x001CC660, message string at +0xA0 -- so the
+ * objects can be found directly by scanning guest RAM for the vtable pointer.
+ *
+ * RECOMP_DIALOG_SCAN=1, once, a few seconds in. A title parked on a healthy
+ * frame loop that draws one full-screen quad and loads nothing looks identical
+ * whether it is idling or showing a message, and this is the difference.
+ */
+#define DIALOG_VTABLE 0x001CC660u
+
+static void bridge_scan_dialogs(void)
+{
+    static int done;
+    uint32_t va, hits = 0;
+
+    if (done || !getenv("RECOMP_DIALOG_SCAN"))
+        return;
+    done = 1;
+
+    fprintf(stderr, "  [DIALOG] scanning guest RAM for vtable 0x%08X\n",
+            DIALOG_VTABLE);
+    for (va = 0x00010000u; va < 0x04000000u && hits < 12; va += 4) {
+        char     msg[192];
+        uint32_t sp;
+        int      k;
+
+        if (BRIDGE_MEM32(va) != DIALOG_VTABLE)
+            continue;
+        hits++;
+        sp = BRIDGE_MEM32(va + 0xA0);
+        msg[0] = 0;
+        if (sp >= 0x00010000u && sp < 0x04000000u) {
+            for (k = 0; k < (int)sizeof(msg) - 1; k++) {
+                char c = (char)(BRIDGE_MEM32((sp + (uint32_t)k) & ~3u)
+                                >> (8 * ((sp + (uint32_t)k) & 3)));
+                if (!c) break;
+                msg[k] = (c >= 32 && c < 127) ? c : '.';
+            }
+            msg[k] = 0;
+        }
+        fprintf(stderr, "  [DIALOG] object 0x%08X [+0x98]=0x%08X \"%s\"\n",
+                va, BRIDGE_MEM32(va + 0x98), msg);
+    }
+    fprintf(stderr, "  [DIALOG] %u object(s)\n", hits);
+    fflush(stderr);
+}
+
 /* Guest backtrace for one file open, selected by path.
  *
  * A title that declares a fatal error writes a file and keeps running, so none
@@ -4790,6 +4840,7 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+            bridge_scan_dialogs();
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             xbox_bridge_dump_ordinal_histogram();
