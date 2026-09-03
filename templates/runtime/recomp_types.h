@@ -157,6 +157,11 @@ extern uint32_t g_xbox_code_hi;
 #endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+
+/* RDTSC. Defined in the runtime (src/kernel/recomp_tsc.c) rather than inline,
+ * because a title reads the counter as a clock and every caller has to agree
+ * on its rate: the guest's own QueryPerformanceFrequency reports 733333333. */
+uint64_t recomp_rdtsc(void);
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
 /* Guest linear base loaded in the x86 FS segment register. Xbox uses FS for

@@ -1217,6 +1217,19 @@ class Lifter:
                 f"  }} else {{ (void)({dst}); }} }}",
             ]
 
+        # rdtsc publishes the timestamp counter in EDX:EAX.
+        #
+        # Left unimplemented it is not a no-op: EAX and EDX keep whatever they
+        # held, so a title that samples the counter twice and subtracts gets
+        # the difference of two stale registers. JSRF times a startup step that
+        # way and decides the disc is damaged when the garbage exceeds its
+        # threshold, which is why it never reached a scene.
+        if m == "rdtsc":
+            return [
+                "{ uint64_t _tsc = recomp_rdtsc();",
+                "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); }",
+            ]
+
         # ── Unhandled ──
         #
         # Recorded, not merely commented -- see self.unimplemented.

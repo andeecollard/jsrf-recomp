@@ -23,6 +23,7 @@ set(KERNEL_SOURCES
     icall_feedback.c
     recomp_trace.c
     recomp_debug.c
+    recomp_tsc.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
 )
