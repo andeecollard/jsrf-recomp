@@ -57,6 +57,8 @@ extern void xbox_FramebufferWindowStart(void);
 #define NV097_INLINE_ARRAY                0x1818
 #define NV097_SET_VIEWPORT_OFFSET         0x0A20   /* +i*4, 4 floats */
 #define NV097_SET_VIEWPORT_SCALE          0x0AF0   /* +i*4, 4 floats */
+#define NV097_SET_TRANSFORM_PROGRAM       0x0B00   /* ..0x0B7C, 32 slots  */
+#define NV097_SET_TRANSFORM_CONSTANT      0x0B80   /* ..0x0BFC, 32 slots  */
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -101,6 +103,52 @@ static struct {
 typedef struct { uint32_t method, count; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
+
+/* The title's vertex program and its constants, recorded verbatim.
+ *
+ * JSRF's vertices are neither screen space nor NDC: they are inputs to a
+ * program uploaded through 0x0B00..0x0B7C, and nothing here can place them
+ * without running it. Writing an interpreter needs the exact XVS instruction
+ * encoding, which is not something to reconstruct from memory -- so this
+ * records what the title actually uploads, in order, and leaves the decoding
+ * to someone with the encoding in front of them.
+ *
+ * Constants print as floats because that is what they are, and because the
+ * scale between the vertices (0..2560) and the surface (640 wide) should be
+ * visible among them. Observation only: the writes are still passed to
+ * note_unhandled, so the ranked list does not change.
+ */
+#define PB_PROG_SLOTS 1024
+static struct { uint32_t method, param; } s_prog_log[PB_PROG_SLOTS];
+static int s_prog_logged;
+
+static void note_program_write(uint32_t method, uint32_t param)
+{
+    if (s_prog_logged < PB_PROG_SLOTS) {
+        s_prog_log[s_prog_logged].method = method;
+        s_prog_log[s_prog_logged].param  = param;
+        s_prog_logged++;
+    }
+}
+
+void nv2a_pb_exec_dump_program(void)
+{
+    int i;
+    if (!s_prog_logged)
+        return;
+    fprintf(stderr, "[GPU] vertex program and constants, first %d writes:\n",
+            s_prog_logged);
+    for (i = 0; i < s_prog_logged; i++) {
+        uint32_t m = s_prog_log[i].method, v = s_prog_log[i].param;
+        float f;
+        memcpy(&f, &v, sizeof(f));
+        if (m >= NV097_SET_TRANSFORM_CONSTANT)
+            fprintf(stderr, "  [GPU]   0x%04X = 0x%08X  (% .6f)\n", m, v, f);
+        else
+            fprintf(stderr, "  [GPU]   0x%04X = 0x%08X\n", m, v);
+    }
+    fflush(stderr);
+}
 
 static void note_unhandled(uint32_t method)
 {
@@ -821,6 +869,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                    &param, sizeof(float));
             s_gpu.vp_seen = 1;
         } else {
+            if ((method >= NV097_SET_TRANSFORM_PROGRAM && method < 0x0C00)
+                    || (method >= 0x1E9C && method <= 0x1EA4))
+                note_program_write(method, param);
             note_unhandled(method);
         }
         break;
@@ -1011,14 +1062,27 @@ void nv2a_pb_exec_report(void)
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
      * of them means the rasteriser is broken. */
+    int n_top;
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
 
     /* Top ten by frequency: selection sort over a small table, once every few
-     * seconds, is not worth a better algorithm. */
-    for (i = 0; i < 10 && i < s_unhandled_count; i++) {
+     * seconds, is not worth a better algorithm. RECOMP_PB_EXEC_TOP raises the
+     * cut, because "which methods does this title use at all" is a different
+     * question from "which dominate", and answering it by guessing at NV2A
+     * register numbers is how you implement the wrong one. */
+    {
+        static int top = -1;
+        if (top < 0) {
+            const char *e = getenv("RECOMP_PB_EXEC_TOP");
+            top = e ? atoi(e) : 10;
+            if (top <= 0) top = 10;
+        }
+        n_top = top;
+    }
+    for (i = 0; i < n_top && i < s_unhandled_count; i++) {
         int best = i;
         for (j = i + 1; j < s_unhandled_count; j++)
             if (s_unhandled[j].count > s_unhandled[best].count)
@@ -1031,5 +1095,7 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "  [GPU]   0x%04X x%u\n",
                 s_unhandled[i].method, s_unhandled[i].count);
     }
+    if (getenv("RECOMP_PB_EXEC_PROGRAM"))
+        nv2a_pb_exec_dump_program();
     fflush(stderr);
 }
