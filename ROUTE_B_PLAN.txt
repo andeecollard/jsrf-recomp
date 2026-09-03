@@ -587,3 +587,52 @@ STRATEGIC -- THE DIVERGENCE IS NOW COSTING REAL WORK
   translator.py and the kernel, all places both sides have edited, so it is a
   session's work on its own -- but the alternative is discovering a fourth and
   fifth duplicate.
+
+
+================================================================================
+13. B1 AND A1 ANSWERED
+================================================================================
+B1 -- DOES THE WINDOW SHOW THE CLEAR COLOUR? YES, AND THE COLOUR IS BLACK.
+Answered with a glReadPixels at Present rather than by looking, which also
+works where looking does not. The centre pixel is 00 00 00 00 at every
+present -- and the guest asked for exactly that:
+
+    [PGRAPH] clear 1: param=0x00000003 flags=0x6 colour=0x00000000
+    [PGRAPH] clear 2: param=0x000000F3 flags=0x7 colour=0x00000000
+
+param 0xF3 sets D3DCLEAR_TARGET, so the colour buffer really is being cleared,
+to black, because that is the value in SET_COLOR_CLEAR_VALUE. There is no bug
+in the clear path. P1's exit criterion is met: the window shows the clear
+colour. It is simply that the clear colour is black, which looks identical to
+nothing happening -- which is why this needed a number rather than a glance.
+
+A1 -- DOES THE DISPATCHER'S CLASS EXIST AT RUNTIME? YES, THREE INSTANCES.
+
+    DISPATCHER class 0x001E1640: 3 live instances, first 0x0183E0A0,
+        referenced from 0x01064824 and 0x0183DFF4   (both heap)
+    RENDERER   class 0x001E0F00: 1 live instance, 0x0105C870,
+        referenced from 0x00251D6C, 0x002650D8, 0x00265110  (all .data globals)
+
+So nothing is missing. Both classes are constructed, the renderer is reachable
+from three globals, and the dispatcher objects are owned by other heap objects
+rather than by globals -- they sit in a container, which is what a scene or
+task list looks like.
+
+THAT MAKES A3 THE LIVE OUTCOME. The chain is intact and simply is not being
+driven: the game is in a state whose slot 23 is never called. Not a missing
+object, not a dropped pointer, not a broken clear.
+
+TWO SCANNING MISTAKES WORTH NOT REPEATING, both mine, both caught by the
+numbers disagreeing with themselves:
+  * Scanning the IMAGE for instances finds the vtable address as an immediate
+    inside the constructor that installs it. The first run reported an
+    "instance" at 0x00159DF0, which is .text. Instances live on the heap.
+  * Scanning only the HEAP for references loses them all, because the global
+    that owns an object is in .data. The renderer went from three references
+    to zero. The two scans need different ranges and it is not symmetric.
+
+NEXT IS A2 AND NOTHING ELSE: turn on RECOMP_ICALL_FEEDBACK and find out
+whether slot 23 of 0x001E1640 is ever dispatched. If it is, something inside
+sub_001596B0 declines and that is readable. If it is not, the question is what
+selects the state -- and that is a game state machine, which should be costed
+as its own piece of work rather than continued on momentum.

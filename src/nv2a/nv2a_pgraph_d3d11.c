@@ -662,6 +662,17 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             if (param & 0x01) flags |= 2;  /* D3DCLEAR_ZBUFFER */
             if (param & 0x02) flags |= 4;  /* D3DCLEAR_STENCIL */
             dev->lpVtbl->Clear(dev, 0, NULL, flags, g_pg.clear_color, 1.0f, 0);
+            {   /* Whether the framebuffer "shows the clear colour" cannot be
+                 * judged without knowing which colour was asked for -- black
+                 * on black reads as a broken clear and as a correct one. */
+                static int n = 0;
+                if (n < 6) {
+                    n++;
+                    fprintf(stderr, "[PGRAPH] clear %d: param=0x%08X flags=0x%X "
+                            "colour=0x%08X\n", n, param, flags, g_pg.clear_color);
+                    fflush(stderr);
+                }
+            }
         }
         g_pg.stats.clears++;
         return 1;

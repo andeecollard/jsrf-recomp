@@ -561,6 +561,30 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
      * SDL_GL_SwapWindow needs the thread holding the GL context. Those are
      * two different threads. Splitting them lets each run where it is legal
      * -- see xbox_d3d8_pump_events. */
+    /* Read the centre pixel back before the swap.
+     *
+     * P1's exit criterion is "the window shows the clear colour", and nobody
+     * had checked it -- the guest issues its clears, the pusher dispatches
+     * them and Present swaps, but none of that says a pixel changed. A
+     * readback answers it with a number instead of an opinion, and works
+     * where looking at the screen does not. */
+    {
+        static int shots = 0;
+        if (shots < 6) {
+            GLint vp[4] = { 0, 0, 0, 0 };
+            GLubyte px[4] = { 0, 0, 0, 0 };
+            glGetIntegerv(GL_VIEWPORT, vp);
+            if (vp[2] > 0 && vp[3] > 0) {
+                glReadPixels(vp[2] / 2, vp[3] / 2, 1, 1,
+                             GL_RGBA, GL_UNSIGNED_BYTE, px);
+            }
+            shots++;
+            fprintf(stderr, "[d3d8_gl] present %d: viewport %dx%d centre "
+                    "pixel RGBA %02X %02X %02X %02X\n",
+                    shots, vp[2], vp[3], px[0], px[1], px[2], px[3]);
+            fflush(stderr);
+        }
+    }
     SDL_GL_SwapWindow(g.window);
     return D3D_OK;
 }

@@ -214,6 +214,26 @@ static uint32_t jsrf_pb_index(uint32_t which)
  * that owns it. That names the thing the tick would have to consult.
  */
 #define JSRF_RENDERER_VTABLE 0x001E0F00u
+/* The 26-slot class whose slot 23 (+0x5C) holds sub_001596B0, the
+ * render dispatcher. If no instance of this exists, the object that
+ * would drive rendering was never built -- which is upstream of every
+ * other question about why nothing draws. */
+#define JSRF_DISPATCH_VTABLE 0x001E1640u
+
+/* Two different ranges, because the two scans want different things.
+ *
+ * INSTANCES live on the heap. Scanning the image for them finds the vtable
+ * address as an IMMEDIATE inside the constructor that installs it -- the first
+ * attempt reported an "instance" at 0x00159DF0, which is .text.
+ *
+ * REFERENCES are the opposite: the global that owns an object is usually in
+ * .data, which is inside the image. Restricting this scan to the heap as well
+ * lost every reference to the renderer -- it reported 0, when three globals at
+ * 0x00251D6C / 0x002650D8 / 0x00265110 point straight at it. Start at .rdata,
+ * which is past the last code section (XPP ends at 0x001C3F58). */
+#define JSRF_HEAP_SCAN_LO 0x00290000u
+#define JSRF_HEAP_SCAN_HI 0x02000000u
+#define JSRF_REF_SCAN_LO  0x001C3F60u
 
 static void jsrf_find_renderer(void)
 {
@@ -227,7 +247,47 @@ static void jsrf_find_renderer(void)
 
     /* Guest RAM only; the scan is a diagnostic, so keep it to the mapped
      * image and heap rather than probing apertures that fault. */
-    for (va = 0x00010000u; va < 0x02000000u; va += 4) {
+    {   /* The dispatcher's class first: it is the more decisive of the two.
+         *
+         * Skip the image itself. A vtable address also appears as an IMMEDIATE
+         * inside the constructor that installs it, so scanning code reports
+         * matches at code addresses -- 0x00159DF0 the first time this ran,
+         * which is .text, not an object. An instance lives on the heap.
+         *
+         * Built into one line and written once: worker threads log
+         * concurrently and a per-entry fprintf interleaves with them, which is
+         * how the first attempt produced a half-finished line with an ADX tick
+         * spliced through it. */
+        char line[320];
+        int off = 0, d = 0, refs = 0;
+        uint32_t first = 0;
+        for (va = JSRF_HEAP_SCAN_LO; va < JSRF_HEAP_SCAN_HI; va += 4) {
+            if (MEM32(va) == JSRF_DISPATCH_VTABLE) {
+                if (!d) first = va;
+                d++;
+            }
+        }
+        off = snprintf(line, sizeof(line),
+                       "  [RENDERER] DISPATCHER class 0x%08X: %d live instance(s)",
+                       JSRF_DISPATCH_VTABLE, d);
+        if (d) {
+            off += snprintf(line + off, sizeof(line) - (size_t)off,
+                            ", first 0x%08X, referenced from:", first);
+            for (va = JSRF_REF_SCAN_LO; va < JSRF_HEAP_SCAN_HI; va += 4) {
+                if (MEM32(va) == first && va != first) {
+                    refs++;
+                    if (refs <= 6 && off > 0 && off < (int)sizeof(line) - 16) {
+                        off += snprintf(line + off, sizeof(line) - (size_t)off,
+                                        " 0x%08X", va);
+                    }
+                }
+            }
+            snprintf(line + off, sizeof(line) - (size_t)off, "  (%d total)", refs);
+        }
+        fprintf(stderr, "%s\n", line);
+    }
+
+    for (va = JSRF_HEAP_SCAN_LO; va < JSRF_HEAP_SCAN_HI; va += 4) {
         if (MEM32(va) == JSRF_RENDERER_VTABLE) {
             if (n < 8) found[n] = va;
             n++;
@@ -242,7 +302,7 @@ static void jsrf_find_renderer(void)
         char line[256];
         int off = snprintf(line, sizeof(line),
                            "  [RENDERER]   instance 0x%08X referenced from:", obj);
-        for (va = 0x00010000u; va < 0x02000000u; va += 4) {
+        for (va = JSRF_REF_SCAN_LO; va < JSRF_HEAP_SCAN_HI; va += 4) {
             if (MEM32(va) == obj && va != obj) {
                 refs++;
                 if (off > 0 && off < (int)sizeof(line) - 16 && refs <= 8) {
