@@ -378,6 +378,49 @@ static void xbox_McpxHoldRegisters(void)
         if ((*rh & 0xFFu) != ndp)
             *rh = (*rh & ~0xFFu) | ndp;
     }
+
+    /* RECOMP_OHCI_ATTACH=1: report a device on root-hub port 1.
+     *
+     * Purely a probe, and the question it asks is whether XPP looks at the
+     * port at all. Setting CurrentConnectStatus with ConnectStatusChange is
+     * how hardware announces a plug, so a stack that polls the root hub should
+     * respond by resetting the port and starting enumeration -- which would
+     * show up as writes to this register and as endpoint descriptors appearing
+     * in the HCCA. A stack that never looks will leave the change bit standing
+     * for ever, and that answers it too.
+     *
+     * Set once. Nothing here can complete an enumeration: there are no
+     * descriptors and no transfer service behind it, so if the title does
+     * respond it will ask questions this cannot answer. Finding out which of
+     * those two happens is the entire point. */
+    {
+        static int attached;
+        if (!attached && getenv("RECOMP_OHCI_ATTACH")) {
+            volatile uint32_t *ps =
+                (volatile uint32_t *)((char *)g_mcpx_regs + 0x500054);
+            volatile uint32_t *ctl =
+                (volatile uint32_t *)((char *)g_mcpx_regs + 0x500004);
+            /* Only once the title has actually brought the controller up,
+             * so this cannot be mistaken for a device present at reset. */
+            if ((*ctl & 0xC0u) != 0) {
+                volatile uint32_t *ist =
+                    (volatile uint32_t *)((char *)g_mcpx_regs + 0x50000C);
+                volatile uint32_t *ien =
+                    (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
+                attached = 1;
+                *ps = 0x00010001u;   /* CurrentConnectStatus | ConnectStatusChange */
+                /* A connect that raises no interrupt is invisible: XPP has
+                 * RootHubStatusChange enabled in HcInterruptEnable and is
+                 * waiting on it, so the status bit is what actually announces
+                 * the plug. */
+                *ist |= 0x00000040u;                    /* RHSC */
+                fprintf(stderr, "  [OHCI] attach probe: port1=0x%08X "
+                        "intr_status=0x%08X intr_enable=0x%08X\n",
+                        *ps, *ist, *ien);
+                fflush(stderr);
+            }
+        }
+    }
 }
 
 static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {

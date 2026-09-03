@@ -2676,9 +2676,13 @@ static void bridge_dump_ohci(void)
     const uint32_t base = 0xFED00000u;
     uint32_t i;
 
-    if (done || !getenv("RECOMP_OHCI_DUMP"))
+    /* RECOMP_OHCI_DUMP=n dumps n times, so a response to the attach probe is
+     * visible as a change rather than only as a first reading. */
+    if (!getenv("RECOMP_OHCI_DUMP"))
         return;
-    done = 1;
+    if (done >= atoi(getenv("RECOMP_OHCI_DUMP")))
+        return;
+    done++;
 
     fprintf(stderr, "  [OHCI] root hub at 0x%08X\n", base);
     for (i = 0; i <= 0x5C; i += 4)
