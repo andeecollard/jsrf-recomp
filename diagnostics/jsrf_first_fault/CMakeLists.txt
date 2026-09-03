@@ -37,6 +37,19 @@ target_include_directories(jsrf_first_fault PRIVATE
     "${JSRF_STOCK_DIR}/src/recomp"
     "${XBOXRECOMP_DIR}/include"
 )
+# Record every indirect-branch target actually dispatched.
+#
+# The render chain is entirely vtable-dispatched -- neither the render entry
+# sub_00155050 nor its dispatcher sub_001596B0 has a static caller -- so the
+# call graph cannot say whether either is ever reached. This is the only
+# instrument that sees it. Costs one subtract, one compare and one OR on the
+# hot path, and an 8 MiB byte array.
+target_compile_definitions(jsrf_first_fault PRIVATE RECOMP_ICALL_FEEDBACK)
+# The observation array itself lives in icall_feedback.c, which is compiled
+# into xbox_kernel -- so the library needs the define too, or the executable
+# references a symbol nobody defined.
+target_compile_definitions(xbox_kernel PRIVATE RECOMP_ICALL_FEEDBACK)
+
 target_compile_options(jsrf_first_fault PRIVATE
     -O0 -g3 -fno-omit-frame-pointer -w
     -include "${CMAKE_CURRENT_LIST_DIR}/guest_trace.h"

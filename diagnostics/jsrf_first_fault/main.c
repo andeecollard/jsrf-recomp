@@ -15,6 +15,7 @@
 #include "guest_trace.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
+#include "recomp_icall_feedback.h"
 #include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 
@@ -329,6 +330,40 @@ static void jsrf_pusher_report(void)
     last = now;
 
     jsrf_find_renderer();
+
+    {   /* Was the render chain ever dispatched?
+         *
+         * Both links are vtable-only, so this is the one instrument that can
+         * answer it. Read directly rather than through the dump file: the
+         * question is about two specific addresses, and a dump has to be
+         * merged by a separate tool before it says anything.
+         *
+         * Dumped PERIODICALLY, never from atexit. Upstream found the atexit
+         * dump is dead code for a title that does not exit cleanly, and every
+         * run here ends in kill -9, so the same applies for a different
+         * reason. An empty dump would read as "no indirect calls observed",
+         * which is the false conclusion this effort has already drawn twice
+         * from a missing instrument. */
+        static int said;
+        uint32_t disp = 0x001596B0u - RECOMP_ICALL_FB_BASE;
+        uint32_t rend = 0x00155050u - RECOMP_ICALL_FB_BASE;
+        unsigned d = (disp < RECOMP_ICALL_FB_SIZE) ? g_icall_seen[disp] : 0;
+        unsigned r = (rend < RECOMP_ICALL_FB_SIZE) ? g_icall_seen[rend] : 0;
+        if (!said || d || r) {
+            said = 1;
+            fprintf(stderr, "  [ICALL-FB] dispatcher sub_001596B0=%s  "
+                    "render sub_00155050=%s\n",
+                    d ? (d & RECOMP_ICALL_SEEN_RESOLVED ? "DISPATCHED"
+                                                        : "seen-unresolved")
+                      : "never",
+                    r ? (r & RECOMP_ICALL_SEEN_RESOLVED ? "DISPATCHED"
+                                                        : "seen-unresolved")
+                      : "never");
+            fflush(stderr);
+        }
+        RECOMP_ICALL_FEEDBACK_DUMP();
+    }
+
     nv2a_pusher_get_stats(&st);
     {
         PgraphD3D11Stats ps;
