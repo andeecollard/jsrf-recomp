@@ -361,6 +361,8 @@ static unsigned xbox_OhciPorts(void)
 /* Enforce the two above on the MCPX aperture. Cheap enough to run beside the
  * NV2A table on every tick, which is where the existing note said this
  * belonged. */
+static void mcpx_hw_store(uint32_t offset, uint32_t value);
+
 static void xbox_McpxHoldRegisters(void)
 {
     if (!g_mcpx_regs)
@@ -412,12 +414,13 @@ static void xbox_McpxHoldRegisters(void)
                 volatile uint32_t *ien =
                     (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
                 attached = 1;
-                *ps = 0x00010001u;   /* CurrentConnectStatus | ConnectStatusChange */
+                mcpx_hw_store(0x500054u, 0x00010001u);
+                (void)ps;            /* announced as hardware, not as the guest */
                 /* A connect that raises no interrupt is invisible: XPP has
                  * RootHubStatusChange enabled in HcInterruptEnable and is
                  * waiting on it, so the status bit is what actually announces
                  * the plug. */
-                *ist |= 0x00000040u;                    /* RHSC */
+                mcpx_hw_store(0x50000Cu, *ist | 0x00000040u);   /* RHSC */
                 /* RECOMP_OHCI_MIE=1 also sets MasterInterruptEnable.
                  *
                  * Strictly a probe, and a dishonest one: bit 31 of
@@ -436,7 +439,8 @@ static void xbox_McpxHoldRegisters(void)
                  * nothing follows, the title is waiting on something else and
                  * faking its register told us so cheaply. Either answer is
                  * worth one line; neither is a fix. */
-                if (getenv("RECOMP_OHCI_MIE")) *ien |= 0x80000000u;
+                if (getenv("RECOMP_OHCI_MIE"))
+                    mcpx_hw_store(0x500010u, *ien | 0x80000000u);
                 fprintf(stderr, "  [OHCI] attach probe: port1=0x%08X "
                         "intr_status=0x%08X intr_enable=0x%08X%s\n",
                         *ps, *ist, *ien,
@@ -496,6 +500,42 @@ static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
  * so a poll only ever sees the second. It has to be observed at write time. */
 #define MCPX_OHCI_INTR_ENABLE   0x500010u
 #define MCPX_OHCI_INTR_DISABLE  0x500014u
+#define MCPX_OHCI_PORT0         0x500054u
+#define MCPX_OHCI_PORT1         0x500058u
+
+/* HcRhPortStatus, which is not a value register either.
+ *
+ * The low half is a set of commands -- writing a 1 to bit 1 enables the port,
+ * to bit 4 resets it, to bit 8 powers it -- and the high half is five change
+ * bits that are write-1-to-clear. As plain memory the driver's acknowledge
+ * stored the value instead: JSRF writes 0x00010000 to clear ConnectStatusChange
+ * and that wiped CurrentConnectStatus with it, so the device vanished the
+ * moment it was noticed.
+ *
+ * A reset completes instantly here. Hardware drives it for 10 ms and then
+ * clears PortResetStatus, sets PortEnableStatus and raises PortResetStatusChange;
+ * there is nothing to wait for, so do all three at once and raise the root-hub
+ * status change with them. */
+static uint32_t ohci_port_write(uint32_t current, uint32_t v)
+{
+    uint32_t n = current;
+
+    if (v & 0x0001u) n &= ~0x0002u;          /* ClearPortEnable */
+    if (v & 0x0002u) n |=  0x0002u;          /* SetPortEnable */
+    if (v & 0x0004u) n |=  0x0004u;          /* SetPortSuspend */
+    if (v & 0x0008u) n &= ~0x0004u;          /* ClearSuspendStatus */
+    if (v & 0x0100u) n |=  0x0100u;          /* SetPortPower */
+    if (v & 0x0200u) n &= ~0x0100u;          /* ClearPortPower */
+    if (v & 0x0010u) {                       /* SetPortReset */
+        if (n & 0x0001u) {                   /* only if something is attached */
+            n &= ~0x0010u;                   /* reset already finished */
+            n |=  0x0002u;                   /* port enabled */
+            n |=  0x00100000u;               /* PortResetStatusChange */
+        }
+    }
+    n &= ~(v & 0x001F0000u);                 /* change bits: write-1-to-clear */
+    return n;
+}
 
 static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[] = {
     { MCPX_AC97_NABM + 0 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
@@ -668,6 +708,34 @@ static int mcpx_guarded_page(uintptr_t host_addr, uintptr_t *page_out)
     return 0;
 }
 
+/* Store to a guarded MCPX register as the hardware, not as the guest.
+ *
+ * The trap turns a guest write into the register's real semantics -- a 1 to a
+ * change bit clears it, a 1 to bit 4 of a port resets it. The runtime asserting
+ * a condition means the opposite: "this is now the value". Announcing a connect
+ * by writing 0x00010001 through the guest path would read as ClearPortEnable
+ * plus an acknowledge of the very change being announced.
+ *
+ * Drops the guard for the store, under the same lock the handler uses. */
+static void mcpx_hw_store(uint32_t offset, uint32_t value)
+{
+    volatile uint32_t *p;
+    uintptr_t page;
+    DWORD old_prot;
+
+    if (!g_mcpx_regs) return;
+    p = (volatile uint32_t *)((char *)g_mcpx_regs + offset);
+    if (!g_mcpx_trap_active) { *p = value; return; }
+
+    page = (uintptr_t)p & ~(uintptr_t)(g_mcpx_page_size - 1);
+    mcpx_lock();
+    if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
+        *p = value;
+        VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
+    }
+    mcpx_unlock();
+}
+
 /* Value the store would have written, after removing bits the hardware clears
  * before software can observe them. Applied per byte so a wide store covering
  * a control byte is handled the same as a byte store to it. */
@@ -747,11 +815,48 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
      * runtime assertion. Apply the same `pending &= ~value` operation as the
      * in-tree NV2A model before performing the intercepted store. */
     uint32_t ohci_disable = 0;
+    int ohci_raise_rhsc = 0;
+    /* Every guest write to the OHCI operational registers, now that the page is
+     * guarded for the interrupt pair. RECOMP_OHCI_TRACE only.
+     *
+     * This is the whole conversation the driver is trying to have: which
+     * registers it programs, in what order, when it resets a port and where it
+     * puts its endpoint lists. Guessing at that from the OHCI specification is
+     * how a device model ends up answering questions the title never asks. */
+    if (guest_va >= XBOX_MCPX_BASE + 0x500000u
+            && guest_va < XBOX_MCPX_BASE + 0x500060u) {
+        static int on = -1;
+        static unsigned long n;
+        if (on < 0) on = getenv("RECOMP_OHCI_TRACE") != NULL;
+        if (on && ++n <= 400) {
+            static const char *nm[] = {
+                "HcRevision","HcControl","HcCommandStatus","HcInterruptStatus",
+                "HcInterruptEnable","HcInterruptDisable","HcHCCA",
+                "HcPeriodCurrentED","HcControlHeadED","HcControlCurrentED",
+                "HcBulkHeadED","HcBulkCurrentED","HcDoneHead","HcFmInterval",
+                "HcFmRemaining","HcFmNumber","HcPeriodicStart","HcLSThreshold",
+                "HcRhDescriptorA","HcRhDescriptorB","HcRhStatus",
+                "HcRhPortStatus0","HcRhPortStatus1",
+            };
+            uint32_t off = guest_va - (XBOX_MCPX_BASE + 0x500000u);
+            fprintf(stderr, "  [OHCI-W] #%lu +0x%02X %-18s <= 0x%08X (w%u)\n",
+                    n, off, (off / 4) < 23 ? nm[off / 4] : "?",
+                    (uint32_t)value, width);
+            fflush(stderr);
+        }
+    }
     if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && width == 4) {
         value = *(volatile uint32_t *)fault & ~(uint32_t)value;
     } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE && width == 4) {
         /* Write-1-to-set. */
         value = *(volatile uint32_t *)fault | (uint32_t)value;
+    } else if ((guest_va == XBOX_MCPX_BASE + MCPX_OHCI_PORT0
+                || guest_va == XBOX_MCPX_BASE + MCPX_OHCI_PORT1) && width == 4) {
+        uint32_t before = *(volatile uint32_t *)fault;
+        value = ohci_port_write(before, (uint32_t)value);
+        /* A change bit going up is a root-hub status change. */
+        if ((value & 0x001F0000u) & ~(before & 0x001F0000u))
+            ohci_raise_rhsc = 1;
     } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE && width == 4) {
         /* Write-1-to-clear against Enable; both read back the enable mask. */
         ohci_disable = (uint32_t)value;
@@ -772,6 +877,11 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     case 2: *(volatile uint16_t *)fault = (uint16_t)value; break;
     case 4: *(volatile uint32_t *)fault = (uint32_t)value; break;
     default: *(volatile uint64_t *)fault = value;          break;
+    }
+    if (ohci_raise_rhsc) {
+        volatile uint32_t *ist = (volatile uint32_t *)
+            (uintptr_t)(XBOX_MCPX_BASE + 0x50000Cu + g_memory_offset);
+        *ist |= 0x00000040u;
     }
     if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) {
         /* Enable sits four bytes below, on this same now-writable page. */

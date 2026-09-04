@@ -673,8 +673,38 @@ It does not yet enumerate, which is expected -- that is step 2. The driver now
 gets as far as asking questions this has no answers for.
 
 Remaining, in order:
-(2) answer the port reset and the control transfers it then issues on the
-    default endpoint through the HCCA at 0x009E2000,
+(2) **started.** Guarding the interrupt pair guards the whole OHCI page, so
+    `RECOMP_OHCI_TRACE=1` now prints every register write the driver makes --
+    the entire conversation, in order, instead of the specification's version
+    of it. It showed the next fault immediately:
+
+    ```
+    #19 HcRhPortStatus0 <= 0x00010001   the probe: connect + change
+    #21 HcInterruptEnable <= 0x80000033  driver sets MIE
+    #23 HcRhPortStatus0 <= 0x00010000    driver acknowledges CSC
+    ```
+
+    `HcRhPortStatus` is not a value register either: the low half is commands
+    (a 1 to bit 1 enables, bit 4 resets, bit 8 powers) and the high half is
+    five write-1-to-clear change bits. As plain memory the acknowledge stored
+    `0x00010000` and wiped CurrentConnectStatus with it, so the device vanished
+    the moment it was noticed. `ohci_port_write` now models both halves, and a
+    reset completes in place -- clearing PortResetStatus, setting
+    PortEnableStatus and raising PortResetStatusChange with the root-hub status
+    change, because there is no 10 ms to wait for here.
+
+    `mcpx_hw_store` is the other half of that: the runtime announcing a connect
+    means "this is now the value", which is the opposite of what a guest write
+    means, so the attach probe drops the guard rather than going through the
+    semantics and acknowledging the change it is announcing.
+
+    Measured: `HcRhPortStatus[0] = 0x00000001` and it stays there across the
+    acknowledge. The driver has a device that does not disappear.
+
+    Still to do: it has not issued the port reset yet, and the control
+    transfers on the default endpoint through the HCCA at 0x009E2000 have no
+    service behind them. That is the remaining bulk of the device model.
+
 (3) answer interrupt-IN with pad reports fed from `xbox_InputGetState`, which
     already exists and already has a synthetic pad for bring-up.
 
