@@ -648,8 +648,31 @@ write time instead of sample time.
 Then the attach probe's connect will raise a real interrupt, the ISR will
 claim it, and `sub_001C2220` will get a bitmap with a port in it.
 
+**Step 1 is done.** `HcInterruptEnable`/`HcInterruptDisable` are now handled by
+the MCPX write trap: a 1 written to Enable sets that bit, a 1 written to Disable
+clears it from Enable, and Disable reads back the enable mask. The guest's own
+writes confirm the diagnosis was right --
+`MEM32(x + 0x10) = 0x80000000` appears in the controller-start path and again in
+the ISR's re-arm at `loc_001C2911`, and `sub_001BD295` writes `0x40` shortly
+after. As plain memory the second write threw the master bit away.
+
+With the pair trapped:
+
+```
+HcInterruptEnable 0x80000073         MIE survives alongside RootHubStatusChange
+device ISR vector 1 -> TRUE (handled)   was FALSE for every run before this
+ord 119 sites: 0x001C290F ...        the ISR now queues its own DPC
+```
+
+The ISR claims the interrupt and queues its DPC, and `bridge_run_isr` runs
+queued DPCs after the handler returns, so the driver is being driven properly
+for the first time. Nothing regressed: 132,440 draws prepared with zero
+rejections, no out-of-memory, no fatal marker, the startup screens unchanged.
+
+It does not yet enumerate, which is expected -- that is step 2. The driver now
+gets as far as asking questions this has no answers for.
+
 Remaining, in order:
-(1) trap the interrupt-enable pair rather than polling it.
 (2) answer the port reset and the control transfers it then issues on the
     default endpoint through the HCCA at 0x009E2000,
 (3) answer interrupt-IN with pad reports fed from `xbox_InputGetState`, which

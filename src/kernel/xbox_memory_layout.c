@@ -379,41 +379,9 @@ static void xbox_McpxHoldRegisters(void)
             *rh = (*rh & ~0xFFu) | ndp;
     }
 
-    /* HcInterruptEnable and HcInterruptDisable are a set/clear pair.
-     *
-     * On OHCI, writing a 1 to a bit of HcInterruptEnable (0x10) *sets* that
-     * bit; clearing needs a 1 written to the same bit of HcInterruptDisable
-     * (0x14). Both read back the same enable mask. This aperture is plain
-     * memory, so each write replaced the register instead: the title sets
-     * MasterInterruptEnable during USB init and then writes
-     * RootHubStatusChange on its own, and the second write threw the master
-     * bit away.
-     *
-     * Its own ISR at 0x001C288F tests bit 31 of HcInterruptEnable separately
-     * from the status AND, so with the master bit lost it declined every
-     * interrupt -- "device ISR vector 1 -> FALSE", for the whole run.
-     *
-     * Accumulating in a shadow gives the set/clear behaviour without a write
-     * trap: whatever the title has written to 0x10 since the last pass is
-     * OR-ed in and persists, and anything written to 0x14 is removed. The
-     * disable register is then cleared so the next write to it is visible;
-     * hardware reads the enable mask back there, and nothing here reads it. */
-    {
-        static uint32_t enable_shadow;
-        volatile uint32_t *ien =
-            (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
-        volatile uint32_t *idis =
-            (volatile uint32_t *)((char *)g_mcpx_regs + 0x500014);
-        uint32_t disable = *idis;
-
-        enable_shadow |= *ien;
-        if (disable) {
-            enable_shadow &= ~disable;
-            *idis = 0;
-        }
-        if (*ien != enable_shadow)
-            *ien = enable_shadow;
-    }
+    /* HcInterruptEnable/HcInterruptDisable are handled at write time by the
+     * MCPX trap (see MCPX_OHCI_INTR_ENABLE). Sampling them here as well would
+     * resurrect bits a disable had just cleared. */
 
     /* RECOMP_OHCI_ATTACH=1: report a device on root-hub port 1.
      *
@@ -514,6 +482,20 @@ static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
 #define MCPX_AC97_BOX    0x10u
 #define MCPX_AC97_CR     0x0Bu
 #define MCPX_AC97_CR_RR  0x02u
+
+/* OHCI HcInterruptEnable / HcInterruptDisable, at the USB0 register block.
+ *
+ * They are a set/clear pair: a 1 written to Enable sets that bit, a 1 written
+ * to Disable clears it, and both read back the same mask. As plain memory each
+ * write replaced the register, and JSRF's XPP driver writes both -- its
+ * controller start sets MasterInterruptEnable and sub_001BD295 then writes
+ * RootHubStatusChange alone, throwing the master bit away. Its ISR tests bit 31
+ * separately and declined every interrupt for the whole run.
+ *
+ * Sampling cannot recover this: the two writes land microseconds apart in init,
+ * so a poll only ever sees the second. It has to be observed at write time. */
+#define MCPX_OHCI_INTR_ENABLE   0x500010u
+#define MCPX_OHCI_INTR_DISABLE  0x500014u
 
 static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[] = {
     { MCPX_AC97_NABM + 0 * MCPX_AC97_BOX + MCPX_AC97_CR, MCPX_AC97_CR_RR },
@@ -764,8 +746,16 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
      * guard, so every trapped write here is a guest acknowledge rather than a
      * runtime assertion. Apply the same `pending &= ~value` operation as the
      * in-tree NV2A model before performing the intercepted store. */
+    uint32_t ohci_disable = 0;
     if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && width == 4) {
         value = *(volatile uint32_t *)fault & ~(uint32_t)value;
+    } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE && width == 4) {
+        /* Write-1-to-set. */
+        value = *(volatile uint32_t *)fault | (uint32_t)value;
+    } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE && width == 4) {
+        /* Write-1-to-clear against Enable; both read back the enable mask. */
+        ohci_disable = (uint32_t)value;
+        value = 0;
     } else {
         value = mcpx_apply_write_clear(guest_va, value, width);
     }
@@ -783,7 +773,12 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     case 4: *(volatile uint32_t *)fault = (uint32_t)value; break;
     default: *(volatile uint64_t *)fault = value;          break;
     }
-    if (guest_va == XBOX_NV2A_PCRTC_INTR_0) {
+    if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) {
+        /* Enable sits four bytes below, on this same now-writable page. */
+        volatile uint32_t *en = (volatile uint32_t *)(fault - 4);
+        *en &= ~ohci_disable;
+        *(volatile uint32_t *)fault = *en;
+    } else if (guest_va == XBOX_NV2A_PCRTC_INTR_0) {
         /* The summary follows its source. Different page, not guarded, so this
          * is an ordinary store. */
         if ((value & 0x1u) == 0) {
@@ -838,6 +833,20 @@ static void xbox_McpxTrapInstall(void)
         }
         if (!seen && g_mcpx_guard_pages < 8) {
             g_mcpx_guard_page[g_mcpx_guard_pages++] = page;
+        }
+    }
+    {
+        static const uint32_t extra[] = {
+            MCPX_OHCI_INTR_ENABLE, MCPX_OHCI_INTR_DISABLE,
+        };
+        for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
+            uintptr_t addr = (uintptr_t)g_mcpx_regs + extra[i];
+            uintptr_t page = addr & ~(uintptr_t)(g_mcpx_page_size - 1);
+            int seen = 0;
+            for (size_t j = 0; j < g_mcpx_guard_pages; j++)
+                if (g_mcpx_guard_page[j] == page) { seen = 1; break; }
+            if (!seen && g_mcpx_guard_pages < 8)
+                g_mcpx_guard_page[g_mcpx_guard_pages++] = page;
         }
     }
     if (g_mcpx_guard_pages == 0 && !g_mcpx_apu_write) {
