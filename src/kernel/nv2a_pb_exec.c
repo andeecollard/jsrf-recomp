@@ -440,12 +440,77 @@ static uint32_t surface_bpp(void)
  * Returns NULL until a clear has established a real surface. The caller runs
  * on the thread owning the GL context and must not touch anything else here.
  */
-const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
-                                 uint32_t *pitch, uint32_t *bpp)
+static uint8_t *s_snap;             /* the last completed frame, packed */
+static uint32_t s_snap_w, s_snap_h, s_snap_bpp;
+static int s_snap_wanted;
+
+/* Take the finished frame at the guest's own frame boundary.
+ *
+ * Presenting the surface live shows it part-drawn as often as finished, which
+ * on screen is a flicker between the picture and the clear colour. The fix is
+ * to copy it once per frame -- but only at a boundary the title actually
+ * marks. NV097_CLEAR_SURFACE is not one: measured in claude-gfx-window-05,
+ * snapshotting there made every sampled frame black, because this title clears
+ * several times per frame and to more than one surface, so the copy kept
+ * catching an offscreen target. NV097_FLIP_STALL is the real boundary -- it is
+ * the title saying this frame is done -- and it fires once per frame on the
+ * surface being displayed.
+ *
+ * Only once someone has asked for a surface, so a run with no window pays
+ * nothing. The copy races the reader and can tear a frame; neither side may
+ * block the other, and a torn frame is a far smaller artefact than the
+ * flicker it replaces. */
+static void snapshot_surface(void)
 {
     uint32_t b = surface_bpp();
     const uint8_t *mem;
+    uint32_t y;
 
+    if (!s_snap_wanted || !s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
+        return;
+    if (b != 2 && b != 4)
+        return;
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+    if (!mem)
+        return;
+
+    if (s_snap_w != s_gpu.clip_w || s_snap_h != s_gpu.clip_h || s_snap_bpp != b) {
+        uint8_t *n = (uint8_t *)realloc(s_snap,
+                                        (size_t)s_gpu.clip_w * s_gpu.clip_h * b);
+        if (!n)
+            return;
+        s_snap = n;
+        s_snap_w = s_gpu.clip_w;
+        s_snap_h = s_gpu.clip_h;
+        s_snap_bpp = b;
+    }
+    for (y = 0; y < s_snap_h; y++)
+        memcpy(s_snap + (size_t)y * s_snap_w * b,
+               mem + s_gpu.color_offset
+                   + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch
+                   + (size_t)s_gpu.clip_x * b,
+               (size_t)s_snap_w * b);
+}
+
+const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
+                                 uint32_t *pitch, uint32_t *bpp)
+{
+    uint32_t b;
+    const uint8_t *mem;
+
+    s_snap_wanted = 1;
+
+    if (s_snap && s_snap_w && s_snap_h) {
+        if (w) *w = s_snap_w;
+        if (h) *h = s_snap_h;
+        if (pitch) *pitch = s_snap_w * s_snap_bpp;   /* the copy is packed */
+        if (bpp) *bpp = s_snap_bpp;
+        return s_snap;
+    }
+
+    /* Before the first flip there is no finished frame, so show the live
+     * surface rather than nothing: the intro logos appear during this window. */
+    b = surface_bpp();
     if (!s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
         return NULL;
     if (b != 2 && b != 4)
@@ -453,7 +518,6 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
     mem = (const uint8_t *)xbox_GetMemoryOffset();
     if (!mem)
         return NULL;
-
     if (w) *w = s_gpu.clip_w;
     if (h) *h = s_gpu.clip_h;
     if (pitch) *pitch = s_gpu.pitch;
@@ -462,16 +526,6 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
                + (size_t)s_gpu.clip_y * s_gpu.pitch
                + (size_t)s_gpu.clip_x * b;
 }
-
-/* This returns the surface being drawn into, live, which means the reader can
- * catch it part-drawn. Snapshotting at NV097_CLEAR_SURFACE to get whole frames
- * instead was tried and is WORSE: measured in claude-gfx-window-05, every
- * sampled frame came back black, because the title clears several times per
- * frame and to more than one surface, so a clear is not a frame boundary here
- * and the snapshot usually caught an offscreen target. Presenting live gave
- * the right pixels on most samples (claude-gfx-window-04). A real fix needs an
- * actual end-of-frame signal -- this executor does not handle the flip methods
- * at all, which is where to start. */
 
 
 /* Write the current surface out as a 24-bit BMP.
@@ -1463,6 +1517,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
+        break;
+
+    /* The title's own frame boundary: this frame is finished. */
+    case NV097_FLIP_STALL:
+        snapshot_surface();
         break;
 
     case NV097_SET_BEGIN_END:
