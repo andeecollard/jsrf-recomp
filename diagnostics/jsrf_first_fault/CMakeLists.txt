@@ -26,6 +26,14 @@ add_executable(jsrf_heap_alloc_test heap_alloc_test.c)
 target_link_libraries(jsrf_heap_alloc_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_heap_alloc COMMAND jsrf_heap_alloc_test)
 
+add_executable(jsrf_ohci_register_test ohci_register_test.c)
+target_link_libraries(jsrf_ohci_register_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_ohci_register COMMAND jsrf_ohci_register_test)
+
+add_executable(jsrf_ohci_transfer_test ohci_transfer_test.c)
+target_link_libraries(jsrf_ohci_transfer_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_ohci_transfer COMMAND jsrf_ohci_transfer_test)
+
 add_executable(jsrf_counted_file_test counted_file_test.c)
 target_link_libraries(jsrf_counted_file_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_counted_file COMMAND jsrf_counted_file_test)

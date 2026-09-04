@@ -16,6 +16,8 @@ a = p.parse_args()
 # its two setters, 0x24480 (current colour) and 0x24540 (target and step).
 # jsrf_resource_probe follows the title's D3D allocation/release vector, the
 # canonical resource Release helper, and the destructor's actual free paths.
+# jsrf_usb_device_probe brackets the root-hub connect path's device-object
+# allocation and observes whether the freshly allocated object is linked.
 # Each site reads registers only; the probe reads guest memory read-only.
 points = {
     'recomp_0000.c': {
@@ -74,6 +76,16 @@ points = {
         # selected message/flags without modifying the path.
         '0006F450': ('jsrf_error_dialog_probe',
                      'MEM32(esp), MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
+    },
+    'recomp_0010.c': {
+        # Root-hub connect path: entry, device-pool allocation result, and the
+        # link helper reached only when that result is non-zero.
+        '001BF72C': ('jsrf_usb_device_probe',
+                     'ecx, 0, MEM32(esp + 4), MEM32(esp + 8)'),
+        '001BF73B': ('jsrf_usb_device_probe',
+                     'edi, eax, MEM32(esp + 0x10), MEM32(esp + 0x14)'),
+        '001C06B3': ('jsrf_usb_device_probe',
+                     'ecx, MEM32(esp + 4), 0, 0'),
     },
 }
 changed = 0

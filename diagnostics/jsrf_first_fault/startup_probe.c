@@ -78,6 +78,34 @@ void jsrf_startup_probe(uint32_t pc,uint32_t object)
 }
 
 /*
+ * Read-only observation of the first USB device-enumeration step. The XPP
+ * root-hub path enters sub_001BF72C for a newly connected port, allocates a
+ * 32-byte device object from the fixed pool at 0x264858, then calls
+ * sub_001C06B3 to link it. This distinguishes "connect was never dispatched"
+ * from "device pool allocation failed" without changing either outcome.
+ */
+void jsrf_usb_device_probe(uint32_t pc, uint32_t controller,
+                           uint32_t device, uint32_t arg1, uint32_t arg2)
+{
+    static int enabled = -1;
+    static unsigned calls[3];
+    unsigned slot = pc == 0x001BF72Cu ? 0u :
+                    pc == 0x001BF73Bu ? 1u : 2u;
+
+    if (enabled < 0) enabled = getenv("RECOMP_USB_DEVICE_TRACE") != NULL;
+    if (!enabled) return;
+    if (++calls[slot] > 64) return;
+
+    fprintf(stderr,
+            "[USB-DEVICE] pc=%08X call=%u controller=%08X device=%08X"
+            " arg1=%08X arg2=%08X pool_state=%02X pool_base=%08X"
+            " list_head=%08X\n",
+            pc, calls[slot], controller, device, arg1, arg2,
+            read_word(0x264858) & 0xFFu, read_word(0x264938),
+            read_word(0x2648D4));
+}
+
+/*
  * Read-only observation of the four-channel colour interpolator that the
  * update list reaches through vtable+4 on object 0x01A41E60.
  *

@@ -1,0 +1,296 @@
+CODEX -> CLAUDE HANDOVER
+Jet Set Radio Future / xboxrecomp
+Date: 2026-09-04 (Europe/London)
+
+PURPOSE
+=======
+
+Continue from the exact USB-input frontier reached in the working tree. The
+title already renders the CRI, SEGA, Smilebit, anti-graffiti, and animated
+"Now Loading" screens, loads Stage 12, and waits for controller input. This
+session proved that the root-hub device path is alive, fixed a real OHCI port
+reset bug, and captured the title's first control request.
+
+No commit was made. The changes listed below are intentional working-tree
+changes on main (HEAD was f37268a at the start of the session).
+
+
+BOTTOM LINE / HOW CLOSE
+=======================
+
+We are now one concrete subsystem away from the Press Start boundary: USB
+enumeration plus controller reports. This is materially closer than the prior
+handover. The game now detects the root-hub connection, allocates and links its
+USB device object, completes port reset, and submits a valid GET_DESCRIPTOR
+control transfer. It then waits because the runtime does not yet execute OHCI
+ED/TD schedules or report transfer completion.
+
+Do not promise "playable" yet. Passing Press Start may expose later menu or
+gameplay faults. For the boot-to-input milestone, however, this is no longer an
+unknown broad boot problem: the immediate blocker is a small, observable USB
+transaction engine (or a carefully targeted high-level XPP bypass).
+
+
+UPSTREAM XBOXRECOMP CLUE
+========================
+
+The requested upstream review found no OHCI device model to copy. Upstream's
+own gap analysis explicitly says:
+
+    USB/OHCI gamepad | N/A | Bypassed via XInput
+
+Sources:
+
+  https://github.com/sp00nznet/xboxrecomp/blob/main/docs/technical/gap-analysis.md
+  https://github.com/sp00nznet/xboxrecomp/blob/main/src/input/xinput_device.c
+
+The second file is a host XInput/SDL state backend, not a USB host-controller
+or Xbox controller device implementation. That architecture works when a
+recompiled title calls the host input shim. JSRF's statically linked XPP drives
+the OHCI registers directly, and no caller currently reaches the existing host
+backend. Therefore upstream confirms two viable strategies but supplies no
+drop-in solution:
+
+  1. Identify and override JSRF's high-level XPP input entry points so they call
+     the existing xbox input backend; or
+  2. Keep the now-working low-level path and implement the minimum OHCI
+     control/interrupt-transfer service the title actually asks for.
+
+Given the evidence below, strategy 2 is currently the shortest evidence-led
+continuation: the first schedule is already available and fully decoded.
+
+
+NEW PROOF: THE SUSPECTED DEVICE ALLOCATION WORKS
+================================================
+
+Read-only probes were added at:
+
+  0x001BF72C  root-hub connect/device creation entry
+  0x001BF73B  immediately after the device-pool allocation
+  0x001C06B3  device-object link helper
+
+Run evidence:
+
+  build-macos/jsrf-first-fault/render-investigation/
+    codex-usb-device-01/stderr.log
+
+Relevant output:
+
+  [USB-DEVICE] pc=001BF72C ... controller=009E4000 ...
+  [USB-DEVICE] pc=001BF73B ... device=009E4020 ...
+  [USB-DEVICE] pc=001C06B3 ... device=009E4020 ...
+
+Conclusion: sub_001BF72C executes, the pool allocation succeeds at 0x009E4020,
+and sub_001C06B3 links the object. The old narrow hypothesis that allocation or
+linking failed is disproved.
+
+
+REAL BUG FIXED: ROOT-PORT RESET COMPLETION ORDER
+===============================================
+
+The title's observed reset write is 0x009E0010. The runtime formerly:
+
+  a. generated PortResetStatusChange (PRSC), then
+  b. applied the guest write-one-to-clear high bits.
+
+Because 0x009E0010 contains high W1C bits, step b erased the PRSC generated in
+step a. Real hardware first acknowledges changes that were already pending,
+then asynchronously reports reset completion. The instant model must preserve
+that ordering even though both happen in one host call.
+
+The fix in src/kernel/xbox_memory_layout.c now:
+
+  a. clears old change bits requested by the write,
+  b. applies port commands, and
+  c. generates the new reset-completion change afterward.
+
+The helper is exported as xbox_OhciPortWrite so a focused regression test can
+cover the observed 0x009E0010 case.
+
+After the fix, this run advanced to a real schedule:
+
+  build-macos/jsrf-first-fault/render-investigation/
+    codex-usb-reset-order-02/stderr.log
+
+Milestone lines:
+
+  HcRhPortStatus0 <= 0x009E0010
+  HcRhPortStatus0 <= 0x00100000        (XPP acknowledges PRSC)
+  HcControlHeadED <= 0x009E29A0
+  HcCommandStatus <= 0x00000002        (ControlListFilled)
+
+
+FIRST CONTROL TRANSFER: FULLY CAPTURED
+======================================
+
+An opt-in RECOMP_OHCI_TRANSFER_TRACE instrument now dumps the control ED/TD
+chain both when XPP publishes HcControlHeadED and when it asserts
+ControlListFilled. The second moment is essential: at publication the ED is
+still skipped and empty; at the doorbell it is populated.
+
+Canonical evidence:
+
+  build-macos/jsrf-first-fault/render-investigation/
+    codex-usb-transfer-dump-04/stderr.log
+
+Relevant lines 1649-1655:
+
+  HcControlHeadED <= 0x009E29A0
+  [OHCI-ED] #1 va=009E29A0 flags=00084000 tail=00000000
+             head=00000000 next=00000000
+  HcCommandStatus <= 0x00000002
+  [OHCI-ED] #2 va=009E29A0 flags=00080000 tail=009E3F50
+             head=009E3FD0 next=00000000
+  [OHCI-TD] i=0 va=009E3FD0 flags=E2E00000 cbp=009E3FB0
+             next=009E3F90 be=009E3FB7
+             data=80 06 00 01 00 00 08 00
+  [OHCI-TD] i=1 va=009E3F90 flags=E3F00000 cbp=002648DC
+             next=009E3F70 be=002648E3
+  [OHCI-TD] i=2 va=009E3F70 flags=E3080000 cbp=00000000
+             next=009E3F50 be=00000000
+
+Decoded USB setup packet:
+
+  bmRequestType = 0x80   device-to-host, standard, device
+  bRequest      = 0x06   GET_DESCRIPTOR
+  wValue        = 0x0100 DEVICE descriptor
+  wIndex        = 0
+  wLength       = 8      first eight bytes only (normal address-0 probe)
+
+The ED is address 0, endpoint 0, max packet size 8. Its chain is the expected
+SETUP / IN-data / OUT-status sequence, followed by the dummy tail TD.
+
+
+EXACT NEXT IMPLEMENTATION STEP
+==============================
+
+Implement the smallest synchronous OHCI control-list service, driven when the
+guest writes ControlListFilled (HcCommandStatus bit 1). Start with only the
+captured address-0 GET_DESCRIPTOR(Device, length 8) request:
+
+  1. Read HcControlHeadED and safely validate the ED and TD addresses against
+     guest RAM.
+  2. Parse the setup TD instead of keying solely on fixed addresses.
+  3. For 80 06 00 01 00 00 08 00, copy the first eight bytes of an Xbox
+     controller-compatible USB device descriptor into the IN TD's CBP buffer.
+  4. Complete the TDs with OHCI condition code NoError and advance the ED head
+     to its tail while preserving the ED carry/halt bits correctly.
+  5. Link completed TDs through HcDoneHead / HCCA DoneHead as XPP expects.
+  6. Raise WritebackDoneHead (WDH, interrupt-status bit 1) through the existing
+     OHCI interrupt plumbing, respecting InterruptEnable and MIE.
+  7. Observe the next control request and extend the model one request at a
+     time (likely SET_ADDRESS, additional device/config/string descriptors,
+     SET_CONFIGURATION, then the controller interrupt-IN endpoint).
+
+Do not invent the entire Xbox USB stack up front. The trace facility exists so
+each next request and completion contract can be learned from the title. Add
+focused tests for descriptor walking, bounds checks, TD condition codes, done
+queue order, and interrupt gating before connecting it to the fault handler.
+
+Signal-handler caution: the MCPX guest-write trap currently runs as a SIGSEGV
+handler on macOS. The read-only tracer already uses stdio because it is
+diagnostic-only, but production schedule servicing should avoid allocation and
+other non-async-signal-safe operations. Prefer a small allocation-free parser
+and deferred interrupt delivery if the existing kernel plumbing permits it.
+
+
+FILES CHANGED (UNCOMMITTED)
+===========================
+
+  diagnostics/jsrf_first_fault/CMakeLists.txt
+    Adds jsrf_ohci_register_test.
+
+  diagnostics/jsrf_first_fault/guest_trace.h
+    Declares jsrf_usb_device_probe.
+
+  diagnostics/jsrf_first_fault/instrument_startup.py
+    Adds the three USB device allocation/link observation sites.
+
+  diagnostics/jsrf_first_fault/startup_probe.c
+    Implements the RECOMP_USB_DEVICE_TRACE probe.
+
+  diagnostics/jsrf_first_fault/ohci_register_test.c   (new, untracked)
+    Covers connect-change acknowledgement, observed reset write ordering,
+    PRSC acknowledgement, and reset on an empty port.
+
+  src/kernel/xbox_memory_layout.c
+    Fixes reset/W1C ordering and adds RECOMP_OHCI_TRANSFER_TRACE ED/TD dumps.
+
+  src/kernel/xbox_memory_layout.h
+    Exposes xbox_OhciPortWrite for focused testing.
+
+The generated recomp tree was re-instrumented with:
+
+  python3 diagnostics/jsrf_first_fault/instrument_startup.py
+
+It reported 30 observation sites in 5 generated files. The generated tree is
+ignored; the tracked instrument script is the durable change.
+
+
+VALIDATION
+==========
+
+Build:
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+
+Result: success. There are seven pre-existing DWORD/%lu format warnings in
+xbox_memory_layout.c and linker alignment warnings; no new build failure.
+
+Tests:
+
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+
+Result: 13/13 passed, including the new jsrf_ohci_register test.
+
+Repository hygiene:
+
+  git diff --check
+
+Result: clean.
+
+Canonical transfer capture command (from repository root):
+
+  env \
+    RECOMP_HDD_ROOT="/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/build-macos/jsrf-first-fault/render-investigation/codex-usb-transfer-dump-04-hdd" \
+    RECOMP_OHCI_ATTACH=1 \
+    RECOMP_OHCI_TRACE=1 \
+    RECOMP_USB_DEVICE_TRACE=1 \
+    RECOMP_OHCI_TRANSFER_TRACE=1 \
+    python3 diagnostics/jsrf_first_fault/run_bounded.py \
+      codex-usb-transfer-dump-04 --seconds 25
+
+
+CURRENT GIT STATUS AT HANDOVER
+==============================
+
+  M diagnostics/jsrf_first_fault/CMakeLists.txt
+  M diagnostics/jsrf_first_fault/guest_trace.h
+  M diagnostics/jsrf_first_fault/instrument_startup.py
+  M diagnostics/jsrf_first_fault/startup_probe.c
+  M src/kernel/xbox_memory_layout.c
+  M src/kernel/xbox_memory_layout.h
+  ?? diagnostics/jsrf_first_fault/ohci_register_test.c
+  ?? CODEX_TO_CLAUDE_HANDOVER_2026-09-04.txt
+
+Preserve these changes. Do not reset or overwrite unrelated work. Re-run git
+status before editing because the user may continue work from another agent.
+
+
+SUCCESS CRITERIA FOR THE NEXT SESSION
+=====================================
+
+Minimum meaningful success:
+
+  - The first GET_DESCRIPTOR request completes through the title's normal XPP
+    path, XPP consumes the completion, and a subsequent USB request appears.
+
+Stronger success:
+
+  - Enumeration reaches a configured controller and the game observes at least
+    one interrupt-IN report from the existing host/fake-pad backend.
+
+User-visible milestone:
+
+  - A controller button advances the current Stage 12 / Press Start wait.
+

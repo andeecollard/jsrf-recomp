@@ -122,6 +122,11 @@ void xbox_SetTotalRam(size_t bytes);
  */
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
 
+/* Apply the command/W1C semantics of an OHCI root-hub port-status write.
+ * Exposed so the register model's ordering can be regression-tested without
+ * requiring a trapped guest store. */
+uint32_t xbox_OhciPortWrite(uint32_t current, uint32_t value);
+
 /**
  * Release the reserved Xbox memory layout.
  */

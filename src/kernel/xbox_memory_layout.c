@@ -26,6 +26,7 @@
 #endif
 
 #include "xbox_memory_layout.h"
+#include "xbox_usb_ohci.h"
 #include "kernel.h"
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -362,6 +363,9 @@ static unsigned xbox_OhciPorts(void)
  * NV2A table on every tick, which is where the existing note said this
  * belonged. */
 static void mcpx_hw_store(uint32_t offset, uint32_t value);
+/* Several of those inside ONE guard window; see the definition. */
+static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
+                            unsigned n);
 
 static void xbox_McpxHoldRegisters(void)
 {
@@ -413,14 +417,18 @@ static void xbox_McpxHoldRegisters(void)
                     (volatile uint32_t *)((char *)g_mcpx_regs + 0x50000C);
                 volatile uint32_t *ien =
                     (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
+                uint32_t off[3], val[3];
+                unsigned n = 0;
                 attached = 1;
-                mcpx_hw_store(0x500054u, 0x00010001u);
-                (void)ps;            /* announced as hardware, not as the guest */
+                /* Connect and its interrupt in ONE window. Two windows let the
+                 * driver's acknowledge land untrapped between them; see
+                 * mcpx_hw_store_n. */
+                off[n] = 0x500054u; val[n++] = 0x00010001u;
                 /* A connect that raises no interrupt is invisible: XPP has
                  * RootHubStatusChange enabled in HcInterruptEnable and is
                  * waiting on it, so the status bit is what actually announces
                  * the plug. */
-                mcpx_hw_store(0x50000Cu, *ist | 0x00000040u);   /* RHSC */
+                off[n] = 0x50000Cu; val[n++] = *ist | 0x00000040u;   /* RHSC */
                 /* RECOMP_OHCI_MIE=1 also sets MasterInterruptEnable.
                  *
                  * Strictly a probe, and a dishonest one: bit 31 of
@@ -439,8 +447,11 @@ static void xbox_McpxHoldRegisters(void)
                  * nothing follows, the title is waiting on something else and
                  * faking its register told us so cheaply. Either answer is
                  * worth one line; neither is a fix. */
-                if (getenv("RECOMP_OHCI_MIE"))
-                    mcpx_hw_store(0x500010u, *ien | 0x80000000u);
+                if (getenv("RECOMP_OHCI_MIE")) {
+                    off[n] = 0x500010u; val[n++] = *ien | 0x80000000u;
+                }
+                mcpx_hw_store_n(off, val, n);
+                (void)ps;            /* announced as hardware, not as the guest */
                 fprintf(stderr, "  [OHCI] attach probe: port1=0x%08X "
                         "intr_status=0x%08X intr_enable=0x%08X%s\n",
                         *ps, *ist, *ien,
@@ -516,10 +527,17 @@ static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
  * clears PortResetStatus, sets PortEnableStatus and raises PortResetStatusChange;
  * there is nothing to wait for, so do all three at once and raise the root-hub
  * status change with them. */
-static uint32_t ohci_port_write(uint32_t current, uint32_t v)
+uint32_t xbox_OhciPortWrite(uint32_t current, uint32_t v)
 {
     uint32_t n = current;
 
+    /* A guest write first acknowledges change bits that were already
+     * pending. Reset completion is a later hardware event; although this
+     * model completes it in the same host call, its new PRSC must therefore
+     * be applied after the write-1-to-clear half. XPP leaves unrelated upper
+     * bits in its reset write (observed as 0x009E0010), so doing this in the
+     * opposite order clears the completion we just generated. */
+    n &= ~(v & 0x001F0000u);                 /* old change bits: W1C */
     if (v & 0x0001u) n &= ~0x0002u;          /* ClearPortEnable */
     if (v & 0x0002u) n |=  0x0002u;          /* SetPortEnable */
     if (v & 0x0004u) n |=  0x0004u;          /* SetPortSuspend */
@@ -533,8 +551,239 @@ static uint32_t ohci_port_write(uint32_t current, uint32_t v)
             n |=  0x00100000u;               /* PortResetStatusChange */
         }
     }
-    n &= ~(v & 0x001F0000u);                 /* change bits: write-1-to-clear */
     return n;
+}
+
+/* Dump the control schedule as XPP publishes and then activates its head. This
+ * is an opt-in, read-only instrument for building the transfer service from
+ * the title's actual ED/TD layout rather than assumptions. */
+static void ohci_trace_control_ed(uint32_t ed_va)
+{
+    static unsigned dumps;
+    uint32_t *ed;
+    uint32_t td_va, tail_va;
+
+    if (!getenv("RECOMP_OHCI_TRANSFER_TRACE") || ++dumps > 32)
+        return;
+    ed_va &= ~0xFu;
+    if (ed_va > g_memory_size - 16u)
+        return;
+    ed = (uint32_t *)((uintptr_t)g_memory_base + ed_va);
+    td_va = ed[2] & ~0xFu;
+    tail_va = ed[1] & ~0xFu;
+    fprintf(stderr,
+            "  [OHCI-ED] #%u va=%08X flags=%08X tail=%08X head=%08X next=%08X\n",
+            dumps, ed_va, ed[0], ed[1], ed[2], ed[3]);
+    for (unsigned i = 0; td_va && td_va != tail_va && i < 16; ++i) {
+        uint32_t *td;
+        uint32_t cbp, next, be;
+        if (td_va > g_memory_size - 16u)
+            break;
+        td = (uint32_t *)((uintptr_t)g_memory_base + td_va);
+        cbp = td[1];
+        next = td[2] & ~0xFu;
+        be = td[3];
+        fprintf(stderr,
+                "  [OHCI-TD] ed=%08X i=%u va=%08X flags=%08X cbp=%08X"
+                " next=%08X be=%08X data=",
+                ed_va, i, td_va, td[0], cbp, td[2], be);
+        if (cbp && cbp < g_memory_size) {
+            size_t bytes = 16;
+            if (be >= cbp && (size_t)(be - cbp) + 1u < bytes)
+                bytes = (size_t)(be - cbp) + 1u;
+            if (bytes > g_memory_size - cbp)
+                bytes = g_memory_size - cbp;
+            const uint8_t *p = (const uint8_t *)g_memory_base + cbp;
+            for (size_t j = 0; j < bytes; ++j)
+                fprintf(stderr, "%s%02X", j ? " " : "", p[j]);
+        }
+        fputc('\n', stderr);
+        if (next == td_va)
+            break;
+        td_va = next;
+    }
+    fflush(stderr);
+}
+
+/* OHCI operational registers, as offsets inside the MCPX aperture. The whole
+ * block from HcRevision to HcRhPortStatus1 sits inside the single guarded page
+ * that starts at 0x500000, so the trap handler can reach any of them while it
+ * has that page unprotected for the intercepted store. */
+#define MCPX_OHCI_INTR_STATUS   0x50000Cu
+#define MCPX_OHCI_HCCA          0x500018u
+#define MCPX_OHCI_CONTROL_HEAD  0x500020u
+#define MCPX_OHCI_BULK_HEAD     0x500028u
+#define MCPX_OHCI_DONE_HEAD     0x500030u
+#define MCPX_OHCI_FM_NUMBER     0x50003Cu
+
+/* Run one list against the device model.
+ *
+ * Called from the write trap the moment the title rings ControlListFilled, so
+ * a transfer completes in the same instruction that submitted it. Hardware
+ * would take a frame; the driver cannot tell the difference, because it learns
+ * of completion through the done queue either way.
+ *
+ * The register writebacks are deliberately left in `svc` for the caller to
+ * apply after it has unprotected the page. Guest RAM, where the descriptors
+ * live, is not guarded, so the walk itself is an ordinary set of loads and
+ * stores. */
+static uint32_t g_ohci_frame;
+
+static unsigned ohci_service(uint32_t head_ed, xbox_ohci_service *svc)
+{
+    /* head_ed 0 is legitimate: it means "publish whatever is already sitting
+     * in HcDoneHead", which is how a writeback deferred behind an
+     * unacknowledged interrupt eventually reaches the driver. */
+    if (!g_memory_base || !g_mcpx_regs)
+        return 0;
+
+    memset(svc, 0, sizeof(*svc));
+    svc->ram = (uint8_t *)g_memory_base;
+    svc->ram_size = (uint32_t)g_memory_size;
+    svc->head_ed = head_ed;
+    svc->hcca = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_HCCA);
+    svc->done_head =
+        *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_DONE_HEAD);
+    svc->intr_status =
+        *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS);
+    svc->intr_enable =
+        *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
+    svc->frame_number = g_ohci_frame;
+    xbox_OhciServiceList(svc);
+    /* "Is there a register writeback owed", which is not the same as "did a TD
+     * retire". A pass that publishes a queue held over from an earlier one
+     * retires nothing and still owes HcDoneHead and the interrupt; a pass that
+     * retires TDs but defers behind an unacknowledged interrupt owes
+     * HcDoneHead alone. Returning the TD count alone left HcDoneHead standing
+     * and the tick republished the same queue for ever. */
+    return svc->published || svc->tds_retired;
+}
+
+/* Run one frame of the periodic list.
+ *
+ * The control list has a doorbell and the periodic list does not: an interrupt
+ * endpoint is polled by the controller for the life of the connection, so the
+ * pad report only ever arrives if something ticks. This is that tick, driven
+ * off the NV2A ack thread because it is the one timer this file already owns.
+ *
+ * Hardware visits one of the HCCA's 32 interrupt-table entries per frame and
+ * that is copied here rather than servicing all 32 at once: a driver that
+ * spreads endpoints across the table gets each of them polled at the interval
+ * it asked for, and the walk stays bounded whatever the table contains.
+ */
+static void ohci_periodic_tick(void)
+{
+    static DWORD last_ms;
+    volatile uint32_t *ctl, *ist, *ien;
+    xbox_ohci_service svc;
+    uint32_t hcca, entry, head;
+    DWORD now;
+
+    /* mcpx_hw_store falls back to a plain store where no trap is installed, so
+     * this needs no host check of its own. */
+    if (!g_mcpx_regs || !g_memory_base)
+        return;
+
+    /* A USB frame is 1 ms. The ack thread runs far hotter than that, and an
+     * interrupt endpoint polled at host speed would bury the driver. */
+    now = GetTickCount();
+    if (now == last_ms)
+        return;
+    last_ms = now;
+    g_ohci_frame++;
+
+    ctl = (volatile uint32_t *)((char *)g_mcpx_regs + 0x500004u);
+    ist = (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS);
+    ien = (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
+
+    /* UsbOperational. Below this the controller is not running frames at all. */
+    if ((*ctl & 0xC0u) != 0x80u)
+        return;
+
+    hcca = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_HCCA);
+
+    /* The frame counter lives in the HCCA, which is ordinary guest RAM: free
+     * to advance every frame. */
+    if (hcca && (hcca & ~0xFFu) <= g_memory_size - XBOX_OHCI_HCCA_SIZE) {
+        *(uint32_t *)((char *)g_memory_base + (hcca & ~0xFFu)
+                      + XBOX_OHCI_HCCA_FRAME_NUMBER) = g_ohci_frame & 0xFFFFu;
+    }
+
+    /* StartOfFrame, but only while the driver is actually counting frames.
+     *
+     * XPP's enumeration turns SOF on and counts frames to time the 2 ms a
+     * device may take after SET_ADDRESS before it has to answer at its new
+     * address. Measured in claude-usb-transfer-service-02: the title completes
+     * SET_ADDRESS(1), writes HcInterruptEnable <= 0x4, and then waits, because
+     * nothing here had ever advanced a frame.
+     *
+     * Hardware raises the status bit every frame whether or not the driver has
+     * enabled it, and this deliberately does not: these registers are on a
+     * guarded page, and mcpx_hw_store has to leave that page unprotected
+     * across two mprotect calls to reach them. At frame rate that window is
+     * open often enough to swallow a guest doorbell write untrapped, which
+     * costs an entire transfer. Gating on the enable keeps the window shut
+     * except during the few milliseconds the answer is wanted. The driver
+     * acknowledges any stale SOF before it enables the bit -- the log shows it
+     * doing exactly that -- so nothing is lost by starting the count late. */
+    if (*ien & XBOX_OHCI_INTR_SF) {
+        uint32_t off[2], val[2];
+        off[0] = MCPX_OHCI_FM_NUMBER; val[0] = g_ohci_frame & 0xFFFFu;
+        off[1] = MCPX_OHCI_INTR_STATUS; val[1] = *ist | XBOX_OHCI_INTR_SF;
+        mcpx_hw_store_n(off, val, 2);
+    }
+
+    /* PeriodicListEnable gates only the list walk below it. */
+    if (!(*ctl & 0x04u))
+        return;
+    /* One done queue at a time. Hardware will not overwrite the HCCA's done
+     * head while the driver still owes it a WritebackDoneHead acknowledge, and
+     * re-raising underneath an unacknowledged interrupt is the same mistake
+     * the vblank path documents next door. */
+    if (*ist & XBOX_OHCI_INTR_WDH)
+        return;
+
+    /* This frame's interrupt-table entry, if the HCCA has one. A zero head is
+     * not a reason to stop: the pass still flushes a deferred done queue. */
+    head = 0;
+    if (hcca) {
+        entry = (hcca & ~0xFFu) + (g_ohci_frame & 31u) * 4u;
+        if (entry <= g_memory_size - 4u)
+            head = *(uint32_t *)((char *)g_memory_base + entry);
+    }
+
+    if (ohci_service(head, &svc)) {
+        /* Through the hardware store: these registers are on a guarded page
+         * and this is the runtime asserting a value, not the guest writing
+         * one. Status last, for the same reason as in the trap. */
+        uint32_t off[3], val[3];
+        off[0] = MCPX_OHCI_DONE_HEAD;   val[0] = svc.done_head;
+        off[1] = MCPX_OHCI_FM_NUMBER;   val[1] = svc.frame_number;
+        /* Status last: it is the bit the ISR gates on, so everything it goes
+         * on to read must already be in place -- and inside the same window,
+         * so the driver cannot see the interrupt before the queue. */
+        off[2] = MCPX_OHCI_INTR_STATUS;
+        val[2] = *ist | (svc.intr_status & XBOX_OHCI_INTR_WDH);
+        mcpx_hw_store_n(off, val, 3);
+    }
+}
+
+/* Apply what the service produced. The caller holds the page unprotected.
+ *
+ * The status register is OR-ed rather than assigned. The service was handed a
+ * copy of it and only ever adds to that copy, while the guest's ISR clears
+ * bits from another thread; storing the copy back whole would resurrect an
+ * acknowledge that landed in between. */
+static void ohci_service_commit(const xbox_ohci_service *svc)
+{
+    *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_DONE_HEAD) =
+        svc->done_head;
+    *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_FM_NUMBER) =
+        svc->frame_number;
+    /* Last, because it is the bit the ISR gates on: everything it will go on
+     * to read must already be in place. */
+    *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS) |=
+        (svc->intr_status & XBOX_OHCI_INTR_WDH);
 }
 
 static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[] = {
@@ -736,6 +985,45 @@ static void mcpx_hw_store(uint32_t offset, uint32_t value)
     mcpx_unlock();
 }
 
+/* The same, for a set of registers that belong to one hardware event.
+ *
+ * Every unprotect is a window in which a guest store to this page lands as
+ * plain memory, with none of the register semantics the trap exists to supply.
+ * The lock does not help: it serialises this file's own threads, and the guest
+ * is neither of them.
+ *
+ * That is not theoretical. Measured in claude-usb-transfer-service-05: the
+ * attach probe announced the connect and its interrupt in two separate
+ * windows, XPP's ISR acknowledged ConnectStatusChange in the gap between them,
+ * and its 0x00010000 stored whole -- wiping CurrentConnectStatus, the precise
+ * failure the port-status model exists to prevent. The driver spent the rest
+ * of the run resetting an empty port. Windows cannot be eliminated while the
+ * mechanism is mprotect, so the rule is to open as few as possible: one per
+ * event, not one per register. All offsets must share a page. */
+static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
+                            unsigned n)
+{
+    uintptr_t page;
+    DWORD old_prot;
+    unsigned i;
+
+    if (!g_mcpx_regs || n == 0) return;
+    if (!g_mcpx_trap_active) {
+        for (i = 0; i < n; i++)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        return;
+    }
+
+    page = ((uintptr_t)g_mcpx_regs + offset[0]) & ~(uintptr_t)(g_mcpx_page_size - 1);
+    mcpx_lock();
+    if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
+        for (i = 0; i < n; i++)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
+    }
+    mcpx_unlock();
+}
+
 /* Value the store would have written, after removing bits the hardware clears
  * before software can observe them. Applied per byte so a wide store covering
  * a control byte is handled the same as a byte store to it. */
@@ -816,6 +1104,8 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
      * in-tree NV2A model before performing the intercepted store. */
     uint32_t ohci_disable = 0;
     int ohci_raise_rhsc = 0;
+    xbox_ohci_service ohci_svc;
+    int ohci_serviced = 0;
     /* Every guest write to the OHCI operational registers, now that the page is
      * guarded for the interrupt pair. RECOMP_OHCI_TRACE only.
      *
@@ -845,7 +1135,50 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
             fflush(stderr);
         }
     }
+    if (guest_va == XBOX_MCPX_BASE + 0x500020u && width == 4 && value)
+        ohci_trace_control_ed((uint32_t)value);
+    if (guest_va == XBOX_MCPX_BASE + 0x500008u && width == 4
+            && (value & 0x00000006u)) {
+        /* ControlListFilled (bit 1) and BulkListFilled (bit 2) are the
+         * doorbells: the title has finished building a list and wants the
+         * controller to run it. By the time XPP asserts ControlListFilled it
+         * has removed Skip and installed the TDs, whereas the earlier
+         * head-register write can expose only its staging state -- which is
+         * why servicing hangs off this write and not off that one.
+         *
+         * HcControlHeadED is six dwords after HcCommandStatus. */
+        if (value & 0x00000002u) {
+            uint32_t head = *(volatile uint32_t *)((uint8_t *)fault + 0x18u);
+            if (head) {
+                ohci_trace_control_ed(head);
+                ohci_serviced = ohci_service(head, &ohci_svc) != 0;
+            }
+        }
+        if (!ohci_serviced && (value & 0x00000004u)) {
+            uint32_t head = *(volatile uint32_t *)((uint8_t *)fault + 0x20u);
+            if (head)
+                ohci_serviced = ohci_service(head, &ohci_svc) != 0;
+        }
+        /* Both bits are cleared by the controller once it finds the list
+         * empty, and this service drains a list in a single pass. Leaving them
+         * set would tell the driver its previous submission is still queued. */
+        value &= ~0x00000006u;
+    }
     if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && width == 4) {
+        value = *(volatile uint32_t *)fault & ~(uint32_t)value;
+    } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_STATUS && width == 4) {
+        /* HcInterruptStatus is WRITE-1-TO-CLEAR, and as plain memory it was
+         * the opposite: the driver's acknowledge stored the bit it meant to
+         * retire, so the condition stood for ever.
+         *
+         * Measured, in claude-usb-transfer-service-01: XPP's ISR ran the
+         * mask/handle/acknowledge/unmask cycle roughly eighty times against a
+         * RootHubStatusChange it could not put down, before the connect
+         * finally got through to the port reset. WritebackDoneHead has the
+         * same shape and matters more -- a done queue that can never be
+         * acknowledged is one transfer, then silence -- because the periodic
+         * tick refuses to publish a second queue over an unacknowledged
+         * first, exactly as hardware does. */
         value = *(volatile uint32_t *)fault & ~(uint32_t)value;
     } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE && width == 4) {
         /* Write-1-to-set. */
@@ -853,10 +1186,16 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     } else if ((guest_va == XBOX_MCPX_BASE + MCPX_OHCI_PORT0
                 || guest_va == XBOX_MCPX_BASE + MCPX_OHCI_PORT1) && width == 4) {
         uint32_t before = *(volatile uint32_t *)fault;
-        value = ohci_port_write(before, (uint32_t)value);
+        value = xbox_OhciPortWrite(before, (uint32_t)value);
         /* A change bit going up is a root-hub status change. */
         if ((value & 0x001F0000u) & ~(before & 0x001F0000u))
             ohci_raise_rhsc = 1;
+        /* A port reset returns the device on it to the default address. The
+         * title resets before it enumerates, so without this a second pass
+         * would probe address 0 and find a device that only answers at the
+         * address the first pass gave it. */
+        if ((uint32_t)value & 0x00100000u)
+            xbox_UsbDeviceReset();
     } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE && width == 4) {
         /* Write-1-to-clear against Enable; both read back the enable mask. */
         ohci_disable = (uint32_t)value;
@@ -882,6 +1221,12 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
         volatile uint32_t *ist = (volatile uint32_t *)
             (uintptr_t)(XBOX_MCPX_BASE + 0x50000Cu + g_memory_offset);
         *ist |= 0x00000040u;
+    }
+    if (ohci_serviced) {
+        /* The done queue and its interrupt, now that the page is writable.
+         * The guest ISR is delivered from bridge_device_irq_poll on its own
+         * thread and will find WritebackDoneHead the next time it runs. */
+        ohci_service_commit(&ohci_svc);
     }
     if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) {
         /* Enable sits four bytes below, on this same now-writable page. */
@@ -1327,6 +1672,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
         xbox_McpxHoldRegisters();
+        ohci_periodic_tick();
         fence_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
@@ -2376,6 +2722,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
             xbox_McpxApplyReady();
+            /* Resolve the USB service's diagnostics here rather than on first
+             * use: first use is inside the write trap's signal handler, where
+             * getenv is not async-signal-safe. */
+            xbox_UsbOhciInit();
+            xbox_UsbDeviceReset();
             xbox_McpxTrapInstall();
 #if defined(_WIN32)
             /* AC'97 codec ready.

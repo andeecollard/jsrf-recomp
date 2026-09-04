@@ -12,6 +12,8 @@ void jsrf_texture_cache_probe(uint32_t pc, uint32_t index,
                               uint32_t resource, uint32_t old_resource);
 void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,
                              uint32_t arg1, uint32_t arg2, uint32_t arg3);
+void jsrf_usb_device_probe(uint32_t pc, uint32_t controller,
+                           uint32_t device, uint32_t arg1, uint32_t arg2);
 void jsrf_trace_block(uint32_t guest_block);
 void recomp_trace_enter(const char *name, uint32_t guest_function);
 

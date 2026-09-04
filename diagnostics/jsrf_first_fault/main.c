@@ -21,6 +21,8 @@ extern void nv2a_pb_exec_report(void);
 extern void xbox_HeapReport(const char *why);
 #include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
+#include "xinput_xbox.h"
+#include "xbox_usb_ohci.h"
 
 /* Defined in src/apu/apu_mmio_hook.c, outside its Win32 guard. The MMIO hook
  * itself is Windows-only; the state pointer is not. */
@@ -521,6 +523,46 @@ static void apu_mmio_write_shim(uint32_t offset, uint32_t value, unsigned width)
     }
 }
 
+/* Host pad state, packed as the Xbox controller's own USB interrupt-IN report.
+ *
+ * The emulated device on root-hub port 1 asks for this whenever the title
+ * polls its interrupt endpoint. Going through the USB device rather than
+ * calling the input backend from an XPP override is what lets JSRF's own
+ * driver stay in the loop: it enumerated the pad, so it is entitled to read it
+ * the way it knows how.
+ *
+ * The layouts line up field for field. XBOX_GAMEPAD::wButtons already uses the
+ * report's digital bit assignments, and bAnalogButtons is in report order
+ * (A, B, X, Y, Black, White, LeftTrigger, RightTrigger), so the only work here
+ * is the two-byte header and little-endian thumbsticks. */
+static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
+{
+    XBOX_INPUT_STATE state;
+    static const struct { int lo; int off; } axis[4] = {
+        { 12, 0 }, { 14, 1 }, { 16, 2 }, { 18, 3 }
+    };
+    const SHORT *thumb;
+    int i;
+
+    if (xbox_InputGetState(0, &state) != ERROR_SUCCESS)
+        return 0;                 /* no controller: the endpoint NAKs */
+
+    memset(report, 0, XBOX_USB_PAD_REPORT);
+    report[0] = 0x00;
+    report[1] = XBOX_USB_PAD_REPORT;
+    report[2] = (uint8_t)(state.Gamepad.wButtons & 0xFFu);
+    for (i = 0; i < 8; i++)
+        report[4 + i] = state.Gamepad.bAnalogButtons[i];
+
+    thumb = &state.Gamepad.sThumbLX;
+    for (i = 0; i < 4; i++) {
+        uint16_t v = (uint16_t)thumb[axis[i].off];
+        report[axis[i].lo]     = (uint8_t)(v & 0xFFu);
+        report[axis[i].lo + 1] = (uint8_t)(v >> 8);
+    }
+    return 1;
+}
+
 #define JSRF_ENTRY_POINT 0x00148023u
 #define JSRF_THREAD_START 0x00147EBBu
 #define JSRF_CALLBACK 0x00147FB4u
@@ -843,6 +885,11 @@ int main(int argc, char **argv)
      * it would otherwise execute the same methods concurrently a second time. */
     nv2a_pb_scan_set_external_executor(1);
     xbox_SetApuMmioWriteHook(apu_mmio_write_shim);
+    /* The emulated gamepad's interrupt endpoint reads from here. Installed
+     * before the memory layout brings up the MCPX aperture, so the very first
+     * poll after enumeration already sees real pad state. */
+    xbox_InputInit();
+    xbox_SetUsbPadStateHook(usb_pad_state_shim);
     /* Diagnostic only: RECOMP_TOTAL_RAM_MB maps more than a retail console has.
      *
      * It exists to answer one question that the failure itself cannot -- whether

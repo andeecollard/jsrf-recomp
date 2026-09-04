@@ -1,0 +1,227 @@
+CLAUDE HANDOVER -- USB ENUMERATION COMPLETE
+Jet Set Radio Future / xboxrecomp
+Date: 2026-09-04 (Europe/London)
+Continues: CODEX_TO_CLAUDE_HANDOVER_2026-09-04.txt
+
+
+BOTTOM LINE
+===========
+
+The controller enumerates. JSRF's XPP driver now completes the whole USB
+conversation against an emulated Xbox gamepad -- device descriptor, address
+assignment, configuration descriptor, SET_CONFIGURATION, XID descriptor,
+capabilities -- and then settles into steadily polling the pad, both by
+GET_REPORT on the control pipe and on the interrupt-IN endpoint.
+
+Measured over 40 s (claude-usb-transfer-service-14 and -15, identical):
+
+  one port reset, no re-enumeration
+  zero unhandled control requests
+  zero guest faults
+  ~5000 schedule services, ~125/s, steady to the end of the run
+  the title renders throughout (47400 frames presented)
+
+The previous handover's minimum success criterion is met and its stronger one
+is met: enumeration reaches a configured controller and the game is reading
+reports from the host input backend.
+
+The user-visible milestone -- a button press advancing the Stage 12 / Press
+Start wait -- is NOT verified. It needs a physical gamepad attached to the
+host, which this session could not do. Everything between the button and the
+title is in place and tested; what is unproven is the last hop, SDL2 reporting
+a real device through xbox_InputGetState.
+
+
+WHAT WAS BUILT
+==============
+
+  src/kernel/xbox_usb_ohci.{c,h}   (new)
+
+An OHCI transfer service and the one USB device behind it. Two halves:
+
+  xbox_OhciServiceList()   walks an ED list, retires the TDs between HeadP and
+                           TailP, builds the done queue, publishes it into the
+                           HCCA and raises WritebackDoneHead.
+  xbox_UsbControlRequest() answers as an Xbox controller (0x045E:0x0289).
+  xbox_UsbInterruptIn()    fills the 20-byte pad report.
+
+Both are pure functions over a caller-supplied RAM window and caller-supplied
+register values. That is not decoration: the live caller is the MCPX SIGSEGV
+handler, so the service must not allocate or lock, and the test drives the
+identical code over a plain buffer with no guest at all.
+
+Wiring in src/kernel/xbox_memory_layout.c:
+
+  - ControlListFilled / BulkListFilled (HcCommandStatus bits 1-2) run the
+    service synchronously, then the doorbell bits are cleared as hardware
+    clears them when it finds the list empty.
+  - A port reset returns the device to the default address.
+  - ohci_periodic_tick() runs one HCCA interrupt-table entry per frame off the
+    NV2A ack thread, and raises StartOfFrame.
+
+Host input, in diagnostics/jsrf_first_fault/main.c: usb_pad_state_shim() packs
+xbox_InputGetState into the Xbox report layout, installed through
+xbox_SetUsbPadStateHook. A hook, so xbox_kernel keeps no link dependency on
+xbox_input -- the same arrangement the APU MMIO hook uses.
+
+
+FIVE BUGS FOUND BY RUNNING IT
+=============================
+
+Each was found by a measured run, and each run name below is a real log under
+build-macos/jsrf-first-fault/render-investigation/.
+
+1. HcInterruptStatus was not write-1-to-clear.
+
+   As plain memory the driver's acknowledge STORED the bit it meant to retire.
+   XPP's ISR ran mask/handle/acknowledge/unmask about eighty times against a
+   RootHubStatusChange it could not put down. It also made every later fix
+   impossible: a WritebackDoneHead that can never be acknowledged is one
+   transfer, then silence. (claude-usb-transfer-service-01)
+
+2. Nothing ever advanced a frame.
+
+   After SET_ADDRESS, XPP enables the StartOfFrame interrupt and counts frames
+   to time the 2 ms a device may take before answering at its new address. It
+   waited for ever. (claude-usb-transfer-service-02/03)
+
+3. An unacknowledged done queue was being overwritten.
+
+   XPP submits the next transfer from its completion DPC, BEFORE it
+   acknowledges the interrupt for the transfer before it. Publishing over that
+   loses the first queue outright; the driver then freed descriptors it was
+   never told about and faulted dereferencing 0xFFFFFFF0. Hardware keeps
+   retiring into HcDoneHead and publishes the lot at the next writeback, which
+   is what the service does now. (claude-usb-transfer-service-04)
+
+4. HeadP was left pointing at a failed TD.
+
+   A retired TD is retired whether or not it succeeded: it is unlinked and put
+   on the done queue, so HeadP advances past it and only gains the Halted bit.
+   Leaving HeadP on it handed the driver the same descriptor from two places.
+   (claude-usb-transfer-service-08)
+
+5. One guard window per register, instead of one per event.
+
+   Every mcpx_hw_store drops the mprotect guard, and a guest write landing in
+   that window is stored as plain memory with none of the register semantics
+   the trap exists to supply. The attach probe used two windows; XPP's ISR
+   acknowledged ConnectStatusChange in the gap and its 0x00010000 stored whole,
+   wiping CurrentConnectStatus -- the exact failure the port model exists to
+   prevent -- and the driver spent the run resetting an empty port. There is
+   now mcpx_hw_store_n() for a set of registers belonging to one event.
+   (claude-usb-transfer-service-05)
+
+   This one is worth remembering beyond USB. Windows cannot be eliminated while
+   the mechanism is mprotect; the rule is to open as few as possible. Any
+   future runtime-side register write on a guarded page should batch.
+
+
+THE ONE DELIBERATE DEVIATION FROM OHCI
+======================================
+
+A short read does not raise DataUnderrun and does not halt the endpoint.
+
+XPP asks for 0x50 bytes of configuration set and builds exactly ten eight-byte
+IN transfer descriptors for it, with bufferRounding set on the last one only.
+The modelled device has 32 bytes, so it underruns in the middle of that chain.
+Per OHCI that halts the endpoint -- and XPP treats a mid-chain halt as a failed
+enumeration, tears the control list down and resets the port, for ever
+(claude-usb-transfer-service-10 and -11). Completing the short read cleanly
+carries it straight through to SET_CONFIGURATION (claude-usb-exp-a2 and -a3).
+
+Read this as a symptom, not a fix. That XPP asks for exactly 80 bytes and sizes
+its TD chain to match is evidence the REAL controller's configuration set is 80
+bytes and the 32-byte one in xbox_usb_ohci.c is missing something -- plausibly
+the expansion-slot interfaces an Xbox pad carries for memory units. Nothing was
+invented to fill the gap: 32 bytes that are right beat 80 that are half
+guessed. If a real descriptor dump turns up, replace USB_CONFIG_DESC and this
+deviation should go with it. Both places carry a comment saying so.
+
+
+THE CONVERSATION, AS CAPTURED
+=============================
+
+In order, each request issued once the one before it completed:
+
+  80 06 00 01 00 00 08 00   GET_DESCRIPTOR(DEVICE), 8 -- the address-0 probe
+  00 05 01 00 00 00 00 00   SET_ADDRESS(1)
+  80 06 00 02 00 00 50 00   GET_DESCRIPTOR(CONFIGURATION), 80
+  00 09 01 00 00 00 00 00   SET_CONFIGURATION(1)
+  C1 06 00 42 00 00 10 00   GET_DESCRIPTOR(XID), 16   -- VENDOR, not class
+  C1 01 00 02 00 00 06 00   GET_CAPABILITIES(output), 6
+  C1 01 00 01 00 00 14 00   GET_CAPABILITIES(input), 20
+  A1 01 00 01 00 00 14 00   GET_REPORT(input), 20     -- CLASS, and repeating
+
+Two of those are worth knowing. The XID descriptor is a VENDOR request
+(bmRequestType 0xC1, bits 6:5 = 2), not a class one -- routing it as class
+stalls it. And GET_REPORT on the control pipe, not the interrupt endpoint, is
+where a button press actually reaches this title; the interrupt endpoint runs
+too, but XID polls.
+
+
+TESTS
+=====
+
+  diagnostics/jsrf_first_fault/ohci_transfer_test.c   (new)
+
+Twelve groups over the real captured schedule, transcribed from
+codex-usb-transfer-dump-04: the ED at 0x009E29A0, MaxPacketSize 8, and its
+SETUP / IN / OUT chain. Covers descriptor content, wLength clamping, the
+SET_ADDRESS ordering rule, stalls, short reads, done-queue order, the HCCA
+done-head low bit and its interrupt gating, deferred writebacks, HeadP on
+halt, bounds checks, cyclic ED and TD lists, and the full enumeration sequence
+above end to end.
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+
+14/14 pass. Build clean apart from the seven pre-existing DWORD/%lu format
+warnings in xbox_memory_layout.c and the linker alignment warnings.
+git diff --check clean.
+
+Canonical capture:
+
+  env \
+    RECOMP_HDD_ROOT="<repo>/build-macos/jsrf-first-fault/render-investigation/<name>-hdd" \
+    RECOMP_OHCI_ATTACH=1 RECOMP_OHCI_TRACE=1 RECOMP_OHCI_TRANSFER_TRACE=1 \
+    python3 diagnostics/jsrf_first_fault/run_bounded.py <name> --seconds 40
+
+
+EXACT NEXT STEP
+===============
+
+Attach a gamepad to the host and run the canonical capture. That is the whole
+remaining question for the boot-to-input milestone, and it is one run.
+
+  - If Press Start advances, the milestone is done and the next frontier is
+    whatever the menu does.
+  - If it does not, the pad is enumerated and polled but the button is not
+    arriving, and the place to look is usb_pad_state_shim in
+    diagnostics/jsrf_first_fault/main.c -- specifically whether SDL2 reports
+    the device at all, and whether XBOX_GAMEPAD's digital bits line up with
+    report byte 2 for the buttons this title reads. Add a trace of the report
+    bytes there; everything upstream of it is already covered by tests.
+
+After that, in rough order of likely need: the EP2 OUT rumble endpoint is
+accepted and discarded rather than driven; the configuration descriptor
+question above; and multiple controller ports, which today is one device on
+root-hub port 1.
+
+
+FILES
+=====
+
+  new     src/kernel/xbox_usb_ohci.c
+  new     src/kernel/xbox_usb_ohci.h
+  new     diagnostics/jsrf_first_fault/ohci_transfer_test.c
+  edited  src/kernel/xbox_memory_layout.c   service wiring, HcInterruptStatus
+                                            W1C, periodic tick, batched store
+  edited  src/kernel/CMakeLists.txt         xbox_usb_ohci.c
+  edited  diagnostics/jsrf_first_fault/CMakeLists.txt   jsrf_ohci_transfer_test
+  edited  diagnostics/jsrf_first_fault/main.c           pad-state shim
+
+Carried forward untouched from the Codex session: ohci_register_test.c,
+guest_trace.h, instrument_startup.py, startup_probe.c, xbox_memory_layout.h.
+
+Nothing is committed. HEAD is still f37268a.
