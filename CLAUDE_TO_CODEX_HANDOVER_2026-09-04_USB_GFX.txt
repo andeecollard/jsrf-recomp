@@ -1,0 +1,311 @@
+CLAUDE -> CODEX HANDOVER
+Jet Set Radio Future / upstream_xboxrecomp_clean
+4 September 2026
+
+Continues CODEX_TO_CLAUDE_HANDOVER_2026-09-04.txt (the USB transfer-service
+brief). Supersedes the input conclusion in CLAUDE_TO_CODEX_HANDOVER_2026-09-04.txt.
+
+
+READ THIS FIRST
+===============
+
+Repository:
+  /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+State: main at 770cf92, pushed to origin/main, working tree clean.
+Six commits on top of f37268a.
+
+Tests: ctest 14/14. Build clean apart from the seven pre-existing DWORD/%lu
+format warnings in xbox_memory_layout.c and the linker alignment warnings.
+
+Two prior conclusions are WRONG and are corrected below. If you read only two
+things, read CORRECTION 1 and CORRECTION 2.
+
+
+EXECUTIVE STATUS
+================
+
+You can now watch JSRF boot, in a window, on this machine:
+
+  env RECOMP_HDD_ROOT=/tmp/jsrf-hdd RECOMP_OHCI_ATTACH=1 RECOMP_PB_EXEC=1 \
+      python3 diagnostics/jsrf_first_fault/run_bounded.py mytest --seconds 120
+
+CRI/ADX logo, then the animated "Now Loading" screen, stable and flicker-free.
+Behind it the CPU rasteriser reports, over 150 s, 267,400 draws and 3,052,519
+triangles with ZERO batches rejected, ZERO skipped as not screen-space and
+ZERO triangles off-surface, running the title's own vertex programs.
+
+It does not get past the loading screen. That is the whole of what is left in
+this line of work, and it is NOT input and NOT the renderer.
+
+
+CORRECTION 1: THE RENDERER WAS NEVER THE BLOCKER
+================================================
+
+draws=0 in the [PUSHER] line is the D3D11 sink's counter. The CPU executor in
+src/kernel/nv2a_pb_exec.c is counted separately and draws. It is gated behind
+RECOMP_PB_EXEC, and no run in the previous sessions' logs set it -- so every
+run drew nothing, and "the renderer is missing geometry" followed from that
+rather than from the renderer.
+
+It is not missing geometry. ARRAY_ELEMENT16, SET_TRANSFORM_PROGRAM,
+SET_TRANSFORM_CONSTANT_LOAD, the vertex-shader interpreter and texturing all
+work on the paths this title uses. Do not start building a geometry path in
+the pushbuffer sink; nothing in its unhandled list is on the critical path.
+
+
+CORRECTION 2: THE TITLE IS NOT WAITING FOR A BUTTON
+===================================================
+
+CLAUDE_TO_CODEX_HANDOVER_2026-09-04.txt says the title "finishes cleanly, and
+waits for a button press it can never receive", and that "G13 ends at G5, host
+input. Not memory, not the renderer, not the scheduler."
+
+That is the premise the whole USB stack was built on, and it does not survive
+being tested. The button now arrives and nothing changes.
+
+The test, and you can re-run it: RECOMP_PAD_SENTINEL=1 stamps a value nothing
+else would produce into the pad's left stick, and the periodic report scans
+guest RAM for it (pad_sentinel_scan in diagnostics/jsrf_first_fault/main.c).
+That the report reaches guest memory was never in question -- the runtime
+writes it there. Whether the title's input layer copies it out was.
+
+  RECOMP_HDD_ROOT=... RECOMP_OHCI_ATTACH=1 RECOMP_PB_EXEC=1 \
+  RECOMP_FAKE_PAD=1 RECOMP_PAD_SENTINEL=1 run_bounded.py <name> --seconds 75
+
+Result, every report, run claude-pad-sentinel-3:
+
+  [PAD-SENTINEL] copy at guest 0x009E10B6
+  [PAD-SENTINEL] copy at guest 0x009E10D6
+  [PAD-SENTINEL] 2 copies of the pad report in guest RAM
+
+Two copies in sixty megabytes, thirty-two bytes apart, both inside the USB
+stack's own allocation region -- the HCCA is at 0x009E2000 and the device pool
+at 0x009E4000 -- and shaped like XPP double-buffering the XID input report at
+its 32-byte endpoint size. Nowhere else in RAM.
+
+XPP takes delivery and stores it. The game never copies it out. The title is
+not blocked on input it cannot get; it is not asking for input.
+
+That agrees with the screen, which shows "Now Loading" and not a title screen,
+and with the state machine (see THE ACTUAL BLOCKER).
+
+The USB work was sound engineering against a wrong premise. It is real
+infrastructure and the title will need it -- it enumerates and polls -- but it
+did not unblock anything, and the premise should have been tested first.
+
+
+WHAT WAS BUILT
+==============
+
+  src/kernel/xbox_usb_ohci.{c,h}          new
+  diagnostics/jsrf_first_fault/ohci_transfer_test.c   new
+
+An OHCI transfer service and one Xbox gamepad. Pure functions over a
+caller-supplied RAM window and register values, because the live caller is the
+MCPX SIGSEGV handler -- it must not allocate or lock -- and the tests then
+drive the identical code over a plain buffer with no guest at all.
+
+The title now completes the whole USB conversation, reproducibly, in this
+order, each request issued once the previous completed:
+
+  80 06 00 01 00 00 08 00   GET_DESCRIPTOR(DEVICE), 8 -- address-0 probe
+  00 05 01 00 00 00 00 00   SET_ADDRESS(1)
+  80 06 00 02 00 00 50 00   GET_DESCRIPTOR(CONFIGURATION), 80
+  00 09 01 00 00 00 00 00   SET_CONFIGURATION(1)
+  C1 06 00 42 00 00 10 00   GET_DESCRIPTOR(XID), 16 -- VENDOR, not class
+  C1 01 00 02/01 ...        GET_CAPABILITIES
+  A1 01 00 01 00 00 14 00   GET_REPORT(input), 20 -- CLASS, and repeating
+
+Two of those are worth knowing. The XID descriptor is a VENDOR request
+(bmRequestType 0xC1, type bits = 2), not a class one; routing it as class
+stalls it. And GET_REPORT on the control pipe, not the interrupt endpoint, is
+where the pad actually goes -- the interrupt endpoint runs too, but XID polls.
+
+Verified with a real DualShock 4 on USB (claude-usb-realpad-01): SDL2 opens it
+and presses decode correctly -- Options as START, the D-pad as its four bits,
+Cross/Circle/Square/Triangle as the analog bytes.
+
+Window presentation:
+
+  nv2a_pb_exec_surface() hands out the rasterised surface; dev_Present in
+  src/d3d/d3d8_gl.c uploads it and draws it over the window with the existing
+  fixed program. A hook, because the executor is xbox_kernel and that is
+  xbox_d3d -- the arrangement the APU MMIO and USB pad hooks already use.
+  Installed in main.c. Whole frames are snapshotted at NV097_FLIP_STALL.
+
+
+FIVE OHCI BUGS, EACH FOUND BY A RUN
+===================================
+
+Logs are under build-macos/jsrf-first-fault/render-investigation/.
+
+1. HcInterruptStatus was not write-1-to-clear, so the driver's acknowledge
+   STORED the bit it meant to retire. An ISR storm, and fatal to everything
+   after it: a WritebackDoneHead that can never be acknowledged is one
+   transfer, then silence. (claude-usb-transfer-service-01)
+
+2. Nothing advanced a frame, so the StartOfFrame count XPP uses to time the
+   2 ms after SET_ADDRESS never finished. (claude-usb-transfer-service-02/03)
+
+3. An unacknowledged done queue was being overwritten. XPP submits the next
+   transfer from its completion DPC, BEFORE acknowledging the previous one.
+   (claude-usb-transfer-service-04)
+
+4. HeadP was left pointing at a failed TD. A retired TD is retired whether or
+   not it succeeded; HeadP advances past it and only gains Halted.
+   (claude-usb-transfer-service-08)
+
+5. One mprotect guard window per register instead of one per event. A guest
+   write landing in a window is stored as plain memory with none of the
+   register semantics the trap exists to supply: XPP acknowledged
+   ConnectStatusChange between the attach probe's two stores and wiped
+   CurrentConnectStatus. mcpx_hw_store_n batches.
+   (claude-usb-transfer-service-05)
+
+   Remember this one beyond USB. Windows cannot be eliminated while the
+   mechanism is mprotect; the rule is to open as few as possible. Any future
+   runtime-side write to a guarded page should batch.
+
+
+ONE DELIBERATE DEVIATION FROM OHCI
+==================================
+
+A short read does not raise DataUnderrun and does not halt the endpoint.
+
+XPP asks for 0x50 bytes of configuration set and builds exactly ten eight-byte
+IN TDs for it, bufferRounding on the last only. The modelled device has 32
+bytes, so it underruns mid-chain; per OHCI that halts the endpoint, and XPP
+reads that as a failed enumeration and resets the port, for ever
+(claude-usb-transfer-service-10/-11). Completing the short read cleanly
+carries it to SET_CONFIGURATION (claude-usb-exp-a2/-a3).
+
+Read it as a symptom. That XPP asks for exactly 80 bytes and sizes its TD
+chain to match is evidence the REAL controller's configuration set is 80 bytes
+and the 32-byte one in xbox_usb_ohci.c is incomplete -- plausibly the
+expansion-slot interfaces for memory units. Nothing was invented to fill it.
+If you find a real descriptor dump, replace USB_CONFIG_DESC and the deviation
+should go with it. Both sites carry the note.
+
+
+THE ACTUAL BLOCKER
+==================
+
+The title reaches "Now Loading" and stays. Not slowly -- it stops.
+
+  45 s run:  242 distinct files, 284 reads
+  150 s run: 242 distinct files, 284 reads
+
+Identical. File I/O finishes and never resumes, while the game loop runs hard
+and the loading animation keeps ticking.
+
+Ruled out by measurement, not argument:
+
+  - No fatal error. No JSRF_FATAL.ERR on the emulated HDD.
+  - No missing asset. All 253 failures are STATUS_OBJECT_NAME_NOT_FOUND on Z:\
+    paths, the HDD-cache-miss-then-read-from-D:\ pattern; the D:\ read
+    succeeds immediately after each.
+  - No blocked thread. Two NtWaitForSingleObjectEx INFINITE calls in a whole
+    run, both early, neither at the stall.
+  - No heap exhaustion. Zero "out of memory", unlike the 2026-09-03 handover's
+    Stg10_01.dat failure, which is fixed.
+  - Audio healthy. ADX manager/server tick advancing, flag clear.
+  - Not input. See CORRECTION 2.
+  - Not rendering. Same 242/284 with and without RECOMP_PB_EXEC.
+
+The guest is busy, not idle: 5.9M kernel calls, ~2.4M each of
+RtlEnterCriticalSection and Leave. It is re-testing a predicate that never
+becomes true.
+
+Loading gets further than the previous session recorded. It loads the PRESS
+START textures (Z:\Media\Mark\PRESS\JSRF_TEXS_1.JTX, JSRF_TEXSx1.JTX) and then
+continues through player assets, sound effects, display sprites
+(Z:\Media\Disp\SprNorm1.dat) and finally the BGM streams.
+
+
+THE STATE MACHINE, AND THE EXACT NEXT STEP
+==========================================
+
+sub_00013A80 is the root object's per-tick update, reached by
+sub_00025310 -> sub_00011070 -> sub_000123E0 -> sub_00013A80. Root object is
+0x005E3A70 and stays there.
+
+Its opening block tests a run of trigger fields and derives flags from them:
+
+  if (MEM32(root+0x50) != 0) { call sub_00065C80; MEM32(root+0x40) = 1; }
+  ... the same shape for +0x54, +0x58, +0x5C, +0x60 ...
+
+RECOMP_STARTUP_TRACE=1 now logs all of them, widened this session for exactly
+this question. Measured over 32,000 ticks with a pad held down throughout:
+
+  +0x50, +0x54, +0x58, +0x5C, +0x60 -- all zero, always
+  +0x40, +0x44 (derived from them)  -- all zero, always
+  +0x94                             -- alternates 0 and 2 every tick
+
++0x94 is a per-frame phase flag, not a stall. It selects between two paths at
+loc_00013B24 and is a red herring; earlier notes treating it as the state
+machine's state are wrong.
+
+So: NOTHING ever sets any of the five triggers. The next question is narrow.
+Which of +0x50..+0x60 is supposed to be set, by what, and what is stopping it?
+Work outwards from sub_000123E0 (the caller) and sub_00065C80 (what a set
+trigger invokes), the way the FCMOV and shared-epilogue faults were found --
+reading the generated guest code against measured runtime state.
+
+Do NOT force a transition, fake a button or synthesise a trigger to get past
+this. That rule has held for the whole project and it is why the measurements
+above can be trusted.
+
+
+TOOLING YOU HAVE
+================
+
+Probes: diagnostics/jsrf_first_fault/instrument_startup.py adds read-only
+observation sites at guest PCs; startup_probe.c implements them. This is how
+the USB device path, the interpolator and the resource path were pinned down,
+and it is the right tool for the state machine.
+
+Useful environment variables (full list: grep -rhoE 'getenv\("RECOMP_[A-Z_0-9]+"\)'
+over src/ and diagnostics/):
+
+  RECOMP_PB_EXEC          run the CPU rasteriser; REQUIRED to see anything
+  RECOMP_FB_DUMP=<prefix> write the surface to <prefix>NNN.bmp per report
+  RECOMP_STARTUP_TRACE    root object trigger/flag fields per tick
+  RECOMP_PAD_SENTINEL     stamp and hunt the pad report through guest RAM
+  RECOMP_FAKE_PAD         pulse A and START once a second, no hardware needed
+  RECOMP_OHCI_TRANSFER_TRACE  ED/TD dumps, [OHCI-SVC] and [USB-PAD]
+  RECOMP_PEEK / _CHAIN    print named guest dwords as hex and float
+
+Host notes, both macOS rather than code. open_controllers() runs once in
+xbox_InputInit and there is no hotplug, so attach a pad BEFORE launching. And
+macOS 26's Games app claims the controller Home button system-wide; harmless
+here, since the Xbox 20-byte report has no Guide button, but it steals focus.
+
+
+VALIDATION
+==========
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+
+14/14. ohci_transfer_test.c covers the captured schedule from
+codex-usb-transfer-dump-04 -- the ED at 0x009E29A0, MaxPacketSize 8, its
+SETUP/IN/OUT chain -- plus descriptor content, wLength clamping, the
+SET_ADDRESS ordering rule, stalls, short reads, done-queue order, the HCCA
+done-head low bit and its interrupt gating, deferred writebacks, HeadP on
+halt, bounds checks, cyclic ED and TD lists, and the full enumeration
+sequence end to end.
+
+git diff --check clean.
+
+
+KNOWN ROUGH EDGES
+=================
+
+  - The presented surface can tear. It is copied at FLIP_STALL by the executor
+    thread and read by the GL thread with no lock, because neither may block
+    the other. A torn frame is much smaller than the flicker it replaced.
+  - The unresolved indirect-call target 0x0013D840 is a return address inside
+    sub_0013D810, 1 of 639, and looks benign. Not chased.
+  - The EP2 OUT rumble endpoint is accepted and discarded.
+  - One device on root-hub port 1. No second controller, no memory units.
