@@ -701,9 +701,34 @@ Remaining, in order:
     Measured: `HcRhPortStatus[0] = 0x00000001` and it stays there across the
     acknowledge. The driver has a device that does not disappear.
 
-    Still to do: it has not issued the port reset yet, and the control
-    transfers on the default endpoint through the HCCA at 0x009E2000 have no
-    service behind them. That is the remaining bulk of the device model.
+    Still to do, and the trace says exactly where it stops. Across a whole run
+    the driver writes:
+
+    ```
+    72  HcRhPortStatus0        acked over and over
+    63  HcInterruptEnable      masked and unmasked with each pass
+    61  HcInterruptStatus
+     1  HcControlHeadED  <= 0  once, at init
+     1  HcCommandStatus  <= 1  once, the reset at init
+    ```
+
+    No non-zero endpoint-list head, and ControlListFilled is never set. It
+    never reaches the transfer stage: it loops in the root hub and does not
+    issue the port reset.
+
+    The path is read and known. `sub_001BD295` marks the port in a bitmap and
+    calls `sub_001C2220`, which walks it against a per-port "already seen" mask
+    at `this+0x461`: an unseen connect sets the bit and calls `sub_001BF8F6`,
+    which tail-calls `sub_001BF72C`. That allocates a device object from the
+    pool at 0x264858, stamps it (`MEM8(esi)=0xFE`, port at +4), links it and
+    calls `sub_001C06B3`. If the pool allocation returns zero it branches
+    straight to the exit at `loc_001BF7ED`, which is the first thing to check --
+    an empty device pool would look exactly like this.
+
+    So the next question is narrow: does `sub_001BF72C` run, and does its
+    allocation succeed? Probe it the way `sub_00024700` and `sub_00192830` were
+    probed. Only after that is answered is the HCCA transfer service -- the
+    remaining bulk of the device model -- worth starting.
 
 (3) answer interrupt-IN with pad reports fed from `xbox_InputGetState`, which
     already exists and already has a synthetic pad for bring-up.
