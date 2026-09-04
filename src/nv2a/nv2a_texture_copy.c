@@ -10,29 +10,95 @@
 const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s)
 {
     memset(s, 0, sizeof(*s));
-    if (!(M(0x1b0c) & 0x40000000)) return "texture 0 disabled";
     for (int u=1; u<4; ++u)
         if (M(0x1b0c+64*u) & 0x40000000) return "multiple textures";
+    if (M(0x288)!=0xc || M(0x28c)!=0x1c80)
+        return "combiner / texture program";
+    /* Untextured: the same four-stage program with a texture-less stage 0.
+     *
+     * The combiner input word packs each of A..D as [7:5] mapping, [4] alpha,
+     * [3:0] register. The measured textured stage 0 is colour 0x08040000 --
+     * A = register 8 (texture 0), B = register 4 (diffuse) -> T0 * V0. With no
+     * texture bound the title issues 0x04200000: A = diffuse, B = register 0
+     * under mapping 1 (unsigned invert) = 1, so the stage is V0 * 1. Alpha
+     * likewise, 0x18140000 (T0.a * V0.a) becoming 0x14200000 (V0.a * 1).
+     * Stages 1..3 are unchanged in both, and the shader stage program is 0
+     * because no stage samples.
+     *
+     * These are 93% of the title's draws once it reaches 3D content, and
+     * rejecting them is why the screen was black after the startup logos. */
+    if (!(M(0x1b0c) & 0x40000000)) {
+        if (M(0x1e70)!=0 || M(0x1e60)!=4
+                || M(0xac0)!=0x04200000 || M(0x260)!=0x14200000
+                || M(0xaa0)!=0xc00 || M(0x1e40)!=0xc00)
+            return "combiner / texture program";
+        for (unsigned i=1; i<4; ++i)
+            if (M(0xac0+4*i)!=0x0c200000 || M(0x260+4*i)!=0x1c200000
+                    || M(0xaa0+4*i)!=0xc00 || M(0x1e40+4*i)!=0xc00)
+                return "combiner / texture program";
+        /* Sampling is skipped and the stage reads as opaque white, which is
+         * what "* 1" means; modulate then multiplies the diffuse in. */
+        s->untextured=1; s->modulate=1;
+        goto raster_state;
+    }
     /* One PROJECT2D stage. A=T0, B=1, C=D=0 -> R0.rgb;
      * A=V0.alpha, B=1, C=D=0 -> R0.alpha. Final D/G select R0. */
-    if (M(0x1e70)!=1 || M(0x1e60)!=1 || M(0xac0)!=0x08200000
-            || M(0x260)!=0x14200000 || M(0xaa0)!=0xc00
-            || M(0x1e40)!=0xc00 || M(0x288)!=0xc || M(0x28c)!=0x1c80)
+    if (M(0x1e70)!=1)
         return "combiner / texture program";
-    if (M(0x300) || M(0x304) || M(0x308) || M(0x30c) || M(0x32c) || M(0x2a4)
+    if (M(0x1e60)==1 && M(0xac0)==0x08200000 && M(0x260)==0x14200000
+            && M(0xaa0)==0xc00 && M(0x1e40)==0xc00) {
+        s->modulate=0;
+    } else if (M(0x1e60)==4 && M(0xac0)==0x08040000 && M(0x260)==0x18140000
+            && M(0xaa0)==0xc00 && M(0x1e40)==0xc00) {
+        /* Measured at JSRF draw 11: stage 0 is T0 * V0 (RGB and alpha),
+         * stages 1..3 are R0 * 1. No constants, dot products or feedback. */
+        for (unsigned i=1; i<4; ++i)
+            if (M(0xac0+4*i)!=0x0c200000 || M(0x260+4*i)!=0x1c200000
+                    || M(0xaa0+4*i)!=0xc00 || M(0x1e40+4*i)!=0xc00)
+                return "combiner / texture program";
+        s->modulate=1;
+    } else return "combiner / texture program";
+raster_state:
+    if (M(0x300) && (M(0x300)!=1 || M(0x33c)!=0x204 || M(0x340)>255)) return "alpha test";
+    s->alpha_test=M(0x300); s->alpha_ref=M(0x340);
+    if (M(0x304) && (M(0x304)!=1 || M(0x344)!=0x302 || M(0x348)!=0x303
+                || M(0x350)!=0x8006)) return "blending";
+    s->blend=M(0x304);
+    if (M(0x308)) {
+        if (M(0x308)!=1 || (M(0x39c)!=0x404 && M(0x39c)!=0x405 && M(0x39c)!=0x408)
+                || (M(0x3a0)!=0x900 && M(0x3a0)!=0x901)) return "face culling";
+        s->cull_face=M(0x39c); s->front_cw=M(0x3a0)==0x900;
+    }
+    if (M(0x30c) && (M(0x30c)!=1 || M(0x354)!=0x203 || M(0x35c)>1
+                || (M(0x290)&0x11000) || (M(0x208)&0xf0)!=0x20)) return "depth test";
+    s->depth_test=M(0x30c); s->depth_write=M(0x35c)!=0;
+    s->depth_handle=M(0x198); s->depth_offset=M(0x214); s->depth_pitch=M(0x20c)>>16;
+    if (M(0x32c) || M(0x2a4)
             || M(0x324) || M(0x338) || M(0x17bc))
-        return "alpha / blend / cull / depth / stencil / fog / polygon / logic op";
+        return "stencil / fog / polygon / logic op";
     if (M(0x37c)!=0x1d01 || M(0x38c)!=0x1b02 || M(0x390)!=0x1b02)
         return "shade / polygon mode";
     if (M(0x358)!=0x01010101 || M(0x2b4)) return "colour mask / window clip";
+    if (s->untextured) goto target_state;
     /* Observed control enables perspective, disables colour key and alpha kill.
      * The LOD range is immaterial for this single-level linear image. */
     if ((M(0x1b0c) & ~0x3ffffu)!=0x40000000 || (M(0x1b0c)&63))
         return "texture control / colour key / alpha kill";
     uint32_t f=M(0x1b04), dma=f&3;
-    if ((f & 0xfffffffcu)!=0x00011128 || (dma!=1 && dma!=2))
-        return "texture format / mip layout";
-    if (M(0x1b08)!=0x00010303) return "texture address mode";
+    if (dma!=1 && dma!=2) return "texture format / mip layout";
+    if ((f & 0xfffffffcu)==0x00011128) {
+        s->width=M(0x1b1c)>>16; s->height=M(0x1b1c)&0xffff;
+        s->pitch=M(0x1b10)>>16;
+        if (!s->width || !s->height || s->pitch<s->width*2u)
+            return "texture dimensions / pitch";
+    } else if ((f & 0xf00ffffcu)==0x00010c28) {
+        s->dxt1=1;
+        s->width=1u<<((f>>20)&15); s->height=1u<<((f>>24)&15);
+        if (s->width>4096 || s->height>4096) return "texture dimensions / pitch";
+        s->pitch=((s->width+3)/4)*8;
+    } else return "texture format / mip layout";
+    if (M(0x1b08)==0x00010101 && s->dxt1) s->repeat=1;
+    else if (M(0x1b08)!=0x00010303) return "texture address mode";
     uint32_t filter=M(0x1b14), min=(filter>>16)&255, mag=(filter>>24)&15;
     if ((filter & 0xf0000000) || (filter & 0x0000e000)!=0x2000)
         return "texture filter / channel sign";
@@ -40,13 +106,10 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
             || (mag==2 && (min==2 || min==4 || min==6))))
         return "texture min / mag filter";
     s->linear=mag==2;
-    s->dither=M(0x310)!=0;
     s->texture_handle=M(dma==1 ? 0x184 : 0x188);
     s->texture_offset=M(0x1b00);
-    s->width=M(0x1b1c)>>16; s->height=M(0x1b1c)&0xffff;
-    s->pitch=M(0x1b10)>>16;
-    if (!s->width || !s->height || s->pitch<s->width*2u)
-        return "texture dimensions / pitch";
+target_state:
+    s->dither=M(0x310)!=0;
     uint32_t format=M(0x208);
     if (((format>>8)&15)!=1 || (format&0x0000f000)) return "nonlinear / multisample target";
     if ((format&15)==3) s->target_bpp=2;
@@ -59,6 +122,8 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     if (!s->clip_w || !s->clip_h
             || s->target_pitch<(s->clip_x+s->clip_w)*s->target_bpp)
         return "target dimensions / pitch";
+    if (s->depth_test && s->depth_pitch<(s->clip_x+s->clip_w)*4u)
+        return "depth dimensions / pitch";
     if ((M(0x2c0)&0xfff)>s->clip_x || ((M(0x2c0)>>16)&0xfff)<s->clip_x+s->clip_w-1
             || (M(0x2e0)&0xfff)>s->clip_y || ((M(0x2e0)>>16)&0xfff)<s->clip_y+s->clip_h-1)
         return "partial window clip";
@@ -91,25 +156,58 @@ int nv2a_dma_resolve(const uint8_t *ramin, size_t size, uint32_t ramht,
     return 0;
 }
 
-static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, float rgb[3])
+size_t nv2a_texture_copy_texture_bytes(const NV2ATextureCopy *s)
 {
-    if (x<0) x=0; else if ((uint32_t)x>=s->width) x=(int)s->width-1;
-    if (y<0) y=0; else if ((uint32_t)y>=s->height) y=(int)s->height-1;
+    if (s->untextured) return 0;
+    return (size_t)s->pitch*(s->dxt1 ? (s->height+3)/4 : s->height);
+}
+static void unpack565(uint32_t v, float rgba[4])
+{
+    rgba[0]=(float)(v>>11)/31; rgba[1]=(float)((v>>5)&63)/63; rgba[2]=(float)(v&31)/31;
+    rgba[3]=1;
+}
+static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, float rgba[4])
+{
+    if (s->repeat) {
+        x=(x%(int)s->width+(int)s->width)%(int)s->width;
+        y=(y%(int)s->height+(int)s->height)%(int)s->height;
+    } else {
+        if (x<0) x=0; else if ((uint32_t)x>=s->width) x=(int)s->width-1;
+        if (y<0) y=0; else if ((uint32_t)y>=s->height) y=(int)s->height-1;
+    }
+    if (s->dxt1) {
+        /* BC1 consists of row-major 4x4 blocks, not Morton-swizzled texels. */
+        const uint8_t *p=data+(size_t)(y/4)*s->pitch+(x/4)*8;
+        uint32_t c0=p[0]|(uint32_t)p[1]<<8,c1=p[2]|(uint32_t)p[3]<<8;
+        unsigned index=(read32(p+4)>>(2*((y&3)*4+(x&3))))&3;
+        if (index<2) { unpack565(index ? c1 : c0,rgba); return; }
+        if (c0<=c1 && index==3) { memset(rgba,0,4*sizeof(float)); return; }
+        float a[4],b[4]; unpack565(c0,a); unpack565(c1,b);
+        float weight=c0<=c1 ? .5f : (index==2 ? 2.0f/3.0f : 1.0f/3.0f);
+        for (int k=0;k<3;++k) rgba[k]=a[k]*weight+b[k]*(1-weight);
+        rgba[3]=1; return;
+    }
     const uint8_t *p=data+(size_t)y*s->pitch+x*2;
     uint32_t v=p[0] | (uint32_t)p[1]<<8;
-    rgb[0]=(float)(v>>11)/31; rgb[1]=(float)((v>>5)&63)/63; rgb[2]=(float)(v&31)/31;
+    unpack565(v,rgba);
 }
-static void sample(const NV2ATextureCopy *s, const uint8_t *data, float u, float v, float rgb[3])
+static void sample(const NV2ATextureCopy *s, const uint8_t *data, float u, float v, float rgba[4])
 {
+    if (s->dxt1) {
+        /* Nonlinear textures use normalized coordinates, unlike image rectangles. */
+        if (s->repeat) { u-=floorf(u); v-=floorf(v); }
+        else { u=fmaxf(0,fminf(1,u)); v=fmaxf(0,fminf(1,v)); }
+        u*=s->width; v*=s->height;
+    }
     /* Clamp before converting to integers, including extreme valid coordinates. */
     u=fmaxf(0, fminf((float)s->width,u));
     v=fmaxf(0, fminf((float)s->height,v));
-    if (!s->linear) { texel(s,data,(int)floorf(u),(int)floorf(v),rgb); return; }
+    if (!s->linear) { texel(s,data,(int)floorf(u),(int)floorf(v),rgba); return; }
     float x=u-0.5f,y=v-0.5f, fx=floorf(x),fy=floorf(y), tx=x-fx,ty=y-fy;
-    float p[4][3];
+    float p[4][4];
     texel(s,data,(int)fx,(int)fy,p[0]); texel(s,data,(int)fx+1,(int)fy,p[1]);
     texel(s,data,(int)fx,(int)fy+1,p[2]); texel(s,data,(int)fx+1,(int)fy+1,p[3]);
-    for (int k=0;k<3;++k) rgb[k]=(p[0][k]*(1-tx)+p[1][k]*tx)*(1-ty)
+    for (int k=0;k<4;++k) rgba[k]=(p[0][k]*(1-tx)+p[1][k]*tx)*(1-ty)
                                       +(p[2][k]*(1-tx)+p[3][k]*tx)*ty;
 }
 static unsigned quantize(float value, unsigned max)
@@ -125,31 +223,39 @@ static int inclusive_edge(const float a[4], const float b[4], float sign)
     float dy=(b[1]-a[1])*sign, dx=(b[0]-a[0])*sign;
     return dy<0 || (dy==0 && dx>0);
 }
-int nv2a_texture_copy_triangle(const NV2ATextureCopy *s,
+int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
     const uint8_t *texture, size_t texture_size, uint8_t *target, size_t target_size,
+    uint8_t *depth, size_t depth_size,
     const float a[16][4], const float b[16][4], const float c[16][4])
 {
-    if (!texture || !target || !s->width || !s->height || s->pitch<s->width*2u
+    if (!target
+            || (!s->untextured && (!texture || !s->width || !s->height
+                || s->width>65535 || s->height>65535
+                || s->pitch<(s->dxt1 ? ((s->width+3)/4)*8 : s->width*2u)))
             || (s->target_bpp!=2 && s->target_bpp!=4)
             || s->target_pitch<(uint64_t)(s->clip_x+s->clip_w)*s->target_bpp
-            || (uint64_t)s->pitch*s->height>texture_size
+            || nv2a_texture_copy_texture_bytes(s)>texture_size
             || (uint64_t)s->target_pitch*(s->clip_y+s->clip_h)>target_size) return 0;
+    if (s->depth_test && (!depth || s->depth_pitch<(uint64_t)(s->clip_x+s->clip_w)*4
+                || (uint64_t)s->depth_pitch*(s->clip_y+s->clip_h)>depth_size)) return 0;
     const float (*v[3])[4]={a,b,c};
     for (int i=0;i<3;++i) {
         for (int k=0;k<4;++k)
-            if (!isfinite(v[i][0][k]) || !isfinite(v[i][NV2A_VSH_OUT_T0][k])) return 0;
-        if (!(v[i][0][3]>0) || !(v[i][NV2A_VSH_OUT_T0][3]>0)
-                || !isfinite(v[i][NV2A_VSH_OUT_D0][3])) return 0;
-        /* Dithering cannot change an exact RGB565 -> RGB565 texel copy.
-         * Other dithered conversions need hardware-verified quantisation. */
-        if (s->dither && (s->target_bpp!=2 || v[i][0][3]!=1
-                || v[i][NV2A_VSH_OUT_T0][3]!=1
-                || v[i][NV2A_VSH_OUT_T0][0]!=v[i][0][0]
-                || v[i][NV2A_VSH_OUT_T0][1]!=v[i][0][1])) return 0;
+            if (!isfinite(v[i][0][k])
+                    || (!s->untextured && !isfinite(v[i][NV2A_VSH_OUT_T0][k])))
+                return 0;
+        if (!(v[i][0][3]>0) || !isfinite(v[i][NV2A_VSH_OUT_D0][3])
+                || (!s->untextured && !(v[i][NV2A_VSH_OUT_T0][3]>0))) return 0;
+        if (s->modulate)
+            for (int k=0;k<3;++k)
+                if (!isfinite(v[i][NV2A_VSH_OUT_D0][k])) return 0;
     }
     float area=edge(a[0],b[0],c[0][0],c[0][1]);
     if (!isfinite(area)) return 0;
     if (area==0) return 1;
+    int front=(area>0)==(s->front_cw!=0); /* framebuffer Y increases downwards */
+    if (s->cull_face==0x408 || (s->cull_face==0x404 && front)
+            || (s->cull_face==0x405 && !front)) return 1;
     float left=(float)s->clip_x,right=(float)(s->clip_x+s->clip_w);
     float top=(float)s->clip_y,bottom=(float)(s->clip_y+s->clip_h);
     int x0=(int)floorf(fmaxf(left,fminf(right,fminf(a[0][0],fminf(b[0][0],c[0][0])))));
@@ -161,7 +267,8 @@ int nv2a_texture_copy_triangle(const NV2ATextureCopy *s,
     /* A common post-process is an oversized triangle copying texels 1:1.
      * Prove that all pixel centres in its bounds are covered before using
      * row copies. This also preserves RGB565 quantisation exactly. */
-    int direct=s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
+    int direct=!s->modulate && !s->dxt1 && !s->alpha_test && !s->blend && !s->depth_test
+        && s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
     for (int i=0;i<3;++i)
         if (v[i][0][3]!=1 || v[i][NV2A_VSH_OUT_T0][3]!=1
                 || v[i][0][0]!=v[i][NV2A_VSH_OUT_T0][0]
@@ -181,23 +288,64 @@ int nv2a_texture_copy_triangle(const NV2ATextureCopy *s,
         int inside=1;
         for (int i=0;i<3;++i) if (e[i]*sign<0 || (e[i]==0 && !include[i])) inside=0;
         if (!inside) continue;
-        float u=0,t=0,q=0,alpha=0,recip=0;
+        float u=0,t=0,q=0,alpha=0,recip=0,diffuse[3]={0};
+        double z=0;
         /* Screen-space XYZ retain clip W in oPos.w. Perspective-correct
          * varyings use reciprocal W; PROJECT2D then divides S/T by Q.
          * The observed framebuffer copy has W=Q=1. */
         for (int i=0;i<3;++i) {
             float w=e[i]/area/v[i][0][3];
-            u+=w*v[i][NV2A_VSH_OUT_T0][0]; t+=w*v[i][NV2A_VSH_OUT_T0][1];
-            q+=w*v[i][NV2A_VSH_OUT_T0][3];
+            z+=(double)e[i]/area*v[i][0][2]; /* post-viewport depth is affine */
+            if (!s->untextured) {
+                u+=w*v[i][NV2A_VSH_OUT_T0][0]; t+=w*v[i][NV2A_VSH_OUT_T0][1];
+                q+=w*v[i][NV2A_VSH_OUT_T0][3];
+            }
             alpha+=w*v[i][NV2A_VSH_OUT_D0][3]; recip+=w;
+            if (s->modulate)
+                for (int k=0;k<3;++k) diffuse[k]+=w*v[i][NV2A_VSH_OUT_D0][k];
         }
-        if (!(q>0) || !(recip>0) || !isfinite(u/q) || !isfinite(t/q)) return 0;
-        float rgb[3]; sample(s,texture,u/q,t/q,rgb);
+        if (!(recip>0)) return 0;
+        float rgb[4];
+        if (s->untextured) { rgb[0]=rgb[1]=rgb[2]=rgb[3]=1; }
+        else {
+            if (!(q>0) || !isfinite(u/q) || !isfinite(t/q)) return 0;
+            sample(s,texture,u/q,t/q,rgb);
+        }
+        rgb[3]=fminf(1,fmaxf(0,alpha/recip))*(s->modulate ? rgb[3] : 1);
+        if (s->modulate)
+            for (int k=0;k<3;++k) rgb[k]=fminf(1,rgb[k]*fmaxf(0,diffuse[k]/recip));
+        if (s->alpha_test && quantize(rgb[3],255)<=s->alpha_ref) continue;
+        uint8_t *zp=s->depth_test ? depth+(size_t)y*s->depth_pitch+x*4 : NULL;
+        uint32_t z24=(uint32_t)(fmin(16777215,fmax(0,z))+.5);
+        if (zp && z24>(read32(zp)>>8)) continue;
+        uint8_t *p=target+(size_t)y*s->target_pitch+x*s->target_bpp;
+        if (s->blend) {
+            float dst[4];
+            if (s->target_bpp==2) unpack565(p[0]|(uint32_t)p[1]<<8,dst);
+            else { dst[0]=p[2]/255.0f; dst[1]=p[1]/255.0f; dst[2]=p[0]/255.0f; dst[3]=p[3]/255.0f; }
+            float a=rgb[3];
+            for (int k=0;k<4;++k) rgb[k]=rgb[k]*a+dst[k]*(1-a);
+        }
+        if (s->dither && s->target_bpp==2) {
+            /* Deterministic ordered approximation; NV2A's exact thresholds
+             * still require hardware comparison. Preserve exact 565 levels. */
+            static const unsigned bayer[4][4]={{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
+            float bias=((bayer[y&3][x&3]+.5f)/16.0f)-.5f;
+            rgb[0]+=bias/31; rgb[1]+=bias/63; rgb[2]+=bias/31;
+        }
         uint32_t pixel;
         if (s->target_bpp==2) pixel=quantize(rgb[0],31)<<11 | quantize(rgb[1],63)<<5 | quantize(rgb[2],31);
-        else pixel=quantize(alpha/recip,255)<<24 | quantize(rgb[0],255)<<16 | quantize(rgb[1],255)<<8 | quantize(rgb[2],255);
-        uint8_t *p=target+(size_t)y*s->target_pitch+x*s->target_bpp;
+        else pixel=quantize(rgb[3],255)<<24 | quantize(rgb[0],255)<<16 | quantize(rgb[1],255)<<8 | quantize(rgb[2],255);
         for (unsigned k=0;k<s->target_bpp;++k) p[k]=(uint8_t)(pixel>>(8*k));
+        if (zp && s->depth_write) { zp[1]=(uint8_t)z24; zp[2]=(uint8_t)(z24>>8); zp[3]=(uint8_t)(z24>>16); }
     }
     return 1;
+}
+
+int nv2a_texture_copy_triangle(const NV2ATextureCopy *s,
+    const uint8_t *texture, size_t texture_size, uint8_t *target, size_t target_size,
+    const float a[16][4], const float b[16][4], const float c[16][4])
+{
+    return nv2a_texture_copy_triangle_depth(s,texture,texture_size,target,target_size,
+                                          NULL,0,a,b,c);
 }

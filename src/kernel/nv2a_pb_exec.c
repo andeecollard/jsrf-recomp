@@ -10,8 +10,9 @@
  * Geometry uses either pre-transformed attributes or the title's uploaded
  * NV2A vertex program. Shader positions and diffuse outputs feed the CPU
  * rasteriser directly. The measured linear RGB565 texture-copy / colour
- * program is supported; other configured fragment states are rejected.
- * Depth, blending and general colour programs remain unsupported.
+ * program and measured texture-times-diffuse combiner are supported with
+ * linear RGB565; other configured fragment states are rejected. Depth,
+ * blending, compressed textures and general colour programs remain unsupported.
  *
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
@@ -122,15 +123,85 @@ static int s_capture_selected;
 static struct {
     NV2ATextureCopy state;
     const uint8_t *texture;
-    uint8_t *target;
-    size_t texture_bytes, target_bytes;
-    uint32_t texture_address, target_address, batches, rejected;
+    uint8_t *target, *depth;
+    size_t texture_bytes, target_bytes, depth_bytes;
+    uint32_t texture_address, target_address, depth_address, batches, rejected;
     int active;
 } s_copy;
+
+/* Group exact register sets, not just a hash or the first failing register.
+ * Keep inactive stages too: the first snapshot contains all combiner state,
+ * and the bounded table makes overflow explicit instead of hiding new cases. */
+#define COMBINER_TRACE_MAX 64
+#define COMBINER_TRACE_WORDS 56
+static struct {
+    uint32_t words[COMBINER_TRACE_WORDS], first_draw;
+    uint64_t draws, rejected, inline_draws, invalid_positions, collapsed_xy;
+} s_combiner_trace[COMBINER_TRACE_MAX];
+static unsigned s_combiner_count;
+static uint64_t s_combiner_overflow;
+static int s_combiner_capture;
+static struct { const char *reason; uint64_t count; } s_texture_reasons[32];
+
+static void trace_combiner(const char *error)
+{
+    s_combiner_capture = 0;
+    if (error) {
+        for (unsigned i=0; i<32; ++i) {
+            if (!s_texture_reasons[i].reason) s_texture_reasons[i].reason=error;
+            if (!strcmp(s_texture_reasons[i].reason,error)) {
+                ++s_texture_reasons[i].count;
+                break;
+            }
+        }
+    }
+    static int enabled=-1;
+    if (enabled<0) enabled=getenv("RECOMP_COMBINER_TRACE")!=NULL;
+    if (!enabled) return;
+    static const unsigned single[]={0x1e60,0x1e70,0x1e74,0x1e78,0x288,0x28c,0x1e20,0x1e24};
+    static const unsigned arrays[]={0x260,0xa60,0xa80,0xaa0,0xac0,0x1e40};
+    uint32_t words[COMBINER_TRACE_WORDS];
+    unsigned n=0;
+    for (unsigned i=0; i<8; ++i) words[n++]=s_methods[single[i]/4];
+    for (unsigned i=0; i<6; ++i)
+        for (unsigned j=0; j<8; ++j) words[n++]=s_methods[arrays[i]/4+j];
+    unsigned id;
+    for (id=0; id<s_combiner_count; ++id)
+        if (!memcmp(words,s_combiner_trace[id].words,sizeof(words))) break;
+    if (id==COMBINER_TRACE_MAX) { ++s_combiner_overflow; return; }
+    if (id==s_combiner_count) {
+        ++s_combiner_count;
+        s_combiner_capture=1;
+        memcpy(s_combiner_trace[id].words,words,sizeof(words));
+        s_combiner_trace[id].first_draw=s_gpu.draws;
+        fprintf(stderr,"[COMBINER] new config=%u draw=%u result=%s\n",id,s_gpu.draws,error?error:"prepared");
+        for (unsigned i=0; i<8; ++i)
+            fprintf(stderr,"[COMBINER] config=%u %04X=%08X\n",id,single[i],words[i]);
+        for (unsigned i=0; i<6; ++i) {
+            fprintf(stderr,"[COMBINER] config=%u %04X..%04X:",id,arrays[i],arrays[i]+28);
+            for (unsigned j=0; j<8; ++j) fprintf(stderr," %08X",words[8+i*8+j]);
+            fputc('\n',stderr);
+        }
+    }
+    ++s_combiner_trace[id].draws;
+    if (error) ++s_combiner_trace[id].rejected;
+    if (s_gpu.inline_count) ++s_combiner_trace[id].inline_draws;
+    int invalid=0, collapsed=1;
+    for (unsigned i=0; i<s_gpu.idx_count; ++i) {
+        const float *p=s_outputs[i][0];
+        for (unsigned k=0; k<4; ++k) if (!isfinite(p[k])) invalid=1;
+        if (!(p[3]>0)) invalid=1;
+        if (p[0]!=s_outputs[0][0][0] || p[1]!=s_outputs[0][0][1]) collapsed=0;
+    }
+    s_combiner_trace[id].invalid_positions+=invalid;
+    s_combiner_trace[id].collapsed_xy+=collapsed;
+}
 
 static const char *prepare_texture_copy(void)
 {
     s_copy.active = 0;
+    s_copy.texture_address = s_copy.target_address = 0;
+    s_copy.depth_address=0; s_copy.depth=NULL; s_copy.depth_bytes=0;
     /* Preserve the original diagnostic flat-colour path when no fragment
      * state has been supplied. Once configured, unsupported states reject. */
     if (!s_method_seen[0x1e60/4] && !s_method_seen[0x1b0c/4]) return NULL;
@@ -141,22 +212,46 @@ static const char *prepare_texture_copy(void)
     uint32_t ramht, base, limit;
     memcpy(&ramht, regs + 0x2210, 4);
     NV2ATextureCopy *c = &s_copy.state;
-    s_copy.texture_bytes = (size_t)c->pitch*c->height;
+    s_copy.texture_bytes = nv2a_texture_copy_texture_bytes(c);
     s_copy.target_bytes = (size_t)c->target_pitch*(c->clip_y+c->clip_h);
-    if (!nv2a_dma_resolve(regs+0x700000, 0x100000, ramht, c->texture_handle, &base, &limit)
-            || (uint64_t)c->texture_offset+s_copy.texture_bytes > (uint64_t)limit+1
-            || (uint64_t)base+c->texture_offset > UINT32_MAX) return "texture DMA range";
-    s_copy.texture_address = base+c->texture_offset;
-    s_copy.texture = xbox_GpuMemoryRange(s_copy.texture_address, s_copy.texture_bytes);
+    /* An untextured program has no texture object to resolve, and the handle
+     * left in the method state belongs to whatever was bound last. Resolving
+     * it rejected every diffuse-only draw with "texture DMA range". */
+    if (c->untextured) {
+        s_copy.texture_address = 0;
+        s_copy.texture = NULL;
+    } else {
+        if (!nv2a_dma_resolve(regs+0x700000, 0x100000, ramht, c->texture_handle, &base, &limit)
+                || (uint64_t)c->texture_offset+s_copy.texture_bytes > (uint64_t)limit+1
+                || (uint64_t)base+c->texture_offset > UINT32_MAX) return "texture DMA range";
+        s_copy.texture_address = base+c->texture_offset;
+        s_copy.texture = xbox_GpuMemoryRange(s_copy.texture_address, s_copy.texture_bytes);
+    }
     if (!nv2a_dma_resolve(regs+0x700000, 0x100000, ramht, c->target_handle, &base, &limit)
             || (uint64_t)c->target_offset+s_copy.target_bytes > (uint64_t)limit+1
             || (uint64_t)base+c->target_offset > UINT32_MAX) return "target DMA range";
     s_copy.target_address = base+c->target_offset;
     s_copy.target = xbox_GpuMemoryRange(s_copy.target_address, s_copy.target_bytes);
-    if (!s_copy.texture || !s_copy.target) return "surface outside mapped RAM";
-    if ((uint64_t)s_copy.texture_address+s_copy.texture_bytes > s_copy.target_address
+    if ((!s_copy.texture && !c->untextured) || !s_copy.target)
+        return "surface outside mapped RAM";
+    if (!c->untextured
+            && (uint64_t)s_copy.texture_address+s_copy.texture_bytes > s_copy.target_address
             && (uint64_t)s_copy.target_address+s_copy.target_bytes > s_copy.texture_address)
         return "overlapping texture and target";
+    if (c->depth_test) {
+        s_copy.depth_bytes=(size_t)c->depth_pitch*(c->clip_y+c->clip_h);
+        if (!nv2a_dma_resolve(regs+0x700000,0x100000,ramht,c->depth_handle,&base,&limit)
+                || (uint64_t)c->depth_offset+s_copy.depth_bytes>(uint64_t)limit+1
+                || (uint64_t)base+c->depth_offset>UINT32_MAX) return "depth DMA range";
+        s_copy.depth_address=base+c->depth_offset;
+        s_copy.depth=xbox_GpuMemoryRange(s_copy.depth_address,s_copy.depth_bytes);
+        if (!s_copy.depth) return "depth outside mapped RAM";
+        if (((uint64_t)s_copy.depth_address+s_copy.depth_bytes>s_copy.target_address
+                    && (uint64_t)s_copy.target_address+s_copy.target_bytes>s_copy.depth_address)
+                || ((uint64_t)s_copy.depth_address+s_copy.depth_bytes>s_copy.texture_address
+                    && (uint64_t)s_copy.texture_address+s_copy.texture_bytes>s_copy.depth_address))
+            return "overlapping depth surface";
+    }
     s_copy.active = 1;
     ++s_copy.batches;
     return NULL;
@@ -419,6 +514,35 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+
+    /* Fixed Z24S8, linear single-sample surface. Resolve the actual DMA
+     * object and validate the entire mapped range before touching depth. */
+    if ((param&3) && (s_methods[0x208/4]&0xfff0)==0x120
+            && !(s_methods[0x290/4]&0x1000)) {
+        const uint8_t *regs=xbox_Nv2aRegisterMemory();
+        uint32_t ramht=0,base=0,limit=0,pitch=s_methods[0x20c/4]>>16;
+        uint32_t offset=s_methods[0x214/4];
+        uint32_t x0=s_methods[0x1d98/4]&0xffff, x1=(s_methods[0x1d98/4]>>16)+1;
+        uint32_t y0=s_methods[0x1d9c/4]&0xffff, y1=(s_methods[0x1d9c/4]>>16)+1;
+        if (x0<s_gpu.clip_x) x0=s_gpu.clip_x;
+        if (y0<s_gpu.clip_y) y0=s_gpu.clip_y;
+        if (x1>s_gpu.clip_x+s_gpu.clip_w) x1=s_gpu.clip_x+s_gpu.clip_w;
+        if (y1>s_gpu.clip_y+s_gpu.clip_h) y1=s_gpu.clip_y+s_gpu.clip_h;
+        size_t bytes=(size_t)pitch*y1;
+        if (regs) memcpy(&ramht,regs+0x2210,4);
+        if (regs && x0<x1 && y0<y1 && pitch>=(uint64_t)x1*4
+                && nv2a_dma_resolve(regs+0x700000,0x100000,ramht,s_methods[0x198/4],&base,&limit)
+                && (uint64_t)offset+bytes<=(uint64_t)limit+1
+                && (uint64_t)base+offset<=UINT32_MAX) {
+            uint8_t *z=xbox_GpuMemoryRange(base+offset,bytes);
+            uint32_t value=s_methods[0x1d8c/4];
+            if (z) for (y=y0;y<y1;++y) for (x=x0;x<x1;++x) {
+                uint8_t *p=z+(size_t)y*pitch+x*4;
+                if (param&2) p[0]=(uint8_t)value;
+                if (param&1) for (unsigned k=1;k<4;++k) p[k]=(uint8_t)(value>>(8*k));
+            }
+        }
+    }
 
     if (!(param & (NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G | NV097_CLEAR_SURFACE_B | NV097_CLEAR_SURFACE_A)))
         return;                            /* depth/stencil only */
@@ -839,6 +963,19 @@ static int prepare_vertices(void)
                     for (uint32_t k = 0; k < 32; ++k)
                         fprintf(stderr, " %02X", raw[k]);
                     fprintf(stderr, "\n");
+                    /* POSIX currently gives the CPU's physical window separate
+                     * storage. D3D resource locks can OR 0x80000000 into the
+                     * same offset; inspect that view before calling an array
+                     * unwritten. This is observation only, not a fetch override. */
+                    uint64_t physical=(uint64_t)s_gpu.attr[0].offset
+                            +(size_t)s_gpu.idx[i]*s_gpu.attr[0].stride+0x80000000u;
+                    const uint8_t *alias=physical<=UINT32_MAX
+                            ? xbox_GpuMemoryRange((uint32_t)physical,32) : NULL;
+                    if (!s_gpu.inline_count && alias) {
+                        fprintf(stderr,"  [VSH] physical-window bytes @%08X:",(uint32_t)physical);
+                        for (uint32_t k=0;k<32;++k) fprintf(stderr," %02X",alias[k]);
+                        fprintf(stderr,"\n");
+                    }
                 }
             }
             if ((s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()) && i < 3)
@@ -880,14 +1017,20 @@ static void capture_bytes(const char *extension, const void *data, size_t size)
 static void capture_draw(const char *error)
 {
     const char *prefix = getenv("RECOMP_DRAW_CAPTURE");
+    const char *sample=getenv("RECOMP_DRAW_SAMPLE");
     s_capture_selected = prefix && (s_gpu.draws == 1 || s_gpu.draws == 128 || s_gpu.draws == 2048
+            || s_combiner_capture || (sample && s_gpu.draws==strtoul(sample,NULL,0))
             || (error && s_copy.rejected < 2));
     if (!s_capture_selected) return;
     char path[768];
     snprintf(path, sizeof(path), "%s%06u.json", prefix, s_gpu.draws);
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return; }
-    fprintf(f, "{\n\"version\":1,\"draw\":%u,\"primitive\":%u,\"registers\":{", s_gpu.draws, s_gpu.prim);
+    fprintf(f, "{\n\"version\":1,\"draw\":%u,\"primitive\":%u,\"inline_words\":%u,\"reject_reason\":",
+            s_gpu.draws, s_gpu.prim, s_gpu.inline_count);
+    /* All rejection reasons are fixed renderer literals, not guest text. */
+    if (error) fprintf(f,"\"%s\"",error); else fputs("null",f);
+    fputs(",\"registers\":{",f);
     int comma = 0;
     for (unsigned i = 0; i < 0x2000/4; ++i) if (s_method_seen[i]) {
         fprintf(f, "%s\n\"%04x\":%u", comma ? "," : "", i*4, s_methods[i]); comma = 1;
@@ -909,12 +1052,13 @@ static void capture_draw(const char *error)
     const uint8_t *regs = xbox_Nv2aRegisterMemory();
     uint32_t ramht = 0;
     if (regs) memcpy(&ramht, regs + 0x2210, 4);
-    fprintf(f, "],\"ramht\":%u,\"copy_supported\":%s,\"texture_address\":%u,\"target_address\":%u}\n",
-            ramht, s_copy.active ? "true" : "false", s_copy.texture_address, s_copy.target_address);
+    fprintf(f, "],\"ramht\":%u,\"copy_supported\":%s,\"texture_address\":%u,\"target_address\":%u,\"depth_address\":%u}\n",
+            ramht, s_copy.active ? "true" : "false", s_copy.texture_address, s_copy.target_address,s_copy.depth_address);
     if (regs) capture_bytes("ramin", regs+0x700000, 0x100000);
     if (s_copy.active) {
         capture_bytes("texture", s_copy.texture, s_copy.texture_bytes);
         capture_bytes("before", s_copy.target, s_copy.target_bytes);
+        if (s_copy.depth) capture_bytes("depth-before",s_copy.depth,s_copy.depth_bytes);
     }
     if (fclose(f)) perror(path);
     else fprintf(stderr, "[DRAW] captured %s\n", path);
@@ -957,8 +1101,9 @@ static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
         raster_triangle(s_positions[a], s_positions[b], s_positions[c], s_colors[a]);
         return;
     }
-    if (nv2a_texture_copy_triangle(&s_copy.state, s_copy.texture, s_copy.texture_bytes,
-            s_copy.target, s_copy.target_bytes, s_outputs[a], s_outputs[b], s_outputs[c]))
+    if (nv2a_texture_copy_triangle_depth(&s_copy.state, s_copy.texture, s_copy.texture_bytes,
+            s_copy.target, s_copy.target_bytes, s_copy.depth,s_copy.depth_bytes,
+            s_outputs[a], s_outputs[b], s_outputs[c]))
         ++s_gpu.tris_drawn;
     else {
         if (++s_copy.rejected <= 4) fprintf(stderr, "[TEXTURE] rejected triangle geometry / bounds\n");
@@ -983,6 +1128,7 @@ static void raster_batch(void)
         return;
     }
     const char *copy_error = prepare_texture_copy();
+    trace_combiner(copy_error);
     capture_draw(copy_error);
     if (copy_error) {
         if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s\n", s_gpu.draws, copy_error);
@@ -1009,7 +1155,7 @@ static void raster_batch(void)
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            raster_indices(i, i+1, i+2);
+            raster_indices(i+(i&1), i+1-(i&1), i+2);
         break;
     case NV_PRIM_TRIANGLE_FAN:
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
@@ -1031,6 +1177,7 @@ static void raster_batch(void)
         break;                             /* points and lines: not yet */
     }
     if (s_copy.active) capture_bytes("after", s_copy.target, s_copy.target_bytes);
+    if (s_copy.active && s_copy.depth) capture_bytes("depth-after",s_copy.depth,s_copy.depth_bytes);
     /* Report-time snapshots may interrupt the clear or raster loops. Capture
      * a few completed batches when inspecting the actual rendered result. */
     if (s_gpu.tris_drawn != drawn_before) {
@@ -1063,18 +1210,24 @@ static void draw_primitive(void)
 
     /* How many batches carry coordinates at all, and what range they span.
      * A pipeline that decodes perfectly and draws nothing is indistinguishable
-     * from one that never ran, unless the vertices themselves are measured. */
+     * from one that never ran, unless the vertices themselves are measured.
+     * Include every input vertex, not only the first (often the same corner
+     * of a full-screen triangle). This is explicitly a pre-shader range. */
     {
         float p[4];
-        if (fetch_vertex(0, s_gpu.idx[0], p)) {
+        int nonzero=0;
+        for (i=0; i<s_gpu.idx_count; ++i) if (fetch_vertex(0, s_gpu.idx[i], p)) {
             if (p[0] != 0.0f || p[1] != 0.0f || p[2] != 0.0f) {
-                s_gpu.nonzero_draws++;
+                nonzero=1;
+            }
+            if (isfinite(p[0]) && isfinite(p[1])) {
                 if (p[0] < s_gpu.min_x) s_gpu.min_x = p[0];
                 if (p[0] > s_gpu.max_x) s_gpu.max_x = p[0];
                 if (p[1] < s_gpu.min_y) s_gpu.min_y = p[1];
                 if (p[1] > s_gpu.max_y) s_gpu.max_y = p[1];
             }
         }
+        s_gpu.nonzero_draws+=nonzero;
     }
 
     raster_batch();
@@ -1342,12 +1495,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->stride = (param >> 8)  & 0xFF;
         } else if (method >= NV097_SET_VIEWPORT_OFFSET
                 && method < NV097_SET_VIEWPORT_OFFSET + 16) {
-            memcpy(&s_gpu.vp_offset[(method - NV097_SET_VIEWPORT_OFFSET) / 4],
+            unsigned k = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
+            memcpy(&s_gpu.vp_offset[k], &param, sizeof(float));
+            memcpy(&s_vsh.constants[NV_IGRAPH_XF_XFCTX_VPOFF][k],
                    &param, sizeof(float));
             s_gpu.vp_seen = 1;
         } else if (method >= NV097_SET_VIEWPORT_SCALE
                 && method < NV097_SET_VIEWPORT_SCALE + 16) {
-            memcpy(&s_gpu.vp_scale[(method - NV097_SET_VIEWPORT_SCALE) / 4],
+            unsigned k = (method - NV097_SET_VIEWPORT_SCALE) / 4;
+            memcpy(&s_gpu.vp_scale[k], &param, sizeof(float));
+            memcpy(&s_vsh.constants[NV_IGRAPH_XF_XFCTX_VPSCL][k],
                    &param, sizeof(float));
             s_gpu.vp_seen = 1;
         } else {
@@ -1509,6 +1666,18 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+/* Read one vertex-program constant.
+ *
+ * Exists for the regression that covers the viewport mirror below: the fault
+ * was invisible from outside because the constant file is private, and the
+ * only symptom was geometry that transformed to a point. */
+int nv2a_pb_exec_vsh_constant(unsigned index, float out[4])
+{
+    if (index >= NV2A_VS_MAX_CONSTANTS || !out) return 0;
+    memcpy(out, s_vsh.constants[index], sizeof(float) * 4);
+    return 1;
+}
+
 void nv2a_pb_exec_report(void)
 {
     if (s_vsh_trace.enabled) {
@@ -1525,12 +1694,76 @@ void nv2a_pb_exec_report(void)
         /* Which program slots the title ever selected. A final start of 0 is
          * only the last selection; the bitmaps say whether there was ever
          * another one to miss. */
+        /* The constant file itself.
+         *
+         * "constants=11,076,944 written, none dropped" says they arrive; it
+         * does not say what is in them. JSRF's 3D geometry transforms to
+         * oPos=(0 0 0 W) with a plausible W, which is what a zero position row
+         * dotted against a good W row looks like -- so print the rows rather
+         * than reasoning about the counter. Delivery matches xemu
+         * (pgraph.c: slot%4 component, CONST_LD_PTR auto-increment), so if the
+         * matrix is present and correct the fault is downstream of here. */
+        {
+            /* The decoded program, so the constants above can be read
+             * against the instructions that consume them. oPos is output 0
+             * and R12 aliases it, so a write to either is a position write. */
+            static const char *macn[] = {"nop","mov","mul","add","mad","dp3",
+                "dph","dp4","dst","min","max","slt","sge","arl"};
+            static const char *ilun[] = {"nop","mov","rcp","rcc","rsq","exp",
+                "log","lit"};
+            static const char *rt[] = {"temp","input","const"};
+            fprintf(stderr, "[VSH-PROG] length=%d valid=%d final=%d\n",
+                    s_vsh.decoded.length, s_vsh.decoded.valid,
+                    s_vsh.decoded.has_final);
+            for (int i = 0; i < s_vsh.decoded.length; ++i) {
+                const NV2AVshInstruction *q = &s_vsh.decoded.insns[i];
+                fprintf(stderr, "[VSH-PROG] %2d %-3s", i,
+                        q->mac_op < 14 ? macn[q->mac_op] : "?");
+                fprintf(stderr, " dst(temp=%d out=%d wm=%X om=%X)",
+                        q->mac_dst.temp_reg, (int)q->mac_dst.output_reg,
+                        q->mac_dst.write_mask, q->mac_dst.output_mask);
+                for (int j = 0; j < 3; ++j)
+                    fprintf(stderr, " %s%d", rt[q->mac_src[j].reg_type & 3],
+                            q->mac_src[j].reg_index);
+                fprintf(stderr, " | %-3s dst(temp=%d out=%d wm=%X om=%X) %s%d\n",
+                        q->ilu_op < 8 ? ilun[q->ilu_op] : "?",
+                        q->ilu_dst.temp_reg, (int)q->ilu_dst.output_reg,
+                        q->ilu_dst.write_mask, q->ilu_dst.output_mask,
+                        rt[q->ilu_src.reg_type & 3], q->ilu_src.reg_index);
+            }
+            unsigned nonzero = 0;
+            for (unsigned i = 0; i < NV2A_VS_MAX_CONSTANTS; ++i)
+                for (unsigned k = 0; k < 4; ++k)
+                    if (s_vsh.constants[i][k] != 0.0f) { ++nonzero; break; }
+            fprintf(stderr, "[VSH-CONST] %u of %u constants non-zero\n",
+                    nonzero, (unsigned)NV2A_VS_MAX_CONSTANTS);
+            for (unsigned i = 0; i < NV2A_VS_MAX_CONSTANTS; ++i) {
+                if (!s_vsh.constants[i][0] && !s_vsh.constants[i][1]
+                        && !s_vsh.constants[i][2] && !s_vsh.constants[i][3])
+                    continue;
+                fprintf(stderr, "[VSH-CONST] c[%u] = %g %g %g %g\n", i,
+                        s_vsh.constants[i][0], s_vsh.constants[i][1],
+                        s_vsh.constants[i][2], s_vsh.constants[i][3]);
+            }
+        }
         fprintf(stderr, "[VSH-TRACE] distinct START slots 0x%08X, LOAD slots"
                         " 0x%08X, LOAD >= 32: %llu\n",
                 s_vsh_trace.start_values, s_vsh_trace.load_values,
                 (unsigned long long)s_vsh_trace.load_high);
     }
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
+    for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)
+        fprintf(stderr,"[TEXTURE]   %llu  %s\n",(unsigned long long)s_texture_reasons[i].count,s_texture_reasons[i].reason);
+    if (s_combiner_count) {
+        fprintf(stderr,"[COMBINER] distinct=%u overflow-draws=%llu\n",s_combiner_count,(unsigned long long)s_combiner_overflow);
+        for (unsigned i=0; i<s_combiner_count; ++i)
+            fprintf(stderr,"[COMBINER] config=%u first-draw=%u draws=%llu rejected=%llu inline=%llu invalid-position=%llu collapsed-xy=%llu\n",i,
+                    s_combiner_trace[i].first_draw,(unsigned long long)s_combiner_trace[i].draws,
+                    (unsigned long long)s_combiner_trace[i].rejected,
+                    (unsigned long long)s_combiner_trace[i].inline_draws,
+                    (unsigned long long)s_combiner_trace[i].invalid_positions,
+                    (unsigned long long)s_combiner_trace[i].collapsed_xy);
+    }
     fprintf(stderr, "[VSH] executed batches=%u rejected=%u mode=%u start=%u slots=%d\n",
             s_vsh.batches, s_vsh.rejected, s_vsh.mode, s_vsh.start, s_vsh.decoded.length);
     for (size_t i = 0; i < sizeof s_vsh_reject / sizeof s_vsh_reject[0]; ++i) {
@@ -1558,7 +1791,7 @@ void nv2a_pb_exec_report(void)
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
             s_gpu.unhandled_total, s_unhandled_count);
     fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
-                    " x %.1f..%.1f  y %.1f..%.1f\n",
+                    " input x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of

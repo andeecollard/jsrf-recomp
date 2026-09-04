@@ -1,15 +1,13 @@
 /*
  * Read-only survey of the pushbuffer a title submits.
  *
- * The title builds NV2A commands in guest RAM and advances DMA_PUT; nothing
- * here executes them, so the framebuffer stays black however far the game
- * gets. Before any of that can be made to draw, the question is what it
- * actually asks for -- which methods, on which object classes, how many of
- * them -- because that is the difference between "the existing PGRAPH
- * translator nearly covers this" and "this needs a real one".
+ * The title builds NV2A commands in guest RAM and advances DMA_PUT. This
+ * survey counts methods and object classes; its inventory is distinct from
+ * the validated streaming pusher's execution of complete submitted packets.
  *
- * Purely a reader: it walks the buffer and counts, and never writes to guest
- * memory or to the GPU state. Enabled with RECOMP_PB_SCAN.
+ * RECOMP_PB_SCAN surveys only. Legacy standalone callers may also execute
+ * with RECOMP_PB_EXEC; a harness with its own validated pusher must select
+ * external execution ownership before starting the scanner thread.
  *
  * Pushbuffer encoding (NV20/NV2A), one dword per command header:
  *   (w & 0xE0030003) == 0x00000000  increasing methods
@@ -25,6 +23,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nv2a_pb_scan.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -44,6 +43,12 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
+static int s_external_executor;
+
+void nv2a_pb_scan_set_external_executor(int external)
+{
+    s_external_executor=external!=0;
+}
 
 static void note(uint32_t subch, uint32_t method)
 {
@@ -129,7 +134,7 @@ void nv2a_pb_scan_report(void)
 {
     int i;
 
-    if (s_exec_enabled > 0)
+    if (s_exec_enabled > 0 && !s_external_executor)
         nv2a_pb_exec_report();
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -152,7 +157,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+    if (!(getenv("RECOMP_PB_SCAN") || (s_exec_enabled && !s_external_executor)) || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
@@ -180,7 +185,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
-                if (s_exec_enabled)
+                if (s_exec_enabled && !s_external_executor)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
                 va += 4;
