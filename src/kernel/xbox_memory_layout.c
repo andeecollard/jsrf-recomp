@@ -82,7 +82,6 @@ void xbox_SetTotalRam(size_t bytes)
     g_xbox_total_ram = bytes;
 }
 
-
 void xbox_SetMapSize(size_t bytes)
 {
     g_xbox_map_size = bytes;
@@ -103,6 +102,7 @@ static void *g_tiled_view = NULL;
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+static void *g_physical_heap_view = NULL;
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -1290,6 +1290,7 @@ ptrdiff_t g_xbox_mem_offset = 0;
  *
  * Zero until the layout is initialised, which the macro treats as "allow" so
  * nothing breaks before the title is loaded. */
+uint32_t g_xbox_low_base = XBOX_LOW_BASE_DEFAULT;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
@@ -1813,6 +1814,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         if (num_sections > 64) num_sections = 64;  /* sanity cap */
 
+        uint32_t image_hi = 0;
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
 
@@ -1856,6 +1858,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     g_xbox_code_hi = sec_va + sec_vsize;
             }
 
+            /* Every section, not only the executable ones: the low block
+             * has to clear .data and BSS too, and g_xbox_code_hi
+             * deliberately excludes them. */
+            if (sec_va + sec_vsize > image_hi)
+                image_hi = sec_va + sec_vsize;
+
             sections_loaded++;
             total_bytes += copy_size;
 
@@ -1866,6 +1874,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
+
+        /* Put the fixed low block just above the image instead of at a base
+         * chosen to clear any XBE. Everything below the heap is memory the
+         * title cannot allocate, so the gap between the two was charged to the
+         * arena: 4.5 MB of it for JSRF. 64 KB granularity because the block
+         * holds page-aligned sub-regions at fixed offsets from this base. */
+        if (image_hi > XBOX_BASE_ADDRESS) {
+            uint32_t base = (image_hi + 0xFFFFu) & ~0xFFFFu;
+            if (base < XBOX_LOW_BASE_DEFAULT)
+                g_xbox_low_base = base;
+            else
+                g_xbox_low_base = base;   /* a larger image pushes it up */
+            fprintf(stderr, "  Low block: 0x%08X (image ends 0x%08X);"
+                            " %u KB returned to the heap\n",
+                    g_xbox_low_base, image_hi,
+                    (unsigned)((XBOX_LOW_BASE_DEFAULT > g_xbox_low_base)
+                               ? (XBOX_LOW_BASE_DEFAULT - g_xbox_low_base) / 1024u
+                               : 0u));
+        }
     }
 
     /*
@@ -1977,7 +2004,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * only worked while page zero was mapped. Pointing at real zeroed
          * memory says the same thing to the title and survives that page being
          * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
+        #define FAKE_PRCB_VA (g_xbox_low_base + 0x61000u)  /* zeroed KPCR Prcb stand-in */
         memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
         MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
         #undef FAKE_PRCB_VA
@@ -2021,8 +2048,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Every guest thread therefore shares LastError. Give this a per-thread
          * allocation when a title is observed to care.
          */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
+        #define FAKE_TLS_BLOCK_VA  (g_xbox_low_base + 0x70000u)  /* image TLS data   */
+        #define FAKE_TLS_THREAD_VA (g_xbox_low_base + 0x70200u)  /* slot 0 target    */
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
@@ -2074,8 +2101,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Deliberately NOT a view of the 64 MB RAM mapping. On hardware this window
      * aliases physical RAM, but we load the XBE image into the low addresses of
      * that same region, so aliasing would put a title's pinned pools on top of
-     * its own code. Separate storage costs an extra mapping and behaves
-     * correctly; nothing here depends on the aliasing.
+     * its own code. Separate storage preserves that pinned-pool layout.
+     * POSIX titles using low-heap unpinned GPU allocations
+     * must explicitly enable the shared heap view after layout initialisation:
+     * D3D resource locks add 0x80000000 to offsets in that heap.
      *
      * Reserved before the kernel page below, which lives inside it.
      */
@@ -2439,6 +2468,40 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     return TRUE;
 }
 
+BOOL xbox_EnablePhysicalHeapAlias(void)
+{
+#if defined(_WIN32)
+    /* The Windows allocator has a different, high-window backing contract. */
+    return FALSE;
+#else
+    if (g_physical_heap_view) return TRUE;
+    /* MapViewOfFileEx uses MAP_FIXED on POSIX. Replace only pages inside the
+     * contiguous window this layout already owns, never an unchecked address.
+     * Expanded layouts and pinned-pool overlap need a full physical allocator;
+     * this opt-in does not claim to solve those contracts. */
+    uintptr_t expected=(uintptr_t)g_memory_offset+XBOX_CONTIG_BASE;
+    uint32_t start=XBOX_HEAP_BASE, end=XBOX_HEAP_TOP;
+    if (!g_mapping_handle || !g_memory_base || (uintptr_t)g_contig_memory!=expected
+            || end<=start || end>XBOX_CONTIG_SIZE || end>g_memory_size
+            || (start&0xffffu) || (end&0xffffu)) {
+        fprintf(stderr,"  Physical heap alias: incompatible or uninitialised layout\n");
+        return FALSE;
+    }
+    void *target=(void *)(expected+start);
+    g_physical_heap_view=MapViewOfFileEx(g_mapping_handle,FILE_MAP_ALL_ACCESS,
+            0,start,(size_t)end-start,target);
+    if (g_physical_heap_view!=target) {
+        if (g_physical_heap_view) UnmapViewOfFile(g_physical_heap_view);
+        g_physical_heap_view=NULL;
+        fprintf(stderr,"  Physical heap alias: mapping failed (error %lu)\n",(unsigned long)GetLastError());
+        return FALSE;
+    }
+    fprintf(stderr,"  Physical heap alias: 0x%08X..0x%08X shares low RAM\n",
+            XBOX_CONTIG_BASE+start,XBOX_CONTIG_BASE+end);
+    return TRUE;
+#endif
+}
+
 /*
  * Make every RAM mirror read-only, for finding writes that reach low memory
  * through an alias.
@@ -2479,6 +2542,10 @@ void xbox_MemoryLayoutShutdown(void)
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_physical_heap_view) {
+        UnmapViewOfFile(g_physical_heap_view);
+        g_physical_heap_view=NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
@@ -2602,7 +2669,10 @@ BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+/* Zero until first use: XBOX_HEAP_BASE follows g_xbox_low_base, which
+ * xbox_MemoryLayoutInit derives from the loaded image, so it is no longer a
+ * compile-time constant. */
+static uint32_t g_heap_next = 0;
 
 static int g_heap_alloc_count = 0;
 static int g_heap_reuse_count = 0;
@@ -2641,6 +2711,19 @@ static int g_heap_block_count = 0;
  * bridge runs, so a heap block records the export and the guest return address
  * that produced it. Zero means "the runtime itself", not a guest call. */
 static uint32_t g_heap_owner_ord = 0;
+
+/* Allocations and frees per kernel export.
+ *
+ * "The heap is full" does not distinguish a title whose working set is genuinely
+ * that large from one whose frees are not reaching this allocator. A per-export
+ * tally does: an export with thousands of allocations and no frees is a missing
+ * release path, and one whose counts track each other is a title using what it
+ * asked for. Indexed by ordinal; 0 is the runtime itself. */
+#define XBOX_HEAP_ORD_MAX 512
+static uint32_t g_heap_ord_allocs[XBOX_HEAP_ORD_MAX];
+static uint32_t g_heap_ord_frees[XBOX_HEAP_ORD_MAX];
+static uint64_t g_heap_ord_alloc_bytes[XBOX_HEAP_ORD_MAX];
+static uint64_t g_heap_ord_free_bytes[XBOX_HEAP_ORD_MAX];
 static uint32_t g_heap_owner_ra  = 0;
 
 /* How many individual heap events to narrate. The default is enough to see
@@ -2703,7 +2786,10 @@ static uint32_t heap_canonical_va(uint32_t va)
 
 static int g_thread_stacks_used = 0;
 
-uint32_t xbox_AllocThreadStack(void)
+#define XBOX_THREAD_STACK_SLOTS 64
+static struct { uint32_t top, bytes; } g_thread_stack_sizes[XBOX_THREAD_STACK_SLOTS];
+
+uint32_t xbox_AllocThreadStack(uint32_t bytes)
 {
     uint32_t base;
 
@@ -2725,13 +2811,37 @@ uint32_t xbox_AllocThreadStack(void)
      * taking slices from it is correct for any image size instead of only
      * for small ones.
      */
-    base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
+    /* Honour the size the title asked for.
+     *
+     * PsCreateSystemThreadEx takes KernelStackSize and JSRF passes 65,536 for
+     * every worker. Handing each one the fixed 512 KB slice instead cost
+     * 458,752 bytes per thread -- 1.75 MB across its four workers, on an arena
+     * the stage loader exhausts. Hardware gives a title what it asks for.
+     *
+     * Clamped rather than trusted: zero means "the caller did not say", and a
+     * guest stack still has to hold recompiled frames, so keep a floor. The
+     * measured main-thread high-water is 3 KB. */
+    if (!bytes) bytes = XBOX_THREAD_STACK_SIZE;
+    if (bytes < XBOX_THREAD_STACK_MIN) bytes = XBOX_THREAD_STACK_MIN;
+    if (bytes > XBOX_THREAD_STACK_SIZE) bytes = XBOX_THREAD_STACK_SIZE;
+    bytes = (bytes + 0xFFFu) & ~0xFFFu;
+
+    base = xbox_HeapAlloc(bytes, 4096);
     if (!base)
         return 0;
     g_thread_stacks_used++;
 
+    /* Remember the size so the free path can find the block again; the API
+     * takes only the top, and callers should not have to do the arithmetic. */
+    for (unsigned i = 0; i < XBOX_THREAD_STACK_SLOTS; ++i) {
+        if (g_thread_stack_sizes[i].top) continue;
+        g_thread_stack_sizes[i].top = base + bytes - 16;
+        g_thread_stack_sizes[i].bytes = bytes;
+        break;
+    }
+
     /* Top of the slice, 16-byte aligned, growing down. */
-    return base + XBOX_THREAD_STACK_SIZE - 16;
+    return base + bytes - 16;
 }
 
 void xbox_SetupCurrentThreadTib(uint32_t tib_va, uint32_t tls_context_va,
@@ -2779,9 +2889,16 @@ void xbox_SetupCurrentThreadTib(uint32_t tib_va, uint32_t tls_context_va,
  */
 void xbox_FreeThreadStack(uint32_t stack_top)
 {
+    uint32_t bytes = XBOX_THREAD_STACK_SIZE;
     if (!stack_top)
         return;
-    xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
+    for (unsigned i = 0; i < XBOX_THREAD_STACK_SLOTS; ++i) {
+        if (g_thread_stack_sizes[i].top != stack_top) continue;
+        bytes = g_thread_stack_sizes[i].bytes;
+        g_thread_stack_sizes[i].top = 0;
+        break;
+    }
+    xbox_HeapFree(stack_top + 16 - bytes);
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
 }
@@ -2811,7 +2928,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     if (alignment < 4096) alignment = 4096;
 #if !defined(_WIN32)
     /* Preserve the POSIX GPU backing contract: command offsets address low
-     * guest RAM, while the high contiguous window has separate storage.
+     * guest RAM. The high contiguous window is separate unless the caller
+     * explicitly enables the physical heap alias (as the JSRF harness does).
      * Returning 0x80084000 here made JSRF's raster clear write to 0x00084000
      * (live guest code) instead of its framebuffer. Keep unpinned buffers in
      * the shared guest heap until GPU physical-address translation is added.
@@ -2851,7 +2969,9 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  */
 void xbox_HeapReport(const char *why)
 {
-    struct heap_owner { uint32_t ord; uint32_t ra; uint32_t n; uint64_t bytes; };
+    if (!g_heap_next) g_heap_next = XBOX_HEAP_BASE;
+    struct heap_owner { uint32_t ord; uint32_t ra; uint32_t n;
+                        uint64_t bytes; uint64_t slack; };
     struct heap_owner own[512];
     int own_used = 0;
     uint64_t live_bytes = 0, free_bytes = 0, retained = 0;
@@ -2887,11 +3007,14 @@ void xbox_HeapReport(const char *why)
             own[own_used].ra  = g_heap_blocks[i].ra;
             own[own_used].n = 0;
             own[own_used].bytes = 0;
+            own[own_used].slack = 0;
             own_used++;
         }
         if (j < own_used) {
             own[j].n++;
             own[j].bytes += sz;
+            if (sz > g_heap_blocks[i].req)
+                own[j].slack += sz - g_heap_blocks[i].req;
         }
 
         /* Keep the 16 largest live blocks, insertion-sorted. */
@@ -2940,20 +3063,70 @@ void xbox_HeapReport(const char *why)
             struct heap_owner t = own[i]; own[i] = own[best]; own[best] = t;
         }
         if (own[i].bytes < 64 * 1024) break;
-        fprintf(stderr, "  [HEAP]   ordinal %-4u ra=0x%08X : %u blocks, %llu bytes\n",
+        /* Slack is what the allocator kept beyond the request: rounding a
+         * reused block up to a whole page charges a 16-byte pool request
+         * 4096 bytes. Printed per owner because "the heap is full" and
+         * "the heap is full of padding" have different fixes. */
+        fprintf(stderr, "  [HEAP]   ordinal %-4u ra=0x%08X : %u blocks,"
+                        " %llu bytes (%llu slack)\n",
                 own[i].ord, own[i].ra, own[i].n,
-                (unsigned long long)own[i].bytes);
+                (unsigned long long)own[i].bytes,
+                (unsigned long long)own[i].slack);
     }
     for (i = 0; i < top_n; i++) {
         fprintf(stderr, "  [HEAP]   live 0x%08X size %-9u ordinal %-4u ra=0x%08X\n",
                 top_addr[i], top_size[i], top_ord[i], top_ra[i]);
     }
+    for (i = 0; i < XBOX_HEAP_ORD_MAX; i++) {
+        if (!g_heap_ord_allocs[i] && !g_heap_ord_frees[i]) continue;
+        fprintf(stderr, "  [HEAP]   export %-4d %u allocs / %llu bytes,"
+                        " %u frees / %llu bytes\n",
+                i, g_heap_ord_allocs[i],
+                (unsigned long long)g_heap_ord_alloc_bytes[i],
+                g_heap_ord_frees[i],
+                (unsigned long long)g_heap_ord_free_bytes[i]);
+    }
     fflush(stderr);
+}
+
+/* Fold the untouched tail of the arena into the free block that ends at it.
+ *
+ * The bump frontier and the free list describe the same arena but were only
+ * ever consulted separately, so a free block sitting immediately below the
+ * frontier could never combine with the space above it. JSRF failed an 827,904
+ * byte request holding 940,208 bytes of free blocks and 219,824 bytes of
+ * untouched arena, no single piece of which was large enough -- while the two
+ * largest pieces were adjacent.
+ *
+ * After this runs the frontier is at the top and every free byte is described
+ * by the block table, which is also what makes the ordinary coalescing in
+ * xbox_HeapFree able to reach it. Costs one backwards scan to the last entry
+ * that still describes a block; the table is address-ordered by construction.
+ */
+static void heap_absorb_frontier(void)
+{
+    int i;
+
+    if (g_heap_next >= XBOX_HEAP_TOP)
+        return;
+    for (i = g_heap_block_count - 1; i >= 0; i--) {
+        if (!g_heap_blocks[i].size)
+            continue;                       /* merged away, keep looking */
+        if (!g_heap_blocks[i].free)
+            return;                         /* live at the frontier */
+        if (g_heap_blocks[i].addr + g_heap_blocks[i].size != g_heap_next)
+            return;                         /* a gap, not the frontier block */
+        g_heap_blocks[i].size = XBOX_HEAP_TOP - g_heap_blocks[i].addr;
+        g_heap_next = XBOX_HEAP_TOP;
+        return;
+    }
 }
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
+
+    if (!g_heap_next) g_heap_next = XBOX_HEAP_BASE;
 
     if (alignment < 4) alignment = 4;
 
@@ -2965,19 +3138,63 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * minimum of 4096 bytes so each allocation gets its own memory. */
     if (size < 16) size = 16;
 
+    heap_absorb_frontier();
+
     /* Reuse a freed block first. Without this the heap only ever grows: Halo's
      * debug build allocates and releases heavily through init, exhausted all
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
      * global_d3d_device, so the rasterizer asserts and startup stops. */
     for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t spare, capacity, kept;
+        uint32_t capacity, base, aligned, lead, avail, kept, spare;
 
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
+        if (!g_heap_blocks[i].free) {
             continue;
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
+
+        /* Reach an aligned start inside the block instead of demanding that
+         * the block already begin on one.
+         *
+         * Rejecting a misaligned free block was the reason the split boundary
+         * had to be page-rounded: a remainder starting at an arbitrary offset
+         * could never serve a 4 KB-aligned caller, so the heap filled with
+         * free memory nothing could allocate. Carving the lead off as its own
+         * free block fixes that at the source, and once it is fixed the
+         * trailing boundary only has to respect this caller's alignment.
+         *
+         * That matters because the callers are not all page-aligned:
+         * ExAllocatePool and ExAllocatePoolWithTag ask for 16. Charging those
+         * a whole page each cost JSRF 2,725,856 bytes across 706 live pool
+         * blocks holding 3,126,516 -- 87% padding -- and 4,581,336 bytes of
+         * slack overall, on a 48.5 MB arena, which is what turned a 1,092,096
+         * byte request into "out of memory" and the title's disc-error dialog.
+         */
+        base    = g_heap_blocks[i].addr;
+        aligned = (base + alignment - 1) & ~(uint32_t)(alignment - 1);
+        if (aligned < base) continue;                 /* alignment overflow */
+        lead    = aligned - base;
+        capacity = g_heap_blocks[i].size;
+        if (capacity < lead) continue;
+        avail = capacity - lead;
+        if (avail < size) continue;
+
+        /* Both splits insert, and the table is address-ordered by
+         * construction (bump order) because coalescing depends on it, so make
+         * room for the worst case before touching anything. */
+        if (lead && g_heap_block_count + 2 > XBOX_HEAP_MAX_BLOCKS) {
+            continue;
+        }
+
+        /* Leading fragment: stays free, keeps its original address. */
+        if (lead) {
+            memmove(&g_heap_blocks[i + 1], &g_heap_blocks[i],
+                    (size_t)(g_heap_block_count - i) * sizeof g_heap_blocks[0]);
+            g_heap_block_count++;
+            g_heap_blocks[i].size = lead;             /* the lead, still free */
+            i++;                                      /* the request's block */
+            g_heap_blocks[i].addr = aligned;
+            g_heap_blocks[i].size = avail;
+            capacity = avail;
         }
 
         /* Split, rather than handing the whole block over.
@@ -2989,22 +3206,10 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
          * that churns small allocations against a heap whose free blocks came
          * from big ones loses the difference every time.
          *
-         * The table is address-ordered by construction (bump order), and
-         * coalescing depends on that, so the remainder is inserted at i+1
-         * rather than appended. XBOX_HEAP_SPLIT_MIN keeps the table from
-         * filling with slivers -- below it the padding stays with the block,
-         * which is what an allocator's minimum granularity is for. */
-        capacity = g_heap_blocks[i].size;
-        /* The remainder starts on a page boundary, not at the end of the
-         * request. A split at an arbitrary offset leaves a free block at an
-         * arbitrary address, and every caller here asks for at least 4 KB
-         * alignment -- so those remainders are unusable, and the heap fills
-         * with free memory nothing can allocate. That is what exhaustion
-         * looked like: 13.9 MB free, a 2.8 MB largest free block, and a
-         * 349 KB request failing anyway. The bytes between the request and
-         * the boundary stay with the block, which is what allocation
-         * granularity means. */
-        kept = (size + XBOX_HEAP_PAGE - 1) & ~(uint32_t)(XBOX_HEAP_PAGE - 1);
+         * XBOX_HEAP_SPLIT_MIN keeps the table from filling with slivers --
+         * below it the padding stays with the block, which is what an
+         * allocator's minimum granularity is for. */
+        kept = (size + alignment - 1) & ~(uint32_t)(alignment - 1);
         if (kept < size) kept = capacity;         /* overflow: do not split */
         spare = capacity > kept ? capacity - kept : 0;
         if (spare >= XBOX_HEAP_SPLIT_MIN &&
@@ -3035,17 +3240,34 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
                     capacity, alignment,
                     g_heap_owner_ord, g_heap_owner_ra);
         result = g_heap_blocks[i].addr;
+        if (g_heap_owner_ord < XBOX_HEAP_ORD_MAX) {
+            g_heap_ord_allocs[g_heap_owner_ord]++;
+            g_heap_ord_alloc_bytes[g_heap_owner_ord] += size;
+        }
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
         return result;
     }
 
-    /* Align the next pointer */
+    /* Align the next pointer.
+     *
+     * The bytes skipped to reach the boundary stay with the allocation below
+     * them and are deliberately not recycled. Handing them out was tried and
+     * reverted: NtAllocateVirtualMemory and MmAllocateContiguousMemoryEx are
+     * page-granular on hardware, so a title that asks for 5,000 bytes owns the
+     * whole 8,192-byte span and writes into it. Reclaiming the tail put a
+     * 16-byte pool block inside a page the title was still using, and JSRF
+     * stopped dead at IoCreateDevice with no draws and no ADX tick. */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+        /* Name the caller. "Out of memory" without it says how much was left
+         * and nothing about which export asked, so the failing request could
+         * not be matched against the owner breakdown printed just below. */
+        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, align %u,"
+                        " used %u/%u, ordinal %u ra=0x%08X)\n",
+                size, alignment, g_heap_next - XBOX_HEAP_BASE,
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE),
+                g_heap_owner_ord, g_heap_owner_ra);
         /* Who ate the heap? The size histogram this used to print named the
          * repeated request size and nothing else -- not whether those blocks
          * were still live, and not who asked for them. The full report does
@@ -3076,6 +3298,10 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         g_heap_block_count++;
     }
 
+    if (g_heap_owner_ord < XBOX_HEAP_ORD_MAX) {
+        g_heap_ord_allocs[g_heap_owner_ord]++;
+        g_heap_ord_alloc_bytes[g_heap_owner_ord] += size;
+    }
     g_heap_alloc_count++;
     /* Rate-limited: a debug title makes thousands of these and the log is a
      * diagnostic, not a transaction record. */
@@ -3226,6 +3452,10 @@ void xbox_HeapFree(uint32_t xbox_va)
                             "ra=0x%08X\n",
                     frees, xbox_va, g_heap_blocks[i].size,
                     g_heap_owner_ord, g_heap_owner_ra);
+        if (g_heap_owner_ord < XBOX_HEAP_ORD_MAX) {
+            g_heap_ord_frees[g_heap_owner_ord]++;
+            g_heap_ord_free_bytes[g_heap_owner_ord] += g_heap_blocks[i].size;
+        }
         g_heap_blocks[i].free = 1;
         g_heap_blocks[i].req = 0;
         g_heap_blocks[i].ord = 0;

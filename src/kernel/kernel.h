@@ -76,6 +76,12 @@ typedef LONG KPRIORITY;
 #ifndef STATUS_NOT_IMPLEMENTED
 #define STATUS_NOT_IMPLEMENTED          ((NTSTATUS)0xC0000002L)
 #endif
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS       ((NTSTATUS)0xC0000003L)
+#endif
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL         ((NTSTATUS)0xC0000023L)
+#endif
 #ifndef STATUS_INVALID_HANDLE
 #define STATUS_INVALID_HANDLE           ((NTSTATUS)0xC0000008L)
 #endif
@@ -661,6 +667,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
 
 NTSTATUS __stdcall xbox_NtFsControlFile(

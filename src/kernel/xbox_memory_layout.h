@@ -190,6 +190,13 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+
+/** Opt in to a shared CPU physical view of the low guest heap on POSIX.
+ * Call after MemoryLayoutInit and before running guest code. Only the heap
+ * above XBOX_HEAP_BASE is aliased; low pinned pools / the fake kernel retain
+ * separate storage. Requires a <=64 MB layout without pinned pools overlapping
+ * the heap. Other titles and the Windows contiguous allocator are unchanged. */
+BOOL xbox_EnablePhysicalHeapAlias(void);
 /* Checked GPU surface access, plus the separately mapped NV2A registers.
  * NULL indicates an unavailable mapping or an out-of-bounds range. */
 void *xbox_GpuMemoryRange(uint32_t address, size_t bytes);
@@ -218,7 +225,7 @@ void xbox_WatchdogStart(void);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+#define XBOX_KERNEL_DATA_BASE   (g_xbox_low_base + 0x40000u)
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -303,7 +310,43 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
+/* Stack region size.
+ *
+ * Everything above this is the heap arena -- XBOX_HEAP_BASE is literally
+ * XBOX_STACK_BASE + XBOX_STACK_SIZE -- so a byte reserved here is a byte the
+ * title cannot allocate. At 8 MB the arena was 50,855,936 bytes on a 64 MB
+ * console, and JSRF ran out loading player assets with 49.4 MB live: it wanted
+ * 827,904 contiguous bytes and the largest free block was 475,136.
+ *
+ * 8 MB was never measured. Painting the region and scanning for the lowest
+ * word the title ever touched puts the main stack's high-water mark at 3 KB
+ * across a full 70-second JSRF startup -- recompiled code keeps its working
+ * set in host locals, so the guest stack stays shallow.
+ *
+ * 6 MB rather than something closer to the measurement, because the bottom
+ * 4 MB is the worker-slice pool below and a title uses one model or the other:
+ * the slices keep their 4 MB, and a main-loop title gets 2 MB of stack against
+ * a measured 3 KB. The 2 MB this returns to the arena is what JSRF needed.
+ * A title that really does recurse deeply will fault in its own stack rather
+ * than corrupt the heap -- the arena starts above it, growing up. */
+#define XBOX_WORKER_STACK_SIZE   (256 * 1024)
+#define XBOX_MAIN_STACK_SIZE (2 * 1024 * 1024)
+
+/* Worker slices are reserved only for a title that uses them.
+ *
+ * They exist for the tick-driven model (see below), and nothing in this tree
+ * calls xbox_worker_stack_alloc -- so on a main-loop title the pool was 4 MB of
+ * address space nobody could touch, sitting directly under the arena. JSRF
+ * loads a 235-texture startup set and then fails allocations of a few hundred
+ * bytes with about 2 MB to spare, so 4 MB is not a rounding error.
+ *
+ * Build a tick-driven title with -DXBOX_WORKER_STACK_COUNT=16. */
+#ifndef XBOX_WORKER_STACK_COUNT
+#define XBOX_WORKER_STACK_COUNT  0
+#endif
+
+#define XBOX_STACK_SIZE     (XBOX_MAIN_STACK_SIZE \
+                             + XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
 
 /** Base VA of the stack area (above last XBE section). */
 /* Where the fake TIB lives -- the linear address fs: is based at.
@@ -317,18 +360,36 @@ typedef union RecompXmm {
  * unmapped and either mistake faults where it happens.
  *
  * Sits below every XBE's image base (0x00010000), so it displaces nothing. */
+/* Base of the fixed low block: primary TLS data, the kernel data exports, the
+ * TLS/PRCB stand-ins, and above them the stack and then the heap arena.
+ *
+ * This was 0x00700000, chosen to clear any XBE. Nothing below the heap can be
+ * allocated by the title, and XBOX_HEAP_BASE is XBOX_STACK_BASE plus the stack
+ * size, so the distance between the top of the loaded image and this base is
+ * dead space charged to the arena. JSRF's image is 11 sections ending at
+ * 0x00288620 -- 2.6 MB -- so 0x00700000 threw away 4.5 MB on a console with 64.
+ *
+ * Set from the actual section extents during xbox_MemoryLayoutInit, rounded up
+ * to 64 KB, and left at the old default until then so anything reading these
+ * before init sees what it always did. A title with a larger image pushes it
+ * up; nothing pushes it below the image, and init fails loudly if the sections
+ * would overlap it. */
+#define XBOX_LOW_BASE_DEFAULT 0x00700000u
+extern uint32_t g_xbox_low_base;
+
 #define XBOX_FS_BASE        0x00001000
 
-#define XBOX_STACK_BASE     0x00780000
+#define XBOX_STACK_BASE     (g_xbox_low_base + 0x80000u)
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
-#define XBOX_THREAD_STACK_SIZE (512 * 1024)
+#define XBOX_THREAD_STACK_SIZE (512 * 1024)   /* cap, and the default */
+#define XBOX_THREAD_STACK_MIN  (64 * 1024)    /* floor for a stated size */
 
 /* Primary-thread storage used by the title's own Xbox TLS bootstrap. */
 #define XBOX_PRIMARY_TIB_VA          XBOX_FS_BASE
-#define XBOX_PRIMARY_TLS_CONTEXT_VA  0x00760000u
-#define XBOX_PRIMARY_TLS_DATA_VA     0x00700000u
+#define XBOX_PRIMARY_TLS_CONTEXT_VA  (g_xbox_low_base + 0x60000u)
+#define XBOX_PRIMARY_TLS_DATA_VA     (g_xbox_low_base)
 
 /* ================================================================
  * Worker stack slices (host-tick-driven titles)
@@ -350,9 +411,9 @@ typedef union RecompXmm {
  * (every default-model title), this is unused address space and dead code, so
  * adding it changes nothing for them.
  */
-#define XBOX_WORKER_STACK_SIZE   (256 * 1024)
-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
-#define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
+#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE
+/* XBOX_WORKER_STACK_SIZE and _COUNT are defined with XBOX_STACK_SIZE above,
+ * because the region's size depends on how many slices are reserved. */
 #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
 
@@ -365,7 +426,7 @@ typedef union RecompXmm {
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00D80000 */
 
 /** Exclusive top of the dynamic heap: the end of RAM for this run. Runtime,
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit
@@ -463,7 +524,7 @@ HANDLE xbox_GetMappingHandle(void);
 
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
  * stack top, or 0 when the pool is exhausted. */
-uint32_t xbox_AllocThreadStack(void);
+uint32_t xbox_AllocThreadStack(uint32_t bytes);
 
 /* Install the per-thread Xbox FS/TIB state used by generated FS_MEM accesses.
  * tls_data_size is the value passed to PsCreateSystemThreadEx. */

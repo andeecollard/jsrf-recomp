@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <stddef.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -34,6 +35,8 @@
 
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
+static void close_dir_context(HANDLE handle);
 
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
@@ -546,6 +549,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
+    close_dir_context(Handle);
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (is_partition0_handle(Handle) || is_partition5_handle(Handle))
         return STATUS_SUCCESS;
@@ -844,6 +848,18 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+static void close_dir_context(HANDLE handle)
+{
+    if (!handle || !s_dir_cs_init) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i=0;i<MAX_DIR_CONTEXTS;++i) if (s_dir_contexts[i].file_handle==handle) {
+        HANDLE find=s_dir_contexts[i].find_handle;
+        if (find && find!=INVALID_HANDLE_VALUE) FindClose(find);
+        memset(&s_dir_contexts[i],0,sizeof(s_dir_contexts[i]));
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
@@ -870,6 +886,7 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     DIR_CONTEXT* ctx;
@@ -878,6 +895,12 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+
+    IoStatusBlock->Information=0;
+    if (FileInformationClass!=XboxFileDirectoryInformation)
+        return IoStatusBlock->Status=STATUS_INVALID_INFO_CLASS;
+    if (Length<offsetof(XBOX_FILE_DIRECTORY_INFORMATION,FileName))
+        return IoStatusBlock->Status=STATUS_BUFFER_TOO_SMALL;
 
     ctx = find_or_create_dir_context(FileHandle, TRUE);
     if (!ctx)
@@ -947,12 +970,17 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->FileNameLength = name_len;
     {
         ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-        if (name_len > 0 && (header_size + name_len) <= Length)
-            memcpy(entry->FileName, filename_ansi, name_len);
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = header_size + name_len;
+        ULONG copied = (ULONG)name_len;
+        if (copied > Length - header_size)
+            copied = Length - header_size;
+        if (copied)
+            memcpy(entry->FileName, filename_ansi, copied);
+        IoStatusBlock->Status = copied == (ULONG)name_len
+                                   ? STATUS_SUCCESS
+                                   : STATUS_BUFFER_OVERFLOW;
+        IoStatusBlock->Information = header_size + copied;
     }
-    return STATUS_SUCCESS;
+    return IoStatusBlock->Status;
 }
 
 /* ======================================================================== */
@@ -1235,6 +1263,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
+    close_dir_context(Handle);
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (is_partition0_handle(Handle) || is_partition5_handle(Handle))
         return STATUS_SUCCESS;
@@ -1468,14 +1497,32 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+static void close_dir_context(HANDLE handle)
+{
+    if (!handle || !s_dir_cs_init) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i=0;i<MAX_DIR_CONTEXTS;++i) if (s_dir_contexts[i].handle==handle) {
+        if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
+        memset(&s_dir_contexts[i],0,sizeof(s_dir_contexts[i]));
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     (void)Event; (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+
+    IoStatusBlock->Information=0;
+    if (FileInformationClass!=XboxFileDirectoryInformation)
+        return IoStatusBlock->Status=STATUS_INVALID_INFO_CLASS;
+    if (Length<offsetof(XBOX_FILE_DIRECTORY_INFORMATION,FileName))
+        return IoStatusBlock->Status=STATUS_BUFFER_TOO_SMALL;
 
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);
@@ -1534,8 +1581,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
     if (stat(full, &st) != 0)
         memset(&st, 0, sizeof(st));
-    LeaveCriticalSection(&s_dir_cs);
 
+    /* readdir's name belongs to ctx->dir; keep it protected from NtClose
+     * until all entry fields and the counted filename have been copied. */
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
 
@@ -1552,11 +1600,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->FileNameLength = name_len;
 
     ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-    if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
-    IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = header_size + name_len;
-    return STATUS_SUCCESS;
+    ULONG copied=(ULONG)name_len;
+    if (copied>Length-header_size) copied=Length-header_size;
+    if (copied) memcpy(entry->FileName,de->d_name,copied);
+    IoStatusBlock->Status=copied==(ULONG)name_len ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+    IoStatusBlock->Information=header_size+copied;
+    LeaveCriticalSection(&s_dir_cs);
+    return IoStatusBlock->Status;
 }
 
 #endif /* _WIN32 */

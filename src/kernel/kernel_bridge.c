@@ -425,6 +425,7 @@ void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 static void bridge_PsCreateSystemThreadEx(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
+    uint32_t kernel_stack_sz = STACK_ARG(2);  /* KernelStackSize, ignored */
     uint32_t tls_data_size   = STACK_ARG(3);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
@@ -441,9 +442,10 @@ static void bridge_PsCreateSystemThreadEx(void)
                         && (g_thread_call_count == 0);
     g_thread_call_count++;
 
-    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X tls=%u\n",
+    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X"
+            " ctx1=0x%08X ctx2=0x%08X tls=%u stack_requested=%u given=%u\n",
             g_thread_call_count, start_routine, start_context1, start_context2,
-            tls_data_size);
+            tls_data_size, kernel_stack_sz, (unsigned)XBOX_THREAD_STACK_SIZE);
     fflush(stderr);
 
     /* Placeholder so a caller that only null-checks its handle sees success.
@@ -494,7 +496,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                  * Now that the register set is thread-local (RECOMP_TLS), a
                  * spawned thread gets its own, and the caller's is untouched by
                  * construction rather than by save/restore. */
-                uint32_t stack_top = xbox_AllocThreadStack();
+                uint32_t stack_top = xbox_AllocThreadStack(kernel_stack_sz);
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
@@ -663,6 +665,61 @@ static void bridge_MmFreeContiguousMemory(void)
  * NTSTATUS NtAllocateVirtualMemory(PVOID *BaseAddress, ULONG ZeroBits,
  *     PULONG AllocationSize, ULONG AllocationType, ULONG Protect)
  */
+/* How much of what a title reserves does it ever commit?
+ *
+ * A pure MEM_RESERVE costs no RAM on hardware; ours charges the arena for all
+ * of it. JSRF's guest heap reserves 1+2+4+8 MB through ra=0x0014903F and holds
+ * 15,728,640 bytes of a 58 MB arena that way, which is what the stage loader
+ * runs out of. Separating reserve from commit is the fix, but only if the title
+ * commits substantially less than it reserves -- if it commits nearly all of
+ * it, the pages are owed either way and the work buys nothing.
+ *
+ * So: record each pure reservation, and attribute every later MEM_COMMIT that
+ * lands inside one. Read-only bookkeeping; nothing here changes what is
+ * returned to the guest. */
+#define BRIDGE_RESERVE_MAX 32
+static struct { uint32_t base, size, committed, commits; } g_reserves[BRIDGE_RESERVE_MAX];
+static unsigned g_reserve_count, g_reserve_overflow;
+
+static void bridge_reserve_note(uint32_t base, uint32_t size)
+{
+    if (g_reserve_count >= BRIDGE_RESERVE_MAX) { ++g_reserve_overflow; return; }
+    g_reserves[g_reserve_count].base = base;
+    g_reserves[g_reserve_count].size = size;
+    g_reserves[g_reserve_count].committed = 0;
+    g_reserves[g_reserve_count].commits = 0;
+    ++g_reserve_count;
+    fprintf(stderr, "  [RESERVE] #%u reserve base=0x%08X size=%u\n",
+            g_reserve_count, base, size);
+    fflush(stderr);
+}
+
+static void bridge_reserve_commit(uint32_t base, uint32_t size)
+{
+    static unsigned seen;
+    for (unsigned i = 0; i < g_reserve_count; ++i) {
+        if (base < g_reserves[i].base
+                || (uint64_t)base >= (uint64_t)g_reserves[i].base + g_reserves[i].size)
+            continue;
+        g_reserves[i].committed += size;
+        ++g_reserves[i].commits;
+        if ((++seen % 64) == 0) {
+            uint64_t r = 0, c = 0;
+            for (unsigned k = 0; k < g_reserve_count; ++k) {
+                r += g_reserves[k].size;
+                c += g_reserves[k].committed;
+            }
+            fprintf(stderr, "  [RESERVE] %u regions, reserved %llu, committed"
+                            " %llu (%llu%%), commits=%u overflow=%u\n",
+                    g_reserve_count, (unsigned long long)r,
+                    (unsigned long long)c, r ? (unsigned long long)(c * 100 / r) : 0ull,
+                    seen, g_reserve_overflow);
+            fflush(stderr);
+        }
+        return;
+    }
+}
+
 static void bridge_NtAllocateVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);  /* PVOID* in Xbox VA */
@@ -675,6 +732,7 @@ static void bridge_NtAllocateVirtualMemory(void)
     uint32_t size = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
     /* Read the base address hint (0 = let kernel choose) */
     uint32_t base_hint = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
+    static unsigned vm_said;
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: base=0x%08X size=%u type=0x%X prot=0x%X\n",
@@ -729,10 +787,22 @@ static void bridge_NtAllocateVirtualMemory(void)
         fflush(stderr);
     }
 
+    /* Report before the commit-only fast path. This used to sit below it, so
+     * the log claimed to distinguish reserve from commit while omitting every
+     * commit into an existing reservation. */
+    if (vm_said++ < 64)
+        fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory #%u size=%u"
+                        " type=0x%X (%s%s) base_hint=0x%08X ra=0x%08X\n",
+                vm_said, size, alloc_type,
+                (alloc_type & 0x2000) ? "RESERVE" : "",
+                (alloc_type & 0x1000) ? "|COMMIT" : "",
+                base_hint, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+
     if (base_hint != 0 && (alloc_type & 0x2000) == 0) {
         /* MEM_COMMIT only, on an already-reserved region.
          * The memory is already committed by our bump allocator.
          * Don't change the base address - just return success. */
+        bridge_reserve_commit(base_hint, size);
         if (KERNEL_LOG_ON()) {
             fprintf(stderr, "  [KERNEL] → MEM_COMMIT on existing region 0x%08X, no-op\n", base_hint);
             fflush(stderr);
@@ -764,6 +834,10 @@ static void bridge_NtAllocateVirtualMemory(void)
      * two. This clamp is enough for a title that reserves generously and
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
+    /* Reserve and commit are charged the same here, which is the known gap
+     * described above. Say which one each call was, rate-limited, so the
+     * question "is this title paying RAM for address space it never commits?"
+     * can be answered from a log rather than guessed at. */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
@@ -802,6 +876,9 @@ static void bridge_NtAllocateVirtualMemory(void)
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
+
+    if ((alloc_type & 0x2000) && !(alloc_type & 0x1000))
+        bridge_reserve_note(xbox_va, size);
 
     /* Write back the allocated address and actual size */
     if (base_ptr) BRIDGE_MEM32(base_ptr) = xbox_va;
@@ -2428,16 +2505,25 @@ static void bridge_RtlNtStatusToDosError(void)
  *   offset 4: Information     (uint32_t)
  */
 
-/* Extract the ANSI path string from an Xbox OBJECT_ATTRIBUTES */
+/* Snapshot the counted ANSI path without modifying guest memory. XAPI's
+ * FindFirstFile splits one buffer into parent and basename by shortening
+ * Length, not by inserting a NUL. strlen() reopened the entire marker file
+ * as a directory, so a completed JSRF cache was never recognized.
+ * The snapshot is thread-local and valid until the next path conversion on
+ * this thread; all current consumers finish before callbacks/another path. */
 static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
 {
+    static RECOMP_TLS char path[UINT16_MAX+1u];
     uint32_t ansi_str_va, buf_va;
     if (!obj_attrs_va) return NULL;
     ansi_str_va = BRIDGE_MEM32(obj_attrs_va + 4);
     if (!ansi_str_va) return NULL;
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
-    return (const char*)XBOX_TO_NATIVE(buf_va);
+    uint16_t length=BRIDGE_MEM16(ansi_str_va);
+    memcpy(path,XBOX_TO_NATIVE(buf_va),length);
+    path[length]='\0';
+    return path;
 }
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
@@ -2559,10 +2645,10 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     const char* path = bridge_get_xbox_path(obj_attrs_va);
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
-    name->MaximumLength = (USHORT)(name->Length + 1);
+    name->MaximumLength = name->Length==UINT16_MAX ? UINT16_MAX : (USHORT)(name->Length + 1);
     oa->RootDirectory = NULL;
     oa->ObjectName    = name;
-    oa->Attributes    = 0;
+    oa->Attributes    = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va+8) : 0;
 }
 
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
@@ -3302,15 +3388,16 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    uint32_t infoclass   = STACK_ARG(7);
+    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(9);  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
@@ -3325,7 +3412,8 @@ static void bridge_NtQueryDirectoryFile(void)
         if (fn.Buffer) pfn = &fn;
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(info_va), length, pfn, (BOOLEAN)restart);
+                XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)infoclass,
+                pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -4155,9 +4243,16 @@ static void bridge_NtSuspendThread(void)
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(void)
 {
+    /* PreviousSuspendCount is optional, and XBOX_TO_NATIVE(0) is not NULL --
+     * it is the base of the guest mapping, so a caller passing NULL had four
+     * bytes written to guest address 0 on every resume. NtSuspendThread beside
+     * this one already guards; this did not. JSRF drives its own cooperative
+     * scheduler and issues 39,130 resumes in a three-minute run. */
+    uint32_t count_va = STACK_ARG(1);
+
     g_eax = (uint32_t)xbox_NtResumeThread(
         bridge_resolve_handle(STACK_ARG(0)),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
 }
 
 /* ── PhyGetLinkState (ordinal 252, 1 arg) */
@@ -4373,7 +4468,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 207: return 40;  /* NtQueryDirectoryFile (10) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
