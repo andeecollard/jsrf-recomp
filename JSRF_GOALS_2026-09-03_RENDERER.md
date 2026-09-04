@@ -546,9 +546,48 @@ other candidate has been measured and excluded -- the arena no longer runs out,
 the scheduler's suspend counts are bounded and its waits are woken, and the
 renderer accepts every draw the title issues.
 
-Unchanged and still open. The OHCI root hub has ports and completes reset, but
-nothing enumerates; that needs descriptors and control transfers through the
-HCCA, which is device emulation. Not started.
+The OHCI root hub has ports and completes reset, but nothing enumerates; that
+needs descriptors and control transfers through the HCCA, which is device
+emulation.
+
+**Surveyed 4 September; here is where it actually stands.**
+
+There is already a host-side backend, `src/input/xinput_device.c` -- SDL game
+controllers, plus a local `RECOMP_FAKE_PAD=1` that pulses A and START. It is
+byte-identical to upstream apart from that addition, and **nothing calls it**:
+`xbox_InputGetState` has no caller in the harness or the bridges. JSRF does not
+go through XAPI-on-the-host at all; it drives OHCI itself from `sub_001A1E74`
+and `sub_001A52F7`, writing 0xFE801xxx and 0xFE802xxx directly.
+
+Upstream is no help: `git grep -i "ohci\|HCCA" upstream/main -- src` is empty.
+This tree is the furthest along.
+
+With `RECOMP_OHCI_ATTACH=1` the state is better than "not started":
+
+```
+[OHCI] attach probe: port1=0x00010001   CCS set, connect-status-change set
+HcControl       0x000000BE              UsbOperational, all four lists enabled
+HcCommandStatus 0x00000000
+HcInterruptStatus 0x00000040            RHSC standing
+HcInterruptEnable 0x00000040            RHSC enabled
+HcHCCA          0x009E2000              the title has published its HCCA
+```
+
+The title has a working controller, an HCCA, and RHSC enabled -- and it
+registered the ISR for it: `KeConnectInterrupt routine=0x001C288F
+context=0x009E4278 vector=1`, which is USB0.
+
+**So the missing piece is narrower than "emulate USB".** Nothing ever delivers
+that interrupt: the status bit stands, the handler never runs, and the title
+never learns a device appeared. The order is
+(1) deliver the RHSC interrupt to the registered ISR at vector 1,
+(2) answer the port reset and the control transfers it then issues on the
+default endpoint through the HCCA,
+(3) answer interrupt-IN with pad reports fed from `xbox_InputGetState`, which
+already exists and already has a synthetic pad for bring-up.
+
+Only step 3 is title-facing; steps 1 and 2 are the device model, and every
+title needs them.
 
 **Completion:** a host key or pad action changes guest-visible state.
 
