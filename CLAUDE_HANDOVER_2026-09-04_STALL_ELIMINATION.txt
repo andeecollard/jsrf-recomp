@@ -1,0 +1,339 @@
+CLAUDE HANDOVER
+Jet Set Radio Future / upstream_xboxrecomp_clean
+4 September 2026
+
+Continues, and corrects, CLAUDE_TO_CODEX_HANDOVER_2026-09-04_USB_GFX.txt and
+the Codex briefing that opened this session (the one directing work at the 110
+unresolved flag branches and the pair in sub_001403B0).
+
+State: main at 8f54dba, eight commits on top of b881281. ctest 14/14.
+git diff --check clean. The title still stops at "Now Loading".
+
+
+READ THIS FIRST
+===============
+
+This session did not fix the stall. It eliminated most of the places it could
+be, fixed two real lifter defects and one real gap in the function database,
+built seven instruments, and retired three hypotheses that previous handovers
+were organised around -- including the one this session was told to pursue.
+
+It also produced four wrong mechanism claims, three of which reached the user
+before I caught them. Two required retraction commits. That failure mode is
+documented under WRONG TURNS because it is the most transferable thing here:
+every one came from asserting a runtime fact from static reading or from a
+trace I had not checked the semantics of.
+
+If you read only two sections, read RULED OUT and WRONG TURNS.
+
+
+WHAT IS FIXED (COMMITTED)
+=========================
+
+87ef36d  Cross-block flag merge for destination-writing setters.
+
+  A jcc reached from several blocks could only be resolved when every edge
+  agreed on the flag setter, or when they were all cmp/test snapshots of the
+  same width. Anything else fell to the `_flags` local, which is initialised
+  to zero and never written, so the branch could go only one way.
+
+  A setter that writes its destination leaves ZF = (dest == 0) and SF =
+  sign(dest). When every edge did that to the same destination those two bits
+  are known whatever the instructions were. MSVC's signed remainder by a power
+  of two is exactly that join -- `and eax, 0x800007FF; jns L; dec eax; or eax,
+  0xFFFFF800; inc eax; L: jne` -- an `and` meeting an `inc`.
+
+  Answers ZF and SF only. CF and OF genuinely differ between these setters, so
+  a branch needing either still falls back.
+
+  tools/recomp/lifter.py, tools/recomp/translator.py,
+  tools/recomp/test_lifter_result_flag_merge.py (7 cases).
+
+  Ten sites in JSRF, nine in the WXCI/XB disc driver. sub_001403B0 is
+  wxCiReqRd, the sector-read request; it runs the idiom twice, on the read
+  length at 0x001404DB and the seek position at 0x001404F1. With the second
+  `je` nailed not-taken every read request fell into "E0109152:illegal seek
+  position." and returned zero.
+
+  backport_result_flag_merge.py carries it into the preserved generated tree,
+  which regeneration does not reproduce because it holds recovered
+  mid-function entries. It runs the fixed translator over each affected
+  function and copies the statement across, keyed on guest block label,
+  mnemonic and branch target -- no hand-written C. --scope also applies the
+  older cmp/test merge's ten sites, which this tree had never received.
+  Together 110 dead fallbacks -> 80, and the ctest ratchet with them.
+
+8597a08  Recovered indirect-call target 0x0013D840, plus
+f76594b  the correction to its reasoning.
+
+  A function whose address is only taken as a data immediate has no call site
+  to be detected by. functions.json held 0x0013D810-0x0013D834 then
+  0x0013D860, leaving 0x0013D835-0x0013D85F undetected, and the disassembler
+  recorded the reference without promoting it ("XREF: 0x0013E42A (data_imm)").
+  RECOMP_ICALL printed "Failed to resolve VA 0x0013D840" three times per run.
+
+  It is the bridge from the WXCI error reporter (installed at 0x002615C4) to
+  CRI's cvFs print path. Not behaviourally significant -- the chain ends at
+  another uninstalled hook at 0x002616D8 -- but a real hole.
+
+  recover_icall_entries.py is the sibling of recover_startup_entries.py: same
+  registration into dispatch/header/bodies, but for an address that is unowned
+  rather than inside an existing function. Extent is decoded, not declared,
+  and a forward conditional keeps the body open so 0x0013D840's `je` over its
+  own tail jump does not truncate it before the `ret`. icall_entries.json also
+  feeds a full regeneration through --seed-functions.
+
+Neither fix moves the milestone. Both are correct anyway.
+
+
+RULED OUT, EACH BY MEASUREMENT
+==============================
+
+Every one of these has an artifact under
+build-macos/jsrf-first-fault/render-investigation/.
+
+Unresolved flag branches.   Of 110 static sites, exactly five execute during a
+  boot: 0x001403B0 twice, 0x001569A0, 0x0015D3F0, 0x0015DC20. All five now
+  resolve; a run executes zero. Milestone unchanged.
+  (claude-flagmerge-00-baseline vs -04-final)
+
+Heap exhaustion.  The all-sites build exhausts the 61.8 MB arena (226 OOMs,
+  deterministic, identical across three runs; zero before). It is not the
+  cause: title.adx fails identically with and without it. The heap is
+  genuinely tight -- 58.9 MB live even in a clean run, ~95% occupancy -- but
+  tight is not the blocker. Worth its own goal.
+  (claude-cf-all-01 vs claude-cf-resultmerge-01)
+
+The pushbuffer spin.  Sampling puts 89% of the main thread in one loop,
+  loc_001914F0 in sub_00191440, the D3D free-space wait, reached through
+  sub_00013A80 -> sub_0014D090 -> sub_00198F10. It is where the time goes and
+  not where the block is: it drains at ~4.6 units/s with the CPU rasteriser
+  and ~1075/s without -- 233x -- and both produce exactly 1341 file opens.
+  (claude-pbwait-01 vs claude-pbwait-noexec-02)
+
+Both WXCI cache misses.  wxCiOpen and wxCiGetFileSize both report
+  "is not in cache" on title.adx and both fall through to the identical path
+  they use when no cache callback is installed (0x00140A94 and 0x00140907
+  respectively). The index at 0x00269D80 is empty and that is normal; the
+  lookup runs three times in ninety seconds.
+
+cvFs.  Its whole failure vocabulary is now readable and it emits nothing.
+
+The vblank acknowledge.  loc_00193E40 executes once in ninety seconds. The
+  write-1-to-clear path and the PMC summary follow-on are correct.
+
+Thread deadlock.  The only dispatcher object the title uses, the D3D device's
+  KEVENT at device+0x2430 (guest 0x0019D630), is waited and signalled 1000+
+  times each. Nothing is stuck.
+
+The indirect call at 0x0013D840.  Fixed; 3 failures -> 0; nothing changed.
+
+The read path.  ~285 NtReadFile calls, every one delivering its full length,
+  up to 1.9 MB in a single call.
+
+The root object's triggers (8f54dba).  +0x50..+0x6C are a latch bank --
+  edge-triggered set/reset PAIRS for four persistent booleans (+0x50/+0x54
+  drive +0x40, +0x58/+0x5C drive +0x44, and so on), consumed and cleared every
+  tick, with 53/21/8/51 static callers spread across the game. "Nothing sets
+  them" means nobody requested a change to four flags already at their
+  intended value. Measured: 59108 writes in ninety seconds, all to the root at
+  0x005E3A70, all sub_00012750 (+0x70) from sub_0001DAA0. Per-frame service.
+  Two handovers were organised around this non-observation. Do not return.
+
+
+THE MILESTONE, AND HOW TO MEASURE IT
+====================================
+
+  RECOMP_PATH_TRACE=1, fresh RECOMP_HDD_ROOT, 75-90 s.
+  opens          = lines matching \[FILE\] Nt(Open|Create)File
+  distinct files = unique Z:\Media\... paths, dropping ~ and directories
+
+As of this session: 1341 opens, 260 distinct files, identical at 45 s, 75 s,
+90 s and 150 s. Identical with the rasteriser on or off, with or without the
+OOM, with all flag fixes or none, and with the indirect call fixed or broken.
+
+That number, not wall-clock, is the thing to beat. Each run needs its own HDD
+(119 MB); reusing one invalidates the comparison.
+
+Do NOT count reads by grepping "NtReadFile" -- reads are not traced by the
+[FILE] logging, and the existing per-read line is labelled "[READ] want=".
+Use RECOMP_READ_COUNT=1. That mistake nearly became a fifth wrong conclusion.
+
+
+INSTRUMENTS BUILT THIS SESSION
+==============================
+
+All read-only, all env-gated, all self-limiting.
+
+  RECOMP_WXCI_ERRORS       Every CRI middleware diagnostic. sub_0013C890 is
+                           the funnel; it copies each message to 0x0027BC20
+                           and forwards to a hook at 0x002616D8 JSRF never
+                           installs, so cvFsOpen's six messages, cvFsAddDev's
+                           three and the WXCI set were all being discarded.
+                           Covers the WXCI reporter too, via 0x0013D840.
+  RECOMP_PB_WAIT_TRACE     The D3D pushbuffer free-space spin at 0x001914F0.
+  RECOMP_CACHE_TRACE       WXCI index hits/misses plus a dump of the 16 mount
+                           slots at 0x00269D80.
+  RECOMP_EVENT_TRACE       Both sides of every dispatcher object crossing the
+                           thunk boundary. NOTE: reports at counts 1, 10,
+                           1000, 100000 -- "count=1" means "at least once".
+  RECOMP_VBLANK_ACK_TRACE  The acknowledge spin at loc_00193E40.
+  RECOMP_READ_REQUESTS     wxCiReqRd entry (sub_001403B0).
+  RECOMP_READ_COUNT        Real NtReadFile calls, bytes asked and delivered.
+
+And the technique that mattered most, which needs no code:
+
+  sample <pid> 20 -f out.txt
+
+Guest functions are real C symbols in a -O0 -g3 -fno-omit-frame-pointer
+binary, so macOS `sample` gives true guest stacks with call paths. Generated
+functions carry NO per-function hook (only 3 traced functions exist), so a
+counter-based profiler is not available -- do not plan one. Launch the run in
+the background, wait ~50 s for the steady state, then sample.
+
+RECOMP_PEEK="0x261588,0x2615C4,..." prints guest dwords and is the cheapest
+way to settle what a pointer actually holds. Use it before reasoning about
+one.
+
+
+WRONG TURNS, AND WHY
+====================
+
+Four claims, same failure mode each time: a runtime fact asserted from static
+reading or from a trace whose semantics I had not checked.
+
+1. "The WXCI cache miss destroys the file handle." The `rep stosd` at
+   0x00140AB1 is conditional on sub_001406D0's return, not the cache result;
+   the miss falls through to the ordinary open path. I read the report site
+   and not the fall-through target.
+
+2. "Two threads are deadlocked on an unsignalled event." (commit 1ca03a1,
+   retracted by ae21723.) Two errors at once: I read "count=1" as "signalled
+   once" when the tracer reports at 1/10/1000/100000, and I treated a thread
+   sampled inside bridge_KeWaitForSingleObject as blocked when that function
+   waits by polling with Sleep(1) -- a thread doing a thousand short
+   successful waits lives there.
+
+3. "The recovered thunk returns immediately because its hook is null."
+   (8597a08, corrected by f76594b.) RECOMP_PEEK showed 0x00261588 = 0x0013AF10.
+   One run would have told me.
+
+4. "1341 opens and one read, so the title never loads data." Caught before
+   reporting. Reads are not logged; I had counted the logging.
+
+The rule that would have prevented all four: before stating what the guest
+DID, measure it. RECOMP_PEEK for a dword, sample for where time goes, a probe
+for a branch. State a mechanism as a hypothesis until a run confirms it, and
+say which it is. Read a counter's reporting thresholds before reading its
+value.
+
+A second, structural lesson. Three sessions in a row picked a hypothesis from
+a static or structural artifact -- a subsystem that looked incomplete, an
+audit count, a field that was always zero -- rather than from the stall
+itself. Each cost a session. The first thing this session did that worked was
+sampling the running process, and it should have been the first thing done.
+
+
+WHERE TO GO NEXT
+================
+
+The loading phase is healthy end to end: files probed, opened, read and
+closed; both middleware layers silent; no thread blocked; no allocation
+failing once the arena settles; the renderer drawing correctly (frame dumps
+show the anti-graffiti screen rendered properly and "Now Loading" still
+animating at 90 s).
+
+The last file activity of every boot is opening D:\Media\Z_ADX\BGM\title.adx,
+the title screen's music, which is exactly what you would load last before a
+title screen. It opens and sizes successfully.
+
+sub_00013A80 is the root object's per-frame service and the loading state is
+not in it. Past the latch bank it clears +0x74, calls sub_000123E0, then
+branches on +0x94 (which alternates 0/2 per tick); the ==0 arm packs indexed
+bytes from 0x00251F5C into +0x28/+0x2C.
+
+The successor question: the loading screen is a CHILD object with its own
+update. Find which child owns it, via sub_000123E0, and read that object's
+per-tick state. The backtrace frames from the BGM open give the game-side
+callers to start from: 0x0013E270 (cvFsOpen), 0x0013E15C, 0x0013D91A.
+
+Worth its own goal, independently: the CPU rasteriser is 233x slower than the
+pushbuffer drain rate without it. That is a measured defect nobody is
+tracking, and it is why a 90 s run sees so little.
+
+Do NOT spend the next session on: a Windows/CrossOver control run (the MMIO
+trap is macOS/AArch64-only, the Windows path decodes x86-64 in a VEH which is
+the worst thing to run under translation, and its APU hook does not even reach
+AC97 -- Codex reached the same conclusion and was right); a Metal or GPTK
+renderer; the remaining 80 dead flag fallbacks (none execute); further USB
+work.
+
+
+VALIDATION AND REPRODUCE
+========================
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+
+14/14. The unresolved-flags ratchet is now --max 80.
+
+Python tests need capstone, which no python3 on this machine has:
+  python3 -m venv <scratch>/venv && <scratch>/venv/bin/pip install capstone pytest
+  <venv>/bin/python -m pytest tools/recomp -q
+186 passed; test_config::test_fallback_is_replaced fails in a full run and
+passes alone, pre-existing and unrelated.
+
+Applying the generated-tree repairs to a restored checkout, in order:
+  recover_shared_epilogues.py
+  recover_startup_entries.py
+  recover_midfunction_entries.py
+  recover_icall_entries.py          <- new
+  announce_unresolved_stubs.py
+  backport_result_flag_merge.py --scope all   <- new
+  instrument_startup.py
+
+A run:
+  RECOMP_PATH_TRACE=1 RECOMP_PB_EXEC=1 \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME-hdd" \
+  python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 90
+
+
+WORKING TREE
+============
+
+Committed this session (b881281..8f54dba, eight commits).
+
+Disclosure: the previous session's uncommitted diagnostics work was absorbed
+into these commits rather than left in the working tree -- main.c went in with
+ae21723, and guest_trace.h / startup_probe.c / instrument_startup.py /
+CMakeLists.txt across several. It is preserved, just committed. The four
+lines the previous session had in src/kernel/kernel_bridge.c went in with
+c7af189 alongside the read counter.
+
+Still uncommitted, deliberately untouched -- the Windows-portability and OHCI
+work from earlier sessions:
+
+  M src/apu/CMakeLists.txt
+  M src/kernel/kernel.h
+  M src/kernel/xbox_memory_layout.c
+  M src/platform/xbox_winnt.h
+  ?? build-windows-jsrf/
+  ?? icall_targets.dump
+
+Run artifacts under render-investigation/ from this session, each with its own
+-hdd (119 MB each; several GB in total, not cleaned up -- delete the ones you
+do not need):
+
+  claude-flagmerge-00-baseline / -01 / -03-all / -04-final   flag merge A/B
+  claude-cf-all-01 / claude-cf-resultmerge-01                heap counterfactual
+  claude-stallprofile-01                                     first WXCI capture
+  claude-pbwait-01 / claude-pbwait-noexec-02                 the 233x measurement
+  claude-event-01 / claude-vblank-01                         event and vblank
+  claude-cache-01 / claude-cvfs-01                           index and middleware
+  claude-icall-fix-01 / claude-readcount-01                  icall and reads
+  claude-trigger-01                                          the latch bank
+  claude-frames-01                                           framebuffer dumps
+  claude-sample-01                                           the sampled run
+
+The sample itself is not preserved in-tree; re-take it with `sample` in one
+command, it costs 20 seconds.
