@@ -577,14 +577,43 @@ The title has a working controller, an HCCA, and RHSC enabled -- and it
 registered the ISR for it: `KeConnectInterrupt routine=0x001C288F
 context=0x009E4278 vector=1`, which is USB0.
 
-**So the missing piece is narrower than "emulate USB".** Nothing ever delivers
-that interrupt: the status bit stands, the handler never runs, and the title
-never learns a device appeared. The order is
-(1) deliver the RHSC interrupt to the registered ISR at vector 1,
+**Step 1 turned out to be already done, and the gate is now known exactly.**
+`bridge_device_irq_poll` already runs every non-NV2A ISR periodically, so the
+USB handler at 0x001C288F is called and has been all along. It declines, and
+its own code says why:
+
+```
+ecx = MEM32(esi)          ; register base from ServiceContext
+eax = MEM32(ecx + 0x10)   ; HcInterruptEnable
+edx = MEM32(ecx + 0x0C)   ; HcInterruptStatus
+edx &= eax                ; gate 1: status & enable   -- we pass this
+if (edx == 0) decline
+test 0x80000000, eax      ; gate 2: MasterInterruptEnable
+if (zero) decline                                     -- we fail here
+```
+
+The title writes `HcInterruptEnable = 0x40` -- RootHubStatusChange, no master
+enable -- and never writes bit 31 in any run measured. So it is not yet
+interrupt-driven for the root hub, and something else has to make it look at
+the port. Forcing MIE as a probe (`RECOMP_OHCI_MIE=1`) does not help: it fires
+before the title's own write, which then replaces it.
+
+Chasing that did find a real modelling bug worth having. `HcInterruptEnable`
+(0x10) is write-1-to-set and `HcInterruptDisable` (0x14) is write-1-to-clear,
+and both read back the same mask; this aperture is plain memory, so every write
+replaced the register instead of accumulating. `xbox_McpxHoldRegisters` now
+shadows the pair. It is correct hardware behaviour and it is *not* the blocker
+here, because the master bit was never set to be lost.
+
+Remaining, in order:
+(1) find what makes the title examine the root hub -- it enables RHSC and
+    waits, so either it polls somewhere we are not answering, or its init has
+    an earlier step still unsatisfied. Read its USB init around
+    `sub_001A1E74` and `sub_001A52F7` rather than guessing.
 (2) answer the port reset and the control transfers it then issues on the
-default endpoint through the HCCA,
+    default endpoint through the HCCA at 0x009E2000,
 (3) answer interrupt-IN with pad reports fed from `xbox_InputGetState`, which
-already exists and already has a synthetic pad for bring-up.
+    already exists and already has a synthetic pad for bring-up.
 
 Only step 3 is title-facing; steps 1 and 2 are the device model, and every
 title needs them.

@@ -379,6 +379,42 @@ static void xbox_McpxHoldRegisters(void)
             *rh = (*rh & ~0xFFu) | ndp;
     }
 
+    /* HcInterruptEnable and HcInterruptDisable are a set/clear pair.
+     *
+     * On OHCI, writing a 1 to a bit of HcInterruptEnable (0x10) *sets* that
+     * bit; clearing needs a 1 written to the same bit of HcInterruptDisable
+     * (0x14). Both read back the same enable mask. This aperture is plain
+     * memory, so each write replaced the register instead: the title sets
+     * MasterInterruptEnable during USB init and then writes
+     * RootHubStatusChange on its own, and the second write threw the master
+     * bit away.
+     *
+     * Its own ISR at 0x001C288F tests bit 31 of HcInterruptEnable separately
+     * from the status AND, so with the master bit lost it declined every
+     * interrupt -- "device ISR vector 1 -> FALSE", for the whole run.
+     *
+     * Accumulating in a shadow gives the set/clear behaviour without a write
+     * trap: whatever the title has written to 0x10 since the last pass is
+     * OR-ed in and persists, and anything written to 0x14 is removed. The
+     * disable register is then cleared so the next write to it is visible;
+     * hardware reads the enable mask back there, and nothing here reads it. */
+    {
+        static uint32_t enable_shadow;
+        volatile uint32_t *ien =
+            (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
+        volatile uint32_t *idis =
+            (volatile uint32_t *)((char *)g_mcpx_regs + 0x500014);
+        uint32_t disable = *idis;
+
+        enable_shadow |= *ien;
+        if (disable) {
+            enable_shadow &= ~disable;
+            *idis = 0;
+        }
+        if (*ien != enable_shadow)
+            *ien = enable_shadow;
+    }
+
     /* RECOMP_OHCI_ATTACH=1: report a device on root-hub port 1.
      *
      * Purely a probe, and the question it asks is whether XPP looks at the
@@ -414,9 +450,29 @@ static void xbox_McpxHoldRegisters(void)
                  * waiting on it, so the status bit is what actually announces
                  * the plug. */
                 *ist |= 0x00000040u;                    /* RHSC */
+                /* RECOMP_OHCI_MIE=1 also sets MasterInterruptEnable.
+                 *
+                 * Strictly a probe, and a dishonest one: bit 31 of
+                 * HcInterruptEnable belongs to the driver, and the title has
+                 * written 0x40 there -- RootHubStatusChange without the master
+                 * enable. Its ISR at 0x001C288F reads HcInterruptStatus and
+                 * HcInterruptEnable, ANDs them, and then tests bit 31 of the
+                 * enable separately; with the master bit clear it declines
+                 * every time, which is what "device ISR vector 1 -> FALSE"
+                 * has been reporting.
+                 *
+                 * The question this asks is whether that gate is the only
+                 * thing between here and enumeration. If the ISR claims the
+                 * interrupt and the title starts issuing control transfers,
+                 * the remaining work is the transfer service. If it claims and
+                 * nothing follows, the title is waiting on something else and
+                 * faking its register told us so cheaply. Either answer is
+                 * worth one line; neither is a fix. */
+                if (getenv("RECOMP_OHCI_MIE")) *ien |= 0x80000000u;
                 fprintf(stderr, "  [OHCI] attach probe: port1=0x%08X "
-                        "intr_status=0x%08X intr_enable=0x%08X\n",
-                        *ps, *ist, *ien);
+                        "intr_status=0x%08X intr_enable=0x%08X%s\n",
+                        *ps, *ist, *ien,
+                        getenv("RECOMP_OHCI_MIE") ? " (MIE forced, probe)" : "");
                 fflush(stderr);
             }
         }
