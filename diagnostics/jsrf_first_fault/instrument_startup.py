@@ -113,6 +113,18 @@ points = {
         # registers are still pushed at each, so the query path is at esp+0x18.
         '001435C4': ('jsrf_cache_lookup_probe', 'MEM32(esp + 0x18), 0'),
         '001435CC': ('jsrf_cache_lookup_probe', 'MEM32(esp + 0x18), ebp'),
+        # wxCiReqRd's entry. At the first instruction nothing is pushed yet,
+        # so the arguments are at esp+4 onward: handle, buffer, sector count.
+        '001403B0': ('jsrf_read_request_probe',
+                     'MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
+        # Every CRI middleware diagnostic funnels through sub_0013C890, which
+        # copies the message into 0x0027BC20 and forwards it to a hook at
+        # 0x002616D8 that JSRF never installs -- so cvFsOpen's six failure
+        # messages, cvFsAddDev's three and the rest reach a buffer and stop.
+        # One probe here reads them all, a level above the WXCI reporter and
+        # covering it too: the WXCI path arrives via 0x0013D840 -> 0x0013AF10.
+        '0013C890': ('jsrf_wxci_error_probe',
+                     'MEM32(esp + 4), 0, MEM32(esp)'),
         # The WXCI/XB disc driver's error reporter. It forwards to whatever
         # callback the title installed at 0x002615C4, and JSRF installs none --
         # so every one of its twelve diagnostics ("read error occurs",

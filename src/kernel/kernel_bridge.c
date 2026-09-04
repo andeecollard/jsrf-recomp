@@ -3358,6 +3358,33 @@ static void bridge_NtReadFile(void)
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
 
+    /* How much asset data actually crosses the boundary.
+     *
+     * Opens and closes are traced and reads were not, so counting "NtReadFile"
+     * in a log measured the logging rather than the title -- and 1341 opens
+     * beside an apparent single read is a conclusion that shape invites. This
+     * is the number itself: calls, bytes asked, bytes delivered. */
+    {
+        static int enabled = -1;
+        static unsigned long calls;
+        static unsigned long long asked, got;
+
+        if (enabled < 0) enabled = getenv("RECOMP_READ_COUNT") != NULL;
+        if (enabled) {
+            ++calls;
+            asked += length;
+            got += ios.Information;
+            /* Decades, so a healthy stream reports a rate and a starved one
+             * still reports its first read. */
+            if (calls <= 5 || calls % 500 == 0)
+                fprintf(stderr,
+                        "[READ] calls=%lu asked=%llu got=%llu last=%u/%u"
+                        " status=%08X\n",
+                        calls, asked, got, (unsigned)ios.Information,
+                        length, (unsigned)g_eax);
+        }
+    }
+
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */

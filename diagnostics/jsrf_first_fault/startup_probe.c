@@ -224,6 +224,35 @@ void jsrf_vblank_ack_probe(uint32_t pc, uint32_t regs, uint32_t pmc,
     fflush(stderr);
 }
 
+/* wxCiReqRd, the WXCI disc read request (sub_001403B0).
+ *
+ * The title issues 1341 NtOpenFile and matching NtClose but exactly one
+ * NtReadFile in a ninety second run, so the whole "loading" phase is file
+ * probing, not loading, and no asset data is ever fetched through the kernel.
+ * Either the game never asks the disc layer for data, or it asks and the
+ * request is never serviced. This counts the asks.
+ *
+ * wxCiWait's "E0109232:Timeout. (Waiting for transmission)" never fires in a
+ * run, which rules out asked-and-timed-out, so the two remaining cases are
+ * never-asked and asked-and-completed-without-a-kernel-read.
+ */
+void jsrf_read_request_probe(uint32_t pc, uint32_t handle, uint32_t buffer,
+                             uint32_t sectors)
+{
+    static int enabled = -1;
+    static unsigned long calls;
+
+    if (enabled < 0) enabled = getenv("RECOMP_READ_REQUESTS") != NULL;
+    if (!enabled) return;
+
+    ++calls;
+    if (calls > 24 && calls % 1000) return;
+    fprintf(stderr,
+            "[READ-REQ] call=%lu pc=%08X handle=%08X buffer=%08X sectors=%d\n",
+            calls, pc, handle, buffer, (int)sectors);
+    fflush(stderr);
+}
+
 void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site)
 {
     static unsigned char seen[1024];
