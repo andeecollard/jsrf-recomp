@@ -1,0 +1,419 @@
+CODEX -> CLAUDE HANDOVER
+Jet Set Radio Future / upstream_xboxrecomp_clean
+3 September 2026
+
+READ THIS FIRST
+===============
+
+Repository:
+  /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+Branch / checked-in base:
+  main at 5d95272 (origin/main)
+
+The working tree is deliberately dirty. The changes are the user's current
+work. Do not reset, discard, overwrite, or mass-format them. Nothing in this
+handover has been committed or pushed.
+
+The current user goal is G8 in JSRF_GOALS_2026-09-03_RENDERER.md:
+  advance beyond the genuine Presented by SEGA screen to the next genuine
+  startup/menu state, without forcing a state transition; preserve the
+  working renderer; add measured fixes and regression coverage.
+
+This goal is NOT complete. The latest turn asked for this handover while the
+investigation was in progress.
+
+
+EXECUTIVE STATUS
+================
+
+1. Genuine graphics are working.
+
+   JSRF renders its real 640x480 "Presented by SEGA" startup logo. This is a
+   title-produced frame, not a synthetic triangle or forced colour. The best
+   concise record is CODEX_PROGRESS_2026-09-03_FIRST_GRAPHICS.md.
+
+   First visual evidence:
+     build-macos/jsrf-first-fault/render-investigation/codex-dxt-depth-08/frame003.png
+
+   Longer confirmation:
+     build-macos/jsrf-first-fault/render-investigation/codex-graphics-09/
+
+   The 300-second fresh-HDD run prepared 129,811 draws at its last report,
+   with zero texture and vertex rejections. It completed the cache, did not
+   fault, and remained on the SEGA logo. This is not gameplay evidence.
+
+2. The graphics path is internally RGBA and alpha is rendered.
+
+   DXT1/BC1 sampling produces RGBA. BC1 three-colour mode produces transparent
+   black for index 3; bilinear filtering can make alpha fractional. The
+   measured combiner multiplies texture RGBA by diffuse RGBA. Alpha GREATER is
+   evaluated before writes, and source-alpha blending is implemented.
+
+   The measured destination is RGB565, so that framebuffer stores RGB only.
+   Alpha still determines discard and blending. The ARGB8888 destination path
+   stores output alpha when selected. Do not describe the RGB565 surface as an
+   RGBA storage format.
+
+3. A real post-cache file ABI bug has just been fixed.
+
+   JSRF's XAPI directory lookup reuses one string buffer. It shortens the
+   ANSI_STRING Length to the parent directory, but does not insert a NUL before
+   the basename. bridge_get_xbox_path() ignored Length and passed the entire
+   NUL-terminated buffer to the host. The bridge therefore attempted to open:
+
+     Z:\Media\Cache\JSRF_CACHE_COMPLETE00.CMP
+
+   with FILE_DIRECTORY_FILE. That failed as "path not found" even though the
+   marker existed. The game repeatedly failed to recognize its completed cache.
+
+   bridge_get_xbox_path() now copies exactly the counted Length to a thread-
+   local snapshot and NUL-terminates the snapshot without changing guest RAM.
+
+4. NtQueryDirectoryFile also had the wrong guest ABI.
+
+   Xbox NtQueryDirectoryFile has TEN parameters. The bridge treated it as nine:
+   it omitted FileInformationClass, read FileName and RestartScan from the wrong
+   stack slots, and popped 36 rather than 40 bytes.
+
+   The generated JSRF call at guest 0x00145F26 pushes ten arguments. The nxdk
+   xboxkrnl declaration also confirms ten:
+     https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h
+
+   The bridge and backend signatures now include FileInformationClass;
+   ordinal 207 cleans up 40 bytes. Only XboxFileDirectoryInformation is
+   accepted. Small buffers and truncated names are bounded and reported.
+
+5. Directory enumeration contexts were leaking.
+
+   The backend owns a fixed 64-entry enumeration-context table. Closing a
+   directory before enumeration EOF did not release its context. NtClose now
+   closes and clears a matching context on both POSIX and Windows paths.
+
+   A new guest-ABI regression drives 96 open/query/close cycles, deliberately
+   exceeding the former 64-context limit. It also verifies counted paths with
+   no NUL, ten-argument stack cleanup, RestartScan, invalid info classes, short
+   output buffers, guard bytes, and that guest string memory is not modified.
+
+6. The file fix is verified, but the next visible state has not been reached.
+
+   In fresh-HDD run codex-startup-state-13, file traces now show the directory
+   path correctly as:
+
+     path=Z:\Media\Cache\
+
+   The run created 122,467,906 bytes and all completion names
+   JSRF_CACHE_COMPLETE.CMP plus JSRF_CACHE_COMPLETE00.CMP through 08.CMP. No
+   JSRF_FATAL.ERR exists.
+
+   Important: run 13 accidentally omitted RECOMP_PB_EXEC=1. It is valid file
+   and startup-object evidence, but NOT a graphics regression run and it made
+   no BMPs. Use run 09 or run 12 for the existing rendering evidence, and set
+   RECOMP_PB_EXEC=1 in the next end-to-end visual run.
+
+
+ACTIVE STARTUP LEAD
+===================
+
+The root object remains stable:
+  root             0x01053A70
+  root + 0x7F9C    0x01A41E60
+  update-list head 0x0107FF40
+  list count       10
+
+The object at 0x01A41E60 has:
+  vtable       0x001C4D10
+  update entry 0x00024700
+  render entry 0x00024400
+  flags        0x00010003
+  owner/child  +0x40 = 0x01943010
+
+sub_00024700 is a four-channel colour interpolator. At steady state in the
+25-second run its relevant fields were:
+
+  current +0x98..+0xA4 = 0, 0, 0, 0
+  target  +0xA8..+0xB4 = 1.0, 0, 0, 0
+  step    +0xB8         = 0x3C088889 (approximately 1/120)
+  colour  +0xBC         = 0
+  active  +0xC0         = 0
+
+The update-list loop reaches this object tens of thousands of times, yet the
+sampled current alpha at +0x98 remains zero. On the face of sub_00024700 it
+should increment by +0xB8 until it reaches +0xA8. Do not yet call this an x87
+translation bug: a setter may be resetting the current value later in each
+frame, or the entry may return before the sampled point. Measure entry and exit
+before changing anything.
+
+Relevant generated code:
+  build-macos/jsrf-first-fault/gen/recomp_0000.c
+    sub_00024400: render method
+    sub_00024480: set current colour
+    sub_00024540: set target colour and step
+    sub_00024600 / sub_00024620: find object slot 6, call setters
+    sub_00024700: update interpolator
+
+The target-colour command is reached through sub_00107340, switch case 1,
+around build-macos/jsrf-first-fault/gen/recomp_0005.c:39300. It tail-calls
+sub_00024620 with target 0xFF000000 or 0 and a nominal 1/60 step. Indirect
+calls may reach the current-colour setter; a text search alone will not find
+those.
+
+Recommended next measurement:
+
+  - Add read-only observations at loc_00024700 and loc_00024962 (entry/exit),
+    rate-limited and enabled only under RECOMP_STARTUP_STATE.
+  - Record object, +0x98, +0xA8, +0xB8, +0xBC and +0xC0 before and after.
+  - Also observe calls to current/target setters 0x24480 and 0x24540, including
+    the return address and arguments, to determine whether something resets
+    current alpha every tick.
+  - Put observation-site installation in
+    diagnostics/jsrf_first_fault/instrument_startup.py rather than relying on
+    an unexplained one-off generated-tree edit. The current script installs
+    four existing sites, and startup_probe.c holds their read-only logic.
+  - If sub_00024700 receives stable values and still fails to increment, make a
+    tiny isolated regression around its x87 compare pattern before repairing
+    the recompiler/runtime. Do not patch guest state or skip the logo timer.
+
+Another active object at 0x01860060 uses update 0x00025310. It is an async
+timeout/file object. Its +0x44 active flag is zero after the cache work, so it
+does not currently look like the post-cache blocker. This was measured, not
+assumed.
+
+
+CHANGES IN THE DIRTY TREE
+=========================
+
+Renderer / memory work (documented in the progress files):
+  M diagnostics/jsrf_first_fault/heap_alloc_test.c
+  M diagnostics/jsrf_first_fault/main.c
+  M diagnostics/jsrf_first_fault/replay_texture_copy.py
+  M diagnostics/jsrf_first_fault/texture_copy_replay.c
+  M diagnostics/jsrf_first_fault/texture_copy_state.h
+  M diagnostics/jsrf_first_fault/texture_copy_test.c
+  M diagnostics/jsrf_first_fault/vsh_render_test.c
+  M src/kernel/nv2a_pb_exec.c
+  M src/kernel/nv2a_pb_scan.c
+  M src/kernel/xbox_memory_layout.c
+  M src/kernel/xbox_memory_layout.h
+  M src/nv2a/nv2a_texture_copy.c
+  M src/nv2a/nv2a_texture_copy.h
+  ?? diagnostics/jsrf_first_fault/dxt_fragment_test.c
+  ?? diagnostics/jsrf_first_fault/pb_scan_owner_test.c
+  ?? diagnostics/jsrf_first_fault/test_combiner_trace.py
+  ?? src/kernel/nv2a_pb_scan.h
+
+New file/cache ABI work:
+  M src/kernel/kernel.h
+  M src/kernel/kernel_bridge.c
+  M src/kernel/kernel_file.c
+  M diagnostics/jsrf_first_fault/CMakeLists.txt
+  ?? diagnostics/jsrf_first_fault/counted_file_test.c
+
+Goal / evidence / diagnostic work:
+  M JSRF_GOALS_2026-09-03_RENDERER.md
+  M diagnostics/jsrf_first_fault/startup_probe.c
+  ?? CODEX_PROGRESS_2026-09-03_COMBINERS.md
+  ?? CODEX_PROGRESS_2026-09-03_FIRST_GRAPHICS.md
+  ?? this handover
+
+The main diff before this handover was 736 insertions and 111 deletions across
+19 tracked files, plus the untracked files above. Review overlap carefully.
+
+
+FILE ABI IMPLEMENTATION DETAILS / REVIEW NOTES
+==============================================
+
+src/kernel/kernel_bridge.c
+
+  - bridge_get_xbox_path() uses a RECOMP_TLS char[UINT16_MAX + 1], copies the
+    guest ANSI_STRING Length, and adds a host-only terminator.
+  - bridge_build_oa() preserves OBJECT_ATTRIBUTES.Attributes and avoids
+    overflowing MaximumLength when Length is UINT16_MAX.
+  - bridge_NtQueryDirectoryFile reads arg 7 as FileInformationClass, arg 8 as
+    FileName, and arg 9 as RestartScan.
+  - stdcall_args_for_ordinal(207) returns 40.
+
+  Review risk: bridge_get_xbox_path() does not yet validate that the complete
+  counted guest range is mapped before memcpy. The previous implementation
+  also dereferenced the guest buffer directly, but a robust follow-up should
+  validate the span without regressing valid maximum-length strings.
+
+src/kernel/kernel_file.c
+
+  - Both POSIX and Windows backends accept only
+    XboxFileDirectoryInformation.
+  - Both reject buffers smaller than offsetof(..., FileName), bound filename
+    writes, and return STATUS_BUFFER_OVERFLOW when truncated.
+  - POSIX retains the directory-context lock while copying readdir's name,
+    preventing NtClose from invalidating it concurrently.
+  - NtClose releases any matching directory context before closing the handle.
+
+  Only the POSIX path was compiled and exercised here. The Windows changes were
+  reviewed structurally but have not been built on Windows. In particular,
+  the Win32 FileName-to-wide-pattern conversion still deserves a bounded-
+  length review for Length >= MAX_PATH.
+
+diagnostics/jsrf_first_fault/counted_file_test.c
+
+  - Calls the real guest thunk bridge rather than only testing host helpers.
+  - Uses a private mkdtemp directory and removes only that fixture.
+  - Runs 96 directory contexts to catch the previous leak.
+
+
+VALIDATION ALREADY RUN
+======================
+
+After the latest POSIX and Windows source edits:
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build --output-on-failure
+
+Result:
+  9/9 tests passed, total approximately 0.89 seconds.
+
+Tests:
+  jsrf_av_encoder_option
+  jsrf_heap_alloc
+  jsrf_counted_file
+  jsrf_vsh
+  jsrf_vsh_render
+  jsrf_texture_copy
+  jsrf_dxt_fragment
+  jsrf_pusher_stream
+  jsrf_pb_scan_owner
+
+The Python combiner test passed during the renderer work. Re-run it before a
+handoff/commit:
+
+  /usr/bin/python3 diagnostics/jsrf_first_fault/test_combiner_trace.py
+
+No Windows build, full upstream suite, or fresh full regeneration was done.
+
+
+RUN EVIDENCE AND WHICH RUNS TO TRUST
+====================================
+
+codex-dxt-depth-08
+  Short fresh-HDD visual milestone. draw 11 wrote 62,008 nonzero bytes into a
+  614,400-byte RGB565 colour surface. frame003 is the recognizable SEGA logo.
+
+codex-graphics-09
+  300-second fresh-HDD confirmation. 129,811 prepared draws at last report;
+  zero texture/vertex rejections; two stable combiner configs; completed cache;
+  no fatal/fault. Of 62 report-time BMPs, 38 contain the logo and 24 are black
+  because a report can sample between clear and draw. Captured completed draws
+  are stronger evidence than arbitrary report snapshots.
+
+codex-counted-path-11
+  First run after the counted-path/directory-ABI fix. It proves the bridge now
+  opens Z:\Media\Cache\ as the directory and the old full-marker-as-directory
+  failure is gone. It still did not show the next recognizable state.
+
+codex-startup-state-12
+  Fresh-HDD run with renderer and initial active-object snapshots. It has draw
+  captures and frame000.bmp through frame005.bmp. It identified the stable
+  update-list objects.
+
+codex-startup-state-13
+  25-second fresh-HDD run with expanded +0x98..+0xC8 state sampling. It made
+  the completed cache and showed the frozen-looking interpolator values above.
+  RECOMP_PB_EXEC was accidentally absent, so do not use it to assess graphics.
+
+All are ignored local evidence under:
+  build-macos/jsrf-first-fault/render-investigation/
+
+Do not delete them and do not reuse an old HDD for a fresh-HDD claim.
+
+
+SAFE NEXT RUN TEMPLATE
+======================
+
+Choose a unique run name and a unique adjacent HDD path. The following is a
+template; replace RUN_NAME in all three places. Do not point it at an existing
+directory.
+
+  env \
+    RECOMP_HDD_ROOT='/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/build-macos/jsrf-first-fault/render-investigation/RUN_NAME-hdd' \
+    RECOMP_PB_EXEC=1 \
+    RECOMP_COMBINER_TRACE=1 \
+    RECOMP_STARTUP_TRACE=1 \
+    RECOMP_STARTUP_STATE=1 \
+    RECOMP_FB_DUMP='/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/build-macos/jsrf-first-fault/render-investigation/RUN_NAME/frame' \
+    python3 diagnostics/jsrf_first_fault/run_bounded.py RUN_NAME --seconds 35
+
+RECOMP_FB_DUMP writes frameNNN.bmp only when the CPU pushbuffer executor sees
+FLIP_STALL. On macOS, the separate framebuffer-window dumper is inactive.
+That is why setting RECOMP_FB_DUMP without RECOMP_PB_EXEC produced no files in
+run 13.
+
+For a draw capture, additionally set:
+  RECOMP_DRAW_CAPTURE='<absolute new run directory>/draw-'
+
+
+RENDERER SCOPE AND LIMITS
+=========================
+
+Implemented and tested for the measured startup draws:
+  - shared physical heap alias for JSRF's high CPU / low GPU views
+  - a single pushbuffer executor owner
+  - UB_D3D vertex colours
+  - measured four-stage texture-times-diffuse combiner
+  - single-mip 2D DXT1/BC1, repeat/clamp, nearest/bilinear
+  - alpha GREATER
+  - source-alpha / one-minus-source-alpha additive blending
+  - front/back culling and alternating triangle-strip winding
+  - fixed Z24S8 LEQUAL, depth write/mask, depth/stencil clears
+  - deterministic ordered RGB565 dithering (approximate)
+
+Explicitly unsupported/new state should continue to reject rather than being
+silently accepted. This is not a complete NV2A renderer. Dithering is not
+hardware-verified. Multiple textures, general combiners, broader blend/depth
+functions, float/W depth, mip chains and many formats remain out of scope.
+
+Sound remains bypassed and silent. Host input is still not connected to guest
+input. No Windows/D3D11 validation has been done. Do not claim playability.
+
+
+DO NOT DO THESE
+===============
+
+  - Do not reset or discard the dirty tree.
+  - Do not edit the game XBE or asset files.
+  - Do not force +0x98, +0xC0, a timer, or game-state pointers to transition.
+  - Do not disable alpha/depth/blend checks merely to obtain another picture.
+  - Do not run with RECOMP_RASTER_TEST for milestone evidence.
+  - Do not treat run 13 as a graphics regression.
+  - Do not claim gameplay or menu reachability until a distinct genuine frame
+    is captured and the state transition is shown to come from game logic.
+  - Do not commit or push unless the user asks.
+
+
+NEXT COMPLETION TEST
+====================
+
+G8 is complete only when all of these hold:
+
+  1. A measured runtime/translation boundary explains and fixes the stalled
+     post-cache transition.
+  2. File and graphics regressions pass.
+  3. A unique fresh-HDD bounded run, with RECOMP_PB_EXEC=1, captures a
+     recognizable title-produced screen different from the SEGA logo.
+  4. The run has no guest fault, forced transition, hidden unsupported-state
+     bypass, or false gameplay claim.
+  5. JSRF_GOALS_2026-09-03_RENDERER.md and a progress note are updated with
+     exact evidence and limitations.
+
+
+PRIMARY LOCAL READING ORDER
+===========================
+
+  1. CODEX_TO_CLAUDE_HANDOVER_2026-09-03.txt (this file)
+  2. CODEX_PROGRESS_2026-09-03_FIRST_GRAPHICS.md
+  3. CODEX_PROGRESS_2026-09-03_COMBINERS.md
+  4. JSRF_GOALS_2026-09-03_RENDERER.md
+  5. CLAUDE_TO_CODEX_HANDOVER_2026-09-03.txt (earlier baseline/history)
+  6. src/kernel/kernel_bridge.c and kernel_file.c latest diff
+  7. diagnostics/jsrf_first_fault/counted_file_test.c
+  8. diagnostics/jsrf_first_fault/startup_probe.c and instrument_startup.py
+
+End of handover.

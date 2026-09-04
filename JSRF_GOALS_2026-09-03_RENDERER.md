@@ -12,12 +12,23 @@ and 290 distinct asset paths, and writes a 117 MB first-run cache. Every
 vertex batch the title submits now completes the vertex stage: rejections went
 70,228 to zero when `UB_D3D` vertex colours were decoded.
 
-The screen is still black, and the reason is measured rather than assumed:
-the executor transforms the title's real geometry with the wrong program.
-Batch 20,000 arrives as an ordinary interleaved vertex buffer and comes out as
-`oPos=(0.53125 0.53125 0 inf)` for every vertex, because `slots=12 start=0` is
-still the twelve-instruction full-screen blit shader from startup, unchanged
-across 135,802 batches.
+The genuine **Presented by SEGA** startup logo now renders. See
+`CODEX_PROGRESS_2026-09-03_FIRST_GRAPHICS.md` for the fresh-HDD evidence and
+remaining limitations. This is a startup-graphics milestone, not gameplay.
+
+The sequence no longer stops there. The CRI ADX logo, the anti-graffiti legal
+notice and the Created by Smilebit screen all render too, and the title runs on
+to a heap exhaustion its own code reports as a disc error. See
+`CLAUDE_PROGRESS_2026-09-03_FCMOV.md` and `CLAUDE_PROGRESS_2026-09-03_HEAP.md`.
+The earlier memory repairs are in `CODEX_PROGRESS_2026-09-03_COMBINERS.md`.
+The title did fill its vertex buffers:
+CPU writes through `0x80000000 + offset` were landing in different storage
+from the renderer's low-memory reads. The JSRF harness now explicitly shares
+the physical heap view. Array-backed draws have finite, varying positions.
+
+Aliasing exposed a second reader executing the same commands concurrently.
+The validated harness pusher now owns execution; the legacy scanner is
+survey-only for this harness. Two stable combiner configurations remain.
 
 ## Closed by measurement, 3 September
 
@@ -27,7 +38,7 @@ one twelve-instruction program — there was no program switch to miss. The
 first-boot cache completes: nine `JSRF_CACHE_COMPLETE*.CMP` markers, no fatal
 file, a file set stable at 259 files / 117 MB.
 
-### G6 — The fragment stage refuses two draws in three
+### G6 — CLOSED. The fragment stage accepts the measured loading draws
 
 `913,580` of `1,370,379` draws are rejected with `combiner / texture program`.
 `nv2a_texture_copy` implements one measured RGB565 blit configuration and
@@ -35,14 +46,27 @@ rejects every other by design. Group the distinct combiner setups the title
 actually uses before writing any combiner code, and implement the one that
 accounts for most of them first.
 
+**Completed:** the four-stage texture-times-diffuse program, single-level
+DXT1, alpha GREATER, source-alpha blending, culling and fixed Z24 LEQUAL are
+implemented and tested. Both measured configurations now prepare without
+rejections, and the newly accepted draws produce the real SEGA logo.
+Ordered RGB565 dithering is explicitly approximate, not hardware-verified.
+
 **Completion:** the rejection count falls substantially, and the draws that
 newly pass write non-zero pixels.
 
-### G7 — Something must write non-zero pixels
+### G7 — CLOSED. Title geometry writes non-zero pixels
 
-The draws that already pass are a copy whose source surface is all zeros, and
-the rasterised position range is degenerate (`x -0.5..-0.5` over 6,851,877
-indices). A working combiner over an empty source still yields black.
+The draws that already pass copy a black source surface. The previous
+`x -0.5..-0.5` statistic measured only the first input vertex of each batch,
+not the rasterized range. It now measures all input vertices and is labelled
+accordingly. The CPU physical-heap alias repair fixed the separate, real
+zero-input problem; the title's geometry now reaches the vertex stage intact.
+A working combiner over an empty source still yields black.
+
+**Completed:** fresh-HDD `codex-dxt-depth-08` draw 11 writes 62,008 nonzero
+colour bytes. Its rendered framebuffer shows the recognizable SEGA logo;
+the longer `codex-graphics-09` run confirms the result.
 
 **Completion:** a surface with non-zero content that the title produced.
 
@@ -50,6 +74,134 @@ indices). A working combiner over an empty source still yields black.
 
 Each goal is finished when its completion test passes on a fresh-HDD run, not
 when the code looks right.
+
+### G8 — CLOSED. The startup sequence advances past the SEGA screen
+
+1. Identify the repeated post-cache wait from actual guest calls and state.
+2. Repair the measured runtime/translation boundary, with regression coverage.
+3. Demonstrate the next genuine visible startup/menu state in a bounded
+   fresh-HDD run, preserving the working logo and reporting new unsupported
+   graphics state explicitly. Do not force a game-state transition.
+
+The earlier evidence — counted-path and ten-argument directory ABI repairs —
+was necessary and is unchanged. It was not sufficient: the title recognized its
+cache and still sat on the logo.
+
+**Completed:** the lifter emitted no code for `FCMOVcc`, so JSRF's `fminf`
+(`sub_0014C870`) and `fmaxf` (`sub_0014C850`) returned their second argument.
+The colour packer `sub_000A4CF0` clamps every channel with `fminf(c, 1.0f)` then
+`fmaxf(c, 0.0f)` and writes the result back, so it stored 0.0f into all four
+channels and packed a colour of 0. `sub_00024400` renders nothing unless
+`+0xBC & 0xFF000000`, so the fade never drew and the startup script never
+advanced. Fixed in `tools/recomp/lifter.py` with
+`tools/recomp/test_lifter_fcmov.py`, backported to the generated tree by
+`diagnostics/jsrf_first_fault/backport_fcmov.py` and gated by the
+`jsrf_fcmov_backport` ctest. Full account in
+`CLAUDE_PROGRESS_2026-09-03_FCMOV.md`.
+
+Fresh-HDD `claude-fcmov-17` captures the CRI ADX logo and the anti-graffiti
+legal notice, both new and both produced by game logic, and still captures the
+SEGA logo byte-identical to `codex-graphics-09/frame003`. Newly reached
+untextured draws are rejected and reported (`135030 texture 0 disabled`), not
+silently accepted; vertex rejections stay at zero.
+
+**Completion:** a different recognizable startup/menu frame produced by game
+logic, plus passing file/graphics regression tests and updated evidence.
+
+### G9 — ACTIVE. The guest heap is exhausted before the title screen
+
+The disc-error dialog is **gone** as of Codex's cross-block flag-merge fix. The
+`jle` at 0x0013D3F3 is reached from two predecessors that both `cmp` but name
+different registers; the older translator discarded the flag state, the branch
+could never be taken, and the loader recorded status -1 and opened
+`JSRF_FATAL.ERR`. See `CLAUDE_PROGRESS_2026-09-03_FLAGS.md`.
+
+That removed the consequence, not the cause. `claude-flagmerge-32` writes no
+fatal marker and still fails 207 allocations, still stops on black after the
+anti-graffiti notice, and still shows the leak unchanged:
+`MmAllocateContiguousMemoryEx` 830 allocs / 32,483,736 bytes against
+`MmFreeContiguousMemory` 227 frees / 2,203,648. The two were real and separate.
+
+**This is now the blocker for G13, and the timeline proves it**: the stage
+loader exhausts the arena and all file I/O stops at the same moment, 52,000 log
+lines before the run ends. See G13 for the evidence and the specific fix.
+
+**It is not a leak.** Codex's resource probes show all 235 resource allocations
+succeeding, Release working (126,000 calls, all decrements), and the texture
+cache holding 235 *distinct* resources in 233 *distinct* slots with zero
+replacements -- the title's real startup working set. What consumes each arena
+increase is `ordinal 184 ra=0x0014903F`, a doubling allocator that retains every
+previous segment: 1+2+4 MB at a 52.9 MB arena, 1+2+4+8 MB at 61.8 MB. Giving it
+4 MB more makes it take 8 MB more. Enlarging the arena is worse than neutral.
+
+The question is now why that heap wants 15 MB of segments when the same code
+fits on a 64 MB console. Check whether our `NtAllocateVirtualMemory` makes its
+growth decision take a different branch before anything else: three of this
+session's four bugs were exactly that.
+
+A related audit: 110 conditional branches in this tree still reach the `_flags`
+fallback, where the condition is a constant zero and the branch can never be
+taken. Eleven are in the render/texture range and all but `sub_0014B536` have no
+static caller or dispatch entry, so they are very likely cold — but the tree
+cannot say which of the 110 matter. The lifter now marks them
+`UNRESOLVED FLAGS`, `audit_unresolved_flags.py` counts them, and the
+`jsrf_unresolved_flags_ratchet` ctest pins the number at 110.
+
+**Repaired so far**, with regression coverage in `heap_alloc_test.c` and the
+account in `CLAUDE_PROGRESS_2026-09-03_HEAP.md`:
+
+- The reuse path rounded every split to a 4 KB page whatever the caller's
+  alignment, so `ExAllocatePoolWithTag` held 3,126,516 bytes to satisfy 400,660
+  bytes of 16-byte-aligned requests. Splits now happen at the caller's
+  alignment, and a leading fragment is carved off so a misaligned free block can
+  still serve a page-aligned request. Slack 4,581,336 → 1,936,552 bytes.
+- The bump frontier and the free list could not combine. `unreached` at failure
+  went from 905,028 to 0.
+- `XBOX_STACK_SIZE` was 8 MB and had never been measured. Painting the region
+  puts the main stack's high-water at 3 KB across a full startup, with the
+  worker slices untouched; reduced to 6 MB, which keeps the slices' 4 MB and
+  returns 2 MB to the arena.
+- Reclaiming the bump path's alignment padding was tried and reverted: that
+  padding is the tail of a page-granular allocation the title owns and writes
+  into, and handing it out stopped the title dead at `IoCreateDevice`.
+- The fixed low block (primary TLS, kernel data exports, stack) sat at
+  `0x00700000` to clear any XBE. JSRF's image ends at `0x00288620`, so 4.5 MB of
+  dead address space was charged to the arena. `g_xbox_low_base` is now derived
+  from the loaded section extents, and the arena is 54 MB.
+
+**Enlarging the arena is not the answer, and that is now measured.** Across four
+arenas — 50,855,936, the same with the allocator fixes, 52,953,088 and
+57,606,144 — the title's live set at failure was 49,301,920, 49,407,608,
+52,188,296 and 55,424,136: between 96% and 99% of whatever it was given, every
+time. The largest arena reached no screen the previous one had not. A bounded
+working set settles; this does not. No further effort should go into making the
+arena bigger.
+
+The title now reaches a fourth genuine screen, **Created by Smilebit**, and
+still keeps the SEGA logo byte-identical to `codex-graphics-09/frame003`.
+
+**What remains, measured.** Per-export tallies name it exactly:
+`MmAllocateContiguousMemoryEx` 673 allocations / 31,409,696 bytes against
+`MmFreeContiguousMemory` 183 frees / 1,765,376 bytes — roughly 29.6 MB taken and
+never returned, 20.3 MB of it from one call site, `ra=0x0018E6E9`, across 231
+live blocks. `NtAllocateVirtualMemory` by contrast churns 146 MB and returns
+131 MB, so the free path itself works and no memory export is unbridged.
+
+`0x0018E6E9` and every other `ordinal 166` return address is a call site of the
+title's own D3D8 allocator vector at `MEM32(0x1C40F8)`; the sibling release slot
+`MEM32(0x1C40FC)` has exactly one call site, `0x00191A8B`. Instrument that and
+the refcount test above it, and establish whether the title declines to release
+or whether the deciding branch is mistranslated -- the FCMOVcc bug was that
+shape. The harness's `[D3D8-HLE]` layer is *not* involved: `main.c` brings it up
+as a probe and nothing in JSRF routes through it.
+Pool memory is never freed either (922 allocations, one `ExFreePool`) and two
+1 MB pure `MEM_RESERVE` calls are charged real RAM, but together those are worth
+about 2 MB against 30.
+
+**Completion:** the contiguous allocations are released as the title expects, a
+fresh-HDD run reaches the title screen without raising the disc error, and the
+bytes recovered are accounted for by measurement rather than by enlarging the
+arena.
 
 ### G1 — CLOSED. The title's vertex programs do take effect
 
@@ -73,7 +225,7 @@ current-vertex defaults. Establish whether the title sets them through
 array or by a value the title actually set; no input is served an unset
 default without that being reported.
 
-### G3 — Geometry that lands somewhere real
+### G3 — CLOSED. Geometry lands somewhere real
 
 Only after G1 and G2. 269 distinct methods reach the executor unhandled;
 `SET_CLIP_MIN`/`MAX`, the window clip, `SET_TEXTURE_CONTROL0` and the zeta
@@ -93,6 +245,276 @@ theory, and it gates everything after loading.
 **Completion:** either `JSRF_CACHE_COMPLETE01.CMP` is finished and the file
 set stops growing, or the repeating work is identified by call site.
 
+### G12 — CLOSED. The title renders its loading screen
+
+This is the blocker for visible progress, and it is not the heap.
+
+After the anti-graffiti notice the title is not stuck: `claude-worker-34` shows
+DMA_PUT advancing, draw #978,000, resources still being created and released,
+and no fatal marker. It has moved on and is rendering. Two things throw the
+result away, and they are in this order.
+
+**First, the positions collapse.** `RECOMP_COMBINER_TRACE=1` groups the whole
+run into three configurations. Config 2 is 509,310 draws -- every rejected one
+-- and its `collapsed-xy` count equals its draw count: every vertex in every
+batch transforms to the same X and Y, so the geometry has no area. The shader
+does run and its other outputs are real:
+
+```
+[VSH] start=0 slots=12 vertex=0 oPos=(0 0 0 31.3942) color=FF007272
+[VSH] start=0 slots=12 vertex=1 oPos=(0 0 0 31.3942) color=FF007272
+[VSH] start=0 slots=12 vertex=2 oPos=(0 0 0 31.3942) color=FF007272
+```
+
+X, Y and Z are exactly zero while W is computed and the diffuse colour is
+plausible. Compare the screens that do render, which use pre-transformed
+screen-space positions: `oPos=(0 0 0 1)`, `(2560 0 0 1)`, `(0 1920 0 1)`.
+
+This is not G2: the program reads inputs 0 and 2 (`reads=0005`) and both have
+declared arrays -- `a0(t2 s3 st32 @01142000) a2(t2 s2 st32 @01142018)`, in a
+live 128-byte block.
+
+**W is provably correct, which localises the fault to the xyz writes.** The
+constant file holds two matrices, and only 14 of 192 constants are non-zero:
+
+```
+c[103] = 1 0 0 0          c[107] = 1 0 0 -32
+c[104] = 0 1.33333 0 0    c[108] = 0 1 0 24
+c[105] = 0 0 0.113029 -135.529   c[109] = 0 0 1 1200
+c[106] = 0 0 0.0260836 0  c[110] = 0 0 0 1
+```
+
+A projection matrix (4:3 aspect) and a view matrix (translation -32, 24, 1200).
+The observed `W = 31.3942` is exactly `c[106].z * (z + c[109].w)` for an object
+z of about 3.6: the view transform, then the projection W row. So the constants
+arrive, the attributes are non-zero, the dp4 path works, and the program reads
+the right registers -- for W. Only x, y and z come out zero, and `c[103] =
+(1,0,0,0)` would need every vertex at x = 32 for that to be legitimate.
+
+**FIXED.** Dumping the decoded program against the constant file named it. The
+program's last two instructions are the viewport transform:
+
+```
+10  mul oPos.xyz (om=E) = R12.xyz * c58     | rcc R1.x = R12
+11  mad oPos.xyz (om=E) = R12.xyz * R1 + c59
+```
+
+`om=E` is x, y and z only, which is exactly why w -- written at instruction 9
+and never touched again -- stayed correct while xyz did not. And c58 and c59
+were zero.
+
+They are not ordinary constants. NV2A keeps the viewport scale and offset at
+fixed slots in the vertex constant file: `NV_IGRAPH_XF_XFCTX_VPSCL` = 0x3a = 58
+and `NV_IGRAPH_XF_XFCTX_VPOFF` = 0x3b = 59, written through
+`NV097_SET_VIEWPORT_SCALE`/`_OFFSET` rather than `SET_TRANSFORM_CONSTANT`.
+`nv2a_pb_exec.c` recorded both methods for the rasteriser and never mirrored
+them into the constant file, so every program that reads them multiplied by
+zero.
+
+Mirroring them is the whole fix. `collapsed-xy` for config 2 went from 714,240
+to **0**, and the SEGA logo stays byte-identical to
+`codex-graphics-09/frame003`. Covered by `vsh_render_test.c`, which asserts both
+slots land and that a neighbouring slot is not scribbled on.
+
+Two candidates ruled out against xemu on the way, recorded so they are not
+re-derived:
+
+- Constant delivery matches `pgraph.c` exactly -- `slot = (method -
+  NV097_SET_TRANSFORM_CONSTANT)/4`, write `[const_load][slot % 4]`, increment
+  `CONST_LD_PTR` when `slot % 4 == 3`. Not the bug.
+- The ±96 D3DSCM correction is a red herring. xemu's `convert_c_register` is
+  `(((c>>5)&7)-3)*32 + (c&31) + 96`, which is the identity for every 8-bit
+  input -- its own source says so (`FIXME: = c_reg?!`). Our plain index is
+  equivalent. Not the bug.
+
+**Second, the fragment stage — also fixed.** Those same draws are also
+rejected by `nv2a_texture_copy_prepare`'s first line, because
+`NV097_SET_TEXTURE_CONTROL0` bit 30 is clear:
+
+```
+[GPU] draws 967607, 13181073 indices; rasterised 72107 triangles
+[TEXTURE] prepared=67277 rejected=900330 -- all "texture 0 disabled"
+```
+
+An untextured stage cannot sample T0, so it needs a diffuse-only program, not
+the texture-times-diffuse one already implemented. Do what G6 did: group the
+rejected configurations and implement the one that accounts for most first.
+This was second because fixing it alone would have rendered nothing while the
+geometry had no area.
+
+**Completed.** The combiner input word packs each of A..D as [7:5] mapping, [4]
+alpha, [3:0] register. The measured textured stage 0 is colour `0x08040000` --
+A = register 8 (texture 0), B = register 4 (diffuse), so `T0 * V0`. With no
+texture bound the title issues `0x04200000`: A = diffuse, B = register 0 under
+mapping 1 (unsigned invert) = 1, so the stage is `V0 * 1`. Alpha likewise:
+`0x18140000` becomes `0x14200000`. Stages 1..3 are byte-identical in both and
+the shader stage program is 0 because nothing samples.
+
+`nv2a_texture_copy` accepts that program with `untextured`, skips sampling and
+reads the stage as opaque white so the existing modulate path multiplies the
+diffuse in. `nv2a_pb_exec` no longer resolves a texture DMA object for it --
+the stale handle from the last bound texture was rejecting every diffuse-only
+draw with "texture DMA range" once the combiner check passed.
+
+Result, `claude-untex-42`, fresh HDD, 90 s:
+
+```
+[TEXTURE] prepared=139463 rejected=0
+[GPU] rasterised 1557266 triangles     (was 40950)
+```
+
+**Zero rejections**, and the title renders its **"Now Loading"** screen with a
+live animated progress bar -- 52 distinct frames in one run, where every
+previous run had at most six. The four startup screens are unchanged and the
+SEGA logo is still byte-identical to `codex-graphics-09/frame003`.
+
+**Completion:** met. `collapsed-xy` 714,240 -> 0, "texture 0 disabled"
+432,960 -> 0, the SEGA logo unchanged, and "Now Loading" is a recognizable frame
+none of the four startup screens contain.
+
+### G13 — ACTIVE. Get from the loading screen into a rendered stage
+
+G12 left the title on its own animated "Now Loading" screen, and it is not
+idling there. In `claude-untex-42` it is streaming real level content:
+
+```
+Z:\Media\Stage\Stg12_08.dat   Z:\Media\Stage\Stg12_t.dat
+Z:\Media\StgObj\StgObj00.dat  StgObj11  StgObj31  CarObj01
+D:\Media\Z_ADX\BGM\
+```
+
+Stage 12 geometry, stage objects, a car object and the background music
+streams. The ADX tick advances (6059 -> 6158 over the sample), so the audio
+decode thread is running rather than stuck, and no fatal marker is written.
+
+**Measured: this and G9 are the same problem.** A 240-second run
+(`claude-stage-43`) puts the timeline beyond doubt. In a 64,251-line log:
+
+```
+first file read                     line     364
+out-of-memory failures            lines  11,607 - 11,918
+last file open of any kind          line  11,927
+last file read                      line  11,933
+                                    ... 52,000 further lines, no I/O at all
+```
+
+The loader streams stage assets, exhausts the heap, and stops. Every subsequent
+line is the loading screen animating over a load that can never finish. The
+title spins on 3.9M `RtlEnterCriticalSection`/`RtlLeaveCriticalSection` pairs
+waiting for workers that have nothing left to do. It is not waiting on audio --
+the ADX tick advances to 16,536 -- nor on input, and no fatal marker is written.
+
+The failing requests are `MmAllocateContiguousMemoryEx` from `ra=0x00199789`,
+128 to 2,880 bytes each, every one page-aligned as hardware would. They fail
+because the arena is full, and the largest single holder of it is the one thing
+that should cost nothing:
+
+```
+ordinal 184 ra=0x0014903F   4 blocks  15,728,640 bytes   1 + 2 + 4 + 8 MB
+```
+
+That is the guest heap's segment reserve, issued with `AllocationType = 0x2000`
+-- `MEM_RESERVE` with no `MEM_COMMIT`, confirmed in the guest code at
+`0x0014900B` where `ebx = 0x2000` is pushed. On hardware a reserve takes address
+space, not pages. We charge it 15.7 MB of a 58 MB arena.
+
+**Step 0 answered this, and the answer was no.** Before separating reserve from
+commit, measure whether the title commits what it reserves. It does: of the
+first four reservations (1+1+2+4 MB) it commits 8,331,376 of 8,388,608 bytes --
+**99%**. The pages are owed either way, so the separation buys almost nothing
+and the work below was not done. Recording it because the reasoning is what
+saves the next person the same days.
+
+**What did work: honour the requested thread stack size.**
+`PsCreateSystemThreadEx` takes `KernelStackSize` as argument 2 and the bridge
+ignored it, handing every thread the fixed `XBOX_THREAD_STACK_SIZE` of 512 KB.
+JSRF asks for 65,536. Four workers, 458,752 wasted each: 1.83 MB. Honouring it
+(clamped to a 64 KB floor and the old value as the cap) took the thread-stack
+total from 2,097,600 bytes to 262,592, and **out-of-memory failures went from
+205 a run to 0**.
+
+Also fixed on the way: `bridge_NtResumeThread` passed
+`XBOX_TO_NATIVE(STACK_ARG(1))` unguarded, and `XBOX_TO_NATIVE(0)` is the base
+of the guest mapping rather than NULL -- a caller passing the optional
+`PreviousSuspendCount` as NULL had four bytes written to guest address 0, up to
+39,130 times a run. `NtSuspendThread` beside it already guarded.
+
+**The load still does not complete, and it is no longer memory.** With OOM at
+zero the title still stops all file I/O at line 11,452 of 45,364 and animates
+the loading screen for the remaining three quarters of the run. What it does
+instead is run its own cooperative scheduler:
+
+```
+ord 224 NtResumeThread             39,130     ord 246 ObReferenceObjectByHandle  64,152
+ord 231 NtSuspendThread            37,883     ord 250 ObfDereferenceObject       64,152
+ord 143 KeSetBasePriorityThread    42,762     ord 159 KeWaitForSingleObject      17,760
+ord 277 RtlEnterCriticalSection  3,936,779    ord 294 RtlLeaveCriticalSection 3,931,674
+```
+
+all from a handful of sites around 0x00147C7A-0x00147E7F. Our suspend/resume
+semantics look right -- they use the host primitives, which keep the suspend
+count, and return the previous count as the Xbox call does. The next question
+is which of those the title is actually waiting on, and this is where xemu's
+kernel is worth reading: thread priority and `KeSetBasePriorityThread` (42,762
+calls, and we have no scheduler to apply a priority to) is the first thing that
+differs between a real kernel and host threads.
+
+(The reserve/commit note that follows is kept for whoever revisits it.)
+
+**The fix considered and deferred is the one `bridge_NtAllocateVirtualMemory` already names in its
+own comment: a reserve that costs nothing and a commit that backs pages on
+demand.** `xbox_ReserveAlloc` exists for this and is unreachable here: it
+requires `g_memory_size > g_xbox_total_ram`, and raising the map size makes
+`XBOX_HEAP_TOP` exceed `XBOX_CONTIG_SIZE` (64 MB), which
+`xbox_EnablePhysicalHeapAlias` refuses -- and JSRF's renderer depends on that
+alias. Separating "how much RAM" from "how much address space the heap may
+serve" is the knot to untie; do that before writing commit-on-demand.
+
+**Completion:** a fresh-HDD bounded run captures a frame of stage geometry --
+not a logo, not the loading screen -- produced by game logic, with the startup
+screens and the SEGA logo unchanged and any newly reached unsupported state
+reported rather than silently accepted.
+
+### G11 — 110 branches can still only go one way
+
+`_flags` is the lifter's fallback when no flag state reaches a conditional
+branch. The translator initialises it to zero and only the rep-string and xadd
+paths ever write it, so for a jcc the condition is a constant zero and the
+branch is never taken. That is arbitrary, not conservative, and it is what cost
+the loader its status at 0x0013D3F3.
+
+`audit_unresolved_flags.py` counts 110 survivors in 78 functions after Codex's
+merge fix. Eleven are in the render/texture range and all but `sub_0014B536`
+have no static caller and no dispatch-table entry, so they are very likely cold;
+nothing shows JSRF executes any of them. The lifter now marks them
+`UNRESOLVED FLAGS` and `jsrf_unresolved_flags_ratchet` pins the count.
+
+Widen `_merge_predecessor_flag_states` only where the merge is provably sound —
+a wrong condition is worse than a marked unknown one. Where it cannot be, the
+honest options are recomputing the flags at the join or refusing to translate
+the function, not a constant.
+
+**Completion:** the count falls, with a lifter regression for each shape newly
+resolved, and the ratchet lowered to match.
+
+### G10 — The pushbuffer executor can write over the guest
+
+`NV097_SET_SURFACE_COLOR_OFFSET` is an offset inside the colour DMA object, not
+a guest VA, and `nv2a_pb_exec.c` treats it as one. Upstream `0655e8e` shows what
+that costs when the two disagree: on the Dashboard a clear wrote 4.9 MB over the
+loaded XBE, and the title spun in a pushbuffer retry loop with no fault and no
+message. JSRF is unaffected today -- its surface is a real heap allocation at
+`0x01160000` and the logos render correctly -- so this is latent, not urgent.
+
+Take upstream's guard (refuse a surface write overlapping the loaded image,
+once, with the reason) and its DMA_GET-beside-DMA_PUT reporting; GET stuck
+behind PUT is the shape of a pushbuffer-full hang and we log only PUT. Getting
+the address genuinely right needs `NV097_SET_CONTEXT_DMA_COLOR`, which is the
+larger fix behind it.
+
+**Completion:** a surface write that would land inside the loaded image is
+refused and reported, with a regression test, and JSRF's rendering is unchanged.
+
 ### G5 — Real host input to the guest
 
 Unchanged and still open. The OHCI root hub has ports and completes reset, but
@@ -100,6 +522,29 @@ nothing enumerates; that needs descriptors and control transfers through the
 HCCA, which is device emulation. Not started.
 
 **Completion:** a host key or pad action changes guest-visible state.
+
+## Upstream, checked 3 September
+
+`upstream` is `sp00nznet/xboxrecomp`, at v0.7.1. We are 41 commits ahead and 11
+behind. Nothing upstream touches contiguous-memory lifetime -- `kernel_memory.c`
+has not changed there since the initial import -- so G9 gets no help from it.
+Two things are worth acting on:
+
+- **`0655e8e` is a fix we do not have, in a file we have modified.**
+  `NV097_SET_SURFACE_COLOR_OFFSET` is an offset inside the colour DMA object,
+  not a guest VA, and our executor treats it as a VA. On the Dashboard that
+  cleared 4.9 MB straight over the loaded XBE. It is benign for JSRF today --
+  our surface is a real heap allocation at `0x01160000` and the logos render
+  correctly -- but it is latent corruption and the guard is cheap. The same
+  commit reports DMA_GET beside DMA_PUT, which is what distinguishes "finished
+  submitting" from a pushbuffer-full hang; we currently log only PUT.
+- **Upstream's lifter still drops `FCMOVcc`** (`git grep fcmov upstream/main --
+  tools/recomp/lifter.py` is empty). The G8 fix and
+  `tools/recomp/test_lifter_fcmov.py` are ours alone and affect every title with
+  an x87 `fminf`/`fmaxf`, so they are worth a PR.
+
+The other nine are D3D8 texture formats, a `ReleaseMutex` `ERROR_NOT_OWNER` fix,
+and tooling.
 
 ## Non-goals for now
 

@@ -420,7 +420,10 @@ void *xbox_thread_debug_handle(void) { return (void *)g_game_thread; }
 /* One bit per worker stack slice. Interlocked because a host-driven title can
  * allocate a slice from the host thread while recompiled code allocates one for
  * a spawned worker, so the allocator itself must be thread-safe. */
-static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
+/* Zero slices is the default -- see XBOX_WORKER_STACK_COUNT. C has no
+ * zero-length array, so keep one element and let the count gate every use. */
+static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT > 0
+                                         ? XBOX_WORKER_STACK_COUNT : 1];
 
 int xbox_worker_stack_alloc(void)
 {

@@ -1,0 +1,400 @@
+CLAUDE -> CODEX HANDOVER
+Jet Set Radio Future / upstream_xboxrecomp_clean
+3 September 2026
+
+Answers CODEX_TO_CLAUDE_HANDOVER_2026-09-03.txt. Do not confuse this file with
+CLAUDE_TO_CODEX_HANDOVER_2026-09-03.txt, which is the earlier baseline.
+
+
+READ THIS FIRST
+===============
+
+Repository:
+  /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+Branch / checked-in base:
+  main at 5d95272 (origin/main). Nothing has been committed or pushed.
+
+The working tree is deliberately dirty and now contains your changes and mine.
+Do not reset, discard, overwrite or mass-format it.
+
+G8 is CLOSED. G9 is ACTIVE and not finished. G10 is new and untouched.
+The goal list is JSRF_GOALS_2026-09-03_RENDERER.md.
+
+
+EXECUTIVE STATUS
+================
+
+1. The startup sequence advances. Four genuine title-produced screens now
+   render, up from one:
+
+     CRI ADX logo
+     Presented by SEGA   (byte-identical to codex-graphics-09/frame003)
+     Created by Smilebit
+     anti-graffiti legal notice
+
+   No forced transition, no disabled check, no guest fault. This is still
+   startup, not gameplay: no input, no sound, no Windows/D3D11 validation.
+
+2. G8's blocker was a recompiler bug, not a renderer one.
+
+   tools/recomp/lifter.py had no case for FCMOVcc. It fell through to the
+   generic x87 handler and became a bare comment, so the conditional move was
+   never emitted. Only four x87 instructions in the whole generated tree were
+   untranslated -- two harmless fnclex and these two -- and both are on the
+   startup path.
+
+   sub_0014C870 is fminf and sub_0014C850 is fmaxf. With the move gone, the
+   trailing fxch/fstp discard the wrong operand and both return their SECOND
+   argument. The colour packer sub_000A4CF0 clamps every channel with
+   fminf(c, 1.0f) then fmaxf(c, 0.0f) and writes the result back, so it stored
+   0.0f into all four channels and packed a colour of 0. sub_00024400 renders
+   nothing unless +0xBC & 0xFF000000, so the fade never drew and the startup
+   script never advanced.
+
+   Your lead was close but inverted: the interpolator did step. The packer
+   zeroed it on the way out. Entry/exit observation showed 18 calls in 35s
+   before the fix and 45,000+ after, with 242 distinct alpha values.
+
+3. G9 is heap exhaustion, and enlarging the arena does not fix it.
+
+   The title still writes a zero-byte Z:\Media\Cache\JSRF_FATAL.ERR and raises
+   its own disc-error dialog. That is the title's error path, not a guest
+   fault -- nothing crashes.
+
+   Three measured corrections recovered 6.4 MB. It changed nothing that
+   matters. See "THE ARENA IS NOT THE PROBLEM" below before doing any more
+   work on memory sizing.
+
+
+WHAT I CHANGED
+==============
+
+G8 -- the FCMOVcc fix
+
+  tools/recomp/lifter.py
+    FCMOVCC_TO_JCC maps the eight FCMOVcc forms to the jcc testing the same
+    EFLAGS bits. _make_fcmovcc_cond reuses the existing _make_condition
+    machinery. lift_basic_block emits
+        if (cond) { fp_top() = fp_st(i); }
+    The source is operands[-1]: capstone reports FCMOVcc with both operands,
+    and reading operands[0] would move st(0) onto itself -- the same silent
+    no-op fxch st(i) once had. When no flag setter is tracked the generic
+    handler now says UNTRANSLATED CONDITIONAL MOVE rather than a bare
+    /* FPU: ... */, which reads as handled.
+
+  tools/recomp/test_lifter_fcmov.py   (new)
+    5 tests, 8 subtests. Both conditions, all eight forms, st(i) source
+    selection, the untracked-flags message, and the whole fmin sequence in
+    order.
+
+  diagnostics/jsrf_first_fault/backport_fcmov.py   (new)
+    The checked-out generated tree predates the lifter fix and JSRF is not
+    regenerated here, so this rewrites exactly the two statements. Idempotent.
+    --check is read-only and is wired up as the jsrf_fcmov_backport ctest, so a
+    regeneration that loses the fix fails rather than silently reverting the
+    milestone. If you do regenerate, run it; it will report "already fixed".
+
+G9 -- the allocator
+
+  src/kernel/xbox_memory_layout.c
+    - Reuse now reaches an aligned start INSIDE a free block and carves the
+      leading fragment off as its own free block. Once a misaligned block is
+      usable the trailing split only has to respect the caller's alignment.
+      ExAllocatePoolWithTag went from 706 blocks / 3,126,516 bytes holding
+      400,660 bytes of requests -- 87% padding -- to 844 blocks / 435,808.
+      Total slack 4,581,336 -> 1,936,552.
+    - heap_absorb_frontier folds the untouched tail of the arena into the free
+      block that ends at it. The two described the same arena and were only
+      ever consulted separately. "unreached" at failure went 905,028 -> 0.
+    - Reporting: per-owner slack, per-export alloc/free tallies, and the
+      failing caller's ordinal and return address on the out-of-memory line.
+
+  src/kernel/xbox_memory_layout.h
+    - XBOX_STACK_SIZE 8 MB -> 6 MB. Painting the region and scanning for the
+      lowest touched word puts the main stack's high-water at 3 KB across a
+      full 70-second startup; the worker slices in the bottom 4 MB are
+      untouched. 6 MB keeps the slices' 4 MB for the tick-driven model and
+      leaves 2 MB for a main-loop title against a measured 3 KB.
+    - g_xbox_low_base. The fixed low block (primary TLS, kernel data exports,
+      TLS/PRCB stand-ins) sat at 0x00700000 to clear any XBE. JSRF's image is
+      11 sections ending at 0x00288620. The 4.5 MB between them was dead
+      address space charged to the arena. It is now derived from the loaded
+      section extents, rounded to 64 KB, with the old value as the pre-init
+      default and a larger image free to push it up.
+      XBOX_KERNEL_DATA_BASE, XBOX_STACK_BASE, XBOX_HEAP_BASE and the
+      primary-TLS addresses are expressions over it. Its 58 call sites are all
+      runtime expressions -- the case labels that look like a problem have the
+      macro on the return side.
+
+  diagnostics/jsrf_first_fault/heap_alloc_test.c
+    Sixteen 16-byte pool blocks must fit in one page; a page-aligned request
+    must be servable from a misaligned free block; the skipped lead must come
+    back reusable. Its stub XBE has no sections, so it exercises the default
+    low base.
+
+Instrumentation (all opt-in, all read-only, none of it writes guest state)
+
+  diagnostics/jsrf_first_fault/startup_probe.c + instrument_startup.py
+    RECOMP_INTERP_TRACE=1 brackets sub_00024700 entry (0x24700) and exit
+    (0x24962) and logs every call into the two setters 0x24480 and 0x24540.
+    instrument_startup.py now installs eight sites, not four; --remove still
+    takes them all out.
+
+  diagnostics/jsrf_first_fault/main.c
+    RECOMP_REPORT_MS=<ms>     periodic report interval, default 5000. This is
+                              also the RECOMP_FB_DUMP sampling interval, and
+                              5 s is coarser than the SEGA logo is on screen --
+                              that is why it appeared in no dump of the first
+                              two post-fix runs. Use 400-1500 to see the
+                              startup sequence in order.
+    RECOMP_HEAP_REPORT=1      xbox_HeapReport each period, for growth curves.
+    RECOMP_STACK_REPORT=1     stack high-water, follows the layout macros.
+    RECOMP_TOTAL_RAM_MB=<n>   diagnostic only, and it does NOT work for JSRF:
+                              xbox_EnablePhysicalHeapAlias requires a <= 64 MB
+                              layout and the renderer depends on that alias.
+                              Left wired for titles where it does work; it
+                              labels itself non-retail in its own log line.
+
+  src/kernel/kernel_bridge.c
+    Rate-limited reserve/commit log for NtAllocateVirtualMemory.
+
+Also
+
+  diagnostics/jsrf_first_fault/test_combiner_trace.py
+    config 2 now expects two draws. Your vsh_render_test.c gained the
+    alternate-winding strip after that expectation was written; the strip
+    changes cull/front-face only, so sharing the combiner config is correct
+    grouping. This was failing before I touched anything.
+
+
+THE ARENA IS NOT THE PROBLEM
+============================
+
+This is the most useful thing in this handover. Four arenas, four failures:
+
+  arena       live at failure   consumed   screens reached
+  50,855,936      49,301,920      97.0%          3
+  50,855,936      49,407,608      97.2%          3   (granularity + frontier)
+  52,953,088      52,188,296      98.6%          4   (stack 6 MB)
+  57,606,144      55,424,136      96.2%          4   (derived low block)
+
+The title consumes 96-99% of whatever it is given and hits the same wall. The
+largest arena reached no screen the previous one had not: the extra 4.5 MB
+bought allocation, not progress. A bounded working set settles somewhere and
+stops. This does not.
+
+Do not spend more effort on arena size, stack sizing, reserve/commit
+separation, or shaving slack. The remaining 1.9 MB of slack is faithful page
+rounding by page-granular allocators and should stay.
+
+What did change is the shape of the failure: the title stopped spinning on a
+retry -- 207 failed requests instead of more than forty thousand -- and now
+fails on 128 to 2,880 byte requests rather than megabytes. It gets much further
+into its allocation sequence before dying.
+
+
+THE ACTIVE LEAD FOR G9
+======================
+
+Per-export tallies (claude-heap-27):
+
+  export  15  ExAllocatePoolWithTag        922 allocs /     430,384 bytes
+  export  17  ExFreePool                     1 free   /         180 bytes
+  export 166  MmAllocateContiguousMemoryEx  673 allocs /  31,409,696 bytes
+  export 171  MmFreeContiguousMemory        183 frees  /   1,765,376 bytes
+  export 184  NtAllocateVirtualMemory       578 allocs / 146,271,184 bytes
+  export 199  NtFreeVirtualMemory           258 frees  / 131,260,464 bytes
+
+NtAllocateVirtualMemory is healthy: it churns 146 MB and returns 131 MB.
+Contiguous memory is not: roughly 29.6 MB is taken and never given back.
+
+The free path works and is not a missing bridge. With RECOMP_HEAP_TRACE=100000
+every free carries its guest return address, and they aggregate to:
+
+    257  ordinal 199 ra=0x00145A84      NtFreeVirtualMemory
+    183  ordinal 171 ra=0x001928C1      MmFreeContiguousMemory
+      2  ordinal 199 ra=0x0014A0F9
+      1  ordinal  17 ra=0x001BCC48
+
+So all contiguous frees come from ONE guest site, and it is reached.
+
+Allocation side: 0x0018E6E9 and every other ordinal-166 return address in the
+owner breakdown is a call site of an indirect call through MEM32(0x1C40F8),
+the title's own D3D8 allocator vector. sub_0018E670 wraps one of them: it
+builds an Xbox D3D resource header (MEM32(esi) = 0x1040001, size masked into
++4) and returns 0x8007000E, E_OUTOFMEMORY, when the allocation fails.
+ra=0x0018E6E9 alone holds 20.3 MB across 231 live blocks.
+
+Free side: sub_00192830 is the resource destructor. It frees through
+MEM32(0x1C404C) from two sites -- 0x00192896 for the plain address and
+0x001928C1 for the 0x80000000-mirrored one -- and picks between them, or skips
+both, on:
+
+    cmp esi, 0x20000 ; jne ...          esi is the resource type/flags
+    cmp MEM32(edi), 0 ; js  -> skip     the Common field's sign bit
+    cmp esi, 0x10000 ; je   -> skip
+    cmp esi, 0x60000 ; je   -> skip
+
+Only the 0x001928C1 path ever fires in our runs; 0x00192896 never does.
+
+So the question is why sub_00192830 is reached about a quarter as often as the
+allocator, or why it takes a skip branch when it does. Bracket it and the
+refcount test in its caller exactly the way instrument_startup.py brackets
+sub_00024700 -- that machinery is already there and takes about ten minutes to
+extend. The FCMOVcc bug was precisely this shape: a comparison on a
+resource-management path that silently went one way. Rule a second one out
+before concluding the title is at fault.
+
+Two smaller leads, both real, both minor against 29.6 MB: pool memory is never
+freed either (922 allocations, one ExFreePool), and two pure 1 MB MEM_RESERVE
+calls are charged real RAM, which bridge_NtAllocateVirtualMemory already
+documents as a known gap. Everything else JSRF asks for is RESERVE|COMMIT.
+
+A hypothesis I put in an earlier draft and then disproved, recorded so you do
+not re-derive it: the harness's [D3D8-HLE] layer is NOT swallowing the
+releases. main.c brings that layer up as a probe and says so in its own
+comment -- nothing in JSRF routes through it, the title runs its own
+statically-linked D3D8.
+
+
+G10, NEW AND UNTOUCHED
+======================
+
+Upstream (sp00nznet/xboxrecomp, this tree's `upstream` remote) has a fix we do
+not, in a file we have modified. Commit 0655e8e:
+NV097_SET_SURFACE_COLOR_OFFSET is an offset inside the colour DMA object, not a
+guest VA, and our nv2a_pb_exec.c treats it as one. On the Dashboard that
+cleared 4.9 MB straight over the loaded XBE and the title spun in a pushbuffer
+retry loop with no fault and no message.
+
+JSRF is unaffected today -- its surface is a real heap allocation at
+0x01160000 and the logos render correctly -- so this is latent, not urgent.
+The same commit reports DMA_GET beside DMA_PUT; GET stuck behind PUT is the
+shape of a pushbuffer-full hang and we log only PUT.
+
+Also worth knowing: upstream's lifter still drops FCMOVcc
+(git grep fcmov upstream/main -- tools/recomp/lifter.py is empty). The fix and
+its test are ours alone and affect every title with an x87 fminf/fmaxf. It is
+worth a PR, but I have not committed or pushed anything.
+
+We are 41 commits ahead of upstream and 11 behind. Nothing upstream touches
+contiguous-memory lifetime; kernel_memory.c has not changed there since the
+initial import, so G9 gets no help from it.
+
+
+VALIDATION ALREADY RUN
+======================
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build
+    10/10 pass, including the new jsrf_fcmov_backport.
+
+  /usr/bin/python3 diagnostics/jsrf_first_fault/test_combiner_trace.py
+    OK.
+
+  tools/recomp pytest
+    172 passed, 31 subtests, 1 pre-existing failure:
+    test_config.py::test_fallback_is_replaced. It passes alone and fails in a
+    full run because test_cfg_recovery leaves config module state set. It
+    fails identically without any of my changes. Not mine, not new.
+
+    capstone is not installed on this machine, so those tests need a venv:
+      python3 -m venv <scratch>/venv
+      <scratch>/venv/bin/pip install capstone pytest
+
+No Windows build, no full upstream suite, no regeneration.
+
+
+SAFE NEXT RUN TEMPLATE
+======================
+
+Unique run name, unique adjacent HDD path, never point at an existing
+directory.
+
+  env \
+    RECOMP_HDD_ROOT='<abs path>/build-macos/jsrf-first-fault/render-investigation/RUN_NAME-hdd' \
+    RECOMP_PB_EXEC=1 \
+    RECOMP_REPORT_MS=1000 \
+    RECOMP_FB_DUMP='<abs path>/build-macos/jsrf-first-fault/render-investigation/RUN_NAME/frame' \
+    python3 diagnostics/jsrf_first_fault/run_bounded.py RUN_NAME --seconds 90
+
+RECOMP_FB_DUMP still writes a BMP only when the CPU pushbuffer executor sees
+FLIP_STALL, so RECOMP_PB_EXEC=1 remains mandatory for any visual claim. One BMP
+is written per periodic report, so RECOMP_REPORT_MS is the sampling interval.
+
+Add RECOMP_INTERP_TRACE=1, RECOMP_HEAP_REPORT=1, RECOMP_STACK_REPORT=1,
+RECOMP_HEAP_TRACE=100000 or RECOMP_FILE_BACKTRACE=JSRF_FATAL as needed.
+
+Known frame hashes, for telling screens apart without opening them:
+
+  20b2450ed90b   Presented by SEGA        92,865 nonzero
+  fea03797e58f   CRI ADX logo             53,009
+  a2a2e38683a2   Created by Smilebit     637,369
+  7202ddaef470   Created by Smilebit (b) 630,512
+  8ac3f44fdc3f   anti-graffiti notice     90,303
+  f4d48eee3742   black                         0
+
+Solid cyan and solid blue full-screen frames are clear colours sampled between
+the clear and the draw. They are not title-produced pictures. Do not count them.
+
+
+RUNS
+====
+
+All fresh-HDD, under build-macos/jsrf-first-fault/render-investigation/.
+Do not delete them and do not reuse an old HDD for a fresh-HDD claim.
+
+  claude-interp-14    35s, pre-fix. The frozen interpolator baseline.
+  claude-fcmov-15     45s, first post-fix run.
+  claude-fcmov-17     90s at RECOMP_REPORT_MS=400. The full startup sequence
+                      including the SEGA logo. Use this for G8 evidence.
+  claude-fatal-18     75s, RECOMP_FILE_BACKTRACE=JSRF_FATAL. The disc-error
+                      message in the title's own words, and the heap report.
+  claude-heap-19/20   growth curve and slack breakdown, before any G9 fix.
+  claude-heap-21      granularity fix alone. Slack 4.58 MB -> 1.94 MB.
+  claude-heap-22      padding reclaim. Stalled at IoCreateDevice, no draws.
+  bisect-no-absorb    which of the two changes caused that.
+  bisect-no-pad-reclaim
+  claude-heap-27      per-export alloc/free tallies. The G9 diagnosis.
+  claude-heap-28      four genuine screens, then the disc error.
+  claude-free-29      free sites by guest return address.
+  claude-ram128-30    128 MB attempt. Fails at the physical heap alias.
+  claude-lowbase-31   derived low block, 54 MB arena. Still exhausts.
+
+
+DO NOT DO THESE
+===============
+
+  - Do not enlarge the arena, shrink the stack further, or shave allocator
+    slack. Four data points say it does not help.
+  - Do not reclaim the bump path's alignment padding. I tried; that padding is
+    the tail of a page-granular allocation the title owns and writes into, and
+    handing it out stopped the title dead at IoCreateDevice with no draws and
+    no ADX tick. The comment in xbox_HeapAlloc says so.
+  - Do not use RECOMP_TOTAL_RAM_MB for JSRF. It breaks the physical heap alias
+    and the run dies before the HDD is created.
+  - Do not treat a run without RECOMP_PB_EXEC=1 as graphics evidence.
+  - Do not count the cyan or blue full-screen frames as title screens.
+  - Do not disable the untextured-draw rejection to make the Smilebit screen's
+    background black. It is cyan because the fade overlay is an untextured
+    draw the renderer rejects by design, and that rejection is reported:
+    [TEXTURE] prepared=15705 rejected=126737.
+  - Do not claim gameplay, menu reachability, input or sound.
+  - Do not commit or push unless the user asks.
+
+
+READING ORDER
+=============
+
+  1. this file
+  2. CLAUDE_PROGRESS_2026-09-03_FCMOV.md   (G8, the FCMOVcc bug in full)
+  3. CLAUDE_PROGRESS_2026-09-03_HEAP.md    (G9, the allocator work and the
+                                            four-arena table)
+  4. JSRF_GOALS_2026-09-03_RENDERER.md     (G8 closed, G9 active, G10 new)
+  5. CODEX_TO_CLAUDE_HANDOVER_2026-09-03.txt   (what you handed me)
+  6. tools/recomp/lifter.py FCMOVCC_TO_JCC and test_lifter_fcmov.py
+  7. src/kernel/xbox_memory_layout.c xbox_HeapAlloc and heap_absorb_frontier
+  8. diagnostics/jsrf_first_fault/instrument_startup.py and startup_probe.c
+
+End of handover.
