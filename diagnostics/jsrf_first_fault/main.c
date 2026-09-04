@@ -18,6 +18,9 @@
 #include "nv2a_pb_scan.h"
 #include "recomp_icall_feedback.h"
 extern void nv2a_pb_exec_report(void);
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+static int pad_sentinel(void);
+static void pad_sentinel_scan(void);
 /* The rasterised surface, and the window that can show it. The executor draws
  * into guest memory and the GL backend owns the window; neither can reach the
  * other without being introduced here. */
@@ -400,6 +403,7 @@ static void jsrf_pusher_report(void)
         }
         RECOMP_ICALL_FEEDBACK_DUMP();
         if (getenv("RECOMP_PB_EXEC")) nv2a_pb_exec_report();
+        pad_sentinel_scan();
         /* The allocator prints its owner breakdown once, when a request
          * fails. That names who holds the heap at the end and says nothing
          * about how it got there -- a working set that plateaus and a leak
@@ -523,6 +527,7 @@ static DWORD WINAPI jsrf_adx_watch(LPVOID unused)
     return 0;
 }
 
+
 static void apu_mmio_write_shim(uint32_t offset, uint32_t value, unsigned width)
 {
     if (g_apu_state) {
@@ -567,7 +572,56 @@ static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
         report[axis[i].lo]     = (uint8_t)(v & 0xFFu);
         report[axis[i].lo + 1] = (uint8_t)(v >> 8);
     }
+
+    /* RECOMP_PAD_SENTINEL stamps a recognisable value into the left stick.
+     *
+     * The report demonstrably reaches guest RAM -- the runtime writes it there
+     * itself -- but that says nothing about whether the title's own input
+     * layer ever copies it out. A value nothing else would produce can be
+     * searched for: one hit is the USB transfer buffer alone, which means XPP
+     * takes delivery and stops; more than one means it propagates, and the
+     * addresses say where to look next. */
+    if (pad_sentinel()) {
+        report[12] = 0x5A; report[13] = 0x5A;      /* left stick X */
+        report[14] = 0xA5; report[15] = 0xA5;      /* left stick Y */
+    }
     return 1;
+}
+
+static int pad_sentinel(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PAD_SENTINEL") ? 1 : 0;
+    return on;
+}
+
+/* Count and locate copies of the sentinel across guest RAM. */
+static void pad_sentinel_scan(void)
+{
+    static const uint8_t pat[4] = { 0x5A, 0x5A, 0xA5, 0xA5 };
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    /* The main RAM window, indexed by guest address exactly as the pushbuffer
+     * executor indexes it. Stopping at 4 MB below the 64 MB top keeps the scan
+     * inside what the layout reserves. */
+    const uint32_t LIMIT = 0x03C00000u;
+    uint32_t i;
+    unsigned hits = 0;
+
+    if (!pad_sentinel() || !base)
+        return;
+
+    for (i = 0x10000u; i + 4 <= LIMIT; i++) {
+        if (base[i] == pat[0] && base[i + 1] == pat[1] &&
+            base[i + 2] == pat[2] && base[i + 3] == pat[3]) {
+            if (hits < 16)
+                fprintf(stderr, "  [PAD-SENTINEL] copy at guest 0x%08X\n",
+                        (unsigned)i);
+            hits++;
+        }
+    }
+    fprintf(stderr, "  [PAD-SENTINEL] %u cop%s of the pad report in guest RAM\n",
+            hits, hits == 1 ? "y" : "ies");
+    fflush(stderr);
 }
 
 #define JSRF_ENTRY_POINT 0x00148023u

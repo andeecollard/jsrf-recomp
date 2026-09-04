@@ -16,7 +16,7 @@ void jsrf_startup_probe(uint32_t pc,uint32_t object)
 {
     static int enabled=-1;
     static unsigned ticks, opens, total;
-    static uint32_t last_root[10];
+    static uint32_t last_root[15];
     static struct { uint32_t object,pc,flags,target; } seen[256];
     static unsigned count;
     static int state_enabled=-1, snapshot;
@@ -31,13 +31,20 @@ void jsrf_startup_probe(uint32_t pc,uint32_t object)
             last_snapshot=now;
             fprintf(stderr,"[STARTUP-STATE] tick=%u ms=%u root=%08X\n",ticks,now,object);
         }
-        const unsigned offsets[]={0x24,0x40,0x44,0x48,0x4c,0x74,0x94,0x7f9c,0x87dc,0x87e8};
-        uint32_t state[10];
-        for(unsigned i=0;i<10;++i) state[i]=read_word(object+offsets[i]);
+        /* +0x50..+0x60 are the triggers sub_00013A80 tests each tick and
+         * +0x40/+0x44 the flags it derives from them. Every one has been
+         * observed stuck at zero while the title sits on the loading screen,
+         * so watching the triggers themselves says whether anything upstream
+         * -- input included -- ever sets one. */
+        const unsigned offsets[]={0x24,0x40,0x44,0x48,0x4c,0x50,0x54,0x58,0x5c,
+                                  0x60,0x74,0x94,0x7f9c,0x87dc,0x87e8};
+        enum { NSTATE = 15 };
+        uint32_t state[NSTATE];
+        for(unsigned i=0;i<NSTATE;++i) state[i]=read_word(object+offsets[i]);
         ++ticks;
         if(ticks<=3 || memcmp(state,last_root,sizeof(state)) || ticks%10000==0) {
             fprintf(stderr,"[STARTUP] tick=%u root=%08X",ticks,object);
-            for(unsigned i=0;i<10;++i) fprintf(stderr," +%04X=%08X",offsets[i],state[i]);
+            for(unsigned i=0;i<NSTATE;++i) fprintf(stderr," +%04X=%08X",offsets[i],state[i]);
             fputc('\n',stderr); memcpy(last_root,state,sizeof(state));
         }
         return;
