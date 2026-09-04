@@ -18,6 +18,13 @@
 #include "nv2a_pb_scan.h"
 #include "recomp_icall_feedback.h"
 extern void nv2a_pb_exec_report(void);
+/* The rasterised surface, and the window that can show it. The executor draws
+ * into guest memory and the GL backend owns the window; neither can reach the
+ * other without being introduced here. */
+extern const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
+                                        uint32_t *pitch, uint32_t *bpp);
+extern void xbox_D3D8SetGuestFramebufferSource(
+        const void *(*fn)(uint32_t *, uint32_t *, uint32_t *, uint32_t *));
 extern void xbox_HeapReport(const char *why);
 #include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
@@ -890,6 +897,9 @@ int main(int argc, char **argv)
      * poll after enumeration already sees real pad state. */
     xbox_InputInit();
     xbox_SetUsbPadStateHook(usb_pad_state_shim);
+    /* Put the executor's output on screen. Harmless when RECOMP_PB_EXEC is
+     * unset: the getter simply reports no surface and Present just swaps. */
+    xbox_D3D8SetGuestFramebufferSource(nv2a_pb_exec_surface);
     /* Diagnostic only: RECOMP_TOTAL_RAM_MB maps more than a retail console has.
      *
      * It exists to answer one question that the failure itself cannot -- whether

@@ -549,6 +549,194 @@ static HRESULT __stdcall dev_GetCreationParameters(IDirect3DDevice8 *s, void *pP
 static HRESULT __stdcall dev_Reset(IDirect3DDevice8 *s, D3DPRESENT_PARAMETERS *pPP)
 { (void)s;(void)pPP; return D3D_OK; }
 
+/* ======================================================================== */
+/* Guest framebuffer presentation                                           */
+/* ======================================================================== */
+
+/*
+ * Show what the NV2A executor rasterised.
+ *
+ * This title drives the NV2A directly and never calls D3D to draw, so every
+ * draw here is a no-op and the window stays black however well the rasteriser
+ * is doing -- which it is: it produces the CRI logo and the loading screen in
+ * guest memory, and until now the only way to see them was RECOMP_FB_DUMP and
+ * a BMP viewer.
+ *
+ * A hook rather than a direct call because the executor lives in xbox_kernel
+ * and this is xbox_d3d, the same arrangement the APU MMIO and USB pad hooks
+ * use. The hook is read-only and is called on the thread that owns the GL
+ * context, which is the only thread allowed to touch GL.
+ */
+static const void *(*g_guest_fb)(uint32_t *w, uint32_t *h,
+                                 uint32_t *pitch, uint32_t *bpp);
+
+void xbox_D3D8SetGuestFramebufferSource(
+        const void *(*fn)(uint32_t *, uint32_t *, uint32_t *, uint32_t *))
+{
+    g_guest_fb = fn;
+}
+
+/* Convert one guest scanline to RGBA8.
+ *
+ * The Xbox surface is either 16-bit R5G6B5 or 32-bit X8R8G8B8, both
+ * little-endian, and GL wants RGBA bytes. The 5- and 6-bit channels are
+ * expanded by replicating their high bits into the low ones, so 0x1F becomes
+ * 0xFF rather than 0xF8 and white stays white. */
+static void fb_row_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t w,
+                           uint32_t bpp)
+{
+    uint32_t x;
+    if (bpp == 2) {
+        for (x = 0; x < w; x++) {
+            uint16_t p = (uint16_t)(src[2 * x] | (src[2 * x + 1] << 8));
+            uint8_t r = (uint8_t)((p >> 11) & 0x1F);
+            uint8_t g = (uint8_t)((p >> 5) & 0x3F);
+            uint8_t b = (uint8_t)(p & 0x1F);
+            dst[4 * x + 0] = (uint8_t)((r << 3) | (r >> 2));
+            dst[4 * x + 1] = (uint8_t)((g << 2) | (g >> 4));
+            dst[4 * x + 2] = (uint8_t)((b << 3) | (b >> 2));
+            dst[4 * x + 3] = 0xFF;
+        }
+    } else {
+        for (x = 0; x < w; x++) {
+            dst[4 * x + 0] = src[4 * x + 2];   /* B G R X -> R G B A */
+            dst[4 * x + 1] = src[4 * x + 1];
+            dst[4 * x + 2] = src[4 * x + 0];
+            dst[4 * x + 3] = 0xFF;
+        }
+    }
+}
+
+/* Upload the guest surface and draw it over the whole window.
+ *
+ * Reuses the fixed program with u_use_xform off, so the quad's coordinates are
+ * already clip space, and u_use_tex on with a white vertex colour so the
+ * texture passes through unmodified. Returns non-zero if it drew. */
+static int present_guest_framebuffer(void)
+{
+    static GLuint tex, vbo, vao;
+    static uint8_t *rgba;
+    static uint32_t rgba_w, rgba_h;
+    const uint8_t *fb;
+    uint32_t w = 0, h = 0, pitch = 0, bpp = 0, y;
+
+    if (!g_guest_fb || !g.prog) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[d3d8_gl] guest framebuffer: no %s\n",
+                    g_guest_fb ? "GL program" : "source hook");
+        return 0;
+    }
+    fb = (const uint8_t *)g_guest_fb(&w, &h, &pitch, &bpp);
+    if (!fb || !w || !h) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[d3d8_gl] guest framebuffer: no surface yet\n");
+        return 0;
+    }
+    {
+        static uint32_t last_w, last_h, last_bpp;
+        if (w != last_w || h != last_h || bpp != last_bpp) {
+            last_w = w; last_h = h; last_bpp = bpp;
+            fprintf(stderr, "[d3d8_gl] presenting guest framebuffer"
+                    " %ux%u pitch=%u bpp=%u\n", w, h, pitch, bpp);
+            fflush(stderr);
+        }
+    }
+
+    if (!tex) {
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    if (rgba_w != w || rgba_h != h) {
+        free(rgba);
+        rgba = (uint8_t *)malloc((size_t)w * h * 4);
+        rgba_w = w; rgba_h = h;
+        if (!rgba) { rgba_w = rgba_h = 0; return 0; }
+    }
+
+    /* The guest surface is top-down and a GL texture is bottom-up, so flip
+     * while converting rather than with a second pass or a flipped quad. */
+    for (y = 0; y < h; y++)
+        fb_row_to_rgba(rgba + (size_t)(h - 1 - y) * w * 4,
+                       fb + (size_t)y * pitch, w, bpp);
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+
+    if (!vao) {
+        /* pos.xyzw, colour.rgba, uv -- one full-screen triangle strip. */
+        static const float quad[] = {
+            -1.f, -1.f, 0.f, 1.f,  1.f, 1.f, 1.f, 1.f,  0.f, 0.f,
+             1.f, -1.f, 0.f, 1.f,  1.f, 1.f, 1.f, 1.f,  1.f, 0.f,
+            -1.f,  1.f, 0.f, 1.f,  1.f, 1.f, 1.f, 1.f,  0.f, 1.f,
+             1.f,  1.f, 0.f, 1.f,  1.f, 1.f, 1.f, 1.f,  1.f, 1.f,
+        };
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 40, (void *)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 40, (void *)16);
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 40, (void *)32);
+    }
+
+    {
+        int fbw = 0, fbh = 0;
+        SDL_GL_GetDrawableSize(g.window, &fbw, &fbh);
+        if (fbw > 0 && fbh > 0)
+            glViewport(0, 0, fbw, fbh);
+    }
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    glUseProgram(g.prog);
+    glUniform1i(g.u_use_xform, 0);
+    glUniform1i(g.u_use_tex, 1);
+    glUniform1i(g.u_tex0, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(g.vao);
+
+    /* Read the centre pixel back straight after the draw, not at the top of
+     * the next Present: after a swap the back buffer's contents are undefined,
+     * so a readback there says nothing about what was shown. This compares the
+     * guest pixel with what actually landed in the framebuffer. */
+    {
+        static unsigned shots;
+        if (++shots <= 2 || shots % 500 == 0) {
+            GLubyte px[4] = { 0, 0, 0, 0 };
+            const uint8_t *centre = rgba + ((size_t)(h / 2) * w + w / 2) * 4;
+            int fbw = 0, fbh = 0;
+            SDL_GL_GetDrawableSize(g.window, &fbw, &fbh);
+            if (fbw > 0 && fbh > 0)
+                glReadPixels(fbw / 2, fbh / 2, 1, 1, GL_RGBA,
+                             GL_UNSIGNED_BYTE, px);
+            fprintf(stderr, "[d3d8_gl] blit %u: guest centre %02X %02X %02X"
+                    " -> window %02X %02X %02X (gl err 0x%04X)\n",
+                    shots, centre[0], centre[1], centre[2],
+                    px[0], px[1], px[2], glGetError());
+            fflush(stderr);
+        }
+    }
+    return 1;
+}
+
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
                                      HWND hwnd, void *dirty)
 {
@@ -585,6 +773,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
             fflush(stderr);
         }
     }
+    present_guest_framebuffer();
     SDL_GL_SwapWindow(g.window);
     return D3D_OK;
 }

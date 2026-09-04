@@ -429,6 +429,51 @@ static uint32_t surface_bpp(void)
 }
 
 
+/* Hand the surface being drawn into to whoever can put it on screen.
+ *
+ * The executor rasterises into GUEST memory, which is the only place the
+ * picture exists: the D3D8 GL backend owns the window and draws nothing,
+ * because this title feeds the NV2A directly rather than calling D3D. So the
+ * two halves have to be introduced, and this is the read-only half of that --
+ * a host pointer to the pixels plus the geometry needed to interpret them.
+ *
+ * Returns NULL until a clear has established a real surface. The caller runs
+ * on the thread owning the GL context and must not touch anything else here.
+ */
+const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
+                                 uint32_t *pitch, uint32_t *bpp)
+{
+    uint32_t b = surface_bpp();
+    const uint8_t *mem;
+
+    if (!s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
+        return NULL;
+    if (b != 2 && b != 4)
+        return NULL;
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+    if (!mem)
+        return NULL;
+
+    if (w) *w = s_gpu.clip_w;
+    if (h) *h = s_gpu.clip_h;
+    if (pitch) *pitch = s_gpu.pitch;
+    if (bpp) *bpp = b;
+    return mem + s_gpu.color_offset
+               + (size_t)s_gpu.clip_y * s_gpu.pitch
+               + (size_t)s_gpu.clip_x * b;
+}
+
+/* This returns the surface being drawn into, live, which means the reader can
+ * catch it part-drawn. Snapshotting at NV097_CLEAR_SURFACE to get whole frames
+ * instead was tried and is WORSE: measured in claude-gfx-window-05, every
+ * sampled frame came back black, because the title clears several times per
+ * frame and to more than one surface, so a clear is not a frame boundary here
+ * and the snapshot usually caught an offscreen target. Presenting live gave
+ * the right pixels on most samples (claude-gfx-window-04). A real fix needs an
+ * actual end-of-frame signal -- this executor does not handle the flip methods
+ * at all, which is where to start. */
+
+
 /* Write the current surface out as a 24-bit BMP.
  *
  * A framebuffer window needs someone watching it. A file does not, which makes
