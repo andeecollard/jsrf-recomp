@@ -3,6 +3,7 @@
 Does not regenerate guest code or change branches, registers, or guest memory.
 """
 import argparse
+import re
 from pathlib import Path
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--remove', action='store_true')
@@ -22,15 +23,39 @@ a = p.parse_args()
 points = {
     'recomp_0000.c': {
         '00013A80': ('jsrf_startup_probe', 'ecx'),
+        # These are the only small setters for the root object's transient
+        # trigger fields.  Record who calls them and which object receives the
+        # write; observation happens before the generated body changes RAM.
+        '000126D0': ('jsrf_trigger_probe', 'ecx, MEM32(esp + 4)'),
+        '000126F0': ('jsrf_trigger_probe', 'ecx, MEM32(esp + 4)'),
+        '00012710': ('jsrf_trigger_probe', 'ecx, MEM32(esp + 4)'),
+        '00012730': ('jsrf_trigger_probe', 'ecx, MEM32(esp + 4)'),
+        '00012750': ('jsrf_trigger_probe', 'ecx, 0'),
+        '00012760': ('jsrf_trigger_probe', 'ecx, 0'),
+        '00012770': ('jsrf_trigger_probe', 'ecx, 0'),
         '00011083': ('jsrf_startup_probe', 'esi'),
         '00013220': ('jsrf_startup_probe', 'MEM32(esi + 0x87EC)'),
         '00025DD0': ('jsrf_startup_probe', 'MEM32(esp + 4)'),
         '00024700': ('jsrf_interp_probe', 'ecx'),
+        '00024711': ('jsrf_interp_path_probe', 'esi'),
+        '0002472C': ('jsrf_interp_path_probe', 'esi'),
+        '00024731': ('jsrf_interp_path_probe', 'esi'),
+        '00024740': ('jsrf_interp_path_probe', 'esi'),
+        '00024757': ('jsrf_interp_path_probe', 'esi'),
+        '00024760': ('jsrf_interp_path_probe', 'esi'),
+        '0002476F': ('jsrf_interp_path_probe', 'esi'),
+        '00024786': ('jsrf_interp_path_probe', 'esi'),
+        '00024945': ('jsrf_interp_path_probe', 'esi'),
         '00024962': ('jsrf_interp_probe', 'esi'),
         '00024480': ('jsrf_interp_probe', 'ecx'),
         '00024540': ('jsrf_interp_probe', 'ecx'),
     },
     'recomp_0009.c': {
+        # The D3D pushbuffer free-space spin. edx holds the pointer the loop
+        # dereferences for the GPU's GET position; edi is PUT and eax the space
+        # being waited for. Read-only, and self-limiting inside the probe.
+        '001914F0': ('jsrf_pushbuffer_wait_probe',
+                     'edx, MEM32(edx), edi, eax'),
         # Main 0x1C40F8 allocation site: header storage, returned address,
         # and requested byte count (computed by sub_00193380 in edi).
         '0018E6E9': ('jsrf_resource_probe', 'esi, eax, edi'),
@@ -77,6 +102,17 @@ points = {
         '0006F450': ('jsrf_error_dialog_probe',
                      'MEM32(esp), MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
     },
+    'recomp_0006.c': {
+        # The WXCI/XB disc driver's error reporter. It forwards to whatever
+        # callback the title installed at 0x002615C4, and JSRF installs none --
+        # so every one of its twelve diagnostics ("read error occurs",
+        # "nsct < 0", "Timeout. (Waiting for transmission)", the three
+        # parameter checks in wxCiReqRd) has been discarded for the whole
+        # project. The driver has been describing its own failures all along.
+        # Arguments are (arg, message) at [esp+4] and [esp+8].
+        '00140190': ('jsrf_wxci_error_probe',
+                     'MEM32(esp + 8), MEM32(esp + 4), MEM32(esp)'),
+    },
     'recomp_0010.c': {
         # Root-hub connect path: entry, device-pool allocation result, and the
         # link helper reached only when that result is non-zero.
@@ -107,4 +143,47 @@ for filename, file_points in points.items():
             s = s.replace(label, label + call)
         changed += 1
     f.write_text(s)
-print(f'{"Removed" if a.remove else "Installed"} {changed} observation sites in {len(points)} generated files')
+
+# Instrument the branch itself for every dead `_flags` fallback. Function-level
+# reachability is insufficient: many recovered functions contain cold data that
+# was conservatively decoded after an unconditional tail jump. This records
+# only a fallback conditional that actually executes, once per site and without
+# changing its value or destination.
+marker = '/* UNRESOLVED_FLAG_OBSERVATION */'
+func_re = re.compile(r'^void sub_([0-9A-Fa-f]+)\(void\)')
+cond_re = re.compile(r'/\* (\w+):')
+unresolved_sites = 0
+unresolved_files = 0
+for f in sorted(a.gen.glob('recomp_*.c')):
+    original = f.read_text().splitlines()
+    lines = [line for line in original if marker not in line]
+    output = []
+    function = None
+    flags_written = False
+    file_changed = len(lines) != len(original)
+    for lineno, line in enumerate(lines, 1):
+        m = func_re.match(line)
+        if m:
+            function = int(m.group(1), 16)
+            flags_written = False
+        if '_flags = ' in line and '_flags = 0;' not in line:
+            flags_written = True
+        if 'if (_flags' in line and not flags_written:
+            condition = cond_re.search(line)
+            if not a.remove:
+                output.append(
+                    f'    jsrf_unresolved_flag_probe(0x{function:08X}u, '
+                    f'{unresolved_sites}u); {marker} '
+                    f'/* {f.name}:{lineno} '
+                    f'{condition.group(1) if condition else "?"} */')
+                file_changed = True
+            unresolved_sites += 1
+        output.append(line)
+    if file_changed:
+        f.write_text('\n'.join(output) + '\n')
+        unresolved_files += 1
+
+action = 'Removed' if a.remove else 'Installed'
+print(f'{action} {changed} fixed observation sites in {len(points)} generated files')
+print(f'{action} {unresolved_sites} unresolved-flag execution sites in '
+      f'{unresolved_files} generated files')

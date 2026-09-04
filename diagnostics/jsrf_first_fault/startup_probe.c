@@ -12,6 +12,130 @@ static uint32_t read_word(uint32_t address) {
     if(p) memcpy(&value,p,4);
     return value;
 }
+
+/* Read back the WXCI/XB disc driver's own diagnostics.
+ *
+ * sub_00140190 is its error reporter: it loads the callback the title
+ * installed at 0x002615C4 and, only if that is non-null, forwards
+ * (context, message, argument) to it. JSRF installs no callback, so the
+ * function is a no-op and every message it was handed has been thrown away
+ * since the port began -- including the three parameter checks in wxCiReqRd
+ * and "E0109232:Timeout. (Waiting for transmission)", which is the driver
+ * saying a read never completed.
+ *
+ * This reads the message pointer out of the caller's frame and prints it. It
+ * does not install a callback: doing that would change what the guest does.
+ * Repeats are counted rather than printed, because a failing read is retried
+ * every frame and the interesting fact is which message and how fast.
+ */
+void jsrf_wxci_error_probe(uint32_t pc, uint32_t message,
+                           uint32_t argument, uint32_t return_address)
+{
+    static int enabled = -1;
+    (void)pc;
+    static struct { uint32_t message, site; unsigned long count; } seen[24];
+    static unsigned distinct;
+    unsigned i;
+
+    if (enabled < 0) enabled = getenv("RECOMP_WXCI_ERRORS") != NULL;
+    if (!enabled) return;
+
+    for (i = 0; i < distinct; ++i) {
+        if (seen[i].message == message && seen[i].site == return_address) {
+            /* Every hundredth repeat, so a retry storm is visible as a rate
+             * without becoming the whole log. */
+            if (++seen[i].count % 100 != 0) return;
+            break;
+        }
+    }
+    if (i == distinct) {
+        if (distinct >= sizeof(seen) / sizeof(seen[0])) return;
+        seen[distinct].message = message;
+        seen[distinct].site = return_address;
+        seen[distinct].count = 1;
+        ++distinct;
+    }
+
+    {
+        char text[96];
+        unsigned n;
+        for (n = 0; n + 1 < sizeof(text); ++n) {
+            const char *p = xbox_GpuMemoryRange(message + n, 1);
+            if (!p || !*p) break;
+            text[n] = *p;
+        }
+        text[n] = 0;
+        fprintf(stderr,
+                "[WXCI-ERROR] count=%lu caller=%08X arg=%08X msg=%08X \"%s\"\n",
+                seen[i].count, return_address, argument, message, text);
+        fflush(stderr);
+    }
+}
+
+/* The D3D pushbuffer free-space wait, which the sampler says is where the
+ * title spends 89% of its main thread during the loading stall:
+ *
+ *   loc_001914F0: ecx = [edx]        ; the GPU's GET pointer, re-read
+ *                 esi = edi - ecx    ; edi = PUT
+ *                 cmp eax, esi ; jb loc_001914F0
+ *
+ * It spins until GET advances. The runtime does advance DMA_GET, but only the
+ * copy in the NV2A USER aperture at 0xFD800044. Whether this loop is reading
+ * that register or some other location nothing updates is the whole question,
+ * and the pointer is only knowable at runtime.
+ *
+ * Samples rather than logs: the loop body runs millions of times a second, so
+ * printing per iteration would change what is being measured.
+ */
+void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,
+                                uint32_t get_value, uint32_t put,
+                                uint32_t needed)
+{
+    static int enabled = -1;
+    static unsigned long long iterations;
+    static unsigned reports;
+    static uint32_t first_get_ptr, first_get_value;
+
+    if (enabled < 0) enabled = getenv("RECOMP_PB_WAIT_TRACE") != NULL;
+    if (!enabled) return;
+
+    if (++iterations == 1) {
+        first_get_ptr = get_ptr;
+        first_get_value = get_value;
+    }
+    /* Powers of ten, so a loop that exits promptly prints once and a loop that
+     * never exits reports its own divergence without flooding. */
+    if (iterations != 1 && iterations % 1000000ull) return;
+    if (reports++ > 40) return;
+
+    fprintf(stderr,
+            "[PB-WAIT] iter=%llu pc=%08X get_ptr=%08X get=%08X put=%08X"
+            " needed=%08X outstanding=%08X get_moved=%s ptr_moved=%s\n",
+            iterations, pc, get_ptr, get_value, put, needed,
+            (uint32_t)(put - get_value),
+            get_value == first_get_value ? "NO" : "yes",
+            get_ptr == first_get_ptr ? "no" : "YES");
+    fflush(stderr);
+}
+
+void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site)
+{
+    static unsigned char seen[1024];
+    static int enabled = -1;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_UNRESOLVED_FLAGS") != NULL;
+    if (!enabled || site >= sizeof(seen) || seen[site])
+        return;
+    seen[site] = 1;
+    fprintf(stderr,
+            "[UNRESOLVED-FLAG] executed site=%u function=0x%08X "
+            "fallback=0 (branch forced not-taken)\n",
+            site, guest_function);
+    fflush(stderr);
+}
+static uint32_t startup_root_object;
+
 void jsrf_startup_probe(uint32_t pc,uint32_t object)
 {
     static int enabled=-1;
@@ -25,6 +149,7 @@ void jsrf_startup_probe(uint32_t pc,uint32_t object)
     if(state_enabled<0) state_enabled=getenv("RECOMP_STARTUP_STATE")!=NULL;
     if(!enabled) return;
     if(pc==0x13a80) {
+        startup_root_object=object;
         uint32_t now=GetTickCount();
         snapshot=state_enabled && (!last_snapshot || now-last_snapshot>=2000);
         if(snapshot) {
@@ -84,6 +209,31 @@ void jsrf_startup_probe(uint32_t pc,uint32_t object)
     fputc('\n',stderr);
 }
 
+/* Observe the only direct writers of the root object's transient command
+ * fields.  The setters are shared by many game systems, so the object and
+ * return address distinguish a genuine root transition request from an
+ * unrelated call.  This probe is deliberately read-only. */
+void jsrf_trigger_probe(uint32_t pc, uint32_t object, uint32_t argument)
+{
+    static int enabled = -1;
+    static unsigned calls, root_calls;
+    uint32_t return_address;
+
+    if (enabled < 0) enabled = getenv("RECOMP_TRIGGER_TRACE") != NULL;
+    if (!enabled) return;
+
+    return_address = read_word(g_esp);
+    ++calls;
+    if (object == startup_root_object) ++root_calls;
+    if (calls <= 512 || object == startup_root_object)
+        fprintf(stderr,
+                "[TRIGGER-WRITE] call=%u root_call=%u pc=%08X ret=%08X"
+                " object=%08X root=%08X arg=%08X%s\n",
+                calls, root_calls, pc, return_address, object,
+                startup_root_object, argument,
+                object == startup_root_object ? " ROOT" : "");
+}
+
 /*
  * Read-only observation of the first USB device-enumeration step. The XPP
  * root-hub path enters sub_001BF72C for a newly connected port, allocates a
@@ -129,6 +279,26 @@ static void interp_read(uint32_t object, uint32_t out[6])
 {
     static const unsigned offsets[6] = { 0x98, 0xA8, 0xB8, 0xBC, 0xC0, 0x9C };
     for (unsigned i = 0; i < 6; ++i) out[i] = read_word(object + offsets[i]);
+}
+
+void jsrf_interp_path_probe(uint32_t pc, uint32_t object)
+{
+    static int enabled = -1;
+    static unsigned lines;
+
+    if (enabled < 0) enabled = getenv("RECOMP_INTERP_PATH_TRACE") != NULL;
+    if (!enabled || lines >= 256 || !object ||
+        !xbox_GpuMemoryRange(object, 0xC4)) return;
+
+    ++lines;
+    fprintf(stderr,
+            "[INTERP-PATH] line=%u pc=%08X object=%08X"
+            " cur=%08X target=%08X step=%08X settled=%08X"
+            " eax=%08X ecx=%08X edx=%08X fp_top=%u fp_cmp=%d\n",
+            lines, pc, object, read_word(object + 0x98),
+            read_word(object + 0xA8), read_word(object + 0xB8),
+            read_word(object + 0xC0), g_eax, g_ecx, g_edx,
+            g_fp_top, g_fp_cmp);
 }
 
 void jsrf_interp_probe(uint32_t pc, uint32_t object)
