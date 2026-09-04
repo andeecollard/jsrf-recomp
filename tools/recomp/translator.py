@@ -23,7 +23,45 @@ import struct
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers)
+                     detect_setjmp_helpers, _operand_width)
+
+
+def _merge_predecessor_flag_states(states):
+    """Return the flag state that is valid on every incoming CFG edge.
+
+    Identical states are the simple case.  ``cmp`` and ``test`` also have a
+    useful less-obvious case: the lifter snapshots their runtime operands into
+    the same function-local ``_fa/_fb/_fas/_fbs`` variables.  If every edge
+    arrives from the same kind and width of snapshot, a joined jcc can read
+    those variables even when each path's compare names different registers.
+
+    Width agreement matters for js/jns, which must cast the subtraction or
+    mask back to the original operand width.  Other flag setters are left
+    conservative because their conditions may re-read the static operands.
+    """
+    if not states or any(state is None for state in states):
+        return None
+
+    first = states[0]
+    if all(state == first for state in states[1:]):
+        return first
+
+    setters = {state[0] for state in states}
+    if len(setters) != 1 or first[0] not in ("cmp", "test", "bsf", "bsr"):
+        return None
+    if any(len(state[1]) < 2 for state in states):
+        return None
+
+    def snapshot_width(state):
+        ops = state[1]
+        return _operand_width(ops[0]) or _operand_width(ops[1]) or 4
+
+    if len({snapshot_width(state) for state in states}) != 1:
+        return None
+
+    # The operands are used only to retain setter kind and width.  At runtime
+    # the condition reads whichever predecessor's snapshot actually executed.
+    return first
 
 
 def _fixup_icall_esp_save(lines):
@@ -1020,11 +1058,7 @@ class FunctionTranslator:
                 incoming = None
             elif all(p in out_state for p in sources):
                 states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
+                incoming = _merge_predecessor_flag_states(states)
             else:
                 incoming = None
 

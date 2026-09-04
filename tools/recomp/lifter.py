@@ -698,6 +698,32 @@ def _make_cmovcc_cond(cmov_mnemonic, flag_setter, flag_ops):
     return None
 
 
+# FCMOVcc reads the integer EFLAGS (CF, ZF, PF only) and moves st(i) into st0
+# when the condition holds. The names are not the same as CMOVcc's -- there is
+# no signed form -- so map each to the jcc that tests the same bits.
+FCMOVCC_TO_JCC = {
+    "fcmovb":   "jb",    # CF=1
+    "fcmovbe":  "jbe",   # CF=1 or ZF=1
+    "fcmove":   "je",    # ZF=1
+    "fcmovu":   "jp",    # PF=1
+    "fcmovnb":  "jae",   # CF=0
+    "fcmovnbe": "ja",    # CF=0 and ZF=0
+    "fcmovne":  "jne",   # ZF=0
+    "fcmovnu":  "jnp",   # PF=0
+}
+
+
+def _make_fcmovcc_cond(fcmov_mnemonic, flag_setter, flag_ops):
+    """Generate the condition expression for an FCMOVcc instruction."""
+    jcc = FCMOVCC_TO_JCC.get(fcmov_mnemonic)
+    if not jcc:
+        return None
+    result = _make_condition(jcc, flag_setter, flag_ops)
+    if result:
+        return result[0]
+    return None
+
+
 # ── Pattern matching for flag-setter + jcc ────────────────────
 
 def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
@@ -2009,13 +2035,27 @@ class Lifter:
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
+        # No usable flag state reached this jcc, so there is no condition to
+        # emit. `_flags` is the function-local fallback: the translator
+        # initialises it to zero and only the rep-string and xadd paths ever
+        # write it, so for a jcc it is a constant zero and the branch is never
+        # taken. That is not a conservative answer, it is an arbitrary one --
+        # a silently mistranslated branch, which is how JSRF's loader came to
+        # record status -1 at 0x0013D3F3 and open JSRF_FATAL.ERR.
+        #
+        # The emitted code is unchanged, because there is no correct
+        # conservative choice for a branch. What changes is that it says so:
+        # UNRESOLVED FLAGS is greppable, so a generated tree can be counted
+        # (`grep -c "UNRESOLVED FLAGS"`) instead of the class hiding behind a
+        # comment that reads like ordinary output.
         cond_info = COND_MAP.get(jcc)
         desc = cond_info[2] if cond_info else jcc
+        mark = f"{jcc}: {desc} - UNRESOLVED FLAGS, branch never taken"
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
-            return [f"if (_flags /* {jcc}: {desc} */) goto loc_{target:08X};"]
+                return [f"if (_flags /* {mark} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+            return [f"if (_flags /* {mark} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
     # ── SETcc / CMOVcc ──
@@ -2023,13 +2063,15 @@ class Lifter:
     def _lift_setcc(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
-        return [_fmt_operand_write(ops[0], f"_flags /* {m} */")]
+        return [_fmt_operand_write(
+            ops[0], f"_flags /* {m} - UNRESOLVED FLAGS, always 0 */")]
 
     def _lift_cmovcc(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        return [f"if (_flags /* {m} */) {_fmt_operand_write(ops[0], src)}"]
+        return [f"if (_flags /* {m} - UNRESOLVED FLAGS, never moves */)"
+                f" {_fmt_operand_write(ops[0], src)}"]
 
     # ── String operations ──
 
@@ -2977,6 +3019,13 @@ class Lifter:
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
+        if m in FCMOVCC_TO_JCC:
+            # Reached only when lift_basic_block could not name the flag
+            # setter, so the condition is unknown. Dropping the move silently
+            # is what made JSRF's fminf/fmaxf return their second argument;
+            # say so in the output instead of leaving a bare FPU comment.
+            return [f"/* FPU: {m} {insn.op_str}"
+                    " - UNTRANSLATED CONDITIONAL MOVE, no tracked flag setter */"]
 
         return [f"/* FPU: {m} {insn.op_str} */"]
 
@@ -3059,6 +3108,31 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     _fmt_operand_write(curr.operands[0],
                                        f"({cond}) ? 1 : 0")
                     + f" /* {curr.mnemonic} */")
+                i += 1
+                continue
+
+        # FCMOVcc, the branchless half of the x87 fminf/fmaxf idiom:
+        #     fld a; fld b; fcom st(1); fnstsw ax; test ah, 1
+        #     fcmove st(0), st(1)   ; fxch st(1) ; fstp st(0)
+        # It fell through to the generic FPU handler, which emitted a bare
+        # `/* FPU: fcmove ... */` comment -- so the move never happened and the
+        # sequence always returned its second argument. JSRF's sub_0014C870 is
+        # fminf and sub_0014C850 is fmaxf; the colour packer sub_000A4CF0 calls
+        # fminf(c, 1.0f) then fmaxf(c, 0.0f) on every channel, so every colour
+        # it wrote came back 0. That is what held the startup fade at alpha 0.
+        if (curr.mnemonic in FCMOVCC_TO_JCC
+                and last_flag_setter and curr.operands):
+            cond = _make_fcmovcc_cond(
+                curr.mnemonic, last_flag_setter, last_flag_ops)
+            if cond:
+                # Capstone reports both operands -- (st(0), st(i)) -- so the
+                # source is the last one; st(0) is the implicit destination.
+                src = curr.operands[-1]
+                idx = (lifter._st_index(src.reg)
+                       if src.type == "reg" and src.reg else 1)
+                stmts.append(
+                    f"if ({cond}) {{ fp_top() = {lifter._st_expr(idx)}; }}"
+                    f" /* {curr.mnemonic} {curr.op_str} */")
                 i += 1
                 continue
 
