@@ -103,6 +103,11 @@ points = {
                      'MEM32(esp), MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
     },
     'recomp_0006.c': {
+        # Both exits of the cache index walk sub_00143540: 0x001435C4 returns
+        # zero (miss) and 0x001435CC returns the matched entry in ebp. Five
+        # registers are still pushed at each, so the query path is at esp+0x18.
+        '001435C4': ('jsrf_cache_lookup_probe', 'MEM32(esp + 0x18), 0'),
+        '001435CC': ('jsrf_cache_lookup_probe', 'MEM32(esp + 0x18), ebp'),
         # The WXCI/XB disc driver's error reporter. It forwards to whatever
         # callback the title installed at 0x002615C4, and JSRF installs none --
         # so every one of its twelve diagnostics ("read error occurs",

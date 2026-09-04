@@ -118,6 +118,75 @@ void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,
     fflush(stderr);
 }
 
+/* The WXCI cache index lookup, sub_00143540, at both of its exits.
+ *
+ * wxCiOpen calls it through the callback the title installs at 0x002615D4.
+ * A miss is not survivable: the caller falls through to a `rep stosd` that
+ * zeroes 0x54 dwords of the handle. At the loading boundary it misses on
+ * D:\Media\Z_ADX\BGM\title.adx, the title screen's music, while the file
+ * itself opens perfectly well through the ordinary path.
+ *
+ * The index is 16 mount slots at 0x00269D80, stride 0x30: an active flag at
+ * +0x00, the prefix string at +0x18, an entry count at +0x24 and the list
+ * head at +0x28. A query matches a slot when it starts with that prefix, and
+ * the remainder is then compared against each name in the list.
+ *
+ * Dumping the table on the first miss answers the question the disassembly
+ * cannot: whether the BGM directory has a slot at all, whether that slot is
+ * active, and how many names it holds.
+ */
+static void cache_string(uint32_t address, char *out, unsigned size)
+{
+    unsigned n;
+    for (n = 0; n + 1 < size; ++n) {
+        const char *p = xbox_GpuMemoryRange(address + n, 1);
+        if (!p || !*p) break;
+        out[n] = *p;
+    }
+    out[n] = 0;
+}
+
+void jsrf_cache_lookup_probe(uint32_t pc, uint32_t path, uint32_t found)
+{
+    static int enabled = -1;
+    static unsigned long hits, misses;
+    static int dumped;
+    char text[160];
+
+    if (enabled < 0) enabled = getenv("RECOMP_CACHE_TRACE") != NULL;
+    if (!enabled) return;
+
+    if (found) { ++hits; if (hits > 8) return; }
+    else ++misses;
+
+    cache_string(path, text, sizeof(text));
+    fprintf(stderr, "[CACHE-%s] hits=%lu misses=%lu entry=%08X path=\"%s\"\n",
+            found ? "HIT" : "MISS", hits, misses, found, text);
+
+    if (!found && !dumped) {
+        unsigned slot;
+        dumped = 1;
+        fprintf(stderr, "[CACHE-TABLE] 16 slots at 0x00269D80\n");
+        for (slot = 0; slot < 16; ++slot) {
+            uint32_t base = 0x00269D80u + slot * 0x30u;
+            uint32_t active = read_word(base);
+            uint32_t prefix = read_word(base + 0x18);
+            uint32_t count = read_word(base + 0x24);
+            uint32_t head = read_word(base + 0x28);
+            char name[96];
+
+            if (!active && !prefix && !count) continue;
+            cache_string(prefix, name, sizeof(name));
+            fprintf(stderr,
+                    "[CACHE-TABLE]   slot=%2u active=%08X count=%d head=%08X"
+                    " prefix=\"%s\"\n",
+                    slot, active, (int)count, head, name);
+        }
+    }
+    fflush(stderr);
+    (void)pc;
+}
+
 void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site)
 {
     static unsigned char seen[1024];

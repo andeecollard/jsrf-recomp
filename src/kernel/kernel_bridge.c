@@ -1340,6 +1340,51 @@ static DWORD bridge_nt_timeout_to_ms(uint32_t timeout_va)
     return 0;   /* absolute deadline: treat as already due */
 }
 
+/* Which dispatcher objects are ever signalled, and which are only waited on.
+ *
+ * An object that a thread waits on indefinitely and nobody ever sets is a
+ * deadlock the sampler shows as a sleeping thread and nothing else explains.
+ * JSRF parks two worker threads in sub_0018CE50, which clears the D3D device's
+ * event at device+0x2430 and waits on it with no timeout; neither KeSetEvent
+ * site in D3D targets that address. Recording both sides is how to tell a
+ * missing signal from a slow one.
+ *
+ * Addresses only, deduplicated, so the cost is a small linear scan on calls
+ * that are already crossing the thunk boundary.
+ */
+static void event_trace_note(const char *side, uint32_t object)
+{
+    static int enabled = -1;
+    static struct { uint32_t object; unsigned long count; char side; } seen[64];
+    static unsigned distinct;
+    unsigned i;
+
+    if (enabled < 0) enabled = getenv("RECOMP_EVENT_TRACE") != NULL;
+    if (!enabled || !object) return;
+
+    for (i = 0; i < distinct; ++i) {
+        if (seen[i].object == object && seen[i].side == side[0]) {
+            ++seen[i].count;
+            /* Report the first, then decade by decade, so a hot signal shows
+             * as a rate and a wait that never returns still reports once. */
+            if (seen[i].count != 10 && seen[i].count != 1000 &&
+                seen[i].count != 100000)
+                return;
+            break;
+        }
+    }
+    if (i == distinct) {
+        if (distinct >= sizeof(seen) / sizeof(seen[0])) return;
+        seen[distinct].object = object;
+        seen[distinct].side = side[0];
+        seen[distinct].count = 1;
+        ++distinct;
+    }
+    fprintf(stderr, "[EVENT-%s] object=%08X count=%lu\n",
+            side, object, seen[i].count);
+    fflush(stderr);
+}
+
 static void bridge_KeSetEvent(void)
 {
     uint32_t event_ptr = STACK_ARG(0);
@@ -1349,6 +1394,7 @@ static void bridge_KeSetEvent(void)
         g_eax = 0;
         return;
     }
+    event_trace_note("SET", event_ptr);
     previous = DISPATCHER_SIGNALSTATE(event_ptr);
     DISPATCHER_SIGNALSTATE(event_ptr) = 1;
     g_eax = previous;
@@ -1372,6 +1418,7 @@ static void bridge_KeWaitForSingleObject(void)
         g_eax = 0;   /* STATUS_SUCCESS */
         return;
     }
+    event_trace_note("WAIT", object);
 
     ms = bridge_nt_timeout_to_ms(timeout_ptr);
     infinite = (ms == INFINITE);
@@ -1423,7 +1470,9 @@ static void bridge_KeWaitForSingleObject(void)
         bridge_timers_poll();
         bridge_vblank_poll();
         bridge_device_irq_poll();
+#if !defined(_WIN32)
         w32_thread_suspend_point();
+#endif
         Sleep(1);
     }
 }
@@ -5062,7 +5111,9 @@ static void kernel_thunk_dispatch(void)
      * suspended parks itself here rather than being stopped from outside,
      * which POSIX cannot do safely. Costs one relaxed read when nothing is
      * pending. See w32_thread_suspend_point. */
+#if !defined(_WIN32)
     w32_thread_suspend_point();
+#endif
     bridge_timers_poll();
 
     g_kernel_call_count++;
