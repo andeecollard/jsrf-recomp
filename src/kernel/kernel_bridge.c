@@ -1355,6 +1355,12 @@ static void bridge_KeSetEvent(void)
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+/* Defined with the scheduling bridges below; used here too. */
+static int sched_trace_on(void);
+static int g_sched_wait_slot = -1;
+static unsigned long *g_sched_wait_woke, *g_sched_wait_timeout;
+static void sched_note(const char *what, uint32_t handle, uint32_t extra);
+
 static void bridge_KeWaitForSingleObject(void)
 {
     uint32_t object      = STACK_ARG(0);
@@ -1370,6 +1376,30 @@ static void bridge_KeWaitForSingleObject(void)
     ms = bridge_nt_timeout_to_ms(timeout_ptr);
     infinite = (ms == INFINITE);
     deadline = GetTickCount() + ms;
+    /* Outcome, not just entry. A thread that re-enters the same wait forever
+     * is either being woken and finding nothing to do, or never being woken at
+     * all, and those have opposite fixes. Counted per object. */
+    if (sched_trace_on()) {
+        static struct { uint32_t obj; unsigned long waits, ready, woke, timeout; } w[16];
+        static unsigned wn;
+        unsigned i;
+        for (i = 0; i < wn; ++i) if (w[i].obj == object) break;
+        if (i == wn && wn < 16) { w[wn].obj = object; ++wn; }
+        if (i < 16) {
+            ++w[i].waits;
+            if (DISPATCHER_SIGNALSTATE(object)) ++w[i].ready;
+            if ((w[i].waits % 2000) == 0) {
+                fprintf(stderr, "  [SCHED] wait object=0x%08X type=%u entries=%lu"
+                                " already-signalled=%lu woken=%lu timed-out=%lu\n",
+                        object, (unsigned)DISPATCHER_TYPE(object), w[i].waits,
+                        w[i].ready, w[i].woke, w[i].timeout);
+                fflush(stderr);
+            }
+            g_sched_wait_slot = (int)i;
+            g_sched_wait_woke = &w[i].woke;
+            g_sched_wait_timeout = &w[i].timeout;
+        }
+    }
 
     for (;;) {
         if (DISPATCHER_SIGNALSTATE(object)) {
@@ -1377,10 +1407,12 @@ static void bridge_KeWaitForSingleObject(void)
             if (DISPATCHER_TYPE(object) == DISPATCHER_SYNCHRONIZATION) {
                 DISPATCHER_SIGNALSTATE(object) = 0;
             }
+            if (g_sched_wait_woke) ++*g_sched_wait_woke;
             g_eax = 0;   /* STATUS_SUCCESS */
             return;
         }
         if (!infinite && (int32_t)(GetTickCount() - deadline) >= 0) {
+            if (g_sched_wait_timeout) ++*g_sched_wait_timeout;
             g_eax = 0x00000102u;   /* STATUS_TIMEOUT */
             return;
         }
@@ -4231,13 +4263,50 @@ static void bridge_NtReleaseMutant(void)
  * does that on a worker, and the "suspended" thread spun through 289 million
  * kernel calls while the title thought it was idle.
  */
+/* Who is waiting for whom.
+ *
+ * With the arena fixed, JSRF still stops all file I/O a quarter of the way
+ * into a run and animates its loading screen for the rest. What it does
+ * instead is drive its own cooperative scheduler: 39,130 NtResumeThread and
+ * 37,883 NtSuspendThread calls, 42,762 KeSetBasePriorityThread, and 3.9M
+ * critical-section pairs, from a handful of sites around 0x00147C7A.
+ *
+ * "The scheduler is spinning" is not a diagnosis. This records the calling
+ * thread, the target handle and the guest return address for each scheduling
+ * primitive, so the question becomes which thread is blocked on which -- and
+ * whether anything is ever actually resumed. RECOMP_SCHED_TRACE only.
+ */
+static int sched_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_SCHED_TRACE") != NULL;
+    return on;
+}
+
+static void sched_note(const char *what, uint32_t handle, uint32_t extra)
+{
+    static unsigned long seen;
+    unsigned long n = ++seen;
+    /* Every call early, then a thinning sample: the pattern is what matters
+     * and a three-minute run makes millions of these. */
+    if (n > 200 && (n % 5000) != 0) return;
+    fprintf(stderr, "  [SCHED] %-18s #%lu host_thread=%lu handle=0x%08X"
+                    " stack_top=0x%08X ra=0x%08X extra=0x%08X\n",
+            what, n, (unsigned long)GetCurrentThreadId(), handle,
+            g_thread_stack_top, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0, extra);
+    fflush(stderr);
+}
+
 static void bridge_NtSuspendThread(void)
 {
     uint32_t count_va = STACK_ARG(1);
 
+    if (sched_trace_on()) sched_note("NtSuspendThread", STACK_ARG(0), 0);
     g_eax = (uint32_t)xbox_NtSuspendThread(
         bridge_resolve_handle(STACK_ARG(0)),
         count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (sched_trace_on() && count_va)
+        sched_note("  -> prev count", STACK_ARG(0), BRIDGE_MEM32(count_va));
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
@@ -4250,9 +4319,12 @@ static void bridge_NtResumeThread(void)
      * scheduler and issues 39,130 resumes in a three-minute run. */
     uint32_t count_va = STACK_ARG(1);
 
+    if (sched_trace_on()) sched_note("NtResumeThread", STACK_ARG(0), 0);
     g_eax = (uint32_t)xbox_NtResumeThread(
         bridge_resolve_handle(STACK_ARG(0)),
         count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (sched_trace_on() && count_va)
+        sched_note("  -> prev count", STACK_ARG(0), BRIDGE_MEM32(count_va));
 }
 
 /* ── PhyGetLinkState (ordinal 252, 1 arg) */

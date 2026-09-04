@@ -451,13 +451,35 @@ ord 143 KeSetBasePriorityThread    42,762     ord 159 KeWaitForSingleObject     
 ord 277 RtlEnterCriticalSection  3,936,779    ord 294 RtlLeaveCriticalSection 3,931,674
 ```
 
-all from a handful of sites around 0x00147C7A-0x00147E7F. Our suspend/resume
-semantics look right -- they use the host primitives, which keep the suspend
-count, and return the previous count as the Xbox call does. The next question
-is which of those the title is actually waiting on, and this is where xemu's
-kernel is worth reading: thread priority and `KeSetBasePriorityThread` (42,762
-calls, and we have no scheduler to apply a priority to) is the first thing that
-differs between a real kernel and host threads.
+all from a handful of sites around 0x00147C7A-0x00147E7F.
+
+**Measured, and the scheduler is not the problem.** `RECOMP_SCHED_TRACE`
+records the calling thread, target handle and previous suspend count for every
+scheduling primitive, and the outcome of every wait:
+
+```
+suspend counts observed          0 and 1 only -- bounded, nothing accumulates
+wait object=0x0019D630 type=0    entries=8000 woken=8006 timed-out=0
+```
+
+Four guest threads suspend and resume each other with correct counts, and every
+wait is satisfied rather than timing out. The last file read is a clean
+51,200-byte success with no error and no retry, and then the loader simply
+stops asking for data.
+
+**It stops because it has finished.** The last assets it opens are
+
+```
+Z:\Media\Mark\PRESS\JSRF_TEXS_0.JTX
+Z:\Media\Mark\PRESS\JSRF_TEXSx0.JTX
+```
+
+the PRESS START textures. The title has loaded its startup content and is
+waiting for a button. **G13 is therefore blocked on G5, not on memory, not on
+the renderer and not on the scheduler** -- and G5 has not been started.
+
+xemu was worth consulting twice on the NV2A side and is not needed here: this
+is not a semantics question, it is a missing input path.
 
 (The reserve/commit note that follows is kept for whoever revisits it.)
 
@@ -515,7 +537,14 @@ larger fix behind it.
 **Completion:** a surface write that would land inside the loaded image is
 refused and reported, with a regression test, and JSRF's rendering is unchanged.
 
-### G5 — Real host input to the guest
+### G5 — ACTIVE, and now the blocker. Real host input to the guest
+
+Promoted from "not started": G13 ends here. The title loads
+`Z:\Media\Mark\PRESS\JSRF_TEXS_0.JTX`, stops all file I/O with a clean final
+read, and animates while four healthy threads wait for a button press. Every
+other candidate has been measured and excluded -- the arena no longer runs out,
+the scheduler's suspend counts are bounded and its waits are woken, and the
+renderer accepts every draw the title issues.
 
 Unchanged and still open. The OHCI root hub has ports and completes reset, but
 nothing enumerates; that needs descriptors and control transfers through the
