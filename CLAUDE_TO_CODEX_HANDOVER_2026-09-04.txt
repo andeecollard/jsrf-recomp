@@ -1,0 +1,361 @@
+CLAUDE -> CODEX HANDOVER
+Jet Set Radio Future / upstream_xboxrecomp_clean
+4 September 2026
+
+Continues CLAUDE_TO_CODEX_HANDOVER_2026-09-03_G8_G9.txt. Do not confuse this
+with CLAUDE_TO_CODEX_HANDOVER_2026-09-03.txt, which is the older baseline.
+
+
+READ THIS FIRST
+===============
+
+Repository:
+  /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+State: main at 12446d7, pushed to origin/main, working tree clean.
+Twelve commits on top of 5d95272. Everything below is committed; there is no
+dirty work to preserve this time.
+
+The local branch jsrf-startup-to-loading-screen points at the same history and
+can be deleted.
+
+Test state: ctest 12/12, test_combiner_trace.py OK, tools/recomp 179 passed
+with one pre-existing failure (see VALIDATION).
+
+
+EXECUTIVE STATUS
+================
+
+JSRF now boots to its animated "Now Loading" screen and streams stage assets.
+The sequence that renders is:
+
+  CRI ADX logo -> Presented by SEGA -> Created by Smilebit
+    -> anti-graffiti notice -> "Now Loading" with a live progress bar
+
+It then loads Stage 12 geometry, stage objects, a car object and the BGM
+streams, finishes cleanly, and waits for a button press it can never receive.
+
+That is the whole story: G13 ends at G5, host input. Not memory, not the
+renderer, not the scheduler. Each of those was measured and excluded.
+
+
+WHAT WAS WRONG, IN ORDER
+========================
+
+Five faults, each hiding the next. Every one was found by reading the
+generated guest code against measured runtime state, not by reasoning from a
+specification.
+
+1. FCMOVcc was never emitted (7ed3441)
+
+   The lifter had no case for it; it fell through to the generic x87 handler
+   and became a bare comment. That is the whole of fminf (sub_0014C870) and
+   fmaxf (sub_0014C850) -- with the move gone the trailing fxch/fstp discard
+   the wrong operand and both return their SECOND argument. The colour packer
+   sub_000A4CF0 clamps every channel with fminf(c, 1.0f) then fmaxf(c, 0.0f)
+   and writes the result back, so it stored 0.0f into all four channels. The
+   startup fade never moved.
+
+   Your interpolator lead was close but inverted: sub_00024700 did step. The
+   packer zeroed it on the way out.
+
+2. Cross-block flag merge (yours, 7ed3441)
+
+   Kept and covered. 110 branches in this tree still reach the `_flags`
+   fallback where the condition is a constant zero; the lifter now marks them
+   UNRESOLVED FLAGS and jsrf_unresolved_flags_ratchet pins the count.
+
+3. Viewport scale/offset never reached the vertex constants (1a93eeb)
+
+   NV2A keeps them at fixed slots in the constant file -- VPSCL = 58, VPOFF =
+   59 -- written through SET_VIEWPORT_SCALE/_OFFSET, not SET_TRANSFORM_CONSTANT.
+   The executor recorded both for the rasteriser and never mirrored them.
+   JSRF's program ends with
+
+       mul oPos.xyz, R12, c58
+       mad oPos.xyz, R12, R1, c59
+
+   so every vertex transformed to x=y=z=0 while w -- written one instruction
+   earlier, outside the xyz write mask -- stayed correct. That asymmetry is
+   what named it: the observed W of 31.3942 is exactly c[106].z * (z +
+   c[109].w). 714,240 draws a run collapsed to a point; now zero do.
+
+4. The untextured combiner was rejected (1a93eeb)
+
+   93% of draws. The combiner input word packs each of A..D as [7:5] mapping,
+   [4] alpha, [3:0] register. Textured stage 0 is 0x08040000, register 8
+   (texture 0) times register 4 (diffuse). With no texture bound the title
+   issues 0x04200000: diffuse times register 0 under mapping 1 (unsigned
+   invert) = 1. Same four-stage program, texture-less stage 0. Sampling is
+   skipped, the stage reads as opaque white, and the existing modulate path
+   multiplies the diffuse in.
+
+   Rejections 432,960 -> 0, triangles 40,950 -> 1,557,266.
+
+5. Thread stacks were eight times too big (3e84ce7)
+
+   PsCreateSystemThreadEx takes KernelStackSize as argument 2 and the bridge
+   ignored it, handing every thread 512 KB. JSRF asks for 65,536. Four
+   workers, 458,752 wasted each. Thread stacks 2,097,600 -> 262,592 bytes and
+   out-of-memory failures 205 a run -> ZERO.
+
+   The same commit carries four smaller allocator corrections: split
+   granularity at the caller's alignment rather than a page, frontier
+   coalescing, a low block derived from the loaded image instead of a fixed
+   0x00700000, and stack-region sizing measured rather than guessed.
+
+
+G5 -- ACTIVE, AND THE ONLY BLOCKER
+==================================
+
+The title loads Z:\Media\Mark\PRESS\JSRF_TEXS_0.JTX -- the PRESS START
+textures -- stops all file I/O with a clean 51,200-byte read, and animates
+while four healthy threads wait for a button.
+
+There is already a host-side backend, src/input/xinput_device.c: SDL game
+controllers plus RECOMP_FAKE_PAD=1, which pulses A and START. It is
+byte-identical to upstream apart from that addition, and NOTHING CALLS IT.
+xbox_InputGetState has no caller. JSRF does not go through XAPI on the host;
+it drives OHCI itself.
+
+Upstream has no USB device model at all (`git grep -i "ohci\|HCCA"
+upstream/main -- src` is empty), so this tree is the furthest along.
+
+What now works (b5cacea, c5fc586):
+
+  - HcInterruptEnable (0xFED00010) and HcInterruptDisable (0xFED00014) are a
+    set/clear pair, handled by the MCPX write trap. As plain memory the
+    controller-start write of MasterInterruptEnable was replaced microseconds
+    later by sub_001BD295's write of RootHubStatusChange, and the ISR at
+    0x001C288F tests bit 31 separately and declined every interrupt.
+    Now: HcInterruptEnable reads 0x80000073, "device ISR vector 1 -> TRUE",
+    and ord 119 gains call site 0x001C290F -- the ISR queuing its own DPC,
+    which bridge_run_isr already runs after the handler returns.
+
+  - HcRhPortStatus is not a value register either. Low half is commands (1 to
+    bit 1 enables, bit 4 resets, bit 8 powers), high half is five
+    write-1-to-clear change bits. As plain memory the driver's acknowledge of
+    0x00010000 wiped CurrentConnectStatus with it, so the device vanished the
+    moment it was noticed. ohci_port_write models both halves; a reset
+    completes in place. HcRhPortStatus[0] now reads 0x00000001 and stays.
+
+  - mcpx_hw_store is the other half of that. The runtime asserting a condition
+    means "this is now the value", the opposite of a guest write, so the
+    attach probe drops the guard rather than acknowledging the change it is
+    announcing.
+
+WHERE IT STOPS, AND THE NEXT QUESTION
+
+Across a whole run the driver writes HcRhPortStatus 72 times,
+HcInterruptEnable 63 and HcInterruptStatus 61 -- acking and re-masking every
+pass -- and writes a non-zero endpoint-list head EXACTLY NEVER.
+ControlListFilled is never set. It loops in the root hub and never issues the
+port reset, so there is nothing for a transfer service to service yet. Do not
+start writing one.
+
+The path is read and recorded:
+
+  sub_001BD295  root-hub poll. Walks four ports from ebx+0x54, tests
+                CurrentConnectStatus, builds a change bitmap, acks each port,
+                writes HcInterruptEnable = 0x40, calls sub_001C2220.
+  sub_001C2220  walks the bitmap against a per-port "already seen" mask at
+                this+0x461. An unseen connect sets the bit and calls
+                sub_001BF8F6.
+  sub_001BF8F6  tail-calls sub_001BF72C.
+  sub_001BF72C  allocates a device object from the pool at 0x264858, stamps it
+                (MEM8(esi)=0xFE, port at +4), links it, calls sub_001C06B3.
+                *** If the allocation returns zero it branches straight to its
+                exit at loc_001BF7ED. ***
+
+So the next question is narrow, not open-ended: DOES sub_001BF72C RUN, AND
+DOES ITS ALLOCATION SUCCEED? An empty device pool looks exactly like what is
+observed. Probe it the way sub_00024700 and sub_00192830 were probed --
+instrument_startup.py plus a read-only probe in startup_probe.c.
+
+Only after that is answered is the HCCA transfer service worth starting. Then:
+answer the port reset and the control transfers on the default endpoint
+through the HCCA at 0x009E2000, and answer interrupt-IN with pad reports fed
+from xbox_InputGetState, which already exists.
+
+
+HYPOTHESES TESTED AND DISPROVED
+===============================
+
+Recorded so they are not re-derived. Each cost time; each was settled by
+measurement rather than argument.
+
+  - "The heap is leaking." It is not. Codex's resource probes show all 235
+    resource allocations succeeding, Release working (126,000 calls, all
+    decrements), and the texture cache holding 235 DISTINCT resources in 233
+    DISTINCT slots with zero replacements. It is the real startup working set.
+
+  - "Give the arena more memory." Actively counterproductive. ordinal 184
+    ra=0x0014903F is a doubling allocator that retains every previous segment:
+    1+2+4 MB at a 52.9 MB arena, 1+2+4+8 MB at 61.8 MB. Four MB more makes it
+    take eight MB more.
+
+  - "Separate MEM_RESERVE from MEM_COMMIT." Measured first, and the answer was
+    no: the title commits 8,331,376 of its first 8,388,608 reserved bytes --
+    99%. The pages are owed either way.
+
+  - "The D3D8-HLE layer is swallowing resource releases." It is not. main.c
+    brings that layer up as a probe and says so in its own comment; nothing in
+    JSRF routes through it.
+
+  - "The cooperative scheduler is deadlocked." It is not. Suspend counts stay
+    at 0 and 1, and the object the loader waits on is woken 8,006 times against
+    8,000 entries with zero timeouts.
+
+  - "The USB driver is sub_001A1E74 / sub_001A52F7." Wrong -- those are APU
+    code on the 0xFE801xxx aperture. The USB stack is the XBE's XPP section,
+    0x001BC7C0, 30,616 bytes.
+
+  - "MIE is lost, so shadow the enable register in xbox_McpxHoldRegisters."
+    Right diagnosis, wrong placement: a poll cannot see a write that is
+    replaced between polls. It needed the write trap. The polled version was
+    removed.
+
+xemu (github.com/xemu-project/xemu) was worth consulting twice, and both times
+it KILLED a hypothesis rather than supplying an answer:
+
+  - Constant delivery matches pgraph.c exactly -- slot = (method -
+    NV097_SET_TRANSFORM_CONSTANT)/4, write [const_load][slot % 4], increment
+    CONST_LD_PTR when slot % 4 == 3.
+  - The +-96 D3DSCM correction is a red herring. convert_c_register is
+    (((c>>5)&7)-3)*32 + (c&31) + 96, which is the identity for every 8-bit
+    input; xemu's own source says so with a FIXME.
+
+Use it that way: to rule things out fast, not to look up answers.
+
+
+INSTRUMENTS ADDED THIS SESSION
+==============================
+
+All opt-in, all read-only, all off by default.
+
+  RECOMP_REPORT_MS=<ms>     periodic report interval, default 5000. This is
+                            also the RECOMP_FB_DUMP sampling interval, and
+                            5 s is coarser than the SEGA logo is on screen.
+                            Use 400-1500 to see the startup sequence in order.
+  RECOMP_INTERP_TRACE=1     brackets the colour interpolator sub_00024700 and
+                            its two setters.
+  RECOMP_RESOURCE_TRACE=1   the D3D allocation and release vectors, the
+                            canonical Release helper, the destructor's free
+                            paths, the texture cache, the error dialog.
+  RECOMP_SCHED_TRACE=1      calling thread, target handle and previous suspend
+                            count for every scheduling primitive, plus the
+                            outcome of every wait.
+  RECOMP_HEAP_REPORT=1      xbox_HeapReport each period, for growth curves.
+  RECOMP_HEAP_TRACE=<n>     every alloc/free/reuse with its guest return
+                            address; n large enough gets them all.
+  RECOMP_STACK_REPORT=1     stack high-water, follows the layout macros.
+  RECOMP_VSH_TRACE=1        vertex delivery counters, the decoded program
+                            ([VSH-PROG]) and the non-zero constant file
+                            ([VSH-CONST]). This is what named fault 3.
+  RECOMP_OHCI_TRACE=1       every guest write to the OHCI operational
+                            registers, named. This is what named the port
+                            semantics fault, and it is the best instrument in
+                            the tree for the remaining USB work.
+  RECOMP_OHCI_ATTACH=1      report a device on root-hub port 1.
+  RECOMP_OHCI_DUMP=<n>      dump the root-hub register block n times, plus the
+                            USB init gate readout.
+  RECOMP_OHCI_MIE=1         force MasterInterruptEnable. A probe, and it does
+                            NOT help -- it fires before the title's own write.
+  RECOMP_FAKE_PAD=1         a pad that reports connected and pulses A/START.
+                            Reaches nothing yet; see G5.
+  RECOMP_TOTAL_RAM_MB=<n>   diagnostic only, and it does NOT work for JSRF:
+                            the physical heap alias requires a 64 MB layout
+                            and the renderer depends on it.
+
+
+VALIDATION
+==========
+
+  cmake --build build-macos/jsrf-first-fault/build --parallel 6
+  ctest --test-dir build-macos/jsrf-first-fault/build          12/12
+  /usr/bin/python3 diagnostics/jsrf_first_fault/test_combiner_trace.py   OK
+
+  tools/recomp pytest: 179 passed, 37 subtests, 1 pre-existing failure --
+  test_config.py::test_fallback_is_replaced. It passes alone and fails in a
+  full run because test_cfg_recovery leaves config module state set. Not new
+  and not ours.
+
+  capstone is not installed on this machine, so those tests need a venv:
+    python3 -m venv <scratch>/venv
+    <scratch>/venv/bin/pip install capstone pytest
+
+  New gates: jsrf_fcmov_backport, jsrf_flag_merge_backport (both idempotent
+  --check scripts over the preserved generated tree) and
+  jsrf_unresolved_flags_ratchet, pinned at 110. The ratchet is a ratchet, not
+  a gate: lower it when a fix reduces the count.
+
+No Windows build, no full regeneration.
+
+
+SAFE RUN TEMPLATE
+=================
+
+Unique run name, unique adjacent HDD path, never an existing directory.
+
+  env \
+    RECOMP_HDD_ROOT='<abs>/build-macos/jsrf-first-fault/render-investigation/RUN-hdd' \
+    RECOMP_PB_EXEC=1 \
+    RECOMP_REPORT_MS=1000 \
+    RECOMP_FB_DUMP='<abs>/build-macos/jsrf-first-fault/render-investigation/RUN/frame' \
+    python3 diagnostics/jsrf_first_fault/run_bounded.py RUN --seconds 90
+
+RECOMP_PB_EXEC=1 remains mandatory for any visual claim: RECOMP_FB_DUMP writes
+a BMP only when the CPU pushbuffer executor sees FLIP_STALL, one per periodic
+report.
+
+Known frame hashes, for telling screens apart without opening them:
+
+  20b2450ed90b   Presented by SEGA        92,865 nonzero
+  fea03797e58f   CRI ADX logo             53,009
+  a2a2e38683a2   Created by Smilebit     637,369
+  7202ddaef470   Created by Smilebit (b) 630,512
+  8ac3f44fdc3f   anti-graffiti notice     90,303
+  f4d48eee3742   black                         0
+
+Everything else with 614,400 nonzero is either a solid clear colour sampled
+between the clear and the draw, or one of ~45 distinct "Now Loading" animation
+frames. Do not count the clear colours as screens.
+
+
+DO NOT DO THESE
+===============
+
+  - Do not enlarge the arena. Four data points say it does not help and the
+    doubling allocator makes it worse.
+  - Do not reclaim the bump path's alignment padding. Tried; that padding is
+    the tail of a page-granular allocation the title owns and writes into, and
+    handing it out stopped the title dead at IoCreateDevice.
+  - Do not use RECOMP_TOTAL_RAM_MB for JSRF. It breaks the physical heap alias
+    and the run dies before the HDD is created.
+  - Do not start the HCCA transfer service yet. The driver has not asked for a
+    transfer; answer the sub_001BF72C question first.
+  - Do not treat a run without RECOMP_PB_EXEC=1 as graphics evidence.
+  - Do not disable the untextured-draw rejection or any other explicit reject
+    to obtain a picture.
+  - Do not claim gameplay, menu reachability, input or sound.
+
+
+READING ORDER
+=============
+
+  1. this file
+  2. JSRF_GOALS_2026-09-03_RENDERER.md   (G8/G12 closed, G9 closed in
+                                          practice, G13 blocked on G5, G5
+                                          active with the exact next question,
+                                          G10/G11 latent)
+  3. CLAUDE_PROGRESS_2026-09-03_FCMOV.md  (fault 1, in full)
+  4. CLAUDE_PROGRESS_2026-09-03_HEAP.md   (the allocator work and the
+                                           four-arena table)
+  5. CLAUDE_PROGRESS_2026-09-03_FLAGS.md  (fault 2 and the 110 audit)
+  6. git log 5d95272..main                (twelve commits, each message says
+                                           what was measured)
+  7. src/kernel/xbox_memory_layout.c      ohci_port_write, mcpx_hw_store, the
+                                           MCPX trap handler
+  8. diagnostics/jsrf_first_fault/instrument_startup.py and startup_probe.c
+
+End of handover.
