@@ -58,5 +58,46 @@ int main(void) {
     memset(target,0xcc,sizeof(target)); CHECK(DRAW());
     CHECK(!memcmp(texture,target,6)); CHECK(!memcmp(texture+8,target+8,6));
     CHECK(target[6]==0xcc && target[7]==0xcc); /* RGB565 direct-copy path honours pitch */
-    puts("Texture DMA, RGB565, filtering, projection, alpha, bounds and rejection checks passed");
+    /* Measured four-stage modulation: non-white diffuse must disable the
+     * byte-copy shortcut and be interpolated with reciprocal W. */
+    copy_methods(methods,3,2,8,20,4); modulate_methods(methods);
+    CHECK(!nv2a_texture_copy_prepare(methods,&s) && s.modulate);
+    vertices();
+    for(int i=0;i<3;++i) for(int k=0;k<3;++k) v[i][3][k]=.25f*(k+1);
+    CHECK(DRAW());
+    CHECK(pixel(target)==0x48400000);
+    CHECK((pixel(target+4)&0xffffff)==0x008000);
+    CHECK((pixel(target+8)&0xffffff)==0x0000bf);
+    for(int i=0;i<3;++i) for(int k=0;k<3;++k) v[i][3][k]=i==1 ? .75f : .25f;
+    for(int i=0;i<3;++i) v[i][9][0]=v[i][9][1]=.5f; /* fixed red texel */
+    v[1][0][3]=2;
+    CHECK(DRAW()); CHECK(pixel(target)==0x44440000);
+    vertices();
+    for(int i=0;i<3;++i) { v[i][3][0]=2; v[i][3][1]=-1; v[i][3][2]=.5f; }
+    CHECK(DRAW()); CHECK((pixel(target)&0xffffff)==0xff0000);
+    CHECK((pixel(target+4)&0xffffff)==0);
+    CHECK((pixel(target+8)&0xffffff)==0x000080);
+    v[1][3][0]=NAN; memset(target,0xcc,sizeof(target));
+    CHECK(!DRAW()); for(unsigned i=0;i<sizeof(target);++i) CHECK(target[i]==0xcc);
+    vertices(); for(int i=0;i<3;++i) for(int k=0;k<3;++k) v[i][3][k]=.5f;
+    copy_methods(methods,3,2,8,8,2); modulate_methods(methods);
+    CHECK(!nv2a_texture_copy_prepare(methods,&s)); CHECK(DRAW());
+    CHECK(target[0]==0 && target[1]==0x80); /* half red, not the original full red */
+    s.dither=1; memset(target,0xcc,sizeof(target));
+    CHECK(DRAW()); CHECK(target[0]==0 && target[1]==0x78); /* ordered half-red quantisation */
+    /* Every active stage and final selection is part of the whitelist. */
+    const unsigned selectors[]={0x1e60,0x1e70,0x288,0x28c,
+        0xac0,0xac4,0xac8,0xacc,0x260,0x264,0x268,0x26c,
+        0xaa0,0xaa4,0xaa8,0xaac,0x1e40,0x1e44,0x1e48,0x1e4c};
+    for(unsigned i=0;i<sizeof(selectors)/sizeof(selectors[0]);++i) {
+        methods[selectors[i]/4]^=1;
+        CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"combiner / texture program"));
+        methods[selectors[i]/4]^=1;
+    }
+    methods[0x300/4]=1; CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"alpha test"));
+    methods[0x300/4]=0; methods[0x304/4]=1;
+    CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"blending"));
+    methods[0x304/4]=0; methods[0x1b04/4]=0x09920c29; /* multiple DXT1 mip levels remain unsupported */
+    CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"texture format / mip layout"));
+    puts("Texture DMA, RGB565, filtering, projection, modulation, alpha, bounds and rejection checks passed");
 }

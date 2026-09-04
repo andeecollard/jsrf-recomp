@@ -62,6 +62,9 @@ int main(void)
 {
     uint32_t a, b, c, d, big;
 
+#if !defined(_WIN32)
+    check(!xbox_EnablePhysicalHeapAlias(), "alias requires an initialised owned layout");
+#endif
     build_xbe();
     if (!xbox_MemoryLayoutInit(g_xbe, sizeof g_xbe)) {
         fprintf(stderr, "FAIL: memory layout would not initialise\n");
@@ -72,9 +75,37 @@ int main(void)
      * table was matched and marked, but no kernel export reached it. */
     a = xbox_HeapAlloc(0x10000, 4096);
     check(a != 0, "first allocation");
+#if !defined(_WIN32)
+    /* JSRF's buffer lock reads resource+4 and ORs 0x80000000. That view
+     * must share the bytes the GPU reads, not merely share free bookkeeping.
+     * Enabling the opt-in also preserves existing low-heap data. */
+    volatile uint32_t *low=(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+a);
+    volatile uint32_t *physical=(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+(a|0x80000000u));
+    volatile uint32_t *low_pinned=(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+0x61000);
+    volatile uint32_t *high_pinned=(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+0x80061000u);
+    *low=0x12345678u;
+    *physical=0x87654321u;
+    check(*low==0x12345678u, "the shared physical heap is opt-in");
+    *low_pinned=0x13579bdfu;
+    *high_pinned=0x2468ace0u;
+    check(xbox_EnablePhysicalHeapAlias(), "enable the JSRF physical heap alias");
+    check(*physical==0x12345678u, "low heap writes reach the CPU physical view");
+    *physical=0xaabbccddu;
+    check(*low==0xaabbccddu, "physical buffer writes reach low GPU memory");
+    check(xbox_EnablePhysicalHeapAlias(), "enabling an existing alias is idempotent");
+    check(*low_pinned==0x13579bdfu && *high_pinned==0x2468ace0u,
+          "low pinned storage remains separate from the image");
+    check(*(uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+0x10000)==0x48454258u,
+          "the low XBE header is intact");
+    check(*(uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+0x8001003cu)==0x80u,
+          "the fake high kernel header is intact");
+#endif
     xbox_HeapFree(a);
     b = xbox_HeapAlloc(0x10000, 4096);
     check(b == a, "a freed block is handed out again");
+#if !defined(_WIN32)
+    check(*physical==0, "reallocation zeroing reaches the physical view");
+#endif
 
     /* The physical-memory mirror names the same RAM. A title that allocates
      * through the ordinary address and frees through 0x80000000 + address is
@@ -134,6 +165,56 @@ int main(void)
     xbox_HeapFree(0x00000040u);
     xbox_HeapFree(big);
     check(xbox_HeapAlloc(0x10000, 4096) == big, "table survives a stray free");
+
+    /* Allocation granularity is the caller's alignment, not a page.
+     *
+     * ExAllocatePool and ExAllocatePoolWithTag ask for 16-byte alignment. When
+     * a reused block was rounded up to a whole page regardless, JSRF's 706
+     * live pool blocks held 3,126,516 bytes to satisfy 400,660 bytes of
+     * requests -- 2,725,856 of padding, part of 4,581,336 bytes of slack on a
+     * 48.5 MB arena. A 1,092,096 byte request then failed with 1,175,364 free,
+     * and the title raised its disc-error dialog.
+     *
+     * Sixteen 16-byte allocations must therefore fit in one page, not sixteen.
+     */
+    xbox_HeapFree(big);
+    {
+        uint32_t pool[16];
+        int k;
+
+        for (k = 0; k < 16; k++) {
+            pool[k] = xbox_HeapAlloc(16, 16);
+            check(pool[k] != 0, "pool allocation");
+            check((pool[k] & 15u) == 0, "pool allocation is 16-byte aligned");
+            if (k)
+                check(pool[k] == pool[k - 1] + 16,
+                      "consecutive pool blocks are 16 bytes apart");
+        }
+        check(pool[15] - pool[0] < 4096,
+              "sixteen 16-byte pool blocks fit inside one page");
+
+        /* And a page-aligned request must still be servable from what is left,
+         * even though the free block now starts 256 bytes into a page. Before
+         * the leading split it could not be: a misaligned free block was
+         * skipped outright, which is the reason the trailing boundary was
+         * page-rounded in the first place. */
+        a = xbox_HeapAlloc(0x2000, 4096);
+        check(a != 0, "page-aligned request served from a misaligned free block");
+        check((a & 0xFFFu) == 0, "it is actually page-aligned");
+        check(a > pool[15], "it came from the remainder, not from fresh arena");
+
+        /* The bytes skipped to reach that boundary are not lost: they go back
+         * as their own free block and a later small request uses them. */
+        b = xbox_HeapAlloc(16, 16);
+        check(b > pool[15] && b < a,
+              "the skipped lead is reusable, not leaked");
+
+        xbox_HeapFree(b);
+        xbox_HeapFree(a);
+        for (k = 15; k >= 0; k--)
+            xbox_HeapFree(pool[k]);
+    }
+
 
     if (failures) {
         fprintf(stderr, "%d heap allocator check(s) failed\n", failures);

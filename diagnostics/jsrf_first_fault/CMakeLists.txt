@@ -26,6 +26,10 @@ add_executable(jsrf_heap_alloc_test heap_alloc_test.c)
 target_link_libraries(jsrf_heap_alloc_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_heap_alloc COMMAND jsrf_heap_alloc_test)
 
+add_executable(jsrf_counted_file_test counted_file_test.c)
+target_link_libraries(jsrf_counted_file_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_counted_file COMMAND jsrf_counted_file_test)
+
 add_executable(jsrf_first_fault
     main.c
     startup_probe.c
@@ -93,6 +97,10 @@ add_executable(jsrf_texture_copy_test texture_copy_test.c)
 target_link_libraries(jsrf_texture_copy_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_texture_copy COMMAND jsrf_texture_copy_test)
 
+add_executable(jsrf_dxt_fragment_test dxt_fragment_test.c)
+target_link_libraries(jsrf_dxt_fragment_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_dxt_fragment COMMAND jsrf_dxt_fragment_test)
+
 add_executable(jsrf_texture_copy_replay texture_copy_replay.c)
 target_link_libraries(jsrf_texture_copy_replay PRIVATE xbox_vsh)
 
@@ -100,6 +108,40 @@ add_executable(jsrf_pusher_stream_test pusher_stream_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c")
 target_include_directories(jsrf_pusher_stream_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_pusher_stream COMMAND jsrf_pusher_stream_test)
+
+# The checked-out generated tree predates the FCMOVcc lifter fix (tools/recomp
+# covers the lifter itself), and JSRF is not regenerated here, so the two
+# fminf/fmaxf sites carry a backport instead. Without it both routines return
+# their second argument and the colour packer writes zero into every channel.
+# This fails if a regeneration or a stray edit ever drops that.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME jsrf_fcmov_backport
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_fcmov.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
+    # The preserved generated tree also predates compatible EFLAGS snapshot
+    # merging.  Without this site the loader unconditionally records -1 and
+    # JSRF reaches its fatal-disc-error path after the anti-graffiti screen.
+    add_test(NAME jsrf_flag_merge_backport
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_flag_merge.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
+    # A ratchet, not a gate. 110 conditional branches in this tree still reach
+    # the `_flags` fallback, where the condition is a constant zero and the
+    # branch can never be taken -- the same defect that cost the loader its
+    # status at 0x0013D3F3. Most are in functions with no static caller, but
+    # the count must not grow unnoticed. Lower the number when a fix reduces it.
+    add_test(NAME jsrf_unresolved_flags_ratchet
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
+                     --max 110 --gen "${RECOMP_GEN_DIR}")
+endif()
+
+add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_scan.c")
+target_include_directories(jsrf_pb_scan_owner_test PRIVATE "${XBOXRECOMP_DIR}/src/kernel")
+add_test(NAME jsrf_pb_scan_owner COMMAND jsrf_pb_scan_owner_test)
 
 option(JSRF_STARTUP_ABI_CHECK "Check guest register preservation at startup chunk calls" OFF)
 if(JSRF_STARTUP_ABI_CHECK)

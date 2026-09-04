@@ -15,8 +15,10 @@
 #include "guest_trace.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
+#include "nv2a_pb_scan.h"
 #include "recomp_icall_feedback.h"
 extern void nv2a_pb_exec_report(void);
+extern void xbox_HeapReport(const char *why);
 #include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 
@@ -46,7 +48,8 @@ extern MCPXAPUState *g_apu_state;
  * It lives HERE, in the per-title harness, and not in src/kernel, because the
  * addresses are this title's: 0x0019DCE0 is a D3D8 global and GET sits in a
  * contiguous buffer whose address only the guest knows. The runtime's existing
- * ack targets the USER area at 0xFD800040/44, which this channel does not use.
+ * ack targets the USER area at 0xFD800040/44, but the software index also needs
+ * acknowledgement after the published commands have actually been consumed.
  * The general fix is to route NV2A register writes to a model the way APU
  * writes now are, and learn the notifier address from the channel setup; until
  * that exists this is the honest stand-in, kept out of the shared runtime.
@@ -120,7 +123,7 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     if (to <= from) return invalid;
     if (to - from > 0x100000u) return invalid;          /* implausible span */
     /* JSRF's DMA objects and allocations map this low physical range to
-     * guest RAM. The separate high contiguous window is not its backing. */
+     * guest RAM. The opt-in CPU physical heap aliases these same bytes. */
     static uint32_t snapshot[0x100000/4];
     memcpy(snapshot, (const void *)XBOX_PTR(from), to-from);
     return nv2a_pusher_run_segment(snapshot, (to-from)/4u);
@@ -338,8 +341,20 @@ static void jsrf_pusher_report(void)
     DWORD now = GetTickCount();
     NV2APusherStats st;
 
+    /* RECOMP_FB_DUMP writes one BMP per report, so the report interval is also
+     * the framebuffer sampling interval. Five seconds is right for a title that
+     * sits on one screen, and far too coarse for a startup sequence that steps
+     * through several -- the SEGA logo is on screen for about as long as the
+     * gap between two samples. Overridable rather than lowered outright: every
+     * report also prints several hundred bytes of counters. */
+    static DWORD interval;
+    if (interval == 0) {
+        const char *ms = getenv("RECOMP_REPORT_MS");
+        long v = ms ? strtol(ms, NULL, 10) : 0;
+        interval = (v >= 100 && v <= 600000) ? (DWORD)v : 5000;
+    }
     if (last == 0) { last = now; return; }
-    if (now - last < 5000) return;
+    if (now - last < interval) return;
     last = now;
 
     jsrf_find_renderer();
@@ -376,6 +391,38 @@ static void jsrf_pusher_report(void)
         }
         RECOMP_ICALL_FEEDBACK_DUMP();
         if (getenv("RECOMP_PB_EXEC")) nv2a_pb_exec_report();
+        /* The allocator prints its owner breakdown once, when a request
+         * fails. That names who holds the heap at the end and says nothing
+         * about how it got there -- a working set that plateaus and a leak
+         * that climbs look identical in a single sample. */
+        if (getenv("RECOMP_HEAP_REPORT")) xbox_HeapReport("periodic");
+        /* How much of the 8 MB stack region the title has ever touched.
+         *
+         * The arena starts where that region ends, so every byte reserved for
+         * a stack nobody uses is a byte the heap does not have. The mapping is
+         * zero-filled at init and the main stack grows down from the top, so
+         * the lowest non-zero word is the high-water mark. Worker slices, if a
+         * title used them, sit at the bottom -- reported separately so the two
+         * are not confused. */
+        if (getenv("RECOMP_STACK_REPORT")) {
+            uint32_t lo = 0, worker = 0, a;
+            for (a = XBOX_STACK_BASE; a < XBOX_HEAP_BASE; a += 4)
+                if (MEM32(a)) { lo = a; break; }
+            for (a = XBOX_WORKER_STACK_END; a < XBOX_HEAP_BASE; a += 4)
+                if (MEM32(a)) { worker = a; break; }
+            fprintf(stderr, "  [STACK] region 0x%08X-0x%08X (%u KB):"
+                    " lowest touched 0x%08X, main-stack depth %u KB,"
+                    " untouched below it %u KB (worker slices %s)\n",
+                    (unsigned)XBOX_STACK_BASE, (unsigned)XBOX_HEAP_BASE,
+                    (unsigned)(XBOX_STACK_SIZE / 1024u),
+                    lo, lo ? ((unsigned)XBOX_HEAP_BASE - lo) / 1024u : 0u,
+                    lo ? (lo - (unsigned)XBOX_STACK_BASE) / 1024u
+                       : (unsigned)(XBOX_STACK_SIZE / 1024u),
+                    (lo && lo < (uint32_t)XBOX_WORKER_STACK_END) ? "in use"
+                                                                 : "untouched");
+            (void)worker;
+            fflush(stderr);
+        }
     }
 
     nv2a_pusher_get_stats(&st);
@@ -703,7 +750,7 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
                 r->ebx, r->esi, r->edi, r->ebp);
     }
     fprintf(stderr, "\nPRIMARY GUEST STACK CODE POINTERS:\n");
-    if (g_esp >= 0x00780000u && g_esp < XBOX_STACK_TOP) {
+    if (g_esp >= (uint32_t)XBOX_STACK_BASE && g_esp < XBOX_STACK_TOP) {
         uint32_t stack_end = g_esp + 0x2000u;
         if (stack_end < g_esp || stack_end > XBOX_STACK_TOP)
             stack_end = XBOX_STACK_TOP;
@@ -791,13 +838,46 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to load XBE\n");
         return 1;
     }
+    /* The validated streaming pusher below is the sole renderer owner.
+     * MemoryLayoutInit starts a legacy scan thread; with shared physical RAM
+     * it would otherwise execute the same methods concurrently a second time. */
+    nv2a_pb_scan_set_external_executor(1);
     xbox_SetApuMmioWriteHook(apu_mmio_write_shim);
+    /* Diagnostic only: RECOMP_TOTAL_RAM_MB maps more than a retail console has.
+     *
+     * It exists to answer one question that the failure itself cannot -- whether
+     * the title's demand is bounded. A working set larger than the arena settles
+     * somewhere and stops; a leak fills whatever it is given. Every fix is
+     * measured against the retail 64 MB, and any run that sets this is not
+     * evidence of anything except which of those two it is. */
+    {
+        const char *ram = getenv("RECOMP_TOTAL_RAM_MB");
+        if (ram) {
+            long mb = strtol(ram, NULL, 10);
+            if (mb >= 64 && mb <= 512) {
+                xbox_SetTotalRam((size_t)mb * 1024 * 1024);
+                fprintf(stderr, "  [DIAG] RECOMP_TOTAL_RAM_MB=%ld -- not a retail"
+                        " configuration, for bounded-demand testing only\n", mb);
+            }
+        }
+    }
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         fprintf(stderr, "xbox_MemoryLayoutInit failed\n");
         free(xbe_data);
         return 1;
     }
     g_xbox_mem_offset = xbox_GetMemoryOffset();
+#if !defined(_WIN32)
+    /* JSRF uses low-heap unpinned GPU buffers, then locks them through the
+     * CPU physical window. Both views must share bytes. Keep this layout
+     * opt-in here: other titles can have overlapping fixed-address pools. */
+    const char *physical_alias=getenv("RECOMP_PHYSICAL_HEAP_ALIAS");
+    if ((!physical_alias || strcmp(physical_alias,"0")) && !xbox_EnablePhysicalHeapAlias()) {
+        fprintf(stderr,"JSRF physical heap alias failed\n");
+        free(xbe_data);
+        return 1;
+    }
+#endif
 
     /* Bring up the MCPX APU. JSRF's statically linked DSOUND drives the audio
      * hardware directly -- it writes a command ring in guest RAM and spins on a

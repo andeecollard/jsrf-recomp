@@ -21,8 +21,19 @@ static void copy_methods(uint32_t m[2048], unsigned width, unsigned height,
     M(0x2c0)=(width-1)<<16; M(0x2e0)=(height-1)<<16;
 #undef M
 }
+/* Exact second program measured on a fresh-HDD JSRF run: T0 * V0,
+ * then three R0 pass-through stages. Other render state is unchanged. */
+static void modulate_methods(uint32_t m[2048])
+{
+    m[0x1e60/4]=4;
+    for (unsigned i=0; i<4; ++i) {
+        m[0xac0/4+i]=i ? 0x0c200000 : 0x08040000;
+        m[0x260/4+i]=i ? 0x1c200000 : 0x18140000;
+        m[0xaa0/4+i]=m[0x1e40/4+i]=0xc00;
+    }
+}
 static void le32(uint8_t *p,uint32_t v) { for(int k=0;k<4;++k) p[k]=(uint8_t)(v>>(8*k)); }
-static void copy_dma(uint8_t *ramin, uint32_t base, uint32_t limit)
+static inline void copy_dma(uint8_t *ramin, uint32_t base, uint32_t limit)
 {
     le32(ramin+0x18,3); le32(ramin+0x1c,0x80000112);
     le32(ramin+0x48,9); le32(ramin+0x4c,0x80000112);

@@ -43,10 +43,14 @@ def check_dma(handle, offset, size, expected):
 
 texture = bytearray(args.capture.with_suffix(".texture").read_bytes())
 target = bytearray(args.capture.with_suffix(".before").read_bytes())
+depth = args.capture.with_suffix(".depth-before").read_bytes() if reg(0x30C) else b""
 check_dma(reg(0x184 if reg(0x1B04) & 3 == 1 else 0x188), reg(0x1B00), len(texture), d["texture_address"])
 check_dma(reg(0x194), reg(0x210), len(target), d["target_address"])
+if depth:
+    check_dma(reg(0x198), reg(0x214), len(depth), d["depth_address"])
 expected = args.capture.with_suffix(".after").read_bytes()
 if args.pattern:
+    assert not depth and (reg(0x1B04) & 0xFFFF) == 0x1129, "pattern check is for the RGB565 copy only"
     width, height = reg(0x1B1C) >> 16, reg(0x1B1C) & 65535
     pitch, target_pitch = reg(0x1B10) >> 16, reg(0x20C) & 65535
     assert reg(0x200) == width << 16 and reg(0x204) == height << 16 and reg(0x208) & 15 == 3
@@ -66,18 +70,25 @@ if args.pattern:
 
 suffix = ".pattern-replayed" if args.pattern else ".replayed"
 output = args.capture.with_suffix(suffix)
+depth_output = args.capture.with_suffix(".depth-replayed")
 with tempfile.TemporaryDirectory(prefix="jsrf-copy-replay-") as tmp:
     packed = Path(tmp) / "draw.bin"
     with packed.open("wb") as f:
-        f.write(struct.pack("<6I", 0x4354584E, 1, 5, len(d["vertices"]), len(texture), len(target)))
+        f.write(struct.pack("<7I", 0x4354584E, 2, 5, len(d["vertices"]), len(texture), len(target),len(depth)))
         f.write(struct.pack("<2048I", *m))
         for vertex in d["vertices"]:
             assert len(vertex) == 16 and all(len(v) == 4 for v in vertex)
             f.write(struct.pack("<64f", *(0 if value is None else value for vec in vertex for value in vec)))
         f.write(texture)
         f.write(target)
-    subprocess.run([str(args.renderer), str(packed), str(output)], check=True)
+        f.write(depth)
+    command = [str(args.renderer), str(packed), str(output)]
+    if depth:
+        command.append(str(depth_output))
+    subprocess.run(command, check=True)
 actual = output.read_bytes()
 assert actual == expected, f"replay differs in {sum(a != b for a, b in zip(actual, expected))} bytes"
+if depth:
+    assert depth_output.read_bytes() == args.capture.with_suffix(".depth-after").read_bytes(), "depth replay differs"
 print(f"{args.capture.name}: {'pattern expectation' if args.pattern else 'live framebuffer'} matches "
       f"all {len(actual)} bytes; sha256={hashlib.sha256(actual).hexdigest()}")
