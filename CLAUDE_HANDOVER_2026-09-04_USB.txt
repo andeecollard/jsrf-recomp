@@ -261,3 +261,88 @@ Carried forward untouched from the Codex session: ohci_register_test.c,
 guest_trace.h, instrument_startup.py, startup_probe.c, xbox_memory_layout.h.
 
 Nothing is committed. HEAD is still f37268a.
+
+
+===========================================================================
+CORRECTION AND UPDATE -- GRAPHICS. The renderer was never the blocker.
+===========================================================================
+
+The "EXACT NEXT STEP" above is WRONG and is superseded by this section. It
+read draws=0 as "nothing renders" and set out to build a geometry path. That
+counter belongs to the D3D11 pushbuffer sink; the CPU executor in
+src/kernel/nv2a_pb_exec.c is counted separately, and it draws. None of my runs
+had set RECOMP_PB_EXEC, so none of them drew anything. Setting it renders the
+title correctly.
+
+  env RECOMP_HDD_ROOT=... RECOMP_OHCI_ATTACH=1 RECOMP_PB_EXEC=1 \
+      RECOMP_FB_DUMP=<dir>/f \
+      python3 diagnostics/jsrf_first_fault/run_bounded.py <name> --seconds 45
+
+Run claude-gfx-pbexec-01 produces the CRI/ADX logo and the animated JSRF
+"Now Loading" screen, both correct, as <dir>/fNNN.bmp. Over 150 s
+(claude-gfx-pbexec-02) the rasteriser reports:
+
+  [VSH] executed batches=... rejected=0        the title's own vertex programs
+  [TEXTURE] prepared=... rejected=0
+  [GPU] draws 267400 (267400 with coordinates), 3596979 indices
+  [GPU] rasterised 3052519 triangles; 0 batches skipped as not screen-space,
+        0 triangles fully off-surface
+
+Zero rejected, zero skipped, zero off-surface. Geometry, the vertex-shader
+interpreter and texturing all work on the paths this title uses. There is a
+window too -- d3d8_gl.c creates one -- so this can be watched live rather than
+through BMP dumps.
+
+
+THE ACTUAL BLOCKER: THE LOAD NEVER COMPLETES
+============================================
+
+The title reaches "Now Loading" and stays there. Not slowly -- it stops.
+
+  45 s run:  242 distinct files, 284 reads
+  150 s run: 242 distinct files, 284 reads
+
+Identical. File I/O finishes and never resumes, while the game loop keeps
+running hard and the loading animation keeps ticking. So this is a stall in
+whatever ends the loading state, not a performance problem and not rendering.
+
+What has been ruled out:
+
+  - Not a fatal error. No JSRF_FATAL.ERR on the emulated HDD.
+  - Not a missing file. All 253 failures are STATUS_OBJECT_NAME_NOT_FOUND on
+    Z:\ paths, which is the HDD-cache-miss-then-read-from-D:\ pattern; the
+    D:\ read succeeds immediately after each one.
+  - Not a blocked thread. Two NtWaitForSingleObjectEx INFINITE calls in the
+    whole run, both early, neither at the stall.
+  - Not audio. The ADX manager/server handshake is healthy: tick advancing,
+    flag clear, no adxm_goto_mwidle_border timeout.
+  - Not input. Same behaviour with a real pad, with RECOMP_FAKE_PAD and with
+    no pad at all.
+  - Not rendering. Same 242/284 with and without RECOMP_PB_EXEC.
+
+The guest is busy, not idle: 5.9M kernel calls, dominated by
+RtlEnterCriticalSection and RtlLeaveCriticalSection at ~2.4M each. It is
+spinning on something it expects to change.
+
+The last file read is an ADX stream header (want=51200 got=51200,
+80 00 00 20), so the last thing loaded is music.
+
+
+NEXT STEP
+=========
+
+Find the loading screen's exit condition, with the probe machinery that is
+already here -- diagnostics/jsrf_first_fault/instrument_startup.py adds
+read-only observation sites at guest addresses, and that is how the USB device
+path was pinned down.
+
+Start from the loading state itself rather than from the file system: the
+title decides to leave "Now Loading" somewhere, and the question is which
+predicate it is re-testing 2.4M times without ever seeing true. The critical
+section traffic gives a thread to follow, and the four stage files it loaded
+(Stg10, Stg00, Stg08, Stg12, in that order, every run) give a load-completion
+counter to look for.
+
+Do not start building renderer features. Nothing in the pushbuffer sink's
+unhandled list is on the critical path -- the CPU executor already handles
+what this title draws.
