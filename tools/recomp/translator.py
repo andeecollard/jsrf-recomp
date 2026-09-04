@@ -23,7 +23,8 @@ import struct
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers, _operand_width)
+                     detect_setjmp_helpers, _operand_width, _fmt_operand_read,
+                     _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER)
 
 
 def _merge_predecessor_flag_states(states):
@@ -36,8 +37,29 @@ def _merge_predecessor_flag_states(states):
     those variables even when each path's compare names different registers.
 
     Width agreement matters for js/jns, which must cast the subtraction or
-    mask back to the original operand width.  Other flag setters are left
-    conservative because their conditions may re-read the static operands.
+    mask back to the original operand width.
+
+    Edges that disagree on the setter itself are the third case.  A setter that
+    writes its destination leaves ZF = (dest == 0) and SF = sign(dest); when
+    every edge did that to the *same* destination, those two bits are known on
+    all of them even though no single setter names the join.  That is not a
+    corner: MSVC's signed remainder-by-power-of-two is
+
+        and eax, 0x800007FF        ; keep sign + low bits
+        jns  L
+        dec  eax                   ; sign-extend the remainder
+        or   eax, 0xFFFFF800
+        inc  eax
+    L:  jne  ...                   ; remainder non-zero?
+
+    and it joins an `and` with an `inc` at L.  Refusing that join is how
+    sub_001403B0 -- wxCiReqRd, the WXCI/XB DVD sector-read request -- came to
+    take a dead `_flags` fallback for its `je` at 0x001404F1 and report
+    "E0109152:illegal seek position." for every read the title issued.
+
+    The join answers ZF and SF only.  CF and OF genuinely differ between these
+    setters, so a jcc needing either still falls back rather than picking one
+    predecessor's answer.
     """
     if not states or any(state is None for state in states):
         return None
@@ -47,21 +69,42 @@ def _merge_predecessor_flag_states(states):
         return first
 
     setters = {state[0] for state in states}
-    if len(setters) != 1 or first[0] not in ("cmp", "test", "bsf", "bsr"):
-        return None
-    if any(len(state[1]) < 2 for state in states):
+    if len(setters) == 1 and first[0] in ("cmp", "test", "bsf", "bsr"):
+        if any(len(state[1]) < 2 for state in states):
+            return None
+
+        def snapshot_width(state):
+            ops = state[1]
+            return _operand_width(ops[0]) or _operand_width(ops[1]) or 4
+
+        if len({snapshot_width(state) for state in states}) != 1:
+            return None
+
+        # The operands are used only to retain setter kind and width.  At
+        # runtime the condition reads whichever predecessor's snapshot
+        # actually executed.
+        return first
+
+    # A destination-writing join.  The destination is compared by the C
+    # expression that reads it and by its width, so `and eax, m` and `inc eax`
+    # merge while `and eax, m` and `inc ecx` do not.
+    allowed = _RESULT_ZF_SF_SETTERS | {MERGED_RESULT_SETTER}
+    if not all(state[0] in allowed and state[1] for state in states):
         return None
 
-    def snapshot_width(state):
-        ops = state[1]
-        return _operand_width(ops[0]) or _operand_width(ops[1]) or 4
+    def destination(state):
+        op = state[1][0]
+        if op.type not in ("reg", "mem"):
+            return None
+        return (_fmt_operand_read(op), _operand_width(op))
 
-    if len({snapshot_width(state) for state in states}) != 1:
+    dests = {destination(state) for state in states}
+    if len(dests) != 1 or None in dests:
         return None
 
-    # The operands are used only to retain setter kind and width.  At runtime
-    # the condition reads whichever predecessor's snapshot actually executed.
-    return first
+    # Only the destination survives: the other operand belonged to whichever
+    # predecessor ran, and no ZF/SF condition reads it.
+    return (MERGED_RESULT_SETTER, [first[1][0]])
 
 
 def _fixup_icall_esp_save(lines):

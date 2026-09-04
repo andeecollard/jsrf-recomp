@@ -236,6 +236,23 @@ FLAG_SETTERS = frozenset({
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
+# Setters whose ZF and SF are both "the destination they just wrote, against
+# zero". They disagree about CF and OF, and about whether the ordered signed
+# conditions are answerable, but on those two bits they are interchangeable --
+# which is what lets a jcc joined from several of them still be resolved. cmp
+# and test are excluded because they write no destination, so reading the
+# operand back at the branch would read the value before the comparison, and
+# imul/bt/rol are excluded because they leave ZF and SF undefined or untouched.
+_RESULT_ZF_SF_SETTERS = frozenset({
+    "and", "or", "xor", "inc", "dec", "add", "sub", "adc", "sbb", "neg",
+    "shl", "shr", "sar", "shld", "shrd",
+})
+
+# The state _merge_predecessor_flag_states produces for such a join. It answers
+# ZF and SF conditions only; anything needing CF or OF falls through to the
+# `_flags` fallback rather than being answered from one arbitrary predecessor.
+MERGED_RESULT_SETTER = "__merged_result"
+
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
@@ -407,6 +424,23 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+
+    # A jcc whose predecessors set flags with different instructions. Every
+    # one of them left ZF = (dest == 0) and SF = sign(dest) for the same
+    # destination, so those two bits are known even though the merge could not
+    # name a single setter. MSVC's signed power-of-two remainder emits exactly
+    # this shape -- `and eax, 0x800007FF; jns L; dec eax; or eax, ~mask; inc
+    # eax; L: jne` -- and joins an `and` with an `inc` at L.
+    if flag_setter == MERGED_RESULT_SETTER:
+        if jcc in ("je", "jz"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return f"({lhs} != 0)", desc
+        if jcc == "js":
+            return f"({_sf_cast}({lhs}) < 0)", desc
+        if jcc == "jns":
+            return f"({_sf_cast}({lhs}) >= 0)", desc
+        return None
 
     # ── bsf/bsr: ZF is the only flag they define ──
     #

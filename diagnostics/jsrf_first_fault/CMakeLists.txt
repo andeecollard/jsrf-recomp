@@ -71,6 +71,9 @@ target_compile_options(jsrf_first_fault PRIVATE
     -O0 -g3 -fno-omit-frame-pointer -w
     -include "${CMAKE_CURRENT_LIST_DIR}/guest_trace.h"
 )
+if(MINGW)
+    target_link_options(jsrf_first_fault PRIVATE -static -static-libgcc)
+endif()
 
 if(NOT WIN32)
     find_package(PkgConfig REQUIRED)
@@ -135,7 +138,7 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_flag_merge.py"
                      --check --gen "${RECOMP_GEN_DIR}")
-    # A ratchet, not a gate. 110 conditional branches in this tree still reach
+    # A ratchet, not a gate. 80 conditional branches in this tree still reach
     # the `_flags` fallback, where the condition is a constant zero and the
     # branch can never be taken -- the same defect that cost the loader its
     # status at 0x0013D3F3. Most are in functions with no static caller, but
@@ -143,7 +146,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_unresolved_flags_ratchet
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
-                     --max 110 --gen "${RECOMP_GEN_DIR}")
+                     --max 80 --gen "${RECOMP_GEN_DIR}")
 endif()
 
 add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c
