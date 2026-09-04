@@ -2822,6 +2822,25 @@ static void bridge_dump_ohci(void)
     const uint32_t base = 0xFED00000u;
     uint32_t i;
 
+    /* The gate the USB init opens with.
+     *
+     * sub_001BD108 maps 0xFED00000 and builds the OHCI device, but only after
+     *     eax = MEM32(0x1C40BC); if (MEM8(eax + 5) == 0xA1) return;
+     * so if that byte reads 0xA1 the controller is never created at all and
+     * everything downstream -- the port, the HCCA, the ISR's register base --
+     * is moot. Printed beside the register block because the two answer the
+     * same question from opposite ends. */
+    {
+        uint32_t obj = BRIDGE_MEM32(0x1C40BC);
+        fprintf(stderr, "  [OHCI] usb-init gate: [0x1C40BC]=0x%08X",
+                obj);
+        if (obj >= 0x10000u && obj < 0x04000000u)
+            fprintf(stderr, " byte[+5]=0x%02X %s", BRIDGE_MEM8(obj + 5),
+                    BRIDGE_MEM8(obj + 5) == 0xA1 ? "-> init SKIPPED" : "-> init runs");
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
+
     /* RECOMP_OHCI_DUMP=n dumps n times, so a response to the attach probe is
      * visible as a change rather than only as a first reading. */
     if (!getenv("RECOMP_OHCI_DUMP"))

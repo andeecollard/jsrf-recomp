@@ -605,11 +605,51 @@ replaced the register instead of accumulating. `xbox_McpxHoldRegisters` now
 shadows the pair. It is correct hardware behaviour and it is *not* the blocker
 here, because the master bit was never set to be lost.
 
+**Step 1 is answered.** The driver is the XBE's `XPP` section (0x001BC7C0,
+30,616 bytes) -- not `sub_001A1E74`/`sub_001A52F7`, which are APU code writing
+the 0xFE801xxx/0xFE802xxx aperture and were misidentified earlier.
+
+`sub_001BD108` is the init. It opens with
+
+    eax = MEM32(0x1C40BC); if (MEM8(eax + 5) == 0xA1) return;
+
+and that gate passes -- measured `[0x1C40BC]=0x002D0000 byte[+5]=0xB1` -- so it
+maps 0xFED00000 for 0x1000 and creates its device. The stack comes up.
+
+`sub_001BD295` is the root-hub handler:
+
+```
+ebx = MEM32(esi)              ; OHCI register base
+MEM8(esi + 0x460) = 4         ; four ports
+eax = MEM32(ebx + 0x50)       ; HcRhStatus, acked by clearing the low half
+eax = ebx + 0x54              ; &HcRhPortStatus[0]
+  edi = MEM32(eax)            ; per port
+  test MEM8(..), 1            ; CurrentConnectStatus
+  ... set this port's bit in a bitmap ...
+  MEM32(eax) = 0              ; ack the port
+MEM32(ebx + 0x10) = 0x40      ; HcInterruptEnable = RootHubStatusChange
+sub_001C2220(esi, &bitmap)    ; act on the changes
+```
+
+That `0x40` is the write we have been observing, so this routine has already
+run -- once, during init, when no port was connected. It acks and then waits
+for the next RootHubStatusChange interrupt. From that point the driver is
+interrupt-driven, and the ISR needs `MasterInterruptEnable`.
+
+**So MIE is set during controller start and we lose it.** Both writes happen
+microseconds apart in init: the start routine sets MIE, `sub_001BD295` then
+writes 0x40. The set/clear shadow added in `xbox_McpxHoldRegisters` cannot see
+that -- it samples on a poll, and the second write replaces the first between
+two polls. The fix is to put `HcInterruptEnable` (0xFED00010) and
+`HcInterruptDisable` (0xFED00014) behind the **MCPX write trap**, which already
+guards a page and already models write-clear registers, so set/clear applies at
+write time instead of sample time.
+
+Then the attach probe's connect will raise a real interrupt, the ISR will
+claim it, and `sub_001C2220` will get a bitmap with a port in it.
+
 Remaining, in order:
-(1) find what makes the title examine the root hub -- it enables RHSC and
-    waits, so either it polls somewhere we are not answering, or its init has
-    an earlier step still unsatisfied. Read its USB init around
-    `sub_001A1E74` and `sub_001A52F7` rather than guessing.
+(1) trap the interrupt-enable pair rather than polling it.
 (2) answer the port reset and the control transfers it then issues on the
     default endpoint through the HCCA at 0x009E2000,
 (3) answer interrupt-IN with pad reports fed from `xbox_InputGetState`, which
