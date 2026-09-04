@@ -51,6 +51,11 @@ points = {
         '00024540': ('jsrf_interp_probe', 'ecx'),
     },
     'recomp_0009.c': {
+        # JSRF's vblank acknowledge spin. ebx is the NV2A register base, ecx
+        # the value about to be written to PCRTC_INTR_0. Reads the summary and
+        # the source as the guest sees them, before its own store.
+        '00193E40': ('jsrf_vblank_ack_probe',
+                     'ebx, MEM32(ebx + 0x100), MEM32(ebx + 0x600100), ecx'),
         # The D3D pushbuffer free-space spin. edx holds the pointer the loop
         # dereferences for the GPU's GET position; edi is PUT and eax the space
         # being waited for. Read-only, and self-limiting inside the probe.

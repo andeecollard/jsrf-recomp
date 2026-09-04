@@ -1,14 +1,22 @@
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 
-#include <signal.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ucontext.h>
 #include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                  uint32_t fault_xbox_va, int is_write);
+#else
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 
 #include <xbox/xboxrecomp.h>
 #include "recomp_types.h"
@@ -26,8 +34,10 @@ static void pad_sentinel_scan(void);
  * other without being introduced here. */
 extern const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
                                         uint32_t *pitch, uint32_t *bpp);
+#if !defined(_WIN32)
 extern void xbox_D3D8SetGuestFramebufferSource(
         const void *(*fn)(uint32_t *, uint32_t *, uint32_t *, uint32_t *));
+#endif
 extern void xbox_HeapReport(const char *why);
 #include "nv2a_pgraph_d3d11.h"
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
@@ -658,7 +668,11 @@ static _Thread_local uint32_t g_current_guest_function;
 static _Thread_local int g_entry_announced;
 static _Thread_local int g_thread_start_announced;
 static _Thread_local int g_callback_announced;
+#if defined(_WIN32)
+static volatile LONG g_handling_fault;
+#else
 static volatile sig_atomic_t g_handling_fault;
+#endif
 
 typedef struct RefTraceState {
     uint32_t object;
@@ -780,6 +794,68 @@ void jsrf_trace_block(uint32_t guest_block)
     }
 }
 
+#if defined(_WIN32)
+static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
+{
+    uintptr_t fault = 0;
+    uint32_t guest_fault = 0;
+    uint32_t count = g_guest_trace_index;
+    uint32_t available = count < GUEST_TRACE_SIZE ? count : GUEST_TRACE_SIZE;
+
+    if (!ep || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->NumberParameters >= 2)
+        fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+
+    /* Windows leaves the APU's 512 KiB window inaccessible so every guest
+     * register access reaches this VEH. Route it to the MCPX model before
+     * treating the exception as a crash. The generated x86-64 instruction is
+     * decoded by the APU hook, which advances RIP after a handled access. */
+    if (xbox_HostAddressToGuest(fault, &guest_fault) &&
+        guest_fault >= 0xFE800000u && guest_fault < 0xFE880000u &&
+        apu_hook_handle_mmio(ep->ContextRecord, fault, guest_fault,
+            ep->ExceptionRecord->ExceptionInformation[0] != 0)) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (InterlockedExchange(&g_handling_fault, 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    fprintf(stderr, "\n========== FIRST GUEST FAULT ==========\n");
+    fprintf(stderr, "EXCEPTION: access violation (0x%08lX)\n",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode);
+    fprintf(stderr, "HOST FAULT ADDRESS: 0x%016llX\n",
+            (unsigned long long)fault);
+#if defined(_M_X64) || defined(__x86_64__)
+    fprintf(stderr, "HOST PC: 0x%016llX\n",
+            (unsigned long long)ep->ContextRecord->Rip);
+    fprintf(stderr, "HOST SP: 0x%016llX\n",
+            (unsigned long long)ep->ContextRecord->Rsp);
+#endif
+    fprintf(stderr, "TRANSLATED GUEST FUNCTION: sub_%08X\n",
+            g_current_guest_function);
+    fprintf(stderr,
+            "GUEST REGISTERS: EAX=%08X ECX=%08X EDX=%08X EBX=%08X "
+            "ESI=%08X EDI=%08X EBP=%08X ESP=%08X\n",
+            g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp, g_esp);
+    fprintf(stderr, "LAST %u GUEST BLOCKS:\n", available);
+    for (uint32_t i = 0; i < available; ++i) {
+        uint32_t sequence = count - available + i;
+        volatile GuestTraceRecord *r =
+            &g_guest_trace[sequence & (GUEST_TRACE_SIZE - 1u)];
+        fprintf(stderr, "[%02u] block=%08X function=sub_%08X ESP=%08X\n",
+                i, r->block, r->function, r->esp);
+    }
+    fprintf(stderr, "=======================================\n");
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static int install_crash_handlers(void)
+{
+    return AddVectoredExceptionHandler(1, crash_handler) != NULL;
+}
+#else
 static void crash_handler(int sig, siginfo_t *si, void *context)
 {
     uintptr_t fault = si ? (uintptr_t)si->si_addr : 0;
@@ -882,6 +958,7 @@ static int install_crash_handlers(void)
     return sigaction(SIGSEGV, &sa, NULL) == 0 &&
            sigaction(SIGBUS, &sa, NULL) == 0;
 }
+#endif
 
 static int load_xbe(const char *path, void **out_data, size_t *out_size)
 {
@@ -908,6 +985,16 @@ static int load_xbe(const char *path, void **out_data, size_t *out_size)
 
 static int ensure_directory(const char *path)
 {
+#if defined(_WIN32)
+    DWORD attrs;
+    if (CreateDirectoryA(path, NULL))
+        return 1;
+    if (GetLastError() != ERROR_ALREADY_EXISTS)
+        return 0;
+    attrs = GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
     struct stat st;
 
     if (mkdir(path, 0755) == 0)
@@ -915,13 +1002,42 @@ static int ensure_directory(const char *path)
     if (errno != EEXIST)
         return 0;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
+
+#if defined(_WIN32)
+static HWND jsrf_create_window(void)
+{
+    static const char class_name[] = "JSRFFirstFaultWindow";
+    HINSTANCE instance = GetModuleHandleA(NULL);
+    WNDCLASSA wc;
+    RECT rect = { 0, 0, 640, 480 };
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = instance;
+    wc.lpszClassName = class_name;
+    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    RegisterClassA(&wc);
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND hwnd = CreateWindowExA(0, class_name, "Jet Set Radio Future",
+                                WS_OVERLAPPEDWINDOW,
+                                CW_USEDEFAULT, CW_USEDEFAULT,
+                                rect.right - rect.left, rect.bottom - rect.top,
+                                NULL, NULL, instance, NULL);
+    if (hwnd) {
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+    }
+    return hwnd;
+}
+#endif
 
 int main(int argc, char **argv)
 {
     const char *xbe_path = argc > 1 ? argv[1] : JSRF_XBE_PATH;
     const char *game_dir = argc > 2 ? argv[2] : JSRF_GAME_DIR;
-    const char *hdd_root = getenv("RECOMP_HDD_ROOT");
+    const char *hdd_root = argc > 3 ? argv[3] : getenv("RECOMP_HDD_ROOT");
     void *xbe_data = NULL;
     size_t xbe_size = 0;
     recomp_func_t entry;
@@ -953,7 +1069,9 @@ int main(int argc, char **argv)
     xbox_SetUsbPadStateHook(usb_pad_state_shim);
     /* Put the executor's output on screen. Harmless when RECOMP_PB_EXEC is
      * unset: the getter simply reports no surface and Present just swaps. */
+#if !defined(_WIN32)
     xbox_D3D8SetGuestFramebufferSource(nv2a_pb_exec_surface);
+#endif
     /* Diagnostic only: RECOMP_TOTAL_RAM_MB maps more than a retail console has.
      *
      * It exists to answer one question that the failure itself cannot -- whether
@@ -1017,7 +1135,11 @@ int main(int argc, char **argv)
      * which is the first half of the interception route. */
     {
         IDirect3D8 *d3d;
+#if defined(_WIN32)
+        HWND hwnd = jsrf_create_window();
+#else
         xbox_d3d8_set_window_title("Jet Set Radio Future");
+#endif
         d3d = xbox_Direct3DCreate8(0);
         fprintf(stderr, "  [D3D8-HLE] xbox_Direct3DCreate8 -> %p\n", (void *)d3d);
         if (d3d) {
@@ -1027,6 +1149,10 @@ int main(int argc, char **argv)
             memset(&pp, 0, sizeof(pp));
             pp.BackBufferWidth  = 640;
             pp.BackBufferHeight = 480;
+#if defined(_WIN32)
+            pp.hDeviceWindow = hwnd;
+            pp.Windowed = TRUE;
+#endif
             hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &dev);
             fprintf(stderr, "  [D3D8-HLE] CreateDevice -> hr=0x%08X dev=%p\n",
                     (unsigned)hr, (void *)dev);

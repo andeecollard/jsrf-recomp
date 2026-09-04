@@ -187,6 +187,43 @@ void jsrf_cache_lookup_probe(uint32_t pc, uint32_t path, uint32_t found)
     (void)pc;
 }
 
+/* JSRF's vblank acknowledge spin, loc_00193E40 inside sub_00193D90.
+ *
+ *     [nv2a+0x600100] = ecx          ; PCRTC_INTR_0, write-1-to-clear
+ *     test [nv2a+0x100], 0x1000000   ; PMC_INTR_0, the read-only summary
+ *     jne  back                      ; spin until the summary clears
+ *     ...  KeSetEvent(device+0x2430) ; only then signal
+ *
+ * The sampler puts the DPC here, and the event at device+0x2430 -- the only
+ * dispatcher object the whole title uses -- is signalled under ten times in
+ * ninety seconds while two worker threads wait on it with no timeout. If the
+ * summary never clears, this loop never reaches the KeSetEvent below it and
+ * that is the loading stall.
+ *
+ * Reads only; the guarded page traps writes, not loads.
+ */
+void jsrf_vblank_ack_probe(uint32_t pc, uint32_t regs, uint32_t pmc,
+                           uint32_t pcrtc, uint32_t written)
+{
+    static int enabled = -1;
+    static unsigned long long iterations;
+    static unsigned reports;
+
+    if (enabled < 0) enabled = getenv("RECOMP_VBLANK_ACK_TRACE") != NULL;
+    if (!enabled) return;
+
+    ++iterations;
+    if (iterations != 1 && iterations % 100000ull) return;
+    if (reports++ > 30) return;
+
+    fprintf(stderr,
+            "[VBLANK-ACK] iter=%llu pc=%08X nv2a=%08X pmc=%08X pcrtc=%08X"
+            " wrote=%08X summary=%s\n",
+            iterations, pc, regs, pmc, pcrtc, written,
+            (pmc & 0x01000000u) ? "STILL SET" : "clear");
+    fflush(stderr);
+}
+
 void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site)
 {
     static unsigned char seen[1024];

@@ -23,6 +23,9 @@ void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,
                                 uint32_t needed);
 void jsrf_cache_lookup_probe(uint32_t pc, uint32_t path,
                              uint32_t found);
+void jsrf_vblank_ack_probe(uint32_t pc, uint32_t regs,
+                           uint32_t pmc, uint32_t pcrtc,
+                           uint32_t written);
 void jsrf_trace_block(uint32_t guest_block);
 void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site);
 void recomp_trace_enter(const char *name, uint32_t guest_function);
