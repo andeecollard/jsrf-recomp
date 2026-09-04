@@ -25,11 +25,31 @@ The previous handover's minimum success criterion is met and its stronger one
 is met: enumeration reaches a configured controller and the game is reading
 reports from the host input backend.
 
-The user-visible milestone -- a button press advancing the Stage 12 / Press
-Start wait -- is NOT verified. It needs a physical gamepad attached to the
-host, which this session could not do. Everything between the button and the
-title is in place and tested; what is unproven is the last hop, SDL2 reporting
-a real device through xbox_InputGetState.
+The input chain is verified end to end with real hardware. A DualShock 4 on
+USB, run claude-usb-realpad-01: SDL2 opens it, and real presses arrive at the
+emulated device correctly decoded --
+
+  buttons=10                 Options -> START
+  buttons=04 / 02 / 06       D-pad Left / Down / Down+Left
+  A=FF B=FF X=FF Y=FF        Cross / Circle / Square / Triangle
+
+so host backend -> USB device -> OHCI -> XPP -> title all works. The
+[USB-PAD] trace in xbox_UsbInterruptIn, gated on RECOMP_OHCI_TRANSFER_TRACE,
+is what shows this; it prints when the pressed set changes.
+
+The user-visible milestone -- a button advancing the Stage 12 / Press Start
+wait -- is still NOT confirmed, but no longer for want of input. The title
+receives the presses and shows no observable reaction: identical stage
+sequence, identical pushbuffer profile, with and without a pad. Whether that
+is the wrong button, an attract loop that ignores input, or game code above
+XPP not consuming it cannot be told apart while draws=0 and there is no
+picture to read. That question now belongs to the renderer, not to USB.
+
+Two hosts notes, both macOS rather than code. open_controllers() runs once in
+xbox_InputInit and there is no hotplug, so a pad attached after launch is
+never seen -- attach first. And on macOS 26 the Games app claims the
+controller Home button system-wide; irrelevant here, since the Xbox 20-byte
+report has no Guide button at all, but it steals focus.
 
 
 WHAT WAS BUILT
@@ -191,17 +211,33 @@ Canonical capture:
 EXACT NEXT STEP
 ===============
 
-Attach a gamepad to the host and run the canonical capture. That is the whole
-remaining question for the boot-to-input milestone, and it is one run.
+Geometry. Nothing else can be judged until something draws.
 
-  - If Press Start advances, the milestone is done and the next frontier is
-    whatever the menu does.
-  - If it does not, the pad is enumerated and polled but the button is not
-    arriving, and the place to look is usb_pad_state_shim in
-    diagnostics/jsrf_first_fault/main.c -- specifically whether SDL2 reports
-    the device at all, and whether XBOX_GAMEPAD's digital bits line up with
-    report byte 2 for the buttons this title reads. Add a trace of the report
-    bytes there; everything upstream of it is already covered by tests.
+The title clears and flips ~45000 times in 40 s and issues ZERO draws. The
+pushbuffer sink implements about fifteen methods, written for Burnout 3's 2D
+menus (INLINE_ARRAY, five-dword X/Y/U/V/Color vertices). JSRF drives a fully
+programmable pipeline, and the top unhandled methods say so exactly:
+
+  0x1800       4.6M    NV097_ARRAY_ELEMENT16          indexed vertices
+  0x1EA4       1.4M    NV097_SET_TRANSFORM_CONSTANT_LOAD
+  0x0B00-0x0B3C 495k each  NV097_SET_TRANSFORM_PROGRAM  vertex shaders
+
+In dependency order, each with an observable stop condition:
+
+  a. Shader upload and constants. nv2a_vsh.c already emits GLSL, which is what
+     this host needs. Stop condition: a translated shader compiles.
+  b. Vertex array state -- offsets and formats, so the sink knows where the
+     vertices are and how they are laid out.
+  c. ARRAY_ELEMENT16/32 as an indexed draw. Stop condition: draws > 0.
+  d. Textures (nv2a_texture_copy.c exists), then render state.
+
+Aim at one recognisable frame -- the SEGA logo, or the loading screen -- rather
+than at "the game renders". Same discipline that worked for USB: one
+observable contract at a time, learned from the title rather than the spec.
+
+Extend the NV2A sink rather than routing through the d3d8_gl HLE layer: JSRF
+writes pushbuffers directly, 23.9M methods a run, so the HLE path is not where
+its geometry goes.
 
 After that, in rough order of likely need: the EP2 OUT rumble endpoint is
 accepted and discarded rather than driven; the configuration descriptor

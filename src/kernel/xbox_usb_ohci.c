@@ -356,6 +356,27 @@ int xbox_UsbInterruptIn(uint8_t endpoint, uint8_t *out, uint32_t out_max,
     if (g_pad_state)
         (void)g_pad_state(report);
 
+    /* Report a button the first few times it appears, and again whenever the
+     * pressed set changes. The question this answers -- does a press actually
+     * reach the title -- is otherwise invisible: the pad is polled a hundred
+     * times a second and every poll looks alike. */
+    if (g_trace) {
+        static uint8_t last_buttons, last_a;
+        static unsigned shown;
+        if ((report[2] != last_buttons || report[4] != last_a) && shown < 16) {
+            shown++;
+            last_buttons = report[2];
+            last_a = report[4];
+            fprintf(stderr, "  [USB-PAD] buttons=%02X A=%02X B=%02X X=%02X"
+                    " Y=%02X LT=%02X RT=%02X lx=%d ly=%d\n",
+                    report[2], report[4], report[5], report[6], report[7],
+                    report[10], report[11],
+                    (int)(int16_t)(report[12] | (report[13] << 8)),
+                    (int)(int16_t)(report[14] | (report[15] << 8)));
+            fflush(stderr);
+        }
+    }
+
     memcpy(out, report, XBOX_USB_PAD_REPORT);
     *out_len = XBOX_USB_PAD_REPORT;
     return 0;
