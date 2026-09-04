@@ -1,0 +1,8 @@
+[
+  {
+    "start": "0x0013D840",
+    "source": "icall-unresolved",
+    "observed": 3,
+    "why": "Tail-call thunk for the hook pair at 0x00261588/0x0026158C. Its address is taken as a data immediate at 0x0013E42A and called indirectly, so no static call reaches it and the detector left 0x0013D835-0x0013D85F undetected between the functions ending 0x0013D834 and starting 0x0013D860. RECOMP_ICALL reported 'Failed to resolve VA 0x0013D840' three times per run, each during the D:\\Media\\Z_ADX\\BGM\\title.adx open, which is the last file activity of the boot."
+  }
+]
