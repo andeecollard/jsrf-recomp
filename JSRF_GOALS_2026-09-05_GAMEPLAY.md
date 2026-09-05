@@ -74,9 +74,35 @@ also what the hardware does.
     faults 0, bad_headers 0, ctest 18/18
 
 So the wait now returns and the loop iterates several times instead of once.
-It is not closed: submission still stops, with 2 rejected control-flow words
-and 1 patch landing during execution still reported. The next measurement is
-where the sixth wait differs from the first five.
+
+### And the iteration that stops is not a reserve defect at all
+
+Five iterations run the full cycle -- patch the notification, publish, wait,
+receive parameter 5, return. The sixth differs in exactly one visible way:
+
+    [PB-PATCH] ... cursor=005D05C4 ... GET=0056D02C PUT=005E7904
+
+`cursor` and `GET` disagree, where every earlier iteration had them equal. Five
+log lines earlier:
+
+    [PUSHER] rejected jump 0EF92EF8 at 005D05C0
+    seg 3186: from=0056D02C end=005E7A0C put=005E7A0C stop=2 consumed=101734
+
+The parse ran 101,734 dwords from the ring base and stopped on a bad jump at
+0x005D05C0; the cursor is 0x005D05C4, the dword after it. `stream_fault`
+latched, so the feed stopped publishing DMA_GET and it froze at 0x0056D02C.
+The reserve routine then computed its distance from a stale GET and waited for
+space that had in fact already been consumed.
+
+**So goal 1's remaining symptom is downstream of G26** -- the one parse
+desynchronisation per run -- and not a separate defect in the reserve or
+notification path. Those work. Fix the desync and this loop should continue on
+its own.
+
+The desync is not explained by in-place execution: the guest's patches change
+packet *parameters* (0x40100/5 to 0x40100/0, 0x40110/0 to 0x40100/0), never
+packet lengths, so they cannot shift the parse. It is the same residual
+one-per-run event seen before the change.
 
 **Acceptance is unchanged:** the wait returns because its completion is
 delivered, repeatedly, with no bypass and no forced event.
