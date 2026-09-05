@@ -8,6 +8,13 @@ int pgraph_d3d11_method(int subch,uint32_t m,uint32_t p) {
     CHECK(subch==0); CHECK(seen<16); method[seen]=m; value[seen++]=p; return 1;
 }
 void nv2a_pb_exec_method(uint32_t s,uint32_t m,uint32_t p) { (void)s; (void)m; (void)p; }
+static unsigned software_seen;
+static void software_method(uint32_t s, uint32_t p) {
+    CHECK(s==0);
+    CHECK(p==5 || p==9);
+    CHECK(seen==6+software_seen); /* zero NOP precedes the first callback */
+    ++software_seen;
+}
 int main(void) {
     const uint32_t packet[]={2u<<18|0x200,0x111,0x222,0x40000000u|2u<<18|0x1818,0x333,0x444};
     NV2APusherResult r=nv2a_pusher_run_segment(packet,2);
@@ -48,5 +55,11 @@ int main(void) {
     const uint32_t zero_count[]={0x200,0,1u<<18|0x208,0x113};
     r=nv2a_pusher_run_segment(zero_count,4);
     CHECK(r.stop==NV2A_PUSHER_END && r.consumed==4 && seen==5 && value[4]==0x113);
+    nv2a_pusher_set_software_method_handler(software_method);
+    const uint32_t notify[]={0x400c0100,0,5,9,0x40208,0x123};
+    r=nv2a_pusher_run_segment(notify,6);
+    CHECK(r.stop==NV2A_PUSHER_END && r.consumed==6 && software_seen==2);
+    CHECK(seen==9 && method[8]==0x208 && value[8]==0x123);
+    nv2a_pusher_set_software_method_handler(NULL);
     puts("Partial packets, both jump encodings, stale tails, CALL/RETURN and malformed headers passed");
 }

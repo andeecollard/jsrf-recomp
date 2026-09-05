@@ -55,6 +55,12 @@ typedef struct {
  * unconsumed cursor and resolves jumps within its own guest memory mapping. */
 NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwords);
 
+/* Optional synchronous software-method sink. Installed before consumption.
+ * Nonzero NV097_NO_OPERATION parameters trap to the guest driver; the sink
+ * must wait for its acknowledgement before returning. Zero remains padding. */
+typedef void (*NV2ASoftwareMethodHandler)(uint32_t subchannel, uint32_t parameter);
+void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler);
+
 void nv2a_pusher_get_stats(NV2APusherStats *out);
 void nv2a_pusher_reset_stats(void);
 

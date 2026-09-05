@@ -1500,8 +1500,14 @@ static void event_trace_note(const char *side, uint32_t object)
         seen[distinct].count = 1;
         ++distinct;
     }
-    fprintf(stderr, "[EVENT-%s] object=%08X count=%lu\n",
-            side, object, seen[i].count);
+    /* Which guest code signals an event is the whole question when a wait
+     * never returns: the object address alone cannot be traced back, because
+     * a title computes it from a device pointer in a register and the literal
+     * never appears in the image. g_esp has had the dummy return address
+     * popped by kernel_thunk_dispatch, so the caller sits just below it. */
+    fprintf(stderr, "[EVENT-%s] object=%08X count=%lu caller=%08X\n",
+            side, object, seen[i].count,
+            g_esp ? (uint32_t)BRIDGE_MEM32(g_esp - 4) : 0);
     fflush(stderr);
 }
 
@@ -2235,7 +2241,12 @@ static void bridge_nv2a_mirror_intr(void)
     uint32_t base = g_nv2a_base;
     if (!base) return;
     if (!(BRIDGE_MEM32(base + NV_PCRTC_INTR_0) & NV_PCRTC_INTR_0_VBLANK)) {
+#if defined(_WIN32)
         BRIDGE_MEM32(base + NV_PMC_INTR_0) &= ~NV_PMC_INTR_0_PCRTC;
+#else
+        __atomic_fetch_and((uint32_t *)((uintptr_t)base + NV_PMC_INTR_0 + g_xbox_mem_offset),
+                           ~NV_PMC_INTR_0_PCRTC, __ATOMIC_SEQ_CST);
+#endif
     }
 }
 
@@ -2252,6 +2263,21 @@ static void bridge_vblank_poll(void)
     }
 
     bridge_nv2a_mirror_intr();
+
+    /* PGRAPH software methods share the GPU interrupt vector but are not
+     * display refresh events. Deliver them on the guest thread that pumps
+     * interrupts, using its saved register/stack context. */
+    if (xbox_Nv2aSoftwareMethodPending()) {
+        for (i = 0; i < BRIDGE_MAX_INTERRUPTS; ++i) {
+            uint32_t iv = g_interrupts[i];
+            if (!iv) break;
+            if (BRIDGE_MEM32(iv + 8) != BRIDGE_NV2A_VECTOR) continue;
+            uint32_t ctx = BRIDGE_MEM32(iv + 4);
+            uint32_t base = ctx ? BRIDGE_MEM32(ctx) : 0;
+            if (base && (BRIDGE_MEM32(base + NV_PMC_INTR_0) & 0x1000u))
+                bridge_run_isr(iv);
+        }
+    }
 
     now = GetTickCount();
     if (next_vblank == 0) {

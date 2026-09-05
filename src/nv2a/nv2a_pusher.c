@@ -42,6 +42,11 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 #define UNHANDLED_SLOTS (0x2000u / 4u)
 
 static NV2APusherStats g_stats;
+static NV2ASoftwareMethodHandler g_software_method;
+void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler)
+{
+    g_software_method = handler;
+}
 static uint32_t g_unhandled[UNHANDLED_SLOTS];
 
 /* Ring of the most recently dispatched methods.
@@ -57,6 +62,12 @@ static unsigned long g_recent_idx;
 
 static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
 {
+    if (method == 0x100 && param && getenv("RECOMP_PB_NOTIFY_TRACE")) {
+        static unsigned n;
+        if (++n <= 16) fprintf(stderr, "[PB-NOP] subch=%u parameter=%08X\n", subchannel, param);
+    }
+    if (method == 0x100 && param && g_software_method)
+        g_software_method(subchannel, param);
     g_stats.methods++;
     g_recent[g_recent_idx % RECENT_SLOTS].method = method;
     g_recent[g_recent_idx % RECENT_SLOTS].param = param;

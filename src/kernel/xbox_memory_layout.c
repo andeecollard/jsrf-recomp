@@ -920,6 +920,11 @@ static uintptr_t g_mcpx_guard_page[8];
 #define XBOX_NV2A_PMC_INTR_0     (XBOX_NV2A_BASE + 0x000100u)
 #define XBOX_NV2A_PMC_INTR_PCRTC 0x01000000u
 
+#define XBOX_NV2A_PGRAPH_INTR (XBOX_NV2A_BASE + 0x400100u)
+#define XBOX_NV2A_PGRAPH_ERROR 0x00100000u
+#define XBOX_NV2A_PMC_INTR_PGRAPH 0x00001000u
+static uintptr_t g_nv2a_pgraph_page;
+static int g_nv2a_pgraph_guarded;
 static uintptr_t g_nv2a_guard_page;
 static int       g_nv2a_guarded;
 static size_t g_mcpx_guard_pages = 0;
@@ -956,6 +961,10 @@ static void mcpx_unlock(void)
 static int mcpx_guarded_page(uintptr_t host_addr, uintptr_t *page_out)
 {
     uintptr_t page = host_addr & ~(uintptr_t)(g_mcpx_page_size - 1);
+    if (g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page) {
+        if (page_out) *page_out = page;
+        return 1;
+    }
     if (g_nv2a_guarded && page == g_nv2a_guard_page) {
         if (page_out) *page_out = page;
         return 1;
@@ -1183,7 +1192,7 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
          * set would tell the driver its previous submission is still queued. */
         value &= ~0x00000006u;
     }
-    if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && width == 4) {
+    if ((guest_va == XBOX_NV2A_PCRTC_INTR_0 || guest_va == XBOX_NV2A_PGRAPH_INTR) && width == 4) {
         value = *(volatile uint32_t *)fault & ~(uint32_t)value;
     } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_STATUS && width == 4) {
         /* HcInterruptStatus is WRITE-1-TO-CLEAR, and as plain memory it was
@@ -1252,12 +1261,16 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
         volatile uint32_t *en = (volatile uint32_t *)(fault - 4);
         *en &= ~ohci_disable;
         *(volatile uint32_t *)fault = *en;
+    } else if (guest_va == XBOX_NV2A_PGRAPH_INTR) {
+        if (value == 0)
+            __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset),
+                               ~XBOX_NV2A_PMC_INTR_PGRAPH, __ATOMIC_SEQ_CST);
     } else if (guest_va == XBOX_NV2A_PCRTC_INTR_0) {
         /* The summary follows its source. Different page, not guarded, so this
          * is an ordinary store. */
         if ((value & 0x1u) == 0) {
-            *(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset)
-                &= ~XBOX_NV2A_PMC_INTR_PCRTC;
+            __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset),
+                               ~XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
         }
     } else {
         xbox_McpxApplyReady();   /* the ack thread cannot reach a guarded page */
@@ -1363,6 +1376,16 @@ static void xbox_McpxTrapInstall(void)
         }
     }
 
+    /* Software methods require the same source acknowledgement semantics as
+     * vblank. The payload and FIFO register share this PGRAPH page. */
+    {
+        DWORD old_prot;
+        g_nv2a_pgraph_page = ((uintptr_t)g_memory_offset + XBOX_NV2A_PGRAPH_INTR)
+                             & ~(uintptr_t)(g_mcpx_page_size - 1);
+        g_nv2a_pgraph_guarded = VirtualProtect((LPVOID)g_nv2a_pgraph_page,
+                g_mcpx_page_size, PAGE_READONLY, &old_prot) != 0;
+    }
+
     /* The APU aperture, as one range rather than a page list. Protected only
      * after the handler is installed: between the mprotect and the sigaction
      * there is no handler, and a write landing in that window would be fatal. */
@@ -1406,7 +1429,7 @@ void xbox_Nv2aRaiseVblank(void)
 
     if (!g_nv2a_guarded) {
         *pcrtc |= 0x1u;
-        *pmc   |= XBOX_NV2A_PMC_INTR_PCRTC;
+        __atomic_fetch_or((uint32_t *)pmc, XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
         return;
     }
     {
@@ -1419,7 +1442,7 @@ void xbox_Nv2aRaiseVblank(void)
                            PAGE_READONLY, &old_prot);
         }
         mcpx_unlock();
-        *pmc |= XBOX_NV2A_PMC_INTR_PCRTC;   /* different page, not guarded */
+        __atomic_fetch_or((uint32_t *)pmc, XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
     }
 }
 
@@ -1432,7 +1455,43 @@ int xbox_Nv2aVblankPending(void)
             & 0x1u) != 0;
 }
 
+BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + g_memory_offset);
+    DWORD old_prot;
+    if (!g_nv2a_pgraph_guarded || !parameter || xbox_Nv2aSoftwareMethodPending()) return FALSE;
+    mcpx_lock();
+    if (!VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_mcpx_page_size,
+                        PAGE_READWRITE, &old_prot)) {
+        mcpx_unlock();
+        return FALSE;
+    }
+    regs[0x400704/4] = ((subchannel & 7u) << 16) | 0x100u;
+    regs[0x400708/4] = parameter;
+    regs[0x400108/4] = 1; /* NSOURCE_NOTIFICATION */
+    regs[0x400720/4] = 0; /* suspend until the guest restores FIFO access */
+    regs[0x400100/4] |= XBOX_NV2A_PGRAPH_ERROR;
+    VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_mcpx_page_size,
+                   PAGE_READONLY, &old_prot);
+    __atomic_fetch_or((uint32_t *)&regs[0x100/4], XBOX_NV2A_PMC_INTR_PGRAPH, __ATOMIC_SEQ_CST);
+    mcpx_unlock();
+    return TRUE;
+}
+
+int xbox_Nv2aSoftwareMethodPending(void)
+{
+    if (!g_nv2a_pgraph_guarded) return 0;
+    volatile uint32_t *regs = (volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + g_memory_offset);
+    return (regs[0x400100/4] & XBOX_NV2A_PGRAPH_ERROR) != 0
+        || (regs[0x400708/4] != 0 && !(regs[0x400720/4] & 1));
+}
+
 #else  /* Windows, or a host this decoder does not cover */
+
+BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
+{ (void)subchannel; (void)parameter; return FALSE; }
+int xbox_Nv2aSoftwareMethodPending(void) { return 0; }
+
 
 /* No write trap on this host, so there is no guard to drop and no way to
  * observe the guest's write-1-to-clear acknowledge either. The raise is a
@@ -1684,8 +1743,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
+            uint32_t mask = NV2A_ACK[i].busy_mask;
+#if !defined(_WIN32) && defined(__aarch64__)
+            if (g_nv2a_pgraph_guarded) {
+                if (NV2A_ACK[i].offset == 0x400100) continue; /* W1C source is modeled */
+                if (NV2A_ACK[i].offset == 0x100) mask &= ~XBOX_NV2A_PMC_INTR_PGRAPH;
+            }
+#endif
+            if (*r & mask) {
+#if !defined(_WIN32)
+                if (NV2A_ACK[i].offset == 0x100)
+                    __atomic_fetch_and((uint32_t *)r, ~mask, __ATOMIC_SEQ_CST);
+                else
+#endif
+                    *r &= ~mask;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -3613,8 +3684,15 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
      * Returning 0x80084000 here made JSRF's raster clear write to 0x00084000
      * (live guest code) instead of its framebuffer. Keep unpinned buffers in
      * the shared guest heap until GPU physical-address translation is added.
-     * Fixed-address pinned allocations retain their separate window. */
-    return xbox_HeapAlloc(size, alignment);
+     * When the heap alias is enabled, high CPU addresses now share those
+     * same low GPU bytes. Fixed-address pinned allocations retain their
+     * separate window. */
+    uint32_t result = xbox_HeapAlloc(size, alignment);
+    /* With the physical heap mapped, return its CPU address while retaining
+     * the same low backing for GPU offsets. D3D reconstructs DMA_GET with
+     * bit 31 set before comparing it with its allocation; returning a low
+     * pointer makes that comparison reject every GET as outside the ring. */
+    return result && g_physical_heap_view ? result | XBOX_CONTIG_BASE : result;
 #else
     uint32_t result;
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);

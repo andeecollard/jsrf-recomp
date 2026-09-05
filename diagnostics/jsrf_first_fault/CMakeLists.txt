@@ -18,6 +18,10 @@ add_subdirectory("${XBOXRECOMP_DIR}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 enable_testing()
 
+add_executable(jsrf_pgraph_notify_test pgraph_notify_test.c)
+target_link_libraries(jsrf_pgraph_notify_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_pgraph_notify COMMAND jsrf_pgraph_notify_test)
+
 add_executable(jsrf_av_encoder_option_test av_encoder_option_test.c)
 target_link_libraries(jsrf_av_encoder_option_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_av_encoder_option COMMAND jsrf_av_encoder_option_test)

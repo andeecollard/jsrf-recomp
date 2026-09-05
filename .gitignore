@@ -43,3 +43,6 @@ build-windows-jsrf/
 
 # RECOMP_ICALL_FEEDBACK output, rewritten every run
 icall_targets.dump
+
+# Stray tool output directory
+output/

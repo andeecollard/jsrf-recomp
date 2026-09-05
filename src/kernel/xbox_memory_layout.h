@@ -227,6 +227,10 @@ BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address);
  * reflects what has actually been consumed rather than what was submitted --
  * which is what stops the producer lapping the consumer. */
 extern int g_nv2a_pusher_owns_dma_get;
+/* Nonzero NV097_NO_OPERATION software trap, delivered through the guest IRQ.
+ * Pending includes the driver's FIFO-disable interval after it acks status. */
+BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter);
+int xbox_Nv2aSoftwareMethodPending(void);
 
 void xbox_ProtectMirrorsForDebug(void);
 

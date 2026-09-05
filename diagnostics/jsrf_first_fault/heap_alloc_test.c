@@ -106,7 +106,21 @@ int main(void)
     check(*low==0x12345678u, "the shared physical heap is opt-in");
     *low_pinned=0x13579bdfu;
     *high_pinned=0x2468ace0u;
+    uint32_t contiguous_low = xbox_ContiguousAlloc(4096, 4096);
+    check(contiguous_low && !(contiguous_low & 0x80000000u),
+          "without the alias contiguous allocation retains low backing");
+    xbox_HeapFree(contiguous_low);
     check(xbox_EnablePhysicalHeapAlias(), "enable the JSRF physical heap alias");
+    uint32_t contiguous = xbox_ContiguousAlloc(4096, 4096);
+    check((contiguous & 0x80000000u) != 0,
+          "aliased contiguous allocation returns a CPU physical address");
+    check(((contiguous & 0x03ffffffu) | 0x80000000u) == contiguous,
+          "DMA_GET round trip preserves the allocation address");
+    *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+contiguous) = 0x13572468u;
+    check(*(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset()+(contiguous & 0x03ffffffu)) == 0x13572468u,
+          "contiguous CPU stores reach GPU physical backing");
+    xbox_HeapFree(contiguous);
+
     check(*physical==0x12345678u, "low heap writes reach the CPU physical view");
     *physical=0xaabbccddu;
     check(*low==0xaabbccddu, "physical buffer writes reach low GPU memory");
