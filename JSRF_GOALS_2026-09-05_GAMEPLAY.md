@@ -454,6 +454,60 @@ Two host notes: `open_controllers()` runs once in `xbox_InputInit` with no
 hotplug, so attach the pad before launching; and this diagnostic harness has no
 window focus of its own to steal.
 
+### Measured 5 September: input reaches the title, and audio is what stops it
+
+Two blockers were in the way and both are fixed. `RECOMP_OHCI_ATTACH=1` puts
+the emulated pad on the port at all. And the address-contract change had broken
+enumeration outright: the driver's descriptors now carry contiguous-window
+addresses (`HcControlHeadED 0x009E29A0 -> 0x808E29A0`) that the service rejected
+against its flat RAM window, so it walked zero endpoints (3bf1f29).
+
+With those, a real DualShock 4 over USB reaches the title: 78 button edges
+delivered through host backend -> USB device -> OHCI -> XPP in one session, and
+366 in a `RECOMP_FAKE_PAD=1` run. The user reports presses working at the
+anti-graffiti screen.
+
+**Then it hangs, every time, at the title screen.** Sampled live
+(claude-realpad-64): the main thread is 100% inside `sub_001A308E`, which is
+
+    loc_001A3094:  test word [ecx+0x12], 0x8000
+                   jne  loc_001A3094
+
+a spin waiting for bit 15 to clear. It is in DSOUND (0x0019E340..0x001BAB1C).
+The bit is cleared by the neighbouring servicing routine at loc_001A2FBE, and a
+DSound worker thread exists and is alive but spends 1909 of 1939 samples asleep
+in `bridge_KeWaitForSingleObject`.
+
+Because the spin never blocks, the main thread never reaches the kernel
+bridge's wait, so nothing pumps and nothing submits: the pusher freezes with
+`put == get` and the window keeps showing the last composed frame. Every
+"it froze" and every beachball in this session is that spin.
+
+**There is no host audio sink on this platform at all:**
+
+    [APU] XAudio2 unavailable, falling back to waveOut
+    [APU] waveOutOpen failed (error 11)
+    [APU] DSP GP/EP initialized (STUBBED - passthrough mode)
+
+XAudio2 and waveOut are both Windows APIs; nothing in the tree opens CoreAudio
+or SDL audio. So the title has been running with its audio decoded into
+nothing, which is also why there has never been any sound. SDL3 is already
+linked, so a sink is available to write.
+
+Hypothesis, not yet measured: the voice-state bit is cleared by a servicing
+path that cannot complete without a working audio pipeline, and the fix is a
+real sink rather than anything in DSOUND. Prove it before writing code -- find
+what clears bit 15 on hardware and what the worker thread is waiting for.
+
+### Frame rate, measured
+
+    anti-graffiti screen   45 fps
+    title screen           12-16 fps   (~2350 triangles/frame, CPU rasteriser)
+    after the spin starts   0 fps
+
+Slow, and expected: the executor rasterises on one core. Not a defect to chase
+before the hang.
+
 ## Constraints and definition of done
 
 Work in the current macOS harness; no upstream merge or full regeneration is
