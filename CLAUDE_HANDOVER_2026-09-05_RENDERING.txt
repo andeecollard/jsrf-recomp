@@ -1,0 +1,251 @@
+JSRF HANDOVER, 5 SEPTEMBER 2026
+The title renders its own screens. The frontier is presentation, not drawing.
+================================================================================
+
+Active goals:  JSRF_GOALS_2026-09-05_GAMEPLAY.md
+Superseded:    JSRF_GOALS_2026-09-05_PUSHBUFFER_RATE.md,
+               JSRF_GOALS_2026-09-04_AUDIO_STALL.md
+Commits:       5103862..f37d451 (22 commits), all pushed to origin/main
+Tests:         ctest 18/18 in build-macos/jsrf-first-fault/build
+
+
+WHERE THE PORT IS
+=================
+
+It boots, loads its assets, streams its title BGM through the CRI stack, runs
+the title screen's state machine to completion, tears it down, builds a
+successor scene of ~128 objects, consumes ~260 million dwords of push buffer
+continuously with zero bad headers and zero faults over a 110-second run, and
+DRAWS ITS OWN SCREENS CORRECTLY.
+
+Two pictures prove that, both captured from the CPU rasteriser's surface:
+
+  - the SEGA anti-graffiti screen, pixel-correct: red spray-can logo, four
+    paragraphs of legible text, right scale and colours (132 distinct colours);
+  - the JSRF title screen: logo, character graphic, "JSRF" and "JET SET RADIO
+    FUTURE(TM)" beneath it, correctly scaled, centred, legible.
+
+It is NOT playable. Nothing has been done on controls (goal 4). Presentation is
+partly working: of 46 frames captured at the flip, 19 carry a picture and 27 do
+not, and the 27 are not frames the title intended to leave blank.
+
+
+WHAT WAS FIXED, AND THE EVIDENCE FOR EACH
+=========================================
+
+Six fixes landed, each measured before and after. They compound; several were
+prerequisites for the next.
+
+1. The empty-list guard (59bf975).
+   sub_00014870's `jbe` at 0x00014885 is an empty-list guard whose `cmp` sits
+   four instructions earlier. The recompiler split those ten instructions into
+   three generated functions chained by fallthrough calls; guest registers
+   survive that (they are globals) but the lifter's _fa/_fb flag snapshot does
+   not (it is a local). So the guard took the constant-zero `_flags` fallback
+   and never fired. The array-remove loop behind it ran with `count - 1`
+   underflowed to 0xFFFFFFFF and copied every dword down one slot across guest
+   memory -- including the kernel import thunk table at 0x001C3F60, which sent
+   every kernel call to the next export along. That is how a call to
+   ObReferenceObjectByHandle arrived at ExQueryNonVolatileSetting.
+   Fix: backport_empty_list_guard.py, with a --check ctest.
+
+2. The shared-ZF branch (914c76c).
+   0x000A13A1's `je` is reached from two different comparisons, so it has no
+   condition of its own and the lifter emitted the fallback. Fixed at each
+   predecessor. This was the only remaining dead `_flags` fallback that
+   executes; RECOMP_UNRESOLVED_FLAGS=1 now reports none at all. 78 latent sites
+   remain in the ratchet and none of them run.
+
+3. DMA_GET published from the consumed cursor, not from PUT (e4f9e99).
+   nv2a_ack_thread copied PUT into GET every tick. For a title whose push
+   buffer nothing executes that is honest; for one whose buffer IS executed it
+   tells the producer the ring is free the instant it submits, so it laps the
+   parser and overwrites commands mid-read. g_nv2a_pusher_owns_dma_get lets an
+   executor take the register over.
+
+4. The ring executed in place, not from a copy (f72ab68).
+   The reserve notification is a PATCH. loc_001914A9 writes [esi+0x10] =
+   0x00040100 and [esi+0x14] = 5 into a segment already published, and
+   loc_001914CD overwrites both words again if the GPU caught up. jsrf_pb_feed
+   memcpy'd up to 1 MB and executed the copy, so patches landing afterwards
+   were never seen. Measured: [PB-PATCH-LOST] address=005DF9A4 snapshot!=5
+   live=5.
+
+5. Consumption in bounded steps with GET republished after each (a2c32a2).
+   THE BIG ONE. GET was published once per poll; a poll could cover most of the
+   ring, and for all that time the producer saw a GET that had not moved. The
+   replay experiment proved it: re-walking the failing window from a copy taken
+   at its start parses cleanly to the end, while the live parse died 1,893
+   dwords in -- so the ring changed underneath it. Steps are 0x8000 bytes,
+   which must exceed the 8 KB largest legal packet.
+     bad headers 1 -> 0, invalid 1 -> 0, rejected control flow 2 -> 0
+     draws 9,819 (frozen) -> 638,538 and climbing
+     triangles 32,535 (frozen) -> 3,266,664 and climbing
+
+6. The framebuffer probe pointed at the surface being drawn (f0dc0dd).
+   [FB] summed PCRTC_START. JSRF never programs a scanout, so that register
+   pointed at a heap block for this port's whole life -- RECOMP_GUARD_PAGE
+   named xbox_HeapAlloc zeroing the very page being summed. Every
+   "nonzero=0/153600" line in the history was reading an allocation.
+
+7. Consumption stops at FLIP_STALL (b1dceba).
+   Presentation ran after the poll, so the parser walked into the next frame's
+   clear before presenting. Blank presents 43/46 -> 27/46.
+
+Codex's parallel work (f79cfa4) was a prerequisite for 4 and 5: the contiguous
+allocator returning high CPU addresses so the guest's reconstructed DMA_GET
+compares against the right range, and the PGRAPH software-method interrupt
+path. Its own caveats are in CODEX_PROGRESS_2026-09-05_PUSHBUFFER.md.
+
+
+WRONG TURNS, AND WHY -- READ THIS ONE
+=====================================
+
+Four claims of mine were withdrawn during the session. Every one came from
+inferring off a fragment instead of measuring, and they cost real time.
+
+1. "The draws arrive in world coordinates, so the transform is broken."
+   The `[GPU] draws ... input x -4636..4636` range is the PRE-SHADER range by
+   construction; draw_primitive says so in its own comment. It describes object
+   space and carries no information about the transform.
+
+2. "oPos = (0,0), (2560,0), (0,1920) is a 4x scale defect."
+   That is the startup blit's oversized covering triangle, a standard
+   technique, and it appears in frames that come out pixel-correct.
+
+3. "The title screen is drawn 4x too large."
+   Those captures were taken mid-composition, showing individual UI elements
+   before the rest of the frame was drawn. The finished frame is correct.
+   Sampling a drawing batch is not sampling a frame.
+
+4. "The framebuffer is black, so the renderer produces nothing."
+   The probe was summing a heap allocation. See fix 6.
+
+There was also a heuristic I added and had to back out: a resync that skipped
+to PUT on a parse failure, and a "backwards PUT with no jump means a restart"
+branch. Both hid the defect instead of explaining it, and the second may have
+been producing desyncs of its own (f03d3a1). Do not add heuristic
+resynchronisation, forward scanning for a plausible header, or clearing of
+stream_fault. The permanence of stream_fault is deliberate: it keeps the one
+event per run visible.
+
+  Rule that would have prevented all five: before stating what the guest did,
+  name the instrument that showed it. If the answer is "I read the range/the
+  sample/the probe line", check what that number actually measures first.
+
+
+THE OPEN FRONTIER (goal 3c)
+===========================
+
+27 of 46 presented frames carry a blank surface, and they are NOT frames the
+title meant to leave blank. The discriminator is the triangle count between one
+flip capture and the next:
+
+    blank, and >50 triangles drawn since the previous capture : 11
+    blank, and <=50 triangles                                 :  0
+    with content                                              : 15
+
+Every blank present follows a frame that drew -- about 750 triangles per
+capture interval, consistently, with no empty frames anywhere. So work is being
+composed, cleared, and then presented.
+
+What has NOT been measured, and is the next thing to do: what the guest emits
+between its last draw and its flip. If the clear for frame N+1 precedes the
+FLIP_STALL for frame N in this title's command order, the flip is the WRONG
+boundary rather than a misapplied one, and the fix is different in kind.
+nv2a_pusher_dump_recent(48) already prints the last methods dispatched; call it
+at the flip and read the sequence.
+
+
+INSTRUMENTS ADDED THIS SESSION
+==============================
+
+All are env-gated or self-limiting and silent in a healthy run.
+
+  RECOMP_GUARD_PAGE=<guest VA>
+      mprotect that page read-only before the guest starts, so the first write
+      faults and the report names the writer. This is what identified both
+      sub_000147A0 (the runaway array-remove) and xbox_HeapAlloc (the
+      framebuffer probe's page). The single most useful thing added.
+
+  RECOMP_PB_REPLAY=1
+      Keep a copy of every push-buffer window as it is taken; on a parse
+      failure re-walk it with nv2a_pusher_scan_segment (dispatches nothing,
+      moves no counters) and report whether the second walk stops at the same
+      offset. Same offset = a decoding defect; different = the ring changed.
+
+  RECOMP_FB_DUMP=<prefix> with RECOMP_FB_DUMP_DRAW=<stride>
+      Capture the executor's surface after every stride-th drawing batch,
+      capped at 24 files. Composed frames rather than report-time snapshots.
+
+  RECOMP_FB_DUMP=<prefix> with RECOMP_FB_DUMP_FLIP=<stride>
+      Capture at the flip -- the only moment a frame is finished. Also logs
+      [FLIP] capture N at frame M: X triangles since the previous capture,
+      which is what separates "intended blank" from "presented after a clear".
+
+  jsrf_title_state_probe   the 21-entry title state machine at 0x001FA008,
+                           printing every change plus a heartbeat every 20000
+                           unchanged visits. Sampling says where it is; only a
+                           trace says whether it is moving.
+  jsrf_list_remove_probe   sub_000147A0's arguments, reporting only calls that
+                           cannot be right. A regression detector for fix 1.
+  jsrf_notify_probe        sub_00193F70's notification index, tallied.
+  jsrf_cri_handler_probe   CRI's installed-handler dispatcher.
+  [PB-NOPSCAN]             one-shot ring scan for software-method packets.
+  [EVENT-SET] caller=      the guest caller on the kernel bridge's event trace.
+                           This is what identified the reserve event's
+                           signaller: the literal 0x0019D640 appears nowhere,
+                           because it is only ever computed as device+0x2440.
+
+
+STRUCTURE WORTH KEEPING
+=======================
+
+The reserve/notification chain, measured end to end and working:
+
+    NO_OPERATION parameter 5
+      -> PGRAPH software-method trap (0xFD400704 method, 0xFD400708 data)
+      -> guest ISR at 0x0019428C, which reads the index from 0xFD400708
+      -> sub_00193F70(device, index): nine-entry switch on index-1,
+         table at 0x001941B4
+      -> index 5 is the only entry reaching 0x00194144
+      -> KeSetEvent(device+0x2440), the event 0x00191510 waits on
+
+  device is 0x0019B200; the reserve event is 0x0019D640; its sibling
+  0x0019D630 is the VBLANK event, signalled ~1000 times a run from 0x00193E62
+  via sub_0018CE50 (D3DDevice_BlockUntilVerticalBlank).
+
+The render target is 0x005F0000, pitch 1280, clip 640x480, 16bpp. The viewport
+the title programs is textbook: scale 320/-240/16777215, offset 320.531/240.531.
+On this host the window is fed from that same surface, via
+xbox_D3D8SetGuestFramebufferSource(nv2a_pb_exec_surface), so what is composed
+is what is displayed. PCRTC_START is never programmed and must not be trusted.
+
+PFIFO control flow: CALL ((h & 3) == 2) and RETURN (h == 0x00020000) are now
+implemented with hardware semantics -- the caller keeps the one-deep stack,
+saving the cursor after the call word exactly as the hardware saves DMA_GET.
+JSRF uses NEITHER; zero of each in a full run. A real gap, closed, and not the
+cause of anything.
+
+
+A RUN
+=====
+
+  RECOMP_PB_EXEC=1 \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME-hdd" \
+  python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 110
+
+Each run needs its own HDD (119 MB); delete the -hdd afterwards, the stderr.log
+is the evidence and it is small. Rebuild with:
+
+  cd build-macos/jsrf-first-fault/build && cmake --build . -j8 && ctest
+
+
+VALIDATION
+==========
+
+ctest 18/18. Four consecutive 110-second runs with no guest fault. The
+generated tree carries five backports, each with a --check test:
+jsrf_empty_list_guard, jsrf_shared_zf_branch, jsrf_adx_loop_flags,
+jsrf_fcmov_backport, jsrf_flag_merge_backport. The unresolved-flags ratchet
+stands at 78 and its limit matches.
