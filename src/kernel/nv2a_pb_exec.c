@@ -1280,8 +1280,21 @@ static void raster_batch(void)
     /* Report-time snapshots may interrupt the clear or raster loops. Capture
      * a few completed batches when inspecting the actual rendered result. */
     if (s_gpu.tris_drawn != drawn_before) {
-        static unsigned captured;
-        if (captured < 3 && getenv("RECOMP_FB_DUMP_DRAW")) {
+        /* RECOMP_FB_DUMP_DRAW=<stride>: capture after every stride-th batch
+         * that actually drew, so the picture is a composed frame rather than
+         * whatever the surface held when a report happened to fire. The first
+         * batches are always the same full-screen blit, so a stride is what
+         * makes the title's own geometry visible; the default keeps the old
+         * behaviour of the first few. */
+        static unsigned batches, captured;
+        static long stride = -1;
+        if (stride < 0) {
+            const char *env = getenv("RECOMP_FB_DUMP_DRAW");
+            stride = env && *env ? strtol(env, NULL, 0) : 0;
+            if (stride < 1) stride = 1;
+        }
+        if (getenv("RECOMP_FB_DUMP_DRAW") && captured < 24
+                && (batches++ % (unsigned long)stride) == 0) {
             captured++;
             dump_surface_bmp();
         }

@@ -219,16 +219,49 @@ all work. The `[FB]` probe reading `nonzero=0/153600` was watching 0x0071E000
 while the executor draws into 0x005F0000; that probe address is a separate
 question and not evidence of a blank renderer.
 
-**The remaining defect is a 4x scale on vertex-program output.** The startup
-screens are pre-transformed screen-space quads and are correct. The title
-screen runs a vertex program, and its oPos comes out at 2560x1920 -- exactly
-four times 640x480. nv2a_pb_exec assumes "NV2A programs include the viewport
-transform and perspective division", so nothing scales oPos afterwards; if the
-program is producing 4x, the viewport scale it was handed is wrong.
+**Correction.** I read oPos = (0,0), (2560,0), (0,1920) as a 4x scale defect.
+It is not: that is the startup full-screen blit, drawn as one oversized
+triangle covering the viewport, which is a standard technique. The same
+coordinates appear in the runs whose output is pixel-correct, so they are not
+evidence of anything wrong. Withdrawn.
 
-Next: read the guest's NV097_SET_VIEWPORT_SCALE/OFFSET and compare against the
-shader constants the program actually multiplies by (RECOMP_VSH_SAMPLE prints
-c0..c7 for a late batch). One of the two is four times the other.
+What is measured is that later screens draw recognisable art -- letters,
+panels, thin rules -- at a scale that puts only a fragment of it on screen,
+while the viewport the title programs is textbook for 640x480:
+
+    viewport scale 320.000 -240.000 16777215.000 0.000
+    viewport offset 320.531 240.531 0.000 0.000
+
+So the viewport methods are being received correctly and the defect is in what
+the title's own geometry is multiplied by, not in the viewport.
+
+### 3a. The 4x scale on vertex-program output (active)
+
+The startup screens are pre-transformed screen-space quads and are correct, so
+nothing general is wrong. The title screen runs a vertex program whose oPos
+comes out at 2560x1920 -- exactly four times 640x480 -- and nv2a_pb_exec
+deliberately applies no further transform, on the documented assumption that
+"NV2A programs include the viewport transform and perspective division".
+
+The viewport side is measured and correct, so the question is what the title's
+geometry is transformed by. The constants sampled so far are the blit
+program's, not the title screen's:
+
+    [VSH] late batch c0..c7: [1 1 1.67772e+07 1] [0.53125 0.53125 0 0]
+                             [0 0 0 0] x6
+
+A scale of 1 with a 0.53125 subpixel bias, which is the blit. The title's own
+program has to be sampled at a batch that draws it -- 225,155 batches execute
+in a run and RECOMP_VSH_SAMPLE was set to 8,000. Sample late, and read the
+constants and oPos together for a batch whose output is the geometry actually
+seen on screen.
+
+Do not scale oPos to compensate. Whichever side is four times the other is the
+defect; correcting the other end would hide it and break the screens that
+already render correctly.
+
+**Acceptance:** the title screen at the same scale as the anti-graffiti screen,
+with the startup screens unchanged.
 
 Measure actual frame completion and presentation, inspect the displayed image,
 and establish continued visual updates through startup and the next scene.
