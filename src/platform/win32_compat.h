@@ -199,6 +199,7 @@ VOID  GetSystemTimeAsFileTime(LPFILETIME ft);
 VOID  GetSystemTime(LPSYSTEMTIME st);
 VOID  GetLocalTime(LPSYSTEMTIME st);
 DWORD GetTickCount(void);
+double xbox_TraceSeconds(void);
 ULONGLONG GetTickCount64(void);
 BOOL  QueryPerformanceCounter(PLARGE_INTEGER count);
 BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);

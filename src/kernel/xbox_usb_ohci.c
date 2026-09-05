@@ -73,6 +73,8 @@ static void *ohci_at(const xbox_ohci_service *s, uint32_t va, uint32_t bytes)
 {
     if (!va || bytes == 0)
         return NULL;
+    if (s->resolve)
+        return s->resolve(va, bytes);
     if (va >= s->ram_size || bytes > s->ram_size - va)
         return NULL;
     return s->ram + va;
@@ -361,14 +363,21 @@ int xbox_UsbInterruptIn(uint8_t endpoint, uint8_t *out, uint32_t out_max,
      * reach the title -- is otherwise invisible: the pad is polled a hundred
      * times a second and every poll looks alike. */
     if (g_trace) {
-        static uint8_t last_buttons, last_a;
+        extern double xbox_TraceSeconds(void);
+        static uint8_t last[8];
         static unsigned shown;
-        if ((report[2] != last_buttons || report[4] != last_a) && shown < 16) {
+        /* Every digital control, so a release is as visible as a press: the
+         * question "did the title react" is asked of an edge, and half the
+         * edges are releases. The cap is generous because a session of
+         * pressing buttons at a screen is minutes of edges, not a handful. */
+        uint8_t now[8] = { report[2], report[3], report[4], report[5],
+                           report[6], report[7], report[10], report[11] };
+        if (memcmp(now, last, sizeof now) != 0 && shown < 400) {
             shown++;
-            last_buttons = report[2];
-            last_a = report[4];
-            fprintf(stderr, "  [USB-PAD] buttons=%02X A=%02X B=%02X X=%02X"
-                    " Y=%02X LT=%02X RT=%02X lx=%d ly=%d\n",
+            memcpy(last, now, sizeof now);
+            fprintf(stderr, "  [USB-PAD] t=%7.2f buttons=%02X A=%02X B=%02X"
+                    " X=%02X Y=%02X LT=%02X RT=%02X lx=%d ly=%d\n",
+                    xbox_TraceSeconds(),
                     report[2], report[4], report[5], report[6], report[7],
                     report[10], report[11],
                     (int)(int16_t)(report[12] | (report[13] << 8)),

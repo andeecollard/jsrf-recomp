@@ -67,6 +67,7 @@ void jsrf_notify_probe(uint32_t pc, uint32_t object, uint32_t index,
  */
 void jsrf_title_state_probe(uint32_t pc, uint32_t object, uint32_t state)
 {
+    extern double xbox_TraceSeconds(void);
     static uint32_t last_object, last_state = 0xFFFFFFFFu;
     static unsigned long same;
 
@@ -74,14 +75,14 @@ void jsrf_title_state_probe(uint32_t pc, uint32_t object, uint32_t state)
     if (object == last_object && state == last_state) {
         if (++same % 20000)
             return;
-        fprintf(stderr, "[TITLE-STATE] this=%08X state=0x%02X still, %lu visits\n",
-                object, state, same);
+        fprintf(stderr, "[TITLE-STATE] t=%7.2f this=%08X state=0x%02X still,"
+                " %lu visits\n", xbox_TraceSeconds(), object, state, same);
         fflush(stderr);
         return;
     }
-    fprintf(stderr, "[TITLE-STATE] this=%08X state=0x%02X (was %08X/0x%02X"
-            " after %lu visits)\n",
-            object, state, last_object, last_state, same);
+    fprintf(stderr, "[TITLE-STATE] t=%7.2f this=%08X state=0x%02X"
+            " (was %08X/0x%02X after %lu visits)\n",
+            xbox_TraceSeconds(), object, state, last_object, last_state, same);
     fflush(stderr);
     last_object = object;
     last_state = state;

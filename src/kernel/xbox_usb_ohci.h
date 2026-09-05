@@ -63,6 +63,17 @@ extern "C" {
 typedef struct {
     uint8_t  *ram;            /* host base of guest address 0 */
     uint32_t  ram_size;
+    /* Optional address resolver, used in place of the flat ram/ram_size
+     * window when set.
+     *
+     * The flat window is only the truth while every descriptor lives in the
+     * low 64 MB. It stopped being so when the contiguous allocator began
+     * returning addresses in the 0x80000000 window, which is separately backed
+     * storage rather than an alias of that RAM -- so neither following the
+     * address nor masking its high bit reaches the right bytes, and the only
+     * thing that does is the runtime's own translation. Left NULL, the flat
+     * window is used, which is what a test with no guest wants. */
+    void *(*resolve)(uint32_t va, uint32_t bytes);
     uint32_t  hcca;           /* HcHCCA, guest address; 0 disables done-queue publication */
     uint32_t  head_ed;        /* HcControlHeadED or the periodic-list head */
     uint32_t  done_head;      /* in/out: HcDoneHead */

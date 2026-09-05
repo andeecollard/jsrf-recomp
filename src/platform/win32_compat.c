@@ -1058,6 +1058,23 @@ ULONGLONG GetTickCount64(void)
 
 DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
+/* Seconds since the first call, for correlating traces across subsystems.
+ *
+ * Separate probes each printing their own elapsed time cannot be lined up
+ * against each other; a run where the question is "did the title react to that
+ * press" needs one clock. Monotonic, so it does not jump under NTP. */
+double xbox_TraceSeconds(void)
+{
+    static struct timespec t0;
+    static int have_t0;
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!have_t0) { t0 = now; have_t0 = 1; }
+    return (double)(now.tv_sec - t0.tv_sec)
+         + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+}
+
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
     struct timespec ts;

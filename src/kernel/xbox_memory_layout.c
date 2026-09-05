@@ -576,6 +576,19 @@ uint32_t xbox_OhciPortWrite(uint32_t current, uint32_t v)
 /* Dump the control schedule as XPP publishes and then activates its head. This
  * is an opt-in, read-only instrument for building the transfer service from
  * the title's actual ED/TD layout rather than assumptions. */
+/* Guest address to host pointer for everything in the OHCI path.
+ *
+ * Descriptors used to live in the low 64 MB and `g_memory_base + va` was
+ * enough. They do not any more: the contiguous allocator returns addresses in
+ * the 0x80000000 window, which this file backs with its own VirtualAlloc
+ * rather than as an alias of guest RAM, so both following the raw address and
+ * masking off its high bit read the wrong bytes. xbox_GpuMemoryRange is the
+ * translation that already knows about both ranges. */
+static void *ohci_resolve(uint32_t va, uint32_t bytes)
+{
+    return xbox_GpuMemoryRange(va, bytes);
+}
+
 static void ohci_trace_control_ed(uint32_t ed_va)
 {
     static unsigned dumps;
@@ -585,9 +598,9 @@ static void ohci_trace_control_ed(uint32_t ed_va)
     if (!getenv("RECOMP_OHCI_TRANSFER_TRACE") || ++dumps > 32)
         return;
     ed_va &= ~0xFu;
-    if (ed_va > g_memory_size - 16u)
+    ed = (uint32_t *)ohci_resolve(ed_va, 16u);
+    if (!ed)
         return;
-    ed = (uint32_t *)((uintptr_t)g_memory_base + ed_va);
     td_va = ed[2] & ~0xFu;
     tail_va = ed[1] & ~0xFu;
     fprintf(stderr,
@@ -596,9 +609,9 @@ static void ohci_trace_control_ed(uint32_t ed_va)
     for (unsigned i = 0; td_va && td_va != tail_va && i < 16; ++i) {
         uint32_t *td;
         uint32_t cbp, next, be;
-        if (td_va > g_memory_size - 16u)
+        td = (uint32_t *)ohci_resolve(td_va, 16u);
+        if (!td)
             break;
-        td = (uint32_t *)((uintptr_t)g_memory_base + td_va);
         cbp = td[1];
         next = td[2] & ~0xFu;
         be = td[3];
@@ -659,6 +672,7 @@ static unsigned ohci_service(uint32_t head_ed, xbox_ohci_service *svc)
     memset(svc, 0, sizeof(*svc));
     svc->ram = (uint8_t *)g_memory_base;
     svc->ram_size = (uint32_t)g_memory_size;
+    svc->resolve = ohci_resolve;
     svc->head_ed = head_ed;
     svc->hcca = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_HCCA);
     svc->done_head =
@@ -723,9 +737,12 @@ static void ohci_periodic_tick(void)
 
     /* The frame counter lives in the HCCA, which is ordinary guest RAM: free
      * to advance every frame. */
-    if (hcca && (hcca & ~0xFFu) <= g_memory_size - XBOX_OHCI_HCCA_SIZE) {
-        *(uint32_t *)((char *)g_memory_base + (hcca & ~0xFFu)
-                      + XBOX_OHCI_HCCA_FRAME_NUMBER) = g_ohci_frame & 0xFFFFu;
+    if (hcca) {
+        uint32_t *fn = (uint32_t *)ohci_resolve((hcca & ~0xFFu)
+                                                + XBOX_OHCI_HCCA_FRAME_NUMBER,
+                                                4u);
+        if (fn)
+            *fn = g_ohci_frame & 0xFFFFu;
     }
 
     /* StartOfFrame, but only while the driver is actually counting frames.
@@ -766,9 +783,11 @@ static void ohci_periodic_tick(void)
      * not a reason to stop: the pass still flushes a deferred done queue. */
     head = 0;
     if (hcca) {
+        uint32_t *slot;
         entry = (hcca & ~0xFFu) + (g_ohci_frame & 31u) * 4u;
-        if (entry <= g_memory_size - 4u)
-            head = *(uint32_t *)((char *)g_memory_base + entry);
+        slot = (uint32_t *)ohci_resolve(entry, 4u);
+        if (slot)
+            head = *slot;
     }
 
     if (ohci_service(head, &svc)) {
@@ -1754,9 +1773,9 @@ static void framebuffer_probe_tick(void)
     {
         extern int nv2a_pb_exec_snapshot_nonzero(void);
         int presented = nv2a_pb_exec_snapshot_nonzero();
-        fprintf(stderr, "  [FB] 0x%08X sum=%08X nonzero=%u/%u %s |"
+        fprintf(stderr, "  [FB] t=%7.2f 0x%08X sum=%08X nonzero=%u/%u %s |"
                 " presented nonzero=%d\n",
-                s_fb_va, sum, nonzero, n,
+                xbox_TraceSeconds(), s_fb_va, sum, nonzero, n,
                 sum != last_sum ? "CHANGED" : "same", presented);
     }
     last_sum = sum;

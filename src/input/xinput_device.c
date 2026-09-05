@@ -120,6 +120,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
 #include <SDL.h>
 #include <time.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
@@ -130,14 +131,32 @@ static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 static void open_controllers(void)
 {
     int slot = 0;
+    /* Say what was found, by name.
+     *
+     * This runs once and there is no hotplug, so a pad attached after launch
+     * is silently absent for the whole run -- and an absent pad is
+     * indistinguishable from a title that ignores input, which is exactly the
+     * question a session with a controller is trying to answer. One line at
+     * startup removes that ambiguity before anyone presses anything. */
     for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
         if (!SDL_IsGameController(i))
             continue;
         if (!g_pads[slot]) {
             g_pads[slot] = SDL_GameControllerOpen(i);
             g_controller_connected[slot] = (g_pads[slot] != NULL);
+            fprintf(stderr, "  [PAD] port %d: %s (%s)\n", slot,
+                    g_pads[slot] ? SDL_GameControllerName(g_pads[slot])
+                                 : "open failed",
+                    g_pads[slot] ? "opened" : SDL_GetError());
+            fflush(stderr);
         }
         slot++;
+    }
+    if (!slot) {
+        fprintf(stderr, "  [PAD] no game controller attached (%d joystick(s)"
+                " seen); there is no hotplug, so attach before launching\n",
+                SDL_NumJoysticks());
+        fflush(stderr);
     }
 }
 
