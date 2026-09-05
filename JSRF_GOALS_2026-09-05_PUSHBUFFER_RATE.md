@@ -50,57 +50,80 @@ Settled. Do not re-open without new runtime evidence.
 
 ## Goals, in order
 
-### G23 — ACTIVE. Explain four pushbuffer grants a second
+### G23 — CLOSED. The rate is a latch, not starvation
 
-The main thread spins in `sub_00191440` at `loc_001914F0`:
+Answered by counting the acknowledgement thread's own loop and its exits:
 
-```
-ecx = [edx]        ; GET
-esi = edi - ecx    ; outstanding = PUT - GET
-cmp eax, esi
-jb  loc_001914F0   ; spin while needed < outstanding
-```
+    [PB-ACK] 3422711 loops/s: acked=4383 already=950582
+             not-consumed=298112789 no-device=28533
 
-`RECOMP_PB_WAIT_TRACE=1` shows it is **not** deadlocked: GET advances, and
-`outstanding` sits at 6 against a `needed` of 2. But across 40 million spin
-iterations in 100 seconds it advances roughly four times a second.
+The thread runs **three and a half million times a second** -- it is not
+starved, and G24 is not the explanation. `acked` freezes at 4383 and every
+subsequent loop takes the "not consumed" exit, three hundred million of them in
+one run, because `jsrf_pb_poll` latches a static `stream_fault` on its first
+parse failure and returns 0 for the rest of the process. GET then never
+advances and the title spins in its pushbuffer reserve forever.
 
-GET is advanced by our own `jsrf_pushbuffer_ack` thread, in
-`diagnostics/jsrf_first_fault/main.c`, whose body is
+So four grants a second was one parse failure followed by silence, not a slow
+handshake.
 
-```
-consumed = jsrf_pb_poll();
-if (getp && consumed && MEM32(getp)!=submitted) MEM32(getp)=submitted;
-Sleep(0);
-```
+### G26 — ACTIVE. One desync per run, at a backwards PUT to a non-base address
 
-A `Sleep(0)` loop should acknowledge thousands of times a second. Two
-explanations, and they need opposite fixes:
+This is the root cause; everything else was downstream of it.
 
-1. **The loop runs fast and the condition is wrong** — `consumed` is usually
-   false, or `MEM32(getp)==submitted` already, so the ack is skipped.
-2. **The loop barely runs** — the thread is starved (see G24).
+The parse is almost perfect: **bad_headers=1 across 6,406,120 dwords**. The
+segment history places that single failure exactly:
 
-**First step:** count the ack thread's own iterations and how many of them
-take each exit, and report the rate. That is one counter and one line; it
-distinguishes the two without guessing.
+    seg 3557: from=005B96F8 end=005E96F8 put=005E96F8 stop=0 consumed=49152
+    seg 3558: from=005E96F8 end=005ED000 put=005E6C80 stop=3 consumed=1
 
-**Acceptance:** a measured statement of which of the two it is, and the grant
-rate in the hundreds per second rather than four.
+One dword past a window consumed cleanly to its end, on a poll where PUT had
+moved **backwards, to an address that is not the ring base**. Every healthy
+wrap in the same run does the opposite -- PUT becomes the ring base and a JUMP
+is waiting in the tail (segs 3544, 3547, 3550, 3554, all stop=2).
+
+The first question is whether the guest really published that value or whether
+we read it wrongly, and one instrument settles it: record every backwards
+transition of PUT with the previous value, the cursor, and an immediate
+re-read. A value that changes on re-read is a race; a stable one is the guest.
+
+Do not resynchronise, skip, or scan to get past this. Two heuristics of mine
+were reverted for exactly that reason (commit f03d3a1) -- one of them may have
+been producing desyncs of its own.
+
+**Acceptance:** a measured statement of what writes that value and why, and
+bad_headers 0 over a full run.
+
+### G25 — CLOSED for CALL/RETURN; `stream_fault` deliberately unchanged
+
+PFIFO's control flow was a stub and the code said so. CALL ((h & 3) == 2) fell
+through to INVALID, and so did RETURN, because 0x00020000 masks to 0x00020000
+under 0xE0030003 and matches neither method form -- a legal return read as a
+malformed header.
+
+Both are now implemented with hardware semantics: CALL reports its target and
+the caller saves the cursor after the call word, which is the DMA_GET hardware
+saves; RETURN restores it. One deep, as PFIFO is. `jsrf_pusher_stream` covers
+both. Commit f03d3a1.
+
+**And JSRF uses neither.** Zero CALLs and zero RETURNs in 110 seconds with the
+opcodes implemented, so the (h & 3) == 2 words seen in earlier runs were data,
+not calls. A real gap, closed, and not the cause.
+
+`stream_fault` stays permanent on purpose until G26 is understood. Making it
+recoverable would hide the one event per run that matters.
 
 ### G24 — `nv2a_ack_thread` spends its life in `mprotect`
 
-In the same sample it spends ~37% of its samples in `__mprotect`, re-arming
-the MCPX write trap, and another ~37% in `cthread_yield`. `mprotect` takes the
-process-wide VM lock on macOS, and the main thread is spinning flat out on
-another core throughout.
+It spends ~37% of its samples in `__mprotect`, re-arming the MCPX write trap,
+and another ~37% in `cthread_yield`. `mprotect` takes the process-wide VM lock
+on macOS.
 
-Re-arming should be driven by the guest actually touching the guarded page,
-not by a loop. This is the most likely cause of G23's explanation 2, and it is
-independently worth fixing.
+**Demoted:** this was proposed as the explanation for G23 and measured not to
+be -- the acknowledgement thread runs three and a half million times a second.
+It remains real waste and worth fixing, but it is not blocking anything.
 
-**Acceptance:** `mprotect` falls out of the thread's profile, and the main
-thread's tick rate improves measurably.
+**Acceptance:** `mprotect` falls out of the thread's profile.
 
 ### G16 — Guest thread priorities are not honoured
 
@@ -152,10 +175,12 @@ the first screen that actually reads a pad.
 
 ## Readiness
 
-Not playable. But the failure mode is now a performance defect in our own
-runtime rather than a crash, a stall, or a missing feature in the title, and it
-has a number attached to it: four pushbuffer grants a second, against the
-hundreds a frame needs.
+Not playable. The failure mode is a single push-buffer parse desynchronisation
+per run -- one bad header in six and a half million dwords -- which a permanent
+`stream_fault` then turns into a dead renderer and a title spinning forever in
+its reserve loop. Everything else that looked like the problem (the transform,
+the draw path, thread starvation, missing PFIFO control flow) has been measured
+and ruled out. G26 is the whole of it.
 
 ## Non-goals for now
 
