@@ -13,13 +13,13 @@ the update walker services continuously. Four consecutive 100-second runs, no
 fault.
 
 What it does not do is finish a frame. The main thread spends **2485 of 2485**
-samples in one loop — D3D's pushbuffer free-space wait — and the grant that
-releases that loop arrives about **four times a second**. Nothing reaches the
-screen because nothing completes.
+samples in D3D's pushbuffer free-space wait, because GET stops advancing —
+and GET stops advancing because our push-buffer parse desynchronises exactly
+once per run and a static `stream_fault` makes that permanent.
 
-So the frontier has moved twice in one day: from "it faults" to "it renders
-nothing" to "it renders at four hertz". The remaining problem is a *rate*, and
-it is in our runtime, not in the title.
+So the frontier moved three times in one day: from "it faults" to "it renders
+nothing" to "it renders at four hertz" to **one bad header in six and a half
+million dwords**. Everything else has been measured and ruled out.
 
 ## Closed by measurement, 5 September
 
@@ -41,10 +41,13 @@ Settled. Do not re-open without new runtime evidence.
   -4636..4636` range is the *pre-shader* range by construction and says nothing
   about the transform; it was cited as evidence of a broken transform and that
   was wrong.
-- **The pushbuffer ring desync.** On a backwards PUT with no jump at the
-  cursor the feed parsed the ring's stale tail as commands, landed on last
-  lap's ARRAY_ELEMENT16 index pairs, and set the permanent `stream_fault`.
-  Fixed; invalid headers per run 1+ → 0. Commit a54ff90.
+- **Missing PFIFO control flow.** CALL and RETURN were unimplemented and both
+  read as malformed headers. Implemented and unit-tested in f03d3a1 — and JSRF
+  executes neither, so it was a real gap and not the cause.
+- *Not* closed: the ring desync. A "backwards PUT with no jump means a restart"
+  branch in a54ff90 appeared to fix it, and was reverted in f03d3a1 because it
+  was a heuristic that hid the event and may have caused desyncs of its own.
+  See G26.
 - **Dead `_flags` fallbacks in reachable code.** Were 2, now 0. The ratchet
   stands at 78 latent sites; none of them execute.
 
@@ -133,18 +136,6 @@ same subject reached from the pushbuffer side; fix those first and re-measure
 before doing scheduler work.
 
 **Acceptance:** the idle thread yields to higher-priority guest threads.
-
-### G25 — Two unfinished edges of the pushbuffer parser
-
-Neither is currently reached, both are real.
-
-- **NV2A `call` headers** (`(word & 3) == 2`) are refused by design — "calls
-  and returns need a caller-owned stack". The hardware subroutine is one deep;
-  implementing it is `NV2A_PUSHER_CALL` plus a return address in the feed loop,
-  with a case in `jsrf_pusher_stream_test`.
-- **`stream_fault` is permanent.** One unparseable stream disables rendering
-  for the life of the process. It should be recoverable — resynchronise at the
-  next published PUT rather than never again.
 
 ### G21 — Carry lifter flag state across fallthrough boundaries
 
