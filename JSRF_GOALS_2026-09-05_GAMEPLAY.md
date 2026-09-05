@@ -268,8 +268,33 @@ flip rather than at a drawing batch, confirm the presented image updates
 through startup and into the title screen, and fix the [FB] probe's address so
 it reports the surface actually being drawn.
 
+### Measured: the probe was reading a heap block
+
+`RECOMP_GUARD_PAGE=0x0071E000` named the writer of the address `[FB]` was
+summing: **xbox_HeapAlloc**, zeroing it as an ordinary allocation. JSRF never
+programs a scanout, so PCRTC_START held whatever was there, and every
+`nonzero=0/153600` line in this port's history was reading heap memory rather
+than a framebuffer.
+
+The probe now reports the executor's own render target, and the answer changes
+completely:
+
+    [FB] 0x005F0000 sum=679424FD nonzero=16779/153600 CHANGED
+    [FB] 0x005F0000 sum=859B5783 nonzero=2/153600     CHANGED
+    [FB] 0x005F0000 sum=88880000 nonzero=2/153600     CHANGED
+
+The surface changes between samples, with content. Zeros are samples that land
+between a clear and its draws, which is what a once-a-second probe against a
+60 Hz clear does.
+
+On this host the window is fed from that same surface --
+`xbox_D3D8SetGuestFramebufferSource(nv2a_pb_exec_surface)` -- so what is
+composed is what is displayed.
+
 **Acceptance:** a sequence of captured frames showing the title screen present
-and update, not a single frame.
+and update, not a single frame. The 43-frame capture in claude-drawdump-45 is
+that sequence for composition; presentation cadence is still worth measuring
+against the flip rather than against drawing batches.
 
 ## 4. Verify controls and reach gameplay
 

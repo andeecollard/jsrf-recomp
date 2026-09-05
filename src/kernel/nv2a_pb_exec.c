@@ -1429,6 +1429,29 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             && method >= NV097_SET_TRANSFORM_PROGRAM && method < NV097_SET_TRANSFORM_CONSTANT)
         ++s_vsh_trace.program_words[subch];
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        /* What else the title is driving, and on which channel.
+         *
+         * The executor renders into the surface the 3D class names and the
+         * CRTC scans out a different address that nothing ever writes, so
+         * something has to be moving pixels between them -- and the obvious
+         * candidate is a second class, image blit or surface-to-memory, on
+         * another subchannel. Everything here is dropped, so a whole engine
+         * could be in use and look identical to silence. Count it. */
+        {
+            static unsigned long per_subch[8];
+            static unsigned long total;
+            if (subch < 8) ++per_subch[subch];
+            if ((++total % 200000ul) == 1ul) {
+                unsigned k;
+                fprintf(stderr, "  [GPU] non-3D subchannel methods:");
+                for (k = 1; k < 8; ++k)
+                    if (per_subch[k])
+                        fprintf(stderr, " subch%u=%lu", k, per_subch[k]);
+                fprintf(stderr, " (latest method 0x%04X param 0x%08X on"
+                        " subch %u)\n", method, param, subch);
+                fflush(stderr);
+            }
+        }
         note_unhandled(method);
         return;
     }
@@ -1793,6 +1816,15 @@ int nv2a_pb_exec_vsh_constant(unsigned index, float out[4])
     if (index >= NV2A_VS_MAX_CONSTANTS || !out) return 0;
     memcpy(out, s_vsh.constants[index], sizeof(float) * 4);
     return 1;
+}
+
+/* The address the executor is actually rendering into, or 0 before the title
+ * has named one. The framebuffer probe needs it because PCRTC_START is not a
+ * substitute: a title that never programs a scanout leaves it holding whatever
+ * was there, and this one leaves it pointing at a heap block. */
+uint32_t nv2a_pb_exec_surface_va(void)
+{
+    return s_gpu.color_offset;
 }
 
 void nv2a_pb_exec_report(void)

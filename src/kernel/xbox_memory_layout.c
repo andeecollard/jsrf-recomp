@@ -1716,6 +1716,17 @@ static void framebuffer_probe_tick(void)
     uint32_t sum = 0, nonzero = 0, i, n;
     const uint32_t *p;
 
+    /* Report the surface being drawn, not whatever PCRTC_START happens to
+     * hold. JSRF never programs a scanout address, so that register pointed at
+     * a heap block for the whole of this port's life -- xbox_HeapAlloc was
+     * measured zeroing the very page the probe was summing -- and every
+     * "nonzero=0/153600" line was reading an allocation rather than a
+     * framebuffer. The executor's own render target is the honest subject. */
+    {
+        extern uint32_t nv2a_pb_exec_surface_va(void);
+        uint32_t drawn = nv2a_pb_exec_surface_va();
+        if (drawn) s_fb_va = drawn;
+    }
     if (!s_nv2a_trace || !s_fb_va || !s_fb_pitch)
         return;
     if (last_ms && (now - last_ms) < 1000)
