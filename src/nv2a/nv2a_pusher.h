@@ -38,7 +38,14 @@ typedef struct {
 uint32_t nv2a_pusher_run(const uint32_t *data, uint32_t num_dwords);
 
 typedef enum {
-    NV2A_PUSHER_END, NV2A_PUSHER_PARTIAL, NV2A_PUSHER_JUMP, NV2A_PUSHER_INVALID
+    NV2A_PUSHER_END, NV2A_PUSHER_PARTIAL, NV2A_PUSHER_JUMP, NV2A_PUSHER_INVALID,
+    /* PFIFO's one-deep subroutine. CALL carries its target in jump_address;
+     * the caller saves the cursor that follows the call word as the return
+     * address, exactly as the hardware saves DMA_GET, and RETURN restores it.
+     * Keeping the stack with the caller is why these are stop codes rather
+     * than something this parser resolves: it only ever sees one window of a
+     * ring it does not own. */
+    NV2A_PUSHER_CALL, NV2A_PUSHER_RETURN
 } NV2APusherStop;
 typedef struct {
     uint32_t methods, consumed, jump_address;

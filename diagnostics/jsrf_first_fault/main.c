@@ -152,6 +152,14 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     return nv2a_pusher_run_segment(snapshot, (to-from)/4u);
 }
 
+/* PFIFO's subroutine is one level deep: a register holding the saved DMA_GET
+ * and a flag saying it is in use. Kept here rather than in the parser because
+ * the parser only ever sees one window of a ring it does not own. */
+#define JSRF_PB_SUBR_MAX 0x10000u
+static uint32_t g_pb_subr_return;
+static int      g_pb_subr_active;
+static unsigned long g_pb_calls, g_pb_returns;
+
 /* The last few segment decisions, for the desync post-mortem below. */
 static struct { uint32_t from, end, put, stop, consumed; } g_pb_hist[16];
 static unsigned g_pb_hist_n;
@@ -186,38 +194,15 @@ static int jsrf_pb_poll(void)
     /* A published cursor can split a packet. Advance only by the dwords
      * actually consumed, and follow the ring's jump instead of parsing its
      * unused tail as commands. Bounds come from the title's live device. */
-    for (unsigned segment=0; g_pb_last!=now && segment<8; ++segment) {
-        if (g_pb_ring_lo && (now<g_pb_ring_lo || now>g_pb_ring_hi)) break;
-        uint32_t end = now>g_pb_last ? now : g_pb_ring_hi;
-        /* PUT below the cursor means one of two things, and they need
-         * opposite handling.
-         *
-         * The ring can wrap by ending its written region with a jump back to
-         * the base, in which case everything from the cursor to the top was
-         * written on the previous lap and must still be executed. That is the
-         * case the tail parse below exists for, and it works.
-         *
-         * Or the title can simply restart the buffer: once GET has caught up
-         * with PUT the ring is drained, so D3D can reset its write cursor to
-         * the base without emitting anything at the old position. Nothing is
-         * written at the cursor then, and the dwords there are last lap's
-         * data. Parsing them desynchronises the stream -- measured landing on
-         * ARRAY_ELEMENT16 index pairs (00FD00FC, 00FF00FE, ...) and reporting
-         * them as invalid headers -- and the invalid header sets stream_fault,
-         * which is permanent, so rendering never resumes and the title spins
-         * forever in its pushbuffer reserve waiting for a GET that no longer
-         * moves.
-         *
-         * A jump is the only thing that can legitimately be at the cursor in
-         * the first case, so its absence identifies the second. */
-        if (now < g_pb_last && g_pb_ring_lo) {
-            uint32_t w = MEM32(g_pb_last);
-            int is_jump = (w & 3u)==1u || (w & 0xe0000003u)==0x20000000u;
-            if (!is_jump) {
-                g_pb_last = g_pb_ring_lo;
-                continue;
-            }
-        }
+    for (unsigned segment=0; (g_pb_last!=now || g_pb_subr_active) && segment<16; ++segment) {
+        if (!g_pb_subr_active && g_pb_ring_lo
+                && (now<g_pb_ring_lo || now>g_pb_ring_hi)) break;
+        /* Inside a subroutine the cursor is in a buffer the ring bounds and
+         * PUT say nothing about, so neither can end the window; only the
+         * RETURN does. Cap it so a target that is not really a push buffer
+         * cannot walk guest memory. */
+        uint32_t end = g_pb_subr_active ? g_pb_last + JSRF_PB_SUBR_MAX
+                     : (now>g_pb_last ? now : g_pb_ring_hi);
         if (!end || end<=g_pb_last) break;
         NV2APusherResult result = jsrf_pb_feed(g_pb_last, end);
         /* Every segment decision, kept in a ring and dumped when the parse
@@ -231,6 +216,40 @@ static int jsrf_pb_poll(void)
         g_pb_hist[g_pb_hist_n & 15].consumed = result.consumed;
         g_pb_hist_n++;
         g_pb_last += result.consumed*4;
+        if (result.stop==NV2A_PUSHER_CALL) {
+            /* Hardware saves DMA_GET as it stands after the call word, which
+             * is exactly the cursor the parser has just left us. */
+            if (g_pb_subr_active) {
+                fprintf(stderr,"[PUSHER] nested CALL %08X at %08X;"
+                        " PFIFO's subroutine is one deep\n",
+                        result.jump_address, g_pb_last-4);
+                stream_fault=1;
+                break;
+            }
+            g_pb_subr_return = g_pb_last;
+            g_pb_subr_active = 1;
+            if (++g_pb_calls <= 4)
+                fprintf(stderr,"[PUSHER] CALL #%lu at %08X -> target %08X,"
+                        " saved return %08X\n",
+                        g_pb_calls, g_pb_last-4, result.jump_address,
+                        g_pb_subr_return);
+            g_pb_last = result.jump_address;
+            continue;
+        }
+        if (result.stop==NV2A_PUSHER_RETURN) {
+            if (!g_pb_subr_active) {
+                fprintf(stderr,"[PUSHER] RETURN at %08X with no active"
+                        " subroutine\n", g_pb_last-4);
+                stream_fault=1;
+                break;
+            }
+            if (++g_pb_returns <= 4)
+                fprintf(stderr,"[PUSHER] RETURN #%lu at %08X -> restored %08X\n",
+                        g_pb_returns, g_pb_last-4, g_pb_subr_return);
+            g_pb_last = g_pb_subr_return;
+            g_pb_subr_active = 0;
+            continue;
+        }
         if (result.stop==NV2A_PUSHER_JUMP) {
             if (g_pb_ring_lo && result.jump_address>=g_pb_ring_lo
                     && result.jump_address<g_pb_ring_hi && !(result.jump_address&3)
@@ -240,6 +259,20 @@ static int jsrf_pb_poll(void)
             }
             stream_fault=1;
             fprintf(stderr,"[PUSHER] rejected jump %08X at %08X\n",result.jump_address,g_pb_last-4);
+            /* Same post-mortem as the invalid-header path: a jump target
+             * outside the ring means the parse is reading data, not commands,
+             * and where sync was lost is several segments upstream. */
+            fprintf(stderr,"[PUSHER]   ring:");
+            for (int k=-8;k<=8;++k)
+                fprintf(stderr," %s%08X",k?"":">",MEM32(g_pb_last-4+k*4));
+            fprintf(stderr,"\n");
+            for (unsigned k = g_pb_hist_n>16?g_pb_hist_n-16:0; k<g_pb_hist_n; ++k)
+                fprintf(stderr,"[PUSHER]   seg %u: from=%08X end=%08X"
+                        " put=%08X stop=%u consumed=%u\n", k,
+                        g_pb_hist[k&15].from, g_pb_hist[k&15].end,
+                        g_pb_hist[k&15].put, g_pb_hist[k&15].stop,
+                        g_pb_hist[k&15].consumed);
+            fflush(stderr);
             break;
         }
         if (result.stop==NV2A_PUSHER_INVALID) {
@@ -593,6 +626,35 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
         uint32_t submitted = dev ? MEM32(dev + JSRF_D3D_PUT_OFFSET) : 0;
         int consumed = jsrf_pb_poll();
         jsrf_pusher_report();
+        /* Why the guest gets so few grants.
+         *
+         * The title's pushbuffer reserve spins until GET catches up with PUT,
+         * and this line is the only thing that moves GET. Measured, it moves
+         * about four times a second, against the hundreds a frame needs -- so
+         * either this loop barely runs, or it runs and takes an early exit.
+         * Those need opposite fixes, and only the counts tell them apart:
+         * `loops` is the thread's own rate, and each `no_*` is one reason the
+         * acknowledgement did not happen. */
+        {
+            static unsigned long loops, no_dev, no_consume, already, acked;
+            static DWORD last;
+            DWORD now_ms = GetTickCount();
+            ++loops;
+            if (!getp)                        ++no_dev;
+            else if (!consumed)               ++no_consume;
+            else if (MEM32(getp)==submitted)  ++already;
+            else                              ++acked;
+            if (!last) last = now_ms;
+            if (now_ms - last >= 2000) {
+                fprintf(stderr, "  [PB-ACK] %lu loops/s: acked=%lu already=%lu"
+                        " not-consumed=%lu no-device=%lu (totals)\n",
+                        loops * 1000ul / (now_ms - last),
+                        acked, already, no_consume, no_dev);
+                fflush(stderr);
+                loops = 0;
+                last = now_ms;
+            }
+        }
         if (getp && consumed && MEM32(getp)!=submitted) MEM32(getp)=submitted;
         Sleep(0);
     }

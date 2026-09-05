@@ -25,11 +25,28 @@ int main(void) {
     tail[0]=0x210dd000;
     r=nv2a_pusher_run_segment(tail,3);
     CHECK(r.stop==NV2A_PUSHER_JUMP && r.jump_address==0x010dd000 && seen==4);
-    tail[0]=0x00020000; /* return: unsupported control flow must stop */
+    /* PFIFO's subroutine. Both opcodes stop the parse and hand the caller the
+     * information it needs to keep the one-deep stack itself: CALL reports its
+     * target, RETURN reports nothing but the fact. Each consumes exactly its
+     * own dword, so the cursor the caller is left holding is the one hardware
+     * saves as DMA_GET -- the dword after the call word. */
+    tail[0]=0x028202A6;                 /* call 0x028202A4 */
+    r=nv2a_pusher_run_segment(tail,3);
+    CHECK(r.stop==NV2A_PUSHER_CALL && r.jump_address==0x028202A4
+          && r.consumed==1 && seen==4);
+    tail[0]=0x00020000;                 /* return */
+    r=nv2a_pusher_run_segment(tail,3);
+    CHECK(r.stop==NV2A_PUSHER_RETURN && r.consumed==1 && seen==4);
+    /* A return must not be mistaken for a method packet: 0x00020000 masks to
+     * neither header form, which is what used to make it read as malformed. */
+    CHECK((0x00020000u & 0xE0030003u) != 0u
+          && (0x00020000u & 0xE0030003u) != 0x40000000u);
+    /* Data that decodes as neither is still refused. */
+    tail[0]=0x00030000;
     r=nv2a_pusher_run_segment(tail,3);
     CHECK(r.stop==NV2A_PUSHER_INVALID && r.consumed==0 && seen==4);
     const uint32_t zero_count[]={0x200,0,1u<<18|0x208,0x113};
     r=nv2a_pusher_run_segment(zero_count,4);
     CHECK(r.stop==NV2A_PUSHER_END && r.consumed==4 && seen==5 && value[4]==0x113);
-    puts("Partial packets, both jump encodings, stale tails and unsupported control flow passed");
+    puts("Partial packets, both jump encodings, stale tails, CALL/RETURN and malformed headers passed");
 }

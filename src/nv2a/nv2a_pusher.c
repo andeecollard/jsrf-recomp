@@ -98,6 +98,22 @@ NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwor
             continue;
         }
 
+        /* PFIFO return: a whole-word opcode, and it matches neither method
+         * form (0x00020000 & 0xE0030003 is 0x00020000), so without this case
+         * a legal return reads as a malformed header. */
+        if (header == 0x00020000u) {
+            result.stop = NV2A_PUSHER_RETURN;
+            ++pos;
+            ++g_stats.dwords;
+            break;
+        }
+        if ((header & 3u)==2u) {
+            result.jump_address = header & 0xfffffffcu;
+            result.stop = NV2A_PUSHER_CALL;
+            ++pos;
+            ++g_stats.dwords;
+            break;
+        }
         if ((header & 3u)==1u || (header & 0xe0000003u)==0x20000000u) {
             result.jump_address = (header & 3u)==1u ? header & 0xfffffffcu : header & 0x1ffffffcu;
             result.stop = NV2A_PUSHER_JUMP;
@@ -110,8 +126,9 @@ NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwor
         } else if ((header & PB_NONINC_MASK) == PB_NONINC_MATCH) {
             increasing = 0;
         } else {
-            /* Never interpret data following unsupported control flow as
-             * another method packet. Calls/returns need a caller-owned stack. */
+            /* Calls and returns are handled above. Anything left that decodes
+             * as neither method form is data, not a command, and continuing
+             * would dispatch whatever the ring happens to contain. */
             g_stats.bad_headers++;
             result.stop = NV2A_PUSHER_INVALID;
             break;
