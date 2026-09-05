@@ -152,6 +152,10 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     return nv2a_pusher_run_segment(snapshot, (to-from)/4u);
 }
 
+/* The last few segment decisions, for the desync post-mortem below. */
+static struct { uint32_t from, end, put, stop, consumed; } g_pb_hist[16];
+static unsigned g_pb_hist_n;
+
 static int jsrf_pb_poll(void)
 {
     static int stream_fault;
@@ -185,8 +189,47 @@ static int jsrf_pb_poll(void)
     for (unsigned segment=0; g_pb_last!=now && segment<8; ++segment) {
         if (g_pb_ring_lo && (now<g_pb_ring_lo || now>g_pb_ring_hi)) break;
         uint32_t end = now>g_pb_last ? now : g_pb_ring_hi;
+        /* PUT below the cursor means one of two things, and they need
+         * opposite handling.
+         *
+         * The ring can wrap by ending its written region with a jump back to
+         * the base, in which case everything from the cursor to the top was
+         * written on the previous lap and must still be executed. That is the
+         * case the tail parse below exists for, and it works.
+         *
+         * Or the title can simply restart the buffer: once GET has caught up
+         * with PUT the ring is drained, so D3D can reset its write cursor to
+         * the base without emitting anything at the old position. Nothing is
+         * written at the cursor then, and the dwords there are last lap's
+         * data. Parsing them desynchronises the stream -- measured landing on
+         * ARRAY_ELEMENT16 index pairs (00FD00FC, 00FF00FE, ...) and reporting
+         * them as invalid headers -- and the invalid header sets stream_fault,
+         * which is permanent, so rendering never resumes and the title spins
+         * forever in its pushbuffer reserve waiting for a GET that no longer
+         * moves.
+         *
+         * A jump is the only thing that can legitimately be at the cursor in
+         * the first case, so its absence identifies the second. */
+        if (now < g_pb_last && g_pb_ring_lo) {
+            uint32_t w = MEM32(g_pb_last);
+            int is_jump = (w & 3u)==1u || (w & 0xe0000003u)==0x20000000u;
+            if (!is_jump) {
+                g_pb_last = g_pb_ring_lo;
+                continue;
+            }
+        }
         if (!end || end<=g_pb_last) break;
         NV2APusherResult result = jsrf_pb_feed(g_pb_last, end);
+        /* Every segment decision, kept in a ring and dumped when the parse
+         * finally lands on a data dword. The stop reason and the dwords
+         * consumed are the only things that say WHERE sync was lost; the
+         * invalid header itself is several segments downstream of the cause. */
+        g_pb_hist[g_pb_hist_n & 15].from = g_pb_last;
+        g_pb_hist[g_pb_hist_n & 15].end = end;
+        g_pb_hist[g_pb_hist_n & 15].put = now;
+        g_pb_hist[g_pb_hist_n & 15].stop = (uint32_t)result.stop;
+        g_pb_hist[g_pb_hist_n & 15].consumed = result.consumed;
+        g_pb_hist_n++;
         g_pb_last += result.consumed*4;
         if (result.stop==NV2A_PUSHER_JUMP) {
             if (g_pb_ring_lo && result.jump_address>=g_pb_ring_lo
@@ -202,10 +245,71 @@ static int jsrf_pb_poll(void)
         if (result.stop==NV2A_PUSHER_INVALID) {
             stream_fault=1;
             static unsigned errors;
-            if (++errors<=4) fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",MEM32(g_pb_last),g_pb_last);
+            if (++errors<=4) {
+                fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",MEM32(g_pb_last),g_pb_last);
+                /* Whether the parser is at a packet boundary or has lost sync
+                 * decides everything: a real NV2A call is a feature to add, a
+                 * desynchronised cursor is a bug to fix. Print the ring either
+                 * side of the cursor, and the head of the would-be call
+                 * target, which should itself look like pushbuffer. */
+                fprintf(stderr,"[PUSHER]   ring:");
+                for (int k=-8;k<=8;++k)
+                    fprintf(stderr," %s%08X",k?"":">",MEM32(g_pb_last+k*4));
+                fprintf(stderr,"\n");
+                uint32_t tgt = MEM32(g_pb_last) & 0xFFFFFFFCu;
+                fprintf(stderr,"[PUSHER]   target %08X:",tgt);
+                for (int k=0;k<8;++k) fprintf(stderr," %08X",MEM32(tgt+k*4));
+                fprintf(stderr,"\n");
+                for (unsigned k = g_pb_hist_n>16?g_pb_hist_n-16:0; k<g_pb_hist_n; ++k)
+                    fprintf(stderr,"[PUSHER]   seg %u: from=%08X end=%08X"
+                            " put=%08X stop=%u consumed=%u\n", k,
+                            g_pb_hist[k&15].from, g_pb_hist[k&15].end,
+                            g_pb_hist[k&15].put, g_pb_hist[k&15].stop,
+                            g_pb_hist[k&15].consumed);
+                fflush(stderr);
+            }
         }
         if (result.stop!=NV2A_PUSHER_END || !result.consumed) break;
         if (g_pb_last==g_pb_ring_hi && now<g_pb_last) g_pb_last=g_pb_ring_lo;
+    }
+
+    /* Why the feed stopped catching up, once.
+     *
+     * The GET index below is only acknowledged when this returns having fully
+     * consumed the ring, so any reason for not catching up is self-sustaining:
+     * the guest waits for GET to move, and GET does not move until the guest
+     * publishes the rest. Distinguishing "the guest stopped publishing" from
+     * "we refused to consume" is the whole question, and the counters cannot:
+     * they only say everything stopped at once.
+     */
+    {
+        static uint32_t last_now, last_pb;
+        static unsigned long stuck;
+        static int reported;
+        if (g_pb_last == now) {
+            stuck = 0;
+        } else if (now == last_now && g_pb_last == last_pb) {
+            if (++stuck == 2000 && !reported) {
+                reported = 1;
+                fprintf(stderr, "[PUSHER] not catching up for %lu polls:"
+                        " put=%08X cursor=%08X ring=%08X-%08X fault=%d\n",
+                        stuck, now, g_pb_last, g_pb_ring_lo, g_pb_ring_hi,
+                        stream_fault);
+                NV2APusherResult r = jsrf_pb_feed(g_pb_last,
+                        now > g_pb_last ? now : g_pb_ring_hi);
+                fprintf(stderr, "[PUSHER]   replay: stop=%d consumed=%u"
+                        " jump=%08X; head", (int)r.stop, r.consumed,
+                        r.jump_address);
+                for (int k = 0; k < 8; ++k)
+                    fprintf(stderr, " %08X", MEM32(g_pb_last + k * 4));
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        } else {
+            stuck = 0;
+        }
+        last_now = now;
+        last_pb = g_pb_last;
     }
 
     /* The guest's FLIP_STALL is the only "frame is complete" signal in the
