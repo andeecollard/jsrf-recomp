@@ -1102,6 +1102,32 @@ static DWORD WINAPI jsrf_adx_watch(LPVOID unused)
 }
 
 
+#if !defined(_WIN32)
+/* Pump the host window, on the one thread that may and no faster than a frame.
+ *
+ * SDL_PollEvent drives the platform event loop, which on macOS belongs to the
+ * process's main thread. The guest owns that thread, so this runs from inside
+ * the kernel bridge's blocking wait -- the moment the guest is idle. Every
+ * other thread that reaches that wait returns immediately, and the rate limit
+ * keeps a title that waits thousands of times a second from spending its time
+ * in Cocoa. */
+static void jsrf_pump_host_events(void)
+{
+    extern void xbox_d3d8_pump_events(void);
+    extern int pthread_main_np(void);
+    static DWORD last_ms;
+    DWORD now;
+
+    if (!pthread_main_np())
+        return;
+    now = GetTickCount();
+    if (last_ms && (now - last_ms) < 16)
+        return;
+    last_ms = now;
+    xbox_d3d8_pump_events();
+}
+#endif
+
 static void apu_mmio_write_shim(uint32_t offset, uint32_t value, unsigned width)
 {
     if (g_apu_state) {
@@ -1641,6 +1667,13 @@ int main(int argc, char **argv)
      * unset: the getter simply reports no surface and Present just swaps. */
 #if !defined(_WIN32)
     xbox_D3D8SetGuestFramebufferSource(nv2a_pb_exec_surface);
+    /* Service the window's event loop whenever the guest blocks on the main
+     * thread. Without it the window draws but never answers the OS, and macOS
+     * shows a beachball over a running emulator -- which reads as a crash. */
+    {
+        extern void xbox_SetWaitPollHook(void (*)(void));
+        xbox_SetWaitPollHook(jsrf_pump_host_events);
+    }
 #endif
     /* Diagnostic only: RECOMP_TOTAL_RAM_MB maps more than a retail console has.
      *

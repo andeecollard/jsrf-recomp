@@ -1527,6 +1527,20 @@ static void bridge_KeSetEvent(void)
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+/* Something for the host to run while a guest thread is blocked.
+ *
+ * The kernel bridge cannot call the window layer directly: it is linked into
+ * tests that have no window and no SDL, and one diagnostic line is not worth
+ * making them all fail to link. The owner installs it, exactly as the pusher's
+ * software-method handler and the executor's recent-method dump are installed.
+ * The hook is responsible for deciding which thread it is legal on. */
+static void (*s_wait_poll_hook)(void);
+
+void xbox_SetWaitPollHook(void (*fn)(void))
+{
+    s_wait_poll_hook = fn;
+}
+
 /* Defined with the scheduling bridges below; used here too. */
 static int sched_trace_on(void);
 static int g_sched_wait_slot = -1;
@@ -1603,6 +1617,18 @@ static void bridge_KeWaitForSingleObject(void)
         bridge_timers_poll();
         bridge_vblank_poll();
         bridge_device_irq_poll();
+        /* And the host window's event loop, for the same reason.
+         *
+         * The guest owns the process's main thread -- main() calls the XBE
+         * entry point and never returns -- so there is no thread left for the
+         * platform to be pumped from, and on macOS SDL_PollEvent must run on
+         * that very thread. The result was a window that drew correctly and
+         * was marked unresponsive by the OS, complete with a spinning
+         * beachball, which is indistinguishable from a hang to anyone
+         * watching. A blocking wait on the main thread is the one moment the
+         * guest is idle and the pump is legal. */
+        if (s_wait_poll_hook)
+            s_wait_poll_hook();
 #if !defined(_WIN32)
         w32_thread_suspend_point();
 #endif
