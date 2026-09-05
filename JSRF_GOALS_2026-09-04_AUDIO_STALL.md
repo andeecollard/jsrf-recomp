@@ -302,7 +302,41 @@ be observed with a probe, not a peek.
 the title BGM begins decoding, followed by a measured successor to the title
 screen's state 0x14.
 
-### G15 — Re-test G5 (host input) only after G14
+### G15 — CLOSED, 5 September. It waits for nothing; the title screen finishes
+
+`jsrf_title_state_probe` traces the 21-entry jump table at 0x001FA008 that
+`sub_0004EF90` indexes by the object's +0x44. Global object id 8 walks
+**0x12 -> 0x13 -> 0x14 in three consecutive visits**, no repeat between them,
+and is never visited again. State 20 is the terminal teardown -- wait for
+global object id 2 to be destroyed, unlink, destroy children -- so not being
+visited again is what completing it looks like.
+
+Sampling +0x44 would still have answered "state 20", the same as during the
+stall. Only a trace separates arriving from sticking, which is why the probe
+prints every change plus a heartbeat every 20000 unchanged visits.
+
+So G5's premise is now disproven twice over: the title was never waiting for a
+button, and it is no longer waiting at all. **Host input is still work worth
+doing, but it is not a blocker and nothing is gated behind it.** Re-scope G5
+from the first screen that actually reads a pad, not from this one.
+
+### G22 — What is on screen after the title screen tears down
+
+The live registered-object count reaches 0x80 and the update walker keeps
+visiting nodes, so a successor scene exists and is being serviced. Nothing is
+visible: `[FB] nonzero=1/153600 same`, and 11,498 draws arrive with input
+coordinates of x -4636..4636, y -801..4172 -- world space, not clip space.
+
+Two things to separate before anything else: whether the vertex transform is
+being applied at all (the `xbox_vsh` path has its own tests), and whether this
+content reaches a draw path the renderer implements, since the startup screens
+did render. This is the frontier and it belongs with
+`JSRF_GOALS_2026-09-03_RENDERER.md`.
+
+**Acceptance:** a measured statement of where the vertex transform is lost,
+and a non-blank framebuffer.
+
+### G5 — Host input, no longer a blocker (was: re-test after G14)
 
 G5 is not disproven as *work* — the input backend is still needed — but its
 premise as **the blocker** is. The title is waiting on the BGM, not a button.
@@ -346,10 +380,12 @@ same shape as the `0x0013D840` hole recovered on 3 September. It is harmless
 Not playable, and not close, but no longer crashing. The audio stall and the
 post-BGM memory corruption are both fixed, and the title now runs for as long
 as it is given, past the state it was stuck in, with 127 live objects and a
-live update walker. What it does not do is put anything on screen: the new
-content's draws arrive in world coordinates. The frontier has moved from "it
-faults" to "it renders nothing", which is G21's general lifter fix and the
-renderer goals in `JSRF_GOALS_2026-09-03_RENDERER.md`.
+live update walker. The title screen's own state machine now runs to
+completion and tears itself down (G15). What it does not do is put anything on
+screen: the successor scene's draws arrive in world coordinates. The frontier
+has moved from "it faults" to "it renders nothing" -- G22 -- with G21's
+general lifter fix still owed. No dead `_flags` fallback is reached by any
+code this title now executes.
 
 ## Non-goals for now
 
