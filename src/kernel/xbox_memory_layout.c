@@ -169,6 +169,10 @@ static size_t xbox_TiledApertureSize(void)
     return g_memory_size < max ? g_memory_size : max;
 }
 
+/* Set when a push-buffer executor is publishing DMA_GET from real progress;
+ * see the acknowledgement in nv2a_ack_thread. */
+int g_nv2a_pusher_owns_dma_get = 0;
+
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
@@ -1696,7 +1700,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             volatile uint32_t *get =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            if (*get != *put) {
+            /* Copying PUT into GET says "the GPU has consumed everything you
+             * submitted" the instant it is submitted. For a title whose push
+             * buffer nothing executes that is the honest acknowledgement, and
+             * it is why this exists. For one whose buffer IS being executed it
+             * is a lie with consequences: the producer believes the ring is
+             * free, laps the parser, and overwrites the commands it is part way
+             * through reading. When something owns GET it publishes the point
+             * it has actually reached, and this must keep out of the way. */
+            if (!g_nv2a_pusher_owns_dma_get && *get != *put) {
                 *get = *put;
             }
         }

@@ -409,6 +409,18 @@ static int jsrf_pb_poll(void)
         last_pb = g_pb_last;
     }
 
+    /* Publish what has actually been consumed.
+     *
+     * DMA_GET is the ring's back-pressure: the producer reads it to know how
+     * much of the buffer it may reuse. The periodic acknowledgement used to
+     * copy PUT into it, which told the title the ring was free the moment it
+     * submitted, so it lapped this parser and overwrote commands mid-read --
+     * measured as exactly one bad header per run, at a different address every
+     * time. The cursor is the truth, and the register holds the physical form
+     * of it, the same masking sub_001912EC applies when it writes PUT. */
+    if (g_pb_ring_lo)
+        MEM32(0xFD800044u) = g_pb_last & 0x03FFFFFFu;
+
     /* The guest's FLIP_STALL is the only "frame is complete" signal in the
      * ring. Present here, on the thread holding the rendering context --
      * pgraph deliberately does not do it itself. */
@@ -681,6 +693,8 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
     (void)unused;
     /* This thread issues the PGRAPH draws, so it must own the GL context. */
     xbox_d3d8_make_current();
+    /* From here on GET means "consumed", not "submitted". */
+    g_nv2a_pusher_owns_dma_get = 1;
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
         /* Snapshot the fence before consuming its commands. Reading PUT again

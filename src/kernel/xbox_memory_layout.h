@@ -222,6 +222,12 @@ const uint8_t *xbox_Nv2aRegisterMemory(void);
  * offset subtraction, this rejects unrelated host addresses such as NULL.
  */
 BOOL xbox_HostAddressToGuest(uintptr_t host_address, uint32_t *guest_address);
+/* Hand ownership of the NV2A DMA_GET register to a push-buffer executor.
+ * While set, the periodic acknowledgement stops copying PUT into GET, so GET
+ * reflects what has actually been consumed rather than what was submitted --
+ * which is what stops the producer lapping the consumer. */
+extern int g_nv2a_pusher_owns_dma_get;
+
 void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within
