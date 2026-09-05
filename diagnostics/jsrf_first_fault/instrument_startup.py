@@ -77,9 +77,16 @@ points = {
         '0004EF90': ('jsrf_title_state_probe', 'ecx, MEM32(ecx + 0x44)'),
     },
     'recomp_0009.c': {
+        '001914BD': ('jsrf_pb_patch_probe', 'esi'),
+        '00191510': ('jsrf_pb_event_probe', 'esi'),
+        '001915FD': ('jsrf_pb_reserve_probe', 'esi, eax, ecx, MEM32(esp + 0xC)'),
         # JSRF's vblank acknowledge spin. ebx is the NV2A register base, ecx
         # the value about to be written to PCRTC_INTR_0. Reads the summary and
         # the source as the guest sees them, before its own store.
+        # D3D's notification dispatcher. At the entry nothing is pushed,
+        # so the return address is at esp and the index at esp+4.
+        '00193F70': ('jsrf_notify_probe',
+                     'ecx, MEM32(esp + 4), MEM32(esp)'),
         '00193E40': ('jsrf_vblank_ack_probe',
                      'ebx, MEM32(ebx + 0x100), MEM32(ebx + 0x600100), ecx'),
         # The D3D pushbuffer free-space spin. edx holds the pointer the loop

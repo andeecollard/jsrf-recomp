@@ -98,8 +98,88 @@ static volatile int g_pushbuf_ack_stop;
 #define JSRF_PB_START_VA  0x0019B224u   /* pb_ring_start, per the BO3 map */
 #define JSRF_PB_END_VA    0x0019B228u   /* pb_ring_end */
 
+/* Observe the reserve decision before changing its address contract. */
+void jsrf_pb_reserve_probe(uint32_t pc, uint32_t dev, uint32_t get,
+                           uint32_t writer, uint32_t limit)
+{
+    static unsigned samples;
+    if (!getenv("RECOMP_PB_RESERVE_TRACE") || samples++ >= 12) return;
+    fprintf(stderr, "[PB-RESERVE] pc=%08X ring=%08X-%08X get=%08X writer=%08X limit=%08X raw-get=%08X\n",
+            pc, MEM32(dev+0x24), MEM32(dev+0x28), get, writer, limit,
+            MEM32(MEM32(dev+0x2264)+0x44));
+}
+
+static uint32_t jsrf_pb_cursor(void);
+
+/* The reserve routine writes its notification into a fixed slot of a segment
+ * it has already published (loc_001914A9: [esi+0x10] = 0x00040100,
+ * [esi+0x14] = 5), then recomputes the distance and, if the GPU has caught up,
+ * overwrites it with a zero NOP at loc_001914CD. So the command is a patch to
+ * a location the parser may already have walked past.
+ *
+ * Whether it has is the whole question, and neither GET nor PUT answers it:
+ * the consumed cursor does. A patch behind the cursor is a notification this
+ * parser will never see, and the wait that follows it cannot return. */
+void jsrf_pb_patch_probe(uint32_t pc, uint32_t patch)
+{
+    static unsigned n;
+    uint32_t slot = patch + 0x10, cursor = jsrf_pb_cursor();
+    if (!getenv("RECOMP_PB_NOTIFY_TRACE") || n++ >= 64) return;
+    fprintf(stderr, "[PB-PATCH] pc=%08X packet=%08X slot=%08X words=%08X/%08X"
+            " cursor=%08X (%s) GET=%08X PUT=%08X\n",
+            pc, patch, slot, MEM32(slot), MEM32(slot+4), cursor,
+            slot < cursor ? "BEHIND cursor - will never be read"
+                          : "ahead of cursor",
+            MEM32(0xFD800044u), MEM32(0xFD800040u));
+    fflush(stderr);
+}
+
+static void jsrf_pb_scan_nops(void);
+
+void jsrf_pb_event_probe(uint32_t pc, uint32_t event)
+{
+    static unsigned n;
+    if (!getenv("RECOMP_PB_NOTIFY_TRACE") || n++ >= 64) return;
+    if (n == 1) jsrf_pb_scan_nops();
+    fprintf(stderr, "[PB-EVENT] pc=%08X event=%08X state=%08X pmc=%08X pgraph=%08X source=%08X trap=%08X data=%08X\n",
+            pc, event, MEM32(event+4), MEM32(0xFD000100u),
+            MEM32(0xFD400100u), MEM32(0xFD400108u),
+            MEM32(0xFD400704u), MEM32(0xFD400708u));
+}
+
 static uint32_t g_pb_last;
 static uint32_t g_pb_ring_lo, g_pb_ring_hi;
+
+static uint32_t jsrf_pb_cursor(void) { return g_pb_last; }
+
+/* Where the software-method commands actually are, the first time the title
+ * enters the reserve event wait.
+ *
+ * The wait returns when something signals device+0x2440, and the only thing
+ * that can is the guest's own interrupt path, reached by a nonzero
+ * NV097_NO_OPERATION trapping as a PGRAPH software method. So the question is
+ * whether that command exists in the ring at all, and whether the cursor has
+ * already passed it. A literal scan for the packet header answers both, and
+ * distinguishes "the title never submitted it" from "we consumed it and did
+ * not act on it" from "it is still ahead of us".
+ *
+ * 0x00040100 is one increasing dword at method 0x100. Data can coincide with
+ * that, so every hit is printed with its parameter rather than counted. */
+static void jsrf_pb_scan_nops(void)
+{
+    uint32_t va, hits = 0, put = MEM32(0xFD800040u);
+    if (!g_pb_ring_lo || g_pb_ring_hi <= g_pb_ring_lo) return;
+    fprintf(stderr, "[PB-NOPSCAN] ring %08X-%08X cursor %08X put %08X\n",
+            g_pb_ring_lo, g_pb_ring_hi, g_pb_last, put);
+    for (va = g_pb_ring_lo; va + 4 < g_pb_ring_hi; va += 4) {
+        if (MEM32(va) != 0x00040100u) continue;
+        if (++hits > 24) break;
+        fprintf(stderr, "[PB-NOPSCAN]   %08X parameter %08X (%s cursor)\n",
+                va, MEM32(va + 4), va < g_pb_last ? "behind" : "ahead of");
+    }
+    fprintf(stderr, "[PB-NOPSCAN] %u header(s) matched\n", hits);
+    fflush(stderr);
+}
 
 /* Read-only render-suppression probe; generated-host-code call sites are
  * temporary observations, never guest state or branch overrides. */
@@ -145,11 +225,39 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     NV2APusherResult invalid = {0, 0, 0, NV2A_PUSHER_INVALID};
     if (to <= from) return invalid;
     if (to - from > 0x100000u) return invalid;          /* implausible span */
-    /* JSRF's DMA objects and allocations map this low physical range to
-     * guest RAM. The opt-in CPU physical heap aliases these same bytes. */
+    /* Execute the ring in place.
+     *
+     * This ran over a memcpy'd copy, and that loses commands the title patches
+     * in after the copy is taken. Its reserve routine does exactly that:
+     * loc_001914A9 writes [esi+0x10] = 0x00040100, [esi+0x14] = 5 into a
+     * segment it has already published, and loc_001914CD overwrites the same
+     * two words again if the GPU has caught up in the meantime. A copy taken
+     * between those points executes stale bytes, so the notification never
+     * reaches PGRAPH, KeSetEvent is never called on device+0x2440, and the
+     * reserve wait at 0x00191510 never returns.
+     *
+     * Measured, with the check below:
+     *   [PB-PATCH-LOST] address=005DF9A4 snapshot!=5 live=5
+     *                   feed=005A2588-005ED000
+     *
+     * Copying was protection against the producer overwriting the ring
+     * underneath the parser. That is now prevented at its source instead --
+     * DMA_GET is published from the consumed cursor, so the producer cannot
+     * lap the parser -- and reading the ring in place is what the hardware
+     * does anyway. The copy is kept only for the trace, so the same check
+     * still reports a patch that lands while a segment is being executed. */
+    const uint32_t *live = (const uint32_t *)XBOX_PTR(from);
+    int trace = getenv("RECOMP_PB_NOTIFY_TRACE") != NULL;
     static uint32_t snapshot[0x100000/4];
-    memcpy(snapshot, (const void *)XBOX_PTR(from), to-from);
-    return nv2a_pusher_run_segment(snapshot, (to-from)/4u);
+    if (trace) memcpy(snapshot, live, to-from);
+    NV2APusherResult result = nv2a_pusher_run_segment(live, (to-from)/4u);
+    if (trace) {
+        for (uint32_t k=1; k<result.consumed; ++k) {
+            if (MEM32(from+(k-1)*4)==0x40100u && snapshot[k]!=5 && MEM32(from+k*4)==5)
+                fprintf(stderr, "[PB-PATCH-RACE] address=%08X copy!=5 live=5 feed=%08X-%08X\n", from+k*4, from, to);
+        }
+    }
+    return result;
 }
 
 /* PFIFO's subroutine is one level deep: a register holding the saved DMA_GET
@@ -159,6 +267,75 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
 static uint32_t g_pb_subr_return;
 static int      g_pb_subr_active;
 static unsigned long g_pb_calls, g_pb_returns;
+
+/* Did the data simply not arrive yet?
+ *
+ * The remaining failure reads a float where a packet header belongs, at a
+ * cursor the previous poll had consumed to exactly. Two explanations, and they
+ * need entirely different fixes: either the producer's ring stores had not
+ * become visible to this thread when its store to DMA_PUT did -- a publication
+ * ordering problem on a weakly ordered host -- or PUT genuinely points into the
+ * middle of a packet, which is a different bug altogether.
+ *
+ * One observation separates them. Re-read the same dword after a barrier and
+ * after two waits. If it turns into a valid header the bytes were merely late,
+ * and the fix belongs at the producer's store. If it stays a float, PUT is
+ * wrong and ordering has nothing to do with it. PUT is sampled alongside it,
+ * because a PUT that moves on tells us the producer was mid-flight. */
+static void pb_recheck(const char *why, uint32_t va)
+{
+    static int done;
+    uint32_t v0, v1, v2, v3, p0, p1, p2, p3;
+    if (done) return;
+    done = 1;
+
+    v0 = MEM32(va);            p0 = MEM32(0xFD800040u);
+    __sync_synchronize();
+    v1 = MEM32(va);            p1 = MEM32(0xFD800040u);
+    Sleep(1);
+    __sync_synchronize();
+    v2 = MEM32(va);            p2 = MEM32(0xFD800040u);
+    Sleep(50);
+    __sync_synchronize();
+    v3 = MEM32(va);            p3 = MEM32(0xFD800040u);
+
+    fprintf(stderr,
+            "[PUSHER] recheck %s at %08X: now=%08X barrier=%08X +1ms=%08X"
+            " +50ms=%08X | PUT %08X/%08X/%08X/%08X\n",
+            why, va, v0, v1, v2, v3, p0, p1, p2, p3);
+
+    /* How far out of step is the cursor?
+     *
+     * Scan back for a dword that decodes as a method header whose packet ends
+     * exactly here. If one exists a few dwords back, the parse consumed that
+     * packet's payload as if it were shorter or longer than it is, and the
+     * distance names the packet. If none exists within a wide window, the
+     * cursor is not merely off by a packet and the misalignment came from
+     * somewhere else entirely. The guest's own copy of PUT is printed beside
+     * the register, because the two disagreeing would explain it outright. */
+    {
+        uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
+        int found = 0;
+        fprintf(stderr, "[PUSHER]   guest PUT copy %08X vs register %08X\n",
+                dev ? MEM32(dev + 0x2C) : 0, p0);
+        for (int back = 1; back <= 512 && !found; ++back) {
+            uint32_t h = MEM32(va - back * 4u);
+            uint32_t masked = h & 0xE0030003u;
+            uint32_t count;
+            if (masked != 0u && masked != 0x40000000u) continue;
+            count = (h >> 18) & 0x7FFu;
+            if ((int)(1u + count) != back) continue;
+            fprintf(stderr, "[PUSHER]   last aligned header %08X is %d dwords"
+                    " back: %s method %04X count %u ends exactly here\n",
+                    h, back, masked ? "non-inc" : "inc", h & 0x1FFCu, count);
+            found = 1;
+        }
+        if (!found)
+            fprintf(stderr, "[PUSHER]   no header within 512 dwords ends at"
+                    " this cursor\n");
+    }
+    fflush(stderr);
+}
 
 /* The last few segment decisions, for the desync post-mortem below. */
 static struct { uint32_t from, end, put, stop, consumed; } g_pb_hist[16];
@@ -174,8 +351,10 @@ static int jsrf_pb_poll(void)
     if (!now) return 0;
 
     if (!g_pb_last) {
-        g_pb_ring_lo = MEM32(JSRF_PB_START_VA);
-        g_pb_ring_hi = MEM32(JSRF_PB_END_VA);
+        /* Device bounds are CPU addresses; DMA_PUT and parser cursors are
+         * physical offsets into the shared low backing. */
+        g_pb_ring_lo = MEM32(JSRF_PB_START_VA) & 0x03FFFFFFu;
+        g_pb_ring_hi = MEM32(JSRF_PB_END_VA) & 0x03FFFFFFu;
         /* Only trust the ring bounds if the cursor actually sits inside them;
          * otherwise the +0x24/+0x28 fields are not what the BO3 map says for
          * this title and a wrap has to be skipped rather than mis-parsed. */
@@ -323,6 +502,7 @@ static int jsrf_pb_poll(void)
             }
             stream_fault=1;
             fprintf(stderr,"[PUSHER] rejected jump %08X at %08X\n",result.jump_address,g_pb_last-4);
+            pb_recheck("rejected jump", g_pb_last-4);
             /* Same post-mortem as the invalid-header path: a jump target
              * outside the ring means the parse is reading data, not commands,
              * and where sync was lost is several segments upstream. */
@@ -344,6 +524,7 @@ static int jsrf_pb_poll(void)
             static unsigned errors;
             if (++errors<=4) {
                 fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",MEM32(g_pb_last),g_pb_last);
+                pb_recheck("invalid header", g_pb_last);
                 /* Whether the parser is at a packet boundary or has lost sync
                  * decides everything: a real NV2A call is a feature to add, a
                  * desynchronised cursor is a bug to fix. Print the ring either
@@ -688,6 +869,27 @@ static void jsrf_pusher_report(void)
     }
 }
 
+static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
+{
+    static unsigned n;
+    DWORD start = GetTickCount();
+    int raised = xbox_Nv2aRaiseSoftwareMethod(subchannel, parameter);
+    if (++n <= 16 || parameter == 5)
+        fprintf(stderr, "[PB-NOTIFY] #%u parameter=%u raised=%d\n", n, parameter, raised);
+    /* The parser must not execute a later software method until this one is
+     * acknowledged. Preserve a missing delivery as a visible stop. */
+    while ((!raised || xbox_Nv2aSoftwareMethodPending()) && !g_pushbuf_ack_stop) {
+        if (GetTickCount() - start >= 2000) {
+            fprintf(stderr, "[PB-NOTIFY] waiting parameter=%u raised=%d pmc=%08X intr=%08X fifo=%08X\n",
+                    parameter, raised, MEM32(0xFD000100u), MEM32(0xFD400100u), MEM32(0xFD400720u));
+            start = GetTickCount();
+        }
+        Sleep(0);
+    }
+    if (n <= 16 || parameter == 5)
+        fprintf(stderr, "[PB-NOTIFY] completed parameter=%u\n", parameter);
+}
+
 static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
 {
     (void)unused;
@@ -695,6 +897,9 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
     xbox_d3d8_make_current();
     /* From here on GET means "consumed", not "submitted". */
     g_nv2a_pusher_owns_dma_get = 1;
+#if !defined(_WIN32) && defined(__aarch64__)
+    nv2a_pusher_set_software_method_handler(jsrf_software_method);
+#endif
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
         /* Snapshot the fence before consuming its commands. Reading PUT again

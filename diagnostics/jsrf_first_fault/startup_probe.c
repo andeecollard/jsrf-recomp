@@ -17,6 +17,42 @@ static uint32_t read_word(uint32_t address) {
     return value;
 }
 
+/* D3D's notification dispatcher, sub_00193F70(device, index).
+ *
+ * A nine-entry switch on index-1, table at 0x001941B4. Index 5 reaches
+ * 0x00194144, which is the only code that calls KeSetEvent on device+0x2440 --
+ * the event the push-buffer reserve waits on at 0x00191510, and the wait that
+ * currently never returns.
+ *
+ * The other end of that chain is measured and healthy: NV097_NO_OPERATION with
+ * a nonzero parameter traps as a PGRAPH software method, 2,530 of them are
+ * raised and acknowledged in a run, and many carry parameter 5. What is not
+ * known is whether the interrupt path ever reaches this dispatcher, and with
+ * which index. Tally them: "never called" and "called with the wrong index"
+ * are different defects with different fixes.
+ */
+void jsrf_notify_probe(uint32_t pc, uint32_t object, uint32_t index,
+                       uint32_t return_address)
+{
+    static unsigned long total, per_index[16];
+    static unsigned reports;
+
+    (void)pc; (void)object;
+    ++total;
+    if (index < 16) ++per_index[index];
+    /* First few, then decades, so a dispatcher that runs once and a dispatcher
+     * that runs constantly are both legible. */
+    if (total <= 8 || total == 100 || total == 10000 || (total % 100000) == 0) {
+        if (++reports > 40) return;
+        fprintf(stderr, "[NOTIFY] #%lu index=%u caller=%08X"
+                " counts 1..8: %lu %lu %lu %lu %lu %lu %lu %lu\n",
+                total, index, return_address,
+                per_index[1], per_index[2], per_index[3], per_index[4],
+                per_index[5], per_index[6], per_index[7], per_index[8]);
+        fflush(stderr);
+    }
+}
+
 /* The title screen's state machine, sub_0004EF90.
  *
  * Global object id 8, vtable 0x001CAAF8. Its update is a 21-entry jump table

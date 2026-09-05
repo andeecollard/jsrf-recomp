@@ -23,6 +23,8 @@ void jsrf_cri_handler_probe(uint32_t pc, uint32_t handler,
 void jsrf_list_remove_probe(uint32_t pc, uint32_t object, uint32_t index,
                             uint32_t return_address);
 void jsrf_title_state_probe(uint32_t pc, uint32_t object, uint32_t state);
+void jsrf_notify_probe(uint32_t pc, uint32_t object, uint32_t index,
+                       uint32_t return_address);
 void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,
                                 uint32_t get_value, uint32_t put,
                                 uint32_t needed);
@@ -47,5 +49,10 @@ void recomp_trace_enter(const char *name, uint32_t guest_function);
 #define RECOMP_GUEST_BLOCK(va) jsrf_trace_block((uint32_t)(va))
 #define RECOMP_TRACE_ENTER(name, va) \
     recomp_trace_enter((name), (uint32_t)(va))
+
+void jsrf_pb_reserve_probe(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+void jsrf_pb_patch_probe(uint32_t, uint32_t);
+void jsrf_pb_event_probe(uint32_t, uint32_t);
 
 #endif
