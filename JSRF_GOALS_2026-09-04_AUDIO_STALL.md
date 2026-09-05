@@ -333,8 +333,46 @@ content reaches a draw path the renderer implements, since the startup screens
 did render. This is the frontier and it belongs with
 `JSRF_GOALS_2026-09-03_RENDERER.md`.
 
-**Acceptance:** a measured statement of where the vertex transform is lost,
-and a non-blank framebuffer.
+**Measured, 5 September. It is not a transform problem, and not a draw-path
+problem.** The vertex shader runs (executed batches=9915, rejected=0), 34,504
+triangles rasterise, 5 batches are skipped as not screen-space and **zero** are
+off-surface. The "input x -4636..4636" range is explicitly the *pre-shader*
+range -- `draw_primitive` says so in its own comment -- so it describes object
+space and carries no information about the transform. Do not cite it again.
+
+What happens instead is that everything stops at once. Draws, triangles,
+clears, VSH batches, the pusher's dwords and methods, and even its unhandled
+count all freeze on the same report and never move, in every run.
+
+*One defect found and fixed there* (commit a54ff90): on a backwards PUT with no
+jump at the cursor, the feed parsed the ring's stale tail, desynchronised onto
+last lap's ARRAY_ELEMENT16 index pairs, called them invalid headers and set the
+permanent `stream_fault`. Invalid headers per run: 1+ before, 0 after.
+
+*The remaining blocker is a rate, not a deadlock.* `sample` on the current
+build puts **2485 of 2485** main-thread samples in one place: the D3D
+pushbuffer free-space spin at `loc_001914F0` inside `sub_00191440`,
+
+    ecx = [edx]        ; GET
+    esi = edi - ecx    ; outstanding = PUT - GET
+    cmp eax, esi
+    jb  loc_001914F0   ; spin while needed < outstanding
+
+`RECOMP_PB_WAIT_TRACE=1` shows it is not stuck -- GET does advance, and
+`outstanding` sits at 6 against a `needed` of 2 -- but over 100 seconds it
+advances about **four times a second**, across 40 million spin iterations. GET
+is advanced by our own `jsrf_pushbuffer_ack` thread, whose loop is a
+`Sleep(0)`, so four grants a second is the number that needs explaining, and
+it is why a frame never completes and the framebuffer stays black.
+
+The runtime's own threads are the suspects. In the same sample
+`nv2a_ack_thread` spends ~37% of its samples in `__mprotect` (re-arming the
+MCPX write trap) and another ~37% in `cthread_yield`. `mprotect` takes the
+process-wide VM lock, and the main thread is spinning flat out on another
+core. That is G16's subject arriving from a different direction.
+
+**Acceptance:** the pushbuffer grant rate rises to something frame-shaped
+(hundreds per second, not four), and a non-blank framebuffer follows.
 
 ### G5 — Host input, no longer a blocker (was: re-test after G14)
 
