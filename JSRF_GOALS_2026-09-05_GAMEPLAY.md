@@ -174,7 +174,61 @@ The high CPU alias fixes a measured GET/ring address mismatch, but a single
 runs beyond the prior failure point with advancing submission and consumption,
 no rejected control flow, malformed headers, or permanent stream faults.
 
-## 3. Display frames continuously
+## 3. Display frames continuously (active)
+
+Now the only thing between the port and a picture. Commands flow continuously,
+the rasteriser runs, 3.2 million triangles and 4,200 presented frames in a
+110-second run -- and the framebuffer probe reads `nonzero=0/153600`.
+
+Three surfaces are in play and they are not the same memory:
+
+    0x005F0000   the render target the CPU executor clears and draws into
+                 (pitch 1280, clip 640x480, 16bpp)
+    0x0071E000   what the [FB] probe samples
+    the D3D11/GL backend's own framebuffer, which pgraph draws into and
+    d3d8_PresentFrame presents
+
+Split it before diagnosing anything. `RECOMP_FB_DUMP` writes the executor's
+surface to a BMP on every report, so the first question -- does the rasteriser
+produce pixels at all -- is answered by looking, not by inference:
+
+- surface has content, probe reads zero -> the copy or flip from render target
+  to scanout is the defect, and the probe may simply be watching the wrong
+  address;
+- surface is blank too -> the rasteriser is being fed state it cannot draw
+  with, and the [GPU] skip/off-surface counters and the VSH reject list say
+  which;
+- both blank but the GL window shows something -> the executor is not the path
+  that matters on this host and the D3D11 sink is.
+
+Triangle counts do not satisfy this milestone; a displayed image does.
+
+### Measured: it renders, and the split is answered
+
+The executor's surface is not blank. `RECOMP_FB_DUMP` over a 110-second run:
+
+    frame001-003   the anti-graffiti screen, **pixel-correct** -- red spray-can
+                   logo, four paragraphs of legible text, correct scale
+    frame008       the title screen: real art, "FUT" and "T" readable, a circle
+                   and grid rules -- but drawn about 4x oversized, so only a
+                   magnified corner is on screen
+    most others    black, sampled between a clear and its draws
+
+So the rasteriser, the vertex shader, the texture path and the colour packing
+all work. The `[FB]` probe reading `nonzero=0/153600` was watching 0x0071E000
+while the executor draws into 0x005F0000; that probe address is a separate
+question and not evidence of a blank renderer.
+
+**The remaining defect is a 4x scale on vertex-program output.** The startup
+screens are pre-transformed screen-space quads and are correct. The title
+screen runs a vertex program, and its oPos comes out at 2560x1920 -- exactly
+four times 640x480. nv2a_pb_exec assumes "NV2A programs include the viewport
+transform and perspective division", so nothing scales oPos afterwards; if the
+program is producing 4x, the viewport scale it was handed is wrong.
+
+Next: read the guest's NV097_SET_VIEWPORT_SCALE/OFFSET and compare against the
+shader constants the program actually multiplies by (RECOMP_VSH_SAMPLE prints
+c0..c7 for a late batch). One of the two is four times the other.
 
 Measure actual frame completion and presentation, inspect the displayed image,
 and establish continued visual updates through startup and the next scene.
