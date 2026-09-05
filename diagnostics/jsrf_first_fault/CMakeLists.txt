@@ -138,6 +138,15 @@ if(Python3_Interpreter_FOUND)
     # The preserved generated tree also predates compatible EFLAGS snapshot
     # merging.  Without this site the loader unconditionally records -1 and
     # JSRF reaches its fatal-disc-error path after the anti-graffiti screen.
+    # The 0x00014870 array-remove guard. Its `jbe` sits in a fallthrough
+    # continuation, where the flags computed by the preceding `cmp` do not
+    # reach it, so the guard was never taken and the removal loop ran on an
+    # empty list -- overwriting guest memory, the kernel import thunk table
+    # included, which sent kernel calls to the next export along.
+    add_test(NAME jsrf_empty_list_guard
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_empty_list_guard.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
     add_test(NAME jsrf_flag_merge_backport
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_flag_merge.py"
@@ -150,7 +159,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_unresolved_flags_ratchet
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
-                     --max 80 --gen "${RECOMP_GEN_DIR}")
+                     --max 79 --gen "${RECOMP_GEN_DIR}")
 endif()
 
 add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c

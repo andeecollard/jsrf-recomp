@@ -37,3 +37,9 @@ build-macos/
 
 # Runtime logs
 xbox_kernel.log
+
+# Out-of-tree Windows build (hundreds of MB, same as build-macos)
+build-windows-jsrf/
+
+# RECOMP_ICALL_FEEDBACK output, rewritten every run
+icall_targets.dump

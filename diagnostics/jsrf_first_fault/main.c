@@ -14,6 +14,7 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                                   uint32_t fault_xbox_va, int is_write);
 #else
 #include <signal.h>
+#include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
 #endif
@@ -1199,6 +1200,34 @@ int main(int argc, char **argv)
         fprintf(stderr, "entry point absent from dispatch\n");
         return 1;
     }
+    /* RECOMP_GUARD_PAGE=<guest VA>: make that page read-only before the guest
+     * runs, so the first write to it faults and the report above names the
+     * host PC and the last instrumented guest function.
+     *
+     * The kernel import thunk table needs this. Its entries are patched once
+     * at bridge init and must not change afterwards, but the entry at
+     * 0x001C4034 (ObReferenceObjectByHandle) is observed holding 0x001C4038's
+     * synthetic VA later in the run -- the whole run of entries reads as
+     * shifted by one -- which sends the guest's kernel calls to the next
+     * export along. RECOMP_KERNEL_WATCH can only say the change happened
+     * across a blocking wait, which names no writer.
+     */
+#if !defined(_WIN32)
+    {
+        const char *spec = getenv("RECOMP_GUARD_PAGE");
+        if (spec) {
+            uint32_t va = (uint32_t)strtoul(spec, NULL, 0);
+            size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            uint32_t base = va & ~(uint32_t)(page - 1);
+            void *ptr = xbox_GpuMemoryRange(base, page);
+            fprintf(stderr, "[GUARD] page 0x%08X (for 0x%08X) size=%zu ptr=%p"
+                    " result=%d\n", base, va, page, ptr,
+                    ptr ? mprotect(ptr, page, PROT_READ) : -1);
+            fflush(stderr);
+        }
+    }
+#endif
+
     printf("Starting translated entry 0x%08X with ESP 0x%08X\n",
            JSRF_ENTRY_POINT, g_esp);
     entry();

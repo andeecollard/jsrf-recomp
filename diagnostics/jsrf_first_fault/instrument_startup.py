@@ -38,6 +38,11 @@ points = {
         '00011BB2': ('jsrf_tree_probe', 'esi, 0'),
         '00012020': ('jsrf_tree_probe', 'ecx, MEM32(esp + 4)'),
         '00012100': ('jsrf_tree_probe', 'ecx, MEM32(esp + 4)'),
+        # The array-remove shift loop that was measured writing into the
+        # kernel import thunk table. At the entry nothing is pushed, so the
+        # return address is at esp and the index argument at esp+4.
+        '000147A0': ('jsrf_list_remove_probe',
+                     'ecx, MEM32(esp + 4), MEM32(esp)'),
         '00013A80': ('jsrf_startup_probe', 'ecx'),
         # These are the only small setters for the root object's transient
         # trigger fields.  Record who calls them and which object receives the
@@ -151,6 +156,19 @@ points = {
         # Arguments are (arg, message) at [esp+4] and [esp+8].
         '00140190': ('jsrf_wxci_error_probe',
                      'MEM32(esp + 8), MEM32(esp + 4), MEM32(esp)'),
+        # CRI's installed-handler dispatcher:
+        #   mov eax,[0x2615E8] / test eax,eax / jz ret
+        #   mov ecx,[0x2615EC] / push ecx / call eax
+        # The handler it reaches is 0x0013F900, which is `eb fe` -- `jmp $`,
+        # the halt stub CRI installs for a condition it does not expect to
+        # survive. RECOMP_ICALL cannot resolve that address (it is not a
+        # detected entry point), so the call is skipped and the run continues
+        # past a point the middleware intended to stop at. It fires once, and
+        # immediately before the first fault after the title screen advances.
+        # The return address is the only thing that says which CRI path
+        # decided to halt; the two globals are the handler and its argument.
+        '00141B60': ('jsrf_cri_handler_probe',
+                     'MEM32(0x2615E8), MEM32(0x2615EC), MEM32(esp)'),
         # The CRI ring-buffer class (vtable 0x0022DB38) acquire and commit.
         # 0x0013F9E0 hands out a block from one of the two views and 0x0013FBC0
         # gives it back; the ADX input buffer at 0x00277180 gets an acquire that

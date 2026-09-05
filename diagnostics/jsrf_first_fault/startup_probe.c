@@ -32,6 +32,93 @@ static uint32_t read_word(uint32_t address) {
  * Repeats are counted rather than printed, because a failing read is retried
  * every frame and the interesting fact is which message and how fast.
  */
+/* sub_000147A0 -- remove one entry from an 8-slot array inside its object.
+ *
+ *   this+0x70  the array, 8 entries      this+0xB0  its count
+ *   this+0x90  a second array, 8 entries this+0xB4  its count
+ *
+ * The tail is closed by a shift-down loop, `for (i = index; i < count - 1;
+ * i++) a[i] = a[i+1]`, walking upwards from `this + index*4 + 0x70`. With a
+ * `this` or a count that is out of range that loop writes straight through
+ * whatever follows the object, and the first thing it reached in the run that
+ * caught it was guest 0x001C4000 -- inside the kernel import thunk table,
+ * which it shifted down by one entry. Every kernel call through a shifted
+ * entry then lands on the next export along; that is how a call to
+ * ObReferenceObjectByHandle arrived at ExQueryNonVolatileSetting with a
+ * kernel function pointer where the Type argument belonged.
+ *
+ * Reports only calls that cannot be right -- a count past the array's 8 slots,
+ * an index past the count, or an object that is not in mapped RAM -- so a
+ * healthy run is silent. Reads guest memory through the bounds-checked
+ * accessor, because a wild `this` is exactly what it is looking for.
+ */
+void jsrf_list_remove_probe(uint32_t pc, uint32_t object, uint32_t index,
+                            uint32_t return_address)
+{
+    static uint32_t seen[8];
+    static unsigned distinct;
+    unsigned i;
+    uint32_t count;
+
+    (void)pc;
+    count = xbox_GpuMemoryRange(object + 0xB0, 4) ? read_word(object + 0xB0)
+                                                  : 0xFFFFFFFFu;
+    if (object >= 0x10000u && count <= 8u && index < count)
+        return;
+
+    for (i = 0; i < distinct; ++i)
+        if (seen[i] == return_address)
+            return;
+    if (distinct >= sizeof(seen) / sizeof(seen[0]))
+        return;
+    seen[distinct++] = return_address;
+
+    fprintf(stderr,
+            "[LIST-REMOVE] caller=%08X this=%08X index=%u count=%u"
+            " first=%08X last=%08X\n",
+            return_address, object, index, count,
+            object + index * 4 + 0x70,
+            count && count != 0xFFFFFFFFu ? object + (count - 1) * 4 + 0x70 : 0);
+    fflush(stderr);
+}
+
+/* CRI's installed-handler dispatcher, sub_00141B60.
+ *
+ * It calls whatever is at 0x002615E8, with the argument at 0x002615EC, and
+ * does nothing when that slot is null -- which is the case for almost every
+ * call, so this reports only the calls that actually dispatch. The handler
+ * observed in the post-BGM runs is 0x0013F900, two bytes of `eb fe`: `jmp $`.
+ * That is the stub CRI parks on a condition it does not expect to return
+ * from, and it is not a detected entry point, so RECOMP_ICALL skips the call
+ * and the guest runs on past a deliberate stop. The return address is the
+ * only record of which middleware path decided to halt.
+ *
+ * Not env-gated: with the null-handler case filtered out it is silent in a
+ * healthy run, and a run where it is not silent is one where that matters.
+ */
+void jsrf_cri_handler_probe(uint32_t pc, uint32_t handler,
+                            uint32_t argument, uint32_t return_address)
+{
+    static uint32_t seen[8];
+    static unsigned distinct;
+    unsigned i;
+
+    (void)pc;
+    if (!handler)
+        return;
+
+    for (i = 0; i < distinct; ++i)
+        if (seen[i] == return_address)
+            return;
+    if (distinct >= sizeof(seen) / sizeof(seen[0]))
+        return;
+    seen[distinct++] = return_address;
+
+    fprintf(stderr, "[CRI-HANDLER] caller=%08X handler=%08X arg=%08X\n",
+            return_address, handler, argument);
+    fflush(stderr);
+}
+
 void jsrf_wxci_error_probe(uint32_t pc, uint32_t message,
                            uint32_t argument, uint32_t return_address)
 {

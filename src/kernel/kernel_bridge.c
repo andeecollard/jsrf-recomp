@@ -286,6 +286,96 @@ static long kernel_log_budget(void)
  * arg0 is at g_esp+0, arg1 at g_esp+4, etc. */
 #define STACK_ARG(n) ((uint32_t)BRIDGE_MEM32(g_esp + (n) * 4))
 
+/* Is a guest VA backed by a mapped page, for a `bytes`-wide access?
+ *
+ * A bridge turns a guest VA into a host pointer by adding an offset and hands
+ * it to the kernel implementation, so a wild VA does not fail the call -- it
+ * faults inside the implementation, with a host stack that has no recompiled
+ * frame in it and a fault address that means nothing on its own. That is
+ * exactly how the first fault after the title screen advanced presented: a
+ * SIGSEGV at host 0x3FE000110, inside xbox_ExQueryNonVolatileSetting's
+ * `if (Type) *Type = 4`, naming neither the ordinal nor the guest caller. */
+static int bridge_va_mapped(uint32_t va, uint32_t bytes)
+{
+    uint64_t end = (uint64_t)va + bytes;
+    uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+
+    if (va < XBOX_FS_BASE)      /* page zero is deliberately unmapped */
+        return 0;
+    if (end <= mapped)
+        return 1;
+    return va >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+}
+
+/* Convert an optional out-pointer argument, rejecting unmapped VAs.
+ *
+ * Returns 0 (the "caller passed NULL" case every kernel implementation here
+ * already handles) for a VA that cannot be dereferenced, and reports it once
+ * per export/argument pair with the guest return address, which is the one
+ * fact that identifies the call site. g_esp has had the dummy return address
+ * popped by kernel_thunk_dispatch, so it sits just below.
+ */
+/* Per-thread, for the same reason g_kernel_dispatch_slot is: guest threads
+ * dispatch concurrently, and a process-global would report another thread's
+ * ordinal beside this thread's stack. */
+static RECOMP_TLS ULONG g_bridge_current_ordinal;
+static RECOMP_TLS int   g_bridge_current_slot = -1;
+static RECOMP_TLS uint32_t g_bridge_current_target;
+static uint32_t g_thunk_table_base;   /* defined with its initialiser below */
+
+static uint32_t bridge_checked_out_va(uint32_t va, uint32_t bytes,
+                                      const char *export_name,
+                                      const char *arg_name)
+{
+    static const char *seen[16];
+    static int distinct;
+    int i;
+
+    if (!va || bridge_va_mapped(va, bytes))
+        return va;
+
+    for (i = 0; i < distinct; ++i)
+        if (seen[i] == arg_name)
+            return 0;
+    if (distinct < (int)(sizeof(seen) / sizeof(seen[0])))
+        seen[distinct++] = arg_name;
+
+    fprintf(stderr,
+            "  [KERNEL] %s: %s = 0x%08X is not mapped guest memory; "
+            "passing NULL. ordinal=%lu slot=%d target=0x%08X "
+            "guest caller=0x%08X esp=0x%08X\n",
+            export_name, arg_name, va,
+            (unsigned long)g_bridge_current_ordinal, g_bridge_current_slot,
+            g_bridge_current_target,
+            g_esp ? (uint32_t)BRIDGE_MEM32(g_esp - 4) : 0, g_esp);
+    /* The whole frame, because "which argument is wrong" is much less useful
+     * than "is this frame an argument list for this export at all". A stack
+     * that is shifted by one dword, or that belongs to a different export
+     * entirely, is visible here and nowhere else. */
+    fprintf(stderr, "  [KERNEL]   guest stack:");
+    for (i = -1; i < 8; ++i)
+        fprintf(stderr, " %s%08X", i < 0 ? "ret=" : "",
+                (uint32_t)BRIDGE_MEM32(g_esp + i * 4));
+    fprintf(stderr, "\n");
+
+    /* The thunk entries around the one that produced this dispatch, read back
+     * now through the same view the guest reads them through. A slot whose
+     * entry no longer holds its own synthetic VA is a corrupted import table,
+     * and that is a different defect from a guest passing a bad pointer. */
+    if (g_bridge_current_slot >= 0) {
+        uint32_t entry = g_thunk_table_base + (uint32_t)g_bridge_current_slot * 4;
+        fprintf(stderr, "  [KERNEL]   thunk table base=0x%08X entry=0x%08X:",
+                g_thunk_table_base, entry);
+        for (i = -2; i <= 2; ++i)
+            fprintf(stderr, " [%+d]=%08X", i,
+                    (uint32_t)BRIDGE_MEM32(entry + i * 4));
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+    return 0;
+}
+
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
  * Each bridge reads args from the Xbox stack, translates pointer
@@ -1037,7 +1127,17 @@ static void bridge_ExQueryNonVolatileSetting(void)
     uint32_t value_length = STACK_ARG(3);
     uint32_t result_va    = STACK_ARG(4);
 
-    NTSTATUS st = xbox_ExQueryNonVolatileSetting(
+    NTSTATUS st;
+
+    /* Every one of these is dereferenced by the implementation, and an
+     * unhandled index memsets Value for ValueLength bytes. */
+    type_va   = bridge_checked_out_va(type_va, 4, "ExQueryNonVolatileSetting", "Type");
+    value_va  = bridge_checked_out_va(value_va, value_length,
+                                      "ExQueryNonVolatileSetting", "Value");
+    result_va = bridge_checked_out_va(result_va, 4, "ExQueryNonVolatileSetting",
+                                      "ResultLength");
+
+    st = xbox_ExQueryNonVolatileSetting(
         value_index,
         type_va   ? (PULONG)&BRIDGE_MEM32(type_va)   : NULL,
         value_va  ? (PVOID)((uintptr_t)value_va + g_xbox_mem_offset) : NULL,
@@ -4018,6 +4118,16 @@ static void bridge_KeQueryBasePriorityThread(void)
     g_eax = obj ? (uint32_t)obj->BasePriority : 0;
 }
 
+static void bridge_KeRestoreFloatingPointState(void)
+{
+    g_eax = (uint32_t)xbox_KeRestoreFloatingPointState(NULL);
+}
+
+static void bridge_KeSaveFloatingPointState(void)
+{
+    g_eax = (uint32_t)xbox_KeSaveFloatingPointState(NULL);
+}
+
 static void bridge_KeSetBasePriorityThread(void)
 {
     XboxGuestObject *obj = bridge_guest_object(STACK_ARG(0));
@@ -4911,6 +5021,15 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  23: return bridge_ExQueryPoolBlockSize;
     case  24: return bridge_ExQueryNonVolatileSetting;
 
+    /* Floating-point state. Both implementations are no-ops -- the host
+     * preserves FP state across its own context switches -- but routing them
+     * matters anyway: the missing-bridge warning says a missing bridge "is
+     * usually the reason a game misbehaves", and these two first appear in the
+     * log at the exact tick the title screen advances, where they read as a
+     * cause and are not one. */
+    case 139: return bridge_KeRestoreFloatingPointState;
+    case 142: return bridge_KeSaveFloatingPointState;
+
     /* IRQL */
     case 160: return bridge_KfRaiseIrql;
     case 161: return bridge_KfLowerIrql;
@@ -5335,6 +5454,11 @@ static void kernel_thunk_dispatch(void)
      * guest return address is the dword just below it. */
     xbox_HeapSetOwner(ordinal, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
 
+    /* So a bridge that rejects an argument can name the export it was reached
+     * through, not just the one whose implementation it is about to enter. */
+    g_bridge_current_ordinal = ordinal;
+    g_bridge_current_slot = slot;
+
     if (bridge) {
         bridge();
     } else {
@@ -5402,6 +5526,7 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
         int slot = (xbox_va - KERNEL_VA_BASE) / 4;
         if (slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE) {
             g_kernel_dispatch_slot = slot;
+            g_bridge_current_target = xbox_va;
             return kernel_thunk_dispatch;
         }
     }

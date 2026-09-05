@@ -18,6 +18,10 @@ void jsrf_usb_device_probe(uint32_t pc, uint32_t controller,
                            uint32_t device, uint32_t arg1, uint32_t arg2);
 void jsrf_wxci_error_probe(uint32_t pc, uint32_t message,
                            uint32_t argument, uint32_t return_address);
+void jsrf_cri_handler_probe(uint32_t pc, uint32_t handler,
+                            uint32_t argument, uint32_t return_address);
+void jsrf_list_remove_probe(uint32_t pc, uint32_t object, uint32_t index,
+                            uint32_t return_address);
 void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,
                                 uint32_t get_value, uint32_t put,
                                 uint32_t needed);
