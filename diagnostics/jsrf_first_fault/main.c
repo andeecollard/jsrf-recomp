@@ -152,6 +152,41 @@ static uint32_t g_pb_ring_lo, g_pb_ring_hi;
 
 static uint32_t jsrf_pb_cursor(void) { return g_pb_last; }
 
+/* The window as it was when the parse of it began. */
+static const uint32_t *g_pb_replay;
+static uint32_t g_pb_replay_from, g_pb_replay_dwords;
+
+/* Did the ring change underneath the parse, or was it always like this?
+ *
+ * Re-walk the copy taken at the start of the failing window, dispatching
+ * nothing, and compare where the second walk stops with where the live one
+ * did. Same offset means the bytes were already that way when the window was
+ * taken -- a decoding defect at a specific packet, and the offset names it.
+ * A later stop, or none, means something wrote the ring while it was being
+ * executed, and that write is the thing to find. */
+static void jsrf_pb_replay(const char *why, uint32_t stopped_at)
+{
+    static int done;
+    NV2APusherResult r;
+    uint32_t live_off;
+    if (done || !g_pb_replay || !g_pb_replay_dwords) return;
+    done = 1;
+    live_off = (stopped_at - g_pb_replay_from) / 4u;
+    r = nv2a_pusher_scan_segment(g_pb_replay, g_pb_replay_dwords);
+    fprintf(stderr,
+            "[PB-REPLAY] %s: window %08X +%u dwords; live stopped at dword %u"
+            " (%08X); replay stop=%d at dword %u (%08X) value %08X vs live %08X"
+            " -- %s\n",
+            why, g_pb_replay_from, g_pb_replay_dwords, live_off, stopped_at,
+            (int)r.stop, r.consumed, g_pb_replay_from + r.consumed * 4u,
+            r.consumed < g_pb_replay_dwords ? g_pb_replay[r.consumed] : 0,
+            MEM32(g_pb_replay_from + r.consumed * 4u),
+            r.consumed == live_off
+                ? "SAME offset: the bytes were already like this"
+                : "DIFFERENT offset: the ring changed during the parse");
+    fflush(stderr);
+}
+
 /* Where the software-method commands actually are, the first time the title
  * enters the reserve event wait.
  *
@@ -249,7 +284,15 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     const uint32_t *live = (const uint32_t *)XBOX_PTR(from);
     int trace = getenv("RECOMP_PB_NOTIFY_TRACE") != NULL;
     static uint32_t snapshot[0x100000/4];
-    if (trace) memcpy(snapshot, live, to-from);
+    /* RECOMP_PB_REPLAY keeps a copy of every window as it is taken, purely so
+     * that a parse failure can be re-walked against the bytes that were there
+     * at the start. See jsrf_pb_replay. */
+    if (trace || getenv("RECOMP_PB_REPLAY")) {
+        memcpy(snapshot, live, to-from);
+        g_pb_replay = snapshot;
+        g_pb_replay_from = from;
+        g_pb_replay_dwords = (to-from)/4u;
+    }
     NV2APusherResult result = nv2a_pusher_run_segment(live, (to-from)/4u);
     if (trace) {
         for (uint32_t k=1; k<result.consumed; ++k) {
@@ -264,6 +307,9 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
  * and a flag saying it is in use. Kept here rather than in the parser because
  * the parser only ever sees one window of a ring it does not own. */
 #define JSRF_PB_SUBR_MAX 0x10000u
+/* One consumption step. Comfortably above the 8 KB maximum packet, and small
+ * enough that GET is republished often enough to hold the producer back. */
+#define JSRF_PB_STEP     0x8000u
 static uint32_t g_pb_subr_return;
 static int      g_pb_subr_active;
 static unsigned long g_pb_calls, g_pb_returns;
@@ -420,6 +466,21 @@ static int jsrf_pb_poll(void)
          * cannot walk guest memory. */
         uint32_t end = g_pb_subr_active ? g_pb_last + JSRF_PB_SUBR_MAX
                      : (now>g_pb_last ? now : g_pb_ring_hi);
+        /* Consume in bounded steps so GET can be published between them.
+         *
+         * GET is the producer's back-pressure and it was only published once
+         * the whole poll finished. A poll can cover most of the ring -- 26,920
+         * dwords in the run that caught this -- and for all of that time the
+         * producer sees a GET that has not moved, so it is free to fill the
+         * ring and write over the very bytes being parsed. Measured with
+         * RECOMP_PB_REPLAY: the copy of the failing window taken at its start
+         * parses cleanly to the end, while the live parse died 1,893 dwords in.
+         * The ring changed underneath it.
+         *
+         * A step must exceed the largest legal packet -- 0x7FF dwords of
+         * payload, so 8 KB -- or a packet could never fit in one. */
+        if (!g_pb_subr_active && end - g_pb_last > JSRF_PB_STEP)
+            end = g_pb_last + JSRF_PB_STEP;
         if (!end || end<=g_pb_last) break;
         NV2APusherResult result = jsrf_pb_feed(g_pb_last, end);
         /* Every segment decision, kept in a ring and dumped when the parse
@@ -446,6 +507,9 @@ static int jsrf_pb_poll(void)
             fflush(stderr);
         }
         g_pb_last += result.consumed*4;
+        /* Republish progress immediately: this is the whole point of stepping. */
+        if (g_pb_ring_lo && !g_pb_subr_active)
+            MEM32(0xFD800044u) = g_pb_last & 0x03FFFFFFu;
         if (result.stop==NV2A_PUSHER_CALL) {
             /* A target has to be a plausible push-buffer address before the
              * cursor follows it anywhere. Without this the parse, having
@@ -503,6 +567,7 @@ static int jsrf_pb_poll(void)
             stream_fault=1;
             fprintf(stderr,"[PUSHER] rejected jump %08X at %08X\n",result.jump_address,g_pb_last-4);
             pb_recheck("rejected jump", g_pb_last-4);
+            jsrf_pb_replay("rejected jump", g_pb_last-4);
             /* Same post-mortem as the invalid-header path: a jump target
              * outside the ring means the parse is reading data, not commands,
              * and where sync was lost is several segments upstream. */
@@ -525,6 +590,7 @@ static int jsrf_pb_poll(void)
             if (++errors<=4) {
                 fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",MEM32(g_pb_last),g_pb_last);
                 pb_recheck("invalid header", g_pb_last);
+                jsrf_pb_replay("invalid header", g_pb_last);
                 /* Whether the parser is at a packet boundary or has lost sync
                  * decides everything: a real NV2A call is a feature to add, a
                  * desynchronised cursor is a bug to fix. Print the ring either

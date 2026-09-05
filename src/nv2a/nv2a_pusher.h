@@ -61,6 +61,13 @@ NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwor
 typedef void (*NV2ASoftwareMethodHandler)(uint32_t subchannel, uint32_t parameter);
 void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler);
 
+/* Walk a segment exactly as run_segment does, but dispatch nothing and count
+ * nothing. For asking "would this data have parsed?" of a buffer that has
+ * already been executed -- re-running the real parse would repeat every
+ * method's side effects. */
+NV2APusherResult nv2a_pusher_scan_segment(const uint32_t *data,
+                                          uint32_t num_dwords);
+
 void nv2a_pusher_get_stats(NV2APusherStats *out);
 void nv2a_pusher_reset_stats(void);
 

@@ -107,6 +107,66 @@ one-per-run event seen before the change.
 **Acceptance is unchanged:** the wait returns because its completion is
 delivered, repeatedly, with no bypass and no forced event.
 
+## 1b. The single parse desynchronisation is now the only blocker (active)
+
+Everything converges here. The reserve wait, the notification path, the
+software-method interrupt, the address contract and the GET fence all work;
+each run ends because the parser desynchronises exactly once, latches
+`stream_fault`, and stops publishing GET.
+
+Two candidates remain, and one experiment separates them. The failing window is
+bounded and known -- `from=0056D02C`, 101,734 dwords, stopping at 0x005D05C0.
+Keep a copy of each window as it is taken, and on a parse failure re-walk that
+copy **without dispatching anything**, then compare where the second walk
+stops:
+
+- stops at the same offset -> the bytes were already like that when the window
+  was taken, so this is a decoding defect at a specific packet, and bisecting
+  the window finds it;
+- stops later or not at all -> the ring changed underneath the parse, and the
+  guilty write is what to hunt.
+
+A non-dispatching walk is required: re-running the real parse would repeat
+every method's side effects.
+
+Do not resynchronise, skip, scan forward for a plausible header, or clear
+`stream_fault` to get past this.
+
+### Answered, and fixed: GET was published once per poll
+
+The replay says it outright:
+
+    [PB-REPLAY] invalid header: window 0056D000 +26920 dwords;
+      live stopped at dword 1893 (0056ED94);
+      replay stop=0 at dword 26920 -- DIFFERENT offset:
+      the ring changed during the parse
+
+The copy taken at the window's start parses cleanly to the end. The live parse
+died 1,893 dwords in. So the bytes were fine and something overwrote them
+mid-parse.
+
+That something is the producer, and we were letting it. GET is its
+back-pressure, and it was published only once the whole poll had finished. A
+poll could cover most of the ring -- 26,920 dwords here -- and for all of that
+time GET did not move, so the title was free to fill the ring and write over
+the bytes being read.
+
+Consumption now proceeds in bounded steps of 0x8000 bytes, comfortably above
+the 8 KB largest legal packet, with GET republished after every step. Measured
+over 110 seconds:
+
+    bad headers 0, invalid 0, rejected control flow 0, faults 0
+    draws       9,819 (frozen) -> 638,538 and still climbing
+    triangles  32,535 (frozen) -> 3,266,664 and still climbing
+    pusher     270,157,486 dwords, 250,556,913 methods
+    ctest 18/18
+
+The counters advance in every report instead of freezing at the seventh. This
+closes goal 1b and substantially answers goal 2.
+
+The framebuffer is still black, and that is now goal 3's question -- a
+presentation and rendering problem, no longer a stall.
+
 ## 2. Validate sustained command consumption
 
 The high CPU alias fixes a measured GET/ring address mismatch, but a single

@@ -87,6 +87,21 @@ static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
     }
 }
 
+static int g_scan_only;
+
+NV2APusherResult nv2a_pusher_scan_segment(const uint32_t *data,
+                                          uint32_t num_dwords)
+{
+    NV2APusherResult r;
+    NV2APusherStats saved;
+    nv2a_pusher_get_stats(&saved);
+    g_scan_only = 1;
+    r = nv2a_pusher_run_segment(data, num_dwords);
+    g_scan_only = 0;
+    g_stats = saved;   /* a scan must not move the counters either */
+    return r;
+}
+
 NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwords)
 {
     uint32_t pos = 0;
@@ -162,10 +177,12 @@ NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwor
             break;
         }
 
-        for (uint32_t i = 0; i < count; i++) {
-            dispatch(subchannel, increasing ? method + i * 4u : method,
-                     data[pos + 1 + i]);
-            result.methods++;
+        if (!g_scan_only) {
+            for (uint32_t i = 0; i < count; i++) {
+                dispatch(subchannel, increasing ? method + i * 4u : method,
+                         data[pos + 1 + i]);
+                result.methods++;
+            }
         }
 
         pos += 1 + count;
