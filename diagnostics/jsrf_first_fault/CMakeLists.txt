@@ -147,6 +147,13 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_empty_list_guard.py"
                      --check --gen "${RECOMP_GEN_DIR}")
+    # The one dead _flags fallback still reached by executing code, measured
+    # with RECOMP_UNRESOLVED_FLAGS=1. Two comparisons share one `je`, so the
+    # condition has to be written by each predecessor, not by the branch.
+    add_test(NAME jsrf_shared_zf_branch
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_shared_zf_branch.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
     add_test(NAME jsrf_flag_merge_backport
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_flag_merge.py"
@@ -159,7 +166,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_unresolved_flags_ratchet
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
-                     --max 79 --gen "${RECOMP_GEN_DIR}")
+                     --max 78 --gen "${RECOMP_GEN_DIR}")
 endif()
 
 add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c

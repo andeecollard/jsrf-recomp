@@ -71,6 +71,11 @@ points = {
         '00024480': ('jsrf_interp_probe', 'ecx'),
         '00024540': ('jsrf_interp_probe', 'ecx'),
     },
+    'recomp_0001.c': {
+        # The title screen's state dispatcher. ecx is the object and its
+        # +0x44 the index into the 21-entry jump table at 0x001FA008.
+        '0004EF90': ('jsrf_title_state_probe', 'ecx, MEM32(ecx + 0x44)'),
+    },
     'recomp_0009.c': {
         # JSRF's vblank acknowledge spin. ebx is the NV2A register base, ecx
         # the value about to be written to PCRTC_INTR_0. Reads the summary and

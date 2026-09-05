@@ -17,21 +17,41 @@ static uint32_t read_word(uint32_t address) {
     return value;
 }
 
-/* Read back the WXCI/XB disc driver's own diagnostics.
+/* The title screen's state machine, sub_0004EF90.
  *
- * sub_00140190 is its error reporter: it loads the callback the title
- * installed at 0x002615C4 and, only if that is non-null, forwards
- * (context, message, argument) to it. JSRF installs no callback, so the
- * function is a no-op and every message it was handed has been thrown away
- * since the port began -- including the three parameter checks in wxCiReqRd
- * and "E0109232:Timeout. (Waiting for transmission)", which is the driver
- * saying a read never completed.
+ * Global object id 8, vtable 0x001CAAF8. Its update is a 21-entry jump table
+ * at 0x001FA008 indexed by `this+0x44`, and for three sessions that index sat
+ * at 0x14 -- state 20, the terminal teardown that waits for global object id 2
+ * to be destroyed and never got it, because id 2 was waiting on the ADX stream.
  *
- * This reads the message pointer out of the caller's frame and prints it. It
- * does not install a callback: doing that would change what the guest does.
- * Repeats are counted rather than printed, because a failing read is retried
- * every frame and the interesting fact is which message and how fast.
+ * Sampling the field says where it is; only a trace says whether it is moving.
+ * Prints every change, and a heartbeat every 20000 unchanged visits so a state
+ * that is stuck is distinguishable from one that is merely quiet -- the
+ * distinction the whole stall investigation turned on.
  */
+void jsrf_title_state_probe(uint32_t pc, uint32_t object, uint32_t state)
+{
+    static uint32_t last_object, last_state = 0xFFFFFFFFu;
+    static unsigned long same;
+
+    (void)pc;
+    if (object == last_object && state == last_state) {
+        if (++same % 20000)
+            return;
+        fprintf(stderr, "[TITLE-STATE] this=%08X state=0x%02X still, %lu visits\n",
+                object, state, same);
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr, "[TITLE-STATE] this=%08X state=0x%02X (was %08X/0x%02X"
+            " after %lu visits)\n",
+            object, state, last_object, last_state, same);
+    fflush(stderr);
+    last_object = object;
+    last_state = state;
+    same = 0;
+}
+
 /* sub_000147A0 -- remove one entry from an 8-slot array inside its object.
  *
  *   this+0x70  the array, 8 entries      this+0xB0  its count
@@ -119,6 +139,21 @@ void jsrf_cri_handler_probe(uint32_t pc, uint32_t handler,
     fflush(stderr);
 }
 
+/* Read back the WXCI/XB disc driver's own diagnostics.
+ *
+ * sub_00140190 is its error reporter: it loads the callback the title
+ * installed at 0x002615C4 and, only if that is non-null, forwards
+ * (context, message, argument) to it. JSRF installs no callback, so the
+ * function is a no-op and every message it was handed has been thrown away
+ * since the port began -- including the three parameter checks in wxCiReqRd
+ * and "E0109232:Timeout. (Waiting for transmission)", which is the driver
+ * saying a read never completed.
+ *
+ * This reads the message pointer out of the caller's frame and prints it. It
+ * does not install a callback: doing that would change what the guest does.
+ * Repeats are counted rather than printed, because a failing read is retried
+ * every frame and the interesting fact is which message and how fast.
+ */
 void jsrf_wxci_error_probe(uint32_t pc, uint32_t message,
                            uint32_t argument, uint32_t return_address)
 {

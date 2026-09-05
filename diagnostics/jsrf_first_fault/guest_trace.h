@@ -22,6 +22,7 @@ void jsrf_cri_handler_probe(uint32_t pc, uint32_t handler,
                             uint32_t argument, uint32_t return_address);
 void jsrf_list_remove_probe(uint32_t pc, uint32_t object, uint32_t index,
                             uint32_t return_address);
+void jsrf_title_state_probe(uint32_t pc, uint32_t object, uint32_t state);
 void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,
                                 uint32_t get_value, uint32_t put,
                                 uint32_t needed);
