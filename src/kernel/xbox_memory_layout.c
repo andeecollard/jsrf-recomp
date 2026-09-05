@@ -1717,11 +1717,16 @@ static void framebuffer_probe_tick(void)
     const uint32_t *p;
 
     /* Report the surface being drawn, not whatever PCRTC_START happens to
-     * hold. JSRF never programs a scanout address, so that register pointed at
-     * a heap block for the whole of this port's life -- xbox_HeapAlloc was
-     * measured zeroing the very page the probe was summing -- and every
-     * "nonzero=0/153600" line was reading an allocation rather than a
-     * framebuffer. The executor's own render target is the honest subject. */
+     * hold. JSRF never programs a scanout address, so that register is not a
+     * scanout in the usual sense.
+     *
+     * It was not junk either, and the earlier reading that it pointed at "a
+     * heap block" was too strong. RECOMP_FLIP_TRACE measures the surface bound
+     * at every FLIP_STALL as 0x0071E000 -- the address PCRTC_START held, and
+     * the address the guard page saw xbox_HeapAlloc zero, which is what
+     * allocating a flip chain from the heap looks like. What the old probe
+     * actually lacked was a moment: it sampled once a second, and between
+     * flips that page holds a frame nobody is composing into. */
     {
         extern uint32_t nv2a_pb_exec_surface_va(void);
         uint32_t drawn = nv2a_pb_exec_surface_va();
@@ -1740,9 +1745,20 @@ static void framebuffer_probe_tick(void)
         sum = sum * 33u + p[i];
         if (p[i]) nonzero++;
     }
-    fprintf(stderr, "  [FB] 0x%08X sum=%08X nonzero=%u/%u %s\n",
-            s_fb_va, sum, nonzero, n,
-            sum != last_sum ? "CHANGED" : "same");
+    /* Two numbers, because they answer different questions. The first is the
+     * surface being composed right now, which is legitimately mid-clear as
+     * often as not. The second is the copy taken at the guest's own FLIP_STALL
+     * -- the only thing the window is ever fed -- and it is the one that means
+     * "there is a picture on screen". Reading a blank first number as a blank
+     * display is the mistake this line exists to prevent. */
+    {
+        extern int nv2a_pb_exec_snapshot_nonzero(void);
+        int presented = nv2a_pb_exec_snapshot_nonzero();
+        fprintf(stderr, "  [FB] 0x%08X sum=%08X nonzero=%u/%u %s |"
+                " presented nonzero=%d\n",
+                s_fb_va, sum, nonzero, n,
+                sum != last_sum ? "CHANGED" : "same", presented);
+    }
     last_sum = sum;
     fflush(stderr);
 }

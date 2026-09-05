@@ -688,7 +688,13 @@ static int jsrf_pb_poll(void)
         /* RECOMP_FB_DUMP_FLIP=<stride>: capture finished frames, at the only
          * moment a frame is finished. Cadence is the question this answers:
          * whether consecutive presents carry different pictures, not merely
-         * whether the surface is non-blank. */
+         * whether the surface is non-blank.
+         *
+         * Two files per capture, and the difference between them is the
+         * measurement: flipNNN is the live surface as it stands here, snapNNN
+         * the copy taken at FLIP_STALL that the window is actually fed. The
+         * parser finishes its bounded step between the two, so they need not
+         * agree, and only the second is a picture anyone saw. */
         {
             extern void nv2a_pb_exec_dump_surface(void);
             static long stride = -1;
@@ -999,6 +1005,12 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
     xbox_d3d8_make_current();
     /* From here on GET means "consumed", not "submitted". */
     g_nv2a_pusher_owns_dma_get = 1;
+    /* Lend the executor the ring's recent-method dump, so RECOMP_FLIP_TRACE
+     * can print the command order that led up to a flip. */
+    {
+        extern void nv2a_pb_exec_set_recent_dump(void (*)(int));
+        nv2a_pb_exec_set_recent_dump(nv2a_pusher_dump_recent);
+    }
 #if !defined(_WIN32) && defined(__aarch64__)
     nv2a_pusher_set_software_method_handler(jsrf_software_method);
 #endif

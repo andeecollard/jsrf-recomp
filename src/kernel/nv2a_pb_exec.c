@@ -19,8 +19,12 @@
  *
  * Enabled with RECOMP_PB_EXEC. RECOMP_RASTER_TEST draws one known triangle
  * after every clear, which separates "the pixel path is broken" from "the title
- * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
- * <prefix>NNN.bmp, so the result can be looked at without a display.
+ * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes surfaces to
+ * <prefix><instrument>NNN.bmp, so the result can be looked at without a
+ * display; the instrument is reportNNN, drawNNN, flipNNN (the live surface at
+ * the present) or snapNNN (the copy the window is actually fed).
+ * RECOMP_FLIP_TRACE=<stride> reports, inside the FLIP_STALL dispatch, what the
+ * guest emitted between its last draw and its flip.
  */
 #include "nv2a_vsh.h"
 #include "nv2a_texture_copy.h"
@@ -528,36 +532,40 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
 }
 
 
-/* Write the current surface out as a 24-bit BMP.
+/* Write a surface out as a 24-bit BMP.
  *
  * A framebuffer window needs someone watching it. A file does not, which makes
  * this the only way to check what a title actually rendered on a machine you
  * are not sitting at -- and the only way to put a picture in a bug report.
  *
- * Programmable batches use guest shader outputs in NV2A screen space.
- * The measured RGB565 copy uses the portable texture/colour path.
- * Fixed-function batches retain the pre-transformed-position heuristic.
- */
-static void dump_surface_bmp(void)
+ * One file series per instrument.
+ *
+ * These three call sites sample at completely different moments -- a report
+ * fires mid-composition, a batch capture after one draw, the flip when a frame
+ * is finished -- and they used to share a single sequence, so a directory of
+ * NNN.bmp mixed them with nothing to tell them apart. Correlating "how many
+ * are blank" against the flip log then counts report snapshots as presented
+ * frames. The tag is what keeps the question answerable. */
+static void write_bmp(const char *tag, unsigned seq,
+                      const uint8_t *base, uint32_t pitch,
+                      uint32_t x0, uint32_t y0,
+                      uint32_t w, uint32_t h, uint32_t bpp)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
-    static int seq;
     char path[512];
-    uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h, y, x;
+    uint32_t y, x;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
 
-    if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !s_gpu.color_offset)
+    if (!prefix || !base || !w || !h || (bpp != 2 && bpp != 4))
         return;
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, seq++);
+    snprintf(path, sizeof path, "%s%s%03u.bmp", prefix, tag, seq);
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -575,17 +583,16 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + s_gpu.color_offset
-                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+        const uint8_t *row = base + (size_t)(y0 + y) * pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
             if (bpp == 4) {
-                uint32_t v = ((const uint32_t *)row)[s_gpu.clip_x + x];
+                uint32_t v = ((const uint32_t *)row)[x0 + x];
                 bgr[0] = (uint8_t)(v);
                 bgr[1] = (uint8_t)(v >> 8);
                 bgr[2] = (uint8_t)(v >> 16);
             } else {
-                uint16_t v = ((const uint16_t *)row)[s_gpu.clip_x + x];
+                uint16_t v = ((const uint16_t *)row)[x0 + x];
                 bgr[0] = (uint8_t)(( v        & 0x1F) << 3);
                 bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
                 bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
@@ -598,10 +605,117 @@ static void dump_surface_bmp(void)
         }
     }
     fclose(f);
-    if (seq == 1)
-        fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
-                path, w, h, s_gpu.color_offset, bpp);
+    {
+        static int announced;
+        if (!announced++)
+            fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u, %ubpp)\n",
+                    path, w, h, bpp);
+    }
 }
+
+/* The surface as it stands right now, wherever the guest last pointed it. */
+static void dump_surface_bmp(const char *tag, unsigned seq)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp();
+
+    if (!mem || !s_gpu.color_offset)
+        return;
+    write_bmp(tag, seq, mem + s_gpu.color_offset, s_gpu.pitch,
+              s_gpu.clip_x, s_gpu.clip_y, s_gpu.clip_w, s_gpu.clip_h, bpp);
+}
+
+/* The frame that was actually presented.
+ *
+ * nv2a_pb_exec_surface hands the window s_snap, the copy taken at FLIP_STALL,
+ * not the live surface -- so a capture of the live surface at present time is
+ * not a capture of what the viewer saw. Between the flip and the present the
+ * parser finishes its bounded step, which can carry it into the next frame's
+ * clear and can even re-point color_offset at another surface. This dumps the
+ * copy, which is the only thing the display path reads. */
+static void dump_snapshot_bmp(const char *tag, unsigned seq)
+{
+    if (!s_snap || !s_snap_w || !s_snap_h)
+        return;
+    write_bmp(tag, seq, s_snap, s_snap_w * s_snap_bpp, 0, 0,
+              s_snap_w, s_snap_h, s_snap_bpp);
+}
+
+/* Non-black pixels in the presented copy. "Blank" is the whole question at the
+ * flip, and a number answers it in the log without opening a file. */
+static uint32_t snapshot_nonzero(void)
+{
+    uint32_t n = 0, i, count;
+
+    if (!s_snap || !s_snap_w || !s_snap_h)
+        return 0;
+    count = s_snap_w * s_snap_h;
+    if (s_snap_bpp == 2) {
+        const uint16_t *p = (const uint16_t *)s_snap;
+        for (i = 0; i < count; i++) if (p[i]) n++;
+    } else if (s_snap_bpp == 4) {
+        const uint32_t *p = (const uint32_t *)s_snap;
+        for (i = 0; i < count; i++) if (p[i] & 0x00FFFFFFu) n++;
+    }
+    return n;
+}
+
+/* Whoever owns the ring lends its recent-method dump.
+ *
+ * The executor is linked into tests that have no pusher at all, so calling
+ * nv2a_pusher_dump_recent directly would make every one of them fail to link
+ * for the sake of one diagnostic line. The same shape the pusher already uses
+ * for its software-method handler: the owner installs it, and without one the
+ * trace simply prints less. */
+static void (*s_recent_dump)(int max_entries);
+
+void nv2a_pb_exec_set_recent_dump(void (*fn)(int max_entries))
+{
+    s_recent_dump = fn;
+}
+
+/* What the guest emitted between its last draw and its flip.
+ *
+ * Every other flip instrument samples after the poll returns, which is after
+ * the parser has finished its bounded step -- so a blank capture there cannot
+ * tell "the frame was never composed" from "the parser walked on into the next
+ * clear before anyone looked". This runs inside the FLIP_STALL dispatch, the
+ * one moment the guest itself calls a frame finished, and reports the copy
+ * that will be presented plus the method order that led to it.
+ *
+ * RECOMP_FLIP_TRACE=<stride> traces every stride-th flip, capped, so a
+ * 110-second run costs a few dozen lines. Silent unless asked for. */
+static void flip_trace(void)
+{
+    static long stride = -1;
+    static unsigned long flips, traced;
+    static uint32_t last_tris, last_clears;
+    uint32_t tris = s_gpu.tris_drawn;
+
+    if (stride < 0) {
+        const char *e = getenv("RECOMP_FLIP_TRACE");
+        stride = e && *e ? strtol(e, NULL, 0) : 0;
+        if (stride < 1) stride = 1;
+    }
+    if (!getenv("RECOMP_FLIP_TRACE"))
+        return;
+    if ((flips++ % (unsigned long)stride) == 0 && traced < 64) {
+        traced++;
+        fprintf(stderr, "  [FLIPTRACE] flip %lu: surface 0x%08X pitch %u"
+                " clip %ux%u+%u+%u fmt 0x%08X | %u triangles, %u clears"
+                " since the last flip | snapshot %ux%u nonzero %u\n",
+                flips - 1, s_gpu.color_offset, s_gpu.pitch,
+                s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y,
+                s_gpu.format, tris - last_tris,
+                s_gpu.clears - last_clears,
+                s_snap_w, s_snap_h, snapshot_nonzero());
+        if (s_recent_dump)
+            s_recent_dump(48);
+    }
+    last_tris = tris;
+    last_clears = s_gpu.clears;
+}
+
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
  * for RECOMP_RASTER_TEST. */
@@ -1295,8 +1409,7 @@ static void raster_batch(void)
         }
         if (getenv("RECOMP_FB_DUMP_DRAW") && captured < 24
                 && (batches++ % (unsigned long)stride) == 0) {
-            captured++;
-            dump_surface_bmp();
+            dump_surface_bmp("draw", captured++);
         }
     }
 
@@ -1558,6 +1671,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* The title's own frame boundary: this frame is finished. */
     case NV097_FLIP_STALL:
         snapshot_surface();
+        flip_trace();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -1827,7 +1941,9 @@ int nv2a_pb_exec_vsh_constant(unsigned index, float out[4])
  * only the flip is a moment when one is finished. */
 void nv2a_pb_exec_dump_surface(void)
 {
-    dump_surface_bmp();
+    static unsigned live_seq, snap_seq;
+    dump_surface_bmp("flip", live_seq++);
+    dump_snapshot_bmp("snap", snap_seq++);
 }
 
 /* Triangles rasterised so far. The delta between two flips is what says
@@ -1836,6 +1952,17 @@ void nv2a_pb_exec_dump_surface(void)
 uint32_t nv2a_pb_exec_triangles(void)
 {
     return s_gpu.tris_drawn;
+}
+
+/* Non-black pixels in the frame that was last presented, or -1 before the
+ * first flip. The surface address alone cannot answer "is there a picture on
+ * screen": the probe samples between flips, when color_offset names the buffer
+ * being composed rather than the one being shown. */
+int nv2a_pb_exec_snapshot_nonzero(void)
+{
+    if (!s_snap || !s_snap_w || !s_snap_h)
+        return -1;
+    return (int)snapshot_nonzero();
 }
 
 uint32_t nv2a_pb_exec_surface_va(void)
@@ -1961,7 +2088,10 @@ void nv2a_pb_exec_report(void)
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
-    dump_surface_bmp();
+    {
+        static unsigned seq;
+        dump_surface_bmp("report", seq++);
+    }
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one

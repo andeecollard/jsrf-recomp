@@ -346,15 +346,113 @@ rather than a misapplied one. Dumping the method sequence around a flip
 answers it.
 
 **Acceptance:** a sequence of captured frames showing the title screen present
-and update, not a single frame. Composition is demonstrated
-(claude-drawdump-45, 43 frames); presentation is partly demonstrated
-(claude-flipsync-51, 19 of 46) and not yet met.
+and update, not a single frame.
+
+### 3c CLOSED. The presents were never blank; the capture was of the wrong buffer
+
+Two instrument defects, and between them they produced the "27 of 46" figure.
+
+**One: the capture sampled the live surface, not the presented one.** The window
+is fed `nv2a_pb_exec_surface`, which returns `s_snap` -- the copy
+`snapshot_surface` takes inside the FLIP_STALL dispatch. `RECOMP_FB_DUMP_FLIP`
+called `dump_surface_bmp`, which reads guest memory at `s_gpu.color_offset` at
+the moment of the present, which is after the poll returns. Consumption stops
+at a flip only after finishing its bounded 0x8000-byte step, so between the two
+the parser walks on -- into the next frame's clear, and past whatever rebinds
+`color_offset`. A blank file there says nothing about what was displayed.
+
+**Two: three instruments shared one file series.** The report, per-batch and
+flip captures all wrote `<prefix>NNN.bmp` from a single counter. Of the 46 files
+in claude-flipcorr-52, 24 were flips and 22 were report snapshots taken
+mid-composition, which is the one sampling moment already known to be
+meaningless for presentation. Files now carry their instrument's name:
+`reportNNN`, `drawNNN`, `flipNNN` (live) and `snapNNN` (presented).
+
+Measured over 110 s, claude-fliporder-53, capturing both buffers at each flip:
+
+    live surface at present time (flipNNN) : blank 10 / 24
+    presented copy   (snapNNN)             : blank  1 / 23
+
+The one blank present is the frame the trace shows drew a single triangle,
+during the change of scene. Everything else carries a picture, and consecutive
+captures differ: snap019-023 are the JSRF title screen, correct, centred and
+legible, with the logo animating between them, and snap014 is the SEGA
+anti-graffiti screen pixel-correct. **The acceptance for goal 3 is met.**
+
+### What the guest emits between its last draw and its flip
+
+`RECOMP_FLIP_TRACE=<stride>` traces inside the FLIP_STALL dispatch: the bound
+surface, triangles and clears since the previous flip, the presented copy's
+non-black count, and the last 48 dispatched methods. Thirty flips over 110 s,
+zero faults. The tail of the command stream is the same every time:
+
+    ... SET_LIGHTING_ENABLE SET_SPECULAR_ENABLE SET_LIGHT_CONTROL 0x17C4
+        FLIP_INCREMENT_WRITE NO_OPERATION FLIP_STALL
+
+No CLEAR_SURFACE and no SET_BEGIN_END anywhere near the boundary, so the
+clear for frame N+1 does **not** precede the FLIP_STALL for frame N. Stopping
+at the flip is the right boundary, and the open question from the last handover
+is answered in the negative.
+
+Clears and triangles between flips are 1-3 and 5 respectively on the title
+screen -- the "about 750 triangles per capture interval" figure was over a
+stride of 150 frames -- and 1 clear, ~2350 triangles per frame in the scene
+that follows.
+
+### The surface at the flip is 0x0071E000, and that revises fix 6
+
+At all thirty traced flips the bound surface is 0x0071E000. That is the address
+PCRTC_START held, and the address `RECOMP_GUARD_PAGE` caught `xbox_HeapAlloc`
+zeroing -- which is what allocating a flip chain out of the heap looks like, not
+proof of a stray allocation. So "the framebuffer probe was summing a heap
+allocation" (f0dc0dd) was too strong: the address was the presented buffer, and
+what the probe lacked was a moment, not an address. Pointing it at
+`nv2a_pb_exec_surface_va()` swapped one wrong sample for another -- 115 of 115
+samples in claude-fliporder-53 read 0x005F0000, a buffer being composed into,
+never the one on screen. The probe now reports the presented copy's non-black
+count alongside, which is the number that means "there is a picture".
+
+### The whole run, as the presented copy sees it
+
+`presented nonzero` once a second over 110 s, claude-fbpresented-54, zero
+faults and zero bad headers:
+
+    -1 31159 31159 307200 307200 18098 18098 18098 307200 307200
+    42349 x22                      the SEGA anti-graffiti screen, held
+    307200 1 1 2 1                 white flash, then the change of scene
+    9651 74417 112154 44365 ...    the title logo animating in
+    44244 +/- a few, x30           the title screen, with something moving
+    64356 71025 79313 84604 109464 36249 8141 1 2 2
+    0 x11                          the last eleven seconds are black
+
+The port draws its own screens, presents them, and moves between them on its
+own. What the last eleven seconds are -- an attract movie we do not draw, a
+fade, or a new stall -- is the next question, and it is a different one.
 
 ## 4. Verify controls and reach gameplay
 
 Connect the existing host input path, confirm guest-visible button/axis changes,
 use controls to enter gameplay, and verify controllable movement in a rendered
 scene. Record the tested route and remaining visual/audio/logic defects.
+
+### The input path is already built and measured; what is untested is reaction
+
+Not a green field. CLAUDE_HANDOVER_2026-09-04_USB.txt records the chain working
+end to end against real hardware (claude-usb-realpad-01): SDL2 opens a pad, and
+presses arrive correctly decoded through the emulated Xbox gamepad, OHCI and
+XPP, with zero unhandled control requests and zero faults over 40 s. The
+emulated controller enumerates and the title polls it steadily, both by
+GET_REPORT and on the interrupt-IN endpoint.
+
+What was never confirmed is that the title *reacts*: with and without a pad the
+stage sequence and pushbuffer profile were identical. That was left to the
+renderer because there was no picture to read. There is one now, so the next
+step is to press buttons at a screen we can see and watch for a change --
+`jsrf_title_state_probe` is the trace that says whether the state machine moves.
+
+Two host notes: `open_controllers()` runs once in `xbox_InputInit` with no
+hotplug, so attach the pad before launching; and this diagnostic harness has no
+window focus of its own to steal.
 
 ## Constraints and definition of done
 
