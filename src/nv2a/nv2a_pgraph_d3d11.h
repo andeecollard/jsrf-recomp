@@ -55,6 +55,10 @@ typedef struct {
 
 /* Non-zero once since the last call if the guest signalled end of frame. */
 int pgraph_d3d11_take_frame(void);
+/* Is a present due, without consuming the flag? A consumer that parses the
+ * ring in bounded steps needs to stop at a frame boundary rather than run on
+ * into the next frame's clear before it presents. */
+int pgraph_d3d11_frame_pending(void);
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);
 

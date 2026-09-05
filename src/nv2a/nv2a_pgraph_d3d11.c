@@ -802,6 +802,11 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
  * and which thread holds that is the caller's business. So the flag is
  * reported and cleared here, and the caller decides.
  */
+int pgraph_d3d11_frame_pending(void)
+{
+    return g_pg.frame_pending;
+}
+
 int pgraph_d3d11_take_frame(void)
 {
     int pending = g_pg.frame_pending;

@@ -613,6 +613,16 @@ static int jsrf_pb_poll(void)
                 fflush(stderr);
             }
         }
+        /* Stop at a frame boundary.
+         *
+         * FLIP_STALL is the guest saying "this frame is finished". Consumption
+         * runs in bounded steps on this thread and presentation happens after
+         * the poll, so without this the parser walks straight on into the next
+         * frame's clear and the surface presented is blank. Measured: of 46
+         * frames captured at the flip, 43 were blank and only one carried the
+         * composed picture, while captures taken mid-draw were full of content.
+         * A frame boundary is a boundary; stop on it. */
+        if (pgraph_d3d11_frame_pending()) break;
         if (result.stop!=NV2A_PUSHER_END || !result.consumed) break;
         if (g_pb_last==g_pb_ring_hi && now<g_pb_last) g_pb_last=g_pb_ring_lo;
     }
@@ -675,6 +685,25 @@ static int jsrf_pb_poll(void)
         static unsigned long presented;
         pgraph_d3d11_flush();
         d3d8_PresentFrame();
+        /* RECOMP_FB_DUMP_FLIP=<stride>: capture finished frames, at the only
+         * moment a frame is finished. Cadence is the question this answers:
+         * whether consecutive presents carry different pictures, not merely
+         * whether the surface is non-blank. */
+        {
+            extern void nv2a_pb_exec_dump_surface(void);
+            static long stride = -1;
+            static unsigned captured;
+            if (stride < 0) {
+                const char *e = getenv("RECOMP_FB_DUMP_FLIP");
+                stride = e && *e ? strtol(e, NULL, 0) : 0;
+                if (stride < 1) stride = 1;
+            }
+            if (getenv("RECOMP_FB_DUMP_FLIP") && captured < 24
+                    && (presented % (unsigned long)stride) == 0) {
+                captured++;
+                nv2a_pb_exec_dump_surface();
+            }
+        }
         if (++presented <= 3 || (presented % 300) == 0) {
             fprintf(stderr, "  [PUSHER] presented frame %lu\n", presented);
             fflush(stderr);

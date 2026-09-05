@@ -291,10 +291,30 @@ On this host the window is fed from that same surface --
 `xbox_D3D8SetGuestFramebufferSource(nv2a_pb_exec_surface)` -- so what is
 composed is what is displayed.
 
+### Measured at the flip: presentation was landing after the clear
+
+`RECOMP_FB_DUMP_FLIP` captures at the only moment a frame is finished. The
+first measurement was blunt: of 46 captures, **43 were blank**, while captures
+taken mid-draw were full of content. Presentation was running after the parser
+had already walked into the next frame's clear.
+
+FLIP_STALL is the guest saying the frame is finished, and consumption now stops
+on it. Same capture again:
+
+    blank flips   43/46 -> 27/46
+    with content   3/46 -> 19/46
+    distinct        16   -> 19
+    throughput    270M dwords -> 260M, 3,900 frames presented (unchanged)
+
+So better, and not solved: 27 of 46 presents still carry a blank surface. The
+remaining cases are worth separating before more code -- whether those flips
+are genuinely blank frames the title intended, or the boundary is still being
+crossed by something other than the step loop.
+
 **Acceptance:** a sequence of captured frames showing the title screen present
-and update, not a single frame. The 43-frame capture in claude-drawdump-45 is
-that sequence for composition; presentation cadence is still worth measuring
-against the flip rather than against drawing batches.
+and update, not a single frame. Composition is demonstrated
+(claude-drawdump-45, 43 frames); presentation is now partly demonstrated
+(claude-flipsync-51, 19 of 46) and not yet met.
 
 ## 4. Verify controls and reach gameplay
 

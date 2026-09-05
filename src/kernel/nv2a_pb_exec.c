@@ -1822,6 +1822,14 @@ int nv2a_pb_exec_vsh_constant(unsigned index, float out[4])
  * has named one. The framebuffer probe needs it because PCRTC_START is not a
  * substitute: a title that never programs a scanout leaves it holding whatever
  * was there, and this one leaves it pointing at a heap block. */
+/* Capture the surface at a caller-chosen moment. The report-time and
+ * per-batch captures both sample a frame part way through being composed;
+ * only the flip is a moment when one is finished. */
+void nv2a_pb_exec_dump_surface(void)
+{
+    dump_surface_bmp();
+}
+
 uint32_t nv2a_pb_exec_surface_va(void)
 {
     return s_gpu.color_offset;
