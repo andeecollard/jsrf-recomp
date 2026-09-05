@@ -700,6 +700,13 @@ static int jsrf_pb_poll(void)
             }
             if (getenv("RECOMP_FB_DUMP_FLIP") && captured < 24
                     && (presented % (unsigned long)stride) == 0) {
+                extern uint32_t nv2a_pb_exec_triangles(void);
+                static uint32_t last_tris;
+                uint32_t tris = nv2a_pb_exec_triangles();
+                fprintf(stderr, "  [FLIP] capture %u at frame %lu:"
+                        " %u triangles since the previous capture\n",
+                        captured, presented, tris - last_tris);
+                last_tris = tris;
                 captured++;
                 nv2a_pb_exec_dump_surface();
             }

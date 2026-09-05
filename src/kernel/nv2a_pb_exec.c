@@ -1830,6 +1830,14 @@ void nv2a_pb_exec_dump_surface(void)
     dump_surface_bmp();
 }
 
+/* Triangles rasterised so far. The delta between two flips is what says
+ * whether a blank presented frame is one the title drew nothing into, or one
+ * whose work was cleared away before it reached the screen. */
+uint32_t nv2a_pb_exec_triangles(void)
+{
+    return s_gpu.tris_drawn;
+}
+
 uint32_t nv2a_pb_exec_surface_va(void)
 {
     return s_gpu.color_offset;

@@ -311,9 +311,43 @@ remaining cases are worth separating before more code -- whether those flips
 are genuinely blank frames the title intended, or the boundary is still being
 crossed by something other than the step loop.
 
+### 3c. Are the remaining blank presents intended? (active)
+
+27 of 46 presents still carry a blank surface. Two possibilities, needing
+opposite responses, and one number separates them: **how many triangles were
+drawn between the previous flip and this one.**
+
+- a blank present after a frame that drew thousands of triangles means the
+  boundary is still being crossed and the clear is wiping composed work;
+- a blank present after a frame that drew nothing means the title genuinely
+  submitted an empty frame, which JSRF's mostly-black title screen may well do,
+  and there is nothing to fix.
+
+Log the triangle count at each flip and correlate it with whether that flip's
+capture is blank. Do not add heuristics to skip "empty" flips or to defer
+presentation until content appears; either the boundary is right or it is not.
+
+**Answered: they are not intended.** Across the correlated captures:
+
+    blank, and >50 triangles drawn since the previous capture : 11
+    blank, and <=50 triangles                                 :  0
+    with content                                              : 15
+
+Every blank present follows a frame that drew -- around 750 triangles per
+capture interval, consistently, with no empty frames at all. So the title never
+submits a blank frame and the boundary is still being crossed: work is
+composed, then cleared, then presented.
+
+Stopping on FLIP_STALL was necessary and is not sufficient. The next question
+is what the guest emits between its last draw and its flip -- in particular
+whether the clear for frame N+1 precedes the FLIP_STALL for frame N in this
+title's command order, which would make "stop at the flip" the wrong boundary
+rather than a misapplied one. Dumping the method sequence around a flip
+answers it.
+
 **Acceptance:** a sequence of captured frames showing the title screen present
 and update, not a single frame. Composition is demonstrated
-(claude-drawdump-45, 43 frames); presentation is now partly demonstrated
+(claude-drawdump-45, 43 frames); presentation is partly demonstrated
 (claude-flipsync-51, 19 of 46) and not yet met.
 
 ## 4. Verify controls and reach gameplay
