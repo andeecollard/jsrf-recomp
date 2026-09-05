@@ -674,6 +674,50 @@ void nv2a_pb_exec_set_recent_dump(void (*fn)(int max_entries))
     s_recent_dump = fn;
 }
 
+/* Every distinct surface the guest has bound, in the order first seen.
+ *
+ * A title that composes into one surface and flips another leaves the flip
+ * looking empty however well the drawing worked, and the only way to tell that
+ * apart from "nothing was drawn" is to look at the others at the same moment.
+ * Small and fixed: this title uses three. */
+#define NV_MAX_TRACKED_SURFACES 8
+static uint32_t s_surfaces[NV_MAX_TRACKED_SURFACES];
+static unsigned s_surface_count;
+
+static void note_surface(uint32_t offset)
+{
+    unsigned i;
+    if (!offset)
+        return;
+    for (i = 0; i < s_surface_count; i++)
+        if (s_surfaces[i] == offset)
+            return;
+    if (s_surface_count < NV_MAX_TRACKED_SURFACES)
+        s_surfaces[s_surface_count++] = offset;
+}
+
+/* Non-black pixels in one surface, read with the geometry in force now. */
+static uint32_t surface_nonzero(uint32_t offset, uint32_t bpp)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t n = 0, x, y;
+
+    if (!mem || !offset || !s_gpu.pitch || !s_gpu.clip_w || !s_gpu.clip_h)
+        return 0;
+    for (y = 0; y < s_gpu.clip_h; y++) {
+        const uint8_t *row = mem + offset
+                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+        if (bpp == 2) {
+            const uint16_t *p = (const uint16_t *)row + s_gpu.clip_x;
+            for (x = 0; x < s_gpu.clip_w; x++) if (p[x]) n++;
+        } else if (bpp == 4) {
+            const uint32_t *p = (const uint32_t *)row + s_gpu.clip_x;
+            for (x = 0; x < s_gpu.clip_w; x++) if (p[x] & 0x00FFFFFFu) n++;
+        }
+    }
+    return n;
+}
+
 /* What the guest emitted between its last draw and its flip.
  *
  * Every other flip instrument samples after the poll returns, which is after
@@ -709,6 +753,20 @@ static void flip_trace(void)
                 s_gpu.format, tris - last_tris,
                 s_gpu.clears - last_clears,
                 s_snap_w, s_snap_h, snapshot_nonzero());
+        {
+            char line[512];
+            int off = snprintf(line, sizeof line, "  [FLIPTRACE]   surfaces:");
+            uint32_t bpp = surface_bpp();
+            unsigned i;
+            for (i = 0; i < s_surface_count && off > 0
+                        && off < (int)sizeof(line) - 40; i++)
+                off += snprintf(line + off, sizeof(line) - (size_t)off,
+                                " 0x%08X=%u%s", s_surfaces[i],
+                                surface_nonzero(s_surfaces[i], bpp),
+                                s_surfaces[i] == s_gpu.color_offset
+                                    ? "(bound)" : "");
+            fprintf(stderr, "%s\n", line);
+        }
         if (s_recent_dump)
             s_recent_dump(48);
     }
@@ -1660,6 +1718,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
         s_gpu.color_offset = param;
+        note_surface(param);
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;

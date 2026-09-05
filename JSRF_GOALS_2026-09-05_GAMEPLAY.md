@@ -499,6 +499,46 @@ path that cannot complete without a working audio pipeline, and the fix is a
 real sink rather than anything in DSOUND. Prove it before writing code -- find
 what clears bit 15 on hardware and what the worker thread is waiting for.
 
+### The missing backgrounds are dropped draws, not a missing copy
+
+The user's reference shot of the real title screen is the JSRF logo composited
+over a live 3D city; ours draws the logo on black, and the earlier logo screens
+are missing or cropped backgrounds the same way.
+
+It is not a surface or copy problem. `RECOMP_FLIP_TRACE` now reports the
+non-black count of *every* surface the guest has ever bound, at each flip, and
+they agree with each other throughout -- at the title screen all three sit at
+45k-69k of 307200. Nothing anywhere holds the city.
+
+It is not the transform either. Over the title screen the executor rasterises
+175,000-390,000 triangles per five seconds while skipping only 75-170 batches
+as not screen-space.
+
+The draws are **dropped at the texture stage**. `prepare_texture_copy` returns
+an error and `draw_primitive` does `return` -- the batch is never rasterised at
+all -- and the rejection tally over a 130-second run is:
+
+    466,676  multiple textures
+    120,879  combiner / texture program
+     77,740  blending
+     17,914  texture format / mip layout
+     10,362  stencil / fog / polygon / logic op
+
+So the executor draws what it can texture with a single stage and a simple
+combiner -- logos, text, UI -- and silently drops everything multi-textured,
+which is the whole city. That is exactly "foreground renders, background is
+black or cropped".
+
+**And it explains the black screen after ~100 s too**, which is a separate
+mechanism worth not confusing with the first: there the skipped-batch counter
+rises to meet the triangle count exactly (103 tris / 103 skipped, 83/83,
+120/120), so that scene is fixed-function and untransformed, and the executor
+has no fixed-function T&L. Two different holes, both in the CPU rasteriser.
+
+Neither is a defect to fix in the executor by guesswork. xemu implements the
+register combiners, multitexturing and fixed-function T&L completely, and is
+the reference to read for both.
+
 ### Frame rate, measured
 
     anti-graffiti screen   45 fps
