@@ -191,6 +191,44 @@ static int jsrf_pb_poll(void)
         g_pb_last = g_pb_ring_lo ? g_pb_ring_lo : now;
     }
 
+    /* Every backwards move of PUT, classified.
+     *
+     * A ring wraps by ending its written span with a JUMP and republishing PUT
+     * at the base; that is normal and happens several times a second. PUT
+     * arriving below the cursor at some *other* address is not, and it is the
+     * poll on which the parse desynchronises -- once per run, one bad header in
+     * six and a half million dwords.
+     *
+     * Three things separate the candidate causes. Re-reading the register twice
+     * says whether the value is stable or is changing under us. The guest's own
+     * copy of PUT, which sub_001912EC writes to device+0x2C as a virtual
+     * address just before it writes the register, says whether the two agree.
+     * And the count of healthy base wraps says how normal this ring's wrapping
+     * has been up to that point. */
+    {
+        static uint32_t prev_now;
+        static unsigned long to_base, to_other;
+        if (prev_now && now < prev_now) {
+            if (g_pb_ring_lo && now == g_pb_ring_lo) {
+                ++to_base;
+            } else if (++to_other <= 8) {
+                uint32_t again = MEM32(0xFD800040u);
+                uint32_t again2 = MEM32(0xFD800040u);
+                uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
+                fprintf(stderr,
+                        "[PUSHER] PUT backwards to a non-base address #%lu:"
+                        " %08X -> %08X (cursor %08X ring %08X-%08X)"
+                        " re-read %08X/%08X guest-copy %08X;"
+                        " healthy base wraps so far %lu\n",
+                        to_other, prev_now, now, g_pb_last,
+                        g_pb_ring_lo, g_pb_ring_hi, again, again2,
+                        dev ? MEM32(dev + 0x2C) : 0, to_base);
+                fflush(stderr);
+            }
+        }
+        prev_now = now;
+    }
+
     /* A published cursor can split a packet. Advance only by the dwords
      * actually consumed, and follow the ring's jump instead of parsing its
      * unused tail as commands. Bounds come from the title's live device. */
@@ -215,8 +253,34 @@ static int jsrf_pb_poll(void)
         g_pb_hist[g_pb_hist_n & 15].stop = (uint32_t)result.stop;
         g_pb_hist[g_pb_hist_n & 15].consumed = result.consumed;
         g_pb_hist_n++;
+        /* END means the parser reached the end of the window, so it must have
+         * consumed all of it. A short END would silently skip the tail of the
+         * window and resume mid-packet next time, which is exactly the shape of
+         * the desync being hunted -- so check it rather than assume it. */
+        if (result.stop==NV2A_PUSHER_END
+                && result.consumed*4u != end - g_pb_last) {
+            static unsigned short_ends;
+            if (++short_ends <= 4)
+                fprintf(stderr,"[PUSHER] short END: window %08X-%08X is %u"
+                        " dwords, consumed %u\n",
+                        g_pb_last, end, (end-g_pb_last)/4u, result.consumed);
+            fflush(stderr);
+        }
         g_pb_last += result.consumed*4;
         if (result.stop==NV2A_PUSHER_CALL) {
+            /* A target has to be a plausible push-buffer address before the
+             * cursor follows it anywhere. Without this the parse, having
+             * already lost sync, read a data dword as a call to 0x00000004 and
+             * walked low guest memory until it hit the XBE header magic. The
+             * jump path has always checked its target; this is the same check,
+             * not a recovery. */
+            if (!result.jump_address || (result.jump_address & 3u)
+                    || result.jump_address >= 0x08000000u) {
+                fprintf(stderr,"[PUSHER] rejected CALL target %08X at %08X\n",
+                        result.jump_address, g_pb_last-4);
+                stream_fault=1;
+                break;
+            }
             /* Hardware saves DMA_GET as it stands after the call word, which
              * is exactly the cursor the parser has just left us. */
             if (g_pb_subr_active) {
