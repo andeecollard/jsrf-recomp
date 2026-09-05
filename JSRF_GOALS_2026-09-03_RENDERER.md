@@ -1,5 +1,11 @@
 # JSRF goals — renderer bring-up, 3 September 2026
 
+> Superseded, 4 September 2026. The active list is
+> `JSRF_GOALS_2026-09-04_AUDIO_STALL.md`. G13 and G5 were both organised around
+> the reading that the title waits for input; measurement shows it waits for the
+> ADX title BGM to buffer. Evidence:
+> `CLAUDE_HANDOVER_2026-09-04_STALL_FOUND.txt`. Kept for the history.
+
 Supersedes the goal list in `JSRF_GOALS_2026-09-03.md`, whose loading and
 startup goals are met. Evidence for the current state is in
 `CLAUDE_HANDOVER_2026-09-03_HEAP.txt` and the two commits after it.

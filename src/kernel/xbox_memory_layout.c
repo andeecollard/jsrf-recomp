@@ -77,6 +77,8 @@ static BOOL host_reservation_contains(uintptr_t target, size_t size)
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
+static BOOL g_separate_reserve_space = FALSE;
+static void reserve_reset(void);
 
 void xbox_SetTotalRam(size_t bytes)
 {
@@ -86,6 +88,19 @@ void xbox_SetTotalRam(size_t bytes)
 void xbox_SetMapSize(size_t bytes)
 {
     g_xbox_map_size = bytes;
+}
+
+void xbox_EnableSeparateReserveSpace(size_t bytes)
+{
+    if (bytes > UINT32_MAX - g_xbox_total_ram)
+        bytes = UINT32_MAX - g_xbox_total_ram;
+    g_xbox_map_size = g_xbox_total_ram + bytes;
+    g_separate_reserve_space = bytes != 0;
+}
+
+BOOL xbox_SeparateReserveSpaceEnabled(void)
+{
+    return g_separate_reserve_space;
 }
 
 /* File mapping handle for the Xbox memory region.
@@ -1419,6 +1434,20 @@ int xbox_Nv2aVblankPending(void)
  * observe the guest's write-1-to-clear acknowledge either. The raise is a
  * plain store; the acknowledge will not be seen, which is the same limitation
  * this file already documents for the MCPX registers. */
+static void mcpx_hw_store(uint32_t offset, uint32_t value)
+{
+    if (g_mcpx_regs)
+        *(volatile uint32_t *)((char *)g_mcpx_regs + offset) = value;
+}
+
+static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
+                            unsigned n)
+{
+    if (!g_mcpx_regs) return;
+    for (unsigned i = 0; i < n; ++i)
+        *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+}
+
 void xbox_Nv2aRaiseVblank(void)
 {
     if (!g_memory_offset) return;
@@ -1743,6 +1772,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
+#if !defined(_WIN32) && defined(__aarch64__)
                 if (g_mcpx_apu_guarded) {
                     uintptr_t pg = (uintptr_t)c
                                    & ~(uintptr_t)(g_mcpx_page_size - 1);
@@ -1755,7 +1785,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                        PAGE_READONLY, &op);
                     }
                     mcpx_unlock();
-                } else {
+                } else
+#endif
+                {
                     *c += 1;
                 }
             }
@@ -2906,11 +2938,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 #endif
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
             uint64_t guest_hi = guest_lo + g_memory_size;
+            uint64_t contig_lo = XBOX_CONTIG_BASE;
+            uint64_t contig_hi = contig_lo + XBOX_CONTIG_SIZE;
 
             if (guest_lo < tiled_hi && tiled_lo < guest_hi) {
                 fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
                                 " aperture at 0x%08X\n",
                         m + 1, (unsigned)XBOX_TILED_BASE);
+                continue;
+            }
+            /* With a map larger than 64 MB, the generic mirror sequence can
+             * reach 0x80000000. Mapping that view after the contiguous window
+             * silently replaces pinned memory and the fake kernel page. The
+             * architectural aperture wins over a generic wrap mirror, just as
+             * the tiled aperture does above. */
+            if (guest_lo < contig_hi && contig_lo < guest_hi) {
+                fprintf(stderr, "  Mirror %d: skipped, overlaps the contiguous"
+                                " aperture at 0x%08X\n",
+                        m + 1, (unsigned)XBOX_CONTIG_BASE);
                 continue;
             }
             g_mirror_views[m] = MapViewOfFileEx(
@@ -3102,10 +3147,11 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
     }
+    reserve_reset();
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 
-/* Bump allocator for pure address-space reservations, above RAM.
+/* Address-space allocator for pure reservations, above RAM.
  *
  * A MEM_RESERVE costs no memory on real hardware -- it takes address space out
  * of a 4 GB range, not pages out of the 64 MB the console has -- so titles
@@ -3122,28 +3168,124 @@ void xbox_MemoryLayoutShutdown(void)
  * Returns 0 when the mapping is no larger than RAM -- the default for titles
  * that never call xbox_SetMapSize -- which leaves the old behaviour untouched.
  *
- * ponytail: a bump allocator with no free. A reservation is address space, the
- * range is large, and a title that reserves and releases repeatedly would need
- * a real allocator; none has yet.
+ * Releases are tracked too. Treating an above-RAM release as an ordinary heap
+ * free made it a permanent leak and left the heap diagnostics claiming that a
+ * valid pointer had never been allocated.
  */
-static uint32_t g_reserve_next;
+#define XBOX_RESERVE_MAX_BLOCKS 128
+static struct {
+    uint32_t addr, size;
+    BOOL free;
+} g_reserve_blocks[XBOX_RESERVE_MAX_BLOCKS];
+static int g_reserve_block_count;
+
+static void reserve_reset(void)
+{
+    g_reserve_block_count = 0;
+}
+
+static void reserve_init(void)
+{
+    if (g_reserve_block_count || g_memory_size <= g_xbox_total_ram)
+        return;
+    g_reserve_blocks[0].addr = (uint32_t)g_xbox_total_ram;
+    g_reserve_blocks[0].size = (uint32_t)(g_memory_size - g_xbox_total_ram);
+    g_reserve_blocks[0].free = TRUE;
+    g_reserve_block_count = 1;
+}
 
 uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
 {
-    uint32_t base;
-
     if (g_memory_size <= g_xbox_total_ram || size == 0)
         return 0;
     if (!align)
         align = 4096;
-    if (!g_reserve_next)
-        g_reserve_next = (uint32_t)g_xbox_total_ram;
+    reserve_init();
 
-    base = (g_reserve_next + align - 1) & ~(align - 1);
-    if ((size_t)base + size > g_memory_size)
-        return 0;
-    g_reserve_next = base + size;
-    return base;
+    for (int i = 0; i < g_reserve_block_count; ++i) {
+        uint32_t start, lead, tail;
+        if (!g_reserve_blocks[i].free)
+            continue;
+        start = (g_reserve_blocks[i].addr + align - 1) & ~(align - 1);
+        if (start < g_reserve_blocks[i].addr)
+            continue;
+        lead = start - g_reserve_blocks[i].addr;
+        if (lead > g_reserve_blocks[i].size
+                || size > g_reserve_blocks[i].size - lead)
+            continue;
+        tail = g_reserve_blocks[i].size - lead - size;
+        if (g_reserve_block_count + (lead != 0) + (tail != 0)
+                > XBOX_RESERVE_MAX_BLOCKS)
+            continue;
+
+        if (lead) {
+            memmove(&g_reserve_blocks[i + 1], &g_reserve_blocks[i],
+                    (size_t)(g_reserve_block_count - i)
+                        * sizeof g_reserve_blocks[0]);
+            ++g_reserve_block_count;
+            g_reserve_blocks[i].size = lead;
+            ++i;
+            g_reserve_blocks[i].addr = start;
+            g_reserve_blocks[i].size -= lead;
+        }
+        if (tail) {
+            memmove(&g_reserve_blocks[i + 2], &g_reserve_blocks[i + 1],
+                    (size_t)(g_reserve_block_count - i - 1)
+                        * sizeof g_reserve_blocks[0]);
+            ++g_reserve_block_count;
+            g_reserve_blocks[i + 1].addr = start + size;
+            g_reserve_blocks[i + 1].size = tail;
+            g_reserve_blocks[i + 1].free = TRUE;
+        }
+        g_reserve_blocks[i].addr = start;
+        g_reserve_blocks[i].size = size;
+        g_reserve_blocks[i].free = FALSE;
+        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+        return start;
+    }
+    return 0;
+}
+
+BOOL xbox_ReserveFree(uint32_t address)
+{
+    reserve_init();
+    for (int i = 0; i < g_reserve_block_count; ++i) {
+        if (g_reserve_blocks[i].free || g_reserve_blocks[i].addr != address)
+            continue;
+        g_reserve_blocks[i].free = TRUE;
+        while (i + 1 < g_reserve_block_count && g_reserve_blocks[i + 1].free) {
+            g_reserve_blocks[i].size += g_reserve_blocks[i + 1].size;
+            memmove(&g_reserve_blocks[i + 1], &g_reserve_blocks[i + 2],
+                    (size_t)(g_reserve_block_count - i - 2)
+                        * sizeof g_reserve_blocks[0]);
+            --g_reserve_block_count;
+        }
+        if (i > 0 && g_reserve_blocks[i - 1].free) {
+            g_reserve_blocks[i - 1].size += g_reserve_blocks[i].size;
+            memmove(&g_reserve_blocks[i], &g_reserve_blocks[i + 1],
+                    (size_t)(g_reserve_block_count - i - 1)
+                        * sizeof g_reserve_blocks[0]);
+            --g_reserve_block_count;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL xbox_QueryReserveAddress(uint32_t address, uint32_t *base, uint32_t *size)
+{
+    reserve_init();
+    for (int i = 0; i < g_reserve_block_count; ++i) {
+        if (g_reserve_blocks[i].free
+                || address < g_reserve_blocks[i].addr
+                || (uint64_t)address >= (uint64_t)g_reserve_blocks[i].addr
+                                         + g_reserve_blocks[i].size)
+            continue;
+        if (base) *base = g_reserve_blocks[i].addr;
+        if (size) *size = g_reserve_blocks[i].size;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 BOOL xbox_IsXboxAddress(uintptr_t address)

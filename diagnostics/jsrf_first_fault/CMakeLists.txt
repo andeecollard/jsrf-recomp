@@ -127,6 +127,10 @@ add_test(NAME jsrf_pusher_stream COMMAND jsrf_pusher_stream_test)
 # This fails if a regeneration or a stray edit ever drops that.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME jsrf_adx_loop_flags
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_adx_loop_flags.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
     add_test(NAME jsrf_fcmov_backport
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_fcmov.py"

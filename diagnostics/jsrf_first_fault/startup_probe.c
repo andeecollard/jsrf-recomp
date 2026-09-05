@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <xbox/xboxrecomp.h>
 #include "recomp_types.h"
 extern void *xbox_GpuMemoryRange(uint32_t address, size_t bytes);
@@ -253,6 +257,143 @@ void jsrf_read_request_probe(uint32_t pc, uint32_t handle, uint32_t buffer,
     fflush(stderr);
 }
 
+/* Watch one CRI ring buffer's acquire/commit pair.
+ *
+ * The title screen waits on an ADX stream whose input ring buffer at
+ * 0x00277180 has its whole capacity acquired as a single write block that is
+ * never committed: +0x10 (what the writer may still take) falls from the full
+ * 0x000D0000 to zero, +0x0C (what the reader may take) never leaves zero, and
+ * both cursors stay at zero because a full-capacity acquire wraps them. The
+ * file data really is in the buffer -- a valid ADX header sits at 0x00C3DF80 --
+ * so the defect is the bookkeeping, not the read.
+ *
+ * Peeking cannot name the acquirer: the acquire and commit are vtable slots
+ * +0x18 and +0x1C, reached from several call sites through pointers, and the
+ * candidate owner tables run to 25 and 40 entries. The return address is the
+ * whole point of this probe -- it says which of them actually ran.
+ *
+ * Read-only: it reads the arguments the caller has already pushed and the
+ * object's own counters, and writes nothing to guest memory.
+ */
+void jsrf_ringbuf_probe(uint32_t pc, uint32_t object, uint32_t view,
+                        uint32_t arg)
+{
+    static int enabled = -1;
+    static uint32_t target;
+    static unsigned long calls;
+
+    /* One-shot diagnostic: stop at the first write to a suspect page once
+     * ADX starts consuming its payload. Never enabled in a normal run. */
+#if !defined(_WIN32)
+    static int guarded;
+    if (!guarded && pc == 0x13F9E0u && object == 0x277180u
+        && view == 1 && arg == 0x7FFFFFFFu) {
+        const char *spec = getenv("RECOMP_ADX_GUARD_PAGE");
+        if (spec) {
+            uint32_t va = (uint32_t)strtoul(spec, NULL, 0);
+            size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            void *ptr = xbox_GpuMemoryRange(va, page);
+            if (ptr && ((uintptr_t)ptr % page) == 0) {
+                guarded = 1;
+                fprintf(stderr, "[ADX-GUARD] protecting %08X size=%zu result=%d\n",
+                        va, page, mprotect(ptr, page, PROT_READ));
+            }
+        }
+    }
+#endif
+    if (enabled < 0) {
+        const char *spec = getenv("RECOMP_RINGBUF_TRACE");
+        enabled = spec != NULL;
+        /* Any other ring buffer of this class can be watched by naming it;
+         * the default is the ADX stream's input buffer. */
+        target = (spec && *spec) ? (uint32_t)strtoul(spec, NULL, 0) : 0x00277180u;
+        if (target < 0x1000u) target = 0x00277180u;
+    }
+    if (!enabled || object != target) return;
+
+    /* The interesting events are the first few and any that change the
+     * counters; a stream that works would otherwise flood the log. */
+    ++calls;
+    if (calls > 64 && calls % 500) return;
+    fprintf(stderr,
+            "[RINGBUF] call=%lu pc=%08X ret=%08X obj=%08X view=%u arg=%08X"
+            " filled=%08X free=%08X rd=%08X wr=%08X blksize=%08X\n",
+            calls, pc, read_word(g_esp), object, (unsigned)view, arg,
+            read_word(object + 0x0C), read_word(object + 0x10),
+            read_word(object + 0x14), read_word(object + 0x18),
+            arg ? read_word(arg + 4) : 0);
+    fflush(stderr);
+}
+
+/* The ADXF read server's entry, and the filter that decides to call it.
+ *
+ * sub_0013C070 acquires the ADX input ring buffer's entire capacity at
+ * 0x0013C1C3 exactly once and never commits it. Its caller sub_0013C290 only
+ * services a table entry while MEM8(f) == 1 and MEM8(f + 1) == 2, so the
+ * question is whether the entry stops matching that filter while still holding
+ * the block. Reading the three state bytes at the server's entry answers it:
+ * a server that is still being called every tick and bailing looks nothing
+ * like one that is never called again.
+ *
+ * Read-only. +0 and +1 are the filter bytes, +2 selects "issue a read" from
+ * "poll the read for completion".
+ */
+void jsrf_adxf_probe(uint32_t pc, uint32_t entry)
+{
+    static int enabled = -1;
+    static unsigned long calls;
+    static uint32_t last;
+    uint32_t word, handle, req, req_word;
+
+    if (enabled < 0) enabled = getenv("RECOMP_ADXF_TRACE") != NULL;
+    if (!enabled || !entry) return;
+
+    word = read_word(entry);
+    handle = read_word(entry + 8);
+    req = handle ? read_word(handle + 4) : 0;
+    req_word = req ? read_word(req) : 0;
+    ++calls;
+    /* Every state change, plus a heartbeat: the interesting run is the one
+     * where this stops being called at all, and a heartbeat is what tells
+     * "stopped" apart from "quiet". */
+    if (calls > 16 && word == last && calls % 2000) return;
+    last = word;
+    fprintf(stderr,
+            "[ADXF] call=%lu pc=%08X ret=%08X entry=%08X state=%02X/%02X/%02X"
+            " buf=%08X handle=%08X vt=%08X done_fn=%08X want=%08X"
+            " req=%08X req_status=%02X req_word=%08X"
+            " io_status=%08X io_info=%08X issue=%08X pending=%08X\n",
+            calls, pc, read_word(g_esp), entry,
+            word & 0xFF, (word >> 8) & 0xFF, (word >> 16) & 0xFF,
+            read_word(entry + 4), handle,
+            read_word(handle), read_word(read_word(handle) + 0x2C),
+            read_word(entry + 0x18), req, (req_word >> 8) & 0xFF, req_word,
+            read_word(req + 0x12C), read_word(req + 0x130),
+            read_word(req + 0x148), read_word(req + 0x14C));
+    fflush(stderr);
+}
+
+/* Trace the status-2 request server at the four points surrounding its native
+ * read and completion publication. Read-only and limited to one request. */
+void jsrf_wxci_request_probe(uint32_t pc, uint32_t req)
+{
+    static int enabled = -1;
+    static unsigned long calls;
+
+    if (enabled < 0) enabled = getenv("RECOMP_WXCI_REQUEST_TRACE") != NULL;
+    if (!enabled || req != 0x00273780u) return;
+
+    ++calls;
+    if (calls > 80 && calls % 1000) return;
+    fprintf(stderr,
+            "[WXCI-REQ] call=%lu pc=%08X req=%08X status=%02X"
+            " io_status=%08X io_info=%08X issue=%08X pending=%08X\n",
+            calls, pc, req, (read_word(req) >> 8) & 0xFF,
+            read_word(req + 0x12C), read_word(req + 0x130),
+            read_word(req + 0x148), read_word(req + 0x14C));
+    fflush(stderr);
+}
+
 void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site)
 {
     static unsigned char seen[1024];
@@ -271,8 +412,112 @@ void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site)
 }
 static uint32_t startup_root_object;
 
+void jsrf_adx_decode_probe(uint32_t pc, uint32_t stack)
+{
+    static unsigned calls;
+    if (!getenv("RECOMP_ADX_DECODE_TRACE") || calls++ >= 16) return;
+    fprintf(stderr, "[ADX-DECODE] pc=%08X esp=%08X args=", pc, stack);
+    for (unsigned i = 0; i < 9; ++i)
+        fprintf(stderr, "%s%08X", i ? "," : "", read_word(stack + i * 4));
+    fprintf(stderr, " output-ring=");
+    for (unsigned i = 0; i < 12; ++i)
+        fprintf(stderr, "%s%08X", i ? "," : "", read_word(0x2771B0u + i * 4));
+    fputc('\n', stderr);
+}
+
+/* Check the update call boundary even when the general ABI log has filled
+ * with unrelated compiler-private calling conventions. */
+static void update_call_probe(uint32_t pc)
+{
+    static _Thread_local struct {
+        uint32_t node, target, esp, ebx, edi;
+    } calls[128];
+    static _Thread_local unsigned depth;
+    static unsigned reports;
+    if (!getenv("RECOMP_TREE_TRACE")) return;
+    if (pc == 0x11083u) {
+        if (depth >= 128) abort();
+        calls[depth].node = g_esi;
+        calls[depth].target = read_word(read_word(g_esi) + 4);
+        calls[depth].esp = g_esp;
+        calls[depth].ebx = g_ebx;
+        calls[depth++].edi = g_edi;
+    } else if (depth) {
+        --depth;
+        if (reports < 8 && (calls[depth].node != g_esi || calls[depth].esp != g_esp
+            || calls[depth].ebx != g_ebx || calls[depth].edi != g_edi)) {
+            ++reports;
+            fprintf(stderr, "[UPDATE-ABI] target=%08X node=%08X->%08X esp=%08X->%08X"
+                    " ebx=%08X->%08X edi=%08X->%08X\n",
+                    calls[depth].target, calls[depth].node, g_esi,
+                    calls[depth].esp, g_esp, calls[depth].ebx, g_ebx,
+                    calls[depth].edi, g_edi);
+        }
+    }
+}
+
+typedef struct tree_event {
+    uint32_t pc, node, related, parent, child, next, flags, vtable, method;
+} tree_event_t;
+
+void jsrf_tree_probe(uint32_t pc, uint32_t node, uint32_t related)
+{
+    enum { HISTORY = 128 };
+    static tree_event_t history[HISTORY];
+    static unsigned cursor;
+    static int enabled = -1, dumped;
+    tree_event_t *event;
+    void *valid;
+
+    if (enabled < 0) enabled = getenv("RECOMP_TREE_TRACE") != NULL;
+    if (!enabled) return;
+    if (pc == 0x1108Au) update_call_probe(pc);
+
+    event = &history[cursor++ % HISTORY];
+    memset(event, 0, sizeof *event);
+    event->pc = pc;
+    event->node = node;
+    event->related = related;
+    valid = node ? xbox_GpuMemoryRange(node, 0x34) : NULL;
+    if (valid) {
+        event->flags = read_word(node + 4);
+        event->parent = read_word(node + 0x24);
+        event->child = read_word(node + 0x28);
+        event->next = read_word(node + 0x30);
+        event->vtable = read_word(node);
+        event->method = read_word(event->vtable + (pc == 0x11D63u ? 8 : 0));
+    }
+
+    /* 0x11D24 is immediately before the failing traversal consumes +0x28.
+     * Preserve the preceding link/unlink history once, while the valid parent
+     * is still readable. */
+    if (!dumped && ((pc == 0x11D63u && event->method == 0x177FE0u)
+                    || ((pc == 0x00011D24u || pc == 0x0001108Au)
+                     && related && !xbox_IsXboxAddress(related))
+                    || ((pc == 0x00011070u || pc == 0x00011B90u)
+                        && node && !xbox_IsXboxAddress(node)))) {
+        unsigned first = cursor > HISTORY ? cursor - HISTORY : 0;
+        dumped = 1;
+        fprintf(stderr,
+                "[TREE] corrupt traversal pc=%08X node=%08X related=%08X flags=%08X"
+                " owner=%08X next=%08X history=%u\n",
+                pc, node, related, event->flags, event->parent, event->next,
+                cursor - first);
+        for (unsigned n = first; n < cursor; ++n) {
+            tree_event_t *h = &history[n % HISTORY];
+            fprintf(stderr,
+                    "[TREE] #%u pc=%08X node=%08X related=%08X flags=%08X"
+                    " owner=%08X child=%08X next=%08X vt=%08X method=%08X\n",
+                    n + 1, h->pc, h->node, h->related, h->flags,
+                    h->parent, h->child, h->next, h->vtable, h->method);
+        }
+        fflush(stderr);
+    }
+}
+
 void jsrf_startup_probe(uint32_t pc,uint32_t object)
 {
+    if (pc == 0x11083u) update_call_probe(pc);
     static int enabled=-1;
     static unsigned ticks, opens, total;
     static uint32_t last_root[15];

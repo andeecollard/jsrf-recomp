@@ -577,18 +577,24 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── dec/inc: result-based, CF unchanged ──
     if flag_setter in ("dec", "inc"):
+        # MOV/LEA/POP may overwrite the destination before flags are consumed.
+        # JSRF's ADX loop reloads ECX with its input pointer after DEC ECX;
+        # testing live ECX made that sixteen-iteration loop run indefinitely.
         if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
+            return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+            return "(_fa != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return "(_fas < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return "(_fas >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
-            cast = "(int32_t)" + lhs
-            op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
-            return f"({cast} {op} 0)", desc
+            bits = (_operand_width(flag_ops[0]) or 4) * 8
+            overflow_result = (1 << (bits - 1)) - (flag_setter == "dec")
+            less = f"((_fas < 0) != (_fa == 0x{overflow_result:X}u))"
+            return {"jl": less, "jge": f"(!{less})",
+                    "jle": f"((_fa == 0) || {less})",
+                    "jg": f"((_fa != 0) && !{less})"}[jcc], desc
         return None
 
     # ── neg: flags from (0 - a_orig), result is -a ──
@@ -1560,9 +1566,14 @@ class Lifter:
         # For sub-registers (al, cl, etc.), use the SET macro instead of ++
         if ops[0].type == "reg" and ops[0].reg in (
                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"):
-            return [f"{val}{'++' if m == 'inc' else '--'};"]
+            out = [f"{val}{'++' if m == 'inc' else '--'};"]
         else:
-            return [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+            out = [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+        size = _operand_width(ops[0]) or 4
+        out.append(f"_fa = (uint32_t)({val}) & {self._SNAP_MASK[size]}; "
+                   f"_fas = (int32_t){self._SNAP_SX[size]}_fa;"
+                   f" /* {m} result snapshot; CF unchanged */")
+        return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):
         if len(ops) < 1:

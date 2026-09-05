@@ -1,0 +1,395 @@
+CLAUDE HANDOVER
+Jet Set Radio Future / upstream_xboxrecomp_clean
+4 September 2026
+
+Continues CLAUDE_HANDOVER_2026-09-04_STALL_ELIMINATION.txt, and answers its
+successor question.
+
+State: main at 2e39891, no new commits. No code was changed this session --
+this was measurement only. Working tree is exactly as that handover left it
+(the Windows-portability and OHCI work, still uncommitted).
+
+
+READ THIS FIRST
+===============
+
+The stall is found. It is not slowness, not the renderer, not I/O, not a
+deadlock. The title screen is waiting for the title BGM to buffer, and the CRI
+ADX stream never gets a single byte of title.adx.
+
+Every link below was measured in a running process. Nothing here is inferred
+from static reading alone. The previous handover's rule was followed and it
+paid: two of my intermediate readings were wrong and measurement caught both
+(see WRONG TURNS).
+
+
+THE HEADLINE: IT IS NOT SLOWNESS
+================================
+
+The previous handover left the 233x CPU-rasteriser slowdown as a suspect for
+"why a 90 s run sees so little". It is not.
+
+  Root per-frame service (sub_00013A80) tick rate, measured:
+    with the rasteriser     25,374 ticks in  66 s   (~620/s)
+    without the rasteriser 481,812 ticks in  94 s  (~5,100/s)
+
+Half a million iterations of the game's main loop, and the state machine does
+not advance one step. The title is stuck, not starved. The rasteriser is still
+a real performance defect, but it is not this.
+
+  (claude-tickrate-exec vs claude-tickrate-noexec)
+
+
+THE WAIT CHAIN, EACH LINK MEASURED
+==================================
+
+1. The title-screen object is global id 8 at 0x00E20870, vtable 0x001CAAF8,
+   update sub_0004EF90. That update is a 21-entry jump table at 0x001FA008
+   indexed by the object's +0x44.
+
+   Measured: +0x44 = 0x14 for the whole run. State 20, handler sub_0004F970.
+   It waits for global object id 2 to be destroyed, then tears down its own
+   subtree. The object is never marked dead (flags stay 0x00020000 across all
+   47 snapshots), so the wait never ends.
+
+2. Global object id 2 is 0x00E1C170, update sub_0007B8D0.
+
+   Measured: +0x48=0, +0x54=0, +0x58=1, identical in all 47 snapshots. That
+   path calls sub_001167F0() and requires it to return 2. It returns global
+   object id 5's +0xBC.
+
+3. Global object id 5 is 0x00C35CC0, update sub_00116E30 -- the ADX stream
+   manager. Four stream slots at +0x68..+0x74, current index at +0x78.
+
+   Measured: +0xBC went 0 -> 1 early and stuck at 1 for the rest of the run.
+   sub_00116C30 advances it to 2 only when sub_0013A9A0(stream, 0) >= 0x2000.
+
+4. sub_0013A9A0 reads stream->[0x18], calls its vtable +0x24 (sub_0013F9A0)
+   with 1, and halves the result. That returns the decoder's +0x0C.
+
+   Measured, decoder 0x002771B0:  +0x0C (filled) = 0
+                                  +0x10 (free)   = 0x4000
+                                  +0x20 (cap)    = 0x4000
+   The output ring buffer is completely empty. It needs 0x4000.
+
+5. The producer is alive. The CRI ADX server thread is sub_0013B1C0, created
+   at 0x0013B330 via CreateThread, and it loops
+   { BlockUntilVerticalBlank (sub_0018CE50); 0x0025EFAC++; call group-2 slot 0 }.
+
+   Measured: 0x0025EFAC ran 332 -> 2354 over the run (~30 Hz). Registration is
+   correct too: the ADXT_Init gate 0x0022DB20 == 1, and group-2 slot 0 at
+   0x00261638 holds 0x00141F10, the ADX server tick. It is being called ~2350
+   times and producing nothing.
+
+6. ADXT handle 0 at 0x0027D120 is stuck in PREP.
+
+   Measured: handle+1 = 1 (PREP). sub_0013D470 dispatches PREP to sub_0013CE30,
+   which requires the stream's own state byte to be 2.
+
+   The stream is 0x0027C720. Measured: stream+1 went 0 -> 1 and stopped at 1.
+   sub_0013BDF0 (the stream server) calls sub_0013B610 for state 1 every tick;
+   sub_0013B610 sets state 2 only after reading >= 0x10 bytes from the reader
+   at stream->[8].
+
+7. The reader is 0x00277180 -- the same ring-buffer class as the decoder,
+   index 0 of the three built by the constructor sub_0013FD60 at
+   0x277180 + n*0x30. Its buffer memory is 0x00C3DF80, capacity 0x000D0000
+   (851,968 bytes).
+
+   And here the earlier reading of this handover was WRONG. The bytes ARE
+   there. Measured at 0x00C3DF80:
+
+       80 00 00 20   ADX magic (sync 0x8000, copyright offset 0x20)
+       03 12 04 02   encoding 3, block size 0x12, 4-bit, 2 channels
+       00 00 AC 44   0xAC44 = 44100 Hz
+
+   a valid stereo 44.1 kHz ADX header, and the read log agrees:
+   "[READ] want=51200 got=51200 st=0x00000000 80 00 00 20".
+
+   What is broken is the BOOKKEEPING, and it is deterministic. Across three
+   independent runs the same thing happens at the same point (sample 5 -> 6 of
+   the periodic peek, roughly a third of the way into the boot), never to
+   change again:
+
+       +0x10 (bytes the WRITER may still take)   0x000D0000 -> 0
+       +0x0C (bytes the READER may take)         0        -> 0   (never moves)
+       +0x14, +0x18 (both cursors)               0        -> 0   (never move)
+       buffer memory at 0x00C3DF80               zero     -> ADX header
+
+   A full-capacity acquire is exactly what produces that: sub_0013F9E0's
+   view-0 path sets +0x14 = (0 + avail) % capacity, which wraps back to 0, and
+   +0x10 -= avail, which lands on 0.
+
+   So: the stream acquires the ENTIRE input ring buffer as one write block, the
+   file read delivers title.adx into it, and the commit that would publish
+   those bytes to the reader never happens. The writer has taken everything,
+   the reader can see nothing, and both counts sit at zero forever.
+
+   The commit is vtable slot +0x1C (sub_0013FBC0) called with view 0. It moves
+   the count into +0x0C. It is never reached for this buffer.
+
+
+WHAT THE SAMPLE SHOWS (and what it rules out)
+=============================================
+
+`sample <pid> 15` on a steady-state run. Four guest threads:
+
+  Thread A  sub_0013B1C0   the ADX server thread. 10,831 of 10,855 samples are
+                           inside sub_0018CE50, D3DDevice_BlockUntilVerticalBlank.
+                           22 samples do the actual ADX work. It is alive and
+                           vblank-paced -- but at ~30 Hz, not 60.
+  Thread B  sub_0013B2A0   the CRI worker. 10,853 of 10,855 samples parked in
+                           NtSuspendThread -> SuspendThread -> pthread_cond_wait.
+                           It suspends itself each iteration and thread A
+                           resumes it every vblank.
+  Thread C  sub_0013B180   `while (!exit) counter++`. CRI's idle/CPU-load
+                           measurement thread. By design -- but it burns a full
+                           core here, because guest thread priorities are not
+                           honoured. Worth its own goal; not the stall.
+  Thread D  sub_0013B230   the second vblank thread (group-2 slot 1, empty).
+
+The sample proves the entire pipeline executes every tick:
+  sub_0013B1C0 -> sub_00141E50 -> sub_00141F10 -> sub_0013A9E0
+     -> sub_0013DE40 (14/22 samples, the read pump; reaches sub_00140C30 ->
+        sub_00140BA0 -> the thread-sync primitives)
+     -> sub_0013BDF0 -> sub_0013B610 -> sub_0013F9E0   (the failing acquire)
+     -> sub_0013D690, sub_0013D470 -> sub_0013CE30     (the PREP handler)
+
+Ruled out by measurement this session, so do not spend time on them:
+
+  Suspend/Resume is NOT losing wakeups. The worker's own tick counter
+  0x0025EFB0 ran 321 -> 1588 in 70 s, in lockstep with thread A's 0x0025EFAC
+  (337 -> 1667). The handshake works. (claude-group5-01)
+
+  The ADX server registration is correct. Gate 0x0022DB20 == 1, and group-2
+  slot 0 at 0x00261638 holds 0x00141F10. sub_00141E50 is its caller and runs.
+
+  No unresolved indirect calls. Zero "[ICALL] Failed to resolve VA" lines in a
+  94 s run.
+
+  0x0013F900, the ring buffer's +0x28 "callback", is `eb fe` -- jmp to itself,
+  CRI's fatal-halt stub. It is correctly never called. (It IS an undetected
+  entry point -- the dispatch table skips 0x0013F8F0 -> 0x0013F910, and the
+  disassembler recorded "XREF: 0x0013F900 (jump), 0x0013FE1B (data_imm)", the
+  same shape as the 0x0013D840 hole recovered last session. Harmless, but real,
+  and recover_icall_entries.py would close it.)
+
+  The ADXF table at 0x27BD20 (40 entries of 0x40) is entirely zero, so
+  sub_0013C070 -- which holds both an acquire and the commits -- never runs for
+  this file. Whatever performed the acquire was something else.
+
+  Group 5 (0x00261698..) is empty, so thread B wakes 30 times a second,
+  dispatches nothing, and parks again.
+
+
+THE INSTRUMENT CLOSED IT: LINKS 8-11
+====================================
+
+G14's instrument was built and run (RECOMP_RINGBUF_TRACE, RECOMP_ADXF_TRACE,
+both in startup_probe.c via instrument_startup.py, both read-only and
+env-gated). It named the acquirer in three lines.
+
+8. The acquirer is sub_0013C070, the ADXF read server, at site 0x0013C1C3.
+
+     [RINGBUF] call=3 pc=0013F9E0 ret=0013C1C3 obj=00277180 view=0
+               arg=000D0000 filled=00000000 free=000D0000
+
+   It asks for 0x000D0000 -- the whole buffer -- ONCE, and there is never a
+   matching commit. Over a whole run the only ring-buffer traffic is:
+
+       34x  acquire view 1  from 0x0013B636   (sub_0013B610, header read)
+        1x  acquire view 0  from 0x0013C1C3   (sub_0013C070)   <-- the leak
+       31x  release view 1  from 0x0013B64F
+        0x  ANY view 0 commit
+
+   This corrects an earlier reading in this handover: sub_0013C070 does run.
+   The peek that said its table was empty was wrong (see WRONG TURNS).
+
+9. The ADXF entry is 0x0027BD20, and it is serviced every tick, forever:
+
+     [ADXF] entry=0027BD20 state=01/02/01 buf=00277180 handle=00261118
+            vt=0022DB98 done_fn=001405B0 want=000D0000
+
+   state bytes are (+0, +1, +2) = (1, 2, 1). Its caller sub_0013C290 services
+   an entry while +0 == 1 and +1 == 2, so the filter matches and the server is
+   called tens of thousands of times. +2 == 1 sends it down the completion-poll
+   path at loc_0013C088, not the issue-a-read path. It is not stuck because
+   nobody calls it; it is stuck because the poll never succeeds.
+
+10. The poll is sub_0013DE70(handle 0x00261118), which returns
+    handle->vtable[0x2C](handle->[4]). Measured: vtable 0x0022DB98, slot 0x2C =
+    **0x001405B0**. sub_0013C070 requires that to return 1.
+
+11. sub_001405B0 is three instructions of substance:
+
+        wxCiGetStat(req):
+            if (req == 0) { report via the 0x2615C4 hook; return 0; }
+            return (int8_t)req->[1];
+
+    So the whole title screen hangs on one byte: **the WXCI request status at
+    req+1 never becomes 1**, where req = MEM32(0x00261118 + 4).
+
+That is the end of the chain. Everything above it is healthy and provably
+running; everything below it is the WXCI/XB disc driver.
+
+
+WHERE TO GO NEXT
+================
+
+One byte: the WXCI request status at req+1 (req = MEM32(0x00261118 + 4)).
+sub_0013C070 polls it through sub_001405B0 and needs 1.
+
+The writers of that byte in the WXCI module are sub_001402F0, sub_00140380,
+sub_001403B0 (wxCiReqRd) and the four command variants sub_00140E60 /
+sub_00140F00 / sub_00140F90 / sub_00140FC0. Each writes the same 1 / 1 / 2
+pattern, so the question is which value the request is parked on and which
+transition is missing.
+
+Note the neighbourhood. sub_001403B0 is the function the 3 September session
+fixed the cross-block flag merge in -- "with the second je nailed not-taken
+every read request fell into E0109152:illegal seek position and returned zero".
+That fix is in and is why the read now delivers bytes at all. This is the next
+defect along the same path, and the WXCI error reporter (sub_00140190, already
+covered by RECOMP_WXCI_ERRORS) has twelve diagnostics about exactly this area.
+
+Do first, in this order, because each is cheap:
+
+  1. Run with RECOMP_WXCI_ERRORS=1 and RECOMP_ADXF_TRACE=1 together. The
+     driver has been describing its own failures all along; read them at the
+     moment the poll fails rather than guessing.
+  2. Extend jsrf_adxf_probe to print req = MEM32(handle + 4) and req->[1]
+     directly. One line then says which status the request is parked on.
+  3. Read the writer that owns that value and find what advances it. If it is
+     an interrupt- or DPC-driven completion, the missing piece is in our
+     kernel, not the guest.
+
+Do NOT re-open: the renderer, the heap, thread deadlock, the vblank
+acknowledge, the flag fallbacks, the root object's latch bank, the pushbuffer
+spin, tick rate, Suspend/Resume, or ADX server registration. All measured, all
+clear, all consistent with this chain.
+
+Two separate goals this session uncovered, neither of them the stall:
+  - sub_0013B180, CRI's idle counter thread, burns a full core because guest
+    thread priorities are not honoured.
+  - The ADX server thread is vblank-paced at ~30 Hz where hardware gives 60.
+
+
+WRONG TURNS, AND WHY
+====================
+
+Two, both caught by measurement before they reached a conclusion.
+
+1. "A[2] is already zero, so state 20 is not blocked." The peek that said zero
+   was sampled early in a run, before global object id 2 was registered. In the
+   steady state A[2] = 0x00E1C170. Fixed by measuring the disputed value and
+   the object's state in the SAME process rather than across two runs.
+
+2. "The jump-table targets have no labels, so the indirect tail jump fails."
+   They are not labels; each of the 21 targets is its own generated function,
+   all present in recomp_dispatch.c. Confirmed by measuring: zero
+   "[ICALL] Failed to resolve VA" lines in a full run.
+
+A fourth, and it cost two wrong statements in this document before the
+instrument caught it. I peeked the ADXF table at 0x0027BD20 and the file table
+at 0x00273780, saw zeros, and concluded that sub_0013C070 never runs. The probe
+then showed entry 0x0027BD20 live, at that exact address, tens of thousands of
+times. RECOMP_PEEK and the in-probe read_word DISAGREE about that region:
+peek_addresses uses xbox_GetMemoryOffset() + va, the probe uses
+xbox_GpuMemoryRange(va, 4). Nearby addresses (0x0027C720, 0x0027D120) peek
+correctly, so this is not a whole-region mapping failure and it is not
+explained yet.
+
+  Rule: a probe that reads at the moment the guest itself uses the value beats
+  a sampled peek. Where they disagree, believe the probe, and do not conclude
+  "this code never runs" from a peek alone -- prove it with a probe at its
+  entry, which costs one rebuild.
+
+A third near-miss worth recording: root+0x87E8 also holds 0x14, and it is
+tempting to read that as the same state index. It is not -- it is the count of
+live registered objects (sub_00012100 increments it per construction). It
+reaching 20 and stopping just means 20 objects are alive.
+
+
+STRUCTURE WORTH KEEPING
+=======================
+
+MEM32(0x0022FCE0) IS the root object at 0x005E3A70. They are the same object,
+and it is the global manager:
+
+  +0x98    7668 object pointers indexed by GLOBAL OBJECT ID.
+           sub_000128C0(i) reads (2802 call sites), sub_00012870 writes
+           (one caller: the base constructor sub_00012100), sub_00012890
+           reads-and-clears.
+  +0x7868  a second array, read by sub_000127E0(i).
+  +0x40/44/48/4C  four booleans selecting one of five game modes. All zero for
+           the whole boot, so mode 0 runs.
+  +0x87DC  scene-graph root (0x0060FF40).
+  +0x87E8  live registered-object count. NOT a state index.
+
+Every scene-graph node: +0x00 vtable, +0x04 flags (bit31 = dead, walker skips),
++0x08 ITS OWN GLOBAL ID, +0x28 first child, +0x30 next sibling.
+
+sub_000123E0 broadcasts one virtual method over the whole tree per mode, via
+five identical walkers (sub_00011070/112A0/114D0/11700/11930 -> vtable slots
+0x04/0x10/0x1C/0x28/0x34) and a second bank for the draw pass (slots
+0x08/0x14/0x20/0x2C/0x38). The vtable is five mode-groups of three slots,
+spaced 0x0C.
+
+The +8 field is what makes the whole registry legible: the existing
+RECOMP_STARTUP_TRACE [STARTUP-OBJECT] line already dumps 32 words per object, so
+word[2] names every live object's global id with no new instrument. The full map
+for a steady-state boot is in claude-tickrate-noexec/stderr.log.
+
+
+HOW TO MEASURE THIS CHEAPLY
+===========================
+
+Almost everything above came from instruments that already existed.
+
+  RECOMP_STARTUP_TRACE=1 RECOMP_STARTUP_STATE=1
+      [STARTUP] prints the root's fields every tick it changes, and a tick
+      counter every 2 s -- that is where the tick-rate numbers came from.
+      [STARTUP-STATE] object=... dumps ~32 fields of every live scene-graph
+      node every 2 s. Nodes 0x00E20870, 0x00E1C170 and 0x00C35CC0 were all
+      read straight out of it; no new code.
+
+  RECOMP_PEEK="0xA,0xB,..."       guest dwords, sampled by the pushbuffer
+                                  reporter. Budget ~22 addresses (256-char buf).
+  RECOMP_PEEK_CHAIN="0xA,0x18"    deref-and-offset, then prints the value at the
+                                  end. One run per chain instead of one per level.
+
+Reading the XBE directly is free and avoids a run entirely -- section table at
+0x11C/0x120, base 0x10000. That is how the 21-entry jump table at 0x001FA008
+and the decoder vtable at 0x0022DB38 were resolved.
+
+A run:
+  RECOMP_PB_EXEC=1 RECOMP_PEEK="..." \
+  RECOMP_HDD_ROOT="$PWD/build-macos/jsrf-first-fault/render-investigation/NAME-hdd" \
+  python3 diagnostics/jsrf_first_fault/run_bounded.py NAME --seconds 75
+
+Each run needs its own HDD (119 MB). Delete the -hdd afterwards; the stderr.log
+is the evidence and it is small.
+
+
+ARTIFACTS FROM THIS SESSION
+===========================
+
+Under build-macos/jsrf-first-fault/render-investigation/ (HDDs already deleted):
+
+  claude-mode-01           the four mode booleans, all zero
+  claude-tickrate-exec     620 ticks/s with the rasteriser
+  claude-tickrate-noexec   5,100 ticks/s without it; the full object/id map
+  claude-conflict-01       A[2] and the object state in one process
+  claude-svrthread-01      the ADX server thread tick counter, 332 -> 2354
+  claude-adxstm-01         the ADXT handle and stream state bytes
+  claude-reader-01         the empty 832 KB input ring buffer
+
+  (claude-loadslot-01, claude-obj5-01, claude-decoder-01, claude-svrtable-01
+   were intermediate and their logs are kept too.)
+
+
+VALIDATION
+==========
+
+No code changed, so nothing to revalidate. The build was current at session
+start and ctest was left untouched at 14/14 by 2e39891.

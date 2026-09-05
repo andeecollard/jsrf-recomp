@@ -66,9 +66,27 @@ int main(void)
     check(!xbox_EnablePhysicalHeapAlias(), "alias requires an initialised owned layout");
 #endif
     build_xbe();
+    xbox_EnableSeparateReserveSpace(32u * 1024u * 1024u);
     if (!xbox_MemoryLayoutInit(g_xbe, sizeof g_xbe)) {
         fprintf(stderr, "FAIL: memory layout would not initialise\n");
         return 1;
+    }
+
+    /* A pure virtual reservation lives above RAM and does not move the normal
+     * heap frontier. Its range is queryable and a release makes it reusable. */
+    {
+        uint32_t reserve, reserve2, query_base = 0, query_size = 0;
+        reserve = xbox_ReserveAlloc(0x3000, 4096);
+        check(reserve == XBOX_TOTAL_RAM, "separate reserve begins above RAM");
+        check(xbox_QueryReserveAddress(reserve + 0x1000,
+                                       &query_base, &query_size),
+              "reservation interior is queryable");
+        check(query_base == reserve && query_size == 0x3000,
+              "reservation query returns its full extent");
+        check(xbox_ReserveFree(reserve), "reservation release succeeds");
+        reserve2 = xbox_ReserveAlloc(0x3000, 4096);
+        check(reserve2 == reserve, "released reservation is reused");
+        check(xbox_ReserveFree(reserve2), "reused reservation releases");
     }
 
     /* A freed block comes back. This is the whole point: before the repair the

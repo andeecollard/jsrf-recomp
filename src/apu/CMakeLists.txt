@@ -34,7 +34,7 @@ if(MSVC)
 endif()
 
 if(WIN32)
-    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm)
+    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm ole32 xaudio2_8)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)

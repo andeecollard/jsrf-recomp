@@ -22,6 +22,22 @@ a = p.parse_args()
 # Each site reads registers only; the probe reads guest memory read-only.
 points = {
     'recomp_0000.c': {
+        # Scene-tree lifetime around the post-BGM crash. sub_00012020 links a
+        # freshly constructed node, sub_00011000 unlinks it, and the 0x11D24
+        # traversal reads the child pointer that is later found corrupted.
+        '00011000': ('jsrf_tree_probe', 'ecx, 0'),
+        '00011070': ('jsrf_tree_probe', 'ecx, 0'),
+        '00011077': ('jsrf_tree_probe', 'esi, 0'),
+        '0001108A': ('jsrf_tree_probe', 'esi, MEM32(esi + 0x28)'),
+        '00011096': ('jsrf_tree_probe', 'esi, MEM32(esi + 0x30)'),
+        '0001109D': ('jsrf_tree_probe', 'MEM32(esp), esp'),
+        '00011B90': ('jsrf_tree_probe', 'MEM32(esp + 4), ecx'),
+        '00011D24': ('jsrf_tree_probe', 'edi, MEM32(edi + 0x28)'),
+        '00011D63': ('jsrf_tree_probe', 'edi, 0'),
+        '00011D30': ('jsrf_tree_probe', 'esi, 0'),
+        '00011BB2': ('jsrf_tree_probe', 'esi, 0'),
+        '00012020': ('jsrf_tree_probe', 'ecx, MEM32(esp + 4)'),
+        '00012100': ('jsrf_tree_probe', 'ecx, MEM32(esp + 4)'),
         '00013A80': ('jsrf_startup_probe', 'ecx'),
         # These are the only small setters for the root object's transient
         # trigger fields.  Record who calls them and which object receives the
@@ -108,6 +124,7 @@ points = {
                      'MEM32(esp), MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
     },
     'recomp_0006.c': {
+        '00144F60': ('jsrf_adx_decode_probe', 'esp'),
         # Both exits of the cache index walk sub_00143540: 0x001435C4 returns
         # zero (miss) and 0x001435CC returns the matched entry in ebp. Five
         # registers are still pushed at each, so the query path is at esp+0x18.
@@ -134,6 +151,28 @@ points = {
         # Arguments are (arg, message) at [esp+4] and [esp+8].
         '00140190': ('jsrf_wxci_error_probe',
                      'MEM32(esp + 8), MEM32(esp + 4), MEM32(esp)'),
+        # The CRI ring-buffer class (vtable 0x0022DB38) acquire and commit.
+        # 0x0013F9E0 hands out a block from one of the two views and 0x0013FBC0
+        # gives it back; the ADX input buffer at 0x00277180 gets an acquire that
+        # covers its whole capacity and never a matching commit. Both are
+        # function entries, so the arguments are at esp+4 onward:
+        # (this, view, size) and (this, view, block).
+        '0013F9E0': ('jsrf_ringbuf_probe',
+                     'MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
+        '0013FBC0': ('jsrf_ringbuf_probe',
+                     'MEM32(esp + 4), MEM32(esp + 8), MEM32(esp + 0xC)'),
+        # The ADXF read server's entry. Its one argument is the table entry
+        # whose state bytes decide whether its caller keeps servicing it.
+        '0013C070': ('jsrf_adxf_probe', 'MEM32(esp + 4)'),
+        # Follow the WXCI request server around the status-2 completion path.
+        # The title's request is the first 0x150-byte entry at 0x00273780.
+        # Entry, return from issuing the native read, completion-flag poll,
+        # and the block that publishes status 1 are enough to distinguish a
+        # missing callback from a control-flow failure after that callback.
+        '00140BA0': ('jsrf_wxci_request_probe', 'MEM32(esp + 4)'),
+        '00140BDD': ('jsrf_wxci_request_probe', 'esi'),
+        '00140C05': ('jsrf_wxci_request_probe', 'esi'),
+        '00140C0F': ('jsrf_wxci_request_probe', 'esi'),
     },
     'recomp_0010.c': {
         # Root-hub connect path: entry, device-pool allocation result, and the

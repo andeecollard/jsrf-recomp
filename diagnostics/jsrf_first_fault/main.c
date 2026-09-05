@@ -690,10 +690,16 @@ static void ref_trace_enter(RefTraceState *state, const char *operation)
     state->object = object;
     state->before = object == JSRF_DUP_FREE_OBJECT ? MEM32(object + 8) : 0;
     state->sequence = ++g_ref_trace_sequence;
-    if (object >= 0xF0000000u) {
+    if (!xbox_IsXboxAddress(object)) {
         fprintf(stderr,
-                "REFCOUNT #%u %s invalid-object=0x%08X caller-return=0x%08X\n",
-                state->sequence, operation, object, MEM32(g_esp));
+                "REFCOUNT #%u %s invalid-object=0x%08X caller-return=0x%08X"
+                " ecx=0x%08X esi=0x%08X edi=0x%08X ebx=0x%08X"
+                " stack=%08X,%08X,%08X,%08X\n",
+                state->sequence, operation, object, MEM32(g_esp),
+                g_ecx, g_esi, g_edi, g_ebx,
+                MEM32(g_esp + 4), MEM32(g_esp + 8),
+                MEM32(g_esp + 12), MEM32(g_esp + 16));
+        fflush(stderr);
     }
     if (object == JSRF_DUP_FREE_OBJECT) {
         fprintf(stderr,
@@ -832,7 +838,7 @@ static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
     fprintf(stderr, "HOST SP: 0x%016llX\n",
             (unsigned long long)ep->ContextRecord->Rsp);
 #endif
-    fprintf(stderr, "TRANSLATED GUEST FUNCTION: sub_%08X\n",
+    fprintf(stderr, "LAST INSTRUMENTED GUEST FUNCTION (may have returned): sub_%08X\n",
             g_current_guest_function);
     fprintf(stderr,
             "GUEST REGISTERS: EAX=%08X ECX=%08X EDX=%08X EBX=%08X "
@@ -893,7 +899,7 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
     } else {
         fprintf(stderr, "HOST ADDRESS IS NOT A VALID MAPPED GUEST ADDRESS\n");
     }
-    fprintf(stderr, "TRANSLATED GUEST FUNCTION: sub_%08X\n", g_current_guest_function);
+    fprintf(stderr, "LAST INSTRUMENTED GUEST FUNCTION (may have returned): sub_%08X\n", g_current_guest_function);
     if (available) {
         uint32_t last = (count - 1u) & (GUEST_TRACE_SIZE - 1u);
         fprintf(stderr, "GUEST EIP/BLOCK: 0x%08X\n", g_guest_trace[last].block);
@@ -1090,6 +1096,10 @@ int main(int argc, char **argv)
             }
         }
     }
+    /* JSRF's guest heaps reserve 1+2+4+8 MB but currently commit only about
+     * 57% of it. Keep those virtual ranges outside the retail 64 MB physical
+     * arena while leaving ordinary and GPU-visible allocations capped there. */
+    xbox_EnableSeparateReserveSpace(64u * 1024u * 1024u);
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         fprintf(stderr, "xbox_MemoryLayoutInit failed\n");
         free(xbe_data);

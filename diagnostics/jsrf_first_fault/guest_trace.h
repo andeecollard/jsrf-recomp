@@ -28,6 +28,12 @@ void jsrf_vblank_ack_probe(uint32_t pc, uint32_t regs,
                            uint32_t written);
 void jsrf_read_request_probe(uint32_t pc, uint32_t handle,
                              uint32_t buffer, uint32_t sectors);
+void jsrf_ringbuf_probe(uint32_t pc, uint32_t object,
+                        uint32_t view, uint32_t arg);
+void jsrf_adxf_probe(uint32_t pc, uint32_t entry);
+void jsrf_wxci_request_probe(uint32_t pc, uint32_t request);
+void jsrf_tree_probe(uint32_t pc, uint32_t node, uint32_t related);
+void jsrf_adx_decode_probe(uint32_t pc, uint32_t stack);
 void jsrf_trace_block(uint32_t guest_block);
 void jsrf_unresolved_flag_probe(uint32_t guest_function, uint32_t site);
 void recomp_trace_enter(const char *name, uint32_t guest_function);

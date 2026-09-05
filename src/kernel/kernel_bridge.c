@@ -838,7 +838,19 @@ static void bridge_NtAllocateVirtualMemory(void)
      * described above. Say which one each call was, rate-limited, so the
      * question "is this title paying RAM for address space it never commits?"
      * can be answered from a log rather than guessed at. */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    uint32_t xbox_va = 0;
+    if ((alloc_type & 0x2000) && !(alloc_type & 0x1000)
+            && xbox_SeparateReserveSpaceEnabled()) {
+        xbox_va = xbox_ReserveAlloc(size, 4096);
+        if (xbox_va) {
+            fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: reserve of %u"
+                            " granted at 0x%08X outside physical RAM\n",
+                    size, xbox_va);
+            fflush(stderr);
+        }
+    }
+    if (!xbox_va)
+        xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.
@@ -929,6 +941,9 @@ static void bridge_NtQueryVirtualMemory(void)
     uint32_t base_va = STACK_ARG(0);
     uint32_t info_va = STACK_ARG(1);
     uint32_t page_base = base_va & ~0xFFFu;
+    uint32_t reserve_base = 0, reserve_size = 0;
+    BOOL is_reserve = xbox_QueryReserveAddress(page_base, &reserve_base,
+                                                &reserve_size);
 
     if (!info_va) {
         g_eax = 0xC000000Du;               /* STATUS_INVALID_PARAMETER */
@@ -941,8 +956,12 @@ static void bridge_NtQueryVirtualMemory(void)
     BRIDGE_MEM32(info_va + 0x14) = 0x04;               /* Protect */
     BRIDGE_MEM32(info_va + 0x18) = 0x20000;            /* MEM_PRIVATE */
 
-    if (page_base >= g_xbox_code_lo && page_base < XBOX_TOTAL_RAM) {
-        BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
+    if (is_reserve) {
+        BRIDGE_MEM32(info_va + 0x04) = reserve_base;       /* AllocationBase */
+        BRIDGE_MEM32(info_va + 0x0C) = reserve_base + reserve_size - page_base;
+        BRIDGE_MEM32(info_va + 0x10) = 0x1000;             /* MEM_COMMIT */
+    } else if (page_base >= g_xbox_code_lo && page_base < g_xbox_total_ram) {
+        BRIDGE_MEM32(info_va + 0x0C) = (uint32_t)g_xbox_total_ram - page_base;
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
         BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
@@ -986,7 +1005,8 @@ static void bridge_NtFreeVirtualMemory(void)
     }
 
     if (free_type & 0x8000u) {              /* MEM_RELEASE */
-        xbox_HeapFree(base_va);
+        if (!xbox_ReserveFree(base_va))
+            xbox_HeapFree(base_va);
         BRIDGE_MEM32(base_ptr) = 0;
     }
 
@@ -1406,13 +1426,20 @@ static int sched_trace_on(void);
 static int g_sched_wait_slot = -1;
 static unsigned long *g_sched_wait_woke, *g_sched_wait_timeout;
 static void sched_note(const char *what, uint32_t handle, uint32_t extra);
+static int bridge_deliver_pending_apcs(void);
 
 static void bridge_KeWaitForSingleObject(void)
 {
     uint32_t object      = STACK_ARG(0);
+    uint32_t alertable   = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     DWORD ms, deadline;
     int infinite;
+
+    if (alertable && bridge_deliver_pending_apcs()) {
+        g_eax = 0x000000C0u;   /* STATUS_USER_APC */
+        return;
+    }
 
     if (!object) {
         g_eax = 0;   /* STATUS_SUCCESS */
@@ -1492,6 +1519,11 @@ static void bridge_NtWaitForSingleObject(void)
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
+    if (alertable && bridge_deliver_pending_apcs()) {
+        g_eax = 0x000000C0u;   /* STATUS_USER_APC */
+        return;
+    }
+
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
 }
@@ -1546,6 +1578,11 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
 
+    if (alertable && bridge_deliver_pending_apcs()) {
+        g_eax = 0x000000C0u;   /* STATUS_USER_APC */
+        return;
+    }
+
     static int logged = 0;
     if (logged++ < 20) {
         fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
@@ -1587,6 +1624,11 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
+
+    if (alertable && bridge_deliver_pending_apcs()) {
+        g_eax = 0x000000C0u;   /* STATUS_USER_APC */
+        return;
+    }
 
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
@@ -1681,6 +1723,10 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
+    if (alertable && bridge_deliver_pending_apcs()) {
+        g_eax = 0x000000C0u;   /* STATUS_USER_APC */
+        return;
+    }
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -3143,18 +3189,31 @@ static void bridge_NtOpenFile(void)
  * cache-partition setup does exactly that, gives up after its 5-second SleepEx,
  * and asserts "setup for new cache file failed (#0)".
  *
- * ponytail: the APC runs inline here rather than at the next alertable wait.
- * The data really is ready by then, so the observable result matches; a title
- * that depends on the APC *not* having run yet would notice. A per-thread
- * deferred queue drained at alertable waits was tried for Halo's map streamer
- * and made no difference (it still issues one 14 KB batch and stops), so it was
- * dropped rather than risk changing this shared path for the other titles.
+ * The native backends complete synchronously, but the APC must not run inline.
+ * Xbox software can inspect its in-flight flag immediately after NtReadFile
+ * returns and only publish completion after an alertable wait dispatches the
+ * APC. JSRF's WXCI reader does exactly that: inline delivery clears the flag
+ * too early, sends the request server down its early-exit branch, and leaves
+ * the request status at 2 forever even though all bytes arrived.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+
+typedef struct bridge_pending_apc {
+    uint32_t routine;
+    uint32_t context;
+    uint32_t iostatus;
+} bridge_pending_apc_t;
+
+#define BRIDGE_PENDING_APC_MAX 256u
+static RECOMP_TLS bridge_pending_apc_t
+    s_pending_apcs[BRIDGE_PENDING_APC_MAX];
+static RECOMP_TLS unsigned s_pending_apc_head;
+static RECOMP_TLS unsigned s_pending_apc_count;
 
 static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                             uint32_t iostatus)
 {
+    uint32_t caller_esp = g_esp;
     /* The APC can be game code or a kernel export. Halo's XAPI passes the
      * latter -- 0xFE0000FC, one of our own synthetic thunk VAs -- so the recomp
      * dispatch correctly fails to find it and the kernel fallback is the one
@@ -3169,7 +3228,11 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
         fn();
-        g_esp += 12;
+        /* A normal guest APC ends in ret 12 and restores this itself. Keep the
+         * bridge boundary exact even for a manual override with a mismatched
+         * declaration: the synthetic callback frame must never leak into the
+         * interrupted alertable wait. */
+        g_esp = caller_esp;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
@@ -3179,6 +3242,47 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                 " (kernel ordinal %u)\n", apc_routine, ord);
         fflush(stderr);
     }
+}
+
+static void bridge_queue_file_apc(uint32_t routine, uint32_t context,
+                                  uint32_t iostatus)
+{
+    unsigned tail;
+
+    if (s_pending_apc_count == BRIDGE_PENDING_APC_MAX) {
+        /* Losing an I/O completion deadlocks its owner. This should never be
+         * reachable with synchronous host I/O, but inline delivery is the
+         * only recoverable fallback if a title queues hundreds without an
+         * alertable wait. */
+        fprintf(stderr, "  [KERNEL] file I/O APC queue full; delivering inline\n");
+        fflush(stderr);
+        deliver_one_apc(routine, context, iostatus);
+        return;
+    }
+
+    tail = (s_pending_apc_head + s_pending_apc_count) %
+           BRIDGE_PENDING_APC_MAX;
+    s_pending_apcs[tail].routine = routine;
+    s_pending_apcs[tail].context = context;
+    s_pending_apcs[tail].iostatus = iostatus;
+    ++s_pending_apc_count;
+}
+
+/* Deliver every APC already queued for this guest thread. Removing an item
+ * before invoking guest code makes re-entrant file I/O safe. */
+static int bridge_deliver_pending_apcs(void)
+{
+    int delivered = 0;
+
+    while (s_pending_apc_count) {
+        bridge_pending_apc_t apc = s_pending_apcs[s_pending_apc_head];
+        s_pending_apc_head = (s_pending_apc_head + 1) %
+                             BRIDGE_PENDING_APC_MAX;
+        --s_pending_apc_count;
+        deliver_one_apc(apc.routine, apc.context, apc.iostatus);
+        ++delivered;
+    }
+    return delivered;
 }
 
 /* Per-thread pending-APC ring. An APC is delivered on the thread that issued
@@ -3191,7 +3295,7 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         if (ev) SetEvent(ev);
     }
     if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
+        bridge_queue_file_apc(apc_routine, apc_context, iostatus);
     }
 }
 

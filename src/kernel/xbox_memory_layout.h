@@ -78,10 +78,20 @@ extern size_t g_xbox_total_ram;
 extern size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
 
+/* Give pure MEM_RESERVE calls a distinct virtual-address arena above RAM.
+ * `bytes` is the size of that arena, not the total mapping. Ordinary heap and
+ * physical allocations remain capped at g_xbox_total_ram. This is opt-in
+ * because older users of xbox_SetMapSize intentionally let the heap consume
+ * the enlarged mapping. Call before xbox_MemoryLayoutInit(). */
+void xbox_EnableSeparateReserveSpace(size_t bytes);
+BOOL xbox_SeparateReserveSpaceEnabled(void);
+
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
  * See the implementation for why reservations must not come from the heap. */
 uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
+BOOL xbox_ReserveFree(uint32_t address);
+BOOL xbox_QueryReserveAddress(uint32_t address, uint32_t *base, uint32_t *size);
 
 /* Bounds of the guest's executable sections, derived from the XBE at load.
  *
@@ -450,8 +460,10 @@ extern uint32_t g_xbox_low_base;
  * Letting the ordinary heap serve the whole mapped range keeps every
  * allocation inside one allocator the guest already understands.
  */
-#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_map_size ? g_xbox_map_size \
-                                                        : g_xbox_total_ram))
+#define XBOX_HEAP_TOP       ((uint32_t)(xbox_SeparateReserveSpaceEnabled() \
+                                      ? g_xbox_total_ram \
+                                      : (g_xbox_map_size ? g_xbox_map_size \
+                                                         : g_xbox_total_ram)))
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */

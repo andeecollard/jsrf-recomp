@@ -36,9 +36,13 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
+/* Processor modes.  These generic names collide with fields in the Windows
+ * SDK when the runtime is cross-compiled with MinGW; no runtime code uses the
+ * names on Windows. */
+#if !defined(_WIN32)
 #define KernelMode  0
 #define UserMode    1
+#endif
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
