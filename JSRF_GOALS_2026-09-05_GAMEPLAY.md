@@ -235,38 +235,41 @@ while the viewport the title programs is textbook for 640x480:
 So the viewport methods are being received correctly and the defect is in what
 the title's own geometry is multiplied by, not in the viewport.
 
-### 3a. The 4x scale on vertex-program output (active)
+### 3a. CLOSED. The title screen renders correctly
 
-The startup screens are pre-transformed screen-space quads and are correct, so
-nothing general is wrong. The title screen runs a vertex program whose oPos
-comes out at 2560x1920 -- exactly four times 640x480 -- and nv2a_pb_exec
-deliberately applies no further transform, on the documented assumption that
-"NV2A programs include the viewport transform and perspective division".
+There is no scale defect. Frame f035 of the composed-frame capture is JSRF's
+title screen: the logo and character graphic, "JSRF" and "JET SET RADIO
+FUTURE(TM)" beneath it, correctly scaled, centred and legible.
 
-The viewport side is measured and correct, so the question is what the title's
-geometry is transformed by. The constants sampled so far are the blit
-program's, not the title screen's:
+Three readings of mine were withdrawn getting here, and the pattern in all
+three was inferring from a fragment:
 
-    [VSH] late batch c0..c7: [1 1 1.67772e+07 1] [0.53125 0.53125 0 0]
-                             [0 0 0 0] x6
+- oPos = (0,0), (2560,0), (0,1920) is the startup blit's oversized covering
+  triangle, a standard technique, and appears in frames that are pixel-correct;
+- the viewport the title programs is textbook -- scale 320/-240, offset
+  320.531/240.531 -- so nothing needed compensating there;
+- the "oversized" frames f008 and f039 were captured mid-composition, showing
+  individual UI elements before the rest of the frame was drawn. Sampling a
+  drawing batch is not the same as sampling a finished frame.
 
-A scale of 1 with a 0.53125 subpixel bias, which is the blit. The title's own
-program has to be sampled at a batch that draws it -- 225,155 batches execute
-in a run and RECOMP_VSH_SAMPLE was set to 8,000. Sample late, and read the
-constants and oPos together for a batch whose output is the geometry actually
-seen on screen.
+The title's own geometry transforms to sensible screen coordinates:
+oPos = (365.7, 192.9, 1.673e7, w=221.0) for a 16-slot program, well inside
+640x480.
 
-Do not scale oPos to compensate. Whichever side is four times the other is the
-defect; correcting the other end would hide it and break the screens that
-already render correctly.
+**`[FB] nonzero=0/153600` was never about the renderer.** The probe samples
+0x0071E000; the executor draws into 0x005F0000. Point the probe at the render
+target, or follow the flip, before reading anything into it again.
 
-**Acceptance:** the title screen at the same scale as the anti-graffiti screen,
-with the startup screens unchanged.
+### 3b. Continuous display (active)
 
-Measure actual frame completion and presentation, inspect the displayed image,
-and establish continued visual updates through startup and the next scene.
-Triangle counts alone do not satisfy this milestone. Diagnose presentation,
-notification, and rendering defects separately using captured evidence.
+What is demonstrated is that correct frames are composed. What is not is that
+they are presented continuously and visibly. Measure frame completion at the
+flip rather than at a drawing batch, confirm the presented image updates
+through startup and into the title screen, and fix the [FB] probe's address so
+it reports the surface actually being drawn.
+
+**Acceptance:** a sequence of captured frames showing the title screen present
+and update, not a single frame.
 
 ## 4. Verify controls and reach gameplay
 
