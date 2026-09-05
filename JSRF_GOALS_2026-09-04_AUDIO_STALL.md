@@ -1,5 +1,9 @@
 # JSRF goals — the loading stall is the audio path, 4 September 2026
 
+> **Superseded by `JSRF_GOALS_2026-09-05_PUSHBUFFER_RATE.md`.** Kept as the
+> record of how the audio stall, the empty-list guard and the render
+> frontier were found. G14, G15, G19 and G20 are closed here.
+
 Supersedes the active goals in `JSRF_GOALS_2026-09-03_RENDERER.md`. Evidence is
 in `CLAUDE_HANDOVER_2026-09-04_STALL_FOUND.txt`; every claim below was measured
 in a running process, not read out of the disassembly.
