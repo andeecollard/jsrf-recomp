@@ -96,6 +96,55 @@ helpers the lift emits — was not in the PRs and was added on integration.)*
   every direct caller. Now direct calls and both tail-jump forms route through
   the manual set that `--manual-functions` and `--exclude-manual` already build.
 
+*Flags, vertex layout and audio (#22, #23, #24)*
+- **`xor reg, reg` zeroed the register without clearing the carry flag** — the
+  lifter emitted the zeroing and nothing else, so `_cf` still held whatever the
+  previous instruction left and a following `adc`/`sbb` borrowed a carry the
+  hardware had already cleared. Shipped with five conformance cases covering
+  byte, high-byte, word and dword zeroing into both `adc` and `sbb`.
+- **The FVF position field was tested as bits (#23)** — `fvf & D3DFVF_XYZRHW`
+  is a bit test against an *encoded* field, so `D3DFVF_XYZB1` (0x006) tested as
+  transformed and took the untransformed path's opposite branch. The attribute
+  offset had the matching bug: it assumed 3 or 4 floats and stepped over blend
+  weights and normals as if they were not there. Both now come from the
+  position field's own value.
+- **DirectSound cursors and the mixer disagreed (#24)** — buffers kept a
+  `play_cursor` and `status` of their own while the mixer advanced and stopped
+  independently, so `SetCurrentPosition` did not seek, `Play` discarded the
+  position it was given, and the getters were stale after rendering. The
+  fixed-point source position was also too narrow and overflowed past 65,535
+  frames. The regression is the notable part: it compiles the real mixer out of
+  `apu_core.c` against the real `dsound_device.c` rather than a copy of either,
+  so it cannot drift from what actually runs.
+
+*Depth/stencil, A8 and audio (#29, #30, #31)*
+- **The depth/stencil state cache keyed on a partial XOR hash (#29)** — it left
+  out `STENCILWRITEMASK`, `STENCILFAIL`, `STENCILZFAIL` and `STENCILPASS`, so
+  changing one of those alone reused a stale D3D11 state object, and being an
+  XOR it could also cancel: moving the stencil reference 0 to 16 while the read
+  mask went 0xFF to 0xFE produced the same key. It compares the whole
+  zero-initialised descriptor now, keeps the stencil reference separate because
+  that is passed to `OMSetDepthStencilState` rather than stored in the
+  descriptor, and only updates the cached copy after the state object is
+  actually created.
+- **Xbox A8 sampled with zero RGB instead of white (#30)** — an alpha-only
+  texture is `(1, 1, 1, alpha)`, so every fixed-function and register-combiner
+  path drew A8 content black. Carried as one alpha-only flag per texture stage,
+  restoring white RGB after the sample without touching alpha. The same PR found
+  that a successful programmable vertex-shader setup skipped the fixed-function
+  pixel-state refresh, so a texture change could leave the previous draw's pixel
+  shader, constants and stale A8 metadata bound; all four draw entry points go
+  through one prepare step now. Shipped with a 336-draw WARP regression that
+  reads pixels back, across 2D/cube/volume, mip 1, all four stages and both
+  pixel paths.
+- **XAudio2 failures were reported as success (#31)** — `Start` and
+  `SubmitSourceBuffer` results went unchecked, so a backend that could not start
+  reported itself active, and a rejected buffer still advanced the ring and the
+  accepted-frame count, which eventually reuses storage that is still queued for
+  playback. Also balances `CoInitializeEx` when initialisation then fails on
+  that thread, without uninitialising on `RPC_E_CHANGED_MODE`, and makes repeat
+  initialisation idempotent and repeat shutdown safe after a partial one.
+
 *Also raised: stored code pointers (#13).* The gap is real and was found
 independently while bringing up Half-Life 2 -- functions reachable only as an
 address in a table have no call site, no prologue and no padding boundary, so
@@ -113,6 +162,55 @@ direction.
   hints and frame shape, so the generated signatures are real.
 - Also **diagnosed the tail of issue #2**, narrowing it from "recomp crashes"
   to the specific missing tool, and posted a workaround before the PR.
+- **D3D8 texture translation (#17)** — 4,096 lines across the D3D8 layer, and
+  the largest single contribution to it so far. All 66 Xbox `D3DFMT_*` formats
+  mapped to DXGI (33 swizzled, 20 linear, plus the float/16-bit-pair/10-bit and
+  DXN/DXT3A/DXT5A/CTX1 extended set), cube textures as a D3D11 `Texture2DArray`
+  with full mip chains and per-face unswizzle, volume textures as `Texture3D`
+  with 3D Z-order unswizzle, and the software channel conversions for the
+  formats whose memory layout does not map straight onto a DXGI equivalent.
+  Shipped with `tests/d3d8_smoke`, which compiles the real `d3d8_resources.c`
+  against stub device accessors so the format tables, swizzle classification
+  and conversions are checkable with no D3D11 device — which is what made a
+  change this size reviewable at all. `docs/technical/gap-analysis.md` marks
+  the approximate maps that still want in-game validation rather than claiming
+  them.
+- **Kernel ordinal routing (#25)** — 20 more routes (SMBus, PCI config space,
+  IRQL, EEPROM save, semaphores, FP-state save/restore, `KeWaitForMultiple-
+  Objects`, and the rest), and more valuably the memory-model corrections
+  behind them: the allocator bridges now answer from the *guest* heap instead
+  of handing back a 64-bit host pointer for the title to truncate to four
+  bytes and dereference, `RtlInitUnicodeString` and `ObReferenceObjectByName`
+  write 4-byte guest fields rather than host-width ones, and a 64-bit return is
+  split across `g_eax`/`g_edx`. That took the image from 150 to 170 of 371
+  ordinals routed. It also closed every ordinal Half-Life 2 was hitting
+  unbridged at runtime — `AvGetSavedDataAddress`, `HalReadWritePCISpace`,
+  `MmFreeSystemMemory` and `ObfDereferenceObject` — which now log none.
+- The same PR **took Burnout 3 out of the tooling** — hardcoded title strings
+  in the parser, disassembler, func_id and translator replaced with a shared
+  config, and the Linux default paths made generic.
+
+### dplewis — [@dplewis](https://github.com/dplewis)
+- **`ReleaseMutex` reported success for a release it did not perform (#18)** —
+  the POSIX shim returned `TRUE` unconditionally, so a thread releasing a mutex
+  it did not own got success, and `xbox_NtReleaseMutant` passed
+  `STATUS_SUCCESS` back to the guest for a release that did nothing. The guest
+  then carried on believing the mutex was free while it was still held. Found
+  by reading for a missing `ERROR_NOT_OWNER`, which turned out to be the
+  smaller half of the problem. Also set `ERROR_INVALID_HANDLE` on the
+  bad-handle path, which had been a bare `FALSE` with no error set.
+- **Built the macOS path he had scoped (#20)** — the Darwin half of
+  `win32_compat`, `mach/mach.h` for the memory queries with no
+  `GlobalMemoryStatusEx`, and honest `TODO`s where the platform has no
+  equivalent rather than a silently wrong one: macOS has no
+  `MAP_FIXED_NOREPLACE`, and plain `MAP_FIXED` would unmap whatever already
+  lives at the address instead of failing, so the note names `mach_vm_map` with
+  `VM_FLAGS_FIXED` as the way through. Also replaced `wcslen` with the
+  project's own `xbox_wcslen`, which is the one functional change: the CRT's
+  operates on 32-bit `wchar_t` and the Xbox `WCHAR` is 16-bit.
+- **Scoped the macOS port (#19)** — an accurate, specific list of what stands
+  in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
+  SDL2/epoxy) rather than a request, which is the useful kind of issue.
 
 ---
 
@@ -127,6 +225,14 @@ direction.
   That single issue is the origin of the pipeline fix in `21488f4` — and of the
   repository having a LICENSE file at all, which the README had claimed for
   months without one actually existing.
+
+### SpringierTrain — [@SpringierTrain](https://github.com/SpringierTrain)
+- **Asked whether Half-Life 2 could be ported (#12).** It could, and the asking
+  is what started it. HL2 is now the toolkit's largest target and its most
+  productive one: the carry-flag, `bt`/`bts`, `rep movs`, atomics, per-thread
+  TIB, function-boundary and SSE-compare fixes all came out of making that one
+  title load a level, and every one of them is in the shared toolkit rather
+  than the title.
 
 ### M0RSM4LLEO — [@M0RSM4LLEO](https://github.com/M0RSM4LLEO)
 - **Reproduced and pinned down the getting-started failures (#2)** with the

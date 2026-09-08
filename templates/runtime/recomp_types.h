@@ -185,8 +185,13 @@ extern RECOMP_TLS int g_fp_top;
 /* Linear base of the fs segment: where the fake TIB lives. Generated code
  * adds this to every fs-relative address, so page zero stays unmapped and a
  * null dereference faults instead of hitting the TIB. Must match
- * XBOX_FS_BASE in src/kernel/xbox_memory_layout.h. */
-#define XBOX_FS_BASE 0x00001000u
+ * XBOX_FS_BASE in src/kernel/xbox_memory_layout.h.
+ *
+ * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
+ * reaches the CRT's per-thread data, so a single shared base makes every
+ * guest thread the same thread as far as the CRT is concerned. */
+extern RECOMP_TLS uint32_t g_fs_base;
+#define XBOX_FS_BASE g_fs_base
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
 
@@ -205,6 +210,28 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * for a buffer that has no native counterpart, leaving the caller to fall back
  * to the guest's own longjmp.
  */
+/* Atomic read-modify-write, for the lock-prefixed instructions.
+ *
+ * "lock xadd" and "lock cmpxchg" are what InterlockedIncrement and
+ * InterlockedCompareExchange compile to, so they carry a title's reference
+ * counts and its lock-free lists. They used to lift to a TODO comment, which
+ * meant a refcount that never moved and a compare-and-swap that never swapped
+ * -- harmless while every guest thread ran synchronously, and not once the
+ * runtime began spawning real ones.
+ *
+ * Genuinely atomic, not merely correct in isolation: the guest's own threads
+ * now run on real host threads, so a read-modify-write that races is exactly
+ * the bug these instructions exist to prevent.
+ */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#else
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#endif
+
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
@@ -290,6 +317,15 @@ void recomp_icall_not_code_log(uint32_t va);
  * init calls does it not come back from", and answering that by
  * overriding a function loses the body you were trying to observe.
  */
+/* The guest's time source.
+ *
+ * Xbox's QueryPerformanceCounter is a bare rdtsc and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant, so the guest
+ * divides this by 733,333,333 to get seconds. Returning the host TSC would
+ * make that division wrong by the ratio of the two clocks; the runtime scales
+ * to the console's rate instead. */
+uint64_t xbox_ReadTimeStampCounter(void);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);

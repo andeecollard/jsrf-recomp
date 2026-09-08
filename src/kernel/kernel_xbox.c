@@ -19,7 +19,9 @@
  * Game code accesses them directly via the thunk table.
  * ============================================================================ */
 
-/* Hardware info - report a standard 1.0 retail Xbox */
+/* Hardware info - default report is a standard retail Xbox.
+ * A target may override via xbox_kernel_set_version() or by patching the
+ * global directly; no title-specific values are baked in. */
 XBOX_HARDWARE_INFO xbox_HardwareInfo = {
     .Flags       = 0x00000020,  /* Retail Xbox */
     .GpuRevision = 0xD2,       /* NV2A D2 revision */
@@ -27,13 +29,24 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
     .Reserved    = {0, 0}
 };
 
-/* Kernel version - match XDK 5849 (the version Burnout 3 was built against) */
+/* Kernel version - default is a stock retail value. Titles built against a
+ * different XDK can report their own through xbox_kernel_set_version(). */
 XBOX_KRNL_VERSION xbox_KrnlVersion = {
     .Major = 1,
     .Minor = 0,
     .Build = 5849,
     .Qfe   = 1
 };
+
+/* Override the kernel version reported to game code (ordinal 324).
+ * Match the XDK revision the target title was built with if it checks it. */
+void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe)
+{
+    xbox_KrnlVersion.Major = major;
+    xbox_KrnlVersion.Minor = minor;
+    xbox_KrnlVersion.Build = build;
+    xbox_KrnlVersion.Qfe   = qfe;
+}
 
 /* Crypto keys - zeroed, not needed for PC operation.
  * These are unique per-console on real hardware. */

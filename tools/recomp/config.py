@@ -71,6 +71,35 @@ ENTRY_POINT = 0x00052A81
 
 _configured_from: Optional[str] = None
 
+# Display name used in generated-code banners. Title-agnostic default; set it
+# to match the game being recompiled via --game-name (see tools.recomp __main__)
+# or set_game_name().
+GAME_NAME = "Xbox Game"
+_game_name_explicit = False
+
+
+def set_game_name(name: str) -> None:
+    """Set the display name stamped into generated code banners."""
+    global GAME_NAME, _game_name_explicit
+    if name:
+        GAME_NAME = name
+        _game_name_explicit = True
+
+
+def banner_name(title: Optional[str] = None) -> str:
+    """The name to stamp into a generated-code banner.
+
+    Two mechanisms arrived at this from different directions and both are
+    worth keeping: --game-name (an explicit override, from #17) and the title
+    read out of the XBE header (automatic, and cannot go stale). The header
+    wins over the default because it is right without anyone remembering a
+    flag; the explicit override wins over the header because someone asked
+    for it by name.
+    """
+    if _game_name_explicit:
+        return GAME_NAME
+    return title or GAME_NAME
+
 
 def _classify(name: str, flags: int) -> bool:
     """Decide whether a section holds code."""

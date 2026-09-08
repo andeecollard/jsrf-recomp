@@ -90,6 +90,11 @@ void xbox_SetMapSize(size_t bytes)
     g_xbox_map_size = bytes;
 }
 
+size_t xbox_GetMappedSize(void)
+{
+    return g_memory_size;
+}
+
 void xbox_EnableSeparateReserveSpace(size_t bytes)
 {
     if (bytes > UINT32_MAX - g_xbox_total_ram)

@@ -49,7 +49,7 @@ typedef struct {
     ID3D11VertexShader *vs;
     ID3DBlob           *vs_blob;      /* Bytecode for input layout creation */
     ID3D11InputLayout  *layouts[16];  /* Cached layouts per input mask subset */
-    uint16_t            layout_masks[16];
+    uint32_t            layout_masks[16];  /* inputs_read | (texcoord-field<<16) */
     int                 layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
 } VshCacheEntry;
@@ -117,8 +117,15 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns, NV2AVshProgram *progr
 /**
  * Default format for each input register.
  * This is the common Xbox convention; games may vary.
+ * Texcoord registers 8-11 use the FVF-declared size (float1/2/3/4).
  */
-static DXGI_FORMAT default_input_format(int vreg)
+static UINT vsh_fvf_texcoord_size(DWORD fvf, UINT t)
+{
+    DWORD field = (fvf >> (16 + t * 2)) & 0x3;
+    return field == 0 ? 2 : field;
+}
+
+static DXGI_FORMAT default_input_format(int vreg, DWORD fvf)
 {
     switch (vreg) {
     case 0:  return DXGI_FORMAT_R32G32B32_FLOAT;    /* Position (xyz) */
@@ -129,10 +136,22 @@ static DXGI_FORMAT default_input_format(int vreg)
     case 5:  return DXGI_FORMAT_R32_FLOAT;            /* Fog */
     case 6:  return DXGI_FORMAT_R32_FLOAT;            /* Point size */
     case 7:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
-    case 8:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 0 */
-    case 9:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 1 */
-    case 10: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 2 */
-    case 11: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 3 */
+    case 8:  return vsh_fvf_texcoord_size(fvf, 0) == 1 ? DXGI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 0) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 0) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
+                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 0 */
+    case 9:  return vsh_fvf_texcoord_size(fvf, 1) == 1 ? DXGI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 1) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 1) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
+                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 1 */
+    case 10: return vsh_fvf_texcoord_size(fvf, 2) == 1 ? DXGI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 2) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 2) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
+                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 2 */
+    case 11: return vsh_fvf_texcoord_size(fvf, 3) == 1 ? DXGI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 3) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 3) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
+                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 3 */
     default: return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* Generic */
     }
 }
@@ -150,7 +169,7 @@ static UINT input_format_size(DXGI_FORMAT fmt)
 }
 
 static ID3D11InputLayout *create_vsh_input_layout(
-    uint16_t inputs_read, ID3DBlob *vs_blob)
+    uint16_t inputs_read, DWORD fvf, ID3DBlob *vs_blob)
 {
     D3D11_INPUT_ELEMENT_DESC elems[NV2A_VS_MAX_INPUTS];
     UINT elem_count = 0;
@@ -163,7 +182,7 @@ static ID3D11InputLayout *create_vsh_input_layout(
         if (!(inputs_read & (1u << i)))
             continue;
 
-        DXGI_FORMAT fmt = default_input_format(i);
+        DXGI_FORMAT fmt = default_input_format(i, fvf);
 
         elems[elem_count].SemanticName      = "ATTR";
         elems[elem_count].SemanticIndex      = (UINT)i;
@@ -320,16 +339,17 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
 /**
  * Get the input layout for a cache entry.
- * Creates and caches the layout on first request per input mask.
+ * Creates and caches the layout on first request per (input mask, texcoord sizes).
  */
-static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry)
+static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
 {
     uint16_t mask = entry->inputs_read;
+    uint32_t key = (uint32_t)mask | (((uint32_t)(fvf >> 16) & 0xFFFF) << 16);
     int i;
 
-    /* Check if we already created a layout for this mask */
+    /* Check if we already created a layout for this mask+texcoord layout */
     for (i = 0; i < entry->layout_count; i++) {
-        if (entry->layout_masks[i] == mask)
+        if (entry->layout_masks[i] == key)
             return entry->layouts[i];
     }
 
@@ -337,9 +357,9 @@ static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry)
     if (entry->layout_count >= 16)
         return entry->layouts[0]; /* Fallback to first */
 
-    ID3D11InputLayout *layout = create_vsh_input_layout(mask, entry->vs_blob);
+    ID3D11InputLayout *layout = create_vsh_input_layout(mask, fvf, entry->vs_blob);
     entry->layouts[entry->layout_count]      = layout;
-    entry->layout_masks[entry->layout_count] = mask;
+    entry->layout_masks[entry->layout_count] = key;
     entry->layout_count++;
 
     return layout;
@@ -532,8 +552,8 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     /* Bind the vertex shader */
     ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
 
-    /* Bind the input layout */
-    layout = get_cached_layout(entry);
+    /* Bind the input layout (sizes texcoords from the bound stream FVF) */
+    layout = get_cached_layout(entry, d3d8_GetCurrentFVF());
     if (layout)
         ID3D11DeviceContext_IASetInputLayout(ctx, layout);
 

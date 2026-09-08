@@ -16,6 +16,7 @@ game_files/
 *.xiso
 
 # IDE
+.vs/
 .vscode/
 .idea/
 *.suo
@@ -30,7 +31,6 @@ build/
 bin/
 *.obj
 *.exe
-
 # Out-of-tree build + regeneration output (hundreds of MB, rebuilt by
 # diagnostics/jsrf_first_fault/regenerate.sh)
 build-macos/
@@ -46,3 +46,6 @@ icall_targets.dump
 
 # Stray tool output directory
 output/
+
+# Generic split-tool output
+tools/split/output/

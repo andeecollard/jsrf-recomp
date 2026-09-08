@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "apu_xaudio2.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -37,27 +38,29 @@ static int                     g_xa2_frames_written = 0;
 int xa2_init(void)
 {
     HRESULT hr;
+    int com_initialized;
     WAVEFORMATEX wfx = { 0 };
 
+    if (g_xa2_initialized) return 1;
+
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != (HRESULT)0x80010106 /* RPC_E_CHANGED_MODE */ && hr != S_FALSE) {
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         fprintf(stderr, "[XA2] CoInitializeEx failed: 0x%08lX\n", hr);
         return 0;
     }
+    com_initialized = SUCCEEDED(hr);
 
     hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
     if (FAILED(hr) || !g_xa2) {
         fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
-        return 0;
+        goto fail;
     }
 
     hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
         XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
     if (FAILED(hr)) {
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
-        IXAudio2_Release(g_xa2);
-        g_xa2 = NULL;
-        return 0;
+        goto fail;
     }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -71,13 +74,14 @@ int xa2_init(void)
         &wfx, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL);
     if (FAILED(hr)) {
         fprintf(stderr, "[XA2] CreateSourceVoice failed: 0x%08lX\n", hr);
-        g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
-        IXAudio2_Release(g_xa2);
-        g_xa2 = NULL;
-        return 0;
+        goto fail;
     }
 
-    IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
+        goto fail;
+    }
 
     g_xa2_next_buf = 0;
     g_xa2_initialized = 1;
@@ -86,12 +90,16 @@ int xa2_init(void)
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
     return 1;
+
+fail:
+    xa2_shutdown();
+    /* Failed initialization still runs on the COM-initializing thread. */
+    if (com_initialized) CoUninitialize();
+    return 0;
 }
 
 void xa2_shutdown(void)
 {
-    if (!g_xa2_initialized) return;
-
     if (g_xa2_source) {
         IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
         IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
@@ -107,7 +115,8 @@ void xa2_shutdown(void)
         g_xa2 = NULL;
     }
 
-    fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
+    if (g_xa2_initialized)
+        fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
     g_xa2_initialized = 0;
 }
 
@@ -124,6 +133,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     XAUDIO2_BUFFER xbuf;
     int idx;
     int copy_samples;
+    HRESULT hr;
 
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
@@ -138,7 +148,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
-    IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+    hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+    if (FAILED(hr)) return 0;
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;

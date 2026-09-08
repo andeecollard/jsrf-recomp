@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-XBE (Xbox Executable) Parser for Burnout 3 Static Recompilation Project.
+XBE (Xbox Executable) Parser for the Xbox Static Recompilation Project.
 
 Parses Xbox XBE files and extracts header information, section tables,
 kernel imports, library versions, and certificate data.
@@ -1106,7 +1106,7 @@ def export_json(xbe: XBEFile, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="XBE (Xbox Executable) Parser for Burnout 3 Static Recompilation"
+        description="XBE (Xbox Executable) Parser for the Xbox Static Recompilation Project"
     )
     parser.add_argument("xbe_path", help="Path to the XBE file")
     parser.add_argument("--extract-sections", metavar="DIR",

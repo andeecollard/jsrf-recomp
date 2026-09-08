@@ -8,7 +8,7 @@
  * honestly on POSIX so the Xbox-specific HLE code above it is unchanged and
  * stays verifiable.
  *
- * Linux-only: on Windows these come from the real <windows.h>.
+ * Linux/MacOS only: on Windows these come from the real <windows.h>.
  */
 
 #ifndef WIN32_COMPAT_H
@@ -208,6 +208,8 @@ BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
 VOID  OutputDebugStringA(LPCSTR str);
 VOID  OutputDebugStringW(LPCWSTR str);
 VOID  ExitProcess(UINT exitCode);
+BOOL  IsDebuggerPresent(void);
+VOID  DebugBreak(void);
 BOOL  TerminateProcess(HANDLE process, UINT exitCode);
 VOID  SecureZeroMemory(PVOID ptr, SIZE_T cnt);
 unsigned int _clearfp(void);   /* clear pending FPU exception flags */
@@ -253,6 +255,9 @@ SHORT GetAsyncKeyState(int vKey);
 HWND  FindWindowA(LPCSTR className, LPCSTR windowName);
 HWND  GetActiveWindow(void);
 BOOL  SetWindowTextA(HWND hwnd, LPCSTR text);
+int   GetWindowTextA(HWND hwnd, LPSTR text, int count);
+typedef BOOL (CALLBACK *WNDENUMPROC)(HWND hwnd, LPARAM lParam);
+BOOL  EnumWindows(WNDENUMPROC enumProc, LPARAM lParam);
 
 /* MessageBox + flags (stderr stub on POSIX). */
 int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
@@ -371,14 +376,13 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
 #define ERROR_MORE_DATA               234u
+#define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u
 #define ERROR_IO_PENDING              997u
 #define ERROR_CANCELLED               1223u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
 #define ERROR_COMMITMENT_LIMIT        1455u
 #define ERROR_DEVICE_NOT_CONNECTED    1167u
-/* macOS portability: present in <windows.h> on Windows; add for POSIX. */
-#define ERROR_NOT_OWNER               0x421u   /* 1057 */
 
 /* ---- COM HRESULT codes ------------------------------------------------ */
 #ifndef S_OK

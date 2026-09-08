@@ -1,12 +1,18 @@
 """
-Configuration constants for Burnout 3 disassembly tool.
+Configuration constants for the disassembly tool.
 
-Defines address ranges, section boundaries, instruction classification,
-and other constants used throughout the disassembler.
+Defines instruction classification, function-detection limits, and other
+constants used throughout the disassembler.
+
+The XBE memory layout below is a reference fallback. Call
+configure_from_xbe() with the XBE being analyzed to derive the real section
+table; the disassembler itself reads sections from the loader's analysis
+JSON, so these numbers are only for anything that consults this module
+directly.
 """
 
 # ============================================================
-# XBE Memory Layout
+# XBE Memory Layout (reference fallback - see configure_from_xbe())
 # ============================================================
 
 XBE_BASE_ADDRESS = 0x00010000
@@ -19,11 +25,10 @@ ENTRY_POINT = 0x001D2807
 KERNEL_THUNK_ADDR = 0x0036B7C0
 
 # ============================================================
-# Section Definitions
+# Section Definitions (reference fallback)
 # ============================================================
 
 # Executable code sections (name, va_start, va_size)
-# These are the sections we'll disassemble
 EXECUTABLE_SECTIONS = [
     (".text",   0x00011000, 2863616),
     ("XMV",     0x002CC200, 163124),
@@ -50,6 +55,64 @@ ALL_SECTIONS = {
     s[0]: {"va": s[1], "size": s[2]}
     for s in EXECUTABLE_SECTIONS + DATA_SECTIONS
 }
+
+# Conventional PE data-section names; matched by name regardless of the XBE's
+# executable flag (matches tools/disasm/loader.py's DATA_SECTION_NAMES).
+_DATA_SECTION_NAMES = frozenset({
+    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
+})
+
+_configured_from = None
+
+
+def configured_from():
+    """Path of the XBE this layout came from, or None if still the fallback."""
+    return _configured_from
+
+
+def _install(sections, entry_point, kernel_thunk_addr, image_size, origin):
+    """Install a derived layout. sections is (name, va_start, va_size)."""
+    global EXECUTABLE_SECTIONS, DATA_SECTIONS, ALL_SECTIONS
+    global ENTRY_POINT, KERNEL_THUNK_ADDR, XBE_IMAGE_SIZE, _configured_from
+
+    EXECUTABLE_SECTIONS = [s for s in sections if s[0] not in _DATA_SECTION_NAMES]
+    DATA_SECTIONS = [s for s in sections if s[0] in _DATA_SECTION_NAMES]
+    if not EXECUTABLE_SECTIONS:
+        EXECUTABLE_SECTIONS = list(sections)
+    ALL_SECTIONS = {s[0]: {"va": s[1], "size": s[2]} for s in sections}
+    _configured_from = origin
+
+    if entry_point:
+        ENTRY_POINT = entry_point
+    if kernel_thunk_addr:
+        KERNEL_THUNK_ADDR = kernel_thunk_addr
+    if image_size:
+        XBE_IMAGE_SIZE = image_size
+
+
+def configure_from_xbe(xbe_path):
+    """Derive the layout from the XBE being analyzed.
+
+    Using this makes anything consulting this module's layout per-title rather
+    than pinned to the reference title's addresses.
+    """
+    from tools.xbe_parser.xbe_parser import XBEParser
+
+    xbe = XBEParser(xbe_path).parse()
+    sections = [
+        (s.name, s.virtual_addr, s.virtual_size)
+        for s in xbe.sections if s.raw_size > 0
+    ]
+    if not sections:
+        raise ValueError(f"XBE has no non-empty sections: {xbe_path}")
+
+    _install(
+        sections,
+        xbe.header.entry_point,
+        xbe.header.kernel_thunk_addr,
+        xbe.header.image_size if hasattr(xbe.header, "image_size") else None,
+        xbe_path,
+    )
 
 # ============================================================
 # Instruction Classification

@@ -1,11 +1,13 @@
 """
-Burnout 3: Takedown - x86 → C Static Recompiler
+Xbox x86 → C Static Recompiler
 
 Usage:
     py -3 -m tools.recomp <xbe_path> [options]
 
 Options:
     -o, --output-dir DIR    Output directory (default: tools/recomp/output)
+    --game-name NAME        Game name stamped into generated-code banners
+                            (default: "Xbox Game")
     -f, --function ADDR     Translate a single function (hex address)
     -c, --category CAT      Translate functions of a specific category
     --game-only             Only translate game_engine + game_vtable + unknown functions
@@ -152,6 +154,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Xbox x86 -> C Static Recompiler")
     parser.add_argument("xbe_path", help="Path to default.xbe")
+    parser.add_argument("--game-name",
+                        help="Game name stamped into generated-code banners")
     parser.add_argument("-o", "--output-dir",
                         help="Output directory")
     parser.add_argument("-f", "--function",
@@ -217,6 +221,9 @@ def main():
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
+
+    if args.game_name:
+        config.set_game_name(args.game_name)
 
     # Find data files
     data_files = find_data_files(

@@ -37,8 +37,115 @@ static long trace_budget(void)
     return budget > 0 ? budget-- : 0;
 }
 
+/* Where a title spends its calls.
+ *
+ * A recompiled title that is CPU-bound gives no clue which guest code is
+ * responsible: the native profile is a wall of sub_XXXX, and the guest has no
+ * program counter to sample. Counting entries does answer it, and the trace
+ * hook is already on every function the run was generated to trace -- so
+ * tracing everything and tallying instead of printing turns the existing
+ * mechanism into a profile for the cost of an array increment.
+ *
+ * Counts, not time: a function called once that loops for a minute does not
+ * appear here, and one called ten million times cheaply does. It says where
+ * the calls go, which is the first question, not the last.
+ *
+ * Enable with RECOMP_TRACE_PROFILE=1. The report goes to stderr at exit,
+ * hottest first.
+ */
+#define PROF_SLOTS 8192                 /* open addressing, power of two */
+
+static struct { uint32_t va; unsigned long long hits; } g_prof[PROF_SLOTS];
+static const char *g_prof_name[PROF_SLOTS];
+static int g_prof_used, g_prof_full;
+static unsigned long long g_prof_calls;
+
+static void prof_report(void)
+{
+    int taken[40], ntaken = 0;
+    int i, j, shown;
+
+    if (!g_prof_used)
+        return;
+    fprintf(stderr, "\n[PROFILE] %d functions entered%s, hottest first:\n",
+            g_prof_used, g_prof_full ? " (table full, some dropped)" : "");
+    for (shown = 0; shown < 40; shown++) {
+        int best = -1;
+        for (i = 0; i < PROF_SLOTS; i++) {
+            if (!g_prof[i].hits)
+                continue;
+            for (j = 0; j < ntaken; j++)
+                if (taken[j] == i)
+                    break;
+            if (j < ntaken)
+                continue;
+            if (best < 0 || g_prof[i].hits > g_prof[best].hits)
+                best = i;
+        }
+        if (best < 0)
+            break;
+        taken[ntaken++] = best;
+        fprintf(stderr, "  %14llu  %s (0x%08X)\n",
+                g_prof[best].hits, g_prof_name[best] ? g_prof_name[best] : "?",
+                g_prof[best].va);
+    }
+    fflush(stderr);
+}
+
+/* RECOMP_TRACE_PROFILE=1 profiles; a larger number is also how often to
+ * report, in calls. The default suits a title burning a core in a spin loop;
+ * a title that no longer has one may never reach it, and then the only report
+ * is the one at exit -- which a killed run never gets. */
+static unsigned long long prof_interval(void)
+{
+    static unsigned long long every;
+    if (!every) {
+        const char *v = getenv("RECOMP_TRACE_PROFILE");
+        unsigned long long n = v ? strtoull(v, NULL, 0) : 0;
+        every = n > 1 ? n : 20000000ull;
+    }
+    return every;
+}
+
+static int prof_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("RECOMP_TRACE_PROFILE") ? 1 : 0;
+        if (on)
+            atexit(prof_report);
+    }
+    return on;
+}
+
+static void prof_count(const char *name, uint32_t va)
+{
+    unsigned i = (va * 2654435761u) & (PROF_SLOTS - 1);
+    unsigned n;
+
+    /* A title being profiled for a hang or a slowdown is a title that gets
+     * killed rather than exited, and a kill does not reach atexit. Report as
+     * it goes, so there is always a recent one. */
+    if (++g_prof_calls % prof_interval() == 0)
+        prof_report();
+
+    for (n = 0; n < PROF_SLOTS; n++) {
+        unsigned k = (i + n) & (PROF_SLOTS - 1);
+        if (g_prof[k].va == va && g_prof[k].hits) { g_prof[k].hits++; return; }
+        if (!g_prof[k].hits) {
+            g_prof[k].va = va;
+            g_prof[k].hits = 1;
+            g_prof_name[k] = name;
+            g_prof_used++;
+            return;
+        }
+    }
+    g_prof_full = 1;
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
      * [esp], and it names the call site, which is the thing a trace of "who
@@ -100,6 +207,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
  * comes back wrong. */
 void recomp_trace_exit(const char *name, uint32_t va)
 {
+    if (prof_enabled()) return;     /* entries alone carry the count */
     if (!trace_budget()) return;
     fprintf(stderr, "[TRACE] <- %s (0x%08X)  esp=%08X eax=%08X ecx=%08X "
             "esi=%08X edi=%08X ebx=%08X\n",
@@ -112,6 +220,7 @@ void recomp_trace_exit(const char *name, uint32_t va)
  * bytes per call is only visible from a sample taken before it. */
 void recomp_trace_esp(const char *name, const char *tag)
 {
+    if (prof_enabled()) return;
     if (!trace_budget()) return;
     fprintf(stderr, "[ESP] %s @%s  esp=%08X esi=%08X edi=%08X\n",
             name, tag, g_esp, g_esi, g_edi);

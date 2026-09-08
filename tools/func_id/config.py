@@ -3,10 +3,16 @@ Configuration constants for the function identification tool.
 
 Defines section address ranges, CRT byte-level signatures, and
 confidence thresholds for each identification method.
+
+The address layout below is a reference fallback. Call configure_from_xbe()
+with the XBE being analyzed to derive the real section ranges; otherwise any
+address past the reference table is misclassified.
 """
 
+from typing import List, Optional, Tuple
+
 # ============================================================
-# Section Address Ranges (from XBE analysis)
+# Section Address Ranges (reference fallback - see configure_from_xbe())
 # ============================================================
 
 # .text section: game code + CRT + RenderWare engine
@@ -27,7 +33,7 @@ DATA_VA_SIZE = 3904988
 DATA_VA_END = DATA_VA_START + DATA_VA_SIZE
 DATA_RAW_ADDR = 0x003A3000
 
-# XBE base address
+# XBE base address (all Xbox XBEs link at 0x00010000)
 XBE_BASE_ADDRESS = 0x00010000
 
 # ============================================================
@@ -66,6 +72,8 @@ def va_to_file_offset(va):
 # ============================================================
 # Maps section name -> (va_start, va_end, game_category)
 # Functions calling into these sections get classified accordingly.
+# Populated per-title by configure_from_xbe(); the values below are the
+# reference fallback only.
 
 # Section NAME -> category. The VAs must come from the XBE being analysed, not
 # from here: these sections sit at completely different addresses in every
@@ -88,6 +96,90 @@ XDK_SECTION_CATEGORIES = {
     "XNET":    "game_network",
     "XPP":     "game_input",
 }
+
+# Category assigned to a statically linked Xbox SDK section by its name.
+# Name-based and title-agnostic; titles that ship a section not listed here
+# simply get no XDK classification from it.
+XDK_CATEGORY_BY_NAME = {
+    "D3D":      "game_render",
+    "DSOUND":   "game_audio",
+    "WMADEC":   "game_audio",
+    "WMADECXM": "game_audio",
+    "XMV":      "game_video",
+    "XONLINE":  "game_network",
+    "XNET":     "game_network",
+    "XGRPH":    "game_render",
+    "XPP":      "game_input",
+    "DOLBY":    "game_audio",
+}
+
+_configured_from: Optional[str] = None
+
+
+def configured_from() -> Optional[str]:
+    """Path of the XBE this layout was derived from, or None if fallback."""
+    return _configured_from
+
+
+def _install(sections: List[Tuple[str, int, int, int]], origin: str) -> None:
+    """Install a derived layout. sections is (name, va_start, va_size, raw_addr)."""
+    global SECTIONS, TEXT_VA_START, TEXT_VA_SIZE, TEXT_VA_END, TEXT_RAW_ADDR
+    global RDATA_VA_START, RDATA_VA_SIZE, RDATA_VA_END, RDATA_RAW_ADDR
+    global DATA_VA_START, DATA_VA_SIZE, DATA_VA_END, DATA_RAW_ADDR
+    global XDK_SECTIONS, _configured_from
+
+    SECTIONS = sorted(sections, key=lambda s: s[1])
+    _configured_from = origin
+
+    by_name = {name: (va, size, raw) for name, va, size, raw in SECTIONS}
+
+    text = by_name.get(".text")
+    rdata = by_name.get(".rdata")
+    data = by_name.get(".data")
+    # Some titles ship no .rdata; fall back to .data so the read-only range
+    # is never left pointing at another game's layout.
+    rdata = rdata or data
+    data = data or rdata
+
+    if text:
+        va, size, raw = text
+        TEXT_VA_START, TEXT_VA_SIZE, TEXT_RAW_ADDR = va, size, raw
+        TEXT_VA_END = va + size
+    if rdata:
+        va, size, raw = rdata
+        RDATA_VA_START, RDATA_VA_SIZE, RDATA_RAW_ADDR = va, size, raw
+        RDATA_VA_END = va + size
+    if data:
+        va, size, raw = data
+        DATA_VA_START, DATA_VA_SIZE, DATA_RAW_ADDR = va, size, raw
+        DATA_VA_END = va + size
+
+    XDK_SECTIONS = {
+        name: (va, va + size, XDK_CATEGORY_BY_NAME[name])
+        for name, va, size, _raw in SECTIONS
+        if name in XDK_CATEGORY_BY_NAME
+    }
+
+
+def configure_from_xbe(xbe_path: str) -> None:
+    """Derive the address layout from the XBE being analyzed.
+
+    Without this the tool uses the reference fallback above, which only matches
+    the one title it was captured from -- every function past that table's end
+    lands outside the .text/.rdata/.data ranges and is misclassified.
+    """
+    from tools.xbe_parser.xbe_parser import XBEParser
+
+    xbe = XBEParser(xbe_path).parse()
+    has_size = [s for s in xbe.sections if s.raw_size > 0]
+    if not has_size:
+        raise ValueError(f"XBE has no non-empty sections: {xbe_path}")
+
+    sections = [
+        (s.name, s.virtual_addr, s.virtual_size, s.raw_addr)
+        for s in has_size
+    ]
+    _install(sections, xbe_path)
 
 # ============================================================
 # CRT Byte Signatures

@@ -268,12 +268,16 @@ One of the most important kernel interactions is file loading. The game uses a r
 static void bridge_resource_load(void) {
     // Read filename from Xbox .rdata (use pristine XBE copy to avoid corruption)
     uint32_t name_va = MEM32(entry_ptr + 0);
+    // VA -> file offset must come from the title's section table; the values
+    // below are this build's .rdata for illustration only.
     size_t file_offset = (name_va - 0x36B7C0) + 0x35C000;
     const char *name = (const char *)(g_xbe_data + file_offset);
 
     // Open and read from game data directory
+    // The game directory defaults to the current working directory's "game"
+    // subfolder (see kernel_path.c); override per-title as needed.
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "Burnout 3 Takedown/%s", name);
+    snprintf(path, sizeof(path), "game/%s", name);
     FILE *f = fopen(path, "rb");
 
     // Write file data directly into the resource VA buffer

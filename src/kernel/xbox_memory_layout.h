@@ -77,6 +77,7 @@ extern size_t g_xbox_total_ram;
  * that does not ask. Set before xbox_MemoryLayoutInit(). */
 extern size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
+size_t xbox_GetMappedSize(void);
 
 /* Give pure MEM_RESERVE calls a distinct virtual-address arena above RAM.
  * `bytes` is the size of that arena, not the total mapping. Ordinary heap and

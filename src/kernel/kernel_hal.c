@@ -725,3 +725,47 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
      */
     return (ULONGLONG)GetTickCount64() * 10000ULL;
 }
+
+/* ============================================================================
+ * Time stamp counter
+ *
+ * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant the title
+ * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
+ * So a frame timer computes seconds as counter / 733333333.
+ *
+ * Returning the host's own TSC would make that division wrong by the ratio of
+ * the two clocks -- a 3.5 GHz host would have the guest believe nearly five
+ * seconds had passed for every real one. Scaling the host's performance
+ * counter to the console's rate keeps the guest's arithmetic honest.
+ *
+ * Monotonic and shared by every thread, which is what a TSC is. The first
+ * call establishes the origin so the counter starts near zero rather than at
+ * whatever the host had been running for.
+ * ========================================================================= */
+#define XBOX_TSC_HZ 733333333ull
+
+uint64_t xbox_ReadTimeStampCounter(void)
+{
+    static LARGE_INTEGER freq;
+    static LARGE_INTEGER origin;
+    LARGE_INTEGER now;
+
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&origin);
+        if (freq.QuadPart == 0)
+            freq.QuadPart = 1;
+    }
+    QueryPerformanceCounter(&now);
+
+    {
+        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
+        /* Split the scaling so a long run cannot overflow: whole seconds
+         * first, then the remainder. */
+        uint64_t secs = ticks / (uint64_t)freq.QuadPart;
+        uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
+        return secs * XBOX_TSC_HZ
+             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
+    }
+}

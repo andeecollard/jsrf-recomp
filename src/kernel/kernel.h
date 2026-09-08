@@ -481,9 +481,16 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * Set the kernel thunk table address for the current game.
  * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
  * from the XBE header's KernelImageThunkAddress field.
- * If not called, the default (Burnout 3's 0x0036B7C0) is used.
+ * If not called, the default (a legacy title's 0x0036B7C0) is used.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
+
+/**
+ * Get the kernel thunk table address and entry count currently in effect.
+ * Set during memory layout init from the XBE header. *xbox_va/*count are
+ * zeroed if never configured.
+ */
+void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
 
 extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
@@ -572,6 +579,9 @@ NTSTATUS __stdcall xbox_RtlUnicodeStringToAnsiString(
 
 BOOLEAN __stdcall xbox_RtlEqualString(PXBOX_ANSI_STRING String1, PXBOX_ANSI_STRING String2, BOOLEAN CaseInSensitive);
 ULONG   __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pattern);
+
+/* Name contended CRT locks by index instead of by address. */
+void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
@@ -787,6 +797,9 @@ extern volatile ULONG xbox_KeTickCount;
 
 extern XBOX_HARDWARE_INFO      xbox_HardwareInfo;
 extern XBOX_KRNL_VERSION       xbox_KrnlVersion;
+
+/* Override the reported kernel version (ordinal 324). */
+void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe);
 extern UCHAR                   xbox_EEPROMKey[16];
 extern UCHAR                   xbox_HDKey[16];
 extern UCHAR                   xbox_SignatureKey[16];

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
-from capstone import CS_OP_IMM, CS_OP_MEM
+from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -360,6 +360,47 @@ class DisasmEngine:
             self._sorted_addrs = None
         return added
 
+    def block_tail_jump(self, addr: int, max_insns: int = 256):
+        """
+        Where the straight-line block at `addr` jumps, if it ends in an
+        unconditional jmp rather than a ret.
+
+        probes_as_returning_body deliberately stops at such a jump, because for
+        a weak candidate -- an address that merely appeared as an immediate --
+        a tail jump is not evidence of a function. But for a branch target that
+        is already known to be reached from inside a function, the jump is the
+        block's terminator and its destination is the rest of the same
+        function. Half-Life 2's _lock helper reaches its loop tail this way:
+        "cmp [ebp-0x1c],-1 / jne / inc edi / jmp back into the body".
+
+        Returns the jump target, or None if the block rets, runs long, or ends
+        in something that is not a direct jmp.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return None
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return None
+
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                return None
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return None                 # a ret block: not this shape
+            if mnemonic in config.JMP_MNEMONICS:
+                try:
+                    ops = decoded.operands
+                except Exception:
+                    return None
+                if not ops or ops[0].type != CS_OP_IMM:
+                    return None             # indirect: nothing to name
+                return ops[0].imm & 0xFFFFFFFF
+        return None
+
     def probes_as_returning_body(self, addr: int,
                                  max_insns: int = 64) -> bool:
         """
@@ -409,6 +450,63 @@ class DisasmEngine:
             if count >= max_insns:
                 return False
         return False
+
+    def probes_as_vcall_thunk(self, addr: int) -> bool:
+        """Is this MSVC's virtual-call thunk?
+
+            mov eax, [ecx]              ; load the vtable from `this`
+            jmp dword ptr [eax + N]     ; dispatch to slot N
+
+        A real function, and one that only ever exists as a value in a table --
+        the compiler emits them for pointers-to-virtual-member-functions and
+        for interface forwarding. They end in an indirect tail jump and never
+        reach a `ret`, so probes_as_returning_body rejects them, and they are
+        packed back to back with no int3 between them, so the padding boundary
+        pass does not see them either.
+
+        Half-Life 2 has 568 of these and only 41 were being found. Each missed
+        one is an indirect call the runtime cannot resolve, so the call is
+        skipped rather than made: two of them, at 0x00583BE2 and 0x00583BFA,
+        were being reached 22 million times in a boot that then sat spinning.
+
+        Matched shape-exactly rather than by relaxing the general prober,
+        because "ends in an indirect jump" on its own is weak evidence that
+        data happens to disassemble into.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.read_bytes_at_va(addr, 16)
+        if not data:
+            return False
+
+        insns = list(self._cs.disasm(data, addr, count=2))
+        if len(insns) != 2:
+            return False
+
+        load, dispatch = insns
+        if load.mnemonic.lower() != "mov":
+            return False
+        try:
+            load_ops = load.operands
+            jmp_ops = dispatch.operands
+        except Exception:
+            return False
+        # mov <reg>, [<reg>]  -- the vtable load, no index, no displacement
+        if len(load_ops) != 2:
+            return False
+        dst, src = load_ops
+        if dst.type != CS_OP_REG or src.type != CS_OP_MEM:
+            return False
+        if src.mem.base == 0 or src.mem.index != 0 or src.mem.disp != 0:
+            return False
+
+        if dispatch.mnemonic.lower() not in config.JMP_MNEMONICS:
+            return False
+        if len(jmp_ops) != 1 or jmp_ops[0].type != CS_OP_MEM:
+            return False
+        # ...through the register the load just filled.
+        return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
 
     def probes_as_prologue(self, addr: int) -> bool:
         """
@@ -471,7 +569,73 @@ class DisasmEngine:
         if m == "mov" and ops.replace(" ", "") == "edi,edi":
             return True   # hot-patch pad
 
+        # A function whose frame __SEH_prolog builds:
+        #
+        #     push <frame size>        immediate
+        #     push <scope table>       immediate
+        #     call __SEH_prolog
+        #
+        # There is no "push ebp; mov ebp, esp" to find, because the helper does
+        # that on the caller's behalf, so none of the shapes above match and
+        # such a function is invisible to every pass that asks this question.
+        # Half-Life 2 has one at 0x001F572B, reached only through a vtable: the
+        # call could not be resolved, so it was skipped rather than made, and
+        # the arguments already pushed for it stayed on the stack. That shifted
+        # the caller's frame, and its "pop ebx" then restored the wrong slot.
+        #
+        # Two immediate pushes followed by a call is specific enough not to
+        # occur by accident -- and this is only ever asked about an address
+        # that already looks like a boundary.
+        if m == "push" and ops.startswith("0x") and len(insns) > 1:
+            nxt = insns[1]
+            if nxt.mnemonic == "push" and nxt.op_str.startswith("0x"):
+                third = list(self._cs.disasm(
+                    data[offset:offset + 24], addr, count=3))
+                if len(third) > 2 and third[2].mnemonic == "call":
+                    return True
+
         return False
+
+    def probes_as_constant_stub(self, addr: int) -> bool:
+        """Is this the whole of a constant-returning accessor?
+
+            mov <reg>, <imm32>
+            ret [imm16]
+
+        MSVC emits runs of these for members that return a fixed address, packs
+        them back to back with no padding, and reaches them only through
+        vtables -- so no pass that looks for a prologue, padding or a call site
+        finds them. Half-Life 2 has 3,147.
+
+        Matched exactly, and not by asking a general "does a ret come soon"
+        probe. That was tried: allowing any short run ending in ret added 825
+        function starts instead of the 19 this shape accounts for, because data
+        and mid-function fragments satisfy it too, and the title stopped
+        loading. The narrow rule is the honest one -- it is what was measured.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+        offset = addr - section.virtual_addr
+        if offset < 0 or offset >= len(data):
+            return False
+
+        insns = list(self._cs.disasm(data[offset:offset + 12], addr, count=2))
+        if len(insns) != 2:
+            return False
+        first, second = insns
+        if first.mnemonic != "mov":
+            return False
+        try:
+            ops = first.operands
+        except Exception:
+            return False
+        if len(ops) != 2 or ops[0].type != CS_OP_REG or ops[1].type != CS_OP_IMM:
+            return False
+        return second.mnemonic in config.RET_MNEMONICS
 
     def probes_as_function_body(self, addr: int,
                                 max_insns: int = 8192) -> bool:

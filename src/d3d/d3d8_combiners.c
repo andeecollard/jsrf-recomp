@@ -515,6 +515,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    uint   alpha_func;\n");
     EMIT("    uint   alpha_test_enable;\n");
     EMIT("    uint   fog_enable;\n");
+    EMIT("    uint4  alpha_only;\n");
     EMIT("};\n\n");
 
     /* ---- Input structure ---- */
@@ -522,10 +523,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float4 pos     : SV_POSITION;\n");
     EMIT("    float4 color0  : COLOR0;\n");
     EMIT("    float4 color1  : COLOR1;\n");
-    EMIT("    float2 tc0     : TEXCOORD0;\n");
-    EMIT("    float2 tc1     : TEXCOORD1;\n");
-    EMIT("    float2 tc2     : TEXCOORD2;\n");
-    EMIT("    float2 tc3     : TEXCOORD3;\n");
+    EMIT("    float3 tc0     : TEXCOORD0;\n");
+    EMIT("    float3 tc1     : TEXCOORD1;\n");
+    EMIT("    float3 tc2     : TEXCOORD2;\n");
+    EMIT("    float3 tc3     : TEXCOORD3;\n");
     EMIT("};\n\n");
 
     /* ---- Main function ---- */
@@ -548,15 +549,20 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         if (state->tex_mode[i] == NV2A_TEXMODE_NONE) {
             EMIT("    float4 r_t%d = float4(0, 0, 0, 0);\n", i);
         } else if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
-            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, float3(input.tc%d, 0));\n",
-                 i, i, i, i);
-        } else if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
-            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, float3(input.tc%d, 0));\n",
-                 i, i, i, i);
-        } else {
+            /* Cube map: use the full 3-component reflection/TCI vector */
             EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
                  i, i, i, i);
+        } else if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
+            /* 3D texture: use the full 3-component coordinate */
+            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
+                 i, i, i, i);
+        } else {
+            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d.xy);\n",
+                 i, i, i, i);
         }
+        /* Preserve disabled stages and sampled alpha. */
+        if (state->tex_mode[i] != NV2A_TEXMODE_NONE)
+            EMIT("    if (alpha_only[%d]) r_t%d.rgb = 1.0;\n", i, i);
     }
 
     /* Temporary registers: R0 initialized to T0 (NV2A convention),
@@ -1043,6 +1049,10 @@ BOOL d3d8_combiners_prepare_draw(void)
         cb->alpha_func = rs[D3DRS_ALPHAFUNC];
         cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
         cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(i));
+            cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+        }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);
     }

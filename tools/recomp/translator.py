@@ -21,6 +21,7 @@ import struct
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
+from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _operand_width, _fmt_operand_read,
@@ -756,6 +757,35 @@ class FunctionTranslator:
             return "thiscall"
         return "cdecl"
 
+    _CARRY_CC = frozenset({
+        "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
+    })
+
+    @staticmethod
+    def _function_needs_cf(instructions):
+        """True when something in the function reads CF."""
+        from .lifter import (FLAG_SETTERS, CF_TRACKED,
+                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
+
+        last_setter = None
+        for insn in instructions:
+            m = insn.mnemonic
+            if m in ("adc", "sbb", "stc", "clc", "cmc"):
+                return True
+            cc = None
+            if m.startswith("j") and len(m) > 1:
+                cc = m[1:]
+            elif m.startswith("set"):
+                cc = m[3:]
+            if (cc in FunctionTranslator._CARRY_CC
+                    and last_setter in CF_TRACKED):
+                return True
+            if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+                last_setter = m
+            elif m in _FLAGS_UNDEFINED:
+                last_setter = None
+        return False
+
     def _func_has_prologue(self, instructions):
         """Check if function starts with push ebp; mov ebp, esp."""
         if len(instructions) < 2:
@@ -764,6 +794,31 @@ class FunctionTranslator:
                 instructions[0].op_str == "ebp" and
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
+
+    def _func_owns_a_frame(self, instructions):
+        """True when the function has a frame, however it got one.
+
+        __SEH_prolog builds its caller's frame for it -- "lea ebp, [esp+0x10]"
+        inside the helper, after stashing the old ebp in the new frame -- so a
+        function that calls it owns a real frame without ever writing ebp
+        itself. Judging only on "push ebp; mov ebp, esp" calls those frameless,
+        and then the frame is never re-published across their calls: any
+        callee with a frame overwrites g_seh_ebp on entry and nothing puts it
+        back, so the next frameless callee inherits a dead frame.
+
+        Half-Life 2 hits this on its __finally funclets, which are ordinary
+        calls into a shared tail that reads the parent's locals through
+        g_seh_ebp. One of them leaves a critical section via
+        [[ebp-0x2c]+0x580]; with a stale frame that read a KeyValues string as
+        a pointer.
+        """
+        if self._func_has_prologue(instructions):
+            return True
+        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
+        if seh_prolog is None:
+            return False
+        return any(getattr(insn, "call_target", None) == seh_prolog
+                   for insn in instructions)
 
     def translate_function(self, func_addr, func_info):
         """
@@ -994,7 +1049,10 @@ class FunctionTranslator:
         # bsf/bsr publish ZF through the same pair (the source, against 0), so
         # a function whose only flag-setter is a bit scan still needs them --
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
-        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "inc", "dec")
+        # cmpxchg belongs here too: it snapshots the compare it performed,
+        # because eax may be replaced before the branch reads the result.
+        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "inc", "dec",
+                                 "cmpxchg", "lock cmpxchg")
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -1004,9 +1062,31 @@ class FunctionTranslator:
             # width, so the branch tests what the compare saw.
 
 
-        # Add _cf for carry-dependent instructions (sbb, adc)
-        has_carry = any(insn.mnemonic in ("sbb", "adc")
-                        for insn in instructions)
+        # Float compare snapshot, same reasoning as the integer one above and
+        # for a sharper reason: an SSE compare is routinely followed by a `lea`
+        # that overwrites the very register the address was built from. MSVC
+        # emits exactly that in Half-Life 2's displacement collision builder --
+        #
+        #   comiss xmm5, [esi + eax*4]     ; compare with the old eax
+        #   lea    eax, [esi + eax*4]      ; then eax becomes the pointer
+        #
+        # -- so reconstructing the comparison at the jcc read `esi + eax*4`
+        # with eax already holding a pointer. The address wrapped to guest
+        # 0x651BCD20 and the level load died in CDispCollTree.
+        if any(insn.mnemonic in ("comiss", "comisd", "ucomiss", "ucomisd")
+               for insn in instructions):
+            lines.append("    double _fca = 0.0, _fcb = 0.0;")
+            lines.append("    (void)_fca; (void)_fcb;")
+
+        # Add _cf for carry-dependent instructions.
+        #
+        # adc/sbb read CF directly, and so does a jb/jae whose flags came from
+        # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
+        # XCompress code are nothing but "add reg,reg" followed by jae. Which
+        # setter a branch reads is the lifter's tracking rule, mirrored here so
+        # only the functions that consume CF declare it: computing it beside
+        # every add in the image would be a line per add in 48,000 functions.
+        has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
         # Only functions that consume CF pay for producing it: an adc/sbb
@@ -1014,7 +1094,7 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
-        self.lifter.publishes_ebp = self._func_has_prologue(instructions)
+        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either
@@ -1349,7 +1429,8 @@ class BatchTranslator:
 
         c_chunks = []
         c_chunks.append("/**")
-        c_chunks.append(f" * {getattr(self, 'title', 'Recompiled')} - Mechanically Translated Game Code")
+        c_chunks.append(f" * {_config.banner_name(getattr(self, 'title', None))}"
+                        f" - Mechanically Translated Game Code")
         c_chunks.append(f" * Generated by tools/recomp from original Xbox x86 code.")
         c_chunks.append(f" * Functions: {len(func_list)}")
         c_chunks.append(" */")
@@ -1543,7 +1624,8 @@ class BatchTranslator:
         header_path = os.path.join(output_dir, header_name)
         header_lines = [
             "/**",
-            f" * {getattr(self, 'title', 'Recompiled')} - Recompiled Function Declarations",
+            f" * {_config.banner_name(getattr(self, 'title', None))}"
+            f" - Recompiled Function Declarations",
             f" * {stats['translated']} functions, auto-generated by tools/recomp",
             " */",
             "",
@@ -1586,25 +1668,44 @@ class BatchTranslator:
         # project writes, so the pipeline should hand it over like everything
         # else it generates.
         #
-        # Never overwritten. A project that has edited this copy keeps its
-        # edits across a regen, which is the opposite of how the .c files
-        # behave -- but this is a header a project may reasonably touch, and
-        # silently reverting someone's change on every regen is worse than
-        # letting a stale one persist. Delete it to get the current one back.
+        # Refreshed every run, not written once.
+        #
+        # This first said "never overwritten, so a project's edits survive".
+        # That was wrong, and the cost is a link error with no obvious cause:
+        # the lifter and this header are two halves of one contract, so a
+        # lifter that starts emitting RECOMP_ATOMIC_CAS32 against a header
+        # from three weeks ago gives
+        #
+        #     LNK2019: unresolved external symbol RECOMP_ATOMIC_CAS32
+        #
+        # pointing at generated code that is perfectly correct. The Xbox
+        # Dashboard hit exactly that. It is not hypothetical elsewhere either:
+        # Bloodwake's and Burnout 3's copies had already drifted from the
+        # template by 641 and 983 lines.
+        #
+        # So it tracks the template, like the .c files do. A project that
+        # genuinely needs its own can put one earlier on the include path --
+        # gen/ is only found because recomp_funcs.h sits beside it.
         types_dst = os.path.join(output_dir, "recomp_types.h")
-        if not os.path.exists(types_dst):
-            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
-                                     "templates", "runtime", "recomp_types.h")
-            try:
-                with open(types_src, "r", encoding="utf-8") as src:
-                    with open(types_dst, "w", encoding="utf-8") as dst:
-                        dst.write(src.read())
-                print(f"  wrote {types_dst} (runtime register model)",
+        types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                 "templates", "runtime", "recomp_types.h")
+        try:
+            with open(types_src, "r", encoding="utf-8") as src:
+                want = src.read()
+            have = None
+            if os.path.exists(types_dst):
+                with open(types_dst, "r", encoding="utf-8") as dst:
+                    have = dst.read()
+            if have != want:
+                with open(types_dst, "w", encoding="utf-8") as dst:
+                    dst.write(want)
+                print("  %s recomp_types.h (runtime register model)"
+                      % ("refreshed" if have is not None else "wrote"),
                       file=sys.stderr)
-            except OSError as e:
-                print(f"  WARNING: could not write recomp_types.h ({e}); copy "
-                      f"it from templates/runtime/ by hand or the build will "
-                      f"not find it", file=sys.stderr)
+        except OSError as e:
+            print(f"  WARNING: could not write recomp_types.h ({e}); copy "
+                  f"it from templates/runtime/ by hand or the build will "
+                  f"not find it", file=sys.stderr)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
@@ -1630,7 +1731,8 @@ class BatchTranslator:
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")
             c_lines = [
                 "/**",
-                f" * {getattr(self, 'title', 'Recompiled')} - Recompiled code chunk {ci}",
+                f" * {_config.banner_name(getattr(self, 'title', None))}"
+                f" - Recompiled code chunk {ci}",
                 f" * Functions: {len(chunk)} "
                 f"(0x{chunk[0][0]:08X} - 0x{chunk[-1][0]:08X})",
                 " */",
@@ -1759,7 +1861,8 @@ class BatchTranslator:
             # getattr: the dispatch writer is exercised directly by tests
             # that build no full translator, and a banner is not worth an
             # AttributeError.
-            f" * {getattr(self, 'title', 'Recompiled')} - Recompiled Function Dispatch Table",
+            f" * {_config.banner_name(getattr(self, 'title', None))}"
+            f" - Recompiled Function Dispatch Table",
             f" * Maps {len(translations)} Xbox VAs to translated function pointers.",
             " * Auto-generated by tools/recomp",
             " */",

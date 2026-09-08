@@ -12,6 +12,7 @@ rather than a configuration one.
 
 import os
 import sys
+import importlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -30,6 +31,10 @@ def _halo_like():
 
 
 def test_fallback_is_replaced():
+    # Other test modules configure this process-global module during collection
+    # and execution. Reload it so this test actually exercises the fallback it
+    # names, independent of test order.
+    importlib.reload(config)
     assert config.configured_from() is None
     config._install(_halo_like(), entry_point=0x001D43B4,
                     kernel_thunk_addr=0x00253090, origin="halo-test")

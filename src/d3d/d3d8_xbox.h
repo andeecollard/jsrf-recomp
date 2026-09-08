@@ -38,6 +38,7 @@ typedef struct IDirect3DIndexBuffer8   IDirect3DIndexBuffer8;
 typedef struct IDirect3DBaseTexture8   IDirect3DBaseTexture8;
 typedef struct IDirect3DCubeTexture8   IDirect3DCubeTexture8;
 typedef struct IDirect3DVolumeTexture8 IDirect3DVolumeTexture8;
+typedef struct IDirect3DVolume8       IDirect3DVolume8;
 
 /* ================================================================
  * Basic D3D8 types
@@ -100,47 +101,166 @@ typedef struct D3DGAMMARAMP {
 typedef enum D3DFORMAT {
     D3DFMT_UNKNOWN       = 0,
 
-    /* Standard RGB formats */
-    D3DFMT_A8R8G8B8      = 6,
-    D3DFMT_X8R8G8B8      = 7,
-    D3DFMT_R5G6B5        = 5,
-    D3DFMT_A1R5G5B5      = 3,
-    D3DFMT_A4R4G4B4      = 4,
-    D3DFMT_A8            = 19,
-    D3DFMT_R8B8          = 16,
+    /* Swizzled formats (canonical Xbox XDK values) */
+    D3DFMT_L8            = 0x00,   /* 8-bit luminance */
+    D3DFMT_AL8           = 0x01,   /* 8-bit alpha + luminance (packed) */
+    D3DFMT_A1R5G5B5      = 0x02,
+    D3DFMT_X1R5G5B5      = 0x03,
+    D3DFMT_A4R4G4B4      = 0x04,
+    D3DFMT_R5G6B5        = 0x05,
+    D3DFMT_A8R8G8B8      = 0x06,
+    D3DFMT_X8R8G8B8      = 0x07,
+    D3DFMT_X8L8V8U8      = 0x08,   /* signed bump: L8 + V8U8, distinct from X8R8G8B8 */
+
+    /* Palette formats */
+    D3DFMT_P8            = 0x0B,   /* 8-bit palettized */
 
     /* Compressed formats */
-    D3DFMT_DXT1          = 12,
-    D3DFMT_DXT2          = 14,
-    D3DFMT_DXT3          = 14,
-    D3DFMT_DXT4          = 15,
-    D3DFMT_DXT5          = 15,
+    D3DFMT_DXT1          = 0x0C,   /* opaque / one-bit alpha */
+    D3DFMT_DXT2          = 0x0E,   /* Alias for D3DFMT_DXT3 */
+    D3DFMT_DXT3          = 0x0E,   /* explicit alpha */
+    D3DFMT_DXT3A         = 0x59,   /* DXT3 with explicit alpha only */
+    D3DFMT_DXT4          = 0x0F,   /* Alias for D3DFMT_DXT5 */
+    D3DFMT_DXT5          = 0x0F,   /* interpolated alpha */
+    D3DFMT_DXT5A         = 0x5A,   /* DXT5 with alpha only */
+    D3DFMT_DXN           = 0x57,   /* two-channel normal-map compression (BC5-style) */
+    D3DFMT_CTX1          = 0x58,   /* 2-color compressed */
+    D3DFMT_Q8W8V8U8      = 0x0D,   /* signed bump: Q8W8V8U8, distinct from A8B8G8R8 */
 
-    /* Depth/stencil */
-    D3DFMT_D16           = 0x2C,
+    /* Alpha / luminance */
+    D3DFMT_A8            = 0x19,
+    D3DFMT_A8L8          = 0x1A,
+
+    /* Bump map (signed) formats */
+    D3DFMT_R6G5B5        = 0x27,
+    D3DFMT_L6V5U5        = 0x09,   /* signed bump: L6V5U5, distinct from R6G5B5 */
+    D3DFMT_G8B8          = 0x28,
+    D3DFMT_V8U8          = 0x0A,   /* signed bump: V8U8, distinct from G8B8 */
+    D3DFMT_R8B8          = 0x29,
+
+    /* Depth/stencil (swizzled depth use is uncommon) */
     D3DFMT_D24S8         = 0x2A,
-    D3DFMT_F16           = 0x2D,
     D3DFMT_F24S8         = 0x2B,
+    D3DFMT_D16           = 0x2C,
+    D3DFMT_D16_LOCKABLE  = 0x2C,   /* Alias for D16 */
+    D3DFMT_F16           = 0x2D,
+    D3DFMT_D24X8         = 0x54,   /* 24-bit depth, no stencil */
+    D3DFMT_D24FS8        = 0x55,   /* 24-bit float depth + 8-bit stencil */
+    D3DFMT_D32           = 0x56,   /* 32-bit fixed depth */
 
-    /* Xbox-specific swizzled formats */
-    D3DFMT_LIN_A8R8G8B8  = 0x12,
-    D3DFMT_LIN_X8R8G8B8  = 0x1E,
-    D3DFMT_LIN_R5G6B5    = 0x11,
-    D3DFMT_LIN_A1R5G5B5  = 0x10,
-    D3DFMT_LIN_A4R4G4B4  = 0x1D,
+    /* 16-bit luminance / signed */
+    D3DFMT_L16           = 0x32,
+    D3DFMT_V16U16        = 0x33,
 
-    /* Luminance */
-    D3DFMT_L8            = 0,
-    D3DFMT_A8L8          = 1,
+    /* Channel-swapped 16-bit formats */
+    D3DFMT_R5G5B5A1      = 0x38,
+    D3DFMT_R4G4B4A4      = 0x39,
 
-    /* Palette */
-    D3DFMT_P8            = 0x0B,
+    /* 32-bit channel-swapped formats */
+    D3DFMT_A8B8G8R8      = 0x3A,
+    D3DFMT_B8G8R8A8      = 0x3B,
+    D3DFMT_R8G8B8A8      = 0x3C,
 
-    /* YUV */
+    /* 10-bit formats */
+    D3DFMT_A2R10G10B10   = 0x4C,
+    D3DFMT_X2R10G10B10   = 0x4E,
+    D3DFMT_A2B10G10R10   = 0x4F,
+    D3DFMT_A2W10V10U10   = 0x50,   /* signed bump variant of A2B10G10R10 */
+    D3DFMT_R10G11B11     = 0x52,
+    D3DFMT_R11G11B10     = 0x53,
+
+    /* 16/32-bit float formats */
+    D3DFMT_R16F          = 0x21,
+    D3DFMT_R32F          = 0x22,
+    D3DFMT_G16R16F       = 0x23,
+    D3DFMT_G32R32F       = 0x26,
+    D3DFMT_A16B16G16R16F = 0x34,
+    D3DFMT_A32B32G32R32F = 0x4B,
+
+    /* 16/32-bit uncompressed pairs */
+    D3DFMT_G16R16        = 0x42,
+    D3DFMT_A16L16        = 0x43,
+    D3DFMT_A16B16G16R16  = 0x44,
+    D3DFMT_A32B32G32R32  = 0x45,
+    D3DFMT_G32R32        = 0x46,
+    D3DFMT_L32           = 0x47,
+    D3DFMT_A32L32        = 0x48,
+
+    /* Signed bump (32-bit / 64-bit) */
+    D3DFMT_V32U32        = 0x49,
+    D3DFMT_Q16W16V16U16  = 0x4A,
+    D3DFMT_Q32W32V32U32  = 0x51,
+
+    /* YUV formats */
     D3DFMT_YUY2          = 0x24,
     D3DFMT_UYVY          = 0x25,
 
-    /* Index buffer formats */
+    /* Vertex data (not a texture format) */
+    D3DFMT_VERTEXDATA    = 0x64,
+
+    /* ============================================================
+     * Linear (unswizzled) variants of the above
+     * ============================================================ */
+    D3DFMT_LIN_A1R5G5B5  = 0x10,
+    D3DFMT_LIN_R5G6B5    = 0x11,
+    D3DFMT_LIN_A8R8G8B8  = 0x12,
+    D3DFMT_LIN_L8        = 0x13,
+    D3DFMT_LIN_X8L8V8U8  = 0x14,   /* signed bump: LIN_X8L8V8U8, distinct from LIN_X8R8G8B8 */
+    D3DFMT_LIN_V8U8      = 0x15,   /* signed bump: LIN_V8U8, distinct from LIN_G8B8 */
+    D3DFMT_LIN_R8B8      = 0x16,
+    D3DFMT_LIN_G8B8      = 0x17,
+    D3DFMT_LIN_L6V5U5    = 0x18,   /* signed bump: LIN_L6V5U5, distinct from LIN_R6G5B5 */
+    D3DFMT_LIN_AL8       = 0x1B,
+    D3DFMT_LIN_X1R5G5B5  = 0x1C,
+    D3DFMT_LIN_A4R4G4B4  = 0x1D,
+    D3DFMT_LIN_X8R8G8B8  = 0x1E,
+    D3DFMT_LIN_A8        = 0x1F,
+    D3DFMT_LIN_A8L8      = 0x20,
+    D3DFMT_LIN_D24S8     = 0x2E,
+    D3DFMT_LIN_F24S8     = 0x2F,
+    D3DFMT_LIN_D16       = 0x30,
+    D3DFMT_LIN_F16       = 0x31,
+    D3DFMT_LIN_L16       = 0x35,
+    D3DFMT_LIN_V16U16    = 0x36,
+    D3DFMT_LIN_R6G5B5    = 0x37,
+    D3DFMT_LIN_R5G5B5A1  = 0x3D,
+    D3DFMT_LIN_R4G4B4A4  = 0x3E,
+    D3DFMT_LIN_A8B8G8R8  = 0x3F,
+    D3DFMT_LIN_B8G8R8A8  = 0x40,
+    D3DFMT_LIN_R8G8B8A8  = 0x41,
+
+    /* LIN variants of the extended (10-bit / float / 16-32-bit) formats */
+    D3DFMT_LIN_R16F          = 0x5B,
+    D3DFMT_LIN_R32F          = 0x5C,
+    D3DFMT_LIN_G16R16F       = 0x5D,
+    D3DFMT_LIN_G32R32F       = 0x5E,
+    D3DFMT_LIN_A16B16G16R16F = 0x5F,
+    D3DFMT_LIN_A32B32G32R32F = 0x60,
+    D3DFMT_LIN_G16R16        = 0x61,
+    D3DFMT_LIN_A16L16        = 0x62,
+    D3DFMT_LIN_A16B16G16R16  = 0x63,
+    D3DFMT_LIN_A32B32G32R32  = 0x79,
+    D3DFMT_LIN_G32R32        = 0x7A,
+    D3DFMT_LIN_L32           = 0x67,
+    D3DFMT_LIN_A32L32        = 0x68,
+    D3DFMT_LIN_V32U32        = 0x69,
+    D3DFMT_LIN_Q16W16V16U16  = 0x6A,
+    D3DFMT_LIN_Q32W32V32U32  = 0x6B,
+    D3DFMT_LIN_A2R10G10B10   = 0x6C,
+    D3DFMT_LIN_X2R10G10B10   = 0x6D,
+    D3DFMT_LIN_A2B10G10R10   = 0x6E,
+    D3DFMT_LIN_A2W10V10U10   = 0x6F,
+    D3DFMT_LIN_R10G11B11     = 0x70,
+    D3DFMT_LIN_R11G11B10     = 0x71,
+    D3DFMT_LIN_D24X8         = 0x72,
+    D3DFMT_LIN_D24FS8        = 0x73,
+    D3DFMT_LIN_D32           = 0x74,
+    D3DFMT_LIN_DXN           = 0x75,
+    D3DFMT_LIN_DXT3A         = 0x76,
+    D3DFMT_LIN_DXT5A         = 0x77,
+    D3DFMT_LIN_CTX1          = 0x78,
+
+    /* Index buffer formats (internal, not real Xbox formats) */
     D3DFMT_INDEX16        = 101,
     D3DFMT_INDEX32        = 102,
 } D3DFORMAT;
@@ -192,6 +312,7 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_FOGEND                   = 37,
     D3DRS_FOGDENSITY               = 38,
     D3DRS_EDGEANTIALIAS            = 40,
+    D3DRS_RANGEFOGENABLE           = 48,
     D3DRS_STENCILENABLE            = 52,
     D3DRS_STENCILFAIL              = 53,
     D3DRS_STENCILZFAIL             = 54,
@@ -207,6 +328,7 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_WRAP3                    = 131,
     D3DRS_LIGHTING                 = 137,
     D3DRS_AMBIENT                  = 139,
+    D3DRS_FOGVERTEXMODE             = 140,
     D3DRS_COLORVERTEX              = 141,
     D3DRS_LOCALVIEWER              = 142,
     D3DRS_NORMALIZENORMALS         = 143,
@@ -340,6 +462,14 @@ typedef enum D3DTEXTUREOP {
 #define D3DTA_COMPLEMENT        0x10
 #define D3DTA_ALPHAREPLICATE    0x20
 
+/* Texture coordinate generation (D3DTSS_TEXCOORDINDEX high bits) */
+#define D3DTSS_TCI_PASSTHRU                      0x00000000
+#define D3DTSS_TCI_CAMERASPACENORMAL             0x00010000
+#define D3DTSS_TCI_CAMERASPACEPOSITION           0x00020000
+#define D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR   0x00030000
+#define D3DTSS_TCI_SPHEREMAP                     0x00040000
+#define D3DTSS_TCI_MASK                          0x000F0000
+
 /* Light types */
 #define D3DLIGHT_POINT          1
 #define D3DLIGHT_SPOT           2
@@ -394,11 +524,60 @@ typedef enum D3DPOOL {
     D3DPOOL_SYSTEMMEM   = 2,
 } D3DPOOL;
 
+typedef enum D3DRESOURCETYPE {
+    D3DRTYPE_NONE          = 0,
+    D3DRTYPE_SURFACE       = 1,
+    D3DRTYPE_VOLUME        = 2,
+    D3DRTYPE_TEXTURE       = 3,
+    D3DRTYPE_VOLUMETEXTURE = 4,
+    D3DRTYPE_CUBETEXTURE   = 5,
+    D3DRTYPE_VERTEXBUFFER  = 6,
+    D3DRTYPE_INDEXBUFFER   = 7,
+    D3DRTYPE_PUSHBUFFER    = 8,
+    D3DRTYPE_PALETTE       = 9,
+} D3DRESOURCETYPE;
+
+typedef enum D3DCUBEMAP_FACES {
+    D3DCUBEMAP_FACE_POSITIVE_X = 0,
+    D3DCUBEMAP_FACE_NEGATIVE_X = 1,
+    D3DCUBEMAP_FACE_POSITIVE_Y = 2,
+    D3DCUBEMAP_FACE_NEGATIVE_Y = 3,
+    D3DCUBEMAP_FACE_POSITIVE_Z = 4,
+    D3DCUBEMAP_FACE_NEGATIVE_Z = 5,
+    D3DCUBEMAP_FACE_FORCE_DWORD = 0x7FFFFFFF,
+} D3DCUBEMAP_FACES;
+
 typedef enum D3DMULTISAMPLE_TYPE {
-    D3DMULTISAMPLE_NONE = 0,
-    D3DMULTISAMPLE_2_SAMPLES = 2,
-    D3DMULTISAMPLE_4_SAMPLES = 4,
+    /* Canonical Xbox XDK values. The low two nibbles are the X/Y
+     * sampling grid (sample count = X*Y); bits 12-13 select the
+     * algorithm (0=none, 1=multisample, 2=supersample). */
+    D3DMULTISAMPLE_NONE                                    = 0x0011,
+    D3DMULTISAMPLE_2_SAMPLES_MULTISAMPLE_LINEAR            = 0x1021,
+    D3DMULTISAMPLE_2_SAMPLES_MULTISAMPLE_QUINCUNX          = 0x1121,
+    D3DMULTISAMPLE_2_SAMPLES_SUPERSAMPLE_HORIZONTAL_LINEAR = 0x2021,
+    D3DMULTISAMPLE_2_SAMPLES_SUPERSAMPLE_VERTICAL_LINEAR   = 0x2012,
+    D3DMULTISAMPLE_4_SAMPLES_MULTISAMPLE_LINEAR            = 0x1022,
+    D3DMULTISAMPLE_4_SAMPLES_MULTISAMPLE_GAUSSIAN          = 0x1222,
+    D3DMULTISAMPLE_4_SAMPLES_SUPERSAMPLE_LINEAR            = 0x2022,
+    D3DMULTISAMPLE_4_SAMPLES_SUPERSAMPLE_GAUSSIAN          = 0x2222,
+    D3DMULTISAMPLE_9_SAMPLES_MULTISAMPLE_GAUSSIAN          = 0x1233,
+    D3DMULTISAMPLE_9_SAMPLES_SUPERSAMPLE_GAUSSIAN          = 0x2233,
+
+    /* Legacy shorthand aliases used by older toolkit code. */
+    D3DMULTISAMPLE_2_SAMPLES = D3DMULTISAMPLE_2_SAMPLES_MULTISAMPLE_LINEAR,
+    D3DMULTISAMPLE_4_SAMPLES = D3DMULTISAMPLE_4_SAMPLES_MULTISAMPLE_LINEAR,
 } D3DMULTISAMPLE_TYPE;
+
+/* Resolve an Xbox multisample type to a D3D11 sample count.
+ * NONE (0x0011) yields 1; 2/4/9-sample grids map to their X*Y counts. */
+static inline UINT d3d8_msaa_sample_count(D3DMULTISAMPLE_TYPE ms)
+{
+    UINT xs = (UINT)(((unsigned)ms >> 4) & 0xF);
+    UINT ys = (UINT)ms & 0xF;
+    UINT count = xs ? xs : 1;
+    count *= ys ? ys : 1;
+    return count < 1 ? 1 : count;
+}
 
 typedef enum D3DTEXTUREFILTERTYPE {
     D3DTEXF_NONE            = 0,
@@ -433,8 +612,14 @@ typedef enum D3DCLEAR_FLAGS {
  * Vertex declaration / FVF
  * ================================================================ */
 
+#define D3DFVF_POSITION_MASK    0x00E
 #define D3DFVF_XYZ              0x002
 #define D3DFVF_XYZRHW           0x004
+#define D3DFVF_XYZB1            0x006
+#define D3DFVF_XYZB2            0x008
+#define D3DFVF_XYZB3            0x00A
+#define D3DFVF_XYZB4            0x00C
+#define D3DFVF_XYZB5            0x00E
 #define D3DFVF_NORMAL           0x010
 #define D3DFVF_DIFFUSE          0x040
 #define D3DFVF_SPECULAR         0x080
@@ -445,6 +630,17 @@ typedef enum D3DCLEAR_FLAGS {
 #define D3DFVF_TEX4             0x400
 #define D3DFVF_TEXCOUNT_MASK    0xF00
 #define D3DFVF_TEXCOUNT_SHIFT   8
+
+/* Per-texcoord-set component count (number of floats). A 2-bit field per
+ * set, starting at bit 16. 0 means the default of 2. Encoded as:
+ *   field = (fvf >> (tcoordsize_field_shift + t*2)) & 0x3
+ * On Xbox the convention is D3DFVF_TEXCOORDSIZE1..4 shifting each set by 2.
+ */
+#define D3DFVF_TEXCOORDSIZE1     0x10000   /* 1 float  (set 0) */
+#define D3DFVF_TEXCOORDSIZE2     0x00000   /* 2 floats (set 0, default) */
+#define D3DFVF_TEXCOORDSIZE3     0x20000   /* 3 floats (set 0) */
+#define D3DFVF_TEXCOORDSIZE4     0x30000   /* 4 floats (set 0) */
+#define D3DFVF_TEXCOORDSIZE_MASK 0xFFFF0000
 
 /* ================================================================
  * Structures
@@ -500,6 +696,17 @@ typedef struct D3DSURFACE_DESC {
     UINT Width;
     UINT Height;
 } D3DSURFACE_DESC;
+
+typedef struct D3DVOLUME_DESC {
+    D3DFORMAT Format;
+    DWORD Type;
+    DWORD Usage;
+    D3DPOOL Pool;
+    UINT Size;
+    UINT Width;
+    UINT Height;
+    UINT Depth;
+} D3DVOLUME_DESC;
 
 /* ================================================================
  * Lock flags
@@ -626,6 +833,165 @@ struct IDirect3DSurface8 {
     const IDirect3DSurface8Vtbl *lpVtbl;
 };
 
+#ifdef COBJMACROS
+#define IDirect3DSurface8_QueryInterface(This,riid,ppv) \
+    (This)->lpVtbl->QueryInterface((This),(riid),(ppv))
+#define IDirect3DSurface8_AddRef(This) \
+    (This)->lpVtbl->AddRef((This))
+#define IDirect3DSurface8_Release(This) \
+    (This)->lpVtbl->Release((This))
+#define IDirect3DSurface8_GetDevice(This,ppDevice) \
+    (This)->lpVtbl->GetDevice((This),(ppDevice))
+#define IDirect3DSurface8_GetDesc(This,pDesc) \
+    (This)->lpVtbl->GetDesc((This),(pDesc))
+#define IDirect3DSurface8_LockRect(This,pLockedRect,pRect,Flags) \
+    (This)->lpVtbl->LockRect((This),(pLockedRect),(pRect),(Flags))
+#define IDirect3DSurface8_UnlockRect(This) \
+    (This)->lpVtbl->UnlockRect((This))
+#endif
+
+/* ================================================================
+ * IDirect3DCubeTexture8 interface
+ * ================================================================ */
+
+typedef struct IDirect3DCubeTexture8Vtbl {
+    /* IUnknown */
+    HRESULT (__stdcall *QueryInterface)(IDirect3DCubeTexture8 *self, const IID *riid, void **ppv);
+    ULONG   (__stdcall *AddRef)(IDirect3DCubeTexture8 *self);
+    ULONG   (__stdcall *Release)(IDirect3DCubeTexture8 *self);
+    /* IDirect3DResource8 */
+    HRESULT (__stdcall *GetDevice)(IDirect3DCubeTexture8 *self, IDirect3DDevice8 **ppDevice);
+    DWORD   (__stdcall *SetPriority)(IDirect3DCubeTexture8 *self, DWORD Priority);
+    DWORD   (__stdcall *GetPriority)(IDirect3DCubeTexture8 *self);
+    void    (__stdcall *PreLoad)(IDirect3DCubeTexture8 *self);
+    DWORD   (__stdcall *GetType)(IDirect3DCubeTexture8 *self);
+    /* IDirect3DBaseTexture8 */
+    DWORD   (__stdcall *GetLevelCount)(IDirect3DCubeTexture8 *self);
+    /* IDirect3DCubeTexture8 */
+    HRESULT (__stdcall *GetLevelDesc)(IDirect3DCubeTexture8 *self, UINT Level, D3DSURFACE_DESC *pDesc);
+    HRESULT (__stdcall *GetCubeMapSurface)(IDirect3DCubeTexture8 *self, D3DCUBEMAP_FACES FaceType, UINT Level, IDirect3DSurface8 **ppCubeMapSurface);
+    HRESULT (__stdcall *LockRect)(IDirect3DCubeTexture8 *self, D3DCUBEMAP_FACES FaceType, UINT Level, D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags);
+    HRESULT (__stdcall *UnlockRect)(IDirect3DCubeTexture8 *self, D3DCUBEMAP_FACES FaceType, UINT Level);
+} IDirect3DCubeTexture8Vtbl;
+
+struct IDirect3DCubeTexture8 {
+    const IDirect3DCubeTexture8Vtbl *lpVtbl;
+};
+
+/* ================================================================
+ * IDirect3DVolume interface
+ * ================================================================ */
+
+typedef struct IDirect3DVolume8Vtbl {
+    /* IUnknown */
+    HRESULT (__stdcall *QueryInterface)(IDirect3DVolume8 *self, const IID *riid, void **ppv);
+    ULONG   (__stdcall *AddRef)(IDirect3DVolume8 *self);
+    ULONG   (__stdcall *Release)(IDirect3DVolume8 *self);
+    /* IDirect3DResource8 */
+    HRESULT (__stdcall *GetDevice)(IDirect3DVolume8 *self, IDirect3DDevice8 **ppDevice);
+    HRESULT (__stdcall *GetContainer)(IDirect3DVolume8 *self, const IID *riid, void **ppContainer);
+    /* IDirect3DVolume8 */
+    HRESULT (__stdcall *GetDesc)(IDirect3DVolume8 *self, D3DVOLUME_DESC *pDesc);
+    HRESULT (__stdcall *LockBox)(IDirect3DVolume8 *self, D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD Flags);
+    HRESULT (__stdcall *UnlockBox)(IDirect3DVolume8 *self);
+} IDirect3DVolume8Vtbl;
+
+struct IDirect3DVolume8 {
+    const IDirect3DVolume8Vtbl *lpVtbl;
+};
+
+/* ================================================================
+ * IDirect3DVolumeTexture8 interface
+ * ================================================================ */
+
+typedef struct IDirect3DVolumeTexture8Vtbl {
+    /* IUnknown */
+    HRESULT (__stdcall *QueryInterface)(IDirect3DVolumeTexture8 *self, const IID *riid, void **ppv);
+    ULONG   (__stdcall *AddRef)(IDirect3DVolumeTexture8 *self);
+    ULONG   (__stdcall *Release)(IDirect3DVolumeTexture8 *self);
+    /* IDirect3DResource8 */
+    HRESULT (__stdcall *GetDevice)(IDirect3DVolumeTexture8 *self, IDirect3DDevice8 **ppDevice);
+    DWORD   (__stdcall *SetPriority)(IDirect3DVolumeTexture8 *self, DWORD Priority);
+    DWORD   (__stdcall *GetPriority)(IDirect3DVolumeTexture8 *self);
+    void    (__stdcall *PreLoad)(IDirect3DVolumeTexture8 *self);
+    DWORD   (__stdcall *GetType)(IDirect3DVolumeTexture8 *self);
+    /* IDirect3DBaseTexture8 */
+    DWORD   (__stdcall *GetLevelCount)(IDirect3DVolumeTexture8 *self);
+    /* IDirect3DVolumeTexture8 */
+    HRESULT (__stdcall *GetLevelDesc)(IDirect3DVolumeTexture8 *self, UINT Level, D3DVOLUME_DESC *pDesc);
+    HRESULT (__stdcall *GetVolumeLevel)(IDirect3DVolumeTexture8 *self, UINT Level, IDirect3DVolume8 **ppVolume);
+    HRESULT (__stdcall *LockBox)(IDirect3DVolumeTexture8 *self, UINT Level, D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD Flags);
+    HRESULT (__stdcall *UnlockBox)(IDirect3DVolumeTexture8 *self, UINT Level);
+} IDirect3DVolumeTexture8Vtbl;
+
+struct IDirect3DVolumeTexture8 {
+    const IDirect3DVolumeTexture8Vtbl *lpVtbl;
+};
+
+/* ================================================================
+ * IDirect3DBaseTexture8 interface (common subset used by SetTexture)
+ * ================================================================ */
+
+typedef struct IDirect3DBaseTexture8Vtbl {
+    /* IUnknown */
+    HRESULT (__stdcall *QueryInterface)(IDirect3DBaseTexture8 *self, const IID *riid, void **ppv);
+    ULONG   (__stdcall *AddRef)(IDirect3DBaseTexture8 *self);
+    ULONG   (__stdcall *Release)(IDirect3DBaseTexture8 *self);
+    /* IDirect3DResource8 */
+    HRESULT (__stdcall *GetDevice)(IDirect3DBaseTexture8 *self, IDirect3DDevice8 **ppDevice);
+    DWORD   (__stdcall *SetPriority)(IDirect3DBaseTexture8 *self, DWORD Priority);
+    DWORD   (__stdcall *GetPriority)(IDirect3DBaseTexture8 *self);
+    void    (__stdcall *PreLoad)(IDirect3DBaseTexture8 *self);
+    DWORD   (__stdcall *GetType)(IDirect3DBaseTexture8 *self);
+    /* IDirect3DBaseTexture8 */
+    DWORD   (__stdcall *GetLevelCount)(IDirect3DBaseTexture8 *self);
+} IDirect3DBaseTexture8Vtbl;
+
+struct IDirect3DBaseTexture8 {
+    const IDirect3DBaseTexture8Vtbl *lpVtbl;
+};
+
+#ifdef COBJMACROS
+#define IDirect3DBaseTexture8_AddRef(This) \
+    (This)->lpVtbl->AddRef((This))
+#define IDirect3DBaseTexture8_Release(This) \
+    (This)->lpVtbl->Release((This))
+#define IDirect3DBaseTexture8_GetType(This) \
+    (This)->lpVtbl->GetType((This))
+#define IDirect3DBaseTexture8_GetLevelCount(This) \
+    (This)->lpVtbl->GetLevelCount((This))
+#define IDirect3DCubeTexture8_AddRef(This) \
+    (This)->lpVtbl->AddRef((This))
+#define IDirect3DCubeTexture8_Release(This) \
+    (This)->lpVtbl->Release((This))
+#define IDirect3DCubeTexture8_GetLevelCount(This) \
+    (This)->lpVtbl->GetLevelCount((This))
+#define IDirect3DCubeTexture8_GetCubeMapSurface(This,Face,Level,pp) \
+    (This)->lpVtbl->GetCubeMapSurface((This),(Face),(Level),(pp))
+#define IDirect3DCubeTexture8_LockRect(This,Face,Level,pRect2,pRect,Flags) \
+    (This)->lpVtbl->LockRect((This),(Face),(Level),(pRect2),(pRect),(Flags))
+#define IDirect3DCubeTexture8_UnlockRect(This,Face,Level) \
+    (This)->lpVtbl->UnlockRect((This),(Face),(Level))
+#define IDirect3DVolume8_AddRef(This) \
+    (This)->lpVtbl->AddRef((This))
+#define IDirect3DVolume8_Release(This) \
+    (This)->lpVtbl->Release((This))
+#define IDirect3DVolume8_GetDesc(This,pDesc) \
+    (This)->lpVtbl->GetDesc((This),(pDesc))
+#define IDirect3DVolume8_LockBox(This,pLocked,pBox,Flags) \
+    (This)->lpVtbl->LockBox((This),(pLocked),(pBox),(Flags))
+#define IDirect3DVolume8_UnlockBox(This) \
+    (This)->lpVtbl->UnlockBox((This))
+#define IDirect3DVolumeTexture8_AddRef(This) \
+    (This)->lpVtbl->AddRef((This))
+#define IDirect3DVolumeTexture8_Release(This) \
+    (This)->lpVtbl->Release((This))
+#define IDirect3DVolumeTexture8_LockBox(This,Level,pLocked,pBox,Flags) \
+    (This)->lpVtbl->LockBox((This),(Level),(pLocked),(pBox),(Flags))
+#define IDirect3DVolumeTexture8_UnlockBox(This,Level) \
+    (This)->lpVtbl->UnlockBox((This),(Level))
+#endif
+
 /* ================================================================
  * IDirect3DDevice8 interface (COM vtable)
  *
@@ -727,6 +1093,14 @@ typedef struct IDirect3DDevice8Vtbl {
 
     /* Swap / display */
     HRESULT (__stdcall *Swap)(IDirect3DDevice8 *self, DWORD Flags);
+
+    /* ============================================================
+     * Extensions appended by xboxrecomp (kept after the historical
+     * slots so existing slot indices are unchanged).
+     * ============================================================ */
+    HRESULT (__stdcall *CreateImageSurface)(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, IDirect3DSurface8 **ppSurface);
+    HRESULT (__stdcall *CreateCubeTexture)(IDirect3DDevice8 *self, UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture8 **ppCubeTexture);
+    HRESULT (__stdcall *CreateVolumeTexture)(IDirect3DDevice8 *self, UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture8 **ppVolumeTexture);
 } IDirect3DDevice8Vtbl;
 
 struct IDirect3DDevice8 {
@@ -780,6 +1154,13 @@ void xbox_d3d8_make_current(void);
 void xbox_d3d8_pump_events(void);
 
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
+
+/**
+ * Set the window title used by the D3D8 GL backend (POSIX builds) when it
+ * creates its own SDL window. The Win32 backend renders into a host-provided
+ * HWND and does not use this. Passing NULL restores the generic default.
+ */
+void xbox_D3D8SetWindowTitle(const char *title);
 
 /**
  * Get the current D3D device (Xbox uses a global device pointer).

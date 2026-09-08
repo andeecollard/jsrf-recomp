@@ -35,14 +35,41 @@ class DirectionFlagLifterTest(unittest.TestCase):
         # The whole point: no unconditional forward step survives.
         self.assertNotIn("edi++;", generated)
 
-    def test_rep_movsb_keeps_the_block_copy_only_for_the_forward_case(self):
+    def test_rep_movsb_uses_the_block_copy_only_when_it_cannot_overlap(self):
         generated = _lift(Instruction(0, 2, "rep movsb", "", "f3a4"))
 
-        # Forwards is still one memcpy...
-        self.assertIn("if (!g_df) { memcpy(", generated)
-        # ...and backwards must not be, because memcpy cannot express it.
-        self.assertIn("else {", generated)
+        # memcpy is still there for the common case, but guarded: it is only
+        # reached when the ranges provably do not overlap.
+        self.assertIn("memcpy(_d, _s, _n)", generated)
+        self.assertIn("_d + _n <= _s || _s + _n <= _d", generated)
+
+    def test_rep_movsb_propagates_an_overlapping_forward_copy(self):
+        """The LZ run case: distance 1, length N repeats one byte N times.
+
+        rep movs copies an element at a time, so a forward copy whose
+        destination is inside the source reads what it has just written.
+        memcpy is undefined there and a vectorised one reads ahead, which
+        silently corrupts every run a decompressor emits.
+        """
+        generated = _lift(Instruction(0, 2, "rep movsb", "", "f3a4"))
+
+        # An explicit ascending byte loop, not memmove: memmove would give the
+        # copy-through-a-temporary answer, which is a different result.
+        self.assertIn("for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i];", generated)
+        self.assertNotIn("memmove", generated)
+
+    def test_rep_movsb_backward_case_is_still_a_loop(self):
+        generated = _lift(Instruction(0, 2, "rep movsb", "", "f3a4"))
+
         self.assertIn("MEM8(edi - _i) = MEM8(esi - _i)", generated)
+
+    def test_rep_movsd_overlap_steps_by_dwords(self):
+        # Element granularity matters: a dword-at-a-time propagation is not
+        # the same sequence of bytes as a byte-at-a-time one.
+        generated = _lift(Instruction(0, 2, "rep movsd", "", "f3a5"))
+
+        self.assertIn("MEM32(edi + _i*4) = MEM32(esi + _i*4)", generated)
+        self.assertIn("_d + _n <= _s || _s + _n <= _d", generated)
 
     def test_unprefixed_string_ops_step_by_the_direction_flag(self):
         for mnemonic, size in (("movsb", 1), ("stosw", 2), ("lodsd", 4)):

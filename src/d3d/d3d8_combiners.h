@@ -248,6 +248,7 @@ typedef struct NV2APSConstants {
     UINT  alpha_func;                       /* D3DCMPFUNC enum value */
     UINT  alpha_test_enable;                /* 0 or 1 */
     UINT  fog_enable;                       /* 0 or 1 */
+    UINT  alpha_only[NV2A_MAX_TEXTURES];     /* A8 sampling uses white RGB */
 } NV2APSConstants;
 
 /* ================================================================

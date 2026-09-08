@@ -19,7 +19,7 @@ from .disasm import Disassembler
 def main():
     parser = argparse.ArgumentParser(
         prog="tools.disasm",
-        description="Burnout 3 XBE Disassembly Tool - "
+        description="Xbox XBE Disassembly Tool - "
                     "Static analysis and function detection for Xbox executables",
     )
 
@@ -37,7 +37,7 @@ def main():
     parser.add_argument(
         "--analysis-json",
         default=None,
-        help="Path to burnout3_analysis.json (auto-detected if not specified)",
+        help="Path to the XBE analysis JSON (auto-detected if not specified)",
     )
     parser.add_argument(
         "--text-only",
@@ -95,6 +95,10 @@ def main():
     args = parser.parse_args()
 
     try:
+        # Derive the section layout from the XBE being analyzed.
+        from . import config
+        config.configure_from_xbe(args.xbe_path)
+
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
         seed_funcs = []
         for _seed_path in (args.seed_functions or []):

@@ -144,7 +144,7 @@ struct VS_IN {
     float4 pos     : POSITION;
     float3 normal  : NORMAL;
     float4 diffuse : COLOR0;
-    float2 tex0    : TEXCOORD0;
+    float4 tex0    : TEXCOORD0;
 };
 
 VS_OUT main(VS_IN input) {
@@ -301,12 +301,19 @@ if (fvf & D3DFVF_DIFFUSE) {
     };
     offset += 4;
 }
-// Texture coordinates: (fvf >> 8) & 0xF = number of tex coord sets
+// Texture coordinates: (fvf >> 8) & 0xF = number of tex coord sets.
+// Each set's component count comes from the D3DFVF_TEXCOORDSIZE field at
+// bits (16 + t*2): 0 defaults to 2. Sets map to R32_FLOAT (1), R32G32_FLOAT
+// (2), R32G32B32_FLOAT (3) or R32G32B32A32_FLOAT (4); the VS declares all
+// texcoords as float4 (missing components read as 0).
 ```
 
 ## Texture Format Translation
 
-Xbox D3D8 uses DXT compressed textures. D3D11 supports these natively as BC formats:
+Xbox `D3DFORMAT` constants use the packed XDK binary values (see
+`src/d3d/d3d8_xbox.h`). Swizzled formats are unswizzled to
+linear at upload; `D3DFMT_LIN_*` formats are already linear. Formats with
+no 1:1 D3D11 equivalent are converted in software at upload.
 
 | D3D8 Format | D3D11/DXGI Format | Bits/Pixel | Notes |
 |-------------|-------------------|------------|-------|
@@ -317,8 +324,54 @@ Xbox D3D8 uses DXT compressed textures. D3D11 supports these natively as BC form
 | D3DFMT_X8R8G8B8 | DXGI_FORMAT_B8G8R8X8_UNORM | 32 | No alpha |
 | D3DFMT_R5G6B5 | DXGI_FORMAT_B5G6R5_UNORM | 16 | |
 | D3DFMT_A1R5G5B5 | DXGI_FORMAT_B5G5R5A1_UNORM | 16 | |
+| D3DFMT_L8 | DXGI_FORMAT_R8_UNORM | 8 | Luminance |
+| D3DFMT_A8 | DXGI_FORMAT_A8_UNORM | 8 | |
+| D3DFMT_A8L8 | DXGI_FORMAT_R8G8_UNORM | 16 | Luminance + alpha |
+| D3DFMT_V8U8 | DXGI_FORMAT_R8G8_SNORM | 16 | Signed bump |
+| D3DFMT_V16U16 | DXGI_FORMAT_R16G16_SNORM | 32 | Signed bump |
+| D3DFMT_L6V5U5 | DXGI_FORMAT_R8G8_SNORM | 16 | Signed bump; V/U sign-extended at upload (L channel dropped) |
+| D3DFMT_Q8W8V8U8 | DXGI_FORMAT_R8G8B8A8_SNORM | 32 | Signed bump |
+| D3DFMT_X8L8V8U8 | DXGI_FORMAT_R8G8B8A8_SNORM | 32 | Signed bump |
+| D3DFMT_P8 | DXGI_FORMAT_B8G8R8A8_UNORM | 32 | Palettized; expanded to BGRA through the stage palette at upload |
+| D3DFMT_YUY2 / UYVY | DXGI_FORMAT_B8G8R8A8_UNORM | 32 | YUV 4:2:2; converted to BGRA (BT.601) at upload |
+| D3DFMT_R5G5B5A1 | DXGI_FORMAT_B5G5R5A1_UNORM | 16 | Bit-reordered at upload |
+| D3DFMT_R4G4B4A4 | DXGI_FORMAT_B4G4R4A4_UNORM | 16 | Bit-reordered at upload |
+| D3DFMT_R16F | DXGI_FORMAT_R16_FLOAT | 16 | |
+| D3DFMT_R32F | DXGI_FORMAT_R32_FLOAT | 32 | |
+| D3DFMT_G16R16F | DXGI_FORMAT_R16G16_FLOAT | 32 | |
+| D3DFMT_G32R32F | DXGI_FORMAT_R32G32_FLOAT | 64 | |
+| D3DFMT_A16B16G16R16F | DXGI_FORMAT_R16G16B16A16_FLOAT | 64 | BGRA→RGBA swapped at upload |
+| D3DFMT_A32B32G32R32F | DXGI_FORMAT_R32G32B32A32_FLOAT | 128 | |
+| D3DFMT_G16R16 | DXGI_FORMAT_R16G16_UNORM | 32 | |
+| D3DFMT_A16L16 | DXGI_FORMAT_R16G16_UNORM | 32 | Luma + alpha |
+| D3DFMT_A16B16G16R16 | DXGI_FORMAT_R16G16B16A16_UNORM | 64 | BGRA→RGBA swapped at upload |
+| D3DFMT_A32B32G32R32 | DXGI_FORMAT_R32G32B32A32_FLOAT | 128 | No 128-bit UNORM in DXGI |
+| D3DFMT_G32R32 | DXGI_FORMAT_R32G32_FLOAT | 64 | No R32G32 UNORM in DXGI |
+| D3DFMT_L32 | DXGI_FORMAT_R32_FLOAT | 32 | 32-bit luminance |
+| D3DFMT_A32L32 | DXGI_FORMAT_R32G32_FLOAT | 64 | |
+| D3DFMT_V32U32 | DXGI_FORMAT_R32G32_FLOAT | 64 | Signed bump; 32-bit ints sampled as float |
+| D3DFMT_Q16W16V16U16 | DXGI_FORMAT_R16G16B16A16_SNORM | 64 | Signed bump |
+| D3DFMT_Q32W32V32U32 | DXGI_FORMAT_R32G32B32A32_SINT | 128 | Signed bump; no 128-bit SNORM in DXGI |
+| D3DFMT_A2R10G10B10 | DXGI_FORMAT_R10G10B10A2_UNORM | 32 | A/R fields swapped at upload |
+| D3DFMT_X2R10G10B10 | DXGI_FORMAT_R10G10B10A2_UNORM | 32 | A/R fields swapped at upload |
+| D3DFMT_A2B10G10R10 | DXGI_FORMAT_R10G10B10A2_UNORM | 32 | |
+| D3DFMT_A2W10V10U10 | DXGI_FORMAT_R10G10B10A2_UNORM | 32 | Signed bump |
+| D3DFMT_R10G11B11 | DXGI_FORMAT_R11G11B10_FLOAT | 32 | No exact DXGI; approx |
+| D3DFMT_R11G11B10 | DXGI_FORMAT_R11G11B10_FLOAT | 32 | |
+| D3DFMT_D24X8 | DXGI_FORMAT_D24_UNORM_S8_UINT | 32 | Stencil unused |
+| D3DFMT_D24FS8 | DXGI_FORMAT_D24_UNORM_S8_UINT | 32 | Float depth approximated |
+| D3DFMT_D32 | DXGI_FORMAT_D32_FLOAT | 32 | Fixed depth approximated as float |
+| D3DFMT_DXN | DXGI_FORMAT_BC5_UNORM | 8 | 2-channel normal compression |
+| D3DFMT_DXT3A | DXGI_FORMAT_BC2_UNORM | 8 | Explicit-alpha DXT3 variant |
+| D3DFMT_DXT5A | DXGI_FORMAT_BC3_UNORM | 8 | Alpha-only DXT5 variant |
+| D3DFMT_CTX1 | DXGI_FORMAT_BC1_UNORM | 4 | No exact DXGI; approx |
 
-The format conversion is straightforward because Xbox uses the same byte ordering as PC for these formats.
+The core ordering formats map directly because Xbox and D3D11 use the same
+byte ordering. Formats that only differ in channel order/width are converted
+in `d3d8_convert_linear_pixels()` during LockRect upload; the conversion
+runs after unswizzling so it sees linear data. Depth/stencil formats map to
+D16/D24 stencil DXGI formats; `F16` has no D3D11 float-depth equivalent and
+falls back to D16 for depth-stencil surfaces.
 
 ## DrawPrimitive Translation
 

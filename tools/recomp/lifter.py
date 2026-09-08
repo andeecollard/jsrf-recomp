@@ -253,6 +253,15 @@ _RESULT_ZF_SF_SETTERS = frozenset({
 # `_flags` fallback rather than being answered from one arbitrary predecessor.
 MERGED_RESULT_SETTER = "__merged_result"
 
+# Arithmetic whose carry-out the lifter computes into _cf next to the write.
+#
+# A jb/jae reading CF after one of these is exact, which matters because the
+# generic fallback is a _flags variable nothing ever assigns -- the condition
+# came out always-false. MSVC's bit-oriented decoders are built entirely from
+# this shape: "add reg, reg" to shift the top bit into CF, then jae on it.
+CF_TRACKED = frozenset({
+    "add", "sub", "adc", "sbb", "shl", "shr", "sar",
+})
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
@@ -394,8 +403,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
                     return f"MEMD({_fmt_mem(op)})"
                 return f"MEMF({_fmt_mem(op)})"
             return _fmt_operand_read(op)
-        a = _sse_op(flag_ops[0]) if len(flag_ops) >= 1 else "0.0f"
-        b = _sse_op(flag_ops[1]) if len(flag_ops) >= 2 else "0.0f"
+        # Read the snapshot the compare left rather than the operands, which
+        # may since have been overwritten. _sse_op stays in use for the
+        # description only.
+        (void_a, void_b) = (
+            _sse_op(flag_ops[0]) if len(flag_ops) >= 1 else "0.0f",
+            _sse_op(flag_ops[1]) if len(flag_ops) >= 2 else "0.0f",
+        )
+        desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
+        a, b = "_fca", "_fcb"
         # comiss uses unsigned condition codes (CF, ZF)
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
@@ -491,6 +507,26 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) & ({rhs})))", desc
         return None
+
+    # ── carry conditions, from the _cf the arithmetic already produced ──
+    #
+    # Ahead of the per-mnemonic rules below, which reconstruct CF from the
+    # operands after the write: that reconstruction is wrong whenever the
+    # destination is also the source, because both sides then read the result.
+    # "add edx, edx" -- the way MSVC shifts a bit into the carry -- turned into
+    # "edx < edx", always false. _cf is computed before the write, so it holds
+    # for every operand shape, and the translator declares it exactly when a
+    # branch like this one is going to read it.
+    if flag_setter in CF_TRACKED:
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        # ZF as well: after these the destination holds the result.
+        if jcc in ("jbe", "jna"):
+            return f"(_cf || {lhs} == 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return f"(!_cf && {lhs} != 0)", desc
 
     # ── sub: a = a - b, flags from (a_orig - b) ──
     if flag_setter == "sub":
@@ -654,6 +690,22 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── bt/bts/btr/btc: bit test, sets CF ──
     if flag_setter in ("bt", "bts", "btr", "btc"):
         if rhs is None:
+            return None
+        # Same bit-string rule as the lifter above: a memory bit base with a
+        # register offset addresses a string, so the dword is chosen by
+        # offset/32 and only then is the bit offset%32. This is the half that
+        # does the testing -- MSVC's strpbrk loop is "bt [esp], eax" fused with
+        # the jae that follows it.
+        if (len(flag_ops) >= 2 and flag_ops[0].type == "mem"
+                and flag_ops[1].type != "imm"):
+            base = _fmt_mem(flag_ops[0])
+            off = _fmt_operand_read(flag_ops[1])
+            bit = (f"((MEM32(({base}) + (((int32_t)({off}) >> 5) * 4))"
+                   f" >> (({off}) & 31)) & 1)")
+            if jcc in ("jb", "jnae", "jc"):
+                return bit, desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return f"!{bit}", desc
             return None
         if jcc in ("jb", "jnae", "jc"):
             return f"(({lhs} >> ({rhs} & 31)) & 1)", desc
@@ -1122,6 +1174,45 @@ class Lifter:
         # a comment and the bit was silently left alone.
         if m in ("bt", "btr", "bts", "btc") and nops >= 2:
             dst, bit = ops[0], ops[1]
+
+            # A memory bit base with a *register* offset is a bit string, not a
+            # dword: the operand addresses the byte holding bit 0, and the
+            # offset then runs over the whole string, so the hardware reads the
+            # dword at base + (offset/32)*4 and takes bit offset%32. Masking the
+            # offset to 31 instead -- which is right only for a register bit
+            # base, where the offset really is taken modulo the operand size --
+            # folds the entire string onto its first dword.
+            #
+            # MSVC builds strpbrk, strspn and strcspn out of exactly this: eight
+            # zero dwords pushed as a 256-bit character map, "bts [esp], eax"
+            # per character of the set, "bt [esp], eax" per character of the
+            # string. Folded onto one dword the map aliases mod 32, so '?'
+            # (0x3F) sets the same bit '_' (0x5F) tests. Half-Life 2 stats every
+            # file for wildcards before opening it, and its archives are
+            # zip0_xbox.xzp and zip0_xbox_english.xzp -- every path with an
+            # underscore came back "contains a wildcard" and the engine loaded
+            # no content at all.
+            #
+            # An immediate offset is genuinely limited to 0..31 within the
+            # addressed dword, so it keeps the simple form.
+            if dst.type == "mem" and bit.type != "imm":
+                base = _fmt_mem(dst)
+                off = _fmt_operand_read(bit)
+                word = f"MEM32(({base}) + (((int32_t)({off}) >> 5) * 4))"
+                index = f"(({off}) & 31)"
+                out = []
+                if self.needs_cf:
+                    out.append(f"_cf = (int)(({word} >> {index}) & 1u);"
+                               f" /* {m}: CF = bit */")
+                update = {"btr": f"{word} & ~(1u << {index})",
+                          "bts": f"{word} | (1u << {index})",
+                          "btc": f"{word} ^ (1u << {index})"}.get(m)
+                if update:
+                    out.append(f"{word} = ({update}); /* {m} */")
+                elif not out:
+                    out.append(f"/* bt {insn.op_str}: no CF consumer */")
+                return out
+
             index = (f"({_fmt_imm(bit.imm)})" if bit.type == "imm"
                      else f"({_fmt_operand_read(bit)} & 31)")
             value = _fmt_operand_read(dst)
@@ -1247,6 +1338,27 @@ class Lifter:
                 return [f"/* {m}: no adc/sbb in this function consumes CF */"]
             expr = {"stc": "1", "clc": "0", "cmc": "!_cf"}[m]
             return [f"_cf = {expr}; /* {m} */"]
+
+        # ── Time stamp counter ──
+        #
+        # The guest reads wall-clock time through it. Xbox's
+        # QueryPerformanceCounter is literally `rdtsc`, and its
+        # QueryPerformanceFrequency returns the CPU clock as a constant --
+        # Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7. So a
+        # frame timer computes seconds as counter / 733333333, and an rdtsc
+        # that does nothing leaves the counter fixed: every "now - last" is
+        # zero, and a loop waiting for time to pass never finishes. HL2 spins
+        # 300 million times in sub_0040F4E0 doing exactly that.
+        #
+        # The runtime scales the host's counter to the console's clock rate
+        # rather than returning the host TSC, so the guest's own division by
+        # its hardcoded frequency yields real seconds.
+        if m == "rdtsc":
+            return [
+                "{ uint64_t _tsc = xbox_ReadTimeStampCounter();",
+                "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); }"
+                "  /* rdtsc */",
+            ]
 
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
@@ -1542,7 +1654,9 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "0") + " /* xor self */"]
+            out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
+            out.append(_fmt_operand_write(ops[0], "0") + " /* xor self */")
+            return out
         expr = f"{dst} {c_op} {src}"
         out = []
         if self.needs_cf:
@@ -2096,11 +2210,25 @@ class Lifter:
         cond_info = COND_MAP.get(jcc)
         desc = cond_info[2] if cond_info else jcc
         mark = f"{jcc}: {desc} - UNRESOLVED FLAGS, branch never taken"
+
+        # Flag tracking resets at a block boundary, because which predecessor
+        # arrives is not known here. _cf survives it: it is a real variable
+        # holding the carry, so a jb/jae landing on a label still reads the
+        # right bit while the generic _flags fallback -- which nothing ever
+        # assigns -- is silently always false. The XCompress bit reader jumps
+        # into the middle of its refill exactly this way.
+        cond = "_flags"
+        if self.needs_cf:
+            if jcc in ("jb", "jnae", "jc"):
+                cond = "_cf"
+            elif jcc in ("jae", "jnb", "jnc"):
+                cond = "!_cf"
+
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {mark} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
-            return [f"if (_flags /* {mark} */) goto loc_{target:08X};"]
+                return [f"if ({cond} /* {mark} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+            return [f"if ({cond} /* {mark} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
     # ── SETcc / CMOVcc ──
@@ -2125,21 +2253,49 @@ class Lifter:
         # literal, because EFLAGS.DF decides the direction and the block
         # forms (memcpy/memset) are only valid forwards. See g_df in
         # recomp_types.h for what a missing direction flag actually costs.
+        # Forward "rep movs" is NOT memcpy. The hardware copies one element at
+        # a time, so when the ranges overlap with the destination ahead of the
+        # source the copy reads bytes it has already written and the pattern
+        # propagates -- which is exactly how every LZ decompressor emits a run:
+        # a match of distance 1 and length N repeats one byte N times. memcpy
+        # is undefined on overlap, and a vectorised one reads ahead and writes
+        # the pre-copy bytes, so runs come out wrong while everything else
+        # looks fine.
+        #
+        # Half-Life 2's disc archives decompressed to exactly the right length
+        # with 165,448 wrong bytes in them, spread over 352 of 26,530 blocks:
+        # every difference a zero where a repeated byte belonged. The backward
+        # (DF=1) path was already an explicit loop and was already correct;
+        # only the common direction took the shortcut.
+        #
+        # memcpy is still used when the ranges provably do not overlap, which
+        # is the overwhelming majority of calls.
         if "movsb" in m:
-            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);"
-                    " esi += ecx; edi += ecx; }",
+            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
+                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
+                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
+                    "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
                     "ecx = 0; /* rep movsb */"]
         if "movsd" in m:
-            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);"
-                    " esi += ecx * 4; edi += ecx * 4; }",
+            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
+                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
+                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
+                    "  esi += ecx * 4; edi += ecx * 4; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi - _i*4) = MEM32(esi - _i*4); esi -= ecx * 4; edi -= ecx * 4; }",
                     "ecx = 0; /* rep movsd */"]
         if "movsw" in m:
-            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);"
-                    " esi += ecx * 2; edi += ecx * 2; }",
+            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
+                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
+                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
+                    "  esi += ecx * 2; edi += ecx * 2; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
                     "ecx = 0; /* rep movsw */"]
@@ -2612,7 +2768,13 @@ class Lifter:
         # ── Comparison ──
         if m in ("comiss", "comisd", "ucomiss", "ucomisd"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} - sets EFLAGS */"]
+                # Snapshot, not a comment. The consuming jcc can be several
+                # instructions away, and what sits between it and here is
+                # frequently a write to a register the operand address was
+                # built from -- so the operands have to be read now, while
+                # they still mean what the compare meant.
+                return [f"_fca = {_sse_read(ops[0])}; _fcb = {_sse_read(ops[1])};"
+                        f" /* {m} */"]
 
         # ── Bitwise ──
         # Done on the integer lanes: these carry sign-mask and select idioms
@@ -2656,8 +2818,8 @@ class Lifter:
         # arithmetic ops (addps/mulps) already use -- but computing the low lane
         # is strictly better than the TODO no-op these used to hit, which left
         # the destination stale and fed garbage into vector normalisation.
-        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; Wreckless
-        # uses them heavily, Burnout 3 did not, which is why this surfaced now.
+        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; some titles
+        # use them heavily, which is why this surfaced on those binaries.
         if m == "sqrtps":
             if nops >= 2:
                 return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")

@@ -2,6 +2,7 @@ import unittest
 
 from .disasm import BasicBlock, Instruction, Operand
 from .lifter import Lifter, lift_basic_block
+from .translator import FunctionTranslator
 
 
 class CarryLifterTest(unittest.TestCase):
@@ -176,3 +177,71 @@ class CarryLifterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CarryBranchTest(unittest.TestCase):
+    """jb/jae after arithmetic must read the carry, not the dead _flags.
+
+    The Xbox XCompress decoder in Half-Life 2's default.xbe is a bit reader
+    built out of this shape -- "add edx, edx" shifts the top bit into CF and
+    the branch tests it. Lowering the branch to _flags, which nothing ever
+    assigns, made it unconditionally false and the decoder walked off into
+    unmapped memory on its first block.
+    """
+
+    @staticmethod
+    def _add_then(jcc):
+        add = Instruction(0, 2, "add", "edx, edx", "03d2")
+        add.operands = [
+            Operand(type="reg", reg="edx"),
+            Operand(type="reg", reg="edx"),
+        ]
+        branch = Instruction(2, 2, jcc, "0x100", "7300")
+        branch.operands = [Operand(type="imm", imm=0x100)]
+        lifter = Lifter()
+        lifter.needs_cf = True
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[add, branch]))
+        return chr(10).join(lifted)
+
+    def test_add_publishes_carry(self):
+        self.assertIn(
+            "_cf = (int)((((uint64_t)(edx) + (uint64_t)(edx)) >> 32) & 1);",
+            self._add_then("jae"),
+        )
+
+    def test_jae_reads_carry(self):
+        generated = self._add_then("jae")
+        self.assertIn("if (!_cf", generated)
+        self.assertNotIn("_flags", generated)
+
+    def test_jb_reads_carry(self):
+        generated = self._add_then("jb")
+        self.assertIn("if (_cf", generated)
+        self.assertNotIn("_flags", generated)
+
+
+class NeedsCarryTest(unittest.TestCase):
+    """A function is only charged for _cf when something reads it."""
+
+    @staticmethod
+    def _insn(mnemonic, ops=()):
+        insn = Instruction(0, 2, mnemonic, "", "0000")
+        insn.operands = list(ops)
+        return insn
+
+    def test_carry_branch_after_add_needs_cf(self):
+        self.assertTrue(FunctionTranslator._function_needs_cf(
+            [self._insn("add"), self._insn("jae")]))
+
+    def test_carry_branch_after_cmp_does_not(self):
+        # cmp lowers jae directly from its own operands.
+        self.assertFalse(FunctionTranslator._function_needs_cf(
+            [self._insn("add"), self._insn("cmp"), self._insn("jae")]))
+
+    def test_signed_branch_after_add_does_not(self):
+        self.assertFalse(FunctionTranslator._function_needs_cf(
+            [self._insn("add"), self._insn("jge")]))
+
+    def test_adc_alone_needs_cf(self):
+        self.assertTrue(FunctionTranslator._function_needs_cf(
+            [self._insn("adc")]))

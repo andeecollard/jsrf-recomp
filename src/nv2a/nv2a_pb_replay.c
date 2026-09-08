@@ -194,48 +194,55 @@ extern int fe_menu_get_pb_state(void);
 static const char *main_items[] = { "WORLD TOUR", "SINGLE EVENT", "MULTIPLAYER", "XBOX LIVE", "DRIVER DETAILS" };
 static const char *single_items[] = { "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH" };
 
+/* Find the game's window for title updates. Any top-level window whose
+ * title ends with "- Static Recompilation" matches; falls back to the active
+ * window. The lookup is generic, not tied to one title. */
+static BOOL CALLBACK find_recomp_window(HWND hwnd, LPARAM lParam)
+{
+    (void)lParam;
+    char title[256];
+    if (GetWindowTextA(hwnd, title, sizeof(title)) > 0) {
+        size_t len = strlen(title);
+        const char *suffix = "- Static Recompilation";
+        size_t slen = strlen(suffix);
+        if (len >= slen && strcmp(title + len - slen, suffix) == 0) {
+            *(HWND *)lParam = hwnd;
+            return FALSE;  /* stop enumerating */
+        }
+    }
+    return TRUE;
+}
+
+static HWND find_recomp_window_hwnd(void)
+{
+    HWND hwnd = NULL;
+    EnumWindows(find_recomp_window, (LPARAM)&hwnd);
+    return hwnd;
+}
+
 static void update_menu_title(int menu, int cursor)
 {
     char title[256];
+    const char *name = (menu >= 0 && menu < MENU_COUNT) ? menu_names[menu] : "Unknown";
     const char *sel = "";
 
     switch (menu) {
     case MENU_MAIN:
-        if (cursor < 5) sel = main_items[cursor];
-        snprintf(title, sizeof(title), "Burnout 3 — Main Menu [%s]", sel);
-        break;
     case MENU_SINGLE_EVENT:
-        if (cursor < 4) sel = single_items[cursor];
-        snprintf(title, sizeof(title), "Burnout 3 — Single Event [%s]", sel);
-        break;
-    case MENU_WORLD_TOUR:
-        snprintf(title, sizeof(title), "Burnout 3 — World Tour");
-        break;
-    case MENU_RACE_SETUP:
-        snprintf(title, sizeof(title), "Burnout 3 — Race Setup");
-        break;
-    case MENU_TIME_ATTACK:
-        snprintf(title, sizeof(title), "Burnout 3 — Time Attack");
-        break;
-    case MENU_ROAD_RAGE:
-        snprintf(title, sizeof(title), "Burnout 3 — Road Rage");
-        break;
-    case MENU_CRASH_SELECT:
-        snprintf(title, sizeof(title), "Burnout 3 — Crash Select");
-        break;
-    case MENU_DRIVER_DETAILS:
-        snprintf(title, sizeof(title), "Burnout 3 — Driver Details");
+        sel = (menu == MENU_MAIN && cursor < 5) ? main_items[cursor]
+            : (cursor < 4)                      ? single_items[cursor] : "";
         break;
     default:
-        snprintf(title, sizeof(title), "Burnout 3: Takedown");
         break;
     }
 
+    if (sel[0])
+        snprintf(title, sizeof(title), "Push Buffer Replay - %s [%s]", name, sel);
+    else
+        snprintf(title, sizeof(title), "Push Buffer Replay - %s", name);
+
     /* Find and update the game window */
-    HWND hwnd = FindWindowA(NULL, NULL);
-    /* Try known window class or enumerate */
-    hwnd = FindWindowA("Burnout3Class", NULL);
-    if (!hwnd) hwnd = FindWindowA(NULL, "Burnout 3: Takedown - Static Recompilation");
+    HWND hwnd = find_recomp_window_hwnd();
     if (!hwnd) hwnd = GetActiveWindow();
     if (hwnd) SetWindowTextA(hwnd, title);
 }

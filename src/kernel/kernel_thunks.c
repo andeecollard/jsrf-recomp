@@ -1,15 +1,16 @@
 /*
  * kernel_thunks.c - Xbox Kernel Thunk Table & Initialization
  *
- * Wires the 147-entry kernel thunk table at VA 0x0036B7C0 to our
- * xbox_* function/data implementations.
+ * Wires the kernel thunk table (an array whose address/size come from the
+ * loaded XBE, not a hardcoded title) to our xbox_* function/data
+ * implementations.
  *
  * The Xbox kernel thunk table is an array of function/data pointers that
  * game code calls through via indirect calls: call [thunk_addr].
  * Each entry corresponds to a kernel export ordinal.
  *
  * This file provides:
- *   - xbox_kernel_thunk_table[] - the 147 pointer slots
+ *   - xbox_kernel_thunk_table[] - the pointer slots
  *   - xbox_resolve_ordinal() - maps ordinal → function/data pointer
  *   - xbox_kernel_init() - fills the thunk table and initializes subsystems
  *   - xbox_kernel_shutdown() - cleanup
@@ -17,10 +18,13 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+
+extern ptrdiff_t g_xbox_mem_offset;
 
 /* ============================================================================
  * Thunk Table Storage
@@ -335,10 +339,13 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 }
 
 /* ============================================================================
- * Ordinal List
+ * Fallback Ordinal List
  *
- * The 147 ordinals imported by Burnout 3, in thunk table order.
- * Extracted from the XBE kernel thunk table at VA 0x0036B7C0.
+ * Reference import set kept in thunk-table order, used only when the XBE has
+ * not been loaded into Xbox memory (no memory layout, no parsed thunk table).
+ * When it is loaded, xbox_kernel_init() reads the actual ordinals out of the
+ * mapped thunk table, so this fallback's specific titles never matter at
+ * runtime -- it exists to keep the table populated when there is no XBE.
  * ============================================================================ */
 
 static const ULONG g_thunk_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE] = {
@@ -388,6 +395,8 @@ void xbox_kernel_init(void)
 {
     ULONG resolved = 0;
     ULONG unresolved = 0;
+    uint32_t thunk_base = 0;
+    uint32_t thunk_count = 0;
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -411,9 +420,27 @@ void xbox_kernel_init(void)
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,
         xbox_KrnlVersion.Build, xbox_KrnlVersion.Qfe);
 
-    /* Fill thunk table */
+    /* Fill thunk table.
+     *
+     * The slot->ordinal mapping normally comes from the in-memory thunk table
+     * of the loaded XBE (0x80000000|ordinal per entry, same source the kernel
+     * bridge reads). That makes the table match any title's import order.
+     * Without a mapped XBE, fall back to the static reference list below. */
+    xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
     for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        ULONG ordinal = g_thunk_ordinals[i];
+        ULONG ordinal;
+
+        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+            uint32_t entry = *(volatile uint32_t *)
+                ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
+            if (entry == 0) {
+                break;  /* rest of the table is empty */
+            }
+            ordinal = entry & 0x7FFFFFFF;
+        } else {
+            ordinal = g_thunk_ordinals[i];
+        }
+
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
 
         if (ptr) {

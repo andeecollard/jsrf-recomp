@@ -289,6 +289,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     if (game_dir) {
         MultiByteToWideChar(CP_UTF8, 0, game_dir, -1, s_game_dir, MAX_PATH);
     } else {
+        /* Neutral default: the CWD's "game" subdirectory, which is the
+         * layout the game projects use (see templates/new-game). */
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
     }
 
@@ -521,10 +523,11 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     if (game_dir) {
         snprintf(s_game_dir, sizeof(s_game_dir), "%s", game_dir);
     } else {
+        /* Neutral default: CWD/"game", the layout game projects use. */
         char cwd[MAX_PATH];
         if (!getcwd(cwd, sizeof(cwd)))
             snprintf(cwd, sizeof(cwd), ".");
-        snprintf(s_game_dir, sizeof(s_game_dir), "%s/Burnout 3 Takedown", cwd);
+        snprintf(s_game_dir, sizeof(s_game_dir), "%s/game", cwd);
     }
 
     if (save_dir) {
@@ -533,10 +536,10 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         /* XDG base-directory spec: $XDG_DATA_HOME or ~/.local/share */
         const char* xdg = getenv("XDG_DATA_HOME");
         if (xdg && xdg[0]) {
-            snprintf(s_save_dir, sizeof(s_save_dir), "%s/burnout3", xdg);
+            snprintf(s_save_dir, sizeof(s_save_dir), "%s/xboxrecomp", xdg);
         } else {
             const char* home = getenv("HOME");
-            snprintf(s_save_dir, sizeof(s_save_dir), "%s/.local/share/burnout3",
+            snprintf(s_save_dir, sizeof(s_save_dir), "%s/.local/share/xboxrecomp",
                      (home && home[0]) ? home : ".");
         }
     }

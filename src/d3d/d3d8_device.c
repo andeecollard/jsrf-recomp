@@ -79,6 +79,43 @@ static IDirect3DIndexBuffer8  *g_cur_ib = NULL;
 static UINT                    g_cur_ib_base_vertex = 0;
 static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 
+/* Bound offscreen render target / depth stencil (NULL = default) */
+static D3D8Surface *g_cur_rt = NULL;
+static D3D8Surface *g_cur_ds = NULL;
+
+/* Palettized texture palettes (256 ARGB entries per stage) */
+#define D3D8_PALETTE_ENTRIES 256
+static DWORD g_palettes[D3D8_MAX_PALETTES][D3D8_PALETTE_ENTRIES];
+static BOOL  g_palettes_initialized = FALSE;
+
+static void d3d8_palettes_init(void)
+{
+    int p, i;
+    if (g_palettes_initialized) return;
+    for (p = 0; p < D3D8_MAX_PALETTES; p++)
+        for (i = 0; i < D3D8_PALETTE_ENTRIES; i++)
+            g_palettes[p][i] = 0xFF000000u | ((DWORD)i * 0x010101u); /* gray ramp */
+    g_palettes_initialized = TRUE;
+}
+
+void d3d8_SetPalette(DWORD stage, const DWORD *entries)
+{
+    d3d8_palettes_init();
+    if (stage >= D3D8_MAX_PALETTES) return;
+    if (entries)
+        memcpy(g_palettes[stage], entries, sizeof(g_palettes[stage]));
+    else {
+        for (int i = 0; i < D3D8_PALETTE_ENTRIES; i++)
+            g_palettes[stage][i] = 0xFF000000u | ((DWORD)i * 0x010101u);
+    }
+}
+
+const DWORD *d3d8_GetPalette(DWORD stage)
+{
+    d3d8_palettes_init();
+    return (stage < D3D8_MAX_PALETTES) ? g_palettes[stage] : g_palettes[0];
+}
+
 /* Forward declarations */
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
@@ -115,6 +152,7 @@ UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
+IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) {
     return ((DWORD)type < MAX_TRANSFORMS) ? &g_device_state.transforms[(DWORD)type] : NULL;
 }
@@ -129,6 +167,10 @@ BOOL                 d3d8_GetLightEnable(DWORD index) {
 
 const D3DMATERIAL8  *d3d8_GetMaterial(void) {
     return &g_device_state.material;
+}
+
+DWORD                d3d8_GetCurrentFVF(void) {
+    return g_cur_vb ? ((D3D8VertexBuffer *)g_cur_vb)->fvf : 0;
 }
 
 UINT                 d3d8_GetNumLights(void) {
@@ -266,6 +308,12 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->viewport.Height = state->height;
     state->viewport.MinZ = 0.0f;
     state->viewport.MaxZ = 1.0f;
+
+    /* Default texture stage states:
+     * By default each stage reads its own texcoord set (0,1,2,3). */
+    memset(state->tss, 0, sizeof(state->tss));
+    for (int s = 0; s < MAX_TEXTURE_STAGES; s++)
+        state->tss[s][D3DTSS_TEXCOORDINDEX] = (DWORD)s;
 
     /* Identity matrices */
     for (int i = 0; i < MAX_TRANSFORMS; i++) {
@@ -407,9 +455,25 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
 {
-    (void)self; (void)iBackBuffer; (void)Type; (void)ppSurface;
-    /* TODO: wrap back buffer as D3D8 surface */
-    return E_NOTIMPL;
+    (void)self; (void)iBackBuffer; (void)Type;
+    ID3D11Texture2D *back_buffer = NULL;
+    HRESULT hr;
+
+    if (!ppSurface) return E_INVALIDARG;
+
+    hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                   &IID_ID3D11Texture2D,
+                                   (void **)&back_buffer);
+    if (FAILED(hr)) return hr;
+
+    *ppSurface = d3d8_surface_create(back_buffer, 0, 0,
+                                     g_device_state.width,
+                                     g_device_state.height,
+                                     D3DFMT_X8R8G8B8,
+                                     D3DPOOL_DEFAULT, 0,
+                                     D3DMULTISAMPLE_NONE, NULL, 0);
+    ID3D11Texture2D_Release(back_buffer);
+    return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
 static HRESULT __stdcall dev_BeginScene(IDirect3DDevice8 *self)
@@ -433,7 +497,11 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
     (void)self; (void)Count; (void)pRects; (void)Stencil;
     g_d3d_clear_count++;
 
-    if (Flags & D3DCLEAR_TARGET) {
+    /* Clear the currently bound targets (default if none set) */
+    ID3D11RenderTargetView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.default_rtv;
+    ID3D11DepthStencilView *dsv = g_cur_ds ? g_cur_ds->dsv : g_device_state.default_dsv;
+
+    if ((Flags & D3DCLEAR_TARGET) && rtv) {
         float clear_color[4] = {
             ((Color >> 16) & 0xFF) / 255.0f,  /* R */
             ((Color >>  8) & 0xFF) / 255.0f,  /* G */
@@ -441,17 +509,17 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
             ((Color >> 24) & 0xFF) / 255.0f,  /* A */
         };
         ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
-                                                   g_device_state.default_rtv,
+                                                   rtv,
                                                    clear_color);
     }
 
-    if (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) {
+    if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && dsv) {
         UINT clear_flags = 0;
         if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= D3D11_CLEAR_DEPTH;
         if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D11_CLEAR_STENCIL;
 
         ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
-                                                    g_device_state.default_dsv,
+                                                    dsv,
                                                     clear_flags, Z, (UINT8)Stencil);
     }
 
@@ -527,10 +595,14 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
 
     /* Bind SRV to pixel shader */
     if (pTexture) {
-        D3D8Texture *tex = (D3D8Texture *)pTexture;
-        if (tex->srv) {
+        ID3D11ShaderResourceView *srv = d3d8_base_srv(pTexture);
+        /* P8 textures bake a palette; record which stage palette they use
+         * so SetPalette can re-bake them later. */
+        if (d3d8_format_is_palettized(d3d8_base_format(pTexture)))
+            d3d8_base_set_palette(pTexture, Stage);
+        if (srv) {
             ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
-                Stage, 1, &tex->srv);
+                Stage, 1, &srv);
         }
         /* Mark texture stage as active */
         if (g_device_state.tss[Stage][D3DTSS_COLOROP] == D3DTOP_DISABLE)
@@ -546,8 +618,11 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
 
 static HRESULT __stdcall dev_GetTexture(IDirect3DDevice8 *self, DWORD Stage, IDirect3DBaseTexture8 **ppTexture)
 {
-    (void)self; (void)Stage; (void)ppTexture;
-    return E_NOTIMPL;
+    (void)self;
+    if (!ppTexture || Stage >= MAX_TEXTURE_STAGES) return E_INVALIDARG;
+    *ppTexture = g_cur_textures[Stage];
+    if (*ppTexture) IDirect3DBaseTexture8_AddRef(*ppTexture);
+    return S_OK;
 }
 
 static HRESULT __stdcall dev_SetStreamSource(IDirect3DDevice8 *self, UINT StreamNumber, IDirect3DVertexBuffer8 *pStreamData, UINT Stride)
@@ -568,8 +643,12 @@ static HRESULT __stdcall dev_SetStreamSource(IDirect3DDevice8 *self, UINT Stream
 
 static HRESULT __stdcall dev_GetStreamSource(IDirect3DDevice8 *self, UINT StreamNumber, IDirect3DVertexBuffer8 **ppStreamData, UINT *pStride)
 {
-    (void)self; (void)StreamNumber; (void)ppStreamData; (void)pStride;
-    return E_NOTIMPL;
+    (void)self;
+    if (!ppStreamData || StreamNumber != 0) return E_INVALIDARG;
+    *ppStreamData = g_cur_vb;
+    if (*ppStreamData) (*ppStreamData)->lpVtbl->AddRef(*ppStreamData);
+    if (pStride) *pStride = g_cur_vb_stride;
+    return S_OK;
 }
 
 static HRESULT __stdcall dev_SetIndices(IDirect3DDevice8 *self, IDirect3DIndexBuffer8 *pIndexData, UINT BaseVertexIndex)
@@ -590,8 +669,12 @@ static HRESULT __stdcall dev_SetIndices(IDirect3DDevice8 *self, IDirect3DIndexBu
 
 static HRESULT __stdcall dev_GetIndices(IDirect3DDevice8 *self, IDirect3DIndexBuffer8 **ppIndexData, UINT *pBaseVertexIndex)
 {
-    (void)self; (void)ppIndexData; (void)pBaseVertexIndex;
-    return E_NOTIMPL;
+    (void)self;
+    if (!ppIndexData) return E_INVALIDARG;
+    *ppIndexData = g_cur_ib;
+    if (*ppIndexData) (*ppIndexData)->lpVtbl->AddRef(*ppIndexData);
+    if (pBaseVertexIndex) *pBaseVertexIndex = g_cur_ib_base_vertex;
+    return S_OK;
 }
 
 static D3D11_PRIMITIVE_TOPOLOGY map_primitive_type(D3DPRIMITIVETYPE pt, UINT count, UINT *out_count)
@@ -740,9 +823,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     if (vertex_count == 0) return E_INVALIDARG;
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
-    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -762,8 +843,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     if (index_count == 0) return E_INVALIDARG;
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -807,8 +887,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -872,8 +951,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
         tmp_ib, ib_fmt, 0);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -906,6 +984,24 @@ static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *self, UINT Width, U
     return d3d8_CreateTextureImpl(Width, Height, Levels, Usage, Format, ppTexture);
 }
 
+static HRESULT __stdcall dev_CreateImageSurface(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, IDirect3DSurface8 **ppSurface)
+{
+    (void)self;
+    return d3d8_CreateImageSurfaceImpl(Width, Height, Format, ppSurface);
+}
+
+static HRESULT __stdcall dev_CreateCubeTexture(IDirect3DDevice8 *self, UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture8 **ppCubeTexture)
+{
+    (void)self; (void)Pool;
+    return d3d8_CreateCubeTextureImpl(EdgeLength, Levels, Usage, Format, ppCubeTexture);
+}
+
+static HRESULT __stdcall dev_CreateVolumeTexture(IDirect3DDevice8 *self, UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture8 **ppVolumeTexture)
+{
+    (void)self; (void)Pool;
+    return d3d8_CreateVolumeTextureImpl(Width, Height, Depth, Levels, Usage, Format, ppVolumeTexture);
+}
+
 static HRESULT __stdcall dev_CreateVertexBuffer(IDirect3DDevice8 *self, UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer8 **ppVertexBuffer)
 {
     (void)self; (void)Pool;
@@ -920,33 +1016,199 @@ static HRESULT __stdcall dev_CreateIndexBuffer(IDirect3DDevice8 *self, UINT Leng
 
 static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, BOOL Lockable, IDirect3DSurface8 **ppSurface)
 {
-    (void)self; (void)Width; (void)Height; (void)Format; (void)MultiSample; (void)Lockable; (void)ppSurface;
-    return E_NOTIMPL;
+    (void)self; (void)Lockable;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr;
+    UINT sample_count;
+
+    if (!ppSurface || !Width || !Height) return E_INVALIDARG;
+
+    sample_count = d3d8_msaa_sample_count(MultiSample);
+    if (sample_count > 1) {
+        UINT levels = 0;
+        UINT maxq = 0;
+        DXGI_FORMAT fmt = d3d8_to_dxgi_format(Format);
+        /* Validate against D3D11 hardware limits; fall back gracefully. */
+        hr = ID3D11Device_CheckMultisampleQualityLevels(d3d8_GetD3D11Device(),
+                fmt, sample_count, &maxq);
+        if (FAILED(hr) || maxq == 0) {
+            UINT counts[] = { 9, 8, 4, 2, 1 };
+            UINT i;
+            for (i = 0; i < 5; i++) {
+                if (counts[i] >= sample_count) continue;
+                if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(
+                        d3d8_GetD3D11Device(), fmt, counts[i], &levels)) && levels > 0) {
+                    sample_count = counts[i];
+                    break;
+                }
+            }
+            if (sample_count > 1) {
+                fprintf(stderr, "D3D8: MSAA %lu unsupported, falling back to %lu samples\n",
+                        d3d8_msaa_sample_count(MultiSample) > 1 ? (unsigned long)d3d8_msaa_sample_count(MultiSample) : 0,
+                        (unsigned long)sample_count);
+            } else {
+                sample_count = 1;
+            }
+        }
+    }
+
+    memset(&td, 0, sizeof(td));
+    td.Width = Width;
+    td.Height = Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = d3d8_to_dxgi_format(Format);
+    td.SampleDesc.Count = sample_count;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateRenderTarget failed: 0x%08lX (fmt=0x%X %ux%u)\n", hr, Format, Width, Height);
+        return hr;
+    }
+
+    *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, Format,
+                                     D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET,
+                                     MultiSample, NULL, 0);
+    ID3D11Texture2D_Release(tex);
+    return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
 static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface)
 {
-    (void)self; (void)Width; (void)Height; (void)Format; (void)MultiSample; (void)ppSurface;
-    return E_NOTIMPL;
+    (void)self;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *tex = NULL;
+    DXGI_FORMAT dxgi;
+    D3DFORMAT surface_format = Format;
+    HRESULT hr;
+    UINT sample_count;
+
+    if (!ppSurface || !Width || !Height) return E_INVALIDARG;
+
+    dxgi = d3d8_to_dxgi_format(Format);
+    if (dxgi == DXGI_FORMAT_R16_FLOAT) {
+        /* F16 has no D3D11 depth equivalent; fall back to D16. */
+        fprintf(stderr, "D3D8: F16 depth surface falling back to D16\n");
+        dxgi = DXGI_FORMAT_D16_UNORM;
+        surface_format = D3DFMT_D16;
+    }
+
+    sample_count = d3d8_msaa_sample_count(MultiSample);
+    if (sample_count > 1) {
+        UINT levels = 0;
+        hr = ID3D11Device_CheckMultisampleQualityLevels(d3d8_GetD3D11Device(),
+                dxgi, sample_count, &levels);
+        if (FAILED(hr) || levels == 0) {
+            UINT counts[] = { 9, 8, 4, 2, 1 };
+            UINT i;
+            for (i = 0; i < 5; i++) {
+                if (counts[i] >= sample_count) continue;
+                if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(
+                        d3d8_GetD3D11Device(), dxgi, counts[i], &levels)) && levels > 0) {
+                    sample_count = counts[i];
+                    break;
+                }
+            }
+            if (sample_count > 1)
+                fprintf(stderr, "D3D8: depth MSAA %lu unsupported, fallback %lu samples\n",
+                        (unsigned long)d3d8_msaa_sample_count(MultiSample),
+                        (unsigned long)sample_count);
+            else
+                sample_count = 1;
+        }
+    }
+
+    memset(&td, 0, sizeof(td));
+    td.Width = Width;
+    td.Height = Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = dxgi;
+    td.SampleDesc.Count = sample_count;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateDepthStencilSurface failed: 0x%08lX (fmt=0x%X)\n", hr, Format);
+        return hr;
+    }
+
+    *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, surface_format,
+                                     D3DPOOL_DEFAULT, D3DUSAGE_DEPTHSTENCIL,
+                                     MultiSample, NULL, 0);
+    ID3D11Texture2D_Release(tex);
+    return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
 static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSurface8 *pRenderTarget, IDirect3DSurface8 *pZStencilSurface)
 {
-    (void)self; (void)pRenderTarget; (void)pZStencilSurface;
-    /* TODO: resolve D3D8 surface to D3D11 RTV/DSV */
+    (void)self;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv = NULL;
+
+    if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
+    if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
+
+    if (pRenderTarget) {
+        g_cur_rt = (D3D8Surface *)pRenderTarget;
+        if (!g_cur_rt->rtv) {
+            g_cur_rt = NULL;
+            fprintf(stderr, "D3D8: SetRenderTarget on non-renderable surface\n");
+            return E_INVALIDARG;
+        }
+        rtv = g_cur_rt->rtv;
+        IDirect3DSurface8_AddRef(pRenderTarget);
+    } else {
+        rtv = g_device_state.default_rtv;
+    }
+
+    if (pZStencilSurface) {
+        g_cur_ds = (D3D8Surface *)pZStencilSurface;
+        if (!g_cur_ds->dsv) {
+            g_cur_ds = NULL;
+            fprintf(stderr, "D3D8: SetRenderTarget with non-depth stencil surface\n");
+        } else {
+            dsv = g_cur_ds->dsv;
+            IDirect3DSurface8_AddRef(pZStencilSurface);
+        }
+    }
+
+    if (!dsv) dsv = g_device_state.default_dsv;
+    ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
+                                            &rtv, dsv);
     return S_OK;
 }
 
 static HRESULT __stdcall dev_GetRenderTarget(IDirect3DDevice8 *self, IDirect3DSurface8 **ppRenderTarget)
 {
-    (void)self; (void)ppRenderTarget;
-    return E_NOTIMPL;
+    (void)self;
+    if (!ppRenderTarget) return E_INVALIDARG;
+    if (g_cur_rt) {
+        *ppRenderTarget = &g_cur_rt->iface;
+        IDirect3DSurface8_AddRef(*ppRenderTarget);
+    } else {
+        *ppRenderTarget = NULL;
+    }
+    return S_OK;
 }
 
 static HRESULT __stdcall dev_GetDepthStencilSurface(IDirect3DDevice8 *self, IDirect3DSurface8 **ppZStencilSurface)
 {
-    (void)self; (void)ppZStencilSurface;
-    return E_NOTIMPL;
+    (void)self;
+    if (!ppZStencilSurface) return E_INVALIDARG;
+    if (g_cur_ds) {
+        *ppZStencilSurface = &g_cur_ds->iface;
+        IDirect3DSurface8_AddRef(*ppZStencilSurface);
+    } else {
+        *ppZStencilSurface = NULL;
+    }
+    return S_OK;
 }
 
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)
@@ -1079,7 +1341,16 @@ static void __stdcall dev_GetGammaRamp(IDirect3DDevice8 *self, D3DGAMMARAMP *pRa
 
 static HRESULT __stdcall dev_SetPalette(IDirect3DDevice8 *self, DWORD PaletteNumber, const void *pEntries)
 {
-    (void)self; (void)PaletteNumber; (void)pEntries;
+    (void)self;
+    if (PaletteNumber >= D3D8_MAX_PALETTES) return E_INVALIDARG;
+    d3d8_SetPalette(PaletteNumber, (const DWORD *)pEntries);
+
+    /* A P8 texture bound to this stage bakes the palette at upload; re-bake
+     * the raw indices so animated / colorized palettes take effect. */
+    if (PaletteNumber < 4) {
+        IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(PaletteNumber);
+        if (tex) d3d8_refresh_palette(tex);
+    }
     return S_OK;
 }
 
@@ -1174,6 +1445,10 @@ static const IDirect3DDevice8Vtbl g_device_vtbl = {
     dev_BeginPush,
     dev_EndPush,
     dev_Swap,
+    /* Extensions appended by xboxrecomp (slots after the historical ones) */
+    dev_CreateImageSurface,
+    dev_CreateCubeTexture,
+    dev_CreateVolumeTexture,
 };
 
 /* ================================================================

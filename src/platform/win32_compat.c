@@ -5,7 +5,7 @@
  * (threads/events/mutexes/atomics/heap/timers) -- it carries no Xbox
  * semantics. The Xbox kernel HLE in src/kernel builds on top of it.
  *
- * Linux/POSIX only.
+ * POSIX (Linux/MacOS) only.
  */
 
 #if !defined(_WIN32)
@@ -31,6 +31,7 @@
 #elif defined(__APPLE__)
 /* macOS portability: no <sys/sysinfo.h>; use sysctl + mach for memory status. */
 #include <sys/sysctl.h>
+#include <sys/stat.h>
 #include <mach/mach.h>
 #endif
 
@@ -577,9 +578,17 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 BOOL ReleaseMutex(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_MUTEX) return FALSE;
+    if (!o || o->kind != K_MUTEX) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
-    if (o->mtx_owner == GetCurrentThreadId() && --o->mtx_recursion <= 0) {
+    if (o->mtx_owner != GetCurrentThreadId()) {
+        pthread_mutex_unlock(&o->lock);
+        SetLastError(ERROR_NOT_OWNER);
+        return FALSE;
+    }
+    if (--o->mtx_recursion <= 0) {
         o->mtx_owner = 0;
         o->mtx_recursion = 0;
         pthread_cond_broadcast(&o->cond);
@@ -977,10 +986,20 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
+#if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
+#elif defined(__APPLE__)
+    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
+     * or a mach_vm_region probe before an MAP_FIXED call. */
+#endif
     void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
                    flags, -1, 0);
     if (p == MAP_FAILED) { SetLastError(8); return NULL; }
+#if !defined(MAP_FIXED_NOREPLACE)
+    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
+     * MAP_FIXED would silently unmap whatever already lives there. Getting a
+     * different address means the range was taken: fail as Linux does. */
+#endif
     return p;
 }
 
@@ -1100,11 +1119,17 @@ VOID OutputDebugStringA(LPCSTR str)
 
 VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 
-VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt) { explicit_bzero(ptr, cnt); }
+BOOL IsDebuggerPresent(void)
+{
+    return FALSE;
+}
 
-/* macOS portability: DebugBreak/IsDebuggerPresent come from <windows.h> on Windows. */
-void  DebugBreak(void) { __builtin_trap(); }
-BOOL  IsDebuggerPresent(void) { return FALSE; }
+VOID DebugBreak(void) { __builtin_trap(); }
+
+VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
+{
+    explicit_bzero(ptr, cnt);
+}
 
 unsigned int _clearfp(void)
 {
@@ -1211,6 +1236,8 @@ SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
 HWND  FindWindowA(LPCSTR c, LPCSTR w)     { (void)c; (void)w; return NULL; }
 HWND  GetActiveWindow(void)               { return NULL; }
 BOOL  SetWindowTextA(HWND h, LPCSTR t)    { (void)h; (void)t; return TRUE; }
+int   GetWindowTextA(HWND h, LPSTR t, int n) { (void)h; (void)t; (void)n; return 0; }
+BOOL  EnumWindows(WNDENUMPROC p, LPARAM l) { (void)p; (void)l; return FALSE; }
 
 int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type)
 {
@@ -1345,6 +1372,17 @@ static size_t view_take(const void *addr)
     return len;
 }
 
+/* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
+ * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
+static int anon_map_fd(const char *name)
+{
+#if defined(__APPLE__)
+    return memfd_create(name ? name : "xbox_map", 0);
+#else
+    return memfd_create(name ? name : "xbox_map", 0);
+#endif
+}
+
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
@@ -1352,7 +1390,7 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
-    int fd = memfd_create(name ? name : "xbox_map", 0);
+    int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
         close(fd);

@@ -22,22 +22,23 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | **Register combiners (pixel shaders)** | Full (8 stages, RGB/alpha, final combiner) | Full (8 stages, HLSL generation, 128-entry cache) | DONE | - |
 | **Vertex shader microcode translation** | Full (MAC+ILU ops, 192 constants, 12 temps) | Full (d3d8_vsh.c: parser, HLSL gen, 64-entry cache) | DONE | - |
 | **Texture unswizzling (Z-order/Morton)** | Full | Full | ADDED | High |
-| Texture format coverage (66 formats) | Full | 17 formats + 3 new | PARTIAL | High |
-| Palettized textures (P8 with palette lookup) | Full | Format mapped, no palette | PARTIAL | Medium |
-| Signed texture formats (R6G5B5, etc.) | Full | Missing | MISSING | Low |
-| YUV texture formats | Full | Missing | MISSING | Low |
-| Mipmapping | Full chain | Level 0 only | PARTIAL | Medium |
-| Cube textures | Full | Missing | MISSING | Low |
-| Volume textures | Full | Missing | MISSING | Low |
-| Anti-aliasing modes | Full | Missing | MISSING | Low |
-| Render target format negotiation | Full | Basic | PARTIAL | Medium |
+| Texture format coverage (66 formats) | Full | All Xbox D3DFMT_* constants (33 swizzled + 20 linear) mapped to DXGI | PARTIAL | High |
+| Palettized textures (P8 with palette lookup) | Full | P8 expanded to BGRA at upload using the texture's stage palette; `dev_SetPalette` re-bakes any P8 texture bound to that stage (animated/colorized palettes work); P8 surface LockRect returns raw 8-bit indices (write-back re-bakes) | DONE | Medium |
+| Signed texture formats (R6G5B5, V8U8, V16U16) | Full | Distinct compact values; V8U8/V16U16 → R8G8_SNORM/R16G16_SNORM; Q8W8V8U8/X8L8V8U8 → R8G8B8A8_SNORM; L6V5U5 sign-extended to R8G8_SNORM at upload | DONE | Low |
+| Extended texture formats (float, 16/32-bit pairs, 10-bit, DXN/DXT3A/DXT5A/CTX1, D24FS8/D24X8/D32) | Full | Added distinct compact values + LIN variants; wired through `d3d8_to_dxgi_format`/`d3d8_format_bpp`/swizzle. BGRA-in-memory→RGBA cases (A16B16G16R16, A32B32G32R32) and 10-bit A/R swaps are channel-converted in software at upload (covered by `tests/d3d8_smoke`). Approximate DXGI maps (DXN/DXT3A/DXT5A/CTX1, R11G11B10) still need in-game validation | DONE | High |
+| YUV texture formats | Full | YUY2/UYVY converted to BGRA in software at upload | PARTIAL | Low |
+| Mipmapping | Full chain | Full chain (auto-generate on Levels=0, per-level upload) | DONE | Medium |
+| Cube textures | Full | Implemented (D3D11 Texture2DArray of 6 + TEXTURECUBE SRV; full mip chains, per-face LockRect/UnlockRect upload with unswizzle + format conversion, GetCubeMapSurface) | PARTIAL | Low |
+| Volume textures | Full | Implemented (D3D11 Texture3D, full mip chains, 3D Z-order unswizzle, LockBox/UnlockBox + GetVolumeLevel wrappers) | PARTIAL | Low |
+| Anti-aliasing modes | Full | MSAA sample counts honored (2/4/9-sample multi/super aliases, quincunx→2); validated via CheckMultisampleQualityLevels with graceful fallback; supersample approximated as MSAA; ResolveSubresource used for MSAA surface LockRect readback | PARTIAL | Low |
+| Render target format negotiation | Full | CreateRenderTarget/CreateDepthStencilSurface/SetRenderTarget/Get*/GetBackBuffer + surfaces (render-to-texture works via GetSurfaceLevel; LockRect readback via staging texture copy: sub-rect, non-readonly write-back, MSAA resolve) | PARTIAL | Medium |
 
 ## D3D8 Translation Layer
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Device creation/reset/present | DONE | D3D11 backend |
-| Fixed-function vertex transform (FVF) | DONE | HLSL vertex shader |
+| Fixed-function vertex transform (FVF) | DONE | HLSL vertex shader; per-set D3DFVF_TEXCOORDSIZE float1/3/4 texcoords supported (float4 VS input, variable input-layout formats) |
 | Texture stage states (4 stages) | DONE | Full D3DTOP set: MODULATE/2X/4X, ADD/SIGNED/2X, SUBTRACT, BLEND*, DOTPRODUCT3 |
 | Render states (blend, depth, stencil, cull) | DONE | ~20 states translated |
 | Vertex/index buffer management | DONE | System memory staging |
@@ -51,9 +52,14 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | **Vertex fog (linear/exp/exp2)** | DONE | VS fog factor, PS fog color blending |
 | **Triangle fan conversion** | DONE | Fan/quad → tri list in DrawPrimitiveUP |
 | **DrawPrimitiveUP ring buffer** | DONE | 4MB ring buffer, no per-call buffer create/destroy |
-| Bump mapping / normal mapping | PARTIAL | Register combiners support bump; tex coord gen missing |
-| Environment mapping | PARTIAL | Register combiners handle it; tex coord gen missing |
-| Per-pixel fog (table fog) | MISSING | Vertex fog done; table fog needs PS computation |
+| **Offscreen render targets / surfaces** | PARTIAL | CreateRenderTarget/CreateDepthStencilSurface/SetRenderTarget/Get*/GetBackBuffer; render-to-texture via tex_GetSurfaceLevel sharing the texture's D3D11 resource; surface LockRect readback via D3D11_USAGE_STAGING copy/resolve (sub-rect supported, write-back unless D3DLOCK_READONLY); CreateImageSurface implemented |
+| **Cube textures (CreateCubeTexture)** | PARTIAL | D3D11 Texture2D with ArraySize=6 + MISC_TEXTURECUBE, TEXTURECUBE SRV; per-face/level LockRect→unswizzle→convert→UpdateSubresource (subresource = face*levels+level); GetCubeMapSurface shares the array's RTV via TEXTURE2DARRAY; FF + combiner pixel shaders declare TextureCube matching the bound SRV and sample the full float3 TCI/reflection vector |
+| **Volume textures (CreateVolumeTexture)** | PARTIAL | D3D11 Texture3D, full mip chains; LockBox/UnlockBox with 3D Z-order unswizzle + per-slice format conversion; GetVolumeLevel returns a ref-counted wrapper delegating to the parent texture; FF + combiner pixel shaders declare Texture3D matching the bound SRV and sample float3 coords |
+| **MSAA / supersample modes** | PARTIAL | MultiSampleType honored via d3d8_msaa_sample_count (packed nibble decode); CheckMultisampleQualityLevels-guarded fallback (9→8→4→2→1); supersample approximated as MSAA; MSAA LockRect readback via ResolveSubresource |
+| **Palettized textures (SetPalette, P8)** | DONE | Per-stage 256-entry palettes stored; P8 expanded to BGRA at upload; bound textures re-baked on SetPalette; P8 surface LockRect returns raw indices |
+| Bump mapping / normal mapping | PARTIAL | Register combiners support bump; TCI normals via TEXCOORDINDEX |
+| Environment mapping | DONE | TCI (camera-space normal/position/reflection, sphere map) + per-stage texture matrix in VS |
+| Per-pixel fog (table fog) | DONE | Table fog computed per-pixel from view-space depth (or range with D3DRS_RANGEFOGENABLE); correct D3DFOGMODE |
 
 ## Kernel
 
@@ -118,8 +124,8 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 
 8. **WMA audio decoder** - Blood Wake has a WMADEC section. Need either a software WMA decoder or integration with Windows Media Foundation.
 
-9. **Mipmap support** - Currently only level 0. Add mipmap chain upload in texture creation and UnlockRect.
+9. ~~**Mipmap support**~~ - DONE. Full chain uploaded: per-level sys_mem, LockRect/UnlockRect per level, auto chain on Levels=0 in CreateTexture, per-level unswizzle.
 
-10. **Texture coordinate generation** - TEXCOORDINDEX with TCI_CAMERASPACENORMAL, TCI_CAMERASPACEPOSITION, TCI_CAMERASPACEREFLECTIONVECTOR for environment mapping.
+10. ~~**Texture coordinate generation**~~ - DONE. D3DTSS_TEXCOORDINDEX high bits (TCI_PASSTHRU/0x10000..0x40000 incl. sphere map) + per-stage D3DTS_TEXTURE matrices in vertex shader. Default TEXCOORDINDEX = stage index.
 
-11. **Per-pixel (table) fog** - Vertex fog is done; table fog needs distance computation in pixel shader.
+11. ~~**Per-pixel (table) fog**~~ - DONE. Table fog computed per-pixel from view-space depth (range fog with D3DRS_RANGEFOGENABLE); correct D3DFOGMODE mapping (1=EXP, 2=EXP2, 3=LINEAR) in both VS and PS.

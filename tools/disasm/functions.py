@@ -158,6 +158,11 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # A function that begins immediately after a ret, with no padding.
+        if self._pass_gap_prologues(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
         # Then the same for addresses that only ever exist as table entries.
         # After the immediate pass, so its results narrow the gaps first. These
         # become aliases rather than function starts, so no rebuild: aliases are
@@ -173,6 +178,75 @@ class FunctionDetector:
         self._build_call_graph()
 
         return len(self.functions)
+
+    def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
+        """A function that starts right after a ret, with no padding between.
+
+        _pass_cc_boundaries only recognises a boundary when the compiler left
+        int3 padding to the next alignment. It usually does -- but not when the
+        next function happens to start on the boundary already, and then a
+        clean prologue sits immediately after the previous function's ret with
+        nothing to mark it.
+
+        Nothing else covers that case either. Such a function is not a call
+        target if it is only ever reached through a vtable, and the prologue
+        pass looks for "push ebp; mov ebp, esp", which an FPO function like
+        "sub esp, 0x18" does not have.
+
+        Restricted to addresses in an unclaimed gap, which makes it safe by
+        construction rather than by judgement: MSVC parks out-of-line tails
+        after a ret too, and those look identical from here. The difference is
+        that a tail belongs to the function above it, so _find_function_end has
+        already walked over it and it is not in a gap. Half-Life 2 has 20 of
+        these; 12 are in gaps and 8 are tails, and the gap test separates them.
+
+        The one that mattered was 0x00476EB0, a material-system method reached
+        only through a shader's vtable. Unresolved, the call was skipped rather
+        than made, so eax kept a stale value that the caller then used as a
+        string pointer.
+        """
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        added = False
+        for insn in list(self.engine.instructions.values()):
+            if not insn.is_ret:
+                continue
+            nxt = insn.end_address
+            if nxt in self._candidates or nxt in self.functions:
+                continue
+            section = self.image.get_section_at_va(nxt)
+            if section is None or not section.executable:
+                continue
+            if not in_a_gap(nxt):
+                continue                    # an out-of-line tail, not a start
+            # A prologue, or a whole small function.
+            #
+            # MSVC packs runs of constant-returning accessors -- "mov eax,
+            # <address>; ret", six bytes each -- back to back with no padding,
+            # and they are reached only through vtables. There is no prologue
+            # to recognise because there is no frame; the entire function is
+            # two instructions. Half-Life 2 has 3,147 of that exact shape, of
+            # which 19 land in a gap and are found by nothing else.
+            #
+            # The gap restriction is what makes this safe. The same two
+            # instructions appear 795 times *inside* larger functions as a
+            # return path, and splitting one of those would cut a function in
+            # half -- but those are covered, so they are not in a gap.
+            if not (self.engine.probes_as_prologue(nxt)
+                    or self.engine.probes_as_constant_stub(nxt)):
+                continue
+            self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
+                                "gap_prologue")
+            added = True
+
+        if added:
+            print("  functions recovered that follow a ret with no padding")
+        return added
 
     def _pass_seed_aliases(self) -> None:
         """
@@ -290,14 +364,29 @@ class FunctionDetector:
                 cc_run_length = i - cc_start
 
                 if cc_run_length >= config.MIN_CC_RUN and i < len(data):
-                    # Check if instruction before CC run was a ret
+                    # Check what the CC run interrupts.
+                    #
+                    # A `ret` is the obvious terminator, but a tail call ends a
+                    # function just as completely: MSVC turns "return f(x)" into
+                    # a bare `jmp f` and pads to the next boundary exactly as it
+                    # would after a `ret`. Only accepting `ret` left the
+                    # function before such a jmp running on through the padding
+                    # and swallowing the next function whole -- and a vtable
+                    # slot pointing into the middle of that merged range then
+                    # has no function to resolve to, so the indirect call is
+                    # skipped at runtime rather than made.
+                    #
+                    # The back-scan has to reach 5 bytes for `jmp rel32`; at 3
+                    # it could not have seen one even if it had looked. Only
+                    # instructions the sweep actually decoded at that address
+                    # are considered, so this cannot invent a misaligned one.
                     before_addr = va_start + cc_start
-                    # Look for a ret instruction ending right at the CC run
                     found_ret = False
-                    for check_offset in range(1, 4):  # ret can be 1-3 bytes
+                    for check_offset in range(1, 8):
                         check_addr = before_addr - check_offset
                         insn = self.engine.get_instruction(check_addr)
-                        if insn and insn.is_ret and insn.end_address == before_addr:
+                        if (insn and insn.end_address == before_addr
+                                and (insn.is_ret or insn.is_jump)):
                             found_ret = True
                             break
 
@@ -491,7 +580,12 @@ class FunctionDetector:
             # A ret, not merely a terminator: an immediate is weak evidence,
             # so the probe has to reject data that happens to disassemble. The
             # cap also keeps a wrong guess from walking the rest of the section.
-            if not self.engine.probes_as_returning_body(target):
+            # ...or a virtual-call thunk, which never reaches a ret: it
+            # dispatches through the vtable and is gone. Those are taken by
+            # address and passed around as values, so an immediate is exactly
+            # how they show up.
+            if not (self.engine.probes_as_returning_body(target)
+                    or self.engine.probes_as_vcall_thunk(target)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
@@ -831,7 +925,20 @@ class FunctionDetector:
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
                 continue
-            if not self.engine.probes_as_returning_body(target, max_insns=256):
+            # A block that ends in an unconditional jmp instead of a ret is
+            # the other half of this shape, and rejecting it left the branch
+            # pointing at a stub just the same. Half-Life 2's _lock helper
+            # (sub_005BE146) exits its scan loop into two such blocks at
+            # 0x005BE244 and 0x005BE250; both were emitted as stubs that
+            # returned without running the function's __finally, so _unlock
+            # never ran. The CRT lock was taken 15 times and released none,
+            # and the next thread to want it waited forever -- a level load
+            # that deadlocked two thirds of the way in, with nothing in the
+            # log to connect it to a missed function boundary.
+            tail = self.engine.block_tail_jump(target)
+            if not (self.engine.probes_as_returning_body(target, max_insns=256)
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or tail is not None):
                 continue
 
             # Run to the next known function start, or the section end.
@@ -840,6 +947,15 @@ class FunctionDetector:
                                                     + section.virtual_size)
             self._alias_entries[target] = end
             added = True
+
+            # Where that jump lands has to be addressable too, or the block we
+            # just recovered ends in a call to a stub and nothing is gained.
+            # Landing inside a function is the ordinary case -- it is the rest
+            # of the loop -- and the alias mechanism already exists for it.
+            if tail is not None and tail not in self._alias_entries                     and tail not in self._candidates and tail not in self.functions:
+                m = bisect.bisect_right(starts, tail) - 1
+                if m >= 0 and bodies[m][0] < tail < bodies[m][1]:
+                    self._alias_entries[tail] = bodies[m][1]
 
         if added:
             print("  conditional-branch orphans recovered as alias entries")
