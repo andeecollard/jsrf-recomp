@@ -1195,6 +1195,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* Keep the decoded idle voice stable until the guest services
+                 * the trap; walking another voice would overwrite its payload. */
+                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
+                        NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                    return;
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);

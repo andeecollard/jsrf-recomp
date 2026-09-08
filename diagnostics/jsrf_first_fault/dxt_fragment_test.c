@@ -84,6 +84,7 @@ int main(void) {
     CHECK(s.alpha_test && s.blend && s.cull_face==0x405 && s.front_cw && s.depth_test && s.depth_write);
     m[0x290/4]=0x1000; CHECK(nv2a_texture_copy_prepare(m,&s)); /* float depth */
     m[0x290/4]=0x10000; CHECK(nv2a_texture_copy_prepare(m,&s)); /* W buffer */
-    m[0x290/4]=0; m[0x1b04/4]=0x09920c29; CHECK(nv2a_texture_copy_prepare(m,&s)); /* mip chain */
+    m[0x290/4]=0; m[0x1b04/4]=0x09920c29; CHECK(!nv2a_texture_copy_prepare(m,&s)); /* mip chain */
+    CHECK(s.levels==2 && nv2a_texture_copy_texture_bytes(&s)==163840);
     puts("BC1 colours, alpha, wrap/filter, blending, Z24, culling and bounds passed");
 }

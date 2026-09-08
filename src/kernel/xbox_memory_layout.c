@@ -844,10 +844,9 @@ static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[]
  * statically linked DSOUND drives this hardware directly, so its writes have to
  * reach the emulated APU rather than landing in plain RAM.
  *
- * Writes only. Reads stay ordinary loads against the mapped page, which keeps a
- * polled register (the sample counter at +0x020010 is read in a spin loop) from
- * becoming millions of signals. The cost is that a register with read side
- * effects -- read-to-clear -- is not modelled; none is known to be needed here.
+ * With a read hook, the main register bank traps reads and writes so status
+ * and interrupt acknowledgements use model state. The separate VP aperture
+ * retains mapped reads, including the frequently polled counter at +0x020010.
  *
  * Reached through a hook rather than a direct call so xbox_kernel keeps no link
  * dependency on xbox_apu: targets that link the kernel alone must still build. */
@@ -856,6 +855,12 @@ static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[]
 
 static void (*g_mcpx_apu_write)(uint32_t offset, uint32_t value,
                                 unsigned width) = NULL;
+static uint32_t (*g_mcpx_apu_read)(uint32_t offset, unsigned width) = NULL;
+
+void xbox_SetApuMmioReadHook(uint32_t (*fn)(uint32_t, unsigned))
+{
+    g_mcpx_apu_read = fn;
+}
 
 void xbox_SetApuMmioWriteHook(void (*fn)(uint32_t, uint32_t, unsigned))
 {
@@ -1109,6 +1114,39 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     }
 
     insn = *(const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+
+    guest_va = (uint32_t)(fault - g_memory_offset);
+    /* Main APU registers must never be a shadow of the last guest store:
+     * ISTS is W1C and the voice processor changes trap state asynchronously.
+     * Decode ordinary scalar loads/stores without opening a writable window.
+     * VP PIO keeps its existing write trap and free-space counter for now. */
+    if (g_mcpx_apu_read && guest_va >= XBOX_MCPX_BASE &&
+            guest_va < XBOX_MCPX_BASE + 0x20000u) {
+        unsigned opc = (insn >> 22) & 3u;
+        unsigned size = insn >> 30;
+        int writeback = !(insn & (1u << 24)) && !(insn & (1u << 21)) &&
+                         ((insn >> 10) & 1u);
+        if ((insn & 0x3E000000u) != 0x38000000u || writeback || size > 2 || opc > 1)
+            goto chain;
+        width = 1u << size;
+        rt = insn & 31u;
+        if (opc == 1) {
+            value = g_mcpx_apu_read(guest_va - XBOX_MCPX_BASE, width);
+            if (width < 4) value &= (1u << (8 * width)) - 1u;
+            if (rt < 29) uc->uc_mcontext->__ss.__x[rt] = value;
+            else if (rt == 29) uc->uc_mcontext->__ss.__fp = value;
+            else if (rt == 30) uc->uc_mcontext->__ss.__lr = value;
+        } else {
+            value = rt < 29 ? uc->uc_mcontext->__ss.__x[rt] :
+                    rt == 29 ? uc->uc_mcontext->__ss.__fp :
+                    rt == 30 ? uc->uc_mcontext->__ss.__lr : 0;
+            if (width < 4) value &= (1u << (8 * width)) - 1u;
+            if (g_mcpx_apu_write)
+                g_mcpx_apu_write(guest_va - XBOX_MCPX_BASE, (uint32_t)value, width);
+        }
+        uc->uc_mcontext->__ss.__pc += 4;
+        return;
+    }
 
     /* Load/store, non-SIMD, opc == 00 (store). Bits 29:27 = 111 select the
      * load/store group, bit 26 is the SIMD/FP flag, bit 25 separates the
@@ -1419,6 +1457,10 @@ static void xbox_McpxTrapInstall(void)
         if (VirtualProtect((LPVOID)apu, MCPX_APU_MMIO_SIZE,
                            PAGE_READONLY, &old_prot)) {
             g_mcpx_apu_guarded = 1;
+            if (g_mcpx_apu_read && !VirtualProtect((LPVOID)apu, 0x20000u,
+                                                   PAGE_NOACCESS, &old_prot)) {
+                fprintf(stderr, "  APU: failed to trap model register reads\n");
+            }
         } else {
             fprintf(stderr, "  WARNING: MCPX write trap: mprotect failed on the "
                     "APU aperture; its registers will not reach the model\n");

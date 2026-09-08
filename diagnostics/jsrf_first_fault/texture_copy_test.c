@@ -85,19 +85,14 @@ int main(void) {
     CHECK(target[0]==0 && target[1]==0x80); /* half red, not the original full red */
     s.dither=1; memset(target,0xcc,sizeof(target));
     CHECK(DRAW()); CHECK(target[0]==0 && target[1]==0x78); /* ordered half-red quantisation */
-    /* Every active stage and final selection is part of the whitelist. */
-    const unsigned selectors[]={0x1e60,0x1e70,0x288,0x28c,
-        0xac0,0xac4,0xac8,0xacc,0x260,0x264,0x268,0x26c,
-        0xaa0,0xaa4,0xaa8,0xaac,0x1e40,0x1e44,0x1e48,0x1e4c};
-    for(unsigned i=0;i<sizeof(selectors)/sizeof(selectors[0]);++i) {
-        methods[selectors[i]/4]^=1;
-        CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"combiner / texture program"));
-        methods[selectors[i]/4]^=1;
-    }
+    /* Unsupported outputs and constant inputs still reject explicitly. */
+    methods[0xaa0/4]=0xc01; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xaa0/4]=0xc00;
+    methods[0xac0/4]=0x01200000; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xac0/4]=0x08040000;
     methods[0x300/4]=1; CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"alpha test"));
     methods[0x300/4]=0; methods[0x304/4]=1;
     CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"blending"));
-    methods[0x304/4]=0; methods[0x1b04/4]=0x09920c29; /* multiple DXT1 mip levels remain unsupported */
-    CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"texture format / mip layout"));
+    methods[0x304/4]=0; methods[0x1b04/4]=0x09920c29; /* two-level DXT1 mip chain */
+    CHECK(!nv2a_texture_copy_prepare(methods,&s));
+    CHECK(s.levels==2 && nv2a_texture_copy_texture_bytes(&s)==163840);
     puts("Texture DMA, RGB565, filtering, projection, modulation, alpha, bounds and rejection checks passed");
 }

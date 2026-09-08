@@ -507,6 +507,9 @@ int  xbox_Nv2aVblankPending(void);
 
 void xbox_SetApuMmioWriteHook(void (*fn)(uint32_t offset, uint32_t value,
                                          unsigned width));
+/* Pair with the write hook before initialization. Main APU register reads on
+ * AArch64 then come from the device model, including interrupt/trap state. */
+void xbox_SetApuMmioReadHook(uint32_t (*fn)(uint32_t offset, unsigned width));
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 

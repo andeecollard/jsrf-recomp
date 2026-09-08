@@ -53,6 +53,11 @@ void xbox_D3D8SetWindowTitle(const char *title)
 {
     g_window_title = (title && title[0]) ? title : "Xbox Game";
 }
+
+void xbox_d3d8_set_window_title(const char *title)
+{
+    xbox_D3D8SetWindowTitle(title);
+}
 #define MAX_TSS   33
 #define MAX_TSU   8     /* texture stages */
 

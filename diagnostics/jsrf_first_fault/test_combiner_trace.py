@@ -10,7 +10,11 @@ import unittest
 class CombinerTraceTest(unittest.TestCase):
     def test_grouping_and_capture(self):
         root = Path(__file__).resolve().parents[2]
-        renderer = root / "build-macos/jsrf-first-fault/build/jsrf_vsh_render_test"
+        build_dir = Path(os.environ.get(
+            "JSRF_TEST_BUILD_DIR",
+            root / "build-macos/jsrf-first-fault/build",
+        ))
+        renderer = build_dir / "jsrf_vsh_render_test"
         with tempfile.TemporaryDirectory(prefix="jsrf-combiner-trace-") as directory:
             prefix = str(Path(directory) / "draw-")
             env = dict(os.environ, RECOMP_COMBINER_TRACE="1", RECOMP_DRAW_CAPTURE=prefix)

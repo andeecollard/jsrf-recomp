@@ -1,3 +1,7 @@
+#include "nv2a_ff.h"
+#ifdef __APPLE__
+#include "nv2a_metal.h"
+#endif
 /**
  * Execute the parts of the title's pushbuffer that produce visible pixels.
  *
@@ -8,11 +12,11 @@
  * on screen: which surface is being drawn into, and clearing it.
  *
  * Geometry uses either pre-transformed attributes or the title's uploaded
- * NV2A vertex program. Shader positions and diffuse outputs feed the CPU
- * rasteriser directly. The measured linear RGB565 texture-copy / colour
- * program and measured texture-times-diffuse combiner are supported with
- * linear RGB565; other configured fragment states are rejected. Depth,
- * blending, compressed textures and general colour programs remain unsupported.
+ * NV2A vertex program. Shader outputs feed the bounded software rasteriser,
+ * or the optional native Metal raster path on macOS. The supported fragment
+ * subset includes the title's measured register combiners, RGB565/RGBA8/DXT1
+ * textures, mipmaps, depth, blending, culling and dithering; every state that
+ * remains unsupported is rejected and counted explicitly.
  *
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
@@ -82,6 +86,7 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
+    uint32_t metal_batches, metal_fallbacks;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -126,6 +131,7 @@ static uint8_t s_method_seen[0x2000 / 4];
 static int s_capture_selected;
 static struct {
     NV2ATextureCopy state;
+    NV2ATextureCopy extra_stages[3];
     const uint8_t *texture;
     uint8_t *target, *depth;
     size_t texture_bytes, target_bytes, depth_bytes;
@@ -255,6 +261,27 @@ static const char *prepare_texture_copy(void)
                 || ((uint64_t)s_copy.depth_address+s_copy.depth_bytes>s_copy.texture_address
                     && (uint64_t)s_copy.texture_address+s_copy.texture_bytes>s_copy.depth_address))
             return "overlapping depth surface";
+    }
+    c->extra_stages=s_copy.extra_stages;
+    for(unsigned unit=1;unit<4;++unit) if(c->texture_mask&(1u<<unit)) {
+        NV2ATextureCopy *t=&s_copy.extra_stages[unit-1];
+        memset(t,0,sizeof(*t));
+        error=nv2a_texture_copy_prepare_image(s_methods,unit,t);
+        if(error) return error;
+        size_t bytes=nv2a_texture_copy_texture_bytes(t);
+        if(!nv2a_dma_resolve(regs+0x700000,0x100000,ramht,t->texture_handle,&base,&limit)
+                || (uint64_t)t->texture_offset+bytes>(uint64_t)limit+1
+                || (uint64_t)base+t->texture_offset+bytes>UINT32_MAX) return "texture DMA range";
+        uint32_t address=base+t->texture_offset;
+        if((uint64_t)address+bytes>s_copy.target_address &&
+                (uint64_t)s_copy.target_address+s_copy.target_bytes>address)
+            return "overlapping texture and target";
+        if(c->depth_test && (uint64_t)address+bytes>s_copy.depth_address &&
+                (uint64_t)s_copy.depth_address+s_copy.depth_bytes>address)
+            return "overlapping depth surface";
+        c->extra_texture[unit-1]=xbox_GpuMemoryRange(address,bytes);
+        c->extra_size[unit-1]=bytes;
+        if(!c->extra_texture[unit-1]) return "surface outside mapped RAM";
     }
     s_copy.active = 1;
     ++s_copy.batches;
@@ -470,6 +497,9 @@ static void snapshot_surface(void)
     const uint8_t *mem;
     uint32_t y;
 
+#ifdef __APPLE__
+    if (getenv("RECOMP_METAL")) nv2a_metal_sync();
+#endif
     if (!s_snap_wanted || !s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
         return;
     if (b != 2 && b != 4)
@@ -619,6 +649,9 @@ static void dump_surface_bmp(const char *tag, unsigned seq)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
 
+#ifdef __APPLE__
+    if (getenv("RECOMP_METAL")) nv2a_metal_sync();
+#endif
     if (!mem || !s_gpu.color_offset)
         return;
     write_bmp(tag, seq, mem + s_gpu.color_offset, s_gpu.pitch,
@@ -785,6 +818,9 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+#ifdef __APPLE__
+    if (getenv("RECOMP_METAL")) nv2a_metal_invalidate(NULL);
+#endif
 
     /* Fixed Z24S8, linear single-sample surface. Resolve the actual DMA
      * object and validate the entire mapped range before touching depth. */
@@ -1262,7 +1298,21 @@ static int prepare_vertices(void)
             memset(s_outputs[i], 0, sizeof(s_outputs[i]));
             memcpy(s_outputs[i][0], s_positions[i], sizeof(s_positions[i]));
             for (int k=0;k<4;++k) s_outputs[i][NV2A_VSH_OUT_D0][k] = has_color ? color[k] : 1;
-            fetch_vertex(9, s_gpu.idx[i], s_outputs[i][NV2A_VSH_OUT_T0]);
+            for(unsigned unit=0;unit<4;++unit) {
+                memcpy(s_outputs[i][NV2A_VSH_OUT_T0+unit],s_vsh.current[9+unit],4*sizeof(float));
+                if(s_gpu.attr[9+unit].size)
+                    fetch_vertex(9+unit,s_gpu.idx[i],s_outputs[i][NV2A_VSH_OUT_T0+unit]);
+            }
+            if(s_method_seen[0x680/4] && s_method_seen[0x6bc/4]) {
+                float inputs[16][4];
+                memcpy(inputs,s_vsh.current,sizeof(inputs));
+                for(unsigned a=0;a<16;++a) if(s_gpu.attr[a].size)
+                    if(!fetch_vertex(a,s_gpu.idx[i],inputs[a])) VSH_REJECT("fixed-function vertex fetch",a);
+                const char *reason=nv2a_ff_vertex(s_methods,inputs,s_outputs[i]);
+                if(reason) VSH_REJECT(reason,0);
+                memcpy(s_positions[i],s_outputs[i][0],sizeof(s_positions[i]));
+                s_colors[i]=pack_color(s_outputs[i][3]);
+            }
         }
     }
     if (programmable) s_vsh.batches++;
@@ -1293,6 +1343,9 @@ static void capture_draw(const char *error)
             || s_combiner_capture || (sample && s_gpu.draws==strtoul(sample,NULL,0))
             || (error && s_copy.rejected < 2));
     if (!s_capture_selected) return;
+#ifdef __APPLE__
+    if (getenv("RECOMP_METAL")) nv2a_metal_sync();
+#endif
     char path[768];
     snprintf(path, sizeof(path), "%s%06u.json", prefix, s_gpu.draws);
     FILE *f = fopen(path, "wb");
@@ -1393,9 +1446,10 @@ static void raster_batch(void)
         note_vsh_reject();
         if (s_vsh.rejected <= 4)
             fprintf(stderr, "  [VSH] rejected batch mode=%u start=%u valid=%d final=%d: "
-                            "%s (%u)\n",
+                            "%s (%u), lighting=%u skin=%u\n",
                     s_vsh.mode, s_vsh.start, s_vsh.decoded.valid, s_vsh.decoded.has_final,
-                    s_vsh_reason ? s_vsh_reason : "unrecorded", s_vsh_reason_detail);
+                    s_vsh_reason ? s_vsh_reason : "unrecorded", s_vsh_reason_detail,
+                    s_methods[0x314/4], s_methods[0x328/4]);
         return;
     }
     const char *copy_error = prepare_texture_copy();
@@ -1405,7 +1459,7 @@ static void raster_batch(void)
         if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s\n", s_gpu.draws, copy_error);
         return;
     }
-    if (s_vsh.mode == 0 && !batch_is_screen_space()) {
+    if (s_vsh.mode == 0 && !(s_method_seen[0x680/4] && s_method_seen[0x6bc/4]) && !batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         /* RECOMP_PB_EXEC_NOCLIPTEST: rasterise anyway, to tell "the vertices
          * were decoded but sit outside the clip rect" apart from "the vertices
@@ -1419,6 +1473,41 @@ static void raster_batch(void)
         }
     }
 
+#ifdef __APPLE__
+    if (s_copy.active && getenv("RECOMP_METAL")) {
+        static unsigned fallback_reports, unique_reports;
+        static const char *seen_reasons[16];
+        static int trace_fallbacks = -1;
+        if (trace_fallbacks < 0)
+            trace_fallbacks = getenv("RECOMP_METAL_FALLBACK_TRACE") ? 1 : 0;
+        int triangles=nv2a_metal_draw(&s_copy.state,s_copy.texture,s_copy.texture_bytes,
+            s_copy.target,s_copy.target_bytes,s_copy.depth,s_copy.depth_bytes,
+            s_outputs,s_gpu.idx_count,s_gpu.prim);
+        if(triangles>=0) {
+            static unsigned reported;
+            s_gpu.tris_drawn+=(unsigned)triangles;
+            ++s_gpu.metal_batches;
+            if(reported++<10) fprintf(stderr,"[METAL] rendered batch: %d triangles\n",triangles);
+            goto batch_complete;
+        }
+        ++s_gpu.metal_fallbacks;
+        const char *reason=nv2a_metal_last_reject();
+        int unique=1;
+        for(unsigned i=0;i<unique_reports;i++)
+            if(!strcmp(reason,seen_reasons[i]))unique=0;
+        if(unique&&unique_reports<16)seen_reasons[unique_reports++]=reason;
+        else if(unique)unique=0;
+        if(fallback_reports++<3 || (trace_fallbacks && unique)) fprintf(stderr,
+            "[METAL] software fallback (%s): combiner=%u mask=0x%x untextured=%u format=%u/%u levels=%u size=%ux%u bpp=%u depth=%u/%u blend=%u dither=%u repeat=%u cull=%u clip=%u,%u\n",
+            reason,
+            s_copy.state.combiner_count,s_copy.state.texture_mask,s_copy.state.untextured,
+            s_copy.state.rgba8,s_copy.state.dxt1,s_copy.state.levels,
+            s_copy.state.width,s_copy.state.height,
+            s_copy.state.target_bpp,s_copy.state.depth_test,s_copy.state.depth_write,s_copy.state.blend,
+            s_copy.state.dither,s_copy.state.repeat,s_copy.state.cull_face,
+            s_copy.state.clip_x,s_copy.state.clip_y);
+    }
+#endif
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
@@ -1447,6 +1536,10 @@ static void raster_batch(void)
     default:
         break;                             /* points and lines: not yet */
     }
+batch_complete:
+#ifdef __APPLE__
+    if (s_capture_selected && getenv("RECOMP_METAL")) nv2a_metal_sync();
+#endif
     if (s_copy.active) capture_bytes("after", s_copy.target, s_copy.target_bytes);
     if (s_copy.active && s_copy.depth) capture_bytes("depth-after",s_copy.depth,s_copy.depth_bytes);
     /* Report-time snapshots may interrupt the clear or raster loops. Capture
@@ -2160,6 +2253,14 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+#ifdef __APPLE__
+    if (getenv("RECOMP_METAL"))
+    {
+        fprintf(stderr,"[METAL] %u batches native, %u software fallbacks\n",
+                s_gpu.metal_batches,s_gpu.metal_fallbacks);
+        nv2a_metal_report();
+    }
+#endif
 
     /* Top ten by frequency: selection sort over a small table, once every few
      * seconds, is not worth a better algorithm. RECOMP_PB_EXEC_TOP raises the

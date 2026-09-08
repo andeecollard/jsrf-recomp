@@ -42,7 +42,10 @@ from tools.recomp.config import configure_from_xbe
 from tools.recomp.translator import FunctionTranslator
 
 STUB = re.compile(
-    r"^void (sub_([0-9A-F]{8}))\(void\) \{ g_esp \+= \d+; /\* 0x[0-9A-F]{8}: [^\n]* \*/ \}$",
+    r"^void (sub_([0-9A-F]{8}))\(void\) \{ "
+    r'(?:static int _seen; if \(!_seen\) \{ _seen = 1; '
+    r'recomp_stub_ran\(0x\2u, "[^"\n]*"\); \} )?'
+    r"g_esp \+= \d+; /\* 0x\2: [^\n]* \*/ \}$",
     re.MULTILINE)
 
 

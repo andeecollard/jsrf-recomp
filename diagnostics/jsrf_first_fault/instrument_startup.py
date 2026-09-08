@@ -77,6 +77,10 @@ points = {
         '0004EF90': ('jsrf_title_state_probe', 'ecx, MEM32(ecx + 0x44)'),
     },
     'recomp_0009.c': {
+        '001A308E': ('jsrf_audio_completion_probe', 'ecx, MEM32(esp)'),
+        '001A2FBE': ('jsrf_audio_completion_probe', 'esi, 0'),
+        '001A25CA': ('jsrf_audio_completion_probe', 'edi, esi'),
+        '001A3A8E': ('jsrf_audio_completion_probe', 'esi, 0'),
         '001914BD': ('jsrf_pb_patch_probe', 'esi'),
         '00191510': ('jsrf_pb_event_probe', 'esi'),
         '001915FD': ('jsrf_pb_reserve_probe', 'esi, eax, ecx, MEM32(esp + 0xC)'),

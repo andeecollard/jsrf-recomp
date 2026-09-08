@@ -322,7 +322,8 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
 static RECOMP_TLS ULONG g_bridge_current_ordinal;
 static RECOMP_TLS int   g_bridge_current_slot = -1;
 static RECOMP_TLS uint32_t g_bridge_current_target;
-static uint32_t g_thunk_table_base;   /* defined with its initialiser below */
+extern uint32_t g_thunk_table_base;
+extern uint32_t g_thunk_table_count;
 
 static uint32_t bridge_checked_out_va(uint32_t va, uint32_t bytes,
                                       const char *export_name,
@@ -5586,39 +5587,6 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
 }
 
 /* ── Initialization ─────────────────────────────────────── */
-
-/*
- * Where this title's kernel thunk table lives. Defaults to the compile-time
- * constant, but every XBE puts it somewhere different (it comes from the
- * header's KernelImageThunkAddress), so xbox_MemoryLayoutInit() parses the
- * real address out of the binary and overrides it here.
- *
- * Halo build 2276 puts it at 0x00253090 against the default's 0x0036B7C0 --
- * without the override the bridge patches ordinals into whatever happens to
- * live at the wrong address and every kernel call goes somewhere arbitrary.
- */
-static uint32_t g_thunk_table_base  = XBOX_KERNEL_THUNK_TABLE_BASE;
-static uint32_t g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
-
-void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
-{
-    if (!xbox_va) {
-        return;
-    }
-
-    g_thunk_table_base = xbox_va;
-
-    /* count indexes g_slot_* arrays, which are sized by the macro. A title
-     * importing more slots than the real kernel exports would run off them. */
-    if (count && count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
-        g_thunk_table_count = count;
-    } else if (count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
-        fprintf(stderr,
-                "  Kernel thunk bridge: XBE declares %u thunk slots, clamping to %d\n",
-                count, XBOX_KERNEL_THUNK_TABLE_SIZE);
-        g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
-    }
-}
 
 /**
  * Resolve the kernel thunk table in Xbox memory.

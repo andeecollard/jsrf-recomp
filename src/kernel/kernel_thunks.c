@@ -32,6 +32,32 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE] = {0};
 
+/* Per-title kernel import table, owned here so xbox_kernel_init() can query it
+ * without dragging the much larger bridge object (and its game callbacks)
+ * into kernel-only test executables. */
+uint32_t g_thunk_table_base = XBOX_KERNEL_THUNK_TABLE_BASE;
+uint32_t g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+
+void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count)
+{
+    if (xbox_va) *xbox_va = g_thunk_table_base;
+    if (count) *count = g_thunk_table_count;
+}
+
+void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
+{
+    if (!xbox_va) return;
+    g_thunk_table_base = xbox_va;
+    if (count && count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        g_thunk_table_count = count;
+    } else if (count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        fprintf(stderr,
+                "  Kernel thunk bridge: XBE declares %u thunk slots, clamping to %d\n",
+                count, XBOX_KERNEL_THUNK_TABLE_SIZE);
+        g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+    }
+}
+
 /* ============================================================================
  * Logging Implementation
  * ============================================================================ */

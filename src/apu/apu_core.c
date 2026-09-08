@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "apu.h"
+#include "apu_sdl2.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
 
@@ -86,6 +87,10 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
     uint64_t r = 0;
 
     switch (addr) {
+    case NV_PAPU_ISTS:
+        update_irq(d);
+        r = qatomic_read(&d->regs[addr]);
+        break;
     case NV_PAPU_XGSCNT:
         r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
         break;
@@ -184,12 +189,12 @@ static struct {
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 #endif
-/* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's
- * waveOut fallback path stays inactive and never produces audio. */
+/* On POSIX, SDL supplies the host output. waveOut remains the Windows
+ * fallback. */
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
+#define WAVEOUT_BUF_SAMPLES 256   /* Eight 32-sample APU subframes */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 
 typedef struct {
@@ -215,6 +220,12 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
         return;
     }
+#if !defined(_WIN32)
+    if (apu_sdl2_init()) {
+        fprintf(stderr, "[APU] Using SDL2 audio backend\n");
+        return;
+    }
+#endif
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
@@ -256,6 +267,10 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
         xa2_shutdown();
         return;
     }
+    if (apu_sdl2_is_active()) {
+        apu_sdl2_shutdown();
+        return;
+    }
     if (!g_waveout.initialized) return;
 
     waveOutReset(g_waveout.hwo);
@@ -270,96 +285,55 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
+    int output_samples = 8 * NUM_SAMPLES_PER_FRAME;
+
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
-    if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
-            }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+    /* VP/DSP has filled this buffer across eight 32-sample subframes. The old
+     * output paths cleared it here and therefore submitted only silence (or
+     * the separate software mixer). Add diagnostics/bridge voices in place. */
+    if (g_test_tone.active && !g_audio_muted) {
+        for (int i = 0; i < output_samples; i++) {
+            int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+            d->monitor.frame_buf[i][0] = s;
+            d->monitor.frame_buf[i][1] = s;
+            g_test_tone.phase += g_test_tone.phase_inc;
+            if (g_test_tone.phase >= 2.0 * M_PI)
+                g_test_tone.phase -= 2.0 * M_PI;
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
-        return;
     }
-
-    if (!g_waveout.initialized) return;
-
-    int idx = g_waveout.next_buf;
-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    /* Wait if this buffer is still playing (with timeout) */
-    int wait_loops = 0;
-    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-        qemu_mutex_unlock(&d->lock);
-        Sleep(1);
-        qemu_mutex_lock(&d->lock);
-        if (++wait_loops > 50) break;
-    }
-
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
+    if (!g_audio_muted)
+        mixer_render(d->monitor.frame_buf, output_samples);
+    else
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
-                g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
-            }
+    if (xa2_is_active())
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, output_samples);
+    else if (apu_sdl2_is_active())
+        apu_sdl2_submit_samples((const int16_t *)d->monitor.frame_buf, output_samples);
+    else if (g_waveout.initialized) {
+        int idx = g_waveout.next_buf;
+        WAVEHDR *hdr = &g_waveout.hdrs[idx];
+
+        /* Wait if this buffer is still playing (with timeout). */
+        int wait_loops = 0;
+        while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+            qemu_mutex_unlock(&d->lock);
+            Sleep(1);
+            qemu_mutex_lock(&d->lock);
+            if (++wait_loops > 50) break;
         }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
+        memcpy(g_waveout.bufs[idx], d->monitor.frame_buf,
+               output_samples * 2 * sizeof(int16_t));
+        hdr->dwFlags &= ~WHDR_DONE;
+        waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+        g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+        g_waveout.frames_written++;
     }
 
-    /* Submit to waveOut */
-    hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
+    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 }
 
 /* ============================================================
@@ -450,6 +424,11 @@ static void *mcpx_apu_frame_thread(void *arg)
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
+
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);

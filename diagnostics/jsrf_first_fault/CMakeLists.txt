@@ -18,6 +18,10 @@ add_subdirectory("${XBOXRECOMP_DIR}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 enable_testing()
 
+add_executable(jsrf_apu_register_test apu_register_test.c)
+target_link_libraries(jsrf_apu_register_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_register COMMAND jsrf_apu_register_test)
+
 add_executable(jsrf_pgraph_notify_test pgraph_notify_test.c)
 target_link_libraries(jsrf_pgraph_notify_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_pgraph_notify COMMAND jsrf_pgraph_notify_test)
@@ -41,6 +45,12 @@ add_test(NAME jsrf_ohci_transfer COMMAND jsrf_ohci_transfer_test)
 add_executable(jsrf_counted_file_test counted_file_test.c)
 target_link_libraries(jsrf_counted_file_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_counted_file COMMAND jsrf_counted_file_test)
+
+if(NOT WIN32)
+    add_executable(jsrf_input_hotplug_test input_hotplug_test.c)
+    target_link_libraries(jsrf_input_hotplug_test PRIVATE xbox_input)
+    add_test(NAME jsrf_input_hotplug COMMAND jsrf_input_hotplug_test)
+endif()
 
 add_executable(jsrf_first_fault
     main.c
@@ -116,6 +126,24 @@ add_executable(jsrf_dxt_fragment_test dxt_fragment_test.c)
 target_link_libraries(jsrf_dxt_fragment_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_dxt_fragment COMMAND jsrf_dxt_fragment_test)
 
+add_executable(jsrf_multitexture_fragment_test multitexture_fragment_test.c)
+target_link_libraries(jsrf_multitexture_fragment_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_multitexture_fragment COMMAND jsrf_multitexture_fragment_test)
+if(APPLE)
+    add_executable(jsrf_metal_copy_test metal_copy_test.c)
+    target_link_libraries(jsrf_metal_copy_test PRIVATE xbox_vsh)
+    # Explicit GPU test; do not turn headless CTest runs into device failures.
+endif()
+add_executable(jsrf_mip_sampling_equivalence_test mip_sampling_equivalence_test.c)
+target_include_directories(jsrf_mip_sampling_equivalence_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+if(NOT WIN32)
+    target_link_libraries(jsrf_mip_sampling_equivalence_test PRIVATE m)
+endif()
+add_test(NAME jsrf_mip_sampling_equivalence COMMAND jsrf_mip_sampling_equivalence_test)
+add_executable(jsrf_ff_vertex_test ff_vertex_test.c)
+target_link_libraries(jsrf_ff_vertex_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_ff_vertex COMMAND jsrf_ff_vertex_test)
+
 add_executable(jsrf_texture_copy_replay texture_copy_replay.c)
 target_link_libraries(jsrf_texture_copy_replay PRIVATE xbox_vsh)
 
@@ -167,10 +195,24 @@ if(Python3_Interpreter_FOUND)
     # branch can never be taken -- the same defect that cost the loader its
     # status at 0x0013D3F3. Most are in functions with no static caller, but
     # the count must not grow unnoticed. Lower the number when a fix reduces it.
+    add_test(NAME jsrf_challenge_flag_merge
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_challenge_flag_merge.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
+    add_test(NAME jsrf_challenge_flag_merge_semantics
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/test_challenge_flag_merge.py")
+    add_test(NAME jsrf_exec_state_flag_merge
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/backport_exec_state_merge.py"
+                     --check --gen "${RECOMP_GEN_DIR}")
+    add_test(NAME jsrf_exec_state_flag_merge_semantics
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/test_exec_state_flag_merge.py")
     add_test(NAME jsrf_unresolved_flags_ratchet
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
-                     --max 78 --gen "${RECOMP_GEN_DIR}")
+                     --max 76 --gen "${RECOMP_GEN_DIR}")
 endif()
 
 add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c
