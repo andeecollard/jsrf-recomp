@@ -43,19 +43,35 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     }
     if (M(0x300) && (M(0x300)!=1 || M(0x33c)!=0x204 || M(0x340)>255)) return "alpha test";
     s->alpha_test=M(0x300); s->alpha_ref=M(0x340);
-    if (M(0x304) && (M(0x304)!=1 || M(0x344)!=0x302 || M(0x348)!=0x303
-                || M(0x350)!=0x8006)) return "blending";
-    s->blend=M(0x304);
+    if (M(0x304)) {
+        uint32_t src=M(0x344),dst=M(0x348);
+        if (M(0x304)!=1 || (src!=0 && src!=1 && src!=0x302 && src!=0x303)
+                || (dst!=0 && dst!=1 && dst!=0x302 && dst!=0x303)
+                || M(0x350)!=0x8006) return "blending";
+        s->blend=1;s->blend_src=src;s->blend_dst=dst;
+    }
     if (M(0x308)) {
         if (M(0x308)!=1 || (M(0x39c)!=0x404 && M(0x39c)!=0x405 && M(0x39c)!=0x408)
                 || (M(0x3a0)!=0x900 && M(0x3a0)!=0x901)) return "face culling";
         s->cull_face=M(0x39c); s->front_cw=M(0x3a0)==0x900;
     }
-    if (M(0x30c) && (M(0x30c)!=1 || M(0x354)!=0x203 || M(0x35c)>1
+    if (M(0x30c) && (M(0x30c)!=1 || M(0x354)<0x200 || M(0x354)>0x207 || M(0x35c)>1
                 || (M(0x290)&0x11000) || (M(0x208)&0xf0)!=0x20)) return "depth test";
-    s->depth_test=M(0x30c); s->depth_write=M(0x35c)!=0;
+    s->depth_test=M(0x30c); s->depth_write=M(0x35c)!=0; s->depth_func=M(0x354);
     s->depth_handle=M(0x198); s->depth_offset=M(0x214); s->depth_pitch=M(0x20c)>>16;
-    if (M(0x32c)) return "stencil test";
+    if (M(0x32c)) {
+        static const uint32_t operations[]={0,0x1e00,0x1e01,0x1e02,0x1e03,0x150a,0x8507,0x8508};
+        uint32_t op[3]={M(0x370),M(0x374),M(0x378)};
+        if(M(0x32c)!=1 || M(0x364)<0x200 || M(0x364)>0x207) return "stencil test";
+        for(unsigned i=0;i<3;++i) {
+            unsigned supported=0;
+            for(unsigned j=0;j<sizeof(operations)/sizeof(operations[0]);++j) supported|=op[i]==operations[j];
+            if(!supported) return "stencil operation";
+        }
+        s->stencil_test=1;s->stencil_write=(M(0x290)&1)!=0;s->stencil_mask=M(0x360);
+        s->stencil_func=M(0x364);s->stencil_ref=M(0x368);s->stencil_func_mask=M(0x36c);
+        s->stencil_fail=op[0];s->stencil_zfail=op[1];s->stencil_zpass=op[2];
+    }
     if (M(0x2a4)) return "fog";
     if (M(0x324) || M(0x338)) return "polygon smoothing / offset";
     if (M(0x17bc)) return "logic op";
@@ -78,7 +94,7 @@ target_state:
     if (!s->clip_w || !s->clip_h
             || s->target_pitch<(s->clip_x+s->clip_w)*s->target_bpp)
         return "target dimensions / pitch";
-    if (s->depth_test && s->depth_pitch<(s->clip_x+s->clip_w)*4u)
+    if ((s->depth_test || s->stencil_test) && s->depth_pitch<(s->clip_x+s->clip_w)*4u)
         return "depth dimensions / pitch";
     if ((M(0x2c0)&0xfff)>s->clip_x || ((M(0x2c0)>>16)&0xfff)<s->clip_x+s->clip_w-1
             || (M(0x2e0)&0xfff)>s->clip_y || ((M(0x2e0)>>16)&0xfff)<s->clip_y+s->clip_h-1)
@@ -294,6 +310,34 @@ static unsigned quantize(float value, unsigned max)
 {
     return (unsigned)(fminf(1,fmaxf(0,value))*max+0.5f);
 }
+static int compare_value(uint32_t func,uint32_t source,uint32_t target)
+{
+    if(!func) func=0x203; /* Directly constructed test state defaults to LEQUAL. */
+    switch(func) {
+    case 0x200:return 0;case 0x201:return source<target;case 0x202:return source==target;
+    case 0x203:return source<=target;case 0x204:return source>target;case 0x205:return source!=target;
+    case 0x206:return source>=target;default:return 1;
+    }
+}
+static uint8_t stencil_result(uint32_t op,uint8_t old,uint8_t ref)
+{
+    switch(op) {
+    case 0:return 0;case 0x1e01:return ref;case 0x1e02:return old==255?255:(uint8_t)(old+1);
+    case 0x1e03:return old?old-1:0;case 0x150a:return (uint8_t)~old;
+    case 0x8507:return (uint8_t)(old+1);case 0x8508:return (uint8_t)(old-1);default:return old;
+    }
+}
+static void stencil_update(const NV2ATextureCopy *s,uint8_t *zeta,uint32_t op)
+{
+    if(!s->stencil_write) return;
+    uint8_t mask=(uint8_t)s->stencil_mask,old=zeta[0];
+    uint8_t next=stencil_result(op,old,(uint8_t)s->stencil_ref);
+    zeta[0]=(uint8_t)((old&~mask)|(next&mask));
+}
+static float blend_factor(uint32_t factor,float source_alpha)
+{
+    switch(factor) {case 0:return 0;case 1:return 1;case 0x302:return source_alpha;default:return 1-source_alpha;}
+}
 static float edge(const float a[4], const float b[4], float x, float y)
 {
     return (b[0]-a[0])*(y-a[1])-(b[1]-a[1])*(x-a[0]);
@@ -317,7 +361,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
             || s->target_pitch<(uint64_t)(s->clip_x+s->clip_w)*s->target_bpp
             || nv2a_texture_copy_texture_bytes(s)>texture_size
             || (uint64_t)s->target_pitch*(s->clip_y+s->clip_h)>target_size) return 0;
-    if (s->depth_test && (!depth || s->depth_pitch<(uint64_t)(s->clip_x+s->clip_w)*4
+    if ((s->depth_test || s->stencil_test) && (!depth || s->depth_pitch<(uint64_t)(s->clip_x+s->clip_w)*4
                 || (uint64_t)s->depth_pitch*(s->clip_y+s->clip_h)>depth_size)) return 0;
     for(unsigned unit=1;unit<4;++unit) if(s->texture_mask&(1u<<unit)) {
         if(!s->extra_stages || !s->extra_texture[unit-1] ||
@@ -360,7 +404,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
     /* A common post-process is an oversized triangle copying texels 1:1.
      * Prove that all pixel centres in its bounds are covered before using
      * row copies. This also preserves RGB565 quantisation exactly. */
-    int direct=!s->combiner_count && !s->rgba8 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test
+    int direct=!s->combiner_count && !s->rgba8 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
         && s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
     for (int i=0;i<3;++i)
         if (v[i][0][3]!=1 || v[i][NV2A_VSH_OUT_T0][3]!=1
@@ -443,16 +487,25 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                 for (int k=0;k<3;++k) rgb[k]=fminf(1,rgb[k]*fmaxf(0,diffuse[k]/recip));
         }
         if (s->alpha_test && quantize(rgb[3],255)<=s->alpha_ref) continue;
-        uint8_t *zp=s->depth_test ? depth+(size_t)y*s->depth_pitch+x*4 : NULL;
+        uint8_t *zp=(s->depth_test||s->stencil_test) ? depth+(size_t)y*s->depth_pitch+x*4 : NULL;
         uint32_t z24=(uint32_t)(fmin(16777215,fmax(0,z))+.5);
-        if (zp && z24>(read32(zp)>>8)) continue;
+        if(s->stencil_test) {
+            uint8_t mask=(uint8_t)s->stencil_func_mask;
+            if(!compare_value(s->stencil_func,(uint8_t)s->stencil_ref&mask,zp[0]&mask)) {
+                stencil_update(s,zp,s->stencil_fail);continue;
+            }
+        }
+        if (s->depth_test && !compare_value(s->depth_func,z24,read32(zp)>>8)) {
+            if(s->stencil_test) stencil_update(s,zp,s->stencil_zfail);
+            continue;
+        }
         uint8_t *p=target+(size_t)y*s->target_pitch+x*s->target_bpp;
         if (s->blend) {
             float dst[4];
             if (s->target_bpp==2) unpack565(p[0]|(uint32_t)p[1]<<8,dst);
             else { dst[0]=p[2]/255.0f; dst[1]=p[1]/255.0f; dst[2]=p[0]/255.0f; dst[3]=p[3]/255.0f; }
-            float a=rgb[3];
-            for (int k=0;k<4;++k) rgb[k]=rgb[k]*a+dst[k]*(1-a);
+            float source=blend_factor(s->blend_src,rgb[3]),destination=blend_factor(s->blend_dst,rgb[3]);
+            for (int k=0;k<4;++k) rgb[k]=rgb[k]*source+dst[k]*destination;
         }
         if (s->dither && s->target_bpp==2) {
             /* Deterministic ordered approximation; NV2A's exact thresholds
@@ -466,6 +519,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
         else pixel=quantize(rgb[3],255)<<24 | quantize(rgb[0],255)<<16 | quantize(rgb[1],255)<<8 | quantize(rgb[2],255);
         for (unsigned k=0;k<s->target_bpp;++k) p[k]=(uint8_t)(pixel>>(8*k));
         if (zp && s->depth_write) { zp[1]=(uint8_t)z24; zp[2]=(uint8_t)(z24>>8); zp[3]=(uint8_t)(z24>>16); }
+        if (s->stencil_test) stencil_update(s,zp,s->stencil_zpass);
     }
     return 1;
 }

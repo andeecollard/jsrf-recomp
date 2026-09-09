@@ -45,7 +45,7 @@ int main(void) {
      * opaque green produces (1/4,1/2,0,3/4), including alpha channel blend. */
     s.linear=1;
     le32(texture+4,0xdddddddd); /* x0=1 red, x1=3 transparent, repeated */
-    coords(.25f,.125f); s.blend=1;
+    coords(.25f,.125f); s.blend=1;s.blend_src=0x302;s.blend_dst=0x303;
     for(int i=0;i<16;++i) le32(target+4*i,0xff00ff00);
     CHECK(DRAW()); CHECK(word(target)==0xbf408000);
     s.alpha_ref=128; memset(target,0x5a,sizeof(target));
@@ -77,6 +77,15 @@ int main(void) {
     CHECK(DRAW()); CHECK(word(target)==0xffff0000 && word(depth)==((100u<<8)|0x7b));
     s.depth_write=1; coords(.375f,.125f); memset(target,0x5a,sizeof(target));
     CHECK(DRAW()); CHECK(word(target)==0x5a5a5a5a && word(depth)==((100u<<8)|0x7b));
+    /* Stencil shares the low byte of D24S8. Test pass increment and fail
+     * replacement without disturbing the 24-bit depth payload. */
+    s.alpha_test=0;s.stencil_test=s.stencil_write=1;s.stencil_mask=s.stencil_func_mask=0xff;
+    s.stencil_func=0x207;s.stencil_ref=9;s.stencil_fail=s.stencil_zfail=0x1e00;s.stencil_zpass=0x1e02;
+    coords(.125f,.125f);for(int i=0;i<3;++i)v[i][0][2]=99;depth[0]=7;
+    CHECK(DRAW());CHECK(depth[0]==8 && (word(depth)>>8)==99);
+    s.stencil_func=0x202;s.stencil_fail=0x1e01;memset(target,0x5a,sizeof(target));
+    CHECK(DRAW());CHECK(depth[0]==9 && word(target)==0x5a5a5a5a);
+    s.stencil_test=s.stencil_write=0;
     /* Both winding selections and front/back culling. */
     coords(.125f,.125f); s.depth_test=0; s.cull_face=0x405; s.front_cw=1;
     CHECK(DRAW()); CHECK(word(target)==0xffff0000);

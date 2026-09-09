@@ -51,7 +51,9 @@ int main(void) {
     v[1][9][3]=0; memset(target,0xcc,sizeof(target));
     CHECK(!DRAW()); for(unsigned i=0;i<sizeof(target);++i) CHECK(target[i]==0xcc);
     vertices(); CHECK(!nv2a_texture_copy_triangle(&s,texture,4,target,sizeof(target),v[0],v[1],v[2]));
-    methods[0x304/4]=1; CHECK(nv2a_texture_copy_prepare(methods,&s));
+    methods[0x304/4]=1;methods[0x344/4]=0;methods[0x348/4]=1;methods[0x350/4]=0x8006;
+    CHECK(!nv2a_texture_copy_prepare(methods,&s) && s.blend_src==0 && s.blend_dst==1);
+    methods[0x344/4]=0x300;CHECK(nv2a_texture_copy_prepare(methods,&s));
     methods[0x304/4]=0; methods[0xac0/4]^=1; CHECK(nv2a_texture_copy_prepare(methods,&s));
     methods[0xac0/4]^=1; methods[0x1b0c/4]|=4; CHECK(nv2a_texture_copy_prepare(methods,&s));
     copy_methods(methods,3,2,8,8,2); CHECK(!nv2a_texture_copy_prepare(methods,&s));
@@ -89,7 +91,7 @@ int main(void) {
     methods[0xaa0/4]=0xc01; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xaa0/4]=0xc00;
     methods[0xac0/4]=0x01200000; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xac0/4]=0x08040000;
     methods[0x300/4]=1; CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"alpha test"));
-    methods[0x300/4]=0; methods[0x304/4]=1;
+    methods[0x300/4]=0; methods[0x304/4]=1;methods[0x344/4]=0x300;
     CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"blending"));
     methods[0x304/4]=0; methods[0x1b04/4]=0x09920c29; /* two-level DXT1 mip chain */
     CHECK(!nv2a_texture_copy_prepare(methods,&s));

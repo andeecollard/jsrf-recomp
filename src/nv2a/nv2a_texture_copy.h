@@ -19,8 +19,11 @@ typedef struct NV2ATextureCopy {
     size_t extra_size[3];
     /* No texture bound: the fragment is the diffuse colour alone. */
     uint32_t untextured;
-    uint32_t dxt1, dxt3, repeat, alpha_test, alpha_ref, blend, cull_face, front_cw;
-    uint32_t depth_test, depth_write, depth_handle, depth_offset, depth_pitch;
+    uint32_t dxt1, dxt3, repeat, alpha_test, alpha_ref, blend, blend_src, blend_dst;
+    uint32_t cull_face, front_cw;
+    uint32_t depth_test, depth_write, depth_func, depth_handle, depth_offset, depth_pitch;
+    uint32_t stencil_test, stencil_write, stencil_mask, stencil_ref, stencil_func_mask;
+    uint32_t stencil_func, stencil_fail, stencil_zfail, stencil_zpass;
     uint32_t target_handle, target_offset, target_pitch, target_bpp;
     uint32_t clip_x, clip_y, clip_w, clip_h;
 } NV2ATextureCopy;

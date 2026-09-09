@@ -54,11 +54,20 @@ int main(void)
     CHECK(nv2a_metal_sync());
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
     s.untextured=0;s.texture_mask=1;s.width=s.height=16;s.pitch=32;s.dither=0;
-    s.blend=1;nv2a_metal_invalidate(gpu);memset(gpu,0xcc,sizeof(gpu));memcpy(cpu,gpu,sizeof(cpu));
+    s.blend=1;s.blend_src=0x302;s.blend_dst=0x303;nv2a_metal_invalidate(gpu);memset(gpu,0xcc,sizeof(gpu));memcpy(cpu,gpu,sizeof(cpu));
     CHECK(nv2a_texture_copy_triangle(&s,tex,sizeof(tex),cpu,sizeof(cpu),v[0],v[1],v[2]));
     CHECK(nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),NULL,0,v,3,5)==1);
     CHECK(nv2a_metal_sync());
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
+    s.blend=0;s.depth_pitch=64;s.stencil_test=s.stencil_write=1;s.stencil_mask=s.stencil_func_mask=0xff;
+    s.stencil_func=0x207;s.stencil_ref=1;s.stencil_fail=s.stencil_zfail=0x1e00;s.stencil_zpass=0x1e02;
+    nv2a_metal_invalidate(gpu);memset(cpu,0xcc,sizeof(cpu));memcpy(gpu,cpu,sizeof(cpu));
+    for(unsigned i=0;i<sizeof(zcpu);i+=4){zcpu[i]=7;zcpu[i+1]=0xff;zcpu[i+2]=0xff;zcpu[i+3]=0xff;}
+    memcpy(zgpu,zcpu,sizeof(zcpu));
+    CHECK(nv2a_texture_copy_triangle_depth(&s,tex,sizeof(tex),cpu,sizeof(cpu),zcpu,sizeof(zcpu),v[0],v[1],v[2]));
+    CHECK(nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),zgpu,sizeof(zgpu),v,3,5)==1);
+    CHECK(nv2a_metal_sync());CHECK(!memcmp(cpu,gpu,sizeof(cpu)));CHECK(!memcmp(zcpu,zgpu,sizeof(zcpu)));
+    s.stencil_test=s.stencil_write=0;s.depth_pitch=0;
     /* Exercise the BC2 path used by JSRF's first rejected city texture. */
     uint8_t bc2[256];
     for(unsigned i=0;i<sizeof(bc2);++i)bc2[i]=(unsigned char)(i*29+7);
@@ -94,6 +103,6 @@ int main(void)
     s.target_bpp=4;nv2a_metal_invalidate(gpu);memset(gpu,0xcc,sizeof(gpu));memcpy(cpu,gpu,sizeof(cpu));
     CHECK(nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),NULL,0,v,3,5)==-1);
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
-    puts("Metal GPU RGB565, Z24, mipmap and multitexture paths match CPU; unsupported state preserves target");
+    puts("Metal GPU RGB565, D24S8 stencil/depth, mipmap and multitexture paths match CPU; unsupported state preserves target");
     return 0;
 }

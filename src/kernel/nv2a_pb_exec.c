@@ -248,7 +248,7 @@ static const char *prepare_texture_copy(void)
             && (uint64_t)s_copy.texture_address+s_copy.texture_bytes > s_copy.target_address
             && (uint64_t)s_copy.target_address+s_copy.target_bytes > s_copy.texture_address)
         return "overlapping texture and target";
-    if (c->depth_test) {
+    if (c->depth_test || c->stencil_test) {
         s_copy.depth_bytes=(size_t)c->depth_pitch*(c->clip_y+c->clip_h);
         if (!nv2a_dma_resolve(regs+0x700000,0x100000,ramht,c->depth_handle,&base,&limit)
                 || (uint64_t)c->depth_offset+s_copy.depth_bytes>(uint64_t)limit+1
@@ -276,7 +276,7 @@ static const char *prepare_texture_copy(void)
         if((uint64_t)address+bytes>s_copy.target_address &&
                 (uint64_t)s_copy.target_address+s_copy.target_bytes>address)
             return "overlapping texture and target";
-        if(c->depth_test && (uint64_t)address+bytes>s_copy.depth_address &&
+        if((c->depth_test || c->stencil_test) && (uint64_t)address+bytes>s_copy.depth_address &&
                 (uint64_t)s_copy.depth_address+s_copy.depth_bytes>address)
             return "overlapping depth surface";
         c->extra_texture[unit-1]=xbox_GpuMemoryRange(address,bytes);

@@ -34,7 +34,12 @@ class CombinerTraceTest(unittest.TestCase):
             self.assertIn("input x -0.5..2559.5  y -0.5..1919.5", log)
             captures = {int(p.stem.split("-")[-1]): json.loads(p.read_text())
                         for p in Path(directory).glob("*.json")}
-            self.assertEqual(set(captures), {1, 4, 5, 6})
+            # Draw 3 is the first vertex-shader rejection.  The bounded VSH
+            # diagnostic added alongside the lighting work deliberately
+            # captures that draw once when capture is enabled.
+            self.assertEqual(set(captures), {1, 3, 4, 5, 6})
+            self.assertEqual(captures[3]["reject_reason"], "shader execution failed")
+            self.assertFalse(captures[3]["copy_supported"])
             self.assertEqual(captures[5]["reject_reason"], "blending")
             self.assertFalse(captures[5]["copy_supported"])
             self.assertEqual(captures[5]["texture_address"], 0)
