@@ -137,11 +137,25 @@ unsigned long g_apu_voice_off_count;
 unsigned long g_apu_idle_trap_count;
 unsigned long g_apu_voice_process_count;
 
+/* Front-end method arrivals, counted before the switch decides anything.
+ *
+ * on=0 answers "did a voice start", but it cannot separate "the guest never
+ * wrote VOICE_ON" from "the write never reached this model". The guest's
+ * submission loop writes SET_CURRENT_VOICE, VOICE_LOCK and the voice config
+ * registers on the same page and in the same iteration as VOICE_ON, so a
+ * nonzero fe/current-voice count next to on=0 localises the failure to the
+ * loop's own control flow rather than to MMIO routing -- and both being zero
+ * says the routing never delivered anything from this loop. */
+unsigned long g_apu_fe_method_count;
+unsigned long g_apu_set_current_voice_count;
+
 void mcpx_apu_voice_report(void)
 {
-    fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu idle_trap=%lu processed=%lu\n",
+    fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu idle_trap=%lu processed=%lu"
+            " fe_methods=%lu set_current_voice=%lu\n",
             g_apu_voice_on_count, g_apu_voice_off_count,
-            g_apu_idle_trap_count, g_apu_voice_process_count);
+            g_apu_idle_trap_count, g_apu_voice_process_count,
+            g_apu_fe_method_count, g_apu_set_current_voice_count);
     fflush(stderr);
 }
 
@@ -204,6 +218,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
 
+    g_apu_fe_method_count++;
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
@@ -346,6 +361,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_VOICE:
+        g_apu_set_current_voice_count++;
         d->regs[NV_PAPU_FECV] = argument;
         break;
 
@@ -578,7 +594,17 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+        /* Free space in the front end's method FIFO. There is no FIFO here --
+         * mcpx_apu_vp_write dispatches each method as it arrives -- so it is
+         * always completely empty, and the honest answer is the whole of it.
+         *
+         * The size matters, because callers do not test this for equality.
+         * JSRF's submission path waits twice: once for (FREE & ~3) >= 0x80,
+         * and once for (FREE >> 2) >= voices * 7, where the voice count is a
+         * byte. 0x80 satisfies the first wait but only the second for four
+         * voices or fewer, and a fifth would spin here for ever. Reporting the
+         * full window satisfies both for any count a byte can hold. */
+        return 0xFFFC;
     default:
         break;
     }

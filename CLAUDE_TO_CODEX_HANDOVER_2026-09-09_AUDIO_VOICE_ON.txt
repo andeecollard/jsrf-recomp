@@ -1,0 +1,152 @@
+JSRF AUDIO HANDOVER FOR CODEX
+Date: 2026-09-09 (Europe/London)
+From: Claude
+
+PURPOSE
+=======
+The VOICE_ON question from CODEX_TO_CLAUDE_HANDOVER_2026-09-09_AUDIO.txt is
+answered and fixed. JSRF now starts voices, retires them, raises the FECTL
+idle trap and queues non-silent PCM. Sound quality has NOT been assessed and
+the mixer is not paced.
+
+Everything below was measured in this session. Nothing is inferred from a
+counter whose trigger was not read first.
+
+
+WHAT THE PROBE FOUND
+====================
+The handover's proposed experiment was run: a bounded, read-only probe on the
+one path that reaches the VOICE_ON store, installed in a copy of the verified
+archive rather than a regeneration.
+
+  runtime  this worktree (identical to xboxrecomp_upstream_integration @ 30ff915)
+  gen      copy of the verified archive, probe-instrumented
+  script   diagnostics/jsrf_first_fault/instrument_voice_submit.py
+  probe    jsrf_voice_submit_probe in main.c, RECOMP_VOICE_TRACE=1
+
+Result, at the title screen with no controller attached:
+
+  [VOICE] entry        obj=80954344 flags=0301 count=1 ret=001A4202
+  [VOICE] pre-voice-on voice_on=00000040 antecedent=0001FFFF i=0 model_on=0
+  [VOICE] loop-done    model_on=0 fe=12 scv=0 shadow_av=0001FFFF shadow_on=00000040
+
+None of the four candidate stopping points was the blocker:
+
+  - the entry gate is open: flags=0301, bit 1 clear on every call;
+  - the voice count is 1, never 0;
+  - both NV1BA0_PIO_FREE spins exit on their first read.
+
+The guest reaches 0x001A3F8D and writes the voice handle every time. It was
+never a control-flow problem. That closes the first two branches of the
+handover's decision list.
+
+
+THE ACTUAL CAUSE: THE MMIO BOUNDARY LOST THE WRITES
+===================================================
+shadow_on=00000040 is the plain-memory contents of 0xFE820124 after the store.
+The write completed as ordinary memory; the APU model never saw it.
+
+Trap accounting (new, [MCPX-TRAP], printed with [APU-VOICE]) measured the
+mechanism over 45 s:
+
+  faults=41526 apu=230 vp=215 ack_windows=13553193 reprotect_failures=0
+
+The APU aperture is guarded read-only so guest stores fault into
+mcpx_trap_handler. The NV2A ack thread was advancing a free-running counter at
+0xFE820010, which lives on the SAME 16 KB page as the voice-submission
+registers at 0x020120-0x020304, by unprotecting the page, storing, and
+reprotecting -- 13.5 million times in 45 s, roughly 300,000 windows a second.
+Every guest store landing in one of those windows completed silently against
+RAM.
+
+215 VP writes reached the model in that run. Not one was VOICE_ON. That is not
+a coin flip: 0x0202F8 is the FIRST store of the submission burst and so tends
+to arrive with the page still guarded, while 0x020120 and 0x020124 follow the
+handler's own reprotect and were reliably swallowed by the next ack window.
+
+
+THE FIX
+=======
+src/kernel/xbox_memory_layout.c
+  - MCPX_APU_MODEL_SIZE (0x30000) names the span the model answers reads for:
+    the main registers plus the VP PIO window.
+  - mcpx_trap_handler's model-backed branch now covers that whole span. It
+    EMULATES the access -- it never unprotects the page -- so there is no
+    window to lose a write in.
+  - the ack thread's free-space counter is skipped when the model answers
+    those reads (g_mcpx_apu_read_trapped). ack_windows drops to 0.
+  - both discarded VirtualProtect results are now checked and counted.
+
+src/apu/apu_vp.c
+  - NV1BA0_PIO_FREE returns 0xFFFC instead of 0x80. There is no FIFO in this
+    model, so it is always empty. The size matters: JSRF waits for
+    (FREE >> 2) >= voices * 7 and the voice count is a byte, so 0x80 would
+    have spun for ever at five voices or more. This replaces a monotonic ramp,
+    which satisfied any comparison by accident; a constant must satisfy them
+    on purpose.
+  - g_apu_fe_method_count / g_apu_set_current_voice_count, reported in
+    [APU-VOICE]. These are the positive control: they separate "the guest did
+    not write" from "the write did not arrive".
+
+The guest binary reads exactly ONE address in the whole VP window -- offset
+0x10, PIO_FREE, at 33 sites -- and writes 45 other offsets. Routing VP reads
+through the model therefore costs nothing: no JSRF code reads back a VP
+shadow. That was checked across the whole generated tree, not assumed.
+
+
+VERIFIED RESULT
+===============
+Built against the PRISTINE archive gen (no probe), 45 s, title screen:
+
+  [APU-VOICE] on=8 off=3 idle_trap=3 processed=259789 fe_methods=1703
+  [MCPX-TRAP] faults=43707 apu=1820 vp=1700 ack_windows=0 reprotect_failures=0
+  [APU-SDL] queued audible batch: 256 frames, peak 5406
+
+Before the fix the same three lines read on=0 off=0 idle_trap=0 processed=0,
+and no audible batch was ever queued.
+
+idle_trap=3 is the transition the previous handover identified as missing:
+voice retirement raises SE2FE_IDLE_VOICE, which sets FETRAPREASON_REQUESTED,
+which is what the guest's service routine at 0x001A25CA waits for. The whole
+chain is now live.
+
+No regression: no guest fault, frames still present, 27/27 ctest pass.
+
+
+WHAT IS STILL OPEN
+==================
+1. PACING. "[APU-SDL] cleared overfull output queue" appears -- the mixer
+   produces faster than 48 kHz playback and the queue is dropped when it
+   overfills. This is the likely source of the glitchy audio reported before
+   the New Game investigation. Nothing clocks the APU frame rate.
+2. off=3 against on=8: most voices never retire. Watch for voice exhaustion
+   over a long session.
+3. apu_core.c:64 and :437 still test a multi-bit FEMETHMODE field with a mask
+   (HALTED, 0x80, also matches 0xE0). Real, independent, untouched.
+4. The two remaining windowed writes in mcpx_trap_handler -- PCRTC_INTR_0 and
+   PGRAPH_INTR -- have the same shape as the bug fixed here. They have not
+   been shown to lose anything; [MCPX-TRAP] is the instrument if they do.
+5. Everything in the previous gameplay handover that is not audio: Gum and the
+   player not rendering, the mission-resource backport's fate, 112 vs 76 dead
+   _flags.
+
+
+REPRODUCING
+===========
+  cmake -S diagnostics/jsrf_first_fault -B <build> \
+        -DRECOMP_GEN_DIR=<extracted archive gen>
+  RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
+  RECOMP_REPORT_MS=10000 RECOMP_HDD_ROOT=<disposable emulated-hdd copy> \
+    <build>/jsrf_first_fault
+
+CMakeLists resolves JSRF_STOCK_DIR as a sibling of the repo root; a worktree
+needs a jsrf_stock_test symlink beside it.
+
+To re-run the probe, instrument a COPY of the gen:
+  python3 diagnostics/jsrf_first_fault/instrument_voice_submit.py --gen <copy>
+  ... --check   report what is installed
+  ... --remove  take it back out
+and add RECOMP_VOICE_TRACE=1 to the launch. The probe is opt-in and read-only;
+it is not needed for the fix.
+
+The preserved baseline and its archive were not modified.

@@ -923,6 +923,14 @@ static void jsrf_pusher_report(void)
             extern void mcpx_apu_voice_report(void);
             mcpx_apu_voice_report();
         }
+        /* And the boundary those voices have to cross. The APU aperture is
+         * guarded read-only so stores fault and reach the model; anything the
+         * guard was not covering at the moment of the store lands in plain
+         * memory and is lost. This says how much of each is happening. */
+        {
+            extern void xbox_McpxTrapReport(void);
+            xbox_McpxTrapReport();
+        }
         pad_sentinel_scan();
         /* The allocator prints its owner breakdown once, when a request
          * fails. That names who holds the heap at the end and says nothing
@@ -1177,6 +1185,138 @@ void jsrf_audio_completion_probe(uint32_t pc, uint32_t object, uint32_t arg)
         fprintf(stderr, "  +%04X guest=%08X model=%08X\n", off,
                 MEM32(0xFE800000u + off),
                 (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4));
+    }
+    fflush(stderr);
+}
+
+/* JSRF's voice submission loop, sub_001A3E58 (guest 0x001A3E58-0x001A4003).
+ *
+ * The APU model reports on=0 at the tutorial: no voice is ever started. The
+ * store that would start one is present in the generated code --
+ *
+ *   0x001A3F8D   mov [0xFE820124], ecx      NV1BA0_PIO_VOICE_ON
+ *
+ * (the translator prints that address as the signed constant -25034460) -- so
+ * either execution never arrives there, or it arrives and the write does not
+ * reach the model. This tells those apart. Every site reads registers and
+ * guest memory only: no branch, register or guest byte changes.
+ *
+ * The path has four places it can stop short of the store:
+ *
+ *   1. the entry gate        test [obj+0x12],2 / jne 0x001A4000. There is no
+ *      label between that test and its jump, so the gate is read at the entry
+ *      site instead: flags & 2 set on arrival means this call returns at once
+ *   2. a PIO_FREE spin       0x001A3EB3, until (FREE & ~3) >= 0x80
+ *   3. a second PIO_FREE spin 0x001A3F24, until (FREE >> 2) >= count * 7
+ *   4. a zero voice count    MEM8(obj+0x64) == 0 skips the loop body entirely
+ *
+ * Both spin heads are sites of their own, so a spin that never exits shows as
+ * its cap being spent with nothing printed after it -- the distinction the
+ * live counters cannot make, because a thread stuck in a guest spin loop is
+ * indistinguishable from one that was never called.
+ *
+ * Caps are per site, not shared: the two spin heads would otherwise spend the
+ * whole budget before the loop body printed anything.
+ *
+ * RECOMP_VOICE_TRACE=1 enables it; =<n> multiplies every cap by n. */
+void jsrf_voice_submit_probe(uint32_t pc, uint32_t a, uint32_t b, uint32_t c)
+{
+    extern unsigned long g_apu_voice_on_count;
+    extern unsigned long g_apu_fe_method_count;
+    extern unsigned long g_apu_set_current_voice_count;
+
+    static const struct { uint32_t pc; unsigned cap; const char *what; } sites[] = {
+        { 0x001A3E58u, 16, "entry" },
+        { 0x001A3E74u, 16, "past-gate" },
+        { 0x001A3EB3u,  8, "free-spin-1" },
+        { 0x001A3EC2u, 16, "free-spin-1-done" },
+        { 0x001A3F17u, 16, "read-count" },
+        { 0x001A3F24u,  8, "free-spin-2" },
+        { 0x001A3F36u, 16, "loop-entered" },
+        { 0x001A3F3Bu, 32, "iteration" },
+        { 0x001A3F7Au, 32, "pre-voice-on" },
+        { 0x001A3FA9u, 16, "loop-done" },
+        { 0x001A3FDBu,  8, "free-spin-3" },
+        { 0x001A3FEAu, 16, "free-spin-3-done" },
+        { 0x001A4000u, 16, "returned" },
+    };
+    enum { NSITES = (int)(sizeof(sites) / sizeof(sites[0])) };
+    static unsigned used[NSITES];
+    static int enabled = -1;
+    static unsigned scale = 1;
+    int i, site = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_VOICE_TRACE");
+        enabled = e != NULL;
+        if (e && *e) {
+            long v = strtol(e, NULL, 0);
+            if (v > 1) scale = (unsigned)v;
+        }
+    }
+    if (!enabled) return;
+
+    for (i = 0; i < NSITES; i++) {
+        if (sites[i].pc == pc) { site = i; break; }
+    }
+    if (site < 0) return;
+    if (used[site] >= sites[site].cap * scale) return;
+    used[site]++;
+
+    switch (pc) {
+    case 0x001A3E58u:
+        /* a = ecx (the voice object), b = the return address at [esp]. */
+        fprintf(stderr, "[VOICE] %-16s obj=%08X flags=%04X count=%u ret=%08X\n",
+                sites[site].what, a, (unsigned)MEM16(a + 0x12),
+                (unsigned)MEM8(a + 0x64), b);
+        break;
+    case 0x001A3E74u:
+    case 0x001A3F17u:
+    case 0x001A4000u:
+        fprintf(stderr, "[VOICE] %-16s obj=%08X flags=%04X count=%u\n",
+                sites[site].what, a, (unsigned)MEM16(a + 0x12),
+                (unsigned)MEM8(a + 0x64));
+        break;
+    case 0x001A3EB3u:
+    case 0x001A3EC2u:
+    case 0x001A3F24u:
+    case 0x001A3FDBu:
+    case 0x001A3FEAu:
+        /* b is the PIO_FREE word as the guest reads it. The aperture is plain
+         * memory for reads, advanced by the ack thread's counter, so this is
+         * the value the spin's comparison actually sees. */
+        fprintf(stderr, "[VOICE] %-16s obj=%08X free=%08X need=%08X\n",
+                sites[site].what, a, b, c);
+        break;
+    case 0x001A3F36u:
+    case 0x001A3F3Bu:
+        fprintf(stderr, "[VOICE] %-16s obj=%08X i=%d handle_ptr=%08X\n",
+                sites[site].what, a, (int)b, c);
+        break;
+    case 0x001A3F7Au:
+        /* a = ecx, the VOICE_ON argument about to be stored; b = the
+         * SET_ANTECEDENT_VOICE argument; c = the loop index. */
+        fprintf(stderr, "[VOICE] %-16s voice_on=%08X antecedent=%08X i=%d "
+                "model_on=%lu fe=%lu\n",
+                sites[site].what, a, b, (int)c,
+                g_apu_voice_on_count, g_apu_fe_method_count);
+        break;
+    case 0x001A3FA9u:
+        /* After the loop. shadow_* are the plain-memory contents of the two
+         * VP registers the loop stores to. The write trap does not write
+         * through, so a nonzero shadow means the store landed as ordinary
+         * memory -- it fell into one of the ack thread's unprotect windows on
+         * that page -- while a zero shadow with a raised model count means it
+         * was trapped and delivered. */
+        fprintf(stderr, "[VOICE] %-16s obj=%08X model_on=%lu fe=%lu scv=%lu "
+                "shadow_av=%08X shadow_on=%08X\n",
+                sites[site].what, a,
+                g_apu_voice_on_count, g_apu_fe_method_count,
+                g_apu_set_current_voice_count,
+                (unsigned)MEM32(0xFE820120u), (unsigned)MEM32(0xFE820124u));
+        break;
+    default:
+        break;
     }
     fflush(stderr);
 }

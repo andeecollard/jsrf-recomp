@@ -285,20 +285,22 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 #define NV2A_USER_DMA_GET 0x800044u
 
 /*
- * Free-running counters in the MCPX aperture.
+ * Free-running counters in the MCPX aperture -- the fallback for a target that
+ * has no APU model behind the aperture.
  *
  * Some hardware registers are clocks, not flags: software reads them and waits
  * until the value passes a target. Against zeroed RAM the value never moves and
  * the wait is forever. DirectSound's CMcpxCore::SetupVoiceProcessor spins on
- * the APU sample counter at 0xFE820010 exactly this way, which is where Halo
- * stopped once input initialisation started working.
+ * 0xFE820010 exactly this way, which is where Halo stopped once input
+ * initialisation started working.
  *
- * Ticking it is the honest model: on hardware this counter advances on its own
- * whether or not anything is listening.
- *
- * ponytail: the rate is "as fast as this thread loops", not 48 kHz. Nothing
- * paces audio off it yet. Derive it from a real clock if timing starts to
- * matter.
+ * Ticking it made that wait finish, but it is the wrong register: 0x020010 is
+ * NV1BA0_PIO_FREE, free space in the front end's method FIFO, and the guest is
+ * asking "is there room for my methods" rather than "has the clock passed N".
+ * When the model answers VP reads it answers that question directly and this
+ * loop is skipped -- which matters for more than tidiness, because advancing
+ * the counter meant unprotecting the page holding the voice-submission
+ * registers several hundred thousand times a second. See mcpx_trap_handler.
  */
 static void *g_mcpx_regs = NULL;
 
@@ -852,6 +854,11 @@ static const struct { uint32_t offset; uint8_t write_clear; } MCPX_WRITE_CLEAR[]
  * dependency on xbox_apu: targets that link the kernel alone must still build. */
 #define MCPX_APU_MMIO_OFFSET 0x000000u
 #define MCPX_APU_MMIO_SIZE   0x080000u   /* 512 KB */
+/* The part of it the model answers reads for: the main registers at 0x00000
+ * and the voice processor's PIO window at 0x20000. Everything above that (GP
+ * at 0x30000, EP at 0x50000) has no model behind it, so it stays plain memory
+ * rather than reading back as a zero the guest did not write. */
+#define MCPX_APU_MODEL_SIZE  0x030000u
 
 static void (*g_mcpx_apu_write)(uint32_t offset, uint32_t value,
                                 unsigned width) = NULL;
@@ -960,6 +967,9 @@ static size_t g_mcpx_guard_pages = 0;
 static size_t g_mcpx_page_size = 0;
 
 static int g_mcpx_apu_guarded = 0;
+/* Set when the model answers reads for the span below MCPX_APU_MODEL_SIZE, so
+ * nothing else has to keep a plausible value in that RAM. */
+static int g_mcpx_apu_read_trapped = 0;
 
 /*
  * Serialises the unprotect/write/reprotect dance between the trap handler and
@@ -974,6 +984,34 @@ static int g_mcpx_apu_guarded = 0;
  * ack thread has already unprotected, so its write cannot fault and re-enter.
  */
 static volatile int g_mcpx_lock = 0;
+
+/* Guard accounting for the APU aperture.
+ *
+ * A guest store to a guarded page reaches the model only if the page is
+ * read-only at the instant of the store. Two things drop that guard on
+ * purpose -- this handler, and the ack thread's free-space counter, which
+ * lives at 0x020010 on the same page as the voice-submission registers at
+ * 0x020120-0x020304 -- and either reprotect can fail, which both call sites
+ * used to discard silently.
+ *
+ * These separate the two ways a write can go missing. A raised leak count
+ * with reprotect failures at zero is a race against an open window; a
+ * reprotect failure is a guard that is gone for the rest of the run. */
+static unsigned long g_mcpx_trap_faults;        /* stores that did fault */
+static unsigned long g_mcpx_trap_apu_writes;    /* ... and reached the APU */
+static unsigned long g_mcpx_trap_apu_vp_writes; /* ... in the VP region */
+static unsigned long g_mcpx_reprotect_failures; /* guard lost, permanently */
+static unsigned long g_mcpx_ack_windows;        /* ack-thread open/close pairs */
+
+void xbox_McpxTrapReport(void)
+{
+    fprintf(stderr, "  [MCPX-TRAP] faults=%lu apu=%lu vp=%lu "
+            "ack_windows=%lu reprotect_failures=%lu\n",
+            g_mcpx_trap_faults, g_mcpx_trap_apu_writes,
+            g_mcpx_trap_apu_vp_writes, g_mcpx_ack_windows,
+            g_mcpx_reprotect_failures);
+    fflush(stderr);
+}
 
 static void mcpx_lock(void)
 {
@@ -1114,14 +1152,27 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     }
 
     insn = *(const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+    g_mcpx_trap_faults++;
 
     guest_va = (uint32_t)(fault - g_memory_offset);
-    /* Main APU registers must never be a shadow of the last guest store:
-     * ISTS is W1C and the voice processor changes trap state asynchronously.
-     * Decode ordinary scalar loads/stores without opening a writable window.
-     * VP PIO keeps its existing write trap and free-space counter for now. */
+    /* Main APU registers and the voice processor's PIO window must never be a
+     * shadow of the last guest store: ISTS is W1C and the voice processor
+     * changes trap state asynchronously. Decode ordinary scalar loads and
+     * stores here, without ever opening a writable window.
+     *
+     * The VP window is in this branch, and not in the write trap below, for a
+     * measured reason. The write trap has to unprotect the page to complete
+     * the store, and so did the ack thread, which advanced a free-running
+     * counter at 0x020010 -- on the same page as the voice-submission
+     * registers at 0x020120-0x020304, roughly 300,000 times a second. Any
+     * guest store landing in one of those windows completed as ordinary
+     * memory and the model never saw it. JSRF's DirectSound submission loop
+     * lost every one of its NV1BA0_PIO_VOICE_ON writes that way: over 45 s on
+     * the title screen, 215 VP writes reached the model and not one of them
+     * was VOICE_ON, so no voice ever started and the title was silent.
+     * Emulating the access instead of replaying it needs no window at all. */
     if (g_mcpx_apu_read && guest_va >= XBOX_MCPX_BASE &&
-            guest_va < XBOX_MCPX_BASE + 0x20000u) {
+            guest_va < XBOX_MCPX_BASE + MCPX_APU_MODEL_SIZE) {
         unsigned opc = (insn >> 22) & 3u;
         unsigned size = insn >> 30;
         int writeback = !(insn & (1u << 24)) && !(insn & (1u << 21)) &&
@@ -1137,12 +1188,17 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
             else if (rt == 29) uc->uc_mcontext->__ss.__fp = value;
             else if (rt == 30) uc->uc_mcontext->__ss.__lr = value;
         } else {
+            uint32_t off = guest_va - XBOX_MCPX_BASE;
             value = rt < 29 ? uc->uc_mcontext->__ss.__x[rt] :
                     rt == 29 ? uc->uc_mcontext->__ss.__fp :
                     rt == 30 ? uc->uc_mcontext->__ss.__lr : 0;
             if (width < 4) value &= (1u << (8 * width)) - 1u;
-            if (g_mcpx_apu_write)
-                g_mcpx_apu_write(guest_va - XBOX_MCPX_BASE, (uint32_t)value, width);
+            if (g_mcpx_apu_write) {
+                g_mcpx_trap_apu_writes++;
+                if (off >= 0x20000u && off < 0x30000u)
+                    g_mcpx_trap_apu_vp_writes++;
+                g_mcpx_apu_write(off, (uint32_t)value, width);
+            }
         }
         uc->uc_mcontext->__ss.__pc += 4;
         return;
@@ -1180,6 +1236,9 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
         uint32_t off = guest_va - XBOX_MCPX_BASE;
         if (g_mcpx_apu_write && off < MCPX_APU_MMIO_OFFSET + MCPX_APU_MMIO_SIZE) {
             static unsigned long n = 0;
+            g_mcpx_trap_apu_writes++;
+            if (off >= 0x20000u && off < 0x30000u)
+                g_mcpx_trap_apu_vp_writes++;
             g_mcpx_apu_write(off, (uint32_t)value, width);
             if (++n <= 8 || (n % 1000) == 0) {
                 fprintf(stderr, "  [APU-MMIO] write #%lu +0x%06X = 0x%08X (%u)\n",
@@ -1337,7 +1396,8 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     } else {
         xbox_McpxApplyReady();   /* the ack thread cannot reach a guarded page */
     }
-    VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
+    if (!VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot))
+        g_mcpx_reprotect_failures++;
     mcpx_unlock();
 
     uc->uc_mcontext->__ss.__pc += 4;   /* every AArch64 instruction is 4 bytes */
@@ -1457,9 +1517,13 @@ static void xbox_McpxTrapInstall(void)
         if (VirtualProtect((LPVOID)apu, MCPX_APU_MMIO_SIZE,
                            PAGE_READONLY, &old_prot)) {
             g_mcpx_apu_guarded = 1;
-            if (g_mcpx_apu_read && !VirtualProtect((LPVOID)apu, 0x20000u,
-                                                   PAGE_NOACCESS, &old_prot)) {
-                fprintf(stderr, "  APU: failed to trap model register reads\n");
+            if (g_mcpx_apu_read) {
+                if (VirtualProtect((LPVOID)apu, MCPX_APU_MODEL_SIZE,
+                                   PAGE_NOACCESS, &old_prot))
+                    g_mcpx_apu_read_trapped = 1;
+                else
+                    fprintf(stderr,
+                            "  APU: failed to trap model register reads\n");
             }
         } else {
             fprintf(stderr, "  WARNING: MCPX write trap: mprotect failed on the "
@@ -1953,7 +2017,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 
-        if (g_mcpx_regs && !g_apu_mmio_trapped) {
+        /* Skipped entirely once the model answers reads for this span: the
+         * counter existed only because 0xFE820010 was plain memory, and
+         * writing it here is what kept the page unprotected often enough to
+         * swallow the guest's voice submissions. */
+        if (g_mcpx_regs && !g_apu_mmio_trapped && !g_mcpx_apu_read_trapped) {
             for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
@@ -1965,9 +2033,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     mcpx_lock();
                     if (VirtualProtect((LPVOID)pg, g_mcpx_page_size,
                                        PAGE_READWRITE, &op)) {
+                        g_mcpx_ack_windows++;
                         *c += 1;
-                        VirtualProtect((LPVOID)pg, g_mcpx_page_size,
-                                       PAGE_READONLY, &op);
+                        if (!VirtualProtect((LPVOID)pg, g_mcpx_page_size,
+                                            PAGE_READONLY, &op))
+                            g_mcpx_reprotect_failures++;
                     }
                     mcpx_unlock();
                 } else
