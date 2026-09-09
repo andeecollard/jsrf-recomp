@@ -1,0 +1,158 @@
+[
+  {
+    "path": "diagnostics/jsrf_first_fault/CMakeLists.txt",
+    "status": " M"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/dxt_fragment_test.c",
+    "status": " M"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/guest_trace.h",
+    "status": " M"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/instrument_startup.py",
+    "status": " M"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/main.c",
+    "status": " M"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/recover_midfunction_entries.py",
+    "status": " M"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/texture_copy_test.c",
+    "status": " M"
+  },
+  {
+    "path": "src/apu/apu_core.c",
+    "status": " M"
+  },
+  {
+    "path": "src/apu/apu_vp.c",
+    "status": " M"
+  },
+  {
+    "path": "src/kernel/nv2a_pb_exec.c",
+    "status": " M"
+  },
+  {
+    "path": "src/kernel/xbox_memory_layout.c",
+    "status": " M"
+  },
+  {
+    "path": "src/kernel/xbox_memory_layout.h",
+    "status": " M"
+  },
+  {
+    "path": "src/nv2a/CMakeLists.txt",
+    "status": " M"
+  },
+  {
+    "path": "src/nv2a/nv2a_texture_copy.c",
+    "status": " M"
+  },
+  {
+    "path": "src/nv2a/nv2a_texture_copy.h",
+    "status": " M"
+  },
+  {
+    "path": "tools/recomp/lifter.py",
+    "status": " M"
+  },
+  {
+    "path": "tools/recomp/test_lifter_flag_merge.py",
+    "status": " M"
+  },
+  {
+    "path": "tools/recomp/translator.py",
+    "status": " M"
+  },
+  {
+    "path": ".pi/",
+    "status": "??"
+  },
+  {
+    "path": "JSRF_NEXT_STEPS_2026-09-05.md",
+    "status": "??"
+  },
+  {
+    "path": "QWEN_FLAGS_AUDIT_INCREMENTAL.md",
+    "status": "??"
+  },
+  {
+    "path": "QWEN_UNRESOLVED_FLAGS_AUDIT_SALVAGE.md",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/apu_register_test.c",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/backport_challenge_flag_merge.py",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/backport_exec_state_merge.py",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/canonical_mapping/",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/ff_vertex_test.c",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/multitexture_fragment_test.c",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/test_challenge_flag_merge.py",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/test_exec_state_flag_merge.py",
+    "status": "??"
+  },
+  {
+    "path": "diagnostics/jsrf_first_fault/test_recovery_stub_format.py",
+    "status": "??"
+  },
+  {
+    "path": "jsrf-harness-starter-v2/",
+    "status": "??"
+  },
+  {
+    "path": "jsrf-harness-starter/",
+    "status": "??"
+  },
+  {
+    "path": "src/nv2a/nv2a_ff.c",
+    "status": "??"
+  },
+  {
+    "path": "src/nv2a/nv2a_ff.h",
+    "status": "??"
+  },
+  {
+    "path": "tmp/",
+    "status": "??"
+  },
+  {
+    "path": "tools/recomp/test_backward_flag_flow.py",
+    "status": "??"
+  },
+  {
+    "path": "tools/recomp/test_flag_continuation.py",
+    "status": "??"
+  },
+  {
+    "path": "tools/recomp/test_mixed_compare_zf.py",
+    "status": "??"
+  }
+]

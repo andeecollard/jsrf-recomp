@@ -1,0 +1,22 @@
+{
+  "project_root": "..",
+  "model": "local/qwen3.8-27b",
+  "defaults": {
+    "search_budget": 2,
+    "files_read_budget": 8,
+    "read_budget_lines": 400,
+    "write_budget": 4,
+    "build_budget": 2,
+    "runtime_budget": 2,
+    "tool_budget": 16
+  },
+  "forbidden_commands": [
+    "git reset",
+    "git checkout",
+    "git clean",
+    "git restore --source",
+    "rm -rf .git",
+    "git rebase",
+    "git merge"
+  ]
+}

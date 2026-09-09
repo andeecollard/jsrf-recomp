@@ -54,5 +54,6 @@ void jsrf_pb_reserve_probe(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 void jsrf_pb_patch_probe(uint32_t, uint32_t);
 void jsrf_pb_event_probe(uint32_t, uint32_t);
+void jsrf_audio_completion_probe(uint32_t, uint32_t, uint32_t);
 
 #endif

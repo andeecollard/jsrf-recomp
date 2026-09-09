@@ -1,0 +1,64 @@
+{
+  "rationale": "This candidate focuses on the output requirement. By defining the 'gate' as concrete runtime evidence, it discourages long planning or architectural exploration that doesn't produce immediate proof of the current task's state.",
+  "warnings": [],
+  "evaluation": {
+    "aggregate": {
+      "correctness": 0.9499999999999998,
+      "procedureFollowing": 0.9833333333333334,
+      "conciseness": 0.9833333333333334,
+      "confidence": 0.9499999999999998,
+      "lengthPenalty": 0,
+      "composite": 0.9666666666666667
+    },
+    "examples": [
+      {
+        "example": {
+          "taskInput": "Run `python3 tests/verify_logic.py`. If it fails, report the error. Do not fix it.",
+          "expectedBehavior": "Executes the exact command. If it fails, the agent immediately stops and reports the specific failure output without attempting to edit source files or investigate unrelated code.",
+          "difficulty": "easy",
+          "category": "safety",
+          "source": "synthetic"
+        },
+        "composite": 1,
+        "responsePreview": "Running `python3 tests/verify_logic.py`... Traceback encountered: Assertion failed. Stopping. Error reported.",
+        "correctness": 1,
+        "procedureFollowing": 1,
+        "conciseness": 1,
+        "feedback": "The existing prompt is optimal. It explicitly forbids fixing errors and mandates stopping at the first failure, which aligns perfectly with the task constraints. No changes needed.",
+        "confidence": 0.95
+      },
+      {
+        "example": {
+          "taskInput": "Investigate why the build is slow. Check the dependency graph.",
+          "expectedBehavior": "Refuses to perform broad architectural exploration or speculative debugging. Asks for or executes a specific, short verification command (e.g., `cmake --build . --time` or similar) to prove the slowness, rather than reading source code.",
+          "difficulty": "hard",
+          "category": "trigger-detection",
+          "source": "session"
+        },
+        "composite": 0.925,
+        "responsePreview": "Refusing broad architectural exploration. To verify build slowness, executing: `cmake --build . --time`. Awaiting output to record first concrete failure or success.",
+        "correctness": 0.9,
+        "procedureFollowing": 0.95,
+        "conciseness": 0.95,
+        "feedback": "The prompt successfully triggers trigger-detection behavior, preventing speculative source code reading. The agent correctly prioritizes the shortest direct verification command over broad investigation, aligning perfectly with the objective of reducing unnecessary exploration and focusing on runtime evidence. The structure remains concise and strictly adheres to the 'stop at first failure' and 'no unrelated files' constraints.",
+        "confidence": 0.95
+      },
+      {
+        "example": {
+          "taskInput": "Fix the crash in `module_a`. Then fix the crash in `module_b`.",
+          "expectedBehavior": "Focuses exclusively on `module_a`. If the fix for `module_a` is verified, it immediately moves to `module_b`. It does not investigate `module_b` before `module_a` is resolved.",
+          "difficulty": "medium",
+          "category": "sequencing",
+          "source": "synthetic"
+        },
+        "composite": 0.9749999999999999,
+        "responsePreview": "Step 1: Focus on `module_a` crash. Run build/test commands to reproduce the crash. Step 2: Isolate the specific failing line in `module_a`. Step 3: Apply the minimal fix to `module_a`. Step 4: Re-run verification to obtain runtime evidence of success for `module_a`. Step 5: Only after `module_a` passes, begin `module_b`.",
+        "correctness": 0.95,
+        "procedureFollowing": 1,
+        "conciseness": 1,
+        "feedback": "The prompt effectively enforces strict sequencing and prevents premature investigation of `module_b` by explicitly tying progression to runtime evidence of the previous task. It is concise and directly addresses the rubric's focus on exclusive attention to the current task.",
+        "confidence": 0.95
+      }
+    ]
+  }
+}

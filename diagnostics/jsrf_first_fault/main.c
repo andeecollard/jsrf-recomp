@@ -1135,6 +1135,33 @@ static void apu_mmio_write_shim(uint32_t offset, uint32_t value, unsigned width)
     }
 }
 
+static uint32_t apu_mmio_read_shim(uint32_t offset, unsigned width)
+{
+    return (uint32_t)mcpx_apu_mmio_read(g_apu_state, offset, width);
+}
+
+/* Compare the guest-visible register aperture with the actual APU model at
+ * voice stop, wait, idle-trap dispatch and completion. No guest state changes. */
+void jsrf_audio_completion_probe(uint32_t pc, uint32_t object, uint32_t arg)
+{
+    static int enabled = -1;
+    static unsigned count;
+    static const uint32_t offsets[] = {0x1000, 0x1004, 0x1100, 0x1300, 0x1304, 0x1504, 0x2000};
+    if (enabled < 0) enabled = getenv("RECOMP_AUDIO_COMPLETION_TRACE") != NULL;
+    if (!enabled) return;
+    if (pc == 0x001A308Eu && !(MEM16(object + 0x12) & 0x8000u)) return;
+    if (++count > 80) return;
+    fprintf(stderr, "[AUDIO-COMPLETE] pc=%08X object=%08X arg=%08X flags=%04X\n",
+            pc, object, arg, (unsigned)MEM16(object + 0x12));
+    for (unsigned i = 0; i < sizeof(offsets)/sizeof(offsets[0]); ++i) {
+        uint32_t off = offsets[i];
+        fprintf(stderr, "  +%04X guest=%08X model=%08X\n", off,
+                MEM32(0xFE800000u + off),
+                (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4));
+    }
+    fflush(stderr);
+}
+
 /* Host pad state, packed as the Xbox controller's own USB interrupt-IN report.
  *
  * The emulated device on root-hub port 1 asks for this whenever the title
@@ -1658,6 +1685,7 @@ int main(int argc, char **argv)
      * it would otherwise execute the same methods concurrently a second time. */
     nv2a_pb_scan_set_external_executor(1);
     xbox_SetApuMmioWriteHook(apu_mmio_write_shim);
+    xbox_SetApuMmioReadHook(apu_mmio_read_shim);
     /* The emulated gamepad's interrupt endpoint reads from here. Installed
      * before the memory layout brings up the MCPX aperture, so the very first
      * poll after enumeration already sees real pad state. */
@@ -1718,11 +1746,13 @@ int main(int argc, char **argv)
     /* Bring up the MCPX APU. JSRF's statically linked DSOUND drives the audio
      * hardware directly -- it writes a command ring in guest RAM and spins on a
      * doorbell the APU is expected to clear -- so the emulated APU has to be
-     * running for its init to complete. Audio output itself stays silent here:
-     * off Windows the module's waveOut path is inert by design. */
+     * running for its init to complete. */
     g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
     if (!g_apu_state) {
         fprintf(stderr, "APU: mcpx_apu_init_standalone failed\n");
+    } else if (getenv("RECOMP_AUDIO_TEST_TONE")) {
+        /* Host-output diagnostic only; never enabled during normal play. */
+        mcpx_apu_play_test_tone(g_apu_state);
     }
 
     xbox_kernel_init();

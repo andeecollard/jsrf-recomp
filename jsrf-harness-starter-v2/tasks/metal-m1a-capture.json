@@ -1,0 +1,18 @@
+{
+  "id": "metal-m1a-capture",
+  "type": "MEASURE",
+  "allowed_files": ["src/kernel/nv2a_pb_exec.c"],
+  "allowed_write_files": ["src/kernel/nv2a_pb_exec.c", "QWEN_METAL_M1A_CAPTURE.md"],
+  "budgets": {
+    "search_budget": 2,
+    "files_read_budget": 3,
+    "read_budget_lines": 400,
+    "write_budget": 3,
+    "build_budget": 2,
+    "runtime_budget": 1,
+    "tool_budget": 14
+  },
+  "required_artifacts": ["QWEN_METAL_M1A_CAPTURE.md"],
+  "forbidden_commands": ["render-investigation", "Video Notes", "JSRF-Decompilation"],
+  "prompt": "Add one compact diagnostic at the existing successful software-rasterisation path. Print at most the first 10 successful draw batches, then stop printing permanently. Do not select a Metal candidate. Do not inspect old logs, video/decomp, or alternate build trees. Record the capture in QWEN_METAL_M1A_CAPTURE.md and stop."
+}

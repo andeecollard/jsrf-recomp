@@ -1,0 +1,14 @@
+{
+  "guest_fault": 0,
+  "tree_corruption": 0,
+  "update_abi": 0,
+  "refcount": 0,
+  "icall": 0,
+  "last_startup": [
+    "2736",
+    "00000086"
+  ],
+  "max_objects": 138,
+  "last_frame": "  [FB] t= 183.02 0x005F0000 sum=8DD44675 nonzero=137793/153600 CHANGED | presented nonzero=-1",
+  "frame_reports": 184
+}

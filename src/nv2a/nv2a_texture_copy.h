@@ -7,9 +7,16 @@
  * copy or measured texture-times-diffuse combiner. Only the measured alpha,
  * source-alpha blend and fixed Z24 LEQUAL state is supported. RGB565 dithering
  * uses ordered quantisation, not yet verified against NV2A hardware. */
-typedef struct {
+typedef struct NV2ATextureCopy {
     uint32_t texture_handle, texture_offset, width, height, pitch, linear, dither;
     uint32_t modulate;
+    uint32_t rgba8, levels, min_filter;
+    float lod_bias;
+    uint32_t combiner_count, color_icw[8], alpha_icw[8], add_specular;
+    uint32_t texture_mask;
+    const struct NV2ATextureCopy *extra_stages;
+    const uint8_t *extra_texture[3];
+    size_t extra_size[3];
     /* No texture bound: the fragment is the diffuse colour alone. */
     uint32_t untextured;
     uint32_t dxt1, repeat, alpha_test, alpha_ref, blend, cull_face, front_cw;
@@ -17,6 +24,8 @@ typedef struct {
     uint32_t target_handle, target_offset, target_pitch, target_bpp;
     uint32_t clip_x, clip_y, clip_w, clip_h;
 } NV2ATextureCopy;
+
+const char *nv2a_texture_copy_prepare_image(const uint32_t methods[2048], unsigned unit, NV2ATextureCopy *state);
 
 size_t nv2a_texture_copy_texture_bytes(const NV2ATextureCopy *state);
 

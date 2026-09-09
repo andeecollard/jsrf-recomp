@@ -1,0 +1,76 @@
+[
+  {
+    "repair": "empty-list guard via 14870",
+    "function": "00014870",
+    "block": "00014885",
+    "status": "present on inlined entry path",
+    "excerpt": "loc_00014885: ;\n    if (CMP_BE(_fa, _fb)) goto loc_00014909; /* jbe: below or equal (unsigned <=) */\n"
+  },
+  {
+    "repair": "challenge comparison merge",
+    "function": "00015130",
+    "block": "00015275",
+    "status": "present",
+    "excerpt": "loc_00015275: ;\n    if (CMP_NE(_fa, _fb)) goto loc_000153BC; /* jne: not equal / not zero */\n"
+  },
+  {
+    "repair": "mixed execution-state NZ",
+    "function": "00015130",
+    "block": "000153A9",
+    "status": "MISSING: mixed CMP/TEST",
+    "excerpt": "loc_000153A9: ;\n    if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000153BC;\n"
+  },
+  {
+    "repair": "shared ZF",
+    "function": "000A0F10",
+    "block": "000A13A1",
+    "status": "MISSING: mixed CMP/TEST",
+    "excerpt": "loc_000A13A1: ;\n    if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000A13CF;\n"
+  },
+  {
+    "repair": "loader comparison merge",
+    "function": "0013D300",
+    "block": "0013D3F3",
+    "status": "present",
+    "excerpt": "loc_0013D3F3: ;\n    if (CMP_LE(_fas, _fbs)) goto loc_0013D3FB; /* jle: less or equal (signed <=) */\n"
+  },
+  {
+    "repair": "read-length result merge",
+    "function": "001403B0",
+    "block": "001404DB",
+    "status": "present",
+    "excerpt": "loc_001404DB: ;\n    if ((eax != 0)) goto loc_00140524; /* jne: not equal / not zero */\n"
+  },
+  {
+    "repair": "seek-position result merge",
+    "function": "001403B0",
+    "block": "001404F1",
+    "status": "present",
+    "excerpt": "loc_001404F1: ;\n    if ((edi == 0)) goto loc_00140508; /* je: equal / zero */\n"
+  },
+  {
+    "repair": "ADX decrement snapshot",
+    "function": "00144F60",
+    "block": "00145181",
+    "status": "present",
+    "excerpt": "loc_00145181: ;\n    edi = esi;\n    esi = MEM32(esp + 0x40);\n    MEM16(esi) = LO16(ecx);\n    ecx = MEM32(esp + 0x48);\n    MEM16(ecx) = LO16(edx);\n    ecx = ecx + 2;\n    MEM32(esp + 0x48) = ecx;\n    ecx = MEM32(esp + 0x24);\n    esi = esi + 2;\n    ecx--;\n    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)_fa; /* dec result snapshot; CF unchanged */\n    ebx = edx;\n    MEM32(esp + 0x24) = ecx;\n    ecx = MEM32(esp + 0x28);\n    MEM32(esp + 0x14) = edi;\n    MEM32(esp + 0x38) = ebx;\n    MEM32(esp + 0x40) = esi;\n    if ((_fa != 0)) goto loc_00145000; /* jne: not equal / not zero */\n"
+  },
+  {
+    "repair": "FCMOV",
+    "function": "0014C850",
+    "status": "present",
+    "excerpt": "void sub_0014C850(void)\n{\n    uint32_t _fa = 0, _fb = 0;\n    int32_t _fas = 0, _fbs = 0;\n    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;\n    #define fp_push(v) do { double _fp_value = (v); \\\n        g_fp_top = (g_fp_top + 7u) & 7u; \\\n        g_fp_stack[g_fp_top] = _fp_value; } while (0)\n    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)\n    #define fp_top() g_fp_stack[g_fp_top]\n    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]\n    #define fp_st1() fp_st(1)\n\nloc_0014C850: ;\n    fp_push(MEMF(esp + 4)); /* fld float */\n    fp_push(MEMF(esp + 8)); /* fld float */\n    g_fp_cmp = RECOMP_FCMP(fp_top(), fp_st1()); /* fcom st(1) */\n    eax = 0; /* xor self */\n    eax = (eax & 0xFFFF0000u) | (uint32_t)(uint16_t)(((g_fp_top & 7u) << 11) | (g_fp_cmp == 2 ? 0x4500u : g_fp_cmp < 0 ? 0x0100u : g_fp_cmp > 0 ? 0x0000u : 0x4000u)); /* fnstsw ax <- fpu status */\n    _fa = (uint32_t)(HI8(eax)) & 0xFFu; _fb = (uint32_t)(1) & 0xFFu;\n    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test HI8(eax), 1 (8-bit) */\n    if (TEST_NZ(_fa, _fb)) { fp_top() = fp_st1(); } /* fcmovne st(0), st(1) */\n    { double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; } /* fxch st(1) */\n    fp_pop(); /* fstp st(0) */\n    esp += 4; return; /* ret */\n\n    #undef fp_push\n    #undef fp_pop\n    #undef fp_top\n    #undef fp_st\n    #undef fp_st1\n}"
+  },
+  {
+    "repair": "FCMOV",
+    "function": "0014C870",
+    "status": "present",
+    "excerpt": "void sub_0014C870(void)\n{\n    uint32_t _fa = 0, _fb = 0;\n    int32_t _fas = 0, _fbs = 0;\n    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;\n    #define fp_push(v) do { double _fp_value = (v); \\\n        g_fp_top = (g_fp_top + 7u) & 7u; \\\n        g_fp_stack[g_fp_top] = _fp_value; } while (0)\n    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)\n    #define fp_top() g_fp_stack[g_fp_top]\n    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]\n    #define fp_st1() fp_st(1)\n\nloc_0014C870: ;\n    fp_push(MEMF(esp + 4)); /* fld float */\n    fp_push(MEMF(esp + 8)); /* fld float */\n    g_fp_cmp = RECOMP_FCMP(fp_top(), fp_st1()); /* fcom st(1) */\n    eax = 0; /* xor self */\n    eax = (eax & 0xFFFF0000u) | (uint32_t)(uint16_t)(((g_fp_top & 7u) << 11) | (g_fp_cmp == 2 ? 0x4500u : g_fp_cmp < 0 ? 0x0100u : g_fp_cmp > 0 ? 0x0000u : 0x4000u)); /* fnstsw ax <- fpu status */\n    _fa = (uint32_t)(HI8(eax)) & 0xFFu; _fb = (uint32_t)(1) & 0xFFu;\n    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test HI8(eax), 1 (8-bit) */\n    if (TEST_Z(_fa, _fb)) { fp_top() = fp_st1(); } /* fcmove st(0), st(1) */\n    { double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; } /* fxch st(1) */\n    fp_pop(); /* fstp st(0) */\n    esp += 4; return; /* ret */\n\n    #undef fp_push\n    #undef fp_pop\n    #undef fp_top\n    #undef fp_st\n    #undef fp_st1\n}"
+  },
+  {
+    "repair": "standalone empty-list fragment",
+    "function": "00014885",
+    "status": "MISSING for independent entry; path through 14870 repaired",
+    "excerpt": "loc_00014885: ;\n    if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00014909;\n"
+  }
+]

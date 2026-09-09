@@ -1,0 +1,25 @@
+{
+  "before_unknown": 70,
+  "after_unknown": 68,
+  "resolved": [
+    {
+      "site": "sub_00015130:000153A9:0",
+      "before": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000153BC;",
+      "after": "if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */"
+    },
+    {
+      "site": "sub_000A0F10:000A13A1:0",
+      "before": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000A13CF;",
+      "after": "if ((_zf != 0)) goto loc_000A13CF; /* je: equal / zero */"
+    }
+  ],
+  "newly_unknown": [],
+  "other_changes": [],
+  "before_only": [],
+  "after_only": [],
+  "changed_bodies": [
+    "sub_00015130",
+    "sub_000A0F10"
+  ],
+  "continuation_body_unchanged": true
+}

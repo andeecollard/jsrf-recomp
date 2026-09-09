@@ -252,6 +252,7 @@ _RESULT_ZF_SF_SETTERS = frozenset({
 # ZF and SF conditions only; anything needing CF or OF falls through to the
 # `_flags` fallback rather than being answered from one arbitrary predecessor.
 MERGED_RESULT_SETTER = "__merged_result"
+MERGED_COMPARE_ZF = "__merged_compare_zf"
 
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
@@ -339,6 +340,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    if flag_setter == MERGED_COMPARE_ZF:
+        if jcc in ("je", "jz"):
+            return "(_zf != 0)", desc
+        if jcc in ("jne", "jnz"):
+            return "(_zf == 0)", desc
+        return None
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
     # _fa/_fb (zero-extended) and _fas/_fbs (sign-extended) at the point the
@@ -1750,6 +1758,9 @@ class Lifter:
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
             f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
         ]
+        if getattr(self, "needs_compare_zf", False):
+            expr = "(_fa == _fb)" if kind == "cmp" else "((_fa & _fb) == 0)"
+            out.append(f"_zf = {expr}; /* CMP/TEST zero-flag snapshot */")
         # A cmp sets the carry flag too, and sbb/adc/setc/rcl read it directly
         # rather than through _fa/_fb. Leaving CF alone here let those pick up
         # whatever an earlier instruction had left in it.
@@ -3075,6 +3086,31 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+def advance_flag_state(insn, state):
+    """Pure flag transfer shared by CFG analysis and instruction emission.
+
+    ``state`` may be an opaque sentinel when summarising a block: returning
+    it unchanged means the block preserves its incoming flag definition.
+    """
+    m = insn.mnemonic
+    if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+        return m, list(insn.operands)
+    if m in _FLAGS_UNDEFINED:
+        return None
+    if m in _EFLAGS_PRESERVE:
+        return state
+    if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi", "sahf"):
+        return m, list(insn.operands)
+    if m.startswith(("f", "cmov", "j", "set")):
+        return state
+    if m.startswith("rep"):
+        forms = ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd")
+        if any(form in m or form in insn.op_str for form in forms):
+            return m, list(insn.operands)
+        return state
+    return None
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3216,55 +3252,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
 
-        # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _FLAGS_UNDEFINED:
-            # Flags are undefined after these - clear tracking
-            last_flag_setter = None
-            last_flag_ops = []
-        elif curr.mnemonic in _EFLAGS_SETTERS:
-            # Additional flag-setting instructions
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _EFLAGS_PRESERVE:
-            pass  # These don't affect EFLAGS
-        elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
-                                "fucomip", "fcomi"):
-            # FPU compare-to-EFLAGS: sets CF, ZF, PF directly
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic == "sahf":
-            # sahf loads AH into flags - typically after fnstsw ax
-            # in the fcomp/fnstsw/sahf pattern for FPU comparisons
-            last_flag_setter = "sahf"
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
-            pass  # FPU and already-handled CMOVcc
-        elif curr.mnemonic.startswith("j"):
-            pass  # Jumps don't set flags
-        elif curr.mnemonic.startswith("set"):
-            pass  # SETcc doesn't set flags
-        elif curr.mnemonic.startswith("rep"):
-            # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
-            rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
-            raw_m = curr.mnemonic
-            _cmp_forms = ("cmpsb", "cmpsw", "cmpsd",
-                          "scasb", "scasw", "scasd")
-            if any(f in raw_m for f in _cmp_forms):
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            elif any(f in rest for f in _cmp_forms):
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            else:
-                pass  # rep movs/stos = data movement, flags preserved
-        else:
-            # Unknown instruction - conservatively clear flag state
-            last_flag_setter = None
-            last_flag_ops = []
+        state = advance_flag_state(
+            curr, (last_flag_setter, last_flag_ops) if last_flag_setter else None)
+        last_flag_setter, last_flag_ops = state if state else (None, [])
 
         i += 1
 

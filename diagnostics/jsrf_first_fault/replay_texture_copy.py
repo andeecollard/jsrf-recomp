@@ -7,6 +7,7 @@ The default compares the replay against the live completed-draw framebuffer.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -87,8 +88,25 @@ with tempfile.TemporaryDirectory(prefix="jsrf-copy-replay-") as tmp:
         command.append(str(depth_output))
     subprocess.run(command, check=True)
 actual = output.read_bytes()
-assert actual == expected, f"replay differs in {sum(a != b for a, b in zip(actual, expected))} bytes"
+metal_rounding = False
+if actual != expected and os.environ.get("RECOMP_METAL_REPLAY"):
+    assert len(actual) == len(expected) and len(actual) % 2 == 0
+    differing = []
+    for offset in range(0, len(actual), 2):
+        got = struct.unpack_from("<H", actual, offset)[0]
+        want = struct.unpack_from("<H", expected, offset)[0]
+        if got != want:
+            g = (got >> 11, (got >> 5) & 63, got & 31)
+            w = (want >> 11, (want >> 5) & 63, want & 31)
+            assert all(abs(a - b) <= 1 for a, b in zip(g, w)), \
+                f"Metal RGB565 error exceeds one quantisation step at byte {offset}"
+            differing.append(offset)
+    assert len(differing) <= 8, f"Metal replay differs in {len(differing)} pixels"
+    metal_rounding = True
+else:
+    assert actual == expected, f"replay differs in {sum(a != b for a, b in zip(actual, expected))} bytes"
 if depth:
     assert depth_output.read_bytes() == args.capture.with_suffix(".depth-after").read_bytes(), "depth replay differs"
-print(f"{args.capture.name}: {'pattern expectation' if args.pattern else 'live framebuffer'} matches "
-      f"all {len(actual)} bytes; sha256={hashlib.sha256(actual).hexdigest()}")
+detail = "within one RGB565 step" if metal_rounding else f"all {len(actual)} bytes"
+print(f"{args.capture.name}: {'pattern expectation' if args.pattern else 'live framebuffer'} matches {detail}; "
+      f"sha256={hashlib.sha256(actual).hexdigest()}")

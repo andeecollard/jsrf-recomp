@@ -1,0 +1,12 @@
+name: jsrf-upstream-clean
+worktree: "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean"
+pi_command: "pi"
+model: "local/qwen3.8-27b"
+
+policy:
+  default_search_budget: 2
+  default_read_budget_lines: 400
+  default_tool_budget: 12
+  default_token_budget: 30000
+  context_stop_percent: 35
+  forbid_destructive_git: true

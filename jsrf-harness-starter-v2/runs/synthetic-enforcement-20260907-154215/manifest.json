@@ -1,0 +1,15 @@
+{
+  "forbidden_commands": [
+    "git reset",
+    "git checkout",
+    "git clean",
+    "git restore --source",
+    "rm -rf .git",
+    "git rebase",
+    "git merge"
+  ],
+  "harness_root": "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/jsrf-harness-starter-v2",
+  "model": "local/qwen3.8-27b",
+  "project_root": "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean",
+  "run_id": "synthetic-enforcement-20260907-154215"
+}

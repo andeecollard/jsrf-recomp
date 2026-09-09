@@ -1,0 +1,17 @@
+{
+  "id": "metal-m1b-select",
+  "type": "CLASSIFY",
+  "allowed_files": ["QWEN_METAL_M1A_CAPTURE.md"],
+  "allowed_write_files": ["QWEN_METAL_M1B_CANDIDATE.md"],
+  "budgets": {
+    "search_budget": 0,
+    "files_read_budget": 1,
+    "read_budget_lines": 300,
+    "write_budget": 1,
+    "build_budget": 0,
+    "runtime_budget": 0,
+    "tool_budget": 4
+  },
+  "required_artifacts": ["QWEN_METAL_M1B_CANDIDATE.md"],
+  "prompt": "Read only QWEN_METAL_M1A_CAPTURE.md. Choose the simplest successful draw candidate for the first Metal proof, or return BLOCKED if the capture is insufficient. Write QWEN_METAL_M1B_CANDIDATE.md and stop."
+}

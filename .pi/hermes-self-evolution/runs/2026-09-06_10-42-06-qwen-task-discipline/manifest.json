@@ -1,0 +1,71 @@
+{
+  "targetPath": "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/.pi/prompts/qwen-task-discipline.md",
+  "objective": "Improve this prompt so Qwen stays tightly focused on the current task during long software-debugging sessions.Preserve its concise structure and all repository-safety constraints.Reduce:- investigating later tasks before the current task is resolved- speculative debugging- repeating already-proven checks- unnecessary architecture exploration- editing unrelated files- long planning instead of executing- claiming success without runtime evidence- continuing after a concrete failure should have been reportedIncrease:- strict task-number order- shortest direct verification- evidence from actual commands and runtime- immediately continuing when a task passes- stopping at and clearly recording the first concrete failure- concise evidence-based reportingPrefer behavioural clarity over adding more instructions. Do not make the prompt substantially longer unless evaluation shows that additional wording is necessary.",
+  "evalSource": "mixed",
+  "modelLabel": "lmstudio/local/qwen3.8-27b",
+  "maxBytes": 983,
+  "baselineHoldout": {
+    "correctness": 0.7166666666666667,
+    "procedureFollowing": 0.9333333333333332,
+    "conciseness": 0.9166666666666666,
+    "confidence": 0.9166666666666666,
+    "lengthPenalty": 0,
+    "composite": 0.8216666666666667
+  },
+  "bestCandidate": {
+    "name": "evidence-gated",
+    "rationale": "This candidate focuses on the output requirement. By defining the 'gate' as concrete runtime evidence, it discourages long planning or architectural exploration that doesn't produce immediate proof of the current task's state.",
+    "score": {
+      "correctness": 0.9499999999999998,
+      "procedureFollowing": 0.9833333333333334,
+      "conciseness": 0.9833333333333334,
+      "confidence": 0.9499999999999998,
+      "lengthPenalty": 0,
+      "composite": 0.9666666666666667
+    },
+    "warnings": [],
+    "path": "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/.pi/hermes-self-evolution/runs/2026-09-06_10-42-06-qwen-task-discipline/best-candidate.md"
+  },
+  "candidates": [
+    {
+      "name": "evidence-gated",
+      "rationale": "This candidate focuses on the output requirement. By defining the 'gate' as concrete runtime evidence, it discourages long planning or architectural exploration that doesn't produce immediate proof of the current task's state.",
+      "warnings": [],
+      "score": {
+        "correctness": 0.9499999999999998,
+        "procedureFollowing": 0.9833333333333334,
+        "conciseness": 0.9833333333333334,
+        "confidence": 0.9499999999999998,
+        "lengthPenalty": 0,
+        "composite": 0.9666666666666667
+      }
+    },
+    {
+      "name": "minimal-loop",
+      "rationale": "This candidate reduces instruction count to maximize signal-to-noise ratio. It groups constraints into a single 'Execution Loop' block to prevent the model from losing focus on the current step, and explicitly bans 'planning' in favor of immediate action.",
+      "warnings": [],
+      "score": {
+        "correctness": 0.9500000000000001,
+        "procedureFollowing": 0.9333333333333332,
+        "conciseness": 0.9499999999999998,
+        "confidence": 0.9499999999999998,
+        "lengthPenalty": 0,
+        "composite": 0.945
+      }
+    },
+    {
+      "name": "strict-sequence",
+      "rationale": "This candidate reinforces the linear execution model by explicitly defining the stop condition and the transition trigger. It emphasizes that 'failure' halts all downstream actions, directly addressing the issue of speculative debugging or attempting later tasks after a break in the chain.",
+      "warnings": [],
+      "score": {
+        "correctness": 0.6666666666666666,
+        "procedureFollowing": 0.6666666666666666,
+        "conciseness": 1,
+        "confidence": 0.9499999999999998,
+        "lengthPenalty": 0,
+        "composite": 0.7333333333333334
+      }
+    }
+  ],
+  "createdAt": "2026-09-06T10:48:13.232Z"
+}

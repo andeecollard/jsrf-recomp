@@ -1,0 +1,339 @@
+{
+  "baseline_branches": 66376,
+  "current_branches": 66376,
+  "baseline_unresolved_markers": 79,
+  "current_unresolved_markers": 70,
+  "resolved": [
+    {
+      "site": "sub_00015130:00015275:0",
+      "before": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000153BC;",
+      "after": "if (CMP_NE(_fa, _fb)) goto loc_000153BC; /* jne: not equal / not zero */"
+    },
+    {
+      "site": "sub_00056990:00056B4C:0",
+      "before": "if (_flags /* jb: below (unsigned <) - UNRESOLVED FLAGS, branch never taken */) goto loc_00057CA4;",
+      "after": "if (CMP_B(_fa, _fb)) goto loc_00057CA4; /* jb: below (unsigned <) */"
+    },
+    {
+      "site": "sub_00056990:00056B7D:0",
+      "before": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00057CA4;",
+      "after": "if (TEST_Z(_fa, _fb)) goto loc_00057CA4; /* je: equal / zero */"
+    },
+    {
+      "site": "sub_00056990:00056C8A:0",
+      "before": "if (_flags /* jb: below (unsigned <) - UNRESOLVED FLAGS, branch never taken */) goto loc_00057CA4;",
+      "after": "if (CMP_B(_fa, _fb)) goto loc_00057CA4; /* jb: below (unsigned <) */"
+    },
+    {
+      "site": "sub_000B40F0:000B4101:0",
+      "before": "if (_flags /* jae: above or equal (unsigned >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_000B413A;",
+      "after": "if (CMP_AE(_fa, _fb)) goto loc_000B413A; /* jae: above or equal (unsigned >=) */"
+    },
+    {
+      "site": "sub_000B4490:000B44C6:0",
+      "before": "if (_flags /* jae: above or equal (unsigned >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_000B44FF;",
+      "after": "if (CMP_AE(_fa, _fb)) goto loc_000B44FF; /* jae: above or equal (unsigned >=) */"
+    },
+    {
+      "site": "sub_000BA890:000BA8D3:0",
+      "before": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_000BA8C1;",
+      "after": "if (CMP_BE(_fa, _fb)) goto loc_000BA8C1; /* jbe: below or equal (unsigned <=) */"
+    },
+    {
+      "site": "sub_0014B536:0014B587:0",
+      "before": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_0014B690;",
+      "after": "if (CMP_EQ(_fa, _fb)) goto loc_0014B690; /* je: equal / zero */"
+    },
+    {
+      "site": "sub_001609E0:00160A5E:0",
+      "before": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00160A70;",
+      "after": "if (CMP_BE(_fa & _fb, 0)) goto loc_00160A70; /* jbe: below or equal (unsigned <=) */"
+    }
+  ],
+  "newly_unresolved": [],
+  "other_changes": [],
+  "baseline_only_sites": [],
+  "current_only_sites": [],
+  "remaining": [
+    {
+      "site": "sub_00014885:00014885:0",
+      "condition": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00014909;"
+    },
+    {
+      "site": "sub_00015130:000153A9:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000153BC;"
+    },
+    {
+      "site": "sub_00023280:00023280:0",
+      "condition": "if (_flags /* jle: less or equal (signed <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_0002328F;"
+    },
+    {
+      "site": "sub_000272F7:000272F7:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_000273C5(); return; }"
+    },
+    {
+      "site": "sub_000272F7:000273BD:0",
+      "condition": "if (_flags /* jb: below (unsigned <) - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_000273C1(); return; }"
+    },
+    {
+      "site": "sub_00027C3E:00027C52:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) goto loc_00027C59;"
+    },
+    {
+      "site": "sub_00027C3E:00027C59:0",
+      "condition": "if (_flags /* jl: less (signed <) - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00027C5D - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00027C3E:00027C5B:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00027C65 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00027C3E:00027C63:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00027C6D - dead code, label not in function */"
+    },
+    {
+      "site": "sub_0003401E:0003404A:0",
+      "condition": "if (_flags /* loop: loop - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_000340A1 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00035006:00035006:0",
+      "condition": "if (_flags /* ja: above (unsigned >) - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00035071 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00035D1F:00035D1F:0",
+      "condition": "if (_flags /* ja: above (unsigned >) - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00035D8C - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:00038000:0",
+      "condition": "if (_flags /* jp: parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00038006 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:00038003:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) goto loc_0003800E;"
+    },
+    {
+      "site": "sub_00038000:0003800E:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00038016 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:0003802E:0",
+      "condition": "if (_flags /* jle: less or equal (signed <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_0003803E;"
+    },
+    {
+      "site": "sub_00038000:0003803E:0",
+      "condition": "if (_flags /* jg: greater (signed >) - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00038046 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:00038043:0",
+      "condition": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_0003804A - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:00038047:0",
+      "condition": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) goto loc_0003804E;"
+    },
+    {
+      "site": "sub_00038000:0003804E:0",
+      "condition": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_0003805A - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:00038057:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_0003806E - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:0003806B:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_00038076 - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00038000:00038073:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) (void)0; /* goto loc_0003807E - dead code, label not in function */"
+    },
+    {
+      "site": "sub_00040AAC:00040AAC:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00040AC5;"
+    },
+    {
+      "site": "sub_00041E24:00041E24:0",
+      "condition": "if (_flags /* jge: greater or equal (signed >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00041E38;"
+    },
+    {
+      "site": "sub_00041E48:00041E48:0",
+      "condition": "if (_flags /* jge: greater or equal (signed >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00041E5C;"
+    },
+    {
+      "site": "sub_00041E4C:00041E4C:0",
+      "condition": "if (_flags /* jge: greater or equal (signed >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00041E5C;"
+    },
+    {
+      "site": "sub_00041E50:00041E50:0",
+      "condition": "if (_flags /* jge: greater or equal (signed >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00041E5C;"
+    },
+    {
+      "site": "sub_00041E54:00041E54:0",
+      "condition": "if (_flags /* jge: greater or equal (signed >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_00041E5C;"
+    },
+    {
+      "site": "sub_0005089B:0005089B:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00050A20(); return; }"
+    },
+    {
+      "site": "sub_000508DF:000508DF:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00050A0C;"
+    },
+    {
+      "site": "sub_00051402:00051402:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00051417;"
+    },
+    {
+      "site": "sub_00052402:00052402:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_0005240D(); return; }"
+    },
+    {
+      "site": "sub_000749DC:000749DC:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000749EC;"
+    },
+    {
+      "site": "sub_000800E1:000800E1:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_0008010D;"
+    },
+    {
+      "site": "sub_000A0F10:000A13A1:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_000A13CF;"
+    },
+    {
+      "site": "sub_00100058:00100058:0",
+      "condition": "if (_flags /* jp: parity - UNRESOLVED FLAGS, branch never taken */) goto loc_00100080;"
+    },
+    {
+      "site": "sub_001000C9:001000C9:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_001000E7;"
+    },
+    {
+      "site": "sub_001028CF:001028EC:0",
+      "condition": "if (_flags /* jae: above or equal (unsigned >=) - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00102936(); return; }"
+    },
+    {
+      "site": "sub_001237A0:00123B15:0",
+      "condition": "if (_flags /* jg: greater (signed >) - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00123B6A(); return; }"
+    },
+    {
+      "site": "sub_001237A0:00123B32:0",
+      "condition": "if (_flags /* jg: greater (signed >) - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00123B6E(); return; }"
+    },
+    {
+      "site": "sub_00130FD0:001310DB:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00131193;"
+    },
+    {
+      "site": "sub_00130FD0:0013120B:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_001312C5;"
+    },
+    {
+      "site": "sub_00130FD0:00131341:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_001313FB;"
+    },
+    {
+      "site": "sub_00130FD0:00131477:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00131531;"
+    },
+    {
+      "site": "sub_00130FD0:001315F6:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_001316AE;"
+    },
+    {
+      "site": "sub_00134CEE:00134D16:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00134D86(); return; }"
+    },
+    {
+      "site": "sub_00134CEE:00134D3A:0",
+      "condition": "if (_flags /* loopne: loopne - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00134D92(); return; }"
+    },
+    {
+      "site": "sub_00134CF3:00134D16:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00134D86(); return; }"
+    },
+    {
+      "site": "sub_00134CF3:00134D3A:0",
+      "condition": "if (_flags /* loopne: loopne - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00134D92(); return; }"
+    },
+    {
+      "site": "sub_00134CFD:00134D16:0",
+      "condition": "if (_flags /* jnp: not parity - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00134D86(); return; }"
+    },
+    {
+      "site": "sub_00134CFD:00134D3A:0",
+      "condition": "if (_flags /* loopne: loopne - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_00134D92(); return; }"
+    },
+    {
+      "site": "sub_00150130:00150329:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150360;"
+    },
+    {
+      "site": "sub_00150170:00150329:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150360;"
+    },
+    {
+      "site": "sub_001501F0:00150329:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150360;"
+    },
+    {
+      "site": "sub_00150240:00150329:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150360;"
+    },
+    {
+      "site": "sub_00150280:00150329:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150360;"
+    },
+    {
+      "site": "sub_001502C0:00150329:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150360;"
+    },
+    {
+      "site": "sub_00150C00:00150C5F:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150D02;"
+    },
+    {
+      "site": "sub_00150C00:00150D7D:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150DF6;"
+    },
+    {
+      "site": "sub_00150C70:00150C8D:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150D02;"
+    },
+    {
+      "site": "sub_00150C70:00150D7D:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150DF6;"
+    },
+    {
+      "site": "sub_00150CA0:00150D7D:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_00150DF6;"
+    },
+    {
+      "site": "sub_001533D0:0015350B:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_0015358E;"
+    },
+    {
+      "site": "sub_00180038:00180038:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_001800A2;"
+    },
+    {
+      "site": "sub_00180038:00180107:0",
+      "condition": "if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, branch never taken */) goto loc_0018011B;"
+    },
+    {
+      "site": "sub_001BD800:001BD800:0",
+      "condition": "if (_flags /* je: equal / zero - UNRESOLVED FLAGS, branch never taken */) goto loc_001BD818;"
+    },
+    {
+      "site": "sub_001C3800:001C3800:0",
+      "condition": "if (_flags /* jae: above or equal (unsigned >=) - UNRESOLVED FLAGS, branch never taken */) goto loc_001C380E;"
+    },
+    {
+      "site": "sub_001C3F18:001C3F18:0",
+      "condition": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_001C3F86(); return; }"
+    },
+    {
+      "site": "sub_001C3F18:001C3F1D:0",
+      "condition": "if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, branch never taken */) { g_seh_ebp = ebp; sub_001C3F96(); return; }"
+    }
+  ]
+}

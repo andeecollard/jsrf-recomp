@@ -1,0 +1,97 @@
+id: metal-m1a-capture
+type: MEASURE
+objective: "Add one bounded diagnostic and capture up to 10 successful software-rendered draw batches."
+
+allowed_files:
+  - src/kernel/nv2a_pb_exec.c
+
+allowed_write_files:
+  - src/kernel/nv2a_pb_exec.c
+  - QWEN_METAL_M1A_CAPTURE.md
+
+required_artifacts:
+  - QWEN_METAL_M1A_CAPTURE.md
+
+budgets:
+  search_budget: 2
+  read_budget_lines: 400
+  tool_budget: 12
+  token_budget: 30000
+
+build:
+  cwd: build-macos/jsrf-first-fault/build
+  command: "cmake --build ."
+
+runtime:
+  cwd: build-macos/jsrf-first-fault/build
+  command: "./xboxrecomp"
+  timeout_seconds: 30
+
+success_checks:
+  - artifact_exists: QWEN_METAL_M1A_CAPTURE.md
+  - artifact_contains: "RESULT"
+  - artifact_contains: "EVIDENCE"
+  - artifact_contains: "NEXT SINGLE STEP"
+
+forbidden_patterns:
+  - "git reset"
+  - "git clean"
+  - "git checkout --"
+  - "render-investigation/"
+  - "Video Notes"
+  - "JSRF-Decompilation"
+
+worker_instructions: |
+  Do not continue the previous Metal investigation.
+  Do not select a Metal candidate.
+  Do not inspect old logs or old render-investigation directories.
+  Do not inspect video/decomp or presentation/windowing.
+  Do not search for alternative build systems.
+
+  The only source file you may inspect initially is:
+  src/kernel/nv2a_pb_exec.c
+
+  Locate draw_primitive() / raster_indices() with at most two targeted searches.
+  Read no more than approximately 120 lines around the successful software-rasterisation point before editing.
+
+  Add one compact diagnostic that prints at most the FIRST 10 successfully rasterised draw batches, then permanently stops printing.
+
+  Print only fields already available cheaply at that point:
+  - sequential batch number
+  - primitive type
+  - vertex count
+  - index count
+  - VSH mode
+  - texture enabled/stage count
+  - depth test/write
+  - cull mode
+  - blend enabled
+  - fog enabled
+  - stencil enabled
+  - triangles actually rasterised
+
+  Do not add substantial new state tracking for unavailable fields.
+  Do not dump vertices, matrices, shaders, textures, pushbuffer contents, or full structures.
+
+  Build using the prescribed build command only.
+  Run the prescribed executable only long enough to obtain the diagnostic lines.
+  Do not diagnose unrelated runtime problems.
+
+  Create QWEN_METAL_M1A_CAPTURE.md containing:
+  - exact diagnostic source location
+  - fields printed
+  - captured lines if obtained
+  - build command
+  - run command
+  - whether the diagnostic remains installed
+
+  Finish the artifact with:
+  RESULT
+  EVIDENCE
+  FILES CHANGED
+  TESTS
+  REMAINING UNCERTAINTY
+  NEXT SINGLE STEP
+
+  NEXT SINGLE STEP must be:
+  Analyse the captured successful batches and select the simplest first Metal candidate.

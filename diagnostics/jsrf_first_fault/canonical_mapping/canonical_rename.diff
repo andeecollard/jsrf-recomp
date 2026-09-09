@@ -1,0 +1,1214 @@
+commit 836b5eaa41148263a5803a1559cd9b7ea12ba7cc
+Author: KeybadeBlox <fluorescencia@protonmail.com>
+Date:   Tue Mar 31 20:20:14 2026 -0400
+
+    Incorporate known names from Smilebit code
+    
+    The Yakuza 1 and 2 rereleases on the Wii U export function symbols,
+    preserving their names, and some debug data was also available in a PS2
+    release, providing some struct definitions.  These have been used to
+    rename analogous classes, functions, and member variables to the same
+    names used by Smilebit, plus a more general imitation of their naming
+    and typing conventions (i.e. Win32 style).
+
+diff --git a/ghidra/symboltable.tsv b/ghidra/symboltable.tsv
+index 055c3c2..fc9033e 100644
+--- a/ghidra/symboltable.tsv
++++ b/ghidra/symboltable.tsv
+@@ -1,123 +1,123 @@
+-0x00011000	func	void	__thiscall	notinline	nofixup	GameObj::~GameObj
+-0x00011070	func	void	__thiscall	notinline	nofixup	GameObj::recursiveExecDefault
+-0x000110a0	func	void	__thiscall	notinline	nofixup	GameObj::drawListDefault	GameObjFlags	flagFilterAny1	int	drawArg1	int	drawArg2	GameObjFlags	flagFilterAll	uint	otherBitfieldFilterAny	GameObjFlags	flagFilterNone	GameObjFlags	flagFilterAny2
+-0x00011220	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeDefault1
+-0x00011260	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeDefault2
+-0x000112a0	func	void	__thiscall	notinline	nofixup	GameObj::recursiveExecEvent
+-0x000112d0	func	void	__thiscall	notinline	nofixup	GameObj::drawListEvent	GameObjFlags	param_1	int	param_2	int	param_3	GameObjFlags	param_4	uint	param_5	GameObjFlags	param_6	GameObjFlags	param_7
+-0x00011450	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeEvent1
+-0x00011490	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeEvent2
+-0x000114d0	func	void	__thiscall	notinline	nofixup	GameObj::recursiveExecCoveredPause
+-0x00011500	func	void	__thiscall	notinline	nofixup	GameObj::drawListCoveredPause	GameObjFlags	flagFilterAny1	int	drawArg1	int	drawArg2	GameObjFlags	flagFilterAll	uint	otherBitfieldFilterAny	GameObjFlags	flagFilterNone	GameObjFlags	flagFilterAny2
+-0x00011680	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeCoveredPause1
+-0x000116c0	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeCoveredPause2
+-0x00011700	func	void	__thiscall	notinline	nofixup	GameObj::recursiveExecFreezeCam
+-0x00011730	func	void	__thiscall	notinline	nofixup	GameObj::drawListFreezeCam	GameObjFlags	param_1	int	param_2	int	param_3	GameObjFlags	param_4	uint	param_5	GameObjFlags	param_6	GameObjFlags	param_7
+-0x000118b0	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeFreezeCam1
+-0x000118f0	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeFreezeCam2
+-0x00011930	func	void	__thiscall	notinline	nofixup	GameObj::recursiveExecUncoveredPause
+-0x00011960	func	void	__thiscall	notinline	nofixup	GameObj::drawListUncoveredPause	GameObjFlags	param_1	int	param_2	int	param_3	GameObjFlags	param_4	uint	param_5	GameObjFlags	param_6	GameObjFlags	param_7
+-0x00011ae0	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeUncoveredPause1
+-0x00011b20	func	void	__thiscall	notinline	nofixup	GameObj::drawTreeUncoveredPause2
+-0x00011b60	func	void	__thiscall	notinline	nofixup	GameObj::addToSiblings	GameObj *	sibling	GameObj *	parent
+-0x00011b90	func	void	__thiscall	notinline	nofixup	GameObj::destructChildren	GameObj *	firstChild
+-0x00011bd0	func	GameObj *	__thiscall	notinline	nofixup	GameObj::getParent
+-0x00011be0	func	void	__thiscall	notinline	nofixup	GameObj::removeFromObjList	GameObj *	obj
+-0x00011c20	func	void	__thiscall	notinline	nofixup	GameObj::removeChildrenFromObjList	GameObj *	firstChild
+-0x00011c80	func	void	__thiscall	notinline	nofixup	GameObj::nopMethod1Arg	uint	param_1
+-0x00011c90	func	void	__thiscall	notinline	nofixup	GameObj::nopMethod0Arg
+-0x00011ca0	func	void	__thiscall	notinline	nofixup	DrawTree::copySomeVectors
+-0x00011ce0	func	void *	__thiscall	notinline	nofixup	GameObj::`scalar_deleting_destructor'	uint	param_1
+-0x00011d00	func	void	__thiscall	notinline	nofixup	GameObj::recursivePostExecDefault
+-0x00011da0	func	void	__thiscall	notinline	nofixup	GameObj::recursivePostExecEvent
+-0x00011e40	func	void	__thiscall	notinline	nofixup	GameObj::recursivePostExecCoveredPause
+-0x00011ee0	func	void	__thiscall	notinline	nofixup	GameObj::recursivePostExecFreezeCam
+-0x00011f80	func	void	__thiscall	notinline	nofixup	GameObj::recursivePostExecUncoveredPause
+-0x00012020	func	void	__thiscall	notinline	nofixup	GameObj::setParent	GameObj *	parent
+-0x00012100	func	GameObj *	__thiscall	notinline	nofixup	GameObj::GameObj	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
+-0x00012170	func	DrawTree *	__thiscall	notinline	nofixup	DrawTree::DrawTree	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
+-0x000121b0	func	void *	__thiscall	notinline	nofixup	DrawTree::`scalar_deleting_destructor'	uint	param_1
+-0x000121d0	func	void	__thiscall	notinline	nofixup	DrawTree::~DrawTree
+-0x000121e0	func	PlayerObj *	__thiscall	notinline	nofixup	PlayerObj::PlayerObj	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
+-0x00012210	func	Game *	__thiscall	notinline	nofixup	Game::Game	uint *	param_1	uint	param_2
+-0x00012390	func	void	__thiscall	notinline	nofixup	Game::~Game
+-0x000123e0	func	void	__thiscall	notinline	nofixup	Game::exec
+-0x00012580	func	void	__thiscall	notinline	nofixup	Game::drawObj	GameObj *	obj	uint	param_2
+-0x000125e0	func	void	__thiscall	notinline	nofixup	Game::drawList_	GameObjFlags	flagFilterAny1	int	drawArg1	int	drawArg2	GameObjFlags	flagFilterAll	uint	otherBitfieldFilterAny	GameObjFlags	flagFilterNone	GameObjFlags	flagFilterAny2
+-0x00012680	func	void	__thiscall	notinline	nofixup	Game::drawTree1	GameObj *	obj
+-0x000126d0	func	void	__thiscall	notinline	nofixup	Game::setCoveredPauseNextFrame	BOOL	val
+-0x000126f0	func	void	__thiscall	notinline	nofixup	Game::setEventNextFrame	BOOL	val
+-0x00012710	func	void	__thiscall	notinline	nofixup	Game::setFreezeCamNextFrame	BOOL	val
+-0x00012730	func	void	__thiscall	notinline	nofixup	Game::setUncoveredPauseNextFrame	BOOL	val
+-0x00012750	func	void	__thiscall	notinline	nofixup	Game::enableDrawChildren
+-0x00012760	func	void	__thiscall	notinline	nofixup	Game::enableSkipDraw
+-0x00012770	func	void	__thiscall	notinline	nofixup	Game::fatal
+-0x000127b0	func	void	__thiscall	notinline	nofixup	Game::setDrawMode	DrawMode	mode
+-0x000127c0	func	void	__thiscall	notinline	nofixup	Game::setGlobal	GlobalIndex	index	uint	val
+-0x000127e0	func	uint	__thiscall	notinline	nofixup	Game::getGlobal	GlobalIndex	index
+-0x000127f0	func	void	__thiscall	notinline	nofixup	Game::addToDrawList	GameObj *	obj
+-0x00012840	func	void	__thiscall	notinline	nofixup	Game::removeFromDrawList	GameObj *	obj
+-0x00012870	func	void	__thiscall	notinline	nofixup	Game::setObj	GameObjIndex	index	GameObj *	obj
+-0x00012890	func	void	__thiscall	notinline	nofixup	Game::unsetObj	GameObjIndex	index
+-0x000128c0	func	GameObj *	__thiscall	notinline	nofixup	Game::getObj	GameObjIndex	index
+-0x000128e0	func	int	__thiscall	notinline	nofixup	Game::allocObjIndex	GameObjIndex	min	GameObjIndex	max
+-0x00012910	func	BOOL	__thiscall	notinline	nofixup	Game::objIndexAvail	GameObjIndex	index
+-0x00012930	func	void	__thiscall	notinline	nofixup	Game::swapObjs	GameObjIndex	index1	GameObjIndex	index2
+-0x00012980	func	void	__thiscall	notinline	nofixup	Game::clearScreen
+-0x000129b0	func	void	__thiscall	notinline	nofixup	Game::enableSomeExtraDrawListCode
+-0x000129c0	func	void	__thiscall	notinline	nofixup	Game::setLogosStarted	BOOL	val
+-0x000129d0	func	void	__thiscall	notinline	nofixup	Game::clearDrawPriorityList
+-0x000129f0	func	GameObj *	__thiscall	notinline	nofixup	Game::getDrawPriorityListHead
+-0x00012a00	func	void	__thiscall	notinline	nofixup	Game::appendToDrawPriorityList	GameObj *	obj
+-0x00012a20	func	void	__thiscall	notinline	nofixup	Game::sortDrawPriorityListSingleLevel	uchar	sortKeyBitOffset
+-0x00012ac0	func	void	__thiscall	notinline	nofixup	Game::setFallbackBgColour	D3DCOLOR	colour	BOOL	useFallback
+-0x00012ae0	func	void	__thiscall	notinline	nofixup	RootExecObj::RootExecObj	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
+-0x00012be0	func	void	__thiscall	notinline	nofixup	RootExecObj::~RootExecObj
+-0x00012bf0	func	void *	__thiscall	notinline	nofixup	Game::`scalar_deleting_destructor'	uint	param_1
+-0x00012c10	func	void	__thiscall	notinline	nofixup	Game::initRootExecObj
+-0x00012c80	func	void	__thiscall	notinline	nofixup	Game::drawList	GameObjFlags	flagFilterAll	BOOL	param_2
+-0x000131a0	func	void	__thiscall	notinline	nofixup	Game::sortDrawPriorityList
+-0x000131d0	func	void *	__thiscall	notinline	nofixup	RootExecObj::`scalar_deleting_destructor'	uint	param_1
+-0x000131f0	func	void	__thiscall	notinline	nofixup	Game::drawObjs
+-0x00013930	func	void	__thiscall	notinline	nofixup	Game::draw
+-0x00013a80	func	void	__thiscall	notinline	nofixup	Game::frame
+-0x00013f80	func	int	__thiscall	notinline	nofixup	Game::mainLoop
+-0x00013fc0	func	void	__cdecl	notinline	nofixup	removeFromObjListByIndex	GameObjIndex	index
+-0x000149d0	func	uint	__thiscall	notinline	nofixup	GameData::getChapter
+-0x000149e0	func	undefined4	__thiscall	notinline	nofixup	GameData::getMissionDigits34
++0x00011000	func	void	__thiscall	notinline	nofixup	CActBase::~CActBase
++0x00011070	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec0Default
++0x000110a0	func	void	__thiscall	notinline	nofixup	CActBase::drawManyDefault	eACTFLAG	flagFilterAny1	int	drawArg1	int	drawArg2	eACTFLAG	flagFilterAll	uint	otherBitfieldFilterAny	eACTFLAG	flagFilterNone	eACTFLAG	flagFilterAny2
++0x00011220	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeDefault1
++0x00011260	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeDefault2
++0x000112a0	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec0Event
++0x000112d0	func	void	__thiscall	notinline	nofixup	CActBase::drawManyEvent	eACTFLAG	param_1	int	param_2	int	param_3	eACTFLAG	param_4	uint	param_5	eACTFLAG	param_6	eACTFLAG	param_7
++0x00011450	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeEvent1
++0x00011490	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeEvent2
++0x000114d0	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec0CoveredPause
++0x00011500	func	void	__thiscall	notinline	nofixup	CActBase::drawManyCoveredPause	eACTFLAG	flagFilterAny1	int	drawArg1	int	drawArg2	eACTFLAG	flagFilterAll	uint	otherBitfieldFilterAny	eACTFLAG	flagFilterNone	eACTFLAG	flagFilterAny2
++0x00011680	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeCoveredPause1
++0x000116c0	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeCoveredPause2
++0x00011700	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec0FreezeCam
++0x00011730	func	void	__thiscall	notinline	nofixup	CActBase::drawManyFreezeCam	eACTFLAG	param_1	int	param_2	int	param_3	eACTFLAG	param_4	uint	param_5	eACTFLAG	param_6	eACTFLAG	param_7
++0x000118b0	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeFreezeCam1
++0x000118f0	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeFreezeCam2
++0x00011930	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec0UncoveredPause
++0x00011960	func	void	__thiscall	notinline	nofixup	CActBase::drawManyUncoveredPause	eACTFLAG	param_1	int	param_2	int	param_3	eACTFLAG	param_4	uint	param_5	eACTFLAG	param_6	eACTFLAG	param_7
++0x00011ae0	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeUncoveredPause1
++0x00011b20	func	void	__thiscall	notinline	nofixup	CActBase::drawTreeUncoveredPause2
++0x00011b60	func	void	__thiscall	notinline	nofixup	CActBase::insertActionTreeSub	CActBase *	sibling	CActBase *	parent
++0x00011b90	func	void	__thiscall	notinline	nofixup	CActBase::deleteActionChild	CActBase *	lpChild
++0x00011bd0	func	CActBase *	__thiscall	notinline	nofixup	CActBase::getParentAction
++0x00011be0	func	void	__thiscall	notinline	nofixup	CActBase::SetDelete	CActBase *	lpAct
++0x00011c20	func	void	__thiscall	notinline	nofixup	CActBase::SetDeleteChild	CActBase *	lpChild
++0x00011c80	func	void	__thiscall	notinline	nofixup	CActBase::nopMethod1Arg	uint	param_1
++0x00011c90	func	void	__thiscall	notinline	nofixup	CActBase::nopMethod0Arg
++0x00011ca0	func	void	__thiscall	notinline	nofixup	CDrawBase::copySomeVectors
++0x00011ce0	func	void *	__thiscall	notinline	nofixup	CActBase::`scalar_deleting_destructor'	uint	param_1
++0x00011d00	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec1Default
++0x00011da0	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec1Event
++0x00011e40	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec1CoveredPause
++0x00011ee0	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec1FreezeCam
++0x00011f80	func	void	__thiscall	notinline	nofixup	CActBase::recursiveExec1UncoveredPause
++0x00012020	func	void	__thiscall	notinline	nofixup	CActBase::insertActionTree	CActBase *	lpParent
++0x00012100	func	CActBase *	__thiscall	notinline	nofixup	CActBase::CActBase	CActBase *	parent	eACTID	index	eACTFLAG	flags
++0x00012170	func	CDrawBase *	__thiscall	notinline	nofixup	CDrawBase::CDrawBase	CActBase *	parent	eACTID	index	eACTFLAG	flags
++0x000121b0	func	void *	__thiscall	notinline	nofixup	CDrawBase::`scalar_deleting_destructor'	uint	param_1
++0x000121d0	func	void	__thiscall	notinline	nofixup	CDrawBase::~CDrawBase
++0x000121e0	func	CPlayer *	__thiscall	notinline	nofixup	CPlayer::CPlayer	CActBase *	parent	eACTID	index	eACTFLAG	flags
++0x00012210	func	CActMan *	__thiscall	notinline	nofixup	CActMan::CActMan	uint *	param_1	uint	param_2
++0x00012390	func	void	__thiscall	notinline	nofixup	CActMan::~CActMan
++0x000123e0	func	void	__thiscall	notinline	nofixup	CActMan::ActionExec
++0x00012580	func	void	__thiscall	notinline	nofixup	CActMan::drawOne	CActBase *	obj	uint	param_2
++0x000125e0	func	void	__thiscall	notinline	nofixup	CActMan::drawListSub	eACTFLAG	flagFilterAny1	int	drawArg1	int	drawArg2	eACTFLAG	flagFilterAll	uint	otherBitfieldFilterAny	eACTFLAG	flagFilterNone	eACTFLAG	flagFilterAny2
++0x00012680	func	void	__thiscall	notinline	nofixup	CActMan::drawTree1	CActBase *	lpAct
++0x000126d0	func	void	__thiscall	notinline	nofixup	CActMan::setCoveredPauseNextFrame	BOOL	bVal
++0x000126f0	func	void	__thiscall	notinline	nofixup	CActMan::setEventNextFrame	BOOL	val
++0x00012710	func	void	__thiscall	notinline	nofixup	CActMan::setFreezeCamNextFrame	BOOL	val
++0x00012730	func	void	__thiscall	notinline	nofixup	CActMan::setUncoveredPauseNextFrame	BOOL	val
++0x00012750	func	void	__thiscall	notinline	nofixup	CActMan::DrawChildren
++0x00012760	func	void	__thiscall	notinline	nofixup	CActMan::DrawSkip
++0x00012770	func	void	__thiscall	notinline	nofixup	CActMan::Fatal
++0x000127b0	func	void	__thiscall	notinline	nofixup	CActMan::SetDrawMode	eDRAWMODE	Mode
++0x000127c0	func	void	__thiscall	notinline	nofixup	CActMan::SetGlobal	eGLOBAL	Index	DWORD	dwVal
++0x000127e0	func	DWORD	__thiscall	notinline	nofixup	CActMan::GetGlobal	eGLOBAL	Index
++0x000127f0	func	void	__thiscall	notinline	nofixup	CActMan::InsertDrawList	CActBase *	lpAct
++0x00012840	func	void	__thiscall	notinline	nofixup	CActMan::DeleteDrawList	CActBase *	lpAct
++0x00012870	func	void	__thiscall	notinline	nofixup	CActMan::InsertActionExecList	eACTID	ActID	CActBase *	lpAct
++0x00012890	func	void	__thiscall	notinline	nofixup	CActMan::FreeActID	eACTID	id
++0x000128c0	func	CActBase *	__thiscall	notinline	nofixup	CActMan::GetAction	eACTID	id
++0x000128e0	func	int	__thiscall	notinline	nofixup	CActMan::GetFreeActionID	eACTID	Min	eACTID	Max
++0x00012910	func	BOOL	__thiscall	notinline	nofixup	CActMan::ActionIDAvail	eACTID	ActID
++0x00012930	func	void	__thiscall	notinline	nofixup	CActMan::SwapActID	eACTID	ActID1	eACTID	ActID2
++0x00012980	func	void	__thiscall	notinline	nofixup	CActMan::ClearScreen
++0x000129b0	func	void	__thiscall	notinline	nofixup	CActMan::EnableSomeExtraDrawListCode
++0x000129c0	func	void	__thiscall	notinline	nofixup	CActMan::SetLogosStarted	BOOL	bVal
++0x000129d0	func	void	__thiscall	notinline	nofixup	CActMan::initSortDrawList
++0x000129f0	func	CActBase *	__thiscall	notinline	nofixup	CActMan::getSortList
++0x00012a00	func	void	__thiscall	notinline	nofixup	CActMan::InsertDrawSortList	CActBase *	lpAct
++0x00012a20	func	void	__thiscall	notinline	nofixup	CActMan::SortListSub	uchar	ucSortKeyBitOffset
++0x00012ac0	func	void	__thiscall	notinline	nofixup	CActMan::SetFallbackBgColor	D3DCOLOR	Colour	BOOL	bUseFallback
++0x00012ae0	func	void	__thiscall	notinline	nofixup	CActRoot::CActRoot	CActBase *	parent	eACTID	index	eACTFLAG	flags
++0x00012be0	func	void	__thiscall	notinline	nofixup	CActRoot::~CActRoot
++0x00012bf0	func	void *	__thiscall	notinline	nofixup	CActMan::`scalar_deleting_destructor'	uint	param_1
++0x00012c10	func	void	__thiscall	notinline	nofixup	CActMan::Init
++0x00012c80	func	void	__thiscall	notinline	nofixup	CActMan::drawMany	eACTFLAG	flagFilterAll	BOOL	param_2
++0x000131a0	func	void	__thiscall	notinline	nofixup	CActMan::sortDrawList
++0x000131d0	func	void *	__thiscall	notinline	nofixup	CActRoot::`scalar_deleting_destructor'	uint	param_1
++0x000131f0	func	void	__thiscall	notinline	nofixup	CActMan::drawSub
++0x00013930	func	void	__thiscall	notinline	nofixup	CActMan::draw
++0x00013a80	func	void	__thiscall	notinline	nofixup	CActMan::IdleSub
++0x00013f80	func	int	__thiscall	notinline	nofixup	CActMan::Idle
++0x00013fc0	func	void	__cdecl	notinline	nofixup	SetActionDelete	eACTID	ActID
++0x000149d0	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetReturnChapterNo
++0x000149e0	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetReturnMissionNo
+ 0x00015110	func	undefined4 *	__thiscall	notinline	nofixup	UnknownStatic02::~UnknownStatic02	byte	param_1
+-0x00015130	func	void	__thiscall	notinline	nofixup	UnknownStatic02::calledDuringExecDefault
+-0x00016040	func	CollisionManager *	__thiscall	notinline	nofixup	CollisionManager::CollisionManager
+-0x00016160	func	void	__thiscall	notinline	nofixup	CollisionManager::~CollisionManager
+-0x000161b0	func	void	__thiscall	notinline	nofixup	CollisionManager::reset
+-0x00016200	func	void	__thiscall	notinline	nofixup	CollisionManager::registerStageCollisions	CollisionsEntry *	ent
+-0x00016220	func	void	__thiscall	notinline	nofixup	CollisionManager::registerStageGrindPath	GrindPathEntry *	ent
+-0x00016240	func	void	__thiscall	notinline	nofixup	CollisionManager::registerObjectCollisions	int	ent
+-0x00016260	func	void	__thiscall	notinline	nofixup	CollisionManager::addQuery	CollisionQuery *	query	undefined4	objectId
+-0x000162a0	func	void	__thiscall	notinline	nofixup	CollisionManager::addColliderSphereQuery	ColliderSphereQuery *	query
+-0x000162e0	func	void	__thiscall	notinline	nofixup	CollisionManager::addColliderCylinderQuery	ColliderCylinderQuery *	query
+-0x00016320	func	void	__thiscall	notinline	nofixup	CollisionManager::addColliderBoxQuery	ColliderBoxQuery *	query
++0x00015130	func	void	__thiscall	notinline	nofixup	UnknownStatic02::calledDuringExec0Default
++0x00016040	func	CSysColiManager *	__thiscall	notinline	nofixup	CSysColiManager::CollisionManager
++0x00016160	func	void	__thiscall	notinline	nofixup	CSysColiManager::~CSysColiManager
++0x000161b0	func	void	__thiscall	notinline	nofixup	CSysColiManager::reset
++0x00016200	func	void	__thiscall	notinline	nofixup	CSysColiManager::registerStageCollisions	CollisionsEntry *	ent
++0x00016220	func	void	__thiscall	notinline	nofixup	CSysColiManager::registerStageGrindPath	GrindPathEntry *	ent
++0x00016240	func	void	__thiscall	notinline	nofixup	CSysColiManager::registerObjectCollisions	int	ent
++0x00016260	func	void	__thiscall	notinline	nofixup	CSysColiManager::addQuery	CollisionQuery *	query	undefined4	objectId
++0x000162a0	func	void	__thiscall	notinline	nofixup	CSysColiManager::addColliderSphereQuery	ColliderSphereQuery *	query
++0x000162e0	func	void	__thiscall	notinline	nofixup	CSysColiManager::addColliderCylinderQuery	ColliderCylinderQuery *	query
++0x00016320	func	void	__thiscall	notinline	nofixup	CSysColiManager::addColliderBoxQuery	ColliderBoxQuery *	query
+ 0x00017d90	func	undefined	__stdcall	notinline	nofixup	makeAABB	AABB *	outBounds	D3DVECTOR *	inBounds	uint	cnt	undefined4	extent
+ 0x00019570	func	undefined	__stdcall	notinline	nofixup	setupSphereCollider	ColliderSphere *	out	ColliderSphere *	template
+ 0x000195f0	func	undefined	__stdcall	notinline	nofixup	setupCylinderCollider	ColliderCylinder *	out	ColliderCylinder *	template
+ 0x00019680	func	ColliderSphere *	__stdcall	notinline	nofixup	createColliderSphere	ColliderSphere *	template
+ 0x000196f0	func	ColliderCylinder *	__stdcall	notinline	nofixup	createColliderCylinder	ColliderCylinder *	template
+-0x00019760	func	void	__thiscall	notinline	nofixup	CollisionManager::freeCollider	void *	collider
+-0x0001d920	func	void	__thiscall	notinline	nofixup	CollisionManager::calledDuringExec
++0x00019760	func	void	__thiscall	notinline	nofixup	CSysColiManager::freeCollider	void *	collider
++0x0001d920	func	void	__thiscall	notinline	nofixup	CSysColiManager::calledDuringExec
+ 0x0001da20	func	void	__thiscall	notinline	nofixup	UnknownObj_0x1289::~UnknownObj_0x1289
+ 0x0001daa0	func	void	__thiscall	notinline	nofixup	UnknownObj_0x1289::draw
+-0x0001daf0	func	DrawTree *	__thiscall	notinline	nofixup	UnknownObj_0x1289::UnknownObj_0x1289	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x0001daf0	func	CDrawBase *	__thiscall	notinline	nofixup	UnknownObj_0x1289::UnknownObj_0x1289	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x0001dc00	func	void *	__thiscall	notinline	nofixup	UnknownObj_0x1289::`scalar_deleting_destructor'	byte	param_1
+ 0x0001dd60	func	void	__thiscall	notinline	nofixup	UnknownStatic04::calledDuringExec
+ 0x0001dde0	func	void	__thiscall	notinline	nofixup	UnknownStatic04::`scalar_deleting_destructor'	byte	param_1
+-0x0001df30	func	void	__thiscall	notinline	nofixup	UnknownStatic05::calledDuringExecDefault
++0x0001df30	func	void	__thiscall	notinline	nofixup	UnknownStatic05::calledDuringExec0Default
+ 0x0001e0b0	func	void	__thiscall	notinline	nofixup	UnknownStatic05::`scalar_deleting_destructor'	byte	param_1
+ 0x0001e140	func	void	__thiscall	notinline	nofixup	CopSpawnView::~CopSpawnView
+-0x0001e1a0	func	void	__thiscall	notinline	nofixup	DrawTree::freezeCamDraw	int	param_1
+-0x0001e280	func	DrawTree *	__thiscall	notinline	nofixup	CopSpawnView::CopSpawnView	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags	undefined4 *	mssnData
++0x0001e1a0	func	void	__thiscall	notinline	nofixup	CDrawBase::freezeCamDraw	int	param_1
++0x0001e280	func	CDrawBase *	__thiscall	notinline	nofixup	CopSpawnView::CopSpawnView	CActBase *	parent	eACTID	index	eACTFLAG	flags	undefined4 *	mssnData
+ 0x0001e3a0	func	void *	__thiscall	notinline	nofixup	CopSpawnView::`scalar_deleting_destructor'	byte	param_1
+ 0x0001e460	func	undefined4	default	notinline	nofixup	createCopSpawnView	Mission *	mssn	undefined4	mssnData
+-0x0001e540	func	EventChild2 *	__thiscall	notinline	nofixup	EventChild2::EventChild2	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	uint	eventId
++0x0001e540	func	EventChild2 *	__thiscall	notinline	nofixup	EventChild2::EventChild2	CActBase *	parent	eACTID	index	uint	bitfieldValue	uint	eventId
+ 0x0001e8c0	func	void	__thiscall	notinline	nofixup	EventChild2::endEvent_MAYBE
+ 0x00022990	func	void	__thiscall	notinline	nofixup	EventChild2::~EventChild2
+ 0x000232a0	func	void	__thiscall	notinline	nofixup	EventChild2::draw	undefined4	param_1
+@@ -125,9 +125,9 @@
+ 0x00023790	func	void	__thiscall	notinline	nofixup	EventChild2::exec
+ 0x000239d0	func	void	__thiscall	notinline	nofixup	EventChild1::~EventChild1
+ 0x00023f20	func	void	__thiscall	notinline	nofixup	EventChild1::draw	int	param_1
+-0x00024150	func	EventChild1 *	__thiscall	notinline	nofixup	EventChild1::EventChild1	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x00024150	func	EventChild1 *	__thiscall	notinline	nofixup	EventChild1::EventChild1	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x00024220	func	EventChild1 *	__thiscall	notinline	nofixup	EventChild1::`scalar_deleting_destructor'	byte	param_1
+-0x00024240	func	GameObj *	__thiscall	notinline	nofixup	Event::Event	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	int	eventId
++0x00024240	func	CActBase *	__thiscall	notinline	nofixup	Event::Event	CActBase *	parent	eACTID	index	uint	bitfieldValue	int	eventId
+ 0x00024330	func	void	__thiscall	notinline	nofixup	Event::~Event
+ 0x000243b0	func	void	__stdcall	notinline	nofixup	virtualFree	void *	ptr
+ 0x000243d0	func	Event *	__thiscall	notinline	nofixup	Event::`scalar_deleting_destructor'	byte	param_1
+@@ -137,12 +137,12 @@
+ 0x00024600	func	undefined	unknown	notinline	nofixup	setUnknownAllocated_0x6Something	undefined4	packed
+ 0x00024620	func	void	__stdcall	notinline	nofixup	setUnknownObj_0x6SomethingElse	uint	packed	float	param_2
+ 0x00024650	func	undefined	unknown	notinline	nofixup	getSomeUnknownAllocated_0x6Field
+-0x00024670	func	UnknownObj_0x6 *	__thiscall	notinline	nofixup	UnknownObj_0x6::UnknownObj_0x6	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x00024670	func	UnknownObj_0x6 *	__thiscall	notinline	nofixup	UnknownObj_0x6::UnknownObj_0x6	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x000246e0	func	UnknownObj_0x6 *	__thiscall	notinline	nofixup	UnknownObj_0x6::`scalar_deleting_destructor'	byte	param_1
+ 0x00024700	func	void	__thiscall	notinline	nofixup	UnknownObj_0x6::exec
+-0x00024ae0	func	void	__thiscall	notinline	nofixup	UnknownStatic06::calledDuringExecDefault
++0x00024ae0	func	void	__thiscall	notinline	nofixup	UnknownStatic06::calledDuringExec0Default
+ 0x00024c70	func	void	__thiscall	notinline	nofixup	UnknownStatic06::`scalar_deleting_destructor'	bool	free
+-0x00024c90	func	CacheBuilder_MAYBE *	__thiscall	notinline	nofixup	CacheBuilder_MAYBE::CacheBuilder_MAYBE	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x00024c90	func	CacheBuilder_MAYBE *	__thiscall	notinline	nofixup	CacheBuilder_MAYBE::CacheBuilder_MAYBE	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x00024cf0	func	void	__thiscall	notinline	nofixup	CacheBuilder_MAYBE::~CacheBuilder_MAYBE
+ 0x00024e10	func	BOOL	__thiscall	notinline	nofixup	CacheBuilder_MAYBE::cacheTablePathExists	uint	index
+ 0x00024e70	func	BOOL	__thiscall	notinline	nofixup	CacheBuilder_MAYBE::writeCacheCheckpoint
+@@ -163,9 +163,9 @@
+ 0x00025740	func	void	__stdcall	notinline	nofixup	freeFile	FileType	fileType	uint	id
+ 0x00025770	func	BOOL	default	notinline	nofixup	fileExists	char *	path
+ 0x000257b0	func	uint	default	notinline	nofixup	getSomeFileManagerField
+-0x000257d0	func	void	__thiscall	notinline	nofixup	FileManager::FileManager	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x000257d0	func	void	__thiscall	notinline	nofixup	FileManager::FileManager	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x00025dd0	func	BOOL	__thiscall	notinline	nofixup	FileManager::readFromPath	char *	filePath	void * *	buf
+-0x00026010	func	void	__cdecl	notinline	nofixup	initFileManager	RootExecObj *	parent
++0x00026010	func	void	__cdecl	notinline	nofixup	initFileManager	CActRoot *	parent
+ 0x00026080	func	void	__stdcall	notinline	nofixup	freeCurrentFile
+ 0x000260d0	func	void	__thiscall	notinline	nofixup	FileManager::~FileManager
+ 0x00026150	func	FileManager *	__thiscall	notinline	nofixup	FileManager::`scalar_deleting_destructor'	UINT	param_1
+@@ -241,73 +241,73 @@
+ 0x00039850	func	BOOL	__thiscall	notinline	nofixup	FileManager::readLogo
+ 0x00039a80	func	void	__thiscall	notinline	nofixup	UnknownStatic07::calledDuringExec
+ 0x00039b30	func	void	__thiscall	notinline	nofixup	UnknownStatic07::`scalar_deleting_destructor'	byte	param_1
+-0x00039b50	func	BOOL	__thiscall	notinline	nofixup	GameData::checkFlagCondition	uint	cond
+-0x00039be0	func	void	__thiscall	notinline	nofixup	GameData::writeStateFlag	uint	flagVal
+-0x00039c70	func	void	__thiscall	notinline	nofixup	GameData::incrementChapter
+-0x00039c80	func	void	__thiscall	notinline	nofixup	GameData::setMissionDigits34	uint	missionDigits34
+-0x00039c90	func	void	__thiscall	notinline	nofixup	GameData::setSpawnPosIndex	uint	index
+-0x00039ca0	func	uint	__thiscall	notinline	nofixup	GameData::getSpawnPosIndex
+-0x00039cb0	func	void	__thiscall	notinline	nofixup	GameData::unlockCharacter	PlayerCharId	charId
+-0x00039cf0	func	void	__thiscall	notinline	nofixup	GameData::lockCharacter	PlayerCharId	charId
+-0x00039d10	func	BOOL	__thiscall	notinline	nofixup	GameData::characterUnlocked	PlayerCharId	charId
+-0x00039d40	func	BOOL	__thiscall	notinline	nofixup	GameData::checkFlagConditions	uint *	conds	uint	count
+-0x00039d80	func	void	__thiscall	notinline	nofixup	GameData::writeStateFlags	uint *	writes	uint	count
+-0x00039db0	func	BOOL	__thiscall	notinline	nofixup	GameData::checkFlagConditionUnpacked	FlagList	flagList	uint	index
+-0x00039de0	func	void	__thiscall	notinline	nofixup	GameData::writeStateFlagUnpacked	FlagList	flagList	uint	index	uint	flagVal
+-0x00039e10	func	void	__thiscall	notinline	nofixup	GameData::setSoulSpawned	uint	soulId
+-0x00039e40	func	BOOL	__thiscall	notinline	nofixup	GameData::getSoulSpawned	uint	soulId
+-0x00039e80	func	void	__thiscall	notinline	nofixup	GameData::setSoulCollected	uint	soulId
+-0x00039eb0	func	BOOL	__thiscall	notinline	nofixup	GameData::getSoulHeld	uint	soulId
+-0x00039ef0	func	BOOL	__thiscall	notinline	nofixup	GameData::soulSpawnedUncollected	uint	soulId
+-0x00039f40	func	void	__thiscall	notinline	nofixup	GameData::clearHeldSouls
+-0x00039f60	func	void	__thiscall	notinline	nofixup	GameData::restoreHeldSouls
+-0x00039fd0	func	uint	__thiscall	notinline	nofixup	GameData::getSoulCount
+-0x0003a0a0	func	uint	__thiscall	notinline	nofixup	GameData::getTotalSoulsInStage	uint	stageId
+-0x0003a130	func	uint	__thiscall	notinline	nofixup	GameData::getHeldSoulsInStage	uint	stageId
+-0x0003a2b0	func	BOOL	__thiscall	notinline	nofixup	GameData::getSoulCollectedBySize	TagSize	size	uint	index
+-0x0003a2f0	func	void	__thiscall	notinline	nofixup	GameData::setUnusedPerStageBitmask	uint	stageId	uint	index
+-0x0003a340	func	int	__thiscall	notinline	nofixup	GameData::getTagState	uint	stageId	uint	tagIndex	BOOL	rivalTag
+-0x0003a3a0	func	void	__thiscall	notinline	nofixup	GameData::setTagState	uint	stageId	uint	tagIndex	BOOL	rivalTag	uint	val
+-0x0003a400	func	void	__thiscall	notinline	nofixup	GameData::setTagCovered	uint	stageId	uint	tagIndex	BOOL	rivalTag	uint	gangOrPlayer
+-0x0003a4a0	func	void	__thiscall	notinline	nofixup	GameData::setVolumeSettings	float	volMusic	float	volSfx
+-0x0003a4c0	func	void	__thiscall	notinline	nofixup	GameData::getVolumeSettings	float *	outMusic	float *	outSfx
+-0x0003a4e0	func	void	__thiscall	notinline	nofixup	GameData::setRumbleEnabled	BOOL	value
+-0x0003a4f0	func	BOOL	__thiscall	notinline	nofixup	GameData::getRumbleEnabled
+-0x0003a500	func	void	__thiscall	notinline	nofixup	GameData::setGarageMusic	uint	songId
+-0x0003a510	func	uint	__thiscall	notinline	nofixup	GameData::getGarageMusic
+-0x0003a520	func	void	__thiscall	notinline	nofixup	GameData::setUnusedBitfield	uint	index
+-0x0003a550	func	void	__thiscall	notinline	nofixup	GameData::setMiscObjective	uint	index
+-0x0003a580	func	BOOL	__thiscall	notinline	nofixup	GameData::getMiscObjective	uint	index
+-0x0003a5c0	func	uint	__thiscall	notinline	nofixup	GameData::countMiscObjectives
+-0x0003a690	func	BOOL	__thiscall	notinline	nofixup	GameData::getHighScore	uint	stageId	TestRunType	type	uint	rank	TestRunScore *	out
+-0x0003a750	func	void	__thiscall	notinline	nofixup	GameData::incrementTimer	Timer	timer
+-0x0003a780	func	uint	__thiscall	notinline	nofixup	GameData::getTimer	Timer	timer
+-0x0003a7b0	func	void	__thiscall	notinline	nofixup	GameData::setTimer	Timer	timer	uint	frames
+-0x0003a7f0	func	void	__thiscall	notinline	nofixup	GameData::setSelectedTag	uint	gangOrPlayer	TagSize	size	uint	tagId	BOOL	multiplayer
+-0x0003a820	func	uint	__thiscall	notinline	nofixup	GameData::getSelectedTag	uint	gangOrPlayer	TagSize	size	BOOL	multiplayer
+-0x0003a840	func	void	__thiscall	notinline	nofixup	GameData::setCustomTagSelected	uint	gangOrPlayer	TagSize	size	BOOL	active	BOOL	multiplayer
+-0x0003a870	func	BOOL	__thiscall	notinline	nofixup	GameData::getCustomTagSelected	uint	gangOrPlayer	TagSize	size	BOOL	multiplayer
+-0x0003a890	func	void	__thiscall	notinline	nofixup	GameData::setEventSeen	uint	eventId
+-0x0003a8c0	func	BOOL	__thiscall	notinline	nofixup	GameData::eventSeen	uint	eventId
+-0x0003a900	func	void	__thiscall	notinline	nofixup	GameData::incrementPlaytime
+-0x0003a910	func	uint	__thiscall	notinline	nofixup	GameData::getSaveDataSize
+-0x0003a920	func	BOOL	__thiscall	notinline	nofixup	GameData::decrypt	char *	saveData
+-0x0003ab60	func	void	__thiscall	notinline	nofixup	GameData::encrypt	char *	outSaveData
+-0x0003ae00	func	void	__thiscall	notinline	nofixup	GameData::getSaveDescription	SaveDescription *	outDesc
+-0x0003ae20	func	void	__thiscall	notinline	nofixup	GameData::clearStateFlags	FlagListOrPtr	flagList
+-0x0003aea0	func	void	__thiscall	notinline	nofixup	GameData::resetTimer	Timer	timer
+-0x0003aed0	func	void	__thiscall	notinline	nofixup	GameData::GameData
+-0x0003b3c0	func	void	__thiscall	notinline	nofixup	GameData::resetSelectedTags
+-0x0003b420	func	void	__thiscall	notinline	nofixup	GameData::resetExceptSettingsAndSouls
+-0x0003b5a0	func	void	__thiscall	notinline	nofixup	GameData::resetExceptSettingsAndHighScores
+-0x0003b640	func	void	__thiscall	notinline	nofixup	GameData::resetExceptSettings
+-0x0003b680	func	void	__thiscall	notinline	nofixup	GameData::stash
+-0x0003b6a0	func	void	__thiscall	notinline	nofixup	GameData::stashRestoreExceptSpecialFlags
+-0x0003b6f0	func	void	__thiscall	notinline	nofixup	GameData::stashRestoreExceptHighScores
+-0x0003b790	func	void	__thiscall	notinline	nofixup	GameData::stashRestore
+-0x0003b7c0	func	void *	__thiscall	notinline	nofixup	GameData::`scalar_deleting_destructor'	uint	param_1
+-0x0003b7e0	func	void	__thiscall	notinline	nofixup	GameData::addHighScore	uint	stageId	TestRunType	type	TestRunScore *	score
+-0x0003c150	func	TextRenderer_MAYBE *	__thiscall	notinline	nofixup	TextRenderer_MAYBE::TextRenderer_MAYBE	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x00039b50	func	BOOL	__thiscall	notinline	nofixup	CSaveData::CheckFlagCondition	DWORD	dwCond
++0x00039be0	func	void	__thiscall	notinline	nofixup	CSaveData::WriteStateFlag	DWORD	dwFlagVal
++0x00039c70	func	void	__thiscall	notinline	nofixup	CSaveData::IncreaseChapter
++0x00039c80	func	void	__thiscall	notinline	nofixup	CSaveData::SetReturnMissionNo	DWORD	dwMission
++0x00039c90	func	void	__thiscall	notinline	nofixup	CSaveData::SetSpawnPosIndex	DWORD	dwIndex
++0x00039ca0	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetSpawnPosIndex
++0x00039cb0	func	void	__thiscall	notinline	nofixup	CSaveData::UnlockCharacter	ePLAYERCHARID	Character
++0x00039cf0	func	void	__thiscall	notinline	nofixup	CSaveData::LockCharacter	ePLAYERCHARID	Character
++0x00039d10	func	BOOL	__thiscall	notinline	nofixup	CSaveData::IsCharacterUnlocked	ePLAYERCHARID	Character
++0x00039d40	func	BOOL	__thiscall	notinline	nofixup	CSaveData::CheckFlagConditions	DWORD *	lpdwConds	DWORD	dwCount
++0x00039d80	func	void	__thiscall	notinline	nofixup	CSaveData::WriteStateFlags	DWORD *	lpdwWrites	DWORD	dwCount
++0x00039db0	func	BOOL	__thiscall	notinline	nofixup	CSaveData::CheckFlagConditionUnpacked	eFLAGLIST	FlagList	DWORD	dwIndex
++0x00039de0	func	void	__thiscall	notinline	nofixup	CSaveData::WriteStateFlagUnpacked	eFLAGLIST	FlagList	DWORD	dwIndex	DWORD	dwFlagVal
++0x00039e10	func	void	__thiscall	notinline	nofixup	CSaveData::SetSoulSpawned	DWORD	dwSoulId
++0x00039e40	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetSoulSpawned	DWORD	dwSoulId
++0x00039e80	func	void	__thiscall	notinline	nofixup	CSaveData::SetSoulCollected	DWORD	dwSoulId
++0x00039eb0	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetSoulHeld	DWORD	dwSoulId
++0x00039ef0	func	BOOL	__thiscall	notinline	nofixup	CSaveData::IsSoulSpawnedUncollected	DWORD	dwSoulId
++0x00039f40	func	void	__thiscall	notinline	nofixup	CSaveData::ClearHeldSouls
++0x00039f60	func	void	__thiscall	notinline	nofixup	CSaveData::RestoreHeldSouls
++0x00039fd0	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetSoulCount
++0x0003a0a0	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetTotalSoulsInStage	DWORD	dwStageId
++0x0003a130	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetHeldSoulsInStage	DWORD	dwStageId
++0x0003a2b0	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetSoulCollectedBySize	eTAGSIZE	Size	DWORD	dwIndex
++0x0003a2f0	func	void	__thiscall	notinline	nofixup	CSaveData::SetUnusedPerStageBitmask	DWORD	dwStageId	DWORD	dwIndex
++0x0003a340	func	int	__thiscall	notinline	nofixup	CSaveData::GetTagState	DWORD	dwStageId	DWORD	dwTagIndex	BOOL	bRivalTag
++0x0003a3a0	func	void	__thiscall	notinline	nofixup	CSaveData::SetTagState	DWORD	dwStageId	DWORD	dwTagIndex	BOOL	bRivalTag	DWORD	dwVal
++0x0003a400	func	void	__thiscall	notinline	nofixup	CSaveData::SetTagCovered	DWORD	dwStageId	DWORD	dwTagIndex	BOOL	bRivalTag	DWORD	dwGangOrPlayer
++0x0003a4a0	func	void	__thiscall	notinline	nofixup	CSaveData::SetVolumeSettings	float	fVolMusic	float	fVolSfx
++0x0003a4c0	func	void	__thiscall	notinline	nofixup	CSaveData::GetVolumeSettings	float *	lpfOutMusic	float *	lpfOutSfx
++0x0003a4e0	func	void	__thiscall	notinline	nofixup	CSaveData::SetRumbleEnabled	BOOL	bValue
++0x0003a4f0	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetRumbleEnabled
++0x0003a500	func	void	__thiscall	notinline	nofixup	CSaveData::SetGarageMusic	DWORD	dwSongId
++0x0003a510	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetGarageMusic
++0x0003a520	func	void	__thiscall	notinline	nofixup	CSaveData::SetUnusedBitfield	DWORD	dwIndex
++0x0003a550	func	void	__thiscall	notinline	nofixup	CSaveData::SetMiscObjective	DWORD	dwIndex
++0x0003a580	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetMiscObjective	DWORD	dwIndex
++0x0003a5c0	func	DWORD	__thiscall	notinline	nofixup	CSaveData::CountMiscObjectives
++0x0003a690	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetHighScore	DWORD	dwStageId	eTESTRUN	Type	DWORD	dwRank	STestRunScore *	lpOut
++0x0003a750	func	void	__thiscall	notinline	nofixup	CSaveData::IncreaseTimer	eTIMER	Timer
++0x0003a780	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetTimer	eTIMER	Timer
++0x0003a7b0	func	void	__thiscall	notinline	nofixup	CSaveData::SetTimer	eTIMER	Timer	DWORD	dwFrames
++0x0003a7f0	func	void	__thiscall	notinline	nofixup	CSaveData::SetSelectedTag	DWORD	dwGangOrPlayer	eTAGSIZE	Size	DWORD	dwTagId	BOOL	bMultiplayer
++0x0003a820	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetSelectedTag	DWORD	dwGangOrPlayer	eTAGSIZE	Size	BOOL	bMultiplayer
++0x0003a840	func	void	__thiscall	notinline	nofixup	CSaveData::SetCustomTagSelected	DWORD	dwGangOrPlayer	eTAGSIZE	Size	BOOL	bActive	BOOL	bMultiplayer
++0x0003a870	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetCustomTagSelected	DWORD	dwGangOrPlayer	eTAGSIZE	Size	BOOL	bMultiplayer
++0x0003a890	func	void	__thiscall	notinline	nofixup	CSaveData::SetEventSeen	DWORD	dwEventId
++0x0003a8c0	func	BOOL	__thiscall	notinline	nofixup	CSaveData::GetEventSeen	DWORD	dwEventId
++0x0003a900	func	void	__thiscall	notinline	nofixup	CSaveData::IncreasePlaytime
++0x0003a910	func	DWORD	__thiscall	notinline	nofixup	CSaveData::GetSaveDataSize
++0x0003a920	func	BOOL	__thiscall	notinline	nofixup	CSaveData::Decode	void *	lpvSaveData
++0x0003ab60	func	void	__thiscall	notinline	nofixup	CSaveData::Encode	void *	lpvOutSaveData
++0x0003ae00	func	void	__thiscall	notinline	nofixup	CSaveData::GetSaveDescription	SSaveDescription *	lpOutDesc
++0x0003ae20	func	void	__thiscall	notinline	nofixup	CSaveData::ClearStateFlags	UFlagListOrPtr	FlagList
++0x0003aea0	func	void	__thiscall	notinline	nofixup	CSaveData::ResetTimer	eTIMER	Timer
++0x0003aed0	func	void	__thiscall	notinline	nofixup	CSaveData::CSaveData
++0x0003b3c0	func	void	__thiscall	notinline	nofixup	CSaveData::ResetSelectedTags
++0x0003b420	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataResetTutorial
++0x0003b5a0	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataResetTestRun
++0x0003b640	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataResetVs
++0x0003b680	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataBackup
++0x0003b6a0	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataRestoreTutorial
++0x0003b6f0	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataRestoreTestRun
++0x0003b790	func	void	__thiscall	notinline	nofixup	CSaveData::SaveDataRestoreVs
++0x0003b7c0	func	void *	__thiscall	notinline	nofixup	CSaveData::`scalar_deleting_destructor'	uint	param_1
++0x0003b7e0	func	void	__thiscall	notinline	nofixup	CSaveData::AddHighScore	DWORD	dwStageId	eTESTRUN	Type	STestRunScore *	lpScore
++0x0003c150	func	TextRenderer_MAYBE *	__thiscall	notinline	nofixup	TextRenderer_MAYBE::TextRenderer_MAYBE	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x0003c2b0	func	void	__thiscall	notinline	nofixup	TextRenderer_MAYBE::~TextRenderer_MAYBE
+ 0x0003c310	func	void	__thiscall	notinline	nofixup	TextRenderer_MAYBE::draw	undefined4	param_1
+ 0x0003ca00	func	void *	__thiscall	notinline	nofixup	TextRenderer_MAYBE::_~TextRenderer_MAYBE	byte	param_1
+@@ -318,7 +318,7 @@
+ 0x0003e420	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::~MissionManagerChild_0xE7
+ 0x0003e430	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::setColour	D3DCOLOR	col
+ 0x0003e440	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::setAmbientColour	D3DCOLOR	col
+-0x0003e5f0	func	MissionManagerChild_0xE7 *	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::MissionManagerChild_0xE7	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x0003e5f0	func	MissionManagerChild_0xE7 *	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::MissionManagerChild_0xE7	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x0003e640	func	MissionManagerChild_0xE7 *	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::`scalar_deleting_destructor'	byte	param_1
+ 0x0003e660	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xE7::draw
+ 0x0003e690	func	void	__thiscall	notinline	nofixup	UnknownStatic09::UnknownStatic09
+@@ -328,14 +328,14 @@
+ 0x0003e9c0	func	void	__thiscall	notinline	nofixup	UnknownStatic09::calledDuringExec
+ 0x0003ee70	func	void	__thiscall	notinline	nofixup	UnknownStatic09::`scalar_deleting_destructor'	byte	param_1
+ 0x00042820	func	void	__thiscall	notinline	nofixup	GraffitiSoulSpawnView_MAYBE::~GraffitiSoulSpawnView_MAYBE
+-0x00042b00	func	GraffitiSoulSpawnView_MAYBE *	__thiscall	notinline	nofixup	GraffitiSoulSpawnView_MAYBE::GraffitiSoulSpawnView_MAYBE	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags	GraffitiSoul *	soul
++0x00042b00	func	GraffitiSoulSpawnView_MAYBE *	__thiscall	notinline	nofixup	GraffitiSoulSpawnView_MAYBE::GraffitiSoulSpawnView_MAYBE	CActBase *	parent	eACTID	index	eACTFLAG	flags	GraffitiSoul *	soul
+ 0x00042c20	func	void *	__thiscall	notinline	nofixup	GraffitiSoulSpawnView_MAYBE::`scalar_deleting_destructor'	byte	param_1
+ 0x000432e0	func	void	__thiscall	notinline	nofixup	PickupList::~PickupList
+ 0x00043700	func	LanguageId	__thiscall	notinline	nofixup	Language::get
+-0x00043c00	func	PickupList *	__thiscall	notinline	nofixup	PickupList::PickupList	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	OffCnt *	pickupList
++0x00043c00	func	PickupList *	__thiscall	notinline	nofixup	PickupList::PickupList	CActBase *	parent	eACTID	index	uint	bitfieldValue	OffCnt *	pickupList
+ 0x00043ea0	func	void *	__thiscall	notinline	nofixup	PickupList::`scalar_deleting_destructor'	byte	param_1
+-0x00044740	func	GameObjIndex	default	notinline	nofixup	spawnPickupList	GameObj *	parent	OffCnt *	pickupList
+-0x000461b0	func	GameObj *	__thiscall	notinline	nofixup	EventChild1Child::EventChild1Child	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x00044740	func	eACTID	default	notinline	nofixup	spawnPickupList	CActBase *	parent	OffCnt *	pickupList
++0x000461b0	func	CActBase *	__thiscall	notinline	nofixup	EventChild1Child::EventChild1Child	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x00046310	func	void	__thiscall	notinline	nofixup	EventChild1Child::~EventChild1Child
+ 0x00046650	func	EventChild1Child *	__thiscall	notinline	nofixup	EventChild1Child::`scalar_deleting_destructor'	byte	param_1
+ 0x00046920	func	undefined	__stdcall	notinline	nofixup	getUnknownStatic13PartDefault	UnknownStatic13Part *	out
+@@ -347,7 +347,7 @@
+ 0x0004a6f0	func	BOOL	__stdcall	notinline	nofixup	someVecsDirectionCheck	D3DVECTOR *	ref	D3DVECTOR *	vs
+ 0x0004a7a0	func	int	__cdecl	notinline	nofixup	xyToAngle	float	x	undefined4	y
+ 0x0004a8f0	func	void *	__cdecl	notinline	nofixup	operator_new	size_t	__size
+-0x0004a910	func	Mission *	__thiscall	notinline	nofixup	Mission::Mission	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags	uint	chapter	uint	idDigits34	BOOL	param_6
++0x0004a910	func	Mission *	__thiscall	notinline	nofixup	Mission::Mission	CActBase *	parent	eACTID	index	eACTFLAG	flags	uint	chapter	uint	idDigits34	BOOL	param_6
+ 0x0004aba0	func	void	__thiscall	notinline	nofixup	Mission::initBin
+ 0x0004abd0	func	void	__thiscall	notinline	nofixup	Mission::initDat
+ 0x0004ac00	func	void	__thiscall	notinline	nofixup	Mission::initMark
+@@ -359,7 +359,7 @@
+ 0x0004c070	func	void	__thiscall	notinline	nofixup	Mission::waitForSomething
+ 0x0004c400	func	void	__thiscall	notinline	nofixup	Mission::showTextForFrame
+ 0x0004ca20	func	void	__thiscall	notinline	nofixup	Mission::setPauseOptions	Call_SetPauseOptions *	args
+-0x0004d5f0	func	undefined	__stdcall	notinline	nofixup	populateSomeCharIdArray	PlayerCharId *	buf
++0x0004d5f0	func	undefined	__stdcall	notinline	nofixup	populateSomeCharIdArray	ePLAYERCHARID *	buf
+ 0x0004d880	func	void	__thiscall	notinline	nofixup	Mission::setManyPlayerStateFieldsToOne
+ 0x0004db30	func	void	default	notinline	nofixup	resolveMissionBinPtrs	MissionBin *	mssn
+ 0x0004e930	func	void	__stdcall	notinline	nofixup	newMission	uint	chapter	uint	idDigits34	BOOL	param_3
+@@ -367,7 +367,7 @@
+ 0x0004eaf0	func	void	__cdecl	notinline	nofixup	resetSomeGlobals
+ 0x0004eb80	func	BOOL	default	notinline	nofixup	getProfKModeSetting	uint	indexMajor	undefined4	indexMinor
+ 0x0004ec30	func	BOOL	default	notinline	nofixup	getSomeController_MAYBE	undefined4	out
+-0x0004ecd0	func	MissionManager *	__thiscall	notinline	nofixup	MissionManager::MissionManager	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x0004ecd0	func	MissionManager *	__thiscall	notinline	nofixup	MissionManager::MissionManager	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x0004ef00	func	void	__thiscall	notinline	nofixup	MissionManager::~MissionManager
+ 0x0004ef90	func	void	__thiscall	notinline	nofixup	MissionManager::execDefault
+ 0x0004f9a0	func	void	__thiscall	notinline	nofixup	MissionManager::drawDefault
+@@ -393,7 +393,7 @@
+ 0x00056990	func	void	__thiscall	notinline	nofixup	Mission::runListenerCalls	Call *	listeners	uint	count
+ 0x00057de0	func	Opcode	__thiscall	notinline	nofixup	Mission::startBlockingCall
+ 0x00057f90	func	void	__thiscall	notinline	nofixup	Mission::setNextSwitchFuncFromOpcode	Opcode	opcode
+-0x00058240	func	CharacterSelect *	__thiscall	notinline	nofixup	CharacterSelect::CharacterSelect	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	OffCnt *	charPreviewList	Coordinates *	coords	PlayerPath *	param_6	PlayerPath *	param_7	PlayerPath *	param_8
++0x00058240	func	CharacterSelect *	__thiscall	notinline	nofixup	CharacterSelect::CharacterSelect	CActBase *	parent	eACTID	index	uint	bitfieldValue	OffCnt *	charPreviewList	Coordinates *	coords	PlayerPath *	param_6	PlayerPath *	param_7	PlayerPath *	param_8
+ 0x000585e0	func	void	__thiscall	notinline	nofixup	Mission::runNonblockingCall	Call *	calls	uint	index
+ 0x0005b3f0	func	Opcode	__thiscall	notinline	nofixup	Mission::runImmediateCalls
+ 0x0005b570	func	void	__thiscall	notinline	nofixup	Mission::runNonblockingCalls	Call *	calls	undefined4	count
+@@ -403,22 +403,22 @@
+ 0x0005bb90	func	void	__thiscall	notinline	nofixup	Mission::runCallsNoBlocking
+ 0x0005d9c0	func	undefined4 *	__cdecl	notinline	nofixup	FUN_0005d9c0_LTCG	void *	param_1	undefined4	param_2
+ 0x0005e030	func	BOOL	__stdcall	notinline	nofixup	addModOrClamp	short *	limit	float *	out	float	increment	BOOL	clamp
+-0x0005f180	func	void	__thiscall	notinline	nofixup	COMManager_MAYBE::COMManager_MAYBE
+-0x0005f1d0	func	void	__thiscall	notinline	nofixup	COMManager_MAYBE::~COMManager_MAYBE
+-0x0005f250	func	int	__thiscall	notinline	nofixup	COMManager_MAYBE::createControllerCOM_MAYBE
+-0x0005f2c0	func	HRESULT	__stdcall	notinline	nofixup	createGraphics	HasScreenWidthAndHeight *	param_1	GraphicsCOM * *	out
+-0x0005f330	func	COMManager_MAYBE *	__thiscall	notinline	nofixup	COMManager_MAYBE::`scalar_deleting_destructor'	byte	param_1
+-0x0005f350	func	int	__thiscall	notinline	nofixup	COMManager_MAYBE::initCOMObjects_MAYBE	uint *	param_1	uint	param_2
+-0x000605b0	func	GameObj *	__thiscall	notinline	nofixup	MissionManagerChild_0xE8::MissionManagerChild_0xE8	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x0005f180	func	CMusashi *	__thiscall	notinline	nofixup	CMusashi::CMusashi
++0x0005f1d0	func	void	__thiscall	notinline	nofixup	CMusashi::~CMusashi
++0x0005f250	func	int	__thiscall	notinline	nofixup	CMusashi::createControllerCOM_MAYBE
++0x0005f2c0	func	HRESULT	__stdcall	notinline	nofixup	MGameGL_Initialize	tag_MGLCLASS *	settings	CMGameGL * *	out
++0x0005f330	func	CMusashi *	__thiscall	notinline	nofixup	CMusashi::`scalar_deleting_destructor'	byte	param_1
++0x0005f350	func	int	__thiscall	notinline	nofixup	CMusashi::Init	uint *	param_1	uint	param_2
++0x000605b0	func	CActBase *	__thiscall	notinline	nofixup	MissionManagerChild_0xE8::MissionManagerChild_0xE8	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x00060650	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xE8::~MissionManagerChild_0xE8
+ 0x00060ac0	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xE8::execDefault
+ 0x00062010	func	MissionManagerChild_0xE8 *	__thiscall	notinline	nofixup	MissionManagerChild_0xE8::`scalar_deleting_destructor'	byte	param_1
+-0x00065800	func	void	__thiscall	notinline	nofixup	UnknownStatic16::calledDuringExecDefault
++0x00065800	func	void	__thiscall	notinline	nofixup	UnknownStatic16::calledDuringExec0Default
+ 0x00065910	func	void	__thiscall	notinline	nofixup	UnknownStatic16::`scalar_deleting_destructor'	byte	param_1
+ 0x00065940	func	void	__cdecl	notinline	nofixup	initInputs_MAYBE
+ 0x000659c0	func	void	__stdcall	notinline	nofixup	readInput
+ 0x00065c80	func	void	__cdecl	notinline	nofixup	setStartButtonStatesToZero
+-0x00066110	func	void	__thiscall	notinline	nofixup	UnknownStatic17::calledDuringExecDefault
++0x00066110	func	void	__thiscall	notinline	nofixup	UnknownStatic17::calledDuringExec0Default
+ 0x000663c0	func	void	__thiscall	notinline	nofixup	UnknownStatic17::`scalar_deleting_destructor'	byte	param_1
+ 0x000663e0	func	void	__thiscall	notinline	nofixup	LoadingScreen::~LoadingScreen
+ 0x00066440	func	void	__thiscall	notinline	nofixup	LoadingScreen::execDefault
+@@ -427,34 +427,34 @@
+ 0x00066660	func	void	__thiscall	notinline	nofixup	LoadingScreen::drawUncoveredPause	undefined4	param_1
+ 0x000666f0	func	void	__thiscall	notinline	nofixup	LoadingScreen::show	BOOL	param_1	BOOL	pauseMusic
+ 0x000667d0	func	void	__thiscall	notinline	nofixup	LoadingScreen::hide
+-0x00066870	func	LoadingScreen *	__thiscall	notinline	nofixup	LoadingScreen::LoadingScreen	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x00066870	func	LoadingScreen *	__thiscall	notinline	nofixup	LoadingScreen::LoadingScreen	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x00066900	func	void *	__thiscall	notinline	nofixup	LoadingScreen::l`scalar_deleting_destructor'	byte	param_1
+ 0x00066950	func	float	__thiscall	notinline	nofixup	FRNG::get
+ 0x00066980	func	void	__thiscall	notinline	nofixup	FRNG::seed	uint	seed
+-0x00066ad0	func	void	__thiscall	notinline	nofixup	UnknownStatic18::calledDuringExecDefault
++0x00066ad0	func	void	__thiscall	notinline	nofixup	UnknownStatic18::calledDuringExec0Default
+ 0x00066b80	func	void	__thiscall	notinline	nofixup	UnknownStatic18::`scalar_deleting_destructor'	byte	param_1
+ 0x00066d80	func	void	__thiscall	notinline	nofixup	UnknownStatic19::calledDuringExec
+ 0x00067010	func	void	__thiscall	notinline	nofixup	UnknownStatic19::`scalar_deleting_destructor'	byte	param_1
+ 0x00067310	func	void	__thiscall	notinline	nofixup	TextBox_MAYBE::drawDefault
+ 0x000678b0	func	BOOL	__thiscall	notinline	nofixup	TextBox_MAYBE::save
+ 0x00067980	func	void	__thiscall	notinline	nofixup	TextBox_MAYBE::~TextBox_MAYBE
+-0x00067b60	func	TextBox_MAYBE *	__thiscall	notinline	nofixup	TextBox_MAYBE::TextBox_MAYBE	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags	undefined4	param_4	undefined4 *	param_5
++0x00067b60	func	TextBox_MAYBE *	__thiscall	notinline	nofixup	TextBox_MAYBE::TextBox_MAYBE	CActBase *	parent	eACTID	index	eACTFLAG	flags	undefined4	param_4	undefined4 *	param_5
+ 0x00067e70	func	void *	__thiscall	notinline	nofixup	TextBox_MAYBE::l`scalar_deleting_destructor'	uint	param_1
+ 0x00067e90	func	void	__thiscall	notinline	nofixup	TextBox_MAYBE::execDefault
+-0x000694a0	func	float	__thiscall	notinline	nofixup	GraphicsSettings::getGraphicsSetting	GraphicsSettingType	setting
+-0x000694c0	func	GraphicsSettings *	__thiscall	notinline	nofixup	GraphicsSettings::GraphicsSettings
++0x000694a0	func	float	__thiscall	notinline	nofixup	GraphicsSettings::getGraphicsSetting	eGRAPHICSSETTINGTYPE	setting
++0x000694c0	func	SGraphicsSettings *	__thiscall	notinline	nofixup	GraphicsSettings::GraphicsSettings
+ 0x0006af00	func	StageBin *	__thiscall	notinline	nofixup	StageBin::StageBin	void *	stgBinBuf
+ 0x0006b270	func	void	__thiscall	notinline	nofixup	StageBin::~StageBin
+ 0x0006bb80	func	void	__thiscall	notinline	nofixup	UnknownStatic22::`scalar_deleting_destructor'	byte	param_1
+ 0x0006c340	func	StageBin *	__thiscall	notinline	nofixup	StageBin::`scalar_deleting_destructor'	byte	param_1
+ 0x0006c6d0	func	void	__thiscall	notinline	nofixup	UnknownGlobal::clearSomeLinkedList_MAYBE
+ 0x0006c6e0	func	void	__thiscall	notinline	nofixup	UnknownGlobal::calledDuringExec
+-0x0006c840	func	TalkCharLive *	__thiscall	notinline	nofixup	TalkCharLive::TalkCharLive	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	TalkCharacter *	talkChar	uint	talkCharIndex	uint	talkEvent
++0x0006c840	func	TalkCharLive *	__thiscall	notinline	nofixup	TalkCharLive::TalkCharLive	CActBase *	parent	eACTID	index	uint	bitfieldValue	TalkCharacter *	talkChar	uint	talkCharIndex	uint	talkEvent
+ 0x0006caf0	func	void	__thiscall	notinline	nofixup	TalkCharLive::execDefault
+ 0x0006cd00	func	int	default	notinline	nofixup	newTalkCharLive	Mission *	mssn	TalkCharacter *	talkChar	uint	talkCharIndex	uint	talkEvent
+ 0x0006ce00	func	void	__thiscall	notinline	nofixup	TalkCharLive::~TalkCharLive
+ 0x0006cec0	func	void *	__thiscall	notinline	nofixup	TalkCharLive::`scalar_deleting_destructor'	byte	param_1
+-0x0006d9a0	func	UnknownObj_0x1DDE *	__thiscall	notinline	nofixup	UnknownObj_0x1DDE::UnknownAllocated_0x1DDE	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	GameObjIndex	param_4	GameObj * * *	param_5	Mat4 *	param_6	float	param_7
++0x0006d9a0	func	UnknownObj_0x1DDE *	__thiscall	notinline	nofixup	UnknownObj_0x1DDE::UnknownAllocated_0x1DDE	CActBase *	parent	eACTID	index	uint	bitfieldValue	eACTID	param_4	CActBase * * *	param_5	Mat4 *	param_6	float	param_7
+ 0x0006da80	func	void	__thiscall	notinline	nofixup	UnknownStatic24::UnknownStatic24
+ 0x0006dbb0	func	void	__thiscall	notinline	nofixup	UnknownStatic24::clearFieldsInSomeLinkedList
+ 0x0006dbe0	func	void	__thiscall	notinline	nofixup	UnknownStatic24::calledDuringExec
+@@ -469,7 +469,7 @@
+ 0x0006ec80	func	void	__thiscall	notinline	nofixup	UnknownObj_0x12B0::drawDefault
+ 0x0006f100	func	void	__thiscall	notinline	nofixup	UnknownObj_0x12B0::setMessage	char *	msg	undefined4	param_2	undefined4	param_3	int	controllerThatCanDismiss_MAYBE
+ 0x0006f190	func	BOOL	default	notinline	nofixup	allocated0x12b0
+-0x0006f200	func	UnknownObj_0x12B0 *	__thiscall	notinline	nofixup	UnknownObj_0x12B0::UnknownAllocated_0x12B0	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags	char *	message	int	param_5	uint	otherFlags	undefined4	controllerThatCanDismiss
++0x0006f200	func	UnknownObj_0x12B0 *	__thiscall	notinline	nofixup	UnknownObj_0x12B0::UnknownAllocated_0x12B0	CActBase *	parent	eACTID	index	eACTFLAG	flags	char *	message	int	param_5	uint	otherFlags	undefined4	controllerThatCanDismiss
+ 0x0006f380	func	UnknownObj_0x12B0 *	__thiscall	notinline	nofixup	UnknownObj_0x12B0::ll`scalar_deleting_destructor'	byte	param_1
+ 0x0006f3a0	func	void	__thiscall	notinline	nofixup	UnknownObj_0x12B0::execDefault
+ 0x0006f450	func	void	__cdecl	notinline	nofixup	showMessage	char *	msg	int	param_2	undefined4	param_3	int	controllerThatCanDismiss
+@@ -479,24 +479,24 @@
+ 0x0006f600	func	undefined	__cdecl	notinline	nofixup	showReconnectNAndStartMessage1	uint	controllerId
+ 0x0006f650	func	undefined	__cdecl	notinline	nofixup	showReconnectNAndStartMessage2	uint	controllerId
+ 0x0006f6a0	func	void	__cdecl	notinline	nofixup	showReconnectControllerMessage
+-0x0006f6d0	func	void	default	notinline	nofixup	showCharacterJoinMessage	PlayerCharId	character	undefined4	controller
++0x0006f6d0	func	void	default	notinline	nofixup	showCharacterJoinMessage	ePLAYERCHARID	character	undefined4	controller
+ 0x0006f730	func	undefined	unknown	notinline	nofixup	showProblemWithDisc
+ 0x0006f760	func	undefined	unknown	notinline	nofixup	showSaveLoadErr
+-0x0006f8c0	func	void	__thiscall	notinline	nofixup	UnknownStatic27::calledDuringExecDefault
++0x0006f8c0	func	void	__thiscall	notinline	nofixup	UnknownStatic27::calledDuringExec0Default
+ 0x0006f9c0	func	undefined4 *	__thiscall	notinline	nofixup	UnknownStatic27::`scalar_deleting_destructor'	byte	param_1
+ 0x0006f9e0	func	void	__cdecl	notinline	nofixup	main
+ 0x00077400	func	void	__cdecl	notinline	nofixup	resetHighScores
+ 0x000780f0	func	void	__thiscall	notinline	nofixup	UnknownObj_0x1167_2::~UnknownAllocated_0x1167_2
+-0x00078520	func	UnknownAllocated_0x1167_2 *	__thiscall	notinline	nofixup	UnknownObj_0x1167_2::UnknownAllocated_0x1167_2	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	undefined4	param_4	uint	mssnId
++0x00078520	func	UnknownAllocated_0x1167_2 *	__thiscall	notinline	nofixup	UnknownObj_0x1167_2::UnknownAllocated_0x1167_2	CActBase *	parent	eACTID	index	uint	bitfieldValue	undefined4	param_4	uint	mssnId
+ 0x000789d0	func	void *	__thiscall	notinline	nofixup	UnknownObj_0x1167_2::`scalar_deleting_destructor'	byte	param_1
+ 0x00079b50	func	void	__thiscall	notinline	nofixup	UnknownObj_0x1167_1::~UnknownAllocated_0x1167_1
+-0x0007a8b0	func	UnknownAllocated_0x1167_1 *	__thiscall	notinline	nofixup	UnknownObj_0x1167_1::UnknownAllocated_0x1167_1	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	undefined4	param_4
++0x0007a8b0	func	UnknownAllocated_0x1167_1 *	__thiscall	notinline	nofixup	UnknownObj_0x1167_1::UnknownAllocated_0x1167_1	CActBase *	parent	eACTID	index	uint	bitfieldValue	undefined4	param_4
+ 0x0007ab20	func	void *	__thiscall	notinline	nofixup	UnknownObj_0x1167_1::`scalar_deleting_destructor'	byte	param_1
+-0x0007ae10	func	DemoInitializer *	__thiscall	notinline	nofixup	DemoInitializer::DemoInitializer	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x0007ae10	func	DemoInitializer *	__thiscall	notinline	nofixup	DemoInitializer::DemoInitializer	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x0007af70	func	void	__thiscall	notinline	nofixup	DemoInitializer::~DemoInitializer
+ 0x0007b830	func	DemoInitializer *	__thiscall	notinline	nofixup	DemoInitializer::`scalar_deleting_destructor'	byte	param_1
+ 0x0007b8d0	func	void	__thiscall	notinline	nofixup	DemoInitializer::execDefault
+-0x0007bc10	func	Director *	__thiscall	notinline	nofixup	Director::Director	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x0007bc10	func	Director *	__thiscall	notinline	nofixup	Director::Director	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x0007bc90	func	void	__thiscall	notinline	nofixup	Director::~Director
+ 0x0007bdd0	func	void	__thiscall	notinline	nofixup	Director::execDefault
+ 0x0007be30	func	void	__thiscall	notinline	nofixup	Director::init
+@@ -511,13 +511,41 @@
+ 0x0007c250	func	void	__thiscall	notinline	nofixup	Director::waitDestructMissionManager
+ 0x0007c270	func	void	__thiscall	notinline	nofixup	Director::switchOnMisc
+ 0x0007c290	func	void	__thiscall	notinline	nofixup	Director::newGame_MAYBE
++0x0007c9e0	func	void	__thiscall	notinline	nofixup	Director::PrepareUnknownMission
++0x0007ca60	func	void	__thiscall	notinline	nofixup	Director::NopUnknownMission
++0x0007ca70	func	void	__thiscall	notinline	nofixup	Director::WaitEndUnknownMission
++0x0007ca90	func	void	__thiscall	notinline	nofixup	Director::ReturnFromUnknownMission
++0x0007cae0	func	void	__thiscall	notinline	nofixup	Director::PrepareTutorial
++0x0007cbb0	func	void	__thiscall	notinline	nofixup	Director::NopTutorial
++0x0007cbc0	func	void	__thiscall	notinline	nofixup	Director::WaitEndTutorial
++0x0007cbe0	func	void	__thiscall	notinline	nofixup	Director::ReturnFromTutorial
++0x0007cc40	func	void	__thiscall	notinline	nofixup	Director::PrepareTestRun
++0x0007cd10	func	void	__thiscall	notinline	nofixup	Director::NopTestRun
++0x0007cd20	func	void	__thiscall	notinline	nofixup	Director::WaitEndTestRun
++0x0007cd40	func	void	__thiscall	notinline	nofixup	Director::ReturnFromTestRun
++0x0007cda0	func	void	__thiscall	notinline	nofixup	Director::PrepareVs
++0x0007ce70	func	void	__thiscall	notinline	nofixup	Director::NopVs
++0x0007ce80	func	void	__thiscall	notinline	nofixup	Director::WaitEndVs
++0x0007cea0	func	void	__thiscall	notinline	nofixup	Director::ReturnFromVs
++0x0007cf00	func	void	__thiscall	notinline	nofixup	Director::PrepareGraffitiMenu
++0x0007cfb0	func	void	__thiscall	notinline	nofixup	Director::WaitLoadGraffitiMenu
++0x0007cfe0	func	void	__thiscall	notinline	nofixup	Director::WaitEndGraffitiMenu
++0x0007d000	func	void	__thiscall	notinline	nofixup	Director::ReturnFromGraffitiMenu
++0x0007d2d0	func	void	__thiscall	notinline	nofixup	Director::PrepareEnding
++0x0007d320	func	void	__thiscall	notinline	nofixup	Director::WaitLoadEnding
++0x0007d3d0	func	void	__thiscall	notinline	nofixup	Director::WaitEndEnding
++0x0007d3f0	func	void	__thiscall	notinline	nofixup	Director::ReturnFromEnding
++0x0007d450	func	void	__thiscall	notinline	nofixup	Director::NopStinger
++0x0007d460	func	void	__thiscall	notinline	nofixup	Director::PrepareStinger
++0x0007d520	func	void	__thiscall	notinline	nofixup	Director::WaitEndStinger
++0x0007d540	func	void	__thiscall	notinline	nofixup	Director::ReturnFromStinger
+ 0x0007d5b0	func	Director *	__thiscall	notinline	nofixup	Director::`scalar_deleting_constructor'	byte	param_1
+ 0x0007e100	func	BOOL	default	notinline	nofixup	0x1DF3NotAllocated
+-0x0007e260	func	void	__stdcall	notinline	nofixup	allocate0x1DF3	GameObj *	parent
++0x0007e260	func	void	__stdcall	notinline	nofixup	allocate0x1DF3	CActBase *	parent
+ 0x0007e2f0	func	void	__thiscall	notinline	nofixup	Opening::~Opening
+ 0x0007e360	func	void	__thiscall	notinline	nofixup	Opening::execDefault
+ 0x0007e550	func	void	__thiscall	notinline	nofixup	Opening::drawDefault	undefined4	param_1
+-0x0007e6a0	func	Opening *	__thiscall	notinline	nofixup	Opening::Opening	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x0007e6a0	func	Opening *	__thiscall	notinline	nofixup	Opening::Opening	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x0007e7b0	func	void *	__thiscall	notinline	nofixup	Opening::`scalar_deleting_destructor'	uint	param_1
+ 0x0007e7d0	func	void	default	notinline	nofixup	startOpening	Director *	director
+ 0x0007e830	func	void	__thiscall	notinline	nofixup	SomePlayerStateChild::~SomePlayerStateChild
+@@ -526,7 +554,7 @@
+ 0x0007fda0	func	void	__thiscall	notinline	nofixup	SomePlayerStateChild::zeroCounters_MAYBE
+ 0x0007fe70	func	void	__thiscall	notinline	nofixup	SomePlayerStateChild::setQuantities	int	cans	int	staminaPercent	int	param_3
+ 0x00080320	func	void *	__thiscall	notinline	nofixup	SomePlayerStateChild::`scalar_deleting_destructor'	byte	param_1
+-0x00084200	func	SomePlayerStateChild *	__thiscall	notinline	nofixup	SomePlayerStateChild::SomePlayerStateChild	undefined4	parent	undefined4	index	GameObjFlags	flags	MissionManagerChild_0xBArrMember *	param_4
++0x00084200	func	SomePlayerStateChild *	__thiscall	notinline	nofixup	SomePlayerStateChild::SomePlayerStateChild	undefined4	parent	undefined4	index	eACTFLAG	flags	MissionManagerChild_0xBArrMember *	param_4
+ 0x00085410	func	void	__thiscall	notinline	nofixup	UnknownObj_0x50::~UnknownObj_0x50
+ 0x00086180	func	UnknownObj_0x50 *	__thiscall	notinline	nofixup	UnknownObj_0x50::`scalar_deleting_destructor'	byte	param_1
+ 0x00092ff0	func	void	__thiscall	notinline	nofixup	SomePlayerStateChild::dealDamage_MAYBE	uint	damage	undefined4	param_2	undefined4	param_3	BOOL	param_4
+@@ -541,24 +569,24 @@
+ 0x000a5070	func	void	__thiscall	notinline	nofixup	PlayerCamera::execDefault
+ 0x000a6110	func	void	__thiscall	notinline	nofixup	SomePlayerState::~SomePlayerState
+ 0x000a63f0	func	void	__thiscall	notinline	nofixup	SomePlayerState::setSomeFieldToOne
+-0x000a6980	func	GameObj *	__thiscall	notinline	nofixup	SomePlayerState::SomePlayerState	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue	MissionManagerChild_0xBArrMember *	param_4
++0x000a6980	func	CActBase *	__thiscall	notinline	nofixup	SomePlayerState::SomePlayerState	CActBase *	parent	eACTID	index	uint	bitfieldValue	MissionManagerChild_0xBArrMember *	param_4
+ 0x000a6af0	func	void *	__thiscall	notinline	nofixup	SomePlayerState::`scalar_deleting_destructor'	byte	param_1
+ 0x000a76e0	func	void	__thiscall	notinline	nofixup	SomePlayerState::execDefault
+-0x000a82d0	func	MissionManagerChild_0xB *	__thiscall	notinline	nofixup	MissionManagerChild_0xB::MissionManagerChild_0xB	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
+-0x000a8360	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xB::~MissionManagerChild_0xB	GameObj *	param_1
++0x000a82d0	func	MissionManagerChild_0xB *	__thiscall	notinline	nofixup	MissionManagerChild_0xB::MissionManagerChild_0xB	CActBase *	parent	eACTID	index	uint	bitfieldValue
++0x000a8360	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xB::~MissionManagerChild_0xB	CActBase *	param_1
+ 0x000a8370	func	void	__thiscall	notinline	nofixup	MissionManagerChild_0xB::execDefault
+ 0x000a8720	func	MissionManagerChild_0xB *	__thiscall	notinline	nofixup	MissionManagerChild_0xB::`scalar_deleting_destructor'	byte	param_1
+-0x000aecc0	func	void	__thiscall	notinline	nofixup	GameObj::callExecDefault
+-0x000b3de0	func	void	__thiscall	notinline	nofixup	GameObj::callDrawDefault	uint	param_1
+-0x000c0a90	func	GameObj *	__thiscall	notinline	nofixup	MissionManagerChild_0x12B1::MissionManagerChild_0x12B1	GameObj *	param_1	GameObjIndex	param_2	uint	param_3
++0x000aecc0	func	void	__thiscall	notinline	nofixup	CActBase::callExecDefault
++0x000b3de0	func	void	__thiscall	notinline	nofixup	CActBase::callDrawDefault	uint	param_1
++0x000c0a90	func	CActBase *	__thiscall	notinline	nofixup	MissionManagerChild_0x12B1::MissionManagerChild_0x12B1	CActBase *	param_1	eACTID	param_2	uint	param_3
+ 0x000fe690	func	undefined	unknown	notinline	nofixup	printableStrLen	undefined4	param_1
+-0x000fe740	func	DrawTree *	__thiscall	notinline	nofixup	MissionManagerChild_0x1165::MissionManagerChild_0x1165	GameObj *	param_1	GameObjIndex	param_2	GameObjFlags	flags
++0x000fe740	func	CDrawBase *	__thiscall	notinline	nofixup	MissionManagerChild_0x1165::MissionManagerChild_0x1165	CActBase *	param_1	eACTID	param_2	eACTFLAG	flags
+ 0x000fea80	func	void	default	notinline	nofixup	setShowText	undefined4	param_1	undefined4	param_2	uint	charDelay	char *	str	undefined4	param_5
+-0x000ff230	func	DrawTree *	__thiscall	notinline	nofixup	MissionManagerChild_0x1163::MissionManagerChild_0x1163	GameObj *	param_1	GameObjIndex	param_2	GameObjFlags	flags
++0x000ff230	func	CDrawBase *	__thiscall	notinline	nofixup	MissionManagerChild_0x1163::MissionManagerChild_0x1163	CActBase *	param_1	eACTID	param_2	eACTFLAG	flags
+ 0x00100000	func	void	__fastcall	notinline	nofixup	functionAtUnfortunateAddress	int	param_1	char	param_2	int	param_3	int	param_4	int	param_5	int	param_6
+ 0x00107260	func	undefined	unknown	notinline	nofixup	showOverlay1	undefined4	param_1
+ 0x00107320	func	undefined	unknown	notinline	nofixup	showOverlay2	undefined4	param_1
+-0x00115fc0	func	AdxManager *	__thiscall	notinline	nofixup	AdxManager::AdxManager	GameObj *	parent	GameObjIndex	index	GameObjFlags	flags
++0x00115fc0	func	AdxManager *	__thiscall	notinline	nofixup	AdxManager::AdxManager	CActBase *	parent	eACTID	index	eACTFLAG	flags
+ 0x001160d0	func	int	__stdcall	notinline	nofixup	getAdxIndex	AdxType	type	int	id
+ 0x00116240	func	void	__thiscall	notinline	nofixup	AdxManager::setPause	AdxType	type	BOOL	val
+ 0x00116290	func	void	__thiscall	notinline	nofixup	AdxManager::setWaitPlayStart	AdxType	type	BOOL	val
+@@ -574,23 +602,25 @@
+ 0x00117140	func	undefined	unknown	notinline	nofixup	playVoiceLine	undefined4	voiceLineId
+ 0x00117330	func	AdxManager *	__thiscall	notinline	nofixup	AdxManager::`scalar_deleting_destructor'	byte	param_1
+ 0x00117350	func	void	default	notinline	nofixup	setMusic	int	id	undefined4	param_2
+-0x001174d0	func	GameObj *	__thiscall	notinline	nofixup	MissionManagerChild_0xEA::MissionManagerChild_0xEA	GameObj *	param_1	GameObjIndex	param_2	uint	param_3
+-0x001179f0	func	GameObj *	__thiscall	notinline	nofixup	MissionManagerChild_0xE9::MissionManagerChild_0xE9	GameObj *	param_1	GameObjIndex	param_2	uint	param_3
++0x001174d0	func	CActBase *	__thiscall	notinline	nofixup	MissionManagerChild_0xEA::MissionManagerChild_0xEA	CActBase *	param_1	eACTID	param_2	uint	param_3
++0x001179f0	func	CActBase *	__thiscall	notinline	nofixup	MissionManagerChild_0xE9::MissionManagerChild_0xE9	CActBase *	param_1	eACTID	param_2	uint	param_3
+ 0x00117ba0	func	WavInfo *	__thiscall	notinline	nofixup	WavInfo::WavInfo	uint	id	void *	fileBuf	uint	param_3
+ 0x00118610	func	void	__thiscall	notinline	nofixup	SoundManager::execNormal
+ 0x00118630	func	void	__thiscall	notinline	nofixup	SoundManager::execEvent
+ 0x00118650	func	char *	default	notinline	nofixup	makeSoundEffectFilepath	int	id
+ 0x00118800	func	void	__cdecl	notinline	nofixup	somethingOnAllWavInfos
+ 0x00118870	func	undefined	unknown	notinline	nofixup	setSomeUnknownAllocated_0x4Field	undefined4	val
+-0x00118c00	func	SoundManager *	__thiscall	notinline	nofixup	SoundManager::SoundManager	GameObj *	parent	GameObjIndex	index	uint	bitfieldValue
++0x00118c00	func	SoundManager *	__thiscall	notinline	nofixup	SoundManager::SoundManager	CActBase *	parent	eACTID	index	uint	bitfieldValue
+ 0x00118cb0	func	void	__thiscall	notinline	nofixup	SoundManager::~SoundManager
+ 0x00119570	func	SoundManager *	__thiscall	notinline	nofixup	SoundManager::`scalar_deleting_destructor'	byte	param_1
+ 0x00119670	func	void	default	notinline	nofixup	parseNormWavs	uint	id	void *	fileBuf
+-0x00126ac0	func	void	__thiscall	notinline	nofixup	UnknownObj_0x1DE2::~UnknownAllocated_0x1DE2
+-0x00127590	func	UnknownObj_0x1DE2 *	__thiscall	notinline	nofixup	UnknownObj_0x1DE2::UnknownAllocated_0x1DE2	GameObj *	param_1	GameObjIndex	param_2	uint	param_3
+-0x001277f0	func	undefined	unknown	notinline	nofixup	UnknownObj_0x1DE2::`scalar_deleting_destructor'	undefined1	param_1
++0x00126ac0	func	void	__thiscall	notinline	nofixup	CGraffitiMenu::~CGraffitiMenu
++0x00127080	func	void	__thiscall	notinline	nofixup	CGraffitiMenu::DrawListDefault	int	param_1
++0x00127590	func	CGraffitiMenu *	__thiscall	notinline	nofixup	CGraffitiMenu::CGraffitiMenu	CActBase *	param_1	eACTID	param_2	uint	param_3
++0x001277f0	func	undefined	unknown	notinline	nofixup	CGraffitiMenu::`scalar_deleting_destructor'	undefined1	param_1
++0x00127810	func	void	__thiscall	notinline	nofixup	CGraffitiMenu::Exec0Default
+ 0x00127e60	func	void	__thiscall	notinline	nofixup	UnknownObj_0x1DE4::~UnknownAllocated_0x1DE4
+-0x00128fd0	func	UnknownObj_0x1DE4 *	__thiscall	notinline	nofixup	UnknownObj_0x1DE4::UnknownAllocated_0x1DE4	GameObj *	param_1	GameObjIndex	param_2	uint	param_3
++0x00128fd0	func	UnknownObj_0x1DE4 *	__thiscall	notinline	nofixup	UnknownObj_0x1DE4::UnknownAllocated_0x1DE4	CActBase *	param_1	eACTID	param_2	uint	param_3
+ 0x00129160	func	UnknownObj_0x1DE4 *	__thiscall	notinline	nofixup	UnknownObj_0x1DE4::`scalar_deleting_destructor'	uint	param_1
+ 0x0013a6b0	func	void	default	notinline	nofixup	CRI::ADXT_Stop	ADXT	adxt
+ 0x0013a980	func	undefined	__stdcall	notinline	nofixup	CRI::ADXT_SetOutVol	ADXT	adxt	Sint32	vol
+@@ -661,8 +691,8 @@
+ 0x001455a3	func	HANDLE	__stdcall	notinline	nofixup	XAPILIB::CreateFile	LPCSTR	lpFileName	DWORD	dwDesiredAccess	DWORD	dwShareMode	void *	lpSecurityAttributes	DWORD	dwCreationDisposition	DWORD	dwFlagsAndAttributes	HANDLE	hTemplateFile
+ 0x0014572e	func	BOOL	__stdcall	notinline	nofixup	XAPILIB::CopyFileEx	char *	lpExistingFileName	char *	lpNewFileName	LPPROGRESS_ROUTINE	lpProgressRoutine	LPVOID	lpData	LPBOOL	pbCancel	DWORD	dwCopyFlags
+ 0x00145a10	func	BOOL	__stdcall	notinline	nofixup	XAPILIB::CopyFile	char *	lpExistingFileName	char *	lpNewFileName	BOOL	bFailIfExists
+-0x00145a2f	func	PVOID	__stdcall	notinline	nofixup	XAPILIB::VirtualAlloc	LPVOID	lpAddress	SIZE_T	dwSize	DWORD	flAllocationType	DWORD	flProtect
+-0x00145a5d	func	BOOL	__stdcall	notinline	nofixup	XAPILIB::VirtualFree	LPVOID	lpAddress	SIZE_T	dwSize	DWORD	dwFreeType
++0x00145a2f	func	PVOID	__stdcall	notinline	nofixup	VirtualAlloc	LPVOID	lpAddress	SIZE_T	dwSize	DWORD	flAllocationType	DWORD	flProtect
++0x00145a5d	func	BOOL	__stdcall	notinline	nofixup	VirtualFree	LPVOID	lpAddress	SIZE_T	dwSize	DWORD	dwFreeType
+ 0x00145a99	func	BOOL	__stdcall	notinline	nofixup	XAPILIB::VirtualProtect	LPVOID	lpAddress	SIZE_T	dwSize	DWORD	flNewProtect	PDWORD	lpflOldProtect
+ 0x00145b64	func	DWORD	__stdcall	notinline	nofixup	XAPILIB::WaitForSingleObjectEx	HANDLE	hHandle	DWORD	dwMilliseconds	BOOL	bAlertable
+ 0x00145ba8	func	DWORD	__stdcall	notinline	nofixup	XAPILIB::WaitForMultipleObjectsEx	DWORD	nCount	HANDLE *	lpHandles	BOOL	fWaitAll	DWORD	dwMilliseconds	BOOL	bAlertable
+@@ -727,9 +757,9 @@
+ 0x0014b4b5	func	void	__stdcall	notinline	nofixup	extern_"C"::_cinit
+ 0x0014b50d	func	void	__stdcall	notinline	nofixup	extern_"C"::_rtinit
+ 0x0014b6c4	func	HANDLE	__stdcall	notinline	nofixup	XAPILIB::XGetSectionHandle	char *	pSectionName
+-0x0014c2a0	func	void	__cdecl	notinline	nofixup	iRngSeed	uint	seed
+-0x0014c2b0	func	uint	__stdcall	notinline	nofixup	iRng
+-0x0014c2d0	func	float	default	notinline	nofixup	iRngF
++0x0014c2a0	func	void	__cdecl	notinline	nofixup	SeedRandom	uint	seed
++0x0014c2b0	func	uint	__stdcall	notinline	nofixup	Random
++0x0014c2d0	func	float	default	notinline	nofixup	FRandom
+ 0x0014c300	func	void	__fastcall	notinline	nofixup	vSum	D3DVECTOR *	out	D3DVECTOR *	u	D3DVECTOR *	v
+ 0x0014c340	func	void	__fastcall	notinline	nofixup	vAdd	D3DVECTOR *	u	D3DVECTOR *	v
+ 0x0014c370	func	void	__fastcall	notinline	nofixup	vProd	D3DVECTOR *	out	D3DVECTOR *	v	float	a
+@@ -751,8 +781,8 @@
+ 0x0014c730	func	void	__fastcall	notinline	nofixup	vAddProd	D3DVECTOR *	u	D3DVECTOR *	v	float	a
+ 0x0014c770	func	float	__stdcall	notinline	nofixup	acos	float	x
+ 0x0014c7a0	func	float	__stdcall	notinline	nofixup	asin	float	x
+-0x0014c7d0	func	float	__stdcall	notinline	nofixup	patan	float	x	float	y
+-0x0014c7f0	func	float	__stdcall	notinline	nofixup	abs	float	x
++0x0014c7d0	func	float	__stdcall	notinline	nofixup	ATan	float	x	float	y
++0x0014c7f0	func	float	__stdcall	notinline	nofixup	FAbs	float	x
+ 0x0014c800	func	float	__fastcall	notinline	nofixup	vDot	D3DVECTOR *	u	D3DVECTOR *	v
+ 0x0014c820	func	float	default	notinline	nofixup	sqrt	float	x
+ 0x0014c840	func	undefined	__fastcall	notinline	nofixup	max	undefined4	x	undefined4	y
+@@ -760,55 +790,59 @@
+ 0x0014c870	func	float	default	notinline	nofixup	fmin	float	x	float	y
+ 0x0014c890	func	float	default	notinline	nofixup	sub_scale_add	float	x	float	y	float	z
+ 0x0014c8b0	func	undefined	__fastcall	notinline	nofixup	vSubScaleAdd	D3DVECTOR *	out	D3DVECTOR *	u	D3DVECTOR *	v	undefined4	a
+-0x0014c910	func	int	default	notinline	nofixup	initSinCosTable
+-0x0014caa0	func	int	default	notinline	nofixup	initFloatMath
+-0x0014cad0	func	undefined	unknown	notinline	nofixup	freeSinCosTable
++0x0014c910	func	int	default	notinline	nofixup	InitializeSinCos
++0x0014caa0	func	int	default	notinline	nofixup	MMath_Initialize
++0x0014cad0	func	void	__cdecl	notinline	nofixup	UninitializeSinCos
++0x0014caf0	func	uint *	__stdcall	notinline	nofixup	MMath_ExportLibrary
++0x0014cb20	func	uint	__stdcall	notinline	nofixup	MMath_ImportLibrary	SMMathExport *	lib
+ 0x0014cc60	func	undefined	__fastcall	notinline	nofixup	clamp	undefined4	x	undefined4	min	undefined4	max
+-0x0014cca0	func	float	__stdcall	notinline	nofixup	clamp	float	x	float	min	float	max
++0x0014cca0	func	float	__stdcall	notinline	nofixup	FSat	float	x	float	min	float	max
+ 0x0014cd50	func	undefined	__fastcall	notinline	nofixup	vInverse	D3DVECTOR *	out	D3DVECTOR *	v
+-0x0014cdb0	func	GraphicsCOM *	__thiscall	notinline	nofixup	GraphicsCOM::GraphicsCOM
+-0x0014cf00	func	ULONG	__stdcall	notinline	nofixup	GraphicsCOM::AddRef	GraphicsCOM *	this
+-0x0014cf20	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::QueryInterface	GraphicsCOM *	this	IID *	riid	void * *	ppvObject
+-0x0014cf80	func	ULONG	__stdcall	notinline	nofixup	GraphicsCOM::Release	GraphicsCOM *	this
+-0x0014d020	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::setClearColour	GraphicsCOM *	this	undefined4	colour
+-0x0014d030	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::clear	GraphicsCOM *	this	undefined4	flags
++0x0014cdb0	func	CMGameGL *	__thiscall	notinline	nofixup	CMGameGL::CMGameGL
++0x0014cf00	func	ULONG	__stdcall	notinline	nofixup	CMGameGL::AddRef	CMGameGL *	this
++0x0014cf20	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::QueryInterface	CMGameGL *	this	IID *	riid	void * *	ppvObject
++0x0014cf80	func	ULONG	__stdcall	notinline	nofixup	CMGameGL::Release	CMGameGL *	this
++0x0014cfb0	func	HRESULT	__stdcall	notinline	nofixup	MGameGLCreate	CMGameGL * *	out
++0x0014d020	func	undefined	__stdcall	notinline	nofixup	CMGameGL::setClearColour	CMGameGL *	this	undefined4	colour
++0x0014d030	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::clear	CMGameGL *	this	undefined4	flags
+ 0x0014d080	func	uint	default	notinline	nofixup	return0
+-0x0014d090	func	HRESULT	default	notinline	nofixup	GraphicsCOM::swapDefault	undefined4	this
+-0x0014d0d0	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::swapFinish	GraphicsCOM *	this
+-0x0014d0f0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::getTextureArrayIndex	GraphicsCOM *	this	undefined4	out
+-0x0014d340	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setRenderTargetFromArray	GraphicsCOM *	this	int	index
+-0x0014d4a0	func	ULONG	__stdcall	notinline	nofixup	AddRef	FontCOM *	this
+-0x0014d9d0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setShaderConstantMode	GraphicsCOM *	this	VERTEXSHADERCONSTANTMODE	mode
++0x0014d090	func	HRESULT	default	notinline	nofixup	CMGameGL::swapDefault	undefined4	this
++0x0014d0d0	func	undefined	__stdcall	notinline	nofixup	CMGameGL::swapFinish	CMGameGL *	this
++0x0014d0f0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::getTextureArrayIndex	CMGameGL *	this	undefined4	out
++0x0014d340	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setRenderTargetFromArray	CMGameGL *	this	int	index
++0x0014d4a0	func	ULONG	__stdcall	notinline	nofixup	AddRef	CMGameGLFont *	this
++0x0014d9d0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setShaderConstantMode	CMGameGL *	this	VERTEXSHADERCONSTANTMODE	mode
+ 0x0014f640	func	undefined	__stdcall	notinline	nofixup	freeFromSomeTextureArray	uint	index
+-0x0014f6d0	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::freeOneOrAllOfSomeTextureArray	GraphicsCOM *	this	int	index
+-0x0014fb20	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::setLightDirection	GraphicsCOM *	this	D3DVECTOR *	direction
+-0x0014fbb0	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::setLightColour	GraphicsCOM *	this	D3DCOLOR	colour
+-0x0014fdb0	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::setAmbient	GraphicsCOM *	this	D3DCOLOR	colour
+-0x0014fde0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setTextureByIndex	GraphicsCOM *	this	uint	stage	undefined4	index
+-0x0014fe30	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setTexCoordIndex	GraphicsCOM *	this	DWORD	stage	DWORD	value
+-0x0014fef0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setTextureOps	GraphicsCOM *	this	uint	stage	DWORD	setting
+-0x001502c0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setMipMapLODBias	GraphicsCOM *	this	uint	stage	float	value
+-0x001504d0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setRenderState	GraphicsCOM *	this	D3DRENDERSTATETYPE	state	undefined4	val
+-0x001507c0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::getRenderState	GraphicsCOM *	this	D3DRENDERSTATETYPE	state	undefined4	out
+-0x00150830	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setSpecularEnable	GraphicsCOM *	this	BOOL	value
+-0x00150850	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setLighting	GraphicsCOM *	this	BOOL	value
+-0x00150890	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setAlphaBlendEnabled	GraphicsCOM *	this	BOOL	value
+-0x00150950	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setFogEnable	GraphicsCOM *	this	BOOL	value
+-0x00150c70	func	int	__stdcall	notinline	nofixup	GraphicsCOM::setMaterial	GraphicsCOM *	this	uint	index
+-0x00151120	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setStencilEnable	GraphicsCOM *	this	BOOL	value
++0x0014f6d0	func	undefined	__stdcall	notinline	nofixup	CMGameGL::freeOneOrAllOfSomeTextureArray	CMGameGL *	this	int	index
++0x0014fb20	func	undefined	__stdcall	notinline	nofixup	CMGameGL::setLightDirection	CMGameGL *	this	D3DVECTOR *	direction
++0x0014fbb0	func	undefined	__stdcall	notinline	nofixup	CMGameGL::setLightColour	CMGameGL *	this	D3DCOLOR	colour
++0x0014fdb0	func	undefined	__stdcall	notinline	nofixup	CMGameGL::setAmbient	CMGameGL *	this	D3DCOLOR	colour
++0x0014fde0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setTextureByIndex	CMGameGL *	this	uint	stage	undefined4	index
++0x0014fe30	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setTexCoordIndex	CMGameGL *	this	DWORD	stage	DWORD	value
++0x0014fef0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setTextureOps	CMGameGL *	this	uint	stage	DWORD	setting
++0x001502c0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setMipMapLODBias	CMGameGL *	this	uint	stage	float	value
++0x001504d0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setRenderState	CMGameGL *	this	D3DRENDERSTATETYPE	state	undefined4	val
++0x001507c0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::getRenderState	CMGameGL *	this	D3DRENDERSTATETYPE	state	undefined4	out
++0x00150830	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setSpecularEnable	CMGameGL *	this	BOOL	value
++0x00150850	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setLighting	CMGameGL *	this	BOOL	value
++0x00150890	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setAlphaBlendEnabled	CMGameGL *	this	BOOL	value
++0x00150950	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setFogEnable	CMGameGL *	this	BOOL	value
++0x00150c70	func	int	__stdcall	notinline	nofixup	CMGameGL::setMaterial	CMGameGL *	this	uint	index
++0x00151120	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setStencilEnable	CMGameGL *	this	BOOL	value
+ 0x00151130	func	HRESULT	default	notinline	nofixup	resetDiffuseVertexData
+-0x00151160	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setDiffuseVertexData	GraphicsCOM *	this	undefined4	packed
+-0x00151180	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setReverseCull	GraphicsCOM *	this	undefined4	value
+-0x001511b0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::setStencilSettings	GraphicsCOM *	this	DWORD	pass	DWORD	func	DWORD	ref
+-0x00151820	func	undefined	__stdcall	notinline	nofixup	FontCOM::setSomeThings	FontCOM *	this	undefined4	param_2	undefined4	colour
+-0x00151840	func	void	__stdcall	notinline	nofixup	FontCOM::draw	FontCOM *	this	uint	x	uint	y	char *	str
+-0x001519d0	func	undefined	__stdcall	notinline	nofixup	FontCOM::drawDecimal	FontCOM *	this	undefined4	x	undefined4	y	int	val
+-0x00151a00	func	undefined	__stdcall	notinline	nofixup	FontCOM::drawPaddedHex	FontCOM *	this	undefined4	x	undefined4	y	uint	val
+-0x00151a30	func	void	__stdcall	notinline	nofixup	FontCOM::drawUnknown	FontCOM *	this	undefined4	x	undefined4	y
+-0x00151a90	func	void	default	notinline	nofixup	FontCOM::drawFormat	FontCOM *	this	uint	x	uint	y	char *	fmt	...
+-0x00151ac0	func	HRESULT	__stdcall	notinline	nofixup	FontCOM::QueryInterface	FontCOM *	this	IID *	riid	void * *	ppvObject
+-0x00151c40	func	ULONG	__stdcall	notinline	nofixup	FontCOM::Release	FontCOM *	this
+-0x00151ca0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::createFont	GraphicsCOM *	this	undefined4	riid	char *	fontPath	undefined4	param_4	FontCOM * *	out
++0x00151160	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setDiffuseVertexData	CMGameGL *	this	undefined4	packed
++0x00151180	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setReverseCull	CMGameGL *	this	undefined4	value
++0x001511b0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::setStencilSettings	CMGameGL *	this	DWORD	pass	DWORD	func	DWORD	ref
++0x00151820	func	undefined	__stdcall	notinline	nofixup	CMGameGLFont::setSomeThings	CMGameGLFont *	this	undefined4	param_2	undefined4	colour
++0x00151840	func	void	__stdcall	notinline	nofixup	CMGameGLFont::draw	CMGameGLFont *	this	uint	x	uint	y	char *	str
++0x001519d0	func	undefined	__stdcall	notinline	nofixup	CMGameGLFont::drawDecimal	CMGameGLFont *	this	undefined4	x	undefined4	y	int	val
++0x00151a00	func	undefined	__stdcall	notinline	nofixup	CMGameGLFont::drawPaddedHex	CMGameGLFont *	this	undefined4	x	undefined4	y	uint	val
++0x00151a30	func	void	__stdcall	notinline	nofixup	CMGameGLFont::drawUnknown	CMGameGLFont *	this	undefined4	x	undefined4	y
++0x00151a90	func	void	default	notinline	nofixup	CMGameGLFont::drawFormat	CMGameGLFont *	this	uint	x	uint	y	char *	fmt	...
++0x00151ac0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGLFont::QueryInterface	CMGameGLFont *	this	IID *	riid	void * *	ppvObject
++0x00151b00	func	int	__cdecl	notinline	nofixup	CLGameGLFont::Initialize	int	param_1	char *	param_2	int	param_3
++0x00151c40	func	ULONG	__stdcall	notinline	nofixup	CMGameGLFont::Release	CMGameGLFont *	this
++0x00151ca0	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::CreateFont	CMGameGL *	this	undefined4	riid	char *	fontPath	undefined4	param_4	CMGameGLFont * *	out
+ 0x00151d70	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOMChild::QueryInterface	GraphicsCOMChild *	this	IID *	riid	void * *	ppvObject
+ 0x00151db0	func	undefined	__stdcall	notinline	nofixup	GraphicsCOMChild::setFirstToSecond	GraphicsCOMChild *	this
+ 0x00151dd0	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOMChild::setGammaRampChannel	GraphicsCOMChild *	this	undefined4	contrast	undefined4	luminance	Channel	channel
+@@ -818,33 +852,37 @@
+ 0x001521b0	func	undefined	unknown	notinline	nofixup	setGammaRamp
+ 0x00152210	func	undefined	__stdcall	notinline	nofixup	GraphicsCOMChild::commitGammaRamp	GraphicsCOMChild *	this
+ 0x00152230	func	ULONG	__stdcall	notinline	nofixup	GraphicsCOMChild::Release	GraphicsCOMChild *	this
+-0x00152270	func	HRESULT	__stdcall	notinline	nofixup	GraphicsCOM::createChild	GraphicsCOM *	this	GraphicsCOMChild * *	out
++0x00152270	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::createChild	CMGameGL *	this	GraphicsCOMChild * *	out
+ 0x001532f0	func	ULONG	__stdcall	notinline	nofixup	AddRef	undefined4 *	this
+-0x00153a90	func	void	__thiscall	notinline	nofixup	GraphicsCOM::setSomeGlobals
+-0x00153e30	func	void	__stdcall	notinline	nofixup	GraphicsCOM::setViewport	GraphicsCOM *	this	D3DRECT *	region
+-0x00154130	func	void	default	notinline	nofixup	GraphicsCOM::projectHomogeneous	GraphicsCOM *	this	Vec2 *	out	D3DVECTOR *	v
++0x00153a90	func	void	__thiscall	notinline	nofixup	CMGameGL::setSomeGlobals
++0x00153e30	func	void	__stdcall	notinline	nofixup	CMGameGL::setViewport	CMGameGL *	this	D3DRECT *	region
++0x00154130	func	void	default	notinline	nofixup	CMGameGL::projectHomogeneous	CMGameGL *	this	Vec2 *	out	D3DVECTOR *	v
+ 0x00154250	func	void	__fastcall	notinline	nofixup	transpose	D3DMATRIX *	mat
+-0x001542a0	func	uint	__stdcall	notinline	nofixup	GraphicsCOM::getTransform	GraphicsCOM *	this	undefined4	type	D3DMATRIX *	out	BOOL	transpose
+-0x00154420	func	uint	__stdcall	notinline	nofixup	GraphicsCOM::setTransform	GraphicsCOM *	this	undefined4	type	undefined4	mat
+-0x00154520	func	uint	__stdcall	notinline	nofixup	GraphicsCOM::setWorldTransform	GraphicsCOM *	this	uint	index	undefined4	mat
+-0x00154540	func	uint	default	notinline	nofixup	GraphicsCOM::setTextureTransform	GraphicsCOM *	this	uint	index	D3DMATRIX *	mat
+-0x001548e0	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::getSomeBoolFromArray	GraphicsCOM *	this	uint	index
++0x001542a0	func	uint	__stdcall	notinline	nofixup	CMGameGL::getTransform	CMGameGL *	this	undefined4	type	D3DMATRIX *	out	BOOL	transpose
++0x00154420	func	uint	__stdcall	notinline	nofixup	CMGameGL::setTransform	CMGameGL *	this	undefined4	type	undefined4	mat
++0x00154520	func	uint	__stdcall	notinline	nofixup	CMGameGL::setWorldTransform	CMGameGL *	this	uint	index	undefined4	mat
++0x00154540	func	uint	default	notinline	nofixup	CMGameGL::setTextureTransform	CMGameGL *	this	uint	index	D3DMATRIX *	mat
++0x001548e0	func	undefined	__stdcall	notinline	nofixup	CMGameGL::getSomeBoolFromArray	CMGameGL *	this	uint	index
+ 0x00154ae0	func	undefined	unknown	notinline	nofixup	unsetTexture
+ 0x00154b00	func	BOOL	__stdcall	notinline	nofixup	someTextureArrayItemIsVolumeTexture	uint	index
+-0x00154b20	func	void	__thiscall	notinline	nofixup	GraphicsCOM::freeSomeTextureArray
++0x00154b20	func	void	__thiscall	notinline	nofixup	CMGameGL::freeSomeTextureArray
+ 0x00154c10	func	undefined	unknown	notinline	nofixup	ROUND	undefined4	x
+-0x00154c20	func	void	__thiscall	notinline	nofixup	GraphicsCOM::resetPerfCounters
+-0x00154c30	func	void	__thiscall	notinline	nofixup	GraphicsCOM::calculatePerformance
+-0x00154cf0	func	uint	__stdcall	notinline	nofixup	GraphicsCOM::getPerfCounters	GraphicsCOM *	this	GraphicsPerformanceCounters *	out
+-0x00155150	func	DWORD	__stdcall	notinline	nofixup	GraphicsCOM::getManyThings	GraphicsCOM *	this	GraphicsCOMThingType	type	void *	outOrIndex
+-0x00155540	func	undefined	__stdcall	notinline	nofixup	GraphicsCOM::releaseSomething	GraphicsCOM *	this	undefined4	param_2
+-0x00155a60	func	undefined	unknown	notinline	nofixup	GraphicsCOM::getCapabilities
++0x00154c20	func	void	__thiscall	notinline	nofixup	CMGameGL::resetPerfCounters
++0x00154c30	func	void	__thiscall	notinline	nofixup	CMGameGL::calculatePerformance
++0x00154cf0	func	uint	__stdcall	notinline	nofixup	CMGameGL::getPerfCounters	CMGameGL *	this	SGraphicsPerformanceCounters *	out
++0x00154d70	func	uint	__stdcall	notinline	nofixup	CMGameGL::ImportLibrary	undefined4	this	undefined4	which	void *	out
++0x00154dc0	func	void *	__stdcall	notinline	nofixup	CMGameGL::ExportLibrary	CMGameGL *	this	uint	which
++0x00154e00	func	uint	__thiscall	notinline	nofixup	CMGameGL::InitializeLibraries	tag_MGLCLASS *	param_1
++0x00155150	func	DWORD	__stdcall	notinline	nofixup	CMGameGL::getManyThings	CMGameGL *	this	GraphicsCOMThingType	type	void *	outOrIndex
++0x00155380	func	HRESULT	__stdcall	notinline	nofixup	CMGameGL::Initialize	CMGameGL *	this	tag_MGLCLASS *	lpParams
++0x00155540	func	undefined	__stdcall	notinline	nofixup	CMGameGL::releaseSomething	CMGameGL *	this	undefined4	param_2
++0x00155a60	func	undefined	unknown	notinline	nofixup	CMGameGL::getCapabilities
+ 0x001560c0	func	undefined	__stdcall	notinline	nofixup	scalePack	D3DVECTOR *	v
+ 0x00156120	func	undefined	__fastcall	notinline	nofixup	unpack3Scaled	D3DVECTOR *	out	undefined4	packed
+ 0x001564a0	func	undefined	unknown	notinline	nofixup	nop
+ 0x00156d60	func	HRESULT	__stdcall	notinline	nofixup	UnknownCOM::QueryInterface	UnknownCOM *	this	IID *	riid	void * *	ppvObject
+ 0x00156dc0	func	ULONG	__stdcall	notinline	nofixup	UnknownCOM::Release	UnknownCOM *	this
+-0x00156df0	func	HRESULT	default	notinline	nofixup	createUnknownCOM	GraphicsCOM *	graphics	UnknownCOM * *	out
++0x00156df0	func	HRESULT	default	notinline	nofixup	createUnknownCOM	CMGameGL *	graphics	UnknownCOM * *	out
+ 0x001576f0	func	ULONG	__stdcall	notinline	nofixup	AddRef	undefined *	this
+ 0x001577c0	func	undefined	unknown	notinline	nofixup	QueryInterface	undefined4	param_1	undefined4	param_2	undefined4	param_3
+ 0x001579a0	func	ULONG	unknown	notinline	nofixup	Release	undefined4	this
+@@ -1001,45 +1039,53 @@
+ 0x0019e0e0	data	DWORD[146]	D3D8::D3D__RenderState
+ 0x001a5299	func	undefined	unknown	notinline	nofixup	initUnknownStatic49
+ 0x001a52a4	func	undefined	unknown	notinline	nofixup	initUnknownStatic50
+-0x001ba8a0	func	void	__cdecl	notinline	nofixup	MMATRIX::setIdentity
+-0x001ba8f0	func	void	__fastcall	notinline	nofixup	MMATRIX::load	Mat4 *	in
+-0x001ba950	func	void	__fastcall	notinline	nofixup	MMATRIX::store	Mat4 *	out
+-0x001ba9b0	func	Mat4 *	__cdecl	notinline	nofixup	MMATRIX::getHead
+-0x001ba9c0	func	void	__cdecl	notinline	nofixup	MMATRIX::dup
+-0x001baa00	func	void	__cdecl	notinline	nofixup	MMATRIX::pushIdentity
+-0x001baa50	func	Mat4 *	__cdecl	notinline	nofixup	MMATRIX::pop
++0x001ba8a0	func	void	__cdecl	notinline	nofixup	IdentityMatrix
++0x001ba8f0	func	void	__fastcall	notinline	nofixup	LoadMatrix	float *	in
++0x001ba950	func	void	__fastcall	notinline	nofixup	StoreMatrix	float *	out
++0x001ba9b0	func	float *	__cdecl	notinline	nofixup	GetCurrentMatrixPointer
++0x001ba9c0	func	void	__cdecl	notinline	nofixup	PushMatrix
++0x001baa00	func	void	__cdecl	notinline	nofixup	PushIdentityMatrix
++0x001baa50	func	float *	__cdecl	notinline	nofixup	PopMatrix
+ 0x001baa60	func	void	__cdecl	notinline	nofixup	MMATRIX::applyIntoTranslation	float	x	float	y	float	z
+ 0x001baaa0	func	void	__fastcall	notinline	nofixup	MMATRIX::applyIntoTranslation	D3DVECTOR *	v
+ 0x001bab20	func	void	__fastcall	notinline	nofixup	MMATRIX::applyOrTranslation	D3DVECTOR *	out	D3DVECTOR *	v
+-0x001bac00	func	void	__fastcall	notinline	nofixup	MMATRIX::apply	D3DVECTOR *	out	D3DVECTOR *	v
+-0x001bac50	func	void	__fastcall	notinline	nofixup	MMATRIX::rotate3D	int *	angles
++0x001bac00	func	void	__fastcall	notinline	nofixup	TransformNormal	float *	out	float *	v
++0x001bac50	func	void	__fastcall	notinline	nofixup	RotateCoord	int *	angles
++0x001bac70	func	void	__fastcall	notinline	nofixup	Rotate_MAYBE	tag_MGLROTATE *	angles
+ 0x001badb0	func	void	__fastcall	notinline	nofixup	MMATRIX::applyTo	Mat4 *	m
+ 0x001bae90	func	void	__fastcall	notinline	nofixup	MMATRIX::apply	Mat4 *	m
+-0x001bb230	func	void	__cdecl	notinline	nofixup	MMATRIX::scaleCols	float	x	float	y	float	z
+-0x001bb270	func	void	__fastcall	notinline	nofixup	MMATRIX::scaleCols	D3DVECTOR *	v
+-0x001bb2b0	func	void	__cdecl	notinline	nofixup	MMATRIX::scale	float	a
+-0x001bb2e0	func	void	__fastcall	notinline	nofixup	MMATRIX::rotateYZ	int	angle
+-0x001bb330	func	void	__fastcall	notinline	nofixup	MMATRIX::rotateXZ	int	angle
+-0x001bb380	func	void	__fastcall	notinline	nofixup	MMATRIX::rotateXY	int	angle
+-0x001bb3d0	func	void	__cdecl	notinline	nofixup	MMATRIX::setIdentitySansTranslation
+-0x001bb410	func	void	__fastcall	notinline	nofixup	MMATRIX::getTranslation	D3DVECTOR *	out
+-0x001bb430	func	void	__fastcall	notinline	nofixup	MMATRIX::setTranslation	D3DVECTOR *	v
+-0x001bb5e0	func	void	__cdecl	notinline	nofixup	MMATRIX::transpose
+-0x001bb690	func	uint	__cdecl	notinline	nofixup	MMATRIX::initMatrices	uint	count
+-0x001bb720	func	void	__cdecl	notinline	nofixup	MMATRIX::freeMatrices
+-0x001bb960	func	void	__cdecl	notinline	nofixup	MMATRIX::scaleCol1	float	a
+-0x001bb980	func	void	__cdecl	notinline	nofixup	MMATRIX::scaleCol2	float	a
+-0x001bb9a0	func	void	__cdecl	notinline	nofixup	MMATRIX::scaleCol3	float	a
++0x001baf70	func	void	__fastcall	notinline	nofixup	LookAt	D3DVECTOR *	param_1	D3DVECTOR *	param_2	int	angle
++0x001bb230	func	void	__cdecl	notinline	nofixup	Scale	float	x	float	y	float	z
++0x001bb270	func	void	__fastcall	notinline	nofixup	ScaleCoord	D3DVECTOR *	v
++0x001bb2b0	func	void	__cdecl	notinline	nofixup	ProportionalScale	float	a
++0x001bb2e0	func	void	__fastcall	notinline	nofixup	RotateX	int	angle
++0x001bb330	func	void	__fastcall	notinline	nofixup	RotateY	int	angle
++0x001bb380	func	void	__fastcall	notinline	nofixup	RotateZ	int	angle
++0x001bb3d0	func	void	__cdecl	notinline	nofixup	IdentityRotate
++0x001bb410	func	void	__fastcall	notinline	nofixup	GetTranslate	float *	out
++0x001bb430	func	void	__fastcall	notinline	nofixup	SetTranslate	float *	v
++0x001bb5e0	func	void	__cdecl	notinline	nofixup	TransposeMatrix
++0x001bb630	func	void	__stdcall	notinline	nofixup	TranslateX	float	param_1
++0x001bb650	func	void	__cdecl	notinline	nofixup	TranslateY	float	param_1
++0x001bb670	func	void	__cdecl	notinline	nofixup	TranslateZ	float	param_1
++0x001bb690	func	uint	__cdecl	notinline	nofixup	MMatrix_Initialize	uint	count
++0x001bb720	func	void	__cdecl	notinline	nofixup	MMatrix_Uninitialize
++0x001bb750	func	uint *	__cdecl	notinline	nofixup	MMatrix_ExportLibrary
++0x001bb780	func	uint	__cdecl	notinline	nofixup	MMatrix_ImportLibrary	SMMatrixExport *	lib
++0x001bb960	func	void	__cdecl	notinline	nofixup	ScaleX	float	a
++0x001bb980	func	void	__cdecl	notinline	nofixup	ScaleY	float	a
++0x001bb9a0	func	void	__cdecl	notinline	nofixup	ScaleZ	float	a
++0x001bb9c0	func	void	__cdecl	notinline	nofixup	GetRotationCoord	int *	param_1
+ 0x001bbac0	func	bool	__stdcall	notinline	nofixup	XGRPH::isDxt	D3DFORMAT	fmt
+ 0x001bd03b	func	undefined	__stdcall	notinline	nofixup	vector_constructor_iterator	void *	param_1	uint	param_2	undefined4	param_3	undefined4	param_4
+ 0x001bdaa9	func	undefined	unknown	notinline	nofixup	initUnknownStaticXPP
+ 0x001c4160	data	D3DDIRTYFLAG[54]	D3D8::D3DDIRTYFROMTEXTURESTATE
+ 0x001c4248	data	D3DSIMPLERENDERSTATEENCODE[82]	D3D8::D3DSIMPLERENDERSTATEENCODE
+-0x001c4390	data	GameObjVtbl	GameObj::`vftable'
+-0x001c43d8	data	GameObjVtbl	DrawTree::`vftable'
+-0x001c4418	data	GameObjVtbl	PlayerObj::`vftable'
+-0x001c4458	data	GameVtbl	Game::`vftable'
+-0x001c4480	data	undefined *	RootExecObj::`vftable'
++0x001c4390	data	CActBaseVtbl	CActBase::`vftable'
++0x001c43d8	data	CActBaseVtbl	CDrawBase::`vftable'
++0x001c4418	data	CActBaseVtbl	CPlayer::`vftable'
++0x001c4458	data	CActManVtbl	CActMan::`vftable'
++0x001c4480	data	undefined *	CActRoot::`vftable'
+ 0x001c4544	data	pointer	UnknownStatic02::vtable
+ 0x001c4558	data	float	2^32
+ 0x001c4580	data	undefined *	UnknownObj_0x1289::vtable
+@@ -1047,26 +1093,26 @@
+ 0x001c45c4	data	pointer	UnknownStatic05::vtable
+ 0x001c45c8	data	undefined *	CopSpawnView::vtable
+ 0x001c4ba8	data	undefined *	EventChild2::vtable
+-0x001c4c88	data	GameObjVtbl	EventChild1::`vftable'
++0x001c4c88	data	CActBaseVtbl	EventChild1::`vftable'
+ 0x001c4cc8	data	float	float(1/255)
+-0x001c4cd0	data	GameObjVtbl	Event::`vftable'
+-0x001c4d10	data	GameObjVtbl	UnknownObj_0x6::`vftable'
++0x001c4cd0	data	CActBaseVtbl	Event::`vftable'
++0x001c4d10	data	CActBaseVtbl	UnknownObj_0x6::`vftable'
+ 0x001c4d50	data	pointer	UnknownStatic06::`vftable'
+-0x001c4d58	data	GameObjVtbl	CacheBuilder_MAYBE::`vftable'
++0x001c4d58	data	CActBaseVtbl	CacheBuilder_MAYBE::`vftable'
+ 0x001c4f68	data	undefined *	FileManager::`vftable'
+ 0x001ca168	data	pointer	UnknownStatic07::vtable
+-0x001ca3d8	data	pointer	GameData::`vftable'
+-0x001ca440	data	GameObjVtbl	TextRenderer_MAYBE::`vftable'
++0x001ca3d8	data	pointer	CSaveData::`vftable'
++0x001ca440	data	CActBaseVtbl	TextRenderer_MAYBE::`vftable'
+ 0x001ca4c8	data	undefined *	MissionManagerChild_0xE7::vtable
+ 0x001ca508	data	undefined *	UnknownStatic09::vtable
+ 0x001ca5f0	data	undefined *	GraffitiSoulSpawnView_MAYBE::vtable
+ 0x001ca678	data	undefined *	PickupList::vtable
+ 0x001ca7d8	data	undefined *	EventChild1Child::vtable
+ 0x001caa8c	data	ProgressVtbl	Progress::`vftable'
+-0x001caab0	data	GameObjVtbl	Mission::`vftable'
+-0x001caaf8	data	GameObjVtbl	MissionManager::`vftable'
++0x001caab0	data	CActBaseVtbl	Mission::`vftable'
++0x001caaf8	data	CActBaseVtbl	MissionManager::`vftable'
+ 0x001cab98	data	undefined *	CharacterSelect::vtable
+-0x001caf70	data	pointer	COMManager_MAYBE::vtable
++0x001caf70	data	pointer	CMusashi::vtable
+ 0x001cb000	data	undefined *	MissionManagerChild_0xE8::vtable
+ 0x001cb094	data	pointer	UnknownStatic16::vtable
+ 0x001cb0a0	data	pointer	UnknownStatic17::vtable
+@@ -1085,25 +1131,25 @@
+ 0x001cc620	data	pointer	Timer::vtable
+ 0x001cc660	data	undefined *	UnknownObj_0x12B0::vtable
+ 0x001cc6a0	data	pointer	UnknownStatic27::vtable
+-0x001ccd18	data	GameObjVtbl	UnknownObj_0x1167_2::`vftable'
+-0x001ccde8	data	GameObjVtbl	UnknownObj_0x1167_1::vtable
+-0x001cce30	data	GameObjVtbl	DemoInitializer::vtable
+-0x001cceb8	data	GameObjVtbl	Director::`vftable'
+-0x001ccf78	data	GameObjVtbl	UnknownObj_0x1DF3::`vftable'
+-0x001ccfb8	data	GameObjVtbl	Opening::`vftable'
+-0x001ccff8	data	GameObjVtbl	SomePlayerStateChild::`vftable'
+-0x001cd0c0	data	GameObjVtbl	UnknownObj_0x50::`vftable'
+-0x001cd518	data	GameObjVtbl	PlayerCamera::vtable
++0x001ccd18	data	CActBaseVtbl	UnknownObj_0x1167_2::`vftable'
++0x001ccde8	data	CActBaseVtbl	UnknownObj_0x1167_1::vtable
++0x001cce30	data	CActBaseVtbl	DemoInitializer::vtable
++0x001cceb8	data	CActBaseVtbl	Director::`vftable'
++0x001ccf78	data	CActBaseVtbl	UnknownObj_0x1DF3::`vftable'
++0x001ccfb8	data	CActBaseVtbl	Opening::`vftable'
++0x001ccff8	data	CActBaseVtbl	SomePlayerStateChild::`vftable'
++0x001cd0c0	data	CActBaseVtbl	UnknownObj_0x50::`vftable'
++0x001cd518	data	CActBaseVtbl	PlayerCamera::vtable
+ 0x001cd560	data	float	g_cameraMinDist
+ 0x001cd564	data	float	g_cameraMaxDist
+-0x001cd570	data	GameObjVtbl	SomePlayerState::vtable
+-0x001cd5c8	data	GameObjVtbl	MissionManagerChild_0xB::vtable
++0x001cd570	data	CActBaseVtbl	SomePlayerState::vtable
++0x001cd5c8	data	CActBaseVtbl	MissionManagerChild_0xB::vtable
+ 0x001d3878	data	FileMapping[56]	musicMapping
+ 0x001d3a38	data	FileMapping[623]	voiceLineMapping
+ 0x001d4db0	data	FileMapping[17]	soundEffectMapping
+ 0x001d76c8	data	undefined *	AdxManager::vtable
+ 0x001d7b20	data	undefined *	SoundManager::vtable
+-0x001da300	data	undefined *	UnknownObj_0x1DE2::vtable
++0x001da300	data	CActBaseVtbl	CGraffitiMenu::vtable
+ 0x001da350	data	undefined *	UnknownObj_0x1DE4::vtable
+ 0x001e0c2c	data	IMAGE_TLS_DIRECTORY32	extern_"C"::_tls_used
+ 0x001e0ea0	data	float	g_radToU16Angle1
+@@ -1111,12 +1157,12 @@
+ 0x001e0ea8	data	float	g_radToU16Angle3
+ 0x001e0ebc	data	float	epsilon_neg
+ 0x001e0ec0	data	float	epsilon_pos
+-0x001e0f00	data	GraphicsCOMVtbl	GraphicsCOM::vtable
+-0x001e1248	data	FontCOMVtbl	FontCOM::vtable
++0x001e0f00	data	CMGameGLVtbl	CMGameGL::vtable
++0x001e1248	data	CMGameGLFontVtbl	CMGameGLFont::vtable
+ 0x001e1270	data	GraphicsCOMChildVtbl	GraphicsCOMChild::vtable
+-0x001e1340	data	IID	FontCOM::iid
++0x001e1340	data	IID	CMGameGLFont::iid
+ 0x001e1350	data	IID	GraphicsCOMChild::iid
+-0x001e13e0	data	IID	GraphicsCOM::iid
++0x001e13e0	data	IID	CMGameGL::iid
+ 0x001e13f0	data	UnknownCOMVtbl	UnknownCOM::vtable
+ 0x001e144c	data	UnknownCOMChildVtbl	UnknownCOMChild::vtable
+ 0x001e16b8	data	IID	UnknownCOMChild::iid
+@@ -1145,7 +1191,7 @@
+ 0x001eb83c	data	pointer	__xc_z
+ 0x001eb840	data	voidFunc *	__xi_a
+ 0x001eb854	data	pointer	__xi_z
+-0x001eb880	data	DrawFuncArgs[15]	drawFuncArgs
++0x001eb880	data	SDrawFuncArgs[15]	drawFuncArgs
+ 0x001eb994	data	UnknownStatic02	g_unknownStatic02
+ 0x001ebaa8	data	UnknownStatic04	g_unknownStatic04
+ 0x001ebabc	data	UnknownStatic05	g_unknownStatic05
+@@ -1172,7 +1218,7 @@
+ 0x001efdc8	data	uint[40]	g_defaultSpawnedSouls
+ 0x001efe68	data	uint[4][5]	g_defaultSelectedTags
+ 0x001efeb8	data	char *[61]	g_unusedDebugStrings
+-0x001effb0	data	GameData	g_gameData
++0x001effb0	data	CSaveData	g_gameData
+ 0x001f8b30	data	float	someJaTextParameter
+ 0x001f8b58	data	float	someSpaceTextParameter
+ 0x001f8c38	data	int[286]	g_soullIdToStageIndex
+@@ -1180,7 +1226,7 @@
+ 0x001f9358	data	UnknownStatic13Part	g_unknownStatic13PartDefault
+ 0x001f93c8	data	UnknownStatic13	g_unknownStatic13
+ 0x001f9640	data	UnknownStatic13Part *	g_unchangingUnknownStatic3Ptr
+-0x001f9808	data	PlayerCharId[32]	charIds
++0x001f9808	data	ePLAYERCHARID[32]	charIds
+ 0x001f9888	data	SwitcherMethod *[119]	Mission::execDefaultFuncs
+ 0x001f9a68	data	SwitcherMethod *[119]	Mission::exec_5Funcs
+ 0x001f9c48	data	SwitcherMethod *[119]	Mission::exec_3Funcs
+@@ -1198,7 +1244,7 @@
+ 0x001fbb7c	data	undefined *	ioMessagesJa
+ 0x001fbbb8	data	undefined *	ioMessagesEn
+ 0x001fbca8	data	char * *[5]	ioMessages
+-0x001fbcc0	data	GraphicsSetting[19][5]	GraphicsSettings::g_graphicsSettingsSource
++0x001fbcc0	data	SGraphicsSetting[19][5]	GraphicsSettings::g_graphicsSettingsSource
+ 0x001fc724	data	Language	g_language
+ 0x0020c6c0	data	UnknownStatic22	g_unknownStatic22
+ 0x0020c750	data	UnknownGlobal	g_unknownGlobal
+@@ -1230,7 +1276,7 @@
+ 0x0021c234	data	uint[5]	tagIdsPoisonJam
+ 0x0021c248	data	uint[5]	tagIdsImmortals
+ 0x0021c25c	data	uint[5]	tagIdsZeroBeat
+-0x0021c450	data	PlayerCharId[24]	someCharIdArray
++0x0021c450	data	ePLAYERCHARID[24]	someCharIdArray
+ 0x0021c510	data	EvCharId[24]	someCharIdMapping
+ 0x0021c570	data	char *[5]	hasJoinedYou
+ 0x0021c584	data	undefined *	testRunRankNamesJa
+@@ -1267,7 +1313,7 @@
+ 0x0022e004	data	OBJECT_STRING	extern_"C"::TitleData
+ 0x0022e00c	data	OBJECT_STRING	extern_"C"::UDrive
+ 0x0022e014	data	OBJECT_STRING	extern_"C"::UserData
+-0x0022e58c	data	uint	g_iRng
++0x0022e58c	data	uint	g_dwRandom
+ 0x0022e6ac	data	float	g_someMin
+ 0x0022e6b0	data	float	g_someMax
+ 0x0022e700	data	D3DMATRIX	g_identityMatrix
+@@ -1275,20 +1321,20 @@
+ 0x0022ed54	data	pointer	__cfltcvt_tab
+ 0x0022ed5c	data	pointer	__cfltcvt
+ 0x0022eeb8	data	PRTL_CRITICAL_SECTION[8]	g_criticalSections
+-0x0022fce0	data	Game *	g_game
+-0x0022fce8	data	CollisionManager	g_collisionManager
++0x0022fce0	data	CActMan *	g_lpActMan
++0x0022fce8	data	CSysColiManager	g_collisionManager
+ 0x002314b0	data	UnknownStatic09	g_unknownStatic09
+-0x00231d40	data	GenericScratch	g_genericScratch
++0x00231d40	data	ScratchPad	g_scratchPad
+ 0x00251d40	data	uint	g_objectCount
+ 0x00251d44	data	DWORD	g_textureOps
+ 0x00251d54	data	int[4]	g_texIndexPerStage
+ 0x00251d64	data	ControllerCOM_MAYBE *	g_controllerCOM_MAYBE
+-0x00251d68	data	FontCOM *	g_timesNewRoman
+-0x00251d6c	data	GraphicsCOM *	g_graphics
++0x00251d68	data	CMGameGLFont *	g_timesNewRoman
++0x00251d6c	data	CMGameGL *	g_pMGameGLInterface
+ 0x00251d70	data	GraphicsCOMChild *	g_graphicsCOMChild
+ 0x00251d74	data	UnknownCOM *	g_unknownCOM
+ 0x00251d78	data	UnknownCOMChild *	g_unknownCOMChild
+-0x00251d7c	data	COMManager_MAYBE *	g_comManager_MAYBE
++0x00251d7c	data	CMusashi *	g_lpMusashi
+ 0x00251d80	data	DWORD	g_specularEnable
+ 0x00251d84	data	BOOL	g_fogEnable
+ 0x00251d88	data	int	g_texIndex
+@@ -1297,7 +1343,7 @@
+ 0x00251f20	data	uint	g_activeController_MAYBE
+ 0x00251f24	data	undefined4	g_loadingScreen
+ 0x00251f28	data	FRNG	g_fRng
+-0x00251f5c	data	GraphicsSettings	g_graphicsSettings
++0x00251f5c	data	SGraphicsSettings	g_graphicsSettings
+ 0x00251f78	data	UnknownStatic24	g_unknownStatic24
+ 0x00252790	data	UnknownStatic25	g_unknownStatic25
+ 0x002588f0	data	char[121]	g_voiceLinePathBuf
+@@ -1310,11 +1356,17 @@
+ 0x0026174c	data	adxerr_func *	CRI::lsc_err_func
+ 0x00261750	data	void *	CRI::lsc_err_obj
+ 0x00264850	data	int	extern_"C"::_tls_index
+-0x00264ba4	data	SinCos *	g_sinCosTable
+-0x00264bac	data	SinCos *	g_ptrToSinCosTable
++0x00264ba4	data	SinCos *	s_lpSinCosTable
++0x00264ba8	data	uint	g_dwMMathVersion
++0x00264bac	data	SinCos *	g_lpSinCosTable
+ 0x00264bb4	data	float[8]	g_floatResults
+-0x00264c04	data	Mat4 * *	g_matricesHead
+-0x00264c08	data	Mat4 *[3]	g_matrices
++0x00264bf8	data	uint	g_dwMMatrixVersion
++0x00264bfc	data	Mat4 * *	g_lpCurrentMatrix
++0x00264c00	data	Mat4 *	g_matrices
++0x00264c04	data	Mat4 * *	s_lplpCurrentMatrix
++0x00264c08	data	Mat4 *	s_lpMatrixStackBase
++0x00264c0c	data	Mat4 *	s_lpMatrixStackAllocation
++0x00264c10	data	Mat4 *	s_lpMatrixStackHead
+ 0x00264c14	data	D3DCOLOR	g_clearColour
+ 0x00264ca0	data	D3DLIGHT8	g_lighting
+ 0x00264d28	data	D3DCOLORVALUE	g_diffuseLightRGB
+@@ -1322,7 +1374,7 @@
+ 0x00264d48	data	D3DMATERIAL8 *	g_material
+ 0x00264d54	data	D3DVECTOR4	g_diffuseVertexData
+ 0x00264d64	data	BOOL	g_reverseCull
+-0x00264d68	data	char[256]	FontCOM::g_buf
++0x00264d68	data	char[256]	CMGameGLFont::g_buf
+ 0x00264e68	data	D3DGAMMARAMP *	g_gammaRamp
+ 0x00264ed0	data	D3DVIEWPORT8	g_viewport
+ 0x00264ee8	data	float	g_someHomogeneousScalingFactorX

@@ -1,0 +1,17 @@
+QWEN WORKER RULES
+
+1. Work on one task only. Never perform NEXT SINGLE STEP.
+2. Use only files/directories permitted by the active task.
+3. Use the restricted jsrf_* tools only.
+4. Respect mechanical denials. Never work around them.
+5. Prefer direct measurement over prolonged inference.
+6. Never investigate or fix adjacent problems.
+7. A bounded BLOCKED result is a successful outcome.
+8. Finish with exactly one terminal status: DONE, BLOCKED, or FAILED.
+
+Research beyond the decision boundary is failure.
+
+
+ACTIVE TASK
+
+Synthetic harness validation only. Do not inspect JSRF source.

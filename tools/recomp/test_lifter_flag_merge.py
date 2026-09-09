@@ -10,7 +10,7 @@ even though the static operand objects differ.
 import unittest
 
 from .disasm import BasicBlock, Instruction, Operand
-from .lifter import Lifter, lift_basic_block
+from .lifter import Lifter, lift_basic_block, _make_condition, MERGED_COMPARE_ZF
 from .translator import _merge_predecessor_flag_states
 
 
@@ -46,14 +46,15 @@ class FlagMergeLifterTest(unittest.TestCase):
             "if (CMP_LE(_fas, _fbs)) goto loc_0013D3FB;", generated)
         self.assertNotIn("_flags", generated)
 
-    def test_incompatible_flag_setters_remain_unknown(self):
+    def test_mixed_compare_setters_expose_only_zf(self):
         incoming = _merge_predecessor_flag_states([
             _cmp_state("eax", "edx"),
             ("test", [Operand(type="reg", reg="eax"),
                       Operand(type="reg", reg="eax")]),
         ])
 
-        self.assertIsNone(incoming)
+        self.assertEqual(incoming, (MERGED_COMPARE_ZF, []))
+        self.assertIsNone(_make_condition("jle", *incoming))
 
     def test_different_snapshot_widths_remain_unknown(self):
         incoming = _merge_predecessor_flag_states([

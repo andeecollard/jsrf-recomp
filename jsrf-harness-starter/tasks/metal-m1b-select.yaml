@@ -1,0 +1,53 @@
+id: metal-m1b-select
+type: CLASSIFY
+objective: "Select the simplest first Metal draw candidate from the bounded M1A capture only."
+
+allowed_files:
+  - QWEN_METAL_M1A_CAPTURE.md
+
+allowed_write_files:
+  - QWEN_METAL_M1B_CANDIDATE.md
+
+required_artifacts:
+  - QWEN_METAL_M1B_CANDIDATE.md
+
+budgets:
+  search_budget: 0
+  read_budget_lines: 300
+  tool_budget: 4
+  token_budget: 12000
+
+success_checks:
+  - artifact_exists: QWEN_METAL_M1B_CANDIDATE.md
+  - artifact_contains: "SELECTED"
+  - artifact_contains: "WHY"
+  - artifact_contains: "NEXT SINGLE STEP"
+
+worker_instructions: |
+  Read only QWEN_METAL_M1A_CAPTURE.md.
+  Do not inspect source, logs, build directories, video/decomp, or presentation code.
+  Do not run JSRF.
+  Do not edit renderer code.
+
+  Compare only the successfully captured batches.
+  Prefer, in order:
+  1. mode=2 / already transformed if present and successful
+  2. triangles
+  3. no texture or one simple texture
+  4. opaque / blending disabled
+  5. simple depth state
+  6. simple culling
+  7. fog/stencil disabled
+  8. smallest observed state surface
+
+  Choose ONE candidate. If capture data is insufficient to distinguish candidates, STOP as BLOCKED and name the exact missing field. Do not search for it.
+
+  Create QWEN_METAL_M1B_CANDIDATE.md with:
+  SELECTED
+  WHY
+  OBSERVED STATE
+  MISSING STATE
+  NEXT SINGLE STEP
+
+  NEXT SINGLE STEP must be:
+  Define the decoded-state interface required to hand this exact batch to a minimal Metal rasterisation backend.

@@ -1,0 +1,21 @@
+{
+  "allowed_files": [
+    "jsrf-harness-starter-v2/tests/fixtures/src/"
+  ],
+  "allowed_write_files": [
+    "jsrf-harness-starter-v2/tests/fixtures/evidence/result.txt"
+  ],
+  "budgets": {
+    "build_budget": 0,
+    "files_read_budget": 2,
+    "read_budget_lines": 20,
+    "runtime_budget": 0,
+    "search_budget": 2,
+    "tool_budget": 10,
+    "write_budget": 1
+  },
+  "id": "synthetic-enforcement",
+  "prompt": "Synthetic harness validation only. Do not inspect JSRF source.",
+  "required_artifacts": [],
+  "type": "VALIDATE"
+}

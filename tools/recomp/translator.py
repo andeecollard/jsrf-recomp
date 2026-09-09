@@ -11,6 +11,7 @@ For each function:
 Produces compilable C code using recomp_types.h macros.
 """
 
+from collections import deque
 import bisect
 import json
 import glob
@@ -24,7 +25,7 @@ from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _operand_width, _fmt_operand_read,
-                     _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER)
+                     _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER, MERGED_COMPARE_ZF, advance_flag_state)
 
 
 def _merge_predecessor_flag_states(states):
@@ -57,7 +58,9 @@ def _merge_predecessor_flag_states(states):
     take a dead `_flags` fallback for its `je` at 0x001404F1 and report
     "E0109152:illegal seek position." for every read the title issued.
 
-    The join answers ZF and SF only.  CF and OF genuinely differ between these
+    The destination-writing join answers ZF and SF only. Mixed CMP/TEST
+    joins instead publish a separate zero-flag snapshot and expose ZF only,
+    including when operand widths differ. CF and OF differ between these
     setters, so a jcc needing either still falls back rather than picking one
     predecessor's answer.
     """
@@ -85,6 +88,11 @@ def _merge_predecessor_flag_states(states):
         # actually executed.
         return first
 
+    # CMP and TEST disagree on other flags, but each can publish ZF after
+    # width masking. Never expose that partial state to CF/SF/OF consumers.
+    if setters == {"cmp", "test"} and all(len(state[1]) >= 2 for state in states):
+        return (MERGED_COMPARE_ZF, [])
+
     # A destination-writing join.  The destination is compared by the C
     # expression that reads it and by its width, so `and eax, m` and `inc eax`
     # merge while `and eax, m` and `inc ecx` do not.
@@ -105,6 +113,63 @@ def _merge_predecessor_flag_states(states):
     # Only the destination survives: the other operand belonged to whichever
     # predecessor ran, and no ZF/SF condition reads it.
     return (MERGED_RESULT_SETTER, [first[1][0]])
+
+
+def _analyze_block_flag_states(blocks, preds, entry):
+    """Propagate reaching flag definitions to a fixed point before emission.
+
+    Empty sets mean not visited yet; {None} means genuinely unknown flags.
+    Keeping these distinct lets loops converge without inventing a flag state
+    at entry. Definitions are block IDs, so unions are finite and monotone.
+    Only after convergence do we merge their semantic states; incompatible
+    width combinations retain the conservative fallback; mixed CMP/TEST
+    definitions expose only their explicitly captured ZF.
+    """
+    preserve = object()
+    transfers = {}
+    for bb in blocks:
+        state = preserve
+        for insn in bb.instructions:
+            state = advance_flag_state(insn, state)
+        transfers[bb.start] = state
+
+    successors = {bb.start: set() for bb in blocks}
+    for target, sources in preds.items():
+        for source in sources:
+            successors[source].add(target)
+    incoming = {bb.start: set() for bb in blocks}
+    outgoing = {bb.start: set() for bb in blocks}
+    pending = deque(bb.start for bb in blocks)
+    queued = set(pending)
+    while pending:
+        address = pending.popleft()
+        queued.remove(address)
+        reached = {None} if address == entry or not preds[address] else set()
+        for source in preds[address]:
+            reached.update(outgoing[source])
+        incoming[address] = reached
+        transfer = transfers[address]
+        if not reached:
+            result = set()
+        elif transfer is preserve:
+            result = reached
+        else:
+            result = {address if transfer is not None else None}
+        if result != outgoing[address]:
+            outgoing[address] = result
+            for target in sorted(successors[address]):
+                if target not in queued:
+                    queued.add(target)
+                    pending.append(target)
+
+    states = {}
+    for address, definitions in incoming.items():
+        if not definitions or None in definitions:
+            states[address] = None
+        else:
+            states[address] = _merge_predecessor_flag_states(
+                [transfers[source] for source in sorted(definitions)])
+    return states
 
 
 def _fixup_icall_esp_save(lines):
@@ -765,6 +830,162 @@ class FunctionTranslator:
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
 
+    def _inline_flag_continuation(self, start, end, instructions):
+        """Keep a split CMP/TEST and its first consumer in one C frame.
+
+        Only exactly decoded prefixes without diverging control flow qualify;
+        returned calls may precede a later producer. Retain every original
+        entry in the database for independent calls; this merely duplicates
+        the bounded continuation on its proven fallthrough path. No
+        runtime-global flags can leak into an unrelated call this way.
+        """
+        def straight(insn):
+            return not (insn.is_branch or insn.is_call or insn.is_ret
+                        or insn.mnemonic in ("int", "int3", "ud2", "hlt"))
+
+        def exact(insns, lo, hi):
+            cursor = lo
+            for insn in insns:
+                if insn.address != cursor:
+                    return False
+                cursor = insn.end_address
+            return cursor == hi
+
+        def chained_fallthrough_state(insns, incoming, lo, hi):
+            """Return a fresh final CMP/TEST on the unique fallthrough path.
+
+            Conditional exits outside this fragment are harmless: their taken
+            paths do not reach the next adjacent entry. A branch into this
+            fragment or directly to its end would create another predecessor,
+            so decline it rather than merging flag states here.
+            """
+            result = incoming
+            for insn in insns:
+                if (insn.is_ret or insn.mnemonic in
+                        ("jmp", "int", "int3", "ud2", "hlt")):
+                    return None
+                if insn.is_branch:
+                    target = insn.jump_target
+                    if target is None or lo <= target <= hi:
+                        return None
+                result = advance_flag_state(insn, result)
+            if result is None or result[0] not in ("cmp", "test"):
+                return None
+            return result
+
+        if not exact(instructions, start, end):
+            return end, instructions, set()
+
+        # The adjacent entry is reached only by falling off the last block.
+        # Earlier conditional control flow is safe when ordinary CFG analysis
+        # proves the state on that fallthrough; direct branches to the boundary
+        # would be alternate predecessors and remain outside this mechanism.
+        # Unconditional transfers and traps retain the original rejection.
+        instruction_addresses = {insn.address for insn in instructions}
+        for insn in instructions:
+            if (insn.is_ret or insn.mnemonic in
+                    ("jmp", "int", "int3", "ud2", "hlt")):
+                return end, instructions, set()
+            if insn.is_branch:
+                target = insn.jump_target
+                if target is None or target == end:
+                    return end, instructions, set()
+                if start <= target < end and target not in instruction_addresses:
+                    return end, instructions, set()
+
+        prefix_blocks = self.disasm.build_basic_blocks(instructions, start, end)
+        if not prefix_blocks:
+            return end, instructions, set()
+        prefix_preds = {bb.start: set() for bb in prefix_blocks}
+        prefix_successors = {bb.start: set() for bb in prefix_blocks}
+        for index, bb in enumerate(prefix_blocks):
+            last = bb.instructions[-1] if bb.instructions else None
+            if last is None:
+                continue
+            if last.jump_target in prefix_preds:
+                prefix_preds[last.jump_target].add(bb.start)
+                prefix_successors[bb.start].add(last.jump_target)
+            leaves = last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt")
+            if not leaves and index + 1 < len(prefix_blocks):
+                target = prefix_blocks[index + 1].start
+                prefix_preds[target].add(bb.start)
+                prefix_successors[bb.start].add(target)
+
+        reachable = {start}
+        pending = deque([start])
+        while pending:
+            for target in prefix_successors[pending.popleft()]:
+                if target not in reachable:
+                    reachable.add(target)
+                    pending.append(target)
+        final_block = prefix_blocks[-1]
+        if final_block.start not in reachable:
+            return end, instructions, set()
+        prefix_inputs = _analyze_block_flag_states(
+            prefix_blocks, prefix_preds, start)
+        for bb in prefix_blocks:
+            consumer_state = prefix_inputs[bb.start]
+            for insn in bb.instructions:
+                uses = ((insn.is_cond_jump and insn.mnemonic not in
+                         ("jecxz", "jcxz", "loop", "loope", "loopne"))
+                        or insn.mnemonic.startswith(("set", "cmov")))
+                if uses and consumer_state is None:
+                    # Do not use a later producer to legitimize a fragment
+                    # that already consumes unknown entry/path flags.
+                    return end, instructions, set()
+                consumer_state = advance_flag_state(insn, consumer_state)
+        state = prefix_inputs[final_block.start]
+        for insn in final_block.instructions:
+            state = advance_flag_state(insn, state)
+        if state is None or state[0] not in ("cmp", "test"):
+            return end, instructions, set()
+
+        original_end = end
+        expanded = list(instructions)
+        entries = set()
+        for _ in range(8):
+            target = self.func_db.get(end)
+            if (target is None or end in self.owned_function_starts
+                    or end in self._recovered_cfg
+                    or end in self.lifter.manual_functions):
+                break
+            next_end = target.get("end") or end + target.get("size", 0)
+            if next_end <= end or next_end - start > 0x4000:
+                break
+            raw = self._read_func_bytes(end, next_end)
+            following = self.disasm.disassemble_function(raw, end, next_end) if raw else []
+            if not following or not exact(following, end, next_end):
+                break
+            consumed = False
+            for insn in following:
+                # jcxz/loop read counters rather than solely EFLAGS; do not
+                # use them as evidence for a flag-preserving continuation.
+                uses = ((insn.is_cond_jump and insn.mnemonic not in
+                         ("jecxz", "jcxz", "loop", "loope", "loopne"))
+                        or insn.mnemonic.startswith(("set", "cmov")))
+                if uses:
+                    consumed = True
+                    break
+                if not straight(insn):
+                    return original_end, instructions, set()
+                new_state = advance_flag_state(insn, state)
+                if new_state is not state:
+                    # A new setter or clobber makes incoming flags irrelevant
+                    # to this fragment. Keep any earlier continuation whose
+                    # consumer was already proved, but stop before this one.
+                    return end, expanded, entries
+            entries.add(end)
+            expanded.extend(following)
+            end = next_end
+            if consumed:
+                next_state = chained_fallthrough_state(
+                    following, state, start, next_end)
+                if next_state is not None:
+                    state = next_state
+                    continue
+                return end, expanded, entries
+        return original_end, instructions, set()
+
     def translate_function(self, func_addr, func_info):
         """
         Translate a single function to C code.
@@ -798,8 +1019,17 @@ class FunctionTranslator:
         if not instructions:
             return None
 
+        continuation_entries = set()
+        if recovered is None:
+            end, instructions, continuation_entries = self._inline_flag_continuation(
+                start, end, instructions)
+            if continuation_entries:
+                size = end - start
+                raw_bytes = self._read_func_bytes(start, end)
+                self.lifter.func_end = end
+
         # Collect switch table targets as extra block leaders
-        switch_leaders = set()
+        switch_leaders = set(continuation_entries)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -908,6 +1138,39 @@ class FunctionTranslator:
             if insn.call_target and is_code_address(insn.call_target):
                 call_targets.add(insn.call_target)
 
+        # Which blocks can reach each block. Flag state has to follow control
+        # flow, not address order: an optimising compiler routinely lets a jcc
+        # consume a `cmp` from a block that is not its immediate predecessor in
+        # memory. Threading the state linearly then hands that jcc the flags of
+        # whatever instruction happens to sit above it -- silently, and with a
+        # perfectly plausible-looking condition.
+        preds = {bb.start: set() for bb in blocks}
+        for i, bb in enumerate(blocks):
+            last = bb.instructions[-1] if bb.instructions else None
+            if last is None:
+                continue
+            if last.jump_target in preds:
+                preds[last.jump_target].add(bb.start)
+            # A conditional jump also falls through; ret and an unconditional
+            # jmp do not.
+            leaves = last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt")
+            if not leaves and i + 1 < len(blocks):
+                preds[blocks[i + 1].start].add(bb.start)
+
+        flag_inputs = _analyze_block_flag_states(blocks, preds, start)
+        # Most mixed joins overwrite flags before reading them. Avoid adding
+        # snapshots to those functions: only a live equality consumer needs ZF.
+        self.lifter.needs_compare_zf = False
+        equality_consumers = {"je", "jz", "jne", "jnz", "sete", "setne",
+                              "cmove", "cmovne", "fcmove", "fcmovne"}
+        for bb in blocks:
+            state = flag_inputs[bb.start]
+            for insn in bb.instructions:
+                if (state and state[0] == MERGED_COMPARE_ZF
+                        and insn.mnemonic in equality_consumers):
+                    self.lifter.needs_compare_zf = True
+                state = advance_flag_state(insn, state)
+
         # All translated functions are void(void).
         # Arguments pass via the global simulated stack (push instructions).
         # Return values pass via g_eax (the global eax register).
@@ -921,6 +1184,9 @@ class FunctionTranslator:
         lines.append(f"/**")
         lines.append(f" * {name}")
         lines.append(f" * Original: 0x{start:08X} - 0x{end:08X} ({size} bytes, {len(instructions)} insns)")
+        if continuation_entries:
+            entries = ", ".join(f"0x{address:08X}" for address in sorted(continuation_entries))
+            lines.append(f" * Inlined flag continuation entries: {entries}")
         if category != "unknown":
             lines.append(f" * Category: {category}")
         if source_file:
@@ -986,6 +1252,9 @@ class FunctionTranslator:
                        for insn in instructions)
         if has_conditionals or has_xadd:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+
+        if self.lifter.needs_compare_zf:
+            lines.append("    int _zf = 0; /* proven mixed CMP/TEST joins only */")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -1062,26 +1331,6 @@ class FunctionTranslator:
                 for t in switch_targets:
                     label_addrs.add(t)
 
-        # Which blocks can reach each block. Flag state has to follow control
-        # flow, not address order: an optimising compiler routinely lets a jcc
-        # consume a `cmp` from a block that is not its immediate predecessor in
-        # memory. Threading the state linearly then hands that jcc the flags of
-        # whatever instruction happens to sit above it -- silently, and with a
-        # perfectly plausible-looking condition.
-        preds = {bb.start: set() for bb in blocks}
-        for i, bb in enumerate(blocks):
-            last = bb.instructions[-1] if bb.instructions else None
-            if last is None:
-                continue
-            if last.jump_target in preds:
-                preds[last.jump_target].add(bb.start)
-            # A conditional jump also falls through; ret and an unconditional
-            # jmp do not.
-            leaves = last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt")
-            if not leaves and i + 1 < len(blocks):
-                preds[blocks[i + 1].start].add(bb.start)
-
-        out_state = {}
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -1092,21 +1341,8 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = _merge_predecessor_flag_states(states)
-            else:
-                incoming = None
-
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
+            stmts, _ = lift_basic_block(
+                self.lifter, bb, flag_state=flag_inputs[bb.start])
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 

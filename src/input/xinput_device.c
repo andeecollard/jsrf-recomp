@@ -126,36 +126,82 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+static uint64_t g_last_controller_scan_ms;
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
-static void open_controllers(void)
+static uint64_t monotonic_ms(void)
 {
-    int slot = 0;
-    /* Say what was found, by name.
-     *
-     * This runs once and there is no hotplug, so a pad attached after launch
-     * is silently absent for the whole run -- and an absent pad is
-     * indistinguishable from a title that ignores input, which is exactly the
-     * question a session with a controller is trying to answer. One line at
-     * startup removes that ambiguity before anyone presses anything. */
-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static int controller_is_open(SDL_JoystickID instance)
+{
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        SDL_Joystick *joystick;
+        if (!g_pads[slot])
+            continue;
+        joystick = SDL_GameControllerGetJoystick(g_pads[slot]);
+        if (joystick && SDL_JoystickInstanceID(joystick) == instance)
+            return 1;
+    }
+    return 0;
+}
+
+/* Refresh controller membership at a bounded rate.  The old backend scanned
+ * only during startup, which made a controller connected after SDL's initial
+ * device snapshot permanently invisible to the title. */
+static void refresh_controllers(int force)
+{
+    uint64_t now = monotonic_ms();
+    int joystick_count;
+
+    if (!force && g_last_controller_scan_ms &&
+        now - g_last_controller_scan_ms < 250)
+        return;
+    g_last_controller_scan_ms = now;
+
+    SDL_GameControllerUpdate();
+
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if (g_pads[slot] && !SDL_GameControllerGetAttached(g_pads[slot])) {
+            fprintf(stderr, "  [PAD] port %d: %s (disconnected)\n", slot,
+                    SDL_GameControllerName(g_pads[slot]));
+            SDL_GameControllerClose(g_pads[slot]);
+            g_pads[slot] = NULL;
+            g_controller_connected[slot] = FALSE;
+        }
+    }
+
+    joystick_count = SDL_NumJoysticks();
+    for (int i = 0; i < joystick_count; i++) {
+        SDL_JoystickID instance;
+        int slot;
+
         if (!SDL_IsGameController(i))
             continue;
-        if (!g_pads[slot]) {
-            g_pads[slot] = SDL_GameControllerOpen(i);
-            g_controller_connected[slot] = (g_pads[slot] != NULL);
-            fprintf(stderr, "  [PAD] port %d: %s (%s)\n", slot,
-                    g_pads[slot] ? SDL_GameControllerName(g_pads[slot])
-                                 : "open failed",
-                    g_pads[slot] ? "opened" : SDL_GetError());
-            fflush(stderr);
-        }
-        slot++;
+        instance = SDL_JoystickGetDeviceInstanceID(i);
+        if (instance < 0 || controller_is_open(instance))
+            continue;
+
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+            if (!g_pads[slot])
+                break;
+        if (slot == XBOX_MAX_CONTROLLERS)
+            break;
+
+        g_pads[slot] = SDL_GameControllerOpen(i);
+        g_controller_connected[slot] = (g_pads[slot] != NULL);
+        fprintf(stderr, "  [PAD] port %d: %s (%s)\n", slot,
+                g_pads[slot] ? SDL_GameControllerName(g_pads[slot])
+                             : "open failed",
+                g_pads[slot] ? "opened" : SDL_GetError());
+        fflush(stderr);
     }
-    if (!slot) {
+
+    if (force && !g_pads[0]) {
         fprintf(stderr, "  [PAD] no game controller attached (%d joystick(s)"
-                " seen); there is no hotplug, so attach before launching\n",
-                SDL_NumJoysticks());
+                " seen); waiting for hotplug\n", joystick_count);
         fflush(stderr);
     }
 }
@@ -164,7 +210,7 @@ void xbox_InputInit(void)
 {
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-    open_controllers();
+    refresh_controllers(1);
 }
 
 /* A pad that is present and pressing things, for bring-up without hardware.
@@ -217,6 +263,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         }
         return ERROR_SUCCESS;
     }
+
+    refresh_controllers(0);
 
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
@@ -290,6 +338,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    refresh_controllers(0);
     return g_controller_connected[dwPort];
 }
 
@@ -298,6 +347,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     (void)dwFlags;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
+    refresh_controllers(0);
     if (!g_pads[dwPort])
         return ERROR_DEVICE_NOT_CONNECTED;
 

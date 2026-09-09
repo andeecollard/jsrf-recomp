@@ -1,0 +1,59 @@
+0001520C -> 000153A9
+    _fa = (uint32_t)(HI8(eax)) & 0xFFu; _fb = (uint32_t)(1) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test HI8(eax), 1 (8-bit) */
+    _zf = ((_fa & _fb) == 0); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+0001527B -> 000153A9
+    _fa = (uint32_t)(HI8(eax)) & 0xFFu; _fb = (uint32_t)(1) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test HI8(eax), 1 (8-bit) */
+    _zf = ((_fa & _fb) == 0); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+000152BB -> 000153A9
+    _fa = (uint32_t)(HI8(eax)) & 0xFFu; _fb = (uint32_t)(1) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test HI8(eax), 1 (8-bit) */
+    _zf = ((_fa & _fb) == 0); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+00015311 -> 000153A9
+    _fa = (uint32_t)(MEM32(ebx + 0x10)) & 0xFFFFFFFFu; _fb = (uint32_t)(3) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp MEM32(ebx + 0x10), 3 (32-bit) */
+    _zf = (_fa == _fb); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+00015333 -> 000153A9
+    _fa = (uint32_t)(MEM32(ebx + 0x10)) & 0xFFFFFFFFu; _fb = (uint32_t)(4) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp MEM32(ebx + 0x10), 4 (32-bit) */
+    _zf = (_fa == _fb); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+00015356 -> 000153A9
+    _fa = (uint32_t)(MEM32(ebx + 0x10)) & 0xFFFFFFFFu; _fb = (uint32_t)(5) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp MEM32(ebx + 0x10), 5 (32-bit) */
+    _zf = (_fa == _fb); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+00015375 -> 000153A9
+    _fa = (uint32_t)(MEM32(ebx + 0x10)) & 0xFFFFFFFFu; _fb = (uint32_t)(6) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp MEM32(ebx + 0x10), 6 (32-bit) */
+    _zf = (_fa == _fb); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+000153A5 -> 000153A9
+    _fa = (uint32_t)(MEM32(ebx + 0x10)) & 0xFFFFFFFFu; _fb = (uint32_t)(7) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp MEM32(ebx + 0x10), 7 (32-bit) */
+    _zf = (_fa == _fb); /* CMP/TEST zero-flag snapshot */
+    if ((_zf == 0)) goto loc_000153BC; /* jne: not equal / not zero */
+
+000A1385 -> 000A13A1
+    _fa = (uint32_t)(MEM32(esi + 0xE6C)) & 0xFFFFFFFFu; _fb = (uint32_t)(edi) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp MEM32(esi + 0xE6C), edi (32-bit) */
+    _zf = (_fa == _fb); /* CMP/TEST zero-flag snapshot */
+    if ((_zf != 0)) goto loc_000A13CF; /* je: equal / zero */
+
+000A139C -> 000A13A1
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fb = (uint32_t)(0x80000) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* test eax, 0x80000 (32-bit) */
+    _zf = ((_fa & _fb) == 0); /* CMP/TEST zero-flag snapshot */
+    if ((_zf != 0)) goto loc_000A13CF; /* je: equal / zero */

@@ -1,5 +1,8 @@
 /* Input is packed by replay_texture_copy.py, never a dumped host C struct. */
 #include "nv2a_texture_copy.h"
+#ifdef __APPLE__
+#include "nv2a_metal.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +37,13 @@ int main(int argc,char **argv) {
     NV2ATextureCopy state;
     const char *error=nv2a_texture_copy_prepare(m,&state);
     if(error) { fprintf(stderr,"unsupported state: %s\n",error); return 1; }
+#ifdef __APPLE__
+    if(getenv("RECOMP_METAL_REPLAY")) {
+        if(nv2a_metal_draw(&state,texture,ts,target,ds,depth,zs,v,n,5)<0 || !nv2a_metal_sync()) {
+            fputs("invalid Metal draw\n",stderr); return 1;
+        }
+    } else
+#endif
     for(unsigned i=0;i<n;i+=3)
         if(!nv2a_texture_copy_triangle_depth(&state,texture,ts,target,ds,depth,zs,v[i],v[i+1],v[i+2])) {
             fputs("invalid triangle\n",stderr); return 1;

@@ -1,0 +1,2204 @@
+{
+  "preserved_bodies": 10739,
+  "fresh_bodies": 10722,
+  "missing_bodies": [
+    "0002507A",
+    "00030592",
+    "000305B9",
+    "00030601",
+    "0004C50B",
+    "0004C513",
+    "00070038",
+    "0007003B",
+    "0007004E",
+    "00075E90",
+    "000765FB",
+    "00076660",
+    "00082741",
+    "000B9231",
+    "000C0F70",
+    "000F8BB9",
+    "0013B750",
+    "0013D840"
+  ],
+  "regressed_to_stub": [
+    "000110D0",
+    "00015682",
+    "000156B0",
+    "0001BF40",
+    "0001DF48",
+    "0002011B",
+    "000212E6",
+    "000212F1",
+    "00021304",
+    "00022043",
+    "00022F30",
+    "000250C9",
+    "000272EC",
+    "000273C1",
+    "000273C5",
+    "00027BD0",
+    "00029FE0",
+    "0002C940",
+    "0002C9D5",
+    "0002CA8B",
+    "0002CAB7",
+    "0002CB95",
+    "0002D3B3",
+    "0002DF51",
+    "0002E00C",
+    "0002EDA2",
+    "0002EE41",
+    "0002F22E",
+    "0002F830",
+    "0002FF70",
+    "000303AE",
+    "000331D2",
+    "00033F47",
+    "00034688",
+    "00034902",
+    "00034994",
+    "00034C11",
+    "00034DE0",
+    "00034F86",
+    "00034FB8",
+    "00035BA0",
+    "00035C88",
+    "00035CBC",
+    "00035D14",
+    "00037F93",
+    "0003A900",
+    "0003D8E2",
+    "00040921",
+    "00041D10",
+    "00042890",
+    "000433D7",
+    "0004355E",
+    "00043FE0",
+    "000441F8",
+    "00044207",
+    "00044BA0",
+    "00045DBB",
+    "00047850",
+    "00048E54",
+    "0004949C",
+    "00049669",
+    "00049F10",
+    "0004A52E",
+    "0004A640",
+    "0004C400",
+    "0004C4F3",
+    "0004C67C",
+    "0004C694",
+    "0004C69C",
+    "0004C7F9",
+    "000508B2",
+    "00050A0C",
+    "000523E0",
+    "000523F8",
+    "00052404",
+    "00054750",
+    "0005BF50",
+    "0005C720",
+    "0005CBF2",
+    "0005D204",
+    "000651BA",
+    "0006A770",
+    "0006FE40",
+    "0006FFA0",
+    "00070060",
+    "000749F6",
+    "00075FED",
+    "000761FF",
+    "00076805",
+    "00077000",
+    "00078887",
+    "0007C8F1",
+    "0007E4A5",
+    "0007E5BF",
+    "000817C3",
+    "000817EE",
+    "00081834",
+    "00081860",
+    "000861A0",
+    "00089A60",
+    "0008AEB0",
+    "0008FF70",
+    "00091FC0",
+    "00092060",
+    "000A5B60",
+    "000A9851",
+    "000AB780",
+    "000AFFF4",
+    "000B0060",
+    "000B0486",
+    "000B05B8",
+    "000B21FB",
+    "000B5ECE",
+    "000B8A60",
+    "000B91FB",
+    "000B9270",
+    "000BC802",
+    "000BCBBA",
+    "000BCF70",
+    "000BD889",
+    "000BFFE0",
+    "000C1050",
+    "000C2730",
+    "000C3410",
+    "000C67A0",
+    "000C6820",
+    "000D3CC2",
+    "000D3CCA",
+    "000D40E4",
+    "000D40F0",
+    "000D52A0",
+    "000D5DAA",
+    "000D9920",
+    "000D9A10",
+    "000DA3E0",
+    "000DA710",
+    "000DB0F0",
+    "000DB3A1",
+    "000E6590",
+    "000E6E80",
+    "000E7260",
+    "000EAFC0",
+    "000EB440",
+    "000F8BE4",
+    "000FAFF1",
+    "00102050",
+    "00102936",
+    "00109FA0",
+    "0010B078",
+    "0010B11C",
+    "0010BB53",
+    "0010BBEF",
+    "0010BC77",
+    "0010BF62",
+    "0010C6A2",
+    "0010C870",
+    "0010CA38",
+    "00110AE9",
+    "00111C10",
+    "00114080",
+    "00114CB8",
+    "00114D73",
+    "001185B0",
+    "00119C20",
+    "00119CE0",
+    "00119DA0",
+    "00119DE0",
+    "00119E20",
+    "00119E60",
+    "001256DC",
+    "00125AD5",
+    "00125B51",
+    "001296C7",
+    "00129D55",
+    "00129E51",
+    "00129FD9",
+    "00134CAD",
+    "00134CCA",
+    "0014005D",
+    "0014006A",
+    "00152DE0",
+    "0015982D",
+    "001606E0",
+    "001625A0",
+    "001625F0",
+    "001626C0",
+    "00162B85",
+    "00162B94",
+    "00162B9D",
+    "00162E4A",
+    "0016309F",
+    "0016B090",
+    "00177B10",
+    "00178882",
+    "0017888A",
+    "0017DBE3",
+    "0017FD31",
+    "0017FF7F",
+    "00180020",
+    "00182277",
+    "00182C08",
+    "00182C71",
+    "00183F71",
+    "00183F86",
+    "00183FC4",
+    "0019F040",
+    "001C379D",
+    "001C37AF"
+  ],
+  "missing_dispatch": [
+    "00030592",
+    "000305B9",
+    "00030601",
+    "0013B750",
+    "0013D840"
+  ],
+  "groups": {
+    "shared_epilogues": [
+      {
+        "address": "0001478C",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00020156",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0002040D",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000208DD",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00021317",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00021319",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0002335F",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000252B2",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000252B5",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000252B7",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00028558",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0002869E",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000287DF",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0002C11E",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0002D134",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0002DC69",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00030480",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0003060E",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00030AF6",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000312A9",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0003210E",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00032CC3",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000331CE",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00036516",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0003719A",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00037291",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0003741F",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000389A4",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000395DE",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00043594",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00044227",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000496AC",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0004A68A",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0004C811",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00050A20",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0005244F",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00052456",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000585CD",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0005C810",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0005C811",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0005D383",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0005D385",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000651C4",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00068194",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00068195",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0006D956",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00072076",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0007234D",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0007402B",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0007402D",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00074BA0",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00074BA3",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00078FFE",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0007ADE1",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0007ADE2",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0007C9BC",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000865B2",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000866C1",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000AA15B",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000AC07A",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000ACDA8",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000AD2B1",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000ADBB4",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000AECA0",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000AECA1",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000AFEA8",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B09DC",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B2244",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B24A7",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B3951",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B672A",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B799A",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B7F8D",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000B7FB3",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000BCBD9",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000BD8AB",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000BE177",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000BFA01",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000BFF19",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000F3127",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000F7705",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FAE12",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FB231",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FB232",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FBA7A",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FBF72",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FBF73",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FCB16",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FCDF9",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FD166",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FDC88",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "000FFFA6",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00102FF7",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00104DB6",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0010E72D",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0010E72E",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00110317",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00112655",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00121ED3",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00125D5E",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00127E26",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0012B50F",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0012B511",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00134D2B",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "001350F1",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00140086",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "001552F3",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "001555A4",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "0015589F",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00155ECC",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      },
+      {
+        "address": "00162DDA",
+        "preserved": "body",
+        "fresh": "body",
+        "dispatch": true
+      }
+    ],
+    "midfunction_entries": [
+      {
+        "address": "000110D0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00015682",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000156B0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0001BF40",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0001DF48",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002011B",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000212E6",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000212F1",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00021304",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00022043",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00022F30",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000250C9",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000272EC",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000273C1",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000273C5",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00027BD0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00029FE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002C940",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002C9D5",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002CA8B",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002CAB7",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002CB95",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002D3B3",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002DF51",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002E00C",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002EDA2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002EE41",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002F22E",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002F830",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0002FF70",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000303AE",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000331D2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00033F47",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034688",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034902",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034994",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034C11",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034DE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034F86",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00034FB8",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00035BA0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00035C88",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00035CBC",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00035D14",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00037F93",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0003A900",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0003D8E2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00040921",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00041D10",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00042890",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000433D7",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004355E",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00043FE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000441F8",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00044207",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00044BA0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00045DBB",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00047850",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00048E54",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004949C",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00049669",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00049F10",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004A52E",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004A640",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004C400",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004C4F3",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004C67C",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004C694",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004C69C",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0004C7F9",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000508B2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00050A0C",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000523E0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000523F8",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00052404",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00054750",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0005BF50",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0005C720",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0005CBF2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0005D204",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000651BA",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0006A770",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0006FE40",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0006FFA0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00070060",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000749F6",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00075FED",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000761FF",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00076805",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00077000",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00078887",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0007C8F1",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0007E4A5",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0007E5BF",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000817C3",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000817EE",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00081834",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00081860",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000861A0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00089A60",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0008AEB0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0008FF70",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00091FC0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00092060",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000A5B60",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000A9851",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000AB780",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000AFFF4",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B0060",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B0486",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B05B8",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B21FB",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B5ECE",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B8A60",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B91FB",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000B9270",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000BC802",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000BCBBA",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000BCF70",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000BD889",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000BFFE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000C1050",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000C2730",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000C3410",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000C67A0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000C6820",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D3CC2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D3CCA",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D40E4",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D40F0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D52A0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D5DAA",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D9920",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000D9A10",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000DA3E0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000DA710",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000DB0F0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000DB3A1",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000E6590",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000E6E80",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000E7260",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000EAFC0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000EB440",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000F8BE4",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "000FAFF1",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00102050",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00102936",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00109FA0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010B078",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010B11C",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010BB53",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010BBEF",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010BC77",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010BF62",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010C6A2",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010C870",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0010CA38",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00110AE9",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00111C10",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00114080",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00114CB8",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00114D73",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001185B0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00119C20",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00119CE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00119DA0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00119DE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00119E20",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00119E60",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001256DC",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00125AD5",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00125B51",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001296C7",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00129D55",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00129E51",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00129FD9",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00134CAD",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00134CCA",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0014005D",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0014006A",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00152DE0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0015982D",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001606E0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001625A0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001625F0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001626C0",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00162B85",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00162B94",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00162B9D",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00162E4A",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0016309F",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0016B090",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00177B10",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00178882",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0017888A",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0017DBE3",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0017FD31",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0017FF7F",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00180020",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00182277",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00182C08",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00182C71",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00183F71",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00183F86",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "00183FC4",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "0019F040",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001C379D",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      },
+      {
+        "address": "001C37AF",
+        "preserved": "body",
+        "fresh": "stub",
+        "dispatch": false
+      }
+    ],
+    "startup": [
+      {
+        "address": "00030592",
+        "preserved": "body",
+        "fresh": "absent",
+        "dispatch": false
+      },
+      {
+        "address": "000305B9",
+        "preserved": "body",
+        "fresh": "absent",
+        "dispatch": false
+      },
+      {
+        "address": "00030601",
+        "preserved": "body",
+        "fresh": "absent",
+        "dispatch": false
+      }
+    ],
+    "icall": [
+      {
+        "address": "0013D840",
+        "preserved": "body",
+        "fresh": "absent",
+        "dispatch": false
+      },
+      {
+        "address": "0013B750",
+        "preserved": "body",
+        "fresh": "absent",
+        "dispatch": false
+      }
+    ]
+  },
+  "fragment_source_references": {
+    "00014881": [],
+    "00014885": [
+      {
+        "caller": "00014881",
+        "stub": false
+      }
+    ]
+  }
+}
