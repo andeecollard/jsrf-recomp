@@ -916,6 +916,13 @@ static void jsrf_pusher_report(void)
         }
         RECOMP_ICALL_FEEDBACK_DUMP();
         if (getenv("RECOMP_PB_EXEC")) nv2a_pb_exec_report();
+        /* Voice lifecycle: separates "no voice ever started" from "voices
+         * start and never retire", which is what decides whether a silent run
+         * is the guest's fault or the APU's. */
+        {
+            extern void mcpx_apu_voice_report(void);
+            mcpx_apu_voice_report();
+        }
         pad_sentinel_scan();
         /* The allocator prints its owner breakdown once, when a request
          * fails. That names who holds the heap at the end and says nothing
@@ -1147,10 +1154,22 @@ void jsrf_audio_completion_probe(uint32_t pc, uint32_t object, uint32_t arg)
     static int enabled = -1;
     static unsigned count;
     static const uint32_t offsets[] = {0x1000, 0x1004, 0x1100, 0x1300, 0x1304, 0x1504, 0x2000};
-    if (enabled < 0) enabled = getenv("RECOMP_AUDIO_COMPLETION_TRACE") != NULL;
+    /* The cap answers "does this site ever run"; the ratio between sites needs
+     * a longer window than 80 events, which JSRF exhausts before the title
+     * screen. RECOMP_AUDIO_COMPLETION_TRACE=<n> sets it; bare =1 keeps 80. */
+    static unsigned cap;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_AUDIO_COMPLETION_TRACE");
+        enabled = e != NULL;
+        cap = 80;
+        if (e && *e) {
+            long v = strtol(e, NULL, 0);
+            if (v > 1) cap = (unsigned)v;
+        }
+    }
     if (!enabled) return;
     if (pc == 0x001A308Eu && !(MEM16(object + 0x12) & 0x8000u)) return;
-    if (++count > 80) return;
+    if (++count > cap) return;
     fprintf(stderr, "[AUDIO-COMPLETE] pc=%08X object=%08X arg=%08X flags=%04X\n",
             pc, object, arg, (unsigned)MEM16(object + 0x12));
     for (unsigned i = 0; i < sizeof(offsets)/sizeof(offsets[0]); ++i) {

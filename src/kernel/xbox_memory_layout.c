@@ -1761,6 +1761,13 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+/* Printing every DMA_PUT is a bring-up question; running the survey is not.
+ * They shared s_nv2a_trace, and RECOMP_PB_EXEC arms that -- so a title could
+ * not be rendered without also emitting one flushed stderr line per
+ * pushbuffer submission. A 15-minute JSRF session wrote 24 GB, and the
+ * fflush put a syscall on the submission path. Only RECOMP_NV2A_TRACE, asked
+ * for explicitly, turns the printing on. */
+static int s_nv2a_trace_print = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1930,11 +1937,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     }
                 }
                 last_put = put; last_put_ms = now_ms;
-                fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X\n", put);
-                fflush(stderr);
+                if (s_nv2a_trace_print) {
+                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X\n", put);
+                    fflush(stderr);
+                }
             }
         }
-        if (s_nv2a_trace) {
+        if (s_nv2a_trace_print) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
             if (start != last_start) {
@@ -2887,6 +2896,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
+        s_nv2a_trace_print = getenv("RECOMP_NV2A_TRACE") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",

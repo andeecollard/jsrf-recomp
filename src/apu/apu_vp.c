@@ -124,8 +124,30 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* Voice lifecycle counters.
+ *
+ * The guest's DirectSound service routine only runs when FECTL reports a
+ * requested trap, and that trap is raised exactly once per voice that retires
+ * (voice_off -> SE2FE_IDLE_VOICE). A silent JSRF run shows the trap never
+ * being raised, which narrows to either "no voice ever starts" or "voices
+ * start and never reach an exhaustion path". Nothing distinguished those,
+ * because neither transition was counted. */
+unsigned long g_apu_voice_on_count;
+unsigned long g_apu_voice_off_count;
+unsigned long g_apu_idle_trap_count;
+unsigned long g_apu_voice_process_count;
+
+void mcpx_apu_voice_report(void)
+{
+    fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu idle_trap=%lu processed=%lu\n",
+            g_apu_voice_on_count, g_apu_voice_off_count,
+            g_apu_idle_trap_count, g_apu_voice_process_count);
+    fflush(stderr);
+}
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    g_apu_voice_off_count++;
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -196,6 +218,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_VOICE_ON: {
+        g_apu_voice_on_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
@@ -488,6 +511,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case SE2FE_IDLE_VOICE:
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
+            g_apu_idle_trap_count++;
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
@@ -1202,6 +1226,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     return;
             } else {
                 /* Process voice directly (single-threaded) */
+                g_apu_voice_process_count++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
             d->regs[current] = d->regs[next];
