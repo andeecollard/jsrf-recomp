@@ -409,6 +409,36 @@ static void se_frame(MCPXAPUState *d)
     mcpx_debug_end_frame();
 }
 
+/* Frame accounting for the sound-engine gate.
+ *
+ * se_frame is skipped whenever the front end is not free-running, and that
+ * includes TRAPPED -- the mode every voice retirement drives. Whether the skip
+ * matters is not answerable from a rate: one frame is 32 samples, 0.67 ms at
+ * 48 kHz, so losing scattered single frames is inaudible while losing a run of
+ * them is a dropout. So count the reasons separately and keep the longest
+ * unbroken trapped run, which is the number the question actually turns on.
+ *
+ * Counters only; nothing here changes what the thread does. */
+unsigned long g_apu_frames_total;
+unsigned long g_apu_frames_se;         /* se_frame ran */
+unsigned long g_apu_frames_trapped;    /* skipped: front end trapped */
+unsigned long g_apu_frames_halted;     /* skipped: front end halted */
+unsigned long g_apu_frames_xcnt_off;   /* skipped: sample counter off */
+unsigned long g_apu_frames_tone;       /* skipped: test tone owns the output */
+static unsigned long g_apu_trapped_run;
+unsigned long g_apu_trapped_run_max;
+
+void mcpx_apu_frame_report(void)
+{
+    double ms = g_apu_trapped_run_max * (double)NUM_SAMPLES_PER_FRAME / 48.0;
+    fprintf(stderr, "  [APU-FRAME] total=%lu se=%lu trapped=%lu halted=%lu"
+            " xcnt_off=%lu tone=%lu longest_trapped_run=%lu (%.2f ms)\n",
+            g_apu_frames_total, g_apu_frames_se, g_apu_frames_trapped,
+            g_apu_frames_halted, g_apu_frames_xcnt_off, g_apu_frames_tone,
+            g_apu_trapped_run_max, ms);
+    fflush(stderr);
+}
+
 /* ============================================================
  * APU frame thread (background processing)
  * ============================================================ */
@@ -454,8 +484,27 @@ static void *mcpx_apu_frame_thread(void *arg)
                           femethmode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
                           femethmode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
 
+        g_apu_frames_total++;
+        if (!apu_active) {
+            if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF)
+                g_apu_frames_xcnt_off++;
+            else if (femethmode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                g_apu_frames_trapped++;
+            else if (femethmode == NV_PAPU_FECTL_FEMETHMODE_HALTED)
+                g_apu_frames_halted++;
+        } else if (g_test_tone.active) {
+            g_apu_frames_tone++;
+        }
+        if (femethmode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+            if (++g_apu_trapped_run > g_apu_trapped_run_max)
+                g_apu_trapped_run_max = g_apu_trapped_run;
+        } else {
+            g_apu_trapped_run = 0;
+        }
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            g_apu_frames_se++;
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */

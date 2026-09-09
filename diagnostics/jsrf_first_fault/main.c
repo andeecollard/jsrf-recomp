@@ -923,6 +923,14 @@ static void jsrf_pusher_report(void)
             extern void mcpx_apu_voice_report(void);
             mcpx_apu_voice_report();
         }
+        /* And how often the sound engine was gated off. Voices starting says
+         * nothing about whether they were processed: se_frame is skipped
+         * whenever the front end is not free-running, so a title that submits
+         * voices perfectly can still be inaudible if the gate is shut. */
+        {
+            extern void mcpx_apu_frame_report(void);
+            mcpx_apu_frame_report();
+        }
         /* And the boundary those voices have to cross. The APU aperture is
          * guarded read-only so stores fault and reach the model; anything the
          * guard was not covering at the moment of the store lands in plain
