@@ -340,11 +340,53 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+/* Pacing accounting.
+ *
+ * The frame thread is supposed to run at one EP frame per EP_FRAME_US, which
+ * is 256 samples per 5333 us -- exactly 48 kHz. Whether it actually does is
+ * not observable from anywhere else: se_frame's own frame_count is reset every
+ * second for a utilisation figure that nothing prints. These are monotonic, so
+ * the effective generated rate over a whole run can be divided out. */
+unsigned long g_apu_subframes;          /* ep_frame_div increments */
+unsigned long g_apu_se_frames;          /* full VP/DSP pipeline runs */
+unsigned long g_apu_light_frames;       /* monitor-only runs */
+unsigned long g_apu_throttle_calls;     /* throttle() reached the wait */
+unsigned long g_apu_throttle_unpaced;   /* ... and returned without waiting */
+unsigned long long g_apu_throttle_slept_us;
+static int64_t g_apu_pace_start_us;
+
+void mcpx_apu_pacing_report(void)
+{
+    extern unsigned long g_apu_sdl_batches, g_apu_sdl_frames, g_apu_sdl_clears;
+    extern unsigned long apu_sdl2_queued_bytes(void);
+    int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    double elapsed_s = g_apu_pace_start_us
+        ? (now_us - g_apu_pace_start_us) / 1000000.0 : 0.0;
+    double gen_hz = elapsed_s > 0.0 ? g_apu_sdl_frames / elapsed_s : 0.0;
+
+    fprintf(stderr, "  [APU-PACE] elapsed=%.1fs subframes=%lu se=%lu light=%lu"
+            " throttle=%lu unpaced=%lu slept=%.1fs\n",
+            elapsed_s, g_apu_subframes, g_apu_se_frames, g_apu_light_frames,
+            g_apu_throttle_calls, g_apu_throttle_unpaced,
+            g_apu_throttle_slept_us / 1000000.0);
+    fprintf(stderr, "  [APU-PACE] batches=%lu frames=%lu gen_hz=%.0f"
+            " queued=%lu bytes (%lu frames) clears=%lu\n",
+            g_apu_sdl_batches, g_apu_sdl_frames, gen_hz,
+            apu_sdl2_queued_bytes(), apu_sdl2_queued_bytes() / 4,
+            g_apu_sdl_clears);
+    fflush(stderr);
+}
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
         return;
     }
+    g_apu_throttle_calls++;
+    if (!g_apu_pace_start_us)
+        g_apu_pace_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (d->pause_requested)
+        g_apu_throttle_unpaced++;
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
@@ -353,6 +395,7 @@ static void throttle(MCPXAPUState *d)
         d->next_frame_time_us = now_us;
     }
 
+    int64_t wait_start_us = now_us;
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
@@ -364,7 +407,19 @@ static void throttle(MCPXAPUState *d)
     }
     d->next_frame_time_us += EP_FRAME_US;
 
-    d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
+    /* Measured from before the wait loop. now_us is whatever the loop's last
+     * iteration read -- the moment it decided not to wait any longer -- so
+     * differencing against it reports approximately zero however long the
+     * throttle actually blocked. sleep_acc_us, which feeds the utilisation
+     * figure, has had that bug all along; it is preserved here rather than
+     * changed, because nothing prints it. */
+    {
+        int64_t end_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        d->sleep_acc_us += (int)(end_us - now_us);
+        if (end_us > wait_start_us)
+            g_apu_throttle_slept_us +=
+                (unsigned long long)(end_us - wait_start_us);
+    }
 }
 
 /* ============================================================
@@ -439,9 +494,13 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            g_apu_se_frames++;
+            g_apu_subframes++;
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            g_apu_light_frames++;
+            g_apu_subframes++;
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

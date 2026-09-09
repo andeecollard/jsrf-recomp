@@ -148,14 +148,16 @@ unsigned long g_apu_voice_process_count;
  * says the routing never delivered anything from this loop. */
 unsigned long g_apu_fe_method_count;
 unsigned long g_apu_set_current_voice_count;
+unsigned long g_apu_voice_on_loop_count;
 
 void mcpx_apu_voice_report(void)
 {
     fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu idle_trap=%lu processed=%lu"
-            " fe_methods=%lu set_current_voice=%lu\n",
+            " fe_methods=%lu set_current_voice=%lu on_loop=%lu\n",
             g_apu_voice_on_count, g_apu_voice_off_count,
             g_apu_idle_trap_count, g_apu_voice_process_count,
-            g_apu_fe_method_count, g_apu_set_current_voice_count);
+            g_apu_fe_method_count, g_apu_set_current_voice_count,
+            g_apu_voice_on_loop_count);
     fflush(stderr);
 }
 
@@ -235,6 +237,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_ON: {
         g_apu_voice_on_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        /* off < on is only a defect for one-shots. A looping voice reaching
+         * ebo takes cbo = lbo and runs for ever by design (see voice_process),
+         * so BGM never retires and never raises the idle trap. Split the two
+         * here, at the only point where a voice starts. */
+        if (voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT,
+                           NV_PAVS_VOICE_CFG_FMT_LOOP))
+            g_apu_voice_on_loop_count++;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
