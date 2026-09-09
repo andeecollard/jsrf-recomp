@@ -61,7 +61,14 @@ void mcpx_debug_end_frame(void) {}
 
 static void update_irq(MCPXAPUState *d)
 {
-    if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+    /* FEMETHMODE is a field, not a flag, so it has to be masked before it is
+     * compared. TRAPPED is 0xE0 and HALTED is 0x80, both inside the 0xE0 mask:
+     * a bare AND against TRAPPED is therefore also true when the front end is
+     * merely HALTED, and would raise the front-end trap interrupt for a mode
+     * that has not trapped anything. The guest can reach that state -- FECTL
+     * is writable from mcpx_apu_write -- so this is reachable, not academic. */
+    if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+            == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
     }
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
@@ -433,9 +440,19 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        /* Same field, same rule as update_irq. This one is latent rather than
+         * wrong today: for the three defined mode values the bare ANDs happen
+         * to agree with the intent, because HALTED's bit is inside TRAPPED's
+         * mask. Write it as the comparison it means so it keeps agreeing.
+         *
+         * Idling the frame on TRAPPED is deliberate -- see mcpx_apu_write --
+         * and is left alone here; whether the sound engine should keep running
+         * while the front end is trapped is a separate question, and one that
+         * needs a measurement rather than an edit. */
+        uint32_t femethmode = fectl & NV_PAPU_FECTL_FEMETHMODE;
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+                          femethmode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
+                          femethmode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */

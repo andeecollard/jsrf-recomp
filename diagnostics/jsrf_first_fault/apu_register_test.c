@@ -64,7 +64,25 @@ int main(void)
     r[NV_PAPU_FECTL/4] = 0;
     r[NV_PAPU_ISTS/4] = NV_PAPU_ISTS_FETINTSTS;
     CHECK(r[NV_PAPU_ISTS/4] == 0);
+
+    /* A halted front end has trapped nothing, so it must not raise the trap
+     * interrupt. FEMETHMODE is a field: HALTED (0x80) lies inside TRAPPED's
+     * mask (0xE0), so testing it with a bare AND against TRAPPED reported a
+     * trap for a merely halted front end. Reading ISTS is what runs the
+     * update, so the read is the exercise as well as the assertion. */
+    r[NV_PAPU_FECTL/4] = NV_PAPU_FECTL_FEMETHMODE_HALTED;
+    CHECK(!(r[NV_PAPU_ISTS/4] & NV_PAPU_ISTS_FETINTSTS));
+
+    /* The positive control for that negative: the same path, one field value
+     * along, still does raise it -- otherwise the check above would pass just
+     * as well against an interrupt that had stopped working altogether. */
+    r[NV_PAPU_FECTL/4] = NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+    CHECK(r[NV_PAPU_ISTS/4] & NV_PAPU_ISTS_FETINTSTS);
+    r[NV_PAPU_FECTL/4] = 0;
+    r[NV_PAPU_ISTS/4] = NV_PAPU_ISTS_FETINTSTS;
+    CHECK(r[NV_PAPU_ISTS/4] == 0);
 #endif
-    puts("APU register reads, W1C and idle-voice trap payload passed");
+    puts("APU register reads, W1C, idle-voice trap payload and"
+         " FEMETHMODE field decoding passed");
     return 0;
 }
