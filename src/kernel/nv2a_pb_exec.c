@@ -1442,6 +1442,13 @@ static void raster_batch(void)
     if (s_gpu.idx_count < 3)
         return;
     if (!prepare_vertices()) {
+        static unsigned vsh_capture_count;
+        if (!vsh_capture_count++ && getenv("RECOMP_DRAW_CAPTURE")) {
+            int combiner_capture = s_combiner_capture;
+            s_combiner_capture = 1;
+            capture_draw(s_vsh_reason ? s_vsh_reason : "vertex preparation");
+            s_combiner_capture = combiner_capture;
+        }
         s_vsh.rejected++;
         note_vsh_reject();
         if (s_vsh.rejected <= 4)

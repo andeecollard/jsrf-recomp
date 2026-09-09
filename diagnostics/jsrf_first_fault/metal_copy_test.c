@@ -24,7 +24,9 @@ int main(void)
         s.linear=linear;s.dither=dither;nv2a_metal_invalidate(gpu);
         memset(cpu,0xcc,sizeof(cpu));memcpy(gpu,cpu,sizeof(cpu));
         CHECK(nv2a_texture_copy_triangle(&s,tex,sizeof(tex),cpu,sizeof(cpu),v[0],v[1],v[2]));
-        CHECK(nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),NULL,0,v,3,5)==1);
+        int result=nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),NULL,0,v,3,5);
+        if(result!=1)fprintf(stderr,"Metal rejected baseline draw: %s\n",nv2a_metal_last_reject());
+        CHECK(result==1);
         CHECK(nv2a_metal_sync());
         CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
     }
@@ -57,6 +59,17 @@ int main(void)
     CHECK(nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),NULL,0,v,3,5)==1);
     CHECK(nv2a_metal_sync());
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
+    /* Exercise the BC2 path used by JSRF's first rejected city texture. */
+    uint8_t bc2[256];
+    for(unsigned i=0;i<sizeof(bc2);++i)bc2[i]=(unsigned char)(i*29+7);
+    s.blend=0;s.dxt3=1;s.width=s.height=16;s.pitch=64;s.levels=1;s.linear=1;s.repeat=1;
+    v[1][0][0]=v[2][0][1]=16;v[1][9][0]=v[2][9][1]=1;
+    nv2a_metal_invalidate(gpu);memset(cpu,0xcc,sizeof(cpu));memcpy(gpu,cpu,sizeof(cpu));
+    CHECK(nv2a_texture_copy_triangle(&s,bc2,sizeof(bc2),cpu,sizeof(cpu),v[0],v[1],v[2]));
+    CHECK(nv2a_metal_draw(&s,bc2,sizeof(bc2),gpu,sizeof(gpu),NULL,0,v,3,5)==1);
+    CHECK(nv2a_metal_sync());
+    CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
+    s.dxt3=0;
     uint8_t mip[168],stage1[128];
     solid_dxt1(mip,128,0xf800);solid_dxt1(mip+128,32,0x07e0);solid_dxt1(mip+160,8,0x001f);
     s.blend=0;s.dxt1=1;s.width=s.height=16;s.pitch=32;s.levels=3;s.min_filter=5;s.linear=0;s.repeat=1;

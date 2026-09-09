@@ -32,8 +32,18 @@ int main(void)
     CHECK(fabsf(out[9][0]-.8f)<1e-6f && fabsf(out[9][1]+.3f)<1e-6f
             && out[9][2]==0 && out[9][3]==1);
     m[0x3cc/4]=0x8511;CHECK(nv2a_ff_vertex(m,in,out));m[0x3cc/4]=0;
-    m[0x3c0/4]=0x8512;CHECK(nv2a_ff_vertex(m,in,out));m[0x3c0/4]=0x8511;
-    m[0x314/4]=1;CHECK(nv2a_ff_vertex(m,in,out));m[0x314/4]=0;
+    m[0x3c0/4]=0x8512;CHECK(nv2a_ff_vertex(m,in,out));m[0x3c0/4]=0;
+    /* Ambient plus one infinite directional light, the path measured in the
+     * first rejected JSRF city batch. */
+    in[2][0]=in[2][1]=0;in[2][2]=1;in[3][0]=in[3][1]=in[3][2]=.5f;in[3][3]=.75f;
+    for(unsigned k=0;k<3;++k) { put(m,0xa10+4*k,.25f);put(m,0x3a8+4*k,.1f);put(m,0x1000+4*k,.2f);put(m,0x100c+4*k,.5f); }
+    put(m,0x3b4,.8f);put(m,0x1034,0);put(m,0x1038,0);put(m,0x103c,-1);
+    m[0x3bc/4]=1;m[0x314/4]=1;
+    CHECK(!nv2a_ff_vertex(m,in,out));
+    for(unsigned k=0;k<3;++k)CHECK(fabsf(out[3][k]-.575f)<1e-6f);
+    CHECK(fabsf(out[3][3]-.6f)<1e-6f);
+    m[0x3bc/4]=2;CHECK(nv2a_ff_vertex(m,in,out));m[0x3bc/4]=0;m[0x314/4]=0;
+    m[0x328/4]=1;CHECK(nv2a_ff_vertex(m,in,out));m[0x328/4]=0;
     put(m,0x6bc,0);CHECK(nv2a_ff_vertex(m,in,out));
     puts("Fixed-function projection, colors, secondary texture matrix and rejection passed");
     return 0;

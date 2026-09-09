@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Bounded CPU fragment path: PROJECT2D, one-level linear RGB565 or DXT1,
+/* Bounded CPU fragment path: PROJECT2D, linear RGB565, DXT1 or DXT3,
  * copy or measured texture-times-diffuse combiner. Only the measured alpha,
  * source-alpha blend and fixed Z24 LEQUAL state is supported. RGB565 dithering
  * uses ordered quantisation, not yet verified against NV2A hardware. */
@@ -19,7 +19,7 @@ typedef struct NV2ATextureCopy {
     size_t extra_size[3];
     /* No texture bound: the fragment is the diffuse colour alone. */
     uint32_t untextured;
-    uint32_t dxt1, repeat, alpha_test, alpha_ref, blend, cull_face, front_cw;
+    uint32_t dxt1, dxt3, repeat, alpha_test, alpha_ref, blend, cull_face, front_cw;
     uint32_t depth_test, depth_write, depth_handle, depth_offset, depth_pitch;
     uint32_t target_handle, target_offset, target_pitch, target_bpp;
     uint32_t clip_x, clip_y, clip_w, clip_h;

@@ -50,8 +50,22 @@ int main(void) {
     CHECK(DRAW()); CHECK(word(target)==0xbf408000);
     s.alpha_ref=128; memset(target,0x5a,sizeof(target));
     CHECK(DRAW()); CHECK(word(target)==0x5a5a5a5a); /* GREATER, not GEQUAL */
+    /* BC2/DXT3 has four-bit explicit alpha followed by a four-colour BC1
+     * block. It must not use BC1's transparent three-colour endpoint rule. */
+    memset(m,0,sizeof(m)); copy_methods(m,4,4,16,16,4); modulate_methods(m);
+    m[0x1b04/4]=0x02210e29; m[0x1b08/4]=0x10101; m[0x1b14/4]=0x01012000;
+    CHECK(!nv2a_texture_copy_prepare(m,&s) && s.dxt3 && !s.dxt1);
+    CHECK(s.pitch==16 && nv2a_texture_copy_texture_bytes(&s)==16);
+    memset(texture,0,sizeof(texture)); texture[0]=0xf8; /* alpha: x0=8/15, x1=15/15 */
+    le32(texture+8,0xf800001f); le32(texture+12,0x0000000c); /* reversed endpoints, selectors 0 then 3 */
+    coords(.125f,.125f); memset(target,0,sizeof(target)); CHECK(DRAW());
+    CHECK(word(target)==0x880000ff);
+    coords(.375f,.125f); memset(target,0,sizeof(target)); CHECK(DRAW());
+    CHECK(word(target)==0xffaa0055);
     /* Z24 test, write mask and alpha-discard ordering. */
-    s.alpha_ref=0; s.blend=0; s.linear=0; s.depth_test=1; s.depth_write=1; s.depth_pitch=16;
+    s.dxt3=0; s.dxt1=1; s.pitch=8; le32(texture,0xf800001f); le32(texture+4,0xdddddddd);
+    s.alpha_test=1; s.alpha_ref=0; s.blend=0; s.linear=0;
+    s.depth_test=1; s.depth_write=1; s.depth_pitch=16;
     coords(.125f,.125f);
     for(int i=0;i<3;++i) v[i][0][2]=100;
     for(int i=0;i<16;++i) le32(depth+4*i,(101u<<8)|0x7b);
