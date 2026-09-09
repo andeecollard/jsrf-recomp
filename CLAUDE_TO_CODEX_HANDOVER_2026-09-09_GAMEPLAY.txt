@@ -1,0 +1,294 @@
+JSRF HANDOVER FOR CODEX
+Date: 2026-09-09 (Europe/London), end of session
+From: Claude
+
+PURPOSE
+=======
+JSRF now boots, passes New Game and reaches gameplay on macOS/ARM64. This
+covers what was fixed, what was measured, what is still broken, and -- most
+importantly -- which measurements in this project LIE. Read the instrument
+warnings before trusting any counter.
+
+Everything here is committed and pushed.
+
+
+BRANCH AND BASELINE
+===================
+  branch  codex/upstream-integration  ==  main   (both at 3018412)
+  tag     jsrf-gameplay-2026-09-09    (95c1d82) -- known-good, reaches gameplay
+  branch  dirty-main-preserved-2026-09-09 -- the dirty tree's 51 uncommitted
+          files, including tools/recomp/translator.py + lifter.py and the three
+          flag tests. That work existed NOWHERE else. It is the 112-vs-76
+          dead-_flags gap.
+
+  archive JSRF_BASELINE_2026-09-09_gameplay/
+            jsrf_first_fault   (33 MB binary that reaches gameplay)
+            gen.tar.gz         (4.7 MB)
+            CMakeCache.txt
+
+  *** gen/ IS GITIGNORED. gen.tar.gz is the ONLY copy of the generated code
+  *** that reaches gameplay. git alone will not restore a playable build.
+
+
+THE BUILD MATRIX THAT WORKS
+===========================
+Not obvious, and three sessions were wasted on getting it wrong:
+
+  runtime   xboxrecomp_upstream_integration/diagnostics/jsrf_first_fault
+  gen       the DIRTY TREE's preserved gen (76 dead _flags), NOT a fresh
+            integration regeneration
+  override  sub_001A308E from the integration tree's jsrf_manual_overrides.c
+
+  cmake -S <integration>/diagnostics/jsrf_first_fault \
+        -B /private/tmp/jsrf-correct-dsound-build \
+        -DRECOMP_GEN_DIR=/private/tmp/jsrf-correct-dsound-gen
+
+The integration tree's OWN freshly regenerated gen reaches the game loop but
+renders nothing. Do not assume a regeneration is a drop-in.
+
+Launch (all of these, or the run proves nothing):
+  RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
+  RECOMP_REPORT_MS=10000 RECOMP_HDD_ROOT=<a copy of emulated-hdd>
+
+Without RECOMP_PB_EXEC the pushbuffer executor never runs and nothing draws.
+
+
+INSTRUMENTS THAT LIE -- READ THIS FIRST
+=======================================
+Seven counters were misread this session, producing three retractions and one
+retraction that was itself wrong. Verify a counter's trigger before reasoning
+from it.
+
+1. `draws=` in the [PUSHER] line is ALWAYS 0. The harness calls
+   nv2a_pb_scan_set_external_executor(1). Read "[GPU] N triangles rasterised".
+
+2. "[PUSHER] D3D11 sink unhandled methods" describes a sink that DOES NOT
+   RENDER ON MACOS. Its list (0x1800 ARRAY_ELEMENT16, vertex shader uploads)
+   is irrelevant here. The CPU executor prints its own list as
+   "  [GPU]   0xNNNN xCOUNT"; raise the cut with RECOMP_PB_EXEC_TOP=<n>.
+
+3. A high unhandled-method count is NOT evidence of a defect. JSRF drives this
+   scene with programmable vertex shaders (mode=2), so the fixed-function
+   matrices it "ignores" are genuinely not needed. [VSH] reports
+   executed batches=98992 rejected=3 -- nothing is being dropped.
+
+4. "[USB-PAD]" only prints on pad STATE CHANGE (memcmp over digital controls,
+   4096 stick-jitter filter, 400 cap). Zero lines in an unattended run means
+   nothing. It also logged zero while input demonstrably worked, because JSRF
+   is served by the XInput/XPP bridge, not the emulated USB path.
+
+5. "[PAD] port 0: PS4 Controller (opened)" appears even with the pad
+   PHYSICALLY DISCONNECTED. It is not evidence of a live controller.
+
+6. grep for "descriptor|SET_ADDRESS|endpoint" returns zero in a KNOWN-WORKING
+   build. There is no enumeration logging; absence proves nothing.
+
+7. Log-size comparisons across different scenes are meaningless. Gameplay
+   submits orders of magnitude more pushbuffer traffic than the title screen.
+
+Method that worked: get a POSITIVE CONTROL before trusting a negative. The
+mode check below is the model -- Default-mode functions appeared, so the
+absence of the other four modes was real.
+
+
+WHAT WAS FIXED (verified)
+=========================
+1. tools/disasm/functions.py -- the startup fault (commit 95c1d82)
+   Upstream 051a128's _pass_gap_prologues split table-reached switch
+   dispatchers. Its gap test read only self.functions, while tail-jump and
+   data-table bodies live in _alias_entries until _build_alias_entries runs
+   last -- and it ran BEFORE _pass_data_ptr_targets, which claims ~3,100 JSRF
+   bodies against the tail-jump pass's ~205.
+   sub_00154D70 and sub_0015A020 are switch dispatchers whose cases end in
+   "ret 12" with the next case following unpadded. Split at a case boundary,
+   cases 0x00154DAA / 0x0015A0F9 were covered by nothing; their stubs popped 4
+   and 12 bytes where the real blocks return 12, and the guest faulted far
+   away in sub_00177FE0.
+   Fix: gap test honours pending alias ranges (prefix-max), and the pass runs
+   last among gap-testing passes. gap_prologue 363 finds -> 87; the 259 given
+   up reappear under tail_jump_alias/seed_vtable_thunk. 18/18 disasm tests.
+   THIS IS UPSTREAMABLE -- platform-neutral, fixes a real defect in their
+   code, has tests. Best contribution candidate.
+
+2. sub_001A308E override -- the New Game deadlock
+   Clears object+0x12 bit 15 when bit 0 is set. Verified: the game passes New
+   Game into gameplay and sub_001A308E appears nowhere in a live sample.
+   THIS IS NOT AN AUDIO FIX. It clears one control-flow deadlock. Do not
+   describe it as fixing DirectSound.
+
+3. xbox_memory_layout.c -- logging on the hot path (commit 84ac2c8)
+   RECOMP_PB_EXEC is required to render and armed the same flag guarding a
+   per-DMA_PUT fprintf + fflush. 25,768 of 33,508 log lines in a 90 s run; a
+   gameplay session wrote 24 GB. Printing now needs RECOMP_NV2A_TRACE.
+   Measured A/B, same scene: log 1.2 MB -> 449 KB, frames 3000 -> 3300.
+   (An earlier "5000x" claim compared different scenes and was wrong.)
+
+
+THE AUDIO BLOCKER (root cause established, not fixed)
+=====================================================
+Chain, traced end to end:
+
+  guest sub_001A25AA reads NV_PAPU_FECTL (0xFE801100), masks 0xF00
+  (FETRAPREASON), and only reaches its sound path at 0x001A25CA when it
+  equals 0xF00 (FETRAPREASON_REQUESTED).
+
+  Live: FECTL = 0x100F -> trap-reason field is ZERO -> branch always taken ->
+  sound path never runs. In a run where the intro tune DID play, FECTL was
+  0x1FEF (FEMETHMODE=TRAPPED, FETRAPREASON=REQUESTED) and FEDECMETH was
+  0x8000 = SE2FE_IDLE_VOICE with the voice handle in FEDECPARAM.
+
+  FETRAPREASON_REQUESTED is set in ONE place: apu_vp.c:489, case
+  SE2FE_IDLE_VOICE, gated on FETFORCE1 bit 15 -- and that gate is ALREADY
+  OPEN (+1504 reads 0x00008000). The missing step is the call that raises it,
+  fe_method(d, SE2FE_IDLE_VOICE, v) at apu_vp.c:1197, which fires only when a
+  voice's ACTIVE_VOICE bit is found clear.
+
+  Voice counters were added (apu_vp.c, reported periodically as [APU-VOICE]).
+  AT THE TUTORIAL, WITH INPUT CONFIRMED WORKING:
+      on=0 off=0 idle_trap=0 processed=0
+
+  NV1BA0_PIO_VOICE_ON NEVER FIRES. The APU is never given a voice. The FECTL
+  gating is a SYMPTOM. The fault is upstream, in the guest's DirectSound path.
+
+Next step: determine why the guest never issues VOICE_ON. Note that
+sub_001A1769 is a manual override whose own comment says "THIS MAKES AUDIO
+SILENT AND IS NOT A FIX FOR AUDIO" -- a candidate, but not a complete
+explanation, since the audible run showed real voice traps (handle 0x44) with
+the same overrides compiled in.
+
+A NOTE ON A PRIOR CLAIM: "APU voice retirement needs FE trap method 0x8000"
+is CORRECT. I retracted it mid-session after searching NV1BA0_PIO_* names and
+the word "retire" and finding neither. The method is named SE2FE_IDLE_VOICE
+and apu_regs.h:216 defines it as 0x00008000. The retraction was wrong.
+
+Also real but NOT the cause: apu_core.c:64 tests
+`fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED` -- a mask test against a multi-bit
+FIELD VALUE. HALTED (0x80) also matches 0xE0, so a halted front end raises
+FETINTSTS as if trapped. Should be
+`(fectl & FEMETHMODE) == FEMETHMODE_TRAPPED`. Same pattern at :437.
+
+
+THE GAMEPLAY BLOCKER (partially diagnosed)
+==========================================
+Symptoms: tutorial stops at the same place every time; SOME characters are
+missing -- Corn and the dog render, GUM AND THE PLAYER DO NOT. That
+selectivity is the sharpest clue available and is unexplained. Corn/Potts are
+static NPCs; Gum and the player are rider characters with skeletal animation
+and skinning. Whatever fails distinguishes those two classes.
+
+RULED OUT, with evidence:
+  - Rendering is not dropping anything. [GPU] draws 1211184 (1211184 with
+    coordinates), 0 batches skipped as not screen-space, 0 triangles fully
+    off-surface, [VSH] rejected=3 of 98992.
+  - Wrong game mode. The decomp gives five modes (Default, Event,
+    CoveredPause, FreezeCam, UncoveredPause) x three phases = 15 virtuals,
+    each with its own CActBase::recursiveExecN<Mode> function. At the stall
+    ONLY recursiveExec0Default (12 samples) and recursiveExec1Default (10)
+    appear; the other four modes are absent. Positive control present.
+  - The game is not hung. Main thread runs the normal loop, frames advance,
+    triangles climb.
+  - A sleeping controller. Confirmed the pad was disconnected during several
+    "input doesn't work" reports -- but the stall reproduces with the pad
+    live, so the stall itself is real.
+
+DEAD BRANCHES EXECUTING DURING THE TUTORIAL (RECOMP_UNRESOLVED_FLAGS=1):
+  site 39  0x000B4490  BENIGN -- verified. A redundant loop pre-check; the
+           bottom `jl` back-edge bounds the loop correctly and the pre-check's
+           correct value is always not-taken. Do not "fix" it.
+  site 34  0x00056990  CMission::runListenerCmds. REAL. `test eax,eax` then a
+           `je` that reads _flags. A predicate on a listener command is
+           replaced by a constant, so the command body ALWAYS executes. Note
+           the direction: commands fire unconditionally, they do not fail to
+           fire. UNFIXED.
+  site 32  0x00052402  inside CMission::InitResources. REAL, addressed below.
+
+
+THE MID-FUNCTION SPLIT DEFECT (the systemic finding)
+====================================================
+This is the most reusable result of the session.
+
+Promoting a mid-function entry to its own C function SEVERS FLAG DATAFLOW.
+The generated flag temporaries _fa/_fb are function-local. If a split lands
+between a flag producer and its consumer, the `cmp` is in one function and the
+`jcc` in another, and the translator emits the constant-zero _flags fallback.
+
+Concrete instance: CMission::InitResources matches a two-word key against a
+table entry. Discovery promoted 0x00052402 -- FIVE BYTES, TWO INSTRUCTIONS --
+to a function, landing exactly between the second `cmp` and its `je`. That
+`je` is the ONLY edge to 0x0005240D, so the "found" path was unreachable and
+the lookup could never succeed.
+
+backport_mission_resource_match.py repairs it in the caller, where the flags
+exist. IMPORTANT: the loop exists in THREE copies, because
+recover_midfunction_entries.py replicates an owner's body at each recovered
+entry. An earlier version patched only one -- the lookup then succeeded down
+one path and failed down two, and the game stopped EARLIER than before. The
+script now patches every copy; --check verifies all of them.
+
+STATUS: UNVERIFIED. Applying it drops executed dead branches from three to
+one, so it changes behaviour, but no run has shown a user-visible improvement.
+The gen is gitignored, so the commit alone changes no build; revert by not
+running the script.
+
+GENERAL LESSON FOR THE RECOMPILER: mid-function entry promotion should either
+avoid splitting between a flag producer and consumer, or the translator should
+carry flag state across such a boundary. Other sites of this shape exist.
+
+
+OPEN / UNEXPLAINED
+==================
+  - Why VOICE_ON is never issued.
+  - Why Gum and the player do not render while Corn and the dog do.
+  - Whether the mission resource backport helps, hurts, or does nothing.
+  - Intermittent input failure with the pad connected and "(opened)" logged.
+    Not reproduced reliably; some reports were a disconnected pad, at least
+    one was not.
+  - 112 vs 76 dead _flags in a fresh integration regeneration. The closing
+    work is on dirty-main-preserved-2026-09-09.
+  - macOS window behaviour: no .app bundle, no Info.plist, no
+    setActivationPolicy / activateIgnoringOtherApps anywhere. Window is made
+    at src/d3d/d3d8_gl.c:1211 with SDL_WINDOW_OPENGL|SDL_WINDOW_SHOWN only.
+    Isolated from emulation; cheap to fix; untouched.
+
+
+UPSTREAM AND REFERENCES
+=======================
+xboxrecomp: `git ls-remote upstream main` -> 051a128, which IS ALREADY AN
+ANCESTOR OF HEAD. Upstream has not moved. There is nothing to port. The T&L,
+multitexturing, combiners, vertex-shader and unswizzle implementations people
+cite are already merged into this tree.
+
+JSRF-Decompilation (Codeberg, local clone present): 6 decompiled files only,
+no Mission.cpp, objects.csv has no mission coverage. Its VALUE IS NAMING:
+  0x00056990 CMission::runListenerCmds
+  0x00052350 CMission::InitResources   (0x00052402 falls inside)
+  0x00011070 CActBase::recursiveExec0Default  (+ four more modes)
+  0x000659C0 readInput
+  0x000B3DE0 CActBase::callDrawDefault
+The mission system is an opcode-dispatched command interpreter (RunCmds,
+RunImmediateCmds, runListenerCmds, setNextSwitchFuncFromCmdID).
+
+Video Notes/*.srt + *_slides.md are transcripts/OCR of two KeybadeBlox videos
+and explain the engine: a god-object "game" class, a game-object tree walked
+depth-first, 15 virtuals (exec/postExec/draw x 5 modes), a "director" driving
+game flow. The slides contain real decompiled source.
+
+Contribution candidates: the functions.py gap-prologue fix to xboxrecomp (MIT,
+merges outside PRs); our switch-dispatcher and 0x001A2FBE findings to the
+decomp (no LICENSE file found there -- check first).
+
+
+SUGGESTED NEXT STEPS
+====================
+1. Decide the fate of backport_mission_resource_match.py by testing it with a
+   live controller. Revert if not clearly better.
+2. Chase "why Gum and the player specifically". Compare what those objects
+   need against Corn/dog -- resource type, skinning, animation.
+3. Find why VOICE_ON is never issued. Instrument the guest's DirectSound
+   buffer submission rather than the APU, which is provably idle.
+4. Fix apu_core.c:64 / :437 field-vs-mask tests on their own merits.
+5. macOS app bundle. Independent, cheap, unblocked.
+6. Port the translator flag work from dirty-main-preserved-2026-09-09 to close
+   112 -> 76.
+
+Do not trust a counter you have not read the trigger condition for.
