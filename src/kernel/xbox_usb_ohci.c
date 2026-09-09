@@ -364,24 +364,47 @@ int xbox_UsbInterruptIn(uint8_t endpoint, uint8_t *out, uint32_t out_max,
      * times a second and every poll looks alike. */
     if (g_trace) {
         extern double xbox_TraceSeconds(void);
-        static uint8_t last[8];
+        static uint8_t last[XBOX_USB_PAD_REPORT - 2];
+        static int have_last;
         static unsigned shown;
         /* Every digital control, so a release is as visible as a press: the
          * question "did the title react" is asked of an edge, and half the
          * edges are releases. The cap is generous because a session of
          * pressing buttons at a screen is minutes of edges, not a handful. */
-        uint8_t now[8] = { report[2], report[3], report[4], report[5],
-                           report[6], report[7], report[10], report[11] };
-        if (memcmp(now, last, sizeof now) != 0 && shown < 400) {
+        const uint8_t *now = report + 2;
+        int changed = !have_last || memcmp(now, last, 10) != 0;
+        if (have_last && !changed) {
+            /* A physical DualShock never rests on precisely the same raw
+             * stick samples.  Do not let that harmless noise consume the
+             * bounded trace before the title reaches a menu; retain deliberate
+             * stick motion by requiring a useful displacement. */
+            for (unsigned axis = 10; axis < sizeof last; axis += 2) {
+                int16_t old_axis = (int16_t)(last[axis] |
+                                             (last[axis + 1] << 8));
+                int16_t new_axis = (int16_t)(now[axis] |
+                                             (now[axis + 1] << 8));
+                int delta = (int)new_axis - (int)old_axis;
+                if (delta < 0) delta = -delta;
+                if (delta >= 4096) {
+                    changed = 1;
+                    break;
+                }
+            }
+        }
+        if (changed && shown < 400) {
             shown++;
-            memcpy(last, now, sizeof now);
+            memcpy(last, now, sizeof last);
+            have_last = 1;
             fprintf(stderr, "  [USB-PAD] t=%7.2f buttons=%02X A=%02X B=%02X"
-                    " X=%02X Y=%02X LT=%02X RT=%02X lx=%d ly=%d\n",
+                    " X=%02X Y=%02X Black=%02X White=%02X LT=%02X RT=%02X"
+                    " lx=%d ly=%d rx=%d ry=%d\n",
                     xbox_TraceSeconds(),
                     report[2], report[4], report[5], report[6], report[7],
-                    report[10], report[11],
+                    report[8], report[9], report[10], report[11],
                     (int)(int16_t)(report[12] | (report[13] << 8)),
-                    (int)(int16_t)(report[14] | (report[15] << 8)));
+                    (int)(int16_t)(report[14] | (report[15] << 8)),
+                    (int)(int16_t)(report[16] | (report[17] << 8)),
+                    (int)(int16_t)(report[18] | (report[19] << 8)));
             fflush(stderr);
         }
     }

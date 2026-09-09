@@ -39,7 +39,16 @@ def main():
     parser.add_argument('--gen', type=Path, default=Path(__file__).resolve().parents[2]
                         / 'build-macos/jsrf-first-fault/gen')
     args = parser.parse_args()
-    path = args.gen / 'recomp_0006.c'
+    # Find the chunk holding the loop rather than naming one. --split packs a
+    # fixed number of functions per file, so any change in how many functions
+    # are discovered shifts every later address into a different chunk: this
+    # site moved from recomp_0006.c to recomp_0007.c when a function-boundary
+    # fix stopped splitting table-reached functions. backport_result_flag_merge
+    # already scans for its site for the same reason.
+    path = next((p for p in sorted(args.gen.glob('recomp_[0-9]*.c'))
+                 if 'loc_00145181: ;' in p.read_text()), None)
+    if path is None:
+        raise SystemExit('ADX loop site 0x00145181 is in no generated chunk')
     old = path.read_text()
     new = patch(old)
     if args.check:

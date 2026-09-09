@@ -158,16 +158,29 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
-        # A function that begins immediately after a ret, with no padding.
-        if self._pass_gap_prologues(sections):
-            self.functions.clear()
-            self._build_functions(sections)
-
         # Then the same for addresses that only ever exist as table entries.
         # After the immediate pass, so its results narrow the gaps first. These
         # become aliases rather than function starts, so no rebuild: aliases are
         # materialised by _build_alias_entries once boundaries are final.
         self._pass_data_ptr_targets(sections)
+
+        # A function that begins immediately after a ret, with no padding.
+        #
+        # Last of the gap-testing passes, because it is the only one that
+        # splits: the others add a start in a gap or claim a body as an alias,
+        # while this one can land inside a function that nothing has claimed
+        # yet and cut it in two. The data-table pass above claims 3,026 bodies
+        # in JSRF against the tail-jump pass's 205, so running before it left
+        # almost every table-reached function looking like open gap.
+        #
+        # That is how sub_00154D70 -- a switch dispatcher reached only through
+        # a table, whose cases end in "ret 12" with the next case following
+        # immediately -- was split at case 0x00154D82, leaving case 0x00154DAA
+        # covered by nothing and emitted as a stub that popped 4 bytes instead
+        # of 12.
+        if self._pass_gap_prologues(sections):
+            self.functions.clear()
+            self._build_functions(sections)
 
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
@@ -205,12 +218,36 @@ class FunctionDetector:
         than made, so eax kept a stale value that the caller then used as a
         string pointer.
         """
-        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        # Alias entries count as covered. They are recorded by the tail-jump
+        # and data-table passes above but only become Functions in
+        # _build_alias_entries, which runs last -- so a body reached solely
+        # through an alias is claimed territory that self.functions does not
+        # yet describe, and testing self.functions alone calls it a gap.
+        #
+        # JSRF's 0x00154D70 is one: a switch dispatcher whose cases end in
+        # "ret 12" and are followed immediately by the next case, reached only
+        # by a tail jump. Splitting it at the case boundary 0x00154D82 left
+        # 0x00154DAA -- another case of the same switch -- covered by nothing,
+        # so it was emitted as an unresolved stub that popped 4 bytes where the
+        # real block returns 12, and the guest faulted a long way downstream.
+        bounds = sorted(
+            [(f.start, f.end) for f in self.functions.values()]
+            + list(self._alias_entries.items()))
         starts = [b[0] for b in bounds]
+
+        # Ranges can overlap: an alias body runs to the end of the function it
+        # lands in, so the range nearest below addr is not always the one that
+        # covers it. Carry the furthest end seen so far, which answers "does
+        # anything starting at or before addr still reach it" in one lookup.
+        furthest_end: List[int] = []
+        reach = 0
+        for _, end in bounds:
+            reach = max(reach, end)
+            furthest_end.append(reach)
 
         def in_a_gap(addr: int) -> bool:
             i = bisect.bisect_right(starts, addr) - 1
-            return not (i >= 0 and addr < bounds[i][1])
+            return not (i >= 0 and addr < furthest_end[i])
 
         added = False
         for insn in list(self.engine.instructions.values()):

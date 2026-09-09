@@ -77,10 +77,9 @@ points = {
         '0004EF90': ('jsrf_title_state_probe', 'ecx, MEM32(ecx + 0x44)'),
     },
     'recomp_0009.c': {
-        '001A308E': ('jsrf_audio_completion_probe', 'ecx, MEM32(esp)'),
-        '001A2FBE': ('jsrf_audio_completion_probe', 'esi, 0'),
-        '001A25CA': ('jsrf_audio_completion_probe', 'edi, esi'),
-        '001A3A8E': ('jsrf_audio_completion_probe', 'esi, 0'),
+        # 0x001A308E is a manual override now. Its original generated body was
+        # an unbounded DSOUND completion spin, so there is no generated label
+        # at which a read-only probe can be installed.
         '001914BD': ('jsrf_pb_patch_probe', 'esi'),
         '00191510': ('jsrf_pb_event_probe', 'esi'),
         '001915FD': ('jsrf_pb_reserve_probe', 'esi, eax, ecx, MEM32(esp + 0xC)'),
@@ -209,6 +208,11 @@ points = {
         '00140C0F': ('jsrf_wxci_request_probe', 'esi'),
     },
     'recomp_0010.c': {
+        # DSOUND completion points moved into this generated partition after
+        # 0x001A308E became a manual function.
+        '001A2FBE': ('jsrf_audio_completion_probe', 'esi, 0'),
+        '001A25CA': ('jsrf_audio_completion_probe', 'edi, esi'),
+        '001A3A8E': ('jsrf_audio_completion_probe', 'esi, 0'),
         # Root-hub connect path: entry, device-pool allocation result, and the
         # link helper reached only when that result is non-zero.
         '001BF72C': ('jsrf_usb_device_probe',

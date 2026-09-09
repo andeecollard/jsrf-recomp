@@ -42,8 +42,12 @@ import argparse
 from pathlib import Path
 import sys
 
-UNGUARDED = ('    if (_flags /* jbe: below or equal (unsigned <=) */) '
-             'goto loc_00014909;')
+UNGUARDED = (
+    ('    if (_flags /* jbe: below or equal (unsigned <=) */) '
+     'goto loc_00014909;'),
+    ('    if (_flags /* jbe: below or equal (unsigned <=) - UNRESOLVED FLAGS, '
+     'branch never taken */) goto loc_00014909;'),
+)
 GUARDED = ('    /* cmp eax, ebp / jbe, with ebp zeroed at 0x0001487C: the '
            'empty-list\n'
            '     * guard. eax still holds MEM32(esi + 0xB0) from 0x00014876; '
@@ -62,9 +66,10 @@ def patch(text):
     body = text[start:end]
     if GUARDED in body:
         return text
-    if body.count(UNGUARDED) != 1:
+    candidates = [old for old in UNGUARDED if body.count(old) == 1]
+    if len(candidates) != 1:
         raise ValueError('sub_00014885 differs from the expected pre-fix form')
-    return text[:start] + body.replace(UNGUARDED, GUARDED) + text[end:]
+    return text[:start] + body.replace(candidates[0], GUARDED) + text[end:]
 
 
 def main():

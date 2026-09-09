@@ -1686,6 +1686,18 @@ int main(int argc, char **argv)
     nv2a_pb_scan_set_external_executor(1);
     xbox_SetApuMmioWriteHook(apu_mmio_write_shim);
     xbox_SetApuMmioReadHook(apu_mmio_read_shim);
+    /* This harness always exposes one Xbox controller on the emulated USB
+     * root hub.  The host backend may still report a neutral controller when
+     * no physical pad is attached, but requiring a diagnostic environment
+     * variable here made an otherwise working DualShock invisible to JSRF in
+     * an ordinary launch. */
+#if defined(_WIN32)
+    if (!getenv("RECOMP_OHCI_ATTACH"))
+        _putenv_s("RECOMP_OHCI_ATTACH", "1");
+#else
+    if (!getenv("RECOMP_OHCI_ATTACH"))
+        setenv("RECOMP_OHCI_ATTACH", "1", 0);
+#endif
     /* The emulated gamepad's interrupt endpoint reads from here. Installed
      * before the memory layout brings up the MCPX aperture, so the very first
      * poll after enumeration already sees real pad state. */

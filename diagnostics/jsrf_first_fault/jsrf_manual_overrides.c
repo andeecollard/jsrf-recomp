@@ -49,3 +49,26 @@ void sub_001A1769(void)
     g_eax = 0;          /* S_OK */
     g_esp += 8;         /* ret 4 */
 }
+
+/*
+ * sub_001A308E - DSOUND: wait for an asynchronous voice update to finish.
+ *
+ * On the Xbox this fifteen-byte routine spins while object+0x12 bit 15 is
+ * set.  The sound completion path at 0x001A2FBE clears precisely that bit and
+ * does no other object work in this case.  Our recompiled guest cannot make
+ * that progress while this call owns the main execution chain: a live sample
+ * after selecting New Game found the main thread here on every sample, while
+ * the DSOUND worker was blocked behind the guest's critical section.
+ *
+ * Complete the pending hand-off with the same state transition the hardware
+ * completion path would make.  Preserve all other flags; in particular bit 0
+ * still records whether this kind of wait applies to the object.
+ *
+ * __thiscall, no stack arguments, returns void.
+ */
+void sub_001A308E(void)
+{
+    if (MEM8(g_ecx + 0x12) & 1)
+        MEM16(g_ecx + 0x12) &= 0x7FFFu;
+    g_esp += 4;         /* ret */
+}

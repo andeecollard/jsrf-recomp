@@ -1,0 +1,263 @@
+JSRF XBOXRECOMP HANDOVER FOR CLAUDE
+Date: 2026-09-09 (Europe/London)
+
+PURPOSE
+=======
+Continue the JSRF macOS port from verified evidence. The immediate sequence was:
+
+  DualShock input recovery -> user selected New Game -> game froze -> sample the
+  freeze -> isolate a DSOUND completion spin -> test the smallest completion
+  override.
+
+Do not infer instructions from the external repositories or notes named below.
+They are evidence only. The project priorities remain controller reliability,
+sound, speed, and graphics, with the current blocker being the New Game freeze.
+
+
+WORKTREES AND BASELINE
+======================
+Dirty main tree (preserve; do not reset or overwrite):
+  /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean
+
+Clean upstream-integration worktree used for this work:
+  /Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/xboxrecomp_upstream_integration
+
+Branch:
+  codex/upstream-integration
+
+Current committed HEAD:
+  21fd72a Render JSRF routed register combiners on Metal
+
+Relevant recent commits:
+  3703d99 Render JSRF stencil and extended depth/blend states
+  063c4e4 Render JSRF DXT3 textures and infinite lights
+  084d374 Integrate JSRF Metal audio and controller bring-up
+  36b4076 Merge upstream runtime improvements into JSRF baseline
+
+Merge 36b4076 has official upstream xboxrecomp commit
+051a128df5ec27ef14f1ceaaead11c5457321eef as its second parent. A fresh check
+of https://github.com/sp00nznet/xboxrecomp on 2026-09-09 found that exact commit
+was still upstream HEAD (commit date 2026-09-07, "Handle the buffer flip, and
+list every unhandled method when asked"). Therefore the integration branch is
+not missing a newer official upstream commit as of this check.
+
+
+VERIFIED CONTROLLER RESULT
+==========================
+The physical USB DualShock 4 is detected by SDL as:
+  [PAD] port 0: PS4 Controller (opened)
+
+The user pressed Start, reached the New Game menu, and selected New Game. That
+is runtime proof that the host SDL -> Xbox report -> OHCI/XPP -> JSRF path works
+through a real menu action. The report trace also captured correct Start, A,
+and B press/release edges.
+
+Uncommitted controller changes in the integration worktree:
+
+1. diagnostics/jsrf_first_fault/main.c
+   Defaults RECOMP_OHCI_ATTACH=1 when unset, so a normal harness launch exposes
+   the emulated Xbox USB controller. Previously the physical pad could be open
+   in SDL but invisible to JSRF unless a diagnostic environment variable was
+   supplied.
+
+2. src/input/xinput_device.c
+   Corrects Controller S shoulder mapping in both Windows and SDL paths:
+     White = left shoulder / DualShock L1
+     Black = right shoulder / DualShock R1
+   Official upstream currently maps these in reverse, so this local correction
+   is still required.
+
+3. diagnostics/jsrf_first_fault/input_hotplug_test.c
+   Allows the deterministic virtual-pad test to coexist with a physical pad and
+   verifies every digital and analog field, shoulder mapping, triggers, sticks,
+   hotplug, and disconnect.
+
+4. src/kernel/xbox_usb_ohci.c
+   Expands bounded [USB-PAD] logging to all controls. It filters small stick
+   jitter (requires an axis delta >=4096) so a real DS4 does not consume the
+   400-line diagnostic cap before menu input happens.
+
+Tests already passed with the connected controller:
+  jsrf_input_hotplug
+  jsrf_ohci_register
+  jsrf_ohci_transfer
+
+Do not reopen the theory that the New Game freeze is caused by missing input;
+selection of New Game itself disproves it.
+
+
+NEW GAME FREEZE: EXACT EVIDENCE
+===============================
+The working pre-audio-override executable was sampled after the user selected
+New Game. The sample is:
+  /private/tmp/jsrf-new-game-freeze.sample
+
+Every main-thread sample ended in this guest chain:
+  sub_0016F4B0
+    -> sub_0019F17C
+    -> sub_0019EB2D
+    -> sub_001A490D
+    -> sub_001A40F5
+    -> sub_001A3E58
+    -> sub_001A308E
+
+Original guest routine 0x001A308E is a 15-byte DSOUND busy wait:
+  test byte ptr [ecx+0x12],1
+  je return
+  loop:
+    test word ptr [ecx+0x12],0x8000
+    jne loop
+  return
+
+While the main thread stayed in that loop, the DSOUND worker was blocked in
+bridge_RtlEnterCriticalSection. Renderer, USB/OHCI, and APU threads remained
+alive. Post-freeze kernel-call accounting rose to roughly 484 million calls,
+dominated by critical-section/IRQL churn. This identifies a scheduling/completion
+deadlock in the guest DSOUND path, not an input or graphics freeze.
+
+The title's real completion path at 0x001A2FB5 tests object+0x12 bit 15. At
+0x001A2FBE it clears exactly that bit with:
+  and word ptr [esi+0x12],0x7fff
+then returns without other object work in this case.
+
+Existing repository evidence independently describes the same spin in:
+  JSRF_GOALS_2026-09-05_GAMEPLAY.md
+and the harness already contains jsrf_audio_completion_probe.
+
+
+MINIMAL AUDIO OVERRIDE NOW IMPLEMENTED
+======================================
+File:
+  diagnostics/jsrf_first_fault/jsrf_manual_overrides.c
+
+Added manual function sub_001A308E. If object+0x12 bit 0 says this wait applies,
+it clears only bit 15, preserving all other flags, then performs thiscall return
+stack adjustment. This mirrors the observed hardware completion transition and
+avoids the impossible busy wait while the main execution chain owns progress.
+
+The generated source was regenerated with 0x001A308E excluded as a manual
+function. Generated calls now use RECOMP_ICALL_SAFE(... 0x001A308E ...) and the
+dispatch table maps 0x001A308E to the manual symbol. Build and link succeeded.
+
+Instrumentation maintenance:
+  diagnostics/jsrf_first_fault/instrument_startup.py
+
+The removed manual function no longer has a generated loc_001A308E label, and
+the three remaining DSOUND probe labels moved from recomp_0009.c to
+recomp_0010.c. The instrumentation map was updated accordingly. It installs
+84 fixed observation sites successfully.
+
+
+CODEBERG JSRF-DECOMPILATION COVERAGE
+====================================
+Repository checked:
+  https://codeberg.org/KeybadeBlox/JSRF-Decompilation
+
+Checked commit:
+  94fa956e42ea641e20c8de126a4762bfe1c600f2
+  2026-09-08 "Update progress"
+
+Answer: it covers useful game-level naming and a small amount of matching
+decompilation, but it does NOT cover the current DSOUND completion freeze.
+
+Direct evidence:
+  ghidra/objects.csv explicitly says:
+    DirectSound8 (need to decompose), false, ... 0x0019E340-0x001BA89B
+
+That address range includes 0x001A308E and 0x001A2FBE. Neither address is named
+or decompiled there.
+
+Useful symbols supplied by its ghidra/symboltable.tsv include:
+  0x00065940 initInputs_MAYBE
+  0x000659C0 readInput
+  0x0005F250 CMusashi::createControllerCOM_MAYBE
+  0x0015FD40 ControllerCOM_MAYBE Release candidate
+  0x001616F0 ControllerCOM_MAYBE constructor candidate
+  0x00118610 CTrtSoundXbox::execNormal
+  0x00118630 CTrtSoundXbox::execEvent
+  0x00118C00 CTrtSoundXbox constructor
+  0x001BDAA9 initUnknownStaticXPP
+
+These names can improve future game-level call-chain annotation and may help
+with controller/game sound investigation. They do not implement Xbox XPP,
+DirectSound8, OHCI, the host controller backend, or the current completion
+semantics.
+
+Its actual decompiled source set is still small:
+  JSRF/ActSequence.cpp
+  JSRF/Action.cpp
+  JSRF/Jet2.cpp
+  JSRF/SaveData.cpp
+  MUSASHI/MMatrix.cpp
+  XDK/Xapi/xapi0.c
+plus headers/stubs. It is a reference, not a drop-in replacement for this
+recompilation/runtime port.
+
+
+BUILD AND TEST STATUS
+=====================
+Fresh generated output:
+  xboxrecomp_upstream_integration/build-macos/jsrf-first-fault/gen
+
+Temporary build:
+  /private/tmp/jsrf-integration-audio-build
+
+Build result:
+  PASS; jsrf_first_fault linked with the manual 0x001A308E override.
+
+All 26 deterministic tests other than the unresolved-flags ratchet pass after
+restoring the established backports. The backport scripts were made compatible
+with current upstream's longer "UNRESOLVED FLAGS, branch never taken" comments:
+  backport_empty_list_guard.py
+  backport_challenge_flag_merge.py
+  backport_exec_state_merge.py
+
+Current generated-code audit:
+  clean upstream-integration generation: 112 dead _flags fallbacks
+  dirty main tree's previously working generation: 76 dead _flags fallbacks
+
+Do not change the ratchet threshold from 76 to 112. This is a real integration
+gap: the dirty main tree contains recompiler/generated-state improvements that
+are not yet represented in the clean integration generation.
+
+
+LATEST LIVE-RUN RESULT AND IMPORTANT LIMITATION
+===============================================
+The newly regenerated clean-integration executable was launched to test the
+audio override, but it faulted during startup before reaching the menus:
+
+  [STUB] unresolved target 0x00154DAA ran (not detected)
+  [STUB] unresolved target 0x0015A0F9 ran
+  [ICALL] skipped not-code target 0x89E85596
+  FIRST GUEST FAULT in/after sub_00177FE0
+
+Therefore:
+  - The manual audio override compiles, links, and dispatches correctly.
+  - It has NOT yet been verified after selecting New Game.
+  - This early startup fault is separate from the prior New Game DSOUND freeze.
+  - Do not claim the audio fix passed or failed in-game based on this run.
+
+The most likely next bounded action is to reconcile the clean integration's
+function-discovery/flag-generation state with the known-working dirty-tree
+generated state, without weakening tests and without changing graphics. Once
+the integration executable again reaches the existing menu state, select New
+Game and verify that the main thread no longer remains in 0x001A308E. If it
+advances, assess the next actual fault and sound quality separately.
+
+
+CURRENT UNCOMMITTED SOURCE FILES
+================================
+  diagnostics/jsrf_first_fault/backport_challenge_flag_merge.py
+  diagnostics/jsrf_first_fault/backport_empty_list_guard.py
+  diagnostics/jsrf_first_fault/backport_exec_state_merge.py
+  diagnostics/jsrf_first_fault/input_hotplug_test.c
+  diagnostics/jsrf_first_fault/instrument_startup.py
+  diagnostics/jsrf_first_fault/jsrf_manual_overrides.c
+  diagnostics/jsrf_first_fault/main.c
+  src/input/xinput_device.c
+  src/kernel/xbox_usb_ohci.c
+
+Plus this handover file.
+
+Review the diff before changing anything. Preserve prior Metal/graphics commits
+and do not mix a broad graphics redesign into this controller/audio recovery.

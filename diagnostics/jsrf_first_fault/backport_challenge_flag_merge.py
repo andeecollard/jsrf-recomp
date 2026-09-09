@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 
 OLD = 'if (_flags /* jne: not equal / not zero */) goto loc_000153BC;'
+OLD_CURRENT = ('if (_flags /* jne: not equal / not zero - UNRESOLVED FLAGS, '
+               'branch never taken */) goto loc_000153BC;')
 NEW = 'if (CMP_NE(_fa, _fb)) goto loc_000153BC; /* jne: not equal / not zero */'
 
 
@@ -22,12 +24,13 @@ def patch(text):
     body = m.group(2)
     if NEW in body:
         return text
-    if body.count(OLD) != 1:
+    candidates = [old for old in (OLD, OLD_CURRENT) if body.count(old) == 1]
+    if len(candidates) != 1:
         raise ValueError('unexpected 0x15275 branch')
     # This branch is no longer unresolved; preserve all other instrumentation.
     body = '\n'.join(line for line in body.split('\n')
                      if 'jsrf_unresolved_flag_probe(' not in line)
-    body = body.replace(OLD, NEW)
+    body = body.replace(candidates[0], NEW)
     return text[:m.start(2)] + body + text[m.end(2):]
 
 

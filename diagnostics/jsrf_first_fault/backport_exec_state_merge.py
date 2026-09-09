@@ -11,6 +11,8 @@ import re
 
 OLD = ('    if (_flags /* jne: not equal / not zero */) '
        'goto loc_000153BC;')
+OLD_CURRENT = ('    if (_flags /* jne: not equal / not zero - UNRESOLVED '
+               'FLAGS, branch never taken */) goto loc_000153BC;')
 NEW = ('    if (_flags) goto loc_000153BC; '
        '/* resolved incoming NZ at 0x153A9 */')
 ARMS = {0x1520C: '((_fa & _fb) != 0)',
@@ -51,7 +53,8 @@ def patch(text):
     if NEW not in body:
         wrong = ('    if (CMP_NE(_fa, _fb)) goto loc_000153BC; '
                  '/* jne: not equal / not zero */')
-        candidates = [old for old in (OLD, wrong) if body.count(old) == 1]
+        candidates = [old for old in (OLD, OLD_CURRENT, wrong)
+                      if body.count(old) == 1]
         if len(candidates) != 1:
             raise ValueError('unexpected 0x153A9 branch')
         body = '\n'.join(l for l in body.split('\n')

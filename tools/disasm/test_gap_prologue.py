@@ -58,12 +58,15 @@ class _Engine:
         return self._stub
 
 
-def _detector(insns, functions, prologues):
+def _detector(insns, functions, prologues, aliases=None):
     det = FunctionDetector.__new__(FunctionDetector)
     det.engine = _Engine(insns, prologues)
     det.image = _Image()
     det.functions = {f.start: f for f in functions}
     det._candidates = {}
+    # Bodies claimed by a pending alias entry count as covered too; they only
+    # become Functions in _build_alias_entries, which runs after this pass.
+    det._alias_entries = dict(aliases or {})
     det.added = []
     det._add_candidate = lambda addr, conf, why: det.added.append((addr, why))
     return det
@@ -85,6 +88,30 @@ class GapPrologueTest(unittest.TestCase):
         det = _detector(insns, funcs, prologues={0x00476EB0})
         self.assertFalse(det._pass_gap_prologues([]))
         self.assertEqual(det.added, [])
+
+    def test_a_body_claimed_only_by_an_alias_entry_is_not_split(self):
+        # JSRF sub_00154D70: a switch dispatcher reached only by a tail jump,
+        # so it is an alias entry rather than a Function until the very last
+        # pass. Its cases end in "ret 12" and the next case follows with no
+        # padding, which is exactly the shape this pass hunts for. Splitting it
+        # at 0x00154D82 left the case at 0x00154DAA covered by nothing, and the
+        # stub emitted for it popped 4 bytes where the real block returns 12.
+        insns = [_Insn(0x00154D82, 3, is_ret=True)]
+        funcs = [_Func(0x00154D00, 0x00154D70)]
+        det = _detector(insns, funcs, prologues={0x00154D85},
+                        aliases={0x00154D70: 0x00154E00})
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
+
+    def test_an_alias_entry_does_not_hide_a_later_real_gap(self):
+        # The alias ends at 0x00154E00; a prologue past it is still a find.
+        insns = [_Insn(0x00154D82, 3, is_ret=True), _Insn(0x00154EFF, 1,
+                                                          is_ret=True)]
+        funcs = [_Func(0x00154D00, 0x00154D70), _Func(0x00155000, 0x00155010)]
+        det = _detector(insns, funcs, prologues={0x00154D85, 0x00154F00},
+                        aliases={0x00154D70: 0x00154E00})
+        self.assertTrue(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [(0x00154F00, "gap_prologue")])
 
     def test_bytes_that_are_neither_a_prologue_nor_a_stub_are_ignored(self):
         insns = [_Insn(0x00476EAF, 1, is_ret=True)]
