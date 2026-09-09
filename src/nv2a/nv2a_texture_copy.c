@@ -12,20 +12,38 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     memset(s, 0, sizeof(*s));
     if ((M(0x288)!=0xc && M(0x288)!=0xe) || M(0x28c)!=0x1c80)
         return "combiner / texture program";
-    if (M(0x1e60)<1 || M(0x1e60)>8) return "combiner / texture program";
-    s->combiner_count=M(0x1e60); s->add_specular=M(0x288)==0xe;
-    /* The measured programs write AB+CD to R0 with no dot/mux/output mapping.
-     * Keep those more general output modes explicitly unsupported. */
+    uint32_t control=M(0x1e60),count=control&0xf;
+    /* Count occupies the low nibble. The three high flags select mux and
+     * per-stage C0/C1; the captured six-stage program sets all three. */
+    if (count<1 || count>8 || (control&~0x0001110fu)) return "combiner / texture program";
+    s->combiner_count=count; s->add_specular=M(0x288)==0xe;
+    /* The measured programs use plain AB, CD, or AB+CD routing to R0/R1.
+     * Keep dot, mux, bias and scale modes explicitly unsupported. */
     for (unsigned i=0;i<s->combiner_count;++i) {
-        if (M(0xaa0+4*i)!=0xc00 || M(0x1e40+4*i)!=0xc00)
-            return "combiner output mode";
+        unsigned uses_constant=0;
+        s->color_ocw[i]=M(0x1e40+4*i);s->alpha_ocw[i]=M(0xaa0+4*i);
+        uint32_t outputs[2]={s->color_ocw[i],s->alpha_ocw[i]};
+        for(unsigned j=0;j<2;++j) {
+            if(outputs[j]&~0xfffu) return "combiner output mode";
+            for(unsigned shift=0;shift<12;shift+=4) {
+                unsigned dst=(outputs[j]>>shift)&15;
+                if(dst && dst!=12 && dst!=13) return "combiner output register";
+            }
+        }
         s->color_icw[i]=M(0xac0+4*i); s->alpha_icw[i]=M(0x260+4*i);
         for (unsigned j=0;j<4;++j) {
             unsigned regs[2]={(s->color_icw[i]>>(8*j))&15,(s->alpha_icw[i]>>(8*j))&15};
-            for(unsigned k=0;k<2;++k)
-                if (regs[k]!=0 && regs[k]!=4 && regs[k]!=5 &&
-                        !(regs[k]>=8 && regs[k]<=12)) return "combiner input register";
+            for(unsigned k=0;k<2;++k) {
+                if (regs[k]!=0 && regs[k]!=1 && regs[k]!=2 && regs[k]!=4 && regs[k]!=5 &&
+                        !(regs[k]>=8 && regs[k]<=13)) return "combiner input register";
+                uses_constant|=regs[k]==1 || regs[k]==2;
+            }
         }
+        /* The captured program enables per-stage constants but programs them
+         * all to zero. Refuse nonzero constants until their full routing is
+         * represented rather than silently shading with the wrong value. */
+        if(uses_constant) for(unsigned j=0;j<8;++j)
+            if(M(0xa60+4*j) || M(0xa80+4*j)) return "combiner constant";
     }
     for (unsigned u=0;u<4;++u) {
         unsigned mode=(M(0x1e70)>>(5*u))&31;
@@ -272,7 +290,7 @@ static void sample_lod(const NV2ATextureCopy *s,const uint8_t *data,float u,floa
     for(unsigned k=0;k<4;++k) out[k]=a[k]*(1-f)+b[k]*f;
 }
 
-static float combiner_input(unsigned input,unsigned channel,const float regs[13][4])
+static float combiner_input(unsigned input,unsigned channel,const float regs[14][4])
 {
     unsigned source=input&15;
     float x=regs[source][input&16?3:channel];
@@ -288,20 +306,31 @@ static float combiner_input(unsigned input,unsigned channel,const float regs[13]
     }
 }
 
-static void combine(const NV2ATextureCopy *s,float regs[13][4],float out[4])
+static void combiner_output(float regs[14][4],uint32_t word,unsigned channel,float ab,float cd)
+{
+    unsigned destination[3]={word&15,(word>>4)&15,(word>>8)&15};
+    float value[3]={cd,ab,ab+cd};
+    for(unsigned i=0;i<3;++i) if(destination[i])
+        regs[destination[i]][channel]=fmaxf(-1,fminf(1,value[i]));
+}
+
+static void combine(const NV2ATextureCopy *s,float regs[14][4],float out[4])
 {
     /* R0 alpha starts with texture zero's alpha on NV2A. */
     regs[12][3]=(s->texture_mask&1)?regs[8][3]:1;
     for(unsigned stage=0;stage<s->combiner_count;++stage) {
-        float next[4];
+        float ab[4],cd[4];
         for(unsigned k=0;k<4;++k) {
             unsigned word=k==3?s->alpha_icw[stage]:s->color_icw[stage];
             unsigned channel=k==3?2:k; /* Alpha ICW selects blue or alpha. */
             float a=combiner_input(word>>24,channel,regs), b=combiner_input((word>>16)&255,channel,regs);
             float c=combiner_input((word>>8)&255,channel,regs),d=combiner_input(word&255,channel,regs);
-            next[k]=fmaxf(-1,fminf(1,a*b+c*d));
+            ab[k]=a*b;cd[k]=c*d;
         }
-        memcpy(regs[12],next,sizeof(next));
+        for(unsigned k=0;k<4;++k) {
+            uint32_t word=k==3?s->alpha_ocw[stage]:s->color_ocw[stage];
+            combiner_output(regs,word,k,ab[k],cd[k]);
+        }
     }
     for(unsigned k=0;k<4;++k)
         out[k]=fmaxf(0,fminf(1,regs[12][k]+(s->add_specular && k<3?regs[5][k]:0)));
@@ -444,7 +473,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
         if (!(recip>0)) return 0;
         float rgb[4];
         if(s->combiner_count) {
-            float regs[13][4]={{0}};
+            float regs[14][4]={{0}};
             for(unsigned i=0;i<3;++i) {
                 float w=e[i]/area/v[i][0][3]/recip;
                 for(unsigned k=0;k<4;++k) {

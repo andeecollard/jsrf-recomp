@@ -54,8 +54,8 @@ int main(void) {
     methods[0x304/4]=1;methods[0x344/4]=0;methods[0x348/4]=1;methods[0x350/4]=0x8006;
     CHECK(!nv2a_texture_copy_prepare(methods,&s) && s.blend_src==0 && s.blend_dst==1);
     methods[0x344/4]=0x300;CHECK(nv2a_texture_copy_prepare(methods,&s));
-    methods[0x304/4]=0; methods[0xac0/4]^=1; CHECK(nv2a_texture_copy_prepare(methods,&s));
-    methods[0xac0/4]^=1; methods[0x1b0c/4]|=4; CHECK(nv2a_texture_copy_prepare(methods,&s));
+    methods[0x304/4]=0; methods[0xac0/4]^=3; CHECK(nv2a_texture_copy_prepare(methods,&s));
+    methods[0xac0/4]^=3; methods[0x1b0c/4]|=4; CHECK(nv2a_texture_copy_prepare(methods,&s));
     copy_methods(methods,3,2,8,8,2); CHECK(!nv2a_texture_copy_prepare(methods,&s));
     memset(target,0xcc,sizeof(target)); CHECK(DRAW());
     CHECK(!memcmp(texture,target,6)); CHECK(!memcmp(texture+8,target+8,6));
@@ -87,9 +87,23 @@ int main(void) {
     CHECK(target[0]==0 && target[1]==0x80); /* half red, not the original full red */
     s.dither=1; memset(target,0xcc,sizeof(target));
     CHECK(DRAW()); CHECK(target[0]==0 && target[1]==0x78); /* ordered half-red quantisation */
-    /* Unsupported outputs and constant inputs still reject explicitly. */
+    /* Six-stage control includes mux/per-stage-constant flags in the high
+     * bits. Plain AB routing through R0/R1 is part of the captured JSRF state. */
+    methods[0x1e60/4]=0x00011106;
+    for(unsigned i=4;i<6;++i) {
+        methods[0xac0/4+i]=0x0c200000;methods[0x260/4+i]=0x1c200000;
+        methods[0x1e40/4+i]=methods[0xaa0/4+i]=0xc00;
+    }
+    methods[0x1e40/4]=methods[0xaa0/4]=0xc0;
+    methods[0x1e40/4+1]=methods[0xaa0/4+1]=0xd0;
+    CHECK(!nv2a_texture_copy_prepare(methods,&s));CHECK(s.combiner_count==6);
+    CHECK(s.color_ocw[0]==0xc0 && s.alpha_ocw[1]==0xd0);
+    modulate_methods(methods);
+    /* Unsupported output destinations and nonzero constants reject explicitly. */
     methods[0xaa0/4]=0xc01; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xaa0/4]=0xc00;
-    methods[0xac0/4]=0x01200000; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xac0/4]=0x08040000;
+    methods[0xac0/4]=0x01200000;methods[0xa60/4]=1;
+    CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"combiner constant"));
+    methods[0xac0/4]=0x08040000;methods[0xa60/4]=0;
     methods[0x300/4]=1; CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"alpha test"));
     methods[0x300/4]=0; methods[0x304/4]=1;methods[0x344/4]=0x300;
     CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"blending"));

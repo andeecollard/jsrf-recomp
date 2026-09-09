@@ -41,8 +41,21 @@ int main(void)
         v[i][10][0]=.625f;v[i][10][1]=.125f;v[i][4][1]=0;
     }
     CHECK(DRAW());CHECK(pixel(target)==0x80200000);
+    /* Captured character/effect combiners route AB through R1 before writing
+     * the following stage's AB result to R0. Exercise that path directly. */
+    for(int i=0;i<16;++i) {light[i*4]=0;light[i*4+1]=255;light[i*4+2]=128;light[i*4+3]=128;}
+    for(int i=0;i<3;++i) {
+        v[i][9][0]=v[i][9][1]=v[i][10][0]=v[i][10][1]=.1f;
+        v[i][4][1]=0;
+    }
+    s.add_specular=0;s.combiner_count=2;
+    s.color_icw[0]=0x08040000;s.alpha_icw[0]=0x18140000;
+    s.color_icw[1]=0x0d090000;s.alpha_icw[1]=0x1d190000;
+    s.color_ocw[0]=s.alpha_ocw[0]=0xd0;
+    s.color_ocw[1]=s.alpha_ocw[1]=0xc0;
+    memset(target,0,sizeof(target));CHECK(DRAW());CHECK(pixel(target)==0x40400000);
     m[0x1b0c/4]=0x40000000;
     CHECK(nv2a_texture_copy_prepare(m,&s)); /* Non-default max LOD is not silently ignored. */
-    puts("Two textures, separate alpha, final specular, DXT1 mip selection, swizzle and bounds passed");
+    puts("Two textures, separate alpha, R0/R1 routing, final specular, DXT1 mip selection, swizzle and bounds passed");
     return 0;
 }

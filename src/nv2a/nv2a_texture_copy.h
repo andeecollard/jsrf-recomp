@@ -12,7 +12,8 @@ typedef struct NV2ATextureCopy {
     uint32_t modulate;
     uint32_t rgba8, levels, min_filter;
     float lod_bias;
-    uint32_t combiner_count, color_icw[8], alpha_icw[8], add_specular;
+    uint32_t combiner_count, color_icw[8], alpha_icw[8];
+    uint32_t color_ocw[8], alpha_ocw[8], add_specular;
     uint32_t texture_mask;
     const struct NV2ATextureCopy *extra_stages;
     const uint8_t *extra_texture[3];

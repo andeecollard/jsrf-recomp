@@ -1,4 +1,5 @@
 #include "nv2a_metal.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #define CHECK(x) do { if(!(x)) {fprintf(stderr,"line %d: %s\n",__LINE__,#x);return 1;} } while(0)
@@ -82,7 +83,7 @@ int main(void)
     uint8_t mip[168],stage1[128];
     solid_dxt1(mip,128,0xf800);solid_dxt1(mip+128,32,0x07e0);solid_dxt1(mip+160,8,0x001f);
     s.blend=0;s.dxt1=1;s.width=s.height=16;s.pitch=32;s.levels=3;s.min_filter=5;s.linear=0;s.repeat=1;
-    s.combiner_count=1;s.color_icw[0]=0x08200000;s.alpha_icw[0]=0x18200000;
+    s.combiner_count=1;s.color_icw[0]=0x08200000;s.alpha_icw[0]=0x18200000;s.color_ocw[0]=s.alpha_ocw[0]=0xc00;
     v[1][0][0]=v[2][0][1]=16;v[1][9][0]=v[2][9][1]=4;
     nv2a_metal_invalidate(gpu);memset(cpu,0xcc,sizeof(cpu));memcpy(gpu,cpu,sizeof(cpu));
     CHECK(nv2a_texture_copy_triangle_depth(&s,mip,sizeof(mip),cpu,sizeof(cpu),NULL,0,v[0],v[1],v[2]));
@@ -91,7 +92,7 @@ int main(void)
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
     NV2ATextureCopy extra[3]={{0}};
     solid_dxt1(mip,128,0xf800);solid_dxt1(stage1,sizeof(stage1),0x07e0);
-    s.levels=1;s.texture_mask=3;s.combiner_count=1;s.color_icw[0]=0x09200000;s.alpha_icw[0]=0x19200000;s.extra_stages=extra;
+    s.levels=1;s.texture_mask=3;s.combiner_count=1;s.color_icw[0]=0x09200000;s.alpha_icw[0]=0x19200000;s.color_ocw[0]=s.alpha_ocw[0]=0xc00;s.extra_stages=extra;
     extra[0].dxt1=1;extra[0].width=extra[0].height=16;extra[0].pitch=32;extra[0].levels=1;extra[0].min_filter=1;extra[0].repeat=1;
     s.extra_texture[0]=stage1;s.extra_size[0]=sizeof(stage1);
     for(unsigned i=0;i<3;i++)memcpy(v[i][10],v[i][9],sizeof(v[i][10]));
@@ -100,6 +101,22 @@ int main(void)
     CHECK(nv2a_metal_draw(&s,mip,128,gpu,sizeof(gpu),NULL,0,v,3,5)==1);
     CHECK(nv2a_metal_sync());
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
+    s.combiner_count=2;s.color_icw[0]=0x08040000;s.alpha_icw[0]=0x18140000;
+    s.color_icw[1]=0x0d090000;s.alpha_icw[1]=0x1d190000;
+    s.color_ocw[0]=s.alpha_ocw[0]=0xd0;s.color_ocw[1]=s.alpha_ocw[1]=0xc0;
+    nv2a_metal_invalidate(gpu);memset(cpu,0xcc,sizeof(cpu));memcpy(gpu,cpu,sizeof(cpu));
+    CHECK(nv2a_texture_copy_triangle_depth(&s,mip,128,cpu,sizeof(cpu),NULL,0,v[0],v[1],v[2]));
+    CHECK(nv2a_metal_draw(&s,mip,128,gpu,sizeof(gpu),NULL,0,v,3,5)==1);
+    CHECK(nv2a_metal_sync());CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
+    /* A title batch can contain invalid/cullable triangles alongside valid
+     * ones.  The CPU drops only those triangles; Metal must not send the
+     * entire remaining batch back through the software rasteriser. */
+    float mixed[6][16][4];memcpy(mixed,v,sizeof(v));memcpy(mixed+3,v,sizeof(v));
+    mixed[3][0][0]=NAN;
+    nv2a_metal_invalidate(gpu);memset(cpu,0xcc,sizeof(cpu));memcpy(gpu,cpu,sizeof(cpu));
+    CHECK(nv2a_texture_copy_triangle_depth(&s,mip,128,cpu,sizeof(cpu),NULL,0,v[0],v[1],v[2]));
+    CHECK(nv2a_metal_draw(&s,mip,128,gpu,sizeof(gpu),NULL,0,mixed,6,5)==1);
+    CHECK(nv2a_metal_sync());CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
     s.target_bpp=4;nv2a_metal_invalidate(gpu);memset(gpu,0xcc,sizeof(gpu));memcpy(cpu,gpu,sizeof(cpu));
     CHECK(nv2a_metal_draw(&s,tex,sizeof(tex),gpu,sizeof(gpu),NULL,0,v,3,5)==-1);
     CHECK(!memcmp(cpu,gpu,sizeof(cpu)));
