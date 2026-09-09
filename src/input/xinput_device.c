@@ -246,10 +246,54 @@ static double fake_pad_seconds(void)
          + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
 }
 
+/* Poll accounting for the host pad.
+ *
+ * "[PAD] port 0: ... (opened)" is printed once at startup and says nothing
+ * about a live controller -- it has been logged with the pad unplugged. There
+ * has been no instrument that separates the three ways input can fail:
+ *
+ *   polls=0                  the guest never asks; the fault is guest-side
+ *   polls>0 nonneutral=0     the guest asks and SDL reports nothing pressed
+ *   polls>0 nonneutral>0     input reaches the runtime and is lost later
+ *
+ * Counted here because every consumer -- the emulated USB gamepad and the
+ * report shim alike -- comes through this one function. Read-only. */
+unsigned long g_pad_polls;
+unsigned long g_pad_polls_connected;
+unsigned long g_pad_polls_nonneutral;
+unsigned long g_pad_polls_disconnected;
+
+void xbox_InputPollReport(void)
+{
+    fprintf(stderr, "  [PAD-POLL] polls=%lu connected=%lu nonneutral=%lu"
+            " not_connected=%lu\n",
+            g_pad_polls, g_pad_polls_connected, g_pad_polls_nonneutral,
+            g_pad_polls_disconnected);
+    fflush(stderr);
+}
+
+/* Anything a human would call "pressed or moved". The stick threshold is the
+ * same 4096 the USB report path uses to reject resting jitter. */
+static void pad_note_state(const XBOX_INPUT_STATE *st)
+{
+    int active = st->Gamepad.wButtons != 0;
+    for (int i = 0; !active && i < 8; i++)
+        active = st->Gamepad.bAnalogButtons[i] > 32;
+    if (!active) {
+        active = st->Gamepad.sThumbLX > 4096 || st->Gamepad.sThumbLX < -4096
+              || st->Gamepad.sThumbLY > 4096 || st->Gamepad.sThumbLY < -4096
+              || st->Gamepad.sThumbRX > 4096 || st->Gamepad.sThumbRX < -4096
+              || st->Gamepad.sThumbRY > 4096 || st->Gamepad.sThumbRY < -4096;
+    }
+    if (active)
+        g_pad_polls_nonneutral++;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+    g_pad_polls++;
 
     if (fake_pad_on()) {
         if (dwPort != 0)
@@ -263,6 +307,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
                 pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
             }
         }
+        g_pad_polls_connected++;
+        pad_note_state(pState);
         return ERROR_SUCCESS;
     }
 
@@ -271,11 +317,13 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        g_pad_polls_disconnected++;
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
     SDL_GameControllerUpdate();
     g_controller_connected[dwPort] = TRUE;
+    g_pad_polls_connected++;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = ++g_packet[dwPort];
@@ -321,6 +369,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
 
+    pad_note_state(pState);
     return ERROR_SUCCESS;
 }
 

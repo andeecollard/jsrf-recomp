@@ -57,6 +57,21 @@ int apu_sdl2_is_active(void)
     return g_device != 0;
 }
 
+/* Production accounting, read by mcpx_apu_pacing_report.
+ *
+ * The queue depth is the only thing that says whether the APU is producing at
+ * playback rate: a device consuming 48000 frames a second against a producer
+ * doing the same holds a roughly constant queue, and any mismatch shows up
+ * here as a trend long before it becomes an audible drop. */
+unsigned long g_apu_sdl_batches;
+unsigned long g_apu_sdl_frames;
+unsigned long g_apu_sdl_clears;
+
+unsigned long apu_sdl2_queued_bytes(void)
+{
+    return g_device ? (unsigned long)SDL_GetQueuedAudioSize(g_device) : 0;
+}
+
 int apu_sdl2_submit_samples(const int16_t *samples, int sample_frames)
 {
     unsigned bytes;
@@ -64,6 +79,8 @@ int apu_sdl2_submit_samples(const int16_t *samples, int sample_frames)
 
     if (!g_device || !samples || sample_frames <= 0)
         return 0;
+    g_apu_sdl_batches++;
+    g_apu_sdl_frames += (unsigned long)sample_frames;
     bytes = (unsigned)sample_frames * APU_CHANNELS * sizeof(int16_t);
     for (int i = 0; i < sample_frames * APU_CHANNELS; i++) {
         int magnitude = samples[i] < 0 ? -(int)samples[i] : samples[i];
@@ -78,6 +95,7 @@ int apu_sdl2_submit_samples(const int16_t *samples, int sample_frames)
      * stall or debugger stop. Normal paced playback remains far below this. */
     if (SDL_GetQueuedAudioSize(g_device) > APU_MAX_QUEUE_BYTES) {
         SDL_ClearQueuedAudio(g_device);
+        g_apu_sdl_clears++;
         if (g_dropped_batches++ < 4)
             fprintf(stderr, "[APU-SDL] cleared overfull output queue\n");
     }
@@ -93,6 +111,12 @@ int apu_sdl2_submit_samples(const int16_t *samples, int sample_frames)
 int apu_sdl2_init(void) { return 0; }
 void apu_sdl2_shutdown(void) {}
 int apu_sdl2_is_active(void) { return 0; }
+unsigned long g_apu_sdl_batches;
+unsigned long g_apu_sdl_frames;
+unsigned long g_apu_sdl_clears;
+
+unsigned long apu_sdl2_queued_bytes(void) { return 0; }
+
 int apu_sdl2_submit_samples(const int16_t *samples, int sample_frames)
 {
     (void)samples;

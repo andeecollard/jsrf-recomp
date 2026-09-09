@@ -939,6 +939,19 @@ static void jsrf_pusher_report(void)
             extern void xbox_McpxTrapReport(void);
             xbox_McpxTrapReport();
         }
+        /* And whether the samples those voices produce are leaving at the
+         * rate the device consumes them. gen_hz against 48000 is the whole
+         * question; the queue depth and clear count say what it costs. */
+        {
+            extern void mcpx_apu_pacing_report(void);
+            mcpx_apu_pacing_report();
+        }
+        /* Whether the pad is being asked, and whether it answers. The
+         * "(opened)" line at startup answers neither. */
+        {
+            extern void xbox_InputPollReport(void);
+            xbox_InputPollReport();
+        }
         pad_sentinel_scan();
         /* The allocator prints its owner breakdown once, when a request
          * fails. That names who holds the heap at the end and says nothing
