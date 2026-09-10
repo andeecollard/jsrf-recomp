@@ -5,6 +5,7 @@
 #include "nv2a_vsh.h"
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 #define M(a) m[(a)/4]
 const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s)
@@ -63,6 +64,31 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     s->alpha_test=M(0x300); s->alpha_ref=M(0x340);
     if (M(0x304)) {
         uint32_t src=M(0x344),dst=M(0x348);
+        /* Every distinct blend combination the title actually asks for, logged
+         * before the accept test rather than after, because the interesting
+         * ones are precisely those this function is about to refuse. Bounded
+         * to eight lines: the set is tiny, and a per-draw log would bury it.
+         *
+         * The reason it exists: xemu issues DST_COLOR/ZERO (0x306/0x0) during
+         * the intro cards, a multiply blend of the sort a fade-to-black uses,
+         * and that pair is outside the set accepted below. Whether our guest
+         * asks for the same thing decides where the missing fade lives -- a
+         * refusal here, or a draw the title never makes. rejected=0 says it is
+         * not being refused, so the combinations actually seen are the
+         * evidence that settles it. */
+        {
+            static uint32_t seen[8]; static int n; int i;
+            uint32_t key = (src<<16) ^ dst ^ (M(0x350)<<1);
+            for (i=0;i<n;i++) if (seen[i]==key) break;
+            if (i==n && n<8) {
+                seen[n++]=key;
+                fprintf(stderr, "  [BLEND] enable=%u src=0x%X dst=0x%X eq=0x%X%s\n",
+                        M(0x304), src, dst, M(0x350),
+                        (M(0x304)!=1 || (src!=0 && src!=1 && src!=0x302 && src!=0x303)
+                         || (dst!=0 && dst!=1 && dst!=0x302 && dst!=0x303)
+                         || M(0x350)!=0x8006) ? "  REFUSED" : "");
+            }
+        }
         if (M(0x304)!=1 || (src!=0 && src!=1 && src!=0x302 && src!=0x303)
                 || (dst!=0 && dst!=1 && dst!=0x302 && dst!=0x303)
                 || M(0x350)!=0x8006) return "blending";
