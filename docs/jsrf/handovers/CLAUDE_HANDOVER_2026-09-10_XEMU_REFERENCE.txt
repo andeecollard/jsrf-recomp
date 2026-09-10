@@ -1,0 +1,224 @@
+JSRF HANDOVER — THE xemu REFERENCE, AND EIGHT HYPOTHESES IT KILLED
+Date: 2026-09-10 (Europe/London)
+From: Claude
+
+PURPOSE
+=======
+This session built a ground-truth reference rig against xemu and pointed it at
+the recomp. The headline is not a fix. It is that the audio investigation is
+closed, and that eight renderer hypotheses -- several of them mine, stated with
+more confidence than they deserved -- died on measurement without a single line
+being patched around them.
+
+Read the "WHAT NOT TO RE-DERIVE" section before forming a theory. Most of the
+obvious ones are already spent.
+
+
+THE RIG
+=======
+xemu 0.8.136 is configured for the *US* ISO, the same title we target, so it is
+a legitimate oracle. Three instruments, none requiring changes to the host:
+
+  Audio, sample-exact:
+    SDL_AUDIO_DRIVER=disk
+    SDL_AUDIO_DISK_OUTPUT_FILE=<path>
+    SDL_AUDIO_DISK_TIMESCALE=1
+  Writes raw S16LE / 48000 / stereo straight from the APU. TIMESCALE is a
+  direct multiplier, NOT a percentage: the plausible-looking 100 runs it ~100x
+  too slowly. This takes audio off the speakers for that run.
+  `-audiodev wav` does NOT work -- xemu exits with "no default audio driver
+  available", because APU output goes through SDL, not QEMU audiodev.
+
+  Method traces, gated:
+    -monitor unix:/tmp/xemu-mon,server,nowait
+    printf 'trace-event nv2a_pgraph_method on\n' | nc -U /tmp/xemu-mon
+  Two seconds is 40 MB / 544k methods. Leaving it on from boot is ~10 GB, so
+  gate it at the monitor rather than at launch. Same for mcpx_apu_method.
+
+  Live state diff:
+    scratchpad/mode_finder.py -- snapshot the game object over the GDB stub
+    (-s, port 1234) in two states, filter noise with a same-state pair.
+  6 noisy dwords out of 8704 across a state change. Excellent signal. This is
+  the most reusable thing built today.
+
+Video capture is `ffmpeg -f avfoundation -i "3:"`. Wrap xemu AND ffmpeg in
+`caffeinate -dimsu` or the Mac locks mid-run and wastes the take.
+
+
+REFERENCE NUMBERS (US ISO)
+==========================
+Boot -> title:
+  chime 0.5-8.5 s; then EXACTLY 40 s of all-zero samples; music from 49.3 s,
+  sustained. RMS ~-21 dBFS, peak ~10100/32767 (~-10 dBFS). JSRF's mix sits
+  about 10 dB below full scale -- worth knowing before "our audio is quiet".
+  12 voices, handles 0x40-0x4B.
+
+Voice lifecycle, and it is scene-dependent -- do not generalise either row:
+                 VOICE_ON  VOICE_OFF  VOICE_RELEASE  SE2FE_IDLE_VOICE  handles
+  boot -> title       40          3            72                59   0x40-0x4B
+  gameplay            61         60             0                61   0-10,68-70
+
+Draw rates, both counting one per BEGIN_END pair:
+  xemu, tutorial start          102 draws/frame   strip 2002 fan 425 quad 24
+  xemu, past the Corn cutscene  150 draws/frame   strip 2739 fan 420
+  ours, stuck tutorial          200 draws/frame
+xemu itself swings 102 -> 150 between two scenes of one level, so our 200 is
+inside scene variance. There is NO established draw-rate divergence.
+
+
+WHAT WAS SETTLED
+================
+The audio investigation is closed. Commit bc4a9b5 deferred its real test to
+gameplay, where one-shot voices retire. Measured there:
+
+  [APU-VOICE] on=13 off=8 release=0 idle_trap=11 fe_methods=17613
+              set_current_voice=5633
+
+idle_trap is 11, not 0 -- the trap fires. release=0 beside off=8 matches xemu's
+gameplay profile exactly (xemu: 0 releases, 60 offs). set_current_voice=5633
+against xemu's 8608 is the same order of magnitude. An earlier reading of 12
+that looked like a three-orders-of-magnitude routing gap was a title-screen
+artifact and nothing more.
+
+One real change is in the tree (src/apu/apu_vp.c, uncommitted): a
+g_apu_voice_release_count, incremented in NV1BA0_PIO_VOICE_RELEASE and reported
+as release=. It exists because off= increments only inside voice_off(), which is
+reachable only from VOICE_OFF, and at boot/title JSRF releases 72 voices against
+3 offs. off=0 would have read identically had all 72 been released. Built clean,
+27/27 ctest.
+
+
+WHAT NOT TO RE-DERIVE
+=====================
+Each of these was proposed, tested, and killed. None was patched around.
+
+  APU/audio front end broken
+    -> idle_trap=11, off=8, release=0 at gameplay, matching xemu.
+
+  The executor discards transform and texture state
+    -> WRONG, and this one is a trap worth naming. The executor's "unhandled"
+       list shows SET_MODEL_VIEW_MATRIX and SET_TEXTURE_OFFSET/FORMAT with
+       hundreds of thousands of hits. But nv2a_pb_exec.c:1729 stores EVERY
+       aligned method below 0x2000 into s_methods[] *before* the switch runs,
+       and s_methods[] is exactly what nv2a_ff_vertex() and
+       nv2a_texture_copy_prepare() read. note_unhandled() only counts; it is a
+       label meaning "no explicit case", not "dropped". CLAUDE.md already warns
+       about the D3D11 sink's method list. The executor's list is the same trap
+       wearing a different hat. The tell was that textures visibly work.
+
+  A corrupted matrix in guest RAM
+    -> RECOMP_FIND_NAN reports "none in RAM" at every scan. Its own message is
+       the useful part: the NaNs are computed into registers, not stored.
+
+  Entities destroyed / Corn's object killed
+    -> 67 live registered, 67 walked, ZERO marked dead, at the frozen tutorial.
+
+  Geometry culled by us
+    -> 0 batches skipped as not screen-space, 0 triangles fully off-surface.
+
+  Batches rejected wholesale
+    -> 640 rejects out of 665738 batches (0.1%).
+
+  A missing depth clear (xemu clears 2x/frame, we count 1)
+    -> counter artifact. clear_surface() performs the Z clear at
+       nv2a_pb_exec.c:845-851, BEFORE the early return at :854 that skips only
+       the colour fill and the s_gpu.clears++ increment. Behaviour correct.
+
+  Cutscenes never enter "event" mode, so event-mode draw methods never run
+    -> FALSIFIED by positive control. Diffed the game object across three
+       states in xemu. Pause sets +0x3C and +0x40 to 1 -- so the offsets, the
+       object and the method are all sound. The Corn cutscene reads ALL ZERO,
+       identical to normal gameplay. Cutscenes are not driven through the mode
+       booleans, and all-zero is the NORMAL reading, not a symptom.
+
+That last one deserves a note. docs and memory have recorded the mode flags as
+"all zero for the whole boot" since 2026-09-04, phrased in a way that invites
+suspicion. That phrasing is what cost a session's hypothesis. All-zero is
+correct outside of pause.
+
+
+COUNTERS IN THIS TREE THAT LIE
+==============================
+Four found misleading in one day. Read a counter's trigger before its value.
+
+  off=            blind to VOICE_RELEASE (now paired with release=)
+  [PUSHER] draws= always 0 by construction (already in CLAUDE.md)
+  [GPU] unhandled= "no explicit case", not "value dropped"
+  [FB] sum=/same   probes a fixed address; reads a retired surface as all-zero
+                   while the live surface has moved (double buffering)
+  [GPU] clears=    does not count depth-only clears
+
+
+THE FOUR USER-VISIBLE FAULTS, WITH WHAT IS KNOWN
+================================================
+1. Intro title cards: wrong colour, no fade in/out.
+   The architecture video describes this exact draw path and it is small: the
+   opening object "paints the whole screen in appropriate color, black or
+   white, sets the active texture to whatever logo or legal notice is supposed
+   to be on screen, and renders it". A fullscreen quad plus a texture plus an
+   alpha ramp. Both symptoms -- wrong colour AND absent fade -- are consistent
+   with one blend/alpha fault. We hold exact reference frames for every card in
+   scratchpad/xemu_ref/run3/reference_av.mp4.
+
+2. Playback speed slow.
+   Ours measured 15.2 fps at the tutorial (152 flips / 10 s). JSRF targets 30,
+   so roughly half speed. NOTE: the xemu figures of 10.5-12 fps in this document
+   were taken while the pgraph trace or the GDB stub was active and are NOT a
+   fair baseline for xemu's true speed. Take a clean xemu fps measurement before
+   concluding anything about relative performance.
+   The APU thread is not the bottleneck: elapsed=740.3s slept=738.1s.
+
+3. Sound glitchy and choppy. This is measured and it is a delivery fault, not
+   a mixing fault:
+     [APU-SDL2] max_submit_gap=71.0 ms gaps_over_cushion=22
+     [APU-PACE] starved=15 empty=5 min_queued=0 bytes (0.0 ms)
+     [APU-SDL2] depth buckets: 0=5 <1=10 1-2=89 2-4=38393 4-8=98375 8+=1838
+   The queue ran completely dry 5 times and 22 submit gaps exceeded the
+   cushion, the worst at 71 ms. Generation is fine -- gen_hz=47983 against a
+   48000 target. So the mixer produces correct audio at the correct rate and
+   then fails to hand it over on time. That is a scheduling problem, and it is
+   very likely the same stall that costs the frame rate in (2).
+
+4. Tutorial does not render or work properly: no player, Corn vanishes, text
+   glitchy. Everything in WHAT NOT TO RE-DERIVE was aimed at this and missed.
+
+
+THE STRONGEST UNTESTED LEAD
+===========================
+From the decompilation author's architecture video:
+
+  "There are a few other trees on linked lists used by the draw phase as well,
+   not to mention every game object has a few flags that determine how it's
+   used in the draw phase."
+
+The 67-node walk that found zero dead objects traversed the EXEC tree. The draw
+phase uses different structures, and nobody has looked at them. A character can
+be perfectly alive in the exec tree and absent from the draw lists, which would
+present exactly as observed: world renders, characters do not, nothing is
+culled, nothing is rejected, every method arrives.
+
+mode_finder.py is the tool: diff the game object between a frame where a
+character is visible and one where it is not.
+
+
+SUGGESTED ORDER
+===============
+Take (1) first. It is isolated, its draw path is documented, it is reproducible
+without reaching gameplay, and we hold frame-exact reference for it. A blend or
+alpha fault found there plausibly explains the glitchy tutorial text too, and it
+is the only one of the four that can be iterated in ten-second runs.
+
+Then (3), because it is measured, bounded, and probably shares a root cause with
+(2). Then (2) with a clean xemu baseline. Then (4), via the draw-phase trees.
+
+
+NOT DONE
+========
+  - No fix was implemented for any of the four faults.
+  - No commit was created; four files are modified in the working tree
+    (main.c, apu_core.c, apu_sdl2.c from earlier sessions; apu_vp.c from this
+    one).
+  - No generated code was regenerated; the verified archived gen was used
+    throughout (hashes checked against RESTORE_MANIFEST.txt).
+  - The 449 "oPos is not finite" batch rejects, a count that climbs steadily
+    through a run, remain unexplained. Too few to hide the characters, but real.

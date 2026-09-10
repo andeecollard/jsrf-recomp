@@ -131,9 +131,20 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * (voice_off -> SE2FE_IDLE_VOICE). A silent JSRF run shows the trap never
  * being raised, which narrows to either "no voice ever starts" or "voices
  * start and never reach an exhaustion path". Nothing distinguished those,
- * because neither transition was counted. */
+ * because neither transition was counted.
+ *
+ * off= alone cannot make that split for this title, because it counts only
+ * voice_off, and voice_off is reached only from VOICE_OFF. JSRF retires
+ * almost everything with VOICE_RELEASE instead: measured against xemu on the
+ * same US title, boot to title screen issues VOICE_RELEASE 72 times against
+ * VOICE_OFF 3. So off=0 is what a run reports whether nothing was released or
+ * seventy-two voices were, and the two need separate counters to be told
+ * apart. release= is the request; off= is the retirement it should eventually
+ * produce once the envelope reaches zero. release>0 beside off=0 is a
+ * release that never completes -- a distinct fault from never releasing. */
 unsigned long g_apu_voice_on_count;
 unsigned long g_apu_voice_off_count;
+unsigned long g_apu_voice_release_count;
 unsigned long g_apu_idle_trap_count;
 unsigned long g_apu_voice_process_count;
 
@@ -152,9 +163,11 @@ unsigned long g_apu_voice_on_loop_count;
 
 void mcpx_apu_voice_report(void)
 {
-    fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu idle_trap=%lu processed=%lu"
+    fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu release=%lu idle_trap=%lu"
+            " processed=%lu"
             " fe_methods=%lu set_current_voice=%lu on_loop=%lu\n",
             g_apu_voice_on_count, g_apu_voice_off_count,
+            g_apu_voice_release_count,
             g_apu_idle_trap_count, g_apu_voice_process_count,
             g_apu_fe_method_count, g_apu_set_current_voice_count,
             g_apu_voice_on_loop_count);
@@ -328,6 +341,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_RELEASE: {
+        g_apu_voice_release_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
