@@ -930,6 +930,8 @@ static void jsrf_pusher_report(void)
         {
             extern void mcpx_apu_frame_report(void);
             mcpx_apu_frame_report();
+            extern void xbox_VblankReport(void);
+            xbox_VblankReport();
         }
         /* And the boundary those voices have to cross. The APU aperture is
          * guarded read-only so stores fault and reach the model; anything the
