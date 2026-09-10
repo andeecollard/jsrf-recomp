@@ -864,11 +864,27 @@ static void clear_surface(uint32_t param)
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
+            /* NV097_SET_COLOR_CLEAR_VALUE arrives already in the surface's own
+             * format, so a 16-bit surface takes the low half verbatim. It is
+             * tempting to treat it as A8R8G8B8 and reduce it to 5:6:5 -- this
+             * did -- but D3D converts the D3DCOLOR the caller passed to Clear
+             * into surface format before it ever reaches the pushbuffer, so
+             * converting again is a second reduction of an already-reduced
+             * value.
+             *
+             * JSRF's opening cards are what exposed it. Every clear value the
+             * title issues has a zero upper half, and reducing again drops the
+             * red field on the floor:
+             *
+             *   0x0000FFFF  white  -> (0,255,255) cyan
+             *   0x000020E4  grey   -> (0,32,224)  blue
+             *   0x00000000  black  -> black, which is why this survived
+             *
+             * Read as the R5G6B5 they are, those are (255,255,255) and
+             * (32,28,32), matching xemu's (227,226,229) and (30,27,30) on the
+             * same cards. Only the black case agreed before, and black is the
+             * one value both readings share. */
+            uint16_t v = (uint16_t)s_gpu.clear_color;
             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = v;
