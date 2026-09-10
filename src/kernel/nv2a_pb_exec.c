@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>     /* ptrdiff_t; MSVC gets it via another header */
+#include <time.h>      /* clock_gettime, for the opt-in traces below */
 
 /* strtok_s is MSVC's name for what POSIX calls strtok_r. Same signature and
  * same semantics, so one alias covers it rather than restructuring the two
@@ -152,6 +153,256 @@ static unsigned s_combiner_count;
 static uint64_t s_combiner_overflow;
 static int s_combiner_capture;
 static struct { const char *reason; uint64_t count; } s_texture_reasons[32];
+
+/* Blend state as the guest programs it, rather than as a draw samples it.
+ *
+ * The [BLEND] line in nv2a_texture_copy_prepare() reads the blend methods at
+ * the moment a batch is prepared, and a batch only gets that far after
+ * surviving the vertex stage and that function's own early returns. A
+ * configuration the title programs, draws one quad with, and puts back before
+ * the next surviving batch leaves no trace there at all. So "the guest never
+ * asks for DST_COLOR/ZERO" was an absence measured downstream of two filters,
+ * either of which can swallow the asking.
+ *
+ * This sits on the method write, which nothing filters: every distinct
+ * (enable, sfactor, dfactor, equation) the title ever programs, counted, with
+ * the draw span it was live across. The combination already known to be asked
+ * for is the positive control -- if 0x302/0x303/0x8006 is missing from this
+ * list then the instrument is wrong, not the title.
+ *
+ * Read-only, opt-in via RECOMP_BLEND_TRACE, bounded to sixteen entries. */
+#define BLEND_TRACE_MAX 16
+static struct {
+    uint32_t en, src, dst, eq, first_draw, last_draw;
+    uint32_t clear_at_first, format_at_first;
+    double first_t, last_t;
+    uint64_t hits;
+} s_blend_trace[BLEND_TRACE_MAX];
+static unsigned s_blend_trace_count;
+static uint64_t s_blend_trace_writes, s_blend_trace_overflow;
+
+/* Which combination is in force right now, as an index into the table above,
+ * so the draw path can report the fate of the batches drawn under it. -1 until
+ * the first write. */
+static int s_blend_current = -1;
+
+/* The fate of every batch drawn while a multiply blend is programmed.
+ *
+ * 270 programmings of DST_COLOR/ZERO produced 80 refusals, and those two
+ * numbers cannot both describe the same event. The gap is either batches dying
+ * before they reach the accept test, or programmings that are never drawn
+ * under at all -- a different fault with a different fix. Counting the batch
+ * at each stage of the draw path separates them.
+ *
+ * "multiply" here means sfactor DST_COLOR, which is the shape a fade-to-black
+ * uses; the dfactor is recorded beside it rather than tested, because the
+ * title programs the two methods one at a time and the intermediate tuple is
+ * real state that a draw can land in. */
+static struct {
+    uint64_t batches, short_idx, vsh_rejected, prepare_rejected, rasterised;
+} s_blend_fade_fate;
+
+/* Elapsed seconds for the traces below.
+ *
+ * Deliberately not trace_seconds(): several unit tests link this
+ * translation unit without the platform library, and referencing it there
+ * costs a link error for a diagnostic none of them enable. The origin is the
+ * first traced write, which the guest issues during D3D initialisation, so
+ * this reads within a millisecond of the [FB] timeline it is compared against. */
+static double trace_seconds(void)
+{
+    static struct timespec origin;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!origin.tv_sec && !origin.tv_nsec) origin = now;
+    return (double)(now.tv_sec - origin.tv_sec)
+         + (double)(now.tv_nsec - origin.tv_nsec) / 1e9;
+}
+
+/* Distinct clear values, with the span of time each was live across. */
+#define CLEAR_TRACE_MAX 16
+static struct {
+    uint32_t value, format, first_draw, last_draw;
+    double first_t, last_t;
+    uint64_t hits;
+} s_clear_trace[CLEAR_TRACE_MAX];
+static unsigned s_clear_trace_count;
+static uint64_t s_clear_trace_overflow;
+
+static void note_clear_value(uint32_t param)
+{
+    static int on = -1;
+    unsigned i;
+
+    if (on < 0) on = getenv("RECOMP_BLEND_TRACE") ? 1 : 0;
+    if (!on) return;
+    for (i = 0; i < s_clear_trace_count; ++i)
+        if (s_clear_trace[i].value == param) {
+            ++s_clear_trace[i].hits;
+            s_clear_trace[i].last_t = trace_seconds();
+            s_clear_trace[i].last_draw = s_gpu.draws;
+            return;
+        }
+    if (s_clear_trace_count >= CLEAR_TRACE_MAX) { ++s_clear_trace_overflow; return; }
+    i = s_clear_trace_count++;
+    s_clear_trace[i].value = param;
+    s_clear_trace[i].format = s_gpu.format;
+    s_clear_trace[i].hits = 1;
+    s_clear_trace[i].first_t = s_clear_trace[i].last_t = trace_seconds();
+    s_clear_trace[i].first_draw = s_clear_trace[i].last_draw = s_gpu.draws;
+    fprintf(stderr, "  [CLEAR-SEQ] new value at t=%.2f draw %u: 0x%08X"
+            " (format=0x%X)\n", s_clear_trace[i].first_t, s_gpu.draws,
+            param, s_gpu.format);
+    fflush(stderr);
+}
+
+/* The diffuse alpha the title actually supplies, per batch.
+ *
+ * xemu draws the opening cards with the same blend we do -- SRC_ALPHA /
+ * ONE_MINUS_SRC_ALPHA -- and holds every combiner factor at 0xffffffff across
+ * the whole card, so the ramp it displays cannot come from the blend mode or
+ * from a combiner constant. That leaves the vertex diffuse alpha as the only
+ * place the fade level can arrive, which makes "what alpha do our vertices
+ * carry while the card is up" the question that separates a guest that never
+ * computes the ramp from a renderer that computes it and throws it away.
+ *
+ * Quantised to 1/255 and tabulated, because the interesting shape is the set
+ * of distinct levels over the card: a ramp is many, a cut is one or two. */
+#define ALPHA_TRACE_MAX 24
+static struct {
+    unsigned level;
+    uint32_t first_draw, last_draw;
+    double first_t, last_t;
+    uint64_t hits;
+} s_alpha_trace[ALPHA_TRACE_MAX];
+static unsigned s_alpha_trace_count;
+static uint64_t s_alpha_trace_overflow, s_alpha_trace_batches;
+
+static void note_batch_alpha(unsigned level)
+{
+    unsigned i;
+    for (i = 0; i < s_alpha_trace_count; ++i)
+        if (s_alpha_trace[i].level == level) {
+            ++s_alpha_trace[i].hits;
+            s_alpha_trace[i].last_t = trace_seconds();
+            s_alpha_trace[i].last_draw = s_gpu.draws;
+            return;
+        }
+    if (s_alpha_trace_count >= ALPHA_TRACE_MAX) { ++s_alpha_trace_overflow; return; }
+    i = s_alpha_trace_count++;
+    s_alpha_trace[i].level = level;
+    s_alpha_trace[i].hits = 1;
+    s_alpha_trace[i].first_t = s_alpha_trace[i].last_t = trace_seconds();
+    s_alpha_trace[i].first_draw = s_alpha_trace[i].last_draw = s_gpu.draws;
+}
+
+/* Combiner constants, as the title writes them.
+ *
+ * xemu steps SET_COMBINER_FACTOR0[20] through 0x60a0ff60, 0x9ca0ff60,
+ * 0xbaa0ff60, 0xc4a0ff60 over the frames right after the first white clear --
+ * one byte ramping 96, 156, 186, 196 while the rest of the colour holds. That
+ * is a fade, and it is the only thing in xemu's entire method stream that
+ * moves during the opening: blend factors, vertex diffuse, clear values and
+ * the gamma LUT are all constant across the cards in both emulators.
+ *
+ * nv2a_texture_copy_prepare() refuses any draw whose combiner program uses a
+ * constant register while any factor is nonzero, so whether our guest writes
+ * this same ramp decides between a guest that never computes the fade and a
+ * renderer that is handed it and throws it away. */
+#define FACTOR_TRACE_MAX 24
+static struct {
+    uint32_t method, value, first_draw, last_draw;
+    double first_t, last_t;
+    uint64_t hits;
+} s_factor_trace[FACTOR_TRACE_MAX];
+static unsigned s_factor_trace_count;
+static uint64_t s_factor_trace_writes, s_factor_trace_overflow;
+
+static void note_factor_write(uint32_t method, uint32_t param)
+{
+    static int on = -1;
+    unsigned i;
+
+    if (on < 0) on = getenv("RECOMP_BLEND_TRACE") ? 1 : 0;
+    if (!on) return;
+    ++s_factor_trace_writes;
+    /* Keyed on method and value together: which slot carries the ramp is part
+     * of the answer, and a table of values alone would merge slots that move
+     * for different reasons. */
+    for (i = 0; i < s_factor_trace_count; ++i)
+        if (s_factor_trace[i].method == method && s_factor_trace[i].value == param) {
+            ++s_factor_trace[i].hits;
+            s_factor_trace[i].last_t = trace_seconds();
+            s_factor_trace[i].last_draw = s_gpu.draws;
+            return;
+        }
+    if (s_factor_trace_count >= FACTOR_TRACE_MAX) { ++s_factor_trace_overflow; return; }
+    i = s_factor_trace_count++;
+    s_factor_trace[i].method = method;
+    s_factor_trace[i].value = param;
+    s_factor_trace[i].hits = 1;
+    s_factor_trace[i].first_t = s_factor_trace[i].last_t = trace_seconds();
+    s_factor_trace[i].first_draw = s_factor_trace[i].last_draw = s_gpu.draws;
+    fprintf(stderr, "  [FACTOR] t=%.2f draw %u: method 0x%04X = 0x%08X\n",
+            s_factor_trace[i].first_t, s_gpu.draws, method, param);
+    fflush(stderr);
+}
+
+static int blend_is_multiply(void)
+{
+    return s_methods[0x304/4] && s_methods[0x344/4] == 0x306;
+}
+
+static void note_blend_write(void)
+{
+    static int on = -1;
+    uint32_t en, src, dst, eq;
+    unsigned i;
+
+    if (on < 0) on = getenv("RECOMP_BLEND_TRACE") ? 1 : 0;
+    if (!on) return;
+    ++s_blend_trace_writes;
+
+    /* The whole tuple on every write to any part of it: the title sets these
+     * four methods one at a time, and it is the combination in force that
+     * decides what a fade looks like. Recording them separately would show
+     * four independent value sets and hide which ones were ever live at once. */
+    en  = s_methods[0x304/4]; src = s_methods[0x344/4];
+    dst = s_methods[0x348/4]; eq  = s_methods[0x350/4];
+
+    for (i = 0; i < s_blend_trace_count; ++i)
+        if (s_blend_trace[i].en == en && s_blend_trace[i].src == src
+                && s_blend_trace[i].dst == dst && s_blend_trace[i].eq == eq) {
+            ++s_blend_trace[i].hits;
+            s_blend_trace[i].last_draw = s_gpu.draws;
+            s_blend_trace[i].last_t = trace_seconds();
+            s_blend_current = (int)i;
+            return;
+        }
+    if (s_blend_trace_count >= BLEND_TRACE_MAX) { ++s_blend_trace_overflow; return; }
+
+    i = s_blend_trace_count++;
+    s_blend_trace[i].en = en;   s_blend_trace[i].src = src;
+    s_blend_trace[i].dst = dst; s_blend_trace[i].eq  = eq;
+    s_blend_trace[i].hits = 1;
+    s_blend_trace[i].first_draw = s_blend_trace[i].last_draw = s_gpu.draws;
+    s_blend_trace[i].first_t = s_blend_trace[i].last_t = trace_seconds();
+    /* The clear colour in force pins the combination to a card. The title
+     * issues exactly three clear values, so 0xFFFF beside a multiply blend is
+     * the white logo card fading and 0x0000 is something else entirely --
+     * which is the whole question a draw number cannot answer. */
+    s_blend_trace[i].clear_at_first = s_gpu.clear_color;
+    s_blend_trace[i].format_at_first = s_gpu.format;
+    /* Printed as it appears as well as summarised at the end, because when it
+     * appears is the question: a combination live only across the intro cards
+     * is the fade, and one live throughout is ordinary alpha blending. */
+    s_blend_current = (int)i;
+    fprintf(stderr, "  [BLEND-WRITE] new combination at t=%.2f draw %u:"
+            " enable=%u src=0x%X dst=0x%X eq=0x%X (clear=0x%08X format=0x%X)\n",
+            s_blend_trace[i].first_t, s_gpu.draws, en, src, dst, eq,
+            s_gpu.clear_color, s_gpu.format);
+    fflush(stderr);
+}
 
 static void trace_combiner(const char *error)
 {
@@ -1455,9 +1706,18 @@ static void raster_batch(void)
     uint32_t i;
     uint32_t drawn_before = s_gpu.tris_drawn;
 
-    if (s_gpu.idx_count < 3)
+    /* Stage-by-stage fate of a batch drawn under a multiply blend. Sampled
+     * here rather than at the accept test, because everything below the
+     * vertex stage is invisible from there. */
+    const int fade_batch = blend_is_multiply();
+    if (fade_batch) ++s_blend_fade_fate.batches;
+
+    if (s_gpu.idx_count < 3) {
+        if (fade_batch) ++s_blend_fade_fate.short_idx;
         return;
+    }
     if (!prepare_vertices()) {
+        if (fade_batch) ++s_blend_fade_fate.vsh_rejected;
         static unsigned vsh_capture_count;
         if (!vsh_capture_count++ && getenv("RECOMP_DRAW_CAPTURE")) {
             int combiner_capture = s_combiner_capture;
@@ -1475,13 +1735,40 @@ static void raster_batch(void)
                     s_methods[0x314/4], s_methods[0x328/4]);
         return;
     }
+    /* Sampled after the vertex stage, so the value recorded is the one the
+     * rasteriser would actually interpolate. Blend-enabled batches only: an
+     * opaque batch carries alpha it never uses, and counting those would bury
+     * the fade quad in a table of 255s. */
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("RECOMP_BLEND_TRACE") ? 1 : 0;
+        if (on && s_methods[0x304/4]) {
+            float lo = 2.0f, hi = -1.0f;
+            for (uint32_t v = 0; v < s_gpu.idx_count; ++v) {
+                float a = s_outputs[s_gpu.idx[v]][NV2A_VSH_OUT_D0][3];
+                if (!isfinite(a)) continue;
+                if (a < lo) lo = a;
+                if (a > hi) hi = a;
+            }
+            if (hi >= 0.0f) {
+                ++s_alpha_trace_batches;
+                /* One level per batch: the fade quad is flat-shaded, so lo and
+                 * hi agree on it, and a batch where they disagree is not the
+                 * quad we are looking for. */
+                note_batch_alpha((unsigned)(lo * 255.0f + 0.5f));
+            }
+        }
+    }
+
     const char *copy_error = prepare_texture_copy();
     trace_combiner(copy_error);
     capture_draw(copy_error);
     if (copy_error) {
-        if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s\n", s_gpu.draws, copy_error);
+        if (fade_batch) ++s_blend_fade_fate.prepare_rejected;
+        if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s (t=%.2f)\n", s_gpu.draws, copy_error, trace_seconds());
         return;
     }
+    if (fade_batch) ++s_blend_fade_fate.rasterised;
     if (s_vsh.mode == 0 && !(s_method_seen[0x680/4] && s_method_seen[0x6bc/4]) && !batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         /* RECOMP_PB_EXEC_NOCLIPTEST: rasterise anyway, to tell "the vertices
@@ -1745,6 +2032,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method < 0x2000 && !(method & 3)) {
         s_methods[method/4] = param;
         s_method_seen[method/4] = 1;
+        if (method == NV097_SET_BLEND_ENABLE || method == NV097_SET_BLEND_FUNC_SFACTOR
+                || method == NV097_SET_BLEND_FUNC_DFACTOR
+                || method == NV097_SET_BLEND_EQUATION)
+            note_blend_write();
+        /* The clear value, timestamped, so a blend combination can be placed
+         * against a card rather than against a draw number. The title issues
+         * only a handful, and the sequence of them is a readable map of the
+         * opening -- the only thing that says whether a fade belongs to the
+         * cards or to what follows.
+         *
+         * Distinct values, not transitions: the title alternates two values
+         * that differ only in bits a 16-bit surface discards, hundreds of
+         * times a second, and logging every change buries the run in the
+         * first half second. */
+        if (method == NV097_SET_COLOR_CLEAR_VALUE)
+            note_clear_value(param);
+        if ((method >= 0x0a60 && method < 0x0a80)
+                || (method >= 0x0a80 && method < 0x0aa0))
+            note_factor_write(method, param);
     }
     if (s_vsh_trace.enabled) {
         unsigned i = (unsigned)(s_vsh_trace.recent_count++ % 2048);
@@ -2217,6 +2523,55 @@ void nv2a_pb_exec_report(void)
                         " 0x%08X, LOAD >= 32: %llu\n",
                 s_vsh_trace.start_values, s_vsh_trace.load_values,
                 (unsigned long long)s_vsh_trace.load_high);
+    }
+    if (s_blend_trace_writes) {
+        fprintf(stderr, "[BLEND-WRITE] writes=%llu distinct=%u overflow=%llu\n",
+                (unsigned long long)s_blend_trace_writes, s_blend_trace_count,
+                (unsigned long long)s_blend_trace_overflow);
+        for (unsigned i = 0; i < s_blend_trace_count; ++i)
+            fprintf(stderr, "[BLEND-WRITE]   enable=%u src=0x%X dst=0x%X eq=0x%X"
+                    "  hits=%llu draws %u..%u  t=%.2f..%.2f"
+                    " (clear=0x%08X format=0x%X at first)\n",
+                    s_blend_trace[i].en, s_blend_trace[i].src, s_blend_trace[i].dst,
+                    s_blend_trace[i].eq, (unsigned long long)s_blend_trace[i].hits,
+                    s_blend_trace[i].first_draw, s_blend_trace[i].last_draw,
+                    s_blend_trace[i].first_t, s_blend_trace[i].last_t,
+                    s_blend_trace[i].clear_at_first, s_blend_trace[i].format_at_first);
+        fprintf(stderr, "[FACTOR] writes=%llu distinct=%u overflow=%llu\n",
+                (unsigned long long)s_factor_trace_writes, s_factor_trace_count,
+                (unsigned long long)s_factor_trace_overflow);
+        for (unsigned i = 0; i < s_factor_trace_count; ++i)
+            fprintf(stderr, "[FACTOR]   0x%04X = 0x%08X hits=%llu draws %u..%u"
+                    " t=%.2f..%.2f\n", s_factor_trace[i].method,
+                    s_factor_trace[i].value,
+                    (unsigned long long)s_factor_trace[i].hits,
+                    s_factor_trace[i].first_draw, s_factor_trace[i].last_draw,
+                    s_factor_trace[i].first_t, s_factor_trace[i].last_t);
+        fprintf(stderr, "[CLEAR-SEQ] distinct=%u overflow=%llu\n",
+                s_clear_trace_count, (unsigned long long)s_clear_trace_overflow);
+        for (unsigned i = 0; i < s_clear_trace_count; ++i)
+            fprintf(stderr, "[CLEAR-SEQ]   0x%08X format=0x%X hits=%llu"
+                    " draws %u..%u t=%.2f..%.2f\n",
+                    s_clear_trace[i].value, s_clear_trace[i].format,
+                    (unsigned long long)s_clear_trace[i].hits,
+                    s_clear_trace[i].first_draw, s_clear_trace[i].last_draw,
+                    s_clear_trace[i].first_t, s_clear_trace[i].last_t);
+        fprintf(stderr, "[ALPHA] blend-enabled batches=%llu distinct-levels=%u"
+                " overflow=%llu\n", (unsigned long long)s_alpha_trace_batches,
+                s_alpha_trace_count, (unsigned long long)s_alpha_trace_overflow);
+        for (unsigned i = 0; i < s_alpha_trace_count; ++i)
+            fprintf(stderr, "[ALPHA]   level=%3u hits=%llu draws %u..%u"
+                    " t=%.2f..%.2f\n", s_alpha_trace[i].level,
+                    (unsigned long long)s_alpha_trace[i].hits,
+                    s_alpha_trace[i].first_draw, s_alpha_trace[i].last_draw,
+                    s_alpha_trace[i].first_t, s_alpha_trace[i].last_t);
+        fprintf(stderr, "[BLEND-FADE] batches under DST_COLOR=%llu short=%llu"
+                " vsh-rejected=%llu prepare-rejected=%llu rasterised=%llu\n",
+                (unsigned long long)s_blend_fade_fate.batches,
+                (unsigned long long)s_blend_fade_fate.short_idx,
+                (unsigned long long)s_blend_fade_fate.vsh_rejected,
+                (unsigned long long)s_blend_fade_fate.prepare_rejected,
+                (unsigned long long)s_blend_fade_fate.rasterised);
     }
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)
