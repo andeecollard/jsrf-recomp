@@ -2277,6 +2277,40 @@ static void bridge_nv2a_mirror_intr(void)
     }
 }
 
+/* Does the guest see a 60 Hz clock, or does it see its own call pattern?
+ *
+ * Vblank here is delivered from exactly one place -- inside
+ * bridge_KeWaitForSingleObject -- because the guest owns the process's main
+ * thread and there is no other thread to pump from. So a vblank arrives when a
+ * guest thread happens to block, not when 16 ms of wall time have passed. The
+ * deadline below is reset to now+PERIOD rather than advanced by PERIOD, so a
+ * late poll does not deliver the periods it missed; they are dropped.
+ *
+ * Whether that costs anything is a question about rates, not about structure,
+ * and it needs the wall clock beside the count to answer. delivered/elapsed is
+ * the number to compare against 60: if it tracks scene load rather than time,
+ * the guest's clock runs on our frame rate. max_gap is the same question asked
+ * about the worst case, because a mean of 60 built from a long stall and a
+ * burst is not a 60 Hz clock either. */
+unsigned long g_vblank_delivered;
+unsigned long g_vblank_deadlines;   /* periods that elapsed and were acted on */
+unsigned long g_vblank_skipped_ack; /* deadline reached, previous still unacked */
+unsigned long g_vblank_max_gap_ms;
+static DWORD  g_vblank_last_ms;
+static DWORD  g_vblank_first_ms;
+
+void xbox_VblankReport(void)
+{
+    DWORD now = GetTickCount();
+    unsigned long ms = g_vblank_first_ms ? (unsigned long)(now - g_vblank_first_ms) : 0;
+    double hz = ms ? (double)g_vblank_delivered * 1000.0 / (double)ms : 0.0;
+    fprintf(stderr, "  [VBLANK] delivered=%lu over %lu ms = %.1f Hz"
+            " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms\n",
+            g_vblank_delivered, ms, hz, 1000 / BRIDGE_VBLANK_PERIOD_MS,
+            g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms);
+    fflush(stderr);
+}
+
 static void bridge_vblank_poll(void)
 {
     static DWORD next_vblank = 0;
@@ -2313,6 +2347,7 @@ static void bridge_vblank_poll(void)
     }
     if ((int32_t)(now - next_vblank) < 0) goto done;
     next_vblank = now + BRIDGE_VBLANK_PERIOD_MS;
+    g_vblank_deadlines++;
 
     for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
         uint32_t iv = g_interrupts[i];
@@ -2342,8 +2377,18 @@ static void bridge_vblank_poll(void)
              * [ctx+0xb0], which this runtime never establishes, so that gate
              * latches shut after the first delivery and nothing is delivered
              * at all. Measured both ways. */
-            if (xbox_Nv2aVblankPending()) continue;
+            if (xbox_Nv2aVblankPending()) { g_vblank_skipped_ack++; continue; }
 
+            {
+                DWORD t = GetTickCount();
+                if (g_vblank_first_ms == 0) g_vblank_first_ms = t;
+                if (g_vblank_last_ms) {
+                    unsigned long gap = (unsigned long)(t - g_vblank_last_ms);
+                    if (gap > g_vblank_max_gap_ms) g_vblank_max_gap_ms = gap;
+                }
+                g_vblank_last_ms = t;
+                g_vblank_delivered++;
+            }
             xbox_Nv2aRaiseVblank();
             bridge_run_isr(iv);
         }
