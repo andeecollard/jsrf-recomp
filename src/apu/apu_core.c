@@ -510,16 +510,86 @@ unsigned long g_apu_frames_xcnt_off;   /* skipped: sample counter off */
 unsigned long g_apu_frames_tone;       /* skipped: test tone owns the output */
 static unsigned long g_apu_trapped_run;
 unsigned long g_apu_trapped_run_max;
+/* Incremented once per frame boundary at which a guest thread was found
+ * waiting for the device lock, immediately before the lock is dropped for it.
+ * Zero means no guest thread ever waited -- not that the hand-off is dead. */
+unsigned long g_apu_lock_handoffs;
 
 void mcpx_apu_frame_report(void)
 {
     double ms = g_apu_trapped_run_max * (double)NUM_SAMPLES_PER_FRAME / 48.0;
     fprintf(stderr, "  [APU-FRAME] total=%lu se=%lu trapped=%lu halted=%lu"
-            " xcnt_off=%lu tone=%lu longest_trapped_run=%lu (%.2f ms)\n",
+            " xcnt_off=%lu tone=%lu longest_trapped_run=%lu (%.2f ms)"
+            " lock_handoffs=%lu\n",
             g_apu_frames_total, g_apu_frames_se, g_apu_frames_trapped,
             g_apu_frames_halted, g_apu_frames_xcnt_off, g_apu_frames_tone,
-            g_apu_trapped_run_max, ms);
+            g_apu_trapped_run_max, ms, g_apu_lock_handoffs);
     fflush(stderr);
+}
+
+/* ============================================================
+ * Device lock hand-off
+ * ============================================================ */
+
+/*
+ * The frame thread takes d->lock once, before its loop, and gives it up only
+ * inside a cond wait -- which it reaches only from throttle(), and only when it
+ * is running ahead of real time. While the mixer is saturated (JSRF's ADPCM
+ * decode will do it on its own) `remaining_ms` is never positive, the wait is
+ * never entered, and the lock is never released at all.
+ *
+ * That is enough to freeze the whole title, measured on a live process:
+ *
+ *   main thread  blocked in the guest's own DSOUND critical section,
+ *                owned by a guest sound thread
+ *   that thread  blocked on d->lock inside a TRAPPED APU register write
+ *                (mcpx_trap_handler -> fe_method -> voice_lock)
+ *   d->lock      owned by the frame thread, 100% busy in voice_process
+ *
+ * The guest's exec phase runs inside that DSOUND lock, so every object stops
+ * updating while audio keeps playing and the USB model keeps polling -- it
+ * reads as "the game hung" with no fault and no stopped counter anywhere in
+ * the guest.
+ *
+ * Waiters announce themselves through mcpx_apu_lock_guest, and the frame
+ * thread stands aside for them at its frame boundary, where model state is
+ * consistent. The yield loop is bounded: a lost decrement must not turn this
+ * into the hang it exists to prevent.
+ */
+#if defined(_WIN32)
+#define APU_LOCK_YIELD() SwitchToThread()
+#else
+#include <sched.h>
+#define APU_LOCK_YIELD() sched_yield()
+#endif
+
+#define APU_LOCK_HANDOFF_YIELDS 256
+
+void mcpx_apu_lock_guest(MCPXAPUState *d)
+{
+    qatomic_fetch_add(&d->lock_waiters, 1);
+    qemu_mutex_lock(&d->lock);
+    qatomic_fetch_add(&d->lock_waiters, -1);
+}
+
+void mcpx_apu_unlock_guest(MCPXAPUState *d)
+{
+    qemu_mutex_unlock(&d->lock);
+}
+
+/* Called by the frame thread with the lock held. */
+static void apu_lock_handoff(MCPXAPUState *d)
+{
+    volatile int *waiters = (volatile int *)&d->lock_waiters;
+    int spins;
+
+    if (!*waiters)
+        return;
+    g_apu_lock_handoffs++;
+    qemu_mutex_unlock(&d->lock);
+    for (spins = 0; spins < APU_LOCK_HANDOFF_YIELDS && *waiters; spins++)
+        APU_LOCK_YIELD();
+    qemu_mutex_lock(&d->lock);
 }
 
 /* ============================================================
@@ -598,6 +668,10 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /* Frame boundary: the model is consistent here, so this is where a
+         * waiting guest thread can be let in. */
+        apu_lock_handoff(d);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -921,13 +995,14 @@ void apu_mixer_play(int slot, int looping)
     }
     LeaveCriticalSection(&g_mixer_cs);
 
-    /* The frame thread takes the APU lock before the mixer lock. */
+    /* The frame thread takes the APU lock before the mixer lock. This runs on
+     * a guest thread, so it announces the wait -- see mcpx_apu_lock_guest. */
     extern MCPXAPUState *g_state;
     if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
+        mcpx_apu_lock_guest(g_state);
         g_state->pause_requested = false;
         qemu_cond_signal(&g_state->cond);
-        qemu_mutex_unlock(&g_state->lock);
+        mcpx_apu_unlock_guest(g_state);
     }
 }
 

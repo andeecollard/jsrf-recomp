@@ -460,6 +460,14 @@ struct MCPXAPUState {
 
     QemuThread apu_thread;
     QemuMutex lock;
+    /* How many threads are blocked waiting for `lock`.
+     *
+     * The frame thread holds the device lock for its whole life, releasing it
+     * only inside a cond wait -- and it reaches that wait only when it is
+     * running ahead of real time. Saturated, it never yields, and a guest
+     * thread that traps on an APU register write waits forever. This counter
+     * is how the frame thread knows to stand aside; see apu_lock_handoff. */
+    int lock_waiters;
     QemuCond cond;
     QemuCond idle_cond;
     bool pause_requested;
@@ -506,6 +514,16 @@ struct MCPXAPUState {
 /* ============================================================
  * Forward declarations for APU sub-module functions
  * ============================================================ */
+
+/* Device lock, taken from a guest thread.
+ *
+ * Identical to qemu_mutex_lock(&d->lock) except that the wait is announced, so
+ * the frame thread can release the lock and let the guest in. Every path that
+ * can reach this lock from guest code -- a trapped register write, the mixer
+ * bridge -- must use this rather than the mutex directly, or its wait is
+ * invisible and it starves. */
+void mcpx_apu_lock_guest(MCPXAPUState *d);
+void mcpx_apu_unlock_guest(MCPXAPUState *d);
 
 /* VP functions */
 void mcpx_apu_vp_init(MCPXAPUState *d);
