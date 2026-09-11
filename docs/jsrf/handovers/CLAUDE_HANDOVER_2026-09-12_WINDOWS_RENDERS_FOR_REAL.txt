@@ -1,0 +1,116 @@
+JSRF HANDOVER -- THE WINDOWS ORACLE RENDERS, AND ITS THREE OPEN ITEMS ARE SHUT
+Date: 2026-09-12 (Europe/London), early hours
+From: Claude.
+
+Supersedes CLAUDE_TO_CODEX_HANDOVER_2026-09-11_WINDOWS_RENDERS.txt. All three
+of that handover's "things to do next" are answered below, two of them by the
+same fix. Long form: docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-11_CONTIG_
+ALIASES_THE_HEAP.md.
+
+
+0. WHAT CHANGED
+===============
+Physical offset N and XBOX_CONTIG_BASE + N did not name the same bytes on
+Windows. The contiguous window was VirtualAlloc'd storage aliasing nothing, so
+every block the guest filled through 0x80XXXXXX was invisible to a GPU
+resolving the low offset -- and the separate bump arena that followed from it
+climbed through the guest's own stacks and heap.
+
+xbox_EnablePhysicalHeapAlias now has a Windows implementation (6fb8734). The
+window is rebuilt at the end of layout init as committed storage below the
+heap, a view of the RAM section across it, and committed storage above;
+xbox_ContiguousAlloc then takes from the heap. RECOMP_PHYSICAL_HEAP_ALIAS=0
+opts out and falls back to the floored arena.
+
+The framebuffer has pixels. Every Windows run before this reported
+nonzero=0/153600 for its whole life. A 260 s run now changes continuously,
+repeatedly covering the full frame, with 5,108 texture copies and zero
+rejected -- against roughly half rejected in every earlier run.
+
+
+1. THE THREE ITEMS, ANSWERED
+============================
+(a) WHY SUBMISSION STOPS AFTER ~600 DRAWS. It does not any more. The 260 s run
+    was still submitting when it was stopped: texture copies climbing linearly
+    to 5,108, framebuffer changing at t=259, no fault, no outstanding notify
+    deadlock. Judge this by the CPU executor's counters, NOT by
+    "[PUSHER] draws=0" -- that line reads 0 on both hosts and CLAUDE.md already
+    lists it as a known-bad shortcut.
+
+(b) THE 0xBC60 VOICE LINK. Gone, and the absence is controlled. The walker's
+    own throughput counter says it ran:
+
+        baseline   [APU-VOICE] processed=16559     + 8 out-of-range reports
+        aliased    [APU-VOICE] processed=1521632   + 0 out-of-range reports
+
+    36x more voices walked and not one bad handle. The 8 in the baseline was
+    the print cap, not a frequency; the list was being truncated every frame
+    ("stopping this list"), which is why so few were processed. The garbage
+    link was the arena writing over the voice list.
+
+(c) A RING THAT HAS NEVER WRAPPED TO ITS BASE. Not a fault. macOS -- which
+    renders, presents and reaches gameplay -- reports the same:
+
+        win baseline 1    win aliased 0    macOS 0
+
+    The healthy reference host never wraps to base either, so this says nothing
+    about Windows. Item closed; do not spend a session on it.
+
+
+2. THE NEW LEADING EDGE: THE APU FRONT END
+==========================================
+Rendering is fixed; audio submission is not, and it is now the clearest
+remaining divergence. Same scene, same build:
+
+        macOS    on=5 fe_methods=4369 set_current_voice=1390 processed=480096
+        Windows  on=4 fe_methods=177  set_current_voice=12   processed=1521632
+
+Windows walks three times as many voices and submits a twenty-fifth of the
+front-end methods, and [APU-PACE] reports batches=0 frames=0 with
+[APU-SDL2] prime=0 -- no audio frames generated at all. Those counters are
+documented in src/apu/apu_vp.c and are the right ones: fe_methods and
+set_current_voice localise a failure to the guest's submission loop rather than
+to MMIO routing, and both are nonzero here, so the routing works and the loop
+is running short.
+
+Start there, and start by reading what increments each counter.
+
+
+3. BUILD AND RUN
+================
+Unchanged from the previous handover -- cross-compile with the mingw toolchain,
+build ONLY the jsrf_first_fault target, drive it from a .bat inside the
+CX_BOTTLE. RECOMP_AC97_READY=1 is still mandatory.
+
+New switches:
+  RECOMP_PHYSICAL_HEAP_ALIAS=0   fall back to the old two-pool arena
+  RECOMP_CONTIG_VERIFY=1         compare both views of a surface where the
+                                 model resolves it; POSIX is its positive
+                                 control and must report "match"
+  RECOMP_TEXTURE_SLOT=<index>    one texture-cache slot's whole life, uncapped
+
+RECOMP_CONTIG_FROM_HEAP is gone. It existed for one session, removed the crash
+by making the window inert, and was never a fix.
+
+
+4. DO NOT RE-RUN THESE
+======================
+  the 0xBC60 voice link           (b) above, with a positive control
+  the ~600-draw submission stall  (a) above, 260 s and still going
+  the ring that never wraps       (c) above, macOS does the same
+  RECOMP_STORE_WATCH on a page a bulk copy touches -- the first toucher of the
+    texture-cache page is a lifted rep stosd, the VEH decoder completes single
+    stores only, and the run dies inside ntdll before reaching the writer
+
+
+5. WHAT I WOULD NOT DO
+======================
+Do not read [PUSHER] clears/flips/draws or the D3D11 sink's unhandled-method
+list as evidence about Windows rendering. On the aliased run they are
+0/0/0 and 100% unhandled while the framebuffer is demonstrably changing --
+the drawing goes through the CPU executor, counted separately. CLAUDE.md lists
+both as known-bad shortcuts and this run is another instance.
+
+Do not treat the triangle total as progress. It fell from 22.2M to 5,108 when
+the alias landed, and that was the improvement: the large figure was a software
+rasteriser sweeping blank memory as fast as it could.
