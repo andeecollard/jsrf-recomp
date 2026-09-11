@@ -44,8 +44,15 @@ normalised by the scale correction above -- which is upstream of both.
 
 ## Steps, in order, with what each settles
 
-1. SETTLE THE .text QUESTION FIRST. -- INSTRUMENT BUILT, db7d9e4, NOT YET RUN
-   ON WINDOWS. RECOMP_TEXT_CHECKSUM=1 sums 16 code pages, 8 inside the ring
+1. SETTLE THE .text QUESTION FIRST. -- DONE AND CLOSED. The guest is NOT
+   overwriting its own code. Zero of 8 pages inside the ring window change on
+   Windows, the one control page that does is byte-identical to macOS ("MU_0"
+   -> "MU_7" in .rdata), the 0x80000000 contiguous window is deliberately not a
+   view of the RAM mapping so the ring cannot reach .text, and the "overlap"
+   came from the probe printing device field 0x80001000 masked to 0x00001000
+   and comparing it to a guest VA. No Windows measurement is void on these
+   grounds. See ../progress/CLAUDE_PROGRESS_2026-09-11_TEXT_QUESTION_SETTLED.md.
+   Original text follows. RECOMP_TEXT_CHECKSUM=1 sums 16 code pages, 8 inside the ring
    window and 8 outside as a control, and names the changed offset and values
    rather than only the checksum. On macOS: nothing inside the window moves,
    and the single control page that does is one dword at 0x001C3F20 going
@@ -59,7 +66,12 @@ normalised by the scale correction above -- which is upstream of both.
    startup and again in the periodic report; if it changes, stop and fix that.
    ~20 lines, one run per host. DO THIS BEFORE ANYTHING ELSE.
 
-2. FIX THE RECOMP_IRQ_THREAD RACE. -- DONE, db7d9e4. Release store on publish,
+2. FIX THE RECOMP_IRQ_THREAD RACE. -- DONE, db7d9e4, AND IT WAS NOT THE CRASH.
+   The validator demonstrably works ("ISR 0xFFFFFF00 not in dispatch" is gone),
+   and Windows still dies with EAX=ECX=0xFFFFFF00. Open question, now with the
+   .text explanation eliminated as well: where does the guest get 0xFFFFFF00
+   and use it as a pointer? Same shape as the -76 in the MCPX alias fault.
+   Original text follows. Release store on publish,
    acquire load plus routine-against-dispatch-table validation in all three
    pumps. not_ready= on the [VBLANK] line counts rejections and reads 0 on
    macOS, which is the control. NOT proven to be the Windows crash mechanism --
@@ -123,6 +135,11 @@ prints the value read BACK from the model rather than the value written, which
 made correct writes look like zeros and produced a whole wrong narrative.
 
 ## Retired
+
+  - the ring scribbling over the title's .text: measured on both hosts, and
+    structurally impossible in this runtime. Closed, see step 1.
+  - the KeConnectInterrupt race as the Windows crash mechanism: fixed, and the
+    crash is unchanged.
 
   - instrumenting the two functions' arguments (step 4 as originally written):
     the event rate is 2.6-5.4% and Windows supplies 92 samples.
