@@ -1,0 +1,237 @@
+JSRF HANDOVER FOR CODEX -- THE WINDOWS DIFFERENTIAL ORACLE
+Date: 2026-09-11 (Europe/London), evening
+From: Claude.
+
+Background and full reasoning: CLAUDE_HANDOVER_2026-09-11_WINDOWS_ORACLE.txt,
+written today, 389 lines. This file is the short version plus the one thing
+that needs doing first. Read section 1 before you touch anything.
+
+
+0. WHAT YOU ARE INHERITING
+==========================
+A Windows build of the JSRF harness now exists: mingw-w64 cross-compile, run
+under CrossOver 25 on Apple Silicon. Purpose is a DIFFERENTIAL ORACLE -- one
+tree, one gen tree, two hosts -- not a playable runtime. macOS is still the
+only build that plays, and is verified unregressed by everything below.
+
+The Windows build boots, loads the XBE, runs guest code, and delivers device
+interrupts at 62 Hz. It stops in DirectSound init. Today found and fixed four
+real bugs getting it that far, three of them in code shared with macOS.
+
+Everything is UNCOMMITTED. 538 insertions across 9 files, both toolchains
+clean.
+
+
+1. DO THIS FIRST: A FIX IS APPLIED BUT WAS NEVER RUN
+====================================================
+The last thing I did was implement the suspected root cause. It compiles on
+both toolchains. IT HAS NOT BEEN EXECUTED ONCE. Do not believe it until you
+have run it, and do not build anything on top of it first.
+
+What it is: the AC97 bus-master reset is WRITE-CLEAR, and on Windows nothing
+implemented that. MCPX_WRITE_CLEAR (xbox_memory_layout.c ~line 836) lists the
+eight AC97 NABM box control registers with the RR bit, but the function that
+applies it -- mcpx_apply_write_clear, defined ~1129 and called ~1357 -- lives
+INSIDE the `#if !defined(_WIN32) && defined(__aarch64__)` block that spans
+934-1623. On Windows it is never compiled and never called.
+
+Why that hangs the title: sub_001A6F52 is DirectSound's AC97 bus-master reset.
+The tree already documents its exact shape, in the comment above the table --
+
+    MEM8(cr) = 2;              // RR, "reset this box's registers"
+    cl = MEM8(cr) & 2;         // read back ONCE, outside the loop
+  L: if (cl) goto L;           // never re-reads memory
+
+-- so the bit has to be suppressed AT THE STORE. Against plain RAM it sticks,
+the stale read is 2, and the guest spins forever. That is where the Windows
+main thread was last seen (see section 3).
+
+The fix guards the AC97 page in the Windows VEH and applies the same table, and
+extends the decoder to byte-width stores (0x88 / 0xC6), which it needed anyway
+because the guest writes that register as a byte.
+
+VERIFY IT LIKE THIS. Two lines should appear at startup:
+
+    NV2A: PCRTC_INTR_0 page guarded for write-1-to-clear
+    AC97: bus-master page guarded for write-clear (RR)
+
+and then the single cheapest success check in the whole effort:
+
+    macOS connects FOUR interrupts; Windows has only ever connected three.
+        grep "KeConnectInterrupt" <log>
+        macOS: vector 3, vector 1, vector 6, and vector 5 (routine 0x001A2681)
+        Windows so far: 3, 1, 6 and nothing more.
+    If Windows connects vector 5, the DirectSound stall is gone.
+
+Also watch: "[APU] started by the title", ADX tick leaving 0, and NtOpenFile
+count leaving 4 (macOS reaches ~1340).
+
+IF IT DOES NOT WORK, the most likely reason is that the AC97 page guard fights
+xbox_McpxApplyReady, which re-applies the codec-ready bit at 0xFEC00130 -- the
+SAME page. On macOS that is handled by calling it from inside the trap handler
+while the page is already unprotected. On Windows the ack thread writes it from
+outside, so it will fault into the VEH; the handler completes any store on a
+guarded page, so it SHOULD be fine, but it is untested and it is the first
+thing I would suspect.
+
+
+2. HOW TO BUILD AND RUN BOTH HOSTS
+==================================
+Windows (cross-compile from macOS; mingw-w64 has every import lib needed):
+
+  cmake -S diagnostics/jsrf_first_fault -B <build> \
+    -DCMAKE_TOOLCHAIN_FILE=<toolchain>.cmake \
+    -DRECOMP_GEN_DIR=<gen> -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-DXBOX_WORKER_STACK_COUNT=4"
+
+  The toolchain file is four lines (CMAKE_SYSTEM_NAME Windows, the three
+  x86_64-w64-mingw32 tools, FIND_ROOT_PATH at the mingw sysroot).
+  XBOX_WORKER_STACK_COUNT is NOT optional: RECOMP_IRQ_THREAD runs guest ISRs
+  and bridge_run_isr pushes onto g_esp without establishing a stack, so the
+  thread borrows a worker slice and the pool is 0 by default.
+
+  Run under CrossOver, bottle "recomp-gate" (win10_64; the user's existing
+  "JSRF-Control" bottle was not touched). Paths are Z:\ style.
+
+  RECOMP_AC97_READY=1 RECOMP_IRQ_THREAD=1 RECOMP_PB_EXEC=1 RECOMP_OHCI_ATTACH=1
+
+  RECOMP_AC97_READY IS MANDATORY. Without it the APU aperture stays plain
+  memory, the guest's writes never reach the model, and it initialises and
+  waits forever. The file says so; it still cost a run to rediscover.
+
+macOS: as documented in CLAUDE.md, plus RECOMP_METAL=1.
+
+THE CROSSOVER WINDOW IS ALWAYS BLACK AND IS NOT A SYMPTOM. The guest
+framebuffer is never connected to it -- xbox_D3D8SetGuestFramebufferSource and
+the event-pump hook are both POSIX-only in main.c -- so it can only ever be a
+black unresponsive rectangle however far the title gets. The D3D8 probe is now
+opt-in on Windows (RECOMP_D3D8_PROBE) so no window appears at all. Judge runs
+by the stderr counters. This confused the session twice.
+
+
+3. WHERE THE GUEST ACTUALLY STOPS
+=================================
+Main guest thread, last entries before it goes quiet:
+
+    ... 001A6C67 001A6E59 001A1B7C 001A0EA1 001A4FA0 001A1B7C 001A4C3D
+        0019E3B7 001A1BAF 001A706C 001A1B7C 001A0E3E 001A6F52 001A1B7C
+
+sub_001A6F52 is the AC97 reset described in section 1. sub_001A1B7C is a scoped
+IRQL raise (it calls kernel thunk slot 93 = ordinal 160 = KfRaiseIrql, read out
+of the XBE at .rdata VA 0x001C3F60 / raw 0x001B4000) and is noise here; it is
+called constantly by everything in DSOUND.
+
+The interrupt side is healthy and is NOT the problem any more:
+    [VBLANK] delivered=2797 over 44910 ms = 62.3 Hz  unacked_skips=0
+    the audio ISR fires at the same rate on both hosts (5534 win / 5474 mac)
+
+
+4. THE INSTRUMENT, AND HOW TO NOT BE FOOLED BY IT
+=================================================
+func_hit_probe.c now records, per thread, a CIRCULAR ring of the last 1024
+function entries, printed by RECOMP_FUNC_HIT_TRACE as [FUNC-SEQ] thread N.
+Arm sites with instrument_func_hit.py against a COPY of a gen tree -- it
+installs counters into existing generated C and needs no regeneration.
+
+Four ways this measurement produced a confident wrong answer today. All four
+are cheap to repeat by accident:
+
+  (a) THREAD INTERLEAVING. The ring used to be global. ISR and DPC entries
+      interleave with the main thread, so 0x00193C50 (vblank ISR) and
+      0x00194480 (D3D's vblank DPC, named as such in the NV2A_ACK comment)
+      both read as guest-path divergences. Per-thread rings fixed this, and
+      with them THREAD 0 IS IDENTICAL ACROSS 547 COLLAPSED STEPS on both hosts
+      -- every "divergence" found before that was scheduling, not behaviour.
+  (b) UNEQUAL POLL COUNTS. sub_00190F90 is a calibrated delay (load 400,
+      decrement, return). macOS calls it 5 times, Windows 28, and Windows then
+      CONTINUES NORMALLY. A positional diff reports a false divergence 80 steps
+      early. Collapse consecutive repeats before diffing.
+  (c) TRUNCATED TABLES. Extracting [FUNC-HIT] with `tail -N` cut macOS's
+      245-entry table against Windows' 56 and invented 23 "Windows-only"
+      functions. There are none; Windows runs a strict SUBSET. Take the last
+      contiguous run of FUNC-HIT lines.
+  (d) A HEAD-CAPPED RING. The first version recorded the first N entries. Both
+      hosts are identical there; what differs is where a thread STOPS. It has
+      to be circular.
+
+And one instrument that lies outright: the Windows-only RECOMP_APU_TRACE in
+apu_mmio_hook.c prints mcpx_apu_mmio_read(offset) -- the value read BACK from
+the model -- not the value written, so correct writes to registers the model
+does not store display as zeros. Use RECOMP_APU_REG_TRACE instead (new; in
+mcpx_apu_mmio_write, works on both hosts, prints the written value and the
+issuing guest function).
+
+
+5. THE FOUR BUGS FIXED TODAY
+============================
+  (a) GP/EP register blocks had NO storage in the APU model ("ignored for now")
+      -- writes dropped, reads returning 0. The guest's EPRST |= 1 read-modify-
+      write therefore wrote 0 and held the DSP in reset. Storage existed
+      (d->gp.regs, d->ep.regs), unwired.
+  (b) Device interrupt delivery required the guest to BLOCK: bridge_device_irq_
+      poll had one caller, inside the guest's blocking wait. A spinning guest
+      never reaches it. RECOMP_IRQ_THREAD (opt-in, default off) runs the pumps
+      on their own thread.
+  (c) PCRTC_INTR_0 had no write-1-to-clear on Windows, so the first vblank was
+      pending forever and 1859 of 1865 deadlines were skipped.
+  (d) [PAD-POLL] counters did not exist on Windows AT ALL. A Windows build
+      would have silently reported polls=0 -- one of the two input failure
+      signatures being investigated. They are wired to the real XInput path,
+      not stubbed, because a counter that cannot move is worse than none.
+
+Plus the portability work: 7 compile errors and 4 link symbols. The 1,310,876
+lines of generated C needed ZERO changes; the blockers were latent Windows-path
+bugs from macOS work, not portability gaps.
+
+
+6. THE FINDING THAT OUTLIVES ALL OF THIS
+========================================
+MACOS NEVER EXERCISES THE APU MODEL'S READ PATH. Its trap protects the aperture
+PROT_READ, so only writes fault; every guest APU register read is an ordinary
+load against aperture RAM that the write handler stores through. The guest
+reads back only what it itself wrote, and mcpx_apu_read is never consulted.
+Windows is the first host to reach it and failed on the second register it
+touched. The model's read side is unvalidated on the platform this effort
+debugs.
+
+Two dead files worth knowing: src/usb/ohci.c is not the live controller (that
+is src/kernel/xbox_usb_ohci.c) which is why it can call an xbox_AllocThreadTib
+defined nowhere and still link; and src/nv2a/nv2a_mmio_hook.c contains a
+complete Windows VEH handler called from nothing but the README.
+
+
+7. FILES CHANGED (all uncommitted)
+==================================
+  src/apu/apu_core.c            GP/EP storage; RECOMP_APU_REG_TRACE at the funnel
+  src/apu/apu.h                 trace PC provider declaration
+  src/apu/apu_sdl2.c            two globals missing from the Windows section
+  src/input/xinput_device.c     pad-poll counters + [PAD-POLL] on Windows
+  src/kernel/kernel_bridge.c    RECOMP_IRQ_THREAD; duplicate g_in_dpc removed
+  src/kernel/xbox_memory_layout.c  PCRTC write-1-to-clear; AC97 write-clear
+                                (SECTION 1 -- UNTESTED); Windows trap install
+  src/kernel/win32_native.c     NEW: xbox_TraceSeconds, w32_thread_trace_report
+  src/kernel/CMakeLists.txt     wires the above on WIN32 only
+  diagnostics/jsrf_first_fault/main.c            NV2A VEH route; guest-fn ring;
+                                pad_inject on CreateThread; D3D8 probe opt-in
+  diagnostics/jsrf_first_fault/func_hit_probe.c  per-thread circular [FUNC-SEQ]
+
+New opt-in switches, all default off: RECOMP_IRQ_THREAD, RECOMP_APU_REG_TRACE,
+RECOMP_GUEST_TRACE_REPORT, RECOMP_D3D8_PROBE.
+
+The archived gen at scratchpad/gen-baseline is the AS-FOUND tree, NOT pristine:
+it already carried 13 jsrf_func_hit sites from an earlier session. It is still
+the right baseline -- it is what the macOS build has been running -- but a
+comparison that assumes it is clean will be wrong.
+
+
+8. IF SECTION 1 WORKS
+=====================
+Expect the next stall, not the title. Nothing about this exercise has been one
+fix deep. Re-run the two-host [FUNC-SEQ] comparison (thread 0 only, repeats
+collapsed) and it will name the next one; that loop is now cheap, which is the
+real deliverable here.
+
+DO NOT fork this into a Windows-only tree. Every comparison above depends on
+both binaries coming from one tree and one gen, and three of the four bugs in
+section 5 are in code macOS shares -- in a fork they would have been
+Windows-local patches with macOS keeping the latent versions.

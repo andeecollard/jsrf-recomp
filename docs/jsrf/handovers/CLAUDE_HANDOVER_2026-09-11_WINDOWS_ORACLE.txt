@@ -1,0 +1,389 @@
+JSRF HANDOVER -- THE WINDOWS DIFFERENTIAL ORACLE
+Date: 2026-09-11 (Europe/London), afternoon/evening
+From: Claude. Read alongside HANDOVER_TO_CODEX_2026-09-11_INPUT_AND_APU.txt,
+      which this does not replace: that one is about input, this one is about
+      building a second host to debug against.
+
+
+0. THE STATE, IN ONE PARAGRAPH
+==============================
+There is now a Windows build of the JSRF harness. It cross-compiles with
+mingw-w64, runs under CrossOver 25 on Apple Silicon, boots, loads the XBE,
+brings up the kernel and APU, executes guest code, and delivers device
+interrupts at 62 Hz. It does NOT reach the title: DirectSound init fails and
+runs an error path, so the sound engine never starts and nothing downstream
+does either. macOS remains the only build that plays. Four real bugs were found
+and fixed getting this far, three of them in code shared with macOS. Everything
+is uncommitted; both toolchains build clean; the macOS build is verified
+unregressed at gameplay counters.
+
+
+1. WHY BOTHER
+=============
+The premise was a differential oracle, not a second playable runtime: one
+source tree, one gen tree, two hosts. A fault that reproduces on both is
+guest-side (the recompiler, the device models); one that appears only on macOS
+is in our Metal/SDL/AArch64 code. The macOS build had reached the point where
+several open questions -- the input stall, the tutorial divergence -- could not
+be told apart from runtime bugs by any single-host measurement.
+
+That premise is why this was NOT forked into a Windows-only tree, and should
+not be. The value of every comparison below rests on both binaries coming from
+one tree and one gen. A fork makes every future difference ambiguous, and the
+three shared-code bugs found here would have become Windows-local patches with
+macOS keeping the latent versions.
+
+
+2. THE FEASIBILITY GATE (scratchpad/wine-gate, preserved)
+=========================================================
+Two questions decided whether any of this was possible. Both were answered with
+a 150-line test program before a line of the harness was built.
+
+(a) Can the guest address space be mapped? Wine reserves the low address space:
+    everything below 0x00800000 returns ERROR_INVALID_ADDRESS, so the 1:1 map
+    at XBOX_BASE_ADDRESS is impossible. It is also not required -- XBOX_PTR is
+    (uint32_t)addr + g_xbox_mem_offset and the apertures are placed the same
+    way, so the whole 4 GB guest space relocates as one block. Reserving 4 GB
+    succeeds; the runtime later mapped guest RAM at 0x02000000 and ran.
+
+(b) Does a guarded MMIO page still trap usefully under translation? YES, and
+    this was the surprise. Faulting address exact, Rip readable, the x86-64
+    store decoded (41 C7 04 24 EF BE AD DE = mov [r12], 0xDEADBEEF),
+    EXCEPTION_CONTINUE_EXECUTION resumed correctly, and the guarded RAM did not
+    take the store. No traps lost across four threads.
+
+    Cost: 27.2 us per trapped store vs 3.5 us native, 7.8x. That sounds fatal
+    and is not: the only recorded JSRF figure is 43,707 faults in a 45 s
+    title-screen run, ~971/s, against 36,807/s sustained single-threaded under
+    Wine. ~38x headroom, and it would survive gameplay trapping ten times
+    harder than the title screen.
+
+DO NOT re-measure these. They are settled.
+
+
+3. WHAT THE PORT ACTUALLY COST
+==============================
+Far less than expected, and the surprise is where the work was.
+
+  Generated C, 1,310,876 lines across 13 files:      0 errors.
+  Runtime libraries, 49 files:                       3 errors in 2 files.
+  Harness (main.c + 4 probes + recomp_manual.c):     4 errors in 1 file.
+
+Every Windows import lib is present in mingw-w64 13.0.0 -- d3d11, dxgi, dxguid,
+d3dcompiler, xinput, xaudio2_8, bcrypt, winmm, ole32, mfplat/mfreadwrite/
+mfuuid/mf. There is no SEH anywhere (__try/__except appear only inside
+comments). #pragma comment(lib,...) is ignored by GCC and CMake already links
+those. The harness already carried an if(MINGW) block and GCC-style flags.
+
+3,301 lines are POSIX-only and ALREADY excluded by CMake on Windows --
+win32_compat.c (1653), d3d8_gl.c (1340), nv2a_metal.m (278), fb_window_stub.c
+(30). A "Windows-only version" would delete code that never compiles anyway.
+
+The blockers were not portability gaps. They were latent Windows-path bugs
+introduced during macOS work: a duplicate TLS definition, a variable declared
+inside a !_WIN32 guard and used outside it, two APU globals never added to the
+Windows list, and -- the one that matters -- the [PAD-POLL] counters, which did
+not exist on Windows AT ALL. A Windows build would have silently reported
+polls=0, which is one of the two input failure signatures under investigation.
+That is why they are wired to the real XInput path rather than stubbed: a
+counter that cannot move is worse than no counter.
+
+
+4. THE FOUR BUGS, AND WHAT THEY COST TO FIND
+============================================
+(a) GP/EP REGISTER BLOCKS HAD NO STORAGE.  apu_core.c's dispatch carried the
+    comment "GP (0x30000) and EP (0x50000) regions ignored for now": writes
+    dropped, reads returning 0. The guest brings the EP DSP out of reset with a
+    READ-MODIFY-WRITE of EPRST at 0x5FFFC, so reading back 0 turned |= 1 into a
+    write of 0 and the DSP stayed in reset. Storage already existed
+    (d->gp.regs, d->ep.regs), simply unwired. After the fix Windows writes
+    0x5FFFC = 1, byte-identical to macOS.
+
+(b) INTERRUPT DELIVERY REQUIRED THE GUEST TO BLOCK.  bridge_device_irq_poll and
+    its siblings had exactly one caller: inside the guest's blocking wait. That
+    is enough for a guest that waits and nothing at all for a guest that SPINS,
+    and JSRF's audio bring-up spins. RECOMP_IRQ_THREAD (opt-in, default off)
+    runs the same three pumps on their own thread, the way ohci_thread already
+    does. Deadlines went 0 -> 1865.
+
+    It needs a guest stack: bridge_run_isr pushes onto g_esp without
+    establishing one, because every previous caller already had the guest's.
+    XBOX_WORKER_STACK_COUNT is 0 by default, so the build directory is
+    configured with -DXBOX_WORKER_STACK_COUNT=4. That is a memory-layout change
+    and is deliberately confined to the Windows build dir.
+
+(c) PCRTC_INTR_0 HAD NO WRITE-1-TO-CLEAR ON WINDOWS.  NV_PCRTC_INTR_0 is
+    write-1-to-clear in hardware, and the vblank handshake depends on it:
+    bridge_vblank_poll will not raise another vblank while the last is pending,
+    and the ISR clears pending by writing a 1. Against plain RAM that write
+    SETS the bit. Measured: 1859 of 1865 deadlines skipped, nothing ever
+    delivered. The VEH now guards that page and does the same work the AArch64
+    trap does. Result: delivered=2797 at 62.3 Hz, unacked_skips=0.
+
+    NOTE THE MISTAKE, it is the one this tree keeps paying for: the first
+    version guarded the page but handled only ONE address on it, so the
+    title's write to 0xFD600140 -- same page, different register -- fell
+    through and killed the process. A page guard must complete every store on
+    the page, not just the interesting one.
+
+(d) Windows traps NV2A not at all otherwise. The VEH covers only
+    0xFE800000..0xFE880000. src/nv2a/nv2a_mmio_hook.c contains a complete
+    Windows VEH handler that is called from nothing but the README, and
+    src/usb/ohci.c is dead code entirely -- the live controller is
+    src/kernel/xbox_usb_ohci.c, which is why ohci.c can reference an
+    xbox_AllocThreadTib that is defined nowhere and still link.
+
+
+5. THE FINDING THAT OUTLIVES THIS EXPERIMENT
+============================================
+MACOS NEVER EXERCISES THE APU MODEL'S READ PATH.
+
+The macOS trap protects the APU aperture PROT_READ, so only writes fault. Every
+guest APU register read there is an ordinary load against the aperture RAM,
+which the write handler stores through. The guest reads back only what it
+itself wrote; mcpx_apu_read is never consulted. Windows is the first host ever
+to reach it, and it failed on the second register it touched.
+
+That is why Windows found (a) and macOS structurally could not. The model's
+read side is unvalidated on the platform this effort has been debugging, and
+that is worth knowing independently of whether the Windows build ever boots.
+
+
+6. WHERE IT STOPS NOW, NAMED -- AND A RETRACTION OF THE FIRST ANSWER
+====================================================================
+Both hosts were run against the SAME gen tree, instrumented with
+instrument_func_hit.py (no regeneration) on all 410 DSOUND-band functions. Only
+2 of 410 skipped: sub_001A1769 and sub_001A308E, exactly the pair
+jsrf_manual_overrides.c replaces -- confirmation the override path is live on
+Windows too.
+
+RETRACT THIS FIRST: an earlier pass reported "Windows enters 23 DSOUND
+functions macOS never enters", and concluded the title was running an error /
+cleanup path. THAT WAS AN ARTEFACT. The hit tables were extracted with `tail
+-N`, which truncated the macOS table (245 functions) far more than the Windows
+one (56). With the FULL tables there are ZERO Windows-only functions.
+
+The corrected picture is simpler and much more useful:
+
+    Windows executes a strict SUBSET of what macOS executes -- 56 of the
+    245 DSOUND functions macOS reaches. It is not taking an error path.
+    It stops partway through the same sequence.
+
+Counting could not have shown that; it took ordering. func_hit_probe.c now
+records the first 384 site entries in CALL ORDER (FUNC_SEQ_MAX / [FUNC-SEQ]),
+and the two hosts line up exactly:
+
+    185 calls byte-identical, then at call #186:
+        MAC:  ... 001A1B7C -> 001A6D5C -> 001A1B7C -> 001A1BAF ...
+        WIN:  ... 001A1B7C -> 001A72E0        (the ISR: the guest stopped)
+
+So the guest stalls between the RETURN of call #185 and entry to sub_001A6D5C.
+
+What those are:
+  - sub_001A1B7C is a scoped IRQL raise, not a lock. It reads fs:[0x24],
+    compares against DISPATCH_LEVEL, and if below it calls through the thunk
+    at 0x1C40D4 -- which is kernel thunk slot 93, ordinal 160, KfRaiseIrql
+    (read straight out of the XBE: .rdata VA 0x001C3F60 / raw 0x001B4000).
+    Both hosts call it; fs:[0x24] reads 0 on both because our kernel keeps IRQL
+    in g_current_irql and never writes the TIB field.
+  - sub_001A6D5C calls sub_001A1B7C itself as its first action, which is why
+    001A1B7C appears on both sides of it in the macOS order.
+
+And the visible consequence, one line of the boot log apart:
+
+    MAC: KeConnectInterrupt vector 3, vector 1, vector 6, vector 5
+                                             (vector 5 routine = 0x001A2681)
+    WIN: KeConnectInterrupt vector 3, vector 1, vector 6   -- and nothing more
+
+macOS connects a FOURTH interrupt that Windows never reaches. That is
+downstream of the stall, not its cause, but it is the cheapest one-line check
+that a future fix has actually worked.
+
+Separately and consistently: the 63 APU register writes Windows DOES make are
+byte-identical to macOS's first 63, same registers, same values, differing only
+in heap addresses. The recompiled guest is not host-sensitive here.
+
+
+6c. THE ANSWER MOVED TWICE AS THE INSTRUMENT WIDENED -- READ THIS FIRST
+=======================================================================
+Section 6 above says the divergence is in DSOUND. THAT IS WRONG, and the way it
+was wrong is the most useful thing in this file.
+
+With only the 410 DSOUND functions armed, the first ordered divergence looked
+like DSOUND. Arming the other SDK bands as well -- D3D (267), XPP (231),
+MMATRIX (46), XGRPH (10), 554 more sites -- moved it EARLIER, into D3D. The
+audio stall was downstream the whole time. An ordered divergence is only ever
+as early as your instrumentation reaches; it is a CEILING on where the fault
+is, never a location, until arming more sites stops moving it.
+
+IT MOVED A THIRD TIME. Arming the render-state driver band as well (0x00150000
+-0x00158000 plus the direct push-helper callers, 342 more sites) moved the
+divergence from step 259 to step 150:
+
+    both: ... 0019701F  001949E2  00197058  001945D6  0019701F  001912A0
+    MAC :  00190F90      (the calibrated delay -- macOS polls)
+    WIN :  00194480
+
+Three widenings, three different answers -- DSOUND, then D3D step 259, then
+step 150. Treat the number below as the best CEILING to date and nothing more.
+The deciding code is still in uninstrumented game .text, which is 10,941
+functions; the SDK bands and the render-state band together are under 1,000.
+
+The step-259 comparison, superseded but kept because the shape is instructive:
+
+    258 steps identical, then at step 259:
+      both: ... 0018F010  0018E960  0018EB80  0018E960  0018EEF0  0018E960
+      MAC :  0018EF40   then 0018E960 0018EFA0 0018E960 0018EC80 0018E960 ...
+      WIN :  00194480   then 00192A80 0018F3B0 0018ED90 001919C0 ...
+
+The alternating "setter, 0018E960, setter, 0018E960" is a D3D state-setting
+loop -- 0018E960 sits beside sub_0018E930, the fastcall push primitive
+CODEX_HANDOVER.txt section (x) documents, and 0018EB80 is the function func_id
+identified as D3DDevice_SetFogState. macOS iterates further through that loop;
+Windows leaves it early for 00194480. The next question is what ends the loop.
+
+TWO ANALYSIS TRAPS, both of which produced a confident wrong answer here:
+
+  - A positional diff of two call sequences is invalid when a poll takes a
+    different number of spins. sub_00190F90 is a calibrated delay loop (load
+    400, decrement, return); macOS calls it 5 times and Windows 28, and
+    Windows then CONTINUES NORMALLY. That is a slower poll, not a stall, but
+    it offsets everything after it and makes a positional diff report a false
+    divergence 80 steps too early. Collapse consecutive repeats first.
+  - The [FUNC-SEQ] ring is GLOBAL ACROSS THREADS. ISR entries interleave with
+    the main thread, so 0x00193C50 (the vblank ISR) shows up mid-sequence and
+    reads as a divergence when it is only the IRQ thread preempting. Filter
+    the three ISR entry points -- 00193C50, 001A72E0, 001C288F -- before
+    diffing. A per-thread ring would be better and is not written.
+
+And the count comparison behind section 6 was ALSO wrong for a third reason:
+the hit tables were extracted with `tail -N`, truncating macOS's 245-entry
+table against Windows' 56. There are ZERO Windows-only functions; Windows
+executes a strict SUBSET. Take the last contiguous run of [FUNC-HIT] lines,
+never a fixed tail.
+
+
+6b. WHAT THE CALLER HUNT ESTABLISHED (and three dead ends)
+=========================================================
+All the functions in question are reached through vtables; not one has a direct
+caller in the generated C. DSOUND is COM-shaped, so static caller analysis
+cannot bracket this. Do not repeat that search.
+
+Three dead ends, recorded so they are not re-run:
+
+  - fs:[0x24] (IRQL) reads 0 on BOTH hosts, so the IRQL test inside
+    sub_001A1B7C cannot be the divergence.
+  - g_current_irql is XBOX_THREAD_LOCAL, so RECOMP_IRQ_THREAD running ISRs on
+    the shared primary TIB does NOT leak IRQL into the main guest thread. That
+    was a real worry about a change made today; it is not happening.
+  - ordinal 161 (KfLowerIrql) called from 0x001A1BC0 is just the matching
+    lower. Nothing further in it.
+
+7. WHAT TO DO NEXT
+==================
+DO NOT simply widen again and believe the result. Three widenings moved the
+answer three times, and there is no reason to think a fourth would be the last:
+game .text is 10,941 functions against the ~1,000 armed so far, and CLAUDE.md's
+own warning about instrumentation weight destabilising this title makes arming
+all of them a poor trade.
+
+Two better options than another round of bisection-by-widening:
+
+  1. Read the branch directly. At the current ceiling the guest is at
+     sub_001912A0 -- which writes GPU register [dev+0x2268]+0x100410 with bit
+     16 set and then spins -- and macOS goes on to poll (sub_00190F90) while
+     Windows leaves for sub_00194480. Read sub_001912A0's caller and see what
+     it tests. That is one function, not ten thousand counters.
+
+  2. Fix the instrument instead. [FUNC-SEQ] is a GLOBAL ring, so it interleaves
+     threads and has to be hand-filtered; and it records entries, so a call
+     tree is flattened and a "next entry" is not a "next step". A per-thread
+     ring with a depth counter would make these comparisons mean what they
+     appear to mean, and would have prevented two of the three wrong answers
+     in this file.
+
+Success is checkable in one line: macOS connects a fourth interrupt,
+KeConnectInterrupt vector 5 routine 0x001A2681. When Windows does that too, the
+stall is gone.
+
+Get an ORDERED trace, not more counts. instrument_func_hit.py installs bounded
+entry counters into a COPY of an existing gen tree and validates every anchor
+before writing, so a missed label leaves the tree untouched -- but it counts,
+and counting has now taken this as far as it goes.
+
+Do NOT reach for a regeneration first; the archived gen is what both hosts ran
+and regeneration is not bit-stable.
+
+CORRECTION TO AN EARLIER CLAIM IN THIS FILE: the archived gen is the AS-FOUND
+tree, not a pristine one. It already carried 8 jsrf_func_hit sites from an
+earlier session (which is why 0005F590 and 00067220 show up in the macOS hits
+despite only the DSOUND band being armed here). It is still the right baseline
+-- it is what the macOS build has been running -- but it is not clean, and a
+future comparison that assumes it is will be wrong.
+
+
+8. RETRACTIONS -- THINGS THIS SESSION GOT WRONG
+===============================================
+(a) "Windows writes zeros to the VP configuration block." FALSE, and it was an
+    instrument artefact. The Windows RECOMP_APU_TRACE prints
+    mcpx_apu_mmio_read(offset) -- the value read BACK from the model -- not the
+    value written. VP registers the model does not store read back as 0, so
+    correct writes displayed as zeros. Read a counter's trigger before
+    trusting it; this tree says so for a reason. RECOMP_APU_REG_TRACE (new,
+    in mcpx_apu_mmio_write, works on both hosts, prints the written value and
+    the issuing guest function) replaces it for cross-host work.
+
+(b) "The model's read path is the cause of the stall." FALSE. Only five
+    registers are ever read on Windows -- FECTL, SECTL, IEN, 0x1510, 0x20010 --
+    and all five round-trip correctly. XGSCNT returning a live host clock is
+    real but irrelevant: the guest never reads it.
+
+(c) "The two d3d8_gl symbols are link blockers." FALSE, both call sites are
+    already #if !defined(_WIN32) guarded. Inspection error.
+
+(d) Several early sweeps reported 35 compile errors. That was a shell bug --
+    zsh does not word-split unquoted parameter expansion, so $INC reached gcc
+    as a single argument. Use ${=INC}. The real number was 7.
+
+(e) The black CrossOver window is NOT a symptom and never was. The guest
+    framebuffer is never connected to it (xbox_D3D8SetGuestFramebufferSource
+    and the event-pump hook are both POSIX-only in main.c), so it can only be a
+    black unresponsive rectangle no matter how far the title gets. The D3D8
+    probe is now opt-in on Windows (RECOMP_D3D8_PROBE) so no window appears and
+    there is nothing to misread. This build's output is the counters on stderr.
+
+
+9. HOW THINGS STAND ON DISK
+===========================
+Uncommitted, 447 insertions across 8 files:
+  src/apu/apu_core.c          GP/EP storage; RECOMP_APU_REG_TRACE at the funnel
+  src/apu/apu.h               trace PC provider declaration
+  src/apu/apu_sdl2.c          two globals missing from the Windows section
+  src/input/xinput_device.c   pad-poll counters + [PAD-POLL] for Windows
+  src/kernel/kernel_bridge.c  RECOMP_IRQ_THREAD; duplicate g_in_dpc removed
+  src/kernel/xbox_memory_layout.c  PCRTC write-1-to-clear; Windows trap install
+  src/kernel/win32_native.c   NEW: xbox_TraceSeconds, w32_thread_trace_report
+  src/kernel/CMakeLists.txt   wires the above on WIN32 only
+  diagnostics/jsrf_first_fault/main.c  NV2A VEH route; guest-fn ring; pad_inject
+                              on CreateThread; D3D8 probe opt-in on Windows
+
+New opt-in switches, all default off:
+  RECOMP_IRQ_THREAD          device interrupts from a host thread
+  RECOMP_APU_REG_TRACE       APU register writes + issuing guest function
+  RECOMP_GUEST_TRACE_REPORT  guest function ring in the periodic report
+  RECOMP_D3D8_PROBE          bring up the D3D8 HLE layer (Windows: also a window)
+
+Windows run line (headless), under the "recomp-gate" bottle:
+  RECOMP_AC97_READY=1 RECOMP_IRQ_THREAD=1 RECOMP_PB_EXEC=1 \
+  RECOMP_OHCI_ATTACH=1 RECOMP_REPORT_MS=15000 \
+  wine --bottle recomp-gate --cx-app "c:\jsrf\jsrf_first_fault.exe" \
+       <xbe> <game dir> <disposable hdd root>      (Z:\ paths)
+
+RECOMP_AC97_READY IS MANDATORY on Windows. Without it the APU aperture stays
+plain memory, the guest's writes go nowhere the model can see, and it
+initialises and then waits forever. The file already says so; it cost a run to
+rediscover.
+
+Build directories are in the session scratchpad and are disposable; the CMake
+lines are in section 3 of this file and in the shell history. The CrossOver
+bottle is "recomp-gate"; the pre-existing "JSRF-Control" bottle was not touched.
