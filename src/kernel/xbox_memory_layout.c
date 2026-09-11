@@ -137,13 +137,6 @@ static void *g_nv2a_memory = NULL;
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
-#if !defined(_WIN32)
-/* The guest sees one view of the MCPX register backing while the device model
- * writes through this second view. Keeping the hardware view writable lets
- * the guest view remain read-only continuously: no guest register write can
- * slip through as a plain store during an mprotect window. */
-static HANDLE g_mcpx_mapping_handle = NULL;
-#endif
 
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
  * address space, and the MCPX span above stops one page short of it -- so a
@@ -311,8 +304,6 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * the counter meant unprotecting the page holding the voice-submission
  * registers several hundred thousand times a second. See mcpx_trap_handler.
  */
-/* Writable device-model view. On POSIX this aliases g_mcpx_memory; on hosts
- * without an alias it is the guest mapping itself. */
 static void *g_mcpx_regs = NULL;
 
 static const uint32_t MCPX_COUNTERS[] = {
@@ -772,11 +763,14 @@ static void ohci_periodic_tick(void)
      * nothing here had ever advanced a frame.
      *
      * Hardware raises the status bit every frame whether or not the driver has
-     * enabled it, and this deliberately does not. The writable alias below
-     * now makes the update race-free, but avoiding an interrupt the driver did
-     * not request also keeps this diagnostic controller model quiet. The
-     * driver acknowledges any stale SOF before enabling it, so nothing is lost
-     * by starting the count late. */
+     * enabled it, and this deliberately does not: these registers are on a
+     * guarded page, and mcpx_hw_store has to leave that page unprotected
+     * across two mprotect calls to reach them. At frame rate that window is
+     * open often enough to swallow a guest doorbell write untrapped, which
+     * costs an entire transfer. Gating on the enable keeps the window shut
+     * except during the few milliseconds the answer is wanted. The driver
+     * acknowledges any stale SOF before it enables the bit -- the log shows it
+     * doing exactly that -- so nothing is lost by starting the count late. */
     if (*ien & XBOX_OHCI_INTR_SF) {
         uint32_t off[2], val[2];
         off[0] = MCPX_OHCI_FM_NUMBER; val[0] = g_ohci_frame & 0xFFFFu;
@@ -1044,8 +1038,8 @@ static int mcpx_guarded_page(uintptr_t host_addr, uintptr_t *page_out)
         if (page_out) *page_out = page;
         return 1;
     }
-    if (g_mcpx_apu_guarded && g_mcpx_memory) {
-        uintptr_t apu = (uintptr_t)g_mcpx_memory + MCPX_APU_MMIO_OFFSET;
+    if (g_mcpx_apu_guarded && g_mcpx_regs) {
+        uintptr_t apu = (uintptr_t)g_mcpx_regs + MCPX_APU_MMIO_OFFSET;
         if (host_addr >= apu && host_addr < apu + MCPX_APU_MMIO_SIZE) {
             if (page_out) *page_out = page;
             return 1;
@@ -1079,15 +1073,6 @@ static void mcpx_hw_store(uint32_t offset, uint32_t value)
     p = (volatile uint32_t *)((char *)g_mcpx_regs + offset);
     if (!g_mcpx_trap_active) { *p = value; return; }
 
-    /* A shared writable alias removes the guard window entirely. Serialize
-     * only the register update; the guest mapping stays read-only throughout. */
-    if (g_mcpx_regs != g_mcpx_memory) {
-        mcpx_lock();
-        *p = value;
-        mcpx_unlock();
-        return;
-    }
-
     page = (uintptr_t)p & ~(uintptr_t)(g_mcpx_page_size - 1);
     mcpx_lock();
     if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
@@ -1109,10 +1094,9 @@ static void mcpx_hw_store(uint32_t offset, uint32_t value)
  * windows, XPP's ISR acknowledged ConnectStatusChange in the gap between them,
  * and its 0x00010000 stored whole -- wiping CurrentConnectStatus, the precise
  * failure the port-status model exists to prevent. The driver spent the rest
- * of the run resetting an empty port. The shared MCPX mapping now eliminates
- * these windows on POSIX. This fallback remains for hosts without an alias,
- * where the rule is still one window per event, not one per register. All
- * offsets must share a page. */
+ * of the run resetting an empty port. Windows cannot be eliminated while the
+ * mechanism is mprotect, so the rule is to open as few as possible: one per
+ * event, not one per register. All offsets must share a page. */
 static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
                             unsigned n)
 {
@@ -1124,14 +1108,6 @@ static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
     if (!g_mcpx_trap_active) {
         for (i = 0; i < n; i++)
             *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
-        return;
-    }
-
-    if (g_mcpx_regs != g_mcpx_memory) {
-        mcpx_lock();
-        for (i = 0; i < n; i++)
-            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
-        mcpx_unlock();
         return;
     }
 
@@ -1379,43 +1355,8 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
         value = mcpx_apply_write_clear(guest_va, value, width);
     }
 
-    /* With a shared hardware alias, apply the intercepted store through that
-     * view and leave the guest page protected. This is the key correctness
-     * property for OHCI: its W1C acknowledgement and list doorbell can no
-     * longer race a device-model write and bypass their register semantics. */
-    if (g_mcpx_regs != g_mcpx_memory &&
-            guest_va >= XBOX_MCPX_BASE &&
-            guest_va < XBOX_MCPX_BASE + XBOX_MCPX_SIZE) {
-        uintptr_t backing = (uintptr_t)g_mcpx_regs +
-                            (guest_va - XBOX_MCPX_BASE);
-        mcpx_lock();
-        switch (width) {
-        case 1: *(volatile uint8_t  *)backing = (uint8_t)value;  break;
-        case 2: *(volatile uint16_t *)backing = (uint16_t)value; break;
-        case 4: *(volatile uint32_t *)backing = (uint32_t)value; break;
-        default: *(volatile uint64_t *)backing = value;          break;
-        }
-        if (ohci_raise_rhsc) {
-            volatile uint32_t *ist = (volatile uint32_t *)
-                ((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS);
-            *ist |= 0x00000040u;
-        }
-        if (ohci_serviced)
-            ohci_service_commit(&ohci_svc);
-        if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) {
-            volatile uint32_t *en = (volatile uint32_t *)(backing - 4u);
-            *en &= ~ohci_disable;
-            *(volatile uint32_t *)backing = *en;
-        } else {
-            xbox_McpxApplyReady();
-        }
-        mcpx_unlock();
-        uc->uc_mcontext->__ss.__pc += 4;
-        return;
-    }
-
     /* Perform the store the faulting instruction was going to perform, then
-     * re-arm the guard on hosts where no writable alias is available. */
+     * re-arm the guard. */
     mcpx_lock();
     if (!VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
         mcpx_unlock();
@@ -1495,7 +1436,7 @@ static void xbox_McpxTrapInstall(void)
 
     /* Only the pages that actually hold a register with semantics. */
     for (size_t i = 0; i < sizeof(MCPX_WRITE_CLEAR) / sizeof(MCPX_WRITE_CLEAR[0]); i++) {
-        uintptr_t addr = (uintptr_t)g_mcpx_memory + MCPX_WRITE_CLEAR[i].offset;
+        uintptr_t addr = (uintptr_t)g_mcpx_regs + MCPX_WRITE_CLEAR[i].offset;
         uintptr_t page = addr & ~(uintptr_t)(g_mcpx_page_size - 1);
         int seen = 0;
         for (size_t j = 0; j < g_mcpx_guard_pages; j++) {
@@ -1510,7 +1451,7 @@ static void xbox_McpxTrapInstall(void)
             MCPX_OHCI_INTR_ENABLE, MCPX_OHCI_INTR_DISABLE,
         };
         for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
-            uintptr_t addr = (uintptr_t)g_mcpx_memory + extra[i];
+            uintptr_t addr = (uintptr_t)g_mcpx_regs + extra[i];
             uintptr_t page = addr & ~(uintptr_t)(g_mcpx_page_size - 1);
             int seen = 0;
             for (size_t j = 0; j < g_mcpx_guard_pages; j++)
@@ -1573,7 +1514,7 @@ static void xbox_McpxTrapInstall(void)
      * after the handler is installed: between the mprotect and the sigaction
      * there is no handler, and a write landing in that window would be fatal. */
     if (g_mcpx_apu_write) {
-        uintptr_t apu = (uintptr_t)g_mcpx_memory + MCPX_APU_MMIO_OFFSET;
+        uintptr_t apu = (uintptr_t)g_mcpx_regs + MCPX_APU_MMIO_OFFSET;
         DWORD old_prot;
         if (VirtualProtect((LPVOID)apu, MCPX_APU_MMIO_SIZE,
                            PAGE_READONLY, &old_prot)) {
@@ -3062,50 +3003,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
-#if !defined(_WIN32)
-        /* Device registers need two protections over the same storage: the
-         * guest view is guarded read-only so semantic writes trap, while the
-         * hardware model must update status without briefly dropping that
-         * guard. A shared file mapping supplies both views. Reserve the fixed
-         * guest address first so MapViewOfFileEx only replaces memory owned by
-         * this runtime on platforms whose fixed mapping primitive replaces. */
-        void *mcpx_reservation = VirtualAlloc(
-            (LPVOID)mcpx_native, XBOX_MCPX_SIZE,
-            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (mcpx_reservation) {
-            g_mcpx_mapping_handle = CreateFileMappingA(
-                INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
-                XBOX_MCPX_SIZE, NULL);
-        }
-        if (g_mcpx_mapping_handle) {
-            g_mcpx_memory = MapViewOfFileEx(
-                g_mcpx_mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0,
-                XBOX_MCPX_SIZE, mcpx_reservation);
-            if (g_mcpx_memory == mcpx_reservation) {
-                g_mcpx_regs = MapViewOfFile(
-                    g_mcpx_mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0,
-                    XBOX_MCPX_SIZE);
-            } else {
-                g_mcpx_memory = NULL;
-            }
-        }
-        if (!g_mcpx_memory || !g_mcpx_regs) {
-            if (g_mcpx_regs) {
-                UnmapViewOfFile(g_mcpx_regs);
-                g_mcpx_regs = NULL;
-            }
-            if (g_mcpx_memory) {
-                UnmapViewOfFile(g_mcpx_memory);
-                g_mcpx_memory = NULL;
-            } else if (mcpx_reservation) {
-                VirtualFree(mcpx_reservation, XBOX_MCPX_SIZE, MEM_RELEASE);
-            }
-            if (g_mcpx_mapping_handle) {
-                CloseHandle(g_mcpx_mapping_handle);
-                g_mcpx_mapping_handle = NULL;
-            }
-        }
-#else
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
             XBOX_MCPX_SIZE,
@@ -3113,7 +3010,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             PAGE_READWRITE
         );
         g_mcpx_regs = g_mcpx_memory;
-#endif
         if (g_mcpx_memory) {
             xbox_McpxApplyReady();
             /* Resolve the USB service's diagnostics here rather than on first
@@ -3181,11 +3077,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 #endif
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed; %zu status bit(s) held "
-                    "ready%s)\n",
+                    "ready)\n",
                     XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE,
-                    sizeof(MCPX_READY) / sizeof(MCPX_READY[0]),
-                    g_mcpx_regs != g_mcpx_memory
-                        ? "; hardware writes use a permanent alias" : "");
+                    sizeof(MCPX_READY) / sizeof(MCPX_READY[0]));
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
@@ -3485,26 +3379,6 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }
-#if !defined(_WIN32)
-    if (g_mcpx_regs && g_mcpx_regs != g_mcpx_memory) {
-        UnmapViewOfFile(g_mcpx_regs);
-        g_mcpx_regs = NULL;
-    }
-    if (g_mcpx_memory) {
-        UnmapViewOfFile(g_mcpx_memory);
-        g_mcpx_memory = NULL;
-    }
-    if (g_mcpx_mapping_handle) {
-        CloseHandle(g_mcpx_mapping_handle);
-        g_mcpx_mapping_handle = NULL;
-    }
-#else
-    if (g_mcpx_memory) {
-        VirtualFree(g_mcpx_memory, XBOX_MCPX_SIZE, MEM_RELEASE);
-        g_mcpx_memory = NULL;
-        g_mcpx_regs = NULL;
-    }
-#endif
     if (g_physical_heap_view) {
         UnmapViewOfFile(g_physical_heap_view);
         g_physical_heap_view=NULL;
