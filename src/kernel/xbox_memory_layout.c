@@ -926,6 +926,11 @@ static void xbox_McpxApplyReady(void)
  * corrupt state quietly, and a fault that is not ours belongs to whoever
  * installed before us.
  */
+/* Needed by both the AArch64 write trap and the Windows VEH below. */
+#define XBOX_NV2A_PCRTC_INTR_0   (XBOX_NV2A_BASE + 0x600100u)
+#define XBOX_NV2A_PMC_INTR_0     (XBOX_NV2A_BASE + 0x000100u)
+#define XBOX_NV2A_PMC_INTR_PCRTC 0x01000000u
+
 #if !defined(_WIN32) && defined(__aarch64__)
 
 #include <signal.h>
@@ -954,9 +959,6 @@ static uintptr_t g_mcpx_guard_page[8];
  * Polling cannot fix it: "the guest acked" and "the runtime raised" both store
  * a 1, so the write itself has to be observed. Hence the trap.
  */
-#define XBOX_NV2A_PCRTC_INTR_0   (XBOX_NV2A_BASE + 0x600100u)
-#define XBOX_NV2A_PMC_INTR_0     (XBOX_NV2A_BASE + 0x000100u)
-#define XBOX_NV2A_PMC_INTR_PCRTC 0x01000000u
 
 #define XBOX_NV2A_PGRAPH_INTR (XBOX_NV2A_BASE + 0x400100u)
 #define XBOX_NV2A_PGRAPH_ERROR 0x00100000u
@@ -1620,6 +1622,21 @@ int xbox_Nv2aSoftwareMethodPending(void)
 
 #else  /* Windows, or a host this decoder does not cover */
 
+/* Declared inside the AArch64 trap block above, but read further down in code
+ * common to both hosts. There is no read trap on this host, so 0 is correct. */
+static int g_mcpx_apu_read_trapped = 0;
+
+/* The POSIX/AArch64 branch counts faults taken by its sigaction trap. This
+ * host routes device registers through the VEH hooks instead, so those
+ * counters have no producer here. Say that, rather than print five zeros that
+ * would read as "the guest never wrote a device register". */
+void xbox_McpxTrapReport(void)
+{
+    fprintf(stderr, "  [MCPX-TRAP] not this host: device registers go through"
+                    " the VEH hooks, not the POSIX write trap\n");
+    fflush(stderr);
+}
+
 BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
 { (void)subchannel; (void)parameter; return FALSE; }
 int xbox_Nv2aSoftwareMethodPending(void) { return 0; }
@@ -1658,10 +1675,182 @@ int xbox_Nv2aVblankPending(void)
 }
 
 
+/* PCRTC interrupt status: write-1-to-clear, on this host too.
+ *
+ * NV_PCRTC_INTR_0 is write-1-to-clear in hardware, and the vblank handshake
+ * depends on it: bridge_vblank_poll will not raise another vblank while the
+ * last is still pending, and the guest ISR clears pending by writing a 1.
+ * Against plain RAM that write SETS the bit, so the first vblank stays pending
+ * forever and every later one is skipped -- measured on this host, 1859 of
+ * 1865 deadlines skipped with nothing ever delivered.
+ *
+ * The AArch64 branch gets this from its write trap. Here the page is guarded
+ * read-only and the VEH does the same work: read the current value, clear the
+ * bits the guest wrote, and follow the PMC summary down when the source goes
+ * quiet.
+ *
+ * The unprotect/store/reprotect window is the hazard this tree has already
+ * paid for once, so it is held under an interlock and nothing else here
+ * touches this page.
+ */
+static uintptr_t g_nv2a_pcrtc_page;
+static int       g_nv2a_pcrtc_guarded;
+static uintptr_t g_ac97_page;      /* AC97 bus-master boxes, write-clear */
+static int       g_ac97_guarded;
+static volatile LONG g_nv2a_pcrtc_lock;
+static size_t    g_nv2a_page_size;   /* g_mcpx_page_size is AArch64-only */
+
+static uint64_t *nv2a_ctx_reg(PCONTEXT c, int reg)
+{
+    switch (reg & 0xF) {
+    case 0:  return (uint64_t *)&c->Rax; case 1:  return (uint64_t *)&c->Rcx;
+    case 2:  return (uint64_t *)&c->Rdx; case 3:  return (uint64_t *)&c->Rbx;
+    case 4:  return (uint64_t *)&c->Rsp; case 5:  return (uint64_t *)&c->Rbp;
+    case 6:  return (uint64_t *)&c->Rsi; case 7:  return (uint64_t *)&c->Rdi;
+    case 8:  return (uint64_t *)&c->R8;  case 9:  return (uint64_t *)&c->R9;
+    case 10: return (uint64_t *)&c->R10; case 11: return (uint64_t *)&c->R11;
+    case 12: return (uint64_t *)&c->R12; case 13: return (uint64_t *)&c->R13;
+    case 14: return (uint64_t *)&c->R14; case 15: return (uint64_t *)&c->R15;
+    default: return NULL;
+    }
+}
+
+static int nv2a_modrm_len(const uint8_t *ip, int rex_b)
+{
+    uint8_t modrm = *ip;
+    int mod = (modrm >> 6) & 3;
+    int rm  = (modrm & 7) | (rex_b ? 8 : 0);
+    int len = 1;
+    if (mod == 3) return 1;
+    if ((rm & 7) == 4) len += 1;
+    if (mod == 0 && (rm & 7) == 5) len += 4;
+    else if (mod == 1) len += 1;
+    else if (mod == 2) len += 4;
+    return len;
+}
+
+int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
+{
+    const uint8_t *ip;
+    int len = 0, rex_r = 0, rex_b = 0, ilen;
+    uint8_t op;
+    uint32_t written, before, after;
+    unsigned width = 4;
+    uintptr_t page = ((uintptr_t)fault) & ~(uintptr_t)(g_nv2a_page_size - 1);
+    DWORD old_prot;
+
+    /* A guard covers a whole page, so EVERY store on it now faults -- not just
+     * the registers with special semantics. Anything else on the page has to
+     * be completed as an ordinary store, or guarding one register turns its
+     * neighbours into fatal faults. (Measured the hard way: the title writes
+     * 0xFD600140 on the PCRTC page and the process died there.) */
+    if (!(g_nv2a_pcrtc_guarded && page == g_nv2a_pcrtc_page) &&
+        !(g_ac97_guarded       && page == g_ac97_page))
+        return 0;
+
+    ip = (const uint8_t *)(uintptr_t)ctx->Rip;
+    while (ip[len] == 0x66 || ip[len] == 0x67 || ip[len] == 0xF2 || ip[len] == 0xF3)
+        len++;
+    if ((ip[len] & 0xF0) == 0x40) { rex_r = (ip[len] >> 2) & 1; rex_b = ip[len] & 1; len++; }
+    op = ip[len];
+
+    if (op == 0x89) {
+        int reg = ((ip[len + 1] >> 3) & 7) | (rex_r ? 8 : 0);
+        written = (uint32_t)*nv2a_ctx_reg(ctx, reg);
+        ilen = len + 1 + nv2a_modrm_len(&ip[len + 1], rex_b);
+    } else if (op == 0xC7) {
+        int ml = nv2a_modrm_len(&ip[len + 1], rex_b);
+        const uint8_t *imm = &ip[len + 1 + ml];
+        written = (uint32_t)(imm[0] | (imm[1] << 8) | (imm[2] << 16)
+                             | ((uint32_t)imm[3] << 24));
+        ilen = len + 1 + ml + 4;
+    } else if (op == 0x88) {                       /* mov [rm], r8  */
+        int reg = ((ip[len + 1] >> 3) & 7) | (rex_r ? 8 : 0);
+        written = (uint32_t)(*nv2a_ctx_reg(ctx, reg) & 0xFFu);
+        width = 1;
+        ilen = len + 1 + nv2a_modrm_len(&ip[len + 1], rex_b);
+    } else if (op == 0xC6) {                       /* mov [rm], imm8 */
+        int ml = nv2a_modrm_len(&ip[len + 1], rex_b);
+        written = ip[len + 1 + ml];
+        width = 1;
+        ilen = len + 1 + ml + 1;
+    } else {
+        return 0;
+    }
+
+    /* AC97 bus-master reset is WRITE-CLEAR: the bit must never stick.
+     * sub_001A6F52 writes RR, reads the register back ONCE outside its loop,
+     * then spins on that stale value -- so suppressing the bit at the store is
+     * the only place it can be done. Same table and same rule the AArch64
+     * branch applies in mcpx_apply_write_clear; without it this host hangs in
+     * DirectSound init forever. */
+    {
+        uint32_t off = guest_va - XBOX_MCPX_BASE;
+        size_t k;
+        for (k = 0; k < sizeof(MCPX_WRITE_CLEAR)/sizeof(MCPX_WRITE_CLEAR[0]); k++)
+            if (MCPX_WRITE_CLEAR[k].offset == off)
+                written &= ~(uint32_t)MCPX_WRITE_CLEAR[k].write_clear;
+    }
+
+    while (InterlockedCompareExchange(&g_nv2a_pcrtc_lock, 1, 0) != 0)
+        SwitchToThread();
+
+    before = (width == 1) ? (uint32_t)*(volatile uint8_t *)fault
+                          : *(volatile uint32_t *)fault;
+    /* Write-1-to-clear for the interrupt status register; every other register
+     * that happens to share this page is a plain store. */
+    after  = (guest_va == XBOX_NV2A_PCRTC_INTR_0) ? (before & ~written)
+                                                  : written;
+
+    if (VirtualProtect((LPVOID)page, g_nv2a_page_size,
+                       PAGE_READWRITE, &old_prot)) {
+        if (width == 1) *(volatile uint8_t  *)fault = (uint8_t)after;
+        else            *(volatile uint32_t *)fault = after;
+        if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && (after & 0x1u) == 0) {
+            __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0
+                                                       + g_memory_offset),
+                               ~XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
+        }
+        if (!VirtualProtect((LPVOID)page, g_nv2a_page_size,
+                            PAGE_READONLY, &old_prot)) {
+            if (page == g_nv2a_pcrtc_page) g_nv2a_pcrtc_guarded = 0;
+            else                           g_ac97_guarded = 0;
+        }
+    }
+
+    InterlockedExchange(&g_nv2a_pcrtc_lock, 0);
+    ctx->Rip += ilen;
+    return 1;
+}
+
 static void xbox_McpxTrapInstall(void)
 {
-    /* Windows routes device registers through the VEH hooks instead; other
-     * hosts get the ack thread only, which cannot model write suppression. */
+    DWORD old_prot;
+
+    /* The APU aperture is guarded by the harness (RECOMP_AC97_READY). What was
+     * missing on this host is the NV2A side: without it the vblank
+     * acknowledge has nowhere to land. */
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        g_nv2a_page_size = (size_t)si.dwPageSize;
+    }
+    if (!g_memory_offset || !g_nv2a_page_size)
+        return;
+    g_nv2a_pcrtc_page = ((uintptr_t)g_memory_offset + XBOX_NV2A_PCRTC_INTR_0)
+                        & ~(uintptr_t)(g_nv2a_page_size - 1);
+    g_nv2a_pcrtc_guarded = VirtualProtect((LPVOID)g_nv2a_pcrtc_page,
+                                          g_nv2a_page_size, PAGE_READONLY,
+                                          &old_prot) != 0;
+    g_ac97_page = ((uintptr_t)g_memory_offset + XBOX_MCPX_BASE + MCPX_AC97_NABM)
+                  & ~(uintptr_t)(g_nv2a_page_size - 1);
+    g_ac97_guarded = VirtualProtect((LPVOID)g_ac97_page, g_nv2a_page_size,
+                                    PAGE_READONLY, &old_prot) != 0;
+    fprintf(stderr, "  NV2A: PCRTC_INTR_0 page %s for write-1-to-clear\n",
+            g_nv2a_pcrtc_guarded ? "guarded" : "NOT guarded");
+    fprintf(stderr, "  AC97: bus-master page %s for write-clear (RR)\n",
+            g_ac97_guarded ? "guarded" : "NOT guarded");
+    fflush(stderr);
 }
 
 #endif
@@ -1892,6 +2081,7 @@ static void framebuffer_probe_tick(void)
      * display is the mistake this line exists to prevent. */
     {
         extern int nv2a_pb_exec_snapshot_nonzero(void);
+        extern double xbox_TraceSeconds(void);
         int presented = nv2a_pb_exec_snapshot_nonzero();
         fprintf(stderr, "  [FB] t=%7.2f 0x%08X sum=%08X nonzero=%u/%u %s |"
                 " presented nonzero=%d\n",

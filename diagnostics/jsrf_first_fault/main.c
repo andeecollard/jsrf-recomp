@@ -34,6 +34,7 @@ static void pad_sentinel_scan(void);
 static void jsrf_save_dump(void);
 static void jsrf_scene_report(void);
 static void jsrf_object_dump(void);
+static void jsrf_guest_trace_report(void);
 /* The rasterised surface, and the window that can show it. The executor draws
  * into guest memory and the GL backend owns the window; neither can reach the
  * other without being introduced here. */
@@ -155,6 +156,23 @@ static uint32_t g_pb_last;
 static uint32_t g_pb_ring_lo, g_pb_ring_hi;
 
 static uint32_t jsrf_pb_cursor(void) { return g_pb_last; }
+
+/* DMA_PUT/DMA_GET contain physical offsets, but command bytes live in the
+ * CPU-visible physical aperture.  This matters on Windows, where that
+ * aperture deliberately has separate backing from low guest RAM so a buffer
+ * at 0x80001000 cannot overlap the XBE image at 0x00010000.  JSRF enables the
+ * shared physical-heap alias on POSIX, so the same translation works there. */
+static const uint32_t *jsrf_pb_range(uint32_t physical, uint32_t bytes)
+{
+    return (const uint32_t *)xbox_GpuMemoryRange(
+            0x80000000u | (physical & 0x03FFFFFFu), bytes);
+}
+
+static uint32_t jsrf_pb_word(uint32_t physical)
+{
+    const uint32_t *p = jsrf_pb_range(physical, sizeof(*p));
+    return p ? *p : 0;
+}
 
 /* The window as it was when the parse of it began. */
 static const uint32_t *g_pb_replay;
@@ -285,7 +303,8 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
      * lap the parser -- and reading the ring in place is what the hardware
      * does anyway. The copy is kept only for the trace, so the same check
      * still reports a patch that lands while a segment is being executed. */
-    const uint32_t *live = (const uint32_t *)XBOX_PTR(from);
+    const uint32_t *live = jsrf_pb_range(from, to - from);
+    if (!live) return invalid;
     int trace = getenv("RECOMP_PB_NOTIFY_TRACE") != NULL;
     static uint32_t snapshot[0x100000/4];
     /* RECOMP_PB_REPLAY keeps a copy of every window as it is taken, purely so
@@ -300,7 +319,8 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     NV2APusherResult result = nv2a_pusher_run_segment(live, (to-from)/4u);
     if (trace) {
         for (uint32_t k=1; k<result.consumed; ++k) {
-            if (MEM32(from+(k-1)*4)==0x40100u && snapshot[k]!=5 && MEM32(from+k*4)==5)
+            if (jsrf_pb_word(from+(k-1)*4)==0x40100u && snapshot[k]!=5
+                    && jsrf_pb_word(from+k*4)==5)
                 fprintf(stderr, "[PB-PATCH-RACE] address=%08X copy!=5 live=5 feed=%08X-%08X\n", from+k*4, from, to);
         }
     }
@@ -339,15 +359,15 @@ static void pb_recheck(const char *why, uint32_t va)
     if (done) return;
     done = 1;
 
-    v0 = MEM32(va);            p0 = MEM32(0xFD800040u);
+    v0 = jsrf_pb_word(va);     p0 = MEM32(0xFD800040u);
     __sync_synchronize();
-    v1 = MEM32(va);            p1 = MEM32(0xFD800040u);
+    v1 = jsrf_pb_word(va);     p1 = MEM32(0xFD800040u);
     Sleep(1);
     __sync_synchronize();
-    v2 = MEM32(va);            p2 = MEM32(0xFD800040u);
+    v2 = jsrf_pb_word(va);     p2 = MEM32(0xFD800040u);
     Sleep(50);
     __sync_synchronize();
-    v3 = MEM32(va);            p3 = MEM32(0xFD800040u);
+    v3 = jsrf_pb_word(va);     p3 = MEM32(0xFD800040u);
 
     fprintf(stderr,
             "[PUSHER] recheck %s at %08X: now=%08X barrier=%08X +1ms=%08X"
@@ -369,7 +389,7 @@ static void pb_recheck(const char *why, uint32_t va)
         fprintf(stderr, "[PUSHER]   guest PUT copy %08X vs register %08X\n",
                 dev ? MEM32(dev + 0x2C) : 0, p0);
         for (int back = 1; back <= 512 && !found; ++back) {
-            uint32_t h = MEM32(va - back * 4u);
+            uint32_t h = jsrf_pb_word(va - back * 4u);
             uint32_t masked = h & 0xE0030003u;
             uint32_t count;
             if (masked != 0u && masked != 0x40000000u) continue;
@@ -577,7 +597,8 @@ static int jsrf_pb_poll(void)
              * and where sync was lost is several segments upstream. */
             fprintf(stderr,"[PUSHER]   ring:");
             for (int k=-8;k<=8;++k)
-                fprintf(stderr," %s%08X",k?"":">",MEM32(g_pb_last-4+k*4));
+                fprintf(stderr," %s%08X", k ? "" : ">",
+                        jsrf_pb_word(g_pb_last - 4 + k * 4));
             fprintf(stderr,"\n");
             for (unsigned k = g_pb_hist_n>16?g_pb_hist_n-16:0; k<g_pb_hist_n; ++k)
                 fprintf(stderr,"[PUSHER]   seg %u: from=%08X end=%08X"
@@ -592,7 +613,8 @@ static int jsrf_pb_poll(void)
             stream_fault=1;
             static unsigned errors;
             if (++errors<=4) {
-                fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",MEM32(g_pb_last),g_pb_last);
+                fprintf(stderr,"[PUSHER] stopped on invalid header %08X at %08X\n",
+                        jsrf_pb_word(g_pb_last), g_pb_last);
                 pb_recheck("invalid header", g_pb_last);
                 jsrf_pb_replay("invalid header", g_pb_last);
                 /* Whether the parser is at a packet boundary or has lost sync
@@ -602,11 +624,13 @@ static int jsrf_pb_poll(void)
                  * target, which should itself look like pushbuffer. */
                 fprintf(stderr,"[PUSHER]   ring:");
                 for (int k=-8;k<=8;++k)
-                    fprintf(stderr," %s%08X",k?"":">",MEM32(g_pb_last+k*4));
+                    fprintf(stderr," %s%08X", k ? "" : ">",
+                            jsrf_pb_word(g_pb_last + k * 4));
                 fprintf(stderr,"\n");
-                uint32_t tgt = MEM32(g_pb_last) & 0xFFFFFFFCu;
+                uint32_t tgt = jsrf_pb_word(g_pb_last) & 0xFFFFFFFCu;
                 fprintf(stderr,"[PUSHER]   target %08X:",tgt);
-                for (int k=0;k<8;++k) fprintf(stderr," %08X",MEM32(tgt+k*4));
+                for (int k=0;k<8;++k)
+                    fprintf(stderr," %08X", jsrf_pb_word(tgt + k * 4));
                 fprintf(stderr,"\n");
                 for (unsigned k = g_pb_hist_n>16?g_pb_hist_n-16:0; k<g_pb_hist_n; ++k)
                     fprintf(stderr,"[PUSHER]   seg %u: from=%08X end=%08X"
@@ -659,7 +683,7 @@ static int jsrf_pb_poll(void)
                         " jump=%08X; head", (int)r.stop, r.consumed,
                         r.jump_address);
                 for (int k = 0; k < 8; ++k)
-                    fprintf(stderr, " %08X", MEM32(g_pb_last + k * 4));
+                    fprintf(stderr, " %08X", jsrf_pb_word(g_pb_last + k * 4));
                 fprintf(stderr, "\n");
                 fflush(stderr);
             }
@@ -958,6 +982,7 @@ static void jsrf_pusher_report(void)
             extern void xbox_InputPollReport(void);
             xbox_InputPollReport();
         }
+        jsrf_guest_trace_report();
         pad_sentinel_scan();
         jsrf_save_dump();
         jsrf_scene_report();
@@ -1456,7 +1481,7 @@ static int pad_inject(void)
     return on;
 }
 
-static void *pad_inject_thread(void *arg)
+static DWORD WINAPI pad_inject_thread(LPVOID arg)
 {
     extern int usb_gamepad_report(uint8_t *out, int max);
     uint8_t rep[20];
@@ -1476,20 +1501,24 @@ static void *pad_inject_thread(void *arg)
             uint32_t va = g_pad_inject_va[g_pad_inject_n - 1];
             memcpy(base + va + 2, rep + 2, 18);
         }
-        usleep(16000);  /* 60 Hz. The title reads this buffer; it does not need
+        Sleep(16);      /* 60 Hz. The title reads this buffer; it does not need
                          * to be written faster than it is read. */
     }
-    return NULL;
+    return 0;
 }
 
 static void pad_inject_start(void)
 {
-    static pthread_t th;
     static int started;
+    HANDLE th;
     if (started || !g_pad_inject_n) return;
     started = 1;
-    if (pthread_create(&th, NULL, pad_inject_thread, NULL) == 0) {
-        pthread_detach(th);
+    /* CreateThread, not pthreads: every other thread in this file uses it, and
+     * win32_compat.c supplies it on POSIX -- so this one call site was the only
+     * thing keeping the harness from building for Windows. */
+    th = CreateThread(NULL, 0, pad_inject_thread, NULL, 0, NULL);
+    if (th) {
+        CloseHandle(th);
         fprintf(stderr, "  [PAD-INJECT] writing live reports to guest 0x%08X"
                 " at 60 Hz (%u copies found, last one used); the USB schedule"
                 " is now bypassed\n",
@@ -1967,6 +1996,66 @@ static volatile GuestTraceRecord g_guest_trace[GUEST_TRACE_SIZE];
 static volatile uint32_t g_guest_trace_index;
 static volatile uint32_t g_first_guest_block;
 static _Thread_local uint32_t g_current_guest_function;
+
+/* Global, unlike g_current_guest_function, which is thread-local and therefore
+ * always 0 when the report thread reads it. Every guest thread records here,
+ * so a spinning guest shows as the same handful of functions repeating across
+ * consecutive reports -- which is the only way to see a guest that neither
+ * faults nor calls the kernel. */
+#define GUEST_FN_RING 8u
+static volatile uint32_t g_fn_ring[GUEST_FN_RING];
+static volatile uint32_t g_fn_ring_index;
+
+
+/* RECOMP_APU_REG_TRACE asks the model who issued each register write; only the
+ * harness knows. Thread-local, and the trap runs on the guest's own thread, so
+ * this is the function that issued the store we are about to trace. */
+static uint32_t jsrf_guest_pc_for_apu(void)
+{
+    return g_current_guest_function;
+}
+
+/* RECOMP_GUEST_TRACE_REPORT -- the tail of the guest-block ring, printed with
+ * the periodic report.
+ *
+ * The same ring is dumped by the crash handler, but only on a fault. A guest
+ * that SPINS never faults and never calls the kernel, so nothing in this
+ * harness says where it is; the counters all read zero and it is
+ * indistinguishable from a guest that is blocked, or dead. The ring is global
+ * (every thread records into it), so the entries that keep changing are the
+ * ones still executing -- and a spin shows up as the same few blocks repeating.
+ */
+static void jsrf_guest_trace_report(void)
+{
+    static int on = -1;
+    uint32_t count, shown, i;
+
+    if (on < 0) on = getenv("RECOMP_GUEST_TRACE_REPORT") ? 1 : 0;
+    if (!on) return;
+
+    count = g_guest_trace_index;
+    shown = count < 8u ? count : 8u;
+    fprintf(stderr, "  [GUEST-RING] %u blocks recorded; last %u:\n",
+            count, shown);
+    for (i = 0; i < shown; ++i) {
+        uint32_t seq = count - shown + i;
+        volatile GuestTraceRecord *r =
+            &g_guest_trace[seq & (GUEST_TRACE_SIZE - 1u)];
+        fprintf(stderr, "    block=%08X in sub_%08X ESP=%08X EAX=%08X ECX=%08X\n",
+                r->block, r->function, r->esp, r->eax, r->ecx);
+    }
+    /* The block ring is empty unless the gen was built with RECOMP_GUEST_BLOCK.
+     * The function ring always has entries, so it is the one that answers
+     * "where is the guest now". */
+    count = g_fn_ring_index;
+    shown = count < GUEST_FN_RING ? count : GUEST_FN_RING;
+    fprintf(stderr, "  [GUEST-FN] %u function entries; last %u:", count, shown);
+    for (i = 0; i < shown; ++i)
+        fprintf(stderr, " sub_%08X",
+                g_fn_ring[(count - shown + i) & (GUEST_FN_RING - 1u)]);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
 static _Thread_local int g_entry_announced;
 static _Thread_local int g_thread_start_announced;
 static _Thread_local int g_callback_announced;
@@ -2028,6 +2117,7 @@ static void ref_trace_exit(RefTraceState *state, const char *operation)
 
 void jsrf_trace_function(uint32_t guest_function)
 {
+    g_fn_ring[g_fn_ring_index++ & (GUEST_FN_RING - 1u)] = guest_function;
     g_current_guest_function = guest_function;
     if (guest_function == JSRF_ENTRY_POINT && !g_entry_announced) {
         g_entry_announced = 1;
@@ -2124,6 +2214,19 @@ static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
         apu_hook_handle_mmio(ep->ContextRecord, fault, guest_fault,
             ep->ExceptionRecord->ExceptionInformation[0] != 0)) {
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* And the guarded write-semantics pages. PCRTC_INTR_0 needs
+     * write-1-to-clear, while the AC97 bus-master reset registers need their
+     * RR bit suppressed at the store. The latter page is also written by the
+     * runtime when it applies codec-ready, so route both guest and native
+     * runtime stores through the same decoder. */
+    {
+        extern int xbox_Nv2aHandleWin32Fault(PCONTEXT, uintptr_t, uint32_t);
+        if (((guest_fault >= 0xFD000000u && guest_fault < 0xFE000000u) ||
+             (guest_fault >= 0xFEC00000u && guest_fault < 0xFED00000u)) &&
+            xbox_Nv2aHandleWin32Fault(ep->ContextRecord, fault, guest_fault))
+            return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     if (InterlockedExchange(&g_handling_fault, 1))
@@ -2369,6 +2472,8 @@ int main(int argc, char **argv)
      * MemoryLayoutInit starts a legacy scan thread; with shared physical RAM
      * it would otherwise execute the same methods concurrently a second time. */
     nv2a_pb_scan_set_external_executor(1);
+    { extern void mcpx_apu_set_trace_pc_fn(uint32_t (*)(void));
+      mcpx_apu_set_trace_pc_fn(jsrf_guest_pc_for_apu); }
     xbox_SetApuMmioWriteHook(apu_mmio_write_shim);
     xbox_SetApuMmioReadHook(apu_mmio_read_shim);
     /* This harness always exposes one Xbox controller on the emulated USB
@@ -2483,6 +2588,15 @@ int main(int argc, char **argv)
      * statically-linked D3D8 and talks to the NV2A model -- so this only
      * answers whether the layer initialises natively on this host at all,
      * which is the first half of the interception route. */
+#if defined(_WIN32)
+    /* ...but not on this host by default. The guest framebuffer is never
+     * connected to the window here -- xbox_D3D8SetGuestFramebufferSource and
+     * the event-pump hook are both POSIX-only above -- so the window can only
+     * ever be a black, unresponsive rectangle, and it reads as a hang to
+     * anyone watching. This build's output is the counters on stderr. Opt in
+     * with RECOMP_D3D8_PROBE to check the layer still initialises. */
+    if (getenv("RECOMP_D3D8_PROBE"))
+#endif
     {
         IDirect3D8 *d3d;
 #if defined(_WIN32)
