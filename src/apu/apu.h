@@ -73,4 +73,7 @@ void apu_mixer_stop(int slot);
 
 #ifdef __cplusplus
 }
+/* Install a provider for the guest function VA used by RECOMP_APU_REG_TRACE. */
+void mcpx_apu_set_trace_pc_fn(uint32_t (*fn)(void));
+
 #endif

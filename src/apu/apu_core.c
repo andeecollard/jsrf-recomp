@@ -820,8 +820,24 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        /* GP, and EP below, are stubbed DSPs -- but "stubbed" has to mean the
+         * register file still behaves like storage, because the guest does
+         * READ-MODIFY-WRITE on it. JSRF brings the EP out of reset with
+         * EPRST |= 1 at 0x5FFFC; dropping the write and reading back 0 turns
+         * that into a write of 0, the DSP stays in reset, and the title never
+         * enables the sound engine -- no SECTL, so no APU frames, no ADX, no
+         * loading. Measured on Windows, where PAGE_NOACCESS traps reads and
+         * they reach this function. macOS never saw it: there only writes
+         * trap, reads are ordinary loads against the aperture RAM that the
+         * trap handler stores through, so the guest reads its own last write
+         * back and the sequence works by accident. */
+        if (is_write)
+            d->gp.regs[addr - 0x30000] = (uint32_t)val;
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        if (is_write)
+            d->ep.regs[addr - 0x50000] = (uint32_t)val;
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
 }
 
 /* ============================================================
@@ -836,12 +852,46 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return d->gp.regs[addr - 0x30000];
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return d->ep.regs[addr - 0x50000];
     }
     return 0;
 }
 
+/* Which guest function is doing the store, supplied by the harness because the
+ * model has no way to know. Optional: unset, the trace still prints the
+ * register traffic. */
+static uint32_t (*g_apu_trace_pc_fn)(void);
+
+void mcpx_apu_set_trace_pc_fn(uint32_t (*fn)(void))
+{
+    g_apu_trace_pc_fn = fn;
+}
+
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
+    /* RECOMP_APU_REG_TRACE -- every APU register write, on BOTH hosts, with
+     * the guest function that issued it.
+     *
+     * This is the one funnel both paths reach: on Windows the VEH decodes the
+     * faulting store and calls here, on macOS the signal handler calls here
+     * through xbox_SetApuMmioWriteHook. Both run on the faulting guest thread,
+     * so the harness's thread-local "current guest function" is the right one.
+     *
+     * The point is cross-host comparison: the same register written with a
+     * different value names the guest function to look at, which register
+     * offsets alone never do. */
+    static int on = -1;
+    static unsigned n;
+    if (on < 0) on = getenv("RECOMP_APU_REG_TRACE") ? 1 : 0;
+    if (on && n++ < 600) {
+        uint32_t pc = g_apu_trace_pc_fn ? g_apu_trace_pc_fn() : 0;
+        fprintf(stderr, "  [APUREG] 0x%05X = %08X (w%u) from sub_%08X\n",
+                (unsigned)addr, (uint32_t)val, size, pc);
+        fflush(stderr);
+    }
     if (!d) return;
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
 }
