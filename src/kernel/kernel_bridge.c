@@ -1323,7 +1323,14 @@ static void bridge_RtlLeaveCriticalSection(void)
     g_eax = 0;
 }
 
-/* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
+/* ── KeQueryInterruptTime / PerformanceCounter / Frequency (125-127) ─ */
+static void bridge_KeQueryInterruptTime(void)
+{
+    ULONGLONG value = xbox_KeQueryInterruptTime();
+    g_eax = (uint32_t)value;
+    g_edx = (uint32_t)(value >> 32);
+}
+
 static void bridge_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER li = xbox_KeQueryPerformanceCounter();
@@ -2477,6 +2484,88 @@ done:
     InterlockedExchange(&g_vblank_delivery_active, 0);
 }
 
+/* RECOMP_IRQ_THREAD -- deliver device interrupts from a host thread.
+ *
+ * The three pumps above have exactly one caller: the guest's blocking wait, in
+ * bridge_wait_for_object. That is sufficient for a guest that WAITS, and
+ * nothing whatsoever for a guest that SPINS -- and JSRF's audio bring-up
+ * spins. Measured on the Windows build: the title writes its APU configuration,
+ * connects the DSOUND ISR on vector 6, then polls in user code with no kernel
+ * call and no register access for as long as it is left running. No wait, no
+ * pump, no interrupt, and the completion it is polling for can never arrive.
+ *
+ * Hardware does not work that way -- an interrupt arrives when the device
+ * decides, not when the driver next blocks. This runs the same three pumps on
+ * their own thread, which is exactly what ohci_thread already does for the USB
+ * controller, and for the same stated reason: the guest register file is
+ * thread-local, so anything calling recompiled code needs a thread of its own.
+ *
+ * The pumps are re-entrancy guarded already (g_vblank_delivery_active is a
+ * process-wide interlock shared by all three), so this thread and a blocked
+ * guest thread cannot deliver at once; whichever loses the CAS simply returns.
+ *
+ * OPT-IN, DEFAULT OFF, deliberately. It changes interrupt timing on a build
+ * that currently reaches gameplay, and the re-entrancy here has been got wrong
+ * twice before -- see the two rejected gates documented in bridge_vblank_poll,
+ * one of which cut delivery from 3380 per 50s to 8. Prove it on the host that
+ * needs it before it becomes the default anywhere.
+ */
+static DWORD WINAPI bridge_irq_thread(LPVOID unused)
+{
+    int slot;
+
+    (void)unused;
+    /* bridge_run_isr pushes the ISR's arguments onto g_esp -- it does not
+     * establish a stack, because every existing caller already had the guest's
+     * own. A host thread has none, so it borrows a worker slice.
+     *
+     * The pool is XBOX_WORKER_STACK_COUNT slices and that is 0 by default: a
+     * main-loop title never needed one, and reserving 256 KB apiece for a pool
+     * nothing draws from is pure waste. So this thread needs a build with the
+     * pool compiled in, and says so rather than silently delivering nothing.
+     *
+     * g_fs_base is left at its TLS initialiser (XBOX_PRIMARY_TIB_VA), which is
+     * enough for fs:[0]/fs:[4] to resolve. Sharing the primary TIB with the
+     * main thread is a real hazard if a guest ISR and the main thread use SEH
+     * at the same time; it is acceptable only because this is opt-in and the
+     * delivery interlock already serialises the ISRs themselves. */
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        fprintf(stderr, "  [IRQ-THREAD] no worker stack slice"
+                        " (XBOX_WORKER_STACK_COUNT=%d); not delivering\n",
+                (int)XBOX_WORKER_STACK_COUNT);
+        fflush(stderr);
+        return 0;
+    }
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+
+    fprintf(stderr, "  [IRQ-THREAD] live; device interrupts no longer depend"
+                    " on the guest blocking\n");
+    fflush(stderr);
+
+    for (;;) {
+        Sleep(1);
+        bridge_timers_poll();
+        bridge_vblank_poll();
+        bridge_device_irq_poll();
+    }
+}
+
+static void bridge_irq_thread_start(void)
+{
+    static int started;
+    HANDLE th;
+
+    if (started || !getenv("RECOMP_IRQ_THREAD"))
+        return;
+    started = 1;
+    th = CreateThread(NULL, 0, bridge_irq_thread, NULL, 0, NULL);
+    if (th)
+        CloseHandle(th);
+    else
+        fprintf(stderr, "  [IRQ-THREAD] CreateThread failed\n");
+}
+
 /* ── MmClaimGpuInstanceMemory (ordinal 168) ───────────────
  * PVOID MmClaimGpuInstanceMemory(SIZE_T NumberOfBytes, SIZE_T *Padding)
  *
@@ -2566,7 +2655,8 @@ static struct {
     uint32_t period_ms;     /* 0 = one-shot */
 } g_timers[BRIDGE_MAX_TIMERS];
 
-static RECOMP_TLS int g_in_dpc = 0;
+/* g_in_dpc is defined near the vblank ISR path above; a second TLS
+ * definition here is a redefinition under GCC. */
 
 /* Call a guest KDPC's DeferredRoutine:
  *   VOID Routine(PKDPC Dpc, PVOID Ctx, PVOID Sys1, PVOID Sys2)  __stdcall
@@ -5142,6 +5232,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 294: return bridge_RtlLeaveCriticalSection;
 
     /* Timing */
+    case 125: return bridge_KeQueryInterruptTime;
     case 126: return bridge_KeQueryPerformanceCounter;
     case 127: return bridge_KeQueryPerformanceFrequency;
     case 128: return bridge_KeQuerySystemTime;
@@ -5655,6 +5746,7 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
 
 void xbox_kernel_bridge_init(void)
 {
+    bridge_irq_thread_start();
     int i;
     int resolved = 0;
     int bridged = 0;
