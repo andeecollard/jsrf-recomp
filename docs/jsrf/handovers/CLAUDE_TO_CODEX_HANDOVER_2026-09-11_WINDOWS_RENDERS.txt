@@ -1,0 +1,177 @@
+JSRF HANDOVER FOR CODEX -- WINDOWS STOPS CRASHING AND STARTS DRAWING
+Date: 2026-09-11 (Europe/London), late night
+From: Claude.
+
+Long form and reasoning: CLAUDE_HANDOVER_2026-09-11_DEPTH_CLEAR.txt and the
+four progress notes of the same date. This is the short version plus the three
+things worth doing next. Section 1 is the one that matters.
+
+
+0. WHAT YOU ARE INHERITING
+==========================
+The Windows oracle no longer crashes. It boots, connects all four vectors, runs
+the APU, raises AND acknowledges PGRAPH software-method notifies, loads game
+media (1,157,120 bytes of Media\People\People01.dat), executes ~600 clears and
+~600 draws, and puts pixels in the framebuffer. Every earlier run died inside
+60 seconds in D3D init.
+
+macOS is unregressed throughout and was never the point: 2.7M pusher methods,
+~1880 flips, 61.8 Hz, ctest 21/27 -- the same five backport-presence failures
+and the one ratchet this gen has always had. Nineteen commits, a8afcf5..a33f47a,
+tree clean, nothing pushed.
+
+The crash that ended every previous run is ROOT-CAUSED AND FIXED, not guarded.
+
+
+1. THE THREE THINGS TO DO NEXT
+==============================
+None of these has been measured. That is deliberate -- I stopped rather than
+open a fourth thread -- so they are leads, not conclusions.
+
+(a) WHY SUBMISSION STOPS AFTER ~600 DRAWS. The run ends with the GPU idle and
+    one software-method notify outstanding. jsrf_software_method blocks the
+    PUSHER thread until the guest acknowledges; the guest may in turn be
+    waiting for the ring to drain. A deadlock between those two would look
+    exactly like this. FIRST MEASUREMENT: is the guest's PGRAPH ISR still being
+    dispatched during the stall? bridge_vblank_poll's software-method loop is
+    gated on xbox_Nv2aSoftwareMethodPending() and on g_in_dpc/g_in_isr, and it
+    runs from the guest's blocking waits -- if the only thread that would
+    deliver it is itself blocked, nothing does.
+
+(b) THE 0xBC60 VOICE LINK. The APU voice list walks four good entries and then
+    a fifth link of 0xBC60, every frame, on Windows only:
+        [APU] voice list 0 entry 4: handle 0xBC60 is out of range
+    It is garbage, not an off-by-one, and it is at a fixed position. macOS
+    never produces one. Find who writes that link.
+
+(c) A RING THAT HAS NEVER WRAPPED TO ITS BASE. The pusher reports
+    "healthy base wraps so far 0" after 600 draws. The PUT-backwards lines that
+    accompany it are DIAGNOSTIC ONLY and their own comment records the desync
+    as pre-existing and once-per-run, so they are not a Windows regression --
+    but a ring that never wraps cleanly is worth understanding.
+
+
+2. WHAT WAS ACTUALLY WRONG, AND THE SHAPE IT KEEPS TAKING
+=========================================================
+0xFFFFFF00 was never a guest computation. It is a cleared Z24S8 depth pixel --
+stencil 0x00 then depth 0xFF 0xFF 0xFF -- and clear_surface in our own
+nv2a_pb_exec.c was painting 1.2 MB of it across the title's .data every clear.
+
+Why: xbox_ContiguousAlloc is two different allocators. POSIX takes from the
+guest heap, which already sits above the image. Windows bumped g_contig_next
+from XBOX_CONTIG_BASE, so its first contiguous allocation had physical offset 0
+and they climbed from there -- and the GPU addresses that window BY PHYSICAL
+OFFSET, so everything below the image end aliased the title's own code and data.
+The POSIX branch carries a comment describing this exact bug being fixed there,
+for this same title.
+
+That is the shape of nearly everything the oracle has found: a real bug in
+SHARED code, fixed on one host and left standing on the other. Five of them so
+far -- AC97 write-clear, PCRTC write-1-to-clear, the APU's GP/EP storage,
+interrupt delivery, the PGRAPH notify -- plus this one and the voice-list bound.
+Windows is not a port. It is a second observer of our own defects.
+
+One cause, three symptoms, all now gone: depth surface 0x00248000 -> 0x004D8000,
+framebuffer 0x001B2000 -> 0x00442000, and the push ring off physical 0x1000.
+
+
+3. BUILD AND RUN
+================
+Windows, cross-compiled from macOS. Build ONLY the harness target: the
+pb_scan_owner_test and d3d8_smoke targets do not cross-compile (setenv,
+nv2a_vsh.h) and will fail the all-target build.
+
+  cmake -S diagnostics/jsrf_first_fault -B <build> \
+    -DCMAKE_TOOLCHAIN_FILE=<mingw-toolchain>.cmake \
+    -DRECOMP_GEN_DIR=<gen> -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-DXBOX_WORKER_STACK_COUNT=4"
+  cmake --build <build> --target jsrf_first_fault -j8
+
+Run it under CrossOver. The wrapper needs CX_BOTTLE, NOT WINEPREFIX, and it
+mis-parses a long quoted argv, so drive it from a .bat inside the bottle:
+
+  CX_BOTTLE=recomp-gate <CX>/bin/wine cmd /c 'C:\jsrf\run_ck.bat'
+
+with the .bat invoking the exe and passing xbe path, game dir (over Z:) and hdd
+root. RECOMP_AC97_READY=1 is still mandatory. The window is black by
+construction -- xbox_D3D8SetGuestFramebufferSource and the event-pump hook are
+POSIX-only in main.c -- so judge every run by the stderr counters.
+
+Symbolising a Windows crash, which works well: the mingw .exe keeps its symbols
+and is based at 0x140000000, so
+    x86_64-w64-mingw32-addr2line -f -e jsrf_first_fault.exe <rip>
+resolves any frame from a Wine backtrace or any host_pc a probe prints. Two
+saved Wine reports are in docs/jsrf/artifacts/.
+
+
+4. THE INSTRUMENTS, ALL OPT-IN
+==============================
+  RECOMP_STORE_WATCH=<va>:<len>  host page guard over ordinary guest RAM; prints
+                                 the faulting HOST PC. This is what found the
+                                 depth clear when three other watches could not.
+  RECOMP_MEM_WATCH=<va>:<len>    guest stores routed through RECOMP_MEM_WRITE
+  RECOMP_KERNEL_WATCH=<va>       samples a dword either side of every bridge call
+  RECOMP_TEXT_CHECKSUM=1         .text pages, ring window + control half
+  RECOMP_DUMP_VA=<va>[,<va>...]  guest dwords once, at load
+  RECOMP_SURFACE_TRACE=1         zeta DMA handle/base/limit/offset/pitch
+  RECOMP_D3D_ALLOC_TRACE=1       twelve sites down both contiguous allocators
+  RECOMP_PB_NOTIFY_TRACE=1       software methods the parser decodes
+  instrument_block_writes.py     1571 lifted rep movs/stos, into a gen COPY
+  instrument_d3d_alloc.py        the two D3D allocators, into a gen COPY
+
+Coverage, so you know what a silence means: RECOMP_MEM_WATCH sees 79,114 macro
+stores and NOT the ~2,735 plain lifted stores, NOT block copies (use the script)
+and NOT the runtime's own device writes -- which is what this crash turned out
+to be. Its header says so; I did not read it for several hours.
+
+
+5. TRAPS THAT COST ME TIME TODAY
+================================
+  - PRINT CAPS ARE COUNTERS. [HEAP] stops at 64 lines (RECOMP_HEAP_TRACE) and
+    jsrf_software_method prints its first 16. The first made "ordinal 166 is
+    never called on Windows" survive every test while being false, and it was
+    the plan's founding fact. The second made me report a healthy notify path
+    as broken. Read the trigger before trusting the value -- CLAUDE.md already
+    says this and it applies to log lines too.
+  - g_xbox_code_lo..hi IS NOT .text. This XBE flags .rdata and .data executable,
+    so that range is mostly data and sampling it reports the guest writing its
+    own globals. Use g_xbox_text_lo/hi.
+  - A GUARDED PAGE MUST NOT SHARE A LOCK WITH A DEVICE HANDLER. Sharing
+    g_nv2a_pcrtc_lock stalled two runs, which reads as "the guard prevented the
+    corruption" and means "the guard wedged the title".
+  - BEFORE BELIEVING A WATCH SAW NOTHING, CHECK THE RUN REACHED THE WRITER.
+    Two zeroes here were runs that stopped early.
+  - CONSULT docs/pipeline/06-debugging.md FIRST. It prescribes the ICALL caller
+    address and the target ring for exactly this class of crash; our build had
+    dropped both, and restoring them named the caller in ten minutes after I had
+    spent hours building four instruments.
+
+
+6. DO NOT RE-RUN THESE
+======================
+Each died under measurement, with a positive control where an absence was the
+evidence.
+
+  .text corruption by the push ring    16/16 pages clean, both hosts
+  the KeConnectInterrupt race          fixed; crash unchanged
+  concurrent guest DPCs                interlock tried; crash unchanged; reverted
+  the OHCI memset(out,0xFF,len)        run without OHCI; byte-identical
+  unbridged ordinals leaking stack     1, 46, 144 all have correct arg sizes;
+                                       the warning saying otherwise WAS the bug
+  guest block copies                   positive control passing, then zero hits
+  kernel bridge calls                  RECOMP_KERNEL_WATCH, zero hits
+  the D3D contiguous allocators        identical call for call on both hosts
+  the physical heap alias as the       superseded: the arena start was the
+    pusher's problem                   cause, and it is fixed
+
+
+7. WHAT I WOULD NOT DO
+======================
+Do not fork a Windows tree. Every finding above depends on one tree, one gen,
+two hosts, and six of the seven bugs were in code macOS shares.
+
+Do not chase the black CrossOver window. Connecting a framebuffer path on that
+host is real work and answers nothing the counters do not.
+
+Do not treat 8 nonzero pixels as rendering. It says the GPU model writes where
+the display is pointed, which it never did here before, and nothing more.
