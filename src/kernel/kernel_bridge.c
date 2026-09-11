@@ -2515,6 +2515,11 @@ done:
  * is complete, or validating the routine against the dispatch table before
  * reading any of it, would close this. Neither is done yet.
  *
+ * NOT PROVEN TO BE THE MECHANISM of that crash, though: the Windows push-buffer
+ * ring bounds (0x1000-0x81000) overlap the title's own .text (0x11000-0x18CB30)
+ * by 448 KB, and a guest scribbling commands over its own code yields garbage
+ * routine pointers just as well. Checksum a .text page before believing either.
+ *
  * OPT-IN, DEFAULT OFF, deliberately. It changes interrupt timing on a build
  * that currently reaches gameplay, and the re-entrancy here has been got wrong
  * twice before -- see the two rejected gates documented in bridge_vblank_poll,

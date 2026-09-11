@@ -308,6 +308,25 @@ corrupted register state afterwards.
 
 Closing it means publishing the slot only once the KINTERRUPT is complete, or
 validating the routine before reading any of the structure. Neither is done.
+
+AND A COMPETING EXPLANATION I CANNOT RULE OUT, found straight after. The
+Windows ring bounds are 0x1000-0x81000 and the title's .text is
+0x11000-0x18CB30: they OVERLAP BY 458752 BYTES. A guest writing push-buffer
+command words through that ring is writing them over 448 KB of its own
+executable code, and a corrupted .text produces garbage routine pointers just
+as convincingly as a registration race does.
+
+Which of the two actually fired here is NOT established. Against the overlap
+being exercised: the device limit field is 0x80008DFC, i.e. physical 0x8DFC,
+which sits BELOW .text, and the hardware DMA_PUT register still read 0x1000 in
+the crashing run -- so on that evidence the active window never reached
+0x11000. For it: the bounds genuinely are 512 KB and a ring that wraps walks
+the whole span.
+
+Settling it is one measurement: checksum a page of .text early and again at the
+fault, and see whether it changed. Do that before believing either story --
+including the race, which I wrote up first and which may not be the mechanism
+at all.
 The switch is opt-in and off by default, so the macOS gameplay build is
 unaffected, but anyone turning it on should expect an intermittent crash around
 interrupt registration.
