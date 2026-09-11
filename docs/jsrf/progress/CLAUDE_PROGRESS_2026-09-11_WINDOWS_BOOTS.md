@@ -288,6 +288,34 @@ for "where did this thread stop" on ONE host and not for cross-host diffs.
 The ring size is back to 1024; 65536 entries times eight threads makes the
 periodic report unreadable and was only ever for one capture.
 
+## A defect I introduced: RECOMP_IRQ_THREAD races KeConnectInterrupt
+
+Measured, and worth more than the thing I was chasing when I found it.
+
+bridge_KeConnectInterrupt publishes g_interrupts[i] = interrupt_va and THEN
+the guest fills in the KINTERRUPT that points at. There is no synchronisation,
+and none was needed: the only caller of the poll ran on the guest's own thread
+inside a blocking wait, so it could not see a half-built entry.
+
+RECOMP_IRQ_THREAD makes the poll concurrent, and it can. A Windows run logged
+
+    [KERNEL] ISR 0xFFFFFF00 not in dispatch
+
+moments after the title connected vector 5, and the guest then faulted with
+ECX = FFFFFF00. The validation caught the bad routine and refused to dispatch
+it, so the guard works; what it does not do is stop the guest being handed a
+corrupted register state afterwards.
+
+Closing it means publishing the slot only once the KINTERRUPT is complete, or
+validating the routine before reading any of the structure. Neither is done.
+The switch is opt-in and off by default, so the macOS gameplay build is
+unaffected, but anyone turning it on should expect an intermittent crash around
+interrupt registration.
+
+Also from that run: it reached FURTHER than any before it -- APU started,
+vector 5 connected, 32 heap allocations -- and STILL made no 524288 request.
+The missing GPU allocation is not downstream of interrupt delivery.
+
 ## Standing traps, all paid for today
 
 - An ordered divergence is a CEILING on where the fault is, never a location,

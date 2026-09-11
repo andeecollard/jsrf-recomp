@@ -74,7 +74,14 @@ static int func_hit_on(void)
  * and 0x00194480 (D3D's vblank DPC) both read as guest-path divergences before
  * anyone noticed they run on another context. Hand-filtering known entry
  * points does not scale; separating the threads does. */
-typedef struct { uint32_t seq[FUNC_SEQ_MAX]; unsigned n; unsigned id; } FuncSeq;
+typedef struct {
+    uint32_t seq[FUNC_SEQ_MAX];
+    unsigned n;
+    unsigned id;
+    uint32_t first;   /* the first armed site this thread entered -- a STABLE
+                       * name for it, unlike the slot index, so the same
+                       * logical thread can be found on both hosts. */
+} FuncSeq;
 static FuncSeq g_seqs[FUNC_SEQ_THREADS];
 static volatile int g_seq_threads;
 static _Thread_local FuncSeq *g_my_seq;
@@ -94,8 +101,10 @@ void jsrf_func_hit(uint32_t va)
     /* CIRCULAR, not head-capped. The head is the same on both hosts for
      * hundreds of steps -- what differs is where a thread STOPS, and a ring
      * that fills up and then ignores everything afterwards cannot show that. */
-    if (g_my_seq)
+    if (g_my_seq) {
+        if (!g_my_seq->first) g_my_seq->first = va;
         g_my_seq->seq[g_my_seq->n++ % FUNC_SEQ_MAX] = va;
+    }
     i = (unsigned)(va >> 4) & FUNC_HIT_MASK;
     for (;;) {
         if (g_hits[i].va == va) { g_hits[i].hits++; return; }
@@ -227,8 +236,9 @@ void jsrf_func_hit_report(void)
             if (!q->n) continue;
             unsigned total = q->n;
             unsigned shown = total < FUNC_SEQ_MAX ? total : FUNC_SEQ_MAX;
-            fprintf(stderr, "  [FUNC-SEQ] thread %u: %u entries, last %u in call order:\n",
-                    t, total, shown);
+            fprintf(stderr, "  [FUNC-SEQ] thread %u first=%08X: %u entries,"
+                    " last %u in call order:\n",
+                    t, (unsigned)q->first, total, shown);
             for (n = 0; n < shown; n++) {
                 unsigned idx = (total - shown + n) % FUNC_SEQ_MAX;
                 fprintf(stderr, "%s%08X%s", (n % 8u) ? " " : "    ",

@@ -2504,6 +2504,17 @@ done:
  * process-wide interlock shared by all three), so this thread and a blocked
  * guest thread cannot deliver at once; whichever loses the CAS simply returns.
  *
+ * KNOWN DEFECT, measured 2026-09-11: this RACES KeConnectInterrupt. The guest
+ * publishes g_interrupts[i] = interrupt_va (see bridge_KeConnectInterrupt)
+ * with no synchronisation and then fills in the KINTERRUPT it points at. The
+ * old single caller ran on the guest's OWN thread inside a blocking wait, so
+ * it could never observe a half-built entry; this thread can, and does -- a
+ * Windows run dispatched a routine of 0xFFFFFF00 ("ISR ... not in dispatch")
+ * moments after the title connected vector 5, and the guest died shortly after
+ * with ECX holding the same value. Publishing the slot only once the KINTERRUPT
+ * is complete, or validating the routine against the dispatch table before
+ * reading any of it, would close this. Neither is done yet.
+ *
  * OPT-IN, DEFAULT OFF, deliberately. It changes interrupt timing on a build
  * that currently reaches gameplay, and the re-entrancy here has been got wrong
  * twice before -- see the two rejected gates documented in bridge_vblank_poll,
