@@ -458,6 +458,96 @@ static void trace_combiner(const char *error)
     s_combiner_trace[id].collapsed_xy+=collapsed;
 }
 
+/* Are the bytes the GPU reads the bytes the guest wrote?
+ *
+ * A surface resolves as dma_base + offset and nothing here masks bit 31, so a
+ * low physical offset reads RAM. On POSIX the contiguous window is an alias of
+ * that same RAM (xbox_EnablePhysicalHeapAlias, enabled by the JSRF harness),
+ * so the two views are the same bytes BY CONSTRUCTION -- which makes that host
+ * the positive control for this probe: it must always say "match", and a
+ * MISMATCH there means the probe is wrong, not the allocator.
+ *
+ * On Windows the window is separate VirtualAlloc storage, deliberately not a
+ * view of RAM. A contiguous block the guest fills through 0x80XXXXXX is then
+ * invisible to a GPU reading 0x00XXXXXX. That distinction is what separates
+ * "contiguous memory now comes from the heap, and the aliasing is fixed" from
+ * "the window has been made inert, and the corruption stopped because nothing
+ * writes there any more" -- and no counter in this file can tell them apart,
+ * because the draw and triangle totals rise either way.
+ *
+ * RECOMP_CONTIG_VERIFY=1. Read-only: two bounded reads through the resolver
+ * this file already uses, so the window bounds check is not reimplemented. */
+static void contig_verify(const char *what, uint32_t address, size_t bytes)
+{
+    /* Bit 31 is the contiguous window's base; kernel.h is not included here
+     * and one constant is not worth pulling it in. */
+    static const uint32_t contig_base = 0x80000000u;
+    enum { SPAN_BYTES = 4096 };
+    static int enabled = -1;
+    static unsigned long calls;
+    uint32_t low, high, mid, lsum = 0, hsum = 0;
+    const uint32_t *lp, *hp;
+    size_t span, i;
+    char where[128];
+    int same;
+
+    if (enabled < 0) enabled = getenv("RECOMP_CONTIG_VERIFY") != NULL;
+    if (!enabled || !address || bytes < sizeof(uint32_t)) return;
+
+    /* Report the first few of each kind and then thin out. A mismatch that
+     * only begins once the title starts streaming would be invisible if this
+     * stopped entirely, and constant if it never stopped. */
+    ++calls;
+    if (calls > 16 && (calls % 2048) != 0) return;
+
+    low  = address & ~contig_base;
+    high = low | contig_base;
+
+    /* Compare a span, not the first dword, and sample from the middle.
+     *
+     * The top-left corner of a surface is usually black, so four leading zero
+     * dwords equal to four other leading zero dwords is a match that would
+     * also be printed if the two views were separate storage that happened to
+     * be untouched. That is the same trap as any absence measurement: the
+     * comparison has to be able to come out different. Summing a span and
+     * saying when BOTH sides are empty keeps a vacuous agreement legible. */
+    span = bytes < SPAN_BYTES ? (bytes & ~(size_t)3) : SPAN_BYTES;
+    if (span < sizeof(uint32_t)) return;
+    mid = (uint32_t)((bytes / 2) & ~(size_t)3);
+    if ((size_t)mid + span > bytes) mid = 0;
+
+    lp = xbox_GpuMemoryRange(low  + mid, span);
+    hp = xbox_GpuMemoryRange(high + mid, span);
+    if (!lp || !hp) {
+        fprintf(stderr, "  [CONTIG-VERIFY] %s resolved=%08X low=%s high=%s"
+                        " (no comparison)\n",
+                what, address, lp ? "mapped" : "unmapped",
+                hp ? "mapped" : "unmapped");
+        fflush(stderr);
+        return;
+    }
+
+    for (i = 0; i < span / sizeof(uint32_t); ++i) {
+        lsum = lsum * 31u + lp[i];
+        hsum = hsum * 31u + hp[i];
+    }
+    same = memcmp(lp, hp, span) == 0;
+    where[0] = '\0';
+    if (!xbox_HeapDescribe(low, where, sizeof where)) where[0] = '\0';
+
+    fprintf(stderr,
+            "  [CONTIG-VERIFY] #%lu %s resolved=%08X %s"
+            " +%X/%u low %08X sum=%08X (%08X %08X) |"
+            " high %08X sum=%08X (%08X %08X)%s%s\n",
+            calls, what, address,
+            (!lsum && !hsum) ? "BOTH-EMPTY" : (same ? "match" : "MISMATCH"),
+            mid, (unsigned)span,
+            low  + mid, lsum, lp[0], lp[1],
+            high + mid, hsum, hp[0], hp[1],
+            where[0] ? " " : "", where);
+    fflush(stderr);
+}
+
 static const char *prepare_texture_copy(void)
 {
     s_copy.active = 0;
@@ -495,6 +585,9 @@ static const char *prepare_texture_copy(void)
     s_copy.target = xbox_GpuMemoryRange(s_copy.target_address, s_copy.target_bytes);
     if ((!s_copy.texture && !c->untextured) || !s_copy.target)
         return "surface outside mapped RAM";
+    contig_verify("target ", s_copy.target_address, s_copy.target_bytes);
+    if (!c->untextured)
+        contig_verify("texture", s_copy.texture_address, s_copy.texture_bytes);
     if (!c->untextured
             && (uint64_t)s_copy.texture_address+s_copy.texture_bytes > s_copy.target_address
             && (uint64_t)s_copy.target_address+s_copy.target_bytes > s_copy.texture_address)

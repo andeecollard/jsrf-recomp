@@ -4288,6 +4288,23 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 #else
     uint32_t result;
 
+    /* RECOMP_CONTIG_FROM_HEAP=1 -- take contiguous memory from the guest heap,
+     * the way the POSIX branch above always has.
+     *
+     * The separate bump arena below cannot be made safe by raising its floor:
+     * the stacks and the heap sit above the image too, and the heap grows to
+     * the top of RAM, so there is no floor that clears them. One pool is what
+     * the hardware has. Opt-in until a run says the title is happier with it.
+     *
+     * The XBOX_CONTIG_BASE bit is not decoration: D3D reconstructs DMA_GET
+     * with bit 31 set before comparing it against its own allocation, and the
+     * GPU model addresses this window by physical offset -- which, with guest
+     * RAM mapped 1:1, is the heap VA itself. */
+    if (getenv("RECOMP_CONTIG_FROM_HEAP")) {
+        uint32_t heap = xbox_HeapAlloc(size, alignment);
+        return heap ? (heap | XBOX_CONTIG_BASE) : 0;
+    }
+
     /* Never hand out a physical offset that overlaps the loaded image.
      *
      * The arena starts at XBOX_CONTIG_BASE, so the first allocation has
@@ -4333,6 +4350,38 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     }
 
     g_contig_next = result + size;
+
+    /* Does this block land on the guest heap or the stacks?
+     *
+     * The arena is a bump allocator over PHYSICAL offsets and knows only two
+     * things: where the image ends, and where the window ends. It does not
+     * know where the guest's low memory lives -- and on this host the stacks
+     * and the heap sit at a FIXED low address above the image, so a long
+     * enough run of contiguous allocations climbs straight into them. The
+     * POSIX branch cannot reach this state: it takes contiguous memory from
+     * that same heap, so the heap allocator itself keeps the two apart.
+     *
+     * Report, do not clamp. Which allocation crosses the line, and what the
+     * title then does with it, is the evidence; moving the floor first would
+     * hide the producer. One line per offending block, capped, because a
+     * title that crosses once crosses for every allocation afterwards. */
+    {
+        static unsigned reported;
+        uint32_t phys = result - XBOX_CONTIG_BASE;
+        uint32_t phys_end = phys + size;
+
+        if (phys_end > XBOX_STACK_BASE && reported < 64u) {
+            ++reported;
+            fprintf(stderr,
+                    "  [CONTIG] block 0x%08X..0x%08X overlaps guest low memory"
+                    " (stacks 0x%08X, heap 0x%08X, %u of arena used)%s\n",
+                    phys, phys_end, (uint32_t)XBOX_STACK_BASE,
+                    (uint32_t)XBOX_HEAP_BASE, phys,
+                    reported == 64u ? " [last report]" : "");
+            fflush(stderr);
+        }
+    }
+
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 #endif
