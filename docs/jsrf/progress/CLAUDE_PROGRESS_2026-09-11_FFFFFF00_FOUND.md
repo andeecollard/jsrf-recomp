@@ -113,3 +113,91 @@ pass and walked again afterwards.
    string operations. Extending `RECOMP_MEM_WRITE` to the lifted `rep`
    sequences is a real change to the translator's output, and worth doing:
    every block copy in the title is currently invisible to it.
+
+---
+
+# Addendum, same night: the saved Wine backtrace
+
+The full crash report (saved from Wine's dialog, kept at
+`../artifacts/win_backtrace_2026-09-11_ffffff00.txt`) carries 27 frames, not
+the 9 the dialog showed. Symbolised:
+
+    main -> xbe_entry_point -> sub_00147F53 -> kernel_thunk_dispatch
+      -> bridge_PsCreateSystemThreadEx -> sub_00147EBB -> sub_00147FB4
+      -> sub_0006F9E0 -> sub_00013F80 -> sub_00013A80 -> sub_0014D090
+      -> sub_00198F10 -> sub_00198ED0 -> sub_00198670
+      -> sub_0018CE50                          <-- D3D's vblank wait
+        -> kernel_thunk_dispatch -> bridge_KeWaitForSingleObject
+          -> bridge_timers_poll -> bridge_run_dpc
+            -> sub_001C2319 (XPP DPC) -> ... -> sub_001BFA3A   CRASH
+
+`sub_0018CE50` is named in `kernel_bridge.c`'s own comment: it is the D3D
+routine that clears the SignalState of the device's vblank KEVENT and waits on
+it. So the XPP timer DPC runs **nested on the D3D thread inside its vblank
+wait**, which is by design -- the wait pumps the timers.
+
+Faulting instruction, from the report: `movl (%rax), %ebx`, rax = 0x101ffff10.
+
+## Tested and rejected: concurrent DPCs
+
+`g_in_dpc` is `RECOMP_TLS`, so `bridge_timers_poll`'s guard is per-thread and
+does not stop two threads running guest DPCs at once, while the vblank and
+device pumps do take a process-wide interlock. That looked like the answer.
+
+Giving `bridge_timers_poll` the same interlock changes nothing: the corruption
+and the crash reproduce byte for byte. **Reverted** rather than left in -- it is
+an unproven change to shared code on a build that works, which is exactly what
+this tree's rules say not to land. The structural observation stands and is
+worth fixing on its own merits some other time; it is not this bug.
+
+## 0xFFFFFF00 is also an indirect call target
+
+    [ICALL] Failed to resolve VA 0xFFFFFF00 (total calls: 3133)
+
+Three of these fire before the crash, and macOS logs **zero** occurrences of
+0xFFFFFF00 anywhere. So the value is not only walked as a list pointer, it is
+called through. It clears `RECOMP_ICALL_IS_CODE` (which accepts anything
+>= 0xFE000000) and then fails the kernel lookup, so it reaches the dispatcher
+looking like a thunk. Nothing in our own code writes it -- the guest computes
+it.
+
+## The unbridged ordinals are NOT the differential
+
+The log warns `no bridge for ordinal 1 (slot 103), returning 0`, and warns that
+a missing `stdcall_args_for_ordinal` entry corrupts the caller's stack. That
+looked decisive. It is not: **both hosts hit exactly the same three** -- 46, 144
+and 1 -- and only Windows produces 0xFFFFFF00. Ordinal 1 is
+AvGetSavedDataAddress, and 0 - 0x100 = 0xFFFFFF00 is a tempting arithmetic
+coincidence, but the ordering says otherwise: on macOS the ordinal-1 warning
+lands *after* `[AV] SetDisplayMode`, on Windows the flow has already diverged.
+
+## The live lead: the framebuffer is inside the image on Windows
+
+Both hosts call AvSetDisplayMode with identical mode, format and pitch, and get
+different framebuffers:
+
+    macOS    [AV] SetDisplayMode mode=0x88070701 format=0x11 pitch=1280 fb=0x0071E000
+    Windows  [AV] SetDisplayMode mode=0x88070701 format=0x11 pitch=1280 fb=0x001B2000
+
+0x0071E000 is above the loaded image. **0x001B2000 is inside it** -- within
+DSOUND's section (0x19E340..0x1BA83C), and a 640x480 2bpp surface from there
+runs to about 0x248000, straight through MMATRIX, XGRPH, XPP (0x1BC7C0) and
+.rdata.
+
+That is the same shape as the push-buffer ring landing at physical 0x1000: on
+this host the title's allocations come back at addresses that collide with its
+own image. It would explain XPP's structures being overwritten with pixel data
+and it would explain 0xFFFFFF00 appearing in both a list head and a vtable
+slot.
+
+**Not proven, and one measurement already argues against the simple version:**
+`RECOMP_TEXT_CHECKSUM` covers 0x81000..0x244000 as its control half and saw
+only the one benign .rdata dword move. If a framebuffer were being blitted
+across 0x1B2000..0x248000, many of those pages would change. So either the
+surface is never actually written at that address, or it is written somewhere
+else than the mode call reports. Re-run TEXT-CK with the inner window aimed at
+0x1B2000 (`RECOMP_TEXT_CK_WINDOW` exists for exactly this) before believing it.
+
+Next: find who chooses that framebuffer address, and why it differs. Both hosts
+ran identical D3D allocation calls earlier tonight, so this is downstream of
+those and is a different allocator.
