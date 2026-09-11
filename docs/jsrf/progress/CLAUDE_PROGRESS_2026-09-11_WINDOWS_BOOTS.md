@@ -140,6 +140,50 @@ for this. Find what actually hands D3D its push-buffer base and why the two
 hosts answer differently. That is the next thing to read, and it is one
 allocation site rather than a bisection.
 
+## ROOT CAUSE: the guest never allocates a push-buffer ring on Windows
+
+Measured, both hosts, same gen, one line each:
+
+    MAC  [HEAP] #7: size=524288 align=4096 -> 0x0056D000..0x005ED000
+         [PUSHER] ring cursor 0x0056D000  bounds 0x0056D000-0x005ED000
+
+    WIN  requests for size=524288: ZERO, in any run
+         [PUSHER] ring cursor 0x00001000  bounds 0x00001000-0x00081000
+
+Both hosts make exactly 32 heap allocations. macOS's #7 IS the ring; Windows'
+#7 is 96 bytes, so the sequence diverges before it and the 512 KB request is
+never made at all. With no ring, the pusher falls back to bounds
+0x1000-0x81000, and 0x1000 is XBOX_FS_BASE -- the fake TIB.
+
+That chains to everything else already recorded here. The guest submits into
+memory that is not a ring; kernel_bridge writes the SEH chain head to fs:[0],
+i.e. dword 0 of that range, on every frame push and RtlUnwind; the pusher
+eventually decodes data as a command, increments bad_headers and stops; GET
+freezes behind PUT; and the guest waits on ring space that never frees. The TIB
+collision recorded above is real but is a CONSEQUENCE of the missing
+allocation, not an allocator placing the ring badly.
+
+NEXT, and it is narrow: the heap sequence diverges before allocation #7, so
+something in the preceding six returns a different answer on Windows and the
+guest skips the ring allocation. Diff the two [HEAP] streams from #1 and find
+the first request that differs in size or that one host makes and the other
+does not. Both logs are already in the scratchpad.
+
+## Two more of my own claims, retracted
+
+Recorded because this file has now carried each of them as fact:
+
+  - "The ring is in the XBE image." Wrong; physical 0x1000 is BELOW the image,
+    which loads at 0x00010000. Corrected in commit a7870e5.
+  - "NtAllocateVirtualMemory #15, 32 KB, is the ring." Wrong. Both hosts place
+    that one in the heap -- 0x611000 on Windows, 0x511000 on macOS, differing
+    by exactly the 1 MB worker-stack pool that XBOX_WORKER_STACK_COUNT=4 adds
+    to the Windows build. The ring is 512 KB, not 32 KB.
+
+The pattern across the whole day is worth stating plainly: every one of these
+was a plausible mechanism believed before the measurement that would have
+falsified it existed. The measurements were cheap in every case.
+
 ## Standing traps, all paid for today
 
 - An ordered divergence is a CEILING on where the fault is, never a location,
