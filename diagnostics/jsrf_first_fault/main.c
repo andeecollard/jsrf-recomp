@@ -1030,6 +1030,9 @@ static void jsrf_pusher_report(void)
                 extern void xbox_TextChecksumReport(void);
                 xbox_TextChecksumReport();
             }
+            /* And where the two D3D contiguous allocators stopped. Silent
+             * unless RECOMP_D3D_ALLOC_TRACE is set and the sites are armed. */
+            jsrf_d3d_alloc_report();
         }
         /* And the boundary those voices have to cross. The APU aperture is
          * guarded read-only so stores fault and reach the model; anything the
@@ -1345,6 +1348,93 @@ void jsrf_audio_completion_probe(uint32_t pc, uint32_t object, uint32_t arg)
  * whole budget before the loop body printed anything.
  *
  * RECOMP_VOICE_TRACE=1 enables it; =<n> multiplies every cap by n. */
+/* Where the two D3D contiguous allocators stop, on each host.
+ *
+ * MmAllocateContiguousMemoryEx (ordinal 166) is called 59 times on macOS and 0
+ * on Windows, and every one of those calls comes from sub_0018E670 or
+ * sub_00199760. Reading both (CLAUDE_PROGRESS_2026-09-11_TWO_FUNCTIONS_READ.md)
+ * showed they have the same shape and exactly one branch ahead of the
+ * allocation:
+ *
+ *     descriptor = sub_0014A83E(0x40, tag)   // the title's own heap
+ *     if (!descriptor) return E_OUTOFMEMORY; // <-- and no allocation happens
+ *     mem = (*(void**)0x001C40F8)(size, ...) // thunk slot 102 = ordinal 166
+ *     if (!mem) { free(descriptor); return E_OUTOFMEMORY; }
+ *
+ * So "Windows never allocates" has two possible shapes, and they are
+ * distinguishable at one site each: the descriptor is null and the guest never
+ * reaches the allocation, or it reaches it and gets zero back. Entry counters
+ * cannot separate them -- sub_0014A83E and the free are general-purpose and
+ * have callers all over the title -- which is why this is a path probe and not
+ * another --va list.
+ *
+ * Counts everything and prints the first few of each, because the counts are
+ * the measurement and the values are how you read it. The thunk word at
+ * 0x001C40F8 is sampled at the call site: if it is ever not a synthetic kernel
+ * VA, the allocation cannot dispatch and neither branch above is the story.
+ *
+ * RECOMP_D3D_ALLOC_TRACE=1 enables it. Read-only: every site is a call placed
+ * after an existing label, taking registers and guest memory as arguments. */
+static const struct { uint32_t pc; const char *what; } g_d3d_alloc_sites[] = {
+        { 0x0018E670u, "E670 entry" },
+        { 0x0018E6CBu, "E670 descriptor" },
+        { 0x0018E6D1u, "E670 pre-alloc" },
+        { 0x0018E6E9u, "E670 alloc returned" },
+        { 0x0018E6F3u, "E670 fail return" },
+        { 0x0018E6FEu, "E670 success" },
+        { 0x00199760u, "9760 entry" },
+        { 0x0019976Au, "9760 descriptor" },
+        { 0x00199770u, "9760 pre-alloc" },
+        { 0x00199789u, "9760 alloc returned" },
+        { 0x00199793u, "9760 fail return" },
+        { 0x0019979Cu, "9760 success" },
+};
+enum { D3D_ALLOC_NSITES =
+           (int)(sizeof(g_d3d_alloc_sites) / sizeof(g_d3d_alloc_sites[0])),
+       D3D_ALLOC_PRINT_CAP = 6 };
+static unsigned long g_d3d_alloc_hits[D3D_ALLOC_NSITES];
+static unsigned      g_d3d_alloc_printed[D3D_ALLOC_NSITES];
+static int           g_d3d_alloc_enabled = -1;
+
+void jsrf_d3d_alloc_probe(uint32_t pc, uint32_t a, uint32_t b)
+{
+    int i, site = -1;
+
+    if (g_d3d_alloc_enabled < 0)
+        g_d3d_alloc_enabled = getenv("RECOMP_D3D_ALLOC_TRACE") ? 1 : 0;
+    if (!g_d3d_alloc_enabled) return;
+
+    for (i = 0; i < D3D_ALLOC_NSITES; i++)
+        if (g_d3d_alloc_sites[i].pc == pc) { site = i; break; }
+    if (site < 0) return;
+
+    g_d3d_alloc_hits[site]++;
+    if (g_d3d_alloc_printed[site] < D3D_ALLOC_PRINT_CAP) {
+        g_d3d_alloc_printed[site]++;
+        fprintf(stderr, "  [D3D-ALLOC] %-20s a=0x%08X b=0x%08X (hit %lu)\n",
+                g_d3d_alloc_sites[site].what, a, b,
+                g_d3d_alloc_hits[site]);
+        fflush(stderr);
+    }
+}
+
+void jsrf_d3d_alloc_report(void)
+{
+    int i;
+
+    if (g_d3d_alloc_enabled <= 0) return;
+
+    /* Every site, INCLUDING the zeroes. A site at 0 is the whole point of this
+     * probe -- "the guest never got here" is the answer it exists to give, and
+     * a report that skipped empty rows could not give it. */
+    fprintf(stderr, "  [D3D-ALLOC] thunk slot 102 (0x001C40F8) = 0x%08X\n",
+            MEM32(0x1C40F8u));
+    for (i = 0; i < D3D_ALLOC_NSITES; i++)
+        fprintf(stderr, "  [D3D-ALLOC] %-20s %lu\n",
+                g_d3d_alloc_sites[i].what, g_d3d_alloc_hits[i]);
+    fflush(stderr);
+}
+
 void jsrf_voice_submit_probe(uint32_t pc, uint32_t a, uint32_t b, uint32_t c)
 {
     extern unsigned long g_apu_voice_on_count;

@@ -73,4 +73,10 @@ void jsrf_audio_completion_probe(uint32_t, uint32_t, uint32_t);
 void jsrf_voice_submit_probe(uint32_t pc, uint32_t a, uint32_t b,
                              uint32_t c);
 
+/* Installed by instrument_d3d_alloc.py into a copy of a gen tree; separates
+ * "the guest never reached the contiguous allocation" from "it reached it and
+ * got zero back". RECOMP_D3D_ALLOC_TRACE=1. */
+void jsrf_d3d_alloc_probe(uint32_t pc, uint32_t a, uint32_t b);
+void jsrf_d3d_alloc_report(void);
+
 #endif

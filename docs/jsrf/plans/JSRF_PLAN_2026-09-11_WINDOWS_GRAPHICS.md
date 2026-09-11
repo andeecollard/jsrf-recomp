@@ -4,7 +4,26 @@ Date: 2026-09-11, written at the end of the session that built the oracle.
 Background: `../progress/CLAUDE_PROGRESS_2026-09-11_WINDOWS_BOOTS.md` and the
 two handovers of the same date.
 
-## The state in three lines
+## RETRACTED, 2026-09-11 night -- READ THIS BEFORE THE REST OF THE FILE
+
+The fact this plan is built on is false, and most of what follows from it is
+dead. `MmAllocateContiguousMemoryEx` IS called on Windows and DOES return
+memory; the "zero times" was a count of `[HEAP]` log lines against a cap of 64
+(`heap_trace_limit()`), not a count of calls. Measured directly, the two
+allocators behave IDENTICALLY on both hosts -- same sizes, same descriptors,
+same thunk, zero failures either side. See
+`../progress/CLAUDE_PROGRESS_2026-09-11_ALLOCATORS_EXONERATED.md`.
+
+What survives: Windows ENTERS these functions 3 and 2 times where macOS enters
+221 and 358. Everything inside them is identical. The fault is upstream of the
+D3D allocation path entirely, and the live question is what stops the guest
+driving D3D at all -- likely the same question as the unexplained 0xFFFFFF00
+crash, now that both the interrupt race and the .text overlap are eliminated.
+
+Steps 1 and 2 below were done and are still worth having. Steps 3-5 are
+superseded.
+
+## The state in three lines (AS ORIGINALLY WRITTEN -- the last sentence is wrong)
 
 Windows boots, runs the APU, connects all four interrupts, delivers vblank at
 62 Hz and streams ADX. It renders nothing. The one fact that has survived every
@@ -140,6 +159,11 @@ made correct writes look like zeros and produced a whole wrong narrative.
     structurally impossible in this runtime. Closed, see step 1.
   - the KeConnectInterrupt race as the Windows crash mechanism: fixed, and the
     crash is unchanged.
+  - the D3D contiguous allocation failing on Windows: it does not fail. The
+    two allocators, their heap descriptor, and thunk slot 102 are all measured
+    identical on both hosts. Do not re-open any of them.
+  - any conclusion drawn by counting [HEAP] lines: the log is capped at 64 and
+    says so nowhere. Raise it with RECOMP_HEAP_TRACE=<n> before counting.
 
   - instrumenting the two functions' arguments (step 4 as originally written):
     the event rate is 2.6-5.4% and Windows supplies 92 samples.
