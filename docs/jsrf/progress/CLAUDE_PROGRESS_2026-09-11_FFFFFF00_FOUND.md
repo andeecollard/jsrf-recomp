@@ -201,3 +201,68 @@ else than the mode call reports. Re-run TEXT-CK with the inner window aimed at
 Next: find who chooses that framebuffer address, and why it differs. Both hosts
 ran identical D3D allocation calls earlier tonight, so this is downstream of
 those and is a different allocator.
+
+---
+
+# Addendum 2: the checksum probe was measuring the wrong thing
+
+Re-aiming `RECOMP_TEXT_CK_WINDOW` at the framebuffer range turned up a defect in
+the probe rather than in the title, and it is the kind this tree keeps paying
+for, so it is written down rather than quietly fixed.
+
+The probe sampled `g_xbox_code_lo..g_xbox_code_hi` and called it ".text". That
+pair is the range indirect calls may target, built from every section with the
+XBE EXECUTABLE flag -- and this XBE flags **.rdata and .data executable too**:
+
+    .text   0x00011000  D3D 0x0018CB40  DSOUND 0x0019E340  MMATRIX 0x001BA8A0
+    XGRPH   0x001BBAC0  XPP 0x001BC7C0   .rdata 0x001C3F60  .data   0x001EB760
+
+so the "code range" ran to 0x00284E18 and was mostly data. Pointed at it, the
+probe dutifully reported four changed pages -- 0x257000, 0x25E000, 0x26E000,
+0x27D000, all inside .data -- under the headline "the guest is writing where
+its own instructions live". The guest was writing its own globals. That is what
+running looks like.
+
+It also explains the benign "MU_0" -> "MU_7" .rdata dword reported earlier: it
+should never have been in scope.
+
+Fixed: `g_xbox_text_lo`/`g_xbox_text_hi` are now captured from the section
+actually named `.text` and the probe uses those. The baseline line now reads
+0x00011000-0x0018CB30, which is the figure the plan quoted all along.
+
+## With that corrected, the .text question is settled on BOTH halves
+
+    macOS    [TEXT-CK] 16 pages unchanged
+    Windows  [TEXT-CK] 16 pages unchanged
+
+Both halves are now genuine code. Nothing writes .text on either host. The
+earlier conclusion was right, but it had been resting partly on control pages
+that were .rdata and .data.
+
+## The framebuffer lead is weaker, not stronger
+
+The one run that did cover 0x1B2000..0x248000 (the mis-aimed one) showed only
+scattered dword writes -- 9, 12, 81, 98 and 103 dwords out of 1024 per page.
+A 640x480 surface being blitted would change whole pages. So there is no
+evidence of a framebuffer landing on the image, only of ordinary global
+traffic. `fb=0x001B2000` is still an unexplained difference from macOS's
+0x0071E000 and still worth knowing, but it is not corrupting the image.
+
+## A second, different crash
+
+`../artifacts/win_backtrace2_2026-09-11_ntdll_retq.txt` is not the same fault.
+It has no guest frames at all: the faulting instruction is `ntdll+0xfb05: retq`.
+A fault on a return is a HOST stack corruption signature, not a guest pointer,
+and it is a different failure from the 0xFFFFFF00 dereference.
+
+Worth connecting to the warning the runtime prints on both hosts:
+
+    [KERNEL] ordinal 1 has no entry in stdcall_args_for_ordinal(). If it takes
+    arguments, this call is corrupting the caller's stack
+
+`stdcall_args_for_ordinal` returning nothing for an ordinal means the bridge
+does not know how many bytes to pop, and a wrong pop is precisely how a return
+address goes bad. Ordinals 46, 144 and 1 are unbridged on both hosts. That did
+not explain the 0xFFFFFF00 dereference -- both hosts hit them and only one
+produces the value -- but it is a live candidate for THIS crash, and the two
+should not be assumed to be the same bug.

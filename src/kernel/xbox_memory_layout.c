@@ -2405,6 +2405,10 @@ ptrdiff_t g_xbox_mem_offset = 0;
 uint32_t g_xbox_low_base = XBOX_LOW_BASE_DEFAULT;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
+/* The .text section proper. See where these are set for why the pair above is
+ * not a substitute. */
+uint32_t g_xbox_text_lo = 0;
+uint32_t g_xbox_text_hi = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
@@ -2959,6 +2963,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Copy initialized data from XBE */
             if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
+            }
+
+            /* The section actually holding instructions, as distinct from the
+             * executable RANGE below. This XBE marks .rdata and .data
+             * executable too -- XBEs commonly do -- so g_xbox_code_lo..hi spans
+             * most of the image and is useless for asking "did code change".
+             * Anything that means .text must use these. */
+            if (sec_name[0] == '.' && sec_name[1] == 't' && sec_name[2] == 'e'
+                && sec_name[3] == 'x' && sec_name[4] == 't') {
+                g_xbox_text_lo = sec_va;
+                g_xbox_text_hi = sec_va + sec_vsize;
             }
 
             /* Executable sections define the range indirect calls may target.
@@ -4757,6 +4772,14 @@ HANDLE xbox_GetMappingHandle(void)
  * finding from it survives -- so this has to be settled before the rest of the
  * Windows plan means anything.
  *
+ * MEASURED OVER .text ONLY, and that distinction is the whole instrument. This
+ * XBE marks .rdata and .data executable as well, so g_xbox_code_lo..hi -- the
+ * range indirect calls may target -- covers most of the image. Sampling that
+ * range reports the guest writing its own globals, every run, on both hosts,
+ * which is what normal execution looks like and says nothing about code. The
+ * first version of this probe did exactly that and its verdict line called it
+ * "the guest is writing where its own instructions live". Use g_xbox_text_*.
+ *
  * Sixteen pages, summed at the first call and re-summed on every periodic
  * report. HALF of them inside the observed ring window and half across the
  * rest of the range, rather than sixteen spread evenly -- an even spread puts
@@ -4797,7 +4820,7 @@ void xbox_TextChecksumReport(void)
 
     if (enabled < 0) enabled = getenv("RECOMP_TEXT_CHECKSUM") ? 1 : 0;
     if (!enabled) return;
-    if (!g_xbox_code_lo || g_xbox_code_hi <= g_xbox_code_lo) return;
+    if (!g_xbox_text_lo || g_xbox_text_hi <= g_xbox_text_lo) return;
 
     {
         static uint32_t window;
@@ -4810,17 +4833,17 @@ void xbox_TextChecksumReport(void)
         /* Clamp: a window past the end of .text would put every page in the
          * inner half and leave no control at all. */
         inner_hi = window;
-        if (inner_hi <= g_xbox_code_lo || inner_hi > g_xbox_code_hi)
-            inner_hi = g_xbox_code_lo + (g_xbox_code_hi - g_xbox_code_lo) / 4;
-        outer_span = g_xbox_code_hi - inner_hi;
+        if (inner_hi <= g_xbox_text_lo || inner_hi > g_xbox_text_hi)
+            inner_hi = g_xbox_text_lo + (g_xbox_text_hi - g_xbox_text_lo) / 4;
+        outer_span = g_xbox_text_hi - inner_hi;
 
         for (i = 0; i < TEXT_CK_PAGES; i++) {
             uint32_t va;
             if (armed) {
                 va = page_va[i];
             } else if (i < TEXT_CK_PAGES / 2) {
-                va = g_xbox_code_lo
-                   + (uint32_t)((uint64_t)(inner_hi - g_xbox_code_lo)
+                va = g_xbox_text_lo
+                   + (uint32_t)((uint64_t)(inner_hi - g_xbox_text_lo)
                         * (uint32_t)i / (TEXT_CK_PAGES / 2));
             } else {
                 va = inner_hi
@@ -4833,8 +4856,8 @@ void xbox_TextChecksumReport(void)
             uint32_t n = 4096, k;
 
             va &= ~0xFFFu;
-            if (va < g_xbox_code_lo) va = g_xbox_code_lo;
-            if (va + n > g_xbox_code_hi) n = g_xbox_code_hi - va;
+            if (va < g_xbox_text_lo) va = g_xbox_text_lo;
+            if (va + n > g_xbox_text_hi) n = g_xbox_text_hi - va;
             page_va[i] = va;
             page_len[i] = n;
             p = (const unsigned char *)((uintptr_t)va + g_memory_offset);
@@ -4854,7 +4877,7 @@ void xbox_TextChecksumReport(void)
         fprintf(stderr, "  [TEXT-CK] baseline over .text 0x%08X-0x%08X: "
                 "%d pages in the ring window 0x%08X-0x%08X, %d outside it "
                 "as the control (0x%08X-0x%08X)\n",
-                g_xbox_code_lo, g_xbox_code_hi,
+                g_xbox_text_lo, g_xbox_text_hi,
                 TEXT_CK_PAGES / 2, page_va[0], page_va[TEXT_CK_PAGES / 2 - 1],
                 TEXT_CK_PAGES / 2, page_va[TEXT_CK_PAGES / 2],
                 page_va[TEXT_CK_PAGES - 1]);
