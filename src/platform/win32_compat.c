@@ -601,6 +601,38 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/*
+ * Suspend/resume accounting, read-only and opt-in (RECOMP_THREAD_TRACE).
+ *
+ * JSRF's XAPI worker parks itself in NtSuspendThread and is woken by a
+ * ResumeThread from another thread. A sample taken during the pad-poll stop
+ * finds that thread parked for 2592 of 2592 samples, where a healthy run has
+ * it parked for roughly 70% -- suggestive, but a parked worker is normal, so
+ * the fraction alone proves nothing.
+ *
+ * What would prove it is a resume that arrives with the count already at zero:
+ * Win32 (and this implementation) treat that as a no-op, so if the producer
+ * signals before the worker parks, the wakeup is LOST and the worker sleeps
+ * for the life of the process. lost_resumes counts exactly that case. A stall
+ * that begins in the same report as a lost resume is the mechanism; a stall
+ * with lost_resumes flat is not.
+ */
+unsigned long g_w32_suspends;
+unsigned long g_w32_resumes;
+unsigned long g_w32_lost_resumes;
+unsigned long g_w32_parked;
+
+void w32_thread_trace_report(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_THREAD_TRACE") != NULL;
+    if (!on) return;
+    fprintf(stderr, "  [THREAD] suspends=%lu resumes=%lu lost_resumes=%lu"
+            " parked_now=%lu\n",
+            g_w32_suspends, g_w32_resumes, g_w32_lost_resumes, g_w32_parked);
+    fflush(stderr);
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
@@ -688,8 +720,15 @@ DWORD ResumeThread(HANDLE h)
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
-    if (o->suspend_count > 0 && --o->suspend_count == 0)
-        pthread_cond_broadcast(&o->gate);
+    g_w32_resumes++;
+    if (o->suspend_count > 0) {
+        if (--o->suspend_count == 0)
+            pthread_cond_broadcast(&o->gate);
+    } else {
+        /* Nothing to resume. Win32 does nothing here and so do we -- but if
+         * the target is about to park, this wakeup is gone for good. */
+        g_w32_lost_resumes++;
+    }
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -715,9 +754,12 @@ DWORD SuspendThread(HANDLE h)
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    g_w32_suspends++;
     if (o == t_self_obj) {
+        g_w32_parked++;
         while (o->suspend_count > 0)
             pthread_cond_wait(&o->gate, &o->lock);
+        g_w32_parked--;
     }
     /* Cross-thread: the count is set here and the TARGET honours it at its next
      * safe point (w32_thread_suspend_point below). */

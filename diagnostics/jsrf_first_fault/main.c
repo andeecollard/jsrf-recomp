@@ -17,6 +17,7 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 #include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <pthread.h>
 #endif
 
 #include <xbox/xboxrecomp.h>
@@ -30,6 +31,7 @@ extern void nv2a_pb_exec_report(void);
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
+static void jsrf_save_dump(void);
 static void jsrf_scene_report(void);
 static void jsrf_object_dump(void);
 /* The rasterised surface, and the window that can show it. The executor draws
@@ -957,6 +959,7 @@ static void jsrf_pusher_report(void)
             xbox_InputPollReport();
         }
         pad_sentinel_scan();
+        jsrf_save_dump();
         jsrf_scene_report();
         jsrf_object_dump();
         jsrf_func_hit_report();
@@ -1402,11 +1405,177 @@ static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
     return 1;
 }
 
+static uint32_t g_pad_inject_va[8];
+static unsigned g_pad_inject_n;
+static int      g_pad_inject_found;
+static int pad_inject(void);
+
 static int pad_sentinel(void)
 {
     static int on = -1;
     if (on < 0) on = getenv("RECOMP_PAD_SENTINEL") ? 1 : 0;
+    /* RECOMP_PAD_INJECT needs the stamp only until it has found the guest's
+     * copies; after that the stamp would fight the live report it writes. */
+    if (pad_inject() && !g_pad_inject_found) return 1;
     return on;
+}
+
+/*
+ * RECOMP_PAD_INJECT -- deliver input without the guest's USB driver.
+ *
+ * Every route from the host pad into the title runs through one door:
+ * xbox_InputGetState is called from exactly one place, usb_gamepad_report,
+ * which only runs when the guest's XPP driver schedules an interrupt
+ * transfer. When that driver stops -- and it does, in roughly a third of
+ * runs, mid-play and without recovering -- the game keeps calling its own
+ * readInput() at full rate and reads a buffer nobody is filling any more.
+ * Measured: polls frozen at 6614 for 60 s while readInput climbed 3349 ->
+ * 4257 and the frame loop ran normally.
+ *
+ * Nothing in the guest can be asked to restart that schedule from here. But
+ * the report's destination is knowable: the sentinel already proves the title
+ * keeps its own copies of the 20-byte report, and prints their addresses. So
+ * this writes the live report straight into those copies on a host thread,
+ * and the USB path becomes irrelevant to whether input works.
+ *
+ * Discovery costs one report's worth of a pinned left stick (the sentinel
+ * stamp), after which stamping stops and real input flows. Bytes 0 and 1 --
+ * type and length -- are left alone; only the button and axis payload is
+ * written, so a partially-read struct can only ever mix two frames of input.
+ *
+ * This is a diagnostic bypass, not a fix: it hides the driver stall rather
+ * than explaining it. Its purpose is to let the title be PLAYED while that is
+ * still open, and to answer a question no amount of further tracing can --
+ * whether the tutorial's jump is counted once a press genuinely arrives.
+ */
+
+static int pad_inject(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PAD_INJECT") ? 1 : 0;
+    return on;
+}
+
+static void *pad_inject_thread(void *arg)
+{
+    extern int usb_gamepad_report(uint8_t *out, int max);
+    uint8_t rep[20];
+    (void)arg;
+    for (;;) {
+        uint8_t *base = (uint8_t *)xbox_GetMemoryOffset();
+        if (base && g_pad_inject_n && usb_gamepad_report(rep, (int)sizeof rep) == 20) {
+            /* Write ONLY the last copy found.
+             *
+             * The first hit is the USB transfer buffer itself -- the address
+             * our own OHCI model writes into, and which XPP's descriptors
+             * point at. Writing there races the device model and is the most
+             * likely cause of the hang the first version of this produced:
+             * the guest's frame loop stopped while audio kept running. The
+             * later copy is XPP's own, downstream of delivery, which is the
+             * one the title reads and the one nothing else is writing. */
+            uint32_t va = g_pad_inject_va[g_pad_inject_n - 1];
+            memcpy(base + va + 2, rep + 2, 18);
+        }
+        usleep(16000);  /* 60 Hz. The title reads this buffer; it does not need
+                         * to be written faster than it is read. */
+    }
+    return NULL;
+}
+
+static void pad_inject_start(void)
+{
+    static pthread_t th;
+    static int started;
+    if (started || !g_pad_inject_n) return;
+    started = 1;
+    if (pthread_create(&th, NULL, pad_inject_thread, NULL) == 0) {
+        pthread_detach(th);
+        fprintf(stderr, "  [PAD-INJECT] writing live reports to guest 0x%08X"
+                " at 60 Hz (%u copies found, last one used); the USB schedule"
+                " is now bypassed\n",
+                g_pad_inject_va[g_pad_inject_n - 1], g_pad_inject_n);
+    } else {
+        fprintf(stderr, "  [PAD-INJECT] thread create failed\n");
+    }
+    fflush(stderr);
+}
+
+/*
+ * RECOMP_SAVE_DUMP -- read JSRF's own save/progress state, read-only.
+ *
+ * The decompilation documents both the structure and where it lives. The
+ * singleton is loaded into ecx immediately before every CSaveData call:
+ *
+ *     loc_00054810:  ecx = 0x1EB938
+ *                    call 0x000149E0   (CSaveData::GetReturnMissionNo)
+ *
+ * and CSaveData begins with the on-disk sdData, so the first fields are at
+ * fixed offsets (JSRF-Decompilation, decompile/src/JSRF/SaveData.hpp):
+ *
+ *     +0x000 m_dwReturnChapterNo     +0x004 m_dwReturnMissionNo
+ *     +0x008 m_dwSpawnPosIndex       +0x00C m_dwPlaytimeFrames
+ *     +0x010 m_dwUnlockedChars       +0x014 m_dwChapterFlags[16]
+ *     +0x054 m_dwGlobalFlags[16]     +0x094 m_dwSpecialFlags[16]
+ *
+ * m_dwSpecialFlags is the one the header describes as carrying "special
+ * effects like unlocking/completing tutorials", which is why this exists:
+ * the tutorial's progress is a value we can now watch rather than infer from
+ * whether the dialogue advances.
+ */
+/* CSaveData is polymorphic, so a vtable pointer sits at +0x00 and the on-disk
+ * sdData begins at +0x04. Not a guess: GetReturnChapterNo reads [ecx+4] and
+ * GetReturnMissionNo reads [ecx+8] in the generated code. */
+#define JSRF_SAVEDATA_VA        0x001EB938u
+#define JSRF_SD_VPTR            0x000u
+#define JSRF_SD_RETURN_CHAPTER  0x004u
+#define JSRF_SD_RETURN_MISSION  0x008u
+#define JSRF_SD_SPAWN_INDEX     0x00Cu
+#define JSRF_SD_PLAYTIME        0x010u
+#define JSRF_SD_CHAPTER_FLAGS   0x018u
+#define JSRF_SD_GLOBAL_FLAGS    0x058u
+#define JSRF_SD_SPECIAL_FLAGS   0x098u
+
+static void jsrf_save_dump(void)
+{
+    static int on = -1;
+    const uint8_t *base;
+    uint32_t v[4];
+    unsigned i;
+
+    if (on < 0) on = getenv("RECOMP_SAVE_DUMP") ? 1 : 0;
+    if (!on) return;
+    base = (const uint8_t *)xbox_GetMemoryOffset();
+    if (!base) return;
+
+    memcpy(&v[0], base + JSRF_SAVEDATA_VA + JSRF_SD_RETURN_CHAPTER, 4);
+    memcpy(&v[1], base + JSRF_SAVEDATA_VA + JSRF_SD_RETURN_MISSION, 4);
+    memcpy(&v[2], base + JSRF_SAVEDATA_VA + JSRF_SD_SPAWN_INDEX, 4);
+    memcpy(&v[3], base + JSRF_SAVEDATA_VA + JSRF_SD_PLAYTIME, 4);
+    fprintf(stderr, "  [SAVE] chapter=%u mission=%u spawn=%u playtime_frames=%u\n",
+            v[0], v[1], v[2], v[3]);
+
+    {
+        static const struct { const char *name; uint32_t off; } lists[] = {
+            { "chapter", JSRF_SD_CHAPTER_FLAGS },
+            { "global",  JSRF_SD_GLOBAL_FLAGS  },
+            { "special", JSRF_SD_SPECIAL_FLAGS },
+        };
+        unsigned l;
+        for (l = 0; l < sizeof lists / sizeof lists[0]; l++) {
+            uint32_t w[16];
+            unsigned set = 0;
+            memcpy(w, base + JSRF_SAVEDATA_VA + lists[l].off, sizeof w);
+            for (i = 0; i < 16; i++) {
+                unsigned b;
+                for (b = 0; b < 32; b++)
+                    if (w[i] & (1u << b)) set++;
+            }
+            fprintf(stderr, "  [SAVE] %-7s flags: %3u bit(s) set  "
+                    "%08X %08X %08X %08X\n",
+                    lists[l].name, set, w[0], w[1], w[2], w[3]);
+        }
+    }
+    fflush(stderr);
 }
 
 /* Count and locate copies of the sentinel across guest RAM. */
@@ -1430,12 +1599,26 @@ static void pad_sentinel_scan(void)
             if (hits < 16)
                 fprintf(stderr, "  [PAD-SENTINEL] copy at guest 0x%08X\n",
                         (unsigned)i);
+            /* The sentinel sits at report bytes 12..15, so the report starts
+             * twelve bytes earlier. Guard the subtraction: a hit below that
+             * is not a report. */
+            if (pad_inject() && !g_pad_inject_found &&
+                    g_pad_inject_n < (unsigned)(sizeof g_pad_inject_va /
+                                                sizeof g_pad_inject_va[0]) &&
+                    i >= 12u)
+                g_pad_inject_va[g_pad_inject_n++] = i - 12u;
             hits++;
         }
     }
     fprintf(stderr, "  [PAD-SENTINEL] %u cop%s of the pad report in guest RAM\n",
             hits, hits == 1 ? "y" : "ies");
     fflush(stderr);
+
+    if (pad_inject() && !g_pad_inject_found && g_pad_inject_n) {
+        /* Latch, so the stamp stops and the pinned stick goes away. */
+        g_pad_inject_found = 1;
+        pad_inject_start();
+    }
 }
 
 /* JSRF's own object bookkeeping, read from the host side.
