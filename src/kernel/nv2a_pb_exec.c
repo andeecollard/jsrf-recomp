@@ -1064,6 +1064,42 @@ static void flip_trace(void)
 static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb);
 
+/* Does a GPU write land on the loaded XBE image? Reported once per distinct
+ * range so a per-frame clear cannot flood the log. */
+/* Pushed in by the loader rather than read as an extern: the small diagnostic
+ * binaries link this translation unit without the kernel layer, and they simply
+ * never set it, which leaves the guard inert instead of unresolved. */
+static uint32_t s_image_lo, s_image_hi;
+
+void nv2a_set_image_bounds(uint32_t lo, uint32_t hi)
+{
+    s_image_lo = lo;
+    s_image_hi = hi;
+}
+
+static int nv2a_range_hits_image(uint32_t guest_va, size_t bytes)
+{
+    static uint32_t last_va; static size_t last_bytes; static unsigned long n;
+
+    if (!s_image_hi || !bytes) return 0;
+    if ((uint64_t)guest_va >= (uint64_t)s_image_hi
+        || (uint64_t)guest_va + bytes <= (uint64_t)s_image_lo)
+        return 0;
+
+    n++;
+    if (guest_va != last_va || bytes != last_bytes) {
+        last_va = guest_va; last_bytes = bytes;
+        fprintf(stderr,
+                "  [NV2A] REFUSED a surface write over the loaded image: "
+                "guest 0x%08X..0x%08X overlaps image 0x%08X..0x%08X (%lu so far)."
+                " The surface address is wrong; the clear is not the bug.\n",
+                guest_va, (uint32_t)(guest_va + bytes),
+                s_image_lo, s_image_hi, n);
+        fflush(stderr);
+    }
+    return 1;
+}
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -1094,6 +1130,23 @@ static void clear_surface(uint32_t param)
                 && (uint64_t)base+offset<=UINT32_MAX) {
             uint8_t *z=xbox_GpuMemoryRange(base+offset,bytes);
             uint32_t value=s_methods[0x1d8c/4];
+            /* Never clear into the loaded image.
+             *
+             * A Z24S8 clear writes stencil 0x00 then depth 0xFF 0xFF 0xFF, so
+             * every dword it touches becomes 0xFFFFFF00. Caught doing exactly
+             * that over guest .data on the Windows host: 0x0025EFB8, a function
+             * pointer the vsync pump calls when non-zero, and the XPP list head
+             * at 0x002648D4. The guest then calls 0xFFFFFF00 and dies, frames
+             * and seconds away from here, with nothing in the guest's own
+             * stores to show for it.
+             *
+             * The DMA checks above validate the offset against the DMA object's
+             * own limit, which says nothing about whether that object was set up
+             * over the image. This is the missing invariant, not a workaround:
+             * the GPU has no business writing the title's code or data, on any
+             * host, and a surface that resolves there is misconfigured. Refuse
+             * and say so, rather than corrupting the guest silently. */
+            if (z && nv2a_range_hits_image(base+offset, bytes)) z = NULL;
             if (z) for (y=y0;y<y1;++y) for (x=x0;x<x1;++x) {
                 uint8_t *p=z+(size_t)y*pitch+x*4;
                 if (param&2) p[0]=(uint8_t)value;

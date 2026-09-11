@@ -1641,6 +1641,29 @@ static uintptr_t g_ac97_page;         /* AC97 bus-master boxes, write-clear */
 static int       g_ac97_guarded;
 static uintptr_t g_nv2a_pgraph_page;  /* PGRAPH_INTR, and the notify trap */
 static int       g_nv2a_pgraph_guarded;
+/* RECOMP_STORE_WATCH=<va>:<len> -- a guarded page over ordinary guest RAM.
+ *
+ * RECOMP_MEM_WATCH sees only stores routed through the RECOMP_MEM_WRITE macros,
+ * the block-write probe sees only lifted string operations, and
+ * RECOMP_KERNEL_WATCH only samples around bridge calls. A value that changes
+ * while all three are silent -- which is where 0x0025EFB8 left us -- is being
+ * written by something none of them covers, and the only instrument that sees
+ * EVERY writer regardless of which thread or which layer it lives in is the
+ * hardware one. Guard the page; the VEH below already decodes and completes
+ * the store, so this reports the host PC and carries on. */
+static uintptr_t g_store_watch_page;
+static int       g_store_watch_guarded;
+static uint32_t  g_store_watch_lo, g_store_watch_hi;
+/* Its OWN lock, not the device one.
+ *
+ * Sharing g_nv2a_pcrtc_lock put ordinary guest .data stores behind the same
+ * interlock the pusher thread takes to raise a PGRAPH notify and the ack thread
+ * spins against. Two runs stalled before AvSetDisplayMode with it, which reads
+ * as "the guard prevents the corruption" and is really "the guard wedged the
+ * title" -- the same shape as the APU lock freezing the guest. A watch page
+ * over plain RAM shares nothing with the device pages and needs no common
+ * lock. */
+static volatile LONG g_store_watch_lock;
 static volatile LONG g_nv2a_pcrtc_lock;
 static size_t    g_nv2a_page_size;    /* g_mcpx_page_size is AArch64-only */
 
@@ -1764,7 +1787,8 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
      * 0xFD600140 on the PCRTC page and the process died there.) */
     if (!(g_nv2a_pcrtc_guarded  && page == g_nv2a_pcrtc_page) &&
         !(g_ac97_guarded        && page == g_ac97_page) &&
-        !(g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page))
+        !(g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page) &&
+        !(g_store_watch_guarded && page == g_store_watch_page))
         return 0;
 
     ip = (const uint8_t *)(uintptr_t)ctx->Rip;
@@ -1811,6 +1835,37 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
                 written &= ~(uint32_t)MCPX_WRITE_CLEAR[k].write_clear;
     }
 
+    /* Plain guest RAM: its own lock, no device semantics, and nothing else on
+     * this page to interpret. Report inside the watched range, naming the host
+     * PC so addr2line can say who it was -- generated code, a bridge, or a
+     * device model on its own thread -- then complete the store and return. */
+    if (g_store_watch_guarded && page == g_store_watch_page) {
+        DWORD wp;
+        if (guest_va + width > g_store_watch_lo && guest_va < g_store_watch_hi) {
+            fprintf(stderr,
+                    "  [STORE-WATCH] va=0x%08X width=%u value=0x%08X"
+                    " old=0x%08X host_pc=0x%016llX\n",
+                    guest_va, width, written,
+                    (width == 1) ? (uint32_t)*(volatile uint8_t *)fault
+                                 : *(volatile uint32_t *)fault,
+                    (unsigned long long)ctx->Rip);
+            fflush(stderr);
+        }
+        while (InterlockedCompareExchange(&g_store_watch_lock, 1, 0) != 0)
+            SwitchToThread();
+        if (VirtualProtect((LPVOID)page, g_nv2a_page_size,
+                           PAGE_READWRITE, &wp)) {
+            if (width == 1) *(volatile uint8_t  *)fault = (uint8_t)written;
+            else            *(volatile uint32_t *)fault = written;
+            if (!VirtualProtect((LPVOID)page, g_nv2a_page_size,
+                                PAGE_READONLY, &wp))
+                g_store_watch_guarded = 0;
+        }
+        InterlockedExchange(&g_store_watch_lock, 0);
+        ctx->Rip += ilen;
+        return 1;
+    }
+
     while (InterlockedCompareExchange(&g_nv2a_pcrtc_lock, 1, 0) != 0)
         SwitchToThread();
 
@@ -1844,6 +1899,7 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
                             PAGE_READONLY, &old_prot)) {
             if      (page == g_nv2a_pcrtc_page)  g_nv2a_pcrtc_guarded = 0;
             else if (page == g_nv2a_pgraph_page) g_nv2a_pgraph_guarded = 0;
+            else if (page == g_store_watch_page) g_store_watch_guarded = 0;
             else                                 g_ac97_guarded = 0;
         }
     }
@@ -1957,6 +2013,25 @@ static void xbox_McpxTrapInstall(void)
             g_ac97_guarded ? "guarded" : "NOT guarded");
     fprintf(stderr, "  NV2A: PGRAPH page %s for software-method notify\n",
             g_nv2a_pgraph_guarded ? "guarded" : "NOT guarded");
+    {
+        const char *spec = getenv("RECOMP_STORE_WATCH");
+        if (spec) {
+            char *end = NULL;
+            uint32_t va = (uint32_t)strtoul(spec, &end, 0);
+            uint32_t len = (end && *end == ':') ? (uint32_t)strtoul(end + 1, NULL, 0) : 4;
+            if (!len) len = 4;
+            g_store_watch_lo = va;
+            g_store_watch_hi = va + len;
+            g_store_watch_page = ((uintptr_t)g_memory_offset + va)
+                                 & ~(uintptr_t)(g_nv2a_page_size - 1);
+            g_store_watch_guarded = VirtualProtect((LPVOID)g_store_watch_page,
+                                                   g_nv2a_page_size,
+                                                   PAGE_READONLY, &old_prot) != 0;
+            fprintf(stderr, "  STORE-WATCH: guest 0x%08X..0x%08X page %s\n",
+                    g_store_watch_lo, g_store_watch_hi,
+                    g_store_watch_guarded ? "guarded" : "NOT guarded");
+        }
+    }
     fflush(stderr);
 }
 
@@ -2409,6 +2484,12 @@ uint32_t g_xbox_code_hi = 0;
  * not a substitute. */
 uint32_t g_xbox_text_lo = 0;
 uint32_t g_xbox_text_hi = 0;
+/* The loaded image, every section. Nothing the GPU writes may land here: a
+ * surface address that resolves into the title's own code and data is always a
+ * bug, and silently honouring it corrupts the guest in ways that surface much
+ * later as garbage pointers. */
+uint32_t g_xbox_image_lo = 0;
+uint32_t g_xbox_image_hi = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
@@ -2990,6 +3071,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * deliberately excludes them. */
             if (sec_va + sec_vsize > image_hi)
                 image_hi = sec_va + sec_vsize;
+            if (!g_xbox_image_lo || sec_va < g_xbox_image_lo)
+                g_xbox_image_lo = sec_va;
+            if (sec_va + sec_vsize > g_xbox_image_hi)
+                g_xbox_image_hi = sec_va + sec_vsize;
 
             sections_loaded++;
             total_bytes += copy_size;
@@ -3001,6 +3086,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
+
+        /* Tell the GPU model where the image is, so it can refuse to render
+         * into it. See nv2a_range_hits_image. */
+        {
+            extern void nv2a_set_image_bounds(uint32_t, uint32_t);
+            nv2a_set_image_bounds(g_xbox_image_lo, g_xbox_image_hi);
+        }
 
         /* Put the fixed low block just above the image instead of at a base
          * chosen to clear any XBE. Everything below the heap is memory the
