@@ -36,6 +36,12 @@ if(NOT WIN32)
     list(APPEND KERNEL_SOURCES fb_window_stub.c)
 endif()
 
+# Windows bodies for the few xbox_* helpers that live in the POSIX-only
+# src/platform/win32_compat.c.
+if(WIN32)
+    list(APPEND KERNEL_SOURCES win32_native.c)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
 # Generated store helpers call into xbox_kernel only on normal game targets.

@@ -287,6 +287,11 @@ unsigned long g_apu_sdl_prime_bytes;
 unsigned long g_apu_sdl_reprimes;
 unsigned long g_apu_sdl_clears;
 
+/* Added with the gap accounting in mcpx_apu_pacing_report, which is common to
+ * both hosts; this Windows list was not updated alongside it. */
+unsigned long g_apu_sdl_max_gap_us;
+unsigned long g_apu_sdl_gaps_over_cushion;
+
 unsigned long apu_sdl2_queued_bytes(void) { return 0; }
 
 int apu_sdl2_submit_samples(const int16_t *samples, int sample_frames)

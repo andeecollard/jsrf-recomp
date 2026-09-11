@@ -12,6 +12,7 @@
 
 #include "xinput_xbox.h"
 #include <string.h>
+#include <stdio.h>   /* both branches report pad-poll counters */
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -33,6 +34,44 @@ void xbox_InputInit(void)
     }
 }
 
+/* Pad-poll accounting, mirroring the POSIX branch below field for field.
+ *
+ * These have to exist on BOTH hosts or the Windows build silently loses the
+ * [PAD-POLL] line -- and a missing line reads exactly like polls=0, which is
+ * one of the two failure signatures under investigation. A counter that cannot
+ * move is worse than no counter, so these are wired to the real XInput path
+ * rather than stubbed. */
+unsigned long g_pad_polls;
+unsigned long g_pad_polls_connected;
+unsigned long g_pad_polls_nonneutral;
+unsigned long g_pad_polls_disconnected;
+
+/* Anything a human would call "pressed or moved". Same 4096 stick threshold as
+ * the POSIX pad_note_state and the USB report path. */
+static void pad_note_state(const XBOX_INPUT_STATE *st)
+{
+    int active = st->Gamepad.wButtons != 0;
+    for (int i = 0; !active && i < 8; i++)
+        active = st->Gamepad.bAnalogButtons[i] > 32;
+    if (!active) {
+        active = st->Gamepad.sThumbLX > 4096 || st->Gamepad.sThumbLX < -4096
+              || st->Gamepad.sThumbLY > 4096 || st->Gamepad.sThumbLY < -4096
+              || st->Gamepad.sThumbRX > 4096 || st->Gamepad.sThumbRX < -4096
+              || st->Gamepad.sThumbRY > 4096 || st->Gamepad.sThumbRY < -4096;
+    }
+    if (active)
+        g_pad_polls_nonneutral++;
+}
+
+void xbox_InputPollReport(void)
+{
+    fprintf(stderr, "  [PAD-POLL] polls=%lu connected=%lu nonneutral=%lu"
+            " not_connected=%lu\n",
+            g_pad_polls, g_pad_polls_connected, g_pad_polls_nonneutral,
+            g_pad_polls_disconnected);
+    fflush(stderr);
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
@@ -40,14 +79,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+    g_pad_polls++;
 
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
+        g_pad_polls_disconnected++;
         return result;
     }
 
     g_controller_connected[dwPort] = TRUE;
+    g_pad_polls_connected++;
     g_last_packet[dwPort] = xi_state.dwPacketNumber;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
@@ -76,6 +118,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
 
+    pad_note_state(pState);
     return ERROR_SUCCESS;
 }
 
