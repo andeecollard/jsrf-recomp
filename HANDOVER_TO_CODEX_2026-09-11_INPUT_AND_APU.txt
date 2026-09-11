@@ -1,0 +1,242 @@
+JSRF HANDOVER FOR CODEX
+Date: 2026-09-11 (Europe/London), afternoon
+From: Claude -- session ran 13:40-15:00 BST, picking up the tree the morning
+      session left.
+
+This file is at the repo root because it was asked for there. Every other JSRF
+note lives in docs/jsrf/; move it there when it stops being the current one.
+Read it with docs/jsrf/goals/JSRF_GOALS_2026-09-11_ANIMATION_AND_INPUT.md and
+the morning's handover in docs/jsrf/handovers/, both of which it updates rather
+than replaces.
+
+
+0. THE STATE, IN ONE PARAGRAPH
+==============================
+The title boots, loads, renders and plays audio. **Controller input does not
+work**, and that is the blocking fault. A second fault -- a deadlock that froze
+the whole guest -- was found and fixed today, so a run no longer dies at ~45 s,
+but the input problem is untouched by that and is what the next session should
+start on. Everything is committed; the tree is clean; main has been
+fast-forwarded to carry it.
+
+
+1. WHAT LANDED TODAY
+====================
+On reference/xemu-oracle, and now on main (local only -- nothing is pushed):
+
+  e3a380f  Hold the MCPX alias: it is the only thing that faults at 0xFFFFFFBE
+  16c4f6b  Put the morning's record and the sampler into git
+  1bed7d3  Let the guest have the APU lock, or it freezes the whole title
+  5d26a23  Three instruments left over from the morning, none of them run yet
+  b91ecbf  Say whether a press reached us at all, without a human keeping time
+
+Commit messages carry the reasoning; this file carries only what they cannot.
+
+
+2. THE DEADLOCK, AND WHY IT MATTERS EVEN THOUGH IT IS FIXED
+===========================================================
+A run hung. Every guest counter stopped in the same report -- ActionExec, both
+exec walkers, readInput, drawOne, CPlayer's own methods -- while audio kept
+playing and the pad counter kept climbing. No fault, no stopped counter with a
+reason. It reads exactly like "the game hung".
+
+The process was still alive, so it was read rather than guessed at. Owners
+taken out of the mutexes themselves:
+
+    main thread   blocked in the guest's own DSOUND critical section,
+                  owner tid 0x1f63c1
+    0x1f63c1      blocked on the APU device lock inside a TRAPPED register
+                  write (mcpx_trap_handler -> fe_method -> voice_lock),
+                  owner tid 0x1f6393
+    0x1f6393      the APU frame thread, 2747 of 2759 samples inside
+                  voice_process and adpcm_decode_block
+
+mcpx_apu_frame_thread took d->lock once before its loop and released it only
+inside throttle()'s cond wait -- which it reaches only while running ahead of
+real time. Saturated, it never released the lock at all, and the guest thread
+waiting on it held the DSOUND critical section the exec phase needs every
+frame. 1bed7d3 adds an announced wait (mcpx_apu_lock_guest) and a bounded
+hand-off at the frame boundary, with lock_handoffs on the [APU-FRAME] line as
+the positive control.
+
+Verified: 600 s run, no freeze, ActionExec 827 -> 14,712, 694 hand-offs. Before
+the fix the same scene froze inside 45 s. ctest unchanged at 21/27 (the same
+six known failures -- backport-presence checks against a gen regenerated
+without them, plus the dead-_flags ratchet).
+
+**Left open by it:** the APU frame thread is CPU-saturated whenever the title
+has voices. That is why the window closed. The fix keeps the guest alive
+through the saturation; it does not make the mixer fast.
+
+**Method worth keeping.** For any future freeze: sample the live process, then
+
+    lldb -p <pid> --batch -o "thread backtrace all -c 40"
+    expr -- (void*)((CRITICAL_SECTION*)<cs>)->LockSemaphore
+    memory read -f x -s 4 -c 16 <mutex>     # owner tid is the 7th word
+    thread list                             # match it
+
+That took the hang from "unexplained" to "named owner" in about ten minutes.
+
+
+3. INPUT: WHAT IS ACTUALLY BROKEN
+=================================
+Two different signatures were measured today, in the same build, minutes apart.
+They are not the same fault and should not be merged again.
+
+### (a) polls climb, then non-neutral reports stop
+
+Run a1-exec-walkers-tutorial-2, 600 s. polls 1,149 -> 73,117, connected tracks
+it exactly, not_connected=0 throughout. nonneutral went 0 -> 71 -> 191 between
+t=79 and t=99 and then never moved again for 500 s. The guest ran normally
+throughout (ActionExec climbing, not paused).
+
+### (b) polls = 0, for the entire run
+
+Run pad-trace-2, 200 s and counting. **polls=0 connected=0 nonneutral=0
+not_connected=0 in every report.** The guest never calls xbox_InputGetState at
+all, while the scene loads and runs normally (live=161, ids_populated=123) and
+the APU hands off the lock 533 times. Nothing is wrong with the guest; it
+simply never asks for input.
+
+This is the "polls = 0 variant" the goals file flagged as possibly a different
+failure from "polls stop after N". It is.
+
+### The one difference on record between the two
+
+The OHCI attach probe prints once per run, and it differs:
+
+    polls=0 run       port1=0x00010001 intr_status=0x00000040 intr_enable=0x00000040
+    polling run       port1=0x00010001 intr_status=0x00000040 intr_enable=0x00000000
+
+Same port state, same status bit (RootHubStatusChange), but in the dead run the
+driver had *already enabled* that interrupt when our model attached the device,
+and in the working run it had not. Given the morning's finding that ohci_raise()
+is never called in any run -- healthy or stalled, positive control taken -- a
+connect that lands after the enable has nothing to deliver it. That is the
+first thing to chase, and it is a race, so it wants several runs classified by
+that line before any code is written.
+
+### What is armed to help
+
+  RECOMP_PAD_TRACE (new, b91ecbf) prints one line per change of host pad state.
+  It fires from inside xbox_InputGetState, so in a polls=0 run it prints
+  nothing -- absence of lines there is not evidence about the host read. In a
+  run that polls, a press either produces a line or the host read is dead.
+
+  RECOMP_PAD_INJECT (5d26a23, never run) writes live reports straight into the
+  guest's own copies, bypassing the USB schedule entirely. If (a) and (b) both
+  resist, this is the way to get a playable title while they are open -- and
+  the only way to answer whether the tutorial's jump is counted once a press
+  genuinely arrives.
+
+
+4. WHAT THE DECOMPILATION GAVE UP, AND IT IS A LOT
+==================================================
+symbolize.py skips every row of symboltable.tsv whose kind is not `func`, so
+the 389 **data** rows had never been read. They name class vtables. Reading
+CPlayer's out of the XBE (base at +0x104, section headers at +0x120, 0x38 bytes
+each) gives its virtual methods directly:
+
+    CPlayer::'vftable'   0x001CCFF8
+      +04 Exec0Default        0x00080340
+      +08 Exec1Default        0x00080BD0
+      +0C DrawListDefault     0x00082770
+      +10 Exec0Event          CActBase::nopMethod0Arg
+      +14 Exec1Event          0x0007EA00   (128 bytes, two calls)
+      +1C..+38 every CoveredPause / FreezeCam / UncoveredPause exec slot
+                             CActBase::nopMethod0Arg
+
+So a CPlayer in any mode but Default genuinely does nothing -- the video's
+mechanism, made checkable. Note 0x00080340 was already in instrument_func_hit's
+default VA list as "a function that forms CPlayer +0xCE0 statically": the block
+we never write at the tutorial is written from inside Exec0Default itself.
+
+Also: MSVC puts the vptr at +0x00, so CActBase::m_ActFlag is +0x04 and m_ActID
+is +0x08 -- the decompilation's struct listing omits the implicit vptr, and an
+--ecxpair VA:4 records the flag, not the id.
+
+And the alias crash's "LAST INSTRUMENTED GUEST FUNCTION: sub_00147EBB" is
+exactly extern_"C"::XapiThreadStartup. That fault is in guest thread startup,
+not in the aperture ff5f578 touches.
+
+
+5. RETRACTIONS -- THINGS THIS SESSION GOT WRONG
+===============================================
+  * "The run reached the Corn tutorial, so A1 is answered." Read off
+    live=61 ids_populated=47 matching a recorded signature. That is not a scene
+    identifier -- the same shape appears elsewhere, two CPlayers and all.
+    **A1 is still unanswered.** The exec-walker counts quoted (Default only,
+    every other walker at zero for 600 s) are real, but they describe whatever
+    scene that run was in, and the new-game menu was already known to be
+    Default-only.
+
+  * A human was asked to press buttons to a schedule to disambiguate a counter.
+    That is a measurement with a person in the loop; RECOMP_PAD_TRACE replaced
+    it in five minutes. If an instrument is missing, write the instrument.
+
+
+6. THE TRAP THAT COST THE MOST TODAY
+====================================
+**Orphaned processes with live windows.** Three copies of the title were
+running at once without anyone intending it, two of them with parent PID 1:
+
+  * Attaching lldb to the child detaches it from run_bounded.py's wait. The
+    wrapper printed `exited=0` while the process was demonstrably still alive,
+    then exited, leaving the game running with its window on screen.
+  * `pkill -f jsrf_first_fault` matches the **wrapper** as well: run_bounded.py's
+    command line contains that path. It killed the harness and orphaned the
+    child.
+
+The window that was being played -- and reported as "stuck" -- was very
+probably the process that had deadlocked twenty minutes earlier, permanently
+frozen, while the log being read belonged to a different process entirely. Any
+observation crossing that boundary is void.
+
+    Before every run:   pgrep -l jsrf_first_fault   # must print nothing
+    To stop one:        kill -9 <pid from run_bounded's "child=" line>
+
+Do not pkill by name in this tree.
+
+
+7. HOW THINGS STAND ON DISK
+===========================
+  * Branch reference/xemu-oracle, and main fast-forwarded to the same commit.
+    Nothing is pushed; everything this week is still on one disk in iCloud.
+  * Working tree clean.
+  * **build-macos/jsrf-first-fault/gen has 12 function-entry counters installed
+    in it** -- the five exec walkers, CActMan::ActionExec, drawOne, and
+    CPlayer's four real methods with --ecxpair. They are opt-in
+    (RECOMP_FUNC_HIT_TRACE) and harmless, but they are in the generated tree,
+    not in git. Remove with instrument_func_hit.py --remove ... or regenerate.
+  * Run logs: build-macos/jsrf-first-fault/render-investigation/, now ~95
+    directories. Today's are a1-exec-walkers-tutorial-{1,2},
+    apu-lock-handoff-control-1, pad-trace-{1,2}.
+  * ff5f578, the MCPX writable alias, is reverted and held. Do not reland it
+    without answering which call returns -76 to XapiThreadStartup.
+
+
+8. WHAT TO DO NEXT
+==================
+  1. **Input, signature (b).** Run five times, classify each by the OHCI attach
+     probe line, and see whether intr_enable=0x40 at attach predicts polls=0.
+     Unattended, no human at the pad, and it either finds a race or kills the
+     theory in half an hour.
+
+  2. **Input, signature (a).** One run with RECOMP_PAD_TRACE=1 that actually
+     polls, and a person pressing anything at all. A line per press means the
+     value reaches our side and is lost in delivery; silence means the host
+     read died. No schedule, no stopwatch.
+
+  3. **RECOMP_PAD_INJECT**, if 1 and 2 do not converge quickly. It makes the
+     title playable while the USB path is broken and answers the tutorial-jump
+     question, which nothing else can.
+
+  4. **A1, properly this time.** The counters are already installed in the gen.
+     What is missing is a way to say which scene a run is in that does not rely
+     on object counts -- RECOMP_SAVE_DUMP (5d26a23, never run) prints chapter,
+     mission and the tutorial flags straight out of CSaveData, which is exactly
+     that. Turn it on and the scene stops being a guess.
+
+  5. **The APU is saturated.** Not urgent now that it cannot deadlock, but it
+     is the reason it could, and it will bite again in any measurement that
+     depends on timing.
