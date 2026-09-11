@@ -3706,6 +3706,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     recomp_mem_watch_init(g_memory_size, g_mirror_mask, XBOX_TILED_BASE,
                           g_tiled_view ? xbox_TiledApertureSize() : 0);
+#if defined(_WIN32)
+    /* Here rather than in the harness, for two reasons. The heap bounds are
+     * only final once the image is loaded and the stacks are sized, which is
+     * this far into init and no earlier; and init is still single-threaded,
+     * which is what makes rebuilding the window safe. POSIX keeps it opt-in
+     * per title because fixed-address pinned pools may legitimately overlap
+     * there -- on this host the alternative is an arena that aliases the
+     * guest's own stacks and heap, so the default is the other way round and
+     * RECOMP_PHYSICAL_HEAP_ALIAS=0 is the way out. */
+    xbox_EnablePhysicalHeapAlias();
+#endif
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -3713,8 +3724,138 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 BOOL xbox_EnablePhysicalHeapAlias(void)
 {
 #if defined(_WIN32)
-    /* The Windows allocator has a different, high-window backing contract. */
-    return FALSE;
+    /* Give this host the same one-pool contract POSIX has always had.
+     *
+     * Physical offset N and XBOX_CONTIG_BASE + N have to name the same bytes.
+     * They did not: the window here is VirtualAlloc'd storage deliberately
+     * aliasing nothing, so a contiguous block the guest filled through
+     * 0x80XXXXXX was invisible to a GPU resolving the low offset -- measured
+     * as 45 mismatching surface resolves against zero matching, with the
+     * guest's texture bytes in the window and zeros where the GPU reads. The
+     * separate arena that follows from it also climbs through the guest's own
+     * stacks and heap, which is what overwrote a texture-cache slot and
+     * crashed the render chain.
+     *
+     * The mechanism is already proven on this host: the tiled aperture maps a
+     * view of the same section at another VA for exactly this reason, and says
+     * so. The only complication is that the window is one VirtualAlloc
+     * reservation, and a file view cannot be mapped inside one -- MEM_RELEASE
+     * frees whole reservations only. So rebuild it as up to three: committed
+     * storage below the heap, a view of RAM across the heap, committed storage
+     * above it.
+     *
+     * The low slice is copied out and back rather than assumed empty. The
+     * kernel's fake PE header lives at window offset 0x10000 and is written
+     * during init, and "nothing else has written there yet" is the kind of
+     * claim that is true until it is not.
+     *
+     * Runs while init is still single-threaded, which is what makes the gap
+     * between releasing the reservation and remapping it safe. */
+    uintptr_t expected = (uintptr_t)g_memory_offset + XBOX_CONTIG_BASE;
+    uint32_t start = XBOX_HEAP_BASE, end = XBOX_HEAP_TOP;
+    void *low_copy = NULL;
+    void *low_region, *high_region = NULL, *target;
+    const char *disabled = getenv("RECOMP_PHYSICAL_HEAP_ALIAS");
+
+    if (g_physical_heap_view) return TRUE;
+    if (disabled && !strcmp(disabled, "0")) {
+        fprintf(stderr, "  Physical heap alias: disabled by"
+                        " RECOMP_PHYSICAL_HEAP_ALIAS=0; the contiguous arena"
+                        " will alias guest low memory\n");
+        return FALSE;
+    }
+    if (!g_mapping_handle || !g_memory_base
+            || (uintptr_t)g_contig_memory != expected
+            || end <= start || end > XBOX_CONTIG_SIZE || end > g_memory_size
+            || (start & 0xffffu) || (end & 0xffffu)) {
+        fprintf(stderr, "  Physical heap alias: incompatible or uninitialised"
+                        " layout (heap 0x%08X..0x%08X)\n", start, end);
+        return FALSE;
+    }
+
+    low_copy = malloc(start);
+    if (!low_copy) {
+        fprintf(stderr, "  Physical heap alias: cannot preserve the low"
+                        " %u bytes of the window\n", start);
+        return FALSE;
+    }
+    memcpy(low_copy, (const void *)expected, start);
+
+    if (!VirtualFree((LPVOID)expected, 0, MEM_RELEASE)) {
+        fprintf(stderr, "  Physical heap alias: releasing the window failed"
+                        " (error %lu)\n", (unsigned long)GetLastError());
+        free(low_copy);
+        return FALSE;
+    }
+
+    low_region = VirtualAlloc((LPVOID)expected, start,
+                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (low_region != (void *)expected) {
+        /* The window is gone and could not be retaken. Nothing downstream can
+         * recover from that, so say which step lost it rather than fault
+         * later somewhere unrelated. */
+        fprintf(stderr, "  Physical heap alias: FATAL, could not re-reserve"
+                        " 0x%08X..0x%08X (error %lu)\n",
+                XBOX_CONTIG_BASE, XBOX_CONTIG_BASE + start,
+                (unsigned long)GetLastError());
+        free(low_copy);
+        g_contig_memory = NULL;
+        return FALSE;
+    }
+    memcpy((void *)expected, low_copy, start);
+    free(low_copy);
+
+    target = (void *)(expected + start);
+    g_physical_heap_view = MapViewOfFileEx(g_mapping_handle,
+                                           FILE_MAP_ALL_ACCESS, 0, start,
+                                           (size_t)end - start, target);
+    if (g_physical_heap_view != target) {
+        if (g_physical_heap_view) UnmapViewOfFile(g_physical_heap_view);
+        g_physical_heap_view = NULL;
+        /* Put plain storage back so the window is whole and the run continues
+         * on the old contract rather than faulting on the first pinned pool. */
+        VirtualAlloc(target, (size_t)XBOX_CONTIG_SIZE - start,
+                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        fprintf(stderr, "  Physical heap alias: mapping failed (error %lu);"
+                        " window restored unaliased\n",
+                (unsigned long)GetLastError());
+        return FALSE;
+    }
+    if (end < XBOX_CONTIG_SIZE) {
+        high_region = VirtualAlloc((LPVOID)(expected + end),
+                                   (size_t)XBOX_CONTIG_SIZE - end,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!high_region)
+            fprintf(stderr, "  WARNING: contiguous window above 0x%08X is"
+                            " unmapped (error %lu); GPU instance memory will"
+                            " fault\n",
+                    XBOX_CONTIG_BASE + end, (unsigned long)GetLastError());
+    }
+
+    /* Prove the alias rather than assert it, the way the tiled aperture does.
+     * If these are not the same bytes the GPU reads empty buffers and the
+     * screen stays black with nothing anywhere to say why. */
+    {
+        volatile uint32_t *via_window =
+            (volatile uint32_t *)(expected + start + 0x1000);
+        volatile uint32_t *via_ram =
+            (volatile uint32_t *)((uintptr_t)g_memory_offset + start + 0x1000);
+        uint32_t saved = *via_ram;
+
+        *via_window = 0xA5C30F17u;
+        if (*via_ram != 0xA5C30F17u) {
+            fprintf(stderr, "  WARNING: physical heap alias does NOT share"
+                            " bytes (wrote A5C30F17, read %08X)\n", *via_ram);
+        }
+        *via_ram = saved;
+    }
+
+    recomp_mem_watch_add_ram_alias(XBOX_CONTIG_BASE + start, start,
+                                   (size_t)end - start);
+    fprintf(stderr, "  Physical heap alias: 0x%08X..0x%08X shares low RAM;"
+                    " contiguous allocations now come from the heap\n",
+            XBOX_CONTIG_BASE + start, XBOX_CONTIG_BASE + end);
+    return TRUE;
 #else
     if (g_physical_heap_view) return TRUE;
     /* MapViewOfFileEx uses MAP_FIXED on POSIX. Replace only pages inside the
@@ -4288,19 +4429,19 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 #else
     uint32_t result;
 
-    /* RECOMP_CONTIG_FROM_HEAP=1 -- take contiguous memory from the guest heap,
-     * the way the POSIX branch above always has.
+    /* With the window aliased to RAM there is one pool, as the hardware has.
      *
-     * The separate bump arena below cannot be made safe by raising its floor:
-     * the stacks and the heap sit above the image too, and the heap grows to
-     * the top of RAM, so there is no floor that clears them. One pool is what
-     * the hardware has. Opt-in until a run says the title is happier with it.
+     * The bump arena below cannot be made safe by raising its floor: the
+     * stacks and the heap sit above the image too, and the heap grows to the
+     * top of RAM, so no floor clears them. It survives only as the fallback
+     * for a layout where the alias could not be established, and its overlap
+     * report says when that fallback is corrupting guest memory.
      *
      * The XBOX_CONTIG_BASE bit is not decoration: D3D reconstructs DMA_GET
      * with bit 31 set before comparing it against its own allocation, and the
-     * GPU model addresses this window by physical offset -- which, with guest
-     * RAM mapped 1:1, is the heap VA itself. */
-    if (getenv("RECOMP_CONTIG_FROM_HEAP")) {
+     * GPU addresses this window by physical offset -- which, with the alias in
+     * place, is the heap VA itself. */
+    if (g_physical_heap_view) {
         uint32_t heap = xbox_HeapAlloc(size, alignment);
         return heap ? (heap | XBOX_CONTIG_BASE) : 0;
     }

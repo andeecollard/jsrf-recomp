@@ -177,14 +177,57 @@ and Windows is upstream's only supported host. This is not a JSRF defect and
 not a porting artefact; it affects every title on the toolkit. We are keeping
 the fix local for now, but it is worth raising if the project ever wants it.
 
+## The fix, and the first Windows frame
+
+`xbox_EnablePhysicalHeapAlias` now has a Windows implementation. The window is
+rebuilt at the end of layout init -- while it is still single-threaded, and
+late enough that the heap bounds are final -- as committed storage below
+`XBOX_HEAP_BASE`, a view of the RAM section across the heap, and committed
+storage above it. The low slice is copied out and back rather than assumed
+empty, because the kernel's fake PE header lives at window offset 0x10000. It
+proves the alias with a write and a read the way the tiled aperture does, and
+`xbox_ContiguousAlloc` then takes from the heap whenever the view is live,
+falling back to the floored arena (and its overlap report) when it is not.
+`RECOMP_PHYSICAL_HEAP_ALIAS=0` is the way out. `RECOMP_CONTIG_FROM_HEAP` is
+gone -- the alias decides.
+
+    Physical heap alias: 0x80610000..0x84000000 shares low RAM;
+    contiguous allocations now come from the heap
+
+Same texture, same block, before and after:
+
+    one pool   low 00CE6000 sum=00000000 | high 80CE6000 sum=9BAA1BD1  MISMATCH
+    aliased    low 00CE6000 sum=9BAA1BD1 | high 80CE6000 sum=9BAA1BD1  match
+
+                              two pools   one pool    aliased
+    CONTIG-VERIFY mismatches     n/a          45           0
+    access violations              1           0           0
+    invalid texture binds          5           0           0
+    contiguous blocks on RAM     64+           0           0
+    textures rejected          4,938      10,294           0
+
+**The framebuffer has pixels.** Every previous Windows run reported
+`nonzero=0/153600` for its whole life. This one changes continuously from
+t=12 s, twice reaching a fully covered frame:
+
+    [FB] t=  12.00 0x006F0000 sum=63719352 nonzero=  7207/153600 CHANGED
+    [FB] t=  60.00 0x006F0000 sum=73C200E0 nonzero=153600/153600 CHANGED
+    [FB] t= 108.00 0x006F0000 sum=17218E1E nonzero=  8108/153600 CHANGED
+
+Texture rejection is 0 for the entire run, against roughly half in every run
+before it. The triangle total is *lower* (5,000 against the one-pool run's
+22.2M) and that is expected: the earlier figure was a software rasteriser
+sweeping blank memory as fast as it could, and this one is doing real textured
+work at frame pace.
+
+macOS is unregressed on the same build: 157 matches, 0 mismatches, no faults,
+no invalid binds, still presenting (`presented nonzero=290856`). `ctest` shows
+the same six failures this gen has always had, and `jsrf_heap_alloc`, which
+exercises the alias directly, passes.
+
 ## Next
 
-Make physical offset N and `0x80000000 + N` the same bytes on Windows, the way
-`xbox_EnablePhysicalHeapAlias` already does on POSIX, and then take contiguous
-memory from the heap. That function is a stub returning `FALSE` on Windows
-today; `MapViewOfFileEx` is native there, `g_mapping_handle` is a real
-`CreateFileMappingA`, and the mirror views already alias RAM at several VAs the
-same way. The obstacle is that the window is `VirtualAlloc(MEM_RESERVE|COMMIT)`
-over all 64 MB and a file view cannot be mapped inside it, so the window has to
-be rebuilt at init as a view over `XBOX_HEAP_BASE..XBOX_HEAP_TOP` plus
-committed storage for the rest.
+The oracle renders now, so the two open items from the previous handover are
+worth re-measuring rather than reasoned about: the 0xBC60 voice link, and where
+submission stops. Both were observed on a host whose GPU was reading blank
+memory.
