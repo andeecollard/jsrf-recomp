@@ -267,6 +267,27 @@ Clues in the tree worth acting on, in order:
      (host pointer on both hosts) and not MmAllocateContiguousMemoryEx (never
      reached). Something earlier in D3D's GPU setup fails and is not checked.
 
+## The sequence instrument cannot answer this yet, and why
+
+Tried to name the D3D function that decides, by enlarging the per-thread ring
+to 65536 and diffing the two hosts around the allocation window. It does not
+work, for a reason worth fixing before anyone tries again:
+
+  THE THREAD SLOT IS ASSIGNED BY FIRST-TOUCH ORDER. Slot N is a different
+  thread on each host AND on each run -- macOS slot 0 opened with 00192A80 in
+  one run and 00154420 in the next. Comparing "thread 0" to "thread 0" is
+  meaningless, and falling back to matching threads by common prefix fails once
+  the two runs sit at different stages: measured, no pair of threads across the
+  two hosts shared even three collapsed steps.
+
+The fix is to key the ring by a STABLE identity -- the first guest function a
+thread enters, or a role assigned where the thread is created -- rather than by
+the order slots happen to be claimed. Until that is done, [FUNC-SEQ] is useful
+for "where did this thread stop" on ONE host and not for cross-host diffs.
+
+The ring size is back to 1024; 65536 entries times eight threads makes the
+periodic report unreadable and was only ever for one capture.
+
 ## Standing traps, all paid for today
 
 - An ordered divergence is a CEILING on where the fault is, never a location,
