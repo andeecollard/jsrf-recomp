@@ -1069,6 +1069,25 @@ void jsrf_resource_probe(uint32_t pc, uint32_t resource, uint32_t value,
     }
 }
 
+/* One cache index followed for its whole life, uncapped.
+ *
+ * RECOMP_TEXTURE_SLOT=<index> names a slot whose every creation, store,
+ * release, bind and teardown is printed regardless of the ordinary print
+ * limits below. Those limits are counters: a slot created after the 512th
+ * store, or bound after the eighth bind, is invisible without this, and an
+ * absent line would read as "the slot was never touched". Accepts decimal or
+ * 0x-prefixed hex; unset means -1, which no index can equal. */
+static long jsrf_texture_slot_watch(void)
+{
+    static long slot = -2;
+    const char *spec;
+
+    if (slot != -2) return slot;
+    spec = getenv("RECOMP_TEXTURE_SLOT");
+    slot = (spec && *spec) ? (long)strtoul(spec, NULL, 0) : -1;
+    return slot;
+}
+
 /* Read-only observation of the title's indexed texture cache. A store with a
  * non-zero old_resource is a replacement; sub_0014F640 should have released
  * and cleared that slot first. */
@@ -1077,16 +1096,21 @@ void jsrf_texture_cache_probe(uint32_t pc, uint32_t index,
 {
     static int enabled = -1;
     static unsigned releases, stores, replacements, teardowns;
+    int watched;
 
-    if (enabled < 0) enabled = getenv("RECOMP_RESOURCE_TRACE") != NULL;
+    if (enabled < 0)
+        enabled = getenv("RECOMP_RESOURCE_TRACE") != NULL ||
+                  jsrf_texture_slot_watch() >= 0;
     if (!enabled) return;
+    watched = (long)index == jsrf_texture_slot_watch();
 
     if (pc == 0x0014F640u) {
         ++releases;
-        if (old_resource || releases <= 32)
+        if (watched || old_resource || releases <= 32)
             fprintf(stderr,
-                    "[TEXTURE-CACHE] release=%u index=%u old=%08X\n",
-                    releases, index, old_resource);
+                    "[TEXTURE-CACHE]%s release=%u index=%u old=%08X\n",
+                    watched ? " WATCH" : "", releases, index, old_resource);
+        if (watched) fflush(stderr);
         return;
     }
     if (pc == 0x00154B20u) {
@@ -1101,12 +1125,96 @@ void jsrf_texture_cache_probe(uint32_t pc, uint32_t index,
 
     ++stores;
     if (old_resource) ++replacements;
-    if (stores <= 512 || old_resource)
+    if (watched || stores <= 512 || old_resource)
         fprintf(stderr,
-                "[TEXTURE-CACHE] store=%u pc=%08X index=%u new=%08X old=%08X"
+                "[TEXTURE-CACHE]%s store=%u pc=%08X index=%u new=%08X old=%08X"
                 " releases=%u replacements=%u\n",
-                stores, pc, index, resource, old_resource, releases,
-                replacements);
+                watched ? " WATCH" : "", stores, pc, index, resource,
+                old_resource, releases, replacements);
+    if (watched) fflush(stderr);
+}
+
+/* Entry of the shared texture-creation body sub_0014F720, which ends by
+ * publishing its result into cacheTable[index] -- either a resource pointer
+ * or the 0xFFFFFFFF its local was initialised to when no resource was made.
+ * Recording the attempt separates "creation was never tried for this slot"
+ * from "creation was tried and failed", which the store alone cannot. */
+void jsrf_texture_create_probe(uint32_t pc, uint32_t index, uint32_t arg1,
+                               uint32_t arg3, uint32_t return_address)
+{
+    static int enabled = -1;
+    static unsigned creates;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_RESOURCE_TRACE") != NULL ||
+                  jsrf_texture_slot_watch() >= 0;
+    if (!enabled) return;
+
+    ++creates;
+    if ((long)index == jsrf_texture_slot_watch() || creates <= 16) {
+        fprintf(stderr,
+                "[TEXTURE-CACHE]%s create=%u pc=%08X index=%u arg1=%08X"
+                " arg3=%08X caller=%08X slot-was=%08X\n",
+                (long)index == jsrf_texture_slot_watch() ? " WATCH" : "",
+                creates, pc, index, arg1, arg3, return_address,
+                read_word(read_word(0x264F68u) + index * 4u));
+        fflush(stderr);
+    }
+}
+
+/* A game render object resolves a texture-cache index and calls D3D's binding
+ * helper with the resulting resource pointer. Windows reached the call with a
+ * live index whose cache slot still held the 0xFFFFFFFF empty sentinel;
+ * sub_0018DF10 accepts null but dereferences every other value. Observe the
+ * lookup at its caller so the original cache index is not lost. The first few
+ * healthy calls are a positive control; invalid values are always reported. */
+void jsrf_texture_bind_probe(uint32_t pc, uint32_t cache_index,
+                             uint32_t stage, uint32_t resource,
+                             uint32_t return_address)
+{
+    static int enabled = -1;
+    static unsigned long calls, invalid;
+    static int dumped;
+    int bad = resource != 0 && !xbox_IsXboxAddress(resource);
+    int watched;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_RESOURCE_TRACE") != NULL ||
+                  jsrf_texture_slot_watch() >= 0;
+    if (!enabled) return;
+    watched = (long)cache_index == jsrf_texture_slot_watch();
+
+    ++calls;
+    if (bad) ++invalid;
+    if (watched || calls <= 8 || bad) {
+        fprintf(stderr,
+                "[TEXTURE-BIND]%s call=%lu pc=%08X cache-index=%u stage=%u"
+                " resource=%08X caller=%08X invalid=%lu\n",
+                watched ? " WATCH" : "", calls, pc, cache_index, stage,
+                resource, return_address, invalid);
+        fflush(stderr);
+    }
+
+    /* The first bad bind, once: the table around the offending index, its
+     * base and its entry count. A slot holding 0xFFFFFFFF beside neighbours
+     * holding real pointers is a creation that failed; a whole region of
+     * 0xFFFFFFFF is a table that was never populated, and the two want
+     * different fixes. Printed here because the guest faults immediately
+     * afterwards and nothing later gets to read the table. */
+    if (bad && !dumped) {
+        uint32_t table = read_word(0x264F68u), count = read_word(0x264F70u);
+        long first = (long)cache_index - 8, i;
+
+        dumped = 1;
+        if (first < 0) first = 0;
+        fprintf(stderr, "[TEXTURE-BIND] table=%08X count=%u slots %ld..%ld:",
+                table, count, first, first + 16);
+        for (i = first; i <= first + 16 && (uint32_t)i < count; ++i)
+            fprintf(stderr, " %ld=%08X", i,
+                    read_word(table + (uint32_t)i * 4u));
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 }
 
 void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,

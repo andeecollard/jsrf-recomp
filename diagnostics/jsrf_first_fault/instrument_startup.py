@@ -132,6 +132,17 @@ points = {
         # Texture-cache lifetime. 0x14F640 releases one indexed slot; the two
         # stores in the shared 0x14F720 body publish the newly created resource.
         # Observe the old slot before each write so replacements cannot hide.
+        # 0x14FDE0 resolves a cache index immediately before passing the slot
+        # to D3D's binding helper, which dereferences every non-null value.
+        '0014FDE0': ('jsrf_texture_bind_probe',
+                     'MEM32(esp + 0xC), MEM32(esp + 8), '
+                     'MEM32(MEM32(0x264F68) + MEM32(esp + 0xC) * 4), MEM32(esp)'),
+        # Entry of the shared creation body. Its index argument is arg2; the
+        # slot it finally publishes is written by the two sites below, so a
+        # create with no matching store is a path that bailed out.
+        '0014F720': ('jsrf_texture_create_probe',
+                     'MEM32(esp + 8), MEM32(esp + 4), MEM32(esp + 0xC), '
+                     'MEM32(esp)'),
         '0014F640': ('jsrf_texture_cache_probe',
                      'MEM32(esp + 4), 0, MEM32(MEM32(0x264F68) + MEM32(esp + 4) * 4)'),
         '0014F801': ('jsrf_texture_cache_probe',
@@ -241,6 +252,11 @@ points = {
 }
 changed = 0
 skipped = []
+# Sites whose label the translator has emitted more than once in some gens and
+# once in others -- the two texture-cache publish stores are inside a body with
+# several entries into it. Install is a replace-all either way, so accept both
+# counts here rather than skip the site: a stale "expected 2" silently dropped
+# exactly the two stores that say what a cache slot was given.
 multi_labels = {
     ('recomp_0007.c', '0014F801'),
     ('recomp_0007.c', '0014FA19'),
@@ -251,14 +267,14 @@ for filename, file_points in points.items():
     for pc, (func, args) in file_points.items():
         label = f'loc_{pc}: ;'
         call = f'\n    {func}(0x{pc}u, {args}); /* STARTUP_OBSERVATION */'
-        expected = 2 if (filename, pc) in multi_labels else 1
-        if s.count(label) != expected:
+        expected = {1, 2} if (filename, pc) in multi_labels else {1}
+        if s.count(label) not in expected:
             if a.skip_mismatched:
                 skipped.append(f'{filename} {label.strip()} '
-                               f'want {expected} found {s.count(label)}')
+                               f'want {sorted(expected)} found {s.count(label)}')
                 continue
             raise AssertionError(
-                f'expected {expected} copies of {label} in {f}, '
+                f'expected {sorted(expected)} copies of {label} in {f}, '
                 f'found {s.count(label)}; --skip-mismatched installs the rest')
         s = s.replace(label + call, label)
         if not a.remove:

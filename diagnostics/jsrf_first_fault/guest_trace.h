@@ -22,6 +22,11 @@ void jsrf_resource_probe(uint32_t pc, uint32_t resource, uint32_t value,
                          uint32_t size);
 void jsrf_texture_cache_probe(uint32_t pc, uint32_t index,
                               uint32_t resource, uint32_t old_resource);
+void jsrf_texture_bind_probe(uint32_t pc, uint32_t cache_index,
+                             uint32_t stage, uint32_t resource,
+                             uint32_t return_address);
+void jsrf_texture_create_probe(uint32_t pc, uint32_t index, uint32_t arg1,
+                               uint32_t arg3, uint32_t return_address);
 void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,
                              uint32_t arg1, uint32_t arg2, uint32_t arg3);
 void jsrf_usb_device_probe(uint32_t pc, uint32_t controller,
