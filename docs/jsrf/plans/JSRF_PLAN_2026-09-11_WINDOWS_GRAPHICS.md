@@ -44,14 +44,28 @@ normalised by the scale correction above -- which is upstream of both.
 
 ## Steps, in order, with what each settles
 
-1. SETTLE THE .text QUESTION FIRST. The Windows ring bounds (0x1000-0x81000)
+1. SETTLE THE .text QUESTION FIRST. -- INSTRUMENT BUILT, db7d9e4, NOT YET RUN
+   ON WINDOWS. RECOMP_TEXT_CHECKSUM=1 sums 16 code pages, 8 inside the ring
+   window and 8 outside as a control, and names the changed offset and values
+   rather than only the checksum. On macOS: nothing inside the window moves,
+   and the single control page that does is one dword at 0x001C3F20 going
+   "MU_0" -> "MU_7", a drive letter in .rdata. That is the baseline to compare
+   the Windows run against. Original text follows.
+
+    The Windows ring bounds (0x1000-0x81000)
    overlap the title's .text (0x11000-0x18CB30) by 448 KB. If the guest is
    writing command words over its own code, every later measurement is
    untrustworthy and that is the whole story. Checksum one .text page at
    startup and again in the periodic report; if it changes, stop and fix that.
    ~20 lines, one run per host. DO THIS BEFORE ANYTHING ELSE.
 
-2. FIX THE RECOMP_IRQ_THREAD RACE. It is mine: the guest publishes
+2. FIX THE RECOMP_IRQ_THREAD RACE. -- DONE, db7d9e4. Release store on publish,
+   acquire load plus routine-against-dispatch-table validation in all three
+   pumps. not_ready= on the [VBLANK] line counts rejections and reads 0 on
+   macOS, which is the control. NOT proven to be the Windows crash mechanism --
+   the .text question above explains it equally well. Original text follows.
+
+    It is mine: the guest publishes
    g_interrupts[i] and then fills the KINTERRUPT, unsynchronised, which was
    safe only while the poll ran on the guest's own thread. It kills Windows
    runs before they reach a report, which blocks step 3. Publish the slot only
