@@ -101,6 +101,45 @@ contiguous window -- which looks like the bug until you check win32_compat.c,
 where the POSIX VirtualAlloc is also a plain mmap returning a host address. The
 two hosts do the same wrong-looking thing, so it is not the divergence.
 
+## CORRECTION, and what the cursor watch actually found
+
+The section above says "the ring is in the XBE image and frozen". BOTH HALVES
+ARE WRONG, and a watch on the cursor (RECOMP_PB_PUT_WATCH -- read-only poller,
+no gen change) says why.
+
+NOT IN THE IMAGE. Physical 0x1000 is BELOW the XBE, which loads at 0x00010000.
+I wrote the classifier in the probe with the image base wrong and then believed
+its label. The ring lives in the low 64 KB.
+
+NOT FROZEN FROM THE START. PUT initialises to 0, becomes 0x80001000, and then
+advances perfectly normally -- 0x1234, 0x1244, 0x128C, 0x1380 ... 0x1C9C across
+the first 229 samples. It is a real ring that the guest walks. And in a short
+run of my own the pusher keeps up completely: runs=1 methods=1011
+bad_headers=0, with idx put=9 get=9 -- GET CAUGHT UP. Codex's frozen
+put=63/get=59 with bad_headers=1 is from a 41-minute run, so the bad header
+appears LATER, which strengthens the caveat already recorded above: the frozen
+pusher is looking more like a consequence than a cause.
+
+WHAT IS REAL, AND IS NEW. The ring occupies physical 0x1000..0x8DFC. The
+harness puts its fake TIB at VA 0x1000 -- XBOX_FS_BASE, 0x30 bytes, and the
+boot log says so in plain text. Those are the same memory. Worse, fs:[0] is the
+SEH chain head and kernel_bridge.c writes it during ordinary operation:
+
+    BRIDGE_MEM32(g_fs_base) = next;          (~3695)
+    BRIDGE_MEM32(g_fs_base) = target_frame;  (~3726)
+
+So on this host every SEH frame push and every RtlUnwind writes a guest pointer
+into dword 0 of the push-buffer ring. That is a concrete corruption mechanism
+for exactly the symptom Codex saw, and it does not exist on macOS, where the
+guest's ring is at physical 0x5D4304 in the heap.
+
+THE OPEN QUESTION IS NOW SHARPER: why does the guest's ring land at 0x1000 here
+and in the heap on macOS? Both hosts return a HOST pointer from
+MmAllocateContiguousMemory (see the red herring below), so neither is using it
+for this. Find what actually hands D3D its push-buffer base and why the two
+hosts answer differently. That is the next thing to read, and it is one
+allocation site rather than a bisection.
+
 ## Standing traps, all paid for today
 
 - An ordered divergence is a CEILING on where the fault is, never a location,

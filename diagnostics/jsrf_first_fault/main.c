@@ -756,6 +756,58 @@ static int jsrf_pb_poll(void)
 /* The index pair the guest's own wait loop watches: [dev+0x30] is PUT and
  * [[dev+0x34]] is GET. Distinct from the ring cursor at device +0x00 -- these
  * are counters, not addresses, and this is what the guest blocks on. */
+/* RECOMP_PB_PUT_WATCH -- every distinct value the guest's push-buffer cursor
+ * takes, from before the guest runs.
+ *
+ * The Windows oracle freezes with put=0x800109A4, which resolves through the
+ * 0x80000000 contiguous window to physical 0x109A4 -- inside the loaded XBE
+ * image, where macOS sits in the heap. That is either the cause (the ring was
+ * never allocated, so the pusher parses the image as commands, stops on a bad
+ * header, and GET never advances past what the guest is waiting for) or a
+ * consequence (the guest stalled elsewhere and stopped submitting). The two
+ * are told apart by ONE fact: whether PUT ever held a sane heap address here.
+ *
+ * Sampled rather than trapped. A write trap on a guest global is the heavy
+ * instrument this tree has already shown perturbs the title; a poller is
+ * read-only and cannot. It can miss a transition it never samples, so it
+ * reports the count of samples alongside the values -- a value seen once in
+ * tens of thousands of samples is a real transition, and "only ever one value"
+ * is only evidence at a sample count that makes a miss implausible. */
+static DWORD WINAPI jsrf_pb_put_watch(LPVOID unused)
+{
+    uint32_t seen_put[16], seen_lim[16];
+    unsigned n = 0, i;
+    unsigned long samples = 0;
+
+    (void)unused;
+    for (;;) {
+        uint32_t put = MEM32(JSRF_PB_PUT_VA);
+        uint32_t lim = MEM32(JSRF_PB_LIMIT_VA);
+        samples++;
+        for (i = 0; i < n; i++)
+            if (seen_put[i] == put && seen_lim[i] == lim) break;
+        if (i == n && n < 16u) {
+            seen_put[n] = put; seen_lim[n] = lim; n++;
+            fprintf(stderr, "  [PB-PUT] #%u after %lu samples: put=0x%08X"
+                    " limit=0x%08X  (put -> phys 0x%08X, %s)\n",
+                    n, samples, put, lim, put - 0x80000000u,
+                    (put - 0x80000000u) < 0x00290000u ? "INSIDE THE XBE IMAGE"
+                  : (put - 0x80000000u) < 0x00510000u ? "below the heap"
+                                                      : "heap");
+            fflush(stderr);
+        }
+        Sleep(1);
+    }
+}
+
+static void jsrf_pb_put_watch_start(void)
+{
+    HANDLE th;
+    if (!getenv("RECOMP_PB_PUT_WATCH")) return;
+    th = CreateThread(NULL, 0, jsrf_pb_put_watch, NULL, 0, NULL);
+    if (th) CloseHandle(th);
+}
+
 static uint32_t jsrf_pb_index(uint32_t which)
 {
     uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
@@ -2628,6 +2680,7 @@ int main(int argc, char **argv)
         fflush(stderr);
     }
 
+    jsrf_pb_put_watch_start();
     CreateThread(NULL, 0, jsrf_pushbuffer_ack, NULL, 0, NULL);
     CreateThread(NULL, 0, jsrf_adx_watch, NULL, 0, NULL);
     g_esp = XBOX_STACK_TOP;
