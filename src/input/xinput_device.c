@@ -318,12 +318,62 @@ unsigned long g_pad_polls_connected;
 unsigned long g_pad_polls_nonneutral;
 unsigned long g_pad_polls_disconnected;
 
+/* Thread suspend/resume accounting lives in the platform layer; the pad report
+ * is where it is wanted, because the question it answers is whether a lost
+ * wakeup coincides with the report in which polls stop climbing. */
+void w32_thread_trace_report(void);
+
 void xbox_InputPollReport(void)
 {
     fprintf(stderr, "  [PAD-POLL] polls=%lu connected=%lu nonneutral=%lu"
             " not_connected=%lu\n",
             g_pad_polls, g_pad_polls_connected, g_pad_polls_nonneutral,
             g_pad_polls_disconnected);
+    fflush(stderr);
+    w32_thread_trace_report();
+}
+
+/* RECOMP_PAD_TRACE -- one line each time the host pad state changes.
+ *
+ * nonneutral counts polls, so a flat counter says "SDL reported nothing
+ * pressed" and cannot be told apart from nobody pressing anything. That
+ * difference has so far been settled by asking a person to press buttons to a
+ * schedule and comparing -- which is a measurement with a human in the loop,
+ * and it does not belong in this tree. An edge-triggered line settles it from
+ * the log alone: press a button, and either a line appears or the host read is
+ * dead. Only transitions print, so a mashed pad costs a few lines a second.
+ *
+ * Read-only, opt-in, and it observes the state the guest is about to be given
+ * -- not SDL's raw view -- so a line here means the value reached our side of
+ * the pad path intact. */
+static void pad_trace(const XBOX_INPUT_STATE *st, int active)
+{
+    static int on = -1;
+    static unsigned long long prev = ~0ull;
+    unsigned long long sig;
+
+    if (on < 0) on = getenv("RECOMP_PAD_TRACE") ? 1 : 0;
+    if (!on) return;
+
+    /* Buttons exactly; axes quantised, so resting jitter is not a transition. */
+    sig = (unsigned long long)st->Gamepad.wButtons;
+    for (int i = 0; i < 8; i++)
+        sig = sig * 3u + (st->Gamepad.bAnalogButtons[i] > 32);
+    sig = sig * 7u + (unsigned)(st->Gamepad.sThumbLX / 8192 + 4);
+    sig = sig * 7u + (unsigned)(st->Gamepad.sThumbLY / 8192 + 4);
+    sig = sig * 7u + (unsigned)(st->Gamepad.sThumbRX / 8192 + 4);
+    sig = sig * 7u + (unsigned)(st->Gamepad.sThumbRY / 8192 + 4);
+    if (sig == prev) return;
+    prev = sig;
+
+    fprintf(stderr, "  [PAD-TRACE] t=%7.2f %s buttons=%04X a=%3u b=%3u"
+            " lx=%6d ly=%6d poll=%lu\n",
+            fake_pad_seconds(), active ? "PRESSED " : "released",
+            (unsigned)st->Gamepad.wButtons,
+            (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_A],
+            (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_B],
+            (int)st->Gamepad.sThumbLX, (int)st->Gamepad.sThumbLY,
+            g_pad_polls);
     fflush(stderr);
 }
 
@@ -342,6 +392,7 @@ static void pad_note_state(const XBOX_INPUT_STATE *st)
     }
     if (active)
         g_pad_polls_nonneutral++;
+    pad_trace(st, active);
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
