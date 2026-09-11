@@ -70,3 +70,60 @@ notifies complete normally. The guest's handler services one and not the other.
 
 Neither has been measured. They are named here so the next session starts from
 them rather than from the crash, which is closed.
+
+---
+
+# Correction: the notify path is healthy, and the print cap fooled me twice
+
+I wrote above that "a PGRAPH software method with parameter=2 is raised and
+never acknowledged" and that "parameter=9 notifies complete normally" while
+parameter=2 does not. Both halves are wrong.
+
+    raised (printed): 16     completed (printed): 16
+
+`jsrf_software_method` prints its `#N` and `completed` lines only for the first
+sixteen (`if (++n <= 16 || parameter == 5)`), while the `waiting` branch has its
+own 2-second throttle and keeps printing forever. So the visible record is
+sixteen raises and sixteen completions -- every one of them acknowledged by the
+guest, parameter=9 and parameter=2 alike -- followed by `waiting` lines from a
+LATER notify whose number was never printed. The notify machinery added in
+`dafa70c` works for both parameters.
+
+That is the second time tonight a capped log produced a confident wrong reading,
+after `[HEAP]` at 64 lines took out the plan's founding fact. The rule already
+in CLAUDE.md covers it and I did not apply it: read a counter's trigger before
+trusting its value, and that includes print caps.
+
+## What the run actually shows
+
+    [GPU] clear #600   [GPU] draw #600      then nothing further
+    [FB] sum=5F06A510 nonzero=8/153600, 9 CHANGED transitions
+    [PB-ACK] 1411755 loops/s acked=353 already=2526944 not-consumed=44100
+
+So the GPU model ran ~600 clears and ~600 draws, the framebuffer changed nine
+times, and then submission stopped with one notify outstanding. Draws reaching
+600 and stopping is a much better-shaped problem than the crash that preceded
+it.
+
+## The PUT-backwards lines are NOT new and NOT the blocker
+
+Three `[PUSHER] PUT backwards to a non-base address` events, the last at the
+wedge. That code is diagnostic only -- it classifies and logs and changes
+nothing -- and its own comment records the condition as already known: "it is
+the poll on which the parse desynchronises -- once per run, one bad header in
+six and a half million dwords". It is a pre-existing macOS-side observation,
+not a Windows regression. `healthy base wraps so far 0` is worth keeping
+though: this ring has never once wrapped to its base address.
+
+## Honest next steps
+
+Nothing below has been measured; they are named so the next session does not
+start by re-deriving them.
+
+  - Why submission stops after ~600 draws with a notify outstanding. The
+    pusher blocks in `jsrf_software_method` until the guest acknowledges, and
+    the guest may in turn be waiting on the ring to drain -- a deadlock between
+    the two would look exactly like this. Check whether the PGRAPH ISR is still
+    being dispatched during the stall.
+  - The 0xBC60 voice link, fifth in list 0, every frame.
+  - `healthy base wraps so far 0` on a ring that has run 600 draws.
