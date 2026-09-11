@@ -106,6 +106,33 @@ Note also [APU-PACE] subframes/se, which DO have a producer on both hosts and
 are nearly equal (14976 vs 15040 at t=10 s). The APU core runs at the same rate
 on both; it is the front-end submission and the output reporting that differ.
 
+DO NOT TRUST [APUREG]'s "from sub_XXXXXXXX". It was the harness's thread-local
+last-instrumented-function, which is whatever ran most recently on that thread
+and not the writer. It confidently named sub_001664D0 for a burst of voice
+configuration; sub_001664D0 is a 37-byte refcount release, `lock xadd [ecx+8]`
+then maybe a vtable call, and it touches no MMIO at all. The macOS attribution
+(sub_00147EBB) was equally wrong. The field is now printed as "guest~" to mark
+it as a hint.
+
+Use host_pc= instead. It is the faulting store itself, and
+
+    x86_64-w64-mingw32-addr2line -f -e jsrf_first_fault.exe <host_pc>
+
+resolves it exactly, which is the method 06-debugging.md prescribes. Both hosts
+now record it (POSIX from the sigaction context, Windows from the VEH).
+
+With it, every APU register write on Windows resolves into the statically
+linked DSOUND -- nineteen distinct functions, all in sub_001A2xxx..sub_001A6xxx:
+
+    sub_001A5E19 sub_001A5742 sub_001A368A sub_001A5671 sub_001A6160
+    sub_001A5CD7 sub_001A586B sub_001A40F5 sub_001A3E58 sub_001A52F7
+    sub_001A4E12 sub_001A5B82 sub_001A5B27 sub_001A5AF0 sub_001A5AB9
+    sub_001A53AA sub_001A268D sub_001A22BC sub_001A2285
+
+That is the submission loop, named. Start by taking the same list on macOS and
+diffing it: a function present there and absent here is the branch that stops
+voice configuration after the first pass.
+
 Start with the submission loop, and start by reading what increments each
 counter -- including the ones that look like they already answered.
 

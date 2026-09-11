@@ -253,9 +253,25 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * Public API (called from VEH in main.c)
  * ============================================================ */
 
+/* The host PC of the faulting store, for [APUREG].
+ *
+ * That line's "from sub_XXXXXXXX" comes from the harness's thread-local
+ * "current guest function", which is updated per instrumented block and is
+ * therefore whatever ran last on the thread -- not the writer. It named
+ * sub_001664D0 for a burst of voice configuration, and sub_001664D0 is a
+ * 37-byte refcount release that touches no MMIO at all. Believing it would
+ * have sent the next session to read the wrong function.
+ *
+ * The faulting RIP is not a guess: it is the address of the store itself, and
+ *   x86_64-w64-mingw32-addr2line -f -e jsrf_first_fault.exe <pc>
+ * resolves it to the generated function, which is the method
+ * docs/pipeline/06-debugging.md prescribes for exactly this. */
+unsigned long long g_apu_trap_host_pc;
+
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
+    g_apu_trap_host_pc = ctx ? (unsigned long long)ctx->Rip : 0ull;
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
 
@@ -278,5 +294,12 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     }
     return ok;
 }
+
+#else /* !_WIN32 */
+
+/* Defined for the POSIX build too: the [APUREG] line is common to both hosts
+ * and prints this unconditionally. The sigaction trap in xbox_memory_layout.c
+ * sets it there. */
+unsigned long long g_apu_trap_host_pc;
 
 #endif /* _WIN32 */

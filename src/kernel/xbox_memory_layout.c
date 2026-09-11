@@ -1203,9 +1203,11 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
                     rt == 30 ? uc->uc_mcontext->__ss.__lr : 0;
             if (width < 4) value &= (1u << (8 * width)) - 1u;
             if (g_mcpx_apu_write) {
+                extern unsigned long long g_apu_trap_host_pc;
                 g_mcpx_trap_apu_writes++;
                 if (off >= 0x20000u && off < 0x30000u)
                     g_mcpx_trap_apu_vp_writes++;
+                g_apu_trap_host_pc = uc->uc_mcontext->__ss.__pc;
                 g_mcpx_apu_write(off, (uint32_t)value, width);
             }
         }
@@ -1245,9 +1247,11 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
         uint32_t off = guest_va - XBOX_MCPX_BASE;
         if (g_mcpx_apu_write && off < MCPX_APU_MMIO_OFFSET + MCPX_APU_MMIO_SIZE) {
             static unsigned long n = 0;
+            extern unsigned long long g_apu_trap_host_pc;
             g_mcpx_trap_apu_writes++;
             if (off >= 0x20000u && off < 0x30000u)
                 g_mcpx_trap_apu_vp_writes++;
+            g_apu_trap_host_pc = uc->uc_mcontext->__ss.__pc;
             g_mcpx_apu_write(off, (uint32_t)value, width);
             if (++n <= 8 || (n % 1000) == 0) {
                 fprintf(stderr, "  [APU-MMIO] write #%lu +0x%06X = 0x%08X (%u)\n",

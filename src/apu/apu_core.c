@@ -907,9 +907,14 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
     static unsigned n;
     if (on < 0) on = getenv("RECOMP_APU_REG_TRACE") ? 1 : 0;
     if (on && n++ < 600) {
+        extern unsigned long long g_apu_trap_host_pc;
         uint32_t pc = g_apu_trace_pc_fn ? g_apu_trace_pc_fn() : 0;
-        fprintf(stderr, "  [APUREG] 0x%05X = %08X (w%u) from sub_%08X\n",
-                (unsigned)addr, (uint32_t)val, size, pc);
+        /* guest= is the thread's last instrumented function and is only a
+         * hint -- see the comment on g_apu_trap_host_pc. host_pc is the store
+         * instruction itself; symbolise that one. */
+        fprintf(stderr, "  [APUREG] 0x%05X = %08X (w%u) guest~sub_%08X"
+                " host_pc=0x%016llX\n",
+                (unsigned)addr, (uint32_t)val, size, pc, g_apu_trap_host_pc);
         fflush(stderr);
     }
     if (!d) return;
