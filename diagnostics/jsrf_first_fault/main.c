@@ -1155,9 +1155,14 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
         extern void nv2a_pb_exec_set_recent_dump(void (*)(int));
         nv2a_pb_exec_set_recent_dump(nv2a_pusher_dump_recent);
     }
-#if !defined(_WIN32) && defined(__aarch64__)
+    /* Both hosts now. This was POSIX/AArch64-only, and on Windows the parser
+     * decoded the title's software methods and dropped them: measured as
+     * [PB-NOP] with no [PB-NOTIFY] beside it. The guard could not simply be
+     * deleted -- jsrf_software_method spins on `!raised`, and the Windows
+     * xbox_Nv2aRaiseSoftwareMethod was a hardcoded FALSE, so installing the
+     * handler alone would have wedged this thread instead of dropping the
+     * notify. The raise and the PGRAPH page guard it needs landed first. */
     nv2a_pusher_set_software_method_handler(jsrf_software_method);
-#endif
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
         /* Snapshot the fence before consuming its commands. Reading PUT again

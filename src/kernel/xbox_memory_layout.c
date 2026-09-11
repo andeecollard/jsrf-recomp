@@ -930,6 +930,14 @@ static void xbox_McpxApplyReady(void)
 #define XBOX_NV2A_PCRTC_INTR_0   (XBOX_NV2A_BASE + 0x600100u)
 #define XBOX_NV2A_PMC_INTR_0     (XBOX_NV2A_BASE + 0x000100u)
 #define XBOX_NV2A_PMC_INTR_PCRTC 0x01000000u
+#define XBOX_NV2A_PGRAPH_INTR     (XBOX_NV2A_BASE + 0x400100u)
+#define XBOX_NV2A_PGRAPH_ERROR    0x00100000u
+#define XBOX_NV2A_PMC_INTR_PGRAPH 0x00001000u
+/* The software-method trap the guest reads after a PGRAPH notify. */
+#define XBOX_NV2A_PGRAPH_TRAPPED_ADDR (XBOX_NV2A_BASE + 0x400704u)
+#define XBOX_NV2A_PGRAPH_TRAPPED_DATA (XBOX_NV2A_BASE + 0x400708u)
+#define XBOX_NV2A_PGRAPH_NSOURCE      (XBOX_NV2A_BASE + 0x400108u)
+#define XBOX_NV2A_PGRAPH_FIFO_ACCESS  (XBOX_NV2A_BASE + 0x400720u)
 
 #if !defined(_WIN32) && defined(__aarch64__)
 
@@ -960,9 +968,6 @@ static uintptr_t g_mcpx_guard_page[8];
  * a 1, so the write itself has to be observed. Hence the trap.
  */
 
-#define XBOX_NV2A_PGRAPH_INTR (XBOX_NV2A_BASE + 0x400100u)
-#define XBOX_NV2A_PGRAPH_ERROR 0x00100000u
-#define XBOX_NV2A_PMC_INTR_PGRAPH 0x00001000u
 static uintptr_t g_nv2a_pgraph_page;
 static int g_nv2a_pgraph_guarded;
 static uintptr_t g_nv2a_guard_page;
@@ -1626,20 +1631,39 @@ int xbox_Nv2aSoftwareMethodPending(void)
  * common to both hosts. There is no read trap on this host, so 0 is correct. */
 static int g_mcpx_apu_read_trapped = 0;
 
+/* Guarded device pages on this host. Declared here because xbox_McpxTrapReport
+ * below reports which of them took, and a page that failed to guard is
+ * otherwise silent -- it reads downstream as the guest never writing that
+ * register, which is a conclusion this tree has drawn wrongly before. */
+static uintptr_t g_nv2a_pcrtc_page;
+static int       g_nv2a_pcrtc_guarded;
+static uintptr_t g_ac97_page;         /* AC97 bus-master boxes, write-clear */
+static int       g_ac97_guarded;
+static uintptr_t g_nv2a_pgraph_page;  /* PGRAPH_INTR, and the notify trap */
+static int       g_nv2a_pgraph_guarded;
+static volatile LONG g_nv2a_pcrtc_lock;
+static size_t    g_nv2a_page_size;    /* g_mcpx_page_size is AArch64-only */
+
 /* The POSIX/AArch64 branch counts faults taken by its sigaction trap. This
  * host routes device registers through the VEH hooks instead, so those
  * counters have no producer here. Say that, rather than print five zeros that
  * would read as "the guest never wrote a device register". */
 void xbox_McpxTrapReport(void)
 {
-    fprintf(stderr, "  [MCPX-TRAP] not this host: device registers go through"
-                    " the VEH hooks, not the POSIX write trap\n");
+    /* The POSIX branch counts faults taken by its sigaction trap; this host has
+     * no such counter. What it can say is which pages the VEH is actually
+     * guarding, because a page that failed to guard is silent otherwise and
+     * reads downstream as "the guest never wrote that register". */
+    fprintf(stderr, "  [MCPX-TRAP] VEH guards: PCRTC=%d AC97=%d PGRAPH=%d"
+                    " (no fault counters on this host)\n",
+            g_nv2a_pcrtc_guarded, g_ac97_guarded, g_nv2a_pgraph_guarded);
     fflush(stderr);
 }
 
-BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
-{ (void)subchannel; (void)parameter; return FALSE; }
-int xbox_Nv2aSoftwareMethodPending(void) { return 0; }
+/* Defined below xbox_Nv2aHandleWin32Fault, which owns the lock and the page
+ * state they need. */
+BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter);
+int  xbox_Nv2aSoftwareMethodPending(void);
 
 
 /* No write trap on this host, so there is no guard to drop and no way to
@@ -1693,12 +1717,6 @@ int xbox_Nv2aVblankPending(void)
  * paid for once, so it is held under an interlock and nothing else here
  * touches this page.
  */
-static uintptr_t g_nv2a_pcrtc_page;
-static int       g_nv2a_pcrtc_guarded;
-static uintptr_t g_ac97_page;      /* AC97 bus-master boxes, write-clear */
-static int       g_ac97_guarded;
-static volatile LONG g_nv2a_pcrtc_lock;
-static size_t    g_nv2a_page_size;   /* g_mcpx_page_size is AArch64-only */
 
 static uint64_t *nv2a_ctx_reg(PCONTEXT c, int reg)
 {
@@ -1744,8 +1762,9 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
      * be completed as an ordinary store, or guarding one register turns its
      * neighbours into fatal faults. (Measured the hard way: the title writes
      * 0xFD600140 on the PCRTC page and the process died there.) */
-    if (!(g_nv2a_pcrtc_guarded && page == g_nv2a_pcrtc_page) &&
-        !(g_ac97_guarded       && page == g_ac97_page))
+    if (!(g_nv2a_pcrtc_guarded  && page == g_nv2a_pcrtc_page) &&
+        !(g_ac97_guarded        && page == g_ac97_page) &&
+        !(g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page))
         return 0;
 
     ip = (const uint8_t *)(uintptr_t)ctx->Rip;
@@ -1799,8 +1818,12 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
                           : *(volatile uint32_t *)fault;
     /* Write-1-to-clear for the interrupt status register; every other register
      * that happens to share this page is a plain store. */
-    after  = (guest_va == XBOX_NV2A_PCRTC_INTR_0) ? (before & ~written)
-                                                  : written;
+    /* Both interrupt status registers are write-1-to-clear. PGRAPH_INTR is how
+     * the guest acknowledges a software-method notify, so without this the
+     * notify stands for ever and the second one is never raised. */
+    after  = (guest_va == XBOX_NV2A_PCRTC_INTR_0
+              || guest_va == XBOX_NV2A_PGRAPH_INTR) ? (before & ~written)
+                                                    : written;
 
     if (VirtualProtect((LPVOID)page, g_nv2a_page_size,
                        PAGE_READWRITE, &old_prot)) {
@@ -1811,16 +1834,90 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
                                                        + g_memory_offset),
                                ~XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
         }
+        /* The summary follows its source down, exactly as for PCRTC above. */
+        if (guest_va == XBOX_NV2A_PGRAPH_INTR && after == 0) {
+            __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0
+                                                       + g_memory_offset),
+                               ~XBOX_NV2A_PMC_INTR_PGRAPH, __ATOMIC_SEQ_CST);
+        }
         if (!VirtualProtect((LPVOID)page, g_nv2a_page_size,
                             PAGE_READONLY, &old_prot)) {
-            if (page == g_nv2a_pcrtc_page) g_nv2a_pcrtc_guarded = 0;
-            else                           g_ac97_guarded = 0;
+            if      (page == g_nv2a_pcrtc_page)  g_nv2a_pcrtc_guarded = 0;
+            else if (page == g_nv2a_pgraph_page) g_nv2a_pgraph_guarded = 0;
+            else                                 g_ac97_guarded = 0;
         }
     }
 
     InterlockedExchange(&g_nv2a_pcrtc_lock, 0);
     ctx->Rip += ilen;
     return 1;
+}
+
+/* Raise a PGRAPH software-method notify, as the AArch64 branch does.
+ *
+ * The pusher calls this when it decodes method 0x100 with a non-zero
+ * parameter. It is not a flag: the guest's handler reads the trap registers to
+ * find out WHAT was trapped, then restores FIFO access and acknowledges
+ * PGRAPH_INTR, and the acknowledge is a guest write that only lands correctly
+ * because the page above is guarded.
+ *
+ * Takes g_nv2a_pcrtc_lock -- the same lock xbox_Nv2aHandleWin32Fault holds --
+ * so a raise from the pusher thread and a guest acknowledge faulting in cannot
+ * overlap.
+ *
+ * The residual hazard is the one CLAUDE.md names, and it is not solved here:
+ * while this holds the page writable, a guest store to any OTHER register on
+ * it from another thread completes silently against RAM instead of faulting.
+ * The window is a handful of stores wide and the AArch64 branch has exactly
+ * the same shape, so this matches it rather than inventing a third contract --
+ * but closing it properly needs a writable alias of the page, which needs the
+ * NV2A aperture to be file-backed, which on this host it is not. If notifies
+ * start going missing on a busy frame, look here first. */
+BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
+{
+    volatile uint32_t *regs;
+    DWORD old_prot;
+    BOOL ok = FALSE;
+
+    if (!g_nv2a_pgraph_guarded || !parameter || !g_memory_offset) return FALSE;
+    if (xbox_Nv2aSoftwareMethodPending()) return FALSE;
+
+    regs = (volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + g_memory_offset);
+
+    while (InterlockedCompareExchange(&g_nv2a_pcrtc_lock, 1, 0) != 0)
+        SwitchToThread();
+
+    if (VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_nv2a_page_size,
+                       PAGE_READWRITE, &old_prot)) {
+        regs[0x400704 / 4] = ((subchannel & 7u) << 16) | 0x100u;
+        regs[0x400708 / 4] = parameter;
+        regs[0x400108 / 4] = 1;   /* NSOURCE_NOTIFICATION */
+        regs[0x400720 / 4] = 0;   /* suspend until the guest restores access */
+        regs[0x400100 / 4] |= XBOX_NV2A_PGRAPH_ERROR;
+        if (!VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_nv2a_page_size,
+                            PAGE_READONLY, &old_prot))
+            g_nv2a_pgraph_guarded = 0;
+        __atomic_fetch_or((uint32_t *)&regs[0x100 / 4],
+                          XBOX_NV2A_PMC_INTR_PGRAPH, __ATOMIC_SEQ_CST);
+        ok = TRUE;
+    }
+
+    InterlockedExchange(&g_nv2a_pcrtc_lock, 0);
+    return ok;
+}
+
+/* Has the guest not finished with the last notify? Reads are permitted on the
+ * guarded page, so this needs no lock and no window. Same two conditions the
+ * AArch64 branch uses: the error bit still set, or trap data still standing
+ * with FIFO access not yet restored. */
+int xbox_Nv2aSoftwareMethodPending(void)
+{
+    volatile uint32_t *regs;
+
+    if (!g_nv2a_pgraph_guarded || !g_memory_offset) return 0;
+    regs = (volatile uint32_t *)(uintptr_t)(XBOX_NV2A_BASE + g_memory_offset);
+    return (regs[0x400100 / 4] & XBOX_NV2A_PGRAPH_ERROR) != 0
+        || (regs[0x400708 / 4] != 0 && !(regs[0x400720 / 4] & 1));
 }
 
 static void xbox_McpxTrapInstall(void)
@@ -1846,10 +1943,20 @@ static void xbox_McpxTrapInstall(void)
                   & ~(uintptr_t)(g_nv2a_page_size - 1);
     g_ac97_guarded = VirtualProtect((LPVOID)g_ac97_page, g_nv2a_page_size,
                                     PAGE_READONLY, &old_prot) != 0;
+    /* PGRAPH_INTR and the software-method trap registers share a page. Guarding
+     * it is what lets the guest's acknowledge be seen; without it a notify can
+     * be raised but never retired, and the pusher blocks on the second one. */
+    g_nv2a_pgraph_page = ((uintptr_t)g_memory_offset + XBOX_NV2A_PGRAPH_INTR)
+                         & ~(uintptr_t)(g_nv2a_page_size - 1);
+    g_nv2a_pgraph_guarded = VirtualProtect((LPVOID)g_nv2a_pgraph_page,
+                                           g_nv2a_page_size, PAGE_READONLY,
+                                           &old_prot) != 0;
     fprintf(stderr, "  NV2A: PCRTC_INTR_0 page %s for write-1-to-clear\n",
             g_nv2a_pcrtc_guarded ? "guarded" : "NOT guarded");
     fprintf(stderr, "  AC97: bus-master page %s for write-clear (RR)\n",
             g_ac97_guarded ? "guarded" : "NOT guarded");
+    fprintf(stderr, "  NV2A: PGRAPH page %s for software-method notify\n",
+            g_nv2a_pgraph_guarded ? "guarded" : "NOT guarded");
     fflush(stderr);
 }
 
@@ -2100,12 +2207,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             uint32_t mask = NV2A_ACK[i].busy_mask;
-#if !defined(_WIN32) && defined(__aarch64__)
+            /* Keyed on the guard, not the host. While PGRAPH is guarded the
+             * software-method notify owns these two bits and this thread must
+             * not touch them: acking 0x400100 or clearing PGRAPH out of the
+             * PMC summary retires the notify before the guest's ISR has seen
+             * it, and the pusher then blocks for ever on an acknowledge that
+             * can never come. Measured on Windows the moment the raise started
+             * working -- raised=1 with pmc=0 intr=0 on every waiting line. */
             if (g_nv2a_pgraph_guarded) {
                 if (NV2A_ACK[i].offset == 0x400100) continue; /* W1C source is modeled */
                 if (NV2A_ACK[i].offset == 0x100) mask &= ~XBOX_NV2A_PMC_INTR_PGRAPH;
             }
-#endif
             if (*r & mask) {
 #if !defined(_WIN32)
                 if (NV2A_ACK[i].offset == 0x100)
