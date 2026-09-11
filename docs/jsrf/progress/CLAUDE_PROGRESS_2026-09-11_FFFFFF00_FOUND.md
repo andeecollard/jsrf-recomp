@@ -266,3 +266,65 @@ address goes bad. Ordinals 46, 144 and 1 are unbridged on both hosts. That did
 not explain the 0xFFFFFF00 dereference -- both hosts hit them and only one
 produces the value -- but it is a live candidate for THIS crash, and the two
 should not be assumed to be the same bug.
+
+---
+
+# Addendum 3: block writes are not the writer either
+
+`instrument_block_writes.py` + `recomp_mem_watch_guest_block` close the gap
+described above: 1571 lifted `rep movs`/`rep stos` sites in a gen COPY now
+report their destination range to the watch before copying. No regeneration --
+the translator is untouched, which matters because regeneration is not
+bit-stable and every preserved result came from a specific tree. Removal
+round-trips to a byte-identical tree.
+
+**Positive control first**, because an absence here would otherwise prove
+nothing:
+
+    RECOMP_MEM_WATCH=0x2617A0:0x10
+    [MEM-WATCH] source=guest-block function=0x001BC98C dst=0x002617A0 len=12304
+
+The instrument fires, names the function, and gives the range. (That particular
+copy ends at 0x2647B0 -- 288 bytes short of 0x2648D0, which is why it is not
+our writer but is a fine control.)
+
+**With that established, watching 0x2648D0:0x10 reports ZERO block writes**,
+while the same run reproduces the corruption exactly: `old=0xFF` at 0x2648D1,
+`old=0xFFFFFF00` at 0x2648D8. So a guest block copy is not what poisons the
+list head. Hypothesis eliminated, properly.
+
+## Kernel calls are not it either
+
+`RECOMP_KERNEL_WATCH=0x2648D8` samples that dword either side of every bridge
+call and names the ordinal that changed it. Zero hits across a run that again
+reproduced the corruption. So the change does not span any kernel bridge call.
+
+## What is left, and it is measurable
+
+The watch covers stores routed through `RECOMP_MEM_WRITE*`. In this gen:
+
+    RECOMP_MEM_WRITE* calls   79,114
+    plain MEM32/16/8(...) =    2,735
+
+So **3.3% of generated stores bypass the watch entirely** and always have. The
+block-op internals were part of that and are now covered; the remainder are
+plain lifted stores like `MEM32(ebx) = 0;`. One of those 2,735 is the most
+likely writer, and the set is small enough to enumerate.
+
+Also still open, and not covered by any of the three instruments: writes into
+guest RAM by the runtime itself from a non-guest thread (device models, the
+OHCI/IRQ/APU/pusher threads). `recomp_mem_watch.c` says in its own header that
+it does not intercept kernel/HLE or device writes, and KWATCH only samples
+around bridge calls on the calling thread.
+
+## Eliminated so far, each by measurement
+
+  - .text corruption by the push-buffer ring (both hosts, 16/16 pages clean,
+    with the probe corrected to measure real .text)
+  - the KeConnectInterrupt race (fixed; crash unchanged)
+  - concurrent guest DPCs (interlock added; crash unchanged; reverted)
+  - the OHCI 0xFF memset (run without RECOMP_OHCI_ATTACH; identical)
+  - unbridged ordinals corrupting the stack (all three have correct arg sizes;
+    the warning that said otherwise was itself the bug)
+  - guest block copies (positive control, then zero hits)
+  - kernel bridge calls (RECOMP_KERNEL_WATCH, zero hits)

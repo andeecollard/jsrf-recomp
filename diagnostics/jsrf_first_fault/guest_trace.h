@@ -77,6 +77,10 @@ void jsrf_voice_submit_probe(uint32_t pc, uint32_t a, uint32_t b,
  * "the guest never reached the contiguous allocation" from "it reached it and
  * got zero back". RECOMP_D3D_ALLOC_TRACE=1. */
 void jsrf_d3d_alloc_probe(uint32_t pc, uint32_t a, uint32_t b);
+
+/* Installed by instrument_block_writes.py into a copy of a gen tree. */
+void recomp_mem_watch_guest_block(uint32_t guest_function, uint32_t dst_va,
+                                  uint32_t len);
 void jsrf_d3d_alloc_report(void);
 
 #endif

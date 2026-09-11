@@ -19,4 +19,10 @@ void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
                                   uint32_t guest_va, unsigned width,
                                   volatile void *host_ptr, uint64_t new_value);
 
+
+/* Report a block write (rep movs / rep stos) that the per-store path cannot
+ * see. Called before the copy, with the destination cursor and byte count. */
+void recomp_mem_watch_guest_block(uint32_t guest_function, uint32_t dst_va,
+                                  uint32_t len);
+
 #endif

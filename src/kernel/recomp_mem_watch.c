@@ -222,3 +222,51 @@ void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
         fflush(stderr);
     }
 }
+
+/* Block writes -- the hole this watch had from the start.
+ *
+ * recomp_mem_watch_guest_store only sees stores routed through the
+ * RECOMP_MEM_WRITE* macros. `rep movs` and `rep stos` are lifted to memcpy and
+ * to raw MEM32/byte loops that bypass those macros entirely, so every block
+ * copy and fill in the title was invisible here. That is not a corner case: it
+ * is how a title clears a structure, and it is exactly what was overwriting
+ * the XPP list head at 0x002648D4 while this watch reported nothing.
+ *
+ * Called BEFORE the copy runs, with the destination cursor and the byte count.
+ * The range is checked in BOTH directions because a string op with the
+ * direction flag set walks downward from the cursor; the watch window is a
+ * handful of bytes, so being generous here costs nothing and missing a
+ * backward copy would cost another session.
+ *
+ * No old/new values: the point is to name the writer. The surrounding
+ * per-store lines already give the values. */
+void recomp_mem_watch_guest_block(uint32_t guest_function, uint32_t dst_va,
+                                  uint32_t len)
+{
+    uint64_t lo, hi, watch_hi;
+    uint32_t ram;
+
+    if (!g_recomp_mem_watch_enabled || !len)
+        return;
+
+    /* Conservative span: [dst-len, dst+len). */
+    lo = (uint64_t)dst_va > (uint64_t)len ? (uint64_t)dst_va - len : 0;
+    hi = (uint64_t)dst_va + len;
+
+    /* normalize_ram needs a fully mapped range; fall back to the raw VA when
+     * the span crosses something it will not resolve, rather than going quiet.
+     * A false positive here is a line of log; a false negative is the bug. */
+    if (!normalize_ram((uint32_t)lo, (size_t)(hi - lo), &ram))
+        ram = (uint32_t)lo;
+
+    watch_hi = (uint64_t)s_watch_ram_lo + s_watch_length;
+    if ((uint64_t)ram >= watch_hi || (uint64_t)s_watch_ram_lo >= (uint64_t)ram + (hi - lo))
+        return;
+
+    fprintf(stderr,
+            "[MEM-WATCH] source=guest-block function=0x%08X dst=0x%08X"
+            " len=%u (span 0x%08llX..0x%08llX)\n",
+            guest_function, dst_va, len,
+            (unsigned long long)lo, (unsigned long long)hi);
+    fflush(stderr);
+}
