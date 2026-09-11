@@ -169,6 +169,49 @@ guest skips the ring allocation. Diff the two [HEAP] streams from #1 and find
 the first request that differs in size or that one host makes and the other
 does not. Both logs are already in the scratchpad.
 
+## The divergence, narrowed to one allocation -- and four hypotheses killed
+
+The heap streams are identical for five allocations and split at the sixth:
+
+    #5  both   size=327680 align=4096
+    #6  MAC    size=96      align=4096   then 524288, 622592, 1228800, 1228800
+        WIN    size=180     align=16     -- and straight on with small objects
+
+macOS makes five large page/16K-aligned GPU allocations there that Windows
+never requests. Windows' #6 onward matches macOS's #11 onward, so it is not a
+reordering: the whole GPU block is skipped. The align=16384 ones are the
+signature of MmAllocateContiguousMemoryEx, and the call counts confirm it:
+
+    ordinal 166 (MmAllocateContiguousMemoryEx)   macOS 59 calls,  Windows 0
+
+So the question is not "where does the ring come from" but "why does D3D skip
+its GPU memory setup entirely on this host", and the branch is immediately
+after allocation #5.
+
+FOUR HYPOTHESES TESTED AND DEAD. Each was plausible; each took one run:
+
+  - RECOMP_IRQ_THREAD delivering vblanks during D3D init. Windows takes ISRs
+    and DPCs in exactly that window and macOS does not, which looked damning.
+    Run with the thread OFF: byte-identical, #6 still 180/16, no 524288. My
+    own instrument is not the cause.
+  - KeQueryInterruptTime. The two hosts' kernel import tables differ by exactly
+    ONE ordinal -- 125 is bridged on Windows and a stub on macOS, so macOS's
+    caller sees a clock that never moves, and a real clock is what would make a
+    timeout fire. Ran Windows with the clock frozen to match: no change.
+  - MmAllocateContiguousMemory returning a host pointer. True, and true on
+    BOTH hosts, so not a divergence.
+  - Unbridged ordinal 46 (HalReadWritePCISpace) appearing in the window.
+    Called twice on both hosts.
+
+Aside from ordinal 125, the unbridged-thunk lists are otherwise identical, so
+the import surface is not where this lives.
+
+NEXT: instrument the guest side of the branch rather than the kernel side. The
+decision is made between the return of allocation #5 and the next allocation,
+in D3D code that is already armed -- the D3D band was instrumented today. A
+per-thread [FUNC-SEQ] capture bracketed to that window should name the function
+that tests something and gives up.
+
 ## Two more of my own claims, retracted
 
 Recorded because this file has now carried each of them as fact:
