@@ -35,6 +35,22 @@ static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
+/* Why the Windows output stage needs its own counters.
+ *
+ * mcpx_apu_pacing_report prints the SDL2 numbers, and on this host apu_sdl2.c
+ * compiles to stubs -- so batches=0 frames=0 prime=0 there is a definition,
+ * not a measurement, and it reads exactly like "no audio was ever generated".
+ * It cost this project one wrong claim in a handover. These are the same
+ * questions asked of the backend that is actually running: how many submits
+ * were offered, how many landed, and which of the two silent early returns
+ * swallowed the rest. */
+unsigned long g_xa2_submits;        /* xa2_submit_samples was called */
+unsigned long g_xa2_submitted;      /* ... and the buffer reached XAudio2 */
+unsigned long g_xa2_drop_inactive;  /* ... dropped: no device */
+unsigned long g_xa2_drop_full;      /* ... dropped: all buffers still queued */
+unsigned long g_xa2_drop_failed;    /* ... dropped: SubmitSourceBuffer failed */
+unsigned long g_xa2_frames;         /* sample frames handed to the device */
+
 int xa2_init(void)
 {
     HRESULT hr;
@@ -135,10 +151,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int copy_samples;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    g_xa2_submits++;
+    if (!g_xa2_initialized || !g_xa2_source) { g_xa2_drop_inactive++; return 0; }
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { g_xa2_drop_full++; return 0; }
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
@@ -149,10 +166,12 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-    if (FAILED(hr)) return 0;
+    if (FAILED(hr)) { g_xa2_drop_failed++; return 0; }
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
+    g_xa2_submitted++;
+    g_xa2_frames += (unsigned long)copy_samples;
     return 1;
 }
 
@@ -162,6 +181,11 @@ int xa2_get_buffer_size(void)
 }
 
 #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+
+/* Defined here too, so the common report can print them unconditionally and
+ * read zero on the host where this backend genuinely does not run. */
+unsigned long g_xa2_submits, g_xa2_submitted, g_xa2_drop_inactive;
+unsigned long g_xa2_drop_full, g_xa2_drop_failed, g_xa2_frames;
 
 int  xa2_init(void)                                   { return 0; }
 void xa2_shutdown(void)                               {}

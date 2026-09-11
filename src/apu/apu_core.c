@@ -402,6 +402,26 @@ void mcpx_apu_pacing_report(void)
             " (%.1f ms)\n",
             g_apu_sdl_prime_bytes, g_apu_sdl_reprimes, g_apu_sdl_max_bytes,
             g_apu_sdl_max_bytes / 192.0);
+    /* The backend that is actually running, named, with its own numbers.
+     * Which of the two is live decides whether the SDL2 block above is a
+     * measurement or a row of definitions, and that is not something a reader
+     * should have to infer from the startup banner. */
+    {
+        extern unsigned long g_xa2_submits, g_xa2_submitted;
+        extern unsigned long g_xa2_drop_inactive, g_xa2_drop_full;
+        extern unsigned long g_xa2_drop_failed, g_xa2_frames;
+        extern int xa2_is_active(void);
+        double xa2_hz = elapsed_s > 0.0 ? g_xa2_frames / elapsed_s : 0.0;
+
+        fprintf(stderr, "  [APU-OUT] backend=%s%s submits=%lu submitted=%lu"
+                " frames=%lu gen_hz=%.0f drops: inactive=%lu full=%lu"
+                " failed=%lu\n",
+                xa2_is_active() ? "XAudio2" : (apu_sdl2_is_active() ? "SDL2"
+                                                                    : "none"),
+                xa2_is_active() ? "" : " (XAudio2 counters below are inactive)",
+                g_xa2_submits, g_xa2_submitted, g_xa2_frames, xa2_hz,
+                g_xa2_drop_inactive, g_xa2_drop_full, g_xa2_drop_failed);
+    }
     fprintf(stderr, "  [APU-SDL2] depth buckets (device buffers):"
             " 0=%lu <1=%lu 1-2=%lu 2-4=%lu 4-8=%lu 8+=%lu\n",
             g_apu_sdl_depth_hist[0], g_apu_sdl_depth_hist[1],

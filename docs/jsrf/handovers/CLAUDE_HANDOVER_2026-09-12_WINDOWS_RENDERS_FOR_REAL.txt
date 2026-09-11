@@ -66,14 +66,48 @@ remaining divergence. Same scene, same build:
         Windows  on=4 fe_methods=177  set_current_voice=12   processed=1521632
 
 Windows walks three times as many voices and submits a twenty-fifth of the
-front-end methods, and [APU-PACE] reports batches=0 frames=0 with
-[APU-SDL2] prime=0 -- no audio frames generated at all. Those counters are
-documented in src/apu/apu_vp.c and are the right ones: fe_methods and
-set_current_voice localise a failure to the guest's submission loop rather than
-to MMIO routing, and both are nonzero here, so the routing works and the loop
-is running short.
+front-end methods. Those two counters are the right ones and live in
+src/apu/apu_vp.c, which both hosts compile: fe_methods and set_current_voice
+localise a failure to the guest's submission loop rather than to MMIO routing,
+and both are nonzero here, so the routing works and the loop runs short. The
+register traffic confirms it -- RECOMP_APU_REG_TRACE shows Windows configuring
+voice handles 0x40..0x43 once and then stopping, where macOS keeps
+re-submitting.
 
-Start there, and start by reading what increments each counter.
+CORRECTION, AND A WARNING ABOUT THIS EXACT REPORT. An earlier draft of this
+handover said Windows "generates no audio frames at all", citing
+[APU-PACE] batches=0 frames=0 and [APU-SDL2] prime=0. That was wrong, and it
+was wrong in the way CLAUDE.md warns about. macOS uses the SDL2 backend and
+Windows uses XAudio2; apu_sdl2.c compiles to stubs under _WIN32, so every
+g_apu_sdl_* counter on that host is a variable with NO PRODUCER. Those zeros
+are a definition. Whether Windows produces audio was, at that point, simply
+unmeasured.
+
+[APU-OUT] now reports the backend that is actually live and its own numbers --
+submits offered, buffers landed, sample frames, and which of the three silent
+early returns in xa2_submit_samples swallowed the rest. Read that line, not
+the SDL2 block, when the host is Windows. It labels itself on both:
+
+    Windows  [APU-OUT] backend=XAudio2 submits=15017 submitted=13104
+             frames=3354624 gen_hz=41890 drops: inactive=0 full=1913 failed=0
+    macOS    [APU-OUT] backend=SDL2 (XAudio2 counters below are inactive)
+             submits=0 ... and [APU-PACE] batches=7500 frames=1920000 gen_hz=48006
+
+So WINDOWS IS PRODUCING AUDIO -- 13,104 buffers and 3.35M sample frames in
+90 s, with the only drops being ordinary back-pressure (the device queue full).
+It runs at about 87% of nominal against macOS's 48 kHz, which is worth
+understanding but is a different question from silence.
+
+What is thin is the CONTENT, and that is where the front-end divergence lands:
+four voices started against five, and voice configuration that stops after the
+first pass. Chase that, not the output stage.
+
+Note also [APU-PACE] subframes/se, which DO have a producer on both hosts and
+are nearly equal (14976 vs 15040 at t=10 s). The APU core runs at the same rate
+on both; it is the front-end submission and the output reporting that differ.
+
+Start with the submission loop, and start by reading what increments each
+counter -- including the ones that look like they already answered.
 
 
 3. BUILD AND RUN
