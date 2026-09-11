@@ -5218,7 +5218,12 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── Crypto ── */
 
-    default:  return  0;  /* DATA exports or truly unknown */
+    /* -1, not 0. A void function and an ordinal nobody has written down both
+     * pop zero bytes, but only one of them is a bug, and the caller below has
+     * to tell them apart -- the missing-bridge warning used to accuse
+     * AvGetSavedDataAddress (ordinal 1, genuinely void) of corrupting the
+     * caller's stack, every run, on both hosts. It cost an hour tonight. */
+    default:  return -1;  /* DATA exports or truly unknown */
     }
 }
 
@@ -5556,6 +5561,9 @@ void xbox_bridge_dump_ordinal_histogram(void)
 }
 
 static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
+/* Whether stdcall_args_for_ordinal actually had an entry for this slot, as
+ * opposed to returning zero because the function takes no arguments. */
+static uint8_t g_slot_arg_known[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
 /* Xbox VA to sample around each bridge call; 0 = off. See dispatch. */
 uint32_t g_kernel_watch_va = 0;
@@ -5731,7 +5739,7 @@ static void kernel_thunk_dispatch(void)
              * returns with its callee-saved registers rotated -- silently,
              * frames away from here. Say so, because a title that dies of this
              * looks nothing like a title that is missing a kernel function. */
-            if (g_slot_arg_bytes[slot] == 0)
+            if (!g_slot_arg_known[slot])
                 fprintf(stderr, "  [KERNEL]   ordinal %u has no entry in "
                         "stdcall_args_for_ordinal(). If it takes arguments, "
                         "this call is corrupting the caller's stack -- add its "
@@ -5861,7 +5869,11 @@ void xbox_kernel_bridge_init(void)
 
             /* FUNCTION export: use synthetic VA for dispatch */
             g_slot_bridges[i] = bridge_for_ordinal(ordinal);
-            g_slot_arg_bytes[i] = stdcall_args_for_ordinal(ordinal);
+            {
+                int _a = stdcall_args_for_ordinal(ordinal);
+                g_slot_arg_known[i] = (_a >= 0);
+                g_slot_arg_bytes[i] = (_a > 0) ? _a : 0;
+            }
             if (g_slot_bridges[i]) {
                 bridged++;
             } else {
@@ -5916,7 +5928,11 @@ void xbox_kernel_bridge_init(void)
 
             g_slot_ordinals[slot] = current & 0x7FFFFFFF;
             g_slot_bridges[slot] = bridge_for_ordinal(g_slot_ordinals[slot]);
-            g_slot_arg_bytes[slot] = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
+            {
+                int _a = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
+                g_slot_arg_known[slot] = (_a >= 0);
+                g_slot_arg_bytes[slot] = (_a > 0) ? _a : 0;
+            }
             BRIDGE_MEM32(va) = KERNEL_VA_BASE + slot * 4;
             resolved++;
             if (g_slot_bridges[slot]) bridged++; else unbridged++;
