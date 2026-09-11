@@ -1217,6 +1217,48 @@ void jsrf_texture_bind_probe(uint32_t pc, uint32_t cache_index,
     }
 }
 
+/* The two-bit gate that decides whether DSOUND configures its fifth voice.
+ *
+ * sub_001A43DA reads byte [this+0x12], masks it with 3, and calls
+ * sub_001A3570 only when both bits are set; sub_001A3570 is one of exactly two
+ * functions that write voice handle 0x44, and on Windows neither ever runs.
+ * That is the whole of the on=5 against on=4 difference, and the register
+ * trace could name the missing writer but not say why it was skipped.
+ *
+ * Read the object and the byte at the branch, before it is taken. Print every
+ * distinct (object, value) pair rather than a running total: a gate that is
+ * wrong once is wrong for that object for ever, and a count would hide which
+ * objects passed. RECOMP_DSOUND_GATE=1. */
+void jsrf_dsound_gate_probe(uint32_t pc, uint32_t object, uint32_t flags_word,
+                            uint32_t return_address)
+{
+    enum { SEEN_MAX = 16 };
+    static struct { uint32_t obj, val; } seen[SEEN_MAX];
+    static unsigned seen_n;
+    static int enabled = -1;
+    static unsigned long calls, passes;
+    unsigned gate = (flags_word >> 16) & 3u;   /* byte +0x12 of the dword at +0x10 */
+    unsigned i;
+
+    if (enabled < 0) enabled = getenv("RECOMP_DSOUND_GATE") != NULL;
+    if (!enabled) return;
+
+    ++calls;
+    if (gate == 3u) ++passes;
+
+    for (i = 0; i < seen_n; ++i)
+        if (seen[i].obj == object && seen[i].val == gate) return;
+    if (seen_n < SEEN_MAX) { seen[seen_n].obj = object; seen[seen_n].val = gate; ++seen_n; }
+
+    fprintf(stderr,
+            "  [DSOUND-GATE] pc=%08X this=%08X dword+0x10=%08X byte+0x12&3=%u"
+            " %s caller=%08X calls=%lu passes=%lu\n",
+            pc, object, flags_word, gate,
+            gate == 3u ? "CONFIGURES voice 0x44" : "skips",
+            return_address, calls, passes);
+    fflush(stderr);
+}
+
 void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,
                              uint32_t arg1, uint32_t arg2, uint32_t arg3)
 {

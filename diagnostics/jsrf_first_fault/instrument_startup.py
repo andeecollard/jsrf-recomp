@@ -84,6 +84,12 @@ points = {
         '0004EF90': ('jsrf_title_state_probe', 'ecx, MEM32(ecx + 0x44)'),
     },
     'recomp_0009.c': {
+        # DSOUND's fifth-voice gate. At 0x001A43F0 the object is still in esi
+        # and nothing is pushed beyond the prologue, so the caller's return
+        # address is not on top of the stack -- read the object and the dword
+        # containing byte +0x12, and let the probe do the masking.
+        '001A43F0': ('jsrf_dsound_gate_probe',
+                     'esi, MEM32(esi + 0x10), MEM32(esp)'),
         # 0x001A308E is a manual override now. Its original generated body was
         # an unbounded DSOUND completion spin, so there is no generated label
         # at which a read-only probe can be installed.

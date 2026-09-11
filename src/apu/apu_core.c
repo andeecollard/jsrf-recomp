@@ -880,6 +880,32 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
     return 0;
 }
 
+/* Resolve the faulting store's address to the generated function that owns it.
+ *
+ * On Windows this is left to addr2line offline: the .exe keeps its symbols and
+ * the method is already written down in 06-debugging.md. On POSIX the image is
+ * position-independent, so a raw PC cannot be symbolised after the fact
+ * without the slide -- and dladdr is right here, knows the slide, and returns
+ * the name directly. Both hosts then answer "which function wrote this
+ * register" without anyone having to reconstruct a load address. */
+#if !defined(_WIN32)
+#include <dlfcn.h>
+static const char *apu_writer_symbol(unsigned long long pc)
+{
+    Dl_info info;
+    if (!pc) return "?";
+    if (dladdr((const void *)(uintptr_t)pc, &info) && info.dli_sname)
+        return info.dli_sname;
+    return "?";
+}
+#else
+static const char *apu_writer_symbol(unsigned long long pc)
+{
+    (void)pc;
+    return "use-addr2line";
+}
+#endif
+
 /* Which guest function is doing the store, supplied by the harness because the
  * model has no way to know. Optional: unset, the trace still prints the
  * register traffic. */
@@ -913,8 +939,9 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
          * hint -- see the comment on g_apu_trap_host_pc. host_pc is the store
          * instruction itself; symbolise that one. */
         fprintf(stderr, "  [APUREG] 0x%05X = %08X (w%u) guest~sub_%08X"
-                " host_pc=0x%016llX\n",
-                (unsigned)addr, (uint32_t)val, size, pc, g_apu_trap_host_pc);
+                " host_pc=0x%016llX writer=%s\n",
+                (unsigned)addr, (uint32_t)val, size, pc, g_apu_trap_host_pc,
+                apu_writer_symbol(g_apu_trap_host_pc));
         fflush(stderr);
     }
     if (!d) return;

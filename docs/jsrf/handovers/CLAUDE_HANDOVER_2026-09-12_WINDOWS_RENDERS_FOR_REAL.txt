@@ -129,9 +129,50 @@ linked DSOUND -- nineteen distinct functions, all in sub_001A2xxx..sub_001A6xxx:
     sub_001A4E12 sub_001A5B82 sub_001A5B27 sub_001A5AF0 sub_001A5AB9
     sub_001A53AA sub_001A268D sub_001A22BC sub_001A2285
 
-That is the submission loop, named. Start by taking the same list on macOS and
-diffing it: a function present there and absent here is the branch that stops
-voice configuration after the first pass.
+That is the submission loop, named. The macOS list, taken the same way (dladdr
+resolves it inline there), has 21 entries and Windows's 19 are a strict subset.
+The two that macOS has and Windows never reaches:
+
+    sub_001A3570   (87 configurations in 55 s)
+    sub_001A49A7   (1)
+
+Both do the same thing: SET_CURRENT_VOICE to handle 0x44, VOICE_LOCK, release.
+**They are the only two functions that touch voice 0x44**, and that is the
+whole of on=5 against on=4. The fifth voice is never configured on Windows
+because neither function runs.
+
+One level up, sub_001A3570 has a single caller, sub_001A43DA, which gates it:
+
+    0x001A43F0  mov al, byte ptr [esi + 0x12]
+    0x001A43F3  and al, 3
+    0x001A43F5  cmp al, 3
+    0x001A43F7  jne 0x1a4484          ; skip sub_001A3570
+
+The gate is NOT what fails. RECOMP_DSOUND_GATE=1 probes that branch:
+
+    macOS    this=80954C64 dword+0x10=0303FFFF byte+0x12&3=3 CONFIGURES
+    Windows  (no lines at all)
+
+sub_001A43DA is never reached on Windows. Controlled: the env var was set,
+other probes in the same generated file fired in the same run (9 [NOTIFY],
+9 [RESERVE]), and the run reached 1,802 texture copies -- so the silence is the
+measurement, not a dead instrument.
+
+Next level up, and where to start:
+
+    sub_001A43DA  called by sub_0019ECA3, sub_001A464B, sub_001A46F0
+    sub_001A49A7  called by sub_0019EDCE
+    sub_0019ECA3  called by sub_0019ECF8, sub_0019F1F4
+    sub_0019EDCE  called by sub_0019F214
+
+Note sub_0019F1F4 and sub_0019F214 are 32 bytes apart -- adjacent methods on
+the same object, one feeding each missing writer. A single gate above both is
+the likely shape. Probe those two entries next.
+
+Worth knowing while reading it: the DSOUND object macOS gates on lives at
+0x80954C64, inside the contiguous window. That window aliased the guest's own
+stacks and heap on this host until today (section 0), so any conclusion about
+DSOUND state drawn from a run older than commit 6fb8734 is unsafe.
 
 Start with the submission loop, and start by reading what increments each
 counter -- including the ones that look like they already answered.
