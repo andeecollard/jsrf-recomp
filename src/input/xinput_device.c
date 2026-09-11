@@ -210,6 +210,15 @@ static void refresh_controllers(int force)
 
 void xbox_InputInit(void)
 {
+    /* Without this, SDL discards controller input whenever the window is not
+     * focused -- and this binary has no .app bundle, no Info.plist and never
+     * calls activateIgnoringOtherApps, so it frequently never becomes the
+     * frontmost app at all.  The failure is silent and looks exactly like a
+     * dead pad: polls climb, connected tracks them, and nonneutral stays 0.
+     * Measured: nonneutral 0 -> 224 over the same interval with this set.
+     * Must precede the subsystem init to take effect. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     refresh_controllers(1);
@@ -232,6 +241,52 @@ static int fake_pad_on(void)
     static int on = -1;
     if (on < 0) on = getenv("RECOMP_FAKE_PAD") ? 1 : 0;
     return on;
+}
+
+/* Whether the synthetic pad should press START on this pulse.
+ *
+ * START is needed to get past "Press Start" and through the menus, so a pad
+ * that never sends it cannot reach the game at all. But START is also the
+ * PAUSE button: keep sending it during play and the title sits in covered
+ * pause, where most objects do nothing by design -- the pad stops being
+ * polled, characters stop animating, and the run looks hung. A whole session
+ * was spent diagnosing that as a "pad-poll stall".
+ *
+ * So START is sent only for an opening window, long enough to boot into the
+ * game, and dropped thereafter. A is always sent, which is what advances
+ * dialogue.
+ *
+ *   RECOMP_FAKE_PAD=1        START for the opening window, then A only
+ *   RECOMP_FAKE_PAD=<n>      as above with an n-second window
+ *   RECOMP_FAKE_PAD=a        never send START
+ *   RECOMP_FAKE_PAD=always   always send START (the old behaviour; it pauses)
+ */
+#define FAKE_PAD_START_WINDOW_DEFAULT 90.0
+
+static int fake_pad_start(double t)
+{
+    static int mode = -1;           /* 0 never, 1 windowed, 2 always */
+    static double window = FAKE_PAD_START_WINDOW_DEFAULT;
+
+    if (mode < 0) {
+        const char *v = getenv("RECOMP_FAKE_PAD");
+        mode = 1;
+        if (v && (v[0] == 'a' || v[0] == 'A') && v[1] != 'l')
+            mode = 0;                                   /* "a" / "noStart" */
+        else if (v && strstr(v, "always"))
+            mode = 2;
+        else if (v && v[0] >= '2' && v[0] <= '9') {
+            double n = strtod(v, NULL);
+            if (n > 0.0) window = n;
+        }
+        fprintf(stderr, "  [PAD] fake pad: START %s\n",
+                mode == 0 ? "never" : mode == 2 ? "always (will pause the game)"
+                                                : "for the opening window only");
+        fflush(stderr);
+    }
+    if (mode == 0) return 0;
+    if (mode == 2) return 1;
+    return t < window;
 }
 
 static double fake_pad_seconds(void)
@@ -303,7 +358,15 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         {
             double t = fake_pad_seconds();
             if (t > 2.0 && (t - (double)(long)t) < 0.15) {
-                pState->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+                /* START opens the pause menu, and a synthetic START once a
+                 * second leaves the title sitting in covered pause with most
+                 * objects doing nothing -- which reads exactly like a hung
+                 * game or a dead controller, and was misdiagnosed as a
+                 * "pad-poll stall" for a whole session. Any run that must keep
+                 * running needs A without START, so the button set is
+                 * selectable: RECOMP_FAKE_PAD=a presses A only. */
+                if (fake_pad_start(t))
+                    pState->Gamepad.wButtons |= XBOX_GAMEPAD_START;
                 pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
             }
         }

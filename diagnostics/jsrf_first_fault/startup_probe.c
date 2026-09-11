@@ -1088,3 +1088,176 @@ void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,
             calls, pc, return_address, arg1, arg2, arg3,
             read_word(g_esp + 0x10), read_word(g_esp + 0x14));
 }
+
+/* Which render states the title sets, and which of them actually move.
+ *
+ * G1 asks what computes the intro fade. Against xemu a combiner factor ramps
+ * through 107 distinct values across the cards while ours holds one value for
+ * the whole opening, and the guest-side question -- what writes it -- has no
+ * static answer: CMGameGL::setRenderState is reached only through a vtable, so
+ * its callers are invisible to the call graph.
+ *
+ * Deliberately NOT filtered to one state. Xbox's D3DRENDERSTATETYPE numbering
+ * is not the PC one, so picking the state to watch would be an assumption
+ * standing exactly where the bug is. Instead every state is counted with the
+ * number of distinct values it takes, and the ramp identifies itself: it is
+ * whichever state moves through many values while the cards are on screen.
+ *
+ * The histogram is also the positive control this project keeps paying for.
+ * "The texture factor never moves" proves nothing on its own -- it reads the
+ * same whether the title holds it constant or the probe is dead. It means
+ * something only beside the states that do move.
+ *
+ * Read-only: the caller's stack is read, never written.
+ */
+#define RSTATE_MAX     128u   /* the guest itself rejects state >= 0x52 */
+#define RSTATE_VALUES    8u   /* distinct values remembered per state */
+
+static struct {
+    unsigned long calls;
+    unsigned long changes;
+    uint32_t      values[RSTATE_VALUES];
+    unsigned      value_count;      /* capped at RSTATE_VALUES */
+    int           overflowed;       /* more distinct values than we can hold */
+    uint32_t      last_value;
+    uint32_t      last_caller;
+} g_rstate[RSTATE_MAX];
+static unsigned long g_rstate_calls, g_rstate_out_of_range;
+
+void jsrf_render_state_probe(uint32_t pc, uint32_t state, uint32_t value,
+                             uint32_t return_address)
+{
+    extern double xbox_TraceSeconds(void);
+    static int enabled = -1;
+    static double next_report;
+    static double interval;
+
+    (void)pc;
+    if (enabled < 0) {
+        enabled = getenv("RECOMP_RSTATE_TRACE") != NULL;
+        const char *ms = getenv("RECOMP_RSTATE_REPORT_MS");
+        long v = ms ? strtol(ms, NULL, 10) : 0;
+        interval = (v >= 100 && v <= 600000) ? v / 1000.0 : 5.0;
+    }
+    if (!enabled)
+        return;
+
+    g_rstate_calls++;
+    if (state >= RSTATE_MAX) {
+        g_rstate_out_of_range++;
+    } else {
+        g_rstate[state].calls++;
+        if (g_rstate[state].calls == 1 || value != g_rstate[state].last_value) {
+            if (g_rstate[state].calls > 1)
+                g_rstate[state].changes++;
+            unsigned i;
+            for (i = 0; i < g_rstate[state].value_count; i++)
+                if (g_rstate[state].values[i] == value)
+                    break;
+            if (i == g_rstate[state].value_count) {
+                if (g_rstate[state].value_count < RSTATE_VALUES)
+                    g_rstate[state].values[g_rstate[state].value_count++] = value;
+                else
+                    g_rstate[state].overflowed = 1;
+            }
+        }
+        g_rstate[state].last_value = value;
+        g_rstate[state].last_caller = return_address;
+    }
+
+    double now = xbox_TraceSeconds();
+    if (now < next_report)
+        return;
+    next_report = now + interval;
+
+    /* Ordered by how much each state moves, because that is the question.
+     * A state set a hundred thousand times to one value is not the fade; a
+     * state set thirty times to thirty values is.
+     *
+     * Selection sort over an index array. The counters are cumulative and are
+     * never touched here -- an earlier draft marked entries "consumed" by
+     * zeroing calls, which silently reset the histogram on every report and
+     * would have produced exactly the kind of counter this tree keeps having
+     * to disown. */
+    unsigned order[RSTATE_MAX], n = 0;
+    for (unsigned s = 0; s < RSTATE_MAX; s++)
+        if (g_rstate[s].calls)
+            order[n++] = s;
+
+    for (unsigned i = 0; i < n; i++) {
+        unsigned best = i;
+        for (unsigned j = i + 1; j < n; j++) {
+            unsigned a = order[j], b = order[best];
+            unsigned long a_d = g_rstate[a].value_count
+                              + (g_rstate[a].overflowed ? 1000u : 0u);
+            unsigned long b_d = g_rstate[b].value_count
+                              + (g_rstate[b].overflowed ? 1000u : 0u);
+            if (a_d > b_d
+                || (a_d == b_d && g_rstate[a].changes > g_rstate[b].changes))
+                best = j;
+        }
+        unsigned t = order[i]; order[i] = order[best]; order[best] = t;
+    }
+
+    for (unsigned i = 0; i < n && i < 12; i++) {
+        unsigned s = order[i];
+        fprintf(stderr, "  state 0x%02X  calls=%-8lu changes=%-6lu distinct=%u%s"
+                "  last=0x%08X from=0x%08X\n",
+                s, g_rstate[s].calls, g_rstate[s].changes,
+                g_rstate[s].value_count, g_rstate[s].overflowed ? "+" : "",
+                g_rstate[s].last_value, g_rstate[s].last_caller);
+    }
+    if (n > 12)
+        fprintf(stderr, "  ... and %u more states set\n", n - 12);
+    fflush(stderr);
+}
+
+/* The intro-card state machine, sampled where it runs.
+ *
+ * Opening's fields were read out of the disassembly rather than guessed:
+ *   +0x98  card index      (Exec0Default switches on it; drawDefault draws
+ *                           index/3, so three states per visible card)
+ *   +0x9c  per-state timer (incremented per tick, compared against 0x78)
+ *   +0xa0  skip flag       (set when any of the four pads has a button down)
+ * +0xa8/+0xac are FileGet() handles and +0xb0/+0xb4 a language id and chapter
+ * number, all written once in the constructor -- so nothing in this object can
+ * ramp, which is the point. Recording the machine that DOES move gives the
+ * card timing a direct comparison against the reference's 726 white-card
+ * frames, and tells us whether the fade could ever have been this object's
+ * job.
+ *
+ * It doubles as the positive control for the render-state probe beside it:
+ * both are installed by the same script through the same mechanism, so if this
+ * one reports and that one does not, the difference is the guest, not the
+ * instrument.
+ */
+void jsrf_opening_probe(uint32_t pc, uint32_t object, uint32_t card,
+                        uint32_t timer, uint32_t skip)
+{
+    extern double xbox_TraceSeconds(void);
+    static int enabled = -1;
+    static uint32_t last_card = 0xFFFFFFFFu, last_skip = 0xFFFFFFFFu;
+    static unsigned long ticks, draws, since;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_OPENING_TRACE") != NULL;
+    if (!enabled)
+        return;
+
+    /* One site is the tick and one the draw; count them apart so "the object
+     * draws but never ticks" is distinguishable from "it does neither". */
+    if (pc == 0x0007E360u) ticks++; else draws++;
+    since++;
+
+    if (card == last_card && skip == last_skip)
+        return;
+
+    fprintf(stderr, "[OPENING] t=%7.2f this=%08X card=%-3u timer=%-5u skip=%u"
+            "  (held %lu calls; ticks=%lu draws=%lu)\n",
+            xbox_TraceSeconds(), object, card, timer, skip, since,
+            ticks, draws);
+    fflush(stderr);
+    last_card = card;
+    last_skip = skip;
+    since = 0;
+}

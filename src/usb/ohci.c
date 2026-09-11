@@ -205,10 +205,21 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 
     case HcInterruptStatus:
         *r &= ~v;                       /* write 1 to clear                 */
+        /* Deliberately NOT re-delivering here. This write happens INSIDE the
+         * driver's ISR, so calling the ISR from it is re-entrant, and a run
+         * with that in place never polled at all. Unmasking (HcInterruptEnable)
+         * is the safe trigger: the driver is outside its handler by then. */
         return;
 
     case HcInterruptEnable:
         hc->reg[HcInterruptEnable / 4] |= v;
+        /* NOT re-delivering pending status on unmask, though real OHCI is
+         * level triggered and would. A level-triggered version was written and
+         * tested against the pad-poll stall: it did not fix it, and the reason
+         * is now measured -- ohci_raise() is never called AT ALL, in healthy
+         * and stalled runs alike, so no interrupt is ever dropped because none
+         * is ever raised. Re-adding it would be correctness work, not a fix,
+         * and it is unproven here: one run carrying it never polled at all. */
         return;
 
     case HcInterruptDisable:
@@ -544,8 +555,51 @@ static void ohci_raise(OhciController *hc, uint32_t source)
 
     hc->reg[HcInterruptStatus / 4] |= source;
 
-    if (!(enable & INTR_MIE) || !(enable & source))
+    /* The positive control for the drop counter below. "No drops" and "raise()
+     * is never called at all" are indistinguishable from a zero drop count,
+     * and they mean completely different things: the second says the model
+     * stops generating interrupts entirely, which would explain the stall far
+     * better than a masking race. */
+    {
+        static int on = -1;
+        static unsigned long raises;
+        if (on < 0) on = getenv("RECOMP_OHCI_DROP_TRACE") ? 1 : 0;
+        if (on) {
+            ++raises;
+            if (raises <= 8 || (raises % 500) == 0)
+                fprintf(stderr, "  [OHCI-RAISE] #%lu source=%08X enable=%08X\n",
+                        raises, source, enable);
+            fflush(stderr);
+        }
+    }
+
+    if (!(enable & INTR_MIE) || !(enable & source)) {
+        /* A raise that reaches no ISR. The status bit stays set, so a
+         * level-triggered controller would deliver it the moment the driver
+         * unmasked; ours historically did not, and the pad-poll stall has the
+         * shape of a driver waiting for an interrupt that already happened.
+         * Counting these, and whether one immediately precedes the stall, is
+         * what separates that theory from a coincidence -- so it is recorded
+         * whether or not the delivery fix is in place.
+         *
+         * Opt-in, bounded, and it changes no controller state. */
+        static int on = -1;
+        static unsigned long dropped, dropped_mie, dropped_src;
+        if (on < 0) on = getenv("RECOMP_OHCI_DROP_TRACE") ? 1 : 0;
+        if (on) {
+            ++dropped;
+            if (!(enable & INTR_MIE)) ++dropped_mie; else ++dropped_src;
+            if (dropped <= 24 || (dropped % 200) == 0)
+                fprintf(stderr, "  [OHCI-DROP] #%lu source=%08X enable=%08X"
+                        " status=%08X reason=%s (mie=%lu masked=%lu)\n",
+                        dropped, source, enable,
+                        hc->reg[HcInterruptStatus / 4],
+                        !(enable & INTR_MIE) ? "MIE-clear" : "source-masked",
+                        dropped_mie, dropped_src);
+            fflush(stderr);
+        }
         return;
+    }
 
     claimed = ohci_call_isr(hc);
     if (s_trace || claimed >= 0) {
@@ -625,6 +679,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
      * what killed the process here, two interrupts in, with no fault report
      * because the fault was in the runtime rather than in the title. */
     unsigned waited = 0;
+    int waited_report = 0, mie_report = 0;
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
@@ -652,12 +707,37 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
+            if (++waited > 1500) {            /* 30 s and it never started */
+                /* This exit was silent, and a silent exit of the only thread
+                 * that can deliver an interrupt is indistinguishable from a
+                 * controller that simply never interrupts. Say so: after this
+                 * the guest can still drive transfers by kicking the schedule
+                 * itself, which is why the title keeps running for a while and
+                 * then stops rather than failing outright. */
+                fprintf(stderr, "  [OHCI0] giving up: HcControl=%08X never "
+                        "reached operational in 30 s; no interrupt will ever "
+                        "be delivered\n", control);
+                fflush(stderr);
                 break;
+            }
             continue;
         }
-        if (!(enable & INTR_MIE))
+        if (!waited_report) {
+            waited_report = 1;
+            fprintf(stderr, "  [OHCI0] operational; interrupt worker live "
+                    "(HcControl=%08X enable=%08X)\n", control, enable);
+            fflush(stderr);
+        }
+        if (!(enable & INTR_MIE)) {
+            if (!mie_report) {
+                mie_report = 1;
+                fprintf(stderr, "  [OHCI0] worker idling: MIE clear "
+                        "(enable=%08X); nothing can be delivered\n", enable);
+                fflush(stderr);
+            }
             continue;
+        }
+        mie_report = 0;
 
         /* Plug the device in once, after the driver is running and listening.
          * Presenting it earlier does not work: the driver clears the connect

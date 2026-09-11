@@ -18,20 +18,23 @@ class FpuLifterTest(unittest.TestCase):
 
     def test_fst_does_not_pop_and_fstp_does(self):
         operand = Operand(type="mem", mem_base="esp", mem_disp=0x18,
-                          mem_size=4)
-        store = Instruction(0, 4, "fst", "dword ptr [esp + 0x18]", "")
+                          mem_size=4, insn_address=0x00123456,
+                          function_address=0x00123000)
+        store = Instruction(0x00123456, 4, "fst", "dword ptr [esp + 0x18]", "")
         store.operands = [operand]
         store_pop = Instruction(
-            0, 4, "fstp", "dword ptr [esp + 0x18]", "")
+            0x00123456, 4, "fstp", "dword ptr [esp + 0x18]", "")
         store_pop.operands = [operand]
 
         self.assertEqual(
             Lifter().lift_instruction(store),
-            ["MEMF(esp + 0x18) = (float)fp_top(); /* fst */"],
+            ["RECOMP_MEM_WRITEF(0x00123456u, 0x00123000u, esp + 0x18, "
+             "(float)fp_top()); /* fst */"],
         )
         self.assertEqual(
             Lifter().lift_instruction(store_pop),
-            ["MEMF(esp + 0x18) = (float)fp_top(); fp_pop(); /* fstp */"],
+            ["RECOMP_MEM_WRITEF(0x00123456u, 0x00123000u, esp + 0x18, "
+             "(float)fp_top()); fp_pop(); /* fstp */"],
         )
 
     def test_qword_integer_conversion_uses_signed_64_bit_storage(self):
@@ -45,7 +48,8 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(store),
-            ["SMEM64(esp + 0x10) = (int64_t)llrint(fp_top()); "
+            ["RECOMP_MEM_WRITE64(0x00000000u, 0x00000000u, esp + 0x10, "
+             "(int64_t)llrint(fp_top())); "
              "fp_pop(); /* fistp */"],
         )
         self.assertEqual(
@@ -127,7 +131,8 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(store),
-            ["MEM16(ebp + 0xFFFFFFFCu) = g_fp_control_word;"
+            ["RECOMP_MEM_WRITE16(0x00000000u, 0x00000000u, "
+             "ebp + 0xFFFFFFFCu, g_fp_control_word);"
              " /* fnstcw word ptr [ebp - 4] */"],
         )
         self.assertEqual(

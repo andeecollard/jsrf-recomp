@@ -365,6 +365,10 @@ static int64_t g_apu_pace_start_us;
 void mcpx_apu_pacing_report(void)
 {
     extern unsigned long g_apu_sdl_batches, g_apu_sdl_frames, g_apu_sdl_clears;
+    extern unsigned long g_apu_sdl_starved, g_apu_sdl_empty, g_apu_sdl_min_bytes;
+    extern unsigned long g_apu_sdl_max_bytes, g_apu_sdl_depth_hist[6];
+    extern unsigned long g_apu_sdl_prime_bytes, g_apu_sdl_reprimes;
+    extern unsigned long g_apu_sdl_max_gap_us, g_apu_sdl_gaps_over_cushion;
     extern unsigned long apu_sdl2_queued_bytes(void);
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     double elapsed_s = g_apu_pace_start_us
@@ -381,6 +385,30 @@ void mcpx_apu_pacing_report(void)
             g_apu_sdl_batches, g_apu_sdl_frames, gen_hz,
             apu_sdl2_queued_bytes(), apu_sdl2_queued_bytes() / 4,
             g_apu_sdl_clears);
+    /* The starvation end. min_bytes is the headroom that was actually left at
+     * the worst moment of the run; starved counts submits that found less than
+     * one device buffer still queued, which is the state a single late frame
+     * turns into silence. */
+    fprintf(stderr, "  [APU-PACE] starved=%lu empty=%lu min_queued=%lu bytes"
+            " (%.1f ms)\n",
+            g_apu_sdl_starved, g_apu_sdl_empty,
+            g_apu_sdl_min_bytes == (unsigned long)-1 ? 0UL : g_apu_sdl_min_bytes,
+            (g_apu_sdl_min_bytes == (unsigned long)-1 ? 0.0
+                : g_apu_sdl_min_bytes / 4.0 / 48.0));
+    /* Startup priming and steady-state refill are separate questions, so they
+     * are reported separately: prime_bytes/reprimes describe getting the
+     * cushion in place, the histogram describes whether it stays there. */
+    fprintf(stderr, "  [APU-SDL2] prime=%lu bytes reprimes=%lu max=%lu bytes"
+            " (%.1f ms)\n",
+            g_apu_sdl_prime_bytes, g_apu_sdl_reprimes, g_apu_sdl_max_bytes,
+            g_apu_sdl_max_bytes / 192.0);
+    fprintf(stderr, "  [APU-SDL2] depth buckets (device buffers):"
+            " 0=%lu <1=%lu 1-2=%lu 2-4=%lu 4-8=%lu 8+=%lu\n",
+            g_apu_sdl_depth_hist[0], g_apu_sdl_depth_hist[1],
+            g_apu_sdl_depth_hist[2], g_apu_sdl_depth_hist[3],
+            g_apu_sdl_depth_hist[4], g_apu_sdl_depth_hist[5]);
+    fprintf(stderr, "  [APU-SDL2] max_submit_gap=%.1f ms gaps_over_cushion=%lu\n",
+            g_apu_sdl_max_gap_us / 1000.0, g_apu_sdl_gaps_over_cushion);
     fflush(stderr);
 }
 

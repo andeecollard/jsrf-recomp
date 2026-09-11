@@ -1,0 +1,110 @@
+JSRF drawOne instrument handover to Claude — 2026-09-10
+
+Current outcome
+Implemented a bounded, opt-in drawOne probe and ran the same 45-second intro
+smoke workload as rstate2 with Claude's disposable HDD. The run survived to
+the bounded stop, reporting at least 84,000 GPU draws and 6,780,500 triangles.
+No tutorial measurement was collected in this smoke run. No rendering fix made.
+
+Files changed by this implementation
+  diagnostics/jsrf_first_fault/draw_one_probe.c (new)
+  diagnostics/jsrf_first_fault/instrument_draw_one.py (new)
+  diagnostics/jsrf_first_fault/guest_trace.h (four declarations added)
+  diagnostics/jsrf_first_fault/CMakeLists.txt (probe source added)
+  build-macos/jsrf-first-fault/gen/recomp_0000.c (four removable probe calls)
+This handover is also new. Existing Claude edits and memory-watch work remain.
+
+Verified call layout
+CActMan::drawOne = 0x00012580. Before its first instruction, ECX is manager,
+[ESP] return address, [ESP+4] drawable, [ESP+8] draw argument; ret 8 confirms
+two stack arguments. Assembly at 0x12580 loads the second argument, pushes
+ESI, then 0x1258C loads the object from adjusted [ESP+8]. The object vtable
+dispatch uses +24/+18/+30/+3C/+0C according to manager +40/+44/+48/+4C,
+in that precedence. The common label 0x125C7 is after the virtual dispatch.
+Two call instructions in drawSub return to 0x1338C and 0x13889, not one.
+
+Probe output and scope
+RECOMP_DRAW_ONE_TRACE=1 enables counting. Optional RECOMP_DRAW_ONE_VA filters
+one guest object address; total counts still count all invocations. Up to 256
+object/vtable/id/caller identities are retained; overflow is explicit. Rows
+include flags, parent, +0C mask, +34 link, draw argument and selected guest
+virtual target, cumulative calls/dispatch returns and field-change count.
+Reads are checked with xbox_GpuMemoryRange. No guest registers/memory changed.
+Reports are throttled to at least five seconds and checked every 1024 hook
+entries on the guest thread, so actual report spacing can be longer. No
+shutdown report is relied on. Counters are not reset by reporting. Assumes
+the observed single guest draw thread; no cross-thread aggregation promised.
+tree1/tree2 count entries into 0x11220/0x11260, including recursive entries;
+they are not frame counts or a containing-pass label for drawOne.
+
+Representative measured record
+[DRAW-ONE] t=27.73 total=2049 dispatch_returned=2048 tree1=2043 tree2=0 entries=1 invalid=0 overflow=0 nesting=0 filter=00000000 gpu_attribution=unavailable
+[DRAW-ONE] function=00012580 caller_return=00013889 object=042D0F40 id=4745 vtable=001C4580 parent=040FFFA0 flags=00010003 mask_0c=00000007 next_34=041E3DA0 arg=00000014 target=0001DAA0 calls=2048 dispatch_returned=2048 changes=1
+The one-count difference is the in-progress entry at reporting time.
+Opening independently reaches card 14 with ticks=2294 draws=4587.
+Last report: t=45.66 total=3073 dispatch_returned=3072 tree1=2706 tree2=0,
+four retained identities, zero invalid/overflow/nesting events. IDs and counts:
+4745=2604, 4451=181, 4453=180, 7640=107. All dispatches returned. The last
+three selected targets were 000FEDC0, 000FEDC0 and 0007E020 respectively.
+
+Interpretation correction
+drawOne is NOT a universal funnel for individual drawable objects. In the
+intro it sees ID 4745 while Opening draws via another route. tree2=0 beside
+positive tree1 and Opening counts means the previous claim that two named
+tree walks explain Opening's 2x count is not proven by this run. Do not use
+absence from drawOne to conclude an object failed to draw.
+Dispatch returned means the translated indirect-call wrapper completed. It
+does not prove vertices, rasterization, Metal emission, or even that a target
+was resolved instead of skipped. The GPU consumer is asynchronous; no counter
+delta was falsely attributed to a synchronous guest object. Skip/reject and
+triangle attribution remain unknown. Raw unidentified fields stay raw.
+
+Validation and reproduction (run from repository root)
+python3 diagnostics/jsrf_first_fault/instrument_draw_one.py
+cmake --build build-macos/jsrf-first-fault/build --target jsrf_first_fault -j4
+RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 RECOMP_DRAW_ONE_TRACE=1 RECOMP_OPENING_TRACE=1 RECOMP_REPORT_MS=5000 RECOMP_HDD_ROOT=/private/tmp/claude-501/-Users-andrewcollard-Library-Mobile-Documents-com-apple-CloudDocs-Jet-Set-Radio-Future-xboxrecomp-upstream-integration/384b56fe-d21f-4e92-838e-07dfc68142d8/scratchpad/hdd python3 diagnostics/jsrf_first_fault/run_bounded.py UNIQUE_NAME --seconds 45
+python3 diagnostics/jsrf_first_fault/instrument_draw_one.py --remove
+Build passed (existing Mach-O common-section alignment warning). Synthetic
+install twice was byte-identical; --remove restored exact original text.
+Installer validates every label before writing and finds files by content.
+Logs: build-macos/jsrf-first-fault/render-investigation/draw-one-smoke/
+
+Single best next experiment
+At the faulty tutorial, compare CPlayer IDs in the exec registry with actual
+virtual dispatches inside drawManyDefault (0x110A0), recording its branch
+filters and target. drawOne alone cannot answer the requested per-player
+visibility question. Keep this probe for the camera/root positive control.
+Do not patch rendering or add broad tracing based on the intro result.
+
+Earlier xemu tutorial experiment, retained for continuity
+Snapshots under build-macos/jsrf-first-fault/render-investigation/:
+snap_corn_talk.{bin,json}, snap_tutorial_terminal.{bin,json},
+snap_tutorial_done_a/b/c.{bin,json}. Each bin contains 0x8800 bytes from
+manager root 0x00363A70, resolved through global 0x22FCE0.
+At final dialogue: "Just get close to her and pull the Right Trigger. Got it?"
+After user pressed A once, the playable character and HUD were visible.
+Live count root+87E8: 61 during dialogue, 65 afterwards. Exec root 0038FF40.
+Stable after-transition candidate globals: +7930 FFFFFFFF->1,
++7934 FFFFFFFF->2, +7BB0/+7BB4 0->1, +7E48/+7E4C 0->6.
+These are xemu temporal changes, NOT proven xemu/recomp divergences.
++7EC4 changed 0->1 before the final line; semantics remain unproven.
+Separate live object read via /private/tmp/jsrf_xemu_objects.py showed actual
+CPlayer vtable 001CCFF8 on IDs 44/45/46, at 03BFFB00/03C0B3E0/03C134F0,
+flags 00805040. Correction to an earlier chat claim: ID 232 at 0165AFB0,
+vtable 001CB000 flags 20, is MissionManagerChild_0xE8, NOT CPlayer.
+The object inventory was printed in tool output, not saved as a JSON file.
+xemu was stopped after capture; snapshots are not resumable emulator saves.
+
+Earlier failed recomp run
+tutorial-memwatch-recomp-baseline/stderr.log records unresolved 0x0002D3B3,
+invalid ICALL EF52E740 then 0, SIGBUS, ESI=8508C483, host address 38508C487,
+last instrumented function 00177FE0 (may have returned), no guest block trace.
+It never reached the requested matching tutorial checkpoint. That run had
+no RECOMP_MEM_WATCH armed: there was no established differential RAM value.
+Current Claude-generated state now passes the intro smoke; do not conflate
+the old failed build with this measured build. A tutorial divergence/writer
+has NOT been established. No memory-watch coverage expansion is justified.
+
+Constraints to preserve
+Do not run abi_analysis, reset/clean the repository, patch tutorial progression,
+or make broad renderer changes. Preserve unrelated working-tree edits.

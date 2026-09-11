@@ -2,6 +2,16 @@
 #define JSRF_FIRST_FAULT_GUEST_TRACE_H
 
 #include <stdint.h>
+void jsrf_draw_many_probe(uint32_t pc, unsigned stage, uint32_t object, uint32_t stack);
+void jsrf_draw_one_enter(uint32_t manager, uint32_t stack);
+void jsrf_draw_one_return(void);
+void jsrf_draw_tree_count(unsigned pass);
+void jsrf_draw_one_report(void);
+
+void jsrf_func_hit(uint32_t va);
+void jsrf_func_hit_report(void);
+void jsrf_func_arg(uint32_t va, uint32_t value);
+void jsrf_func_arg2(uint32_t va, uint32_t a, uint32_t b);
 
 void jsrf_trace_function(uint32_t guest_function);
 void jsrf_startup_probe(uint32_t pc, uint32_t object);
@@ -23,6 +33,10 @@ void jsrf_cri_handler_probe(uint32_t pc, uint32_t handler,
 void jsrf_list_remove_probe(uint32_t pc, uint32_t object, uint32_t index,
                             uint32_t return_address);
 void jsrf_title_state_probe(uint32_t pc, uint32_t object, uint32_t state);
+void jsrf_render_state_probe(uint32_t pc, uint32_t state, uint32_t value,
+                             uint32_t return_address);
+void jsrf_opening_probe(uint32_t pc, uint32_t object, uint32_t card,
+                        uint32_t timer, uint32_t skip);
 void jsrf_notify_probe(uint32_t pc, uint32_t object, uint32_t index,
                        uint32_t return_address);
 void jsrf_pushbuffer_wait_probe(uint32_t pc, uint32_t get_ptr,

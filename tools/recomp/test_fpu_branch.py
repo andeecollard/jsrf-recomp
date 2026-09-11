@@ -94,7 +94,7 @@ def test_fnstsw_to_memory_writes_the_status_word():
         _Insn("fnstsw", [_Op("word ptr [eax]", type="mem", mem_size=2,
                              mem_base="eax")],
               "word ptr [eax]")))
-    assert "MEM16(eax) =" in out, out
+    assert "RECOMP_MEM_WRITE16(" in out, out
     assert "g_fp_cmp" in out, out
     # equal -> C3 (0x4000), less -> C0 (0x0100), greater -> 0
     assert "0x4000u" in out and "0x0100u" in out, out

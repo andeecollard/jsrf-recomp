@@ -24,6 +24,7 @@ set(KERNEL_SOURCES
     icall_feedback.c
     recomp_trace.c
     recomp_debug.c
+    recomp_mem_watch.c
     recomp_tsc.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
@@ -36,6 +37,11 @@ if(NOT WIN32)
 endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+
+# Generated store helpers call into xbox_kernel only on normal game targets.
+# Standalone conformance harnesses include recomp_types.h without this public
+# definition and retain direct, dependency-free stores.
+target_compile_definitions(xbox_kernel PUBLIC RECOMP_MEM_WATCH_RUNTIME=1)
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

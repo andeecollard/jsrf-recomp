@@ -853,6 +853,15 @@ class FunctionTranslator:
         if not instructions:
             return None
 
+        # Memory-watch provenance is cheapest and most reliable as generated
+        # constants. This boundary is already authoritative for the body being
+        # emitted, including recovered CFGs; no runtime PC-to-symbol table is
+        # needed merely to name a matching store's containing function.
+        for instruction in instructions:
+            for operand in instruction.operands:
+                if operand.type == "mem":
+                    operand.function_address = start
+
         # Collect switch table targets as extra block leaders
         switch_leaders = set()
         for insn in instructions:

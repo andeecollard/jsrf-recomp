@@ -55,6 +55,8 @@ endif()
 add_executable(jsrf_first_fault
     main.c
     startup_probe.c
+    draw_one_probe.c
+    func_hit_probe.c
     jsrf_manual_overrides.c
     "${JSRF_STOCK_DIR}/src/recomp_manual.c"
     ${RECOMP_GEN_SOURCES}

@@ -80,6 +80,13 @@ class Operand:
     mem_scale: int = 1
     mem_disp: int = 0
     mem_size: int = 0  # operand size in bytes
+    # Original instruction address.  Store lowering needs this at the point
+    # where an operand becomes a C memory operation; retaining it here avoids
+    # reconstructing a guest PC from a generated host address later.
+    insn_address: int = 0
+    # Containing translated function. The translator fills this from its
+    # already-known function boundary, so watch records need no runtime lookup.
+    function_address: int = 0
     # Segment override, when the instruction carries one. Only fs matters on
     # Xbox -- it is how a title reaches the TIB -- but dropping the prefix put
     # fs:[0] at linear address 0, which is also where a null pointer lands.
@@ -136,6 +143,7 @@ def _parse_operand(cs, cs_op, insn_obj):
             mem_scale=cs_op.mem.scale,
             mem_disp=cs_op.mem.disp & 0xFFFFFFFF if cs_op.mem.disp >= 0 else cs_op.mem.disp,
             mem_size=cs_op.size,
+            insn_address=insn_obj.address,
             mem_seg=(_reg_names.get(cs_op.mem.segment)
                      if getattr(cs_op.mem, "segment", 0) else None),
         )

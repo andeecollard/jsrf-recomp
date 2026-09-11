@@ -7,6 +7,13 @@ import re
 from pathlib import Path
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--remove', action='store_true')
+p.add_argument('--skip-mismatched', action='store_true',
+               help='install the sites whose label still validates and report '
+                    'the rest, instead of refusing the whole set. Generated '
+                    'code drifts between regenerations, and a handful of stale '
+                    'sites should not block the other eighty: each site '
+                    'installed is still validated individually, so the tree is '
+                    'never half-instrumented at a site that did not match.')
 p.add_argument('--gen', type=Path, default=Path(__file__).resolve().parents[2] / 'build-macos/jsrf-first-fault/gen')
 a = p.parse_args()
 # Generated file -> pc -> (probe function, argument expression).
@@ -224,6 +231,7 @@ points = {
     },
 }
 changed = 0
+skipped = []
 multi_labels = {
     ('recomp_0007.c', '0014F801'),
     ('recomp_0007.c', '0014FA19'),
@@ -235,8 +243,14 @@ for filename, file_points in points.items():
         label = f'loc_{pc}: ;'
         call = f'\n    {func}(0x{pc}u, {args}); /* STARTUP_OBSERVATION */'
         expected = 2 if (filename, pc) in multi_labels else 1
-        assert s.count(label) == expected, \
-            f'expected {expected} copies of {label} in {f}, found {s.count(label)}'
+        if s.count(label) != expected:
+            if a.skip_mismatched:
+                skipped.append(f'{filename} {label.strip()} '
+                               f'want {expected} found {s.count(label)}')
+                continue
+            raise AssertionError(
+                f'expected {expected} copies of {label} in {f}, '
+                f'found {s.count(label)}; --skip-mismatched installs the rest')
         s = s.replace(label + call, label)
         if not a.remove:
             s = s.replace(label, label + call)
@@ -286,3 +300,7 @@ action = 'Removed' if a.remove else 'Installed'
 print(f'{action} {changed} fixed observation sites in {len(points)} generated files')
 print(f'{action} {unresolved_sites} unresolved-flag execution sites in '
       f'{unresolved_files} generated files')
+if skipped:
+    print(f'skipped {len(skipped)} stale site(s):')
+    for line in skipped:
+        print('  ' + line)

@@ -58,7 +58,8 @@ class SsePackedLifterTest(unittest.TestCase):
             Lifter().lift_instruction(
                 _insn("movss", "dword ptr [ecx], xmm2",
                       [_mem("ecx", 0, size=4), _xmm("xmm2")])),
-            ["MEMF(ecx) = xmm2.f[0]; /* movss */"],
+            ["RECOMP_MEM_WRITEF(0x00000000u, 0x00000000u, "
+             "ecx, xmm2.f[0]); /* movss */"],
         )
 
     def test_packed_arithmetic_emits_a_statement(self):

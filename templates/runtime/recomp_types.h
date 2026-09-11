@@ -352,6 +352,77 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
 
+/* Explicit translated-store seam.
+ *
+ * MEM8/MEM16/MEM32 must remain lvalues because generated reads use the same
+ * spelling.  A callback hidden in those macros could not distinguish a read
+ * from a write.  Store lowering therefore calls these helpers explicitly and
+ * carries the original guest instruction PC with it.
+ *
+ * The runtime-enabled form has one predictable disabled-path branch. Builds
+ * that consume this header without xbox_kernel (the conformance harnesses)
+ * retain direct stores and need no tracer symbols. */
+#if defined(RECOMP_MEM_WATCH_RUNTIME)
+extern int g_recomp_mem_watch_enabled;
+void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
+                                  uint32_t guest_va, unsigned width,
+                                  volatile void *host_ptr, uint64_t new_value);
+
+#define RECOMP_MEM_WRITE_HELPER(bits, type, pc, function, addr, value) do { \
+    uint32_t _mw_addr = (uint32_t)(addr);                                  \
+    type _mw_value = (type)(value);                                        \
+    volatile type *_mw_ptr = (volatile type *)XBOX_PTR(_mw_addr);          \
+    if (g_recomp_mem_watch_enabled)                                        \
+        recomp_mem_watch_guest_store((uint32_t)(pc), (uint32_t)(function), \
+                                     _mw_addr,                              \
+                                     (bits) / 8u, (volatile void *)_mw_ptr, \
+                                     (uint64_t)_mw_value);                 \
+    else                                                                   \
+        *_mw_ptr = _mw_value;                                              \
+} while (0)
+#else
+#define RECOMP_MEM_WRITE_HELPER(bits, type, pc, function, addr, value) do { \
+    (void)(pc); (void)(function); MEM##bits(addr) = (type)(value);           \
+} while (0)
+#endif
+
+#define RECOMP_MEM_WRITE8(pc, function, addr, value)  \
+    RECOMP_MEM_WRITE_HELPER(8, uint8_t, pc, function, addr, value)
+#define RECOMP_MEM_WRITE16(pc, function, addr, value) \
+    RECOMP_MEM_WRITE_HELPER(16, uint16_t, pc, function, addr, value)
+#define RECOMP_MEM_WRITE32(pc, function, addr, value) \
+    RECOMP_MEM_WRITE_HELPER(32, uint32_t, pc, function, addr, value)
+
+static inline void RECOMP_MEM_WRITE64(uint32_t pc, uint32_t function,
+                                      uint32_t addr, uint64_t value) {
+#if defined(RECOMP_MEM_WATCH_RUNTIME)
+    volatile uint64_t *ptr = (volatile uint64_t *)XBOX_PTR(addr);
+    if (g_recomp_mem_watch_enabled)
+        recomp_mem_watch_guest_store(pc, function, addr, 8,
+                                     (volatile void *)ptr, value);
+    else
+        *ptr = value;
+#else
+    (void)pc;
+    (void)function;
+    *(volatile uint64_t *)XBOX_PTR(addr) = value;
+#endif
+}
+
+static inline void RECOMP_MEM_WRITEF(uint32_t pc, uint32_t function,
+                                     uint32_t addr, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    RECOMP_MEM_WRITE32(pc, function, addr, bits);
+}
+
+static inline void RECOMP_MEM_WRITED(uint32_t pc, uint32_t function,
+                                     uint32_t addr, double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    RECOMP_MEM_WRITE64(pc, function, addr, bits);
+}
+
 /** FS-segmented accesses retain their per-thread segment base. */
 #define FS_MEM8(addr)  MEM8(g_fs_base + (uint32_t)(addr))
 #define FS_MEM16(addr) MEM16(g_fs_base + (uint32_t)(addr))

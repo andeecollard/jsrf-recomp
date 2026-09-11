@@ -28,7 +28,8 @@ class FsSegmentLifterTest(unittest.TestCase):
         instruction = self._decode("64890d00000000")  # mov fs:[0], ecx
 
         self.assertEqual(
-            ["FS_MEM32(0) = ecx;"],
+            ["RECOMP_MEM_WRITE32(0x00001000u, 0x00000000u, "
+             "g_fs_base + (uint32_t)(0), ecx);"],
             Lifter().lift_instruction(instruction),
         )
 

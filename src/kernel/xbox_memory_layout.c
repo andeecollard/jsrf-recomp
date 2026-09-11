@@ -28,6 +28,7 @@
 #include "xbox_memory_layout.h"
 #include "xbox_usb_ohci.h"
 #include "kernel.h"
+#include "recomp_mem_watch.h"
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -117,6 +118,7 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+static uint32_t g_mirror_mask;
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -3181,6 +3183,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uint64_t tiled_lo = XBOX_TILED_BASE;
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
 
+        g_mirror_mask = 0;
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
@@ -3223,6 +3226,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             );
             if (g_mirror_views[m]) {
                 mirrors_ok++;
+                g_mirror_mask |= 1u << m;
             } else {
                 fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
                         m + 1, (void *)mirror_base, GetLastError());
@@ -3291,6 +3295,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    recomp_mem_watch_init(g_memory_size, g_mirror_mask, XBOX_TILED_BASE,
+                          g_tiled_view ? xbox_TiledApertureSize() : 0);
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -3323,6 +3329,8 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
         fprintf(stderr,"  Physical heap alias: mapping failed (error %lu)\n",(unsigned long)GetLastError());
         return FALSE;
     }
+    recomp_mem_watch_add_ram_alias(XBOX_CONTIG_BASE + start, start,
+                                   (size_t)end - start);
     fprintf(stderr,"  Physical heap alias: 0x%08X..0x%08X shares low RAM\n",
             XBOX_CONTIG_BASE+start,XBOX_CONTIG_BASE+end);
     return TRUE;
@@ -3360,6 +3368,7 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    recomp_mem_watch_shutdown();
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
@@ -3385,6 +3394,7 @@ void xbox_MemoryLayoutShutdown(void)
             g_mirror_views[m] = NULL;
         }
     }
+    g_mirror_mask = 0;
     /* Unmap base view */
     if (g_memory_base) {
         UnmapViewOfFile(g_memory_base);

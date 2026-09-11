@@ -30,6 +30,8 @@ extern void nv2a_pb_exec_report(void);
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
+static void jsrf_scene_report(void);
+static void jsrf_object_dump(void);
 /* The rasterised surface, and the window that can show it. The executor draws
  * into guest memory and the GL backend owns the window; neither can reach the
  * other without being introduced here. */
@@ -955,6 +957,9 @@ static void jsrf_pusher_report(void)
             xbox_InputPollReport();
         }
         pad_sentinel_scan();
+        jsrf_scene_report();
+        jsrf_object_dump();
+        jsrf_func_hit_report();
         /* The allocator prints its owner breakdown once, when a request
          * fails. That names who holds the heap at the end and says nothing
          * about how it got there -- a working set that plateaus and a leak
@@ -1431,6 +1436,321 @@ static void pad_sentinel_scan(void)
     fprintf(stderr, "  [PAD-SENTINEL] %u cop%s of the pad report in guest RAM\n",
             hits, hits == 1 ? "y" : "ies");
     fflush(stderr);
+}
+
+/* JSRF's own object bookkeeping, read from the host side.
+ *
+ * "The player does not move" and "the player is not drawn" are two symptoms of
+ * one cause if the player object does not exist: nothing to drive, and nothing
+ * to draw. Asking the title's registry what is alive separates that from an
+ * input fault, which the pad sentinel has already ruled out.
+ *
+ * Layout measured 2026-09-04 and recorded in docs/jsrf/handovers:
+ *   root object      guest 0x005E3A70, also pointed to by MEM32(0x0022FCE0)
+ *   +0x98            7668 object pointers indexed by global object id
+ *   +0x87DC          root of the scene graph
+ *   +0x87E8          count of live registered objects
+ * and per scene node:
+ *   +0x04 flags (bit31 = dead)   +0x08 own global id
+ *   +0x28 first child            +0x30 next sibling
+ *
+ * Both ways of naming the root are tried and reported. At the title screen the
+ * pointer at 0x0022FCE0 has been observed holding 0x040D3A70, which is past the
+ * top of the 64 MB RAM window and so cannot be the object -- the title has not
+ * filled it in yet. The static address is the fallback, and printing which one
+ * answered keeps a stale pointer from being mistaken for an empty registry.
+ *
+ * Read-only and bounded: the walk has a visit cap, so a corrupt or cyclic
+ * graph cannot spin it. */
+#define JSRF_ROOT_PTR_VA   0x0022FCE0u
+#define JSRF_ROOT_VA       0x005E3A70u
+#define JSRF_IDS_OFF       0x98u
+#define JSRF_IDS_COUNT     7668u
+#define JSRF_SCENE_OFF     0x87DCu
+#define JSRF_LIVE_OFF      0x87E8u
+#define JSRF_WALK_CAP      8192u
+#define JSRF_RAM_TOP       0x08000000u  /* reserve space sits above the retail 64 MB arena */
+
+static int jsrf_scene_probe(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_SCENE_REPORT") ? 1 : 0;
+    return on;
+}
+
+static int jsrf_va_ok(uint32_t va)
+{
+    return va >= 0x10000u && va < JSRF_RAM_TOP;
+}
+
+/* A full object inventory in exactly the schema /private/tmp/jsrf_xemu_objects.py
+ * prints from xemu's GDB stub, so the two can be diffed field by field.
+ *
+ * The registry comparison at the tutorial is already known to match xemu on
+ * cardinality and on the id set itself, so counting is finished: what is not
+ * yet measured is each object's own eACTFLAG, draw links and vtable, which is
+ * where a "present but never drawn" character would show. Writing the same
+ * JSON both sides keeps the comparison mechanical rather than by eye.
+ *
+ * Read-only: every read is bounds-checked against the same RAM window the
+ * scene walk uses, and nothing is written back into guest memory. Opt-in via
+ * RECOMP_OBJECT_DUMP=<path>, and it writes once per run so a bounded run does
+ * not accumulate hundreds of megabytes.
+ *
+ * Per-object offsets are the xemu tool's, which came from CActBase in the
+ * decompilation: +00 vtable, +04 eACTFLAG, +08 own id, +0C draw child mask,
+ * +24 parent, +28 child, +2C/+30 siblings, +34/+38/+3C draw links, +40 zsort.
+ * Manager draw-side offsets are CActMan's: +74 m_bSkipDraw, +94 m_DrawMode,
+ * +7FA4 m_lpDrawRoot, +7FAC m_lpDrawSortRoot, +7FB4 m_lpDrawSortBinRoots[256]. */
+static void jsrf_object_dump(void)
+{
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    static unsigned seq = 0;
+    const char *dir = getenv("RECOMP_OBJECT_DUMP");
+    char path[1024];
+    uint32_t via_ptr, root;
+    unsigned i, emitted = 0;
+    FILE *f;
+
+    /* A sequence, not a single shot. Which report coincides with a given line
+     * of dialogue is only knowable afterwards, and a per-object field that
+     * changes mid-tutorial is itself the interesting measurement -- one file
+     * could not show either. The cap bounds a long run's disk use. */
+    if (!dir || !base || seq >= 128u)
+        return;
+
+#define R32(va) (*(const uint32_t *)(base + (va)))
+
+    via_ptr = R32(JSRF_ROOT_PTR_VA);
+    root = jsrf_va_ok(via_ptr) ? via_ptr : JSRF_ROOT_VA;
+    if (!jsrf_va_ok(root + 0x87E8u + 3u))
+        return;
+
+    snprintf(path, sizeof path, "%s/objects_%03u.json", dir, seq);
+    f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "  [JSRF-DUMP] cannot write %s\n", path);
+        fflush(stderr);
+        return;
+    }
+    seq++;
+
+    fprintf(f, "{\n  \"source\": \"recomp\",\n");
+    fprintf(f, "  \"seq\": %u,\n", seq);
+    fprintf(f, "  \"root\": %u,\n", (unsigned)root);
+    fprintf(f, "  \"live\": %u,\n", (unsigned)R32(root + 0x87E8u));
+    fprintf(f, "  \"exec_root\": %u,\n", (unsigned)R32(root + 0x87DCu));
+    fprintf(f, "  \"draw_root\": %u,\n", (unsigned)R32(root + 0x7FA4u));
+    fprintf(f, "  \"draw_root_tail\": %u,\n", (unsigned)R32(root + 0x7FA8u));
+    fprintf(f, "  \"draw_sort_root\": %u,\n", (unsigned)R32(root + 0x7FACu));
+    fprintf(f, "  \"draw_sort_tail\": %u,\n", (unsigned)R32(root + 0x7FB0u));
+    fprintf(f, "  \"skip_draw\": %u,\n", (unsigned)R32(root + 0x74u));
+    fprintf(f, "  \"draw_mode\": %u,\n", (unsigned)R32(root + 0x94u));
+    fprintf(f, "  \"state_7930\": %u,\n", (unsigned)R32(root + 0x7930u));
+    fprintf(f, "  \"state_7934\": %u,\n", (unsigned)R32(root + 0x7934u));
+    fprintf(f, "  \"state_7EC4\": %u,\n", (unsigned)R32(root + 0x7EC4u));
+
+    fprintf(f, "  \"draw_sort_bins\": [");
+    for (i = 0; i < 256; i++) {
+        uint32_t v = R32(root + 0x7FB4u + i * 4u);
+        if (!v) continue;
+        fprintf(f, "%s\n    {\"bin\": %u, \"head\": %u}", emitted ? "," : "",
+                i, (unsigned)v);
+        emitted++;
+    }
+    fprintf(f, "%s],\n", emitted ? "\n  " : "");
+
+    emitted = 0;
+    fprintf(f, "  \"objects\": [");
+    for (i = 0; i < JSRF_IDS_COUNT; i++) {
+        uint32_t a = R32(root + JSRF_IDS_OFF + i * 4u);
+        if (!jsrf_va_ok(a) || !jsrf_va_ok(a + 0x4Fu))
+            continue;
+        fprintf(f, "%s\n    {\"id\": %u, \"address\": %u, \"vtable\": %u,"
+                " \"flags\": %u, \"stored_id\": %u, \"draw_child_mask\": %u,"
+                " \"state_11C\": %u, \"state_E50\": %u,"
+                " \"gate_E54\": %u, \"gate_1144\": %u,"
+                " \"fz\": %u, \"zsort_key\": %u,"
+                " \"tx\": %u, \"ty\": %u, \"tz\": %u,"
+                " \"parent\": %u, \"child\": %u, \"sibling_before\": %u,"
+                " \"sibling_next\": %u, \"draw_next\": %u,"
+                " \"draw_before_ptr\": %u, \"draw_last_ptr\": %u,"
+                " \"zsort\": %u, \"extra_44\": %u, \"extra_48\": %u}",
+                emitted ? "," : "", i, (unsigned)a,
+                (unsigned)R32(a), (unsigned)R32(a + 4u), (unsigned)R32(a + 8u),
+                (unsigned)R32(a + 0x0Cu),
+                /* The animation gate: bit 0 of +0xE54 with +0x1144, read by
+                 * sub_00094AB0 before it will touch the +0xCE0 transform. Both
+                 * are far outside the 0x50-byte record, so they are read
+                 * separately and bounds-checked like everything else. */
+                /* The CPlayer state/animation index and its companion.
+                 * Sampled per report so the question "does it advance, or
+                 * settle and stop?" is answered by a series rather than by a
+                 * snapshot -- a snapshot of a mutable field has already been
+                 * mistaken here for a fixed identity. */
+                jsrf_va_ok(a + 0x1147u) ? (unsigned)R32(a + 0x11Cu) : 0u,
+                jsrf_va_ok(a + 0x1147u) ? (unsigned)R32(a + 0xE50u) : 0u,
+                jsrf_va_ok(a + 0x1147u) ? (unsigned)R32(a + 0xE54u) : 0u,
+                jsrf_va_ok(a + 0x1147u) ? (unsigned)R32(a + 0x1144u) : 0u,
+                (unsigned)R32(a + 0x10u), (unsigned)R32(a + 0x14u),
+                (unsigned)R32(a + 0x18u), (unsigned)R32(a + 0x1Cu),
+                (unsigned)R32(a + 0x20u), (unsigned)R32(a + 0x24u),
+                (unsigned)R32(a + 0x28u), (unsigned)R32(a + 0x2Cu),
+                (unsigned)R32(a + 0x30u), (unsigned)R32(a + 0x34u),
+                (unsigned)R32(a + 0x38u), (unsigned)R32(a + 0x3Cu),
+                (unsigned)R32(a + 0x40u), (unsigned)R32(a + 0x44u),
+                (unsigned)R32(a + 0x48u));
+        emitted++;
+    }
+    fprintf(f, "%s]\n}\n", emitted ? "\n  " : "");
+    fclose(f);
+
+    fprintf(stderr, "  [JSRF-DUMP] seq=%u wrote %u objects to %s\n",
+            seq - 1u, emitted, path);
+    fflush(stderr);
+#undef R32
+}
+
+static void jsrf_scene_report(void)
+{
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    static uint32_t stack[JSRF_WALK_CAP];
+    unsigned sp = 0, visited = 0, dead = 0, ids_live = 0, shown = 0;
+    uint32_t via_ptr, root, scene, live;
+    const char *how;
+    unsigned i;
+
+    if (!jsrf_scene_probe() || !base)
+        return;
+
+#define R32(va) (*(const uint32_t *)(base + (va)))
+
+    via_ptr = R32(JSRF_ROOT_PTR_VA);
+    if (jsrf_va_ok(via_ptr)) {
+        root = via_ptr; how = "ptr";
+    } else {
+        root = JSRF_ROOT_VA; how = "static";
+    }
+    if (!jsrf_va_ok(root + JSRF_LIVE_OFF + 3u)) {
+        fprintf(stderr, "  [JSRF-SCENE] no usable root (ptr=%08X)\n",
+                (unsigned)via_ptr);
+        fflush(stderr);
+        return;
+    }
+
+    live  = R32(root + JSRF_LIVE_OFF);
+    scene = R32(root + JSRF_SCENE_OFF);
+
+    /* How much of the id-indexed array is populated. This counts objects that
+     * were constructed at all, independently of whether the scene graph has
+     * linked them in -- so "constructed but not in the tree" stays visible. */
+    for (i = 0; i < JSRF_IDS_COUNT; i++) {
+        uint32_t slot = root + JSRF_IDS_OFF + i * 4u;
+        if (!jsrf_va_ok(slot + 3u)) break;
+        if (R32(slot) != 0) ids_live++;
+    }
+
+    fprintf(stderr, "  [JSRF-SCENE] root=%08X via=%s ptr=%08X live=%u"
+            " ids_populated=%u scene_root=%08X\n",
+            (unsigned)root, how, (unsigned)via_ptr, (unsigned)live,
+            ids_live, (unsigned)scene);
+
+    /* Tutorial-state candidates, from the xemu snapshot diff: +0x7930/+0x7934
+     * read 0xFFFFFFFF throughout the tutorial and become 1/2 once it
+     * completes.  Printed here so that transition can be read straight from
+     * the log -- attaching a debugger to a live run cost one session already,
+     * when the SIGSTOP coincided with the guest ceasing to poll the pad. */
+    if (jsrf_va_ok(root + 0x7EC4u + 3u)) {
+        fprintf(stderr, "  [JSRF-STATE] +7930=%08X +7934=%08X +7BB0=%08X"
+                " +7E48=%08X +7EC4=%08X\n",
+                (unsigned)R32(root + 0x7930u), (unsigned)R32(root + 0x7934u),
+                (unsigned)R32(root + 0x7BB0u), (unsigned)R32(root + 0x7E48u),
+                (unsigned)R32(root + 0x7EC4u));
+    }
+
+    /* Is the title PAUSED?
+     *
+     * CActMan +0x3C/+0x40 both read 1 in covered pause. In that mode most
+     * objects do nothing by design: the pad stops being polled, characters
+     * stop moving, and the run is indistinguishable from a hang or a dead
+     * controller unless someone says so. A whole session was spent chasing a
+     * "pad-poll stall" that was this. Printed every report so it can never be
+     * mistaken again. */
+    if (jsrf_va_ok(root + 0x4Cu + 3u)) {
+        uint32_t p3c = R32(root + 0x3Cu), p40 = R32(root + 0x40u);
+        fprintf(stderr, "  [JSRF-PAUSE] +3C=%08X +40=%08X%s\n",
+                (unsigned)p3c, (unsigned)p40,
+                (p3c && p40) ? "  <== PAUSED (covered pause)" : "");
+    }
+
+    /* The animation gate for the two CPlayers, read cheaply.
+     *
+     * Sampling this through the full object dump meant a 7668-slot walk per
+     * report, and raising the report rate to catch the flag being set was
+     * enough extra work on a timing-sensitive path to trip the pad-poll stall
+     * three runs running. Two id lookups and four reads cost nothing, so the
+     * rate can go up without perturbing the run. */
+    {
+        unsigned oid;
+        for (oid = 44; oid <= 45; oid++) {
+            uint32_t slot = root + JSRF_IDS_OFF + oid * 4u;
+            uint32_t a;
+            if (!jsrf_va_ok(slot + 3u)) continue;
+            a = R32(slot);
+            if (!jsrf_va_ok(a) || !jsrf_va_ok(a + 0x1147u)) continue;
+            fprintf(stderr, "  [JSRF-GATE] id=%u obj=%08X +E54=%08X bit0=%u"
+                    " +1144=%08X\n", oid, (unsigned)a,
+                    (unsigned)R32(a + 0xE54u), (unsigned)(R32(a + 0xE54u) & 1u),
+                    (unsigned)R32(a + 0x1144u));
+        }
+    }
+
+    /* The populated id set itself, not just its cardinality: two different
+     * object sets can share a count, so the count alone cannot show the
+     * registry matches. */
+    {
+        char line[512];
+        unsigned emitted = 0;
+        int col = snprintf(line, sizeof line, "  [JSRF-IDS]");
+        for (i = 0; i < JSRF_IDS_COUNT; i++) {
+            uint32_t slot = root + JSRF_IDS_OFF + i * 4u;
+            if (!jsrf_va_ok(slot + 3u)) break;
+            if (R32(slot) == 0) continue;
+            if (col > (int)sizeof line - 16) {
+                fprintf(stderr, "%s\n", line);
+                col = snprintf(line, sizeof line, "  [JSRF-IDS]");
+            }
+            col += snprintf(line + col, sizeof line - (size_t)col, " %u",
+                            (unsigned)i);
+            emitted++;
+        }
+        if (emitted) fprintf(stderr, "%s\n", line);
+    }
+
+    if (jsrf_va_ok(scene)) stack[sp++] = scene;
+    while (sp > 0 && visited < JSRF_WALK_CAP) {
+        uint32_t n = stack[--sp];
+        uint32_t flags, id, child, sib;
+        if (!jsrf_va_ok(n + 0x33u)) continue;
+        visited++;
+        flags = R32(n + 4u);
+        id    = R32(n + 8u);
+        child = R32(n + 0x28u);
+        sib   = R32(n + 0x30u);
+        if (flags & 0x80000000u) dead++;
+        else if (shown < 24) {
+            fprintf(stderr, "  [JSRF-SCENE]   node %08X id=%u flags=%08X\n",
+                    (unsigned)n, (unsigned)id, (unsigned)flags);
+            shown++;
+        }
+        if (jsrf_va_ok(sib)   && sp < JSRF_WALK_CAP) stack[sp++] = sib;
+        if (jsrf_va_ok(child) && sp < JSRF_WALK_CAP) stack[sp++] = child;
+    }
+
+    fprintf(stderr, "  [JSRF-SCENE] nodes=%u dead=%u%s\n",
+            visited, dead, visited >= JSRF_WALK_CAP ? " (CAPPED)" : "");
+    fflush(stderr);
+#undef R32
 }
 
 #define JSRF_ENTRY_POINT 0x00148023u
@@ -1918,7 +2238,23 @@ int main(int argc, char **argv)
     /* JSRF's guest heaps reserve 1+2+4+8 MB but currently commit only about
      * 57% of it. Keep those virtual ranges outside the retail 64 MB physical
      * arena while leaving ordinary and GPU-visible allocations capped there. */
-    xbox_EnableSeparateReserveSpace(64u * 1024u * 1024u);
+    /* Opt-out for the reserve-space experiment. With the reserves held outside
+     * the retail arena the title's heap runs at a different base than on
+     * hardware, so its free-list history differs and different blocks carry
+     * stale contents -- which is the standing explanation for the object
+     * fields that read garbage here and zero in xemu. Setting
+     * RECOMP_SEPARATE_RESERVE=0 puts the heap back where hardware puts it so
+     * that explanation can be tested. Default is unchanged. */
+    {
+        const char *sep = getenv("RECOMP_SEPARATE_RESERVE");
+        if (sep && strcmp(sep, "0") == 0) {
+            fprintf(stderr, "  [DIAG] RECOMP_SEPARATE_RESERVE=0 -- guest heap"
+                    " reserves stay inside the retail arena\n");
+            xbox_EnableSeparateReserveSpace(0u);
+        } else {
+            xbox_EnableSeparateReserveSpace(64u * 1024u * 1024u);
+        }
+    }
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         fprintf(stderr, "xbox_MemoryLayoutInit failed\n");
         free(xbe_data);

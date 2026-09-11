@@ -151,11 +151,22 @@ def _fmt_mem_read(op):
     return f"{accessor}({addr})"
 
 
+def _fmt_store_address(op):
+    """Format the effective linear address of a generated memory store."""
+    addr = _fmt_mem(op)
+    if getattr(op, "mem_seg", None) == "fs":
+        addr = f"g_fs_base + (uint32_t)({addr})"
+    return addr
+
+
 def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
-    accessor = _mem_accessor(op.mem_size, getattr(op, "mem_seg", None))
-    addr = _fmt_mem(op)
-    return f"{accessor}({addr}) = {value_expr};"
+    addr = _fmt_store_address(op)
+    width = {1: 8, 2: 16, 4: 32}.get(op.mem_size, 32)
+    pc = getattr(op, "insn_address", 0)
+    function = getattr(op, "function_address", 0)
+    return (f"RECOMP_MEM_WRITE{width}(0x{pc:08X}u, 0x{function:08X}u, "
+            f"{addr}, {value_expr});")
 
 
 _REG_WIDTH = {
@@ -1076,6 +1087,13 @@ class Lifter:
         ops = insn.operands
         nops = len(ops)
 
+        # Direct lifter users (principally focused tests) do not pass through
+        # Translator.translate_function(), so supply its current boundary here
+        # when available. Real translation has already annotated every operand.
+        for op in ops:
+            if op.type == "mem" and not getattr(op, "function_address", 0):
+                op.function_address = self.func_start
+
         # ── NOP ──
         if m == "nop" or (m == "lea" and nops == 2 and
                           ops[0].type == "reg" and ops[1].type == "mem" and
@@ -1198,7 +1216,8 @@ class Lifter:
             if dst.type == "mem" and bit.type != "imm":
                 base = _fmt_mem(dst)
                 off = _fmt_operand_read(bit)
-                word = f"MEM32(({base}) + (((int32_t)({off}) >> 5) * 4))"
+                word_addr = f"({base}) + (((int32_t)({off}) >> 5) * 4)"
+                word = f"MEM32({word_addr})"
                 index = f"(({off}) & 31)"
                 out = []
                 if self.needs_cf:
@@ -1208,7 +1227,10 @@ class Lifter:
                           "bts": f"{word} | (1u << {index})",
                           "btc": f"{word} ^ (1u << {index})"}.get(m)
                 if update:
-                    out.append(f"{word} = ({update}); /* {m} */")
+                    out.append(
+                        f"RECOMP_MEM_WRITE32(0x{insn.address:08X}u, "
+                        f"0x{self.func_start:08X}u, "
+                        f"{word_addr}, ({update})); /* {m} */")
                 elif not out:
                     out.append(f"/* bt {insn.op_str}: no CF consumer */")
                 return out
@@ -2605,9 +2627,14 @@ class Lifter:
             elif op.type == "reg":
                 return f"{op.reg} = {val};"
             elif op.type == "mem":
+                pc = getattr(op, "insn_address", 0)
+                function = getattr(op, "function_address", self.func_start)
+                addr = _fmt_store_address(op)
                 if op.mem_size == 8:
-                    return f"MEMD({_fmt_mem(op)}) = {val};"
-                return f"MEMF({_fmt_mem(op)}) = {val};"
+                    return (f"RECOMP_MEM_WRITED(0x{pc:08X}u, "
+                            f"0x{function:08X}u, {addr}, {val});")
+                return (f"RECOMP_MEM_WRITEF(0x{pc:08X}u, "
+                        f"0x{function:08X}u, {addr}, {val});")
             return f"/* sse_write? */;"
 
         # ── Packed (128-bit) access ──
@@ -2950,11 +2977,18 @@ class Lifter:
             # rejected orthonormal camera matrices at render_cameras.c:458.
             do_pop = " fp_pop();" if m == "fstp" else ""
             if len(ops) >= 1 and ops[0].type == "mem":
-                pop = " fp_pop();" if m == "fstp" else ""
+                op = ops[0]
+                pc = getattr(op, "insn_address", getattr(insn, "address", 0))
+                function = getattr(op, "function_address", self.func_start)
+                addr = _fmt_store_address(op)
                 if ops[0].mem_size == 4:
-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
+                    return [f"RECOMP_MEM_WRITEF(0x{pc:08X}u, "
+                            f"0x{function:08X}u, {addr}, (float)fp_top());"
+                            f"{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
+                    return [f"RECOMP_MEM_WRITED(0x{pc:08X}u, "
+                            f"0x{function:08X}u, {addr}, fp_top());"
+                            f"{do_pop} /* {m} */"]
             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
             # is the common idiom for "pop the value fptan/fsincos just pushed";
@@ -2983,14 +3017,18 @@ class Lifter:
 
         if m in ("fist", "fistp"):
             if len(ops) >= 1 and ops[0].type == "mem":
-                size = ops[0].mem_size
-                mem_acc = _smem_accessor(
-                    size, getattr(ops[0], "mem_seg", None))
+                op = ops[0]
+                size = op.mem_size
                 int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
                     size, "int32_t")
+                bits = {2: 16, 4: 32, 8: 64}.get(size, 32)
+                pc = getattr(op, "insn_address", getattr(insn, "address", 0))
+                function = getattr(op, "function_address", self.func_start)
+                addr = _fmt_store_address(op)
                 pop = " fp_pop();" if m == "fistp" else ""
-                return [f"{mem_acc}({_fmt_mem(ops[0])}) = "
-                        f"({int_type})llrint(fp_top());{pop} /* {m} */"]
+                return [f"RECOMP_MEM_WRITE{bits}(0x{pc:08X}u, "
+                        f"0x{function:08X}u, {addr}, "
+                        f"({int_type})llrint(fp_top()));{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
@@ -3197,8 +3235,8 @@ class Lifter:
                 return [f"eax = (eax & 0xFFFF0000u) | (uint32_t){status};"
                         " /* fnstsw ax <- fpu status */"]
             if ops and ops[0].type == "mem":
-                return [f"MEM16({_fmt_mem(ops[0])}) = {status};"
-                        f" /* fnstsw {insn.op_str} */"]
+                return [_fmt_mem_write(ops[0], status)
+                        + f" /* fnstsw {insn.op_str} */"]
             if ops and ops[0].type == "reg":
                 return [_fmt_set_reg(ops[0].reg, status)
                         + f" /* fnstsw {insn.op_str} */"]
@@ -3207,8 +3245,8 @@ class Lifter:
             # The CRT reads the control word back to decide whether an
             # exception is masked, so it must be stored, not dropped.
             if ops and ops[0].type == "mem":
-                return [f"MEM16({_fmt_mem(ops[0])}) = g_fp_control_word;"
-                        f" /* fnstcw {insn.op_str} */"]
+                return [_fmt_mem_write(ops[0], "g_fp_control_word")
+                        + f" /* fnstcw {insn.op_str} */"]
             if ops and ops[0].type == "reg":
                 return [_fmt_set_reg(ops[0].reg, "g_fp_control_word")
                         + f" /* fnstcw {insn.op_str} */"]

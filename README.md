@@ -117,6 +117,22 @@ This produces 6 static libraries in `build/src/*/Release/`. Link your game proje
 
 **This repo builds libraries only — there is no game `.exe` here, and building it will never produce one.** The executable is built by *your* game project, which lives in its own directory and links these libraries. Start it by copying [`templates/new-game/`](templates/new-game/): it has the `CMakeLists.txt` that produces the `.exe` and the `main.c` that boots the guest. See [Getting Started, Step 6](docs/GETTING_STARTED.md#step-6-create-your-game-project).
 
+### Guest Memory Write Tracing
+
+Set `RECOMP_MEM_WATCH=<guest_va>:<length>` when running a recompiled title to
+log covered translated-guest writes that overlap a RAM range. For example,
+`RECOMP_MEM_WATCH=0x00123450:4 ./mygame` watches four bytes and reports the
+exact guest instruction and containing translated function, effective address,
+normalized RAM address, width, and old/new bits. Decimal and hexadecimal input
+are accepted; omit the variable to disable tracing.
+
+> **Coverage is intentionally incomplete.** Missing output does not prove that
+> memory was not modified: stack pushes, string operations, atomics, packed
+> SIMD, MMX, unimplemented x87 environment/save forms, kernel/HLE/device
+> writers, and reads are not currently traced.
+> See [Translated Guest Memory Watch](docs/runtime/memory-watch.md) before using
+> a negative result as evidence.
+
 ### Integration Pattern
 
 Your recompiled game provides two callback functions that the kernel bridge calls to resolve function addresses:
@@ -712,8 +728,8 @@ one title's WMV decoder as no-op comments.
   which argument arrived null.
 - `RECOMP_PEEK` / `RECOMP_PEEK_CHAIN` — read guest dwords, or walk a pointer
   chain, without a run per level.
-- `RECOMP_WATCH_VA` — hardware watchpoint on a guest address, generalised from a
-  single hardcoded one.
+- `RECOMP_MEM_WATCH` — filtered translated-guest RAM write tracing; see
+  [Translated Guest Memory Watch](docs/runtime/memory-watch.md).
 - `RECOMP_PB_SCAN` / `RECOMP_PB_EXEC` — survey a title's NV2A pushbuffer and
   execute its surface and clear methods. The survey ranks what is *not*
   implemented, so the remaining work is a list rather than a guess.

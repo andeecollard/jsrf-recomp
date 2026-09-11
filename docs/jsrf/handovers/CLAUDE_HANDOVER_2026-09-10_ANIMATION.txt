@@ -1,0 +1,1394 @@
+JSRF HANDOVER -- THE CORN TUTORIAL: CHARACTERS DRAW BUT DO NOT ANIMATE
+=====================================================================
+Claude, 10 Sep 2026. Supersedes the animation/missing-character parts of
+earlier handovers. Read this before touching the tutorial fault.
+
+Checkpoint used throughout: the opening Corn dialogue,
+"This is the GG's Garrage. Hey, where's our pizza?"
+Both sides at live=61, 47 ids, +7930/+7934=FFFFFFFF, +7EC4=0.
+Run the recomp with RECOMP_SEPARATE_RESERVE=0 (see below) to see Corn at all.
+
+
+1. THE ESTABLISHED FAILURE
+--------------------------
+Per-frame character state is not written. Measured with the same 0x2000 window
+and 12 s interval on both sides:
+
+    object            xemu            recomp
+    CPlayer id 44     299 dwords      8
+    CPlayer id 45     506 dwords      136
+
+Not merely fewer -- different places. In xemu BOTH CPlayers write a contiguous
+run at +0x9E8 and +0xCE0..0xD14+ (a 4x4 matrix; confirmed 16 dwords in 5 s).
+In the recomp NEITHER does. The only offset written on all four is +0xC94.
+
+User-confirmed by eye: Corn dances in xemu, is static in the recomp, and A does
+not advance the dialogue. +0x7EC4 (a tutorial progression marker that xemu's
+archived snapshots show going 0 -> 1) never leaves 0 in our runs -- 720 s of
+steady state with no change in any of the 47 objects' first 0x50 bytes.
+
+
+2. THE DIVERGENCE, AND ITS SIGNATURE
+------------------------------------
+Every per-character identity field is DISTINCT PER CHARACTER in xemu and
+IDENTICAL ACROSS BOTH CHARACTERS in the recomp:
+
+    field      xemu            recomp
+    +0xE50     23, 25          15, 15
+    +0x11C     170, 171        128, 128
+    +0xE6C     170, 171        128, 128
+    +0x9E4     233, 234        61, 61
+
+This is the shape of both CPlayers being CONSTRUCTED WITH THE SAME CHARACTER
+IDENTITY, not of one field being miswritten. Everything downstream follows
+faithfully from it.
+
+The downstream mechanics are fully understood and CORRECT in the recomp:
+
+    sub_0009E910 @0x0009EBC3:  +0xE6C := [this+0x11C]        (a plain copy)
+    sub_000A0120:              record = 0x2104A0 + idx*96
+                               + 0x30 if [this+0xE70] != 0
+    sub_000A0260:              return *(record + 0xC)
+    sub_0009D030 @0x0009D0AA:  [this+0xE54] := that return value
+
+Verified: the table at 0x002104A0 is XBE-resident and byte-identical between
+default.xbe and xemu's runtime memory (all 6144 bytes checked). record[128]+0xC
+is genuinely 61; record[170]/[171] are genuinely 233/234. The lookup is right;
+the input is wrong.
+
+
+3. WHAT IS ELIMINATED (do not re-investigate)
+---------------------------------------------
+Each of these was measured, not argued.
+
+  ID 46's absence          xemu lacks it during the dialogue too; it appears
+                           only in the tutorial_done snapshots.
+  Draw-list membership     identical across all 47 objects, all three lists.
+  eACTFLAG / mask +0x0C    0 differences across all 47.
+  m_dwZSort +0x14          0 differences across all 47.
+  The id registry          identical 47-id set; ids 233/234 exist in BOTH.
+  vtables                  CPlayers are 0x001CCFF8 with flags 0x00805040 on
+                           both sides. NOT a vtable or layout fault.
+  CActSequence             object id 0, +0x48 = 30 = WaitEndStoryOrVsMission
+                           on both sides. The Corn tutorial is a STORY MISSION,
+                           not the Tutorial branch (indices 32-35).
+  Heap placement           RECOMP_SEPARATE_RESERVE=0 moved the manager
+                           0x040D3A70 -> 0x005E3A70 and changed every garbage
+                           value while leaving the garbage COUNT at 106/107 of
+                           188 float fields (xemu 33). Placement is not it.
+  The +0xE54 bit-0 gate    FALSIFIED. xemu reads +0xE54 = 0 with bit 0 clear on
+                           both CPlayers and Corn dances anyway. A four-link
+                           causal chain was built on this and is dead. The
+                           unexamined assumption was that every `lea [reg+0xce0]`
+                           site operates on a CPlayer -- sub_00080340 uses ebx,
+                           sub_00094AB0 uses ebp, and neither base was ever tied
+                           to that object. A static offset match is not an
+                           object identity.
+  sub_0007EA00             writes +0x11C from [this+0x10F4] gated on
+                           [this+0xE50]==0x1B. Nobody has 27 and +0x10F4 is 0
+                           on both sides, so it never ran.
+
+Still UNPROVEN: that the identity divergence causes the missing animation. We
+have a confirmed symptom and a confirmed divergence with no demonstrated link.
+Do not assert one.
+
+
+4. THE NEXT STEP
+----------------
+CPlayer is constructed by sub_0007E830 (one of only two sites storing vtable
+0x001CCFF8; the other is sub_00084200), called from sub_00080320. The
+constructor takes no identity argument in its prologue, so identity is either
+already on the object or applied by the caller.
+
+  a) Instrument sub_00080320 at entry with `this` capture (ONE site) and see
+     what it assigns to each CPlayer.
+  b) Find what writes +0xE50 -- it is the earliest field showing the signature.
+  c) Whatever is found, the decisive test is whether restoring distinct
+     identities restores the +0x9E8/+0xCE0 writes. Correlation is not the
+     chain.
+
+Also still unanswered, and worth reopening if (a)-(c) stall: WHAT actually
+writes +0xCE0 in xemu? Never determined. xemu's GDB write watchpoints do not
+trap these writes (proven with a positive control: the block changed 16 dwords
+in 5 s while an armed Z2 watchpoint never fired).
+
+
+5. TOOLING ADDED THIS SESSION
+-----------------------------
+  diagnostics/jsrf_first_fault/
+    xemu_objects.py        GDB-stub object inventory (was in /private/tmp)
+    xemu_object_delta.py   per-object mutation rates over an interval
+    xemu_index_chain.py    one-pass capture of the +0x9E4 provenance
+    xemu_rsp.py            resume-safe RSP helper -- USE THIS, see 6
+    compare_objects.py     symbolic differ; resolves pointers to pointee
+                           identity so heap-base offsets cannot fake diffs
+    func_hit_probe.c       function-entry counters + `this` capture
+    instrument_func_hit.py installs/removes them in generated C
+  main.c
+    jsrf_object_dump()     RECOMP_OBJECT_DUMP=<dir>, bounded JSON time series
+    [JSRF-GATE]            cheap two-object field sampler in the scene report
+    RECOMP_SEPARATE_RESERVE=0 opt-out (default unchanged)
+
+Captures worth keeping (render-investigation/):
+  xemu_corn_opening_v2.json, xemu_corn_opening_64mb.json,
+  xemu_index_chain.json, xemu_delta_corn.json, recomp_corn_opening_v2.json
+  /tmp/xemu_cplayer_44.bin, _45.bin (0x2000 each -- most questions about xemu
+  CPlayer fields can be answered from these WITHOUT a replay)
+
+
+6. CONSTRAINTS PAID FOR IN RUNS
+-------------------------------
+  * NEVER probe xemu's stub port with nc. Connecting IS attaching and attaching
+    HALTS the VM. A bare `nc -z` froze the guest.
+  * Any script that halts xemu must resume it in a `finally`. Three replays were
+    lost to scripts that raised between the halt and the continue; the stub then
+    refuses new connections (a stale CLOSED socket beside the LISTEN).
+  * Do NOT send \x03 after connecting -- the attach already stopped the guest and
+    the extra interrupt desynchronises the stream. xemu_rsp.py probes with a
+    read first and only interrupts if that fails. Use it.
+  * INSTRUMENTATION WEIGHT IS A HAZARD, measured. jsrf_func_arg originally
+    linear-scanned 192 entries per call; with nine hot sites the pad poll
+    stalled within 10 s (polls=475 flat, pad opened, nonneutral=262). One site
+    with a bounded scan ran past 6000 polls to the tutorial. Instrument ONE site
+    at a time and keep per-call work cheap. A sudden early poll stall means the
+    probe set is too heavy -- it is not the controller.
+  * Do NOT instrument mid-function `loc_` labels. Counters at 00094D20/3F/47/5A
+    wedged the guest on the SEGA screen (drawOne stuck at 12, polls=1, no GPU
+    draws). Function-entry labels are safe.
+  * RECOMP_MEM_WATCH CANNOT RUN on this build. Armed on 0x03536C3C it SIGSEGVs
+    at t=5 s on guest 0xFFFFFFF8; the identical binary with it unset has zero
+    faults and reaches the tutorial. The hook being present in the generated
+    recomp_types.h does NOT mean the build tolerates it.
+  * "No input" has two distinct fingerprints: polls climbing with nonneutral=0
+    means another process holds the pad (xemu was the culprit once); polls
+    flatlining means the guest stopped asking.
+  * Object-diff window size matters: a 0x400 window said "CPlayers frozen" and
+    a 0x2000 window disproved it in the same session.
+
+
+7. IDEAS AND TOOLS WORTH BUILDING NEXT
+--------------------------------------
+Ranked by how much time they would have saved today. Roughly fifteen manual
+playthroughs to the Corn dialogue were spent this session; that, not analysis,
+was the dominant cost.
+
+  (1) xemu SAVE STATES, scripted.  Launch xemu with
+        -monitor unix:/tmp/xemu-mon,server,nowait
+      and drive `savevm corn` / `loadvm corn` over that socket. Reaching the
+      oracle checkpoint becomes seconds instead of a playthrough. This is the
+      single highest-value item and it is small. (The user was asked twice to
+      save a state manually; automating it removes the need.)
+
+  (2) SCRIPTED INPUT FOR THE RECOMP.  Add RECOMP_INPUT_SCRIPT=<file> feeding
+      timestamped pad reports into the OHCI/USB path, recorded from a live run.
+      Reaching our own checkpoint then costs no human. Combined with (1) the
+      whole paired comparison becomes a single unattended command. This also
+      makes the poll-stall reproducible on demand instead of by luck.
+
+  (3) THE SIGNATURE SCANNER.  Today's breakthrough was noticing a pattern:
+      fields that are DISTINCT between the two CPlayers in xemu but IDENTICAL
+      between them in the recomp. That is mechanically detectable across all
+      0x2000 bytes rather than found by eye. Write it: read both objects on both
+      sides, and report every offset matching that signature (and its inverse).
+      It would have pointed at +0xE50/+0x11C immediately, and it generalises to
+      any pair of same-class objects.
+
+  (4) FUNCTION-SCOPED STORE WATCHING.  RECOMP_MEM_WATCH is global -- a call on
+      every guest store -- which is why it kills the run. Instead extend
+      instrument_func_hit.py to wrap stores only inside chosen functions, so the
+      cost is proportional to one function rather than the whole title. That
+      turns "which instruction wrote this field" from impossible back into a
+      one-run question, which is exactly what blocked us tonight.
+
+  (5) O(1) PROBE STORAGE.  Replace jsrf_func_arg's linear scan with a small
+      direct-mapped hash keyed on (va, value). Removes the perturbation class
+      that cost several runs and lets more than one site be armed at a time.
+
+  (6) POLL-STALL WATCHDOG.  Detect `polls` flatlining while GPU draws advance,
+      print a loud marker, and optionally dump guest thread PCs at that instant.
+      The stall is still unexplained after five sessions and is a recurring tax;
+      catching it in the act with a stack sample is the obvious missing step.
+
+  (7) AUTO-SYMBOLISATION IN REPORTS.  Pipe every raw sub_XXXXXXXX through
+      symbolize.py when printing, so logs name functions where the
+      decompilation knows them. Cheap, and would have made several traces
+      readable at a glance.
+
+  (8) A SINGLE PAIRED-DIFF COMMAND.  jsrf_diff.py that, given a checkpoint,
+      captures both sides and prints the field-level differences -- wrapping
+      xemu_objects.py, the recomp dump and compare_objects.py. The pieces exist;
+      the glue does not.
+
+
+8. A NOTE ON METHOD
+-------------------
+Three hypotheses died today: ID 46, heap placement, and the +0xE54 gate. The
+third had a complete four-link causal chain and survived until someone finally
+read the field in xemu. The lesson is the one already in CLAUDE.md, but it
+recurred in a new form: a static offset match (`lea [reg+0xce0]`) was treated as
+an object identity without ever proving the base register held that object.
+Before building a chain, check that each link's BASE is the object you think it
+is -- not just that the offset matches.
+
+
+9. FACILITIES THIS PROJECT ALREADY HAS THAT WE DID NOT USE
+----------------------------------------------------------
+Asked at the end of the session whether xboxrecomp was being leveraged fully.
+It was not. 196 RECOMP_* switches exist; enumerate them before building
+anything (`grep -rhoE 'RECOMP_[A-Z0-9_]+' src diagnostics templates tools`).
+
+  --trace-functions FILE   THE BIG MISS. tools/recomp/__main__.py takes a file
+                           of addresses and emits trace calls for exactly those
+                           functions, backed by src/kernel/recomp_trace.c, with
+                           RECOMP_TRACE_ARGS (argument capture),
+                           RECOMP_TRACE_BUDGET (a cap -- the perturbation
+                           control whose absence cost runs this session),
+                           RECOMP_TRACE_PROFILE, _ESP, _DEREF, _ENTER, _EXIT.
+                           func_hit_probe.c + instrument_func_hit.py are a
+                           hand-rolled, worse version of this. The one real
+                           argument for hand-instrumenting is that
+                           --trace-functions needs a REGENERATION, which this
+                           tree warns is not bit-stable and has a SIGBUS
+                           history -- but that trade should be made knowingly.
+
+  RECOMP_HEAP_POISON       Would have settled the "uninitialised object fields"
+                           thread directly. We instead ran the whole
+                           reserve-space experiment to falsify it.
+  RECOMP_PEEK / _CHAIN     Guest memory peeking; probably replaces the ad-hoc
+                           lldb `memory read --outfile` reads used all session.
+  RECOMP_DIALOG_SCAN       Aimed at dialogue. "A does not advance the dialogue"
+                           is half the reported symptom and was never probed.
+  RECOMP_WATCHDOG_SECS     Relevant to the poll stall.
+  RECOMP_KERNEL_WATCH/_ALL Kernel-side watching, unexplored.
+  RECOMP_MEM_WATCH_MIRRORS NOT A SWITCH -- corrected 11 Sep. It is a
+                           compile-time `#define 28u` in recomp_mem_watch.c with
+                           no env binding, used only to bound one mirror loop
+                           that normalize_ram skips for in-range addresses. It
+                           cannot reduce the watch's cost.
+                           Also checked: MEM32(addr) is literally
+                           *(volatile uint32_t*)XBOX_PTR(addr), identical to the
+                           watch-DISABLED store path, so enabling the watch
+                           changes no store semantics or masking. The cost is
+                           purely the per-store function call.
+                           Two further reasons the watch is the wrong tool here:
+                           it takes a FIXED guest VA, and CPlayer addresses are
+                           not stable across runs (0x3626B50 in one fake-pad
+                           run, 0x36284A0 in the next).
+  RECOMP_ICALL_FEEDBACK    Indirect-call resolution, unused here.
+  RECOMP_HEAP_TRACE/_REPORT/_NO_FREE   Allocation history, unused.
+
+  RECOMP_FAKE_PAD          EXISTS but is explicitly diagnostic: it pulses A and
+                           START once a second and "cannot steer anything". So
+                           scripted input to reach a checkpoint unattended is
+                           still genuinely missing (idea 7.2 stands).
+
+Revision to section 7: ideas (4) function-scoped store watching and (5) O(1)
+probe storage are largely SUPERSEDED by --trace-functions, which is already
+selective and already budgeted. Build (1) xemu save states and (2) scripted
+input first; then reach for --trace-functions instead of extending the
+hand-rolled probes.
+
+On Burnout 3 (../burnout3-research): its docs are forward-looking planning for
+a different title -- RenderWare .rws formats, kernel imports, recompilation
+strategy options -- not debugging findings. JSRF does touch RenderWare (the
+64 MB wrap mirrors in xbox_memory_layout.c exist for its memory walker), but
+the current fault is in JSRF's own CActBase/CPlayer identity assignment,
+upstream of any rendering engine. No clues for this bug. It would only become
+relevant if the missing +0xCE0 writes turn out to be skinning matrices.
+
+
+10. SIGNATURE SCAN RESULTS (diagnostics/jsrf_first_fault/signature_scan.py)
+---------------------------------------------------------------------------
+Built and run against the saved captures, no game needed:
+  /tmp/xemu_cplayer_{44,45}.bin  vs  /tmp/recomp_cplayer_{44,45}.bin
+(the recomp pair is sliced out of the chr_1.bin character-region capture).
+
+2048 dwords per object compared. Four classes:
+
+  IDENTITY-LOST    23 offsets   distinct in xemu, IDENTICAL here
+  IDENTITY-GAINED  90 offsets   identical in xemu, distinct here
+  BOTH-DISTINCT  1112 offsets   healthy per-character data
+  VALUE-DIFF      317 offsets
+
+**The 1112 matters as much as the 23.** Our two CPlayers differ in over a
+thousand places, so this is NOT "the same object registered twice" or two
+copies of one character. Only specific identity fields collapse to one value.
+
+IDENTITY-LOST, excluding pointer-valued noise -- the causal candidates:
+
+    offset   xemu (44 / 45)        recomp (44 / 45)
+    +0x011C  170 / 171             128 / 128     character slot
+    +0x09E4  233 / 234             61 / 61       derived index
+    +0x09E8  0.390 / 0.800 (f)     0 / 0         per-frame animated value
+    +0x0D68  11.69 / 11.12 (f)     5.61 / 5.61
+    +0x0E50  23 / 25               15 / 15
+    +0x0E58  12 / 3                11 / 11
+    +0x0E6C  170 / 171             128 / 128
+    +0x0E80  39.5 / 99.5 (f)       0.5 / 0.5     (sub_0009D030 does
+                                                  `lea ebx,[esi+0xE80]`)
+
+The remaining entries (+0x11A8 upward) are sparse per-frame floats, nonzero in
+xemu for one character or the other and zero in both here -- consistent with
+animation simply not running, i.e. consequences rather than causes.
+
+So the identity cluster is SMALL and TIGHT: +0x011C, +0x0E50, +0x0E58, +0x0E6C,
++0x0E80, +0x0D68. Chase whichever is written earliest.
+
+IDENTITY-GAINED (90) is a separate finding: contiguous regions
+(+0x0178..+0x0244, +0x0368..+0x0418 and more) read ZERO in xemu on both
+characters and hold garbage here, in values shaped like packed 16-bit pairs.
+This is the "uninitialised fields" pattern from earlier in the session, now
+quantified and localised. Untested idea: run with RECOMP_HEAP_POISON and see
+whether these offsets carry the poison pattern -- that would prove the guest
+never writes them, which the reserve-space experiment could not.
+
+The scanner is generic: give it any two same-class objects from each side.
+It would have pointed at +0x0E50/+0x011C on day one instead of by eye.
+
+
+11. RECOMP_FAKE_PAD RESULT (negative, useful)
+---------------------------------------------
+`RECOMP_FAKE_PAD=1` DOES drive the title unattended -- it got past the intro
+into a scene load without any human input -- but it landed at live=161/123, a
+different scene from the tutorial's 61/47, and `polls` flatlined at 124 with
+nonneutral=0. Consistent with its own comment: it pulses A and START and
+"cannot steer anything".
+
+So it cannot reach the Corn checkpoint, and scripted input (idea 7.2) is still
+needed. But it is a usable no-human smoke test for anything that only needs the
+title or an arbitrary scene.
+
+Also learned: RECOMP_PEEK takes FIXED guest VAs, so an address list computed for
+one scene prints garbage in another. Recompute the addresses per scene, or peek
+the manager root and derive.
+
+
+12. AUTONOMOUS SESSION (fake pad + O(1) probe): THE BIG UNLOCKS
+---------------------------------------------------------------
+(a) THE IDENTITY COLLAPSE IS GENERAL, NOT TUTORIAL-SPECIFIC.
+    RECOMP_FAKE_PAD=1 reaches gameplay unattended with 3-4 CPlayers. All of
+    them read:
+        +0x11C=128  +0xE50=15  +0xE58=11  +0xE6C=128  +0x9E4=61
+    identical across every CPlayer, in an ordinary gameplay scene.
+    **Debugging this no longer requires the Corn checkpoint or a human.**
+    That is the single most useful thing found today.
+
+(b) THE PROBE IS NOW O(1). jsrf_func_hit uses a 1024-slot direct-mapped table
+    (open addressing on va>>4) instead of a linear scan. **113 sites armed at
+    once ran with no destabilisation** -- against nine sites stalling the guest
+    in ten seconds with the old scan. This makes "which of N candidates runs?"
+    a single experiment instead of N.
+
+(c) THE FUNNEL, using (a) and (b):
+        186 store sites writing +0x11C
+     -> 112 containing functions
+     ->  16 that actually execute       (96 never run at all)
+     ->  13 called with a CPlayer `this`
+     ->   5 that also write +0xE50
+     ->   4 after excluding the clearing pass
+
+    **SHORTLIST FOR THE IDENTITY SETTER:**
+        sub_00091930  sub_00092100  sub_00098100  sub_000A0610
+    all called at initialisation frequency (1-2 calls per CPlayer).
+
+(d) sub_000836F0 IS THE CLEARING PASS, not the setter. Called exactly once per
+    CPlayer, it writes the whole identity cluster:
+        0x00083726  mov [esi+0x11C], ebx     ; ebx = 0 (xor ebx,ebx at 0x8370F)
+        0x0008372C  mov [esi+0xE6C], ebx     ; 0
+        0x000837E6  mov [esi+0xE50], edx     ; edx = descriptor[+0x24]
+        0x00083AA7  mov [esi+0xE58], 3
+        0x00083AD9  mov [esi+0xE80], ebx
+    Its descriptor argument (arg1) IS distinct per CPlayer -- captured live at
+    0x018FBA54 and 0x018FBA88, 0x34 apart, i.e. consecutive 52-byte records --
+    and descriptor[+0x24] AT CALL TIME varies (0 and 0x18). Since the object
+    ends up with +0xE50=15 and +0x11C=128, both values must come from a LATER
+    write. So the descriptor path is not the fault.
+
+(e) HEAP POISON. RECOMP_HEAP_POISON=0xAB fills freed blocks. Of the 97 dwords
+    in the IDENTITY-GAINED regions, **0 held the poison pattern** on any of the
+    three CPlayers. Caveat: poison only marks FREED blocks, so this rules out
+    recycled-and-poisoned memory as the source but does not prove the fields
+    were written.
+
+NEW INSTALLER OPTIONS (diagnostics/jsrf_first_fault/instrument_func_hit.py):
+    --va-file FILE        VAs one per line (zsh does not word-split an
+                          expanded argument list, which silently mangles a
+                          long --va sequence)
+    --stackarg VA:OFF     record the dword at [esp+OFF] on entry -- a
+                          stack-passed argument
+    --derefarg VA:OFF:F   record [[esp+OFF]+F] on entry -- a FIELD of a
+                          pointer argument, sampled AT CALL TIME. Reading the
+                          block later is not equivalent: it may have been
+                          reused by then, which cost one experiment here.
+
+NEXT: arm --arg or --derefarg on the four shortlisted functions and see which
+one writes a nonzero +0x11C / +0xE50 for a CPlayer, and from what source. All
+four are reachable unattended with RECOMP_FAKE_PAD=1, so this needs no human.
+
+
+13. CORRECTION (11 Sep): +0x11C IS A MUTABLE STATE INDEX, NOT AN IDENTITY
+--------------------------------------------------------------------------
+Captured with the new --ecxpair option, which records `this` AND the field
+together (either alone is ambiguous):
+
+    sub_00098100  this=036274A0 (CPlayer)  +0x11C = 0x6A (106)
+    sub_00098100  this=036274A0 (CPlayer)  +0x11C = 0x7E (126)
+    sub_00098100  this=03630880 (CPlayer)  +0x11C = 4
+
+Both objects confirmed CPlayers from the same run's object dump. So +0x11C
+takes 4, 106, 126 and 128 at different moments and sub_00098100 actively
+changes it (106 -> 126). It is a **state/animation index**, not a fixed
+character identity.
+
+**This corrects section 12 and the memory note.** "Both CPlayers read
++0x11C=128" was a SINGLE-INSTANT SNAPSHOT of a field that moves, not a
+permanent collapse. Two objects sharing a value at one instant is not evidence
+of shared identity.
+
+**And it is a methodological warning about signature_scan.py:** it compares one
+instant per side. For any MUTABLE field, "distinct in xemu, identical here" can
+be sampling coincidence. The scan's output is a list of CANDIDATES, and each
+one must be re-checked over time before it is believed. Fields that survive
+that check are real; the rest are noise. Use --ecxpair (or a dump time series)
+to classify a candidate as static or mutable BEFORE building on it.
+
+What survives, and fits the symptom better: ours sit at **128** while xemu's sit
+at **170/171**. That is consistent with our characters being stuck in a DEFAULT
+state rather than being the wrong character -- and with the user's observation
+that "the player appears briefly". A stuck state index would also explain the
+missing per-frame +0xCE0 writes without any identity being wrong.
+
+NEXT, and it is now a different question: not "who assigns identity" but
+**"why does the state index stop advancing"**. sub_00098100 is the function
+observed advancing it (106 -> 126) and is called on CPlayers. Instrument its
+callers, and compare the state-index TIME SERIES between xemu and the recomp
+rather than single samples -- the recomp reaching 128 and stopping, against
+xemu moving through a range, would be the real measurement.
+
+
+14. THE FAULT IS TUTORIAL-SPECIFIC. THE ANIMATION MACHINERY WORKS.
+-------------------------------------------------------------------
+Two measurements on 11 Sep, both unattended via RECOMP_FAKE_PAD.
+
+(a) +0x11C IS NOT STUCK. A 31-sample series, 3 s apart, with the state index
+    added to jsrf_object_dump:
+
+      CPlayer 44: 13 distinct values -- 0,17,28,32,48,56,68,90,91,115,126,150,152
+      CPlayer 45: 12 distinct values -- 17,24,28,36,44,52,56,58,60,68,76,106
+
+    It cycles continuously, and **128 never appears in either series**. So
+    "the recomp reaches 128 and stops" is FALSE. The 128 readings came from a
+    different scene state (the tutorial dialogue), plausibly a legitimate
+    idle/talking state. Comparing a single instant of a fast-moving field
+    across two runs that are not in identical states shows a difference by
+    construction. **The +0x11C divergence was sampling noise.**
+
+(b) **THE TRANSFORM BLOCK MOVES IN GAMEPLAY.** Two live reads 10 s apart, four
+    CPlayers:
+
+      id 44 @ 03626C10  +0xCE0 16/16 dwords changed   object  319 dwords
+      id 45 @ 0361E910  +0xCE0 16/16 dwords changed   object 1124 dwords
+      id 46 @ 0362F010  +0xCE0 16/16, +0x9E8 2/2      object  773 dwords
+      id 47 @ 0363E010  +0xCE0 16/16, +0x9E8 2/2      object 1579 dwords
+
+    Against the Corn tutorial, where the same measurement gave 8 and 136 dwords
+    with the +0xCE0 block untouched on both CPlayers.
+
+**So the recomp animates characters correctly in ordinary gameplay.** The
+missing animation is SCENE-SPECIFIC to the Corn tutorial, where xemu animates
+and we do not.
+
+This retires the whole line of inquiry from sections 2, 12 and 13: identity
+assignment, the descriptor path, the state index, sub_000836F0, and the
+four-way setter shortlist were all chasing a general animation fault that does
+not exist. The machinery is fine; something about the tutorial state suppresses
+it for those particular objects.
+
+### The question now
+
+What is different about the Corn tutorial that stops animation there, when the
+same code animates four CPlayers in gameplay?
+
+Candidates, in the order they are cheapest to test:
+  * The tutorial CPlayers may be driven as cutscene/scripted actors rather than
+    by the normal per-frame path. Compare WHICH functions are entered with a
+    CPlayer `this` in the tutorial versus in gameplay -- the O(1) probe can arm
+    a hundred sites, so one run of each and a set-difference answers it.
+  * +0x7EC4 never leaves 0 in our tutorial while xemu's archived snapshots show
+    0 -> 1. That progression marker is still unexplained and is tutorial-scoped.
+  * The dialogue never advances on A. RECOMP_DIALOG_SCAN is unexplored and is
+    aimed exactly at this.
+
+### Method note, third occurrence
+
+A snapshot of a mutable quantity is not a fact about that quantity. The +0xE54
+gate, the +0x11C identity and the signature scan's candidate list were all
+built on single-instant comparisons. **Measure rates and series; compare
+snapshots only for fields first shown to be static.**
+
+
+15. PLAN FROM HERE (written 11 Sep, after the tutorial-specific finding)
+------------------------------------------------------------------------
+The question is now: **what suppresses character animation in the Corn tutorial
+when the same code animates four CPlayers in ordinary gameplay?**
+
+Ordered by evidence-per-hour, with the human cost of each stated.
+
+STEP 1 -- THE DIFFERENTIAL ENTRY SET.  *One tutorial playthrough; gameplay half
+unattended.*  Arm the O(1) probe on a broad set of candidate functions with
+`--ecxpair VA:0` (records `this`), run once in gameplay via RECOMP_FAKE_PAD and
+once in the tutorial, and set-difference the functions entered with a CPlayer
+`this`. Functions present in gameplay and ABSENT in the tutorial are the
+suppressed path; the first one that stops is the target.
+This is the single most direct attack and it is only possible because the probe
+is now O(1) -- 113 sites ran with no destabilisation, so a few hundred is
+plausible. Start with the known per-frame path (sub_00094AB0, sub_00080340,
+sub_000606C0, sub_00060730, sub_000651E0, sub_00060930) plus the 13 functions
+already observed with a CPlayer `this`.
+
+STEP 2 -- RECOMP_TRIGGER_TRACE.  *Unattended.*  `jsrf_trigger_probe` observes
+"the only direct writers of the root object's transient command fields" -- i.e.
+scene/mode transition requests, distinguished by object and return address.
+That is precisely the shape of "the tutorial is in a state gameplay is not".
+It also bears on `CActMan +0x7EC4` never leaving 0 while xemu goes 0 -> 1.
+Needs its probe installed (see instrument_startup.py).
+
+STEP 3 -- RECOMP_DIALOG_SCAN.  *Unattended to reach a scene; tutorial needs a
+run.*  Aimed at dialogue, and "A does not advance the dialogue" is half the
+reported symptom and has never been probed directly.
+
+STEP 4 -- RECOMP_EVENT_TRACE.  *Unattended.*  Pairs kernel event signals with
+waits, deduplicated by object, and reports "a wait that never returns ... once".
+If the tutorial is blocked on an event that is never signalled, this names it.
+RECOMP_SCHED_TRACE is the sibling for the thread side.
+
+STEP 5 -- INFRASTRUCTURE, still the biggest multiplier.
+  (a) xemu save states via `-monitor unix:/tmp/xemu-mon,server,nowait` and
+      savevm/loadvm. The oracle checkpoint becomes seconds. ~15 playthroughs
+      were spent this session.
+  (b) Scripted input for the recomp. RECOMP_FAKE_PAD gets to gameplay but
+      "cannot steer", so it cannot reach the tutorial. A timestamped pad-report
+      replay would make BOTH halves of step 1 unattended.
+
+NOT WORTH DOING: extending the identity/descriptor line (retired, section 14);
+RECOMP_MEM_WATCH (unusable, and it takes a fixed VA while CPlayer addresses
+move between runs); RECOMP_MEM_WATCH_MIRRORS (not a switch).
+
+### Are we leveraging xboxrecomp fully? Better, still no.
+
+Used for the first time today: RECOMP_FAKE_PAD (reaches gameplay with no
+human -- the biggest workflow win of the session), RECOMP_HEAP_POISON,
+RECOMP_PEEK.
+
+Still unused, and four of them aim straight at the current question:
+  RECOMP_TRIGGER_TRACE   scene/mode transition requests      <- step 2
+  RECOMP_EVENT_TRACE     signal/wait pairing                 <- step 4
+  RECOMP_DIALOG_SCAN     dialogue                            <- step 3
+  RECOMP_SCHED_TRACE     thread scheduling
+  RECOMP_TREE_TRACE      object-tree traversal
+  RECOMP_RESOURCE_TRACE / RECOMP_STARTUP_STATE / RECOMP_STARTUP_TRACE
+  RECOMP_KERNEL_WATCH / _ALL
+  RECOMP_ICALL_FEEDBACK  (and the memory note that its merge step is manual)
+  --trace-functions FILE with RECOMP_TRACE_ARGS / _BUDGET / _PROFILE
+                         -- still the proper version of the hand-rolled probe,
+                         but it needs a regeneration this tree warns about.
+
+The pattern worth naming: the runtime's SWITCHES have been used reasonably, the
+TRANSLATOR has not been used at all beyond hand-patching its output. And three
+of the unused switches (trigger/event/dialog) were written for exactly the kind
+of fault now in front of us.
+
+
+16. STEP 1 GAMEPLAY HALF DONE; FOUR SWITCHES UNBLOCKED
+-------------------------------------------------------
+### Why TRIGGER/TREE/RESOURCE/STARTUP had never been used
+
+`instrument_startup.py` refused to install ANYTHING: it asserts a per-site
+label count and **5 of its 84 sites had drifted** against this generated tree
+(`loc_0014F801` and `loc_0014FA19` want 2 found 1; `loc_001A2FBE`,
+`loc_001A25CA`, `loc_001A3A8E` want 1 found 0). One stale assert blocked four
+switches, which is very likely why they were recorded as "unexplored" rather
+than tried.
+
+Fixed with `--skip-mismatched`: each site is still validated individually, the
+79 that match are installed, and the 5 skipped are named. Not a loosening of the
+guarantee -- nothing is installed at a site that did not validate.
+
+    python3 diagnostics/jsrf_first_fault/instrument_startup.py --skip-mismatched
+    -> Installed 79 fixed observation sites in 7 generated files
+    -> Installed 107 unresolved-flag execution sites in 12 generated files
+    -> skipped 5 stale site(s): <named>
+
+### They work
+
+  RECOMP_TRIGGER_TRACE
+    [TRIGGER-WRITE] call=N root_call=0 pc=00012750 ret=0001DAE7
+                    object=005E3A70 root=00000000 arg=00000000
+    Repeated writes to the manager root's transient command field, all with
+    arg=0, from one site. In the tutorial this is where a scene/mode transition
+    request would appear -- and `+0x7EC4` never leaving 0 is exactly that shape.
+
+  RECOMP_DIALOG_SCAN
+    [DIALOG] scanning guest RAM for vtable 0x001CC660
+    [DIALOG] object 0x0006F244 [+0x98]="" -- 1 object
+    It finds the dialogue object by vtable and prints its string. Run this AT
+    THE CORN DIALOGUE: the text and the object's state are then directly
+    readable, which is the most direct probe yet of "A does not advance".
+
+  RECOMP_TREE_TRACE printed nothing in gameplay (sites may be among the five
+    skipped, or it is scene-gated). Untested rather than negative.
+
+### Step 1, gameplay half -- DONE (unattended)
+
+`render-investigation/cplayer_functions_gameplay.txt`: the 17 functions entered
+with a CPlayer `this` in settled gameplay (live=161), captured with
+`--ecxpair VA:0`, which records (`this`, vtable) so the class is identified
+without correlating against a dump:
+
+    00080340 000836F0 0008D040 0008E5A0 00091640 00091930 00092100 00098100
+    000982B0 0009A170 0009AA70 0009D030 0009E910 000A0260 000A0610 000A08B0
+    000A0F10
+
+**Absent even in gameplay: 00094AB0, 000606C0, 00060730, 000651E0, 00060930.**
+None of them ever takes a CPlayer `this`. That is independent confirmation that
+the +0xE54/+0xCE0 chain of section 2 was built on functions that never touch a
+CPlayer at all.
+
+RECOMP_SCHED_TRACE also works and looks healthy in gameplay: waits report
+`woken` climbing with `timed-out=0`.
+
+### What remains, and it needs one playthrough
+
+Run the SAME armed build at the Corn tutorial and diff:
+
+    comm -13 <tutorial set> <gameplay set>   -> present in gameplay, absent in
+                                                the tutorial = the suppressed path
+
+with RECOMP_DIALOG_SCAN=1 and RECOMP_TRIGGER_TRACE=1 in the same run, so the
+dialogue object's state and any transition request are captured at the same
+instant. That is one human run for three measurements.
+
+
+17. THE SUPPRESSED REGION: CPlayer +0x0000..+0x09F4
+----------------------------------------------------
+Measured 11 Sep, same build, same 10 s interval, two scenes.
+
+The tutorial run had progressed further than any before it: `+0x7EC4 = 1`
+(matching xemu's `snap_tutorial_terminal`), and the dialogue DID advance on A.
+So the tutorial is not stuck. **The characters still do not animate:**
+
+    tutorial  id 44 @ 03536B20  +0xCE0  0/16 dwords   object   8 dwords
+    tutorial  id 45 @ 03542D00  +0xCE0  0/16 dwords   object 137 dwords
+    gameplay  id 44..47         +0xCE0 16/16 dwords   object 319/1124/773/1579
+
+The tutorial figures (8, 137) reproduce the original Corn-dialogue reading
+(8, 136) exactly, in a different run and a later tutorial stage. The fault is
+stable and scene-scoped, and it is NOT the progression stall -- progression
+worked here and animation still did not.
+
+### Which regions move, per scene
+
+    move in GAMEPLAY, never in the tutorial : 1645 dwords, +0x0000..+0x09F4
+                                              (one near-contiguous sweep;
+                                               +0x0444..+0x09CC alone is 355)
+    move in BOTH                            :  139 dwords, all ABOVE +0xC94
+                                              (+0xC94, +0x11CC, +0x1248..,
+                                               +0x147C, +0x1628..)
+    move only in the tutorial               :    5 dwords
+
+So the tutorial updates only the object's HIGH region and never touches the low
+~2.5 KB. `+0x9E8` -- one of the two fields xemu writes per frame on both
+CPlayers -- sits inside the suppressed sweep, at its very top edge.
+
+**The target is therefore: what writes CPlayer +0x0000..+0x09F4 每 frame in
+gameplay and not in the tutorial?**
+
+### Candidates from the entry-set differential
+
+Entered with a CPlayer `this` in gameplay but NOT at the tutorial:
+
+    sub_00091640   sub_00091930   sub_00092100   sub_000A0610
+
+Nothing is entered in the tutorial that is not also entered in gameplay, so the
+tutorial path is a strict subset. Treat this list as SUGGESTIVE only: those four
+fire just 1-63 times in gameplay, so their absence over one window is weak
+evidence. Confirm with a longer tutorial window before acting.
+Three of the four (00091930, 00092100, 000A0610) were independently on the
+earlier "+0xE50 writers called with a CPlayer" shortlist, which is mild
+corroboration that they are per-character behaviour drivers.
+
+### Reproduction
+
+    python3 diagnostics/jsrf_first_fault/instrument_func_hit.py \
+        --va 00012580 --ecxpair 00080340:0 ... (see /tmp/anim_path.txt list)
+    RECOMP_FUNC_HIT_TRACE=1 RECOMP_DIALOG_SCAN=1 RECOMP_SEPARATE_RESERVE=0 ...
+    gameplay half: add RECOMP_FAKE_PAD=1 (no human)
+    tutorial half: real pad, and do NOT install instrument_startup.py -- its
+                   107 unresolved-flag sites take `polls` to ZERO (the guest
+                   never asks at all) and read exactly like a dead controller.
+
+
+18. PLAN, REVISED 11 Sep AFTER THE REGION FINDING
+--------------------------------------------------
+State: two SEPARATE faults are now distinguished.
+  A. Animation suppressed in the tutorial -- STABLE, reproduced across runs
+     and tutorial stages (8/137 dwords vs 16/16 in gameplay).
+  B. Tutorial progression stalling (+0x7EC4 stuck at 0) -- INTERMITTENT; it
+     did NOT occur in the last run, and animation was still dead. Do not
+     conflate them.
+
+### Why the current candidate list is insufficient
+
+The four tutorial-absent functions write only ~14 distinct offsets between them
+(0x118-0x134, 0x1A4, 0x9D0, 0x9DC). The suppressed sweep is **1645 dwords**.
+They cannot explain it.
+
+And static store analysis cannot find the real writer: a 355-dword contiguous
+block (+0x0444..+0x09CC) is a block copy or an indexed loop, not the
+`mov [reg+disp]` form a disassembly grep matches. **Do not spend more time
+grepping for stores.** The writer has to be found at runtime.
+
+### STEP 1 (decisive) -- the oracle at the same point
+Two GDB reads 10 s apart on xemu's CPlayers AT THE CORN TUTORIAL, then diff the
+changed-offset regions exactly as section 17 does for the recomp.
+  * xemu writes +0x0000..+0x09F4 there -> confirms the low region is what we
+    fail to write, in the oracle, at the same scene. The comparison stops being
+    "our gameplay vs our tutorial" and becomes a true differential.
+  * xemu does NOT write it -> the low sweep is a gameplay-only behaviour and
+    section 17's framing is wrong; go back to +0xCE0 alone.
+Cost: xemu with `-s` plus one playthrough. Use xemu_rsp.py. This is the highest
+value measurement available and it has never been taken.
+
+### STEP 2 -- widen the entry differential
+The armed set (23 sites) was chosen before the region was known and is too
+narrow. Arm several hundred sites -- affordable now the probe is O(1), proven
+at 113 -- covering the functions that plausibly touch a CPlayer per frame, and
+re-run both halves. The writer of a 1645-dword sweep is NOT in the current set.
+Gameplay half is unattended (RECOMP_FAKE_PAD); tutorial half needs one run.
+Remember: do NOT install instrument_startup.py for the tutorial half.
+
+### STEP 3 -- infrastructure, to stop paying a playthrough per experiment
+  (a) xemu save states: `-monitor unix:/tmp/xemu-mon,server,nowait` +
+      savevm/loadvm. Makes STEP 1 repeatable in seconds.
+  (b) Scripted pad input for the recomp, so the tutorial half of STEP 2 needs
+      no human either. RECOMP_FAKE_PAD reaches gameplay but cannot steer.
+Roughly twenty playthroughs have been spent across this investigation.
+
+### STEP 4 -- fault B, separately
++0x7EC4 stuck at 0, and the pad-poll stall. Both intermittent, both distinct
+from fault A. RECOMP_TRIGGER_TRACE is installed and working for the first one
+(watch the root transient command writes at pc=00012750), but it rides on
+instrument_startup.py, which cannot be used in a run that needs input. Resolve
+that conflict before attacking B -- e.g. install only the trigger sites.
+
+### Not worth doing
+More static store grepping (per above); the identity/descriptor line (retired);
+RECOMP_MEM_WATCH (unusable, fixed VA); mid-function loc_ probes (wedge the
+guest); the four-candidate list as a target in itself.
+
+
+19. SECTION 17 CORRECTED -- THE REAL DIFFERENTIAL, LIKE FOR LIKE
+------------------------------------------------------------------
+The oracle measurement of STEP 1 was taken (xemu_region_delta.py, new) and it
+**overturned section 17**, exactly as that step was designed to be able to.
+
+    xemu at the Corn tutorial, 10 s:
+      CPlayer 44:   2 dwords changed,  +0xCE0  0/16,  low region 0
+      CPlayer 45: 449 dwords changed,  +0xCE0 16/16,  low region 1 (just +0x9E8)
+
+**xemu does NOT write +0x0000..+0x09F4 at the tutorial either.** That sweep is
+gameplay-only behaviour in both implementations, so "the suppressed low 2.5 KB"
+was an artefact of comparing our gameplay against our tutorial. Section 17's
+target was wrong. Compare like with like: same scene, both sides.
+
+**And id 44 is near-static in xemu too** (2 dwords, against our 8). So id 44 is
+not the animating character; **id 45 is**. Any framing built on "both CPlayers
+are frozen" was wrong about half its subject.
+
+### The actual divergence, CPlayer 45, tutorial, 10 s
+
+    xemu 449 dwords | recomp 137 dwords | shared 119
+
+    IN XEMU, NOT IN THE RECOMP -- 330 dwords, structured:
+      +0x09E8                     1
+      +0x0CE0..+0x0DE4           66      <- the transform block; FOUR TIMES the
+                                            16 dwords previously measured
+      +0x0E80                     1
+      +0x11D4..+0x120C      4 x 3        <- 3-dword groups = vectors
+      +0x12C0..+0x140C      4 x 15
+      +0x1484..+0x14D4      5+ x 3
+
+    IN THE RECOMP, NOT IN XEMU -- 18 dwords: +0x1C44..+0x1C64, +0x1CA0..+0x1CC0
+    IN BOTH -- 119 dwords: +0xC94, +0x11CC, +0x147C, +0x1628.. upward
+
+A large matrix block plus many 3-float vector groups is the shape of SKELETAL
+ANIMATION -- bone matrices and per-bone transforms. The recomp drives the
+shared 119 dwords (whatever that is: state, timers, the +0x1628 block) but
+never produces the 330.
+
+### Why this is the right target now
+
+It is a single object (id 45), a single scene, both sides measured with the same
+tool over the same interval, and the difference is 330 specific dwords in
+identifiable structures rather than "animation does not work". The earlier
++0xCE0 16-dword figure was a windowing artefact: the real block is +0xCE0..
++0xDE4, 66 dwords.
+
+### Next
+
+  1. Widen the recomp-side window to +0x2000 and confirm the 330 are absent over
+     a longer interval, not merely slower.
+  2. Find what writes +0xCE0..+0xDE4 on id 45 in xemu. Static grep is useless
+     for a 66-dword block (block copy / indexed loop), and xemu's GDB
+     watchpoints do not trap these writes (proven with a positive control).
+     So: widen the O(1) entry differential (STEP 2) and look for a function
+     entered with id 45's `this` in xemu-like conditions but not ours -- or
+     bracket it by arming every function that the shared-119 writer calls.
+  3. Re-check whether id 44 SHOULD animate at all. If xemu leaves it near-static
+     at this dialogue, "Corn is still" may be correct behaviour for that object,
+     and the whole user-visible symptom may be about id 45 alone.
+
+
+20. ID 44 IS STATIC BY DESIGN. THE FAULT IS ONE OBJECT: ID 45.
+---------------------------------------------------------------
+A 30 s xemu sample at the Corn dialogue (against the 10 s one):
+
+    CPlayer 44:   2 dwords changed in 30 s -- the SAME two as in 10 s
+                  (+0x0C94, +0x134C). +0xCE0 0/16.
+    CPlayer 45: 506 dwords in 30 s, same structure as in 10 s.
+
+**xemu's id 44 does not animate at this dialogue.** It is static by design, and
+our id 44 (8 dwords) is therefore NOT divergent. Corn is **id 45**.
+
+So the entire user-visible fault reduces to: **CPlayer id 45 is missing 330
+dwords of structured animation writes per interval** -- the +0xCE0..+0xDE4
+66-dword block, four 15-dword groups at +0x12C0..+0x140C, and a series of
+3-dword vector groups. Everything else about both objects matches in kind.
+
+Note the offsets touched by id 45 SATURATE quickly: the 10 s and 30 s samples
+name the same runs with the same counts. So this is a fixed working set written
+every frame, not a slowly growing one -- which means a recomp-side longer window
+will not reveal "slower", only "absent". That check is now cheap and conclusive.
+
+### What this retires
+
+  * "Both CPlayers are frozen" -- half of it was correct behaviour.
+  * Anything measured on id 44 as evidence of the fault, including the 8-vs-2
+    dword comparison and the +0x11C / +0xE50 / +0xE58 readings taken on it.
+  * The +0x0000..+0x09F4 region (section 17, already corrected).
+
+### The remaining question, stated exactly
+
+What writes CPlayer id 45's +0xCE0..+0xDE4 (66 dwords), +0x12C0..+0x140C
+(4 x 15) and the 3-dword vector groups every frame, in xemu at the Corn
+dialogue and in our own GAMEPLAY, but not in our tutorial?
+
+Constraints on answering it, all established:
+  * static grep cannot see it (block copy / indexed loop, not mov [reg+disp]);
+  * xemu GDB write watchpoints do not trap these writes (positive control:
+    the block changed 16 dwords in 5 s while an armed Z2 never fired);
+  * RECOMP_MEM_WATCH cannot run (SIGSEGV at t=5 s, A/B proven) and takes a
+    fixed VA while CPlayer addresses move between runs;
+  * the 23-site entry differential did not contain the writer.
+
+So: widen the O(1) entry differential substantially (it is proven at 113 sites
+and is O(1) per call), comparing our GAMEPLAY against our TUTORIAL for id 45
+specifically -- gameplay writes the block, the tutorial does not, and both are
+the same binary, so the function that appears in one and not the other is the
+target. The gameplay half needs no human.
+
+
+21. THE VIDEO'S MECHANISM, AND WHAT IT REFRAMES
+------------------------------------------------
+Source: Video Notes/nJWHf-uUIBU.{srt,_slides.md} -- the JSRF-Decompilation
+author's own walkthrough of the exec phase. Two passages matter.
+
+  "with three methods, exec, postexec, and draw, for each of the five modes,
+   there's a total of 15 virtual methods on the game object class. The modes
+   are controlled by booleans on the game class, and while multiple modes can
+   be set at once, only one actually has its methods run that frame, in
+   accordance with some precedence rules."
+
+  "...making everything stop during freeze cam moments, because most objects
+   don't do anything in their freeze cam exec methods, SO THE PLAYER
+   CHARACTER'S POSITION AND ANIMATION WON'T GET UPDATED, for example."
+
+The second sentence describes our exact symptom, and the five modes are
+coveredPause > Event (a cutscene, "called an event internally") > FreezeCam >
+UncoveredPause > Default. The Corn tutorial is a cutscene.
+
+### Tested, and the simple form is FALSE
+
+CActMan +0x30..+0x9C, xemu vs recomp, both at the Corn dialogue
+(`snap_corn_talk.bin` against `mgr_1.bin`):
+
+  * the mode booleans +0x38..+0x48 are **all zero and identical on both sides**
+  * `+0x94 m_DrawMode` 0 on both, `+0x74 m_bSkipDraw` 0 on both
+  * the only differences are frame counters (+0x7C 0x3C vs 0x16, +0x84 0x8EEE
+    vs 0x8EF0, +0x88 0x65 vs 0x66) and +0x98, the id-array base (different heap)
+
+So both sides are in **Default** mode and the flags are not divergent. This
+independently reconfirms the earlier session's "the Corn cutscene reads ALL
+ZERO, identical to normal gameplay".
+
+### What it reframes -- the right next measurement
+
+The flags being equal does NOT mean the same virtual method runs. The
+precedence rules select ONE of the 15 slots, and an earlier handover already
+recorded the draw-side shape: "the object vtable dispatch uses +24/+18/+30/+3C/
++0C according to manager +40/+44/+48/+4C, in that precedence". If our
+*selection* lands on a different slot despite identical flags -- a dispatch
+index bug rather than a state bug -- the object would be walked, would pass
+every filter, and would run a method that does nothing. That is consistent with
+EVERY measurement so far: identical object state, identical draw lists,
+identical flags, and no animation.
+
+**So: instrument the exec dispatch and record WHICH virtual slot is invoked on
+CPlayer id 45 per frame, in the tutorial versus in gameplay.** Same binary, one
+object, and the answer is a small integer. If the slot differs between the two
+scenes while the mode flags are identical, the precedence computation is the
+bug. If the slot is the same, mode selection is exonerated entirely and the
+difference is inside the method.
+
+This is a better-posed question than the 545-site entry differential, and it
+supersedes it: the entry differential asks "which function stopped being
+called", this asks "which function was called instead", which is the same
+information with a hundredth of the noise.
+
+
+22. EXEC-MODE MEASUREMENT (partial) AND THE STALL AS THE BINDING CONSTRAINT
+----------------------------------------------------------------------------
+The five mode walkers are NAMED in the decompilation's symboltable.tsv, so the
+active mode can be counted directly instead of inferred from flags:
+
+    0x00011070 CActBase::recursiveExec0Default
+    0x000112A0 CActBase::recursiveExec0Event
+    0x000114D0 CActBase::recursiveExec0CoveredPause
+    0x00011700 CActBase::recursiveExec0FreezeCam
+    0x00011930 CActBase::recursiveExec0UncoveredPause
+    0x00011D00..0x00011F80  the recursiveExec1* (postexec) set
+    0x000123E0 CActMan::ActionExec (the driver)
+
+### Measured
+
+  GAMEPLAY:   Exec0Default 33916, Exec1Default 33917, ActionExec 3028
+              **every other walker: never called**
+  NEW GAME MENU: Exec0Default 10020, Exec1Default 10000, others never called
+
+So Default mode runs exclusively in both, and flags -> walker correspondence is
+confirmed (the flags were all zero in both).
+
+### The tutorial half is STILL UNMEASURED
+
+Three consecutive real-pad runs were lost to the poll stall. Strong inference,
+NOT measurement: the CActMan mode booleans at the Corn tutorial are all zero and
+byte-identical to xemu (section 21), and all-zero demonstrably selects Default
+in two other scenes -- so the tutorial almost certainly runs Default too, which
+would EXONERATE mode selection entirely and place the fault inside the Default
+exec method for CPlayer id 45. **Confirm it before relying on it.**
+
+### The stall is now the binding constraint
+
+Rate, correctly filtered: most "stalled" rows in a naive survey are FAKE_PAD
+runs, where the real poll counter legitimately does not climb because the fake
+pad substitutes. Among REAL-pad runs it is roughly **4 failures in 14**, and it
+landed on three in a row here.
+
+Its user-visible effect is exactly "the game stops responding": the guest ceases
+calling the pad read, so the menu or tutorial ignores input. That is why a run
+looks like a dead controller.
+
+**Sampled live while stalled** (new evidence): the guest is NOT spinning in a
+tight loop and is NOT blocked. It runs the whole frame loop -- `recursiveExec0Default`
+(0x00011070) appears in the sample -- while never reaching the pad read. Hot
+frames: `sub_0013B180` (hottest, unnamed), `XapiThreadStartup` (0x00147EBB),
+and a spread across 0x0019xxxx-0x001Axxxx (XDK/CRT, unnamed in the decomp).
+This refines the older note that it "spins in guest code": it does not spin, it
+simply stops taking the branch that polls.
+
+Next for the stall: `xbox_InputGetState` (src/input/xinput_device.c:301) is the
+host function that increments the counter. Record the GUEST RETURN ADDRESS on
+every call; when the count flatlines, the last caller is known, and its callers
+can then be armed with the O(1) probe to find which one stopped running. That
+is a small, targeted change and it is the first approach that does not depend
+on RECOMP_MEM_WATCH (unusable) or on catching the stall by luck.
+
+
+23. THE PAD-POLL STALL: MECHANISM FOUND AND A FIX UNDER TEST
+--------------------------------------------------------------
+### It reproduces WITHOUT a human -- the key that unlocked it
+
+`RECOMP_FAKE_PAD` does NOT bypass the USB path. `g_pad_polls++` is at
+`xinput_device.c:305`, and the fake-pad branch is at :307, i.e. AFTER the
+counter. The counter is reached only from `usb_gamepad_report()`
+(`src/usb/usb_gamepad.c:168`), which runs when the guest requests a report over
+USB. **So flat `polls` in a FAKE_PAD run is the same stall**, not an artefact.
+Six such rows were dismissed as "expected" earlier in this session; that was
+wrong, and correcting it made the bug reproducible on demand for the first time
+in five sessions. It reproduced unattended on the first attempt (flat at 957).
+
+### The mechanism
+
+With `RECOMP_OHCI_TRACE`, at the stall:
+
+    OHCI register writes stop dead at log line 1702; the stall begins at 1909;
+    the log runs to 11389 with NO further OHCI write of any kind.
+
+The last writes are a truncated service cycle:
+
+    #397 HcCommandStatus    <= 0x00000006   ControlListFilled|BulkListFilled
+    #398 HcInterruptEnable  <= 0x80000000   MIE on
+    #399 HcInterruptDisable <= 0x80000000   MIE off
+    #400 HcInterruptStatus  <= 0x00000002   ack WritebackDoneHead
+         ... nothing, ever again
+
+**`ohci_raise()` was edge triggered.** It sets the status bit and then returns
+early when `!(enable & INTR_MIE)` -- without calling the ISR. `case
+HcInterruptEnable:` merely OR'd the mask and returned, re-evaluating nothing.
+Real OHCI is LEVEL triggered: a pending status bit re-asserts the line the
+moment the driver unmasks it.
+
+So: the driver masks MIE for the length of its ISR; a transfer completes inside
+that window; WDH is recorded but never delivered; the driver unmasks and waits
+for an interrupt that has already happened; it never refills the schedule; the
+gamepad's interrupt endpoint is never polled again. Intermittent precisely
+because it needs a completion to land inside the mask window.
+
+### The fix (src/usb/ohci.c)
+
+`ohci_deliver_pending()` -- deliver any interrupt that is pending AND now
+unmasked -- called from the `HcInterruptEnable` write (the mask just changed)
+and from the `HcInterruptStatus` ack (a second source may have arrived while
+the first was being serviced). Kept separate from `ohci_raise()` because the
+triggers differ; neither may call the ISR while MIE is clear.
+
+### THE FIX IS NOT CONFIRMED -- three runs, one pass, two failures
+
+    baseline (no fix):        flat at polls=957 after 4 reports
+    run 1, both paths hooked: polls 3632 -> 9825 over 8 reports, no stall
+    run 2, both paths hooked: polls=0 for the WHOLE run -- never polled
+    run 3, unmask path only:  climbed to 3117 then FLATLINED (stalled later,
+                              not eliminated)
+
+**So the fix does not reliably remove the stall.** Run 2's total failure was
+plausibly self-inflicted: `ohci_deliver_pending()` was also called from the
+`HcInterruptStatus` ack, and that write happens INSIDE the driver's ISR, so it
+re-entered the ISR. That call has been removed; only the `HcInterruptEnable`
+(unmask) trigger remains, which is the one the trace actually justifies.
+Run 3 still stalled, so either there is a second cause or the level-triggered
+delivery is implemented incompletely.
+
+Beware a crude pass/fail test: comparing only first vs last poll count called
+run 3 "OK" when its last three reports were identical. **Check the TAIL for a
+flatline, not the endpoints.**
+
+Note also that `grep -c OHCI-W` reads 400 in both stalled and healthy runs --
+that is a trace cap, not a signal; do not use it as one.
+
+### What is still solid, regardless of the fix
+
+  * The stall reproduces UNATTENDED under RECOMP_FAKE_PAD (the counter sits
+    before the fake-pad branch, so the fake pad does not bypass the USB path).
+    That alone converts this from a bug caught by luck into one that can be
+    iterated on, and it is the most useful thing learned about it in five
+    sessions.
+  * At the stall the guest stops writing OHCI registers ENTIRELY, mid service
+    cycle, after an ack with MIE masked -- and never writes another.
+  * `ohci_raise()` genuinely is edge triggered and genuinely drops interrupts
+    raised while masked; real OHCI is level triggered. That is a real defect
+    whether or not it is THE defect here.
+
+### Next for the stall
+
+Instrument rather than patch: log every ohci_raise() that returns early because
+the source was masked, with the source bits and the current mask. If the stall
+is preceded by a dropped WDH, the mechanism is confirmed and the fix is merely
+wrong in its details. If no raise is dropped before the stall, the level-trigger
+theory is dead and the guest is stopping for another reason.
+
+
+24. THE STALL: BOTH INTERRUPT THEORIES DEAD, AND WHY
+-----------------------------------------------------
+Instrumented rather than patched further (`RECOMP_OHCI_DROP_TRACE`, opt-in,
+read-only, in `ohci_raise`): a counter for raises that reach no ISR, and -- the
+part that mattered -- a POSITIVE CONTROL counting raises that do.
+
+    stalled run (polls flat at 1767):  OHCI-RAISE 0   OHCI-DROP 0
+    healthy run (polls -> 14329, reached gameplay):  OHCI-RAISE 0   OHCI-DROP 0
+
+**`ohci_raise()` is never called at all, in healthy and stalled runs alike.**
+No interrupt is ever dropped because none is ever raised. The positive control
+is what makes that readable: without it, "0 drops" would have been filed as
+"no masking race", which is the opposite of the truth.
+
+Dead as a result:
+  * the level-trigger theory (nothing is dropped);
+  * the worker-exit theory -- the "delivered 200 times ... stopping" guard has
+    never fired in any run, and no `[OHCI0]` message appears at all, including
+    the "operational ... device arriving on port 1" line. The interrupt worker
+    never reaches the operational state in ANY run, healthy or not.
+
+So the gamepad is polled entirely through the guest kicking the schedule
+itself (`usb_gamepad_report` at ohci.c:427, reached from TD processing), and
+the interrupt path is unused end to end. **The stall is the guest ceasing to
+drive the schedule, not a missed interrupt.**
+
+The level-triggered delivery was written, tested and then REVERTED: it did not
+fix the stall, one run carrying it never polled at all, and the measurement
+above shows it addresses a path that never executes. What remains in the file
+is the opt-in tracing only (+83 lines, no behavioural change). Re-adding
+level-triggered delivery would be defensible correctness work, but it must not
+be described as a fix for this.
+
+### Where the stall investigation actually got to
+
+  * It REPRODUCES UNATTENDED under RECOMP_FAKE_PAD -- the counter sits before
+    the fake-pad branch, so the fake pad does not bypass the USB path. This is
+    the single most useful thing learned about it in five sessions: it is now
+    iterable without a human, at roughly a 50% hit rate per run.
+  * At the stall the guest stops writing OHCI registers entirely, mid service
+    cycle, and never writes another.
+  * A live sample shows the guest still running its whole frame loop
+    (recursiveExec0Default appears) -- it is not spinning and not blocked, it
+    simply stops taking the branch that drives USB.
+
+### Next for the stall
+
+The question is now guest-side: what stops calling the USB service path? Since
+it reproduces unattended, arm the O(1) probe on the guest functions around the
+last OHCI register write and bisect upward -- the same differential method that
+worked for the animation thread, now affordable because no human is needed per
+iteration.
+
+
+25. PLAN (11 Sep, after both interrupt theories died)
+------------------------------------------------------
+Two independent faults remain. **Do the stall first** -- not because it is more
+important, but because it is now the only one that can be iterated without a
+human, and it is what costs a tutorial run its value.
+
+## THREAD B -- the pad-poll stall (unattended, do this first)
+
+  B1. PUT A GUEST PC ON THE OHCI REGISTER TRACE.
+      `[OHCI-W]` already logs every register write. The MMIO handler runs on
+      the guest thread, so the guest PC / return address is available there.
+      Add it. At the stall the LAST write then names the exact guest code that
+      was driving USB, instead of only naming the register.
+      One line of instrumentation; reproduces unattended at ~50% per run.
+
+  B2. BISECT UPWARD FROM THAT PC with the O(1) probe.
+      Arm the containing function and its callers with `--ecxpair VA:0`,
+      reproduce, and find which one stops being entered. This is the same
+      differential that worked on the animation thread, and it is affordable
+      now only because no human is needed per iteration.
+
+  B3. Compare the answer against xemu's behaviour at the same moment if it is
+      still ambiguous. xemu drives the same guest driver, so "which function
+      stops" has a ground truth.
+
+  What NOT to do: anything in the interrupt path. `ohci_raise()` is never
+  called in healthy or stalled runs (section 24), the worker never reaches
+  operational in either, and the level-triggered change was tried and reverted.
+
+## THREAD A -- id 45's missing animation writes (needs a human per run)
+
+  A1. CONFIRM THE TUTORIAL RUNS Exec0Default. Gameplay and the new-game menu
+      both run Default exclusively (33916 / 10020 calls, every other walker
+      zero). The tutorial's mode booleans are byte-identical to xemu's and
+      all-zero, which selects Default elsewhere -- so this is strong inference
+      but NOT measured. One run with the twelve exec-mode counters settles it.
+      If Default runs, mode selection is exonerated and the fault is inside the
+      Default exec method for id 45.
+
+  A2. FIND THE WRITER of id 45's +0xCE0..+0xDE4 (66 dwords), +0x12C0..+0x140C
+      (4 x 15) and the 3-dword vector groups. Constraints already established:
+      static grep cannot see it (block copy / indexed loop); xemu watchpoints
+      do not trap it; RECOMP_MEM_WATCH cannot run. So: the widened O(1) entry
+      differential, gameplay vs tutorial, same binary, filtered to calls whose
+      `this` is id 45. The 545-site band 0x90000-0xAFFFF is already installed
+      and its gameplay half is captured
+      (`render-investigation/cplayer_functions_gameplay.txt`, 176 of 550 ran).
+      Only the tutorial half is missing.
+
+  A3. Do NOT chase: id 44 (static by design in xemu too), +0x11C (a mutable
+      state index, not identity), the descriptor path, +0xE54, the low 2.5 KB
+      region, or the four-candidate setter shortlist. All measured dead.
+
+## THREAD C -- infrastructure, if either thread drags
+
+  xemu save states (`-monitor unix:/tmp/xemu-mon,server,nowait` + savevm/loadvm)
+  and scripted pad input. Around twenty playthroughs have gone into this
+  investigation; A1 and A2 each cost one, and B now costs none.
+
+## Sequencing
+
+  B1+B2 unattended -> if the stall is fixed, A1 and A2 become reliable, and
+  they are then two runs rather than two runs plus however many the stall eats.
+
+
+26. THE "PAD-POLL STALL" IS THE GAME BEING PAUSED
+---------------------------------------------------
+Caught by SAMPLING, not instrumentation -- necessarily, because the probe set
+needed to observe the stall is heavy enough to precipitate it (1118 sites froze
+it at 30 polls, 578 sites at 253; the same build with no probes ran to 8790).
+A sampling profiler has no per-call cost, so it is the only unperturbed
+observer available for this bug.
+
+One run, two samples, zero instrumentation:
+
+    healthy (polls=1166): sub_00011070 and sub_00011D00 present
+    stalled (polls=8790): both ABSENT; sub_000114D0 present, 13 samples
+
+From the decompilation's symbol table:
+
+    0x00011070  CActBase::recursiveExec0Default        <- healthy only
+    0x00011D00  CActBase::recursiveExec1Default        <- healthy only
+    0x000114D0  CActBase::recursiveExec0CoveredPause   <- STALLED only
+
+Read live from the stalled process:
+
+    CActMan +0x3C = 1      +0x40 = 1
+
+and an earlier handover already recorded "Pause sets +0x3C and +0x40 to 1".
+
+**So the guest is in COVERED PAUSE.** It is not stalled, not deadlocked and not
+missing an interrupt: it is paused, and in covered-pause mode most objects do
+nothing by design -- which is exactly why the pad stops being polled, the
+characters stop moving and the title looks hung. The video says this outright:
+"making everything stop ... so the player character's position and animation
+won't get updated".
+
+### The unattended reproduction was self-inflicted
+
+`RECOMP_FAKE_PAD` "pulses A and START for 150 ms once a second"
+(src/input/xinput_device.c, its own comment). **START opens the pause menu.**
+So every FAKE_PAD run that "stalled" was the fake pad pausing the game, and the
+delighted claim in section 23 that the stall "reproduces unattended" is wrong:
+what reproduces unattended is a synthetic START press.
+
+This invalidates, as evidence about the stall:
+  * "it reproduces unattended at ~50% per run" (section 23/24) -- that was
+    START being pressed, not a bug;
+  * the FAKE_PAD rows in the poll-rate survey (section 22) -- already flagged
+    as suspect there for the wrong reason;
+  * "OHCI-RAISE 0 in healthy AND stalled runs" remains TRUE and still kills the
+    interrupt theories, but the "stalled" run in that comparison was a paused
+    run, so it says less than it appeared to.
+
+### What is still genuinely open
+
+Whether the REAL-pad stalls are the same thing. Four of ~14 real-pad runs
+flatlined, and the user was not knowingly pausing. Two possibilities:
+  a) a stray START reaches the guest (a controller mapping or a spurious USB
+     report) -- check `+0x3C`/`+0x40` the moment a real-pad run flatlines;
+  b) something else sets the pause booleans.
+Either way the question is now "what sets +0x3C/+0x40", not "what breaks USB".
+
+### Method note, fourth occurrence
+
+An unattended reproduction that is produced BY the harness is not a
+reproduction of the bug. The fake pad's own comment said it presses START; that
+was read in section 11 and its consequence not followed through.
+
+
+27. TWO PHENOMENA, NOW SEPARABLE IN ONE LINE
+----------------------------------------------
+Two harness changes, both small, both aimed at never repeating section 26's
+misdiagnosis.
+
+  A1  `RECOMP_FAKE_PAD=a` (or `=noStart`) presses A WITHOUT START.
+      The default is unchanged (A+START) so older notes still apply. START
+      opens the pause menu, so any unattended run that must keep running needs
+      this form. src/input/xinput_device.c.
+
+  A2  `[JSRF-PAUSE] +3C=.. +40=..` printed every report, with an explicit
+      "<== PAUSED (covered pause)" when both are set.
+      diagnostics/jsrf_first_fault/main.c.
+
+### And they immediately separated two different failures
+
+First run with `RECOMP_FAKE_PAD=a`:
+
+    polls = 0 for the whole run   -- the guest never requested a USB report
+    +3C = 0, +40 = 0              -- NOT paused
+    scene reached live=141        -- a scene loaded regardless
+
+So there are at least TWO things that have been reported as "controller not
+working", and they are now distinguishable at a glance:
+
+  (1) PAUSE. `polls` stops climbing, +3C/+40 = 1, recursiveExec0CoveredPause
+      runs instead of Default. Caused by a START press -- synthetic in every
+      FAKE_PAD run to date. **Not a bug.**
+
+  (2) polls = 0. The guest never polls at all and is NOT paused. A genuine
+      defect, and the one worth chasing. Note the title still advances through
+      menus and loads a scene without any input, which is why it can look like
+      it is "working" while ignoring the pad entirely.
+
+Every prior "stall" observation in this document needs re-reading against that
+split. The real-pad flatlines (4 of ~14) were never checked for pause state and
+could be either.
+
+### Next
+
+  * Re-run the real-pad case with A2 live: one look at [JSRF-PAUSE] when it
+    flatlines says which of (1) or (2) it is. No new tooling.
+  * For (2): the guest reaches a scene without ever polling, so the question is
+    what normally starts the poll loop and why it never starts. Sampling is the
+    right observer (the probe set needed to watch it precipitates failures --
+    1118 sites froze a run at 30 polls, 578 at 253, zero probes ran to 8790).
+  * The animation thread (id 45's missing +0xCE0 writes) is untouched by any of
+    this and remains the actual objective.
+
+
+28. THE GENUINE INPUT BUG, ISOLATED AND REPRODUCIBLE UNATTENDED
+----------------------------------------------------------------
+### The fake pad now boots the game without pausing it
+
+The game needs START to get past "Press Start" and through the menus, so a pad
+that never sends START cannot reach gameplay at all -- `RECOMP_FAKE_PAD=a` is
+useless for that and the first attempt at a fix was wrong. START is also the
+PAUSE button. Resolved by making it a time window:
+
+    RECOMP_FAKE_PAD=1        START for the first 90 s, then A only   [default]
+    RECOMP_FAKE_PAD=<n>      as above with an n-second window
+    RECOMP_FAKE_PAD=a        never send START
+    RECOMP_FAKE_PAD=always   old behaviour -- always START, and it WILL pause
+
+The chosen mode is announced at startup (`[PAD] fake pad: ...`).
+
+### With that, the real bug reproduces unattended and is unambiguous
+
+    [PAD] fake pad: START for the opening window only
+    polls climbed to 1220   -- so START worked and the game started
+    then flat at 1220 for five reports
+    [JSRF-PAUSE] +3C=00000000 +40=00000000   -- NOT paused
+    scene live=145
+
+Sampled at that moment (no instrumentation, so no perturbation):
+
+    recursiveExec0Default  15 samples   } running normally
+    recursiveExec1Default  12 samples   }
+    Event / CoveredPause / FreezeCam / UncoveredPause   0 samples
+
+**So the guest is in Default mode, executing its frame loop, and simply stops
+requesting USB reports.** Not paused, not deadlocked, not in a cutscene mode.
+
+Top guest frames at the stall:
+
+    sub_0005E9B0 55   sub_00191440 48   sub_000B3E10 46   sub_001993A0 45
+    sub_000163D0 26   sub_00159650 24   sub_00191530 21   sub_00047690 20
+
+`sub_000163D0` matches the frame recorded in
+[[jsrf-corn-tutorial-input-poll-stall]] from an earlier session, so this is the
+same long-standing bug, now with a clean unattended reproduction and the pause
+confound removed.
+
+### Next
+
+Take a HEALTHY sample and a STALLED sample in the same run (the sampler script
+does this) and diff the frame sets, exactly as section 26 did -- but now the
+"stalled" side is the genuine bug rather than a paused game. The frames present
+when healthy and absent when stalled are the poll path that stops. Sampling is
+mandatory here: 1118 probe sites froze a run at 30 polls, 578 at 253, and zero
+probes ran to 8790.
