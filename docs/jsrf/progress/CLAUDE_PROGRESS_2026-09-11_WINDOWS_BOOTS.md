@@ -52,6 +52,55 @@ Worth checking first, in order:
    magnitude lower and much shorter, which may mean a different buffer entirely.
 3. Whether the 24 unhandled methods are the same 24 macOS handles early.
 
+## What the pusher lead turned into (measured, same evening)
+
+Followed it. The chain below is consistent and ties to Codex's D3D boundary,
+but the last link is NOT established -- see the caveat.
+
+FROZEN, NOT SLOW. The Windows pusher line is byte-identical across all 281
+reports of a ~41 minute run:
+
+    runs=14 dwords=15360 methods=24 unhandled=24 bad_headers=1
+    put=0x800109A4 limit=0x8001872C idx put=63 get=59
+
+macOS advances every report (put 0x805D4304 -> 0x80595234, runs 937 -> 1964,
+bad_headers=0). So this is not a slower GPU, it is a ring that stopped.
+
+THE RING IS IN THE WRONG PLACE. The contiguous window at 0x80000000 aliases
+physical RAM, so Windows' put resolves to physical 0x000109A4 -- inside the XBE
+IMAGE, which loads at 0x00010000. macOS's resolves to 0x005D1050, in the heap
+(0x00510000-0x04000000) where a pushbuffer belongs. put/limit are read from the
+guest's own device fields, so 0x800109A4 is what the GUEST believes its
+pushbuffer is, not something the harness invented.
+
+WHAT THE PARSER SAW. The 24 "methods" are a contiguous ascending run --
+0x1F38, 0x1F3C, 0x1F40 ... 0x1F84, each exactly once. That is what an
+increasing-method command with a large count looks like when the count and
+method come from data rather than a real header: the parser walks sequential
+dwords, emits 24 bogus methods, then hits something that decodes as neither
+method form and stops (bad_headers has one producer, nv2a_pusher.c ~158).
+
+WHY THE GUEST THEN WAITS. GET freezes 4 behind PUT (idx put=63 get=59). Codex
+independently found the guest's last instrumented entry is sub_001910E0, which
+it described as computing a distance from device and push-buffer fields -- that
+is PUT minus GET. A guest asking "how much ring space is free", against a GET
+our pusher will never advance because it stopped on a bad header, waits
+forever.
+
+CAVEAT, and it matters: a frozen pusher is ALSO what you would see if the guest
+had stalled first for an unrelated reason and simply stopped submitting. The
+ordering has not been established. What argues for cause over consequence is
+bad_headers=1 and the ring's location, neither of which a merely-idle guest
+explains. What would settle it: whether PUT ever held a sane heap address on
+Windows before 0x800109A4, i.e. whether the guest allocated a pushbuffer at all
+or was handed that value from the start.
+
+A RED HERRING, recorded so it is not re-run: xbox_MmAllocateContiguousMemory
+returns VirtualAlloc(NULL,...), a HOST pointer rather than a guest VA in the
+contiguous window -- which looks like the bug until you check win32_compat.c,
+where the POSIX VirtualAlloc is also a plain mmap returning a host address. The
+two hosts do the same wrong-looking thing, so it is not the divergence.
+
 ## Standing traps, all paid for today
 
 - An ordered divergence is a CEILING on where the fault is, never a location,
