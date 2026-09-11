@@ -1,0 +1,117 @@
+JSRF HANDOVER -- THE WINDOWS CRASH, ROOT-CAUSED
+Date: 2026-09-11 (Europe/London), late night
+From: Claude.
+
+Supersedes the Windows sections of JSRF_PLAN_2026-09-11_WINDOWS_GRAPHICS.md,
+which is retracted at the top of its own file, and every account of the
+0xFFFFFF00 crash written earlier today.
+
+
+0. THE ONE-LINE VERSION
+=======================
+0xFFFFFF00 is a cleared Z24S8 depth pixel. Our own NV2A executor was painting
+1.2 MB of it over the title's .data on every clear, because the depth surface
+resolves to guest 0x00248000 -- inside the loaded image. Windows no longer
+crashes. The surface ADDRESS is still wrong and that is the open work.
+
+
+1. WHAT LANDED (all committed, tree clean)
+==========================================
+  2e0e921  nv2a_range_hits_image: refuse surface writes over the image
+  0a9ef37  restore the documented ICALL caller + ring logging
+  e74721e  instrument_block_writes.py + recomp_mem_watch_guest_block
+  87f82d4  stop the missing-bridge warning accusing void functions
+  79b5821  point the .text checksum probe at real .text
+  dafa70c  PGRAPH software-method notify on Windows (guard, raise, handler)
+  db7d9e4  KeConnectInterrupt race fix + RECOMP_TEXT_CHECKSUM
+  a8afcf5  read the two D3D allocators
+
+Instruments now available, all opt-in:
+  RECOMP_STORE_WATCH=<va>:<len>   host page guard, reports the faulting HOST PC
+  RECOMP_MEM_WATCH=<va>:<len>     guest macro stores (79,114 of them)
+  RECOMP_KERNEL_WATCH=<va>        samples either side of every bridge call
+  RECOMP_TEXT_CHECKSUM=1          .text pages, ring window + control half
+  RECOMP_DUMP_VA=<va>[,<va>...]   guest dwords once, at load
+  RECOMP_D3D_ALLOC_TRACE=1        the two contiguous allocators, path probe
+  RECOMP_PB_NOTIFY_TRACE=1        software methods the parser decodes
+  instrument_block_writes.py      1571 lifted rep movs/stos, into a gen COPY
+  instrument_d3d_alloc.py         12 sites down both D3D allocators
+
+Symbolising a Windows crash: the mingw .exe keeps symbols and is based at
+0x140000000, so
+    x86_64-w64-mingw32-addr2line -f -e jsrf_first_fault.exe <rip>
+resolves any frame from Wine's backtrace or from a STORE-WATCH host_pc. Saved
+Wine reports are in docs/jsrf/artifacts/.
+
+
+2. STATE OF THE TWO HOSTS
+=========================
+macOS   unchanged throughout. 2.7M pusher methods, ~1880 flips, 61.8 Hz,
+        notifies completing, zero image refusals, ctest 21/27 (the five
+        backport-presence failures and the ratchet this gen has always had).
+
+Windows boots, all four vectors, APU + ADX, PGRAPH notifies raised AND
+        acknowledged, no crash, runs minutes instead of dying inside 60s.
+        Renders nothing yet, and never will until it has a framebuffer path --
+        xbox_D3D8SetGuestFramebufferSource and the event-pump hook are still
+        POSIX-only in main.c, so the CrossOver window is black by construction.
+        Judge it by counters.
+
+Current Windows boundary: a PGRAPH software method with parameter=2 is raised
+and never acknowledged --
+    [PB-NOTIFY] waiting parameter=2 raised=1 pmc=00001000 intr=00100000 fifo=00000000
+so PGRAPH_ERROR is set, PMC's PGRAPH bit is set, and the guest has not restored
+FIFO access. parameter=9 notifies complete normally, six of them. That asymmetry
+is the next thread to pull.
+
+
+3. THE OPEN ROOT CAUSE
+======================
+Three symptoms, one shape: this host hands the title addresses that collide
+with its own image.
+
+    depth surface   guest 0x00248000, 0x12C000 bytes   (inside .data)
+    framebuffer     fb=0x001B2000 vs macOS 0x0071E000  (inside DSOUND)
+    push ring       physical 0x1000 vs macOS 0x56D000  (would be .text)
+
+The D3D contiguous allocators are NOT the cause -- measured identical on both
+hosts, same sizes, same descriptors, same thunk, zero failures either side
+(CLAUDE_PROGRESS_2026-09-11_ALLOCATORS_EXONERATED.md). So the divergence is
+downstream of them, in whatever computes surface and ring addresses from what
+those allocations returned. Start by logging the colour/depth surface offsets
+and their DMA objects on both hosts and diffing; the REFUSED line already gives
+the Windows half.
+
+
+4. RULES THIS SESSION PAID FOR
+==============================
+  - A guarded page must not share a lock with a device handler. Sharing
+    g_nv2a_pcrtc_lock stalled two runs, which reads as "the guard prevented the
+    corruption" and means "the guard wedged the title".
+  - Before believing a watch reported nothing, check the run reached the code
+    that writes. Two zeroes here were runs that stopped early.
+  - [HEAP] lines are capped at 64 (RECOMP_HEAP_TRACE). Counting them is not
+    counting allocations; that is what made "ordinal 166 is never called on
+    Windows" survive every test while being false.
+  - g_xbox_code_lo..hi is NOT .text. This XBE flags .rdata and .data
+    executable, so that range is mostly data; use g_xbox_text_lo/hi.
+  - The memory watch sees only RECOMP_MEM_WRITE stores: not block copies (now
+    separately instrumented), and not the runtime's own device writes, which is
+    what this crash turned out to be.
+  - docs/pipeline/06-debugging.md prescribes the ICALL caller address and the
+    target ring for exactly this class of crash. Our build had dropped both.
+    Consult the documented method before building a new instrument.
+
+
+5. HYPOTHESES CLOSED BY MEASUREMENT -- DO NOT RE-RUN
+====================================================
+  .text corruption by the push ring (16/16 pages clean, both hosts, with the
+    probe corrected to measure real .text)
+  the KeConnectInterrupt race (fixed; crash unchanged)
+  concurrent guest DPCs (interlock tried; crash unchanged; reverted)
+  the OHCI memset(out,0xFF,len) (run without RECOMP_OHCI_ATTACH; identical)
+  unbridged ordinals leaking stack (1, 46 and 144 all have correct arg sizes;
+    the warning that said otherwise was itself the bug)
+  guest block copies (positive control passing, then zero hits)
+  kernel bridge calls (RECOMP_KERNEL_WATCH, zero hits)
+  the D3D contiguous allocators (identical call for call on both hosts)
