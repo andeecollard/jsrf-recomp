@@ -37,11 +37,47 @@ static int func_hit_on(void)
     return on;
 }
 
+/* The ORDER the sites were first entered in, not just how often.
+ *
+ * Counting brackets a divergence to a set of functions; it cannot say which
+ * ran when, and "how did the guest get into this error path" is an ordering
+ * question. This records the first FUNC_SEQ_MAX entries in call order, which
+ * is the window the init sequence lives in -- a stalled guest then repeats one
+ * or two sites forever and adds nothing, so recording the head rather than the
+ * tail is what makes the two hosts comparable. */
+#define FUNC_SEQ_MAX 1024u
+#define FUNC_SEQ_THREADS 8u
+
+/* PER THREAD, deliberately. A single global ring interleaves the guest's main
+ * thread with the ISRs and the DPCs they dispatch, and a flat interleaved log
+ * cannot be diffed against another host: whichever host happens to take an
+ * interrupt at that moment shows a "divergence" that is only scheduling. That
+ * mistake was made three times in one session -- 0x00193C50 (the vblank ISR)
+ * and 0x00194480 (D3D's vblank DPC) both read as guest-path divergences before
+ * anyone noticed they run on another context. Hand-filtering known entry
+ * points does not scale; separating the threads does. */
+typedef struct { uint32_t seq[FUNC_SEQ_MAX]; unsigned n; unsigned id; } FuncSeq;
+static FuncSeq g_seqs[FUNC_SEQ_THREADS];
+static volatile int g_seq_threads;
+static _Thread_local FuncSeq *g_my_seq;
+
 void jsrf_func_hit(uint32_t va)
 {
     unsigned i;
     if (!func_hit_on() || !va)
         return;
+    if (!g_my_seq) {
+        int slot = __atomic_fetch_add(&g_seq_threads, 1, __ATOMIC_SEQ_CST);
+        if (slot >= 0 && slot < (int)FUNC_SEQ_THREADS) {
+            g_my_seq = &g_seqs[slot];
+            g_my_seq->id = (unsigned)slot;
+        }
+    }
+    /* CIRCULAR, not head-capped. The head is the same on both hosts for
+     * hundreds of steps -- what differs is where a thread STOPS, and a ring
+     * that fills up and then ignores everything afterwards cannot show that. */
+    if (g_my_seq)
+        g_my_seq->seq[g_my_seq->n++ % FUNC_SEQ_MAX] = va;
     i = (unsigned)(va >> 4) & FUNC_HIT_MASK;
     for (;;) {
         if (g_hits[i].va == va) { g_hits[i].hits++; return; }
@@ -164,6 +200,25 @@ void jsrf_func_hit_report(void)
         if (g_hits[i].va)
             fprintf(stderr, "  [FUNC-HIT] %08X calls=%llu\n",
                     (unsigned)g_hits[i].va, g_hits[i].hits);
+    {
+        unsigned t, n;
+        int used = g_seq_threads;
+        if (used > (int)FUNC_SEQ_THREADS) used = (int)FUNC_SEQ_THREADS;
+        for (t = 0; t < (unsigned)used; t++) {
+            FuncSeq *q = &g_seqs[t];
+            if (!q->n) continue;
+            unsigned total = q->n;
+            unsigned shown = total < FUNC_SEQ_MAX ? total : FUNC_SEQ_MAX;
+            fprintf(stderr, "  [FUNC-SEQ] thread %u: %u entries, last %u in call order:\n",
+                    t, total, shown);
+            for (n = 0; n < shown; n++) {
+                unsigned idx = (total - shown + n) % FUNC_SEQ_MAX;
+                fprintf(stderr, "%s%08X%s", (n % 8u) ? " " : "    ",
+                        (unsigned)q->seq[idx], (n % 8u) == 7u ? "\n" : "");
+            }
+            if (shown % 8u) fprintf(stderr, "\n");
+        }
+    }
     jsrf_func_arg_report();
     fflush(stderr);
 }
