@@ -1264,6 +1264,36 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             }
 
             uint16_t v = (uint16_t)d->regs[current];
+
+            /* NEXT_VOICE_HANDLE is a full 16-bit field (mask 0x0000FFFF) and
+             * the terminator is 0xFFFF, so the loop condition above admits
+             * every value from 0x0100 to 0xFFFE -- all of which are invalid,
+             * because the hardware has 256 voices. The only thing standing
+             * between such a handle and voice_process was an assert, and
+             * voice_process indexes g_dbg.vp.v[256] with it before doing
+             * anything else: fatal in a debug build, an out-of-bounds write in
+             * a release one.
+             *
+             * Reached for the first time on the Windows host once it got far
+             * enough to load media. The value is reported rather than assumed,
+             * because "the guest wrote a bad handle" and "we decoded the link
+             * field wrongly" want different fixes and only the number tells
+             * them apart. Bounded: a list that is wrong once is wrong every
+             * frame. */
+            if (v >= MCPX_HW_MAX_VOICES) {
+                static unsigned reported;
+                if (reported < 8) {
+                    reported++;
+                    fprintf(stderr,
+                            "  [APU] voice list %d entry %d: handle 0x%04X is "
+                            "out of range (max %d, terminator 0xFFFF) -- "
+                            "stopping this list\n",
+                            list, i, v, MCPX_HW_MAX_VOICES - 1);
+                    fflush(stderr);
+                }
+                break;
+            }
+
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
