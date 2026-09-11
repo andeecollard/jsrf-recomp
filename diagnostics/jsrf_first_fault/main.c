@@ -1023,6 +1023,13 @@ static void jsrf_pusher_report(void)
             mcpx_apu_frame_report();
             extern void xbox_VblankReport(void);
             xbox_VblankReport();
+            /* And whether the code all of the above is measuring is still the
+             * code we loaded. First call takes the baseline, so this is also
+             * the startup arm. */
+            {
+                extern void xbox_TextChecksumReport(void);
+                xbox_TextChecksumReport();
+            }
         }
         /* And the boundary those voices have to cross. The APU aperture is
          * guarded read-only so stores fault and reach the model; anything the
@@ -2645,6 +2652,24 @@ int main(int argc, char **argv)
     printf("Writable emulated HDD root: %s\n", hdd_root);
     xbox_path_init(game_dir, hdd_root);
     xbox_kernel_bridge_init();
+
+    /* Baseline the guest's code pages here, and here specifically.
+     *
+     * Not at the first periodic report -- that lands seconds in, and anything
+     * that had already overwritten .text would be baselined as if it were the
+     * original image. And not at section load either, which is where this call
+     * started: xbox_kernel_bridge_init rewrites the kernel thunk table, at VA
+     * 0x001C3F60, and the executable range this probe covers includes it. A
+     * load-time baseline reports that page as CHANGED on the first report, on
+     * macOS, every run -- our own write, read back as the guest corrupting
+     * itself. Measured, not reasoned about: it fired on the first run.
+     *
+     * Between the two is the only point where the image is complete and
+     * nothing but the guest writes to it again. */
+    {
+        extern void xbox_TextChecksumReport(void);
+        xbox_TextChecksumReport();
+    }
 
     /* PROBE: bring up the D3D8 HLE layer (src/d3d, OpenGL 3.3 backend on
      * POSIX). Nothing in JSRF routes through it yet -- the title runs its own

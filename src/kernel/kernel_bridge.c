@@ -2153,7 +2153,45 @@ static RECOMP_TLS uint32_t g_pending_dpc_sys2;
 #define NV_PCRTC_INTR_0        0x600100u
 #define NV_PCRTC_INTR_0_VBLANK 0x00000001u
 
-static uint32_t g_interrupts[BRIDGE_MAX_INTERRUPTS];
+static volatile uint32_t g_interrupts[BRIDGE_MAX_INTERRUPTS];
+
+/* Entries skipped by the validator below. Non-zero means the race was real and
+ * was caught; it stays at zero on a host where the publish is never observed
+ * part-built, which is what macOS has always been. */
+unsigned long g_interrupt_not_ready;
+
+/* Is this slot safe to dispatch FROM ANOTHER THREAD?
+ *
+ * The slot is published on the guest's own thread the moment the title calls
+ * KeConnectInterrupt, and the KINTERRUPT it points at is the guest's memory.
+ * The pumps below read the routine, the vector and the ServiceContext out of
+ * it and dereference the context. While the only caller ran on the guest's own
+ * thread inside a blocking wait, no reader could observe that structure
+ * part-built. RECOMP_IRQ_THREAD added a reader that can: a Windows run
+ * dispatched a routine of 0xFFFFFF00 moments after the title connected vector
+ * 5, and the guest died shortly after with the same value in ECX.
+ *
+ * The routine is the one field whose correctness can be CHECKED rather than
+ * assumed -- either the dispatch table knows that address or it does not. The
+ * ServiceContext deliberately is not range-checked: contiguous allocations
+ * live in the 0x80000000 physical mirror, so every bound naive enough to write
+ * here would reject a legitimate context.
+ *
+ * A failing entry is skipped, never cleared. The title is mid-way through
+ * filling it in and the next pass, 16 ms later, will find it complete. */
+static int bridge_interrupt_ready(uint32_t iv)
+{
+    uint32_t routine;
+
+    if (!iv) return 0;
+    routine = BRIDGE_MEM32(iv + 0);
+    if (!routine) return 0;
+    if (!recomp_lookup(routine) && !recomp_lookup_manual(routine)) {
+        g_interrupt_not_ready++;
+        return 0;
+    }
+    return 1;
+}
 
 static void bridge_KeConnectInterrupt(void)
 {
@@ -2164,7 +2202,11 @@ static void bridge_KeConnectInterrupt(void)
         for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
             if (g_interrupts[i] == interrupt_va) break;
             if (g_interrupts[i] == 0) {
-                g_interrupts[i] = interrupt_va;
+                /* Release: everything KeInitializeInterrupt wrote into this
+                 * KINTERRUPT must be visible to the IRQ thread before the slot
+                 * that points at it is. */
+                __atomic_store_n(&g_interrupts[i], interrupt_va,
+                                 __ATOMIC_RELEASE);
                 fprintf(stderr,
                         "  [KERNEL] KeConnectInterrupt: kinterrupt=0x%08X "
                         "routine=0x%08X context=0x%08X vector=%u\n",
@@ -2312,9 +2354,11 @@ void xbox_VblankReport(void)
     unsigned long ms = g_vblank_first_ms ? (unsigned long)(now - g_vblank_first_ms) : 0;
     double hz = ms ? (double)g_vblank_delivered * 1000.0 / (double)ms : 0.0;
     fprintf(stderr, "  [VBLANK] delivered=%lu over %lu ms = %.1f Hz"
-            " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms\n",
+            " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms"
+            " not_ready=%lu\n",
             g_vblank_delivered, ms, hz, 1000 / BRIDGE_VBLANK_PERIOD_MS,
-            g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms);
+            g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms,
+            g_interrupt_not_ready);
     fflush(stderr);
 }
 
@@ -2337,8 +2381,9 @@ static void bridge_vblank_poll(void)
      * interrupts, using its saved register/stack context. */
     if (xbox_Nv2aSoftwareMethodPending()) {
         for (i = 0; i < BRIDGE_MAX_INTERRUPTS; ++i) {
-            uint32_t iv = g_interrupts[i];
+            uint32_t iv = __atomic_load_n(&g_interrupts[i], __ATOMIC_ACQUIRE);
             if (!iv) break;
+            if (!bridge_interrupt_ready(iv)) continue;
             if (BRIDGE_MEM32(iv + 8) != BRIDGE_NV2A_VECTOR) continue;
             uint32_t ctx = BRIDGE_MEM32(iv + 4);
             uint32_t base = ctx ? BRIDGE_MEM32(ctx) : 0;
@@ -2357,8 +2402,9 @@ static void bridge_vblank_poll(void)
     g_vblank_deadlines++;
 
     for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
-        uint32_t iv = g_interrupts[i];
+        uint32_t iv = __atomic_load_n(&g_interrupts[i], __ATOMIC_ACQUIRE);
         if (!iv) break;
+        if (!bridge_interrupt_ready(iv)) continue;
         if (BRIDGE_MEM32(iv + 8) == BRIDGE_NV2A_VECTOR) {
             /* Raise the pending bit the way the GPU would before asserting the
              * line. JSRF's ISR reads its ServiceContext's register base and
@@ -2451,11 +2497,12 @@ static void bridge_device_irq_poll(void)
     next_irq = now + BRIDGE_DEVICE_IRQ_PERIOD_MS;
 
     for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
-        uint32_t iv = g_interrupts[i];
+        uint32_t iv = __atomic_load_n(&g_interrupts[i], __ATOMIC_ACQUIRE);
         uint32_t vector;
         uint32_t result;
 
         if (!iv) break;
+        if (!bridge_interrupt_ready(iv)) continue;
         vector = BRIDGE_MEM32(iv + 8);
         if (vector == BRIDGE_NV2A_VECTOR) {
             continue;   /* the GPU has its own handshake; see bridge_vblank_poll */
@@ -2504,21 +2551,21 @@ done:
  * process-wide interlock shared by all three), so this thread and a blocked
  * guest thread cannot deliver at once; whichever loses the CAS simply returns.
  *
- * KNOWN DEFECT, measured 2026-09-11: this RACES KeConnectInterrupt. The guest
- * publishes g_interrupts[i] = interrupt_va (see bridge_KeConnectInterrupt)
- * with no synchronisation and then fills in the KINTERRUPT it points at. The
- * old single caller ran on the guest's OWN thread inside a blocking wait, so
- * it could never observe a half-built entry; this thread can, and does -- a
- * Windows run dispatched a routine of 0xFFFFFF00 ("ISR ... not in dispatch")
- * moments after the title connected vector 5, and the guest died shortly after
- * with ECX holding the same value. Publishing the slot only once the KINTERRUPT
- * is complete, or validating the routine against the dispatch table before
- * reading any of it, would close this. Neither is done yet.
+ * IT RACED KeConnectInterrupt, and now does not. The slot is published with a
+ * release store and every pump acquire-loads it and puts it through
+ * bridge_interrupt_ready before reading any other field of the KINTERRUPT --
+ * see the validator's own comment for the mechanism. g_interrupt_not_ready
+ * counts what that rejects and is reported as not_ready= on the [VBLANK] line;
+ * on macOS, where no reader ever observed a part-built entry, it should stay at
+ * zero, which is the control that says the counter is measuring the race and
+ * not something ordinary.
  *
- * NOT PROVEN TO BE THE MECHANISM of that crash, though: the Windows push-buffer
- * ring bounds (0x1000-0x81000) overlap the title's own .text (0x11000-0x18CB30)
- * by 448 KB, and a guest scribbling commands over its own code yields garbage
- * routine pointers just as well. Checksum a .text page before believing either.
+ * That crash is STILL NOT EXPLAINED, and this fix should not be read as
+ * explaining it. The Windows push-buffer ring bounds (0x1000-0x81000) overlap
+ * the title's own .text (0x11000-0x18CB30) by 448 KB, and a guest scribbling
+ * command words over its own code yields garbage routine pointers just as well
+ * -- the validator would reject those too, and silently. Checksum a .text page
+ * before believing either account.
  *
  * OPT-IN, DEFAULT OFF, deliberately. It changes interrupt timing on a build
  * that currently reaches gameplay, and the re-entrancy here has been got wrong

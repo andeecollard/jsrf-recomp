@@ -4634,3 +4634,174 @@ HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
 }
+
+/* ── Is the title's code still the code we loaded? ─────────────────────────
+ *
+ * The Windows oracle's push-buffer ring was observed at 0x1000-0x81000, and
+ * the title's executable range starts at 0x11000. That is a 448 KB overlap
+ * between where the guest writes command words and where its own instructions
+ * live. If the ring really is there, the guest is scribbling over its own
+ * code, every divergence measured on that host is an artefact, and no other
+ * finding from it survives -- so this has to be settled before the rest of the
+ * Windows plan means anything.
+ *
+ * Sixteen pages, summed at the first call and re-summed on every periodic
+ * report. HALF of them inside the observed ring window and half across the
+ * rest of the range, rather than sixteen spread evenly -- an even spread puts
+ * only three pages inside the window that the hypothesis is actually about,
+ * and spends the other thirteen on ground nothing is accused of touching.
+ *
+ * The outer half is the control, and it is what makes the result readable: the
+ * ring covers only the bottom of the range, so if the ring is the writer the
+ * inner pages move and the outer ones do not. All sixteen moving is a
+ * different fault entirely, and none moving retires the hypothesis.
+ *
+ * The window is RECOMP_TEXT_CK_WINDOW (default 0x81000, the ring limit seen on
+ * Windows) so a run that measures a different ring can re-aim this without a
+ * rebuild.
+ *
+ * Read-only and opt-in, per the tree's convention, though the weight that rule
+ * exists for is not really in question here -- 64 KB summed every few seconds.
+ * The Windows steps need RECOMP_TEXT_CHECKSUM=1 set.
+ */
+#define TEXT_CK_PAGES 16
+
+void xbox_TextChecksumReport(void)
+{
+    static int enabled = -1;
+    static uint32_t page_va[TEXT_CK_PAGES];
+    static uint32_t baseline[TEXT_CK_PAGES];
+    /* A checksum says a page moved; it cannot say what moved, and "the guest
+     * is overwriting its code" and "our own loader patched a table" look
+     * identical through one. Keep the bytes so the report can name the offset
+     * and the values -- 64 KB, and it is the difference between a finding and
+     * an alarm. */
+    static unsigned char snapshot[TEXT_CK_PAGES][4096];
+    static uint32_t page_len[TEXT_CK_PAGES];
+    static int armed;
+    static unsigned long reports;
+    uint32_t now[TEXT_CK_PAGES];
+    int i, changed = 0, inner_changed = 0;
+
+    if (enabled < 0) enabled = getenv("RECOMP_TEXT_CHECKSUM") ? 1 : 0;
+    if (!enabled) return;
+    if (!g_xbox_code_lo || g_xbox_code_hi <= g_xbox_code_lo) return;
+
+    {
+        static uint32_t window;
+        uint32_t inner_hi, outer_span;
+
+        if (!window) {
+            const char *w = getenv("RECOMP_TEXT_CK_WINDOW");
+            window = w ? (uint32_t)strtoul(w, NULL, 0) : 0x81000u;
+        }
+        /* Clamp: a window past the end of .text would put every page in the
+         * inner half and leave no control at all. */
+        inner_hi = window;
+        if (inner_hi <= g_xbox_code_lo || inner_hi > g_xbox_code_hi)
+            inner_hi = g_xbox_code_lo + (g_xbox_code_hi - g_xbox_code_lo) / 4;
+        outer_span = g_xbox_code_hi - inner_hi;
+
+        for (i = 0; i < TEXT_CK_PAGES; i++) {
+            uint32_t va;
+            if (armed) {
+                va = page_va[i];
+            } else if (i < TEXT_CK_PAGES / 2) {
+                va = g_xbox_code_lo
+                   + (uint32_t)((uint64_t)(inner_hi - g_xbox_code_lo)
+                        * (uint32_t)i / (TEXT_CK_PAGES / 2));
+            } else {
+                va = inner_hi
+                   + (uint32_t)((uint64_t)outer_span
+                        * (uint32_t)(i - TEXT_CK_PAGES / 2)
+                        / (TEXT_CK_PAGES / 2));
+            }
+            const unsigned char *p;
+            uint32_t h = 2166136261u;
+            uint32_t n = 4096, k;
+
+            va &= ~0xFFFu;
+            if (va < g_xbox_code_lo) va = g_xbox_code_lo;
+            if (va + n > g_xbox_code_hi) n = g_xbox_code_hi - va;
+            page_va[i] = va;
+            page_len[i] = n;
+            p = (const unsigned char *)((uintptr_t)va + g_memory_offset);
+            for (k = 0; k < n; k++) { h ^= p[k]; h *= 16777619u; }
+            now[i] = h;
+        }
+    }
+
+    if (!armed) {
+        armed = 1;
+        for (i = 0; i < TEXT_CK_PAGES; i++) {
+            baseline[i] = now[i];
+            memcpy(snapshot[i],
+                   (const void *)((uintptr_t)page_va[i] + g_memory_offset),
+                   page_len[i]);
+        }
+        fprintf(stderr, "  [TEXT-CK] baseline over .text 0x%08X-0x%08X: "
+                "%d pages in the ring window 0x%08X-0x%08X, %d outside it "
+                "as the control (0x%08X-0x%08X)\n",
+                g_xbox_code_lo, g_xbox_code_hi,
+                TEXT_CK_PAGES / 2, page_va[0], page_va[TEXT_CK_PAGES / 2 - 1],
+                TEXT_CK_PAGES / 2, page_va[TEXT_CK_PAGES / 2],
+                page_va[TEXT_CK_PAGES - 1]);
+        fflush(stderr);
+        return;
+    }
+
+    reports++;
+    for (i = 0; i < TEXT_CK_PAGES; i++) {
+        if (now[i] == baseline[i]) continue;
+        changed++;
+        if (i < TEXT_CK_PAGES / 2) inner_changed++;
+        {
+            const unsigned char *live =
+                (const unsigned char *)((uintptr_t)page_va[i] + g_memory_offset);
+            uint32_t off, first = page_len[i], last = 0, dwords = 0;
+            for (off = 0; off + 4 <= page_len[i]; off += 4) {
+                if (memcmp(snapshot[i] + off, live + off, 4) == 0) continue;
+                if (dwords == 0) first = off;
+                last = off;
+                dwords++;
+            }
+            fprintf(stderr, "  [TEXT-CK] page %2d VA 0x%08X (%s) CHANGED "
+                    "0x%08X -> 0x%08X (report %lu): %u dwords, "
+                    "VA 0x%08X..0x%08X, first 0x%08X -> 0x%08X\n",
+                    i, page_va[i],
+                    (i < TEXT_CK_PAGES / 2) ? "ring window" : "control",
+                    baseline[i], now[i], reports, dwords,
+                    page_va[i] + first, page_va[i] + last,
+                    *(const uint32_t *)(snapshot[i] + first),
+                    *(const uint32_t *)(live + first));
+            memcpy(snapshot[i], live, page_len[i]);
+        }
+        /* Re-baseline so the next report says "changed again" rather than
+         * repeating this one forever. The count below is the running total. */
+        baseline[i] = now[i];
+    }
+    if (inner_changed) {
+        fprintf(stderr, "  [TEXT-CK] %d of %d pages INSIDE the ring window "
+                "differ (and %d of %d in the control) -- the guest is writing "
+                "where its own instructions live; treat every other "
+                "measurement on this host as void until it is explained\n",
+                inner_changed, TEXT_CK_PAGES / 2,
+                changed - inner_changed, TEXT_CK_PAGES / 2);
+        fflush(stderr);
+    } else if (changed) {
+        /* Outside the window the ring cannot reach, so this is not the
+         * hypothesis this probe was built for and must not be reported as if
+         * it were. The executable range covers .rdata in this XBE, and the
+         * guest writes there in the ordinary course of running: on macOS the
+         * only page that ever moves is 0x001C3000, one dword at 0x001C3F20,
+         * "MU_0" -> "MU_7" -- a memory-unit drive letter, not code. Read the
+         * offset and the values before treating any of these as a fault. */
+        fprintf(stderr, "  [TEXT-CK] %d page(s) changed, all OUTSIDE the ring "
+                "window -- see the offsets above; not the ring, and not on "
+                "its own a reason to distrust this run\n", changed);
+        fflush(stderr);
+    } else if (reports == 1) {
+        fprintf(stderr, "  [TEXT-CK] %d pages unchanged\n", TEXT_CK_PAGES);
+        fflush(stderr);
+    }
+}

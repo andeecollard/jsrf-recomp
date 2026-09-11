@@ -548,6 +548,11 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
  */
 HANDLE xbox_GetMappingHandle(void);
 
+/* Checksum a spread of the title's own code pages. First call baselines, every
+ * later call compares and names any page that moved. Opt-in via
+ * RECOMP_TEXT_CHECKSUM; see the definition for why the Windows work needs it. */
+void xbox_TextChecksumReport(void);
+
 #ifdef __cplusplus
 }
 #endif
