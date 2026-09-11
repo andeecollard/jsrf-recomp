@@ -228,6 +228,15 @@ points = {
                      'edi, eax, MEM32(esp + 0x10), MEM32(esp + 0x14)'),
         '001C06B3': ('jsrf_usb_device_probe',
                      'ecx, MEM32(esp + 4), 0, 0'),
+        # XPP's global device/event list. Observe the new node immediately
+        # after topology linking, both append cases, and the consumer just
+        # before it dereferences node+0x10. The probe itself performs guarded
+        # reads so an already-poisoned pointer remains diagnostic, not fatal.
+        '001BF762': ('jsrf_usb_list_probe', 'esi, 0'),
+        '001BF793': ('jsrf_usb_list_probe', 'esi, 0'),
+        '001BF7A3': ('jsrf_usb_list_probe', 'esi, eax'),
+        '001BFA3A': ('jsrf_usb_list_probe', 'MEM32(0x2648D4), 0'),
+        '001BFA6B': ('jsrf_usb_list_probe', 'eax, 0'),
     },
 }
 changed = 0

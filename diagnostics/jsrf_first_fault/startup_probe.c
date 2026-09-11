@@ -802,6 +802,41 @@ void jsrf_usb_device_probe(uint32_t pc, uint32_t controller,
 }
 
 /*
+ * Follow XPP's singly linked device/event list without putting the global
+ * RECOMP_MEM_WATCH hook on every guest store.  The latter has already been
+ * shown to perturb this title enough to cause unrelated wild-pointer faults.
+ *
+ * The list head is 0x2648D4 and the link is node+0x10.  Logging the complete
+ * 32-byte pool entry at the append and consume sites makes the surviving Mac
+ * run a direct oracle for Windows while keeping the probe O(1) and read-only.
+ */
+void jsrf_usb_list_probe(uint32_t pc, uint32_t node, uint32_t related)
+{
+    static int enabled = -1;
+    static unsigned calls;
+    uint32_t head, words[8] = {0};
+    int valid;
+
+    if (enabled < 0) enabled = getenv("RECOMP_USB_LIST_TRACE") != NULL;
+    if (!enabled || ++calls > 64) return;
+
+    head = read_word(0x2648D4);
+    valid = node != 0 && xbox_GpuMemoryRange(node, sizeof(words)) != NULL;
+    if (valid)
+        for (unsigned i = 0; i < 8; ++i)
+            words[i] = read_word(node + i * 4);
+
+    fprintf(stderr,
+            "[USB-LIST] pc=%08X call=%u head=%08X tail=%08X"
+            " node=%08X related=%08X valid=%d words="
+            "%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X\n",
+            pc, calls, head, read_word(0x2648D8), node, related, valid,
+            words[0], words[1], words[2], words[3], words[4], words[5],
+            words[6], words[7]);
+    fflush(stderr);
+}
+
+/*
  * Read-only observation of the four-channel colour interpolator that the
  * update list reaches through vtable+4 on object 0x01A41E60.
  *
