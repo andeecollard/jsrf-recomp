@@ -227,6 +227,46 @@ The pattern across the whole day is worth stating plainly: every one of these
 was a plausible mechanism believed before the measurement that would have
 falsified it existed. The measurements were cheap in every case.
 
+## The device fields are read correctly, and the ring base is a zero result
+
+docs/technical/d3d-translation.md maps the D3D8LTCG device with push-buffer
+BASE at +0x08 and SIZE at +0x0C, where the harness reads ring bounds from
++0x24/+0x28 "per the BO3 map". That looked like the diagnostic reading the
+wrong fields, which would have made every statement here about where the ring
+lives an artefact. Printed side by side on one line, both hosts:
+
+    MAC  +0x00=8056D000 +0x04=80574DFC +0x08=0 +0x0C=0 | +0x24=8056D000 +0x28=805ED000
+    WIN  +0x00=80001000 +0x04=80008DFC +0x08=0 +0x0C=0 | +0x24=80001000 +0x28=80081000
+
++0x08 and +0x0C are ZERO on both, so that part of the doc describes Burnout 3's
+D3D8LTCG build and not this title's. The +0x24/+0x28 pair holds coherent values
+on both hosts and the cursor sits inside them, which is why the probe's own
+validity check accepts them. THE PROBE IS RIGHT and the ring-location findings
+above stand.
+
+What the comparison does add is the shape of the failure. On Windows
+0x81000 - 0x1000 = 0x80000 = 524288 exactly: the guest asked for a 512 KB ring,
+computed end = base + 512 KB, and ended up with BASE 0x1000. No 512 KB heap
+allocation is ever made on this host, and ordinal 166 is called 59 times on
+macOS and zero times here. A base of 0x1000 is what an allocator returning
+NULL/zero looks like after the title adds its own small offset -- so the
+question is not "who put the ring at the TIB" but "which allocation returns
+zero, and why is the failure not checked".
+
+Clues in the tree worth acting on, in order:
+
+  1. d3d-translation.md:456 -- "Any function that spin-waits on GPU registers
+     must be stubbed entirely, not just the register read. Allocating the page
+     via VEH prevents the crash but the loop spins forever on zero." That is
+     exactly sub_001912A0 (the PFB flush kick and spin) and exactly what a
+     VEH-only approach does. This host is VEH-only for NV2A.
+  2. The device context is a STATIC object in the D3D section, not heap
+     allocated, and the doc recommends capturing it from xemu. That gives a
+     known-good field map instead of inferring offsets from another title.
+  3. Find the allocation that returns zero. It is not MmAllocateContiguousMemory
+     (host pointer on both hosts) and not MmAllocateContiguousMemoryEx (never
+     reached). Something earlier in D3D's GPU setup fails and is not checked.
+
 ## Standing traps, all paid for today
 
 - An ordered divergence is a CEILING on where the fault is, never a location,

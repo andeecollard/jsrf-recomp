@@ -436,6 +436,17 @@ static int jsrf_pb_poll(void)
                 "bounds 0x%08X-0x%08X%s\n",
                 now, MEM32(JSRF_PB_LIMIT_VA), g_pb_ring_lo, g_pb_ring_hi,
                 g_pb_ring_lo ? "" : " (bounds rejected; wraps skipped)");
+        /* The same question read the way docs/technical/d3d-translation.md
+         * maps the D3D8LTCG device: base at +0x08 and size at +0x0C, against
+         * the +0x24/+0x28 pair above that the BO3 map suggested. Printed side
+         * by side rather than swapped, because every statement made today
+         * about where the ring lives rests on which of these is right, and
+         * they have never been compared on one line. */
+        fprintf(stderr, "  [PUSHER] device fields: +0x00=%08X +0x04=%08X"
+                " +0x08=%08X +0x0C=%08X | +0x24=%08X +0x28=%08X\n",
+                MEM32(JSRF_PB_PUT_VA), MEM32(JSRF_PB_LIMIT_VA),
+                MEM32(0x0019B208u), MEM32(0x0019B20Cu),
+                MEM32(JSRF_PB_START_VA), MEM32(JSRF_PB_END_VA));
         fflush(stderr);
         g_pb_last = g_pb_ring_lo ? g_pb_ring_lo : now;
     }
