@@ -2766,6 +2766,27 @@ int main(int argc, char **argv)
         xbox_TextChecksumReport();
     }
 
+    /* RECOMP_DUMP_VA=<addr>[,<addr>...] prints those guest dwords once, here,
+     * after the image is loaded and the runtime's own writes to it are done
+     * and before a single guest instruction runs.
+     *
+     * It exists because a global can be wrong without anything ever writing
+     * it: 0x0025EFB8 is a function pointer in .data's BSS that the vsync pump
+     * calls when non-zero, and it reads 0 on macOS and 0xFFFFFF00 on Windows
+     * with no guest store, no kernel call and no block copy touching it on
+     * either host. Either the load leaves it different, or one of those three
+     * instruments is lying; this says which without another argument. */
+    {
+        const char *spec = getenv("RECOMP_DUMP_VA");
+        while (spec && *spec) {
+            uint32_t va = (uint32_t)strtoul(spec, NULL, 0);
+            const char *comma = strchr(spec, ',');
+            fprintf(stderr, "  [DUMP] guest 0x%08X = 0x%08X\n", va, MEM32(va));
+            spec = comma ? comma + 1 : NULL;
+        }
+        fflush(stderr);
+    }
+
     /* PROBE: bring up the D3D8 HLE layer (src/d3d, OpenGL 3.3 backend on
      * POSIX). Nothing in JSRF routes through it yet -- the title runs its own
      * statically-linked D3D8 and talks to the NV2A model -- so this only

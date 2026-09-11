@@ -1,0 +1,49 @@
+--- ../jsrf_stock_test/src/recomp_manual.c.orig	2026-09-11 21:21:16
++++ ../jsrf_stock_test/src/recomp_manual.c	2026-09-11 21:21:16
+@@ -45,12 +45,44 @@
+ static uint64_t s_fail_printed = 0;
+ #define FAIL_PRINT_LIMIT 100
+ 
++/* docs/pipeline/06-debugging.md calls a failed indirect call "the most common
++ * crash type" and prescribes two things for it, both of which this trimmed
++ * copy had dropped: the CALLER address, and the ring of recent targets.
++ *
++ * Without the caller there is nothing to map back to a function, so the log
++ * says a bad pointer was called and not who called it -- which is the one fact
++ * that matters. Without the ring there is no execution context either.
++ *
++ * The caller is a native address in this binary. Map it the way the doc says:
++ * a .map file under MSVC, or on a mingw build
++ *     x86_64-w64-mingw32-addr2line -f -e jsrf_first_fault.exe <caller>
++ * which resolves straight to the generated sub_XXXXXXXX. */
++#if defined(_MSC_VER)
++#  include <intrin.h>
++#  define RECOMP_CALLER_ADDRESS() _ReturnAddress()
++#else
++#  define RECOMP_CALLER_ADDRESS() __builtin_return_address(0)
++#endif
++
+ void recomp_icall_fail_log(uint32_t va)
+ {
+     if (s_fail_printed < FAIL_PRINT_LIMIT) {
++        void *caller = RECOMP_CALLER_ADDRESS();
++        int i;
+         s_fail_printed++;
+-        fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
+-                va, (unsigned long long)g_icall_count);
++        fprintf(stderr,
++                "[ICALL] Failed to resolve VA 0x%08X caller=%p (total calls: %llu)\n",
++                va, caller, (unsigned long long)g_icall_count);
++        /* Last 16 targets, oldest first. The valid entries before the garbage
++         * one are the execution context the doc asks for. */
++        fprintf(stderr, "[ICALL]   recent targets:");
++        for (i = 0; i < ICALL_TRACE_SIZE; i++) {
++            uint32_t t = g_icall_trace[(g_icall_trace_idx - ICALL_TRACE_SIZE + i)
++                                       & (ICALL_TRACE_SIZE - 1)];
++            if (t) fprintf(stderr, " %08X", t);
++        }
++        fprintf(stderr, "\n");
++        fflush(stderr);
+         if (s_fail_printed == FAIL_PRINT_LIMIT) {
+             fprintf(stderr, "[ICALL] ... further failures suppressed (counted only)\n");
+         }
