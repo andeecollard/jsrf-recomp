@@ -1,0 +1,267 @@
+THE RIG: HOW THIS BRING-UP IS BUILT, RUN AND MEASURED
+Written 2026-09-11. Every path, number and switch here was verified on the day
+by running it, not recalled. Update this file in place; do not date-fork it.
+
+Read with ../../CLAUDE.md (orientation and the rules) and the newest file in
+../handovers/ (current state). This file is the *rig* -- the parts that do not
+change run to run.
+
+
+1. HOST AND TOOLCHAIN
+=====================
+    macOS 26.6.2 (build 25G83), arm64
+    cmake 4.0.1
+    Python 3.14.7
+    Apple clang 21.0.0 (clang-2100.1.1.101)
+    xemu at /Applications/xemu.app   (the oracle; see section 7)
+
+The recomp is built Debug. A release build has never been part of this
+investigation and no measurement here has been reproduced against one.
+
+
+2. WHAT IS WHERE
+================
+Everything lives under
+
+    ~/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/
+
+which is **iCloud Drive**. Paths contain spaces and `~` characters -- always
+quote them. Files can be evicted; a "missing" file may just be dataless.
+
+    xboxrecomp_upstream_integration/     THE working tree. Branch
+                                         reference/xemu-oracle. All current work.
+    upstream_xboxrecomp_clean/           worktree, branch
+                                         dirty-main-preserved-2026-09-09.
+                                         Historical; also holds the emulated HDD
+                                         the diagnostic writes to (section 4).
+    ~/.codex/worktrees/3e95/upstream_xboxrecomp_clean/
+                                         worktree, DETACHED at 48d89f3 (9 Sep)
+                                         with stale WIP. It looks like the
+                                         project and contains none of this
+                                         week's work. Do not work there.
+    Jet Set Radio Future (US)/           the guest image; default.xbe is the
+                                         translation input.
+    jsrf_stock_test/                     sibling the diagnostic's CMakeLists
+                                         resolves as JSRF_STOCK_DIR. A new
+                                         worktree needs this symlink beside it.
+    JSRF-Decompilation/                  the community decompilation. Its
+                                         ghidra/symboltable.tsv (1332 names) is
+                                         what symbolize.py reads. Read-only
+                                         reference -- no licence, do not vendor.
+    JSRF_BASELINE_2026-09-09_gameplay/   preserved known-good build:
+                                         jsrf_first_fault, gen.tar.gz,
+                                         CMakeCache.txt, RESTORE_MANIFEST.txt.
+                                         Verify against the manifest; extract
+                                         only into scratch.
+
+Branch state as of writing: `reference/xemu-oracle` is **local only** -- there is
+no origin/reference/xemu-oracle, and it is six commits ahead of origin/main.
+Nothing on it exists on any remote.
+
+
+3. BUILD
+========
+The generated C is **not in git** (49 MB, 32 `recomp_*.c`) and lives at
+`build-macos/jsrf-first-fault/gen`, which is gitignored.
+
+Configure (already done in this tree; shown for a fresh one):
+
+    cmake -S diagnostics/jsrf_first_fault -B build-macos/jsrf-first-fault/build \
+          -DRECOMP_GEN_DIR=$PWD/build-macos/jsrf-first-fault/gen
+
+Build:
+
+    cmake --build build-macos/jsrf-first-fault/build -j
+    cmake --build build-macos/jsrf-first-fault/build -j --target jsrf_first_fault
+
+The second form relinks only the diagnostic and takes well under a minute --
+use it when only a runtime `.c` changed. The binary is ~43 MB at
+`build-macos/jsrf-first-fault/build/jsrf_first_fault`.
+
+**Regeneration is not bit-stable across translator changes.** Prefer a verified
+archived gen when reproducing a past result. `diagnostics/jsrf_first_fault/
+regenerate.sh` is the only supported path when you do need a fresh one; it now
+closes the icall feedback loop itself (run -> merge -> seed -> regenerate), and
+skipping the merge fails *silently* by re-seeding from the previous cycle.
+
+
+4. RUN
+======
+Known-good invocation -- three consecutive 75 s runs on 11 Sep reached ~8,600
+pad polls each with no fault:
+
+    env RECOMP_SEPARATE_RESERVE=0 \
+        RECOMP_FAKE_PAD=1 \
+        RECOMP_SCENE_REPORT=1 \
+        RECOMP_PB_EXEC=1 \
+        RECOMP_METAL=1 \
+        RECOMP_OHCI_ATTACH=1 \
+        RECOMP_REPORT_MS=10000 \
+      python3 diagnostics/jsrf_first_fault/run_bounded.py <name> --seconds 75
+
+There are 141 distinct `RECOMP_*` switches across src/ and diagnostics/.
+Enumerate rather than guess:
+
+    grep -rhoE 'RECOMP_[A-Z0-9_]+' src diagnostics | sort -u
+
+### The four that decide whether a run is comparable at all
+
+  RECOMP_SEPARATE_RESERVE=0
+      **Opt-out; the default is the other path.** With it, guest heap reserves
+      stay in the retail arena (`[RESERVE] #1 base=0x00510000`) and the log
+      prints `[DIAG] RECOMP_SEPARATE_RESERVE=0`. Without it they land at
+      0x04000000 "outside physical RAM", and that path has its own known
+      0xFFFFFFxx guest fault. Corn is only visible with this set. **Every
+      healthy run on record has it; set it always.**
+
+  RECOMP_TOTAL_RAM_MB
+      Default 64, which is what the title expects. 128 changes the whole map --
+      "mapped 131072 KB", "Mirror 16: skipped, overlaps the contiguous aperture
+      at 0x80000000", 27/28 mirror views, tiled aperture 128 MB. A run at 128 MB
+      is not comparable with the corpus. Check the banner, don't assume.
+
+  RECOMP_FAKE_PAD
+      Unattended input. START is both "Press Start" and PAUSE, so it is a window:
+          =1        START for the first 90 s, then A only   [default]
+          =<n>      as above with an n-second window
+          =a        never send START -- cannot get past "Press Start"
+          =always   always START, and it WILL pause the game mid-play
+      For runs shorter than ~2 minutes use `=20`: with the default window a
+      100 s run spends most of its life toggling pause, which is exactly what
+      it looks like on screen.
+
+  RECOMP_SCENE_REPORT=1
+      Turns on the periodic report, including `[JSRF-PAUSE] +3C=.. +40=..`.
+      Without it a flat `[PAD-POLL] polls=` cannot be told apart from the game
+      simply being paused -- the single most expensive confusion of the week.
+
+The diagnostic writes to a real emulated HDD, by default
+
+    upstream_xboxrecomp_clean/build-macos/jsrf-first-fault/emulated-hdd
+
+Override with `RECOMP_HDD_ROOT` and point it at a disposable copy for anything
+that might corrupt save state.
+
+
+5. HARNESSES
+============
+    diagnostics/jsrf_first_fault/run_bounded.py <name> --seconds <n>
+        Runs the diagnostic for a bounded interval and preserves both logs.
+        Inherits the caller's environment -- which is how two runs "with the
+        same config" silently differed by RAM size. Set the env explicitly.
+
+    diagnostics/jsrf_first_fault/sample_pad_poll.py <name> [--seconds 3]
+        [--timeout 100] [--stable-reports 3]
+        Launches the uninstrumented diagnostic, watches its reports, and takes
+        a macOS `sample` profile in two states -- healthy (polls climbing, not
+        paused) and stalled (polls flat for N reports, not paused) -- then
+        diffs the guest frame sets. Zero per-call cost, which is the whole
+        point: see section 9.
+
+    diagnostics/jsrf_first_fault/instrument_*.py
+        Install opt-in probes into a *copy* of a gen tree. `instrument_startup.py`
+        and `instrument_func_hit.py` take `--skip-mismatched`, which validates
+        each site individually instead of failing all of them on one drift --
+        five stale sites out of 84 had been blocking four switches entirely.
+        `instrument_func_hit.py --ecxpair VA:0` records (this, vtable) per call.
+
+    diagnostics/jsrf_first_fault/symbolize.py
+        Maps VAs to the decompilation's names. Defaults to
+        ../JSRF-Decompilation/ghidra/symboltable.tsv; override with --symbols.
+
+
+6. THE LOG CORPUS
+=================
+Every run this week is preserved:
+
+    build-macos/jsrf-first-fault/render-investigation/<name>/{stdout,stderr}.log
+
+90 directories as of writing, gitignored but on disk. This is the project's
+most under-used asset -- several questions that look like they need a run can be
+answered by grepping it instead. A run classifies itself in one pass:
+
+    grep -m1 'permanent alias'          -> MCPX writable alias present
+    grep -m1 'SEPARATE_RESERVE=0'       -> retail-arena heap (comparable)
+    grep -m1 -oE 'mapped [0-9]+ KB'     -> 65536 = 64 MB, 131072 = 128 MB
+    grep -m1 'HOST FAULT ADDRESS'       -> the fault, if any
+    grep    '\[PAD-POLL\]' | tail -1    -> where input got to
+    grep    '\[JSRF-PAUSE\]'            -> paused or not
+
+Fault addresses are guest VA + 0x300000000, so 0x3FFFFFFBE is guest 0xFFFFFFBE.
+Known signatures: 0x38508C487 is the mem-watch series; 0x3FFFFFFBE appears only
+in builds carrying the MCPX alias (see the handover's section 9).
+
+
+7. THE XEMU ORACLE
+==================
+xemu runs the same US ISO, so it is the only ground truth that is neither our
+runtime nor static reading. Launch it with the GDB stub:
+
+    /Applications/xemu.app/Contents/MacOS/xemu ... -s      (stub on :1234)
+
+Then, from diagnostics/jsrf_first_fault/:
+
+    xemu_rsp.py           the RSP client the rest are built on (localhost:1234)
+    xemu_objects.py       dump the object registry
+    xemu_object_delta.py  which dwords of an object changed between two reads
+    xemu_region_delta.py  the same, summarised as contiguous regions
+    xemu_index_chain.py   follow an index chain
+    xemu_watch.py         watchpoints (they do NOT trap block copies)
+
+    xemu_reference/capture_reference.sh <outdir> <seconds>
+        Video via avfoundation plus sample-exact audio off the APU through
+        SDL3's disk driver. Three things cost a take: SDL_AUDIO_DISK_TIMESCALE
+        is a multiplier (1 = realtime, not 100); the disk driver takes audio
+        off the speakers for that run, so silence is expected; and
+        `caffeinate -dimsu` must wrap both xemu and ffmpeg or the Mac locks
+        partway. `-audiodev wav` does not work.
+
+The oracle's cost is a human playthrough per measurement. Save states via
+`-monitor` + `savevm` would make a checkpoint reusable in seconds and have not
+been set up yet; that is the single biggest time multiplier available.
+
+
+8. TEST STATE (measured 11 Sep, this gen, this branch)
+======================================================
+    ctest --test-dir build-macos/jsrf-first-fault/build
+    -> 21/27 pass, 6 fail, 2.5 s
+
+Failing, and why none of them is a runtime regression:
+
+    jsrf_fcmov_backport          )  each asserts that a hand-written backport is
+    jsrf_empty_list_guard        )  present in the GENERATED tree. This gen was
+    jsrf_shared_zf_branch        )  regenerated without them, so they report
+    jsrf_challenge_flag_merge    )  "MISSING". Their `_semantics` siblings --
+    jsrf_exec_state_flag_merge   )  which test behaviour -- all PASS.
+
+    jsrf_unresolved_flags_ratchet   107 dead `_flags` fallbacks against a
+                                    ratchet of 76. This is the known 112-vs-76
+                                    gap, a property of this gen tree.
+
+CLAUDE.md's "27/27 as of 48d89f3" is true of *that* commit's gen, not this one.
+Judge a change by the delta against this baseline, not against 27/27.
+
+
+9. HAZARDS OF THIS RIG
+======================
+  * **Instrument weight precipitates the input failure it is meant to observe.**
+    1118 probe sites froze a run at 30 polls; 578 at 253; zero probes ran to
+    8790. Sampling is the only unperturbed observer for anything in that area.
+
+  * **A guarded MMIO page loses writes if anything else unprotects it.** The
+    standing rule in CLAUDE.md. The fix currently at HEAD (ff5f578, the MCPX
+    writable alias) is itself implicated in a new crash -- 9 faults at
+    0x3FFFFFFBE across 18 alias runs, 0 in 72 non-alias runs. Do not carry it
+    under a measurement until that is resolved.
+
+  * **The git stash stack is shared across all worktrees.** Never bare
+    `git stash` / `git stash pop`. Prefer a WIP commit.
+
+  * **Absence needs a positive control.** `polls=0`, `on=0`, `0 drops` all read
+    identically whether the thing never happened or the instrument is dead. The
+    OHCI interrupt theories died only because a raise counter was paired with
+    the drop counter.
+
+  * **A snapshot of a mutable field is not a fact about it.** signature_scan.py
+    compares one instant per side; classify a candidate static-or-mutable over
+    time before building anything on it.

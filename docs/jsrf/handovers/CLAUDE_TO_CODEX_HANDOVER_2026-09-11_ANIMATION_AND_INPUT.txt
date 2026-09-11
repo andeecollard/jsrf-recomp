@@ -1,0 +1,411 @@
+JSRF HANDOVER FOR CODEX
+Date: 2026-09-11 (Europe/London), midday
+From: Claude -- session ran 10 Sep 20:40 BST through 11 Sep 12:00 BST; this
+      note covers the morning half (08:00-12:00 BST) and the tree as left.
+
+PURPOSE
+=======
+Two independent faults were worked this morning: the Corn-tutorial animation
+fault (the actual objective) and the "pad-poll stall" (the thing that was
+destroying runs). Both moved substantially, and in both cases the movement came
+from *retiring* a theory rather than confirming one. The long-form record is
+sections 13-28 of
+
+    docs/jsrf/handovers/CLAUDE_HANDOVER_2026-09-10_ANIMATION.txt
+
+which supersedes everything older on these subjects. This file is the short
+version plus the tree state, which that file does not cover.
+
+
+0. THE BRANCH
+=============
+    reference/xemu-oracle
+
+in the worktree
+
+    .../Jet Set Radio Future/xboxrecomp_upstream_integration
+
+That is the only branch touched this morning. Three things about it matter:
+
+  * It is **entirely local**. There is no origin/reference/xemu-oracle. Five
+    commits sit on it that are on no remote:
+
+        9a114fe  Integrate upstream Xbox recompilation changes
+        f2f6e57  Borrow the decompilation's names, and find G4 walking...
+        4ea335b  Merge the icall observations we were already seeding from
+        e90db7a  Write down where the intro fade is not...
+        893324b  Ask where the fade level lives...
+
+    Nothing this morning exists anywhere but this worktree's disk.
+
+  * **9a114fe is not one of ours in style or shape.** It landed at 12:02 BST,
+    two minutes after the session ended, with a generated-looking message, and
+    it swept the entire dirty tree into a single commit -- so it mixes the
+    morning's instrumentation with integration work that had been sitting
+    uncommitted (recomp_mem_watch, lifter/translator changes, the xemu_* tools,
+    several docs). 44 files, +5722/-42. If the log's prose convention matters
+    for this branch, it wants splitting before it is pushed.
+
+    The morning's work *is* inside it -- verified by content, not by message:
+    `[JSRF-PAUSE]` in diagnostics/jsrf_first_fault/main.c, `--skip-mismatched`
+    in instrument_startup.py and instrument_func_hit.py, `--ecxpair` in the
+    latter, `OHCI-RAISE`/`OHCI-DROP` in src/usb/ohci.c, the windowed-START
+    fake pad in src/input/xinput_device.c.
+
+  * Codex's branch is untouched: codex/upstream-integration is still at 48d89f3
+    (== origin).
+
+
+1. THE TREE AS HANDED OVER
+==========================
+One uncommitted file:
+
+    MM src/kernel/xbox_memory_layout.c
+
+It carries the **MCPX writable-alias** work: a shared file mapping gives two
+views of the 8 MB MCPX aperture -- the guest view stays read-only permanently
+while the device model writes through the second view -- so `mcpx_hw_store`,
+`mcpx_hw_store_n` and `mcpx_trap_handler` no longer unprotect anything, and the
+POSIX guard window disappears. The Windows path is unchanged behind `_WIN32`.
+
+Provenance, stated plainly: **this is not Claude's work.** It is in substance
+the same change as stash 31efe87, tagged `codex-ohci-alias-wip`, taken off
+codex/upstream-integration at 12:19 BST; the copy in this tree differs from the
+stash only by the mem-watch wiring that 9a114fe already committed here, plus one
+comment-indent hunk that is the sole unstaged change. It is directly the fix for
+[[mprotect-mmio-windows-lose-writes]] and for the rule in CLAUDE.md about
+guarded MMIO pages.
+
+As far as this session can determine it has **not been built or run** in this
+worktree. It wants `cmake --build`, `ctest`, and one real run before it is
+committed -- it rewrites the aperture's allocation path, so a silent failure
+there degrades to "USB/audio register access will fault".
+
+
+2. THREAD A -- THE ANIMATION FAULT (the objective)
+==================================================
+### Where it now stands, measured like-for-like
+
+At the Corn tutorial, both sides, same tool, same 10 s interval:
+
+    id 44:  xemu   2 dwords changed    recomp   8      <- near-static in BOTH
+    id 45:  xemu 449 dwords changed    recomp 137
+            shared 119 | xemu-only 330 | recomp-only 18
+
+The 330 dwords xemu writes and we never do are structured, not scattered:
+
+    +0x09E8           (1)
+    +0x0CE0..+0x0DE4  (66)   <- the transform block; 4x wider than the 16 dwords
+                                 previously measured, so the old window was too
+                                 narrow
+    +0x0E80           (1)
+    +0x11D4..+0x120C  (4 groups of 3)      <- 3-dword groups read as vectors
+    +0x12C0..+0x140C  (4 groups of 15)
+    +0x1484..+0x14D4  (5+ groups of 3)
+
+Shape reads as skeletal animation: bone matrices plus per-bone transforms. The
+offsets **saturate** -- a 30 s xemu sample names the identical set with
+identical counts as the 10 s one -- so this is a fixed per-frame working set,
+and a longer recomp window can only ever show "absent", never "slower".
+
+### Three framings died this morning, and that is the real progress
+
+  * **+0x11C is not an identity.** 31 samples: id 44 takes 13 distinct values,
+    id 45 takes 12, and **128 never appears in either series**. It is a mutable
+    state/animation index. The whole "both characters were given the same
+    identity" chain, the descriptor path and the four-way setter shortlist are
+    dead.
+
+  * **The animation machinery works.** In gameplay all four CPlayers show 16/16
+    dwords changing at +0xCE0 -- the same rate xemu shows at the tutorial. The
+    fault is scene-scoped to the Corn tutorial, not a general failure.
+
+  * **The "suppressed low 2.5 KB" (section 17) was an artefact.** xemu does not
+    write +0x0000..+0x09F4 at the tutorial either; that sweep is gameplay-only
+    on both sides. It came from comparing our gameplay against our tutorial,
+    which is not a differential at all.
+
+  * **id 44 is static by design.** xemu changes 2 dwords on it in 10 s and the
+    *same* two (+0xC94, +0x134C) in 30 s. Corn is id 45. Every reading taken on
+    id 44 -- the 8-vs-2 dwords, the +0x11C / +0xE50 / +0xE58 comparisons -- was
+    measuring correct behaviour.
+
+### The mode theory, and the one measurement still outstanding
+
+The JSRF-Decompilation author's video supplied the mechanism: every game object
+has 15 virtual methods (exec, postexec, draw x five modes), precedence
+CoveredPause > Event > FreezeCam > UncoveredPause > Default, and his own example
+of the wrong mode is *"the player character's position and animation won't get
+updated"* -- our symptom exactly. The decompilation's symbol table gives the
+walkers:
+
+    0x00011070  CActBase::recursiveExec0Default
+    0x00011D00  CActBase::recursiveExec1Default
+    0x000112A0  CActBase::recursiveExec0Event
+    0x000114D0  CActBase::recursiveExec0CoveredPause
+    0x00011700  CActBase::recursiveExec0FreezeCam
+    0x00011930  CActBase::recursiveExec0UncoveredPause
+    0x000123E0  CActMan::ActionExec
+
+Measured so far:
+
+    gameplay      Exec0Default 33916  Exec1Default 33917  ActionExec 3028
+                  Event / CoveredPause / FreezeCam / UncoveredPause  ALL ZERO
+    new-game menu Exec0Default 10020  Exec1Default 10000  others zero
+    tutorial      NOT YET MEASURED     <-- the outstanding step
+
+The mode booleans at CActMan +0x38..+0x48 are all-zero and **byte-identical to
+xemu** at the Corn dialogue (only frame counters and the id-array base differ),
+and all-zero demonstrably selects Default in two other scenes. So the inference
+is that the tutorial runs Default too and mode selection is exonerated -- but it
+is an inference, it is twelve counters and one human run to settle, and this
+project has been burned four times this week by exactly that substitution.
+
+### Also checked, and clean
+
+  * 893 indirect-call targets resolved, **0 unresolved**.
+  * 501 stubbed functions in the build, and **none** appears in CPlayer's vtable
+    or four related class vtables. A virtual landing on a stub would dispatch
+    correctly and silently do nothing -- the exact shape of our fault -- so this
+    was worth eliminating.
+  * Object layout was already verified twice: against the decompilation's real
+    CActBase/CActMan headers, and by the 47-object field-by-field xemu match.
+
+
+3. THREAD B -- THE "PAD-POLL STALL" IS TWO THINGS
+=================================================
+This is the correction with the widest blast radius. **Every prior stall
+observation in the older handovers needs re-reading against this split.**
+
+  (1) PAUSE. `polls` stops climbing, CActMan +0x3C and +0x40 both read 1, and
+      `recursiveExec0CoveredPause` runs in place of Default. Caused by a START
+      press. **Not a bug.** RECOMP_FAKE_PAD pulsed A *and START* once a second,
+      so START opened the pause menu -- meaning every unattended "reliable
+      reproduction of the stall" celebrated earlier in the session was the fake
+      pad pausing the game.
+
+  (2) polls flat or polls = 0 while **not** paused, with Default mode still
+      executing normally. A genuine defect, and the one worth chasing.
+
+Caught live, with zero instrumentation (so no perturbation):
+
+    healthy (polls=1166)   Exec0Default + Exec1Default running
+    stalled (polls=8790)   both absent, Exec0CoveredPause running   <- (1)
+
+    genuine (polls flat at 1220, +3C=0 +40=0, live=145)
+        Exec0Default 15 samples, Exec1Default 12, every other walker 0
+        top frames: sub_0005E9B0 55  sub_00191440 48  sub_000B3E10 46
+                    sub_001993A0 45  sub_000163D0 26  sub_00159650 24
+
+`sub_000163D0` is the frame already recorded in
+[[jsrf-corn-tutorial-input-poll-stall]], so (2) is the same long-standing bug,
+now with the pause confound stripped out. The guest runs its whole frame loop
+and simply stops requesting USB reports.
+
+### Both interrupt theories are dead, killed by a positive control
+
+    stalled run (polls flat at 1767):  OHCI-RAISE 0   OHCI-DROP 0
+    healthy run (polls -> 14329):      OHCI-RAISE 0   OHCI-DROP 0
+
+`ohci_raise()` is **never called at all**, healthy or stalled. No interrupt is
+ever dropped because none is ever raised, and the worker's "operational after
+N ms; device arriving on port 1" line never prints in any run. That kills both
+the level-vs-edge-trigger theory and the worker-exit-guard theory. Without the
+positive control, "0 drops" would have been filed as "no masking race", which is
+the exact opposite of the truth.
+
+A level-triggered delivery change to ohci.c was written, tested (one clean run,
+one that never polled at all, one that stalled later at 3117) and **reverted**.
+What remains in ohci.c is opt-in tracing only -- no behavioural change.
+
+### Instrument weight precipitates (2)
+
+    1118 probe sites -> froze at 30 polls
+     578 probe sites -> froze at 253 polls
+       0 probes      -> ran to 8790 polls
+
+The instrument heavy enough to watch this stall is heavy enough to cause it
+earlier, so the entry-differential approach is self-defeating here. Sampling
+(/usr/bin/sample against the live pid) has zero per-call cost and is the only
+unperturbed observer available. Consistent with
+[[jsrf-instrumentation-weight-destabilises-jsrf]].
+
+
+4. TOOLING CHANGED (all in 9a114fe)
+===================================
+  * `instrument_startup.py --skip-mismatched`. It asserted a per-site label
+    count across all 84 sites and **5 had drifted** against this gen, so it
+    refused to install anything -- which is why RECOMP_TRIGGER_TRACE,
+    TREE_TRACE, RESOURCE_TRACE and STARTUP_STATE were all recorded as
+    "unexplored". Each site is still validated individually; the 79 that match
+    install, the 5 skipped are named. TRIGGER_TRACE and DIALOG_SCAN both work
+    now and print usefully.
+
+  * `instrument_func_hit.py --ecxpair VA:0` records `(this, vtable)` per call,
+    so an object's class is identified directly with no dump correlation. Same
+    skip escape valve: 545 of 550 counters installed, ran clean (scene
+    live=164, 701,600 draws), 176 executed in gameplay.
+
+  * `[JSRF-PAUSE] +3C=.. +40=..` printed every report in main.c, with an
+    explicit "<== PAUSED (covered pause)" marker. One line, and it permanently
+    prevents section 3's misdiagnosis recurring.
+
+  * RECOMP_FAKE_PAD is now a START *window*, because a pad that never sends
+    START cannot get past "Press Start" at all (the first fix attempt got this
+    wrong):
+
+        RECOMP_FAKE_PAD=1        START for the first 90 s, then A only [default]
+        RECOMP_FAKE_PAD=<n>      as above with an n-second window
+        RECOMP_FAKE_PAD=a        never send START
+        RECOMP_FAKE_PAD=always   old behaviour -- and it WILL pause the game
+
+    The mode is announced at startup as `[PAD] fake pad: ...`.
+
+  * ohci.c: OHCI-RAISE / OHCI-DROP counters, opt-in, read-only.
+
+
+5. TRAPS PAID FOR THIS MORNING
+==============================
+  * `signature_scan.py` compares **one instant per side**. For any mutable field
+    "distinct in xemu, identical here" can be sampling coincidence. Its output
+    is a candidate list, and each candidate must be classified static-or-mutable
+    over time before anything is built on it.
+
+  * A pass/fail check of first-vs-last poll count labelled a run "OK" whose last
+    three reports were identical -- it had stalled, just later. **The tail is the
+    signal, not the endpoints.**
+
+  * Freeze detection comparing `tail -1` against `tail -3 | head -1` matches
+    spuriously when fewer than three reports exist, and produced a false stall.
+
+  * RECOMP_FAKE_PAD does **not** bypass the USB path: `g_pad_polls++` sits
+    *before* the fake-pad branch in `xbox_InputGetState`, so flat `polls` in a
+    FAKE_PAD run is a real observation -- but see section 3 for why those runs
+    were pausing themselves anyway.
+
+  * `RECOMP_MEM_WATCH_MIRRORS` is not a switch. It is a compile-time
+    `#define 28u` inside recomp_mem_watch.c with no env binding. An earlier
+    handover line suggesting it be tried was wrong.
+
+
+6. WHAT TO DO NEXT
+==================
+Ordered by evidence per hour. B is the only thread that iterates without a human
+at the pad.
+
+  A1. Measure the exec walkers at the Corn tutorial. Twelve counters, one run,
+      `[JSRF-PAUSE]` now live so the run self-diagnoses. Default-only exonerates
+      mode selection outright and puts the fault inside the Default exec method
+      for id 45; anything else and the video's mechanism is our bug.
+
+  A2. Find the writer of id 45's +0xCE0..+0xDE4 by gameplay-vs-tutorial entry
+      differential -- same binary both halves, so whatever runs in one and not
+      the other is the target. Use a **light** probe set (578 sites perturb the
+      run). Static grep cannot find it: a 66-dword block plus 15-dword groups is
+      a block copy or an indexed loop, not `mov [reg+disp]` stores.
+
+  B1. Take a healthy and a stalled sample in the same run and diff the frame
+      sets. The frames present when healthy and absent when stalled are the poll
+      path that stops. Sampling only, for the reason in section 3.
+
+  B2. Re-run the real-pad case. Four of ~14 real-pad runs flatlined and none was
+      checked for pause state; `[JSRF-PAUSE]` now settles which of (1) or (2)
+      each one is at a glance.
+
+  C1. Build and test the MCPX alias sitting in the tree (section 1), then commit
+      it on its own with a message that says why.
+
+  C2. Harness, if A or B drags: xemu save states via `-monitor`/`savevm` makes
+      the oracle measurement repeatable in seconds instead of a playthrough, and
+      scripted pad input makes the tutorial half of A2 unattended. Roughly
+      twenty-five playthroughs have gone into this investigation; that is the
+      dominant cost, not compute.
+
+
+7. ARTEFACTS
+============
+Correction to an earlier draft of this file: the run artefacts are **not**
+lost. Every run this week is preserved under
+
+    build-macos/jsrf-first-fault/render-investigation/<name>/{stdout,stderr}.log
+
+(90 directories, gitignored but on disk), including the gameplay CPlayer-entry
+baselines and every exec-mode count quoted above. Only the ad-hoc scratch
+scripts live in an ephemeral /private/tmp session directory. That log corpus is
+what made section 9 below provable without re-running anything.
+
+The sampler itself was an inline loop around /usr/bin/sample taking a paired
+healthy/stalled capture from one pid. Given that sampling is now the only
+viable observer for thread B, it is worth writing properly into
+diagnostics/jsrf_first_fault/ rather than rebuilt ad hoc each session.
+
+
+9. THE MCPX ALIAS (ff5f578) IS IMPLICATED IN A NEW CRASH
+========================================================
+Added 11 Sep, after the alias described in section 1 was committed as ff5f578
+"Keep MCPX guest writes guarded through a writable alias" and validated as
+"SIGSEGV is pre-existing". **It is not pre-existing.**
+
+### The measurement
+
+Every preserved run under render-investigation/, classified by whether its
+banner says "hardware writes use a permanent alias":
+
+    alias builds      9 faults at 0x00000003FFFFFFBE / 18 runs
+    non-alias builds  0 occurrences of that address, in 72 recorded runs
+                      over two days
+
+Faults in non-alias runs exist but are other addresses with other causes
+(0x38508C487 is the mem-watch series, 0x38B04778D, 0x3FFFF7A89). The address
+0x3FFFFFFBE appears **only** with the alias, and always identically:
+
+    SIGNAL: SIGSEGV (11)   HOST FAULT ADDRESS: 0x00000003FFFFFFBE
+    EAX=FFFFFFB4 ECX=000006C4 EDX=00002054 EBX=00000011
+    LAST INSTRUMENTED GUEST FUNCTION: sub_00147EBB
+
+0x3FFFFFFBE is guest VA 0xFFFFFFBE (base 0x300000000), i.e. a guest
+dereference at -66 with EAX = -76 -- a negative/error value used as a pointer.
+
+### The controlled A/B, run today
+
+Same build directory, same gen, same environment
+(`RECOMP_SEPARATE_RESERVE=0`, 64 MB, fake pad), the only variable being
+`git checkout ff5f578^ -- src/kernel/xbox_memory_layout.c` and a rebuild:
+
+    alias, run_bounded 75 s          0 faults / 3   (~8,600 polls each)
+    alias, sample_pad_poll harness   1 fault  / 3
+    control, sample_pad_poll         0 faults / 5
+
+So it is intermittent and load-sensitive -- the sampler harness provokes it --
+but it never appears without the alias.
+
+### Why the original validation missed it
+
+Two confounds, both visible in the preserved logs:
+
+  * The runs used to declare it pre-existing were themselves **alias runs**.
+    The one named `alias-ref-long-1` -- the intended reference -- prints
+    "hardware writes use a permanent alias" in its own banner. There was no
+    control arm.
+  * Those runs also differed from the morning's healthy baseline in two
+    unrelated switches: `RECOMP_TOTAL_RAM_MB` was 128 rather than 64 (visible
+    as "mapped 131072 KB", "Mirror 16: skipped", 27/28 views) and
+    `RECOMP_SEPARATE_RESERVE` was unset, so heap reserves landed at 0x04000000
+    "outside physical RAM". Both differ from every healthy run on record, and
+    neither was noticed.
+
+Note that the project's own harness already knew about this shape:
+`sample_pad_poll.py` hard-codes `RECOMP_SEPARATE_RESERVE=0` with the comment
+that the separate-reserve path "has its own known 0xFFFFFFxx guest-address
+fault".
+
+### Recommendation
+
+Revert or hold ff5f578 until the mechanism is understood. The change is
+mechanically sound in intent -- it is the right answer to
+[[mprotect-mmio-windows-lose-writes]], and its own instrumentation is clean
+(12,469 trapped writes, zero guard windows) -- but it introduces a crash in
+half the runs that provoke it, and nothing in the current investigation
+depends on it. Do not carry it under the animation or input measurements: a
+build that dies at ~10 s in half its runs will corrupt every differential
+those threads rely on.
