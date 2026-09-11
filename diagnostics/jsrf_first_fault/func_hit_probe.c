@@ -37,14 +37,32 @@ static int func_hit_on(void)
     return on;
 }
 
-/* The ORDER the sites were first entered in, not just how often.
+/* The ORDER the sites were entered in, not just how often.
  *
- * Counting brackets a divergence to a set of functions; it cannot say which
- * ran when, and "how did the guest get into this error path" is an ordering
- * question. This records the first FUNC_SEQ_MAX entries in call order, which
- * is the window the init sequence lives in -- a stalled guest then repeats one
- * or two sites forever and adds nothing, so recording the head rather than the
- * tail is what makes the two hosts comparable. */
+ * Counting brackets a divergence to a SET of functions; it cannot say which
+ * ran when, and "how did the guest get here" is an ordering question.
+ *
+ * The ring is CIRCULAR and per thread. It was head-capped first, which was
+ * wrong: both hosts are identical for hundreds of steps and what differs is
+ * where a thread STOPS, which a ring that fills up and then ignores everything
+ * afterwards cannot show.
+ *
+ * KNOWN LIMIT, and it blocks cross-host use. The slot a thread gets is handed
+ * out by FIRST-TOUCH ORDER, so slot N is a different thread on each host and
+ * on each RUN -- macOS slot 0 opened with 00192A80 in one run and 00154420 in
+ * the next. Comparing "thread 0" against "thread 0" across hosts is therefore
+ * meaningless, and matching threads by common prefix fails too once the runs
+ * sit at different stages: measured, no pair across the two hosts shared even
+ * three collapsed steps. To use this differentially the ring has to be keyed
+ * by a STABLE identity -- the first guest function a thread enters, or a role
+ * assigned where the thread is created -- not by the order slots are claimed.
+ * As it stands this answers "where did this thread stop" on ONE host.
+ *
+ * Two things the DIFF needs, which are not obvious and cost a wrong answer
+ * each: collapse consecutive repeats first, or a poll that takes a different
+ * number of spins offsets everything after it; and filter the ISR entry points
+ * if the rings are merged, because an interrupt taken at a different moment is
+ * scheduling, not divergence. */
 #define FUNC_SEQ_MAX 1024u
 #define FUNC_SEQ_THREADS 8u
 
