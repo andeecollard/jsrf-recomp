@@ -85,3 +85,65 @@ Every one of these was tested and eliminated before the answer turned up, and
 none of them was it: .text corruption by the ring, the KeConnectInterrupt race,
 concurrent guest DPCs, the OHCI 0xFF memset, unbridged ordinals leaking stack,
 guest block copies, and kernel bridge calls.
+
+---
+
+# Addendum: the real fix, one field wide
+
+The refusal guard made the corruption visible and non-fatal. This is why it
+happened, found by printing the surface address in its two parts.
+
+    macOS    [SURFACE] zeta dma_handle=0x0A base=0x00000000 limit=0x07FFAFFF
+                       pitch=2560 offset=0x007B4000 -> 0x007B4000..0x008E0000
+    Windows  [SURFACE] zeta dma_handle=0x0A base=0x00000000 limit=0x07FFAFFF
+                       pitch=2560 offset=0x00248000 -> 0x00248000..0x00374000
+
+Same DMA object, same base, same limit, same pitch. **Only the offset differs**,
+and the offset is the guest's own SET_SURFACE_ZETA_OFFSET -- so the guest had
+allocated its depth buffer somewhere different, and the GPU model was faithfully
+clearing where it was told.
+
+`xbox_ContiguousAlloc` is two different allocators:
+
+    POSIX     xbox_HeapAlloc(size, alignment)      -- the guest heap, which
+                                                      already sits above the image
+    Windows   g_contig_next, starting at XBOX_CONTIG_BASE
+
+so on Windows the first contiguous allocation has physical offset 0 and they
+climb from there, straight through the title's own code and data. The GPU
+addresses this window BY PHYSICAL OFFSET, so anything below the image end is
+aliased onto the image.
+
+The POSIX branch's own comment records this exact bug being fixed there, for
+this same title:
+
+    Returning 0x80084000 here made JSRF's raster clear write to 0x00084000
+    (live guest code) instead of its framebuffer.
+
+It was fixed on one host and left standing on the other -- the same shape as
+every other find of this session.
+
+## The fix and what it moved
+
+The Windows arena now starts above the loaded image, read lazily because the
+image bounds are only known after the sections load:
+
+    [CONTIG] arena starts above the image: 0x80290000 (image ends 0x00288620)
+
+    depth surface   offset 0x00248000 -> 0x004D8000
+    framebuffer     fb=0x001B2000     -> fb=0x00442000
+
+Both now clear the image. Zero refusals, zero 0xFFFFFF00, no guest fault, and
+the title gets far enough to load its media -- the run ends in
+`Media\People\People01.dat` (1,157,120 bytes read) and then an assertion in our
+own APU voice processor, `v < MCPX_HW_MAX_VOICES` at apu_vp.c:1055. That is a
+different and much later failure, and it is the next thing to look at.
+
+macOS unchanged and untouched by this (its branch is the POSIX one): 2,733,864
+methods, 7528 clears, 1885 flips, 61.8 Hz, zero CONTIG lines, ctest 21/27.
+
+## Standing conclusion
+
+Three symptoms had one cause. The depth surface inside .data, the framebuffer at
+0x001B2000, and the push-buffer ring at physical 0x1000 were all the Windows
+contiguous arena starting at offset 0. The ring is worth re-measuring now.

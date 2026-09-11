@@ -4287,6 +4287,38 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     return result && g_physical_heap_view ? result | XBOX_CONTIG_BASE : result;
 #else
     uint32_t result;
+
+    /* Never hand out a physical offset that overlaps the loaded image.
+     *
+     * The arena starts at XBOX_CONTIG_BASE, so the first allocation has
+     * physical offset 0 and they climb from there -- straight through the
+     * title's own code and data. The GPU addresses this window BY PHYSICAL
+     * OFFSET: JSRF puts a depth surface here and programs
+     * SET_SURFACE_ZETA_OFFSET with the low 26 bits, and the clear then writes
+     * through that offset into low guest RAM. Measured: offset 0x00248000 on
+     * this host against 0x007B4000 on POSIX, 1.2 MB of cleared depth
+     * (0xFFFFFF00) painted over .data, and the title dying later on a function
+     * pointer and a list head that had been inside the surface.
+     *
+     * The POSIX branch above does not have this problem because it allocates
+     * from the guest heap, which already sits above the image -- and its
+     * comment records the same bug being fixed there, for this same title.
+     * This is that fix for this host.
+     *
+     * Read lazily rather than at init: the image bounds are known only after
+     * the sections are loaded, and the first caller is later than that. */
+    if (g_xbox_image_hi) {
+        uint32_t floor_va = XBOX_CONTIG_BASE
+                          + ((g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu);
+        if (g_contig_next < floor_va) {
+            fprintf(stderr, "  [CONTIG] arena starts above the image: "
+                            "0x%08X (image ends 0x%08X)\n",
+                    floor_va, g_xbox_image_hi);
+            fflush(stderr);
+            g_contig_next = floor_va;
+        }
+    }
+
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
     /* Leave the top of the window for GPU instance memory. */

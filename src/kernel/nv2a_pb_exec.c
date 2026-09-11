@@ -1130,6 +1130,28 @@ static void clear_surface(uint32_t param)
                 && (uint64_t)base+offset<=UINT32_MAX) {
             uint8_t *z=xbox_GpuMemoryRange(base+offset,bytes);
             uint32_t value=s_methods[0x1d8c/4];
+            /* Where the depth surface actually is, in its two parts.
+             *
+             * The address is the zeta DMA object's base plus
+             * SET_SURFACE_ZETA_OFFSET, and on Windows it lands inside the
+             * loaded image while macOS puts it above. Printing base and offset
+             * separately says WHICH half is wrong -- a bad DMA object and a bad
+             * offset are different bugs with different owners, and the refusal
+             * line downstream only shows their sum. Once per distinct
+             * combination; RECOMP_SURFACE_TRACE=1. */
+            {
+                static int on=-1; static uint32_t lb,lo,lp; static uint32_t lh;
+                if (on<0) on=getenv("RECOMP_SURFACE_TRACE")?1:0;
+                if (on && (base!=lb||offset!=lo||pitch!=lp||s_methods[0x198/4]!=lh)) {
+                    lb=base; lo=offset; lp=pitch; lh=s_methods[0x198/4];
+                    fprintf(stderr,
+                        "  [SURFACE] zeta dma_handle=0x%08X base=0x%08X limit=0x%08X"
+                        " offset=0x%08X pitch=%u -> 0x%08X..0x%08X\n",
+                        lh, base, limit, offset, pitch,
+                        base+offset, (uint32_t)(base+offset+bytes));
+                    fflush(stderr);
+                }
+            }
             /* Never clear into the loaded image.
              *
              * A Z24S8 clear writes stencil 0x00 then depth 0xFF 0xFF 0xFF, so
