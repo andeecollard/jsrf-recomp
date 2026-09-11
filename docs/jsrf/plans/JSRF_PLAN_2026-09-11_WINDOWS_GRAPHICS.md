@@ -12,6 +12,14 @@ test: `MmAllocateContiguousMemoryEx` (ordinal 166) is called 59 times on macOS
 and zero times on Windows, so D3D never allocates GPU memory and the push
 buffer falls back to a bogus base.
 
+## Scale correction (2026-09-11)
+
+"Windows walks in a handful of times" is true of these two functions and false
+of the machine. Normalised against the 547 sites armed on both hosts, Windows
+runs the interrupt and poll path five to six times MORE than macOS. It is not
+idle or short; it spins. Read every Windows deficit below against that
+baseline, not against an assumption that the host is doing less.
+
 ## The target is now two functions
 
 The `[HEAP]` lines carry the guest return address of each allocation, and on
@@ -19,12 +27,20 @@ macOS every ordinal-166 call comes from one of two sites -- `ra=0x0018E6E9` and
 `ra=0x00199789`, inside `sub_0018E670` and `sub_00199760`, both in the D3D
 section. Both are armed, and both ARE entered on Windows:
 
-        sub_0018E670    mac=235    win=3
-        sub_00199760    mac=895    win=2
+        sub_0018E670    mac=235    win=15
+        sub_00199760    mac=979    win=77
 
-So the branch is INSIDE these two, not upstream of them. Windows walks in a
-handful of times, returns without allocating, and never comes back. That is a
-far smaller target than anything chased today.
+(Counts corrected 2026-09-11 to one run per host, both read from the last
+contiguous [FUNC-HIT] table in the same logs the allocations were counted in.
+The earlier win=3/win=2 came from a shorter run and understated entry.)
+
+"So the branch is INSIDE these two, not upstream of them" -- WITHDRAWN. macOS
+allocates on 2.6% and 5.4% of entries, so Windows' 92 entries would be expected
+to yield 4.6 allocations and yielded none: P = 0.009, one run, and the
+sub_0018E670 half of it is worthless alone (P = 0.68). That is suggestive of an
+inside-branch difference, not evidence of one. The larger and far more certain
+effect is the entry deficit itself -- 92 against 1,214, and ~70-90x once
+normalised by the scale correction above -- which is upstream of both.
 
 ## Steps, in order, with what each settles
 
@@ -42,16 +58,24 @@ far smaller target than anything chased today.
    once the structure is complete, or validate the routine before reading any
    of it. ~10 lines.
 
-3. READ THE TWO FUNCTIONS. sub_0018E670 is 0xBB bytes and sub_00199760 is 0x56
-   -- both small. Read what they test before the allocation call. A capability
-   check, a null from an earlier call, or a mode field are all plausible and
-   the code will say which.
+3. READ THE TWO FUNCTIONS. -- DONE, 2026-09-11. See
+   `../progress/CLAUDE_PROGRESS_2026-09-11_TWO_FUNCTIONS_READ.md`. Neither
+   contains a capability check or a mode field; each has exactly one branch
+   before the allocation, and it is the same call in both --
+   `sub_0014A83E`, a wrapper over the title's heap. The allocation itself is
+   an indirect call through kernel thunk slot 102, confirmed from the XBE as
+   ordinal 166. The icall is not failing to resolve: the only ICALL failure on
+   Windows is a single null target that macOS also has exactly once.
 
-4. IF READING DOES NOT SETTLE IT, instrument their arguments rather than more
-   functions. instrument_func_hit.py already supports --stackarg, --ecxfield
-   and --ecxpair, so the `this` pointer and the size/alignment arguments can be
-   recorded on both hosts and diffed. That is a direct comparison of what the
-   guest asks for, not another bisection.
+4. ARM `sub_0014A83E` -- replaces the argument-instrumentation step, which the
+   counts do not support. Windows enters the two functions 15 and 77 times
+   against macOS's 235 and 979, and macOS allocates on only 2.6% and 5.4% of
+   entries, so 92 Windows calls cannot resolve a branch at that rate (P = 0.009
+   for the whole observation, from one run). `sub_0014A83E` is armed in no run
+   in the corpus and is the only untested link in the chain; it separates "the
+   guest never reaches the allocation" from "the allocation returns zero" with
+   one site. Arm `0x0014A83E` and `0x001497DC`, and log `MEM32(0x27DCD4)` --
+   the title's heap handle -- once at startup.
 
 5. ONLY THEN widen tracing, and if you do, fix the sequence ring first: thread
    slots are handed out by first-touch order, so cross-host diffs are invalid
@@ -83,3 +107,12 @@ arming more sites stops moving it -- today's moved three times.
 And read a counter's trigger before trusting it. The Windows RECOMP_APU_TRACE
 prints the value read BACK from the model rather than the value written, which
 made correct writes look like zeros and produced a whole wrong narrative.
+
+## Retired
+
+  - instrumenting the two functions' arguments (step 4 as originally written):
+    the event rate is 2.6-5.4% and Windows supplies 92 samples.
+  - the icall through thunk slot 102 failing to resolve: measured on both
+    hosts, one null target each, not a discriminator.
+  - the 187 sites present on macOS and absent from Windows as a lead: macOS
+    reached gameplay and Windows has not, so they are absent by construction.
