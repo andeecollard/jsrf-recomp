@@ -887,6 +887,7 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
 
     s_snap_wanted = 1;
 
+#if !defined(_WIN32)
     if (s_snap && s_snap_w && s_snap_h) {
         if (w) *w = s_snap_w;
         if (h) *h = s_snap_h;
@@ -894,9 +895,17 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
         if (bpp) *bpp = s_snap_bpp;
         return s_snap;
     }
+#endif
 
     /* Before the first flip there is no finished frame, so show the live
-     * surface rather than nothing: the intro logos appear during this window. */
+     * surface rather than nothing: the intro logos appear during this window.
+     *
+     * Windows deliberately stays on this path after flips too. JSRF continues
+     * issuing FLIP_STALL while the saved frame remains the anti-graffiti image,
+     * even though it renders later frames into rotating live surfaces. A
+     * generation timeout therefore cannot distinguish the stale copy. Live
+     * presentation may tear, but it keeps the displayed image in step with
+     * the game and is the reliable path under Wine/CrossOver. */
     b = surface_bpp();
     if (!s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
         return NULL;
@@ -905,13 +914,39 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
     mem = (const uint8_t *)xbox_GetMemoryOffset();
     if (!mem)
         return NULL;
-    if (w) *w = s_gpu.clip_w;
-    if (h) *h = s_gpu.clip_h;
-    if (pitch) *pitch = s_gpu.pitch;
-    if (bpp) *bpp = b;
-    return mem + s_gpu.color_offset
-               + (size_t)s_gpu.clip_y * s_gpu.pitch
-               + (size_t)s_gpu.clip_x * b;
+
+    /* Bounds-check before handing a pointer to the presenter.
+     *
+     * Every rasteriser path in this file validates the surface against guest
+     * RAM before touching it; this one handed out a raw pointer computed from
+     * color_offset, clip and pitch and trusted them. Those come from the guest
+     * and are mid-update while the parser is running, so a plausible-looking
+     * set can address past the end of RAM -- measured on Windows, which reads
+     * the live surface every frame: an access violation at guest 0x01FFFFF8,
+     * eight bytes below the 32 MB boundary, five seconds into the run.
+     *
+     * xbox_GpuMemoryRange is the accessor the rest of the file uses and it
+     * checks the whole span, not just the first byte. Returning NULL here just
+     * means the presenter skips a frame, which is what it already does before
+     * the first flip. */
+    {
+        uint32_t first = s_gpu.color_offset
+                       + (uint32_t)s_gpu.clip_y * s_gpu.pitch
+                       + (uint32_t)s_gpu.clip_x * b;
+        uint64_t span = (uint64_t)s_gpu.clip_h * s_gpu.pitch;
+        const uint8_t *p;
+
+        if (!span || span > 0x08000000ull)
+            return NULL;
+        p = (const uint8_t *)xbox_GpuMemoryRange(first, (size_t)span);
+        if (!p)
+            return NULL;
+        if (w) *w = s_gpu.clip_w;
+        if (h) *h = s_gpu.clip_h;
+        if (pitch) *pitch = s_gpu.pitch;
+        if (bpp) *bpp = b;
+        return p;
+    }
 }
 
 
@@ -2811,13 +2846,20 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    /* How much of the drawing went through software, on EVERY host.
+     *
+     * This lived inside the Apple branch beside the Metal counters, so the one
+     * host with no GPU path at all -- the one where the answer matters -- never
+     * printed it. Same trap as the VEH fault counters: a counter that cannot
+     * be read on the host under investigation is not a counter. */
+    fprintf(stderr, "[RASTER] %u batches + %u triangles on the CPU;"
+                    " %u triangles total\n",
+            s_gpu.cpu_batches, s_gpu.cpu_tris, s_gpu.tris_drawn);
 #ifdef __APPLE__
     if (getenv("RECOMP_METAL"))
     {
-        fprintf(stderr,"[METAL] %u batches native, %u software fallbacks,"
-                       " %u batches + %u triangles on the CPU\n",
-            s_gpu.metal_batches,s_gpu.metal_fallbacks,
-            s_gpu.cpu_batches,s_gpu.cpu_tris);
+        fprintf(stderr,"[METAL] %u batches native, %u software fallbacks\n",
+            s_gpu.metal_batches,s_gpu.metal_fallbacks);
         nv2a_metal_report();
     }
 #endif
