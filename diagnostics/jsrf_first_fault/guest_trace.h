@@ -10,6 +10,9 @@ void jsrf_draw_one_report(void);
 
 void jsrf_func_hit(uint32_t va);
 void jsrf_func_hit_report(void);
+/* Entry count for one armed site -- the guest's own clock, for comparisons
+ * that must be anchored to guest execution rather than to wall-clock. */
+unsigned long long jsrf_func_hit_count(uint32_t va);
 void jsrf_func_arg(uint32_t va, uint32_t value);
 void jsrf_func_arg2(uint32_t va, uint32_t a, uint32_t b);
 

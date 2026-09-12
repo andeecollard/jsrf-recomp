@@ -116,6 +116,32 @@ void jsrf_func_hit(uint32_t va)
     }
 }
 
+/* How many times an armed site has been entered, for anyone who needs the
+ * GUEST's own clock rather than the host's.
+ *
+ * The two hosts run at very different speeds -- Windows about a fifth of macOS
+ * on the main loop -- so anything anchored to wall-clock compares two different
+ * moments in the guest's life and calls the difference a divergence. This
+ * project has already published three handovers that made exactly that mistake.
+ * Anchoring to a site's entry count instead compares the same instant of guest
+ * execution on both hosts, whatever the hosts were doing.
+ *
+ * Returns 0 for a site that is not armed, which is indistinguishable from one
+ * that has not run yet -- so callers that care must arm the site deliberately
+ * and check it is counting before trusting a zero. */
+unsigned long long jsrf_func_hit_count(uint32_t va)
+{
+    unsigned i = (unsigned)(va >> 4) & FUNC_HIT_MASK;
+    unsigned probes;
+    if (!va) return 0;
+    for (probes = 0; probes <= FUNC_HIT_MASK; ++probes) {
+        if (g_hits[i].va == va) return g_hits[i].hits;
+        if (g_hits[i].va == 0)  return 0;
+        i = (i + 1u) & FUNC_HIT_MASK;
+    }
+    return 0;
+}
+
 /* Record the distinct `this` pointers a site is entered with.
  *
  * sub_0009D030 stores sub_000A0260's return value into [this + 0xE54], the bit

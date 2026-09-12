@@ -1906,6 +1906,43 @@ static void jsrf_object_dump(void)
     if (!dir || !base || seq >= 128u)
         return;
 
+    /* RECOMP_OBJECT_DUMP_AT=<n>[,<va>] anchors the dump to the GUEST's clock.
+     *
+     * This function is called from the periodic report, which is wall-clock
+     * driven -- fine for watching one host, useless for comparing two. Windows
+     * runs the guest main loop at about a fifth of macOS's rate, so the same
+     * report interval catches the two hosts at completely different points in
+     * the guest's life, and every field that has simply moved on reads as a
+     * divergence. Three handovers in this project made that mistake before the
+     * rule was written down.
+     *
+     * With this set, the dump waits until an armed site has been entered <n>
+     * times and then writes ONCE. Both hosts then describe the same instant of
+     * guest execution. Default site is sub_000123E0, the manager's per-frame
+     * tick, which is the clock the loop-rate figures already use; arm it with
+     *     instrument_func_hit.py --va 000123E0
+     * and the site must be armed or the count is always zero and the dump
+     * never fires -- deliberately, because a dump at the wrong moment is worse
+     * than no dump. */
+    {
+        const char *at = getenv("RECOMP_OBJECT_DUMP_AT");
+        if (at) {
+            static int done;
+            unsigned long long want = strtoull(at, NULL, 0);
+            const char *comma = strchr(at, ',');
+            uint32_t clock_va = comma ? (uint32_t)strtoul(comma + 1, NULL, 16)
+                                      : 0x000123E0u;
+            unsigned long long now = jsrf_func_hit_count(clock_va);
+            if (done || now < want)
+                return;
+            done = 1;
+            fprintf(stderr, "  [OBJ-DUMP] guest clock %08X reached %llu"
+                            " (wanted %llu); dumping once\n",
+                    clock_va, now, want);
+            fflush(stderr);
+        }
+    }
+
 #define R32(va) (*(const uint32_t *)(base + (va)))
 
     via_ptr = R32(JSRF_ROOT_PTR_VA);
