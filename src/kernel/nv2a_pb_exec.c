@@ -925,15 +925,31 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
 
     s_snap_wanted = 1;
 
-#if !defined(_WIN32)
-    if (s_snap && s_snap_w && s_snap_h) {
-        if (w) *w = s_snap_w;
-        if (h) *h = s_snap_h;
-        if (pitch) *pitch = s_snap_w * s_snap_bpp;   /* the copy is packed */
-        if (bpp) *bpp = s_snap_bpp;
-        return s_snap;
+    /* The frame AT the flip, which is a whole frame by construction.
+     *
+     * Reading the surface the guest is still drawing into, on the presenter's
+     * own timer, catches it mid-draw: a fullscreen image is two triangles, the
+     * software rasteriser manages a few frames a second, and the result tears
+     * on a hard diagonal. That is what the flip copy exists to avoid.
+     *
+     * This was #if !defined(_WIN32) -- Windows took the live surface because
+     * the flip copy was seen holding the anti-graffiti image while rendering
+     * went on elsewhere. That trades a frozen picture for a torn one and hides
+     * which of the two is actually happening. It is a runtime switch now, so
+     * the two can be told apart in one run each: RECOMP_FB_LIVE=1 restores the
+     * live surface, and the [FB] sampler line says whether the picture is
+     * moving under either. */
+    {
+        static int live = -1;
+        if (live < 0) live = getenv("RECOMP_FB_LIVE") ? 1 : 0;
+        if (!live && s_snap && s_snap_w && s_snap_h) {
+            if (w) *w = s_snap_w;
+            if (h) *h = s_snap_h;
+            if (pitch) *pitch = s_snap_w * s_snap_bpp;   /* the copy is packed */
+            if (bpp) *bpp = s_snap_bpp;
+            return s_snap;
+        }
     }
-#endif
 
     /* Before the first flip there is no finished frame, so show the live
      * surface rather than nothing: the intro logos appear during this window.
