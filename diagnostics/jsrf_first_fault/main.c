@@ -1891,11 +1891,13 @@ static int jsrf_va_ok(uint32_t va)
  * +7FA4 m_lpDrawRoot, +7FAC m_lpDrawSortRoot, +7FB4 m_lpDrawSortBinRoots[256]. */
 static int g_obj_dump_force;
 static void jsrf_object_dump(void);
+static int g_obj_dump_fired;      /* the alarm got there first */
 static void jsrf_object_dump_alarm(void)
 {
     g_obj_dump_force = 1;
     jsrf_object_dump();
     g_obj_dump_force = 0;
+    g_obj_dump_fired = 1;
 }
 
 static void jsrf_object_dump(void)
@@ -1934,6 +1936,22 @@ static void jsrf_object_dump(void)
      * and the site must be armed or the count is always zero and the dump
      * never fires -- deliberately, because a dump at the wrong moment is worse
      * than no dump. */
+    /* Applies to the alarm path as much as the polling one.
+     *
+     * This used to be set inside the polling block, which the alarm skips --
+     * so the precise dump landed and the run then carried on for ever, and the
+     * only reason anything ever exited was the second, sloppier dump that the
+     * poll produced a few frames later. Suppressing that duplicate exposed it.
+     * Gated on an anchor being configured so that a plain RECOMP_OBJECT_DUMP
+     * run, which wants a sequence of dumps, still gets one. */
+    {
+        static int exit_env = -1;
+        if (exit_env < 0)
+            exit_env = getenv("RECOMP_OBJECT_DUMP_EXIT") != NULL
+                    && getenv("RECOMP_OBJECT_DUMP_AT") != NULL;
+        dump_exit = exit_env;
+    }
+
     {
         /* Cached, and polled from the ack loop rather than only from the
          * periodic report.
@@ -1966,7 +1984,7 @@ static void jsrf_object_dump(void)
              * thread. Registered once, below. */
             static int registered;
             unsigned long long now;
-            if (done)
+            if (done || g_obj_dump_fired)   /* the alarm already dumped */
                 return;
             if (!registered) {
                 registered = 1;
@@ -2085,6 +2103,22 @@ static void jsrf_object_dump(void)
             seq - 1u, emitted, path);
     fflush(stderr);
     if (dump_exit) {
+        /* What CODE had run by this anchor, not just what the objects hold.
+         *
+         * The object inventory answers "is the state the same"; it cannot
+         * answer "did the same functions run", and the open question between
+         * the two hosts is exactly that -- Windows entered 12 of the 17 CPlayer
+         * gameplay sites where macOS entered 17. Those two counts were taken at
+         * different guest clocks, which makes them uncomparable; printed here
+         * they are taken at the same one. Input is reported alongside because
+         * it is the first thing a missing gameplay path suggests, and because
+         * "the pad was never polled" and "the pad was polled and said nothing"
+         * need opposite fixes. */
+        jsrf_func_hit_report();
+        {
+            extern void xbox_InputPollReport(void);
+            xbox_InputPollReport();
+        }
         fprintf(stderr, "  [OBJ-DUMP] RECOMP_OBJECT_DUMP_EXIT set; stopping\n");
         fflush(stderr);
         _exit(0);
