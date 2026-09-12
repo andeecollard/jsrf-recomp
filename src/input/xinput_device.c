@@ -16,6 +16,8 @@
 
 /* ======================================================================== */
 #if defined(_WIN32)
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
 /* ====================  XInput backend  ================================== */
 /* ======================================================================== */
 
@@ -72,6 +74,134 @@ void xbox_InputPollReport(void)
     fflush(stderr);
 }
 
+/* DirectInput fallback, for the pads XInput was never going to report.
+ *
+ * XInput only ever supported Xbox-family controllers. A DualShock 4 is not an
+ * XInput device on real Windows either -- it needs DS4Windows or Steam Input to
+ * be translated into one -- so XInputGetState answers ERROR_DEVICE_NOT_CONNECTED
+ * on every port with the pad sitting right there. Measured in the CrossOver
+ * bottle: XInput 1167 on all four ports, while DirectInput8 enumerates
+ * "Wireless Controller", type 0x00010215 = DIDEVTYPE_HID | DI8DEVTYPE_GAMEPAD.
+ *
+ * The POSIX branch below never had this problem because it goes through SDL,
+ * which ships a controller database. This is the Windows equivalent: enumerate
+ * once, acquire, and present the result as an XINPUT_STATE so every line of the
+ * mapping below stays exactly as it was.
+ *
+ * Only consulted when XInput says nothing is attached, so an Xbox pad keeps the
+ * path it always had and this costs a poll that was going to fail anyway. */
+static IDirectInput8A  *g_di;
+static IDirectInputDevice8A *g_di_pad[XBOX_MAX_CONTROLLERS];
+static int              g_di_count;
+static int              g_di_tried;
+
+static BOOL CALLBACK di_enum_cb(const DIDEVICEINSTANCEA *inst, void *ctx)
+{
+    IDirectInputDevice8A *dev = NULL;
+    (void)ctx;
+    if (g_di_count >= XBOX_MAX_CONTROLLERS)
+        return DIENUM_STOP;
+    if (FAILED(IDirectInput8_CreateDevice(g_di, &inst->guidInstance, &dev, NULL)))
+        return DIENUM_CONTINUE;
+    /* Background+nonexclusive: this process often has no foreground window at
+     * all (the framebuffer window is optional), and an exclusive acquire would
+     * simply fail there. */
+    if (FAILED(IDirectInputDevice8_SetDataFormat(dev, &c_dfDIJoystick2)) ||
+        FAILED(IDirectInputDevice8_SetCooperativeLevel(dev, NULL,
+                   DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))) {
+        IDirectInputDevice8_Release(dev);
+        return DIENUM_CONTINUE;
+    }
+    IDirectInputDevice8_Acquire(dev);
+    g_di_pad[g_di_count++] = dev;
+    fprintf(stderr, "  [PAD] DirectInput port %d: %s (type 0x%08lX)\n",
+            g_di_count - 1, inst->tszProductName,
+            (unsigned long)inst->dwDevType);
+    fflush(stderr);
+    return DIENUM_CONTINUE;
+}
+
+static void di_init_once(void)
+{
+    if (g_di_tried)
+        return;
+    g_di_tried = 1;
+    if (FAILED(DirectInput8Create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION,
+                                  &IID_IDirectInput8A, (void **)&g_di, NULL))) {
+        g_di = NULL;
+        return;
+    }
+    IDirectInput8_EnumDevices(g_di, DI8DEVCLASS_GAMECTRL, di_enum_cb, NULL,
+                              DIEDFL_ATTACHEDONLY);
+    if (!g_di_count) {
+        fprintf(stderr, "  [PAD] DirectInput: no attached game controllers\n");
+        fflush(stderr);
+    }
+}
+
+/* DS4 button order over HID, which is what DirectInput reports here:
+ * 0 Square 1 Cross 2 Circle 3 Triangle 4 L1 5 R1 6 L2 7 R2
+ * 8 Share 9 Options 10 L3 11 R3 12 PS 13 Touchpad.
+ * Cross is the Xbox A, Circle is B, Square is X, Triangle is Y. */
+static int di_get_state(DWORD port, XINPUT_STATE *out)
+{
+    DIJOYSTATE2 js;
+    IDirectInputDevice8A *dev;
+    static DWORD packet;
+    unsigned i;
+
+    di_init_once();
+    if (port >= (DWORD)g_di_count || !(dev = g_di_pad[port]))
+        return 0;
+    if (FAILED(IDirectInputDevice8_Poll(dev))) {
+        if (FAILED(IDirectInputDevice8_Acquire(dev)))
+            return 0;
+        IDirectInputDevice8_Poll(dev);
+    }
+    if (FAILED(IDirectInputDevice8_GetDeviceState(dev, sizeof js, &js)))
+        return 0;
+
+    memset(out, 0, sizeof *out);
+    out->dwPacketNumber = ++packet;
+    #define DIBTN(n) (js.rgbButtons[(n)] & 0x80)
+    if (DIBTN(1))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_A;
+    if (DIBTN(2))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_B;
+    if (DIBTN(0))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_X;
+    if (DIBTN(3))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_Y;
+    if (DIBTN(4))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    if (DIBTN(5))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (DIBTN(8))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_BACK;
+    if (DIBTN(9))  out->Gamepad.wButtons |= XINPUT_GAMEPAD_START;
+    if (DIBTN(10)) out->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
+    if (DIBTN(11)) out->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    out->Gamepad.bLeftTrigger  = DIBTN(6) ? 255 : 0;
+    out->Gamepad.bRightTrigger = DIBTN(7) ? 255 : 0;
+    #undef DIBTN
+
+    /* The hat switch carries the d-pad. -1 is centred; otherwise hundredths of
+     * a degree clockwise from north. */
+    for (i = 0; i < 4; i++) {
+        DWORD pov = js.rgdwPOV[i];
+        if (pov == (DWORD)-1 || LOWORD(pov) == 0xFFFF)
+            continue;
+        if (pov > 27000 || pov < 9000)   out->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+        if (pov > 0     && pov < 18000)  out->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+        if (pov > 9000  && pov < 27000)  out->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+        if (pov > 18000)                 out->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+        break;
+    }
+
+    /* DirectInput axes are 0..65535 with c_dfDIJoystick2's default range;
+     * XInput wants signed, and Y is inverted between the two. */
+    #define AX(v)  ((SHORT)(((LONG)(v) - 32768) > 32767 ? 32767 : ((LONG)(v) - 32768)))
+    out->Gamepad.sThumbLX =  AX(js.lX);
+    out->Gamepad.sThumbLY = (SHORT)-AX(js.lY);
+    out->Gamepad.sThumbRX =  AX(js.lZ);
+    out->Gamepad.sThumbRY = (SHORT)-AX(js.lRz);
+    #undef AX
+    return 1;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
@@ -82,6 +212,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     g_pad_polls++;
 
     result = XInputGetState(dwPort, &xi_state);
+    if (result != ERROR_SUCCESS && di_get_state(dwPort, &xi_state))
+        result = ERROR_SUCCESS;          /* a pad XInput cannot describe */
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         g_pad_polls_disconnected++;
