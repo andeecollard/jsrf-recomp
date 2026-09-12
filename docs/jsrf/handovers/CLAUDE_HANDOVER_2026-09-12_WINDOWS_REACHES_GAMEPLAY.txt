@@ -96,21 +96,56 @@ one run read 153600/153600. Worth fixing by blitting on the guest's flip,
 which would also make the window admissible as evidence.
 
 
-4. WHAT TO DO NEXT
-==================
-The oracle now works as designed: both hosts reach gameplay, so a fault that
-reproduces on both is guest-side and one that does not is host-side. Nothing
-is known to be broken on Windows.
+4. THE BIGGER HALF OF THE SLOWDOWN: WINDOWS HAS NO GPU RASTERISER
+=================================================================
+CORRECTS section 2's implication that a native PC would fix the speed. It
+would remove the translation penalty and leave the larger problem standing.
 
-If you want it faster, in order of expected value:
-  1. Test on a native x86-64 Windows PC. If the hypothesis in section 2 holds,
-     the 5x disappears and the oracle becomes pleasant to use.
-  2. The diagnostic logging is unconditional and heavy -- [FILE], [PATH] and
-     [KERNEL] lines print on every call with an fflush. Windows emits ~25 log
-     lines per guest loop iteration against macOS's 4.3.
-  3. The VEH trap now has per-page fault counters (commit 996f84c); a run with
-     them says how much of the cost is the MMIO guard rather than translation.
-     That number has never existed on this host.
+    macOS    [METAL] native raster pipeline ready: Apple M1 Max
+             128,425 batches native, 0 software fallbacks     -- 100% GPU
+    Windows  0 batches native; 6,625,275 triangles through raster_triangle()
+                                                             -- 100% CPU
+
+In src/kernel/nv2a_pb_exec.c the entire accelerated path is
+
+    #ifdef __APPLE__
+        if (s_copy.active && getenv("RECOMP_METAL")) {
+            int triangles = nv2a_metal_draw(...);
+            if (triangles >= 0) goto batch_complete;      /* GPU */
+        }
+    #endif
+        switch (s_gpu.prim) { ...                          /* CPU fallback */
+
+so every triangle on Windows is scalar software rasterisation, and then that
+software rasteriser is itself binary-translated. The D3D11 sink that would be
+the Windows equivalent handles nothing at all: unhandled=15,078,354 of
+15,078,354 methods.
+
+Observed directly in the window: the city intro draws layer by layer at about
+four seconds a frame. That is the software rasteriser completing one batch at
+a time, with the unsynced presenter blitting between batches.
+
+So the order of expected value is:
+  1. GIVE WINDOWS A GPU BACKEND. The D3D11 sink already exists and is already
+     initialised; it just implements no methods. The Metal path is the
+     structural model -- one entry point that takes the prepared batch state
+     and returns a triangle count or -1 to fall back.
+  2. Only then test a native x86-64 PC. Both effects are real and they
+     multiply; neither alone makes the intro run.
+  3. The diagnostic logging is unconditional and heavy -- [FILE], [PATH] and
+     [KERNEL] print on every call with an fflush. Windows emits ~25 log lines
+     per guest loop iteration against macOS's 4.3.
+  4. The VEH trap now has per-page fault counters (commit 996f84c); a run with
+     them says how much of the remainder is the MMIO guard. That number has
+     never existed on this host.
+
+DO NOT read [TEXTURE] prepared=N rejected=M as a rejection RATE, and do not
+compare it across hosts. `batches` counts batches and `rejected` counts a
+mixture of rejected triangles and rejected draws, so the two are different
+units; and macOS's Metal path reaches `goto batch_complete` before the site
+that increments `rejected`, so macOS reports ~28 where Windows reports
+439,082 for the same work. Windows's own figure is about 6% of the triangles
+it rasterises.
 
 
 5. RUNS BEHIND THIS
