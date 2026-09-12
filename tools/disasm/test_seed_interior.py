@@ -57,7 +57,7 @@ class _Xrefs:
 
 
 def _detector(bodies, candidates, forced=(), natural=None,
-              refs=None, provenance=None):
+              refs=None, provenance=None, tables=None, sites=None):
     """`bodies` are the functions as built; `natural` their true extents.
 
     natural maps a start to what _find_function_end returns when it is not
@@ -70,6 +70,7 @@ def _detector(bodies, candidates, forced=(), natural=None,
     det._forced_bounds = list(forced)
     det.image = _Image()
     det.xrefs = _Xrefs(refs)
+    det.engine = _WalkEngine(tables, sites)
     det._seed_provenance = dict(provenance or {})
     natural = natural or {}
     det._find_function_end = lambda start, nxt, sec: natural.get(
@@ -102,11 +103,18 @@ class _WalkEngine:
     instructions = {}
     jump_tables = {}
 
+    def __init__(self, tables=None, sites=None):
+        self.jump_tables = dict(tables or {})
+        self._sites = dict(sites or {})
+
     def get_instruction(self, addr):
         return _WalkInsn(addr)
 
     def jump_table_entries(self, t):
-        return []
+        return list(self.jump_tables.get(t, ()))
+
+    def jump_table_sites(self, t):
+        return list(self._sites.get(t, ()))
 
 
 def _end_detector(forced):
@@ -253,6 +261,41 @@ class SeedInteriorTest(unittest.TestCase):
         end = FunctionDetector._find_function_end(
             det, 0x00100000, None, 0x00100010)
         self.assertEqual(end, 0x00100010)
+
+    def test_a_switch_arm_is_dropped_even_though_it_was_measured(self):
+        # The self-sustaining case. sub_00025040 is `push esi; mov esi,ecx;
+        # mov eax,[esi+0x54]; cmp eax,7; ja default; push ebx; push edi;
+        # jmp [eax*4+0x252BC]`. Every arm ends by popping edi, ebx and esi,
+        # so an arm carved into its own function returns with all three
+        # changed -- which is what RECOMP_ABI_CHECK reports. The arms are only
+        # ever reached through the table, so the runtime feed records them and
+        # they come back as seeds on the next run, forever.
+        det = _detector([(0x00025040, 0x00025058)],
+                        {0x00025058: SEED, 0x00025078: SEED},
+                        natural={0x00025040: 0x000252DC},
+                        provenance={0x00025058: ["icall_targets.json"],
+                                    0x00025078: ["icall_targets.json"]},
+                        tables={0x000252BC: [0x00025058, 0x00025078]},
+                        sites={0x000252BC: [0x00025051]})
+        det._pass_demote_interior_seeds([])
+        self.assertEqual(det._candidates, {})
+        self.assertEqual([r["reference_class"] for r in det.dropped_seeds],
+                         ["switch_arm", "switch_arm"])
+        self.assertEqual(det.dropped_seeds[0]["dispatch"], "0x00025051")
+
+    def test_a_table_entry_dispatched_from_elsewhere_is_kept(self):
+        # Both halves of the test have to hold. An address that appears in
+        # some table is an arm of the function whose own code dispatches
+        # through it -- not of whatever function it happens to sit inside.
+        det = _detector([(0x00025040, 0x00025058)], {0x00025058: SEED},
+                        natural={0x00025040: 0x000252DC},
+                        provenance={0x00025058: ["icall_targets.json"]},
+                        tables={0x000252BC: [0x00025058]},
+                        sites={0x000252BC: [0x00099000]})
+        det._pass_demote_interior_seeds([])
+        self.assertEqual(det.dropped_seeds, [])
+        self.assertEqual(det.kept_interior_seeds[0]["reference_class"],
+                         "indirect_target")
 
     def test_nothing_to_do_is_cheap(self):
         # No seeds and no declared extents: the pass must not force a rebuild.

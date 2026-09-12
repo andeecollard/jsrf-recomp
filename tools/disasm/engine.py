@@ -95,6 +95,11 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # Table VA -> the addresses of the `jmp [reg*4 + table]` instructions
+        # that dispatch through it. A table entry is a switch arm of whatever
+        # function contains the dispatch, which is how a seeded arm can be told
+        # from a function that merely happens to sit at that address.
+        self._jt_sites: Dict[int, Set[int]] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -144,6 +149,7 @@ class DisasmEngine:
                             self.image.base_address + self.image.image_size):
                         insn.jump_table = disp
                         self._jt_candidates.add(disp)
+                        self._jt_sites.setdefault(disp, set()).add(insn.address)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -291,6 +297,10 @@ class DisasmEngine:
             resynced += 1
 
         return resynced
+
+    def jump_table_sites(self, tbl: int) -> List[int]:
+        """Addresses of the indexed indirect jumps that dispatch through tbl."""
+        return sorted(self._jt_sites.get(tbl, ()))
 
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""

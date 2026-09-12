@@ -303,15 +303,52 @@ class FunctionDetector:
             print("  functions recovered that follow a ret with no padding")
         return added
 
-    # Reference classes for an interior seed, worst-evidence-last. Only the
-    # first two are safe to drop: nothing points at them but the guess that
-    # produced them. The rest name an address something really reaches, so
-    # removing the start would leave that reach unresolved -- they are reported
-    # and kept, because they are the subset that needs a genuine secondary
-    # entry rather than either a carve or a deletion.
-    SEED_DROPPABLE = ("unreferenced", "speculative")
+    # Reference classes for an interior seed, worst-evidence-last. The first
+    # three are safe to drop. Two of them are dropped because nothing points at
+    # them but the guess that produced them; the third, switch_arm, is dropped
+    # for the opposite reason -- something points at it very precisely, and
+    # that something is a jump table belonging to the function it sits inside.
+    # The rest name an address reached from outside any function that contains
+    # it, so removing the start would leave that reach unresolved: they are the
+    # subset that needs a genuine secondary entry.
+    SEED_DROPPABLE = ("unreferenced", "speculative", "switch_arm")
 
-    def _classify_interior_seed(self, addr: int) -> Tuple[str, dict]:
+    def _switch_arm_of(self, addr: int, lo: int, hi: int) -> Optional[int]:
+        """The dispatching `jmp [reg*4 + table]` inside [lo, hi) reaching addr.
+
+        A switch arm is not a function and never was. The confusion is
+        self-inflicted and self-sustaining: the arm is only ever reached
+        through the table, so a runtime observation of indirect-branch targets
+        records it, the feedback seeds it as a function start, and that start
+        truncates the owner to end at the dispatching jump. Once the owner ends
+        there, every entry in its table lies outside [func_start, func_end) and
+        the lifter's switch analysis -- which requires the arms to be inside
+        the function -- refuses to resolve the table. The jump stays indirect,
+        so the next run observes the same arms and re-seeds them.
+
+        The way out is to recognise the arm for what it is before it is ever
+        given a start. Both halves of the test matter: an address that appears
+        in a table is only an arm of a function whose own code dispatches
+        through that table.
+        """
+        tables = getattr(self, "_arm_tables", None)
+        if tables is None:
+            tables = {}
+            for tbl in self.engine.jump_tables:
+                sites = self.engine.jump_table_sites(tbl)
+                if not sites:
+                    continue
+                for target in self.engine.jump_table_entries(tbl):
+                    tables.setdefault(target, []).extend(sites)
+            self._arm_tables = tables
+        for site in tables.get(addr, ()):
+            if lo <= site < hi:
+                return site
+        return None
+
+    def _classify_interior_seed(self, addr: int,
+                                owner: Optional[Tuple[int, int]] = None
+                                ) -> Tuple[str, dict]:
         """Why does this address exist, and would dropping it lose anything?"""
         provenance = sorted(getattr(self, "_seed_provenance", {}).get(addr, []))
         detail = {"provenance": provenance}
@@ -332,6 +369,15 @@ class FunctionDetector:
 
         if kinds.get("call") or kinds.get("kernel_call"):
             return "direct_call", detail
+        # An arm of this owner's own switch. Checked before every reference
+        # class below, because the references that would otherwise keep it --
+        # a runtime observation of the indirect branch, or the table entry
+        # read as data -- are the switch itself, described twice.
+        if owner is not None:
+            site = self._switch_arm_of(addr, owner[0], owner[1])
+            if site is not None:
+                detail["dispatch"] = f"0x{site:08X}"
+                return "switch_arm", detail
         # An address taken as data is how a vtable slot or a jump table names a
         # function; the branch through it is invisible here.
         if kinds.get("data_imm") or kinds.get("data_read"):
@@ -392,7 +438,8 @@ class FunctionDetector:
                 j = bisect.bisect_right(forced_starts, start_addr) - 1
                 declared_inside = (j >= 0
                                    and forced[j][0] < start_addr < forced[j][1])
-                kind, detail = self._classify_interior_seed(start_addr)
+                kind, detail = self._classify_interior_seed(
+                    start_addr, (owner, owner_end))
                 record = {
                     "address": f"0x{start_addr:08X}",
                     "owner_start": f"0x{owner:08X}",

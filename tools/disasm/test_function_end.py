@@ -60,6 +60,7 @@ class _Engine:
 def _detector(insns, jump_tables=None, entries=None):
     det = FunctionDetector.__new__(FunctionDetector)
     det.engine = _Engine(insns, jump_tables, entries)
+    det._forced_bounds = []
     return det
 
 
