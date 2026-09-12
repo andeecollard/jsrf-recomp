@@ -1,4 +1,4 @@
-# 129 functions return with callee-saved registers changed, and none of them are the jump
+# 131 functions return with callee-saved registers changed, and one of them walks the exec tree
 
 Date: 2026-09-12 (Europe/London)
 
@@ -19,10 +19,10 @@ code that runs before a frame. It was never pointed at gameplay.
 gameplay under `RECOMP_FAKE_PAD=1` (19.3M triangles, so well past the intro):
 
 ```
-129 distinct offending callee VAs
+131 distinct offending callee VAs
 ```
 
-The logger deduplicates by callee VA, so that is 129 distinct *functions*, not
+The logger deduplicates by callee VA, so that is 131 distinct *functions*, not
 events. The original cap of 32 filled entirely during asset loading, which is
 why raising it to 512 was necessary before anything at gameplay time was
 reachable at all.
@@ -46,7 +46,7 @@ whatever symbol happens to precede it:
 | `__SEH_prolog` | 2 | esp, ebx esi edi |
 | `__chkstk` | 1 | esp |
 
-57 of the 129 land inside a named function; the other 71 are in unnamed gaps
+58 of the 131 land inside a named function; the other 71 are in unnamed gaps
 and are not attributed here.
 
 `__SEH_prolog` and `__chkstk` are **expected**: both move `esp` by design --
@@ -68,15 +68,39 @@ its restore. Tested directly against `midfunction_entries.json`: 206 recorded
 mid-function entries, 129 offenders, **zero overlap**. The hypothesis is dead
 and should not be retried without new evidence.
 
-**Not the tutorial jump.** A first pass at this attributed hits to
+**One offender is in the exec tree, and it was found late.**
+`0x00011D00` is `CActBase::recursiveExec1Default` at offset 0 -- the recursive
+actor-tree walker -- in a densely named region, so there is no gap ambiguity:
+
+```
+[ABI] sub_00011D00: ebx edi esp(epilogue never ran)
+      ebx 00000000->0050FE28   edi 04914C50->04910010   esp 0050FE70->0050FE4C
+```
+
+`esp` returns 36 bytes low, so the epilogue did not run. `edi` goes in holding
+one object pointer and comes back holding a different one. `ebx` comes back
+holding a stack address. A recursive tree walker returning with a moved cursor
+and an unbalanced frame is a candidate mechanism for "some actors are updated
+and others are not" -- which is the shape of the 17x CPlayer update asymmetry
+already on record.
+
+It is a candidate, not a cause. Nothing here shows the walk terminating early
+or skipping id 45; that is the next measurement, not this one. It is recorded
+because it appeared only **late in the run**, after ~19M triangles, which is
+why a mid-run sample missed it entirely and reported zero hits in the gameplay
+classes.
+
+**Not, on the evidence, the asset readers reaching the jump.** A first pass at
+this attributed hits to
 `CPlayer::damageFire`, `CActBase::callExec0Default` and
 `CMission::RunCmdsNoBlocking`, which would have been a direct explanation for
 the animation gate and the 17x CPlayer update asymmetry. It was wrong. Those
 came from a nearest-preceding-symbol lookup with no bound, attributing
 addresses in unnamed gaps to symbols eight to forty kilobytes earlier -- an
-offset of `+41750` is not inside anything. Bounded to 1 KB, **no offender falls
-in `CPlayer`, `CActBase` or `CMission` at all.** There is currently no evidence
-connecting this defect to the jump.
+offset of `+41750` is not inside anything. Bounded to 1 KB, `CPlayer` and
+`CMission` have **no** offenders, and `CActBase` has exactly one -- the
+`recursiveExec1Default` hit above, which is real and was found by the bounded
+method rather than the broken one.
 
 ## What to do with it
 
