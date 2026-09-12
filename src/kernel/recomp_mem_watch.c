@@ -23,6 +23,7 @@ static uint32_t s_heap_alias_ram_offset;
 static size_t s_heap_alias_span;
 static uint32_t s_watch_ram_lo;
 static uint32_t s_watch_length;
+static int s_watch_raw_va;
 
 static int checked_end(uint32_t start, size_t bytes, uint64_t *end)
 {
@@ -102,6 +103,7 @@ static int configure(const char *spec)
 {
     const char *end;
     uint32_t va, length, normalized;
+    uint64_t range_end;
 
     g_recomp_mem_watch_enabled = 0;
     if (!spec || !*spec)
@@ -113,21 +115,27 @@ static int configure(const char *spec)
                 " (expected <guest_va>:<length>)\n", spec);
         return 0;
     }
-    if (!normalize_ram(va, length, &normalized)) {
-        fprintf(stderr,
-                "[MEM-WATCH] unsupported range va=0x%08X length=0x%X;"
-                " v1 accepts one fully mapped RAM/alias range\n",
+    if (!checked_end(va, length, &range_end)) {
+        fprintf(stderr, "[MEM-WATCH] invalid range va=0x%08X length=0x%X\n",
                 va, length);
         return 0;
     }
+
+    /* RAM has several aliases, so normalize it to byte identity. MMIO has no
+     * such aliases: compare an aperture watch by literal guest VA. The store
+     * helper already has the instruction's valid host pointer, so accepting a
+     * raw range here neither maps nor touches any additional memory. */
+    s_watch_raw_va = !normalize_ram(va, length, &normalized);
+    if (s_watch_raw_va) normalized = va;
 
     s_watch_ram_lo = normalized;
     s_watch_length = length;
     g_recomp_mem_watch_enabled = 1;
     fprintf(stderr,
             "[MEM-WATCH] armed source=guest va=0x%08X length=0x%X"
-            " ram=0x%08X aliases=on\n",
-            va, length, normalized);
+            " %s=0x%08X aliases=%s\n",
+            va, length, s_watch_raw_va ? "raw" : "ram", normalized,
+            s_watch_raw_va ? "off" : "on");
     fflush(stderr);
     return 1;
 }
@@ -156,6 +164,45 @@ void recomp_mem_watch_add_ram_alias(uint32_t guest_base,
         configure(getenv("RECOMP_MEM_WATCH"));
 }
 
+/* The inverse of normalize_ram.  A resident render target lives at one RAM
+ * offset and is readable at every window that aliases it; the ownership map
+ * has to be armed at all of them, because nothing constrains which one the
+ * guest's own pointer arithmetic produced. */
+unsigned recomp_mem_watch_ram_aliases(uint32_t ram_offset, size_t span,
+                                      uint32_t *out_va, unsigned max)
+{
+    uint64_t end;
+    unsigned n = 0;
+
+    if (!out_va || !max || !checked_end(ram_offset, span, &end))
+        return 0;
+    if (!s_ram_span || end > s_ram_span) {
+        /* Not RAM as this module understands it -- an MMIO aperture, or a
+         * range that runs off the end of the mapping.  The literal address is
+         * still worth arming; it just has no aliases to add. */
+        out_va[n++] = ram_offset;
+        return n;
+    }
+
+    out_va[n++] = ram_offset;
+    for (unsigned i = 0; i < RECOMP_MEM_WATCH_MIRRORS && n < max; ++i) {
+        uint64_t base;
+        if (!(s_mirror_mask & (1u << i)))
+            continue;
+        base = (uint64_t)(i + 1u) * s_ram_span + ram_offset;
+        if (base + span <= 0x100000000ULL)
+            out_va[n++] = (uint32_t)base;
+    }
+    if (n < max && s_tiled_span && end <= s_tiled_span)
+        out_va[n++] = s_tiled_base + ram_offset;
+    if (n < max && s_heap_alias_span
+            && (uint64_t)ram_offset >= s_heap_alias_ram_offset
+            && end <= (uint64_t)s_heap_alias_ram_offset + s_heap_alias_span)
+        out_va[n++] = s_heap_alias_base
+                    + (ram_offset - s_heap_alias_ram_offset);
+    return n;
+}
+
 void recomp_mem_watch_shutdown(void)
 {
     g_recomp_mem_watch_enabled = 0;
@@ -165,6 +212,7 @@ void recomp_mem_watch_shutdown(void)
     s_heap_alias_span = 0;
     s_watch_ram_lo = 0;
     s_watch_length = 0;
+    s_watch_raw_va = 0;
 }
 
 static uint64_t load_width(volatile void *ptr, unsigned width)
@@ -199,7 +247,8 @@ void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
     uint64_t old_value = 0;
 
     if (host_ptr && (width == 1 || width == 2 || width == 4 || width == 8) &&
-        normalize_ram(guest_va, width, &ram)) {
+        (s_watch_raw_va || normalize_ram(guest_va, width, &ram))) {
+        if (s_watch_raw_va) ram = guest_va;
         access_hi = (uint64_t)ram + width;
         watch_hi = (uint64_t)s_watch_ram_lo + s_watch_length;
         match = (uint64_t)ram < watch_hi &&

@@ -15,7 +15,11 @@ if(WIN32)
         # and xbox_d3d8 already depends on xbox_vsh for the batch state.
         ${CMAKE_CURRENT_LIST_DIR}/../nv2a/nv2a_d3d11.c
     )
-    target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+    # xbox_guestmem, not xbox_kernel: the raster path arms the ownership map,
+    # and the standalone renderer regressions link this library without a
+    # kernel at all.
+    target_link_libraries(xbox_d3d8 PUBLIC platform xbox_guestmem
+                          d3d11 dxgi dxguid d3dcompiler)
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke

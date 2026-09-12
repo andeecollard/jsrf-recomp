@@ -26,6 +26,7 @@
 #include "d3d8_internal.h"           /* COBJMACROS, d3d11.h, device accessors */
 #include <d3dcompiler.h>
 #include "nv2a_d3d11.h"
+#include "recomp_gpu_own.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +106,14 @@ static const char *const pixel_preamble =
 "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
 "};\n"
 "cbuffer PSParams : register(b0) { uint4 pfrag; };  /* x: alpha reference */\n";
+
+static const char *const clear_pixel_source =
+"struct VSOut {\n"
+"    float4 p:SV_POSITION; float4 d0:COLOR0; float4 d1:COLOR1;\n"
+"    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+"};\n"
+"cbuffer ClearParams : register(b0) { float4 clear_color; };\n"
+"float4 ps_clear(VSOut i) : SV_TARGET { return clear_color; }\n";
 
 /* Everything about a batch that changes the emitted program. alpha_ref is not
  * here on purpose: it rides in the constant buffer, so a fade does not compile
@@ -280,6 +289,7 @@ static int emit_pixel_shader(const ShaderKey *k, char *buf, size_t size)
 static ID3D11Device *device;
 static ID3D11DeviceContext *context;
 static ID3D11VertexShader *vertex_shader;
+static ID3D11PixelShader *clear_pixel_shader;
 static ID3D11InputLayout *input_layout;
 static int pipeline_ready;
 static ID3D11RasterizerState *rasterizer;
@@ -310,8 +320,14 @@ typedef struct {
     uint8_t *ram, *zram;                 /* where in guest RAM each one lives */
     size_t ram_size, zram_size;
     uint32_t w, h, row, zrow;
-    int ready;                           /* holds the guest's current content */
+    int colour_ready, depth_ready;       /* holds the guest's current content */
     int colour_pending, depth_pending;   /* drawn, not yet given back */
+    /* What this surface currently holds in the guest-memory ownership map.
+     * The armed range is remembered separately from ram/zram because a
+     * surface can be rebound to a different guest address while armed, and
+     * the release has to undo exactly the hold that was taken. */
+    const uint8_t *own_ram, *own_zram;
+    size_t own_ram_size, own_zram_size;
     uint64_t stamp;
 } Surface;
 #define SURFACE_CACHE_SIZE 4
@@ -337,7 +353,8 @@ static uint64_t surface_clock, surface_evictions;
 #define surface_height      (bound->h)
 #define surface_pitch       (bound->row)
 #define surface_depth_pitch (bound->zrow)   /* not depth_pitch: NV2ATextureCopy has one */
-#define surface_valid       (bound->ready)
+#define surface_valid       (bound->colour_ready)
+#define depth_valid         (bound->depth_ready)
 #define surface_dirty       (bound->colour_pending)
 #define depth_dirty         (bound->depth_pending)
 
@@ -348,13 +365,92 @@ static uint64_t draw_batches, drawn_triangles;
  * failures with different causes. */
 static uint64_t sync_calls, sync_colour_writebacks, sync_failures;
 static uint64_t sync_nonblack_pixels, uploads_cleared, uploads_copied;
+static uint64_t range_syncs, gpu_colour_clears, gpu_depth_clears;
 static int trace_surfaces;
+
+static int resident_clears_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("RECOMP_D3D11_RESIDENT_CLEARS") ? 1 : 0;
+    return enabled;
+}
+
+/* One ordered line per clear, draw, flush and flip.
+ *
+ * Counts said the pixels were written and then were not there, which is not a
+ * sequence anyone can reason about. This is the sequence. */
+int nv2a_d3d11_event_trace(void)
+{
+    static long budget = -1;
+    if (budget < 0) {
+        const char *e = getenv("RECOMP_D3D11_EVENTS");
+        budget = e ? strtol(e, NULL, 0) : 0;
+    }
+    if (budget <= 0) return 0;
+    --budget;
+    return 1;
+}
+
+uint32_t nv2a_d3d11_guest_offset(const void *host)
+{
+    extern ptrdiff_t xbox_GetMemoryOffset(void);
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    return (base && host) ? (uint32_t)((const uint8_t *)host - base) : 0u;
+}
 
 typedef struct { float p[4], d0[4], d1[4], t[4][4]; } Vertex;
 typedef struct { float viewport[4]; float texscale[4][4]; } VSParams;
 typedef struct { uint32_t frag[4]; } PSParams;   /* x: alpha reference */
 
+static int ensure_dynamic(ID3D11Buffer **buffer, unsigned *capacity,
+                          unsigned bytes, UINT bind);
+static int write_dynamic(ID3D11Buffer *buffer, const void *data, size_t bytes);
+static int sync_range_inner(uint8_t *target, size_t bytes);
+static int invalidate_range_inner(uint8_t *target, size_t bytes);
+static void publish_ownership(void);
+
 #define RELEASE(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
+
+/* One writer at a time.
+ *
+ * Everything here used to be reached from whichever guest thread was pushing
+ * the command stream, and a D3D11 immediate context has never been safe to
+ * share. The ownership map adds a second kind of caller -- any guest thread
+ * that happens to load from a resident surface -- so the entry points now
+ * serialise. It is a leaf lock: nothing inside this file waits on anything
+ * else while holding it, and the internal callers below take the unlocked
+ * inner forms, so the pusher cannot deadlock against itself through
+ * texture_view() or the reconcile path. */
+static volatile long device_lock;
+static volatile unsigned long device_owner;   /* thread id, never 0 when held */
+static unsigned device_depth;
+
+/* Recursive on purpose.
+ *
+ * The first version was not, and it hung on the first draw the renderer
+ * rejected: reject() invalidates every surface, and the invalidate entry point
+ * is public. Splitting every entry point into a locked outer and an unlocked
+ * inner is still worth doing -- it keeps the reconciliation from running twice
+ * per call -- but it is not a property this file can be relied on to preserve
+ * as it grows, and the failure mode is a spin at 100% with no output. Counting
+ * re-entry costs one thread-id compare and makes the mistake harmless. */
+static void device_acquire(void)
+{
+    unsigned long self = GetCurrentThreadId();
+    if (device_owner == self) { ++device_depth; return; }
+    while (__atomic_exchange_n(&device_lock, 1L, __ATOMIC_ACQUIRE))
+        SwitchToThread();
+    device_owner = self;
+    device_depth = 1;
+}
+
+static void device_release(void)
+{
+    if (--device_depth) return;
+    device_owner = 0;
+    __atomic_store_n(&device_lock, 0L, __ATOMIC_RELEASE);
+}
 
 const char *nv2a_d3d11_last_reject(void) { return reject_reason ? reject_reason : "none"; }
 
@@ -372,6 +468,11 @@ void nv2a_d3d11_report(void)
             (unsigned long long)uploads_cleared, (unsigned long long)uploads_copied);
     fprintf(stderr, "[D3D11] surfaces: %llu binds, %llu evictions\n",
             (unsigned long long)surface_clock, (unsigned long long)surface_evictions);
+    fprintf(stderr, "[D3D11] coherence: %llu range syncs; %llu colour / %llu depth clears stayed on GPU\n",
+            (unsigned long long)range_syncs,
+            (unsigned long long)gpu_colour_clears,
+            (unsigned long long)gpu_depth_clears);
+    recomp_gpu_own_report();
 }
 
 /* ================================================================
@@ -452,7 +553,7 @@ static int build_shaders(void)
         { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 80, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 96, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    ID3DBlob *vs = NULL;
+    ID3DBlob *vs = NULL, *ps = NULL;
     HRESULT hr;
 
     if (!compile(vertex_source, "vs_main", "vs_4_0", &vs)) return 0;
@@ -462,6 +563,14 @@ static int build_shaders(void)
         hr = ID3D11Device_CreateInputLayout(device, elements, 7,
                 ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs), &input_layout);
     RELEASE(vs);
+    if (SUCCEEDED(hr) && compile(clear_pixel_source, "ps_clear", "ps_4_0", &ps)) {
+        hr = ID3D11Device_CreatePixelShader(device,
+                ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps),
+                NULL, &clear_pixel_shader);
+        RELEASE(ps);
+    } else if (SUCCEEDED(hr)) {
+        hr = E_FAIL;
+    }
     if (FAILED(hr)) {
         fprintf(stderr, "[D3D11] shader objects failed: 0x%08X\n", (unsigned)hr);
         return 0;
@@ -803,6 +912,11 @@ static ID3D11ShaderResourceView *texture_view(const NV2ATextureCopy *t,
     unsigned i;
 
     if (!data || !bytes) return empty_view();
+    /* Guest RAM may name a render target that is still authoritative on the
+     * GPU. Materialise only that range before hashing/decoding the texture;
+     * unrelated cached targets remain resident. A future surface-as-texture
+     * view can remove even this necessary copy. */
+    if (!sync_range_inner((uint8_t *)data, bytes)) return NULL;
     ++texture_requests;
     for (i = 0; i < TEXTURE_CACHE_SIZE; i++) {
         TextureEntry *entry = &texture_cache[i];
@@ -889,7 +1003,7 @@ static int sync_surface(Surface *sf)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     Surface *previous = bound;
-    unsigned x, y;
+    unsigned x, y, wrote_now = 0;
     int result = 1;
 
     bound = sf;
@@ -910,6 +1024,7 @@ static int sync_surface(Surface *sf)
                                          (ID3D11Resource *)color_surface);
         if (FAILED(ID3D11DeviceContext_Map(context, (ID3D11Resource *)color_staging,
                 0, D3D11_MAP_READ, 0, &mapped))) { ++sync_failures; bound = previous; return 0; }
+        wrote_now = 0;
         for (y = 0; y < surface_height; ++y) {
             const uint8_t *row = (const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch;
             uint8_t *out = surface_target + (size_t)y * surface_pitch;
@@ -919,13 +1034,16 @@ static int sync_surface(Surface *sf)
                            | (unsigned)(row[x * 4 + 2] >> 3);
                 out[x * 2] = (uint8_t)c;
                 out[x * 2 + 1] = (uint8_t)(c >> 8);
-                if (c) ++sync_nonblack_pixels;
+                if (c) { ++sync_nonblack_pixels; ++wrote_now; }
             }
         }
         ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)color_staging, 0);
         if (trace_surfaces)
             fprintf(stderr, "[D3D11-TRACE]   writeback target=%p nonblack=%llu\n",
                     (void *)surface_target, (unsigned long long)sync_nonblack_pixels);
+        if (nv2a_d3d11_event_trace())
+            fprintf(stderr, "  [EV] FLUSH  target=%08X wrote %u non-black\n",
+                    nv2a_d3d11_guest_offset(surface_target), wrote_now);
         ++sync_colour_writebacks;
         surface_dirty = 0;
     }
@@ -972,6 +1090,7 @@ void nv2a_d3d11_surface_report(void)
     unsigned i;
 
     if (!device || !context) return;
+    device_acquire();
     off = snprintf(line, sizeof line, "  [FLIPTRACE]   d3d11 surfaces:");
     for (i = 0; i < SURFACE_CACHE_SIZE && off > 0 && off < (int)sizeof(line) - 64; i++) {
         Surface *sf = &surfaces[i];
@@ -1004,40 +1123,327 @@ void nv2a_d3d11_surface_report(void)
             off += snprintf(line + off, sizeof(line) - (size_t)off,
                             " 0x%08X=gpu%u/ram%u(%s%s)",
                             base ? (unsigned)(sf->ram - base) : 0u, nonblack, ram,
-                            sf->ready ? "ready" : "stale",
+                            (sf->colour_ready && (!sf->zram || sf->depth_ready))
+                                ? "ready" : "stale",
                             sf->colour_pending ? ",unflushed" : "");
         }
     }
+    device_release();
     fprintf(stderr, "%s\n", line);
 }
 
 int nv2a_d3d11_sync(void)
 {
-    unsigned i;
-    int result = 1;
+    int result;
     /* Every retained surface, because the caller means "guest RAM is about to
      * be read" and does not know which target that is. */
-    for (i = 0; i < SURFACE_CACHE_SIZE; i++)
-        if (surfaces[i].tex && !sync_surface(&surfaces[i])) result = 0;
+    device_acquire();
+    result = sync_range_inner(NULL, 0);
+    device_release();
     return result;
+}
+
+static int ranges_overlap(const uint8_t *a, size_t a_size,
+                          const uint8_t *b, size_t b_size)
+{
+    uintptr_t av, bv;
+    if (!a || !b || !a_size || !b_size) return 0;
+    av = (uintptr_t)a;
+    bv = (uintptr_t)b;
+    /* Subtraction after ordering avoids end-pointer overflow. */
+    return av <= bv ? bv - av < a_size : av - bv < b_size;
+}
+
+/* ================================================================
+ * Guest-memory ownership
+ * ================================================================
+ *
+ * Between a draw and its write-back the GPU's copy of a surface is the newer
+ * one, and guest RAM holds whatever was there before. Every consumer inside
+ * this runtime asks for the write-back at its own call site; translated guest
+ * code cannot, because a static recompile emits an ordinary load. The map in
+ * recomp_gpu_own.c is that missing observer, and this is the half that tells
+ * it which guest bytes are currently owed pixels.
+ *
+ * Publishing is a reconciliation rather than a set of paired calls at each
+ * flag assignment: colour_pending and depth_pending are written from eight
+ * places across draw, upload, clear and sync, and a scheme that needed each of
+ * them to remember to arm or disarm would be wrong the first time one was
+ * added. Four surfaces make the sweep free.
+ */
+static int own_reconcile_range(void *host, size_t bytes);
+
+static void publish_ownership(void)
+{
+    static int hooked;
+    unsigned i;
+
+    if (!hooked) {
+        recomp_gpu_own_set_sync(own_reconcile_range);
+        hooked = 1;
+    }
+    for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+        Surface *sf = &surfaces[i];
+        int owed = sf->tex && sf->colour_pending;
+        const uint8_t *want = owed ? sf->ram : NULL;
+        size_t want_size = owed ? sf->ram_size : 0;
+
+        if (!want || !want_size) { want = NULL; want_size = 0; }
+        if (sf->own_ram != want || sf->own_ram_size != want_size) {
+            if (sf->own_ram)
+                recomp_gpu_own_release(sf->own_ram, sf->own_ram_size);
+            if (want) recomp_gpu_own_hold(want, want_size);
+            sf->own_ram = want;
+            sf->own_ram_size = want_size;
+        }
+
+        owed = sf->tex && sf->depth_pending;
+        want = owed ? sf->zram : NULL;
+        want_size = owed ? sf->zram_size : 0;
+        if (!want || !want_size) { want = NULL; want_size = 0; }
+        if (sf->own_zram != want || sf->own_zram_size != want_size) {
+            if (sf->own_zram)
+                recomp_gpu_own_release(sf->own_zram, sf->own_zram_size);
+            if (want) recomp_gpu_own_hold(want, want_size);
+            sf->own_zram = want;
+            sf->own_zram_size = want_size;
+        }
+    }
+}
+
+static int sync_range_inner(uint8_t *target, size_t bytes)
+{
+    unsigned i;
+    int result = 1, hit = 0;
+    if (!target || !bytes) {
+        for (i = 0; i < SURFACE_CACHE_SIZE; i++)
+            if (surfaces[i].tex && !sync_surface(&surfaces[i])) result = 0;
+        publish_ownership();
+        return result;
+    }
+    for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+        Surface *sf = &surfaces[i];
+        if (!sf->tex) continue;
+        if ((ranges_overlap(target, bytes, sf->ram, sf->ram_size)
+                || ranges_overlap(target, bytes, sf->zram, sf->zram_size))) {
+            hit = 1;
+            if (!sync_surface(sf)) result = 0;
+        }
+    }
+    if (hit) ++range_syncs;
+    publish_ownership();
+    return result;
+}
+
+/* Returns how many surfaces the range actually reached, so the ownership map
+ * can separate a real reconciliation from a granule-granularity false hit. */
+static int invalidate_range_inner(uint8_t *target, size_t bytes)
+{
+    unsigned i;
+    int hits = 0;
+
+    if (!target || !bytes) {
+        (void)sync_range_inner(NULL, 0);
+        for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+            surfaces[i].colour_ready = 0;
+            surfaces[i].depth_ready = 0;
+        }
+        publish_ownership();
+        return SURFACE_CACHE_SIZE;
+    }
+
+    /* A CPU writer needs the previous GPU contents only for resources it can
+     * overlap. Flush those resources before the write, then make only the
+     * affected aspect upload again. This is the same ownership transition as
+     * xemu's surface memory callback, expressed at our explicit write sites. */
+    for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+        Surface *sf = &surfaces[i];
+        int colour = ranges_overlap(target, bytes, sf->ram, sf->ram_size);
+        int depth = ranges_overlap(target, bytes, sf->zram, sf->zram_size);
+        if (!sf->tex || (!colour && !depth)) continue;
+        ++hits;
+        (void)sync_surface(sf);
+        if (colour) sf->colour_ready = 0;
+        if (depth) sf->depth_ready = 0;
+    }
+    publish_ownership();
+    return hits;
+}
+
+/* The ownership map's slow path.
+ *
+ * It reaches here from a translated guest access whose direction is unknown:
+ * XBOX_PTR is shared by loads, by stores, and by the MEM32 lvalues the lifter
+ * expands `rep movs` into, which never pass through the explicit store helper.
+ * Downloading alone would be right for the loads and silently wrong for those
+ * block stores -- a stale GPU surface would later be written back over them --
+ * so the range is handed back completely: copied down, and marked for upload
+ * again on the next draw that needs it. Separating the two directions is worth
+ * doing, but it needs the block operations routed through a store seam first,
+ * and the counters here are what will say whether it is worth the regeneration.
+ */
+static int own_reconcile_range(void *host, size_t bytes)
+{
+    int hits;
+    device_acquire();
+    hits = invalidate_range_inner((uint8_t *)host, bytes);
+    device_release();
+    return hits;
+}
+
+int nv2a_d3d11_sync_range(uint8_t *target, size_t bytes)
+{
+    int result;
+    device_acquire();
+    result = sync_range_inner(target, bytes);
+    device_release();
+    return result;
+}
+
+void nv2a_d3d11_invalidate_range(uint8_t *target, size_t bytes)
+{
+    device_acquire();
+    (void)invalidate_range_inner(target, bytes);
+    device_release();
 }
 
 void nv2a_d3d11_invalidate(uint8_t *target)
 {
+    nv2a_d3d11_invalidate_range(target, target ? 1 : 0);
+}
+
+static int clear_color_inner(uint8_t *target, size_t target_size,
+        uint32_t pitch, uint32_t width, uint32_t height,
+        uint32_t components, uint32_t value)
+{
+    float rgba[4];
+    Vertex v[3];
+    VSParams vsp;
+    NV2ATextureCopy state;
+    ID3D11BlendState *blend;
+    ID3D11DepthStencilState *zstate;
+    D3D11_VIEWPORT viewport;
+    const float factor[4] = { 1, 1, 1, 1 };
     unsigned i;
-    nv2a_d3d11_sync();
-    /* The CPU is about to write this memory itself -- a clear, or the software
-     * rasteriser taking a batch we refused -- so whatever is retained for it
-     * must be re-read rather than trusted. A null target means "all of it". */
-    for (i = 0; i < SURFACE_CACHE_SIZE; i++)
-        if (!target || surfaces[i].ram == target || surfaces[i].zram == target)
-            surfaces[i].ready = 0;
+    int handled = 0;
+    uint16_t c = (uint16_t)value;
+
+    /* A static recompile currently has no general guest-CPU read callback for
+     * framebuffer pages. Keep the GPU-authoritative transition experimental
+     * until those reads can demand a range sync; otherwise JSRF consumes stale
+     * RAM after its first batch and stops advancing. */
+    if (!resident_clears_enabled()) return 0;
+    if (!device || !context || !target || !target_size || !width || !height)
+        return 0;
+    /* The retained target is RGB565. Alpha is discarded on download, but the
+     * clear shader currently uses an all-channel blend state. Keep partial
+     * RGB writes on the CPU until it has a write-mask variant. */
+    if ((components & 0x70u) != 0x70u) return 0;
+    rgba[0] = (float)(c >> 11) / 31.0f;
+    rgba[1] = (float)((c >> 5) & 63) / 63.0f;
+    rgba[2] = (float)(c & 31) / 31.0f;
+    rgba[3] = 1.0f;
+
+    memset(&state, 0, sizeof(state));
+    state.untextured = 1;
+    blend = blend_state(&state);
+    zstate = depth_state(&state);
+    if (!clear_pixel_shader || !blend || !zstate) return 0;
+
+    memset(v, 0, sizeof(v));
+    for (i = 0; i < 3; ++i) {
+        v[i].p[3] = 1.0f;
+        memcpy(v[i].d0, rgba, sizeof(rgba));
+    }
+    /* One oversized triangle avoids a diagonal seam and covers every pixel. */
+    v[1].p[0] = (float)width * 2.0f;
+    v[2].p[1] = (float)height * 2.0f;
+    memset(&vsp, 0, sizeof(vsp));
+    vsp.viewport[0] = (float)width;
+    vsp.viewport[1] = (float)height;
+    if (!ensure_dynamic(&vertex_buffer, &vertex_capacity, sizeof(v),
+                        D3D11_BIND_VERTEX_BUFFER)
+            || !write_dynamic(vertex_buffer, v, sizeof(v))
+            || !write_dynamic(vs_constants, &vsp, sizeof(vsp))
+            || !write_dynamic(ps_constants, rgba, sizeof(rgba)))
+        return 0;
+
+    for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+        Surface *sf = &surfaces[i];
+        if (!sf->tex || sf->ram != target || sf->ram_size != target_size
+                || sf->row != pitch || sf->w != width || sf->h != height)
+            continue;
+        {
+            UINT stride = sizeof(Vertex), offset = 0;
+            ID3D11DeviceContext_IASetInputLayout(context, input_layout);
+            ID3D11DeviceContext_IASetVertexBuffers(context, 0, 1,
+                    &vertex_buffer, &stride, &offset);
+            ID3D11DeviceContext_IASetPrimitiveTopology(context,
+                    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        ID3D11DeviceContext_VSSetShader(context, vertex_shader, NULL, 0);
+        ID3D11DeviceContext_VSSetConstantBuffers(context, 0, 1, &vs_constants);
+        ID3D11DeviceContext_PSSetShader(context, clear_pixel_shader, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(context, 0, 1, &ps_constants);
+        ID3D11DeviceContext_RSSetState(context, rasterizer);
+        memset(&viewport, 0, sizeof(viewport));
+        viewport.Width = (float)sf->w;
+        viewport.Height = (float)sf->h;
+        viewport.MaxDepth = 1.0f;
+        ID3D11DeviceContext_RSSetViewports(context, 1, &viewport);
+        ID3D11DeviceContext_OMSetBlendState(context, blend, factor, 0xffffffffu);
+        ID3D11DeviceContext_OMSetDepthStencilState(context, zstate, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(context, 1, &sf->rtv, NULL);
+        ID3D11DeviceContext_Draw(context, 3, 0);
+        sf->colour_ready = 1;
+        sf->colour_pending = 1;
+        sf->stamp = ++surface_clock;
+        handled = 1;
+    }
+    if (handled) ++gpu_colour_clears;
+    publish_ownership();
+    return handled;
+}
+
+int nv2a_d3d11_clear_color(uint8_t *target, size_t target_size,
+        uint32_t pitch, uint32_t width, uint32_t height,
+        uint32_t components, uint32_t value)
+{
+    int handled;
+    device_acquire();
+    handled = clear_color_inner(target, target_size, pitch, width, height,
+                                components, value);
+    device_release();
+    return handled;
+}
+
+int nv2a_d3d11_clear_depth_stencil(uint8_t *target, size_t target_size,
+        uint32_t pitch, uint32_t width, uint32_t height,
+        uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+        uint32_t components, uint32_t value)
+{
+    /* CrossOver's mapped D24S8 staging representation does not agree with the
+     * ClearDepthStencilView representation used here: 0x12345678 returns as
+     * guest 0x34567812. Until depth uses a verified shader/resource format,
+     * refuse the shortcut so the caller performs its byte-exact CPU clear. */
+    (void)target;
+    (void)target_size;
+    (void)pitch;
+    (void)width;
+    (void)height;
+    (void)x0;
+    (void)y0;
+    (void)x1;
+    (void)y1;
+    (void)components;
+    (void)value;
+    return 0;
 }
 
 static int reject(const char *reason)
 {
     reject_reason = reason;
-    nv2a_d3d11_invalidate(NULL);
+    (void)invalidate_range_inner(NULL, 0);
     return -1;
 }
 
@@ -1193,7 +1599,7 @@ static int write_dynamic(ID3D11Buffer *buffer, const void *data, size_t bytes)
     return 1;
 }
 
-int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t texture_size,
+static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t texture_size,
         uint8_t *target, size_t target_size, uint8_t *depth, size_t depth_size,
         const float (*vertices)[16][4], unsigned count, unsigned primitive)
 {
@@ -1204,6 +1610,7 @@ int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t tex
     ID3D11BlendState *blend;
     ID3D11DepthStencilState *zstate;
     ID3D11PixelShader *fragment;
+    int reuse_for_trace = 0;
     D3D11_VIEWPORT viewport;
     VSParams vsp;
     PSParams psp;
@@ -1293,9 +1700,12 @@ int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t tex
             slot = oldest;
             ++surface_evictions;
             if (!sync_surface(slot)) return reject("surface-sync");
-            slot->ready = 0;
+            slot->colour_ready = 0;
+            slot->depth_ready = 0;
         }
-        reuse = slot->tex && slot->ready;
+        reuse = slot->tex && slot->colour_ready
+              && (!next_depth || slot->depth_ready);
+        reuse_for_trace = reuse;
         bound = slot;
         slot->stamp = ++surface_clock;
 
@@ -1335,6 +1745,7 @@ int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t tex
             if (!upload_surface(target, next_depth, next_depth_pitch))
                 return reject("surface-upload");
             surface_valid = 1;
+            depth_valid = next_depth ? 1 : 0;
             surface_dirty = depth_dirty = 0;
         }
     }
@@ -1419,6 +1830,25 @@ int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t tex
         depth_dirty = 1;
     ++draw_batches;
     drawn_triangles += n / 3;
+    if (nv2a_d3d11_event_trace())
+        fprintf(stderr, "  [EV] DRAW   target=%08X texture=%08X mask=%x %u triangles%s\n",
+                nv2a_d3d11_guest_offset(target),
+                nv2a_d3d11_guest_offset(texture), s->texture_mask, n / 3,
+                reuse_for_trace ? " (retained)" : " (uploaded)");
+    if (nv2a_d3d11_event_trace()) {
+        /* Whether the SOURCE had anything in it. A textured copy with depth
+         * off that writes black had a black texture, and the only way this
+         * path gets one is by reading guest RAM that the pixels have not been
+         * given back to yet. */
+        size_t tb = (s->texture_mask & 1) ? nv2a_texture_copy_texture_bytes(s) : 0;
+        size_t i, nz = 0;
+        for (i = 0; texture && i < tb; ++i) if (texture[i]) ++nz;
+        fprintf(stderr, "  [EV]        zeta=%d depth=%08X test=%u write=%u"
+                " texbytes=%zu nonzero=%zu combiners=%u blend=%u\n",
+                use_zeta, nv2a_d3d11_guest_offset(next_depth),
+                s->depth_test, s->depth_write, tb, nz,
+                s->combiner_count, s->blend);
+    }
     reject_reason = NULL;
     /* RECOMP_D3D11_SYNC_EACH=1: give the pixels back immediately instead of at
      * the flip. Slow by construction, and diagnostic only -- it separates "the
@@ -1428,7 +1858,24 @@ int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t tex
     {
         static int each = -1;
         if (each < 0) each = getenv("RECOMP_D3D11_SYNC_EACH") ? 1 : 0;
-        if (each) nv2a_d3d11_sync();
+        if (each) (void)sync_range_inner(NULL, 0);
     }
+    publish_ownership();
     return (int)(n / 3);
+}
+
+int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t texture_size,
+        uint8_t *target, size_t target_size, uint8_t *depth, size_t depth_size,
+        const float (*vertices)[16][4], unsigned count, unsigned primitive)
+{
+    int result;
+    device_acquire();
+    result = draw_inner(s, texture, texture_size, target, target_size,
+                        depth, depth_size, vertices, count, primitive);
+    /* Every early return above is a rejection that leaves the pending flags
+     * where they were, but an eviction or an upload can have moved them, so
+     * the map is reconciled on the way out regardless of the verdict. */
+    publish_ownership();
+    device_release();
+    return result;
 }

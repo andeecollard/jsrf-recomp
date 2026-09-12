@@ -42,12 +42,36 @@ if(WIN32)
     list(APPEND KERNEL_SOURCES win32_native.c)
 endif()
 
+# The guest-memory ownership map has two users that do not link one another:
+# the recompiled code reaches it through xbox_kernel, and the graphics backend
+# reaches it from xbox_d3d8. Its own target is what keeps a single copy of the
+# map -- and a single arm/disarm count -- in the final image.
+add_library(xbox_guestmem STATIC recomp_gpu_own.c)
+target_include_directories(xbox_guestmem PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Generated code only grows the ownership check when this is defined, which is
+# to say: only on targets that also link something able to arm the map.
+#
+# -DRECOMP_GPU_OWNERSHIP=OFF removes the check from every translated access, so
+# what it costs can be answered with two builds rather than an argument.
+# RECOMP_GPU_OWN=0 at run time is the cheaper control: it leaves the check in
+# but never arms anything, which is the same behaviour without the rebuild.
+option(RECOMP_GPU_OWNERSHIP "Observe GPU-owned surfaces from translated accesses" ON)
+if(RECOMP_GPU_OWNERSHIP)
+    target_compile_definitions(xbox_guestmem PUBLIC RECOMP_GPU_OWNERSHIP=1)
+endif()
+if(MSVC)
+    target_compile_options(xbox_guestmem PRIVATE /W4 /O2)
+else()
+    target_compile_options(xbox_guestmem PRIVATE -Wall -Wextra -O2)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
 # Generated store helpers call into xbox_kernel only on normal game targets.
 # Standalone conformance harnesses include recomp_types.h without this public
 # definition and retain direct, dependency-free stores.
 target_compile_definitions(xbox_kernel PUBLIC RECOMP_MEM_WATCH_RUNTIME=1)
+target_link_libraries(xbox_kernel PUBLIC xbox_guestmem)
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

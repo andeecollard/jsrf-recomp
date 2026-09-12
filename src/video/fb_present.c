@@ -25,7 +25,7 @@
 #include <stdint.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-/* The frame as it was AT the flip, not the surface being drawn into. */
+/* Returns the presentation surface selected by the NV2A executor. */
 extern const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
                                         uint32_t *pitch, uint32_t *bpp);
 
@@ -179,7 +179,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        /* Prefer the FLIP_STALL snapshot over live guest memory.
+        /* Ask the NV2A executor for the surface to display.
          *
          * Reading the surface the guest is drawing into, on a 16 ms timer with
          * no flip synchronisation, catches it mid-draw -- and since a full
@@ -187,12 +187,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          * other, tearing on a hard diagonal. It is unwatchable at the few
          * frames a second the CPU rasteriser manages.
          *
-         * nv2a_pb_exec_surface hands back s_snap, the copy taken AT the flip,
-         * which is a whole frame by construction. The POSIX presenter has
-         * always used it -- that is the entire reason macOS does not tear --
-         * and this one simply never asked. Falls back to the live surface when
-         * there is no snapshot yet, so the window still shows something during
-         * boot before the first flip. */
+         * On Windows this is intentionally the live surface: JSRF's completed
+         * snapshot can remain the anti-graffiti image while rendering proceeds
+         * elsewhere. Other platforms retain the stable flip snapshot. */
         if (s_rgb) {
             uint32_t sw = 0, sh = 0, spitch = 0, sbpp = 0;
             const void *snap = nv2a_pb_exec_surface(&sw, &sh, &spitch, &sbpp);

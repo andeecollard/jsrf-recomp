@@ -380,7 +380,36 @@ void recomp_trace_esp(const char *name, const char *tag);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
+#if defined(RECOMP_GPU_OWNERSHIP)
+/* Guest-memory ownership seam.
+ *
+ * Every translated memory access in this header resolves its address through
+ * XBOX_PTR: the scalar accessors, the signed and floating forms, the
+ * FS-segmented forms, the XMM lane helpers, the locked read-modify-writes, and
+ * the MEM32 lvalues the lifter emits for `rep movs`/`rep stos`.  That makes it
+ * the one boundary wide enough to hold an ownership check that block
+ * operations cannot slip past -- which is the whole reason the check is here
+ * and not in the store helper below, where a load would never see it.
+ *
+ * The disabled path is one indexed byte load and a not-taken branch.  The map
+ * is only non-empty while a render target is actually resident on the GPU, so
+ * outside those granules this costs the same for a stack slot as it always
+ * did.  See src/kernel/recomp_gpu_own.h.
+ */
+#define RECOMP_GPU_OWN_SHIFT 16
+#define RECOMP_GPU_OWN_SLOTS (1u << (32 - RECOMP_GPU_OWN_SHIFT))
+extern unsigned char g_recomp_gpu_own_map[RECOMP_GPU_OWN_SLOTS];
+uintptr_t recomp_gpu_own_reconcile(uint32_t guest_va);
+
+static inline uintptr_t recomp_guest_ptr(uint32_t va) {
+    if (g_recomp_gpu_own_map[va >> RECOMP_GPU_OWN_SHIFT])
+        return recomp_gpu_own_reconcile(va);
+    return (uintptr_t)va + g_xbox_mem_offset;
+}
+#define XBOX_PTR(addr) recomp_guest_ptr((uint32_t)(addr))
+#else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#endif
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))

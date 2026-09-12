@@ -29,6 +29,7 @@
 #include "xbox_usb_ohci.h"
 #include "kernel.h"
 #include "recomp_mem_watch.h"
+#include "recomp_gpu_own.h"
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -433,18 +434,25 @@ static void xbox_McpxHoldRegisters(void)
      * those two happens is the entire point. */
     {
         static int attached;
-        if (!attached && getenv("RECOMP_OHCI_ATTACH")) {
+        const char *attach = getenv("RECOMP_OHCI_ATTACH");
+        if (!attached && attach && attach[0] != '\0' && strcmp(attach, "0") != 0) {
             volatile uint32_t *ps =
                 (volatile uint32_t *)((char *)g_mcpx_regs + 0x500054);
             volatile uint32_t *ctl =
                 (volatile uint32_t *)((char *)g_mcpx_regs + 0x500004);
-            /* Only once the title has actually brought the controller up,
-             * so this cannot be mistaken for a device present at reset. */
-            if ((*ctl & 0xC0u) != 0) {
+            volatile uint32_t *ien =
+                (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
+            /* Hot-plug only after the title has made the controller
+             * operational AND enabled the root-hub interrupt and its master
+             * gate.  Testing HcControl alone announced JSRF's pad while
+             * HcInterruptEnable was still zero and before KeConnectInterrupt:
+             * the synthetic device ISR later declined that stale event and
+             * enumeration never began.  Hardware cannot deliver a connect
+             * notification before the driver is listening for it. */
+            if ((*ctl & 0xC0u) == 0x80u
+                    && (*ien & 0x80000040u) == 0x80000040u) {
                 volatile uint32_t *ist =
                     (volatile uint32_t *)((char *)g_mcpx_regs + 0x50000C);
-                volatile uint32_t *ien =
-                    (volatile uint32_t *)((char *)g_mcpx_regs + 0x500010);
                 uint32_t off[3], val[3];
                 unsigned n = 0;
                 attached = 1;
@@ -1643,6 +1651,8 @@ static uintptr_t g_nv2a_pcrtc_page;
 static int       g_nv2a_pcrtc_guarded;
 static uintptr_t g_ac97_page;         /* AC97 bus-master boxes, write-clear */
 static int       g_ac97_guarded;
+static uintptr_t g_ohci_page;         /* USB0 operational registers */
+static int       g_ohci_guarded;
 static uintptr_t g_nv2a_pgraph_page;  /* PGRAPH_INTR, and the notify trap */
 static int       g_nv2a_pgraph_guarded;
 /* RECOMP_STORE_WATCH=<va>:<len> -- a guarded page over ordinary guest RAM.
@@ -1685,16 +1695,19 @@ static size_t    g_nv2a_page_size;    /* g_mcpx_page_size is AArch64-only */
  * it does not guard (which it must pass on) and a store whose opcode the
  * decoder does not recognise (which becomes a crash). The second is the one
  * that reads as a mystery fault if it is not counted. */
-static volatile LONG g_veh_faults, g_veh_pcrtc, g_veh_ac97, g_veh_pgraph;
+static volatile LONG g_veh_faults, g_veh_pcrtc, g_veh_ac97, g_veh_ohci;
+static volatile LONG g_veh_pgraph;
 static volatile LONG g_veh_watch, g_veh_not_ours, g_veh_undecoded;
 
 void xbox_McpxTrapReport(void)
 {
-    fprintf(stderr, "  [MCPX-TRAP] VEH guards: PCRTC=%d AC97=%d PGRAPH=%d"
-                    " faults=%ld pcrtc=%ld ac97=%ld pgraph=%ld watch=%ld"
+    fprintf(stderr, "  [MCPX-TRAP] VEH guards: PCRTC=%d AC97=%d OHCI=%d"
+                    " PGRAPH=%d faults=%ld pcrtc=%ld ac97=%ld ohci=%ld"
+                    " pgraph=%ld watch=%ld"
                     " declined: not-ours=%ld undecoded=%ld\n",
-            g_nv2a_pcrtc_guarded, g_ac97_guarded, g_nv2a_pgraph_guarded,
-            g_veh_faults, g_veh_pcrtc, g_veh_ac97, g_veh_pgraph,
+            g_nv2a_pcrtc_guarded, g_ac97_guarded, g_ohci_guarded,
+            g_nv2a_pgraph_guarded, g_veh_faults, g_veh_pcrtc, g_veh_ac97,
+            g_veh_ohci, g_veh_pgraph,
             g_veh_watch, g_veh_not_ours, g_veh_undecoded);
     fflush(stderr);
 }
@@ -1705,22 +1718,37 @@ BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter);
 int  xbox_Nv2aSoftwareMethodPending(void);
 
 
-/* No write trap on this host, so there is no guard to drop and no way to
- * observe the guest's write-1-to-clear acknowledge either. The raise is a
- * plain store; the acknowledge will not be seen, which is the same limitation
- * this file already documents for the MCPX registers. */
+/* Assert one or more OHCI register values as hardware.  The Windows guest
+ * write path guards this page, so runtime writes have to open it under the
+ * same lock as the VEH and close it again as one transaction. */
 static void mcpx_hw_store(uint32_t offset, uint32_t value)
 {
-    if (g_mcpx_regs)
-        *(volatile uint32_t *)((char *)g_mcpx_regs + offset) = value;
+    mcpx_hw_store_n(&offset, &value, 1);
 }
 
 static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
                             unsigned n)
 {
-    if (!g_mcpx_regs) return;
-    for (unsigned i = 0; i < n; ++i)
-        *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+    DWORD old_prot;
+
+    if (!g_mcpx_regs || n == 0) return;
+    if (!g_ohci_guarded) {
+        for (unsigned i = 0; i < n; ++i)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        return;
+    }
+
+    while (InterlockedCompareExchange(&g_nv2a_pcrtc_lock, 1, 0) != 0)
+        SwitchToThread();
+    if (VirtualProtect((LPVOID)g_ohci_page, g_nv2a_page_size,
+                       PAGE_READWRITE, &old_prot)) {
+        for (unsigned i = 0; i < n; ++i)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        if (!VirtualProtect((LPVOID)g_ohci_page, g_nv2a_page_size,
+                            PAGE_READONLY, &old_prot))
+            g_ohci_guarded = 0;
+    }
+    InterlockedExchange(&g_nv2a_pcrtc_lock, 0);
 }
 
 void xbox_Nv2aRaiseVblank(void)
@@ -1795,6 +1823,10 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
     unsigned width = 4;
     int opsize16 = 0;
     int rmw = 0;
+    int ohci_raise_rhsc = 0;
+    int ohci_serviced = 0;
+    uint32_t ohci_disable = 0;
+    xbox_ohci_service ohci_svc;
     uintptr_t page = ((uintptr_t)fault) & ~(uintptr_t)(g_nv2a_page_size - 1);
     DWORD old_prot;
 
@@ -1806,6 +1838,7 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
     InterlockedIncrement(&g_veh_faults);
     if (!(g_nv2a_pcrtc_guarded  && page == g_nv2a_pcrtc_page) &&
         !(g_ac97_guarded        && page == g_ac97_page) &&
+        !(g_ohci_guarded        && page == g_ohci_page) &&
         !(g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page) &&
         !(g_store_watch_guarded && page == g_store_watch_page)) {
         InterlockedIncrement(&g_veh_not_ours);
@@ -1815,6 +1848,8 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
         InterlockedIncrement(&g_veh_pcrtc);
     else if (g_ac97_guarded   && page == g_ac97_page)
         InterlockedIncrement(&g_veh_ac97);
+    else if (g_ohci_guarded   && page == g_ohci_page)
+        InterlockedIncrement(&g_veh_ohci);
     else if (g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page)
         InterlockedIncrement(&g_veh_pgraph);
     else
@@ -1904,6 +1939,21 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
         return 0;
     }
 
+    if (g_ohci_guarded && page == g_ohci_page) {
+        static int trace = -1;
+        static unsigned long traces;
+        if (trace < 0) trace = getenv("RECOMP_OHCI_TRACE") != NULL;
+        if (trace && ++traces <= 400) {
+            uint32_t off = guest_va - (XBOX_MCPX_BASE + 0x500000u);
+            fprintf(stderr, "  [OHCI-W] #%lu +0x%02X <= 0x%08X (w%u)\n",
+                    traces, off, written, width);
+            fflush(stderr);
+        }
+        if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_CONTROL_HEAD
+                && width == 4 && written)
+            ohci_trace_control_ed(written);
+    }
+
     /* AC97 bus-master reset is WRITE-CLEAR: the bit must never stick.
      * sub_001A6F52 writes RR, reads the register back ONCE outside its loop,
      * then spins on that stale value -- so suppressing the bit at the store is
@@ -1975,10 +2025,63 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
                      || guest_va == XBOX_NV2A_PGRAPH_INTR) ? (before & ~written)
                                                            : written);
 
+    /* The Xbox USB stack talks straight to OHCI registers.  On Windows these
+     * used to be ordinary RAM: Enable/Disable lost their set/clear semantics,
+     * status acknowledgements stuck, port commands replaced port state, and
+     * ControlListFilled never ran the descriptor service.  The AArch64 trap
+     * above already implements this state machine; mirror it here at the
+     * decoded guest store boundary. */
+    if (g_ohci_guarded && page == g_ohci_page && width == 4) {
+        if (guest_va == XBOX_MCPX_BASE + 0x500008u
+                && (written & 0x00000006u)) {
+            if (written & 0x00000002u) {
+                uint32_t head = *(volatile uint32_t *)
+                    ((char *)g_mcpx_regs + MCPX_OHCI_CONTROL_HEAD);
+                if (head) {
+                    ohci_trace_control_ed(head);
+                    ohci_serviced = ohci_service(head, &ohci_svc) != 0;
+                }
+            }
+            if (!ohci_serviced && (written & 0x00000004u)) {
+                uint32_t head = *(volatile uint32_t *)
+                    ((char *)g_mcpx_regs + MCPX_OHCI_BULK_HEAD);
+                if (head)
+                    ohci_serviced = ohci_service(head, &ohci_svc) != 0;
+            }
+            after = written & ~0x00000006u;
+        } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_STATUS) {
+            after = before & ~written;                 /* write 1 to clear */
+        } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE) {
+            after = before | written;                  /* write 1 to set */
+        } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) {
+            ohci_disable = written;                    /* clears Enable */
+            after = 0;
+        } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_PORT0
+                || guest_va == XBOX_MCPX_BASE + MCPX_OHCI_PORT1) {
+            after = xbox_OhciPortWrite(before, written);
+            if ((after & 0x001F0000u) & ~(before & 0x001F0000u))
+                ohci_raise_rhsc = 1;
+            if (after & 0x00100000u)
+                xbox_UsbDeviceReset();
+        }
+    }
+
     if (VirtualProtect((LPVOID)page, g_nv2a_page_size,
                        PAGE_READWRITE, &old_prot)) {
         if (width == 1) *(volatile uint8_t  *)fault = (uint8_t)after;
         else            *(volatile uint32_t *)fault = after;
+        if (ohci_raise_rhsc) {
+            *(volatile uint32_t *)((char *)g_mcpx_regs
+                                   + MCPX_OHCI_INTR_STATUS) |= 0x00000040u;
+        }
+        if (ohci_serviced)
+            ohci_service_commit(&ohci_svc);
+        if (ohci_disable) {
+            volatile uint32_t *enable = (volatile uint32_t *)
+                ((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
+            *enable &= ~ohci_disable;
+            *(volatile uint32_t *)fault = *enable;
+        }
         if (guest_va == XBOX_NV2A_PCRTC_INTR_0 && (after & 0x1u) == 0) {
             __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0
                                                        + g_memory_offset),
@@ -1994,6 +2097,7 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
                             PAGE_READONLY, &old_prot)) {
             if      (page == g_nv2a_pcrtc_page)  g_nv2a_pcrtc_guarded = 0;
             else if (page == g_nv2a_pgraph_page) g_nv2a_pgraph_guarded = 0;
+            else if (page == g_ohci_page)         g_ohci_guarded = 0;
             else if (page == g_store_watch_page) g_store_watch_guarded = 0;
             else                                 g_ac97_guarded = 0;
         }
@@ -2094,6 +2198,13 @@ static void xbox_McpxTrapInstall(void)
                   & ~(uintptr_t)(g_nv2a_page_size - 1);
     g_ac97_guarded = VirtualProtect((LPVOID)g_ac97_page, g_nv2a_page_size,
                                     PAGE_READONLY, &old_prot) != 0;
+    /* USB0's operational registers occupy one page.  Guarding it gives the
+     * Windows VEH the same set/clear, port-command and transfer-doorbell
+     * boundary the AArch64 store trap already has. */
+    g_ohci_page = ((uintptr_t)g_memory_offset + XBOX_MCPX_BASE + 0x500000u)
+                  & ~(uintptr_t)(g_nv2a_page_size - 1);
+    g_ohci_guarded = VirtualProtect((LPVOID)g_ohci_page, g_nv2a_page_size,
+                                    PAGE_READONLY, &old_prot) != 0;
     /* PGRAPH_INTR and the software-method trap registers share a page. Guarding
      * it is what lets the guest's acknowledge be seen; without it a notify can
      * be raised but never retired, and the pusher blocks on the second one. */
@@ -2106,6 +2217,8 @@ static void xbox_McpxTrapInstall(void)
             g_nv2a_pcrtc_guarded ? "guarded" : "NOT guarded");
     fprintf(stderr, "  AC97: bus-master page %s for write-clear (RR)\n",
             g_ac97_guarded ? "guarded" : "NOT guarded");
+    fprintf(stderr, "  OHCI: USB0 page %s for register semantics\n",
+            g_ohci_guarded ? "guarded" : "NOT guarded");
     fprintf(stderr, "  NV2A: PGRAPH page %s for software-method notify\n",
             g_nv2a_pgraph_guarded ? "guarded" : "NOT guarded");
     {
@@ -3812,6 +3925,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     recomp_mem_watch_init(g_memory_size, g_mirror_mask, XBOX_TILED_BASE,
                           g_tiled_view ? xbox_TiledApertureSize() : 0);
+    /* The ownership map arms a resident surface at every guest window that
+     * names it, and this file is the only place that knows what those windows
+     * are.  Registered here rather than at first use so a surface armed before
+     * the first alias query cannot be armed at the low window alone. */
+    recomp_gpu_own_set_aliases(recomp_mem_watch_ram_aliases);
 #if defined(_WIN32)
     /* Here rather than in the harness, for two reasons. The heap bounds are
      * only final once the image is loaded and the stacks are sized, which is

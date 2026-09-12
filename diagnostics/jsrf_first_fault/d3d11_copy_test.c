@@ -18,11 +18,61 @@
  */
 #include "d3d8_xbox.h"
 #include "nv2a_d3d11.h"
+#include "recomp_gpu_own.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
+
+/* A stand-in guest window.
+ *
+ * The renderer tests link the graphics backend without a kernel, so nothing
+ * else here owns a guest address space -- and the ownership map is indexed by
+ * guest VA, so without one it could only ever be exercised at address zero.
+ * One static megabyte, declared as the guest window, lets the surfaces below
+ * live at real guest VAs and lets the read seam be driven exactly as the
+ * recompiled code drives it. */
+#define GUEST_RAM_BYTES (1u << 20)
+static unsigned char guest_ram[GUEST_RAM_BYTES];
+ptrdiff_t g_xbox_mem_offset;
+ptrdiff_t xbox_GetMemoryOffset(void) { return g_xbox_mem_offset; }
+
+/* Two granules apart, not one.
+ *
+ * The map arms one access width below each range, so a granule-aligned surface
+ * also arms the granule beneath it. Neighbouring surfaces would then share a
+ * map byte and "only the overlapping surface moved" could not be read off the
+ * map at all -- which is a property of the test's addresses, not of the
+ * ownership model, and cost a confusing failure to work out once already. */
+#define GUEST_A 0x00010000u
+#define GUEST_B 0x00030000u
+#define GUEST_C 0x00050000u
+#define GUEST_Z 0x00070000u
+#define HOSTP(va) (guest_ram + (va))
+
+/* The translated load, spelled the way recomp_types.h spells it.
+ *
+ * Written out rather than included because this test links no register model,
+ * but it is the same three steps -- granule lookup, not-taken branch, offset
+ * add -- and test_runtime_helpers_defined.py keeps the header's copy honest. */
+static uintptr_t guest_ptr(uint32_t va)
+{
+    if (g_recomp_gpu_own_map[va >> RECOMP_GPU_OWN_SHIFT])
+        return recomp_gpu_own_reconcile(va);
+    return (uintptr_t)va + g_xbox_mem_offset;
+}
+
+static uint16_t guest_read16(uint32_t va)
+{
+    return *(volatile uint16_t *)guest_ptr(va);
+}
+
+static void guest_write16(uint32_t va, uint16_t value)
+{
+    *(volatile uint16_t *)guest_ptr(va) = value;
+}
 
 static HWND make_window(void)
 {
@@ -123,6 +173,206 @@ static void run(const char *name, NV2ATextureCopy *s,
     compare(name, cpu, gpu, s->clip_w, s->clip_h, s->target_pitch, ceiling);
 }
 
+static int differs_from_seed(const uint8_t *p, size_t bytes, uint8_t seed)
+{
+    size_t i;
+    for (i = 0; i < bytes; ++i) if (p[i] != seed) return 1;
+    return 0;
+}
+
+/* Exercise the ownership transitions that JSRF needs, not just one isolated
+ * draw. Three guest targets stay dirty on the GPU; touching A must not flush B
+ * or C, and a subsequent full clear of A must remain GPU-resident until a
+ * consumer explicitly synchronises that range. */
+static void resident_surface_coherence(float v[][16][4])
+{
+    /* In the guest window, so these exercise the ownership map as well as the
+     * range API: a surface that is resident on the GPU arms its granule, and a
+     * range sync or invalidate has to give it back. */
+    uint8_t *a = HOSTP(GUEST_A), *b = HOSTP(GUEST_B), *c = HOSTP(GUEST_C);
+    uint8_t *z = HOSTP(GUEST_Z);
+    static uint8_t before[512], zbefore[1024];
+    NV2ATextureCopy s;
+    uint8_t *targets[3] = { a, b, c };
+    const size_t abytes = 512, zbytes = 1024;
+    unsigned i, x;
+    int ok = 1, selective_a, selective_b, selective_c;
+    int clear_handled, clear_deferred, clear_value = 1, partial_rejected;
+    int depth_rejected, depth_preserved;
+
+    memset(&s, 0, sizeof(s));
+    s.untextured = 1;
+    s.clip_w = s.clip_h = 16;
+    s.target_pitch = 32;
+    s.target_bpp = 2;
+    for (i = 0; i < 3; ++i) memset(targets[i], 0xcc, abytes);
+
+    for (i = 0; i < 3; ++i) {
+        if (nv2a_d3d11_draw(&s, NULL, 0, targets[i], abytes,
+                NULL, 0, (const float (*)[16][4])v, 3, 5) < 0)
+            ok = 0;
+    }
+    nv2a_d3d11_invalidate_range(a, abytes);
+    selective_a = differs_from_seed(a, abytes, 0xcc)
+               && !differs_from_seed(b, abytes, 0xcc)
+               && !differs_from_seed(c, abytes, 0xcc);
+    if (!selective_a) ok = 0;
+    if (!nv2a_d3d11_sync_range(b, abytes)
+            || !differs_from_seed(b, abytes, 0xcc)
+            || differs_from_seed(c, abytes, 0xcc))
+        ok = 0;
+    selective_b = differs_from_seed(b, abytes, 0xcc)
+               && !differs_from_seed(c, abytes, 0xcc);
+    if (!nv2a_d3d11_sync_range(c, abytes)
+            || !differs_from_seed(c, abytes, 0xcc))
+        ok = 0;
+    selective_c = differs_from_seed(c, abytes, 0xcc);
+
+    /* Re-establish A as resident after the CPU ownership transition above. */
+    if (nv2a_d3d11_draw(&s, NULL, 0, a, abytes, NULL, 0,
+            (const float (*)[16][4])v, 3, 5) < 0)
+        ok = 0;
+    memcpy(before, a, abytes);
+    clear_handled = nv2a_d3d11_clear_color(a, abytes, 32, 16, 16,
+                                           0xf0, 0x07e0);
+    if (!clear_handled) ok = 0;
+    clear_deferred = memcmp(a, before, abytes) == 0;
+    if (!clear_deferred) ok = 0; /* still GPU-authoritative */
+    if (!nv2a_d3d11_sync_range(a, abytes)) ok = 0;
+    for (x = 0; x < 16 * 16; ++x)
+        if (a[x * 2] != 0xe0 || a[x * 2 + 1] != 0x07) {
+            if (clear_value)
+                printf("    first clear mismatch pixel %u: %02x%02x\n",
+                       x, a[x * 2 + 1], a[x * 2]);
+            clear_value = 0;
+        }
+    if (!clear_value) ok = 0;
+    partial_rejected = !nv2a_d3d11_clear_color(a, abytes, 32, 16, 16,
+                                                0x10, 0);
+    if (!partial_rejected) ok = 0; /* partial RGB masks use CPU fallback */
+
+    /* The depth/stencil aspect has independent ownership. Materialise one
+     * depth-writing draw and confirm the resident shortcut refuses it: under
+     * CrossOver, ClearDepthStencilView's staging layout rotates the guest's
+     * Z24S8 bytes, so the CPU clear remains the correctness path. */
+    for (i = 0; i < (unsigned)zbytes; i += 4) {
+        z[i] = 0x5a;
+        z[i + 1] = z[i + 2] = z[i + 3] = 0xff;
+    }
+    s.depth_test = 1;
+    s.depth_write = 1;
+    s.depth_pitch = 64;
+    s.depth_func = 0x203;
+    if (nv2a_d3d11_draw(&s, NULL, 0, a, abytes, z, zbytes,
+            (const float (*)[16][4])v, 3, 5) < 0
+            || !nv2a_d3d11_sync_range(z, zbytes))
+        ok = 0;
+    memcpy(zbefore, z, zbytes);
+    depth_rejected = !nv2a_d3d11_clear_depth_stencil(z, zbytes, 64, 16, 16,
+                                                      0, 0, 16, 16,
+                                                      3, 0x12345678);
+    depth_preserved = memcmp(z, zbefore, zbytes) == 0;
+    if (!depth_rejected || !depth_preserved) ok = 0;
+
+    printf("  %-28s %s\n", "resident surface coherence", ok ? "ok" : "FAIL");
+    if (!ok)
+        printf("    selective=%d/%d/%d clear=%d deferred=%d value=%d partial=%d"
+               " depth-rejected=%d preserved=%d\n",
+               selective_a, selective_b, selective_c, clear_handled,
+               clear_deferred, clear_value, partial_rejected, depth_rejected,
+               depth_preserved);
+    if (!ok) ++failures;
+}
+
+/* Does a translated guest access see a surface the GPU still owns?
+ *
+ * The coherence test above drives the range API directly, which is what the
+ * runtime's own consumers do. This one drives the seam the recompiled code
+ * uses -- a guest VA through the ownership map -- because that is the path
+ * that was missing, and the reason RECOMP_D3D11_RESIDENT_CLEARS could not be
+ * turned on: the game read its framebuffer through a plain load, got the
+ * pre-clear bytes, and stopped.
+ *
+ * The ordering assertion at the end is the one worth keeping. A guest store
+ * resolves its address first and writes second, so the reconcile that the
+ * address resolution triggers must download the surface BEFORE the store
+ * lands. Get that backwards and the download silently eats the write -- which
+ * would read as memory corruption a long way from here.
+ */
+static void guest_ownership_boundary(float v[][16][4])
+{
+    uint8_t *a = HOSTP(GUEST_A), *b = HOSTP(GUEST_B);
+    NV2ATextureCopy s;
+    const size_t abytes = 512;
+    uint64_t touches0, hits0, armed0, touches1, hits1, armed1;
+    uint16_t seed = 0xcccc, drawn, seen, readback;
+    int ok = 1;
+    int armed_after_draw, ram_still_stale, read_saw_gpu, disarmed_after_read;
+    int b_untouched, b_still_armed, write_survived;
+    unsigned i;
+
+    memset(&s, 0, sizeof(s));
+    s.untextured = 1;
+    s.clip_w = s.clip_h = 16;
+    s.target_pitch = 32;
+    s.target_bpp = 2;
+
+    /* 1. The CPU establishes guest VRAM. */
+    for (i = 0; i < abytes / 2; ++i) {
+        ((uint16_t *)a)[i] = seed;
+        ((uint16_t *)b)[i] = seed;
+    }
+    recomp_gpu_own_counters(&touches0, &hits0, &armed0);
+
+    /* 2. Two draws make both surfaces resident and GPU-authoritative. */
+    if (nv2a_d3d11_draw(&s, NULL, 0, a, abytes, NULL, 0,
+            (const float (*)[16][4])v, 3, 5) < 0) ok = 0;
+    if (nv2a_d3d11_draw(&s, NULL, 0, b, abytes, NULL, 0,
+            (const float (*)[16][4])v, 3, 5) < 0) ok = 0;
+
+    /* 3. The map says so, and guest RAM has not been written back. */
+    armed_after_draw = g_recomp_gpu_own_map[GUEST_A >> RECOMP_GPU_OWN_SHIFT] != 0
+                    && g_recomp_gpu_own_map[GUEST_B >> RECOMP_GPU_OWN_SHIFT] != 0;
+    ram_still_stale = ((uint16_t *)a)[0] == seed && ((uint16_t *)b)[0] == seed;
+    if (!armed_after_draw || !ram_still_stale) ok = 0;
+
+    /* 4-6. One translated load of one pixel. It must reconcile A, return what
+     * the GPU drew, and leave B alone. */
+    seen = guest_read16(GUEST_A);
+    drawn = ((uint16_t *)a)[0];
+    read_saw_gpu = seen != seed && seen == drawn;
+    disarmed_after_read = g_recomp_gpu_own_map[GUEST_A >> RECOMP_GPU_OWN_SHIFT] == 0;
+    b_untouched = ((uint16_t *)b)[0] == seed;
+    b_still_armed = g_recomp_gpu_own_map[GUEST_B >> RECOMP_GPU_OWN_SHIFT] != 0;
+    if (!read_saw_gpu || !disarmed_after_read || !b_untouched || !b_still_armed)
+        ok = 0;
+
+    /* 7-8. A translated store into the still-resident B. The reconcile has to
+     * happen first and the guest's value has to be what remains. */
+    guest_write16(GUEST_B + 4, 0x1234);
+    readback = ((uint16_t *)b)[2];
+    write_survived = readback == 0x1234
+                  && ((uint16_t *)b)[0] != seed;   /* B was downloaded too */
+    if (!write_survived) ok = 0;
+
+    recomp_gpu_own_counters(&touches1, &hits1, &armed1);
+    if (touches1 - touches0 < 2 || hits1 - hits0 < 2) ok = 0;
+
+    printf("  %-28s %s\n", "guest ownership boundary", ok ? "ok" : "FAIL");
+    if (!ok)
+        printf("    armed=%d stale=%d read=%d(%04x vs seed %04x) disarmed=%d"
+               " b-untouched=%d b-armed=%d write=%d(%04x) touches=%llu hits=%llu\n",
+               armed_after_draw, ram_still_stale, read_saw_gpu, seen, seed,
+               disarmed_after_read, b_untouched, b_still_armed, write_survived,
+               readback, (unsigned long long)(touches1 - touches0),
+               (unsigned long long)(hits1 - hits0));
+    if (!ok) ++failures;
+
+    /* Leave nothing armed: the raster comparison below renders into ordinary
+     * host buffers and must not pay for a stale hold. */
+    nv2a_d3d11_invalidate_range(NULL, 0);
+}
+
 int main(void)
 {
     IDirect3D8 *d3d;
@@ -135,6 +385,10 @@ int main(void)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    /* Production leaves retained clears off until guest CPU reads can demand
+     * synchronisation. This test opts into the experimental transition. */
+    _putenv("RECOMP_D3D11_RESIDENT_CLEARS=1");
+    g_xbox_mem_offset = (ptrdiff_t)guest_ram;
     d3d = xbox_Direct3DCreate8(0);
     if (!d3d) { fprintf(stderr, "xbox_Direct3DCreate8 failed\n"); return 1; }
     memset(&pp, 0, sizeof(pp));
@@ -174,6 +428,9 @@ int main(void)
     }
 
     puts("D3D11 raster path against the CPU rasteriser, in RGB565 channel steps:");
+
+    resident_surface_coherence(v);
+    guest_ownership_boundary(v);
 
     /* The diffuse-only fragment: no texture, no combiner. Nothing to filter,
      * so anything but a near-exact match here is a broken pipeline. */

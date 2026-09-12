@@ -15,6 +15,15 @@ void recomp_mem_watch_add_ram_alias(uint32_t guest_base,
                                     uint32_t ram_offset, size_t span);
 void recomp_mem_watch_shutdown(void);
 
+/* The inverse of the alias identity used for watch matching: given a byte
+ * range in RAM, list every guest VA window that names it -- the low window,
+ * each live mirror, the tiled aperture, and the physical heap alias.  The
+ * GPU-ownership map needs this to arm a resident surface at every address the
+ * guest could read it through, not just the one the backend happened to be
+ * handed.  Returns how many windows were written. */
+unsigned recomp_mem_watch_ram_aliases(uint32_t ram_offset, size_t span,
+                                      uint32_t *out_va, unsigned max);
+
 void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
                                   uint32_t guest_va, unsigned width,
                                   volatile void *host_ptr, uint64_t new_value);

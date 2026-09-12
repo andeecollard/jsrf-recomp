@@ -12,7 +12,9 @@
 #define NV2A_GPU_TAG         "METAL"
 #define nv2a_gpu_draw        nv2a_metal_draw
 #define nv2a_gpu_sync        nv2a_metal_sync
+#define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()
 #define nv2a_gpu_invalidate  nv2a_metal_invalidate
+#define nv2a_gpu_invalidate_range(target, bytes) nv2a_metal_invalidate(target)
 #define nv2a_gpu_last_reject nv2a_metal_last_reject
 #define nv2a_gpu_report      nv2a_metal_report
 #elif defined(_WIN32)
@@ -22,7 +24,11 @@
 #define NV2A_GPU_TAG         "D3D11"
 #define nv2a_gpu_draw        nv2a_d3d11_draw
 #define nv2a_gpu_sync        nv2a_d3d11_sync
+#define nv2a_gpu_sync_range  nv2a_d3d11_sync_range
 #define nv2a_gpu_invalidate  nv2a_d3d11_invalidate
+#define nv2a_gpu_invalidate_range nv2a_d3d11_invalidate_range
+#define nv2a_gpu_clear_color nv2a_d3d11_clear_color
+#define nv2a_gpu_clear_depth_stencil nv2a_d3d11_clear_depth_stencil
 #define nv2a_gpu_last_reject nv2a_d3d11_last_reject
 #define nv2a_gpu_report      nv2a_d3d11_report
 #define nv2a_gpu_surface_report nv2a_d3d11_surface_report
@@ -885,17 +891,19 @@ static int s_snap_wanted;
 static void snapshot_surface(void)
 {
     uint32_t b = surface_bpp();
-    const uint8_t *mem;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t y;
 
 #if NV2A_GPU_PATH
-    if (nv2a_gpu_on()) nv2a_gpu_sync();
+    if (nv2a_gpu_on() && mem && s_gpu.color_offset && s_gpu.pitch
+            && s_gpu.clip_h)
+        nv2a_gpu_sync_range((uint8_t *)mem + s_gpu.color_offset,
+                (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h));
 #endif
     if (!s_snap_wanted || !s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
         return;
     if (b != 2 && b != 4)
         return;
-    mem = (const uint8_t *)xbox_GetMemoryOffset();
     if (!mem)
         return;
 
@@ -1092,7 +1100,10 @@ static void dump_surface_bmp(const char *tag, unsigned seq)
     uint32_t bpp = surface_bpp();
 
 #if NV2A_GPU_PATH
-    if (nv2a_gpu_on()) nv2a_gpu_sync();
+    if (nv2a_gpu_on() && mem && s_gpu.color_offset && s_gpu.pitch
+            && s_gpu.clip_h)
+        nv2a_gpu_sync_range((uint8_t *)mem + s_gpu.color_offset,
+                (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h));
 #endif
     if (!mem || !s_gpu.color_offset)
         return;
@@ -1340,6 +1351,7 @@ static void clear_surface(uint32_t param)
                 && (uint64_t)base+offset<=UINT32_MAX) {
             uint8_t *z=xbox_GpuMemoryRange(base+offset,bytes);
             uint32_t value=s_methods[0x1d8c/4];
+            int gpu_cleared = 0;
             /* Where the depth surface actually is, in its two parts.
              *
              * The address is the zeta DMA object's base plus
@@ -1380,9 +1392,22 @@ static void clear_surface(uint32_t param)
              * and say so, rather than corrupting the guest silently. */
             if (z && nv2a_range_hits_image(base+offset, bytes)) z = NULL;
 #if NV2A_GPU_PATH
-            if (z && nv2a_gpu_on()) nv2a_gpu_invalidate(z);
+            if (z && nv2a_gpu_on()) {
+#ifdef nv2a_gpu_clear_depth_stencil
+                gpu_cleared = nv2a_gpu_clear_depth_stencil(z, bytes, pitch,
+                        s_gpu.clip_w, s_gpu.clip_h, x0, y0, x1, y1,
+                        param & 3u, value);
 #endif
-            if (z) for (y=y0;y<y1;++y) for (x=x0;x<x1;++x) {
+                if (!gpu_cleared) nv2a_gpu_invalidate_range(z, bytes);
+            }
+#endif
+#ifdef nv2a_gpu_surface_report
+            if (nv2a_gpu_on() && nv2a_d3d11_event_trace())
+                fprintf(stderr, "  [EV] ZCLEAR %s base=%08X off=%08X value=%08X%s\n",
+                        z ? "ok" : "REFUSED", base, offset, s_methods[0x1d8c/4],
+                        gpu_cleared ? " (resident)" : "");
+#endif
+            if (z && !gpu_cleared) for (y=y0;y<y1;++y) for (x=x0;x<x1;++x) {
                 uint8_t *p=z+(size_t)y*pitch+x*4;
                 if (param&2) p[0]=(uint8_t)value;
                 if (param&1) for (unsigned k=1;k<4;++k) p[k]=(uint8_t)(value>>(8*k));
@@ -1390,22 +1415,51 @@ static void clear_surface(uint32_t param)
         }
     }
 
+#ifdef nv2a_gpu_surface_report
+    /* Whether the depth half ran at all. A depth clear the executor declines
+     * leaves a retained GPU depth buffer holding the previous frame, and every
+     * later draw then fails its depth test -- which looks exactly like a
+     * renderer that stopped drawing. */
+    if (nv2a_gpu_on() && nv2a_d3d11_event_trace())
+        fprintf(stderr, "  [EV] CLEARP param=%02X zcond=%d\n", param,
+                (int)((param&3) && (s_methods[0x208/4]&0xfff0)==0x120
+                      && !(s_methods[0x290/4]&0x1000)));
+#endif
     if (!(param & (NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G | NV097_CLEAR_SURFACE_B | NV097_CLEAR_SURFACE_A)))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
+    {
+        size_t bytes = (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h);
+        int gpu_cleared = 0;
+        (void)bytes; /* the Metal compatibility macro needs no range yet */
 #if NV2A_GPU_PATH
-    if (nv2a_gpu_on()) nv2a_gpu_invalidate(mem + s_gpu.color_offset);
+        if (nv2a_gpu_on()) {
+#ifdef nv2a_gpu_clear_color
+            if (bpp == 2)
+                gpu_cleared = nv2a_gpu_clear_color(mem + s_gpu.color_offset,
+                        bytes, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
+                        param, s_gpu.clear_color);
+#endif
+            if (!gpu_cleared)
+                nv2a_gpu_invalidate_range(mem + s_gpu.color_offset, bytes);
+        }
+#endif
+#ifdef nv2a_gpu_surface_report
+        if (nv2a_gpu_on() && nv2a_d3d11_event_trace())
+            fprintf(stderr, "  [EV] CLEAR  target=%08X colour=%08X%s\n",
+                    s_gpu.color_offset, s_gpu.clear_color,
+                    gpu_cleared ? " (resident)" : "");
 #endif
 
-    for (y = 0; y < s_gpu.clip_h; y++) {
-        uint8_t *row = mem + s_gpu.color_offset
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
-        if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
-                p[x] = s_gpu.clear_color;
-        } else if (bpp == 2) {
+        if (!gpu_cleared) for (y = 0; y < s_gpu.clip_h; y++) {
+            uint8_t *row = mem + s_gpu.color_offset
+                         + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+            if (bpp == 4) {
+                uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+                for (x = 0; x < s_gpu.clip_w; x++)
+                    p[x] = s_gpu.clear_color;
+            } else if (bpp == 2) {
             /* NV097_SET_COLOR_CLEAR_VALUE arrives already in the surface's own
              * format, so a 16-bit surface takes the low half verbatim. It is
              * tempting to treat it as A8R8G8B8 and reduce it to 5:6:5 -- this
@@ -1426,10 +1480,11 @@ static void clear_surface(uint32_t param)
              * (32,28,32), matching xemu's (227,226,229) and (30,27,30) on the
              * same cards. Only the black case agreed before, and black is the
              * one value both readings share. */
-            uint16_t v = (uint16_t)s_gpu.clear_color;
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
-                p[x] = v;
+                uint16_t v = (uint16_t)s_gpu.clear_color;
+                uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+                for (x = 0; x < s_gpu.clip_w; x++)
+                    p[x] = v;
+            }
         }
     }
     s_gpu.clears++;
@@ -2454,6 +2509,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "  [FLIPTRACE] pre-sync:\n");
             nv2a_gpu_surface_report();
         }
+        if (nv2a_gpu_on() && nv2a_d3d11_event_trace())
+            fprintf(stderr, "  [EV] FLIP   bound=%08X\n", s_gpu.color_offset);
 #endif
         snapshot_surface();
         flip_trace();

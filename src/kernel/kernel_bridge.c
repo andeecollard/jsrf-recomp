@@ -2151,7 +2151,13 @@ static RECOMP_TLS LONG g_current_isr_handoff;
  * it into the summary. */
 #define NV_PMC_INTR_0          0x100u
 #define NV_PMC_INTR_0_PCRTC    0x01000000u   /* bit 24: display engine */
+#define NV_PMC_INTR_0_PGRAPH   0x00001000u   /* bit 12: graphics engine */
 #define NV_PMC_INTR_EN_0       0x140u
+#define NV_PGRAPH_INTR         0x400100u
+#define NV_PGRAPH_INTR_ERROR   0x00100000u
+#define NV_PGRAPH_TRAPPED_ADDR 0x400704u
+#define NV_PGRAPH_TRAPPED_DATA 0x400708u
+#define NV_PGRAPH_FIFO_ACCESS  0x400720u
 #define NV_PCRTC_INTR_0        0x600100u
 #define NV_PCRTC_INTR_0_VBLANK 0x00000001u
 
@@ -2399,12 +2405,31 @@ static void bridge_nv2a_mirror_intr(void)
     uint32_t base = g_nv2a_base;
     if (!base) return;
     if (!(BRIDGE_MEM32(base + NV_PCRTC_INTR_0) & NV_PCRTC_INTR_0_VBLANK)) {
-#if defined(_WIN32)
-        BRIDGE_MEM32(base + NV_PMC_INTR_0) &= ~NV_PMC_INTR_0_PCRTC;
-#else
         __atomic_fetch_and((uint32_t *)((uintptr_t)base + NV_PMC_INTR_0 + g_xbox_mem_offset),
                            ~NV_PMC_INTR_0_PCRTC, __ATOMIC_SEQ_CST);
-#endif
+    }
+
+    /* PMC_INTR_0 is a read-only summary of the engine sources.  The Windows
+     * aperture is ordinary RAM outside the two guarded device pages, so a
+     * guest store or a concurrent acknowledgement can erase the PGRAPH bit
+     * after xbox_Nv2aRaiseSoftwareMethod asserted it.  The source remains
+     * pending in PGRAPH_INTR, but the delivery gate below then sees pmc=0 and
+     * the pusher waits forever -- JSRF visibly stops on the anti-graffiti
+     * screen.  Rebuild the summary from its source on every interrupt pump,
+     * just as the hardware does.  Atomic updates also avoid losing a PGRAPH
+     * raise while the PCRTC half of the summary is being retired. */
+    /* Restrict the repair to a software-method trap created by
+     * xbox_Nv2aRaiseSoftwareMethod.  PGRAPH_INTR can contain unrelated
+     * initialization-time errors before the pusher installs that handshake;
+     * promoting those to PMC sends the guest ISR into a legitimate but
+     * unserviceable error loop. */
+    if ((BRIDGE_MEM32(base + NV_PGRAPH_INTR) & NV_PGRAPH_INTR_ERROR)
+            && (BRIDGE_MEM32(base + NV_PGRAPH_TRAPPED_ADDR) & 0x1FFFu) == 0x100u
+            && BRIDGE_MEM32(base + NV_PGRAPH_TRAPPED_DATA) != 0
+            && !(BRIDGE_MEM32(base + NV_PGRAPH_FIFO_ACCESS) & 1u)) {
+        __atomic_fetch_or((uint32_t *)((uintptr_t)base + NV_PMC_INTR_0
+                                      + g_xbox_mem_offset),
+                          NV_PMC_INTR_0_PGRAPH, __ATOMIC_SEQ_CST);
     }
 }
 

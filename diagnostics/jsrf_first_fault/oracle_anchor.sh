@@ -10,6 +10,9 @@
 #   * RECOMP_OBJECT_DUMP_EXIT ends the run the moment the dump is written.
 #
 # Usage: oracle_anchor.sh mac|win <clock> <outdir>
+# ORACLE_NO_OHCI_ATTACH=1 keeps the synthetic controller detached. This is a
+# graphics-oracle control: it isolates renderer work from the still-incomplete
+# OHCI enumeration/transfer path without changing normal diagnostic defaults.
 set -e
 HOST="$1"; CLOCK="$2"; OUT="$3"
 [ -n "$OUT" ] || { echo "usage: $0 mac|win <clock> <outdir>" >&2; exit 2; }
@@ -49,7 +52,8 @@ if [ -n "$ORACLE_CONTIG_VERIFY" ]; then
 fi
 if [ "$HOST" = mac ]; then
   RECOMP_USB=${ORACLE_USB:-} \
-  RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
+  RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
+  RECOMP_OHCI_ATTACH=$([ -n "$ORACLE_NO_OHCI_ATTACH" ] && printf 0 || printf 1) \
   RECOMP_REPORT_MS=600000 RECOMP_FUNC_HIT_TRACE=1 \
   RECOMP_OBJECT_DUMP="$OUT" RECOMP_OBJECT_DUMP_AT="$CLOCK" \
   RECOMP_OBJECT_DUMP_EXIT=1 RECOMP_HDD_ROOT="$SCRATCH/hdd-$HOST-$CLOCK" \
@@ -67,7 +71,14 @@ else
     printf '%s\n' 'set RECOMP_AC97_READY=1'
     printf '%s\n' 'set RECOMP_IRQ_THREAD=1'
     printf '%s\n' 'set RECOMP_PB_EXEC=1'
-    printf '%s\n' 'set RECOMP_OHCI_ATTACH=1'
+    if [ -n "$ORACLE_NO_OHCI_ATTACH" ]; then
+      printf '%s\n' 'set RECOMP_OHCI_ATTACH=0'
+    else
+      printf '%s\n' 'set RECOMP_OHCI_ATTACH=1'
+    fi
+    [ -n "$ORACLE_OHCI_TRACE" ] && printf '%s\n' 'set RECOMP_OHCI_TRACE=1'
+    [ -n "$ORACLE_OHCI_TRANSFER_TRACE" ] && \
+        printf '%s\n' 'set RECOMP_OHCI_TRANSFER_TRACE=1'
     [ -n "$ORACLE_USB" ] && printf '%s\n' 'set RECOMP_USB=1'
     # ORACLE_D3D11=1 puts the batches on the GPU, which is what macOS does by
     # default above. Off by default so the two Windows configurations can be
@@ -87,6 +98,17 @@ else
         printf 'set RECOMP_FLIP_TRACE=%s\n' "$ORACLE_FLIP_TRACE"
     [ -n "$ORACLE_CONTIG_VERIFY" ] && printf '%s\n' 'set RECOMP_CONTIG_VERIFY=1'
     [ -n "$ORACLE_SYNC_EACH" ] && printf '%s\n' 'set RECOMP_D3D11_SYNC_EACH=1'
+    # ORACLE_RESIDENT_CLEARS=1: leave a colour clear on the GPU instead of
+    # writing it into guest RAM. Only safe once translated guest reads can
+    # demand the surface back, which is what the ownership map does; the pair
+    # is the measurement, so it is one switch away rather than a rebuild.
+    [ -n "$ORACLE_RESIDENT_CLEARS" ] && \
+        printf '%s\n' 'set RECOMP_D3D11_RESIDENT_CLEARS=1'
+    # ORACLE_NO_GPU_OWN=1: the negative control for the ownership map. Nothing
+    # is armed, so no translated access can reconcile a surface, and anything
+    # that still works was not the map's doing.
+    [ -n "$ORACLE_NO_GPU_OWN" ] && printf '%s\n' 'set RECOMP_GPU_OWN=0'
+    [ -n "$ORACLE_EVENTS" ] && printf 'set RECOMP_D3D11_EVENTS=%s\n' "$ORACLE_EVENTS"
     printf '%s\n' 'set RECOMP_REPORT_MS=600000'
     printf '%s\n' 'set RECOMP_FUNC_HIT_TRACE=1'
     printf 'set RECOMP_OBJECT_DUMP=%s\n' "$(W "$OUT")"

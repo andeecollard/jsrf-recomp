@@ -1144,6 +1144,10 @@ static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
         if (GetTickCount() - start >= 2000) {
             fprintf(stderr, "[PB-NOTIFY] waiting parameter=%u raised=%d pmc=%08X intr=%08X fifo=%08X\n",
                     parameter, raised, MEM32(0xFD000100u), MEM32(0xFD400100u), MEM32(0xFD400720u));
+            {
+                extern void xbox_PgraphIrqReport(void);
+                xbox_PgraphIrqReport();
+            }
             start = GetTickCount();
         }
         Sleep(0);
@@ -1182,6 +1186,11 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
         uint32_t submitted = dev ? MEM32(dev + JSRF_D3D_PUT_OFFSET) : 0;
         int consumed = jsrf_pb_poll();
         jsrf_pusher_report();
+        /* Cheap and constant: the guest-clock anchor must not inherit the
+         * report's interval, or the two hosts dump at different guest
+         * instants. Self-gating and a no-op unless RECOMP_OBJECT_DUMP_AT is
+         * set. */
+        jsrf_object_dump();
         /* Why the guest gets so few grants.
          *
          * The title's pushbuffer reserve spins until GET catches up with PUT,
@@ -2009,7 +2018,6 @@ static void jsrf_object_dump(void)
              * reaching it. _exit, not exit: atexit handlers in this harness
              * dump and flush things that would confuse the run that follows,
              * and the dump has already been written and fflushed above. */
-            dump_exit = getenv("RECOMP_OBJECT_DUMP_EXIT") != NULL;
         }
     }
 
@@ -2535,9 +2543,13 @@ static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
      * runtime stores through the same decoder. */
     {
         extern int xbox_Nv2aHandleWin32Fault(PCONTEXT, uintptr_t, uint32_t);
-        if (((guest_fault >= 0xFD000000u && guest_fault < 0xFE000000u) ||
-             (guest_fault >= 0xFEC00000u && guest_fault < 0xFED00000u)) &&
-            xbox_Nv2aHandleWin32Fault(ep->ContextRecord, fault, guest_fault))
+        /* No address filter. The handler checks the faulting PAGE against the
+         * set it guards and returns 0 for anything else, so the filter here
+         * only ever duplicated that -- and it silently excluded
+         * RECOMP_STORE_WATCH, which guards a page of ordinary guest RAM and so
+         * can sit anywhere. A guarded page that never reaches its handler
+         * reads as a hard crash at the first legitimate write. */
+        if (xbox_Nv2aHandleWin32Fault(ep->ContextRecord, fault, guest_fault))
             return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -2561,6 +2573,13 @@ static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
             "GUEST REGISTERS: EAX=%08X ECX=%08X EDX=%08X EBX=%08X "
             "ESI=%08X EDI=%08X EBP=%08X ESP=%08X\n",
             g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp, g_esp);
+    if (g_esp >= (uint32_t)XBOX_STACK_BASE &&
+        g_esp + 32u * 4u >= g_esp && g_esp + 32u * 4u <= XBOX_STACK_TOP) {
+        fprintf(stderr, "GUEST STACK FROM ESP:");
+        for (uint32_t i = 0; i < 32u; ++i)
+            fprintf(stderr, " %08X", MEM32(g_esp + i * 4u));
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "LAST %u GUEST BLOCKS:\n", available);
     for (uint32_t i = 0; i < available; ++i) {
         uint32_t sequence = count - available + i;
