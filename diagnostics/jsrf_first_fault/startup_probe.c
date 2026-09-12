@@ -1259,6 +1259,416 @@ void jsrf_dsound_gate_probe(uint32_t pc, uint32_t object, uint32_t flags_word,
     fflush(stderr);
 }
 
+/* DSOUND's fatal latch, and the two API chains it shuts off.
+ *
+ * The gate probe above answered its own question and raised a better one: on
+ * Windows sub_001A43DA is never reached at all, so the byte it tests is not
+ * what is wrong.  One level up, sub_0019ECA3 and sub_0019EDCE -- the only
+ * callers of the two functions that configure voice 0x44 -- open with the
+ * identical four instructions:
+ *
+ *     call sub_0019E438            ; take the DSOUND critical section
+ *     cmp  dword ptr [0x1BA04C], 0
+ *     jne  -> leave section, return 0x80004005 (E_FAIL)
+ *
+ * 0x001BA04C is read at forty-eight sites spread across the whole of DSOUND's
+ * API surface and WRITTEN AT EXACTLY ONE: 0x001A2317, inside sub_001A230D, a
+ * vtable thunk that adjusts `this` by -0x764 and calls a destructor.  It is a
+ * latch, never cleared, and once it is set every DirectSound entry point
+ * returns E_FAIL without doing anything.  That is a single gate sitting above
+ * both missing writers, which is the shape the handover asked for, and it fits
+ * what the register trace shows: voices 0x40..0x43 configured once and then
+ * nothing.
+ *
+ * Static reading cannot say whether Windows sets it -- that is exactly the
+ * inference CLAUDE.md forbids -- so measure it.  Five sites:
+ *
+ *   0x0019F1F4, 0x0019F214   the two adjacent DSOUND API thunks the guest calls
+ *   0x0019ECA3, 0x0019EDCE   where the latch is read and E_FAIL is returned
+ *   0x001A230D               the latch itself, with its caller
+ *
+ * The four reader sites are each other's positive control: they are in one
+ * generated file and on one code path, so "the thunk ran and the gate did not"
+ * is a measurement, while all five silent means the instrument is dead and the
+ * run says nothing.  Reported unconditionally at every interval for the same
+ * reason -- a site with count 0 has to be printed to be evidence.
+ *
+ * RECOMP_DSOUND_FATAL=1.  Read-only: every value here is read before the
+ * generated body at the label runs. */
+enum { DSOUND_FATAL_FLAG = 0x001BA04Cu };
+
+static const struct { uint32_t pc; const char *what; } g_dsound_fatal_sites[] = {
+    { 0x0019F1F4u, "api-thunk -> ECA3 -> 43DA -> 3570 (voice 0x44)" },
+    { 0x0019F214u, "api-thunk -> EDCE -> 49A7 (voice 0x44)" },
+    { 0x0019ECA3u, "gate ECA3" },
+    { 0x0019EDCEu, "gate EDCE" },
+    { 0x001A230Du, "LATCH sub_001A230D" },
+};
+enum { DSOUND_FATAL_SITES =
+           (int)(sizeof g_dsound_fatal_sites / sizeof g_dsound_fatal_sites[0]) };
+
+static struct {
+    unsigned long calls;      /* times the site ran */
+    unsigned long blocked;    /* ... with the latch already set */
+    unsigned long printed;
+    uint32_t last_flag;
+    int seen;
+} g_dsound_fatal[DSOUND_FATAL_SITES];
+
+void jsrf_dsound_fatal_probe(uint32_t pc, uint32_t object, uint32_t fatal,
+                             uint32_t return_address)
+{
+    static int enabled = -1;
+    int i, site = -1;
+
+    if (enabled < 0) enabled = getenv("RECOMP_DSOUND_FATAL") != NULL;
+    if (!enabled) return;
+
+    for (i = 0; i < DSOUND_FATAL_SITES; ++i)
+        if (g_dsound_fatal_sites[i].pc == pc) { site = i; break; }
+    if (site < 0) return;
+
+    ++g_dsound_fatal[site].calls;
+    if (fatal) ++g_dsound_fatal[site].blocked;
+
+    /* The latch every time -- it can only fire as often as DirectSound is torn
+     * down, and which caller does it is the whole answer.  The readers on the
+     * first few calls and then only when the value they read CHANGES, which is
+     * the transition that matters and costs one line. */
+    if (pc != 0x001A230Du &&
+        g_dsound_fatal[site].seen && g_dsound_fatal[site].last_flag == fatal &&
+        g_dsound_fatal[site].printed >= 4)
+        goto done;
+
+    ++g_dsound_fatal[site].printed;
+    fprintf(stderr,
+            "  [DSOUND-FATAL] pc=%08X %s this=%08X [1BA04C]=%08X %s"
+            " caller=%08X calls=%lu blocked=%lu\n",
+            pc, g_dsound_fatal_sites[site].what, object, fatal,
+            pc == 0x001A230Du ? "SETS THE LATCH"
+                              : (fatal ? "-> E_FAIL" : "proceeds"),
+            return_address, g_dsound_fatal[site].calls,
+            g_dsound_fatal[site].blocked);
+    fflush(stderr);
+
+done:
+    g_dsound_fatal[site].seen = 1;
+    g_dsound_fatal[site].last_flag = fatal;
+}
+
+void jsrf_dsound_fatal_report(void)
+{
+    static int enabled = -1;
+    int i;
+
+    if (enabled < 0) enabled = getenv("RECOMP_DSOUND_FATAL") != NULL;
+    if (!enabled) return;
+
+    fprintf(stderr, "  [DSOUND-FATAL] [1BA04C]=%08X now;", read_word(DSOUND_FATAL_FLAG));
+    for (i = 0; i < DSOUND_FATAL_SITES; ++i)
+        fprintf(stderr, " %08X: %lu calls %lu blocked;",
+                g_dsound_fatal_sites[i].pc, g_dsound_fatal[i].calls,
+                g_dsound_fatal[i].blocked);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* CRI's DirectSound driver, which is where the fifth voice actually goes.
+ *
+ * The latch probe above answered its question and moved the question. On both
+ * hosts 0x001BA04C stays 0 for the whole run and sub_001A230D never fires, so
+ * DSOUND is not shut down anywhere -- but sub_0019F1F4 is called 1604 times on
+ * macOS and NOT ONCE on Windows, from a caller that is not in DSOUND at all:
+ * 0x001417EA, inside sub_001417B0.
+ *
+ * sub_001417B0 is CRI middleware, and reading it names sub_0019F1F4:
+ *
+ *     eax = [handle + 4];  if (!eax) goto fail
+ *     eax = [handle + 8];  if (!eax) { report "E1225:dsb..."; return 0 }
+ *     call sub_0019F1F4(eax, &play, &write)      ; GetCurrentPosition
+ *     if (!result) return play / ([handle+0x1A] >> 3) / [handle + 0x24]
+ *
+ * Three arguments, a play cursor and a write cursor, divided by a frame size:
+ * that is IDirectSoundBuffer::GetCurrentPosition, and the 1604 calls are the
+ * ADX streaming feeder polling its buffer at about 20 Hz. The fifth voice is
+ * the streaming voice, and on Windows nothing ever asks where its play cursor
+ * is.
+ *
+ * `dsb` is CRI's own name for the buffer: the string at 0x001DFDD4 reads
+ * "E1225:dsb(member in handle) is NULL" and twelve sites across the 0x00141xxx
+ * driver push it. Every one of them funnels into sub_00143240, which formats
+ * into 0x0026A280 and forwards to a hook at 0x0026177C that JSRF never
+ * installs -- so this layer has been describing its own failures into a dead
+ * buffer for the whole project, exactly as sub_0013C890 does one layer down.
+ *
+ * Three sites, and between them they separate the three answers:
+ *
+ *   0x00143240   the diagnostic funnel. Prints what CRI is trying to say.
+ *   0x001417B0   the play-cursor poll: called at all, and with what handle.
+ *   0x00141560   its sibling, which takes the other chain into sub_0019F214.
+ *
+ * "Never called" means the layer above CRI never starts the stream; "called
+ * with [handle+8] == 0" means the stream started and its DirectSound buffer
+ * was never created. Those want different fixes, and the counts alone cannot
+ * tell them apart -- so read the handle at the entry, before the branch.
+ *
+ * RECOMP_CRI_DSOUND=1. Read-only. */
+static void cri_read_string(uint32_t va, char *out, size_t cap)
+{
+    size_t n;
+    for (n = 0; n + 1 < cap; ++n) {
+        const char *p = xbox_GpuMemoryRange(va + (uint32_t)n, 1);
+        if (!p || !*p) break;
+        out[n] = *p;
+    }
+    out[n] = 0;
+}
+
+static const struct { uint32_t pc; const char *what; } g_cri_dsound_sites[] = {
+    { 0x00143240u, "diag"      },
+    { 0x001417B0u, "GetCurrentPosition caller" },
+    { 0x00141560u, "sibling"   },
+};
+enum { CRI_DSOUND_SITES =
+           (int)(sizeof g_cri_dsound_sites / sizeof g_cri_dsound_sites[0]) };
+
+static struct {
+    unsigned long calls;
+    unsigned long null_dsb;   /* handle sites: [handle+8] was 0 */
+    unsigned long printed;
+} g_cri_dsound[CRI_DSOUND_SITES];
+
+void jsrf_cri_dsound_probe(uint32_t pc, uint32_t argument,
+                           uint32_t return_address)
+{
+    static int enabled = -1;
+    int i, site = -1;
+
+    if (enabled < 0) enabled = getenv("RECOMP_CRI_DSOUND") != NULL;
+    if (!enabled) return;
+
+    for (i = 0; i < CRI_DSOUND_SITES; ++i)
+        if (g_cri_dsound_sites[i].pc == pc) { site = i; break; }
+    if (site < 0) return;
+
+    ++g_cri_dsound[site].calls;
+
+    if (pc == 0x00143240u) {
+        /* One line per distinct message and caller. A driver that is unhappy
+         * is unhappy every frame, and the rate belongs in the report. */
+        enum { SEEN_MAX = 24 };
+        static struct { uint32_t msg, site; } seen[SEEN_MAX];
+        static unsigned distinct;
+        char text[96];
+        unsigned k;
+
+        for (k = 0; k < distinct; ++k)
+            if (seen[k].msg == argument && seen[k].site == return_address)
+                return;
+        if (distinct < SEEN_MAX) {
+            seen[distinct].msg = argument;
+            seen[distinct].site = return_address;
+            ++distinct;
+        }
+        cri_read_string(argument, text, sizeof text);
+        fprintf(stderr, "  [CRI-DSOUND] diag caller=%08X msg=%08X \"%s\""
+                " calls=%lu\n",
+                return_address, argument, text, g_cri_dsound[site].calls);
+        fflush(stderr);
+        return;
+    }
+
+    {
+        uint32_t driver = read_word(argument + 4);
+        uint32_t dsb    = read_word(argument + 8);
+
+        if (!dsb) ++g_cri_dsound[site].null_dsb;
+        if (g_cri_dsound[site].printed >= 6) return;
+        ++g_cri_dsound[site].printed;
+        fprintf(stderr,
+                "  [CRI-DSOUND] pc=%08X %s handle=%08X [+4]=%08X [+8]=%08X %s"
+                " caller=%08X calls=%lu null_dsb=%lu\n",
+                pc, g_cri_dsound_sites[site].what, argument, driver, dsb,
+                !driver ? "NO DRIVER" : (!dsb ? "NULL dsb -> E1225"
+                                              : "reaches DSOUND"),
+                return_address, g_cri_dsound[site].calls,
+                g_cri_dsound[site].null_dsb);
+        fflush(stderr);
+    }
+}
+
+void jsrf_cri_dsound_report(void)
+{
+    static int enabled = -1;
+    int i;
+
+    if (enabled < 0) enabled = getenv("RECOMP_CRI_DSOUND") != NULL;
+    if (!enabled) return;
+
+    fprintf(stderr, "  [CRI-DSOUND]");
+    for (i = 0; i < CRI_DSOUND_SITES; ++i)
+        fprintf(stderr, " %08X %s: %lu calls %lu null-dsb;",
+                g_cri_dsound_sites[i].pc, g_cri_dsound_sites[i].what,
+                g_cri_dsound[i].calls, g_cri_dsound[i].null_dsb);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* CRI's stream server, and the two gates that stand above the whole chain.
+ *
+ * The layer below is measured: on Windows sub_001417B0 and sub_00141560 are
+ * never entered, and neither is sub_00143240, so CRI's DirectSound driver does
+ * not even get as far as complaining that its buffer is missing. The stream is
+ * never serviced at all. One level up says why, and it is all static state:
+ *
+ *   sub_0013F080          the server tick
+ *     if ([0x002615A0] == 1) return;            re-entrancy guard
+ *     for (slot = 0x0027B1C0, i = 16; i--; slot += 0xA4)
+ *         if (byte [slot] == 1) sub_0013EF00(slot);
+ *
+ *   sub_0013EF00          one stream
+ *     if ([slot + 0x8C] == 1) return;           <-- everything below is skipped
+ *     sub_0013E9E0(slot)  -> sub_00141560 -> sub_0019F214
+ *     ... sub_0013ECE0(slot) -> sub_001417B0 -> sub_0019F1F4
+ *
+ * Sixteen slots of 0xA4 bytes at a fixed address, each with a one-byte "in
+ * use" at +0 and a dword at +0x8C that switches the whole body off. That is a
+ * single gate standing above both missing writers, which is the shape the
+ * handover predicted, one level higher than it predicted it.
+ *
+ * So dump the table rather than counting calls. Both fields are plain guest
+ * memory and a count cannot distinguish "no slot is in use" from "a slot is in
+ * use and gated" -- which are the two answers, and they want different fixes.
+ * Printed when the table's shape CHANGES, so a stream starting, stopping or
+ * being gated is one line each and a steady state is silent.
+ *
+ * The tick's own call count is the positive control: a table that never fills
+ * means nothing if the server is not running.
+ *
+ * RECOMP_CRI_SERVER=1. Read-only. */
+enum { CRI_SLOT_BASE = 0x0027B1C0u, CRI_SLOT_STRIDE = 0xA4u, CRI_SLOTS = 16 };
+
+static unsigned long g_cri_server_ticks, g_cri_stream_calls, g_cri_stream_gated;
+static unsigned long g_cri_dispatch_calls;
+
+void jsrf_cri_server_probe(uint32_t pc, uint32_t slot, uint32_t return_address)
+{
+    static int enabled = -1;
+    static uint32_t last_shape = 0xFFFFFFFFu;
+    uint32_t shape = 0;
+    int i;
+
+    if (enabled < 0) enabled = getenv("RECOMP_CRI_SERVER") != NULL;
+    if (!enabled) return;
+
+    if (pc == 0x0013EF00u) {
+        ++g_cri_stream_calls;
+        if (read_word(slot + 0x8Cu) == 1u) ++g_cri_stream_gated;
+        return;
+    }
+
+    /* The dispatch itself.  sub_0013ECE0 does
+     *
+     *     eax = [stream + 0x38]      ; the sound-driver handle
+     *     ecx = [eax]                ; its vtable
+     *     call dword ptr [ecx + 0x20]
+     *
+     * and on macOS that slot holds sub_001417B0.  The two hosts run the same
+     * generated C from the same gen tree, so if the pointer read out of guest
+     * memory is the same on both, the call is being dropped by the indirect
+     * dispatcher rather than aimed somewhere else -- and if it differs, the
+     * guest built a different driver object.  Print the whole chain; one line
+     * per distinct target is enough, because a vtable that changes is itself
+     * the finding. */
+    if (pc == 0x0013ECE0u) {
+        enum { SEEN_MAX = 8 };
+        static struct { uint32_t handle, vtable, target; } seen[SEEN_MAX];
+        static unsigned distinct;
+        uint32_t handle = read_word(slot + 0x38u);
+        uint32_t vtable = handle ? read_word(handle) : 0;
+        uint32_t target = vtable ? read_word(vtable + 0x20u) : 0;
+        unsigned k;
+
+        ++g_cri_dispatch_calls;
+        for (k = 0; k < distinct; ++k)
+            if (seen[k].handle == handle && seen[k].vtable == vtable &&
+                seen[k].target == target)
+                return;
+        if (distinct < SEEN_MAX) {
+            seen[distinct].handle = handle;
+            seen[distinct].vtable = vtable;
+            seen[distinct].target = target;
+            ++distinct;
+        }
+        fprintf(stderr,
+                "  [CRI-SERVER] dispatch stream=%08X [+0x38]=%08X vtable=%08X"
+                " [vt+0x20]=%08X %s calls=%lu\n",
+                slot, handle, vtable, target,
+                target == 0x001417B0u ? "= sub_001417B0" : "NOT sub_001417B0",
+                g_cri_dispatch_calls);
+        fflush(stderr);
+        return;
+    }
+
+    ++g_cri_server_ticks;
+
+    /* In-use, gated, and the status byte at +1, hashed so that any change in
+     * any slot prints one line.
+     *
+     * +1 is the one that matters. sub_0013EF00 reaches the play-cursor poll
+     * only through
+     *
+     *     edx = byte [stream + 1];  edx >>= 1;  edx &= 1
+     *     if (edx) sub_0013ECE0(stream)
+     *
+     * and it tests the same byte four more times (&1, and ==5) to decide
+     * everything else it does. It is a status enum, not a bitfield, and this
+     * project has met it before: the loading stall was a stream stuck in PREP.
+     * Recording it turns "sub_0013ECE0 is never called" into "the stream never
+     * reaches the status that would call it", which is a different claim and a
+     * different fix. */
+    for (i = 0; i < CRI_SLOTS; ++i) {
+        uint32_t base = CRI_SLOT_BASE + (uint32_t)i * CRI_SLOT_STRIDE;
+        uint32_t word = read_word(base);
+        uint32_t used = word & 0xFFu;
+        uint32_t stat = (word >> 8) & 0xFFu;
+        uint32_t gate = read_word(base + 0x8Cu);
+        shape = (shape ^ (used | (stat << 8) | (gate == 1u ? 0x10000u : 0u)))
+                * 16777619u;
+    }
+    if (shape == last_shape) return;
+    last_shape = shape;
+
+    fprintf(stderr, "  [CRI-SERVER] tick=%lu caller=%08X slots:",
+            g_cri_server_ticks, return_address);
+    for (i = 0; i < CRI_SLOTS; ++i) {
+        uint32_t base = CRI_SLOT_BASE + (uint32_t)i * CRI_SLOT_STRIDE;
+        uint32_t used = read_word(base) & 0xFFu;
+        if (!used) continue;
+        fprintf(stderr, " [%d]=%08X use=%u stat=%u%s +8C=%08X%s", i, base,
+                used, (read_word(base) >> 8) & 0xFFu,
+                (((read_word(base) >> 9) & 1u) ? " polls-cursor" : ""),
+                read_word(base + 0x8Cu),
+                read_word(base + 0x8Cu) == 1u ? " GATED" : "");
+    }
+    if (shape == 0) fprintf(stderr, " (none in use)");
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+void jsrf_cri_server_report(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) enabled = getenv("RECOMP_CRI_SERVER") != NULL;
+    if (!enabled) return;
+    fprintf(stderr, "  [CRI-SERVER] ticks=%lu stream-calls=%lu gated=%lu"
+            " dispatch-calls=%lu\n",
+            g_cri_server_ticks, g_cri_stream_calls, g_cri_stream_gated,
+            g_cri_dispatch_calls);
+    fflush(stderr);
+}
+
 void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,
                              uint32_t arg1, uint32_t arg2, uint32_t arg3)
 {

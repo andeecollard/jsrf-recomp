@@ -29,6 +29,15 @@ void jsrf_texture_create_probe(uint32_t pc, uint32_t index, uint32_t arg1,
                                uint32_t arg3, uint32_t return_address);
 void jsrf_dsound_gate_probe(uint32_t pc, uint32_t object, uint32_t flags_word,
                             uint32_t return_address);
+void jsrf_dsound_fatal_probe(uint32_t pc, uint32_t object, uint32_t fatal,
+                             uint32_t return_address);
+void jsrf_dsound_fatal_report(void);
+void jsrf_cri_dsound_probe(uint32_t pc, uint32_t argument,
+                           uint32_t return_address);
+void jsrf_cri_dsound_report(void);
+void jsrf_cri_server_probe(uint32_t pc, uint32_t slot,
+                           uint32_t return_address);
+void jsrf_cri_server_report(void);
 void jsrf_error_dialog_probe(uint32_t pc, uint32_t return_address,
                              uint32_t arg1, uint32_t arg2, uint32_t arg3);
 void jsrf_usb_device_probe(uint32_t pc, uint32_t controller,

@@ -1,0 +1,182 @@
+JSRF HANDOVER -- THE MISSING FIFTH VOICE IS THE MUSIC, AND IT IS NOT A DSOUND BUG
+Date: 2026-09-12 (Europe/London)
+From: Claude.
+
+Supersedes the audio half of CLAUDE_HANDOVER_2026-09-12_WINDOWS_RENDERS_FOR_REAL.txt.
+That handover's sections 0, 1 and 5 (the contiguous alias, the three closed
+items, the known-bad shortcuts) all still stand. Its section 2 -- "the new
+leading edge: the APU front end" -- is answered here, and the answer is that
+the front end was never the place to look.
+
+Long form: docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-12_STREAM_NEVER_STARTS.md
+
+
+0. THE ONE-LINE ANSWER
+======================
+Voice 0x44 is the ADX streaming voice -- the music. On Windows the guest never
+opens D:\Media\Z_ADX\BGM\, so no ADX stream ever leaves status 0, so CRI never
+polls a play cursor, so DirectSound is never asked for the fifth voice. Every
+link below that is healthy on both hosts and was never the bug.
+
+
+1. THE CHAIN, MEASURED END TO END
+=================================
+    D:\Media\Z_ADX\BGM\ opened
+      -> ADX stream slot 0, byte [slot+1]: 0 -> 1 -> 3
+        -> sub_0013EF00 reaches sub_0013ECE0          (needs (stat >> 1) & 1)
+          -> call [[slot+0x38]+0x20]  ==  sub_001417B0
+            -> sub_0019F1F4                           (GetCurrentPosition)
+              -> sub_0019ECA3 -> sub_001A43DA -> sub_001A3570
+                -> SET_CURRENT_VOICE 0x44             -> on=5
+
+Windows never takes the first step. macOS takes it at about 30 s: the two
+D:\Media\Z_ADX\BGM\ opens are at log lines 6119 and 6123 and the 0 -> 1
+transition at line 6130.
+
+
+2. THE FOUR LEVELS AND THEIR NUMBERS
+====================================
+All paired runs: one gen tree, one instrumented build cross-compiled for both
+hosts from the same sources, same scene.
+
+(a) THE DSOUND FATAL LATCH IS NOT IT. RECOMP_DSOUND_FATAL=1.
+
+0x001BA04C is read at 48 sites across DSOUND's API surface and written at
+exactly one, 0x001A2317 inside the vtable thunk sub_001A230D; every reader
+returns E_FAIL when it is set, and nothing clears it. It is a perfect single
+gate above both missing writers. It is also never set:
+
+    macOS    [1BA04C]=00000000 all run, 001A230D: 0 calls, blocked=0
+    Windows  [1BA04C]=00000000 all run, 001A230D: 0 calls, blocked=0
+
+What that run did establish is where the two hosts part:
+
+    site        what                       macOS   Windows
+    0019F1F4    thunk -> ECA3 -> ... -> 3570 1604         0
+    0019ECA3    gate above 001A43DA          1604         0
+    0019F214    thunk -> EDCE -> 49A7         204        63
+    0019EDCE    gate above 001A49A7           204        63
+
+The first 63 calls through the second chain are IDENTICAL on both hosts, from
+the same caller 0x0016CDB1. The first chain Windows never enters.
+
+(b) WHAT sub_0019F1F4 IS. Its macOS caller is 0x001417EA, outside DSOUND.
+sub_001417B0 divides the returned cursor by a frame size:
+IDirectSoundBuffer::GetCurrentPosition, polled at about 20 Hz. That identifies
+the fifth voice as the streaming voice.
+
+(c) CRI'S DIRECTSOUND DRIVER IS NEVER ENTERED. RECOMP_CRI_DSOUND=1.
+
+    site        what                        macOS   Windows
+    00143240    diagnostic funnel               0         0
+    001417B0    GetCurrentPosition caller     664+        0
+    00141560    sibling                         1         0
+
+macOS's handle is the static 0x00272900, [+4]=1, [+8]=80954B60 -- and
+80954B60 is exactly the `this` entering sub_0019F1F4. Windows reports no
+E1225 because it never reaches the check.
+
+(d) CRI'S STREAM SERVER IS IDENTICAL, AND ONE BYTE DIFFERS.
+RECOMP_CRI_SERVER=1. Sixteen slots of 0xA4 bytes at 0x0027B1C0.
+
+    macOS    4 slots in use from tick 1, none gated, ticks=2682 calls=10728
+    Windows  4 slots in use from tick 3, none gated, ticks=3809 calls=15236
+
+Windows runs the per-stream body MORE than macOS. The +0x8C gate inside
+sub_0013EF00 is never taken on either host. The difference is byte [slot+1]:
+
+    macOS    slot 0: stat 0 -> 1 (tick 906) -> 3 (tick 931); 3 polls the cursor
+    Windows  all four slots: stat 0 for the whole run
+
+sub_0013ECE0 runs 1533 times on macOS and zero times on Windows. Its vtable
+dispatch [[slot+0x38]+0x20] resolves on macOS to vtable=0x0022DC80 ->
+0x001417B0, closing the chain.
+
+
+3. THE CONFOUND, RULED OUT
+==========================
+"Windows has not got there yet" would explain all of it. It does not hold:
+
+  * the same Z:\Media\* directories in near-identical proportions
+    (Event 79/76, TalkEvent 79/76, Stage 66/66, Mission 52/52, SE 43/38,
+    Effect 32/32, Enemy 24/24, StgObj 20/20)
+  * the same four stream slots created within three server ticks on both
+  * Windows healthy elsewhere: 2577 textures prepared / 0 rejected,
+    VBLANK 62.3 Hz, XAudio2 delivering 13,104 buffers
+  * the Windows run was 120 s; macOS starts the stream at about 30 s
+  * D:\Media\Z_ADX\BGM\ is the ONLY D:\ subpath either host opens, and
+    Windows never opens it
+
+
+4. WHERE TO START
+=================
+    WHAT OPENS D:\Media\Z_ADX\BGM\, AND WHY DOES IT NOT RUN ON WINDOWS?
+
+Not DSOUND, not the APU, not the front end. Leads, in the order I would take
+them:
+
+  * Instrument the open itself. It is two NtOpenFile calls on D:\ and the only
+    D:\ subpath in either log, so it is trivially greppable and its caller
+    names the requester directly.
+  * 0x0027B1C0 is referenced from six sites. sub_0013E550 (called by
+    sub_0013F290) is the slot lookup; sub_0013E440 and sub_0013F470 have no
+    static callers and are reached indirectly.
+  * byte [slot+1] is written from about a dozen sites in
+    0x0013Bxxx..0x0013Cxxx. CONFIRM THE OBJECT before trusting any of them --
+    several of those sites are a different structure's +1.
+  * The transition to watch is 0 -> 1. On macOS it lands within eleven log
+    lines of the directory open, so the two are almost certainly the same
+    event.
+
+
+5. THE INSTRUMENTS ADDED
+========================
+All read-only and opt-in, installed by instrument_startup.py into a gen tree,
+and all report unconditionally at every interval so a zero count is evidence.
+
+  RECOMP_DSOUND_FATAL=1  [DSOUND-FATAL]  0x0019F1F4 0x0019F214 0x0019ECA3
+                                         0x0019EDCE 0x001A230D
+                                         the latch and the two API chains
+  RECOMP_CRI_DSOUND=1    [CRI-DSOUND]    0x00143240 0x001417B0 0x00141560
+                                         CRI's DirectSound driver and the
+                                         diagnostics it has been discarding
+  RECOMP_CRI_SERVER=1    [CRI-SERVER]    0x0013F080 0x0013EF00 0x0013ECE0
+                                         the stream table, the status byte,
+                                         and the vtable dispatch
+
+The four DSOUND-FATAL reader sites are each other's positive control; the
+server tick's own call count is the control for the stream table.
+
+
+6. RETIRED -- DO NOT RE-RUN
+===========================
+  the byte [this+0x12] & 3 gate at 0x001A43F0
+      reached only on macOS, where it passes. Never the question.
+  the DSOUND fatal latch 0x001BA04C
+      measured zero on both hosts with a positive control.
+  "two adjacent methods on one object"
+      0x0019F1F4 and 0x0019F214 are adjacent, but they are DirectSound API
+      thunks carrying the MSVC neg/sbb/and null-check idiom, called from seven
+      and nine game sites. Not two methods on one object. The single gate the
+      previous handover predicted is real -- four levels higher.
+
+Everything in section 4 of the previous handover still stands.
+
+
+7. BUILD AND RUN
+================
+Unchanged. The Windows oracle cross-compiles cleanly from this worktree with a
+nine-line mingw toolchain file:
+
+  cmake -S diagnostics/jsrf_first_fault -B <build> \
+    -DCMAKE_TOOLCHAIN_FILE=<toolchain>.cmake \
+    -DRECOMP_GEN_DIR=<gen> -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-DXBOX_WORKER_STACK_COUNT=4"
+
+  CMAKE_SYSTEM_NAME Windows, the three x86_64-w64-mingw32 tools,
+  CMAKE_FIND_ROOT_PATH at the mingw sysroot
+  (/opt/homebrew/Cellar/mingw-w64/13.0.0_2/toolchain-x86_64/x86_64-w64-mingw32).
+
+Run it in bottle "recomp-gate" from a .bat; RECOMP_AC97_READY=1 is still
+mandatory, and the CrossOver window is still always black and still not a
+symptom.

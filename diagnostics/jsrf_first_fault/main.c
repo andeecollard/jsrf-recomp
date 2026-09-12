@@ -1033,6 +1033,16 @@ static void jsrf_pusher_report(void)
             /* And where the two D3D contiguous allocators stopped. Silent
              * unless RECOMP_D3D_ALLOC_TRACE is set and the sites are armed. */
             jsrf_d3d_alloc_report();
+            /* And whether DirectSound is still answering at all. One latch at
+             * 0x001BA04C turns every DSOUND entry point into an E_FAIL stub,
+             * and the counters that say so are only evidence if they are
+             * printed when they are zero. Silent unless RECOMP_DSOUND_FATAL
+             * is set and the sites are armed. */
+            jsrf_dsound_fatal_report();
+            /* And the CRI DirectSound driver above it, whose own diagnostics
+             * have never had anywhere to go. */
+            jsrf_cri_dsound_report();
+            jsrf_cri_server_report();
         }
         /* And the boundary those voices have to cross. The APU aperture is
          * guarded read-only so stores fault and reach the model; anything the

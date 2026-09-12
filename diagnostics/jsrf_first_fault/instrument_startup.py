@@ -90,6 +90,26 @@ points = {
         # containing byte +0x12, and let the probe do the masking.
         '001A43F0': ('jsrf_dsound_gate_probe',
                      'esi, MEM32(esi + 0x10), MEM32(esp)'),
+        # One level above that gate, and the reason it is never reached.
+        # sub_0019ECA3 and sub_0019EDCE are the only callers of the two
+        # functions that configure voice 0x44, and both open by testing the
+        # DSOUND fatal latch at 0x001BA04C -- forty-eight readers across the
+        # API surface, one writer, never cleared. Take the two API thunks the
+        # guest calls, the two gates themselves, and the latch. All five are
+        # function entries: the return address is at esp and the first
+        # argument at esp+4.
+        '0019F1F4': ('jsrf_dsound_fatal_probe',
+                     'MEM32(esp + 4), MEM32(0x1BA04C), MEM32(esp)'),
+        '0019F214': ('jsrf_dsound_fatal_probe',
+                     'MEM32(esp + 4), MEM32(0x1BA04C), MEM32(esp)'),
+        '0019ECA3': ('jsrf_dsound_fatal_probe',
+                     'MEM32(esp + 4), MEM32(0x1BA04C), MEM32(esp)'),
+        '0019EDCE': ('jsrf_dsound_fatal_probe',
+                     'MEM32(esp + 4), MEM32(0x1BA04C), MEM32(esp)'),
+        # The latch's only writer, read before its own store, so the value
+        # printed here is the one it is about to overwrite.
+        '001A230D': ('jsrf_dsound_fatal_probe',
+                     'MEM32(esp + 4), MEM32(0x1BA04C), MEM32(esp)'),
         # 0x001A308E is a manual override now. Its original generated body was
         # an unbounded DSOUND completion spin, so there is no generated label
         # at which a read-only probe can be installed.
@@ -169,6 +189,28 @@ points = {
     },
     'recomp_0006.c': {
         '00144F60': ('jsrf_adx_decode_probe', 'esp'),
+        # CRI's DirectSound driver layer, which is where the fifth voice goes.
+        # sub_001417B0 polls the streaming buffer's play cursor through
+        # sub_0019F1F4 and is called 1604 times on macOS and never on Windows;
+        # sub_00141560 is its sibling on the other chain. Both are function
+        # entries whose single argument is the CRI handle at esp+4, and both
+        # bail to the E1225 "dsb is NULL" diagnostic when [handle+8] is zero.
+        # sub_00143240 is the funnel every one of this layer's diagnostics
+        # goes through before being dropped into a buffer nothing reads; its
+        # message pointer is also at esp+4.
+        # And the two gates above that whole layer: CRI's stream server tick
+        # and the per-stream body it calls. sub_0013F080 takes no argument --
+        # it walks a fixed sixteen-slot table -- so only the return address is
+        # meaningful there; sub_0013EF00 takes the slot at esp+4.
+        '0013F080': ('jsrf_cri_server_probe', '0, MEM32(esp)'),
+        '0013EF00': ('jsrf_cri_server_probe', 'MEM32(esp + 4), MEM32(esp)'),
+        # And the indirect call that actually reaches the DirectSound driver:
+        # sub_0013ECE0 dispatches through [[stream+0x38]+0x20]. Read it at the
+        # entry, where the stream is still the argument at esp+4.
+        '0013ECE0': ('jsrf_cri_server_probe', 'MEM32(esp + 4), MEM32(esp)'),
+        '00143240': ('jsrf_cri_dsound_probe', 'MEM32(esp + 4), MEM32(esp)'),
+        '001417B0': ('jsrf_cri_dsound_probe', 'MEM32(esp + 4), MEM32(esp)'),
+        '00141560': ('jsrf_cri_dsound_probe', 'MEM32(esp + 4), MEM32(esp)'),
         # Both exits of the cache index walk sub_00143540: 0x001435C4 returns
         # zero (miss) and 0x001435CC returns the matched entry in ebp. Five
         # registers are still pushed at each, so the query path is at esp+0x18.
