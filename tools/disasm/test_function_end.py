@@ -57,10 +57,11 @@ class _Engine:
         return self.entries.get(tbl, [])
 
 
-def _detector(insns, jump_tables=None, entries=None):
+def _detector(insns, jump_tables=None, entries=None, known=()):
     det = FunctionDetector.__new__(FunctionDetector)
     det.engine = _Engine(insns, jump_tables, entries)
     det._forced_bounds = []
+    det.functions = {a: None for a in known}
     return det
 
 
@@ -194,3 +195,49 @@ if __name__ == "__main__":
             print(f"  FAIL {name}: {exc}")
     print("function end: " + ("OK" if not failures else f"{failures} FAILED"))
     sys.exit(1 if failures else 0)
+
+
+# A tail call to a function that is already known must not extend anybody.
+#
+# _pass_demote_interior_seeds walks with next_func=None on purpose, so `upper`
+# is the whole section and every forward tail call in the image looks like an
+# internal branch. Measured on JSRF, that took one 95-byte function to 271,018
+# bytes: it stepped over its own ret because max_target sat on a callee it also
+# *called* two instructions earlier.
+#
+#   0x13AEDE  call 0x13C480      <- the same address, as a call
+#   0x13AEF3  jmp  0x13C480      <- and as a tail call
+#   0x13AF0A  jmp  0x13C480
+#   0x13AF0F  nop                <- inter-function padding
+TAILCALL = [
+    _Insn(0x13AED0, 14),
+    _Insn(0x13AEDE, 5, "call"),
+    _Insn(0x13AEE3, 16),
+    _Insn(0x13AEF3, 5, "jmp", target=0x13AF10, is_jump=True),
+    _Insn(0x13AEF8, 8),                       # only reachable by walking on
+    _Insn(0x13AF00, 1, "ret", is_ret=True),
+    _Insn(0x13AF10, 1, "ret", is_ret=True),   # the callee
+]
+
+
+def test_tail_call_to_a_known_function_does_not_extend():
+    det = _detector(TAILCALL, known=(0x13AF10,))
+    end = det._find_function_end(0x13AED0, next_func=None, sec_end=0x200000)
+    assert end == 0x13AEF8, f"walked past its own tail call: {end:#x}"
+
+
+def test_an_unknown_jump_target_still_extends():
+    # The veto is about KNOWN functions. Nothing else changes, or the walk
+    # would truncate every ordinary forward jump inside a body.
+    det = _detector(TAILCALL, known=())
+    end = det._find_function_end(0x13AED0, next_func=None, sec_end=0x200000)
+    assert end > 0x13AEF8, f"expected the walk to continue, got {end:#x}"
+
+
+def test_a_conditional_branch_to_a_known_function_still_extends():
+    # Halo's get_edge_vertex parks its branch target out of line and reaches it
+    # with a jne. Vetoing that shape is the bug this file was written for, so
+    # the veto must be restricted to UNCONDITIONAL jumps.
+    det = _detector(TAIL, known=(0x107FB8,))
+    end = det._find_function_end(0x107F9F, next_func=None, sec_end=0x108100)
+    assert end == 0x107FC2, f"conditional branch wrongly vetoed: {end:#x}"

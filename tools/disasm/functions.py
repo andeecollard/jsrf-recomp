@@ -331,6 +331,13 @@ class FunctionDetector:
         in a table is only an arm of a function whose own code dispatches
         through that table.
         """
+        for site in self._arm_table_map().get(addr, ()):
+            if lo <= site < hi:
+                return site
+        return None
+
+    def _arm_table_map(self) -> Dict[int, List[int]]:
+        """Every resynced table's entries, mapped to the jumps dispatching it."""
         tables = getattr(self, "_arm_tables", None)
         if tables is None:
             tables = {}
@@ -341,8 +348,32 @@ class FunctionDetector:
                 for target in self.engine.jump_table_entries(tbl):
                     tables.setdefault(target, []).extend(sites)
             self._arm_tables = tables
-        for site in tables.get(addr, ()):
-            if lo <= site < hi:
+        return tables
+
+    def _fallthrough_arm_of(self, addr: int) -> Optional[int]:
+        """The dispatching jump just before addr, if addr is its first arm.
+
+        MSVC makes case 0 the instruction immediately after the dispatch, so a
+        switch's FIRST arm is the jump's own fall-through. That one arm defeats
+        the owner-bounded test above, and it does so twice over. Seeding it ends
+        the dispatching function exactly at the jump, so the arm is interior to
+        nothing and the interior test never examines it -- and every later arm
+        in the same table is then judged against an owner that begins after the
+        dispatch site, so `lo <= site < hi` is false for all of them too.
+
+        Measured on JSRF: of 422 resynced tables, 137 have their dispatching
+        function ending exactly at the jump and 133 of those are truncated by a
+        seed sitting on the fall-through. Recognising the arms alone therefore
+        left the loop intact and merely displaced by one entry.
+
+        Looking backwards a short distance rather than at the running owner is
+        what makes this independent of the truncation: the dispatch is the
+        instruction the arm falls out of, so it is a handful of bytes behind it
+        whatever the boundaries say. Sixteen bytes covers the `jmp [reg*4+disp]`
+        form with room to spare.
+        """
+        for site in self._arm_table_map().get(addr, ()):
+            if addr - 16 <= site < addr:
                 return site
         return None
 
@@ -373,11 +404,14 @@ class FunctionDetector:
         # class below, because the references that would otherwise keep it --
         # a runtime observation of the indirect branch, or the table entry
         # read as data -- are the switch itself, described twice.
+        site = None
         if owner is not None:
             site = self._switch_arm_of(addr, owner[0], owner[1])
-            if site is not None:
-                detail["dispatch"] = f"0x{site:08X}"
-                return "switch_arm", detail
+        if site is None:
+            site = self._fallthrough_arm_of(addr)
+        if site is not None:
+            detail["dispatch"] = f"0x{site:08X}"
+            return "switch_arm", detail
         # An address taken as data is how a vtable slot or a jump table names a
         # function; the branch through it is invisible here.
         if kinds.get("data_imm") or kinds.get("data_read"):
@@ -434,6 +468,10 @@ class FunctionDetector:
         for start_addr in sorted(set(self.functions) | seed_set
                                  | set(forced_starts)):
             interior = owner is not None and owner < start_addr < owner_end
+            # A first arm sits exactly ON the boundary it created, so it is
+            # interior to nothing; see _fallthrough_arm_of.
+            if not interior and start_addr in seed_set:
+                interior = self._fallthrough_arm_of(start_addr) is not None
             if interior and start_addr in seed_set:
                 j = bisect.bisect_right(forced_starts, start_addr) - 1
                 declared_inside = (j >= 0
@@ -1365,9 +1403,36 @@ class FunctionDetector:
             # `upper` is already clamped to the next known function start, so a
             # target inside these bounds is internal rather than a tail call.
             # is_jump and is_cond_jump are mutually exclusive; is_branch is both.
+            #
+            # That reasoning holds only where `upper` really is the next start.
+            # _pass_demote_interior_seeds passes next_func=None deliberately --
+            # it wants the extent the sweep would find without any seed -- and
+            # then `upper` is the whole section, so every forward tail call in
+            # the image satisfies the test. Once max_target is past a `ret` the
+            # walk cannot stop; it decodes into the next function, whose own
+            # tail calls ratchet it further, and the chain ends only where the
+            # decode dies. Measured on JSRF: p99.9 of that walk was 270,906
+            # bytes against 4,639 for the clamped one, and in 83 of the 83
+            # worst escalations the culprit was an unconditional jmp to an
+            # address already known to be a function.
+            #
+            # So state the invariant instead of relying on the caller to supply
+            # it: an unconditional jump to a known function start is a tail
+            # call and never extends anybody. Conditional branches are
+            # untouched -- Halo's get_edge_vertex jumps forward over its own
+            # epilogue with a `jne`, which is the case the rule above exists
+            # for -- and so are switch dispatches, which take the jump_table
+            # path below. Under the clamped caller this vetoes nothing at all
+            # in 6,566 walks, which is the point: it changes only the walk that
+            # was already wrong.
             if insn.is_branch and insn.jump_target is not None:
                 target = insn.jump_target
-                if start <= target < upper and target > max_target:
+                tail_call = (insn.is_jump and not insn.is_cond_jump
+                             and target != start
+                             and (target in getattr(self, "_candidates", ())
+                                  or target in getattr(self, "functions", ())))
+                if (not tail_call
+                        and start <= target < upper and target > max_target):
                     # This jump goes forward within bounds, extend
                     max_target = target
 

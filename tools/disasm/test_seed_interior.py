@@ -297,6 +297,39 @@ class SeedInteriorTest(unittest.TestCase):
         self.assertEqual(det.kept_interior_seeds[0]["reference_class"],
                          "indirect_target")
 
+    def test_the_first_arm_is_dropped_though_it_is_interior_to_nothing(self):
+        # MSVC makes case 0 the dispatching jump's own fall-through, so the
+        # first arm sits exactly ON the boundary its own seed created: the
+        # owner was clamped to end there, so nothing contains it and the
+        # interior test never looks at it. Every later arm is then judged
+        # against an owner starting AFTER the dispatch, so the owner-bounded
+        # test fails for those too -- which left 133 of JSRF's 422 resynced
+        # tables still carved after a459a6d recognised the arms.
+        det = _detector([(0x0002C360, 0x0002C397)],
+                        {0x0002C397: SEED, 0x0002CA05: SEED},
+                        natural={0x0002C360: 0x0002CFBA},
+                        provenance={0x0002C397: ["vtable_seeds_accum.json"]},
+                        tables={0x0002CBB4: [0x0002C397, 0x0002CA05]},
+                        sites={0x0002CBB4: [0x0002C390]})
+        det._pass_demote_interior_seeds([])
+        self.assertEqual(det._candidates, {})
+        self.assertEqual([r["reference_class"] for r in det.dropped_seeds],
+                         ["switch_arm", "switch_arm"])
+        self.assertEqual(det.dropped_seeds[0]["dispatch"], "0x0002C390")
+
+    def test_a_table_entry_far_from_its_dispatch_is_not_a_first_arm(self):
+        # The backward look is deliberately short. An arm that is neither
+        # interior to its owner nor immediately after the dispatch is not
+        # something this rule can speak for, and must be left alone.
+        det = _detector([(0x0002C360, 0x0002C397)], {0x0002C397: SEED},
+                        natural={0x0002C360: 0x0002C397},
+                        provenance={0x0002C397: ["icall_targets.json"]},
+                        tables={0x0002CBB4: [0x0002C397]},
+                        sites={0x0002CBB4: [0x0002C100]})
+        det._pass_demote_interior_seeds([])
+        self.assertEqual(det.dropped_seeds, [])
+        self.assertEqual(det._candidates, {0x0002C397: SEED})
+
     def test_nothing_to_do_is_cheap(self):
         # No seeds and no declared extents: the pass must not force a rebuild.
         det = _detector([(0x1000, 0x1010)], {0x2000: (0.9, "call_target")})
