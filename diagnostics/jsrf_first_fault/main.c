@@ -2119,6 +2119,15 @@ static void jsrf_object_dump(void)
             extern void xbox_InputPollReport(void);
             xbox_InputPollReport();
         }
+        /* And how that drawing was done.
+         *
+         * [RASTER] is the only statement of how much geometry went through the
+         * software rasteriser, and an anchored run switches the periodic report
+         * off, so without this the one measurement that compares the two hosts'
+         * renderers could not be taken at a guest clock at all -- only at a
+         * wall clock, which section 1 of the WINDOWS_PLAYABLE handover spent
+         * three wrong findings establishing is meaningless. */
+        nv2a_pb_exec_report();
         fprintf(stderr, "  [OBJ-DUMP] RECOMP_OBJECT_DUMP_EXIT set; stopping\n");
         fflush(stderr);
         _exit(0);
@@ -2720,7 +2729,7 @@ static int ensure_directory(const char *path)
 }
 
 #if defined(_WIN32)
-static HWND jsrf_create_window(void)
+static HWND jsrf_create_window(int visible)
 {
     static const char class_name[] = "JSRFFirstFaultWindow";
     HINSTANCE instance = GetModuleHandleA(NULL);
@@ -2739,7 +2748,7 @@ static HWND jsrf_create_window(void)
                                 CW_USEDEFAULT, CW_USEDEFAULT,
                                 rect.right - rect.left, rect.bottom - rect.top,
                                 NULL, NULL, instance, NULL);
-    if (hwnd) {
+    if (hwnd && visible) {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
@@ -2937,12 +2946,18 @@ int main(int argc, char **argv)
      * ever be a black, unresponsive rectangle, and it reads as a hang to
      * anyone watching. This build's output is the counters on stderr. Opt in
      * with RECOMP_D3D8_PROBE to check the layer still initialises. */
-    if (getenv("RECOMP_D3D8_PROBE"))
+    /* RECOMP_D3D11 needs this block for a different reason. The accelerated
+     * raster path in nv2a_d3d11.c draws through the D3D11 device this layer
+     * creates, so it cannot come up until CreateDevice has. Its window is a
+     * swap-chain requirement only -- nothing presents through it, the picture
+     * belongs to RECOMP_FB_WINDOW -- so it stays hidden rather than becoming a
+     * second black rectangle for someone to read as a hang. */
+    if (getenv("RECOMP_D3D8_PROBE") || getenv("RECOMP_D3D11"))
 #endif
     {
         IDirect3D8 *d3d;
 #if defined(_WIN32)
-        HWND hwnd = jsrf_create_window();
+        HWND hwnd = jsrf_create_window(getenv("RECOMP_D3D8_PROBE") != NULL);
 #else
         xbox_d3d8_set_window_title("Jet Set Radio Future");
 #endif

@@ -316,6 +316,53 @@ static void sample_lod(const NV2ATextureCopy *s,const uint8_t *data,float u,floa
     for(unsigned k=0;k<4;++k) out[k]=a[k]*(1-f)+b[k]*f;
 }
 
+/* Unpack one mip level into tightly packed RGBA8, in R,G,B,A byte order.
+ *
+ * A hardware sampler cannot read the guest's Morton-swizzled ARGB8, its
+ * block-compressed levels, or its pitch-padded RGB565 image rectangles, so the
+ * D3D11 path unpacks each texture once and uploads the result. It goes through
+ * the same texel() the CPU rasteriser uses, so the two agree by construction
+ * rather than by a second reading of the format documentation.
+ *
+ * Returns zero without writing anything if the level does not exist, or if
+ * either the source or the destination would be overrun. */
+int nv2a_texture_copy_decode_level(const NV2ATextureCopy *s, const uint8_t *data,
+    size_t size, unsigned level, uint8_t *out, size_t out_size,
+    unsigned *out_w, unsigned *out_h)
+{
+    if(!s || !data || !out || s->untextured) return 0;
+    unsigned levels=s->levels?s->levels:1;
+    if(level>=levels || !s->width || !s->height) return 0;
+    NV2ATextureCopy t=*s;
+    /* Decoding addresses exact texels, so the wrap mode cannot matter; force
+     * clamp so a rounding error reads an edge texel rather than wrapping. */
+    t.repeat=0;
+    size_t offset=0;
+    for(unsigned l=0;l<level;++l) {
+        offset+=t.dxt1?(size_t)((t.width+3)/4)*((t.height+3)/4)*8:
+            t.dxt3?(size_t)((t.width+3)/4)*((t.height+3)/4)*16:
+            t.rgba8?(size_t)t.width*t.height*4:(size_t)t.pitch*t.height;
+        t.width=t.width>1?t.width/2:1; t.height=t.height>1?t.height/2:1;
+        t.pitch=t.dxt1?((t.width+3)/4)*8:t.dxt3?((t.width+3)/4)*16:
+            t.rgba8?t.width*4:t.pitch;
+    }
+    size_t level_bytes=t.dxt1?(size_t)((t.width+3)/4)*((t.height+3)/4)*8:
+        t.dxt3?(size_t)((t.width+3)/4)*((t.height+3)/4)*16:
+        t.rgba8?(size_t)t.width*t.height*4:(size_t)t.pitch*t.height;
+    if(offset>size || level_bytes>size-offset) return 0;
+    if((size_t)t.width*t.height*4>out_size) return 0;
+    const uint8_t *p=data+offset;
+    for(unsigned y=0;y<t.height;++y) for(unsigned x=0;x<t.width;++x) {
+        float rgba[4];
+        texel(&t,p,(int)x,(int)y,rgba);
+        uint8_t *q=out+((size_t)y*t.width+x)*4;
+        for(unsigned k=0;k<4;++k) q[k]=(uint8_t)(fminf(1,fmaxf(0,rgba[k]))*255+.5f);
+    }
+    if(out_w) *out_w=t.width;
+    if(out_h) *out_h=t.height;
+    return 1;
+}
+
 static float combiner_input(unsigned input,unsigned channel,const float regs[14][4])
 {
     unsigned source=input&15;
@@ -459,7 +506,11 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
     /* A common post-process is an oversized triangle copying texels 1:1.
      * Prove that all pixel centres in its bounds are covered before using
      * row copies. This also preserves RGB565 quantisation exactly. */
-    int direct=!s->combiner_count && !s->rgba8 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
+    /* !untextured, because the copy below reads `texture`, and an untextured
+     * batch is entitled to pass NULL for it -- every other guard above lets it
+     * through, and the bounds test that incidentally covered this only did so
+     * because an untextured state also leaves width and height zero. */
+    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
         && s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
     for (int i=0;i<3;++i)
         if (v[i][0][3]!=1 || v[i][NV2A_VSH_OUT_T0][3]!=1

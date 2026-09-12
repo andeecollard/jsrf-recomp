@@ -136,6 +136,14 @@ if(APPLE)
     target_link_libraries(jsrf_metal_copy_test PRIVATE xbox_vsh)
     # Explicit GPU test; do not turn headless CTest runs into device failures.
 endif()
+if(WIN32)
+    # The same question for the D3D11 path, and the same reason it is not a
+    # CTest case: it needs a real device, and under CrossOver that means a
+    # bottle rather than a build machine.
+    add_executable(jsrf_d3d11_copy_test d3d11_copy_test.c)
+    target_link_libraries(jsrf_d3d11_copy_test PRIVATE xbox_d3d8 xbox_vsh)
+    target_include_directories(jsrf_d3d11_copy_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+endif()
 add_executable(jsrf_mip_sampling_equivalence_test mip_sampling_equivalence_test.c)
 target_include_directories(jsrf_mip_sampling_equivalence_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 if(NOT WIN32)

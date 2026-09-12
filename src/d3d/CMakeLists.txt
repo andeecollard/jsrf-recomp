@@ -10,6 +10,10 @@ if(WIN32)
         d3d8_states.c
         d3d8_combiners.c
         d3d8_vsh.c
+        # The NV2A native raster path. It lives with the D3D11 backend rather
+        # than with xbox_vsh because it needs this library's device accessors,
+        # and xbox_d3d8 already depends on xbox_vsh for the batch state.
+        ${CMAKE_CURRENT_LIST_DIR}/../nv2a/nv2a_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
 

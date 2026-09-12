@@ -33,6 +33,13 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t methods[2048], unsign
 
 size_t nv2a_texture_copy_texture_bytes(const NV2ATextureCopy *state);
 
+/* Unpack one mip level into tightly packed RGBA8 for a hardware sampler.
+ * Returns zero, writing nothing, if the level is absent or either buffer is
+ * too small. out_size must hold level_width * level_height * 4 bytes. */
+int nv2a_texture_copy_decode_level(const NV2ATextureCopy *state,
+    const uint8_t *data, size_t size, unsigned level,
+    uint8_t *out, size_t out_size, unsigned *out_w, unsigned *out_h);
+
 const char *nv2a_texture_copy_prepare(const uint32_t methods[2048], NV2ATextureCopy *state);
 int nv2a_dma_resolve(const uint8_t *ramin, size_t size, uint32_t ramht,
                      uint32_t handle, uint32_t *base, uint32_t *limit);

@@ -1,6 +1,33 @@
 #include "nv2a_ff.h"
-#ifdef __APPLE__
+/* The accelerated raster path, under one set of names.
+ *
+ * macOS reaches it through Metal and Windows through D3D11. The two backends
+ * present the same five entry points on purpose -- see the header comment in
+ * nv2a_d3d11.c -- so every site below is host-independent, and a measurement
+ * taken on one host means the same thing on the other. */
+#if defined(__APPLE__)
 #include "nv2a_metal.h"
+#define NV2A_GPU_PATH        1
+#define NV2A_GPU_SWITCH      "RECOMP_METAL"
+#define NV2A_GPU_TAG         "METAL"
+#define nv2a_gpu_draw        nv2a_metal_draw
+#define nv2a_gpu_sync        nv2a_metal_sync
+#define nv2a_gpu_invalidate  nv2a_metal_invalidate
+#define nv2a_gpu_last_reject nv2a_metal_last_reject
+#define nv2a_gpu_report      nv2a_metal_report
+#elif defined(_WIN32)
+#include "nv2a_d3d11.h"
+#define NV2A_GPU_PATH        1
+#define NV2A_GPU_SWITCH      "RECOMP_D3D11"
+#define NV2A_GPU_TAG         "D3D11"
+#define nv2a_gpu_draw        nv2a_d3d11_draw
+#define nv2a_gpu_sync        nv2a_d3d11_sync
+#define nv2a_gpu_invalidate  nv2a_d3d11_invalidate
+#define nv2a_gpu_last_reject nv2a_d3d11_last_reject
+#define nv2a_gpu_report      nv2a_d3d11_report
+#define nv2a_gpu_surface_report nv2a_d3d11_surface_report
+#else
+#define NV2A_GPU_PATH        0
 #endif
 /**
  * Execute the parts of the title's pushbuffer that produce visible pixels.
@@ -13,7 +40,7 @@
  *
  * Geometry uses either pre-transformed attributes or the title's uploaded
  * NV2A vertex program. Shader outputs feed the bounded software rasteriser,
- * or the optional native Metal raster path on macOS. The supported fragment
+ * or the optional native GPU raster path (Metal on macOS, D3D11 on Windows). The supported fragment
  * subset includes the title's measured register combiners, RGB565/RGBA8/DXT1
  * textures, mipmaps, depth, blending, culling and dithering; every state that
  * remains unsupported is rejected and counted explicitly.
@@ -40,6 +67,17 @@
 #include <string.h>
 #include <stddef.h>     /* ptrdiff_t; MSVC gets it via another header */
 #include <time.h>      /* clock_gettime, for the opt-in traces below */
+
+#if NV2A_GPU_PATH
+/* Read once: this is consulted per batch, and getenv on Windows walks the
+ * environment block every call. */
+static int nv2a_gpu_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv(NV2A_GPU_SWITCH) ? 1 : 0;
+    return on;
+}
+#endif
 
 /* strtok_s is MSVC's name for what POSIX calls strtok_r. Same signature and
  * same semantics, so one alias covers it rather than restructuring the two
@@ -87,11 +125,11 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
-    uint32_t metal_batches, metal_fallbacks;
+    uint32_t gpu_batches, gpu_fallbacks;
     /* Batches and triangles that the GPU never saw.
      *
-     * metal_batches counts Metal successes and metal_fallbacks counts batches
-     * that TRIED Metal and were refused -- so between them they say nothing
+     * gpu_batches counts accelerated successes and gpu_fallbacks counts
+     * batches that TRIED the accelerated path and were refused -- so between them they say nothing
      * about a batch that skipped the accelerated path altogether, which is
      * what happens whenever s_copy.active is 0. "0 software fallbacks" was
      * therefore not the same claim as "nothing is rasterised on the CPU", and
@@ -850,8 +888,8 @@ static void snapshot_surface(void)
     const uint8_t *mem;
     uint32_t y;
 
-#ifdef __APPLE__
-    if (getenv("RECOMP_METAL")) nv2a_metal_sync();
+#if NV2A_GPU_PATH
+    if (nv2a_gpu_on()) nv2a_gpu_sync();
 #endif
     if (!s_snap_wanted || !s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
         return;
@@ -1037,8 +1075,8 @@ static void dump_surface_bmp(const char *tag, unsigned seq)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
 
-#ifdef __APPLE__
-    if (getenv("RECOMP_METAL")) nv2a_metal_sync();
+#if NV2A_GPU_PATH
+    if (nv2a_gpu_on()) nv2a_gpu_sync();
 #endif
     if (!mem || !s_gpu.color_offset)
         return;
@@ -1179,15 +1217,31 @@ static void flip_trace(void)
             int off = snprintf(line, sizeof line, "  [FLIPTRACE]   surfaces:");
             uint32_t bpp = surface_bpp();
             unsigned i;
+            /* Both aliases of each surface.
+             *
+             * AvSetDisplayMode states the scanout as a PHYSICAL address, and a
+             * contiguous allocation's physical P is visible to the CPU at
+             * 0x80000000 + P. Reading P directly lands in the loaded
+             * image instead. Printing one number cannot tell "nothing was
+             * drawn" from "it was drawn in the other window", and that is a
+             * distinction this renderer has already been wrong about. */
             for (i = 0; i < s_surface_count && off > 0
-                        && off < (int)sizeof(line) - 40; i++)
+                        && off < (int)sizeof(line) - 56; i++)
                 off += snprintf(line + off, sizeof(line) - (size_t)off,
-                                " 0x%08X=%u%s", s_surfaces[i],
+                                " 0x%08X=%u/hi=%u%s", s_surfaces[i],
                                 surface_nonzero(s_surfaces[i], bpp),
+                                surface_nonzero(s_surfaces[i] | 0x80000000u, bpp),
                                 s_surfaces[i] == s_gpu.color_offset
                                     ? "(bound)" : "");
             fprintf(stderr, "%s\n", line);
         }
+#ifdef nv2a_gpu_surface_report
+        /* The same addresses as the line above, but what the GPU holds rather
+         * than what guest RAM holds. Where they disagree is where the frame
+         * goes missing. */
+        if (nv2a_gpu_on())
+            nv2a_gpu_surface_report();
+#endif
         if (s_recent_dump)
             s_recent_dump(48);
     }
@@ -1242,9 +1296,12 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
-#ifdef __APPLE__
-    if (getenv("RECOMP_METAL")) nv2a_metal_invalidate(NULL);
-#endif
+    /* The invalidate is per surface, and moved down to each half.
+     *
+     * It used to be one nv2a_gpu_invalidate(NULL) here, which flushes and
+     * discards EVERY retained surface for a clear of one of them. JSRF holds
+     * three colour surfaces and swaps between them batch by batch, so that
+     * blast radius meant no surface ever survived a frame. */
 
     /* Fixed Z24S8, linear single-sample surface. Resolve the actual DMA
      * object and validate the entire mapped range before touching depth. */
@@ -1306,6 +1363,9 @@ static void clear_surface(uint32_t param)
              * host, and a surface that resolves there is misconfigured. Refuse
              * and say so, rather than corrupting the guest silently. */
             if (z && nv2a_range_hits_image(base+offset, bytes)) z = NULL;
+#if NV2A_GPU_PATH
+            if (z && nv2a_gpu_on()) nv2a_gpu_invalidate(z);
+#endif
             if (z) for (y=y0;y<y1;++y) for (x=x0;x<x1;++x) {
                 uint8_t *p=z+(size_t)y*pitch+x*4;
                 if (param&2) p[0]=(uint8_t)value;
@@ -1318,6 +1378,9 @@ static void clear_surface(uint32_t param)
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
+#if NV2A_GPU_PATH
+    if (nv2a_gpu_on()) nv2a_gpu_invalidate(mem + s_gpu.color_offset);
+#endif
 
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_offset
@@ -1823,8 +1886,8 @@ static void capture_draw(const char *error)
             || s_combiner_capture || (sample && s_gpu.draws==strtoul(sample,NULL,0))
             || (error && s_copy.rejected < 2));
     if (!s_capture_selected) return;
-#ifdef __APPLE__
-    if (getenv("RECOMP_METAL")) nv2a_metal_sync();
+#if NV2A_GPU_PATH
+    if (nv2a_gpu_on()) nv2a_gpu_sync();
 #endif
     char path[768];
     snprintf(path, sizeof(path), "%s%06u.json", prefix, s_gpu.draws);
@@ -1997,32 +2060,33 @@ static void raster_batch(void)
         }
     }
 
-#ifdef __APPLE__
-    if (s_copy.active && getenv("RECOMP_METAL")) {
+#if NV2A_GPU_PATH
+    if (s_copy.active && nv2a_gpu_on()) {
         static unsigned fallback_reports, unique_reports;
         static const char *seen_reasons[16];
         static int trace_fallbacks = -1;
         if (trace_fallbacks < 0)
-            trace_fallbacks = getenv("RECOMP_METAL_FALLBACK_TRACE") ? 1 : 0;
-        int triangles=nv2a_metal_draw(&s_copy.state,s_copy.texture,s_copy.texture_bytes,
+            trace_fallbacks = getenv("RECOMP_GPU_FALLBACK_TRACE")
+                || getenv("RECOMP_METAL_FALLBACK_TRACE") ? 1 : 0;
+        int triangles=nv2a_gpu_draw(&s_copy.state,s_copy.texture,s_copy.texture_bytes,
             s_copy.target,s_copy.target_bytes,s_copy.depth,s_copy.depth_bytes,
             s_outputs,s_gpu.idx_count,s_gpu.prim);
         if(triangles>=0) {
             static unsigned reported;
             s_gpu.tris_drawn+=(unsigned)triangles;
-            ++s_gpu.metal_batches;
-            if(reported++<10) fprintf(stderr,"[METAL] rendered batch: %d triangles\n",triangles);
+            ++s_gpu.gpu_batches;
+            if(reported++<10) fprintf(stderr,"[" NV2A_GPU_TAG "] rendered batch: %d triangles\n",triangles);
             goto batch_complete;
         }
-        ++s_gpu.metal_fallbacks;
-        const char *reason=nv2a_metal_last_reject();
+        ++s_gpu.gpu_fallbacks;
+        const char *reason=nv2a_gpu_last_reject();
         int unique=1;
         for(unsigned i=0;i<unique_reports;i++)
             if(!strcmp(reason,seen_reasons[i]))unique=0;
         if(unique&&unique_reports<16)seen_reasons[unique_reports++]=reason;
         else if(unique)unique=0;
         if(fallback_reports++<3 || (trace_fallbacks && unique)) fprintf(stderr,
-            "[METAL] software fallback (%s): combiner=%u mask=0x%x untextured=%u format=%u/%u levels=%u size=%ux%u bpp=%u depth=%u/%u blend=%u dither=%u repeat=%u cull=%u clip=%u,%u\n",
+            "[" NV2A_GPU_TAG "] software fallback (%s): combiner=%u mask=0x%x untextured=%u format=%u/%u levels=%u size=%ux%u bpp=%u depth=%u/%u blend=%u dither=%u repeat=%u cull=%u clip=%u,%u\n",
             reason,
             s_copy.state.combiner_count,s_copy.state.texture_mask,s_copy.state.untextured,
             s_copy.state.rgba8,s_copy.state.dxt1,s_copy.state.levels,
@@ -2062,8 +2126,8 @@ static void raster_batch(void)
         break;                             /* points and lines: not yet */
     }
 batch_complete:
-#ifdef __APPLE__
-    if (s_capture_selected && getenv("RECOMP_METAL")) nv2a_metal_sync();
+#if NV2A_GPU_PATH
+    if (s_capture_selected && nv2a_gpu_on()) nv2a_gpu_sync();
 #endif
     if (s_copy.active) capture_bytes("after", s_copy.target, s_copy.target_bytes);
     if (s_copy.active && s_copy.depth) capture_bytes("depth-after",s_copy.depth,s_copy.depth_bytes);
@@ -2366,6 +2430,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     /* The title's own frame boundary: this frame is finished. */
     case NV097_FLIP_STALL:
+#ifdef nv2a_gpu_surface_report
+        /* BEFORE the snapshot, because the snapshot syncs: the question is
+         * what the GPU still owes guest RAM at the moment the guest calls the
+         * frame finished, and a sync answers it by destroying it. */
+        if (getenv("RECOMP_FLIP_TRACE") && nv2a_gpu_on()) {
+            fprintf(stderr, "  [FLIPTRACE] pre-sync:\n");
+            nv2a_gpu_surface_report();
+        }
+#endif
         snapshot_surface();
         flip_trace();
         break;
@@ -2855,12 +2928,12 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[RASTER] %u batches + %u triangles on the CPU;"
                     " %u triangles total\n",
             s_gpu.cpu_batches, s_gpu.cpu_tris, s_gpu.tris_drawn);
-#ifdef __APPLE__
-    if (getenv("RECOMP_METAL"))
+#if NV2A_GPU_PATH
+    if (nv2a_gpu_on())
     {
-        fprintf(stderr,"[METAL] %u batches native, %u software fallbacks\n",
-            s_gpu.metal_batches,s_gpu.metal_fallbacks);
-        nv2a_metal_report();
+        fprintf(stderr,"[" NV2A_GPU_TAG "] %u batches native, %u software fallbacks\n",
+            s_gpu.gpu_batches,s_gpu.gpu_fallbacks);
+        nv2a_gpu_report();
     }
 #endif
 
