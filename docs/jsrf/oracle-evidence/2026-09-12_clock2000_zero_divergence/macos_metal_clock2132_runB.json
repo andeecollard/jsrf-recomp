@@ -1,0 +1,30 @@
+{
+  "source": "recomp",
+  "seq": 1,
+  "root": 67975792,
+  "live": 10,
+  "exec_root": 68157248,
+  "draw_root": 68157248,
+  "draw_root_tail": 68181236,
+  "draw_sort_root": 70061888,
+  "draw_sort_tail": 69090784,
+  "skip_draw": 0,
+  "draw_mode": 0,
+  "state_7930": 0,
+  "state_7934": 0,
+  "state_7EC4": 0,
+  "draw_sort_bins": [
+    {"bin": 0, "head": 70061888}
+  ],
+  "objects": [
+    {"id": 0, "address": 68157344, "vtable": 1887928, "flags": 0, "stored_id": 0, "draw_child_mask": 1, "state_11C": 68163932, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 0, "tx": 0, "ty": 0, "tz": 0, "parent": 68157248, "child": 70061664, "sibling_before": 68157536, "sibling_next": 68163984, "draw_next": 68163984, "draw_before_ptr": 68157588, "draw_last_ptr": 68008472, "zsort": 0, "extra_44": 0, "extra_48": 8},
+    {"id": 4, "address": 68163984, "vtable": 1932064, "flags": 0, "stored_id": 4, "draw_child_mask": 1, "state_11C": 0, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 0, "tx": 0, "ty": 0, "tz": 0, "parent": 68157248, "child": 0, "sibling_before": 68157344, "sibling_next": 68181184, "draw_next": 68181184, "draw_before_ptr": 68157396, "draw_last_ptr": 68008472, "zsort": 0, "extra_44": 0, "extra_48": 0},
+    {"id": 5, "address": 68181184, "vtable": 1930952, "flags": 0, "stored_id": 5, "draw_child_mask": 1, "state_11C": 0, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 131094, "zsort_key": 0, "tx": 67109248, "ty": 67109248, "tz": 1982496, "parent": 68157248, "child": 0, "sibling_before": 68163984, "sibling_next": 0, "draw_next": 0, "draw_before_ptr": 68164036, "draw_last_ptr": 68008472, "zsort": 0, "extra_44": 0, "extra_48": 68181488},
+    {"id": 6, "address": 70061664, "vtable": 1854736, "flags": 65539, "stored_id": 6, "draw_child_mask": 7, "state_11C": 68008464, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 10, "tx": 0, "ty": 0, "tz": 0, "parent": 68157344, "child": 0, "sibling_before": 0, "sibling_next": 70061888, "draw_next": 70061888, "draw_before_ptr": 68008460, "draw_last_ptr": 68008464, "zsort": 69090720, "extra_44": 0, "extra_48": 0},
+    {"id": 7, "address": 68157536, "vtable": 1855336, "flags": 0, "stored_id": 7, "draw_child_mask": 1, "state_11C": 0, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 0, "tx": 0, "ty": 0, "tz": 0, "parent": 68157248, "child": 0, "sibling_before": 0, "sibling_next": 68157344, "draw_next": 68157344, "draw_before_ptr": 68157300, "draw_last_ptr": 68008472, "zsort": 0, "extra_44": 0, "extra_48": 30},
+    {"id": 4454, "address": 70240784, "vtable": 1877056, "flags": 1073742080, "stored_id": 4454, "draw_child_mask": 1, "state_11C": 0, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 0, "tx": 0, "ty": 0, "tz": 0, "parent": 70061888, "child": 0, "sibling_before": 0, "sibling_next": 0, "draw_next": 0, "draw_before_ptr": 0, "draw_last_ptr": 0, "zsort": 0, "extra_44": 70138176, "extra_48": 0},
+    {"id": 4745, "address": 70061888, "vtable": 1852800, "flags": 65539, "stored_id": 4745, "draw_child_mask": 7, "state_11C": 0, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 15, "tx": 0, "ty": 0, "tz": 0, "parent": 68157344, "child": 70240784, "sibling_before": 70061664, "sibling_next": 69090720, "draw_next": 69090720, "draw_before_ptr": 70061716, "draw_last_ptr": 68008464, "zsort": 70061664, "extra_44": 0, "extra_48": 0},
+    {"id": 7642, "address": 70149952, "vtable": 1888184, "flags": 9, "stored_id": 7642, "draw_child_mask": 7, "state_11C": 12, "state_E50": 3984387452, "gate_E54": 3916425583, "gate_1144": 2786633240, "fz": 0, "zsort_key": 0, "tx": 4, "ty": 0, "tz": 0, "parent": 68157344, "child": 0, "sibling_before": 69090720, "sibling_next": 0, "draw_next": 0, "draw_before_ptr": 69090772, "draw_last_ptr": 68008464, "zsort": 0, "extra_44": 0, "extra_48": 0},
+    {"id": 7663, "address": 69090720, "vtable": 1880232, "flags": 65539, "stored_id": 7663, "draw_child_mask": 7, "state_11C": 0, "state_E50": 0, "gate_E54": 0, "gate_1144": 0, "fz": 0, "zsort_key": 0, "tx": 0, "ty": 0, "tz": 0, "parent": 68157344, "child": 0, "sibling_before": 70061888, "sibling_next": 70149952, "draw_next": 70149952, "draw_before_ptr": 70061940, "draw_last_ptr": 68008464, "zsort": 0, "extra_44": 0, "extra_48": 0}
+  ]
+}

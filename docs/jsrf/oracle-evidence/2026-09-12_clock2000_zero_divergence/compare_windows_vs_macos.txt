@@ -1,0 +1,23 @@
+recomp root 0x040d3a70   xemu root 0x040d3a70   (delta +0x0)
+
+== manager ==
+    live             recomp=          10  xemu=          10
+    skip_draw        recomp=           0  xemu=           0
+    draw_mode        recomp=           0  xemu=           0
+    state_7930       recomp=           0  xemu=           0
+    state_7934       recomp=           0  xemu=           0
+    state_7EC4       recomp=           0  xemu=           0
+    exec_root        recomp=execroot+0x0  xemu=execroot+0x0
+    draw_root        recomp=execroot+0x0  xemu=execroot+0x0
+    draw_root_tail   recomp=  obj#5+0x34  xemu=  obj#5+0x34
+    draw_sort_root   recomp=    obj#4745  xemu=    obj#4745
+    draw_sort_tail   recomp=obj#7663+0x40  xemu=obj#7663+0x40
+    draw_sort_bins   both {0: 'obj#4745'}
+
+== id set ==
+    identical, 9 ids
+
+== per-object ==
+    every common object matches on every compared field
+
+0 divergent field group(s)
