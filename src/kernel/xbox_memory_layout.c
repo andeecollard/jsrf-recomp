@@ -2724,7 +2724,11 @@ extern volatile uint32_t g_icall_trace_idx;
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0)
 {
-    enum { SLOTS = 32 };
+    /* 32 filled during asset loading alone -- every slot went to
+     * FileManager's readers -- so nothing at gameplay time was ever reachable.
+     * The table is deduplicated by callee VA, so this bounds distinct
+     * offenders, not events. */
+    enum { SLOTS = 512 };
     static uint32_t seen[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;

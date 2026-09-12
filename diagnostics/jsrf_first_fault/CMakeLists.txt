@@ -231,8 +231,27 @@ target_include_directories(jsrf_pb_scan_owner_test PRIVATE "${XBOXRECOMP_DIR}/sr
 add_test(NAME jsrf_pb_scan_owner COMMAND jsrf_pb_scan_owner_test)
 
 option(JSRF_STARTUP_ABI_CHECK "Check guest register preservation at startup chunk calls" OFF)
-if(JSRF_STARTUP_ABI_CHECK)
-    set_source_files_properties("${RECOMP_GEN_DIR}/recomp_0000.c"
-        PROPERTIES COMPILE_DEFINITIONS RECOMP_ABI_CHECK)
+# Every generated chunk, not just the startup one.
+#
+# The narrow form was pointed at recomp_0000.c on 03 Sep and has not been used
+# since, so the only code ever checked is the code that runs before a frame.
+# The failure this catches is a callee returning with ebx/esi/edi changed --
+# upstream found it when MSVC switch tables parked mid-function made the sweep
+# lose an epilogue, so `pop esi / pop edi` was never lifted and every caller
+# silently lost those registers. The caller then carries on with a wrong loop
+# cursor and simply does less work, with no error anywhere. A partial write of
+# a structure and a lopsided update count are what that looks like from the
+# outside, which is exactly the shape of the tutorial's animation gate.
+#
+# The logger deduplicates by callee VA and stops at 32, so this cannot flood.
+option(JSRF_ABI_CHECK_ALL "Check guest register preservation across every generated chunk" OFF)
+if(JSRF_STARTUP_ABI_CHECK OR JSRF_ABI_CHECK_ALL)
+    if(JSRF_ABI_CHECK_ALL)
+        set_source_files_properties(${RECOMP_GEN_SOURCES}
+            PROPERTIES COMPILE_DEFINITIONS RECOMP_ABI_CHECK)
+    else()
+        set_source_files_properties("${RECOMP_GEN_DIR}/recomp_0000.c"
+            PROPERTIES COMPILE_DEFINITIONS RECOMP_ABI_CHECK)
+    endif()
     target_compile_definitions(xbox_kernel PRIVATE RECOMP_ABI_CHECK)
 endif()
