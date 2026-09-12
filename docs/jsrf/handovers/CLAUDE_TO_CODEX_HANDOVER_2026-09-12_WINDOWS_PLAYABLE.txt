@@ -1,0 +1,223 @@
+JSRF HANDOVER -- WINDOWS RUNS THE GAME. WHAT IS LEFT IS SPEED AND INPUT.
+Date: 2026-09-12 (Europe/London)
+From: Claude.  To: Codex.
+
+Supersedes every 2026-09-12 handover before it. Two of them
+(ADX_STREAM_NEVER_STARTS, WINDOWS_NEVER_REACHES_GAMEPLAY) are marked RETIRED in
+place because they are WRONG, and section 1 says why in one line.
+
+24 commits, f3a12b3..dd2a094.
+
+
+0. STATE, VERIFIED AT THE DESK
+==============================
+The CrossOver build boots, renders into a visible window, plays music, reaches
+gameplay, and its intro animation runs. A human watched it. Audio was glitching
+and is now fixed; the picture was tearing and is now clean.
+
+    macOS     ~30 s to gameplay, GPU rasterised, pad works, audio 48004 Hz
+    Windows   ~150 s to gameplay, CPU rasterised, pad NOT seen by the guest,
+              audio 47983 Hz
+
+Launch it:  wine --bottle recomp-gate --cx-app 'C:\jsrf\run_jsrf.bat'
+The bottle has jsrf.exe, run_jsrf.bat, hdd\, and three probes with .bat files
+(xiprobe, diprobe, padtest).
+
+
+1. THE RULE THAT COST THREE WRONG HANDOVERS
+===========================================
+    NEVER COMPARE THE TWO HOSTS AT EQUAL WALL-CLOCK TIME.
+    COMPARE AT EQUAL GUEST MAIN-LOOP COUNT.
+
+Windows runs the guest main loop at roughly a fifth of macOS's rate. Every
+"Windows never does X" finding on 11-12 Sep was a Windows run caught mid-boot
+measured against a macOS run already in gameplay. on=4 vs on=5, fe_methods 177
+vs 4369, "CRI's DirectSound driver is never entered", "the BGM directory is
+never opened", "0 of 17 CPlayer markers" -- all of it dissolved when the runs
+were anchored properly. Windows crosses the title at main loop 2408; macOS at
+2400-2900. In guest time they agree almost exactly.
+
+`[FUNC-HIT] 000123E0 calls=N` is the clock. Arm it with instrument_func_hit.py.
+
+
+2. THE ORACLE, AND ITS ONE TRAP
+===============================
+diagnostics/jsrf_first_fault/oracle_anchor.sh mac|win <clock> <outdir>
+
+Runs one host to a guest-clock anchor, dumps the object inventory there, and
+EXITS. macOS 13 s to clock 1000, Windows 37 s. Overshoot 0 on both.
+RECOMP_OBJECT_DUMP_AT=<n>[,<va>] is the anchor; RECOMP_OBJECT_DUMP_EXIT ends
+the run at it; the periodic report is switched off because at 2 s it cost 2.7x
+of guest throughput.
+
+Compare with compare_objects.py A.json B.json. It resolves pointers
+symbolically, so two different heap layouts do not read as divergence.
+
+Result, Windows against macOS at clocks 500/750/1000/1500/2000: ZERO divergent
+field groups at every anchor. Evidence preserved in
+docs/jsrf/oracle-evidence/2026-09-12_clock2000_zero_divergence/ with the clock,
+the root address, the compared field lists and the method.
+
+THE TRAP, and it nearly produced a fake finding. Anchoring by POLLING the clock
+from the ack loop pins the FRAME but not the position inside it, because the
+poller is not the thread running the guest. Anchored that way the hosts
+"diverged" on id 7 +0x44 at clock 500 and id 4454/7665 at 750 -- and every one
+of those reproduced between two runs of the SAME host. jsrf_func_hit_alarm now
+fires the dump on the thread that takes the clock site's nth entry, which is
+the same instruction boundary on both hosts, and the macOS noise floor at 750
+went from two divergent groups to zero.
+
+    A CROSS-HOST COMPARISON IS UNINTERPRETABLE WITHOUT A SAME-HOST CONTROL AT
+    THE SAME ANCHOR. The noise floor is phase-dependent; measure it per anchor.
+
+
+3. WHAT WAS FIXED, WITH NUMBERS
+===============================
+(a) NATIVE TLS ON WINDOWS -- 2.2x.  tools/windows/clang-mingw.cmake
+    mingw-gcc implements __thread with EMULATED TLS: __emutls_get_address, a
+    call per access, and the generated code is `#define eax g_eax` over a
+    thread-local register set. 145 emutls symbols. clang, same sysroot, same
+    source, emits _tls_index -- native, TEB-relative. Zero emutls.
+        GCC/emutls    203 @30s   421 @60s   782 @90s
+        clang/native  880 @29s  1574 @59s  1754 @84s
+    Upstream does not have this problem because upstream builds with MSVC,
+    where _MSC_VER selects __declspec(thread). We run a third configuration.
+    Three things clang's driver does not do that gcc's does are handled in the
+    toolchain file; read its comments before touching it.
+
+(b) THE TRAP DECODER WAS COMPILER-DEPENDENT.  f37a9d0
+    xbox_Nv2aHandleWin32Fault completed plain stores only, so every guarded
+    MMIO page depended on how the compiler spelled `|=`. gcc emits load/or/
+    store; clang emits `orl $imm, mem` and the clang build died inside its own
+    memory-layout init. 0x81 and 0x83 with /1 and /4 now fold the current value
+    in. ONE EXCEPTION, which cost a run: a read-modify-write states the final
+    value, so it must NOT then have write-1-to-clear applied -- host code
+    raises an interrupt with PGRAPH_INTR |= bit, and before & ~(before|bit) is
+    zero, so the raise became a clear and the pusher waited for ever.
+
+(c) THE WINDOWS PRESENTER SHOWS WHOLE FRAMES.  ad0474f
+    It read the live surface on a 16 ms timer with no flip sync; a fullscreen
+    image is two triangles and the CPU rasteriser manages a few frames a
+    second, so it caught mid-draw almost every time and tore on a hard
+    diagonal. nv2a_pb_exec_surface hands back the copy taken AT the flip, which
+    is what the POSIX presenter has always used. Sampler went from oscillating
+    0/19841/2690/12860 nonzero to a steady 153600/153600.
+
+(d) WINDOWS AUDIO.  dd2a094
+    XAudio2 queued three 1024-sample buffers, ~64 ms, and DROPPED the block
+    when full. 3,496 drops in one run; output 43,750 Hz against the model's
+    48,000. Now sixteen slots with at most eight queued (~170 ms), separate
+    numbers so a slot cannot be recycled while still playing.
+        gen_hz 43750 -> 47983     drops full 3496 -> 6
+
+(e) THE WINDOWS BUILD HAS A PICTURE.  RECOMP_FB_WINDOW=1, commit 0d45c25.
+    src/video/fb_present.c is a Windows-only GDI presenter, wired into
+    AvSetDisplayMode, linked into the exe, and never switched on by anything.
+    Every older handover saying "the CrossOver window is always black" was
+    describing the D3D8 route only.
+
+(f) A DUALSHOCK 4 EXISTS ON WINDOWS AT ALL.  0d60248
+    XInput only ever supported Xbox-family pads -- a DS4 is not an XInput
+    device on real Windows either. Added a DirectInput8 fallback, consulted
+    only when XInput reports nothing. Verified by a binary linking the real
+    input file: CONNECTED with live stick values where it returned 1167.
+
+
+4. THE TWO THINGS LEFT, IN ORDER
+================================
+(1) WINDOWS HAS NO GPU RASTERISER. This is the slowness.
+    The accelerated path in nv2a_pb_exec.c is #ifdef __APPLE__ in its entirety.
+    Measured with a counter added for the purpose (15d74e7):
+        macOS    223,976 batches native, 0 software fallbacks,
+                 0 batches + 0 triangles on the CPU
+        Windows  0 native; every triangle through raster_triangle()
+    and then that software rasteriser is itself binary-translated. The two
+    effects multiply; neither alone makes the intro run.
+
+    Upstream ships a D3D11 pgraph sink, it is initialised, and it implements
+    nothing useful: unhandled = 15,078,354 of 15,078,354. The big misses are
+    NV097_ARRAY_ELEMENT16 (21.4M), NV097_SET_BEGIN_END, and the
+    NV097_SET_TRANSFORM_CONSTANT block -- indexed vertices and vertex-shader
+    constants. The CPU executor already implements all of it and xbox_vsh
+    already runs the shaders, so this is a bounded port. nv2a_metal_draw is the
+    structural model: one entry point taking the prepared batch state,
+    returning a triangle count or -1 to fall back.
+
+    DO NOT read [TEXTURE] prepared/rejected as a rate or compare it across
+    hosts. The fields are different units and macOS's Metal path returns before
+    the site that increments `rejected`, so macOS reads 28 where Windows reads
+    439,082 for the same work.
+
+(2) THE GUEST NEVER ASKS FOR INPUT ON WINDOWS.
+    With a DS4 attached and working, past the title, in gameplay:
+    polls=0. macOS at a comparable point polls hundreds of times. Our input
+    layer is fine -- padtest.exe in the bottle returns CONNECTED with live
+    sticks. The break is between our layer and the guest.
+
+    The chain is: guest XPP schedules an interrupt transfer -> ohci_thread
+    services it -> usb_gamepad_report -> xbox_InputGetState. ohci_thread is
+    created only #if defined(_WIN32), and it CANNOT LINK, because ohci.c calls
+    xbox_AllocThreadTib and this tree does not define it.
+
+    xbox_GetConnectedInterrupt is now defined (8a0e349). xbox_AllocThreadTib is
+    NOT, and the note where it would go in kernel_bridge.c explains why at
+    length. Short version: I wrote the obvious one -- a stack from
+    xbox_AllocThreadStack, the xbox_HeapAlloc trio PsCreateSystemThreadEx uses,
+    xbox_SetupCurrentThreadTib, sized from g_image_tls_total which the loader
+    now publishes -- it built on both hosts, macOS showed no object-state
+    change, and IT WEDGED WINDOWS: "[ADX] tick STUCK at 1 (flag=0)", never
+    advancing, where the binary without it runs the same configuration fine.
+    Reverted.
+
+    Prime suspect, unproven: ohci_thread starts during init and calls
+    xbox_AllocThreadStack and xbox_HeapAlloc from a HOST thread while the guest
+    is allocating on its own, and nothing says the guest heap is thread-safe.
+    Pre-allocate on the main thread before the thread is created and hand the
+    block over. Validate with a pad plugged in -- without one, a correct TIB
+    and a broken one look identical.
+
+    CHEAPER FIRST STEP: find out whether the pad does anything in GAMEPLAY ON
+    MACOS. macOS polls properly and is a 30 second loop. If input works there
+    and not on Windows, (2) is isolated to the OHCI path; if it works on
+    neither, the problem is above both and this whole thread is a red herring.
+
+
+5. DO NOT REPEAT THESE
+======================
+  * The register-context change. Consolidating the eight RECOMP_TLS scalars
+    into one struct removes 13% of generated code (recomp_0000.c.o 8.32MB ->
+    7.25MB) and buys NOTHING: title crossover 30.55 s -> 30.69 s, gameplay loop
+    rate identical. _tlv_get_addr is 75% of the profile's samples and not 75%
+    of the cost -- a profiler's top entry is a hypothesis. Written up in
+    CLAUDE_PROGRESS_2026-09-12_REGISTER_STRUCT_NEGATIVE.md.
+  * Keying RECOMP_TLS on _WIN32 so mingw-gcc takes __declspec(thread). emutls
+    drops 145 -> 16 and the title exits through HalReturnToFirmware within
+    sixteen file opens.
+  * The DSOUND fatal latch 0x001BA04C, the byte [this+0x12] & 3 gate at
+    0x001A43F0, and "two adjacent methods on one object". All measured on both
+    hosts, all dead ends.
+  * Calling xbox_OhciReport. It has no caller anywhere, and referencing it
+    pulls in parts of ohci.c that need the undefined symbols above. It is a
+    landmine, not a spare instrument.
+
+
+6. INSTRUMENTS ADDED
+====================
+  RECOMP_OBJECT_DUMP_AT=<n>[,<va>]  anchor the dump to the guest clock
+  RECOMP_OBJECT_DUMP_EXIT=1         end the run when it fires
+  jsrf_func_hit_count(va)           the guest clock, readable
+  jsrf_func_hit_alarm(va,n,fn)      fire fn on the thread that reaches n
+  RECOMP_DSOUND_FATAL / RECOMP_CRI_DSOUND / RECOMP_CRI_SERVER
+  [MCPX-TRAP] now counts VEH faults per page and undecoded opcodes (996f84c)
+  [METAL] now counts batches and triangles that went to the CPU (15d74e7)
+  [FILE] NtOpenFile now carries the guest caller
+  diagnostics/jsrf_first_fault/padcheck.sh -- can either build see a pad, in
+    one second. Both hosts read the pad through macOS's HID layer, so a pad on
+    the USB bus with no HID gamepad interface reads exactly like an unplugged
+    one. That cost two runs.
+
+A controller note, because it wasted time: a DualShock 4 works on both hosts
+(macOS via SDL, Windows via the new DirectInput path). An Xbox Series X wired
+pad works on both too, natively via XInput on Windows -- when it enumerates. It
+intermittently sits on the USB bus presenting no HID interface at all, and in
+that state it is indistinguishable from absent. Run padcheck.sh first.
