@@ -1671,19 +1671,31 @@ static volatile LONG g_store_watch_lock;
 static volatile LONG g_nv2a_pcrtc_lock;
 static size_t    g_nv2a_page_size;    /* g_mcpx_page_size is AArch64-only */
 
-/* The POSIX/AArch64 branch counts faults taken by its sigaction trap. This
- * host routes device registers through the VEH hooks instead, so those
- * counters have no producer here. Say that, rather than print five zeros that
- * would read as "the guest never wrote a device register". */
+/* What the VEH trap actually costs, per page.
+ *
+ * This used to print the guard flags and the words "no fault counters on this
+ * host", which was honest and useless: the POSIX branch counts its sigaction
+ * faults, so the one number that would let the two hosts be compared -- how
+ * often the guest faults into a guarded page -- existed on exactly one of
+ * them. A trapped store is the most expensive thing either host does, and
+ * "the Windows oracle runs the guest's main loop at a twelfth of macOS's
+ * rate" cannot be attributed without it.
+ *
+ * Counted per page, plus the two ways the handler declines: a fault on a page
+ * it does not guard (which it must pass on) and a store whose opcode the
+ * decoder does not recognise (which becomes a crash). The second is the one
+ * that reads as a mystery fault if it is not counted. */
+static volatile LONG g_veh_faults, g_veh_pcrtc, g_veh_ac97, g_veh_pgraph;
+static volatile LONG g_veh_watch, g_veh_not_ours, g_veh_undecoded;
+
 void xbox_McpxTrapReport(void)
 {
-    /* The POSIX branch counts faults taken by its sigaction trap; this host has
-     * no such counter. What it can say is which pages the VEH is actually
-     * guarding, because a page that failed to guard is silent otherwise and
-     * reads downstream as "the guest never wrote that register". */
     fprintf(stderr, "  [MCPX-TRAP] VEH guards: PCRTC=%d AC97=%d PGRAPH=%d"
-                    " (no fault counters on this host)\n",
-            g_nv2a_pcrtc_guarded, g_ac97_guarded, g_nv2a_pgraph_guarded);
+                    " faults=%ld pcrtc=%ld ac97=%ld pgraph=%ld watch=%ld"
+                    " declined: not-ours=%ld undecoded=%ld\n",
+            g_nv2a_pcrtc_guarded, g_ac97_guarded, g_nv2a_pgraph_guarded,
+            g_veh_faults, g_veh_pcrtc, g_veh_ac97, g_veh_pgraph,
+            g_veh_watch, g_veh_not_ours, g_veh_undecoded);
     fflush(stderr);
 }
 
@@ -1789,11 +1801,22 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
      * be completed as an ordinary store, or guarding one register turns its
      * neighbours into fatal faults. (Measured the hard way: the title writes
      * 0xFD600140 on the PCRTC page and the process died there.) */
+    InterlockedIncrement(&g_veh_faults);
     if (!(g_nv2a_pcrtc_guarded  && page == g_nv2a_pcrtc_page) &&
         !(g_ac97_guarded        && page == g_ac97_page) &&
         !(g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page) &&
-        !(g_store_watch_guarded && page == g_store_watch_page))
+        !(g_store_watch_guarded && page == g_store_watch_page)) {
+        InterlockedIncrement(&g_veh_not_ours);
         return 0;
+    }
+    if (g_nv2a_pcrtc_guarded  && page == g_nv2a_pcrtc_page)
+        InterlockedIncrement(&g_veh_pcrtc);
+    else if (g_ac97_guarded   && page == g_ac97_page)
+        InterlockedIncrement(&g_veh_ac97);
+    else if (g_nv2a_pgraph_guarded && page == g_nv2a_pgraph_page)
+        InterlockedIncrement(&g_veh_pgraph);
+    else
+        InterlockedIncrement(&g_veh_watch);
 
     ip = (const uint8_t *)(uintptr_t)ctx->Rip;
     while (ip[len] == 0x66 || ip[len] == 0x67 || ip[len] == 0xF2 || ip[len] == 0xF3)
@@ -1822,6 +1845,7 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
         width = 1;
         ilen = len + 1 + ml + 1;
     } else {
+        InterlockedIncrement(&g_veh_undecoded);
         return 0;
     }
 
