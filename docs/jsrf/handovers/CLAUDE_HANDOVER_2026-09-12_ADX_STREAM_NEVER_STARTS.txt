@@ -1,3 +1,11 @@
+RETIRED 2026-09-12 EVENING -- THIS FILE IS WRONG AT THE TOP LEVEL.
+The Windows oracle DOES reach gameplay, opens the BGM, starts the ADX
+stream and reports on=5. It just needs 672 seconds, not 110. Every run
+behind this file was too short, and comparing the two hosts at equal
+wall-clock time was the error. Compare at equal guest main-loop count.
+See CLAUDE_HANDOVER_2026-09-12_WINDOWS_REACHES_GAMEPLAY.txt.
+================================================================
+
 JSRF HANDOVER -- THE MISSING FIFTH VOICE IS THE MUSIC, AND IT IS NOT A DSOUND BUG
 Date: 2026-09-12 (Europe/London)
 From: Claude.

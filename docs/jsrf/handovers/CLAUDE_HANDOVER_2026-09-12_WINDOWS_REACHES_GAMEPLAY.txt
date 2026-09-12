@@ -1,0 +1,124 @@
+JSRF HANDOVER -- THE WINDOWS ORACLE REACHES GAMEPLAY. IT WAS ONLY EVER SLOW.
+Date: 2026-09-12 (Europe/London), evening
+From: Claude.
+
+SUPERSEDES AND RETIRES, IN FULL:
+  CLAUDE_HANDOVER_2026-09-12_ADX_STREAM_NEVER_STARTS.txt
+  CLAUDE_HANDOVER_2026-09-12_WINDOWS_NEVER_REACHES_GAMEPLAY.txt
+Both are wrong at the top level and both were wrong for the same reason: every
+Windows run this project has ever made was too short.
+
+
+0. WHAT ACTUALLY HAPPENS
+========================
+Given 672 seconds instead of 110, the Windows build:
+
+    t=671.9  [TITLE-STATE] 0x12 -> 0x13 -> 0x14      at main loop 2408
+             opens \Device\CdRom0\Media\Z_ADX\BGM\title.adx
+             ADX slot 0: stat 0 -> 1 -> 3 (polls-cursor)
+             [APU-VOICE] on=5  fe_methods=1945  set_current_voice=582
+             10 of the 17 CPlayer gameplay markers entered
+
+macOS, for comparison, crosses the same title teardown at main loop
+~2400-2900, and hits 12 of 17 CPlayer markers.
+
+IN GUEST TIME THE TWO HOSTS AGREE ALMOST EXACTLY: 2408 against 2400-2900. The
+divergence that three handovers chased was entirely wall-clock.
+
+
+1. EVERY AUDIO FINDING OF THE LAST TWO DAYS IS RETIRED
+======================================================
+on=4 against on=5, fe_methods 177 against 4369, set_current_voice 12 against
+1390, "CRI's DirectSound driver is never entered", "the BGM directory is never
+opened", "sub_0019F1F4 is called 1604 times on macOS and never on Windows" --
+all of it was a 90-to-110 second run measured against a 90 second run that had
+already reached gameplay at t=30. There was never an audio bug, never a DSOUND
+bug, and never a content-loading bug.
+
+Windows now reports on=5, fe_methods=1945, set_current_voice=582 and climbing,
+through the exact chain the earlier handover named:
+
+    BGM opened -> ADX slot 0 byte[+1] 0->1->3 -> sub_0013ECE0
+      -> [[slot+0x38]+0x20] = sub_001417B0 -> sub_0019F1F4 -> ... -> voice 0x44
+
+That chain is correct and is now confirmed on BOTH hosts. Only the conclusion
+drawn from its absence was wrong.
+
+Still genuinely closed, because they were measured on both hosts directly:
+  * the DSOUND fatal latch 0x001BA04C -- zero on both, latch never fires
+  * the byte [this+0x12] & 3 gate at 0x001A43F0
+  * "two adjacent methods on one object" -- they are DirectSound API thunks
+
+
+2. THE REAL NUMBER
+==================
+The guest main loop, sub_000123E0, measured on both hosts at equal elapsed
+time:
+
+    macOS    36.1 iterations/s   (70/s during the title, ~9.5/s in gameplay)
+    Windows   7.4 iterations/s   (~2-5/s during the title)
+
+About 5x on the loop, and about 22x on the whole boot in wall clock, because
+macOS's early phase is much faster than its later one.
+
+That is Windows x86-64 under CrossOver on Apple Silicon: recompiled C ->
+x86-64 -> binary-translated to ARM64. On a native x86-64 PC -- which is what
+upstream xboxrecomp targets -- that layer does not exist. NOT MEASURED here;
+there is no native PC in this setup. It is the obvious hypothesis and it is
+cheap for anyone with a PC to test.
+
+RULE, AND IT IS THE ONLY ONE THAT MATTERED THIS WEEK:
+
+    NEVER COMPARE THE TWO HOSTS AT EQUAL WALL-CLOCK TIME.
+    COMPARE AT EQUAL GUEST MAIN-LOOP COUNT.
+
+`[FUNC-HIT] 000123E0 calls=N` armed by instrument_func_hit.py is the clock.
+A Windows run needs 600+ seconds to reach what macOS reaches in 30.
+
+
+3. THE WINDOWS BUILD HAS A PICTURE: RECOMP_FB_WINDOW=1
+======================================================
+Also corrected today, see commit 0d45c25. src/video/fb_present.c is a
+Windows-only GDI presenter, wired into AvSetDisplayMode, linked into the exe,
+and never switched on by anything in this project. Set RECOMP_FB_WINDOW=1 and
+the run prints
+
+    [FBWIN] framebuffer window open (640x480)
+
+and shows the boot logos, the title, and gameplay.
+
+KNOWN ARTIFACT, do not chase it as a rendering bug: the image tears along a
+clean diagonal, one half at a time. The blit loop is a bare 16 ms timer that
+reads guest RAM with no flip, lock, vsync or double buffer -- so at 62 Hz
+against a guest drawing at 2-7 Hz it lands mid-draw nearly every time, and a
+fullscreen image is two triangles. Complete frames are produced: 50 samples in
+one run read 153600/153600. Worth fixing by blitting on the guest's flip,
+which would also make the window admissible as evidence.
+
+
+4. WHAT TO DO NEXT
+==================
+The oracle now works as designed: both hosts reach gameplay, so a fault that
+reproduces on both is guest-side and one that does not is host-side. Nothing
+is known to be broken on Windows.
+
+If you want it faster, in order of expected value:
+  1. Test on a native x86-64 Windows PC. If the hypothesis in section 2 holds,
+     the 5x disappears and the oracle becomes pleasant to use.
+  2. The diagnostic logging is unconditional and heavy -- [FILE], [PATH] and
+     [KERNEL] lines print on every call with an fflush. Windows emits ~25 log
+     lines per guest loop iteration against macOS's 4.3.
+  3. The VEH trap now has per-page fault counters (commit 996f84c); a run with
+     them says how much of the cost is the MMIO guard rather than translation.
+     That number has never existed on this host.
+
+
+5. RUNS BEHIND THIS
+===================
+  render-investigation/win-fbwindow-1   the 720 s Windows run, everything in
+                                        section 0 is from its stderr
+  render-investigation/mac-threshold-1  macOS with RECOMP_REPORT_MS=2000, which
+                                        pins the title crossover to a loop count
+  render-investigation/win-bisect-1,
+  render-investigation/mac-bisect-1     the 583-site func_hit sweep behind the
+                                        loop-rate figures

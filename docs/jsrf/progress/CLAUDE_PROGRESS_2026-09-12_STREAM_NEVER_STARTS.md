@@ -2,6 +2,12 @@
 
 Date: 2026-09-12 (Europe/London)
 
+> **RETIRED THE SAME EVENING.** Windows reaches gameplay, opens the BGM and
+> reports `on=5` — it needs 672 s, not 110. The runs behind this note were
+> too short and the hosts were compared at equal wall-clock time instead of
+> equal guest main-loop count. See
+> `CLAUDE_HANDOVER_2026-09-12_WINDOWS_REACHES_GAMEPLAY.txt`.
+>
 > **CORRECTED LATER THE SAME DAY.** The measurements below are sound; the
 > conclusion drawn from them was pitched one level too low. The Windows oracle
 > **never reaches gameplay** -- 0 of the 17 CPlayer gameplay functions ever
