@@ -1,4 +1,25 @@
-# How CrossOver exposes a controller, and why our Windows build cannot see one
+# How CrossOver exposes a controller
+
+**CORRECTED 2026-09-12, later.** Two pads have now been measured on both hosts
+and the picture is better than this note first said:
+
+| pad | macOS (SDL) | Windows (CrossOver) |
+|---|---|---|
+| DualShock 4 (054C:09CC) | works | works, but only via the DirectInput fallback added in 0d60248 -- XInput reports 1167 |
+| Xbox Series X wired, PowerA (20D6:2062) | works, "Xbox Series X Controller" | **works natively via XInput**, ports 0 and 1 report CONNECTED |
+
+So an Xbox-layout pad is the better choice for the CrossOver build: it needs no
+fallback and lands on the path the code always had.
+
+A claim in an earlier draft of this file was WRONG and is retracted: that the
+PowerA unit speaks GIP and so cannot appear as a HID gamepad on macOS. It does
+appear -- `ioreg -c IOHIDDevice` shows `"Product" = "Controller"` with
+PrimaryUsagePage 1, PrimaryUsage 5, which is Generic Desktop / Game Pad. The
+reading that produced the wrong conclusion was a single `0 joystick(s) seen`
+line taken before SDL had hotplugged the device; the very next run showed
+`port 0: Xbox Series X Controller (opened)`, 844 of 844 polls connected. One
+sample, before a hotplug had settled, is not a measurement.
+
 
 Date: 2026-09-12 (Europe/London)
 Measured with a DualShock 4 attached to the Mac by USB.
