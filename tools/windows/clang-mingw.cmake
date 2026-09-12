@@ -31,3 +31,13 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_C_STANDARD_LIBRARIES
     "-lwinpthread -lgdi32 -luser32 -lkernel32 -ladvapi32 -lole32 -loleaut32 -luuid -lshell32 -lwinmm -lws2_32"
     CACHE STRING "" FORCE)
+
+# The static libraries are mutually dependent -- xbox_usb calls into
+# xbox_kernel (xbox_AllocThreadTib, xbox_GetConnectedInterrupt) and the kernel
+# calls back into the device models. GNU ld is single pass, and clang's driver
+# does not group the archives the way gcc's spec happens to, so a reference
+# that appears in a library already scanned is simply undefined. Grouping makes
+# the link order-independent, which is what a set of co-dependent archives
+# needs; it costs a little link time and nothing else.
+set(CMAKE_C_LINK_EXECUTABLE
+    "<CMAKE_C_COMPILER> <FLAGS> <CMAKE_C_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> -Wl,--start-group <LINK_LIBRARIES> -Wl,--end-group")
