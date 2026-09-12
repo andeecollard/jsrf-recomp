@@ -2589,6 +2589,10 @@ uint32_t g_xbox_image_hi = 0;
 /* Global registers for recompiled code (via recomp_types.h) */
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+/* Size of the image's TLS block, as the loader built it. Zero until the XBE
+ * is loaded, and zero for an image with no TLS directory. */
+uint32_t g_image_tls_total;
+
 RECOMP_TLS uint32_t g_fs_base = XBOX_PRIMARY_TIB_VA;
 
 #ifdef RECOMP_ABI_CHECK
@@ -3375,6 +3379,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 uint32_t init_size  = (data_end > data_start)
                                     ? data_end - data_start : 0;
                 uint32_t total      = ((init_size + zero_fill + 0xF) & ~0xFu) + 4;
+
+                /* Published so a thread created OUTSIDE the guest --
+                 * ohci_thread, which runs the title's own USB ISR -- can build
+                 * a TLS block the same size the loader built here. It was a
+                 * local, so xbox_AllocThreadTib had nothing to size itself
+                 * from and could not be written at all. */
+                g_image_tls_total = total;
 
                 memset(XBOX_VA(FAKE_TLS_BLOCK_VA), 0, total);
                 memset(XBOX_VA(FAKE_TLS_THREAD_VA), 0, 64);

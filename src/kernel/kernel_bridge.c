@@ -2244,26 +2244,35 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
     return (vector < BRIDGE_MAX_INTERRUPTS) ? g_interrupts[vector] : 0;
 }
 
-/* THE OTHER HALF IS DELIBERATELY NOT WRITTEN HERE.
+/* xbox_AllocThreadTib IS STILL NOT DEFINED HERE, AND NOW THERE IS A MEASUREMENT.
  *
- * src/usb/ohci.c also calls xbox_AllocThreadTib(), which this tree likewise
- * does not define. It is NOT a copy-paste from upstream: upstream builds the
- * block from g_tls_total / g_tls_template_va / g_tls_thread_size, and this
- * tree has none of those -- our loader lays the per-thread block out
- * differently and keeps its size in a local, so there is no accessor for it.
+ * src/usb/ohci.c calls it; this tree does not define it; upstream does, from
+ * g_tls_total / g_tls_template_va / g_tls_thread_size, none of which exist
+ * here because our loader lays the per-thread block out differently. The
+ * loader's size is now published as g_image_tls_total, so the obvious version
+ * became writable:
  *
- * The shape it has to match is PsCreateSystemThreadEx's, above: a stack from
- * xbox_AllocThreadStack, then xbox_HeapAlloc(0x30, 16) for the TIB,
- * xbox_HeapAlloc(0x2C, 16) for the TLS context and one sized to the image's
- * TLS total for the data, then xbox_SetupCurrentThreadTib. Doing that needs
- * the loader's TLS total exported, which is a real change to thread setup.
+ *     stack = xbox_AllocThreadStack(0);
+ *     tib   = xbox_HeapAlloc(0x30, 16);
+ *     ctx   = xbox_HeapAlloc(0x2C, 16);
+ *     data  = xbox_HeapAlloc(g_image_tls_total, 16);
+ *     xbox_SetupCurrentThreadTib(tib, ctx, data, g_image_tls_total, ...);
  *
- * Writing it blind is the wrong move and was not attempted: with no controller
- * attached (connected=0 on both hosts) a wrong TIB and a right one look
- * identical from the outside, so it cannot be validated by behaviour -- and a
- * host thread running a guest ISR on a mis-shaped TIB is exactly the class of
- * corruption this project keeps paying for. Export the TLS total first, then
- * mirror the pattern above, then verify with a pad actually plugged in. */
+ * It was written, built on both hosts, and it WEDGES WINDOWS. With
+ * RECOMP_USB=1 and a pad attached the guest hangs with
+ * "[ADX] tick STUCK at 1 (flag=0)" and never advances; the same run on the
+ * binary without it is fine, and USB-on runs before it showed no STUCK line at
+ * all. So defining this is what breaks it, not RECOMP_USB.
+ *
+ * Prime suspect, unproven: those allocators. ohci_thread starts during init
+ * and calls xbox_AllocThreadStack and xbox_HeapAlloc from a HOST thread while
+ * the guest is allocating on its own; if the guest heap is not thread-safe --
+ * and nothing here says it is -- the two corrupt each other and everything
+ * downstream stalls. That is checkable: pre-allocate the TIB, stack and TLS
+ * block on the main thread before ohci_thread is created, and hand them over.
+ *
+ * Do not re-add the naive version. It builds, it links, it looks right, and it
+ * stops the title. */
 
 static uint32_t bridge_run_isr(uint32_t interrupt_va)
 {

@@ -599,6 +599,9 @@ uint32_t xbox_AllocThreadStack(uint32_t bytes);
 
 /* Install the per-thread Xbox FS/TIB state used by generated FS_MEM accesses.
  * tls_data_size is the value passed to PsCreateSystemThreadEx. */
+/* Size of the image's TLS block as the loader built it; 0 before load. */
+extern uint32_t g_image_tls_total;
+
 void xbox_SetupCurrentThreadTib(uint32_t tib_va, uint32_t tls_context_va,
                                uint32_t tls_data_va, uint32_t tls_data_size,
                                uint32_t stack_top, uint32_t stack_limit);
