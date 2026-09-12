@@ -1793,6 +1793,8 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
     uint8_t op;
     uint32_t written, before, after;
     unsigned width = 4;
+    int opsize16 = 0;
+    int rmw = 0;
     uintptr_t page = ((uintptr_t)fault) & ~(uintptr_t)(g_nv2a_page_size - 1);
     DWORD old_prot;
 
@@ -1819,8 +1821,10 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
         InterlockedIncrement(&g_veh_watch);
 
     ip = (const uint8_t *)(uintptr_t)ctx->Rip;
-    while (ip[len] == 0x66 || ip[len] == 0x67 || ip[len] == 0xF2 || ip[len] == 0xF3)
+    while (ip[len] == 0x66 || ip[len] == 0x67 || ip[len] == 0xF2 || ip[len] == 0xF3) {
+        if (ip[len] == 0x66) opsize16 = 1;
         len++;
+    }
     if ((ip[len] & 0xF0) == 0x40) { rex_r = (ip[len] >> 2) & 1; rex_b = ip[len] & 1; len++; }
     op = ip[len];
 
@@ -1844,6 +1848,57 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
         written = ip[len + 1 + ml];
         width = 1;
         ilen = len + 1 + ml + 1;
+    } else if (op == 0x81 || op == 0x83) {
+        /* Read-modify-write against a guarded page: `or [mem], imm` and
+         * `and [mem], imm`.
+         *
+         * This handler completed plain stores only, which made the guard
+         * depend on how the compiler spelled `|=`. GCC emits load / or /
+         * store, so the store decoded as 0x89 and everything worked; clang
+         * emits `orl $imm, mem` and the page died on the first access. That
+         * cost a whole Windows build -- xbox_memory_layout.c itself does
+         *
+         *     *(volatile uint32_t *)(mcpx + MCPX_AC97_CODEC_STATUS)
+         *         |= MCPX_AC97_CODEC_READY;
+         *
+         * two thousand lines after it guards that page, so the process died
+         * in its own init before a single guest instruction ran.
+         *
+         * Folding the current value in here and handing the RESULT to the
+         * paths below makes clang produce exactly the inputs GCC's
+         * load/or/store already produced -- the write-clear mask, the
+         * write-1-to-clear registers and the summary follow-down all see the
+         * same value they saw before. That equivalence is the reason to do it
+         * at this point rather than anywhere later.
+         *
+         * The read is safe: these pages are guarded PAGE_READONLY -- the code
+         * below already reads `before` from the faulting address before it
+         * unprotects anything. */
+        int ml = nv2a_modrm_len(&ip[len + 1], rex_b);
+        unsigned ext = (unsigned)((ip[len + 1] >> 3) & 7);
+        const uint8_t *imm = &ip[len + 1 + ml];
+        uint32_t operand, current;
+
+        if (opsize16) {          /* 16-bit forms are not worth guessing at */
+            InterlockedIncrement(&g_veh_undecoded);
+            return 0;
+        }
+        if (op == 0x83) {
+            operand = (uint32_t)(int32_t)(int8_t)imm[0];
+            ilen = len + 1 + ml + 1;
+        } else {
+            operand = (uint32_t)(imm[0] | (imm[1] << 8) | (imm[2] << 16)
+                                 | ((uint32_t)imm[3] << 24));
+            ilen = len + 1 + ml + 4;
+        }
+        current = *(volatile uint32_t *)fault;
+        if (ext == 1)        written = current | operand;   /* OR  /1 */
+        else if (ext == 4)   written = current & operand;   /* AND /4 */
+        else {
+            InterlockedIncrement(&g_veh_undecoded);
+            return 0;
+        }
+        rmw = 1;
     } else {
         InterlockedIncrement(&g_veh_undecoded);
         return 0;
@@ -1855,7 +1910,7 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
      * the only place it can be done. Same table and same rule the AArch64
      * branch applies in mcpx_apply_write_clear; without it this host hangs in
      * DirectSound init forever. */
-    {
+    if (!rmw) {
         uint32_t off = guest_va - XBOX_MCPX_BASE;
         size_t k;
         for (k = 0; k < sizeof(MCPX_WRITE_CLEAR)/sizeof(MCPX_WRITE_CLEAR[0]); k++)
@@ -1904,9 +1959,21 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
     /* Both interrupt status registers are write-1-to-clear. PGRAPH_INTR is how
      * the guest acknowledges a software-method notify, so without this the
      * notify stands for ever and the second one is never raised. */
-    after  = (guest_va == XBOX_NV2A_PCRTC_INTR_0
-              || guest_va == XBOX_NV2A_PGRAPH_INTR) ? (before & ~written)
-                                                    : written;
+    /* A read-modify-write states the intended FINAL value, so the device
+     * transforms above it must not be applied a second time.
+     *
+     * Learned the expensive way. Host code raises an interrupt with
+     * `PGRAPH_INTR |= bit`; folding the current value in gives
+     * written = before|bit, and the write-1-to-clear rule then computes
+     * before & ~(before|bit) == 0 -- so the raise became a clear, the summary
+     * never followed it up, and the pusher sat in [PB-NOTIFY] waiting for a
+     * notify that had been erased on its way in. `pmc=00000000 intr=00100000`
+     * is what that looks like. Write-1-to-clear is what a guest STORE of a
+     * bit pattern means; it is not what `or` means. */
+    after  = rmw ? written
+                 : ((guest_va == XBOX_NV2A_PCRTC_INTR_0
+                     || guest_va == XBOX_NV2A_PGRAPH_INTR) ? (before & ~written)
+                                                           : written);
 
     if (VirtualProtect((LPVOID)page, g_nv2a_page_size,
                        PAGE_READWRITE, &old_prot)) {
