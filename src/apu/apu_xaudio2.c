@@ -25,7 +25,26 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+
+/* Ring slots, and how many may be outstanding at once. They are deliberately
+ * NOT the same number.
+ *
+ * This was 3 slots with 3 allowed queued -- about 64 ms of audio. That is
+ * tight on bare metal and hopeless under CrossOver, where a scheduling hiccup
+ * longer than 64 ms means xa2_submit_samples finds the queue full and DROPS
+ * the block outright: twenty-one milliseconds of sound simply gone. Measured
+ * in a JSRF run: 3,496 dropped blocks, and the output stage delivering
+ * 43,750 Hz against the model's 48,000 -- nine percent of the audio missing,
+ * which is what "very glitchy" sounds like. macOS, whose SDL2 sink queues far
+ * more, reports gen_hz=48004 on the same content.
+ *
+ * More slots than the queue limit also fixes a second bug that had not bitten
+ * yet: g_xa2_next_buf advances round-robin over the slots, so with slots ==
+ * limit a slot could be handed to XAudio2 again while it was still reading it.
+ * With twice as many slots as may be queued, a slot always completes before it
+ * comes round again. */
+#define XA2_NUM_BUFS      16     /* ring slots */
+#define XA2_MAX_QUEUED     8     /* ~170 ms outstanding */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -104,7 +123,7 @@ int xa2_init(void)
     g_xa2_frames_written = 0;
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+            XA2_SAMPLE_RATE, XA2_MAX_QUEUED, XA2_BUF_SAMPLES);
     return 1;
 
 fail:
@@ -155,7 +174,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) { g_xa2_drop_inactive++; return 0; }
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { g_xa2_drop_full++; return 0; }
+    if ((int)state.BuffersQueued >= XA2_MAX_QUEUED) { g_xa2_drop_full++; return 0; }
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
