@@ -1,0 +1,134 @@
+JSRF HANDOVER -- THE BIGGEST COST IS THE TLS LOOKUP, AND THE TOOLCHAIN CHOOSES IT
+Date: 2026-09-12 (Europe/London), late
+From: Claude.
+
+Follows CLAUDE_HANDOVER_2026-09-12_WINDOWS_REACHES_GAMEPLAY.txt, which stands.
+That one said both hosts reach gameplay and Windows is ~5x slower. This one
+says why BOTH hosts are slow, which is a different and larger question.
+
+
+0. THE MEASUREMENT
+==================
+Profiled macOS with RECOMP_METAL unset -- the same CPU path Windows runs,
+natively, where `sample` works:
+
+    _tlv_get_addr                      ~5250 of the main guest thread's 7021
+    combine                             3022
+    nv2a_texture_copy_triangle_depth    2029
+    sub_0013B180 (guest, ADX)           1933
+    texel                               1055
+
+ABOUT 75% OF THE MAIN GUEST THREAD IS THE THREAD-LOCAL LOOKUP. More than the
+rasteriser, the combiner and the ADX decoder together.
+
+The generated code is `#define eax g_eax` over a thread-local register set, so
+every guest register read and write is one TLS access.
+
+
+1. IT IS A TOOLCHAIN ARTEFACT, NOT UPSTREAM'S DESIGN
+====================================================
+Upstream declares the registers exactly as we do, RECOMP_TLS, with _MSC_VER
+checked first, and upstream's README requires Visual Studio 2022 and supports
+Windows+MSVC+D3D11 or Linux+GCC+OpenGL. On MSVC, __declspec(thread) is a
+TEB-relative load and costs nothing.
+
+We run neither supported configuration:
+
+    Windows   mingw-w64 defines __GNUC__, so it takes __thread, and GCC
+              implements __thread on that target with EMULATED TLS --
+              __emutls_get_address(), a real call per access. 145 emutls
+              symbols in the exe.
+    macOS     Darwin has no ELF TLS models. __thread always goes through the
+              tlv descriptor and _tlv_get_addr in libdyld, and -ftls-model= is
+              silently a no-op. There is no flag that fixes this.
+
+
+2. CLANG FIXES THE WINDOWS HALF, AND NEEDS NO WINDOWS MACHINE
+=============================================================
+Same mingw sysroot, same headers, same libraries, same source. Only the
+compiler changes:
+
+    x86_64-w64-mingw32-gcc   ->  __emutls_get_address, __emutls_v.g_eax
+    clang --target=x86_64-w64-windows-gnu  ->  _tls_index   (native, TEB)
+
+Verified on the real build, not a toy: tools/windows/clang-mingw.cmake
+produces jsrf_first_fault.exe with 145 -> 0 emutls symbols.
+
+Three things clang's driver does not do that GCC's does, all handled in that
+toolchain file:
+  * it drives the host ld -- point -fuse-ld at x86_64-w64-mingw32-ld
+  * it does not add libgcc's directory -- -L .../lib/gcc/x86_64-w64-mingw32/<v>
+  * it links no default libraries -- winpthread (for clock_gettime64, which
+    mingw's pthread_time.h inlines a call to) and the usual Win32 import libs,
+    and they must go in CMAKE_C_STANDARD_LIBRARIES so they land AFTER the
+    objects, not in the linker flags where the archives are scanned too early.
+
+
+3. WHERE IT STOPS, AND IT IS ONE CONTAINED BUG
+==============================================
+The clang exe builds and runs the whole memory layout, then dies on the first
+guest fault:
+
+    HOST FAULT ADDRESS 0x0000000100C00130   (the AC97 codec status register)
+    LAST INSTRUMENTED GUEST FUNCTION sub_00000000   (none -- still in init)
+
+xbox_memory_layout.c does, long after the AC97 page is guarded read-only:
+
+    *(volatile uint32_t *)((char *)g_mcpx_memory + MCPX_AC97_CODEC_STATUS)
+        |= MCPX_AC97_CODEC_READY;
+
+That is a read-modify-write against a guarded page. The VEH decoder in
+xbox_Nv2aHandleWin32Fault completes PLAIN STORES ONLY -- 0x89, 0xC7, 0x88,
+0xC6. GCC spells the |= as load / or / store, so the store decodes and the
+handler completes it. Clang emits `or [mem], imm`, which the decoder rejects,
+returns 0, and the process dies.
+
+So the guard has always been compiler-dependent; GCC merely happened to spell
+it in the one form the decoder knows.
+
+THE FIX IS THE DECODER, NOT THE CALL SITE. Moving the write earlier does not
+help -- tried, and it only moves the fault, because the AC97 guard goes up at
+xbox_memory_layout.c:2040 and this write is at ~3500. Add the read-modify-write
+forms (0x81 /1 and 0x83 /1 for OR, and whatever else the codebase actually
+emits) to the decoder, computing the new value from the current one and then
+completing it with the existing store path. The undecoded counter added in
+commit 996f84c will tell you if anything else is being silently rejected --
+that counter is why this was findable at all.
+
+
+4. WHAT THIS IS WORTH
+=====================
+If the ~75% figure carries, removing the TLS lookup is worth roughly a 3-4x on
+the guest thread, on BOTH hosts, and it is larger than the GPU-rasteriser gap
+of the previous handover. Order of work:
+
+  1. Extend the VEH decoder (section 3). Small, and it unblocks the clang
+     Windows build, which is native TLS for free.
+  2. Measure the clang build against the GCC baseline: 203 loops @30s,
+     421 @60s, 782 @90s. That is the A/B for the whole hypothesis.
+  3. macOS needs a different fix -- there is no fast __thread on Darwin. The
+     real answer is to stop doing a lookup per access: hand each generated
+     function a register-context pointer on entry and index through it. That is
+     a translator change or a mechanical edit of the gen tree, and it is the
+     single largest measured win available.
+
+RECOMP_TLS is now overridable by the build (-DRECOMP_TLS=) for bounding
+experiments. Plain globals crash, as they must -- guest threads share the
+register set -- so the profile stays the measurement.
+
+TRIED AND REVERTED, so nobody pays for it twice: keying RECOMP_TLS on _WIN32 so
+mingw-gcc takes __declspec(thread). emutls drops 145 -> 16 but the title exits
+through HalReturnToFirmware within sixteen file opens. Native PE TLS wants its
+directory and per-thread init; gcc's mingw path does not give the harness that.
+Clang is the better route and is already proven to emit native TLS.
+
+
+5. BUILD IT
+===========
+  cmake -S diagnostics/jsrf_first_fault -B <build> \
+    -DCMAKE_TOOLCHAIN_FILE=tools/windows/clang-mingw.cmake \
+    -DRECOMP_GEN_DIR=<gen> -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-DXBOX_WORKER_STACK_COUNT=4"
+
+tools/windows/gcc-mingw.cmake is the working GCC toolchain, kept so the two can
+be compared without reconstructing either.
