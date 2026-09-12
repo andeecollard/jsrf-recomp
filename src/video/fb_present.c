@@ -25,6 +25,9 @@
 #include <stdint.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+/* The frame as it was AT the flip, not the surface being drawn into. */
+extern const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
+                                        uint32_t *pitch, uint32_t *bpp);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -55,12 +58,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 /* The display formats an Xbox front buffer is actually set to. The pitch says
  * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
  * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
+static uint32_t s_fb_pitch_used;
+
 static void fb_convert(const uint8_t *src, uint32_t bpp)
 {
     uint32_t x, y;
 
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * s_fb_pitch;
+        const uint8_t *row = src + (size_t)y * s_fb_pitch_used;
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
@@ -174,13 +179,43 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_fb_va && s_fb_pitch && s_rgb) {
-            const uint8_t *src =
-                (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+        /* Prefer the FLIP_STALL snapshot over live guest memory.
+         *
+         * Reading the surface the guest is drawing into, on a 16 ms timer with
+         * no flip synchronisation, catches it mid-draw -- and since a full
+         * screen image is two triangles, what you see is one half, then the
+         * other, tearing on a hard diagonal. It is unwatchable at the few
+         * frames a second the CPU rasteriser manages.
+         *
+         * nv2a_pb_exec_surface hands back s_snap, the copy taken AT the flip,
+         * which is a whole frame by construction. The POSIX presenter has
+         * always used it -- that is the entire reason macOS does not tear --
+         * and this one simply never asked. Falls back to the live surface when
+         * there is no snapshot yet, so the window still shows something during
+         * boot before the first flip. */
+        if (s_rgb) {
+            uint32_t sw = 0, sh = 0, spitch = 0, sbpp = 0;
+            const void *snap = nv2a_pb_exec_surface(&sw, &sh, &spitch, &sbpp);
+            const uint8_t *src = NULL;
+            uint32_t bpp = 0;
+
+            if (snap && sw == s_fb_width && sh == s_fb_height
+                     && (sbpp == 2 || sbpp == 4)) {
+                src = (const uint8_t *)snap;
+                bpp = sbpp;
+                s_fb_pitch_used = spitch;
+            } else if (s_fb_va && s_fb_pitch) {
+                src = (const uint8_t *)((uintptr_t)s_fb_va
+                                        + xbox_GetMemoryOffset());
+                bpp = s_fb_pitch / s_fb_width;
+                s_fb_pitch_used = s_fb_pitch;
+            }
+            if (src) {
+                fb_convert(src, bpp);
+                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                              0, 0, (int)s_fb_width, (int)s_fb_height,
+                              s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            }
         }
         {
             /* One dump, a few seconds in, so the title has had time to render
