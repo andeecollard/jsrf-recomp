@@ -22,6 +22,7 @@ XBE="$ROOT/../Jet Set Radio Future (US)/default.xbe"
 DIR="$ROOT/../Jet Set Radio Future (US)"
 START=$(date +%s)
 if [ "$HOST" = mac ]; then
+  RECOMP_USB=${ORACLE_USB:-} \
   RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
   RECOMP_REPORT_MS=600000 RECOMP_FUNC_HIT_TRACE=1 \
   RECOMP_OBJECT_DUMP="$OUT" RECOMP_OBJECT_DUMP_AT="$CLOCK" \
@@ -41,6 +42,7 @@ else
     printf '%s\n' 'set RECOMP_IRQ_THREAD=1'
     printf '%s\n' 'set RECOMP_PB_EXEC=1'
     printf '%s\n' 'set RECOMP_OHCI_ATTACH=1'
+    [ -n "$ORACLE_USB" ] && printf '%s\n' 'set RECOMP_USB=1'
     printf '%s\n' 'set RECOMP_REPORT_MS=600000'
     printf '%s\n' 'set RECOMP_FUNC_HIT_TRACE=1'
     printf 'set RECOMP_OBJECT_DUMP=%s\n' "$(W "$OUT")"

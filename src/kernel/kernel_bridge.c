@@ -2099,6 +2099,8 @@ static RECOMP_TLS int g_in_isr;
 static RECOMP_TLS uint32_t g_pending_dpc;
 static RECOMP_TLS uint32_t g_pending_dpc_sys1;
 static RECOMP_TLS uint32_t g_pending_dpc_sys2;
+static volatile LONG g_isr_handoff_seq;
+static RECOMP_TLS LONG g_current_isr_handoff;
 
 /* Connected interrupts.
  *
@@ -2225,11 +2227,50 @@ static void bridge_KeConnectInterrupt(void)
 /* Call a guest ISR: BOOLEAN (__stdcall *)(PKINTERRUPT, PVOID ServiceContext).
  * Same mechanism as bridge_run_dpc, and it reuses the same g_in_dpc guard so
  * an ISR cannot be entered from inside a DPC or another ISR. */
+/* The KINTERRUPT a title connected on a vector, or 0.
+ *
+ * src/usb/ohci.c has declared and called this since it was written, and
+ * NOTHING IN THIS TREE DEFINED IT. Upstream does, at kernel_bridge.c:2087 over
+ * its own g_connected_isr table; we diverged, kept our own g_interrupts, and
+ * lost the accessor. Nobody noticed because the only caller is ohci_call_isr,
+ * which -O2 drops as unreachable along with ohci_thread -- so the OHCI service
+ * path has not been linked into either host's binary, and the link only broke
+ * when something finally referenced enough of ohci.c to keep those functions.
+ *
+ * Same contract as upstream's: the routine and its context are at +0 and +4 of
+ * the returned KINTERRUPT. */
+uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
+{
+    return (vector < BRIDGE_MAX_INTERRUPTS) ? g_interrupts[vector] : 0;
+}
+
+/* THE OTHER HALF IS DELIBERATELY NOT WRITTEN HERE.
+ *
+ * src/usb/ohci.c also calls xbox_AllocThreadTib(), which this tree likewise
+ * does not define. It is NOT a copy-paste from upstream: upstream builds the
+ * block from g_tls_total / g_tls_template_va / g_tls_thread_size, and this
+ * tree has none of those -- our loader lays the per-thread block out
+ * differently and keeps its size in a local, so there is no accessor for it.
+ *
+ * The shape it has to match is PsCreateSystemThreadEx's, above: a stack from
+ * xbox_AllocThreadStack, then xbox_HeapAlloc(0x30, 16) for the TIB,
+ * xbox_HeapAlloc(0x2C, 16) for the TLS context and one sized to the image's
+ * TLS total for the data, then xbox_SetupCurrentThreadTib. Doing that needs
+ * the loader's TLS total exported, which is a real change to thread setup.
+ *
+ * Writing it blind is the wrong move and was not attempted: with no controller
+ * attached (connected=0 on both hosts) a wrong TIB and a right one look
+ * identical from the outside, so it cannot be validated by behaviour -- and a
+ * host thread running a guest ISR on a mis-shaped TIB is exactly the class of
+ * corruption this project keeps paying for. Export the TLS total first, then
+ * mirror the pattern above, then verify with a pad actually plugged in. */
+
 static uint32_t bridge_run_isr(uint32_t interrupt_va)
 {
     uint32_t routine, context;
     recomp_func_t fn;
     uint32_t isr_result = 0;
+    int handoff_trace = 0;
 
     routine = BRIDGE_MEM32(interrupt_va + 0);
     context = BRIDGE_MEM32(interrupt_va + 4);
@@ -2249,6 +2290,20 @@ static uint32_t bridge_run_isr(uint32_t interrupt_va)
 
     {
         BridgeGuestRegs saved;
+        if (getenv("RECOMP_PGRAPH_ISR_TRACE") &&
+            BRIDGE_MEM32(interrupt_va + 8) == BRIDGE_NV2A_VECTOR) {
+            g_current_isr_handoff = InterlockedIncrement(&g_isr_handoff_seq);
+            /* A healthy render loop executes this thousands of times. Keep
+             * the first handoffs and occasional progress markers without
+             * turning a short diagnostic run into hundreds of megabytes. */
+            handoff_trace = g_current_isr_handoff <= 16 ||
+                            (g_current_isr_handoff % 1000) == 0;
+        }
+        if (handoff_trace) {
+            fprintf(stderr, "  [ISR-HANDOFF] #%ld guest-enter routine=%08X esp=%08X\n",
+                    g_current_isr_handoff, routine, g_esp);
+            fflush(stderr);
+        }
         bridge_save_regs(&saved);
         g_in_isr = 1;
         g_pending_dpc = 0;
@@ -2258,6 +2313,12 @@ static uint32_t bridge_run_isr(uint32_t interrupt_va)
         fn();
         g_in_isr = 0;
         isr_result = g_eax;
+        if (handoff_trace) {
+            fprintf(stderr,
+                    "  [ISR-HANDOFF] #%ld guest-return result=%02X pending-dpc=%08X\n",
+                    g_current_isr_handoff, isr_result & 0xFF, g_pending_dpc);
+            fflush(stderr);
+        }
         bridge_restore_regs(&saved);
     }
 
@@ -2288,8 +2349,20 @@ static uint32_t bridge_run_isr(uint32_t interrupt_va)
         uint32_t dpc = g_pending_dpc;
         uint32_t s1 = g_pending_dpc_sys1, s2 = g_pending_dpc_sys2;
         g_pending_dpc = 0;
+        if (handoff_trace) {
+            fprintf(stderr, "  [ISR-HANDOFF] #%ld dpc-enter dpc=%08X\n",
+                    g_current_isr_handoff, dpc);
+            fflush(stderr);
+        }
         bridge_run_dpc(dpc, s1, s2);
+        if (handoff_trace) {
+            fprintf(stderr, "  [ISR-HANDOFF] #%ld dpc-return\n",
+                    g_current_isr_handoff);
+            fflush(stderr);
+        }
     }
+
+    if (handoff_trace) g_current_isr_handoff = 0;
 
     return isr_result;
 }
@@ -2348,6 +2421,85 @@ unsigned long g_vblank_max_gap_ms;
 static DWORD  g_vblank_last_ms;
 static DWORD  g_vblank_first_ms;
 
+/* Does a pending PGRAPH software method still reach the guest ISR?
+ *
+ * jsrf_software_method deliberately blocks the pusher until the guest
+ * acknowledges the notify.  If submission stops there, totals alone cannot
+ * distinguish a guest handler that keeps running from a delivery path that
+ * has stopped being pumped or is stuck behind one of bridge_vblank_poll's
+ * gates.  Keep one counter for each gate and for the resulting handshake.
+ *
+ * RECOMP_PGRAPH_ISR_TRACE is diagnostic only.  xbox_PgraphIrqReport is called
+ * by the harness's existing two-second "waiting" report, so a completely
+ * silent poll path is observable too. */
+static volatile LONG g_pgraph_poll_calls;
+static volatile LONG g_pgraph_pending_polls;
+static volatile LONG g_pgraph_tls_skips;
+static volatile LONG g_pgraph_interlock_skips;
+static volatile LONG g_pgraph_no_vector;
+static volatile LONG g_pgraph_pmc_blocked;
+static volatile LONG g_pgraph_ctx_disabled;
+static volatile LONG g_pgraph_en_disabled;
+static volatile LONG g_pgraph_isr_dispatches;
+static volatile LONG g_pgraph_isr_handled;
+static volatile LONG g_pgraph_notify_acked;
+static volatile LONG g_pgraph_last_ctx_a0;
+static volatile LONG g_pgraph_last_ctx_b0;
+static volatile LONG g_pgraph_last_intr_en;
+
+void xbox_PgraphIrqReport(void)
+{
+    static LONG prev_poll, prev_pending, prev_tls, prev_interlock;
+    static LONG prev_no_vector, prev_pmc_blocked, prev_ctx_disabled;
+    static LONG prev_en_disabled, prev_dispatch;
+    static LONG prev_handled, prev_acked;
+    LONG poll, pending, tls, interlock, no_vector, pmc_blocked;
+    LONG ctx_disabled, en_disabled, dispatch, handled, acked;
+
+    if (!getenv("RECOMP_PGRAPH_ISR_TRACE")) return;
+
+    poll        = InterlockedCompareExchange(&g_pgraph_poll_calls, 0, 0);
+    pending     = InterlockedCompareExchange(&g_pgraph_pending_polls, 0, 0);
+    tls         = InterlockedCompareExchange(&g_pgraph_tls_skips, 0, 0);
+    interlock   = InterlockedCompareExchange(&g_pgraph_interlock_skips, 0, 0);
+    no_vector   = InterlockedCompareExchange(&g_pgraph_no_vector, 0, 0);
+    pmc_blocked = InterlockedCompareExchange(&g_pgraph_pmc_blocked, 0, 0);
+    ctx_disabled = InterlockedCompareExchange(&g_pgraph_ctx_disabled, 0, 0);
+    en_disabled = InterlockedCompareExchange(&g_pgraph_en_disabled, 0, 0);
+    dispatch    = InterlockedCompareExchange(&g_pgraph_isr_dispatches, 0, 0);
+    handled     = InterlockedCompareExchange(&g_pgraph_isr_handled, 0, 0);
+    acked       = InterlockedCompareExchange(&g_pgraph_notify_acked, 0, 0);
+
+    fprintf(stderr,
+            "  [PGRAPH-ISR] +poll=%ld +pending=%ld +tls-skip=%ld "
+            "+interlock-skip=%ld +no-vector=%ld +pmc-blocked=%ld "
+            "+ctx-off=%ld +en-off=%ld +dispatch=%ld +handled=%ld +acked=%ld "
+            "(last ctx-a0=%08lX ctx-b0=%08lX intr-en=%08lX; totals "
+            "dispatch=%ld acked=%ld)\n",
+            poll - prev_poll, pending - prev_pending, tls - prev_tls,
+            interlock - prev_interlock, no_vector - prev_no_vector,
+            pmc_blocked - prev_pmc_blocked, ctx_disabled - prev_ctx_disabled,
+            en_disabled - prev_en_disabled, dispatch - prev_dispatch,
+            handled - prev_handled, acked - prev_acked,
+            InterlockedCompareExchange(&g_pgraph_last_ctx_a0, 0, 0),
+            InterlockedCompareExchange(&g_pgraph_last_ctx_b0, 0, 0),
+            InterlockedCompareExchange(&g_pgraph_last_intr_en, 0, 0),
+            dispatch, acked);
+    fflush(stderr);
+
+    prev_poll = poll;
+    prev_pending = pending;
+    prev_tls = tls;
+    prev_interlock = interlock;
+    prev_no_vector = no_vector;
+    prev_pmc_blocked = pmc_blocked;
+    prev_ctx_disabled = ctx_disabled;
+    prev_en_disabled = en_disabled;
+    prev_dispatch = dispatch;
+    prev_handled = handled;
+    prev_acked = acked;
+}
+
 void xbox_VblankReport(void)
 {
     DWORD now = GetTickCount();
@@ -2367,10 +2519,22 @@ static void bridge_vblank_poll(void)
     static DWORD next_vblank = 0;
     DWORD now;
     int i;
+    int trace = getenv("RECOMP_PGRAPH_ISR_TRACE") != NULL;
+    int pending_at_entry = xbox_Nv2aSoftwareMethodPending();
 
-    if (g_in_dpc || g_in_isr) return;
+    if (trace) {
+        InterlockedIncrement(&g_pgraph_poll_calls);
+        if (pending_at_entry) InterlockedIncrement(&g_pgraph_pending_polls);
+    }
+
+    if (g_in_dpc || g_in_isr) {
+        if (trace && pending_at_entry) InterlockedIncrement(&g_pgraph_tls_skips);
+        return;
+    }
 
     if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) != 0) {
+        if (trace && pending_at_entry)
+            InterlockedIncrement(&g_pgraph_interlock_skips);
         return;
     }
 
@@ -2380,16 +2544,40 @@ static void bridge_vblank_poll(void)
      * display refresh events. Deliver them on the guest thread that pumps
      * interrupts, using its saved register/stack context. */
     if (xbox_Nv2aSoftwareMethodPending()) {
+        int vector_found = 0;
+        int pmc_ready = 0;
         for (i = 0; i < BRIDGE_MAX_INTERRUPTS; ++i) {
             uint32_t iv = __atomic_load_n(&g_interrupts[i], __ATOMIC_ACQUIRE);
             if (!iv) break;
             if (!bridge_interrupt_ready(iv)) continue;
             if (BRIDGE_MEM32(iv + 8) != BRIDGE_NV2A_VECTOR) continue;
+            vector_found = 1;
             uint32_t ctx = BRIDGE_MEM32(iv + 4);
             uint32_t base = ctx ? BRIDGE_MEM32(ctx) : 0;
-            if (base && (BRIDGE_MEM32(base + NV_PMC_INTR_0) & 0x1000u))
-                bridge_run_isr(iv);
+            if (base && (BRIDGE_MEM32(base + NV_PMC_INTR_0) & 0x1000u)) {
+                uint32_t handled;
+                pmc_ready = 1;
+                if (trace) {
+                    LONG ctx_a0 = (LONG)BRIDGE_MEM32(ctx + 0xA0);
+                    LONG ctx_b0 = (LONG)BRIDGE_MEM32(ctx + 0xB0);
+                    LONG intr_en = (LONG)BRIDGE_MEM32(base + NV_PMC_INTR_EN_0);
+                    InterlockedExchange(&g_pgraph_last_ctx_a0, ctx_a0);
+                    InterlockedExchange(&g_pgraph_last_ctx_b0, ctx_b0);
+                    InterlockedExchange(&g_pgraph_last_intr_en, intr_en);
+                    if (!ctx_a0) InterlockedIncrement(&g_pgraph_ctx_disabled);
+                    if (!intr_en) InterlockedIncrement(&g_pgraph_en_disabled);
+                    InterlockedIncrement(&g_pgraph_isr_dispatches);
+                }
+                handled = bridge_run_isr(iv);
+                if (trace && (handled & 0xFF))
+                    InterlockedIncrement(&g_pgraph_isr_handled);
+                if (trace && !xbox_Nv2aSoftwareMethodPending())
+                    InterlockedIncrement(&g_pgraph_notify_acked);
+            }
         }
+        if (trace && !vector_found) InterlockedIncrement(&g_pgraph_no_vector);
+        if (trace && vector_found && !pmc_ready)
+            InterlockedIncrement(&g_pgraph_pmc_blocked);
     }
 
     now = GetTickCount();
@@ -2542,10 +2730,21 @@ done:
  * pump, no interrupt, and the completion it is polling for can never arrive.
  *
  * Hardware does not work that way -- an interrupt arrives when the device
- * decides, not when the driver next blocks. This runs the same three pumps on
- * their own thread, which is exactly what ohci_thread already does for the USB
- * controller, and for the same stated reason: the guest register file is
- * thread-local, so anything calling recompiled code needs a thread of its own.
+ * decides, not when the driver next blocks. This runs the timer and non-GPU
+ * device pumps on their own thread, which is exactly what ohci_thread already
+ * does for the USB controller, and for the same stated reason: the guest
+ * register file is thread-local, so anything calling recompiled code needs a
+ * thread of its own.
+ *
+ * The GPU is deliberately different. Its ISR masks NV_PMC_INTR_EN_0 and queues
+ * a DPC which restores it. On Windows, running that translated pair on this
+ * synthetic guest stack eventually lost the restore and left the pusher
+ * blocked forever on a software-method notify. The macOS path already avoids
+ * that failure: bridge_KeWaitForSingleObject pumps bridge_vblank_poll on the
+ * real waiting guest thread, preserving the interrupted guest's scheduling
+ * context. Windows completed thousands of the same ISR/DPC handoffs when run
+ * that way. Keep RECOMP_IRQ_THREAD_GPU as a diagnostic escape hatch, not the
+ * normal RECOMP_IRQ_THREAD behaviour.
  *
  * The pumps are re-entrancy guarded already (g_vblank_delivery_active is a
  * process-wide interlock shared by all three), so this thread and a blocked
@@ -2604,12 +2803,20 @@ static DWORD WINAPI bridge_irq_thread(LPVOID unused)
 
     fprintf(stderr, "  [IRQ-THREAD] live; device interrupts no longer depend"
                     " on the guest blocking\n");
+    if (getenv("RECOMP_IRQ_THREAD_GPU")) {
+        fprintf(stderr, "  [IRQ-THREAD] synthetic GPU delivery enabled"
+                        " (diagnostic; may break the ISR/DPC handoff)\n");
+    } else {
+        fprintf(stderr, "  [IRQ-THREAD] GPU delivery remains on waiting guest"
+                        " threads\n");
+    }
     fflush(stderr);
 
     for (;;) {
         Sleep(1);
         bridge_timers_poll();
-        bridge_vblank_poll();
+        if (getenv("RECOMP_IRQ_THREAD_GPU"))
+            bridge_vblank_poll();
         bridge_device_irq_poll();
     }
 }
@@ -2786,8 +2993,16 @@ static void bridge_timers_poll(void)
     DWORD now;
     int i;
 
-    if (g_in_dpc) {
-        return;   /* a DPC is running on this thread; do not nest */
+    if (g_in_dpc || g_in_isr) {
+        /* A timer expires at DPC level; it cannot pre-empt an ISR.  Besides
+         * being the Xbox ordering rule, this is required by the bridge's ISR
+         * hand-off: JSRF masks NV_PMC_INTR_EN_0, then calls KeInsertQueueDpc
+         * to arrange the callback that restores it.  kernel_thunk_dispatch
+         * polls timers before entering that bridge.  Letting a timer DPC run
+         * there can strand the ISR inside an unrelated callback after it has
+         * masked the GPU interrupt but before KeInsertQueueDpc records the
+         * restore DPC. */
+        return;
     }
     now = GetTickCount();
     for (i = 0; i < BRIDGE_MAX_TIMERS; i++) {
@@ -2912,6 +3127,13 @@ static void bridge_KeInsertQueueDpc(void)
         g_pending_dpc = dpc_va;
         g_pending_dpc_sys1 = STACK_ARG(1);
         g_pending_dpc_sys2 = STACK_ARG(2);
+        if (getenv("RECOMP_PGRAPH_ISR_TRACE") && g_current_isr_handoff) {
+            fprintf(stderr,
+                    "  [ISR-HANDOFF] #%ld queue-dpc dpc=%08X sys1=%08X sys2=%08X\n",
+                    g_current_isr_handoff, dpc_va,
+                    g_pending_dpc_sys1, g_pending_dpc_sys2);
+            fflush(stderr);
+        }
         g_eax = 1;
         return;
     }
