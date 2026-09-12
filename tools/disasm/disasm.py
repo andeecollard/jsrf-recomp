@@ -4,6 +4,7 @@ Main disassembly orchestrator.
 Coordinates all analysis passes and produces the final output.
 """
 
+import os
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -39,7 +40,8 @@ class Disassembler:
                  force: bool = False,
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
-                 function_bounds: Optional[list] = None):
+                 function_bounds: Optional[list] = None,
+                 seed_provenance: Optional[dict] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -50,6 +52,7 @@ class Disassembler:
         self.extra_sections = extra_sections or []
         self.seed_functions = seed_functions or []
         self.function_bounds = function_bounds or []
+        self.seed_provenance = seed_provenance or {}
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -164,6 +167,7 @@ class Disassembler:
         # Declared extents, before any pass runs: they are what the seed
         # demotion tests against as well as being unsplittable themselves.
         self.func_detector._forced_bounds = list(self.function_bounds)
+        self.func_detector._seed_provenance = dict(self.seed_provenance)
 
         # Add seed functions from vtable scanner or other sources.
         #
@@ -255,6 +259,20 @@ class Disassembler:
                           f"{undecodable} undecodable")
 
         num_funcs = self.func_detector.detect_all(sections)
+
+        # The drop report is evidence, not a side effect: an interior seed that
+        # something really references is the subset that needs a secondary
+        # entry, and it is only visible here.
+        dropped = getattr(self.func_detector, "dropped_seeds", None)
+        kept = getattr(self.func_detector, "kept_interior_seeds", None)
+        if dropped is not None or kept is not None:
+            import json as _json
+            os.makedirs(self.output_dir, exist_ok=True)
+            _path = os.path.join(self.output_dir, "interior_seeds.json")
+            with open(_path, "w") as _f:
+                _json.dump({"dropped": dropped or [], "kept": kept or []},
+                           _f, indent=2)
+            print(f"  Wrote {_path}")
         if self.verbose:
             summary = self.func_detector.summary()
             print(f"  Total functions: {num_funcs:,d}")

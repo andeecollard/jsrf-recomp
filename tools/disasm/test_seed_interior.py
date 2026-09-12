@@ -37,11 +37,27 @@ class _Section:
 
 
 class _Image:
+    entry_point = 0x00011000
+
     def get_section_at_va(self, addr):
         return _Section()
 
 
-def _detector(bodies, candidates, forced=(), natural=None):
+class _Ref:
+    def __init__(self, kind):
+        self.xref_type = type("K", (), {"value": kind})()
+
+
+class _Xrefs:
+    def __init__(self, refs):
+        self._refs = refs or {}
+
+    def get_refs_to(self, addr):
+        return [_Ref(k) for k in self._refs.get(addr, [])]
+
+
+def _detector(bodies, candidates, forced=(), natural=None,
+              refs=None, provenance=None):
     """`bodies` are the functions as built; `natural` their true extents.
 
     natural maps a start to what _find_function_end returns when it is not
@@ -53,6 +69,8 @@ def _detector(bodies, candidates, forced=(), natural=None):
     det._alias_entries = {}
     det._forced_bounds = list(forced)
     det.image = _Image()
+    det.xrefs = _Xrefs(refs)
+    det._seed_provenance = dict(provenance or {})
     natural = natural or {}
     det._find_function_end = lambda start, nxt, sec: natural.get(
         start, dict(bodies).get(start, start))
@@ -82,8 +100,13 @@ class SeedInteriorTest(unittest.TestCase):
                         {0x00037587: SEED},
                         natural={0x00037550: 0x00037960})
         det._pass_demote_interior_seeds([])
+        # Dropped, not aliased: no start and no second body. Aliasing was the
+        # previous repair and it SIGBUSed, because an alias runs the owner's
+        # epilogue without having run its prologue.
         self.assertNotIn(0x00037587, det._candidates)
-        self.assertEqual(det._alias_entries[0x00037587], 0x00037960)
+        self.assertEqual(det._alias_entries, {})
+        self.assertEqual(det.dropped_seeds[0]["reference_class"],
+                         "unreferenced")
 
     def test_a_seed_in_a_gap_still_starts_a_function(self):
         # The legitimate use: a thunk the detector never reached.
@@ -116,7 +139,8 @@ class SeedInteriorTest(unittest.TestCase):
                         natural={0x00037550: 0x00037960})
         det._pass_demote_interior_seeds([])
         self.assertEqual(det._candidates, {})
-        self.assertEqual(sorted(det._alias_entries), sorted(seeds))
+        self.assertEqual(det._alias_entries, {})
+        self.assertEqual(len(det.dropped_seeds), 4)
 
     def test_a_declared_extent_protects_a_body_the_sweep_missed(self):
         # The XenonRecomp escape hatch: the analyser cannot resolve a function
@@ -126,7 +150,55 @@ class SeedInteriorTest(unittest.TestCase):
                         forced=[(0x00154D70, 0x00154E00)])
         det._pass_demote_interior_seeds([])
         self.assertNotIn(0x00154D82, det._candidates)
-        self.assertEqual(det._alias_entries[0x00154D82], 0x00154E00)
+        self.assertEqual(det._alias_entries, {})
+
+    def test_a_direct_call_target_is_kept_and_reported(self):
+        # Something really calls it, so removing the start would leave that
+        # call unresolved. This is the subset that needs a secondary entry.
+        det = _detector([(0x00037550, 0x00037960)], {0x00037587: SEED},
+                        natural={0x00037550: 0x00037960},
+                        refs={0x00037587: ["call"]})
+        det._pass_demote_interior_seeds([])
+        self.assertIn(0x00037587, det._candidates)
+        self.assertEqual(det.dropped_seeds, [])
+        self.assertEqual(det.kept_interior_seeds[0]["reference_class"],
+                         "direct_call")
+
+    def test_a_measured_indirect_target_is_kept(self):
+        # icall_targets.json is a record of the title actually branching there.
+        det = _detector([(0x00037550, 0x00037960)], {0x00037587: SEED},
+                        natural={0x00037550: 0x00037960},
+                        provenance={0x00037587: ["icall_targets.json"]})
+        det._pass_demote_interior_seeds([])
+        self.assertIn(0x00037587, det._candidates)
+        self.assertEqual(det.kept_interior_seeds[0]["reference_class"],
+                         "indirect_target")
+
+    def test_an_address_taken_as_data_is_kept(self):
+        # A vtable slot names a function by address; the branch is invisible.
+        det = _detector([(0x00037550, 0x00037960)], {0x00037587: SEED},
+                        natural={0x00037550: 0x00037960},
+                        refs={0x00037587: ["data_imm"]})
+        det._pass_demote_interior_seeds([])
+        self.assertIn(0x00037587, det._candidates)
+
+    def test_the_entry_point_is_never_dropped(self):
+        det = _detector([(0x00010F00, 0x00012000)], {0x00011000: SEED},
+                        natural={0x00010F00: 0x00012000})
+        det._pass_demote_interior_seeds([])
+        self.assertIn(0x00011000, det._candidates)
+        self.assertEqual(det.kept_interior_seeds[0]["reference_class"],
+                         "entry_point")
+
+    def test_a_branch_only_target_is_an_interior_label(self):
+        # Reached only from inside the owner: that is a label, not a function.
+        det = _detector([(0x00037550, 0x00037960)], {0x00037587: SEED},
+                        natural={0x00037550: 0x00037960},
+                        refs={0x00037587: ["cond_jump"]})
+        det._pass_demote_interior_seeds([])
+        self.assertNotIn(0x00037587, det._candidates)
+        self.assertEqual(det.dropped_seeds[0]["reference_class"],
+                         "speculative")
 
     def test_nothing_to_do_is_cheap(self):
         # No seeds and no declared extents: the pass must not force a rebuild.

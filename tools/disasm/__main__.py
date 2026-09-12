@@ -11,6 +11,7 @@ Examples:
 """
 
 import argparse
+import os
 import sys
 
 from .disasm import Disassembler
@@ -112,9 +113,19 @@ def main():
 
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
         seed_funcs = []
+        # Which file each seed came from. The detector records one method for
+        # all of them (seed_vtable_thunk), which is enough to know a candidate
+        # is speculative but not enough to tell a vtable guess from an address
+        # the title was measured branching to. Dropping the first is cheap and
+        # dropping the second loses a real entry point, so the difference has
+        # to survive as far as the drop decision.
+        seed_provenance = {}
         for _seed_path in (args.seed_functions or []):
             _got = _load_seed_functions(_seed_path)
             seed_funcs.extend(_got)
+            _tag = os.path.basename(_seed_path)
+            for _a in _got:
+                seed_provenance.setdefault(_a, []).append(_tag)
             if args.verbose:
                 print(f"  Seed file {_seed_path}: {len(_got)} addresses")
         seed_funcs = sorted(set(seed_funcs))
@@ -135,6 +146,7 @@ def main():
             extra_sections=extra,
             seed_functions=seed_funcs,
             function_bounds=forced_bounds,
+            seed_provenance=seed_provenance,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)

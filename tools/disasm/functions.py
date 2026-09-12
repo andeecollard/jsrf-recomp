@@ -10,6 +10,7 @@ Implements multi-pass function detection with confidence scoring:
 """
 
 import bisect
+import collections
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -302,48 +303,71 @@ class FunctionDetector:
             print("  functions recovered that follow a ret with no padding")
         return added
 
+    # Reference classes for an interior seed, worst-evidence-last. Only the
+    # first two are safe to drop: nothing points at them but the guess that
+    # produced them. The rest name an address something really reaches, so
+    # removing the start would leave that reach unresolved -- they are reported
+    # and kept, because they are the subset that needs a genuine secondary
+    # entry rather than either a carve or a deletion.
+    SEED_DROPPABLE = ("unreferenced", "speculative")
+
+    def _classify_interior_seed(self, addr: int) -> Tuple[str, dict]:
+        """Why does this address exist, and would dropping it lose anything?"""
+        provenance = sorted(getattr(self, "_seed_provenance", {}).get(addr, []))
+        detail = {"provenance": provenance}
+
+        if addr == getattr(self.image, "entry_point", None):
+            return "entry_point", detail
+        for lo, hi in self._forced_bounds:
+            if addr == lo:
+                return "declared_bound", detail
+
+        kinds = collections.Counter()
+        try:
+            for ref in self.xrefs.get_refs_to(addr):
+                kinds[ref.xref_type.value] += 1
+        except Exception:                       # xrefs absent in unit fixtures
+            pass
+        detail["xrefs"] = dict(kinds)
+
+        if kinds.get("call") or kinds.get("kernel_call"):
+            return "direct_call", detail
+        # An address taken as data is how a vtable slot or a jump table names a
+        # function; the branch through it is invisible here.
+        if kinds.get("data_imm") or kinds.get("data_read"):
+            return "indirect_target", detail
+        # Measured at runtime beats anything static: the title really branched
+        # to it, whatever the sweep believes about the surrounding function.
+        if any("icall" in tag for tag in provenance):
+            return "indirect_target", detail
+        if kinds.get("jump") or kinds.get("cond_jump"):
+            # Reached only by a branch from inside the owner: that is what an
+            # interior label looks like, and exactly what should not be a
+            # function.
+            return "speculative", detail
+        if provenance:
+            return "speculative", detail
+        return "unreferenced", detail
+
     def _pass_demote_interior_seeds(self, sections) -> bool:
-        """Seeds inside another function's natural extent become aliases.
+        """Drop seeds that fall inside another function's natural extent.
 
-        The test cannot be "is it inside a body a seedless build would find".
-        readStageObj's own start is a seed too, so withholding seeds turns the
-        whole region into open gap and every interior seed then looks like a
-        legitimate discovery -- measured: 2 demotions out of 1,334 carves.
+        The previous form aliased them, which regenerated cleanly and then
+        SIGBUSed before the first frame: an alias body runs from the seed to
+        the OWNER's end, so it executes an epilogue popping registers the alias
+        entry never pushed. Dropping instead leaves the owner exactly as the
+        compiler emitted it -- one prologue, one epilogue, no second entry --
+        which is the point, since a false interior boundary is the whole defect.
 
-        The question is instead where the *owner* would end if nothing cut it
-        short. _find_function_end walks fall-through and internal branches to a
-        terminator and takes `next_func` only as an upper bound, so calling it
-        with no bound gives the natural extent. Any seed strictly inside that
-        is not a new function, it is a second entry point into an existing one
-        -- exactly what _pass_seed_aliases builds, and callable without
-        truncating the code the call wanted to reach.
+        Owners are carried forward while walking ascending. A run of fragments
+        has to be judged against the function that owns the run, not against
+        the fragment before it: that one ends exactly where the next begins, so
+        every seed after the first would look like a fresh start.
 
-        Addresses in a boundary-override file are authoritative and tested
-        first: that is the escape hatch XenonRecomp settled on for the same
-        problem, its analyser being unable to bound functions containing jump
-        tables either.
+        Never dropped: declared bounds, the entry point, and anything a call or
+        a taken address really reaches. Those are recorded instead.
         """
         # OFF BY DEFAULT. RECOMP_SEED_INTERIOR=1 opts in.
-        #
-        # The pass does what it says -- it healed 1,134 of JSRF's 1,334 carved
-        # fragments and made FileManager::readStageObj one function again --
-        # and the resulting build SIGBUSes before its first frame. Measured
-        # against a control regenerated from the same tree with this line
-        # taken: 25 reports and 131 ABI offenders with the pass off, 0 reports
-        # and 3 with it on. The 3 were not a fix, they were a corpse.
-        #
-        # The likely reason is that demoting a seed to an alias is not free. An
-        # alias body runs from the seed to the OWNER's end, so it executes the
-        # owner's epilogue -- popping registers that the owner's prologue
-        # pushed above the alias entry and the alias itself never did. That is
-        # the same stack walk the carve caused, in the opposite direction, and
-        # 1,160 new aliases is a lot of chances to hit it at startup.
-        #
-        # So the next attempt should probably not alias at all: an interior
-        # seed that is not a real entry point wants dropping, which leaves the
-        # ICALL unresolved and loud, rather than aliased and silently wrong.
-        # Whichever way, the carve measurement above is real and the mechanism
-        # is understood; only the repair is unproven.
         if os.environ.get("RECOMP_SEED_INTERIOR") != "1":
             return False
 
@@ -354,40 +378,59 @@ class FunctionDetector:
 
         forced = sorted(self._forced_bounds)
         forced_starts = [b[0] for b in forced]
-        demoted = 0
-
-        # Ascending, carrying the owner forward. A run of fragments has to be
-        # judged against the function that owns the whole run, not against the
-        # fragment immediately before -- that one ends exactly where the next
-        # begins, so every seed after the first would look like a fresh start
-        # and the carve would survive with only its first cut healed.
+        self.dropped_seeds: List[dict] = []
+        kept: List[dict] = []
         owner = None
         owner_end = 0
-        # Seeds that never became functions are still candidates that a later
-        # rebuild would promote, so they are judged here too.
-        for start in sorted(set(self.functions) | seed_set):
-            if start in seed_set:
-                j = bisect.bisect_right(forced_starts, start) - 1
-                if j >= 0 and forced[j][0] < start < forced[j][1]:
-                    self._alias_entries.setdefault(start, forced[j][1])
-                    del self._candidates[start]
-                    demoted += 1
+
+        # Declared bounds are owners in their own right: the reason to declare
+        # one is that the sweep did not find the function at all.
+        for start_addr in sorted(set(self.functions) | seed_set
+                                 | set(forced_starts)):
+            interior = owner is not None and owner < start_addr < owner_end
+            if interior and start_addr in seed_set:
+                j = bisect.bisect_right(forced_starts, start_addr) - 1
+                declared_inside = (j >= 0
+                                   and forced[j][0] < start_addr < forced[j][1])
+                kind, detail = self._classify_interior_seed(start_addr)
+                record = {
+                    "address": f"0x{start_addr:08X}",
+                    "owner_start": f"0x{owner:08X}",
+                    "owner_end": f"0x{owner_end:08X}",
+                    "method": "seed_vtable_thunk",
+                    "reference_class": kind,
+                    **detail,
+                }
+                if kind in self.SEED_DROPPABLE or declared_inside:
+                    # Suppressed entirely: no start, and no second body.
+                    del self._candidates[start_addr]
+                    self._alias_entries.pop(start_addr, None)
+                    self.dropped_seeds.append(record)
                     continue
-                if owner is not None and owner < start < owner_end:
-                    self._alias_entries.setdefault(start, owner_end)
-                    del self._candidates[start]
-                    demoted += 1
-                    continue
-            owner = start
-            section = self.image.get_section_at_va(start)
+                kept.append(record)
+            owner = start_addr
+            k = bisect.bisect_left(forced_starts, start_addr)
+            if k < len(forced_starts) and forced_starts[k] == start_addr:
+                owner_end = forced[k][1]          # declared, not inferred
+                continue
+            section = self.image.get_section_at_va(start_addr)
             sec_end = (section.virtual_addr + section.virtual_size
                        if section else None)
-            owner_end = self._find_function_end(start, None, sec_end)
+            owner_end = self._find_function_end(start_addr, None, sec_end)
 
-        if demoted:
-            print(f"  seed-interior pass: {demoted} seed(s) demoted to aliases "
-                  f"rather than splitting their enclosing function")
-        return demoted > 0
+        self.kept_interior_seeds = kept
+        if self.dropped_seeds or kept:
+            by_kind = collections.Counter(r["reference_class"]
+                                          for r in self.dropped_seeds)
+            print(f"  seed-interior pass: dropped {len(self.dropped_seeds)} "
+                  f"interior seed(s) {dict(by_kind)}; kept "
+                  f"{len(kept)} that something references")
+            if kept:
+                keep_kinds = collections.Counter(r["reference_class"]
+                                                 for r in kept)
+                print(f"    kept by class: {dict(keep_kinds)} -- these need a "
+                      f"secondary-entry representation, not a carve")
+        return bool(self.dropped_seeds)
 
     def _pass_seed_aliases(self) -> None:
         """
