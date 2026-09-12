@@ -113,6 +113,7 @@ while [ "$round" -le "$MAX_ROUNDS" ]; do
         --seed-functions diagnostics/jsrf_first_fault/startup_entries.json \
         --seed-functions "$ACCUM" \
         ${ICALL_DB:+--seed-functions "$ICALL_DB"} \
+        --function-bounds diagnostics/jsrf_first_fault/function_bounds.json \
         --force \
         --verbose
 

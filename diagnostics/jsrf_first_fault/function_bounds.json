@@ -1,0 +1,7 @@
+[
+  {
+    "start": "0x0003B926",
+    "end":   "0x0003B938",
+    "why":   "Ends the translation unit this function belongs to. The sweep's gap-prologue pass gave it 0x0003B940, nine bytes past the boundary, which is not a place a function can end: an external delinking analysis puts the object's last byte at 0x0003B937. Verified independently by auditing every function in the database against that map -- this was the only one of 10,292 that crossed an object boundary."
+  }
+]

@@ -80,6 +80,43 @@ def _detector(bodies, candidates, forced=(), natural=None,
 SEED = (0.95, "seed_vtable_thunk")
 
 
+class _WalkInsn:
+    """One byte, never a terminator: the walk runs to `upper` and stops there,
+    so the returned end IS the bound under test."""
+    def __init__(self, addr):
+        self.address = addr
+        self.size = 1
+        self.end_address = addr + 1
+        self.is_ret = False
+        self.is_jump = False
+        self.is_cond_jump = False
+        self.is_branch = False
+        self.is_terminator = False
+        self.jump_target = None
+        self.jump_table = None
+        self.mnemonic = "nop"
+        self.op_str = ""
+
+
+class _WalkEngine:
+    instructions = {}
+    jump_tables = {}
+
+    def get_instruction(self, addr):
+        return _WalkInsn(addr)
+
+    def jump_table_entries(self, t):
+        return []
+
+
+def _end_detector(forced):
+    det = FunctionDetector.__new__(FunctionDetector)
+    det._forced_bounds = list(forced)
+    det.engine = _WalkEngine()
+    det._table_after = lambda a, upper: None
+    return det
+
+
 class SeedInteriorTest(unittest.TestCase):
     # The pass is opt-in (it heals the carve and the resulting build SIGBUSes;
     # see functions.py). These tests are about whether the rule is right, so
@@ -199,6 +236,23 @@ class SeedInteriorTest(unittest.TestCase):
         self.assertNotIn(0x00037587, det._candidates)
         self.assertEqual(det.dropped_seeds[0]["reference_class"],
                          "speculative")
+
+    def test_a_declared_extent_caps_the_function_end(self):
+        # The other half of --function-bounds. Informing the seed test is not
+        # enough: a function may not be given an end past the range it was
+        # declared to occupy. 0x0003B926 was found running nine bytes beyond
+        # its translation unit by auditing every function against an external
+        # delinking map -- one straddle in 10,292.
+        det = _end_detector([(0x00039B50, 0x0003B938)])
+        end = FunctionDetector._find_function_end(
+            det, 0x0003B926, None, 0x00200000)
+        self.assertEqual(end, 0x0003B938)
+
+    def test_a_declared_extent_does_not_shorten_an_unrelated_function(self):
+        det = _end_detector([(0x00039B50, 0x0003B938)])
+        end = FunctionDetector._find_function_end(
+            det, 0x00100000, None, 0x00100010)
+        self.assertEqual(end, 0x00100010)
 
     def test_nothing_to_do_is_cheap(self):
         # No seeds and no declared extents: the pass must not force a rebuild.

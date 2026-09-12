@@ -1271,6 +1271,18 @@ class FunctionDetector:
         upper = sec_end if sec_end else start + 0x100000
         if next_func and next_func < upper:
             upper = next_func
+        # A declared extent is authoritative: nothing walks out of one.
+        #
+        # This is the half of --function-bounds that does the work. Without it
+        # the flag only informed the interior-seed test and a function could
+        # still be given an end past the range it was declared to occupy --
+        # which is exactly the error a cross-check against an external
+        # delinking map found at 0x0003B926, running nine bytes beyond the end
+        # of the translation unit it belongs to.
+        for lo, hi in self._forced_bounds:
+            if lo <= start < hi and hi < upper:
+                upper = hi
+                break
 
         while addr < upper:
             # An embedded switch table is data sitting on the fall-through
