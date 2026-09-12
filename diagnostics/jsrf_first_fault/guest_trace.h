@@ -13,6 +13,10 @@ void jsrf_func_hit_report(void);
 /* Entry count for one armed site -- the guest's own clock, for comparisons
  * that must be anchored to guest execution rather than to wall-clock. */
 unsigned long long jsrf_func_hit_count(uint32_t va);
+/* Fire fn() on the thread that takes `va`'s `count`-th entry -- the only way
+ * to put two hosts at the same instruction boundary rather than merely in the
+ * same frame. */
+void jsrf_func_hit_alarm(uint32_t va, unsigned long long count, void (*fn)(void));
 void jsrf_func_arg(uint32_t va, uint32_t value);
 void jsrf_func_arg2(uint32_t va, uint32_t a, uint32_t b);
 

@@ -1889,9 +1889,19 @@ static int jsrf_va_ok(uint32_t va)
  * +24 parent, +28 child, +2C/+30 siblings, +34/+38/+3C draw links, +40 zsort.
  * Manager draw-side offsets are CActMan's: +74 m_bSkipDraw, +94 m_DrawMode,
  * +7FA4 m_lpDrawRoot, +7FAC m_lpDrawSortRoot, +7FB4 m_lpDrawSortBinRoots[256]. */
+static int g_obj_dump_force;
+static void jsrf_object_dump(void);
+static void jsrf_object_dump_alarm(void)
+{
+    g_obj_dump_force = 1;
+    jsrf_object_dump();
+    g_obj_dump_force = 0;
+}
+
 static void jsrf_object_dump(void)
 {
     const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    int dump_exit = 0;
     static unsigned seq = 0;
     const char *dir = getenv("RECOMP_OBJECT_DUMP");
     char path[1024];
@@ -1925,21 +1935,63 @@ static void jsrf_object_dump(void)
      * never fires -- deliberately, because a dump at the wrong moment is worse
      * than no dump. */
     {
-        const char *at = getenv("RECOMP_OBJECT_DUMP_AT");
-        if (at) {
-            static int done;
-            unsigned long long want = strtoull(at, NULL, 0);
-            const char *comma = strchr(at, ',');
-            uint32_t clock_va = comma ? (uint32_t)strtoul(comma + 1, NULL, 16)
-                                      : 0x000123E0u;
-            unsigned long long now = jsrf_func_hit_count(clock_va);
-            if (done || now < want)
+        /* Cached, and polled from the ack loop rather than only from the
+         * periodic report.
+         *
+         * Gating this inside the report tied the anchor's PRECISION to the
+         * report interval, and the report is expensive -- dropping it to 2 s
+         * to tighten the anchor cost about 2.7x of guest throughput, and the
+         * overshoot was still asymmetric because the two hosts run different
+         * numbers of guest loops per report. Both hosts must dump at the same
+         * guest instant or the comparison is worthless, so the check has to be
+         * cheap enough to run constantly: one hash lookup, no getenv. */
+        static int configured, armed, done;
+        static unsigned long long want;
+        static uint32_t clock_va = 0x000123E0u;
+        if (!configured) {
+            const char *at = getenv("RECOMP_OBJECT_DUMP_AT");
+            configured = 1;
+            if (at) {
+                const char *comma = strchr(at, ',');
+                want = strtoull(at, NULL, 0);
+                if (comma) clock_va = (uint32_t)strtoul(comma + 1, NULL, 16);
+                armed = 1;
+            }
+        }
+        if (armed && !g_obj_dump_force) {
+            /* The polling path is now only a fallback. jsrf_func_hit_alarm
+             * fires the dump on the thread that takes the clock site's want-th
+             * entry, which is the same instruction boundary on both hosts;
+             * this poll cannot be that precise because it runs on another
+             * thread. Registered once, below. */
+            static int registered;
+            unsigned long long now;
+            if (done)
+                return;
+            if (!registered) {
+                registered = 1;
+                jsrf_func_hit_alarm(clock_va, want, jsrf_object_dump_alarm);
+            }
+            now = jsrf_func_hit_count(clock_va);
+            if (now < want)
                 return;
             done = 1;
             fprintf(stderr, "  [OBJ-DUMP] guest clock %08X reached %llu"
-                            " (wanted %llu); dumping once\n",
-                    clock_va, now, want);
+                            " (wanted %llu, overshoot %llu); dumping once\n",
+                    clock_va, now, want, now - want);
             fflush(stderr);
+            /* RECOMP_OBJECT_DUMP_EXIT=1 ends the run the moment the anchor is
+             * reached.
+             *
+             * A differential sweep is many runs, and every second spent after
+             * the dump is waste -- a Windows run to a deep anchor is minutes,
+             * and without this it kept going until something killed it, which
+             * also meant killing it under Wine and getting a winedbg window.
+             * Exiting here makes the cost of an anchor exactly the cost of
+             * reaching it. _exit, not exit: atexit handlers in this harness
+             * dump and flush things that would confuse the run that follows,
+             * and the dump has already been written and fflushed above. */
+            dump_exit = getenv("RECOMP_OBJECT_DUMP_EXIT") != NULL;
         }
     }
 
@@ -2032,6 +2084,11 @@ static void jsrf_object_dump(void)
     fprintf(stderr, "  [JSRF-DUMP] seq=%u wrote %u objects to %s\n",
             seq - 1u, emitted, path);
     fflush(stderr);
+    if (dump_exit) {
+        fprintf(stderr, "  [OBJ-DUMP] RECOMP_OBJECT_DUMP_EXIT set; stopping\n");
+        fflush(stderr);
+        _exit(0);
+    }
 #undef R32
 }
 

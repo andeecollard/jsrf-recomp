@@ -86,6 +86,35 @@ static FuncSeq g_seqs[FUNC_SEQ_THREADS];
 static volatile int g_seq_threads;
 static _Thread_local FuncSeq *g_my_seq;
 
+/* Fire a callback the moment a site's entry count reaches a value, ON THE
+ * THREAD THAT GOT THERE.
+ *
+ * Polling the count from somewhere else -- the pushbuffer ack loop, say --
+ * pins the FRAME but not the position within it, because the poller is a
+ * different thread from the guest's main loop. Measured: two runs of the SAME
+ * host, anchored the same way, disagreed on id 7's +0x44 and on id 7665's
+ * zsort, and a Windows-vs-macOS comparison at the same anchor disagreed on
+ * exactly the same fields. That is intra-frame phase, and it is indistinguish-
+ * able from a real host divergence unless a same-host control is run at every
+ * anchor. Firing here instead puts both hosts at the same instruction
+ * boundary. */
+static uint32_t g_alarm_va;
+static unsigned long long g_alarm_count;
+static void (*g_alarm_fn)(void);
+
+void jsrf_func_hit_alarm(uint32_t va, unsigned long long count, void (*fn)(void))
+{
+    g_alarm_va = va; g_alarm_count = count; g_alarm_fn = fn;
+}
+
+static void func_hit_alarm(uint32_t va, unsigned long long hits)
+{
+    void (*fn)(void) = g_alarm_fn;
+    if (!fn || va != g_alarm_va || hits != g_alarm_count) return;
+    g_alarm_fn = NULL;            /* once */
+    fn();
+}
+
 void jsrf_func_hit(uint32_t va)
 {
     unsigned i;
@@ -107,9 +136,15 @@ void jsrf_func_hit(uint32_t va)
     }
     i = (unsigned)(va >> 4) & FUNC_HIT_MASK;
     for (;;) {
-        if (g_hits[i].va == va) { g_hits[i].hits++; return; }
+        if (g_hits[i].va == va) {
+            unsigned long long n = ++g_hits[i].hits;
+            func_hit_alarm(va, n);
+            return;
+        }
         if (g_hits[i].va == 0) {
-            g_hits[i].va = va; g_hits[i].hits = 1; g_hit_count++; return;
+            g_hits[i].va = va; g_hits[i].hits = 1; g_hit_count++;
+            func_hit_alarm(va, 1);
+            return;
         }
         i = (i + 1u) & FUNC_HIT_MASK;   /* the table is far larger than the
                                         * number of sites, so this is rare */
