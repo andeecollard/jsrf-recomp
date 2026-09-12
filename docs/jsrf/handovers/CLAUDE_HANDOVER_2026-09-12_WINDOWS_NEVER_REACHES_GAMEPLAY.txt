@@ -169,4 +169,53 @@ The Windows oracle cross-compiles from any worktree; no separate checkout.
 
 Toolchain file: CMAKE_SYSTEM_NAME Windows, the three x86_64-w64-mingw32 tools,
 CMAKE_FIND_ROOT_PATH at the mingw sysroot. Bottle "recomp-gate", driven from a
-.bat, RECOMP_AC97_READY=1 mandatory, window always black and not a symptom.
+.bat, RECOMP_AC97_READY=1 mandatory.
+
+
+7. THE WINDOWS BUILD CAN SHOW ITS OUTPUT: RECOMP_FB_WINDOW=1
+============================================================
+CORRECTS every handover from 2026-09-11 onward, which said the CrossOver
+window is always black and is not a symptom, and told you to judge runs by the
+stderr counters. That was true of ONE route and wrong as a general claim, and
+it cost this project every Windows run it has ever done: none of them had a
+picture.
+
+The route those handovers describe -- xbox_D3D8SetGuestFramebufferSource plus
+the event-pump hook -- really is inside `#if !defined(_WIN32)` in main.c, so
+the D3D8 layer's window really is a black rectangle on this host.
+
+But there is a SECOND presenter, and it is the Windows-only one.
+src/video/fb_present.c is a plain GDI window that reads the guest framebuffer
+out of guest RAM and blits it -- deliberately not going through the D3D8
+layer, so that it shows whatever the guest actually wrote. Its whole body is
+`#if defined(_WIN32)`; POSIX gets the stub at the bottom of the file. It is
+wired into AvSetDisplayMode already (kernel_bridge.c calls
+xbox_FramebufferWindowSet then xbox_FramebufferWindowStart), it is linked into
+jsrf_first_fault.exe, and `x86_64-w64-mingw32-nm` finds both symbols in the
+binary.
+
+It is off unless RECOMP_FB_WINDOW is set, and nothing in this project had ever
+set it.
+
+    set RECOMP_FB_WINDOW=1
+
+and the run prints
+
+    [FBWIN] framebuffer window open (640x480)
+
+Measured 2026-09-12: the window shows the SMILEBIT "Created by" logo and then
+advances through the boot sequence, changing continuously. The Windows build
+renders, presents, and can be watched.
+
+Two consequences:
+
+  * "Judge Windows runs by the stderr counters" is no longer the only option,
+    and several of this project's hardest arguments -- whether the frame is
+    real, which screen it is on, whether it is advancing -- are now one
+    screenshot.
+  * The framebuffer nonzero counts in the logs were never the right instrument
+    for "what is on screen". Use the window.
+
+RECOMP_FB_VA pins the window to one guest address instead of following the
+surface being drawn, which separates "the read path is broken" from "the title
+rendered black".
