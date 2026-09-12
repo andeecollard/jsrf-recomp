@@ -2157,11 +2157,25 @@ static void jsrf_scene_report(void)
 
 #define R32(va) (*(const uint32_t *)(base + (va)))
 
+    /* Range alone is not enough to believe this pointer.
+     *
+     * The root literal moves between runs -- 0x005E3A70, 0x040D3A70 and
+     * 0x00363A70 have all been seen -- but its LOW 16 BITS ARE INVARIANT at
+     * 0x3A70, which the xemu rig's README states outright. A bare range check
+     * accepts anything in RAM, and on 12 Sep it accepted 0x040FFF40 in the
+     * middle of a run where the guest's own `this` was 0x040D3A70. Every field
+     * this function printed from that pointer was read from the wrong object,
+     * which is how a fatal flag came to be reported clear while the guest was
+     * demonstrably acting on a set one. */
     via_ptr = R32(JSRF_ROOT_PTR_VA);
-    if (jsrf_va_ok(via_ptr)) {
+    if (jsrf_va_ok(via_ptr) && (via_ptr & 0xFFFFu) == (JSRF_ROOT_VA & 0xFFFFu)) {
         root = via_ptr; how = "ptr";
     } else {
         root = JSRF_ROOT_VA; how = "static";
+        if (jsrf_va_ok(via_ptr))
+            fprintf(stderr, "  [JSRF-SCENE] ptr %08X rejected: low16 is not"
+                    " %04X, so it is not the object\n",
+                    (unsigned)via_ptr, (unsigned)(JSRF_ROOT_VA & 0xFFFFu));
     }
     if (!jsrf_va_ok(root + JSRF_LIVE_OFF + 3u)) {
         fprintf(stderr, "  [JSRF-SCENE] no usable root (ptr=%08X)\n",
@@ -2193,6 +2207,16 @@ static void jsrf_scene_report(void)
      * the log -- attaching a debugger to a live run cost one session already,
      * when the SIGSTOP coincided with the guest ceasing to poll the pad. */
     if (jsrf_va_ok(root + 0x7EC4u + 3u)) {
+        /* m_bFatal, CActMan+0x24. CActMan::Idle() runs IdleSub() while it is
+         * clear and `readInput(); Sleep(0x10);` forever once it is set, so a
+         * black screen with a live frame loop is this byte. Measured 12 Sep:
+         * a fresh New Game reaches it every time, and CActMan::Fatal()
+         * (0x00012770) is never called -- so one of the other ten writers of
+         * [reg+0x24] is responsible and this says when. */
+        fprintf(stderr, "  [JSRF-FATAL] m_bFatal=%u m_InitState=%08X"
+                " m_bLogosStarted=%u\n",
+                (unsigned)R32(root + 0x24u), (unsigned)R32(root + 0x10u),
+                (unsigned)R32(root + 0x20u));
         fprintf(stderr, "  [JSRF-STATE] +7930=%08X +7934=%08X +7BB0=%08X"
                 " +7E48=%08X +7EC4=%08X\n",
                 (unsigned)R32(root + 0x7930u), (unsigned)R32(root + 0x7934u),

@@ -1,0 +1,248 @@
+JSRF HANDOVER -- A FRESH NEW GAME FREEZES IN CActMan::Idle, AND THE TRANSLATOR
+                 WORK OF 12 SEP IS NOT WHY
+Date: 2026-09-12 (Europe/London), late evening
+From: Claude.
+
+Supersedes nothing outright. It adds a new top-level fault, and it corrects
+four readings made during this session -- three of them mine, made in the same
+way, and section 4 exists so the next session does not repeat them.
+
+
+0. THE ONE-LINE ANSWER
+======================
+Selecting New Game loads a complete stage and then freezes with a black screen.
+The guest is in CActMan::Idle() taking its second branch -- `readInput();
+Sleep(0x10);` forever -- which is the branch the title runs when it has decided
+something is fatally wrong. It is deterministic (1408 file opens, live=56,
+every run), the guest is otherwise healthy, and it reproduces bit-identically
+on the pre-change gen tree, so nothing committed today caused it.
+
+
+1. WHAT LANDED TODAY (three commits, all pushed)
+================================================
+a459a6d  Switch arms recognised and dropped.
+    Interior seeds are switch cases, not secondary entries. 143 of 175 kept
+    seeds, and 870 of the 895 previously dropped, are entries in a table
+    dispatched by `jmp [reg*4 + disp32]`. The loop was self-sustaining: an arm
+    is only reachable through its table, so a run observes it, icall_targets
+    seeds it as a function start, that start truncates the owner to end at the
+    dispatching jump, and a truncated owner is exactly what stops
+    _analyze_switch_table resolving the table.
+        kept interior seeds 175 -> 35;  resolved switches 293 -> 354;
+        unresolved indirect tails 678 -> 615;  functions 9,397 -> 9,129.
+
+12954cb  The ABI check records HOW a target was reached.
+    RECOMP_ITAIL is an indirect TAIL JUMP routed through RECOMP_ABI_CALL, so a
+    shared epilogue reached that way reads as a violation every time -- false
+    by construction. 'C' direct, 'I' indirect call, 'T' tail jump; dedup key is
+    the pair.
+        ABI offenders 131 -> 9:  C=4, I=0, T=5.
+    Five of the nine are one shared epilogue (0x0007E575..5AA). Three of the
+    four C rows are the CRT at 0x17CAB0/0x17D1F8/0x17D231, two saying
+    "esp(epilogue never ran)" -- the __SEH_prolog/__chkstk signature already
+    called expected on 12 Sep. sub_00011D00, recursiveExec1Default, the one
+    offender in the exec tree, is GONE.
+    regenerate.sh now sets RECOMP_SEED_INTERIOR=1.
+
+289f21f  Two further defects, both found by subagents, both making the OWNER
+         wrong rather than the arm.
+    (a) THE FIRST ARM. MSVC makes case 0 the dispatch's own fall-through, so a
+        switch's first arm sits exactly on a boundary of its own making:
+        interior to nothing, and every later arm in that table is then judged
+        against an owner that BEGINS after the dispatch site. Of 422 resynced
+        tables, 137 have the dispatcher ending at the jump and 133 are
+        truncated this way. resync_jump_tables was never at fault -- the raw
+        FF24 scan and the engine agree on all 422, none missed either way.
+    (b) THE TAIL CALL. functions.json is healthy (largest body 11,124 bytes).
+        The runaway is at the one call site passing next_func=None, where
+        `upper` becomes the whole 1.5 MB .text and every forward tail call
+        looks internal. p99.9 4,639 -> 270,906. In 83 of 83 worst escalations
+        the culprit is an unconditional jmp to an address already in
+        functions.json. The veto fires ZERO times under the clamped builder.
+        Cost of leaving it: 45 of 1,142 interior-seed verdicts were decided by
+        an owner extent above 11 KB.
+
+    310 tests green, including 8 in test_function_end.py that had been failing
+    since c621ffe (its fixture predates _forced_bounds).
+
+
+2. THE FREEZE -- WHAT IS ESTABLISHED
+====================================
+    // Address: 0x00013F80   Status: matching   (JSRF-Decompilation)
+    int CActMan::Idle() {
+        if (this->m_InitState >= 0) while (true) {
+            if (!this->m_bFatal) this->IdleSub();
+            else { readInput(); Sleep(0x10); }
+        } else return -1;
+    }
+
+Our generated C matches that structure exactly:
+
+    loc_00013F90:
+        eax = MEM32(esi + 0x24);                     // m_bFatal
+        if (TEST_NZ(_fa, _fb)) goto loc_00013FA0;    // != 0 -> freeze branch
+        call sub_00013A80;                           // else IdleSub()
+        goto loc_00013F90;
+    loc_00013FA0:
+        call sub_000659C0;   // readInput
+        push 0x10; call sub_00145CA6;                // Sleep(0x10)
+        goto loc_00013F90;
+
+/usr/bin/sample against the live pid, TWO separate processes, at the stall:
+
+    sub_00013F80 + 724 -> sub_00145CA6 (Sleep)      2676 / 3450 samples
+    sub_00013F80 + 576 -> sub_000659C0 (readInput)    53 /   62 samples
+    sub_00013A80       (IdleSub)                       0 /    0 samples
+
+So MEM32(esi + 0x24) is nonzero and the freeze branch is running. m_bFatal is
+at CActMan+0x24: derived from the decompilation's struct layout and confirmed
+independently by sub_00012770's body, which writes [ecx+0x24] = 1.
+
+Also measured at the stall:
+  * deterministic: 1408 NtOpenFile, 264 distinct files, live=56, EVERY run
+  * a complete stage loads: Stage, StgObj, Effect, Sounds\SE, Disp\map,
+    Player, Disp\charicon
+  * the guest is healthy: frame loop running, Exec0Default climbing, no errors
+  * 446 indirect targets resolved, ZERO unresolved
+  * NOT today's translator work: the pre-change tree (gen.dropcontrol, built at
+    scratchpad/build-control) stalls with the same 1408 / live=56
+  * NOT slowness: removing JSRF_ABI_CHECK_ALL changed nothing, and the file
+    count was bit-identical
+  * Z_ADX\BGM IS opened (4x) -- the step the Windows oracle never reached
+
+WHAT IS NOT KNOWN: what sets the flag. CActMan::Fatal() at 0x00012770 is
+instrumented and NEVER CALLED. Only ELEVEN sites in the whole image write 1 to
+[reg+0x24]; ten remain:
+
+    0x0001B5C0 (x2)  0x00027F70  0x0007AF90  0x0008B3E0 (x2)
+    0x00156AB0       0x0017C069  0x0019F39C
+
+Probes on seven of them are installed and record `this`. At the stall none had
+`this` = the CActMan. That set is where the next session starts.
+
+
+3. THE OTHER REAL RESULT -- PAD_INJECT KILLS THE POLL STALL
+===========================================================
+    USB schedule:  polls FROZEN at 971,  nonneutral 116,  15 transitions
+    PAD_INJECT=1:  polls 13,379+,        nonneutral 1,969, 482 transitions
+
+The stall is in USB DELIVERY, not in the guest. RECOMP_PAD_INJECT writes the
+report straight into the title's own copies at 60 Hz and the schedule stops
+mattering. Unattended runs of arbitrary length are now possible.
+diagnostics/jsrf_first_fault/play_tutorial.sh is the human-driven harness;
+it sets PAD_INJECT, the scene markers and the exec-mode counters.
+
+
+4. FOUR WRONG READINGS, ALL THE SAME MISTAKE
+============================================
+Read this section before trusting any counter in this tree. Every one of these
+was "a number that looked like an answer", and each cost a cycle.
+
+  (1) "nonneutral=0 proves the poll stall."  It proved RECOMP_USB was unset, so
+      the OHCI model was never enabled. An absence with no positive control.
+
+  (2) "[ADX] flag=0 means the stream is stuck in PREP."  flag is MEM32(0x25EFA4),
+      the ADX server's WAKE flag, and 0 is the HEALTHY value -- the server
+      clears it each pass. main.c says so five lines above the print. The
+      successful 79M-triangle run shows flag=0 throughout.
+
+  (3) "CActMan::Fatal() must be what sets m_bFatal."  The decompilation covers
+      0.38% of the binary and marks that function `unimplemented`. It is never
+      called. The generated C -- which has no coverage problem -- names eleven
+      writers.
+
+  (4) "m_bFatal=0, so the freeze branch is not running."  jsrf_scene_report
+      accepted 0x040FFF40 as the root because it only RANGE-checked the pointer.
+      The root literal moves between runs but its low 16 bits are invariant at
+      0x3A70 (the xemu rig's README says so outright). Every field printed from
+      that pointer was read from the wrong object. NOW FIXED in main.c: the
+      pointer is rejected unless low16 matches, and it says so when it rejects.
+
+Also worth recording, because it wasted your time rather than mine: RECOMP_FAKE_PAD
+REPLACES the real pad rather than merging with it, so an unattended run started
+while a human has the window silently eats every press. Check `pgrep -x
+jsrf_first_fault` before launching -- twice today two instances fought over the
+controller, and once a "the task finished" notification raced a run that had
+70 seconds left.
+
+
+5. WHAT IS OWED
+===============
+  * The regeneration that would show 289f21f's effect. Both fixes are
+    unit-tested and static-measured; neither has been through regenerate.sh.
+    Expect resolved switches to move well past 354 (133 tables are implicated)
+    and the carve count to fall from 155.
+  * ctest cannot run: the test targets fail to link on _g_apu_trap_host_pc,
+    which lives in src/apu/apu_mmio_hook.c and is not linked into them.
+    Pre-existing, unrelated to anything here.
+  * Three iCloud duplicates are sitting untracked: "main 2.c",
+    "kernel_bridge 2.c", "xbox_memory_layout 2.c". They are NOT in the build.
+  * diagnostics/jsrf_first_fault/main.c is MODIFIED and uncommitted: the root
+    validation from section 4(4), plus a [JSRF-FATAL] line printing m_bFatal,
+    m_InitState and m_bLogosStarted. Worth keeping.
+  * The gen tree carries func-hit probes (0x00013F80 ecxpair, 0x00012770, and
+    the +0x24 writers). instrument_func_hit.py --remove reverses them.
+
+
+6. WHAT THE 12 SEP GOALS SAID, AND WHERE IT NOW STANDS
+======================================================
+P1 secondary entries -- DONE, and the premise was wrong: they were switch arms.
+   ABI 131 -> 9, of which 8 are structurally expected.
+P2 the tutorial jump -- BLOCKED BEHIND THIS FREEZE. A fresh New Game cannot
+   reach the tutorial at all, so the jump cannot be attempted. This is now the
+   gate on "playable", ahead of the jump.
+P3 the differential oracle -- untouched, and section 7 argues it should not be.
+P4 naming -- the decompilation's names were decisive twice today (CActMan::Idle
+   and the CActMan layout). Folding them into the generated C's banners would
+   have saved hours.
+P5 merge and boundary guards -- partly: regenerate.sh now sets
+   RECOMP_SEED_INTERIOR=1, so a plain regeneration no longer re-carves.
+
+
+7. NEXT SESSION -- AND CAN IT BE AUTONOMOUS?
+============================================
+Mostly yes, but not from a standing start, and the first task is what buys the
+rest.
+
+THE BLOCKER ON AUTONOMY: reaching the freeze needs New Game selected. The
+synthetic pad presses START and A on a blind one-per-second pulse; it reaches
+live=133 and 1342 opens but never New Game's live=56 / 1408. Every measurement
+in section 2 cost a human playthrough.
+
+TASK 1 -- A SCRIPTED PAD (do this first, ~30 lines in src/input/xinput_device.c)
+    RECOMP_PAD_SCRIPT="2.0:START 3.0:A 4.0:A 6.0:A ..." -- a timed sequence
+    rather than a pulse. fake_pad_start() already has the shape; this replaces
+    the window heuristic with a list. Done when an unattended run reaches
+    1408 opens / live=56 without a human. After that everything below is
+    autonomous, and a human never has to sit through another boot.
+
+TASK 2 -- NAME THE WRITER OF m_bFatal
+    Ten sites, seven already probed. Add the remaining three, run to the
+    freeze, find the one entered with this = the CActMan (low16 0x3A70). Then
+    read what it tested. This is the actual bug and it is one measurement away.
+
+TASK 3 -- REGENERATE AND MEASURE 289f21f
+    Owed from section 5. Mechanical.
+
+TASK 4 -- THE 36 REAL FUNCTION STARTS
+    Of the 155 remaining carves: 28 are switch arms of the 133-table family,
+    86 are interior addresses of one compiler function, 36 are REAL function
+    starts (all 16-aligned, all reached only by a tail jmp, 30 preceded by NOP
+    padding or a ret), 5 are phantoms from decodes that ran past a ret into
+    data. _pass_tail_jump_targets misses the 36 for a measured reason: 41 of
+    43 jump sites fail `if insn.address >= body_end` because the jmp sits in a
+    tail_jump_alias fragment or a gap, and aliases do not exist when that pass
+    runs; one more fails because that pass never calls engine.decode_at on the
+    target, unlike _pass_call_targets. Both guards are narrow and testable.
+
+WHAT SIX HOURS WOULD REALISTICALLY COVER: task 1 (~1h, including the unattended
+verification), task 2 (~1h once task 1 lands), task 3 (~1h, mostly waiting on
+regenerate.sh and one run), task 4 (~2h with tests). That leaves an hour of
+slack, which will be needed: rebuilds are minutes each and this title punishes
+heavy instrumentation -- 578 probe sites froze the guest at 253 polls where an
+unprobed run reached 8,790.
+
+WHAT WOULD MAKE IT GO WRONG: doing task 2 before task 1. Every hour spent
+without a scripted repro is an hour of a human pressing START, and section 4 is
+what happens when the cost of a measurement tempts you into inferring one
+instead.
