@@ -2722,31 +2722,38 @@ extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
-                              uint32_t edi0, uint32_t esp0)
+                              uint32_t edi0, uint32_t esp0, int kind)
 {
     /* 32 filled during asset loading alone -- every slot went to
      * FileManager's readers -- so nothing at gameplay time was ever reachable.
-     * The table is deduplicated by callee VA, so this bounds distinct
-     * offenders, not events. */
+     *
+     * The key is the (callee VA, reach kind) pair, not the VA alone. A tail
+     * jump reaching a shared epilogue restores its caller's caller's registers
+     * by design, so 'T' rows are expected and 'C'/'I' rows are not; pooling
+     * them produced a count that could not be read. Pairing also means a
+     * target reached both ways is reported once for each, which is the more
+     * useful answer than whichever way happened to come first. */
     enum { SLOTS = 512 };
     static uint32_t seen[SLOTS];
+    static int seen_kind[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;
     int i;
 
     for (i = 0; i < count; i++)
-        if (seen[i] == va)
+        if (seen[i] == va && seen_kind[i] == kind)
             break;
     if (i == count) {
         if (count == SLOTS)
             return;
         seen[count] = va;
+        seen_kind[count] = kind;
         hits[count] = 0;
         count++;
-        fprintf(stderr, "[ABI] sub_%08X:%s%s%s%s\n"
+        fprintf(stderr, "[ABI/%c] sub_%08X:%s%s%s%s\n"
                         "      ebx %08X->%08X esi %08X->%08X"
                         " edi %08X->%08X esp %08X->%08X\n",
-                va,
+                kind, va,
                 g_ebx != ebx0 ? " ebx" : "",
                 g_esi != esi0 ? " esi" : "",
                 g_edi != edi0 ? " edi" : "",

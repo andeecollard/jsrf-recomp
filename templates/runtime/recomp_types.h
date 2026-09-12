@@ -1070,19 +1070,33 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * call through this macro, which expands to a plain call when the flag is
  * off. That matters because CRT and static-initialiser paths -- where these
  * clobbers actually bite -- are almost entirely direct calls.
+ *
+ * HOW the target was reached is recorded with the violation, because the three
+ * ways do not mean the same thing and the count is uninterpretable pooled.
+ * RECOMP_ITAIL is an indirect *tail jump*: no return address is pushed, the
+ * frame belongs to the jumping function, and a shared epilogue reached that way
+ * is SUPPOSED to restore the caller's caller's ebx/esi/edi. Checked as though
+ * it were a call, that reads as a violation every time -- false by
+ * construction, and indistinguishable from a real one until the kind is
+ * printed beside it. 'C' is a direct call, 'I' an indirect call, 'T' a tail
+ * jump; the dedup key is the pair, so a target reached both ways is reported
+ * once for each.
  */
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
-                              uint32_t edi0, uint32_t esp0);
-#define RECOMP_ABI_CALL(va, fn) do { \
+                              uint32_t edi0, uint32_t esp0, int kind);
+#define RECOMP_ABI_CALL_K(va, fn, kind) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
-        recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
+        recomp_abi_violation_log((va), _ab, _as, _ad, _ap, (kind)); \
 } while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_K(va, fn, kind) (fn)()
 #endif
+/* Direct calls are the overwhelming majority and the lifter emits thousands of
+ * them, so they keep the short spelling. */
+#define RECOMP_ABI_CALL(va, fn) RECOMP_ABI_CALL_K((va), (fn), 'C')
 
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
@@ -1115,7 +1129,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_K(_va, _fn, 'I'); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -1141,7 +1155,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_K(_va, _fn, 'I'); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -1159,7 +1173,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_K(_va, _fn, 'T'); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)

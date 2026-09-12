@@ -87,17 +87,67 @@ Regenerating with `RECOMP_SEED_INTERIOR=1`:
 the switch resolved to eight `goto`s. That is the shape P1 asked for, reached
 by removing the cause rather than by adding a selector.
 
+## At runtime: 131 offenders become 9
+
+The ABI check now records HOW the target was reached, because the three ways do
+not mean the same thing and the pooled count could not be read. `RECOMP_ITAIL`
+is an indirect *tail jump*: no return address is pushed, the frame belongs to
+the jumping function, and a shared epilogue reached that way is supposed to
+restore the caller's caller's registers. Routed through `RECOMP_ABI_CALL`, as
+it has always been, that reads as a violation every time. 'C' is a direct call,
+'I' an indirect call, 'T' a tail jump, and the dedup key is now the pair.
+
+One run to the Corn tutorial under `RECOMP_FAKE_PAD=1`, same instrument, same
+machine:
+
+| | control | switch_arm |
+|---|---|---|
+| ABI offenders | 131 | **9** |
+| -- direct call `C` | not partitioned | 4 |
+| -- indirect call `I` | | **0** |
+| -- tail jump `T` | | 5 |
+| RASTER lines | 25 | 30 |
+| outcome | SIGSEGV at the end | still running at the 300 s cap |
+
+All nine, in full:
+
+```
+[ABI/C] sub_0017D1F8: esp(epilogue never ran)
+[ABI/C] sub_0017D231: ebx esi edi
+[ABI/C] sub_001816B0: ebx
+[ABI/C] sub_0017CAB0: esp(epilogue never ran)
+[ABI/T] sub_0007E575: ebx esi
+[ABI/T] sub_0007E58D: ebx esi
+[ABI/T] sub_0007E594: ebx esi
+[ABI/T] sub_0007E5A3: ebx esi
+[ABI/T] sub_0007E5AA: ebx esi
+```
+
+**No indirect call offends at all.** The five 'T' rows are one shared epilogue
+-- five addresses inside 0x35 bytes, every one losing the same two registers --
+which is the expected-false class the partition exists to name. Three of the
+four 'C' rows are in the CRT at 0x17CAB0/0x17D1F8/0x17D231 and two of them say
+`esp(epilogue never ran)`, which is the `__SEH_prolog`/`__chkstk` signature
+12 Sep already called expected.
+
+`sub_00011D00` -- `CActBase::recursiveExec1Default`, the one offender in the
+exec tree -- **is absent**. The goals document predicted it was a cascade
+victim rather than a carved fragment and would resolve with P1. It did.
+
 ## What this does NOT show
 
-**The ABI count has not been re-measured.** The binary builds; the run to
-gameplay has not been done. A reduced kept-seed count is a database result, not
-a runtime one, and the previous session's rule stands: a reduced count on a
-corpse is not a result. Both halves are still owed -- the count, and the build
-still reaching the control's anchor.
+**The two runs are not comparable on throughput.** 101,017,579 triangles at a
+300 s cap against the control's 169,356,768 at its SIGSEGV is not a slowdown
+and not a speedup: one run was killed and the other died, and comparing two
+builds by wall clock is the same trap as comparing two hosts by wall clock,
+which cost a whole fake audio investigation on 12 Sep. An anchored comparison
+at equal guest clock is owed. What the run does establish is that the build
+reaches the Corn tutorial and outlives the control.
 
-**`recursiveExec1Default` is untouched by this.** `0x00011D00` is a genuine
-`call_target` with two callers and is not a switch arm. Whatever it is, it is
-not this, and the 12 Sep reading of it stands.
+**Nothing here reaches the tutorial jump.** The violations were switch arms,
+and on the guest stack an arm's pops match pushes the dispatcher really made --
+only the C-level function boundary was wrong. That the count fell is a
+statement about the translator, not about the title.
 
 ## Reproducing
 

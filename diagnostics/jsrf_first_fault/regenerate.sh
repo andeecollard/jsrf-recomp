@@ -3,6 +3,17 @@ set -eu
 
 PYTHON="${PYTHON:-python3}"
 
+# Demote interior seeds. Off by default in tools/disasm because the first two
+# forms of it broke the build; on here because the third measured 131 ABI
+# offenders down to 9, of which none is an indirect call. Without it a plain
+# regeneration re-carves every switch arm the runtime feed ever observed, and
+# the loop that does so cannot break from inside: the arm is only reachable
+# through its table, so observing it seeds it, seeding it truncates the owner
+# to end at the dispatching jump, and the truncated owner is what stops the
+# table from ever resolving. Set it to anything else to reproduce the carve.
+RECOMP_SEED_INTERIOR="${RECOMP_SEED_INTERIOR:-1}"
+export RECOMP_SEED_INTERIOR
+
 XBE="../Jet Set Radio Future (US)/default.xbe"
 OUT=build-macos/jsrf-first-fault
 ACCUM="$OUT/vtable_seeds_accum.json"
