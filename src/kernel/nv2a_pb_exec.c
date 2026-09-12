@@ -88,6 +88,15 @@ static struct {
     uint32_t clears, unhandled_total;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     uint32_t metal_batches, metal_fallbacks;
+    /* Batches and triangles that the GPU never saw.
+     *
+     * metal_batches counts Metal successes and metal_fallbacks counts batches
+     * that TRIED Metal and were refused -- so between them they say nothing
+     * about a batch that skipped the accelerated path altogether, which is
+     * what happens whenever s_copy.active is 0. "0 software fallbacks" was
+     * therefore not the same claim as "nothing is rasterised on the CPU", and
+     * the difference was invisible. */
+    uint32_t cpu_batches, cpu_tris;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -1461,6 +1470,7 @@ static void raster_triangle(const float a[2], const float b[2],
         }
     }
     s_gpu.tris_drawn++;
+    s_gpu.cpu_tris++;
 }
 
 /* One vertex source for both paths: a batch that pushed inline data reads from
@@ -1862,9 +1872,10 @@ static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
     }
     if (nv2a_texture_copy_triangle_depth(&s_copy.state, s_copy.texture, s_copy.texture_bytes,
             s_copy.target, s_copy.target_bytes, s_copy.depth,s_copy.depth_bytes,
-            s_outputs[a], s_outputs[b], s_outputs[c]))
+            s_outputs[a], s_outputs[b], s_outputs[c])) {
         ++s_gpu.tris_drawn;
-    else {
+        ++s_gpu.cpu_tris;
+    } else {
         if (++s_copy.rejected <= 4) fprintf(stderr, "[TEXTURE] rejected triangle geometry / bounds\n");
     }
 }
@@ -1986,6 +1997,7 @@ static void raster_batch(void)
             s_copy.state.clip_x,s_copy.state.clip_y);
     }
 #endif
+    ++s_gpu.cpu_batches;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
@@ -2802,8 +2814,10 @@ void nv2a_pb_exec_report(void)
 #ifdef __APPLE__
     if (getenv("RECOMP_METAL"))
     {
-        fprintf(stderr,"[METAL] %u batches native, %u software fallbacks\n",
-                s_gpu.metal_batches,s_gpu.metal_fallbacks);
+        fprintf(stderr,"[METAL] %u batches native, %u software fallbacks,"
+                       " %u batches + %u triangles on the CPU\n",
+            s_gpu.metal_batches,s_gpu.metal_fallbacks,
+            s_gpu.cpu_batches,s_gpu.cpu_tris);
         nv2a_metal_report();
     }
 #endif
