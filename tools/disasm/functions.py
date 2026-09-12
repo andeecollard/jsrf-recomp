@@ -10,6 +10,7 @@ Implements multi-pass function detection with confidence scoring:
 """
 
 import bisect
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -84,6 +85,9 @@ class FunctionDetector:
         # function's end. Kept out of self._candidates so they cannot truncate
         # the function they land in.
         self._alias_entries: Dict[int, int] = {}
+        # [(start, end)] extents no pass may split. Populated from
+        # --function-bounds; see _pass_demote_interior_seeds.
+        self._forced_bounds: List[Tuple[int, int]] = []
 
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
@@ -183,6 +187,19 @@ class FunctionDetector:
             self._build_functions(sections)
 
         # Seeds that landed inside a function rather than on its start.
+        #
+        # Two passes, because a seed can be interior in two different senses.
+        # _pass_demote_interior_seeds asks whether the address is inside a body
+        # the sweep would have found WITHOUT any seed, which is the question
+        # that matters and can only be asked once every other pass has run --
+        # readStageObj's extent comes from the tail-jump and data-pointer
+        # passes above, so asking earlier finds open gap where there is a
+        # function, and demotes nothing. _pass_seed_aliases then catches the
+        # remainder, where the enclosing body exists only because of some other
+        # seed.
+        if self._pass_demote_interior_seeds(sections):
+            self.functions.clear()
+            self._build_functions(sections)
         self._pass_seed_aliases()
 
         self._build_alias_entries()
@@ -284,6 +301,93 @@ class FunctionDetector:
         if added:
             print("  functions recovered that follow a ret with no padding")
         return added
+
+    def _pass_demote_interior_seeds(self, sections) -> bool:
+        """Seeds inside another function's natural extent become aliases.
+
+        The test cannot be "is it inside a body a seedless build would find".
+        readStageObj's own start is a seed too, so withholding seeds turns the
+        whole region into open gap and every interior seed then looks like a
+        legitimate discovery -- measured: 2 demotions out of 1,334 carves.
+
+        The question is instead where the *owner* would end if nothing cut it
+        short. _find_function_end walks fall-through and internal branches to a
+        terminator and takes `next_func` only as an upper bound, so calling it
+        with no bound gives the natural extent. Any seed strictly inside that
+        is not a new function, it is a second entry point into an existing one
+        -- exactly what _pass_seed_aliases builds, and callable without
+        truncating the code the call wanted to reach.
+
+        Addresses in a boundary-override file are authoritative and tested
+        first: that is the escape hatch XenonRecomp settled on for the same
+        problem, its analyser being unable to bound functions containing jump
+        tables either.
+        """
+        # OFF BY DEFAULT. RECOMP_SEED_INTERIOR=1 opts in.
+        #
+        # The pass does what it says -- it healed 1,134 of JSRF's 1,334 carved
+        # fragments and made FileManager::readStageObj one function again --
+        # and the resulting build SIGBUSes before its first frame. Measured
+        # against a control regenerated from the same tree with this line
+        # taken: 25 reports and 131 ABI offenders with the pass off, 0 reports
+        # and 3 with it on. The 3 were not a fix, they were a corpse.
+        #
+        # The likely reason is that demoting a seed to an alias is not free. An
+        # alias body runs from the seed to the OWNER's end, so it executes the
+        # owner's epilogue -- popping registers that the owner's prologue
+        # pushed above the alias entry and the alias itself never did. That is
+        # the same stack walk the carve caused, in the opposite direction, and
+        # 1,160 new aliases is a lot of chances to hit it at startup.
+        #
+        # So the next attempt should probably not alias at all: an interior
+        # seed that is not a real entry point wants dropping, which leaves the
+        # ICALL unresolved and loud, rather than aliased and silently wrong.
+        # Whichever way, the carve measurement above is real and the mechanism
+        # is understood; only the repair is unproven.
+        if os.environ.get("RECOMP_SEED_INTERIOR") != "1":
+            return False
+
+        seed_set = {addr for addr, (_c, method) in self._candidates.items()
+                    if method == "seed_vtable_thunk"}
+        if not seed_set and not self._forced_bounds:
+            return False
+
+        forced = sorted(self._forced_bounds)
+        forced_starts = [b[0] for b in forced]
+        demoted = 0
+
+        # Ascending, carrying the owner forward. A run of fragments has to be
+        # judged against the function that owns the whole run, not against the
+        # fragment immediately before -- that one ends exactly where the next
+        # begins, so every seed after the first would look like a fresh start
+        # and the carve would survive with only its first cut healed.
+        owner = None
+        owner_end = 0
+        # Seeds that never became functions are still candidates that a later
+        # rebuild would promote, so they are judged here too.
+        for start in sorted(set(self.functions) | seed_set):
+            if start in seed_set:
+                j = bisect.bisect_right(forced_starts, start) - 1
+                if j >= 0 and forced[j][0] < start < forced[j][1]:
+                    self._alias_entries.setdefault(start, forced[j][1])
+                    del self._candidates[start]
+                    demoted += 1
+                    continue
+                if owner is not None and owner < start < owner_end:
+                    self._alias_entries.setdefault(start, owner_end)
+                    del self._candidates[start]
+                    demoted += 1
+                    continue
+            owner = start
+            section = self.image.get_section_at_va(start)
+            sec_end = (section.virtual_addr + section.virtual_size
+                       if section else None)
+            owner_end = self._find_function_end(start, None, sec_end)
+
+        if demoted:
+            print(f"  seed-interior pass: {demoted} seed(s) demoted to aliases "
+                  f"rather than splitting their enclosing function")
+        return demoted > 0
 
     def _pass_seed_aliases(self) -> None:
         """

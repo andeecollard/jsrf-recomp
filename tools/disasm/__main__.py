@@ -67,6 +67,17 @@ def main():
              "e.g., --extra-sections XIPS,DOLBY)",
     )
     parser.add_argument(
+        "--function-bounds",
+        action="append",
+        default=None,
+        metavar="JSON",
+        help="JSON file of declared function extents: array of objects with "
+             "'start' and 'end' hex address strings. An extent listed here is "
+             "authoritative -- no pass splits it, and a seed landing inside it "
+             "becomes an alias. Use it for functions the analyser gets wrong, "
+             "typically ones containing a jump table.",
+    )
+    parser.add_argument(
         "--seed-functions",
         action="append",
         default=None,
@@ -107,6 +118,12 @@ def main():
             if args.verbose:
                 print(f"  Seed file {_seed_path}: {len(_got)} addresses")
         seed_funcs = sorted(set(seed_funcs))
+        forced_bounds = []
+        for _b in (args.function_bounds or []):
+            _got = _load_function_bounds(_b)
+            forced_bounds.extend(_got)
+            if args.verbose:
+                print(f"  Boundary file {_b}: {len(_got)} declared extents")
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
             analysis_json=args.analysis_json,
@@ -117,6 +134,7 @@ def main():
             force=args.force,
             extra_sections=extra,
             seed_functions=seed_funcs,
+            function_bounds=forced_bounds,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)
@@ -135,6 +153,34 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(2)
+
+
+def _load_function_bounds(path):
+    """Load declared function extents from a JSON file.
+
+    Format: array of {"start": "0xHEX", "end": "0xHEX"}. An extent declared
+    here is authoritative: no pass may split it, and any seed landing strictly
+    inside becomes an alias rather than a new function start.
+
+    This is the escape hatch XenonRecomp arrived at for the same problem. Its
+    analyser cannot resolve the boundaries of functions containing jump tables
+    either -- they look like tail calls -- and rather than guess, it lets the
+    project state the extent. An Xbox 360 XEX at least has .pdata for functions
+    with stack space; an Xbox XBE has no equivalent, so this is strictly more
+    necessary here than there.
+    """
+    import json
+    with open(path) as f:
+        data = json.load(f)
+    bounds = []
+    for entry in data:
+        if not isinstance(entry, dict) or "start" not in entry or "end" not in entry:
+            continue
+        start = int(entry["start"], 16)
+        end = int(entry["end"], 16)
+        if end > start:
+            bounds.append((start, end))
+    return bounds
 
 
 def _load_seed_functions(path):

@@ -38,7 +38,8 @@ class Disassembler:
                  verbose: bool = False,
                  force: bool = False,
                  extra_sections: Optional[list] = None,
-                 seed_functions: Optional[list] = None):
+                 seed_functions: Optional[list] = None,
+                 function_bounds: Optional[list] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -48,6 +49,7 @@ class Disassembler:
         self.force = force
         self.extra_sections = extra_sections or []
         self.seed_functions = seed_functions or []
+        self.function_bounds = function_bounds or []
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -159,6 +161,9 @@ class Disassembler:
             print("\nPhase 5: Detecting functions...")
         self.func_detector = FunctionDetector(
             self.engine, self.image, self.xrefs, self.labels)
+        # Declared extents, before any pass runs: they are what the seed
+        # demotion tests against as well as being unsplittable themselves.
+        self.func_detector._forced_bounds = list(self.function_bounds)
 
         # Add seed functions from vtable scanner or other sources.
         #
