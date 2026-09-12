@@ -299,12 +299,47 @@ void xbox_WatchdogStart(void);
 
 /* Thread-local storage class for the recompiled register set. Must match
  * templates/runtime/recomp_types.h -- a mismatch is a link-time surprise. */
+/* Thread-local storage class for the recompiled register set. Must match
+ * templates/runtime/recomp_types.h -- a mismatch is a link-time surprise.
+ *
+ * MEASURED 12 Sep 2026, and the biggest single cost in the program on BOTH
+ * hosts. The generated code is `#define eax g_eax` over this register set, so
+ * every guest register read and write is one access to a thread-local.
+ *
+ *   macOS   Darwin has no ELF TLS models, so __thread always goes through the
+ *           tlv descriptor and _tlv_get_addr in libdyld, and -ftls-model= is
+ *           silently a no-op. `sample` puts _tlv_get_addr at roughly 75% of
+ *           the main guest thread's samples -- more than the rasteriser, the
+ *           combiner and the ADX decoder put together.
+ *   Windows mingw-w64 defines __GNUC__, so it takes the __thread branch, and
+ *           GCC implements __thread on this target with EMULATED TLS:
+ *           __emutls_get_address(), a real call with a lookup inside it, per
+ *           access. jsrf_first_fault.exe carries 145 emutls symbols.
+ *
+ * TRIED AND REVERTED: keying the choice on _WIN32 so mingw takes
+ * __declspec(thread) (native TEB-relative, no call). It builds, and emutls
+ * symbols drop 145 -> 16, but the title exits through HalReturnToFirmware
+ * within 16 file opens. Native PE TLS needs its directory and per-thread
+ * initialisation, and something in the harness's own thread creation or memory
+ * layout does not satisfy that. Do not simply re-apply it; find out why first.
+ *
+ * The real fix is not a storage class. It is to stop doing a TLS lookup per
+ * register access -- hand the generated functions a register-context pointer
+ * once on entry and index through it. That needs a translator change or a
+ * mechanical edit of the generated tree, and it is worth doing: it is the
+ * single largest measured win available on either host.
+ *
+ * RECOMP_TLS may be predefined by the build to override the choice below;
+ * -DRECOMP_TLS= builds with plain globals, which is not thread-safe and
+ * crashes, but is useful for bounding experiments. */
+#ifndef RECOMP_TLS
 #if defined(_MSC_VER)
 #  define RECOMP_TLS __declspec(thread)
 #elif defined(__GNUC__) || defined(__clang__)
 #  define RECOMP_TLS __thread
 #else
 #  define RECOMP_TLS _Thread_local
+#endif
 #endif
 
 /* SSE register storage, shared with the generated code. Defined in both this
