@@ -1,0 +1,172 @@
+JSRF HANDOVER -- CORRECTION: THE WINDOWS ORACLE NEVER REACHES GAMEPLAY
+Date: 2026-09-12 (Europe/London), later
+From: Claude.
+
+SUPERSEDES CLAUDE_HANDOVER_2026-09-12_ADX_STREAM_NEVER_STARTS.txt, WHICH IS
+WRONG AT THE TOP LEVEL. Read this instead. Everything that handover measured
+below the top level is correct and is kept here; what it got wrong is what
+those measurements meant.
+
+
+0. THE CORRECTION
+=================
+That handover said the Windows/macOS audio divergence was that Windows never
+opens D:\Media\Z_ADX\BGM\, and treated that as the root. It is not the root.
+It is the fourth symptom down.
+
+    THE WINDOWS ORACLE NEVER REACHES GAMEPLAY.
+
+Measured with the seventeen CPlayer functions recorded in settled gameplay in
+`render-investigation/cplayer_functions_gameplay.txt`, armed on both hosts with
+the same instrumented build:
+
+    Windows   0 of 17 ever entered
+    macOS    12 of 17, hundreds of calls each (00080340: 566, 000A0260: 591)
+
+And the title screen's own state machine, sub_0004EF90, which is unconditional
+instrumentation and needs no switch:
+
+    macOS    t=29.83  state 0x12 -> 0x13 -> 0x14   (the title tearing down)
+    Windows  no [TITLE-STATE] line at all, in 110 s
+
+So the previous handover's whole audio comparison -- on=5 against on=4,
+fe_methods 4369 against 177 -- was a gameplay scene measured against a
+pre-gameplay one. It was never a valid differential. No music is not an audio
+bug; it is what a title that has not started a stage sounds like.
+
+
+1. WHAT MISLED ME, SO IT DOES NOT MISLEAD YOU
+=============================================
+I checked the "is Windows even at the same point" confound and cleared it on
+evidence that was real and insufficient:
+
+  * both hosts open the same Z:\Media\* directories in near-identical
+    proportions (Event 79/76, Stage 66/66, Mission 52/52, SE 43/38, ...)
+  * both create the same four CRI stream slots within three server ticks
+  * both start four SE voices
+  * Windows is healthy at every other instrument: textures prepared with zero
+    rejects, VBLANK 62.3 Hz, XAudio2 delivering 13,104 buffers
+  * the Windows run was longer than the point at which macOS starts the stream
+
+All true. All compatible with a title sitting in attract, loading the same
+content and never entering it. **Loading a directory is not entering a scene.**
+
+The marker that settles it is a function that only runs in gameplay, and this
+project already had one written down. Use it:
+
+    for va in $(cat render-investigation/cplayer_functions_gameplay.txt); do
+        grep "\[FUNC-HIT\] $va " <log>
+    done
+
+Two other markers are much weaker than they look. Draw totals differ by 113x
+(macOS 317,400 against Windows 2,800), but CLAUDE.md already lists draw counts
+as a known-bad shortcut and the Windows drawing goes through the CPU executor.
+And the Windows framebuffer DOES reach full coverage -- 27 samples at
+153600/153600 -- so "it renders" is true and proves nothing about where it is.
+
+
+2. WHAT STILL STANDS FROM THE SUPERSEDED HANDOVER
+=================================================
+All of it, as measurement. Re-read as symptoms rather than causes:
+
+(a) VOICE 0x44 IS THE ADX MUSIC VOICE. The chain is named end to end:
+
+      D:\Media\Z_ADX\BGM\ opened
+        -> ADX slot 0 (0x0027B1C0, 16 x 0xA4), byte [slot+1]: 0 -> 1 -> 3
+          -> sub_0013EF00 reaches sub_0013ECE0        (needs (stat >> 1) & 1)
+            -> [[slot+0x38]+0x20] == sub_001417B0     (vtable 0x0022DC80)
+              -> sub_0019F1F4                          GetCurrentPosition
+                -> sub_0019ECA3 -> sub_001A43DA -> sub_001A3570 -> voice 0x44
+
+    On macOS every link fires, in that order, starting at about 30 s -- which
+    is exactly when the title tears down. That is the point: the music starts
+    because the stage starts.
+
+(b) THE DSOUND FATAL LATCH IS DEAD ON BOTH HOSTS. 0x001BA04C, 48 readers, one
+    writer at 0x001A2317, never cleared, every reader returns E_FAIL. Measured
+    zero on both hosts with a positive control; sub_001A230D never runs.
+    Do not re-open it.
+
+(c) THE byte [this+0x12] & 3 GATE AT 0x001A43F0 is reached only on macOS,
+    where it passes. Never the question.
+
+(d) "TWO ADJACENT METHODS ON ONE OBJECT" is not what 0x0019F1F4 and
+    0x0019F214 are. They are DirectSound API thunks carrying the MSVC
+    neg/sbb/and null-check idiom, called from seven and nine game sites.
+
+(e) CRI'S STREAM SERVER RUNS IDENTICALLY ON BOTH -- and that is interesting in
+    the new framing. Sixteen slots, the same four in use, the +0x8C gate never
+    taken, Windows ticking MORE than macOS (3809/15236 against 2682/10728).
+    CRI is initialised and healthy on Windows. The game just never asks it for
+    anything, because the game is not in a stage.
+
+
+3. WHERE WINDOWS ACTUALLY STOPS -- WHAT I HAVE
+==============================================
+Not pinned down. What the sweep gives you, all macOS-run / Windows-never, from
+a 539-site func-hit sweep over CRI plus the sound manager:
+
+    sub_0004C400   595 calls   1185 bytes, no static callers, calls sub_00117140
+    sub_000585E0    39 calls   11124 bytes -- a very large update body,
+                               called by 0x0005B3F0 and 0x0005B570
+    sub_00067220  2373 calls   called by 0x0005F590
+    sub_0004EF90     3 calls   the title state machine, 0x12 -> 0x13 -> 0x14
+
+sub_000585E0 at eleven kilobytes is the most promising ladder rung: something
+that large running 39 times on one host and never on the other is a whole
+subsystem, not a branch.
+
+The two CRI functions with game-side callers are sub_0013AA60 and sub_0013AEB0
+(tiny setters, `[this+0x6C] = al` and similar), called from sub_00116AB0,
+sub_00117060, sub_00117140 and sub_001171F0 -- the game's BGM entry points.
+sub_00117140 has nine call sites spread across the game. That is the boundary
+where game code enters CRI, and it is never crossed on Windows.
+
+
+4. HOW TO CARRY THIS ON
+=======================
+Arm func_hit over the scene/mission band and bisect downward from
+sub_000585E0's callers (0x0005B3F0, 0x0005B570) and sub_0005F590. The installer
+handles hundreds of sites at once and needs no regeneration:
+
+    python3 diagnostics/jsrf_first_fault/instrument_func_hit.py \
+        --va-file <file of VAs> --skip-mismatched
+    python3 diagnostics/jsrf_first_fault/instrument_func_hit.py \
+        --remove --va-file <same file> --skip-mismatched
+
+RECOMP_FUNC_HIT_TRACE=1 at run time. The gen tree in build-macos is currently
+left with 556 sites armed (CRI + sound manager + the 17 CPlayer markers).
+
+**Put the gameplay marker in every future Windows/macOS comparison, first,
+before reading any other counter.** Every audio conclusion in the last two
+handovers would have been caught by that one check.
+
+
+5. INSTRUMENTS ADDED THIS SESSION
+=================================
+Read-only and opt-in, installed by instrument_startup.py, all reporting
+unconditionally so a zero count is evidence:
+
+  RECOMP_DSOUND_FATAL=1  [DSOUND-FATAL]  0019F1F4 0019F214 0019ECA3 0019EDCE
+                                         001A230D
+  RECOMP_CRI_DSOUND=1    [CRI-DSOUND]    00143240 001417B0 00141560
+  RECOMP_CRI_SERVER=1    [CRI-SERVER]    0013F080 0013EF00 0013ECE0
+
+Plus: every [FILE] NtOpenFile line now carries `caller=` -- the guest return
+address, read at g_esp-4 the way the unimplemented-ordinal report already does.
+"Which code opens this path" used to be answered by reading neighbouring log
+lines, which is guesswork.
+
+
+6. BUILD AND RUN
+================
+The Windows oracle cross-compiles from any worktree; no separate checkout.
+
+  cmake -S diagnostics/jsrf_first_fault -B <build> \
+    -DCMAKE_TOOLCHAIN_FILE=<toolchain>.cmake \
+    -DRECOMP_GEN_DIR=<gen> -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-DXBOX_WORKER_STACK_COUNT=4"
+
+Toolchain file: CMAKE_SYSTEM_NAME Windows, the three x86_64-w64-mingw32 tools,
+CMAKE_FIND_ROOT_PATH at the mingw sysroot. Bottle "recomp-gate", driven from a
+.bat, RECOMP_AC97_READY=1 mandatory, window always black and not a symptom.

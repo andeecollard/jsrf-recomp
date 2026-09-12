@@ -3511,12 +3511,19 @@ static void bridge_NtOpenFile(void)
             "{root=0x%08X name=0x%08X attributes=0x%08X} "
             "ios=0x%08X access=0x%08X share=0x%08X "
             "disposition=0x%08X options=0x%08X file_attributes=0x%08X "
-            "path=%s\n",
+            "caller=0x%08X path=%s\n",
             handle_va, obj_attrs,
             obj_attrs ? BRIDGE_MEM32(obj_attrs + 0) : 0,
             obj_attrs ? BRIDGE_MEM32(obj_attrs + 4) : 0,
             obj_attrs ? BRIDGE_MEM32(obj_attrs + 8) : 0,
             iostatus, access, share, 1u, options, 0u,
+            /* kernel_thunk_dispatch has popped the dummy return address, so
+             * the guest's own return address sits just below g_esp -- the same
+             * idiom the unimplemented-ordinal report uses. Without it a [FILE]
+             * line says what was opened and never who asked, and "which code
+             * opens this path" has been answered by correlating against
+             * neighbouring log lines, which is guesswork. */
+            g_esp ? (uint32_t)BRIDGE_MEM32(g_esp - 4) : 0,
             path ? path : "<null>");
 
     /* NtOpenFile = NtCreateFile with FILE_OPEN disposition */

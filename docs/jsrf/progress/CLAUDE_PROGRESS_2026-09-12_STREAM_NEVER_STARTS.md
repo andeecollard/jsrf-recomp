@@ -2,6 +2,16 @@
 
 Date: 2026-09-12 (Europe/London)
 
+> **CORRECTED LATER THE SAME DAY.** The measurements below are sound; the
+> conclusion drawn from them was pitched one level too low. The Windows oracle
+> **never reaches gameplay** -- 0 of the 17 CPlayer gameplay functions ever
+> run, and the title state machine sub_0004EF90 never executes -- so the
+> missing BGM open is a symptom, not a root cause, and the whole `on=5` vs
+> `on=4` comparison was a gameplay scene measured against a pre-gameplay one.
+> See `CLAUDE_HANDOVER_2026-09-12_WINDOWS_NEVER_REACHES_GAMEPLAY.txt`.
+> Section "The confound, and why it does not explain this", below, is the part
+> that was wrong: its evidence is real and does not support its conclusion.
+
 Long form behind `CLAUDE_HANDOVER_2026-09-12_ADX_STREAM_NEVER_STARTS.txt`.
 Supersedes the audio half of
 `CLAUDE_PROGRESS_2026-09-11_CONTIG_ALIASES_THE_HEAP.md` and of the
