@@ -1,0 +1,199 @@
+CLAUDE, 13 Sep 2026 (later session)
+THE MISSING SCENERY WAS A REFUSED BLEND. THE Z-CLIPPING LEAD IS RETRACTED.
+
+Supersedes CLAUDE_HANDOVER_2026-09-13_THE_TUTORIAL_IS_PASSED.txt, which is
+correct except for its section 4. Read section 1 here before believing any
+counter in this project.
+
+
+0. STATE OF PLAY
+================
+HEAD 680c753, three commits this session, working tree clean apart from the two
+pre-existing iCloud conflict duplicates (`src/kernel/kernel_bridge 2.c`,
+`src/kernel/xbox_memory_layout 2.c`) which are still not built and still safe
+to delete. NOT PUSHED at handover: origin/main is behind by all three.
+
+Build tree is still /Users/andrewcollard/jsrf-build via the `build-macos`
+symlink; nothing about that changed. Python tests 160, all passing. ctest is
+24 tests now rather than 27, and the two Python failures left are truthful.
+
+    PYTHON=/usr/bin/python3 diagnostics/jsrf_first_fault/regenerate.sh
+    cmake --build build-macos/jsrf-first-fault/build --target jsrf_first_fault -j 6
+
+NOTE: the lifter change below is NOT in the gen tree. It needs a regeneration,
+which this session did not run.
+
+
+1. THE METHOD, AGAIN, BECAUSE IT CAUGHT A WHOLE DAY'S WRONG CONCLUSION
+======================================================================
+**Read what increments a counter before you difference it.** The previous
+session's z-clipping finding rested on an A/B of `s_gpu.tris_drawn` with
+RECOMP_METAL_DEPTH_CLAMP on and off, 18.46M against 15.26M. That counter is
+`nv2a_metal_draw`'s return value, `n/3` -- triangles assembled and culled,
+computed BEFORE the render encoder is created. The clip mode is set on the
+encoder afterwards. The counter cannot respond to it, at all. The two numbers
+differed because the two runs got different distances into the title.
+
+This is the third counter in this project to lie in the same way, and the rule
+in CLAUDE.md already said so. It is cheap to check and it was not checked.
+
+The second half of the method: **when you think geometry is being dropped,
+count the drops at every stage, and split each bucket by whether the geometry
+had any business being drawn.** A raw drop count is meaningless -- most
+dropped triangles are supposed to be dropped.
+
+
+2. RETRACTED, WITH THE MEASUREMENT THAT DID IT
+==============================================
+`RECOMP_METAL_CLIP_AUDIT=1` (new, opt-in, read-only, in nv2a_metal.m)
+recomputes on the CPU exactly the clip position the vertex shader emits and
+applies exactly Metal's volume to it. Over 37.7M triangles at the Corn
+tutorial:
+
+    discarded by the far plane                           0
+    discarded while fully on screen with every w > 0     0
+
+Both zero. The far plane CANNOT fire: the shader clamps z into [0,16777215]
+and only then multiplies by w, so 0 <= z*w <= w holds identically for w > 0.
+For w > 0 the side planes reduce to "every vertex beyond one screen edge",
+which is correct culling. Every discard the audit finds has w < 0 -- geometry
+behind the camera, which the guest's own perspective divide mirrors through
+the viewport origin, so it lands on screen looking legitimate. Discarding it
+is right, and recovering it is all RECOMP_METAL_DEPTH_CLAMP ever did: it drew
+mirrored garbage over large areas, which is why it halved the frame rate.
+
+The clamp switch stays, off, as the positive control for this class of claim.
+
+Two more figures the audit settles, so nobody spends a day on them:
+  * 14.5% of assembled triangles have ZERO AREA -- but 98.9% of those have a
+    duplicate vertex. Triangle-strip stitching. Supposed to vanish. (xemu
+    ground truth agrees JSRF is strip-dominated: 2002 strips vs 0 plain
+    triangle lists at the tutorial.)
+  * 42.5% backface culled, with front_cw on 113.0M of 113.1M. Ordinary. And
+    front_ccw occurs ONLY when culling is off -- exactly equal counts, every
+    report -- so the winding plumbing is not misread.
+
+
+3. FIXED: THE DRAWS THAT WERE BEING DELETED
+===========================================
+`prepare_texture_copy` accepted four blend factors: ZERO, ONE, SRC_ALPHA,
+ONE_MINUS_SRC_ALPHA. The factor was modelled as one scalar float, and
+DST_COLOR is per-channel, so it could not be expressed and was refused.
+
+JSRF asks for **DST_COLOR/ZERO**, a multiply blend. A refusal there is not a
+degraded draw. prepare_texture_copy returns an error, nv2a_pb_exec.c:2117
+returns, and the batch reaches NEITHER Metal NOR the CPU rasteriser. It is
+deleted. Measured before the fix: **6034 draws in a 150 s run**, onset the
+exact moment the tutorial scene loads, recurring about once a frame, count
+rising monotonically (0,0,0,0,27,134,410,692,1039,1802,4200,5542,5828,6034).
+
+A deleted draw is a whole flat piece of scene that never gets painted. That is
+the reported symptom, and it had nothing to do with clipping.
+
+Fixed: per-channel factors in all three sinks -- the Metal fragment shader, the
+CPU rasteriser, and the D3D11 blend state which supports them natively -- gated
+by one shared predicate, `nv2a_texture_copy_blend_factor_supported`, so the
+three cannot drift apart. The destination-ALPHA factors stay refused and the
+comment says why: the Metal surface keeps its 24-bit depth in the alpha
+channel, so there is no destination alpha there to read. Adding them means
+giving that path a real alpha channel first.
+
+Also removed from all three: a silent `default:` that returned ONE_MINUS_SRC
+_ALPHA for any factor it did not recognise. An unreachable factor now
+contributes nothing rather than quietly rendering as something else.
+
+MEASURED AFTER: the same state logs without REFUSED; rejected falls 6034 -> 0
+across 733,909 draws; the run reaches live=161 with no fault. Confirmed again
+on two further runs, 370,790 and 389,792 draws, rejected=0 on both.
+
+**NOT VERIFIED VISUALLY.** Nobody has looked at the screen since the fix. Those
+6034 draws per run now paint something that was previously invisible, and a
+multiply blend that is subtly wrong will look like a dark overlay rather than
+like nothing. That is the first thing to check.
+
+
+4. FIXED: A CRASH REPORT THAT COULD NOT NAME THE CRASH
+======================================================
+37 of 277 archived runs end in a guest fault -- **13%** -- and none of the
+reports say where. Two sites dominate LAST INSTRUMENTED GUEST FUNCTION:
+
+    19  sub_00147EBB   XapiThreadStartup(DWORD, DWORD)
+    15  sub_00177FE0   Controller::AddRef(Controller *this)
+
+The first is not a crashing function. It is the thread entry trampoline, and
+that line reports the most recent function the TRACER saw, which on a
+worker-thread fault is many frames above the code that died. GUEST EIP/BLOCK
+reads `unavailable` on all of them and GUEST REGISTERS is the main thread's
+globals, not the faulting thread's.
+
+`describe_host_address()` now runs dladdr on HOST PC and HOST LR. 9100 of the
+9140 generated sub_* are external symbols, so a fault in translated code gets
+a name and an offset. Caveats are in the comment: dladdr returns the nearest
+PRECEDING symbol (a four-digit offset means the name is a neighbour, not the
+answer), and _DARWIN_C_SOURCE must precede the include or it compiles and then
+fails at the call.
+
+Verified standalone, NOT yet on a real fault -- three runs afterwards did not
+crash, which at 13% is the likely outcome and is not evidence either way.
+
+WHAT THE FAULT ADDRESSES SAY, for whoever picks this up (guest base
+0x300000000):
+
+    20x  0x3FFFFFFxx   guest 0xFFFFFFxx. A small NEGATIVE value used as a
+                       pointer: EAX=FFFFFFB4 (-76) read at +10, ESI=FFFFFFF0
+                       (-16) read at +8. The `NULL - offset` shape of an
+                       unterminated list walk or an unchecked lookup.
+    13x  0x385.. 0x38B..  guest 0x8xxxxxxx, the physical-window alias range.
+
+Get one crash with the new report and it should name the function directly.
+
+
+5. HOUSEKEEPING DONE
+====================
+  * Four backports retired: the lifter emits their fixed form itself, so they
+    passed as tautologies or failed because a chunk moved. Each retirement
+    quotes the emitted line in the CMake comment.
+  * TWO KEPT AND STILL FAILING ON PURPOSE: jsrf_shared_zf_branch and
+    jsrf_exec_state_flag_merge are two of the four reachable dead branches.
+    They are the only site-specific gates on those defects. Do not "fix" them
+    by deletion.
+  * The ratchet gates on the REACHABLE count, now 4, not the tree total of 90.
+    At 76-against-90 it could never pass. If functions.json is unreadable it
+    now FAILS rather than silently falling back to the total.
+  * in/out/wbinvd/invd/invlpg emit an explicitly marked no-op:
+    `grep -rn RECOMP-IGNORED-PRIV <gen>` enumerates every site. hlt and the
+    ins/outs string forms are deliberately excluded -- a silent no-op there
+    would be a real behaviour change. NEEDS A REGENERATION to appear.
+
+
+6. WHAT IS LEFT, IN THE ORDER I WOULD TAKE IT
+=============================================
+  1. **Look at the screen.** Section 3 is unverified visually.
+  2. **The 13% crash.** The report can name it now. One crash is all it needs.
+  3. **`oPos is not finite` kills whole batches.** ~52 of 166k batches, and
+     the previous handover's "the count is STATIC, so it happens early and
+     stops" is WRONG -- it climbs through a run (23,31,54,94,101). The detail
+     value is 0, meaning screen X is non-finite. VSH_REJECT drops the ENTIRE
+     batch, while the Metal sink's vertex_valid() already drops non-finite
+     vertices per triangle -- so the batch-level kill is strictly more
+     destructive than it needs to be. But the NaN is a PRODUCER bug: find what
+     makes a non-finite X before softening the gate.
+  4. **The title stall, still roughly 1 in 3.**
+  5. 197k collinear-distinct triangles per run are flattened to zero area,
+     0.17% of the total. The candidate is the 1/16-pixel quantisation at
+     nv2a_pb_exec.c:1813, which also uses truncf where NV2A rounds. Small.
+
+
+7. TRAPS ADDED TO THE LIST
+==========================
+  * `s_gpu.tris_drawn` counts triangles SUBMITTED, after CPU culling and
+    before the encoder. It is blind to clipping, to the fragment shader, and
+    to anything the GPU decides. Do not A/B a GPU state against it.
+  * There are TWO counters called `rejected` in the log. `prepared=N
+    rejected=M` is whole draws refused by prepare_texture_copy. `[VSH]
+    executed batches=N rejected=M` is batches refused by the vertex stage.
+    Grepping `rejected=[0-9]+` gets you whichever came last.
+  * A run's depth into the title varies enormously with nothing changed:
+    296k draws and live=61 on one run, 733k and live=161 on the next, same
+    binary. Never compare two runs' totals without checking how far each got.
+    This is what made the retracted A/B look real.
