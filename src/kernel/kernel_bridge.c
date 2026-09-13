@@ -2302,6 +2302,21 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
  * Do not re-add the naive version. It builds, it links, it looks right, and it
  * stops the title. */
 
+
+/* RECOMP_PGRAPH_ISR_TRACE, read once.
+ *
+ * This was two unconditional getenv calls on two of the hottest paths in the
+ * bridge: bridge_vblank_poll runs every vblank poll and bridge_run_isr on
+ * every interrupt handoff. getenv takes a lock and walks the environment
+ * linearly on macOS, and a 12 s profile of the Corn tutorial put __findenv
+ * above nv2a_metal_draw. The switch cannot change during a run. */
+static int bridge_isr_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PGRAPH_ISR_TRACE") != NULL;
+    return on;
+}
+
 static uint32_t bridge_run_isr(uint32_t interrupt_va)
 {
     uint32_t routine, context;
@@ -2327,7 +2342,7 @@ static uint32_t bridge_run_isr(uint32_t interrupt_va)
 
     {
         BridgeGuestRegs saved;
-        if (getenv("RECOMP_PGRAPH_ISR_TRACE") &&
+        if (bridge_isr_trace() &&
             BRIDGE_MEM32(interrupt_va + 8) == BRIDGE_NV2A_VECTOR) {
             g_current_isr_handoff = InterlockedIncrement(&g_isr_handoff_seq);
             /* A healthy render loop executes this thousands of times. Keep
@@ -2575,7 +2590,7 @@ static void bridge_vblank_poll(void)
     static DWORD next_vblank = 0;
     DWORD now;
     int i;
-    int trace = getenv("RECOMP_PGRAPH_ISR_TRACE") != NULL;
+    int trace = bridge_isr_trace();
     int pending_at_entry = xbox_Nv2aSoftwareMethodPending();
 
     if (trace) {

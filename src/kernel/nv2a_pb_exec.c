@@ -1215,6 +1215,138 @@ static uint32_t surface_nonzero(uint32_t offset, uint32_t bpp)
  *
  * RECOMP_FLIP_TRACE=<stride> traces every stride-th flip, capped, so a
  * 110-second run costs a few dozen lines. Silent unless asked for. */
+/* Frame pacing, at the title's own frame boundary.
+ *
+ * There was no frame-time instrument here at all, which is why every
+ * performance claim in this project so far has been made in one of three
+ * currencies -- seconds of boot, total draws, or controller polls -- and none
+ * of them is what a player feels. Boot time is dominated by file I/O. Total
+ * draws divided by seconds is a mean, and a mean hides exactly the thing that
+ * makes a game unplayable: a 90th percentile twice the median, or one 400 ms
+ * stall a second. Two runs can post the same mean and be completely different
+ * to play.
+ *
+ * NV097_FLIP_STALL is the right boundary and the only honest one: it is the
+ * guest saying "this frame is finished", so the interval between two of them
+ * is a frame as the title counts them. Deliberately measured FIRST in that
+ * dispatch, before snapshot_surface(), so each interval covers everything
+ * that happened in the frame including our own diagnostic sync -- the cost is
+ * real, the player pays it, and leaving it out would flatter us.
+ *
+ * A histogram rather than a running mean, because percentiles are the point.
+ * 500 us bins to 128 ms and one overflow bucket: 2 KB of statics, one
+ * clock_gettime and one increment per frame, against a [FB] line that already
+ * checksums the entire framebuffer once a second. Unconditional for that
+ * reason -- an opt-in perf counter is one nobody has switched on when they
+ * need the number.
+ *
+ * Percentiles report their bin's UPPER edge, so p50=16.5 means "half of all
+ * frames finished in 16.5 ms or less", accurate to the 0.5 ms bin width.
+ * max_us is exact and is not binned. */
+#define FRAME_BIN_US   500u
+#define FRAME_BINS     257u          /* 0..128 ms, plus one overflow bucket */
+typedef struct {
+    unsigned long long n, total_us, bin[FRAME_BINS];
+    unsigned long long max_us;
+} FrameHist;
+
+/* Two of them, and the second is the one you usually want.
+ *
+ * `run` is everything since process start. It is the honest summary of a whole
+ * session, and it is nearly useless for comparing two builds, because a JSRF
+ * run is three or four different workloads in sequence -- logos, title menu,
+ * cutscene, gameplay -- and a cumulative percentile is a blend of however much
+ * of each this particular run happened to reach. Two runs that got to
+ * different places post different percentiles for that reason alone, which is
+ * the same trap as comparing their draw totals.
+ *
+ * `win` covers only the interval since the previous report, so successive
+ * lines describe successive segments and a scene can be compared against the
+ * same scene in another run. Zeroed at the end of every report. */
+static struct {
+    FrameHist run, win;
+    struct timespec last;
+    int started;
+} s_frame;
+
+static void frame_stats_flip(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (s_frame.started) {
+        /* Signed, and in that order: tv_nsec wraps every second, so the naive
+         * unsigned difference reads about 4e9 us once a second. */
+        long long us = (long long)(now.tv_sec - s_frame.last.tv_sec) * 1000000LL
+                     + ((long long)now.tv_nsec - (long long)s_frame.last.tv_nsec) / 1000LL;
+        unsigned b;
+        if (us < 0) us = 0;
+        b = (unsigned)((unsigned long long)us / FRAME_BIN_US);
+        if (b >= FRAME_BINS) b = FRAME_BINS - 1u;
+        s_frame.run.bin[b]++;
+        s_frame.win.bin[b]++;
+        s_frame.run.n++;
+        s_frame.win.n++;
+        s_frame.run.total_us += (unsigned long long)us;
+        s_frame.win.total_us += (unsigned long long)us;
+        if ((unsigned long long)us > s_frame.run.max_us)
+            s_frame.run.max_us = (unsigned long long)us;
+        if ((unsigned long long)us > s_frame.win.max_us)
+            s_frame.win.max_us = (unsigned long long)us;
+    }
+    s_frame.last = now;
+    s_frame.started = 1;
+}
+
+/* Upper edge of the bin the p-th percentile falls in, in milliseconds. The
+ * overflow bucket has no upper edge, so it reports the bottom of the bucket
+ * and the caller's max_us is what says how far past it the run actually got. */
+static double frame_pct(const FrameHist *h, double p)
+{
+    unsigned long long want, seen = 0;
+    unsigned i;
+    if (!h->n) return 0.0;
+    want = (unsigned long long)((double)h->n * p);
+    if (want < 1) want = 1;
+    for (i = 0; i < FRAME_BINS; ++i) {
+        seen += h->bin[i];
+        if (seen >= want)
+            return (i + 1u == FRAME_BINS)
+                 ? (double)(FRAME_BINS - 1u) * FRAME_BIN_US / 1000.0
+                 : (double)(i + 1u) * FRAME_BIN_US / 1000.0;
+    }
+    return (double)(FRAME_BINS - 1u) * FRAME_BIN_US / 1000.0;
+}
+
+static void frame_hist_line(const char *tag, const FrameHist *h)
+{
+    double mean_ms;
+    unsigned long long over = 0;
+    unsigned i;
+    /* Frames that missed 30 Hz outright. A percentile says where the bulk
+     * sits; this says how often the title visibly hitched. */
+    for (i = 33000u / FRAME_BIN_US + 1u; i < FRAME_BINS; ++i)
+        over += h->bin[i];
+    mean_ms = (double)h->total_us / (double)h->n / 1000.0;
+    fprintf(stderr, "  [%s] flips=%llu mean=%.2f ms (%.1f fps)"
+            " p50=%.1f p90=%.1f p99=%.1f max=%.1f ms  over-33ms=%llu\n",
+            tag, (unsigned long long)h->n, mean_ms,
+            mean_ms > 0.0 ? 1000.0 / mean_ms : 0.0,
+            frame_pct(h, 0.50), frame_pct(h, 0.90), frame_pct(h, 0.99),
+            (double)h->max_us / 1000.0, over);
+}
+
+static void frame_stats_report(void)
+{
+    if (!s_frame.run.n) {
+        fprintf(stderr, "  [FRAME] no FLIP_STALL yet\n");
+        return;
+    }
+    frame_hist_line("FRAME", &s_frame.run);
+    if (s_frame.win.n)
+        frame_hist_line("FRAME-WIN", &s_frame.win);
+    memset(&s_frame.win, 0, sizeof s_frame.win);
+}
+
 static void flip_trace(void)
 {
     static long stride = -1;
@@ -1937,9 +2069,66 @@ static int prepare_vertices(void)
  * The first draw and two later samples distinguish initial setup from steady
  * state. Raw method values are included even when rendering does not support
  * them yet. The snapshot format is deliberately independent of C structs. */
+/* One getenv per switch, cached for the life of the process.
+ *
+ * getenv is not free: on macOS it takes a lock and walks the environment
+ * linearly (__findenv_locked), and on Windows it walks a block. Most switches
+ * in this file already read through the `static int on = -1` idiom for that
+ * reason -- see nv2a_gpu_on() and the comment above it. These four were
+ * missed, and they sit in the three hottest functions in the file:
+ * nv2a_pb_exec_method runs once per pushbuffer METHOD, draw_primitive and
+ * capture_draw once per draw.
+ *
+ * MEASURED, 12 s sample of the title at the menu scene on the -O2 build:
+ * getenv cost 444 samples, against 320 for the whole vertex shader
+ * interpreter and 60 for nv2a_metal_draw -- roughly half of all the CPU this
+ * file was using, spent asking the environment about switches that were off.
+ *
+ * Caching means the value is the environment as it stood at first use. That is
+ * already the contract every other switch in this file has, and nothing sets
+ * these after startup. */
+static int pb_env_on(const char *name, int *slot)
+{
+    if (*slot < 0) *slot = getenv(name) != NULL;
+    return *slot;
+}
+
+/* The string form, for switches that carry a value. Caches the miss too, so a
+ * switch that is off costs one getenv for the whole run rather than one per
+ * draw. Returns NULL when unset, exactly as getenv does.
+ *
+ * The sentinel is not decoration. Caching a miss as "" would make a variable
+ * that is SET TO AN EMPTY STRING indistinguishable from one that is unset, and
+ * they do not mean the same thing here: RECOMP_DRAW_CAPTURE="" is a valid
+ * (if odd) prefix that captures into the working directory, and getenv reports
+ * it as non-NULL. An address no string literal can share keeps the two
+ * apart, so this is a cache and not a behaviour change. */
+static const char pb_env_unset[1];
+
+static const char *pb_env_str(const char *name, const char **slot)
+{
+    if (!*slot) {
+        const char *v = getenv(name);
+        *slot = v ? v : pb_env_unset;
+    }
+    return *slot == pb_env_unset ? NULL : *slot;
+}
+
+static int pb_verbose(void)
+{
+    static int on = -1;
+    return pb_env_on("RECOMP_PB_EXEC_VERBOSE", &on);
+}
+
+static const char *pb_draw_capture(void)
+{
+    static const char *slot;
+    return pb_env_str("RECOMP_DRAW_CAPTURE", &slot);
+}
+
 static void capture_bytes(const char *extension, const void *data, size_t size)
 {
-    const char *prefix = getenv("RECOMP_DRAW_CAPTURE");
+    const char *prefix = pb_draw_capture();
     if (!prefix || !data || !s_capture_selected) return;
     char path[768];
     snprintf(path, sizeof(path), "%s%06u.%s", prefix, s_gpu.draws, extension);
@@ -1951,8 +2140,9 @@ static void capture_bytes(const char *extension, const void *data, size_t size)
 
 static void capture_draw(const char *error)
 {
-    const char *prefix = getenv("RECOMP_DRAW_CAPTURE");
-    const char *sample=getenv("RECOMP_DRAW_SAMPLE");
+    const char *prefix = pb_draw_capture();
+    static const char *sample_slot;
+    const char *sample = pb_env_str("RECOMP_DRAW_SAMPLE", &sample_slot);
     s_capture_selected = prefix && (s_gpu.draws == 1 || s_gpu.draws == 128 || s_gpu.draws == 2048
             || s_combiner_capture || (sample && s_gpu.draws==strtoul(sample,NULL,0))
             || (error && s_copy.rejected < 2));
@@ -2213,12 +2403,15 @@ batch_complete:
          * behaviour of the first few. */
         static unsigned batches, captured;
         static long stride = -1;
+        static const char *dump_slot;
+        static int dump_on;
         if (stride < 0) {
-            const char *env = getenv("RECOMP_FB_DUMP_DRAW");
+            const char *env = pb_env_str("RECOMP_FB_DUMP_DRAW", &dump_slot);
+            dump_on = env != NULL;
             stride = env && *env ? strtol(env, NULL, 0) : 0;
             if (stride < 1) stride = 1;
         }
-        if (getenv("RECOMP_FB_DUMP_DRAW") && captured < 24
+        if (stride > 0 && dump_on && captured < 24
                 && (batches++ % (unsigned long)stride) == 0) {
             dump_surface_bmp("draw", captured++);
         }
@@ -2268,7 +2461,7 @@ static void draw_primitive(void)
 
     raster_batch();
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -2331,7 +2524,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose()) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -2501,6 +2694,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     /* The title's own frame boundary: this frame is finished. */
     case NV097_FLIP_STALL:
+        /* First, so the interval covers the whole frame -- see frame_stats_flip. */
+        frame_stats_flip();
 #ifdef nv2a_gpu_surface_report
         /* BEFORE the snapshot, because the snapshot syncs: the question is
          * what the GPU still owes guest RAM at the moment the guest calls the
@@ -2526,7 +2721,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * below is the same one the indexed path uses. */
             if (s_gpu.inline_count) {
                 inline_layout();
-                if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+                if (pb_verbose()) {
                     static int shown_inline;
                     if (shown_inline++ < 40) {
                         uint32_t a, k;
@@ -2934,6 +3129,7 @@ void nv2a_pb_exec_report(void)
                 (unsigned long long)s_blend_fade_fate.prepare_rejected,
                 (unsigned long long)s_blend_fade_fate.rasterised);
     }
+    frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)
         fprintf(stderr,"[TEXTURE]   %llu  %s\n",(unsigned long long)s_texture_reasons[i].count,s_texture_reasons[i].reason);
