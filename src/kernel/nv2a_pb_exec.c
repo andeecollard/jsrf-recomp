@@ -2206,6 +2206,12 @@ static int pb_verbose(void)
     return pb_env_on("RECOMP_PB_EXEC_VERBOSE", &on);
 }
 
+static int pb_vertex_range(void)
+{
+    static int on = -1;
+    return pb_env_on("RECOMP_VERTEX_RANGE", &on);
+}
+
 static const char *pb_draw_capture(void)
 {
     static const char *slot;
@@ -2532,8 +2538,21 @@ static void draw_primitive(void)
      * A pipeline that decodes perfectly and draws nothing is indistinguishable
      * from one that never ran, unless the vertices themselves are measured.
      * Include every input vertex, not only the first (often the same corner
-     * of a full-screen triangle). This is explicitly a pre-shader range. */
-    {
+     * of a full-screen triangle). This is explicitly a pre-shader range.
+     *
+     * OPT-IN since 13 Sep 2026, and it should have been from the start. This is
+     * a SECOND full pass over every vertex of every draw -- its own
+     * fetch_vertex per index, on top of the one the vertex pipeline already
+     * does -- and it exists solely to print one diagnostic line per report. It
+     * ran unconditionally on the hottest path in the renderer for the whole of
+     * bring-up. That was the right trade while "does anything have coordinates
+     * at all" was an open question; it is not now that the title renders.
+     *
+     * RECOMP_VERTEX_RANGE=1 brings it back. The report says so when it is off,
+     * rather than printing a stale or zeroed range as though it were measured
+     * -- an instrument that silently reports nothing is worse than one that is
+     * plainly absent. */
+    if (pb_vertex_range()) {
         float p[4];
         int nonzero=0;
         for (i=0; i<s_gpu.idx_count; ++i) if (fetch_vertex(0, s_gpu.idx[i], p)) {
@@ -3260,10 +3279,15 @@ void nv2a_pb_exec_report(void)
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
             s_gpu.unhandled_total, s_unhandled_count);
-    fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
-                    " input x %.1f..%.1f  y %.1f..%.1f\n",
-            s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
-            s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    if (pb_vertex_range())
+        fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
+                        " input x %.1f..%.1f  y %.1f..%.1f\n",
+                s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
+                s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    else
+        fprintf(stderr, "[GPU] draws %u, %u indices; input range not measured"
+                        " (RECOMP_VERTEX_RANGE=1)\n",
+                s_gpu.draws, s_gpu.verts);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
     {
