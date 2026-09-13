@@ -1202,17 +1202,23 @@ static void voice_short_note(uint16_t v, int produced, int requested)
     if (produced == 0) r->dry_calls++;
 }
 
-/* A starved voice contributes silence, never stack residue.
+/* A starved voice contributes silence, and says so here rather than relying on
+ * a memset in its caller.
  *
- * voice_process declares `float samples[NUM_SAMPLES_PER_FRAME][2]` as a plain
- * uninitialised local and then mixes ALL of it into the mixbins -- the mix loop
- * does not know how many entries were actually produced. So any path that fills
- * fewer than it was asked for mixes whatever was on the stack into the output:
- * usually the previous voice's samples, which is audible as a fragment of the
- * wrong sound rather than as a gap.
+ * CORRECTION, and it is the point of this comment. An earlier version of this
+ * said voice_process mixed "stack residue" into the output on a short return,
+ * because `float samples[NUM_SAMPLES_PER_FRAME][2]` is a plain local and the
+ * mix loop walks all 32 entries regardless of how many were produced. The
+ * second half is true. The first half is not: the very next line after that
+ * declaration is `memset(samples, 0, sizeof(samples))`, and git blame puts it
+ * in the original import (7a71ed2), so a short return has ALWAYS produced
+ * silence in the tail, here and in upstream and in burnout3-research alike.
+ * The claim came from reading the declaration and not the line under it.
  *
- * xemu has the identical caller, `if (count < 0) break;`, and does not have the
- * bug, because its resampler's callback guarantees a full frame:
+ * So this is not a bug fix and must not be cited as one. What it is: the
+ * guarantee now lives in the function that knows how many samples it produced,
+ * instead of depending on a memset in a different function that nothing
+ * connects to it. That is where xemu puts it --
  *
  *     if (sample_count < NUM_SAMPLES_PER_FRAME) {
  *         // Starvation causes SRC hang on repeated calls. Provide silence.
@@ -1220,9 +1226,12 @@ static void voice_short_note(uint16_t v, int produced, int requested)
  *         sample_count = NUM_SAMPLES_PER_FRAME;
  *     }
  *
- * (hw/xbox/mcpx/apu/vp/vp.c, voice_resample_callback). So the guarantee belongs
- * here, at the bottom of the resampler, not in the caller -- which is where
- * xemu put it and why its version of this loop is safe. */
+ * (hw/xbox/mcpx/apu/vp/vp.c, voice_resample_callback), and xemu's caller is
+ * byte-identical to ours, so the placement is the whole of the difference.
+ *
+ * MEASURED: with RECOMP_VOICE_RATES counting short and dry returns per voice,
+ * every voice reports short=0 dry=0 over 154 s reaching the Corn tutorial. This
+ * path does not execute. It is cheap insurance, not a repair. */
 static void voice_fill_silence(float samples[][2], int from, int to)
 {
     if (from < to)
