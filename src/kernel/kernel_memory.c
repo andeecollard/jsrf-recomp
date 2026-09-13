@@ -141,9 +141,24 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Report the RAM this run actually has, not the retail constant.
+     *
+     * This said 64 MB unconditionally, while g_xbox_total_ram is runtime-
+     * settable (xbox_SetTotalRam, RECOMP_TOTAL_RAM_MB) precisely so a debug or
+     * beta build made for a 128 MB devkit can be run. A title that asks how much
+     * memory it has and is told 64 MB will size its pools for 64 MB, which
+     * defeats the whole point of the override -- and it would be told so
+     * silently, which is the part that makes it a bug rather than a limitation.
+     *
+     * Found during a sweep for hardcoded 64 MB assumptions after the APU was
+     * caught masking every DMA to that size while the map was twice as large. */
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+    {
+        extern size_t g_xbox_total_ram;
+        size_t ram = g_xbox_total_ram ? g_xbox_total_ram
+                                      : (size_t)64 * 1024 * 1024;
+        MemoryStatistics->TotalPhysicalPages = (ULONG)(ram / page_size);
+    }
     MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
         MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;

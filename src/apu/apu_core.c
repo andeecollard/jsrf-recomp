@@ -836,7 +836,7 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
 
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
-    extern size_t xbox_GetMemorySize(void);
+    extern size_t xbox_GetMappedSize(void);
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -848,7 +848,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
      * size-1; anything else falls back to 64 MB, which is the old behaviour and
      * says so rather than inventing a mask for a size nobody has seen. */
     {
-        size_t sz = xbox_GetMemorySize();
+        size_t sz = xbox_GetMappedSize();
         if (sz && (sz & (sz - 1)) == 0 && sz <= 0x100000000ull) {
             g_apu_ram_mask = (uint32_t)(sz - 1);
         } else {
