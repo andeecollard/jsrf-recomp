@@ -78,6 +78,14 @@ typedef struct XBOX_INPUT_CAPABILITIES {
 #define XBOX_BUTTON_LTRIGGER    6
 #define XBOX_BUTTON_RTRIGGER    7
 
+/* One clock for every input-side log line.
+ *
+ * RECOMP_PAD_SCRIPT's schedule, the pad trace and anything correlating the
+ * title's state against a press all have to agree about what t=2.0 means, or
+ * a schedule cannot be tuned from the log it produced. Zero is set at
+ * xbox_InputInit. */
+double xbox_InputSeconds(void);
+
 /* ================================================================
  * Public API
  * ================================================================ */

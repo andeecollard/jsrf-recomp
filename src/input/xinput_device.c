@@ -27,6 +27,15 @@
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
+double xbox_InputSeconds(void)
+{
+    static DWORD t0;
+    static int have_t0;
+    DWORD now = GetTickCount();
+    if (!have_t0) { t0 = now; have_t0 = 1; }
+    return (double)(now - t0) / 1000.0;
+}
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -299,6 +308,12 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>      /* RECOMP_PAD_SCRIPT parses its schedule */
+#include <strings.h>    /* strncasecmp, so button names are case-insensitive */
+
+static double fake_pad_seconds(void);
+static int  pad_script_on(void);
+static void pad_script_apply(XBOX_INPUT_STATE *st);
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
@@ -397,6 +412,14 @@ void xbox_InputInit(void)
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     refresh_controllers(1);
+
+    /* Anchor RECOMP_PAD_SCRIPT's t=0 here rather than at the first poll. The
+     * guest does not poll until its USB driver is up, and how long that takes
+     * varies, so a schedule measured from the first poll is not the same
+     * schedule twice. Parsing here also puts any complaint about the schedule
+     * at the top of the log rather than minutes into the run. */
+    fake_pad_seconds();
+    (void)pad_script_on();
 }
 
 /* A pad that is present and pressing things, for bring-up without hardware.
@@ -464,6 +487,8 @@ static int fake_pad_start(double t)
     return t < window;
 }
 
+double xbox_InputSeconds(void) { return fake_pad_seconds(); }
+
 static double fake_pad_seconds(void)
 {
     static struct timespec t0;
@@ -506,6 +531,224 @@ void xbox_InputPollReport(void)
             g_pad_polls_disconnected);
     fflush(stderr);
     w32_thread_trace_report();
+}
+
+/* RECOMP_PAD_SCRIPT -- a timed list of presses, so an unattended run can steer.
+ *
+ * The pulse above cannot reach a new game. It presses the same two buttons on
+ * a blind one-per-second beat, which walks the title as far as live=133 and
+ * 1342 file opens and stops there; New Game's live=56 / 1408 has only ever
+ * been reached by a person holding the pad. That made every measurement past
+ * the title screen cost a human playthrough, and section 4 of the 12 Sep
+ * handover is what happens when a measurement is expensive enough to tempt
+ * you into inferring it instead.
+ *
+ * A schedule is the whole difference: menus need DOWN and A at particular
+ * moments, not A forever, and a confirm whose default is "no" is invisible to
+ * a masher. So:
+ *
+ *   RECOMP_PAD_SCRIPT="2:START 6:A 9:DOWN 10:A"        inline
+ *   RECOMP_PAD_SCRIPT=@diagnostics/.../new_game.pad    one event per line
+ *
+ * Each event is  <t>:<BUTTONS>[:<hold>]  -- t seconds after xbox_InputInit,
+ * BUTTONS one or more names joined by '+', hold in seconds (default 0.20,
+ * which is 12 frames at 60 Hz). Events may overlap; they are OR'd together.
+ *
+ * Names: START BACK LTHUMB RTHUMB UP DOWN LEFT RIGHT
+ *        A B X Y WHITE BLACK LT RT
+ *        LUP LDOWN LLEFT LRIGHT RUP RDOWN RLEFT RRIGHT   (stick deflections)
+ *
+ * Unlike RECOMP_FAKE_PAD this MERGES rather than replaces: with a controller
+ * attached the live report is read first and the scripted presses are OR'd
+ * into it, so a person can take over a run the script has driven into place.
+ * With no controller attached port 0 still reports connected, which is what
+ * makes an unattended run possible at all.
+ */
+#define PAD_SCRIPT_MAX      256
+#define PAD_SCRIPT_HOLD     0.20
+
+struct pad_script_ev {
+    double t0, t1;
+    WORD   buttons;
+    BYTE   analog[8];
+    SHORT  lx, ly, rx, ry;
+    int    fired;
+};
+
+static struct pad_script_ev g_pad_script[PAD_SCRIPT_MAX];
+static int g_pad_script_n = -1;
+
+static const struct { const char *name; WORD bit; } pad_script_bits[] = {
+    { "START",  XBOX_GAMEPAD_START      }, { "BACK",   XBOX_GAMEPAD_BACK       },
+    { "LTHUMB", XBOX_GAMEPAD_LEFT_THUMB }, { "RTHUMB", XBOX_GAMEPAD_RIGHT_THUMB},
+    { "UP",     XBOX_GAMEPAD_DPAD_UP    }, { "DOWN",   XBOX_GAMEPAD_DPAD_DOWN  },
+    { "LEFT",   XBOX_GAMEPAD_DPAD_LEFT  }, { "RIGHT",  XBOX_GAMEPAD_DPAD_RIGHT },
+};
+static const struct { const char *name; int idx; } pad_script_analog[] = {
+    { "A", XBOX_BUTTON_A }, { "B", XBOX_BUTTON_B },
+    { "X", XBOX_BUTTON_X }, { "Y", XBOX_BUTTON_Y },
+    { "WHITE", XBOX_BUTTON_WHITE }, { "BLACK", XBOX_BUTTON_BLACK },
+    { "LT", XBOX_BUTTON_LTRIGGER }, { "RT", XBOX_BUTTON_RTRIGGER },
+};
+/* Full deflection, not the 4096 the report path uses to reject jitter: a menu
+ * that reads the stick as a d-pad wants an unambiguous push. */
+#define PAD_SCRIPT_STICK 30000
+static const struct { const char *name; int axis; int sign; } pad_script_stick[] = {
+    { "LLEFT", 0, -1 }, { "LRIGHT", 0, +1 }, { "LDOWN", 1, -1 }, { "LUP", 1, +1 },
+    { "RLEFT", 2, -1 }, { "RRIGHT", 2, +1 }, { "RDOWN", 3, -1 }, { "RUP", 3, +1 },
+};
+
+/* One "NAME" or "NAME+NAME+..." into an event. Returns 0 on an unknown name,
+ * which is reported rather than ignored -- a typo in a schedule is otherwise a
+ * silent hour of watching the title not do the thing you asked for. */
+static int pad_script_buttons(const char *s, size_t len, struct pad_script_ev *ev)
+{
+    size_t i = 0;
+    while (i < len) {
+        size_t j = i, n;
+        unsigned k;
+        int hit = 0;
+        while (j < len && s[j] != '+') j++;
+        n = j - i;
+        for (k = 0; !hit && k < sizeof pad_script_bits / sizeof pad_script_bits[0]; k++)
+            if (strlen(pad_script_bits[k].name) == n
+                && !strncasecmp(s + i, pad_script_bits[k].name, n)) {
+                ev->buttons |= pad_script_bits[k].bit; hit = 1;
+            }
+        for (k = 0; !hit && k < sizeof pad_script_stick / sizeof pad_script_stick[0]; k++)
+            if (strlen(pad_script_stick[k].name) == n
+                && !strncasecmp(s + i, pad_script_stick[k].name, n)) {
+                SHORT v = (SHORT)(pad_script_stick[k].sign * PAD_SCRIPT_STICK);
+                switch (pad_script_stick[k].axis) {
+                case 0: ev->lx = v; break;  case 1: ev->ly = v; break;
+                case 2: ev->rx = v; break;  default: ev->ry = v; break;
+                }
+                hit = 1;
+            }
+        for (k = 0; !hit && k < sizeof pad_script_analog / sizeof pad_script_analog[0]; k++)
+            if (strlen(pad_script_analog[k].name) == n
+                && !strncasecmp(s + i, pad_script_analog[k].name, n)) {
+                ev->analog[pad_script_analog[k].idx] = 255; hit = 1;
+            }
+        if (!hit) {
+            fprintf(stderr, "  [PAD-SCRIPT] unknown button '%.*s'\n", (int)n, s + i);
+            return 0;
+        }
+        i = j + 1;
+    }
+    return 1;
+}
+
+/* Whitespace-, comma- and semicolon-separated events; '#' to end of line is a
+ * comment, so an inline value and a file are the same grammar. */
+static void pad_script_parse(const char *text)
+{
+    const char *p = text;
+    int bad = 0;
+    g_pad_script_n = 0;
+    while (*p) {
+        const char *tok, *colon, *end;
+        struct pad_script_ev ev;
+        while (*p && (isspace((unsigned char)*p) || *p == ',' || *p == ';')) p++;
+        if (*p == '#') { while (*p && *p != '\n') p++; continue; }
+        if (!*p) break;
+        tok = p;
+        while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != ';' && *p != '#') p++;
+        end = p;
+        colon = memchr(tok, ':', (size_t)(end - tok));
+        if (!colon) {
+            fprintf(stderr, "  [PAD-SCRIPT] ignoring '%.*s': expected <t>:<BUTTONS>\n",
+                    (int)(end - tok), tok);
+            bad++;
+            continue;
+        }
+        memset(&ev, 0, sizeof ev);
+        ev.t0 = strtod(tok, NULL);
+        {
+            const char *hold = memchr(colon + 1, ':', (size_t)(end - colon - 1));
+            const char *blast = hold ? hold : end;
+            double h = hold ? strtod(hold + 1, NULL) : PAD_SCRIPT_HOLD;
+            if (h <= 0.0) h = PAD_SCRIPT_HOLD;
+            ev.t1 = ev.t0 + h;
+            if (!pad_script_buttons(colon + 1, (size_t)(blast - colon - 1), &ev)) {
+                bad++;
+                continue;
+            }
+        }
+        if (g_pad_script_n < PAD_SCRIPT_MAX)
+            g_pad_script[g_pad_script_n++] = ev;
+        else
+            bad++;
+    }
+    fprintf(stderr, "  [PAD-SCRIPT] %d event(s) loaded%s; t=0 is input init\n",
+            g_pad_script_n, bad ? " (some rejected -- see above)" : "");
+    fflush(stderr);
+}
+
+static int pad_script_on(void)
+{
+    if (g_pad_script_n < 0) {
+        const char *v = getenv("RECOMP_PAD_SCRIPT");
+        g_pad_script_n = 0;
+        if (v && *v == '@') {
+            FILE *f = fopen(v + 1, "rb");
+            if (!f) {
+                fprintf(stderr, "  [PAD-SCRIPT] cannot open %s\n", v + 1);
+                fflush(stderr);
+            } else {
+                char *buf; long sz;
+                fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+                buf = (char *)malloc((size_t)sz + 1);
+                if (buf && sz >= 0 && fread(buf, 1, (size_t)sz, f) == (size_t)sz) {
+                    buf[sz] = 0;
+                    pad_script_parse(buf);
+                }
+                free(buf);
+                fclose(f);
+            }
+        } else if (v && *v) {
+            pad_script_parse(v);
+        }
+    }
+    return g_pad_script_n > 0;
+}
+
+/* OR the schedule into whatever the caller has already filled in. A scripted
+ * stick deflection yields to a live one, so taking over a run mid-flight does
+ * not fight the script for the camera. */
+static void pad_script_apply(XBOX_INPUT_STATE *st)
+{
+    double t;
+    int i;
+
+    if (!pad_script_on()) return;
+    t = fake_pad_seconds();
+    for (i = 0; i < g_pad_script_n; i++) {
+        struct pad_script_ev *ev = &g_pad_script[i];
+        int j;
+        if (t < ev->t0 || t >= ev->t1) continue;
+        if (!ev->fired) {
+            ev->fired = 1;
+            fprintf(stderr, "  [PAD-SCRIPT] t=%7.2f fire #%d buttons=%04X"
+                    " a=%u b=%u lx=%d ly=%d poll=%lu\n",
+                    t, i, (unsigned)ev->buttons, (unsigned)ev->analog[XBOX_BUTTON_A],
+                    (unsigned)ev->analog[XBOX_BUTTON_B], (int)ev->lx, (int)ev->ly,
+                    g_pad_polls);
+            fflush(stderr);
+        }
+        st->Gamepad.wButtons |= ev->buttons;
+        for (j = 0; j < 8; j++)
+            if (ev->analog[j] > st->Gamepad.bAnalogButtons[j])
+                st->Gamepad.bAnalogButtons[j] = ev->analog[j];
+        if (ev->lx && st->Gamepad.sThumbLX > -4096 && st->Gamepad.sThumbLX < 4096)
+            st->Gamepad.sThumbLX = ev->lx;
+        if (ev->ly && st->Gamepad.sThumbLY > -4096 && st->Gamepad.sThumbLY < 4096)
+            st->Gamepad.sThumbLY = ev->ly;
+        if (ev->rx && st->Gamepad.sThumbRX > -4096 && st->Gamepad.sThumbRX < 4096)
+            st->Gamepad.sThumbRX = ev->rx;
+        if (ev->ry && st->Gamepad.sThumbRY > -4096 && st->Gamepad.sThumbRY < 4096)
+            st->Gamepad.sThumbRY = ev->ry;
+    }
 }
 
 /* RECOMP_PAD_TRACE -- one line each time the host pad state changes.
@@ -581,6 +824,14 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             return ERROR_DEVICE_NOT_CONNECTED;
         memset(pState, 0, sizeof(*pState));
         pState->dwPacketNumber = ++g_packet[0];
+        if (pad_script_on()) {
+            /* A schedule is strictly better than the pulse -- it can press
+             * DOWN, and it stops pressing START -- so it wins outright. */
+            pad_script_apply(pState);
+            g_pad_polls_connected++;
+            pad_note_state(pState);
+            return ERROR_SUCCESS;
+        }
         {
             double t = fake_pad_seconds();
             if (t > 2.0 && (t - (double)(long)t) < 0.15) {
@@ -605,6 +856,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
+        /* With a schedule loaded, port 0 is a pad whether or not hardware is
+         * attached -- otherwise an unattended run reports "not connected" and
+         * the title waits for a controller that is never going to arrive. */
+        if (dwPort == 0 && pad_script_on()) {
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+            pState->dwPacketNumber = ++g_packet[0];
+            pad_script_apply(pState);
+            g_controller_connected[0] = TRUE;
+            g_pad_polls_connected++;
+            pad_note_state(pState);
+            return ERROR_SUCCESS;
+        }
         g_controller_connected[dwPort] = FALSE;
         g_pad_polls_disconnected++;
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -658,6 +921,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
 
+    /* MERGE, not replace: RECOMP_FAKE_PAD replaces the real pad and so
+     * silently eats every press a person makes, which cost an afternoon. A
+     * schedule that OR's itself into the live report lets a person take over
+     * a run the script has driven into place. */
+    if (dwPort == 0) pad_script_apply(pState);
+
     pad_note_state(pState);
     return ERROR_SUCCESS;
 }
@@ -680,6 +949,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    if (dwPort == 0 && (fake_pad_on() || pad_script_on())) return TRUE;
     refresh_controllers(0);
     return g_controller_connected[dwPort];
 }
