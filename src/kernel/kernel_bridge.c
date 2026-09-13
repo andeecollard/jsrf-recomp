@@ -1727,15 +1727,35 @@ static void bridge_KeWaitForSingleObject(void)
          * how the table above was produced and how a regression would be
          * bisected.
          *
-         * NOT a complete fix: 14% of the ring is still replayed, because even
-         * at 44.9 passes/s the server's cycle still crosses a vblank period
-         * sometimes. What this removes is the part of the deficit that was
-         * ours. */
+         * REVERTED TO 1000 -- 100 us BROKE GAMEPLAY AUDIO COMPLETELY.
+         *
+         * The table above is real and was taken at the intro, where the APU
+         * front end is never trapped. In actual gameplay with a controller it
+         * put the front end into FEMETHMODE_TRAPPED for 203628 of 269896 APU
+         * frames, against 0 and 70 in the two gameplay runs on the previous
+         * default. se_frame is skipped whenever the front end is trapped
+         * (apu_core.c, "Idling the frame on TRAPPED is deliberate"), so voice
+         * processing stopped -- `processed` froze across four consecutive
+         * reports -- and the game went SILENT. Polling ten times as often lets
+         * the guest push front-end methods ten times as often, and the trap
+         * window scales with that traffic.
+         *
+         * So the intro measurement was real and the conclusion drawn from it
+         * was not: it was taken in one scene and generalised, which is the same
+         * error made three times already in this investigation. A scene where
+         * the front end is never trapped cannot say what happens in one where
+         * it is.
+         *
+         * The switch stays, because the underlying finding stands -- CRI's
+         * sound server really is starved by this poll. Whatever replaces it
+         * must not increase front-end method traffic: a real wakeup on event
+         * set, not a faster poll. Any future change here must be measured at
+         * GAMEPLAY with [APU-FRAME] trapped= read, not only at the intro. */
         {
             static long poll_us = -1;
             if (poll_us < 0) {
                 const char *e = getenv("RECOMP_WAIT_POLL_US");
-                poll_us = e ? strtol(e, NULL, 10) : 100;
+                poll_us = e ? strtol(e, NULL, 10) : 1000;
                 if (poll_us < 0) poll_us = 0;
                 if (poll_us > 1000000) poll_us = 1000000;
             }
