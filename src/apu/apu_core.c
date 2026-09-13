@@ -293,8 +293,25 @@ static void apu_wav_write(const int16_t *samples, int sample_frames)
     g_apu_wav_frames += (unsigned long)sample_frames;
     /* Flushed periodically rather than at exit: a timed run is killed, not
      * closed, so an unflushed tail is the part you wanted to hear. */
-    if ((g_apu_wav_frames % 48000u) < (unsigned long)sample_frames)
+    if ((g_apu_wav_frames % 48000u) < (unsigned long)sample_frames) {
+        /* Patch the two RIFF length fields before flushing, not only in
+         * apu_wav_finish. Every timed run here is killed rather than closed --
+         * measure.sh sends SIGTERM then SIGKILL -- so apu_wav_finish is never
+         * reached (it is one of twelve xbox_apu exports the link shows nothing
+         * references), and every capture taken today carried its placeholder
+         * zeros. Readers that trust the header, Python's `wave` among them,
+         * refuse the file outright, which is a silent tax on every audio
+         * measurement. Two seeks a second is nothing next to that. */
+        long pos = ftell(g_apu_wav);
+        if (pos > 44) {
+            fseek(g_apu_wav, 4, SEEK_SET);
+            apu_wav_put32(g_apu_wav, (uint32_t)(pos - 8));
+            fseek(g_apu_wav, 40, SEEK_SET);
+            apu_wav_put32(g_apu_wav, (uint32_t)(pos - 44));
+            fseek(g_apu_wav, pos, SEEK_SET);
+        }
         fflush(g_apu_wav);
+    }
 }
 
 
