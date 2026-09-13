@@ -1,0 +1,24 @@
+# Boot to the Corn tutorial, unattended.  RECOMP_PAD_SCRIPT=@this-file
+#
+# The title wants START, START, A -- not a mash. The first START leaves the
+# attract animation, the second takes the menu, and A selects New Game. The
+# group repeats every 8 s because how long the logos take varies by ten seconds
+# or more between runs, so the schedule must not depend on hitting one window.
+#
+# It stops at t=73. Past the title, START is the PAUSE button and a synthetic
+# one every few seconds leaves the title sitting in covered pause, which reads
+# exactly like a hang -- a whole session went on diagnosing that. Stopping also
+# hands the pad back to a person: RECOMP_PAD_SCRIPT merges with a live
+# controller rather than replacing it.
+#
+# Measured 13 Sep: reaches WaitEndStoryOrVsMission at t=46.9 and holds the Corn
+# tutorial (live=61) with nobody at the machine.
+
+12.0:START  13.5:START  15.0:A
+20.0:START  21.5:START  23.0:A
+28.0:START  29.5:START  31.0:A
+36.0:START  37.5:START  39.0:A
+44.0:START  45.5:START  47.0:A
+52.0:START  53.5:START  55.0:A
+60.0:START  61.5:START  63.0:A
+68.0:START  69.5:START  71.0:A
