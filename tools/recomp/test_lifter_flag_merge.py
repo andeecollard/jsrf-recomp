@@ -10,7 +10,8 @@ even though the static operand objects differ.
 import unittest
 
 from .disasm import BasicBlock, Instruction, Operand
-from .lifter import Lifter, lift_basic_block
+from .lifter import (Lifter, lift_basic_block, _make_condition,
+                     MERGED_ZF_CMP, MERGED_ZF_TEST)
 from .translator import _merge_predecessor_flag_states
 
 
@@ -55,13 +56,53 @@ class FlagMergeLifterTest(unittest.TestCase):
 
         self.assertIsNone(incoming)
 
-    def test_different_snapshot_widths_remain_unknown(self):
+    def test_different_snapshot_widths_keep_zf_and_drop_the_rest(self):
+        """Width disagreement costs the width-sensitive conditions, not ZF.
+
+        Each predecessor masked _fa/_fb to its OWN width where its compare
+        happened, so at the join the pair is correctly masked whichever path
+        ran and `_fa == _fb` is that path's ZF. What genuinely needs the width
+        is the sign: js/jns and the signed ordered conditions cast the
+        subtraction back to the operand width, and there is no single width to
+        cast to here.
+
+        This used to return None outright, which cost sub_00130FD0 five `je`
+        branches -- each an 8-bit `cmp byte ptr [...], dl` joined with a 32-bit
+        `cmp [eax-0x80], edx`, every one of them emitted as constant false.
+        """
         incoming = _merge_predecessor_flag_states([
             _cmp_state("mem:esi", "eax", width=2),
             _cmp_state("mem:edi", "ecx", width=4),
         ])
 
-        self.assertIsNone(incoming)
+        self.assertIsNotNone(incoming)
+        self.assertEqual(incoming[0], MERGED_ZF_CMP)
+
+        # ZF is answerable from the snapshot.
+        for jcc, macro in (("je", "CMP_EQ"), ("jne", "CMP_NE")):
+            with self.subTest(jcc=jcc):
+                cond = _make_condition(jcc, incoming[0], incoming[1])
+                self.assertIsNotNone(cond)
+                self.assertIn(f"{macro}(_fa, _fb)", cond[0])
+
+        # Everything that needs the width, or a flag other than ZF, must still
+        # refuse rather than pick one predecessor's answer.
+        for jcc in ("js", "jns", "jl", "jge", "jg", "jle", "jb", "jae"):
+            with self.subTest(jcc=jcc):
+                self.assertIsNone(
+                    _make_condition(jcc, incoming[0], incoming[1]))
+
+    def test_a_test_join_answers_zf_with_the_test_macro(self):
+        incoming = _merge_predecessor_flag_states([
+            ("test", [Operand(type="mem", mem_base="esi", mem_size=1),
+                      Operand(type="reg", reg="al")]),
+            ("test", [Operand(type="reg", reg="ecx"),
+                      Operand(type="reg", reg="ecx")]),
+        ])
+
+        self.assertEqual(incoming[0], MERGED_ZF_TEST)
+        cond = _make_condition("je", incoming[0], incoming[1])
+        self.assertIn("TEST_Z(_fa, _fb)", cond[0])
 
 
 if __name__ == "__main__":

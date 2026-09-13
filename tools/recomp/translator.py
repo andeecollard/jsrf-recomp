@@ -26,7 +26,8 @@ from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _operand_width, _fmt_operand_read,
-                     _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER)
+                     _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER,
+                     MERGED_ZF_SETTERS)
 
 
 # How many times the flag-state walk may sweep the blocks before emitting.
@@ -87,6 +88,11 @@ def _merge_predecessor_flag_states(states):
             return _operand_width(ops[0]) or _operand_width(ops[1]) or 4
 
         if len({snapshot_width(state) for state in states}) != 1:
+            # Widths disagree. That rules out only the conditions that cast
+            # back to the operand width; ZF is still known, because each
+            # predecessor masked _fa/_fb to its own width at its own compare.
+            if first[0] in MERGED_ZF_SETTERS:
+                return (MERGED_ZF_SETTERS[first[0]], list(first[1]))
             return None
 
         # The operands are used only to retain setter kind and width.  At

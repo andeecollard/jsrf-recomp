@@ -264,6 +264,17 @@ _RESULT_ZF_SF_SETTERS = frozenset({
 # `_flags` fallback rather than being answered from one arbitrary predecessor.
 MERGED_RESULT_SETTER = "__merged_result"
 
+# A join of cmp/test snapshots whose WIDTHS disagree. Width is only needed by
+# the conditions that must cast back to the original operand width -- js/jns
+# and the signed ordered pair -- because ZF does not depend on it: each
+# predecessor already masked _fa/_fb to its own width where the comparison
+# happened, so at the join the pair is correctly masked whichever path ran.
+# Refusing these outright cost sub_00130FD0 five `je` branches, each after an
+# 8-bit `cmp byte ptr [...], dl` joined with a 32-bit `cmp [eax-0x80], edx`.
+MERGED_ZF_CMP = "__merged_zf_cmp"
+MERGED_ZF_TEST = "__merged_zf_test"
+MERGED_ZF_SETTERS = {"cmp": MERGED_ZF_CMP, "test": MERGED_ZF_TEST}
+
 # Arithmetic whose carry-out the lifter computes into _cf next to the write.
 #
 # A jb/jae reading CF after one of these is exact, which matters because the
@@ -365,7 +376,8 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # comparison happens. Use those rather than re-reading registers that may
     # since have changed.
     SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
-    if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
+    if (flag_setter in ("cmp", "test", "bsf", "bsr", MERGED_ZF_CMP,
+                        MERGED_ZF_TEST) and len(flag_ops) >= 2):
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
     elif len(flag_ops) >= 2:
@@ -501,6 +513,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── cmp: flags from (a - b), operands unchanged ──
+    # A width-mismatched snapshot join answers ZF and nothing else.
+    if flag_setter in (MERGED_ZF_CMP, MERGED_ZF_TEST):
+        if jcc not in ("je", "jz", "jne", "jnz"):
+            return None
+        macro = cmp_macro if flag_setter == MERGED_ZF_CMP else test_macro
+        return (f"{macro}({lhs}, {rhs})", desc) if macro else None
+
     if flag_setter == "cmp":
         if cmp_macro:
             return f"{cmp_macro}({lhs}, {rhs})", desc
