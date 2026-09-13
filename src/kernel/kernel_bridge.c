@@ -4726,6 +4726,12 @@ static void bridge_KeSetBasePriorityThread(void)
 
     previous = obj->BasePriority;
     obj->BasePriority = (int32_t)increment;
+    /* Under RECOMP_SCHED_TRACE, which thread is being given which priority.
+     * This matters more than it looks: JSRF runs threads whose entire body is a
+     * counting spin loop, and such a thread is only affordable if it actually
+     * runs at the bottom of the scheduler. Whether the guest asks for that, and
+     * for which handle, is not something to assume. */
+    sched_note("KeSetBasePriority", obj->HandleToken, (uint32_t)increment);
     /* Apply to the real thread through the handle the object stands for. */
     xbox_KeSetBasePriorityThread(
         bridge_thread_handle_for_token(obj->HandleToken), increment);
