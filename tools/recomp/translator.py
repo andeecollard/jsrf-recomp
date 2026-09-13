@@ -12,6 +12,7 @@ Produces compilable C code using recomp_types.h macros.
 """
 
 import bisect
+import copy
 import json
 import glob
 import os
@@ -26,6 +27,13 @@ from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _operand_width, _fmt_operand_read,
                      _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER)
+
+
+# How many times the flag-state walk may sweep the blocks before emitting.
+# Two sweeps resolve every forward reference in an acyclic region; the rest are
+# for chains of them. The loop stops early as soon as the map stops changing,
+# so this is a ceiling on pathological cases, not a fixed cost.
+_FLAG_FIXPOINT_PASSES = 4
 
 
 def _merge_predecessor_flag_states(states):
@@ -1170,7 +1178,65 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        def incoming_state(bb, out_state):
+            """The flag state valid on every edge into bb, or None."""
+            sources = preds[bb.start]
+            if bb.start == start or not sources:
+                return None
+            if not all(p in out_state for p in sources):
+                return None
+            return _merge_predecessor_flag_states(
+                [out_state[p] for p in sources])
+
+        # Reach a FIXED POINT before emitting, rather than resolving the state
+        # in one address-order sweep.
+        #
+        # The predecessor map above follows control flow, but walking the
+        # blocks once walks them by address, so a join whose predecessor sits
+        # at a HIGHER address hits the `all(p in out_state)` guard and is
+        # abandoned -- the merge is not defeated, it is never called. That is
+        # every loop back edge, and every forward jump into a shared tail.
+        # CSysChallengeRegionManager::calledDuringExec0Default is the clean
+        # example: its join at 0x15275 takes `cmp [ebx+0x10], 1` by fallthrough
+        # and `cmp [ebx+0x10], 2` from a jmp at 0x152F2 -- same operand, same
+        # width, which is exactly the snapshot join
+        # _merge_predecessor_flag_states documents itself as existing to
+        # handle. Its `jne` came out constant false, in a function that runs
+        # every frame.
+        #
+        # Iterating is safe because every individual decision is already
+        # conservative: a merge returns a state only when EVERY predecessor
+        # agrees, so another round can only turn None into an agreed state,
+        # never the reverse, and never into a wrong one. The cap is there
+        # because a cycle of flag-transparent blocks can oscillate rather than
+        # settle; if it does, the last map is used and each entry in it is
+        # still individually sound.
+        #
+        # Re-lifting is safe for the x87 model -- _fp_top is vestigial, the
+        # stack is modelled at runtime through g_fp_top -- but the Lifter DOES
+        # accumulate three reporting dictionaries while it works, and a pass
+        # whose statements are thrown away must not contribute to them. Left
+        # unguarded, `unimplemented` counted every instruction once per sweep
+        # and reported 538 where the truth was 176, which would have retired a
+        # real diagnostic by making it meaningless. Snapshot, sweep, restore;
+        # only the emitting pass below is allowed to record anything.
+        saved = (copy.deepcopy(self.lifter.unimplemented),
+                 copy.deepcopy(self.lifter.referenced_calls),
+                 copy.deepcopy(self.lifter.jump_table_targets))
+
         out_state = {}
+        for _ in range(_FLAG_FIXPOINT_PASSES):
+            previous = dict(out_state)
+            for bb in blocks:
+                _, out_state[bb.start] = lift_basic_block(
+                    self.lifter, bb, flag_state=incoming_state(bb, out_state))
+            if out_state == previous:
+                break
+
+        (self.lifter.unimplemented,
+         self.lifter.referenced_calls,
+         self.lifter.jump_table_targets) = saved
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -1181,21 +1247,8 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = _merge_predecessor_flag_states(states)
-            else:
-                incoming = None
-
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
+            stmts, _ = lift_basic_block(
+                self.lifter, bb, flag_state=incoming_state(bb, out_state))
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
