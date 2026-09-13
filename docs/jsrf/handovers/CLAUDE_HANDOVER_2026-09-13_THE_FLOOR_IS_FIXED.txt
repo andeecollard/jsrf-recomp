@@ -1,0 +1,202 @@
+CLAUDE, 13 Sep 2026 (evening)
+THE MISSING SCENERY IS FIXED. THREE DEFECTS CLOSED, ONE EXPERIMENT REPEATED
+THAT SHOULD NOT HAVE BEEN.
+
+Supersedes CLAUDE_HANDOVER_2026-09-13_THE_MISSING_SCENERY_WAS_A_BLEND.txt and
+everything before it. Read section 1 before touching performance -- it is the
+one that cost this session an hour and a regression.
+
+
+0. STATE OF PLAY
+================
+HEAD d6230da. Six commits this session; **origin/main is TWO BEHIND** (dc6bc42
+and d6230da are unpushed). Python tests 160, all passing.
+
+Working tree: `src/nv2a/nv2a_metal.m` is MODIFIED and uncommitted -- a vertex/
+index ring buffer, written and compile-checked but NEVER RUN. See section 4.
+The two iCloud conflict duplicates are still there and still not built.
+
+**The user's verdict on the renderer, in their words: "this is working very
+well. little to no clipping."** The black floor is closed. What they asked for
+next is SPEED.
+
+    PYTHON=/usr/bin/python3 diagnostics/jsrf_first_fault/regenerate.sh
+    cmake --build build-macos/jsrf-first-fault/build --target jsrf_first_fault -j 6
+
+**To PLAY it, use the new script, not run_scripted.sh:**
+
+    diagnostics/jsrf_first_fault/play.sh
+
+run_scripted.sh always sets RECOMP_PAD_SCRIPT, which keeps firing START until
+t=69.5 while the game reaches gameplay around t=47 -- so six synthetic STARTs
+land in play, where START is PAUSE. It reads exactly like a dead controller and
+cost this session two wrong diagnoses before I worked out it was us.
+
+Archived fallbacks, both verified good:
+    gen.pre-regen-20260913 / jsrf_first_fault.pre-regen-20260913
+    gen.pre-tls-20260913   / jsrf_first_fault.pre-tls-20260913   <- current HEAD build
+
+
+1. THE MISTAKE, FIRST, BECAUSE IT IS THE MOST USEFUL THING HERE
+===============================================================
+I profiled the running title, saw `_tlv_get_addr` at the top of self time,
+found a comment in recomp_types.h recommending a register-context pointer,
+and implemented it: one RecompRegs struct, RECOMP_REGS_BIND in every function
+prologue, translator change, full regeneration.
+
+**It had already been done on 12 Sep and recorded as a negative result.**
+`docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-12_REGISTER_STRUCT_NEGATIVE.md`,
+whose subtitle is "NEGATIVE. Reverted. Do not repeat it." Object code fell 13%;
+runtime went 30.55s -> 30.69s, which is noise. The reason is in that note:
+`_tlv_get_addr` is a tiny leaf called constantly, so `sample` ranks it top by
+ENTRY COUNT without it being the top COST. It also anticipated the bound-pointer
+variant I wrote and asked for a handful-of-functions prototype with a
+measurement before anyone touched the translator.
+
+Reverted in full. The user saw broken audio and input on that build.
+
+**Two lessons, both cheap:**
+  * `docs/jsrf/progress/` is not optional reading. The handovers are the
+    narrative; the progress notes are where the negative results live, and a
+    negative result is the most expensive kind to rediscover.
+  * The comment in `recomp_types.h` that sent me there is STALE -- it still
+    says the register-context change "is worth doing: it is the single largest
+    measured win available on either host". It is contradicted by a measurement
+    taken the next day. I did not edit it, because the file is upstream's and
+    the fix belongs with whoever reconciles the two. Trust the progress note.
+
+
+2. FIXED, WITH EVIDENCE
+=======================
+  * **A refused blend was deleting whole draws.** prepare_texture_copy accepted
+    only ZERO/ONE/SRC_ALPHA/ONE_MINUS_SRC_ALPHA, because the factor was one
+    scalar and DST_COLOR is per-channel. JSRF asks for DST_COLOR/ZERO, a
+    multiply blend; a refusal there is not a degraded draw, nv2a_pb_exec.c:2117
+    returns and the batch reaches NEITHER sink. **6034 draws deleted in a 150 s
+    run**, onset the moment the tutorial scene loads. Now per-channel in all
+    three sinks behind one predicate. Measured: rejected 6034 -> 0 over 733,909
+    draws. (ac38c32)
+
+  * **The floor was culled by an inverted winding.** area() runs on positions
+    the guest already perspective-divided, and dividing by a negative w negates
+    x and y, so a triangle with an ODD number of vertices behind the camera
+    arrives wound backwards. Large ground quads near the camera straddle; small
+    objects on them do not, which is exactly what the screen showed. Census over
+    106M triangles: 1,908,636 straddling, of which **955,965 culled** -- the
+    entire half that faces the viewer. Correction is a parity of sign bits
+    (the product overflows; w reaches 1e31). (d6230da)
+
+  * **The depth policy was at the wrong stage and the wrong way round.** We
+    clamped z into a hardcoded range in the VERTEX shader. The range is right --
+    SET_CLIP_MIN/MAX captured live read 0 and 16777215 -- but clamping before
+    the perspective multiply corrupts the endpoint the clipper interpolates
+    from, and NV097_SET_ZMIN_MAX_CONTROL asks for CULL, not clamp: ZCLAMP_EN is
+    a FOUR-BIT field at 0xF0, and JSRF writes 1, so 1 & 0xF0 == 0 == CULL. Read
+    as bit 0 it looks like CLAMP and means the opposite. Now: no vertex clamp,
+    depth clamp always on, cull-or-clamp per fragment in guest z units, which is
+    what xemu does. RECOMP_LEGACY_ZCLAMP=1 A/Bs it. (d6230da)
+
+  * **Crash reports name the crash now.** 37 of 277 archived runs end in a
+    guest fault (13%) and none could say where -- LAST INSTRUMENTED GUEST
+    FUNCTION reports the tracer's last sighting, which on a worker-thread fault
+    is the thread trampoline. dladdr on HOST PC/LR fixes it; 9100 of 9140
+    generated sub_* are external symbols. First real fault after the change
+    named itself immediately. (680c753)
+
+  * **Housekeeping.** Four backports the lifter outgrew retired (two KEPT and
+    still failing on purpose -- they are two of the four reachable dead
+    branches); ratchet regated on the reachable count (4, was an unpassable 76);
+    in/out/wbinvd now say they are deliberately ignored. 153 -> 160 tests.
+    (05e0465)
+
+  * **A regeneration landed**, merging the runtime icall dump. Translation
+    "failed": 0. Verified to live=157 with 0 crashes and 0 blend rejects.
+
+
+3. RETRACTED
+============
+  * **Depth clipping was never losing geometry.** The previous handover's A/B
+    used `s_gpu.tris_drawn`, which is nv2a_metal_draw's return -- triangles
+    assembled and culled, counted BEFORE the encoder exists. The clip mode is
+    invisible to it. Measured properly: far-plane discards 0 of 37.7M, and 0
+    triangles discarded while fully on screen with every w>0.
+  * **I claimed the black bars and grey ellipse were screen-capture tearing.**
+    They are in a raw framebuffer dump. They are real and still open. My
+    reasoning was bad: I compared against a clean Smilebit LOGO frame, a
+    different scene.
+  * **I claimed sub_001C29F7 crashed on an uninitialised pool base.** Wrong.
+    See section 4.
+
+
+4. WHAT IS LEFT, IN THE ORDER I WOULD TAKE IT
+=============================================
+**(1) SPEED -- and the first move is a config change, not code.**
+
+    CMAKE_BUILD_TYPE:STRING=Debug
+    CMAKE_C_FLAGS_DEBUG:STRING=-g
+
+The whole title, all 1.3M lines of generated C included, is compiled at -O0.
+Measured on this machine at 640x480: the RGB565 convert loop is 1.038 ms at -O0
+and 0.201 ms at -O2 (5.2x); the depth loop 1.264 -> 0.203 (7.5x). Memory already
+lists an unset CMAKE_BUILD_TYPE as one of three causes of the title stall, so
+this has regressed before. Do this FIRST and re-measure everything after it --
+several numbers in this file are -O0 numbers.
+
+**(2) The Metal vertex/index ring, uncommitted in the tree.** Replaces 304,980
+per-batch MTLBuffer allocations (measured 4.88 us at 16 KB, 8.17 us at 64 KB)
+with bump allocation from 8 x 2 MiB slabs, ~6 ns per reservation. Safety against
+in-flight GPU work is an atomic in-flight count per slab plus a condvar on wrap,
+and it was stress-tested over 20,000 real command buffers with a positive
+control that reproduces corruption when the pin is removed. **It has never been
+run in the game.** Build it, run it, and read RECOMP_METAL_RING_AUDIT.
+
+**(3) The 13% crash is a USB use-after-free, not a pool bug.** 0x27DBC0 is a
+virtual-minus-physical BIAS and is legitimately 0 on this host every run --
+kernel_bridge.c:1930 returns the VA unchanged, so EAX=0 carries no information.
+The fault operand is 0xFFFFFFF0, the guest's own free-list poison: sub_001C2403
+ORs -1 into descriptor +8 on free. This is the Xbox OHCI driver (XBE section
+XPP), and we are dereferencing a freed USB descriptor. Our own source already
+records the same fault address at xbox_usb_ohci.c:645. Prime suspect:
+xbox_OhciServiceList writes guest descriptor memory (td[2], ed[2]) from TWO
+threads with no mutual exclusion -- ohci_periodic_tick on the ack thread
+(xbox_memory_layout.c:810) and mcpx_trap_handler on the guest thread (:1324,
+:1330). Fix is a dedicated OHCI lock across both call sites -- NOT mcpx_lock,
+see the APU-lock-inversion lesson. Test: 30 boots, 13% -> 0.
+**The user's intermittent controller stalls are very likely the same bug.**
+
+**(4) Black bars and a grey ellipse** in the attract/title scenes. Real, in the
+framebuffer, unexplained, predate today's fixes.
+
+**(5) `oPos is not finite`** kills whole batches -- 52 of 166k. VSH_REJECT drops
+the entire batch while the sinks already drop non-finite vertices per triangle,
+so the batch-level kill is stricter than it needs to be -- but the NaN is a
+producer bug, so find the producer first.
+
+**(6) Sub-pixel viewport offset.** SET_VIEWPORT_OFFSET.x reads 320.531 on a
+640-wide surface; our inverse transform assumes exactly 320. We never handle
+SET_VIEWPORT_SCALE/OFFSET at all. Half a pixel, but it is free information we
+are throwing away.
+
+
+5. TRAPS ADDED THIS SESSION
+===========================
+  * `s_gpu.tris_drawn` counts triangles SUBMITTED, after CPU culling and before
+    the encoder. It is blind to clipping and to everything the GPU decides.
+  * There are TWO counters called `rejected`. `prepared=N rejected=M` is whole
+    draws refused by prepare_texture_copy; `[VSH] executed batches=N rejected=M`
+    is batches refused by the vertex stage. Grepping `rejected=[0-9]+` gets
+    whichever came last.
+  * A run's depth into the title varies enormously with nothing changed: 296k
+    draws and live=61 on one run, 733k and live=161 on the next, same binary.
+    Never compare two runs' totals without checking how far each got.
+  * The unhandled-method histogram is TOP TEN. A method's absence from it proves
+    nothing; RECOMP_PB_EXEC_TOP raises the cut.
+  * `symbolize.py callers` does not follow tail-jmp thunks, so it will tell you
+    a function has no caller when it has one. That is how I convinced myself an
+    initialiser was never running.
+  * An audit counter that compares the fixed code against itself reads 0 and
+    proves nothing. After the winding fix, `culled ONLY because the winding is
+    inverted` went 7,388,956 -> 0 -- and that number was meaningless, because
+    the main path now uses the corrected sign the audit compares against.
+  * Killing the user's game to take the machine, four times, is not free. Batch
+    machine work and ask.
