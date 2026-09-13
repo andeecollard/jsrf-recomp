@@ -243,3 +243,60 @@ INSTRUMENT NOTES, because two of these cost runs
     EMPTY dumps, because it carried its own bare-range root check instead of
     the low-16 rule. Both fixed, but for "what is still changing" use
     RECOMP_OBJECT_ACTIVITY / RECOMP_OBJECT_BLOCKS, which write nothing.
+
+
+8. G1 ANSWERED BY XEMU, AND IT KILLS THE LEADING HYPOTHESIS
+===========================================================
+xemu, US ISO, at the Corn tutorial on the "This is the GG's Garage" beat, read
+through the GDB stub with diagnostics/jsrf_first_fault/xemu_cplayer_state.py.
+
+FIELD FOR FIELD, XEMU IS IDENTICAL TO US:
+
+                  ours                        xemu
+    scene         live=61 seq=30              live=61 seq=30
+    id 44         e50=23 s11c=AA r38=0        e50=23 s11c=AA r38=0
+    id 45         e50=25 s11c=AB r38=0        e50=25 s11c=AB r38=0
+
+and static across three samples over six seconds on BOTH sides -- while Corn is
+visibly animating in xemu (two screenshots, different arm poses).
+
+So both of the predicates found in section 7 are CORRECT BEHAVIOUR:
+  * +0xE50 parked in 0x14..0x1A is what the real console does here.
+  * [[this+0x2D0]+0x38] == 0, skipping the sub_00080340 pose writes, is what
+    the real console does here.
+Neither is the fault. The 0x14..0x1A band and sub_000A76E0 are exonerated, and
+the plan in JSRF_GOALS_2026-09-13 branch one is dead.
+
+WHERE THE ANIMATION ACTUALLY COMES FROM, same beat, 64-byte blocks, 3 s apart:
+
+    xemu id=45   30/96 changed: 09C0 0C80 0CC0 0D00 0D40 0D80 0DC0 0E80
+                                11C0 1200 12C0 1300 1340 1380 13C0 1400
+                                1440 1480 14C0 1540 1580 15C0 1600 1640
+                                1680 16C0 1700 1740 ...
+    ours id=45   10/96 changed: 0C80 11C0 1440 1600 1640 1680 16C0 1700
+                                1780 17C0
+    xemu id=44   26/96 changed (including 0CC0..0DC0)
+    ours id=44    5/96 changed: 0C80 1240 1280 12C0 1340
+
+xemu writes +0x0CE0..+0x0DC0 -- the transform block -- WITH r38 == 0 and e50 in
+the skip band. The loop at 0x000804A1 is therefore correctly skipped on both
+sides, and A SECOND, SEPARATE WRITER OF +0xCE0 EXISTS THAT RUNS IN XEMU AND
+NEVER RUNS IN OURS. Both CPlayers animate there; neither does here.
+
+That second writer is the target. It is not reachable by grepping for a literal
+"+ 0xCE0" -- section 7 already showed no RECOMP_MEM_WRITE32 targets it, and the
+known 0x804A1 loop writes through a computed pointer via sub_0014C340.
+
+HOW I BROKE THE ORACLE, so the next session does not
+    A GDB write watchpoint (Z2) on Corn's +0xCE0 was accepted with OK and then
+    never trapped in 20 s. Reading registers while the guest was running
+    desynchronised the stream, and the stub then refused new connections --
+    exactly the failure xemu_rsp.py's own docstring warns about in its first
+    paragraph. The port stays LISTENing with a dead peer; xemu must be
+    restarted and the tutorial replayed.
+
+    Do not send `g` or any register read unless a stop reply has actually been
+    received. Probe with a memory read first, and if a watchpoint does not trap
+    within a few seconds, remove it with z2 BEFORE touching anything else.
+    Better: the block-delta method above needs no watchpoints at all and got
+    the whole answer.
