@@ -784,12 +784,20 @@ static void pad_trace(const XBOX_INPUT_STATE *st, int active)
     if (sig == prev) return;
     prev = sig;
 
+    /* The triggers are in the signature above but were not in this line, so a
+     * pull could change the state and leave the log looking idle -- which is
+     * exactly the question asked when the tutorial stopped at "pull the Right
+     * Trigger". Print them; they are analog buttons on this pad, not axes. */
     fprintf(stderr, "  [PAD-TRACE] t=%7.2f %s buttons=%04X a=%3u b=%3u"
-            " lx=%6d ly=%6d poll=%lu\n",
+            " x=%3u y=%3u lt=%3u rt=%3u lx=%6d ly=%6d poll=%lu\n",
             fake_pad_seconds(), active ? "PRESSED " : "released",
             (unsigned)st->Gamepad.wButtons,
             (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_A],
             (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_B],
+            (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_X],
+            (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_Y],
+            (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER],
+            (unsigned)st->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER],
             (int)st->Gamepad.sThumbLX, (int)st->Gamepad.sThumbLY,
             g_pad_polls);
     fflush(stderr);
