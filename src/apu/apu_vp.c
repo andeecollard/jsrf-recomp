@@ -1050,6 +1050,7 @@ typedef struct {
 static VoiceRate g_voice_rate[MCPX_HW_MAX_VOICES];
 
 static int voice_fresh_on(void);
+int mcpx_apu_se_while_trapped(void);
 
 /* RECOMP_VOICE_FRESH implies this: the freshness counters are reported by
  * mcpx_apu_voice_rate_report, and the per-voice loop there skips any voice with
@@ -1928,13 +1929,25 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
         d->regs[current] = d->regs[top];
 
-        for (int i = 0; d->regs[current] != 0xFFFF; i++) {
+        /* The walk is driven by a LOCAL cursor, not by d->regs[current].
+         *
+         * d->regs[current] is how the guest learns which voice idled, so it has
+         * to stay pointing at that voice until the trap is serviced -- which is
+         * why the original returned outright. But freezing the guest-visible
+         * register and abandoning the rest of the mix are two different things,
+         * and only the first is required. With the local cursor the register
+         * can be held still while every voice behind the dead one still gets
+         * rendered. See mcpx_apu_se_while_trapped. */
+        uint16_t cur = (uint16_t)d->regs[current];
+        int trap_held = 0;
+
+        for (int i = 0; cur != 0xFFFF; i++) {
             if (i >= MCPX_HW_MAX_VOICES) {
                 DPRINTF("Voice list contains invalid entry!\n");
                 break;
             }
 
-            uint16_t v = (uint16_t)d->regs[current];
+            uint16_t v = cur;
 
             /* NEXT_VOICE_HANDLE is a full 16-bit field (mask 0x0000FFFF) and
              * the terminator is 0xFFFF, so the loop condition above admits
@@ -1965,23 +1978,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 break;
             }
 
-            d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+            uint16_t nxt = (uint16_t)voice_get_mask(d, v,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            d->regs[next] = nxt;
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
-                /* Keep the decoded idle voice stable until the guest services
-                 * the trap; walking another voice would overwrite its payload. */
-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
-                        NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
-                    return;
+                /* Raise the trap once. Re-raising it for a second dead voice
+                 * would overwrite the handle the guest has not read yet, and
+                 * re-raising it for the SAME voice every frame is what produced
+                 * 217 traps per retirement. */
+                if (!trap_held) {
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                    if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
+                            NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+                        if (!mcpx_apu_se_while_trapped())
+                            return;
+                        /* Hold d->regs[current] here for the guest, and keep
+                         * rendering everything behind it. */
+                        trap_held = 1;
+                    }
+                }
             } else {
                 /* Process voice directly (single-threaded) */
                 g_apu_voice_process_count++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
-            d->regs[current] = d->regs[next];
+            if (!trap_held) d->regs[current] = nxt;
+            cur = nxt;
         }
     }
 

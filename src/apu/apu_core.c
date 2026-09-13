@@ -726,6 +726,40 @@ static void apu_lock_handoff(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+/* Should the sound engine keep rendering while the FRONT END is trapped?
+ *
+ * The comment below this said the question "needs a measurement rather than an
+ * edit". Here is the measurement, and it took a human with a controller to get
+ * it, because every scripted run in this tree is structurally blind to it.
+ *
+ * During real play: 109 voices started, 103 retired, and 22371 idle traps -- so
+ * roughly 217 traps per retirement, because the voice-list walk restarts from
+ * the top each frame and re-traps the SAME dead voice until the guest services
+ * it. 48% of APU frames were skipped as a result. In every scripted run ever
+ * taken here the figures are on=5 off=0 idle_trap=0: the pad schedules park the
+ * player, nothing skates or grinds, no voice ever retires, and this entire path
+ * is never executed.
+ *
+ * The user hears it as a sustained effect -- the grind -- fading in and out,
+ * which is what an engine that is down half the time does to a continuous
+ * sound; percussive music hides the same chopping far better.
+ *
+ * On hardware FE (method processing) and SE (voice rendering) are separate
+ * units. A trapped front end means the CPU owes the FE some servicing; it does
+ * not mean the sound engine stops. If it did, every voice retirement would
+ * glitch audio on a stock Xbox, which it plainly does not.
+ *
+ * Opt-in and OFF by default. Earlier tonight a change measured only at the
+ * intro shipped as a default and took gameplay audio out entirely; this one
+ * does not get a default until it has been heard at gameplay, with a
+ * controller, against [APU-FRAME] trapped= and [APU-VOICE] idle_trap=. */
+int mcpx_apu_se_while_trapped(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_SE_WHILE_TRAPPED") != NULL;
+    return on;
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -764,7 +798,8 @@ static void *mcpx_apu_frame_thread(void *arg)
          * needs a measurement rather than an edit. */
         uint32_t femethmode = fectl & NV_PAPU_FECTL_FEMETHMODE;
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          femethmode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED &&
+                          (femethmode != NV_PAPU_FECTL_FEMETHMODE_TRAPPED
+                           || mcpx_apu_se_while_trapped()) &&
                           femethmode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
 
         g_apu_frames_total++;
