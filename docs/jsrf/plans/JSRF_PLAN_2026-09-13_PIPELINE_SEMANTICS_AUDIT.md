@@ -19,6 +19,66 @@ the one confirmed bug lived and where the counters already point.
 
 ---
 
+## Priority 0 — flag dataflow is a single address-order pass
+
+Found 13 Sep while auditing Priority 1. This is the cause *underneath* most of
+those dead branches, so it comes first.
+
+`translator.py` builds a proper control-flow predecessor map -- and the comment
+above it is emphatic about why address order is not good enough:
+
+    # Flag state has to follow control flow, not address order: an optimising
+    # compiler routinely lets a jcc consume a `cmp` from a block that is not
+    # its immediate predecessor in memory.
+
+But the *evaluation* is then a single pass in address order:
+
+    out_state = {}
+    for bb in blocks:
+        ...
+        elif all(p in out_state for p in sources):
+            incoming = _merge_predecessor_flag_states(states)
+        else:
+            incoming = None          # <-- a predecessor at a higher address
+
+So a join whose predecessor sits LATER in memory can never be resolved: its
+`out_state` has not been computed when the join is reached, the `all(...)` guard
+fails, and the merge is never even called. That is every loop back-edge, and
+every forward jump into a shared tail.
+
+`CSysChallengeRegionManager::calledDuringExec0Default` is exactly this shape:
+
+    0x00015271  cmp dword ptr [ebx+0x10], 1     ; falls through
+                ; XREF: 0x000152F2 (jump)
+    0x00015275  jne 0x153BC                     ; <-- the join
+
+    0x000152EE  cmp dword ptr [ebx+0x10], 2     ; the other predecessor
+    0x000152F2  jmp 0x15275                     ; at a HIGHER address
+
+Both predecessors end in a 32-bit `cmp` on the *same* operand, differing only in
+the immediate. That is precisely the snapshot join
+`_merge_predecessor_flag_states` was written to handle, and it is documented in
+that function's own docstring. The merge never gets the chance.
+
+**Do:** iterate the block walk to a fixed point instead of a single pass.
+Compute `out_state` in a pre-pass, repeating until it stops changing (with a
+small cap), then emit using the converged map. Each individual decision is
+already conservative, so extra iterations can only turn `None` into a state
+every predecessor agrees on -- never the reverse.
+
+**Two cautions.** `lift_basic_block` threads `_fp_top`, the x87 stack index, so
+any pre-pass must reset the per-function lifter state before each iteration or
+the FPU model drifts. And a cycle of flag-transparent blocks can oscillate, so
+cap the iterations and accept the last map rather than looping forever.
+
+**Done when:** the UNRESOLVED FLAGS count drops, the tutorial still passes
+(`+7930/+7934` read 1/2), and ctest shows no new failures.
+
+**Incidentally:** `ljmp` is in `_EFLAGS_PRESERVE` and plain `jmp` is not, though
+neither touches EFLAGS. Not the cause here -- an unconditional `jmp` ends a
+block, so the question never arises -- but it is inconsistent and worth tidying
+with this work.
+
 ## Priority 1 — the 104 branches we already know are dead
 
 `audit_unresolved_flags.py` reports, today:
