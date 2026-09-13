@@ -33,6 +33,7 @@ static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
 static void jsrf_save_dump(void);
 static void jsrf_scene_report(void);
+static void jsrf_seq_trace_start(void);
 static void jsrf_object_dump(void);
 static void jsrf_guest_trace_report(void);
 /* The rasterised surface, and the window that can show it. The executor draws
@@ -1067,6 +1068,7 @@ static void jsrf_pusher_report(void)
         }
         jsrf_guest_trace_report();
         pad_sentinel_scan();
+        jsrf_seq_trace_start();
         jsrf_save_dump();
         jsrf_scene_report();
         jsrf_object_dump();
@@ -2143,6 +2145,247 @@ static void jsrf_object_dump(void)
 #undef R32
 }
 
+/* Which pointer is the object registry, by the one rule that has held.
+ *
+ * Factored out of jsrf_scene_report because a second reader appeared and the
+ * rule is the expensive part: the root literal moves between runs --
+ * 0x005E3A70, 0x040D3A70 and 0x00363A70 have all been seen -- but its LOW 16
+ * BITS ARE INVARIANT at 0x3A70. A bare range check accepts anything in RAM,
+ * and on 12 Sep it accepted 0x040FFF40 in the middle of a run whose real
+ * `this` was 0x040D3A70, so every field printed came from the wrong object.
+ * One copy of that rule, not two. */
+static uint32_t jsrf_root_va(const uint8_t *base, uint32_t *via_out,
+                             const char **how_out, int verbose)
+{
+    uint32_t via = *(const uint32_t *)(base + JSRF_ROOT_PTR_VA);
+    uint32_t root;
+    const char *how;
+
+    if (jsrf_va_ok(via) && (via & 0xFFFFu) == (JSRF_ROOT_VA & 0xFFFFu)) {
+        root = via; how = "ptr";
+    } else {
+        root = JSRF_ROOT_VA; how = "static";
+        if (verbose && jsrf_va_ok(via))
+            fprintf(stderr, "  [JSRF-SCENE] ptr %08X rejected: low16 is not"
+                    " %04X, so it is not the object\n",
+                    (unsigned)via, (unsigned)(JSRF_ROOT_VA & 0xFFFFu));
+    }
+    if (via_out) *via_out = via;
+    if (how_out) *how_out = how;
+    return root;
+}
+
+/*
+ * RECOMP_SEQ_TRACE -- name the title's own top-level state, live.
+ *
+ * Everything about where the title has got to has so far been inferred from
+ * side effects: how many objects are live, how many files have been opened,
+ * whether the screen is black. Those are downstream of a single number the
+ * title keeps for exactly this purpose. CActSequence::Exec0Default, at guest
+ * 0x0007BDD0, is
+ *
+ *     if (this->m_dwNextMethod < 64)
+ *         (this->*fSequenceMethods[this->m_dwNextMethod])();
+ *
+ * -- confirmed in the generated C, which reads MEM32(esi + 0x48), compares it
+ * against 0x40 and dispatches through a table at guest 0x0020D2B8.
+ *
+ * The 64 entries of that table are named by the decompilation, and the names
+ * are checked rather than trusted: the table is read out of guest RAM on the
+ * first poll and compared entry for entry against the addresses the
+ * decompilation gives. A mismatch is reported and the names are suppressed,
+ * because a wrong name here would be worse than no name -- it is the kind of
+ * thing section 4 of the 12 Sep handover is a list of.
+ *
+ * So a log line now says "the title is in WaitEndTitle" or "it has entered
+ * PrepareTutorial", and driving it with RECOMP_PAD_SCRIPT stops being blind.
+ *
+ * Read-only and off the guest's threads: one host thread, one dword read per
+ * poll, printing only on a transition. Nothing is written into guest memory
+ * and no generated code is touched, which matters because this title punishes
+ * instrumentation weight -- 578 probe sites froze it at 253 polls where an
+ * unprobed run reached 8,790.
+ */
+#define JSRF_SEQ_TABLE_VA   0x0020D2B8u
+#define JSRF_SEQ_COUNT      64u
+#define JSRF_SEQ_NEXT_OFF   0x48u        /* CActSequence::m_dwNextMethod */
+#define JSRF_SEQ_ID         0u           /* its global object id */
+
+/* fSequenceMethods, in table order. Names and addresses both from
+ * JSRF-Decompilation decompile/src/JSRF/ActSequence.cpp; the addresses are
+ * what the runtime check below compares against. */
+static const struct { uint32_t va; const char *name; } jsrf_seq_tab[JSRF_SEQ_COUNT] = {
+    { 0x0007BE30, "Init" },
+    { 0x0007BFD0, "LoadSprNorm" },
+    { 0x0007C020, "WaitLoadSprNorm" },
+    { 0x0007C050, "StartBuildCache" },
+    { 0x0007C070, "WaitDestructAct0x1" },
+    { 0x0007C270, "SwitchOnGlobal" },
+    { 0x0007C090, "LoadLogos" },
+    { 0x0007C0D0, "StartLogos" },
+    { 0x0007C110, "WaitDestructLogos" },
+    { 0x0007C140, "FreeLogos" },
+    { 0x0007C160, "PrepareTitle" },
+    { 0x0007C230, "SetNextMethod" },
+    { 0x0007C250, "WaitEndTitle" },
+    { 0x0007C270, "SwitchOnGlobal" },
+    { 0x0007C290, "PrepareHandleTitleMenuSelection" },
+    { 0x0007C410, "PrepareLoadGameMenu" },
+    { 0x0007C450, "WaitEndLoadGameMenu" },
+    { 0x0007C4B0, "LoadTags_MAYBE" },
+    { 0x0007C510, "WaitLoadTags_MAYBE" },
+    { 0x0007C560, "StartHandleTitleMenuSelection" },
+    { 0x0007C600, "LoadFullRoboyMenu" },
+    { 0x0007C720, "StartFullRoboyMenu" },
+    { 0x0007C7E0, "WaitEndFullRoboyMenu" },
+    { 0x0007C800, "ReturnFromFullRoboyMenu" },
+    { 0x00011C90, "nop" },
+    { 0x00011C90, "nop" },
+    { 0x00011C90, "nop" },
+    { 0x00011C90, "nop" },
+    { 0x0007C9E0, "PrepareStoryOrVsMission" },
+    { 0x0007CA60, "NopStoryOrVsMission" },
+    { 0x0007CA70, "WaitEndStoryOrVsMission" },
+    { 0x0007CA90, "ReturnFromStoryOrVsMission" },
+    { 0x0007CAE0, "PrepareTutorial" },
+    { 0x0007CBB0, "NopTutorial" },
+    { 0x0007CBC0, "WaitEndTutorial" },
+    { 0x0007CBE0, "ReturnFromTutorial" },
+    { 0x0007CC40, "PrepareTestRun" },
+    { 0x0007CD10, "NopTestRun" },
+    { 0x0007CD20, "WaitEndTestRun" },
+    { 0x0007CD40, "ReturnFromTestRun" },
+    { 0x0007CDA0, "PrepareUnused" },
+    { 0x0007CE70, "NopUnused" },
+    { 0x0007CE80, "WaitEndUnused" },
+    { 0x0007CEA0, "ReturnFromUnused" },
+    { 0x0007CF00, "PrepareGraffitiMenu" },
+    { 0x0007CFB0, "WaitLoadGraffitiMenu" },
+    { 0x0007CFE0, "WaitEndGraffitiMenu" },
+    { 0x0007D000, "ReturnFromGraffitiMenu" },
+    { 0x0007D450, "NopStinger" },
+    { 0x0007D460, "PrepareStinger" },
+    { 0x0007D520, "WaitEndStinger" },
+    { 0x0007D540, "ReturnFromStinger" },
+    { 0x0007D2D0, "PrepareEnding" },
+    { 0x0007D320, "WaitLoadEnding" },
+    { 0x0007D3D0, "WaitEndEnding" },
+    { 0x0007D3F0, "ReturnFromEnding" },
+    { 0x0007D030, "PrepareVsMenu" },
+    { 0x0007D080, "WaitLoadVsMenu" },
+    { 0x0007D100, "WaitEndVsMenu" },
+    { 0x0007D120, "ReturnFromVsMenu" },
+    { 0x0007D1A0, "PrepareEndingSaveMenu" },
+    { 0x0007D210, "StartEndingSaveMenu" },
+    { 0x0007D270, "WaitEndEndingSaveMenu" },
+    { 0x0007D290, "ReturnFromEndingSaveMenu" },
+};
+
+extern double xbox_InputSeconds(void);
+
+static int      g_seq_names_ok = -1;    /* -1 not yet checked */
+static uint32_t g_seq_last = 0xFFFFFFFFu;
+
+static const char *jsrf_seq_name(uint32_t i)
+{
+    if (i >= JSRF_SEQ_COUNT) return "OUT-OF-RANGE";
+    return g_seq_names_ok > 0 ? jsrf_seq_tab[i].name : "?";
+}
+
+/* The names are only as good as the table they were read off. Check once. */
+static void jsrf_seq_check_table(const uint8_t *base)
+{
+    unsigned i, bad = 0, first_bad = 0;
+
+    g_seq_names_ok = 0;
+    if (!jsrf_va_ok(JSRF_SEQ_TABLE_VA + JSRF_SEQ_COUNT * 4u)) return;
+    for (i = 0; i < JSRF_SEQ_COUNT; i++) {
+        uint32_t live = *(const uint32_t *)(base + JSRF_SEQ_TABLE_VA + i * 4u);
+        if (live != jsrf_seq_tab[i].va) {
+            if (!bad) first_bad = i;
+            bad++;
+        }
+    }
+    if (bad) {
+        fprintf(stderr, "  [JSRF-SEQ] table at %08X does not match the"
+                " decompilation: %u of %u entries differ (first at %u:"
+                " live %08X, expected %08X). Names SUPPRESSED -- indices"
+                " only.\n",
+                JSRF_SEQ_TABLE_VA, bad, JSRF_SEQ_COUNT, first_bad,
+                (unsigned)*(const uint32_t *)(base + JSRF_SEQ_TABLE_VA
+                                              + first_bad * 4u),
+                (unsigned)jsrf_seq_tab[first_bad].va);
+    } else {
+        g_seq_names_ok = 1;
+        fprintf(stderr, "  [JSRF-SEQ] fSequenceMethods at %08X matches the"
+                " decompilation on all %u entries; names are trustworthy\n",
+                JSRF_SEQ_TABLE_VA, JSRF_SEQ_COUNT);
+    }
+    fflush(stderr);
+}
+
+/* The CActSequence itself: global object id 0 in the registry. Validated, not
+ * assumed -- an object that is not it will not have id 0 at +0x08 and will not
+ * hold a dispatchable index at +0x48. */
+static uint32_t jsrf_seq_object(const uint8_t *base)
+{
+    uint32_t root = jsrf_root_va(base, NULL, NULL, 0);
+    uint32_t p;
+
+    if (!jsrf_va_ok(root + JSRF_IDS_OFF + 3u)) return 0;
+    p = *(const uint32_t *)(base + root + JSRF_IDS_OFF + JSRF_SEQ_ID * 4u);
+    if (!jsrf_va_ok(p + JSRF_SEQ_NEXT_OFF + 3u)) return 0;
+    if (*(const uint32_t *)(base + p + 0x08u) != JSRF_SEQ_ID) return 0;
+    if (*(const uint32_t *)(base + p + JSRF_SEQ_NEXT_OFF) >= JSRF_SEQ_COUNT)
+        return 0;
+    return p;
+}
+
+static DWORD WINAPI jsrf_seq_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t obj, idx;
+        if (base) {
+            if (g_seq_names_ok < 0) jsrf_seq_check_table(base);
+            obj = jsrf_seq_object(base);
+            if (obj) {
+                idx = *(const uint32_t *)(base + obj + JSRF_SEQ_NEXT_OFF);
+                if (idx != g_seq_last) {
+                    fprintf(stderr, "  [JSRF-SEQ] t=%8.2f  %2u %-32s ->"
+                            " %2u %s\n",
+                            xbox_InputSeconds(),
+                            (unsigned)g_seq_last,
+                            g_seq_last == 0xFFFFFFFFu ? "(start)"
+                                                      : jsrf_seq_name(g_seq_last),
+                            (unsigned)idx, jsrf_seq_name(idx));
+                    fflush(stderr);
+                    g_seq_last = idx;
+                }
+            }
+        }
+        /* 100 Hz. The state advances at frame rate at most, and a transition
+         * that is missed is a transition that never appears in the log --
+         * which is the failure mode every counter in section 4 had. */
+        Sleep(10);
+    }
+    return 0;
+}
+
+static void jsrf_seq_trace_start(void)
+{
+    static int started;
+    HANDLE th;
+    if (started || !getenv("RECOMP_SEQ_TRACE")) return;
+    started = 1;
+    th = CreateThread(NULL, 0, jsrf_seq_thread, NULL, 0, NULL);
+    if (th) CloseHandle(th);
+    fprintf(stderr, "  [JSRF-SEQ] tracing CActSequence::m_dwNextMethod%s\n",
+            th ? "" : " -- THREAD CREATE FAILED");
+    fflush(stderr);
+}
+
 static void jsrf_scene_report(void)
 {
     const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2167,16 +2410,7 @@ static void jsrf_scene_report(void)
      * this function printed from that pointer was read from the wrong object,
      * which is how a fatal flag came to be reported clear while the guest was
      * demonstrably acting on a set one. */
-    via_ptr = R32(JSRF_ROOT_PTR_VA);
-    if (jsrf_va_ok(via_ptr) && (via_ptr & 0xFFFFu) == (JSRF_ROOT_VA & 0xFFFFu)) {
-        root = via_ptr; how = "ptr";
-    } else {
-        root = JSRF_ROOT_VA; how = "static";
-        if (jsrf_va_ok(via_ptr))
-            fprintf(stderr, "  [JSRF-SCENE] ptr %08X rejected: low16 is not"
-                    " %04X, so it is not the object\n",
-                    (unsigned)via_ptr, (unsigned)(JSRF_ROOT_VA & 0xFFFFu));
-    }
+    root = jsrf_root_va(base, &via_ptr, &how, 1);
     if (!jsrf_va_ok(root + JSRF_LIVE_OFF + 3u)) {
         fprintf(stderr, "  [JSRF-SCENE] no usable root (ptr=%08X)\n",
                 (unsigned)via_ptr);
