@@ -2,7 +2,61 @@ CLAUDE, 13 Sep 2026 (end of session)
 THE TUTORIAL IS PASSED. THE PIPELINE HAS FOUR REACHABLE DEFECTS LEFT.
 
 Read section 1 first; it is the method, and it is worth more than any single
-fix below.
+fix below. Section 0 is what a cold session needs before touching anything.
+
+
+0. STATE OF PLAY, AND WHAT MOVED
+================================
+JSRF boots, renders, plays audio, COMPLETES THE CORN TUTORIAL and reaches the
+playable part. The blocker that stood for two days is fixed (section 2).
+
+**THE BUILD TREE HAS MOVED. CLAUDE.md is out of date on this.**
+
+    build-macos  ->  /Users/andrewcollard/jsrf-build        (a symlink)
+
+It was inside iCloud Drive, and the sync churn over 4 GB of freshly written
+output was starving the guest: boot variance ran to a 16-second range and about
+half of all runs never left the title screen. After the move the variance is
+0.2 s and the stall is roughly 1 in 3. Every hardcoded path still resolves
+through the symlink -- regenerate.sh, the CMake caches, run_scripted.sh, the
+archived gen trees -- so nothing needs editing. Do NOT "tidy" the symlink away,
+and do NOT add it to the tracked .gitignore: that file has `build-macos/`, a
+directory pattern that does not match a symlink, and it belongs to upstream.
+The exclusion is in the repo-local exclude file, which for this WORKTREE is the
+common dir's -- `git rev-parse --git-common-dir`, not .git/info/exclude.
+
+HEAD at handover: 100d92b. Eleven commits this session, 597de02 onwards.
+Working tree clean apart from two pre-existing iCloud conflict duplicates,
+`src/kernel/kernel_bridge 2.c` and `src/kernel/xbox_memory_layout 2.c`, which
+are NOT built (src/kernel/CMakeLists.txt names its sources explicitly).
+
+**Regenerate, build, run:**
+
+    PYTHON=/usr/bin/python3 diagnostics/jsrf_first_fault/regenerate.sh
+    cmake --build build-macos/jsrf-first-fault/build --target jsrf_first_fault -j 6
+
+PYTHON= is required: capstone is installed only for /usr/bin/python3.
+Regeneration is ~40 s, the build ~4 min, and translation reports 0 failed.
+
+    JSRF_BIN="$PWD/build-macos/jsrf-first-fault/build/jsrf_first_fault" \
+    RECOMP_ANIMATION_STATE=1 diagnostics/jsrf_first_fault/run_scripted.sh \
+        <name> @diagnostics/jsrf_first_fault/pad/new_game.pad 1200
+
+That drives the title with a pad script and STOPS firing at t=73, handing the
+pad to a person -- so a long limit leaves a live run at the tutorial for someone
+to play. Expect to retry: the title stall is still about 1 in 3.
+
+**THE VERIFICATION GATE.** A translator change is not verified until a run
+reaches gameplay. The objective signal, not a screen-watching claim:
+
+    CActMan +0x7930 / +0x7934 read FFFFFFFF through the tutorial and 1 / 2 once
+    it COMPLETES.   [JSRF-STATE] in the log. live=61 is the Corn cutscene,
+    65 gameplay, 70 PAUSED.
+
+Unit tests: `/usr/bin/python3 -m unittest discover -s tools/recomp -t . -p 'test_*.py'`
+-- 153, all passing. ctest is 11 of 27 failing and ALL 11 predate this session;
+six are backport_* checks made obsolete by their own fixes moving into the
+lifter, five are "Not Run".
 
 
 1. THE METHOD, WHICH FOUND EVERYTHING
