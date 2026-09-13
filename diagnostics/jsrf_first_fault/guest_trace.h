@@ -106,4 +106,12 @@ void recomp_mem_watch_guest_block(uint32_t guest_function, uint32_t dst_va,
                                   uint32_t len);
 void jsrf_d3d_alloc_report(void);
 
+/* One object's exec dispatch, edge-triggered; see func_hit_probe.c. Installed
+ * at 0x00011083, the single site recursiveExec0Default calls every live
+ * object's exec virtual from. RECOMP_FUNC_HIT_TRACE=1. */
+void jsrf_corn_note(uint32_t id, uint32_t self, uint32_t flags,
+                    uint32_t state11c, uint32_t exec,
+                    uint32_t e50, uint32_t e60, uint32_t e68);
+extern unsigned long long g_exec_dispatches;
+
 #endif

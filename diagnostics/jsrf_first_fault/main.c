@@ -34,6 +34,8 @@ static void pad_sentinel_scan(void);
 static void jsrf_save_dump(void);
 static void jsrf_scene_report(void);
 static void jsrf_seq_trace_start(void);
+static uint32_t jsrf_root_va(const uint8_t *base, uint32_t *via_out,
+                             const char **how_out, int verbose);
 static void jsrf_object_dump(void);
 static void jsrf_guest_trace_report(void);
 /* The rasterised surface, and the window that can show it. The executor draws
@@ -2025,9 +2027,22 @@ static void jsrf_object_dump(void)
 
 #define R32(va) (*(const uint32_t *)(base + (va)))
 
-    via_ptr = R32(JSRF_ROOT_PTR_VA);
-    root = jsrf_va_ok(via_ptr) ? via_ptr : JSRF_ROOT_VA;
+    /* The same low-16 rule the scene report uses, not a bare range check.
+     *
+     * This function had its own weaker copy -- accept any pointer inside RAM --
+     * which is exactly the error 12 Sep traced to a run reporting a clear fatal
+     * flag while the guest was acting on a set one. Here it cost a whole
+     * measurement a different way: before the registry exists the pointer is
+     * garbage that still passes a range check, so every report wrote an EMPTY
+     * dump, and the 128-file cap was spent long before the tutorial loaded.
+     * All 128 files came back with live=0 and no objects. */
+    root = jsrf_root_va(base, &via_ptr, NULL, 0);
     if (!jsrf_va_ok(root + 0x87E8u + 3u))
+        return;
+    /* Nothing to say is not worth a sequence number. The cap exists to bound a
+     * long run's disk use, and an empty dump consumes it without recording
+     * anything -- which is how a 220 s run produced 128 files and no data. */
+    if (R32(root + JSRF_LIVE_OFF) == 0u)
         return;
 
     snprintf(path, sizeof path, "%s/objects_%03u.json", dir, seq);
@@ -2386,6 +2401,125 @@ static void jsrf_seq_trace_start(void)
     fflush(stderr);
 }
 
+/* WHICH objects are still changing, and which have stopped.
+ *
+ * "Corn is frozen" is only half a finding: the useful question is whether
+ * anything else in the scene is still moving, because that separates "the
+ * character update is gated" from "the whole cutscene driver has stopped".
+ *
+ * The object dump answers it in principle and could not in practice. It writes
+ * a JSON file per report, and at any cadence fast enough to bracket the stall
+ * the file I/O perturbs the guest enough that the title screen stops
+ * responding -- measured twice, live=157 instead of live=61, both runs
+ * rejected. It also spends its 128-file cap long before the tutorial loads.
+ *
+ * A digest needs no files. Once per report, hash a window of each registered
+ * object and compare against the previous report; print only the ids whose
+ * hash moved. Read-only, no allocation, no disk, ~72k guest reads per report
+ * against a frame loop doing millions -- which is why this one survives its
+ * control run where the dump did not.
+ */
+#define JSRF_ACT_IDS    512u
+#define JSRF_ACT_WINDOW 0x1800u      /* covers CPlayer's transform block */
+static uint32_t g_act_digest[JSRF_ACT_IDS];
+static int      g_act_primed;
+
+static void jsrf_object_activity(const uint8_t *base, uint32_t root)
+{
+    static int on = -1;
+    unsigned id, changed = 0, present = 0, shown = 0;
+    char line[512];
+    int n = 0;
+
+    if (on < 0) on = getenv("RECOMP_OBJECT_ACTIVITY") ? 1 : 0;
+    if (!on) return;
+
+    line[0] = 0;
+    for (id = 0; id < JSRF_ACT_IDS; id++) {
+        uint32_t slot = root + JSRF_IDS_OFF + id * 4u;
+        uint32_t p, h = 2166136261u, off;
+        if (!jsrf_va_ok(slot + 3u)) break;
+        p = *(const uint32_t *)(base + slot);
+        if (!p || !jsrf_va_ok(p + JSRF_ACT_WINDOW)) {
+            g_act_digest[id] = 0;
+            continue;
+        }
+        present++;
+        for (off = 0; off < JSRF_ACT_WINDOW; off += 4u)
+            h = (h ^ *(const uint32_t *)(base + p + off)) * 16777619u;
+        if (!h) h = 1u;
+        if (g_act_primed && g_act_digest[id] && g_act_digest[id] != h) {
+            changed++;
+            if (shown < 24u) {
+                n += snprintf(line + n, sizeof line - (size_t)n, " %u", id);
+                shown++;
+            }
+        }
+        g_act_digest[id] = h;
+    }
+    if (g_act_primed)
+        fprintf(stderr, "  [JSRF-ACT] %u of %u objects changed since the last"
+                " report:%s%s\n", changed, present,
+                changed ? line : " none",
+                changed > shown ? " ..." : "");
+    g_act_primed = 1;
+    fflush(stderr);
+}
+
+/* WHICH PART of one object changes, at 64-byte resolution.
+ *
+ * The whole-object digest says Corn's memory moves every report while its
+ * state index is pinned, which is the interesting half of the earlier finding
+ * and does not say what moves. The 11 Sep xemu differential names the answer to
+ * check: xemu writes +0x0CE0..+0x0DE4 -- 66 dwords of transform block -- and we
+ * never do, along with +0x11D4.., +0x12C0.. and +0x1484... If those blocks are
+ * still absent here while others move, the fault is in the pose/transform
+ * submission and not in gameplay scheduling at all.
+ *
+ * Same cost profile as the object digest: read-only, no files, two objects. */
+#define JSRF_BLK 64u
+static uint32_t g_blk[2][JSRF_ACT_WINDOW / JSRF_BLK];
+static int      g_blk_primed;
+
+static void jsrf_object_blocks(const uint8_t *base, uint32_t root)
+{
+    static int on = -1;
+    unsigned k;
+    if (on < 0) on = getenv("RECOMP_OBJECT_BLOCKS") ? 1 : 0;
+    if (!on) return;
+
+    for (k = 0; k < 2u; k++) {
+        unsigned id = 44u + k, b, changed = 0, n = 0;
+        uint32_t slot = root + JSRF_IDS_OFF + id * 4u;
+        uint32_t p;
+        char line[768];
+        if (!jsrf_va_ok(slot + 3u)) continue;
+        p = *(const uint32_t *)(base + slot);
+        if (!p || !jsrf_va_ok(p + JSRF_ACT_WINDOW)) continue;
+        line[0] = 0;
+        for (b = 0; b < JSRF_ACT_WINDOW / JSRF_BLK; b++) {
+            uint32_t h = 2166136261u, off;
+            for (off = 0; off < JSRF_BLK; off += 4u)
+                h = (h ^ *(const uint32_t *)(base + p + b * JSRF_BLK + off))
+                    * 16777619u;
+            if (!h) h = 1u;
+            if (g_blk_primed && g_blk[k][b] && g_blk[k][b] != h) {
+                changed++;
+                if (n < 600)
+                    n += snprintf(line + n, sizeof line - (size_t)n,
+                                  " %04X", b * JSRF_BLK);
+            }
+            g_blk[k][b] = h;
+        }
+        if (g_blk_primed)
+            fprintf(stderr, "  [JSRF-BLK] id=%u %u/%u blocks changed:%s\n",
+                    id, changed, JSRF_ACT_WINDOW / JSRF_BLK,
+                    changed ? line : " none");
+    }
+    g_blk_primed = 1;
+    fflush(stderr);
+}
+
 static void jsrf_scene_report(void)
 {
     const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2420,6 +2554,9 @@ static void jsrf_scene_report(void)
 
     live  = R32(root + JSRF_LIVE_OFF);
     scene = R32(root + JSRF_SCENE_OFF);
+
+    jsrf_object_activity(base, root);
+    jsrf_object_blocks(base, root);
 
     /* How much of the id-indexed array is populated. This counts objects that
      * were constructed at all, independently of whether the scene graph has

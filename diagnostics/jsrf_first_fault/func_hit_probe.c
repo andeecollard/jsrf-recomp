@@ -274,6 +274,99 @@ static void jsrf_func_arg_report(void)
                 g_arg_dropped);
 }
 
+/* One object's exec dispatch, edge-triggered.
+ *
+ * CActBase::recursiveExec0Default walks the scene tree and calls each live
+ * object's exec virtual -- vtable slot 1 -- from a single site at 0x00011083,
+ * with the object in ecx. That is the cheapest place in the frame to ask
+ * whether a particular object is still being updated: one site, every object,
+ * once per frame.
+ *
+ * Two ids, not one. 45 is Corn, the object whose animation has stalled; 44 is
+ * the other CPlayer in the tutorial and is STATIC BY DESIGN -- xemu changes two
+ * dwords on it in 10 s and the same two in 30 s. Carrying it through the same
+ * run makes the control part of the measurement: if both read zero the probe is
+ * dead, and only if 44 behaves while 45 does not is the asymmetry real. An
+ * absence with no positive control has already cost this effort a cycle.
+ *
+ * Edge-triggered, because the site runs ~14,700 times per report interval and
+ * a line per call is both useless and fatal: the last attempt at this used
+ * jsrf_func_arg, whose linear scan over 384 entries at two hot sites perturbed
+ * the guest enough that the title screen stopped responding. Here the filter is
+ * one load and a compare in the generated C, and this function is only entered
+ * for the two objects that matter.
+ */
+struct corn_seen {
+    uint32_t id, self, flags, state11c, exec;
+    /* The CPlayer's own state machine, read from the same hook.
+     * sub_00080340 -- the exec virtual both CPlayers dispatch -- opens on
+     *     eax = [this+0xE50]; if (eax < 0x14) ...; if (eax <= 0x1A) skip
+     *     eax = [this+0xE60]; [this+0xE68] = 0
+     *     if (eax > 0) { [this+0xE60] = --eax; if (!eax) [this+0xE68] = 1; }
+     * so +0xE50 is the state index, +0xE60 a countdown and +0xE68 its expiry
+     * flag. If the state is frozen, those three say whether the timer is even
+     * running -- which +0x11C alone cannot. */
+    uint32_t e50, e60, e68;
+    unsigned long long calls;
+    int primed;
+};
+static struct corn_seen g_corn[2];
+
+/* Every object dispatched from 0x00011083, not just the two. Incremented
+ * inline in the generated C so the walker's own liveness comes from the same
+ * hook: "Corn is not updated" and "nothing is updated" are different faults
+ * and an id-filtered counter cannot tell them apart. */
+unsigned long long g_exec_dispatches;
+
+double xbox_InputSeconds(void);
+
+void jsrf_corn_note(uint32_t id, uint32_t self, uint32_t flags,
+                    uint32_t state11c, uint32_t exec,
+                    uint32_t e50, uint32_t e60, uint32_t e68)
+{
+    struct corn_seen *c;
+
+    if (!func_hit_on()) return;
+    if (id != 44u && id != 45u) return;
+    /* Also bump the ordinary counter for this site. jsrf_func_hit_report bails
+     * with "no instrumented site has been entered" when g_hit_count is zero,
+     * which silently swallowed the periodic counts on the first run -- and the
+     * periodic count is the whole difference between "exec stopped being
+     * called" and "exec is called but nothing changes". */
+    jsrf_func_hit(0x00011083u);
+    c = &g_corn[id - 44u];
+    c->calls++;
+    if (c->primed && c->self == self && c->flags == flags
+        && c->state11c == state11c && c->exec == exec
+        && c->e50 == e50 && c->e60 == e60 && c->e68 == e68)
+        return;
+    fprintf(stderr, "  [CORN] t=%8.2f id=%u this=%08X s11c=%08X"
+            " e50=%u e60=%u e68=%u exec=%08X calls=%llu\n",
+            xbox_InputSeconds(), (unsigned)id, (unsigned)self,
+            (unsigned)state11c, (unsigned)e50, (unsigned)e60, (unsigned)e68,
+            (unsigned)exec, c->calls);
+    fflush(stderr);
+    c->primed = 1; c->self = self; c->flags = flags;
+    c->state11c = state11c; c->exec = exec;
+    c->e50 = e50; c->e60 = e60; c->e68 = e68;
+}
+
+/* Call counts on the report cadence, so "is it still being updated at all"
+ * is answerable without a line per frame. */
+static void jsrf_corn_report(void)
+{
+    unsigned i;
+    fprintf(stderr, "  [CORN] exec dispatches (all objects)=%llu\n",
+            g_exec_dispatches);
+    for (i = 0; i < 2; i++)
+        if (g_corn[i].primed)
+            fprintf(stderr, "  [CORN] id=%u exec_dispatches=%llu"
+                    " s11c=%08X e50=%u e60=%u e68=%u\n",
+                    44u + i, g_corn[i].calls, (unsigned)g_corn[i].state11c,
+                    (unsigned)g_corn[i].e50, (unsigned)g_corn[i].e60,
+                    (unsigned)g_corn[i].e68);
+}
+
 void jsrf_func_hit_report(void)
 {
     unsigned i;
@@ -309,5 +402,6 @@ void jsrf_func_hit_report(void)
         }
     }
     jsrf_func_arg_report();
+    jsrf_corn_report();
     fflush(stderr);
 }
