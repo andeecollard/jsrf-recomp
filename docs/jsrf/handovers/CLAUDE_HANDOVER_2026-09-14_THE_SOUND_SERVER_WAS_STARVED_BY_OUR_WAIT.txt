@@ -1,0 +1,147 @@
+CLAUDE, 14 Sep 2026 (early)
+THE INTRO STUTTER IS OURS: A 1 ms POLL IN KeWaitForSingleObject STARVES CRI'S
+SOUND SERVER. HALF FIXED, MEASURED BOTH WAYS, AND THE REST IS NAMED.
+
+Supersedes CLAUDE_HANDOVER_2026-09-13_THE_APU_ADDRESSED_HALF_THE_MACHINE.txt.
+Section 4 is the method section and it is why the bug survived a day.
+
+
+0. STATE OF PLAY
+================
+HEAD 4619db2. ctest 21/23, the two failures deliberate (05e0465).
+Commits: e945997 diagnosis, 1afe4ed note, 8440c9c the fix, 4619db2 WAV headers.
+
+    RECOMP_VOICE_FRESH=1   ring-freshness probe (implies RECOMP_VOICE_RATES)
+    RECOMP_ADX_RATE=1      the guest's own sound-server pass rate
+    RECOMP_WAIT_POLL_US=N  the wait poll interval; =1000 restores the old build
+
+
+1. WHAT THE GLITCH IS
+=====================
+About a quarter of the intro's music was the previous lap of voice 68's
+16384-sample ring, replayed, in unbroken runs of 100-163 ms, ~2.7 times a
+second. Every sample of it is valid decoded music.
+
+The chain, every link measured:
+
+  * CRI's renderer moves at most 1024 samples per server pass (clamp at guest
+    0x0013E965), so 44100 Hz needs >= 43.1 passes/s.
+  * The server is a guest thread (body 0x0013B1C0) waiting on the D3D vblank
+    event at 59.94 Hz. That looks like 2x headroom. It is 39%.
+  * MEASURED 33.4 passes/s, pinned, at 88 fps and at 12 fps alike, with CRI's
+    own consecutive-underrun counter (0x002615AC) flat ZERO -- the renderer
+    always had data; the pass rate was the ceiling.
+  * bridge_KeWaitForSingleObject is not a wait. It is a poll loop ending in
+    Sleep(1) -> nanosleep, late under load, on a 16.67 ms budget. A cycle that
+    overruns one vblank period catches the next one and the rate halves.
+
+
+2. THE FIX, AND WHAT IT LEAVES
+==============================
+Default wait poll 1000 -> 100 us (8440c9c). Same scene, 70 s each:
+
+              server passes/s   guest writes   ring stale   frame rate
+   1000 us         36.8            71-75%       25-29%      11.6/11.7/14.1
+    100 us         44.9              86%          14%       11.6/11.9/14.2
+
+Cost side empty: frame times identical window for window, scene gets as far
+(live=137 vs 134), vblank delivery slightly BETTER (59.9 Hz vs 59.6).
+
+Confirmed independently against xemu, correlation of our attract clip with the
+oracle's:
+
+    window    before    after
+    100 ms     0.971    0.980
+    400 ms     0.883    0.965
+    1000 ms    0.449    0.904
+    2000 ms    0.281    0.634
+
+Short windows were already ~0.99 both ways -- the samples were always right.
+
+NOT FINISHED. 14-17% of the ring is still replayed and the 2 s correlation is
+0.634. At 44.9 passes/s the server still sometimes crosses a vblank period.
+Next lever: the wait is still a poll against a deadline tracked in whole
+milliseconds (next_vblank, GetTickCount), so sub-ms wake needs that clock
+reworked -- or a real wakeup when the event is set.
+
+
+3. RETRACTIONS -- MINE, FROM THIS SESSION
+=========================================
+  * "The buffer wrap is the candidate" (previous handover): DEAD. Voice 68
+    wraps 82 times in 30.5 s, exactly the arithmetic for the ring, with
+    starved_loops=0.
+  * "Voice bounds are incoherent": an artifact. voice_desc_dump runs at the TOP
+    of the VOICE_ON case, ~50 lines before that case resets CBO.
+  * "Gameplay is clean": scene-specific. live=61 freezes its stale count;
+    live=161 is 22.7% stale, the same as the intro. One run, generalised.
+  * "The frame collapse is caused by the music": no. [STAGE] shows draws going
+    3 -> 552 per frame at that moment; both are the attract scene starting. The
+    stale fraction is FLAT across that collapse, which killed the theory.
+
+
+4. HOW TO COMPARE AUDIO WITH xemu, BECAUSE THE OBVIOUS WAY LIES
+===============================================================
+The previous session's A/B declared our clip and xemu's "statistically
+indistinguishable" and concluded the samples were fine. Both halves were wrong,
+from one method error.
+
+  * Correlation over ONE long window cannot separate "different music" from
+    "same music, broken continuity". Both come back near zero. Ours and xemu's
+    read 0.09 over six seconds and 0.98-0.99 from 5 ms to 400 ms. SWEEP THE
+    WINDOW LENGTH -- the length at which it collapses IS the defect's period.
+  * A coarse ratio grid steps straight over a rate error and reports no match,
+    which reads exactly like a finding. A 6 s window decorrelates at 0.15%.
+  * CONTROL EVERY CORRELATOR AGAINST ITSELF, in the same run, at every window
+    length. r=1.000 self-match is the only thing that separates "no match" from
+    "broken instrument". This caught one of mine.
+  * Envelope agreement is not content agreement. Per-second RMS tracked for four
+    seconds while the waveforms had already diverged.
+
+Scripts (scratchpad, not committed): winsweep.py, track.py, match.py, ratesearch.py
+
+
+5. INSTRUMENT BUGS I SHIPPED AND FIXED, AS WARNINGS
+===================================================
+  * The windowed rate line called its interval helper TWICE in one fprintf. The
+    second call measured ~0 and the "consumed" figure came out 5x high. It now
+    samples once per report; the giveaway was consumed=44100 exactly, which is
+    the positive control -- if that column is not 44100, do not read the row.
+  * Cumulative counters averaged the silent part of the intro with the
+    stuttering part and hid a five-fold difference. Per-window or nothing; this
+    is what [FRAME-WIN] already exists for.
+
+
+6. xbox_apu IS NOT FULLY USED
+=============================
+One object never links and 12 of 50 exports are referenced by nothing:
+
+  * apu_mmio_hook.c.o -- not in the link at all (Windows MMIO path; macOS traps
+    in xbox_memory_layout.c).
+  * mcpx_apu_read / mcpx_apu_write / mcpx_apu_dispatch_mmio -- the whole
+    top-level register dispatch is bypassed; the macOS trap calls
+    mcpx_apu_vp_write directly. The dead READ path was known; the dead WRITE
+    dispatcher is new.
+  * mcpx_apu_monitor_init/frame/finalize, mcpx_debug_begin_frame/end_frame --
+    xemu's APU monitor tap, unused. That is where a DEBUG_MCPX-style trace would
+    go if we want one; our port kept the macro and dropped all but 2 of xemu's
+    DPRINTF sites, so enabling DEBUG_MCPX here buys nothing.
+  * mcpx_apu_shutdown, mcpx_apu_vp_reset, apu_wav_finish -- teardown, never
+    reached because timed runs are killed. That is what 4619db2 works around.
+  * apu_dsp.c links but is a stub: "DSP GP/EP initialized (STUBBED)".
+
+
+7. STILL OPEN
+=============
+  * The remaining 14-17%. See section 2.
+  * Our first 29.3 s are digital silence; xemu plays a logo chime in its first
+    10. Unchanged, separate, reproducible.
+  * 552 draw batches/frame in the attract against vsh 34.5 ms -- 12 fps. No xemu
+    reference exists for THAT scene (the 102-150 figures are the tutorial).
+    Capturing one is the obvious next oracle run.
+  * g_apu_lock_handoffs (84 in 70 s) cannot be trusted to exonerate the device
+    lock: it only fires at a frame boundary, so a single long hold reads as one.
+    A per-thread blocked-time instrument was designed this session and NOT
+    built; the design is in the session log if wanted.
+  * Voices 64-67 run the whole session producing silence, ebo=31, single-slot
+    buffers -- they never commit a freshness slot, which is why they correctly
+    report all zeros. Not a probe failure.
