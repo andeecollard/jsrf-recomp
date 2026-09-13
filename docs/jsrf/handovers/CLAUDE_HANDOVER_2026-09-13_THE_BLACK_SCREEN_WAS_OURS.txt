@@ -114,11 +114,35 @@ is in rendering or in a progressive reveal, not the data. Dialogue DOES advance
 -- a scripted A every 8 s walked through several lines -- so input reaches the
 tutorial. 13,876 nonneutral polls with a human on the pad did not move it.
 
-NEXT MEASUREMENT, and it is the one that was missing all session:
-JSRF_STARTUP_ABI_CHECK arms ONLY recomp_0000.c. Every violation seen so far in
-other chunks was an INDIRECT call, checked by the armed kernel layer. DIRECT
-call clobbers outside chunk 0 have been invisible, and the tutorial runs there.
-Build with JSRF_ABI_CHECK_ALL=ON before anything else.
+THAT MEASUREMENT IS NOW DONE, and it came back CLEAN.
+
+JSRF_STARTUP_ABI_CHECK arms ONLY recomp_0000.c, so every violation seen earlier
+in another chunk was an INDIRECT call caught by the armed kernel layer, and
+direct-call clobbers outside chunk 0 had been invisible all session. Rebuilt
+with JSRF_ABI_CHECK_ALL=ON and run to the tutorial, the whole path reports FOUR
+violations and all four are the CRT signatures already called expected on
+12 Sep:
+
+    sub_0017CAB0  esp delta -6032          __chkstk's stack probe
+    sub_0017D1F8  esp(epilogue never ran)  __SEH_prolog
+    sub_0017D231  ebx esi edi, esp +140    __SEH_epilog
+    sub_001816B0  ebx, esp +20             icall targets all FE0000xx
+
+So there is NO unexplained register clobber left on the path to the tutorial.
+The 154 remaining dispatches whose arms fall outside their body are either not
+executed here or do not clobber. Do not spend the next session on them
+expecting the tutorial to move.
+
+AND THE GUEST IS NOT HUNG. Kernel calls climb 913,139 -> 921,107 between two
+reports and the pusher keeps acking (12,896 -> 13,055). The frame loop runs and
+re-presents the same image. This is a state the title will not leave, not a
+stall in our translation.
+
+SO THE TUTORIAL IS A GAME-LOGIC OR RENDERING PROBLEM, and it is very likely the
+one already on file: the CPlayer animation gate (Corn is object id 45, id 44 is
+static by design) and the 17x update asymmetry between the two CPlayers. Those
+leads were recorded when reaching the tutorial cost a human playthrough. They
+are now reachable unattended, in about 50 seconds, with one schedule.
 
 
 6. RULES PAID FOR THIS SESSION
