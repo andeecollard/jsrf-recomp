@@ -29,6 +29,12 @@ LGPL-2.1-or-later — extracted from xemu
     src/apu/fpconv.h      (c) 2020-2025 Matt Borgerson
     src/nv2a/nv2a_regs.h  NV2A register definitions
                           (c) 2012 espes; 2015 Jannik Vogel
+    src/nv2a/nv2a_core.c  NV2A PMC/PBUS/PTIMER/PFB/PCRTC/PRAMDAC handlers
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+    src/nv2a/nv2a_state.h NV2A device state
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
 
   src/apu/apu_shim.h is this project's own file but is released under the
   same licence, because it exists only to host the extracted APU code.
