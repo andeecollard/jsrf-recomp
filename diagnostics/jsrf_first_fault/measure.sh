@@ -58,6 +58,17 @@ cp -R "$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" "$SCR
 echo "binary: $BIN"
 echo "log:    $OUT/stderr.log  (${LIMIT}s)"
 cd "$ROOT" || exit 1
+# The guest image, resolved from the repo root rather than baked into the
+# binary. CLAUDE.md puts the game directory beside the repo root; override
+# JSRF_GAME_DIR to point somewhere else.
+GAME_DIR="${JSRF_GAME_DIR:-$ROOT/../Jet Set Radio Future (US)}"
+if [ ! -f "$GAME_DIR/default.xbe" ]; then
+    echo "no default.xbe under $GAME_DIR" >&2
+    echo "  set JSRF_GAME_DIR to the directory holding your own dump" >&2
+    exit 1
+fi
+
+RECOMP_XBE_PATH="$GAME_DIR/default.xbe" RECOMP_GAME_DIR="$GAME_DIR" \
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
 RECOMP_OHCI_ATTACH=1 RECOMP_USB=1 RECOMP_PAD_INJECT=1 \
 RECOMP_PAD_SCRIPT="@$PAD" RECOMP_SCENE_REPORT=1 \

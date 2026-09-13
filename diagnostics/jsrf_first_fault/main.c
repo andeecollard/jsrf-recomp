@@ -2971,12 +2971,23 @@ static void jsrf_scene_report(void)
 #define JSRF_ADDREF 0x00177FE0u
 #define JSRF_RELEASE 0x001664D0u
 #define JSRF_DUP_FREE_OBJECT 0x0105DE68u
-#define JSRF_XBE_PATH \
-    "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/Jet Set Radio Future (US)/default.xbe"
-#define JSRF_GAME_DIR \
-    "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/Jet Set Radio Future (US)"
-#define JSRF_HDD_ROOT \
-    "/Users/andrewcollard/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/build-macos/jsrf-first-fault/emulated-hdd"
+/* Where the guest image lives.
+ *
+ * These were three absolute paths inside one developer's home directory, baked
+ * into the binary as the LAST-RESORT defaults -- and play.sh and measure.sh
+ * pass no argv, so they were the paths every normal run actually used. That is
+ * a personal path published in source, and it makes the tree unusable by anyone
+ * else without editing C.
+ *
+ * Resolution order is now: argv, then the environment, then a relative default.
+ * RECOMP_HDD_ROOT already worked this way; the other two now match it. The
+ * scripts set all three from the repo root, so behaviour is unchanged for a
+ * checkout laid out the way CLAUDE.md describes -- the game directory a sibling
+ * of the repo root -- and someone else gets a path they can point at their own
+ * dump instead of a stranger's home directory. */
+#define JSRF_XBE_PATH  "game/default.xbe"
+#define JSRF_GAME_DIR  "game"
+#define JSRF_HDD_ROOT  "emulated-hdd"
 #define GUEST_TRACE_SIZE 32u
 
 typedef struct GuestTraceRecord {
@@ -3493,8 +3504,10 @@ static HWND jsrf_create_window(int visible)
 
 int main(int argc, char **argv)
 {
-    const char *xbe_path = argc > 1 ? argv[1] : JSRF_XBE_PATH;
-    const char *game_dir = argc > 2 ? argv[2] : JSRF_GAME_DIR;
+    const char *xbe_path = argc > 1 ? argv[1] : getenv("RECOMP_XBE_PATH");
+    const char *game_dir = argc > 2 ? argv[2] : getenv("RECOMP_GAME_DIR");
+    if (!xbe_path || !*xbe_path) xbe_path = JSRF_XBE_PATH;
+    if (!game_dir || !*game_dir) game_dir = JSRF_GAME_DIR;
     const char *hdd_root = argc > 3 ? argv[3] : getenv("RECOMP_HDD_ROOT");
     void *xbe_data = NULL;
     size_t xbe_size = 0;

@@ -53,6 +53,17 @@ echo "binary: $BIN"
 echo "log:    $SCRATCH/stderr.log"
 echo "Click the game window so it has focus, then press START to begin."
 cd "$ROOT" || exit 1
+# The guest image, resolved from the repo root rather than baked into the
+# binary. CLAUDE.md puts the game directory beside the repo root; override
+# JSRF_GAME_DIR to point somewhere else.
+GAME_DIR="${JSRF_GAME_DIR:-$ROOT/../Jet Set Radio Future (US)}"
+if [ ! -f "$GAME_DIR/default.xbe" ]; then
+    echo "no default.xbe under $GAME_DIR" >&2
+    echo "  set JSRF_GAME_DIR to the directory holding your own dump" >&2
+    exit 1
+fi
+
+RECOMP_XBE_PATH="$GAME_DIR/default.xbe" RECOMP_GAME_DIR="$GAME_DIR" \
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
 RECOMP_OHCI_ATTACH=1 RECOMP_USB=1 RECOMP_PAD_INJECT=1 \
 RECOMP_REPORT_MS="${REPORT_MS:-30000}" \
