@@ -42,6 +42,10 @@ p.add_argument("--max", type=int, default=None,
                help="exit 1 if more dead branches than this are found")
 p.add_argument("--list", action="store_true",
                help="print every site, not just the summary")
+p.add_argument("--functions", type=Path, default=None,
+               help="functions.json, to split the count by whether anything "
+                    "calls the function (default: the gen tree's sibling "
+                    "disasm/functions.json)")
 a = p.parse_args()
 
 dead = defaultdict(list)
@@ -72,6 +76,32 @@ print(f"  dead fallbacks -- condition is constant zero:              {total}"
 if total:
     counts = Counter(c for sites in dead.values() for _, _, c in sites)
     print("  by condition:", ", ".join(f"{k}={v}" for k, v in counts.most_common()))
+# Split by reachability. The total is still the total -- "probably cold" is
+# exactly the reasoning this file exists to distrust, and a branch nothing
+# calls TODAY can be called by the next dispatch table the translator resolves.
+# But the split is what makes the number actionable: on 13 Sep a total of 90
+# was 4 branches in reachable code and 86 in functions nothing calls, and those
+# 86 carry the signature of data swept as code -- `loop`, `loopne` and `jnp`
+# following `adc` at unaligned addresses no MSVC output would produce. Chasing
+# the total without the split means chasing the disassembler, not the lifter.
+fjson = a.functions or (a.gen.parent / "disasm" / "functions.json")
+called_by = {}
+try:
+    import json
+    for f in json.loads(fjson.read_text()):
+        called_by[int(f["start"], 16)] = bool(f.get("called_by"))
+except Exception as exc:                      # absent or unreadable: say so
+    print(f"  (no reachability split: {fjson} unreadable -- {exc})")
+else:
+    reach = {va: v for (va, _n), v in dead.items() if called_by.get(va)}
+    unreach = {va: v for (va, _n), v in dead.items() if not called_by.get(va)}
+    print(f"    reachable  (something calls the function): "
+          f"{sum(len(v) for v in reach.values()):4d}  in "
+          f"{len(reach)} function(s)   <-- the ones that can execute")
+    print(f"    no caller  (likely data swept as code):    "
+          f"{sum(len(v) for v in unreach.values()):4d}  in "
+          f"{len(unreach)} function(s)")
+
 if a.list:
     for (va, name), sites in sorted(dead.items()):
         for fname, lineno, cond in sites:
