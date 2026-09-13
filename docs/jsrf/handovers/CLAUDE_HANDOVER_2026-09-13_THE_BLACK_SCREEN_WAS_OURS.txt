@@ -155,3 +155,91 @@ are now reachable unattended, in about 50 seconds, with one schedule.
   * "Only real starts clamp" is not a heuristic, it is the definition of an
     alias. Deriving it from the concept would have been faster than the 198/200
     measurement that eventually forced it.
+
+
+7. THE TUTORIAL STALL, TRACED (added later the same day)
+========================================================
+Reaching the tutorial unattended made this cheap, so it was worked properly.
+Every measurement below had a control run against the untouched binary first
+and was REJECTED if progression to the tutorial differed. Three were.
+
+WHAT THE FRAME IS DOING
+    Corn's exec virtual keeps being dispatched -- 2550, 2815, 3081, 3348 over
+    successive reports -- so this is not an update-selection gate above
+    CPlayer. 16 of 27 registered objects change every report, both CPlayers
+    among them, and the changing set is identical each time. "Corn is frozen"
+    was wrong; only the state indices and the pose blocks are pinned.
+
+THE STRUCTURE, from the binary rather than from memory
+    CPlayer vtable      0x001CCFF8
+    slot 1 (exec)       sub_00080340       <- what the walker dispatches
+    slots 4,7,8,10,11,13,14 = 0x00011C90   <- every non-Default mode IS a nop
+
+THE TWO PREDICATES, both inside sub_00080340
+    0x00080340:  eax = [this+0xE50]
+                 if (eax <  0x14) <timer path>
+                 if (eax <= 0x1A) skip          <- taken, every frame
+    0x00080407:  eax = [this+0x2D0]
+                 if ([eax+0x38] == 0) goto 0x0008066E
+                                                <- taken, every frame; jumps
+                    past +0xCB0, +0xCA4, +0x13C.. and the +0xCE0 loop
+
+    Measured from the first frame the tutorial scene exists:
+        id=44  e50=23  r2d0=04839950  r38=0
+        id=45  e50=25  r2d0=04846280  r38=0
+    The resource pointer is VALID; the field inside it is zero and stays zero.
+
+WHAT IS ACTUALLY ABSENT, at 64-byte resolution
+    id 44 changes exactly blocks 0C80 and 1340 -- which is where xemu's
+    reference puts its only two moving dwords (+0xC94, +0x134C). The control
+    behaves correctly, so the instrument is not dead.
+    id 45 changes 0C80, 11C0, 1440, 1600..17C0 and NOT 0CC0..0DC0, NOT
+    12C0..13C0, NOT 1480..14C0 -- the +0x0CE0..+0x0DE4, +0x12C0.. and
+    +0x1484.. groups the 11 Sep xemu differential named. Positive control for
+    the absence: 0C80 moves on the same object, 96 bytes below a block that
+    never does.
+
+WHAT THE SKIPPED LOOP IS, and why the first reading was too strong
+    sub_0014C340 is a three-float VECTOR ADD, not a copy:
+        for (i = 0; i < 21; i++)
+            (this+0xCE0 + i*12).xyz += ([this+0x2D0]+0x3C).xyz;
+    So +0xCE0..+0xDDC is 21 positions translated by ONE delta, and [res+0x38]
+    gates whether the delta is applied. Zero there is consistent with "this
+    character is not moving", which in a cutscene may be CORRECT. The pose gate
+    is therefore probably a SYMPTOM of the parked state, not a second defect.
+
+THE STATE BAND
+    +0xE50 in 0x14..0x1A is written by one contiguous family, and nothing else
+    writes those values:
+        sub_0009C4D0 0x14   sub_0009C550 0x15   sub_0009C600 0x16
+        sub_0009B2D0 0x17   sub_0009B350 0x18   sub_0009B3E0 0x19
+        sub_0009B4B0 0x1A
+    The 0x17 and 0x19 setters -- the two parked values -- are both called from
+    sub_000A76E0, a 3000-byte function at .rdata vtable slot 0x001CD574, i.e. a
+    virtual on a class OTHER than CPlayer. +0x11C reads 170/171 for ids 44/45,
+    the same pair recorded on 10 Sep.
+
+NEXT, AND IT IS A REFERENCE QUESTION NOT A STATIC ONE
+    Ask xemu what +0xE50 is for Corn at the same moment.
+      * If xemu also shows 25, the state is right and the fault is in what the
+        state's handler does -- keep going down from sub_000A76E0.
+      * If xemu shows something outside 0x14..0x1A, the fault is in how the
+        state was chosen, and the 0x09/0x0A family is where it should have
+        gone instead.
+    +0xE50 is now a cheap proven marker readable from the existing hook at
+    0x00011083, so this is one run per side.
+
+STILL OPEN, and deliberately not answered: whether Draw is called for Corn. It
+needs a second walker hook, which the one-probe discipline ruled out. The
+vector-add reading makes a pure render fault unlikely, but that is an inference.
+
+INSTRUMENT NOTES, because two of these cost runs
+  * jsrf_func_arg does a LINEAR SCAN of up to 384 entries per call. At two hot
+    CPlayer sites it perturbed the guest enough that the title stopped
+    responding. jsrf_func_hit is a direct-mapped O(1) increment; prefer it.
+  * RECOMP_OBJECT_DUMP writes a JSON file per report. At any cadence fast
+    enough to bracket the stall the I/O stalls the title (live=157, not 61 --
+    twice). Its 128-file cap was also spent before the tutorial loaded, on
+    EMPTY dumps, because it carried its own bare-range root check instead of
+    the low-16 rule. Both fixed, but for "what is still changing" use
+    RECOMP_OBJECT_ACTIVITY / RECOMP_OBJECT_BLOCKS, which write nothing.
