@@ -73,6 +73,20 @@ static uint64_t audit_deg_nonfinite,audit_deg_dup,audit_deg_collinear,audit_deg_
 /* And the raster state the cull decision is made from, as actually seen. */
 static uint64_t audit_cull_none,audit_cull_back,audit_cull_front,audit_cull_both,
     audit_cull_other,audit_front_cw,audit_front_ccw;
+/* The w-sign census, and the reason for it.
+ *
+ * area() runs on positions the GUEST already perspective-divided. Dividing
+ * by a negative w negates x and y, so a triangle with an ODD number of
+ * w<0 vertices comes out with its screen winding reversed, and the backface
+ * test then answers the opposite of the truth.
+ *
+ * The orientation that does not lie is the sign of the 3x3 determinant of
+ * the homogeneous coordinates. Writing x_clip = ndc_x * w, that determinant
+ * factors exactly into (screen area) * w0*w1*w2 -- so the correct test is
+ * the current one times sign(w0*w1*w2), and the current code is missing
+ * that factor. `flip` counts the triangles where it changes the answer. */
+static uint64_t audit_w_allpos,audit_w_mixed,audit_w_allneg;
+static uint64_t audit_mixed_culled,audit_signflip,audit_signflip_culled;
 static float audit_z_min=INFINITY,audit_z_max=-INFINITY;
 static float audit_w_min=INFINITY,audit_w_max=-INFINITY;
 
@@ -309,6 +323,13 @@ void nv2a_metal_report(void)
             (unsigned long long)audit_cull_back,(unsigned long long)audit_cull_both,
             (unsigned long long)audit_cull_other,(unsigned long long)audit_front_cw,
             (unsigned long long)audit_front_ccw);
+    if(clip_audit_on())
+        fprintf(stderr,"[METAL] clip audit: w sign per triangle: all-positive=%llu "
+            "MIXED=%llu all-negative=%llu | mixed culled=%llu | odd-negative=%llu "
+            "of which culled ONLY because the winding is inverted=%llu\n",
+            (unsigned long long)audit_w_allpos,(unsigned long long)audit_w_mixed,
+            (unsigned long long)audit_w_allneg,(unsigned long long)audit_mixed_culled,
+            (unsigned long long)audit_signflip,(unsigned long long)audit_signflip_culled);
 }
 
 typedef struct{float p[4],d0[4],d1[4],t[4][4];}Vertex;
@@ -392,7 +413,28 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
                     if(q[k][3]<0)wn=1;}
                 if(on&&!wn)++audit_deg_lost;}}}
     return;}int front=(ar>0)==(s->front_cw!=0);
- if(s->cull_face==0x408||(s->cull_face==0x404&&front)||(s->cull_face==0x405&&!front)){if(audit)++audit_asm_culled;return;}out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;}
+ int culled=s->cull_face==0x408||(s->cull_face==0x404&&front)||(s->cull_face==0x405&&!front);
+ if(audit){const float*pa=v[a][0],*pb=v[b][0],*pc=v[c][0];
+    int neg=(pa[3]<0)+(pb[3]<0)+(pc[3]<0);
+    if(!neg)++audit_w_allpos;else if(neg==3)++audit_w_allneg;else{++audit_w_mixed;if(culled)++audit_mixed_culled;}
+    if(neg&1){++audit_signflip;
+        int front2=((ar>0)^1)==(s->front_cw!=0);
+        int culled2=s->cull_face==0x408||(s->cull_face==0x404&&front2)||(s->cull_face==0x405&&!front2);
+        if(culled&&!culled2){++audit_signflip_culled;
+            /* The geometry itself, for the first few. A count says how big the
+             * population is; these say what the population IS, and whether it
+             * looks like the large near-camera ground quads the symptom
+             * points at. Screen x,y are pixels; w is the guest's oPos.w. */
+            static unsigned shown;
+            if(shown<6){++shown;
+                fprintf(stderr,"  [METAL] winding-flip example %u: area=%.1f cull=0x%X front_cw=%u\n",
+                    shown,ar,s->cull_face,s->front_cw);
+                const float*q[3]={pa,pb,pc};
+                for(int k=0;k<3;k++)
+                    fprintf(stderr,"  [METAL]   v%d x=%9.2f y=%9.2f z=%14.1f w=%12.4f\n",
+                        k,q[k][0],q[k][1],q[k][2],q[k][3]);
+                fflush(stderr);}}}}
+ if(culled){if(audit)++audit_asm_culled;return;}out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;}
 
 int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
  uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
