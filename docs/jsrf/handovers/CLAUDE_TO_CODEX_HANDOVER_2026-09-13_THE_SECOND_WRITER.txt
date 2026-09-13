@@ -1,0 +1,131 @@
+CLAUDE -> CODEX, 13 Sep 2026
+ONE QUESTION: WHAT WRITES CPlayer +0xCE0 ON HARDWARE AND NEVER IN OUR BUILD?
+
+Everything else in here is context for that question. If you only read one
+section, read 2.
+
+
+0. STATE OF PLAY
+================
+The black screen on New Game is FIXED and pushed (a13aa04). The unattended path
+now reaches the Corn tutorial in ~46 s with no human:
+
+    diagnostics/jsrf_first_fault/run_scripted.sh <name> \
+        @diagnostics/jsrf_first_fault/pad/new_game.pad 200
+
+It holds live=61, seq=30 WaitEndStoryOrVsMission, m_bFatal=0, renders and
+presents. JSRF_ABI_CHECK_ALL over every chunk reports four violations and all
+four are the expected CRT signatures. The characters do not animate. That is
+the only thing left between here and a playable tutorial.
+
+
+1. WHAT IS ALREADY EXCLUDED, WITH EVIDENCE
+==========================================
+Do not spend time re-deriving these.
+
+  * NOT register clobber. ABI check armed across every chunk on the tutorial
+    path: 4 rows, all CRT (__chkstk, __SEH_prolog/epilog, a thunk helper).
+  * NOT exec scheduling. Corn's exec virtual (CPlayer vtable 0x001CCFF8 slot 1
+    = sub_00080340) is dispatched 3,400+ times after the stall.
+  * NOT mode selection. Slots 4,7,8,10,11,13,14 are all 0x00011C90, the nop, so
+    every non-Default mode is a nop by design.
+  * NOT the draw path. Both CPlayers are in the draw list (CActMan +0x7FA4,
+    threaded on +0x34) every report, and Corn is visibly on screen.
+  * NOT the +0xE50 state band. See section 2 -- xemu is IDENTICAL.
+  * NOT the pose gate at 0x00080407. See section 2 -- xemu is IDENTICAL.
+  * NOT the remaining 154 truncated switch dispatchers. None clobbers anything
+    on this path.
+
+
+2. THE MEASUREMENT THAT MATTERS
+===============================
+xemu (US ISO, GDB stub) and our build, at the SAME tutorial beat
+("This is the GG's Garage. Hey, where's our pizza?"):
+
+                  ours                        xemu
+    scene         live=61 seq=30              live=61 seq=30
+    id 44         e50=23 s11c=AA r38=0        e50=23 s11c=AA r38=0
+    id 45         e50=25 s11c=AB r38=0        e50=25 s11c=AB r38=0
+
+Identical, and static on BOTH sides across three samples over six seconds --
+while Corn is visibly animating in xemu.
+
+Then 64-byte block deltas on the same objects, 3 s apart:
+
+    xemu id=45  30/96 changed: 09C0 0C80 0CC0 0D00 0D40 0D80 0DC0 0E80
+                               11C0 1200 12C0 1300 1340 1380 13C0 1400
+                               1440 1480 14C0 1540 1580 15C0 1600 1640
+                               1680 16C0 1700 1740 ...
+    ours id=45  10/96 changed: 0C80 11C0 1440 1600 1640 1680 16C0 1700
+                               1780 17C0
+    xemu id=44  26/96 (including 0CC0..0DC0)
+    ours id=44   5/96: 0C80 1240 1280 12C0 1340
+
+THE POINT: xemu writes +0x0CE0..+0x0DC0 -- the transform block -- WITH r38 == 0
+and e50 in the skip band. So the copy loop at 0x000804A1 inside sub_00080340 is
+CORRECTLY SKIPPED ON BOTH SIDES, and a SECOND, SEPARATE WRITER of that block
+exists that runs on hardware and never runs here.
+
+That second writer is the whole question.
+
+
+3. WHY IT IS HARD TO FIND FROM HERE, AND WHAT I TRIED
+=====================================================
+  * No RECOMP_MEM_WRITE32 in the entire generated tree targets +0xCE0. The one
+    known writer computes the address (edi = esi + 0xCE0) and writes through
+    sub_0014C340, which is a three-float VECTOR ADD (dest.xyz += src.xyz), not
+    a copy. So grepping for the offset does not find writers.
+  * Candidate family by offset: sub_000836F0 writes +0x9E8, +0xE80, +0x9C0 and
+    +0x9E4 -- four of the fields xemu changes and we do not -- and is called
+    from sub_00084200, sub_00091AC0/C30/D70, sub_000A6B10 and sub_000A76E0.
+    sub_0009D030/D0C0/D260/D7E0/D870 and sub_0009E910 also write +0x9E4/+0x9C0.
+    Whether any of them runs at the tutorial IS NOT YET MEASURED -- see 4.
+  * A GDB write watchpoint on xemu's Corn+0xCE0 would name the writer directly.
+    I set one (Z2 accepted, OK), it never trapped in 20 s, and reading
+    registers while the guest was still running desynchronised the stub. xemu
+    then refused new connections and had to be killed. DO NOT REPEAT THAT
+    without a stop reply in hand first; see xemu_rsp.py's docstring.
+
+
+4. WHAT I WOULD DO NEXT, AND THE TRAP IN IT
+===========================================
+Put plain jsrf_func_hit counters (direct-mapped, O(1)) on sub_000836F0,
+sub_0009D030/D0C0/D260/D7E0/D870 and sub_0009E910, run the unattended path, and
+see which run at the tutorial. Instrument via
+
+    diagnostics/jsrf_first_fault/instrument_func_hit.py --va ... --skip-mismatched
+
+THE TRAP, and it cost me three runs today: a control run that stalls at the
+title screen (live=157 instead of 61) is NOT necessarily instrumentation
+weight. I attributed three such failures to probe cost. At least one was CPU
+starvation -- a wedged xemu was spinning at 124% and the load average was 10.
+CHECK `uptime` AND `ps -A -o %cpu,command -r | head` BEFORE blaming the probe.
+
+Real weight limits that ARE established:
+  * jsrf_func_arg does a LINEAR SCAN of up to 384 entries per call. Two of
+    those at hot CPlayer sites stalled the title reliably. jsrf_func_hit is
+    O(1); prefer it always.
+  * RECOMP_OBJECT_DUMP writes a JSON file per report and stalls the title at
+    any useful cadence. Use RECOMP_OBJECT_ACTIVITY / RECOMP_OBJECT_BLOCKS
+    instead -- host-side digests, no files, never failed a control.
+  * EVERY measurement needs a control run against the untouched binary first,
+    and must be rejected if progression to the tutorial differs.
+
+
+5. IF YOU WANT THE ORACLE BACK
+==============================
+xemu must be relaunched with the stub and the tutorial replayed (~4 min):
+
+    /Applications/xemu.app/Contents/MacOS/xemu -s        # stub on 1234
+    /usr/bin/python3 diagnostics/jsrf_first_fault/xemu_cplayer_state.py
+
+Snapshots did not save on this build, so there is no shortcut. The block-delta
+method in section 2 needs no watchpoints and produced the whole answer; prefer
+it.
+
+
+6. THE ONE-LINE ASK
+===================
+Given that hardware writes CPlayer +0x0CE0..+0x0DC0 every frame at the Corn
+tutorial while +0xE50 is parked at 25 and [[this+0x2D0]+0x38] is 0, and our
+build does not: which function is it, and why is it unreachable for us?
