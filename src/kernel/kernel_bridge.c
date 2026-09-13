@@ -38,6 +38,11 @@
 #include <stdlib.h>
 #include <float.h>
 #include <stddef.h>
+#if !defined(_WIN32)
+#include <time.h>
+#include <errno.h>
+#include <sched.h>
+#endif
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
@@ -1694,7 +1699,59 @@ static void bridge_KeWaitForSingleObject(void)
 #if !defined(_WIN32)
         w32_thread_suspend_point();
 #endif
-        Sleep(1);
+        /* How long to wait before looking again.
+         *
+         * This was Sleep(1), and Sleep(1) is nanosleep(1 ms), which on macOS
+         * returns late under load. That is a large granularity to impose on a
+         * 16.67 ms budget, and one of the threads waiting here is JSRF's sound
+         * server: CRI's renderer moves at most 1024 samples per pass (guest
+         * 0x0013E965), so at 44100 Hz it needs >= 43.1 passes a second, and it
+         * was MEASURED at 33.4 -- pinned there at every frame rate, with CRI's
+         * own underrun counter at zero, so it is not short of data, it is short
+         * of passes. A cycle that overruns one vblank period catches the next
+         * one instead, which halves the rate; the poll granularity is enough on
+         * its own to push it over.
+         *
+         * MEASURED, intro, 70 s each, same scene (live=137 vs 134):
+         *
+         *              server passes/s   guest writes   ring stale   frame rate
+         *   1000 us         36.8            71-75%       25-29%       11.6/11.7/14.1
+         *    100 us         44.9              86%        14%          11.6/11.9/14.2
+         *
+         * 43.1 passes/s is break-even, so 1000 us is below it and 100 us is
+         * above it. The cost side came out empty: frame times are identical
+         * window for window, the scene gets as far, and vblank delivery is
+         * slightly BETTER (59.9 Hz against 59.6, max_gap 17 ms against 18).
+         * So the default is 100 us. RECOMP_WAIT_POLL_US overrides it, and
+         * RECOMP_WAIT_POLL_US=1000 restores the old behaviour exactly, which is
+         * how the table above was produced and how a regression would be
+         * bisected.
+         *
+         * NOT a complete fix: 14% of the ring is still replayed, because even
+         * at 44.9 passes/s the server's cycle still crosses a vblank period
+         * sometimes. What this removes is the part of the deficit that was
+         * ours. */
+        {
+            static long poll_us = -1;
+            if (poll_us < 0) {
+                const char *e = getenv("RECOMP_WAIT_POLL_US");
+                poll_us = e ? strtol(e, NULL, 10) : 100;
+                if (poll_us < 0) poll_us = 0;
+                if (poll_us > 1000000) poll_us = 1000000;
+            }
+            if (poll_us >= 1000) {
+                Sleep((DWORD)(poll_us / 1000));
+            } else if (poll_us > 0) {
+#if defined(_WIN32)
+                Sleep(0);
+#else
+                struct timespec ts = { 0, poll_us * 1000L };
+                while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+#endif
+            } else {
+                sched_yield();
+            }
+        }
     }
 }
 

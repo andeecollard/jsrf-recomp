@@ -59,6 +59,8 @@ extern void xbox_HeapReport(const char *why);
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 #include "xinput_xbox.h"
 #include "xbox_usb_ohci.h"
+static void jsrf_adx_rate_report(void);
+
 
 /* Defined in src/apu/apu_mmio_hook.c, outside its Win32 guard. The MMIO hook
  * itself is Windows-only; the state pointer is not. */
@@ -1055,6 +1057,9 @@ static void jsrf_pusher_report(void)
              * resampler currently ignores. Opt-in (RECOMP_VOICE_RATES). */
             extern void mcpx_apu_voice_rate_report(void);
             mcpx_apu_voice_rate_report();
+            /* And how fast the guest's sound server ran in the same window,
+             * which is what decides whether it can keep the ring full. */
+            jsrf_adx_rate_report();
             extern void xbox_VblankReport(void);
             xbox_VblankReport();
             /* And whether the code all of the above is measuring is still the
@@ -1279,6 +1284,75 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
 #define ADX_TICK_VA   0x0025EFB0u
 #define ADX_SHUTDOWN_VA 0x0025EFD8u
 #define ADX_THREAD_VA 0x0027D0E8u
+
+/* How fast the guest's own sound server actually runs, as a RATE.
+ *
+ * The APU consumes 44100 source samples a second and the guest was measured
+ * writing only 32-36k of them, so about a quarter of the music is the previous
+ * lap of the ring replayed. CRI's renderer clamps each transfer to 1024 samples
+ * (guest 0x0013E965), so breaking even needs >= 43.07 server passes a second,
+ * and the server is driven by a wait on the D3D vblank event at 59.94 Hz --
+ * only 39% of headroom, not the 2x it looks like.
+ *
+ * That makes the pass rate the number the whole question turns on, and the
+ * guest already counts it for us:
+ *
+ *   0x0025EFA8  the CPU-idle spin thread   (guest body 0x0013B180)
+ *   0x0025EFAC  SOUND SERVER PASSES        (bodies 0x0013B1C0 and 0x0013B230,
+ *                                           BOTH increment it, so this reads
+ *                                           about twice the true server rate --
+ *                                           0x0013B230 dispatches an SVM slot
+ *                                           that has no callback registered)
+ *   0x0025EFB0  the level-5 worker         (body 0x0013B2A0)
+ *   0x002615AC  CRI's own consecutive-underrun count, inside mwlRnaExecServer
+ *               (bumped at 0x0013EF5B, zeroed at 0x0013EF4F). Non-zero means
+ *               the renderer found no data to send; flat zero means it had data
+ *               and the pass rate is the ceiling.
+ *
+ * Printed against the vblank rate in the same window, because "33 passes a
+ * second" only means something beside "59.7 vblanks a second". Deltas, not
+ * totals, and divided by a measured interval rather than the requested one.
+ *
+ * Opt-in (RECOMP_ADX_RATE), read-only, four guest loads per report. */
+#define ADX_SPIN_VA      0x0025EFA8u
+#define ADX_SERVER_VA    0x0025EFACu
+#define ADX_WORKER_VA    0x0025EFB0u
+#define ADX_UNDERRUN_VA  0x002615ACu
+
+static void jsrf_adx_rate_report(void)
+{
+    static int on = -1;
+    static uint32_t p_spin, p_srv, p_wrk;
+    static struct timespec prev;
+    struct timespec now;
+    uint32_t spin, srv, wrk, under;
+    double dt;
+
+    if (on < 0) on = getenv("RECOMP_ADX_RATE") != NULL;
+    if (!on) return;
+
+    spin = MEM32(ADX_SPIN_VA); srv = MEM32(ADX_SERVER_VA);
+    wrk  = MEM32(ADX_WORKER_VA); under = MEM32(ADX_UNDERRUN_VA);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (prev.tv_sec || prev.tv_nsec) {
+        dt = (double)(now.tv_sec - prev.tv_sec)
+           + (double)(now.tv_nsec - prev.tv_nsec) / 1e9;
+        if (dt > 1e-3) {
+            double srv_hz = (double)(uint32_t)(srv - p_srv) / dt;
+            fprintf(stderr,
+                "  [ADX-RATE] server=%.1f/s (counted by two threads, so ~%.1f "
+                "true passes/s; >=43.1 needed) worker=%.1f/s spin=%.0f/s "
+                "underruns=%u%s\n",
+                srv_hz, srv_hz / 2.0,
+                (double)(uint32_t)(wrk - p_wrk) / dt,
+                (double)(uint32_t)(spin - p_spin) / dt, under,
+                (srv_hz / 2.0 < 43.1)
+                    ? "   <- below break-even: the ring cannot be kept full" : "");
+            fflush(stderr);
+        }
+    }
+    p_spin = spin; p_srv = srv; p_wrk = wrk; prev = now;
+}
 
 static DWORD WINAPI jsrf_adx_watch(LPVOID unused)
 {

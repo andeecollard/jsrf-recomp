@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include <time.h>
 
 /* #define DEBUG_MCPX */
 
@@ -1027,6 +1028,19 @@ typedef struct {
     unsigned long loopbacks, starved_loops;
     unsigned long fresh_slots, stale_slots, new_slots;
     unsigned long cur_stale_run, max_stale_run;
+    /* Same two counts, per report window, reset by the report. Cumulative
+     * totals averaged the silent pre-music part of the intro together with the
+     * part that stutters and hid a five-fold difference; [FRAME-WIN] exists for
+     * the same reason, and these are printed so the two can be read off against
+     * each other in the same window. */
+    unsigned long w_fresh_slots, w_stale_slots;
+    /* Leading edges: a stale slot followed by a fresh one is the start of one
+     * chunk the guest wrote. Counting edges rather than slots turns the deficit
+     * into a CADENCE in Hz, which can be matched against the clocks that exist
+     * -- vblank at 59.7, the APU frame at 1500, a 1 ms sleep at 1000 -- instead
+     * of being described as a percentage that fits nothing. */
+    unsigned long w_refill_edges;
+    int last_slot_stale;
     unsigned long frames, off_frames;
     unsigned long short_calls, dry_calls, short_samples;
     unsigned long silent_frames;      /* fetched samples were all ~zero */
@@ -1123,11 +1137,16 @@ static void voice_fresh_commit(uint16_t v, VoiceFresh *f)
         r->cur_stale_run = 0;
     } else if (f->crc[sl] == f->acc) {
         r->stale_slots++;
+        r->w_stale_slots++;
+        r->last_slot_stale = 1;
         if (f->stale_n[sl] < 0xFFFF) f->stale_n[sl]++;
         if (++r->cur_stale_run > r->max_stale_run)
             r->max_stale_run = r->cur_stale_run;
     } else {
         r->fresh_slots++;
+        r->w_fresh_slots++;
+        if (r->last_slot_stale) r->w_refill_edges++;
+        r->last_slot_stale = 0;
         r->cur_stale_run = 0;
     }
     if (f->pass_n[sl] < 0xFFFF) f->pass_n[sl]++;
@@ -1561,11 +1580,31 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     return produced;
 }
 
+/* Seconds since the previous call. The windowed counters are counts, and a
+ * count is not a rate until it is divided by the interval it was collected
+ * over -- and REPORT_MS is a request, not a guarantee, so this measures the
+ * interval rather than assuming it. */
+static double voice_fresh_window_s(void)
+{
+    static struct timespec prev;
+    struct timespec now;
+    double dt;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!prev.tv_sec && !prev.tv_nsec) { prev = now; return 1.0; }
+    dt = (double)(now.tv_sec - prev.tv_sec)
+       + (double)(now.tv_nsec - prev.tv_nsec) / 1e9;
+    prev = now;
+    return dt > 1e-3 ? dt : 1.0;
+}
+
+static double g_voice_fresh_window_s = 1.0;
+
 void mcpx_apu_voice_rate_report(void)
 {
     unsigned v, shown = 0, any = 0;
     unsigned long tot = 0, tot_off = 0;
     if (!voice_rate_on()) return;
+    g_voice_fresh_window_s = voice_fresh_window_s();
     for (v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         tot += g_voice_rate[v].frames;
         tot_off += g_voice_rate[v].off_frames;
@@ -1631,6 +1670,26 @@ void mcpx_apu_voice_rate_report(void)
                         "%u never stale, %u <25%%, %u 25-75%%, %u >75%%, "
                         "%u ALWAYS | longest always-ish span %u slots at %u\n",
                         hi + 1, b[0], b[1], b[2], b[3], b[4], best_run, best_lo);
+            }
+            {
+                VoiceRate *rw = &g_voice_rate[v];
+                unsigned long wc = rw->w_fresh_slots + rw->w_stale_slots;
+                double dt = g_voice_fresh_window_s;
+                fprintf(stderr, "  [VOICE-FRESH-WIN]   this window: %lu fresh, "
+                        "%lu stale (%.1f%%) | guest wrote %.0f samples/s of "
+                        "%.0f consumed (%.0f%%) in %.1f chunks/s of %.1f ms\n",
+                        rw->w_fresh_slots, rw->w_stale_slots,
+                        wc ? 100.0 * (double)rw->w_stale_slots / (double)wc : 0.0,
+                        (double)rw->w_fresh_slots * NUM_SAMPLES_PER_FRAME / dt,
+                        (double)wc * NUM_SAMPLES_PER_FRAME / dt,
+                        wc ? 100.0 * (double)rw->w_fresh_slots / (double)wc : 0.0,
+                        (double)rw->w_refill_edges / dt,
+                        rw->w_refill_edges
+                            ? (double)rw->w_fresh_slots / (double)rw->w_refill_edges
+                              * NUM_SAMPLES_PER_FRAME / 44.1
+                            : 0.0);
+                rw->w_fresh_slots = 0; rw->w_stale_slots = 0;
+                rw->w_refill_edges = 0;
             }
         }
     }
