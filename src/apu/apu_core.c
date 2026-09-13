@@ -30,6 +30,7 @@
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
+uint32_t g_apu_ram_mask = 0x03FFFFFFu;  /* replaced at init by the real size */
 
 MCPXAPUState *g_state = NULL;
 
@@ -835,6 +836,7 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
 
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
+    extern size_t xbox_GetMemorySize(void);
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -842,6 +844,20 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+    /* Mask from the actual map, not from a constant. A power-of-two size gives
+     * size-1; anything else falls back to 64 MB, which is the old behaviour and
+     * says so rather than inventing a mask for a size nobody has seen. */
+    {
+        size_t sz = xbox_GetMemorySize();
+        if (sz && (sz & (sz - 1)) == 0 && sz <= 0x100000000ull) {
+            g_apu_ram_mask = (uint32_t)(sz - 1);
+        } else {
+            fprintf(stderr, "[APU] guest RAM size %zu is not a power of two; "
+                            "DMA wrap mask stays at 64 MB\n", sz);
+        }
+        fprintf(stderr, "[APU] DMA wrap mask %08X (%zu MB of guest RAM)\n",
+                g_apu_ram_mask, sz >> 20);
+    }
     g_state = d;
     d->ram_ptr = ram_ptr;
 

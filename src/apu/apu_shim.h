@@ -93,34 +93,47 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+extern uint8_t *g_apu_ram_ptr; /* Set at init to point at guest RAM */
+/* Wrap mask for APU DMA, one less than the guest RAM size.
+ *
+ * This was a hardcoded 0x03FFFFFF -- 64 MB, the retail Xbox -- in all six
+ * accessors below, while this runtime maps 128 MB ("mapped 131072 KB" at boot).
+ * Any APU DMA to an address above 64 MB therefore WRAPPED into the wrong half
+ * of memory instead of faulting, silently and per-access.
+ *
+ * That is not hypothetical: JSRF's voice scatter-gather descriptors resolve to
+ * 0x041E5000, 0x042E5000 and 0x045CF000, all of them legal in a 128 MB map and
+ * all of them folded back below 64 MB here, which is why those voices fetched
+ * zeros while voice 68 at 0x00B30004 -- the one buffer that happens to live
+ * low -- played correctly. Set from the real size at init. */
+extern uint32_t g_apu_ram_mask;
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)(g_apu_ram_ptr + (addr & g_apu_ram_mask));
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)(g_apu_ram_ptr + (addr & g_apu_ram_mask));
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint8_t *)(g_apu_ram_ptr + (addr & g_apu_ram_mask));
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)(g_apu_ram_ptr + (addr & g_apu_ram_mask)) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)(g_apu_ram_ptr + (addr & g_apu_ram_mask)) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint8_t *)(g_apu_ram_ptr + (addr & g_apu_ram_mask)) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */

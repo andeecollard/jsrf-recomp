@@ -199,6 +199,7 @@ BOOL xbox_IsXboxAddress(uintptr_t address);
  * Returns NULL if memory layout is not initialized.
  */
 void *xbox_GetMemoryBase(void);
+size_t xbox_GetMemorySize(void);
 
 /**
  * Get the offset from Xbox VA to actual mapped address.

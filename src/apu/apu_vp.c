@@ -196,6 +196,75 @@ static int voice_ev_on(void)
     return on;
 }
 
+static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr);
+
+/* Everything voice_get_samples will consult, printed at VOICE_ON.
+ *
+ * Voice 70 -- the one the title uses to cover its music track change -- is
+ * processed for the right number of frames, is never starved or short, and
+ * every sample it fetches is zero, while voice 68 beside it fetches real audio.
+ * So the question is what its descriptor names and whether there is anything
+ * there. Printing the fields alone is not enough: a plausible base address
+ * pointing at zeroed memory looks exactly like a correct one, so the first
+ * dwords AT that address go out too, and that is what separates "we are reading
+ * the wrong place" from "the guest has not filled it yet".
+ *
+ * Stream voices resolve through the SSL page table rather than BA, so which
+ * path the voice takes is printed first -- reading BA for a stream voice would
+ * be reading a field that means nothing. */
+static void voice_desc_dump(MCPXAPUState *d, uint16_t v)
+{
+    uint32_t fmt, ba, ebo, cbo, lbo;
+    int stream, stereo, ssize, csize, loop;
+    if (!voice_ev_on() || v >= MCPX_HW_MAX_VOICES) return;
+    fmt    = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+    stream = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                            NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
+    stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                            NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
+    ssize  = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                            NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE);
+    csize  = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                            NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE);
+    loop   = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                            NV_PAVS_VOICE_CFG_FMT_LOOP) != 0;
+    ba  = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                         NV_PAVS_VOICE_CUR_PSL_START_BA);
+    ebo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
+                         NV_PAVS_VOICE_PAR_NEXT_EBO);
+    cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                         NV_PAVS_VOICE_PAR_OFFSET_CBO);
+    lbo = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                         NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO);
+    fprintf(stderr, "  [VOICE-DESC] voice %u %s fmt=%08X stereo=%d ssize=%d "
+            "csize=%d loop=%d ba=%08X cbo=%u ebo=%u lbo=%u ssladdr=%08X\n",
+            v, stream ? "STREAM" : "buffer", fmt, stereo, ssize, csize, loop,
+            ba, cbo, ebo, lbo, d->regs[NV_PAPU_VPSSLADDR]);
+    /* The bytes themselves -- through the SAME translation voice_get_samples
+     * uses, which is the only reason this line is worth anything.
+     *
+     * BA is NOT a guest address. For the buffered path it is a linear offset
+     * translated through the VPSGEADDR scatter-gather page table
+     * (get_data_ptr), and an earlier version of this dump printed guest[ba]
+     * directly and produced a tidy, entirely fictional story about voices
+     * pointing into low memory and into the game's own code. Translate, or do
+     * not print. */
+    if (!stream) {
+        hwaddr a0 = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba);
+        fprintf(stderr, "  [VOICE-DESC]   sge=%08X ba->phys=%08X = "
+                "%08X %08X %08X %08X\n",
+                d->regs[NV_PAPU_VPSGEADDR], (unsigned)a0,
+                (unsigned)ldl_le_phys(address_space_memory, a0),
+                (unsigned)ldl_le_phys(address_space_memory, a0 + 4),
+                (unsigned)ldl_le_phys(address_space_memory, a0 + 8),
+                (unsigned)ldl_le_phys(address_space_memory, a0 + 12));
+    } else {
+        fprintf(stderr, "  [VOICE-DESC]   stream: resolved per-segment through "
+                "the SSL, not BA\n");
+    }
+    fflush(stderr);
+}
+
 static void voice_ev_note(unsigned kind, unsigned handle)
 {
     extern unsigned long long g_apu_out_frames;
@@ -380,6 +449,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         g_apu_voice_on_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
         voice_ev_note(0, selected_handle);
+        voice_desc_dump(d, (uint16_t)selected_handle);
         /* off < on is only a defect for one-shots. A looping voice reaching
          * ebo takes cbo = lbo and runs for ever by design (see voice_process),
          * so BGM never retires and never raises the idle trap. Split the two
@@ -1047,7 +1117,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, &d->ram_ptr[addr & g_apu_ram_mask],
                            block_size);
                 } else {
                     linear_addr += ba;

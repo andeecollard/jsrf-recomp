@@ -4351,6 +4351,17 @@ BOOL xbox_IsXboxAddress(uintptr_t address)
             address < XBOX_BASE_ADDRESS + g_memory_size);
 }
 
+/* How much guest RAM is actually mapped.
+ *
+ * Added because the APU had a 64 MB wrap mask compiled into it while this
+ * runtime maps 128 MB, so every APU DMA above 64 MB folded silently into the
+ * wrong half of memory. A consumer that needs to mask an address must be able
+ * to ask how big the map is rather than assume the retail console's size. */
+size_t xbox_GetMemorySize(void)
+{
+    return g_memory_size;
+}
+
 void *xbox_GetMemoryBase(void)
 {
     return g_memory_base;
