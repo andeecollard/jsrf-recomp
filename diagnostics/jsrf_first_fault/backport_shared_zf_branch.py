@@ -70,7 +70,19 @@ def main():
     parser.add_argument('--gen', type=Path, default=Path(__file__).resolve().parents[2]
                         / 'build-macos/jsrf-first-fault/gen')
     args = parser.parse_args()
-    path = args.gen / 'recomp_0003.c'
+    # Find the chunk the function landed in rather than naming one. The chunk
+    # numbering is an artefact of how many functions preceded it, so it moves
+    # on any change to function bounds -- this site went from recomp_0003.c to
+    # recomp_0002.c, and the hardcoded name turned a truthful "the branch is
+    # still dead" into `ValueError: substring not found`, which reads like a
+    # broken script rather than a live defect.
+    needle = 'void sub_000A0F10(void)'
+    candidates = [p for p in sorted(args.gen.glob('recomp_*.c'))
+                  if needle in p.read_text()]
+    if len(candidates) != 1:
+        sys.exit(f'{needle}: expected one chunk in {args.gen}, '
+                 f'found {len(candidates)}')
+    path = candidates[0]
     old = path.read_text()
     new = patch(old)
     if args.check:

@@ -294,6 +294,20 @@ _EFLAGS_SETTERS = frozenset({
     "lock xadd",         # LOCK changes atomicity, not arithmetic flags
 })
 
+# Privileged and port instructions this recompilation deliberately ignores,
+# mapped to the reason. Emitted as an explicitly marked no-op rather than the
+# generic TODO comment, so the decision is visible in the generated C and
+# greppable (RECOMP-IGNORED-PRIV) instead of reading like ordinary output.
+# See the matching branch in Lifter._lift_instruction for the full argument,
+# and for what is deliberately NOT in here.
+_IGNORED_PRIVILEGED = {
+    "in": "x86 port I/O; no I/O port space in a user-mode recompilation",
+    "out": "x86 port I/O; the write has no modelled device behind it",
+    "wbinvd": "cache write-back/invalidate; host caches are already coherent",
+    "invd": "cache invalidate; there is no guest-visible cache to discard",
+    "invlpg": "TLB invalidate; guest addresses are resolved on every access",
+}
+
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
@@ -1400,6 +1414,49 @@ class Lifter:
         # in the unimplemented report as if they were missing work.
         if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence"):
             return [f"(void)0; /* {m}: cache/ordering hint, nothing to model */"]
+
+        # ── Privileged / port instructions, deliberately ignored ──
+        #
+        # These three are the whole of the reachable unimplemented set in JSRF,
+        # one site each. They were falling through to the generic TODO comment,
+        # which is the shape this file spends most of its length warning about:
+        # a translation that emits nothing and reads like ordinary output. The
+        # decision to ignore them is a real decision, so it is written down in
+        # the generated C and given a token nothing else uses.
+        #
+        # `grep -rn RECOMP-IGNORED-PRIV <gen>` enumerates every site.
+        #
+        #   in / out   x86 I/O port space. There is no port space here: the
+        #              recompilation runs in user mode and the devices behind
+        #              those ports -- the SMBus, the LPC debug port, the PIC --
+        #              are modelled at the kernel API the title actually calls,
+        #              not at the port. An `out` is therefore a write nothing
+        #              reads. An `in` is the one with a cost: its destination
+        #              register keeps whatever it held, which the comment says
+        #              out loud so a future reader does not have to infer it.
+        #              String port I/O (ins/outs) is NOT included: it moves
+        #              guest memory and a silent no-op there would be a real
+        #              behaviour change, so it keeps its TODO.
+        #   wbinvd     write back and invalidate the caches. The host's caches
+        #              are coherent with every access the generated code makes,
+        #              and there is no guest-visible cache model to flush.
+        #   invd       same, without the write-back. Nothing to discard.
+        #   invlpg     TLB shootdown for one page. Guest addresses are resolved
+        #              through the memory model on every access; no TLB caches
+        #              a translation that this could invalidate.
+        #
+        # Not listed here on purpose: `hlt`, which has real semantics (wait for
+        # an interrupt) that a no-op would turn into a spin, and the `ins`/
+        # `outs` string forms above.
+        if m in _IGNORED_PRIVILEGED:
+            why = _IGNORED_PRIVILEGED[m]
+            text = f"{m} {insn.op_str}".strip()
+            out = [f"(void)0; /* RECOMP-IGNORED-PRIV: {text} */",
+                   f"         /* {why} */"]
+            if m == "in":
+                out.append("         /* the destination register is left"
+                           " unchanged, not zeroed */")
+            return out
 
         if m in ("stc", "clc", "cmc"):
             if not self.needs_cf:

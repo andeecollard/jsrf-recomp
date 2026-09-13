@@ -9,8 +9,7 @@ That is not hypothetical. The `jle` at 0x0013D3F3 is reached from two
 predecessors that both `cmp` but name different registers; the older translator
 discarded the state, the branch could never be taken, the loader recorded status
 -1 and JSRF opened JSRF_FATAL.ERR after the anti-graffiti screen.
-`_merge_predecessor_flag_states` resolves that shape now, and
-`backport_flag_merge.py` applies it to this preserved tree, but 110 sites the
+`_merge_predecessor_flag_states` resolves that shape now, but the sites the
 merge cannot reach survive.
 
 Most are in functions with no static caller and no dispatch-table entry, so they
@@ -19,9 +18,25 @@ one way, and the last one that mattered cost a boot. This counts them and
 distinguishes a real `_flags` write -- `rep cmpsb`, `scas`, `xadd`, which do set
 it -- from the dead fallback.
 
-  --max N   exit 1 if more than N dead branches are found. The build wires this
-            as a ratchet at the current count so the number cannot grow
-            unnoticed; lower it whenever a fix brings it down.
+  --max N   exit 1 if more than N REACHABLE dead branches are found -- sites in
+            functions something calls, printed below as the "reachable" half of
+            the split. The build wires this as a ratchet at the current
+            reachable count so the number cannot grow unnoticed; lower it
+            whenever a fix brings it down.
+
+            It gates on the reachable count and NOT on the total, because the
+            total is dominated by data the linear sweep walked into as code and
+            barely moves when the lifter is fixed. On 13 Sep 2026 one session's
+            work took the total from 104 to 90 -- noise -- while the reachable
+            count went 18 -> 4. A ratchet on the total would have scored that
+            session as having achieved nothing, and an earlier one set at 76
+            against a tree at 90 could never pass at all, so it taught nothing
+            either way.
+
+            The split needs functions.json. If it is unreadable, --max FAILS
+            rather than falling back to the total: passing on a different
+            number than the one the ratchet names is how a gate stops meaning
+            anything.
 """
 
 import argparse
@@ -39,7 +54,8 @@ p.add_argument("--gen", type=Path,
                default=Path(__file__).resolve().parents[2]
                / "build-macos/jsrf-first-fault/gen")
 p.add_argument("--max", type=int, default=None,
-               help="exit 1 if more dead branches than this are found")
+               help="exit 1 if more REACHABLE dead branches than this are "
+                    "found (not the total -- see the module docstring)")
 p.add_argument("--list", action="store_true",
                help="print every site, not just the summary")
 p.add_argument("--functions", type=Path, default=None,
@@ -86,17 +102,21 @@ if total:
 # the total without the split means chasing the disassembler, not the lifter.
 fjson = a.functions or (a.gen.parent / "disasm" / "functions.json")
 called_by = {}
+reachable = None          # None means the split could not be computed
+split_problem = None
 try:
     import json
     for f in json.loads(fjson.read_text()):
         called_by[int(f["start"], 16)] = bool(f.get("called_by"))
 except Exception as exc:                      # absent or unreadable: say so
-    print(f"  (no reachability split: {fjson} unreadable -- {exc})")
+    split_problem = f"{fjson} unreadable -- {exc}"
+    print(f"  (no reachability split: {split_problem})")
 else:
     reach = {va: v for (va, _n), v in dead.items() if called_by.get(va)}
     unreach = {va: v for (va, _n), v in dead.items() if not called_by.get(va)}
+    reachable = sum(len(v) for v in reach.values())
     print(f"    reachable  (something calls the function): "
-          f"{sum(len(v) for v in reach.values()):4d}  in "
+          f"{reachable:4d}  in "
           f"{len(reach)} function(s)   <-- the ones that can execute")
     print(f"    no caller  (likely data swept as code):    "
           f"{sum(len(v) for v in unreach.values()):4d}  in "
@@ -107,6 +127,23 @@ if a.list:
         for fname, lineno, cond in sites:
             print(f"    0x{va:08X} {name:20s} {fname}:{lineno}  {cond}")
 
-if a.max is not None and total > a.max:
-    print(f"FAIL: {total} dead fallbacks, ratchet is {a.max}", file=sys.stderr)
-    sys.exit(1)
+# The gate is the REACHABLE count. Name the number in the failure so nobody
+# has to work out which of the three printed above the ratchet meant -- the
+# previous message said "90 dead fallbacks, ratchet is 76" against a ratchet
+# that could never pass, and reading it as the total was the only reading
+# available.
+if a.max is not None:
+    if reachable is None:
+        print(f"FAIL: --max gates on the REACHABLE dead-branch count and the "
+              f"reachability split is unavailable ({split_problem}). "
+              f"Refusing to pass on the total ({total}) instead -- pass "
+              f"--functions <functions.json> to restore the split.",
+              file=sys.stderr)
+        sys.exit(1)
+    if reachable > a.max:
+        print(f"FAIL: {reachable} REACHABLE dead fallbacks, ratchet is "
+              f"{a.max}. The ratchet gates on the reachable count -- branches "
+              f"in functions something calls -- not on the tree total, which "
+              f"is {total} and is dominated by data swept as code. Rerun with "
+              f"--list to see the sites.", file=sys.stderr)
+        sys.exit(1)

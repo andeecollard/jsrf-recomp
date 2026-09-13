@@ -19,8 +19,8 @@ at 0x001404F1.  With the second ``je`` nailed not-taken every read request the
 title issued fell straight into "E0109152:illegal seek position." and returned
 zero.
 
-A full regeneration is avoided here for the same reason
-``backport_flag_merge.py`` avoids it: this generated checkout carries recovered
+A full regeneration is avoided here for the same reason the other backports
+in this directory avoided it: this generated checkout carries recovered
 mid-function entries, shared epilogues and startup entries that regeneration
 does not reproduce on its own.  So rather than hand-writing C, this runs the
 fixed translator over each affected function and copies its statement across,

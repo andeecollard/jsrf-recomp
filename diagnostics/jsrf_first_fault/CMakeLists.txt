@@ -162,56 +162,46 @@ add_executable(jsrf_pusher_stream_test pusher_stream_test.c
 target_include_directories(jsrf_pusher_stream_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_pusher_stream COMMAND jsrf_pusher_stream_test)
 
-# The checked-out generated tree predates the FCMOVcc lifter fix (tools/recomp
-# covers the lifter itself), and JSRF is not regenerated here, so the two
-# fminf/fmaxf sites carry a backport instead. Without it both routines return
-# their second argument and the colour packer writes zero into every channel.
-# This fails if a regeneration or a stray edit ever drops that.
+# The backport checks below patch specific sites in the GENERATED tree, from
+# when that tree was preserved rather than regenerated. A backport is retired
+# the moment the lifter emits the fixed form by itself: the check then passes
+# on a tautology, or -- once function bounds move and the chunk it names is no
+# longer the chunk the site is in -- fails for a reason that has nothing to do
+# with the defect. Four were retired on 13 Sep 2026 for exactly that:
+#
+#   jsrf_fcmov_backport      the lifter emits TEST_Z/TEST_NZ at fminf/fmaxf
+#                            itself; tools/recomp/test_lifter_fcmov.py covers it
+#   jsrf_flag_merge_backport the 0x0013D3F3 jle is emitted as CMP_LE(_fas,_fbs),
+#                            byte for byte what the backport wrote;
+#                            tools/recomp/test_lifter_flag_merge.py covers it
+#   jsrf_empty_list_guard    the 0x00014885 split no longer exists, so the guard
+#                            is an ordinary resolved `jbe` inside sub_00014870
+#   jsrf_challenge_flag_merge  the 0x15275 CMP merge is emitted as CMP_NE by the
+#                            lifter; its _semantics sibling below still checks
+#                            that the emitted expression is right
+#
+# What is left here is NOT obsolete. Each surviving backport names a site the
+# lifter still cannot resolve, and two of them are half of the entire reachable
+# dead-branch population the ratchet gates on.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_adx_loop_flags
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_adx_loop_flags.py"
                      --check --gen "${RECOMP_GEN_DIR}")
-    add_test(NAME jsrf_fcmov_backport
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/backport_fcmov.py"
-                     --check --gen "${RECOMP_GEN_DIR}")
-    # The preserved generated tree also predates compatible EFLAGS snapshot
-    # merging.  Without this site the loader unconditionally records -1 and
-    # JSRF reaches its fatal-disc-error path after the anti-graffiti screen.
-    # The 0x00014870 array-remove guard. Its `jbe` sits in a fallthrough
-    # continuation, where the flags computed by the preceding `cmp` do not
-    # reach it, so the guard was never taken and the removal loop ran on an
-    # empty list -- overwriting guest memory, the kernel import thunk table
-    # included, which sent kernel calls to the next export along.
-    add_test(NAME jsrf_empty_list_guard
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/backport_empty_list_guard.py"
-                     --check --gen "${RECOMP_GEN_DIR}")
-    # The one dead _flags fallback still reached by executing code, measured
-    # with RECOMP_UNRESOLVED_FLAGS=1. Two comparisons share one `je`, so the
-    # condition has to be written by each predecessor, not by the branch.
+    # 0x000A13A1: two comparisons share one `je`, so the condition has to be
+    # written by each predecessor, not read at the branch. STILL UNRESOLVED by
+    # the lifter -- one of the four reachable dead fallbacks the ratchet counts
+    # (sub_000A0F10, called from 0x000A1BE0). This check fails, and it is
+    # supposed to: it is the only site-specific gate on that defect.
     add_test(NAME jsrf_shared_zf_branch
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_shared_zf_branch.py"
                      --check --gen "${RECOMP_GEN_DIR}")
-    add_test(NAME jsrf_flag_merge_backport
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/backport_flag_merge.py"
-                     --check --gen "${RECOMP_GEN_DIR}")
-    # A ratchet, not a gate. 80 conditional branches in this tree still reach
-    # the `_flags` fallback, where the condition is a constant zero and the
-    # branch can never be taken -- the same defect that cost the loader its
-    # status at 0x0013D3F3. Most are in functions with no static caller, but
-    # the count must not grow unnoticed. Lower the number when a fix reduces it.
-    add_test(NAME jsrf_challenge_flag_merge
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/backport_challenge_flag_merge.py"
-                     --check --gen "${RECOMP_GEN_DIR}")
-    add_test(NAME jsrf_challenge_flag_merge_semantics
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/test_challenge_flag_merge.py")
+    # 0x000153A9: eight incoming edges, three of them TEST and five CMP, so no
+    # single expression at the branch is correct. Also STILL UNRESOLVED -- the
+    # second of the four reachable dead fallbacks (sub_00015130, called from
+    # 0x000123E0). Fails for the same honest reason as jsrf_shared_zf_branch.
     add_test(NAME jsrf_exec_state_flag_merge
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_exec_state_merge.py"
@@ -219,10 +209,29 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_exec_state_flag_merge_semantics
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/test_exec_state_flag_merge.py")
+    add_test(NAME jsrf_challenge_flag_merge_semantics
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_LIST_DIR}/test_challenge_flag_merge.py")
+    # A ratchet on the REACHABLE dead-branch count, not on the tree total.
+    # A conditional branch that reaches the `_flags` fallback has a constant
+    # zero for a condition and can never be taken -- the defect that cost the
+    # loader its status at 0x0013D3F3.
+    #
+    # It gated on the total until 13 Sep 2026, which made it useless twice
+    # over: it was set at 76 against a tree at 90, so it could never pass, and
+    # the total is dominated by data the linear sweep walked into as code, so
+    # it barely moves when the lifter is fixed. One session took the total from
+    # 104 to 90 while taking the reachable count from 18 to 4; a ratchet on the
+    # total would have called that nothing.
+    #
+    # 4 is the reachable count on the current tree: two at sub_001237A0, which
+    # need OF carried across a join that no merge answers, plus the two named
+    # above. Lower it when a fix brings it down. It must never be raised
+    # without a measurement saying why the new branches cannot execute.
     add_test(NAME jsrf_unresolved_flags_ratchet
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
-                     --max 76 --gen "${RECOMP_GEN_DIR}")
+                     --max 4 --gen "${RECOMP_GEN_DIR}")
 endif()
 
 add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c
