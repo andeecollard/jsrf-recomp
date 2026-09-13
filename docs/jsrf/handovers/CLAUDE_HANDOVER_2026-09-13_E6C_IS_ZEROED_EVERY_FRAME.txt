@@ -1,0 +1,219 @@
+CLAUDE, 13 Sep 2026
+TWO STATE-ENTRY PATHS FIGHT EVERY FRAME. THAT IS WHY CORN DOES NOT ANIMATE.
+
+Supersedes CLAUDE_TO_CODEX_HANDOVER_2026-09-13_THE_SECOND_WRITER.txt, whose
+central question was built on a premise that does not survive measurement.
+
+
+0. THE CHAIN, END TO END
+========================
+There is no missing writer. sub_0009E910 runs here (3290+ calls per 10 s
+window) and does write CPlayer +0xCE0. The character freezes because two
+state-entry paths both claim the player on every frame:
+
+  A. sub_000A76E0 guards on the state and enters state 23 / 25:
+         0x000A7EBD  cmp [eax+0xE50], 0x17     ; already in state 23?
+         0x000A7EC4  je  ...                   ; yes -> skip
+         0x000A7ECC  call sub_0009B2D0         ; no  -> enter it
+     sub_0009B2D0 (id 44) / sub_0009B3E0 (id 45) set state := 0x17 / 0x19,
+     set anim from a table, and set +0xE6C := 0. Zeroing +0xE6C is CORRECT
+     here -- it is how the engine says "restart this clip".
+
+  B. sub_00080340, the CPlayer exec virtual, runs every frame and dispatches
+     on [esi+0x3CC]:
+         0x00080716  mov eax, [esi+0x3CC]
+                     == 0 -> 0x8073A
+                     == 1 -> sub_00092690
+                     == 2 -> sub_00092750
+     sub_00092750 sets [esi+0x11C] := 0x80 (anim 128) and
+     [esi+0xE50] := 0x0F (state 15) -- EXACTLY the frozen values we observe.
+     It is the ONLY site in the whole .text that writes 15 to +0xE50.
+
+So each frame: A sets state 23/25 and zeroes +0xE6C; B overwrites state with
+15; next frame A's guard sees 15 != 0x17, fires again, and zeroes +0xE6C
+again. sub_0009E910 therefore always takes its "animation changed" branch, the
+animation timing is reset before it can advance, and the pose is evaluated at
+the same phase forever.
+
+THE ORACLE HAS ANSWERED. xemu at the same beat (root live=61, seq=30), eight
+samples 1.5 s apart, with the pose block hashed each time as a positive control:
+
+                      ours (frozen)        xemu (animating)
+    +0x3CC            2                    0        (8/8)
+    +0xE50            15                   23 / 25  (8/8)
+    +0x11C            128                  170 / 171 (8/8)
+    +0xE6C            0 at entry           170 / 171  == +0x11C
+    pose block        identical x16        8 distinct of 8 samples
+
+The control passes -- xemu's pose really is moving -- so the stable e50 there is
+meaningful. On hardware +0xE6C EQUALS +0x11C, which is the "same animation"
+branch our build never takes.
+
+AND THE SELECTOR IS NOT COMPUTED, IT IS COPIED, under a guard:
+
+    0x000806A8  mov eax, [esi+0x3C8]     ; a record, not a class instance
+    0x000806AE  cmp [eax+0x38], ebp      ; ebp = 0
+    0x000806B1  je  0x80741              ; [+0x38]==0 -> skip the copy AND the
+                                         ;   dispatch at 0x00080716 entirely
+    0x000806B7  mov ecx, [eax+0x3C]
+    0x000806BA  mov [esi+0x3CC], ecx     ; +0x3CC := [[this+0x3C8]+0x3C]
+
+xemu at the tutorial: [+0x3C8]+0x38 = 0 and +0x3C = 0 for BOTH players, so the
+branch is taken, nothing is copied, +0x3CC stays 0, sub_00092750 never runs.
+id 44 also reads +0xE58 = 12 = 0xC there -- the value sub_0009B2D0 writes --
+so path A ran ONCE and stuck, which is the intended behaviour.
+
+Ours latched +0x3CC = 2 earlier in the run, at a moment when [+0x38] was
+nonzero: Codex's probe caught exactly that ("pending=1 kind=2"), and the
+report-time probe reads pend=0 kind=2 afterwards. So the copy fired once on a
+state hardware never presents, and +0x3CC is sticky thereafter.
+
+THE ONE QUESTION IS NOW: why does [[CPlayer+0x3C8]+0x3C] ever hold 2 here when
+it is 0 on hardware -- and why is [+0x38] ever nonzero? The record at +0x3C8 is
+not a vtable object; on xemu it reads as floats plus links:
+
+    +00 43CBFC57  +08 43F4F608        (~407.97, ~489.92 -- a position)
+    +10 FFC00000 x3                   (sentinel)
+    +20 43CBFC57  +28 43F4F608        (the same pair repeated)
+    +30 001EC05C  +34 03C13F30        (a static descriptor, and a link to the
+                                       OTHER player's record)
+    +38 00000000  +3C 00000000        (the guard and the selector source)
+
+So this is a small linked record carrying a position and a static descriptor
+pointer, and the fault is in whatever fills it. Dump the same 0x50 bytes on our
+side and diff -- that is the next measurement, and it needs no oracle.
+
+
+1. WHAT THE PREVIOUS HANDOVER GOT WRONG, AND WHY
+================================================
+It asked "what writes CPlayer +0xCE0 on hardware and never in our build?" and
+concluded a second, separate writer exists that we never reach. It reached that
+by diffing 64-byte blocks on two samples 3 s apart and finding 0CC0..0DC0
+unchanged on our side.
+
+Two flaws:
+
+  * 64-byte blocks straddle the 12-byte entries. One moving float inside a
+    block of static neighbours is invisible; the method can report "this region
+    does not move" about a region that does.
+  * Two samples is not a time series. The block DOES move here -- for about two
+    report intervals after the tutorial loads -- and then freezes. Sampling
+    twice inside the frozen window says "never moves".
+
+Measured instead with a hash of +0xCE0..+0xDDC taken per report and compared
+against the previous report (RECOMP_ANIMATION_STATE, main.c, host-side, no
+guest cost). Verdict sequence for both tutorial CPlayers:
+
+    new-object -> MOVED -> MOVED -> static x16   (hash identical throughout)
+
+Also note the registry rebinds: the tutorial constructs NEW CPlayers, so ids
+44/45 name different objects before and after. Compare the self pointer or a
+rebind reads as movement.
+
+
+2. THE MEASUREMENT THAT SETTLES IT
+==================================
+O(1) counters at sub_0009E910 entry, gated on own_id (+0x8) in {44,45},
+counting which way `cmp [esi+0x11C], [esi+0xE6C]` goes.
+
+Intro, animating correctly:
+
+    id44 same=2011 changed=37 | id45 same=2009 changed=39     (~54:1)
+
+Corn tutorial, frozen:
+
+    id44 same=184 changed=328  ... 840 ... 1352 ... 4424
+    id45 same=185 changed=327  ... 839 ... 1351 ... 4423
+    seen id=45 anim=128 prev=0 state=15 frame=0.5 blend=0.0555556
+
+`same` STOPS INCREMENTING ALTOGETHER at 184/185. `changed` rises by exactly
+512 per report -- every call. And `prev=0` at entry while the report-time
+sample of the same field reads 128, because sub_0009E910 sets it itself at
+0x0009EBD6. So the zeroing happens between calls, every frame.
+
+0.0555556 is 1/18: an accumulator reset to zero and advanced exactly one step.
+
+
+3. THE ZEROING STORE, IDENTIFIED
+================================
+O(1) counters on all four explicit stores of zero to +0xE6C, gated on
+own_id (+0x8) in {44,45}. At the Corn tutorial:
+
+    [E6C-ZERO] pc=0009B2FB id=44 hits=1025 1537 2049 2561 3073 3585
+    [E6C-ZERO] pc=0009B40B id=45 hits=1025 1537 2049 2561 3073 3585
+
+512 per report each -- the SAME rate as the "changed" branch counter, and one
+per player per frame. The other two candidates (0x0007FF9A, 0x0008372C) do not
+fire at the tutorial. So these two stores account for all of it.
+
+0x0009B2FB is in sub_0009B2D0 and 0x0009B40B is in sub_0009B3E0. Both are
+small complete functions ending in a real `ret`, not carved fragments. The
+decompilation names 0x0009B2D0 `CPlayer::talk`, which fits a dialogue scene --
+but that name comes from nearest-preceding-symbol attribution and is NOT
+proven; the measurement above is what matters, not the name.
+
+4. WHAT IS NOW EXCLUDED, WITH EVIDENCE
+======================================
+  * NOT a missing writer. sub_0009E910 runs, 3290+ calls per window.
+  * NOT vtable truncation on this path. sub_0009E910 does have a function
+    carved out of its interior at 0x000A000D (tail_jump_alias), but its
+    generated C contains the whole tail -- loc_000A0003, loc_000A0008, and the
+    stores at 0xA000F/0xA0015. The carved function is an unreferenced
+    duplicate. Binary-wide there are 1604 overlapping function pairs and 1596
+    of the interior ones are tail_jump_alias, i.e. shared-epilogue aliasing,
+    not lost code.
+  * NOT the jump table at 0xA00BC. 15 targets emitted plus a RECOMP_ITAIL
+    fallback; nothing is dropped.
+  * NOT a stuck resource load. [[this+0x3C8]+0x38] reads 0 at the tutorial in
+    every sample; an earlier reading of 1 was transient.
+
+
+5. THE PROBES, AND HOW TO RE-RUN THEM
+=====================================
+Host-side, no guest cost, in main.c behind RECOMP_ANIMATION_STATE:
+  [ANIMATION-STATE]  the field band for ids 44/45, sampled outside execution
+  [ANIM-BLOCK]       pose hash + MOVED/static/new-object + consecutive runs
+  [ANIM-DELTA]       which of the 21 entries moved, and the largest delta
+
+Guest-side, O(1), in a COPY of the gen tree at gen.claude-anim:
+  [ANIM-BRANCH]      the entry compare, per id, every 1024 qualifying calls
+  [E6C-ZERO]         each of the four zeroing stores, per id
+
+Build and run:
+
+    cmake -S diagnostics/jsrf_first_fault -B <build> \
+        -DRECOMP_GEN_DIR=<gen tree> -DCMAKE_BUILD_TYPE=Debug
+    JSRF_BIN=<build>/jsrf_first_fault RECOMP_ANIMATION_STATE=1 \
+        diagnostics/jsrf_first_fault/run_scripted.sh <name> \
+        @diagnostics/jsrf_first_fault/pad/new_game.pad 200
+
+
+6. THE HARNESS IS ABOUT 50% RELIABLE, AND IT IS NOT PROBE WEIGHT
+================================================================
+Six runs today stalled at the title (live=127..165, seq stuck at 12
+WaitEndTitle). THE CLEAN, UNINSTRUMENTED BINARY STALLS TOO -- that control is
+what stops you blaming the probe, and the previous handover's author spent
+three runs making exactly that mistake.
+
+Three separable causes, in the order they are cheap to check:
+
+  * READ THE POLL RATE FIRST. Every [PAD-SCRIPT] line carries poll=, which is a
+    frame-rate proxy already in every log. Differenced against a good run at
+    the same t= it separates the cases in one line:
+        t=15  good 1991  bad 2003     (not yet diverged)
+        t=39  good 6238  bad 3470     (~61 polls/s vs ~177)
+  * CMAKE_BUILD_TYPE. The known-good build/ is Debug. A build dir configured
+    without -DCMAKE_BUILD_TYPE=Debug gets an EMPTY build type, different
+    optimisation, and stalled the title at only 8% below baseline poll rate.
+    grep it out of CMakeCache.txt before trusting any A/B.
+  * CPU starvation. The repo is inside iCloud Drive, so copying a gen tree or
+    linking a binary wakes cloudd, bird, mds and managedcorespotlightd; load
+    average hit 34 that way. uptime alone misleads -- read
+    `ps -A -o %cpu,command -r | head`.
+
+There is also a genuine feedback loop once the first menu window is missed: the
+title's attract demo loads a full scene (live rises to 127-165), the guest drops
+to ~50 polls/s, and the wall-clock pad schedule desynchronises for good. Do not
+"fix" this by starting the schedule later -- tried, it is worse, because the
+repetition in new_game.pad is the robustness. Loop the whole run instead and
+keep the first attempt that reports seq 30.

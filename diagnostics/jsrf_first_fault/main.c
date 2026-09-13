@@ -2598,6 +2598,146 @@ static void jsrf_scene_report(void)
     jsrf_draw_list_report(base, root);
     jsrf_object_blocks(base, root);
 
+    /* Sample the registered players outside guest execution. Function-entry
+     * samples can otherwise describe a different object, or a temporary state
+     * used during drawing, and be mistaken for the tutorial player's state. */
+    if (getenv("RECOMP_ANIMATION_STATE")) {
+        for (unsigned id = 44; id <= 45; ++id) {
+            uint32_t p = R32(root + JSRF_IDS_OFF + id * 4u);
+            if (!p || !jsrf_va_ok(p + 0x1178u)) continue;
+            fprintf(stderr, "  [ANIMATION-STATE] id=%u self=%08X vt=%08X"
+                    " own_id=%u state=%u anim=%u previous=%u phase=%u"
+                    " clip=%u frame=%g blend=%g flags=%08X\n",
+                    id, p, R32(p), R32(p + 8), R32(p + 0xE50),
+                    R32(p + 0x11C), R32(p + 0xE6C), R32(p + 0x9C4),
+                    R32(p + 0x9E4),
+                    (double)*(const float *)(base + p + 0xE80),
+                    (double)*(const float *)(base + p + 0x9C0),
+                    R32(p + 0xE54));
+
+            /* Does the transform block actually move?
+             *
+             * This is the question the second-writer hunt exists to answer,
+             * and it has so far been asked only by diffing two objects across
+             * a three-second window by hand. A hash of the band, kept per id
+             * and compared report to report, answers it continuously and
+             * costs the guest nothing -- which matters, because every
+             * guest-side probe aimed at this band so far has either missed it
+             * (the address is computed, so write hooks never fire) or cost
+             * enough to stall the title before the tutorial.
+             *
+             * The self pointer is part of the state: the tutorial CONSTRUCTS
+             * NEW CPlayers, so id 44/45 change object mid-run. A hash that
+             * changes because the id now points at a different object is not
+             * animation, and is reported as such rather than as movement. */
+            {
+                static uint32_t prev_self[46], prev_hash[46];
+                static float prev_blk[46][63];
+                static unsigned have_prev[46], static_runs[46];
+                uint32_t r2d0 = R32(p + 0x2D0), r3c8 = R32(p + 0x3C8);
+                uint32_t h = 2166136261u;
+                const unsigned char *q =
+                    (const unsigned char *)(base + p + 0xCE0u);
+                const float *fv = (const float *)(base + p + 0xCE0u);
+                const char *verdict;
+                unsigned k;
+
+                for (k = 0; k < 252u; ++k) { h ^= q[k]; h *= 16777619u; }
+
+                if (!have_prev[id] || prev_self[id] != p) {
+                    verdict = "new-object";
+                    static_runs[id] = 0;
+                } else if (prev_hash[id] != h) {
+                    verdict = "MOVED";
+                    static_runs[id] = 0;
+                } else {
+                    verdict = "static";
+                    static_runs[id]++;
+                }
+
+                /* WHICH of the 21 entries moved, and by how much.
+                 *
+                 * "The block changed" is too coarse to settle the open
+                 * question: a root position that jitters in its last mantissa
+                 * bit and a skeleton that is genuinely animating both read as
+                 * changed. The handover's 64-byte block diff had the same
+                 * problem in the other direction -- it straddles entries, so
+                 * one moving float can only be reported as a whole 64-byte
+                 * region moving, or, if it lands beside enough static bytes,
+                 * be described as a region that does not move at all. */
+                if (have_prev[id] && prev_self[id] == p) {
+                    char mask[22];
+                    float worst = 0.0f;
+                    unsigned moved = 0, e;
+
+                    for (e = 0; e < 21u; ++e) {
+                        float d = 0.0f;
+                        unsigned c;
+                        for (c = 0; c < 3u; ++c) {
+                            float a = fv[e * 3u + c], b = prev_blk[id][e * 3u + c];
+                            float diff = a > b ? a - b : b - a;
+                            if (diff > d) d = diff;
+                        }
+                        mask[e] = d > 0.0f ? 'X' : '.';
+                        if (d > 0.0f) moved++;
+                        if (d > worst) worst = d;
+                    }
+                    mask[21] = 0;
+                    fprintf(stderr, "  [ANIM-DELTA] id=%u %s moved=%u/21"
+                            " maxdelta=%g root=%g,%g,%g\n",
+                            id, mask, moved, (double)worst,
+                            (double)fv[0], (double)fv[1], (double)fv[2]);
+                }
+                for (k = 0; k < 63u; ++k) prev_blk[id][k] = fv[k];
+
+                have_prev[id] = 1; prev_self[id] = p; prev_hash[id] = h;
+
+                /* -1 means the pointer did not survive the range check,
+                 * which is a different claim from "the field reads zero" and
+                 * has to stay distinguishable from it. */
+                long r38  = jsrf_va_ok(r2d0 + 0x3Bu) ? (long)R32(r2d0 + 0x38) : -1;
+                long pend = jsrf_va_ok(r3c8 + 0x3Fu) ? (long)R32(r3c8 + 0x38) : -1;
+                long kind = jsrf_va_ok(r3c8 + 0x3Fu) ? (long)R32(r3c8 + 0x3C) : -1;
+
+                fprintf(stderr, "  [ANIM-BLOCK] id=%u self=%08X pose=%08X %s"
+                        " runs=%u res2D0=%08X r38=%ld res3C8=%08X pend=%ld"
+                        " kind=%ld sel3CC=%u\n",
+                        id, p, h, verdict, static_runs[id],
+                        r2d0, r38, r3c8, pend, kind, R32(p + 0x3CC));
+
+                /* The record at +0x3C8, which is where the selector is copied
+                 * from. On xemu at this beat it reads as a position pair, a
+                 * sentinel, a static descriptor pointer and a link to the other
+                 * player's record, with +0x38 and +0x3C both zero. Dump it only
+                 * when it changes: it is 0x50 bytes and most reports repeat. */
+                {
+                    static uint32_t prev_rec[46], prev_rp[46];
+                    static unsigned have_rec[46];
+                    if (r3c8 && jsrf_va_ok(r3c8 + 0x4Fu)) {
+                        const unsigned char *rb =
+                            (const unsigned char *)(base + r3c8);
+                        uint32_t rh = 2166136261u;
+                        unsigned k;
+                        for (k = 0; k < 0x50u; ++k) {
+                            rh ^= rb[k]; rh *= 16777619u;
+                        }
+                        if (!have_rec[id] || prev_rec[id] != rh
+                                || prev_rp[id] != r3c8) {
+                            fprintf(stderr, "  [ANIM-REC]   id=%u rec=%08X"
+                                    " hash=%08X\n", id, r3c8, rh);
+                            for (k = 0; k < 0x50u; k += 16u)
+                                fprintf(stderr, "  [ANIM-REC]     +%02X: %08X"
+                                        " %08X %08X %08X\n", k,
+                                        R32(r3c8 + k), R32(r3c8 + k + 4),
+                                        R32(r3c8 + k + 8), R32(r3c8 + k + 12));
+                        }
+                        have_rec[id] = 1; prev_rec[id] = rh; prev_rp[id] = r3c8;
+                    }
+                }
+            }
+        }
+    }
+
     /* How much of the id-indexed array is populated. This counts objects that
      * were constructed at all, independently of whether the scene graph has
      * linked them in -- so "constructed but not in the tree" stays visible. */

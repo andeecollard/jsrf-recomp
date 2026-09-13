@@ -1,0 +1,120 @@
+CLAUDE, 13 Sep 2026
+SOLVED: COMISS ON NaN. CORN ANIMATES.
+
+Supersedes both CLAUDE_TO_CODEX_HANDOVER_2026-09-13_THE_SECOND_WRITER.txt and
+CLAUDE_HANDOVER_2026-09-13_E6C_IS_ZEROED_EVERY_FRAME.txt, which are the two
+earlier stations on the way to this.
+
+
+0. THE BUG, IN ONE PARAGRAPH
+============================
+x86 `comiss` sets ZF, PF and CF ALL AT ONCE when either operand is NaN. The
+lifter emitted the unsigned conditions as the plain C operators, and C
+disagrees in both directions: `a == b` is false for NaN where ZF is set, and
+`a != b` is true for NaN where ZF is clear. JSRF's ray-plane intersection
+sub_0014C100 ends `comiss xmm0, xmm7` / `je -> return 0`, and is handed a
+movement segment that is zero-length whenever a character stands still, which
+normalises to NaN. On hardware the branch is taken and the test reports no
+intersection. For us it fell through and reported a HIT, with a NaN
+intersection point. CSysDeathWarpManager therefore death-warped both CPlayers
+on every frame of the Corn tutorial, and that read -- for two days -- as
+"the characters do not animate".
+
+    tools/recomp/lifter.py, the comiss/ucomiss condition mapping.
+    Regression test: tools/recomp/test_lifter_comiss.py (144 suite tests pass).
+
+
+1. THE CHAIN
+============
+    zero-length movement segment (standing still in a cutscene)
+      -> normalise gives 0/0 = NaN
+      -> comiss xmm0, xmm7 ; je     in sub_0014C100
+      -> x86: ZF=1 unordered -> je TAKEN -> "no hit"       <- xemu
+      -> ours: NaN == 0.0f false -> fall through -> "HIT"  <- the bug
+      -> warp-hit branch at 0x00024BA0 writes the record at CPlayer+0x3C8:
+             +0x38 := 1        (warp pending)
+             +0x3C := kind     (2)
+             +0x40 := the intersection point  (NaN,NaN,NaN -- the tell)
+      -> exec virtual sub_00080340 at 0x000806A8 sees [+0x3C8]+0x38 != 0 and
+         copies +0x3CC := [[this+0x3C8]+0x3C] = 2
+      -> its 3-way dispatch at 0x00080716 sends 2 -> sub_00092750
+      -> sub_00092750 sets state(+0xE50) := 15 and anim(+0x11C) := 128,
+         the respawn animation, EVERY FRAME
+      -> that defeats the idempotence guard at 0x000A7EBD in sub_000A76E0,
+         which skips only when the state already equals 23
+      -> so sub_0009B2D0 / sub_0009B3E0 re-enter the dialogue state every frame
+         and set +0xE6C := 0, which is the engine's "restart this clip"
+      -> sub_0009E910 therefore always takes its "animation changed" branch
+      -> the clip is re-armed before it can advance; the pose is evaluated at
+         the same phase forever and the transform block never changes.
+
+
+2. BEFORE AND AFTER, MEASURED
+=============================
+Same beat, root live=61/62, seq=30. xemu column is 8 samples 1.5 s apart with
+the pose block hashed each time as a positive control.
+
+                    before            xemu              after the fix
+    +0x3CC          2                 0                 (unread; guard skips)
+    +0xE50          15                23 / 25           23 / 25
+    +0x11C          128               170 / 171         170 / 171
+    +0xE6C          0 at entry        170 / 171         170 / 171  == +0x11C
+    frame           0.5, parked       advancing         25 -> 72.5, 1 -> 48.5
+    blend           0.0555556 (1/18)  --                1
+    pose block      identical x16     8 distinct of 8   MOVED every report
+
+The record diff is what cracked it. The POSITIONS were bit-identical to xemu
+(43CBFC57, 43F4F608), so the geometry input was never wrong; only +0x38..+0x4C
+differed, and those are written by exactly one branch.
+
+
+3. WHAT THE EARLIER HANDOVERS GOT WRONG, AND THE LESSON
+=======================================================
+  * "A second writer exists that runs on hardware and never runs here."
+    False. sub_0009E910 runs, 3290+ calls per 10 s window, and writes +0xCE0.
+    That conclusion came from diffing 64-byte blocks on two samples 3 s apart:
+    the blocks straddle the 12-byte entries, and two samples inside the frozen
+    window cannot see that the pose moved for ~30 s first.
+
+  * "The +0xE50 state band is not the problem -- xemu is IDENTICAL."
+    The VALUE matched. The WRITE RATE did not. A field rewritten every frame
+    reads exactly like one written once, so comparing values against the oracle
+    crossed the true culprit off the list. THIS IS THE LESSON: when comparing
+    against xemu, compare how often a field is written, not just what it holds.
+    Branch counters at the reading site cost nothing and would have caught it.
+
+  * Do not derive a function's extent by measuring to the next NAMED symbol.
+    The decompilation names 1332 of ~8868 functions, so the gaps contain real
+    unnamed functions; that method reports CPlayer::talk as 2112 bytes and
+    claims 477 shredded functions, and both figures are artifacts.
+
+  * Vtable/seed shredding is NOT implicated here. sub_0009E910 does have a
+    function carved out of its interior at 0x000A000D, but its generated C
+    contains the whole tail; the carved one is an unreferenced duplicate.
+    Binary-wide, 1596 of 1604 overlapping pairs are tail_jump_alias, i.e.
+    shared-epilogue aliasing.
+
+
+4. STILL OPEN
+=============
+  * REGENERATE. The fix is in the lifter; the running proof was a hand-patch of
+    the single `je` in the gen tree. Every one of the 54 comiss/ucomiss sites
+    needs the corrected emission, and `jp`/`jnp` were returning hardcoded 0/1,
+    which silently discarded every NaN test made through the parity flag.
+
+  * ARM vs x86 DEFAULT NaN. Ours is 0x7FC00000, hardware's is 0xFFC00000 --
+    opposite sign bits. Visible in the record at +0x10..+0x18. NOT the cause of
+    this bug, but it will bite anything that tests a NaN's sign.
+
+  * OUR HEAP RETURNS DIRTY MEMORY where the Xbox's was zeroed. After the fix
+    +0x3CC reads as garbage (402717546) because the guard now correctly skips
+    the copy and nothing else initialises it. Harmless only because it is read
+    solely on the path that has just written it.
+
+  * THE TITLE STALL IS UNRELATED AND STILL THERE. Roughly half of unattended
+    runs never leave the title (live=127..165, seq stuck at 12). The CLEAN
+    binary does it too. See the previous handover's section 6: read the poll=
+    count in [PAD-SCRIPT] lines before blaming a probe, check CMAKE_BUILD_TYPE
+    is Debug, and check `ps -A -o %cpu,command -r` before blaming load.
+    The attract demo runs at ~54 polls/s against a healthy ~177, which is why
+    a human at the pad also experiences it as "input not registering".
