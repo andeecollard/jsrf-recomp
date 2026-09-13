@@ -1,0 +1,227 @@
+CLAUDE, 13 Sep 2026 (late night)
+THE APU WAS ADDRESSING HALF THE MACHINE. THE MUSIC GAP IS FIXED. THE INTRO IS
+STILL AUDIBLY BROKEN AND FOUR OF MY METRICS SAY IT IS FINE.
+
+Supersedes CLAUDE_HANDOVER_2026-09-13_THE_RESAMPLER_AND_FIVE_NON_FIXES.txt and
+everything before it. Section 3 is the one to read first -- it is about how to
+measure this, and it is why the remaining bug is still open.
+
+
+0. STATE OF PLAY
+================
+HEAD d449575, pushed to origin/main. tools/recomp 160/160. ctest 21/23, the two
+failures deliberate (05e0465).
+
+The default build dir IS the optimised one now, and every log opens with
+
+    [BUILD] title compiled -O2, binary <path>
+    [APU] DMA wrap mask 07FFFFFF (128 MB of guest RAM)
+
+A log without those lines predates them; re-take its numbers rather than trust
+them. play.sh and measure.sh refuse a binary older than the sources
+(JSRF_ALLOW_STALE=1 overrides).
+
+    diagnostics/jsrf_first_fault/measure.sh <name> [seconds] [padfile]
+    pad/intro.pad    presses NOTHING -- the only way to capture the intro
+    pad/measure.pad  reach the tutorial and stop pressing
+    pad/still.pad + pad/moving.pad   identical to t=47, then one holds the stick
+
+
+1. FIXED TODAY, WITH EVIDENCE
+=============================
+  * **The APU masked every DMA to 64 MB while the map is 128 MB.** Seven
+    accessors in apu_shim.h carried a hardcoded 0x03FFFFFF. An APU read above
+    64 MB did not fault; it folded into the wrong half and returned whatever was
+    there. JSRF's voice buffers resolve to 0x041E57B0, 0x042E5A10, 0x045CF010 --
+    all legal in a 128 MB map, all silently wrapped. Voice 68 played only
+    because its buffer happens to live at 0x00B30004.
+
+    This was the ~300 ms music gap at the track change. The title covers the
+    change with a second voice (on70 at 42730 ms, off68 at 42762, off70 at
+    43024, on68 at 43034 -- only ~10 ms uncovered by design), and that cover
+    voice was fetching zeros. Measured: voice 70 energy 0.0 with 432/433 frames
+    silent -> 3017.4 with 0/411 silent; worst gap 304 ms -> 14 ms, against
+    xemu's whole-run worst of 16 ms. (2d21ce2)
+
+    NOT an xemu artifact -- an EXTRACTION artifact. xemu reads through QEMU's
+    real address_space_memory and has no mask at all. The constant appeared when
+    that address space became a flat pointer. The category to watch is "what got
+    hardcoded when a QEMU abstraction became a raw pointer".
+
+  * **The voice resampler discarded its rate.** `(void)rate;` under a comment
+    claiming nearest-neighbour resampling that did not exist. JSRF runs voices
+    at 48000, 44100 and 22050 Hz concurrently, so the 22 kHz voice played 2.177x
+    too fast. Linear interpolation now, carrying fractional phase across frames;
+    unity rate keeps its old path bit-identical. RECOMP_NO_RESAMPLE=1 A/Bs it:
+    0 deltas >12000 with it on, 137 with it off. (f464df9)
+
+  * **Vblank ran 4% fast for the life of the port.** BRIDGE_VBLANK_PERIOD_MS was
+    16 under a comment saying 60 Hz; 1000/16 is 62.5. A fractional macro does not
+    fix it -- both operands are DWORD, so `now + 16.683` truncates every call.
+    bridge_vblank_step_ms carries the remainder. Measured 62.3 -> 59.7 Hz against
+    59.94. Frame rate unchanged; correctness, not speed. (cfd07a3)
+
+  * **MmQueryStatistics reported 64 MB unconditionally**, silently defeating
+    RECOMP_TOTAL_RAM_MB. (c2afab2)
+
+  * getenv was half the pushbuffer executor's CPU (855308c); five C tests did
+    not LINK and ctest called that "Not Run" (81eaf21); the default build dir was
+    the -O0 tree while every measurement used another binary (2f7c741).
+
+
+2. THE OPEN BUG, AND IT IS THE IMPORTANT ONE
+============================================
+**The intro audio is audibly broken and every sample-level metric says it is
+fine.** The user's words: ours "super glitchy", xemu's "perfect".
+
+Ours and xemu's 30-second attract clips, aligned on the music's first note:
+
+    peak 9882 / 10183   d50 527 / 535   d99 2404 / 2520   dmax 7050 / 6667
+    deltas >2k 37460 / 45762    >4k 267 / 374    gaps 1 / 1
+
+Statistically indistinguishable, OURS WITH FEWER LARGE JUMPS. One sounds broken.
+
+**The live candidate: the buffer wrap.** Voice 68's bounds are incoherent in
+every capture taken today:
+
+    ba=00001004 cbo=0     ebo=16383
+    ba=00001004 cbo=14740 ebo=32
+    ba=00001004 cbo=13711 ebo=32      (different run)
+
+The cursor sits thousands of samples past the declared end of a LOOPING buffer.
+voice_get_samples runs `for (; sample_count < requested && cbo <= ebo; cbo++)`
+and then `if (cbo >= ebo) { if (loop) cbo = lbo; }` with lbo=0 -- so that state
+produces zero samples, snaps the cursor to 0, and the next call plays samples
+0..32, which is 0.69 ms, before snapping back. A voice stuck there replays a
+fragment forever, and every sample of it is valid music.
+
+**That is why the statistics cannot see it: the defect is in WHICH samples get
+played, not in the samples.**
+
+THE EXPERIMENT IS BUILT AND NOT YET RUN. RECOMP_VOICE_RATES now counts per voice
+`loopbacks` and `starved_loops` -- wraps that produced NOTHING first. A healthy
+stream wraps after playing a bufferful; a stuttering one wraps on an empty
+buffer. Run measure.sh with pad/intro.pad and read voice 68's line. If
+starved_loops is large, it is confirmed, and the next question is who is
+supposed to advance ebo (the guest writes it through NV_PAVS_VOICE_PAR_NEXT --
+check we are not dropping or mis-decoding that write).
+
+
+3. HOW TO MEASURE THIS, BECAUSE I GOT IT WRONG FOUR TIMES
+=========================================================
+Four metrics of mine called an audibly broken capture clean. Each looked
+reasonable. Do not rebuild them and believe them.
+
+  * **Delta distributions** (|x[k]-x[k-1]|). Found the resampler bug honestly,
+    then said the intro was fine. A replayed buffer has normal deltas.
+  * **Silence-gap detection** with |sample|<64. That threshold fires on every
+    zero crossing: 8830 of 8850 "silence runs" in one window were ONE SAMPLE
+    long, and I reported "550 of 551 discontinuities are near silence" from it.
+    It meant "near a zero crossing", which is true of nearly all audio.
+  * **Autocorrelation for echo.** Measures tonality. It scored the tutorial
+    HIGHER than the intro (0.520 vs 0.016) because sustained notes look like
+    echoes.
+  * **Log-frequency spectral alignment** for pitch. Flat -- 0.512 down to 0.495
+    across ratios 0.88 to 1.00. No peak. Reported as inconclusive, correctly,
+    but only after I nearly read a "-12.2% pitch error" out of noise.
+
+  And one dump that produced pure fiction: printing guest[ba] for a voice
+  descriptor. BA is NOT an address -- it is a linear offset through the
+  VPSGEADDR scatter-gather table. Printed raw it gave a tidy story about voices
+  pointing into low memory and into the game's own code. Translate with
+  get_data_ptr or do not print.
+
+  **What DID work: the user's ears, and structural counters.** Per-voice output
+  energy found the silent cover voice in one run. The loopback counter above is
+  the same shape. Count events in the mechanism; do not characterise the output.
+
+
+4. THINGS THAT MEASURED AS NOTHING
+==================================
+All committed saying so. Do not re-derive.
+
+  * **-O2 on the recompiled title.** Scene-matched, identical to -O0 within
+    noise (live=133: 108.5 vs 104.0 flips/window). Kills _tlv_get_addr (75% of
+    guest samples -> 22), shrinks the binary 42.7 -> 29.7 MB, buys no frame
+    time. Kept. (b1f0531)
+  * **Flat dispatch.** Genuinely never called -- the only caller is upstream's
+    template. Profiled with RECOMP_FLAT_DISPATCH=0 so every indirect call used
+    the binary search: recomp_lookup does not appear in the profile AT ALL. Left
+    OFF. (c5b3908)
+  * **Skipping unstored VSH units**: vsh 16.07 -> 14.25 ms/frame, frame time
+    39.8 -> 39.8. (dc4a79e)
+  * **The per-vertex diagnostic range** (a SECOND fetch_vertex over every vertex
+    of every draw, for one report line): rest 15.96 -> 15.12 ms, mean 68.5 ->
+    68.4. Now RECOMP_VERTEX_RANGE=1. (068b6f6)
+  * **Zero-filling a starved voice**: short=0 dry=0 on every voice, dropouts
+    unchanged. The stack-residue claim that motivated it was RETRACTED -- the
+    line after the declaration is `memset(samples, 0, sizeof(samples))`, present
+    since the original import. (85a9177, c2c003e)
+
+
+5. AUDITS THAT SAID "DO NOT"
+============================
+  * **xbox_dsound is dead code for JSRF and must stay that way.** The title
+    statically links Microsoft's DSOUND.lib into the XBE (section 2, 116 KB) and
+    that recompiled guest code drives the MCPX registers directly -- 14,677 APU
+    writes in 154 s. Our xbox_dsound is itself a stub ("accept all method calls
+    silently"), so switching to it would delete all audio. (6384659)
+  * **nv2a_core.c is unwired scaffolding and wiring it is not justified yet.**
+    nv2a_init_standalone has never been called by anything. Mostly
+    complementary, not duplicated. The one real overlap is the interrupt path,
+    where its computed PMC summary beats our store-and-mask -- but
+    unacked_skips=0 and not_ready=0 across six runs, so the race it prevents is
+    not happening, and making it authoritative needs NV2A register READ traps.
+    (53f36d2)
+  * **Library usage at the linker:** xbox_kernel 23/25, xbox_apu 6/6, xbox_vsh
+    4/5, xbox_nv2a 2/6, xbox_video 2/3, xbox_dsound 0/1. video_player.c is
+    Media Foundation behind #if defined(_WIN32), so there is no FMV decode on
+    this host at all.
+
+
+6. ALSO OPEN
+============
+  * **Our first 29.3 s are digital silence; xemu plays a logo chime in its first
+    10.** No VOICE_ON at all before 29.344 s, though the guest loads
+    Z:\Media\Sounds\SE\se_sys.dat. Reproducible, separate from the glitch.
+  * **Voices 64-67 run the whole session and produce nothing** -- 194,969 frames,
+    energy 0.0. They resolve BELOW 64 MB so the mask fix did not touch them.
+    Their ebo is 31 and loop=1, so they may be intentional silent keep-alives.
+  * **25 fps against a 30 fps target.** Stage breakdown at live=61: vsh 14.25,
+    submit 9.47, sync 1.44, rest 14.67, 101 batches. GPU sync is NOT the problem.
+    Two reductions in pusher work moved the frame rate by zero, so the pusher is
+    not the critical path. sub_0013B180 -- a guest busy-wait on a flag that reads
+    zero for an entire run while its spin counter passes 1.1 BILLION -- holds a
+    core at 100%. But the spinners are LOAD-BEARING: RECOMP_SKIP_SPIN_THREADS=1
+    leaves the handles intact and the title then stops at live=20 and never
+    advances, twice. The lifter was exonerated: the original XBE bytes at
+    0x0013B180 really do contain a call-free spin. (da2f4c0)
+  * **Thread priority is a no-op on POSIX.** SetThreadPriority records the value
+    and returns, so all 42,762 KeSetBasePriorityThread calls do nothing and the
+    guest's four-level ordering (+2/+1/0/-16) is flat. Real, unfixed, and NOT
+    the spin cause -- the spinners are ABOVE_NORMAL and the thread the title puts
+    at IDLE is the one that blocks properly. (e2c0e45)
+  * **13% of runs SIGSEGV** in the OHCI path (free-list poison 0xFFFFFFF0). One
+    hit on the first play launch tonight. Untouched today; needs ~20 runs an arm
+    to attribute, and today's vblank change shifts thread timing, so do not
+    assume the old rate still holds.
+  * **Black bars in the title animation are NOT a defect** -- the user says they
+    are intentional graphical elements. The grey ellipse is unconfirmed.
+
+
+7. TRAPS
+========
+  * **Upstream's threading docs are STALE.** kernel-replacement.md,
+    gap-analysis.md and 05-runtime.md all say "single-threaded" / "stubbed" /
+    "no real threading". The code spawns real threads and honours
+    CREATE_SUSPENDED. Believing them sends you the wrong way entirely.
+  * **Every pad schedule except intro.pad SKIPS THE INTRO.** They fire START at
+    t=12 to reach gameplay unattended. A whole day of "JSRF audio" measurements
+    never contained the intro, and nobody noticed until the intro was reported
+    broken.
+  * **Scene-match or measure nothing.** A 150 s run reaches the tutorial about
+    three times in four. Compare [FRAME-WIN] at the same live=, never totals.
+  * **`cmake --build --target jsrf_first_fault` never builds the tests.**
+  * **ctest "Not Run" is a LINK FAILURE**, not a skip.
+  * **Do not add an accessor before grepping for one.** xbox_GetMappedSize
+    already existed; I added a duplicate and had to remove it.
