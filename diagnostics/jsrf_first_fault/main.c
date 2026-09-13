@@ -1041,6 +1041,10 @@ static void jsrf_pusher_report(void)
         {
             extern void mcpx_apu_frame_report(void);
             mcpx_apu_frame_report();
+            /* Which APU registers the guest reads. Opt-in, and silent unless
+             * RECOMP_APU_READ_TRACE is set -- see mcpx_apu_read_report. */
+            extern void mcpx_apu_read_report(void);
+            mcpx_apu_read_report();
             extern void xbox_VblankReport(void);
             xbox_VblankReport();
             /* And whether the code all of the above is measuring is still the

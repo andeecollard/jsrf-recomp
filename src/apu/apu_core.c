@@ -213,6 +213,89 @@ typedef struct {
     int      frames_written;
 } WaveOutState;
 
+/* RECOMP_APU_WAV=<path> -- the mixed output, exactly as the backend receives it.
+ *
+ * We can now show that audio DELIVERY is healthy: 48,003 frames a second, zero
+ * starvation, a queue that never drops below two device buffers, and an APU
+ * frame gate shut for 0.05% of frames with a longest unbroken run of 10 ms.
+ * None of that says the SAMPLES ARE RIGHT. A stale streaming buffer, a voice
+ * left running past its loop point or a mis-decoded ADX block all produce a
+ * perfectly punctual stream of wrong audio, and every counter above stays
+ * green while it happens.
+ *
+ * So: tap the buffer at the point the backend is handed it, after the mixer
+ * and after the mute check, and write a WAV. That is the artefact a person can
+ * listen to, and the one a script can measure -- silence runs, discontinuities,
+ * clipping -- without anybody having to be at the machine when it happens.
+ *
+ * Deliberately AFTER the backend selection would have happened but before it,
+ * so the capture is identical whichever backend is live and exists even when
+ * none is. Header is written with a placeholder length and patched on close;
+ * if the process is killed (which is how every timed run ends) the sizes are
+ * stale, so the reader is fixed up from the file length instead -- see
+ * apu_wav_finish. A truncated capture is still worth having.
+ *
+ * Cost when unset: one pointer test per APU frame. */
+static FILE *g_apu_wav;
+static unsigned long g_apu_wav_frames;
+
+static void apu_wav_put32(FILE *f, uint32_t v)
+{
+    fputc((int)(v & 0xFF), f);        fputc((int)((v >> 8) & 0xFF), f);
+    fputc((int)((v >> 16) & 0xFF), f); fputc((int)((v >> 24) & 0xFF), f);
+}
+
+static void apu_wav_put16(FILE *f, uint16_t v)
+{
+    fputc((int)(v & 0xFF), f); fputc((int)((v >> 8) & 0xFF), f);
+}
+
+void apu_wav_finish(void)
+{
+    if (!g_apu_wav) return;
+    {
+        uint32_t data = (uint32_t)(g_apu_wav_frames * 4u);   /* 2ch * 16-bit */
+        fseek(g_apu_wav, 4, SEEK_SET);  apu_wav_put32(g_apu_wav, 36u + data);
+        fseek(g_apu_wav, 40, SEEK_SET); apu_wav_put32(g_apu_wav, data);
+    }
+    fclose(g_apu_wav);
+    g_apu_wav = NULL;
+    fprintf(stderr, "  [APU-WAV] closed, %lu frames (%.1f s)\n",
+            g_apu_wav_frames, g_apu_wav_frames / 48000.0);
+    fflush(stderr);
+}
+
+static void apu_wav_write(const int16_t *samples, int sample_frames)
+{
+    static int tried;
+    if (!tried) {
+        const char *path = getenv("RECOMP_APU_WAV");
+        tried = 1;
+        if (path && *path) {
+            g_apu_wav = fopen(path, "wb");
+            if (!g_apu_wav) { perror(path); return; }
+            fwrite("RIFF", 1, 4, g_apu_wav); apu_wav_put32(g_apu_wav, 0);
+            fwrite("WAVEfmt ", 1, 8, g_apu_wav); apu_wav_put32(g_apu_wav, 16);
+            apu_wav_put16(g_apu_wav, 1);        /* PCM */
+            apu_wav_put16(g_apu_wav, 2);        /* stereo */
+            apu_wav_put32(g_apu_wav, 48000);
+            apu_wav_put32(g_apu_wav, 48000 * 4);
+            apu_wav_put16(g_apu_wav, 4);
+            apu_wav_put16(g_apu_wav, 16);
+            fwrite("data", 1, 4, g_apu_wav); apu_wav_put32(g_apu_wav, 0);
+            fprintf(stderr, "  [APU-WAV] capturing the mixed output to %s\n", path);
+        }
+    }
+    if (!g_apu_wav || sample_frames <= 0) return;
+    fwrite(samples, 4, (size_t)sample_frames, g_apu_wav);
+    g_apu_wav_frames += (unsigned long)sample_frames;
+    /* Flushed periodically rather than at exit: a timed run is killed, not
+     * closed, so an unflushed tail is the part you wanted to hear. */
+    if ((g_apu_wav_frames % 48000u) < (unsigned long)sample_frames)
+        fflush(g_apu_wav);
+}
+
+
 static WaveOutState g_waveout = { 0 };
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
@@ -315,6 +398,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         mixer_render(d->monitor.frame_buf, output_samples);
     else
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+
+    apu_wav_write((const int16_t *)d->monitor.frame_buf, output_samples);
 
     if (xa2_is_active())
         xa2_submit_samples((const int16_t *)d->monitor.frame_buf, output_samples);
@@ -865,9 +950,91 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
+/* Which APU registers the guest actually READS, and how often.
+ *
+ * This exists to answer one question with a measurement instead of a reading of
+ * the source: does JSRF read NV_PAPU_XGSCNT, and if so how hard? That register
+ * matters because our implementation and current xemu's disagree about what it
+ * MEANS -- we return qemu_clock_get_ns(VIRTUAL)/100, a wall clock in 100 ns
+ * units, and xemu returns the count of audio samples actually processed. A
+ * title using it to pace a stream would get "time has passed" from us where
+ * xemu says "this much audio has been consumed", and those come apart precisely
+ * when the audio engine falls behind -- which is the case under investigation.
+ * Changing it blind would be a guess; a title that never reads it makes the
+ * whole question moot.
+ *
+ * It is also the positive control for the read trap itself. On macOS the
+ * aperture is guarded PAGE_READONLY for writes and PAGE_NOACCESS over
+ * MCPX_APU_MODEL_SIZE for reads, and the comment on the GP/EP branch below
+ * still says macOS never traps reads -- which was true when it was written and
+ * is not now. If total=0 here the read path is dead and every conclusion drawn
+ * from a register read on this host is worthless; if total is large, the trap
+ * works and an absent XGSCNT means the guest genuinely does not read it.
+ *
+ * Opt-in (RECOMP_APU_READ_TRACE) because unlike the frame histogram this sits
+ * on a signal-handler path that already costs a page fault per access, and
+ * because the answer is a one-off audit rather than something a normal run
+ * needs. Fixed 48 slots, no allocation, no lock: reads arrive on the guest
+ * thread inside the trap handler, and a miscount here would only ever cost a
+ * slightly wrong histogram. */
+#define APU_READ_SLOTS 48
+typedef struct { uint32_t off; unsigned long count; } ApuReadSlot;
+static ApuReadSlot g_apu_read_hist[APU_READ_SLOTS];
+static unsigned g_apu_read_slots;
+unsigned long g_apu_reads_total;
+unsigned long g_apu_reads_xgscnt;
+
+static int apu_read_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_READ_TRACE") != NULL;
+    return on;
+}
+
+static void apu_read_note(uint32_t off)
+{
+    unsigned i;
+    g_apu_reads_total++;
+    if (off == NV_PAPU_XGSCNT) g_apu_reads_xgscnt++;
+    for (i = 0; i < g_apu_read_slots; i++)
+        if (g_apu_read_hist[i].off == off) { g_apu_read_hist[i].count++; return; }
+    if (g_apu_read_slots < APU_READ_SLOTS) {
+        g_apu_read_hist[g_apu_read_slots].off = off;
+        g_apu_read_hist[g_apu_read_slots].count = 1;
+        g_apu_read_slots++;
+    }
+}
+
+void mcpx_apu_read_report(void)
+{
+    unsigned i, j;
+    if (!apu_read_trace_on()) return;
+    fprintf(stderr, "  [APU-READ] total=%lu XGSCNT=%lu distinct=%u%s\n",
+            g_apu_reads_total, g_apu_reads_xgscnt, g_apu_read_slots,
+            g_apu_reads_total ? "" : "  <- READ TRAP IS DEAD, or the guest "
+                                     "never reads the APU");
+    /* Descending, by selection so the table is not reordered under a reader
+     * comparing two runs' reports line by line. */
+    for (i = 0; i < g_apu_read_slots && i < 12; i++) {
+        unsigned best = i;
+        for (j = i + 1; j < g_apu_read_slots; j++)
+            if (g_apu_read_hist[j].count > g_apu_read_hist[best].count) best = j;
+        if (best != i) {
+            ApuReadSlot tmp = g_apu_read_hist[i];
+            g_apu_read_hist[i] = g_apu_read_hist[best];
+            g_apu_read_hist[best] = tmp;
+        }
+        fprintf(stderr, "  [APU-READ]   +0x%05X x%lu%s\n",
+                g_apu_read_hist[i].off, g_apu_read_hist[i].count,
+                g_apu_read_hist[i].off == NV_PAPU_XGSCNT ? "   <- XGSCNT" : "");
+    }
+    fflush(stderr);
+}
+
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
+    if (apu_read_trace_on()) apu_read_note((uint32_t)addr);
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
