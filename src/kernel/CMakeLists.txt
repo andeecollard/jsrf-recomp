@@ -102,3 +102,12 @@ endif()
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
 
 target_link_libraries(xbox_kernel PUBLIC xbox_vsh)
+
+# The MCPX write trap lives here, in mcpx_trap_handler, and records the host PC
+# of the faulting store in g_apu_trap_host_pc so the APU model can name the
+# instruction that wrote a register. That variable belongs to xbox_apu, so this
+# is a real dependency and not a convenience -- without it every consumer that
+# links xbox_kernel alone fails to link, which is what five of this project's
+# C tests had been doing silently, unnoticed because the only target anyone
+# rebuilt was the title itself.
+target_link_libraries(xbox_kernel PUBLIC xbox_apu)

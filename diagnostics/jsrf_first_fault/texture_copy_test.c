@@ -53,7 +53,26 @@ int main(void) {
     vertices(); CHECK(!nv2a_texture_copy_triangle(&s,texture,4,target,sizeof(target),v[0],v[1],v[2]));
     methods[0x304/4]=1;methods[0x344/4]=0;methods[0x348/4]=1;methods[0x350/4]=0x8006;
     CHECK(!nv2a_texture_copy_prepare(methods,&s) && s.blend_src==0 && s.blend_dst==1);
-    methods[0x344/4]=0x300;CHECK(nv2a_texture_copy_prepare(methods,&s));
+    /* The accepted factor set widened on 13 Sep to the eight per-channel
+     * factors blend_factor() implements, because refusing one does not degrade
+     * a draw -- nv2a_pb_exec drops the whole batch, and refusing DST_COLOR was
+     * deleting 6034 of them in a 150 s run. SRC_COLOR (0x300) and DST_COLOR
+     * (0x306) are accepted now; this line asserted the opposite and went on
+     * passing for a day because only the jsrf_first_fault target was being
+     * rebuilt. Pin both halves of the contract instead of one.
+     *
+     * Still refused, and not an oversight: the destination ALPHA factors
+     * (0x304, 0x305) and SRC_ALPHA_SATURATE (0x308). The Metal sink keeps the
+     * 24-bit depth value in the surface's alpha channel, so there is no
+     * destination alpha there to read. */
+    methods[0x344/4]=0x300;
+    CHECK(!nv2a_texture_copy_prepare(methods,&s) && s.blend_src==0x300 && s.blend_dst==1);
+    methods[0x344/4]=0x306;
+    CHECK(!nv2a_texture_copy_prepare(methods,&s) && s.blend_src==0x306 && s.blend_dst==1);
+    methods[0x344/4]=0x304;CHECK(nv2a_texture_copy_prepare(methods,&s));
+    methods[0x344/4]=0x001;methods[0x348/4]=0x308;
+    CHECK(nv2a_texture_copy_prepare(methods,&s));
+    methods[0x348/4]=1;
     methods[0x304/4]=0; methods[0xac0/4]^=3; CHECK(nv2a_texture_copy_prepare(methods,&s));
     methods[0xac0/4]^=3; methods[0x1b0c/4]|=4; CHECK(nv2a_texture_copy_prepare(methods,&s));
     copy_methods(methods,3,2,8,8,2); CHECK(!nv2a_texture_copy_prepare(methods,&s));
