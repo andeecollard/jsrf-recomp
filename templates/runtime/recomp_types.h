@@ -301,6 +301,36 @@ extern RECOMP_TLS int g_fp_cmp;
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
 
+/* x86 float -> int32, which a plain C cast does NOT reproduce.
+ *
+ * On x86 a source that is NaN, infinite, or outside int32 range yields the
+ * "integer indefinite" 0x80000000. In C the same cast is UNDEFINED BEHAVIOUR,
+ * and AArch64 saturates instead -- NaN gives 0, +inf gives INT_MAX -- so the
+ * two hosts disagree exactly where the guest is most likely to be relying on
+ * the sentinel.
+ *
+ * The two forms differ in rounding, which is the part that is wrong for
+ * ordinary values and not just at the edges: CVTTSS2SI truncates toward zero,
+ * CVTSS2SI rounds under MXCSR, whose default is nearest-even. Emitting both as
+ * `(int32_t)x` silently turns every CVTSS2SI into a truncation.
+ *
+ * The range test is written as a negated AND so that NaN, which compares false
+ * against everything, falls into the indefinite case rather than past it. */
+#define RECOMP_INT_INDEFINITE ((int32_t)0x80000000)
+
+static inline int32_t RECOMP_F2I_TRUNC(double v) {
+    if (!(v >= -2147483648.0 && v < 2147483648.0)) return RECOMP_INT_INDEFINITE;
+    return (int32_t)v;
+}
+
+static inline int32_t RECOMP_F2I_ROUND(double v) {
+    double r;
+    if (v != v) return RECOMP_INT_INDEFINITE;   /* nearbyint would propagate it */
+    r = nearbyint(v);                           /* current mode; default nearest-even */
+    if (!(r >= -2147483648.0 && r < 2147483648.0)) return RECOMP_INT_INDEFINITE;
+    return (int32_t)r;
+}
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */
@@ -820,13 +850,18 @@ static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
  * Rotation / shift helpers
  * ================================================================ */
 
+/* The n == 0 case has to be taken before the shifts: after `n &= 31` the
+ * complement is 32, and shifting a uint32_t by 32 is undefined in C even
+ * though the x86 instruction is simply a no-op there. */
 static inline uint32_t ROL32(uint32_t val, int n) {
     n &= 31;
+    if (n == 0) return val;
     return (val << n) | (val >> (32 - n));
 }
 
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
+    if (n == 0) return val;
     return (val >> n) | (val << (32 - n));
 }
 

@@ -423,23 +423,41 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
-        if jcc in ("ja", "jnbe"):
+        # comiss uses unsigned condition codes (CF, ZF) -- but NOT the plain C
+        # operators, because a NaN operand sets ZF=PF=CF=1 all at once:
+        #
+        #     unordered  ZF=1 PF=1 CF=1        less     ZF=0 PF=0 CF=1
+        #     equal      ZF=1 PF=0 CF=0        greater  ZF=0 PF=0 CF=0
+        #
+        # C disagrees with that in both directions: `a == b` is FALSE for NaN
+        # where ZF is set, and `a != b` is TRUE for NaN where ZF clears it. So
+        # `je` must fire on unordered and `jne` must not.
+        #
+        # This was not academic. JSRF's ray-plane test sub_0014C100 ends
+        # `comiss xmm0, xmm7` / `je -> return 0`, and feeds it a movement
+        # segment that is zero-length whenever a character stands still, which
+        # normalises to NaN. On hardware ZF is set, the branch is taken and the
+        # test reports no hit. Emitted as a bare `==` it fell through and
+        # reported a HIT, so CSysDeathWarpManager death-warped both CPlayers
+        # every frame of the Corn tutorial -- which read, for two days, as "the
+        # characters do not animate".
+        u = f"({a} != {a} || {b} != {b})"
+        if jcc in ("ja", "jnbe"):           # !CF && !ZF -- greater, ordered
             return f"({a} > {b})", desc
-        if jcc in ("jae", "jnb", "jnc"):
+        if jcc in ("jae", "jnb", "jnc"):    # !CF        -- greater or equal
             return f"({a} >= {b})", desc
-        if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
-        if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
-        if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
-        if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
-        if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
-        if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+        if jcc in ("jb", "jnae", "jc"):     # CF         -- less, or unordered
+            return f"({a} < {b} || {u})", desc
+        if jcc in ("jbe", "jna"):           # CF || ZF   -- le, or unordered
+            return f"({a} <= {b} || {u})", desc
+        if jcc in ("je", "jz"):             # ZF         -- equal, or unordered
+            return f"({a} == {b} || {u})", desc
+        if jcc in ("jne", "jnz"):           # !ZF        -- ordered and unequal
+            return f"({a} != {b} && !{u})", desc
+        if jcc == "jp":                     # PF         -- unordered
+            return f"{u} /* {jcc}: unordered/NaN */", desc
+        if jcc == "jnp":                    # !PF        -- ordered
+            return f"(!{u}) /* {jcc}: ordered */", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -1821,7 +1839,12 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        # x86 masks the shift count to 5 bits, so `shl eax, 32` is a no-op.
+        # C leaves a shift of 32 or more UNDEFINED, and the compiler is
+        # entitled to assume it never happens. Masking here costs nothing for
+        # the immediate counts (it folds) and makes the register forms both
+        # defined and x86-exact.
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
@@ -1835,7 +1858,7 @@ class Lifter:
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31)"   # see _lift_shift
         out = []
         if self.needs_cf:
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
@@ -2776,15 +2799,27 @@ class Lifter:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
         if m in ("cvtss2si", "cvttss2si"):
+            # CVTSS2SI ROUNDS (MXCSR, default nearest-even); only the double-T
+            # form truncates. Emitting both as `(int32_t)x` made every
+            # CVTSS2SI a truncation, which is wrong for ordinary values and
+            # not merely at the edges. The helper also supplies the x86
+            # integer-indefinite result for NaN, infinity and out-of-range,
+            # where the bare cast is undefined behaviour and AArch64
+            # saturates instead. The packed path already made this
+            # distinction; the scalar one did not.
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                helper = "RECOMP_F2I_TRUNC" if m == "cvttss2si" else "RECOMP_F2I_ROUND"
+                return [_fmt_operand_write(
+                    ops[0], f"(uint32_t){helper}({_sse_read(ops[1])})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                helper = "RECOMP_F2I_TRUNC" if m == "cvttsd2si" else "RECOMP_F2I_ROUND"
+                return [_fmt_operand_write(
+                    ops[0], f"(uint32_t){helper}({_sse_read(ops[1])})") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
