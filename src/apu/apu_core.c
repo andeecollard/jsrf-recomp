@@ -236,6 +236,7 @@ typedef struct {
  * apu_wav_finish. A truncated capture is still worth having.
  *
  * Cost when unset: one pointer test per APU frame. */
+unsigned long long g_apu_out_frames;
 static FILE *g_apu_wav;
 static unsigned long g_apu_wav_frames;
 
@@ -399,6 +400,12 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     else
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
+    /* Free-running count of output samples produced, whether or not anything
+     * is capturing them. This is the clock voice events are stamped with:
+     * the WAV is written from this same buffer at this same point, so a
+     * sample index here IS a sample index in the capture, exactly, with no
+     * conversion and no drift between two clocks to argue about. */
+    g_apu_out_frames += (unsigned long long)output_samples;
     apu_wav_write((const int16_t *)d->monitor.frame_buf, output_samples);
 
     if (xa2_is_active())

@@ -142,6 +142,79 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * apart. release= is the request; off= is the retirement it should eventually
  * produce once the envelope reaches zero. release>0 beside off=0 is a
  * release that never completes -- a distinct fault from never releasing. */
+/* A timestamped ring of voice lifecycle events.
+ *
+ * The counters below say how many voices started and stopped over a whole run.
+ * They cannot answer the question actually in front of us, which is what the
+ * guest did during ONE two-second window: our audio matches xemu's in steady
+ * state and departs from it for about two seconds around a music transition,
+ * with 551 single-sample deltas over 12000 where xemu's whole run never exceeds
+ * 8462. A total over 160 s cannot see a two-second event.
+ *
+ * Stamped with g_apu_out_frames, the count of output samples produced, because
+ * the WAV capture is written from the same buffer at the same point -- so the
+ * stamp is a sample index INTO THE CAPTURE. No clock conversion, and no pair of
+ * clocks that might drift apart and have to be argued about afterwards. Divide
+ * by 48000 for seconds into the WAV.
+ *
+ * A ring, not a log: voice traffic is heavy and the interesting window is
+ * usually behind you by the time you know it was interesting. 4096 events is a
+ * few seconds of the busiest traffic seen so far and costs 64 KB.
+ *
+ * Opt-in (RECOMP_VOICE_EVENTS) and read-only. */
+#define VOICE_EV_MAX 4096
+typedef struct { unsigned long long at; uint16_t handle; uint8_t kind; } VoiceEv;
+static VoiceEv g_voice_ev[VOICE_EV_MAX];
+static unsigned long g_voice_ev_n;          /* total seen; index is % VOICE_EV_MAX */
+static const char *const voice_ev_name[] = { "ON", "OFF", "RELEASE" };
+
+static int voice_ev_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VOICE_EVENTS") != NULL;
+    return on;
+}
+
+static void voice_ev_note(unsigned kind, unsigned handle)
+{
+    extern unsigned long long g_apu_out_frames;
+    VoiceEv *e;
+    if (!voice_ev_on()) return;
+    e = &g_voice_ev[g_voice_ev_n % VOICE_EV_MAX];
+    e->at = g_apu_out_frames;
+    e->handle = (uint16_t)handle;
+    e->kind = (uint8_t)kind;
+    g_voice_ev_n++;
+}
+
+/* Events per second of produced audio, so a transition shows up as a spike in
+ * a column rather than as something a reader has to spot in 4096 lines. */
+void mcpx_apu_voice_events_report(void)
+{
+    unsigned long start, i;
+    unsigned long long sec_lo = 0;
+    unsigned on = 0, off = 0, rel = 0;
+    if (!voice_ev_on()) return;
+    fprintf(stderr, "  [VOICE-EV] %lu events; per second of output audio:\n",
+            g_voice_ev_n);
+    start = g_voice_ev_n > VOICE_EV_MAX ? g_voice_ev_n - VOICE_EV_MAX : 0;
+    for (i = start; i < g_voice_ev_n; i++) {
+        const VoiceEv *e = &g_voice_ev[i % VOICE_EV_MAX];
+        unsigned long long s = e->at / 48000ull;
+        if (s != sec_lo) {
+            if (on | off | rel)
+                fprintf(stderr, "  [VOICE-EV]   t=%4llus  on=%-4u off=%-4u release=%-4u\n",
+                        sec_lo, on, off, rel);
+            sec_lo = s; on = off = rel = 0;
+        }
+        if (e->kind == 0) on++; else if (e->kind == 1) off++; else rel++;
+    }
+    if (on | off | rel)
+        fprintf(stderr, "  [VOICE-EV]   t=%4llus  on=%-4u off=%-4u release=%-4u\n",
+                sec_lo, on, off, rel);
+    fflush(stderr);
+}
+
 unsigned long g_apu_voice_on_count;
 unsigned long g_apu_voice_off_count;
 unsigned long g_apu_voice_release_count;
@@ -177,6 +250,7 @@ void mcpx_apu_voice_report(void)
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     g_apu_voice_off_count++;
+    voice_ev_note(1, v);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -252,6 +326,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_ON: {
         g_apu_voice_on_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_ev_note(0, selected_handle);
         /* off < on is only a defect for one-shots. A looping voice reaching
          * ebo takes cbo = lbo and runs for ever by design (see voice_process),
          * so BGM never retires and never raises the idle trap. Split the two
@@ -345,6 +420,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_RELEASE: {
         g_apu_voice_release_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_ev_note(2, selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -1043,6 +1119,86 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     return sample_count;
 }
 
+/* What playback rate each voice actually asks for.
+ *
+ * voice_resample() takes a rate and then discards it -- its body ends with a
+ * cast to void and a note that it is ignored until proper resampling exists --
+ * so every voice plays back one source sample per output sample whatever its
+ * pitch register says. rate is
+ * 1/2^(pitch/4096), so rate == 1.0 exactly when the pitch register is zero.
+ *
+ * Whether that MATTERS is an empirical question and this is how to settle it
+ * rather than argue it. If every voice the title starts asks for 1.0, the
+ * missing resampler costs nothing and is not the audio defect. If a voice asks
+ * for anything else, it is being played at the wrong speed, and a streaming
+ * voice played at the wrong speed drains its buffer at the wrong speed -- which
+ * is a mechanism that produces exactly what we see: fine in steady state,
+ * wrong at the moment a stream is switched or refilled.
+ *
+ * Per voice rather than in aggregate, because "some voice somewhere had a
+ * non-unit rate" cannot be acted on. Counted in frames, with min and max, so a
+ * voice that is briefly bent (a pitch envelope) is distinguishable from one
+ * playing at a flat wrong rate for its whole life.
+ *
+ * Opt-in (RECOMP_VOICE_RATES), read-only, one float compare per voice frame. */
+typedef struct {
+    unsigned long frames, off_frames;
+    float min_rate, max_rate, last_rate;
+} VoiceRate;
+static VoiceRate g_voice_rate[MCPX_HW_MAX_VOICES];
+
+static int voice_rate_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VOICE_RATES") != NULL;
+    return on;
+}
+
+static void voice_rate_note(uint16_t v, float rate)
+{
+    VoiceRate *r;
+    if (!voice_rate_on() || v >= MCPX_HW_MAX_VOICES) return;
+    r = &g_voice_rate[v];
+    if (!r->frames) { r->min_rate = rate; r->max_rate = rate; }
+    if (rate < r->min_rate) r->min_rate = rate;
+    if (rate > r->max_rate) r->max_rate = rate;
+    r->last_rate = rate;
+    r->frames++;
+    /* 1e-6 rather than ==: rate comes out of powf, and a pitch of exactly 0
+     * should give exactly 1.0f but nothing here depends on that being bit
+     * exact. Anything this close plays back indistinguishably. */
+    if (rate < 1.0f - 1e-6f || rate > 1.0f + 1e-6f) r->off_frames++;
+}
+
+void mcpx_apu_voice_rate_report(void)
+{
+    unsigned v, shown = 0, any = 0;
+    unsigned long tot = 0, tot_off = 0;
+    if (!voice_rate_on()) return;
+    for (v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        tot += g_voice_rate[v].frames;
+        tot_off += g_voice_rate[v].off_frames;
+        if (g_voice_rate[v].off_frames) any++;
+    }
+    fprintf(stderr, "  [VOICE-RATE] %lu voice-frames, %lu at a rate we ignore "
+            "(%.2f%%), %u voice(s) affected%s\n",
+            tot, tot_off, tot ? 100.0 * (double)tot_off / (double)tot : 0.0, any,
+            tot ? "" : "   <- NO VOICE FRAMES: nothing is being processed");
+    for (v = 0; v < MCPX_HW_MAX_VOICES && shown < 12; v++) {
+        const VoiceRate *r = &g_voice_rate[v];
+        if (!r->off_frames) continue;
+        shown++;
+        /* A rate of R means we play R source samples per output sample; we
+         * currently always play 1. So the source is consumed at 1/R times the
+         * speed it should be, and 48000/R is the rate the guest asked for. */
+        fprintf(stderr, "  [VOICE-RATE]   voice %3u: %lu/%lu frames off, "
+                "rate min=%.4f max=%.4f last=%.4f  (asked ~%.0f Hz, played 48000)\n",
+                v, r->off_frames, r->frames, r->min_rate, r->max_rate,
+                r->last_rate, r->last_rate > 0.0f ? 48000.0f / r->last_rate : 0.0f);
+    }
+    fflush(stderr);
+}
+
 /* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
@@ -1081,6 +1237,7 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
     float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
     dbg->rate = rate;
+    voice_rate_note(v, rate);
 
     /* Step amplitude envelope */
     float ea_value = voice_step_envelope(
