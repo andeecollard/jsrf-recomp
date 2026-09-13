@@ -457,6 +457,38 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_thread_stack_top = s->stack_top;
     free(s);
 
+    /* EXPERIMENT, opt-in: do not run the spin-wait workers at all.
+     *
+     * JSRF creates workers through XapiThreadStartup whose bodies at
+     * 0x0013B180 and 0x0013B1C0 are counting spin loops on flags in .data that
+     * nothing observed ever sets -- measured over a whole run, the flag reads
+     * zero throughout while the spin counter passes 1.1 billion, and one such
+     * thread holds a core at 100%.
+     *
+     * Whether that COSTS us anything is a separate question from whether it is
+     * wrong, and it is the cheaper one to answer. Two renderer optimisations
+     * today each removed real work from the pusher thread and moved the frame
+     * rate by nothing, so the assumption that a busy core must be the limiter
+     * has to be tested before anything is built on it. Returning here leaves
+     * the thread object and its handle intact -- the guest's NtResumeThread
+     * still succeeds -- and simply lets the thread exit instead of spinning.
+     *
+     * RECOMP_SKIP_SPIN_THREADS=1. Diagnostic only: if the title ever does set
+     * those flags, this silently removes whatever the workers would have gone
+     * on to do, so it is not a fix and must never become the default. */
+    {
+        static int skip = -1;
+        if (skip < 0) skip = getenv("RECOMP_SKIP_SPIN_THREADS") != NULL;
+        if (skip && (ctx1 == 0x0013B180u || ctx1 == 0x0013B1C0u)) {
+            fprintf(stderr, "  [KERNEL] SKIPPING spin worker ctx=0x%08X "
+                            "(RECOMP_SKIP_SPIN_THREADS)\n", ctx1);
+            fflush(stderr);
+            xbox_FreeThreadStack(g_thread_stack_top);
+            g_thread_stack_top = 0;
+            return 0;
+        }
+    }
+
     bridge_run_thread_inline(fn, ctx1, ctx2);
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
