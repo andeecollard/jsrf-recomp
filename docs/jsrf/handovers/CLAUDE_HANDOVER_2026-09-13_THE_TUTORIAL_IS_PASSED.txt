@@ -1,0 +1,116 @@
+CLAUDE, 13 Sep 2026 (end of session)
+THE TUTORIAL IS PASSED. THE PIPELINE HAS FOUR REACHABLE DEFECTS LEFT.
+
+Read section 1 first; it is the method, and it is worth more than any single
+fix below.
+
+
+1. THE METHOD, WHICH FOUND EVERYTHING
+=====================================
+Every bug this session had ONE SHAPE: an x86 behaviour emitted as the nearest C
+construct where C differs at a single edge, or emitted as nothing at all.
+Ordinary inputs pass either way, so tests and casual play never see it.
+
+And ONE TELL: **split every population by REACHABILITY before reading its
+count.** Raw counts here are dominated by functions nothing calls -- data swept
+as code -- and the raw number sends you to the wrong component:
+
+    dead branches        104 -> 90 total  BUT  18 -> 4 reachable
+    unimplemented insns  176 -> 164 total BUT  12 -> 3 reachable
+
+Both totals barely moved. Both reachable counts fell by about 78%. A change
+that looks like noise in the total is the whole of the work.
+
+
+2. FIXED, WITH EVIDENCE
+=======================
+  * `comiss` on NaN (55 sites). x86 sets ZF/PF/CF together; C's `==` is false
+    and `!=` is true. This froze the Corn tutorial for two days: a ray-plane
+    test reported a HIT on the zero-length movement segment a standing
+    character produces, so CSysDeathWarpManager death-warped both CPlayers
+    every frame of a cutscene.
+  * `cvtss2si` emitted as truncation when it rounds; float->int of NaN/inf/range
+    was UB where x86 yields 0x80000000.
+  * Variable shift counts unmasked (339 sites). ROL32/ROR32 undefined at count 0.
+  * Flag dataflow swept once in address order, so any join whose predecessor sat
+    at a HIGHER address was abandoned before the merge was ever called.
+  * Width-mismatched snapshot joins refused outright, when ZF is still knowable.
+  * `rcl`/`rcr` emitted as NOTHING, inside MSVC's 64-bit shift -- the low word
+    was never shifted.
+  * `stmxcsr` emitted as nothing, so a rounding-mode check read stale memory.
+
+  * Overlapping functions are NOT truncation. All 1599 pairs checked: in every
+    one the outer body emits code covering the interior range.
+
+  * THE BUILD TREE IS OUT OF iCLOUD. `build-macos` is a symlink to
+    /Users/andrewcollard/jsrf-build. Boot variance went from a 16-second range
+    to 0.2 s and the title stall went from ~50% to roughly 1 in 3.
+
+
+3. WHAT IS LEFT
+===============
+  * 3 reachable unimplemented: `in`, `wbinvd`, `out`, one each. Probably
+    ignorable on this host, but they should SAY so rather than be comments that
+    read like ordinary output.
+  * 4 reachable dead branches. Two need OF across a join, which no merge answers.
+  * The ratchet is 76 against a tree at 90, so it cannot pass and teaches
+    nothing. `audit_unresolved_flags.py` now prints the reachability split;
+    decide which number it should gate on.
+  * Six `backport_*` tests fail because their fixes moved into the lifter.
+    `jsrf_challenge_flag_merge` started passing by itself. Retire them.
+  * The disassembler is where the 161 + 86 unreachable items live. One finding,
+    not two hundred: the linear sweep walks into data.
+
+
+4. THE OPEN RENDERING BUG, AND A DIAGNOSTIC THAT IS NOT THE FIX
+===============================================================
+Reported: background geometry vanishes in WHOLE FLAT CHUNKS as the camera
+moves. Characters are fine.
+
+Measured clean, so these are excluded: 70M triangles rasterised, 0 batches
+skipped as not screen-space, 0 triangles off-surface, 0 Metal software
+fallbacks, 0 texture rejects. Geometry reaches the rasteriser.
+
+The Metal path is a SOFTWARE rasteriser: it takes already-transformed
+screen-space vertices and does its own depth test in the fragment shader
+against a 24-bit Z packed into the surface's ALPHA channel. There is no depth
+attachment. But Metal still clips to 0 <= z <= w by default, so any triangle
+whose z leaves [0,1] is discarded before the shader can judge it.
+
+`RECOMP_METAL_DEPTH_CLAMP=1` turns that clipping off. A/B in ONE binary:
+
+    clamp off:  11980 polls, 15.26M triangles
+    clamp on:    6085 polls, 18.46M triangles
+
+So geometry IS being z-clipped -- 20% more of it survives -- but clamping
+HALVES the frame rate, because geometry past the far plane is squashed onto it
+and rasterised over large areas. It is therefore a diagnostic, left OPT-IN and
+OFF by default. Do not ship it.
+
+THE REAL QUESTION: why does z leave [0,1] for geometry the title expects to be
+visible? That is upstream, in whatever produces the screen-space z in
+nv2a_pb_exec.c. Start there, not in the Metal file.
+
+Also unexplained and possibly related: `[VSH] rejected=59  oPos is not finite`.
+59 batches with NaN vertex positions. The count is STATIC across reports, so it
+happens early and stops -- not the ongoing clipping, but NaN reaching geometry
+is exactly what cost two days this morning.
+
+
+5. TRAPS, EACH PAID FOR TODAY
+=============================
+  * **START skips the logos.** So `8 WaitDestructLogos -> 12 WaitEndTitle` is
+    NOT a boot duration, it is when a press landed. Retuning new_game.pad to
+    fire "after the logos end" REMOVES the skip: two retunes scored 1/2 and 1/3
+    against 7/7 for the untouched file. Leave that file alone.
+  * **live=70 is PAUSED** (61 cutscene, 65 gameplay). A frozen pose plus
+    m_bFatal=1 was a human pressing START, not a regression -- three "clean"
+    runs and one "bad" one is not a bisect when the build AND the input history
+    both differ. Ask what was pressed.
+  * **PAD-TRACE proves our side, not delivery.** It observes the state the
+    guest is about to be given. RECOMP_PAD_INJECT then writes it into the
+    title's own copy; check the [PAD-INJECT] line says it found one.
+  * A repeated sweep must not touch the Lifter's reporting dictionaries.
+    Unguarded, `unimplemented` counted 538 where the truth was 176.
+  * `timeout` does not exist on macOS. Five runs reported "stalled" having
+    never started.

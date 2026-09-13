@@ -274,5 +274,28 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;
   id<MTLCommandBuffer>command=[queue commandBuffer];id<MTLRenderCommandEncoder>encoder=[command renderCommandEncoderWithDescriptor:pass];if(!command||!encoder)return reject("command-encoder");
   Params p={0};p.width=s->clip_w;p.height=s->clip_h;p.dither=s->dither;p.untextured=s->untextured;p.combiner_count=s->combiner_count;p.texture_mask=s->texture_mask;p.add_specular=s->add_specular;p.alpha_test=s->alpha_test;p.alpha_ref=s->alpha_ref;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
+  /* Do not let the hardware clip in Z.
+   *
+   * This path does its own depth test in the fragment shader, against a 24-bit
+   * Z packed into the surface's alpha channel -- there is no depth attachment
+   * and no hardware depth state. Metal still clips to the standard volume
+   * 0 <= z <= w by default, so any triangle whose interpolated z leaves [0,1]
+   * is thrown away BEFORE the shader can judge it, and whole flat pieces of
+   * background vanish as the camera moves. Clamp instead: the shader owns the
+   * decision, and geometry outside the range is depth-tested rather than
+   * discarded.
+   *
+   * OPT-IN, because clamping is a DIAGNOSTIC here and not the fix. Measured
+   * A/B in one binary: it recovers about 20% more triangles -- 18.46M against
+   * 15.26M, which proves geometry really is being z-clipped -- but it halves
+   * the frame rate, 6085 controller polls against 11980 over the same window.
+   * Geometry past the far plane is squashed onto it and rasterised across
+   * large areas, which is both expensive and wrong.
+   *
+   * So the clipping is a SYMPTOM. Something upstream is producing z outside
+   * [0,1] for geometry the title expects to be visible, and that is what needs
+   * fixing. Turn this on to confirm a suspected clip, not to ship. */
+  {static int clamp_z=-1;if(clamp_z<0)clamp_z=getenv("RECOMP_METAL_DEPTH_CLAMP")?1:0;
+   if(clamp_z)[encoder setDepthClipMode:MTLDepthClipModeClamp];}
   [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:0 atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:0 atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];[encoder endEncoding];[command commit];last_command=command;surface_dirty=1;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
 }
