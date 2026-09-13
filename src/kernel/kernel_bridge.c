@@ -2152,10 +2152,30 @@ static RECOMP_TLS LONG g_current_isr_handoff;
  * vector the guest registers for the GPU is 3. */
 #define BRIDGE_NV2A_VECTOR 3
 
-/* 60 Hz. The Xbox display list JSRF selects is 60 Hz progressive; pacing is
- * approximate either way because delivery happens at the thunk-dispatch poll,
- * not on a real timer. */
-#define BRIDGE_VBLANK_PERIOD_MS 16
+/* The vblank period, in microseconds, because it is not a whole number of
+ * milliseconds and pretending otherwise cost us 4%.
+ *
+ * This was `#define BRIDGE_VBLANK_PERIOD_MS 16` under a comment that said
+ * 60 Hz. 1000/16 is 62.5, and the guest's clock ran that fast: the archived
+ * measurement in CLAUDE_HANDOVER_2026-09-11_WINDOWS_ORACLE.txt reads
+ * "delivered=2797 over 44910 ms = 62.3 Hz", and 44910/16 is 2807, so delivery
+ * tracked the nominal constant to within 0.4%. The poll jitter is the small
+ * term; the constant was the big one.
+ *
+ * NTSC progressive is 59.94 Hz -- 60000/1001 exactly -- which is 16683.3 us.
+ * That cannot be a millisecond literal, and making the macro fractional does
+ * NOT work: `next_vblank` and `now` are both DWORD, so `now + 16.683` promotes
+ * to double and truncates straight back on every single call, leaving the
+ * behaviour bit-identical to 16. The fraction has to be carried between
+ * periods, which is what carry_us below does -- the step alternates between 16
+ * and 17 ms in the ratio that averages 16683 us.
+ *
+ * Deliberately still reset from `now` rather than advanced from the previous
+ * deadline. A late poll drops the periods it missed instead of delivering them
+ * in a burst, which is the existing contract (see the comment above
+ * g_vblank_deadlines) and the safer half of the tradeoff: a title that misses a
+ * frame should see one late vblank, not five at once. */
+#define BRIDGE_VBLANK_PERIOD_US 16683u
 
 /* NV_PMC_INTR_0 is a READ-ONLY SUMMARY of the engine interrupts: bit 24 is
  * asserted for as long as the display engine (PCRTC) has one pending, and it
@@ -2579,10 +2599,24 @@ void xbox_VblankReport(void)
     fprintf(stderr, "  [VBLANK] delivered=%lu over %lu ms = %.1f Hz"
             " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms"
             " not_ready=%lu\n",
-            g_vblank_delivered, ms, hz, 1000 / BRIDGE_VBLANK_PERIOD_MS,
+            g_vblank_delivered, ms, hz, 1000000 / BRIDGE_VBLANK_PERIOD_US,
             g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms,
             g_interrupt_not_ready);
     fflush(stderr);
+}
+
+/* One vblank period in whole milliseconds, carrying the remainder.
+ *
+ * Returns 17, 17, 17, 16, 17, 17, 17, 16 ... -- whatever sequence makes the
+ * running average 16683 us. The carry is what makes the average right; any
+ * single step is wrong by up to 317 us, which is far inside the poll jitter
+ * this is delivered against anyway. */
+static DWORD bridge_vblank_step_ms(void)
+{
+    static uint32_t carry_us;
+    uint32_t step_us = carry_us + BRIDGE_VBLANK_PERIOD_US;
+    carry_us = step_us % 1000u;
+    return (DWORD)(step_us / 1000u);
 }
 
 static void bridge_vblank_poll(void)
@@ -2653,11 +2687,11 @@ static void bridge_vblank_poll(void)
 
     now = GetTickCount();
     if (next_vblank == 0) {
-        next_vblank = now + BRIDGE_VBLANK_PERIOD_MS;
+        next_vblank = now + bridge_vblank_step_ms();
         goto done;
     }
     if ((int32_t)(now - next_vblank) < 0) goto done;
-    next_vblank = now + BRIDGE_VBLANK_PERIOD_MS;
+    next_vblank = now + bridge_vblank_step_ms();
     g_vblank_deadlines++;
 
     for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
