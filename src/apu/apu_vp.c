@@ -1025,6 +1025,8 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * Opt-in (RECOMP_VOICE_RATES), read-only, one float compare per voice frame. */
 typedef struct {
     unsigned long loopbacks, starved_loops;
+    unsigned long fresh_slots, stale_slots, new_slots;
+    unsigned long cur_stale_run, max_stale_run;
     unsigned long frames, off_frames;
     unsigned long short_calls, dry_calls, short_samples;
     unsigned long silent_frames;      /* fetched samples were all ~zero */
@@ -1033,10 +1035,16 @@ typedef struct {
 } VoiceRate;
 static VoiceRate g_voice_rate[MCPX_HW_MAX_VOICES];
 
+static int voice_fresh_on(void);
+
+/* RECOMP_VOICE_FRESH implies this: the freshness counters are reported by
+ * mcpx_apu_voice_rate_report, and the per-voice loop there skips any voice with
+ * no counted frames, so arming freshness alone would print nothing at all. */
 static int voice_rate_on(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_VOICE_RATES") != NULL;
+    if (on < 0)
+        on = getenv("RECOMP_VOICE_RATES") != NULL || voice_fresh_on();
     return on;
 }
 
@@ -1054,6 +1062,95 @@ static void voice_rate_note(uint16_t v, float rate)
      * should give exactly 1.0f but nothing here depends on that being bit
      * exact. Anything this close plays back indistinguishably. */
     if (rate < 1.0f - 1e-6f || rate > 1.0f + 1e-6f) r->off_frames++;
+}
+
+
+/* Is the guest still WRITING the buffer we are reading out of?
+ *
+ * Measured against xemu, our intro plays the same music sample-for-sample
+ * (r=1.00) for about two seconds and then starts losing ground -- 85 ms of
+ * forward progress lost in a 200 ms window, with disruptions too close together
+ * for a 100 ms window to correlate at all. Content right, continuity wrong.
+ * That is the signature of a streaming ring buffer whose producer has fallen
+ * behind its consumer: the play cursor laps the write cursor and re-plays the
+ * previous pass, and every sample of that is valid music, which is why five
+ * different characterisations of the output called it clean.
+ *
+ * Inferring that from the audio is not enough -- so count it in the mechanism.
+ * The buffer is divided into slots of one APU frame; each slot's contents are
+ * hashed as we read them and compared with what the SAME slot held on the
+ * previous pass. The guest refilling normally makes every slot differ: music
+ * does not repeat bit-exactly. A guest that has fallen behind makes them
+ * identical, and max_stale_run says how much unbroken stale audio was played.
+ *
+ * The prediction from the oracle is specific, which is the point of measuring
+ * rather than arguing: stale ~0 for the first two seconds of music, then a
+ * quarter to a half of slots stale.
+ *
+ * Opt-in (RECOMP_VOICE_FRESH), read-only, one multiply-xor per sample. */
+#define VOICE_FRESH_SLOTS 2048u
+
+typedef struct {
+    uint32_t crc[VOICE_FRESH_SLOTS];
+    uint8_t  seen[VOICE_FRESH_SLOTS];
+    /* Per slot, how many passes over the ring found it unchanged. This is what
+     * separates the two explanations for a constant stale fraction, and they
+     * want opposite fixes: a producer that cannot keep up leaves DIFFERENT
+     * slots stale on every lap, so every slot is stale some of the time; a
+     * buffer we are reading through the wrong mapping leaves the SAME slots
+     * stale for ever, so the histogram is bimodal and the always-stale ones are
+     * contiguous. */
+    uint16_t stale_n[VOICE_FRESH_SLOTS], pass_n[VOICE_FRESH_SLOTS];
+    uint32_t acc, slot;
+    int      started;
+} VoiceFresh;
+static VoiceFresh g_voice_fresh[MCPX_HW_MAX_VOICES];
+
+static int voice_fresh_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VOICE_FRESH") != NULL;
+    return on;
+}
+
+static void voice_fresh_commit(uint16_t v, VoiceFresh *f)
+{
+    VoiceRate *r = &g_voice_rate[v];
+    uint32_t sl = f->slot;
+    if (!f->seen[sl]) {
+        f->seen[sl] = 1;
+        r->new_slots++;
+        r->cur_stale_run = 0;
+    } else if (f->crc[sl] == f->acc) {
+        r->stale_slots++;
+        if (f->stale_n[sl] < 0xFFFF) f->stale_n[sl]++;
+        if (++r->cur_stale_run > r->max_stale_run)
+            r->max_stale_run = r->cur_stale_run;
+    } else {
+        r->fresh_slots++;
+        r->cur_stale_run = 0;
+    }
+    if (f->pass_n[sl] < 0xFFFF) f->pass_n[sl]++;
+    f->crc[sl] = f->acc;
+}
+
+static void voice_fresh_sample(uint16_t v, uint32_t cbo, const float s[2])
+{
+    VoiceFresh *f;
+    uint32_t slot;
+    union { float f; uint32_t u; } c0, c1;
+    if (!voice_fresh_on() || v >= MCPX_HW_MAX_VOICES) return;
+    f = &g_voice_fresh[v];
+    slot = (cbo / NUM_SAMPLES_PER_FRAME) % VOICE_FRESH_SLOTS;
+    if (!f->started) {
+        f->started = 1; f->slot = slot; f->acc = 2166136261u;
+    } else if (slot != f->slot) {
+        voice_fresh_commit(v, f);
+        f->slot = slot; f->acc = 2166136261u;
+    }
+    c0.f = s[0]; c1.f = s[1];
+    f->acc = (f->acc ^ c0.u) * 16777619u;
+    f->acc = (f->acc ^ c1.u) * 16777619u;
 }
 
 static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
@@ -1238,6 +1335,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         if (!stereo) {
             samples[sample_count][1] = samples[sample_count][0];
         }
+
+        voice_fresh_sample((uint16_t)v, cbo, samples[sample_count]);
     }
 
     /* How often the cursor ran past the end of the buffer.
@@ -1497,6 +1596,43 @@ void mcpx_apu_voice_rate_report(void)
                 "played NOTHING first%s\n", r->loopbacks, r->starved_loops,
                 (r->starved_loops > r->frames / 8)
                     ? "   <- STUTTERING: wrapping on an empty buffer" : "");
+        if (voice_fresh_on()) {
+            unsigned long classified = r->fresh_slots + r->stale_slots;
+            fprintf(stderr, "  [VOICE-FRESH]       slots: %lu fresh, %lu STALE "
+                    "(%.1f%%), %lu first-pass | longest stale run %lu slots "
+                    "= %.0f ms%s\n",
+                    r->fresh_slots, r->stale_slots,
+                    classified ? 100.0 * (double)r->stale_slots
+                               / (double)classified : 0.0,
+                    r->new_slots, r->max_stale_run,
+                    r->max_stale_run * NUM_SAMPLES_PER_FRAME / 48.0,
+                    (classified && r->stale_slots > classified / 20)
+                        ? "   <- the guest is not refilling this buffer" : "");
+            {
+                const VoiceFresh *f = &g_voice_fresh[v];
+                unsigned b[5] = { 0, 0, 0, 0, 0 }, i, lo = 0, hi = 0, run = 0,
+                         best_run = 0, best_lo = 0;
+                for (i = 0; i < VOICE_FRESH_SLOTS; i++) {
+                    unsigned p = f->pass_n[i], st = f->stale_n[i];
+                    if (!p) continue;
+                    if (!st) b[0]++;
+                    else if (st == p) b[4]++;
+                    else if (st * 4 < p) b[1]++;
+                    else if (st * 4 > p * 3) b[3]++;
+                    else b[2]++;
+                    if (st * 4 > p * 3) {
+                        if (!run) lo = i;
+                        run++;
+                        if (run > best_run) { best_run = run; best_lo = lo; }
+                    } else run = 0;
+                    hi = i;
+                }
+                fprintf(stderr, "  [VOICE-FRESH]       per-slot over %u slots: "
+                        "%u never stale, %u <25%%, %u 25-75%%, %u >75%%, "
+                        "%u ALWAYS | longest always-ish span %u slots at %u\n",
+                        hi + 1, b[0], b[1], b[2], b[3], b[4], best_run, best_lo);
+            }
+        }
     }
     fflush(stderr);
 }
