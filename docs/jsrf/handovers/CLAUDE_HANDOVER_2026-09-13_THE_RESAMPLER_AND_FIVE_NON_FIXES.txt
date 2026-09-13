@@ -1,0 +1,205 @@
+CLAUDE, 13 Sep 2026 (night)
+ONE REAL AUDIO FIX, ONE REAL TIMING FIX, AND FIVE CHANGES THAT MEASURED AS
+NOTHING. READ SECTION 2 BEFORE OPTIMISING ANYTHING.
+
+Supersedes CLAUDE_HANDOVER_2026-09-13_THE_PROFILE_SAYS_WAITING.txt, which is
+half a day old and already wrong in places this one names.
+
+
+0. STATE OF PLAY
+================
+HEAD da2f4c0. origin/main is far behind; nothing has been pushed today.
+tools/recomp 160/160. ctest 21/23, the two failures deliberate (05e0465).
+
+**The default build dir is now the optimised one.** build-macos/jsrf-first-fault/
+build is RelWithDebInfo with the title at -O2, so play.sh and measure.sh no
+longer launch the -O0 tree. Every log now opens with
+
+    [BUILD] title compiled -O2, binary <path>
+
+A log WITHOUT that line predates the stamp, and any performance number in it
+should be re-taken rather than trusted. play.sh and measure.sh also refuse a
+binary older than the sources (JSRF_ALLOW_STALE=1 overrides).
+
+    diagnostics/jsrf_first_fault/measure.sh <name> [seconds] [padfile]
+    pad/still.pad + pad/moving.pad   -- identical to t=47, then one holds the stick
+    pad/measure.pad                  -- reach the tutorial and stop pressing
+
+
+1. WHAT IS ACTUALLY FIXED
+=========================
+  * **The music glitch was the voice resampler.** voice_resample() took a
+    playback rate and discarded it -- `(void)rate;` under a comment claiming
+    nearest-neighbour resampling that did not exist. JSRF plays concurrent
+    voices at 48000 (rate 1.0), 44100 (1.0885) and 22050 Hz (2.1770), so the
+    22 kHz voice played 2.177x too fast. Linear interpolation now, carrying
+    fractional phase across frames; unity rate keeps its old path bit-identical,
+    so four of six voices are untouched by construction. Measured, same binary,
+    voice 69 alive at t=35-38 in both arms:
+
+        resampling on          0 deltas >12000, dmax 8365, over 154.7 s
+        RECOMP_NO_RESAMPLE=1   137 deltas >12000 in seconds 35/36/37, dmax 16641
+
+    dmax 8365 is BELOW the 8462 that an xemu capture's whole run never exceeds,
+    so our audio now sits inside the reference envelope. (f464df9)
+
+  * **Vblank ran 4% fast for the life of the port.** BRIDGE_VBLANK_PERIOD_MS was
+    16 under a comment saying 60 Hz; 1000/16 is 62.5. Not jitter -- the archived
+    62.3 Hz measurement tracks the nominal constant to 0.4%. A fractional macro
+    does NOT fix it: next_vblank and now are both DWORD, so `now + 16.683`
+    truncates back to 16 every call. bridge_vblank_step_ms carries the remainder
+    and returns a 16/17 sequence averaging 16683 us. Measured 62.3 -> 59.7 Hz
+    against a 59.94 target. Frame rate unchanged; this is correctness, not
+    speed. (cfd07a3, ba244a3)
+
+  * **getenv was half the pushbuffer executor's CPU.** nv2a_pb_exec_method called
+    it once per METHOD; __findenv_locked cost 444 samples against 320 for the
+    entire vertex shader interpreter. Cached, in the idiom those files already
+    used elsewhere. (855308c)
+
+  * **Five C tests did not LINK**, and ctest reports that as "Not Run", which
+    reads like a skip. xbox_kernel needed xbox_apu declared. And
+    jsrf_texture_copy was asserting the blend set ac38c32 deliberately widened
+    the day before, passing only because nobody rebuilt it. 16/23 -> 21/23.
+    (81eaf21)
+
+  * **The reference rig can capture audio alone now**, and survives an absolute
+    outdir -- "$PWD/$OUT" silently produced "$PWD//tmp/..." and xemu exited
+    before writing a sample while the script reported success. (6853538)
+
+
+2. FIVE THINGS THAT MEASURED AS NOTHING
+=======================================
+Each of these looked obviously right. Each is committed saying plainly that it
+is not a speedup. Do not re-derive them.
+
+  * **-O2 on the recompiled title.** Scene-matched, -O0 and -O2 are identical
+    within noise: live=131 118.0 vs 114.0 flips/window, live=133 108.5 vs 104.0,
+    live=137 106.5 vs 105.0. It kills _tlv_get_addr (75% of guest samples -> 22)
+    and shrinks the binary 42.7 -> 29.7 MB, and buys no frame time. Kept anyway.
+    The handover before this one said the whole runtime was at -O0; that was
+    WRONG -- every runtime library sets its own -O2 in target_compile_options.
+    (b1f0531)
+
+  * **Flat dispatch.** recomp_dispatch_init() was genuinely never called by this
+    harness -- the only caller in the tree is upstream's template. Wired up, then
+    profiled with RECOMP_FLAT_DISPATCH=0 so every indirect call used the binary
+    search: recomp_lookup does not appear in the profile AT ALL. 8,923 functions
+    is not Half-Life 2's 45,000. Left OFF. (c5b3908)
+
+  * **Skipping unstored VSH units.** vsh 16.07 -> 14.25 ms per frame, frame time
+    39.8 -> 39.8. The 1.8 ms reappeared as `rest`. (dc4a79e)
+
+  * **The per-vertex diagnostic range.** draw_primitive ran a SECOND fetch_vertex
+    over every vertex of every draw to compute a bounding box for one report
+    line. Now opt-in (RECOMP_VERTEX_RANGE=1). rest 15.96 -> 15.12 ms, mean 68.5
+    -> 68.4. (068b6f6)
+
+  * **Zero-filling a starved voice.** Real placement improvement, no behaviour
+    change: short=0 and dry=0 on every voice over 154 s, dropouts unchanged at
+    88 vs 85. (85a9177, corrected by c2c003e)
+
+
+3. RETRACTIONS
+==============
+  * **"voice_process mixes stack residue."** It does not. The line after the
+    declaration is `memset(samples, 0, sizeof(samples))`, present since the
+    original import. I read the declaration and not the line beneath it. A short
+    return has always truncated to silence. (c2c003e)
+  * **"550 of 551 discontinuities are within 5 ms of silence."** An artifact of
+    my own detector: the silence test was |sample|<64, which fires on every zero
+    crossing, and 8830 of 8850 "silence runs" were ONE SAMPLE long. The
+    follow-up guess that the burst was near-Nyquist noise is also dead -- a
+    roughness metric put a clean window HIGHER than the burst.
+  * **"The spinners are idle-priority CPU-measuring threads."** Traced: the
+    guest gives them ABOVE_NORMAL (+1), and gives IDLE (-16) to the worker that
+    blocks properly. (e2c0e45)
+  * **Black bars in the title animation are a defect.** The user says they are
+    intentional graphical elements. Stop looking. The grey ellipse reported
+    alongside them is NOT yet confirmed either way.
+
+
+4. AUDITS THAT SAID "DO NOT"
+============================
+  * **xbox_dsound is dead code for JSRF and must stay that way.** The title
+    statically links Microsoft's DSOUND.lib into the XBE (section 2, 116 KB) and
+    that recompiled guest code drives the MCPX registers directly -- 14,677 APU
+    writes in 154 s. xbox_DirectSoundCreate has no callers. And our xbox_dsound
+    is itself a stub ("accept all method calls silently", "deferred to a later
+    phase"), so switching to it would delete all audio. (6384659)
+
+  * **nv2a_core.c is unwired scaffolding, and wiring it is not justified yet.**
+    nv2a_init_standalone has never been called by anything. Most of it is
+    complementary, not duplicated -- it is the MMIO register-block model
+    (PMC/PBUS/PTIMER/PFB/PCRTC/PRAMDAC/PVIDEO/PFIFO) we do not have, and its
+    pgraph_method is a stub that renders nothing, so nv2a_pb_exec.c's 3354 lines
+    were not redundant. The one real overlap is the interrupt path, where its
+    computed PMC summary is better than our store-and-mask. Declined because
+    unacked_skips=0 and not_ready=0 across six runs -- the race it would prevent
+    is not happening -- and because making the model authoritative needs NV2A
+    register READ traps, which are currently ordinary loads. (53f36d2)
+
+  * **Library usage, measured at the linker:** xbox_kernel 23/25 objects,
+    xbox_apu 6/6, xbox_vsh 4/5, xbox_nv2a 2/6, xbox_video 2/3, xbox_dsound 0/1.
+    video_player.c is unused on macOS BY DESIGN -- it is Media Foundation behind
+    #if defined(_WIN32). If the intro animation is an FMV, it is not being
+    decoded on this host at all, which may bear on how the intro behaves here.
+
+
+5. THE TWO OPEN DEFECTS
+=======================
+**(1) Audio dropouts at a music track change.** 85 gaps >=3 ms in 155 s against
+xemu's 37, worst ~300 ms against xemu's 16 ms. The big gap sits EXACTLY between
+`off68` at t=42 and `on68` at t=43 -- the guest stopping its own music voice,
+with voice 70 briefly covering. Delivery is provably healthy throughout: 48,003
+frames/s, starved=0, empty=0, queue never below two device buffers.
+
+  The live lead, from an upstream audit: apu_dsp.c:31-54 documents a DirectSound
+  -> GP "command doorbell" where DSOUND writes a command word and spins until the
+  DSP writes ZERO back, and our GP is a passthrough stub so it never does.
+  RECOMP_APU_DSP_ACK=<addr> clears such words once per APU frame; it is set for
+  Wreckless and has never been set for JSRF. NOT yet shown to be our bug --
+  check whether the track change touches GPSADDR/GPFADDR/EPSADDR/EPFADDR or
+  writes a doorbell word before believing it.
+
+  Settling this needs xemu driven to the SAME transition, which the rig cannot
+  do unattended. Keystroke automation for capture_reference.sh (osascript, which
+  it already uses for focus) is the blocking task.
+
+**(2) 25 fps against a 30 fps target.** Stage breakdown at live=61, ~40 ms/frame:
+vsh 14.25, submit 9.47, sync 1.44, rest 14.67, 101 batches. GPU sync is NOT the
+problem, which retires a guess made from the ring audit's counters.
+
+  Two independent reductions in pusher-thread work moved the frame rate by zero
+  (section 2), so the pusher is not the critical path. A profile puts
+  sub_0013B180 -- a guest busy-wait -- at 1611 samples where a whole thread's
+  count is 1606. RECOMP_PEEK over a run: the flag 0x0025EFC0 reads 0 for the
+  ENTIRE run, its spin counter 0x0025EFA8 climbs past 1.1 BILLION, and
+  0x0025EFC4 never sets either.
+
+  But the spinners are LOAD-BEARING: RECOMP_SKIP_SPIN_THREADS=1 leaves the
+  handles intact and lets their bodies exit, and the title then stops at live=20
+  and never advances, twice, reproducibly. So they cannot be deleted or starved,
+  and "a core is busy" is not by itself the defect. (da2f4c0)
+
+  The lifter was checked and exonerated: the original XBE bytes at 0x0013B180
+  really do contain a call-free spin.
+
+
+6. TRAPS ADDED TODAY
+====================
+  * **Upstream's threading docs are STALE.** kernel-replacement.md,
+    gap-analysis.md and 05-runtime.md all say "single-threaded", "stubbed", "no
+    real threading". The code spawns real threads and honours CREATE_SUSPENDED.
+    Believing those docs would send you the wrong way entirely.
+  * **Thread priority is a no-op on POSIX.** SetThreadPriority records the value
+    and returns ("real RT priorities need privileges; tracked only"), so all
+    42,762 KeSetBasePriorityThread calls do nothing and the guest's four-level
+    ordering (+2/+1/0/-16) is flat. A real defect, unfixed, and NOT the spin
+    cause.
+  * **Scene-match or measure nothing.** A 150 s run reaches the tutorial about
+    three times in four. Compare [FRAME-WIN] windows at the same live=, never
+    cumulative totals.
+  * **Write the positive control before believing an absence.** Two of today's
+    wrong turns were absences without one.
+  * **`cmake --build --target jsrf_first_fault` never builds the tests.**
