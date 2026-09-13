@@ -1033,9 +1033,20 @@ class FunctionTranslator:
         # and must NOT be declared locally, otherwise the local shadows
         # the global and cross-function register passing breaks.
         # Volatile registers (eax, ecx, edx, esp) are also global via macros.
+        # Initialised, and that is not cosmetic. A function with a real
+        # `push ebp; mov ebp, esp` prologue pushes ebp BEFORE assigning it, to
+        # save the caller's frame -- so the generated code reads this variable
+        # while it is indeterminate, which is UB. At -O0 that is merely whatever
+        # was in the register; from -O1 up the compiler is entitled to treat the
+        # read as poison and propagate it. The title is now built at -O2
+        # (JSRF_OPT_LEVEL in diagnostics/jsrf_first_fault/CMakeLists.txt), so
+        # this stopped being theoretical. Zero is also strictly more
+        # reproducible than stack residue: the value is pushed to the guest
+        # stack and popped back into ebp by the epilogue, so nothing reads it
+        # except that round trip.
         reg_decls = []
         if "ebp" in used_regs:
-            reg_decls.append("ebp")
+            reg_decls.append("ebp = 0")
         if reg_decls:
             lines.append(f"    uint32_t {', '.join(reg_decls)};")
 

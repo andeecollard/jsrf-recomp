@@ -14,6 +14,56 @@ if(NOT RECOMP_GEN_SOURCES)
     message(FATAL_ERROR "No instrumented sources in ${RECOMP_GEN_DIR}")
 endif()
 
+# Optimisation.
+#
+# The recompiled title -- 1.3M lines of generated C, and the guest's own code,
+# which is where the run actually spends itself -- was built at -O0 for the
+# whole of bring-up. That was the right call while every diagnosis was a
+# debugger session: an inlined frame is a frame you cannot ask about. The
+# title now boots, renders, plays and makes noise, so the deliverable is speed,
+# and this is the largest thing standing in its way.
+#
+# MEASURED, because the handover's version of this was half wrong and the other
+# half would have sent the next session after CMAKE_BUILD_TYPE. Read the flags
+# out of a configured tree rather than believing either of us:
+#
+#     grep -h '^C_FLAGS =' <build>/xboxrecomp/src/*/CMakeFiles/*.dir/flags.make
+#
+# Every runtime library sets its OWN -O2 in target_compile_options -- xbox_vsh
+# (rasteriser, combiner, texture copy, the Metal sink), xbox_kernel (pb_exec,
+# memory layout, OHCI), xbox_apu, xbox_nv2a, platform. Target options come
+# after CMAKE_C_FLAGS_<CONFIG> on the command line, so they win, and those
+# libraries are at -O2 in a Debug tree already. The RGB565 and depth loops
+# quoted at 5x and 7.5x live in xbox_vsh and xbox_kernel; they were ALREADY
+# optimised in the shipped build, and the microbenchmark that produced those
+# figures was measuring code nobody ships at -O0. The build type reaches
+# exactly one library here, xbox_video, the FMV player.
+#
+# So there is one knob that matters and it is JSRF_OPT_LEVEL, which governs the
+# recompiled title. CMAKE_BUILD_TYPE is defaulted below anyway -- it is free,
+# it picks up xbox_video, and an unset build type has been blamed for a stalled
+# title before -- but do not expect it to be where the time is.
+#
+# RelWithDebInfo deliberately does NOT carry -DNDEBUG here. The APU model is
+# xemu's and is held together by assert(); this change is meant to be
+# optimisation and nothing else, and quietly deleting every bounds check is a
+# semantic change wearing an optimisation's clothes.
+#
+# -g and frame pointers stay on. The crash reporter symbolises host PC and LR
+# through dladdr and walks the frame chain to do it, and that is the only thing
+# that can name the function a worker-thread fault happened in.
+#
+# JSRF_OPT_LEVEL=-O0 restores the bring-up build without editing this file.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
+        "Build type (defaulted by jsrf_first_fault)" FORCE)
+endif()
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -fno-omit-frame-pointer"
+    CACHE STRING "" FORCE)
+set(JSRF_OPT_LEVEL "-O2" CACHE STRING
+    "Optimisation level for the recompiled title (-O0 restores the bring-up build)")
+message(STATUS "jsrf: build type ${CMAKE_BUILD_TYPE}, title ${JSRF_OPT_LEVEL}")
+
 add_subdirectory("${XBOXRECOMP_DIR}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 enable_testing()
@@ -84,7 +134,7 @@ target_compile_definitions(jsrf_first_fault PRIVATE RECOMP_ICALL_FEEDBACK)
 target_compile_definitions(xbox_kernel PRIVATE RECOMP_ICALL_FEEDBACK)
 
 target_compile_options(jsrf_first_fault PRIVATE
-    -O0 -g3 -fno-omit-frame-pointer -w
+    ${JSRF_OPT_LEVEL} -g -fno-omit-frame-pointer -w
     -include "${CMAKE_CURRENT_LIST_DIR}/guest_trace.h"
 )
 if(MINGW)
