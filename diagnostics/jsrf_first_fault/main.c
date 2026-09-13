@@ -287,6 +287,16 @@ void jsrf_render_probe(uint32_t pc)
     }
 }
 
+
+/* RECOMP_PB_NOTIFY_TRACE, read once. jsrf_pb_feed runs per pushbuffer window;
+ * getenv on that path showed up in a profile of the tutorial. */
+static int pb_notify_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PB_NOTIFY_TRACE") != NULL;
+    return on;
+}
+
 static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
 {
     NV2APusherResult invalid = {0, 0, 0, NV2A_PUSHER_INVALID};
@@ -315,7 +325,7 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
      * still reports a patch that lands while a segment is being executed. */
     const uint32_t *live = jsrf_pb_range(from, to - from);
     if (!live) return invalid;
-    int trace = getenv("RECOMP_PB_NOTIFY_TRACE") != NULL;
+    int trace = pb_notify_trace();
     static uint32_t snapshot[0x100000/4];
     /* RECOMP_PB_REPLAY keeps a copy of every window as it is taken, purely so
      * that a parse failure can be re-walked against the bytes that were there
@@ -3618,6 +3628,54 @@ int main(int argc, char **argv)
              * every method returns "unhandled" and the pusher measures
              * nothing. */
             if (dev) pgraph_d3d11_init();
+        }
+        fflush(stderr);
+    }
+
+    /* The flat dispatch table. OFF by default, and the measurement is why.
+     *
+     * recomp_lookup falls back to a binary search over the function table when
+     * recomp_dispatch_init() is not called -- log2(8923) is about 13 compares
+     * on every indirect call -- and JSRF's render chain is entirely
+     * vtable-dispatched, so that search sits underneath every frame. The
+     * generator has emitted recomp_dispatch_init() for this title all along
+     * and nothing here ever called it: the only caller in the tree is
+     * templates/new-game/src/main.c, which this harness is not built from.
+     * Upstream's template comment records Half-Life 2 spending most of its
+     * static initialisation inside recomp_lookup for exactly this reason.
+     *
+     * So it looked like free speed, and for this title it is not.
+     * MEASURED 13 Sep 2026: a 12 s `sample` of the Corn tutorial taken with
+     * RECOMP_FLAT_DISPATCH=0, so every indirect call went through the search,
+     * does not contain recomp_lookup AT ALL -- not in the top-of-stack list,
+     * not anywhere above the 5-sample cut. The search is not a measurable cost
+     * in JSRF. Half-Life 2 has 45,000 functions and a static-initialiser storm;
+     * this title has 8,923 and does its dispatch from a settled scene graph.
+     *
+     * Left in and defaulted off rather than deleted: it costs 13.6 MiB of
+     * mostly-untouched address space, one run with it enabled ended in a
+     * SIGSEGV that could not be attributed (13% of archived runs fault anyway,
+     * so one run proves nothing either way), and there is no measured upside to
+     * weigh against even an unproven risk. RECOMP_FLAT_DISPATCH=1 turns it on;
+     * a title with a bigger function table should start by turning it on and
+     * re-taking that profile.
+     *
+     * Here, and nowhere later, if it is enabled: it swaps the lookup strategy
+     * under recomp_lookup and nothing serialises that against a concurrent
+     * reader, so it has to happen while this program is still single-threaded
+     * -- before any CreateThread on this path and before the preflight lookups
+     * below. */
+    {
+        const char *flat = getenv("RECOMP_FLAT_DISPATCH");
+        if (!flat || !strcmp(flat, "0")) {
+            /* Silent: this is the default, and a line every boot saying
+             * nothing happened is how a log stops being read. */
+        } else if (!recomp_dispatch_init()) {
+            fprintf(stderr, "  [BOOT] flat dispatch unavailable; indirect "
+                            "calls will use the binary search\n");
+        } else {
+            fprintf(stderr, "  [BOOT] flat dispatch built: %.1f MiB reserved\n",
+                    recomp_dispatch_flat_bytes() / 1048576.0);
         }
         fflush(stderr);
     }

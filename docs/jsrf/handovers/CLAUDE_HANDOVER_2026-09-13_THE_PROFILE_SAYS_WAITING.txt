@@ -1,0 +1,284 @@
+CLAUDE, 13 Sep 2026 (late evening)
+THE TITLE IS NOT CPU-BOUND. IT IS WAITING, AND WE NOW HAVE AN INSTRUMENT THAT
+CAN SEE THAT.
+
+Supersedes CLAUDE_HANDOVER_2026-09-13_THE_FLOOR_IS_FIXED.txt and everything
+before it. Read section 1 before doing any performance work at all: it
+retracts the premise the previous handover put at the top of its to-do list,
+and it is the reason nothing else in that list is worth starting yet.
+
+
+0. STATE OF PLAY
+================
+HEAD bb5ee31, origin/main THREE BEHIND. Working tree has SEVEN modified files
+and TWO new ones, all described below, NOT COMMITTED -- the session was asked
+for measurements, not commits, so the decision is yours.
+
+tools/recomp tests 160/160. ctest 21 of 23, and the two failures are the two
+that 05e0465 deliberately kept failing. That is up from 16 of 23: five test
+targets did not LINK and one was asserting a contract we changed yesterday.
+See section 5.
+
+Build (the -O2 default is new, see section 2):
+
+    cmake -S diagnostics/jsrf_first_fault -B <build>
+    cmake --build <build> -j 6
+
+To measure rather than play, there is a new script:
+
+    diagnostics/jsrf_first_fault/measure.sh <name> [seconds] [padfile]
+    JSRF_BIN=<path> ... to A/B two binaries
+
+Build dirs left behind, all current, all with the same source:
+    build-O2   the default, -O2 title          <- use this
+    build-O0   -O0 title, identical otherwise  <- the control for section 1
+    build/     the old Debug tree, untouched, still the archived-baseline build
+
+
+1. THE RETRACTION, FIRST
+========================
+The previous handover's item (1) was "SPEED -- and the first move is a config
+change, not code", on the grounds that the whole program including the runtime
+was compiled at -O0, with the RGB565 convert loop measured 5.2x faster at -O2
+and the depth loop 7.5x.
+
+**The premise is wrong, and it was checkable in thirty seconds.** Every runtime
+library sets its own -O2 in target_compile_options -- xbox_vsh, xbox_kernel,
+xbox_apu, xbox_nv2a, platform -- and target options come after
+CMAKE_C_FLAGS_<CONFIG> on the command line, so they win. Those libraries have
+been at -O2 in the Debug tree all along. Read it out of a configured tree:
+
+    grep -h '^C_FLAGS =' <build>/xboxrecomp/src/*/CMakeFiles/*.dir/flags.make
+
+The RGB565 and depth loops live in xbox_vsh and xbox_kernel. They were ALREADY
+optimised in the shipped build. The microbenchmark that produced 5.2x and 7.5x
+was timing code nobody ships at -O0. CMAKE_BUILD_TYPE reaches exactly one
+library in this project, xbox_video, the FMV player.
+
+What WAS at -O0 is the recompiled title itself, whose flags are set explicitly
+and ignore the build type. That is now -O2 (section 2). It did not make the
+game faster either, and section 3 says what does.
+
+
+2. -O2 ON THE TITLE: WHAT IT DID AND DID NOT BUY
+=================================================
+JSRF_OPT_LEVEL in diagnostics/jsrf_first_fault/CMakeLists.txt, default -O2,
+set it to -O0 to get the bring-up build back. -g and frame pointers stay on --
+the crash reporter symbolises host PC/LR through dladdr and walks the frame
+chain, and that is the only thing that can name a worker-thread fault.
+RelWithDebInfo deliberately carries no -DNDEBUG: the APU model is xemu's and is
+held together by assert(), and deleting every bounds check is a semantic change
+wearing an optimisation's clothes.
+
+DID buy: the binary drops 42.7 MB -> 29.7 MB, and _tlv_get_addr -- recorded in
+recomp_types.h as "the biggest single cost in the program on BOTH hosts", about
+75% of the main guest thread's samples at -O0 -- falls to 22 samples out of
+~37,000 in a profile. The compiler CSEs the thread-local address per function,
+which is what the reverted register-context rewrite was trying to do by hand.
+That also retroactively explains why that rewrite measured 30.55s vs 30.69s:
+the TLS lookup was never the bottleneck, so removing it changed nothing.
+
+DID NOT buy: any frame time. Scene-matched, -O0 and -O2 are identical within
+noise. Same source, same schedule, 210 s each, comparing only windows in the
+same scene:
+
+    scene     -O0 flips/window   p50      -O2 flips/window   p50
+    live=131       118.0        89.5 ms        114.0        93.5 ms
+    live=133       108.5        95.0 ms        104.0        99.2 ms
+    live=137       106.5        89.2 ms        105.0        90.2 ms
+
+**Do not read the first measurement I took as evidence.** With a 150 s budget
+the -O2 build reached the Corn tutorial and the -O0 build did not, and its
+cumulative flip count was 28% higher. Both facts are real and neither is about
+speed: they are the run-to-run depth variance the previous handover already
+warned about ("296k draws and live=61 on one run, 733k and live=161 on the
+next, same binary"). Match the scene or measure nothing.
+
+I kept -O2 anyway -- smaller, no measured regression, and the CPU efficiency
+will matter once section 3 is fixed -- but it is not the win, and anyone
+reporting it as one has not matched scenes.
+
+
+3. WHERE THE TIME ACTUALLY GOES
+===============================
+12 s `sample` of the -O2 build sitting in the Corn tutorial (live=61):
+
+    __psynch_cvwait              44037
+    __semwait_signal             42129
+    __workq_kernreturn           40463
+    mach_msg2_trap               26256
+    semaphore_wait_trap          26010
+    sub_0013B180                  8670   <- the only large compute entry
+    semaphore_wait_signal_trap    8633
+    swtch_pri                     7040
+    nv2a_vsh_execute              2198
+    write_dest                     747
+    __findenv_locked               638
+    nv2a_metal_draw                496
+
+**The program is blocked, not computing.** Roughly 195,000 samples of waiting
+against maybe 14,000 of work. Every CPU-side optimisation on the previous
+handover's list is optimising the 7%.
+
+**sub_0013B180 is the guest busy-waiting.** It is a tight loop that reads
+MEM32(0x0025EFC0), increments a spin counter at MEM32(0x0025EFA8), and loops
+until the flag goes nonzero (recomp_0004.c around line 149933). It is reached
+from sub_00147EBB, which the decompilation names XapiThreadStartup -- so this
+is a guest worker thread spinning on a flag somebody else is supposed to set.
+It is the single largest consumer of guest CPU in the program, by 4x.
+
+That is the thread to pull. The question is not "how do we make the spin
+cheaper" -- it is **who sets 0x0025EFC0, and why are we slow to do it**. On a
+733 MHz Xbox this spin was presumably short. RECOMP_MEM_WRITE32 already carries
+the address, so a watch on 0x0025EFC0 should name the writer directly; note the
+mem-watch caveats in memory before trusting silence from it.
+
+
+4. WHAT CHANGED, WITH EVIDENCE
+==============================
+  * **There is a frame-time instrument now.** Every performance claim in this
+    project has been made in seconds of boot, total draws or controller polls,
+    and none of them is what a player feels. `[FRAME]` reports flips, mean,
+    p50/p90/p99/max and a count of frames over 33 ms, measured at NV097_FLIP_
+    STALL -- the guest's own frame boundary -- and `[FRAME-WIN]` reports the
+    same for the window since the last report. Use FRAME-WIN. A JSRF run is
+    three or four workloads in sequence and a cumulative percentile blends
+    however much of each that run happened to reach, which is the same trap as
+    comparing two runs' draw totals. 500 us bins, 2 KB of statics, one
+    clock_gettime per frame; cheaper than the [FB] line that already checksums
+    the whole framebuffer once a second, so it is unconditional.
+
+  * **The Metal vertex/index ring is no longer unrun.** Two 150 s runs, both
+    ending at live=61, no ring against ring:
+
+        flips 4085 -> 4275      mean 36.71 -> 35.08 ms
+        p50   50.5 -> 48.5      p90  52.5 -> 50.5    p99 126.5 -> 118.0
+        max  174.8 -> 123.3 ms  (-29%)
+        audio: starved 1 -> 0, empty 1 -> 0, min_queued 0 -> 7168 bytes
+
+    RECOMP_METAL_RING_AUDIT at 150 s: 111,207 reservations, 0 fallbacks to a
+    private allocation, 4058 wraps of which **0 had to wait**. The safety
+    machinery never engages -- the GPU is always finished with a slab long
+    before we come round to it again. Modest on the mean, real on the tail, and
+    it is the run where the audio underrun disappeared.
+
+  * **getenv was half the pushbuffer executor's CPU.** nv2a_pb_exec_method
+    called getenv("RECOMP_PB_EXEC_VERBOSE") once per pushbuffer METHOD;
+    draw_primitive and capture_draw did the same per draw; bridge_vblank_poll
+    and bridge_run_isr read RECOMP_PGRAPH_ISR_TRACE unconditionally. getenv
+    takes a lock and walks the environment linearly on macOS. In the first
+    profile __findenv_locked cost 444 samples against 320 for the ENTIRE vertex
+    shader interpreter and 60 for nv2a_metal_draw. Now cached, in the idiom the
+    rest of those files already used. This is justified by the profile, not by
+    a frame-rate A/B -- at the sample sizes I could afford the frame numbers
+    could not resolve it.
+
+  * **The uninitialised ebp is fixed in the translator.** 4901 generated
+    functions declared `uint32_t ebp;` and then pushed it before assigning it,
+    to save the caller's frame. Reading an indeterminate value is UB, harmless
+    at -O0 and not something to rely on at -O2. Now emitted as `= 0`. **This
+    needs a regeneration to take effect; the gen tree in build-macos still has
+    the old form.** Nothing observed was traced to it -- it is closed on
+    principle because we now ship -O2.
+
+
+5. TWO THINGS THE TEST SUITE WAS HIDING
+=======================================
+Both found by building ALL targets, which nobody had done -- the habit is
+`--target jsrf_first_fault`, and that never builds the tests.
+
+  * **Five C test targets did not link**, and had not for some time:
+    g_apu_trap_host_pc is defined in xbox_apu and referenced by
+    mcpx_trap_handler in xbox_kernel, and the small tests link xbox_kernel
+    alone. ctest reported them "Not Run", which reads like a skip. That is a
+    real dependency, now declared: xbox_kernel PUBLIC xbox_apu.
+
+  * **jsrf_texture_copy was asserting the blend set we widened yesterday.**
+    ac38c32 deliberately widened the accepted blend factors to the eight
+    per-channel ones (refusing DST_COLOR was deleting 6034 draws), and the test
+    still said SRC_COLOR must be refused. It went on "passing" for a day
+    because the binary was stale. Now it pins both halves -- an accepted factor
+    and a refused one -- and names why the destination-alpha factors stay
+    refused (the Metal surface keeps 24-bit depth in its alpha channel).
+
+
+6. THE TWO PIPELINE GAPS, BOTH CONFIRMED, BOTH WORTH LESS THAN THEY LOOK
+========================================================================
+  * **Flat dispatch was genuinely never enabled, and enabling it buys nothing
+    here.** recomp_dispatch_init() has been generated for this title all along
+    and the only caller in the tree is templates/new-game/src/main.c, which
+    this harness is not built from -- so every indirect call went through a
+    ~13-compare binary search, under a render chain that is entirely
+    vtable-dispatched. It looked like free speed. It is not: a 12 s profile
+    taken with RECOMP_FLAT_DISPATCH=0, so every indirect call used the search,
+    **does not contain recomp_lookup at all**, anywhere above the 5-sample cut.
+    8,923 functions is not 45,000. Wired up, measured, and left OFF
+    (RECOMP_FLAT_DISPATCH=1 enables it): no measured upside, 13.6 MiB, and one
+    run with it on ended in a SIGSEGV that cannot be attributed either way at
+    n=1 against a 13% background fault rate.
+
+  * **tools.abi_analysis is skipped by regenerate.sh, and running it would
+    change comments.** Confirmed: the pipeline runs tools.disasm, tools.func_id
+    and tools.recomp only, tools/abi_analysis/output does not exist, and
+    tools.recomp prints a WARNING and proceeds with an empty abi_db. But follow
+    what the data actually feeds. In translator.py the ABI fields land in the
+    doc comment and nowhere else -- ret_type and param_str are hardcoded
+    "void", every translated function is void(void) by design, and arguments go
+    through the simulated guest stack. lifter.py's _build_call_args, the one
+    function that would turn estimated_params into real arguments, is **defined
+    and never called**. The single codegen effect is that a function classified
+    ebp_frame would stop emitting `ebp = g_seh_ebp`, which _func_has_prologue
+    already gates -- so the realistic outcomes are "no change" and "a
+    disagreement removes an inheritance we need". It cannot be a speedup.
+    Worth running once to fix the comments (the generated headers currently say
+    `Frame: fpo_leaf` for functions that plainly have an ebp prologue, which
+    will mislead somebody), and only after diffing the generated C to confirm
+    the diff is comments-only.
+
+
+7. WHAT I WOULD DO NEXT
+=======================
+**(1) Find who sets 0x0025EFC0.** Section 3. Everything else is the 7%.
+
+**(2) The sync traffic the ring audit exposed.** Over 150 s: 13,817
+nv2a_metal_sync calls, 7,172 colour read-backs, 4,716 depth read-backs and
+7,169 surface re-uploads. That is a GPU->CPU->GPU round trip roughly twice per
+frame, on the thread the guest is waiting on, and it fits the profile's shape
+far better than anything CPU-side. Measure before designing.
+
+**(3) The OHCI use-after-free**, unchanged from the previous handover and still
+the best explanation for both the 13% fault rate and the intermittent
+controller stalls. Confirm ownership before adding a lock, and do NOT reuse
+mcpx_lock -- see the APU lock-inversion note.
+
+**(4) A real crash study.** 13% is not something two runs can attribute. Any
+claim that a change causes or fixes a crash needs ~20 runs per arm; I did not
+have the machine time, which is why flat dispatch is off rather than blamed.
+
+**(5) Black bars and grey ellipse, oPos NaN, sub-pixel viewport offset** --
+all unchanged from the previous handover, all still open.
+
+
+8. TRAPS ADDED THIS SESSION
+===========================
+  * **Cumulative [FRAME] percentiles blend scenes.** Use [FRAME-WIN] and read
+    the live= in force for that window. diagnostics/jsrf_first_fault has no
+    analysis script for this; I did it with a throwaway that joins FRAME-WIN
+    lines to the preceding JSRF-SCENE line, which is ten lines of python and
+    worth writing properly if this gets used twice more.
+  * **`cmake --build --target jsrf_first_fault` never builds the tests.** Two
+    real defects hid behind that for a day. Build all targets before believing
+    ctest.
+  * **ctest "Not Run" is a LINK FAILURE, not a skip.** It looks benign in the
+    summary line.
+  * **measure.pad stops pressing at t=47 on purpose.** new_game.pad keeps
+    firing to t=71, and past the title START is PAUSE -- so for timing runs the
+    tail has to come off or two runs end up in two different places. The cost
+    is that an unlucky run never leaves the menus at all; that shows up as
+    live!=61 and the run is discarded, not compared.
+  * **A 150 s run reaches the tutorial maybe three times in four**, same
+    binary. Budget for discards.
+  * **getenv is not free and this codebase calls it from hot paths.** Four
+    sites fixed here; `grep -rn getenv src/ | wc -l` still returns plenty, and
+    the ones inside `static int on = -1` guards are fine. Check the guard
+    before assuming a site is cached.
