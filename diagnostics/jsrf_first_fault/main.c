@@ -1045,6 +1045,8 @@ static void jsrf_pusher_report(void)
              * RECOMP_APU_READ_TRACE is set -- see mcpx_apu_read_report. */
             extern void mcpx_apu_read_report(void);
             mcpx_apu_read_report();
+            extern void mcpx_apu_write_report(void);
+            mcpx_apu_write_report();
             /* Voice lifecycle with sample-exact stamps. Opt-in
              * (RECOMP_VOICE_EVENTS); silent otherwise. */
             extern void mcpx_apu_voice_events_report(void);

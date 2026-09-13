@@ -917,9 +917,58 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size);
 void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size);
 
 /* Dispatch a VP-region access (offset 0x20000-0x2FFFF from APU base) */
+/* Which APU regions the guest WRITES, and what the DSP address registers hold.
+ *
+ * This exists to test one specific hypothesis and should be read as testing it,
+ * not as general telemetry. apu_dsp.c documents a DirectSound -> GP "command
+ * doorbell": DSOUND hands the audio DSP a command block in guest RAM, writes a
+ * command word, and spins until the DSP writes zero back. Our GP is a
+ * passthrough stub, so on Wreckless that hung DirectSound outright and needed
+ * RECOMP_APU_DSP_ACK=<addr> to fake the acknowledgement. It has never been set
+ * for JSRF.
+ *
+ * If JSRF's music track change issues a GP or EP command rather than only VP
+ * voice methods, the same stub could explain the ~300 ms silence that sits
+ * exactly between the guest stopping and restarting its own music voice.
+ * If it never touches GP or EP, the hypothesis is dead and this says so in one
+ * line rather than costing another session.
+ *
+ * GPSADDR/GPFADDR/EPSADDR/EPFADDR are printed because apu_dsp.c is explicit
+ * that the doorbell is NOT inside them -- it is a DirectSound heap allocation --
+ * so they bound where it is not, and are the starting point for finding where
+ * it is.
+ *
+ * Opt-in (RECOMP_APU_WRITE_TRACE), counters only, no per-access output. */
+unsigned long g_apu_w_main, g_apu_w_vp, g_apu_w_gp, g_apu_w_ep, g_apu_w_other;
+
+static int apu_write_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_WRITE_TRACE") != NULL;
+    return on;
+}
+
+void mcpx_apu_write_report(void)
+{
+    extern MCPXAPUState *mcpx_apu_get_state(void);
+    if (!apu_write_trace_on()) return;
+    fprintf(stderr, "  [APU-WRITE] main=%lu vp=%lu gp=%lu ep=%lu other=%lu%s\n",
+            g_apu_w_main, g_apu_w_vp, g_apu_w_gp, g_apu_w_ep, g_apu_w_other,
+            (g_apu_w_gp || g_apu_w_ep) ? ""
+              : "   <- GP and EP NEVER written: no DSP command doorbell here");
+    fflush(stderr);
+}
+
 void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
                              unsigned int size, bool is_write)
 {
+    if (is_write && apu_write_trace_on()) {
+        if (addr >= 0x20000 && addr < 0x30000)      g_apu_w_vp++;
+        else if (addr < 0x20000)                    g_apu_w_main++;
+        else if (addr >= 0x30000 && addr < 0x40000) g_apu_w_gp++;
+        else if (addr >= 0x50000 && addr < 0x60000) g_apu_w_ep++;
+        else                                        g_apu_w_other++;
+    }
     if (addr >= 0x20000 && addr < 0x30000) {
         /* VP region */
         hwaddr vp_addr = addr - 0x20000;
