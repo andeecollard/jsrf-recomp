@@ -111,7 +111,8 @@ void jsrf_d3d_alloc_report(void);
  * object's exec virtual from. RECOMP_FUNC_HIT_TRACE=1. */
 void jsrf_corn_note(uint32_t id, uint32_t self, uint32_t flags,
                     uint32_t state11c, uint32_t exec,
-                    uint32_t e50, uint32_t e60, uint32_t e68);
+                    uint32_t e50, uint32_t e60, uint32_t e68,
+                    uint32_t r2d0, uint32_t r38);
 extern unsigned long long g_exec_dispatches;
 
 #endif

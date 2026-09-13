@@ -307,6 +307,12 @@ struct corn_seen {
      * flag. If the state is frozen, those three say whether the timer is even
      * running -- which +0x11C alone cannot. */
     uint32_t e50, e60, e68;
+    /* this+0x2D0 is a model/resource pointer; +0x38 inside it is what
+     * sub_00080340 tests at 0x00080407 before computing the pose:
+     *     if (MEM32(MEM32(this+0x2D0) + 0x38) == 0) skip
+     * and the skip jumps past every write the block digest found missing --
+     * +0xCB0, +0xCA4, +0x13C.. and the +0xCE0 transform loop. */
+    uint32_t r2d0, r38;
     unsigned long long calls;
     int primed;
 };
@@ -322,7 +328,8 @@ double xbox_InputSeconds(void);
 
 void jsrf_corn_note(uint32_t id, uint32_t self, uint32_t flags,
                     uint32_t state11c, uint32_t exec,
-                    uint32_t e50, uint32_t e60, uint32_t e68)
+                    uint32_t e50, uint32_t e60, uint32_t e68,
+                    uint32_t r2d0, uint32_t r38)
 {
     struct corn_seen *c;
 
@@ -338,17 +345,19 @@ void jsrf_corn_note(uint32_t id, uint32_t self, uint32_t flags,
     c->calls++;
     if (c->primed && c->self == self && c->flags == flags
         && c->state11c == state11c && c->exec == exec
-        && c->e50 == e50 && c->e60 == e60 && c->e68 == e68)
+        && c->e50 == e50 && c->e60 == e60 && c->e68 == e68
+        && c->r2d0 == r2d0 && c->r38 == r38)
         return;
     fprintf(stderr, "  [CORN] t=%8.2f id=%u this=%08X s11c=%08X"
-            " e50=%u e60=%u e68=%u exec=%08X calls=%llu\n",
+            " e50=%u e60=%u e68=%u r2d0=%08X r38=%08X calls=%llu\n",
             xbox_InputSeconds(), (unsigned)id, (unsigned)self,
             (unsigned)state11c, (unsigned)e50, (unsigned)e60, (unsigned)e68,
-            (unsigned)exec, c->calls);
+            (unsigned)r2d0, (unsigned)r38, c->calls);
     fflush(stderr);
     c->primed = 1; c->self = self; c->flags = flags;
     c->state11c = state11c; c->exec = exec;
     c->e50 = e50; c->e60 = e60; c->e68 = e68;
+    c->r2d0 = r2d0; c->r38 = r38;
 }
 
 /* Call counts on the report cadence, so "is it still being updated at all"
@@ -361,10 +370,11 @@ static void jsrf_corn_report(void)
     for (i = 0; i < 2; i++)
         if (g_corn[i].primed)
             fprintf(stderr, "  [CORN] id=%u exec_dispatches=%llu"
-                    " s11c=%08X e50=%u e60=%u e68=%u\n",
+                    " s11c=%08X e50=%u r2d0=%08X r38=%08X%s\n",
                     44u + i, g_corn[i].calls, (unsigned)g_corn[i].state11c,
-                    (unsigned)g_corn[i].e50, (unsigned)g_corn[i].e60,
-                    (unsigned)g_corn[i].e68);
+                    (unsigned)g_corn[i].e50, (unsigned)g_corn[i].r2d0,
+                    (unsigned)g_corn[i].r38,
+                    g_corn[i].r38 == 0u ? "   <== POSE SKIPPED" : "");
 }
 
 void jsrf_func_hit_report(void)
