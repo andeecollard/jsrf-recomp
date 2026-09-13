@@ -331,13 +331,18 @@ class FunctionDetector:
         in a table is only an arm of a function whose own code dispatches
         through that table.
         """
-        for site in self._arm_table_map().get(addr, ()):
+        for site, _tbl in self._arm_table_map().get(addr, ()):
             if lo <= site < hi:
                 return site
         return None
 
-    def _arm_table_map(self) -> Dict[int, List[int]]:
-        """Every resynced table's entries, mapped to the jumps dispatching it."""
+    def _arm_table_map(self) -> Dict[int, List[Tuple[int, int]]]:
+        """Every resynced table's entries -> (dispatching jump, table).
+
+        The table address is carried alongside the site because one of the
+        three arm tests needs to ask which OTHER addresses belong to the same
+        table; see _arm_of_a_carved_run.
+        """
         tables = getattr(self, "_arm_tables", None)
         if tables is None:
             tables = {}
@@ -346,7 +351,8 @@ class FunctionDetector:
                 if not sites:
                     continue
                 for target in self.engine.jump_table_entries(tbl):
-                    tables.setdefault(target, []).extend(sites)
+                    tables.setdefault(target, []).extend(
+                        (site, tbl) for site in sites)
             self._arm_tables = tables
         return tables
 
@@ -372,8 +378,58 @@ class FunctionDetector:
         whatever the boundaries say. Sixteen bytes covers the `jmp [reg*4+disp]`
         form with room to spare.
         """
-        for site in self._arm_table_map().get(addr, ()):
+        for site, _tbl in self._arm_table_map().get(addr, ()):
             if addr - 16 <= site < addr:
+                return site
+        return None
+
+    def _arm_of_a_carved_run(self, addr: int) -> Optional[int]:
+        """The dispatching jump for addr, when only its own table's arms
+        separate the two.
+
+        The third shape, and the one that survived a459a6d and 289f21f
+        together. Once the first arm has been seeded the dispatcher ends at the
+        jump, so every LATER arm becomes a start whose owner is the previous
+        arm. _switch_arm_of then asks whether the dispatch lies inside the
+        arm's owner -- it does not, it lies in the dispatcher -- and
+        _fallthrough_arm_of looks only sixteen bytes back, which reaches the
+        first arm and no further. Both decline, correctly by their own terms,
+        and the loop survives one arm further along than before.
+
+        Measured on JSRF at 0x0007E550: `cmp edx,4; ja default;
+        jmp [edx*4+0x7E68C]` with arms at 0x7E575, 0x7E58D, 0x7E594, 0x7E5A3
+        and 0x7E5AA. 289f21f drops the first. The other four stay carved, each
+        owned by the one before it, and because the dispatcher pushes ecx, ebx,
+        esi and edi before the jump while the arms pop them, a carved arm
+        returns with all four changed. That is what RECOMP_ABI_CHECK reported
+        as `sub_0007E550: ebx esi esp(epilogue never ran)` seconds before the
+        guest ran its stack off the bottom -- and it is the same defect that
+        put a code address in CActMan::Idle's `this`.
+
+        What still separates this from a genuine function that merely appears
+        in someone else's table is the layout: walking back from the arm to the
+        function that contains the dispatch, EVERYTHING CROSSED IS AN ENTRY OF
+        THE SAME TABLE. A real function has unrelated code between it and that
+        dispatch -- which is exactly what
+        test_a_table_entry_far_from_its_dispatch_is_not_a_first_arm pins down,
+        and why that case is still left alone.
+        """
+        starts = getattr(self, "_seed_walk_starts", None)
+        if not starts:
+            return None
+        for site, tbl in self._arm_table_map().get(addr, ()):
+            if not site < addr:
+                continue
+            # The function the dispatch belongs to: the last start at or
+            # before it. Its recorded end is not consulted -- being clamped to
+            # the jump is the whole problem.
+            i = bisect.bisect_right(starts, site) - 1
+            if i < 0:
+                continue
+            entries = set(self.engine.jump_table_entries(tbl))
+            crossed = starts[bisect.bisect_right(starts, starts[i]):
+                             bisect.bisect_left(starts, addr)]
+            if all(x in entries for x in crossed):
                 return site
         return None
 
@@ -409,6 +465,8 @@ class FunctionDetector:
             site = self._switch_arm_of(addr, owner[0], owner[1])
         if site is None:
             site = self._fallthrough_arm_of(addr)
+        if site is None:
+            site = self._arm_of_a_carved_run(addr)
         if site is not None:
             detail["dispatch"] = f"0x{site:08X}"
             return "switch_arm", detail
@@ -465,13 +523,21 @@ class FunctionDetector:
 
         # Declared bounds are owners in their own right: the reason to declare
         # one is that the sweep did not find the function at all.
-        for start_addr in sorted(set(self.functions) | seed_set
-                                 | set(forced_starts)):
+        self._seed_walk_starts = sorted(set(self.functions) | seed_set
+                                        | set(forced_starts))
+        for start_addr in self._seed_walk_starts:
             interior = owner is not None and owner < start_addr < owner_end
             # A first arm sits exactly ON the boundary it created, so it is
-            # interior to nothing; see _fallthrough_arm_of.
+            # interior to nothing; see _fallthrough_arm_of. Every LATER arm of
+            # the same run is interior to nothing either, for a second reason:
+            # dropping an arm deliberately does not make it an owner, so the
+            # owner stays clamped at the dispatching jump and each remaining
+            # arm sits past its end. See _arm_of_a_carved_run. Both are asked
+            # here as well as in the classifier, because a seed the gate turns
+            # away is never classified at all.
             if not interior and start_addr in seed_set:
-                interior = self._fallthrough_arm_of(start_addr) is not None
+                interior = (self._fallthrough_arm_of(start_addr) is not None
+                            or self._arm_of_a_carved_run(start_addr) is not None)
             if interior and start_addr in seed_set:
                 j = bisect.bisect_right(forced_starts, start_addr) - 1
                 declared_inside = (j >= 0
@@ -1230,6 +1296,95 @@ class FunctionDetector:
             print("  conditional-branch orphans recovered as alias entries")
         return added
 
+    def _alias_end(self, addr: int, end: int) -> int:
+        """Re-measure an alias whose recorded end provably predates a boundary
+        change.
+
+        An alias's extent is recorded by whichever pass created it, and those
+        passes all run BEFORE _pass_demote_interior_seeds rebuilds the function
+        set. When that pass drops a switch arm, every boundary derived from the
+        arm becomes stale -- including the enclosing body an alias was given a
+        share of, which ended where the arm began.
+
+        Not every alias is re-measured, because most of them are fine and
+        2,557 gratuitous boundary changes is not a fix. The trigger is an end
+        that is demonstrably wrong rather than merely old: the body's last
+        instruction is `jmp [reg*4 + table]`, that table is resolved, and arms
+        of it lie outside the very body that dispatches them. A function cannot
+        end at its own switch and exclude its own cases.
+
+        That state is exactly what stops the lifter resolving the switch --
+        _analyze_switch_table requires func_start <= arm < func_end and breaks
+        at the first arm that is not -- so the dispatch stays an unresolved
+        indirect tail jump, the arms are never translated, and the jump lands
+        on nothing. The arms restore the registers the dispatcher pushed, so
+        `push ecx; push ebx; push esi; push edi; jmp [table]` returns with all
+        four still pushed and the caller's esi holding a return address. That
+        is how CActMan::Idle came to be looping on a code pointer with the
+        screen black.
+
+        Measured on JSRF 13 Sep: 270 of 2,557 aliases are in this state, and
+        every one of the 270 is a tail_jump_alias.
+        """
+        # EVERY dispatch in the body, not just the one it ends on.
+        #
+        # The first version of this looked only at the last instruction, on the
+        # assumption that a truncated body ends at its switch. It often does --
+        # sub_0007E550 and sub_0006D770 both did -- but it need not: a body can
+        # be cut after the dispatch and still stop short of the arms, and then
+        # the last instruction is ordinary code and the whole test is skipped.
+        # That left 156 of 161 remaining cases untouched, sub_00114A80 among
+        # them, which leaks 160 bytes of stack per call and hands its caller a
+        # zeroed esi -- measured as the registry root going 040D3A70 -> 0, the
+        # scene reading back as pixel data, and the state machine resetting to
+        # Init in the middle of the tutorial.
+        tables = []
+        probe = addr
+        while probe < end:
+            insn = self.engine.get_instruction(probe)
+            if insn is None:
+                break
+            if insn.jump_table is not None and insn.jump_table not in tables:
+                tables.append(insn.jump_table)
+            probe = insn.end_address
+        if not tables:
+            return end
+        arms = [a for tbl in tables for a in self.engine.jump_table_entries(tbl)]
+        if not arms or all(addr <= arm < end for arm in arms):
+            return end
+
+        # Where the re-measure must stop: the next REAL function start.
+        #
+        # Two things do not stop it, and getting either wrong breaks a switch.
+        #
+        # Aliases do not, because an alias is an alternate ENTRY into a body,
+        # not a boundary of one -- _build_alias_entries says the overlap is
+        # deliberate. Counting them cost 198 of 200 dispatches their arms:
+        # every one was stopped by a tail_jump_alias sitting between the jump
+        # and its own table, leaving the switch unresolved, the arms
+        # untranslated and the registers the dispatcher pushed never popped.
+        # sub_000F8B10 and sub_000FDA20 both did that at runtime, with
+        # RECOMP_ABI_CHECK reporting esp deltas of -32 and -16.
+        #
+        # The arms do not, because absorbing them is the entire purpose.
+        #
+        # The snapshot is taken before any alias is materialised, since
+        # _build_alias_entries inserts into self.functions as it goes and a
+        # body re-measured early would otherwise be stopped by whichever
+        # aliases happened to be materialised already -- an extent that
+        # depends on iteration order.
+        arm_set = set(arms)
+        starts = getattr(self, "_alias_walk_starts", None) or sorted(self.functions)
+        nxt = None
+        for cand in starts[bisect.bisect_right(starts, addr):]:
+            if cand not in arm_set:
+                nxt = cand
+                break
+        section = self.image.get_section_at_va(addr)
+        sec_end = (section.virtual_addr + section.virtual_size
+                   if section else None)
+        return max(end, self._find_function_end(addr, nxt, sec_end))
+
     def _build_alias_entries(self) -> None:
         """
         Emit a Function for each tail-jump target that lands inside another
@@ -1240,9 +1395,12 @@ class FunctionDetector:
         callable. The alternative -- a stub that returns immediately -- silently
         skips the epilogue and leaks the caller's frame.
         """
+        # Real starts only, and fixed before the loop begins: see _alias_end.
+        self._alias_walk_starts = sorted(self.functions)
         for addr, end in sorted(self._alias_entries.items()):
             if addr in self.functions:
                 continue
+            end = self._alias_end(addr, end)
             insns = self.engine.get_instructions_in_range(addr, end)
             if not insns:
                 continue

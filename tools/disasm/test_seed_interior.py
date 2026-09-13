@@ -34,6 +34,7 @@ class _Func:
 class _Section:
     virtual_addr = 0
     virtual_size = 0x01000000
+    name = ".text"
 
 
 class _Image:
@@ -115,6 +116,69 @@ class _WalkEngine:
 
     def jump_table_sites(self, t):
         return list(self._sites.get(t, ()))
+
+
+class _DispatchInsn(_WalkInsn):
+    """A one-byte stand-in for `jmp [reg*4 + table]`: an unconditional jump
+    that terminates the body and names the table it reads."""
+    def __init__(self, addr, table):
+        super().__init__(addr)
+        self.jump_table = table
+        self.is_jump = True
+        self.is_terminator = True
+        self.mnemonic = "jmp"
+
+
+class _MidInsn(_WalkInsn):
+    """A dispatch that does NOT end the body: `jmp [reg*4+table]` reached by a
+    branch, with ordinary code decoded after it."""
+    def __init__(self, addr, table):
+        super().__init__(addr)
+        self.jump_table = table
+        self.mnemonic = "jmp"
+
+
+class _AliasEngine(_WalkEngine):
+    def __init__(self, tables, dispatch_at):
+        super().__init__(tables, None)
+        self._dispatch_at = dispatch_at
+
+    def get_instruction(self, addr):
+        if addr in self._dispatch_at:
+            return _DispatchInsn(addr, self._dispatch_at[addr])
+        if addr in getattr(self, "_mid_at", {}):
+            return _MidInsn(addr, self._mid_at[addr])
+        return _WalkInsn(addr)
+
+    def get_instructions_in_range(self, lo, hi):
+        return [self.get_instruction(a) for a in range(lo, hi)]
+
+
+def _alias_detector(functions, aliases, tables, dispatch_at, natural=None,
+                    mid_at=None):
+    det = FunctionDetector.__new__(FunctionDetector)
+    det.functions = {s: _Func(s, e) for s, e in functions}
+    det._alias_entries = dict(aliases)
+    det._forced_bounds = []
+    det.image = _Image()
+    det.engine = _AliasEngine(tables, dispatch_at)
+    det.engine._mid_at = dict(mid_at or {})
+    det.labels = _Labels()
+    natural = natural or {}
+    # Mirrors the real _find_function_end's clamp: `upper` is lowered to the
+    # next function start, so a fake that ignored nxt could not show the bug
+    # the clamp exists for.
+    det._find_function_end = lambda start, nxt, sec: min(
+        natural.get(start, start), nxt if nxt is not None else 1 << 32)
+    return det
+
+
+class _Labels:
+    def get(self, addr):
+        return None
+
+    def auto_name_function(self, addr, sec, conf):
+        pass
 
 
 def _end_detector(forced):
@@ -329,6 +393,151 @@ class SeedInteriorTest(unittest.TestCase):
         det._pass_demote_interior_seeds([])
         self.assertEqual(det.dropped_seeds, [])
         self.assertEqual(det._candidates, {0x0002C397: SEED})
+
+    def test_every_later_arm_of_a_carved_run_is_dropped(self):
+        # JSRF 0x0007E550, measured 13 Sep, and the case that survived both
+        # a459a6d and 289f21f. `cmp edx,4; ja default; jmp [edx*4+0x7E68C]`
+        # with five arms. Dropping the first one is not enough: the dispatcher
+        # still ends at the jump, so arm 1 is owned by arm 0, arm 2 by arm 1,
+        # and so on down the run. The dispatch is then outside every one of
+        # those owners and more than sixteen bytes behind, so both earlier
+        # tests decline and four arms stay carved.
+        #
+        # They matter because the dispatcher pushes ecx, ebx, esi and edi
+        # before the jump and the arms pop them: a carved arm returns with all
+        # four changed. RECOMP_ABI_CHECK reported exactly that, and the same
+        # defect one table over is what left a code address in
+        # CActMan::Idle's `this` and put the title on a black screen.
+        arms = [0x0007E575, 0x0007E58D, 0x0007E594, 0x0007E5A3, 0x0007E5AA]
+        det = _detector([(0x0007E550, 0x0007E575)],
+                        {a: SEED for a in arms},
+                        natural={0x0007E550: 0x0007E575,
+                                 **{a: 0x0007E68A for a in arms}},
+                        provenance={a: ["icall_targets.json"] for a in arms},
+                        tables={0x0007E68C: arms},
+                        sites={0x0007E68C: [0x0007E56E]})
+        det._pass_demote_interior_seeds([])
+        self.assertEqual(det._candidates, {})
+        self.assertEqual([r["reference_class"] for r in det.dropped_seeds],
+                         ["switch_arm"] * 5)
+        self.assertEqual({r["dispatch"] for r in det.dropped_seeds},
+                         {"0x0007E56E"})
+
+    def test_a_run_broken_by_unrelated_code_is_left_alone(self):
+        # The discriminator, stated as a test rather than as a distance. The
+        # dispatch is inside a real function and the arm really is in its
+        # table, but a function that is NOT an entry of that table sits
+        # between them -- so this is not one original body carved into
+        # fragments, and the rule must not speak for it.
+        det = _detector([(0x00030000, 0x00030040), (0x00030100, 0x00030180)],
+                        {0x00030200: SEED},
+                        natural={0x00030000: 0x00030040,
+                                 0x00030100: 0x00030180,
+                                 0x00030200: 0x00030400},
+                        provenance={0x00030200: ["icall_targets.json"]},
+                        tables={0x00030500: [0x00030200]},
+                        sites={0x00030500: [0x00030030]})
+        det._pass_demote_interior_seeds([])
+        self.assertEqual(det.dropped_seeds, [])
+        self.assertEqual(det._candidates, {0x00030200: SEED})
+
+    def test_an_alias_ending_at_its_own_switch_is_re_measured(self):
+        # JSRF 0x0007E550. Every pass that records an alias extent runs BEFORE
+        # _pass_demote_interior_seeds rebuilds the function set, so dropping a
+        # switch arm leaves behind an alias whose body ends where the arm used
+        # to begin -- which is the dispatching jump itself. A function cannot
+        # end at its own switch and exclude its own cases, and while it does,
+        # _analyze_switch_table refuses the table (it needs
+        # func_start <= arm < func_end), the tail jump stays indirect, and the
+        # arms are never translated at all. The arms are what pop the four
+        # registers the dispatcher pushed.
+        #
+        # Measured 13 Sep: 270 of JSRF's 2,557 aliases sit in this state.
+        det = _alias_detector(
+            functions=[(0x0007E360, 0x0007E524), (0x0007E5C3, 0x0007E68A)],
+            aliases={0x0007E550: 0x0007E575},
+            tables={0x0007E68C: [0x0007E575, 0x0007E58D, 0x0007E594,
+                                 0x0007E5A3, 0x0007E5AA]},
+            dispatch_at={0x0007E574: 0x0007E68C},
+            natural={0x0007E550: 0x0007E5C3})
+        det._build_alias_entries()
+        self.assertEqual(det.functions[0x0007E550].end, 0x0007E5C3)
+
+    def test_an_alias_that_covers_its_own_arms_is_left_alone(self):
+        # The trigger is a provably wrong end, not merely an old one. An alias
+        # whose body already contains every arm of the switch it dispatches is
+        # correct, and re-measuring 2,557 aliases that are fine is not a fix.
+        det = _alias_detector(
+            functions=[(0x00030000, 0x00030040)],
+            aliases={0x00030100: 0x00030200},
+            tables={0x000301F0: [0x00030120, 0x00030130]},
+            dispatch_at={0x000301FF: 0x000301F0},
+            natural={0x00030100: 0x00030800})
+        det._build_alias_entries()
+        self.assertEqual(det.functions[0x00030100].end, 0x00030200)
+
+    def test_a_re_measured_alias_stops_at_the_next_real_function(self):
+        # The clamp exists because _find_function_end run with no upper bound
+        # runs away -- 289f21f measured p99.9 of 270,906 bytes against 4,639
+        # for the clamped walk. A re-measured body must still stop somewhere.
+        #
+        # It stops at the next REAL function start. 0x30150 is an arm and does
+        # not stop it, because absorbing the arms is the entire purpose;
+        # 0x30300 is an ordinary function and does.
+        det = _alias_detector(
+            functions=[(0x00030000, 0x00030040), (0x00030300, 0x00030400)],
+            aliases={0x00030100: 0x00030140},
+            tables={0x00030500: [0x00030150, 0x00030160]},
+            dispatch_at={0x0003013F: 0x00030500},
+            natural={0x00030100: 0x00030900})
+        det._build_alias_entries()
+        self.assertEqual(det.functions[0x00030100].end, 0x00030300)
+
+    def test_another_alias_does_not_stop_a_re_measure(self):
+        # The correction the runtime forced, and the reason the clamp is not
+        # simply "the next start".
+        #
+        # An alias is an alternate ENTRY into a body, not a boundary of one --
+        # _build_alias_entries overlaps them deliberately -- so treating an
+        # alias start as a clamp stops a dispatcher absorbing its own arms.
+        # Measured on JSRF: 198 of 200 dispatches whose arms fell outside
+        # their body were stopped by a tail_jump_alias sitting between the
+        # jump and its table. sub_000F8B10 and sub_000FDA20 are two of them,
+        # and RECOMP_ABI_CHECK caught them losing 32 and 16 bytes of stack
+        # with edi clobbered, seconds before the screen went black.
+        #
+        # The snapshot is also taken before the loop starts, so an extent does
+        # not depend on how many aliases happen to be materialised already.
+        det = _alias_detector(
+            functions=[(0x00030000, 0x00030040)],
+            aliases={0x00030100: 0x00030140, 0x00030200: 0x00030280},
+            tables={0x00030500: [0x00030150, 0x00030160]},
+            dispatch_at={0x0003013F: 0x00030500},
+            natural={0x00030100: 0x00030400})
+        det._build_alias_entries()
+        self.assertEqual(det.functions[0x00030100].end, 0x00030400)
+
+    def test_a_dispatch_in_the_MIDDLE_of_a_body_still_triggers(self):
+        # A truncated body often ends at its switch -- sub_0007E550 and
+        # sub_0006D770 both did -- but it need not. Cut after the dispatch and
+        # still short of the arms, the last instruction is ordinary code and a
+        # test that looks only there skips the case entirely. That left 156 of
+        # 161 remaining cases untouched.
+        #
+        # sub_00114A80 is one: 692 bytes, its `jmp [eax*4+0x114F90]` well
+        # inside the body, and its arms past the end. It leaks the 0x98-byte
+        # frame on every call and returns esi zeroed -- measured as the object
+        # registry root going 040D3A70 -> 0, the scene reading back as pixel
+        # data, and the sequence resetting to Init mid-tutorial.
+        det = _alias_detector(
+            functions=[(0x00030000, 0x00030040), (0x00030800, 0x00030900)],
+            aliases={0x00030100: 0x00030180},
+            tables={0x00030500: [0x00030200, 0x00030210]},
+            dispatch_at={},
+            mid_at={0x00030120: 0x00030500},
+            natural={0x00030100: 0x00030600})
+        det._build_alias_entries()
+        self.assertEqual(det.functions[0x00030100].end, 0x00030600)
 
     def test_nothing_to_do_is_cheap(self):
         # No seeds and no declared extents: the pass must not force a rebuild.
