@@ -2520,6 +2520,45 @@ static void jsrf_object_blocks(const uint8_t *base, uint32_t root)
     fflush(stderr);
 }
 
+/* Is an object in the draw list at all, read from the host.
+ *
+ * Two counter hooks on sub_000131F0's dispatch sites answered this directly
+ * and cost the measurement: both runs stalled at the title (live=158 and 162)
+ * where eight consecutive unprobed runs had reached the tutorial, so both were
+ * rejected. Two cheap counters at a per-object-per-frame site is still too
+ * much for this title.
+ *
+ * The draw phase walks its own list -- CActMan +0x7FA4 m_lpDrawRoot, threaded
+ * through each object's +0x34 -- so membership can be read from outside
+ * without touching the guest at all. It is one step weaker than "Draw was
+ * called": an object in the list that the walker skips would read as present.
+ * It is bounded, and it costs nothing.
+ */
+#define JSRF_DRAW_ROOT_OFF 0x7FA4u
+#define JSRF_DRAW_NEXT_OFF 0x34u
+
+static void jsrf_draw_list_report(const uint8_t *base, uint32_t root)
+{
+    static int on = -1;
+    uint32_t p, n = 0;
+    int saw44 = 0, saw45 = 0;
+
+    if (on < 0) on = getenv("RECOMP_DRAW_LIST") ? 1 : 0;
+    if (!on || !jsrf_va_ok(root + JSRF_DRAW_ROOT_OFF + 3u)) return;
+
+    p = *(const uint32_t *)(base + root + JSRF_DRAW_ROOT_OFF);
+    while (p && jsrf_va_ok(p + JSRF_DRAW_NEXT_OFF + 3u) && n < JSRF_WALK_CAP) {
+        uint32_t id = *(const uint32_t *)(base + p + 0x08u);
+        if (id == 44u) saw44 = 1;
+        if (id == 45u) saw45 = 1;
+        p = *(const uint32_t *)(base + p + JSRF_DRAW_NEXT_OFF);
+        n++;
+    }
+    fprintf(stderr, "  [JSRF-DRAW] list=%u id44=%s id45=%s\n",
+            n, saw44 ? "present" : "ABSENT", saw45 ? "present" : "ABSENT");
+    fflush(stderr);
+}
+
 static void jsrf_scene_report(void)
 {
     const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2556,6 +2595,7 @@ static void jsrf_scene_report(void)
     scene = R32(root + JSRF_SCENE_OFF);
 
     jsrf_object_activity(base, root);
+    jsrf_draw_list_report(base, root);
     jsrf_object_blocks(base, root);
 
     /* How much of the id-indexed array is populated. This counts objects that
