@@ -70,12 +70,17 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
          * to eight lines: the set is tiny, and a per-draw log would bury it.
          *
          * The reason it exists: xemu issues DST_COLOR/ZERO (0x306/0x0) during
-         * the intro cards, a multiply blend of the sort a fade-to-black uses,
-         * and that pair is outside the set accepted below. Whether our guest
-         * asks for the same thing decides where the missing fade lives -- a
-         * refusal here, or a draw the title never makes. rejected=0 says it is
-         * not being refused, so the combinations actually seen are the
-         * evidence that settles it. */
+         * the intro cards, a multiply blend of the sort a fade-to-black uses.
+         *
+         * MEASURED 13 Sep 2026, and the answer was not the one this comment
+         * used to record. Our guest asks for exactly that pair too, and it was
+         * being refused: 6034 draws deleted in a 150 s run, onset the moment
+         * the tutorial scene loads, recurring about once a frame. A refusal
+         * here is not a degraded draw, it is no draw at all -- prepare_texture
+         * _copy returns an error and nv2a_pb_exec.c drops the batch before
+         * either sink sees it -- so each one is a whole flat piece of the
+         * scene that never gets painted. That is now implemented rather than
+         * refused; what remains refused is listed against blend_factor. */
         {
             static uint32_t seen[8]; static int n; int i;
             uint32_t key = (src<<16) ^ dst ^ (M(0x350)<<1);
@@ -84,13 +89,13 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
                 seen[n++]=key;
                 fprintf(stderr, "  [BLEND] enable=%u src=0x%X dst=0x%X eq=0x%X%s\n",
                         M(0x304), src, dst, M(0x350),
-                        (M(0x304)!=1 || (src!=0 && src!=1 && src!=0x302 && src!=0x303)
-                         || (dst!=0 && dst!=1 && dst!=0x302 && dst!=0x303)
+                        (M(0x304)!=1 || !nv2a_texture_copy_blend_factor_supported(src)
+                         || !nv2a_texture_copy_blend_factor_supported(dst)
                          || M(0x350)!=0x8006) ? "  REFUSED" : "");
             }
         }
-        if (M(0x304)!=1 || (src!=0 && src!=1 && src!=0x302 && src!=0x303)
-                || (dst!=0 && dst!=1 && dst!=0x302 && dst!=0x303)
+        if (M(0x304)!=1 || !nv2a_texture_copy_blend_factor_supported(src)
+                || !nv2a_texture_copy_blend_factor_supported(dst)
                 || M(0x350)!=0x8006) return "blending";
         s->blend=1;s->blend_src=src;s->blend_dst=dst;
     }
@@ -436,9 +441,41 @@ static void stencil_update(const NV2ATextureCopy *s,uint8_t *zeta,uint32_t op)
     uint8_t next=stencil_result(op,old,(uint8_t)s->stencil_ref);
     zeta[0]=(uint8_t)((old&~mask)|(next&mask));
 }
-static float blend_factor(uint32_t factor,float source_alpha)
+/* A blend factor is per-channel, not a scalar. DST_COLOR and SRC_COLOR
+ * cannot be expressed as one number, and writing them as one is what forced
+ * the accept test below to refuse a multiply blend outright -- which deleted
+ * the whole draw. `src` and `dst` are the two colours; the result is the
+ * four-channel weight this factor contributes.
+ *
+ * The destination ALPHA factors (0x304, 0x305) and SRC_ALPHA_SATURATE (0x308)
+ * are deliberately absent, and the accept test still refuses them: the Metal
+ * sink keeps the 24-bit depth value in the surface's alpha channel, so there
+ * is no destination alpha there to read. Adding them means giving that path a
+ * real alpha channel first. */
+static void blend_factor(uint32_t factor,const float src[4],const float dst[4],float out[4])
 {
-    switch(factor) {case 0:return 0;case 1:return 1;case 0x302:return source_alpha;default:return 1-source_alpha;}
+    int k;
+    switch(factor) {
+    case 0x000: for(k=0;k<4;++k) out[k]=0;         break;  /* ZERO */
+    case 0x001: for(k=0;k<4;++k) out[k]=1;         break;  /* ONE */
+    case 0x300: for(k=0;k<4;++k) out[k]=src[k];    break;  /* SRC_COLOR */
+    case 0x301: for(k=0;k<4;++k) out[k]=1-src[k];  break;  /* ONE_MINUS_SRC_COLOR */
+    case 0x302: for(k=0;k<4;++k) out[k]=src[3];    break;  /* SRC_ALPHA */
+    case 0x303: for(k=0;k<4;++k) out[k]=1-src[3];  break;  /* ONE_MINUS_SRC_ALPHA */
+    case 0x306: for(k=0;k<4;++k) out[k]=dst[k];    break;  /* DST_COLOR */
+    case 0x307: for(k=0;k<4;++k) out[k]=1-dst[k];  break;  /* ONE_MINUS_DST_COLOR */
+    /* Unreachable: the accept test gates the set. Contribute nothing rather
+     * than silently standing in for ONE_MINUS_SRC_ALPHA, which is what the
+     * old default did. */
+    default:    for(k=0;k<4;++k) out[k]=0;         break;
+    }
+}
+/* The set blend_factor implements, and therefore the set prepare_texture_copy
+ * may accept. One place, so the three sinks cannot drift apart. */
+int nv2a_texture_copy_blend_factor_supported(uint32_t f)
+{
+    return f==0x000||f==0x001||f==0x300||f==0x301
+        || f==0x302||f==0x303||f==0x306||f==0x307;
 }
 static float edge(const float a[4], const float b[4], float x, float y)
 {
@@ -610,8 +647,10 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
             float dst[4];
             if (s->target_bpp==2) unpack565(p[0]|(uint32_t)p[1]<<8,dst);
             else { dst[0]=p[2]/255.0f; dst[1]=p[1]/255.0f; dst[2]=p[0]/255.0f; dst[3]=p[3]/255.0f; }
-            float source=blend_factor(s->blend_src,rgb[3]),destination=blend_factor(s->blend_dst,rgb[3]);
-            for (int k=0;k<4;++k) rgb[k]=rgb[k]*source+dst[k]*destination;
+            float source[4],destination[4];
+            blend_factor(s->blend_src,rgb,dst,source);
+            blend_factor(s->blend_dst,rgb,dst,destination);
+            for (int k=0;k<4;++k) rgb[k]=rgb[k]*source[k]+dst[k]*destination[k];
         }
         if (s->dither && s->target_bpp==2) {
             /* Deterministic ordered approximation; NV2A's exact thresholds

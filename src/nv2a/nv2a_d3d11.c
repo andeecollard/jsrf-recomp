@@ -673,13 +673,22 @@ static D3D11_STENCIL_OP stencil_operation(uint32_t op)
     default:     return D3D11_STENCIL_OP_KEEP;
     }
 }
+/* Keep in step with blend_factor in nv2a_texture_copy.c and bfactor in
+ * nv2a_metal.m: the same accept test admits all three, so a factor missing
+ * here would render as ONE_MINUS_SRC_ALPHA on Windows and correctly on macOS,
+ * which is the kind of divergence the differential oracle exists to catch. */
 static D3D11_BLEND blend_factor(uint32_t f)
 {
     switch (f) {
-    case 0:      return D3D11_BLEND_ZERO;
-    case 1:      return D3D11_BLEND_ONE;
+    case 0x000:  return D3D11_BLEND_ZERO;
+    case 0x001:  return D3D11_BLEND_ONE;
+    case 0x300:  return D3D11_BLEND_SRC_COLOR;
+    case 0x301:  return D3D11_BLEND_INV_SRC_COLOR;
     case 0x302:  return D3D11_BLEND_SRC_ALPHA;
-    default:     return D3D11_BLEND_INV_SRC_ALPHA;
+    case 0x303:  return D3D11_BLEND_INV_SRC_ALPHA;
+    case 0x306:  return D3D11_BLEND_DEST_COLOR;
+    case 0x307:  return D3D11_BLEND_INV_DEST_COLOR;
+    default:     return D3D11_BLEND_ZERO;
     }
 }
 

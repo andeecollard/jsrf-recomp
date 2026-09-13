@@ -52,4 +52,9 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *state,
     const uint8_t *texture, size_t texture_size, uint8_t *target, size_t target_size,
     uint8_t *depth, size_t depth_size,
     const float a[16][4], const float b[16][4], const float c[16][4]);
+/* True for the NV2A blend factors every sink implements. The accept test
+ * in prepare_texture_copy consults this, so a factor cannot be accepted
+ * that a sink would then silently substitute for. */
+int nv2a_texture_copy_blend_factor_supported(uint32_t factor);
+
 #endif
