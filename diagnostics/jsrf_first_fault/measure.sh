@@ -59,4 +59,9 @@ echo "--- audio ---"
 grep -E '\[APU-PACE\]|\[APU-OUT\]' "$OUT/stderr.log" | tail -5
 echo "--- how far it got ---"
 grep -E '\[JSRF-SCENE\] root=' "$OUT/stderr.log" | tail -2
-grep -cE '\[JSRF-FATAL\]|LAST INSTRUMENTED' "$OUT/stderr.log" | sed 's/^/fatal lines: /'
+# A real fault prints "FIRST GUEST FAULT" and a symbolised host PC. Do NOT
+# count [JSRF-FATAL] lines for this: that is a periodic status line reporting
+# the guest's m_bFatal flag, and it prints m_bFatal=0 when all is well, so
+# counting it reports nine "fatal lines" for a run that finished cleanly.
+printf 'guest faults: %s\n' "$(grep -c 'FIRST GUEST FAULT' "$OUT/stderr.log")"
+grep -A 4 'FIRST GUEST FAULT' "$OUT/stderr.log" | grep -E 'SIGNAL|HOST PC' | head -4
