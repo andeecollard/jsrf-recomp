@@ -1,0 +1,187 @@
+CLAUDE, 14 Sep 2026
+JSRF IS A 60 FPS TITLE AND WE RUN AT HALF SPEED. THE AUDIO STUTTER IS AN APU
+TRAP STORM. MY HARNESS IS STRUCTURALLY BLIND TO BOTH, AND A HUMAN WITH A
+CONTROLLER FOUND THEM IN TEN MINUTES.
+
+Supersedes CLAUDE_HANDOVER_2026-09-14_THE_SOUND_SERVER_WAS_STARVED_BY_OUR_WAIT.txt
+-- which is four hours old and already half wrong; see section 5. Read section 4
+before you trust ANY measurement in this tree.
+
+
+0. STATE OF PLAY
+================
+HEAD a3c4676. ctest 21/23, the two failures deliberate (05e0465).
+
+    RECOMP_VOICE_FRESH=1          ring-freshness probe (implies VOICE_RATES)
+    RECOMP_ADX_RATE=1             the guest's own sound-server pass rate
+    RECOMP_WAIT_POLL_US=N         wait poll interval, default 1000
+    RECOMP_APU_SE_WHILE_TRAPPED=1 keep the SE rendering while the FE is trapped
+                                  -- BUILT, OFF, AND NEVER HEARD. See section 3.
+
+Nothing in this handover about audio quality or frame rate was established by a
+scripted run. All of it came from a person playing with a controller, or from
+xemu.
+
+
+1. THE HEADLINE: 60 FPS, AND WE ARE AT 12
+==========================================
+xemu 0.8.136, US ISO, traced with nv2a_pgraph_flip_stall -- the same event our
+own [FRAME] counter is built on, so no conversion:
+
+    xemu, in-engine attract (character, HUD, city, dialogue)   59.2 - 60.1 fps
+    ours, the same attract scene                               11.7 - 14.3 fps
+    ours, gameplay at Dogenzaka Hill                                  31.3 fps
+
+11018 flips traced. **JSRF is a 60 fps title.** The "25 fps against a 30 fps
+target" line in three handovers has NOTHING measured behind it and understates
+the gap by 2x -- 5x at the attract.
+
+This is why the user said it "looks slow" rather than choppy. 31.3 fps against a
+59.8 Hz vblank, frame time pinned at 31.9-33.5 ms = two vblank periods: a 60 Hz
+title missing 16.67 ms and dropping to every other refresh. Titles of this era
+advance simulation a fixed step per frame, so half the frame rate is half the
+game speed. The world literally moves at half pace.
+
+Where the 32 ms goes at gameplay:
+
+    vsh 7.52 | submit 8.41 | sync 0.98 | REST (guest CPU) 15.03 | total 31.94
+
+Read that last column before attacking this as a renderer problem. The guest-CPU
+half is as large as all the graphics work combined, and 16.67 ms is the budget
+for the whole frame.
+
+    xemu -trace enable=nv2a_pgraph_flip_stall,file=/tmp/xemu-flip.trace
+
+~60 events/s, so straight to a file: no FIFO, no monitor gating. No timestamps
+-- count lines over an interval you timed yourself.
+
+
+2. THE AUDIO CHAIN, AS FAR AS IT IS KNOWN
+==========================================
+The intro replays ~23% of voice 68's 16384-sample music ring, in unbroken runs
+of 100-163 ms. Every sample of it is valid music, which is why five separate
+characterisations of the output called it clean.
+
+  * CRI's renderer moves at most 1024 samples per server pass (guest
+    0x0013E965), so 44100 Hz needs >= 43.1 passes/s.
+  * The server (guest thread body 0x0013B1C0) waits on the D3D vblank event at
+    59.94 Hz. That looks like 2x headroom. It is 39%.
+  * MEASURED 33.4 passes/s, pinned, at 88 fps and at 12 fps alike, with CRI's
+    own underrun counter (0x002615AC) flat ZERO -- it always had data; the pass
+    rate is the ceiling.
+  * bridge_KeWaitForSingleObject is not a wait. It is a poll loop ending in
+    Sleep(1) on a 16.67 ms budget.
+
+Confirmed independently: correlation of our attract clip against xemu's, per
+window, 0.449 -> 0.904 at 1 s when the poll was shortened. Short windows were
+already ~0.99 both ways; the samples were always right.
+
+
+3. THE TRAP STORM, WHICH IS PROBABLY THE BIGGER ONE
+====================================================
+The user, playing with a controller, reported a sustained effect -- the grind --
+fading in and out. That is not the ring replay. It is this:
+
+    real play        on=109  off=103  idle_trap=22371   48% of APU frames skipped
+    every scripted   on=5    off=0    idle_trap=0        0%
+    run ever taken
+
+~217 traps per voice retirement. The voice-list walk restarts from the top each
+frame and re-traps the SAME dead voice until the guest services it; each trap
+costs ~11 APU frames (~7 ms) with the sound engine down. A sustained sound is
+the obvious victim -- percussive music hides the same chopping.
+
+Two defects, both addressed behind RECOMP_APU_SE_WHILE_TRAPPED (edbd87d):
+  * se_frame was skipped while the FRONT END was trapped. FE (method
+    processing) and SE (voice rendering) are separate units; if a trapped FE
+    stopped the SE, every voice retirement would glitch audio on a stock Xbox.
+  * the walk abandoned the whole VP frame at the first idle voice, so one dead
+    voice silenced every voice behind it in every list.
+
+IT IS OFF AND HAS NEVER BEEN HEARD. ctest passes but no test in this tree
+retires a voice. It needs a controller, a grind, and [APU-FRAME] trapped= read
+beside [APU-VOICE] idle_trap=.
+
+
+4. THE HARNESS CANNOT SEE ANY OF THIS
+======================================
+This is the most important section and it is a process finding, not a bug.
+
+**Every pad schedule in diagnostics/jsrf_first_fault/pad/ parks the player.**
+measure.pad reaches gameplay and stops pressing. So nothing skates, nothing
+grinds, no sound effect starts or finishes, and no voice EVER retires:
+on=5 off=0 idle_trap=0 in every scripted run in this tree's history.
+
+Consequences, all real:
+  * the trap storm in section 3 was invisible for the life of the project;
+  * a change was shipped as a default on intro-only numbers and took gameplay
+    audio out entirely (section 5);
+  * "gameplay is clean" was asserted from live=61 and is false at live=161.
+
+A pad schedule that actually plays -- moves, jumps, grinds, sprays -- is worth
+more than any probe in this repo. Until it exists, ANY audio or performance
+conclusion from a scripted run is provisional, and should say so.
+
+
+5. RETRACTIONS
+==============
+Five, all mine, all from generalising one run.
+
+  * "The buffer wrap is the candidate" -- DEAD. Voice 68 wraps 82 times in
+    30.5 s, exactly the ring arithmetic, starved_loops=0.
+  * "Voice bounds are incoherent" -- an artifact. voice_desc_dump runs at the
+    TOP of the VOICE_ON case, ~50 lines before that case resets CBO.
+  * "Gameplay is clean" -- scene-specific. live=61 freezes its stale count;
+    live=161 is 22.7% stale, same as the intro.
+  * "The frame collapse is caused by the music" -- no. [STAGE] shows draws going
+    3 -> 552 per frame at that moment; both are the attract scene starting.
+  * **"The wait poll fix is a measured win"** (8440c9c) -- REVERTED in 3d00122.
+    100 us raised the intro's server passes 36.8 -> 44.9 and halved the replay,
+    at no frame-time cost. It also put the APU front end into TRAPPED for 203628
+    of 269896 gameplay frames against 0 and 70 before, froze voice processing,
+    and made the game SILENT. The intro's front end is never trapped, so that
+    scene was structurally incapable of showing it.
+
+
+6. TRAPS, PAID FOR
+==================
+  * **Correlating audio over ONE long window cannot distinguish "different
+    music" from "same music, broken continuity".** Both read near zero. Ours and
+    xemu's read 0.09 over six seconds and 0.98-0.99 from 5 ms to 400 ms. SWEEP
+    THE WINDOW LENGTH; the collapse length is the defect's period. Control every
+    correlator against itself in the same run -- that caught one of mine.
+  * A coarse ratio grid steps over a rate error and reports no match, which
+    reads exactly like a finding. A 6 s window decorrelates at 0.15%.
+  * **Sending `quit` to the QEMU monitor terminates the VM.** Cost one xemu run.
+  * xemu reads 60 fps at a LOGO screen too. That proves it presents at 60,
+    nothing more. Scene-match before believing any of it.
+  * My own windowed-rate line called its interval helper twice in one fprintf;
+    the second call measured ~0 and the rate came out 5x high. The giveaway is
+    the `consumed` column: if it is not 44100, do not read the row.
+  * Cumulative counters averaged the silent part of the intro with the
+    stuttering part and hid a five-fold difference. Per-window or nothing.
+
+
+7. STILL OPEN
+=============
+  * **The 2x frame-rate gap**, now correctly sized. Guest CPU is half of it.
+  * **The trap storm.** Turn on RECOMP_APU_SE_WHILE_TRAPPED, play, listen.
+  * **Controller hotplug ABORTS the process.** Disconnect then re-open:
+    [PAD] opened / disconnected / opened, then SIGABRT immediately after
+    SDL_GameControllerOpen returns (xinput_device.c:346, reached from guest
+    threads via xbox_InputGetState). No backtrace yet -- macOS wrote no report,
+    and lldb needs SIGSEGV/SIGBUS passed through or it breaks the MMIO trap
+    handlers the whole memory model depends on. Distinct from the known 13%
+    OHCI SIGSEGV.
+  * The remaining ring replay after any wait fix. 14-17% at 100 us.
+  * Our first 29.3 s are digital silence; xemu plays a logo chime in its first
+    10. Unchanged, separate, reproducible.
+  * g_apu_lock_handoffs only fires at a frame boundary, so its 84-in-70s cannot
+    exonerate the device lock. A per-thread blocked-time design exists in the
+    session log; not built.
+  * **xbox_apu is not fully used**: apu_mmio_hook.c.o never links, and 12 of 50
+    exports are referenced by nothing -- including the entire top-level register
+    dispatch (mcpx_apu_read/write/dispatch_mmio) and xemu's APU monitor tap
+    (mcpx_apu_monitor_*, mcpx_debug_*), which is where a DEBUG_MCPX-style trace
+    would go. apu_dsp.c links but is a stub. apu_wav_finish never runs because
+    timed runs are killed -- worked around in 4619db2.
