@@ -153,19 +153,21 @@ static void mac_eval(NV2AVshMacOp op, float s[3][4], float out[4])
         for (int k = 0; k < (op == NV2A_VSH_MAC_DP4 ? 4 : 3); ++k) dot += a[k]*b[k];
         if (op == NV2A_VSH_MAC_DPH) dot += b[3];
     }
-    for (int k = 0; k < 4; ++k) {
-        switch (op) {
-        case NV2A_VSH_MAC_MOV: out[k] = a[k]; break;
-        case NV2A_VSH_MAC_MUL: out[k] = multiply(a[k], b[k]); break;
-        case NV2A_VSH_MAC_ADD: out[k] = a[k] + c[k]; break;
-        case NV2A_VSH_MAC_MAD: out[k] = multiply(a[k], b[k]) + c[k]; break;
-        case NV2A_VSH_MAC_DP3: case NV2A_VSH_MAC_DPH: case NV2A_VSH_MAC_DP4: out[k] = dot; break;
-        case NV2A_VSH_MAC_MIN: out[k] = fminf(a[k], b[k]); break;
-        case NV2A_VSH_MAC_MAX: out[k] = fmaxf(a[k], b[k]); break;
-        case NV2A_VSH_MAC_SLT: out[k] = a[k] < b[k]; break;
-        case NV2A_VSH_MAC_SGE: out[k] = a[k] >= b[k]; break;
-        default: out[k] = 0; break;
-        }
+    /* Switch once, then run the component loop -- not the reverse. This used to
+     * evaluate the opcode switch four times per instruction, once per
+     * component, on the hottest path in the renderer. */
+    switch (op) {
+    case NV2A_VSH_MAC_MOV: for (int k=0;k<4;++k) out[k] = a[k]; break;
+    case NV2A_VSH_MAC_MUL: for (int k=0;k<4;++k) out[k] = multiply(a[k], b[k]); break;
+    case NV2A_VSH_MAC_ADD: for (int k=0;k<4;++k) out[k] = a[k] + c[k]; break;
+    case NV2A_VSH_MAC_MAD: for (int k=0;k<4;++k) out[k] = multiply(a[k], b[k]) + c[k]; break;
+    case NV2A_VSH_MAC_DP3: case NV2A_VSH_MAC_DPH: case NV2A_VSH_MAC_DP4:
+        for (int k=0;k<4;++k) out[k] = dot; break;
+    case NV2A_VSH_MAC_MIN: for (int k=0;k<4;++k) out[k] = fminf(a[k], b[k]); break;
+    case NV2A_VSH_MAC_MAX: for (int k=0;k<4;++k) out[k] = fmaxf(a[k], b[k]); break;
+    case NV2A_VSH_MAC_SLT: for (int k=0;k<4;++k) out[k] = a[k] < b[k]; break;
+    case NV2A_VSH_MAC_SGE: for (int k=0;k<4;++k) out[k] = a[k] >= b[k]; break;
+    default: for (int k=0;k<4;++k) out[k] = 0; break;
     }
     if (op == NV2A_VSH_MAC_DST) {
         out[0] = 1; out[1] = a[1]*b[1]; out[2] = a[2]; out[3] = b[3];
@@ -236,18 +238,37 @@ int nv2a_vsh_execute(const NV2AVshProgram *p, const float in[16][4],
         const NV2AVshInstruction *s = &p->insns[i];
         float inputs[3][4] = {{0}}, m[4], u[4];
         unsigned used = nv2a_vsh_mac_sources(s->mac_op) | (s->ilu_op ? 4 : 0);
+        /* Whether either unit's result can be observed at all. write_dest is a
+         * no-op when both masks are clear, so computing a value nobody stores
+         * is pure waste -- and a vertex program is mostly half-empty, because
+         * an instruction word carries a MAC slot and an ILU slot and most
+         * instructions use one of them. Every such slot used to cost a full
+         * eval and a call into write_dest.
+         *
+         * ARL is the exception and must run whatever its masks say: its effect
+         * is the address register, not a destination write. */
+        int mac_stored = s->mac_dst.write_mask
+                      || (s->mac_dst.output_mask
+                          && s->mac_dst.output_reg != NV2A_VSH_OUT_NONE);
+        int ilu_stored = s->ilu_dst.write_mask
+                      || (s->ilu_dst.output_mask
+                          && s->ilu_dst.output_reg != NV2A_VSH_OUT_NONE);
         /* Read every operand before either execution unit writes anything. */
         for (int j = 0; j < 3; ++j)
             if ((used & (1u << j)) && !read_source(&s->mac_src[j], in, c, temp, out, address, inputs[j])) return 0;
         if (s->mac_dst.constant_reg >= 0 || s->ilu_dst.constant_reg >= 0) return 0;
-        mac_eval(s->mac_op, inputs, m);
-        ilu_eval(s->ilu_op, inputs[2], u);
         if (s->mac_op == NV2A_VSH_MAC_ARL) {
             float a = floorf(inputs[0][0]);
             if (!isfinite(a) || a < -2147483648.0f || a >= 2147483648.0f) return 0;
             address = (int)a;
-        } else write_dest(&s->mac_dst, m, temp, out);
-        write_dest(&s->ilu_dst, u, temp, out);
+        } else if (mac_stored) {
+            mac_eval(s->mac_op, inputs, m);
+            write_dest(&s->mac_dst, m, temp, out);
+        }
+        if (ilu_stored) {
+            ilu_eval(s->ilu_op, inputs[2], u);
+            write_dest(&s->ilu_dst, u, temp, out);
+        }
     }
     return 1;
 }
