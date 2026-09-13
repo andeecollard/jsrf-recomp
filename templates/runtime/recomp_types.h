@@ -299,6 +299,20 @@ extern RECOMP_TLS int g_fp_cmp;
  * The unordered case is not a curiosity: `fucompp` of a value with itself
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
+/* MXCSR as the guest will find it.
+ *
+ * 0x1F80 is the architectural reset value: all six exception flags clear, all
+ * six masks set, rounding control 00 (nearest-even), flush-to-zero and
+ * denormals-are-zero off. JSRF reads it exactly once, in sub_0015F0F0, which
+ * does `stmxcsr` then `test ah, 0x60` -- bits 13-14, the rounding-control
+ * field -- and returns 0x8000FFFF if they are not zero. `ldmxcsr` never appears
+ * anywhere in the title, so the guest never changes it and a constant is the
+ * whole of the model.
+ *
+ * While stmxcsr was emitted as a no-op comment that check read whatever stale
+ * bytes happened to be at 0x265150, so it passed or failed by luck. */
+#define RECOMP_MXCSR_DEFAULT 0x1F80u
+
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
 
 /* x86 float -> int32, which a plain C cast does NOT reproduce.

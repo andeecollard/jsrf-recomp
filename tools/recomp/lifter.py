@@ -1188,6 +1188,13 @@ class Lifter:
             return self._lift_rotate(insn, ops, m)
         if m in ("rcl", "rcr"):
             return self._lift_rotate_carry(insn, ops, m)
+        if m == "stmxcsr" and ops:
+            # The guest reads MXCSR and never writes one: there is no ldmxcsr
+            # in the title. So the value it should find is the architectural
+            # default, and emitting nothing left the destination holding
+            # whatever was already there.
+            return [_fmt_operand_write(ops[0], "RECOMP_MXCSR_DEFAULT")
+                    + " /* stmxcsr */"]
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
