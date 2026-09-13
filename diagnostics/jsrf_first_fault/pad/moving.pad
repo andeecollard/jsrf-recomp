@@ -1,0 +1,26 @@
+# Reach the Corn tutorial, then MOVE, continuously. The test arm.
+#
+# Identical to still.pad up to t=47 -- same boot, same loads, same scene -- and
+# then holds the left stick for 90 seconds so the camera and the world are in
+# motion for the whole measurement window. Compare [STAGE], [FRAME-WIN],
+# [APU-FRAME] and [APU-PACE] against the still.pad run at the same live=61.
+#
+# Held in four overlapping 30 s pushes rather than one, and in two directions,
+# because a single sustained deflection can walk Corn into a wall and then the
+# "moving" arm is a stationary arm with the stick pressed. Overlapping events
+# are OR'd by the script parser, and a later event's stick value replaces the
+# earlier one for that axis, so these hand over cleanly.
+#
+# LUP/LRIGHT rather than a button: full deflection is 30000, well past the
+# 4096 the report path uses to reject jitter.
+
+12.0:START  13.5:START  15.0:A
+20.0:START  21.5:START  23.0:A
+28.0:START  29.5:START  31.0:A
+36.0:START  37.5:START  39.0:A
+44.0:START  45.5:START  47.0:A
+
+55.0:LUP:25
+80.0:LRIGHT:25
+105.0:LUP:25
+130.0:LLEFT:25

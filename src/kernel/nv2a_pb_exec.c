@@ -74,6 +74,57 @@
 #include <stddef.h>     /* ptrdiff_t; MSVC gets it via another header */
 #include <time.h>      /* clock_gettime, for the opt-in traces below */
 
+/* Where a frame's time goes, by stage.
+ *
+ * [FRAME] says a frame took 50 ms. It cannot say whether that was the guest
+ * thinking, our CPU vertex pipeline, handing work to Metal, or blocking on the
+ * GPU to hand something back -- and those four have completely different fixes.
+ * A profile says which FUNCTIONS are hot across the whole process, which is not
+ * the same question: this program is roughly 93% blocked, so the interesting
+ * quantity is which stage the frame is blocked IN, and for how long per frame.
+ *
+ * Three stages are timed because three are separable at a call boundary:
+ *
+ *   vsh     prepare_vertices -- the CPU vertex pipeline, nv2a_vsh_execute and
+ *           the attribute fetch underneath it. Per batch.
+ *   submit  nv2a_gpu_draw -- building and committing the command buffer. Per
+ *           batch that survives to a draw.
+ *   sync    nv2a_gpu_sync_range -- waiting for the GPU and reading the surface
+ *           back to guest memory. Per snapshot.
+ *
+ * Everything else in the frame -- the guest's own execution, the pushbuffer
+ * walk, method dispatch -- is reported as `rest`, by subtraction from the
+ * frame time. It is a residual, not a measurement, and is labelled that way.
+ *
+ * Cost is two clock reads per batch, not per triangle. mach_absolute_time
+ * appeared in a profile at 1097 samples, so this is deliberately coarse:
+ * instrumenting per draw call rather than per primitive keeps it at a few
+ * thousand reads a second against tens of millions of triangles.
+ *
+ * Both a run total and a per-report window, for the same reason [FRAME-WIN]
+ * exists: a JSRF run is several workloads in sequence and the cumulative
+ * average describes none of them. */
+typedef enum { PB_STAGE_VSH, PB_STAGE_SUBMIT, PB_STAGE_SYNC, PB_STAGE_N } PbStage;
+static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "submit", "sync" };
+static struct { unsigned long long us[PB_STAGE_N], n[PB_STAGE_N]; }
+    s_stage_run, s_stage_win;
+
+static unsigned long long pb_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull
+         + (unsigned long long)(ts.tv_nsec / 1000);
+}
+
+static void pb_stage_add(PbStage s, unsigned long long t0)
+{
+    unsigned long long d = pb_now_us() - t0;
+    s_stage_run.us[s] += d; s_stage_run.n[s]++;
+    s_stage_win.us[s] += d; s_stage_win.n[s]++;
+}
+
+
 #if NV2A_GPU_PATH
 /* Read once: this is consulted per batch, and getenv on Windows walks the
  * environment block every call. */
@@ -897,8 +948,12 @@ static void snapshot_surface(void)
 #if NV2A_GPU_PATH
     if (nv2a_gpu_on() && mem && s_gpu.color_offset && s_gpu.pitch
             && s_gpu.clip_h)
+    {
+        unsigned long long _t = pb_now_us();
         nv2a_gpu_sync_range((uint8_t *)mem + s_gpu.color_offset,
                 (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h));
+        pb_stage_add(PB_STAGE_SYNC, _t);
+    }
 #endif
     if (!s_snap_wanted || !s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
         return;
@@ -1102,8 +1157,12 @@ static void dump_surface_bmp(const char *tag, unsigned seq)
 #if NV2A_GPU_PATH
     if (nv2a_gpu_on() && mem && s_gpu.color_offset && s_gpu.pitch
             && s_gpu.clip_h)
+    {
+        unsigned long long _t = pb_now_us();
         nv2a_gpu_sync_range((uint8_t *)mem + s_gpu.color_offset,
                 (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h));
+        pb_stage_add(PB_STAGE_SYNC, _t);
+    }
 #endif
     if (!mem || !s_gpu.color_offset)
         return;
@@ -1335,6 +1394,30 @@ static void frame_hist_line(const char *tag, const FrameHist *h)
             (double)h->max_us / 1000.0, over);
 }
 
+/* Per-frame stage cost for the window just ended. `rest` is the frame time
+ * that none of the timed stages accounts for -- guest execution, the
+ * pushbuffer walk, method dispatch -- and is a residual rather than a
+ * measurement. A negative residual would mean a stage ran on a thread other
+ * than the one flipping, so it is reported rather than clamped. */
+static void pb_stage_line(unsigned long long frames, unsigned long long frame_us)
+{
+    double per[PB_STAGE_N];
+    double sum = 0.0;
+    unsigned i;
+    if (!frames) return;
+    for (i = 0; i < PB_STAGE_N; ++i) {
+        per[i] = (double)s_stage_win.us[i] / (double)frames / 1000.0;
+        sum += per[i];
+    }
+    fprintf(stderr, "  [STAGE] per frame:");
+    for (i = 0; i < PB_STAGE_N; ++i)
+        fprintf(stderr, " %s=%.2f ms (%.0f calls)", pb_stage_name[i], per[i],
+                (double)s_stage_win.n[i] / (double)frames);
+    fprintf(stderr, " | rest=%.2f ms of %.2f\n",
+            (double)frame_us / (double)frames / 1000.0 - sum,
+            (double)frame_us / (double)frames / 1000.0);
+}
+
 static void frame_stats_report(void)
 {
     if (!s_frame.run.n) {
@@ -1342,9 +1425,12 @@ static void frame_stats_report(void)
         return;
     }
     frame_hist_line("FRAME", &s_frame.run);
-    if (s_frame.win.n)
+    if (s_frame.win.n) {
         frame_hist_line("FRAME-WIN", &s_frame.win);
+        pb_stage_line(s_frame.win.n, s_frame.win.total_us);
+    }
     memset(&s_frame.win, 0, sizeof s_frame.win);
+    memset(&s_stage_win, 0, sizeof s_stage_win);
 }
 
 static void flip_trace(void)
@@ -2254,7 +2340,10 @@ static void raster_batch(void)
         if (fade_batch) ++s_blend_fade_fate.short_idx;
         return;
     }
-    if (!prepare_vertices()) {
+    unsigned long long _t_vsh = pb_now_us();
+    int _vsh_ok = prepare_vertices();
+    pb_stage_add(PB_STAGE_VSH, _t_vsh);
+    if (!_vsh_ok) {
         if (fade_batch) ++s_blend_fade_fate.vsh_rejected;
         static unsigned vsh_capture_count;
         if (!vsh_capture_count++ && getenv("RECOMP_DRAW_CAPTURE")) {
@@ -2329,9 +2418,11 @@ static void raster_batch(void)
         if (trace_fallbacks < 0)
             trace_fallbacks = getenv("RECOMP_GPU_FALLBACK_TRACE")
                 || getenv("RECOMP_METAL_FALLBACK_TRACE") ? 1 : 0;
+        unsigned long long _t_sub = pb_now_us();
         int triangles=nv2a_gpu_draw(&s_copy.state,s_copy.texture,s_copy.texture_bytes,
             s_copy.target,s_copy.target_bytes,s_copy.depth,s_copy.depth_bytes,
             s_outputs,s_gpu.idx_count,s_gpu.prim);
+        pb_stage_add(PB_STAGE_SUBMIT, _t_sub);
         if(triangles>=0) {
             static unsigned reported;
             s_gpu.tris_drawn+=(unsigned)triangles;

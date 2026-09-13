@@ -1,0 +1,20 @@
+# Reach the Corn tutorial, then DO NOTHING. The control arm.
+#
+# Pairs with moving.pad, which is this file plus a held stick. The two are
+# identical up to t=47 on purpose: same boot, same loads, same scene, same
+# binary, so the only difference between the two runs is whether the player is
+# moving. That is what separates "rendering contention while the camera moves"
+# from "the music feed is late regardless".
+#
+# Nothing after t=47. Past the title START is PAUSE, and an A after it is
+# navigating a pause menu, so a schedule that keeps pressing puts the two arms
+# in two different places and the comparison is void.
+#
+# A run that does not reach live=61 is discarded, not compared. Roughly one in
+# four does not.
+
+12.0:START  13.5:START  15.0:A
+20.0:START  21.5:START  23.0:A
+28.0:START  29.5:START  31.0:A
+36.0:START  37.5:START  39.0:A
+44.0:START  45.5:START  47.0:A
