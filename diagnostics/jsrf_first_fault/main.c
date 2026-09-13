@@ -14,6 +14,13 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                                   uint32_t fault_xbox_va, int is_write);
 #else
 #include <signal.h>
+/* dladdr, to name the function a crash actually happened in. It is a Darwin
+ * extension, so the header hides it under the -std=c11 the build asks for;
+ * _DARWIN_C_SOURCE is what unhides it, and must precede the include. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -3173,6 +3180,39 @@ static int install_crash_handlers(void)
     return AddVectoredExceptionHandler(1, crash_handler) != NULL;
 }
 #else
+/* Name a host address, because on a worker thread nothing else can.
+ *
+ * Every translated guest function is an ordinary symbol in this binary, so
+ * dladdr turns the faulting PC into `sub_00123456 +0x1c` -- which is the one
+ * thing the report was missing. `LAST INSTRUMENTED GUEST FUNCTION` only names
+ * the most recent function the tracer saw, and on a fault inside a thread
+ * started through XapiThreadStartup that is the thread entry trampoline, many
+ * frames above the code that actually died. Every such report so far has been
+ * unattributable for exactly that reason.
+ *
+ * Read the offset before trusting the name. dladdr reports the nearest
+ * PRECEDING exported symbol, so an address that is not inside any symbolised
+ * function is attributed to whatever happens to sit below it, with a large
+ * offset to say so. 9100 of the 9140 generated sub_* functions are external
+ * symbols, so a fault in translated code lands on the right one; a fault in a
+ * static helper will name the function before it. A four-digit offset means
+ * the name is a neighbour, not the answer.
+ *
+ * dladdr is not async-signal-safe. Neither is the fprintf immediately below
+ * it, nor the guest memory walk further down; this handler has always traded
+ * strict safety for a report, and a deadlock here costs a crash log that was
+ * previously useless anyway. Returns a leading-space suffix, or "".
+ */
+static const char *describe_host_address(uintptr_t address, char *out, size_t size)
+{
+    Dl_info info;
+    if (!address || !dladdr((void *)address, &info) || !info.dli_sname)
+        return "";
+    snprintf(out, size, "  %s +0x%llX", info.dli_sname,
+             (unsigned long long)(address - (uintptr_t)info.dli_saddr));
+    return out;
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *context)
 {
     uintptr_t fault = si ? (uintptr_t)si->si_addr : 0;
@@ -3198,12 +3238,15 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
         host_sp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
     }
 #endif
+    char pc_name[256], lr_name[256];
 
     fprintf(stderr, "\n========== FIRST GUEST FAULT ==========\n");
     fprintf(stderr, "SIGNAL: %s (%d)\n", sig == SIGBUS ? "SIGBUS" : "SIGSEGV", sig);
     fprintf(stderr, "HOST FAULT ADDRESS: 0x%016llX\n", (unsigned long long)fault);
-    fprintf(stderr, "HOST PC: 0x%016llX\n", (unsigned long long)host_pc);
-    fprintf(stderr, "HOST LR: 0x%016llX\n", (unsigned long long)host_lr);
+    fprintf(stderr, "HOST PC: 0x%016llX%s\n", (unsigned long long)host_pc,
+            describe_host_address(host_pc, pc_name, sizeof pc_name));
+    fprintf(stderr, "HOST LR: 0x%016llX%s\n", (unsigned long long)host_lr,
+            describe_host_address(host_lr, lr_name, sizeof lr_name));
     fprintf(stderr, "HOST SP: 0x%016llX\n", (unsigned long long)host_sp);
     if (xbox_HostAddressToGuest(fault, &guest_fault)) {
         fprintf(stderr, "VALID MAPPED GUEST ADDRESS: 0x%08X\n", guest_fault);
