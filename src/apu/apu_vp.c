@@ -220,6 +220,27 @@ void mcpx_apu_voice_events_report(void)
     if (!voice_ev_on()) return;
     fprintf(stderr, "  [VOICE-EV] %lu events; per second of output audio:\n",
             g_voice_ev_n);
+    /* Then the same events at full resolution.
+     *
+     * The per-second rows below answer "which second did something happen in",
+     * which was the right question while finding the window. It is the wrong
+     * question now: the ~300 ms silence at the music change sits between an
+     * off68 and an on68 that BOTH land in the same second, so the summary
+     * cannot say whether the gap is the guest's own pacing between stopping and
+     * restarting the voice, or our latency in starting it. The stamp is an
+     * output-sample index and always has been; only the report threw the
+     * precision away. Milliseconds here are milliseconds into the WAV capture,
+     * exactly, because both are counted from the same buffer. */
+    {
+        unsigned long i2, start2 = g_voice_ev_n > VOICE_EV_MAX
+                                 ? g_voice_ev_n - VOICE_EV_MAX : 0;
+        for (i2 = start2; i2 < g_voice_ev_n; i2++) {
+            const VoiceEv *e2 = &g_voice_ev[i2 % VOICE_EV_MAX];
+            fprintf(stderr, "  [VOICE-EV]   %10.3f ms  %-3s voice %u\n",
+                    (double)e2->at / 48.0,
+                    voice_ev_name[e2->kind < 3 ? e2->kind : 0], e2->handle);
+        }
+    }
     start = g_voice_ev_n > VOICE_EV_MAX ? g_voice_ev_n - VOICE_EV_MAX : 0;
     for (i = start; i < g_voice_ev_n; i++) {
         const VoiceEv *e = &g_voice_ev[i % VOICE_EV_MAX];
@@ -1154,6 +1175,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 typedef struct {
     unsigned long frames, off_frames;
     unsigned long short_calls, dry_calls, short_samples;
+    unsigned long silent_frames;      /* fetched samples were all ~zero */
+    double energy;                    /* sum |sample| of what the voice produced */
     float min_rate, max_rate, last_rate;
 } VoiceRate;
 static VoiceRate g_voice_rate[MCPX_HW_MAX_VOICES];
@@ -1366,7 +1389,7 @@ void mcpx_apu_voice_rate_report(void)
             tot ? "" : "   <- NO VOICE FRAMES: nothing is being processed");
     for (v = 0; v < MCPX_HW_MAX_VOICES && shown < 12; v++) {
         const VoiceRate *r = &g_voice_rate[v];
-        if (!r->off_frames && !r->short_calls) continue;
+        if (!r->frames) continue;
         shown++;
         /* A rate of R means we play R source samples per output sample; we
          * currently always play 1. So the source is consumed at 1/R times the
@@ -1376,9 +1399,11 @@ void mcpx_apu_voice_rate_report(void)
                 v, r->off_frames, r->frames, r->min_rate, r->max_rate,
                 r->last_rate, r->last_rate > 0.0f ? 48000.0f / r->last_rate : 0.0f);
         fprintf(stderr, "  [VOICE-RATE]        short=%lu (dry=%lu) losing %lu "
-                "samples = %.1f ms of output\n",
+                "samples = %.1f ms | energy=%.1f silent_frames=%lu/%lu%s\n",
                 r->short_calls, r->dry_calls, r->short_samples,
-                r->short_samples / 48.0);
+                r->short_samples / 48.0, r->energy, r->silent_frames, r->frames,
+                (r->frames && r->silent_frames == r->frames)
+                    ? "   <- PRODUCED NOTHING" : "");
     }
     fflush(stderr);
 }
@@ -1559,6 +1584,23 @@ static void voice_process(MCPXAPUState *d,
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
+    }
+
+    /* What this voice actually produced, before any mixbin routing or volume.
+     *
+     * "The voice ran" and "the voice made a sound" are different claims, and the
+     * gap at the music change turns on exactly that difference: the guest covers
+     * the change with a second voice, that voice is processed for the right
+     * number of frames, and the output is silent for the whole window anyway.
+     * This separates a voice that fetched zeros from one whose samples were fine
+     * and got lost downstream in the bins or the volume. */
+    if (voice_rate_on() && v < MCPX_HW_MAX_VOICES) {
+        double e = 0.0;
+        int si;
+        for (si = 0; si < NUM_SAMPLES_PER_FRAME; ++si)
+            e += fabs((double)samples[si][0]) + fabs((double)samples[si][1]);
+        g_voice_rate[v].energy += e;
+        if (e < 1e-6) g_voice_rate[v].silent_frames++;
     }
 
     /* VP monitor mix */
