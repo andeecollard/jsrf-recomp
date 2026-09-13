@@ -35,13 +35,67 @@ have the list.
 The ratchet is set at 76 and we are at 104, so this is also a standing test
 failure. It is the single highest-value target in this document.
 
-**Do:** for each of the 57 functions, identify the flag setter the lifter
-missed. Group by cause rather than fixing one at a time; `jnp`/`jp` at 21
-combined suggests one missing x87 idiom, and `loop`/`loope`/`loopne` at 13
-suggests the loop instructions are not modelled at all.
+### Audited 13 Sep -- the 104 split three ways
 
-**Done when:** the ratchet is lowered to the new count and the count is
-justified line by line, or driven to zero.
+**Reachability.** Only 10 of the 57 functions are called by anything at all:
+
+    called by something :  10 functions,  18 dead branches
+    no callers at all   :  47 functions,  86 dead branches
+
+The 86 are data swept as code -- the give-away is `loop`, `loopne` and `jnp`
+following `adc` at unaligned addresses like `sub_00102282`, a sequence no MSVC
+output contains. They are harmless and should be excluded from the ratchet
+rather than fixed, which makes the real number **18**.
+
+**The 10 reachable ones**, two of which the decompilation names:
+
+    sub_00130FD0  dead=5  callers=2
+    sub_00056990  dead=3  callers=3   CMission::runListenerCmds
+    sub_00015130  dead=2  callers=1   CSysChallengeRegionManager::calledDuringExec0Default
+    sub_001237A0  dead=2  callers=3
+    sub_000A0F10, sub_000B40F0, sub_000B4490, sub_000BA890,
+    sub_0014B536, sub_001609E0                      dead=1 each
+
+`CSysChallengeRegionManager::calledDuringExec0Default` is the sibling of
+`CSysDeathWarpManager::calledDuringExec0Default`, which is the function that
+caused the tutorial freeze, and it runs every frame.
+
+**The mechanism, which is the actual finding.** 33 of the 104 sit immediately
+after a LABEL:
+
+    _fa = MEM32(ebx + 0x10); _fb = 1;   /* cmp MEM32(ebx+0x10), 1 */
+
+    loc_00015275: ;
+    if (_flags /* jne: ... UNRESOLVED FLAGS, branch never taken */) goto ...;
+
+The `cmp` is the immediately preceding instruction and it sets `_fa`/`_fb`
+correctly. The lifter fuses `cmp`+`jcc` only when they are ADJACENT, and a label
+between them ends the basic block, so the fusion is abandoned and the condition
+falls back to `_flags` -- which, as this file's own docstring says, almost
+nothing ever writes. The result is a branch that is constant false.
+
+The caution is legitimate: `loc_00015275` has one incoming `goto` and
+`loc_000153A9` has seven, so the flags really do depend on which path arrived.
+Emitting `0` is still the worst available answer, because it silently commits to
+one path rather than admitting it does not know.
+
+**Do:** stop treating flags as a compile-time fusion and give them a runtime
+model. `_fa`/`_fb` are already function-scope and already assigned by the
+comparison, so the value at the label is correct at runtime whichever path
+arrived -- PROVIDED every flag setter on every incoming path writes them. Two
+routes, in increasing order of work and correctness:
+
+  1. have every flag-setting instruction write `_fa`/`_fb` plus a small kind
+     tag, then emit `CMP_NE(_fa, _fb)` and friends at the branch regardless of
+     adjacency; or
+  2. only fuse across a label when every predecessor block ends in a flag setter
+     -- a dataflow question the lifter already has the CFG to answer.
+
+Either way, an unresolved condition must become a loud failure, not a `0`.
+
+**Done when:** the 86 unreachable ones are excluded from the ratchet with the
+reachability evidence recorded, the 18 reachable ones are resolved, and the
+ratchet is lowered to match.
 
 ## Priority 2 — the instruction edge matrix
 
