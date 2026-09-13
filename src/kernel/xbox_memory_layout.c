@@ -2330,7 +2330,13 @@ const uint8_t *xbox_Nv2aRegisterMemory(void)
  * same reason the fence is: the device is allocated at runtime.
  */
 #define XBOX_MAX_FRAME_COUNTERS 4
-#define XBOX_FRAME_PERIOD_MS    16      /* ~60 Hz */
+/* NOTE: 16 ms is 62.5 Hz, not the 59.94 Hz of NTSC progressive -- the same
+ * error BRIDGE_VBLANK_PERIOD_US in kernel_bridge.c was corrected for. Left
+ * alone deliberately: xbox_Nv2aFrameCounter has no callers anywhere in the
+ * tree, so this is dead for JSRF and changing it would be changing code nothing
+ * runs. If it is ever wired up, fix it the way kernel_bridge.c does -- carry
+ * the sub-millisecond remainder -- rather than copying this literal. */
+#define XBOX_FRAME_PERIOD_MS    16      /* 62.5 Hz; see note above. Unused. */
 
 static struct {
     uint32_t device_ptr_va;
