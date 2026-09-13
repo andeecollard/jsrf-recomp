@@ -3421,6 +3421,19 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     printf("=== JSRF fresh-upstream first-fault diagnostic ===\n");
+    /* Which build this is, on stderr where the rest of the run's evidence
+     * goes. Not decoration: the harness scripts spent a session defaulting to
+     * the -O0 tree while every measurement was taken against another binary,
+     * and no log said so. A performance number from a log without this line
+     * predates the stamp and should be re-taken rather than trusted. */
+#ifdef JSRF_BUILD_OPT
+    fprintf(stderr, "  [BUILD] title compiled " JSRF_BUILD_OPT
+                    ", binary %s\n", argv[0]);
+#else
+    fprintf(stderr, "  [BUILD] title optimisation UNKNOWN (no JSRF_BUILD_OPT)"
+                    ", binary %s\n", argv[0]);
+#endif
+    fflush(stderr);
     printf("XBE: %s\nGame dir: %s\n", xbe_path, game_dir);
 
     if (!install_crash_handlers()) {

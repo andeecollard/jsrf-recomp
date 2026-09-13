@@ -18,6 +18,24 @@ set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 LIMIT="${1:-0}"
 BIN="${JSRF_BIN:-$ROOT/build-macos/jsrf-first-fault/build/jsrf_first_fault}"
+
+# Which binary, and is it current? Five scripts here defaulted to
+# build-macos/jsrf-first-fault/build for a session while every measurement was
+# taken against a different tree, so a run could silently be the old -O0 build.
+# The binary now prints its own optimisation level at startup ([BUILD]); this
+# checks the other half, that it is not simply stale.
+if [ ! -x "$BIN" ]; then
+    echo "no binary at $BIN" >&2
+    echo "  build it:  cmake -S diagnostics/jsrf_first_fault -B ${BIN%/*} && cmake --build ${BIN%/*} -j 6" >&2
+    exit 1
+fi
+NEWER=$(find "$ROOT/src" "$ROOT/diagnostics/jsrf_first_fault" -name '*.c' -o -name '*.h' -o -name '*.m' 2>/dev/null \
+        | grep -v ' 2\.c$' | while read -r f; do [ "$f" -nt "$BIN" ] && echo "$f"; done | head -3)
+if [ -n "$NEWER" ]; then
+    echo "WARNING: $BIN is older than these sources -- rebuild, or you are measuring the previous build:" >&2
+    echo "$NEWER" | sed 's/^/    /' >&2
+    [ -n "${JSRF_ALLOW_STALE:-}" ] || { echo "  (set JSRF_ALLOW_STALE=1 to run anyway)" >&2; exit 1; }
+fi
 SCRATCH="${PLAY_SCRATCH:-/tmp/jsrf-play}"
 STOCK="$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd"
 

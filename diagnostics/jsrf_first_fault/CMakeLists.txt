@@ -133,6 +133,13 @@ target_compile_definitions(jsrf_first_fault PRIVATE RECOMP_ICALL_FEEDBACK)
 # references a symbol nobody defined.
 target_compile_definitions(xbox_kernel PRIVATE RECOMP_ICALL_FEEDBACK)
 
+# Stamp the optimisation level into the binary. A log that does not say which
+# build produced it is a log two people can read as two different experiments,
+# and that has already happened here: five harness scripts defaulted to the
+# -O0 tree while every measurement was taken with JSRF_BIN pointed elsewhere.
+target_compile_definitions(jsrf_first_fault PRIVATE
+    JSRF_BUILD_OPT="${JSRF_OPT_LEVEL}")
+
 target_compile_options(jsrf_first_fault PRIVATE
     ${JSRF_OPT_LEVEL} -g -fno-omit-frame-pointer -w
     -include "${CMAKE_CURRENT_LIST_DIR}/guest_trace.h"
