@@ -41,6 +41,44 @@ Report the split, always.
 
 ## What is left, in priority order
 
+### 0. m_bFatal is set DURING GAMEPLAY, and that is the new frontier
+
+Found the moment the title stall stopped hiding it. A run that passes the
+tutorial and reaches `live=70` runs healthy for about six reports and then:
+
+    [ANIM-BLOCK] id=44 ... MOVED      <- still animating
+    [ANIM-BLOCK] id=45 ... MOVED
+    [JSRF-FATAL] m_bFatal=1           <- flips here
+    ... 11 further reports, both players `static runs=9`
+
+The poses are still moving when the flag flips, so the freeze is a CONSEQUENCE:
+`CActMan::Idle()` runs `IdleSub()` while +0x24 is clear and
+`readInput(); Sleep(0x10);` forever once it is set. The animation stopping is
+the idle loop, not a second animation bug, and chasing the pose here would be
+chasing a symptom for the second time in one day.
+
+`CActMan::Fatal()` at 0x00012770 is NOT called -- that was measured on 12 Sep --
+so one of the other writers of `[reg+0x24]` is responsible. There are **710**
+stores to that offset in .text and none writes an immediate 1, so it arrives
+through a register and static enumeration will not find it.
+
+**Approach, in order of cost:**
+
+  1. Characterise it first, because it is now cheap to reproduce. Is the flip
+     at a fixed TIME, a fixed number of frames, or tied to an action? Several
+     runs reaching gameplay and left alone will say, and "always at report 6"
+     versus "when the player does X" point at completely different writers.
+  2. `RECOMP_MEM_WATCH` on root+0x24 is the obvious instrument and is recorded
+     as not working: arming it needs a regeneration that SIGBUSes, and on a
+     working build it logs nothing, silently. Re-test it rather than trust the
+     note -- the tree has changed a great deal since -- but do not spend a day
+     on it.
+  3. Failing that, narrow the 710 by reachability the way everything else was
+     narrowed today, then by which candidates can hold the CActMan pointer, and
+     put O(1) counters on what survives. That is exactly how the +0xE6C writer
+     was found: two counters, one run, unambiguous.
+
+
 ### 1. The four reachable unimplemented instructions
 `stmxcsr`, `in`, `wbinvd`, `out` -- one each. `stmxcsr` is the interesting one:
 it writes the SSE control word to memory and emitting nothing leaves the
