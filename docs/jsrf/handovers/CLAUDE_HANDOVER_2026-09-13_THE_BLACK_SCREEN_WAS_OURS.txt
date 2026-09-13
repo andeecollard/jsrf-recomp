@@ -1,0 +1,133 @@
+JSRF HANDOVER -- THE BLACK SCREEN WAS A LOST `pop esi`, AND THE TITLE NOW
+                 REACHES THE CORN TUTORIAL UNATTENDED
+Date: 2026-09-13 (Europe/London), morning
+From: Claude.
+
+Supersedes CLAUDE_HANDOVER_2026-09-12_THE_IDLE_LOOP_FREEZE.txt on its central
+claim. That handover's task list was right and its diagnosis was not.
+
+
+0. THE ONE-LINE ANSWER
+======================
+Nothing ever set m_bFatal. CActMan::Idle's `this` was a CODE ADDRESS, because
+a switch dispatcher's arms were never translated and the arm's `pop esi` never
+ran. Three translator fixes later the title reaches the Corn tutorial with
+nobody at the machine, zero ABI violations, rendering and presenting.
+
+
+1. WHAT LANDED (three commits on main)
+======================================
+68569e8  RECOMP_PAD_SCRIPT -- a timed press schedule.
+    "12:START 13.5:START 15:A", or @file. t is measured from xbox_InputInit,
+    not the first poll. MERGES with a live controller rather than replacing it,
+    and reports port 0 connected with no hardware attached.
+    run_scripted.sh drives it; JSRF_BIN selects the binary.
+
+b8abfea  RECOMP_SEQ_TRACE -- the title's own top-level state, by name.
+    CActSequence::m_dwNextMethod at +0x48, dispatched through the 64-entry
+    table at guest 0x0020D2B8. All 64 names come from the decompilation and are
+    CHECKED against the live table on the first poll; a mismatch suppresses the
+    names rather than lying. One host thread, 100 Hz, prints on change only.
+
+d013f03  A function must contain its own switch arms.
+    Two defects, both stopping a dispatcher absorbing its arms. See section 3.
+
+
+2. THE FREEZE, AND WHY 12 SEP GOT IT WRONG
+==========================================
+12 Sep concluded "so m_bFatal is set" from /usr/bin/sample finding the guest in
+CActMan::Idle's readInput/Sleep arm. The sample was right. The inference was
+not: the arm runs when MEM32(esi+0x24) is nonzero, and esi was not the object.
+
+Probes on BOTH arms, the healthy one as the positive control:
+
+    00013F97 this=040D3A70 field=00000000 calls=2792   healthy
+    00013FA0 this=00013B24 field=6AF88B00 calls=6385   freeze
+
+0x00013B24 is the return address pushed for the call at 0x00013B1F. With
+RECOMP_ABI_CHECK armed the cascade falls out in one run, innermost first:
+
+    [ABI/I] sub_0006D770: esp(epilogue never ran)
+    [ABI/C] sub_00011070: esi 0492E2F0 -> 0001108A
+    [ABI/C] sub_000123E0: esi 040D3A70 -> 000124C3
+    [ABI/C] sub_00013A80: esi 040D3A70 -> 00013B24
+
+THE LESSON, and it is the same one as 12 Sep's section 4: a counter that says
+"the flag is set" is only as good as the pointer it was read through. The fix
+was to probe both branches and record `this`, not the field.
+
+
+3. THE TRANSLATOR DEFECTS
+=========================
+(a) LATER ARMS OF A CARVED RUN. 289f21f drops a switch's first arm. That alone
+    leaves the dispatcher ending at the jump, so arm 1 is owned by arm 0, arm 2
+    by arm 1, and the dispatch is outside every one of those owners. New test:
+    walking back from the arm to the function holding the dispatch, everything
+    crossed is an entry of the SAME table. Asked in the classifier AND in the
+    interior gate -- a seed the gate turns away is never classified.
+        switch_arm drops 533 -> 1333; carves 35 -> 17, all 17 16-aligned.
+
+(b) STALE ALIAS EXTENTS. Every pass recording an alias extent runs before
+    _pass_demote_interior_seeds rebuilds the function set. A body is
+    re-measured only when its end is PROVABLY wrong: it contains a
+    `jmp [reg*4+table]`, the table resolves, and arms lie outside the body
+    dispatching them. A function cannot end at its own switch and exclude its
+    own cases -- and while it does, _analyze_switch_table refuses the table
+    (it needs func_start <= arm < func_end), so the arms are never translated.
+
+THREE THINGS I GOT WRONG IN (b), each settled by measurement:
+  * The clamp counted ALIASES as boundaries. An alias is an alternate ENTRY
+    into a body, not a boundary -- _build_alias_entries overlaps them
+    deliberately. Cost: 198 of 200 dispatches lost their arms.
+  * With no clamp at all the walk ran away, exactly as 289f21f documents:
+    49 of 124 bodies crossed a real start and became overlapping duplicates.
+  * The trigger looked only at the body's LAST instruction. A body cut AFTER
+    its dispatch and still short of its arms is skipped entirely. That left
+    156 of 161 cases untouched, sub_00114A80 among them.
+
+
+4. WHERE THE TITLE IS NOW
+=========================
+Unattended, one schedule, no human:
+
+    logos -> title -> New Game -> Corn tutorial (live=61), HELD for 250 s
+    ABI violations reaching the tutorial:  4 -> 0
+    dispatches whose arms fall outside:  276 -> 154
+    framebuffer: presenting ~202,000 nonzero, changing
+    +7930/+7934 = FFFFFFFF (in-tutorial marker), m_bFatal=0, not paused
+
+sub_0006D770  22 -> 488 bytes    sub_0007E550  37 -> 314
+sub_000F8B10  68 -> 1408         sub_00114A80  692 -> 1296
+
+CONTROL PRESERVED, read-only, with CONTROL_README.txt:
+    gen.freeze-repro/          pre-regeneration tree
+    jsrf_first_fault.CONTROL   its binary
+    build-ab/                  its build dir
+
+
+5. THE OPEN ITEM
+================
+The tutorial does not advance. It holds live=61 (cutscene) and never reaches
+65 (gameplay). On screen the prompt reads "Press the" and stops; the strings in
+the XBE are COMPLETE ('Press the A Button!' at 0x001D2758), so the truncation
+is in rendering or in a progressive reveal, not the data. Dialogue DOES advance
+-- a scripted A every 8 s walked through several lines -- so input reaches the
+tutorial. 13,876 nonneutral polls with a human on the pad did not move it.
+
+NEXT MEASUREMENT, and it is the one that was missing all session:
+JSRF_STARTUP_ABI_CHECK arms ONLY recomp_0000.c. Every violation seen so far in
+other chunks was an INDIRECT call, checked by the armed kernel layer. DIRECT
+call clobbers outside chunk 0 have been invisible, and the tutorial runs there.
+Build with JSRF_ABI_CHECK_ALL=ON before anything else.
+
+
+6. RULES PAID FOR THIS SESSION
+==============================
+  * A predicate over a function body must consider the WHOLE body. I reasoned
+    from the last instruction twice and was wrong twice.
+  * An A/B is only an A/B if one variable moved. I attributed a dead title
+    screen to the gen tree when the controller had been unplugged at the same
+    moment; the correlation held over five runs and was still a coincidence.
+  * "Only real starts clamp" is not a heuristic, it is the definition of an
+    alias. Deriving it from the concept would have been faster than the 198/200
+    measurement that eventually forced it.
