@@ -84,6 +84,41 @@ None has a known symptom; all are real differences.
 float-cast UB directly rather than by reading code. Cheap, and it covers classes
 nobody has thought to look for.
 
+## The title stall is SOLVED, and it was the build tree's location
+
+Resolved the same day this was written, so the section below is kept only for
+the reasoning that led here.
+
+`build-macos` was inside iCloud Drive. Every regeneration and link handed
+`cloudd`, `bird`, `fileproviderd` and Spotlight four gigabytes of freshly
+written files, and the contention is what starved the guest. The tree now lives
+at `/Users/andrewcollard/jsrf-build` with `build-macos` a symlink to it -- a
+rename on the same APFS volume, so nothing was copied and every hardcoded path
+still resolves.
+
+    before:  logos end 15.5 - 31.3 s, bimodal with a clean gap, ~50% stall
+    after:   7 runs, 7 reached the tutorial
+             22.69 22.73 22.68 22.67 22.68 22.87 (and one at 17.40)
+
+Six of seven within 0.2 s of each other, against a 16-second range before. A
+variance collapse like that is the signature of removing a contending process,
+not of a lucky sample -- which is what makes seven runs enough here.
+
+It also retires the guesswork in the earlier sections: boot time DID predict the
+stall, but boot time was itself the symptom. Two hypotheses died on the way and
+are worth not re-running: there is no extra step in the slow path (identical
+file, kernel, heap, GPU and notify counts, uniformly 1.6x slower), and it is not
+process priority (a `nice 5` run booted in 22.3 s).
+
+Do not "tidy" the symlink away, and do not move the exclusion into the tracked
+`.gitignore`: that file has `build-macos/`, a directory pattern that does not
+match a symlink, and it is upstream's. The exclusion lives in the repo-local
+exclude file, which for this worktree is the COMMON dir's -- find it with
+`git rev-parse --git-common-dir`.
+
+Only the build output moved. The repo source is still in iCloud, and that was
+evidently enough.
+
 ## Verification is the bottleneck now, not the changes
 
 Each translator change needs a regeneration (~40 s), a build (~4 min) and a
