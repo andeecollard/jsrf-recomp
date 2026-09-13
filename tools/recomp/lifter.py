@@ -1186,6 +1186,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1883,6 +1885,23 @@ class Lifter:
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
         return out
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """RCL/RCR: a 33-bit rotate, the carry flag being the extra bit.
+
+        These used to fall through to the TODO comment, which is a silent
+        no-op. `shr high, 1; rcr low, 1` is MSVC's 64-bit right shift by one,
+        and JSRF reaches four helpers built that way -- so the low half of
+        every such shift was left unshifted.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        bits = (_operand_width(ops[0]) or 4) * 8
+        func = "RECOMP_RCL" if m == "rcl" else "RECOMP_RCR"
+        return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt}, &_cf, {bits})")
+                + f" /* {m} ({bits}-bit) */"]
 
     def _lift_rotate(self, insn, ops, m):
         if len(ops) < 2:

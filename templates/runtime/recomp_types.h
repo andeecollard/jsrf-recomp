@@ -865,6 +865,45 @@ static inline uint32_t ROR32(uint32_t val, int n) {
     return (val >> n) | (val << (32 - n));
 }
 
+/* Rotate THROUGH CARRY, at the operand's own width.
+ *
+ * These are a rotate of WIDTH+1 bits, not WIDTH: the carry flag is the extra
+ * bit. So a byte rcl is a 9-bit rotate, a word one 17-bit and a dword one
+ * 33-bit, and the count is reduced modulo that -- which is why they cannot be
+ * expressed through ROL32/ROR32, and why one 32-bit helper cannot serve all
+ * three widths.
+ *
+ * `shr high, 1` followed by `rcr low, 1` is how MSVC shifts a 64-bit value
+ * right by one, and JSRF reaches four helpers built that way. While rcr was
+ * emitted as a no-op comment the low word was never shifted at all, so the
+ * shift returned a number half of which had not moved.
+ *
+ * x86 masks the count to 5 bits BEFORE the modulo, so `rcl al, 32` is a count
+ * of 0 and not of 32 % 9. A count of 0 leaves value and flag untouched. */
+static inline uint32_t RECOMP_RCR(uint32_t val, int n, int *cf, int bits) {
+    uint32_t mask = (bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    val &= mask;
+    n = (n & 31) % (bits + 1);
+    while (n--) {
+        int lsb = (int)(val & 1u);
+        val = ((val >> 1) | ((uint32_t)(*cf & 1) << (bits - 1))) & mask;
+        *cf = lsb;
+    }
+    return val;
+}
+
+static inline uint32_t RECOMP_RCL(uint32_t val, int n, int *cf, int bits) {
+    uint32_t mask = (bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    val &= mask;
+    n = (n & 31) % (bits + 1);
+    while (n--) {
+        int msb = (int)((val >> (bits - 1)) & 1u);
+        val = ((val << 1) | (uint32_t)(*cf & 1)) & mask;
+        *cf = msb;
+    }
+    return val;
+}
+
 /* ================================================================
  * Sign/zero extension
  * ================================================================ */

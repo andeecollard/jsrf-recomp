@@ -784,7 +784,10 @@ class FunctionTranslator:
         last_setter = None
         for insn in instructions:
             m = insn.mnemonic
-            if m in ("adc", "sbb", "stc", "clc", "cmc"):
+            # rcl/rcr rotate THROUGH the carry, so they both read and write
+            # it -- a function whose only carry user is an rcr still needs _cf
+            # declared, or the emitted RCR32(..., &_cf) will not compile.
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
                 return True
             cc = None
             if m.startswith("j") and len(m) > 1:
