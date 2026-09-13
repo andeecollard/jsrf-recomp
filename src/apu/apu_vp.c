@@ -1129,6 +1129,106 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
+/* What playback rate each voice actually asks for.
+ *
+ * voice_resample() used to take a rate and discard it, playing one source
+ * sample per output sample whatever the pitch register said. It resamples now;
+ * this stayed because it is what says WHICH voices depend on that, and it is
+ * the check that catches a voice whose rate we still handle badly. rate is
+ * 1/2^(pitch/4096), so rate == 1.0 exactly when the pitch register is zero.
+ *
+ * Whether that MATTERS is an empirical question and this is how to settle it
+ * rather than argue it. If every voice the title starts asks for 1.0, the
+ * missing resampler costs nothing and is not the audio defect. If a voice asks
+ * for anything else, it is being played at the wrong speed, and a streaming
+ * voice played at the wrong speed drains its buffer at the wrong speed -- which
+ * is a mechanism that produces exactly what we see: fine in steady state,
+ * wrong at the moment a stream is switched or refilled.
+ *
+ * Per voice rather than in aggregate, because "some voice somewhere had a
+ * non-unit rate" cannot be acted on. Counted in frames, with min and max, so a
+ * voice that is briefly bent (a pitch envelope) is distinguishable from one
+ * playing at a flat wrong rate for its whole life.
+ *
+ * Opt-in (RECOMP_VOICE_RATES), read-only, one float compare per voice frame. */
+typedef struct {
+    unsigned long frames, off_frames;
+    unsigned long short_calls, dry_calls, short_samples;
+    float min_rate, max_rate, last_rate;
+} VoiceRate;
+static VoiceRate g_voice_rate[MCPX_HW_MAX_VOICES];
+
+static int voice_rate_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VOICE_RATES") != NULL;
+    return on;
+}
+
+static void voice_rate_note(uint16_t v, float rate)
+{
+    VoiceRate *r;
+    if (!voice_rate_on() || v >= MCPX_HW_MAX_VOICES) return;
+    r = &g_voice_rate[v];
+    if (!r->frames) { r->min_rate = rate; r->max_rate = rate; }
+    if (rate < r->min_rate) r->min_rate = rate;
+    if (rate > r->max_rate) r->max_rate = rate;
+    r->last_rate = rate;
+    r->frames++;
+    /* 1e-6 rather than ==: rate comes out of powf, and a pitch of exactly 0
+     * should give exactly 1.0f but nothing here depends on that being bit
+     * exact. Anything this close plays back indistinguishably. */
+    if (rate < 1.0f - 1e-6f || rate > 1.0f + 1e-6f) r->off_frames++;
+}
+
+/* A voice that could not fill the frame it was asked for. The caller breaks out
+ * of its fill loop on a short return and leaves the remainder of the frame
+ * buffer as it found it, so a short call is a hole in the output -- which is
+ * exactly the defect class the delta metric is blind to, because a hole that
+ * opens and closes quietly produces no large sample-to-sample step.
+ *
+ * `dry` is the subset where nothing at all came back: the voice was active and
+ * had no data, which is the guest failing to refill a stream rather than
+ * anything the resampler does. Separating the two is the point -- one is ours
+ * and one is upstream of us. */
+static void voice_short_note(uint16_t v, int produced, int requested)
+{
+    VoiceRate *r;
+    if (!voice_rate_on() || v >= MCPX_HW_MAX_VOICES) return;
+    if (produced >= requested) return;
+    r = &g_voice_rate[v];
+    r->short_calls++;
+    r->short_samples += (unsigned long)(requested - produced);
+    if (produced == 0) r->dry_calls++;
+}
+
+/* A starved voice contributes silence, never stack residue.
+ *
+ * voice_process declares `float samples[NUM_SAMPLES_PER_FRAME][2]` as a plain
+ * uninitialised local and then mixes ALL of it into the mixbins -- the mix loop
+ * does not know how many entries were actually produced. So any path that fills
+ * fewer than it was asked for mixes whatever was on the stack into the output:
+ * usually the previous voice's samples, which is audible as a fragment of the
+ * wrong sound rather than as a gap.
+ *
+ * xemu has the identical caller, `if (count < 0) break;`, and does not have the
+ * bug, because its resampler's callback guarantees a full frame:
+ *
+ *     if (sample_count < NUM_SAMPLES_PER_FRAME) {
+ *         // Starvation causes SRC hang on repeated calls. Provide silence.
+ *         memset(&filter->resample_buf[2*sample_count], 0, ...);
+ *         sample_count = NUM_SAMPLES_PER_FRAME;
+ *     }
+ *
+ * (hw/xbox/mcpx/apu/vp/vp.c, voice_resample_callback). So the guarantee belongs
+ * here, at the bottom of the resampler, not in the caller -- which is where
+ * xemu put it and why its version of this loop is safe. */
+static void voice_fill_silence(float samples[][2], int from, int to)
+{
+    if (from < to)
+        memset(&samples[from], 0, (size_t)(to - from) * sizeof samples[0]);
+}
+
 /* Resample a voice to the output rate.
  *
  * This used to take `rate` and discard it -- one source sample per output
@@ -1193,7 +1293,9 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
             if (count == 0) return -1;
             sample_count += count;
         }
-        return sample_count;
+        voice_short_note(v, sample_count, requested_num);
+        voice_fill_silence(samples, sample_count, requested_num);
+        return requested_num;
     }
 
     rs = &g_voice_rs[v];
@@ -1207,11 +1309,17 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
         while (rs->ncarry < 2) {
             int count;
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
-                return produced;
+                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                voice_short_note(v, produced, requested_num);
+                voice_fill_silence(samples, produced, requested_num);
+                return requested_num;
+            }
             count = voice_get_samples(d, v, &rs->carry[rs->ncarry], 1);
-            if (count < 0) return produced;
-            if (count == 0) return produced ? produced : -1;
+            if (count <= 0) {
+                voice_short_note(v, produced, requested_num);
+                voice_fill_silence(samples, produced, requested_num);
+                return requested_num;
+            }
             rs->ncarry += count;
         }
 
@@ -1229,58 +1337,8 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
             rs->ncarry--;
         }
     }
+    voice_short_note(v, produced, requested_num);
     return produced;
-}
-
-/* What playback rate each voice actually asks for.
- *
- * voice_resample() used to take a rate and discard it, playing one source
- * sample per output sample whatever the pitch register said. It resamples now;
- * this stayed because it is what says WHICH voices depend on that, and it is
- * the check that catches a voice whose rate we still handle badly. rate is
- * 1/2^(pitch/4096), so rate == 1.0 exactly when the pitch register is zero.
- *
- * Whether that MATTERS is an empirical question and this is how to settle it
- * rather than argue it. If every voice the title starts asks for 1.0, the
- * missing resampler costs nothing and is not the audio defect. If a voice asks
- * for anything else, it is being played at the wrong speed, and a streaming
- * voice played at the wrong speed drains its buffer at the wrong speed -- which
- * is a mechanism that produces exactly what we see: fine in steady state,
- * wrong at the moment a stream is switched or refilled.
- *
- * Per voice rather than in aggregate, because "some voice somewhere had a
- * non-unit rate" cannot be acted on. Counted in frames, with min and max, so a
- * voice that is briefly bent (a pitch envelope) is distinguishable from one
- * playing at a flat wrong rate for its whole life.
- *
- * Opt-in (RECOMP_VOICE_RATES), read-only, one float compare per voice frame. */
-typedef struct {
-    unsigned long frames, off_frames;
-    float min_rate, max_rate, last_rate;
-} VoiceRate;
-static VoiceRate g_voice_rate[MCPX_HW_MAX_VOICES];
-
-static int voice_rate_on(void)
-{
-    static int on = -1;
-    if (on < 0) on = getenv("RECOMP_VOICE_RATES") != NULL;
-    return on;
-}
-
-static void voice_rate_note(uint16_t v, float rate)
-{
-    VoiceRate *r;
-    if (!voice_rate_on() || v >= MCPX_HW_MAX_VOICES) return;
-    r = &g_voice_rate[v];
-    if (!r->frames) { r->min_rate = rate; r->max_rate = rate; }
-    if (rate < r->min_rate) r->min_rate = rate;
-    if (rate > r->max_rate) r->max_rate = rate;
-    r->last_rate = rate;
-    r->frames++;
-    /* 1e-6 rather than ==: rate comes out of powf, and a pitch of exactly 0
-     * should give exactly 1.0f but nothing here depends on that being bit
-     * exact. Anything this close plays back indistinguishably. */
-    if (rate < 1.0f - 1e-6f || rate > 1.0f + 1e-6f) r->off_frames++;
 }
 
 void mcpx_apu_voice_rate_report(void)
@@ -1299,7 +1357,7 @@ void mcpx_apu_voice_rate_report(void)
             tot ? "" : "   <- NO VOICE FRAMES: nothing is being processed");
     for (v = 0; v < MCPX_HW_MAX_VOICES && shown < 12; v++) {
         const VoiceRate *r = &g_voice_rate[v];
-        if (!r->off_frames) continue;
+        if (!r->off_frames && !r->short_calls) continue;
         shown++;
         /* A rate of R means we play R source samples per output sample; we
          * currently always play 1. So the source is consumed at 1/R times the
@@ -1308,6 +1366,10 @@ void mcpx_apu_voice_rate_report(void)
                 "rate min=%.4f max=%.4f last=%.4f  (source ~%.0f Hz -> 48000)\n",
                 v, r->off_frames, r->frames, r->min_rate, r->max_rate,
                 r->last_rate, r->last_rate > 0.0f ? 48000.0f / r->last_rate : 0.0f);
+        fprintf(stderr, "  [VOICE-RATE]        short=%lu (dry=%lu) losing %lu "
+                "samples = %.1f ms of output\n",
+                r->short_calls, r->dry_calls, r->short_samples,
+                r->short_samples / 48.0);
     }
     fflush(stderr);
 }
