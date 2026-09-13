@@ -27,6 +27,13 @@ typedef struct NV2ATextureCopy {
     uint32_t stencil_func, stencil_fail, stencil_zfail, stencil_zpass;
     uint32_t target_handle, target_offset, target_pitch, target_bpp;
     uint32_t clip_x, clip_y, clip_w, clip_h;
+    /* The guest's own depth range and what it wants done outside it.
+     * NV097_SET_CLIP_MIN/MAX (0x394/0x398) are IEEE floats in the same
+     * 0..16777215 units as oPos.z; ZMIN_MAX_CONTROL (0x1D78) selects
+     * discard (CULL) or saturate (CLAMP) outside them. Measured in JSRF:
+     * 0 .. 16777215 with CULL. */
+    float z_clip_min, z_clip_max;
+    uint32_t z_cull;
 } NV2ATextureCopy;
 
 const char *nv2a_texture_copy_prepare_image(const uint32_t methods[2048], unsigned unit, NV2ATextureCopy *state);
@@ -56,5 +63,12 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *state,
  * in prepare_texture_copy consults this, so a factor cannot be accepted
  * that a sink would then silently substitute for. */
 int nv2a_texture_copy_blend_factor_supported(uint32_t factor);
+
+/* Screen-space winding is inverted for a triangle with an ODD number of
+ * vertices behind the camera. The guest perspective-divided these positions
+ * itself, and dividing by a negative w negates x and y, so the sign of the
+ * screen area is the opposite of the true orientation. Pass the three w
+ * values; returns non-zero when the facing test must be flipped. */
+int nv2a_texture_copy_winding_flipped(float wa, float wb, float wc);
 
 #endif

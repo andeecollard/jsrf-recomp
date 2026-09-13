@@ -144,13 +144,19 @@ static NSString *const shader =
  "using namespace metal;\n"
  "struct Vertex { float4 p,d0,d1,t0,t1,t2,t3; };\n"
  "struct Params { uint width,height,dither,untextured,combiner_count,texture_mask,add_specular,alpha_test,alpha_ref,modulate,blend,blend_src,blend_dst,depth_test,depth_write,depth_func;"
+ "  uint z_cull; float z_lo,z_hi;"
  " uint stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;"
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
  " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8]; };\n"
  "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; };\n"
  "struct Frag { float4 color [[color(0)]]; uint stencil [[color(1)]]; };\n"
  "vertex Out vs(uint id [[vertex_id]], const device Vertex *v [[buffer(0)]], constant Params &s [[buffer(1)]],const device uint*indices [[buffer(2)]]) {\n"
- " Vertex x=v[indices[id]];Out o;float4 p=x.p;float z=clamp(p.z,0.0f,16777215.0f)/16777215.0f;"
+ /* No clamp here. The guest's z range and its out-of-range policy belong to
+  * the fragment stage (see below); clamping before the perspective
+  * multiply also corrupts the endpoints the hardware clipper interpolates
+  * from, which is what made straddling ground polygons wrong even once
+  * their winding was fixed. xemu does the same: normalise, never clamp. */
+ " Vertex x=v[indices[id]];Out o;float4 p=x.p;float z=p.z/16777215.0f;"
  " o.p=float4((p.x/s.width*2-1)*p.w,(1-p.y/s.height*2)*p.w,z*p.w,p.w);\n"
  " o.d0=x.d0;o.d1=x.d1;o.t0=x.t0;o.t1=x.t1;o.t2=x.t2;o.t3=x.t3;return o; }\n"
  "uint morton(uint x,uint y,uint w,uint h) { uint index=0,bit=0;"
@@ -222,12 +228,19 @@ static NSString *const shader =
  " if(da)r[da][k]=clamp(ab[k],-1.0f,1.0f);if(ds)r[ds][k]=clamp(ab[k]+cd[k],-1.0f,1.0f);}}"
  " c=clamp(r[12]+(s.add_specular?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
  " else if(!s.untextured){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(s.modulate?c.a:1);if(s.modulate)c.rgb*=max(float3(0),d0.rgb);}"
+ /* The guest's depth-range policy, per fragment, in guest z units.
+  * NV097_SET_ZMIN_MAX_CONTROL selects discard (CULL) or saturate (CLAMP)
+  * outside SET_CLIP_MIN/MAX. JSRF asks for CULL. */
+ " float zg=i.p.z*16777215.0f;"
+ " if(s.z_cull){ if(zg<s.z_lo||zg>s.z_hi) return o; }"
+ " else zg=clamp(zg,s.z_lo,s.z_hi);"
+ " float zn=clamp(zg/16777215.0f,0.0f,1.0f);"
  " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref)return o;"
  " uint mask=s.stencil_func_mask&255;if(s.stencil_test&&!cmpu(s.stencil_func,s.stencil_ref&mask,stencil&mask)){o.stencil=stupd(stencil,s.stencil_fail,s);return o;}"
- " if(s.depth_test&&!cmpf(s.depth_func,i.p.z,dst.a)){if(s.stencil_test)o.stencil=stupd(stencil,s.stencil_zfail,s);return o;}"
+ " if(s.depth_test&&!cmpf(s.depth_func,zn,dst.a)){if(s.stencil_test)o.stencil=stupd(stencil,s.stencil_zfail,s);return o;}"
  " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
- " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}o.color=float4(c.rgb,s.depth_write?i.p.z:dst.a);if(s.stencil_test)o.stencil=stupd(stencil,s.stencil_zpass,s);return o;}\n";
+ " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}o.color=float4(c.rgb,s.depth_write?zn:dst.a);if(s.stencil_test)o.stencil=stupd(stencil,s.stencil_zpass,s);return o;}\n";
 
 static int initialize(void)
 {
@@ -334,6 +347,7 @@ void nv2a_metal_report(void)
 
 typedef struct{float p[4],d0[4],d1[4],t[4][4];}Vertex;
 typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_mask,add_specular,alpha_test,alpha_ref,modulate,blend,blend_src,blend_dst,depth_test,depth_write,depth_func;
+    uint32_t z_cull; float z_lo,z_hi;
     uint32_t stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;
     uint32_t tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4];
     float lod_bias[4];
@@ -412,7 +426,9 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
                         &&q[k][1]>=0&&q[k][1]<=(float)s->clip_h))on=0;
                     if(q[k][3]<0)wn=1;}
                 if(on&&!wn)++audit_deg_lost;}}}
-    return;}int front=(ar>0)==(s->front_cw!=0);
+    return;}
+ int front=((ar>0)^nv2a_texture_copy_winding_flipped(v[a][0][3],v[b][0][3],v[c][0][3]))
+           ==(s->front_cw!=0);
  int culled=s->cull_face==0x408||(s->cull_face==0x404&&front)||(s->cull_face==0x405&&!front);
  if(audit){const float*pa=v[a][0],*pb=v[b][0],*pc=v[c][0];
     int neg=(pa[3]<0)+(pb[3]<0)+(pc[3]<0);
@@ -484,7 +500,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;}
   MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;
   id<MTLCommandBuffer>command=[queue commandBuffer];id<MTLRenderCommandEncoder>encoder=[command renderCommandEncoderWithDescriptor:pass];if(!command||!encoder)return reject("command-encoder");
-  Params p={0};p.width=s->clip_w;p.height=s->clip_h;p.dither=s->dither;p.untextured=s->untextured;p.combiner_count=s->combiner_count;p.texture_mask=s->texture_mask;p.add_specular=s->add_specular;p.alpha_test=s->alpha_test;p.alpha_ref=s->alpha_ref;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
+  Params p={0};p.width=s->clip_w;p.height=s->clip_h;p.dither=s->dither;p.untextured=s->untextured;p.combiner_count=s->combiner_count;p.texture_mask=s->texture_mask;p.add_specular=s->add_specular;p.alpha_test=s->alpha_test;p.alpha_ref=s->alpha_ref;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;{static int legacy=-1;if(legacy<0)legacy=getenv("RECOMP_LEGACY_ZCLAMP")?1:0;
+   p.z_cull=legacy?0u:s->z_cull;}p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:
@@ -517,7 +534,17 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * whole-draw loss was elsewhere: a DST_COLOR/ZERO multiply blend refused by
    * prepare_texture_copy, which deleted the batch outright. See the comment on
    * blend_factor in nv2a_texture_copy.c. */
-  {static int clamp_z=-1;if(clamp_z<0)clamp_z=getenv("RECOMP_METAL_DEPTH_CLAMP")?1:0;
-   if(clamp_z)[encoder setDepthClipMode:MTLDepthClipModeClamp];}
+  /* ALWAYS clamp, never clip. The fragment shader now applies the guest's
+   * own SET_CLIP_MIN/MAX and ZMIN_MAX_CONTROL policy, so hardware z
+   * clipping would pre-empt a decision that is no longer ours to make --
+   * and would discard the straddling ground polygons before the shader
+   * could judge them. This is what xemu does unconditionally
+   * (glEnable(GL_DEPTH_CLAMP) / depthClampEnable = VK_TRUE).
+   *
+   * Behind-camera geometry is NOT resurrected by this: a vertex with w<0
+   * cannot satisfy -w<=x<=w, so the side planes still remove it.
+   * RECOMP_LEGACY_ZCLAMP=1 forces the old saturate-instead-of-discard
+   * policy, to A/B the change in one binary. */
+  [encoder setDepthClipMode:MTLDepthClipModeClamp];
   [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:0 atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:0 atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];[encoder endEncoding];[command commit];last_command=command;surface_dirty=1;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
 }

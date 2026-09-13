@@ -62,6 +62,21 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     }
     if (M(0x300) && (M(0x300)!=1 || M(0x33c)!=0x204 || M(0x340)>255)) return "alpha test";
     s->alpha_test=M(0x300); s->alpha_ref=M(0x340);
+    /* Depth range and policy, straight from the guest rather than assumed.
+     * ZCLAMP_EN is a FOUR-BIT field at 0xF0, not bit 0 -- JSRF writes 1,
+     * which is ZCLAMP_EN_CULL (0), i.e. discard outside the range. Reading
+     * it as bit 0 gives CLAMP and the opposite behaviour. */
+    { union { uint32_t u; float f; } lo, hi;
+      lo.u = M(0x394); hi.u = M(0x398);
+      /* An unwritten method reads 0 here, and 0 is a legitimate minimum but
+       * not a legitimate maximum -- fall back to the Z24 full range rather
+       * than collapse the depth range to nothing. */
+      s->z_clip_min = isfinite(lo.f) ? lo.f : 0.0f;
+      s->z_clip_max = (hi.u && isfinite(hi.f)) ? hi.f : 16777215.0f;
+      if (!(s->z_clip_max > s->z_clip_min)) {
+          s->z_clip_min = 0.0f; s->z_clip_max = 16777215.0f;
+      }
+      s->z_cull = (((M(0x1d78) & 0xF0u) >> 4) == 0u); }
     if (M(0x304)) {
         uint32_t src=M(0x344),dst=M(0x348);
         /* Every distinct blend combination the title actually asks for, logged
@@ -470,6 +485,32 @@ static void blend_factor(uint32_t factor,const float src[4],const float dst[4],f
     default:    for(k=0;k<4;++k) out[k]=0;         break;
     }
 }
+/* True when the screen-space winding of a triangle is the reverse of its true
+ * orientation, because an odd number of its vertices sit behind the camera.
+ *
+ * area() runs on positions the GUEST already perspective-divided. The true
+ * orientation is the sign of the 3x3 determinant of the homogeneous
+ * coordinates, and writing x_clip = ndc_x * w that determinant factors exactly
+ * into (screen area) * w0*w1*w2 -- so the correct test is the screen area
+ * times sign(w0*w1*w2). Measured over random clip-space triangles: with
+ * exactly one negative w the uncorrected test is wrong EVERY time, not
+ * sometimes.
+ *
+ * Counted as a parity of sign bits rather than an actual product, because
+ * w reaches 1e31 here and the product overflows to infinity. w == 0 counts as
+ * positive, which leaves the existing behaviour for a vertex exactly on the
+ * camera plane.
+ *
+ * This does NOT resurrect geometry behind the camera. A vertex with w < 0
+ * cannot satisfy -w <= x <= w (summing the two gives 2w >= 0), so the GPU's
+ * homogeneous clipper removes it: measured, 0 of 20000 random all-negative
+ * triangles survive. Correcting the sign only rescues triangles that STRADDLE
+ * the camera plane -- the large near ground quads whose loss reads as a black
+ * floor -- and those are clipped to their visible part before rasterising. */
+int nv2a_texture_copy_winding_flipped(float wa, float wb, float wc)
+{
+    return (((wa < 0) + (wb < 0) + (wc < 0)) & 1) != 0;
+}
 /* The set blend_factor implements, and therefore the set prepare_texture_copy
  * may accept. One place, so the three sinks cannot drift apart. */
 int nv2a_texture_copy_blend_factor_supported(uint32_t f)
@@ -529,7 +570,13 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
     float area=edge(a[0],b[0],c[0][0],c[0][1]);
     if (!isfinite(area)) return 0;
     if (area==0) return 1;
-    int front=(area>0)==(s->front_cw!=0); /* framebuffer Y increases downwards */
+    /* framebuffer Y increases downwards; the w parity corrects a winding
+     * the guest's own perspective divide reversed. NOTE: this path also
+     * rejects any vertex with w <= 0 outright before reaching here, so a
+     * straddling triangle is still lost on the software fallback -- that
+     * needs real near-plane clipping, which the GPU sinks get for free. */
+    int front=((area>0)^nv2a_texture_copy_winding_flipped(v[0][0][3],v[1][0][3],v[2][0][3]))
+              ==(s->front_cw!=0);
     if (s->cull_face==0x408 || (s->cull_face==0x404 && front)
             || (s->cull_face==0x405 && !front)) return 1;
     float left=(float)s->clip_x,right=(float)(s->clip_x+s->clip_w);
