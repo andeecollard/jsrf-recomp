@@ -66,6 +66,26 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+/* Per-voice resampler state.
+ *
+ * `phase` is the fractional position between carry[0] and carry[1], and
+ * `carry` holds source samples already fetched from the voice but not yet
+ * fully consumed. Both have to persist across calls: a 32-sample output frame
+ * almost never ends on an integer source sample, and throwing the remainder
+ * away at every frame boundary would put a discontinuity at 1500 Hz. */
+#define VOICE_RS_CARRY 4
+typedef struct {
+    float phase;
+    float carry[VOICE_RS_CARRY][2];
+    int   ncarry;
+} VoiceResampleState;
+static VoiceResampleState g_voice_rs[MCPX_HW_MAX_VOICES];
+
+static void voice_resample_reset(uint16_t v)
+{
+    if (v < MCPX_HW_MAX_VOICES) memset(&g_voice_rs[v], 0, sizeof g_voice_rs[v]);
+}
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
@@ -74,6 +94,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
+    voice_resample_reset(v);
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -166,7 +187,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 typedef struct { unsigned long long at; uint16_t handle; uint8_t kind; } VoiceEv;
 static VoiceEv g_voice_ev[VOICE_EV_MAX];
 static unsigned long g_voice_ev_n;          /* total seen; index is % VOICE_EV_MAX */
-static const char *const voice_ev_name[] = { "ON", "OFF", "RELEASE" };
+static const char *const voice_ev_name[] = { "on", "off", "rel" };
 
 static int voice_ev_on(void)
 {
@@ -194,6 +215,8 @@ void mcpx_apu_voice_events_report(void)
     unsigned long start, i;
     unsigned long long sec_lo = 0;
     unsigned on = 0, off = 0, rel = 0;
+    char detail[256] = {0};
+    int dn = 0;
     if (!voice_ev_on()) return;
     fprintf(stderr, "  [VOICE-EV] %lu events; per second of output audio:\n",
             g_voice_ev_n);
@@ -203,15 +226,24 @@ void mcpx_apu_voice_events_report(void)
         unsigned long long s = e->at / 48000ull;
         if (s != sec_lo) {
             if (on | off | rel)
-                fprintf(stderr, "  [VOICE-EV]   t=%4llus  on=%-4u off=%-4u release=%-4u\n",
-                        sec_lo, on, off, rel);
-            sec_lo = s; on = off = rel = 0;
+                fprintf(stderr, "  [VOICE-EV]   t=%4llus  on=%-3u off=%-3u release=%-3u | %s\n",
+                        sec_lo, on, off, rel, detail);
+            sec_lo = s; on = off = rel = 0; dn = 0; detail[0] = 0;
         }
         if (e->kind == 0) on++; else if (e->kind == 1) off++; else rel++;
+        /* The handles, not just the counts. Two seconds in the last run each
+         * had two starts and two stops; one of them corrupted the audio and the
+         * other did not, so "how many voices changed" is not the question --
+         * "which voice" is, and it is what ties a second to a row of
+         * [VOICE-RATE]. */
+        if (dn < (int)sizeof detail - 12)
+            dn += snprintf(detail + dn, sizeof detail - dn, "%s%s%u",
+                           dn ? " " : "", voice_ev_name[e->kind < 3 ? e->kind : 0],
+                           e->handle);
     }
     if (on | off | rel)
-        fprintf(stderr, "  [VOICE-EV]   t=%4llus  on=%-4u off=%-4u release=%-4u\n",
-                sec_lo, on, off, rel);
+        fprintf(stderr, "  [VOICE-EV]   t=%4llus  on=%-3u off=%-3u release=%-3u | %s\n",
+                sec_lo, on, off, rel, detail);
     fflush(stderr);
 }
 
@@ -1097,34 +1129,115 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
+/* Resample a voice to the output rate.
+ *
+ * This used to take `rate` and discard it -- one source sample per output
+ * sample regardless -- and the comment said "nearest-neighbor", which it was
+ * not; it was no resampling at all. MEASURED 13 Sep 2026 with
+ * RECOMP_VOICE_RATES: of the voices JSRF starts, 64-67 ask for rate 1.0 and
+ * were unaffected, voice 68 asks for 1.0885 (44100 Hz material) for 100% of its
+ * frames, and voice 69 asks for 2.1770 (22050 Hz) for 100% of its. Voice 69 is
+ * alive only during the three seconds where our captured audio departs from
+ * xemu's -- 535 single-sample deltas over 12000 in those seconds and none
+ * anywhere else in the run, against an xemu capture whose whole run never
+ * exceeds 8462.
+ *
+ * Two things go wrong when the rate is ignored, and they are worth separating.
+ * The obvious one is pitch: 22050 Hz material played at 48000 comes out 2.177x
+ * too fast, which multiplies every frequency in it by 2.177 and pushes its top
+ * end into the region where consecutive samples can swing the full scale --
+ * that is what the deltas are. The less obvious one matters more for a stream:
+ * the voice's own cursor advances one sample per output sample, so a streaming
+ * buffer is consumed 2.177x faster than the guest is refilling it.
+ *
+ * Linear interpolation, not nearest-neighbour: nearest-neighbour at a
+ * non-integer ratio is a jitter of up to half a sample on every output, which
+ * is a broadband noise floor. Linear is not audiophile -- it is a gentle
+ * low-pass with some aliasing left -- but it is the difference between wrong
+ * and roughly right, and it costs two multiplies.
+ *
+ * `rate` is output samples per source sample (48000/source_hz), so we advance
+ * the source by 1/rate per output sample.
+ *
+ * RECOMP_NO_RESAMPLE=1 restores the old behaviour so the change can be A/B-ed
+ * against itself rather than against a memory of it. */
+static int voice_resample_disabled(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("RECOMP_NO_RESAMPLE") != NULL;
+    return off;
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    VoiceResampleState *rs;
+    float step;
+    int produced = 0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
+    /* Unity is the common case -- four of JSRF's six voices -- and it must stay
+     * bit-identical to what it was, so it does not go through the interpolator
+     * at all. Also the fallback for a nonsense rate: refusing to divide by it
+     * is better than producing silence or a NaN that reaches the mixer. */
+    if (voice_resample_disabled() || !(rate > 0.0f) || !isfinite(rate)
+            || (rate > 0.99999f && rate < 1.00001f)) {
+        int sample_count = 0;
+        while (sample_count < requested_num) {
+            int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+            int count;
+            if (!active) break;
+            count = voice_get_samples(d, v, &samples[sample_count],
                                       requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+            if (count < 0) break;
+            if (count == 0) return -1;
+            sample_count += count;
+        }
+        return sample_count;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+
+    rs = &g_voice_rs[v];
+    step = 1.0f / rate;                    /* source samples per output sample */
+
+    while (produced < requested_num) {
+        /* Two source samples are needed to interpolate between. Fetch one at a
+         * time: asking for a block would advance the voice's cursor past what
+         * this frame actually consumes, which is the same over-consumption
+         * being fixed here. */
+        while (rs->ncarry < 2) {
+            int count;
+            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                return produced;
+            count = voice_get_samples(d, v, &rs->carry[rs->ncarry], 1);
+            if (count < 0) return produced;
+            if (count == 0) return produced ? produced : -1;
+            rs->ncarry += count;
+        }
+
+        samples[produced][0] = rs->carry[0][0] * (1.0f - rs->phase)
+                             + rs->carry[1][0] * rs->phase;
+        samples[produced][1] = rs->carry[0][1] * (1.0f - rs->phase)
+                             + rs->carry[1][1] * rs->phase;
+        produced++;
+
+        rs->phase += step;
+        while (rs->phase >= 1.0f && rs->ncarry > 0) {
+            rs->phase -= 1.0f;
+            memmove(&rs->carry[0], &rs->carry[1],
+                    (size_t)(rs->ncarry - 1) * sizeof rs->carry[0]);
+            rs->ncarry--;
+        }
+    }
+    return produced;
 }
 
 /* What playback rate each voice actually asks for.
  *
- * voice_resample() takes a rate and then discards it -- its body ends with a
- * cast to void and a note that it is ignored until proper resampling exists --
- * so every voice plays back one source sample per output sample whatever its
- * pitch register says. rate is
+ * voice_resample() used to take a rate and discard it, playing one source
+ * sample per output sample whatever the pitch register said. It resamples now;
+ * this stayed because it is what says WHICH voices depend on that, and it is
+ * the check that catches a voice whose rate we still handle badly. rate is
  * 1/2^(pitch/4096), so rate == 1.0 exactly when the pitch register is zero.
  *
  * Whether that MATTERS is an empirical question and this is how to settle it
@@ -1180,7 +1293,7 @@ void mcpx_apu_voice_rate_report(void)
         tot_off += g_voice_rate[v].off_frames;
         if (g_voice_rate[v].off_frames) any++;
     }
-    fprintf(stderr, "  [VOICE-RATE] %lu voice-frames, %lu at a rate we ignore "
+    fprintf(stderr, "  [VOICE-RATE] %lu voice-frames, %lu needing resampling "
             "(%.2f%%), %u voice(s) affected%s\n",
             tot, tot_off, tot ? 100.0 * (double)tot_off / (double)tot : 0.0, any,
             tot ? "" : "   <- NO VOICE FRAMES: nothing is being processed");
@@ -1191,8 +1304,8 @@ void mcpx_apu_voice_rate_report(void)
         /* A rate of R means we play R source samples per output sample; we
          * currently always play 1. So the source is consumed at 1/R times the
          * speed it should be, and 48000/R is the rate the guest asked for. */
-        fprintf(stderr, "  [VOICE-RATE]   voice %3u: %lu/%lu frames off, "
-                "rate min=%.4f max=%.4f last=%.4f  (asked ~%.0f Hz, played 48000)\n",
+        fprintf(stderr, "  [VOICE-RATE]   voice %3u: %lu/%lu frames resampled, "
+                "rate min=%.4f max=%.4f last=%.4f  (source ~%.0f Hz -> 48000)\n",
                 v, r->off_frames, r->frames, r->min_rate, r->max_rate,
                 r->last_rate, r->last_rate > 0.0f ? 48000.0f / r->last_rate : 0.0f);
     }
