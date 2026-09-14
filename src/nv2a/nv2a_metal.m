@@ -631,6 +631,10 @@ static _Atomic unsigned ring_waiters;
  * is gated, so a normal run's output does not change. */
 static uint64_t ring_reserves,ring_bytes,ring_wraps,ring_waits,ring_fallbacks,ring_slabs_live;
 static uint64_t sync_calls,sync_clean,sync_color,sync_depth,surface_uploads;
+/* Nanoseconds inside nv2a_metal_sync, split: waiting for the GPU to drain
+ * versus reading the surface back and converting it. See the comment at the
+ * wait. */
+static uint64_t g_sync_drain_ns, g_sync_read_ns;
 
 static int ring_audit_on(void)
 {static int on=-1;if(on<0)on=getenv("RECOMP_METAL_RING_AUDIT")?1:0;return on;}
@@ -717,6 +721,11 @@ static void batch_flush(void)
 
 void nv2a_metal_report(void)
 {
+    fprintf(stderr,"[METAL] sync %llu calls (%llu already clean): %.1f ms draining"
+            " the GPU, %.1f ms reading back and converting."
+            "  A resident clear could remove the second only.\n",
+            (unsigned long long)sync_calls,(unsigned long long)sync_clean,
+            g_sync_drain_ns/1e6,g_sync_read_ns/1e6);
     fprintf(stderr,"[METAL] texture buffers: %llu requests, %llu cache hits, %llu uploads; vertices: %llu inline, %llu allocated\n",
         (unsigned long long)texture_requests,(unsigned long long)texture_hits,
         (unsigned long long)texture_uploads,(unsigned long long)inline_vertex_batches,
@@ -893,6 +902,7 @@ int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
 
 int nv2a_metal_sync(void)
 {
+    unsigned long long _t_sync = mtl_now_ns(), _t_drained = 0;
     @autoreleasepool{
         ++sync_calls;
         /* BEFORE the dirty test and before the wait. An open batch is work the
@@ -900,8 +910,25 @@ int nv2a_metal_sync(void)
          * committed buffer and waiting on it would read a surface that is
          * missing every draw in the batch. */
         batch_flush();
-        if(!surface_dirty&&!depth_dirty){++sync_clean;return 1;}
+        if(!surface_dirty&&!depth_dirty){++sync_clean;
+            g_sync_drain_ns += mtl_now_ns()-_t_sync; return 1;}
         [last_command waitUntilCompleted];
+        /* The split that decides whether a resident clear is worth building.
+         *
+         * clear_surface pays 11-15 ms a frame, and all of it is attributed to
+         * `clear` because that is where the stall lands -- but the wait above
+         * is a drain of command buffers the DRAWS submitted, and no clear
+         * implementation can remove that. What a resident clear WOULD remove
+         * is everything below: the readback, the two per-pixel conversion
+         * loops, and the re-upload the invalidate forces on the next draw.
+         *
+         * So time the two halves separately. If the readback half is large,
+         * the case is arithmetic. If the drain is nearly all of it, the clear
+         * is only paying for the draws and the only available win is
+         * pipelining, which is a different piece of work. Reported as a
+         * breakdown OF the clear, never added to it. */
+        _t_drained = mtl_now_ns();
+        g_sync_drain_ns += _t_drained - _t_sync;
         if(last_command.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[METAL] command failed: %s\n",last_command.error.description.UTF8String);return 0;}
         size_t pixels=(size_t)surface_width*surface_height;
         float *rgba=malloc(pixels*16);
@@ -932,6 +959,7 @@ int nv2a_metal_sync(void)
             depth_dirty=0;
         }
         free(rgba);
+        g_sync_read_ns += mtl_now_ns()-_t_drained;
         return 1;}
 }
 

@@ -25,8 +25,22 @@ green suite there would mean the gate had stopped working.
 xemu. Roughly a third of the frame is `clear_surface`, 11–15 ms across two
 calls, most of it waiting on the GPU. Measured, not yet addressed.
 
-**Intermittent crash.** Around one 300 s run in five ends in a guest fault with
-the stack pointer outside the primary stack. Long-standing, unattributed.
+**Intermittent crash — now attributed, and the rate was overstated here.**
+Across 390 recorded runs, 46 end in a guest fault (11.8%), and the hazard is
+not spread through the run: it is concentrated at **t = 43-50 s**, the title
+menu to first mission transition. Among runs that reach that transition, 7 of
+97 crash; among runs that survive past it, about 1.6%. An earlier version of
+this page said "one run in five", which does not match the data.
+
+Of the 33 genuine faults on this host (excluding a known mem-watch build and
+some Windows ones), **20 are the same bug**: the DirectSound APU interrupt
+handler is entered for an idle-voice trap and dereferences a voice object that
+is NULL. The faulting instruction, the guest register fingerprint, the frame
+depth and a three-deep call chain read out of the guest's own stack all agree,
+and the handler is the one the title registers with
+`KeConnectInterrupt(routine=0x001A2681, vector=5)`. What is not yet proven is
+which route sets the trap method to the idle-voice value; that needs a
+read-only probe at the handler's entry rather than more static reading.
 
 **Intro card transitions.** The fade between the opening cards renders as a cut.
 Localised on 14 Sep: the guest computes the ramp, and the vertex buffer it
@@ -72,7 +86,8 @@ shows the bypass followed by the freeze.
 - Why `clear_surface` costs 11–15 ms a frame, and whether the GPU wait inside
   it is avoidable. It is where the stall is *paid*; what *creates* it is the
   draws.
-- The intermittent guest fault.
+- The intermittent guest fault: confirm, with a probe rather than by reading,
+  that the idle-voice trap is being delivered for a torn-down voice.
 - Where the intro fade is lost in guest code, and whether that path is shared.
 - The vertex-reuse mismatch.
 - Whether batching can be made default-safe.

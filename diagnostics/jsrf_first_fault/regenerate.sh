@@ -217,7 +217,15 @@ MANIFEST="$OUT/gen/GENERATION_MANIFEST.txt"
 # (disasm before recomp), so the two hashes could never agree and every build
 # would have reported STALE. A check that always fires is a check everyone
 # learns to ignore, which is worse than not having one.
-tools_hash=$(ls tools/disasm/*.py tools/recomp/*.py 2>/dev/null | sort \
+#
+# test_*.py is EXCLUDED, and that matters as much as the sort order above. The
+# glob matches 76 files and 54 of them are tests, so adding or editing a lifter
+# test -- which is exactly what a contributor is asked to do -- marked every
+# existing gen tree STALE and printed the regenerate warning, although no
+# generator behaviour had changed. That is the same "always fires, so everyone
+# ignores it" failure the paragraph above describes, arrived at from the other
+# direction. Tests do not shape the emitted code; the generators do.
+tools_hash=$(ls tools/disasm/*.py tools/recomp/*.py 2>/dev/null | grep -v '/test_' | sort \
              | xargs cat | shasum -a 256 | cut -c1-16)
 types_hash=$(shasum -a 256 templates/runtime/recomp_types.h | cut -c1-16)
 xbe_hash=$(shasum -a 256 "$XBE" 2>/dev/null | cut -c1-16)

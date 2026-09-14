@@ -1743,10 +1743,38 @@ static void clear_surface(uint32_t param)
                         z ? "ok" : "REFUSED", base, offset, s_methods[0x1d8c/4],
                         gpu_cleared ? " (resident)" : "");
 #endif
-            if (z && !gpu_cleared) for (y=y0;y<y1;++y) for (x=x0;x<x1;++x) {
-                uint8_t *p=z+(size_t)y*pitch+x*4;
-                if (param&2) p[0]=(uint8_t)value;
-                if (param&1) for (unsigned k=1;k<4;++k) p[k]=(uint8_t)(value>>(8*k));
+            /* The two `param` tests are loop-invariant and were being made
+             * once per pixel, around single-byte stores -- roughly 307k
+             * iterations and 1.2 MB written a byte at a time for a 640x480
+             * Z24S8 surface. Hoisted, and the common case (both halves, so the
+             * whole dword is `value`) is now a word store the compiler can
+             * widen. Byte order is unchanged: p[k] = value >> 8k for k=0..3 is
+             * `value` in little-endian, which is what the memcpy writes, and
+             * memcpy rather than a cast keeps it alignment- and
+             * aliasing-clean. The partial cases keep their original stores.
+             *
+             * This is arithmetic, not a policy change: the same bytes land in
+             * the same places, and it touches nothing about who owns the
+             * surface. */
+            if (z && !gpu_cleared) {
+                const unsigned half = param & 3u;
+                for (y = y0; y < y1; ++y) {
+                    uint8_t *row = z + (size_t)y * pitch;
+                    if (half == 3u) {
+                        for (x = x0; x < x1; ++x)
+                            memcpy(row + (size_t)x * 4, &value, 4);
+                    } else if (half == 2u) {
+                        for (x = x0; x < x1; ++x)
+                            row[(size_t)x * 4] = (uint8_t)value;
+                    } else if (half == 1u) {
+                        for (x = x0; x < x1; ++x) {
+                            uint8_t *p = row + (size_t)x * 4;
+                            p[1] = (uint8_t)(value >> 8);
+                            p[2] = (uint8_t)(value >> 16);
+                            p[3] = (uint8_t)(value >> 24);
+                        }
+                    }
+                }
             }
         }
     }

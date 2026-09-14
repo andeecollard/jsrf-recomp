@@ -10,7 +10,7 @@ A static recompiler for original-Xbox titles, derived from
 specialised to bring up **Jet Set Radio Future (US)** on macOS ARM64.
 
 `origin` is a standalone private repo — *not* a GitHub fork. `upstream` is a
-plain remote we fetch from and merge. We are ~108 commits ahead of it.
+plain remote we fetch from and merge, currently a few hundred commits behind us.
 
 The recompiler translates the guest XBE to C, which is compiled against a
 replacement Xbox kernel, an NV2A graphics model and an MCPX APU model in
@@ -38,7 +38,8 @@ The generated C is **not** in git — it is hundreds of MB, rebuilt by
 ```sh
 cmake -S diagnostics/jsrf_first_fault -B <build> -DRECOMP_GEN_DIR=<gen dir>
 cmake --build <build> -j
-ctest --test-dir <build>            # 27/27 as of 48d89f3
+ctest --test-dir <build>            # 28/30; the two failures are
+                                   # deliberate gates, see CMakeLists.txt
 ```
 
 ```sh
@@ -47,8 +48,10 @@ RECOMP_REPORT_MS=10000 RECOMP_HDD_ROOT=<disposable emulated-hdd copy> \
   <build>/jsrf_first_fault
 ```
 
-`CMakeLists.txt` resolves `JSRF_STOCK_DIR` as a **sibling of the repo root**, so
-a worktree needs a `jsrf_stock_test` symlink beside it.
+The build needs nothing outside the repository. It used to: `recomp_manual.c`
+came from a sibling `jsrf_stock_test` checkout via `JSRF_STOCK_DIR`, which
+meant a fresh clone failed in CMake and every worktree needed a symlink beside
+it. The file is vendored at `diagnostics/jsrf_first_fault/recomp_manual.c`.
 
 There are ~100 `RECOMP_*` opt-in switches. Enumerate them rather than guessing:
 

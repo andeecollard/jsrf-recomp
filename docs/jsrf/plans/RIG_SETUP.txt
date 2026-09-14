@@ -41,18 +41,9 @@ quote them. Files can be evicted; a "missing" file may just be dataless.
                                          week's work. Do not work there.
     Jet Set Radio Future (US)/           the guest image; default.xbe is the
                                          translation input.
-    jsrf_stock_test/                     sibling the diagnostic's CMakeLists
-                                         resolves as JSRF_STOCK_DIR. A new
-                                         worktree needs this symlink beside it.
-    JSRF-Decompilation/                  the community decompilation. Its
-                                         ghidra/symboltable.tsv (1332 names) is
-                                         what symbolize.py reads. Read-only
-                                         reference -- no licence, do not vendor.
-    JSRF_BASELINE_2026-09-09_gameplay/   preserved known-good build:
-                                         jsrf_first_fault, gen.tar.gz,
-                                         CMakeCache.txt, RESTORE_MANIFEST.txt.
-                                         Verify against the manifest; extract
-                                         only into scratch.
+    (jsrf_stock_test/ is no longer needed -- recomp_manual.c was
+     vendored into diagnostics/jsrf_first_fault on 14 Sep 2026)
+
 
 Branch state as of writing: `reference/xemu-oracle` is **local only** -- there is
 no origin/reference/xemu-oracle, and it is six commits ahead of origin/main.

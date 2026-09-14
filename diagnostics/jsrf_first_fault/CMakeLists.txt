@@ -5,7 +5,6 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 get_filename_component(XBOXRECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-get_filename_component(JSRF_STOCK_DIR "${XBOXRECOMP_DIR}/../jsrf_stock_test" ABSOLUTE)
 set(RECOMP_GEN_DIR "${XBOXRECOMP_DIR}/build-macos/jsrf-first-fault/gen"
     CACHE PATH "Instrumented generated JSRF source directory")
 
@@ -32,9 +31,30 @@ set(JSRF_GEN_MANIFEST "${RECOMP_GEN_DIR}/GENERATION_MANIFEST.txt")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${JSRF_GEN_MANIFEST}")
 set(JSRF_GEN_TRANSLATOR "unrecorded")
+set(JSRF_GEN_TYPES "unrecorded")
 if(EXISTS "${JSRF_GEN_MANIFEST}")
     file(STRINGS "${JSRF_GEN_MANIFEST}" _man REGEX "^translator_sha=")
     string(REPLACE "translator_sha=" "" JSRF_GEN_TRANSLATOR "${_man}")
+    file(STRINGS "${JSRF_GEN_MANIFEST}" _mant REGEX "^runtime_types_sha=")
+    string(REPLACE "runtime_types_sha=" "" JSRF_GEN_TYPES "${_mant}")
+endif()
+
+# recomp_types.h, compared as well as recorded.
+#
+# regenerate.sh has always written runtime_types_sha into the manifest and
+# nothing ever read it, so only translator_sha was checked. That leaves the
+# identical hole one field over: recomp_types.h is included by every generated
+# translation unit -- it holds the MMX unions, the FS accessors and the
+# float-to-int helpers -- and an edit to it reached no binary until somebody
+# happened to regenerate, with nothing saying so. That is exactly how the
+# uninitialised-ebp fix sat unbuilt for a day.
+execute_process(
+    COMMAND sh -c "shasum -a 256 templates/runtime/recomp_types.h | cut -c1-16"
+    WORKING_DIRECTORY "${XBOXRECOMP_DIR}"
+    OUTPUT_VARIABLE JSRF_TYPES_NOW
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT JSRF_TYPES_NOW)
+    set(JSRF_TYPES_NOW "uncomputed")
 endif()
 
 # Compute the CURRENT translator hash by running the SAME pipeline
@@ -44,7 +64,9 @@ endif()
 # build reported STALE. A check that always fires is one everybody learns to
 # ignore -- worse than no check.
 execute_process(
-    COMMAND sh -c "ls tools/disasm/*.py tools/recomp/*.py 2>/dev/null | sort | xargs cat | shasum -a 256 | cut -c1-16"
+    # Byte-identical to regenerate.sh's pipeline, test_*.py exclusion included
+    # -- see the comment there for why the tests are left out.
+    COMMAND sh -c "ls tools/disasm/*.py tools/recomp/*.py 2>/dev/null | grep -v '/test_' | sort | xargs cat | shasum -a 256 | cut -c1-16"
     WORKING_DIRECTORY "${XBOXRECOMP_DIR}"
     OUTPUT_VARIABLE JSRF_TOOLS_NOW
     OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -64,6 +86,15 @@ elseif(NOT JSRF_GEN_TRANSLATOR STREQUAL JSRF_TOOLS_NOW)
         "diagnostics/jsrf_first_fault/regenerate.sh, or you are testing yesterday.")
 else()
     message(STATUS "jsrf: gen tree matches tools/recomp (${JSRF_TOOLS_NOW})")
+endif()
+
+if(NOT JSRF_GEN_TYPES STREQUAL "unrecorded"
+   AND NOT JSRF_GEN_TYPES STREQUAL JSRF_TYPES_NOW)
+    message(WARNING
+        "STALE RUNTIME TYPES. The gen tree was produced against recomp_types.h "
+        "${JSRF_GEN_TYPES}; it is now ${JSRF_TYPES_NOW}. Every generated "
+        "translation unit includes that header, so a change to it is NOT in "
+        "this binary until you run regenerate.sh.")
 endif()
 
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${RECOMP_GEN_DIR}/*.c")
@@ -228,7 +259,7 @@ add_executable(jsrf_first_fault
     draw_one_probe.c
     func_hit_probe.c
     jsrf_manual_overrides.c
-    "${JSRF_STOCK_DIR}/src/recomp_manual.c"
+    "${CMAKE_CURRENT_LIST_DIR}/recomp_manual.c"
     ${RECOMP_GEN_SOURCES}
 )
 target_link_libraries(jsrf_first_fault PRIVATE xboxrecomp)
@@ -236,8 +267,6 @@ target_include_directories(jsrf_first_fault PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
     "${RECOMP_GEN_DIR}"
     "${XBOXRECOMP_DIR}/templates/runtime"
-    "${JSRF_STOCK_DIR}/src"
-    "${JSRF_STOCK_DIR}/src/recomp"
     "${XBOXRECOMP_DIR}/include"
 )
 # Record every indirect-branch target actually dispatched.
