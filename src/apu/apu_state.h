@@ -536,6 +536,11 @@ void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 
+/* One output frame: mix, stamp g_apu_out_frames, then hand the buffer to
+ * whichever sink is active. Defined in apu_core.c and, until now, declared
+ * nowhere -- which is part of why nothing ever tested the output path. */
+void mcpx_apu_monitor_frame(MCPXAPUState *d);
+
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;

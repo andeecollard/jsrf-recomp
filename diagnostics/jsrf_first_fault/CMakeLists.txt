@@ -88,6 +88,15 @@ add_executable(jsrf_apu_register_test apu_register_test.c)
 target_link_libraries(jsrf_apu_register_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_register COMMAND jsrf_apu_register_test)
 
+# The audio OUTPUT path, which nothing here had ever driven. A run whose host
+# audio device fails reads [APU-PACE] gen_hz=0 batches=0 frames=0 -- every one
+# of those a sink counter -- while the engine upstream is fine, and ctest could
+# not tell that from the engine having stopped. Needs no sound device, which is
+# the point. See the test's own comment.
+add_executable(jsrf_apu_output_frames_test apu_output_frames_test.c)
+target_link_libraries(jsrf_apu_output_frames_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_output_frames COMMAND jsrf_apu_output_frames_test)
+
 add_executable(jsrf_pgraph_notify_test pgraph_notify_test.c)
 target_link_libraries(jsrf_pgraph_notify_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_pgraph_notify COMMAND jsrf_pgraph_notify_test)

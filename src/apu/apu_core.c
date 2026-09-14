@@ -475,6 +475,7 @@ static int64_t g_apu_pace_start_us;
 void mcpx_apu_pacing_report(void)
 {
     extern unsigned long g_apu_sdl_batches, g_apu_sdl_frames, g_apu_sdl_clears;
+    extern unsigned long long g_apu_out_frames;
     extern unsigned long g_apu_sdl_starved, g_apu_sdl_empty, g_apu_sdl_min_bytes;
     extern unsigned long g_apu_sdl_max_bytes, g_apu_sdl_depth_hist[6];
     extern unsigned long g_apu_sdl_prime_bytes, g_apu_sdl_reprimes;
@@ -484,14 +485,35 @@ void mcpx_apu_pacing_report(void)
     double elapsed_s = g_apu_pace_start_us
         ? (now_us - g_apu_pace_start_us) / 1000000.0 : 0.0;
     double gen_hz = elapsed_s > 0.0 ? g_apu_sdl_frames / elapsed_s : 0.0;
+    double out_hz = elapsed_s > 0.0 ? g_apu_out_frames / elapsed_s : 0.0;
 
     fprintf(stderr, "  [APU-PACE] elapsed=%.1fs subframes=%lu se=%lu light=%lu"
             " throttle=%lu unpaced=%lu slept=%.1fs\n",
             elapsed_s, g_apu_subframes, g_apu_se_frames, g_apu_light_frames,
             g_apu_throttle_calls, g_apu_throttle_unpaced,
             g_apu_throttle_slept_us / 1000000.0);
-    fprintf(stderr, "  [APU-PACE] batches=%lu frames=%lu gen_hz=%.0f"
+    /* out_frames is the SINK-INDEPENDENT one, and it is first because without
+     * it this line cannot tell two completely different failures apart.
+     *
+     * batches, frames and gen_hz all come from the SDL sink. If the host
+     * refuses the audio device -- see apu_sdl2_init, and on macOS this really
+     * happens: "CoreAudio error (AudioQueueStart): -66681" -- the APU falls
+     * back to a waveOut path that does nothing here, and all three read zero
+     * while the engine upstream is perfectly healthy. [APU-FRAME] se= does not
+     * help, because it counts rendered subframes rather than delivered ones,
+     * so it stays healthy too. A whole hour went into "the new build silenced
+     * gameplay audio" on 14 Sep 2026 before the cause turned out to be the
+     * Mac's audio daemon and not any code in this tree.
+     *
+     * g_apu_out_frames is incremented in mcpx_apu_monitor_frame BEFORE the
+     * sink is chosen, so it answers the question the other counters cannot:
+     * did the engine produce output at all. out_hz near 48000 with gen_hz=0
+     * means the device is dead and the emulation is fine. Both at zero means
+     * the engine stopped, which is the bug worth chasing. */
+    fprintf(stderr, "  [APU-PACE] out_frames=%llu out_hz=%.0f |"
+            " batches=%lu frames=%lu gen_hz=%.0f"
             " queued=%lu bytes (%lu frames) clears=%lu\n",
+            g_apu_out_frames, out_hz,
             g_apu_sdl_batches, g_apu_sdl_frames, gen_hz,
             apu_sdl2_queued_bytes(), apu_sdl2_queued_bytes() / 4,
             g_apu_sdl_clears);
