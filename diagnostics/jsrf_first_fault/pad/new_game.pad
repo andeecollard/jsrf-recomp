@@ -13,6 +13,17 @@
 #
 # Measured 13 Sep: reaches WaitEndStoryOrVsMission at t=46.9 and holds the Corn
 # tutorial (live=61) with nobody at the machine.
+#
+# PAD-LINT: allow-late-start
+# test_pad_schedule.py fails any schedule that presses START past t=48, because
+# START is PAUSE there. This file is the deliberate exception, for the reason
+# given above: logo length varies by ten seconds or more between runs, so the
+# repeats after t=48 are the margin that makes an unattended boot reliable, and
+# the cost is a pause on the runs that were already through. Do not retune the
+# timings to remove them -- START also SKIPS the logos, so the t at which they
+# end is a property of this schedule rather than of the title, and chasing it
+# has misled before. A schedule that must measure gameplay should instead stop
+# at t=47 the way moving.pad, still.pad and gameplay.pad do.
 
 12.0:START  13.5:START  15.0:A
 20.0:START  21.5:START  23.0:A

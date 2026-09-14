@@ -1,0 +1,124 @@
+# Play the game. Skate, jump, spray -- the arm this repo has never had.
+#
+# WHY THIS FILE EXISTS
+#
+# Every other schedule in this directory parks the player. The difference is
+# not cosmetic; it is the reason two real defects were invisible for the life
+# of the project. Measured 14 Sep, gameplay, same build:
+#
+#     a person with a controller    on=109  off=103  idle_trap=22371  48% APU
+#     every scripted run ever       on=5    off=0    idle_trap=0       0% APU
+#
+# No scripted run has ever RETIRED a voice. The APU trap storm (48% of audio
+# frames lost) and the controller-hotplug abort were both found by hand,
+# because a parked player starts no sound effect and finishes none.
+#
+# TWO GATES, AND THEY ARE DIFFERENT QUESTIONS
+#
+#   1. Did the run REACH gameplay?  NtOpenFile count, which needs no probe:
+#      ~1342 opens / 260 distinct files / live=133 is the TITLE plateau, and
+#      1408 opens / 264 files / live=56 is New Game. A run that stops at 1342
+#      never left the attract screen.
+#   2. Did it then PLAY?  [APU-VOICE] off=, which must be well clear of zero.
+#
+# Both gates matter and neither substitutes for the other. The first version of
+# this file failed gate 1 and still produced off=1, and off=1 read as "it
+# played" until the open count was checked. play_scripted.sh now tests both.
+#
+# THE BOOT PREFIX IS new_game.pad's, NOT moving.pad's, AND THAT IS THE POINT
+#
+# moving.pad and still.pad stop pressing START at t=45.5, which depends on
+# hitting a single window. Logo length varies by ten seconds or more between
+# runs -- that variance is exactly why new_game.pad repeats the group to t=71 --
+# so a truncated prefix is a gamble taken fresh on every run. MEASURED: this
+# file with moving.pad's prefix reached 1342 opens, i.e. the title plateau, and
+# never started a game at all.
+#
+# The repeats cost something real and it is written down rather than glossed:
+# past the title START is PAUSE, so on a run that was already through, the
+# groups at t=52/60/68 pause and unpause, and the A between them lands in a
+# pause menu. new_game.pad carries that same risk and is nonetheless the only
+# prefix in this tree with a measured record of reaching the tutorial, so this
+# file follows the measured artifact rather than a nicer-looking guess. Play
+# therefore does not begin until t=80, after the last of them.
+#
+# PAD-LINT: allow-late-start
+# test_pad_schedule.py fails any schedule pressing START past t=48. This file
+# is a deliberate exception for the reason above; the play window is placed
+# clear of the STARTs so nothing synthetic pauses the part being measured.
+#
+# WHAT THE BUTTONS ARE
+#
+# A = jump and RT = spray are the game's own words, not inference: the tutorial
+# says "Press the 'A button' and jump 1 time!" and "Just get close to her and
+# pull the Right Trigger". The left stick skates. Grinding needs no button --
+# you skate onto a rail -- so it is the one thing here a schedule cannot
+# guarantee: it depends on where the player happens to be.
+#
+# HOW THE PARSER ACTUALLY BEHAVES -- READ THIS BEFORE EDITING
+#
+# Overlapping STICK events on the SAME AXIS do not hand over. The apply path
+# (src/input/xinput_device.c:743) writes a scripted deflection only when that
+# axis is still near neutral:
+#
+#     if (ev->lx && st->Gamepad.sThumbLX > -4096 && st->Gamepad.sThumbLX < 4096)
+#
+# so once an earlier active event has driven the axis to 30000, every later
+# overlapping event is REFUSED and the first in file order wins until it
+# expires. (That guard is what lets a live controller take a run over from the
+# script, which is deliberate.) moving.pad's header claimed the opposite for a
+# while; it got the right answer anyway because its segments happen to be
+# adjacent rather than overlapping. Every stick segment below is therefore
+# strictly non-overlapping, and a diagonal is ONE event naming both directions
+# (LUP+LRIGHT), never two overlaid. Buttons are unaffected -- digital ones OR
+# and analog ones take the maximum -- so A and RT may overlap freely.
+# test_pad_schedule.py asserts all of this.
+
+# ── boot to the Corn tutorial (identical to new_game.pad) ──
+12.0:START  13.5:START  15.0:A
+20.0:START  21.5:START  23.0:A
+28.0:START  29.5:START  31.0:A
+36.0:START  37.5:START  39.0:A
+44.0:START  45.5:START  47.0:A
+52.0:START  53.5:START  55.0:A
+60.0:START  61.5:START  63.0:A
+68.0:START  69.5:START  71.0:A
+
+# ── skate: strictly non-overlapping segments, one per direction ──
+80.0:LUP:6.0  86.0:LUP+LRIGHT:6.0  92.0:LRIGHT:6.0  98.0:LDOWN+LRIGHT:6.0
+104.0:LDOWN:6.0  110.0:LDOWN+LLEFT:6.0  116.0:LLEFT:6.0  122.0:LUP+LLEFT:6.0
+128.0:LUP:6.0  134.0:LUP+LRIGHT:6.0  140.0:LRIGHT:6.0  146.0:LDOWN+LRIGHT:6.0
+152.0:LDOWN:6.0  158.0:LDOWN+LLEFT:6.0  164.0:LLEFT:6.0  170.0:LUP+LLEFT:6.0
+176.0:LUP:6.0  182.0:LUP+LRIGHT:6.0  188.0:LRIGHT:6.0  194.0:LDOWN+LRIGHT:6.0
+200.0:LDOWN:6.0  206.0:LDOWN+LLEFT:6.0  212.0:LLEFT:6.0  218.0:LUP+LLEFT:6.0
+224.0:LUP:6.0  230.0:LUP+LRIGHT:6.0  236.0:LRIGHT:6.0  242.0:LDOWN+LRIGHT:6.0
+248.0:LDOWN:6.0  254.0:LDOWN+LLEFT:6.0
+
+# ── jump: a tap every 2 s, every fourth one doubled ──
+81.00:A  83.00:A  85.00:A  87.00:A  87.35:A  89.00:A
+91.00:A  93.00:A  95.00:A  95.35:A  97.00:A  99.00:A
+101.00:A  103.00:A  103.35:A  105.00:A  107.00:A  109.00:A
+111.00:A  111.35:A  113.00:A  115.00:A  117.00:A  119.00:A
+119.35:A  121.00:A  123.00:A  125.00:A  127.00:A  127.35:A
+129.00:A  131.00:A  133.00:A  135.00:A  135.35:A  137.00:A
+139.00:A  141.00:A  143.00:A  143.35:A  145.00:A  147.00:A
+149.00:A  151.00:A  151.35:A  153.00:A  155.00:A  157.00:A
+159.00:A  159.35:A  161.00:A  163.00:A  165.00:A  167.00:A
+167.35:A  169.00:A  171.00:A  173.00:A  175.00:A  175.35:A
+177.00:A  179.00:A  181.00:A  183.00:A  183.35:A  185.00:A
+187.00:A  189.00:A  191.00:A  191.35:A  193.00:A  195.00:A
+197.00:A  199.00:A  199.35:A  201.00:A  203.00:A  205.00:A
+207.00:A  207.35:A  209.00:A  211.00:A  213.00:A  215.00:A
+215.35:A  217.00:A  219.00:A  221.00:A  223.00:A  223.35:A
+225.00:A  227.00:A  229.00:A  231.00:A  231.35:A  233.00:A
+235.00:A  237.00:A  239.00:A  239.35:A  241.00:A  243.00:A
+245.00:A  247.00:A  247.35:A  249.00:A  251.00:A  253.00:A
+255.00:A  255.35:A  257.00:A  259.00:A
+
+# ── spray: pull the Right Trigger every 5 s ──
+83.0:RT:0.35  88.0:RT:0.35  93.0:RT:0.35  98.0:RT:0.35  103.0:RT:0.35  108.0:RT:0.35
+113.0:RT:0.35  118.0:RT:0.35  123.0:RT:0.35  128.0:RT:0.35  133.0:RT:0.35  138.0:RT:0.35
+143.0:RT:0.35  148.0:RT:0.35  153.0:RT:0.35  158.0:RT:0.35  163.0:RT:0.35  168.0:RT:0.35
+173.0:RT:0.35  178.0:RT:0.35  183.0:RT:0.35  188.0:RT:0.35  193.0:RT:0.35  198.0:RT:0.35
+203.0:RT:0.35  208.0:RT:0.35  213.0:RT:0.35  218.0:RT:0.35  223.0:RT:0.35  228.0:RT:0.35
+233.0:RT:0.35  238.0:RT:0.35  243.0:RT:0.35  248.0:RT:0.35  253.0:RT:0.35  258.0:RT:0.35

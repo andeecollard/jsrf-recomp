@@ -5,11 +5,24 @@
 # motion for the whole measurement window. Compare [STAGE], [FRAME-WIN],
 # [APU-FRAME] and [APU-PACE] against the still.pad run at the same live=61.
 #
-# Held in four overlapping 30 s pushes rather than one, and in two directions,
-# because a single sustained deflection can walk Corn into a wall and then the
-# "moving" arm is a stationary arm with the stick pressed. Overlapping events
-# are OR'd by the script parser, and a later event's stick value replaces the
-# earlier one for that axis, so these hand over cleanly.
+# Held in four 25 s pushes rather than one, and in two directions, because a
+# single sustained deflection can walk Corn into a wall and then the "moving"
+# arm is a stationary arm with the stick pressed.
+#
+# The four pushes below are ADJACENT, NOT OVERLAPPING, and that is load-bearing
+# rather than incidental -- this header used to say the opposite. A later
+# event's stick value does NOT replace an earlier one: the apply path
+# (src/input/xinput_device.c:743) writes a scripted deflection only while the
+# axis is still near neutral,
+#
+#     if (ev->lx && st->Gamepad.sThumbLX > -4096 && st->Gamepad.sThumbLX < 4096)
+#
+# so an overlapping event finds the axis already at 30000 and is refused; the
+# first event in FILE ORDER wins until it expires. (The same guard is what lets
+# a live controller take over a scripted run, which is deliberate.) These four
+# hand over cleanly because 55+25=80, 80+25=105, 105+25=130 and the window test
+# is half-open -- not because replacement works. Buttons are unaffected: digital
+# ones OR together and analog ones take the maximum.
 #
 # LUP/LRIGHT rather than a button: full deflection is 30000, well past the
 # 4096 the report path uses to reject jitter.
