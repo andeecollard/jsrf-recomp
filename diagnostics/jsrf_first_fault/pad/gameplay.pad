@@ -34,6 +34,26 @@
 # file with moving.pad's prefix reached 1342 opens, i.e. the title plateau, and
 # never started a game at all.
 #
+# RELIABILITY, MEASURED, AND IT IS NOT GOOD: 1 run in 3 reached New Game.
+# The two failures sat at exactly 1342 opens, which is the documented "blind
+# masher" plateau -- new_game.pad's own header says a one-per-second beat walks
+# the title to live=133 / 1342 and stops there. Check the scene gate on EVERY
+# run before using it; a title-plateau run still produces a full log and
+# plausible audio counters and means nothing.
+#
+# DO NOT TRY TO FIX THIS BY PRESSING START MORE OFTEN. Tried, 14 Sep: groups
+# every 4 s to t=118 instead of every 8 s to t=71, i.e. 27 attempts instead of
+# 8. It did not reach New Game either, and denser input is how you become the
+# masher that plateaus. There is an explicit note in this project's memory not
+# to retune new_game.pad's timings, and it is right. The prefix below is that
+# artifact, unchanged.
+#
+# The one success differed from the three failures in having a DEAD host audio
+# device, which is suggestive -- the APU throttles to real time, so audio pacing
+# could shift the boot -- but it is 1 observation against 3 and a person plays
+# this game with sound on and reaches gameplay fine. Do not repeat it as a
+# finding; it is a hypothesis worth one controlled experiment, no more.
+#
 # The repeats cost something real and it is written down rather than glossed:
 # past the title START is PAUSE, so on a run that was already through, the
 # groups at t=52/60/68 pause and unpause, and the A between them lands in a
