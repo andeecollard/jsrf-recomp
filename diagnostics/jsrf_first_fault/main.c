@@ -1142,6 +1142,7 @@ static void jsrf_pusher_report(void)
                 extern unsigned long g_ohci_wdh_blocked, g_ohci_wdh_cleared,
                                      g_ohci_wdh_longest_ms;
                 extern unsigned long g_ohci_tds_retired, g_ohci_tds_error;
+                extern unsigned long g_pcrtc_untrapped, g_pcrtc_windows;
                 /* HcInterruptEnable and the published HCCA done head, every
                  * report, because the stall snapshot found WDH set with only
                  * the master enable bit on -- and that is only a cause if the
@@ -1162,6 +1163,12 @@ static void jsrf_pusher_report(void)
                             g_ohci_wdh_longest_ms,
                             g_ohci_tds_retired, g_ohci_tds_error,
                             ien, ist, hd);
+                    fprintf(stderr,
+                            "  [PCRTC] %lu writable windows opened, %lu stores"
+                            " arrived without faulting%s\n",
+                            g_pcrtc_windows, g_pcrtc_untrapped,
+                            g_pcrtc_untrapped ? "   <-- the NV2A aperture is"
+                                                " losing guest writes" : "");
                 }
                 fflush(stderr);
             }
@@ -3570,18 +3577,40 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
                 i, r->block, r->function, r->esp, r->eax, r->ecx, r->edx,
                 r->ebx, r->esi, r->edi, r->ebp);
     }
-    fprintf(stderr, "\nPRIMARY GUEST STACK CODE POINTERS:\n");
-    if (g_esp >= (uint32_t)XBOX_STACK_BASE && g_esp < XBOX_STACK_TOP) {
-        uint32_t stack_end = g_esp + 0x2000u;
-        if (stack_end < g_esp || stack_end > XBOX_STACK_TOP)
-            stack_end = XBOX_STACK_TOP;
-        for (uint32_t va = g_esp; va + 4u <= stack_end; va += 4u) {
-            uint32_t value = MEM32(va);
-            if (value >= 0x00011000u && value < 0x0028C000u)
-                fprintf(stderr, "stack[%08X] = %08X\n", va, value);
+    /* The FAULTING THREAD's stack, not just the primary one.
+     *
+     * g_esp is RECOMP_TLS, so a fault on any guest thread but the first used
+     * to print "guest ESP is outside the primary stack" unconditionally --
+     * true, useless, and indistinguishable from a genuinely wild pointer. It
+     * is why the intermittent crash was recorded as unattributable for so
+     * long. The thread stacks are registered as they are handed out; ask. */
+    {
+        uint32_t stack_lo = (uint32_t)XBOX_STACK_BASE, stack_hi = XBOX_STACK_TOP;
+        const char *which = "PRIMARY";
+        int known = (g_esp >= stack_lo && g_esp < stack_hi);
+        if (!known && xbox_GuestStackRangeFor(g_esp, &stack_lo, &stack_hi)) {
+            known = 1;
+            which = "WORKER";
         }
-    } else {
-        fprintf(stderr, "guest ESP is outside the primary stack\n");
+        if (known) {
+            uint32_t stack_end = g_esp + 0x2000u;
+            fprintf(stderr, "\n%s GUEST STACK CODE POINTERS"
+                    " (esp=%08X in %08X..%08X, %u bytes used):\n",
+                    which, g_esp, stack_lo, stack_hi,
+                    (unsigned)(stack_hi - g_esp));
+            if (stack_end < g_esp || stack_end > stack_hi)
+                stack_end = stack_hi;
+            for (uint32_t va = g_esp; va + 4u <= stack_end; va += 4u) {
+                uint32_t value = MEM32(va);
+                if (value >= 0x00011000u && value < 0x0028C000u)
+                    fprintf(stderr, "stack[%08X] = %08X\n", va, value);
+            }
+        } else {
+            fprintf(stderr, "\nGUEST STACK: esp=%08X is in NO known stack"
+                    " -- neither the primary one (%08X..%08X) nor any of the"
+                    " registered thread stacks. This one really is wild.\n",
+                    g_esp, (uint32_t)XBOX_STACK_BASE, XBOX_STACK_TOP);
+        }
     }
     fprintf(stderr, "=======================================\n");
     fflush(stderr);

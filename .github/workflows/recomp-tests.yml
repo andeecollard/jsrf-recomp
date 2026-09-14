@@ -1,0 +1,42 @@
+# The translator tests, on every push and pull request.
+#
+# These need no GPU, no game dump and no generated tree -- they exercise
+# tools/recomp and tools/disasm directly, which is where the x86 semantics
+# live and where a wrong lift is cheapest to catch. The C tests are not here
+# on purpose: most of them link against a generated tree that is hundreds of
+# megabytes and is rebuilt locally, so they cannot run on a clean checkout.
+#
+# The ratchet in particular only earns its keep if something runs it on every
+# change; that is the whole point of a ratchet.
+name: recomp tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install what the lifter tests need
+        run: python -m pip install --upgrade pip capstone pytest
+      - name: Translator and lifter tests
+        run: |
+          # Run as modules from the repo root: several of these use relative
+          # imports (from .disasm import ...) and fail as bare scripts.
+          fail=0
+          for f in tools/recomp/test_*.py tools/disasm/test_*.py; do
+            [ -e "$f" ] || continue
+            m="$(printf '%s' "${f%.py}" | tr '/' '.')"
+            printf '%-52s ' "$(basename "$f")"
+            if python -m "$m" >/tmp/out 2>&1; then
+              echo PASS
+            else
+              echo FAIL; sed 's/^/    /' /tmp/out | tail -20; fail=1
+            fi
+          done
+          exit $fail

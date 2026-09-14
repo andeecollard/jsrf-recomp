@@ -1322,6 +1322,40 @@ static void xbox_McpxApplyReady(void)
  */
 /* Needed by both the AArch64 write trap and the Windows VEH below. */
 #define XBOX_NV2A_PCRTC_INTR_0   (XBOX_NV2A_BASE + 0x600100u)
+
+/* Is the NV2A aperture losing guest writes the way the MCPX one was?
+ *
+ * The MCPX aperture is now mapped twice, so its guarded view is never
+ * unprotected and a guest store cannot slip past the trap. The NV2A aperture
+ * is a plain allocation with no alias, so it still has the old shape:
+ * xbox_Nv2aRaiseVblank opens a writable window on the PCRTC page 60-120 times
+ * a second, and the trap handler leaves that page writable across its own
+ * store. NV_PCRTC_INTR_0 is write-1-to-clear, so a guest acknowledge landing
+ * inside one of those windows would store its bit instead of clearing it --
+ * latching vblank pending on the register that gates the guest's clock.
+ *
+ * That is the same hazard, on a worse register. Whether it actually fires is a
+ * measurement, and this is it: record what this runtime last left in the
+ * register, and compare before touching it again. A value we did not write is
+ * a store that never faulted. Counters only; nothing here changes behaviour.
+ * Reported by the periodic report. */
+static volatile uint32_t g_pcrtc_expected;
+static volatile int g_pcrtc_known;
+unsigned long g_pcrtc_untrapped, g_pcrtc_windows;
+
+static void pcrtc_note_expected(uint32_t v) { g_pcrtc_expected = v; g_pcrtc_known = 1; }
+static void pcrtc_check(const char *where)
+{
+    uint32_t now;
+    if (!g_pcrtc_known || !g_memory_offset) return;
+    now = *(volatile uint32_t *)(uintptr_t)(XBOX_NV2A_PCRTC_INTR_0 + g_memory_offset);
+    if (now == g_pcrtc_expected) return;
+    ++g_pcrtc_untrapped;
+    if (g_pcrtc_untrapped <= 8 || (g_pcrtc_untrapped % 1000) == 0)
+        fprintf(stderr, "  [PCRTC] BYPASS #%lu at %s: left %08X, reads %08X"
+                        " -- a store reached the page without faulting\n",
+                g_pcrtc_untrapped, where, g_pcrtc_expected, now);
+}
 #define XBOX_NV2A_PMC_INTR_0     (XBOX_NV2A_BASE + 0x000100u)
 #define XBOX_NV2A_PMC_INTR_PCRTC 0x01000000u
 #define XBOX_NV2A_PGRAPH_INTR     (XBOX_NV2A_BASE + 0x400100u)
@@ -1935,6 +1969,7 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
             __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset),
                                ~XBOX_NV2A_PMC_INTR_PGRAPH, __ATOMIC_SEQ_CST);
     } else if (guest_va == XBOX_NV2A_PCRTC_INTR_0) {
+        pcrtc_note_expected(*(volatile uint32_t *)fault);
         /* The summary follows its source. Different page, not guarded, so this
          * is an ordinary store. */
         if ((value & 0x1u) == 0) {
@@ -2114,9 +2149,12 @@ void xbox_Nv2aRaiseVblank(void)
     {
         DWORD old_prot;
         mcpx_lock();
+        pcrtc_check("vblank raise");   /* before we touch it */
+        ++g_pcrtc_windows;
         if (VirtualProtect((LPVOID)g_nv2a_guard_page, g_mcpx_page_size,
                            PAGE_READWRITE, &old_prot)) {
             *pcrtc |= 0x1u;
+            pcrtc_note_expected(*pcrtc);
             VirtualProtect((LPVOID)g_nv2a_guard_page, g_mcpx_page_size,
                            PAGE_READONLY, &old_prot);
         }
@@ -5069,6 +5107,33 @@ static int g_thread_stacks_used = 0;
 
 #define XBOX_THREAD_STACK_SLOTS 64
 static struct { uint32_t top, bytes; } g_thread_stack_sizes[XBOX_THREAD_STACK_SLOTS];
+
+/* Which guest thread stack, if any, contains `esp`.
+ *
+ * The crash reporter used to test ESP against the PRIMARY stack alone and
+ * print "guest ESP is outside the primary stack" otherwise. g_esp is
+ * RECOMP_TLS, so on any guest thread but the first that message was
+ * guaranteed, whether or not anything was wrong -- which is how a crash that
+ * lands on a worker thread reads as "the stack pointer went wild" and stays
+ * unattributed. The registry below already knows every stack it handed out;
+ * nothing was asking it.
+ *
+ * Returns 1 and fills the range when esp is inside a known thread stack. */
+int xbox_GuestStackRangeFor(uint32_t esp, uint32_t *base_out, uint32_t *top_out)
+{
+    for (unsigned i = 0; i < XBOX_THREAD_STACK_SLOTS; ++i) {
+        uint32_t top = g_thread_stack_sizes[i].top;
+        uint32_t bytes = g_thread_stack_sizes[i].bytes;
+        uint32_t base;
+        if (!top || !bytes) continue;
+        base = top + 16u - bytes;
+        if (esp < base || esp > top) continue;
+        if (base_out) *base_out = base;
+        if (top_out) *top_out = top;
+        return 1;
+    }
+    return 0;
+}
 
 uint32_t xbox_AllocThreadStack(uint32_t bytes)
 {

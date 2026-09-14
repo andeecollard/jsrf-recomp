@@ -597,6 +597,12 @@ void xbox_TextChecksumReport(void);
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(uint32_t bytes);
 
+/* The guest thread stack containing `esp`, if any. Returns 1 and fills the
+ * range, else 0. For the crash reporter: g_esp is thread-local, so a fault off
+ * the primary thread otherwise reads as "ESP is outside the primary stack",
+ * which is true of every worker and says nothing. */
+int xbox_GuestStackRangeFor(uint32_t esp, uint32_t *base_out, uint32_t *top_out);
+
 /* Install the per-thread Xbox FS/TIB state used by generated FS_MEM accesses.
  * tls_data_size is the value passed to PsCreateSystemThreadEx. */
 /* Size of the image's TLS block as the loader built it; 0 before load. */
