@@ -47,11 +47,20 @@ fi
 [ -d "$STOCK" ] || { echo "no emulated-hdd at $STOCK" >&2; exit 1; }
 
 # A disposable copy: the guest writes saves, and the stock tree is a baseline.
+# The log does NOT live in the scratch directory, and that is the point.
+# Scratch is under /tmp, and something on this machine reaps /tmp aggressively
+# -- two directories vanished mid-session while they were still being written
+# to. When a person hit a boot hang interactively, there was no log left to
+# read and the session had to guess at what they had run. Logs go somewhere
+# durable and timestamped, so the next failure leaves evidence; only the
+# disposable HDD copy stays in scratch.
+LOGDIR="${JSRF_PLAY_LOG:-$ROOT/build-macos/jsrf-first-fault/play/$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$LOGDIR" || exit 1
 rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
 cp -R "$STOCK" "$SCRATCH/hdd"
 
 echo "binary: $BIN"
-echo "log:    $SCRATCH/stderr.log"
+echo "log:    $LOGDIR/stderr.log"
 echo "Click the game window so it has focus, then press START to begin."
 cd "$ROOT" || exit 1
 # The guest image, resolved from the repo root rather than baked into the
@@ -69,7 +78,7 @@ RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
 RECOMP_OHCI_ATTACH=1 RECOMP_USB=1 RECOMP_PAD_INJECT=1 \
 RECOMP_REPORT_MS="${REPORT_MS:-30000}" \
 RECOMP_HDD_ROOT="$SCRATCH/hdd" \
-  "$BIN" > "$SCRATCH/stderr.log" 2>&1 &
+  "$BIN" > "$LOGDIR/stderr.log" 2>&1 &
 PID=$!
 if [ "$LIMIT" -gt 0 ] 2>/dev/null; then
     ( sleep "$LIMIT"; kill -TERM $PID 2>/dev/null; sleep 5; kill -9 $PID 2>/dev/null ) &

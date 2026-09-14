@@ -397,6 +397,7 @@ static void mcpx_hw_store(uint32_t offset, uint32_t value);
 unsigned long g_ohci_wdh_blocked;      /* frame passes refused by the gate */
 unsigned long g_ohci_wdh_cleared;      /* times the driver acknowledged */
 unsigned long g_ohci_wdh_longest_ms;   /* longest single unacknowledged stretch */
+DWORD g_ohci_wdh_last_clear_ms;        /* when the driver last acknowledged */
 static DWORD  g_ohci_wdh_since;
 
 static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
@@ -729,6 +730,210 @@ static unsigned ohci_service(uint32_t head_ed, xbox_ohci_service *svc)
  * spreads endpoints across the table gets each of them polled at the interval
  * it asked for, and the walk stays bounded whatever the table contains.
  */
+/* One snapshot, at the first sustained TD-completion plateau.
+ *
+ * tds_retired stops moving partway through every run measured so far, in both
+ * submission paths, at a scattered point -- report 3 of 29 in one run and 29 of
+ * 29 in another. The periodic report can say THAT it stopped; it cannot say
+ * which of three quite different things happened, and those want different
+ * fixes:
+ *
+ *   nothing submitted     the driver stopped queueing work. The periodic list
+ *                         is disabled, or its HCCA entry is empty, or every ED
+ *                         on it has HeadP == TailP.
+ *   queued but unserviced work is on the list and is not being run: the ED is
+ *                         skipped or halted, or the controller is not in
+ *                         UsbOperational so no frame is processed at all.
+ *   completed unreclaimed TDs retired onto the done queue and the driver never
+ *                         took them: WritebackDoneHead set and never cleared,
+ *                         so the gate refuses to publish the next queue.
+ *
+ * The snapshot prints what separates them: controller state and the periodic
+ * list enable, the HCCA entry for this frame, every ED with its skip and halt
+ * bits decoded, every TD between HeadP and TailP with its condition code, and
+ * the WriteBackDoneHead gate's counters with the time since it was last
+ * cleared.
+ *
+ * The plateau has to be sustained AND the guest has to still be alive, or a
+ * snapshot taken during an ordinary idle gap says nothing. So it fires only
+ * once, only after OHCI_STALL_MS with no TD retiring, and only if the guest's
+ * interrupt service routine has RETURNED at least OHCI_STALL_ISRS times in
+ * that window -- a machine that has stopped running ISRs is a different bug
+ * and this would misattribute it.
+ *
+ * Opt-in: RECOMP_OHCI_STALL_SNAPSHOT=1.
+ */
+#define OHCI_STALL_MS   3000u
+#define OHCI_STALL_ISRS 20u
+
+/* Defined in xbox_usb_ohci.c, where the service loop increments them. */
+extern unsigned long g_ohci_tds_retired, g_ohci_tds_error;
+
+/* Incremented by kernel_bridge.c around the guest's interrupt service routine.
+ * The storage is here rather than there so that referencing it does not drag
+ * the bridge -- and the generated tree it depends on -- into every target that
+ * links this file. See the note at the declaration in kernel_bridge.c. */
+volatile LONG g_bridge_isr_entered, g_bridge_isr_returned;
+
+/* Descriptor bits, as xbox_usb_ohci.c defines them; they are not in the
+ * header and this file needs them only to decode a snapshot. */
+#define ED_SKIP          0x00004000u
+#define ED_HEAD_HALTED   0x1u
+#define ED_HEAD_CARRY    0x2u
+
+static const char *ohci_cc_name(uint32_t cc)
+{
+    switch (cc) {
+    case 0x0: return "NOERROR";      case 0x1: return "CRC";
+    case 0x2: return "BITSTUFFING";  case 0x3: return "DATATOGGLE";
+    case 0x4: return "STALL";        case 0x5: return "DEVICENOTRESPONDING";
+    case 0x6: return "PIDCHECKFAILURE"; case 0x7: return "UNEXPECTEDPID";
+    case 0x8: return "DATAOVERRUN";  case 0x9: return "DATAUNDERRUN";
+    case 0xC: return "BUFFEROVERRUN"; case 0xD: return "BUFFERUNDERRUN";
+    case 0xE: return "NOTACCESSED-E"; case 0xF: return "NOTACCESSED";
+    default:  return "reserved";
+    }
+}
+
+static void ohci_dump_ed_chain(const char *tag, uint32_t head_ed)
+{
+    uint32_t ed_va = head_ed & ~0xFu;
+    unsigned eds = 0;
+    if (!ed_va) { fprintf(stderr, "  [OHCI-STALL] %s: empty\n", tag); return; }
+    while (ed_va && eds < 16u) {
+        uint32_t *ed = (uint32_t *)ohci_resolve(ed_va, 16u);
+        uint32_t tail, head, next;
+        unsigned tds = 0;
+        if (!ed) { fprintf(stderr, "  [OHCI-STALL] %s ed=%08X UNRESOLVABLE\n", tag, ed_va); return; }
+        ++eds;
+        tail = ed[1] & ~0xFu; head = ed[2]; next = ed[3] & ~0xFu;
+        fprintf(stderr,
+                "  [OHCI-STALL] %s ed#%u va=%08X flags=%08X%s%s head=%08X%s%s"
+                " tail=%08X next=%08X%s\n",
+                tag, eds, ed_va, ed[0],
+                (ed[0] & ED_SKIP) ? " SKIP" : "",
+                (ed[0] & (1u << 13)) ? " ISO" : "",
+                head,
+                (head & ED_HEAD_HALTED) ? " HALTED" : "",
+                (head & ED_HEAD_CARRY) ? " CARRY" : "",
+                ed[1], next,
+                ((head & ~0xFu) == tail) ? "   [empty: HeadP == TailP]" : "");
+        {
+            uint32_t td_va = head & ~0xFu;
+            while (td_va && td_va != tail && tds < 8u) {
+                uint32_t *td = (uint32_t *)ohci_resolve(td_va, 16u);
+                uint32_t cc, next_td;
+                if (!td) break;
+                cc = (td[0] >> 28) & 0xFu;
+                next_td = td[2] & ~0xFu;
+                fprintf(stderr,
+                        "  [OHCI-STALL]   td#%u va=%08X flags=%08X cc=%X(%s)"
+                        " errcnt=%u cbp=%08X be=%08X next=%08X\n",
+                        ++tds, td_va, td[0], cc, ohci_cc_name(cc),
+                        (td[0] >> 26) & 3u, td[1], td[3], td[2]);
+                if (next_td == td_va) break;
+                td_va = next_td;
+            }
+            if (!tds && (head & ~0xFu) != tail)
+                fprintf(stderr, "  [OHCI-STALL]   (no TD resolved between HeadP and TailP)\n");
+        }
+        if (next == ed_va) break;
+        ed_va = next;
+    }
+}
+
+static void ohci_stall_snapshot(unsigned long isrs_in_window)
+{
+    volatile uint32_t *ctl, *cmd, *ist, *ien;
+    uint32_t hcca, entry = 0, control_head, bulk_head, done;
+
+    ctl = (volatile uint32_t *)((char *)g_mcpx_regs + 0x500004u);
+    cmd = (volatile uint32_t *)((char *)g_mcpx_regs + 0x500008u);
+    ist = (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS);
+    ien = (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
+    hcca = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_HCCA);
+    control_head = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_CONTROL_HEAD);
+    bulk_head = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_BULK_HEAD);
+    done = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_DONE_HEAD);
+
+    fprintf(stderr,
+            "\n  [OHCI-STALL] ===== first sustained TD plateau =====\n"
+            "  [OHCI-STALL] %lu ms with no TD retired, %lu ISR returns in the window,\n"
+            "  [OHCI-STALL] so the guest is alive and the controller is not completing work.\n"
+            "  [OHCI-STALL] tds_retired=%lu tds_error=%lu frame=%u\n",
+            (unsigned long)OHCI_STALL_MS, isrs_in_window,
+            g_ohci_tds_retired, g_ohci_tds_error, g_ohci_frame);
+    fprintf(stderr,
+            "  [OHCI-STALL] HcControl=%08X  state=%s  lists: PLE=%u CLE=%u BLE=%u IE=%u\n"
+            "  [OHCI-STALL] HcCommandStatus=%08X  CLF=%u BLF=%u\n"
+            "  [OHCI-STALL] HcInterruptStatus=%08X enable=%08X  WDH=%u\n"
+            "  [OHCI-STALL] HcHCCA=%08X HcControlHeadED=%08X HcBulkHeadED=%08X HcDoneHead=%08X\n",
+            *ctl,
+            ((*ctl & 0xC0u) == 0x00u) ? "UsbReset" :
+            ((*ctl & 0xC0u) == 0x40u) ? "UsbResume" :
+            ((*ctl & 0xC0u) == 0x80u) ? "UsbOperational" : "UsbSuspend",
+            (*ctl >> 2) & 1u, (*ctl >> 4) & 1u, (*ctl >> 5) & 1u, (*ctl >> 3) & 1u,
+            *cmd, *cmd & 2u ? 1u : 0u, *cmd & 4u ? 1u : 0u,
+            *ist, *ien, (*ist & XBOX_OHCI_INTR_WDH) ? 1u : 0u);
+
+    if (hcca) {
+        uint32_t *tbl = (uint32_t *)ohci_resolve((hcca & ~0xFFu)
+                                                 + (g_ohci_frame & 31u) * 4u, 4u);
+        uint32_t *dh = (uint32_t *)ohci_resolve((hcca & ~0xFFu)
+                                                + XBOX_OHCI_HCCA_DONE_HEAD, 4u);
+        entry = tbl ? *tbl : 0u;
+        fprintf(stderr,
+                "  [OHCI-STALL] HCCA periodic entry [%u] = %08X   HccaDoneHead=%08X\n",
+                g_ohci_frame & 31u, entry, dh ? *dh : 0u);
+    }
+
+    ohci_dump_ed_chain("periodic", entry);
+    ohci_dump_ed_chain("control", control_head);
+
+    fprintf(stderr,
+            "  [OHCI-STALL] WDH gate: blocked=%lu cleared=%lu longest=%lu ms,"
+            " last clear %lu ms ago\n"
+            "  [OHCI-STALL] ======================================\n\n",
+            g_ohci_wdh_blocked, g_ohci_wdh_cleared, g_ohci_wdh_longest_ms,
+            g_ohci_wdh_last_clear_ms
+                ? (unsigned long)(GetTickCount() - g_ohci_wdh_last_clear_ms)
+                : 0ul);
+    fflush(stderr);
+}
+
+/* Watch for the plateau. Cheap enough to run every frame: two loads and a
+ * compare until something is actually wrong. */
+static void ohci_stall_watch(void)
+{
+    static int on = -1;
+    static unsigned long last_tds, isrs_at_mark;
+    static DWORD mark_ms;
+    static int fired;
+    unsigned long now_tds, now_isrs;
+    DWORD now;
+
+    if (on < 0) on = getenv("RECOMP_OHCI_STALL_SNAPSHOT") ? 1 : 0;
+    if (!on || fired) return;
+
+    now_tds = g_ohci_tds_retired;
+    now_isrs = (unsigned long)g_bridge_isr_returned;
+    now = GetTickCount();
+
+    if (now_tds != last_tds || !mark_ms) {
+        last_tds = now_tds; mark_ms = now ? now : 1u; isrs_at_mark = now_isrs;
+        return;
+    }
+    if (now - mark_ms < OHCI_STALL_MS) return;
+    if (now_isrs - isrs_at_mark < OHCI_STALL_ISRS) {
+        /* The guest is not running ISRs either. That is a different failure and
+         * this snapshot would misattribute it, so re-arm and keep waiting. */
+        mark_ms = now; isrs_at_mark = now_isrs;
+        return;
+    }
+    fired = 1;
+    ohci_stall_snapshot(now_isrs - isrs_at_mark);
+}
+
 static void ohci_periodic_tick(void)
 {
     static DWORD last_ms;
@@ -749,6 +954,7 @@ static void ohci_periodic_tick(void)
         return;
     last_ms = now;
     g_ohci_frame++;
+    ohci_stall_watch();
 
     ctl = (volatile uint32_t *)((char *)g_mcpx_regs + 0x500004u);
     ist = (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS);
@@ -822,6 +1028,7 @@ static void ohci_periodic_tick(void)
         if (held > g_ohci_wdh_longest_ms) g_ohci_wdh_longest_ms = held;
         g_ohci_wdh_since = 0;
         g_ohci_wdh_cleared++;
+        g_ohci_wdh_last_clear_ms = GetTickCount();
     }
 
     /* This frame's interrupt-table entry, if the HCCA has one. A zero head is

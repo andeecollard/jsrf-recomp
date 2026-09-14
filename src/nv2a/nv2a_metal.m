@@ -84,8 +84,18 @@ static void batch_flush(void);
 /* -1 forces off, 1 forces on, 0 defers to the switch. The frame benchmark
  * drives both paths inside one process, so it cannot use the environment. */
 static int batch_force;
-/* ON by default since 14 Sep 2026; RECOMP_METAL_BATCH=0 restores the per-draw
- * path. What that default rests on, and what it does not:
+/* OPT-IN again as of 14 Sep 2026, after being on by default for one commit.
+ *
+ * It was turned on by default on the evidence below, and then a person playing
+ * the title interactively got stuck on the SEGA screen. That is a report from
+ * the only test that actually matters, and it is not something the scripted
+ * runs saw -- a scripted boot on the same binary reaches NtOpenFile 1408 and
+ * 61 scene nodes. So the default goes back to off until that is either
+ * reproduced and fixed or shown to be something else. Nothing below is
+ * retracted; a measured rendering win does not outrank a title that will not
+ * boot for the user, and the switch costs nothing to keep.
+ *
+ * RECOMP_METAL_BATCH=1 enables it. What the evidence below establishes:
  *
  *   image      identical colour and depth to the per-draw path across the five
  *              boundaries metal_batch_test exercises -- overlapping blended and
@@ -110,7 +120,7 @@ static int batch_force;
  */
 static int batch_on(void)
 {static int on=-1;if(batch_force)return batch_force>0;
- if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=e?(atoi(e)!=0):1;}
+ if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=e?(atoi(e)!=0):0;}
  return on;}
 /* A cap exists so the effect of unbounded batching can be told apart from the
  * effect of batching at all, and so a pathological scene cannot defer the GPU

@@ -132,7 +132,7 @@ static int draw(const NV2ATextureCopy *s, const uint8_t *tex,
 int main(int argc, char **argv)
 {
     const char *e = getenv("RECOMP_METAL_BATCH");
-    const char *mode = (!e || atoi(e)) ? "batched" : "per-draw";
+    const char *mode = (e && atoi(e)) ? "batched" : "per-draw";
     unsigned d, i, oracle_bad = 0, oracle_zbad = 0;
 
     for (i = 0; i < TEXTURES; ++i)

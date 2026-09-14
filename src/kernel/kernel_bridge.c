@@ -2439,6 +2439,15 @@ static RECOMP_TLS uint32_t g_pending_dpc;
 static RECOMP_TLS uint32_t g_pending_dpc_sys1;
 static RECOMP_TLS uint32_t g_pending_dpc_sys2;
 static volatile LONG g_isr_handoff_seq;
+/* DEFINED in xbox_memory_layout.c, not here, and deliberately.
+ *
+ * The OHCI stall snapshot lives down there and gates on the returned count.
+ * Defining these in this file made every target that links the memory layout
+ * pull in this object too, and this object needs recomp_lookup from the
+ * generated tree -- which broke the link of four unrelated unit tests. The
+ * counters belong to the bridge conceptually; the storage belongs where it
+ * costs nothing. */
+extern volatile LONG g_bridge_isr_entered, g_bridge_isr_returned;
 static RECOMP_TLS LONG g_current_isr_handoff;
 
 /* Connected interrupts.
@@ -2709,7 +2718,18 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
         g_esp -= 4; BRIDGE_MEM32(g_esp) = interrupt_va;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         if (entered) *entered = 1;
+        /* Entered and returned as two counters, not one.
+         *
+         * An ISR count that is bumped once around the call cannot tell "the
+         * handler ran 37,000 times" from "the handler was entered 37,000 times
+         * and the 37,000th never came back" -- and an ISR that does not return
+         * is exactly the shape a dead USB driver would have. The increment
+         * before fn() and the one after it are the whole difference, and the
+         * USB stall snapshot gates on the SECOND one: a machine still
+         * returning from ISRs is alive, whatever else has stopped. */
+        InterlockedIncrement(&g_bridge_isr_entered);
         fn();
+        InterlockedIncrement(&g_bridge_isr_returned);
         g_in_isr = 0;
         isr_result = g_eax;
         if (handoff_trace) {
