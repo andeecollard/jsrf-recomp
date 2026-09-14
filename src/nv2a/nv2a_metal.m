@@ -1001,9 +1001,8 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
                     if(q[k][3]<0)wn=1;}
                 if(on&&!wn)++audit_deg_lost;}}}
     return;}
- int front=((ar>0)^nv2a_texture_copy_winding_flipped(v[a][0][3],v[b][0][3],v[c][0][3]))
-           ==(s->front_cw!=0);
- int culled=s->cull_face==0x408||(s->cull_face==0x404&&front)||(s->cull_face==0x405&&!front);
+ int front=nv2a_texture_copy_front_facing(s,ar,v[a][0][3],v[b][0][3],v[c][0][3]);
+ int culled=nv2a_texture_copy_culled(s,front);
  if(audit){const float*pa=v[a][0],*pb=v[b][0],*pc=v[c][0];
     int neg=(pa[3]<0)+(pb[3]<0)+(pc[3]<0);
     if(!neg)++audit_w_allpos;else if(neg==3)++audit_w_allneg;else{++audit_w_mixed;if(culled)++audit_mixed_culled;}

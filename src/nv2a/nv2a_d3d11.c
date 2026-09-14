@@ -1575,10 +1575,9 @@ static void triangle(const NV2ATextureCopy *s, const float (*v)[16][4],
     if (!vertex_valid(s,v,a) || !vertex_valid(s,v,b) || !vertex_valid(s,v,c)) return;
     ar = area(v[a][0], v[b][0], v[c][0]);
     if (!isfinite(ar) || ar == 0) return;
-    front = ((ar > 0) ^ nv2a_texture_copy_winding_flipped(
-                v[a][0][3], v[b][0][3], v[c][0][3])) == (s->front_cw != 0);
-    if (s->cull_face == 0x408 || (s->cull_face == 0x404 && front)
-            || (s->cull_face == 0x405 && !front)) return;
+    front = nv2a_texture_copy_front_facing(s, ar, v[a][0][3],
+                                           v[b][0][3], v[c][0][3]);
+    if (nv2a_texture_copy_culled(s, front)) return;
     out[(*n)++] = a; out[(*n)++] = b; out[(*n)++] = c;
 }
 

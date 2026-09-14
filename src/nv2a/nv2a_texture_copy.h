@@ -71,4 +71,32 @@ int nv2a_texture_copy_blend_factor_supported(uint32_t factor);
  * values; returns non-zero when the facing test must be flipped. */
 int nv2a_texture_copy_winding_flipped(float wa, float wb, float wc);
 
+/* Facing and culling, in ONE place, for the same reason blend_factor_supported
+ * is in one place: the three sinks must not drift apart.
+ *
+ * Both expressions were written out identically in nv2a_texture_copy.c, in
+ * nv2a_d3d11.c and in nv2a_metal.m. Straddle culling is an open question here
+ * -- inverted winding is known to discard half of the triangles crossing the
+ * camera plane, and the obvious one-line sign fix is recorded as WRONG -- so
+ * whoever eventually gets it right would have had to find all three copies and
+ * change them the same way. Two out of three is a bug that renders correctly
+ * on one host.
+ *
+ * Header-inline rather than a call, because this is per-triangle and the
+ * software rasteriser runs it millions of times a frame. */
+static inline int nv2a_texture_copy_front_facing(
+        const NV2ATextureCopy *s, float area, float wa, float wb, float wc)
+{
+    return ((area > 0) ^ nv2a_texture_copy_winding_flipped(wa, wb, wc))
+           == (s->front_cw != 0);
+}
+
+/* NV097_SET_CULL_FACE: 0x408 culls everything, 0x404 front, 0x405 back. */
+static inline int nv2a_texture_copy_culled(const NV2ATextureCopy *s, int front)
+{
+    return s->cull_face == 0x408
+        || (s->cull_face == 0x404 && front)
+        || (s->cull_face == 0x405 && !front);
+}
+
 #endif

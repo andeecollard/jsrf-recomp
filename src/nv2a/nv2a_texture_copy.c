@@ -575,10 +575,9 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
      * rejects any vertex with w <= 0 outright before reaching here, so a
      * straddling triangle is still lost on the software fallback -- that
      * needs real near-plane clipping, which the GPU sinks get for free. */
-    int front=((area>0)^nv2a_texture_copy_winding_flipped(v[0][0][3],v[1][0][3],v[2][0][3]))
-              ==(s->front_cw!=0);
-    if (s->cull_face==0x408 || (s->cull_face==0x404 && front)
-            || (s->cull_face==0x405 && !front)) return 1;
+    int front = nv2a_texture_copy_front_facing(s, area, v[0][0][3],
+                                               v[1][0][3], v[2][0][3]);
+    if (nv2a_texture_copy_culled(s, front)) return 1;
     float left=(float)s->clip_x,right=(float)(s->clip_x+s->clip_w);
     float top=(float)s->clip_y,bottom=(float)(s->clip_y+s->clip_h);
     int x0=(int)floorf(fmaxf(left,fminf(right,fminf(a[0][0],fminf(b[0][0],c[0][0])))));
