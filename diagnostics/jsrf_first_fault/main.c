@@ -3619,6 +3619,30 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
                     g_esp, (uint32_t)XBOX_STACK_BASE, XBOX_STACK_TOP);
         }
     }
+    /* What the APU last asked the guest to service.
+     *
+     * 20 of the 33 genuine faults on this host are the DirectSound interrupt
+     * handler dereferencing a NULL voice object, and the handle it was given
+     * comes from an idle-voice trap this runtime raised. Printing the last
+     * sixteen here means the next fault carries that history with it, instead
+     * of needing a run that both crashes AND has the periodic report land at
+     * the right moment -- which three runs in a row failed to produce. */
+    {
+        extern unsigned long g_idle_trap_raises, g_idle_trap_ring;
+        extern uint16_t g_idle_trap_last[];
+        if (g_idle_trap_raises) {
+            unsigned i, n = g_idle_trap_ring < 16u
+                          ? (unsigned)g_idle_trap_ring : 16u;
+            fprintf(stderr, "\nLAST IDLE-VOICE TRAPS RAISED (%lu total),"
+                            " oldest first:\n  ", g_idle_trap_raises);
+            for (i = 0; i < n; ++i)
+                fprintf(stderr, " v%u",
+                        (unsigned)g_idle_trap_last[(g_idle_trap_ring + i) & 15u]);
+            fprintf(stderr, "\n  The guest ISR dereferences its own object for"
+                            " the handle it is handed; a NULL there is this"
+                            " list's last entry.\n");
+        }
+    }
     fprintf(stderr, "=======================================\n");
     fflush(stderr);
 
