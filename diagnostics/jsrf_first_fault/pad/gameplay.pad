@@ -110,35 +110,36 @@
 # Then bare A presses, which is the one thing not yet tried and the only change
 # here that a measurement actually points at.
 #
-# Comparing a successful boot against a failed one, both reached the 1342-open
-# plateau at t=36-37 -- so it is NOT that the failing run boots too slowly. The
-# difference is what the A presses did afterwards. In the run that worked, the
-# A at t=47 moved it 1342 -> 1344 -> 1408, i.e. that A selected New Game. In the
-# run that failed, the A presses at t=39, 47, 55, 63 and 71 each did nothing at
-# all.
+# WRONG, AND CORRECTED 14 Sep. This block used to say that the A press at t=47
+# moved the run 1342 -> 1344 -> 1408, and the bare A presses below were added on
+# the strength of it. Reading the logs properly says otherwise:
 #
-# The suspicion that follows: once the menu is up, a group's START,START moves
-# OFF it and the group's own A then lands somewhere harmless. So after the
-# groups stop, press A alone -- no START -- a few times, spaced wide. If the
-# menu is up, A is exactly what it wants. If the game is already in play, a
-# bare A is a jump and costs nothing.
+#   * 1342 -> 1344 is TWO OPENS OF D:\Media\Z_ADX\BGM\, and they land 0.1-0.3 s
+#     after a START and about 1.5 s BEFORE the A -- in both successful runs.
+#     It is the attract screen handing over to the menu, not a selection.
+#   * 1344 -> 1408 is the New Game content load, starting 3-4 s after the A with
+#     no pad event in between.
 #
-# This is a hypothesis with one comparison behind it, not a finding. If these
-# bare presses do not change the hit rate, say so here and delete them.
+# So the A does matter, but the arrow attributed to it was the wrong one, and
+# the bare presses are not aimed at the thing that fails.
 #
-# FIRST RUN WITH THEM: reached New Game (1408). That is 1 for 1 and means very
-# little on its own -- the boot was already landing about two times in five.
-# Note also that the host audio device failed in that run (CoreAudio -66681,
-# which wedges repeatedly on this machine), so it does NOT test the live-device
-# arm, whatever it looked like at launch. Someone needs to run this several
-# times, with the AUDIO verdict read each time, before the bare presses can be
-# called an improvement.
+# WHAT ACTUALLY DECIDES A RUN: whether the guest's XPP USB driver is still
+# submitting transfers when the presses arrive. Measure it with kernel ordinal
+# 175 (MmLockUnlockBufferPages), which is in every log already:
 #
-# Running tally across every run of the groups prefix, for whoever does that:
-#   device dead/off    3 of 5 reached New Game
-#   device live        0 of 2
-# which is still too few to separate, and is why the audio note above is a
-# retraction rather than a finding.
+#     reached New Game    ord175 = 12963, 23022, 27676, 74150, 74603
+#     stuck at the title  ord175 = 234, 1100, 6684
+#
+# 234 transfers in a 300 s run is enumeration and nothing else -- that run was
+# never going to accept a button, however many are pressed. A schedule cannot
+# fix this; do not tune the pad file for it.
+#
+# AND DO NOT TRUST [PAD-TRACE] OR nonneutral= AS PROOF A PRESS REACHED THE
+# GUEST. With RECOMP_PAD_INJECT=1 our own host thread calls xbox_InputGetState
+# at 50 Hz, so those lines appear at a healthy rate against a completely deaf
+# guest. Healthy runs poll at ~172/s, dead ones at exactly 50/s -- the injector
+# alone. That instrument misled this project for a full day.
+#
 12.0:START  13.5:START  15.0:A
 20.0:START  21.5:START  23.0:A
 28.0:START  29.5:START  31.0:A

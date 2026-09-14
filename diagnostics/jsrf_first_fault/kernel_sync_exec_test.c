@@ -25,6 +25,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>  /* setenv */
 #include <string.h>
 
 #include "xbox_memory_layout.h"
@@ -159,6 +160,13 @@ static void build_xbe(void)
 
 int main(void)
 {
+    /* Ordinal 153 defaults OFF since it was measured to regress the USB
+     * transfer rate (see its comment in kernel_bridge.c). The bridge is
+     * still correct in what it does and is still worth testing, so this
+     * asks for it explicitly rather than depending on the default --
+     * which also means the test keeps passing whichever way the default
+     * goes in future. */
+    setenv("RECOMP_KE_SYNC_EXEC", "1", 1);
     uint32_t thunk_page, thunk_base, stack, stack_top, result;
 
     build_xbe();

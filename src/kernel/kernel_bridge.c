@@ -3630,30 +3630,57 @@ static unsigned long g_sync_exec_unsynchronised;
  * trying to attribute a freeze. Reported by xbox_ReportSyncExec below. */
 static unsigned long g_sync_exec_calls;
 
-/* Ordinal 153 off-switch, and this one is justified by a measurement rather
- * than by caution: the first hand-played session with this bridge routed froze
- * during a rail grind -- framebuffer identical for 15 consecutive seconds, ADX
- * tick stuck, pushbuffer waiting on a fence. The bridge's own comment names
- * that risk: it takes the interrupt-delivery interlock and sets g_in_isr across
- * a GUEST routine, and both call sites are DSOUND on the audio vectors, so a
- * routine that waits inside the region stops interrupt delivery for everyone.
+/* Ordinal 153 is OFF BY DEFAULT, and that is a retreat from the commit that
+ * added it (b707832). Enable with RECOMP_KE_SYNC_EXEC=1.
  *
- * This is a bisect handle, not a verdict -- the freeze is a known class here
- * with other causes on record. Set RECOMP_NO_KE_SYNC_EXEC=1 to take ordinal
- * 153 back to the unbridged behaviour every prior measurement was made
- * against, and play the same way. If it still freezes, 153 is exonerated. */
+ * WHY. Bridging it was correct on its own terms -- the guest really was being
+ * handed a fabricated FALSE for a routine that never ran. But it was shipped
+ * without ever being exercised at gameplay, and measurement since says it
+ * regressed the title:
+ *
+ *   scripted, 3 runs each, same schedule, same machine:
+ *     binary WITHOUT this bridge   3/3 reached New Game, ord175 = 74603, 74150, 73945
+ *     binary WITH it               1/3 reached New Game, ord175 = 27676, 10614, 5130
+ *
+ * ord175 is MmLockUnlockBufferPages, i.e. how often the guest's XPP USB driver
+ * pins a transfer buffer. A third of the traffic, and degrading, while the same
+ * binary rendered MORE (666k draws against 607k) -- so it is not a general
+ * slowdown but something specific to interrupt-driven I/O. Three hand-played
+ * sessions also froze during a rail grind with it on, and it has never once
+ * been played with it off.
+ *
+ * THE MECHANISM, and it is not the one the bridge's own comment worried about.
+ * Both guest call sites are inside DPC bodies, so the spin and g_in_isr code
+ * below never executes here and g_sync_exec_unsynchronised is vacuous. What
+ * the bridge actually does is switch on roughly 41 previously-dead DSOUND
+ * functions: the only instruction in the title that sets a bit in the DSOUND
+ * state word [this+0x6FC] lives inside the routine this now calls, so before
+ * it was bridged those code paths were unreachable. They run inside
+ * bridge_run_isr -> bridge_run_dpc, which holds g_vblank_delivery_active --
+ * the same interlock bridge_device_irq_poll needs, and that pump is the ONLY
+ * thing that runs the guest's USB ISR on vector 1. More time in the interlock
+ * is fewer USB interrupts delivered. That closure contains a 10 ms busy-wait
+ * (KeStallExecutionProcessor 0x2710 at 0x001A1BDA) and four unbounded guest
+ * spins on APU MMIO.
+ *
+ * This is a retreat, not a diagnosis. The remaining work is to make the
+ * interlock not double as the IRQL model, so guest ISR and DPC bodies stop
+ * blocking interrupt delivery process-wide -- at which point this can be
+ * turned back on and the guest can finally have its synchronize routine. */
 static int bridge_sync_exec_disabled(void)
 {
     static int off = -1;
     if (off < 0) {
-        const char *v = getenv("RECOMP_NO_KE_SYNC_EXEC");
-        off = (v && *v && *v != '0') ? 1 : 0;
-        if (off) {
-            fprintf(stderr, "  [KERNEL] KeSynchronizeExecution (153) DISABLED "
-                    "by RECOMP_NO_KE_SYNC_EXEC; returning FALSE without "
-                    "running the routine, as before it was bridged\n");
-            fflush(stderr);
-        }
+        const char *v = getenv("RECOMP_KE_SYNC_EXEC");
+        off = (v && *v && *v != '0') ? 0 : 1;   /* default: OFF */
+        fprintf(stderr, off
+                ? "  [KERNEL] KeSynchronizeExecution (153) off (default);"
+                  " returning FALSE without running the routine, as before it"
+                  " was bridged. RECOMP_KE_SYNC_EXEC=1 enables it.\n"
+                : "  [KERNEL] KeSynchronizeExecution (153) ENABLED by"
+                  " RECOMP_KE_SYNC_EXEC; it regressed USB transfer rate when"
+                  " last measured -- watch ordinal 175.\n");
+        fflush(stderr);
     }
     return off;
 }
