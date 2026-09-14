@@ -166,6 +166,72 @@ typedef struct {
  * layout, and the index array caps the batch at 4096 either way. */
 #define NV_MAX_INLINE_WORDS 16384
 
+/* Vertex-reuse opportunity, opt-in via RECOMP_VSH_REUSE_STATS=1. Counts only;
+ * changes nothing about what is transformed. */
+unsigned long long g_vsh_idx_total, g_vsh_idx_unique;
+unsigned long g_vsh_batches_counted, g_vsh_idx_max_batch;
+static int vsh_reuse_stats(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VSH_REUSE_STATS") ? 1 : 0;
+    return on;
+}
+
+/* Batch-local vertex reuse.
+ *
+ * s_outputs[] is indexed by POSITION IN THE INDEX ARRAY, so a vertex
+ * referenced N times in one batch runs the whole shader N times. Measured on
+ * this title at gameplay: 423,405,051 indices against 205,792,923 unique --
+ * 51.4% duplicates, stable to one decimal across every report of a 300 s run.
+ *
+ * Sound because nv2a_vsh_execute is a pure function of (program, inputs,
+ * constants): grepping nv2a_vsh.c for mutable file-scope state finds none, and
+ * the inputs depend only on the vertex index and the attribute arrays, which do
+ * not change within a batch. The cached entry is copied AFTER subpixel
+ * quantisation, so a hit reproduces the original bytes exactly rather than
+ * re-deriving them.
+ *
+ * Both switches are opt-in. RECOMP_VSH_REUSE_VERIFY runs the shader anyway on
+ * every hit and compares, which is the correctness gate this has to pass before
+ * any performance claim -- and it is deliberately separate from the reuse
+ * switch so the two can never be confused in a log. */
+unsigned long long g_vsh_reuse_hits, g_vsh_reuse_mismatch;
+static int vsh_reuse_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VSH_REUSE") ? 1 : 0;
+    return on;
+}
+static int vsh_reuse_verify(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VSH_REUSE_VERIFY") ? 1 : 0;
+    return on;
+}
+
+void nv2a_vsh_reuse_report(void)
+{
+    if (!vsh_reuse_stats()) return;
+    if (!g_vsh_batches_counted) {
+        fprintf(stderr, "  [VSH-REUSE] armed, no batches counted yet\n");
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr,
+            "  [VSH-REUSE] batches=%lu indices=%llu unique=%llu"
+            " duplicate=%.1f%% max_batch=%lu\n",
+            g_vsh_batches_counted, g_vsh_idx_total, g_vsh_idx_unique,
+            g_vsh_idx_total ? 100.0 * (double)(g_vsh_idx_total - g_vsh_idx_unique)
+                              / (double)g_vsh_idx_total : 0.0,
+            g_vsh_idx_max_batch);
+    if (vsh_reuse_on() || vsh_reuse_verify())
+        fprintf(stderr, "  [VSH-REUSE] reuse=%s verify=%s hits=%llu mismatches=%llu\n",
+                vsh_reuse_on() ? "on" : "off",
+                vsh_reuse_verify() ? "on" : "off",
+                g_vsh_reuse_hits, g_vsh_reuse_mismatch);
+    fflush(stderr);
+}
+
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
@@ -1989,9 +2055,69 @@ static int prepare_vertices(void)
         s_vsh.dirty = 0;
         trace_selected_program();
     }
+    /* How much of this batch is a vertex we have already transformed?
+     *
+     * MEASURE BEFORE OPTIMISING. s_outputs[] is indexed by POSITION IN THE
+     * INDEX ARRAY, not by vertex index, so a vertex referenced N times runs
+     * the whole shader N times. Whether that is worth caching depends entirely
+     * on how indexed this title's geometry actually is, and nothing here has
+     * ever counted it. An indexed triangle list sharing vertices between
+     * adjacent faces would show a large gap; a batch of independent triangles
+     * would show none, and the cache would be pure overhead.
+     *
+     * Opt-in: this tree has a documented history of instrumentation weight
+     * destabilising the title, and this sits in the hottest loop there is.
+     * O(n) with an 8 KB bitmap cleared by re-walking the same indices, so no
+     * 64 K memset per batch. */
+    if (vsh_reuse_stats()) {
+        static uint8_t seen[65536 / 8];
+        uint32_t uniq = 0, i;
+        for (i = 0; i < s_gpu.idx_count; ++i) {
+            uint16_t v = s_gpu.idx[i];
+            if (!(seen[v >> 3] & (1u << (v & 7)))) {
+                seen[v >> 3] |= (uint8_t)(1u << (v & 7));
+                uniq++;
+            }
+        }
+        for (i = 0; i < s_gpu.idx_count; ++i) {
+            uint16_t v = s_gpu.idx[i];
+            seen[v >> 3] &= (uint8_t)~(1u << (v & 7));
+        }
+        g_vsh_idx_total  += s_gpu.idx_count;
+        g_vsh_idx_unique += uniq;
+        g_vsh_batches_counted++;
+        if (s_gpu.idx_count > g_vsh_idx_max_batch) g_vsh_idx_max_batch = s_gpu.idx_count;
+    }
+
+    /* Batch-local reuse cache: vertex index -> the position that first
+     * transformed it. Cleared by re-walking this batch's indices at the end,
+     * so there is no 64 K memset per batch. */
+    static uint16_t reuse_at[65536];
+    static uint8_t  reuse_seen[65536 / 8];
+    /* Inputs as actually consumed at the first occurrence. Only allocated in
+     * verify mode's conscience: 4096 slots x 16 attrs x 4 floats = 1 MB, which
+     * is fine for a diagnostic and is the only way to answer the question that
+     * matters -- did the two occurrences see the same data? Without it a
+     * mismatch cannot distinguish "the inputs changed under us" from "the cache
+     * is wrong", and rarity does not distinguish them either. */
+    static float reuse_inputs[NV_MAX_INDICES][16][4];
+    int reuse_active = (vsh_reuse_on() || vsh_reuse_verify()) && programmable;
+
     for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
         if (programmable) {
             float inputs[16][4];
+            uint16_t reuse_key = s_gpu.idx[i];
+            int reuse_from = -1;
+            if (reuse_active &&
+                (reuse_seen[reuse_key >> 3] & (1u << (reuse_key & 7))))
+                reuse_from = (int)reuse_at[reuse_key];
+            if (reuse_from >= 0 && vsh_reuse_on() && !vsh_reuse_verify()) {
+                memcpy(s_outputs[i],   s_outputs[reuse_from],   sizeof(s_outputs[i]));
+                memcpy(s_positions[i], s_positions[reuse_from], sizeof(s_positions[i]));
+                s_colors[i] = s_colors[reuse_from];
+                g_vsh_reuse_hits++;
+                continue;
+            }
             NV2AVshResult result;
             memcpy(inputs, s_vsh.current, sizeof(inputs));
             for (uint32_t a = 0; a < 16; ++a) {
@@ -2031,6 +2157,66 @@ static int prepare_vertices(void)
                 if (fabsf(s_positions[i][k]) < 0x1p20f)
                     s_positions[i][k] = truncf(s_positions[i][k] * 16.0f) / 16.0f;
                 s_outputs[i][0][k] = s_positions[i][k];
+            }
+            if (reuse_active) {
+                if (reuse_from >= 0) {
+                    /* Verification path: the shader ran anyway. Compare the
+                     * COMPLETE transformed output, not just position -- a cache
+                     * that got oPos right and a texcoord wrong would otherwise
+                     * pass. */
+                    g_vsh_reuse_hits++;
+                    if (memcmp(s_outputs[i], s_outputs[reuse_from],
+                               sizeof(s_outputs[i])) != 0 ||
+                        memcmp(s_positions[i], s_positions[reuse_from],
+                               sizeof(s_positions[i])) != 0 ||
+                        s_colors[i] != s_colors[reuse_from]) {
+                        if (g_vsh_reuse_mismatch < 4) {
+                            int a, k, in_diff = 0;
+                            fprintf(stderr,
+                                    "  [VSH-REUSE] MISMATCH batch=%u i=%u idx=%u"
+                                    " first_at=%d prog_len=%u\n",
+                                    s_vsh.batches, i, reuse_key, reuse_from,
+                                    s_vsh.decoded.length);
+                            /* Did the INPUTS differ? This is the question --
+                             * a pure shader cannot produce two answers from one
+                             * input, so either they differed or the cache is
+                             * wrong, and this says which. */
+                            for (a = 0; a < 16; ++a)
+                                for (k = 0; k < 4; ++k)
+                                    if (memcmp(&reuse_inputs[reuse_from][a][k],
+                                               &inputs[a][k], sizeof(float))) {
+                                        in_diff++;
+                                        if (in_diff <= 6)
+                                            fprintf(stderr,
+                                                "    input a%d.%d first=%.9g now=%.9g"
+                                                " (bits %08X vs %08X)\n", a, k,
+                                                (double)reuse_inputs[reuse_from][a][k],
+                                                (double)inputs[a][k],
+                                                *(const uint32_t *)&reuse_inputs[reuse_from][a][k],
+                                                *(const uint32_t *)&inputs[a][k]);
+                                    }
+                            fprintf(stderr, "    inputs differing: %d of 64\n", in_diff);
+                            /* And which OUTPUT components differ, named. */
+                            for (a = 0; a < 16; ++a)
+                                for (k = 0; k < 4; ++k)
+                                    if (memcmp(&s_outputs[reuse_from][a][k],
+                                               &s_outputs[i][a][k], sizeof(float)))
+                                        fprintf(stderr,
+                                            "    output o%d.%d cached=%.9g fresh=%.9g\n",
+                                            a, k, (double)s_outputs[reuse_from][a][k],
+                                            (double)s_outputs[i][a][k]);
+                            fprintf(stderr, "    colors cached=%08X fresh=%08X\n",
+                                    s_colors[reuse_from], s_colors[i]);
+                            fflush(stderr);
+                        }
+                        g_vsh_reuse_mismatch++;
+                    }
+                } else {
+                    reuse_seen[reuse_key >> 3] |= (uint8_t)(1u << (reuse_key & 7));
+                    reuse_at[reuse_key] = (uint16_t)i;
+                    if (vsh_reuse_verify() && i < NV_MAX_INDICES)
+                        memcpy(reuse_inputs[i], inputs, sizeof(inputs));
+                }
             }
             /* Sample a late batch as well as the first few. The early ones
              * are the measured full-screen blit and always look the same;
@@ -2145,6 +2331,18 @@ static int prepare_vertices(void)
                 memcpy(s_positions[i],s_outputs[i][0],sizeof(s_positions[i]));
                 s_colors[i]=pack_color(s_outputs[i][3]);
             }
+        }
+    }
+    /* Clear the reuse cache for the NEXT batch, by re-walking this batch's own
+     * indices. Without this, entries leak across batches and a later batch
+     * reuses a transform computed from a different vertex array, different
+     * constants or a different program -- silently wrong geometry rather than a
+     * crash. O(n), and it is why the cache is a bitmap plus a table rather than
+     * a 64 K array that would need clearing wholesale. */
+    if (reuse_active) {
+        for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
+            uint16_t v = s_gpu.idx[i];
+            reuse_seen[v >> 3] &= (uint8_t)~(1u << (v & 7));
         }
     }
     if (programmable) s_vsh.batches++;

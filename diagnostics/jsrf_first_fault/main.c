@@ -1133,6 +1133,8 @@ static void jsrf_pusher_report(void)
              * rework -- it should read 0 outside legacy mode. */
             extern void xbox_ReportIrqDelivery(void);
             xbox_ReportIrqDelivery();
+            /* Vertex-reuse opportunity. Counts only; see nv2a_pb_exec.c. */
+            { extern void nv2a_vsh_reuse_report(void); nv2a_vsh_reuse_report(); }
             /* The WriteBackDoneHead gate, which is the leading suspect for the
              * guest's USB driver dying mid-run. blocked climbing while cleared
              * stands still is the signature; both moving exonerates it. */

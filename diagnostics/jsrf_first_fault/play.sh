@@ -30,7 +30,8 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 NEWER=$(find "$ROOT/src" "$ROOT/diagnostics/jsrf_first_fault" -name '*.c' -o -name '*.h' -o -name '*.m' 2>/dev/null \
-        | grep -v ' 2\.c$' | while read -r f; do [ "$f" -nt "$BIN" ] && echo "$f"; done | head -3)
+        | grep -v ' 2\.c$' | grep -vE '_test\.c$' \
+        | while read -r f; do [ "$f" -nt "$BIN" ] && echo "$f"; done | head -3)
 if [ -n "$NEWER" ]; then
     echo "WARNING: $BIN is older than these sources -- rebuild, or you are measuring the previous build:" >&2
     echo "$NEWER" | sed 's/^/    /' >&2

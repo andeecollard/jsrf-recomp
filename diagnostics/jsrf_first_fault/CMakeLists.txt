@@ -309,6 +309,12 @@ if(NOT WIN32)
     endif()
 endif()
 
+# Batch-local vertex reuse must not outlive its batch: constants, arrays and
+# the program all change between batches, so a leaked entry is silently wrong
+# geometry. The first cache had no clear at all and nothing would have caught it.
+add_executable(jsrf_vsh_reuse_test vsh_reuse_test.c)
+add_test(NAME jsrf_vsh_reuse COMMAND jsrf_vsh_reuse_test)
+
 add_executable(jsrf_vsh_test vsh_test.c)
 target_link_libraries(jsrf_vsh_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_vsh COMMAND jsrf_vsh_test)
