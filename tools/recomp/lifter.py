@@ -495,6 +495,11 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+    # The unsigned type of that same width. add/sub recover the destination as
+    # it was before the write -- result -/+ the source -- and the recovery is
+    # modular at the operand's width, not at 32 bits: `sub al, bl` leaves
+    # LO8(eax), and LO8(eax) + LO8(ebx) can reach 0x1FE, which is not a byte.
+    _flag_utype = {1: "uint8_t", 2: "uint16_t"}.get(_sf_width, "uint32_t")
 
     # A jcc whose predecessors set flags with different instructions. Every
     # one of them left ZF = (dest == 0) and SF = sign(dest) for the same
@@ -596,25 +601,32 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        # SF is the sign bit at the OPERAND's width. `sub al, bl` writes
+        # through SET_LO8 and reads back through LO8, which zero-extends, so
+        # `(int32_t)LO8(eax) < 0` is 0 <= x <= 255 < 0 -- false for every
+        # possible result, at every 8- and 16-bit site in the image. Same
+        # defect for a byte/word memory destination: MEM8/MEM16 are uint8_t and
+        # uint16_t. Cast back to the width the subtraction happened at.
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
-        # Ordered: reconstruct original a = result + b
+            return f"({_sf_cast}({lhs}) >= 0)", desc
+        # Ordered: reconstruct original a = result + b, and do it modulo the
+        # operand width. CMP_L and friends take their width from sizeof() of
+        # what they are handed, so the casts are what make an 8-bit compare an
+        # 8-bit compare rather than a widened unsigned one -- which is also
+        # what makes the signed forms SF != OF instead of SF alone, since a
+        # signed comparison of the two original operands IS SF != OF.
         if cmp_macro and rhs:
-            return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
+            return (f"{cmp_macro}(({_flag_utype})(({lhs}) + ({rhs})), "
+                    f"({_flag_utype})({rhs}))"), desc
         if jcc in ("jb", "jnae"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
-        if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
-        if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
-        if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
-        if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+        # jl/jge/jle/jg deliberately have no fallback below the reconstruction:
+        # they used to answer `result < 0`, which is SF, and SF is not the
+        # condition. Without the source operand OF is unknowable, so refuse.
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -624,21 +636,32 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
-        if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
-        if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
-        if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
-        if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+        if jcc in ("jl", "jle", "jg", "jge") and rhs:
+            # x86's signed conditions are SF != OF, not SF: `add eax, 1` at
+            # 0x7FFFFFFF leaves SF=1 and OF=1, so jl is NOT taken, where
+            # `(int32_t)eax < 0` says it is. Same shape as the dec/inc branch
+            # below, which already does this.
+            #
+            # Both bits fall out of the UNtruncated sum. With no overflow SF is
+            # its sign and OF is 0; with overflow SF is the opposite of its
+            # sign and OF is 1. Either way SF != OF is exactly "the exact sum
+            # is negative", so sign-extend both operands to int64 and add them
+            # there, where nothing is lost. The original destination comes back
+            # the way the carry conditions above recover it -- result minus the
+            # source, wrapped to the operand's own width.
+            a_orig = f"(int64_t){_sf_cast}({_flag_utype})(({lhs}) - ({rhs}))"
+            src = f"(int64_t){_sf_cast}({_flag_utype})({rhs})"
+            less = f"(({a_orig} + {src}) < 0)"
+            return {"jl": less, "jge": f"(!{less})",
+                    "jle": f"(({lhs} == 0) || {less})",
+                    "jg": f"(({lhs} != 0) && !{less})"}[jcc], desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -3156,16 +3179,35 @@ class Lifter:
             if len(ops) >= 1 and ops[0].type == "mem":
                 op = ops[0]
                 size = op.mem_size
-                int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
-                    size, "int32_t")
                 bits = {2: 16, 4: 32, 8: 64}.get(size, 32)
                 pc = getattr(op, "insn_address", getattr(insn, "address", 0))
                 function = getattr(op, "function_address", self.func_start)
                 addr = _fmt_store_address(op)
                 pop = " fp_pop();" if m == "fistp" else ""
+                # The same float -> int rule the SSE path already uses, which
+                # this one was simply missed by. `(int_type)llrint(x)` is wrong
+                # twice over: llrint saturates on AArch64 where x86 stores the
+                # integer indefinite (NaN reads back as 0, not 0x80000000), and
+                # narrowing its long long result is undefined behaviour for
+                # exactly the out-of-range values the sentinel is about.
+                # FIST/FISTP rounds -- under the x87 control word rather than
+                # MXCSR, but with the same nearest-even default -- so it is the
+                # ROUND helper at the destination's own width, never TRUNC.
+                #
+                # Not a corner of the title: sub_0017C3E8 is MSVC's _ftol2 --
+                # 432 call sites across 129 functions in JSRF, i.e. it is *the*
+                # (int)float conversion for the whole image -- and its
+                # `fistp qword ptr [esp+0x10]` lands here. That routine does
+                # NOT reprogram the control word: it converts nearest-even,
+                # reloads with fild, and corrects toward zero with the residue
+                # (fsubp / add 0x7FFFFFFF / adc-sbb), all of which is ordinary
+                # arithmetic we already lift. So nearest-even is the right mode
+                # to hand it, and the truncation falls out of the guest's code.
+                helper = {16: "RECOMP_F2I16_ROUND",
+                          64: "RECOMP_F2I64_ROUND"}.get(bits, "RECOMP_F2I_ROUND")
                 return [f"RECOMP_MEM_WRITE{bits}(0x{pc:08X}u, "
                         f"0x{function:08X}u, {addr}, "
-                        f"({int_type})llrint(fp_top()));{pop} /* {m} */"]
+                        f"{helper}(fp_top()));{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",

@@ -49,7 +49,7 @@ class FpuLifterTest(unittest.TestCase):
         self.assertEqual(
             Lifter().lift_instruction(store),
             ["RECOMP_MEM_WRITE64(0x00000000u, 0x00000000u, esp + 0x10, "
-             "(int64_t)llrint(fp_top())); "
+             "RECOMP_F2I64_ROUND(fp_top())); "
              "fp_pop(); /* fistp */"],
         )
         self.assertEqual(

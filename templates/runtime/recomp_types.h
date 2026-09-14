@@ -345,6 +345,45 @@ static inline int32_t RECOMP_F2I_ROUND(double v) {
     return (int32_t)r;
 }
 
+/* The other two destination widths, for FIST/FISTP.
+ *
+ * The indefinite is the destination's own most-negative value, not the int32
+ * one: a `fistp word ptr` out of range stores 0x8000, and a `fistp qword ptr`
+ * stores 0x8000000000000000. Narrowing the int32 helper's answer would write
+ * 0 into a 16-bit slot and lose the sentinel entirely.
+ *
+ * Only the rounding form exists at these widths because only FIST/FISTP
+ * reaches them, and FIST always rounds -- under the x87 control word rather
+ * than MXCSR, but with the same nearest-even default, which is what nearbyint
+ * gives under the host's untouched rounding mode. There is no 16- or 64-bit
+ * CVTT to want a truncating sibling.
+ *
+ * The int64 bound has to be written as the literal 2^63 and not as
+ * (double)INT64_MAX: INT64_MAX is not representable as a double and converting
+ * it rounds UP to 2^63, so `r < (double)INT64_MAX` would admit exactly the one
+ * value that overflows. 9223372036854775808.0 is a power of two, so it is
+ * exact, and as an exclusive bound it is the correct one. The low bound is
+ * inclusive for the same reason in reverse -- -2^63 IS int64's minimum. */
+#define RECOMP_INT16_INDEFINITE ((int16_t)0x8000)
+#define RECOMP_INT64_INDEFINITE ((int64_t)(-9223372036854775807LL - 1))
+
+static inline int16_t RECOMP_F2I16_ROUND(double v) {
+    double r;
+    if (v != v) return RECOMP_INT16_INDEFINITE; /* nearbyint would propagate it */
+    r = nearbyint(v);
+    if (!(r >= -32768.0 && r < 32768.0)) return RECOMP_INT16_INDEFINITE;
+    return (int16_t)r;
+}
+
+static inline int64_t RECOMP_F2I64_ROUND(double v) {
+    double r;
+    if (v != v) return RECOMP_INT64_INDEFINITE; /* nearbyint would propagate it */
+    r = nearbyint(v);
+    if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0))
+        return RECOMP_INT64_INDEFINITE;
+    return (int64_t)r;
+}
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */
@@ -405,10 +444,23 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* Guarded because a harness may force-include its own header that defines
+ * these first -- JSRF's guest_trace.h is force-included via -include and does
+ * exactly that. Unguarded, the two collide once per translation unit, and the
+ * collision was invisible for as long as the title was compiled with a blanket
+ * -w. It happens to be harmless today: the two definitions differ only by a
+ * (uint32_t) cast on va, and this one wins because it is textually later. That
+ * is luck, not design -- whoever next gives a harness a DIFFERENT tracer would
+ * find this one silently overriding it. First definition wins now, which is the
+ * rule that lets a harness mean what it says. */
 void recomp_trace_enter(const char *name, uint32_t va);
+#ifndef RECOMP_TRACE_ENTER
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
+#endif
 void recomp_trace_exit(const char *name, uint32_t va);
+#ifndef RECOMP_TRACE_EXIT
 #define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
+#endif
 void recomp_trace_esp(const char *name, const char *tag);
 #define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
 
