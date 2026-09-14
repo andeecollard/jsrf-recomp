@@ -147,6 +147,14 @@ if(NOT WIN32)
     add_executable(jsrf_input_hotplug_test input_hotplug_test.c)
     target_link_libraries(jsrf_input_hotplug_test PRIVATE xbox_input)
     add_test(NAME jsrf_input_hotplug COMMAND jsrf_input_hotplug_test)
+
+    # Nothing gave the controller back when a run was killed, so the next run
+    # opened a device that never sent a report again -- indistinguishable from
+    # a broken pad, and it cost most of a hand-played session. See the test's
+    # own comment.
+    add_executable(jsrf_input_release_test input_release_test.c)
+    target_link_libraries(jsrf_input_release_test PRIVATE xbox_input)
+    add_test(NAME jsrf_input_release COMMAND jsrf_input_release_test)
 endif()
 
 add_executable(jsrf_first_fault

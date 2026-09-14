@@ -308,6 +308,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>      /* release the pad on SIGTERM/SIGINT */
 #include <ctype.h>      /* RECOMP_PAD_SCRIPT parses its schedule */
 #include <strings.h>    /* strncasecmp, so button names are case-insensitive */
 
@@ -398,6 +399,60 @@ static void refresh_controllers(int force)
     }
 }
 
+/* Give the pad back, and do it on the way out of a killed run.
+ *
+ * THE BUG THIS FIXES cost most of a hand-played session. Nothing released the
+ * controller when the process died: SDL_GameControllerClose appears only in
+ * the hotplug path above, there is no signal handler, and main.c deliberately
+ * uses _exit so no atexit handler can run -- for good reasons, see its comment
+ * about dumps confusing the run that follows. Every run therefore ended with
+ * the HID interface still claimed by a dead process.
+ *
+ * The next run then opens the device, gets a handle, and receives nothing ever
+ * again: polls climb, connected tracks them, nonneutral stays flat. It reads
+ * exactly like a broken controller. On a DualShock 4 over USB it compounds --
+ * the pad drops back to charge-only and will not send reports until its PS
+ * button is pressed. Four reconnections went into that on 14 Sep 2026 before
+ * anyone looked here.
+ *
+ * Deliberately minimal: this releases the pad and nothing else. No dumps, no
+ * flushing of other instruments -- those are precisely what main.c avoids at
+ * exit, and a handler that did more would be a different kind of problem.
+ *
+ * SIGKILL cannot be caught, so this only helps when a run is stopped with
+ * SIGTERM or SIGINT. play.sh and play_scripted.sh already send TERM first and
+ * escalate to -9 only after five seconds; stopping a run by hand should follow
+ * the same order rather than reaching straight for kill -9. */
+void xbox_InputReleasePads(void)
+{
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if (g_pads[slot]) {
+            SDL_GameControllerClose(g_pads[slot]);
+            g_pads[slot] = NULL;
+            g_controller_connected[slot] = FALSE;
+        }
+    }
+    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+        SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+}
+
+/* Re-raise with the default disposition so the exit status stays honest: a run
+ * killed by SIGTERM still reports as killed by SIGTERM, which is what the
+ * watchdogs in play.sh and play_scripted.sh expect to see. The once-guard means
+ * a second signal arriving while we are still inside SDL takes the default
+ * action immediately rather than deadlocking in here. */
+static volatile sig_atomic_t g_release_in_progress;
+
+static void pad_signal_handler(int sig)
+{
+    if (!g_release_in_progress) {
+        g_release_in_progress = 1;
+        xbox_InputReleasePads();
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 void xbox_InputInit(void)
 {
     /* Without this, SDL discards controller input whenever the window is not
@@ -411,6 +466,23 @@ void xbox_InputInit(void)
 
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+
+    /* AFTER SDL is up, and that ordering is the whole point.
+     *
+     * SDL_InitSubSystem installs signal handlers of its own -- it catches
+     * SIGTERM and SIGINT to post a quit event rather than die. Installing ours
+     * first, which is what this did at first and what its comment argued for,
+     * means SDL simply overwrites them: the handler never runs, the pad is
+     * never released, and nothing says so. Caught by input_release_test, whose
+     * child exited 42 instead of dying by SIGTERM.
+     *
+     * The cost of installing after is a window during subsystem init where a
+     * signal takes SDL's disposition instead of ours. That window is
+     * milliseconds and leaks nothing that was not already leaking; being
+     * clobbered for the entire run is the worse failure by far. */
+    signal(SIGTERM, pad_signal_handler);
+    signal(SIGINT, pad_signal_handler);
+
     refresh_controllers(1);
 
     /* Anchor RECOMP_PAD_SCRIPT's t=0 here rather than at the first poll. The

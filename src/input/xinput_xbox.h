@@ -96,6 +96,12 @@ double xbox_InputSeconds(void);
  */
 void xbox_InputInit(void);
 
+/* Close any opened controllers and drop SDL's gamecontroller subsystem.
+ * Called from the SIGTERM/SIGINT handler installed by xbox_InputInit, because
+ * nothing else released the HID device when a run was killed -- see the long
+ * comment on the definition. Safe to call more than once. */
+void xbox_InputReleasePads(void);
+
 /**
  * Get the state of a controller.
  * Port: 0-3 (Xbox controller ports)

@@ -1097,6 +1097,13 @@ static void jsrf_pusher_report(void)
         {
             extern void mcpx_apu_pacing_report(void);
             mcpx_apu_pacing_report();
+            /* Ordinal 153 was routed for the first time on 14 Sep 2026 and the
+             * first hand-played session with it froze during a grind. Its own
+             * warning only fires on a contended interlock, so a quiet log could
+             * not distinguish "never called" from "called cleanly" -- print the
+             * call count so the next freeze can be attributed or ruled out. */
+            extern void xbox_ReportSyncExec(void);
+            xbox_ReportSyncExec();
         }
         /* Whether the pad is being asked, and whether it answers. The
          * "(opened)" line at startup answers neither. */

@@ -3624,6 +3624,47 @@ static void bridge_KeInsertQueueDpc(void)
 #define BRIDGE_SYNC_SPIN_TRIES 256
 
 static unsigned long g_sync_exec_unsynchronised;
+/* Plain call count, because the warning above only fires when the interlock is
+ * contended -- so a silent log could mean "never called" or "called hundreds of
+ * times, cleanly", and on 14 Sep 2026 those two were indistinguishable while
+ * trying to attribute a freeze. Reported by xbox_ReportSyncExec below. */
+static unsigned long g_sync_exec_calls;
+
+/* Ordinal 153 off-switch, and this one is justified by a measurement rather
+ * than by caution: the first hand-played session with this bridge routed froze
+ * during a rail grind -- framebuffer identical for 15 consecutive seconds, ADX
+ * tick stuck, pushbuffer waiting on a fence. The bridge's own comment names
+ * that risk: it takes the interrupt-delivery interlock and sets g_in_isr across
+ * a GUEST routine, and both call sites are DSOUND on the audio vectors, so a
+ * routine that waits inside the region stops interrupt delivery for everyone.
+ *
+ * This is a bisect handle, not a verdict -- the freeze is a known class here
+ * with other causes on record. Set RECOMP_NO_KE_SYNC_EXEC=1 to take ordinal
+ * 153 back to the unbridged behaviour every prior measurement was made
+ * against, and play the same way. If it still freezes, 153 is exonerated. */
+static int bridge_sync_exec_disabled(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *v = getenv("RECOMP_NO_KE_SYNC_EXEC");
+        off = (v && *v && *v != '0') ? 1 : 0;
+        if (off) {
+            fprintf(stderr, "  [KERNEL] KeSynchronizeExecution (153) DISABLED "
+                    "by RECOMP_NO_KE_SYNC_EXEC; returning FALSE without "
+                    "running the routine, as before it was bridged\n");
+            fflush(stderr);
+        }
+    }
+    return off;
+}
+
+void xbox_ReportSyncExec(void)
+{
+    fprintf(stderr, "  [KE-SYNC] calls=%lu unsynchronised=%lu disabled=%d\n",
+            g_sync_exec_calls, g_sync_exec_unsynchronised,
+            bridge_sync_exec_disabled());
+    fflush(stderr);
+}
 
 static void bridge_KeSynchronizeExecution(void)
 {
@@ -3633,6 +3674,12 @@ static void bridge_KeSynchronizeExecution(void)
     recomp_func_t fn;
     int nested = (g_in_isr || g_in_dpc);
     int locked = 0;
+
+    g_sync_exec_calls++;
+    if (bridge_sync_exec_disabled()) {
+        g_eax = 0;   /* exactly what the unbridged dispatcher did */
+        return;
+    }
 
     if (!routine_va) {
         /* The real kernel would call through a null pointer and bugcheck.
