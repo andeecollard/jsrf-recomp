@@ -1143,6 +1143,7 @@ static void jsrf_pusher_report(void)
                                      g_ohci_wdh_longest_ms;
                 extern unsigned long g_ohci_tds_retired, g_ohci_tds_error;
                 extern unsigned long g_pcrtc_untrapped, g_pcrtc_windows;
+                extern unsigned long g_sched_absolute_deadlines;
                 /* HcInterruptEnable and the published HCCA done head, every
                  * report, because the stall snapshot found WDH set with only
                  * the master enable bit on -- and that is only a cause if the
@@ -1169,6 +1170,12 @@ static void jsrf_pusher_report(void)
                             g_pcrtc_windows, g_pcrtc_untrapped,
                             g_pcrtc_untrapped ? "   <-- the NV2A aperture is"
                                                 " losing guest writes" : "");
+                    if (g_sched_absolute_deadlines)
+                        fprintf(stderr,
+                                "  [SCHED] %lu waits passed an ABSOLUTE deadline,"
+                                " which is reported as already due -- a retry"
+                                " loop there spins\n",
+                                g_sched_absolute_deadlines);
                 }
                 fflush(stderr);
             }

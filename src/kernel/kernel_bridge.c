@@ -1517,6 +1517,9 @@ static void bridge_restore_regs(const BridgeGuestRegs *r)
 
 /* kernel_sync.c keeps this file-static; the guest-object wait below needs the
  * same NT timeout conversion (NULL = infinite, negative = relative 100ns). */
+/* Guest waits that passed an absolute deadline; see the return below. */
+unsigned long g_sched_absolute_deadlines;
+
 static DWORD bridge_nt_timeout_to_ms(uint32_t timeout_va)
 {
     int64_t t;
@@ -1524,7 +1527,19 @@ static DWORD bridge_nt_timeout_to_ms(uint32_t timeout_va)
     t = (int64_t)((uint64_t)BRIDGE_MEM32(timeout_va) |
                   ((uint64_t)BRIDGE_MEM32(timeout_va + 4) << 32));
     if (t < 0) return (DWORD)((-t) / 10000);   /* relative 100ns -> ms */
-    return 0;   /* absolute deadline: treat as already due */
+    /* An ABSOLUTE deadline, which this does not implement: it is reported as
+     * already due, so the caller gets STATUS_TIMEOUT immediately and a guest
+     * that retries in a loop spins.
+     *
+     * Whether JSRF ever passes one was never measured, and the cost of
+     * finding out is a counter. Zero here means the shortcut is free and the
+     * missing implementation can stay missing; anything else means a thread is
+     * burning a core on a wait that never waits, which would read as "the
+     * title is slow" and never point here. Counted rather than fixed, because
+     * implementing absolute deadlines against the guest's own clock is a real
+     * piece of work and should not be done on a guess. */
+    ++g_sched_absolute_deadlines;
+    return 0;
 }
 
 /* Which dispatcher objects are ever signalled, and which are only waited on.
