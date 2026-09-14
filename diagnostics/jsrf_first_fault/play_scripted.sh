@@ -29,10 +29,15 @@
 #
 # Measured 14 Sep 2026, same binary, same schedule, same boot prefix, four runs:
 #
-#     live audio device      1342, 1342 opens   -- never left the title
-#     device forced off      1408, 1410 opens   -- reached New Game, both times
+#     live audio device      1342, 1342 opens         0 of 2 left the title
+#     device forced off      1408, 1410, 1342 opens   2 of 3 reached New Game
 #
-# Clean separation, and with a mechanism that fits: the APU throttles to real
+# CORRECTED: this said "clean separation" on the first two runs of the
+# forced-off arm. The third forced-off run stayed at 1342, so the effect is
+# 2/3 against 0/2, not 2/2 against 0/2. It is a lean, not a switch, and it is
+# n=5 in total. (That third run ALSO took a 76 s input-poll stall, so it is
+# unhealthy on a second axis -- see the INPUT verdict below.) A mechanism does
+# fit: the APU throttles to real
 # time against the device (slept= is essentially the whole run), so with no
 # device the title advances through the logos at a different rate and the fixed
 # pad schedule lands differently. Two runs per arm is not proof, but it is a
@@ -135,6 +140,37 @@ FIRED=$(grep -c '\[PAD-SCRIPT\] .* fire ' "$OUT/stderr.log")
 echo "${LAST_VOICE:-  [APU-VOICE] (no report -- did the run reach one?)}"
 echo "${LAST_FRAME:-  [APU-FRAME] (no report)}"
 echo "  pad events fired: $FIRED"
+
+# Gate 0b: did the guest stop READING the pad partway through?
+#
+# The input-poll stall is a known failure mode here and it is invisible in
+# every other number: the schedule still runs to completion, the last event
+# still fires at its scheduled time, and the average poll rate barely moves,
+# because the stall is one long silence inside an otherwise healthy run.
+# Measured 14 Sep 2026: a run that fired 128 of 202 events had a SEVENTY-SIX
+# SECOND gap between t=164 and t=240, with a 19 ms mean poll interval either
+# side -- identical, to three significant figures, to a run that fired all 202.
+# Counting events or averaging polls cannot see it. The gap can.
+#
+# Anything scheduled inside the gap simply did not happen, so a run with a
+# large one cannot support a claim about what the input did or did not cause.
+BIGGEST_GAP=$(grep '\[PAD-SCRIPT\] .* fire ' "$OUT/stderr.log" \
+    | sed 's/.*t= *\([0-9.]*\).*/\1/' \
+    | awk 'NR>1 && $1-p>g { g=$1-p; a=p; b=$1 } { p=$1 } END { printf "%.1f %.2f %.2f", g, a, b }')
+GAP_S=${BIGGEST_GAP%% *}
+case "$GAP_S" in
+    ''|*[!0-9.]*) GAP_S=0 ;;
+esac
+# 10 s: comfortably above this schedule's own 9 s spacing at the boot/play seam,
+# so ordinary gaps do not trip it.
+if [ "$(/usr/bin/python3 -c "print(1 if $GAP_S >= 10 else 0)" 2>/dev/null || echo 0)" = "1" ]; then
+    echo "  INPUT:   POLL STALL -- ${BIGGEST_GAP%% *}s with no event firing" \
+         "(t=$(echo "$BIGGEST_GAP" | cut -d' ' -f2) to $(echo "$BIGGEST_GAP" | cut -d' ' -f3))."
+    echo "           The guest stopped reading the pad. Everything scheduled in"
+    echo "           that window did not happen; do not attribute anything to input."
+else
+    echo "  INPUT:   no poll stall (largest gap ${GAP_S}s)"
+fi
 echo "  NtOpenFile:       $OPENS   (~1342 = title plateau, 1408 = New Game)"
 
 # Gate 0, and it comes first because it invalidates everything below it.

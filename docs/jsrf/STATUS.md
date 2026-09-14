@@ -49,8 +49,16 @@ vsh 7.52 | submit 8.41 | GPU sync 0.98 | rest (guest CPU) 15.03  = 31.94 ms
 
 The guest-CPU half is as large as all graphics work combined.
 
-**Whether that 15 ms is compute or blocked waiting: measured 2026-09-14, and it
-is blocked.** A 10 s `sample` of the live process at gameplay, top-of-stack:
+**Whether that 15 ms is compute or blocked waiting: the profile below is REAL
+but it was taken AT THE TITLE, not at gameplay.** It was described here as a
+gameplay profile; that was wrong. The run it was sampled from finished at 1342
+`NtOpenFile`, the attract-screen plateau, so it never reached gameplay at all —
+and "at gameplay rather than at the title, which is what was actually in doubt"
+had it exactly backwards. Retaking it properly is still open, and is now cheap:
+see the audio-device note in `play_scripted.sh` for how to get a reliable
+unattended boot.
+
+A 10 s `sample` of the live process **at the attract screen**, top-of-stack:
 
 | samples | frame | |
 |---|---|---|
@@ -64,9 +72,10 @@ is blocked.** A 10 s `sample` of the live process at gameplay, top-of-stack:
 | 8 | `_platform_memcmp` | host compute |
 | 5 | `draw_primitive` | host compute |
 
-≈93% blocked against ≈100 samples of real compute. That reproduces the earlier
-"93% blocked" profile, but **at gameplay** rather than at the title, which is
-what was actually in doubt.
+≈93% blocked against ≈100 samples of real compute. That matches the earlier
+"93% blocked" figure — but at the same kind of scene it was already known for,
+so it **confirms nothing that was in doubt**. The gameplay profile, which is
+the one the 15 ms question needs, has still not been taken.
 
 The one large guest entry, `sub_0013B180`, is a spin on `0x0025EFC0` that
 increments a counter at `0x0025EFA8` while it waits. Its exit path pushes

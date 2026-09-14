@@ -51,14 +51,16 @@
 # THE AUDIO DEVICE IS THE VARIABLE. That started as a hunch off one run and was
 # then tested properly, same binary and same prefix throughout:
 #
-#     live audio device      1342, 1342   never left the title
-#     device forced off      1408, 1410   reached New Game, both times
+#     live audio device      1342, 1342         0 of 2 left the title
+#     device forced off      1408, 1410, 1342   2 of 3 reached New Game
 #
 # Forced off with SDL_AUDIODRIVER=no_such_driver, which makes apu_sdl2_init
-# fail deterministically. Two runs an arm is not proof, but the separation is
-# clean and the mechanism fits: the APU throttles against the real device, so
-# without one the title moves through the logos at a different rate and this
-# fixed schedule lands differently.
+# fail deterministically. CORRECTED from an earlier version of this note that
+# read the first two forced-off runs as a clean 2/2 separation: the third
+# stayed at 1342. It is a lean, not a switch. A mechanism fits -- the APU
+# throttles against the real device, so without one the title moves through the
+# logos at a different rate and this fixed schedule lands differently -- but
+# n=5 total does not carry more than that.
 #
 # For anything NOT about audio, run with the device forced off and the boot
 # becomes reliable. For audio measurements you need it on, and then this
