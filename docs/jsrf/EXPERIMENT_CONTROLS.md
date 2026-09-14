@@ -68,3 +68,31 @@ on 11 Sep. **Any conclusion resting on that file's counters is void.**
 
 The switch is removed from the scripts. `src/usb/ohci.c` is left in place
 because it is upstream's, and deleting it would diverge the tree for no gain.
+
+## Two things a green `ctest` does not cover (14 Sep 2026)
+
+**`tests/` at the repository root is inert.** `tests/audio_mixer`,
+`tests/d3d8_smoke`, `tests/mmio_decode` and `tests/xaudio2` are built by
+nothing: no `add_subdirectory(tests)` exists in any CMakeLists, and two of the
+four have no CMakeLists of their own. They are upstream's and are left in
+place, but **nobody should read 28/28 from `ctest` as covering them** -- the
+28 are `diagnostics/jsrf_first_fault`'s, and that is the whole of the C-side
+coverage this fork runs.
+
+**The APU asserts are a latent footgun, not a live bug.** `src/apu/apu_vp.c`
+has 22 `assert()` calls, several on values the guest supplies directly --
+`assert(current_voice < MCPX_HW_MAX_VOICES)` where `current_voice` is
+`d->regs[NV_PAPU_FECV]`, a register the title writes. `RelWithDebInfo`
+deliberately omits `-DNDEBUG` (and that is the right call: the model is xemu's
+and is held together by those asserts, so deleting them silently would be a
+semantic change wearing an optimisation's clothes). The consequence is that a
+malformed guest write would abort the process rather than being rejected.
+
+Measured before changing anything: **zero aborts across 397 recorded runs** --
+no `SIGABRT`, no `Abort trap`, no `Assertion failed`. So the title does not
+write an out-of-range voice index, and the asserts have never fired. They are
+left exactly as they are.
+
+What this buys is a diagnosis for free later: if a crash ever presents as
+SIGABRT rather than SIGSEGV, it is almost certainly one of these, and the
+guest wrote something the model does not model. Look here first.
