@@ -19,8 +19,10 @@ OUT="${TMPDIR:-/tmp}/jsrf-batch-check.$$"
 mkdir -p "$OUT" || exit 1
 trap 'rm -rf "$OUT"' EXIT INT TERM
 
+# Batching is the default now, so the per-draw arm is the one that needs the
+# switch. Setting it to 1 for the other arm is redundant but says which is which.
 echo "per-draw:"
-                       "$BIN" "$OUT/per-draw.bin" || exit 1
+RECOMP_METAL_BATCH=0   "$BIN" "$OUT/per-draw.bin" || exit 1
 echo "batched:"
 RECOMP_METAL_BATCH=1   "$BIN" "$OUT/batched.bin"  || exit 1
 

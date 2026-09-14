@@ -27,8 +27,9 @@
  * from the rasteriser differently would mean the two runs had not done the
  * same work.
  *
- * Run twice -- the switch is read once per process:
- *     jsrf_metal_batch_test  a.bin
+ * Run twice -- the switch is read once per process, and batching is the
+ * default, so it is the per-draw arm that has to ask for itself:
+ *     RECOMP_METAL_BATCH=0 jsrf_metal_batch_test  a.bin
  *     RECOMP_METAL_BATCH=1 jsrf_metal_batch_test  b.bin
  *     cmp a.bin b.bin
  * metal_batch_check.sh does that and reports it.
@@ -130,7 +131,8 @@ static int draw(const NV2ATextureCopy *s, const uint8_t *tex,
 
 int main(int argc, char **argv)
 {
-    const char *mode = getenv("RECOMP_METAL_BATCH") ? "batched" : "per-draw";
+    const char *e = getenv("RECOMP_METAL_BATCH");
+    const char *mode = (!e || atoi(e)) ? "batched" : "per-draw";
     unsigned d, i, oracle_bad = 0, oracle_zbad = 0;
 
     for (i = 0; i < TEXTURES; ++i)

@@ -84,8 +84,34 @@ static void batch_flush(void);
 /* -1 forces off, 1 forces on, 0 defers to the switch. The frame benchmark
  * drives both paths inside one process, so it cannot use the environment. */
 static int batch_force;
+/* ON by default since 14 Sep 2026; RECOMP_METAL_BATCH=0 restores the per-draw
+ * path. What that default rests on, and what it does not:
+ *
+ *   image      identical colour and depth to the per-draw path across the five
+ *              boundaries metal_batch_test exercises -- overlapping blended and
+ *              depth-tested draws, a staging ring wrap, texture-cache eviction,
+ *              a render-target change, and interleaved invalidate/readback.
+ *              Correctness for those cases, not in general.
+ *   lifetime   metal_ring_test: pinning each slab once per batch protects
+ *              staging memory as well as pinning per command buffer did, with
+ *              a control that corrupts 2392 of 4000 when pinning is removed.
+ *   speed      replaying one captured 492-draw frame through both paths, 25
+ *              alternating trials: 69.2 ms to GPU completion per-draw against
+ *              46.5 ms batched, distributions not overlapping. A 16-draw frame
+ *              gives 11.1 against 8.8 ms, medians apart but tails overlapping.
+ *              That is replay rendering performance. It is NOT a measured
+ *              gameplay frame-rate gain -- the scripted runs never produced
+ *              matched enough workloads to claim one.
+ *   integration a 300 s gameplay run each way: no crash, no software fallback,
+ *              no rejected draw, the same resident-memory growth (196 -> 297
+ *              MB either way, so that growth is not this), input alive to the
+ *              end, and APU trap counts that track which scene the run reached
+ *              rather than which path it used.
+ */
 static int batch_on(void)
-{static int on=-1;if(batch_force)return batch_force>0;if(on<0)on=getenv("RECOMP_METAL_BATCH")?1:0;return on;}
+{static int on=-1;if(batch_force)return batch_force>0;
+ if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=e?(atoi(e)!=0):1;}
+ return on;}
 /* A cap exists so the effect of unbounded batching can be told apart from the
  * effect of batching at all, and so a pathological scene cannot defer the GPU
  * for an arbitrarily long time.  0 means no cap; the natural bound is the
@@ -1162,16 +1188,24 @@ static void bench_run(void)
             "  [FRAME-BENCH] Each trial restores the starting pixels and invalidates,\n"
             "  [FRAME-BENCH] so both arms pay one full surface re-upload; that fixed\n"
             "  [FRAME-BENCH] cost is in both columns and not in the difference.\n"
-            "  [FRAME-BENCH]   per-draw  issue %.3f ms (min %.3f, %.1f us/draw)"
-            "  to-gpu-done %.3f ms (min %.3f)\n"
-            "  [FRAME-BENCH]   batched   issue %.3f ms (min %.3f, %.1f us/draw)"
-            "  to-gpu-done %.3f ms (min %.3f)\n"
-            "  [FRAME-BENCH]   difference  issue %+.3f ms   to-gpu-done %+.3f ms\n",
-            trials, bench_n,
-            perc[trials/2]/1e6, perc[0]/1e6, perc[trials/2]/1e3/(double)bench_n,
-            per[trials/2]/1e6, per[0]/1e6,
-            batc[trials/2]/1e6, batc[0]/1e6, batc[trials/2]/1e3/(double)bench_n,
-            bat[trials/2]/1e6, bat[0]/1e6,
+            "  [FRAME-BENCH] Spread is min/p25/median/p75/max over the %u trials --\n"
+            "  [FRAME-BENCH] quoting only min and median would hide the tails.\n"
+            "  [FRAME-BENCH]   per-draw issue    %.3f %.3f %.3f %.3f %.3f ms  (%.1f us/draw)\n"
+            "  [FRAME-BENCH]   batched  issue    %.3f %.3f %.3f %.3f %.3f ms  (%.1f us/draw)\n"
+            "  [FRAME-BENCH]   per-draw gpu-done %.3f %.3f %.3f %.3f %.3f ms\n"
+            "  [FRAME-BENCH]   batched  gpu-done %.3f %.3f %.3f %.3f %.3f ms\n"
+            "  [FRAME-BENCH]   median difference   issue %+.3f ms   to-gpu-done %+.3f ms\n",
+            trials, bench_n, trials,
+            perc[0]/1e6, perc[trials/4]/1e6, perc[trials/2]/1e6,
+            perc[(3*trials)/4]/1e6, perc[trials-1]/1e6,
+            perc[trials/2]/1e3/(double)bench_n,
+            batc[0]/1e6, batc[trials/4]/1e6, batc[trials/2]/1e6,
+            batc[(3*trials)/4]/1e6, batc[trials-1]/1e6,
+            batc[trials/2]/1e3/(double)bench_n,
+            per[0]/1e6, per[trials/4]/1e6, per[trials/2]/1e6,
+            per[(3*trials)/4]/1e6, per[trials-1]/1e6,
+            bat[0]/1e6, bat[trials/4]/1e6, bat[trials/2]/1e6,
+            bat[(3*trials)/4]/1e6, bat[trials-1]/1e6,
             ((double)batc[trials/2]-(double)perc[trials/2])/1e6,
             ((double)bat[trials/2]-(double)per[trials/2])/1e6);
     }
