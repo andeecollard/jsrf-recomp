@@ -104,8 +104,22 @@
  * Both a run total and a per-report window, for the same reason [FRAME-WIN]
  * exists: a JSRF run is several workloads in sequence and the cumulative
  * average describes none of them. */
-typedef enum { PB_STAGE_VSH, PB_STAGE_SUBMIT, PB_STAGE_SYNC, PB_STAGE_N } PbStage;
-static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "submit", "sync" };
+/* CLEAR is a stage because it was not one, and that is where a measurable part
+ * of `rest` was hiding. clear_surface calls nv2a_gpu_invalidate_range with no
+ * timer around it; on Metal that is nv2a_metal_invalidate, which syncs. A
+ * sampling profile put 12.8% and 14.5% of the rendering thread's stacks under
+ * one clear_surface path in two captures of one run, most of it waiting for a
+ * command buffer or in the readback -- none of it attributed anywhere, because
+ * `rest` is wall time minus the timed regions rather than anything measured.
+ *
+ * The GPU synchronisation inside a clear is attributed HERE and not also to
+ * sync: the sync timer covers snapshot synchronisation only, and adding a
+ * nested cost to two stages would make the stages overlap and the residual
+ * meaningless. That is the whole point of splitting it out. */
+typedef enum { PB_STAGE_VSH, PB_STAGE_SUBMIT, PB_STAGE_SYNC, PB_STAGE_CLEAR,
+               PB_STAGE_N } PbStage;
+static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "submit", "sync",
+                                                       "clear" };
 static struct { unsigned long long us[PB_STAGE_N], n[PB_STAGE_N]; }
     s_stage_run, s_stage_win;
 
@@ -1605,6 +1619,7 @@ static int nv2a_range_hits_image(uint32_t guest_va, size_t bytes)
 
 static void clear_surface(uint32_t param)
 {
+    unsigned long long _t_clear = pb_now_us();
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
@@ -1711,9 +1726,9 @@ static void clear_surface(uint32_t param)
                       && !(s_methods[0x290/4]&0x1000)));
 #endif
     if (!(param & (NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G | NV097_CLEAR_SURFACE_B | NV097_CLEAR_SURFACE_A)))
-        return;                            /* depth/stencil only */
+        { pb_stage_add(PB_STAGE_CLEAR, _t_clear); return; }   /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
-        return;
+        { pb_stage_add(PB_STAGE_CLEAR, _t_clear); return; }
     {
         size_t bytes = (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h);
         int gpu_cleared = 0;
@@ -1844,6 +1859,7 @@ static void clear_surface(uint32_t param)
      * known to be real, because a clear just used it. Idempotent and gated on
      * RECOMP_FB_WINDOW, so the cost is one interlocked compare per clear. */
     xbox_FramebufferWindowStart();
+    pb_stage_add(PB_STAGE_CLEAR, _t_clear);
 }
 
 

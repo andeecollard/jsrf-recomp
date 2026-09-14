@@ -604,6 +604,16 @@ static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
  *
  * Sampling cannot recover this: the two writes land microseconds apart in init,
  * so a poll only ever sees the second. It has to be observed at write time. */
+/* RECOMP_OHCI_IEN_TRACE: the interrupt-mask write log. Off by default; see the
+ * write site for why. Resolved once, away from the signal handler, because
+ * getenv is not async-signal-safe. */
+static int ohci_ien_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_OHCI_IEN_TRACE") ? 1 : 0;
+    return on;
+}
+
 /* What the trap handler last left in HcInterruptEnable; see its store site. */
 static volatile uint32_t g_ohci_ien_expected;
 static volatile int g_ohci_ien_known;
@@ -1069,7 +1079,7 @@ static void ohci_periodic_tick(void)
         extern unsigned long g_ohci_tds_retired;
         uint32_t ien_now =
             *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
-        if (ien_now != last_ien) {
+        if (ien_now != last_ien && ohci_ien_trace()) {
             /* The value only. Comparing it against what the trap left is done
              * on the faulting thread now -- from here it races the guest's own
              * paired writes and reported a bypass that had not happened. */
@@ -1745,18 +1755,20 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
             fflush(stderr);
         }
     }
-    /* Every guest write to the interrupt mask, unconditionally and cheaply.
+    /* Every guest write to the interrupt mask -- OPT-IN, because there are
+     * tens of thousands of them.
      *
-     * The stall snapshot found HcInterruptEnable reading 80000000 while a
-     * healthy run reads 80000073 all the way through -- so the WritebackDoneHead
-     * enable bit is being LOST rather than never set, and the question is what
-     * takes it away. These two registers are the only things that can:
-     * HcInterruptEnable sets bits, HcInterruptDisable clears them. A guest
-     * write shows up here; if the bit disappears with no line printed, the
-     * guest did not do it and the model did. There are only a handful of these
-     * writes in a whole run, so this is not instrumentation weight. */
+     * The comment that used to stand here said "there are only a handful of
+     * these writes in a whole run, so this is not instrumentation weight",
+     * and left the fprintf and its fflush unconditional. That was wrong by
+     * three orders of magnitude: a 300 s gameplay run logs 70,608 of them, and
+     * a profile taken against that binary is measuring the logging as much as
+     * the title. The count was measurable from the first run that used this
+     * and I asserted it instead. RECOMP_OHCI_IEN_TRACE=1 turns it back on for
+     * the investigation it was written for. */
     if ((guest_va == XBOX_MCPX_BASE + 0x500010u ||
-         guest_va == XBOX_MCPX_BASE + 0x500014u) && width == 4) {
+         guest_va == XBOX_MCPX_BASE + 0x500014u) && width == 4
+        && ohci_ien_trace()) {
         extern unsigned long g_ohci_tds_retired;
         fprintf(stderr, "  [OHCI-IEN] guest writes %s <= %08X  (tds_retired=%lu)\n",
                 guest_va == XBOX_MCPX_BASE + 0x500010u ? "HcInterruptEnable "
@@ -4196,6 +4208,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * use: first use is inside the write trap's signal handler, where
              * getenv is not async-signal-safe. */
             xbox_UsbOhciInit();
+            (void)ohci_ien_trace();   /* same reason */
             xbox_UsbDeviceReset();
             xbox_McpxTrapInstall();
 #if defined(_WIN32)
