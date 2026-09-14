@@ -27,11 +27,27 @@ Gameplay frame budget: `vsh 7.52 | submit 8.41 | sync 0.98 | rest (guest CPU)
 15.03` of 31.94 ms, against a 16.67 ms budget. **The guest-CPU half is as large
 as all graphics work combined**, so this is not a pure renderer problem.
 
-*Open question, unresolved:* is that 15 ms compute or blocked waiting? A prior
-profile says the guest is "93% blocked", and `bridge_KeWaitForSingleObject` is a
-1 ms poll rather than a wait. An A/B of poll granularity at gameplay was
-attempted and **thrown away as invalid — the two runs reached different scenes**
-(live=161 vs live=61). Redo it scene-matched before believing any result.
+*Settled 2026-09-14: it is NOT wait-poll latency.* Four runs, paired by `live=`:
+
+| live | poll 1000us | poll 100us | delta |
+|---|---|---|---|
+| 11 | 88.5 | 92.7 | +4.7% |
+| 60 | 20.7 | 20.8 | +0.5% |
+| 61 | 24.9 | 25.4 | +2.0% |
+| 133 | 12.8 | 11.7 | -9.1% |
+
+Mean +2.4% with the scatter straddling zero — noise. Tenfold finer polling buys
+nothing, so the guest's 15 ms is real work or a different kind of blocking.
+(Unmatched, the same runs "showed" +60%; that was a scene difference, and it is
+why this table is paired by `live=`.)
+
+*Still open:* what the 15 ms actually is. A prior profile says the guest is "93%
+blocked". The standard architectural levers are already spent and measured:
+flat dispatch does not appear in the profile at all, the icall feedback loop
+changed nothing, and `-O2` on the title matched `-O0` within noise. Upstream's
+own analysis says guest-registers-in-memory is "the single biggest performance
+factor, and there is no fix short of a native backend" — which it also says not
+to build. So this needs a profiler pointed at it, not more architecture.
 
 ### 2. Audio: the engine is down about half the time during real play
 Two independent defects, both only visible with a controller in hand:
