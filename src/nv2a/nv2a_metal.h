@@ -15,4 +15,9 @@ void nv2a_metal_invalidate(uint8_t *target);
 const char *nv2a_metal_last_reject(void);
 /* Compact cumulative counters for live performance validation. */
 void nv2a_metal_report(void);
+/* Command-buffer accounting (RECOMP_METAL_CB_STATS=1). The frame count is
+ * bumped by the pushbuffer executor at the guest's own frame boundary,
+ * NV097_FLIP_STALL, because this file has no notion of a frame. */
+void nv2a_metal_cb_report(void);
+extern unsigned long long g_mtl_frames;
 #endif

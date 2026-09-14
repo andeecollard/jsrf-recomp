@@ -14,7 +14,139 @@ static id<MTLDevice> device;
 static id<MTLCommandQueue> queue;
 static id<MTLRenderPipelineState> pipeline;
 static id<MTLTexture> surface,stencil_surface;
+#include <time.h>
 static id<MTLCommandBuffer> last_command;
+
+/* Command-buffer accounting, opt-in via RECOMP_METAL_CB_STATS=1.
+ *
+ * This path creates a command buffer AND a render encoder per draw and commits
+ * immediately (see the draw function below), so command buffers per frame is
+ * draws per frame -- around 700k over a 300 s run. Whether that costs anything
+ * worth reclaiming is a measurement, not an assumption: Metal command buffers
+ * are cheap by design, and the encoder and pipeline state may dominate. Count
+ * and time the three phases separately before changing any of it. */
+unsigned long long g_mtl_cbufs, g_mtl_frames;
+unsigned long long g_mtl_ns_create, g_mtl_ns_encode, g_mtl_ns_commit;
+static int mtl_cb_stats(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_METAL_CB_STATS") ? 1 : 0;
+    return on;
+}
+static inline unsigned long long mtl_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+/* Batched submission: one command buffer and one render encoder across a run
+ * of consecutive draws, instead of one of each per draw.  RECOMP_METAL_BATCH=1.
+ *
+ * WHY THIS IS CORRECT, which is the only interesting part.
+ *
+ * Draw order.  Metal executes the commands in one render encoder in the order
+ * they were encoded, so encoding draws back to back into a single encoder
+ * preserves the order the guest emitted them in, exactly as committing one
+ * command buffer each did.
+ *
+ * Overlapping fragments.  This is where a per-draw command buffer was doing
+ * real work: it put a full barrier between draws, and the fragment shader here
+ * needs one, because it implements the guest's blending, depth test and
+ * stencil itself by reading the attachments back.  Inside a single encoder
+ * there is no such barrier -- but there does not need to be one, because the
+ * shader already declares both attachments raster_order_group(0) (see fs(),
+ * above), and that is precisely the guarantee that fragments covering the same
+ * pixel are read-modify-written in primitive order.  It was there before this
+ * change and is what makes this change legal; without it, batching would be
+ * wrong and would look right most of the time, which is worse.
+ *
+ * Staging lifetime.  Unchanged in substance: a slab is still pinned to the
+ * command buffer that reads it, before that buffer is committed, and released
+ * from its completion handler.  What changes is that one command buffer now
+ * covers several draws, so a slab is pinned once per batch rather than once
+ * per draw -- tracked in batch_pins so the in-flight count still matches the
+ * number of command buffers that can read the slab, not the number of draws.
+ *
+ * Flushing.  The batch must be committed before anything reads what the GPU
+ * has produced or invalidates what it is drawing into.  Every such site in the
+ * pushbuffer executor -- readback at a flip, a clear, a capture, a surface
+ * change, a rejected batch -- reaches the GPU through nv2a_metal_sync(), so
+ * one flush at the top of that function covers all of them.  The other flush
+ * is the ring wrap: the pins for the open batch have not been installed yet,
+ * so a wrap that waited on a slab this batch is about to read would wait for a
+ * command buffer that has not been committed and never will be.  Flushing
+ * first turns that deadlock into an ordinary wait. */
+static id<MTLCommandBuffer> batch_command;
+static id<MTLRenderCommandEncoder> batch_encoder;
+static unsigned batch_draws, batch_pins;
+static uint64_t batch_flushes, batch_draws_total, batch_longest;
+static void batch_flush(void);
+static int batch_on(void)
+{static int on=-1;if(on<0)on=getenv("RECOMP_METAL_BATCH")?1:0;return on;}
+/* A cap exists so the effect of unbounded batching can be told apart from the
+ * effect of batching at all, and so a pathological scene cannot defer the GPU
+ * for an arbitrarily long time.  0 means no cap; the natural bound is the
+ * frame, because the flip syncs. */
+static unsigned batch_cap(void)
+{static int cap=-1;if(cap<0){const char*e=getenv("RECOMP_METAL_BATCH_MAX");cap=e?atoi(e):0;if(cap<0)cap=0;}return(unsigned)cap;}
+
+/* GPU-side cost of the same command buffers, behind its OWN switch.
+ *
+ * The CPU numbers above are not the whole question and, measured, are not even
+ * the big half: one command buffer per draw means one render pass per draw,
+ * and a render pass over an RGBA32Float attachment pays a full tile load and a
+ * full tile store whatever it draws. That cost is invisible to a CPU timer.
+ *
+ * Reading it needs addCompletedHandler on every command buffer, which the ring
+ * comment measured at 0.20 us of producer-side cost -- small, but not nothing,
+ * and it perturbs exactly what the create/encode/commit timers measure. So it
+ * is a separate switch: take the CPU timing run clean, then take this one. */
+static int mtl_cb_gpu(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_METAL_CB_GPU") ? 1 : 0;
+    return on;
+}
+static _Atomic unsigned long long g_mtl_gpu_ns, g_mtl_sched_ns, g_mtl_gpu_n;
+static void mtl_cb_gpu_watch(id<MTLCommandBuffer> command)
+{
+    if (!mtl_cb_gpu()) return;
+    [command addCompletedHandler:^(id<MTLCommandBuffer> done){
+        double gpu = done.GPUEndTime - done.GPUStartTime;
+        double sched = done.kernelEndTime - done.kernelStartTime;
+        if (gpu > 0) atomic_fetch_add(&g_mtl_gpu_ns, (unsigned long long)(gpu * 1e9));
+        if (sched > 0) atomic_fetch_add(&g_mtl_sched_ns, (unsigned long long)(sched * 1e9));
+        atomic_fetch_add(&g_mtl_gpu_n, 1);
+    }];
+}
+
+void nv2a_metal_cb_report(void)
+{
+    if (!mtl_cb_stats()) return;
+    fprintf(stderr,
+            "  [METAL-CB] cbufs=%llu frames=%llu per_frame=%.1f"
+            " create=%.2fms encode=%.2fms commit=%.2fms (totals)\n",
+            g_mtl_cbufs, g_mtl_frames,
+            g_mtl_frames ? (double)g_mtl_cbufs / (double)g_mtl_frames : 0.0,
+            g_mtl_ns_create / 1e6, g_mtl_ns_encode / 1e6, g_mtl_ns_commit / 1e6);
+    if (batch_on())
+        fprintf(stderr,
+                "  [METAL-CB] batched: %llu flushes, %llu draws, %.1f draws/flush,"
+                " longest %llu\n",
+                batch_flushes, batch_draws_total,
+                batch_flushes ? (double)batch_draws_total / (double)batch_flushes : 0.0,
+                batch_longest);
+    if (mtl_cb_gpu()) {
+        unsigned long long n = atomic_load(&g_mtl_gpu_n);
+        fprintf(stderr,
+                "  [METAL-CB] gpu: %llu completed, %.2fms on the GPU,"
+                " %.2fms scheduling (totals; %.2fus and %.2fus each)\n",
+                n, atomic_load(&g_mtl_gpu_ns) / 1e6, atomic_load(&g_mtl_sched_ns) / 1e6,
+                n ? atomic_load(&g_mtl_gpu_ns) / 1e3 / (double)n : 0.0,
+                n ? atomic_load(&g_mtl_sched_ns) / 1e3 / (double)n : 0.0);
+    }
+    fflush(stderr);
+}
 static uint8_t *surface_target,*depth_target;
 static size_t surface_target_size,depth_target_size;
 static uint32_t surface_width,surface_height,surface_pitch,depth_pitch;
@@ -397,6 +529,9 @@ static id<MTLBuffer> ring_reserve(size_t bytes,size_t*offset_out,void**cpu_out,u
     if(ring_offset+need>RING_SLAB_BYTES){
         unsigned next=(ring_current+1u)%RING_SLABS;
         ++ring_wraps;
+        /* Before looking at the next slab's in-flight count: see the flushing
+         * paragraph above. An open batch holds unpinned reservations. */
+        batch_flush();
         /* Announce before looking, so a handler that drains the slab after we
          * have looked and before we sleep is guaranteed to see us and shout.
          * It takes ring_mutex to shout and we hold it from the look to the
@@ -442,6 +577,19 @@ static void ring_pin(id<MTLCommandBuffer>command,unsigned slab)
             pthread_mutex_lock(&ring_mutex);
             pthread_cond_broadcast(&ring_cond);
             pthread_mutex_unlock(&ring_mutex);}}];
+}
+
+static void batch_flush(void)
+{
+    if(!batch_encoder)return;
+    [batch_encoder endEncoding];
+    for(unsigned i=0;i<RING_SLABS;i++)if(batch_pins&(1u<<i))ring_pin(batch_command,i);
+    mtl_cb_gpu_watch(batch_command);
+    [batch_command commit];
+    last_command=batch_command;
+    if(batch_draws>batch_longest)batch_longest=batch_draws;
+    batch_draws_total+=batch_draws;++batch_flushes;
+    batch_command=nil;batch_encoder=nil;batch_pins=0;batch_draws=0;
 }
 
 void nv2a_metal_report(void)
@@ -521,6 +669,11 @@ int nv2a_metal_sync(void)
 {
     @autoreleasepool{
         ++sync_calls;
+        /* BEFORE the dirty test and before the wait. An open batch is work the
+         * GPU has not been told about, so last_command would be the previous
+         * committed buffer and waiting on it would read a surface that is
+         * missing every draw in the batch. */
+        batch_flush();
         if(!surface_dirty&&!depth_dirty){++sync_clean;return 1;}
         [last_command waitUntilCompleted];
         if(last_command.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[METAL] command failed: %s\n",last_command.error.description.UTF8String);return 0;}
@@ -688,7 +841,25 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    for(unsigned y=0;y<surface_height;y++)for(unsigned x=0;x<surface_width;x++){const uint8_t*p=target+(size_t)y*surface_pitch+x*2;unsigned c=p[0]|(unsigned)p[1]<<8;size_t at=((size_t)y*surface_width+x)*4;rgba[at]=(float)(c>>11)/31;rgba[at+1]=(float)((c>>5)&63)/63;rgba[at+2]=(float)(c&31)/31;if(next_depth){const uint8_t*z=next_depth+(size_t)y*next_depth_pitch+x*4;uint32_t q=(uint32_t)z[1]|(uint32_t)z[2]<<8|(uint32_t)z[3]<<16;rgba[at+3]=(float)q/16777215;stencil[(size_t)y*surface_width+x]=z[0];}else{rgba[at+3]=1;stencil[(size_t)y*surface_width+x]=0;}}
    [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;}
   MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;
-  id<MTLCommandBuffer>command=[queue commandBuffer];id<MTLRenderCommandEncoder>encoder=[command renderCommandEncoderWithDescriptor:pass];if(!command||!encoder)return reject("command-encoder");
+  unsigned long long _t0=mtl_cb_stats()?mtl_now_ns():0;
+  id<MTLCommandBuffer>command;id<MTLRenderCommandEncoder>encoder;
+  if(batch_on()){
+   /* An encoder already open is one whose pass descriptor still describes the
+    * live surface: the only thing that changes it is the surface upload above,
+    * which syncs, and a sync flushes. */
+   if(!batch_encoder){
+    batch_command=[queue commandBuffer];
+    batch_encoder=batch_command?[batch_command renderCommandEncoderWithDescriptor:pass]:nil;
+    if(!batch_command||!batch_encoder){batch_command=nil;batch_encoder=nil;return reject("command-encoder");}
+    if(mtl_cb_stats())g_mtl_cbufs++;
+   }
+   command=batch_command;encoder=batch_encoder;
+  }else{
+   command=[queue commandBuffer];encoder=command?[command renderCommandEncoderWithDescriptor:pass]:nil;
+   if(!command||!encoder)return reject("command-encoder");
+   if(mtl_cb_stats())g_mtl_cbufs++;
+  }
+  if(mtl_cb_stats()){g_mtl_ns_create+=mtl_now_ns()-_t0;_t0=mtl_now_ns();}
   Params p={0};p.width=s->clip_w;p.height=s->clip_h;p.dither=s->dither;p.untextured=s->untextured;p.combiner_count=s->combiner_count;p.texture_mask=s->texture_mask;p.add_specular=s->add_specular;p.alpha_test=s->alpha_test;p.alpha_ref=s->alpha_ref;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;{static int legacy=-1;if(legacy<0)legacy=getenv("RECOMP_LEGACY_ZCLAMP")?1:0;
    p.z_cull=legacy?0u:s->z_cull;}p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
@@ -735,5 +906,18 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * RECOMP_LEGACY_ZCLAMP=1 forces the old saturate-instead-of-discard
    * policy, to A/B the change in one binary. */
   [encoder setDepthClipMode:MTLDepthClipModeClamp];
-  [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];[encoder endEncoding];if(pinned_slab>=0)ring_pin(command,(unsigned)pinned_slab);[command commit];last_command=command;surface_dirty=1;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
+  [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+  if(batch_on()){
+   if(pinned_slab>=0)batch_pins|=1u<<(unsigned)pinned_slab;
+   ++batch_draws;
+   if(mtl_cb_stats()){g_mtl_ns_encode+=mtl_now_ns()-_t0;_t0=mtl_now_ns();}
+   if(batch_cap()&&batch_draws>=batch_cap())batch_flush();
+   if(mtl_cb_stats())g_mtl_ns_commit+=mtl_now_ns()-_t0;
+  }else{
+   [encoder endEncoding];if(mtl_cb_stats()){g_mtl_ns_encode+=mtl_now_ns()-_t0;_t0=mtl_now_ns();}
+   if(pinned_slab>=0)ring_pin(command,(unsigned)pinned_slab);
+   mtl_cb_gpu_watch(command);
+   [command commit];if(mtl_cb_stats())g_mtl_ns_commit+=mtl_now_ns()-_t0;last_command=command;
+  }
+  surface_dirty=1;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
 }

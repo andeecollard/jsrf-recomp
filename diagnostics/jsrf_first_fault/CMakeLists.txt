@@ -350,7 +350,14 @@ add_test(NAME jsrf_multitexture_fragment COMMAND jsrf_multitexture_fragment_test
 if(APPLE)
     add_executable(jsrf_metal_copy_test metal_copy_test.c)
     target_link_libraries(jsrf_metal_copy_test PRIVATE xbox_vsh)
-    # Explicit GPU test; do not turn headless CTest runs into device failures.
+    # Several draws into one encoder, compared against the software rasteriser.
+    # Run it BOTH ways -- the switch is read once per process, so the batched
+    # and per-draw cases are two invocations:
+    #     build/jsrf_metal_batch_test
+    #     RECOMP_METAL_BATCH=1 build/jsrf_metal_batch_test
+    add_executable(jsrf_metal_batch_test metal_batch_test.c)
+    target_link_libraries(jsrf_metal_batch_test PRIVATE xbox_vsh)
+    # Explicit GPU tests; do not turn headless CTest runs into device failures.
 endif()
 if(WIN32)
     # The same question for the D3D11 path, and the same reason it is not a

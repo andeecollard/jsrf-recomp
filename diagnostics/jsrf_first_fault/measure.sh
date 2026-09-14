@@ -30,30 +30,17 @@ OUT="$ROOT/build-macos/jsrf-first-fault/measure/$NAME"
 SCRATCH="/tmp/jsrf-measure-$NAME"
 BIN="${JSRF_BIN:-$ROOT/build-macos/jsrf-first-fault/build/jsrf_first_fault}"
 
-# Which binary, and is it current? Five scripts here defaulted to
-# build-macos/jsrf-first-fault/build for a session while every measurement was
-# taken against a different tree, so a run could silently be the old -O0 build.
-# The binary now prints its own optimisation level at startup ([BUILD]); this
-# checks the other half, that it is not simply stale.
-if [ ! -x "$BIN" ]; then
-    echo "no binary at $BIN" >&2
-    echo "  build it:  cmake -S diagnostics/jsrf_first_fault -B ${BIN%/*} && cmake --build ${BIN%/*} -j 6" >&2
-    exit 1
-fi
-NEWER=$(find "$ROOT/src" "$ROOT/diagnostics/jsrf_first_fault" -name '*.c' -o -name '*.h' -o -name '*.m' 2>/dev/null \
-        | grep -v ' 2\.c$' | while read -r f; do [ "$f" -nt "$BIN" ] && echo "$f"; done | head -3)
-if [ -n "$NEWER" ]; then
-    echo "WARNING: $BIN is older than these sources -- rebuild, or you are measuring the previous build:" >&2
-    echo "$NEWER" | sed 's/^/    /' >&2
-    [ -n "${JSRF_ALLOW_STALE:-}" ] || { echo "  (set JSRF_ALLOW_STALE=1 to run anyway)" >&2; exit 1; }
-fi
-
-if pgrep -x jsrf_first_fault >/dev/null 2>&1; then
-    echo "REFUSING: jsrf_first_fault is already running (pid $(pgrep -x jsrf_first_fault | tr '\n' ' '))" >&2
-    exit 2
-fi
+# Which binary, and is it current, and is the disc image the one we think?
+# Five scripts here defaulted to build-macos/jsrf-first-fault/build for a
+# session while every measurement was taken against a different tree, so a run
+# could silently be the old -O0 build. The binary prints its own optimisation
+# level at startup ([BUILD]); run_common.sh checks the other half.
+. "$ROOT/diagnostics/jsrf_first_fault/run_common.sh"
+jsrf_require_current_binary
+jsrf_require_idle
+jsrf_require_game
 rm -rf "$OUT" "$SCRATCH"; mkdir -p "$OUT" "$SCRATCH"
-cp -R "$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" "$SCRATCH/hdd"
+jsrf_stage_hdd
 
 echo "binary: $BIN"
 echo "log:    $OUT/stderr.log  (${LIMIT}s)"
@@ -61,7 +48,6 @@ cd "$ROOT" || exit 1
 # The guest image, resolved from the repo root rather than baked into the
 # binary. CLAUDE.md puts the game directory beside the repo root; override
 # JSRF_GAME_DIR to point somewhere else.
-GAME_DIR="${JSRF_GAME_DIR:-$ROOT/../Jet Set Radio Future (US)}"
 if [ ! -f "$GAME_DIR/default.xbe" ]; then
     echo "no default.xbe under $GAME_DIR" >&2
     echo "  set JSRF_GAME_DIR to the directory holding your own dump" >&2

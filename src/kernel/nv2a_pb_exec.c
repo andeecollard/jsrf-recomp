@@ -3004,6 +3004,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_FLIP_STALL:
         /* First, so the interval covers the whole frame -- see frame_stats_flip. */
         frame_stats_flip();
+#if defined(__APPLE__)
+        g_mtl_frames++;   /* command buffers per frame needs a frame */
+#endif
 #ifdef nv2a_gpu_surface_report
         /* BEFORE the snapshot, because the snapshot syncs: the question is
          * what the GPU still owes guest RAM at the moment the guest calls the
@@ -3516,6 +3519,9 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr,"[" NV2A_GPU_TAG "] %u batches native, %u software fallbacks\n",
             s_gpu.gpu_batches,s_gpu.gpu_fallbacks);
         nv2a_gpu_report();
+#if defined(__APPLE__)
+        nv2a_metal_cb_report();
+#endif
     }
 #endif
 

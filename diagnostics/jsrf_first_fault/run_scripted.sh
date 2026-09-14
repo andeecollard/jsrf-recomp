@@ -32,13 +32,13 @@ SCRATCH="${PLAY_SCRATCH:-/tmp/jsrf-scripted-$NAME}"
 # destroy whichever binary you are not testing.
 BIN="${JSRF_BIN:-$ROOT/build-macos/jsrf-first-fault/build/jsrf_first_fault}"
 
-if pgrep -x jsrf_first_fault >/dev/null 2>&1; then
-    echo "REFUSING: jsrf_first_fault is already running (pid $(pgrep -x jsrf_first_fault | tr '\n' ' '))" >&2
-    exit 2
-fi
+. "$ROOT/diagnostics/jsrf_first_fault/run_common.sh"
+jsrf_require_current_binary
+jsrf_require_idle
+jsrf_require_game
 
 rm -rf "$OUT" "$SCRATCH"; mkdir -p "$OUT" "$SCRATCH"
-cp -R "$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" "$SCRATCH/hdd"
+jsrf_stage_hdd
 
 echo "schedule: $SCHED"
 echo "binary:   $BIN"
