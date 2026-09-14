@@ -670,10 +670,18 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        # SF at the operand's width, not at 32 bits: `adc al, bl` writes
+        # through SET_LO8 and reads back through LO8, which zero-extends, so
+        # `(int32_t)LO8(eax) < 0` compares 0..255 against zero and is false for
+        # every result the instruction can produce. Same defect the add/sub
+        # branches above had.
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
+        # jl/jge/jle/jg deliberately absent: OF after adc/sbb depends on the
+        # original destination, and the carry-in means the result alone does
+        # not recover it. Refusing is the same choice sub makes.
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -682,18 +690,32 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        # OF is architecturally 0 after these, so the signed conditions really
+        # do collapse to SF -- that part was right. What was wrong is the
+        # width: `or al, al; js` is MSVC's "is this byte negative" and read
+        # `(int32_t)LO8(eax) < 0`, a compare of 0..255 against zero, so it
+        # could not be taken at any 8- or 16-bit site in the image.
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
-        if jcc in ("jb", "jnae", "jbe", "jna"):
+            return f"({_sf_cast}({lhs}) > 0)", desc
+        if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
-        if jcc in ("jae", "jnb", "ja", "jnbe"):
+        if jcc in ("jae", "jnb"):
             return "1", desc
+        # jbe is CF || ZF and ja is !CF && !ZF, and only CF is zero here -- so
+        # they are ZF and !ZF, not constants. Answering them 0 and 1 made
+        # "and eax, eax; jbe" never taken and "ja" always taken, both wrong
+        # exactly when the result is zero. The test branch above already gets
+        # this right by going through CMP_BE(a & b, 0).
+        if jcc in ("jbe", "jna"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return f"({lhs} != 0)", desc
         return None
 
     # ── dec/inc: result-based, CF unchanged ──
@@ -725,22 +747,55 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("jb", "jnae", "jc"):
-            # CF=1 unless original was 0
+            # CF=1 unless original was 0. Zero-extended narrow reads are fine
+            # here: "is this byte nonzero" is the same question at any width.
             return f"({lhs} != 0)", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
+        # CF is "result != 0" and ZF is "result == 0", so after a neg the two
+        # unsigned conditions that combine them are constants. They had no case
+        # at all and fell through to the `_flags` fallback, which nothing ever
+        # assigns -- an always-taken jbe came out never taken.
+        if jcc in ("jbe", "jna"):
+            return "1 /* neg: CF||ZF is always set */", desc
+        if jcc in ("ja", "jnbe"):
+            return "0 /* neg: !CF && !ZF is never set */", desc
+        # SF is the sign of the result at the OPERAND's width. `neg al` writes
+        # through SET_LO8 and reads back through LO8, which zero-extends, so
+        # `(int32_t)LO8(eax) < 0` compared 0..255 against zero -- never true,
+        # at every 8- and 16-bit neg in the image.
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
-        if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
-        if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
-        if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
-        if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
+        if jcc in ("jl", "jnge", "jge", "jnl", "jle", "jng", "jg", "jnle"):
+            # And the ordered signed conditions are SF != OF, not SF. neg is
+            # the one setter whose OF is not rare: it sets OF=1 exactly when
+            # the operand was the width's most negative value, because that is
+            # the one value whose negation does not fit (0 - 0x80 = 0x80).
+            #
+            # Rather than reconstruct SF and OF separately, note that these
+            # four conditions are by definition the true signed comparison of
+            # (0 - a) against 0, computed without wrapping -- that is what
+            # SF != OF means. So they are just a test on the ORIGINAL operand:
+            #
+            #     jl  0 - a <  0   <=>  a >  0
+            #     jge 0 - a >= 0   <=>  a <= 0
+            #     jle 0 - a <= 0   <=>  a >= 0
+            #     jg  0 - a >  0   <=>  a <  0
+            #
+            # and negation is its own inverse modulo 2^width, so the original
+            # comes back from the result exactly. At a = most-negative that
+            # recovery returns most-negative again, which is the OF case and
+            # falls on the correct side of every one of the four: `neg al` at
+            # al=0x80 leaves SF=1 and OF=1, so jl is NOT taken, where the
+            # sign-bit form said it was. At al=1 the result is 0xFF with SF=1
+            # and OF=0, so jl IS taken, where the zero-extended form said it
+            # was not. Both directions were wrong, for different reasons.
+            a_orig = f"{_sf_cast}({_flag_utype})(0u - ({_flag_utype})({lhs}))"
+            op = {"jl": ">", "jnge": ">", "jge": "<=", "jnl": "<=",
+                  "jle": ">=", "jng": ">=", "jg": "<", "jnle": "<"}[jcc]
+            return f"({a_orig} {op} 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -749,10 +804,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        # Sign of the result at the operand's width, for the same reason as
+        # add/sub/and above: a narrow destination reads back zero-extended, so
+        # the 32-bit cast can never see the sign bit it is asking about.
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -762,9 +820,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
@@ -1963,14 +2021,39 @@ class Lifter:
         return out
 
     def _lift_sar(self, insn, ops):
+        """Arithmetic right shift, at the OPERAND's width.
+
+        The cast has to match the destination's size, not always be int32_t.
+        Every narrow read here arrives zero-extended -- LO8/LO16 mask, and
+        MEM8/MEM16 are unsigned pointers -- so `(int32_t)LO8(eax) >> n` is a
+        LOGICAL shift wearing an arithmetic cast, and the sign bits it should
+        be feeding in are zeros that were never there.
+
+        Measured, not reasoned: `sar al, 1` with al=0x80 produced 0x40 where
+        x86 gives 0xC0. Same defect at 16 bits. That is a wrong VALUE, not a
+        wrong flag -- it silently halves a negative number instead of
+        propagating its sign, which is exactly how a fixed-point divide or a
+        signed average goes quietly wrong.
+
+        The count keeps its 5-bit mask: x86 masks to 5 bits for 8-, 16- and
+        32-bit operands alike. A masked count larger than the operand is then
+        fine, because int8_t/int16_t promote to int before the shift, so the
+        result is sign-filled rather than undefined.
+
+        CF is unaffected by the change. It is bit (count-1) of the ORIGINAL
+        value, and zero-extension cannot disturb bits that are inside the
+        operand's own width.
+        """
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31)"   # see _lift_shift
+        width = _operand_width(ops[0]) or 4
+        scast = {1: "(int8_t)", 2: "(int16_t)"}.get(width, "(int32_t)")
         out = []
         if self.needs_cf:
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({scast}{dst} >> {cnt})"))
         return out
 
     def _lift_rotate_carry(self, insn, ops, m):
