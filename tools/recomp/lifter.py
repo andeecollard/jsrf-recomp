@@ -275,6 +275,27 @@ MERGED_ZF_CMP = "__merged_zf_cmp"
 MERGED_ZF_TEST = "__merged_zf_test"
 MERGED_ZF_SETTERS = {"cmp": MERGED_ZF_CMP, "test": MERGED_ZF_TEST}
 
+# A join whose predecessors end in a MIX of cmp and test.
+#
+# The two write ZF differently -- cmp as (a == b), test as ((a & b) == 0) --
+# and both snapshot into the same _fa/_fb pair, so at the join there is no
+# expression in those two values that is correct for both. The merge is right
+# to refuse; the bug was that refusing fell through to the generic `_flags`
+# fallback, which nothing ever assigns, so the branch was not merely wrong but
+# provably never taken.
+#
+# The answer is the one already used for CF: publish the flag where it is
+# computed rather than reconstructing it where it is read. _snapshot_flags
+# writes _zf at each cmp/test, and the join reads it. Because the merge only
+# admits this case when EVERY predecessor's last flag setter is a cmp or a
+# test, _zf is written on every incoming edge and cannot be stale -- anything
+# setting flags later in a predecessor changes what out_state names for that
+# block, the setter set leaves {cmp, test}, and the merge refuses again.
+#
+# ZF only. A mixed join needing js/jns or a signed ordered compare still
+# refuses and still marks, because _fa/_fb remain ambiguous for those.
+MERGED_ZF_PUBLISHED = "__merged_zf_published"
+
 # Arithmetic whose carry-out the lifter computes into _cf next to the write.
 #
 # A jb/jae reading CF after one of these is exact, which matters because the
@@ -384,6 +405,23 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    # A cmp/test MIX reads the ZF each predecessor published into _zf.
+    #
+    # Handled FIRST, and deliberately: this form carries no operands -- there
+    # is no meaningful _fa/_fb pair at such a join, which is the whole reason
+    # it exists -- and every operand-resolving path below bails on an empty
+    # list. Placing it after them returned None and left the dead `_flags`
+    # fallback exactly where it was, which is how the first version of this
+    # change regenerated a full tree and fixed nothing.
+    #
+    # ZF only: js/jns and the signed ordered pair still refuse, and still mark.
+    if flag_setter == MERGED_ZF_PUBLISHED:
+        if jcc in ("je", "jz", "sete", "setz"):
+            return "_zf", "je: equal / zero (published ZF)"
+        if jcc in ("jne", "jnz", "setne", "setnz"):
+            return "!_zf", "jne: not equal / not zero (published ZF)"
+        return None
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
     # _fa/_fb (zero-extended) and _fas/_fbs (sign-extended) at the point the
@@ -1163,6 +1201,11 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        # Set per-function by translator when a je/jne lands on a jump target,
+        # i.e. when a ZF join is possible at all. Gated because publishing at
+        # every cmp/test in the image is 65,024 extra stores, and the gate
+        # narrows that to 3,072.
+        self.needs_zf = False
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
         # Every direct call target we emit a name for, as {addr: name}. The
@@ -2140,6 +2183,14 @@ class Lifter:
                 out.append("_cf = (int)(_fa < _fb);")
             else:
                 out.append("_cf = 0; /* test/cmp-logical clears CF */")
+        if self.needs_zf:
+            # Published here, at the comparison, for the same reason _cf is:
+            # a join of cmp and test cannot reconstruct ZF from _fa/_fb.
+            if kind == "cmp":
+                out.append("_zf = (int)(_fa == _fb); /* published for a join */")
+            else:
+                out.append("_zf = (int)((_fa & _fb) == 0);"
+                           " /* published for a join */")
         return out
 
     def _lift_cmp(self, insn, ops):

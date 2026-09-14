@@ -27,6 +27,7 @@ from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _operand_width, _fmt_operand_read,
                      _RESULT_ZF_SF_SETTERS, MERGED_RESULT_SETTER,
+                     MERGED_ZF_PUBLISHED,
                      MERGED_ZF_SETTERS)
 
 
@@ -101,6 +102,17 @@ def _merge_predecessor_flag_states(states):
         return first
 
     # A destination-writing join.  The destination is compared by the C
+    # A MIX of cmp and test. Neither's ZF is reconstructable from _fa/_fb at
+    # the join -- cmp writes (a == b), test writes ((a & b) == 0), and both use
+    # the same pair -- so the lifter publishes ZF into _zf at each comparison
+    # and the branch reads that instead. Admitted only when EVERY predecessor
+    # ends in one of the two, which is what makes _zf written on every edge.
+    # See MERGED_ZF_PUBLISHED in lifter.py.
+    setter_names = {state[0] for state in states}
+    if (setter_names <= {"cmp", "test"} and len(setter_names) > 1
+            and all(len(state[1]) >= 2 for state in states)):
+        return (MERGED_ZF_PUBLISHED, [])
+
     # expression that reads it and by its width, so `and eax, m` and `inc eax`
     # merge while `and eax, m` and `inc ecx` do not.
     allowed = _RESULT_ZF_SF_SETTERS | {MERGED_RESULT_SETTER}
@@ -776,6 +788,35 @@ class FunctionTranslator:
     })
 
     @staticmethod
+    def _function_needs_zf(instructions):
+        """True when a je/jne could land on a join, so _zf must be published.
+
+        Publishing at every cmp/test in the image is 65,024 extra stores and
+        buys nothing where no branch joins; gating on "the function has both a
+        cmp and a test" is barely a gate at all (80% of sites). What actually
+        selects is whether a ZF-reading conditional sits at a JUMP TARGET,
+        because that is the only way two different comparisons can reach one
+        branch. Measured over the current tree: 83 functions, 3,072 sites.
+
+        Deliberately cheap and independent -- one linear pass, no CFG, no
+        predecessor map, no fixpoint -- so it can run beside _function_needs_cf
+        before any of that exists.
+        """
+        targets = set()
+        for insn in instructions:
+            m = insn.mnemonic
+            if (m.startswith("j") and insn.operands
+                    and insn.operands[0].type == "imm"
+                    and insn.operands[0].imm is not None):
+                targets.add(insn.operands[0].imm)
+        if not targets:
+            return False
+        for insn in instructions:
+            if insn.mnemonic in ("je", "jz", "jne", "jnz") and insn.address in targets:
+                return True
+        return False
+
+    @staticmethod
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
         from .lifter import (FLAG_SETTERS, CF_TRACKED,
@@ -1131,6 +1172,14 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
+        # Same bargain for ZF, and for a sharper reason: a join of cmp and test
+        # cannot reconstruct it from _fa/_fb at all, so without this the branch
+        # falls back to a `_flags` nothing assigns and is never taken. Gated to
+        # functions where a je/jne actually sits at a jump target.
+        has_zf = self._function_needs_zf(instructions)
+        if has_zf:
+            lines.append(f"    int _zf = 0; /* zero flag, published at cmp/test */")
+        self.lifter.needs_zf = has_zf
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the

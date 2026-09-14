@@ -11,6 +11,7 @@ import unittest
 
 from .disasm import BasicBlock, Instruction, Operand
 from .lifter import (Lifter, lift_basic_block, _make_condition,
+                     MERGED_ZF_PUBLISHED,
                      MERGED_ZF_CMP, MERGED_ZF_TEST)
 from .translator import _merge_predecessor_flag_states
 
@@ -47,14 +48,31 @@ class FlagMergeLifterTest(unittest.TestCase):
             "if (CMP_LE(_fas, _fbs)) goto loc_0013D3FB;", generated)
         self.assertNotIn("_flags", generated)
 
-    def test_incompatible_flag_setters_remain_unknown(self):
+    def test_cmp_and_test_join_reads_a_published_zf(self):
+        """A cmp/test mix used to be unanswerable. Now it publishes ZF.
+
+        This assertion was assertIsNone until the _zf change. Refusing was
+        correct as far as it went -- cmp writes ZF as (a == b) and test as
+        ((a & b) == 0), both out of the same _fa/_fb pair, so no expression in
+        those two values serves both -- but refusing fell through to the
+        generic `_flags` fallback, which nothing ever assigns. The branch was
+        therefore not merely wrong on some paths, it was never taken on any,
+        and two such sites were reachable in JSRF.
+
+        ZF is published into _zf at each comparison now, exactly as _cf has
+        long been published for carry, so the join has something real to read.
+        The merge still refuses anything that needs more than ZF from such a
+        join -- see the sibling test below for the width case, where _fa/_fb
+        remain ambiguous for js/jns and the signed ordered pair.
+        """
         incoming = _merge_predecessor_flag_states([
             _cmp_state("eax", "edx"),
             ("test", [Operand(type="reg", reg="eax"),
                       Operand(type="reg", reg="eax")]),
         ])
 
-        self.assertIsNone(incoming)
+        self.assertIsNotNone(incoming)
+        self.assertEqual(incoming[0], MERGED_ZF_PUBLISHED)
 
     def test_different_snapshot_widths_keep_zf_and_drop_the_rest(self):
         """Width disagreement costs the width-sensitive conditions, not ZF.

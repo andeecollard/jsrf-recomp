@@ -445,23 +445,30 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_adx_loop_flags.py"
                      --check --gen "${RECOMP_GEN_DIR}")
-    # 0x000A13A1: two comparisons share one `je`, so the condition has to be
-    # written by each predecessor, not read at the branch. STILL UNRESOLVED by
-    # the lifter -- one of the four reachable dead fallbacks the ratchet counts
-    # (sub_000A0F10, called from 0x000A1BE0). This check fails, and it is
-    # supposed to: it is the only site-specific gate on that defect.
-    add_test(NAME jsrf_shared_zf_branch
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/backport_shared_zf_branch.py"
-                     --check --gen "${RECOMP_GEN_DIR}")
-    # 0x000153A9: eight incoming edges, three of them TEST and five CMP, so no
-    # single expression at the branch is correct. Also STILL UNRESOLVED -- the
-    # second of the four reachable dead fallbacks (sub_00015130, called from
-    # 0x000123E0). Fails for the same honest reason as jsrf_shared_zf_branch.
-    add_test(NAME jsrf_exec_state_flag_merge
-             COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_LIST_DIR}/backport_exec_state_merge.py"
-                     --check --gen "${RECOMP_GEN_DIR}")
+    # RETIRED 14 Sep 2026, both of them, because the lifter now resolves them.
+    #
+    # jsrf_shared_zf_branch (0x000A13A1) and jsrf_exec_state_flag_merge
+    # (0x000153A9) were the two site-specific gates on one defect: a branch
+    # joined from predecessors ending in a MIX of cmp and test. cmp writes ZF
+    # as (a == b) and test as ((a & b) == 0), both out of the same _fa/_fb
+    # pair, so no expression in those two values served both -- and refusing
+    # fell through to a `_flags` local nothing ever assigns, which made the
+    # branches not merely wrong but never taken.
+    #
+    # The lifter publishes ZF into _zf at each comparison now, as it has long
+    # published _cf for carry and for the same reason, and both sites emit a
+    # real condition. They cannot simply be left in place and expected to pass:
+    # each asserts the PRE-FIX text and inserts a byte-exact replacement, so
+    # against a fixed lifter they fail with "differs from the expected pre-fix
+    # form" -- which is a pass for the fix, not a regression.
+    #
+    # The backport scripts stay on disk. They are the record of what the defect
+    # was, and the A/B they perform is still the way to price the consequence.
+    # tools/recomp/test_lifter_zf_publish.py is the live gate now, with a
+    # control proving cmp and test genuinely disagree on 39 of 128 pairs.
+    #
+    # Four gates were retired the same way on 13 Sep. This is the pattern: a
+    # site-specific gate exists until the generator stops needing it.
     add_test(NAME jsrf_exec_state_flag_merge_semantics
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/test_exec_state_flag_merge.py")
@@ -496,7 +503,17 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_unresolved_flags_ratchet
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/audit_unresolved_flags.py"
-                     --max 4 --gen "${RECOMP_GEN_DIR}")
+                     --max 2 --gen "${RECOMP_GEN_DIR}")
+    # 4 -> 2 on 14 Sep 2026: the two cmp/test ZF joins are resolved.
+    #
+    # Why 2 and not 0. The residue is a PAIR of jg sites in sub_001237A0, and
+    # they are not a live defect -- both sit after that function's tail
+    # `return`, and no goto in the function targets either label. They are data
+    # swept as code inside a function that does have callers, which the audit's
+    # function-level reachability cannot distinguish. Lowering to 0 would need
+    # the audit to reason about intra-function reachability; until it does, 2
+    # is the honest floor and this note is why nobody should read it as two
+    # outstanding bugs.
 endif()
 
 add_executable(jsrf_pb_scan_owner_test pb_scan_owner_test.c
