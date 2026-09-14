@@ -211,8 +211,14 @@ cp templates/runtime/recomp_types.h "$OUT/gen/recomp_types.h"
 # which translator built the code being measured. A stale tree is then visible
 # in any log anyone sends you, without needing the filesystem.
 MANIFEST="$OUT/gen/GENERATION_MANIFEST.txt"
-tools_hash=$(cat tools/recomp/*.py tools/disasm/*.py 2>/dev/null \
-             | shasum -a 256 | cut -c1-16)
+# Sorted by full path, then concatenated -- the SAME order CMake uses when it
+# globs both directories and list(SORT)s the absolute paths. The first version
+# of this used shell glob order (recomp before disasm) while CMake sorted paths
+# (disasm before recomp), so the two hashes could never agree and every build
+# would have reported STALE. A check that always fires is a check everyone
+# learns to ignore, which is worse than not having one.
+tools_hash=$(ls tools/disasm/*.py tools/recomp/*.py 2>/dev/null | sort \
+             | xargs cat | shasum -a 256 | cut -c1-16)
 types_hash=$(shasum -a 256 templates/runtime/recomp_types.h | cut -c1-16)
 xbe_hash=$(shasum -a 256 "$XBE" 2>/dev/null | cut -c1-16)
 probes=$( [ -f "$OUT/gen/jsrf_probes_installed.c" ] && echo armed || echo none )

@@ -3587,9 +3587,14 @@ int main(int argc, char **argv)
      * 13-14 Sep. If these two differ the binary contains generated code older
      * than tools/recomp. */
 #if defined(JSRF_GEN_TRANSLATOR) && defined(JSRF_TOOLS_NOW)
+    /* Three states, not two. "unrecorded" means the tree predates manifests,
+     * which is UNKNOWN, not stale -- reporting it as stale would be the same
+     * over-claim this banner exists to prevent. */
     fprintf(stderr, "  [GEN] translator=%s tools=%s%s\n",
             JSRF_GEN_TRANSLATOR, JSRF_TOOLS_NOW,
-            strcmp(JSRF_GEN_TRANSLATOR, JSRF_TOOLS_NOW)
+            !strcmp(JSRF_GEN_TRANSLATOR, "unrecorded")
+                ? "   (no manifest: tree predates them, currency UNKNOWN)"
+            : strcmp(JSRF_GEN_TRANSLATOR, JSRF_TOOLS_NOW)
                 ? "   <<< STALE: regenerate, this binary predates tools/recomp"
                 : " (current)");
 #endif

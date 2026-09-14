@@ -23,21 +23,34 @@ set(RECOMP_GEN_DIR "${XBOXRECOMP_DIR}/build-macos/jsrf-first-fault/gen"
 # log says which translator produced the code being measured. A stale tree then
 # shows up in any log someone sends you.
 set(JSRF_GEN_MANIFEST "${RECOMP_GEN_DIR}/GENERATION_MANIFEST.txt")
+# Re-configure when the manifest appears, changes or is removed. Without this
+# the hash is read once and frozen into the compile definitions, so `cmake
+# --build` keeps stamping a stale label -- which is exactly what happened while
+# testing this check: a deliberately wrong hash survived deleting the manifest
+# and was baked into a batch of runs. A provenance stamp that can go stale is
+# the failure it exists to prevent.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${JSRF_GEN_MANIFEST}")
 set(JSRF_GEN_TRANSLATOR "unrecorded")
 if(EXISTS "${JSRF_GEN_MANIFEST}")
     file(STRINGS "${JSRF_GEN_MANIFEST}" _man REGEX "^translator_sha=")
     string(REPLACE "translator_sha=" "" JSRF_GEN_TRANSLATOR "${_man}")
 endif()
 
-file(GLOB _tool_py "${XBOXRECOMP_DIR}/tools/recomp/*.py" "${XBOXRECOMP_DIR}/tools/disasm/*.py")
-list(SORT _tool_py)
-set(_tool_cat "")
-foreach(_f ${_tool_py})
-    file(READ "${_f}" _c)
-    string(APPEND _tool_cat "${_c}")
-endforeach()
-string(SHA256 _tool_full "${_tool_cat}")
-string(SUBSTRING "${_tool_full}" 0 16 JSRF_TOOLS_NOW)
+# Compute the CURRENT translator hash by running the SAME pipeline
+# regenerate.sh uses, rather than reimplementing it in CMake. Two
+# implementations of one hash is two chances to disagree, and they did: the
+# first version globbed in a different order and could never match, so every
+# build reported STALE. A check that always fires is one everybody learns to
+# ignore -- worse than no check.
+execute_process(
+    COMMAND sh -c "ls tools/disasm/*.py tools/recomp/*.py 2>/dev/null | sort | xargs cat | shasum -a 256 | cut -c1-16"
+    WORKING_DIRECTORY "${XBOXRECOMP_DIR}"
+    OUTPUT_VARIABLE JSRF_TOOLS_NOW
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT JSRF_TOOLS_NOW)
+    set(JSRF_TOOLS_NOW "uncomputed")
+endif()
 
 if(JSRF_GEN_TRANSLATOR STREQUAL "unrecorded")
     message(WARNING
