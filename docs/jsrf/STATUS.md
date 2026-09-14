@@ -47,9 +47,38 @@ vsh 7.52 | submit 8.41 | GPU sync 0.98 | rest (guest CPU) 15.03  = 31.94 ms
                                                      budget for 60 fps = 16.67
 ```
 
-The guest-CPU half is as large as all graphics work combined. Whether that
-15 ms is compute or blocked waiting is **unresolved** and is the single most
-valuable thing left to measure.
+The guest-CPU half is as large as all graphics work combined.
+
+**Whether that 15 ms is compute or blocked waiting: measured 2026-09-14, and it
+is blocked.** A 10 s `sample` of the live process at gameplay, top-of-stack:
+
+| samples | frame | |
+|---|---|---|
+| 330 | `__semwait_signal` | blocked |
+| 271 | `__psynch_cvwait` | blocked |
+| 209 | `semaphore_wait_trap` | blocked |
+| 205 | `__workq_kernreturn` | idle workers |
+| 158 | `mach_msg2_trap` | blocked |
+| 68 | `sub_0013B180` | **guest compute** |
+| 11 | `nv2a_vsh_execute` | host compute |
+| 8 | `_platform_memcmp` | host compute |
+| 5 | `draw_primitive` | host compute |
+
+≈93% blocked against ≈100 samples of real compute. That reproduces the earlier
+"93% blocked" profile, but **at gameplay** rather than at the title, which is
+what was actually in doubt.
+
+The one large guest entry, `sub_0013B180`, is a spin on `0x0025EFC0` that
+increments a counter at `0x0025EFA8` while it waits. Its exit path pushes
+`0xF0000001`, writes `0x0025EFC4 = 1`, calls `sub_00147E4E` and ends in an
+`int3` — the shape of a watchdog or assertion, read statically from the
+generated C and **not** confirmed by a run.
+
+So the remaining question is not *whether* the guest is waiting but *what for*.
+Note the chain under the hot guest frame: `kernel_thunk_dispatch` →
+`bridge_KeWaitForSingleObject` → `Sleep` → `nanosleep`, i.e. the wait is a
+host sleep-poll. Poll *granularity* has already been settled as noise
+(±2.4%, paired by `live=`); this is about what the guest is waiting on.
 
 ## Host support
 

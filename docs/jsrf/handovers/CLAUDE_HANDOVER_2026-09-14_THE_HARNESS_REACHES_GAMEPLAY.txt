@@ -1,0 +1,188 @@
+CLAUDE, 14 Sep 2026 (later)
+THE HARNESS NOW REACHES GAMEPLAY WITHOUT A HUMAN. SIX RANKED GAPS ARE CLOSED.
+THE THING THAT COST THE MOST TIME WAS A STALE ARTIFACT, AND THE AUDIO
+"REGRESSION" I SPENT AN HOUR ON WAS THE MAC'S AUDIO DAEMON.
+
+Supersedes CLAUDE_HANDOVER_2026-09-14_THE_RENDERER_IS_FINE_AND_THE_HARNESS_IS_NOT.txt.
+Read sections 1, 4 and 5. Section 5 is the one that will save you time.
+
+
+0. STATE OF PLAY
+================
+Tree dirty, nothing committed by me beyond what is described here.
+ctest 24/26 -- the 2 failures are the same deliberate pair as before (05e0465).
+Was 21/23; three tests added, all passing.
+
+The title was REGENERATED and REBUILT this session. That matters (section 2).
+
+    diagnostics/jsrf_first_fault/pad/gameplay.pad     skates, jumps, sprays
+    diagnostics/jsrf_first_fault/play_scripted.sh     light runner + 3 verdicts
+    diagnostics/jsrf_first_fault/test_pad_schedule.py pad lint, in ctest
+
+
+1. WHAT GOT DONE, AGAINST THE OLD RANKED LIST
+==============================================
+All of ACCURACY_GAPS.md's "suggested order" items 1, 2 and 4, plus §8:
+
+  * BUILD FLAGS (§4). -fwrapv on the title; -fno-strict-aliasing TREE-WIDE, not
+    just on generated code -- kernel_bridge.c, xbox_memory_layout.c and the two
+    nv2a pushbuffer files reach guest memory through the same MEM8/16/32/MEMF
+    macros. -w replaced by -Wall minus four generator-inherent classes, NOT
+    dropped: dropping it outright is 11318 unused-label and 742 unused-variable,
+    which nobody reads. Measured yield of the chosen set over the whole gen
+    tree: 440 -Wuninitialized and 11 -Wmacro-redefined, and nothing else.
+  * KeSynchronizeExecution (§6) and NtProtectVirtualMemory (§7) bridged.
+    CONFIRMED LIVE by a run first -- both appear as "[KERNEL] WARNING: no bridge
+    for ordinal N" in a real gameplay log, so neither was a static reading.
+  * fistp -> RECOMP_F2I_* (§5), with new 16- and 64-bit helpers.
+  * Signed conditions vs OF (§8).
+
+Three of those sections were WRONG in ways worth knowing; see ACCURACY_GAPS.md,
+which now records each correction inline. Briefly: §5's "172 callers" is 432
+calls across 129 functions and there are only SIX fist/fistp sites in the whole
+image; §8's claim was true of `add` only, because `sub` already went through a
+reconstruction that is SF!=OF at 32 bits; §6's "returns STATUS_SUCCESS" is a
+BOOLEAN export, so the guest got a fabricated FALSE, not a success.
+
+
+2. THE MOST EXPENSIVE BUG WAS NOT A BUG, IT WAS A STALE ARTIFACT
+=================================================================
+Dropping -w surfaced 440 `PUSH32(esp, ebp)` reading an indeterminate `ebp`.
+Real: at -O2 that is poison the compiler may propagate, not stack residue.
+
+But translator.py ALREADY FIXED IT, in b1f0531, at 18:44 on 13 Sep. The gen
+tree in build-macos was generated at 16:59 the same day -- one hour and
+forty-five minutes earlier. So the fix existed, and every binary measured since
+carried all 440 anyway, because nobody regenerated.
+
+REGENERATING CLEARED THEM: 496 declarations now `uint32_t ebp = 0;`, zero
+uninitialised, zero -Wuninitialized from the generated title in the build log.
+
+THE LESSON IS THE PROCESS ONE. A translator fix does nothing until the title is
+regenerated, and nothing in the build tells you the gen tree is older than the
+tool that produced it. If you change tools/recomp, regenerate, or you are
+testing yesterday.
+
+
+3. THE HARNESS NOW REACHES GAMEPLAY
+====================================
+gameplay.pad + play_scripted.sh. MEASURED: 1408 NtOpenFile, i.e. New Game, with
+nobody at the machine. Previously only a human had ever got there.
+
+play_scripted.sh exists because neither existing script could measure gameplay:
+play.sh is light but has no schedule; run_scripted.sh has a schedule but turns
+on four heavy probes at once, and heavy probes provoke the input-poll stall, so
+the measurement measures the probes. This is the first with both.
+
+It prints THREE verdicts, deliberately separate, because conflating them is how
+the first version of this lied to me:
+
+    AUDIO   did the host audio device even open      (section 5)
+    SCENE   1342 opens = title plateau, 1408 = New Game
+    PLAYED  [APU-VOICE] off=, which must be well clear of 0
+
+FIRST VERSION FAILED INSTRUCTIVELY, and this is the part to keep. It ran the
+full 250 s, fired 186 of 193 events, retired one voice -- and never left the
+attract screen. off=1 read as "it played" until the open count was checked. The
+cause: it copied moving.pad's boot prefix, which stops pressing START at t=45.5
+and therefore gambles on hitting one window, and logo length varies by ten
+seconds or more between runs. gameplay.pad now uses new_game.pad's full measured
+prefix and starts play at t=80, clear of the last START.
+
+STILL NOT DONE: the schedule reaches gameplay and then does LITTLE. Best run is
+on=12 off=7 idle_trap=10 against a human's on=109 off=103 idle_trap=22371.
+Whether that is the Corn tutorial gating the player, or the synthetic pad not
+driving him, is UNSETTLED -- and note the best run also had no working audio
+device, so it is not even a clean data point. That is the next job.
+
+
+4. THE PARSER TRAP THAT WAS DOCUMENTED BACKWARDS
+=================================================
+Overlapping STICK events on the SAME AXIS do not hand over. xinput_device.c:743
+writes a scripted deflection only while the axis is still near neutral:
+
+    if (ev->lx && st->Gamepad.sThumbLX > -4096 && st->Gamepad.sThumbLX < 4096)
+
+so an overlapping event finds the axis at 30000 and is REFUSED; the first event
+in FILE ORDER wins until it expires. (The guard is deliberate -- it is what lets
+a live controller take over a scripted run.)
+
+moving.pad's header asserted the OPPOSITE, that a later event replaces an
+earlier one. It reached the right behaviour anyway because its segments happen
+to be adjacent rather than overlapping. Header corrected; test_pad_schedule.py
+now asserts it, along with the event-count limit and the post-t=48 START rule
+(new_game.pad carries an explicit waiver comment for the one real exception).
+
+
+5. THE AUDIO "REGRESSION" WAS THE MAC. I LOST AN HOUR TO IT; YOU SHOULD NOT
+===========================================================================
+A gameplay run read [APU-PACE] gen_hz=0 batches=0 frames=0 against the previous
+binary's 46086 / 44571 / 11410176. The sound engine still reported se=405138
+rendered subframes, so `se=` looked perfectly healthy.
+
+I called it a regression and suspected the new KeSynchronizeExecution bridge,
+which is on the two audio interrupt vectors. WRONG, twice:
+
+  1. The comparison was CROSS-SCENE. The baseline never left the title; the new
+     run reached gameplay. This tree's own rule says scene-match before
+     believing a number, and I did not.
+  2. The actual cause was one line further up the log:
+
+         [APU-SDL] output open failed: CoreAudio error (AudioQueueStart): -66681
+
+     The host audio device never opened. apu_sdl2_init() failed, the APU fell
+     back to a waveOut path that does nothing on macOS, and every audio figure
+     in the run was void.
+
+PROVED it was the host, not us, by reproducing it in a standalone 12-line SDL2
+program linking none of this code -- same error, same minute. It did NOT clear
+on its own or after killing every jsrf process. Fix: `sudo killall coreaudiod`.
+
+play_scripted.sh now prints this as the FIRST verdict, before any audio number.
+
+I briefly gated both new bridges behind env switches on the strength of the
+wrong diagnosis, then reverted it once the cause was known: the switches were
+justified by a measurement error, and leaving them in would have left a false
+claim in a comment in kernel_bridge.c. Both ordinals are routed unconditionally.
+
+
+6. WHAT ctest CANNOT SEE
+=========================
+The suite passed 24/26 throughout the whole audio episode. NO TEST IN THIS TREE
+GENERATES AN AUDIO OUTPUT BATCH, so a total audio failure is invisible to it --
+just as no test retires a voice, which is why the trap storm survived so long.
+If you want audio regressions caught, that is the gap to close.
+
+
+7. STILL OPEN
+==============
+  * Make the schedule actually PLAY once it is in (section 3). Highest value.
+  * RECOMP_APU_SE_WHILE_TRAPPED=1 remains BUILT, OFF AND NEVER HEARD. The A/B
+    harness for it now exists; it needs a run with a working audio device and
+    an idle_trap count big enough to have signal. At idle_trap=10 the A/B is
+    underpowered and would produce a number that means nothing -- do not run it
+    and report it.
+  * One gameplay run under -fsanitize=undefined,alignment. Never done. Now
+    cheap, because a schedule can reach gameplay unattended.
+  * Finish the signed-condition fix: `neg` has BOTH the OF and the width
+    defect; adc/sbb, and/or/xor, shl/shr/sar, shld/shrd have the width one.
+  * MmSetAddressProtect (ordinal 182) still reaches host mprotect on guest
+    memory -- the hazard CLAUDE.md names. LATENT here: 182 is not among the 23
+    ordinals JSRF calls in a 250 s run. "Not hot", not "never" -- the kernel log
+    budget caps logging.
+  * The 15 ms of guest CPU: now profiled AT GAMEPLAY (see STATUS.md). ~93%
+    blocked, largest single compute frame is sub_0013B180, a spin on 0x0025EFC0.
+    The question is no longer whether it waits but what it waits on.
+
+
+8. TRAPS PAID FOR THIS SESSION
+===============================
+  * `pgrep -f "cmake --build"` MATCHES THE WAITER'S OWN COMMAND LINE. I left
+    fourteen shells all waiting for each other; no build was running at all.
+    Match the real process (`pgrep -x jsrf_first_fault`) or use a marker file.
+  * off= above zero does NOT mean a run played. Check the open count first.
+  * `se=` in [APU-FRAME] stays healthy when the audio DEVICE is dead. It counts
+    rendered subframes, not delivered ones. gen_hz is the one that tells you.
+  * Do not change six things and then take one measurement. I changed flags,
+    two lifter fixes, two bridges and the gen tree, then ran once -- which is
+    why an unrelated host failure took an hour to attribute.
