@@ -226,6 +226,35 @@ extern RECOMP_TLS int g_fp_top;
  * reaches the CRT's per-thread data, so a single shared base makes every
  * guest thread the same thread as far as the CRT is concerned. */
 extern RECOMP_TLS uint32_t g_fs_base;
+
+/* The #undef is deliberate and the comment above understates the situation:
+ * these are not the same thing, and "must match" is not what happens.
+ *
+ * xbox_memory_layout.h defines XBOX_FS_BASE as the CONSTANT 0x00001000. This
+ * file defines it as the per-thread VARIABLE. Which one a translation unit
+ * gets is decided purely by include order, and today that happens to give
+ * every TU the one it needs:
+ *
+ *   runtime C (xbox_memory_layout.c, kernel_bridge.c) never includes this
+ *       header, so it gets 0x1000 -- correct, because it uses XBOX_FS_BASE to
+ *       initialise the PRIMARY TIB and as the "page zero is unmapped" bound
+ *       in the mapped-address check
+ *   generated code includes both, so it gets g_fs_base -- correct, because
+ *       fs:[0] is the SEH chain head and fs:[4] the CRT's per-thread data,
+ *       and a shared base makes every guest thread the same thread
+ *
+ * That is luck resting on an include list, not a design, and it was silent for
+ * as long as the title was built with a blanket -w. Give kernel_bridge.c a
+ * reason to include this header and its null-pointer check quietly becomes
+ * "below THIS THREAD's TIB", which for a spawned thread rejects a large range
+ * of perfectly valid low addresses.
+ *
+ * #undef preserves exactly today's behaviour -- this definition still wins
+ * wherever both are visible -- while making the override deliberate and
+ * stopping it hiding behind a warning nobody reads. Do NOT "fix" this with
+ * #ifndef: that flips generated code onto the constant and gives every guest
+ * thread the primary thread's TIB. */
+#undef XBOX_FS_BASE
 #define XBOX_FS_BASE g_fs_base
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
