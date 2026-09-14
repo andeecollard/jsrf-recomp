@@ -1,38 +1,33 @@
-/* Several draws, one readback: the case batching actually changes.
+/* Does batching change what is drawn? Five phases, one dump, compared byte for
+ * byte against the per-draw path.
  *
- * WHY metal_copy_test DOES NOT COVER THIS. Every comparison there syncs
- * immediately after its single draw, so the batch is one draw long and the
- * encoder is closed before the next one opens. Running it with
- * RECOMP_METAL_BATCH=1 therefore proves the flush happens, and nothing about
- * what batching is for: several draws accumulated into ONE render encoder.
+ * WHY THE PHASES. The first version of this exercised only overlapping draws,
+ * and concluded from raster_order_group(0) that ordering was safe. Fragment
+ * ordering is not the whole of correctness: batching also changes WHEN
+ * staging memory is released, when a texture buffer may be replaced, and when
+ * the surface may be torn down and rebuilt, because all three used to be
+ * bounded by a command buffer that was committed immediately and are now
+ * bounded by a flush that may be many draws away. Raster order groups say
+ * nothing about any of that. So each of those boundaries gets a phase:
  *
- * That case has a hazard the per-draw path did not. The fragment shader
- * implements the guest's blending, depth test and stencil itself, by reading
- * the attachments back -- so two triangles covering the same pixel are a
- * read-modify-write pair, and they have to happen in the order the guest
- * emitted them. Committing a command buffer per draw enforced that by brute
- * force. Inside one encoder the ordering comes instead from the attachments
- * being declared raster_order_group(0), and this test is the evidence that the
- * declaration does the job -- for overlapping geometry, with blending and the
- * depth test live, which is where a missing barrier would show.
+ *   A  overlapping blended and depth-tested draws   fragment ordering
+ *   B  draws large enough to wrap the staging ring  vertex lifetime
+ *   C  more distinct textures than the cache holds  texture lifetime
+ *   D  alternating render targets                   surface teardown
+ *   E  invalidate and readback between draws        flush boundaries
  *
- * WHAT IS COMPARED, and why it is not the software rasteriser. The obvious
- * oracle is nv2a_texture_copy_*, and this does run it -- but it cannot be the
- * gate, because the per-draw path DISAGREES WITH IT TOO, on 4 of 1024 pixels,
- * before any of this was written. Failing the batched run for a difference the
- * unbatched run also has would be blaming batching for something older. (That
- * disagreement is real and worth its own investigation; so is the depth
- * mismatch metal_copy_test reports at its line 49. Neither is this change.)
+ * WHAT IS COMPARED. Not the software rasteriser: the per-draw path already
+ * disagrees with it on 4 of 1024 pixels and 587 of 4096 depth bytes in phase A,
+ * before any of this was written, and failing the batched run for that would
+ * blame this change for an older one. (That disagreement is real and tracked
+ * separately, as is the depth mismatch metal_copy_test reports at its line 49.)
+ * The gate is the direct one: every byte this program reads back, per-draw
+ * against batched. The oracle count for phase A is still reported and must
+ * match between the two, because a run that agreed on the image but drifted
+ * from the rasteriser differently would mean the two runs had not done the
+ * same work.
  *
- * So the gate is the direct one: the image the per-draw path produces, byte for
- * byte, against the image the batched path produces from the same draws. That
- * is exactly the question "does batching change what is drawn", it needs no
- * oracle to be perfect, and it is the comparison to make before any timing.
- * The oracle count is still reported, and must MATCH between the two runs --
- * a batched run that agreed with the per-draw image but drifted from the
- * rasteriser differently would mean the comparison had not run what it thought.
- *
- * Run twice, because the switch is read once per process:
+ * Run twice -- the switch is read once per process:
  *     jsrf_metal_batch_test  a.bin
  *     RECOMP_METAL_BATCH=1 jsrf_metal_batch_test  b.bin
  *     cmp a.bin b.bin
@@ -46,112 +41,216 @@
 
 #define CHECK(x) do { if(!(x)) {fprintf(stderr,"line %d: %s\n",__LINE__,#x);return 1;} } while(0)
 
-#define W 32u
-#define H 32u
-#define DRAWS 40u
+/* 256x256, not 32x32. The first version used a surface small enough that the
+ * GPU finished each pass almost immediately, and that made the ring-wrap phase
+ * toothless: removing the slab pinning entirely -- so staging memory can be
+ * overwritten while the GPU is still reading it -- produced an IDENTICAL image,
+ * because the GPU was never actually behind. A test that cannot fail for a
+ * defect is not covering it. With a real fragment load the GPU lags the
+ * producer and the race is reachable; the negative control below is the
+ * evidence that it now is. */
+#define W 256u
+#define H 256u
 #define TARGET_BYTES (W*H*2u)
 #define DEPTH_BYTES  (W*H*4u)
 
-/* A fixed generator, so a failure is reproducible and the two registrations
- * see byte-identical geometry. */
+/* Bigger than the ring slab can hold in a handful of draws: a Vertex is 112
+ * bytes, so 4000 of them is ~448 KB against a 2 MB slab and 8 slabs, and 100
+ * such draws go round the ring about three times. */
+#define BIG_VERTS 4000u
+#define BIG_DRAWS 40u        /* 40 * ~464 KB > the 16 MB ring: it must wrap */
+/* More than TEXTURE_CACHE_SIZE (128), so the cache must evict while a batch is
+ * open and the evicted buffer may still be referenced by an unflushed draw. */
+#define TEXTURES 200u
+#define TEX_BYTES 512u
+
 static unsigned rng_state = 0x1234567u;
 static unsigned rnd(unsigned n){rng_state=rng_state*1103515245u+12345u;return (rng_state>>16)%n;}
 
+static uint8_t textures[TEXTURES][TEX_BYTES];
+static uint8_t targetA[TARGET_BYTES], targetB[TARGET_BYTES];
+static uint8_t depthA[DEPTH_BYTES],  depthB[DEPTH_BYTES];
+static uint8_t oracle[TARGET_BYTES], oracle_z[DEPTH_BYTES];
+static float big[BIG_VERTS][16][4];
+
+static FILE *dump;
+static unsigned long drawn;
+
+/* Everything the host can observe, appended after each phase. A difference
+ * anywhere in this file is a difference in what the GPU produced. */
+static void record(void)
+{
+    if (!dump) return;
+    fwrite(targetA, 1, sizeof targetA, dump);
+    fwrite(targetB, 1, sizeof targetB, dump);
+    fwrite(depthA,  1, sizeof depthA,  dump);
+    fwrite(depthB,  1, sizeof depthB,  dump);
+}
+
+static void base_state(NV2ATextureCopy *s)
+{
+    memset(s, 0, sizeof *s);
+    s->width = s->height = 16; s->pitch = 32; s->levels = 1; s->texture_mask = 1;
+    s->clip_w = W; s->clip_h = H; s->target_pitch = W * 2; s->target_bpp = 2;
+    s->depth_pitch = W * 4;
+}
+
+static void fill_tri(float v[3][16][4], unsigned span)
+{
+    unsigned j;
+    for (j = 0; j < 3; ++j) {
+        v[j][0][0] = (float)(rnd(W - 8) + 4);
+        v[j][0][1] = (float)(rnd(H - 8) + 4);
+        v[j][0][2] = (float)rnd(0x1000000);
+        v[j][0][3] = 1.0f;
+        v[j][3][0] = (float)rnd(256) / 255.0f;
+        v[j][3][1] = (float)rnd(256) / 255.0f;
+        v[j][3][2] = (float)rnd(256) / 255.0f;
+        v[j][3][3] = (float)rnd(256) / 255.0f;
+        v[j][9][0] = (float)rnd(16);
+        v[j][9][1] = (float)rnd(16);
+        v[j][9][3] = 1.0f;
+    }
+    (void)span;
+}
+
+static int draw(const NV2ATextureCopy *s, const uint8_t *tex,
+                uint8_t *target, uint8_t *depth,
+                const float (*v)[16][4], unsigned count, const char *phase)
+{
+    int r = nv2a_metal_draw(s, tex, TEX_BYTES, target, TARGET_BYTES,
+                            depth, DEPTH_BYTES, v, count, 5);
+    if (r < 0) {
+        fprintf(stderr, "%s: draw rejected: %s\n", phase, nv2a_metal_last_reject());
+        return 0;
+    }
+    drawn += (unsigned)r;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
-    static uint8_t tex[512];
-    static uint8_t cpu[TARGET_BYTES], gpu[TARGET_BYTES];
-    static uint8_t zcpu[DEPTH_BYTES], zgpu[DEPTH_BYTES];
     const char *mode = getenv("RECOMP_METAL_BATCH") ? "batched" : "per-draw";
-    unsigned d, i, drawn = 0;
+    unsigned d, i, oracle_bad = 0, oracle_zbad = 0;
 
-    for (i = 0; i < sizeof tex; ++i) tex[i] = (uint8_t)(i * 73 + 11);
+    for (i = 0; i < TEXTURES; ++i)
+        for (d = 0; d < TEX_BYTES; ++d)
+            textures[i][d] = (uint8_t)(i * 31 + d * 73 + 11);
 
-    /* Both surfaces start identical and neither is touched again by the host
-     * until the single readback at the end. */
-    memset(cpu, 0xcc, sizeof cpu); memcpy(gpu, cpu, sizeof gpu);
+    memset(targetA, 0xcc, sizeof targetA); memcpy(targetB, targetA, sizeof targetB);
+    memcpy(oracle, targetA, sizeof oracle);
     for (i = 0; i < DEPTH_BYTES; i += 4) {
-        zcpu[i] = 0x5a; zcpu[i+1] = 0xff; zcpu[i+2] = 0xff; zcpu[i+3] = 0xff;
+        depthA[i] = 0x5a; depthA[i+1] = 0xff; depthA[i+2] = 0xff; depthA[i+3] = 0xff;
     }
-    memcpy(zgpu, zcpu, sizeof zgpu);
-    nv2a_metal_invalidate(gpu);
+    memcpy(depthB, depthA, sizeof depthB);
+    memcpy(oracle_z, depthA, sizeof oracle_z);
 
-    for (d = 0; d < DRAWS; ++d) {
-        NV2ATextureCopy s = {0};
-        float v[3][16][4] = {{{0}}};
-        unsigned j;
-        s.width = s.height = 16; s.pitch = 32; s.levels = 1; s.texture_mask = 1;
-        s.clip_w = W; s.clip_h = H; s.target_pitch = W * 2; s.target_bpp = 2;
-        s.depth_pitch = W * 4;
-        /* Depth test and write on for most draws, so later triangles are
-         * rejected by earlier ones -- the ordering-sensitive case. Blending on
-         * for the rest, which is the other read-modify-write of the colour
-         * attachment. */
+    if (argc > 1) { dump = fopen(argv[1], "wb"); if (!dump) { perror(argv[1]); return 1; } }
+    nv2a_metal_invalidate(NULL);
+
+    /* A -- overlapping, blended, depth-tested, one readback at the end. The
+     * software rasteriser runs alongside here only, as a cross-check that both
+     * modes did the same work. */
+    for (d = 0; d < 40; ++d) {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        base_state(&s);
         if (d & 1) { s.depth_test = 1; s.depth_write = 1; s.depth_func = 4; }
         else       { s.blend = 1; s.blend_src = 0x302; s.blend_dst = 0x303; }
-        s.linear = d & 2 ? 1 : 0;
-
-        /* Deliberately overlapping: every triangle is anchored near the middle
-         * so the same pixels are written over and over. */
-        for (j = 0; j < 3; ++j) {
-            v[j][0][0] = (float)(4 + rnd(W - 8));
-            v[j][0][1] = (float)(4 + rnd(H - 8));
-            v[j][0][2] = (float)(rnd(0x1000000));
-            v[j][0][3] = 1.0f;                       /* w */
-            v[j][3][0] = (float)rnd(256) / 255.0f;   /* diffuse */
-            v[j][3][1] = (float)rnd(256) / 255.0f;
-            v[j][3][2] = (float)rnd(256) / 255.0f;
-            v[j][3][3] = (float)rnd(256) / 255.0f;
-            v[j][9][0] = (float)rnd(16);             /* texcoord0 */
-            v[j][9][1] = (float)rnd(16);
-            v[j][9][3] = 1.0f;
-        }
-
-        /* The oracle first, then the GPU, with NO sync in between -- that
-         * absence is the entire point of this test. */
-        if (!nv2a_texture_copy_triangle_depth(&s, tex, sizeof tex,
-                                              cpu, sizeof cpu, zcpu, sizeof zcpu,
+        s.linear = (d & 2) ? 1 : 0;
+        fill_tri(v, 0);
+        if (!nv2a_texture_copy_triangle_depth(&s, textures[0], TEX_BYTES,
+                                              oracle, sizeof oracle,
+                                              oracle_z, sizeof oracle_z,
                                               v[0], v[1], v[2]))
-            continue;                    /* degenerate: neither path draws it */
-        {
-            int r = nv2a_metal_draw(&s, tex, sizeof tex, gpu, sizeof gpu,
-                                    zgpu, sizeof zgpu, v, 3, 5);
-            if (r < 0) {
-                fprintf(stderr, "draw %u rejected: %s\n", d, nv2a_metal_last_reject());
-                return 1;
-            }
-            drawn += (unsigned)r;
-        }
+            continue;
+        if (!draw(&s, textures[0], targetA, depthA, v, 3, "A")) return 1;
     }
-
-    /* One readback for all of them. With batching on this is the first time
-     * the GPU is told to run anything at all. */
     CHECK(nv2a_metal_sync());
+    for (i = 0; i < sizeof oracle; i += 2)
+        if (oracle[i] != targetA[i] || oracle[i+1] != targetA[i+1]) ++oracle_bad;
+    for (i = 0; i < sizeof oracle_z; ++i)
+        if (oracle_z[i] != depthA[i]) ++oracle_zbad;
+    record();
 
-    /* A positive control on the test itself: if nothing was rasterised, the
-     * two buffers agree trivially and the comparison below proves nothing. */
-    if (!drawn) { fprintf(stderr, "no triangles survived assembly\n"); return 1; }
-
-    {
-        unsigned bad = 0, zbad = 0;
-        for (i = 0; i < sizeof cpu; i += 2)
-            if (cpu[i] != gpu[i] || cpu[i+1] != gpu[i+1]) ++bad;
-        for (i = 0; i < sizeof zcpu; ++i) if (zcpu[i] != zgpu[i]) ++zbad;
-        printf("metal batch (%s): %u draws, %u triangles, one readback; "
-               "oracle differs on %u of %u pixels, %u of %u depth bytes\n",
-               mode, DRAWS, drawn, bad, W * H, zbad, (unsigned)sizeof zcpu);
+    /* B -- ring wrap. Each draw stages ~448 KB, so the 2 MB slabs turn over
+     * every few draws and the wrap must wait on a slab an open batch has not
+     * pinned yet. No sync inside the loop: the wrap is the only thing that may
+     * flush, and that is exactly what is under test. */
+    for (i = 0; i < BIG_VERTS; ++i) {
+        /* Large, so each triangle costs real fragment work and the GPU falls
+         * behind the thread staging vertices for the next draw. */
+        big[i][0][0] = (float)(rnd(W - 2) + 1);
+        big[i][0][1] = (float)(rnd(H - 2) + 1);
+        if (i % 3 == 1) { big[i][0][0] += 64.0f; if (big[i][0][0] > W - 1) big[i][0][0] = W - 1; }
+        if (i % 3 == 2) { big[i][0][1] += 64.0f; if (big[i][0][1] > H - 1) big[i][0][1] = H - 1; }
+        big[i][0][2] = (float)rnd(0x1000000);
+        big[i][0][3] = 1.0f;
+        big[i][3][0] = (float)rnd(256) / 255.0f;
+        big[i][3][3] = 1.0f;
+        big[i][9][0] = (float)rnd(16);
+        big[i][9][1] = (float)rnd(16);
+        big[i][9][3] = 1.0f;
     }
+    for (d = 0; d < BIG_DRAWS; ++d) {
+        NV2ATextureCopy s; base_state(&s);
+        s.depth_test = 1; s.depth_write = 1; s.depth_func = 4;
+        if (!draw(&s, textures[d % TEXTURES], targetA, depthA,
+                  (const float (*)[16][4])big, BIG_VERTS, "B")) return 1;
+    }
+    CHECK(nv2a_metal_sync());
+    record();
 
-    /* The image itself, for the caller to compare against the other mode. */
-    if (argc > 1) {
-        FILE *f = fopen(argv[1], "wb");
-        if (!f) { perror(argv[1]); return 1; }
-        if (fwrite(gpu, 1, sizeof gpu, f) != sizeof gpu ||
-            fwrite(zgpu, 1, sizeof zgpu, f) != sizeof zgpu) {
-            fprintf(stderr, "short write to %s\n", argv[1]);
-            fclose(f); return 1;
-        }
-        fclose(f);
+    /* C -- more distinct textures than the cache holds, so entries are evicted
+     * while a batch is open. The evicted MTLBuffer may still be bound into an
+     * encoder that has not been committed. */
+    for (d = 0; d < TEXTURES * 2; ++d) {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        base_state(&s);
+        s.blend = 1; s.blend_src = 0x302; s.blend_dst = 0x303;
+        fill_tri(v, 0);
+        if (!draw(&s, textures[d % TEXTURES], targetA, depthA, v, 3, "C")) return 1;
+    }
+    CHECK(nv2a_metal_sync());
+    record();
+
+    /* D -- alternating render targets. A target change tears the surface down,
+     * syncs, reallocates and re-uploads; with a batch open that has to flush
+     * first or the readback is missing every draw in it. */
+    for (d = 0; d < 40; ++d) {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        uint8_t *t = (d & 1) ? targetB : targetA;
+        uint8_t *z = (d & 1) ? depthB  : depthA;
+        base_state(&s);
+        s.depth_test = 1; s.depth_write = 1; s.depth_func = 4;
+        fill_tri(v, 0);
+        if (!draw(&s, textures[d % TEXTURES], t, z, v, 3, "D")) return 1;
+    }
+    CHECK(nv2a_metal_sync());
+    record();
+
+    /* E -- explicit invalidate and readback between draws, which is what a
+     * guest clear and a flip look like from here. */
+    for (d = 0; d < 40; ++d) {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        base_state(&s);
+        s.blend = 1; s.blend_src = 0x302; s.blend_dst = 0x303;
+        fill_tri(v, 0);
+        if (!draw(&s, textures[d % TEXTURES], targetA, depthA, v, 3, "E")) return 1;
+        if ((d % 7) == 6) { CHECK(nv2a_metal_sync()); record(); }
+        if ((d % 13) == 12) { nv2a_metal_invalidate(targetA); record(); }
+    }
+    CHECK(nv2a_metal_sync());
+    record();
+
+    if (!drawn) { fprintf(stderr, "no triangles survived assembly\n"); return 1; }
+    printf("metal batch (%s): %lu triangles over 5 phases "
+           "(overlap, ring wrap, texture eviction, surface change, readback); "
+           "phase A differs from the software rasteriser on %u of %u pixels "
+           "and %u of %u depth bytes\n",
+           mode, drawn, oracle_bad, W * H, oracle_zbad, (unsigned)sizeof oracle_z);
+    if (dump) {
+        if (ferror(dump)) { fprintf(stderr, "write error on %s\n", argv[1]); return 1; }
+        fclose(dump);
     }
     return 0;
 }

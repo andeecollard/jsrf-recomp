@@ -107,14 +107,77 @@ static int mtl_cb_gpu(void)
     if (on < 0) on = getenv("RECOMP_METAL_CB_GPU") ? 1 : 0;
     return on;
 }
-static _Atomic unsigned long long g_mtl_gpu_ns, g_mtl_sched_ns, g_mtl_gpu_n;
+static _Atomic unsigned long long g_mtl_sched_ns, g_mtl_gpu_n;
+static _Atomic unsigned long long g_mtl_span_ns, g_mtl_submit_seq;
+static _Atomic unsigned long long g_mtl_out_of_order, g_mtl_overlapped, g_mtl_bad_stamp;
+static pthread_mutex_t gpu_acc_mutex = PTHREAD_MUTEX_INITIALIZER;
+static double gpu_first_start, gpu_last_end, gpu_coverage;
+static unsigned long long gpu_prev_seq;
+static pthread_t gpu_handler_thread[4];
+static unsigned gpu_handler_threads;
+static unsigned gpu_raw_printed;
+
+/* WHAT THIS DOES AND DOES NOT MEASURE.
+ *
+ * The first version added up GPUEndTime - GPUStartTime across every command
+ * buffer and reported 3,086 seconds inside a 300 second run. I described that
+ * as queue wait. That was a guess: an impossible total says the counter is not
+ * measuring what was assumed, and nothing about which assumption broke. Apple
+ * documents these as the times GPU execution started and finished. So this
+ * version reports the things that can actually be checked, and labels them:
+ *
+ *   span      the sum of end-start, which is what was wrong before. Kept, and
+ *             named a span rather than time, because comparing it against the
+ *             coverage below is how overlap shows up.
+ *   coverage  elapsed time covered by the union of the intervals. Bounded by
+ *             wall clock, so it can be sanity-checked -- but it is COVERAGE,
+ *             not hardware occupancy: a GPU idle inside an interval still
+ *             counts, and this says nothing about how busy the device was.
+ *   overlap   intervals that began before the previous one ended, counted
+ *             directly instead of inferred.
+ *   order     handlers arriving out of submission order, and how many distinct
+ *             threads deliver them -- both of which would break any sequential
+ *             accumulation, including the coverage above.
+ *   raw       the first few stamp pairs, printed in full, so the unit is read
+ *             off the log rather than assumed from the header file.
+ *
+ * If overlap is nonzero the span is meaningless as a duration and the coverage
+ * is the only figure worth quoting. If the handlers are out of order or on
+ * several threads, the coverage is wrong too and needs a sort. */
 static void mtl_cb_gpu_watch(id<MTLCommandBuffer> command)
 {
+    unsigned long long seq;
     if (!mtl_cb_gpu()) return;
+    seq = atomic_fetch_add(&g_mtl_submit_seq, 1);
     [command addCompletedHandler:^(id<MTLCommandBuffer> done){
-        double gpu = done.GPUEndTime - done.GPUStartTime;
+        double start = done.GPUStartTime, end = done.GPUEndTime;
         double sched = done.kernelEndTime - done.kernelStartTime;
-        if (gpu > 0) atomic_fetch_add(&g_mtl_gpu_ns, (unsigned long long)(gpu * 1e9));
+        unsigned i;
+        pthread_t self = pthread_self();
+        if (!(end > start)) { atomic_fetch_add(&g_mtl_bad_stamp, 1); }
+        pthread_mutex_lock(&gpu_acc_mutex);
+        for (i = 0; i < gpu_handler_threads; ++i)
+            if (pthread_equal(gpu_handler_thread[i], self)) break;
+        if (i == gpu_handler_threads && gpu_handler_threads < 4)
+            gpu_handler_thread[gpu_handler_threads++] = self;
+        if (seq < gpu_prev_seq) atomic_fetch_add(&g_mtl_out_of_order, 1);
+        gpu_prev_seq = seq;
+        if (end > start) {
+            if (gpu_raw_printed < 6) {
+                fprintf(stderr, "  [METAL-CB] raw stamp %u: start=%.9f end=%.9f "
+                                "delta=%.9f s  kernel=%.9f s\n",
+                        gpu_raw_printed, start, end, end - start, sched);
+                ++gpu_raw_printed;
+            }
+            if (gpu_first_start == 0.0) gpu_first_start = start;
+            if (start < gpu_last_end) atomic_fetch_add(&g_mtl_overlapped, 1);
+            else                      gpu_coverage += start - gpu_last_end > 0 ? 0.0 : 0.0;
+            {   double from = start < gpu_last_end ? gpu_last_end : start;
+                if (end > from) gpu_coverage += end - from; }
+            if (end > gpu_last_end) gpu_last_end = end;
+            atomic_fetch_add(&g_mtl_span_ns, (unsigned long long)((end - start) * 1e9));
+        }
+        pthread_mutex_unlock(&gpu_acc_mutex);
         if (sched > 0) atomic_fetch_add(&g_mtl_sched_ns, (unsigned long long)(sched * 1e9));
         atomic_fetch_add(&g_mtl_gpu_n, 1);
     }];
@@ -138,12 +201,19 @@ void nv2a_metal_cb_report(void)
                 batch_longest);
     if (mtl_cb_gpu()) {
         unsigned long long n = atomic_load(&g_mtl_gpu_n);
+        double cov, elapsed;
+        pthread_mutex_lock(&gpu_acc_mutex);
+        cov = gpu_coverage; elapsed = gpu_last_end - gpu_first_start;
         fprintf(stderr,
-                "  [METAL-CB] gpu: %llu completed, %.2fms on the GPU,"
-                " %.2fms scheduling (totals; %.2fus and %.2fus each)\n",
-                n, atomic_load(&g_mtl_gpu_ns) / 1e6, atomic_load(&g_mtl_sched_ns) / 1e6,
-                n ? atomic_load(&g_mtl_gpu_ns) / 1e3 / (double)n : 0.0,
-                n ? atomic_load(&g_mtl_sched_ns) / 1e3 / (double)n : 0.0);
+                "  [METAL-CB] gpu: %llu completed, span-sum %.0fms,"
+                " coverage %.0fms of %.0fms elapsed (coverage is NOT occupancy),"
+                " scheduling %.0fms; overlapped %llu, out-of-order %llu,"
+                " bad-stamp %llu, handler threads %u\n",
+                n, atomic_load(&g_mtl_span_ns) / 1e6, cov * 1e3, elapsed * 1e3,
+                atomic_load(&g_mtl_sched_ns) / 1e6,
+                atomic_load(&g_mtl_overlapped), atomic_load(&g_mtl_out_of_order),
+                atomic_load(&g_mtl_bad_stamp), gpu_handler_threads);
+        pthread_mutex_unlock(&gpu_acc_mutex);
     }
     fflush(stderr);
 }
@@ -492,6 +562,12 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
 #define RING_ALIGN_UP(n) (((n)+RING_ALIGN-1)&~(size_t)(RING_ALIGN-1))
 
 static id<MTLBuffer> ring_slab[RING_SLABS];
+/* How many of the slabs are in use. RING_SLABS in every normal run; the ring
+ * self-test squeezes it to two, because a wrap that takes 36 draws to come
+ * round is a wrap the GPU has always finished with by the time it matters, and
+ * a hazard that cannot be reached cannot be tested for. */
+static unsigned ring_limit = RING_SLABS;
+static void (*ring_wrap_hook)(void);
 static unsigned ring_current;
 static size_t ring_offset;
 static pthread_mutex_t ring_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -527,11 +603,17 @@ static id<MTLBuffer> ring_reserve(size_t bytes,size_t*offset_out,void**cpu_out,u
     if(!bytes||bytes>RING_SLAB_BYTES){++ring_fallbacks;return nil;}
     size_t need=RING_ALIGN_UP(bytes);
     if(ring_offset+need>RING_SLAB_BYTES){
-        unsigned next=(ring_current+1u)%RING_SLABS;
+        unsigned next=(ring_current+1u)%ring_limit;
         ++ring_wraps;
         /* Before looking at the next slab's in-flight count: see the flushing
-         * paragraph above. An open batch holds unpinned reservations. */
+         * paragraph above. An open batch holds unpinned reservations.
+         *
+         * A batch therefore NEVER spans a wrap, which is what makes pinning a
+         * slab once per batch sufficient. The hook lets the ring self-test
+         * reproduce that ordering instead of testing a pattern the draw path
+         * cannot produce. */
         batch_flush();
+        if (ring_wrap_hook) ring_wrap_hook();
         /* Announce before looking, so a handler that drains the slab after we
          * have looked and before we sleep is guaranteed to see us and shout.
          * It takes ring_mutex to shout and we hold it from the look to the
@@ -664,6 +746,109 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     uint32_t tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4];
     float lod_bias[4];
     uint32_t color_icw[8],alpha_icw[8],color_ocw[8],alpha_ocw[8];}Params;
+
+/* Does the ring actually protect staging memory from the GPU?
+ *
+ * This exercises the REAL ring_reserve and ring_pin, not a copy of them. An
+ * earlier version of this evidence was a throwaway harness that was never
+ * committed, so the claim in the comment above -- 20,000 blit command buffers,
+ * zero corrupted reservations, 147 with the pinning removed -- could not be
+ * re-run by anyone, including by me when batching changed how pinning works.
+ * A copy would drift from the original; a hook does not.
+ *
+ * Each iteration reserves a span, stamps every word of it with the iteration
+ * number, and blits it into its own slot of a destination buffer WITHOUT
+ * waiting. Only at the end is everything waited on and checked, so a slab
+ * handed back while the GPU was still reading it shows up as the wrong stamp.
+ *
+ * pin_mode is the point: 0 pins nothing (the positive control -- this MUST
+ * corrupt, or the test is measuring nothing), 1 pins per command buffer (what
+ * the per-draw path does), 2 pins each slab once from a bitmask (what batching
+ * does, and the thing that previously had no test at all).
+ *
+ * The wrap hook matters for mode 2. In the draw path a batch can never span a
+ * wrap, because ring_reserve flushes before it waits; without reproducing that
+ * ordering the test would drive a pattern the real code cannot produce, and
+ * would report a hazard that does not exist. */
+static id<MTLCommandBuffer> st_cmd;
+static id<MTLBlitCommandEncoder> st_blit;
+static unsigned st_pins, st_in_batch, st_pin_mode;
+
+static void selftest_flush(void)
+{
+    if (!st_cmd) return;
+    [st_blit endEncoding];
+    if (st_pin_mode == 2) {
+        unsigned b;
+        for (b = 0; b < RING_SLABS; ++b) if (st_pins & (1u << b)) ring_pin(st_cmd, b);
+    }
+    [st_cmd commit];
+    last_command = st_cmd;
+    st_cmd = nil; st_blit = nil; st_pins = 0; st_in_batch = 0;
+}
+
+int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
+                             unsigned per_batch, unsigned *corrupt_out)
+{
+    const size_t span = 64u * 1024u;       /* 32 to a 2 MB slab */
+    unsigned saved_limit = ring_limit, corrupt = 0, i;
+    id<MTLBuffer> dst;
+    int failed = 0;
+
+    if (!initialize()) return 0;
+    if (slabs < 2 || slabs > RING_SLABS || !iters || !per_batch) return 0;
+    dst = [device newBufferWithLength:span * iters options:MTLResourceStorageModeShared];
+    if (!dst) return 0;
+    memset(dst.contents, 0, span * iters);
+
+    ring_limit = slabs;
+    ring_current = 0; ring_offset = 0;
+    st_cmd = nil; st_blit = nil; st_pins = 0; st_in_batch = 0; st_pin_mode = (unsigned)pin_mode;
+    ring_wrap_hook = selftest_flush;
+
+    for (i = 0; i < iters; ++i) {
+        size_t at = 0; void *cpu = NULL; unsigned slot = 0;
+        id<MTLBuffer> slab;
+        uint32_t *w; size_t n, k;
+        if (!st_cmd) {
+            st_cmd = [queue commandBuffer];
+            st_blit = st_cmd ? [st_cmd blitCommandEncoder] : nil;
+            if (!st_cmd || !st_blit) { failed = 1; break; }
+        }
+        /* Reserve AFTER the command buffer exists, so a wrap inside the
+         * reservation flushes a real open batch, as it does in the draw path. */
+        slab = ring_reserve(span, &at, &cpu, &slot);
+        if (!slab) { failed = 1; break; }
+        if (!st_cmd) {                      /* the wrap hook flushed us */
+            st_cmd = [queue commandBuffer];
+            st_blit = st_cmd ? [st_cmd blitCommandEncoder] : nil;
+            if (!st_cmd || !st_blit) { failed = 1; break; }
+        }
+        w = (uint32_t *)cpu; n = span / 4;
+        for (k = 0; k < n; ++k) w[k] = 0xA5000000u | i;
+        [st_blit copyFromBuffer:slab sourceOffset:at
+                       toBuffer:dst destinationOffset:(size_t)i * span size:span];
+        if (pin_mode == 1) ring_pin(st_cmd, slot);
+        else if (pin_mode == 2) st_pins |= 1u << slot;
+        if (++st_in_batch >= per_batch) selftest_flush();
+    }
+    selftest_flush();
+    ring_wrap_hook = NULL;
+    [last_command waitUntilCompleted];
+
+    if (!failed) {
+        const uint32_t *w = (const uint32_t *)dst.contents;
+        for (i = 0; i < iters; ++i) {
+            size_t base = (size_t)i * span / 4, k;
+            for (k = 0; k < span / 4; ++k)
+                if (w[base + k] != (0xA5000000u | i)) { ++corrupt; break; }
+        }
+    }
+    ring_limit = saved_limit;
+    ring_current = 0; ring_offset = 0;
+    if (corrupt_out) *corrupt_out = failed ? 0xFFFFFFFFu : corrupt;
+    return 1;
+}
 
 int nv2a_metal_sync(void)
 {

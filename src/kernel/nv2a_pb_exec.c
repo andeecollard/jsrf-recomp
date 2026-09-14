@@ -1453,10 +1453,11 @@ static void frame_hist_line(const char *tag, const FrameHist *h)
         over += h->bin[i];
     mean_ms = (double)h->total_us / (double)h->n / 1000.0;
     fprintf(stderr, "  [%s] flips=%llu mean=%.2f ms (%.1f fps)"
-            " p50=%.1f p90=%.1f p99=%.1f max=%.1f ms  over-33ms=%llu\n",
+            " p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f ms  over-33ms=%llu\n",
             tag, (unsigned long long)h->n, mean_ms,
             mean_ms > 0.0 ? 1000.0 / mean_ms : 0.0,
-            frame_pct(h, 0.50), frame_pct(h, 0.90), frame_pct(h, 0.99),
+            frame_pct(h, 0.50), frame_pct(h, 0.90), frame_pct(h, 0.95),
+            frame_pct(h, 0.99),
             (double)h->max_us / 1000.0, over);
 }
 

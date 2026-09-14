@@ -19,5 +19,11 @@ void nv2a_metal_report(void);
  * bumped by the pushbuffer executor at the guest's own frame boundary,
  * NV097_FLIP_STALL, because this file has no notion of a frame. */
 void nv2a_metal_cb_report(void);
+/* Ring staging self-test. pin_mode: 0 none (positive control), 1 per command
+ * buffer, 2 once per batch from a slab bitmask. Returns 0 if it could not run;
+ * *corrupt_out is the number of reservations the GPU read after they had been
+ * overwritten. See the comment on nv2a_metal_ring_selftest. */
+int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
+                             unsigned per_batch, unsigned *corrupt_out);
 extern unsigned long long g_mtl_frames;
 #endif

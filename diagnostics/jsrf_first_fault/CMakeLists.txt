@@ -357,6 +357,10 @@ if(APPLE)
     #     RECOMP_METAL_BATCH=1 build/jsrf_metal_batch_test
     add_executable(jsrf_metal_batch_test metal_batch_test.c)
     target_link_libraries(jsrf_metal_batch_test PRIVATE xbox_vsh)
+    # Staging-ring lifetime, including the pin-once-per-batch pattern batching
+    # introduced. Carries its own positive control.
+    add_executable(jsrf_metal_ring_test metal_ring_test.c)
+    target_link_libraries(jsrf_metal_ring_test PRIVATE xbox_vsh)
     # Explicit GPU tests; do not turn headless CTest runs into device failures.
 endif()
 if(WIN32)
