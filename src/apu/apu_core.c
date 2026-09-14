@@ -662,6 +662,13 @@ unsigned long g_apu_frames_xcnt_off;   /* skipped: sample counter off */
 unsigned long g_apu_frames_tone;       /* skipped: test tone owns the output */
 static unsigned long g_apu_trapped_run;
 unsigned long g_apu_trapped_run_max;
+/* How many separate times the front end entered TRAPPED, as opposed to how
+ * many frames it spent there. The two answer different questions and the
+ * difference decides whether anything needs doing: 240,000 trapped frames is
+ * a dropout if it is one hold and routine voice churn if it is 60,000 traps
+ * the guest clears within a frame or two each. longest_trapped_run already
+ * bounds the worst case; this gives the mean. */
+unsigned long g_apu_trap_episodes;
 /* Incremented once per frame boundary at which a guest thread was found
  * waiting for the device lock, immediately before the lock is dropped for it.
  * Zero means no guest thread ever waited -- not that the hand-off is dead. */
@@ -671,10 +678,14 @@ void mcpx_apu_frame_report(void)
 {
     double ms = g_apu_trapped_run_max * (double)NUM_SAMPLES_PER_FRAME / 48.0;
     fprintf(stderr, "  [APU-FRAME] total=%lu se=%lu trapped=%lu halted=%lu"
-            " xcnt_off=%lu tone=%lu longest_trapped_run=%lu (%.2f ms)"
+            " xcnt_off=%lu tone=%lu episodes=%lu mean_run=%.1f"
+            " longest_trapped_run=%lu (%.2f ms)"
             " lock_handoffs=%lu\n",
             g_apu_frames_total, g_apu_frames_se, g_apu_frames_trapped,
             g_apu_frames_halted, g_apu_frames_xcnt_off, g_apu_frames_tone,
+            g_apu_trap_episodes,
+            g_apu_trap_episodes ? (double)g_apu_frames_trapped
+                                  / (double)g_apu_trap_episodes : 0.0,
             g_apu_trapped_run_max, ms, g_apu_lock_handoffs);
     fflush(stderr);
 }
@@ -836,6 +847,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             g_apu_frames_tone++;
         }
         if (femethmode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+            if (!g_apu_trapped_run) g_apu_trap_episodes++;
             if (++g_apu_trapped_run > g_apu_trapped_run_max)
                 g_apu_trapped_run_max = g_apu_trapped_run;
         } else {
