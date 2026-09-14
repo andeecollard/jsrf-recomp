@@ -48,19 +48,17 @@
 # to retune new_game.pad's timings, and it is right. The prefix below is that
 # artifact, unchanged.
 #
-# THE AUDIO DEVICE IS THE VARIABLE. That started as a hunch off one run and was
-# then tested properly, same binary and same prefix throughout:
+# THE AUDIO DEVICE IS NOT THE VARIABLE. RETRACTED, in three stages, and the
+# stages are the lesson:
 #
-#     live audio device      1342, 1342         0 of 2 left the title
-#     device forced off      1408, 1410, 1342   2 of 3 reached New Game
+#   1 run   "the one success had a dead audio device" -- a hunch
+#   2 v 2   forced off reached New Game twice, live device failed twice.
+#           Written up as a clean separation. It was not.
+#   n = 6   forced off 2 of 4, live device 0 of 2.
 #
-# Forced off with SDL_AUDIODRIVER=no_such_driver, which makes apu_sdl2_init
-# fail deterministically. CORRECTED from an earlier version of this note that
-# read the first two forced-off runs as a clean 2/2 separation: the third
-# stayed at 1342. It is a lean, not a switch. A mechanism fits -- the APU
-# throttles against the real device, so without one the title moves through the
-# logos at a different rate and this fixed schedule lands differently -- but
-# n=5 total does not carry more than that.
+# 0/2 against 2/4 is exactly what one ~40% rate looks like. There is no
+# evidence the audio device matters. What IS true is that the boot reaches New
+# Game roughly two times in five, whatever the audio is doing.
 #
 # For anything NOT about audio, run with the device forced off and the boot
 # becomes reliable. For audio measurements you need it on, and then this
@@ -107,7 +105,40 @@
 # and analog ones take the maximum -- so A and RT may overlap freely.
 # test_pad_schedule.py asserts all of this.
 
-# ── boot to the Corn tutorial (identical to new_game.pad) ──
+# ── boot to the Corn tutorial (new_game.pad's groups, unchanged) ──
+#
+# Then bare A presses, which is the one thing not yet tried and the only change
+# here that a measurement actually points at.
+#
+# Comparing a successful boot against a failed one, both reached the 1342-open
+# plateau at t=36-37 -- so it is NOT that the failing run boots too slowly. The
+# difference is what the A presses did afterwards. In the run that worked, the
+# A at t=47 moved it 1342 -> 1344 -> 1408, i.e. that A selected New Game. In the
+# run that failed, the A presses at t=39, 47, 55, 63 and 71 each did nothing at
+# all.
+#
+# The suspicion that follows: once the menu is up, a group's START,START moves
+# OFF it and the group's own A then lands somewhere harmless. So after the
+# groups stop, press A alone -- no START -- a few times, spaced wide. If the
+# menu is up, A is exactly what it wants. If the game is already in play, a
+# bare A is a jump and costs nothing.
+#
+# This is a hypothesis with one comparison behind it, not a finding. If these
+# bare presses do not change the hit rate, say so here and delete them.
+#
+# FIRST RUN WITH THEM: reached New Game (1408). That is 1 for 1 and means very
+# little on its own -- the boot was already landing about two times in five.
+# Note also that the host audio device failed in that run (CoreAudio -66681,
+# which wedges repeatedly on this machine), so it does NOT test the live-device
+# arm, whatever it looked like at launch. Someone needs to run this several
+# times, with the AUDIO verdict read each time, before the bare presses can be
+# called an improvement.
+#
+# Running tally across every run of the groups prefix, for whoever does that:
+#   device dead/off    3 of 5 reached New Game
+#   device live        0 of 2
+# which is still too few to separate, and is why the audio note above is a
+# retraction rather than a finding.
 12.0:START  13.5:START  15.0:A
 20.0:START  21.5:START  23.0:A
 28.0:START  29.5:START  31.0:A
@@ -117,41 +148,43 @@
 60.0:START  61.5:START  63.0:A
 68.0:START  69.5:START  71.0:A
 
+# ── bare A: no START, so nothing can move off the menu first ──
+76.0:A  80.0:A  84.0:A  88.0:A  92.0:A  96.0:A
+
 # ── skate: strictly non-overlapping segments, one per direction ──
-80.0:LUP:6.0  86.0:LUP+LRIGHT:6.0  92.0:LRIGHT:6.0  98.0:LDOWN+LRIGHT:6.0
-104.0:LDOWN:6.0  110.0:LDOWN+LLEFT:6.0  116.0:LLEFT:6.0  122.0:LUP+LLEFT:6.0
-128.0:LUP:6.0  134.0:LUP+LRIGHT:6.0  140.0:LRIGHT:6.0  146.0:LDOWN+LRIGHT:6.0
-152.0:LDOWN:6.0  158.0:LDOWN+LLEFT:6.0  164.0:LLEFT:6.0  170.0:LUP+LLEFT:6.0
-176.0:LUP:6.0  182.0:LUP+LRIGHT:6.0  188.0:LRIGHT:6.0  194.0:LDOWN+LRIGHT:6.0
-200.0:LDOWN:6.0  206.0:LDOWN+LLEFT:6.0  212.0:LLEFT:6.0  218.0:LUP+LLEFT:6.0
-224.0:LUP:6.0  230.0:LUP+LRIGHT:6.0  236.0:LRIGHT:6.0  242.0:LDOWN+LRIGHT:6.0
-248.0:LDOWN:6.0  254.0:LDOWN+LLEFT:6.0
+105.0:LUP:6.0  111.0:LUP+LRIGHT:6.0  117.0:LRIGHT:6.0  123.0:LDOWN+LRIGHT:6.0
+129.0:LDOWN:6.0  135.0:LDOWN+LLEFT:6.0  141.0:LLEFT:6.0  147.0:LUP+LLEFT:6.0
+153.0:LUP:6.0  159.0:LUP+LRIGHT:6.0  165.0:LRIGHT:6.0  171.0:LDOWN+LRIGHT:6.0
+177.0:LDOWN:6.0  183.0:LDOWN+LLEFT:6.0  189.0:LLEFT:6.0  195.0:LUP+LLEFT:6.0
+201.0:LUP:6.0  207.0:LUP+LRIGHT:6.0  213.0:LRIGHT:6.0  219.0:LDOWN+LRIGHT:6.0
+225.0:LDOWN:6.0  231.0:LDOWN+LLEFT:6.0  237.0:LLEFT:6.0  243.0:LUP+LLEFT:6.0
+249.0:LUP:6.0  255.0:LUP+LRIGHT:6.0  261.0:LRIGHT:6.0  267.0:LDOWN+LRIGHT:6.0
+273.0:LDOWN:2.0
 
 # ── jump: a tap every 2 s, every fourth one doubled ──
-81.00:A  83.00:A  85.00:A  87.00:A  87.35:A  89.00:A
-91.00:A  93.00:A  95.00:A  95.35:A  97.00:A  99.00:A
-101.00:A  103.00:A  103.35:A  105.00:A  107.00:A  109.00:A
-111.00:A  111.35:A  113.00:A  115.00:A  117.00:A  119.00:A
-119.35:A  121.00:A  123.00:A  125.00:A  127.00:A  127.35:A
-129.00:A  131.00:A  133.00:A  135.00:A  135.35:A  137.00:A
-139.00:A  141.00:A  143.00:A  143.35:A  145.00:A  147.00:A
-149.00:A  151.00:A  151.35:A  153.00:A  155.00:A  157.00:A
-159.00:A  159.35:A  161.00:A  163.00:A  165.00:A  167.00:A
-167.35:A  169.00:A  171.00:A  173.00:A  175.00:A  175.35:A
-177.00:A  179.00:A  181.00:A  183.00:A  183.35:A  185.00:A
-187.00:A  189.00:A  191.00:A  191.35:A  193.00:A  195.00:A
-197.00:A  199.00:A  199.35:A  201.00:A  203.00:A  205.00:A
-207.00:A  207.35:A  209.00:A  211.00:A  213.00:A  215.00:A
-215.35:A  217.00:A  219.00:A  221.00:A  223.00:A  223.35:A
-225.00:A  227.00:A  229.00:A  231.00:A  231.35:A  233.00:A
-235.00:A  237.00:A  239.00:A  239.35:A  241.00:A  243.00:A
-245.00:A  247.00:A  247.35:A  249.00:A  251.00:A  253.00:A
-255.00:A  255.35:A  257.00:A  259.00:A
+106.00:A  108.00:A  110.00:A  112.00:A  112.35:A  114.00:A
+116.00:A  118.00:A  120.00:A  120.35:A  122.00:A  124.00:A
+126.00:A  128.00:A  128.35:A  130.00:A  132.00:A  134.00:A
+136.00:A  136.35:A  138.00:A  140.00:A  142.00:A  144.00:A
+144.35:A  146.00:A  148.00:A  150.00:A  152.00:A  152.35:A
+154.00:A  156.00:A  158.00:A  160.00:A  160.35:A  162.00:A
+164.00:A  166.00:A  168.00:A  168.35:A  170.00:A  172.00:A
+174.00:A  176.00:A  176.35:A  178.00:A  180.00:A  182.00:A
+184.00:A  184.35:A  186.00:A  188.00:A  190.00:A  192.00:A
+192.35:A  194.00:A  196.00:A  198.00:A  200.00:A  200.35:A
+202.00:A  204.00:A  206.00:A  208.00:A  208.35:A  210.00:A
+212.00:A  214.00:A  216.00:A  216.35:A  218.00:A  220.00:A
+222.00:A  224.00:A  224.35:A  226.00:A  228.00:A  230.00:A
+232.00:A  232.35:A  234.00:A  236.00:A  238.00:A  240.00:A
+240.35:A  242.00:A  244.00:A  246.00:A  248.00:A  248.35:A
+250.00:A  252.00:A  254.00:A  256.00:A  256.35:A  258.00:A
+260.00:A  262.00:A  264.00:A  264.35:A  266.00:A  268.00:A
+270.00:A  272.00:A  272.35:A  274.00:A
 
 # ── spray: pull the Right Trigger every 5 s ──
-83.0:RT:0.35  88.0:RT:0.35  93.0:RT:0.35  98.0:RT:0.35  103.0:RT:0.35  108.0:RT:0.35
-113.0:RT:0.35  118.0:RT:0.35  123.0:RT:0.35  128.0:RT:0.35  133.0:RT:0.35  138.0:RT:0.35
-143.0:RT:0.35  148.0:RT:0.35  153.0:RT:0.35  158.0:RT:0.35  163.0:RT:0.35  168.0:RT:0.35
-173.0:RT:0.35  178.0:RT:0.35  183.0:RT:0.35  188.0:RT:0.35  193.0:RT:0.35  198.0:RT:0.35
-203.0:RT:0.35  208.0:RT:0.35  213.0:RT:0.35  218.0:RT:0.35  223.0:RT:0.35  228.0:RT:0.35
-233.0:RT:0.35  238.0:RT:0.35  243.0:RT:0.35  248.0:RT:0.35  253.0:RT:0.35  258.0:RT:0.35
+108.0:RT:0.35  113.0:RT:0.35  118.0:RT:0.35  123.0:RT:0.35  128.0:RT:0.35  133.0:RT:0.35
+138.0:RT:0.35  143.0:RT:0.35  148.0:RT:0.35  153.0:RT:0.35  158.0:RT:0.35  163.0:RT:0.35
+168.0:RT:0.35  173.0:RT:0.35  178.0:RT:0.35  183.0:RT:0.35  188.0:RT:0.35  193.0:RT:0.35
+198.0:RT:0.35  203.0:RT:0.35  208.0:RT:0.35  213.0:RT:0.35  218.0:RT:0.35  223.0:RT:0.35
+228.0:RT:0.35  233.0:RT:0.35  238.0:RT:0.35  243.0:RT:0.35  248.0:RT:0.35  253.0:RT:0.35
+258.0:RT:0.35  263.0:RT:0.35  268.0:RT:0.35  273.0:RT:0.35
