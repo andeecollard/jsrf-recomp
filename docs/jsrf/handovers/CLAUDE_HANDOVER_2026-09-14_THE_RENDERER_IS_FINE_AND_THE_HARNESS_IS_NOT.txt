@@ -1,0 +1,177 @@
+CLAUDE, 14 Sep 2026 (late)
+THE RENDERER IS NOT THE PROBLEM. THE TEST HARNESS IS. JSRF IS PLAYABLE AT HALF
+SPEED WITH AN APU THAT IS DOWN HALF THE TIME, AND BOTH WERE FOUND BY A PERSON
+WITH A CONTROLLER, NOT BY ANYTHING IN THIS REPO.
+
+Supersedes CLAUDE_HANDOVER_2026-09-14_SIXTY_FPS_AND_A_HARNESS_THAT_CANNOT_SEE.txt.
+Read section 1 and section 5. Section 5 is why this project keeps being wrong.
+
+
+0. STATE OF PLAY
+================
+HEAD 68896ab, tree clean. ctest 21/23, the two failures deliberate (05e0465).
+
+    RECOMP_VOICE_FRESH=1           ring-freshness probe (implies VOICE_RATES)
+    RECOMP_ADX_RATE=1              the guest's sound-server pass rate
+    RECOMP_WAIT_POLL_US=N          wait poll interval, default 1000
+    RECOMP_APU_SE_WHILE_TRAPPED=1  keep the SE rendering while the FE is trapped
+                                   BUILT, OFF, AND STILL NEVER HEARD
+    RECOMP_PB_EXEC_TOP=N           how many unhandled GPU methods to list
+
+Three documents replace reading the handover pile:
+    docs/jsrf/STATUS.md          what works and what does not, all measured
+    docs/jsrf/ACCURACY_GAPS.md   the ranked gap list, with evidence
+    docs/jsrf/PUBLIC_README_DRAFT.md   front page for publication day
+
+
+1. THE RANKED ANSWER TO "WHAT DO WE FIX"
+=========================================
+Full detail in ACCURACY_GAPS.md. Short form:
+
+  1. SPEED. 11.7-14.3 fps at the attract, 31.3 at gameplay, against xemu's
+     59.2-60.1. JSRF is a 60 fps title and uses a fixed step per frame, so half
+     the frame rate is half the GAME SPEED -- it runs in slow motion, which is
+     what the user noticed unprompted. Budget: vsh 7.52, submit 8.41, sync 0.98,
+     REST (guest CPU) 15.03 of 31.94 ms against a 16.67 ms budget.
+  2. AUDIO UPTIME. The APU is down ~48% of real play to an idle-voice trap
+     storm; separately ~23% of the music ring is the previous lap replayed.
+  3. BUILD FLAGS. -O2 with no -fwrapv, no -fno-strict-aliasing, and -w silencing
+     every warning over 40 MB of generated C. Cheapest item here by far, and a
+     UBSan run has never been done.
+  4. fistp under _ftol2 (172 callers) still uses llrint instead of the
+     RECOMP_F2I_* helpers that already exist. NaN and out-of-range diverge.
+  5. KeSynchronizeExecution (ord 153) is unbridged, and an unbridged ordinal
+     returns g_eax=0 -- STATUS_SUCCESS. Both guest call sites are DSOUND, on the
+     two interrupt vectors JSRF connects for audio. The guest believes that work
+     ran. It did not.
+  6. NtProtectVirtualMemory (ord 204): 4089 calls, returns success, changes
+     nothing, never writes lpflOldProtect, so the guest reads uninitialised
+     stack as "previous protection".
+
+
+2. NEGATIVE RESULTS -- DO NOT RE-DERIVE ANY OF THESE
+=====================================================
+This section is worth more than section 1. Each cost a run or an agent.
+
+  * THE RENDERER IS FINE. "392 distinct unhandled methods, 85% of all methods"
+    has been in every log for months and is a RED HERRING. note_unhandled means
+    "no explicit case in the switch", not "dropped": every method < 0x2000 lands
+    in s_methods[] before the switch and the fixed-function path reads it back
+    (nv2a_ff.c:22 consumes SET_COMPOSITE_MATRIX directly). Real figures: VSH
+    314598 batches with 164 rejected (0.05%), 697789 textures with 0 rejected,
+    700k draws, 68.7M triangles. Do not spend a session on GPU method coverage.
+  * WAIT POLL GRANULARITY DOES NOT AFFECT FRAME RATE. Four runs paired by live=:
+    +2.4% mean, scatter -9.1% to +4.7%. So the guest's 15 ms is real work or
+    some other blocking, NOT poll latency.
+  * The other architectural levers are spent and measured: flat dispatch does
+    not appear in the profile at all, the icall feedback loop changed nothing,
+    -O2 on the title matched -O0 within noise.
+  * Clean on audit, do not re-check: kernel file I/O, async APC completion,
+    save/persistent storage, EEPROM and clocks, DPCs, events. Lifter x87 80-bit
+    precision (double is correct here -- no _controlfp(_PC_24) in the image),
+    minps/maxps NaN, shufps, direction flag and string ops, movzx/movsx, lock
+    prefixes, AF and parity, jump tables, endianness.
+  * Previously-open lifter items cvtss2si rounding, NaN float->int casts and
+    shift-count masking are ALREADY FIXED. Only the fistp path was missed.
+
+
+3. WHAT IS BUILT AND WAITING TO BE HEARD
+=========================================
+RECOMP_APU_SE_WHILE_TRAPPED=1 (edbd87d) is the fix for the trap storm. It is
+off by default and has never been listened to. ctest passes but NO TEST IN THIS
+TREE RETIRES A VOICE, so the tests cannot exercise it.
+
+To validate: play.sh with that switch set, grind a rail, listen for the grind
+fading in and out. Read [APU-FRAME] trapped= beside [APU-VOICE] idle_trap=.
+Expect trapped to collapse and idle_trap to stop running at ~217 per retirement.
+
+
+4. PUBLICATION STATE
+====================
+Housekeeping is done and the repo is close to publishable:
+  * three tracked iCloud duplicates removed (they were never built)
+  * four stray files moved out of the root; root is now CLAUDE.md + diagnostics/
+  * NOTICE gained the two LGPL files it was missing (nv2a_core.c, nv2a_state.h)
+    -- that gap is upstream's too and should be sent to them
+  * the developer's home directory is no longer compiled into the binary;
+    argv -> RECOMP_XBE_PATH/RECOMP_GAME_DIR/RECOMP_HDD_ROOT -> relative default
+  * WAV captures now survive being killed (headers patched on flush)
+
+VERIFIED, not assumed: no ROM/BIOS/ISO blob anywhere in history, no email
+addresses in tracked files, no vendored decompilation data and zero
+decomp-derived names in tracked files.
+
+STILL THE OWNER'S CALL: whether docs/jsrf/ (109 files of handovers, progress
+notes and plans -- this file included) goes public at all. The owner has said
+they do not want the warts published. Recommended: keep them in this repo as
+working memory, publish from a filtered history with STATUS.md, ACCURACY_GAPS.md
+and the promoted README. 20 docs files still contain /Users/andrewcollard.
+
+
+5. THE HARNESS CANNOT REACH THE BUGS
+=====================================
+Every scripted pad schedule in diagnostics/jsrf_first_fault/pad/ parks the
+player. Nothing skates, nothing grinds, no sound effect starts or finishes, and
+no voice is ever retired:
+
+    real play (controller)   on=109  off=103  idle_trap=22371   48% frames lost
+    every scripted run ever  on=5    off=0    idle_trap=0        0%
+
+Consequences this session alone: the trap storm was invisible for the life of
+the project; a change was shipped as a default on intro-only numbers and
+silenced gameplay audio entirely; and the controller hotplug abort had never
+been seen. A pad schedule that actually plays -- moves, jumps, grinds, sprays --
+is worth more than any probe in this repo, and is the highest-value thing anyone
+could add to it.
+
+
+6. RETRACTIONS FROM THIS SESSION
+=================================
+Seven, all mine, every one from generalising a single run.
+
+  * the buffer-wrap theory for the intro stutter -- dead, wraps are exactly right
+  * "voice bounds are incoherent" -- an artifact of where voice_desc_dump sits
+  * "gameplay is clean" -- true at live=61, false at live=161 (22.7% stale)
+  * "the music causes the frame collapse" -- both are the attract scene starting
+  * "the wait poll fix is a measured win" -- it silenced gameplay audio; reverted
+  * "the wait poll improves frame rate by 60%" -- a scene difference; matched it
+    is +2.4%, i.e. noise
+  * "85% of GPU methods are unhandled" as a gap -- see section 2
+
+
+7. TRAPS, EACH PAID FOR
+========================
+  * Correlating audio over ONE long window cannot tell "different music" from
+    "same music, broken continuity" -- both read near zero. SWEEP THE WINDOW
+    LENGTH; the collapse point is the defect's period. Control every correlator
+    against itself in the same run.
+  * Sending `quit` to the QEMU monitor TERMINATES xemu. Cost one run.
+  * xemu reads 60 fps at a logo screen too. Scene-match before believing it.
+  * Measure xemu's frame rate with -trace enable=nv2a_pgraph_flip_stall,file=...
+    ~60 events/s, no FIFO needed, no timestamps -- count lines over an interval
+    you timed yourself. It is the same event our [FRAME] counter uses.
+  * `git add -A` after editing source will bury unrelated changes under a docs
+    commit message. It happened once tonight and had to be split back out.
+  * A windowed rate line that samples its own clock twice measures ~0 the second
+    time. The control is the `consumed` column: if it is not 44100, the row is
+    lying.
+
+
+8. STILL OPEN
+=============
+  * What the 15 ms of guest CPU actually is. Needs a profiler, not another
+    architectural guess -- the guesses are spent (section 2).
+  * The trap storm fix, unheard (section 3).
+  * Controller hotplug ABORTS the process: disconnect then reconnect gives
+    [PAD] opened / disconnected / opened then SIGABRT right after
+    SDL_GameControllerOpen returns (src/input/xinput_device.c:346, called from
+    guest threads). No backtrace yet: macOS wrote no report, and lldb needs
+    SIGSEGV/SIGBUS passed through or it breaks the MMIO trap handlers.
+  * ~13% of runs SIGSEGV in the OHCI path; rate not re-measured since timing
+    changed.
+  * First 29.3 s are digital silence; xemu plays a logo chime in its first 10.
+  * xbox_apu is not fully used: apu_mmio_hook.c.o never links, 12 of 50 exports
+    are referenced by nothing (including the whole top-level register dispatch
+    and xemu's APU monitor tap), apu_dsp.c is a stub.
+  * g_apu_lock_handoffs only fires at a frame boundary, so its 84-in-70s cannot
+    exonerate the device lock.
