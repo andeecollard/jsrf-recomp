@@ -101,6 +101,14 @@ add_executable(jsrf_pgraph_notify_test pgraph_notify_test.c)
 target_link_libraries(jsrf_pgraph_notify_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_pgraph_notify COMMAND jsrf_pgraph_notify_test)
 
+# Interrupt delivery: recursion protection, guest IRQL and per-vector state are
+# three separate things. They used to be one process-wide interlock, which is
+# how an audio DPC starved the guest's USB driver. The fourth case is the
+# regression test: a different eligible vector must not be blocked.
+add_executable(jsrf_irq_delivery_test irq_delivery_test.c)
+target_link_libraries(jsrf_irq_delivery_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_irq_delivery COMMAND jsrf_irq_delivery_test)
+
 add_executable(jsrf_av_encoder_option_test av_encoder_option_test.c)
 target_link_libraries(jsrf_av_encoder_option_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_av_encoder_option COMMAND jsrf_av_encoder_option_test)

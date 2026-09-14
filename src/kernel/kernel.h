@@ -49,6 +49,29 @@ typedef LONG KPRIORITY;
 #define APC_LEVEL       1
 #define DISPATCH_LEVEL  2
 
+/* The guest's current IRQL for this execution context. Interrupt delivery uses
+ * it to decide eligibility; see the interrupt section of kernel_bridge.c. */
+KIRQL xbox_KeGetCurrentIrql(void);
+
+/* Why interrupt delivery did or did not happen. Returned by the real decision
+ * function; see the interrupt section of kernel_bridge.c. */
+#define XBOX_IRQ_ELIGIBLE        0
+#define XBOX_IRQ_DEFER_REENTRY   1   /* this thread is already in an ISR/DPC */
+#define XBOX_IRQ_DEFER_IRQL      2   /* masked: effective IRQL >= vector IRQL */
+#define XBOX_IRQ_DEFER_VECTOR    3   /* this vector is already in service */
+
+void xbox_ReportIrqDelivery(void);
+
+/* Test seam -- drives the real state the real decision reads. */
+int  xbox_IrqTestDecide(uint32_t vector);
+void xbox_IrqTestSetVectorIrql(uint32_t vector, uint32_t irql);
+void xbox_IrqTestSetInService(uint32_t vector, int on);
+int  xbox_IrqTestPending(uint32_t vector);
+void xbox_IrqTestSetPending(uint32_t vector, int on);
+void xbox_IrqTestEnterIsr(int on);
+void xbox_IrqTestEnterDpc(int on);
+void xbox_IrqTestReset(void);
+
 /*
  * NTSTATUS codes - guard each against Windows SDK redefinition.
  * winnt.h defines a few of these (STATUS_PENDING, STATUS_INVALID_HANDLE, etc.)

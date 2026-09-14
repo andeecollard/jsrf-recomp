@@ -2392,6 +2392,10 @@ static void bridge_HalGetInterruptVector(void)
 
 /* VOID KeInitializeInterrupt(PKINTERRUPT, ServiceRoutine, ServiceContext,
  *                            Vector, Irql, InterruptMode, ShareVector) */
+/* Defined with the interrupt-delivery machinery below, which is where the
+ * per-vector IRQL table lives. */
+static void bridge_note_vector_irql(uint32_t vector, uint32_t irql);
+
 static void bridge_KeInitializeInterrupt(void)
 {
     uint32_t interrupt_va = STACK_ARG(0);
@@ -2404,6 +2408,13 @@ static void bridge_KeInitializeInterrupt(void)
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
     BRIDGE_MEM32(interrupt_va + 8)  = vector;
+
+    /* Arg 4 is the vector's IRQL and it used to be dropped on the floor, which
+     * is why delivery had nothing to test eligibility against and fell back on
+     * a process-wide interlock. Xbox KeInitializeInterrupt is
+     * (Interrupt, ServiceRoutine, ServiceContext, Vector, Irql, Mode, Shared)
+     * -- 7 args, which is what stdcall_args_for_ordinal has always said. */
+    bridge_note_vector_irql(vector, STACK_ARG(4));
     g_eax = 0;
 }
 
@@ -2755,7 +2766,233 @@ static uint32_t g_nv2a_base;
  * process-wide guard, several waiters can pass the pending check together and
  * run the same interrupt and DPC concurrently.  The NV2A delivers one IRQ at a
  * time, and D3D's DPC mutates shared pending state under that assumption. */
+/* ── Interrupt delivery: three concepts that used to be one ──────────────
+ *
+ * g_vblank_delivery_active was a single process-wide interlock doing three
+ * unrelated jobs at once, and conflating them is what made an ISR or DPC on
+ * ONE guest thread stop interrupt delivery for EVERY thread and EVERY vector.
+ * Measured consequence: bridging ordinal 153 ran previously-dead DSOUND code
+ * inside that interlock, and the guest's USB driver -- whose ISR is delivered
+ * only by bridge_device_irq_poll, behind the same interlock -- starved and
+ * died. Transfer rate fell from ~74000 to ~14000 per run and the title stopped
+ * reaching New Game. The interlock was never an IRQL model; it just happened
+ * to suppress enough to look like one.
+ *
+ * Separated here into what each job actually needs:
+ *
+ *   1. RECURSIVE-ENTRY PROTECTION, and it is per thread, not per process.
+ *      A thread already running a guest ISR or DPC must not be handed another
+ *      interrupt on top of it -- that is a genuine stack hazard. A DIFFERENT
+ *      thread is not endangered by it at all. g_dispatch_depth.
+ *
+ *   2. PER-VECTOR NON-REENTRANCY, process wide but only for the one vector.
+ *      A guest ISR is not re-entrant for its own vector, so the same vector
+ *      must not be in service twice concurrently. Two different vectors may
+ *      be, and on real hardware routinely are. g_vector_in_service[].
+ *
+ *   3. GUEST IRQL AND MASKING, which is what "can this be delivered" actually
+ *      means. The guest already tracks IRQL through KfRaiseIrql/KfLowerIrql
+ *      and KeInitializeInterrupt already tells us each vector's IRQL -- we
+ *      simply threw that argument away. An interrupt is eligible when the
+ *      delivering context's effective IRQL is BELOW the vector's IRQL.
+ *      Otherwise it stays pending and is delivered when IRQL drops.
+ *
+ * ISR/DPC execution state (g_in_isr, g_in_dpc) is concept 3's input for THIS
+ * thread -- it raises this thread's effective IRQL -- and concept 1's trigger.
+ * It is no longer a global veto.
+ *
+ * RECOMP_LEGACY_IRQ_INTERLOCK=1 restores the old process-wide behaviour, so
+ * the two can be compared on one binary. */
 static volatile LONG g_vblank_delivery_active;
+
+/* 1. Per-thread recursion depth. Non-zero means this thread is inside a guest
+ *    ISR or DPC and must not start another. */
+static RECOMP_TLS int g_dispatch_depth;
+
+/* 2. Per-vector in-service flags, and 3. per-vector pending + IRQL. */
+static volatile LONG g_vector_in_service[BRIDGE_MAX_INTERRUPTS];
+static volatile LONG g_vector_pending[BRIDGE_MAX_INTERRUPTS];
+static uint8_t       g_vector_irql[BRIDGE_MAX_INTERRUPTS];
+
+/* Counters. Every one of these is read by xbox_ReportIrqDelivery below, and
+ * each is incremented at exactly one site so its meaning cannot drift -- this
+ * tree has been misled more than once by a counter whose trigger nobody had
+ * read. */
+static volatile LONG g_irq_delivered;        /* ISR actually entered */
+static volatile LONG g_irq_defer_irql;       /* blocked: effective IRQL too high */
+static volatile LONG g_irq_defer_reentry;    /* blocked: this thread already dispatching */
+static volatile LONG g_irq_defer_vector;     /* blocked: same vector already in service */
+static volatile LONG g_irq_pending_peak;     /* most vectors pending at once */
+static volatile LONG g_irq_legacy_hits;      /* old global interlock actually blocked someone */
+
+static int bridge_legacy_irq_interlock(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_LEGACY_IRQ_INTERLOCK");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+/* This context's effective IRQL.
+ *
+ * Inside a guest ISR the processor is at the device's IRQL; inside a DPC it is
+ * at DISPATCH_LEVEL. Outside both it is whatever the guest last set. Modelling
+ * ISR/DPC state as an IRQL contribution rather than as a separate veto is the
+ * whole point: it keeps the suppression scoped to the context that is actually
+ * raised, instead of the entire process. */
+static KIRQL bridge_effective_irql(void)
+{
+    if (g_in_isr) return (KIRQL)0xFF;          /* device level: nothing preempts */
+    if (g_in_dpc) return (KIRQL)DISPATCH_LEVEL;
+    return xbox_KeGetCurrentIrql();
+}
+
+static void bridge_note_vector_irql(uint32_t vector, uint32_t irql)
+{
+    if (vector < BRIDGE_MAX_INTERRUPTS)
+        g_vector_irql[vector] = (uint8_t)irql;
+}
+
+static KIRQL bridge_vector_irql(uint32_t vector)
+{
+    /* DISPATCH_LEVEL + 1 is the floor for a device interrupt: it must be able
+     * to preempt DPC-level work, which is what a device IRQL means. A vector
+     * the guest never gave an IRQL for gets that floor rather than 0, which
+     * would make it permanently ineligible. */
+    KIRQL irql = (vector < BRIDGE_MAX_INTERRUPTS) ? g_vector_irql[vector] : 0;
+    return irql > (KIRQL)DISPATCH_LEVEL ? irql : (KIRQL)(DISPATCH_LEVEL + 1);
+}
+
+/* Deliver one connected interrupt, if this context is allowed to.
+ *
+ * Returns the ISR's result, or 0 when nothing was delivered. A refusal is
+ * counted by reason and, when the reason is IRQL, the vector is left pending
+ * so the next poll picks it up once the guest drops back down. Re-delivery is
+ * driven by the existing poll rather than by a separate queue: the pumps
+ * already revisit every connected vector on a timer, so a pending vector is
+ * retried within one period, and a second mechanism would be a second thing to
+ * keep correct. */
+/* The eligibility decision, separated from the act of delivering.
+ *
+ * Separate so the tests can exercise THIS function rather than a copy of its
+ * reasoning -- a test that reimplements the rule it is checking passes against
+ * a broken implementation, which this tree has already been bitten by once
+ * today. bridge_deliver_isr below is the only production caller. */
+static int bridge_irq_decide(uint32_t vector)
+{
+    int slot = (vector < BRIDGE_MAX_INTERRUPTS) ? (int)vector : -1;
+
+    /* 1. Recursion, and only for THIS thread. */
+    if (g_dispatch_depth) return XBOX_IRQ_DEFER_REENTRY;
+
+    /* 3. Eligibility by IRQL. */
+    if (bridge_effective_irql() >= bridge_vector_irql(vector))
+        return XBOX_IRQ_DEFER_IRQL;
+
+    /* 2. Same vector already in service, anywhere in the process. A different
+     *    vector is deliberately NOT consulted here. */
+    if (slot >= 0 && g_vector_in_service[slot]) return XBOX_IRQ_DEFER_VECTOR;
+
+    return XBOX_IRQ_ELIGIBLE;
+}
+
+static uint32_t bridge_deliver_isr(uint32_t iv)
+{
+    uint32_t vector = BRIDGE_MEM32(iv + 8);
+    uint32_t result;
+    int slot = (vector < BRIDGE_MAX_INTERRUPTS) ? (int)vector : -1;
+    int decision = bridge_irq_decide(vector);
+
+    if (decision == XBOX_IRQ_DEFER_REENTRY) {
+        InterlockedIncrement(&g_irq_defer_reentry);
+        return 0;
+    }
+    if (decision == XBOX_IRQ_DEFER_IRQL) {
+        /* Pending, not dropped. The pumps revisit every connected vector on a
+         * timer, so this is retried within one period once IRQL drops. */
+        InterlockedIncrement(&g_irq_defer_irql);
+        if (slot >= 0) {
+            LONG n = 0; int k;
+            InterlockedExchange(&g_vector_pending[slot], 1);
+            for (k = 0; k < BRIDGE_MAX_INTERRUPTS; k++)
+                if (g_vector_pending[k]) n++;
+            if (n > g_irq_pending_peak) InterlockedExchange(&g_irq_pending_peak, n);
+        }
+        return 0;
+    }
+    if (decision == XBOX_IRQ_DEFER_VECTOR) {
+        InterlockedIncrement(&g_irq_defer_vector);
+        return 0;
+    }
+
+    /* Claim the vector. The decision above read the flag; this is what makes
+     * the claim atomic against another thread deciding the same thing. */
+    if (slot >= 0 &&
+        InterlockedCompareExchange(&g_vector_in_service[slot], 1, 0) != 0) {
+        InterlockedIncrement(&g_irq_defer_vector);
+        return 0;
+    }
+
+    g_dispatch_depth++;
+    result = bridge_run_isr(iv);
+    g_dispatch_depth--;
+
+    /* Acknowledge exactly once: pending cleared and the vector released, in
+     * that order, so a concurrent decide() cannot see "free but still pending"
+     * and count a spurious deferral. */
+    if (slot >= 0) {
+        InterlockedExchange(&g_vector_pending[slot], 0);
+        InterlockedExchange(&g_vector_in_service[slot], 0);
+    }
+    InterlockedIncrement(&g_irq_delivered);
+    return result;
+}
+
+/* ── Test seam ────────────────────────────────────────────────────────────
+ * Deliberately thin, and every entry point drives the REAL state the real
+ * decision reads. Nothing here duplicates the rule. */
+int xbox_IrqTestDecide(uint32_t vector) { return bridge_irq_decide(vector); }
+void xbox_IrqTestSetVectorIrql(uint32_t v, uint32_t irql) { bridge_note_vector_irql(v, irql); }
+void xbox_IrqTestSetInService(uint32_t v, int on)
+{
+    if (v < BRIDGE_MAX_INTERRUPTS) InterlockedExchange(&g_vector_in_service[v], on ? 1 : 0);
+}
+int xbox_IrqTestPending(uint32_t v)
+{
+    return (v < BRIDGE_MAX_INTERRUPTS) ? (int)g_vector_pending[v] : 0;
+}
+void xbox_IrqTestSetPending(uint32_t v, int on)
+{
+    if (v < BRIDGE_MAX_INTERRUPTS) InterlockedExchange(&g_vector_pending[v], on ? 1 : 0);
+}
+void xbox_IrqTestEnterIsr(int on) { g_in_isr = on ? 1 : 0; g_dispatch_depth = on ? 1 : 0; }
+void xbox_IrqTestEnterDpc(int on) { g_in_dpc = on ? 1 : 0; g_dispatch_depth = on ? 1 : 0; }
+void xbox_IrqTestReset(void)
+{
+    int k;
+    g_in_isr = g_in_dpc = g_dispatch_depth = 0;
+    for (k = 0; k < BRIDGE_MAX_INTERRUPTS; k++) {
+        InterlockedExchange(&g_vector_in_service[k], 0);
+        InterlockedExchange(&g_vector_pending[k], 0);
+        g_vector_irql[k] = 0;
+    }
+}
+
+void xbox_ReportIrqDelivery(void)
+{
+    int k; LONG pend = 0;
+    for (k = 0; k < BRIDGE_MAX_INTERRUPTS; k++) if (g_vector_pending[k]) pend++;
+    fprintf(stderr,
+            "  [IRQ] delivered=%ld deferred: irql=%ld reentry=%ld vector=%ld"
+            " | pending now=%ld peak=%ld | legacy-interlock-blocks=%ld%s\n",
+            g_irq_delivered, g_irq_defer_irql, g_irq_defer_reentry,
+            g_irq_defer_vector, pend, g_irq_pending_peak, g_irq_legacy_hits,
+            bridge_legacy_irq_interlock() ? " (LEGACY MODE)" : "");
+    fflush(stderr);
+}
+
 
 /* Make the summary bit follow its source, which is what the hardware does.
  *
@@ -2811,7 +3048,8 @@ static void bridge_nv2a_mirror_intr(void)
  * the guest's clock runs on our frame rate. max_gap is the same question asked
  * about the worst case, because a mean of 60 built from a long stall and a
  * burst is not a 60 Hz clock either. */
-unsigned long g_vblank_delivered;
+unsigned long g_vblank_delivered;   /* guest ISR actually entered */
+unsigned long g_vblank_raised;      /* source asserted, ISR may have been refused */
 unsigned long g_vblank_deadlines;   /* periods that elapsed and were acted on */
 unsigned long g_vblank_skipped_ack; /* deadline reached, previous still unacked */
 unsigned long g_vblank_max_gap_ms;
@@ -2901,11 +3139,16 @@ void xbox_VblankReport(void)
 {
     DWORD now = GetTickCount();
     unsigned long ms = g_vblank_first_ms ? (unsigned long)(now - g_vblank_first_ms) : 0;
+    /* Hz from DELIVERED, not raised: the guest's clock is how often its ISR
+     * ran, not how often we asserted the line. Both are printed so a gap
+     * between them is visible rather than hidden -- raised > delivered means
+     * interrupts are being refused, which is a real condition worth seeing. */
     double hz = ms ? (double)g_vblank_delivered * 1000.0 / (double)ms : 0.0;
-    fprintf(stderr, "  [VBLANK] delivered=%lu over %lu ms = %.1f Hz"
+    fprintf(stderr, "  [VBLANK] delivered=%lu (raised=%lu) over %lu ms = %.1f Hz"
             " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms"
             " not_ready=%lu\n",
-            g_vblank_delivered, ms, hz, 1000000 / BRIDGE_VBLANK_PERIOD_US,
+            g_vblank_delivered, g_vblank_raised, ms, hz,
+            1000000 / BRIDGE_VBLANK_PERIOD_US,
             g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms,
             g_interrupt_not_ready);
     fflush(stderr);
@@ -2938,15 +3181,21 @@ static void bridge_vblank_poll(void)
         if (pending_at_entry) InterlockedIncrement(&g_pgraph_pending_polls);
     }
 
-    if (g_in_dpc || g_in_isr) {
+    /* Per-thread only. A thread inside a guest ISR or DPC must not start
+     * another; other threads are unaffected, which is the change. Eligibility
+     * for each individual vector is decided in bridge_deliver_isr. */
+    if (g_dispatch_depth) {
         if (trace && pending_at_entry) InterlockedIncrement(&g_pgraph_tls_skips);
         return;
     }
 
-    if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) != 0) {
-        if (trace && pending_at_entry)
-            InterlockedIncrement(&g_pgraph_interlock_skips);
-        return;
+    if (bridge_legacy_irq_interlock()) {
+        if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) != 0) {
+            InterlockedIncrement(&g_irq_legacy_hits);
+            if (trace && pending_at_entry)
+                InterlockedIncrement(&g_pgraph_interlock_skips);
+            return;
+        }
     }
 
     bridge_nv2a_mirror_intr();
@@ -2979,7 +3228,7 @@ static void bridge_vblank_poll(void)
                     if (!intr_en) InterlockedIncrement(&g_pgraph_en_disabled);
                     InterlockedIncrement(&g_pgraph_isr_dispatches);
                 }
-                handled = bridge_run_isr(iv);
+                handled = bridge_deliver_isr(iv);
                 if (trace && (handled & 0xFF))
                     InterlockedIncrement(&g_pgraph_isr_handled);
                 if (trace && !xbox_Nv2aSoftwareMethodPending())
@@ -3039,15 +3288,32 @@ static void bridge_vblank_poll(void)
                     if (gap > g_vblank_max_gap_ms) g_vblank_max_gap_ms = gap;
                 }
                 g_vblank_last_ms = t;
-                g_vblank_delivered++;
+                g_vblank_raised++;
             }
             xbox_Nv2aRaiseVblank();
-            bridge_run_isr(iv);
+            /* Raising the source and running the guest's ISR are two different
+             * events and this used to count only the first while calling it
+             * "delivered". That was always loose -- the ISR could decline --
+             * and it became wrong when bridge_deliver_isr gained the ability to
+             * REFUSE outright (reentry, IRQL, vector already in service), at
+             * which point a refused interrupt still incremented the counter and
+             * still fed the Hz figure. Every "62.3 Hz, the guest's clock is
+             * fine" claim in the handovers came from this number.
+             *
+             * g_irq_delivered is incremented in exactly one place, after the
+             * guest ISR returns, so differencing it across the call is the
+             * honest test of whether anything actually ran. */
+            {
+                LONG before = g_irq_delivered;
+                bridge_deliver_isr(iv);
+                if (g_irq_delivered != before) g_vblank_delivered++;
+            }
         }
     }
 
 done:
-    InterlockedExchange(&g_vblank_delivery_active, 0);
+    if (bridge_legacy_irq_interlock())
+        InterlockedExchange(&g_vblank_delivery_active, 0);
 }
 
 /* Device interrupts other than the GPU.
@@ -3078,13 +3344,18 @@ static void bridge_device_irq_poll(void)
     DWORD now;
     int i;
 
-    if (g_in_dpc || g_in_isr) return;
+    /* Per-thread only. This pump used to share the NV2A global interlock on the
+     * reasoning that "a guest ISR is not re-entrant" -- true, but that is a
+     * property of ONE vector, not of the process, and paying for it globally is
+     * what let an audio DPC stop USB interrupts. Per-vector non-reentrancy is
+     * enforced in bridge_deliver_isr instead. */
+    if (g_dispatch_depth) return;
 
-    /* Shares the NV2A delivery interlock: one interrupt at a time across the
-     * process, for the same reason the vblank path needs it -- several blocked
-     * waiters pump this, and a guest ISR is not re-entrant. */
-    if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) != 0) {
-        return;
+    if (bridge_legacy_irq_interlock()) {
+        if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) != 0) {
+            InterlockedIncrement(&g_irq_legacy_hits);
+            return;
+        }
     }
 
     now = GetTickCount();
@@ -3107,7 +3378,7 @@ static void bridge_device_irq_poll(void)
             continue;   /* the GPU has its own handshake; see bridge_vblank_poll */
         }
 
-        result = bridge_run_isr(iv);
+        result = bridge_deliver_isr(iv);
 
         /* Logged per vector, because one chatty device would otherwise spend a
          * shared budget and hide the others. A run of FALSE means the routine
@@ -3127,7 +3398,8 @@ static void bridge_device_irq_poll(void)
     }
 
 done:
-    InterlockedExchange(&g_vblank_delivery_active, 0);
+    if (bridge_legacy_irq_interlock())
+        InterlockedExchange(&g_vblank_delivery_active, 0);
 }
 
 /* RECOMP_IRQ_THREAD -- deliver device interrupts from a host thread.
@@ -3386,6 +3658,12 @@ static void bridge_run_dpc(uint32_t dpc_va, uint32_t sys1, uint32_t sys2)
     {
         BridgeGuestRegs saved;
         bridge_save_regs(&saved);
+        /* Raise the per-thread recursion depth around every DPC body, not just
+         * the ones reached from an ISR. A timer DPC runs here with no ISR above
+         * it, and guest code inside it can call back into the kernel and reach
+         * a pump; without this that pump would see depth 0 and start a second
+         * guest interrupt on a thread already running guest interrupt code. */
+        g_dispatch_depth++;
         g_in_dpc = 1;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = sys2;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = sys1;
@@ -3394,6 +3672,7 @@ static void bridge_run_dpc(uint32_t dpc_va, uint32_t sys1, uint32_t sys2)
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         fn();
         g_in_dpc = 0;
+        g_dispatch_depth--;
         bridge_restore_regs(&saved);
     }
 }

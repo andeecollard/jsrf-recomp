@@ -31,6 +31,21 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* The guest's current IRQL, readable from outside this file.
+ *
+ * It was tracked here from the beginning and consulted by NOTHING. Interrupt
+ * delivery in kernel_bridge.c instead used a process-wide interlock as a
+ * stand-in for "interrupts are masked", which is a different thing on a
+ * different scope: IRQL is per execution context, the interlock was global, so
+ * one guest thread inside an ISR or DPC suppressed delivery for every other
+ * thread and every other vector. That is what this accessor exists to fix.
+ *
+ * Thread-local, like the variable, because that is what IRQL is. */
+KIRQL xbox_KeGetCurrentIrql(void)
+{
+    return g_current_irql;
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).

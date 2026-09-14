@@ -59,6 +59,10 @@ extern void xbox_HeapReport(const char *why);
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 #include "xinput_xbox.h"
 #include "xbox_usb_ohci.h"
+
+/* 0 unless the gen tree defines it -- see the definition further down and the
+ * [PROBES] NOT ARMED gate in the periodic report. */
+extern int jsrf_probes_installed;
 static void jsrf_adx_rate_report(void);
 
 
@@ -1073,15 +1077,34 @@ static void jsrf_pusher_report(void)
              * unless RECOMP_D3D_ALLOC_TRACE is set and the sites are armed. */
             jsrf_d3d_alloc_report();
             /* And whether DirectSound is still answering at all. One latch at
-             * 0x001BA04C turns every DSOUND entry point into an E_FAIL stub,
-             * and the counters that say so are only evidence if they are
-             * printed when they are zero. Silent unless RECOMP_DSOUND_FATAL
-             * is set and the sites are armed. */
-            jsrf_dsound_fatal_report();
-            /* And the CRI DirectSound driver above it, whose own diagnostics
-             * have never had anywhere to go. */
-            jsrf_cri_dsound_report();
-            jsrf_cri_server_report();
+             * 0x001BA04C turns every DSOUND entry point into an E_FAIL stub.
+             *
+             * THESE THREE PRINT ZEROS WHEN THE PROBES ARE NOT INSTALLED, and a
+             * row of zeros reads exactly like "the guest never called DSOUND".
+             * That is the same shape as the dead OHCI counters whose zeros were
+             * read as evidence and voided a session's reasoning on 11 Sep. The
+             * comment here used to claim they were "silent unless ... the sites
+             * are armed"; they were not.
+             *
+             * The probes live in the gen tree, and regenerate.sh overwrites it,
+             * so they are absent far more often than anyone expects.
+             * instrument_startup.py now stamps a marker into the tree it
+             * instruments; jsrf_probes_installed is a weak symbol that stays 0
+             * when that marker is absent. */
+            if (!jsrf_probes_installed) {
+                fprintf(stderr,
+                        "  [PROBES] NOT ARMED -- the gen tree carries no probe "
+                        "sites, so DSOUND/CRI counters below would read zero "
+                        "whatever the guest did. Re-run instrument_startup.py "
+                        "against a COPY of the gen tree to arm them.\n");
+                fflush(stderr);
+            } else {
+                jsrf_dsound_fatal_report();
+                /* And the CRI DirectSound driver above it, whose own
+                 * diagnostics have never had anywhere to go. */
+                jsrf_cri_dsound_report();
+                jsrf_cri_server_report();
+            }
         }
         /* And the boundary those voices have to cross. The APU aperture is
          * guarded read-only so stores fault and reach the model; anything the
@@ -1104,6 +1127,12 @@ static void jsrf_pusher_report(void)
              * call count so the next freeze can be attributed or ruled out. */
             extern void xbox_ReportSyncExec(void);
             xbox_ReportSyncExec();
+            /* Interrupt delivery: delivered vs deferred-by-reason, what is
+             * pending, and whether the old process-wide interlock ever blocks
+             * anyone. The last field is the one that matters after the IRQL
+             * rework -- it should read 0 outside legacy mode. */
+            extern void xbox_ReportIrqDelivery(void);
+            xbox_ReportIrqDelivery();
         }
         /* Whether the pad is being asked, and whether it answers. The
          * "(opened)" line at startup answers neither. */
@@ -3150,6 +3179,13 @@ void jsrf_trace_function(uint32_t guest_function)
         fprintf(stderr, "CALLBACK EXECUTED: 0x%08X\n", JSRF_CALLBACK);
     }
 }
+
+/* 0 unless the gen tree defines it. instrument_startup.py writes
+ * jsrf_probes_installed.c into the tree it instruments, and a freshly
+ * regenerated tree has no such file -- which is precisely the state that used
+ * to make every probe report print zeros indistinguishable from "the code
+ * never ran". Weak, so the gen tree's strong definition wins when present. */
+__attribute__((weak)) int jsrf_probes_installed = 0;
 
 void recomp_trace_enter(const char *name, uint32_t guest_function)
 {
