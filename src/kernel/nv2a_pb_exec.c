@@ -462,6 +462,27 @@ static struct {
 static unsigned s_alpha_trace_count;
 static uint64_t s_alpha_trace_overflow, s_alpha_trace_batches;
 
+/* Distinct INPUT diffuse-alpha levels, and whether the attribute came from a
+ * bound array rather than an immediate. Same shape as the output table. */
+static float s_fetched_alpha_lo = 2.0f, s_fetched_alpha_hi = -1.0f;
+static int s_fetched_alpha_seen;
+static struct { unsigned level; int from_array; uint64_t hits; } s_alpha_in[ALPHA_TRACE_MAX];
+static unsigned s_alpha_in_count;
+static uint64_t s_alpha_in_overflow;
+
+static void note_batch_alpha_in(unsigned level, int from_array)
+{
+    unsigned i;
+    for (i = 0; i < s_alpha_in_count; ++i)
+        if (s_alpha_in[i].level == level && s_alpha_in[i].from_array == from_array) {
+            ++s_alpha_in[i].hits; return;
+        }
+    if (s_alpha_in_count >= ALPHA_TRACE_MAX) { ++s_alpha_in_overflow; return; }
+    i = s_alpha_in_count++;
+    s_alpha_in[i].level = level; s_alpha_in[i].from_array = from_array;
+    s_alpha_in[i].hits = 1;
+}
+
 static void note_batch_alpha(unsigned level)
 {
     unsigned i;
@@ -493,7 +514,15 @@ static void note_batch_alpha(unsigned level)
  * constant register while any factor is nonzero, so whether our guest writes
  * this same ramp decides between a guest that never computes the fade and a
  * renderer that is handed it and throws it away. */
-#define FACTOR_TRACE_MAX 24
+/* 24 was far too few and made the instrument answer the opposite question.
+ *
+ * The table keys on (method, value) pairs, so sixteen factor registers taking
+ * more than a couple of values each fill it in the first second; a 75 s intro
+ * run reported overflow=76158. "Only three distinct factor values were seen"
+ * was therefore a statement about the table being full, not about the title --
+ * and a ramp, which is by definition many distinct values, is precisely what
+ * this could not show. Big enough now that overflow means something. */
+#define FACTOR_TRACE_MAX 512
 static struct {
     uint32_t method, value, first_draw, last_draw;
     double first_t, last_t;
@@ -2139,6 +2168,7 @@ static int prepare_vertices(void)
             memcpy(inputs, s_vsh.current, sizeof(inputs));
             for (uint32_t a = 0; a < 16; ++a) {
                 if (!(s_vsh.decoded.inputs_read & (1u << a))) continue;
+                if (a == 3 && s_gpu.attr[3].size) s_fetched_alpha_seen = 1;
                 if (s_gpu.attr[a].size && !fetch_vertex(a, s_gpu.idx[i], inputs[a])) {
                     /* Name the record, once. "attribute 3 failed" is one step
                      * from useless; the format byte is the answer, because
@@ -2156,6 +2186,17 @@ static int prepare_vertices(void)
                     }
                     VSH_REJECT("vertex attribute could not be fetched", a);
                 }
+            }
+            /* Diffuse alpha as the shader actually receives it, every vertex
+             * and independent of any trace switch. Kept as its own braced
+             * statement: the previous version was inserted in front of
+             * trace_vertex_inputs, which is the unbraced body of the `if`
+             * below, and so both stole that guard and ran the trace
+             * unconditionally. */
+            {
+                float ia = inputs[3][3];
+                if (ia < s_fetched_alpha_lo) s_fetched_alpha_lo = ia;
+                if (ia > s_fetched_alpha_hi) s_fetched_alpha_hi = ia;
             }
             if (i == 0 && (s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()))
                 trace_vertex_inputs(inputs);
@@ -2600,6 +2641,42 @@ static void raster_batch(void)
             }
             if (hi >= 0.0f) {
                 ++s_alpha_trace_batches;
+                /* The INPUT alpha beside the output, because they answer
+                 * different questions and only the pair localises the loss.
+                 * note_batch_alpha samples s_outputs[..][OUT_D0][3], the vertex
+                 * shader's RESULT. A ramp that reaches the input and not the
+                 * output is the shader or our execution of it; one that never
+                 * reaches the input was lost before the pushbuffer, in guest
+                 * code. Both look identical from the output alone, which is all
+                 * that was measured before. Attribute 3 is diffuse, and
+                 * s_vsh.current[3] is what an immediate write leaves there. */
+                /* The FETCHED value when the attribute is array-bound, which
+                 * is the one the shader actually received. Sampling
+                 * s_vsh.current[3][3] instead reported the untouched 1.0
+                 * default and looked exactly like a real 255. */
+                note_batch_alpha_in(
+                    s_fetched_alpha_hi >= 0.0f
+                        ? (unsigned)(s_fetched_alpha_lo * 255.0f + 0.5f)
+                        : (unsigned)(s_vsh.current[3][3] * 255.0f + 0.5f),
+                    s_gpu.attr[3].size != 0);
+                /* The DECLARATION, because a constant 255 is also exactly what
+                 * a 3-component diffuse produces: fetch_vertex fills what the
+                 * declaration names and leaves w at the 1.0 default. That
+                 * would be our mis-parse of the vertex format rather than the
+                 * guest losing the value, and the two are indistinguishable
+                 * from the fetched alpha alone. */
+                {
+                    static int shown;
+                    if (!shown) {
+                        shown = 1;
+                        fprintf(stderr, "[ALPHA-IN] attr[3] decl: size=%u type=%u"
+                                " stride=%u offset=0x%X\n",
+                                s_gpu.attr[3].size, s_gpu.attr[3].type,
+                                s_gpu.attr[3].stride, s_gpu.attr[3].offset);
+                        fflush(stderr);
+                    }
+                }
+                s_fetched_alpha_lo = 2.0f; s_fetched_alpha_hi = -1.0f;
                 /* One level per batch: the fade quad is flat-shaded, so lo and
                  * hi agree on it, and a batch where they disagree is not the
                  * quad we are looking for. */
@@ -3444,6 +3521,13 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "[ALPHA] blend-enabled batches=%llu distinct-levels=%u"
                 " overflow=%llu\n", (unsigned long long)s_alpha_trace_batches,
                 s_alpha_trace_count, (unsigned long long)s_alpha_trace_overflow);
+        fprintf(stderr, "[ALPHA-IN] distinct input levels=%u overflow=%llu\n",
+                s_alpha_in_count, (unsigned long long)s_alpha_in_overflow);
+        for (unsigned i = 0; i < s_alpha_in_count; ++i)
+            fprintf(stderr, "[ALPHA-IN]   level=%3u source=%s hits=%llu\n",
+                    s_alpha_in[i].level,
+                    s_alpha_in[i].from_array ? "array " : "immed ",
+                    (unsigned long long)s_alpha_in[i].hits);
         for (unsigned i = 0; i < s_alpha_trace_count; ++i)
             fprintf(stderr, "[ALPHA]   level=%3u hits=%llu draws %u..%u"
                     " t=%.2f..%.2f\n", s_alpha_trace[i].level,
