@@ -14,7 +14,17 @@ p.add_argument('--skip-mismatched', action='store_true',
                     'sites should not block the other eighty: each site '
                     'installed is still validated individually, so the tree is '
                     'never half-instrumented at a site that did not match.')
-p.add_argument('--gen', type=Path, default=Path(__file__).resolve().parents[2] / 'build-macos/jsrf-first-fault/gen')
+# NO DEFAULT, deliberately. This used to default to
+# build-macos/jsrf-first-fault/gen -- the very tree regenerate.sh overwrites and
+# the build compiles. So probes were installed into the live tree and the next
+# regeneration silently deleted every one of them, leaving ~38 RECOMP_* switches
+# that read as available and do nothing. CLAUDE.md says instrumentation is
+# "installed into a *copy* of a gen tree"; defaulting here is what made that
+# untrue in practice. Name the tree you mean.
+p.add_argument('--gen', type=Path, required=True,
+               help='the gen tree to instrument. Use a COPY, not the tree '
+                    'regenerate.sh writes and the build compiles, or the next '
+                    'regeneration will silently remove every probe.')
 a = p.parse_args()
 # Generated file -> pc -> (probe function, argument expression).
 #
@@ -368,6 +378,27 @@ for f in sorted(a.gen.glob('recomp_*.c')):
     if file_changed:
         f.write_text('\n'.join(output) + '\n')
         unresolved_files += 1
+
+# Stamp the tree so the RUNTIME can tell "probe never fired" from "probe was
+# never installed". Those two look identical in a log -- a report prints zeros
+# either way -- and that is exactly how a dead OHCI file's zero counters were
+# read as evidence and voided a whole session's reasoning on 11 Sep.
+#
+# A weak symbol in the harness defaults to 0; this definition in the gen tree
+# overrides it. Nothing else in the build defines it, so it cannot be faked.
+marker_file = a.gen / 'jsrf_probes_installed.c'
+if a.remove:
+    if marker_file.exists():
+        marker_file.unlink()
+        print('Removed probe-installed marker')
+else:
+    marker_file.write_text(
+        '/* Written by instrument_startup.py. Overrides the weak default in\n'
+        ' * main.c so the periodic reports can say NOT ARMED instead of\n'
+        ' * printing zeros that read exactly like "the site never ran".\n'
+        ' * Deleted by --remove, and absent from any freshly regenerated tree. */\n'
+        'int jsrf_probes_installed = 1;\n')
+    print(f'Wrote probe-installed marker to {marker_file}')
 
 action = 'Removed' if a.remove else 'Installed'
 print(f'{action} {changed} fixed observation sites in {len(points)} generated files')
