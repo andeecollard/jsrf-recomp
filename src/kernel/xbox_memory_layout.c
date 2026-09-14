@@ -459,15 +459,23 @@ static void xbox_McpxHoldRegisters(void)
 {
     if (!g_mcpx_regs)
         return;
+    /* Through the alias, like every other runtime write.
+     *
+     * These offsets are on the guarded page, so writing them through the guest
+     * view faults into our OWN trap handler -- which then applies GUEST
+     * semantics (write-1-to-clear and the rest) to a write the runtime made
+     * for itself. It worked, because the handler stores what it computes, but
+     * it is a fault per register per call and the semantics are the wrong
+     * ones. The alias has neither problem. */
     for (size_t i = 0; i < sizeof(MCPX_ACK) / sizeof(MCPX_ACK[0]); i++) {
         volatile uint32_t *r =
-            (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_ACK[i].offset);
+            (volatile uint32_t *)(MCPX_WBASE + MCPX_ACK[i].offset);
         if (*r & MCPX_ACK[i].clear_mask)
             *r &= ~MCPX_ACK[i].clear_mask;
     }
     {
         volatile uint32_t *rh =
-            (volatile uint32_t *)((char *)g_mcpx_regs + 0x500048);
+            (volatile uint32_t *)(MCPX_WBASE + 0x500048);
         unsigned ndp = xbox_OhciPorts();
         if ((*rh & 0xFFu) != ndp)
             *rh = (*rh & ~0xFFu) | ndp;

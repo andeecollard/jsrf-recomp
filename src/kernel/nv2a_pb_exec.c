@@ -452,7 +452,14 @@ static void note_clear_value(uint32_t param)
  *
  * Quantised to 1/255 and tabulated, because the interesting shape is the set
  * of distinct levels over the card: a ramp is many, a cut is one or two. */
-#define ALPHA_TRACE_MAX 24
+/* One slot per possible level, so the table can never be the answer.
+ *
+ * 24 was enough for the intro, where there is one level, and silently wrong
+ * for gameplay, where a 300 s run reported distinct-levels=24 overflow=4841 --
+ * a full table, not a finding. The FACTOR table had the identical defect and
+ * reversed a conclusion twice before it was noticed. An alpha level is a byte;
+ * 256 slots costs nothing and overflow can then only mean a bug. */
+#define ALPHA_TRACE_MAX 256
 static struct {
     unsigned level;
     uint32_t first_draw, last_draw;
