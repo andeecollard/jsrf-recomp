@@ -2948,6 +2948,104 @@ static void jsrf_scene_report(void)
                 (unsigned)R32(root + 0x7EC4u));
     }
 
+    /* WHY WaitEndStoryOrVsMission does not end.
+     *
+     * The state itself is not a fault -- xemu sits in it too through the Corn
+     * tutorial. What was never established is why ours never leaves, and the
+     * exit condition turns out to be four instructions:
+     *
+     *   CActSequence::WaitEndStoryOrVsMission (0x0007CA70)
+     *     mov  ecx, [0x0022FCE0]          ; CActMan
+     *     push 8
+     *     call CActMan::GetAction         ; 0x000128C0
+     *     test eax, eax
+     *     jne  keep_waiting
+     *     mov  [esi+0x48], 0x1F           ; advance to method 31
+     *
+     * CActMan::GetAction is a bounds-checked lookup into the action table at
+     * CActMan+0x98, indexed by eACTID -- so this is not a counter or a flag,
+     * it is a LIVE OBJECT POINTER. The state waits for the action with
+     * eACTID 8 to be deleted, and holds as long as that object exists.
+     *
+     * (Read off the disassembly, then named from the decompilation's symbol
+     * table: sub_000128C0 is CActMan::GetAction, sub_00012870 is
+     * InsertActionExecList and sub_00012890 is FreeActID. Before those names
+     * the same code reads convincingly as a script-variable array, which is
+     * what I first took it for. The enum stops at eACTID_ACTSEQUENCE = 0 in
+     * the decompilation, so 8 has no name there and has to be identified from
+     * the object itself.)
+     *
+     * So print the pointer AND its vtable, because the vtable is what says
+     * which class is refusing to die -- the data symbols give vtable
+     * addresses. Neighbours in the table come too: whether slots around 8 are
+     * also occupied distinguishes "one mission object outlived its mission"
+     * from "the whole table is never being torn down". Read-only. */
+    if (jsrf_va_ok(root + 0x98u + 16u * 4u + 3u)) {
+        uint32_t act8 = R32(root + 0xB8u);
+        unsigned i, live = 0;
+        for (i = 0; i < 16u; ++i) if (R32(root + 0x98u + i * 4u)) ++live;
+        fprintf(stderr,
+                "  [JSRF-WAIT] GetAction(8) = %08X%s  vtable=%08X"
+                "   (%u of eACTID 0..15 live)\n",
+                act8,
+                act8 ? "  <-- alive, so WaitEndStoryOrVsMission cannot advance"
+                     : "  <-- NULL, the state should advance to method 31",
+                (act8 && jsrf_va_ok(act8 + 3u)) ? (unsigned)R32(act8) : 0u,
+                live);
+        /* CMissionManager's OWN state, which is what separates the two
+         * readings of a long wait.
+         *
+         *   CMissionManager::Exec0Default (0x0004EF90)
+         *     mov eax, [ecx + 0x44]
+         *     cmp eax, 0x15                 ; 21 states
+         *     jae ret
+         *     jmp [eax*4 + 0x001FA008]      ; jump table
+         *
+         * A state index that advances means the mission is running and simply
+         * has not been completed -- which a scripted pad cannot do, so a long
+         * hold would be expected rather than a fault. One that never moves
+         * means the mission logic itself is stuck, and then the jump-table
+         * entry for that index says where. Printing the index every report is
+         * what tells the two apart; the state name is not needed to do that. */
+        if (act8 && jsrf_va_ok(act8 + 0x48u)) {
+            static uint32_t prev_state = 0xFFFFFFFFu;
+            static unsigned same;
+            uint32_t st = R32(act8 + 0x44u);
+            if (st == prev_state) ++same; else { same = 0; prev_state = st; }
+            /* And which handler that index selects, straight out of the
+             * jump table the exec dispatches through. "State 7 does not
+             * advance" is not yet "state 7 is stuck" -- a state whose job is
+             * to wait for the player would look identical under a scripted
+             * pad -- and the handler's address is what settles which. */
+            /* The whole table, once. Chasing a run that happens to land on
+             * the state of interest wasted three runs; the table is constant
+             * so one dump names every handler. */
+            static int table_dumped;
+            if (!table_dumped && jsrf_va_ok(0x001FA008u + 20u * 4u + 3u)) {
+                unsigned k;
+                table_dumped = 1;
+                fprintf(stderr, "  [JSRF-WAIT]   CMissionManager jump table"
+                                " at 001FA008:\n  [JSRF-WAIT]    ");
+                for (k = 0; k < 21u; ++k)
+                    fprintf(stderr, " %u=%08X", k,
+                            (unsigned)R32(0x001FA008u + k * 4u));
+                fprintf(stderr, "\n");
+            }
+            uint32_t handler = jsrf_va_ok(0x001FA008u + st * 4u + 3u) && st < 21u
+                             ? R32(0x001FA008u + st * 4u) : 0u;
+            fprintf(stderr,
+                    "  [JSRF-WAIT]   CMissionManager m_dwState=%u (of 21)"
+                    " handler=%08X, unchanged for %u reports%s\n",
+                    (unsigned)st, handler, same,
+                    same >= 5u ? "   <-- not advancing" : "");
+        }
+        fprintf(stderr, "  [JSRF-WAIT]   eACTID[0..15] =");
+        for (i = 0; i < 16u; ++i)
+            fprintf(stderr, "%s%08X", (i == 8u) ? " [" : " ",
+                    (unsigned)R32(root + 0x98u + i * 4u));
+        fprintf(stderr, "   (8 bracketed)\n");
+    }
+
     /* Is the title PAUSED?
      *
      * CActMan +0x3C/+0x40 both read 1 in covered pause. In that mode most

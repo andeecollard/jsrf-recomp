@@ -307,6 +307,56 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  */
 static void *g_mcpx_regs = NULL;
 
+/* A SECOND, PERMANENTLY WRITABLE VIEW OF THE SAME PHYSICAL PAGES.
+ *
+ * The guarded aperture is read-only so guest stores fault into the trap, which
+ * supplies the register semantics -- write-1-to-set on HcInterruptEnable,
+ * write-1-to-clear on the status and port registers, and so on. To perform the
+ * store the handler then had to make the page writable, and everything else
+ * that touches a register did the same. Every one of those is a window in
+ * which a guest store on another thread lands as plain memory with no
+ * semantics at all, and the lock cannot close it because the guest is not one
+ * of the threads taking it.
+ *
+ * That is measured, not feared. It cost 13.5M swallowed APU writes once; it
+ * wiped CurrentConnectStatus while XPP acknowledged a connect, leaving the
+ * driver resetting an empty port; and it is how HcInterruptEnable ends up
+ * reading 80000000 -- the guest's routine master-enable re-arm landing whole
+ * instead of setting one bit, taking WritebackDoneHead with it.
+ *
+ * The comment on mcpx_hw_store_n concluded that windows "cannot be eliminated
+ * while the mechanism is mprotect, so the rule is to open as few as possible".
+ * This removes that constraint rather than living within it: the aperture is
+ * backed by a file mapping and mapped twice, so the runtime writes through an
+ * alias that is always writable while the guest's view is never unprotected at
+ * all. No window, so nothing to race. Protections are per-mapping; the pages
+ * are the same pages.
+ *
+ * If the double mapping cannot be made the code falls back to the old
+ * unprotect-and-store path, which is wrong in the same old way but no worse. */
+static void *g_mcpx_alias = NULL;
+static HANDLE g_mcpx_mapping = NULL;
+
+/* A guest-view pointer, translated to the writable alias. */
+static inline volatile void *mcpx_w(const volatile void *p)
+{
+    size_t off;
+    if (!g_mcpx_alias || !g_mcpx_regs) return (volatile void *)p;
+    /* ONLY inside the MCPX aperture. The same trap handler also serves NV2A
+     * faults, whose addresses are nowhere near this mapping -- translating one
+     * of those produced a wild offset into the alias and jsrf_pgraph_notify
+     * caught it immediately. Outside the window the pointer is returned
+     * unchanged, which is correct: those pages are not guarded and an ordinary
+     * store is what they want. */
+    off = (size_t)((const char *)p - (const char *)g_mcpx_regs);
+    if (off >= (size_t)XBOX_MCPX_SIZE) return (volatile void *)p;
+    return (volatile void *)((char *)g_mcpx_alias + off);
+}
+#define MCPX_W32(p) ((volatile uint32_t *)mcpx_w(p))
+/* Base for WRITES to the aperture: the alias when there is one, the guest view
+ * otherwise. Reads may use either -- same pages. */
+#define MCPX_WBASE ((char *)(g_mcpx_alias ? g_mcpx_alias : g_mcpx_regs))
+
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
@@ -1020,20 +1070,15 @@ static void ohci_periodic_tick(void)
         uint32_t ien_now =
             *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
         if (ien_now != last_ien) {
-            int untrapped = g_ohci_ien_known && ien_now != g_ohci_ien_expected;
-            if (untrapped) ++g_ohci_ien_untrapped;
-            fprintf(stderr, "  [OHCI-IEN] mask %08X -> %08X%s%s  (tds_retired=%lu,"
+            /* The value only. Comparing it against what the trap left is done
+             * on the faulting thread now -- from here it races the guest's own
+             * paired writes and reported a bypass that had not happened. */
+            fprintf(stderr, "  [OHCI-IEN] mask %08X -> %08X%s  (tds_retired=%lu,"
                             " frame=%u)\n",
                     last_ien, ien_now,
                     ((last_ien & XBOX_OHCI_INTR_WDH) && !(ien_now & XBOX_OHCI_INTR_WDH))
                         ? "   <-- WDH enable LOST" : "",
-                    untrapped ? "   <-- UNTRAPPED WRITE (trap left "
-                                "a different value)" : "",
                     g_ohci_tds_retired, g_ohci_frame);
-            if (untrapped)
-                fprintf(stderr, "  [OHCI-IEN]   trap left %08X, register reads %08X"
-                                " -- a guest store reached the page without faulting\n",
-                        g_ohci_ien_expected, ien_now);
             fflush(stderr);
             last_ien = ien_now;
         }
@@ -1154,13 +1199,13 @@ static void ohci_periodic_tick(void)
  * acknowledge that landed in between. */
 static void ohci_service_commit(const xbox_ohci_service *svc)
 {
-    *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_DONE_HEAD) =
+    *(volatile uint32_t *)(MCPX_WBASE + MCPX_OHCI_DONE_HEAD) =
         svc->done_head;
-    *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_FM_NUMBER) =
+    *(volatile uint32_t *)(MCPX_WBASE + MCPX_OHCI_FM_NUMBER) =
         svc->frame_number;
     /* Last, because it is the bit the ISR gates on: everything it will go on
      * to read must already be in place. */
-    *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS) |=
+    *(volatile uint32_t *)(MCPX_WBASE + MCPX_OHCI_INTR_STATUS) |=
         (svc->intr_status & XBOX_OHCI_INTR_WDH);
 }
 
@@ -1411,6 +1456,12 @@ static void mcpx_hw_store(uint32_t offset, uint32_t value)
     p = (volatile uint32_t *)((char *)g_mcpx_regs + offset);
     if (!g_mcpx_trap_active) { *p = value; return; }
 
+    if (g_mcpx_alias) {          /* no window: see g_mcpx_alias */
+        mcpx_lock();
+        *MCPX_W32(p) = value;
+        mcpx_unlock();
+        return;
+    }
     page = (uintptr_t)p & ~(uintptr_t)(g_mcpx_page_size - 1);
     mcpx_lock();
     if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
@@ -1449,6 +1500,15 @@ static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
         return;
     }
 
+    if (g_mcpx_alias) {
+        /* All of them at once still, but now because they belong to one event
+         * rather than to save windows -- there are no windows left to save. */
+        mcpx_lock();
+        for (i = 0; i < n; i++)
+            *(volatile uint32_t *)((char *)g_mcpx_alias + offset[i]) = value[i];
+        mcpx_unlock();
+        return;
+    }
     page = ((uintptr_t)g_mcpx_regs + offset[0]) & ~(uintptr_t)(g_mcpx_page_size - 1);
     mcpx_lock();
     if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
@@ -1490,14 +1550,24 @@ static void mcpx_hw_store_n_or_last(const uint32_t *offset, const uint32_t *valu
         return;
     }
 
+    if (g_mcpx_alias) {
+        mcpx_lock();
+        for (i = 0; i + 1 < n; i++)
+            *(volatile uint32_t *)((char *)g_mcpx_alias + offset[i]) = value[i];
+        /* Read and OR here, not in the caller: an acknowledge that lands
+         * before this line is preserved, and one that lands after it is
+         * outside anything this function controls. The guest's acknowledge no
+         * longer has a window to be lost in either way -- it faults into the
+         * trap whatever this thread is doing. */
+        *(volatile uint32_t *)((char *)g_mcpx_alias + offset[n - 1]) |= or_bits;
+        mcpx_unlock();
+        return;
+    }
     page = ((uintptr_t)g_mcpx_regs + offset[0]) & ~(uintptr_t)(g_mcpx_page_size - 1);
     mcpx_lock();
     if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
         for (i = 0; i + 1 < n; i++)
             *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
-        /* Read and OR here, not in the caller: an acknowledge that lands
-         * before this line is preserved, and one that lands after it is
-         * outside any window this function controls. */
         *(volatile uint32_t *)((char *)g_mcpx_regs + offset[n - 1]) |= or_bits;
         VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
     }
@@ -1525,6 +1595,8 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
 {
     ucontext_t *uc = (ucontext_t *)context;
     uintptr_t fault = si ? (uintptr_t)si->si_addr : 0;
+    uintptr_t wfault = 0;   /* the same address in the writable alias */
+    int aliased = 0;        /* ... and whether it actually is one */
     uintptr_t page = 0;
     uint32_t insn, rt;
     unsigned width;
@@ -1764,21 +1836,50 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     /* Perform the store the faulting instruction was going to perform, then
      * re-arm the guard. */
     mcpx_lock();
-    if (!VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
+    /* The store goes through the alias, so the guest's own view is never made
+     * writable and no other thread can slip a semantics-free store past this
+     * handler. Without an alias, fall back to the old unprotect. */
+    wfault = (uintptr_t)mcpx_w((const volatile void *)fault);
+    /* Aliased only if the fault really was inside the MCPX aperture. NV2A
+     * faults come through this same handler, are not translated, and still
+     * need their page unprotected the old way -- skipping it for them left the
+     * store faulting against a read-only page for ever. */
+    aliased = (wfault != fault);
+    /* The bypass check, on the faulting thread and inside the lock.
+     *
+     * It used to run on the frame tick, which sampled the register and the
+     * expected value from another thread -- so a tick landing between the
+     * guest's paired HcInterruptDisable(80000000) and HcInterruptEnable
+     * (80000000) saw a half-applied toggle and called it a bypass. That is a
+     * race in the detector, not in the guest: the run it fired on went
+     * 80000073 -> 00000073 -> 80000073 and never lost a bit. Here there is
+     * nothing to race: this thread is the one that last wrote the register,
+     * and it holds the lock. */
+    if ((guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE ||
+         guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) && g_ohci_ien_known) {
+        uint32_t now = *(volatile uint32_t *)(MCPX_WBASE + MCPX_OHCI_INTR_ENABLE);
+        if (now != g_ohci_ien_expected) {
+            ++g_ohci_ien_untrapped;
+            fprintf(stderr, "  [OHCI-IEN] BYPASS: trap left %08X, register held"
+                            " %08X on the next fault -- a guest store reached"
+                            " the page without faulting\n",
+                    g_ohci_ien_expected, now);
+            fflush(stderr);
+        }
+    }
+    if (!aliased
+        && !VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
         mcpx_unlock();
         goto chain;
     }
     switch (width) {
-    case 1: *(volatile uint8_t  *)fault = (uint8_t)value;  break;
-    case 2: *(volatile uint16_t *)fault = (uint16_t)value; break;
-    case 4: *(volatile uint32_t *)fault = (uint32_t)value; break;
-    default: *(volatile uint64_t *)fault = value;          break;
+    case 1: *(volatile uint8_t  *)wfault = (uint8_t)value;  break;
+    case 2: *(volatile uint16_t *)wfault = (uint16_t)value; break;
+    case 4: *(volatile uint32_t *)wfault = (uint32_t)value; break;
+    default: *(volatile uint64_t *)wfault = value;          break;
     }
-    if (ohci_raise_rhsc) {
-        volatile uint32_t *ist = (volatile uint32_t *)
-            (uintptr_t)(XBOX_MCPX_BASE + 0x50000Cu + g_memory_offset);
-        *ist |= 0x00000040u;
-    }
+    if (ohci_raise_rhsc)
+        *(volatile uint32_t *)(MCPX_WBASE + 0x50000Cu) |= 0x00000040u;
     if (ohci_serviced) {
         /* The done queue and its interrupt, now that the page is writable.
          * The guest ISR is delivered from bridge_device_irq_poll on its own
@@ -1787,9 +1888,9 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     }
     if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_DISABLE) {
         /* Enable sits four bytes below, on this same now-writable page. */
-        volatile uint32_t *en = (volatile uint32_t *)(fault - 4);
+        volatile uint32_t *en = (volatile uint32_t *)(wfault - 4);
         *en &= ~ohci_disable;
-        *(volatile uint32_t *)fault = *en;
+        *(volatile uint32_t *)wfault = *en;
         g_ohci_ien_expected = *en;
         g_ohci_ien_known = 1;
     } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE) {
@@ -1807,7 +1908,7 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
          * constant HcInterruptEnable <= 80000000 becoming the whole register
          * instead of setting one bit, wiping the 0x73 underneath. Whether it
          * is happening is a measurement, and this is it. */
-        g_ohci_ien_expected = *(volatile uint32_t *)fault;
+        g_ohci_ien_expected = *(volatile uint32_t *)wfault;
         g_ohci_ien_known = 1;
     } else if (guest_va == XBOX_NV2A_PGRAPH_INTR) {
         if (value == 0)
@@ -1823,7 +1924,8 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
     } else {
         xbox_McpxApplyReady();   /* the ack thread cannot reach a guarded page */
     }
-    if (!VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot))
+    if (!aliased
+        && !VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot))
         g_mcpx_reprotect_failures++;
     mcpx_unlock();
 
@@ -4054,13 +4156,40 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
-        g_mcpx_memory = VirtualAlloc(
-            (LPVOID)mcpx_native,
-            XBOX_MCPX_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        /* File-backed, so the same pages can be mapped a second time. The
+         * guest's view goes at the native address and is the one that gets
+         * guarded; the alias goes wherever and stays writable for ever. See
+         * g_mcpx_alias. */
+        g_mcpx_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                                            PAGE_READWRITE, 0,
+                                            XBOX_MCPX_SIZE, NULL);
+        if (g_mcpx_mapping) {
+            g_mcpx_memory = MapViewOfFileEx(g_mcpx_mapping, FILE_MAP_ALL_ACCESS,
+                                            0, 0, XBOX_MCPX_SIZE,
+                                            (LPVOID)mcpx_native);
+            if (g_mcpx_memory)
+                g_mcpx_alias = MapViewOfFileEx(g_mcpx_mapping,
+                                               FILE_MAP_ALL_ACCESS, 0, 0,
+                                               XBOX_MCPX_SIZE, NULL);
+            if (!g_mcpx_alias && g_mcpx_memory) {
+                fprintf(stderr, "  [MCPX] alias view FAILED; register writes"
+                                " fall back to unprotecting the guest page\n");
+            }
+        }
+        if (!g_mcpx_memory) {
+            fprintf(stderr, "  [MCPX] file mapping unavailable, using a plain"
+                            " allocation (no alias, unprotect windows remain)\n");
+            g_mcpx_memory = VirtualAlloc(
+                (LPVOID)mcpx_native,
+                XBOX_MCPX_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
+        }
         g_mcpx_regs = g_mcpx_memory;
+        if (g_mcpx_alias)
+            fprintf(stderr, "  [MCPX] aperture aliased at %p; the guarded view"
+                            " is never unprotected\n", g_mcpx_alias);
         if (g_mcpx_memory) {
             xbox_McpxApplyReady();
             /* Resolve the USB service's diagnostics here rather than on first
