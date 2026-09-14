@@ -89,11 +89,35 @@ and therefore gambles on hitting one window, and logo length varies by ten
 seconds or more between runs. gameplay.pad now uses new_game.pad's full measured
 prefix and starts play at t=80, clear of the last START.
 
+WHAT DECIDES WHETHER IT ARRIVES: the host audio device, not the schedule.
+Same binary, same prefix, four runs --
+
+    live audio device      1342, 1342 opens   never left the title
+    device forced off      1408, 1410 opens   reached New Game, both times
+
+-- with the second arm forced deterministically via
+SDL_AUDIODRIVER=no_such_driver. Two an arm is not proof; the separation is
+clean and the mechanism fits (the APU throttles against the real device, so
+without one the logos advance at a different rate and a fixed schedule lands
+differently). Use the forced-off form for every NON-audio unattended
+measurement; it turns one-run-in-three into reliable.
+
+The tension this creates is the real news, and it is why section 7's trap-storm
+item is still open: audio measurements need the device ON, and that is the arm
+in which the boot does not arrive. Either the schedule survives a live device
+or that experiment needs a person on the pad.
+
+DENSER INPUT IS NOT THE FIX, and this was tried: groups every 4 s to t=118
+instead of every 8 s to t=71, i.e. 27 attempts rather than 8, still 1342. That
+is the documented masher plateau -- new_game.pad's own header says a blind
+one-per-second beat walks the title to live=133 / 1342 and stops -- and this
+project's notes already said not to retune those timings. The prefix is back to
+the measured artifact.
+
 STILL NOT DONE: the schedule reaches gameplay and then does LITTLE. Best run is
-on=12 off=7 idle_trap=10 against a human's on=109 off=103 idle_trap=22371.
-Whether that is the Corn tutorial gating the player, or the synthetic pad not
-driving him, is UNSETTLED -- and note the best run also had no working audio
-device, so it is not even a clean data point. That is the next job.
+on=22 off=16 idle_trap=19, trapped=184, against a human's on=109 off=103
+idle_trap=22371. Whether that is the Corn tutorial gating the player or the
+synthetic pad not driving him is UNSETTLED. That is the next job.
 
 
 4. THE PARSER TRAP THAT WAS DOCUMENTED BACKWARDS
