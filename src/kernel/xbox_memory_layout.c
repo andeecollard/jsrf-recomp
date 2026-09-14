@@ -393,6 +393,12 @@ static unsigned xbox_OhciPorts(void)
  * belonged. */
 static void mcpx_hw_store(uint32_t offset, uint32_t value);
 /* Several of those inside ONE guard window; see the definition. */
+/* WriteBackDoneHead gate telemetry; see the gate itself for why. */
+unsigned long g_ohci_wdh_blocked;      /* frame passes refused by the gate */
+unsigned long g_ohci_wdh_cleared;      /* times the driver acknowledged */
+unsigned long g_ohci_wdh_longest_ms;   /* longest single unacknowledged stretch */
+static DWORD  g_ohci_wdh_since;
+
 static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
                             unsigned n);
 static void mcpx_hw_store_n_or_last(const uint32_t *offset, const uint32_t *value,
@@ -795,8 +801,28 @@ static void ohci_periodic_tick(void)
      * head while the driver still owes it a WritebackDoneHead acknowledge, and
      * re-raising underneath an unacknowledged interrupt is the same mistake
      * the vblank path documents next door. */
-    if (*ist & XBOX_OHCI_INTR_WDH)
+    if (*ist & XBOX_OHCI_INTR_WDH) {
+        /* Blocked waiting for the driver to acknowledge the done queue. This
+         * is the suspected mechanism for the USB driver dying: the bit is
+         * write-1-to-clear and only the trap implements that, but the page is
+         * unprotected and reprotected around every frame that retires a TD, so
+         * a guest acknowledge landing inside one of those windows SETS the bit
+         * instead of clearing it and this gate never opens again.
+         *
+         * Counted, not assumed -- CLAUDE.md's rule about not patching around a
+         * gate until a run says which value is wrong. A run where
+         * wdh_blocked_ms climbs without bound and wdh_acks stops moving is the
+         * signature; one where both keep moving exonerates it. */
+        g_ohci_wdh_blocked++;
+        if (g_ohci_wdh_since == 0) g_ohci_wdh_since = GetTickCount();
         return;
+    }
+    if (g_ohci_wdh_since) {
+        DWORD held = GetTickCount() - g_ohci_wdh_since;
+        if (held > g_ohci_wdh_longest_ms) g_ohci_wdh_longest_ms = held;
+        g_ohci_wdh_since = 0;
+        g_ohci_wdh_cleared++;
+    }
 
     /* This frame's interrupt-table entry, if the HCCA has one. A zero head is
      * not a reason to stop: the pass still flushes a deferred done queue. */

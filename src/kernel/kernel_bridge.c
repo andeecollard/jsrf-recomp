@@ -2834,6 +2834,10 @@ static uint8_t       g_vector_irql[BRIDGE_MAX_INTERRUPTS];
  * tree has been misled more than once by a counter whose trigger nobody had
  * read. */
 static volatile LONG g_irq_delivered;        /* ISR actually entered */
+/* Per vector, because the process-wide total cannot answer "is the guest's USB
+ * ISR still being entered" -- which is the question the bimodal investigation
+ * turns on. Vector 1 is USB, 5 and 6 are the audio pair JSRF connects. */
+static volatile LONG g_irq_delivered_vec[BRIDGE_MAX_INTERRUPTS];
 static volatile LONG g_irq_defer_irql;       /* blocked: effective IRQL too high */
 static volatile LONG g_irq_defer_reentry;    /* blocked: this thread already dispatching */
 static volatile LONG g_irq_defer_vector;     /* blocked: same vector already in service */
@@ -2961,7 +2965,10 @@ static uint32_t bridge_deliver_isr_ex(uint32_t iv, int *entered)
          * without running when the KINTERRUPT has no routine, or when that
          * routine is not in the dispatch table -- neither is a delivery, and
          * counting them inflated both [IRQ] delivered= and the vblank Hz. */
-        if (ran) InterlockedIncrement(&g_irq_delivered);
+        if (ran) {
+            InterlockedIncrement(&g_irq_delivered);
+            if (slot >= 0) InterlockedIncrement(&g_irq_delivered_vec[slot]);
+        }
     }
 
     /* Acknowledge exactly once: pending cleared and the vector released, in
@@ -3026,6 +3033,17 @@ void xbox_ReportIrqDelivery(void)
 {
     int k; LONG pend = 0;
     for (k = 0; k < BRIDGE_MAX_INTERRUPTS; k++) if (g_vector_pending[k]) pend++;
+    {
+        /* Per-vector deliveries, so a stalled USB ISR is visible while audio
+         * keeps running. A single total hides exactly that. */
+        char per[128]; int n = 0; int v;
+        per[0] = 0;
+        for (v = 0; v < BRIDGE_MAX_INTERRUPTS && n < (int)sizeof per - 16; v++)
+            if (g_irq_delivered_vec[v])
+                n += snprintf(per + n, sizeof per - n, " v%d=%ld",
+                              v, g_irq_delivered_vec[v]);
+        fprintf(stderr, "  [IRQ-VEC]%s\n", per[0] ? per : " (none delivered)");
+    }
     fprintf(stderr,
             "  [IRQ] delivered=%ld deferred: irql=%ld reentry=%ld vector=%ld"
             " | pending now=%ld peak=%ld | legacy-interlock-blocks=%ld%s\n",

@@ -23,6 +23,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* USB progress telemetry. Read by the periodic report; see the increment site
+ * in the retire loop for why TDs rather than ordinal 175 or ISR entries. */
+unsigned long g_ohci_tds_retired;
+unsigned long g_ohci_tds_error;
+
 /* ================================================================
  * Descriptor field accessors
  * ================================================================
@@ -599,6 +604,20 @@ unsigned xbox_OhciServiceList(xbox_ohci_service *s)
             done = td_va;
             retired++;
             tds++;
+
+            /* ACTUAL USB PROGRESS, as distinct from the ISR being entered.
+             *
+             * Ordinal 175 (MmLockUnlockBufferPages) is the guest-origin signal
+             * we have been using, but it counts buffer lock/unlock calls, not
+             * transfers -- a driver can pin buffers it never completes. And an
+             * ISR entry only says the handler ran. This counts TDs actually
+             * retired onto the done queue, which is the thing that has to keep
+             * happening for a controller to be working, and the NAK path above
+             * deliberately does not reach it. Split by condition code so
+             * "completing successfully" and "completing with errors" cannot be
+             * read as the same thing. */
+            g_ohci_tds_retired++;
+            if (cc != XBOX_OHCI_CC_NOERROR) g_ohci_tds_error++;
 
             /* The carry bit records the toggle the next transaction on this
              * endpoint should use. Control transfers force DATA0 on every

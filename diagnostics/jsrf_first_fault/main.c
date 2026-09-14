@@ -1133,6 +1133,21 @@ static void jsrf_pusher_report(void)
              * rework -- it should read 0 outside legacy mode. */
             extern void xbox_ReportIrqDelivery(void);
             xbox_ReportIrqDelivery();
+            /* The WriteBackDoneHead gate, which is the leading suspect for the
+             * guest's USB driver dying mid-run. blocked climbing while cleared
+             * stands still is the signature; both moving exonerates it. */
+            {
+                extern unsigned long g_ohci_wdh_blocked, g_ohci_wdh_cleared,
+                                     g_ohci_wdh_longest_ms;
+                extern unsigned long g_ohci_tds_retired, g_ohci_tds_error;
+                fprintf(stderr,
+                        "  [OHCI-WDH] blocked=%lu cleared=%lu longest=%lu ms"
+                        " | tds_retired=%lu tds_error=%lu\n",
+                        g_ohci_wdh_blocked, g_ohci_wdh_cleared,
+                        g_ohci_wdh_longest_ms,
+                        g_ohci_tds_retired, g_ohci_tds_error);
+                fflush(stderr);
+            }
         }
         /* Whether the pad is being asked, and whether it answers. The
          * "(opened)" line at startup answers neither. */
