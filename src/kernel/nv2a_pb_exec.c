@@ -3007,6 +3007,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         frame_stats_flip();
 #if defined(__APPLE__)
         g_mtl_frames++;   /* command buffers per frame needs a frame */
+        nv2a_metal_frame_bench_flip();
 #endif
 #ifdef nv2a_gpu_surface_report
         /* BEFORE the snapshot, because the snapshot syncs: the question is

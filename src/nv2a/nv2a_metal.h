@@ -19,6 +19,9 @@ void nv2a_metal_report(void);
  * bumped by the pushbuffer executor at the guest's own frame boundary,
  * NV097_FLIP_STALL, because this file has no notion of a frame. */
 void nv2a_metal_cb_report(void);
+/* Capture one frame's draws and replay them through both submission paths.
+ * Called at the guest's own frame boundary. See RECOMP_METAL_FRAME_BENCH. */
+void nv2a_metal_frame_bench_flip(void);
 /* Ring staging self-test. pin_mode: 0 none (positive control), 1 per command
  * buffer, 2 once per batch from a slab bitmask. Returns 0 if it could not run;
  * *corrupt_out is the number of reservations the GPU read after they had been

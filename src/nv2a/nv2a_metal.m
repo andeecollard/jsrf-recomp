@@ -81,8 +81,11 @@ static id<MTLRenderCommandEncoder> batch_encoder;
 static unsigned batch_draws, batch_pins;
 static uint64_t batch_flushes, batch_draws_total, batch_longest;
 static void batch_flush(void);
+/* -1 forces off, 1 forces on, 0 defers to the switch. The frame benchmark
+ * drives both paths inside one process, so it cannot use the environment. */
+static int batch_force;
 static int batch_on(void)
-{static int on=-1;if(on<0)on=getenv("RECOMP_METAL_BATCH")?1:0;return on;}
+{static int on=-1;if(batch_force)return batch_force>0;if(on<0)on=getenv("RECOMP_METAL_BATCH")?1:0;return on;}
 /* A cap exists so the effect of unbounded batching can be told apart from the
  * effect of batching at all, and so a pathological scene cannot defer the GPU
  * for an arbitrarily long time.  0 means no cap; the natural bound is the
@@ -101,9 +104,11 @@ static unsigned batch_cap(void)
  * comment measured at 0.20 us of producer-side cost -- small, but not nothing,
  * and it perturbs exactly what the create/encode/commit timers measure. So it
  * is a separate switch: take the CPU timing run clean, then take this one. */
+static int mtl_cb_gpu_force;
 static int mtl_cb_gpu(void)
 {
     static int on = -1;
+    if (mtl_cb_gpu_force) return mtl_cb_gpu_force > 0;
     if (on < 0) on = getenv("RECOMP_METAL_CB_GPU") ? 1 : 0;
     return on;
 }
@@ -957,6 +962,259 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
                 fflush(stderr);}}}}
  if(culled){if(audit)++audit_asm_culled;return;}out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;}
 
+/* Replay one captured frame through both submission paths and time them.
+ *
+ * WHY THIS EXISTS. The live A/B could not settle whether batching makes frames
+ * faster, and more runs were not going to fix it. Every playthrough emits the
+ * same first few reports and then follows one of a small number of paths, so
+ * runs are not draws from one distribution; and the periodic reports are spaced
+ * by wall clock, so as soon as two runs differ in speed -- the thing being
+ * measured -- report i of one covers a different slice of the scene from report
+ * i of the other. Matching on scene object counts was too loose: two reports in
+ * one bucket were 22% apart in triangles. Matching on triangles per frame
+ * answers a weaker question than it looks like, because triangle count is not
+ * rendering cost -- overdraw, texture access, blending and the number of draws
+ * all vary independently of it. And matching on a RATE would be worse again: a
+ * rate depends on how fast the frame ran, so matching it discards the effect.
+ *
+ * So: capture one real frame -- every draw, its state, its texture bytes, its
+ * vertices, and the colour and depth contents those draws start from -- and
+ * replay that identical input through per-draw and batched submission. Same
+ * commands, same resources, same starting pixels, alternating trials. The only
+ * thing left different is the submission path.
+ *
+ * What is timed: the CPU cost of issuing the frame, and the elapsed time until
+ * the GPU has finished it. The diagnostic completion handlers are forced OFF
+ * for the duration -- they run once per command buffer, and there are about
+ * thirteen times as many of those in the per-draw path, so leaving them on
+ * taxes one arm far more than the other.
+ *
+ * What this does NOT establish: that the difference reaches gameplay. It
+ * measures the rendering path on one captured frame. The live runs remain the
+ * evidence for integration behaviour and stability.
+ *
+ *   RECOMP_METAL_FRAME_BENCH=<flip>    capture the frame after this flip
+ *   RECOMP_METAL_FRAME_BENCH_TRIALS=n  timed trials per arm (default 20)
+ */
+#define BENCH_MAX_DRAWS 4096
+#define BENCH_MAX_SURF  8
+typedef struct {
+    NV2ATextureCopy state, extra[3];
+    uint8_t *tex[4]; size_t tex_size[4];
+    float (*verts)[16][4]; unsigned count, primitive;
+    int target_slot, depth_slot;
+} BenchDraw;
+typedef struct { const uint8_t *guest; size_t size; uint8_t *initial, *work; } BenchSurf;
+
+static BenchDraw *bench_draw;
+static BenchSurf bench_surf[BENCH_MAX_SURF];
+static unsigned bench_n, bench_surfs, bench_flip_at, bench_trials, bench_min_draws;
+
+/* Throw away a captured frame and try the next one. A frame boundary reached
+ * at an arbitrary flip is as likely to be a menu as gameplay -- the first
+ * attempt captured three draws -- and three draws do not exercise submission
+ * at all. */
+static void bench_discard(void)
+{
+    unsigned i, u;
+    for (i = 0; i < bench_n; ++i) {
+        for (u = 0; u < 4; ++u) free(bench_draw[i].tex[u]);
+        free(bench_draw[i].verts);
+    }
+    for (i = 0; i < bench_surfs; ++i) { free(bench_surf[i].initial); free(bench_surf[i].work); }
+    memset(bench_draw, 0, BENCH_MAX_DRAWS * sizeof *bench_draw);
+    memset(bench_surf, 0, sizeof bench_surf);
+    bench_n = 0; bench_surfs = 0;
+}
+static int bench_state;          /* 0 unset, -1 off, 1 armed, 2 capturing, 3 done */
+static unsigned long long bench_flips;
+
+static int bench_slot(const uint8_t *guest, size_t size)
+{
+    unsigned i;
+    if (!guest || !size) return -1;
+    for (i = 0; i < bench_surfs; ++i)
+        if (bench_surf[i].guest == guest && bench_surf[i].size == size) return (int)i;
+    if (bench_surfs >= BENCH_MAX_SURF) return -1;
+    bench_surf[bench_surfs].guest = guest;
+    bench_surf[bench_surfs].size = size;
+    bench_surf[bench_surfs].initial = malloc(size);
+    bench_surf[bench_surfs].work = malloc(size);
+    if (!bench_surf[bench_surfs].initial || !bench_surf[bench_surfs].work) return -1;
+    /* Contents BEFORE this frame touched it: snapshot on first sight, so every
+     * trial starts from the same pixels the real frame started from. */
+    memcpy(bench_surf[bench_surfs].initial, guest, size);
+    return (int)bench_surfs++;
+}
+
+static void bench_capture(const NV2ATextureCopy *st, const uint8_t *texture, size_t texture_size,
+                          uint8_t *target, size_t target_size, uint8_t *depth, size_t depth_size,
+                          const float (*v)[16][4], unsigned count, unsigned primitive)
+{
+    BenchDraw *d;
+    unsigned u;
+    if (bench_n >= BENCH_MAX_DRAWS) return;
+    d = &bench_draw[bench_n];
+    memset(d, 0, sizeof *d);
+    d->state = *st;
+    if (st->extra_stages) { memcpy(d->extra, st->extra_stages, sizeof d->extra);
+                            d->state.extra_stages = d->extra; }
+    for (u = 0; u < 4; ++u) {
+        const uint8_t *src = u ? st->extra_texture[u-1] : texture;
+        size_t n = u ? st->extra_size[u-1] : texture_size;
+        if (!src || !n) continue;
+        d->tex[u] = malloc(n); if (!d->tex[u]) return;
+        memcpy(d->tex[u], src, n); d->tex_size[u] = n;
+        if (u) { d->state.extra_texture[u-1] = d->tex[u]; d->state.extra_size[u-1] = n; }
+    }
+    d->verts = malloc((size_t)count * sizeof *d->verts);
+    if (!d->verts) return;
+    memcpy(d->verts, v, (size_t)count * sizeof *d->verts);
+    d->count = count; d->primitive = primitive;
+    d->target_slot = bench_slot(target, target_size);
+    d->depth_slot  = bench_slot(depth, depth_size);
+    if (d->target_slot < 0) return;
+    ++bench_n;
+}
+
+static unsigned long long bench_replay(int batched, unsigned long long *cpu_ns)
+{
+    unsigned long long t0, t1, t2;
+    unsigned i;
+    batch_force = batched ? 1 : -1;
+    for (i = 0; i < bench_surfs; ++i)
+        memcpy(bench_surf[i].work, bench_surf[i].initial, bench_surf[i].size);
+    nv2a_metal_invalidate(NULL);       /* identical starting pixels every trial */
+    t0 = mtl_now_ns();
+    for (i = 0; i < bench_n; ++i) {
+        BenchDraw *d = &bench_draw[i];
+        uint8_t *tgt = bench_surf[d->target_slot].work;
+        uint8_t *dep = d->depth_slot >= 0 ? bench_surf[d->depth_slot].work : NULL;
+        size_t ds = d->depth_slot >= 0 ? bench_surf[d->depth_slot].size : 0;
+        nv2a_metal_draw(&d->state, d->tex[0], d->tex_size[0], tgt,
+                        bench_surf[d->target_slot].size, dep, ds,
+                        (const float (*)[16][4])d->verts, d->count, d->primitive);
+    }
+    t1 = mtl_now_ns();
+    nv2a_metal_sync();                 /* through final GPU completion */
+    t2 = mtl_now_ns();
+    batch_force = 0;
+    if (cpu_ns) *cpu_ns = t1 - t0;
+    return t2 - t0;
+}
+
+static int bench_cmp(const void *a, const void *b)
+{
+    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void bench_run(void)
+{
+    unsigned long long *per, *bat, *perc, *batc;
+    unsigned t, trials = bench_trials, mismatch = 0, i;
+    uint8_t **shot_a, **shot_b;
+    int saved_gpu = mtl_cb_gpu_force;
+
+    fprintf(stderr, "  [FRAME-BENCH] captured %u draws over %u surfaces\n",
+            bench_n, bench_surfs);
+    if (!bench_n) { bench_state = 3; return; }
+
+    /* Handlers off: see the header comment. */
+    mtl_cb_gpu_force = -1;
+
+    /* Correctness before speed. */
+    shot_a = calloc(bench_surfs, sizeof *shot_a);
+    shot_b = calloc(bench_surfs, sizeof *shot_b);
+    if (shot_a && shot_b) {
+        bench_replay(0, NULL);
+        for (i = 0; i < bench_surfs; ++i) {
+            shot_a[i] = malloc(bench_surf[i].size);
+            if (shot_a[i]) memcpy(shot_a[i], bench_surf[i].work, bench_surf[i].size);
+        }
+        bench_replay(1, NULL);
+        for (i = 0; i < bench_surfs; ++i) {
+            shot_b[i] = malloc(bench_surf[i].size);
+            if (shot_b[i]) memcpy(shot_b[i], bench_surf[i].work, bench_surf[i].size);
+            if (shot_a[i] && shot_b[i] && memcmp(shot_a[i], shot_b[i], bench_surf[i].size))
+                ++mismatch;
+        }
+        fprintf(stderr, "  [FRAME-BENCH] output equality over %u surfaces: %s\n",
+                bench_surfs, mismatch ? "DIFFERENT -- do not read the timings below"
+                                      : "identical");
+    }
+
+    for (t = 0; t < 3; ++t) { bench_replay(0, NULL); bench_replay(1, NULL); }   /* warm both */
+
+    per  = malloc(trials * sizeof *per);  bat  = malloc(trials * sizeof *bat);
+    perc = malloc(trials * sizeof *perc); batc = malloc(trials * sizeof *batc);
+    if (per && bat && perc && batc) {
+        for (t = 0; t < trials; ++t) {
+            per[t] = bench_replay(0, &perc[t]);
+            bat[t] = bench_replay(1, &batc[t]);
+        }
+        qsort(per, trials, sizeof *per, bench_cmp);
+        qsort(bat, trials, sizeof *bat, bench_cmp);
+        qsort(perc, trials, sizeof *perc, bench_cmp);
+        qsort(batc, trials, sizeof *batc, bench_cmp);
+        fprintf(stderr,
+            "  [FRAME-BENCH] %u alternating trials of %u draws, handlers off.\n"
+            "  [FRAME-BENCH] Each trial restores the starting pixels and invalidates,\n"
+            "  [FRAME-BENCH] so both arms pay one full surface re-upload; that fixed\n"
+            "  [FRAME-BENCH] cost is in both columns and not in the difference.\n"
+            "  [FRAME-BENCH]   per-draw  issue %.3f ms (min %.3f, %.1f us/draw)"
+            "  to-gpu-done %.3f ms (min %.3f)\n"
+            "  [FRAME-BENCH]   batched   issue %.3f ms (min %.3f, %.1f us/draw)"
+            "  to-gpu-done %.3f ms (min %.3f)\n"
+            "  [FRAME-BENCH]   difference  issue %+.3f ms   to-gpu-done %+.3f ms\n",
+            trials, bench_n,
+            perc[trials/2]/1e6, perc[0]/1e6, perc[trials/2]/1e3/(double)bench_n,
+            per[trials/2]/1e6, per[0]/1e6,
+            batc[trials/2]/1e6, batc[0]/1e6, batc[trials/2]/1e3/(double)bench_n,
+            bat[trials/2]/1e6, bat[0]/1e6,
+            ((double)batc[trials/2]-(double)perc[trials/2])/1e6,
+            ((double)bat[trials/2]-(double)per[trials/2])/1e6);
+    }
+    mtl_cb_gpu_force = saved_gpu;
+    free(per); free(bat); free(perc); free(batc);
+    if (shot_a) { for (i = 0; i < bench_surfs; ++i) free(shot_a[i]); free(shot_a); }
+    if (shot_b) { for (i = 0; i < bench_surfs; ++i) free(shot_b[i]); free(shot_b); }
+    fflush(stderr);
+}
+
+void nv2a_metal_frame_bench_flip(void)
+{
+    if (!bench_state) {
+        const char *e = getenv("RECOMP_METAL_FRAME_BENCH");
+        if (!e) { bench_state = -1; return; }
+        bench_flip_at = (unsigned)strtoul(e, NULL, 0);
+        e = getenv("RECOMP_METAL_FRAME_BENCH_TRIALS");
+        bench_trials = e ? (unsigned)strtoul(e, NULL, 0) : 20u;
+        if (!bench_trials) bench_trials = 20u;
+        e = getenv("RECOMP_METAL_FRAME_BENCH_MIN_DRAWS");
+        bench_min_draws = e ? (unsigned)strtoul(e, NULL, 0) : 40u;
+        bench_draw = calloc(BENCH_MAX_DRAWS, sizeof *bench_draw);
+        bench_state = bench_draw ? 1 : -1;
+    }
+    if (bench_state < 1 || bench_state == 3) return;
+    ++bench_flips;
+    if (bench_state == 1) { if (bench_flips >= bench_flip_at) bench_state = 2; return; }
+    if (bench_state == 2 && bench_n < bench_min_draws) {
+        /* Not a representative frame: drop it and capture the next one. */
+        bench_discard();
+        return;
+    }
+    if (bench_state == 2) {
+        /* Close capture BEFORE replaying. The replays go through
+         * nv2a_metal_draw like everything else, so leaving the state at
+         * "capturing" made them capture themselves: three draws captured and
+         * eight surfaces reported, and an output comparison against a moving
+         * target that duly came out DIFFERENT. */
+        bench_state = 3;
+        bench_run();
+    }
+}
+
 int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
  uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
  const float(*vertices)[16][4],unsigned count,unsigned primitive)
@@ -987,6 +1245,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  case 9:for(unsigned i=0;i+3<count;i+=2){triangle(s,vertices,indices,&n,i,i+1,i+3);triangle(s,vertices,indices,&n,i,i+3,i+2);}break;default:return reject("primitive");}
  if(!n){reject_reason=NULL;return 0;}
  if(clip_audit_on())clip_audit(vertices,indices,n,s->clip_w,s->clip_h);
+ if(bench_state==2)bench_capture(s,texture,texture_size,target,target_size,depth,depth_size,vertices,count,primitive);
  @autoreleasepool{if(!initialize())return reject("initialization");
   int use_zeta=s->depth_test||s->stencil_test;uint8_t*next_depth=use_zeta?depth:NULL;uint32_t next_depth_pitch=use_zeta?s->depth_pitch:0;size_t next_depth_size=use_zeta?depth_size:0;
   /* Staging. Anything that fits Metal's 4 KB inline limit still goes through
