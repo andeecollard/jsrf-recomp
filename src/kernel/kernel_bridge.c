@@ -2654,13 +2654,22 @@ static int bridge_isr_trace(void)
     return on;
 }
 
-static uint32_t bridge_run_isr(uint32_t interrupt_va)
+/* `entered` is set only if the guest's ISR actually ran.
+ *
+ * The return value cannot carry this: a guest ISR legitimately returns FALSE
+ * to mean "not mine, I declined", and that is indistinguishable from the two
+ * early exits below where no guest code ran at all. Inferring entry from a
+ * counter delta is worse still -- g_irq_delivered is process-wide, so another
+ * thread completing a USB or audio delivery moves it while this vector was
+ * refused. Pass the fact out explicitly. */
+static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
 {
     uint32_t routine, context;
     recomp_func_t fn;
     uint32_t isr_result = 0;
     int handoff_trace = 0;
 
+    if (entered) *entered = 0;
     routine = BRIDGE_MEM32(interrupt_va + 0);
     context = BRIDGE_MEM32(interrupt_va + 4);
     if (!routine) return 0;
@@ -2699,6 +2708,7 @@ static uint32_t bridge_run_isr(uint32_t interrupt_va)
         g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = interrupt_va;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+        if (entered) *entered = 1;
         fn();
         g_in_isr = 0;
         isr_result = g_eax;
@@ -2766,6 +2776,11 @@ static uint32_t g_nv2a_base;
  * process-wide guard, several waiters can pass the pending check together and
  * run the same interrupt and DPC concurrently.  The NV2A delivers one IRQ at a
  * time, and D3D's DPC mutates shared pending state under that assumption. */
+static uint32_t bridge_run_isr(uint32_t interrupt_va)
+{
+    return bridge_run_isr_ex(interrupt_va, NULL);
+}
+
 /* ── Interrupt delivery: three concepts that used to be one ──────────────
  *
  * g_vblank_delivery_active was a single process-wide interlock doing three
@@ -2898,13 +2913,14 @@ static int bridge_irq_decide(uint32_t vector)
     return XBOX_IRQ_ELIGIBLE;
 }
 
-static uint32_t bridge_deliver_isr(uint32_t iv)
+static uint32_t bridge_deliver_isr_ex(uint32_t iv, int *entered)
 {
     uint32_t vector = BRIDGE_MEM32(iv + 8);
     uint32_t result;
     int slot = (vector < BRIDGE_MAX_INTERRUPTS) ? (int)vector : -1;
     int decision = bridge_irq_decide(vector);
 
+    if (entered) *entered = 0;
     if (decision == XBOX_IRQ_DEFER_REENTRY) {
         InterlockedIncrement(&g_irq_defer_reentry);
         return 0;
@@ -2935,9 +2951,18 @@ static uint32_t bridge_deliver_isr(uint32_t iv)
         return 0;
     }
 
-    g_dispatch_depth++;
-    result = bridge_run_isr(iv);
-    g_dispatch_depth--;
+    {
+        int ran = 0;
+        g_dispatch_depth++;
+        result = bridge_run_isr_ex(iv, &ran);
+        g_dispatch_depth--;
+        if (entered) *entered = ran;
+        /* Count only what actually entered guest code. bridge_run_isr_ex bails
+         * without running when the KINTERRUPT has no routine, or when that
+         * routine is not in the dispatch table -- neither is a delivery, and
+         * counting them inflated both [IRQ] delivered= and the vblank Hz. */
+        if (ran) InterlockedIncrement(&g_irq_delivered);
+    }
 
     /* Acknowledge exactly once: pending cleared and the vector released, in
      * that order, so a concurrent decide() cannot see "free but still pending"
@@ -2946,14 +2971,31 @@ static uint32_t bridge_deliver_isr(uint32_t iv)
         InterlockedExchange(&g_vector_pending[slot], 0);
         InterlockedExchange(&g_vector_in_service[slot], 0);
     }
-    InterlockedIncrement(&g_irq_delivered);
     return result;
+}
+
+static uint32_t bridge_deliver_isr(uint32_t iv)
+{
+    return bridge_deliver_isr_ex(iv, NULL);
 }
 
 /* ── Test seam ────────────────────────────────────────────────────────────
  * Deliberately thin, and every entry point drives the REAL state the real
  * decision reads. Nothing here duplicates the rule. */
 int xbox_IrqTestDecide(uint32_t vector) { return bridge_irq_decide(vector); }
+/* Drives the REAL delivery path, so a test can prove refuse-then-retry rather
+ * than only that the decision function answers correctly. Codex's review of
+ * the first version of this test made the point: it set pending state by hand
+ * and never showed a refused interrupt was subsequently delivered -- which is
+ * exactly the bug that was live in the vblank pump at the time. Returns 1 if
+ * the guest ISR was entered. */
+int xbox_IrqTestDeliver(uint32_t interrupt_va)
+{
+    int entered = 0;
+    bridge_deliver_isr_ex(interrupt_va, &entered);
+    return entered;
+}
+LONG xbox_IrqTestDeliveredCount(void) { return g_irq_delivered; }
 void xbox_IrqTestSetVectorIrql(uint32_t v, uint32_t irql) { bridge_note_vector_irql(v, irql); }
 void xbox_IrqTestSetInService(uint32_t v, int on)
 {
@@ -3050,6 +3092,7 @@ static void bridge_nv2a_mirror_intr(void)
  * burst is not a 60 Hz clock either. */
 unsigned long g_vblank_delivered;   /* guest ISR actually entered */
 unsigned long g_vblank_raised;      /* source asserted, ISR may have been refused */
+unsigned long g_vblank_retry_delivered; /* serviced on a later poll after a refusal */
 unsigned long g_vblank_deadlines;   /* periods that elapsed and were acted on */
 unsigned long g_vblank_skipped_ack; /* deadline reached, previous still unacked */
 unsigned long g_vblank_max_gap_ms;
@@ -3144,10 +3187,10 @@ void xbox_VblankReport(void)
      * between them is visible rather than hidden -- raised > delivered means
      * interrupts are being refused, which is a real condition worth seeing. */
     double hz = ms ? (double)g_vblank_delivered * 1000.0 / (double)ms : 0.0;
-    fprintf(stderr, "  [VBLANK] delivered=%lu (raised=%lu) over %lu ms = %.1f Hz"
+    fprintf(stderr, "  [VBLANK] delivered=%lu (raised=%lu retried=%lu) over %lu ms = %.1f Hz"
             " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms"
             " not_ready=%lu\n",
-            g_vblank_delivered, g_vblank_raised, ms, hz,
+            g_vblank_delivered, g_vblank_raised, g_vblank_retry_delivered, ms, hz,
             1000000 / BRIDGE_VBLANK_PERIOD_US,
             g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms,
             g_interrupt_not_ready);
@@ -3278,7 +3321,30 @@ static void bridge_vblank_poll(void)
              * [ctx+0xb0], which this runtime never establishes, so that gate
              * latches shut after the first delivery and nothing is delivered
              * at all. Measured both ways. */
-            if (xbox_Nv2aVblankPending()) { g_vblank_skipped_ack++; continue; }
+            /* RAISE and SERVICE are different actions and this used to
+             * `continue` past both.
+             *
+             * The raise is gated because raising underneath an unacknowledged
+             * vblank fights the acknowledge -- measured, it cut delivery from
+             * 3380 per 50 s to 8. But the SERVICE was gated by the same test,
+             * and once bridge_deliver_isr gained the ability to refuse (IRQL,
+             * reentry, vector in service) that became a trap: a refused
+             * delivery leaves the vblank pending, and every later poll took
+             * this branch and skipped the retry. The interrupt was stranded
+             * until something else happened to acknowledge it, and the
+             * per-vector pending array did not rescue it -- nothing consumed
+             * that array here.
+             *
+             * A level-triggered source that is still asserted is exactly what
+             * SHOULD be re-offered to the handler, so: skip the raise, keep
+             * the service. */
+            if (xbox_Nv2aVblankPending()) {
+                int retried = 0;
+                g_vblank_skipped_ack++;
+                bridge_deliver_isr_ex(iv, &retried);
+                if (retried) g_vblank_retry_delivered++;
+                continue;
+            }
 
             {
                 DWORD t = GetTickCount();
@@ -3304,9 +3370,9 @@ static void bridge_vblank_poll(void)
              * guest ISR returns, so differencing it across the call is the
              * honest test of whether anything actually ran. */
             {
-                LONG before = g_irq_delivered;
-                bridge_deliver_isr(iv);
-                if (g_irq_delivered != before) g_vblank_delivered++;
+                int ran = 0;
+                bridge_deliver_isr_ex(iv, &ran);
+                if (ran) g_vblank_delivered++;
             }
         }
     }

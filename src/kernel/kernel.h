@@ -71,6 +71,8 @@ void xbox_IrqTestSetPending(uint32_t vector, int on);
 void xbox_IrqTestEnterIsr(int on);
 void xbox_IrqTestEnterDpc(int on);
 void xbox_IrqTestReset(void);
+int  xbox_IrqTestDeliver(uint32_t interrupt_va);   /* real delivery path */
+LONG xbox_IrqTestDeliveredCount(void);
 
 /*
  * NTSTATUS codes - guard each against Windows SDK redefinition.

@@ -395,6 +395,8 @@ static void mcpx_hw_store(uint32_t offset, uint32_t value);
 /* Several of those inside ONE guard window; see the definition. */
 static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
                             unsigned n);
+static void mcpx_hw_store_n_or_last(const uint32_t *offset, const uint32_t *value,
+                                    unsigned n, uint32_t or_bits);
 
 static void xbox_McpxHoldRegisters(void)
 {
@@ -818,8 +820,12 @@ static void ohci_periodic_tick(void)
          * on to read must already be in place -- and inside the same window,
          * so the driver cannot see the interrupt before the queue. */
         off[2] = MCPX_OHCI_INTR_STATUS;
-        val[2] = *ist | (svc.intr_status & XBOX_OHCI_INTR_WDH);
-        mcpx_hw_store_n(off, val, 3);
+        /* val[2] is unused for the OR form; the bits go in separately so the
+         * read-modify-write happens inside the lock. Passing `*ist | bits`
+         * here is what let a guest acknowledge be resurrected. */
+        val[2] = 0;
+        mcpx_hw_store_n_or_last(off, val, 3,
+                                svc.intr_status & XBOX_OHCI_INTR_WDH);
     }
 }
 
@@ -1131,6 +1137,51 @@ static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
     if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
         for (i = 0; i < n; i++)
             *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
+    }
+    mcpx_unlock();
+}
+
+/* Same, but the LAST register is OR-ed with bits rather than assigned, and the
+ * read-modify-write happens INSIDE the lock and the writable window.
+ *
+ * Why this exists: the frame pump used to compute `*ist | bits` and pass the
+ * result to mcpx_hw_store_n, which only then took the lock. A guest ISR
+ * acknowledging a status bit between that read and the eventual store had its
+ * acknowledge resurrected by the stale copy. ohci_service_commit twelve lines
+ * below already documents exactly this hazard -- "storing the copy back whole
+ * would resurrect an acknowledge that landed in between" -- and OR-s under the
+ * lock for that reason; the frame path did not.
+ *
+ * This narrows the race to the window itself. It does NOT close the separate
+ * hazard that the window exists at all: a guest store landing inside it still
+ * completes against plain memory with none of the register semantics. That is
+ * the CLAUDE.md rule about guarded pages and it needs the write emulated in
+ * the handler, not a lock. */
+static void mcpx_hw_store_n_or_last(const uint32_t *offset, const uint32_t *value,
+                                    unsigned n, uint32_t or_bits)
+{
+    uintptr_t page;
+    DWORD old_prot;
+    unsigned i;
+
+    if (!g_mcpx_regs || n == 0) return;
+    if (!g_mcpx_trap_active) {
+        for (i = 0; i + 1 < n; i++)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        *(volatile uint32_t *)((char *)g_mcpx_regs + offset[n - 1]) |= or_bits;
+        return;
+    }
+
+    page = ((uintptr_t)g_mcpx_regs + offset[0]) & ~(uintptr_t)(g_mcpx_page_size - 1);
+    mcpx_lock();
+    if (VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READWRITE, &old_prot)) {
+        for (i = 0; i + 1 < n; i++)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        /* Read and OR here, not in the caller: an acknowledge that lands
+         * before this line is preserved, and one that lands after it is
+         * outside any window this function controls. */
+        *(volatile uint32_t *)((char *)g_mcpx_regs + offset[n - 1]) |= or_bits;
         VirtualProtect((LPVOID)page, g_mcpx_page_size, PAGE_READONLY, &old_prot);
     }
     mcpx_unlock();
