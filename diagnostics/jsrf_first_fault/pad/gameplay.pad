@@ -48,11 +48,22 @@
 # to retune new_game.pad's timings, and it is right. The prefix below is that
 # artifact, unchanged.
 #
-# The one success differed from the three failures in having a DEAD host audio
-# device, which is suggestive -- the APU throttles to real time, so audio pacing
-# could shift the boot -- but it is 1 observation against 3 and a person plays
-# this game with sound on and reaches gameplay fine. Do not repeat it as a
-# finding; it is a hypothesis worth one controlled experiment, no more.
+# THE AUDIO DEVICE IS THE VARIABLE. That started as a hunch off one run and was
+# then tested properly, same binary and same prefix throughout:
+#
+#     live audio device      1342, 1342   never left the title
+#     device forced off      1408, 1410   reached New Game, both times
+#
+# Forced off with SDL_AUDIODRIVER=no_such_driver, which makes apu_sdl2_init
+# fail deterministically. Two runs an arm is not proof, but the separation is
+# clean and the mechanism fits: the APU throttles against the real device, so
+# without one the title moves through the logos at a different rate and this
+# fixed schedule lands differently.
+#
+# For anything NOT about audio, run with the device forced off and the boot
+# becomes reliable. For audio measurements you need it on, and then this
+# schedule is back to roughly one run in three -- which is why the trap-storm
+# A/B still cannot be taken unattended. See play_scripted.sh's header.
 #
 # The repeats cost something real and it is written down rather than glossed:
 # past the title START is PAUSE, so on a run that was already through, the

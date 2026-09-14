@@ -25,6 +25,35 @@
 # RECOMP_APU_SE_WHILE_TRAPPED has been built and off since edbd87d and has
 # never been evaluated, because evaluating it needed someone to grind a rail.
 #
+# THE LIVE AUDIO DEVICE DECIDES WHETHER THE SCRIPTED BOOT WORKS.
+#
+# Measured 14 Sep 2026, same binary, same schedule, same boot prefix, four runs:
+#
+#     live audio device      1342, 1342 opens   -- never left the title
+#     device forced off      1408, 1410 opens   -- reached New Game, both times
+#
+# Clean separation, and with a mechanism that fits: the APU throttles to real
+# time against the device (slept= is essentially the whole run), so with no
+# device the title advances through the logos at a different rate and the fixed
+# pad schedule lands differently. Two runs per arm is not proof, but it is a
+# controlled result rather than a hunch, and it is reproducible on demand:
+#
+#     SDL_AUDIODRIVER=no_such_driver play_scripted.sh <name> @<pad> <secs>
+#
+# makes apu_sdl2_init fail deterministically, which is exactly the state the
+# successful runs were in.
+#
+# THE TENSION IS REAL AND THERE IS NO TRICK FOR IT. Audio measurements need the
+# device ON, and that is the arm in which the boot does not reach gameplay. So
+# the trap-storm A/B (RECOMP_APU_SE_WHILE_TRAPPED) cannot currently be taken
+# unattended: the run that reaches gameplay has no audio, and the run with
+# audio does not reach gameplay. Either the boot schedule has to become robust
+# with audio live, or that experiment needs a person on the controller.
+#
+# Use SDL_AUDIODRIVER=no_such_driver for anything NOT about audio -- scene,
+# input, frame rate, object state, guest CPU profiling -- where it turns a
+# one-in-three boot into a reliable one.
+#
 # Usage:  play_scripted.sh <outname> <schedule|@file> [seconds]
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -142,9 +171,15 @@ if grep -q '\[APU-SDL\] output open failed' "$OUT/stderr.log"; then
 elif grep -q '\[APU-SDL\] output ready' "$OUT/stderr.log"; then
     echo "  AUDIO:   device open --" \
          "$(grep -m1 '\[APU-SDL\] output ready' "$OUT/stderr.log" | sed 's/^ *\[APU-SDL\] //')"
+elif grep -q '\[APU-SDL\] SDL audio initialization failed' "$OUT/stderr.log"; then
+    # Deliberate, if SDL_AUDIODRIVER was set to something that does not exist.
+    # That is the supported way to get a reliable scripted boot -- see below.
+    echo "  AUDIO:   OFF BY REQUEST --" \
+         "$(grep -m1 '\[APU-SDL\] SDL audio initialization failed' "$OUT/stderr.log" | sed 's/^ *//')"
+    echo "           Audio counters are void; scene and input figures are fine."
 else
     echo "  AUDIO:   no [APU-SDL] line at all -- which backend did it pick?"
-    grep -m1 '\[APU\] ' "$OUT/stderr.log" | sed 's/^/           /'
+    grep -m1 -E '\[APU\] (Using|XAudio2)' "$OUT/stderr.log" | sed 's/^ *//;s/^/           /'
 fi
 
 # Gate 1: scene.

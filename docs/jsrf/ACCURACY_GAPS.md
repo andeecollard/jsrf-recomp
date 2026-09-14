@@ -99,7 +99,25 @@ measured yield over the whole gen tree is exactly two classes and no noise:
 | count | warning | what it is |
 |---|---|---|
 | 440 | `-Wuninitialized` | `PUSH32(esp, ebp)` reading an indeterminate `ebp` |
-| 11 | `-Wmacro-redefined` | `RECOMP_TRACE_ENTER`, defined by both `guest_trace.h` and `recomp_types.h` (one per TU) |
+| 11 | `-Wmacro-redefined` | `RECOMP_TRACE_ENTER`, defined by both `guest_trace.h` and `recomp_types.h` |
+| 6 | `-Wmacro-redefined` | `XBOX_FS_BASE` — and these two definitions genuinely differ |
+
+*That table was wrong twice before it was right, in the same way both times.*
+"Zero warnings from the generated title" was claimed after grepping the build
+log for `gen/recomp_*.c`, which does not match a warning reported against
+`gen/recomp_types.h`. Both macro collisions hid in exactly that blind spot.
+Count over headers too.
+
+`XBOX_FS_BASE` was the one worth finding. `xbox_memory_layout.h` makes it the
+constant `0x00001000`; `recomp_types.h` makes it the per-thread variable
+`g_fs_base`. Include order alone decides which a translation unit gets, and it
+currently gives each the one it needs — the runtime gets the constant, for
+primary-TIB setup and for `kernel_bridge.c`'s "page zero is unmapped" bound,
+while generated code gets the per-thread base it must have for `fs:[0]` and
+`fs:[4]`. Benign today, and benign by accident of an include list: let
+`kernel_bridge.c` include `recomp_types.h` and its null-pointer check silently
+becomes "below this thread's TIB". Now an explicit `#undef` with the reasoning
+written down, which preserves current behaviour rather than changing it.
 
 **The 440 are the vindication of this section, with a twist.** They are real —
 at `-O2` an indeterminate read is poison the compiler may propagate, not merely
@@ -217,6 +235,37 @@ Both are now fixed, tested by an exhaustive sweep of 6 conditions × 3 widths ×
 2 mnemonics × 196 operand pairs against a reference computing ZF/SF/OF from
 x86's definitions, with a negative control confirming the old expressions fail it.
 
+**FINISHED 2026-09-14 (later), across all five remaining setters**, with three
+defects the section did not mention:
+
+* `and`/`or`/`xor` answered `jbe` as 0 and `ja` as 1. Only CF is cleared by
+  those — ZF is not — so `jbe` is ZF and `ja` is `!ZF`. `and eax, eax; jbe` was
+  never taken where x86 takes it.
+* `neg` had no `jbe`/`ja` case and fell through to the always-false `_flags`
+  fallback. After `neg`, `CF || ZF` is always 1, so `jbe` should always be
+  taken and never was.
+* `neg`'s CF cases were **not** affected by width — "is this nonzero" survives
+  zero-extension — so they were left alone rather than changed to look tidy.
+
+`sar` was the serious one, and a different class: a wrong **value**, not a wrong
+flag. `(int32_t)LO8(eax) >> n` over a zero-extended byte is a logical shift in
+an arithmetic cast. `sar al, 1` with `al=0x80` gave 0x40 where x86 gives 0xC0 —
+a negative number quietly halved into a positive one.
+
+**Bounded honestly: it changes nothing for JSRF.** The regenerated tree has 673
+arithmetic-shift emissions and every one is 32-bit; there is no narrow `sar`
+anywhere in this image. Same for the `js`/`jns` fix on `shr`, whose destination
+can never have its MSB set for a nonzero count. These are correctness insurance
+for the translator, not a behavioural change to this title, and no run is
+claimed for them.
+
+**Still open in the shifts:** 16-bit `shld`/`shrd` shift the incoming bits in
+from the wrong end (`shld ax, bx, 4` with both 0xFFFF gives 0xFFF0 where x86
+gives 0xFFFF), and a zero masked shift count is treated as setting flags where
+x86 leaves them untouched.
+
+*Superseded — the original note, kept because it is what the next section of
+work was planned from:*
 **The same defect survives elsewhere, found but out of scope that day:** `neg`
 (`lifter.py:733-743`) has *both* halves — it sets OF=1 when the operand was the
 width's most-negative value, so `jl` after `neg al` is wrong for `al=1`;
