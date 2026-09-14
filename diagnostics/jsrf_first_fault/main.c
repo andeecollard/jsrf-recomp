@@ -1142,12 +1142,27 @@ static void jsrf_pusher_report(void)
                 extern unsigned long g_ohci_wdh_blocked, g_ohci_wdh_cleared,
                                      g_ohci_wdh_longest_ms;
                 extern unsigned long g_ohci_tds_retired, g_ohci_tds_error;
-                fprintf(stderr,
-                        "  [OHCI-WDH] blocked=%lu cleared=%lu longest=%lu ms"
-                        " | tds_retired=%lu tds_error=%lu\n",
-                        g_ohci_wdh_blocked, g_ohci_wdh_cleared,
-                        g_ohci_wdh_longest_ms,
-                        g_ohci_tds_retired, g_ohci_tds_error);
+                /* HcInterruptEnable and the published HCCA done head, every
+                 * report, because the stall snapshot found WDH set with only
+                 * the master enable bit on -- and that is only a cause if the
+                 * mask is DIFFERENT while transfers are completing normally.
+                 * If it reads 80000000 throughout the healthy part of the run
+                 * too, the driver is not relying on that interrupt and the
+                 * missing bit explains nothing. A snapshot at the moment of
+                 * failure cannot answer that; only the time series can. */
+                {
+                    extern unsigned nv2a_ohci_snapshot(unsigned *ist,
+                                                       unsigned *hcca_done);
+                    unsigned ist = 0, hd = 0, ien = nv2a_ohci_snapshot(&ist, &hd);
+                    fprintf(stderr,
+                            "  [OHCI-WDH] blocked=%lu cleared=%lu longest=%lu ms"
+                            " | tds_retired=%lu tds_error=%lu"
+                            " | ien=%08X ist=%08X hcca_done=%08X\n",
+                            g_ohci_wdh_blocked, g_ohci_wdh_cleared,
+                            g_ohci_wdh_longest_ms,
+                            g_ohci_tds_retired, g_ohci_tds_error,
+                            ien, ist, hd);
+                }
                 fflush(stderr);
             }
         }

@@ -554,6 +554,11 @@ static const struct { uint32_t offset; uint32_t ready_mask; } MCPX_READY[] = {
  *
  * Sampling cannot recover this: the two writes land microseconds apart in init,
  * so a poll only ever sees the second. It has to be observed at write time. */
+/* What the trap handler last left in HcInterruptEnable; see its store site. */
+static volatile uint32_t g_ohci_ien_expected;
+static volatile int g_ohci_ien_known;
+unsigned long g_ohci_ien_untrapped;
+
 #define MCPX_OHCI_INTR_ENABLE   0x500010u
 #define MCPX_OHCI_INTR_DISABLE  0x500014u
 #define MCPX_OHCI_PORT0         0x500054u
@@ -867,27 +872,62 @@ static void ohci_stall_snapshot(unsigned long isrs_in_window)
             "  [OHCI-STALL] HcControl=%08X  state=%s  lists: PLE=%u CLE=%u BLE=%u IE=%u\n"
             "  [OHCI-STALL] HcCommandStatus=%08X  CLF=%u BLF=%u\n"
             "  [OHCI-STALL] HcInterruptStatus=%08X enable=%08X  WDH=%u\n"
-            "  [OHCI-STALL] HcHCCA=%08X HcControlHeadED=%08X HcBulkHeadED=%08X HcDoneHead=%08X\n",
+            "  [OHCI-STALL] HcControlHeadED=%08X HcBulkHeadED=%08X HcDoneHead=%08X\n",
             *ctl,
             ((*ctl & 0xC0u) == 0x00u) ? "UsbReset" :
             ((*ctl & 0xC0u) == 0x40u) ? "UsbResume" :
             ((*ctl & 0xC0u) == 0x80u) ? "UsbOperational" : "UsbSuspend",
             (*ctl >> 2) & 1u, (*ctl >> 4) & 1u, (*ctl >> 5) & 1u, (*ctl >> 3) & 1u,
             *cmd, *cmd & 2u ? 1u : 0u, *cmd & 4u ? 1u : 0u,
-            *ist, *ien, (*ist & XBOX_OHCI_INTR_WDH) ? 1u : 0u);
+            *ist, *ien, (*ist & XBOX_OHCI_INTR_WDH) ? 1u : 0u,
+            /* These four were missing, and the line printed whatever happened
+             * to be in the argument registers -- HcHCCA read 00000000 in the
+             * first capture while the HCCA line below successfully resolved
+             * the same pointer, which is what gave it away. A snapshot whose
+             * fields are undefined is worse than no snapshot. */
+            control_head, bulk_head, done);
 
     if (hcca) {
-        uint32_t *tbl = (uint32_t *)ohci_resolve((hcca & ~0xFFu)
-                                                 + (g_ohci_frame & 31u) * 4u, 4u);
         uint32_t *dh = (uint32_t *)ohci_resolve((hcca & ~0xFFu)
                                                 + XBOX_OHCI_HCCA_DONE_HEAD, 4u);
-        entry = tbl ? *tbl : 0u;
-        fprintf(stderr,
-                "  [OHCI-STALL] HCCA periodic entry [%u] = %08X   HccaDoneHead=%08X\n",
-                g_ohci_frame & 31u, entry, dh ? *dh : 0u);
+        uint32_t distinct[8]; unsigned ndistinct = 0, slot, nonzero = 0;
+        /* ALL 32 interrupt-table slots, not just this frame's.
+         *
+         * The first capture printed the slot for the frame it happened to stop
+         * on, found it empty, and that says nothing: hardware visits one slot
+         * per frame and an interrupt endpoint polled every 8 ms lives in four
+         * of the thirty-two. "The endpoint is not scheduled" and "it is not
+         * scheduled in slot 12" are different claims and only the first one
+         * matters here. */
+        fprintf(stderr, "  [OHCI-STALL] HcHCCA=%08X HccaDoneHead=%08X"
+                        "  interrupt table (32 slots):\n  [OHCI-STALL]  ",
+                hcca, dh ? *dh : 0u);
+        for (slot = 0; slot < 32u; ++slot) {
+            uint32_t *e = (uint32_t *)ohci_resolve((hcca & ~0xFFu) + slot * 4u, 4u);
+            uint32_t v = e ? *e : 0u;
+            unsigned k;
+            fprintf(stderr, " %08X", v);
+            if ((slot & 7u) == 7u && slot != 31u)
+                fprintf(stderr, "\n  [OHCI-STALL]  ");
+            if (!v) continue;
+            ++nonzero;
+            for (k = 0; k < ndistinct; ++k) if (distinct[k] == v) break;
+            if (k == ndistinct && ndistinct < 8u) distinct[ndistinct++] = v;
+        }
+        fprintf(stderr, "\n  [OHCI-STALL] %u of 32 slots filled, %u distinct head(s)%s\n",
+                nonzero, ndistinct,
+                nonzero ? "" : "   <-- NOTHING is scheduled on the periodic list");
+        for (slot = 0; slot < ndistinct; ++slot) {
+            char tag[32];
+            snprintf(tag, sizeof tag, "periodic[%u]", slot);
+            ohci_dump_ed_chain(tag, distinct[slot]);
+        }
+        if (!ndistinct) ohci_dump_ed_chain("periodic", 0);
+    } else {
+        fprintf(stderr, "  [OHCI-STALL] HcHCCA=0  <-- no HCCA, nothing can be"
+                        " scheduled or published\n");
     }
 
-    ohci_dump_ed_chain("periodic", entry);
     ohci_dump_ed_chain("control", control_head);
 
     fprintf(stderr,
@@ -934,6 +974,23 @@ static void ohci_stall_watch(void)
     ohci_stall_snapshot(now_isrs - isrs_at_mark);
 }
 
+/* HcInterruptEnable, HcInterruptStatus and the HCCA's published done head, for
+ * the periodic report. Read-only. */
+unsigned nv2a_ohci_snapshot(unsigned *ist_out, unsigned *hcca_done_out)
+{
+    uint32_t hcca;
+    if (!g_mcpx_regs || !g_memory_base) return 0;
+    if (ist_out)
+        *ist_out = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_STATUS);
+    hcca = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_HCCA);
+    if (hcca_done_out) {
+        uint32_t *dh = hcca ? (uint32_t *)ohci_resolve((hcca & ~0xFFu)
+                                          + XBOX_OHCI_HCCA_DONE_HEAD, 4u) : NULL;
+        *hcca_done_out = dh ? *dh : 0u;
+    }
+    return *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
+}
+
 static void ohci_periodic_tick(void)
 {
     static DWORD last_ms;
@@ -954,6 +1011,33 @@ static void ohci_periodic_tick(void)
         return;
     last_ms = now;
     g_ohci_frame++;
+    {
+        /* The mask as it actually reads, whoever changed it. Paired with the
+         * guest-write line above, a change with no write before it is a change
+         * this runtime made. */
+        static uint32_t last_ien = 0xFFFFFFFFu;
+        extern unsigned long g_ohci_tds_retired;
+        uint32_t ien_now =
+            *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_INTR_ENABLE);
+        if (ien_now != last_ien) {
+            int untrapped = g_ohci_ien_known && ien_now != g_ohci_ien_expected;
+            if (untrapped) ++g_ohci_ien_untrapped;
+            fprintf(stderr, "  [OHCI-IEN] mask %08X -> %08X%s%s  (tds_retired=%lu,"
+                            " frame=%u)\n",
+                    last_ien, ien_now,
+                    ((last_ien & XBOX_OHCI_INTR_WDH) && !(ien_now & XBOX_OHCI_INTR_WDH))
+                        ? "   <-- WDH enable LOST" : "",
+                    untrapped ? "   <-- UNTRAPPED WRITE (trap left "
+                                "a different value)" : "",
+                    g_ohci_tds_retired, g_ohci_frame);
+            if (untrapped)
+                fprintf(stderr, "  [OHCI-IEN]   trap left %08X, register reads %08X"
+                                " -- a guest store reached the page without faulting\n",
+                        g_ohci_ien_expected, ien_now);
+            fflush(stderr);
+            last_ien = ien_now;
+        }
+    }
     ohci_stall_watch();
 
     ctl = (volatile uint32_t *)((char *)g_mcpx_regs + 0x500004u);
@@ -1589,6 +1673,25 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
             fflush(stderr);
         }
     }
+    /* Every guest write to the interrupt mask, unconditionally and cheaply.
+     *
+     * The stall snapshot found HcInterruptEnable reading 80000000 while a
+     * healthy run reads 80000073 all the way through -- so the WritebackDoneHead
+     * enable bit is being LOST rather than never set, and the question is what
+     * takes it away. These two registers are the only things that can:
+     * HcInterruptEnable sets bits, HcInterruptDisable clears them. A guest
+     * write shows up here; if the bit disappears with no line printed, the
+     * guest did not do it and the model did. There are only a handful of these
+     * writes in a whole run, so this is not instrumentation weight. */
+    if ((guest_va == XBOX_MCPX_BASE + 0x500010u ||
+         guest_va == XBOX_MCPX_BASE + 0x500014u) && width == 4) {
+        extern unsigned long g_ohci_tds_retired;
+        fprintf(stderr, "  [OHCI-IEN] guest writes %s <= %08X  (tds_retired=%lu)\n",
+                guest_va == XBOX_MCPX_BASE + 0x500010u ? "HcInterruptEnable "
+                                                       : "HcInterruptDisable",
+                (uint32_t)value, g_ohci_tds_retired);
+        fflush(stderr);
+    }
     if (guest_va == XBOX_MCPX_BASE + 0x500020u && width == 4 && value)
         ohci_trace_control_ed((uint32_t)value);
     if (guest_va == XBOX_MCPX_BASE + 0x500008u && width == 4
@@ -1687,6 +1790,25 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
         volatile uint32_t *en = (volatile uint32_t *)(fault - 4);
         *en &= ~ohci_disable;
         *(volatile uint32_t *)fault = *en;
+        g_ohci_ien_expected = *en;
+        g_ohci_ien_known = 1;
+    } else if (guest_va == XBOX_MCPX_BASE + MCPX_OHCI_INTR_ENABLE) {
+        /* What this handler LEFT in the register. The periodic tick compares
+         * the register against it and shouts if they have drifted.
+         *
+         * HcInterruptEnable is write-1-to-set and nothing else writes it, so
+         * the two can only differ if a guest store reached the register
+         * WITHOUT faulting -- which is possible, because reaching any register
+         * on this page means unprotecting the whole 16 KB of it across two
+         * VirtualProtect calls, and a guest store landing inside that window
+         * completes as a plain store. This runtime already knows that shape:
+         * it cost 13.5M lost APU writes once. The signature it would leave
+         * here is exactly the one the stall snapshot found -- the guest's
+         * constant HcInterruptEnable <= 80000000 becoming the whole register
+         * instead of setting one bit, wiping the 0x73 underneath. Whether it
+         * is happening is a measurement, and this is it. */
+        g_ohci_ien_expected = *(volatile uint32_t *)fault;
+        g_ohci_ien_known = 1;
     } else if (guest_va == XBOX_NV2A_PGRAPH_INTR) {
         if (value == 0)
             __atomic_fetch_and((uint32_t *)(uintptr_t)(XBOX_NV2A_PMC_INTR_0 + g_memory_offset),
