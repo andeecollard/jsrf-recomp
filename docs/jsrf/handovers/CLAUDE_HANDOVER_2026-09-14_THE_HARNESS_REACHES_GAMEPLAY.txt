@@ -223,3 +223,63 @@ If you want audio regressions caught, that is the gap to close.
   * Do not change six things and then take one measurement. I changed flags,
     two lifter fixes, two bridges and the gen tree, then ran once -- which is
     why an unrelated host failure took an hour to attribute.
+
+9. THE CONTROLLER WAS NEVER THE BUG, AND ORDINAL 153 WAS
+=========================================================
+Added late on 14 Sep, after a hand-played session and two read-only reviews.
+
+"CONTROLLER INPUT NOT WORKING" IS THE GUEST'S USB DRIVER DYING. The XPP driver
+stops submitting transfers, permanently, at a different moment every run.
+Measure it with kernel ordinal 175 (MmLockUnlockBufferPages), already in every
+log's histogram:
+
+    reached New Game    ord175 = 12963 23022 27676 30174 72421 72737 73945 74150 74603
+    stuck at the title  ord175 = 234 1100 5130 6684 10614
+
+234 transfers in a 300 s run is enumeration and nothing else. That run was
+never going to accept a button, however many were pressed.
+
+DO NOT TRUST [PAD-TRACE] OR nonneutral= AS PROOF A PRESS REACHED THE GUEST.
+With RECOMP_PAD_INJECT=1 our own host thread calls xbox_InputGetState at 50 Hz,
+so a completely deaf guest still produces a healthy-looking trace. Healthy runs
+poll at ~172/s, dead ones at EXACTLY 50/s -- the injector alone. This single
+instrument produced three confident wrong claims in one session and has been
+misleading this project since 10 Sep. "START works but A does not" was the same
+illusion: one 20-byte report, one writer, no threshold anywhere -- the STARTs
+landed before the driver died and the A presses after it.
+
+ORDINAL 153 WAS THE REGRESSION, MEASURED THREE WAYS:
+
+    yesterday's binary, no 153 bridge   3/3 New Game   ord175 74603 74150 73945
+    today WITH 153 on                   1/3 New Game   ord175 27676 10614  5130
+    today with 153 off (new default)    3/3 New Game   ord175 30174 72421 72737
+
+Turning it off restores both the success rate and the transfer rate to within
+2% of yesterday, and no 153-off run has produced an ADX stall. Three
+hand-played sessions froze during a rail grind with it on; none has been played
+with it off.
+
+THE MECHANISM IS NOT THE ONE THE BRIDGE'S COMMENT FEARED. Both guest call sites
+are inside DPC bodies, so its bounded spin and g_in_isr code never execute --
+which makes g_sync_exec_unsynchronised vacuous, and reading "unsynchronised=0"
+as "the interlock was always acquired" was wrong. What it really does is switch
+on ~41 previously-dead DSOUND functions: the only instruction in the image that
+sets a bit in the DSOUND state word [this+0x6FC] is inside the routine the
+bridge calls. They run inside bridge_run_isr -> bridge_run_dpc, holding
+g_vblank_delivery_active -- the same interlock bridge_device_irq_poll needs, and
+that pump is the ONLY thing that runs the guest's USB ISR on vector 1.
+
+So the freeze, the dying controller and the depressed transfer rate are ONE
+fault: the interrupt-delivery interlock doubles as the IRQL model, so any guest
+ISR or DPC body blocks interrupt delivery process-wide. FIXING THAT IS THE REAL
+WORK; defaulting 153 off is a retreat, and it is marked as one in the code.
+
+STILL UNEXPLAINED: verify153-1 reached New Game with ord175=30174, a 2.4x
+depression with a healthy outcome, while runs 2 and 3 sat at ~72500. n=1, not
+theorised about.
+
+ALSO CORRECTED: RECOMP_USB=1 does nothing on macOS (src/usb/ohci.c has no
+callers), so the 11 Sep elimination of both interrupt theories rested on dead
+counters and is VOID. The lifter-regression hypothesis is dead too -- the same
+binary succeeded and failed 20 minutes apart, and the and/or/xor + jbe/ja idiom
+changed today occurs ZERO times in this image.
