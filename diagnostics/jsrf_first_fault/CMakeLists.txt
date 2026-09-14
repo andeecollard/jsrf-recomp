@@ -9,6 +9,50 @@ get_filename_component(JSRF_STOCK_DIR "${XBOXRECOMP_DIR}/../jsrf_stock_test" ABS
 set(RECOMP_GEN_DIR "${XBOXRECOMP_DIR}/build-macos/jsrf-first-fault/gen"
     CACHE PATH "Instrumented generated JSRF source directory")
 
+# ── Is the generated tree current? ───────────────────────────────────────
+#
+# A translator fix reaches no binary until the title is regenerated, and
+# nothing used to say the gen tree was older than the tool that produced it.
+# That cost a full day on 13-14 Sep: translator.py gained `ebp = 0` at 18:44,
+# the tree had been written at 16:59, and every binary measured afterwards
+# carried 440 reads of an indeterminate local -- UB at -O2 -- while the fix sat
+# in git looking done.
+#
+# regenerate.sh writes GENERATION_MANIFEST.txt recording the translator hash it
+# ran with. Compare it here, and stamp it into the binary either way so every
+# log says which translator produced the code being measured. A stale tree then
+# shows up in any log someone sends you.
+set(JSRF_GEN_MANIFEST "${RECOMP_GEN_DIR}/GENERATION_MANIFEST.txt")
+set(JSRF_GEN_TRANSLATOR "unrecorded")
+if(EXISTS "${JSRF_GEN_MANIFEST}")
+    file(STRINGS "${JSRF_GEN_MANIFEST}" _man REGEX "^translator_sha=")
+    string(REPLACE "translator_sha=" "" JSRF_GEN_TRANSLATOR "${_man}")
+endif()
+
+file(GLOB _tool_py "${XBOXRECOMP_DIR}/tools/recomp/*.py" "${XBOXRECOMP_DIR}/tools/disasm/*.py")
+list(SORT _tool_py)
+set(_tool_cat "")
+foreach(_f ${_tool_py})
+    file(READ "${_f}" _c)
+    string(APPEND _tool_cat "${_c}")
+endforeach()
+string(SHA256 _tool_full "${_tool_cat}")
+string(SUBSTRING "${_tool_full}" 0 16 JSRF_TOOLS_NOW)
+
+if(JSRF_GEN_TRANSLATOR STREQUAL "unrecorded")
+    message(WARNING
+        "gen tree has no GENERATION_MANIFEST.txt -- it predates manifests, so "
+        "whether it matches tools/recomp is unknown. Regenerate to find out.")
+elseif(NOT JSRF_GEN_TRANSLATOR STREQUAL JSRF_TOOLS_NOW)
+    message(WARNING
+        "STALE GENERATED TREE. It was produced by translator ${JSRF_GEN_TRANSLATOR}; "
+        "tools/recomp is now ${JSRF_TOOLS_NOW}. Any translator fix since then is "
+        "NOT in the binary you are about to build. Run "
+        "diagnostics/jsrf_first_fault/regenerate.sh, or you are testing yesterday.")
+else()
+    message(STATUS "jsrf: gen tree matches tools/recomp (${JSRF_TOOLS_NOW})")
+endif()
+
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${RECOMP_GEN_DIR}/*.c")
 if(NOT RECOMP_GEN_SOURCES)
     message(FATAL_ERROR "No instrumented sources in ${RECOMP_GEN_DIR}")
@@ -201,7 +245,9 @@ target_compile_definitions(xbox_kernel PRIVATE RECOMP_ICALL_FEEDBACK)
 # and that has already happened here: five harness scripts defaulted to the
 # -O0 tree while every measurement was taken with JSRF_BIN pointed elsewhere.
 target_compile_definitions(jsrf_first_fault PRIVATE
-    JSRF_BUILD_OPT="${JSRF_OPT_LEVEL}")
+    JSRF_BUILD_OPT="${JSRF_OPT_LEVEL}"
+    JSRF_GEN_TRANSLATOR="${JSRF_GEN_TRANSLATOR}"
+    JSRF_TOOLS_NOW="${JSRF_TOOLS_NOW}")
 
 # -fwrapv, and warnings that are worth reading.
 #

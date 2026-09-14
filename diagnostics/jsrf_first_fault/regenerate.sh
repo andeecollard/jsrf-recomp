@@ -195,3 +195,36 @@ cp templates/runtime/recomp_types.h "$OUT/gen/recomp_types.h"
 # Skipping this leaves ~200 such stubs and the title faults during stage load.
 "$PYTHON" diagnostics/jsrf_first_fault/recover_midfunction_entries.py \
     --output "$OUT"
+
+# ── Generation manifest ───────────────────────────────────────────────────
+#
+# WHY. A translator fix does nothing until the title is regenerated, and
+# nothing in the build says the gen tree is older than the tool that produced
+# it. On 13-14 Sep that cost a full day: translator.py gained `ebp = 0` at
+# 18:44, the gen tree had been written at 16:59, and every binary measured for
+# the next day carried 440 reads of an indeterminate local -- undefined
+# behaviour at -O2 -- while the fix sat in git looking done.
+#
+# This records what actually produced this tree. CMake compares the translator
+# hash against the current tools/recomp at configure time and says so loudly if
+# they differ, and the hash is stamped into the binary so EVERY log line says
+# which translator built the code being measured. A stale tree is then visible
+# in any log anyone sends you, without needing the filesystem.
+MANIFEST="$OUT/gen/GENERATION_MANIFEST.txt"
+tools_hash=$(cat tools/recomp/*.py tools/disasm/*.py 2>/dev/null \
+             | shasum -a 256 | cut -c1-16)
+types_hash=$(shasum -a 256 templates/runtime/recomp_types.h | cut -c1-16)
+xbe_hash=$(shasum -a 256 "$XBE" 2>/dev/null | cut -c1-16)
+probes=$( [ -f "$OUT/gen/jsrf_probes_installed.c" ] && echo armed || echo none )
+{
+    echo "# Written by regenerate.sh. Do not edit."
+    echo "translator_sha=$tools_hash"
+    echo "runtime_types_sha=$types_hash"
+    echo "xbe_sha=$xbe_hash"
+    echo "probes=$probes"
+    echo "generated_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "git_head=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "git_dirty=$( [ -n "$(git status --porcelain tools templates 2>/dev/null)" ] && echo yes || echo no )"
+} > "$MANIFEST"
+echo "=== generation manifest ==="
+sed 's/^/  /' "$MANIFEST"

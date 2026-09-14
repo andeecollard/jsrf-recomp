@@ -3566,6 +3566,18 @@ int main(int argc, char **argv)
      * the -O0 tree while every measurement was taken against another binary,
      * and no log said so. A performance number from a log without this line
      * predates the stamp and should be re-taken rather than trusted. */
+    /* Which translator produced the code being measured. Without this, a log
+     * cannot be told apart from one taken against a gen tree that predates the
+     * fix under test -- which is exactly what happened for a full day on
+     * 13-14 Sep. If these two differ the binary contains generated code older
+     * than tools/recomp. */
+#if defined(JSRF_GEN_TRANSLATOR) && defined(JSRF_TOOLS_NOW)
+    fprintf(stderr, "  [GEN] translator=%s tools=%s%s\n",
+            JSRF_GEN_TRANSLATOR, JSRF_TOOLS_NOW,
+            strcmp(JSRF_GEN_TRANSLATOR, JSRF_TOOLS_NOW)
+                ? "   <<< STALE: regenerate, this binary predates tools/recomp"
+                : " (current)");
+#endif
 #ifdef JSRF_BUILD_OPT
     fprintf(stderr, "  [BUILD] title compiled " JSRF_BUILD_OPT
                     ", binary %s\n", argv[0]);
