@@ -1,112 +1,80 @@
-# JSRF on xboxrecomp — status
+# Where Jet Set Radio Future has got to
 
-Last measured 2026-09-14. Every number here came from a run; nothing is
-estimated. Where something is unknown it says so.
+Last measured 14 September 2026, against the tree at `a113ae9`, title built
+`-O2`, on an Apple M1 Max. Every number here came from a run; where something
+is believed rather than measured it says so.
 
-## Where the title has got to
-
-Jet Set Radio Future (US) **boots, renders, presents, plays music, accepts a
-controller, reaches gameplay and is playable** on macOS ARM64 (Apple M1 Max,
-Metal). It has been played past the opening tutorial to the "Collect 10 Spray
-Cans" objective with a DualShock 4 over Bluetooth.
-
-It is not yet *enjoyable*, for reasons measured below.
-
-## What works
+## Working
 
 | | evidence |
 |---|---|
-| Boot to gameplay, unattended | 0 guest faults over 150 s runs |
-| Rendering | 700k draws, 68.7M triangles in 150 s; VSH 314,598 batches with 164 rejected (0.05%); 697,789 textures prepared, 0 rejected |
-| Audio output path | SDL2 at 48 kHz native, `gen_hz` 48003, never starved, queue never empty |
-| Music | ADX streaming, correct pitch, correct content |
-| Controller | PS4 pad over Bluetooth; 44% of polls non-neutral during play |
-| File I/O, saves, EEPROM, clocks, DPCs, events | real host implementations, audited 2026-09-14 |
-| Tests | 21/23 ctest; the 2 failures are deliberate (see 05e0465) |
+| Boots to gameplay unattended | 12 of 12 scripted boots reached at least the title gate (`NtOpenFile` 1342); most reach New Game (1408) |
+| Renders | 245,331 native draw batches in a 75 s intro run, 0 software fallbacks |
+| Audio | output holds 47,602–48,006 Hz across every scene measured, 14 runs |
+| Controller input | 7 of 7 full 300 s runs retire USB transfers continuously; the guest's own driver acknowledges ~31,000 done queues per run |
+| Tutorial | completes; the title reaches the playable part |
+| Tests | 28/30 C tests, 44/44 recompiler Python tests |
 
-## What does not
+The two failing C tests fail deliberately. They are site-specific gates on two
+unresolved lifter defects and are documented as such in `CMakeLists.txt`; a
+green suite there would mean the gate had stopped working.
 
-| | measured | reference |
-|---|---|---|
-| **Frame rate** | 11.7–14.3 fps (attract), 31.3 fps (gameplay) | xemu holds **59.2–60.1** |
-| **Audio engine uptime** | ~52% during real play — the rest is lost to an APU front-end trap storm | n/a |
-| **Music ring** | ~23% of the buffer is the previous lap replayed | xemu clean |
-| First 29.3 s | digital silence | xemu plays a logo chime in its first 10 s |
-| FMV | no decode on this host at all (`video_player.c` is Media Foundation behind `#if defined(_WIN32)`) | — |
-| APU DSP (GP/EP) | stubbed, passthrough — no hardware reverb or effects | — |
-| Stability | ~13% of runs SIGSEGV in the OHCI path; controller hotplug aborts the process | — |
+## Not working
 
-**The frame rate is the headline.** JSRF is a 60 fps title and era-typical
-fixed-step simulation means half the frame rate is half the *game speed* — so it
-does not merely look choppy, it runs in slow motion.
+**Frame rate.** 26–31 fps at gameplay against a title that holds 60.1 fps in
+xemu. Roughly a third of the frame is `clear_surface`, 11–15 ms across two
+calls, most of it waiting on the GPU. Measured, not yet addressed.
 
-## Frame budget, gameplay
+**Intermittent crash.** Around one 300 s run in five ends in a guest fault with
+the stack pointer outside the primary stack. Long-standing, unattributed.
 
-```
-vsh 7.52 | submit 8.41 | GPU sync 0.98 | rest (guest CPU) 15.03  = 31.94 ms
-                                                     budget for 60 fps = 16.67
-```
+**Intro card transitions.** The fade between the opening cards renders as a cut.
+Localised on 14 Sep: the guest computes the ramp, and the vertex buffer it
+draws from already contains alpha 255 by the time the renderer sees it, so the
+value is lost in recompiled guest code rather than in the renderer. Whether the
+same path carries other tints in the game is **not established**, and if it
+does this matters well beyond the intro.
 
-The guest-CPU half is as large as all graphics work combined.
+**Metal command-buffer batching** is implemented, measured and **off by
+default**. Replaying one captured 492-draw frame through both submission paths,
+25 alternating trials: 69.2 ms to GPU completion per-draw against 46.5 ms
+batched, distributions not overlapping. It was briefly the default and a person
+playing interactively got stuck on the SEGA screen; twelve scripted boots could
+not reproduce that, and it is opt-in until it is understood. A measured
+rendering win does not outrank a title that will not start.
+`RECOMP_METAL_BATCH=1`.
 
-**Whether that 15 ms is compute or blocked waiting: the profile below is REAL
-but it was taken AT THE TITLE, not at gameplay.** It was described here as a
-gameplay profile; that was wrong. The run it was sampled from finished at 1342
-`NtOpenFile`, the attract-screen plateau, so it never reached gameplay at all —
-and "at gameplay rather than at the title, which is what was actually in doubt"
-had it exactly backwards. Retaking it properly is still open, and is now cheap:
-see the audio-device note in `play_scripted.sh` for how to get a reliable
-unattended boot.
+**Vertex reuse** is implemented and off. Its correctness gate is unresolved: one
+unexplained output mismatch in around 225M shader invocations.
 
-A 10 s `sample` of the live process **at the attract screen**, top-of-stack:
+## Recently fixed
 
-| samples | frame | |
-|---|---|---|
-| 330 | `__semwait_signal` | blocked |
-| 271 | `__psynch_cvwait` | blocked |
-| 209 | `semaphore_wait_trap` | blocked |
-| 205 | `__workq_kernreturn` | idle workers |
-| 158 | `mach_msg2_trap` | blocked |
-| 68 | `sub_0013B180` | **guest compute** |
-| 11 | `nv2a_vsh_execute` | host compute |
-| 8 | `_platform_memcmp` | host compute |
-| 5 | `draw_primitive` | host compute |
+The controller used to die partway through most sessions. The cause was a
+guest store that never faulted: the MCPX register page had to be made writable
+for the trap handler to perform a store, and a guest store landing inside that
+window completed as plain memory with none of the register semantics the trap
+exists to supply. The guest re-arms its master interrupt enable constantly, and
+that write landing untrapped replaced `HcInterruptEnable` wholesale, taking
+`WritebackDoneHead` with it — after which the driver was never told its done
+queue had been published, never claimed it, and never queued another transfer.
 
-≈93% blocked against ≈100 samples of real compute. That matches the earlier
-"93% blocked" figure — but at the same kind of scene it was already known for,
-so it **confirms nothing that was in doubt**. The gameplay profile, which is
-the one the 15 ms question needs, has still not been taken.
+The aperture is now mapped twice: the guest's view, guarded and never
+unprotected, and a private always-writable alias the runtime writes through.
+Ten of twelve runs froze before; none of seven since.
 
-The one large guest entry, `sub_0013B180`, is a spin on `0x0025EFC0` that
-increments a counter at `0x0025EFA8` while it waits. Its exit path pushes
-`0xF0000001`, writes `0x0025EFC4 = 1`, calls `sub_00147E4E` and ends in an
-`int3` — the shape of a watchdog or assertion, read statically from the
-generated C and **not** confirmed by a run.
+Full account: `docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-14_USB_STALL.md`.
+It separates what is verified from what is still a hypothesis — the bypass is
+demonstrated and its removal coincides with healthy runs, but no single run
+shows the bypass followed by the freeze.
 
-So the remaining question is not *whether* the guest is waiting but *what for*.
-Note the chain under the hot guest frame: `kernel_thunk_dispatch` →
-`bridge_KeWaitForSingleObject` → `Sleep` → `nanosleep`, i.e. the wait is a
-host sleep-poll. Poll *granularity* has already been settled as noise
-(±2.4%, paired by `live=`); this is about what the guest is waiting on.
+## Open, and individually tractable
 
-## Host support
-
-| host | state |
-|---|---|
-| macOS ARM64 + Metal | primary; everything above |
-| Windows (mingw/CrossOver) | renders and reaches gameplay; used as a differential oracle, because macOS's APU trap is write-only and cannot exercise the model's read path at all |
-
-## What to fix next
-
-See [ACCURACY_GAPS.md](ACCURACY_GAPS.md). Short version: build flags first
-(`-fwrapv -fno-strict-aliasing`, drop `-w`, then a UBSan run), then two small
-kernel bridges, then settle whether the guest's 15 ms is compute or waiting.
-
-## A caveat about this project's own measurements
-
-Every scripted pad schedule in this repository parks the player. Nothing skates,
-nothing grinds, no sound effect ever finishes, and no voice is ever retired
-(`on=5 off=0 idle_trap=0` in every scripted run ever taken here). Two of the
-defects listed above were invisible to the test harness for the life of the
-project and were found in minutes by a person holding a controller. Treat any
-audio or performance conclusion drawn from a scripted run as provisional.
+- Why `clear_surface` costs 11–15 ms a frame, and whether the GPU wait inside
+  it is avoidable. It is where the stall is *paid*; what *creates* it is the
+  draws.
+- The intermittent guest fault.
+- Where the intro fade is lost in guest code, and whether that path is shared.
+- The vertex-reuse mismatch.
+- Whether batching can be made default-safe.
+- One scene traps the APU on more than half its frames and empties the output
+  queue. Audio keeps flowing, so this is a robustness question, not a silence.
