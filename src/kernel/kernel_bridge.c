@@ -1925,6 +1925,90 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
         XBOX_TO_NATIVE(timeout_ptr));
 }
 
+/* ── Guest page protection bookkeeping ────────────────────
+ *
+ * Three exports argue about page protection -- NtProtectVirtualMemory (204),
+ * MmSetAddressProtect (182) and MmQueryAddressProtect (179) -- and nothing in
+ * this runtime remembered what any of them was ever told. 204 was not even
+ * routed: 4,089 calls in a JSRF session, all of them XAPI's VirtualProtect,
+ * each returning STATUS_SUCCESS having changed nothing and, worse, having left
+ * the caller's lpflOldProtect untouched, so the title's wrapper handed back a
+ * stack slot as "previous protection".
+ *
+ * This is the store those three now share: one 16-bit Xbox protection value
+ * per 4 KB guest page. A zero entry means "nobody has said", which reads back
+ * as PAGE_READWRITE -- the same answer the host VirtualQuery shim fabricates
+ * for every address it is ever handed (win32_compat.c:1489), so a page this
+ * runtime has not been told about gives exactly the answer it always did.
+ *
+ * IT IS BOOKKEEPING ONLY, AND DELIBERATELY SO. Nothing here calls host
+ * mprotect. The rule is in CLAUDE.md: a guarded MMIO page loses writes if
+ * anything else unprotects it. The APU aperture is trapped read-only precisely
+ * so guest stores reach the model; host pages on macOS are 16 KB; and a
+ * title-driven protection change over a guest range that shares one of those
+ * pages with a trapped aperture would open the same window that once swallowed
+ * every VOICE_ON in a 45-second run. Honouring PAGE_READONLY for real would
+ * also mean routing every resulting fault back through the MMIO handler, which
+ * is a much larger change than the lie being fixed.
+ *
+ * So the guest gets a consistent ANSWER about protection and no enforcement of
+ * it: a page it marks PAGE_READONLY stays writable, a PAGE_NOACCESS page stays
+ * readable, and a title that depends on a protection fault actually firing
+ * will not get one. Nothing observed in JSRF does; a title that did would need
+ * the enforcement question reopened with the aperture overlap measured first.
+ */
+#define BRIDGE_PROT_PAGE_SHIFT 12u
+#define BRIDGE_PROT_PAGES      ((128u * 1024u * 1024u) >> BRIDGE_PROT_PAGE_SHIFT)
+static uint16_t g_guest_page_protect[BRIDGE_PROT_PAGES];
+
+/* Page index for a guest VA, or -1 for an address this table does not cover.
+ *
+ * The contiguous mirror folds onto the RAM it aliases: a contiguous allocation
+ * is 0x80000000 | (address & 0x03FFFFFF) -- the DMA_GET round trip
+ * heap_alloc_test checks -- and it is the same physical page, so it must not
+ * carry a second, independent protection. Everything else is deliberately
+ * uncovered, the NV2A and APU apertures above 0xFD000000 above all: this table
+ * describes guest RAM, and a device window's protection is the host's
+ * business, not the title's.
+ */
+static long bridge_prot_page_index(uint32_t va)
+{
+    uint32_t page;
+
+    if (va >= XBOX_CONTIG_BASE && va < XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        va &= 0x03FFFFFFu;
+    page = va >> BRIDGE_PROT_PAGE_SHIFT;
+    return (page < BRIDGE_PROT_PAGES) ? (long)page : -1;
+}
+
+static uint32_t bridge_prot_get(uint32_t va)
+{
+    long page = bridge_prot_page_index(va);
+    uint32_t p = (page >= 0) ? (uint32_t)g_guest_page_protect[page] : 0u;
+
+    return p ? p : (uint32_t)PAGE_READWRITE;
+}
+
+static void bridge_prot_set(uint32_t va, uint32_t bytes, uint32_t protect)
+{
+    uint64_t first, last, p;
+
+    if (!bytes || !protect)
+        return;
+    first = (uint64_t)va & ~(uint64_t)0xFFFu;
+    last  = ((uint64_t)va + bytes + 0xFFFu) & ~(uint64_t)0xFFFu;
+    /* A range wider than the table cannot describe anything the table covers
+     * beyond its first 128 MB, and walking it page by page would be a long
+     * loop for nothing. */
+    if (last - first > (uint64_t)BRIDGE_PROT_PAGES * 4096u)
+        last = first + (uint64_t)BRIDGE_PROT_PAGES * 4096u;
+    for (p = first; p < last; p += 4096u) {
+        long page = bridge_prot_page_index((uint32_t)p);
+        if (page >= 0)
+            g_guest_page_protect[page] = (uint16_t)protect;
+    }
+}
+
 /*
  * Takes an Xbox VA, so the native pointer has to be formed before the query --
  * an unbridged 0 return reads as PAGE_NOACCESS. Halo walks all 22 MB of its
@@ -1934,9 +2018,26 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
 static void bridge_MmQueryAddressProtect(void)
 {
     uint32_t address = STACK_ARG(0);
+    long page;
 
-    g_eax = address ? (uint32_t)xbox_MmQueryAddressProtect(XBOX_TO_NATIVE(address))
-                    : 0;
+    if (!address) {
+        g_eax = 0;
+        return;
+    }
+
+    /* Answer from the store whenever the title has told this runtime something
+     * about the page, so a protection it set through 204 or 182 reads back as
+     * itself instead of as whatever the host thinks. Falling through to the
+     * host query otherwise keeps the existing behaviour exactly: on macOS that
+     * shim answers PAGE_READWRITE for every address, which is also the store's
+     * default, so no answer that used to be given changes. */
+    page = bridge_prot_page_index(address);
+    if (page >= 0 && g_guest_page_protect[page]) {
+        g_eax = (uint32_t)g_guest_page_protect[page];
+        return;
+    }
+
+    g_eax = (uint32_t)xbox_MmQueryAddressProtect(XBOX_TO_NATIVE(address));
 }
 
 /* ── NtUserIoApcDispatcher (ordinal 232) ─────────────────── */
@@ -2052,8 +2153,104 @@ static void bridge_MmSetAddressProtect(void)
     uint32_t size = STACK_ARG(1);
     uint32_t prot = STACK_ARG(2);
 
+    /* Record it as well as forwarding it, so MmQueryAddressProtect and
+     * NtProtectVirtualMemory answer with what this call set rather than with
+     * the host shim's fixed PAGE_READWRITE. The forwarding is left alone: this
+     * one has always reached the host's VirtualProtect and changing that is a
+     * separate question from the ledger. */
+    bridge_prot_set(addr, size, prot);
     xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
     g_eax = 0;
+}
+
+/* ── NtProtectVirtualMemory (ordinal 204) ───────────────────
+ *
+ * NTSTATUS NtProtectVirtualMemory(PVOID *BaseAddress, PSIZE_T RegionSize,
+ *                                 ULONG NewProtect, PULONG OldProtect)
+ *
+ * The hottest unbridged export in a JSRF session by a factor of forty -- 4,089
+ * calls, one guest call site, XAPI's VirtualProtect. Unbridged it told two
+ * lies. The first is the one the bookkeeping note above explains and does not
+ * fix: no protection changes. The second is the one that can corrupt a caller,
+ * and it is fixed here. OldProtect is an OUT parameter and nothing wrote it,
+ * so VirtualProtect returned an uninitialised stack slot as "previous
+ * protection" -- and the whole idiom this API exists for is to save that value
+ * and restore it afterwards, which means restoring garbage.
+ *
+ * Both IN/OUT parameters are written back the way NT writes them: BaseAddress
+ * rounded down to its page, RegionSize rounded up to cover the request from
+ * there. OldProtect is the protection of the FIRST page of the region, which
+ * is what NT reports for a range that spans several with different values.
+ *
+ * How far this goes: it is a ledger, not an mprotect. The host mapping is not
+ * touched -- see the bookkeeping note above for the APU-aperture reason -- so
+ * the value the guest sets is the value it reads back from here and from
+ * MmQueryAddressProtect, and nothing else about the page changes.
+ */
+static void bridge_NtProtectVirtualMemory(void)
+{
+    uint32_t base_ptr = bridge_checked_out_va(STACK_ARG(0), 4,
+                                              "NtProtectVirtualMemory",
+                                              "BaseAddress");
+    uint32_t size_ptr = bridge_checked_out_va(STACK_ARG(1), 4,
+                                              "NtProtectVirtualMemory",
+                                              "RegionSize");
+    uint32_t new_prot = STACK_ARG(2);
+    uint32_t old_ptr  = bridge_checked_out_va(STACK_ARG(3), 4,
+                                              "NtProtectVirtualMemory",
+                                              "OldProtect");
+    uint32_t base, size, aligned_base, aligned_size, old_prot;
+    uint64_t end;
+
+    /* Both of these are IN as well as OUT: the call cannot be described
+     * without them. NULL or unmapped is a caller error, not something to
+     * paper over with success. */
+    if (!base_ptr || !size_ptr) {
+        g_eax = 0xC000000Du;                 /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    base = BRIDGE_MEM32(base_ptr);
+    size = BRIDGE_MEM32(size_ptr);
+    if (!size || (uint64_t)base + size > 0x100000000ull) {
+        g_eax = 0xC000000Du;                 /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    /* Exactly one of the eight access values, optionally with the GUARD,
+     * NOCACHE and WRITECOMBINE modifiers. NT rejects anything else and so does
+     * this: a caller passing a bad protection wants to be told, and this is
+     * the export whose whole job is to have an opinion about the value. */
+    {
+        uint32_t access    = new_prot & 0xFFu;
+        uint32_t modifiers = new_prot & ~0xFFu;
+
+        if (!access || (access & (access - 1u)) || (modifiers & ~0x700u)) {
+            g_eax = 0xC0000045u;             /* STATUS_INVALID_PAGE_PROTECTION */
+            return;
+        }
+    }
+
+    aligned_base = base & ~0xFFFu;
+    end          = ((uint64_t)base + size + 0xFFFu) & ~(uint64_t)0xFFFu;
+    aligned_size = (uint32_t)(end - aligned_base);
+
+    old_prot = bridge_prot_get(aligned_base);
+    bridge_prot_set(aligned_base, aligned_size, new_prot);
+
+    BRIDGE_MEM32(base_ptr) = aligned_base;
+    BRIDGE_MEM32(size_ptr) = aligned_size;
+    if (old_ptr)
+        BRIDGE_MEM32(old_ptr) = old_prot;
+
+    if (KERNEL_LOG_ON()) {
+        fprintf(stderr, "  [KERNEL] NtProtectVirtualMemory: 0x%08X+%u -> 0x%X"
+                        " (was 0x%X); ledger only, host mapping untouched\n",
+                aligned_base, aligned_size, new_prot, old_prot);
+        fflush(stderr);
+    }
+
+    g_eax = 0;                               /* STATUS_SUCCESS */
 }
 
 /* ── AvSetDisplayMode (ordinal 3) ────────────────────────── */
@@ -3357,6 +3554,176 @@ static void bridge_KeInsertQueueDpc(void)
     }
     bridge_run_dpc(dpc_va, STACK_ARG(1), STACK_ARG(2));
     g_eax = 1;
+}
+
+/* ── KeSynchronizeExecution (ordinal 153) ───────────────
+ *
+ * BOOLEAN KeSynchronizeExecution(PKINTERRUPT Interrupt,
+ *                                PKSYNCHRONIZE_ROUTINE SynchronizeRoutine,
+ *                                PVOID SynchronizeContext)
+ *
+ * DELIBERATELY NOT ROUTED TO xbox_KeSynchronizeExecution. That function
+ * (kernel_sync.c:553) casts its PVOID straight to a host function pointer and
+ * calls it. SynchronizeRoutine is a GUEST VA -- a 32-bit number naming a
+ * recompiled function -- so handing it over would jump to whatever host code
+ * happens to live at address 0x0013xxxx. It is the memory-model trap the
+ * NOT ROUTED note by bridge_for_ordinal describes, in its function-pointer
+ * form, and it is why the CALL has to happen here, through the dispatch table,
+ * like every other guest callback in this file. The native version stays for a
+ * native caller.
+ *
+ * Unbridged, this set g_eax = 0 and ran nothing. For an NTSTATUS export that
+ * zero reads as STATUS_SUCCESS; this one returns BOOLEAN, so what the guest
+ * actually got was a fabricated FALSE -- the routine's answer, invented,
+ * without the routine. JSRF calls it 102-229 times a session from DSOUND, on
+ * the two interrupt objects it connects for audio, and one of those call sites
+ * loops retesting a flag. A synthesised FALSE there is not a harmless lie; it
+ * is a loop whose exit condition nobody is computing.
+ *
+ * Stack shape: BOOLEAN (__stdcall *)(PVOID Context). Push the context, then
+ * the dummy return address; the callee's `ret 4` consumes both, so g_esp needs
+ * no fixup afterwards -- the same discipline as bridge_NtUserIoApcDispatcher
+ * and bridge_run_dpc. The BOOLEAN comes back in al, and eax is passed through
+ * to the caller unchanged, which is what the real export does: it is a call
+ * and a return, and it does not normalise the byte.
+ *
+ * IRQL AND THE INTERRUPT LOCK -- the part that had a choice in it.
+ *
+ * Hardware raises to the interrupt's SynchronizeIrql and takes its spinlock so
+ * the routine cannot race the ISR. The nearest equivalent this runtime has is
+ * g_vblank_delivery_active, the process-wide interlock all three interrupt
+ * pumps already hold while they deliver, so holding it across the routine IS
+ * the exclusion the real call provides, against the only thing that can run a
+ * guest ISR here.
+ *
+ * It is taken as a BOUNDED spin and never as a blocking wait, and the reason
+ * is the rule in CLAUDE.md that a lock held across guest code has frozen this
+ * title before -- the APU lock inversion, where healthy audio and a dead guest
+ * turned out to be one thread holding a lock another needed. The interlock is
+ * held by bridge_run_isr for as long as a guest ISR body takes, which is
+ * bounded but not instant, so a short spin with a yield fits; if it does not
+ * come free in that time the routine runs anyway and the miss is counted and
+ * reported. Running unsynchronised is a far smaller lie than not running at
+ * all, which is the behaviour being replaced, and the counter makes the
+ * frequency measurable instead of assumed. As of writing NOTHING HAS RUN THIS:
+ * the shape is argued from the code, not from a session.
+ *
+ * While the routine runs, g_in_isr marks this thread. That flag means, at all
+ * four of its readers, "this thread is executing guest code at a raised level:
+ * deliver no interrupts or timers into it, and defer any DPC it queues" --
+ * which is exactly the state a synchronised routine is in. Without it a nested
+ * kernel call from the routine would let bridge_timers_poll run a timer DPC
+ * inside the synchronised region, which is the one thing the region exists to
+ * prevent. Any DPC the routine queues is run afterwards, outside the region,
+ * the same way bridge_run_isr does it.
+ *
+ * Already inside an ISR or a DPC on this thread: call straight through. We
+ * hold the exclusion already, spinning for an interlock this thread may itself
+ * be holding would deadlock, and g_pending_dpc belongs to the outer frame.
+ */
+#define BRIDGE_SYNC_SPIN_TRIES 256
+
+static unsigned long g_sync_exec_unsynchronised;
+
+static void bridge_KeSynchronizeExecution(void)
+{
+    uint32_t interrupt_va = STACK_ARG(0);
+    uint32_t routine_va   = STACK_ARG(1);
+    uint32_t context_va   = STACK_ARG(2);
+    recomp_func_t fn;
+    int nested = (g_in_isr || g_in_dpc);
+    int locked = 0;
+
+    if (!routine_va) {
+        /* The real kernel would call through a null pointer and bugcheck.
+         * xbox_KeSynchronizeExecution answers FALSE; match it rather than
+         * inventing a fault. */
+        g_eax = 0;
+        return;
+    }
+
+    fn = recomp_lookup(routine_va);
+    if (!fn) fn = recomp_lookup_manual(routine_va);
+    if (!fn) {
+        static uint32_t warned_routine = 0;
+        if (warned_routine != routine_va) {
+            warned_routine = routine_va;
+            fprintf(stderr, "  [KERNEL] KeSynchronizeExecution: routine "
+                    "0x%08X not in dispatch (kinterrupt=0x%08X); returning "
+                    "FALSE without running it\n", routine_va, interrupt_va);
+            fflush(stderr);
+        }
+        g_eax = 0;
+        return;
+    }
+
+    if (!nested) {
+        int tries;
+        for (tries = 0; tries < BRIDGE_SYNC_SPIN_TRIES; tries++) {
+            if (InterlockedCompareExchange(&g_vblank_delivery_active, 1, 0) == 0) {
+                locked = 1;
+                break;
+            }
+#if defined(_WIN32)
+            Sleep(0);
+#else
+            sched_yield();
+#endif
+        }
+        if (!locked && ++g_sync_exec_unsynchronised <= 8) {
+            fprintf(stderr, "  [KERNEL] KeSynchronizeExecution: interrupt "
+                    "delivery interlock still held after %d yields; running "
+                    "routine 0x%08X UNSYNCHRONISED (%lu so far)\n",
+                    BRIDGE_SYNC_SPIN_TRIES, routine_va,
+                    g_sync_exec_unsynchronised);
+            fflush(stderr);
+        }
+    }
+
+    {
+        BridgeGuestRegs saved;
+        uint32_t result;
+        uint32_t outer_pending = 0, outer_sys1 = 0, outer_sys2 = 0;
+
+        bridge_save_regs(&saved);
+        if (!nested) {
+            outer_pending = g_pending_dpc;
+            outer_sys1 = g_pending_dpc_sys1;
+            outer_sys2 = g_pending_dpc_sys2;
+            g_pending_dpc = 0;
+            g_in_isr = 1;
+        }
+
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = context_va;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+        fn();
+        result = g_eax;
+
+        if (!nested)
+            g_in_isr = 0;
+        /* Callee-saved registers only in spirit: restoring all six is stricter
+         * than x86 requires, since ecx and edx are the caller's to lose, but a
+         * caller cannot tell the difference and this tree has a measured
+         * history of recompiled functions not giving ebx/esi/edi back
+         * (129 of them). eax is the return value and is put back after. */
+        bridge_restore_regs(&saved);
+        g_eax = result;
+
+        if (!nested) {
+            uint32_t queued = g_pending_dpc;
+            uint32_t s1 = g_pending_dpc_sys1, s2 = g_pending_dpc_sys2;
+
+            g_pending_dpc = outer_pending;
+            g_pending_dpc_sys1 = outer_sys1;
+            g_pending_dpc_sys2 = outer_sys2;
+            if (locked)
+                InterlockedExchange(&g_vblank_delivery_active, 0);
+            /* Outside the synchronised region and outside the interlock, which
+             * is where a deferred call belongs. */
+            if (queued)
+                bridge_run_dpc(queued, s1, s2);
+        }
+    }
 }
 
 /* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
@@ -5718,6 +6085,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 199: return bridge_NtFreeVirtualMemory;
     case 215: return bridge_NtQuerySymbolicLinkObject;
     case 217: return bridge_NtQueryVirtualMemory;
+    /* Routed, and checked against the memory-model bar in the NOT ROUTED note
+     * below: this one allocates nothing, frees nothing and hands back no host
+     * pointer. It writes three guest dwords at addresses the caller supplied
+     * and keeps a ledger of what the title asked for; see its own comment for
+     * exactly how far the emulation goes, and why it stops short of calling
+     * host mprotect. */
+    case 204: return bridge_NtProtectVirtualMemory;
 
     /* Pool */
     case  14: return bridge_ExAllocatePool;
@@ -5775,6 +6149,11 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 159: return bridge_KeWaitForSingleObject;
     case  99: return bridge_KeDelayExecutionThread;
     case 179: return bridge_MmQueryAddressProtect;
+    /* Routed at last. Not to xbox_KeSynchronizeExecution -- that takes a host
+     * function pointer and this argument is a guest VA -- but to a bridge that
+     * calls the routine through the dispatch table. See its comment for the
+     * IRQL and locking decision, which was the part with a choice in it. */
+    case 153: return bridge_KeSynchronizeExecution;
     case 232: return bridge_NtUserIoApcDispatcher;
     case  95: return bridge_KeBugCheck;
     case  96: return bridge_KeBugCheckEx;
