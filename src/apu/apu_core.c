@@ -716,10 +716,15 @@ void mcpx_apu_frame_report(void)
                 fprintf(stderr, " v%u=%lu", bi, best);
             }
             fprintf(stderr, "\n  [APU-IDLE]   last handles:");
-            for (i = 0; i < 16u; ++i) {
+            {   /* Slot 0 is the oldest until the ring wraps; see the identical
+                 * note in the crash reporter, where reading the wrapped form
+                 * too early printed untouched zeros as voice 0. */
                 unsigned long k = g_idle_trap_ring;
-                if (k < 16u && i >= k) break;
-                fprintf(stderr, " %u", (unsigned)g_idle_trap_last[(k + i) & 15u]);
+                unsigned n2 = k < 16u ? (unsigned)k : 16u;
+                unsigned base = k < 16u ? 0u : (unsigned)(k & 15u);
+                for (i = 0; i < n2; ++i)
+                    fprintf(stderr, " %u",
+                            (unsigned)g_idle_trap_last[(base + i) & 15u]);
             }
             fprintf(stderr, "   (oldest first)\n");
         }

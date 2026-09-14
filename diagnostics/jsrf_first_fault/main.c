@@ -3633,11 +3633,21 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
         if (g_idle_trap_raises) {
             unsigned i, n = g_idle_trap_ring < 16u
                           ? (unsigned)g_idle_trap_ring : 16u;
+            /* The oldest entry is slot 0 until the ring has WRAPPED; only
+             * afterwards is it at (ring & 15). Reading the wrapped form
+             * unconditionally printed slots the ring had not reached yet,
+             * which are zero -- and zero is a valid voice handle, so eight
+             * untouched slots read as "eight traps for voice 0" and were very
+             * nearly reported as confirming the crash hypothesis. The
+             * per-handle counters in the same run said v69 and v68, which is
+             * what gave it away. */
+            unsigned base = g_idle_trap_ring < 16u ? 0u
+                          : (unsigned)(g_idle_trap_ring & 15u);
             fprintf(stderr, "\nLAST IDLE-VOICE TRAPS RAISED (%lu total),"
                             " oldest first:\n  ", g_idle_trap_raises);
             for (i = 0; i < n; ++i)
                 fprintf(stderr, " v%u",
-                        (unsigned)g_idle_trap_last[(g_idle_trap_ring + i) & 15u]);
+                        (unsigned)g_idle_trap_last[(base + i) & 15u]);
             fprintf(stderr, "\n  The guest ISR dereferences its own object for"
                             " the handle it is handed; a NULL there is this"
                             " list's last entry.\n");
