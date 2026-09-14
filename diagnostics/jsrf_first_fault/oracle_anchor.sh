@@ -51,6 +51,10 @@ if [ -n "$ORACLE_CONTIG_VERIFY" ]; then
   export RECOMP_CONTIG_VERIFY
 fi
 if [ "$HOST" = mac ]; then
+  # ORACLE_USB is inert: RECOMP_USB is read only by src/usb/ohci.c, which
+  # nothing calls on either host. Kept as a knob rather than removed, because
+  # the anchor's job is to hold both sides identical -- but do not read a
+  # difference into setting it. See docs/jsrf/EXPERIMENT_CONTROLS.md.
   RECOMP_USB=${ORACLE_USB:-} \
   RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
   RECOMP_OHCI_ATTACH=$([ -n "$ORACLE_NO_OHCI_ATTACH" ] && printf 0 || printf 1) \

@@ -49,3 +49,22 @@ scene gate (`NtOpenFile` count) rather than assuming a timestamp means a scene.
   completions for actual USB progress.
 * Compare like scenes. A number from the attract screen and one from gameplay
   are not the same measurement.
+
+## RECOMP_USB reaches nothing (14 Sep 2026)
+
+Seven scripts here set `RECOMP_USB=1`. The only `getenv("RECOMP_USB")` in the
+tree is at `src/usb/ohci.c:805`, and that file is not wired to anything: none
+of `xbox_OhciInit`, `xbox_OhciOwnsAddress`, `xbox_OhciHandleMmio` or
+`xbox_OhciReport` has a single reference outside itself. The library is still
+linked, so it compiles and does nothing.
+
+The live USB model is `src/kernel/xbox_usb_ohci.c`, reached through the MCPX
+write trap, and it needs no switch.
+
+This matters beyond tidiness: a run that set `RECOMP_USB=1` and saw no USB
+activity from `ohci.c`'s counters was reading an unwired file, and a handover
+records that exact reasoning voiding an elimination of two interrupt theories
+on 11 Sep. **Any conclusion resting on that file's counters is void.**
+
+The switch is removed from the scripts. `src/usb/ohci.c` is left in place
+because it is upstream's, and deleting it would diverge the tree for no gain.

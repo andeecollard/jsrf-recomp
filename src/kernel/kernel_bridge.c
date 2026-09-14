@@ -1610,8 +1610,17 @@ void xbox_SetWaitPollHook(void (*fn)(void))
 
 /* Defined with the scheduling bridges below; used here too. */
 static int sched_trace_on(void);
-static int g_sched_wait_slot = -1;
-static unsigned long *g_sched_wait_woke, *g_sched_wait_timeout;
+/* These were file-scope, and shared by every guest thread in this function.
+ *
+ * Two threads waiting on different objects overwrote each other's pointers, so
+ * one thread's wake was counted against whichever object the other had looked
+ * up last -- and past the 16-object table the `if (i < 16)` guard left the
+ * PREVIOUS thread's pointers in place entirely, so its counters collected
+ * somebody else's increments. A counter that attributes one thread's events to
+ * another object is worse than no counter, and this file's own rule is to read
+ * a counter's trigger before trusting its value. They are locals now, so each
+ * wait attributes to the object it actually waited on. RECOMP_SCHED_TRACE
+ * only, but the traces were being read. */
 static void sched_note(const char *what, uint32_t handle, uint32_t extra);
 static int bridge_deliver_pending_apcs(void);
 
@@ -1622,6 +1631,8 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     DWORD ms, deadline;
     int infinite;
+    /* Per-thread, deliberately: see the note where these used to be globals. */
+    unsigned long *sched_woke = NULL, *sched_timeout = NULL;
 
     if (alertable && bridge_deliver_pending_apcs()) {
         g_eax = 0x000000C0u;   /* STATUS_USER_APC */
@@ -1656,9 +1667,8 @@ static void bridge_KeWaitForSingleObject(void)
                         w[i].ready, w[i].woke, w[i].timeout);
                 fflush(stderr);
             }
-            g_sched_wait_slot = (int)i;
-            g_sched_wait_woke = &w[i].woke;
-            g_sched_wait_timeout = &w[i].timeout;
+            sched_woke = &w[i].woke;
+            sched_timeout = &w[i].timeout;
         }
     }
 
@@ -1668,12 +1678,12 @@ static void bridge_KeWaitForSingleObject(void)
             if (DISPATCHER_TYPE(object) == DISPATCHER_SYNCHRONIZATION) {
                 DISPATCHER_SIGNALSTATE(object) = 0;
             }
-            if (g_sched_wait_woke) ++*g_sched_wait_woke;
+            if (sched_woke) ++*sched_woke;
             g_eax = 0;   /* STATUS_SUCCESS */
             return;
         }
         if (!infinite && (int32_t)(GetTickCount() - deadline) >= 0) {
-            if (g_sched_wait_timeout) ++*g_sched_wait_timeout;
+            if (sched_timeout) ++*sched_timeout;
             g_eax = 0x00000102u;   /* STATUS_TIMEOUT */
             return;
         }
@@ -3590,7 +3600,14 @@ static DWORD WINAPI bridge_irq_thread(LPVOID unused)
 
     fprintf(stderr, "  [IRQ-THREAD] live; device interrupts no longer depend"
                     " on the guest blocking\n");
-    if (getenv("RECOMP_IRQ_THREAD_GPU")) {
+    /* Resolved once. Every other switch in this file caches with a
+     * `static int on = -1`; these two were calling getenv twice per
+     * millisecond for the life of the process, which walks the environment
+     * each time -- on the thread whose whole job is to be punctual. */
+    static int irq_thread_gpu = -1;
+    if (irq_thread_gpu < 0)
+        irq_thread_gpu = getenv("RECOMP_IRQ_THREAD_GPU") ? 1 : 0;
+    if (irq_thread_gpu) {
         fprintf(stderr, "  [IRQ-THREAD] synthetic GPU delivery enabled"
                         " (diagnostic; may break the ISR/DPC handoff)\n");
     } else {
@@ -3602,7 +3619,7 @@ static DWORD WINAPI bridge_irq_thread(LPVOID unused)
     for (;;) {
         Sleep(1);
         bridge_timers_poll();
-        if (getenv("RECOMP_IRQ_THREAD_GPU"))
+        if (irq_thread_gpu)
             bridge_vblank_poll();
         bridge_device_irq_poll();
     }

@@ -25,7 +25,7 @@ jsrf_require_current_binary; jsrf_require_idle; jsrf_require_game
 rm -rf "$OUT" "$SCRATCH"; mkdir -p "$OUT" "$SCRATCH"
 jsrf_stage_hdd >/dev/null
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
-RECOMP_OHCI_ATTACH=1 RECOMP_USB=1 RECOMP_PAD_INJECT=1 \
+RECOMP_OHCI_ATTACH=1 RECOMP_PAD_INJECT=1 \
 RECOMP_PAD_SCRIPT="@diagnostics/jsrf_first_fault/pad/new_game.pad" \
 RECOMP_REPORT_MS=30000 \
 RECOMP_METAL_BATCH="$BATCH" \

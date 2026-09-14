@@ -26,7 +26,7 @@ cd "$ROOT" || exit 1
 echo "Plug in a controller, then press START and choose New Game."
 echo "Log: $OUT/stderr.log"
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
-RECOMP_OHCI_ATTACH=1 RECOMP_USB=1 RECOMP_PAD_INJECT=1 RECOMP_PAD_TRACE=1 \
+RECOMP_OHCI_ATTACH=1 RECOMP_PAD_INJECT=1 RECOMP_PAD_TRACE=1 \
 RECOMP_SCENE_REPORT=1 RECOMP_FUNC_HIT_TRACE=1 RECOMP_REPORT_MS=5000 \
 RECOMP_HDD_ROOT="$SCRATCH/hdd" \
   "$ROOT/build-macos/jsrf-first-fault/build/jsrf_first_fault" \

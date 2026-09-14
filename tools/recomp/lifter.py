@@ -2030,17 +2030,38 @@ class Lifter:
                 f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
             ]
+        # A zero divisor, and idiv's one overflow case, are UNDEFINED in C.
+        #
+        # x86 raises #DE for both. We cannot raise it, and the interesting
+        # part is what the two hosts do instead: on AArch64 the division
+        # instruction yields zero, while on x86-64 it faults -- so a guest
+        # divide by zero is silent on the primary host and crashes the
+        # Windows differential oracle. A divergence that only appears on the
+        # host used to check the other one is the worst place to have one.
+        #
+        # Guarding makes both hosts do what the primary one already does, so
+        # this changes no observed behaviour on macOS and removes the
+        # undefined behaviour -- which at -O2 the compiler is otherwise
+        # entitled to reason backwards from. idiv's second case is
+        # INT64_MIN / -1, whose quotient does not fit and which x86 also
+        # faults on.
         elif m == "div":
             return [
                 f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
-                f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
+                f"  uint32_t _divisor = (uint32_t)({src});",
+                f"  if (_divisor) {{",
+                f"    eax = (uint32_t)(_dividend / _divisor);",
+                f"    edx = (uint32_t)(_dividend % _divisor);",
+                f"  }} else {{ eax = 0; edx = 0; /* x86 would #DE */ }} }}"
             ]
         elif m == "idiv":
             return [
                 f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
-                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
+                f"  int32_t _divisor = (int32_t)({src});",
+                f"  if (_divisor && !(_divisor == -1 && _dividend == INT64_MIN)) {{",
+                f"    eax = (uint32_t)((int32_t)(_dividend / _divisor));",
+                f"    edx = (uint32_t)((int32_t)(_dividend % _divisor));",
+                f"  }} else {{ eax = 0; edx = 0; /* x86 would #DE */ }} }}"
             ]
         return [f"/* {m}: unhandled */"]
 
@@ -2058,8 +2079,18 @@ class Lifter:
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
             # CF is the last bit shifted out; a zero count leaves CF alone.
+            #
+            # The count is masked to 5 bits, so for a narrow operand it can
+            # exceed the operand's width: `shl al, cl` with cl = 31 gives
+            # bit = 8 - 31 = -23, and a shift by a negative amount is
+            # UNDEFINED in C -- which at -O2 the compiler is entitled to
+            # assume never happens, and to optimise around accordingly.
+            # x86 leaves CF UNDEFINED once the count exceeds the width, so
+            # declining to compute it there is exact rather than a
+            # compromise: the guard and the architecture agree.
             bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
+            out.append(f"if (({cnt}) && ({cnt}) <= {w})"
+                       f" _cf = (int)((({dst}) >> ({bit})) & 1);")
         out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
         return out
 
