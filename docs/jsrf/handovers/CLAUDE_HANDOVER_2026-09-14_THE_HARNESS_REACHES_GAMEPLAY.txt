@@ -89,30 +89,43 @@ and therefore gambles on hitting one window, and logo length varies by ten
 seconds or more between runs. gameplay.pad now uses new_game.pad's full measured
 prefix and starts play at t=80, clear of the last START.
 
-WHAT DECIDES WHETHER IT ARRIVES: the host audio device, not the schedule.
-Same binary, same prefix, four runs --
+WHAT DECIDES WHETHER IT ARRIVES: not known, and the audio device is NOT it.
+Across nine runs the boot reaches New Game roughly two times in five. Always
+read the SCENE verdict before using a run; a title-plateau run produces a full
+log, a full pad trace and plausible audio counters, and means nothing.
 
-    live audio device      1342, 1342 opens   never left the title
-    device forced off      1408, 1410 opens   reached New Game, both times
+I got this wrong three times in a row and the sequence is the useful part:
 
--- with the second arm forced deterministically via
-SDL_AUDIODRIVER=no_such_driver. Two an arm is not proof; the separation is
-clean and the mechanism fits (the APU throttles against the real device, so
-without one the logos advance at a different rate and a fixed schedule lands
-differently). Use the forced-off form for every NON-audio unattended
-measurement; it turns one-run-in-three into reliable.
+    1 run    "the one success had a dead audio device"   a hunch
+    2 v 2    forced off twice reached New Game, live     written up as a
+             device twice did not                        CLEAN SEPARATION
+    n = 6    forced off 2 of 4, live device 0 of 2       no evidence at all
 
-The tension this creates is the real news, and it is why section 7's trap-storm
-item is still open: audio measurements need the device ON, and that is the arm
-in which the boot does not arrive. Either the schedule survives a live device
-or that experiment needs a person on the pad.
+0/2 against 2/4 is what one ~40% rate looks like. Anything built on the middle
+row -- including "force audio off for non-audio runs" -- was resting on nothing.
+
+THE LEAD THAT DID COME OUT OF IT came from diffing a successful boot against a
+failed one instead of running more of them. Both reach the 1342 plateau at
+t=36-37, so the failure is NOT slow booting. The difference is the A press: in
+the good run the A at t=47 moved it 1342 -> 1344 -> 1408, i.e. that A selected
+New Game; in the bad run the A presses at t=39, 47, 55, 63 and 71 each did
+nothing. So a group's START,START may be moving off the menu before the group's
+own A lands. gameplay.pad now fires bare A presses after the groups stop. One
+run, one success, against a baseline that already lands two in five -- untested,
+not fixed.
 
 DENSER INPUT IS NOT THE FIX, and this was tried: groups every 4 s to t=118
-instead of every 8 s to t=71, i.e. 27 attempts rather than 8, still 1342. That
-is the documented masher plateau -- new_game.pad's own header says a blind
-one-per-second beat walks the title to live=133 / 1342 and stops -- and this
-project's notes already said not to retune those timings. The prefix is back to
-the measured artifact.
+instead of every 8 s to t=71 still gave 1342. That is the documented masher
+plateau, and this project's notes already said not to retune those timings.
+
+TWO CONFOUNDS THAT LOOK LIKE HEALTHY RUNS, both now gated in play_scripted.sh:
+  * INPUT-POLL STALL. One run fired 128 of 202 events with a SEVENTY-SIX SECOND
+    window in which the guest polled nothing -- while its mean poll interval,
+    18.7 ms, matched a healthy run's 18.9 ms, and the schedule still ran to
+    completion. No counter we print could see it. The gate reports the largest
+    gap between pad events.
+  * COREAUDIO FAILING THE DEVICE. Wedges repeatedly on this machine, including
+    mid-session, and makes a run's audio figures void while se= stays healthy.
 
 STILL NOT DONE: the schedule reaches gameplay and then does LITTLE. Best run is
 on=22 off=16 idle_trap=19, trapped=184, against a human's on=109 off=103
