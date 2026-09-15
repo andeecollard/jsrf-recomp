@@ -146,24 +146,9 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
-/* Voice lifecycle counters.
- *
- * The guest's DirectSound service routine only runs when FECTL reports a
- * requested trap, and that trap is raised exactly once per voice that retires
- * (voice_off -> SE2FE_IDLE_VOICE). A silent JSRF run shows the trap never
- * being raised, which narrows to either "no voice ever starts" or "voices
- * start and never reach an exhaustion path". Nothing distinguished those,
- * because neither transition was counted.
- *
- * off= alone cannot make that split for this title, because it counts only
- * voice_off, and voice_off is reached only from VOICE_OFF. JSRF retires
- * almost everything with VOICE_RELEASE instead: measured against xemu on the
- * same US title, boot to title screen issues VOICE_RELEASE 72 times against
- * VOICE_OFF 3. So off=0 is what a run reports whether nothing was released or
- * seventy-two voices were, and the two need separate counters to be told
- * apart. release= is the request; off= is the retirement it should eventually
- * produce once the envelope reaches zero. release>0 beside off=0 is a
- * release that never completes -- a distinct fault from never releasing. */
+/* off counts every model retirement, including envelope/sample exhaustion.
+ * Explicit guest VOICE_OFF commands are counted separately below. Neither
+ * counter establishes that the guest freed its software voice object. */
 /* A timestamped ring of voice lifecycle events.
  *
  * The counters below say how many voices started and stopped over a whole run.
@@ -338,6 +323,107 @@ void mcpx_apu_voice_events_report(void)
     fflush(stderr);
 }
 
+/* A bounded, opt-in lifecycle log. Record the first idle encounter after
+ * each ON, plus each command/retirement. Repeated traps cannot evict the
+ * transition that started a storm. Sequence is log order; audio_frames is a
+ * capture position, not wall time. This observes hardware state only: guest
+ * object ownership must be checked separately. */
+static void voice_lifecycle_note(MCPXAPUState *d, uint16_t v,
+                                 const char *event)
+{
+    static int enabled = -1;
+    static unsigned long sequence;
+    static unsigned char idle_seen[MCPX_HW_MAX_VOICES];
+    extern unsigned long long g_apu_out_frames;
+    if (enabled < 0) enabled = getenv("RECOMP_VOICE_LIFECYCLE") != NULL;
+    if (!enabled || v >= MCPX_HW_MAX_VOICES) return;
+    if (!strcmp(event, "on")) idle_seen[v] = 0;
+    if (!strcmp(event, "idle")) {
+        if (idle_seen[v]) return;
+        idle_seen[v] = 1;
+    }
+    fprintf(stderr, "  [VOICE-LIFECYCLE] seq=%lu audio_frames=%llu"
+            " event=%s voice=%u state=%08X next=%04X"
+            " fectl=%08X force1=%08X\n",
+            ++sequence, g_apu_out_frames, event, v,
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF),
+            voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE),
+            d->regs[NV_PAPU_FECTL], d->regs[NV_PAPU_FETFORCE1]);
+}
+
+/* Who else writes the voice list?
+ *
+ * voice_set_mask stores through stl_le_phys: the voice register file lives in
+ * GUEST RAM, not in d->regs. So the guest changes a PITCH_LINK with an ordinary
+ * store -- no MMIO, no method, nothing a write hook can see, and nothing that a
+ * trapped-page window could swallow. Only the three list HEADS are registers.
+ *
+ * That makes a write trace impossible and a differential one easy: remember the
+ * value this model last wrote for each voice, and whenever we read that link
+ * back, report it if it no longer matches. A mismatch is someone else's store,
+ * and the only other writer is the guest.
+ *
+ * Reports the first divergence per voice rather than every one: the walk reads
+ * every link every subframe, so an unbounded log would be tens of thousands of
+ * lines a second once a list is being edited. */
+static uint16_t g_link_shadow[MCPX_HW_MAX_VOICES];
+static uint8_t  g_link_shadow_valid[MCPX_HW_MAX_VOICES];
+static uint8_t  g_link_reported[MCPX_HW_MAX_VOICES];
+unsigned long   g_guest_link_writes;
+unsigned long   g_link_checks;
+
+static void link_shadow_set(uint16_t v, uint32_t val)
+{
+    if (v >= MCPX_HW_MAX_VOICES) return;
+    g_link_shadow[v] = (uint16_t)val;
+    g_link_shadow_valid[v] = 1;
+}
+
+static void link_shadow_check(uint16_t v, uint32_t observed, const char *where)
+{
+    static int enabled = -1;
+    extern unsigned long long g_apu_out_frames;
+    if (v >= MCPX_HW_MAX_VOICES || !g_link_shadow_valid[v]) return;
+    g_link_checks++;
+    if ((uint16_t)observed == g_link_shadow[v]) return;
+    g_guest_link_writes++;
+    if (enabled < 0) enabled = getenv("RECOMP_VOICE_LIFECYCLE") != NULL;
+    if (enabled && !g_link_reported[v]) {
+        g_link_reported[v] = 1;
+        fprintf(stderr, "  [VOICE-RELINK] audio_frames=%llu voice=%u"
+                " ours=%04X now=%04X at=%s\n",
+                g_apu_out_frames, v, g_link_shadow[v],
+                (unsigned)(observed & 0xFFFF), where);
+    }
+    g_link_shadow[v] = (uint16_t)observed;   /* resync; report transitions once */
+}
+
+/* Every VOICE_ON insert, under the same switch as the lifecycle trace so the
+ * two interleave in one log. Prints the FEAV the insert read, the branch it
+ * chose, and the link before and after -- enough to read a self-link back to
+ * the register that produced it without re-deriving the arithmetic by hand.
+ * Unbounded on purpose: ONs are thousands per run, not the hundreds of
+ * thousands the idle traps reach, and losing the early ones would lose the
+ * insert that started a storm. */
+static void voice_link_note(MCPXAPUState *d, uint16_t v, uint32_t feav,
+                            unsigned int list, unsigned int ante,
+                            uint32_t link_before, uint32_t link_after)
+{
+    static int enabled = -1;
+    extern unsigned long long g_apu_out_frames;
+    if (enabled < 0) enabled = getenv("RECOMP_VOICE_LIFECYCLE") != NULL;
+    if (!enabled || v >= MCPX_HW_MAX_VOICES) return;
+    (void)d;
+    fprintf(stderr, "  [VOICE-LINK] audio_frames=%llu voice=%u feav=%08X"
+            " lst=%u ante=%04X link=%04X->%04X%s%s\n",
+            g_apu_out_frames, v, feav, list, ante,
+            link_before, link_after,
+            (list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT &&
+             ante == v) ? " SELF-ANTE" : "",
+            (link_after == v) ? " SELF-LINK" : "");
+}
+
 /* Idle-voice traps, by handle, and the last sixteen raised.
  *
  * The guest's DirectSound ISR takes this handle, looks up its own voice object
@@ -358,34 +444,75 @@ unsigned long g_apu_voice_release_count;
 unsigned long g_apu_idle_trap_count;
 unsigned long g_apu_voice_process_count;
 
-/* Front-end method arrivals, counted before the switch decides anything.
- *
- * on=0 answers "did a voice start", but it cannot separate "the guest never
- * wrote VOICE_ON" from "the write never reached this model". The guest's
- * submission loop writes SET_CURRENT_VOICE, VOICE_LOCK and the voice config
- * registers on the same page and in the same iteration as VOICE_ON, so a
- * nonzero fe/current-voice count next to on=0 localises the failure to the
- * loop's own control flow rather than to MMIO routing -- and both being zero
- * says the routing never delivered anything from this loop. */
+/* fe_methods includes internal SE2FE events. guest_methods counts only
+ * arrivals through mcpx_apu_vp_write, independently of idle-trap arming.
+ * SET_CURRENT_VOICE is a second positive control for guest submissions.
+ * A zero delta means no methods arrived here; it cannot distinguish a guest
+ * that stopped submitting from writes lost before reaching this entry point. */
 unsigned long g_apu_fe_method_count;
+unsigned long g_apu_guest_method_count;
+unsigned long g_apu_voice_off_command_count;
 unsigned long g_apu_set_current_voice_count;
 unsigned long g_apu_voice_on_loop_count;
+
+#define APU_UNKNOWN_METHOD_MAX 64
+unsigned long g_apu_unknown_method_count;
+uint32_t g_apu_unknown_method[APU_UNKNOWN_METHOD_MAX];
+unsigned g_apu_unknown_method_n;
+
+/* Where a voice's forward link comes from at VOICE_ON.
+ *
+ * SET_ANTECEDENT_VOICE is only ever issued by the guest -- the one internal
+ * fe_method call is SE2FE_IDLE_VOICE -- so antecedent_sets is guest traffic by
+ * construction, and comparing it against VOICE_ON tells a dropped store from a
+ * guest that genuinely reuses a stale FEAV. The two branch counters say which
+ * insert ran; self_ante is the INHERIT case where FEAV names the voice being
+ * turned on, which collapses that branch's read-modify-write to link(v) = v.
+ *
+ * self_link is the OUTCOME, read back from the voice after the insert, and it
+ * is the one to trust: it covers the TOP branch reaching the same state via a
+ * list head that already names this voice, and it stands even if the reasoning
+ * about the INHERIT arithmetic is wrong. A self-link is a one-entry cycle in
+ * the list mcpx_apu_vp_frame walks. */
+unsigned long g_apu_antecedent_set_count;
+unsigned long g_apu_voice_on_top_count;
+unsigned long g_apu_voice_on_inherit_count;
+unsigned long g_apu_voice_on_self_ante_count;
+unsigned long g_apu_voice_on_self_link_count;
 
 void mcpx_apu_voice_report(void)
 {
     fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu release=%lu idle_trap=%lu"
             " processed=%lu"
-            " fe_methods=%lu set_current_voice=%lu on_loop=%lu\n",
+            " fe_methods=%lu set_current_voice=%lu on_loop=%lu"
+            " guest_methods=%lu off_commands=%lu\n",
             g_apu_voice_on_count, g_apu_voice_off_count,
             g_apu_voice_release_count,
             g_apu_idle_trap_count, g_apu_voice_process_count,
             g_apu_fe_method_count, g_apu_set_current_voice_count,
-            g_apu_voice_on_loop_count);
+            g_apu_voice_on_loop_count, g_apu_guest_method_count,
+            g_apu_voice_off_command_count);
+    {
+        unsigned k;
+        fprintf(stderr, "  [VOICE-RELINK] links changed behind the model: %lu"
+            " (of %lu reads)\n", g_guest_link_writes, g_link_checks);
+    fprintf(stderr, "  [APU-FE-UNKNOWN] dropped=%lu distinct=%u:",
+                g_apu_unknown_method_count, g_apu_unknown_method_n);
+        for (k = 0; k < g_apu_unknown_method_n; k++)
+            fprintf(stderr, " %04X", g_apu_unknown_method[k]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "  [APU-LINK] antecedent_sets=%lu on_top=%lu"
+            " on_inherit=%lu self_ante=%lu self_link=%lu\n",
+            g_apu_antecedent_set_count, g_apu_voice_on_top_count,
+            g_apu_voice_on_inherit_count, g_apu_voice_on_self_ante_count,
+            g_apu_voice_on_self_link_count);
     fflush(stderr);
 }
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    voice_lifecycle_note(d, v, "retire");
     g_apu_voice_off_count++;
     voice_ev_note(1, v);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -457,12 +584,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_ANTECEDENT_VOICE:
+        g_apu_antecedent_set_count++;
         d->regs[NV_PAPU_FEAV] = argument;
         break;
 
     case NV1BA0_PIO_VOICE_ON: {
         g_apu_voice_on_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_lifecycle_note(d, (uint16_t)selected_handle, "on");
         voice_ev_note(0, selected_handle);
         voice_desc_dump(d, (uint16_t)selected_handle);
         /* off < on is only a defect for one-shots. A looping voice reaching
@@ -476,9 +605,20 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
 
+        /* Read-only provenance capture. feav_before is the register as the
+         * insert found it, so the log records what decided the branch rather
+         * than what the branch left behind. */
+        uint32_t feav_before = d->regs[NV_PAPU_FEAV];
+        unsigned int ante_before = GET_MASK(feav_before, NV_PAPU_FEAV_VALUE);
+        uint32_t link_before = voice_get_mask(
+            d, (uint16_t)selected_handle, NV_PAVS_VOICE_TAR_PITCH_LINK,
+            NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        link_shadow_check((uint16_t)selected_handle, link_before, "voice-on");
+
         list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
         if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
             unsigned int top_reg = voice_list_regs[list - 1].top;
+            g_apu_voice_on_top_count++;
             voice_set_mask(d, (uint16_t)selected_handle,
                            NV_PAVS_VOICE_TAR_PITCH_LINK,
                            NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
@@ -488,6 +628,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             unsigned int antecedent_voice =
                 GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
             assert(antecedent_voice != 0xFFFF);
+
+            g_apu_voice_on_inherit_count++;
+            if (antecedent_voice == selected_handle)
+                g_apu_voice_on_self_ante_count++;
 
             uint32_t next_handle = voice_get_mask(
                 d, (uint16_t)antecedent_voice, NV_PAVS_VOICE_TAR_PITCH_LINK,
@@ -501,6 +645,16 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                            NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
                            selected_handle);
         }
+
+        /* The outcome, read back rather than predicted. Nothing below changes
+         * the link, so this is the state the walk will meet. */
+        uint32_t link_after = voice_get_mask(
+            d, (uint16_t)selected_handle, NV_PAVS_VOICE_TAR_PITCH_LINK,
+            NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        if (link_after == selected_handle) g_apu_voice_on_self_link_count++;
+        link_shadow_set((uint16_t)selected_handle, link_after);
+        voice_link_note(d, (uint16_t)selected_handle, feav_before, list,
+                        ante_before, link_before, link_after);
 
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
@@ -558,6 +712,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_RELEASE: {
         g_apu_voice_release_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_lifecycle_note(d, (uint16_t)selected_handle, "release-command");
         voice_ev_note(2, selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
@@ -585,6 +740,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        g_apu_voice_off_command_count++;
+        voice_lifecycle_note(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE),
+                             "off-command");
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -816,7 +974,25 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                     method < NV1BA0_PIO_SET_OUTBUF_LEN + 32)) {
             /* Outbuf base/length - ignore for now */
         } else {
-            /* Unknown method - silently ignore */
+            /* Unknown method.
+             *
+             * This was a DPRINTF, which compiles to nothing, so every method
+             * the model does not decode was dropped leaving no trace and no
+             * count. That is the wrong shape for a front end whose job is to
+             * receive guest commands: "the guest never asked" and "we ignored
+             * the ask" read identically from every log in the repository.
+             *
+             * Records distinct method numbers so the report can name them. It
+             * changes no behaviour -- the method is still ignored. */
+            g_apu_unknown_method_count++;
+            {
+                unsigned k;
+                for (k = 0; k < g_apu_unknown_method_n; k++)
+                    if (g_apu_unknown_method[k] == method) break;
+                if (k == g_apu_unknown_method_n &&
+                    g_apu_unknown_method_n < APU_UNKNOWN_METHOD_MAX)
+                    g_apu_unknown_method[g_apu_unknown_method_n++] = method;
+            }
             DPRINTF("Unknown FE method: 0x%08X arg=0x%08X\n", method, argument);
         }
         break;
@@ -856,6 +1032,7 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
+    g_apu_guest_method_count++;
     /* Dispatch known methods through fe_method */
     fe_method(d, (uint32_t)addr, (uint32_t)val);
 }
@@ -1995,6 +2172,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             uint16_t nxt = (uint16_t)voice_get_mask(d, v,
                                NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            link_shadow_check(v, nxt, "walk");
             d->regs[next] = nxt;
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -2004,6 +2182,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * re-raising it for the SAME voice every frame is what produced
                  * 217 traps per retirement. */
                 if (!trap_held) {
+                    voice_lifecycle_note(d, v, "idle");
                     g_idle_trap_raises++;
                     if (v < MCPX_HW_MAX_VOICES) g_idle_trap_by_voice[v]++;
                     g_idle_trap_last[g_idle_trap_ring & 15u] = (uint16_t)v;

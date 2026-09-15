@@ -13,6 +13,9 @@ recomp_func_t recomp_lookup(uint32_t va) { (void)va; return NULL; }
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return NULL; }
 int xbox_VideoIsPlaying(void) { return 0; }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while (0)
+extern unsigned long g_apu_guest_method_count;
+extern unsigned long g_apu_voice_off_command_count;
+extern unsigned long g_apu_voice_off_count;
 static MCPXAPUState *apu;
 static uint32_t read_apu(uint32_t off, unsigned width)
 { return (uint32_t)mcpx_apu_mmio_read(apu, off, width); }
@@ -55,7 +58,9 @@ int main(void)
     stl_le_phys(address_space_memory,0x20000 + 8*NV_PAVS_SIZE + NV_PAVS_VOICE_TAR_PITCH_LINK,0xFFFF);
     r[NV_PAPU_FETFORCE1/4] = NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE;
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME] = {{0}};
+    unsigned long guest_before = g_apu_guest_method_count;
     mcpx_apu_vp_frame(apu,mixbins);
+    CHECK(g_apu_guest_method_count == guest_before);
     CHECK(r[NV_PAPU_FEDECMETH/4] == SE2FE_IDLE_VOICE);
     CHECK(r[NV_PAPU_FEDECPARAM/4] == 7);
     CHECK((r[NV_PAPU_FECTL/4] & NV_PAPU_FECTL_FEMETHMODE) == NV_PAPU_FECTL_FEMETHMODE_TRAPPED);
@@ -81,6 +86,14 @@ int main(void)
     r[NV_PAPU_FECTL/4] = 0;
     r[NV_PAPU_ISTS/4] = NV_PAPU_ISTS_FETINTSTS;
     CHECK(r[NV_PAPU_ISTS/4] == 0);
+    /* A guest method increments the positive control; the internal idle
+     * event above must not. Explicit OFF is a subset of model retirement. */
+    unsigned long off_before = g_apu_voice_off_count;
+    unsigned long command_before = g_apu_voice_off_command_count;
+    mcpx_apu_mmio_write(apu, 0x20000 + NV1BA0_PIO_VOICE_OFF, 7, 4);
+    CHECK(g_apu_guest_method_count == guest_before + 1);
+    CHECK(g_apu_voice_off_command_count == command_before + 1);
+    CHECK(g_apu_voice_off_count == off_before + 1);
 #endif
     puts("APU register reads, W1C, idle-voice trap payload and"
          " FEMETHMODE field decoding passed");

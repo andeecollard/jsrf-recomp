@@ -117,6 +117,8 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
     return r;
 }
 
+extern unsigned long g_apu_top_write_count[3];
+
 void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                      unsigned int size)
 {
@@ -127,6 +129,33 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
      *         (unsigned long long)addr, size, (unsigned long long)val);
      */
     (void)size;
+
+    /* Does the guest ever move a voice-list head?
+     *
+     * The head lives only in these three registers, and VOICE_ON in apu_vp.c
+     * is the ONLY writer of them inside the model -- voice_off does not touch
+     * them, and neither does the walk. So a retired voice that is its list's
+     * head can only be removed by the guest writing the register itself. If
+     * that write never arrives the head keeps naming the retired voice, the
+     * next VOICE_ON for it links it to itself, and the walk pins on a
+     * one-entry cycle.
+     *
+     * Counts arrivals HERE, after the trap decoded the store, so zero means
+     * the write did not reach the model: it cannot separate a guest that never
+     * issued one from a store lost before this point. g_apu_w_main is the
+     * positive control -- other main-register writes arriving while these stay
+     * at zero distinguishes "no write" from "this aperture is deaf". */
+    if (addr == NV_PAPU_TVL2D || addr == NV_PAPU_TVL3D || addr == NV_PAPU_TVLMP) {
+        static int trace = -1;
+        int idx = (addr == NV_PAPU_TVL2D) ? 0 : (addr == NV_PAPU_TVL3D) ? 1 : 2;
+        g_apu_top_write_count[idx]++;
+        if (trace < 0) trace = getenv("RECOMP_VOICE_LIFECYCLE") != NULL;
+        if (trace)
+            fprintf(stderr, "  [VOICE-TOP] list=%s %04X -> %04X\n",
+                    idx == 0 ? "2D" : idx == 1 ? "3D" : "MP",
+                    (unsigned)(qatomic_read(&d->regs[addr]) & 0xFFFF),
+                    (unsigned)(val & 0xFFFF));
+    }
 
     switch (addr) {
     case NV_PAPU_ISTS:
@@ -1095,8 +1124,13 @@ static int apu_write_trace_on(void)
     return on;
 }
 
+unsigned long g_apu_top_write_count[3];
+
 void mcpx_apu_write_report(void)
 {
+    fprintf(stderr, "  [VOICE-TOP] head writes from guest: 2D=%lu 3D=%lu MP=%lu\n",
+            g_apu_top_write_count[0], g_apu_top_write_count[1],
+            g_apu_top_write_count[2]);
     extern MCPXAPUState *mcpx_apu_get_state(void);
     if (!apu_write_trace_on()) return;
     fprintf(stderr, "  [APU-WRITE] main=%lu vp=%lu gp=%lu ep=%lu other=%lu%s\n",
