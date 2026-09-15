@@ -37,7 +37,15 @@ uncontrolled.
 
 **Wall-clock scheduling.** The pad schedule is anchored at input init, but how
 far the title has progressed by a given `t` varies run to run. Always read the
-scene gate (`NtOpenFile` count) rather than assuming a timestamp means a scene.
+scene gate rather than assuming a timestamp means a scene.
+
+The scene gate is `CActSequence::m_dwNextMethod`, read by `RECOMP_SEQ_REPORT`
+and printed as `[JSRF-SEQ] now=`; 28–35 is a mission or the tutorial. It is
+**not** the `NtOpenFile` count, which this sentence named until 15 Sep 2026.
+That count was timing the disc cache build, and on a pre-cached emulated HDD —
+which every tree here now stages — it reads 131 at the title, 131 in the VS menu
+and 131 in gameplay. See `CLAUDE_HANDOVER_2026-09-15_THE_SOUND_ENGINE_WAS_SWITCHED_OFF.txt`
+section 4.
 
 ## Reading rules earned the hard way
 

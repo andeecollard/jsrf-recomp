@@ -8,12 +8,12 @@ is believed rather than measured it says so.
 
 | | evidence |
 |---|---|
-| Boots to gameplay unattended | 12 of 12 scripted boots reached at least the title gate (`NtOpenFile` 1342); most reach New Game (1408) |
+| Boots to gameplay unattended | `pad/gameplay_nobarrage.pad` reached a running mission — `[JSRF-SEQ] now=30`, held 111 s — unattended, 15 Sep 2026. The older "12 of 12 scripted boots reached the title gate (`NtOpenFile` 1342)" is withdrawn: that count was timing the disc cache build and reads 131 in every scene on a pre-cached HDD |
 | Renders | 245,331 native draw batches in a 75 s intro run, 0 software fallbacks |
 | Audio | output holds 47,602–48,006 Hz across every scene measured, 14 runs |
 | Controller input | 7 of 7 full 300 s runs retire USB transfers continuously; the guest's own driver acknowledges ~31,000 done queues per run |
 | Tutorial | completes; the title reaches the playable part |
-| Tests | 28/28 C tests, 56/56 translator Python tests — both re-run 15 Sep 2026 at `6b56ef1` |
+| Tests | 29/29 C tests (the suite gained `jsrf_vsh_msl`), 56/56 translator Python tests — C suite re-run 15 Sep 2026 at `8b11fcc` |
 
 The C suite is green because the checks it used to fail on were RETIRED, not
 because they started passing by luck. `CMakeLists.txt` records each one: four

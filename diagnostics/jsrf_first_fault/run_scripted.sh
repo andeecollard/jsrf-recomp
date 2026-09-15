@@ -64,7 +64,14 @@ echo "=== presses fired ==="
 grep '\[PAD-SCRIPT\] t=' "$OUT/stderr.log" | tail -20
 echo "=== scene / fatal ==="
 grep -E '\[JSRF-SCENE\] root=|\[JSRF-FATAL\]' "$OUT/stderr.log" | tail -6
-echo "=== files ==="
+# The open count is the boot and disc-cache path, and NOTHING about which
+# screen the run reached. It read 131 at the title, in the VS menu and in
+# gameplay on 15 Sep 2026 -- the same 22 paths with the same multiplicities --
+# because every staged emulated-hdd now carries a complete Media/Cache and the
+# title skips StartBuildCache. The 1342/1408 gates it used to carry were timing
+# the cache build. The sequence block at the top of this output is the scene
+# verdict; this is disc traffic and is labelled as such.
+echo "=== files opened (disc traffic only -- NOT a scene marker) ==="
 printf 'NtOpenFile=%s distinct=%s\n' \
     "$(grep -c 'NtOpenFile' "$OUT/stderr.log")" \
     "$(grep -o 'path=.*' "$OUT/stderr.log" | sort -u | wc -l | tr -d ' ')"
