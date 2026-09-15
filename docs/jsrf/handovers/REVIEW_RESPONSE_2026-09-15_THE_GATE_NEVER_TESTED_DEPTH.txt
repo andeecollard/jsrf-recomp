@@ -737,3 +737,72 @@ probably separate defect, and it is not tile-aligned.
 
 NOT YET MEASURED: what batching costs or saves in frame time on the hardware
 path, which is the question that decides the default.
+
+
+17. THE FIX, THE GATE THAT WOULD HAVE CAUGHT IT, AND WHAT IS LEFT
+==================================================================
+FIXED: RECOMP_METAL_BATCH now defaults ON. One encoder for many draws instead
+of a render pass per draw, which is the correct architecture as well as the
+fast one -- loading and storing a whole surface through tile memory tens of
+thousands of times per frame was never going to be right. =0 restores the
+per-draw path and must keep working; it is the control for the whole result.
+
+It is a CORRECTNESS default. Batching had been argued about only on frame time,
+where its A/B ranges overlapped and nobody could call it, so it sat switched
+off. metal_batch_check.sh already held the invariant that decides whether
+turning it on is safe -- batched output byte-for-byte against per-draw on the
+device test -- and it still passes.
+
+NEW GATE: diagnostics/jsrf_first_fault/fb_score.py, because nothing here could
+score a real frame. Two metrics:
+
+  tile     strong edges landing on a grid boundary against what chance gives,
+           reported as enrichment rather than a count so it tracks the artefact
+           and not the scene's own detail
+  speckle  isolated pixels disagreeing with ALL their neighbours -- granular
+           noise with no straight edges, which `tile` cannot see
+
+--selftest injects a known seam and known speckle and requires detection,
+because a tool that cannot fail is not a gate. Run it on two arms of the same
+scene with --compare; neither metric is a pass/fail alone.
+
+Its first use settled an open question. The granular noise a person reported is
+NOT a hardware-path artefact:
+
+    software control      15806 /Mpx
+    hardware per-draw     13282
+    hardware batched      11686
+
+Highest on the known-good path, lowest on the fixed one. It is the title's own
+dithering and cel-shaded detail, and the fix neither introduces nor worsens it.
+
+ALSO FIXED, and it is the reason the A/B below can be believed: the batching
+switch now names itself in the [METAL] report in BOTH states, and ab_score.py's
+SWITCH_TOKEN and METAL_SWITCH_RE know about it. Batch statistics used to print
+only under RECOMP_METAL_CB_STATS and only when batching was on, so the OFF arm
+said nothing and any comparison fell back to "assumes the environment took" --
+the same hole that ran RECOMP_APU_SELFLINK_END and RECOMP_VSH_REUSE with the
+feature enabled in both arms, on the switch that turned out to decide whether
+the frame is correct.
+
+WHAT IS LEFT
+
+  1. FRAME TIME. Every performance number this renderer has -- the 9.6% for the
+     hardware path and the 14.5% for 565 -- predates the batching default and
+     predates the dither fix's raster_order_group(0) on dithered blended draws.
+     An A/B of RECOMP_METAL_BATCH on the hardware path is running; until it
+     lands, treat both figures as unverified rather than wrong.
+  2. Re-run the 565 A/B, whose arms were never verifiable.
+  3. Re-run RECOMP_VSH_REUSE properly.
+  4. metal_copy_test line 49: the software path's depth readback is now the
+     only arm failing an exact comparison.
+  5. RECOMP_SURFACE_AUDIT is built and still has not been run.
+
+WHAT THIS EPISODE SHOULD CHANGE ABOUT THE GATES. The defect needed tens of
+thousands of draws before the GPU fell behind the producer, and every gate in
+this tree submits a few hundred to one retained surface and reads it straight
+back. metal_batch_test's own header already said the first version of its ring
+phase was "toothless" because "the GPU was never actually behind" -- that
+sentence was true of the whole file and nobody generalised it. A gate that
+cannot get the GPU behind cannot see this class of defect at all, and the
+answer is fb_score.py on frames from a real run, not another synthetic phase.
