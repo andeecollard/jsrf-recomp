@@ -41,6 +41,7 @@ static void pad_sentinel_scan(void);
 static void jsrf_save_dump(void);
 static void jsrf_scene_report(void);
 static void jsrf_seq_trace_start(void);
+static void jsrf_seq_report(void);
 static uint32_t jsrf_root_va(const uint8_t *base, uint32_t *via_out,
                              const char **how_out, int verbose);
 static void jsrf_object_dump(void);
@@ -1189,6 +1190,7 @@ static void jsrf_pusher_report(void)
         jsrf_guest_trace_report();
         pad_sentinel_scan();
         jsrf_seq_trace_start();
+        jsrf_seq_report();
         jsrf_save_dump();
         jsrf_scene_report();
         jsrf_object_dump();
@@ -2488,6 +2490,33 @@ extern double xbox_InputSeconds(void);
 static int      g_seq_names_ok = -1;    /* -1 not yet checked */
 static uint32_t g_seq_last = 0xFFFFFFFFu;
 
+/* Sampler health and dwell, for RECOMP_SEQ_REPORT below.
+ *
+ * Written only by jsrf_seq_thread, read only by jsrf_seq_report -- the same
+ * plain-counter arrangement every other cross-thread counter in this file
+ * uses. Triggers, because the next person is entitled to read them before
+ * trusting the numbers:
+ *
+ *   g_seq_polls        ++ on EVERY loop iteration, before anything can fail.
+ *                         This is the positive control: if it climbs and
+ *                         g_seq_resolved does not, the instrument is alive and
+ *                         the object is not readable -- which is a different
+ *                         finding from "the scene did not change".
+ *   g_seq_resolved     ++ when jsrf_seq_object() validated (id 0 at +0x08 and
+ *                         a dispatchable index at +0x48).
+ *   g_seq_transitions  ++ when the index changed, not counting the first read.
+ *   g_seq_dwell[i]     ++ once per RESOLVED poll while the index is i, so it
+ *                         is in sampler ticks, nominally 10 ms. Sleep(10) is a
+ *                         floor, so seconds derived from it UNDERSTATE wall
+ *                         time on a loaded host. The line prints both.
+ */
+static unsigned long g_seq_polls;
+static unsigned long g_seq_resolved;
+static unsigned long g_seq_transitions;
+static unsigned long g_seq_dwell[JSRF_SEQ_COUNT];
+static unsigned long g_seq_here;        /* resolved polls in the current index */
+static uint32_t      g_seq_obj;         /* last address that validated */
+
 static const char *jsrf_seq_name(uint32_t i)
 {
     if (i >= JSRF_SEQ_COUNT) return "OUT-OF-RANGE";
@@ -2545,26 +2574,40 @@ static uint32_t jsrf_seq_object(const uint8_t *base)
 
 static DWORD WINAPI jsrf_seq_thread(LPVOID arg)
 {
+    /* The per-transition line belongs to RECOMP_SEQ_TRACE. RECOMP_SEQ_REPORT
+     * starts the same sampler for its periodic line, and must not start
+     * printing a line the caller did not ask for. */
+    const int trace = getenv("RECOMP_SEQ_TRACE") ? 1 : 0;
+
     (void)arg;
     for (;;) {
         const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
         uint32_t obj, idx;
+        g_seq_polls++;
         if (base) {
             if (g_seq_names_ok < 0) jsrf_seq_check_table(base);
             obj = jsrf_seq_object(base);
             if (obj) {
+                g_seq_resolved++;
+                g_seq_obj = obj;
                 idx = *(const uint32_t *)(base + obj + JSRF_SEQ_NEXT_OFF);
                 if (idx != g_seq_last) {
-                    fprintf(stderr, "  [JSRF-SEQ] t=%8.2f  %2u %-32s ->"
-                            " %2u %s\n",
-                            xbox_InputSeconds(),
-                            (unsigned)g_seq_last,
-                            g_seq_last == 0xFFFFFFFFu ? "(start)"
-                                                      : jsrf_seq_name(g_seq_last),
-                            (unsigned)idx, jsrf_seq_name(idx));
-                    fflush(stderr);
+                    if (trace) {
+                        fprintf(stderr, "  [JSRF-SEQ] t=%8.2f  %2u %-32s ->"
+                                " %2u %s\n",
+                                xbox_InputSeconds(),
+                                (unsigned)g_seq_last,
+                                g_seq_last == 0xFFFFFFFFu
+                                    ? "(start)" : jsrf_seq_name(g_seq_last),
+                                (unsigned)idx, jsrf_seq_name(idx));
+                        fflush(stderr);
+                    }
+                    if (g_seq_last != 0xFFFFFFFFu) g_seq_transitions++;
                     g_seq_last = idx;
+                    g_seq_here = 0;
                 }
+                if (idx < JSRF_SEQ_COUNT) g_seq_dwell[idx]++;
+                g_seq_here++;
             }
         }
         /* 100 Hz. The state advances at frame rate at most, and a transition
@@ -2578,13 +2621,144 @@ static DWORD WINAPI jsrf_seq_thread(LPVOID arg)
 static void jsrf_seq_trace_start(void)
 {
     static int started;
+    const char *tr, *rep;
     HANDLE th;
-    if (started || !getenv("RECOMP_SEQ_TRACE")) return;
+
+    if (started) return;
+    tr  = getenv("RECOMP_SEQ_TRACE");
+    rep = getenv("RECOMP_SEQ_REPORT");
+    if (!tr && !rep) return;
     started = 1;
     th = CreateThread(NULL, 0, jsrf_seq_thread, NULL, 0, NULL);
     if (th) CloseHandle(th);
-    fprintf(stderr, "  [JSRF-SEQ] tracing CActSequence::m_dwNextMethod%s\n",
+    fprintf(stderr, "  [JSRF-SEQ] sampling CActSequence::m_dwNextMethod at"
+            " 100 Hz%s%s%s\n",
+            tr  ? " (transitions)" : "",
+            rep ? " (periodic report)" : "",
             th ? "" : " -- THREAD CREATE FAILED");
+    fflush(stderr);
+}
+
+/*
+ * RECOMP_SEQ_REPORT -- the same number the trace prints, once per periodic
+ * report, so an UNATTENDED run can be scored on the scene it was in.
+ *
+ * WHY THIS EXISTS. Scripted runs were scored on the NtOpenFile count, with
+ * gates of ~1342 = title plateau and 1408 = New Game. On 15 Sep 2026 three
+ * runs against a staged HDD that already carried a built Media\Cache all
+ * reported exactly 131 opens -- one of them screenshot-confirmed in the VS
+ * stage-select menu, one screenshot-confirmed in gameplay. The gate does not
+ * separate them and cannot: with the cache present the title skips
+ * StartBuildCache, every open in the run has happened by t=79 s, and both
+ * scenes are reached long after the last one. Frame rate does not separate
+ * them either -- the menu's 3D stage preview drew 2,706 draws/s against
+ * gameplay's 3,042.
+ *
+ * WHAT MAKES THIS LINE MOVE. CActSequence::m_dwNextMethod, the index
+ * CActSequence::Exec0Default dispatches through, read out of guest RAM by the
+ * sampler thread above. It is the title's own top-level state, written by the
+ * sequence methods themselves -- sub_0007D030 ends `mov [esi+0x48], 0x39`, and
+ * so on down the chain. The VS menu chain is 56 PrepareVsMenu -> 57
+ * WaitLoadVsMenu -> 58 WaitEndVsMenu (which holds until CActMan::GetAction
+ * 0x1DEB comes back null) -> 59 ReturnFromVsMenu; a mission is 28
+ * PrepareStoryOrVsMission -> 30 WaitEndStoryOrVsMission, held until GetAction 8
+ * is freed. So the stage-select menu reads 58 and a running mission reads 30.
+ *
+ * WHAT WOULD MAKE IT READ THE SAME IN BOTH SCENES, stated up front:
+ *
+ *  - State 30 is "a mission action object exists", NOT "the player is
+ *    skating". The mission's own loading screen, its opening cutscene and its
+ *    pause menu are all inside 30. This separates the menu SHELL from a
+ *    mission; it does not separate playing from being paused inside one.
+ *  - Two menus in the same chain share a state. Character select and stage
+ *    select are both action 0x1DEB inside 58.
+ *  - If the root pointer never validates, the index is never read and the
+ *    line says so rather than printing a stale index. That is the failure this
+ *    file has been burned by twice, so resolved=0 is reported as an instrument
+ *    failure in those words.
+ *
+ * POSITIVE CONTROL, built into the line. polls= increments on every sampler
+ * iteration before anything can fail, and resolved= only when the object
+ * validated. polls climbing with resolved=0 proves the instrument runs and the
+ * object is unreadable. polls frozen proves the thread is dead. Neither can be
+ * mistaken for "the title never left this state", which is what a bare index
+ * would look like in all three cases. names= is the third control: the 64-entry
+ * table is compared against the decompilation on the first poll, and the names
+ * are suppressed rather than guessed if it differs.
+ *
+ * Read-only: one dword read per poll off the guest's threads, no writes into
+ * guest memory, no generated code touched, and one bounded line per report.
+ */
+#define JSRF_SEQ_DWELL_SHOWN 6u
+
+static void jsrf_seq_report(void)
+{
+    static int on = -1;
+    const char *names;
+    unsigned seen[JSRF_SEQ_DWELL_SHOWN];
+    unsigned shown, i;
+    char line[320];
+    int n = 0;
+
+    line[0] = '\0';
+    if (on < 0) on = getenv("RECOMP_SEQ_REPORT") ? 1 : 0;
+    if (!on) return;
+
+    names = g_seq_names_ok > 0 ? "checked"
+          : g_seq_names_ok == 0 ? "SUPPRESSED" : "unchecked";
+
+    if (!g_seq_resolved) {
+        fprintf(stderr, "  [JSRF-SEQ] NO READING: polls=%lu resolved=0"
+                " names=%s -- %s\n",
+                g_seq_polls, names,
+                g_seq_polls
+                    ? "the sampler is running and CActSequence is not"
+                      " readable. This is the instrument, not the scene:"
+                      " do not score the run on it"
+                    : "the sampler thread has not ticked at all");
+        fflush(stderr);
+        return;
+    }
+
+    /* Top few dwell entries, so the line says what the run DID, not only where
+     * it ended up: a run that spent 200 s in 58 and 3 s in 30 is a different
+     * result from one that is the other way round, and a snapshot cannot tell
+     * them apart. Bounded at six entries and one line. */
+    for (shown = 0; shown < JSRF_SEQ_DWELL_SHOWN; shown++) {
+        unsigned bi = JSRF_SEQ_COUNT;
+        unsigned long best = 0;
+        int w;
+
+        for (i = 0; i < JSRF_SEQ_COUNT; i++) {
+            unsigned k, dup = 0;
+            for (k = 0; k < shown; k++) if (seen[k] == i) dup = 1;
+            if (dup || g_seq_dwell[i] <= best) continue;
+            best = g_seq_dwell[i];
+            bi = i;
+        }
+        if (bi == JSRF_SEQ_COUNT) break;
+        seen[shown] = bi;
+        w = snprintf(line + n, sizeof line - (size_t)n, " %u:%s=%.1fs",
+                     bi, jsrf_seq_name(bi), (double)g_seq_dwell[bi] / 100.0);
+        if (w < 0 || (size_t)w >= sizeof line - (size_t)n) {
+            /* snprintf truncated into the tail; drop the partial entry rather
+             * than print half a state name. */
+            line[n] = '\0';
+            break;
+        }
+        n += w;
+    }
+
+    /* held= is in sampler ticks and the seconds beside it are ticks x 10 ms.
+     * Sleep(10) is a floor, so the seconds UNDERSTATE wall time on a loaded
+     * host; the tick count is the number that is exactly what it says. */
+    fprintf(stderr, "  [JSRF-SEQ] now=%u %s held=%lu ticks (~%.1fs) obj=%08X"
+            " polls=%lu resolved=%lu transitions=%lu names=%s |"
+            " dwell:%s\n",
+            (unsigned)g_seq_last, jsrf_seq_name(g_seq_last),
+            g_seq_here, (double)g_seq_here / 100.0, (unsigned)g_seq_obj,
+            g_seq_polls, g_seq_resolved, g_seq_transitions, names,
+            n ? line : " none");
     fflush(stderr);
 }
 

@@ -15,10 +15,19 @@
 #
 # TWO GATES, AND THEY ARE DIFFERENT QUESTIONS
 #
-#   1. Did the run REACH gameplay?  NtOpenFile count, which needs no probe:
-#      ~1342 opens / 260 distinct files / live=133 is the TITLE plateau, and
-#      1408 opens / 264 files / live=56 is New Game. A run that stops at 1342
-#      never left the attract screen.
+#   1. Did the run REACH gameplay?  RECOMP_SEQ_REPORT=1, then read the
+#      [JSRF-SEQ] now= index: 28-35 is a mission or the tutorial, 56-59 is the
+#      VS menu chain, 10-23 is the title and its menus.
+#
+#      IT USED TO BE THE NtOpenFile COUNT, and that gate is DEAD. It read
+#      "~1342 opens / 260 distinct files / live=133 = TITLE plateau, 1408 opens
+#      / 264 files / live=56 = New Game". Measured 15 Sep 2026: a
+#      screenshot-confirmed gameplay run and two screenshot-confirmed VS-menu
+#      runs ALL reported 131 opens, the same 22 paths with the same
+#      multiplicities, last one at t=79-81 s. The 1342/1408 band was the disc
+#      CACHE BUILD; with a staged emulated-hdd that already carries
+#      Media/Cache and JSRF_CACHE_COMPLETE.CMP the title skips it entirely.
+#      Do not resurrect the count. See the note at gate 1 in play_scripted.sh.
 #   2. Did it then PLAY?  [APU-VOICE] off=, which must be well clear of zero.
 #
 # Both gates matter and neither substitutes for the other. The first version of

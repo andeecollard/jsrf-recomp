@@ -60,6 +60,14 @@
 # one-in-three boot into a reliable one.
 #
 # Usage:  play_scripted.sh <outname> <schedule|@file> [seconds]
+#
+# THE SCENE VERDICT IS OPT-IN. Gate 1 reads CActSequence::m_dwNextMethod,
+# which needs RECOMP_SEQ_REPORT=1 in the environment; the run inherits it.
+# Without it the script says SCENE: NOT MEASURED, because the counter it
+# used to use -- NtOpenFile -- reads 131 in the VS menu and 131 in
+# gameplay. See the long note at gate 1.
+#
+#   RECOMP_SEQ_REPORT=1 play_scripted.sh <name> @<pad> <secs>
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 NAME="${1:?usage: play_scripted.sh <outname> <schedule|@file> [seconds]}"
@@ -129,14 +137,41 @@ rm -rf "$SCRATCH"
 # title's own audio. Reaching gameplay and playing once there are different
 # failures with different fixes, so they get different lines.
 #
-# Gate 1 costs nothing extra. [FILE] lines are on by default, and the
-# NtOpenFile count is a reliable, long-established scene marker:
+# GATE 1 USED TO BE THE NtOpenFile COUNT. IT IS NOT A SCENE MARKER. It said:
 #   ~1342 opens / 260 distinct files / live=133  = TITLE plateau
 #    1408 opens / 264 distinct files / live=56   = New Game reached
 # (CLAUDE_HANDOVER_2026-09-12_THE_IDLE_LOOP_FREEZE.txt:102,209 and
-# CLAUDE_HANDOVER_2026-09-04_STALL_ELIMINATION.txt:151.) It needs none of the
-# heavy probes, which is what makes it usable from a run light enough to be
-# worth measuring.
+# CLAUDE_HANDOVER_2026-09-04_STALL_ELIMINATION.txt:151.)
+#
+# Measured 15 Sep 2026, three runs, same binary, same gen:
+#   .../play/20260915-122828-human-gameplay  screenshot: GAMEPLAY   131 opens
+#   .../play/20260915-120746-topwrite        screenshot: VS MENU    131 opens
+#   .../play/20260915-121615-relink          screenshot: VS MENU    131 opens
+# Not merely the same count -- the same 22 distinct paths with the same
+# multiplicities, byte for byte, and the last open in all three lands at
+# t=79 s, long before either scene is reached.
+#
+# WHAT THE COUNTER WAS ACTUALLY MEASURING: the cache build. The 1410-open run
+# (.../play/20260915-110630) opened Cache00.tbl~ .. DmCache09.tbl~ and took 253
+# FAILED opens probing for them; its HDD's Media/Cache is dated 11:11, the
+# minute that run ended. Once the staged emulated-hdd carries a complete
+# Media/Cache and JSRF_CACHE_COMPLETE.CMP -- which every tree here now does --
+# the title skips StartBuildCache and the count collapses to 131 in EVERY
+# scene. The old gate measured whether the disc cache had to be rebuilt.
+#
+# Frame rate does not separate them either: the VS menu's 3D stage preview ran
+# 2,706 draws/s against gameplay's 3,042.
+#
+# So gate 1 now reads the title's OWN top-level state,
+# CActSequence::m_dwNextMethod, via RECOMP_SEQ_REPORT (diagnostics/.../main.c).
+# It is opt-in because it starts a 100 Hz sampler thread and this title
+# punishes instrumentation weight; the run below inherits it from the
+# environment, so:
+#
+#     RECOMP_SEQ_REPORT=1 play_scripted.sh <name> @<pad> <secs>
+#
+# With it off there is no scene verdict, and the script says so rather than
+# guessing from a counter that cannot see the difference.
 echo
 echo "=== did it reach gameplay, and did it play? ==="
 LAST_VOICE=$(grep '\[APU-VOICE\]' "$OUT/stderr.log" | tail -1)
@@ -177,7 +212,6 @@ if [ "$(/usr/bin/python3 -c "print(1 if $GAP_S >= 10 else 0)" 2>/dev/null || ech
 else
     echo "  INPUT:   no poll stall (largest gap ${GAP_S}s)"
 fi
-echo "  NtOpenFile:       $OPENS   (~1342 = title plateau, 1408 = New Game)"
 
 # Gate 0, and it comes first because it invalidates everything below it.
 #
@@ -224,15 +258,48 @@ else
     grep -m1 -E '\[APU\] (Using|XAudio2)' "$OUT/stderr.log" | sed 's/^ *//;s/^/           /'
 fi
 
-# Gate 1: scene.
-if [ "$OPENS" -ge 1400 ]; then
-    echo "  SCENE:   reached New Game."
-    SCENE_OK=1
+# Gate 1: scene, from CActSequence::m_dwNextMethod. See the long note above for
+# why this is no longer the NtOpenFile count.
+#
+# The index groups, all read straight off the dispatch table at 0x0020D2B8 and
+# the `mov [esi+0x48], N` that ends each method:
+#    10-13  title screen            28-31  a story-or-VS mission exists
+#    14-23  title menus             32-35  the tutorial
+#    56-59  the VS menu chain       44-47  the graffiti menu
+#
+# 28-35 is the honest boundary for "reached play": state 30 means a mission
+# ACTION OBJECT exists, which covers the mission's own loading screen, its
+# opening cutscene and its pause menu as well as skating. It separates the menu
+# shell from a mission. It does not separate playing from being paused inside
+# one -- use gate 2 for that.
+SEQ_LINE=$(grep '\[JSRF-SEQ\] now=' "$OUT/stderr.log" | tail -1)
+SEQ_IDX=$(printf '%s' "$SEQ_LINE" | sed -n 's/.*now=\([0-9][0-9]*\).*/\1/p')
+echo "  NtOpenFile:       $OPENS   (boot/cache-build only -- NOT a scene marker)"
+if [ -n "$SEQ_IDX" ]; then
+    printf '%s\n' "$SEQ_LINE" | sed 's/^ */  /'
+    case "$SEQ_IDX" in
+        28|29|30|31|32|33|34|35) SCENE_OK=1 ;;
+        *)                       SCENE_OK=0 ;;
+    esac
+    if [ "$SCENE_OK" -eq 1 ]; then
+        echo "  SCENE:   in a mission or the tutorial (state $SEQ_IDX)."
+    else
+        echo "  SCENE:   NEVER REACHED A MISSION -- ended in state $SEQ_IDX."
+        echo "           The boot prefix did not land, or the schedule stopped in"
+        echo "           a menu. Logo length varies by ten seconds or more between"
+        echo "           runs. Nothing about gameplay, audio uptime or voice"
+        echo "           retirement can be concluded from this run; re-run it."
+        echo "           Read the dwell: list on the line above for where it sat."
+    fi
+elif grep -q '\[JSRF-SEQ\] NO READING' "$OUT/stderr.log"; then
+    grep '\[JSRF-SEQ\] NO READING' "$OUT/stderr.log" | tail -1 | sed 's/^ */  /'
+    echo "  SCENE:   INSTRUMENT FAILED, not measured. The sampler ran and could"
+    echo "           not read CActSequence. Do not score this run."
+    SCENE_OK=0
 else
-    echo "  SCENE:   NEVER LEFT THE TITLE. The boot prefix did not land -- logo"
-    echo "           length varies by ten seconds or more between runs. Nothing"
-    echo "           about gameplay, audio uptime or voice retirement can be"
-    echo "           concluded from this run; re-run it."
+    echo "  SCENE:   NOT MEASURED. Re-run with RECOMP_SEQ_REPORT=1 in the"
+    echo "           environment; the NtOpenFile count above cannot tell a menu"
+    echo "           from gameplay (see the note in this script)."
     SCENE_OK=0
 fi
 
