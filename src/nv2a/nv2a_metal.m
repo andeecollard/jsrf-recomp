@@ -720,7 +720,26 @@ static int hw_state_on(void);
  * attachment's.
  *
  * Verified renderable, blendable and CPU-readable on this device before being
- * written, rather than assumed. RECOMP_METAL_565=1. */
+ * written, rather than assumed.
+ *
+ * MEASURED, pooled over two rounds, both arms on the hardware path so this
+ * isolates the format alone:
+ *
+ *     RECOMP_METAL_565=0   29.63 - 33.55 ms   (n=5, mean 31.87)
+ *     RECOMP_METAL_565=1   26.73 - 27.54 ms   (n=3, mean 27.23)
+ *     ranges do not overlap: 14.5% less frame time
+ *
+ * and again the columns that moved are the ones the mechanism names:
+ *
+ *     submit  9.33 -> 6.03 ms      the per-pixel upload conversion, deleted
+ *     sync    0.73 -> 0.28 ms      the per-pixel readback conversion, deleted
+ *
+ * Both become 16-bit row copies because the attachment is the guest's own
+ * format. vsh moved 9.89 -> 11.72 in the same pair, which is noise: nothing
+ * here touches the vertex stage.
+ *
+ * RECOMP_METAL_565=1. Still default off, with RECOMP_METAL_HW, pending a
+ * person playing it. */
 static int hw_565_on(void)
 {
     static int on = -1;
@@ -1198,6 +1217,12 @@ void nv2a_metal_report(void)
             (unsigned long long)g_hw_pipeline_misses,
             (unsigned long long)g_hw_state_refusals,
             hw_state_on()?"on":"OFF");
+    /* The colour attachment's format, named so an A/B can verify its arms
+     * differ rather than assume the environment took. ab_score.py harvests
+     * this; it could not for RECOMP_METAL_565 and said so. */
+    fprintf(stderr,"[METAL] colour attachment: %s\n",
+            hw_565_on()?"B5G6R5Unorm (metal_565 on)"
+                       :"RGBA32Float (metal_565 OFF)");
     fprintf(stderr,"[METAL] clear discards=%llu (clear_discard %s)\n",
             (unsigned long long)g_mtl_discards,
             g_mtl_discards?"used":"unused");

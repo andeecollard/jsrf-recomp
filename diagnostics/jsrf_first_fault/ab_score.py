@@ -116,7 +116,7 @@ SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)")
 # rather than falling back to "assumes the environment took".
 SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] (reuse=\w+)")
 # The Metal backend names its own state in parentheses, like the APU reports.
-METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_hw \w+)\)")
+METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_(?:hw|565) \w+)\)")
 
 # WHICH TOKEN IN THAT HARVESTED STATE BELONGS TO WHICH SWITCH.
 #
@@ -137,6 +137,7 @@ SWITCH_TOKEN = {
     "RECOMP_APU_REON_HEAD_NOP":    "reon_head_nop",
     "RECOMP_VSH_REUSE":            "reuse",
     "RECOMP_METAL_HW":             "metal_hw",
+    "RECOMP_METAL_565":            "metal_565",
 }
 
 
