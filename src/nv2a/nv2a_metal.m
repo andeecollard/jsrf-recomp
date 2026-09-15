@@ -2186,7 +2186,30 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  if(clip_audit_on())clip_audit(vertices,indices,n,s->clip_w,s->clip_h);
  if(bench_state==2)bench_capture(s,texture,texture_size,target,target_size,depth,depth_size,vertices,count,primitive);
  @autoreleasepool{if(!initialize())return reject("initialization");
-  int use_zeta=s->depth_test||s->stencil_test;uint8_t*next_depth=use_zeta?depth:NULL;uint32_t next_depth_pitch=use_zeta?s->depth_pitch:0;size_t next_depth_size=use_zeta?depth_size:0;
+  /* A DRAW WITH NO DEPTH DOES NOT NEED THE RETAINED DEPTH THROWN AWAY.
+   *
+   * This bound NULL for any draw that neither depth-tests nor stencil-tests,
+   * and NULL then failed the retained-surface test below -- which syncs, reads
+   * the whole surface back, reallocates every texture and re-uploads it. So
+   * every alternation between a depth-using draw and a depth-less one cost a
+   * full surface round trip, measured at about 1.7 per frame at gameplay, and
+   * each one also ends the open batch.
+   *
+   * Keeping the binding is not a shortcut, it is what the state already says:
+   * with depth_test off the compare is forced to ALWAYS, and since depth
+   * writes were gated on the test the write is off too, so an attached depth
+   * buffer is inert for such a draw. The software tail agrees -- p.depth_test
+   * is 0 so it never compares, and p.depth_write is depth_test && depth_write
+   * so it writes dst.a straight back. depth_dirty is likewise only set for
+   * depth_test && depth_write, so nothing marks the buffer dirty either.
+   *
+   * Before anything has been uploaded there is nothing to keep, so the first
+   * draw still takes the upload path and hw_depth_upload(NULL, ...) fills a
+   * depth texture with 1.0 as it always did. */
+  int use_zeta=s->depth_test||s->stencil_test;
+  uint8_t*next_depth      =use_zeta?depth        :(depth_valid?depth_target      :NULL);
+  uint32_t next_depth_pitch=use_zeta?s->depth_pitch:(depth_valid?depth_pitch      :0);
+  size_t next_depth_size  =use_zeta?depth_size   :(depth_valid?depth_target_size :0);
   /* Staging. Anything that fits Metal's 4 KB inline limit still goes through
    * setVertexBytes, which costs no allocation at all; everything larger comes
    * out of the slab ring above in a single contiguous reservation covering
