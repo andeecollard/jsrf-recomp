@@ -21,6 +21,9 @@ int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth);
 /* Read-only: what the backend currently retains, for RECOMP_SURFACE_AUDIT.
  * owed is -1 nothing retained, 0 retained and clean, 1 retained and dirty. */
 void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed);
+
+/* Is the dithered-blend shader path active? RECOMP_METAL_SHADER_BLEND=0 off. */
+int nv2a_metal_shader_blend_on(void);
 /* Stable diagnostic label for the most recent -1 result. */
 const char *nv2a_metal_last_reject(void);
 /* Compact cumulative counters for live performance validation. */

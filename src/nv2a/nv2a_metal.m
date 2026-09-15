@@ -936,8 +936,25 @@ static void hw_depth_readback(uint8_t *zram, unsigned w, unsigned h,
  * quantisation. Everything else pays nothing. */
 static int hw_shader_blend(const NV2ATextureCopy *s)
 {
-    return s->blend && s->dither;
+    /* RECOMP_METAL_SHADER_BLEND=0 restores the defect, in one binary.
+     *
+     * The fix re-introduces raster_order_group(0) for these draws, and every
+     * frame-time number this renderer has predates it -- so the cost has to be
+     * A/B-able without rebuilding, and so does the image. =0 puts the dither
+     * back on the wrong side of the blend, which is the "before" picture.
+     *
+     * A VALUE, not presence: =0 has to mean off, which is the whole point of
+     * an arm. The state is printed in the [METAL] report so ab_score.py can
+     * verify the two arms actually differed. */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_METAL_SHADER_BLEND");
+                  on = e ? (atoi(e) != 0) : 1; }
+    return on && s->blend && s->dither;
 }
+
+int nv2a_metal_shader_blend_on(void)
+{ NV2ATextureCopy probe; memset(&probe, 0, sizeof probe);
+  probe.blend = 1; probe.dither = 1; return hw_shader_blend(&probe); }
 
 /* THE SELECTOR IS PART OF THE KEY. Two draws with identical blend state but
  * differing dither need DIFFERENT pipelines now -- one with the blend unit
@@ -1334,6 +1351,10 @@ void nv2a_metal_report(void)
      * and a mixed frame -- some draws writing depth to the attachment, the
      * rest to the colour alpha -- reads as a depth bug rather than as a
      * fallback, which is exactly how this was first misread. */
+    fprintf(stderr,"[METAL] shader blend for dithered blended draws: %s "
+            "(metal_shader_blend %s)\n",
+            nv2a_metal_shader_blend_on()?"on":"OFF",
+            nv2a_metal_shader_blend_on()?"on":"OFF");
     fprintf(stderr,"[METAL] hw draws=%llu pipelines=%llu refusals=%llu (metal_hw %s)\n",
             (unsigned long long)g_hw_draws,
             (unsigned long long)g_hw_pipeline_misses,
