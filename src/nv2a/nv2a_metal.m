@@ -558,6 +558,15 @@ static NSString *const shader =
   * with writing something else into alpha only because it had already done the
   * blend itself by that point -- and it wrote depth there, which is the whole
   * reason this path exists. */
+ /* NO CHANNEL SWAP, and that was worth measuring rather than reasoning about.
+  *
+  * Metal's only packed 16-bit target is named B5G6R5Unorm, which reads as
+  * blue-in-the-high-bits where the guest's RGB565 puts red there. A swap was
+  * written on that reading and scored 38060 of 65536 pixels wrong at up to 27
+  * channel steps -- not a rounding difference, channels in the wrong place.
+  * Removing it: 697 pixels, worst error ONE step. Metal's packed-format names
+  * run from the least significant bits up, so B5G6R5 already IS the guest's
+  * layout and the attachment can hold its words verbatim. */
  " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
@@ -693,6 +702,35 @@ unsigned long long g_hw_draws;
  * fault rate in the OHCI path is ~11.8%, one fault at n=3 is not evidence
  * either way. A default flip here wants a person playing it, the same gate
  * RECOMP_METAL_BATCH is still waiting on. */
+static int hw_state_on(void);
+
+/* A true RGB565 colour attachment: two bytes a pixel against sixteen.
+ *
+ * It is what xemu allocates for a 565 guest surface on both of its backends
+ * (GL_RGB565, VK_FORMAT_R5G6B5_UNORM_PACK16) and what the software rasteriser
+ * already blends at, so it is the faithful choice rather than merely the cheap
+ * one -- and it removes the double rounding a wider attachment forces, because
+ * the attachment IS the guest format. Upload and readback stop converting and
+ * become 16-bit copies.
+ *
+ * Only available on the hardware path: the legacy one still packs depth into
+ * the colour alpha, and this format has no alpha at all. That is also why it
+ * costs nothing here -- DST_ALPHA factors are already refused by the shared
+ * accept test, and SRC_ALPHA comes from the fragment's own alpha, not the
+ * attachment's.
+ *
+ * Verified renderable, blendable and CPU-readable on this device before being
+ * written, rather than assumed. RECOMP_METAL_565=1. */
+static int hw_565_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_METAL_565");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on && hw_state_on();
+}
+
 static int hw_state_on(void)
 {
     static int on = -1;
@@ -830,7 +868,8 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
      * attachment IS the guest format -- and it is exactly what xemu allocates.
      * It is only available on this path, because the legacy one still needs
      * alpha for depth. */
-    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+    d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
+                                                    : MTLPixelFormatRGBA32Float;
     /* SEPARATE depth and stencil textures, not a combined format. Measured on
      * this host before choosing: Depth32Float, Stencil8 and
      * Depth32Float_Stencil8 all accept MTLStorageModeShared and all accept
@@ -1369,8 +1408,18 @@ int nv2a_metal_sync(void)
         size_t pixels=(size_t)surface_width*surface_height;
         float *rgba=malloc(pixels*16);
         if(!rgba)return 0;
-        [surface getBytes:rgba bytesPerRow:surface_width*16 fromRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0];
-        if(surface_dirty) {
+        int fmt565=hw_565_on();
+        [surface getBytes:rgba bytesPerRow:surface_width*(fmt565?2:16) fromRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0];
+        if(surface_dirty&&fmt565) {
+            /* Straight back out, no conversion and no rounding -- which is the
+             * whole point: a wider attachment has to round twice, here and
+             * again at the 565 grid. */
+            ++sync_color;
+            const uint16_t*w16=(const uint16_t*)rgba;
+            for(unsigned y=0;y<surface_height;++y)
+                memcpy(surface_target+(size_t)y*surface_pitch,w16+(size_t)y*surface_width,(size_t)surface_width*2);
+            surface_dirty=0;
+        } else if(surface_dirty) {
             ++sync_color;
             for(unsigned y=0;y<surface_height;++y) for(unsigned x=0;x<surface_width;++x) {
                 size_t at=((size_t)y*surface_width+x)*4;
@@ -1831,10 +1880,19 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
   if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
-   ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
+   ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;float*rgba=malloc(pixels*16);uint8_t*stencil=malloc(pixels);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
+   if(hw_565_on()){
+    /* The attachment is the guest's format, so there is nothing to convert:
+     * copy the rows in and let the shader's channel swap put each component
+     * where the hardware will pack it back. */
+    uint16_t*w16=(uint16_t*)rgba;
+    for(unsigned y=0;y<surface_height;y++)
+     memcpy(w16+(size_t)y*surface_width,target+(size_t)y*surface_pitch,(size_t)surface_width*2);
+    [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:w16 bytesPerRow:surface_width*2];
+   }else
    for(unsigned y=0;y<surface_height;y++)for(unsigned x=0;x<surface_width;x++){const uint8_t*p=target+(size_t)y*surface_pitch+x*2;unsigned c=p[0]|(unsigned)p[1]<<8;size_t at=((size_t)y*surface_width+x)*4;rgba[at]=(float)(c>>11)/31;rgba[at+1]=(float)((c>>5)&63)/63;rgba[at+2]=(float)(c&31)/31;if(next_depth){const uint8_t*z=next_depth+(size_t)y*next_depth_pitch+x*4;uint32_t q=(uint32_t)z[1]|(uint32_t)z[2]<<8|(uint32_t)z[3]<<16;rgba[at+3]=(float)q/16777215;stencil[(size_t)y*surface_width+x]=z[0];}else{rgba[at+3]=1;stencil[(size_t)y*surface_width+x]=0;}}
-   [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
+   if(!hw_565_on())[surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
    /* The real attachments are built from the same guest bytes, at the same
     * moment, so the two paths start from identical depth. If this fails the
     * textures are left nil and every draw below falls back to the software
