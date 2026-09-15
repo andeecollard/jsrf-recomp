@@ -68,7 +68,22 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD="${JSRF_BUILD:-$ROOT/build-macos/jsrf-first-fault/build-feav}"
 BIN="$BUILD/jsrf_metal_batch_test"
 
+COPY="$BUILD/jsrf_metal_copy_test"
+
 [ -x "$BIN" ] || { echo "no $BIN -- build the jsrf_metal_batch_test target" >&2; exit 1; }
+[ -x "$COPY" ] || { echo "no $COPY -- build the jsrf_metal_copy_test target" >&2; exit 1; }
+# WHICH BUILD DID THIS SCORE? Say so, and default to the same one as its
+# siblings. metal_batch_check.sh defaulted to .../build while
+# metal_hw_check.sh defaulted to .../build-feav, so the two gates over the same
+# binary read different build trees -- and during the 15 Sep review the first
+# scored a day-old binary and reported a retracted figure as current. Stating
+# the path and its timestamp makes that visible in the output instead of
+# invisible in a default.
+say_build() {
+    printf 'build: %s\n' "$BUILD"
+    printf 'binary: %s (%s)\n' "$1" "$(date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown mtime')"
+}
+say_build "$BIN"
 
 # The test prints one line per scored phase:
 #   "... differs from the software rasteriser on N of M pixels and Z of Y depth
@@ -126,6 +141,39 @@ for phase in "batch:phase A, one surface" "swap:phase F, three surfaces"; do
         fi
     done
 done
+
+# THE STRICTER ORACLE, WHICH NOTHING WAS RUNNING.
+#
+# metal_copy_test compares the Metal backend against the rasteriser with an
+# exact memcmp -- no tolerance at all -- across the states a mission actually
+# uses and metal_batch_test never sets: register combiners (one stage and two),
+# alpha test, stencil with a real func and real ops, multi-texture, DXT1, DXT3,
+# mip selection, untextured draws and dither. It is built on Apple but
+# registered with nothing: it needs a real GPU, so it is out of ctest, and no
+# check script ran it. So the broadest state coverage in the tree was sitting
+# unexecuted while the narrowest was gating the renderer.
+#
+# Run across the same three arms it answers the question metal_batch_test
+# cannot: both hardware arms pass byte-exactly, and the software arm fails at
+# its line 49 -- a depth readback mismatch after a depth-tested draw, known and
+# tracked, and the reason this is not a plain "all arms must pass".
+#
+# The rule is a ratchet on the hardware arms: they pass today, so a change that
+# breaks combiners, stencil or multi-texture on them fails here in a second
+# rather than surviving to a mission.
+echo "exact-match state coverage (metal_copy_test)"
+copy_arm() {
+    if RECOMP_METAL_HW="$2" RECOMP_METAL_565="$3" "$COPY" >"${TMPDIR:-/tmp}/jsrf-copy-$2-$3.txt" 2>&1; then
+        printf '  %-22s exact match against the rasteriser\n' "$1"
+        return 0
+    fi
+    printf '  %-22s FAILED: %s\n' "$1" \
+        "$(grep -v 'native raster' "${TMPDIR:-/tmp}/jsrf-copy-$2-$3.txt" | head -1)"
+    return 1
+}
+copy_arm "software state" 0 0 || echo "  (known: the software path's depth readback, tracked separately)"
+copy_arm "hardware state" 1 0 || status=1
+copy_arm "hardware + 565"  1 1 || status=1
 
 [ "$status" -eq 0 ] && echo "PASS: no arm is further from the oracle than the software path"
 exit $status
