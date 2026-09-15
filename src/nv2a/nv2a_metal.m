@@ -765,6 +765,33 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = hw_vs; d.fragmentFunction = hw_fs;
+    /* STILL RGBA32Float, and this is a measured decision rather than an
+     * oversight. Depth left the alpha channel, so the colour target no longer
+     * NEEDS float precision, and narrowing it is the obvious next win: 16
+     * bytes a pixel for a surface the guest thinks is two.
+     *
+     * Both narrower formats were built and scored against the oracle:
+     *
+     *     RGBA32Float      1 of 65536 pixels differ
+     *     RGBA16Unorm     24
+     *     RGBA8Unorm    5705
+     *
+     * The initial RGB565 round trip is exact in all three -- the cost is
+     * INTERMEDIATE. Overlapping blended draws read the attachment back and
+     * blend again, and every such step requantises at the attachment's
+     * precision, where the float target kept them exact. At 8 bits that is
+     * plainly visible; at 16 it is 24 pixels of tie-break rounding.
+     *
+     * 24 in 65536 is small, and the bandwidth win is 2x, and that trade may
+     * well be right -- but it has not been measured that the colour attachment
+     * is where this frame is spending its time, and trading accuracy for an
+     * unmeasured win is how this project has gone wrong before. Revisit with
+     * a frame profile, not with an argument.
+     *
+     * Worth noting for whoever does: real NV2A blends at framebuffer
+     * precision, which is RGB565. If that is right then RGBA8 is the FAITHFUL
+     * choice and the software rasteriser is the wrong oracle for this one
+     * question. Settling that needs hardware or xemu, not a preference. */
     d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
     /* SEPARATE depth and stencil textures, not a combined format. Measured on
      * this host before choosing: Depth32Float, Stencil8 and
