@@ -1,0 +1,218 @@
+HANDOVER, 15 Sep 2026 (late)
+SIX DEFECTS FIXED, MEASURED, AND THE PICTURE IS STILL WRONG
+
+Supersedes REVIEW_RESPONSE_2026-09-15_THE_GATE_NEVER_TESTED_DEPTH.txt, which
+supersedes REVIEW_2026-09-15_WHAT_TO_TRUST_AND_WHAT_TO_CHECK.txt. Read section
+1 before anything else; it is the reason not to trust the rest as progress.
+
+State: 51 commits unpushed on main, tree clean, ctest 31/31, metal_hw_check
+PASS, metal_batch_check IDENTICAL.
+
+
+1. THE HEADLINE
+================
+RECOMP_METAL_HW=1 still renders the game wrong. Six real defects were found,
+fixed and measured today, each with a test that fails without it, and a person
+playing the game reports the picture is still visibly corrupted: scattered
+black fragments and speckle on textured surfaces during gameplay.
+
+Do not read the six fixes as progress toward the artefact. They are six
+correctness bugs that happened to be in the same subsystem. The artefact is
+unexplained.
+
+The switch is still default OFF. Nothing here changes that.
+
+
+2. WHAT WAS FIXED, AND HOW IT IS KNOWN
+=======================================
+  1. THE BATCHED HARDWARE PATH DREW INTO AN ENDED ENCODER. batch_flush() ran
+     after `encoder` was bound, so every draw after it encoded into a committed
+     command buffer. RECOMP_METAL_HW=1 with RECOMP_METAL_BATCH=1 segfaulted on
+     its first draw. No gate crossed the two switches, so nothing saw it. This
+     mattered beyond the crash: it made the configuration that fixes defect 5
+     unreachable.
+
+  2. THE DITHER WAS APPLIED ON THE WRONG SIDE OF THE BLEND. fs() does
+     blend-then-dither, which is what the NV2A and nv2a_texture_copy.c do;
+     fs_hw handed the biased colour to the fixed-function blend unit instead.
+     8192 of 65536 pixels wrong on the dither matrix's own 4x4 lattice, where
+     the software path scored 0. Fixed with a third pipeline, fs_hw_blend,
+     selected only for draws that both blend and dither.
+
+  3. THE DEPTH/STENCIL STATE CACHE KEYED ON NINE FIELDS AND ITS DESCRIPTOR READ
+     ELEVEN. stencil_zfail and stencil_func_mask were absent from the key, so
+     two draws differing only in one of those were served whichever state was
+     built first. 8056 of 65536 pixels against the software path's 5.
+
+  4. DEPTH WRITES WERE NOT GATED ON THE DEPTH TEST. depthWriteEnabled read
+     depth_write alone while the fragment tail derives depth_test &&
+     depth_write. An overlay with the mask still set stamped depth over
+     everything it covered here and nothing on the other path.
+
+  5. ONE RENDER PASS PER DRAW, RACING ON TILE MEMORY. Every draw was its own
+     render pass and command buffer: load the surface into tile memory, draw,
+     store it back. 80.7 command buffers per frame with 664,933 of 781,703
+     starting before the previous one ended. Each 64x64 tile kept whichever
+     buffer stored it last -- a mosaic of moments, which is what a person
+     watching it called the background being cut and jumbled. Batching by
+     default took grid-aligned seams from 17.0x chance to 0.0x.
+
+  6. THE SURFACE WAS TORN DOWN ON EVERY SWAP. The backend retained one surface
+     and the title uses three (measured: RECOMP_SURFACE_AUDIT reports 3
+     distinct colour surfaces, with the named surface differing from the held
+     one at 55% of flips). 12,448 readback-reallocate-re-upload round trips per
+     run, about 18% of runtime. Now a swap back is a rebind.
+
+Also fixed: nv2a_metal_discard dropped the retained surface without reading it
+back and without being told which surface the guest was clearing (24,848 of
+65536 pixels of finished rendering lost, default off); and the sink now asks
+the shared blend accept test rather than its own enum map, so the two lists
+cannot drift.
+
+
+3. WHAT HAS BEEN ELIMINATED, AND WHY THAT IS SOLID
+===================================================
+  THE TEXTURE PATH, BY CONSTRUCTION. shade() -- texture fetch, mip LOD
+  selection, register combiners -- is shared byte for byte between the two
+  fragment tails, as are the Params it reads and the texture buffers it
+  samples. A bug there would appear on the software path too, and the software
+  path is clean at gameplay. This rules out every texture-shaped suspect
+  without needing a run: wrong texels, mip selection, DXT decode, the texture
+  cache.
+
+  THE BLEND UNIT AND FRAGMENT ORDERING. RECOMP_METAL_SHADER_BLEND=2 routes
+  every blended draw through fs_hw_blend, which blends in-shader under
+  raster_order_group(0) while keeping the real depth and stencil attachments.
+  The speckle is unchanged.
+
+  MISSING OR SILENTLY-IGNORED PIPELINE STAGES. Written out stage by stage:
+  every stage is implemented or refused by name, and there is no third
+  category. nv2a_texture_copy_prepare refuses about thirty states -- fog, logic
+  op, colour write mask, texture address modes, texture filter and format,
+  polygon offset, window clip, multisample. And the refusal path never fires
+  for this title: prepared=750558 rejected=0, with 0 batches and 0 triangles on
+  the CPU rasteriser.
+
+  PER-DRAW TRANSLATION. metal_copy_test compares the backend against the
+  rasteriser with an exact memcmp across combiners at one and two stages, alpha
+  test, stencil with real ops, multi-texture, DXT1, DXT3, mip selection,
+  untextured draws and dither. Both hardware arms match exactly.
+
+
+4. WHAT IS LEFT
+================
+The real DEPTH attachment and the real STENCIL attachment, and whatever remains
+of fs_hw's own behaviour (the z_cull branch, discard_fragment versus returning
+the untouched destination).
+
+The symptom agrees for the first time: the speckle is BLACK -- pixels where
+nothing was written and the clear colour shows through. That is fragments being
+rejected, which is the depth or stencil unit, not anything to do with colour.
+
+RECOMP_METAL_HW_DEPTH_ALWAYS=1 and RECOMP_METAL_HW_NO_STENCIL=1 exist for
+exactly this bisect. Both arms were started twice and killed twice by my own
+runs competing for the binary. THEY HAVE NOT BEEN RUN TO A USABLE RESULT. That
+is the next thing.
+
+An earlier run of those two arms was reported as "still broken". That result is
+VOID: it was scored with a black-pixel metric that was counting letterboxing
+and intro art.
+
+
+5. HOW TO MEASURE THIS, WHICH IS THE EXPENSIVE LESSON
+======================================================
+WHAT WORKS: comparing MATCHED SURFACES by eye. A flat wall on the hardware path
+against a flat wall on the software path, magnified. It has separated the two
+paths every time it has been used, in about a minute.
+
+WHAT ALSO WORKS: a structural signature that scene content cannot have. The
+tile metric in fb_score.py measures how many strong seams land on a grid
+boundary against what chance would give, as a ratio inside one frame. That is
+why it works where nothing else did: it needs no matched scene.
+
+WHAT DOES NOT WORK, AND WAS TRIED SIX TIMES: any generic image statistic
+compared across arms. speckle in three versions, temporal flicker, dark-blob
+counting, black-pixel counting. All of them failed for ONE reason: the two
+paths run at different speeds, a fixed pad schedule lands them in different
+places, and a statistic over different pictures measures the pictures. Four of
+them ranked the KNOWN-GOOD software path as the worst arm, which is the metric
+telling you it is broken.
+
+DETERMINISM DOES NOT SURVIVE FAR ENOUGH TO HELP. The two paths render the boot
+logos bit-identically, but they diverge in TIMING within about ten seconds, and
+from then on matched capture indices hold different moments. A promising idea
+-- diff the deterministic intro -- produced 46 "identical" frames that turned
+out to be a static logo on a flat background, and whole-frame differences as
+soon as the sequence had any content in it. Do not spend time here again
+without first solving the timing drift.
+
+THE ARTEFACT IS LOAD-DEPENDENT. Device tests submit a few hundred draws and
+read back immediately, so the GPU is never behind the producer.
+metal_batch_test's own header says its first ring phase was "toothless" for
+exactly that reason; the sentence is true of the whole file. A gate that cannot
+get the GPU behind cannot see this class of defect. That is why every gate
+passed for weeks on a renderer a person could see was wrong.
+
+
+6. INSTRUMENTS BUILT TODAY
+===========================
+  fb_score.py          scores dumped frames. `tile` is validated and is the
+                       metric that found the mosaic. `speckle`, `temporal` and
+                       `specks` are NOT validated -- they detect their injected
+                       artefacts in --selftest and do not measure the real one.
+                       The file says so at the top; do not quote them.
+  sample_window.sh     records the window at the display's frame rate and
+                       extracts every frame. NOTE: macOS revoked Screen
+                       Recording for the terminal mid-session and it then
+                       captures black. RECOMP_FB_DUMP needs no permission.
+  RECOMP_SURFACE_AUDIT counts, per clear and per flip, whether the surface the
+                       guest names is the one the backend holds and whether
+                       that one owes guest RAM unsaved rendering.
+  RECOMP_METAL_HW_DEPTH_ALWAYS, RECOMP_METAL_HW_NO_STENCIL,
+  RECOMP_METAL_SHADER_BLEND=0/2, RECOMP_METAL_SURFACE_CACHE=0
+                       bisect arms, each neutering one difference from the
+                       software path. They render incorrectly by construction.
+  recomp_switch.h      one predicate for opt-in switches, with a test. Ten
+                       behavioural switches were presence-tested, so =0 turned
+                       them ON -- RECOMP_PB_EXEC among them.
+
+
+7. OPEN, RANKED
+================
+  1. RUN THE DEPTH AND STENCIL BISECT ARMS TO A RESULT. One run each, compared
+     by magnified matched surface against the software path. This is the whole
+     remaining search space.
+  2. FRAME TIME IS UNVERIFIED. The 9.6% for the hardware path and the 14.5% for
+     565 both predate batching, the dither fix's raster_order_group and the
+     surface cache. An A/B of RECOMP_METAL_BATCH lost one arm to boot attrition
+     and returned no comparison. Treat both figures as unverified, not wrong.
+  3. THE DEFAULT FLIP HAS NEVER BEEN RUN WITH THE VARIABLE UNSET. Every clean
+     capture passed RECOMP_METAL_BATCH=1 explicitly.
+  4. metal_copy_test line 49 -- the software path's depth readback is now the
+     only arm failing an exact comparison.
+  5. A rejected draw is DROPPED, not CPU-rasterised (nv2a_pb_exec.c:2944), and
+     is counted in neither gpu_fallbacks nor cpu_batches. JSRF never triggers
+     it; a title using fog or a colour mask would lose geometry silently.
+  6. The presenter reads s_snap while snapshot_surface() writes it, with no
+     lock, and can realloc it underneath. Never verified.
+
+
+8. A NOTE ON HOW THIS SESSION WENT
+===================================
+The useful findings came from a person watching the screen and saying what they
+saw: that gameplay is worse than the intro, that characters and text are
+unaffected while the world is not, that the black bars in the intro are graphic
+elements, that the pattern looks granular, and that the window could be sampled
+directly. Each of those redirected the search more than anything measured.
+
+Against that, several claims in earlier notes were made before being checked
+and had to be withdrawn: a 64-pixel alignment found by a search that only
+looked at multiples of 64; a depth-precision mechanism that does not exist,
+because both paths compare an interpolated value against the same CPU-computed
+q/16777215; "the same class at finer granularity", from a magnified image whose
+seam spacings are in fact irregular; "the granular noise is not a hardware-path
+artefact", from a metric that ranked the known-good path worst; and a bit-exact
+intro comparison that was comparing a static logo.
+
+The rule that would have prevented all five: run the check before writing the
+claim. It is the same rule the first review handover was written to enforce.
