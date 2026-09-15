@@ -474,3 +474,70 @@ the shape (the lattice), then write it down.
      arm failing an exact comparison.
   8. ab_score.py's SWITCH_TOKEN covers seven switches; RECOMP_METAL_BATCH is an
      A/B arm that is not among them.
+
+13. THE RENDERER REVIEW, AND WHAT THE RUNS COULD NOT REACH
+===========================================================
+THE DITHER FIX DID NOT FIX THE PICTURE. It is a real defect and it is measured
+-- 8192 of 65536 pixels on the dither lattice, software path 0, now 0 on both
+-- but a person watching the game reports the artefact unchanged with it in.
+Section 10 stands as a correctness fix and is retracted as an explanation.
+
+WHAT THE ARTEFACT ACTUALLY IS, measured from dumped frames rather than from a
+description: large black regions, not a 4x4 lattice. Matched capture index,
+same scene, RECOMP_FB_DUMP_FLIP:
+
+    HW=0 (default)              165 black pixels of 307200
+    HW=1, 565=0              30,705
+    HW=1, 565=1              22,412
+    HW=1 + depth ALWAYS      50,131
+    HW=1 + no stencil        32,885
+    HW=1 + all blends in-shader, ordered   20,144
+
+So it is RECOMP_METAL_HW itself, not the 565 attachment, and it is not the
+depth unit, the stencil unit, the blend unit or the fragment ordering -- each
+was neutered in its own run and the regions stayed. The default path renders
+the same frame essentially perfectly.
+
+I also over-read one frame: black runs in it started on a 32-pixel boundary 27%
+of the time, which I called tile alignment. The other frames read 0-7%, which
+is chance. It is not tile-aligned; it is large regions.
+
+WHAT READING FOUND THAT FIVE RUNS DID NOT. Neither defect is a stage that can
+be switched off, which is why the bisect could not reach them:
+
+  * THE DEPTH/STENCIL STATE CACHE KEYED ON NINE FIELDS AND ITS DESCRIPTOR READ
+    ELEVEN. stencil_zfail feeds depthFailureOperation, stencil_func_mask feeds
+    readMask, and neither was in the key, so two draws differing only in one of
+    those were served whichever state was built first. Hardware path only: the
+    software tail takes all eleven per draw and caches nothing. Measured at
+    8056 of 65536 pixels against the software path's 5. Fixed, phase I.
+
+  * DEPTH WRITES WERE NOT GATED ON THE DEPTH TEST. depthWriteEnabled read
+    depth_write alone while the fragment tail derives depth_test && depth_write
+    and depth_dirty is marked on the same pair. With the test off cmp is
+    already ALWAYS, so an overlay with the mask still set stamped depth over
+    everything it covered here and over nothing on the other path -- and
+    depth_dirty was not set, so it was never read back and the next surface
+    swap re-uploaded over it from stale guest RAM. Fixed, phase H.
+
+A THIRD, RECORDED NOT FIXED: nv2a_texture_copy_blend_factor_supported allows
+eight blend factors and the software bfactor implements exactly those eight,
+but nv2a_metal_blend_factor maps three more -- DST_ALPHA, ONE_MINUS_DST_ALPHA
+and SRC_ALPHA_SATURATED. Not reachable today, because the accept test refuses
+them before the sink sees them. It is a drift hazard rather than a bug: widen
+the accept test and the hardware path will blend against an alpha channel that
+holds the shaded alpha, or depth immediately after an upload, or does not exist
+at all under 565, while the software path's bfactor falls through to default.
+nv2a_metal_state.c is deliberately standalone for upstreaming, so it should not
+learn about the accept test; the two lists want a comment pointing at each
+other, or one shared table.
+
+STILL UNEXPLAINED: the black regions. Everything above is real and none of it
+is yet shown to be the cause. The instruments to carry on with are committed:
+RECOMP_METAL_HW_DEPTH_ALWAYS, RECOMP_METAL_HW_NO_STENCIL,
+RECOMP_METAL_SHADER_BLEND=0/2, and a [METAL] count of draws that took the
+software tail while the hardware path was on -- a mixed frame that reject()
+never sees and refusals= never showed. That last counter is built and HAS NOT
+BEEN RUN; it is the next thing to look at, because the depth-ownership comment
+in nv2a_metal.m already describes its symptom as "every differing pixel had
+software 0x000000 against hardware 0xFFFFFF".
