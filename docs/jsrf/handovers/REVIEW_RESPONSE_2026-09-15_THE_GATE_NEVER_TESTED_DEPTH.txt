@@ -850,3 +850,42 @@ reports surface re-uploads and RECOMP_METAL_CB_STATS reports flushes and
 draws-per-flush. If flushes per frame are in the thousands, the churn is the
 mechanism and the fix is to stop tearing the surface down for a draw that
 simply has no depth buffer.
+
+
+19. A MAGNITUDE I GOT WRONG, AND WHAT THE COUNTERS ACTUALLY SAY
+================================================================
+CORRECTED: "a gameplay frame issues tens of thousands of render passes". It
+does not. Measured, on the per-draw path at gameplay:
+
+    command buffers          781,703 over 9,688 frames  =  80.7 per frame
+    of those, overlapping    664,933                    =  85% of them
+    draws                    315,448 over the run       =  about 40 per frame
+    surface re-uploads       13,543                     =  about 1.7 per frame
+    ring                     267,621 reservations, 11,509 wraps,
+                             0 waits, 0 fallbacks
+
+About eighty command buffers a frame, not tens of thousands. The figure appears
+in section 16, in the batch_on() comment and in two commit messages, and it is
+wrong by roughly five hundred times.
+
+THE MECHANISM IS UNAFFECTED. Eighty render passes a frame, each loading and
+storing a whole surface through tile memory, with 85% of them starting before
+the previous one ended, is ample to produce the tile races -- and the fix
+measured 17.0x enrichment down to 0.0x. What was wrong was the scale of the
+number, not the argument it supported. The two counters are also a consistency
+check on each other: 781,703 command buffers at 80.7 per frame is 9,688 frames,
+and 664,933 of them overlapping is the 85% above.
+
+AND IT WEAKENS MY OWN NEXT HYPOTHESIS. Section 18 nominated the use_zeta churn
+as the reason the residual specks survive batching, on the guess that a frame
+alternates between depth-using and depth-less draws often enough to end a batch
+constantly. It does not: surface re-uploads run at about 1.7 per frame. With
+batching on, the flushes per frame should therefore be a handful, not
+thousands, and a race between a handful of command buffers is a much poorer
+explanation for specks scattered across a flat wall.
+
+WHAT TO MEASURE INSTEAD, and it is one number: command buffers per frame on the
+BATCHED path, from the same RECOMP_METAL_CB_STATS line. If it is a handful,
+the residual is not the same race and needs its own explanation. If it is still
+dozens, something is ending batches far more often than the surface churn
+accounts for, and that something is the lead.
