@@ -338,6 +338,20 @@ void mcpx_apu_voice_events_report(void)
     fflush(stderr);
 }
 
+/* Idle-voice traps, by handle, and the last sixteen raised.
+ *
+ * The guest's DirectSound ISR takes this handle, looks up its own voice object
+ * and dereferences it -- and 20 of the 33 genuine faults on this host are that
+ * dereference finding NULL. A live stack walk has since put 0x001A2450 and
+ * 0x001A2031 on the faulting thread's stack, which are that ISR's frames. What
+ * is NOT established is whether the trap is raised for a voice the title has
+ * already torn down; this records what we last asked the guest to service so a
+ * crash can be read against it. */
+unsigned long g_idle_trap_raises;
+unsigned long g_idle_trap_by_voice[MCPX_HW_MAX_VOICES];
+uint16_t g_idle_trap_last[16];
+unsigned long g_idle_trap_ring;
+
 unsigned long g_apu_voice_on_count;
 unsigned long g_apu_voice_off_count;
 unsigned long g_apu_voice_release_count;
@@ -1990,6 +2004,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * re-raising it for the SAME voice every frame is what produced
                  * 217 traps per retirement. */
                 if (!trap_held) {
+                    g_idle_trap_raises++;
+                    if (v < MCPX_HW_MAX_VOICES) g_idle_trap_by_voice[v]++;
+                    g_idle_trap_last[g_idle_trap_ring & 15u] = (uint16_t)v;
+                    g_idle_trap_ring++;
                     fe_method(d, SE2FE_IDLE_VOICE, v);
                     if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
                             NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {

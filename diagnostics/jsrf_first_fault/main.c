@@ -3619,6 +3619,28 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
                     g_esp, (uint32_t)XBOX_STACK_BASE, XBOX_STACK_TOP);
         }
     }
+    /* What the APU last asked the guest to service. Printed HERE and not only
+     * by the periodic report, because waiting for a run that both crashes and
+     * has the report land at the right moment is a worse experiment than making
+     * the crash carry its own evidence -- three runs in a row failed to produce
+     * one. Same ring-read rule as the periodic report: slot 0 is the oldest
+     * until the ring wraps. */
+    {
+        extern unsigned long g_idle_trap_raises, g_idle_trap_ring;
+        extern uint16_t g_idle_trap_last[];
+        if (g_idle_trap_raises) {
+            unsigned long r = g_idle_trap_ring;
+            unsigned i, n = r < 16u ? (unsigned)r : 16u;
+            unsigned base = r < 16u ? 0u : (unsigned)(r & 15u);
+            fprintf(stderr, "\nLAST IDLE-VOICE TRAPS RAISED (%lu total),"
+                            " oldest first:\n  ", g_idle_trap_raises);
+            for (i = 0; i < n; ++i)
+                fprintf(stderr, " v%u",
+                        (unsigned)g_idle_trap_last[(base + i) & 15u]);
+            fprintf(stderr, "\n  The guest ISR dereferences its own object for"
+                            " the handle it is handed.\n");
+        }
+    }
     fprintf(stderr, "=======================================\n");
     fflush(stderr);
 

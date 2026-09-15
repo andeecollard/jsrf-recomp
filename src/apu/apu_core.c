@@ -687,6 +687,51 @@ void mcpx_apu_frame_report(void)
             g_apu_trap_episodes ? (double)g_apu_frames_trapped
                                   / (double)g_apu_trap_episodes : 0.0,
             g_apu_trapped_run_max, ms, g_apu_lock_handoffs);
+    {
+        extern unsigned long g_idle_trap_raises, g_idle_trap_ring;
+        extern unsigned long g_idle_trap_by_voice[];
+        extern uint16_t g_idle_trap_last[];
+        if (g_idle_trap_raises) {
+            unsigned seen[8];
+            unsigned i, k, shown = 0, distinct = 0;
+            /* The BUSIEST handles, not the lowest-numbered: taking the first
+             * eight hid v71 entirely while it was saturating the ring. */
+            for (i = 0; i < MCPX_HW_MAX_VOICES; ++i)
+                if (g_idle_trap_by_voice[i]) ++distinct;
+            fprintf(stderr, "  [APU-IDLE] %lu idle-voice traps raised over %u"
+                            " distinct voices; busiest:",
+                    g_idle_trap_raises, distinct);
+            for (shown = 0; shown < 8; ++shown) {
+                unsigned long best = 0; unsigned bi = 0; int found = 0;
+                for (i = 0; i < MCPX_HW_MAX_VOICES; ++i) {
+                    int already = 0;
+                    for (k = 0; k < shown; ++k) if (seen[k] == i) already = 1;
+                    if (already || !g_idle_trap_by_voice[i]) continue;
+                    if (!found || g_idle_trap_by_voice[i] > best) {
+                        best = g_idle_trap_by_voice[i]; bi = i; found = 1;
+                    }
+                }
+                if (!found) break;
+                seen[shown] = bi;
+                fprintf(stderr, " v%u=%lu", bi, best);
+            }
+            fprintf(stderr, "\n  [APU-IDLE]   last handles:");
+            {   /* Slot 0 is the oldest UNTIL THE RING WRAPS; only afterwards is
+                 * it at (ring & 15). Reading the wrapped form unconditionally
+                 * prints slots the ring has never reached -- and those are
+                 * zero, and zero is a valid voice handle, so untouched memory
+                 * reads as "every trap was for voice 0". That happened, and it
+                 * corroborated exactly the hypothesis being tested. */
+                unsigned long r = g_idle_trap_ring;
+                unsigned n2 = r < 16u ? (unsigned)r : 16u;
+                unsigned base = r < 16u ? 0u : (unsigned)(r & 15u);
+                for (i = 0; i < n2; ++i)
+                    fprintf(stderr, " %u",
+                            (unsigned)g_idle_trap_last[(base + i) & 15u]);
+            }
+            fprintf(stderr, "   (oldest first)\n");
+        }
+    }
     fflush(stderr);
 }
 
