@@ -72,6 +72,7 @@ static uint8_t textures[TEXTURES][TEX_BYTES];
 static uint8_t targetA[TARGET_BYTES], targetB[TARGET_BYTES];
 static uint8_t depthA[DEPTH_BYTES],  depthB[DEPTH_BYTES];
 static uint8_t oracle[TARGET_BYTES], oracle_z[DEPTH_BYTES];
+static unsigned oracle_worst, oracle_one_step;
 static float big[BIG_VERTS][16][4];
 
 static FILE *dump;
@@ -168,8 +169,30 @@ int main(int argc, char **argv)
         if (!draw(&s, textures[0], targetA, depthA, v, 3, "A")) return 1;
     }
     CHECK(nv2a_metal_sync());
-    for (i = 0; i < sizeof oracle; i += 2)
-        if (oracle[i] != targetA[i] || oracle[i+1] != targetA[i+1]) ++oracle_bad;
+    /* COUNT AND MAGNITUDE, because a count alone cannot be acted on.
+     *
+     * This project's stated acceptance rule for a GPU sink is that it "matches
+     * the CPU rasteriser to within one RGB565 channel step" -- the rule the
+     * D3D11 backend was accepted under, where 48% of pixels differed on a
+     * single UNBLENDED draw and every one of them was off by exactly one step.
+     * A bare count cannot distinguish that from a real error, so a narrower
+     * colour attachment looks catastrophic when it may be conforming.
+     *
+     * Per channel, in 565 steps, because that is the unit the rule is written
+     * in: a whole-pixel measure would hide a 1-step red behind a correct green. */
+    for (i = 0; i < sizeof oracle; i += 2) {
+        unsigned o = oracle[i] | (unsigned)oracle[i+1] << 8;
+        unsigned g = targetA[i] | (unsigned)targetA[i+1] << 8;
+        if (o == g) continue;
+        ++oracle_bad;
+        int dr = (int)(o >> 11) - (int)(g >> 11);
+        int dg = (int)((o >> 5) & 63) - (int)((g >> 5) & 63);
+        int db = (int)(o & 31) - (int)(g & 31);
+        if (dr < 0) dr = -dr; if (dg < 0) dg = -dg; if (db < 0) db = -db;
+        int worst = dr > dg ? dr : dg; if (db > worst) worst = db;
+        if (worst > (int)oracle_worst) oracle_worst = (unsigned)worst;
+        if (worst == 1) ++oracle_one_step;
+    }
     for (i = 0; i < sizeof oracle_z; ++i)
         if (oracle_z[i] != depthA[i]) ++oracle_zbad;
     record();
@@ -248,8 +271,10 @@ int main(int argc, char **argv)
     printf("metal batch (%s): %lu triangles over 5 phases "
            "(overlap, ring wrap, texture eviction, surface change, readback); "
            "phase A differs from the software rasteriser on %u of %u pixels "
-           "and %u of %u depth bytes\n",
-           mode, drawn, oracle_bad, W * H, oracle_zbad, (unsigned)sizeof oracle_z);
+           "and %u of %u depth bytes; worst channel error %u step(s), "
+           "%u of the differing pixels are within one\n",
+           mode, drawn, oracle_bad, W * H, oracle_zbad, (unsigned)sizeof oracle_z,
+           oracle_worst, oracle_one_step);
     if (dump) {
         if (ferror(dump)) { fprintf(stderr, "write error on %s\n", argv[1]); return 1; }
         fclose(dump);
