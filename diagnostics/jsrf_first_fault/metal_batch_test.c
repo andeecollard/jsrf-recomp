@@ -368,6 +368,73 @@ int main(int argc, char **argv)
             if (swap_oz[i][b] != swap_z[i][b]) ++swap_zbad;
     }
 
+    /* G -- a full clear of a surface the backend is NOT holding.
+     *
+     * nv2a_metal_discard drops the retained surface without reading it back,
+     * which is sound only when the CPU is about to overwrite THAT surface's
+     * guest memory. clear_surface decides from the clear's parameters and the
+     * currently bound colour offset, and neither says which surface the backend
+     * is holding -- the title swaps between three of them batch by batch, and
+     * the bound offset moves on the register write while the backend's retained
+     * surface only moves on the next DRAW. A clear in that window names one
+     * surface and drops another.
+     *
+     * nv2a_metal_invalidate already takes a target for exactly this reason:
+     * "It used to be one nv2a_gpu_invalidate(NULL) here, which flushes and
+     * discards EVERY retained surface for a clear of one of them ... that blast
+     * radius meant no surface ever survived a frame." The discard path was
+     * added later and never got the same treatment.
+     *
+     * Draw into surface 0, leave it dirty, then discard as a clear of surfaces
+     * 1 and 2 would. Surface 0's draws must still reach guest RAM. */
+    {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        unsigned bad = 0, gw = 0, gone = 0;
+        memset(swap_t[0], 0xcc, TARGET_BYTES);
+        for (d = 0; d < DEPTH_BYTES; d += 4) {
+            swap_z[0][d] = 0x5a; swap_z[0][d+1] = 0xff;
+            swap_z[0][d+2] = 0xff; swap_z[0][d+3] = 0xff;
+        }
+        memcpy(swap_o[0], swap_t[0], TARGET_BYTES);
+        memcpy(swap_oz[0], swap_z[0], DEPTH_BYTES);
+        nv2a_metal_invalidate(NULL);
+        for (d = 0; d < 8; ++d) {
+            base_state(&s);
+            s.depth_test = 1; s.depth_write = 1; s.depth_func = 0x203;
+            fill_tri(v, 0);
+            if (!nv2a_texture_copy_triangle_depth(&s, textures[d], TEX_BYTES,
+                                                  swap_o[0], TARGET_BYTES,
+                                                  swap_oz[0], DEPTH_BYTES,
+                                                  v[0], v[1], v[2]))
+                continue;
+            if (!draw(&s, textures[d], swap_t[0], swap_z[0], v, 3, "G")) return 1;
+        }
+        /* The clear names surfaces 1 and 2. Surface 0 is the one being held. */
+        nv2a_metal_discard(swap_t[1], swap_z[1]);
+        CHECK(nv2a_metal_sync());
+        score(swap_t[0], swap_o[0], TARGET_BYTES, &bad, &gw, &gone);
+        if (bad > (W * H) / 100u) {
+            fprintf(stderr, "phase G: a clear naming ANOTHER surface threw away "
+                    "%u of %u pixels drawn into the retained one (worst %u "
+                    "step(s))\n", bad, W * H, gw);
+            return 1;
+        }
+        /* POSITIVE CONTROL, because a discard that never fires would pass the
+         * check above trivially and silently delete the optimisation. A clear
+         * naming the surface actually being held must still take the fast
+         * path, and must still say so. */
+        if (!draw(&s, textures[0], swap_t[0], swap_z[0], v, 3, "G")) return 1;
+        if (!nv2a_metal_discard(swap_t[0], swap_z[0])) {
+            fprintf(stderr, "phase G: a clear naming the RETAINED surface was "
+                            "refused -- the fast path is dead\n");
+            return 1;
+        }
+        CHECK(nv2a_metal_sync());
+        printf("metal discard: a clear naming another surface leaves the "
+               "retained one intact (%u of %u pixels differ); a clear naming "
+               "the retained one still discards\n", bad, W * H);
+    }
+
     if (!drawn) { fprintf(stderr, "no triangles survived assembly\n"); return 1; }
     printf("metal batch (%s): %lu triangles over 6 phases "
            "(overlap, ring wrap, texture eviction, surface change, readback, "

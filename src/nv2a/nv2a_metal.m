@@ -1553,14 +1553,36 @@ int nv2a_metal_sync(void)
  * and dropping our reference is safe. dirty is cleared too, so a later sync
  * cannot try to read back a surface that has been abandoned. */
 
-void nv2a_metal_discard(void)
+int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth)
 {
+    /* ONLY IF THE SURFACE BEING CLEARED IS THE ONE BEING HELD.
+     *
+     * Dropping without a readback is sound because the CPU is about to write a
+     * constant over every byte -- but only over the CLEARED surface's bytes.
+     * This used to take no arguments and drop whatever was retained, and the
+     * two are not the same surface as often as it looks: the bound colour
+     * offset moves when the guest writes the register, while surface_target
+     * only moves on the next DRAW, so a clear issued in that window names one
+     * surface and threw away another. metal_batch_test phase G measures it at
+     * 24848 of 65536 pixels of finished rendering lost.
+     *
+     * nv2a_metal_invalidate takes a target for exactly this reason -- "it used
+     * to be one nv2a_gpu_invalidate(NULL) here ... that blast radius meant no
+     * surface ever survived a frame" -- and this path, added later, did not.
+     *
+     * Returning 0 leaves the retained surface alone AND tells the caller its
+     * fast path did not apply, so it invalidates normally. Pointer equality is
+     * the same test invalidate uses; a surface reached through a non-zero DMA
+     * base simply fails it and takes the slow, correct route. */
+    if (surface_target != color || depth_target != depth)
+        return 0;
     @autoreleasepool{
         batch_flush();
         ++g_mtl_discards;
         surface_valid=depth_valid=0;
         surface_dirty=depth_dirty=0;
     }
+    return 1;
 }
 
 void nv2a_metal_invalidate(uint8_t *target)

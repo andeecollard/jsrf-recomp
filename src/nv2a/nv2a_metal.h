@@ -13,7 +13,11 @@ int nv2a_metal_sync(void);
 void nv2a_metal_invalidate(uint8_t *target);
 /* Drop the retained surface without reading it back. Only valid when the
  * caller is about to overwrite every byte of it -- see the definition. */
-void nv2a_metal_discard(void);
+/* Drop the retained surface WITHOUT reading it back, for a guest clear that is
+ * about to overwrite every byte of it. Returns non-zero if it actually dropped
+ * something -- the caller must invalidate normally when it returns 0, because
+ * the surface being cleared was not the one being held. */
+int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth);
 /* Stable diagnostic label for the most recent -1 result. */
 const char *nv2a_metal_last_reject(void);
 /* Compact cumulative counters for live performance validation. */

@@ -16,7 +16,7 @@
 #define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()
 #define nv2a_gpu_invalidate  nv2a_metal_invalidate
 #define nv2a_gpu_invalidate_range(target, bytes) nv2a_metal_invalidate(target)
-#define nv2a_gpu_discard     nv2a_metal_discard
+#define nv2a_gpu_discard(color, depth) nv2a_metal_discard(color, depth)
 #define nv2a_gpu_last_reject nv2a_metal_last_reject
 #define nv2a_gpu_report      nv2a_metal_report
 #elif defined(_WIN32)
@@ -1860,7 +1860,9 @@ static void clear_surface(uint32_t param)
                     /* Reaching here with z valid means the CPU loop below
                      * will write the whole depth range, and want_discard
                      * already established the colour half will too. */
-                    if (want_discard) { nv2a_gpu_discard(); discarded = 1; }
+                    if (want_discard
+                            && nv2a_gpu_discard(mem + s_gpu.color_offset, z))
+                        discarded = 1;
                     else
 #endif
                     nv2a_gpu_invalidate_range(z, bytes);
