@@ -889,3 +889,63 @@ BATCHED path, from the same RECOMP_METAL_CB_STATS line. If it is a handful,
 the residual is not the same race and needs its own explanation. If it is still
 dozens, something is ending batches far more often than the surface churn
 accounts for, and that something is the lead.
+
+
+20. THE PIPELINE COMPARED STAGE BY STAGE, WHICH RULES OUT A WHOLE CLASS
+========================================================================
+Done because hypothesis-and-test had knocked down four mechanisms in a row and
+a structural comparison finds OMISSIONS rather than bugs. Write out what an
+NV2A-to-Metal translation must do, stage by stage, and ask of each stage
+whether this implementation does it, refuses it, or silently ignores it. The
+third category is the dangerous one.
+
+    vertex fetch, T&L, viewport   implemented, shared vs between both paths
+    clip and cull                 CPU side, shared
+    texture sample, mips, DXT     implemented AND byte-exact in metal_copy_test
+    register combiners            implemented, byte-exact
+    alpha test                    implemented
+    depth and stencil             implemented
+    blend                         implemented
+    dither                        implemented (stage order fixed today)
+    fog                           refused
+    logic op                      refused
+    colour write mask             refused
+    texture address modes         refused
+    texture filter, format, LOD   refused
+    polygon offset, window clip   refused
+    multisample, shade mode       refused
+
+THERE IS NO THIRD CATEGORY. nv2a_texture_copy_prepare refuses about thirty
+distinct states by name rather than approximating any of them, which is the
+right design and is why looking for a missing stage found nothing.
+
+AND THE REFUSAL PATH NEVER FIRES HERE. Over four runs:
+
+    [TEXTURE] prepared=750558 rejected=0
+    [TEXTURE] prepared=792428 rejected=0
+    [TEXTURE] prepared=440094 rejected=0
+    [RASTER]  0 batches + 0 triangles on the CPU
+
+Every draw this title issues is expressible, accepted and rendered by the sink.
+Nothing is dropped, nothing falls back, nothing is approximated.
+
+ONE REAL GAP FOUND, WHICH IS NOT THIS BUG. A draw the decoder rejects is
+DROPPED, not rasterised on the CPU: nv2a_pb_exec.c:2944 logs the first eight
+and returns. It is counted in neither gpu_fallbacks nor cpu_batches, which is
+why both read zero and why nobody would notice. For a title that used fog or a
+colour mask, geometry would simply be absent with every counter reading clean.
+JSRF never triggers it, so it is a latent hazard rather than the cause.
+
+WHAT THIS LEAVES, and it is the useful half of a negative result. The residual
+cannot be a PER-DRAW problem: every stage is implemented or refused, nothing is
+ignored, no draw is dropped, and the per-draw translation is verified
+byte-exact against the CPU oracle across combiners, alpha test, stencil,
+multi-texture, DXT and mips. So it has to be about how draws COMBINE or
+PERSIST -- the retained surface across frames, or ordering between passes.
+
+That is the same place the tile mosaic lived, which is consistent with a person
+watching it saying the residual looks like the same issue. It differs in one
+measured respect: the mosaic sat on a clean 64 grid and this does not. Seam
+spacings in the corrupted region are 12.1, 4.3, 9.8, 12.1, 2.5, 5.6, 2.0, 1.7,
+32.0 -- irregular. I had called it "the same class at finer granularity" from a
+magnified image before measuring, and the measurement does not support it.
