@@ -10,11 +10,18 @@
  *   asuint(x)            becomes as_type<uint>(x).
  *   : ATTR0 / SV_POSITION become [[attribute(0)]] / [[position]].
  *   cbuffer ... b1       becomes a `constant float4 *c [[buffer(1)]]` pointer
- *                        argument. It is declared as a pointer rather than a
- *                        192-entry array so that a0-relative addressing, which
- *                        the hardware wraps at 8 bits, cannot index past a
- *                        fixed-size declaration. The binder owes this shader
- *                        256 float4s; see the design note.
+ *                        argument over the guest's 192 float4s. The HLSL
+ *                        emitter indexes a0-relative reads as
+ *                        c[(a0 + N) & 255] against a 192-entry array, which
+ *                        is an out-of-bounds read for 192..255; in MSL, past
+ *                        the end of a `constant` pointer, that is undefined
+ *                        rather than merely clamped, so the index is clamped
+ *                        here. It also keeps the buffer at 3072 bytes, inside
+ *                        Metal's 4 KB setVertexBytes limit; 256 float4s would
+ *                        be 4096 and would need a real MTLBuffer per batch.
+ *                        The interpreter refuses the whole draw in this case
+ *                        (read_source returns 0), which a vertex function
+ *                        cannot do -- see the design note.
  *   VS_OUT               carries [[position]], and the NV2A screen-space to
  *                        clip-space conversion is done here, at the end of
  *                        main, because on the Metal path that conversion is
@@ -119,9 +126,11 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
     case NV2A_VSH_REG_CONST:
         /* The hardware wraps a0-relative indices at 8 bits before any bounds
          * check -- read_source in nv2a_vsh.c does the same -- so the mask is
-         * part of the semantics, not a safety net. */
+         * part of the semantics, not a safety net. The clamp that follows it
+         * is the safety net, and is a divergence; see the file comment. */
         if (src->rel_addr)
-            sb_append(sb, "c[(a0 + %d) & 255]", src->reg_index);
+            sb_append(sb, "c[min((a0 + %d) & 255, %d)]",
+                      src->reg_index, NV2A_VS_MAX_CONSTANTS - 1);
         else
             sb_append(sb, "c[%d]", src->reg_index);
         break;
@@ -470,13 +479,11 @@ int nv2a_vsh_generate_msl(const NV2AVshProgram *program,
         "using namespace metal;\n"
         "\n");
 
-    /* Constants are a `constant float4 *` argument on main, declared below.
-     * The binder owes this shader 256 float4s: the guest bank is %d, but
-     * a0-relative reads wrap at 8 bits before any bounds check. */
+    /* Constants are a `constant float4 *` argument on main, declared below. */
     sb_append(&sb,
-        "/* Constant file: c[0..%d] are the guest's; c[%d..255] exist only so\n"
-        " * that an a0-relative index masked to 8 bits stays in bounds. */\n"
-        "\n", NV2A_VS_MAX_CONSTANTS - 1, NV2A_VS_MAX_CONSTANTS);
+        "/* Constant file: %d float4 at buffer(1), %d bytes. a0-relative reads\n"
+        " * wrap at 8 bits as the hardware does, then clamp to the last entry. */\n"
+        "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_CONSTANTS * 16);
 
     sb_append(&sb,
         "float4 vsh_rcc(float x) { float r = 1.0f / x;\n"

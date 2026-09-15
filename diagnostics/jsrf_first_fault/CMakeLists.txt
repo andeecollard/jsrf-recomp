@@ -348,6 +348,13 @@ add_executable(jsrf_vsh_test vsh_test.c)
 target_link_libraries(jsrf_vsh_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_vsh COMMAND jsrf_vsh_test)
 
+# What the MSL emitter emits, for the same decoded programs the HLSL emitter
+# consumes. Text only: nothing here is compiled as a shader or executed, and
+# the emitter is not wired into the renderer.
+add_executable(jsrf_vsh_msl_test vsh_msl_test.c)
+target_link_libraries(jsrf_vsh_msl_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_vsh_msl COMMAND jsrf_vsh_msl_test)
+
 add_executable(jsrf_vsh_render_test vsh_render_test.c
     "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
 target_link_libraries(jsrf_vsh_render_test PRIVATE xbox_vsh)
@@ -390,6 +397,19 @@ if(APPLE)
     # introduced. Carries its own positive control.
     add_executable(jsrf_metal_ring_test metal_ring_test.c)
     target_link_libraries(jsrf_metal_ring_test PRIVATE xbox_vsh)
+    # Is the emitted MSL legal, and will Metal build a pipeline from it? Needs
+    # the runtime compiler, so it needs a device -- `xcrun metal` ships with
+    # Xcode, not the Command Line Tools, and cannot be assumed. Carries its own
+    # positive control: a shader that must fail to compile.
+    #
+    # This project is declared C, and enable_language in src/nv2a only reaches
+    # that directory and below, so the first Objective-C source HERE has to ask
+    # for the language itself or CMake generates nothing.
+    enable_language(OBJC)
+    add_executable(jsrf_vsh_msl_compile_test vsh_msl_compile_test.m)
+    set_source_files_properties(vsh_msl_compile_test.m PROPERTIES
+                                COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(jsrf_vsh_msl_compile_test PRIVATE xbox_vsh)
     # Explicit GPU tests; do not turn headless CTest runs into device failures.
 endif()
 if(WIN32)

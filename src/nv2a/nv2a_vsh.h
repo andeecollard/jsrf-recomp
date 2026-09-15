@@ -1,4 +1,4 @@
-/* Portable NV2A vertex-program representation shared by CPU and HLSL. */
+/* Portable NV2A vertex-program representation shared by CPU, HLSL and MSL. */
 #ifndef XBOXRECOMP_NV2A_VSH_H
 #define XBOXRECOMP_NV2A_VSH_H
 #include <stdint.h>
