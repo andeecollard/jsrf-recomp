@@ -155,9 +155,46 @@ static int batch_force;
  * cannot -- there are seventeen of them now (twelve before, five here) and the
  * hang was in none of them, which is the same evidence it already had.
  */
+/* ON BY DEFAULT, AND IT IS A CORRECTNESS DEFAULT RATHER THAN A FAST ONE.
+ *
+ * Off, every draw is its own render pass and its own command buffer: load the
+ * whole surface into tile memory, draw one batch, store it back. A gameplay
+ * frame issues tens of thousands of those against the same texture, and
+ * RECOMP_METAL_CB_GPU measures 664,933 command buffers starting before the
+ * previous one ended (out-of-order 0). The tiles therefore resolve out of
+ * step, and each 64x64 tile of the presented frame keeps whichever command
+ * buffer stored it last -- a mosaic of different moments, which is what a
+ * person watching it called the background being cut and jumbled.
+ *
+ * Measured on real gameplay frames, counting strong vertical seams and asking
+ * how many land on a multiple of 64 against what chance would give:
+ *
+ *     hardware, per-draw    248 seams, 66 on a 64 boundary   17.0x chance
+ *     hardware, batched      29 seams,  0                     0.0x
+ *     software control      227 seams,  3                     0.8x
+ *
+ * Not reduced, gone. In a screen recording the seams sit on a 64 grid in both
+ * axes -- x = 0,64,192,256,320,384,448,640 and y = 128,256,384 -- which is the
+ * tile grid and not anything in the scene.
+ *
+ * It only ever showed on the hardware-state path, for the same reason that
+ * path is quick: the software fragment tail serialises overdrawn fragments
+ * with raster_order_group(0), which keeps the GPU shallow enough that the
+ * per-draw passes rarely overlap. Removing that serialisation is where the
+ * 9.6% came from and is what let them race.
+ *
+ * No device test could catch this. metal_batch_test submits a few hundred
+ * draws and reads back immediately, so the GPU is never behind -- its own
+ * header says the first ring phase was "toothless" for exactly that reason.
+ * The gate for this is a real frame, and metal_batch_check.sh still holds the
+ * invariant that matters here: batched output is byte-for-byte the per-draw
+ * output on the device test.
+ *
+ * =0 restores the per-draw path, which is the arm that has to ask for itself
+ * now. Keep it working: it is the control for this whole result. */
 static int batch_on(void)
 {static int on=-1;if(batch_force)return batch_force>0;
- if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=e?(atoi(e)!=0):0;}
+ if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=e?(atoi(e)!=0):1;}
  return on;}
 /* A cap exists so the effect of unbounded batching can be told apart from the
  * effect of batching at all, and so a pathological scene cannot defer the GPU
