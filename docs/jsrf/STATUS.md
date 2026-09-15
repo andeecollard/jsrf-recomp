@@ -33,9 +33,22 @@ about them. Recorded at `462b656`; the detail is in
 
 ## Not working
 
-**Frame rate.** 26–31 fps at gameplay against a title that holds 60.1 fps in
-xemu. Roughly a third of the frame is `clear_surface`, 11–15 ms across two
-calls, most of it waiting on the GPU. Measured, not yet addressed.
+**Frame rate.** 27–30 fps at a scene-verified mission against a title that
+holds 60.1 fps in xemu. The `clear_surface` cost is now split: over a 20-minute
+play session, 443,738 ms went on draining the GPU and 125,914 ms on reading back
+and converting — **78% drain, 22% readback**. The code's own note says what that
+means: drain-dominated leaves pipelining as the only win, and a resident clear
+could remove the readback half only. `RECOMP_METAL_BATCH` is the pipelining
+lever and is measured; what it lacks is a stability verdict, not performance
+evidence.
+
+Separately, and larger: **NV2A vertex programs are interpreted on the CPU on
+macOS** (`nv2a_vsh_execute`, ~7.5 ms of a ~32 ms frame). The D3D11 path emits
+HLSL instead. An MSL emitter now exists with full opcode coverage and tests, but
+it is not wired into the renderer and must not be until its outputs are compared
+against the interpreter — moving vertex work to the GPU also moves triangle
+assembly, culling and the reject paths, which all currently read the shader's
+CPU-side output.
 
 **Intermittent crash — now attributed, and the rate was overstated here.**
 Across 390 recorded runs, 46 end in a guest fault (11.8%), and the hazard is
@@ -103,5 +116,36 @@ shows the bypass followed by the freeze.
 - Where the intro fade is lost in guest code, and whether that path is shared.
 - The vertex-reuse mismatch.
 - Whether batching can be made default-safe.
-- One scene traps the APU on more than half its frames and empties the output
-  queue. Audio keeps flowing, so this is a robustness question, not a silence.
+- Whether batching can be made default-safe — the last open question on the
+  biggest measured rendering win.
+- The voice-list ownership defect underneath the trap storm. The guest owns the
+  list and the head; our `VOICE_ON` writes both underneath it, and `regs[top]`
+  goes stale, so a re-ON links a voice to itself. Mitigated, not cured: the two
+  APU changes below restore the engine's frames without fixing why `TVL` is
+  stale. `docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-15_VOICE_LIST_SELF_LINK.md`.
+
+## Fixed 15 September 2026 — the sound engine
+
+It was running on 63.6% of APU frames and now runs on 98.6%, measured at a
+scene-verified mission. `trapped=` was never a count of traps raised; it counts
+frames where the engine is **switched off** because the front end is in TRAPPED
+state, so the old number measured how long it spent waiting for each trap to be
+serviced.
+
+Two changes, each measured over two matched pairs before either shipped:
+
+| | engine duty | traps raised |
+|---|---|---|
+| before | 63.8% / 63.5% | ~10,300 |
+| `SE_WHILE_TRAPPED` alone | 99.1% / 98.8% | ~125,000 |
+| both, shipped | 98.8% / 98.6% | ~10,800 |
+
+The engine had been throttling its own trap rate by switching itself off, which
+is why they only make sense together: coalescing a trap that is already
+outstanding removed 92% of the raises with duty unchanged. That matters because
+each raise is a guest interrupt into the DirectSound ISR where 20 of the 33
+recorded faults land.
+
+**The gate on this is still open and is not a measurement.** The switch carried
+the condition "no default until it has been heard at gameplay, with a
+controller". A person still has to listen. `RECOMP_APU_SE_WHILE_TRAPPED=0`.
