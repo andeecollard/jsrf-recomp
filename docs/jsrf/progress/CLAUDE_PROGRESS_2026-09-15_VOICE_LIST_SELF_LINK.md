@@ -337,6 +337,47 @@ neither `PAR_STATE` (0x54) nor `TAR_PITCH_LINK` (0x7C). **xemu drops all seven
 identically**, so this is neither a divergence nor a cause. The counter stays,
 because not knowing was the defect.
 
+## Joined at gameplay: voice 3 self-links and voice 3 is the storm
+
+`20260915-122828-human-gameplay`, a person playing with a controller, because
+the scripted schedule could not be trusted to reach a stage. The gap the top of
+this note declares open is now closed, in a single run carrying every counter:
+
+    [VOICE-LINK] voice=3 feav=0002FFFF lst=2 ante=FFFF link=0003->0003 SELF-LINK
+    [APU-IDLE]   last handles: 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3
+    [APU-FRAME]  total=315072 se=145693 trapped=168445   (53.5% trapped)
+    [APU-VOICE]  on=70 off=65 off_commands=64 idle_trap=15337
+    [VOICE-TOP]  head writes from guest: 2D=4 3D=17 MP=1
+
+**The voice that self-links and the voice raising the storm are the same voice**,
+named by two independent instruments in the same run. 15,337 traps against 64
+explicit retirements. And it is voice 3 on the 3D list — the same handle that
+raised 19,552 of 19,585 traps in `20260915-110630`, a different gameplay run on
+a different binary. Two runs, same voice, same list.
+
+The guest-side half is visible in the same log: `voice=2 ours=FFFF now=0002`,
+`voice=6 ours=0002 now=0006`, `voice=9 ours=0002 now=0009` — the self-handle
+sentinel written before re-ON, exactly as `RemoveIdleVoice` documents.
+
+So the chain is complete end to end: guest marks the voice unlinked, `regs[top]`
+still names it because the removal handshake did not complete, `VOICE_ON` stores
+`link(v) = regs[top] = v`, the walk meets a one-entry cycle, raises the trap,
+returns pinned, and half the APU frames are lost.
+
+### A counter that could not do the job it was given
+
+This note previously said the three earlier runs "did not reach gameplay" and
+cited `NtOpenFile` = 131 against gates of 1342 and 1408. **The open count does
+not support that.** This gameplay run also reports 131, and file logging stops
+partway through both. What established that those runs were in the Battle-mode
+menu was a person looking at the window and sending a screenshot.
+
+The gates are real but were calibrated for a different probe configuration, and
+they do not transfer to this one. The claim stands — the runs were in a menu —
+but it rests on the screenshot. Stated again because it is this repository's
+oldest rule and it still caught us: read a counter's trigger before trusting its
+value.
+
 ## Scope of the change
 
 Counters, traces and comments. **No trap policy, list behaviour or audio
