@@ -73,6 +73,7 @@ static uint8_t targetA[TARGET_BYTES], targetB[TARGET_BYTES];
 static uint8_t depthA[DEPTH_BYTES],  depthB[DEPTH_BYTES];
 static uint8_t oracle[TARGET_BYTES], oracle_z[DEPTH_BYTES];
 static unsigned oracle_worst, oracle_one_step;
+static unsigned oracle_cell_lo, oracle_cell_hi;
 /* Phase F: three surfaces, because JSRF holds three and swaps between them
  * batch by batch, and this backend retains ONE Metal texture and re-uploads on
  * every swap. Its own buffers rather than phase A's: by the time F runs,
@@ -123,6 +124,7 @@ static void base_state(NV2ATextureCopy *s)
      * fall back to ALWAYS. Two fixture defects cancelling: no depth to compare,
      * and no comparison to make. */
     s->z_clip_min = 0.0f; s->z_clip_max = 16777215.0f;
+    s->dither = 1;
 }
 
 static void fill_tri(float v[3][16][4], unsigned span)
@@ -161,6 +163,32 @@ static int draw(const NV2ATextureCopy *s, const uint8_t *tex,
 /* COUNT AND MAGNITUDE, in 565 channel steps -- the unit this project's
  * acceptance rule is written in. Shared by phase A and phase F so the two
  * report the same quantity. */
+/* IS THE ERROR ON THE DITHER LATTICE? A count says how many pixels are wrong;
+ * this says whether they are wrong in a PATTERN.
+ *
+ * The ordered dither is a 4x4 Bayer matrix, so an error introduced by applying
+ * it at the wrong stage lands on that lattice and nowhere else. Coverage noise
+ * -- the disagreement every phase already carries -- is spread evenly, so it
+ * fills the sixteen cells to within counting noise. Reporting the emptiest and
+ * fullest cell separates the two without anyone having to look at an image:
+ * even means "more of the usual", an order of magnitude apart means the dither
+ * stage is wrong. */
+static void lattice(const uint8_t *got, const uint8_t *want, unsigned w,
+                    unsigned h, unsigned *lo, unsigned *hi)
+{
+    unsigned cell[16] = {0}, px, k;
+    for (px = 0; px < w * h; ++px) {
+        unsigned o = want[px*2] | (unsigned)want[px*2+1] << 8;
+        unsigned g = got[px*2]  | (unsigned)got[px*2+1]  << 8;
+        if (o != g) ++cell[((px / w) & 3) * 4 + ((px % w) & 3)];
+    }
+    *lo = cell[0]; *hi = cell[0];
+    for (k = 1; k < 16; ++k) {
+        if (cell[k] < *lo) *lo = cell[k];
+        if (cell[k] > *hi) *hi = cell[k];
+    }
+}
+
 static void score(const uint8_t *got, const uint8_t *want, size_t bytes,
                   unsigned *bad, unsigned *worst_out, unsigned *one_step)
 {
@@ -232,6 +260,7 @@ int main(int argc, char **argv)
      * Per channel, in 565 steps, because that is the unit the rule is written
      * in: a whole-pixel measure would hide a 1-step red behind a correct green. */
     score(targetA, oracle, sizeof oracle, &oracle_bad, &oracle_worst, &oracle_one_step);
+    lattice(targetA, oracle, W, H, &oracle_cell_lo, &oracle_cell_hi);
     for (i = 0; i < sizeof oracle_z; ++i)
         if (oracle_z[i] != depthA[i]) ++oracle_zbad;
     record();
@@ -441,9 +470,10 @@ int main(int argc, char **argv)
            "three-surface swap); "
            "phase A differs from the software rasteriser on %u of %u pixels "
            "and %u of %u depth bytes; worst channel error %u step(s), "
-           "%u of the differing pixels are within one\n",
+           "%u of the differing pixels are within one; emptiest/fullest 4x4 "
+           "dither cell %u/%u\n",
            mode, drawn, oracle_bad, W * H, oracle_zbad, (unsigned)sizeof oracle_z,
-           oracle_worst, oracle_one_step);
+           oracle_worst, oracle_one_step, oracle_cell_lo, oracle_cell_hi);
     printf("metal swap (%s): phase F differs from the software rasteriser on "
            "%u of %u pixels and %u of %u depth bytes; worst channel error "
            "%u step(s), %u of the differing pixels are within one\n",
