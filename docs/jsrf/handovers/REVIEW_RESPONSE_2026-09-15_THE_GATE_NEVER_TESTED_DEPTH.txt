@@ -811,3 +811,42 @@ phase was "toothless" because "the GPU was never actually behind" -- that
 sentence was true of the whole file and nobody generalised it. A gate that
 cannot get the GPU behind cannot see this class of defect at all, and the
 answer is fb_score.py on frames from a real run, not another synthetic phase.
+
+
+18. THE RESIDUAL IS REAL, AND THE METRIC THAT SAID OTHERWISE WAS WRONG
+=======================================================================
+RETRACTED: "the granular noise is NOT a hardware-path artefact". It is. That
+claim came from fb_score.py's speckle metric, which ranked the known-good
+software path as the noisiest of three arms -- and I reported the ranking as a
+result instead of reading it as the metric being broken.
+
+SETTLED BY LOOKING, at comparable surfaces rather than comparable scenes. A
+flat wall on the batched hardware path carries small sharp BLACK fragments,
+two to five pixels, scattered across it. The same kind of surface on the
+software control is smooth and carries none. Magnifying one crop of each
+answered in a minute what four metrics could not.
+
+WHY THE METRICS COULD NOT. Every one compared arms that never reach the same
+scene, because the two paths run at different speeds and a fixed pad schedule
+lands them in different places. A single-frame noise rate then measures how
+much flat area a scene happens to have. `tile` escaped this only because
+enrichment is a ratio taken inside one frame against that frame's own seam
+count; nothing about the speckle rate is.
+
+THE SHAPE OF WHAT IS LEFT. Black, small, on flat surfaces -- the same kind of
+loss as the tile mosaic, three orders of magnitude smaller. Batching removed
+the 64x64 blocks by replacing a render pass per draw with one per batch, but a
+batch still ends at every flush, and the flushes have not been counted. The
+`use_zeta` churn is the suspect: next_depth is NULL for any draw that neither
+depth-tests nor stencil-tests, so every alternation between a depth-using draw
+and a depth-less one fails the retained-surface test, and that forces a sync, a
+full readback, a texture reallocation and a re-upload -- each of which ends a
+batch. If a frame alternates often, batching is still committing a great many
+command buffers and the same race survives at a finer grain.
+
+NEXT, AND IT IS A MEASUREMENT RATHER THAN A THEORY: count surface re-uploads
+and batch flushes per frame at gameplay. RECOMP_METAL_RING_AUDIT already
+reports surface re-uploads and RECOMP_METAL_CB_STATS reports flushes and
+draws-per-flush. If flushes per frame are in the thousands, the churn is the
+mechanism and the fix is to stop tearing the surface down for a draw that
+simply has no depth buffer.
