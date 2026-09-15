@@ -18,9 +18,34 @@ binaries, under five different switch configurations.
 so `0x19E340`–`0x1BA89C`. That is Microsoft's DirectSound, recompiled as guest
 code with the rest of the title.
 
-## Which makes STATUS.md wrong
+## Most of this was already known, and I should have read further first
 
-`docs/jsrf/STATUS.md` has carried this as:
+`STATUS.md` already carried the substance: *"Of the 33 genuine faults on this
+host, 20 are the same bug: the DirectSound APU interrupt handler is entered for
+an idle-voice trap and dereferences a voice object that is NULL"*, with the
+faulting instruction, the register fingerprint, the frame depth, a three-deep
+call chain out of the guest's stack, and the handler's registration at
+`KeConnectInterrupt(routine=0x001A2681, vector=5)`. That is a better-evidenced
+account than this note's, and it predates it.
+
+What is actually new here is narrower, and worth keeping for three reasons:
+
+1. **The exact instruction and operand, at 10 of 10.** `sub_001A2E2E +0x670`
+   on guest `0xFFFFFFBE`, identical across A/Bs hours apart on four binaries
+   under five switch configurations. A probe can target one instruction.
+2. **`ACCURACY_GAPS.md` and `STATUS.md` disagreed**, and the wrong one was the
+   one being quoted: "SIGSEGV in the OHCI path" against STATUS's DirectSound.
+   Corrected to agree.
+3. **It is not a NULL object.** STATUS says the handler "dereferences a voice
+   object that is NULL". A NULL object read at `[obj+0xBE]` faults at `0xBE`.
+   This faults at `0xFFFFFFBE`, every time — the top of the address space, which
+   is what a pointer computed from a **sentinel** looks like. `0xFFFF` is the
+   voice list's own terminator. That is a different bug shape from a null
+   object, and it points at the link value rather than at the object lookup.
+
+## Which makes ACCURACY_GAPS wrong
+
+`docs/jsrf/ACCURACY_GAPS.md` has carried this as:
 
 > ~13% of runs SIGSEGV in the OHCI path
 
