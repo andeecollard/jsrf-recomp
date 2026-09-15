@@ -117,6 +117,37 @@ static int batch_force;
  *              MB either way, so that growth is not this), input alive to the
  *              end, and APU trap counts that track which scene the run reached
  *              rather than which path it used.
+ *   gameplay   15 Sep 2026, and this is the first measurement of it AT a
+ *              scene-verified mission: ten boots on pad/gameplay_nobarrage.pad,
+ *              four usable runs per arm, scored only over report windows at
+ *              least 20 s into sequence state 30 (ab_switch.sh).
+ *
+ *                            per frame, mean of 4 runs      range
+ *                clear       10.75 -> 8.88 ms          9.49-11.47 v 8.70-9.24
+ *                submit       8.09 -> 7.73 ms          7.63-8.29  v 7.60-7.83
+ *                vsh         10.55 -> 11.25 ms         9.14-11.54 v 10.67-12.65
+ *                whole frame 33.53 -> 32.27 ms         30.23-35.13 v 31.49-33.77
+ *
+ *              THE CLEAR COLUMN IS THE ONLY ONE WHOSE RANGES DO NOT OVERLAP,
+ *              and it is the biggest mover at 1.87 ms/frame. That is not a
+ *              surprise once you read why: a clear reaches the GPU through
+ *              nv2a_metal_sync(), so its cost is a drain, and batching changes
+ *              how much is outstanding when the drain happens. submit moves the
+ *              way batching predicts but only by 0.36 ms and its ranges
+ *              overlap.
+ *
+ *              WHOLE-FRAME TIME DOES NOT SEPARATE THE ARMS. The 1.26 ms of
+ *              mean difference is inside the run-to-run spread, because vsh --
+ *              the CPU vertex interpreter, which batching does not touch --
+ *              varies by 3.5 ms between runs on its own and swamps it. So the
+ *              honest claim is a localised 2.2 ms/frame off clear+submit, not
+ *              a measured frame-rate gain.
+ *
+ * THE DEFAULT STAYS OFF ANYWAY, and the numbers above do not bear on why. The
+ * gate is the SEGA-screen hang: one interactive session, never reproduced, and
+ * a person has to run this switch interactively to close it. Scripted boots
+ * cannot -- there are seventeen of them now (twelve before, five here) and the
+ * hang was in none of them, which is the same evidence it already had.
  */
 static int batch_on(void)
 {static int on=-1;if(batch_force)return batch_force>0;
