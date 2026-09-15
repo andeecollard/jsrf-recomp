@@ -1,0 +1,279 @@
+CLAUDE, 15 Sep 2026 (afternoon)
+THE SOUND ENGINE WAS SWITCHED OFF, AND THE HARNESS WAS WATCHING THE WRONG SCREEN
+
+Supersedes CLAUDE_TO_CODEX_HANDOVER_2026-09-14_THE_INSTRUMENTS_LIE.txt for
+everything about the APU voice list, the idle-voice trap storm, and how a
+scripted run is scored. 13 commits, ctest 29/29 (the suite gained
+jsrf_vsh_msl), nothing pushed.
+
+Two of today's findings came from a person looking at the game window and
+sending a screenshot. Both overturned a conclusion I had already written down.
+That is the third session running where that has happened and it is now the
+most reliable instrument in this project.
+
+
+0. THE ONE PARAGRAPH VERSION
+=============================
+The sound engine was running on 63.6% of APU frames because `trapped=` does not
+count traps -- it counts frames where the engine is SWITCHED OFF waiting for one
+to be serviced. RECOMP_APU_SE_WHILE_TRAPPED fixes that (98.6%) but costs 125,000
+guest interrupts, so a second change coalesces a trap that is already
+outstanding and gives 92% of them back. Both are now default-on and the gate on
+them -- "heard at gameplay, with a controller" -- IS STILL OPEN. Separately:
+every scripted run in this tree has been landing in the VS Battle menu, because
+gameplay.pad fires six bare A presses after a selection is already made; and the
+NtOpenFile gate everything was scored on was timing the DISC CACHE BUILD, not
+the scene.
+
+
+1. WHAT IS COMMITTED
+=====================
+Sound (the deliverable):
+  * RECOMP_APU_SE_WHILE_TRAPPED default ON. 63.6% -> 98.6% engine duty.
+  * RECOMP_APU_TRAP_COALESCE default ON, new. Do not re-raise SE2FE_IDLE_VOICE
+    while FEMETHMODE is already TRAPPED.
+  * RECOMP_APU_SELFLINK_END, new, default OFF -- see section 5, it is not a fix.
+  * [APU-TRAP], [APU-SELFLINK], [APU-LINK], [VOICE-TOP], [VOICE-RELINK],
+    [APU-FE-UNKNOWN] counters.
+
+Harness (the thing that had been invalidating measurements):
+  * pad/gameplay_nobarrage.pad -- reaches a real mission unattended.
+  * RECOMP_SEQ_REPORT -- the scene marker. play_scripted.sh scores on it.
+
+Renderer (not wired in):
+  * src/nv2a/nv2a_vsh_msl.c, full opcode coverage, two tests.
+
+Notes: CLAUDE_PROGRESS_2026-09-15_VOICE_LIST_SELF_LINK.md,
+CLAUDE_PROGRESS_2026-09-15_THE_FONT_IS_NOT_BROKEN.md, and a parallel session's
+2026-09-15-audio-lifecycle.md.
+
+
+2. THE SOUND FIX, AND WHY THE TWO HALVES ARE INSEPARABLE
+=========================================================
+Read the counter's trigger first, as always. `trapped=` in [APU-FRAME] is
+incremented in mcpx_apu_frame_thread when FEMETHMODE == TRAPPED, i.e. on frames
+where the sound engine is SKIPPED. It was never a measure of how many traps were
+raised. 67 raises/s x 11 subframes of dwell = 49% of frames, which is the ~50%
+that has been in ACCURACY_GAPS as "the engine is down about half the time".
+
+Two matched pairs each, 240 s, same binary, arms alternated:
+
+    SE_WHILE_TRAPPED off   duty 63.8% 63.5%   trapped 113408 114048   raises ~10300
+    SE_WHILE_TRAPPED on    duty 99.1% 98.8%   trapped      0      0   raises ~125000
+
+    coalesce off (SE on)   raises 112716 120791   duty 98.9% 98.5%
+    coalesce on  (SE on)   raises   9455  12138   duty 98.8% 98.6%
+
+The engine had been throttling its own trap rate BY SWITCHING ITSELF OFF. Turn
+it back on and the raise count explodes twelvefold, and every raise is an
+interrupt into the DirectSound ISR that 20 of the 33 recorded faults land in.
+Shipping the first without the second would have traded a duty-cycle defect for
+a crash-rate one. Zero faults across all four coalesce arms, which is
+reassuring and is not the same as evidence at n=4.
+
+Validated at a mission the scene marker confirms is state 30: duty 98.6%,
+trapped=0, suppressed=95721.
+
+THE GATE IS OPEN. The comment beside the switch said "no default until it has
+been heard at gameplay, with a controller". I changed the default on counters
+and rewrote the comment to say the gate is still open rather than delete it. A
+person has to listen to a sustained sound -- the grind is the documented tell,
+because an engine down a third of the time makes a continuous sound fade in and
+out. RECOMP_APU_SE_WHILE_TRAPPED=0 reverts in the same binary.
+
+
+3. WHAT IS STILL BROKEN UNDERNEATH IT   <-- THE REAL OPEN QUESTION
+===================================================================
+The fix restores the engine's frames. It does not explain why the traps happen.
+
+Measured, end to end, in one gameplay run carrying every counter: voice 3
+self-links (link(3) = 3) and voice 3 is the voice raising the storm -- two
+independent instruments naming the same handle. Same voice, same 3D list, in two
+separate gameplay runs on two different binaries.
+
+The chain: the guest writes link(v) = v as its "not in any list" sentinel before
+re-ONing v; our regs[top] still names v; VOICE_ON stores link(v) = regs[top] = v;
+the walk meets a one-entry cycle on a dead voice and traps.
+
+WHY regs[top] IS STALE IS NOT ESTABLISHED. That is the open question.
+
+What the xemu comparison settled (read against xemu master and the XDK
+DirectSound driver source, mcpvoice.cpp):
+  * Our VOICE_ON is byte-for-byte xemu's. git log -S on the TOP write finds only
+    the initial import. KEEP IT -- CMcpxVoiceClient never writes TVL on the
+    insert path and its own debug validation asserts dwTVL equals its head
+    voice, so conditioning that write away breaks every head insertion.
+  * The driver source independently confirms all three guest behaviours the
+    differential shadow caught: TVL = next for a head removal, predecessor
+    relink otherwise, then point the voice at itself. Nothing the guest did was
+    anomalous.
+  * xemu has no cycle detection either, and accepts guest TVL writes verbatim.
+
+So the divergence is OURS and it is in the walk, not the insert. Two local
+changes:
+  1. xemu finishes the walk and stalls the next frame on TRAPPED. We return
+     mid-walk on a local cursor. RemoveIdleVoice repairs CVL AND NVL to steer an
+     in-progress hardware walk through the voice being removed -- and a mid-walk
+     removal is exactly what [VOICE-RELINK] voice=70 ... at=walk caught. The
+     guest computes those repairs from registers our walk no longer honours.
+  2. xemu raises the trap for every inactive voice it meets; we raise one per
+     frame per list and hold (trap_held).
+
+CHASE 1. It is the only candidate with a mechanism behind it.
+
+
+4. THE HARNESS WAS MEASURING THE WRONG SCREEN, FOR EVERYTHING
+==============================================================
+gameplay.pad reuses new_game.pad's eight START/START/A groups -- documented to
+reach the Corn tutorial -- and then adds
+
+    76.0:A  80.0:A  84.0:A  88.0:A  92.0:A  96.0:A
+
+after a selection has already been made. Those six presses walk the menu into VS
+Battle. A person looked at the window and said "selected vs mode"; that is how
+this was found, after three instrumented runs and a frame-rate A/B had been
+taken there.
+
+pad/gameplay_nobarrage.pad drops the barrage and keeps everything else. Verified
+by the scene marker to reach state 30, a running mission, unattended. That is
+the first scripted run in this repository to do so.
+
+AND THE GATE EVERYTHING WAS SCORED ON WAS MEASURING SOMETHING ELSE ENTIRELY.
+NtOpenFile 1342/1408 was the DISC CACHE BUILD, not the scene. The 1410-open run
+wrote Media/Cache into the staged HDD -- the directory is dated 11:11, the minute
+that run ended -- and every HDD staged since carries a complete cache plus
+JSRF_CACHE_COMPLETE.CMP, so StartBuildCache is skipped and the count collapses to
+131 in EVERY scene. File logging stops at t = 79-81 s in all runs, minutes before
+either scene is reached. play_scripted.sh was printing "SCENE: NEVER LEFT THE
+TITLE" for a screenshot-confirmed gameplay run.
+
+The marker that works was already in the tree and switched off in every run:
+RECOMP_SEQ_TRACE reads CActSequence::m_dwNextMethod, which the sequence methods
+write themselves. RECOMP_SEQ_REPORT now prints it once per report.
+
+    12 = WaitEndTitle      58 = WaitEndVsMenu      30 = WaitEndStoryOrVsMission
+
+Verified, not trusted: the 64-entry table at 0x0020D2B8 was dumped out of
+default.xbe and matches jsrf_seq_tab entry for entry, and the disassembly shows
+the VS chain writing its own successor. Validated against a falsifiable control
+-- a run with no pad schedule at all must read 12, and did.
+
+Two things it will NOT tell you: state 30 means a mission action object exists,
+so the loading screen, the opening cutscene and the pause menu are all inside
+it; and character select and stage select are the same state.
+
+
+5. THE FIX THAT WASN'T, AND WHY IT IS STILL IN THE TREE
+========================================================
+RECOMP_APU_SELFLINK_END treats link(v) == v as end-of-list in the walk. That is
+the driver's own convention -- SetupVoiceProcessor writes it for all 256 voices
+at boot -- so it is correct on its own terms, and an unbounded self-cycle is a
+defect regardless (the walk's only protection is a 256-iteration cap, so a
+self-linked ACTIVE voice would render 256 times in a subframe).
+
+It is not the trap storm fix. It fired 47,293 times in 240 s and left trapped at
+50.3%, indistinguishable. Terminating the cycle cannot help: the self-linked
+voice is still the HEAD of its list and still inactive, so the walk begins on a
+dead voice and traps whether or not it then loops. I fixed the loop and left the
+trap.
+
+DEFAULT OFF, because shipping it on would be patching around a gate before a run
+proved which value was wrong.
+
+
+6. TEXT RENDERING: THERE IS NO DEFECT
+======================================
+Reported as glyph substitution from three screenshots -- DDD1 for 0001, Spra§
+for Spray, %SOU for $SOU. Every wrong character was a clean valid glyph of the
+same font, which is the shape of an indexing fault.
+
+It is the shipped art. Decoded the assets and looked at them: the HUD sprite
+sheet's zero is a heavy filled square with a triangular notch cut from its
+upper-left corner, jetfont's y has a flat horizontal descender instead of a
+tail, and jetfont's $ carries two rectangular counters either side of a blocky
+S. At gameplay size those read as D, § and %.
+
+The fact that should have stopped me sooner was already in hand: the errors are
+selective INSIDE ONE STRING drawn by ONE call. "Spra§ Cans" has a correct 'a'
+before the bad glyph and C-a-n-s after it. A fault in a shared index or UV
+computation moves every character, not one.
+
+decode_norm_asset.py is kept -- it turns any Media/**/*.dat into PNGs and writes
+down the NORM/MULT container format. The trap in it, which costs an hour to
+rediscover, is that nested containers use offsets relative to their own base.
+
+
+7. SPEED: WHAT THE FRAME IS ACTUALLY MADE OF
+=============================================
+From a 20-minute human play session, [METAL] sync:
+
+    443,738 ms draining the GPU     125,914 ms reading back and converting
+
+78% drain, 22% readback. The code's own comment says what that means: a resident
+clear could remove the second only, and if the drain is nearly all of it the
+available win is pipelining. RECOMP_METAL_BATCH is exactly that lever, is
+already measured (69.2 ms per-draw against 46.5 ms batched, 25 alternating
+replays of one captured frame, distributions not overlapping), and is off for a
+SAFETY reason, not a performance one: one interactive session got stuck on the
+SEGA screen and twelve scripted boots could not reproduce it.
+
+An A/B of it at a scene-verified mission was IN FLIGHT when this was written, in
+measure/batch_gameplay_*. It reports boot success (scene marker) and frame time
+per arm. Read it before doing anything else on speed.
+
+Larger and structural: NV2A vertex programs are INTERPRETED ON THE CPU on this
+host -- nv2a_vsh_execute, ~7.5 ms of a ~32 ms frame -- while the D3D11 path emits
+HLSL. src/nv2a/nv2a_vsh_msl.c is a complete MSL emitter with tests and is
+DELIBERATELY NOT WIRED IN. Three things break the moment vertex work moves to
+the GPU: triangle() assembles and culls on the CPU from the shader's own output
+and would lose oPos; prepare_vertices' VSH_REJECT paths vanish, so batches now
+dropped start drawing while their reject counters read zero (which looks like an
+improvement); and s_outputs/s_colors feed texture interpolation, the software
+rasteriser and the draw captures, all of which would silently read zeros. The
+cheapest next step is a compute kernel over the same inputs compared against the
+interpreter across all 16 outputs -- the shape vsh_reference_test.c already uses.
+
+
+8. MY RETRACTIONS TODAY
+========================
+Listed because the pattern is the useful part, as last session's was.
+
+  * "The text rendering is a new defect." It is the game's own art. I had
+    already written down the fact that kills the theory -- correct characters
+    either side of a wrong one -- and built on top of it anyway.
+  * "The self-link guard is the fix." It fires 47,293 times and moves nothing.
+  * "The guest never writes the list head." Asserted off a t=30 s sample taken
+    before any voice churn, when the only writes were three init writes to FFFF.
+    It writes it 33-36 times a run.
+  * "The INHERIT branch's arithmetic produces the self-link." Real code, never
+    executed: on_inherit=0 across 596 ONs. The counter caught the true producer
+    only because it was written as a READBACK of the outcome instead of as the
+    condition I expected.
+  * "Stale FEAV from a store lost through the guarded page." antecedent_sets
+    tracked on exactly at every report of every run.
+  * "opens=131 proves those runs never reached gameplay." The gameplay run
+    reports 131 too. The menu diagnosis was right and rests on a screenshot.
+
+Two process errors worth not repeating:
+  * I rebuilt the binary underneath a running A/B, which silently changed a
+    default halfway through the arms. Restarted it.
+  * I ran `git add -A` in a tree where a parallel agent was working and swept an
+    in-progress draft of nv2a_vsh_msl.c into an APU commit. Fixed forward.
+    Stage paths, not the tree, when anything else is writing here.
+
+
+9. WHAT I WOULD DO NEXT
+========================
+  1. LISTEN to it. The sound gate is a person's ears and nothing else closes it.
+  2. Read measure/batch_gameplay_* and decide RECOMP_METAL_BATCH's default. It
+     is the largest measured rendering win that is already built.
+  3. Section 3: why regs[top] is stale. Honour CVL/NVL in the walk so the
+     guest's removal handshake can steer it, which is what hardware does and
+     what RemoveIdleVoice is written against.
+  4. The MSL emitter's compute-kernel comparison, before anyone is tempted to
+     wire it in.
+  5. Re-run the crash rate. 11.8% in STATUS.md predates both APU changes, and
+     coalescing removed 92% of the interrupts into the ISR where those faults
+     land. It may have moved. It may not have.
+  6. Retire the NtOpenFile gate everywhere else it appears. It cannot come back
+     on a pre-cached HDD and it currently reports the opposite of the truth.
