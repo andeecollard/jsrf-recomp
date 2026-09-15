@@ -551,7 +551,14 @@ static NSString *const shader =
   * other two; a uniform bias would dither green twice as hard. */
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
- " return float4(c.rgb,1);}\n"
+ /* THE SHADED ALPHA, not 1. The blend unit takes its SRC_ALPHA and
+  * ONE_MINUS_SRC_ALPHA factors from this value, where the software path took
+  * them from c.a inside bfactor(). Returning 1 here silently turned every
+  * alpha-blended draw into an opaque one. The software path could get away
+  * with writing something else into alpha only because it had already done the
+  * blend itself by that point -- and it wrote depth there, which is the whole
+  * reason this path exists. */
+ " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
@@ -810,7 +817,20 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
     uint32_t func = s->depth_func ? s->depth_func : NV2A_GUEST_DEPTH_FUNC_DEFAULT;
     int cmp = s->depth_test ? nv2a_metal_compare_func(func)
                             : NV2A_MTL_CMP_ALWAYS;
-    if (cmp < 0) { ++g_hw_state_refusals; return nil; }
+    /* AN UNRECOGNISED COMPARE BECOMES ALWAYS, because that is precisely what
+     * the shader this path replaces does: cmpf()'s switch ends in
+     * "default: return true". Mirroring it is not guessing -- it is the whole
+     * requirement, because the two paths have to produce the same image before
+     * either can be preferred, and a path that refuses where the other passes
+     * is a different renderer, not a faster one.
+     *
+     * It is reachable. metal_batch_test sets depth_func = 4, a D3D-style
+     * D3DCMP_LESSEQUAL that the NV2A never emits -- its own encoding is the
+     * 0x200 range -- and the shader has been treating it as ALWAYS ever since.
+     * Whether that default should be `true` at all is a real question about
+     * the software path, with its own evidence to gather; it is not a question
+     * this commit gets to answer by quietly diverging. */
+    if (cmp < 0) { ++g_hw_state_refusals; cmp = NV2A_MTL_CMP_ALWAYS; }
 
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
     d.depthCompareFunction = (MTLCompareFunction)cmp;
@@ -821,8 +841,12 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
         int fail = nv2a_metal_stencil_op(s->stencil_fail);
         int pass = nv2a_metal_stencil_op(s->stencil_zpass);
         int zfail = nv2a_metal_stencil_op(s->stencil_zfail);
-        if (sc < 0 || fail < 0 || pass < 0 || zfail < 0)
-            { ++g_hw_state_refusals; return nil; }
+        /* Same rule, same reason: stop()'s switch ends in "default: return
+         * old", which is KEEP. */
+        if (sc < 0) { ++g_hw_state_refusals; sc = NV2A_MTL_CMP_ALWAYS; }
+        if (fail < 0) { ++g_hw_state_refusals; fail = NV2A_MTL_STENCIL_KEEP; }
+        if (pass < 0) { ++g_hw_state_refusals; pass = NV2A_MTL_STENCIL_KEEP; }
+        if (zfail < 0) { ++g_hw_state_refusals; zfail = NV2A_MTL_STENCIL_KEEP; }
         MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
         sd.stencilCompareFunction = (MTLCompareFunction)sc;
         sd.stencilFailureOperation = (MTLStencilOperation)fail;
@@ -1060,6 +1084,16 @@ void nv2a_metal_report(void)
     /* A full clear discards the surface instead of syncing it, so each of
      * these is one drain and one 4.9 MB readback that did not happen. Printed
      * with the state of the switch so an A/B can see the arms differ. */
+    /* Draws that actually took the hardware path, against the states it had to
+     * refuse. "The switch is on" and "the draws used it" are different facts,
+     * and a mixed frame -- some draws writing depth to the attachment, the
+     * rest to the colour alpha -- reads as a depth bug rather than as a
+     * fallback, which is exactly how this was first misread. */
+    fprintf(stderr,"[METAL] hw draws=%llu pipelines=%llu refusals=%llu (metal_hw %s)\n",
+            (unsigned long long)g_hw_draws,
+            (unsigned long long)g_hw_pipeline_misses,
+            (unsigned long long)g_hw_state_refusals,
+            hw_state_on()?"on":"OFF");
     fprintf(stderr,"[METAL] clear discards=%llu (clear_discard %s)\n",
             (unsigned long long)g_mtl_discards,
             g_mtl_discards?"used":"unused");
@@ -1748,7 +1782,21 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   int hw = hw_state_on() && hw_depth_tex && hw_stencil_tex;
   id<MTLRenderPipelineState> hw_pso_use = hw ? hw_pipeline_for(s) : nil;
   id<MTLDepthStencilState> hw_dss_use = hw ? hw_depth_state_for(s) : nil;
-  if (hw && (!hw_pso_use || !hw_dss_use)) hw = 0;   /* refused: fall back */
+  /* DEPTH OWNERSHIP IS EXCLUSIVE, so there is no "fall back for this draw".
+   *
+   * The software path stores depth in the colour attachment's alpha; the
+   * hardware path stores it in the depth attachment. Letting individual draws
+   * choose puts one quantity in two places, updated on different schedules,
+   * and nv2a_metal_sync can then only read one of them -- which is exactly
+   * what happened: every differing pixel had software 0x000000 against
+   * hardware 0xFFFFFF, the hardware attachment still holding its uploaded
+   * value because the draws that wrote depth had quietly used the other path.
+   *
+   * So an untranslatable state rejects the draw instead. reject() is the
+   * existing, counted route the pushbuffer executor already handles, and a
+   * rejected draw is visible; a silently mixed frame is not. */
+  if (hw && (!hw_pso_use || !hw_dss_use))
+    return reject("hw-state-untranslatable");
   MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
   if(hw){pass.depthAttachment.texture=hw_depth_tex;pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;
          pass.stencilAttachment.texture=hw_stencil_tex;pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;}
@@ -1825,6 +1873,16 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   if(batch_on()&&batch_encoder&&hw!=batch_encoder_hw){batch_flush();}
   batch_encoder_hw=hw;
   if(hw){[encoder setRenderPipelineState:hw_pso_use];[encoder setDepthStencilState:hw_dss_use];
+         /* CLAMP, not clip. Metal's default discards a fragment whose z leaves
+          * [0,1]; the software path clamped it and drew it anyway, which is
+          * also what the guest's CLAMP z-range policy asks for. The vertex
+          * shader deliberately does not clamp -- "clamping before the
+          * perspective multiply corrupts the endpoints the hardware clipper
+          * interpolates from", which is what made straddling ground polygons
+          * wrong -- so the clamp has to happen here, at the rasteriser, or
+          * geometry crossing the near plane renders differently on the two
+          * paths. */
+         [encoder setDepthClipMode:MTLDepthClipModeClamp];
          [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;}
   else [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
   if(batch_on()){
