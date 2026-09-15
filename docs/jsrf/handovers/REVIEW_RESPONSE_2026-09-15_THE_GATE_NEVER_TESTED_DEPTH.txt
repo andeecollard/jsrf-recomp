@@ -352,21 +352,47 @@ That is the flickering checkerboard: a 4x4 lattice error that compounds with
 each overlapping blended layer, over backgrounds that are mostly overlapping
 blended layers, changing frame to frame as the camera changes how many overlap.
 
-NOT A ONE-LINE FIX. Metal has no ROP-stage dither and the blend unit runs after
-the fragment shader, so this path cannot dither where the hardware does.
-Skipping the shader dither when blending was measured and is WORSE -- 92 pixels
-beyond one step against the current 19 -- because the oracle dithers and the
-hardware path then would not. The real options are a third pipeline that blends
-in-shader while keeping the real depth and stencil attachments (losing the
-ordering win only for dithered blended draws), or a documented divergence. That
-is a design decision.
+FIXED, with the third pipeline. Metal has no ROP-stage dither and the blend
+unit runs after the fragment shader, so a draw that needs dither after blend
+has to do the blend in the shader. fs_hw_blend does that and nothing else
+differently: it reads the destination, blends with the same bfactor() the
+software path uses, dithers after it, and leaves depth and stencil in the real
+attachments where the hardware path put them.
 
-NOT MEASURED: the magnitude at scale. This is 20 blended draws; a mission has
-far more overlap and compounding is the whole mechanism. The structure is
-confirmed; its size in a real frame is not.
+                        before                  after
+    phase A   hardware  8192 differ, 19 over      0 differ, 0 over   worst 0
+              hw + 565  8402 differ, 19 over    515 differ, 0 over   worst 1
+    phase F   hardware 23003 differ, 186 over     29 differ, 29 over
+              hw + 565 23601 differ, 196 over    932 differ, 29 over
 
-metal_hw_check.sh NOW FAILS, deliberately, naming this. Leaving dither out to
-keep it green would be the exact failure this review has been about.
+The hardware path is now exactly as close to the rasteriser as the software
+path, on both phases, and 565's remainder is entirely within one channel step.
+The lattice spread goes from 77/857 to 0/0. metal_hw_check.sh passes again, and
+passes because the defect is gone rather than because nobody asked -- the
+fixture still sets dither.
+
+Selected only where needed: hw_shader_blend() is blend && dither. Blending
+alone keeps the blend unit; dithering alone is already correct in fs_hw,
+because with nothing after it the bias IS the last step before quantisation. So
+the raster_order_group(0) it re-introduces is paid by dithered blended draws
+and nothing else.
+
+Two things that would have been silent bugs. The selector had to go into the
+pipeline CACHE KEY -- two draws with identical blend state but differing dither
+need different pipelines now, and keying on blend alone would have served one
+the other's pipeline. And HW_CACHE went 16 -> 32, because the key gaining a
+dimension can double the set and a miss is not a small slowdown: the draw is
+rejected and falls back to the CPU rasteriser.
+
+The obvious shortcut was measured and is WORSE: skipping the shader dither when
+blending scores 92 pixels beyond one step against the original 19, because the
+oracle dithers and the hardware path then would not.
+
+NOT MEASURED, and it gates defaulting anything on: the frame-time cost at a
+mission. The serialisation is bounded to dithered blended draws, but what
+fraction of a real frame those are is unknown, and the 9.6% the hardware path
+was worth should be re-taken. Also unmeasured: the magnitude of the original
+defect at scale -- this is 20 blended draws and a mission has far more overlap.
 
 
 11. THE FRAME-BOUNDARY TRACE, AND WHAT IT FOUND
@@ -428,18 +454,23 @@ the shape (the lattice), then write it down.
 
 12. WHAT IS STILL OPEN
 =======================
-  1. THE DITHER STAGE. Cause known, fix is a design decision (section 10).
-     metal_hw_check.sh is red until it is made.
+  1. RE-TAKE THE FRAME TIME. The dither fix re-introduces raster_order_group(0)
+     for dithered blended draws, and the 9.6% and 14.5% both predate it. No
+     default should move until that is measured.
   2. Whether the checkerboard fully accounts for what was seen, or only the
      grid half of it. "Solid black rectangles" and "a large black band" are not
      obviously dither, and the [FB] sampler in fbcheck-on shows frames at
-     203078 of 307200 nonzero pixels where the control shows 307152.
-  3. RECOMP_SURFACE_AUDIT is built and NOT YET RUN. It answers how often a
+     203078 of 307200 nonzero pixels where the control shows 307152. A person
+     playing it with the fix in is the cheapest answer.
+  3. Watch refusals= in the [METAL] report at a mission. HW_CACHE is 32 now on
+     an argument, not a measurement: pipelines=4..5 was measured before the key
+     gained a dimension.
+  4. RECOMP_SURFACE_AUDIT is built and NOT YET RUN. It answers how often a
      clear names a surface other than the held one, which decides how bad the
      discard defect would have been.
-  4. Re-run the 565 A/B on the current binary, which now names its attachment.
-  5. Re-run RECOMP_VSH_REUSE properly -- the original handover's item 3.
-  6. The software path's metal_copy_test line 49 depth mismatch, now the only
+  5. Re-run the 565 A/B on the current binary, which now names its attachment.
+  6. Re-run RECOMP_VSH_REUSE properly -- the original handover's item 3.
+  7. The software path's metal_copy_test line 49 depth mismatch, now the only
      arm failing an exact comparison.
-  7. ab_score.py's SWITCH_TOKEN covers seven switches; RECOMP_METAL_BATCH is an
+  8. ab_score.py's SWITCH_TOKEN covers seven switches; RECOMP_METAL_BATCH is an
      A/B arm that is not among them.
