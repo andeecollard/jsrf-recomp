@@ -618,3 +618,58 @@ WHAT IS STILL UNMEASURED, and is where I would look next:
 
 I do not know the cause. Three defects found this session are real, fixed and
 pinned, and none of them is this one.
+
+
+15. THE ARTEFACT, MEASURED AT GAMEPLAY AGAINST A MATCHED CONTROL
+=================================================================
+TWO EARLIER MEASUREMENTS IN THIS NOTE WERE OF THE WRONG THING, and a person
+watching the screen caught both. Sections 13 and 14 counted "black pixels" in
+frames that were the intro and a cutscene: the black bars in the intro are
+GRAPHIC ELEMENTS and the black bars in a cutscene are LETTERBOXING. The 105,000
+black pixels in the 65%-non-blank frames are letterbox, entirely legitimate.
+The picket-fence columns in section 14 are intro art. Neither was the bug, and
+every conclusion drawn from those counts is void.
+
+The artefact is obvious at GAMEPLAY and barely present anywhere else, which is
+why 200 s runs that stop at the cutscene kept missing it. Two 280 s runs, same
+pad, same capture stride, same capture indices:
+
+    DEFAULT path   clean. A gameplay frame -- player, chain-link fence,
+                   buildings, HUD, ground -- is pixel-correct.
+    HARDWARE path  the ground plane is cut into rectangular blocks: some black,
+                   some displaced, and the magenta-and-grey HUD meter appears
+                   down in the ground.
+
+Counting strong vertical discontinuities that land on a multiple of 64 and span
+at least a third of the screen:
+
+    hardware path, all three fixes in   66 over 11 frames   6.0 per frame
+    default path                         3 over  5 frames   0.6 per frame
+
+SO THE THREE DEFECTS FIXED IN THIS SESSION ARE NOT THIS ONE. They are real,
+they are pinned by phases, and the picture is unchanged.
+
+WHAT THE SHAPE SAYS. The blocks are axis-aligned in SCREEN space while the
+ground they corrupt is perspective-projected, so the corruption is in the
+surface, not in the geometry. The boundaries recur at {64, 128, 192, 256, 320,
+384, 448, 512, 576} -- every multiple of 64 across a 640-wide surface, in every
+frame. At RGBA32Float that is exactly 1024 bytes per band; at the guest's two
+bytes it is 128. And blocks carry content from ELSEWHERE in the same frame --
+the HUD meter in the ground is the clearest instance -- so this is misaddressed
+copying rather than lost drawing.
+
+WHAT IS STILL NOT KNOWN: which operation misaddresses it. The upload, the
+readback and the depth paths all index with the pitch the surface was captured
+with, and metal_copy_test puts every per-draw state byte-exact against the
+rasteriser. The 64-pixel period is the strongest clue in this whole
+investigation and it has not been explained.
+
+WHAT I WOULD DO NEXT, in order:
+  1. Score a GAMEPLAY frame, not the title screen. Every gate in this tree
+     scores a synthetic surface or an intro frame, which is why all of them
+     pass while the game is visibly wrong. metal_hw_check.sh cannot see this.
+  2. Find the source of a displaced block: cross-correlate a corrupted 64-wide
+     band against the rest of the frame and read off the offset. The offset in
+     pixels, or in bytes, names the addressing error directly.
+  3. Only then look for the code. Three sessions of reading have not found it
+     and one measurement of the offset would.
