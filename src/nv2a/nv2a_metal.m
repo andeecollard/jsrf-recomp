@@ -716,6 +716,12 @@ unsigned long long g_hw_pipeline_misses, g_hw_state_refusals;
 static id<MTLTexture> hw_depth_tex, hw_stencil_tex;
 static int batch_encoder_hw;
 unsigned long long g_hw_draws;
+/* Draws that took the SOFTWARE tail while the hardware path was switched on,
+ * and depth uploads that failed and caused it. Neither was counted, and the
+ * mixed frame they produce is the one the depth-ownership comment describes:
+ * "every differing pixel had software 0x000000 against hardware 0xFFFFFF".
+ * refusals= stays 0 through all of it, because reject() is never reached. */
+static unsigned long long g_hw_mixed, g_hw_upload_fail;
 
 /* MEASURED, and it is the first frame-time win this renderer has produced.
  *
@@ -948,7 +954,14 @@ static int hw_shader_blend(const NV2ATextureCopy *s)
      * verify the two arms actually differed. */
     static int on = -1;
     if (on < 0) { const char *e = getenv("RECOMP_METAL_SHADER_BLEND");
-                  on = e ? (atoi(e) != 0) : 1; }
+                  on = e ? atoi(e) : 1; }
+    /* =2 takes EVERY blended draw into the shader, not just the dithered ones.
+     * That is the bisect for the blend unit and for the ordering it runs
+     * without: with it, the hardware path blends exactly as the software path
+     * does, under raster_order_group(0), while keeping the real depth and
+     * stencil attachments. Depth and stencil are already ruled out, so if the
+     * lost regions come back here the blend stage owns them. */
+    if (on == 2) return s->blend;
     return on && s->blend && s->dither;
 }
 
@@ -1059,15 +1072,22 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     return pso;
 }
 
-static struct { uint32_t key[9]; id<MTLDepthStencilState> dss; }
+/* ELEVEN, and it was nine. The key has to name every field the descriptor
+ * below reads, or the cache serves a state built for a different draw.
+ * stencil_zfail feeds depthFailureOperation and stencil_func_mask feeds
+ * readMask, and neither was in the key -- so two draws differing only in one
+ * of those got whichever state was built first, on the hardware path only,
+ * silently. metal_batch_test phase I measures it at 8056 of 65536 pixels. */
+static struct { uint32_t key[11]; id<MTLDepthStencilState> dss; }
     hw_dss[HW_CACHE];
 static unsigned hw_dss_n;
 
 static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
 {
-    uint32_t k[9] = { s->depth_test, s->depth_write, s->depth_func,
-                      s->stencil_test, s->stencil_write, s->stencil_mask,
-                      s->stencil_func, s->stencil_fail, s->stencil_zpass };
+    uint32_t k[11] = { s->depth_test, s->depth_write, s->depth_func,
+                       s->stencil_test, s->stencil_write, s->stencil_mask,
+                       s->stencil_func, s->stencil_fail, s->stencil_zpass,
+                       s->stencil_zfail, s->stencil_func_mask };
     unsigned i;
     for (i = 0; i < hw_dss_n; ++i)
         if (!memcmp(hw_dss[i].key, k, sizeof k)) return hw_dss[i].dss;
@@ -1095,8 +1115,47 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
     if (cmp < 0) { ++g_hw_state_refusals; cmp = NV2A_MTL_CMP_ALWAYS; }
 
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+    /* RECOMP_METAL_HW_DEPTH_ALWAYS=1 neuters the depth test on this path only.
+     *
+     * A bisect instrument, not a mode. The hardware path loses large
+     * rectangular regions of a real frame that the software path renders
+     * correctly, and the two candidate shapes are "the draws never reach the
+     * attachment" and "the draws reach it and the depth unit rejects them
+     * against contents that are wrong". Forcing ALWAYS separates those in one
+     * run: if the missing regions come back, the uploaded depth is the
+     * problem; if they stay missing, depth is not involved and the stencil,
+     * the blend unit or the store is.
+     *
+     * It renders incorrectly by construction -- everything draws over
+     * everything -- so it is only ever a diagnostic. */
+    {
+        static int always = -1;
+        if (always < 0) always = recomp_switch_on("RECOMP_METAL_HW_DEPTH_ALWAYS");
+        if (always) { cmp = NV2A_MTL_CMP_ALWAYS; }
+    }
     d.depthCompareFunction = (MTLCompareFunction)cmp;
-    d.depthWriteEnabled = s->depth_write ? YES : NO;
+    /* GATED ON THE TEST, like the software tail and like the hardware.
+     *
+     * This read s->depth_write alone, while the fragment tail derives its flag
+     * as depth_test && depth_write and nv2a_metal_draw marks depth_dirty on
+     * the same pair. With the test off, cmp is forced to ALWAYS above, so a
+     * draw with the mask still set -- an overlay, a UI quad -- stamped its own
+     * depth over everything it covered on this path and over nothing on the
+     * other. The NV2A does not update depth when the test is disabled, and
+     * neither does nv2a_texture_copy.c.
+     *
+     * The second-order half is worse than the divergence: depth_dirty is not
+     * set for such a draw, so whatever this wrote was never read back and the
+     * next surface swap re-uploaded over it from stale guest RAM. */
+    d.depthWriteEnabled = (s->depth_test && s->depth_write) ? YES : NO;
+    {   /* RECOMP_METAL_HW_NO_STENCIL=1: the same bisect, one stage along.
+         * Depth was ruled out by forcing ALWAYS and watching the regions stay
+         * missing; this asks the question of the stencil unit. Diagnostic
+         * only -- a path that ignores stencil renders wrongly by construction. */
+        static int off = -1;
+        if (off < 0) off = recomp_switch_on("RECOMP_METAL_HW_NO_STENCIL");
+        if (off) goto no_stencil;
+    }
     if (s->stencil_test || s->stencil_write) {
         int sc = s->stencil_test ? nv2a_metal_compare_func(s->stencil_func)
                                  : NV2A_MTL_CMP_ALWAYS;
@@ -1118,6 +1177,8 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
         sd.writeMask = s->stencil_write ? (s->stencil_mask & 255) : 0;
         d.frontFaceStencil = sd; d.backFaceStencil = sd;
     }
+no_stencil:
+    ;
     id<MTLDepthStencilState> dss = [device newDepthStencilStateWithDescriptor:d];
     if (!dss) { ++g_hw_state_refusals; return nil; }
     memcpy(hw_dss[hw_dss_n].key, k, sizeof k);
@@ -1355,6 +1416,9 @@ void nv2a_metal_report(void)
             "(metal_shader_blend %s)\n",
             nv2a_metal_shader_blend_on()?"on":"OFF",
             nv2a_metal_shader_blend_on()?"on":"OFF");
+    fprintf(stderr,"[METAL] MIXED draws (software tail while hw on)=%llu, "
+            "depth uploads failed=%llu\n",
+            (unsigned long long)g_hw_mixed,(unsigned long long)g_hw_upload_fail);
     fprintf(stderr,"[METAL] hw draws=%llu pipelines=%llu refusals=%llu (metal_hw %s)\n",
             (unsigned long long)g_hw_draws,
             (unsigned long long)g_hw_pipeline_misses,
@@ -2104,7 +2168,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * moment, so the two paths start from identical depth. If this fails the
     * textures are left nil and every draw below falls back to the software
     * path -- slower, and correct. */
-   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){hw_depth_tex=nil;hw_stencil_tex=nil;}}
+   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){++g_hw_upload_fail;hw_depth_tex=nil;hw_stencil_tex=nil;}}
   /* The hardware-state path attaches real depth and stencil buffers and drops
    * the second colour attachment the software path used to carry stencil in.
    * Chosen per draw rather than per surface because a state this path cannot
@@ -2224,7 +2288,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
           * paths. */
          [encoder setDepthClipMode:MTLDepthClipModeClamp];
          [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;}
-  else [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+  else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
   if(batch_on()){
    if(pinned_slab>=0)batch_pins|=1u<<(unsigned)pinned_slab;
    ++batch_draws;

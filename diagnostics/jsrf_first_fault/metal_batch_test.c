@@ -464,6 +464,119 @@ int main(int argc, char **argv)
                "the retained one still discards\n", bad, W * H);
     }
 
+    /* H -- depth_write=1 with depth_test=0, which is what a UI or overlay quad
+     * looks like, and which no phase had ever set.
+     *
+     * The NV2A does not update depth when the depth test is off, and neither
+     * does nv2a_texture_copy.c nor the software fragment tail, which derives
+     * its flag as depth_test && depth_write. The hardware path took
+     * s->depth_write alone and paired it with a compare forced to ALWAYS, so
+     * such a draw overwrites depth across its whole area. Everything drawn
+     * into that area afterwards then fails the depth test and never appears --
+     * a rectangle of missing picture, shaped like the overlay that stamped it.
+     *
+     * Second-order: depth_dirty is only set for depth_test && depth_write, so
+     * the depth the hardware path wrote here is never read back, and the next
+     * surface swap re-uploads over it from stale guest RAM.
+     *
+     * Draw an overlay that stamps depth it should not, then draw geometry
+     * behind it that must still be visible. */
+    {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        unsigned bad = 0, hw = 0, one = 0;
+        memset(swap_t[0], 0xcc, TARGET_BYTES);
+        for (d = 0; d < DEPTH_BYTES; d += 4) {
+            swap_z[0][d] = 0x5a; swap_z[0][d+1] = 0xff;
+            swap_z[0][d+2] = 0xff; swap_z[0][d+3] = 0xff;
+        }
+        memcpy(swap_o[0], swap_t[0], TARGET_BYTES);
+        memcpy(swap_oz[0], swap_z[0], DEPTH_BYTES);
+        nv2a_metal_invalidate(NULL);
+        for (d = 0; d < 24; ++d) {
+            base_state(&s);
+            if (d & 1) {          /* the overlay: no test, mask still set */
+                s.depth_test = 0; s.depth_write = 1;
+            } else {              /* ordinary depth-tested geometry behind it */
+                s.depth_test = 1; s.depth_write = 1; s.depth_func = 0x203;
+            }
+            fill_tri(v, 0);
+            if (!nv2a_texture_copy_triangle_depth(&s, textures[d % TEXTURES], TEX_BYTES,
+                                                  swap_o[0], TARGET_BYTES,
+                                                  swap_oz[0], DEPTH_BYTES,
+                                                  v[0], v[1], v[2]))
+                continue;
+            if (!draw(&s, textures[d % TEXTURES], swap_t[0], swap_z[0], v, 3, "H"))
+                return 1;
+        }
+        CHECK(nv2a_metal_sync());
+        score(swap_t[0], swap_o[0], TARGET_BYTES, &bad, &hw, &one);
+        printf("metal depth-mask: depth_write with depth_test off differs from "
+               "the rasteriser on %u of %u pixels (worst %u step(s), %u within "
+               "one)\n", bad, W * H, hw, one);
+        if (bad - one > (W * H) / 100u) {
+            fprintf(stderr, "phase H: %u pixels beyond one step -- depth was "
+                    "written by a draw that does not test depth\n", bad - one);
+            return 1;
+        }
+    }
+
+    /* I -- two draws that differ ONLY in a field the depth/stencil cache does
+     * not key on.
+     *
+     * hw_depth_state_for caches MTLDepthStencilState objects under a nine-word
+     * key, but the descriptor it builds reads ELEVEN fields: stencil_zfail
+     * feeds depthFailureOperation and stencil_func_mask feeds readMask, and
+     * neither is in the key. Two draws differing only in one of those are
+     * served whichever state was built first, silently, on the hardware path
+     * only -- the software tail takes all eleven per draw through Params.
+     *
+     * A wrong stencil read mask changes which fragments pass over a whole
+     * masked region, which is what makes this worth a phase rather than a
+     * comment: it is the shape of "a region that should be there is not".
+     *
+     * Stencil holds 0x0F. Both draws compare EQUAL against ref 0xFF:
+     *     func_mask 0xFF -> 0xFF vs 0x0F, fails, nothing drawn
+     *     func_mask 0x0F -> 0x0F vs 0x0F, passes, drawn
+     * so the second must differ from the first. Cached on the first key alone,
+     * it does not. */
+    {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        unsigned bad = 0, wst = 0, one = 0, k;
+        memset(swap_t[0], 0xcc, TARGET_BYTES);
+        for (d = 0; d < DEPTH_BYTES; d += 4) {
+            swap_z[0][d] = 0x0F; swap_z[0][d+1] = 0xff;
+            swap_z[0][d+2] = 0xff; swap_z[0][d+3] = 0xff;
+        }
+        memcpy(swap_o[0], swap_t[0], TARGET_BYTES);
+        memcpy(swap_oz[0], swap_z[0], DEPTH_BYTES);
+        nv2a_metal_invalidate(NULL);
+        for (k = 0; k < 2; ++k) {
+            base_state(&s);
+            s.stencil_test = 1; s.stencil_write = 0;
+            s.stencil_func = 0x202;                 /* EQUAL */
+            s.stencil_ref = 0xFF;
+            s.stencil_mask = 0xFF;
+            s.stencil_func_mask = k ? 0x0F : 0xFF;  /* the only difference */
+            s.stencil_fail = s.stencil_zfail = s.stencil_zpass = 0x1e00; /* KEEP */
+            fill_tri(v, 0);
+            if (!nv2a_texture_copy_triangle_depth(&s, textures[k], TEX_BYTES,
+                                                  swap_o[0], TARGET_BYTES,
+                                                  swap_oz[0], DEPTH_BYTES,
+                                                  v[0], v[1], v[2]))
+                continue;
+            if (!draw(&s, textures[k], swap_t[0], swap_z[0], v, 3, "I")) return 1;
+        }
+        CHECK(nv2a_metal_sync());
+        score(swap_t[0], swap_o[0], TARGET_BYTES, &bad, &wst, &one);
+        printf("metal dss key: two draws differing only in stencil_func_mask "
+               "differ from the rasteriser on %u of %u pixels\n", bad, W * H);
+        if (bad > (W * H) / 1000u) {
+            fprintf(stderr, "phase I: %u pixels wrong -- the depth/stencil "
+                    "cache served a state built for a different key\n", bad);
+            return 1;
+        }
+    }
+
     if (!drawn) { fprintf(stderr, "no triangles survived assembly\n"); return 1; }
     printf("metal batch (%s): %lu triangles over 6 phases "
            "(overlap, ring wrap, texture eviction, surface change, readback, "
