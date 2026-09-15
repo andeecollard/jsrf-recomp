@@ -11,6 +11,9 @@ int nv2a_metal_draw(const NV2ATextureCopy *state, const uint8_t *texture,
 int nv2a_metal_sync(void);
 /* Synchronize, then require the next draw to upload CPU-modified pixels. */
 void nv2a_metal_invalidate(uint8_t *target);
+/* Drop the retained surface without reading it back. Only valid when the
+ * caller is about to overwrite every byte of it -- see the definition. */
+void nv2a_metal_discard(void);
 /* Stable diagnostic label for the most recent -1 result. */
 const char *nv2a_metal_last_reject(void);
 /* Compact cumulative counters for live performance validation. */

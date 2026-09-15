@@ -15,6 +15,7 @@
 #define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()
 #define nv2a_gpu_invalidate  nv2a_metal_invalidate
 #define nv2a_gpu_invalidate_range(target, bytes) nv2a_metal_invalidate(target)
+#define nv2a_gpu_discard     nv2a_metal_discard
 #define nv2a_gpu_last_reject nv2a_metal_last_reject
 #define nv2a_gpu_report      nv2a_metal_report
 #elif defined(_WIN32)
@@ -215,6 +216,78 @@ static int vsh_reuse_on(void)
     static int on = -1;
     if (on < 0) on = getenv("RECOMP_VSH_REUSE") ? 1 : 0;
     return on;
+}
+
+/* THE OUTPUT SLOTS ANYTHING DOWNSTREAM CAN ACTUALLY READ.
+ *
+ * s_outputs is float[4096][16][4] -- 1 MB -- and every vertex writes all 256
+ * bytes of its row, whether the shader ran or the reuse cache served it. That
+ * write is the per-vertex cost: with RECOMP_VSH_REUSE on, a cache hit -- which
+ * skips the attribute fetch AND the shader entirely and does nothing but this
+ * copy -- still costs 93% of a full transform. Measured, three runs, 50.4%
+ * duplicate indices moving the vsh stage only 5.79 -> 5.52/5.68 ms. The
+ * arithmetic was never the expense. The streaming write into a 1 MB array is.
+ *
+ * Of the sixteen slots, NINE are dead. 1, 2 and 13-15 have no output register
+ * in NV2AVshOutputReg at all, so no program can write them. FOG(5), PTS(6),
+ * B0(7) and B1(8) are real registers a program may write, and nothing reads
+ * them: grepping every NV2A_VSH_OUT_* mention across nv2a_metal.m,
+ * nv2a_texture_copy.c and this file yields only T0, D0 and D1, plus POS as a
+ * bare [0] and T1-T3 computed as [9+u]. The Metal backend's own vertex
+ * assembly takes exactly 0, 3, 4 and 9..12 and ignores the rest -- so this
+ * model drops fog, point size and back-face colours today, and narrowing the
+ * copy does not change that, it only stops paying to stage values no one
+ * collects.
+ *
+ * The two diagnostics that DO read all sixteen -- capture_draw, and the
+ * reuse verifier's full-row memcmp -- force the wide copy when they are on,
+ * which is why this is a predicate rather than a constant.
+ *
+ * RECOMP_VSH_NARROW_OUTPUTS=1 enables it. Default OFF until an A/B says which
+ * value is wrong: the argument above is a good one, and a good argument is
+ * exactly what shipped a regression earlier today. */
+static const uint8_t s_live_outputs[] = { 0, 3, 4, 9, 10, 11, 12 };
+
+/* A clear of BOTH halves overwrites every byte of the retained surface, so
+ * reading that surface back first is pure waste -- see nv2a_metal_discard.
+ * The readback and the command-buffer wait it skips are, by this file's own
+ * profile, most of what the clear stage costs.
+ *
+ * Gated because it is a correctness claim about coverage, not a tuning knob:
+ * if a guest ever cleared both halves over LESS than the full clip region,
+ * this would discard pixels it should have kept. clear_surface's CPU loops run
+ * over clip_w x clip_h and the Metal surface is clip_w x clip_h, so that
+ * cannot currently happen -- but the switch is how that gets falsified rather
+ * than assumed.
+ *
+ * RECOMP_CLEAR_DISCARD=1 enables it. */
+static int clear_discard_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CLEAR_DISCARD");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
+static int vsh_narrow_outputs(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VSH_NARROW_OUTPUTS");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
+static inline void copy_live_outputs(float dst[16][4], const float src[16][4])
+{
+    unsigned k;
+    for (k = 0; k < sizeof s_live_outputs; ++k) {
+        unsigned s = s_live_outputs[k];
+        memcpy(dst[s], src[s], sizeof dst[s]);
+    }
 }
 static int vsh_reuse_verify(void)
 {
@@ -1659,6 +1732,27 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+    /* Will this clear overwrite EVERY byte of the retained surface?
+     *
+     * Decided here, before either half runs, because the win is skipping both
+     * syncs and the depth half comes first. Requires: both depth and stencil
+     * (param&3 == 3), all three colour channels -- alpha is discarded on
+     * download to RGB565 so it is not required, the same rule the D3D11
+     * resident clear uses -- a 16-bit target, and every guard the colour half
+     * below would otherwise bail on. If the DEPTH half turns out not to run,
+     * `discarded` stays 0 and the colour half invalidates normally, so a
+     * half-taken decision costs the win rather than the pixels. */
+    int want_discard = 0, discarded = 0;
+#ifdef nv2a_gpu_discard
+    want_discard = clear_discard_on() && (param & 3u) == 3u
+                && (param & (NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G
+                             | NV097_CLEAR_SURFACE_B))
+                   == (NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G
+                       | NV097_CLEAR_SURFACE_B)
+                && bpp == 2 && s_gpu.color_offset && s_gpu.pitch
+                && s_gpu.clip_h && s_gpu.clip_w;
+#endif
+    (void)want_discard;
     /* The invalidate is per surface, and moved down to each half.
      *
      * It used to be one nv2a_gpu_invalidate(NULL) here, which flushes and
@@ -1734,7 +1828,16 @@ static void clear_surface(uint32_t param)
                         s_gpu.clip_w, s_gpu.clip_h, x0, y0, x1, y1,
                         param & 3u, value);
 #endif
-                if (!gpu_cleared) nv2a_gpu_invalidate_range(z, bytes);
+                if (!gpu_cleared) {
+#ifdef nv2a_gpu_discard
+                    /* Reaching here with z valid means the CPU loop below
+                     * will write the whole depth range, and want_discard
+                     * already established the colour half will too. */
+                    if (want_discard) { nv2a_gpu_discard(); discarded = 1; }
+                    else
+#endif
+                    nv2a_gpu_invalidate_range(z, bytes);
+                }
             }
 #endif
 #ifdef nv2a_gpu_surface_report
@@ -1805,7 +1908,7 @@ static void clear_surface(uint32_t param)
                         bytes, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
                         param, s_gpu.clear_color);
 #endif
-            if (!gpu_cleared)
+            if (!gpu_cleared && !discarded)
                 nv2a_gpu_invalidate_range(mem + s_gpu.color_offset, bytes);
         }
 #endif
@@ -2183,6 +2286,11 @@ static int prepare_vertices(void)
      * is wrong", and rarity does not distinguish them either. */
     static float reuse_inputs[NV_MAX_INDICES][16][4];
     int reuse_active = (vsh_reuse_on() || vsh_reuse_verify()) && programmable;
+    /* Wide copy whenever something reads the slots the narrow one leaves
+     * stale: the reuse verifier compares all sixteen, and capture_draw writes
+     * all sixteen to its JSON. Both are opt-in, so at gameplay this is 1. */
+    const int narrow_outputs = vsh_narrow_outputs() && !vsh_reuse_verify()
+                               && !getenv("RECOMP_DRAW_CAPTURE");
 
     for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
         if (programmable) {
@@ -2193,7 +2301,10 @@ static int prepare_vertices(void)
                 (reuse_seen[reuse_key >> 3] & (1u << (reuse_key & 7))))
                 reuse_from = (int)reuse_at[reuse_key];
             if (reuse_from >= 0 && vsh_reuse_on() && !vsh_reuse_verify()) {
-                memcpy(s_outputs[i],   s_outputs[reuse_from],   sizeof(s_outputs[i]));
+                if (narrow_outputs)
+                    copy_live_outputs(s_outputs[i], s_outputs[reuse_from]);
+                else
+                    memcpy(s_outputs[i], s_outputs[reuse_from], sizeof(s_outputs[i]));
                 memcpy(s_positions[i], s_positions[reuse_from], sizeof(s_positions[i]));
                 s_colors[i] = s_colors[reuse_from];
                 g_vsh_reuse_hits++;
@@ -2239,7 +2350,10 @@ static int prepare_vertices(void)
                 VSH_REJECT("shader execution failed", s_vsh.decoded.length);
             if ((result.written[0] & 12) != 12)
                 VSH_REJECT("program left oPos.zw unwritten", result.written[0]);
-            memcpy(s_outputs[i], result.output, sizeof(s_outputs[i]));
+            if (narrow_outputs)
+                copy_live_outputs(s_outputs[i], result.output);
+            else
+                memcpy(s_outputs[i], result.output, sizeof(s_outputs[i]));
             memcpy(s_positions[i], result.output[0], sizeof(s_positions[i]));
             s_colors[i] = pack_color(result.output[NV2A_VSH_OUT_D0]);
             /* NV2A programs include the viewport transform and perspective
@@ -3593,6 +3707,16 @@ void nv2a_pb_exec_report(void)
     }
     fprintf(stderr, "[VSH] executed batches=%u rejected=%u mode=%u start=%u slots=%d\n",
             s_vsh.batches, s_vsh.rejected, s_vsh.mode, s_vsh.start, s_vsh.decoded.length);
+    /* A rejected batch is a batch the player does not see, so the split
+     * between "we could not normalise a normal nothing reads" -- which now
+     * draws -- and "we could not normalise one something reads" -- which still
+     * does not -- is the difference between a fixed bug and a remaining one.
+     * Printed unconditionally and beside the reject list, because the whole
+     * failure here was that 37,575 dropped draws sat inside one number. */
+    if (nv2a_ff_normal_unread || nv2a_ff_normal_read)
+        fprintf(stderr, "[VSH] degenerate normals: %lu drawn (nothing read it)"
+                ", %lu still rejected (lighting or NORMAL_MAP texgen reads it)\n",
+                nv2a_ff_normal_unread, nv2a_ff_normal_read);
     for (size_t i = 0; i < sizeof s_vsh_reject / sizeof s_vsh_reject[0]; ++i) {
         if (!s_vsh_reject[i].reason) break;
         fprintf(stderr, "[VSH]   %8u  %s (first detail %u)\n",

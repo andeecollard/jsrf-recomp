@@ -76,6 +76,9 @@ static inline unsigned long long mtl_now_ns(void)
  * so a wrap that waited on a slab this batch is about to read would wait for a
  * command buffer that has not been committed and never will be.  Flushing
  * first turns that deadlock into an ordinary wait. */
+/* Full clears that dropped the surface instead of syncing it. Each one is
+ * a GPU drain and a 4.9 MB readback that did not happen. */
+static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
 static unsigned batch_draws, batch_pins;
@@ -757,6 +760,12 @@ void nv2a_metal_report(void)
             "  A resident clear could remove the second only.\n",
             (unsigned long long)sync_calls,(unsigned long long)sync_clean,
             g_sync_drain_ns/1e6,g_sync_read_ns/1e6);
+    /* A full clear discards the surface instead of syncing it, so each of
+     * these is one drain and one 4.9 MB readback that did not happen. Printed
+     * with the state of the switch so an A/B can see the arms differ. */
+    fprintf(stderr,"[METAL] clear discards=%llu (clear_discard %s)\n",
+            (unsigned long long)g_mtl_discards,
+            g_mtl_discards?"used":"unused");
     fprintf(stderr,"[METAL] texture buffers: %llu requests, %llu cache hits, %llu uploads; vertices: %llu inline, %llu allocated\n",
         (unsigned long long)texture_requests,(unsigned long long)texture_hits,
         (unsigned long long)texture_uploads,(unsigned long long)inline_vertex_batches,
@@ -992,6 +1001,42 @@ int nv2a_metal_sync(void)
         free(rgba);
         g_sync_read_ns += mtl_now_ns()-_t_drained;
         return 1;}
+}
+
+/* DROP THE RETAINED SURFACE WITHOUT READING IT BACK.
+ *
+ * nv2a_metal_invalidate syncs first, because in general guest RAM has to
+ * receive whatever the GPU rendered before the CPU is allowed to write there.
+ * A FULL clear is the one case where that is provably pointless: the CPU is
+ * about to overwrite every byte of the region with a constant, so every byte
+ * the readback writes is dead on arrival.
+ *
+ * clear_surface's own CPU loops run over clip_w x clip_h, which is exactly the
+ * region this surface covers, so coverage is not in question -- the only
+ * question is whether BOTH halves are being cleared, because colour and depth
+ * share one RGBA32Float texture here (depth is packed into alpha). A
+ * colour-only clear still needs depth preserved and vice versa, so the caller
+ * only reaches this when the guest cleared both.
+ *
+ * What is skipped, per clear: [last_command waitUntilCompleted], a 4.9 MB
+ * getBytes, and two 307k-pixel conversion loops. A sampling profile put 12.8%
+ * and 14.5% of the rendering thread under one clear_surface path, "most of it
+ * waiting for a command buffer or in the readback" -- this is that cost, and
+ * for a full clear it buys nothing.
+ *
+ * No wait is needed before releasing the textures: Metal keeps a texture alive
+ * for any command buffer still referencing it, so committing the open batch
+ * and dropping our reference is safe. dirty is cleared too, so a later sync
+ * cannot try to read back a surface that has been abandoned. */
+
+void nv2a_metal_discard(void)
+{
+    @autoreleasepool{
+        batch_flush();
+        ++g_mtl_discards;
+        surface_valid=depth_valid=0;
+        surface_dirty=depth_dirty=0;
+    }
 }
 
 void nv2a_metal_invalidate(uint8_t *target)
