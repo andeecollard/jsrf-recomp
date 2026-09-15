@@ -14,6 +14,29 @@ records four hypotheses it killed, three of them mine.
 Three runs, `pad/gameplay.pad` driving them unattended — the schedule that
 skates and sprays rather than parking the player, so voices actually retire.
 
+**They did not reach gameplay, and that bounds every claim below.** A person
+looked at the window during the fourth run and found the title sitting in the
+VS **Battle mode stage-select menu**. The boot prefix is timing-fragile by its
+own admission — `new_game.pad`'s header says the logos vary by ten seconds or
+more between runs — and the `A` that should take New Game took multiplayer
+instead. All three runs show `NtOpenFile` = **131**, against 1342 for the title
+plateau and 1408 for New Game. `ord175` was 63,794–67,926, so input was healthy
+throughout; the title was not stalled, it was in the wrong branch of the menu.
+
+What the runs therefore measure is the voice list under the Battle-mode menu's
+own churn — cursor and stage-preview sounds — which turns out to exercise it
+hard: 196–233 ONs and 179–226 retirements, more than any scripted run in this
+repository has previously produced. The mechanism below is established on that
+traffic, and it is the same code either way.
+
+What is **not** established is that this mechanism produces the gameplay trap
+storm. That storm is real and separately measured — `20260915-110630`,
+`NtOpenFile` 1410, `ord175` 73,645, v3 raising 19,552 of 19,585 traps — but that
+run predates this instrumentation and carries none of it. The two have not been
+joined, and joining them needs an instrumented run that actually reaches a
+stage. Until then this is a mechanism demonstrated in a menu and a storm
+observed at gameplay, with a plausible but unproven identity between them.
+
 | run | length | on | off | off_commands | idle_trap | self_link |
 |---|---|---|---|---|---|---|
 | `20260915-120238-feav2` | 260 s | 233 | 226 | 222 | 18879 | 35 |
