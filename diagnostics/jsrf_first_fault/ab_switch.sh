@@ -32,6 +32,19 @@
 # that script's own header documents: the switch and RECOMP_SEQ_REPORT in the
 # environment, JSRF_BIN for the binary.
 #
+# WAITING FOR THIS SCRIPT TO FINISH: watch THIS SCRIPT, not the emulator.
+#
+#     while pgrep -f "ab_switch.sh <name>" >/dev/null; do sleep 60; done
+#
+# `pgrep -x jsrf_first_fault` is the obvious check and it is wrong: it is false
+# between runs, while the HDD for the next one is being staged. Waiting on it
+# reports "finished" several times during a normal A/B. On 15 Sep that led to a
+# rebuild landing underneath a live A/B -- which the binary pin below caught and
+# aborted, correctly -- and to a second A/B being launched on top of the first,
+# whose runs then refused with "jsrf_first_fault is already running" and whose
+# one completed run was contending for the GPU with the other A/B and measured
+# the contention.
+#
 # PINNED BINARY. The binary is hashed before the first run and re-hashed before
 # every run after it, and a change aborts the whole A/B. On 15 Sep a rebuild
 # landed underneath a running A/B and silently changed a compiled-in default
