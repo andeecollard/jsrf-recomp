@@ -13,11 +13,23 @@ is believed rather than measured it says so.
 | Audio | output holds 47,602–48,006 Hz across every scene measured, 14 runs |
 | Controller input | 7 of 7 full 300 s runs retire USB transfers continuously; the guest's own driver acknowledges ~31,000 done queues per run |
 | Tutorial | completes; the title reaches the playable part |
-| Tests | 28/30 C tests, 44/44 recompiler Python tests |
+| Tests | 28/28 C tests, 56/56 translator Python tests — both re-run 15 Sep 2026 at `6b56ef1` |
 
-The two failing C tests fail deliberately. They are site-specific gates on two
-unresolved lifter defects and are documented as such in `CMakeLists.txt`; a
-green suite there would mean the gate had stopped working.
+The C suite is green because the checks it used to fail on were RETIRED, not
+because they started passing by luck. `CMakeLists.txt` records each one: four
+site-specific gates retired on 13 Sep 2026 and two more on 14 Sep, each the
+moment the lifter began emitting the fixed form by itself — at which point the
+check asserts a pre-fix text that no longer exists and fails FOR the fix. The
+unresolved-flags ratchet was re-based the same week: it was set at 76 against a
+tree at 90, so it could never pass, and it gated on a total dominated by data
+the linear sweep walked into as code. It gates the reachable count now, at 2.
+
+Read the 28 narrowly. They are `diagnostics/jsrf_first_fault`'s, and that is the
+whole of the C-side coverage this fork runs: `tests/` at the repository root is
+built by nothing — no `add_subdirectory(tests)` exists anywhere, and two of its
+four directories have no `CMakeLists.txt` of their own. Green here says nothing
+about them. Recorded at `462b656`; the detail is in
+`docs/jsrf/EXPERIMENT_CONTROLS.md`.
 
 ## Not working
 

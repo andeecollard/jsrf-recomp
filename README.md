@@ -11,9 +11,11 @@ upstream where they belong.
 
 > **This is a work in progress, not a release.** It boots, renders, plays music
 > and reaches gameplay. It also runs at about half the frame rate it should,
-> crashes in roughly one run in five, and gets the intro card transitions
-> wrong. The honest state is in [docs/jsrf/STATUS.md](docs/jsrf/STATUS.md) and
-> it is kept current with measurements rather than impressions.
+> faults in 46 of 390 recorded runs (11.8%) — with the hazard concentrated at
+> the title-menu-to-first-mission transition rather than spread through the
+> run — and gets the intro card transitions wrong. The honest state is in
+> [docs/jsrf/STATUS.md](docs/jsrf/STATUS.md) and it is kept current with
+> measurements rather than impressions.
 
 ## You need your own copy of the game
 

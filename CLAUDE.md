@@ -38,8 +38,9 @@ The generated C is **not** in git — it is hundreds of MB, rebuilt by
 ```sh
 cmake -S diagnostics/jsrf_first_fault -B <build> -DRECOMP_GEN_DIR=<gen dir>
 cmake --build <build> -j
-ctest --test-dir <build>            # 28/30; the two failures are
-                                   # deliberate gates, see CMakeLists.txt
+ctest --test-dir <build>            # 28/28. Those 28 are
+                                   # diagnostics/jsrf_first_fault's; tests/
+                                   # at the repo root is built by nothing
 ```
 
 ```sh
