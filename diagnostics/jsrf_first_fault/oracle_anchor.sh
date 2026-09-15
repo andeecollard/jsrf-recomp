@@ -18,9 +18,10 @@ HOST="$1"; CLOCK="$2"; OUT="$3"
 [ -n "$OUT" ] || { echo "usage: $0 mac|win <clock> <outdir>" >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SCRATCH="${ORACLE_SCRATCH:-/tmp/jsrf-oracle}"
+STOCK="${JSRF_HDD_SRC:-$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd}"
+[ -d "$STOCK" ] || { echo "no emulated-hdd at $STOCK -- set JSRF_HDD_SRC" >&2; exit 1; }
 rm -rf "$OUT" "$SCRATCH/hdd-$HOST-$CLOCK"; mkdir -p "$OUT" "$SCRATCH"
-cp -R "$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" \
-      "$SCRATCH/hdd-$HOST-$CLOCK"
+cp -R "$STOCK" "$SCRATCH/hdd-$HOST-$CLOCK"
 XBE="$ROOT/../Jet Set Radio Future (US)/default.xbe"
 DIR="$ROOT/../Jet Set Radio Future (US)"
 START=$(date +%s)

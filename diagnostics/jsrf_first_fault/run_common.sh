@@ -90,6 +90,7 @@ jsrf_hdd_manifest() {
 jsrf_stage_hdd() {
     if [ ! -d "$JSRF_HDD_SRC" ]; then
         echo "no emulated HDD at $JSRF_HDD_SRC" >&2
+        echo "  set JSRF_HDD_SRC to the directory holding it" >&2
         exit 1
     fi
     cp -R "$JSRF_HDD_SRC" "$SCRATCH/hdd" || exit 1

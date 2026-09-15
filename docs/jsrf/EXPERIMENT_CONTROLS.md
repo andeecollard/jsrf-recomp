@@ -17,7 +17,8 @@ was itself wrong. Kept short and honest: the point is the gaps, not the list.
 ## NOT controlled, and why it matters
 
 **The stock HDD source is checked by mtime only.** `play_scripted.sh` copies
-from `../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd` and nothing
+from `$JSRF_HDD_SRC` — which defaulted, and still defaults, to
+`../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd` — and nothing
 verifies its CONTENTS. As of this batch its mtime is 4 Sep 2026 and has been
 stable for ten days, which is evidence but not proof: mtime does not change
 under a content-preserving touch, and does not tell you whether an earlier

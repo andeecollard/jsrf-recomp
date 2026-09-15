@@ -53,6 +53,12 @@ came from a sibling `jsrf_stock_test` checkout via `JSRF_STOCK_DIR`, which
 meant a fresh clone failed in CMake and every worktree needed a symlink beside
 it. The file is vendored at `diagnostics/jsrf_first_fault/recomp_manual.c`.
 
+Running is different: the game dump and the emulated HDD tree to copy from
+cannot be vendored, so they stay outside. Every script in
+`diagnostics/jsrf_first_fault/` that stages an HDD reads `JSRF_HDD_SRC` for
+the latter and names it when the tree is missing. The default is still a
+sibling checkout, which is nobody else's layout — set the variable.
+
 There are ~100 `RECOMP_*` opt-in switches. Enumerate them rather than guessing:
 
 ```sh

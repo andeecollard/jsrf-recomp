@@ -20,8 +20,10 @@ set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT="${1:-$ROOT/build-macos/jsrf-first-fault/render-investigation/play-tutorial}"
 SCRATCH="${PLAY_SCRATCH:-/tmp/jsrf-play}"
+STOCK="${JSRF_HDD_SRC:-$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd}"
+[ -d "$STOCK" ] || { echo "no emulated-hdd at $STOCK -- set JSRF_HDD_SRC" >&2; exit 1; }
 rm -rf "$OUT" "$SCRATCH/hdd"; mkdir -p "$OUT" "$SCRATCH"
-cp -R "$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" "$SCRATCH/hdd"
+cp -R "$STOCK" "$SCRATCH/hdd"
 cd "$ROOT" || exit 1
 echo "Plug in a controller, then press START and choose New Game."
 echo "Log: $OUT/stderr.log"

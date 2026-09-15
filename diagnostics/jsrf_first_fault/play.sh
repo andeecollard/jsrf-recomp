@@ -38,13 +38,17 @@ if [ -n "$NEWER" ]; then
     [ -n "${JSRF_ALLOW_STALE:-}" ] || { echo "  (set JSRF_ALLOW_STALE=1 to run anyway)" >&2; exit 1; }
 fi
 SCRATCH="${PLAY_SCRATCH:-/tmp/jsrf-play}"
-STOCK="$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd"
+STOCK="${JSRF_HDD_SRC:-$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd}"
 
 if pgrep -x jsrf_first_fault >/dev/null 2>&1; then
     echo "REFUSING: jsrf_first_fault is already running (pid $(pgrep -x jsrf_first_fault | tr '\n' ' '))" >&2
     exit 2
 fi
-[ -d "$STOCK" ] || { echo "no emulated-hdd at $STOCK" >&2; exit 1; }
+if [ ! -d "$STOCK" ]; then
+    echo "no emulated-hdd at $STOCK" >&2
+    echo "  set JSRF_HDD_SRC to the directory holding it" >&2
+    exit 1
+fi
 
 # A disposable copy: the guest writes saves, and the stock tree is a baseline.
 # The log does NOT live in the scratch directory, and that is the point.
