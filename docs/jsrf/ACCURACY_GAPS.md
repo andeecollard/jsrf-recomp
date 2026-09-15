@@ -80,7 +80,17 @@ Two independent defects, both only visible with a controller in hand:
   CRI's sound server gets 33.4 of the 43.1 passes/s it needs.
 
 ### 3. Stability
-* ~13% of runs SIGSEGV in the OHCI path (rate not re-measured since timing changed).
+* ~13% of runs SIGSEGV. *2026-09-15: NOT the OHCI path.* All ten faults recorded
+  across today's scripted runs are the **same instruction** at the **same
+  operand** — `sub_001A2E2E +0x670`, faulting on guest `0xFFFFFFBE` — and
+  `0x1A2E2E` is inside the **DSOUND** section, i.e. recompiled DirectSound.
+  `sub_001A2E2E` is the function that reads the guest's software previous/next
+  links and updates the hardware voice list, so the crash sits in the same
+  correspondence as the trap storm. `0xFFFFFFBE` is sentinel-shaped, not
+  NULL-shaped, and `0xFFFF` is that list's own terminator. See
+  `progress/CLAUDE_PROGRESS_2026-09-15_THE_CRASH_IS_ONE_INSTRUCTION.md`. The
+  rate is unchanged and still not re-measured; what changed is that it has one
+  address instead of a subsystem.
 * **Controller hotplug aborts the process**: disconnect then reconnect →
   SIGABRT immediately after `SDL_GameControllerOpen` returns
   (`src/input/xinput_device.c:346`, reached from guest threads). No backtrace

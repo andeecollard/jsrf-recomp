@@ -57,6 +57,18 @@ menu to first mission transition. Among runs that reach that transition, 7 of
 97 crash; among runs that survive past it, about 1.6%. An earlier version of
 this page said "one run in five", which does not match the data.
 
+*2026-09-15: it is ONE INSTRUCTION.* All ten faults across today's scripted
+runs share a PC and an operand — `sub_001A2E2E +0x670`, faulting on guest
+`0xFFFFFFBE` — and `0x1A2E2E` sits inside the DSOUND section, so this is
+recompiled DirectSound rather than anything of ours. `sub_001A2E2E` reads the
+guest's software previous/next links and updates the hardware voice list, which
+puts the crash in the same correspondence as the trap storm; `0xFFFF` is that
+list's own terminator and `0xFFFFFFBE` is sentinel-shaped rather than
+NULL-shaped. Every crashing run had also stalled its USB driver and never left
+the title screen, so the t=43-50 s concentration above may be describing the
+same runs from a different angle. See
+`progress/CLAUDE_PROGRESS_2026-09-15_THE_CRASH_IS_ONE_INSTRUCTION.md`.
+
 Of the 33 genuine faults on this host (excluding a known mem-watch build and
 some Windows ones), **20 are the same bug**: the DirectSound APU interrupt
 handler is entered for an idle-voice trap and dereferences a voice object that
