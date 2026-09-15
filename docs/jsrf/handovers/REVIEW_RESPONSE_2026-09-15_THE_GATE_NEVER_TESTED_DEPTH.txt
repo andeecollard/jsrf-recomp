@@ -249,16 +249,68 @@ bit me during this review: metal_batch_check.sh reported "5 phases" and the old
 JSRF_BUILD, or give them the same default.
 
 
-9. WHAT I WOULD DO NEXT
-========================
-  1. Re-run metal_hw_check.sh's question at a real mission, not because the
-     synthetic gate is worthless but because it has now said everything it can:
-     the swap is clean, the formats conform, and the fault is elsewhere.
-  2. Extend phase F to combiners, alpha test and stencil before that. Those are
-     the states a mission uses and the gate has never touched, and they are
-     seconds rather than a three-minute boot.
-  3. Convert the eleven behavioural switches to a value test, LEGACY_ZCLAMP
-     first.
-  4. Re-run the 565 A/B on the current binary, which now names its attachment.
-  5. Fix metal_hw_check.sh's comment, which still quotes 54091 as evidence for
-     a conclusion it does not support. (Done in the working tree.)
+9. WHAT WAS DONE NEXT, AND WHAT IT FOUND
+=========================================
+Items 2, 3 and 5 below are now done and committed. Their results change the
+picture again, so they are recorded here rather than left in the commits.
+
+THE STATE COVERAGE ALREADY EXISTED, IN A TEST NOTHING RAN. Before writing a
+phase G for combiners, alpha test and stencil, it was worth checking what was
+already there: metal_copy_test compares the backend against the rasteriser with
+an exact memcmp across combiners at one stage and two, alpha test, stencil with
+real ops, multi-texture, DXT1, DXT3, mip selection, untextured draws and dither.
+It is built on Apple and registered with nothing -- out of ctest because it
+needs a GPU, and with no check script, unlike metal_batch_test. So the broadest
+state coverage in the tree had never been executed, which is the same shape as
+the phase-A-only problem in section 2.
+
+Run across the three arms:
+
+    software state    FAILS at line 49 -- the depth readback after a
+                      depth-tested draw, known and tracked
+    hardware state    exact match
+    hardware + 565    exact match
+
+That is the strongest result of this review. Combiners, alpha test, stencil and
+multi-texture are BYTE-EXACT on the hardware path, and the software path is the
+one that misses. It is also the evidence the retracted 54091 was standing in
+for, and a stronger claim than that ever was, because it is exact equality
+rather than a tolerance.
+
+And it narrows the remaining space sharply. Every per-draw state translation a
+mission uses is now known correct in isolation on the hardware path. The wrong
+image is therefore NOT a mistranslated combiner, blend factor, stencil op or
+compare function. What is left is behaviour over time or at scale: the retained
+surface across frames, the clear/flip interaction, the presenter round trip --
+none of which any device test reaches, because they all begin from
+nv2a_metal_invalidate and run a few dozen draws.
+
+THE SWITCH SWEEP HAD TO BE WIDER THAN THE PATTERN. RECOMP_PB_EXEC is read in
+four places in three spellings; the `? 1 : 0` form the handover named finds one
+of them. Ten behavioural switches now go through recomp_switch_on(), which
+treats "0" and empty as off and everything else as on -- the conservative
+conversion, so nothing that turns a switch on today changes. RECOMP_FAKE_PAD
+stays on presence and is annotated to say why: its value is meaningful (1, <n>,
+`a`, `always`) and an atoi() conversion would silently disable `=a`.
+
+I also nearly filed a fourth instance that was not one. RECOMP_OHCI_ATTACH
+looked presence-tested to the pattern match, and oracle_anchor.sh's
+ORACLE_NO_OHCI_ATTACH writes RECOMP_OHCI_ATTACH=0 -- which looked like a live
+broken control arm. Reading the predicate rather than the grep shows it already
+excludes "0" and the empty string, and main.c's two `!getenv` sites are a
+default-setter, not a gate. The rule that catches counters catches greps too.
+
+
+10. WHAT IS STILL OPEN
+=======================
+  1. THE WRONG IMAGE AT A MISSION. Still unexplained, and now with the swap,
+     both attachment formats, and every per-draw state translation eliminated.
+     Look at what persists across frames rather than at what a draw does.
+  2. Re-run the 565 A/B on the current binary, which now names its attachment,
+     so the 14.5% has arms that can be verified.
+  3. Re-run RECOMP_VSH_REUSE properly -- the handover's item 3, untouched here.
+  4. The software path's metal_copy_test line 49 depth mismatch, now that it is
+     the only arm failing an exact comparison.
+  5. ab_score.py's SWITCH_TOKEN has entries for seven switches. Every switch
+     that is an A/B arm should print its state and appear there;
+     RECOMP_METAL_BATCH is one that does not.
