@@ -532,12 +532,38 @@ nv2a_metal_state.c is deliberately standalone for upstreaming, so it should not
 learn about the accept test; the two lists want a comment pointing at each
 other, or one shared table.
 
-STILL UNEXPLAINED: the black regions. Everything above is real and none of it
-is yet shown to be the cause. The instruments to carry on with are committed:
-RECOMP_METAL_HW_DEPTH_ALWAYS, RECOMP_METAL_HW_NO_STENCIL,
-RECOMP_METAL_SHADER_BLEND=0/2, and a [METAL] count of draws that took the
-software tail while the hardware path was on -- a mixed frame that reject()
-never sees and refusals= never showed. That last counter is built and HAS NOT
-BEEN RUN; it is the next thing to look at, because the depth-ownership comment
-in nv2a_metal.m already describes its symptom as "every differing pixel had
-software 0x000000 against hardware 0xFFFFFF".
+STILL UNEXPLAINED: the black regions. All three defects above are real, all
+three are fixed and pinned by a phase, and NONE of them changed the picture. A
+200 s run with all three in still reports 46609 and 18613 black pixels on its
+two picture frames.
+
+THE MIXED-FRAME LEAD IS NOW DEAD TOO, and it was the best one left. The
+depth-ownership comment in nv2a_metal.m describes exactly this symptom -- "every
+differing pixel had software 0x000000 against hardware 0xFFFFFF" -- and the
+route to it is hw_depth_upload failing, which drops hw to 0 and sends draws down
+the software tail without reject() ever seeing it, so refusals= stays 0 and
+proves nothing. Counted in a real run:
+
+    MIXED draws (software tail while hw on) = 0
+    depth uploads failed                    = 0
+    hw draws 518122, batches 522245, refusals 0, fallbacks 0, pipelines 5
+
+Every draw took the hardware branch and no upload ever failed. The 4123 gap
+between batches and hw draws is the empty-batch early return, at the same
+~0.8% seen in all three arms in section 11.
+
+WHAT IS LEFT, with everything above eliminated. Not the depth unit, the stencil
+unit, the blend unit, the fragment ordering, the attachment format, the state
+caches, the mixed frame, or any per-draw state translation -- metal_copy_test
+puts the hardware path byte-exact against the rasteriser across combiners,
+alpha test, stencil, multi-texture, DXT and mips. Every device test agrees
+exactly, and a real frame does not.
+
+That gap is the finding. Something the hardware path does is invisible to a
+test that submits a few hundred draws to one retained surface and reads it back
+immediately, and shows up in a frame of ~40,000 draws across three surfaces
+with ~15,000 clears. The next instrument should measure the FRAME rather than
+the draw: dump the surface at intervals WITHIN one frame -- RECOMP_FB_DUMP_DRAW
+already exists for that -- and find the draw index at which a region that was
+correct becomes black. That localises it in the guest's own draw order, which
+no synthetic phase can do.
