@@ -577,6 +577,46 @@ int main(int argc, char **argv)
         }
     }
 
+    /* J -- a blend factor the shared accept test refuses must be REFUSED here,
+     * not quietly translated.
+     *
+     * nv2a_metal_blend_factor is a faithful enum map and knows DST_ALPHA;
+     * nv2a_texture_copy_blend_factor_supported deliberately does not, and the
+     * software tail's bfactor() implements exactly the eight it allows. Only
+     * one of those two lists used to be consulted when building a hardware
+     * pipeline, so widening the accept test would have widened the hardware
+     * path alone -- where DST_ALPHA reads an attachment alpha holding the
+     * shaded alpha, or the guest's depth right after an upload, or nothing at
+     * all under 565.
+     *
+     * Nothing can reach a sink with this today; the point of the phase is that
+     * the two lists cannot drift apart again without it failing. A refusal is
+     * the correct outcome: rejected draws are counted and visible, and the
+     * pushbuffer executor already knows how to fall back on one. */
+    {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        int r;
+        base_state(&s);
+        s.blend = 1; s.blend_src = 0x304 /* DST_ALPHA */; s.blend_dst = 0x303;
+        fill_tri(v, 0);
+        nv2a_metal_invalidate(NULL);
+        r = nv2a_metal_draw(&s, textures[0], TEX_BYTES, swap_t[0], TARGET_BYTES,
+                            swap_z[0], DEPTH_BYTES,
+                            (const float (*)[16][4])v, 3, 5);
+        if (getenv("RECOMP_METAL_HW") && atoi(getenv("RECOMP_METAL_HW"))) {
+            if (r >= 0) {
+                fprintf(stderr, "phase J: DST_ALPHA was accepted by the "
+                        "hardware path; the accept test is not being asked\n");
+                return 1;
+            }
+            printf("metal blend accept: DST_ALPHA refused by the hardware "
+                   "path (%s)\n", nv2a_metal_last_reject());
+        } else {
+            printf("metal blend accept: software path, not gated here\n");
+        }
+        CHECK(nv2a_metal_sync());
+    }
+
     if (!drawn) { fprintf(stderr, "no triangles survived assembly\n"); return 1; }
     printf("metal batch (%s): %lu triangles over 6 phases "
            "(overlap, ring wrap, texture eviction, surface change, readback, "

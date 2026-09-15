@@ -990,6 +990,31 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
 
     int sf = MTLBlendFactorOne, df = MTLBlendFactorZero;
     if (s->blend) {
+        /* THE SHARED ACCEPT TEST DECIDES, not the enum map.
+         *
+         * nv2a_metal_blend_factor is a faithful NV2A-to-Metal translation and
+         * knows DST_ALPHA, ONE_MINUS_DST_ALPHA and SRC_ALPHA_SATURATED.
+         * nv2a_texture_copy_blend_factor_supported deliberately does not, and
+         * the software fragment tail's bfactor() implements exactly the eight
+         * it allows -- anything else falls through its default and contributes
+         * nothing. Two lists, and only one of them was consulted here.
+         *
+         * Nothing reaches a sink with those three today, because the accept
+         * test refuses them in prepare_texture_copy first. The hazard is that
+         * widening the accept test silently widens THIS path and not the other
+         * one: on the hardware path a DST_ALPHA factor would read the colour
+         * attachment's alpha, which holds the shaded alpha, or the guest's
+         * DEPTH immediately after a surface upload, or -- under 565 -- does not
+         * exist at all.
+         *
+         * So the sink asks the shared test, and the enum map stays a pure
+         * translation with no policy in it. nv2a_metal_state.c has no title
+         * knowledge and is the piece most ready to go upstream; this is the
+         * right side of that line for the decision to live on. */
+        if (!nv2a_texture_copy_blend_factor_supported(s->blend_src)
+         || !nv2a_texture_copy_blend_factor_supported(s->blend_dst)) {
+            ++g_hw_state_refusals; return nil;
+        }
         sf = nv2a_metal_blend_factor(s->blend_src);
         df = nv2a_metal_blend_factor(s->blend_dst);
         if (sf < 0 || df < 0) { ++g_hw_state_refusals; return nil; }
