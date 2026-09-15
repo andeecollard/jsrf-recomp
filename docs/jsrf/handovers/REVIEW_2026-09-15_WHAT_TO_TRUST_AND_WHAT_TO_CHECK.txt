@@ -1,0 +1,175 @@
+REVIEW HANDOVER, 15 Sep 2026
+WHAT TO TRUST, WHAT TO CHECK, AND WHAT THIS SESSION GOT WRONG
+
+For someone REVIEWING this work rather than continuing it. 26 commits, 19
+unpushed, ctest 30/30, tree clean. The tactical detail is in
+CLAUDE_HANDOVER_2026-09-15_A_METAL_RENDERER_AND_FOUR_COUNTERS_THAT_LIED.txt;
+this is the layer above it.
+
+Read section 1 first. It is the reason to distrust the rest by default.
+
+
+1. THE HEADLINE FOR A REVIEWER
+===============================
+A person played the game, saw a flickering grid and black rectangles, and
+reported it in one sentence. My entire measurement apparatus -- a committed A/B
+harness, a correctness gate, thirty tests, six A/Bs -- had said the renderer was
+9.6% and 14.5% faster and MORE correct than what it replaced. All of those
+numbers are real. The configuration they describe renders the game wrong.
+
+ab_switch.sh scores frame time, scene and crashes. metal_hw_check.sh scores a
+synthetic 40-draw image. NOTHING SCORED A FRAME FROM A REAL RUN. Every
+discipline applied to timing -- verify the arms differ, check the predicted
+column moved, refuse a verdict below n=2 -- was never extended to "does it still
+look right".
+
+That is the single most important thing to take from this session, and it is
+not a tooling gap. The tooling is better than it was this morning. It is that I
+optimised what I could measure and did not notice the thing I could not.
+
+MITIGATION IN PLACE: both renderer switches are default OFF, the warning is at
+the switch in nv2a_metal.m, and no default changed all day.
+
+
+2. STATE OF THE TREE: WHAT TO TRUST
+====================================
+TRUST -- measured, reproducible, gates in place:
+  * ctest 30/30 (was 29; gained jsrf_metal_state). Python 15/15.
+  * The A/B harness (ab_switch.sh + ab_score.py). It caught two invalid A/Bs
+    today by refusing to compare them. Scoring is a pure function of a log, so
+    every archived run can be re-scored.
+  * `nv2a_metal_state.c/h` -- guest NV2A enums to Metal, unit-tested, no title
+    knowledge, cross-checked against the set the software rasteriser renders.
+    This is the piece most ready to go upstream.
+  * The `fixed-function normal` fix. 6% of every draw batch was being DROPPED
+    because a lighting normal had zero length while nothing read it. That is a
+    pure correctness win with no switch and no measurement needed.
+  * The crash is ONE instruction: sub_001A2E2E +0x670 on guest 0xFFFFFFBE, in
+    recompiled DirectSound, triggered by the A press that starts the
+    menu-to-mission transition. It is reproducible on demand rather than a 12%
+    lottery.
+
+DO NOT TRUST -- correct arithmetic, wrong conclusion, all retracted in-tree:
+  * "A reuse-cache hit costs 93% of a full transform." The A/B it came from had
+    the cache ON IN BOTH ARMS. A hit costs approximately nothing.
+  * "The MSL emitter is aimed at arithmetic that is ~7% of the cost." Follows
+    from the above. The arithmetic is ~100%. The emitter is aimed correctly.
+  * "The software rasteriser prefers a float attachment because float keeps
+    intermediates exact." It blends at RGB565, like xemu and like hardware.
+  * "The USB driver had stalled." Absolute counts across runs of different
+    length. Normalised, 117.7 / 119.4 / 120.5 transfers per second -- identical.
+  * "The crash is deterministic at 30 s and 40 s." That is the report cadence.
+  * "~13% of runs SIGSEGV in the OHCI path." It is DirectSound. ACCURACY_GAPS
+    and STATUS disagreed and the wrong one was being quoted.
+
+DO NOT SHIP -- measured and wrong:
+  * RECOMP_METAL_HW and RECOMP_METAL_565 at a real mission. Section 1.
+
+
+3. THE METHODOLOGICAL FINDING, WHICH MAY OUTLAST THE CODE
+==========================================================
+Six counters lied today. Every one was fixed by finding an instrument with the
+right RESOLUTION or the right REFERENT, never by reasoning harder:
+
+    trapped=        counts frames where the engine was switched OFF
+    NtOpenFile      measures the disc cache build, not the scene
+    vsh             is all of prepare_vertices(), not the vertex shader
+    ord175          absolute count across runs of different length
+    [VBLANK] over   prints only at report boundaries
+    pixel COUNT     says nothing without magnitude; this project's own
+                    acceptance rule is "within one RGB565 channel step"
+
+And TWICE a switch ran in the same configuration in both arms of an A/B:
+
+    RECOMP_APU_SELFLINK_END   getenv(X) ? 1 : 0   -- so =0 turned it ON
+    RECOMP_VSH_REUSE          the same, three more predicates
+
+The second happened AFTER I fixed the first and did not sweep for others. A
+reviewer should check every remaining `getenv("RECOMP_...") ? 1 : 0` in the
+tree and decide, per switch, whether it is a trace (presence is right) or an
+A/B arm (value is required).
+
+ab_score.py now refuses to compare two arms that report the same switch state,
+but it can only check switches that PRINT their state. Adding that print is one
+line and should be the rule for any new switch.
+
+
+4. THE STRATEGIC PICTURE
+=========================
+WHAT THE RENDERER WORK IS ACTUALLY ABOUT. One decision in nv2a_metal.m -- depth
+packed into the colour attachment's alpha -- forced blending, depth and stencil
+into the fragment shader, which forced raster_order_group(0), which serialises
+every overdrawn pixel, which forced a 16-byte-per-pixel attachment for a
+2-byte guest surface. Undoing that cascade is the right direction and the
+measurements say so. The implementation is not yet correct.
+
+WHERE IT SITS RELATIVE TO UPSTREAM. Upstream has a PGRAPH-to-D3D11 translator
+(sp00nz, 835 lines). This fork wrote its own NV2A pushbuffer backends: D3D11
+(1890 lines, last week) and Metal. There is NO Metal NV2A backend anywhere in
+the project, and upstream's cross-platform story stops at OpenGL for the D3D8
+API level, which JSRF never calls. So a working Metal backend is a genuinely
+novel, title-agnostic contribution -- but only once it draws correctly.
+
+WHAT IS UNIVERSAL ALREADY, AND WHAT IS NOT. nv2a_metal_state.c has zero title
+knowledge. Against that: the pipeline and depth/stencil caches are 16 entries
+sized from "JSRF uses three", and nv2a_metal.m refuses target_bpp != 2. Both
+are limits that should be evidence-driven before a PR.
+
+DO WE NEED AN OPENGL BACKEND? No, and not on macOS -- GL is deprecated and
+frozen at 4.1 there, and the GL we already have is a liability: the frame ends
+Metal -> CPU readback -> two conversions -> glTexImage2D -> GL quad, two GPU
+APIs with a full CPU round trip. The answer changes when someone needs Linux,
+and then xemu's GL backend is the reference to port from, not to reinvent.
+
+
+5. OPEN ITEMS, RANKED, WITH CONFIDENCE
+=======================================
+  1. THE RENDERER REGRESSION. Two suspects recorded at the switch: the
+     multi-surface swap (JSRF holds three colour surfaces and swaps batch by
+     batch; this backend retains one), and setDepthClipMode:Clamp, which I
+     added speculatively, which moved no number, and which flattens
+     out-of-range fragments onto a plane where coplanar geometry fights.
+     Test the second first -- it is one line and it is my own unjustified
+     change. CONFIDENCE: high that one of these is it.
+  2. A CORRECTNESS GATE THAT RUNS IN SECONDS. Extend the device test to swap
+     between three surfaces and score the image. Everything else here is
+     gated behind a 3-minute boot that fails a quarter of the time.
+  3. RECOMP_VSH_REUSE, now that its predicate works. Worth ~5 ms of a ~10 ms
+     column on evidence already collected, for a default flip. CONFIDENCE:
+     high, but it is TWO BLOCKS run 27 minutes apart, not interleaved arms.
+     Re-run it properly.
+  4. THE METAL PRESENTER. Deletes the GPU-to-CPU-to-GL round trip and one of
+     ~4.8 syncs per frame. Uncosted. One agent's analysis suggests only ~23% of
+     any CPU-side vertex saving currently reaches frame time, the rest
+     reappearing as waiting in `clear` -- if that holds, this outranks the MSL
+     emitter. CONFIDENCE: medium; the 23% is from two blocks, not an A/B.
+  5. THE CRASH. One instruction, one operand, a trigger. The probe is
+     specified: dump the software prev/next links on entry to sub_001A2E2E.
+     Do NOT suppress a trap or forcibly unlink a voice.
+  6. THE AUDIO STORM. Producer identified (VOICE_ON for a voice already at the
+     list head); regs[top] is NOT stale. May be the same defect as item 5 --
+     same function's data, and the faulting address is sentinel-shaped.
+  7. THE TEXT GLYPH. Not the font page that draws the string beside it. Needs
+     one RECOMP_DRAW_CAPTURE with a texture-address predicate.
+
+  NOT ON THE LIST, DELIBERATELY: RECOMP_VSH_NARROW_OUTPUTS. It was built to
+  attack a cost that the 93% error invented. It attacks 3-4%, its treatment arm
+  pays a per-batch getenv the control does not, and an n=1 run made things
+  worse. An aligned(64) on s_outputs gets the same cache-line saving for one
+  word. Remove or ignore.
+
+
+6. WHAT A REVIEWER SHOULD ACTUALLY CHECK
+=========================================
+  * Run `metal_hw_check.sh`. It PASSES. Satisfy yourself that a gate which
+    passes on a renderer that visibly breaks the game is the finding, not the
+    tool.
+  * Sweep `getenv("RECOMP_...") ? 1 : 0` and classify each one.
+  * Re-score any archived A/B: `ab_score.py --summarise --var X <RESULTS.txt>`.
+    It is a pure function of the log. Check that the arms were verified
+    distinct; where it says they were not, treat the result as unproven.
+  * Check that every frame-time claim in this session's commits names the
+    STAGE COLUMN that moved and that the column matches the mechanism. Where it
+    does not, the claim is weaker than it reads.
+  * The boot attrition -- roughly one run in four lost to the item 5 crash --
+    is the tax on every measurement here and is why several arms land at n=1.
