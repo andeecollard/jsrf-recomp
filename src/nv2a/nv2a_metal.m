@@ -668,6 +668,31 @@ static id<MTLTexture> hw_depth_tex, hw_stencil_tex;
 static int batch_encoder_hw;
 unsigned long long g_hw_draws;
 
+/* MEASURED, and it is the first frame-time win this renderer has produced.
+ *
+ *     RECOMP_METAL_HW=0   31.56  31.78  34.62 ms   (mean 32.65, n=3)
+ *     RECOMP_METAL_HW=1   28.83  30.20        ms   (mean 29.52, n=2)
+ *     ranges do not overlap: 9.6% less frame time
+ *
+ * and the column that moved is the one the mechanism predicts:
+ *
+ *     clear   9.61 / 10.25 / 11.12 ms   ->   5.76 ms
+ *
+ * A clear's cost here is mostly waiting for the GPU to drain. Without
+ * raster_order_group(0) the overdrawn fragments no longer serialise, so there
+ * is less outstanding work to wait for. submit and vsh did not move, which is
+ * what should happen: this change touches neither.
+ *
+ * The arms were verified distinct rather than assumed -- [METAL] hw draws=0
+ * against 742443 and 773039, five pipelines, ZERO refusals, so every draw took
+ * this path and no state had to fall back.
+ *
+ * STILL OFF BY DEFAULT. One run of six faulted, and although it never left the
+ * title screen (scene=12, ord175=9859 -- the USB driver had already stalled)
+ * so the renderer was barely running in it, and although the pre-existing
+ * fault rate in the OHCI path is ~11.8%, one fault at n=3 is not evidence
+ * either way. A default flip here wants a person playing it, the same gate
+ * RECOMP_METAL_BATCH is still waiting on. */
 static int hw_state_on(void)
 {
     static int on = -1;
@@ -765,10 +790,22 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = hw_vs; d.fragmentFunction = hw_fs;
-    /* STILL RGBA32Float, and this is a measured decision rather than an
-     * oversight. Depth left the alpha channel, so the colour target no longer
-     * NEEDS float precision, and narrowing it is the obvious next win: 16
-     * bytes a pixel for a surface the guest thinks is two.
+    /* STILL RGBA32Float, AND THE REASON RECORDED HERE BEFORE WAS WRONG.
+     *
+     * That comment said the software rasteriser prefers float because float
+     * keeps blend intermediates exact. It does not keep anything exact: it
+     * reads its blend destination out of guest RAM with unpack565() and stores
+     * RGB565 back after every pixel of every draw (nv2a_texture_copy.c:691-711).
+     * It is a framebuffer-precision blender, and always was. xemu is the same
+     * on both of its backends -- GL_RGB565 and VK_FORMAT_R5G6B5_UNORM_PACK16,
+     * a true two-byte attachment -- and blends there with the GPU's own unit.
+     *
+     * So float is the one candidate NOBODY models: it is the only format that
+     * never requantises between draws, which is the single thing the NV2A
+     * certainly does. If intermediate precision drove the ranking below, RGBA8
+     * would be CLOSEST to the oracle and float furthest. It is the exact
+     * inverse, so that ranking measures double rounding at the readback
+     * boundary, not blending.
      *
      * Both narrower formats were built and scored against the oracle:
      *
@@ -782,16 +819,17 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
      * precision, where the float target kept them exact. At 8 bits that is
      * plainly visible; at 16 it is 24 pixels of tie-break rounding.
      *
-     * 24 in 65536 is small, and the bandwidth win is 2x, and that trade may
-     * well be right -- but it has not been measured that the colour attachment
-     * is where this frame is spending its time, and trading accuracy for an
-     * unmeasured win is how this project has gone wrong before. Revisit with
-     * a frame profile, not with an argument.
+     * It also scored the wrong quantity. A COUNT cannot be acted on: this
+     * project admitted the D3D11 backend under "matches the CPU rasteriser to
+     * within one RGB565 channel step", with 48% of pixels differing on a
+     * single unblended draw. metal_batch_test now reports worst-step as well,
+     * and the next move is to re-score the narrow formats by magnitude.
      *
-     * Worth noting for whoever does: real NV2A blends at framebuffer
-     * precision, which is RGB565. If that is right then RGBA8 is the FAITHFUL
-     * choice and the software rasteriser is the wrong oracle for this one
-     * question. Settling that needs hardware or xemu, not a preference. */
+     * The format that should win is neither: MTLPixelFormatB5G6R5Unorm, two
+     * bytes a pixel, an 8x cut, no double rounding at all because the
+     * attachment IS the guest format -- and it is exactly what xemu allocates.
+     * It is only available on this path, because the legacy one still needs
+     * alpha for depth. */
     d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
     /* SEPARATE depth and stencil textures, not a combined format. Measured on
      * this host before choosing: Depth32Float, Stencil8 and

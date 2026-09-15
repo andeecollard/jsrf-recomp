@@ -112,6 +112,8 @@ SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)")
 # Harvested separately so a renderer A/B can verify its arms differ too,
 # rather than falling back to "assumes the environment took".
 SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] (reuse=\w+)")
+# The Metal backend names its own state in parentheses, like the APU reports.
+METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_hw \w+)\)")
 
 # WHICH TOKEN IN THAT HARVESTED STATE BELONGS TO WHICH SWITCH.
 #
@@ -131,6 +133,7 @@ SWITCH_TOKEN = {
     "RECOMP_APU_SE_WHILE_TRAPPED": "se_while_trapped",
     "RECOMP_APU_REON_HEAD_NOP":    "reon_head_nop",
     "RECOMP_VSH_REUSE":            "reuse",
+    "RECOMP_METAL_HW":             "metal_hw",
 }
 
 
@@ -246,6 +249,9 @@ def score(path, warmup, pad_path=None):
             if m:
                 switches.add(m.group(1).strip())
             m = SWITCH_BARE_RE.search(line)
+            if m:
+                switches.add(m.group(1).strip())
+            m = METAL_SWITCH_RE.search(line)
             if m:
                 switches.add(m.group(1).strip())
             m = IDLE_RE.search(line)
