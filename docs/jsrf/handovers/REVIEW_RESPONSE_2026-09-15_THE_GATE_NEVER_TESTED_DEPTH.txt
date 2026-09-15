@@ -787,6 +787,11 @@ the frame is correct.
 
 WHAT IS LEFT
 
+  0. THE DEFAULT FLIP ITSELF IS UNVERIFIED IN A REAL RUN. Every capture that
+     showed batching clean passed RECOMP_METAL_BATCH=1 explicitly, and the
+     frame-time A/B sets it explicitly in both arms, so nothing has yet
+     exercised the new default with the variable UNSET. That is one run and it
+     is the difference between "batching fixes it" and "the fix ships".
   1. FRAME TIME. Every performance number this renderer has -- the 9.6% for the
      hardware path and the 14.5% for 565 -- predates the batching default and
      predates the dither fix's raster_order_group(0) on dithered blended draws.
