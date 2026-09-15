@@ -750,6 +750,38 @@ static int hw_565_on(void)
     return on && hw_state_on();
 }
 
+/* !!! THE IMAGE IS WRONG AT A REAL MISSION. DO NOT DEFAULT THIS ON. !!!
+ *
+ * 15 Sep 2026, reported by a person watching the game: a flickering grid across
+ * the background, with solid black rectangles appearing and disappearing frame
+ * to frame. Reproduced in a framebuffer dump from a scene-verified mission with
+ * RECOMP_METAL_HW=1 RECOMP_METAL_565=1: torn rectangular tiles carrying content
+ * from elsewhere in the scene, and a large black band.
+ *
+ * It is not draws being dropped. That run reports hw draws=900426, refusals=0,
+ * 0 software fallbacks, 0 texture rejects, [VSH] rejected=45 of 239005. Every
+ * draw took this path and succeeded. The surface CONTENTS are wrong.
+ *
+ * AND metal_hw_check.sh PASSES. That gate scores a synthetic 40-draw test
+ * against the software rasteriser and says 1 pixel differs by 1 step. So the
+ * gate does not exercise whatever this is. The most likely candidate, from
+ * clear_surface's own comment: "JSRF holds three colour surfaces and swaps
+ * between them batch by batch". This backend retains ONE and re-uploads on each
+ * swap; the synthetic test changes surface once. Tiles carrying content from
+ * elsewhere is what a broken multi-surface swap looks like.
+ *
+ * The frame-time numbers recorded below are real measurements OF A
+ * CONFIGURATION THAT RENDERS THE GAME WRONG. They are not a reason to ship it.
+ * I reported them as wins before ever looking at a frame from a real run, which
+ * is the hole in the method: ab_switch.sh scores frame time, scene and crashes,
+ * and nothing scores the image.
+ *
+ * Also suspect, and added speculatively: setDepthClipMode:MTLDepthClipModeClamp
+ * at the draw site. It was put in to close a depth difference, did not change
+ * the number at all, and was left in anyway. Clamping rather than clipping
+ * flattens every out-of-range fragment onto the near or far plane, where
+ * coplanar geometry then fights -- which is what a flickering grid looks like.
+ * Revert it first and re-test. */
 static int hw_state_on(void)
 {
     static int on = -1;
