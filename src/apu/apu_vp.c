@@ -475,6 +475,23 @@ unsigned g_apu_unknown_method_n;
  * about the INHERIT arithmetic is wrong. A self-link is a one-entry cycle in
  * the list mcpx_apu_vp_frame walks. */
 unsigned long g_apu_selflink_terminated;
+unsigned long g_apu_trap_suppressed;
+
+int mcpx_apu_se_while_trapped(void);   /* apu_core.c */
+
+/* On by default. Unlike the self-link guard this is not a new behaviour looking
+ * for a justification -- it is the existing "do not overwrite a handle the
+ * guest has not read" rule applied across frames instead of only within one
+ * walk. */
+int mcpx_apu_trap_coalesce(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_TRAP_COALESCE");
+        on = e ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
 
 /* OFF by default, and the reason is a measurement that did not go my way.
  *
@@ -532,6 +549,10 @@ void mcpx_apu_voice_report(void)
             fprintf(stderr, " %04X", g_apu_unknown_method[k]);
         fprintf(stderr, "\n");
     }
+    fprintf(stderr, "  [APU-TRAP] suppressed=%lu (coalesce %s, se_while_trapped %s)\n",
+            g_apu_trap_suppressed,
+            mcpx_apu_trap_coalesce() ? "on" : "OFF",
+            mcpx_apu_se_while_trapped() ? "on" : "OFF");
     fprintf(stderr, "  [APU-SELFLINK] terminated=%lu (guard %s)\n",
             g_apu_selflink_terminated,
             mcpx_apu_selflink_end() ? "on" : "OFF");
@@ -2246,6 +2267,33 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * would overwrite the handle the guest has not read yet, and
                  * re-raising it for the SAME voice every frame is what produced
                  * 217 traps per retirement. */
+                /* One outstanding trap is one outstanding trap.
+                 *
+                 * The front end is already TRAPPED and the guest has not
+                 * serviced it yet, so raising again cannot mean anything to
+                 * hardware: it would overwrite FEDECPARAM -- the handle the
+                 * guest has not read -- and raise a second interrupt for a
+                 * condition already signalled. The comment below already says
+                 * this about a second dead voice inside one walk; the same
+                 * argument holds across frames, which is the case it missed.
+                 *
+                 * It is load-bearing once the sound engine keeps running while
+                 * trapped. Measured over 240 s of churn: with the engine
+                 * switched off during a trap the storm self-throttles to about
+                 * 10,300 raises, and with it running that becomes 126,181 --
+                 * every one of them a guest interrupt into the DirectSound ISR
+                 * that is already the top crash site here. Restoring the
+                 * engine's frames must not be paid for in interrupts.
+                 *
+                 * RECOMP_APU_TRAP_COALESCE=0 disables, for A/B. */
+                if (!trap_held && mcpx_apu_trap_coalesce() &&
+                    (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
+                        NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+                    g_apu_trap_suppressed++;
+                    if (!mcpx_apu_se_while_trapped()) return;
+                    trap_held = 1;
+                }
+
                 if (!trap_held) {
                     voice_lifecycle_note(d, v, "idle");
                     g_idle_trap_raises++;

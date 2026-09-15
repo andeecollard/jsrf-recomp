@@ -36,7 +36,7 @@ if(WIN32)
 endif()
 
 # Platform-independent shader semantics shared by D3D11 and CPU rendering.
-add_library(xbox_vsh STATIC nv2a_vsh.c nv2a_vsh_hlsl.c nv2a_texture_copy.c nv2a_ff.c)
+add_library(xbox_vsh STATIC nv2a_vsh.c nv2a_vsh_hlsl.c nv2a_vsh_msl.c nv2a_texture_copy.c nv2a_ff.c)
 target_include_directories(xbox_vsh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(APPLE)
     enable_language(OBJC)

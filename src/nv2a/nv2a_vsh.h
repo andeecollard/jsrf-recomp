@@ -204,6 +204,13 @@ int nv2a_vsh_execute(const NV2AVshProgram *program,
                      NV2AVshResult *result);
 int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program, char *buf, int bufsize);
 
+/* Emit a Metal Shading Language vertex function for the same program. Returns
+ * characters written, or 0 on error (invalid program, missing FINAL, a write
+ * to the constant file, or a buffer too small). The emitted function is named
+ * vsh_main and expects the constant file at buffer(1) and a VSH_Viewport at
+ * buffer(2); see src/nv2a/nv2a_vsh_msl.c. Untested against the renderer. */
+int nv2a_vsh_generate_msl(const NV2AVshProgram *program, char *buf, int bufsize);
+
 #ifdef __cplusplus
 }
 #endif
