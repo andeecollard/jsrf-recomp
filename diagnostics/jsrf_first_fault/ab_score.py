@@ -116,7 +116,7 @@ SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)")
 # rather than falling back to "assumes the environment took".
 SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] \((vsh_reuse \w+)")
 # The Metal backend names its own state in parentheses, like the APU reports.
-METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_(?:hw|565) \w+)\)")
+METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_(?:hw|565|batch) \w+)\)")
 
 # WHICH TOKEN IN THAT HARVESTED STATE BELONGS TO WHICH SWITCH.
 #
@@ -138,6 +138,9 @@ SWITCH_TOKEN = {
     "RECOMP_VSH_REUSE":            "vsh_reuse",
     "RECOMP_METAL_HW":             "metal_hw",
     "RECOMP_METAL_565":            "metal_565",
+    # The switch that decides whether a real frame is correct, and the one this
+    # table was missing while it was being A/B'd on frame time alone.
+    "RECOMP_METAL_BATCH":          "metal_batch",
 }
 
 

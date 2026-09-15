@@ -1474,6 +1474,12 @@ void nv2a_metal_report(void)
      * and a mixed frame -- some draws writing depth to the attachment, the
      * rest to the colour alpha -- reads as a depth bug rather than as a
      * fallback, which is exactly how this was first misread. */
+    /* Named unconditionally, in both states, so ab_score.py can verify an A/B's
+     * arms actually differed. It could not for this switch, which is the one
+     * that turned out to decide whether the frame is correct. */
+    fprintf(stderr,"[METAL] one encoder per batch: %s (metal_batch %s)\n",
+            batch_on()?"yes":"no (a render pass per draw)",
+            batch_on()?"on":"OFF");
     fprintf(stderr,"[METAL] shader blend for dithered blended draws: %s "
             "(metal_shader_blend %s)\n",
             nv2a_metal_shader_blend_on()?"on":"OFF",
