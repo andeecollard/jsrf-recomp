@@ -106,7 +106,45 @@ BUSIEST_RE = re.compile(r"\[APU-IDLE\] (\d+) idle-voice traps raised over "
 # 15 Sep 2026, so an A/B whose control arm passed =0 ran with the guard on in
 # both arms and reported "(guard on)" in both. Nobody read the line. The
 # summary compares these between arms and refuses an A/B where they match.
-SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK)\][^(]*\(([^)]*)\)")
+SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)")
+# The renderer reports its own state without parentheses, e.g.
+#   [VSH-REUSE] reuse=on verify=on hits=... mismatches=1
+# Harvested separately so a renderer A/B can verify its arms differ too,
+# rather than falling back to "assumes the environment took".
+SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] (reuse=\w+)")
+
+# WHICH TOKEN IN THAT HARVESTED STATE BELONGS TO WHICH SWITCH.
+#
+# Without this the VOID rule below was worse than useless. [APU-TRAP] prints
+# "(coalesce on, se_while_trapped on)" on EVERY report of EVERY run whatever is
+# under test, so two arms of any A/B that is not about those two switches
+# harvest identical strings and the rule declares the A/B void. It would have
+# voided the RECOMP_APU_REON_HEAD_NOP A/B running when this was found, and it
+# would void every renderer A/B ever taken -- RECOMP_METAL_BATCH included.
+#
+# So the rule now asks a narrower question it can actually answer: does the
+# report token for THIS switch differ between the arms? A switch with no entry
+# here cannot be checked, and the summary says so rather than guessing.
+SWITCH_TOKEN = {
+    "RECOMP_APU_SELFLINK_END":     "guard",
+    "RECOMP_APU_TRAP_COALESCE":    "coalesce",
+    "RECOMP_APU_SE_WHILE_TRAPPED": "se_while_trapped",
+    "RECOMP_APU_REON_HEAD_NOP":    "reon_head_nop",
+    "RECOMP_VSH_REUSE":            "reuse",
+}
+
+
+def switch_state_for(var, states):
+    """The part of the harvested state that speaks to `var`, or None."""
+    token = SWITCH_TOKEN.get(var)
+    if not token:
+        return None
+    for state in states:
+        for field in state.split(";"):
+            for clause in field.split(","):
+                if token in clause:
+                    return clause.strip()
+    return None
 
 # A mission action object exists. Covers the mission's loading screen, its
 # opening cutscene and its pause menu as well as skating, which is why warmup
@@ -205,6 +243,9 @@ def score(path, warmup, pad_path=None):
                         ord175 = int(field[4:])
                 continue
             m = SWITCH_RE.search(line)
+            if m:
+                switches.add(m.group(1).strip())
+            m = SWITCH_BARE_RE.search(line)
             if m:
                 switches.add(m.group(1).strip())
             m = IDLE_RE.search(line)
@@ -379,18 +420,28 @@ def summarise(path, var, warmup):
         for tag, why in excluded:
             out.append("    %-16s %s" % (tag, why))
 
-    # Before any comparison: did the arms differ at all? The model reports the
-    # state of the switches it read, and if both arms report the same state
-    # there is nothing being compared, whatever the frame times say.
-    if states["0"] and states["1"] and states["0"] == states["1"]:
-        out.append("")
-        out.append("  VOID: BOTH ARMS RAN THE SAME CONFIGURATION.")
-        out.append("  Every run reported: %s" % "; ".join(sorted(states["0"])))
-        out.append("  The model did not read %s the way this A/B set it."
-                   " Check that the switch tests the variable's VALUE and not"
-                   " merely its presence -- `getenv(X) != NULL` makes X=0"
-                   " enable the thing it was meant to disable." % var)
-        return "\n".join(out)
+    # Before any comparison: did the arms actually differ? Only the token that
+    # belongs to THIS switch can answer that -- see SWITCH_TOKEN above for why
+    # comparing the whole harvested string voided everything.
+    s0 = switch_state_for(var, states["0"])
+    s1 = switch_state_for(var, states["1"])
+    if s0 is not None and s1 is not None:
+        if s0 == s1:
+            out.append("")
+            out.append("  VOID: BOTH ARMS RAN THE SAME CONFIGURATION.")
+            out.append("  Every run reported: %s" % s0)
+            out.append("  The model did not read %s the way this A/B set it."
+                       " Check that the switch tests the variable's VALUE and"
+                       " not merely its presence -- `getenv(X) != NULL` makes"
+                       " X=0 enable the thing it was meant to disable." % var)
+            return "\n".join(out)
+        out.append("  arms verified distinct: %s=0 reported \"%s\", =1 reported"
+                   " \"%s\"" % (var, s0, s1))
+    elif states["0"] or states["1"]:
+        # Not a failure: most switches do not name themselves in any report.
+        # Saying so is better than a check that silently passes.
+        out.append("  arms NOT verified distinct: no report names %s. The"
+                   " comparison below assumes the environment took." % var)
 
     a, b = arms["0"], arms["1"]
     if a and b:

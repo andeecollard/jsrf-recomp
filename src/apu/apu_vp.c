@@ -587,6 +587,50 @@ int mcpx_apu_selflink_end(void)
     return on;
 }
 
+/* OFF by default, pending an A/B, and the story of that default is the useful
+ * part of this comment.
+ *
+ * WHAT IT DOES. VOICE_ON for a voice that is already its list's head stores
+ * that voice's own handle over its successor, so everything behind it in the
+ * list becomes unreachable -- not unrendered, GONE, because the successor
+ * handle lived only in the field just overwritten. The walk then spins on the
+ * one-entry cycle for its full 256-iteration cap every subframe.
+ * RECOMP_APU_SELFLINK_END terminates that cycle but cannot undo it, which is
+ * why that switch measured as no help and this is a different question.
+ *
+ * WHY THE ARGUMENT IS GOOD. Prepending a voice that is already the head is a
+ * no-op on a list; doing it as a write is data loss. It does not condition away
+ * the TOP write that CMcpxVoiceClient's debug validation depends on -- in this
+ * branch regs[top] already IS the handle, so dwTVL still names the head. It
+ * fired 40 times in a 280 s scripted run, so the state is common.
+ *
+ * AND WHY THAT IS NOT ENOUGH. The first verification run, against two pre-fix
+ * runs on the same schedule, went the wrong way on two counters:
+ *
+ *                    on        idle_trap        processed
+ *     before     250, 290    19706, 18891    3.73M, 5.46M
+ *     after           284           30709           1.83M
+ *
+ * n=1 against n=2 decides nothing -- ab_switch.sh refuses exactly this
+ * comparison -- but it is not the result a working fix owes you either, and it
+ * was taken on a scripted schedule whose voice traffic differs run to run.
+ * This switch was briefly default-ON on the strength of the paragraph above
+ * plus a player's silent session. That is this repository's own rule broken:
+ * do not ship on an argument before a run says which value is wrong.
+ *
+ * RECOMP_APU_REON_HEAD_NOP=1 enables it. */
+unsigned long g_apu_voice_on_head_nop;
+
+int mcpx_apu_reon_head_nop(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_REON_HEAD_NOP");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
 unsigned long g_apu_antecedent_set_count;
 unsigned long g_apu_voice_on_top_count;
 unsigned long g_apu_voice_on_inherit_count;
@@ -622,6 +666,9 @@ void mcpx_apu_voice_report(void)
     fprintf(stderr, "  [APU-SELFLINK] terminated=%lu (guard %s)\n",
             g_apu_selflink_terminated,
             mcpx_apu_selflink_end() ? "on" : "OFF");
+    fprintf(stderr, "  [APU-REON] head_nop=%lu (reon_head_nop %s)\n",
+            g_apu_voice_on_head_nop,
+            mcpx_apu_reon_head_nop() ? "on" : "OFF");
     fprintf(stderr, "  [APU-LINK] antecedent_sets=%lu on_top=%lu"
             " on_inherit=%lu self_ante=%lu self_link=%lu\n",
             g_apu_antecedent_set_count, g_apu_voice_on_top_count,
@@ -739,11 +786,53 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
             unsigned int top_reg = voice_list_regs[list - 1].top;
             g_apu_voice_on_top_count++;
-            voice_set_mask(d, (uint16_t)selected_handle,
-                           NV_PAVS_VOICE_TAR_PITCH_LINK,
-                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
-                           d->regs[top_reg]);
-            d->regs[top_reg] = selected_handle;
+            /* PREPENDING THE VOICE THAT IS ALREADY THE HEAD IS A NO-OP ON THE
+             * LIST, AND DOING IT AS A WRITE DESTROYS THE LIST.
+             *
+             * link(v) = regs[top] with regs[top] == v stores v's own handle
+             * over its real successor. The list becomes a one-entry cycle whose
+             * single entry is a voice that is about to go inactive again, and
+             * everything behind it is unreachable -- not merely unrendered,
+             * GONE, because the successor handle lived only in the field that
+             * was just overwritten.
+             *
+             * The walk then spins on that cycle for its full 256-iteration cap,
+             * every subframe, for the rest of the run. Measured in the player's
+             * own session 20260915-161819: voice 3 taking 51,665 of 52,884 idle
+             * traps, voice_process calls falling 14-fold, VOICE_ON from the
+             * guest stopping entirely, and the title going SILENT with a
+             * perfectly healthy output device -- out_hz 48003, starved=0,
+             * empty=0. We were feeding the card silence.
+             *
+             * WHY THIS IS THE RIGHT PLACE. regs[top] is not stale: the guest
+             * re-ONs a voice that genuinely IS its list's head, which is an
+             * ordinary thing to do with a DirectSound buffer whose voice has
+             * stopped but has not yet been taken out of the hardware list.
+             * Sixteen cycle-forming inserts across four instrumented runs, and
+             * in every one of them link(v) held a real successor at the moment
+             * we overwrote it. See
+             * docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-15_THE_HEAD_WAS_NEVER_STALE.md.
+             *
+             * AND IT DOES NOT CONDITION AWAY THE TOP WRITE. The objection to
+             * touching this insert was that CMcpxVoiceClient's debug validation
+             * asserts dwTVL equals its head voice, so suppressing the write
+             * would break every head insertion. That assert is UNAFFECTED here:
+             * in this branch regs[top] already IS selected_handle, so leaving
+             * both fields alone leaves dwTVL naming the head exactly as the
+             * driver requires. Every other insertion takes the original path
+             * untouched.
+             *
+             * RECOMP_APU_REON_HEAD_NOP=0 restores the overwrite for A/B. */
+            if (d->regs[top_reg] == selected_handle
+                && mcpx_apu_reon_head_nop()) {
+                g_apu_voice_on_head_nop++;
+            } else {
+                voice_set_mask(d, (uint16_t)selected_handle,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
+                               d->regs[top_reg]);
+                d->regs[top_reg] = selected_handle;
+            }
         } else {
             unsigned int antecedent_voice =
                 GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);

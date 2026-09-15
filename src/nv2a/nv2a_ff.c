@@ -12,6 +12,7 @@ static void matrix(const uint32_t *m,unsigned base,const float in[4],float out[4
 }
 static float length3(const float v[4])
 { return sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
+unsigned long nv2a_ff_normal_unread, nv2a_ff_normal_read;
 static float clamp01(float x)
 { return x<0?0:x>1?1:x; }
 const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float out[16][4])
@@ -32,8 +33,49 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
     matrix(m,0x580,normal_in,normal);
     if(m[0x3a4/4]) {
         float n=length3(normal);
-        if(!isfinite(n) || n==0) return "fixed-function normal";
-        for(unsigned k=0;k<3;++k) normal[k]/=n;
+        if(!isfinite(n) || n==0) {
+            /* A DEGENERATE NORMAL IS NOT A REASON TO DROP THE DRAW, AND FOR
+             * MOST OF THEM IT IS NOT A REASON TO DO ANYTHING AT ALL.
+             *
+             * This returned a rejection, and VSH_REJECT returns 0 out of
+             * prepare_vertices, so the whole batch went undrawn. Measured in a
+             * player's 450 s session: 37,575 of 37,777 vertex-shader
+             * rejections were this one line -- six per cent of every draw
+             * batch in the run, silently missing, with a counter that reported
+             * it as "rejected" rather than as geometry the player cannot see.
+             *
+             * Hardware does not drop a draw over a vertex attribute. Whatever
+             * the NV2A produces for a zero normal, it produces a triangle.
+             *
+             * The value is also USUALLY UNREAD. `normal` is consumed in exactly
+             * two places below: the lighting block, which runs only when
+             * m[0x314/4] (NV097_SET_LIGHTING_ENABLE) is set, and NORMAL_MAP
+             * texgen. With neither of those on, normalising it is dead
+             * arithmetic and failing to normalise it decided nothing -- so
+             * that case is not a judgement call about hardware behaviour, it
+             * is a bug, and it is fixed here outright.
+             *
+             * When the normal IS consumed, the honest answer is that we do not
+             * know what the hardware's rsqrt does with zero, so that case still
+             * rejects and is counted SEPARATELY. If JSRF turns out never to hit
+             * it, the remaining question is moot; if it does, the split counter
+             * says so instead of burying it in one number. Read the two counts
+             * before changing anything here. */
+            uint32_t light_on=m[0x314/4];
+            int normal_read=light_on!=0;
+            for(unsigned u=0;u<4 && !normal_read;++u)
+                for(unsigned k=0;k<3;++k)
+                    if(m[(0x3c0+u*16+k*4)/4]==normal_map) { normal_read=1;break; }
+            if(!normal_read) {
+                nv2a_ff_normal_unread++;
+                normal[0]=normal[1]=normal[2]=0;
+            } else {
+                nv2a_ff_normal_read++;
+                return "fixed-function normal";
+            }
+        } else {
+            for(unsigned k=0;k<3;++k) normal[k]/=n;
+        }
     }
     if(m[0x314/4]) {
         /* JSRF's first previously rejected fixed-function draws use the
