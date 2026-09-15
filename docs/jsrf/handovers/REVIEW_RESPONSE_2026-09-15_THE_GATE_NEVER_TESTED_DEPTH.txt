@@ -1,0 +1,264 @@
+REVIEW RESPONSE, 15 Sep 2026
+THE GATE NEVER PERFORMED A DEPTH COMPARISON, AND THE ACCURACY WIN WAS THE FIXTURE
+
+Written against REVIEW_2026-09-15_WHAT_TO_TRUST_AND_WHAT_TO_CHECK.txt, working
+through its section 6 list. Read section 1 of that file first; this is the
+reply to it.
+
+Changed in the working tree, uncommitted:
+    diagnostics/jsrf_first_fault/metal_batch_test.c    phase F, and the fixture
+    diagnostics/jsrf_first_fault/metal_hw_check.sh     two phases, three arms
+    src/nv2a/nv2a_metal.m                              one crash fix
+
+ctest 30/30. metal_hw_check PASS. metal_batch_check IDENTICAL. Full build clean.
+
+
+1. THE HEADLINE FOR THE REVIEWED
+=================================
+The handover asked me to satisfy myself that a gate passing on a broken
+renderer is the finding rather than the tool. It is both, and worse than
+stated: metal_batch_test has never performed a depth COMPARISON, on either
+path, in any phase.
+
+Two fixture defects, each hiding the other:
+
+  * Every phase sets `s.depth_func = 4`. That is a D3D-style D3DCMP_LESSEQUAL;
+    the NV2A encodes compare functions in the 0x200 range, so
+    nv2a_metal_compare_func returns -1 and BOTH paths fall back to ALWAYS. The
+    code comment at nv2a_metal.m:982 says this outright. Nobody connected it
+    to the gate that reads the test's output.
+
+  * base_state() builds the state with memset(0), leaving
+    z_clip_min == z_clip_max == 0. The software path clamps every fragment
+    into that range when z_cull is off, so ALL of its depth was zero.
+    nv2a_texture_copy.c:76 normalises that pair back to [0, 16777215] when it
+    decodes the guest registers, so no real draw can reach the backend with
+    it. Only a fixture filling the struct by hand could.
+
+With no depth to compare and no comparison to make, the depth half of the gate
+measured nothing. The proof is a negative control: injecting
+`d.depthCompareFunction = MTLCompareFunctionAlways` into hw_depth_state_for --
+breaking depth testing outright on the hardware path -- produced a PASS with
+numbers identical to the last digit.
+
+WHICH MEANS THE ACCURACY CLAIM WAS THE ARTIFACT. metal_hw_check.sh's own
+comment reads:
+
+    software state    1 of 65536 pixels,  54091 of 262144 depth bytes differ
+    hardware state    1 of 65536 pixels,     25 of 262144 depth bytes differ
+
+and concludes the hardware path "is the BETTER approximation" because it "takes
+z from the rasteriser's own depth interpolation, which is what the NV2A does".
+The 54091 is the software path being fed a depth range it clamps everything
+into. Give the fixture a legal range and the same two arms read:
+
+    software state    24 of 262144 depth bytes differ
+    hardware state    25 of 262144 depth bytes differ
+
+deterministic over three runs each. The gap is one byte, the other way. The
+hardware path may still be the better approximation for the reason given, but
+this measurement has never shown it and the sentence should not survive.
+
+
+2. WHAT THE GATE ACTUALLY MISSED, WHICH IS NOT WHAT SECTION 5 GUESSED
+=====================================================================
+Section 1 of the handover said "NOTHING SCORED A FRAME FROM A REAL RUN". True,
+and there is a smaller, cheaper statement inside it: nothing scored a surface
+swap either, and the reason is not the one recorded.
+
+The handover says "the synthetic test changes surface once". It does not.
+metal_batch_test phase D alternates two render targets forty times, on purpose,
+with a comment explaining why. What is missing is the SCORE: the only oracle
+comparison in the program is phase A, and phase A never changes surface. D is
+compared batched-against-per-draw, which is orthogonal to whether either is
+right. metal_hw_check.sh reads phase A's numbers, so the swap was invisible to
+it.
+
+Second hole, not noticed anywhere: metal_hw_check.sh never set
+RECOMP_METAL_565. The configuration reported broken is HW=1 AND 565=1 -- a
+different attachment format, a different upload path and a different readback
+path -- and the gate scored neither arm of it.
+
+Both are now closed. Phase F draws 120 triangles across THREE alternating
+surfaces (the count the title holds) with a real guest LEQUAL, scored against
+the rasteriser; metal_hw_check.sh scores phase A and phase F across three arms.
+
+
+3. THE RESULT, WHICH DOES NOT SUPPORT THE LEADING HYPOTHESIS
+=============================================================
+                        pixels    beyond one   worst    depth
+                        differ    step         step     bytes
+    phase A, one surface
+      software state         1         0          1        24
+      hardware state         1         0          1        25
+      hardware + 565       697         0          1        25
+    phase F, three surfaces
+      software state        29        29         52       109
+      hardware state        29        29         52       109
+      hardware + 565      1513        29         52       109
+
+Three genuinely distinct arms -- and that took two attempts, because zsh does
+not word-split an unquoted variable, so my first sweep ran the same
+configuration in two of the three arms and produced identical numbers I nearly
+reported. The same defect the handover documents twice, in the tooling built to
+catch it.
+
+Read it as follows.
+
+  * THE THREE-SURFACE SWAP DOES NOT REPRODUCE IT. Every arm scores the same 29
+    pixels beyond one channel step and the same 109 depth bytes. The retained-
+    surface machinery is shared by both state paths, and it behaves the same in
+    both. Section 5 item 1's first suspect is not supported by this test.
+
+  * 565's EXTRA PIXELS CONFORM. 697 and 1513 pixels differ, and every one of
+    them is within one RGB565 channel step -- the rule the D3D11 backend was
+    admitted under. A count-based gate would have failed the format for being
+    the guest's own format. This is why the rule is now magnitude.
+
+  * THE 29 PIXELS ARE NOT A SWAP DEFECT. They are scattered singletons across
+    all three surfaces (10/14/22), present with blending off, present with
+    depth testing off, and present with ONE surface. They scale with the number
+    of triangle edges drawn, which is what a rasteriser coverage disagreement
+    does.
+
+So the wrong image at a real mission is still unexplained, and the surface
+swap is now evidence against rather than a lead. What this gate STILL does not
+exercise, and a real mission does: register combiners, alpha test, stencil,
+multi-texture. That is where I would look next.
+
+
+4. SECTION 5 ITEM 1's SECOND SUSPECT IS VOID -- DO NOT SPEND A BOOT ON IT
+=========================================================================
+"setDepthClipMode:MTLDepthClipModeClamp at the draw site ... added
+speculatively ... Revert it first and re-test."
+
+It cannot be the difference, and reverting it cannot change anything, because
+the clamp is already applied to BOTH paths. nv2a_metal.m:2064 sets it
+unconditionally on the encoder, before the `if(hw)` branch, and has since the
+13 Sep depth-clipping retraction -- with a paragraph explaining that the
+fragment shader now owns the guest's SET_CLIP_MIN/MAX policy and hardware
+clipping would pre-empt it. The call inside the hw branch is a SECOND call, on
+the same encoder object, setting the same value. It is dead code.
+
+Removing the hw-path call: no behavioural change. Removing the unconditional
+one: changes both paths equally, so it still cannot explain a difference
+between them.
+
+
+5. A REAL CRASH, FOUND AND FIXED
+=================================
+    RECOMP_METAL_HW=1 RECOMP_METAL_BATCH=1 jsrf_metal_batch_test   ->  SIGSEGV
+
+nv2a_metal_draw bound `encoder` to the open batch encoder, then -- eighty lines
+later, after already issuing setDepthClipMode on it -- called batch_flush() to
+honour "a batch encoder is opened from ONE pass descriptor". batch_flush() ends
+the encoder, commits its command buffer and nils batch_encoder. The local
+`encoder` still pointed at it, so every setRenderPipelineState, setVertexBuffer
+and drawPrimitives below went to an encoder that was already ended.
+
+It fires on the FIRST hardware draw of any process, every time:
+batch_encoder_hw is a static initialised to 0, hw is 1, so the very first
+hardware draw always takes the flush branch.
+
+Nothing saw it because no gate combines the two switches. metal_batch_check.sh
+runs RECOMP_METAL_BATCH with the hardware path off; metal_hw_check.sh runs
+RECOMP_METAL_HW with batching off.
+
+Fixed by moving the check above the encoder acquisition, where the comment
+always said it belonged ("batch_flush() BEFORE switching"). After the fix the
+batched hardware path runs clean and its dump is byte-identical to the per-draw
+hardware path.
+
+
+6. THE getenv SWEEP
+====================
+37 distinct variables are tested for PRESENCE with `getenv("RECOMP_...") ? 1 : 0`.
+26 are traces, audits, reports and dumps, where presence is the correct test
+and a value would be meaningless. Eleven change what the program DOES, and for
+those a value is required:
+
+    RECOMP_PB_EXEC              nv2a_pusher.c:78        the pushbuffer executor
+    RECOMP_PB_EXEC_NOCLIPTEST   nv2a_pb_exec.c:2880     suppresses a draw guard
+    RECOMP_LEGACY_ZCLAMP        nv2a_metal.m:2019       forces the old z policy
+    RECOMP_FB_LIVE              nv2a_pb_exec.c:1222     which framebuffer is read
+    RECOMP_HEAP_NO_FREE         xbox_memory_layout.c:5865  disables heap free
+    RECOMP_D3D11_RESIDENT_CLEARS nv2a_d3d11.c:375
+    RECOMP_D3D11_SYNC_EACH      nv2a_d3d11.c:1869
+    RECOMP_IRQ_THREAD_GPU       kernel_bridge.c:3633
+    RECOMP_FAKE_PAD             xinput_device.c:512
+    RECOMP_PAD_INJECT           main.c:1857
+    RECOMP_OHCI_MIE             xbox_memory_layout.c:553
+
+RECOMP_PB_EXEC is the one that matters. It is the master switch for the whole
+NV2A executor, it appears as `RECOMP_PB_EXEC=1` in CLAUDE.md's own run line,
+and `RECOMP_PB_EXEC=0` would leave it ON -- a control arm that is not a
+control, on the most load-bearing switch in the project.
+
+RECOMP_OHCI_MIE is the sharpest trap: the comment beside it literally reads
+"RECOMP_OHCI_MIE=1 also sets MasterInterruptEnable", and =0 sets it too.
+
+Nothing in the tree currently passes =0 to any of the eleven, so no live
+measurement is wrong because of this. Converting them to `atoi(e) != 0` is
+mechanical; RECOMP_LEGACY_ZCLAMP is the urgent one because it is a documented
+A/B arm ("RECOMP_LEGACY_ZCLAMP=1 forces the old saturate-instead-of-discard
+policy, to A/B the change in one binary") that cannot be A/B'd.
+
+
+7. RE-SCORING THE ARCHIVE
+==========================
+"Scoring is a pure function of a log, so every archived run can be re-scored."
+True of the log. NOT true of `--summarise`, which reads RESULTS.txt -- the
+OUTPUT of scoring, frozen at run time. A harvester added afterwards cannot
+reach it. Re-summarising the archive reports "arms NOT verified distinct" for
+runs whose arms were perfectly distinct.
+
+Re-scored properly, from each arm's stderr.log:
+
+  RECOMP_METAL_HW (metalhw_ab_20260915-181457)
+      ARMS VERIFIED DISTINCT -- =0 reported "metal_hw OFF", =1 "metal_hw on".
+      9.6%, ranges do not overlap, n=3 against n=2. The claim stands, and the
+      commit names the stage column (clear 9.61/10.25/11.12 -> 5.76 ms) with a
+      mechanism that predicts that column. Passes the section 6 check.
+
+  RECOMP_METAL_565 (m565_ab_184344, m565b_ab_190437)
+      STILL NOT VERIFIABLE, and not because of the summariser: the
+      "[METAL] colour attachment:" line does not appear in any of the eleven
+      logs. It was added after those runs. The commit says so itself, which is
+      to its credit. The hardware path WAS on in every arm (hw draws 757k-976k,
+      "metal_hw on"), so hw_565_on() could take effect and the switch was not
+      inert -- but no evidence in the log says it did. The current binary
+      prints it; one re-run closes this.
+
+  RECOMP_METAL_BATCH (batch_ab_20260915-150600)
+      THE RANGES OVERLAP. Does not separate the arms. n=3 per arm.
+
+Incidental evidence for section 4's "sized from JSRF uses three" question: at a
+real mission the logs report pipelines=4 or 5 and refusals=0, against
+HW_CACHE = 16. The pipeline cache is not binding, and that is now measured
+rather than assumed.
+
+
+8. ONE MORE TOOLING TRAP
+=========================
+metal_batch_check.sh defaults to build-macos/jsrf-first-fault/build.
+metal_hw_check.sh defaults to build-macos/jsrf-first-fault/build-feav.
+
+Two sibling gates over the same binary, pointing at different build trees. It
+bit me during this review: metal_batch_check.sh reported "5 phases" and the old
+54091 figure from a stale binary while I was looking at a six-phase one. Pass
+JSRF_BUILD, or give them the same default.
+
+
+9. WHAT I WOULD DO NEXT
+========================
+  1. Re-run metal_hw_check.sh's question at a real mission, not because the
+     synthetic gate is worthless but because it has now said everything it can:
+     the swap is clean, the formats conform, and the fault is elsewhere.
+  2. Extend phase F to combiners, alpha test and stencil before that. Those are
+     the states a mission uses and the gate has never touched, and they are
+     seconds rather than a three-minute boot.
+  3. Convert the eleven behavioural switches to a value test, LEGACY_ZCLAMP
+     first.
+  4. Re-run the 565 A/B on the current binary, which now names its attachment.
+  5. Fix metal_hw_check.sh's comment, which still quotes 54091 as evidence for
+     a conclusion it does not support. (Done in the working tree.)

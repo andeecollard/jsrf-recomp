@@ -764,11 +764,7 @@ static int hw_565_on(void)
  *
  * AND metal_hw_check.sh PASSES. That gate scores a synthetic 40-draw test
  * against the software rasteriser and says 1 pixel differs by 1 step. So the
- * gate does not exercise whatever this is. The most likely candidate, from
- * clear_surface's own comment: "JSRF holds three colour surfaces and swaps
- * between them batch by batch". This backend retains ONE and re-uploads on each
- * swap; the synthetic test changes surface once. Tiles carrying content from
- * elsewhere is what a broken multi-surface swap looks like.
+ * gate does not exercise whatever this is.
  *
  * The frame-time numbers recorded below are real measurements OF A
  * CONFIGURATION THAT RENDERS THE GAME WRONG. They are not a reason to ship it.
@@ -776,12 +772,29 @@ static int hw_565_on(void)
  * is the hole in the method: ab_switch.sh scores frame time, scene and crashes,
  * and nothing scores the image.
  *
- * Also suspect, and added speculatively: setDepthClipMode:MTLDepthClipModeClamp
- * at the draw site. It was put in to close a depth difference, did not change
- * the number at all, and was left in anyway. Clamping rather than clipping
- * flattens every out-of-range fragment onto the near or far plane, where
- * coplanar geometry then fights -- which is what a flickering grid looks like.
- * Revert it first and re-test. */
+ * BOTH SUSPECTS RECORDED HERE HAVE SINCE BEEN TESTED AND NEITHER SURVIVED.
+ * Reviewed 15 Sep 2026; see
+ * docs/jsrf/handovers/REVIEW_RESPONSE_2026-09-15_THE_GATE_NEVER_TESTED_DEPTH.txt.
+ *
+ *   The multi-surface swap. metal_batch_test now draws 120 triangles across
+ *   THREE alternating surfaces and scores them against the rasteriser, and
+ *   every arm -- software state, hardware state, hardware+565 -- lands on the
+ *   same 29 pixels and the same 109 depth bytes. The retained-surface
+ *   machinery is shared by both paths and behaves identically in both. (The
+ *   note that "the synthetic test changes surface once" was wrong: phase D
+ *   already alternated two targets forty times. What was missing was a SCORE,
+ *   because the only oracle comparison was phase A, which never swaps.)
+ *
+ *   setDepthClipMode:MTLDepthClipModeClamp. Not speculative and not
+ *   hardware-path-only: it is applied unconditionally to the encoder below,
+ *   before the hw branch, and has been since the 13 Sep depth-clipping
+ *   retraction. The call inside the hw branch is a second call on the same
+ *   encoder object with the same value. Reverting it changes nothing, and
+ *   reverting the unconditional one changes both paths equally, so neither can
+ *   explain a difference between them.
+ *
+ * What the gate still does not exercise, and a mission does: register
+ * combiners, alpha test, stencil, multi-texture. Look there. */
 static int hw_state_on(void)
 {
     static int on = -1;
