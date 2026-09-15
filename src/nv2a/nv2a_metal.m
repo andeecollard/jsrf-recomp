@@ -1981,6 +1981,22 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   if(hw){pass.depthAttachment.texture=hw_depth_tex;pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;
          pass.stencilAttachment.texture=hw_stencil_tex;pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;}
   else{pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;}
+  /* A batch encoder is opened from ONE pass descriptor, so a draw that needs
+   * the other attachment layout cannot join it. batch_flush() before switching
+   * keeps that invariant; without it the hardware path would silently render
+   * into the software path's descriptor.
+   *
+   * IT HAS TO HAPPEN BEFORE THE ENCODER IS BOUND, and it used to happen after.
+   * batch_flush() calls endEncoding, commits the command buffer and nils
+   * batch_encoder -- but `encoder` had already been bound to that object a few
+   * lines above, so every setRenderPipelineState and drawPrimitives below went
+   * to an encoder that was already ended and a command buffer already
+   * committed. RECOMP_METAL_HW=1 with RECOMP_METAL_BATCH=1 segfaulted on its
+   * first draw, because batch_encoder_hw starts at 0 and the first hardware
+   * draw therefore always takes this branch. Neither gate combined the two
+   * switches, so nothing saw it. */
+  if(batch_on()&&batch_encoder&&hw!=batch_encoder_hw){batch_flush();}
+  batch_encoder_hw=hw;
   unsigned long long _t0=mtl_cb_stats()?mtl_now_ns():0;
   id<MTLCommandBuffer>command;id<MTLRenderCommandEncoder>encoder;
   if(batch_on()){
@@ -2046,12 +2062,6 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * RECOMP_LEGACY_ZCLAMP=1 forces the old saturate-instead-of-discard
    * policy, to A/B the change in one binary. */
   [encoder setDepthClipMode:MTLDepthClipModeClamp];
-  /* A batch encoder is opened from ONE pass descriptor, so a draw that needs
-   * the other attachment layout cannot join it. batch_flush() before switching
-   * keeps that invariant; without it the hardware path would silently render
-   * into the software path's descriptor. */
-  if(batch_on()&&batch_encoder&&hw!=batch_encoder_hw){batch_flush();}
-  batch_encoder_hw=hw;
   if(hw){[encoder setRenderPipelineState:hw_pso_use];[encoder setDepthStencilState:hw_dss_use];
          /* CLAMP, not clip. Metal's default discards a fragment whose z leaves
           * [0,1]; the software path clamped it and drew it anyway, which is
