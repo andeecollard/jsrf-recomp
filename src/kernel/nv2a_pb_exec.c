@@ -1753,6 +1753,80 @@ static int nv2a_range_hits_image(uint32_t guest_va, size_t bytes)
     return 1;
 }
 
+/* RECOMP_SURFACE_AUDIT -- does the surface the guest names match the one the
+ * backend is holding, at the two moments where it matters?
+ *
+ * The backend retains exactly ONE surface. The guest binds whichever it likes
+ * (s_gpu.color_offset moves on the register write) and the retained surface
+ * only moves on the next DRAW, so between those two the guest can name one
+ * surface while the backend holds another. Every claim about that window so
+ * far -- including the one that motivated giving nv2a_metal_discard a target
+ * -- has come from reading the code. This counts it in a real run.
+ *
+ * Sampled at the clear, because that is where the discard fast path decides
+ * whether it may throw the retained surface away, and at the flip, because
+ * that is where the presenter's snapshot is taken. `owed` says whether the
+ * retained surface is holding rendering guest RAM has not seen: a mismatch
+ * while owed is the only combination that can cost pixels.
+ *
+ * Read-only and opt-in. It answers a question, it does not change one. */
+#if defined(__APPLE__) && NV2A_GPU_PATH
+static int surface_audit_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_SURFACE_AUDIT");
+    return on;
+}
+static uint64_t sa_clear, sa_clear_other, sa_clear_other_owed;
+static uint64_t sa_flip, sa_flip_other, sa_flip_other_owed, sa_flip_nothing;
+static const uint8_t *sa_seen[16];
+static unsigned sa_seen_n;
+
+static void surface_audit(int at_flip)
+{
+    const uint8_t *held = NULL, *heldz = NULL, *bound;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    int owed = -1, other;
+    unsigned i;
+
+    if (!surface_audit_on() || !mem || !s_gpu.color_offset) return;
+    nv2a_metal_retained(&held, &heldz, &owed);
+    bound = mem + s_gpu.color_offset;
+    for (i = 0; i < sa_seen_n; ++i) if (sa_seen[i] == bound) break;
+    if (i == sa_seen_n && sa_seen_n < 16) sa_seen[sa_seen_n++] = bound;
+    other = (held != bound);
+    if (at_flip) {
+        ++sa_flip;
+        if (owed < 0) { ++sa_flip_nothing; return; }
+        if (other) { ++sa_flip_other; if (owed > 0) ++sa_flip_other_owed; }
+    } else {
+        ++sa_clear;
+        if (owed < 0) return;
+        if (other) { ++sa_clear_other; if (owed > 0) ++sa_clear_other_owed; }
+    }
+}
+
+static void surface_audit_report(void)
+{
+    if (!surface_audit_on()) return;
+    fprintf(stderr,
+        "[SURFACE-AUDIT] %llu distinct colour surfaces bound\n"
+        "[SURFACE-AUDIT] clears: %llu with a surface retained, %llu naming a "
+        "DIFFERENT one than is held, %llu of those holding unsaved rendering\n"
+        "[SURFACE-AUDIT] flips:  %llu total, %llu with nothing retained, %llu "
+        "naming a DIFFERENT one than is held, %llu of those holding unsaved "
+        "rendering\n",
+        (unsigned long long)sa_seen_n,
+        (unsigned long long)sa_clear, (unsigned long long)sa_clear_other,
+        (unsigned long long)sa_clear_other_owed,
+        (unsigned long long)sa_flip, (unsigned long long)sa_flip_nothing,
+        (unsigned long long)sa_flip_other, (unsigned long long)sa_flip_other_owed);
+}
+#else
+static void surface_audit(int at_flip) { (void)at_flip; }
+static void surface_audit_report(void) { }
+#endif
+
 static void clear_surface(uint32_t param)
 {
     unsigned long long _t_clear = pb_now_us();
@@ -1769,6 +1843,7 @@ static void clear_surface(uint32_t param)
      * below would otherwise bail on. If the DEPTH half turns out not to run,
      * `discarded` stays 0 and the colour half invalidates normally, so a
      * half-taken decision costs the win rather than the pixels. */
+    surface_audit(0);
     int want_discard = 0, discarded = 0;
 #ifdef nv2a_gpu_discard
     want_discard = clear_discard_on() && (param & 3u) == 3u
@@ -3291,6 +3366,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (nv2a_gpu_on() && nv2a_d3d11_event_trace())
             fprintf(stderr, "  [EV] FLIP   bound=%08X\n", s_gpu.color_offset);
 #endif
+        surface_audit(1);
         snapshot_surface();
         flip_trace();
         break;
@@ -3808,6 +3884,7 @@ void nv2a_pb_exec_report(void)
     {
         fprintf(stderr,"[" NV2A_GPU_TAG "] %u batches native, %u software fallbacks\n",
             s_gpu.gpu_batches,s_gpu.gpu_fallbacks);
+        surface_audit_report();
         nv2a_gpu_report();
 #if defined(__APPLE__)
         nv2a_metal_cb_report();

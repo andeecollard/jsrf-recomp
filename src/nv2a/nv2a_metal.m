@@ -1553,6 +1553,23 @@ int nv2a_metal_sync(void)
  * and dropping our reference is safe. dirty is cleared too, so a later sync
  * cannot try to read back a surface that has been abandoned. */
 
+/* WHAT IS THE BACKEND HOLDING RIGHT NOW? Read-only, for RECOMP_SURFACE_AUDIT.
+ *
+ * Every question about state surviving a frame boundary reduces to this one:
+ * the backend retains ONE surface, the guest binds and clears whichever it
+ * likes, and the two only meet on a draw. Nothing could compare them from
+ * outside, so every answer so far has come from reading this file rather than
+ * from a run. `owed` is -1 when nothing is retained, 0 when the retained
+ * surface matches guest RAM, and 1 when it holds rendering guest RAM has not
+ * seen yet -- which is the only state in which losing it costs pixels. */
+void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed)
+{
+    if (color) *color = surface_target;
+    if (depth) *depth = depth_target;
+    if (owed)  *owed  = (!surface_valid && !depth_valid) ? -1
+                      : ((surface_dirty || depth_dirty) ? 1 : 0);
+}
+
 int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth)
 {
     /* ONLY IF THE SURFACE BEING CLEARED IS THE ONE BEING HELD.

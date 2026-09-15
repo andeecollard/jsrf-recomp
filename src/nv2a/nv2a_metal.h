@@ -18,6 +18,9 @@ void nv2a_metal_invalidate(uint8_t *target);
  * something -- the caller must invalidate normally when it returns 0, because
  * the surface being cleared was not the one being held. */
 int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth);
+/* Read-only: what the backend currently retains, for RECOMP_SURFACE_AUDIT.
+ * owed is -1 nothing retained, 0 retained and clean, 1 retained and dirty. */
+void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed);
 /* Stable diagnostic label for the most recent -1 result. */
 const char *nv2a_metal_last_reject(void);
 /* Compact cumulative counters for live performance validation. */
