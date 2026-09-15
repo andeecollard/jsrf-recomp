@@ -73,6 +73,15 @@ static uint8_t targetA[TARGET_BYTES], targetB[TARGET_BYTES];
 static uint8_t depthA[DEPTH_BYTES],  depthB[DEPTH_BYTES];
 static uint8_t oracle[TARGET_BYTES], oracle_z[DEPTH_BYTES];
 static unsigned oracle_worst, oracle_one_step;
+/* Phase F: three surfaces, because JSRF holds three and swaps between them
+ * batch by batch, and this backend retains ONE Metal texture and re-uploads on
+ * every swap. Its own buffers rather than phase A's: by the time F runs,
+ * targetA has been through B, C and D without the rasteriser alongside it, so
+ * the phase A oracle has legitimately diverged and cannot be reused. */
+#define SWAPS 3u
+static uint8_t swap_t[SWAPS][TARGET_BYTES], swap_z[SWAPS][DEPTH_BYTES];
+static uint8_t swap_o[SWAPS][TARGET_BYTES], swap_oz[SWAPS][DEPTH_BYTES];
+static unsigned swap_bad, swap_zbad, swap_worst, swap_one_step;
 static float big[BIG_VERTS][16][4];
 
 static FILE *dump;
@@ -87,6 +96,8 @@ static void record(void)
     fwrite(targetB, 1, sizeof targetB, dump);
     fwrite(depthA,  1, sizeof depthA,  dump);
     fwrite(depthB,  1, sizeof depthB,  dump);
+    fwrite(swap_t,  1, sizeof swap_t,  dump);
+    fwrite(swap_z,  1, sizeof swap_z,  dump);
 }
 
 static void base_state(NV2ATextureCopy *s)
@@ -95,6 +106,23 @@ static void base_state(NV2ATextureCopy *s)
     s->width = s->height = 16; s->pitch = 32; s->levels = 1; s->texture_mask = 1;
     s->clip_w = W; s->clip_h = H; s->target_pitch = W * 2; s->target_bpp = 2;
     s->depth_pitch = W * 4;
+    /* A DEPTH RANGE, because memset(0) is a state the guest cannot produce and
+     * it silently disabled depth on one path.
+     *
+     * The software path clamps every fragment to [z_clip_min, z_clip_max] when
+     * z_cull is off -- so a zeroed pair clamps ALL depth to zero, and that path
+     * then cannot depth-test at all. The hardware path takes depth from the
+     * rasteriser and is unaffected, so the two paths were not rendering the
+     * same quantity. nv2a_texture_copy.c:76 normalises exactly this case back
+     * to [0, 16777215] when it decodes NV097_SET_CLIP_MIN/MAX, so no real draw
+     * ever reaches the backend with it; only this fixture, which fills the
+     * struct by hand, could.
+     *
+     * It stayed invisible because every phase also set depth_func = 4, which is
+     * not an NV2A encoding -- nv2a_metal_compare_func returns -1 and both paths
+     * fall back to ALWAYS. Two fixture defects cancelling: no depth to compare,
+     * and no comparison to make. */
+    s->z_clip_min = 0.0f; s->z_clip_max = 16777215.0f;
 }
 
 static void fill_tri(float v[3][16][4], unsigned span)
@@ -128,6 +156,29 @@ static int draw(const NV2ATextureCopy *s, const uint8_t *tex,
     }
     drawn += (unsigned)r;
     return 1;
+}
+
+/* COUNT AND MAGNITUDE, in 565 channel steps -- the unit this project's
+ * acceptance rule is written in. Shared by phase A and phase F so the two
+ * report the same quantity. */
+static void score(const uint8_t *got, const uint8_t *want, size_t bytes,
+                  unsigned *bad, unsigned *worst_out, unsigned *one_step)
+{
+    size_t i;
+    for (i = 0; i < bytes; i += 2) {
+        unsigned o = want[i] | (unsigned)want[i+1] << 8;
+        unsigned g = got[i]  | (unsigned)got[i+1]  << 8;
+        int dr, dg, db, worst;
+        if (o == g) continue;
+        ++*bad;
+        dr = (int)(o >> 11)       - (int)(g >> 11);
+        dg = (int)((o >> 5) & 63) - (int)((g >> 5) & 63);
+        db = (int)(o & 31)        - (int)(g & 31);
+        if (dr < 0) dr = -dr; if (dg < 0) dg = -dg; if (db < 0) db = -db;
+        worst = dr > dg ? dr : dg; if (db > worst) worst = db;
+        if (worst > (int)*worst_out) *worst_out = (unsigned)worst;
+        if (worst == 1) ++*one_step;
+    }
 }
 
 int main(int argc, char **argv)
@@ -180,19 +231,7 @@ int main(int argc, char **argv)
      *
      * Per channel, in 565 steps, because that is the unit the rule is written
      * in: a whole-pixel measure would hide a 1-step red behind a correct green. */
-    for (i = 0; i < sizeof oracle; i += 2) {
-        unsigned o = oracle[i] | (unsigned)oracle[i+1] << 8;
-        unsigned g = targetA[i] | (unsigned)targetA[i+1] << 8;
-        if (o == g) continue;
-        ++oracle_bad;
-        int dr = (int)(o >> 11) - (int)(g >> 11);
-        int dg = (int)((o >> 5) & 63) - (int)((g >> 5) & 63);
-        int db = (int)(o & 31) - (int)(g & 31);
-        if (dr < 0) dr = -dr; if (dg < 0) dg = -dg; if (db < 0) db = -db;
-        int worst = dr > dg ? dr : dg; if (db > worst) worst = db;
-        if (worst > (int)oracle_worst) oracle_worst = (unsigned)worst;
-        if (worst == 1) ++oracle_one_step;
-    }
+    score(targetA, oracle, sizeof oracle, &oracle_bad, &oracle_worst, &oracle_one_step);
     for (i = 0; i < sizeof oracle_z; ++i)
         if (oracle_z[i] != depthA[i]) ++oracle_zbad;
     record();
@@ -267,14 +306,82 @@ int main(int argc, char **argv)
     CHECK(nv2a_metal_sync());
     record();
 
+    /* F -- THREE surfaces, alternating, scored against the rasteriser.
+     *
+     * Phase D already alternates two render targets, but nothing ever scored
+     * its image: D is compared batched-against-per-draw only, and the only
+     * oracle comparison in this program is phase A, which never changes
+     * surface at all. So metal_hw_check.sh -- which reads phase A's numbers --
+     * passed a hardware path that renders a real mission wrong, with tiles
+     * carrying content from elsewhere in the scene. A gate that cannot see the
+     * swap cannot gate the swap.
+     *
+     * Three rather than two because that is what the title holds, and because
+     * a two-surface alternation cannot tell "the retained texture is re-
+     * uploaded from the wrong target" from "it is re-uploaded from the one
+     * before last".
+     *
+     * Blended AND depth-tested, so the readback path for both attachments is
+     * exercised on every swap: under RECOMP_METAL_HW depth lives in its own
+     * attachment and has to be uploaded and read back per swap, which is
+     * precisely the state the per-draw phases never make it rebuild. */
+    for (i = 0; i < SWAPS; ++i) {
+        memset(swap_t[i], 0xcc, TARGET_BYTES);
+        for (d = 0; d < DEPTH_BYTES; d += 4) {
+            swap_z[i][d] = 0x5a; swap_z[i][d+1] = 0xff;
+            swap_z[i][d+2] = 0xff; swap_z[i][d+3] = 0xff;
+        }
+        memcpy(swap_o[i],  swap_t[i], TARGET_BYTES);
+        memcpy(swap_oz[i], swap_z[i], DEPTH_BYTES);
+    }
+    for (d = 0; d < 120; ++d) {
+        NV2ATextureCopy s; float v[3][16][4] = {{{0}}};
+        unsigned k = d % SWAPS;
+        base_state(&s);
+        /* 0x203, NOT 4. Every other phase sets depth_func = 4, a D3D-style
+         * D3DCMP_LESSEQUAL the NV2A never emits -- its own encoding is the
+         * 0x200 range -- so nv2a_metal_compare_func returns -1 and BOTH paths
+         * fall back to ALWAYS. The consequence was invisible until this phase
+         * was written: the only correctness gate the Metal renderer has never
+         * performed a depth COMPARISON at all, on either path. Its depth
+         * numbers came from depth writes. Use the real guest LEQUAL here so
+         * the comparison, the MTLDepthStencilState built from it, and the
+         * fragment shader cmpf() it replaces are all actually exercised. */
+        s.depth_test = 1; s.depth_write = 1; s.depth_func = 0x203;
+        if (d & 1) { s.blend = 1; s.blend_src = 0x302; s.blend_dst = 0x303; }
+        fill_tri(v, 0);
+        if (!nv2a_texture_copy_triangle_depth(&s, textures[d % TEXTURES], TEX_BYTES,
+                                              swap_o[k], TARGET_BYTES,
+                                              swap_oz[k], DEPTH_BYTES,
+                                              v[0], v[1], v[2]))
+            continue;
+        if (!draw(&s, textures[d % TEXTURES], swap_t[k], swap_z[k], v, 3, "F"))
+            return 1;
+    }
+    CHECK(nv2a_metal_sync());
+    record();
+    for (i = 0; i < SWAPS; ++i) {
+        unsigned b;
+        score(swap_t[i], swap_o[i], TARGET_BYTES,
+              &swap_bad, &swap_worst, &swap_one_step);
+        for (b = 0; b < DEPTH_BYTES; ++b)
+            if (swap_oz[i][b] != swap_z[i][b]) ++swap_zbad;
+    }
+
     if (!drawn) { fprintf(stderr, "no triangles survived assembly\n"); return 1; }
-    printf("metal batch (%s): %lu triangles over 5 phases "
-           "(overlap, ring wrap, texture eviction, surface change, readback); "
+    printf("metal batch (%s): %lu triangles over 6 phases "
+           "(overlap, ring wrap, texture eviction, surface change, readback, "
+           "three-surface swap); "
            "phase A differs from the software rasteriser on %u of %u pixels "
            "and %u of %u depth bytes; worst channel error %u step(s), "
            "%u of the differing pixels are within one\n",
            mode, drawn, oracle_bad, W * H, oracle_zbad, (unsigned)sizeof oracle_z,
            oracle_worst, oracle_one_step);
+    printf("metal swap (%s): phase F differs from the software rasteriser on "
+           "%u of %u pixels and %u of %u depth bytes; worst channel error "
+           "%u step(s), %u of the differing pixels are within one\n",
+           mode, swap_bad, SWAPS * W * H, swap_zbad,
+           (unsigned)sizeof swap_z, swap_worst, swap_one_step);
     if (dump) {
         if (ferror(dump)) { fprintf(stderr, "write error on %s\n", argv[1]); return 1; }
         fclose(dump);
