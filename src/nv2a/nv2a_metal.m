@@ -80,7 +80,7 @@ static inline unsigned long long mtl_now_ns(void)
  * first turns that deadlock into an ordinary wait. */
 /* Full clears that dropped the surface instead of syncing it. Each one is
  * a GPU drain and a 4.9 MB readback that did not happen. */
-static id<MTLFunction> hw_vs, hw_fs;
+static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend;
 static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
@@ -569,6 +569,44 @@ static NSString *const shader =
   * run from the least significant bits up, so B5G6R5 already IS the guest's
   * layout and the attachment can hold its words verbatim. */
  " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
+ /* THE THIRD ENTRY POINT: hardware depth and stencil, blending in the shader.
+  *
+  * It exists for one reason. The NV2A dithers at the ROP, AFTER blending, and
+  * so does fs() and so does nv2a_texture_copy.c at its store. fs_hw cannot:
+  * the blend unit runs after the fragment shader, so a bias added there is
+  * multiplied by the source blend factor and mixed with a destination that
+  * already carries its own -- instead of being the bounded +/-0.5 LSB nudge at
+  * quantisation that ordered dither is. Measured at 8192 of 65536 pixels wrong
+  * against the rasteriser, on the dither matrix's own 4x4 lattice, where the
+  * software path scored 0. That is the flickering checkerboard.
+  *
+  * So for a draw that BOTH blends and dithers, the blend comes back into the
+  * shader and the dither follows it, exactly as fs() orders them. Depth and
+  * stencil stay where the hardware path put them -- real attachments and an
+  * MTLDepthStencilState -- because that is the part that was right, and
+  * because depth ownership is exclusive: a draw that put depth back in the
+  * colour alpha here would mix two representations in one frame.
+  *
+  * WHAT IT COSTS, and only for these draws: reading the destination needs
+  * raster_order_group(0), so overlapping fragments serialise again. A draw
+  * that blends without dithering keeps the blend unit and pays nothing; so
+  * does a draw that dithers without blending, because then the bias IS the
+  * last thing before quantisation and fs_hw is already correct.
+  *
+  * The alpha it returns is the shaded alpha, not a blended one, matching
+  * fs(): bfactor() takes its SRC_ALPHA from c.a and nothing downstream reads
+  * this attachment's alpha on this path -- depth comes from hw_depth_readback
+  * and the 565 attachment has no alpha at all. */
+ "fragment float4 fs_hw_blend(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3);"
+ " float zg=i.p.z*16777215.0f;"
+ " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
+ " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
+ " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
+ " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
+ " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
+ " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
@@ -604,6 +642,7 @@ static int initialize(void)
         /* Retained for the hardware-state pipelines, which are built lazily
          * per distinct blend state rather than once here. */
         hw_vs=[library newFunctionWithName:@"vs"];hw_fs=[library newFunctionWithName:@"fs_hw"];
+        hw_fs_blend=[library newFunctionWithName:@"fs_hw_blend"];
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
         pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -872,17 +911,51 @@ static void hw_depth_readback(uint8_t *zram, unsigned w, unsigned h,
     free(dep); free(ste);
 }
 
-#define HW_CACHE 16
-static struct { uint32_t blend,src,dst; id<MTLRenderPipelineState> pso; }
+/* 32, NOT 16, BECAUSE THE KEY JUST GAINED A DIMENSION.
+ *
+ * The old 16 was sized from "JSRF uses three" and a real mission was later
+ * measured at pipelines=4..5 with refusals=0, so it had comfortable headroom.
+ * Keying on the shader-blend selector as well can double the set -- the same
+ * blend state appears both dithered and not -- so the same measurement now
+ * implies up to ten. A miss is not a small slowdown here: hw_pipeline_for
+ * returns nil, the draw is rejected, and the pushbuffer executor falls back to
+ * the CPU rasteriser for it. 32 keeps the margin the 16 used to have, at
+ * 32 pointers.
+ *
+ * Still not evidence for a mission, which is what it should be sized from:
+ * RECOMP_METAL_HW reports pipelines= and refusals= on every run, and the
+ * number to watch is refusals staying at 0. */
+#define HW_CACHE 32
+/* WHICH OF THE TWO HARDWARE FRAGMENT TAILS THIS DRAW NEEDS.
+ *
+ * Only a draw that blends AND dithers has to take the blend back into the
+ * shader, because only then does the ROP-stage ordering matter: dither after
+ * blend is what the NV2A does, what fs() does and what the rasteriser does.
+ * Blending alone keeps the blend unit; dithering alone is already correct in
+ * fs_hw, because with nothing after it the bias IS the last step before
+ * quantisation. Everything else pays nothing. */
+static int hw_shader_blend(const NV2ATextureCopy *s)
+{
+    return s->blend && s->dither;
+}
+
+/* THE SELECTOR IS PART OF THE KEY. Two draws with identical blend state but
+ * differing dither need DIFFERENT pipelines now -- one with the blend unit
+ * enabled and fs_hw, one with it disabled and fs_hw_blend. Keying on blend
+ * alone would hand the second draw the first one's pipeline and blend twice,
+ * or not at all. */
+static struct { uint32_t blend,src,dst,sblend; id<MTLRenderPipelineState> pso; }
     hw_pso[HW_CACHE];
 static unsigned hw_pso_n;
 
 static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
 {
     unsigned i;
+    uint32_t sblend = (uint32_t)hw_shader_blend(s);
     for (i = 0; i < hw_pso_n; ++i)
         if (hw_pso[i].blend == s->blend && hw_pso[i].src == s->blend_src
-            && hw_pso[i].dst == s->blend_dst) return hw_pso[i].pso;
+            && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend)
+            return hw_pso[i].pso;
     if (hw_pso_n >= HW_CACHE) { ++g_hw_state_refusals; return nil; }
 
     int sf = MTLBlendFactorOne, df = MTLBlendFactorZero;
@@ -892,7 +965,9 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
         if (sf < 0 || df < 0) { ++g_hw_state_refusals; return nil; }
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = hw_vs; d.fragmentFunction = hw_fs;
+    d.vertexFunction = hw_vs;
+    d.fragmentFunction = sblend ? hw_fs_blend : hw_fs;
+    if (sblend && !hw_fs_blend) { ++g_hw_state_refusals; return nil; }
     /* STILL RGBA32Float, AND THE REASON RECORDED HERE BEFORE WAS WRONG.
      *
      * That comment said the software rasteriser prefers float because float
@@ -944,7 +1019,7 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
      * bytes in and out of a private texture. */
     d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
-    if (s->blend) {
+    if (s->blend && !sblend) {
         d.colorAttachments[0].blendingEnabled = YES;
         /* The guest's only blend equation here is ADD; nv2a_texture_copy's
          * accept test rejects anything else before a draw reaches us. */
@@ -961,7 +1036,8 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     if (!pso) { ++g_hw_state_refusals; return nil; }
     ++g_hw_pipeline_misses;
     hw_pso[hw_pso_n].blend = s->blend; hw_pso[hw_pso_n].src = s->blend_src;
-    hw_pso[hw_pso_n].dst = s->blend_dst; hw_pso[hw_pso_n].pso = pso;
+    hw_pso[hw_pso_n].dst = s->blend_dst; hw_pso[hw_pso_n].sblend = sblend;
+    hw_pso[hw_pso_n].pso = pso;
     ++hw_pso_n;
     return pso;
 }
