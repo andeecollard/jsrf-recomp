@@ -1758,10 +1758,10 @@ static void bridge_KeWaitForSingleObject(void)
          * front end is never trapped. In actual gameplay with a controller it
          * put the front end into FEMETHMODE_TRAPPED for 203628 of 269896 APU
          * frames, against 0 and 70 in the two gameplay runs on the previous
-         * default. se_frame is skipped whenever the front end is trapped
-         * (apu_core.c, "Idling the frame on TRAPPED is deliberate"), so voice
-         * processing stopped -- `processed` froze across four consecutive
-         * reports -- and the game went SILENT. Polling ten times as often lets
+         * default. se_frame was then skipped whenever the front end was trapped,
+         * so voice processing stopped -- `processed` froze across four
+         * consecutive reports -- and the game went SILENT. Polling ten times as
+         * often lets
          * the guest push front-end methods ten times as often, and the trap
          * window scales with that traffic.
          *
@@ -1775,7 +1775,16 @@ static void bridge_KeWaitForSingleObject(void)
          * sound server really is starved by this poll. Whatever replaces it
          * must not increase front-end method traffic: a real wakeup on event
          * set, not a faster poll. Any future change here must be measured at
-         * GAMEPLAY with [APU-FRAME] trapped= read, not only at the intro. */
+         * GAMEPLAY with [APU-FRAME] trapped= read, not only at the intro.
+         *
+         * ONE HALF OF THE MECHANISM ABOVE IS NO LONGER TRUE, and it makes this
+         * worth re-testing rather than re-reading. Since 15 Sep 2026
+         * RECOMP_APU_SE_WHILE_TRAPPED is the default, so a trapped front end no
+         * longer stops the sound engine: trapped= 203628 of 269896 would now
+         * cost interrupts and front-end latency rather than silence. The
+         * revert stands until someone measures it again at gameplay -- the
+         * finding that killed it was silence, and the reason for the silence
+         * has been removed. */
         {
             static long poll_us = -1;
             if (poll_us < 0) {

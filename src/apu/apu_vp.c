@@ -493,31 +493,67 @@ int mcpx_apu_trap_coalesce(void)
     return on;
 }
 
-/* OFF by default, and the reason is a measurement that did not go my way.
+/* OFF by default, and UNMEASURED. Read that as written: not "measured and found
+ * useless", which is what this comment used to say.
  *
- * It was written as a fix for the idle-voice trap storm and it is not one. In
- * a 240 s run that reached voice churn it fired 47,293 times -- so self-links
- * are real and frequent -- and left `trapped` at 50.3%, indistinguishable from
- * the runs without it. Terminating the cycle does not stop the storm, because
- * the self-linked voice is still the HEAD of its list and still inactive: the
- * walk starts on a dead voice and raises its trap whether or not it then loops.
+ * It said the guard "fired 47,293 times and left `trapped` at 50.3%,
+ * indistinguishable from the runs without it". Both halves of that fail:
  *
- * What it still is, is correct. link(v) = v is the driver's "not in any list"
- * marker, written by SetupVoiceProcessor for all 256 voices at boot and by
- * RemoveIdleVoice for every voice it removes, so treating it as end-of-list
- * honours a convention the guest already relies on. And an unbounded self-cycle
- * is a defect on its own terms: the walk's only protection is a 256-iteration
- * cap, so a self-linked ACTIVE voice would be rendered 256 times in a subframe.
- * That has not been observed, which is exactly why it is not being shipped on
- * the strength of an argument.
+ *   * there were no runs without it. The control arm set
+ *     RECOMP_APU_SELFLINK_END=0, and until the same day this function tested
+ *     for the variable's PRESENCE, so the control had the guard on too. See
+ *     the note on mcpx_apu_selflink_end below.
+ *   * three of that A/B's four runs never reached voice churn at all --
+ *     on=5 off=0 idle_trap=0, the parked-player signature, and 12 of 199 pad
+ *     events fired. One run in four had any churn and it was in the guard=1
+ *     arm, so 50.3% had nothing to be indistinguishable from.
  *
- * So it stays, off, as a switch with a number behind it. Turning it on by
- * default would be patching around a gate before a run has proved which value
- * is wrong -- this repository's own rule, and the one I broke to write it. */
+ * What the switch IS remains what it was: link(v) = v is the driver's "not in
+ * any list" marker, written by SetupVoiceProcessor for all 256 voices at boot
+ * and by RemoveIdleVoice for every voice it removes, so treating it as
+ * end-of-list honours a convention the guest already relies on. An unbounded
+ * self-cycle is also a defect on its own terms -- the walk's only protection is
+ * a 256-iteration cap, so a self-linked ACTIVE voice would be rendered 256
+ * times in a subframe.
+ *
+ * AND THERE IS NOW AN ARGUMENT AGAINST IT, which is why the default does not
+ * move on the strength of the paragraph above. The case for "terminating cannot
+ * lose a reachable voice" rested on the guest having already written
+ * link(v) = v before the re-ON. Measured across four instrumented runs, that is
+ * false in every one of the sixteen cycle-forming inserts: link(v) held a real
+ * successor, and OUR insert overwrote it. Terminating therefore drops whatever
+ * the guest still had behind v. So does looping, so the guard is not worse --
+ * but neither is lossless, and that points back at the insert.
+ * See docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-15_THE_HEAD_WAS_NEVER_STALE.md.
+ *
+ * It stays off until an A/B with a working control arm and two churning runs
+ * per arm says otherwise. diagnostics/jsrf_first_fault/ab_switch.sh takes it. */
+/* THE SWITCH TESTED FOR THE VARIABLE'S PRESENCE, SO `=0` TURNED IT ON.
+ *
+ * `getenv(...) != NULL` is the right shape for a trace, where setting the name
+ * at all means "start printing", and it is what most RECOMP_* switches here
+ * do. It is the wrong shape for an A/B switch, and this one's own comment two
+ * paragraphs up promised the opposite: "RECOMP_APU_SELFLINK_END=0 restores the
+ * previous behaviour for A/B".
+ *
+ * So the only A/B ever taken of it ran with the guard ON IN BOTH ARMS -- the
+ * control arm set the variable to 0 and thereby enabled the very thing it was
+ * controlling for. Both arms' reports even said "(guard on)"; nobody read them.
+ * That is the second independent reason the "it moves nothing" verdict in
+ * CLAUDE_HANDOVER_2026-09-15 is unsupported, and it is the mechanical one: the
+ * first is that three of that A/B's four runs never reached voice churn.
+ *
+ * Value-tested now, matching mcpx_apu_trap_coalesce and
+ * mcpx_apu_se_while_trapped, which were written correctly. The other switches
+ * in this tree documented as `=0`-disableable -- RECOMP_GPU_OWN and
+ * RECOMP_PHYSICAL_HEAP_ALIAS -- were checked the same day and honour it. */
 int mcpx_apu_selflink_end(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_APU_SELFLINK_END") != NULL;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_SELFLINK_END");
+        on = e ? (atoi(e) != 0) : 0;
+    }
     return on;
 }
 
@@ -2172,8 +2208,6 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         current = voice_list_regs[list].current;
         next = voice_list_regs[list].next;
 
-        d->regs[current] = d->regs[top];
-
         /* The walk is driven by a LOCAL cursor, not by d->regs[current].
          *
          * d->regs[current] is how the guest learns which voice idled, so it has
@@ -2183,8 +2217,39 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
          * and only the first is required. With the local cursor the register
          * can be held still while every voice behind the dead one still gets
          * rendered. See mcpx_apu_se_while_trapped. */
-        uint16_t cur = (uint16_t)d->regs[current];
+        uint16_t cur = (uint16_t)d->regs[top];
         int trap_held = 0;
+
+        /* CVL AND NVL ARE ONE CURSOR, AND BOTH HAVE TO HOLD STILL.
+         *
+         * Hardware stalls the walk on a trap with CVL naming the idle voice and
+         * NVL naming its successor, and the guest reads BOTH: RemoveIdleVoice
+         * repairs the pair to steer an in-progress walk through the voice it is
+         * taking out. A pair that half-moves is worse than one that does not
+         * move at all, because CVL still looks right.
+         *
+         * Holding only CVL was enough while the frame thread idled on TRAPPED:
+         * nothing then ran to move NVL either. That was xemu's behaviour and
+         * this model's until RECOMP_APU_SE_WHILE_TRAPPED became the default on
+         * 15 Sep 2026. With the engine now rendering through a trap this
+         * function is re-entered every 1500th of a second while the guest still
+         * owes a service, and it used to rewrite NVL at every voice behind the
+         * trapped one -- walking it to the tail -- and then reset CVL from TVL
+         * here, discarding the one value the guest was told to read.
+         *
+         * So the two cursors are separated. The LOCAL one always starts at the
+         * head, because rendering must not stop -- that is the whole point of
+         * SE_WHILE_TRAPPED. The GUEST-VISIBLE pair does not move while a trap
+         * the guest has not serviced is outstanding. `hold` is that
+         * distinction and is the only thing it does.
+         *
+         * NOT OFFERED AS THE TRAP STORM'S FIX, and it is not one: the storm is
+         * measured in runs that predate both this and the local cursor. It is
+         * the handshake the guest is entitled to, and it was intact before
+         * today. */
+        int hold = (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                       == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+        if (!hold) d->regs[current] = d->regs[top];
 
         for (int i = 0; cur != 0xFFFF; i++) {
             if (i >= MCPX_HW_MAX_VOICES) {
@@ -2259,7 +2324,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 g_apu_selflink_terminated++;
                 nxt = 0xFFFF;
             }
-            d->regs[next] = nxt;
+            if (!hold) d->regs[next] = nxt;
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
@@ -2292,6 +2357,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     g_apu_trap_suppressed++;
                     if (!mcpx_apu_se_while_trapped()) return;
                     trap_held = 1;
+                    /* Redundant today -- reaching here with !trap_held and
+                     * FEMETHMODE already TRAPPED means the trap was raised
+                     * before this list's walk began, which is exactly what set
+                     * `hold` above. Written out so that a later change to this
+                     * condition cannot unfreeze the pair silently. */
+                    hold = 1;
                 }
 
                 if (!trap_held) {
@@ -2300,14 +2371,24 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     if (v < MCPX_HW_MAX_VOICES) g_idle_trap_by_voice[v]++;
                     g_idle_trap_last[g_idle_trap_ring & 15u] = (uint16_t)v;
                     g_idle_trap_ring++;
+                    /* The pair names the voice the guest is about to be told
+                     * about. With coalescing off this raise REPLACES an
+                     * outstanding one, so the cursor has to follow it to the
+                     * new voice rather than stay frozen on the old -- otherwise
+                     * FEDECPARAM and CVL would name different voices. With
+                     * coalescing on this is the first raise and both are
+                     * already correct; writing them is then a no-op. */
+                    d->regs[current] = v;
+                    d->regs[next] = nxt;
                     fe_method(d, SE2FE_IDLE_VOICE, v);
                     if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
                             NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
                         if (!mcpx_apu_se_while_trapped())
                             return;
-                        /* Hold d->regs[current] here for the guest, and keep
-                         * rendering everything behind it. */
+                        /* Hold the pair here for the guest, and keep rendering
+                         * everything behind it. */
                         trap_held = 1;
+                        hold = 1;
                     }
                 }
             } else {
@@ -2315,7 +2396,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 g_apu_voice_process_count++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
-            if (!trap_held) d->regs[current] = nxt;
+            if (!hold) d->regs[current] = nxt;
             cur = nxt;
         }
     }
