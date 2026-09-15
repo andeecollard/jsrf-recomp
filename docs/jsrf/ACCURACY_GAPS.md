@@ -55,8 +55,27 @@ Two independent defects, both only visible with a controller in hand:
 * **Trap storm.** Every voice retirement raises an APU front-end trap that stops
   the sound engine; the voice-list walk re-traps the same dead voice every frame.
   Real play: 109 voices started, 103 retired, **22,371 traps**, 48% of APU frames
-  skipped. A fix exists behind `RECOMP_APU_SE_WHILE_TRAPPED=1` — **built, off,
-  and never heard**.
+  skipped.
+
+  *2026-09-15, and read the whole of this before quoting any number above.*
+  48% is a run-cumulative figure and it is diluted by a healthy first two
+  minutes; differenced over the last 30 s of `20260915-110630` the engine is at
+  **8.2%** duty and stays there. `RECOMP_APU_SE_WHILE_TRAPPED` is now **default
+  ON** and takes duty from 63.6% to 98.6% over two matched pairs, with
+  `RECOMP_APU_TRAP_COALESCE` (also default on) giving back 92% of the guest
+  interrupts that costs. **The engine's frames are restored; the storm
+  underneath them is not fixed** — a scene-verified mission still reports
+  `suppressed=95721`. It has also never been heard: the gate on both switches
+  is a person listening to a sustained sound at gameplay, and counters cannot
+  close it.
+
+  The producer is a `VOICE_ON` for a voice that is **already its list's head**,
+  which stores `link(v) = regs[top] = v` and leaves the walk on a one-entry
+  cycle. `regs[top]` is not stale and no guest write is missing; see
+  `progress/CLAUDE_PROGRESS_2026-09-15_THE_HEAD_WAS_NEVER_STALE.md`, which
+  retracts the "failed removal handshake" framing. `RECOMP_APU_SELFLINK_END`
+  terminates such a list, is **untested** — its A/B had one usable arm — and is
+  the next measurement, not the next edit.
 * **Ring replay.** ~23% of the music ring is the previous lap replayed, because
   CRI's sound server gets 33.4 of the 43.1 passes/s it needs.
 
@@ -349,7 +368,13 @@ provoke the input-poll stall and make a gameplay measurement measure the probes.
 **It is not yet proven to work, and the first version of it failed instructively.**
 It ran the full 250 s, fired 186 of 193 events, retired one voice — and never
 left the attract screen: 1342 `NtOpenFile` calls, the title plateau, against New
-Game's 1408. `off=1` read as success until the open count was checked. The
+Game's 1408. `off=1` read as success until the open count was checked.
+
+*2026-09-15:* **those two numbers were measuring the disc cache build, not the
+screen.** They are left above because the conclusion drawn at the time — that
+the run never left the attract screen — was independently right, but the gate
+is retired: on a pre-cached emulated HDD the count is 131 in every scene. The
+scene gate is now `[JSRF-SEQ] now=` under `RECOMP_SEQ_REPORT`. The
 runner now tests *reaching* gameplay and *playing* as two separate gates, and
 the schedule now uses new_game.pad's full measured boot prefix rather than
 moving.pad's truncated one. The next run is what settles it.
