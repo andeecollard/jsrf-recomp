@@ -17,7 +17,13 @@ class CombinerTraceTest(unittest.TestCase):
         renderer = build_dir / "jsrf_vsh_render_test"
         with tempfile.TemporaryDirectory(prefix="jsrf-combiner-trace-") as directory:
             prefix = str(Path(directory) / "draw-")
-            env = dict(os.environ, RECOMP_COMBINER_TRACE="1", RECOMP_DRAW_CAPTURE=prefix)
+            # RECOMP_VERTEX_RANGE because the input-range line asserted below
+            # became opt-in on 13 Sep 2026 -- it is a second full pass over
+            # every vertex of every draw and no longer runs by default. This
+            # test has been failing since, on an assertion about a probe that
+            # was switched off rather than about anything the renderer does.
+            env = dict(os.environ, RECOMP_COMBINER_TRACE="1",
+                       RECOMP_DRAW_CAPTURE=prefix, RECOMP_VERTEX_RANGE="1")
             result = subprocess.run([str(renderer)], env=env, check=True,
                                     capture_output=True, text=True)
             log = result.stderr
