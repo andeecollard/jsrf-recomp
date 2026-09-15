@@ -301,16 +301,145 @@ excludes "0" and the empty string, and main.c's two `!getenv` sites are a
 default-setter, not a gate. The rule that catches counters catches greps too.
 
 
-10. WHAT IS STILL OPEN
+10. THE CAUSE OF THE FLICKERING CHECKERBOARD
+=============================================
+FOUND, AND IT IS NOT A FRAME-BOUNDARY PROBLEM AT ALL. It is one draw, and the
+gate could have caught it on day one if the fixture had set one field.
+
+base_state() builds its state with memset(0), so s.dither was 0 in every phase
+of the only test that scores an image. The one code path in this renderer that
+produces a literal 4x4 lattice had never been executed. That is the THIRD
+fixture field found this way, after depth_func = 4 and the zeroed clip range,
+and it is the one that mattered.
+
+Set it and the paths separate at once:
+
+                        pixels differ   beyond one step   4x4 dither cells
+    software state            0                0            0 / 0
+    hardware state         8192               19           77 / 857
+    hardware + 565         8402               19           93 / 878
+
+The software path becomes EXACT -- 0 of 65536, worst error 0 steps, better than
+the 1 pixel it scored with dither off. Dither is not noise; it is something the
+oracle does and the gate was not asking about.
+
+THE MECHANISM. The two fragment shaders apply the dither at different stages:
+
+    fs      shade -> blend (in shader) -> dither -> store
+    fs_hw   shade -> dither -> return  -> [blend unit] -> store
+
+The NV2A dithers at the ROP, after blending. fs does that, and so does
+nv2a_texture_copy.c at its store. fs_hw hands the biased colour to the
+fixed-function blend unit instead, so the +/-0.5 LSB nudge is multiplied by the
+source blend factor and mixed with a destination that already carries its own
+baked-in bias, instead of being applied once at quantisation.
+
+MEASURED, NOT INFERRED, and this is the part that makes it certain:
+
+    dither ON, blending OFF     hardware scores 0 of 65536 -- exact
+    dither ON, blending ON      hardware scores 8192
+
+The error exists only where both are active. That is the ordering and nothing
+else.
+
+AND IT IS A PATTERN, NOT MORE NOISE. The emptiest and fullest of the sixteen
+4x4 dither cells hold 77 and 857 differing pixels. Coverage disagreement -- the
+kind every other phase carries -- fills all sixteen evenly. An order of
+magnitude apart is the dither matrix's own shape, and the test now reports that
+cell range so the distinction needs no image.
+
+That is the flickering checkerboard: a 4x4 lattice error that compounds with
+each overlapping blended layer, over backgrounds that are mostly overlapping
+blended layers, changing frame to frame as the camera changes how many overlap.
+
+NOT A ONE-LINE FIX. Metal has no ROP-stage dither and the blend unit runs after
+the fragment shader, so this path cannot dither where the hardware does.
+Skipping the shader dither when blending was measured and is WORSE -- 92 pixels
+beyond one step against the current 19 -- because the oracle dithers and the
+hardware path then would not. The real options are a third pipeline that blends
+in-shader while keeping the real depth and stencil attachments (losing the
+ordering win only for dithered blended draws), or a documented divergence. That
+is a design decision.
+
+NOT MEASURED: the magnitude at scale. This is 20 blended draws; a mission has
+far more overlap and compounding is the whole mechanism. The structure is
+confirmed; its size in a real frame is not.
+
+metal_hw_check.sh NOW FAILS, deliberately, naming this. Leaving dither out to
+keep it green would be the exact failure this review has been about.
+
+
+11. THE FRAME-BOUNDARY TRACE, AND WHAT IT FOUND
+================================================
+Done before the above, and it is how the search got narrow enough to look at a
+single draw again. What survives a frame, all of it in nv2a_metal.m and all for
+exactly ONE surface:
+
+    surface, stencil_surface, hw_depth_tex, hw_stencil_tex   reallocated per swap
+    surface_target / depth_target + geometry + valid/dirty
+    hw_pso[16] / hw_dss[16]      keyed caches, never invalidated
+    texture_cache[128]           keyed by address AND a full memcmp
+    ring slabs, last_command, batch_*
+
+Reset points: the upload block (any pointer or geometry change),
+nv2a_metal_sync (readback), nv2a_metal_invalidate(target) (per surface), and
+nv2a_metal_discard (which took no target at all -- fixed, see below).
+
+CONFIRMED AND FIXED. nv2a_metal_discard dropped the retained surface without
+reading it back and without being told which surface the guest was clearing.
+s_gpu.color_offset moves on the register write, surface_target on the next
+draw, so a clear in that window names one surface and drops another. Measured
+at 24848 of 65536 pixels of finished rendering lost. Latent -- default off, and
+the reproducing run reports "clear discards=0" -- so nothing recorded is
+affected.
+
+CONFIRMED, NOT FIXED. nv2a_gpu_sync_range(target, bytes) is
+#define'd to nv2a_metal_sync() and discards its target. Benign while one
+surface is retained; wrong the moment that changes. And hw_565_on() never
+consults hw_depth_tex, so a depth-texture allocation failure would leave a
+B5G6R5 attachment bound while draws fall to a pipeline built for RGBA32Float --
+corruption instead of a clean fallback. Not reachable in any observed run.
+
+UNVERIFIED. The presenter reads s_snap while snapshot_surface() writes it, and
+snapshot_surface() can realloc it. dev_Present runs on the render thread; I
+could not establish whether the pushbuffer executor is the same thread without
+a run.
+
+ELIMINATED WITH EVIDENCE, all of which I had first proposed as causes:
+  * clip-origin mismatch -- clip is +0+0 in all 1275 reports of every archived
+    mission run
+  * texture cache staleness -- a hit requires a full memcmp of the contents
+  * pipeline/depth-state cache overflow -- pipelines=4..5, refusals=0, cache 16
+  * the batches-vs-hw-draws gap of 7381 -- empty batches returning early, and
+    the same 0.6-1.1% rate in all three arms
+  * an unordered tile-memory race from dropping raster_order_group(0) --
+    fs_hw returns float4 and takes no destination read, so there is nothing to
+    race on
+
+ON PROCESS. Four of the six hypotheses in this section died, two of them after
+I had written them up as findings rather than as guesses. Nothing false reached
+a commit, because each was checked -- but in a project whose recorded failure
+mode is believing a number before reading what produced it, generating the
+narration ahead of the evidence is the wrong order, and I did it while
+reviewing a handover about exactly that. The dither result above is what the
+right order looks like: predict, measure with a control (blending off), check
+the shape (the lattice), then write it down.
+
+
+12. WHAT IS STILL OPEN
 =======================
-  1. THE WRONG IMAGE AT A MISSION. Still unexplained, and now with the swap,
-     both attachment formats, and every per-draw state translation eliminated.
-     Look at what persists across frames rather than at what a draw does.
-  2. Re-run the 565 A/B on the current binary, which now names its attachment,
-     so the 14.5% has arms that can be verified.
-  3. Re-run RECOMP_VSH_REUSE properly -- the handover's item 3, untouched here.
-  4. The software path's metal_copy_test line 49 depth mismatch, now that it is
-     the only arm failing an exact comparison.
-  5. ab_score.py's SWITCH_TOKEN has entries for seven switches. Every switch
-     that is an A/B arm should print its state and appear there;
-     RECOMP_METAL_BATCH is one that does not.
+  1. THE DITHER STAGE. Cause known, fix is a design decision (section 10).
+     metal_hw_check.sh is red until it is made.
+  2. Whether the checkerboard fully accounts for what was seen, or only the
+     grid half of it. "Solid black rectangles" and "a large black band" are not
+     obviously dither, and the [FB] sampler in fbcheck-on shows frames at
+     203078 of 307200 nonzero pixels where the control shows 307152.
+  3. RECOMP_SURFACE_AUDIT is built and NOT YET RUN. It answers how often a
+     clear names a surface other than the held one, which decides how bad the
+     discard defect would have been.
+  4. Re-run the 565 A/B on the current binary, which now names its attachment.
+  5. Re-run RECOMP_VSH_REUSE properly -- the original handover's item 3.
+  6. The software path's metal_copy_test line 49 depth mismatch, now the only
+     arm failing an exact comparison.
+  7. ab_score.py's SWITCH_TOKEN covers seven switches; RECOMP_METAL_BATCH is an
+     A/B arm that is not among them.
