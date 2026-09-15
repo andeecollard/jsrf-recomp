@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "nv2a_metal.h"
+#include "nv2a_metal_state.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -78,6 +79,7 @@ static inline unsigned long long mtl_now_ns(void)
  * first turns that deadlock into an ordinary wait. */
 /* Full clears that dropped the surface instead of syncing it. Each one is
  * a GPU drain and a 4.9 MB readback that did not happen. */
+static id<MTLFunction> hw_vs, hw_fs;
 static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
@@ -512,6 +514,44 @@ static NSString *const shader =
  " c=clamp(r[12]+(s.add_specular?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
  " else if(!s.untextured){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(s.modulate?c.a:1);if(s.modulate)c.rgb*=max(float3(0),d0.rgb);}"
  " return c;}\n"
+ /* THE HARDWARE-STATE ENTRY POINT.
+  *
+  * Same colour as fs(), then nothing. No destination read, so no
+  * raster_order_group and no serialisation of overdrawn pixels; no depth test
+  * and no stencil, because a real Depth32Float_Stencil8 attachment and an
+  * MTLDepthStencilState do both; no blend, because the pipeline's blend
+  * descriptor does it.
+  *
+  * WHAT STAYS, and why each one has to:
+  *   z range   NV097_SET_ZMIN_MAX_CONTROL asks for CULL or CLAMP outside
+  *             SET_CLIP_MIN/MAX. CULL is a per-fragment discard that no fixed
+  *             function expresses, so it stays. It costs early-Z on the
+  *             fragments that reach it, which is a real cost and is the first
+  *             thing to measure if this path disappoints.
+  *   alpha     Metal has no fixed-function alpha test at all.
+  *   dither    the guest's own ordered dither, matching the 16-bit target.
+  *
+  * The depth VALUE needs no work here: vs() already emits o.p.z = z*p.w with
+  * z = guest_z/16777215, so after the hardware divide the rasteriser has
+  * exactly the guest's normalised depth, which is what the attachment stores
+  * and what MTLCompareFunction compares. That is why this change does not
+  * touch the vertex stage. */
+ "fragment float4 fs_hw(Out i [[stage_in]],"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3);"
+ /* discard_fragment() does NOT return in MSL -- execution continues and the
+  * write is dropped at the end -- so each discard returns explicitly. The
+  * returned value is immaterial; the explicit return is what stops the rest
+  * of the shader running for a fragment that is already gone. */
+ " float zg=i.p.z*16777215.0f;"
+ " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
+ " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
+ /* Byte-for-byte the dither fs() uses. It is per-channel because the guest
+  * target is RGB565 and the quantisation step differs between green and the
+  * other two; a uniform bias would dither green twice as hard. */
+ " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
+ " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
+ " return float4(c.rgb,1);}\n"
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
@@ -544,6 +584,9 @@ static int initialize(void)
     id<MTLLibrary> library=[device newLibraryWithSource:shader options:options error:&error];
     if(library){MTLRenderPipelineDescriptor *desc=[MTLRenderPipelineDescriptor new];
         desc.vertexFunction=[library newFunctionWithName:@"vs"];desc.fragmentFunction=[library newFunctionWithName:@"fs"];
+        /* Retained for the hardware-state pipelines, which are built lazily
+         * per distinct blend state rather than once here. */
+        hw_vs=[library newFunctionWithName:@"vs"];hw_fs=[library newFunctionWithName:@"fs_hw"];
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
         pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -551,6 +594,151 @@ static int initialize(void)
     attempted=1;
     if(!pipeline||!queue){pipeline=nil;fprintf(stderr,"[METAL] initialization failed: %s\n",error.description.UTF8String);pthread_mutex_unlock(&initialization_mutex);return 0;}
     fprintf(stderr,"[METAL] native raster pipeline ready: %s\n",device.name.UTF8String);pthread_mutex_unlock(&initialization_mutex);return 1;
+}
+
+/* ============================================================
+ * Hardware render state: pipelines and depth/stencil objects
+ * ============================================================
+ *
+ * Metal bakes blending into the pipeline state object and depth/stencil into a
+ * separate immutable object, so neither can be set per draw the way the guest
+ * sets its registers. Both are therefore cached on the guest state that
+ * produces them. The caches are tiny and linear because a title uses a handful
+ * of distinct render states, not thousands: JSRF's own combiner trace reports
+ * three distinct configurations across a whole frame.
+ *
+ * REFUSAL, NOT SUBSTITUTION. If any field fails to translate, these return nil
+ * and the caller falls back to the software-state path for that draw. A
+ * pipeline built from a guessed blend factor draws the frame with the wrong
+ * equation and reports nothing; falling back is visibly slower and correct.
+ * The counters below say how often it happens so "the hardware path is on"
+ * never silently means "for some of the draws". */
+_Static_assert(MTLBlendFactorZero==NV2A_MTL_BLEND_ZERO
+    && MTLBlendFactorOne==NV2A_MTL_BLEND_ONE
+    && MTLBlendFactorSourceColor==NV2A_MTL_BLEND_SRC_COLOR
+    && MTLBlendFactorOneMinusSourceColor==NV2A_MTL_BLEND_ONE_MINUS_SRC_COLOR
+    && MTLBlendFactorSourceAlpha==NV2A_MTL_BLEND_SRC_ALPHA
+    && MTLBlendFactorOneMinusSourceAlpha==NV2A_MTL_BLEND_ONE_MINUS_SRC_ALPHA
+    && MTLBlendFactorDestinationAlpha==NV2A_MTL_BLEND_DST_ALPHA
+    && MTLBlendFactorOneMinusDestinationAlpha==NV2A_MTL_BLEND_ONE_MINUS_DST_ALPHA
+    && MTLBlendFactorDestinationColor==NV2A_MTL_BLEND_DST_COLOR
+    && MTLBlendFactorOneMinusDestinationColor==NV2A_MTL_BLEND_ONE_MINUS_DST_COLOR
+    && MTLBlendFactorSourceAlphaSaturated==NV2A_MTL_BLEND_SRC_ALPHA_SATURATED,
+    "nv2a_metal_state.h blend constants must equal the MTLBlendFactor values");
+_Static_assert(MTLCompareFunctionNever==NV2A_MTL_CMP_NEVER
+    && MTLCompareFunctionLess==NV2A_MTL_CMP_LESS
+    && MTLCompareFunctionEqual==NV2A_MTL_CMP_EQUAL
+    && MTLCompareFunctionLessEqual==NV2A_MTL_CMP_LESS_EQUAL
+    && MTLCompareFunctionGreater==NV2A_MTL_CMP_GREATER
+    && MTLCompareFunctionNotEqual==NV2A_MTL_CMP_NOT_EQUAL
+    && MTLCompareFunctionGreaterEqual==NV2A_MTL_CMP_GREATER_EQUAL
+    && MTLCompareFunctionAlways==NV2A_MTL_CMP_ALWAYS,
+    "nv2a_metal_state.h compare constants must equal MTLCompareFunction");
+_Static_assert(MTLStencilOperationKeep==NV2A_MTL_STENCIL_KEEP
+    && MTLStencilOperationZero==NV2A_MTL_STENCIL_ZERO
+    && MTLStencilOperationReplace==NV2A_MTL_STENCIL_REPLACE
+    && MTLStencilOperationIncrementClamp==NV2A_MTL_STENCIL_INCR_CLAMP
+    && MTLStencilOperationDecrementClamp==NV2A_MTL_STENCIL_DECR_CLAMP
+    && MTLStencilOperationInvert==NV2A_MTL_STENCIL_INVERT
+    && MTLStencilOperationIncrementWrap==NV2A_MTL_STENCIL_INCR_WRAP
+    && MTLStencilOperationDecrementWrap==NV2A_MTL_STENCIL_DECR_WRAP,
+    "nv2a_metal_state.h stencil constants must equal MTLStencilOperation");
+
+unsigned long long g_hw_pipeline_misses, g_hw_state_refusals;
+
+#define HW_CACHE 16
+static struct { uint32_t blend,src,dst; id<MTLRenderPipelineState> pso; }
+    hw_pso[HW_CACHE];
+static unsigned hw_pso_n;
+
+static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
+{
+    unsigned i;
+    for (i = 0; i < hw_pso_n; ++i)
+        if (hw_pso[i].blend == s->blend && hw_pso[i].src == s->blend_src
+            && hw_pso[i].dst == s->blend_dst) return hw_pso[i].pso;
+    if (hw_pso_n >= HW_CACHE) { ++g_hw_state_refusals; return nil; }
+
+    int sf = MTLBlendFactorOne, df = MTLBlendFactorZero;
+    if (s->blend) {
+        sf = nv2a_metal_blend_factor(s->blend_src);
+        df = nv2a_metal_blend_factor(s->blend_dst);
+        if (sf < 0 || df < 0) { ++g_hw_state_refusals; return nil; }
+    }
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = hw_vs; d.fragmentFunction = hw_fs;
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    if (s->blend) {
+        d.colorAttachments[0].blendingEnabled = YES;
+        /* The guest's only blend equation here is ADD; nv2a_texture_copy's
+         * accept test rejects anything else before a draw reaches us. */
+        d.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        d.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        d.colorAttachments[0].sourceRGBBlendFactor = (MTLBlendFactor)sf;
+        d.colorAttachments[0].destinationRGBBlendFactor = (MTLBlendFactor)df;
+        d.colorAttachments[0].sourceAlphaBlendFactor = (MTLBlendFactor)sf;
+        d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
+    }
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pso =
+        [device newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!pso) { ++g_hw_state_refusals; return nil; }
+    ++g_hw_pipeline_misses;
+    hw_pso[hw_pso_n].blend = s->blend; hw_pso[hw_pso_n].src = s->blend_src;
+    hw_pso[hw_pso_n].dst = s->blend_dst; hw_pso[hw_pso_n].pso = pso;
+    ++hw_pso_n;
+    return pso;
+}
+
+static struct { uint32_t key[9]; id<MTLDepthStencilState> dss; }
+    hw_dss[HW_CACHE];
+static unsigned hw_dss_n;
+
+static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
+{
+    uint32_t k[9] = { s->depth_test, s->depth_write, s->depth_func,
+                      s->stencil_test, s->stencil_write, s->stencil_mask,
+                      s->stencil_func, s->stencil_fail, s->stencil_zpass };
+    unsigned i;
+    for (i = 0; i < hw_dss_n; ++i)
+        if (!memcmp(hw_dss[i].key, k, sizeof k)) return hw_dss[i].dss;
+    if (hw_dss_n >= HW_CACHE) { ++g_hw_state_refusals; return nil; }
+
+    /* An unwritten NV097_SET_DEPTH_FUNC reads 0, and the shader's cmpf treats
+     * that as LEQUAL. The hardware path has to agree or a title that never
+     * wrote the register would depth-test differently on the two paths. */
+    uint32_t func = s->depth_func ? s->depth_func : NV2A_GUEST_DEPTH_FUNC_DEFAULT;
+    int cmp = s->depth_test ? nv2a_metal_compare_func(func)
+                            : NV2A_MTL_CMP_ALWAYS;
+    if (cmp < 0) { ++g_hw_state_refusals; return nil; }
+
+    MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+    d.depthCompareFunction = (MTLCompareFunction)cmp;
+    d.depthWriteEnabled = s->depth_write ? YES : NO;
+    if (s->stencil_test || s->stencil_write) {
+        int sc = s->stencil_test ? nv2a_metal_compare_func(s->stencil_func)
+                                 : NV2A_MTL_CMP_ALWAYS;
+        int fail = nv2a_metal_stencil_op(s->stencil_fail);
+        int pass = nv2a_metal_stencil_op(s->stencil_zpass);
+        int zfail = nv2a_metal_stencil_op(s->stencil_zfail);
+        if (sc < 0 || fail < 0 || pass < 0 || zfail < 0)
+            { ++g_hw_state_refusals; return nil; }
+        MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+        sd.stencilCompareFunction = (MTLCompareFunction)sc;
+        sd.stencilFailureOperation = (MTLStencilOperation)fail;
+        sd.depthStencilPassOperation = (MTLStencilOperation)pass;
+        sd.depthFailureOperation = (MTLStencilOperation)zfail;
+        sd.readMask = s->stencil_func_mask & 255;
+        sd.writeMask = s->stencil_write ? (s->stencil_mask & 255) : 0;
+        d.frontFaceStencil = sd; d.backFaceStencil = sd;
+    }
+    id<MTLDepthStencilState> dss = [device newDepthStencilStateWithDescriptor:d];
+    if (!dss) { ++g_hw_state_refusals; return nil; }
+    memcpy(hw_dss[hw_dss_n].key, k, sizeof k);
+    hw_dss[hw_dss_n].dss = dss; ++hw_dss_n;
+    return dss;
 }
 
 static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)

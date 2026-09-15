@@ -40,11 +40,17 @@
  * and the test needs no device. Static asserts in nv2a_metal.m check them
  * against the real MTL enums at compile time, so a Metal SDK change cannot
  * silently invalidate the table. */
+/* Read off MTLRenderPipeline.h, not remembered. The first draft of this enum
+ * had DestinationColor and DestinationAlpha transposed -- 6/7 against 8/9 --
+ * which would have blended every DST_COLOR draw against the wrong channel and
+ * shown up as a subtly wrong image in one blend mode. The _Static_asserts in
+ * nv2a_metal.m caught it at compile time, which is the entire reason they are
+ * there and the reason these are written out rather than computed. */
 enum { NV2A_MTL_BLEND_ZERO = 0, NV2A_MTL_BLEND_ONE = 1,
        NV2A_MTL_BLEND_SRC_COLOR = 2, NV2A_MTL_BLEND_ONE_MINUS_SRC_COLOR = 3,
        NV2A_MTL_BLEND_SRC_ALPHA = 4, NV2A_MTL_BLEND_ONE_MINUS_SRC_ALPHA = 5,
-       NV2A_MTL_BLEND_DST_ALPHA = 6, NV2A_MTL_BLEND_ONE_MINUS_DST_ALPHA = 7,
-       NV2A_MTL_BLEND_DST_COLOR = 8, NV2A_MTL_BLEND_ONE_MINUS_DST_COLOR = 9,
+       NV2A_MTL_BLEND_DST_COLOR = 6, NV2A_MTL_BLEND_ONE_MINUS_DST_COLOR = 7,
+       NV2A_MTL_BLEND_DST_ALPHA = 8, NV2A_MTL_BLEND_ONE_MINUS_DST_ALPHA = 9,
        NV2A_MTL_BLEND_SRC_ALPHA_SATURATED = 10 };
 
 enum { NV2A_MTL_CMP_NEVER = 0, NV2A_MTL_CMP_LESS = 1, NV2A_MTL_CMP_EQUAL = 2,
