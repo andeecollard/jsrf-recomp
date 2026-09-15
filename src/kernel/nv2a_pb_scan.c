@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_pb_scan.h"
+#include "../recomp_switch.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -156,7 +157,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     uint32_t words = 0, jumps = 0, unknown = 0;
 
     if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+        s_exec_enabled = recomp_switch_on("RECOMP_PB_EXEC");
     if (!(getenv("RECOMP_PB_SCAN") || (s_exec_enabled && !s_external_executor)) || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */

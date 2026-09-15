@@ -1,4 +1,5 @@
 #include "nv2a_ff.h"
+#include "../recomp_switch.h"
 /* The accelerated raster path, under one set of names.
  *
  * macOS reaches it through Metal and Windows through D3D11. The two backends
@@ -1219,7 +1220,7 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
      * moving under either. */
     {
         static int live = -1;
-        if (live < 0) live = getenv("RECOMP_FB_LIVE") ? 1 : 0;
+        if (live < 0) live = recomp_switch_on("RECOMP_FB_LIVE");
         if (!live && s_snap && s_snap_w && s_snap_h) {
             if (w) *w = s_snap_w;
             if (h) *h = s_snap_h;
@@ -2877,7 +2878,7 @@ static void raster_batch(void)
          * untransformed vertices would otherwise paint nonsense. */
         {
             static int allow = -1;
-            if (allow < 0) allow = getenv("RECOMP_PB_EXEC_NOCLIPTEST") ? 1 : 0;
+            if (allow < 0) allow = recomp_switch_on("RECOMP_PB_EXEC_NOCLIPTEST");
             if (!allow)
                 return;
         }

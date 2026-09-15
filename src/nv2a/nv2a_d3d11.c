@@ -23,7 +23,8 @@
  * build exists. See the note beside build_shaders() for why the D3D8 layer's
  * register-combiner compiler is not used here.
  */
-#include "d3d8_internal.h"           /* COBJMACROS, d3d11.h, device accessors */
+#include "d3d8_internal.h"
+#include "../recomp_switch.h"           /* COBJMACROS, d3d11.h, device accessors */
 #include <d3dcompiler.h>
 #include "nv2a_d3d11.h"
 #include "recomp_gpu_own.h"
@@ -372,7 +373,7 @@ static int resident_clears_enabled(void)
 {
     static int enabled = -1;
     if (enabled < 0)
-        enabled = getenv("RECOMP_D3D11_RESIDENT_CLEARS") ? 1 : 0;
+        enabled = recomp_switch_on("RECOMP_D3D11_RESIDENT_CLEARS");
     return enabled;
 }
 
@@ -1866,7 +1867,7 @@ static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t t
      * itself and so has never exercised the deferred path the game uses. */
     {
         static int each = -1;
-        if (each < 0) each = getenv("RECOMP_D3D11_SYNC_EACH") ? 1 : 0;
+        if (each < 0) each = recomp_switch_on("RECOMP_D3D11_SYNC_EACH");
         if (each) (void)sync_range_inner(NULL, 0);
     }
     publish_ownership();

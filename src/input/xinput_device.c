@@ -509,6 +509,15 @@ void xbox_InputInit(void)
 static int fake_pad_on(void)
 {
     static int on = -1;
+    /* PRESENCE, DELIBERATELY, and not an oversight of the 15 Sep sweep that
+     * converted ten other switches to recomp_switch_on().
+     *
+     * This switch's VALUE selects the START policy, read below: 1, <n>, `a`
+     * and `always` are all meaningful and all mean "the fake pad is on".
+     * recomp_switch_on() would keep every one of those working, but a future
+     * atoi() conversion would silently turn `RECOMP_FAKE_PAD=a` off, which is
+     * the spelling that presses A without pausing the game. Presence is the
+     * right test here; the value question is answered separately. */
     if (on < 0) on = getenv("RECOMP_FAKE_PAD") ? 1 : 0;
     return on;
 }

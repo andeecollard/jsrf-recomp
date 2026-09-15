@@ -11,11 +11,24 @@
 # same reason jsrf_metal_copy_test is built but not registered.
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BUILD="${JSRF_BUILD:-$ROOT/build-macos/jsrf-first-fault/build}"
+BUILD="${JSRF_BUILD:-$ROOT/build-macos/jsrf-first-fault/build-feav}"
 BIN="$BUILD/jsrf_metal_batch_test"
 OUT="${TMPDIR:-/tmp}/jsrf-batch-check.$$"
 
+# WHICH BUILD DID THIS SCORE? Say so, and default to the same one as its
+# siblings. metal_batch_check.sh defaulted to .../build while
+# metal_hw_check.sh defaulted to .../build-feav, so the two gates over the same
+# binary read different build trees -- and during the 15 Sep review the first
+# scored a day-old binary and reported a retracted figure as current. Stating
+# the path and its timestamp makes that visible in the output instead of
+# invisible in a default.
+say_build() {
+    printf 'build: %s\n' "$BUILD"
+    printf 'binary: %s (%s)\n' "$1" "$(date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown mtime')"
+}
+
 [ -x "$BIN" ] || { echo "no $BIN -- build the jsrf_metal_batch_test target" >&2; exit 1; }
+say_build "$BIN"
 mkdir -p "$OUT" || exit 1
 trap 'rm -rf "$OUT"' EXIT INT TERM
 

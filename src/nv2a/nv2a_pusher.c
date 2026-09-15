@@ -3,6 +3,7 @@
  */
 
 #include "nv2a_pusher.h"
+#include "../recomp_switch.h"
 #include "nv2a_pgraph_d3d11.h"
 
 #include <stdio.h>
@@ -75,7 +76,7 @@ static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
 
     {
         static int exec_on = -1;
-        if (exec_on < 0) exec_on = getenv("RECOMP_PB_EXEC") ? 1 : 0;
+        if (exec_on < 0) exec_on = recomp_switch_on("RECOMP_PB_EXEC");
         if (exec_on) nv2a_pb_exec_method(subchannel, method, param);
     }
 

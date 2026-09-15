@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "../recomp_switch.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -3630,7 +3631,7 @@ static DWORD WINAPI bridge_irq_thread(LPVOID unused)
      * each time -- on the thread whose whole job is to be punctual. */
     static int irq_thread_gpu = -1;
     if (irq_thread_gpu < 0)
-        irq_thread_gpu = getenv("RECOMP_IRQ_THREAD_GPU") ? 1 : 0;
+        irq_thread_gpu = recomp_switch_on("RECOMP_IRQ_THREAD_GPU");
     if (irq_thread_gpu) {
         fprintf(stderr, "  [IRQ-THREAD] synthetic GPU delivery enabled"
                         " (diagnostic; may break the ISR/DPC handoff)\n");

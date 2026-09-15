@@ -29,6 +29,7 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #include <xbox/xboxrecomp.h>
 #include "recomp_types.h"
+#include "../../src/recomp_switch.h"
 #include "guest_trace.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
@@ -1033,7 +1034,7 @@ static void jsrf_pusher_report(void)
             fflush(stderr);
         }
         RECOMP_ICALL_FEEDBACK_DUMP();
-        if (getenv("RECOMP_PB_EXEC")) nv2a_pb_exec_report();
+        if (recomp_switch_on("RECOMP_PB_EXEC")) nv2a_pb_exec_report();
         /* Voice lifecycle: separates "no voice ever started" from "voices
          * start and never retire", which is what decides whether a silent run
          * is the guest's fault or the APU's. */
@@ -1854,7 +1855,7 @@ static int pad_sentinel(void)
 static int pad_inject(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_PAD_INJECT") ? 1 : 0;
+    if (on < 0) on = recomp_switch_on("RECOMP_PAD_INJECT");
     return on;
 }
 

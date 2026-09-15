@@ -378,6 +378,11 @@ add_test(NAME jsrf_texture_copy COMMAND jsrf_texture_copy_test)
 
 # Guest render state -> Metal enums. Pure integer translation, so unlike every
 # other Metal test here it needs no device and can be a ctest case.
+# The opt-in switch predicate. Four lines, and the four lines it replaces cost
+# three wrong A/Bs -- so it gets a test like anything else.
+add_executable(jsrf_switch_test switch_test.c)
+add_test(NAME jsrf_switch COMMAND jsrf_switch_test)
+
 add_executable(jsrf_metal_state_test metal_state_test.c)
 target_link_libraries(jsrf_metal_state_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_metal_state COMMAND jsrf_metal_state_test)

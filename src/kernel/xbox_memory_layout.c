@@ -26,6 +26,7 @@
 #endif
 
 #include "xbox_memory_layout.h"
+#include "../recomp_switch.h"
 #include "xbox_usb_ohci.h"
 #include "kernel.h"
 #include "recomp_mem_watch.h"
@@ -550,7 +551,7 @@ static void xbox_McpxHoldRegisters(void)
                  * nothing follows, the title is waiting on something else and
                  * faking its register told us so cheaply. Either answer is
                  * worth one line; neither is a fix. */
-                if (getenv("RECOMP_OHCI_MIE")) {
+                if (recomp_switch_on("RECOMP_OHCI_MIE")) {
                     off[n] = 0x500010u; val[n++] = *ien | 0x80000000u;
                 }
                 mcpx_hw_store_n(off, val, n);
@@ -558,7 +559,7 @@ static void xbox_McpxHoldRegisters(void)
                 fprintf(stderr, "  [OHCI] attach probe: port1=0x%08X "
                         "intr_status=0x%08X intr_enable=0x%08X%s\n",
                         *ps, *ist, *ien,
-                        getenv("RECOMP_OHCI_MIE") ? " (MIE forced, probe)" : "");
+                        recomp_switch_on("RECOMP_OHCI_MIE") ? " (MIE forced, probe)" : "");
                 fflush(stderr);
             }
         }
@@ -4178,7 +4179,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * variable arms it. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+                    || recomp_switch_on("RECOMP_PB_EXEC");
         s_nv2a_trace_print = getenv("RECOMP_NV2A_TRACE") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
@@ -5862,7 +5863,7 @@ void xbox_HeapFree(uint32_t xbox_va)
      * uses" from "the title never wrote there". It exhausts the heap. */
     {
         static int disabled = -1;
-        if (disabled < 0) disabled = getenv("RECOMP_HEAP_NO_FREE") ? 1 : 0;
+        if (disabled < 0) disabled = recomp_switch_on("RECOMP_HEAP_NO_FREE");
         if (disabled) return;
     }
     frees++;
