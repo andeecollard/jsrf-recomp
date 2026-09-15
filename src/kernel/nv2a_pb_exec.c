@@ -188,7 +188,7 @@ unsigned long g_vsh_batches_counted, g_vsh_idx_max_batch;
 static int vsh_reuse_stats(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_VSH_REUSE_STATS") ? 1 : 0;
+    if (on < 0) { const char *e = getenv("RECOMP_VSH_REUSE_STATS"); on = e ? (atoi(e) != 0) : 0; }
     return on;
 }
 
@@ -211,10 +211,25 @@ static int vsh_reuse_stats(void)
  * any performance claim -- and it is deliberately separate from the reuse
  * switch so the two can never be confused in a log. */
 unsigned long long g_vsh_reuse_hits, g_vsh_reuse_mismatch;
+
+/* VALUE, NOT PRESENCE, and the old form cost a whole measurement.
+ *
+ * These read `getenv(X) ? 1 : 0`, so RECOMP_VSH_REUSE=0 set the variable to the
+ * string "0", which is not NULL, and turned the cache ON. ab_switch.sh runs its
+ * control arm as VAR=0 -- so the vshreuse A/B compared reuse-ON against
+ * reuse-ON. Its three "different" runs measured 56.4, 56.4 and 55.0 us per
+ * batch, which is what one configuration sampled three times looks like, and a
+ * 93% "cost of a cache hit" was solved out of that noise and then used to
+ * conclude that the vertex interpreter was not where the time goes. It is.
+ *
+ * This is the SAME bug as RECOMP_APU_SELFLINK_END, found and fixed in
+ * apu_vp.c earlier the same day -- and not swept for anywhere else, which is
+ * why it was still here. The right shape for an A/B switch is atoi; the
+ * presence test is right only for a trace nobody passes =0 to. */
 static int vsh_reuse_on(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_VSH_REUSE") ? 1 : 0;
+    if (on < 0) { const char *e = getenv("RECOMP_VSH_REUSE"); on = e ? (atoi(e) != 0) : 0; }
     return on;
 }
 
@@ -292,12 +307,23 @@ static inline void copy_live_outputs(float dst[16][4], const float src[16][4])
 static int vsh_reuse_verify(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_VSH_REUSE_VERIFY") ? 1 : 0;
+    if (on < 0) { const char *e = getenv("RECOMP_VSH_REUSE_VERIFY"); on = e ? (atoi(e) != 0) : 0; }
     return on;
 }
 
 void nv2a_vsh_reuse_report(void)
 {
+    /* The STATE prints unconditionally; the statistics stay opt-in.
+     *
+     * Everything below used to sit behind RECOMP_VSH_REUSE_STATS, and the
+     * reuse=on/off line behind reuse-or-verify being on -- so the control arm
+     * of an A/B printed nothing at all and ab_score.py had nothing to verify
+     * the arms against. It said "arms NOT verified distinct", which was
+     * correct and was ignored, and the A/B underneath it turned out to have
+     * both arms in the same configuration. One cheap line closes that. */
+    fprintf(stderr, "  [VSH-REUSE] (vsh_reuse %s, verify %s)\n",
+            vsh_reuse_on() ? "on" : "OFF",
+            vsh_reuse_verify() ? "on" : "OFF");
     if (!vsh_reuse_stats()) return;
     if (!g_vsh_batches_counted) {
         fprintf(stderr, "  [VSH-REUSE] armed, no batches counted yet\n");

@@ -114,7 +114,7 @@ SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)")
 #   [VSH-REUSE] reuse=on verify=on hits=... mismatches=1
 # Harvested separately so a renderer A/B can verify its arms differ too,
 # rather than falling back to "assumes the environment took".
-SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] (reuse=\w+)")
+SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] \((vsh_reuse \w+)")
 # The Metal backend names its own state in parentheses, like the APU reports.
 METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_(?:hw|565) \w+)\)")
 
@@ -135,7 +135,7 @@ SWITCH_TOKEN = {
     "RECOMP_APU_TRAP_COALESCE":    "coalesce",
     "RECOMP_APU_SE_WHILE_TRAPPED": "se_while_trapped",
     "RECOMP_APU_REON_HEAD_NOP":    "reon_head_nop",
-    "RECOMP_VSH_REUSE":            "reuse",
+    "RECOMP_VSH_REUSE":            "vsh_reuse",
     "RECOMP_METAL_HW":             "metal_hw",
     "RECOMP_METAL_565":            "metal_565",
 }
