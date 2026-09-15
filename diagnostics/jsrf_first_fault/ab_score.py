@@ -93,6 +93,9 @@ STAGE_ONE = re.compile(r"(\w+)=([\d.]+) ms")
 # runs stuck at the title read 234-6,684 (pad/gameplay_nobarrage.pad's header).
 # Carried on every run so an EXCLUDED one still says something.
 ORD175_RE = re.compile(r"\[KERNEL\] ordinals used \(\d+\):(.*)")
+# Run length, so USB traffic can be reported as a RATE. See below for why an
+# absolute count is not merely less useful but actively misleading.
+VBLANK_MS_RE = re.compile(r"\[VBLANK\].* over (\d+) ms")
 IDLE_RE = re.compile(r"\[APU-VOICE\].* idle_trap=(\d+)")
 SUPP_RE = re.compile(r"\[APU-TRAP\] suppressed=(\d+)")
 TERM_RE = re.compile(r"\[APU-SELFLINK\] terminated=(\d+)")
@@ -211,6 +214,7 @@ def score(path, warmup, pad_path=None):
     apu = None
     voice = None
     ord175 = None
+    run_ms = None
     switches = set()
     apu_counters = {}
 
@@ -245,6 +249,9 @@ def score(path, warmup, pad_path=None):
                     if field.startswith("175="):
                         ord175 = int(field[4:])
                 continue
+            m = VBLANK_MS_RE.search(line)
+            if m:
+                run_ms = int(m.group(1))
             m = SWITCH_RE.search(line)
             if m:
                 switches.add(m.group(1).strip())
@@ -324,6 +331,7 @@ def score(path, warmup, pad_path=None):
         "apu": apu,
         "voice": voice,
         "ord175": ord175,
+        "run_ms": run_ms,
         "switches": sorted(switches),
         "counters": apu_counters,
     }
@@ -346,7 +354,21 @@ def run_line(tag, var, value, path, warmup, pad_path=None):
     bits.append("crash=%d" % s["crash"])
     bits.append("missed=%.0fs/%d" % (s["gap"], s["gap_n"]))
     if s["ord175"] is not None:
-        bits.append("ord175=%d" % s["ord175"])
+        # PER SECOND, not the raw count.
+        #
+        # The raw count reads as a USB stall on any run that ended early, and
+        # that misled this file's own author: three crashed runs showed
+        # ord175 of 4709/3578 against a healthy 32547 and were written up as
+        # "the USB driver had stalled". Normalised they are 117.7, 119.4 and
+        # 120.5 transfers per second -- identical. They were 30-40 s runs that
+        # crashed, not stalls.
+        #
+        # A real stall looks nothing like that: pad/gameplay_nobarrage.pad
+        # records 234 transfers in a 300 s run, which is 0.78/s.
+        if s["run_ms"]:
+            bits.append("usb=%.0f/s" % (s["ord175"] * 1000.0 / s["run_ms"]))
+        else:
+            bits.append("ord175=%d(no duration)" % s["ord175"])
     if s["apu"]:
         total, se, trapped = s["apu"]
         bits.append("duty=%.1f%%" % (100.0 * se / total if total else 0.0))

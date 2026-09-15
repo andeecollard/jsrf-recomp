@@ -112,11 +112,28 @@ patching around the symptom hides the writer.
 * Ten faults is ten, not a rate. Today's per-A/B counts were 3/4, 2/6, 1/6,
   1/4, 1/2 and 0 in four other A/Bs; that is consistent with the ~12% the
   project already records, and nothing here re-measures it.
-* **Every fault was in a run that never left the title screen** — `scene=12`
-  with `ord175` in the 5,600–9,900 range, i.e. the USB driver had already
-  stopped submitting transfers. Whether the stall causes the fault, the fault
-  causes the stall, or both follow from something earlier is not established
-  here. It does mean the renderer was barely running in every crashing run,
-  which is the reason these faults are not attributed to today's Metal work.
+* **Every fault was in a run that never left the title screen** (`scene=12`),
+  and the renderer was therefore barely running in it — which is why none of
+  these faults is attributed to today's Metal work.
+
+  **RETRACTED, same day, and it is worth keeping as the error it was.** This
+  bullet first said those runs "had already stopped submitting USB transfers",
+  read off an `ord175` of 5,600–9,900 against a healthy run's 68,000. That is
+  an absolute count compared across runs of different lengths. The crashing
+  runs lasted 30–40 seconds because they crashed; the healthy one lasted 270.
+  Normalised:
+
+      t2_metalhw1  crashed    40.0 s   117.7 transfers/s
+      t1_m5651     crashed    30.0 s   119.4 transfers/s
+      t1_metalhw1  healthy   270.0 s   120.5 transfers/s
+
+  **The USB driver was healthy in all three.** The OHCI counters agree — the
+  blocked:cleared ratio is 4.05 against 4.01, and `tds_error=0` everywhere. No
+  stall, in either direction, and nothing here is evidence about the USB path.
+
+  A real stall looks nothing like this: `pad/gameplay_nobarrage.pad` records 234
+  transfers in a 300 s run, which is 0.78/s. Two different failure modes were
+  being conflated. `ab_score.py` now reports `usb=N/s` rather than the raw
+  count, because the raw count reads as a stall on any run that ended early.
 * Two of the ten were in `RECOMP_METAL_HW` arms. Given the other eight predate
   that switch entirely, that is not a signal about it.
