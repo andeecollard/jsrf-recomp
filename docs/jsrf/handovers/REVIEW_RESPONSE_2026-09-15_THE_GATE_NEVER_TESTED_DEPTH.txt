@@ -567,3 +567,54 @@ the draw: dump the surface at intervals WITHIN one frame -- RECOMP_FB_DUMP_DRAW
 already exists for that -- and find the draw index at which a region that was
 correct becomes black. That localises it in the guest's own draw order, which
 no synthetic phase can do.
+
+
+14. WHAT THE PIXELS SAY, WHICH IS NOT WHAT I HAD ASSUMED
+=========================================================
+The artefact is not missing draws. It is draws that RUN AND OUTPUT BLACK.
+
+Read out of a dumped frame at native RGB565, sky rows 40-43, across a damaged
+band at x=52..70 and a clean band at x=300..322:
+
+    clean   74D1 7CF2 74D1 7CF2 ...   sky colour, alternating by one step
+    damaged 0000 0000 0800 0000 ...   zero, with 0800 at some positions
+
+0x800 is one step of red and nothing else. Its positions have period 4 in x on
+one row, period 2 on the next, and none on the rows between -- which is the 4x4
+Bayer matrix. So a draw covered those columns, shaded them to approximately
+zero, and the ordered dither then biased some of them up by one step. Geometry
+that never rendered would carry no dither at all.
+
+THE SHAPE IS A PICKET FENCE, and that is the "grid". Columns that are >=95%
+black run x = 53,55,57...69 and 165,167...201 and 225: one pixel wide, spaced
+exactly two apart, every ODD column, in bands. At a distance a one-on
+one-off column pattern reads as a grid, which is what a person watching it
+called it. It is not tile-aligned and it is not 32-pixel anything -- I claimed
+that from one frame in section 13 and the measurement here supersedes it.
+
+WHAT THAT RULES IN. shade() is shared between the two fragment tails, byte for
+byte, and so are the Params it reads and the texture buffers it samples. So
+either a DIFFERENT draw covers those columns on the hardware path -- a
+visibility difference -- or shade()'s inputs differ. Every visibility stage has
+been neutered in its own run and the bands survived each: depth compare,
+stencil, blend unit, fragment ordering, attachment format.
+
+WHAT IS STILL UNMEASURED, and is where I would look next:
+
+  * WHICH DRAW paints them. RECOMP_FB_DUMP_DRAW captures within a frame but
+    counts batches from process start, so it cannot be aimed at a scene 170 s
+    in. It needs a start offset -- a few lines -- and then consecutive captures
+    either side of the damaged band name the draw in the guest's own order.
+  * z_cull. fs() clamps zg into [z_clip_min, z_clip_max] when z_cull is OFF and
+    fs_hw does not, so the depth those two store diverges for any draw with
+    ZMIN_MAX_CONTROL set to CLAMP. JSRF is recorded as using CULL, but that is
+    a whole-title statement and this is a per-draw register. Counting draws with
+    z_cull == 0 is one counter and has never been done.
+  * Thin geometry and sample_lod. The bands sit where the scene has thin
+    vertical structures, and LOD comes from dfdx/dfdy of uv. Both tails compute
+    shade() before any discard_fragment(), so the derivatives ought to match --
+    but fs_hw discards where fs returns the untouched destination, and that is
+    the one place the two differ in a way a quad of fragments can see.
+
+I do not know the cause. Three defects found this session are real, fixed and
+pinned, and none of them is this one.
