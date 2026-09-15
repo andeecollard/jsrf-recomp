@@ -48,6 +48,19 @@ person can see:
   temporal  reads 0.5 per million on a gameplay recording where the mosaic is
             plainly visible, because it needs the surroundings to hold still
             and the camera is moving.
+  specks    counts dark blobs against a local background, written to match what
+            the residual artefact looks like magnified. It reports 2410 per
+            frame on the batched hardware path and 2118 on the software
+            control, whose equivalent wall was verified BY EYE to be clean --
+            so it is counting the title's own shadows, decals and dark texture
+            detail, not the defect.
+
+THE PATTERN ACROSS ALL FOUR FAILURES IS ONE THING: they compare arms that never
+reach the same scene. Generic image statistics cannot separate an artefact from
+scene content that way, however the statistic is normalised. What has actually
+worked twice is comparing MATCHED SURFACES -- a flat wall against a flat wall,
+magnified -- and, for the mosaic, a structural signature that scene content
+cannot have.
 
 `tile` works because it keys on a STRUCTURAL property only the artefact has --
 alignment to a grid -- measured as a ratio inside one frame, which is why it
@@ -219,6 +232,50 @@ def distinct_frames(files, limit):
             break
     return out
 
+def dark_specks(rows, w, h, drop, radius=4, maxpix=40):
+    """Small blobs much DARKER than their local background.
+
+    Written to match what the residual artefact actually looks like when you
+    magnify it, rather than what a generic noise metric assumes: sharp black
+    fragments of one to a few pixels, scattered over flat surfaces, where the
+    software control's equivalent surface is smooth and carries none.
+
+    Local background is a box mean, so this does not care whether the scene is
+    bright or dark, only that the blob is far below what surrounds it. Blobs
+    larger than `maxpix` are dropped -- those are real geometry, not specks.
+    """
+    g = [[(rows[y][x*3] + rows[y][x*3+1] + rows[y][x*3+2]) / 3.0
+          for x in range(w)] for y in range(h)]
+    # box mean via row prefix sums, then column prefix sums
+    acc = [[0.0]*(w+1) for _ in range(h+1)]
+    for y in range(h):
+        run = 0.0
+        for x in range(w):
+            run += g[y][x]
+            acc[y+1][x+1] = acc[y][x+1] + run
+    def mean(y, x):
+        y0, y1 = max(0, y-radius), min(h, y+radius+1)
+        x0, x1 = max(0, x-radius), min(w, x+radius+1)
+        tot = acc[y1][x1] - acc[y0][x1] - acc[y1][x0] + acc[y0][x0]
+        return tot / ((y1-y0) * (x1-x0))
+    dark = [[(mean(y, x) - g[y][x]) > drop for x in range(w)] for y in range(h)]
+    seen = [[False]*w for _ in range(h)]
+    blobs = []
+    for y in range(h):
+        for x in range(w):
+            if not dark[y][x] or seen[y][x]:
+                continue
+            stack = [(y, x)]; seen[y][x] = True; pix = []
+            while stack:
+                cy, cx = stack.pop(); pix.append((cy, cx))
+                for dy, dx in ((1,0),(-1,0),(0,1),(0,-1)):
+                    ny, nx = cy+dy, cx+dx
+                    if 0 <= ny < h and 0 <= nx < w and dark[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True; stack.append((ny, nx))
+            if len(pix) <= maxpix:
+                blobs.append(len(pix))
+    return blobs
+
 def score_files(files, args):
     tot = on = exp = 0.0; sp = 0.0; used = 0
     for f in files:
@@ -308,6 +365,8 @@ def main():
     p.add_argument('--temporal', metavar='DIR',
                    help='consecutive frames (or a recording\'s frames): score flicker')
     p.add_argument('--still', type=int, default=6, help='how quiet the surroundings must be')
+    p.add_argument('--specks', metavar='DIR', help='count small blobs far darker than their background')
+    p.add_argument('--drop', type=int, default=45, help='how far below the local background a speck sits')
     p.add_argument('--frames', type=int, default=14, help='distinct frames to use')
     p.add_argument('--skip', type=int, default=0, help='ignore the first N frames (intro)')
     args = p.parse_args()
@@ -318,6 +377,21 @@ def main():
         for it in items:
             out += sorted(glob.glob(os.path.join(it, '*.bmp'))) if os.path.isdir(it) else sorted(glob.glob(it))
         return out[args.skip:]
+    if args.specks:
+        files = expand([args.specks])
+        tot = 0; frames = 0
+        for f in files:
+            try:
+                w, h, rows = load_any(f)
+            except Exception:
+                continue
+            b = dark_specks(rows, w, h, args.drop)
+            tot += len(b); frames += 1
+        if not frames:
+            print('no readable frames', file=sys.stderr); return 2
+        print(f"{args.specks}: {frames} frames, {tot} dark specks, "
+              f"{tot/frames:.0f} per frame")
+        return 0
     if args.temporal:
         files = sorted(glob.glob(os.path.join(args.temporal, '*')))
         fr = distinct_frames([f for f in files if os.path.isfile(f)], args.frames)
