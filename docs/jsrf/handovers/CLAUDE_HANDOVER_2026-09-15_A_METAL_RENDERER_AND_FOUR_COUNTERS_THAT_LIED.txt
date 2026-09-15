@@ -1,0 +1,217 @@
+CLAUDE, 15 Sep 2026 (evening/night)
+A METAL RENDERER THAT LETS THE HARDWARE DO THE WORK, AND FOUR COUNTERS THAT LIED
+
+Supersedes CLAUDE_HANDOVER_2026-09-15_THE_CONTROL_ARM_WAS_NEVER_A_CONTROL.txt
+for everything about the renderer, the crash attribution, and what `vsh` is.
+Its APU sections stand.
+
+~20 commits, ctest 30/30, metal_hw_check PASS, nothing pushed since 76fa9f5.
+
+
+0. THE ONE PARAGRAPH VERSION
+=============================
+There is now a second Metal backend behind RECOMP_METAL_HW: real depth and
+stencil attachments, hardware blend/depth/stencil, combiners still in the
+shader. It is 9.6% faster (ranges do not overlap, arms verified distinct) and
+MORE correct -- depth 2000x closer to the oracle. A true RGB565 colour
+attachment (RECOMP_METAL_565) takes 16 bytes a pixel to 2 and is mid-A/B.
+Both default OFF pending a person playing them. Separately: `vsh` is not the
+vertex shader, the crash is one instruction in recompiled DirectSound with a
+trigger you can drive, and the USB driver was never stalling.
+
+
+1. THE RENDERER, AND WHY THE OLD ONE WAS SLOW
+==============================================
+One decision explains the whole shape of the old backend: 24-bit depth was
+packed into the colour attachment's ALPHA. Its own comment says so -- "so there
+is no destination alpha". With alpha spent, hardware blending is unavailable;
+blending moves into the fragment shader; depth and stencil follow; the shader
+then needs raster_order_group(0) on both attachments, which SERIALISES every
+overdrawn pixel; and the attachment must be RGBA32Float, sixteen bytes a pixel
+for a surface the guest thinks is two.
+
+RECOMP_METAL_HW undoes that cascade. Separate Depth32Float and Stencil8
+attachments -- measured on this host first: all three candidate formats accept
+MTLStorageModeShared and direct replaceRegion/getBytes on Apple Silicon, so no
+blit encoder is needed. Pipeline and depth/stencil objects cached on guest
+state, because Metal bakes blending into the pipeline and it cannot be set per
+draw. Untranslatable state REJECTS the draw rather than falling back, because
+depth ownership has to be exclusive -- see section 2.
+
+MEASURED, arms verified distinct (hw draws=0 against 742443, zero refusals):
+
+    RECOMP_METAL_HW=0   31.56  31.78  34.62 ms   (mean 32.65, n=3)
+    RECOMP_METAL_HW=1   28.83  30.20        ms   (mean 29.52, n=2)
+    clear                9.61 / 10.25 / 11.12  ->  5.76 ms
+
+submit and vsh did not move, which is right -- this touches neither. A clear's
+cost is mostly waiting for the GPU to drain, and without the raster order group
+there is less outstanding to wait for.
+
+The vertex stage needed NO change: vs() already emits o.p.z = z*p.w with
+z = guest_z/16777215, so after the hardware divide the rasteriser holds exactly
+the guest's normalised depth.
+
+
+2. THREE BUGS IN IT, AND HOW EACH WAS FOUND
+============================================
+None by reading. All three by metal_hw_check.sh.
+
+  * fs_hw returned float4(c.rgb, 1). The blend unit takes SRC_ALPHA from that,
+    where the shader took it from c.a -- so every alpha-blended draw went
+    opaque. 23096 of 65536 pixels.
+  * DEPTH OWNERSHIP. Letting draws choose per-draw put one quantity in two
+    stores on different schedules. Every differing pixel read software
+    0x000000 against hardware 0xFFFFFF: the attachment still held its uploaded
+    value because the draws that wrote depth had quietly used the other path.
+    Untranslatable state now rejects the draw.
+  * DEFAULTS MUST MATCH THE REFERENCE, NOT IMPROVE ON IT. An unrecognised
+    compare is now ALWAYS and an unrecognised stencil op KEEP, because that is
+    what cmpf()'s "default: return true" and stop()'s "default: return old"
+    already do. Reachable: metal_batch_test sets depth_func=4, a D3D-style
+    value the NV2A never emits.
+
+AND THE GATE ITSELF WAS WRONG. It demanded the two Metal paths be
+byte-identical, assuming the old one was the reference. Both approximate the
+software rasteriser, and against that oracle the new path is 2000x closer on
+depth. A byte-identical rule fails the more accurate renderer FOR being more
+accurate. It now scores both against the oracle.
+
+
+3. THE COLOUR FORMAT, WHERE I WAS WRONG TWICE   <-- READ BEFORE TOUCHING IT
+===========================================================================
+I wrote, and committed twice, that the software rasteriser prefers a float
+attachment because float keeps blend intermediates exact.
+
+IT KEEPS NOTHING EXACT. nv2a_texture_copy.c:691-711 reads its blend destination
+out of guest RAM with unpack565() and stores RGB565 back after every pixel of
+every draw. It is a framebuffer-precision blender and always was. xemu is the
+same on both backends -- GL_RGB565 and VK_FORMAT_R5G6B5_UNORM_PACK16, a true
+two-byte attachment. Our own nv2a_d3d11.c:972 uses R8G8B8A8.
+
+So float is the one format NOBODY models, being the only one that never
+requantises between draws. If intermediate precision drove the ranking, RGBA8
+would be closest to the oracle and float furthest; it is the exact inverse, so
+that ranking measures double rounding at the readback boundary.
+
+Scored by MAGNITUDE (the test reports worst-step now; a bare count cannot be
+acted on, and this project admitted the D3D11 sink under "within one RGB565
+channel step" with 48% of pixels differing):
+
+    RGBA32Float      1 of 65536 pixels, worst 1 step
+    RGBA16Unorm     24, worst 1
+    RGBA8Unorm    5705, worst 1
+    B5G6R5Unorm    697, worst 1     <- and it is 2 bytes a pixel
+
+All conform. RECOMP_METAL_565 uses B5G6R5 and deletes both per-pixel conversion
+loops from the sync path -- upload and readback become 16-bit row copies.
+
+NO CHANNEL SWAP. Metal's format is NAMED B5G6R5Unorm, which reads as
+blue-in-the-high-bits. It is not: packed names run from the least significant
+bit up, so it already IS the guest's layout. A swap written on the other
+reading scored 38060 pixels wrong at up to 27 steps.
+
+A/B mid-flight at handover: 565=0 gave 30.61-33.55 (n=3), 565=1 gave 27.43
+(n=1, two runs lost to the crash). Pool the two rounds before concluding.
+
+
+4. FOUR COUNTERS THAT LIED, ONE PER HOUR
+=========================================
+This is the section to read if you read nothing else.
+
+  * `vsh` IS NOT THE VERTEX SHADER. The timer brackets all of
+    prepare_vertices(). Proof: with the reuse cache on, a HIT -- which skips
+    the attribute fetch AND the whole shader, doing nothing but one copy --
+    still costs 93% of a full transform. The cost is the 256-byte write into
+    s_outputs, float[4096][16][4], one megabyte. NINE of those sixteen slots
+    are dead. RECOMP_VSH_NARROW_OUTPUTS copies the seven live ones and is
+    built, unmeasured, and the biggest column on the board.
+    THE MSL EMITTER IS AIMED AT ARITHMETIC THAT IS ~7% OF THE COST.
+  * `ord175` READ AS A USB STALL. Three crashed runs showed 4709/3578 against
+    a healthy 32547 and I wrote up "the USB driver had stalled". Normalised by
+    duration: 117.7, 119.4, 120.5 transfers per second. Identical. They were
+    30-40 s runs that crashed. ab_score.py reports usb=N/s now.
+  * `[VBLANK] over N ms` READ AS A CRASH TIME. Every fault appeared to land at
+    exactly 30 s or 40 s, which looked deterministic. It is the REPORT CADENCE:
+    that line only prints at a periodic report. Pad events give the real clock.
+  * (yesterday's, still true) `trapped=` counts frames where the engine was
+    switched OFF, and NtOpenFile measures the disc cache build.
+
+Every one was fixed by finding an instrument with the right resolution, never
+by reasoning harder about the wrong one.
+
+
+5. THE CRASH HAS ONE INSTRUCTION AND A TRIGGER
+===============================================
+All 11 faults recorded today:
+
+    HOST PC:            sub_001A2E2E +0x670
+    HOST FAULT ADDRESS: guest 0xFFFFFFBE
+
+0x1A2E2E is inside DSOUND (0x19E340 + 116060), so this is recompiled
+DirectSound. STATUS.md already had 20 of 33 faults attributed to that handler
+with a register fingerprint and a call chain -- better evidence than I
+rediscovered. What is new:
+
+  * ACCURACY_GAPS said "OHCI path" and STATUS said DirectSound. Corrected.
+  * IT IS NOT A NULL OBJECT. STATUS says the handler "dereferences a voice
+    object that is NULL". A NULL object read at [obj+0xBE] faults at 0xBE.
+    This faults at 0xFFFFFFBE, every time -- the top of the address space,
+    which is what a pointer computed from a SENTINEL looks like. 0xFFFF is the
+    voice list's own terminator. That points at the LINK VALUE, not the
+    object lookup.
+  * IT HAS A TRIGGER. Every crash lands immediately after an `A` press on the
+    title menu -- t=31.00, t=31.01, t=39.00 against a schedule with A at 31.0
+    and 39.0. That is the menu-to-mission transition starting audio, which
+    matches STATUS's independently measured t=43-50 s. It is reproducible on
+    demand rather than a 12% lottery.
+
+sub_001A2E2E reads the guest's software previous/next links and updates the
+hardware list -- the same correspondence as the trap storm, where our regs[top]
+and the guest's software list disagree about the head. The two may be one
+defect. Not proven.
+
+DO NOT suppress a trap or forcibly unlink a voice. Standing instruction from
+the audio-lifecycle note and still right.
+
+
+6. WHAT I WOULD DO NEXT
+========================
+  1. Pool the two 565 A/B rounds and decide that switch.
+  2. RECOMP_VSH_NARROW_OUTPUTS. Biggest column, built, needs no code, never
+     measured -- its A/B was killed at n=1.
+  3. EARLY-Z. fs_hw calls discard_fragment() for the z-range cull and the alpha
+     test, which disables early-Z for EVERY draw, so the depth unit cannot
+     reject fragments before shading. A second pipeline variant without the
+     discards, selected when neither is active, may be the largest remaining
+     win given this title's overdraw. Small change.
+  4. THE METAL PRESENTER. The frame still ends Metal -> CPU readback -> two
+     conversions -> glTexImage2D -> GL quad. Two GPU APIs and a full CPU round
+     trip, every frame. Deletes one of ~4.8 syncs. Uncosted and possibly the
+     biggest item here.
+  5. The sub_001A2E2E probe, now that it has a trigger: dump the software
+     prev/next links on entry.
+  6. Before any upstream PR: the caches are 16 entries sized from "JSRF uses
+     three", and nv2a_metal.m:1739 refuses target_bpp != 2. Both are limits
+     that should be evidence-driven rather than title-shaped. The translation
+     layer itself (nv2a_metal_state.c) has zero title knowledge and is ready.
+
+BOOT ATTRITION IS THE TAX ON ALL OF THIS. Roughly one run in four of every A/B
+is lost to the section 5 crash, which is why three trials is the floor and why
+some arms still land at n=1.
+
+
+7. PROCESS NOTES
+=================
+  * Do not edit src/**.{c,h,m} while an A/B runs -- the staleness guard aborts
+    the next run. docs/, .sh, .py and *_test.c are safe; ab_switch.sh itself is
+    NOT, because sh reads a script incrementally.
+  * The Metal shader is compiled at RUNTIME. A green C build proves nothing
+    about it; run jsrf_metal_batch_test. That caught fs_hw being declared above
+    shade().
+  * Read the SDK header rather than remembering enum values. The static asserts
+    caught MTLBlendFactorDestinationColor/DestinationAlpha transposed on their
+    first run, which would have shipped as a subtly wrong image in one mode.
+  * ab_score.py now verifies arms are distinct for the switches it knows. It
+    could not for RECOMP_METAL_HW and said so, which is the only reason I went
+    and checked by hand.
