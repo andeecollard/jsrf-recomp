@@ -474,6 +474,36 @@ unsigned g_apu_unknown_method_n;
  * list head that already names this voice, and it stands even if the reasoning
  * about the INHERIT arithmetic is wrong. A self-link is a one-entry cycle in
  * the list mcpx_apu_vp_frame walks. */
+unsigned long g_apu_selflink_terminated;
+
+/* OFF by default, and the reason is a measurement that did not go my way.
+ *
+ * It was written as a fix for the idle-voice trap storm and it is not one. In
+ * a 240 s run that reached voice churn it fired 47,293 times -- so self-links
+ * are real and frequent -- and left `trapped` at 50.3%, indistinguishable from
+ * the runs without it. Terminating the cycle does not stop the storm, because
+ * the self-linked voice is still the HEAD of its list and still inactive: the
+ * walk starts on a dead voice and raises its trap whether or not it then loops.
+ *
+ * What it still is, is correct. link(v) = v is the driver's "not in any list"
+ * marker, written by SetupVoiceProcessor for all 256 voices at boot and by
+ * RemoveIdleVoice for every voice it removes, so treating it as end-of-list
+ * honours a convention the guest already relies on. And an unbounded self-cycle
+ * is a defect on its own terms: the walk's only protection is a 256-iteration
+ * cap, so a self-linked ACTIVE voice would be rendered 256 times in a subframe.
+ * That has not been observed, which is exactly why it is not being shipped on
+ * the strength of an argument.
+ *
+ * So it stays, off, as a switch with a number behind it. Turning it on by
+ * default would be patching around a gate before a run has proved which value
+ * is wrong -- this repository's own rule, and the one I broke to write it. */
+int mcpx_apu_selflink_end(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_SELFLINK_END") != NULL;
+    return on;
+}
+
 unsigned long g_apu_antecedent_set_count;
 unsigned long g_apu_voice_on_top_count;
 unsigned long g_apu_voice_on_inherit_count;
@@ -502,6 +532,9 @@ void mcpx_apu_voice_report(void)
             fprintf(stderr, " %04X", g_apu_unknown_method[k]);
         fprintf(stderr, "\n");
     }
+    fprintf(stderr, "  [APU-SELFLINK] terminated=%lu (guard %s)\n",
+            g_apu_selflink_terminated,
+            mcpx_apu_selflink_end() ? "on" : "OFF");
     fprintf(stderr, "  [APU-LINK] antecedent_sets=%lu on_top=%lu"
             " on_inherit=%lu self_ante=%lu self_link=%lu\n",
             g_apu_antecedent_set_count, g_apu_voice_on_top_count,
@@ -2173,6 +2206,38 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                                NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
             link_shadow_check(v, nxt, "walk");
+
+            /* A voice whose next-handle is ITSELF is the end of the list.
+             *
+             * This is the driver's own convention, not an invention here.
+             * CMcpxCore::SetupVoiceProcessor writes link(v) = v for all 256
+             * voices at boot, and RemoveIdleVoice writes it again for every
+             * voice it takes out: self-link means "not in any list". Our walk
+             * did not honour it, so such a voice was a one-entry cycle -- the
+             * walk raised its idle trap, returned with the cursor pinned on it,
+             * and every voice behind it went unrendered for the rest of the
+             * run. Measured at gameplay before this change: voice 3 raising
+             * 43,070 traps against 243 retirements, with 70-81% of APU frames
+             * trapped and the sound engine reaching 8% duty in steady state.
+             *
+             * The cycle forms when VOICE_ON prepends a voice that regs[top]
+             * already names: link(selected) = regs[top] = selected. The insert
+             * is xemu's and is correct -- hardware does the same, and the XDK
+             * driver asserts on it -- so the fix belongs here, at the read,
+             * where it also catches cycles created by guest stores this model
+             * never sees (the voice register file lives in guest RAM).
+             *
+             * Terminating cannot lose a reachable voice: by the time the guest
+             * re-ONs v it has already written link(v) = v itself, so whatever v
+             * used to point at is unreachable through v regardless.
+             *
+             * RECOMP_APU_SELFLINK_END=0 restores the previous behaviour for
+             * A/B, because a fix measured only against its own arm is not
+             * measured. */
+            if (nxt == v && mcpx_apu_selflink_end()) {
+                g_apu_selflink_terminated++;
+                nxt = 0xFFFF;
+            }
             d->regs[next] = nxt;
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
