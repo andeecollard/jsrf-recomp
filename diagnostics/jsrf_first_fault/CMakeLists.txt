@@ -376,6 +376,12 @@ add_executable(jsrf_texture_copy_test texture_copy_test.c)
 target_link_libraries(jsrf_texture_copy_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_texture_copy COMMAND jsrf_texture_copy_test)
 
+# Guest render state -> Metal enums. Pure integer translation, so unlike every
+# other Metal test here it needs no device and can be a ctest case.
+add_executable(jsrf_metal_state_test metal_state_test.c)
+target_link_libraries(jsrf_metal_state_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_metal_state COMMAND jsrf_metal_state_test)
+
 add_executable(jsrf_dxt_fragment_test dxt_fragment_test.c)
 target_link_libraries(jsrf_dxt_fragment_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_dxt_fragment COMMAND jsrf_dxt_fragment_test)
