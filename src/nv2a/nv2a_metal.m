@@ -492,9 +492,14 @@ static NSString *const shader =
  " case 0x302:return float3(src.a);case 0x303:return float3(1-src.a);"
  " case 0x306:return dst;case 0x307:return 1-dst;"
  " default:return float3(0);}}\n"
- "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
- " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
- " Frag o;o.color=dst;o.stencil=stencil;float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
+ /* TEXTURING AND THE REGISTER COMBINERS, SHARED BY BOTH FRAGMENT ENTRY POINTS.
+  * Extracted so the software-state `fs` below and the hardware-state `fs_hw`
+  * cannot drift: combiners are the part that genuinely belongs in a shader --
+  * upstream's D3D11 backend puts them in one too -- while blending, depth and
+  * stencil only live here because depth was packed into alpha. One copy, two
+  * tails. */
+ "float4 shade(Out i, const device uchar*t0, constant Params&s, const device uchar*t1, const device uchar*t2, const device uchar*t3){\n"
+ " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
  " if(s.texture_mask&1)tex=sample_lod(t0,i.t0,0,s);"
  " if(s.combiner_count){float4 r[14];for(uint n=0;n<14;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
  " if(s.texture_mask&2)r[9]=sample_lod(t1,i.t1,1,s);if(s.texture_mask&4)r[10]=sample_lod(t2,i.t2,2,s);if(s.texture_mask&8)r[11]=sample_lod(t3,i.t3,3,s);"
@@ -506,6 +511,12 @@ static NSString *const shader =
  " if(da)r[da][k]=clamp(ab[k],-1.0f,1.0f);if(ds)r[ds][k]=clamp(ab[k]+cd[k],-1.0f,1.0f);}}"
  " c=clamp(r[12]+(s.add_specular?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
  " else if(!s.untextured){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(s.modulate?c.a:1);if(s.modulate)c.rgb*=max(float3(0),d0.rgb);}"
+ " return c;}\n"
+ /* The software-state path: everything the hardware is not being allowed to
+  * do. Unchanged in behaviour; it just calls shade() for its colour now. */
+ "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
+ " Frag o;o.color=dst;o.stencil=stencil;float4 c=shade(i,t0,s,t1,t2,t3);"
  /* The guest's depth-range policy, per fragment, in guest z units.
   * NV097_SET_ZMIN_MAX_CONTROL selects discard (CULL) or saturate (CLAMP)
   * outside SET_CLIP_MIN/MAX. JSRF asks for CULL. */
