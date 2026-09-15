@@ -332,6 +332,67 @@ void nv2a_metal_cb_report(void)
     }
     fflush(stderr);
 }
+/* THE GPU TEXTURE IS AUTHORITATIVE, NOT GUEST RAM.
+ *
+ * The backend retained ONE surface and the title uses THREE -- measured, not
+ * assumed: RECOMP_SURFACE_AUDIT reports "3 distinct colour surfaces bound",
+ * and at 55% of flips and 50% of clears the surface the guest names is not the
+ * one being held. Every swap therefore tore the retained surface down: sync it
+ * out to guest RAM, reallocate four textures, and upload the new one back in.
+ * 12,448 of those in a 280 s run, costing 16.1 s reading back and converting
+ * on top of 33.8 s draining -- about 18% of the run.
+ *
+ * It was ALSO my candidate for where content goes missing, and that half was
+ * wrong -- recorded because the reasoning was good and the conclusion was not.
+ * A person watching the game reports that characters, text and logos are
+ * unaffected while the world behind them is not, which fits this exactly:
+ * world geometry is drawn FIRST, so it makes the round trip through guest RAM
+ * on the next swap, while the character and HUD drawn afterwards never do. The
+ * fit was convincing and the fix did not change the artefact. Keep the change
+ * for what it demonstrably does -- remove 12,448 round trips -- and do not
+ * carry the explanation forward.
+ *
+ * So keep each surface's textures and rebind them on a swap instead of
+ * rebuilding from guest RAM. A slot stays valid only while guest RAM cannot
+ * have changed underneath it -- nv2a_metal_invalidate, which every clear goes
+ * through, drops the slots it names -- so the cache can never serve a surface
+ * the CPU has written since.
+ *
+ * RECOMP_METAL_SURFACE_CACHE=0 restores the rebuild-every-swap behaviour, and
+ * is the control for any measurement of this. */
+#define SURFACE_SLOTS 4
+static struct {
+    uint8_t *target; size_t target_size;
+    uint32_t w, h, pitch;
+    uint8_t *depth; uint32_t depth_pitch; size_t depth_size;
+    id<MTLTexture> colour, stencil, hw_depth, hw_stencil;
+    uint64_t stamp; int valid;
+} surf_slot[SURFACE_SLOTS];
+static uint64_t surf_clock;
+static uint64_t surface_hits, surface_evictions;
+
+static int surface_cache_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_METAL_SURFACE_CACHE");
+                  on = e ? (atoi(e) != 0) : 1; }
+    return on;
+}
+
+/* Drop every slot that could describe memory the CPU is about to write. NULL
+ * means "all of them", which is what a full invalidate asks for. */
+static void surface_cache_drop(const uint8_t *target)
+{
+    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+        if (!surf_slot[i].valid) continue;
+        if (target && surf_slot[i].target != target && surf_slot[i].depth != target)
+            continue;
+        surf_slot[i].valid = 0;
+        surf_slot[i].colour = nil; surf_slot[i].stencil = nil;
+        surf_slot[i].hw_depth = nil; surf_slot[i].hw_stencil = nil;
+    }
+}
+
 static uint8_t *surface_target,*depth_target;
 static size_t surface_target_size,depth_target_size;
 static uint32_t surface_width,surface_height,surface_pitch,depth_pitch;
@@ -1516,6 +1577,12 @@ void nv2a_metal_report(void)
             (unsigned long long)sync_calls,(unsigned long long)sync_clean,
             (unsigned long long)sync_color,(unsigned long long)sync_depth,
             (unsigned long long)surface_uploads);
+    fprintf(stderr,"[METAL] surface cache: %llu rebinds, %llu rebuilds, "
+            "%llu evictions (surface_cache %s)\n",
+            (unsigned long long)surface_hits,
+            (unsigned long long)surface_uploads,
+            (unsigned long long)surface_evictions,
+            surface_cache_on()?"on":"OFF");
     if(clip_audit_on())
         fprintf(stderr,"[METAL] clip audit: %llu triangles submitted, discarded whole "
             "by near=%llu far=%llu side=%llu | %llu vertices, w<0=%llu w==0=%llu "
@@ -1832,7 +1899,11 @@ int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth)
 }
 
 void nv2a_metal_invalidate(uint8_t *target)
-{if(!target||target==surface_target||target==depth_target){nv2a_metal_sync();surface_valid=depth_valid=0;}}
+{/* The cached slots describe guest memory, so whatever this invalidates in the
+  * live binding it must also invalidate in the cache -- otherwise a later swap
+  * back would rebind a texture for memory the CPU has since overwritten. */
+ surface_cache_drop(target);
+ if(!target||target==surface_target||target==depth_target){nv2a_metal_sync();surface_valid=depth_valid=0;}}
 const char *nv2a_metal_last_reject(void){return reject_reason?reject_reason:"none";}
 static int reject(const char *reason){reject_reason=reason;nv2a_metal_sync();surface_valid=depth_valid=0;return-1;}
 static float area(const float a[4],const float b[4],const float c[4])
@@ -2242,7 +2313,29 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
   if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
-   ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
+   ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");
+   /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
+    * The sync above has already written the outgoing surface out, so the
+    * incoming slot's textures still hold exactly what was drawn into them --
+    * and unlike a re-upload from guest RAM, rebinding cannot lose the early
+    * draws that made the round trip. */
+   int slot_hit=-1;
+   if(surface_cache_on())
+    for(unsigned i=0;i<SURFACE_SLOTS;i++)
+     if(surf_slot[i].valid&&surf_slot[i].target==target&&surf_slot[i].target_size==target_size
+        &&surf_slot[i].w==s->clip_w&&surf_slot[i].h==s->clip_h&&surf_slot[i].pitch==s->target_pitch
+        &&surf_slot[i].depth==next_depth&&surf_slot[i].depth_pitch==next_depth_pitch
+        &&surf_slot[i].depth_size==next_depth_size){slot_hit=(int)i;break;}
+   if(slot_hit>=0){
+    surface=surf_slot[slot_hit].colour;stencil_surface=surf_slot[slot_hit].stencil;
+    hw_depth_tex=surf_slot[slot_hit].hw_depth;hw_stencil_tex=surf_slot[slot_hit].hw_stencil;
+    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;
+    surface_height=s->clip_h;surface_pitch=s->target_pitch;
+    depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
+    surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;
+    surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
+   }else{
+   MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;float*rgba=malloc(pixels*16);uint8_t*stencil=malloc(pixels);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
    if(hw_565_on()){
     /* The attachment is the guest's format, so there is nothing to convert:
@@ -2259,7 +2352,24 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * moment, so the two paths start from identical depth. If this fails the
     * textures are left nil and every draw below falls back to the software
     * path -- slower, and correct. */
-   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){++g_hw_upload_fail;hw_depth_tex=nil;hw_stencil_tex=nil;}}
+   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){++g_hw_upload_fail;hw_depth_tex=nil;hw_stencil_tex=nil;}
+   /* Remember it, so the next swap back is a rebind. Least-recently-used goes
+    * first; a dropped slot only costs the rebuild it would have saved. */
+   if(surface_cache_on()){
+    unsigned pick=0;
+    for(unsigned i=0;i<SURFACE_SLOTS;i++){
+     if(!surf_slot[i].valid){pick=i;break;}
+     if(surf_slot[i].stamp<surf_slot[pick].stamp)pick=i;}
+    if(surf_slot[pick].valid)++surface_evictions;
+    surf_slot[pick].target=target;surf_slot[pick].target_size=target_size;
+    surf_slot[pick].w=surface_width;surf_slot[pick].h=surface_height;
+    surf_slot[pick].pitch=surface_pitch;
+    surf_slot[pick].depth=next_depth;surf_slot[pick].depth_pitch=next_depth_pitch;
+    surf_slot[pick].depth_size=next_depth_size;
+    surf_slot[pick].colour=surface;surf_slot[pick].stencil=stencil_surface;
+    surf_slot[pick].hw_depth=hw_depth_tex;surf_slot[pick].hw_stencil=hw_stencil_tex;
+    surf_slot[pick].stamp=++surf_clock;surf_slot[pick].valid=1;}
+   }}
   /* The hardware-state path attaches real depth and stencil buffers and drops
    * the second colour attachment the software path used to carry stencil in.
    * Chosen per draw rather than per surface because a state this path cannot
