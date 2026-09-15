@@ -272,6 +272,71 @@ whether our `VOICE_ON` should be writing `regs[top]` at all. That is a question
 about what the hardware does, and this model is derived from xemu's, so it is
 answered by reading xemu — not by experiment on our own guess.
 
+## Answered: keep the TOP write, the divergence is in our walk
+
+Read the same day against xemu master (`hw/xbox/mcpx/apu/vp/vp.c`) and against
+the XDK DirectSound driver's own source (`mcpvoice.cpp`).
+
+**Our `VOICE_ON` is byte-for-byte xemu's**, casts and counters aside;
+`git log -S "d->regs[top_reg] = selected_handle"` returns only the initial
+import. xemu writes the head on a TOP insert exactly as we do, and the driver
+depends on it: `CMcpxVoiceClient` never writes TVL on the insert path, and its
+debug validation asserts `dwTVL == m_ahVoices[0]` when a voice is at the head —
+an assert that only holds if the hardware front end moved TVL for it. Removing
+or conditioning that write would break every head insertion. **It stays.**
+
+The driver source also confirms, independently of our runs, all three guest
+behaviours the shadow caught. `CMcpxVoiceClient::RemoveIdleVoice` writes
+`TVL = next` when its software list says the voice is the head,
+read-modify-writes the predecessor's `PITCH_LINK` otherwise, and then "removes
+the voice from the hardware list by making it point to itself". The self-link is
+the driver's documented "not in any list" marker, written for all 256 voices at
+boot. Nothing we measured was the guest misbehaving.
+
+xemu has no cycle detection either — the same `i >= MCPX_HW_MAX_VOICES` cap —
+and accepts guest TVL writes verbatim as we do. It has no immunity to this
+defect; it would burn the frame differently.
+
+**What is ours, and is now the lead.** Two things in the walk diverge from xemu,
+and both were local changes:
+
+  1. xemu finishes the walk and stalls the *next* frame on `FEMETHMODE_TRAPPED`.
+     We return mid-walk on a local cursor, mirroring only into `regs[current]`.
+     `RemoveIdleVoice` repairs **CVL and NVL** to steer an in-progress hardware
+     walk when the voice being removed is the one under the cursor — and a
+     mid-walk removal is exactly what `[VOICE-RELINK] voice=70 ... at=walk`
+     caught. The guest computes those repairs from registers our walk no longer
+     honours, so its removal handshake cannot redirect us as it redirects
+     hardware.
+  2. xemu raises the idle trap for every inactive voice it meets; we raise one
+     per frame per list and hold (`trap_held`). That changes what the ISR sees
+     between services.
+
+That reframes the defect a third time, and away from the insert entirely: TVL
+still names `v` at re-ON because the *removal* handshake did not complete, and
+that handshake runs through registers we stopped honouring when the walk was
+given a local cursor. v3 re-trapping 19,552 times is a handshake failing to
+complete, not an insert misbehaving.
+
+A bounded stopgap exists — terminate instead of self-linking when
+`regs[top] == selected`, which cannot lose reachable entries because the guest
+has already written `link(v) = v` by then — but it is a deliberate divergence
+from xemu and would hide the handshake, which is the part actually broken.
+**Not applied.**
+
+## The seven dropped methods are harmless
+
+Identified from `nv_uap.h`: `0x2A0`–`0x2B0` are the five global tracking slew
+rates (volume, pitch, HRTF, ITD, filter), which `SetupVoiceProcessor` writes once
+with `MCPX_HW_DEFAULT_TRACKING = 0xFFF` — the maximum of a 12-bit field, "track
+as fast as possible", and applying targets immediately is that limit case.
+`0x350` and `0x370` are per-voice LFO delay and modulation depth; neither xemu
+nor this model has an LFO engine, so dropping them loses tremolo, vibrato and
+filter sweep and cannot corrupt anything — voice offsets 0x50 and 0x70 alias
+neither `PAR_STATE` (0x54) nor `TAR_PITCH_LINK` (0x7C). **xemu drops all seven
+identically**, so this is neither a divergence nor a cause. The counter stays,
+because not knowing was the defect.
+
 ## Scope of the change
 
 Counters, traces and comments. **No trap policy, list behaviour or audio
