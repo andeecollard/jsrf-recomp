@@ -646,6 +646,97 @@ _Static_assert(MTLStencilOperationKeep==NV2A_MTL_STENCIL_KEEP
 
 unsigned long long g_hw_pipeline_misses, g_hw_state_refusals;
 
+/* The real depth and stencil attachments, and the guest RAM they mirror.
+ *
+ * This is the pair that frees the colour attachment's alpha channel, which is
+ * what the whole hardware-state path is for: with depth somewhere else there
+ * is a destination alpha again, so blending can go back to the blend unit, and
+ * depth and stencil can go back to the depth unit, and the fragment shader
+ * stops reading its own attachments through a raster order group.
+ *
+ * Guest depth is D24S8: byte 0 stencil, bytes 1..3 the 24-bit depth, little
+ * endian -- the same layout nv2a_metal_sync already writes back today, just
+ * read out of alpha instead of out of here. */
+static id<MTLTexture> hw_depth_tex, hw_stencil_tex;
+static int batch_encoder_hw;
+unsigned long long g_hw_draws;
+
+static int hw_state_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_METAL_HW");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
+/* Guest D24S8 -> the two attachments. Returns 0 if either texture could not be
+ * made, and the caller falls back; a half-populated depth buffer would render
+ * a plausible wrong image, which is worse than being slow. */
+static int hw_depth_upload(const uint8_t *zram, unsigned w, unsigned h,
+                           unsigned pitch)
+{
+    size_t px = (size_t)w * h;
+    float *dep = malloc(px * sizeof *dep);
+    uint8_t *ste = malloc(px);
+    if (!dep || !ste) { free(dep); free(ste); return 0; }
+    for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x) {
+        size_t at = (size_t)y * w + x;
+        if (zram) {
+            const uint8_t *z = zram + (size_t)y * pitch + x * 4;
+            uint32_t q = (uint32_t)z[1] | (uint32_t)z[2] << 8 | (uint32_t)z[3] << 16;
+            dep[at] = (float)q / 16777215.0f;
+            ste[at] = z[0];
+        } else { dep[at] = 1.0f; ste[at] = 0; }
+    }
+    MTLTextureDescriptor *dd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:w height:h mipmapped:NO];
+    dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModeShared;
+    hw_depth_tex = [device newTextureWithDescriptor:dd];
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatStencil8
+        width:w height:h mipmapped:NO];
+    sd.usage = MTLTextureUsageRenderTarget; sd.storageMode = MTLStorageModeShared;
+    hw_stencil_tex = [device newTextureWithDescriptor:sd];
+    if (!hw_depth_tex || !hw_stencil_tex) {
+        hw_depth_tex = nil; hw_stencil_tex = nil;
+        free(dep); free(ste); return 0;
+    }
+    [hw_depth_tex replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0
+        withBytes:dep bytesPerRow:w * sizeof *dep];
+    [hw_stencil_tex replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0
+        withBytes:ste bytesPerRow:w];
+    free(dep); free(ste);
+    return 1;
+}
+
+/* And back, in the guest's own layout, so nothing downstream can tell which
+ * path produced it. */
+static void hw_depth_readback(uint8_t *zram, unsigned w, unsigned h,
+                              unsigned pitch)
+{
+    if (!zram || !hw_depth_tex || !hw_stencil_tex) return;
+    size_t px = (size_t)w * h;
+    float *dep = malloc(px * sizeof *dep);
+    uint8_t *ste = malloc(px);
+    if (!dep || !ste) { free(dep); free(ste); return; }
+    [hw_depth_tex getBytes:dep bytesPerRow:w * sizeof *dep
+        fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+    [hw_stencil_tex getBytes:ste bytesPerRow:w
+        fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+    for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x) {
+        size_t at = (size_t)y * w + x;
+        uint32_t q = (uint32_t)((double)fminf(1.0f, fmaxf(0.0f, dep[at]))
+                                * 16777215.0 + 0.5);
+        uint8_t *p = zram + (size_t)y * pitch + x * 4;
+        p[0] = ste[at]; p[1] = (uint8_t)q; p[2] = (uint8_t)(q >> 8);
+        p[3] = (uint8_t)(q >> 16);
+    }
+    free(dep); free(ste);
+}
+
 #define HW_CACHE 16
 static struct { uint32_t blend,src,dst; id<MTLRenderPipelineState> pso; }
     hw_pso[HW_CACHE];
@@ -668,8 +759,15 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = hw_vs; d.fragmentFunction = hw_fs;
     d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
-    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    /* SEPARATE depth and stencil textures, not a combined format. Measured on
+     * this host before choosing: Depth32Float, Stencil8 and
+     * Depth32Float_Stencil8 all accept MTLStorageModeShared and all accept
+     * replaceRegion/getBytes on Apple Silicon -- so the combined format buys
+     * nothing and separate ones keep the guest's D24S8 unpack trivial, with no
+     * blit encoder and no MTLBlitOptionDepthFromDepthStencil dance to move
+     * bytes in and out of a private texture. */
+    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
     if (s->blend) {
         d.colorAttachments[0].blendingEnabled = YES;
         /* The guest's only blend equation here is ADD; nv2a_texture_copy's
@@ -1183,7 +1281,15 @@ int nv2a_metal_sync(void)
             }
             surface_dirty=0;
         }
-        if(depth_dirty&&depth_target) {
+        /* Hardware path: depth and stencil live in their own attachments, so
+         * they come back from there rather than out of the colour texture's
+         * alpha. Written in the guest's own D24S8 layout either way, so
+         * nothing downstream can tell which path produced the frame. */
+        if(depth_dirty&&depth_target&&hw_state_on()&&hw_depth_tex) {
+            ++sync_depth;
+            hw_depth_readback(depth_target,surface_width,surface_height,depth_pitch);
+            depth_dirty=0;
+        } else if(depth_dirty&&depth_target) {
             ++sync_depth;
             uint8_t *stencil=malloc(pixels);
             if(!stencil){free(rgba);return 0;}
@@ -1629,8 +1735,24 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;float*rgba=malloc(pixels*16);uint8_t*stencil=malloc(pixels);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
    for(unsigned y=0;y<surface_height;y++)for(unsigned x=0;x<surface_width;x++){const uint8_t*p=target+(size_t)y*surface_pitch+x*2;unsigned c=p[0]|(unsigned)p[1]<<8;size_t at=((size_t)y*surface_width+x)*4;rgba[at]=(float)(c>>11)/31;rgba[at+1]=(float)((c>>5)&63)/63;rgba[at+2]=(float)(c&31)/31;if(next_depth){const uint8_t*z=next_depth+(size_t)y*next_depth_pitch+x*4;uint32_t q=(uint32_t)z[1]|(uint32_t)z[2]<<8|(uint32_t)z[3]<<16;rgba[at+3]=(float)q/16777215;stencil[(size_t)y*surface_width+x]=z[0];}else{rgba[at+3]=1;stencil[(size_t)y*surface_width+x]=0;}}
-   [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;}
-  MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;
+   [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
+   /* The real attachments are built from the same guest bytes, at the same
+    * moment, so the two paths start from identical depth. If this fails the
+    * textures are left nil and every draw below falls back to the software
+    * path -- slower, and correct. */
+   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){hw_depth_tex=nil;hw_stencil_tex=nil;}}
+  /* The hardware-state path attaches real depth and stencil buffers and drops
+   * the second colour attachment the software path used to carry stencil in.
+   * Chosen per draw rather than per surface because a state this path cannot
+   * translate falls back, and a fallback draw needs the old descriptor. */
+  int hw = hw_state_on() && hw_depth_tex && hw_stencil_tex;
+  id<MTLRenderPipelineState> hw_pso_use = hw ? hw_pipeline_for(s) : nil;
+  id<MTLDepthStencilState> hw_dss_use = hw ? hw_depth_state_for(s) : nil;
+  if (hw && (!hw_pso_use || !hw_dss_use)) hw = 0;   /* refused: fall back */
+  MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+  if(hw){pass.depthAttachment.texture=hw_depth_tex;pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;
+         pass.stencilAttachment.texture=hw_stencil_tex;pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;}
+  else{pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;}
   unsigned long long _t0=mtl_cb_stats()?mtl_now_ns():0;
   id<MTLCommandBuffer>command;id<MTLRenderCommandEncoder>encoder;
   if(batch_on()){
@@ -1696,7 +1818,15 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * RECOMP_LEGACY_ZCLAMP=1 forces the old saturate-instead-of-discard
    * policy, to A/B the change in one binary. */
   [encoder setDepthClipMode:MTLDepthClipModeClamp];
-  [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+  /* A batch encoder is opened from ONE pass descriptor, so a draw that needs
+   * the other attachment layout cannot join it. batch_flush() before switching
+   * keeps that invariant; without it the hardware path would silently render
+   * into the software path's descriptor. */
+  if(batch_on()&&batch_encoder&&hw!=batch_encoder_hw){batch_flush();}
+  batch_encoder_hw=hw;
+  if(hw){[encoder setRenderPipelineState:hw_pso_use];[encoder setDepthStencilState:hw_dss_use];
+         [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;}
+  else [encoder setRenderPipelineState:pipeline];if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
   if(batch_on()){
    if(pinned_slab>=0)batch_pins|=1u<<(unsigned)pinned_slab;
    ++batch_draws;
