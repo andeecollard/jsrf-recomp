@@ -673,3 +673,67 @@ WHAT I WOULD DO NEXT, in order:
      pixels, or in bytes, names the addressing error directly.
   3. Only then look for the code. Three sessions of reading have not found it
      and one measurement of the offset would.
+
+
+16. FOUND: ONE RENDER PASS PER DRAW, RACING ON TILE MEMORY
+============================================================
+THE ARTEFACT IS A 64x64 TILE MOSAIC, and RECOMP_METAL_BATCH=1 removes it.
+
+Measured on a real gameplay recording rather than a synthetic surface. Strong
+seams found by an UNRESTRICTED search -- the earlier 64-alignment claim in
+section 15 came from a search that only looked at multiples of 64 and could
+only find what it was looking for, which is a methodological error and is
+corrected here by counting all seams and comparing against chance:
+
+                                frames  seams  on x%64==0  expected  enrichment
+    hardware, per-draw (default)    11    248       66        3.9      17.0x
+    hardware, BATCHED                7     29        0        0.5       0.0x
+    software control                 5    227        3        3.5       0.8x
+
+And in a recording the seams are on a 64 grid in BOTH axes, consistently over
+three frames: vertical at game x = 0, 64, 192, 256, 320, 384, 448, 640, and
+horizontal at y = 128, 256, 384. That is a tile grid, not a column artefact.
+
+THE MECHANISM. With batching off -- the default -- every draw is its own render
+pass and its own command buffer: load the whole surface into tile memory, draw
+one batch, store it back. A gameplay frame issues tens of thousands of those
+against the same texture, and RECOMP_METAL_CB_GPU measures 664,933 command
+buffers STARTING before the previous one ended, with out-of-order = 0. Tiles
+therefore resolve independently and out of step, and each 64x64 tile of the
+presented frame ends up holding whichever command buffer stored it last. The
+result is a mosaic of moments -- which is exactly what a person watching it
+described as the background being cut and jumbled, with elements moving in the
+grid.
+
+The player is coherent because it is drawn last, into whatever the surface then
+holds.
+
+WHY IT IS HARDWARE-PATH-ONLY, and why "slow but looked ok" before. The software
+path serialises overdrawn fragments with raster_order_group(0). That keeps the
+GPU shallow and the producer close behind it, so the per-draw passes rarely
+overlap. Removing that serialisation is where the 9.6% came from, and it is
+also what let the passes race.
+
+WHY NO DEVICE TEST COULD SEE IT. metal_batch_test submits a few hundred draws
+and reads back immediately; the GPU is never behind. Its own header says the
+first version of the ring phase was "toothless" for exactly this reason -- "the
+GPU was never actually behind" -- and the same sentence applies to every phase
+in the file.
+
+BATCHING WAS ALREADY BUILT, default off, and had only ever been argued about on
+frame time, where its A/B ranges overlapped. It is a CORRECTNESS fix, and that
+changes the case for defaulting it on. metal_batch_check.sh already gates
+batched output against per-draw byte for byte.
+
+AND IT WAS UNREACHABLE UNTIL TODAY. RECOMP_METAL_HW=1 with
+RECOMP_METAL_BATCH=1 segfaulted on its first draw until the stale-encoder fix
+earlier in this session: batch_flush() ran after `encoder` was bound, so the
+draw encoded into an ended encoder. The configuration that fixes the artefact
+could not be run before that.
+
+STILL OPEN: a finer speckle remains on textured surfaces in the batched frames,
+visible in the third recording as a more granular pattern. It is a smaller and
+probably separate defect, and it is not tile-aligned.
+
+NOT YET MEASURED: what batching costs or saves in frame time on the hardware
+path, which is the question that decides the default.
