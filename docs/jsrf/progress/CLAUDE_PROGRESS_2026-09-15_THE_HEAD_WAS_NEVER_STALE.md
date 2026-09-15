@@ -168,7 +168,41 @@ two arms that report the same one. Its positive control is the pair above.
 
 The retraction in the handover — "the self-link guard is the fix" corrected to
 "it fires 47,293 times and moves nothing" — replaced a wrong conclusion with an
-unmeasured one. The honest statement is that the switch is **untested**.
+unmeasured one.
+
+### Now measured, and the verdict it asserted turns out to be right
+
+Six boots with the switch fixed, five reaching a scene-verified mission, two
+arms that report different states:
+
+|  | guard OFF (n=2) | guard ON (n=3) |
+|---|---|---|
+| idle traps raised | 19706 · 18891 | 18957 · 18883 · 18344 |
+| halted frames | 6350 · 5809 | 2286 · 1564 · 1457 |
+| engine duty | 98.43% · 98.57% | 99.44% · 99.61% · 99.64% |
+| longest trapped run | 47 · 47 frames | 87 · 55 · 55 frames |
+| frame time | 36.74 · 31.95 ms | 36.44 · 35.31 · 34.07 ms |
+
+**The trap storm is unchanged.** Raises overlap, and so does the busiest
+voice's share of them — which swings 70–98% *within* the OFF arm, so it is not
+an instrument that separates anything at this sample size. Terminating the
+cycle does not stop the storm, for the reason already written down: the
+self-linked voice is still the head of its list and still inactive, so the walk
+begins on a dead voice and traps whether or not it then loops. The conclusion
+was right; it just had nothing behind it until now.
+
+**Two things moved, in opposite directions.** Engine duty is higher with the
+guard on and the ranges do not overlap — 98.5% against 99.6%, dropped subframes
+falling from ~6100 to ~1700 a run. That is entirely the halted-frame count, a
+third of what it is with the guard off. But `halted` is the guest writing
+`FECTL`, so the path from this switch to that count is not established, and at
+n=2 in the OFF arm it could be scene variation. Against it, the guest takes
+**longer** to service each trap: the longest trapped run goes from 31 ms to
+37–58 ms. Frame time does not separate.
+
+The default does not move. A one-point duty gain of unexplained provenance does
+not outweigh the tail loss argued above, and what would decide it is the
+mechanism behind `halted`, not more runs of this A/B.
 
 ## Two divergences in the walk, and the second is new
 

@@ -526,8 +526,38 @@ int mcpx_apu_trap_coalesce(void)
  * but neither is lossless, and that points back at the insert.
  * See docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-15_THE_HEAD_WAS_NEVER_STALE.md.
  *
- * It stays off until an A/B with a working control arm and two churning runs
- * per arm says otherwise. diagnostics/jsrf_first_fault/ab_switch.sh takes it. */
+ * MEASURED PROPERLY, 15 Sep 2026, and it stays off. Six boots on
+ * pad/gameplay_nobarrage.pad with the switch actually working, five reaching a
+ * scene-verified mission, two arms that report different states:
+ *
+ *                      guard OFF (n=2)      guard ON (n=3)
+ *   idle traps raised  19706  18891         18957  18883  18344
+ *   halted frames       6350   5809          2286   1564   1457
+ *   engine duty        98.43% 98.57%        99.44% 99.61% 99.64%
+ *   longest trap run      47     47            87     55     55  frames
+ *   frame time         36.74  31.95 ms      36.44  35.31  34.07 ms
+ *
+ * THE TRAP STORM IS UNCHANGED. Raises overlap between the arms and so does the
+ * busiest voice's share of them, which swings 70-98% inside a single arm. So
+ * the verdict this comment used to assert without evidence is now the verdict
+ * with evidence: terminating the cycle does not stop the storm. The reason is
+ * the one already written down -- the self-linked voice is still the head of
+ * its list and still inactive, so the walk begins on a dead voice and traps
+ * whether or not it then loops.
+ *
+ * TWO THINGS DID MOVE, IN OPPOSITE DIRECTIONS, AND NEITHER DECIDES IT.
+ * Engine duty is higher with the guard on and the ranges do not overlap --
+ * 98.5% against 99.6%, which is dropped subframes falling from ~6100 to ~1700
+ * a run -- and that is entirely the halted-frame count, a third of what it is
+ * with the guard off. But `halted` is the guest writing FECTL, so the path from
+ * this switch to that count is not established and could be scene variation at
+ * n=2. Against it, the guest takes LONGER to service each trap: the longest
+ * trapped run goes from 31 ms to 37-58 ms. Frame time does not separate.
+ *
+ * A one-point duty gain of unexplained provenance does not outweigh the tail
+ * loss above, so the default does not move. What would decide it is the
+ * mechanism behind `halted`, not more runs of this A/B.
+ * diagnostics/jsrf_first_fault/ab_switch.sh takes it. */
 /* THE SWITCH TESTED FOR THE VARIABLE'S PRESENCE, SO `=0` TURNED IT ON.
  *
  * `getenv(...) != NULL` is the right shape for a trace, where setting the name

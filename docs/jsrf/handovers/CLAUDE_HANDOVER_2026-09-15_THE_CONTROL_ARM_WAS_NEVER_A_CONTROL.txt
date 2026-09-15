@@ -1,0 +1,273 @@
+CLAUDE, 15 Sep 2026 (evening)
+THE CONTROL ARM WAS NEVER A CONTROL, AND THE HEAD WAS NEVER STALE
+
+Supersedes CLAUDE_HANDOVER_2026-09-15_THE_SOUND_ENGINE_WAS_SWITCHED_OFF.txt for
+sections 3 (the voice-list open question), 5 (the self-link guard) and 9 items
+2, 4 and 6. Everything it says about the sound engine's duty cycle, the trap
+coalescing, the harness and the font stands unchanged.
+
+7 commits, ctest 29/29, diagnostics Python 15/15, nothing pushed.
+
+This session took two A/Bs the previous one could not finish, and both of them
+turned out to be about the instruments rather than the switches.
+
+
+0. THE ONE PARAGRAPH VERSION
+=============================
+RECOMP_APU_SELFLINK_END tested for its environment variable's PRESENCE, so the
+A/B that concluded "it moves nothing" ran with the guard ON IN BOTH ARMS -- and
+both arms printed "(guard on)" in every report. Fixed, re-taken, and the
+conclusion survives: the guard does not touch the trap storm. Separately, the
+open question in section 3 of the last handover is malformed: regs[top] is not
+stale, and in none of the sixteen cycle-forming inserts across four runs had the
+guest written its "not in any list" sentinel first. The producer is a VOICE_ON
+for a voice that is ALREADY its list's head. RECOMP_METAL_BATCH is worth a
+measured 2.2 ms/frame off clear+submit at a real mission and does not move
+whole-frame time out of the noise; its default stays off for the same safety
+reason as before. THE LISTENING GATE ON THE SOUND ENGINE IS STILL OPEN.
+
+
+1. WHAT IS COMMITTED
+=====================
+  * diagnostics/jsrf_first_fault/ab_switch.sh + ab_score.py -- an A/B harness
+    that is a file rather than a shell loop. Section 2.
+  * apu_vp.c: RECOMP_APU_SELFLINK_END value-tested instead of presence-tested;
+    the CVL/NVL pair frozen while a trap is outstanding.
+  * nv2a_metal.m, apu_vp.c: the two A/B results written where the evidence for
+    each switch already lives.
+  * boot_trial.sh, run_scripted.sh, EXPERIMENT_CONTROLS.md, STATUS.md: the
+    NtOpenFile gate retired from the three places still carrying it.
+  * test_combiner_trace.py: failing since 13 Sep on a probe that went opt-in.
+  * kernel_bridge.c: a comment whose mechanism stopped being true yesterday.
+  * docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-15_THE_HEAD_WAS_NEVER_STALE.md
+
+Nothing changed the audio or rendering defaults. Both A/Bs left their switch
+where they found it, and section 5 says why for each.
+
+
+2. THE HARNESS, BECAUSE IT IS WHY THE REST OF THIS EXISTS
+==========================================================
+Four A/Bs were taken yesterday and every one was a throwaway loop typed at the
+prompt. The outputs are under measure/; the scripts are gone. That is why the
+metal_batch A/B could not be resumed -- the arms, the run length, the pad file
+and the scoring went with the shell.
+
+ab_switch.sh <name> <RECOMP_VAR> [trials] [seconds] [pad] now takes one, and
+ab_score.py is a pure function of a log, so any archived run can be re-scored
+later. What it refuses to do is the useful part, and every refusal is something
+that actually went wrong:
+
+  * it hashes the binary before every run and aborts if it changed. A rebuild
+    landed underneath a running A/B yesterday.
+  * it excludes and NAMES a run that did not reach a mission rather than
+    averaging it in.
+  * it reads frame windows in MISSION time, not wall time.
+  * it measures the input-poll stall against the SCHEDULE, because
+    gameplay_nobarrage.pad has a designed 34 s pause and a bare-gap rule
+    rejects every healthy run on it.
+  * it refuses a verdict below two usable runs per arm. One run has a range of
+    zero width, so any difference "does not overlap" -- which is a statement
+    about arithmetic. It printed exactly that for a 1-v-1 result before I fixed
+    it, and I nearly reported it.
+  * IT SAYS "VOID" IF BOTH ARMS REPORT THE SAME SWITCH STATE. See section 4.
+
+Usage, and note that all three variables are needed on this machine:
+
+    ICL="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future"
+    JSRF_GAME_DIR="$ICL/Jet Set Radio Future (US)" \
+    JSRF_HDD_SRC="$ICL/upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" \
+    JSRF_BIN=$PWD/build-macos/jsrf-first-fault/build-feav/jsrf_first_fault \
+      sh diagnostics/jsrf_first_fault/ab_switch.sh <name> <VAR> 3 280
+
+BOOT RELIABILITY IS THE LIMIT ON EVERY A/B HERE. Sixteen boots this session,
+thirteen reached a mission. That is far better than the "one run in three"
+gameplay_nobarrage.pad's header records, but it still costs an arm now and
+then, and it is why three trials is the floor rather than two.
+
+
+3. THE OPEN QUESTION IN SECTION 3 WAS MALFORMED   <-- READ THIS FIRST
+======================================================================
+The last handover put it as: "WHY regs[top] IS STALE IS NOT ESTABLISHED."
+
+It is not stale. The chain it belongs to was:
+
+    the guest writes link(v) = v as its "not in any list" sentinel before
+    re-ONing v; our regs[top] still names v; VOICE_ON stores link(v) = v
+
+Classify only the ON that FIRST self-links each voice -- the later ones are the
+absorbing state re-counted -- across all four instrumented runs. Sixteen
+cycle-forming inserts. In NOT ONE did link(v) hold the sentinel: twelve pointed
+at another voice, four at the FFFF terminator, which is the last element of a
+list and not absence from one. The sentinel reading comes from counting all 358
+self-linking ONs, where it is 343 of them, i.e. from counting the consequence.
+
+What the log shows, end to end, 20260915-122828-human-gameplay, 3D list:
+
+    9417  [VOICE-LINK]   voice=4 link=0004->0001      ON 4   head 1 -> 4
+    9444  [VOICE-RELINK] voice=4 ours=0001 now=FFFF at=walk
+    9510  [VOICE-LINK]   voice=4 link=FFFF->0004 SELF-LINK
+
+At 9444 the guest rewrites link(4) to FFFF as it removes voices 1 and 3 from
+BEHIND voice 4 -- so it is maintaining the list correctly and treating 4 as the
+live head, exactly as we do. Then it ONs voice 4 again. regs[top] is 4 because
+voice 4 IS the head. No head write is missing and no handshake failed.
+
+THE PRODUCER IS A VOICE_ON FOR A VOICE ALREADY AT THE HEAD OF ITS LIST, which
+is an ordinary thing for DirectSound to do with a buffer whose voice has stopped
+but has not yet been taken out of the hardware list.
+
+The remaining unexplained part is small and sharp, and it is the next thing to
+measure: our regs[top] names v at the re-ON and the guest's own software list
+evidently does not, or RemoveIdleVoice would have written TVL when it took v
+out. WHERE THE TWO VIEWS PART COMPANY is the question. It is not "why is the
+head stale" and it is not "does our insert match xemu" -- that was answered
+last session and the answer is yes.
+
+This also removes the argument that made the self-link guard safe. "Terminating
+cannot lose a reachable voice" rested on the guest having already written
+link(v) = v. At formation link(v) held a real successor and OUR INSERT
+OVERWROTE IT, so terminating drops whatever the guest still had behind v.
+Looping drops the same tail and pins the walk as well, so the guard is not
+worse -- but neither is lossless, and both losses come from the insert
+overwriting a live link.
+
+
+4. THE SWITCH THAT COULD NOT BE TURNED OFF
+===========================================
+    on = getenv("RECOMP_APU_SELFLINK_END") != NULL;
+
+so =0 ENABLED the guard, which is the opposite of what its own comment eight
+lines above offered as the way to A/B it. Both arms of yesterday's A/B ran with
+it on, and both said so in every report:
+
+    [APU-SELFLINK] terminated=214679 (guard on)     <- the =0 arm
+    [APU-SELFLINK] terminated=199861 (guard on)     <- the =1 arm
+
+Reproduced in a fresh pair before fixing it; those are the numbers. Nobody read
+the line, and "it fires 47,293 times and moves nothing" went into a handover as
+a retraction of a retraction.
+
+That was the SECOND defect in that A/B. The first: three of its four runs never
+reached voice churn -- on=5 off=0 idle_trap=0, the parked-player signature, 12
+of 199 pad events fired. One run in four had churn and it was in the guard=1
+arm, so 50.3% had nothing to be indistinguishable from.
+
+Value-tested now, like mcpx_apu_trap_coalesce and mcpx_apu_se_while_trapped
+beside it. The other two switches documented as =0-disableable, RECOMP_GPU_OWN
+and RECOMP_PHYSICAL_HEAP_ALIAS, were checked and honour it. The ~30 remaining
+presence tests in src/ are traces, where that shape is correct.
+
+ab_score.py now harvests the switch state each report names and refuses to
+compare arms that report the same one. Its positive control is the pair above.
+
+
+5. THE TWO A/Bs, AND WHY NEITHER DEFAULT MOVED
+===============================================
+RECOMP_METAL_BATCH -- ten boots, four usable runs per arm, scored only inside
+state 30:
+
+                    per frame, mean of 4      range
+      clear         10.75 -> 8.88 ms     9.49-11.47 v 8.70-9.24   NO OVERLAP
+      submit         8.09 -> 7.73 ms     7.63-8.29  v 7.60-7.83
+      vsh           10.55 -> 11.25 ms    9.14-11.54 v 10.67-12.65
+      whole frame   33.53 -> 32.27 ms    30.23-35.13 v 31.49-33.77
+
+The win is real, localised and about 2.2 ms/frame off clear+submit. `clear` is
+the only column that separates, which makes sense: a clear reaches the GPU
+through nv2a_metal_sync(), so its cost is a drain, and batching changes how much
+is outstanding when the drain happens. WHOLE-FRAME TIME DOES NOT SEPARATE,
+because vsh -- the CPU vertex interpreter, which batching does not touch --
+varies 3.5 ms run to run and swamps it.
+
+Default stays OFF and none of that bears on why. The gate is the SEGA-screen
+hang: one interactive session, never reproduced, seventeen scripted boots now
+and it was in none of them -- which is the evidence it already had. A PERSON
+RUNNING RECOMP_METAL_BATCH=1 INTERACTIVELY IS THE ONLY THING THAT CLOSES IT.
+
+RECOMP_APU_SELFLINK_END -- six boots, five usable, arms verified distinct:
+
+                      guard OFF (n=2)      guard ON (n=3)
+    idle traps         19706  18891         18957  18883  18344
+    halted frames       6350   5809          2286   1564   1457
+    engine duty        98.43% 98.57%        99.44% 99.61% 99.64%
+    longest trap run      47     47            87     55     55  frames
+    frame time         36.74  31.95 ms      36.44  35.31  34.07 ms
+
+THE TRAP STORM IS UNCHANGED -- raises overlap, and the busiest voice's share of
+them swings 70-98% inside the OFF arm alone. Yesterday's verdict was right and
+now has something behind it.
+
+Two things moved in opposite directions and neither decides it. Duty separates,
+98.5% against 99.6%, which is dropped subframes falling from ~6100 to ~1700 a
+run; but it is entirely the halted-frame count, `halted` is the GUEST writing
+FECTL, and the path from this switch to that count is not established. Against
+it, the guest takes LONGER to service each trap -- longest trapped run 31 ms to
+37-58 ms. Default stays off. What would decide it is the mechanism behind
+`halted`, not more runs of this A/B.
+
+
+6. A FIX THAT IS NOT A FIX FOR ANYTHING YOU ARE CHASING
+========================================================
+CVL and NVL are one cursor and both have to hold still. Hardware stalls the walk
+on a trap with CVL naming the idle voice and NVL its successor, and
+RemoveIdleVoice repairs the pair to steer an in-progress walk through the voice
+it is removing.
+
+Holding only CVL was enough while the frame thread idled on TRAPPED -- nothing
+then ran to move NVL either. Since RECOMP_APU_SE_WHILE_TRAPPED became the
+default the walk is re-entered every 1500th of a second while the guest still
+owes a service, and it was rewriting NVL at every voice behind the trapped one
+and then resetting CVL from TVL at the top of the next frame, discarding the one
+value the guest was told to read.
+
+Now separated: the local rendering cursor always starts at the head, so the
+duty-cycle win is untouched, and the guest-visible pair does not move until the
+guest clears the trap. With coalescing off, a raise that replaces an outstanding
+one moves the pair, so FEDECPARAM and CVL cannot name different voices.
+
+THIS IS NOT THE STORM'S FIX AND IS NOT OFFERED AS ONE. The storm is measured in
+runs that predate both this and the local cursor. It is the handshake the guest
+is entitled to, and it was intact before yesterday.
+
+
+7. MY RETRACTIONS AND NEAR-MISSES
+==================================
+  * "ON is faster and the ranges DO NOT OVERLAP (5.8%)." My own summariser
+    printed that for one run against one run. A single run has a range of zero
+    width. Caught before reporting it, and the tool now refuses below n=2.
+  * "The self-link is a legitimate one-element list, so the guard models
+    hardware." Written, then weakened: the same finding that supports it shows
+    our insert destroys a live link, so terminating drops a tail. Both readings
+    are in section 3 and the default did not move on either.
+  * I assumed the previous session's "indistinguishable" was a statistical
+    weakness. It was a mechanical one -- the control arm enabled the thing it
+    controlled for -- and the tell was printed in every report of every run.
+
+One process note: do not edit src/**.c|h|m while an A/B is running. The
+staleness guard will refuse the next run and abort the whole thing. Docs, .sh
+and .py are safe; ab_switch.sh itself is not, because sh reads a script
+incrementally.
+
+
+8. WHAT I WOULD DO NEXT
+========================
+  1. LISTEN TO IT, with a controller, at gameplay. Still the only thing that
+     closes the gate on RECOMP_APU_SE_WHILE_TRAPPED and RECOMP_APU_TRAP_COALESCE,
+     both default-on since yesterday and neither ever heard. The tell is a
+     sustained sound -- the grind -- fading in and out.
+  2. RUN RECOMP_METAL_BATCH=1 INTERACTIVELY a few times and watch the SEGA
+     screen. That is the whole remaining gate on a measured 2.2 ms/frame.
+  3. Section 3's sharp question: where our regs[top] and the guest's software
+     list part company. The instrument is already there -- [VOICE-TOP] counts
+     every guest TVL write and [VOICE-LINK] prints every insert's before/after;
+     what is missing is a count of guest READS of TVL/CVL/NVL, which would say
+     whether the guest ever consults the registers at all. It is four counters
+     in mcpx_apu_read.
+  4. Why `halted` is three times lower with the self-link guard on. It is the
+     guest writing FECTL, so it is a real behavioural difference we do not
+     understand, and it is the only thing standing between that switch and a
+     decision.
+  5. The MSL emitter's compute-kernel comparison, unchanged from yesterday's
+     list and still the largest structural rendering item.
+  6. Re-run the crash rate. Still predates the APU changes; one guest fault
+     appeared in sixteen boots this session, which is not a measurement.
