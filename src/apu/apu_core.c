@@ -856,14 +856,34 @@ static void apu_lock_handoff(MCPXAPUState *d)
  * not mean the sound engine stops. If it did, every voice retirement would
  * glitch audio on a stock Xbox, which it plainly does not.
  *
- * Opt-in and OFF by default. Earlier tonight a change measured only at the
- * intro shipped as a default and took gameplay audio out entirely; this one
- * does not get a default until it has been heard at gameplay, with a
- * controller, against [APU-FRAME] trapped= and [APU-VOICE] idle_trap=. */
+ * ON by default since 15 Sep 2026. It was opt-in because evaluating it needed
+ * a run that reached voice churn, and every scripted schedule in this tree
+ * parked the player; pad/gameplay_nobarrage.pad is the first that does not.
+ *
+ * Two matched pairs, 240 s each, same binary, arms alternated:
+ *
+ *     off   duty 63.8%  63.5%   trapped 113408 114048
+ *     on    duty 99.1%  98.8%   trapped      0      0
+ *
+ * The cost it brought -- raises going from ~10,300 to ~125,000, every one a
+ * guest interrupt into the DirectSound ISR that is this port's top crash site
+ * -- is removed by mcpx_apu_trap_coalesce, measured separately over two more
+ * pairs: 112,716/120,791 raises become 9,455/12,138 with duty unchanged at
+ * 98.8%/98.6%. The engine had been throttling its own trap rate by switching
+ * itself off, which is why the two changes only make sense together.
+ *
+ * THE GATE THIS COMMENT USED TO SET IS NOT CLOSED. It said no default until it
+ * has been heard at gameplay with a controller, and counters cannot close that
+ * one -- a person has to listen. What has changed is that everything a
+ * measurement can settle is settled, so listening is the only step left.
+ * RECOMP_APU_SE_WHILE_TRAPPED=0 turns it off in the same binary. */
 int mcpx_apu_se_while_trapped(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_APU_SE_WHILE_TRAPPED") != NULL;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_SE_WHILE_TRAPPED");
+        on = e ? (atoi(e) != 0) : 1;
+    }
     return on;
 }
 
