@@ -1,0 +1,129 @@
+BUG HUNT 2026-09-16 (night, second) -- THE APU'S PAGE TABLE HAS A BOUNDS
+PARAMETER AND EVERY CALLER DEFEATS IT
+
+Read-only hunt through the APU's memory path, prompted by 27,801 ADPCM decode
+failures per 150 s that survived the refutation of the segment-stride theory
+(see HANDOVER_..._NIGHT2..., section 1b). Three defects, one of them a strong
+fit for those failures. Nothing fixed yet; each has its evidence.
+
+
+=============================================================================
+1. THE SCATTER-GATHER BOUNDS CHECK CANNOT FIRE
+=============================================================================
+
+    static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge,
+                               uint32_t addr)
+    {
+        unsigned int entry = addr / TARGET_PAGE_SIZE;
+        assert(entry <= max_sge);
+        uint32_t prd_address =
+            ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
+        return prd_address + addr % TARGET_PAGE_SIZE;
+    }
+
+The function takes a bound and asserts against it. ALL THREE call sites pass
+0xFFFFFFFF:
+
+    apu_vp.c:239   the descriptor dump
+    apu_vp.c:3110  the ADPCM block fetch
+    apu_vp.c:3188  the PCM sample fetch
+
+so `entry <= 0xFFFFFFFF` is true for every possible entry and the assert is
+dead code. A read past the end of the voice processor's page table therefore
+loads whatever dword happens to sit at sge_base + entry*8, treats it as a
+physical page address, and returns a pointer into it. There is no error, no
+counter, and no way to tell the result from a valid translation.
+
+The hardware does have the registers this parameter was meant to carry --
+NV_PAPU_GPSMAXSGE, GPFMAXSGE, EPSMAXSGE, EPFMAXSGE (apu_regs.h:74-77) -- so
+the bound is a real concept that this path declines to use.
+
+
+=============================================================================
+2. AND IT FITS THE ADPCM FAILURES, WHICH ARE STILL UNEXPLAINED
+=============================================================================
+
+What is measured about them:
+
+    [APU-ADPCM-FAIL] first=0 last=1487 mid=26314
+    last 8: v4 blk 161/170 hdr 08080808   (and 159/170, 160/170, 213/214)
+
+    first=0   block 0 of a buffer NEVER fails
+    hdr byte 3 is 0x08, and the decoder refuses any block whose fourth header
+    byte is non-zero -- so this is ADPCM sample data being read as a header,
+    i.e. we are looking at the wrong bytes, not at corrupt ones.
+
+A 36-byte ADPCM block means 4096/36 = 113.8 blocks per 4 KB page. EVERY
+observed failing block index is above 113 (159, 160, 161, 213) and block 0
+always succeeds. That is what "the first page translates correctly and later
+ones do not" looks like.
+
+IT IS A FIT, NOT A PROOF, and two cheaper explanations have already died:
+  - the segment descriptor's samples-per-block: MEASURED, no effect, and the
+    scene has no streaming ADPCM voice at all.
+  - samples_per_block > 1 making the block stride disagree with the fixed
+    ADPCM_SAMPLES_PER_BLOCK=64 index: RULED OUT by g_apu_adpcm_oversize=0 in
+    every archived run, which proves 36*spb <= 36*channels, so spb == 1 for
+    the mono voices that are failing.
+
+THE INSTRUMENT THAT DECIDES IT, and it is small: record, per failure, the
+linear address, its page index (addr / TARGET_PAGE_SIZE), and the
+prd_address the table returned for that page. Then read the FIRST failing
+block index per voice. If failures begin at a page index and prd_address is
+zero or implausible beyond it, this is the defect and the fix is to carry a
+real bound and refuse rather than read. If failures are scattered across
+pages with plausible prd_addresses, this dies too and the buffer itself is
+being reused under us.
+
+DO NOT "fix" the assert by passing a bound before taking that measurement:
+an assert that starts firing in a player's build is a crash, and we do not
+yet know whether the guest legitimately walks past the table.
+
+
+=============================================================================
+3. A STEREO SAMPLE THAT STRADDLES A PAGE READS ITS SECOND CHANNEL FROM THE
+   WRONG ONE
+=============================================================================
+
+The PCM path (apu_vp.c:3184-3218) translates ONCE per sample and then walks
+the channels on the translated PHYSICAL address:
+
+    addr = get_data_ptr(..., ba + cbo * block_size);
+    for (channel = 0; channel < channels; channel++) {
+        ... read at addr ...
+        addr += container_size;
+    }
+
+Physical contiguity is exactly what a scatter-gather table does not promise.
+When a stereo sample's two channels fall either side of a 4 KB boundary, the
+second channel is read from whatever physically follows the first page, which
+is a different buffer.
+
+The ADPCM path does NOT have this bug -- it re-translates per dword
+(apu_vp.c:3110) -- which is the clearest evidence that per-read translation
+is the intended discipline and this loop simply missed it.
+
+LATENT AND UNMEASURED: it needs a stereo BUFFERED voice, and the voices
+failing today are mono. Frequency is roughly one sample in 1024 for 16-bit
+stereo, and only when the adjacent pages are not contiguous. Worth a counter
+before a fix, for the same reason as section 1.
+
+
+=============================================================================
+4. A PERFORMANCE FINDING, NOT A CORRECTNESS ONE
+=============================================================================
+
+nv2a_metal.m's texture_buffer() confirms every cache HIT with a full memcmp
+of the entire texture against the guest copy:
+
+    if(entry->source==data && entry->size==size) {
+        if(entry->buffer && !memcmp(entry->buffer.contents, data, size)) ...
+
+Measured in a 130 s run: 537,605 requests, 534,232 hits -- i.e. half a
+million whole-texture comparisons, O(texture bytes) each, on the thread the
+guest is waiting on. The comparison is what makes the cache SAFE (it is why a
+stale hit is impossible), so it cannot simply be deleted; but a cheap dirty
+signal -- a hash kept per entry, or the executor's existing knowledge of
+which guest ranges were written -- would remove most of them. Measure before
+believing it matters: at 32 KB average this is ~1% of a core, at 256 KB it is
+not.

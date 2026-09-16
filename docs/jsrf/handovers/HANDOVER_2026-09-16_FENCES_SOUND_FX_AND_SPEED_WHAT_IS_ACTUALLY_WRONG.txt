@@ -1,0 +1,349 @@
+HANDOVER 2026-09-16 (fifth of the day) -- THE FENCES, THE SOUND, THE EFFECTS
+AND THE SPEED: WHAT IS ACTUALLY WRONG, AND WHAT TO DO ABOUT IT
+
+Read CLAUDE.md first. This supersedes every earlier handover of 16 Sep where it
+contradicts them, and it contradicts them in a lot of places -- including
+conclusions I published today with confidence and had to retract by evening.
+
+This is written to be the document that permanently closes four player-visible
+complaints: DISAPPEARING FENCES, BROKEN MUSIC, NO SOUND EFFECTS, and SPEED.
+
+
+=============================================================================
+0. THE ONE PARAGRAPH VERSION
+=============================================================================
+
+Fences: FIXED, by the vertex-shader dot-product zero rule
+(RECOMP_VSH_DP_ZERO). Confirmed twice, once by a player and once by a natural
+experiment. Make it the default.
+
+Music breaking up: the idle-voice trap was level-triggered where the hardware's
+is an edge. RECOMP_APU_IDLE_TRAP_EDGE takes trapped subframes from 46.7% to
+0.59%. Measured, scene-matched, both arms in gameplay. Make it the default.
+
+Sound effects: FOUND, and it is not what four separate investigations thought.
+Effects are the 3D positional voices; every one of them had its mixbin routing
+overwritten with an HRTF submix, and the DSP reads two of thirty-two bins. 3D
+heard=0, lost=375,382 in one run, against 2D heard=380,614 lost=0. One line
+gates it.
+
+Speed: fixed-function T&L now runs on the GPU. CPU vertex shading goes to ZERO,
+the frame goes 23.53 ms -> 17.31 ms. The next and largest item is the flip sync
+(4-9 ms/frame), which is designed and staged but not implemented.
+
+
+=============================================================================
+1. THE FENCES -- FIXED, AND HOW IT WAS ACTUALLY ESTABLISHED
+=============================================================================
+
+CAUSE: mac_eval computed DP3/DP4/DPH with a plain multiply, while multiply() --
+which implements the NV2A rule that a*0 is +0 even when the other operand is
+inf -- was reached only by MUL and MAD. RSQ(0) is +inf by design, so through a
+dot product it becomes NaN. Dot products build this title's texture
+coordinates: 1,889 DP3/DP4 across the 126 vertex programs, 598 reaching a
+texcoord. A NaN texcoord leaves the POSITION finite, so the triangle is
+assembled, submitted and drawn, and then samples garbage. On an opaque surface
+that is a wrong colour nobody reports. On an ALPHA-CUTOUT texture -- a wire
+fence -- every fragment fails the alpha test and the object disappears.
+Transparency is what turns "slightly wrong" into "gone", which is why fences
+are what the player notices.
+
+EVIDENCE: 13 mismatches -> 0 against the title's own 126 programs in the GPU
+diff test, worst error 4.29e-4 -> 6.35e-6, no measurable frame cost (57.3 ->
+58.6 fps). The player confirmed the fix on their own build. Then the decisive
+one, which nobody designed: the player watched a SCRIPTED run's window and said
+"the fence issue is back" -- and that run's log read `[VSH] (vsh_dp_zero OFF)`
+while their own working session read `vsh_dp_zero on`. Same engine, same scene
+type, one switch, symptom present and absent accordingly.
+
+ACTION: make RECOMP_VSH_DP_ZERO default ON. It is a correctness fix with a
+measured result and a human confirmation, and it is currently a switch only
+because it was landed cautiously.
+
+DO NOT re-open these, all measured out today: batch truncation (no-room=0
+against a 9,681-index batch), INLINE_ARRAY truncation (12 words of 16,384),
+DRAW_ARRAYS volume (0.01% of per-frame indices), alpha-test and blend
+refusals (0 in gameplay runs two days apart), the texture cache (a hit
+requires a full memcmp), mip base arithmetic / levels clamp / filter selection
+(correct across all three implementations), the viewport scale (D3D bakes it
+into the composite matrix -- "fixing" it would multiply the screen by 320
+twice), the all-zero texture matrix (its enable is off), and float32
+cancellation in area() (measured: rescues exactly 0 triangles).
+
+
+=============================================================================
+2. THE SOUND EFFECTS -- FOUND, AND FOUR INVESTIGATIONS WERE WRONG FIRST
+=============================================================================
+
+THE ANSWER: voices 0-63 are the 3D positional voices, i.e. the effects. Every
+one of them had bin[0..3] overwritten with d->vp.hrtf_submix[] -- unconditional
+-- while .hrtf is false and no HRTF runs. mcpx_apu_dsp_frame then reads
+mixbins[0] and mixbins[1] and discards the other thirty, because the GP and EP
+are stubs. So effects are generated correctly and mixed into bins nothing
+reads.
+
+    [APU-BIN] 2D heard=380614 lost=0 | 3D heard=0 lost=375382
+              hrtf_submix=6,8,7,9 | lost by bin: 6:115742 7:115742
+                                                 8:14054 9:14054 10:115790
+
+2D heard=380,614 lost=0 is the positive control: music is audible, so that
+number MUST move, and it does. 3D heard=0 lost=375,382 is the defect.
+
+WHY IT TOOK ALL DAY. dbg->bin[i] is written in voice_process and read by
+NOTHING -- grep returns one hit. No counter, log line or document in the tree
+ever recorded which mixbin a voice landed in. Thirty of thirty-two bins were
+discarded every frame in complete silence, so every instrument upstream read
+healthy while the player heard nothing.
+
+AND THE INSTRUMENT THAT SENT THREE INVESTIGATIONS THE WRONG WAY WAS ADDED
+TODAY, BY ME. [APU-SE] prints `oneshot = on_count - on_loop_count` and asserts
+"no one-shot voice started while the engine kept running: SE silence, not a
+stopped APU". JSRF sets CFG_FMT.LOOP on every voice it starts -- 57 of 57
+descriptor dumps read loop=1, and on == on_loop in all 251 report windows
+across 15 logs -- so that quantity is IDENTICALLY ZERO BY CONSTRUCTION. It
+never measured effects. Effects were starting the whole time: 348 and 366
+voice starts in the long runs. RETIRE IT or give it a positive control; the
+discriminator that actually tracks BGM vs effects in this title is the 2D/3D
+split on v < 64.
+
+ACTION: the gate is in the tree (RECOMP_APU_HRTF_BINS, default 0 = do not
+apply the override, restoring the guest's own V0BIN..V3BIN). Verify with
+[APU-BIN]: 3D heard must become non-zero with 2D heard still moving. If the
+guest's own routing also points above bin 1, the remaining work is to widen
+mcpx_apu_dsp_frame's mixdown to sum the routed bins -- about 20 lines, inside
+the existing signature, because it already receives float mixbins[32][...].
+
+A REAL GP/EP IS NOT NEEDED FOR THIS TITLE. JSRF issues gp=7 ep=8 writes
+against vp=249,688 -- initialisation only, no command stream. Interpreting a
+DSP56300 is ~3,000 lines and would buy nothing here.
+
+
+=============================================================================
+3. THE MUSIC -- THE TRAP WAS A LEVEL WHERE THE HARDWARE HAS AN EDGE
+=============================================================================
+
+SE2FE_IDLE_VOICE reports a voice TRANSITIONING to inactive. This model raised
+it on the standing condition. The guest's DirectSound ISR has three early
+returns that all leave a voice inactive and still linked -- including PERSIST,
+a documented feature this model implements the same way -- so against a level
+trap it loops at 1500 Hz with the driver behaving exactly as written. 89% of
+raises in the player's own session named the same voice as the previous raise.
+
+MEASURED, two 340 s scene-matched arms with a LIVE audio device, both in the
+gameplay band:
+
+    off  raises=23481  trapped=231245/495072 = 46.7%  on=348 off=343
+    on   raises=305    trapped=2902/495184  =  0.59%  on=366 off=366
+         edge_suppressed=1105858  rearm=289
+
+rearm is the control that matters: suppressed climbing with rearm stuck at 0
+would mean the latch shut instead of cycling. It cycled 289 times.
+
+ACTION: make RECOMP_APU_IDLE_TRAP_EDGE default ON.
+
+A CLAIM I MADE AND HAVE TO WITHDRAW: I reported a crossover where the front
+end passes ~56% trapped and the output queue starves permanently. That does
+not survive. `trapped=` is a CUMULATIVE ratio -- the same trap
+ACCURACY_GAPS.md already flags -- and the one badly-starving run in the
+archive (a1-exec-walkers-tutorial-1) has trapped=0 throughout. Neither 340 s
+arm starved at all. The storm is real and worth removing; the starvation
+correlation was an artefact of reading a cumulative counter as instantaneous.
+
+
+=============================================================================
+4. THE SPEED
+=============================================================================
+
+DONE: fixed-function T&L on the GPU (RECOMP_METAL_FF). 62.8% of index slots --
+520 million of 829 million in one run -- were transformed on the CPU because
+only programmable-shader draws were GPU-shaded.
+
+    off  vsh draws 345065 GPU / 458142 CPU   vsh=5.17 submit=5.35 | 23.53 ms
+    on   vsh draws 783829 GPU /      0 CPU   vsh=1.60 submit=3.39 | 17.31 ms
+         438075 batches accepted, 0 left on the CPU
+         mean 58.6 -> 61.8 fps, p99 42.5 -> 39.5 ms
+
+CPU vertex shading is ELIMINATED. 6.2 ms off the frame, four times the
+predicted win, because submit dropped too once the per-triangle CPU work
+stopped. Gated by jsrf_ff_msl_diff_test: residual 0 over 15 states in both
+modes, injected fault firing in every one, accept-parity clean, anchored to a
+value measured from a real run. DO NOT ENABLE RECOMP_METAL_FF FOR A BUILD
+WHOSE TEST HAS NOT PASSED.
+
+CAVEATS: max frame went 72.4 -> 286.7 ms (almost certainly the one-time
+shader compile) and over-33ms rose slightly. Take a second run before calling
+p99 improved. And that A/B ran WITHOUT RECOMP_VSH_DP_ZERO, so it needs
+re-scoring against a config that matches the player's build (see section 6).
+
+NEXT AND LARGEST: the flip sync, 4.06-6.91 ms per frame, one call per frame,
+~70% of all sync cost despite being a third of the calls. The frame is
+serialised into submit -> stall the whole GPU -> read 614 KB back -> convert
+-> present, and it exists only because the presenter is OpenGL and reads the
+guest framebuffer out of guest RAM.
+
+THE NAIVE FIX IS DEAD AND THE CENSUS THAT KILLED IT IS WORTH KNOWING: the live
+Metal surface is NEVER the surface being flipped. Zero times, in two
+independent gameplay runs ([SURFACE-AUDIT], three counts that sum exactly). So
+"just present the Metal texture" would present the wrong surface on every
+frame. The design must look the FLIPPED address up in the surface cache.
+
+Staged design and patches for stages 0-2 exist. Stage 0 (the blit instrument)
+must land first because every later stage is verified with it.
+
+A CAVEAT ON THE PAYOFF: removing waitUntilCompleted removes the
+SERIALISATION, not the GPU work. Nothing in the tree records the flip sync's
+per-frame DISTRIBUTION, so it may move p50 and leave the p99 tail untouched. A
+per-frame sync histogram should precede the presenter change.
+
+
+=============================================================================
+5. PLAYER SPEED / "JUMPING AND FLOATING" -- UNRESOLVED, AND A LEAD
+=============================================================================
+
+The player reports the character jumping or floating. NOT DIAGNOSED. The
+leading candidate is the same dot-product defect as the fences: DP4 is what
+transforms POSITION, and a corrupted dot product hits position and texcoords
+alike. If RECOMP_VSH_DP_ZERO is defaulted on and the floating persists, that
+hypothesis is dead and the next place to look is the fixed-function transform
+chain -- but note the composite matrix already carries the viewport scale, so
+do not "fix" that (section 1).
+
+A SECOND OBSERVATION, AND A RETRACTION OF IT IN THE SAME BREATH. I reported
+that 161,586-260,714 triangles a run are dropped on screen for having exactly
+zero area, and ranked splitting that bucket as open item 1. THAT FIGURE IS AN
+ARTEFACT OF A NON-DEFAULT ARM. Both runs it came from set
+RECOMP_METAL_VSH=0, and on the GPU vertex path -- the default, and the
+player's build -- triangle() returns before area() is ever reached
+(nv2a_metal.m:3008-3009), so the counter only counts in the arm that has the
+rejection. Scene- and switch-matched on the DEFAULT path:
+
+    dp_off_1  collinear-distinct=162, of which 12 were on screen
+    dp_on_1   collinear-distinct=846, of which  9 were on screen
+
+Nine to twelve triangles a run, not a quarter of a million. This is CLAUDE.md's
+`N triangles fully off-surface` failure recurring on a different counter: a
+rejection counted only where the rejection happens. Do not spend a run on it.
+The area_rescued=0 negative is still correct for the CPU path and the counter
+is worth keeping; the framing was wrong.
+
+
+=============================================================================
+6. THE METHODOLOGICAL FAILURE THAT COST THE MOST, AND THE FIX
+=============================================================================
+
+THE HARNESS AND THE PLAYER'S BUILD WERE DIFFERENT SOFTWARE ALL DAY.
+
+The player's app reads ~/Library/Application Support/JSRF/paths.conf, which
+exports four switches. play_scripted.sh sets NONE of them unless the caller
+remembers. So scripted runs contained bugs the player's build did not, and
+lacked fixes it had. This is how the fence fix was nearly missed: most A/Bs ran
+with RECOMP_VSH_DP_ZERO absent, i.e. with the fence bug present, while the
+player's build had it fixed.
+
+It was caught only because the player watched a scripted run's window and
+said the symptom was back. That is not a repeatable way to find configuration
+drift.
+
+AN AUDIT OF EVERY CONCLUSION FROM TODAY HAS NOW BEEN DONE. The vblank A/B, the
+voice-list ring A/B, the idle-trap A/B and the no-room figure are all SAFE --
+arms verified to differ in exactly one token, both in a mission, held within a
+second of each other. Two are not:
+
+  - THE ALPHA-TEST ARM IS UNVERIFIABLE. RECOMP_METAL_NO_ALPHA_TEST prints no
+    state, so which arm ran cannot be recovered from the log, and three of its
+    four runs sat in the attract loop anyway. Give it a state print per
+    recomp_switch.h's own rule before using it again.
+  - THE DP_ZERO MATCHED PAIR EXISTS AND I SAID IT DID NOT. dp_off_1 and
+    dp_on_1 differ in that token and nothing else across 20 tokens, both scene
+    30, held 98.6 and 98.4 s. I wrote "the scripted A/B could not produce a
+    matched scene" and left a clean pair unscored.
+
+AND THE `on=` BAND IN CLAUDE.md IS DURATION-DEPENDENT. `on=` is cumulative, so
+a perfectly healthy 149 s run reads 81-125 and falls in neither the 148-453
+"gameplay" band nor the 4-12 "parked" one. Eight healthy arms today would have
+been voided by that rule. The reliable scene gate is the sequence state plus
+`held=`; `on=` is a voice-churn control and its band needs a run length
+attached.
+
+ACTION: make the harness's switch set EXPLICIT and REPORTED, and make any
+difference from paths.conf visible in the run's own log. Do not silently adopt
+the player's config -- an A/B must be able to differ deliberately -- the
+requirement is that a difference is never silent. Every conclusion from today
+should be re-checked for whether its arms had matching switch sets.
+
+
+=============================================================================
+7. INSTRUMENTS THAT LIE -- SIX FOUND TODAY, ONE OF THEM MINE
+=============================================================================
+
+  no-room=            no term for the INLINE_ARRAY path; quoted all day as
+                      "nothing is dropped" while covering 2 of 3 paths
+  texcoord-q=         fires for non-finite OR q<=0, and q<=0 is arithmetically
+                      impossible for 123 of 126 programs
+  fedec_hold          printed "on (default)" while defaulting to 0
+  g_pcrtc_windows     read 0 while the trap handler opened a window 60x/s
+  resident clears     counted one of two GPU paths, with the cost of the gap
+                      attached to it
+  [APU-SE] oneshot    a subtraction that is identically zero by construction.
+                      ADDED TODAY, BY ME, AND QUOTED AS A FINDING.
+
+Already in CLAUDE.md's known-bad list: `N triangles fully off-surface` is dead
+on every Metal run.
+
+AND ONE I BROKE: the [d3d8_gl] blit line no longer holds its exact-match
+property. It compares a guest pixel against the drawable centre and matched
+only while the drawable was an exact 1x the guest. It is now 4x on a 2x panel,
+where texel centres land on pixel boundaries, so NO choice of sample point can
+restore equality -- the fix is to compute the expected bilinear blend and
+compare with a 1 LSB tolerance. Stage 0 of the presenter work does this. Until
+then that line means "should be close", not "must be equal".
+
+
+=============================================================================
+8. THE V2 QUESTION -- ANSWERED: DO NOT REWRITE
+=============================================================================
+
+Our APU is 8,128 lines against upstream's 4,196. The voice processor is 3,963
+against 1,247, so 68% of it is ours -- and I used that to argue the bugs were
+ours. THAT WAS BACKWARDS. Checked defect by defect against merge-base 051a128,
+every UNFIXED defect is inherited verbatim: the ADPCM stack smash, the ignored
+return value, the VOICE_ON race, the dead segment fields, the HRTF submix
+override, the GP/EP stub. The only defect that was ours is the voice-list ring,
+and it is fixed.
+
+And the +2,716 is not accretion: 55.5% is comment, most of the rest is
+instrumentation, and actual behaviour change is about 272 lines across three
+functions, each behind an A/B lever.
+
+The missing capability is a wider MIXDOWN, not a different shape -- about 20
+lines inside an existing signature. A rewrite would discard unusually good
+instrumentation and reach no current bug.
+
+THE ONE FINDING THAT WOULD JUSTIFY A REWRITE, stated so it can be tested: if
+the VOICE_ON / frame-thread race survives widening the device lock over the
+VOICE_ON body, then guest RAM is the wrong home for the voice register file
+and the voice processor needs the shadow this tree deliberately avoided.
+
+
+=============================================================================
+9. OPEN, RANKED
+=============================================================================
+
+ 1. Verify the HRTF bin gate restores effect audio ([APU-BIN] 3D heard > 0
+    with 2D heard still moving), then widen the mixdown if the guest's own
+    routing also lands above bin 1. Section 2.
+ 2. Default RECOMP_VSH_DP_ZERO and RECOMP_APU_IDLE_TRAP_EDGE. Both are
+    evidence-complete. Sections 1 and 3.
+ 3. Make the harness report its switch set and diff it against paths.conf, and
+    re-score today's A/Bs for matched arms. Section 6.
+ 4. The player's floating/jumping. Section 5. The leading candidate is the
+    same dot-product defect as the fences, since DP4 transforms position.
+ 5. The flip sync: stage 0 (blit instrument), then the census, then the
+    presenter. Section 4.
+ 6. Retire or fix [APU-SE]; add a positive control. Section 7.
+ 7. ADPCM: 19,465-108,074 decode failures a run emitting stack memory as audio
+    at full scale. Counters are in, the repair is behind
+    RECOMP_APU_ADPCM_GUARD. The stack smash is clamped unconditionally and is
+    measured LATENT (oversize=0 everywhere).
+ 8. Widen the device lock over the VOICE_ON body -- and if the race survives,
+    see section 8.

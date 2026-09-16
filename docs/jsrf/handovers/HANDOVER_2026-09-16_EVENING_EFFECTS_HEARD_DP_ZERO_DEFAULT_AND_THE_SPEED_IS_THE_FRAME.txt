@@ -1,0 +1,59 @@
+HANDOVER 2026-09-16 (evening) -- EFFECTS ARE HEARD, DP_ZERO IS THE DEFAULT,
+AND THE PLAYER'S SPEED COMPLAINT IS THE FRAME TIME
+
+Addendum to HANDOVER_2026-09-16_FENCES_SOUND_FX_AND_SPEED_WHAT_IS_ACTUALLY_WRONG.
+Read that first; this only records what changed after it.
+
+1. SOUND EFFECTS -- VERIFIED. The guest's own V0BIN..V3BIN route the 3D voices
+   to bins 6-10 (the HRTF gate default already skipped the override; the bins
+   were the guest's). RECOMP_APU_MIXDOWN_ALL (apu_dsp.c, default ON) sums all
+   32 bins. Scripted gameplay run verify-effects-3, 150 s, live audio, scene 30
+   held 98 s:
+       [APU-BIN] 2D heard=134358 lost=0 | 3D heard=713784 lost=0 | mixdown=all
+       [APU-PACE] starved=0 empty=0 min_queued=6144 bytes
+   THE INSTRUMENT HAD TO BE FIXED FIRST: [APU-BIN]'s "audible" hard-coded bins
+   0 and 1, so the first run after the widening read 3D heard=0 lost=343968
+   with the effects playing. It now asks mcpx_apu_mixdown_all() and prints
+   mixdown=all|0-1. Seventh lying instrument of the day.
+
+2. RECOMP_VSH_DP_ZERO DEFAULTS ON (nv2a_vsh.c). Only the literal =0 turns it
+   off; the [VSH] state line still prints. jsrf_vsh_msl_test pins =0 because
+   its text expectations describe the plain-dot() emitter; the ON emitter is
+   covered numerically by jsrf_vsh_msl_diff_test. ctest 35/35 on this build.
+
+3. BUNDLE: ~/jsrf-build/JSRF.app rebuilt 16:11 from build-feav
+   (md5 7f2d3adc...). The previous bundle (15:29) predated the mixdown and the
+   instrument fix. The player's only session log since is stamped 15:09, so
+   every player report received this evening is about a build with NONE of
+   the above.
+
+4. "SOUND STILL BREAKS OVER TIME" -- the player's 15:09 log: no edge code
+   (zero rearm= lines), trapped=160308/254680 (63%), idle_trap=16220 on two
+   voices, and the output queue dry at the end (starved=17 min_queued=0). That
+   is the level-triggered storm the edge fix removes, and the fix was ABSENT
+   from that session -- so the 15:4x "total silence" backout in paths.conf
+   cannot have been observed with the fix present. Re-enabled in paths.conf
+   with that reasoning written beside it. If total silence recurs on the 16:11
+   bundle, last-run.log now carries rearm=; copy it before relaunching.
+
+5. "PLAYER SPEED IS WRONG" -- the 15:09 log has vsh_dp_zero on, so the DP4
+   hypothesis from section 5 of the previous handover is DEAD. The tree
+   already knows the mechanism (HANDOVER_..._SIXTY_FPS_AND_THE_PICTURE_IS_RIGHT
+   line ~190, kernel_bridge.c BRIDGE_VBLANK_PERIOD_US): a late vblank poll
+   DROPS the periods it missed, so game speed = 16.683 ms / mean frame. The
+   player's session: [FRAME] mean 18.14 ms (92%), with [FRAME-WIN] windows at
+   30-49 fps (50-80% speed). A jump in a 40 ms frame window plays at half
+   speed: that is "floating". Two levers, one taken:
+     - RECOMP_METAL_FF=1 added to paths.conf (23.53 -> 17.31 ms measured;
+       jsrf_ff_msl_diff_test passed on this build, which is the stated
+       precondition).
+     - The flip sync (previous handover section 4) is still the largest
+       remaining per-frame cost and is unchanged.
+   A THIRD OPTION NOT TAKEN: deliver missed vblank periods instead of dropping
+   them. kernel_bridge.c chose dropping deliberately ("one late vblank, not
+   five at once") and the drop is what makes the frame rate the game speed.
+   A catch-up mode capped at 2 periods would hold speed at the cost of
+   stutter; it is a switch worth building and measuring, not a default.
+
+6. OPEN (carried): harness switch reporting (prev. sec. 6), retire [APU-SE]
+   oneshot (prev. sec. 7), flip sync stage 0, ADPCM guard, VOICE_ON lock.

@@ -1,5 +1,8 @@
 # Goals — 13 Sep 2026: the tutorial is the last gate, and it is one question wide
 
+> Superseded, 16 September 2026. The active list is
+> `JSRF_GOALS_2026-09-16_EVERYTHING_ON_THE_GPU.md`. Kept for the history.
+
 Supersedes `JSRF_GOALS_2026-09-12_CAN_WE_DO_IT.md` on ordering. Its framing was
 "one gate (the tutorial jump) and a renderer residency step"; the gate is now
 located to two predicates and the black screen that stood in front of it is

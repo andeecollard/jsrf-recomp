@@ -1,0 +1,258 @@
+HANDOVER 2026-09-16 (night) -- THE LATCH, THE GLYPHS, AND "I WANT EVERYTHING
+ON THE GPU"
+
+Read CLAUDE.md, then HANDOVER_2026-09-16_FENCES_SOUND_FX_AND_SPEED_WHAT_IS_
+ACTUALLY_WRONG.txt, then HANDOVER_2026-09-16_EVENING_EFFECTS_HEARD_DP_ZERO_
+DEFAULT_AND_THE_SPEED_IS_THE_FRAME.txt. This supersedes the evening one where
+they disagree, and they disagree about the idle-trap edge: the evening one
+re-enabled it and was wrong.
+
+The player's standing instruction: EVERYTHING ON THE GPU. RECOMP_METAL_FF is
+the goal state, not an experiment. It is off in paths.conf tonight only
+because it drew corrupt glyphs; the job is to fix the glyphs, not to leave
+the switch off.
+
+
+=============================================================================
+0. STATE OF THE WORLD AT HANDOVER
+=============================================================================
+
+Bundle: ~/jsrf-build/JSRF.app built 16:11 from build-macos/jsrf-first-fault/
+build-feav (jsrf_first_fault md5 7f2d3adc...). ctest 35/35. In it:
+  - RECOMP_VSH_DP_ZERO default ON (fences: FIXED, player-confirmed on this
+    bundle).
+  - RECOMP_APU_MIXDOWN_ALL default ON (effects: AUDIBLE, player-confirmed).
+  - [APU-BIN] "audible" follows the mixdown and prints mixdown=all|0-1.
+
+Player's paths.conf (~/Library/Application Support/JSRF/paths.conf):
+  PMC_UPMIRROR=1, SELFLINK_END=1, LIST_MOVE_TO_FRONT=1, VSH_DP_ZERO=1
+  (redundant), IDLE_TRAP_EDGE commented out (see 2), METAL_FF=0 (see 3).
+  Every change has its evidence written beside it in that file.
+
+Player reports, in order, tonight:
+  16:1x  "sound fx working, fences fixed. No music"        (edge ON, FF ON)
+  16:23  screenshot: Gum's tutorial text, 'w' in "how" and 'y' in "you"
+         corrupt, everything else clean. "Soundfx cut off"  (edge ON, FF ON)
+  16:2x  "I want everything on the gpu"
+
+Player logs copied to the session scratchpad; the live one is
+~/Library/Application Support/JSRF/last-run.log (overwritten on launch).
+The 16:22-16:28 log is the edge-ON, FF-ON session and is the evidence for
+sections 2 and 3. COPY IT before the player relaunches if it is still there.
+
+
+=============================================================================
+1. FIXED TONIGHT, WITH THE EVIDENCE
+=============================================================================
+
+FENCES. RECOMP_VSH_DP_ZERO defaulted on in nv2a_vsh.c; only the literal =0
+turns it off; [VSH] still prints the state. jsrf_vsh_msl_test pins =0
+because its text expectations describe the plain-dot() emitter. Player: "fences
+fixed".
+
+EFFECTS. Guest routes 3D voices to bins 6-10 (its own V0BIN..V3BIN, the HRTF
+override gate was never the point); the DSP summed bins 0-1 only. apu_dsp.c
+RECOMP_APU_MIXDOWN_ALL (default on) sums all 32. Scripted verify-effects-3,
+scene 30 held 98 s, live audio: 3D heard=713784 lost=0, 2D heard=134358
+lost=0, starved=0. Player: "sound fx working".
+
+THE INSTRUMENT LIED FIRST: [APU-BIN] hard-coded "audible = bin 0 or 1", so
+the first post-widening run read 3D heard=0 lost=343968 with effects playing.
+Fixed to ask mcpx_apu_mixdown_all(). Seventh lying instrument of the day.
+
+
+=============================================================================
+2. NO MUSIC + EFFECTS CUT OFF -- ONE DEFECT, AND IT IS THE IDLE-TRAP EDGE
+=============================================================================
+
+THE EVIDENCE (player session 16:22-16:28, idle_edge on, 37 report windows):
+
+  [APU-BIN] 2D heard: 0, 2560, 19988, 29597, 29597, 29597 ... 29597 (x31)
+            3D heard climbing the whole time (234045 at the end)
+  [APU-IDLE-EDGE] edge_suppressed=1010411 rearm=51
+  [APU-IDLE] first raises: 2D:v69 2D:v68 2D:v69 3D:v0 2D:v68 2D:v70 ...
+             then 24 raises total over the whole session (level arm: 16220)
+  [APU-VOICE] on=98 off=94 off_commands=94 idle_trap=65
+  [APU-PACE] starved=0 empty=0 -- the output queue never ran dry
+
+Music (2D, v68-v70) fell silent ~20 s in and never returned. Effects kept
+playing but the player heard them cut off.
+
+off == off_commands == 94: EVERY retirement was a guest VOICE_OFF command.
+Zero model retirements (EOS, SSL exhaustion, envelope release). The music
+voices did not run off the end of anything; the GUEST stopped them, and they
+then sat "inactive and still linked" -- the state the level trap storms on
+and the edge trap reports exactly once.
+
+WHAT THE GUEST DOES WITH THE RAISE. Xbox DirectSound uses SE2FE_IDLE_VOICE to
+run RemoveIdleVoice (the crash at 351439b is that function): it is how the
+driver RECLAIMS a voice for its free list. Three early returns (PERSIST among
+them) leave the voice linked and expect to be told AGAIN later. So:
+
+  level trap  -> told 1500x/s -> reclaim works, storm costs the breakup
+  edge trap   -> told once, at a moment the ISR returns early -> never
+                 reclaimed -> free list empties -> new sounds STEAL playing
+                 voices -> "effects cut off" -> a music voice is stolen ->
+                 "no music" at ~20 s, permanently
+
+That single mechanism produces both reports, in that order, and predicts the
+2D-heard plateau. It is a hypothesis with a test, not a measurement:
+
+  TEST: in the edge-ON log, count VOICE_ON on a handle whose last event was
+  VOICE_OFF within the same report window, per handle, over time. Steals show
+  as the pool (distinct handles started) shrinking to a handful being
+  recycled at high rate from ~20 s on. The level-arm log should show a stable
+  pool. [APU-IDLE-RING] and the voice_lifecycle_note() "retire" notes are the
+  raw material; nothing prints the pool size yet -- add it ([APU-POOL]
+  distinct handles on'd this window, handles reused within 1 window).
+
+WHY IT CYCLED IN THE SCRIPTED ARM AND NOT FOR THE PLAYER: rearm=289 over
+340 s came from a scene where the guest kept restarting the same handles
+(rearm site B: any voice seen ACTIVE again re-arms). The tutorial the player
+sits in does not; its music voices are stopped once and left. The edge arm
+was validated on a scene that could not fail this way.
+
+THE FIX IS NEITHER ARM. Both are wrong for the same reason: the model does not
+know when the guest has FINISHED with the notification, so it either nags
+forever or gives up after one. Two candidate fixes, in order:
+
+  A. EDGE WITH A BOUNDED RE-RAISE (recommended first; ~30 lines, one switch).
+     Keep the edge latch. When a latched voice is still inactive-and-linked
+     N ms after its raise, raise again and restart the timer. N = one guest
+     DirectSound tick (RECOMP_APU_IDLE_TRAP_REARM_MS, try 16 then 33). Worst
+     case per stuck voice: 60 raises/s instead of 1500; music voices get
+     told again until reclaimed. Verify: 2D heard keeps climbing for the
+     whole player session, edge_suppressed and rearm both climbing, [APU-POOL]
+     stable, trapped% under 5.
+     Site: the suppress branch at apu_vp.c ~3925 (add a per-voice last-raise
+     timestamp beside g_idle_trap_reported[]); the timestamp store is the same
+     unlocked plain-store class as the bitmap, same justification.
+
+  B. RAISE ONLY FOR MODEL RETIREMENTS, NOT GUEST VOICE_OFF (the hardware
+     question). Whether the DSP raises idle for a voice the driver itself
+     stopped is not known here. Do NOT take this on argument: with
+     off == off_commands the guest's own stops are 100% of retirements in the
+     tutorial, so B silences the notification entirely for that scene and
+     the pool test above will say within a minute whether the guest survives
+     it. Build only if A fails.
+
+  ALSO CHECK, CHEAPLY, BEFORE A: does the latch set on a raise that was
+  ATTEMPTED or one that was DELIVERED? [APU-VOICE2] raises_minus_idle_trap=0
+  says the two counters agree, but if the FE can refuse a raise (the vblank
+  path has raised != delivered) and g_idle_trap_reported is set on the
+  attempt, the guest never saw the one raise the edge allowed. Read where the
+  bit is SET (grep "g_idle_trap_reported\[.*\] |=") and what can fail after
+  it.
+
+DO NOT RE-ENABLE RECOMP_APU_IDLE_TRAP_EDGE for the player as it stands. It
+has now silenced the music twice, once with the log to prove it.
+
+
+=============================================================================
+3. THE GLYPHS -- RECOMP_METAL_FF DRAWS TWO WRONG CHARACTERS
+=============================================================================
+
+Screenshot 16:23 (tutorial, "Let's see how much air you can grab. Press the
+"A button" to jump."): the 'w' of "how" is a doubled/stretched shape, the 'y'
+of "you" reads as another glyph ('$'-like). ~40 other characters, the
+speech-bubble, the button glyph, the world: all correct. Positions correct;
+TEXCOORDS of two glyphs wrong by a whole atlas cell, not a texel.
+
+The same scene on the CPU fixed-function path draws clean text (every player
+session before tonight). RECOMP_METAL_FF is the only rendering switch that
+changed. Its stats line in the session: 765211 batches accepted, 0 on the
+CPU, 0 texgen, 0 texmat anomalies.
+
+RULED OUT BY READING (do not re-read these; go to the experiment):
+  - The emitter's arithmetic: texgen pass-through `g.k = v9+u.k`, optional
+    texmat ff_dot4 per row, same as nv2a_ff_vertex; the diff test's residual
+    is 0 over 15 states and the texmat states are among them.
+  - The input side: GPU FF fetches attrs in key->inputs (0x1E19: pos, D0,
+    D1, T0-3, + normal if read) with the same fetch_vertex and the same
+    s_vsh.current defaults for unsized attributes as the CPU branch.
+  - The constants: nv2a_metal_vsh_constants stores a POINTER to
+    nv2a_ff_constants, which nv2a_ff_params rewrites per batch. Harmless
+    only because nv2a_metal_draw is called per batch (nv2a_pb_exec.c:3432)
+    and setVertexBytes copies at encode. Cheap hardening: memcpy at the
+    call. Not the glyph bug unless a draw is ever deferred.
+  - Cache key collision: keysize 32 = 2 hash words, full memcmp after the
+    hash, version byte in the key.
+
+NOT RULED OUT -- THE DIFFERENCES THAT REMAIN BETWEEN THE TWO PATHS:
+  a. WHAT THE DIFF TEST NEVER FED: a real text batch. make_inputs() is
+     synthetic. Two glyphs wrong out of forty means those glyphs' BATCHES
+     differ from the others' in some state (a second font page, a texmat
+     enabled just for them, a different attribute layout such as texcoords
+     supplied as shorts or as the SET_VERTEX_DATA "current" register rather
+     than an array). The CPU path handles that state; the GPU path
+     mishandles it. The per-batch key/state of the failing glyphs is the
+     fact that decides this, and nothing captures it yet.
+  b. The FF epilogue omits the programmable path's subpixel snap. Cannot
+     produce a whole-cell texcoord error; listed so nobody spends a run on it.
+  c. Fragment-side q handling for the FF-produced oT (float4 with q from the
+     current register when the array is 2-wide). If q != 1 for exactly those
+     glyphs' vertices, the divide moves the sample by a cell. Same fetch on
+     both paths, so only possible if the CPU sink divides by q differently
+     from the GPU-vertex sink (nv2a_metal.m:2846 area).
+
+THE EXPERIMENT (one evening, no argument):
+  1. Reproduce unattended: play_tutorial.sh reaches this text (state 61/65
+     per its header; needs a real pad -- or the gameplay.pad schedule if it
+     passes through the tutorial text; check the [JSRF-SEQ] dwell).
+     frame_bisect.sh captures pictures; capture the text frame with
+     RECOMP_METAL_FF=0 and =1. Confirms the switch, gives a pixel diff.
+  2. Add RECOMP_FF_BATCH_DUMP=<n>: for FF batches whose texture is the font
+     page (or simply the first 200 FF batches after the [JSRF-SEQ] state
+     that shows the text), print key bytes, texmat enables, attr sizes/types
+     for 0,3,9..12, s_vsh.current[9..12], the first 4 vertices' inputs, and
+     in the CPU arm the CPU outputs oT0. One line per batch. Both arms.
+  3. Diff the two arms' dumps for the glyph batches. Whichever field differs
+     between the good glyphs and the bad ones is the defect. Then add that
+     exact batch as state 16 of jsrf_ff_msl_diff_test so it cannot regress.
+  4. Only then re-enable RECOMP_METAL_FF in paths.conf, and after the
+     player confirms clean text, make it the DEFAULT -- "everything on the
+     GPU" is the instruction.
+
+Frame time is why this matters beyond text: the game is frame-locked
+(speed = 16.683 ms / mean frame), METAL_FF is worth 6 ms, and the player's
+speed complaint is the frame time. See the evening handover, section 5.
+
+
+=============================================================================
+4. SPEED (unchanged from the evening handover, restated so it is not lost)
+=============================================================================
+
+Player's 15:09 session: [FRAME] mean 18.14 ms = 92% game speed, windows at
+30-49 fps = 50-80%. The 16:2x session with METAL_FF on: mean 15.44 ms
+(64.8 fps), p99 39.5 ms, over-33ms=209 of 6154. Better mean, same tail.
+Levers, in order: METAL_FF (blocked on section 3), the flip sync (previous
+handover section 4, staged, stage 0 first), then a capped vblank catch-up
+switch (kernel_bridge.c BRIDGE_VBLANK_PERIOD_US comment explains why dropping
+was chosen; a cap of 2 would hold speed at the cost of stutter -- measure,
+do not default).
+
+
+=============================================================================
+5. OPEN, RANKED
+=============================================================================
+
+ 1. Section 2 fix A (bounded re-raise) + the [APU-POOL] instrument + the
+    latch set-on-attempt check. Music and effects both ride on it.
+ 2. Section 3 experiment, then METAL_FF back on, then default.
+ 3. Harness switch reporting and paths.conf diff (still not done; tonight's
+    scripted arm set its switches by hand in a script in the scratchpad).
+ 4. Retire [APU-SE] oneshot (identically zero by construction).
+ 5. Flip sync stage 0. ADPCM guard (fail=15529 this session). VOICE_ON lock.
+
+MISTAKES TONIGHT, SO THEY ARE NOT REPEATED:
+  - Re-enabled the edge from a log that predated the silence report instead
+    of asking for the log of the silent session. The 15:09 log was the only
+    one on disk because last-run.log is overwritten per launch. When a
+    report and a log disagree on time, the log is not the evidence.
+  - Enabled METAL_FF for the player on a test that scores positions, and
+    called the test "the stated precondition". It was; it was also not a
+    test of texcoords. A player-facing default needs a picture, not a
+    residual.
+  - A post-/clear task notification looked like a concurrent session for
+    twenty minutes. It was this session's own pre-clear run (memory:
+    jsrf-clear-keeps-background-tasks).

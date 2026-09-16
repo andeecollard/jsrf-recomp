@@ -1,0 +1,184 @@
+BUG HUNT 2026-09-16 (night) -- I CLAIMED FOUR PER CENT OF THE SIMULATION WAS
+DROPPED IN THE INTERRUPT PATH. IT IS NOT. READ SECTION 0 FIRST.
+
+=============================================================================
+0. THE RETRACTION, WRITTEN BEFORE THE CLAIM SO NOBODY ACTS ON THE CLAIM
+=============================================================================
+
+Sections 1 and 3 below argue that 4.4% of vblank raises never reach the guest
+and that recovering them is worth ~4% of game speed. I built the recovery
+(RECOMP_IRQ_RETRY_PENDING) and measured it. THE HYPOTHESIS IS REFUTED.
+
+Scene-matched gameplay pair, 130 s each, held 82.5 s and 82.3 s:
+
+                    off        on
+    delivered Hz   55.4      101.0     <- hardware rate is 59.94
+    raised         7694      7751
+    delivered      7199     13131      <- EXCEEDS raised by 5,380
+    frame mean    15.83     15.84 ms
+    fps            63.2      63.1
+    p99            39.0      39.5 ms
+
+The guest's vblank ISR ran at 101 Hz against a 59.94 Hz hardware rate, and
+the frame time did not move at all. So the deferred raises were never lost
+work: xbox_Nv2aRaiseVblank() has ALREADY asserted the PCRTC source by the
+time the delivery is refused, and the ISR that is still running sees and
+acknowledges it. Re-delivering afterwards hands the guest a SECOND tick for
+one assertion. The switch does not recover a missed step, it manufactures an
+extra one -- which would run the game FAST, and burns CPU for nothing.
+
+WHICH MEANS delivered= WAS NEVER A MEASURE OF SIMULATION STEPS. It counts ISR
+ENTRIES, and one entry can service more than one assertion. "delivered <
+raised" is therefore not evidence of lost work, and section 1's whole
+arithmetic -- 446 raises lost, 95.8% game speed -- rests on reading it as if
+it were. Do not repeat that reading.
+
+AND THE 5% THAT LOOKED LIKE A WIN WAS NOISE. The first A/B of this switch
+showed 59.4 fps off against 62.4 on, which I nearly reported as a result. The
+second pair's OFF arm read 63.2 fps. One run per arm cannot see a 5% effect
+on this host; two arms of one run each is what this project's own rules call
+a lean, not a measurement.
+
+RECOMP_IRQ_RETRY_PENDING stays in the tree at default OFF with this table
+beside it, because the mechanism is sound and cheap and the next person will
+otherwise re-derive it from the same false premise. Turning it on is a
+correctness regression, not a speed fix.
+
+WHAT SURVIVES from the hunt below: section 2 is still true and still worth
+fixing (g_vector_pending has no production reader, so its "Pending, not
+dropped" comment is false). Section 4 is a verified negative worth keeping.
+Section 5's instrument gap is real, and I then added a seventh instrument of
+my own that lied -- see section 6.
+
+=============================================================================
+6. AND I BUILT ONE THAT LIED, IN THE HOUR I WROTE UP TWO OTHERS
+=============================================================================
+
+The first measurement of this switch printed "retry_queued=5862
+retry_delivered=5862" beside a delivered= that had not moved: 55.7 Hz against
+56.0. I read the frame rate rising 5% in the same pair and reached for an
+explanation -- the retries are reaching the guest, the counter cannot see
+them -- which was TRUE about the counter (g_vblank_delivered is incremented
+only at bridge_vblank_poll's own call site) and WRONG about the conclusion.
+Fixing the counter is what produced the 101 Hz that refuted the whole thing.
+
+The lesson is not "fix the counter". It is that I had a number that did not
+fit, and my first move was to find a reason the number was wrong rather than
+a reason the hypothesis was. The counter WAS wrong. The hypothesis was too.
+
+A read-only hunt through the SPEED path (goal G3), which no review had
+touched. Two verified defects, one instrument gap, and one assumption checked
+and found SOUND. Nothing here is fixed yet; each has its evidence and its
+shape.
+
+THE PLAYER'S TARGET: "We want to hit 60fps and for the player to move at the
+correct speed." On this title those are one number, and this hunt found a
+second, INDEPENDENT four per cent that has nothing to do with frame time.
+
+
+=============================================================================
+1. A VBLANK THAT ARRIVES WHILE ITS OWN ISR IS RUNNING IS DROPPED FOREVER
+=============================================================================
+
+MEASURED, player session 16 Sep 2026:
+
+    [VBLANK] delivered=9724 (raised=10170 retried=9) over 170097 ms
+             = 57.2 Hz (target 59) deadlines=10190 unacked_skips=12
+             max_gap=35 ms not_ready=0
+
+    deadlines   59.75/s   -- the SCHEDULE is very nearly right
+    delivered   57.20/s   -- what the guest's ISR actually ran
+    lost        446 raises, 4.4%
+
+The guest advances its simulation one step per vblank event (its vsync pump
+waits on the event D3D's own ISR signals), so 4.4% of raises never reaching
+guest code is 4.4% of simulation steps that never happen: ~95.8% game speed
+BEFORE any frame-time effect is counted. That is on top of the frame-locked
+loss the earlier handovers describe, not part of it.
+
+WHERE THEY GO. bridge_irq_decide returns XBOX_IRQ_DEFER_VECTOR when the same
+vector is already in service anywhere in the process, and
+bridge_deliver_isr_ex then returns 0. defer_irql and defer_reentry are both
+measured ZERO in that session and not_ready is 0, so essentially all 446 are
+this one branch: a vblank raised while the previous vblank ISR had not yet
+returned. [IRQ] reports deferred vector=7978 across all vectors, which is
+where they are counted -- but not on the line a reader checks.
+
+WHY IT IS A DEFECT AND NOT HARDWARE BEHAVIOUR: on the real machine the PCRTC
+interrupt stays ASSERTED until the driver acknowledges it at the source. It
+does not evaporate because the CPU is busy in the previous handler; it is
+taken when the handler returns. This model drops it.
+
+
+=============================================================================
+2. "PENDING, NOT DROPPED" IS FALSE -- NOTHING EVER RE-DELIVERS
+=============================================================================
+
+The IRQL branch of the same function reads:
+
+    /* Pending, not dropped. The pumps revisit every connected vector on a
+     * timer, so this is retried within one period once IRQL drops. */
+    InterlockedExchange(&g_vector_pending[slot], 1);
+
+g_vector_pending has EXACTLY these uses in the whole tree:
+    3094  set here
+    3096  counted, for a peak statistic
+    3134  cleared after a successful delivery
+    3169  read by xbox_IrqTestPending  -- a TEST accessor
+    3191  counted in xbox_ReportIrqDelivery
+    3183  cleared by xbox_IrqTestReset -- a TEST hook
+
+There is no production reader. Nothing re-runs the deferred interrupt. What
+the comment calls a retry is only the NEXT period raising its own, separate
+vblank -- which is a different simulation step, not a recovery of the missed
+one. The flag is decoration and the comment asserts a mechanism that does not
+exist.
+
+It happens not to cost anything today because defer_irql measures 0 in
+gameplay. It is still a false comment guarding a real hole, and it is the
+reason the DEFER_VECTOR branch above was written to just drop: the author
+believed one of these branches queued.
+
+
+=============================================================================
+3. THE FIX, AND WHY IT IS BOUNDED
+=============================================================================
+
+Give the vector deferral what the IRQL branch pretends to have, and give the
+pending flag a production consumer: on a deferral, set pending; when an ISR
+completes and clears in_service, re-deliver any vector whose pending bit is
+set. The flag is ONE BIT per vector, so a storm coalesces into a single
+retry -- it cannot burst, which is the failure mode the vblank scheduler's
+own comment (BRIDGE_VBLANK_PERIOD_US, "a title that misses a frame should see
+one late vblank, not five at once") is written to avoid.
+
+Behind RECOMP_IRQ_RETRY_PENDING, default off until measured, with the arms
+scored on [VBLANK] delivered/elapsed against 59.94 and on [FRAME]. The
+prediction is sharp and falsifiable: delivered should move from 57.2 Hz
+toward 59.75 (the deadline rate), and the game should get ~4% faster with NO
+change in frame time. If delivered rises and the frame rate does not, the
+guest was never the bottleneck and this is not where the speed went.
+
+
+=============================================================================
+4. AN ASSUMPTION CHECKED AND FOUND SOUND
+=============================================================================
+
+bridge_irq_decide's recursion guard is documented "only for THIS thread".
+g_dispatch_depth is declared RECOMP_TLS, so it genuinely is per-thread and a
+long ISR on one thread cannot block delivery on another. Checked because a
+plain static there would have produced dropped interrupts with exactly the
+signature above. It is correct; do not re-examine it.
+
+
+=============================================================================
+5. THE INSTRUMENT GAP
+=============================================================================
+
+[VBLANK] prints delivered, raised, deadlines, unacked_skips and not_ready.
+In the session above those name 12 of the 446 missing deliveries. The other
+434 are only visible by opening [IRQ] and knowing that its cross-vector
+"deferred vector=" total includes the NV2A. Print the per-vector deferral on
+the [VBLANK] line, so "raised minus delivered" is always accounted for where
+it is read. This is the same class as every instrument this project has had
+to retire: a number that looks complete and is not.

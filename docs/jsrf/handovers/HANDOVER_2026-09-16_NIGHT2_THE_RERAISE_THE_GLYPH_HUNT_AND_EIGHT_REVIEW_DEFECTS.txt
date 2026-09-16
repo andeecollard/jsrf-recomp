@@ -1,0 +1,277 @@
+HANDOVER 2026-09-16 (night, second) -- THE RE-RAISE WORKS, THE GLYPH IS RARE
+AND TIMING-DEPENDENT, AND A REVIEW FOUND EIGHT MORE
+
+Read CLAUDE.md, then docs/jsrf/goals/JSRF_GOALS_2026-09-16_EVERYTHING_ON_THE_GPU.md
+(the active goal list), then the three earlier 16 Sep handovers. This one
+supersedes HANDOVER_2026-09-16_NIGHT_THE_LATCH_THE_GLYPHS_AND_EVERYTHING_ON_THE_GPU
+where they differ: that one proposed the bounded re-raise, this one measures it.
+
+THE PLAYER'S TARGET, IN THEIR WORDS: "I want everything on the gpu", and
+"We want to hit 60fps and for the player to move at the correct speed".
+On this title those are one number -- a late vblank drops its period, so game
+speed = 16.683 ms / mean frame.
+
+
+=============================================================================
+1. THE MUSIC AND THE EFFECTS -- FIXED, AND THE FIX IS IN THE REARM CONDITION
+=============================================================================
+
+Neither trap arm was ever right. Level: the guest is told 1500x/s and the
+music breaks up. Edge: it is told once, and if that once lands while its ISR
+takes an early return the voice is never reclaimed, the free list empties, and
+new sounds STEAL playing voices -- effects cut off, then the music.
+
+THE EVIDENCE FOR THE STEAL, from the player's 16:22 session (edge, no re-raise):
+    [APU-BIN] 2D heard froze at 29597 twenty seconds in; 3D kept climbing
+    [APU-IDLE-EDGE] edge_suppressed=1010411 rearm=51
+    [APU-VOICE] on=98 off=94 off_commands=94   <- EVERY retirement was a guest
+                                                  VOICE_OFF; nothing ran off
+                                                  the end of anything
+
+THE FIX: RECOMP_APU_IDLE_TRAP_REARM_MS (default 16, =0 restores the pure edge).
+The edge latch stands, and a voice still inactive-and-linked one guest tick
+after its raise is raised again. 60 raises/s per stuck voice instead of 1500.
+
+MEASURED, scripted mission run, 150 s, live audio, scene 30 held 90 s:
+
+    level (edge off)   trapped 53%    raises 11731   2D heard 134358
+    pure edge          trapped 0.6%   MUSIC DEAD in the player's session
+    edge + re-raise    trapped 3.6%   raises 1467    2D heard 203741
+                       reraise=1387 rearm=70 starved=0 effects lost=0
+
+2D heard is the positive control and it is now the HIGHEST of the three arms.
+Enabled in the player's paths.conf with that table beside it.
+
+NEW INSTRUMENT: [APU-POOL] distinct= per window, on_active= and reuse=
+cumulative. on_active is a VOICE_ON for a handle that was still playing, i.e.
+the theft itself. It read 0 in the fixed arm. If the music ever dies again,
+that is the line to read first.
+
+
+=============================================================================
+1b. AND THEN THE PLAYER'S 18:33 SESSION FROZE 2D HEARD ANYWAY
+=============================================================================
+
+The player played the re-raise build (bundle 17:19, metal_ff on, idle_edge on,
+detectors on) for ~170 s. The re-raise MECHANISM worked: reraise=6219,
+rearm=136, [APU-POOL] on_active=0 -- no voice theft, the latch cycling. And
+yet:
+
+    window   2D heard    3D heard   cycles  selflink-term  trapped
+      8        95324       36446       0           0          321
+      9        95324       36446       0           0         1271   <- 2D stops
+     22        95324      301950      44       65115        18502
+     33        95324      614294      44      138045        26186
+
+2D heard froze at window 9 and never moved again; 3D climbed to 614,294.
+
+WHAT THIS RULES OUT, AND IT RULES OUT MY OWN TWO FAVOURITE ANSWERS:
+  - NOT the voice-list cycle. walks_with_a_cycle stays 0 until window 22,
+    THIRTEEN windows after the freeze.
+  - NOT the self-link guard cutting the tail off. terminated= is 0 until
+    window 13, four windows after.
+  - NOT voice theft. on_active=0 for the whole run.
+  - NOT starvation. starved=0, min_queued 6144 bytes throughout.
+  - NOT the ADX music thread. [ADX] ticked to 11,485, flag=0, never stuck.
+
+WHAT IT DOES NOT RULE OUT, AND THIS IS THE OPEN QUESTION: whether the player
+could HEAR music in that session. 2D heard counts subframes in which a 2D
+voice produced a non-zero amplitude. It reads zero both when we have lost the
+music and when the GUEST is not playing any -- a menu, a cutscene, a stretch
+of the game with no BGM. Nothing in the log distinguishes those, and neither
+do I. ASK THE PLAYER BEFORE INVESTIGATING FURTHER; if they heard music
+throughout, this table is a scene, not a defect, and [APU-BIN] needs a
+positive control that says "the guest asked for a 2D voice and we dropped it"
+rather than "no 2D voice made a sound".
+
+ONE REAL SIGNAL IN THE SAME LOG, INDEPENDENT OF THAT QUESTION: voice 1 raised
+4,063 of the run's 6,369 idle traps, every one of the last sixteen flagged
+[RC] (repeat + in-a-cycle). The re-raise is bounded per voice, so this is not
+the old storm, but one 3D voice absorbing two thirds of all raises is a defect
+in its own right and it is cheap to chase: the ring already names it.
+
+ALSO IN THAT LOG, AND IT IS A REAL BUG -- BUT NOT THE ONE I FIRST NAMED.
+[APU-ADPCM-FAIL] shows the SAME block
+refused over and over -- "v11 blk 213/214 hdr 08080808", eight identical
+entries in the ring. Header byte 3 is 0x08, and the decoder refuses any block
+whose fourth header byte is non-zero, so we are reading ADPCM SAMPLE data as
+a block header: a misalignment, not a corrupt stream. 44,775 of the failures
+are middle blocks, 1,116 last blocks, ZERO first blocks -- a first block that
+always decodes and later ones that do not is what a wrong block STRIDE looks
+like. block_size for ADPCM is set to 36*samples_per_block, and the guest's segment
+descriptor carries its own samples-per-block (seg_spb) which this model
+decoded and then never read -- so I built RECOMP_APU_SEGMENT_SPB to use it.
+
+THAT WAS WRONG AND THE A/B SAYS SO. Scene-matched gameplay pair:
+    off  ok=697869 fail=27801  (3.83%)
+    on   ok=584716 fail=25224  (4.13%)
+No effect, and [APU-ADPCM-SPB] printed in NEITHER arm -- g_adpcm_spb_voice
+was zero, so this scene contains no streaming ADPCM voice and the switch
+could not have done anything. The failing voices are NON-STREAM ("v4 blk
+161/170", no S flag in the ring), and a non-stream voice never consults a
+segment descriptor. The switch is left in the tree at default OFF with that
+table beside it, because for a scene that DOES stream ADPCM it is an
+unmeasured behaviour change and default-on would ship an argument.
+
+SO THE ADPCM DEFECT IS OPEN, and what is established about it is worth more
+than the guess was: first=0 in every sample -- block 0 of a buffer ALWAYS
+decodes -- while middle blocks fail 26,314 times and last blocks 1,487. A
+first block that is always right and later ones that are not is a STRIDE or
+BASE error, and the stride for a non-stream voice is
+ba + block_index * (36 * samples_per_block) against an index computed as
+cbo / ADPCM_SAMPLES_PER_BLOCK, where that constant is 64 and carries a FIXME
+in apu_regs.h asking whether it should be 65. Read samples_per_block for the
+failing voice first; nothing prints it yet. 27,801 failures in 150 s, each
+emitting uninitialised stack as audio at full scale.
+
+
+=============================================================================
+2. THE GLYPHS -- REPRODUCED ONCE, THEN NOT IN ~4,800 FRAMES
+=============================================================================
+
+WHAT IS ESTABLISHED:
+
+  - It is REAL and it is the GPU fixed-function path. frame-bisect ffglyph2,
+    tutorial scene, 24 captures per arm: ff-on/fb/flip013.bmp has two quote
+    glyphs relocated onto the "C" of "Corn"; ff-off never does, in any frame.
+    1 frame in 24 captures.
+  - It is not the vertex DATA. [FF-WATCH] hashes every vertex of every batch
+    drawn from the tutorial font page (tex 01737000) and reports the first
+    vertex that differs between two draws of the same shape. Over a full run
+    in both arms: ZERO changes. What the CPU fetched was identical every time.
+  - It is not reproducible on demand. [FB-WATCH] compares the speech-bubble
+    text region of the PRESENTED copy at every flip against the previous
+    flip. In the parked tutorial, both arms: zero changes after the text
+    settles, across ~2,400 flips each. The defect did not recur.
+
+So it is TIMING-DEPENDENT, downstream of the fetch, and rare. The candidates
+that survive, in order:
+
+  a. THE RING -- AND A CLAIM I HAD TO WITHDRAW WITHIN THE HOUR. I wrote that
+     the two arms stage different-sized vertex rows, so only one is exposed
+     to a wrap bug. THAT IS FALSE AND THE ARITHMETIC IS TWO LINES: the FF key
+     reads attributes 0x1E19, which is 7 attributes, 7*16 = 112 bytes, and
+     the CPU path's `struct Vertex { float4 p,d0,d1,t0,t1,t2,t3; }` is also
+     112 bytes. The rows are the SAME SIZE unless a normal is read (8 attrs,
+     128 B), and the measured staging bears it out: 309,312 allocated vertex
+     batches on ff-on against 306,985 on ff-off, 0.8% apart. So the ring
+     wraps at the same rate in both arms and is a WEAK candidate, not the
+     first thing to do. RECOMP_METAL_RING_AUDIT still prints
+     reserves/wraps/waits/fallbacks and the pair is cheap to take, but do not
+     expect it to separate the arms.
+  b. THE SINK'S SKIPPED PER-VERTEX TEST, which is now the strongest candidate
+     and is written up in section 3 as the review finding left unfixed. On
+     every GPU vertex path triangle() returns before vertex_valid(), so a
+     texcoord with q<=0 or a non-finite output is DRAWN where the CPU arm
+     drops the triangle, and the fragment then computes uv = tc.xy/tc.w.
+     That is a per-vertex divergence between the arms, it is timing-
+     independent in principle but data-dependent in practice, and it fits
+     "two quads sample from the wrong place" better than anything else here.
+     Test it without changing the renderer: count, on the GPU FF path, the
+     vertices whose q would fail, using the pass-through case (texmat off,
+     which is 87% of batches) where oT is just the fetched attribute.
+  c. The texture-buffer cache (128 entries, keyed on source POINTER and size,
+     confirmed with a full memcmp on hit). A stale hit is impossible because
+     of the memcmp; an eviction under a live command buffer is not, but the
+     command buffers retain their references (no
+     commandBufferWithUnretainedReferences anywhere in the file), so this is
+     probably safe. Audit only if b fails.
+  d. Something in the guest's own draw order that only the GPU path's timing
+     exposes. Least likely, hardest to test, leave it last.
+
+TWO DETECTORS ARE NOW IN THE PLAYER'S BUILD, because their session is the only
+environment that has reproduced this twice:
+    RECOMP_FB_WATCH=100,55,400,60      small per-flip changes in the text
+    RECOMP_FF_BATCH_WATCH_TEX=01737000 vertex data changes for the font page
+FB_WATCH prints only SMALL changes (< 1/4 of the region) and counts the rest,
+so it is safe in a gameplay log. If the player sees the glitch, last-run.log
+now says whether the data or the timing moved. COPY IT BEFORE RELAUNCHING.
+
+
+=============================================================================
+3. EIGHT DEFECTS FROM A REVIEW OF THE DAY'S DIFF, SEVEN FIXED
+=============================================================================
+
+A medium-effort review of the uncommitted diff (14 files, +1168) found eight.
+Fixed tonight:
+
+  1. THE GPU FF PATH SKIPPED THE CLIP-W REFUSAL. nv2a_ff_vertex refuses a
+     whole batch when a vertex's composite w is 0 or non-finite ("fixed-
+     function clip W", 1-193 batches in EVERY archived run); the GPU path drew
+     them, dividing by zero and taking the vertex to NaN with no counter. The
+     "strict subset" rule did not cover it because that rule is about batch
+     SHAPES and this is a property of a vertex. nv2a_ff_clip_w_ok() now does
+     the same test over the position the executor has already fetched, four
+     multiply-adds, and refuses with the same string. Counted as
+     "clip-w vertices" in the [VSH] fixed-function line.
+  2. FUSED MULTIPLY-ADD. The MSL emitter compiles with contract(off) and the
+     comment claimed "the CPU side is a plain C loop that does not fuse" --
+     but nv2a_ff.c builds -O2 arm64 with clang's default -ffp-contract=on and
+     had 71 fused ops, 28 of them on the accumulation that produces the clip w
+     an EXACT ==0 test then decides a batch on. `#pragma clang fp contract(off)`
+     added to nv2a_ff.c. The diff test's "residual 0" now means what it says.
+  3. THE HRTF HEADROOM was still applied to bins 0-3 of every 3D voice even
+     with the submix override gated OFF, so the guest's own routing got the
+     wrong headroom -- and g_bin_hrtf_on was set regardless, so [APU-BIN]
+     printed "hrtf=on" in BOTH arms of its own A/B. Both gated on the switch.
+  4. __builtin_popcountll in the new [APU-POOL] code would not compile under
+     MSVC, which this tree still targets. Replaced with a portable loop.
+  5. "N batches accepted, 0 left on the CPU" counted acceptance BEFORE the
+     backend was asked, so with RECOMP_METAL_VSH=0 (a documented arm) every
+     batch would read as GPU-accepted while running on the CPU. Now
+     decremented on refusal and counted as "backend refused".
+  6. [FF-BATCH]'s batch= printed s_vsh.batches, which only counts PROGRAMMABLE
+     batches -- consecutive fixed-function records carried the same number.
+     Own counter now.
+  7. g_idle_trap_edge_hold[] is uint16_t; REARM_MS above ~43,000 would make
+     the re-raise never fire and read exactly like a shut latch. Clamped.
+  8. `RECOMP_VSH_DP_ZERO=` (empty, the shell idiom for "leave the default")
+     turned the FENCE FIX OFF, contradicting its own comment. Empty now keeps
+     the default.
+
+NOT FIXED, DELIBERATELY: the sink's per-vertex vertex_valid() test (q<=0 or
+non-finite texcoord drops the triangle) is skipped on every GPU vertex path,
+programmable and fixed-function alike, because triangle() returns before it
+when vsh_gpu_culling is set. The CPU arm drops those triangles and the GPU arm
+samples them. Fixing it means either transforming the texcoord on the CPU --
+which is the work the GPU path exists to avoid -- or discarding in the
+fragment shader on q<=0. The second is cheap and is the recommendation, but it
+changes what every GPU draw does and wants its own A/B, not a change smuggled
+in beside a glyph hunt. It is ALSO a live candidate for section 2.
+
+
+=============================================================================
+4. THE HARNESS CAN NO LONGER DIFFER FROM THE PLAYER SILENTLY (G4, done)
+=============================================================================
+
+play_scripted.sh now prints every RECOMP_* in its environment, writes them to
+<out>/switches.txt, and diffs them line by line against the player's
+paths.conf, naming each difference in both directions. frame_bisect.sh gained
+ff-off/ff-on arms and had an unbound-variable crash fixed that had been
+silently killing every arm after the first (which is why the first glyph
+bisect ran one arm and reported nothing).
+
+
+=============================================================================
+5. WHERE THE FRAME TIME IS (G3, NOT STARTED)
+=============================================================================
+
+Unchanged and un-begun: the flip sync, 4.06-6.91 ms/frame, one call per frame,
+~70% of all sync cost. The frame is serialised into submit -> stall the GPU ->
+read 614 KB back -> convert -> present, and it exists only because the
+presenter is OpenGL (src/d3d/d3d8_gl.c) and reads the guest framebuffer out of
+guest RAM. The live Metal surface is NEVER the surface being flipped (zero
+times in two runs, [SURFACE-AUDIT]), so the design must look the FLIPPED
+address up in the surface cache. There are NO staged patches in the tree --
+the earlier handover's "stages 0-2 exist" means prose, not files. Stage 0 is
+the blit instrument, and it needs its sample point fixed first: the
+[d3d8_gl] blit line compares a guest pixel against the drawable centre and
+that equality only held while the drawable was exactly 1x the guest. It is 4x
+on a 2x panel now, so it means "should be close", not "must be equal" --
+compute the expected bilinear blend and compare with a 1 LSB tolerance.
+
+A per-frame sync HISTOGRAM should precede the presenter change: removing
+waitUntilCompleted removes the serialisation, not the GPU work, so it may move
+p50 and leave p99 alone. Player's last two sessions: mean 18.14 ms (FF off),
+15.44 ms (FF on), p99 39-43 ms in both. The mean is nearly there; the tail is
+not, and the tail is what "moves at the correct speed" means.
