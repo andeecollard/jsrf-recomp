@@ -438,6 +438,18 @@ add_test(NAME jsrf_multitexture_fragment COMMAND jsrf_multitexture_fragment_test
 # header byte" -- decided which hypotheses were worth a run, so it is driven
 # here rather than read. Also pins the refuse-after-writing behaviour that
 # makes RECOMP_APU_ADPCM_GUARD necessary. Pure function, no device.
+# G10 for the fix that is in the player's build. The music died twice on the
+# idle trap, and reraise/rearm/edge_suppressed are the only counters anyone
+# will read if it dies again. Two arms in two processes, because a switch is
+# cached in a static on first read: `pureedge` is the negative control -- if
+# REARM_MS=0 ever starts raising again, the A/B's two arms are one arm.
+add_executable(jsrf_apu_idle_trap_edge_test apu_idle_trap_edge_test.c)
+target_link_libraries(jsrf_apu_idle_trap_edge_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_idle_trap_reraise
+         COMMAND jsrf_apu_idle_trap_edge_test reraise)
+add_test(NAME jsrf_apu_idle_trap_pureedge
+         COMMAND jsrf_apu_idle_trap_edge_test pureedge)
+
 add_executable(jsrf_adpcm_decode_test adpcm_decode_test.c)
 target_link_libraries(jsrf_adpcm_decode_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_adpcm_decode COMMAND jsrf_adpcm_decode_test)
