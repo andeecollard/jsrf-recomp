@@ -2327,6 +2327,30 @@ static void trace_vertex_inputs(const float inputs[16][4])
     }
 }
 
+/* RECOMP_VSH_SPLIT=1 -- how much of the vsh stage is FETCHING attributes out of
+ * guest RAM, and how much is RUNNING the guest's program.
+ *
+ * WHY IT HAS TO BE MEASURED BEFORE THE GPU PATH IS BUILT. Moving the vertex
+ * program to the GPU by gathering attributes into the staging ring removes the
+ * program execution and KEEPS the fetch. So if the fetch is most of the 9.65 ms
+ * this stage costs at gameplay, that change buys a fraction of what it looks
+ * like, and the honest answer is to attack the fetch instead -- by handing the
+ * GPU the guest's arrays directly rather than gathering them.
+ * docs/jsrf/plans/GPU_VERTEX_SHADING.md says plainly that nothing knows this
+ * split, and 400 lines of backend is too much to write on a guess.
+ *
+ * Opt-in, because two clock reads per vertex in the hottest loop in the program
+ * is exactly the instrumentation weight this title has been destabilised by
+ * before. The counts are the positive control: nanoseconds with a zero vertex
+ * count is a dead instrument, not a free fetch. */
+static unsigned long long g_vsh_fetch_ns, g_vsh_exec_ns;
+static unsigned long long g_vsh_fetch_n,  g_vsh_exec_n;
+static int vsh_split_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_VSH_SPLIT"); return on; }
+static unsigned long long vsh_now_ns(void)
+{ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+  return (unsigned long long)t.tv_sec*1000000000ull + (unsigned long long)t.tv_nsec; }
+
 static int prepare_vertices(void)
 {
     int programmable = s_vsh.mode == 2;
@@ -2417,6 +2441,7 @@ static int prepare_vertices(void)
                 continue;
             }
             NV2AVshResult result;
+            unsigned long long _t_fetch = vsh_split_on() ? vsh_now_ns() : 0;
             memcpy(inputs, s_vsh.current, sizeof(inputs));
             for (uint32_t a = 0; a < 16; ++a) {
                 if (!(s_vsh.decoded.inputs_read & (1u << a))) continue;
@@ -2450,12 +2475,19 @@ static int prepare_vertices(void)
                 if (ia < s_fetched_alpha_lo) s_fetched_alpha_lo = ia;
                 if (ia > s_fetched_alpha_hi) s_fetched_alpha_hi = ia;
             }
+            if (vsh_split_on()) {
+                unsigned long long _n = vsh_now_ns();
+                g_vsh_fetch_ns += _n - _t_fetch; ++g_vsh_fetch_n; _t_fetch = _n;
+            }
             if (i == 0 && (s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()))
                 trace_vertex_inputs(inputs);
             if (!nv2a_vsh_execute(&s_vsh.decoded, inputs, s_vsh.constants, &result))
                 VSH_REJECT("shader execution failed", s_vsh.decoded.length);
             if ((result.written[0] & 12) != 12)
                 VSH_REJECT("program left oPos.zw unwritten", result.written[0]);
+            if (vsh_split_on()) {
+                g_vsh_exec_ns += vsh_now_ns() - _t_fetch; ++g_vsh_exec_n;
+            }
             if (narrow_outputs)
                 copy_live_outputs(s_outputs[i], result.output);
             else
@@ -3838,6 +3870,13 @@ void nv2a_pb_exec_report(void)
                     (unsigned long long)s_combiner_trace[i].invalid_positions,
                     (unsigned long long)s_combiner_trace[i].collapsed_xy);
     }
+    if (vsh_split_on())
+        fprintf(stderr, "[VSH] split: fetch %.1f ms over %llu vertices, "
+                "execute %.1f ms over %llu vertices"
+                " (a zero here with a zero count is a dead instrument,"
+                " not a free stage)\n",
+                g_vsh_fetch_ns / 1e6, (unsigned long long)g_vsh_fetch_n,
+                g_vsh_exec_ns / 1e6,  (unsigned long long)g_vsh_exec_n);
     fprintf(stderr, "[VSH] executed batches=%u rejected=%u mode=%u start=%u slots=%d\n",
             s_vsh.batches, s_vsh.rejected, s_vsh.mode, s_vsh.start, s_vsh.decoded.length);
     /* A rejected batch is a batch the player does not see, so the split
