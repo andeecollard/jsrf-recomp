@@ -853,6 +853,118 @@ int mcpx_apu_reon_head_nop(void)
     return on;
 }
 
+/* THE INSERT, RATHER THAN THE WALK THAT TRIPS OVER IT.
+ *
+ * VOICE_ON's TOP branch does, unconditionally:
+ *
+ *     link(v) = regs[top];   regs[top] = v;
+ *
+ * which is right for a voice that is not in the list and catastrophic for one
+ * that is. link(v) is the ONLY pointer to v's successor -- the voice register
+ * file lives in guest RAM and this model keeps no shadow of it -- so the first
+ * store destroys the tail and the second splices v in front of a list that
+ * still reaches v. The result is a ring, and the walk then renders every voice
+ * inside it once per lap, for ever.
+ *
+ * WHAT IT COSTS, from counters that were already in the logs -- voice_process
+ * calls per subframe, i.e. `processed` differenced against `se` between two
+ * consecutive report lines. voice_process is called once per VISIT with no
+ * dedup, bounded only by the walk's 256-iteration cap:
+ *
+ *                clean windows      ringing windows
+ *   apuclock2      4.00-5.24        12.2 ->  77.1
+ *   idxfix3        5.00             10.9 ->  71.4
+ *   reverted       4.73             13.2 -> 194.6
+ *
+ * That is audible rather than merely expensive: each visit advances cbo by
+ * another 32 samples, steps the amplitude and filter envelopes again, and ADDS
+ * its different 32 samples into the same bin, which the EP then hard-clamps
+ * (apu_dsp.c:151-157). Voice 0's 14,016-sample ADPCM loop at N=70 finishes in
+ * ~4 ms instead of 292 ms -- a ~240 Hz buzz where the music should be. The
+ * other failure mode is silence: `reverted` also has three consecutive 10 s
+ * windows at 0.00 voice_process calls, the ring having closed around members
+ * that are all inactive. One run holds both, minutes apart.
+ *
+ * WHAT THIS SWITCH DOES. Before the splice, walk from regs[top]; if v is
+ * already reachable, take it out of the list first, then prepend as before.
+ * That is a move-to-front, which is what "insert at the head a voice that is
+ * already in this list" means on a list. Two populations, and the counters
+ * printed on the [APU-REON] line separate them because their histories differ:
+ *
+ *   - v IS ALREADY THE HEAD. Unlink-then-prepend would write back the two
+ *     values it just read, so the insert is a no-op and this does literally
+ *     nothing -- which is RECOMP_APU_REON_HEAD_NOP, reached by another route
+ *     and arriving at the same final state. This switch therefore SUBSUMES
+ *     that one exactly; turn this on and the head guard has nothing left to do.
+ *   - v IS DEEPER. link(pred) = link(v) detaches v and leaves its successor
+ *     hanging off its old predecessor; the prepend then moves v to the head.
+ *     Nothing becomes unreachable. This is the case nothing in this file has
+ *     ever repaired and the one that forms rings of length >= 2.
+ *
+ * HOW THE TWO SPLIT. Every completed run in this tree that reached voice churn
+ * and carries the cycle counters -- ten of them, all with reon_head_nop OFF, so
+ * link_after == v in the TOP branch happens iff regs[top] == v and self_link IS
+ * the head population -- read as self_link/relink:
+ *
+ *   reverted   356/370    e32_1     174/195    caponly1  97/117
+ *   apuclock2  173/209    capseq1   165/210    idxfix3   87/114
+ *   capseq2    107/141    idxsplit1 122/193    idxfix2   60/93
+ *   idxsplit2   44/57
+ *
+ * 63.2% to 96.2% head, so the deep case is 4% to 37% of re-inserts and runs
+ * from 13 to 71 of them per session -- not the 17% a single run suggests.
+ * Both halves are worth having, and that is the point: each of the two existing
+ * guards addresses one half and misses the other, which is why each measured as
+ * nothing on its own.
+ *
+ * WHAT IT DOES NOT FIX, and this is the paragraph to read before calling a run
+ * with walks_with_a_cycle != 0 a failed fix. The guest writes link(v) = v
+ * ITSELF, at runtime, to voices our TVL still names, and in the head case this
+ * switch deliberately writes nothing -- so a guest-set sentinel survives it and
+ * the walk still meets a one-entry ring. The measurement is the three runs
+ * taken with the head guard on, where our code cannot have written the
+ * sentinel and self_link therefore counts only the guest's:
+ *
+ *   ab-reon-t1_reon1   head_nop=104   self_link=99
+ *   ab-reon-t2_reon1   head_nop=47    self_link=46
+ *   reon-verify        head_nop=40    self_link=8
+ *
+ * 99 of 104 and 46 of 47 head-case re-inserts found link(v) already equal to v.
+ * No insert-side change can prevent that. The read-side half is
+ * RECOMP_APU_SELFLINK_END, which is why the two are meant to be measured
+ * together and why this one on its own should not be expected to take
+ * walks_with_a_cycle to zero.
+ *
+ * THE RACE IS REAL AND THIS DOES NOT CLOSE IT. VOICE_ON runs on a guest thread;
+ * voice_lock() takes d->lock and releases it immediately, while the frame
+ * thread holds it across the whole of se_frame. So the unlink's store and the
+ * prepend's two stores race mcpx_apu_vp_frame's walk exactly as the original
+ * two stores did. What changes is WHICH torn states are reachable: a walk that
+ * lands mid-unlink now sees a list SHORT by one voice for the width of one
+ * insert -- one voice unrendered for at most a 1/1500 s subframe -- where
+ * before it could see a list that was circular for the rest of the run. That is
+ * the trade, stated rather than hidden. It is not a claim that the insert is
+ * atomic. The real fix is the lock discipline, and it is not this.
+ *
+ * OFF by default. This repository shipped one APU guard on the strength of a
+ * good argument and made the crash worse, and the rule that came out of that is
+ * a run count, not a better argument: five clean runs per arm before the
+ * default moves, where "clean" is defined by the positive control on the
+ * [APU-CYCLE] line. RECOMP_APU_LIST_MOVE_TO_FRONT=1 enables it. */
+unsigned long g_apu_list_mtf_head;     /* re-ON of a voice already at the head */
+unsigned long g_apu_list_mtf_deep;     /* ...already deeper in: the ring case */
+unsigned long g_apu_list_mtf_inherit;  /* ...unlinked from the INHERIT branch */
+
+int mcpx_apu_list_move_to_front(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_LIST_MOVE_TO_FRONT");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
 unsigned long g_apu_antecedent_set_count;
 unsigned long g_apu_voice_on_top_count;
 unsigned long g_apu_voice_on_inherit_count;
@@ -896,6 +1008,7 @@ unsigned long g_apu_voice_on_self_link_count;
  * every run. relink must never exceed it, and must be >= self_link. */
 unsigned long g_apu_voice_on_relink_count;   /* VOICE_ON for a handle already in the list */
 unsigned long g_apu_list_cycles_seen;        /* walks that revisited a voice */
+unsigned long g_apu_list_walk_cap;           /* ...and ran out of iterations */
 unsigned long g_apu_list_cycle_breaks;       /* ...and stopped early because of it */
 unsigned      g_apu_list_cycle_last;         /* the voice that closed the last one */
 unsigned      g_apu_list_cycle_list;
@@ -924,6 +1037,91 @@ static int voice_list_contains(MCPXAPUState *d, unsigned top_reg, uint16_t h)
                                        NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
     }
     return 0;
+}
+
+/* WHERE does `h` hang off `top_reg`'s list, not merely whether.
+ *
+ * The bool above is enough to COUNT a re-insert and useless for repairing one:
+ * to take v out of a list you need the field that points AT it, and that field
+ * is either the head register or some other voice's PITCH_LINK. So this is the
+ * same walk with the cursor's predecessor carried along.
+ *
+ * Returns 1 when h is reachable, writing the predecessor's handle into *pred --
+ * 0xFFFF meaning "h is the head, and the pointer at it is d->regs[top_reg]
+ * itself", which is the same sentinel the frame walk's `came_from` uses for the
+ * same thing. Returns 0 otherwise, with *pred left at 0xFFFF.
+ *
+ * THE THREE EXITS ARE THE FRAME WALK'S THREE EXITS and must stay that way: the
+ * 0xFFFF terminator, a handle >= MCPX_HW_MAX_VOICES (NEXT_VOICE_HANDLE is a
+ * full 16-bit field, so every value from 0x0100 to 0xFFFE is admissible and
+ * invalid), and the MCPX_HW_MAX_VOICES iteration cap. The cap is not defensive
+ * padding here -- this function is called specifically on lists that may
+ * ALREADY be rings, which is the entire reason it exists, and without it the
+ * repair would hang where the bug only degraded. An out-of-range h is never
+ * found, because the range bail is tested before the comparison; callers guard
+ * it anyway. */
+static int voice_list_find_pred(MCPXAPUState *d, unsigned top_reg, uint16_t h,
+                                uint16_t *pred)
+{
+    uint16_t prev = 0xFFFF;
+    uint16_t cur = (uint16_t)d->regs[top_reg];
+    int i;
+
+    *pred = 0xFFFF;
+    for (i = 0; i < MCPX_HW_MAX_VOICES && cur != 0xFFFF; i++) {
+        if (cur >= MCPX_HW_MAX_VOICES) break;
+        if (cur == h) {
+            *pred = prev;
+            return 1;
+        }
+        prev = cur;
+        cur = (uint16_t)voice_get_mask(d, cur, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                       NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+    }
+    return 0;
+}
+
+/* Take `h` out of `top_reg`'s list, given the predecessor voice_list_find_pred
+ * found for it. pred == 0xFFFF means h is the head and the pointer to repair is
+ * the head register rather than another voice's link.
+ *
+ * link(h) IS DELIBERATELY LEFT ALONE. Every caller is about to overwrite it as
+ * part of re-inserting h, so clearing it here would be a third store to the
+ * same guest-RAM dword for no gain -- and while it still holds h's old
+ * successor, a frame walk that reads between our two stores sees a list that is
+ * merely missing an entry, not one that contradicts itself.
+ *
+ * THE link(h) == h CASE IS THE ONE THAT DECIDES THIS FUNCTION. That is the
+ * driver's "not in any list" sentinel: CMcpxCore::SetupVoiceProcessor writes it
+ * for all 256 voices at boot, RemoveIdleVoice writes it for every voice it
+ * retires, and this model has five direct captures of the guest writing it at
+ * runtime to a voice our TVL still names. Copy it into pred's link and pred
+ * still names h -- the unlink silently does nothing, and the prepend that
+ * follows closes exactly the ring this change exists to prevent. Reading it as
+ * end-of-list instead loses nothing, by the same argument that justifies
+ * RECOMP_APU_SELFLINK_END at the walk: if link(h) reads h, whatever was behind
+ * h is already unreachable through h. It is applied here unconditionally, and
+ * not behind that switch, because without it this is not an unlink.
+ *
+ * A link that is out of range rather than self or 0xFFFF is copied through
+ * unchanged. The list then ends one entry earlier than it would have, at the
+ * same bad handle and with the same [APU] out-of-range report from the frame
+ * walk -- the walk was going to stop at h and read that handle regardless. */
+static void voice_list_unlink_at(MCPXAPUState *d, unsigned top_reg,
+                                 uint16_t pred, uint16_t h)
+{
+    uint16_t nxt = (uint16_t)voice_get_mask(
+        d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+        NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+
+    if (nxt == h) nxt = 0xFFFF;
+
+    if (pred == 0xFFFF) {
+        d->regs[top_reg] = nxt;
+        return;
+    }
+    voice_set_mask(d, pred, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                   NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE, nxt);
 }
 
 void mcpx_apu_voice_report(void)
@@ -965,9 +1163,21 @@ void mcpx_apu_voice_report(void)
     fprintf(stderr, "  [APU-SELFLINK] terminated=%lu (guard %s)\n",
             g_apu_selflink_terminated,
             mcpx_apu_selflink_end() ? "on" : "OFF");
-    fprintf(stderr, "  [APU-REON] head_nop=%lu (reon_head_nop %s)\n",
-            g_apu_voice_on_head_nop,
-            mcpx_apu_reon_head_nop() ? "on" : "OFF");
+    /* mtf_head and mtf_deep are the two populations the ring fix splits the
+     * re-inserts into, and they are printed beside head_nop because head_nop is
+     * the guard mtf_head replaces: with move_to_front on, head_nop must read 0
+     * and mtf_head must carry what it used to. The switch state goes in the
+     * parentheses on this line because ab_score.py harvests exactly that from
+     * [APU-TRAP], [APU-SELFLINK] and [APU-REON] to decide whether an arm
+     * actually took -- a new line it does not know about would leave a
+     * move_to_front A/B in the "assumes the environment took" class that the
+     * SELFLINK_END A/B died of. */
+    fprintf(stderr, "  [APU-REON] head_nop=%lu mtf_head=%lu mtf_deep=%lu"
+            " mtf_inherit=%lu (reon_head_nop %s, move_to_front %s)\n",
+            g_apu_voice_on_head_nop, g_apu_list_mtf_head, g_apu_list_mtf_deep,
+            g_apu_list_mtf_inherit,
+            mcpx_apu_reon_head_nop() ? "on" : "OFF",
+            mcpx_apu_list_move_to_front() ? "on" : "OFF");
     fprintf(stderr, "  [APU-LINK] antecedent_sets=%lu on_top=%lu"
             " on_inherit=%lu self_ante=%lu self_link=%lu\n",
             g_apu_antecedent_set_count, g_apu_voice_on_top_count,
@@ -980,6 +1190,15 @@ void mcpx_apu_voice_report(void)
             g_apu_list_cycles_seen, g_apu_list_cycle_breaks,
             g_apu_list_cycle_last, g_apu_list_cycle_list,
             mcpx_apu_cycle_break() ? "on" : "OFF");
+    /* The 256-iteration cap, which reported through a compiled-out DPRINTF from
+     * the day it was written. On its own line rather than appended to
+     * [APU-CYCLE] because it answers a different question -- walks_with_a_cycle
+     * says a voice was reached twice, this says the walk ran out of iterations
+     * before the list ended -- and because six months of notes grep the
+     * [APU-CYCLE] line as it stands. Non-zero here with walks_with_a_cycle at
+     * zero would mean a list genuinely longer than 256 entries, which is a
+     * different bug from the ring. */
+    fprintf(stderr, "  [APU-WALKCAP] hit=%lu\n", g_apu_list_walk_cap);
     mcpx_apu_idle_trap_report(0);
     fflush(stderr);
 }
@@ -1033,9 +1252,19 @@ void mcpx_apu_idle_trap_report(int crash)
             " (fedec_hold %s) -- a held pair is an ISR that read the handle it"
             " was sent, not the next method's argument\n",
             g_apu_fedec_held,
+            /* THIS LINE USED TO SAY "on (default)" WHEN THE GUARD IS OFF.
+             * The accessor below reads `hold = e ? (atoi(e) != 0) : 0` -- the
+             * default is 0 -- so an unset variable printed as enabled, and a
+             * reader saw "held=0 (fedec_hold on (default))" and concluded the
+             * guard was armed and had never needed to fire. The truth was that
+             * it was off and had never once been exercised. That is exactly
+             * the class CLAUDE.md means by "read a counter's trigger before
+             * trusting its value", and it mattered here: this guard is the one
+             * that would break the idle-trap storm, so its state is the first
+             * thing anyone debugging that storm reads. */
             getenv("RECOMP_APU_FEDEC_HOLD")
                 ? (atoi(getenv("RECOMP_APU_FEDEC_HOLD")) ? "on" : "OFF")
-                : "on (default)");
+                : "OFF (default)");
     if (!g_idle_trap_raises)
         return;
 
@@ -1326,8 +1555,67 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             if (voice_list_contains(d, top_reg, (uint16_t)selected_handle))
                 g_apu_voice_on_relink_count++;
 
-            if (d->regs[top_reg] == selected_handle
-                && mcpx_apu_reon_head_nop()) {
+            /* TAKE v OUT BEFORE PUTTING IT BACK IN.
+             *
+             * The long-form argument, the measured cost of not doing this and
+             * the race it does not close are all above
+             * mcpx_apu_list_move_to_front; what follows is only what the two
+             * branches do.
+             *
+             *   pred == 0xFFFF   v is already this list's head. Unlinking would
+             *                    write regs[top] = link(v), and the prepend
+             *                    below would then write link(v) = regs[top] =
+             *                    link(v) and regs[top] = v -- the same two
+             *                    values back again. So do neither: the final
+             *                    state is identical, and skipping both stores
+             *                    also means there is no instant in which the
+             *                    list does not contain v for the frame thread
+             *                    to walk into. This is RECOMP_APU_REON_HEAD_NOP
+             *                    by construction rather than by arithmetic,
+             *                    which is the sense in which this switch
+             *                    subsumes it exactly.
+             *
+             *   otherwise        v is deeper in. voice_list_unlink_at writes
+             *                    link(pred) = link(v), so v's successor stays
+             *                    attached to v's old predecessor, and the
+             *                    prepend below then moves v to the head.
+             *                    Nothing becomes unreachable -- which is the
+             *                    entire difference from what this branch did.
+             *
+             * The chain below is left intact and still reads reon_head_nop, so
+             * that with move_to_front OFF this insert is byte-for-byte the code
+             * that was here before: the switch adds one bounded walk when it is
+             * ON and nothing at all when it is OFF.
+             *
+             * selected_handle is range-checked because VOICE_ON masks the
+             * handle with 0x0000FFFF (apu_regs.h:137) while the hardware has
+             * 256 voices. An out-of-range handle cannot be in a list, and
+             * voice_get_mask on one would address guest RAM past the end of the
+             * voice register file. */
+            int mtf_is_head = 0;
+            if (mcpx_apu_list_move_to_front()
+                && selected_handle < MCPX_HW_MAX_VOICES) {
+                uint16_t mtf_pred = 0xFFFF;
+                if (voice_list_find_pred(d, top_reg,
+                                         (uint16_t)selected_handle,
+                                         &mtf_pred)) {
+                    if (mtf_pred == 0xFFFF) {
+                        g_apu_list_mtf_head++;
+                        mtf_is_head = 1;
+                    } else {
+                        g_apu_list_mtf_deep++;
+                        voice_list_unlink_at(d, top_reg, mtf_pred,
+                                             (uint16_t)selected_handle);
+                    }
+                }
+            }
+
+            if (mtf_is_head) {
+                /* Nothing to do. v is the head already, so the insert the
+                 * guest asked for is the state the list is in. Counted as
+                 * mtf_head on the [APU-REON] line. */
+            } else if (d->regs[top_reg] == selected_handle
+                       && mcpx_apu_reon_head_nop()) {
                 g_apu_voice_on_head_nop++;
             } else {
                 voice_set_mask(d, (uint16_t)selected_handle,
@@ -1344,6 +1632,56 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             g_apu_voice_on_inherit_count++;
             if (antecedent_voice == selected_handle)
                 g_apu_voice_on_self_ante_count++;
+
+            /* THE SAME DEFECT, ONE BRANCH OVER.
+             *
+             * The splice below writes link(selected) = link(antecedent) and
+             * then link(antecedent) = selected. If selected is already in a
+             * list, the first of those stores lands on the only pointer to
+             * selected's successor and the second splices selected in behind an
+             * antecedent that may still reach it. That is the TOP branch's ring
+             * reached by different arithmetic, and it is fixed the same way:
+             * unlink first, then splice.
+             *
+             * THIS BUYS JSRF NOTHING AND COSTS IT NOTHING. on_inherit is 0 --
+             * and self_ante with it -- in all 5,372 [APU-LINK] report lines
+             * across the 268 run logs this tree has kept, because FEAV reads
+             * 0x0001FFFF or 0x0002FFFF in all 535 [VOICE-LINK] lines of
+             * play/20260915-122828-human-gameplay/stderr.log: ante is always
+             * the FFFF that selects a TOP insert. It is here so the two
+             * insert paths cannot disagree about what re-inserting a voice
+             * means, and so that the next title through does not meet the bug
+             * we just took out of the other branch.
+             *
+             * INHERIT names no list, so there is no top register to start from
+             * and no way to know which of the three holds selected: all three
+             * are searched with the same bounded walk and the first that
+             * reaches it wins. A handle in two lists at once is corruption no
+             * insert can repair, and this does not pretend to.
+             *
+             * SELF-ANTECEDENT IS LEFT EXACTLY AS IT WAS. FEAV naming the voice
+             * being turned on collapses the splice to link(v) = v, and
+             * "unlink v, then insert v after v" is not a repair of that, it is
+             * a different wrong answer -- it would drop v from its list and
+             * leave the sentinel set. self_ante=0 in all 5,372 of those report
+             * lines; the counter one line above is what would say otherwise. */
+            if (mcpx_apu_list_move_to_front()
+                && selected_handle < MCPX_HW_MAX_VOICES
+                && antecedent_voice != selected_handle) {
+                int mtf_l;
+                for (mtf_l = 0; mtf_l < 3; mtf_l++) {
+                    unsigned mtf_top = (unsigned)voice_list_regs[mtf_l].top;
+                    uint16_t mtf_pred = 0xFFFF;
+                    if (!voice_list_find_pred(d, mtf_top,
+                                              (uint16_t)selected_handle,
+                                              &mtf_pred))
+                        continue;
+                    g_apu_list_mtf_inherit++;
+                    voice_list_unlink_at(d, mtf_top, mtf_pred,
+                                         (uint16_t)selected_handle);
+                    break;
+                }
+            }
 
             uint32_t next_handle = voice_get_mask(
                 d, (uint16_t)antecedent_voice, NV_PAVS_VOICE_TAR_PITCH_LINK,
@@ -2927,12 +3265,40 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
         for (int i = 0; cur != 0xFFFF; i++) {
             if (i >= MCPX_HW_MAX_VOICES) {
-                /* DPRINTF compiles to nothing, so this break has been silent
-                 * for the life of the file -- a list that rings burns 256
-                 * iterations here every subframe and says so nowhere. The
-                 * cycle detector below is what makes it visible; this stays as
-                 * the backstop for a list that is long rather than circular. */
-                DPRINTF("Voice list contains invalid entry!\n");
+                /* THIS BREAK HAS BEEN SILENT FOR THE LIFE OF THE FILE.
+                 *
+                 * It reported through DPRINTF, and DEBUG_MCPX is commented out
+                 * at the top of this file (:26), so DPRINTF is
+                 * `do { } while (0)`. A list that rings burns 256 iterations
+                 * here every subframe, calls voice_process once per iteration,
+                 * and said so nowhere -- which is the mechanical reason a ring
+                 * that has been audible since audio first worked went unfound.
+                 * The cycle detector below is the instrument that found it in
+                 * the end; this is the older and blunter one, and it is worth
+                 * keeping distinct because it also fires for a list that is
+                 * merely LONGER than the hardware has voices, which is a
+                 * different defect with a different cause.
+                 *
+                 * Bounded to the first eight, matching the out-of-range report
+                 * below, because at 1500 subframes a second an unbounded line
+                 * here is the log. g_apu_list_walk_cap is what survives the
+                 * eighth: the count is printed on the [APU-WALKCAP] report line
+                 * every reporting interval, so the number is readable for the
+                 * whole run and not just its first moments. */
+                static unsigned cap_reported;
+                g_apu_list_walk_cap++;
+                if (cap_reported < 8) {
+                    cap_reported++;
+                    fprintf(stderr,
+                            "  [APU] voice list %d hit the %d-iteration walk "
+                            "cap at handle 0x%04X (came from 0x%04X, head "
+                            "0x%04X) -- the list has more entries than the "
+                            "hardware has voices, i.e. it rings; stopping "
+                            "this list\n",
+                            list, MCPX_HW_MAX_VOICES, cur, came_from,
+                            (unsigned)(uint16_t)d->regs[top]);
+                    fflush(stderr);
+                }
                 break;
             }
 
