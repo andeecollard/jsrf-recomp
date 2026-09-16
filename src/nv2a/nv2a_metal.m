@@ -367,6 +367,20 @@ static struct {
     uint8_t *depth; uint32_t depth_pitch; size_t depth_size;
     id<MTLTexture> colour, stencil, hw_depth, hw_stencil;
     uint64_t stamp; int valid;
+    /* THE GPU HOLDS PIXELS GUEST RAM HAS NOT GOT.
+     *
+     * Set when this slot's texture is cleared residently while some OTHER
+     * surface is bound -- the GPU writes the constant, and the CPU clear that
+     * would have written guest RAM is skipped. From that moment the texture is
+     * the authority for this surface and guest RAM is behind it.
+     *
+     * It has exactly one consequence and surface_cache_drop is where it lands:
+     * a slot that owes guest RAM cannot simply be dropped, because dropping it
+     * throws the only copy away. This is the same class of mistake that cost
+     * 24,848 pixels when nv2a_metal_discard dropped a retained surface without
+     * reading it back; the difference is that this one is written down and
+     * counted before it can happen. */
+    int owes_guest_ram;
 } surf_slot[SURFACE_SLOTS];
 static uint64_t surf_clock;
 static uint64_t surface_hits, surface_evictions;
@@ -381,13 +395,19 @@ static int surface_cache_on(void)
 
 /* Drop every slot that could describe memory the CPU is about to write. NULL
  * means "all of them", which is what a full invalidate asks for. */
+static void surface_slot_writeback(unsigned i);
+static int clear_encode(MTLRenderPassDescriptor *pass);
 static void surface_cache_drop(const uint8_t *target)
 {
     for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
         if (!surf_slot[i].valid) continue;
         if (target && surf_slot[i].target != target && surf_slot[i].depth != target)
             continue;
-        surf_slot[i].valid = 0;
+        /* A slot that owes guest RAM is the only copy of those pixels. Drop it
+         * without reading it back and the clear -- or whatever else the GPU
+         * wrote while this surface was unbound -- is simply gone. */
+        if (surf_slot[i].owes_guest_ram) surface_slot_writeback(i);
+        surf_slot[i].valid = 0; surf_slot[i].owes_guest_ram = 0;
         surf_slot[i].colour = nil; surf_slot[i].stencil = nil;
         surf_slot[i].hw_depth = nil; surf_slot[i].hw_stencil = nil;
     }
@@ -1556,6 +1576,7 @@ static uint64_t g_queue_drains;
  * clear refused and took the read-back route, which is a measurement, not a
  * silence: read it before believing a frame-time number. */
 static uint64_t g_resident_color_clears, g_resident_depth_clears;
+static uint64_t g_resident_unbound_clears, g_slot_writebacks, g_slot_writeback_skipped;
 /* WHY A RESIDENT CLEAR REFUSED, by reason, because the counts alone said the
  * colour half was refusing 8 times for every one it took and nothing said
  * which test threw it out. A refusal is not free: clear_surface then calls
@@ -1750,6 +1771,11 @@ void nv2a_metal_report(void)
             (unsigned long long)g_clear_color_calls,
             (unsigned long long)g_resident_depth_clears,
             (unsigned long long)g_clear_depth_calls);
+    fprintf(stderr,"[METAL] unbound-surface clears: %llu served from the cache,"
+            " %llu slot write-backs (%llu skipped)\n",
+            (unsigned long long)g_resident_unbound_clears,
+            (unsigned long long)g_slot_writebacks,
+            (unsigned long long)g_slot_writeback_skipped);
     fprintf(stderr,"[METAL] clear refused: mask=%llu components=%llu rect=%llu"
             " soft-tail=%llu invalidated=%llu target=%llu geometry=%llu\n",
             (unsigned long long)g_clear_refuse_mask,
@@ -2173,6 +2199,112 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
  * REFUSING IS FREE AND COUNTED. Returning 0 tells clear_surface its fast path
  * did not apply and it performs the byte-exact CPU clear it always did, so
  * every refusal is a correct frame rather than a wrong one. */
+/* Pay a slot's debt to guest RAM: read its colour texture back, in the guest's
+ * own RGB565 layout, exactly as nv2a_metal_sync does for the bound surface.
+ *
+ * Called only from surface_cache_drop, so it happens when something is about to
+ * write that guest memory from the CPU and the GPU's copy is about to stop
+ * being reachable. It costs a drain and a read-back -- the very things the
+ * resident clear exists to avoid -- which is the point: the debt is paid once,
+ * at the moment it has to be, instead of twice a frame whether or not anyone
+ * ever looks. */
+static void surface_slot_writeback(unsigned i)
+{
+    uint8_t *dst = surf_slot[i].target;
+    id<MTLTexture> tex = surf_slot[i].colour;
+    uint32_t w = surf_slot[i].w, h = surf_slot[i].h, pitch = surf_slot[i].pitch;
+    if (!dst || !tex || !w || !h) { ++g_slot_writeback_skipped; return; }
+    @autoreleasepool {
+        size_t px = (size_t)w * h;
+        int fmt565 = hw_565_on();
+        uint8_t *buf = malloc(px * (fmt565 ? 2 : 16));
+        if (!buf) { ++g_slot_writeback_skipped; return; }
+        batch_flush();
+        [last_command waitUntilCompleted];
+        [tex getBytes:buf bytesPerRow:w * (fmt565 ? 2 : 16)
+           fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+        if (fmt565) {
+            const uint16_t *src = (const uint16_t *)buf;
+            for (uint32_t y = 0; y < h; ++y)
+                memcpy(dst + (size_t)y * pitch, src + (size_t)y * w, (size_t)w * 2);
+        } else {
+            const float *src = (const float *)buf;
+            for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) {
+                size_t at = ((size_t)y * w + x) * 4;
+                unsigned c = (unsigned)(fminf(1,fmaxf(0,src[at]))*31+.5f)<<11
+                           | (unsigned)(fminf(1,fmaxf(0,src[at+1]))*63+.5f)<<5
+                           | (unsigned)(fminf(1,fmaxf(0,src[at+2]))*31+.5f);
+                uint8_t *q = dst + (size_t)y * pitch + x * 2;
+                q[0] = (uint8_t)c; q[1] = (uint8_t)(c >> 8);
+            }
+        }
+        free(buf);
+        ++g_slot_writebacks;
+    }
+    surf_slot[i].owes_guest_ram = 0;
+}
+
+/* CLEAR A SURFACE THE GUEST NAMES BUT THE BACKEND IS NOT CURRENTLY BOUND TO.
+ *
+ * Measured at gameplay, 16 Sep 2026: of 14,603 colour clears, 12,507 -- 86% --
+ * named a colour surface other than the bound one, and every one of them fell
+ * back to the CPU. That is not an accident of this title, it is how the guest
+ * works: the colour offset register moves when the guest writes it, while
+ * surface_target only moves on the next DRAW, so a clear issued in that window
+ * names one surface while the backend holds another. nv2a_metal_discard's
+ * comment describes the same window, and RECOMP_SURFACE_AUDIT measured 8,843
+ * of 17,646 clears in it.
+ *
+ * JSRF rotates three colour surfaces and the cache holds four, so the surface
+ * being cleared is usually one we already have a texture for -- just not the
+ * bound one. Clearing that texture is the same load action; the only thing
+ * that changes is which slot it lands in and who then owes guest RAM.
+ *
+ * WHY THIS IS THE EXPENSIVE HALF. Refusing did not merely cost the read-back
+ * saving. clear_surface falls back to nv2a_gpu_invalidate_range, which drops
+ * every cache slot naming that pointer -- so 86% of clears were emptying the
+ * surface cache, which is why its hit rate sat at exactly 50% with 10,352
+ * rebuilds in a run. Each rebuild reallocates four textures and re-uploads
+ * 6.4 MB. The refusal was costing more than the clear.
+ *
+ * Returns 0 for anything it cannot serve, and the byte-exact CPU clear then
+ * runs as it always did. */
+static int clear_unbound_slot(uint8_t *target, uint32_t pitch,
+                              uint32_t width, uint32_t height, uint16_t v)
+{
+    unsigned i;
+    if (!surface_cache_on() || !hw_state_on() || !initialize()) return 0;
+    for (i = 0; i < SURFACE_SLOTS; ++i) {
+        if (!surf_slot[i].valid || surf_slot[i].target != target) continue;
+        if (surf_slot[i].w != width || surf_slot[i].h != height) return 0;
+        if (surf_slot[i].pitch != pitch) return 0;
+        if (!surf_slot[i].colour) return 0;
+        break;
+    }
+    if (i == SURFACE_SLOTS) return 0;            /* not a surface we hold */
+    @autoreleasepool {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        batch_flush();
+        pass.colorAttachments[0].texture = surf_slot[i].colour;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor =
+            MTLClearColorMake((double)(v >> 11) / 31.0,
+                              (double)((v >> 5) & 63) / 63.0,
+                              (double)(v & 31) / 31.0, 1.0);
+        /* No depth or stencil attachment: this slot's depth textures belong to
+         * whatever geometry last used it and the colour clear must not disturb
+         * them. A pass with a colour attachment alone is legal and clears
+         * exactly what it names. */
+        if (!clear_encode(pass)) return 0;
+        /* The CPU clear is now skipped, so guest RAM for this surface is behind
+         * the texture until the slot is rebound or dropped. */
+        surf_slot[i].owes_guest_ram = 1;
+        ++g_resident_unbound_clears;
+    }
+    return 1;
+}
+
 static int clear_resident_ok(const uint8_t *target, uint32_t pitch,
                              uint32_t width, uint32_t height)
 {
@@ -2212,7 +2344,12 @@ int nv2a_metal_clear_color(uint8_t *target, size_t target_size, uint32_t pitch,
      * loop runs. NV097_CLEAR_SURFACE's R/G/B bits are 0x10/0x20/0x40. */
     ++g_clear_color_calls;
     if ((param & 0x70u) != 0x70u) { ++g_clear_refuse_mask; return 0; }
-    if (!clear_resident_ok(target, pitch, width, height)) return 0;
+    if (!clear_resident_ok(target, pitch, width, height)) {
+        /* Not the bound surface -- but very probably one we hold. See
+         * clear_unbound_slot: 86% of this title's colour clears land here. */
+        return clear_unbound_slot(target, pitch, width, height,
+                                  (uint16_t)value);
+    }
     @autoreleasepool {
         /* SET_COLOR_CLEAR_VALUE arrives already in the surface's own format,
          * so a 16-bit surface takes the low half verbatim as R5G6B5 -- the
@@ -2773,7 +2910,15 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;
     surface_height=s->clip_h;surface_pitch=s->target_pitch;
     depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
-    surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;
+    surface_valid=depth_valid=1;
+    /* INHERIT THE SLOT'S DEBT. If this slot was cleared while another surface
+     * was bound, its texture holds pixels guest RAM has never seen; becoming
+     * the live surface transfers that debt to surface_dirty, which the flip's
+     * sync already knows how to pay. Clearing surface_dirty here instead --
+     * which is what "a swap back is a rebind" did before there was any way for
+     * a slot to be ahead of guest RAM -- would drop the clear on the floor. */
+    surface_dirty=surf_slot[slot_hit].owes_guest_ram?1:0;depth_dirty=0;
+    surf_slot[slot_hit].owes_guest_ram=0;
     surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
    }else{
    MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
