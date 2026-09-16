@@ -141,6 +141,15 @@ SWITCH_TOKEN = {
     # The switch that decides whether a real frame is correct, and the one this
     # table was missing while it was being A/B'd on frame time alone.
     "RECOMP_METAL_BATCH":          "metal_batch",
+    # Added 16 Sep 2026. Each of these was A/B'd that day; without an entry
+    # here the harvest works and the VOID check is silently SKIPPED, which is
+    # the state every one of them was scored in.
+    "RECOMP_APU_IDLE_TRAP_EDGE":   "idle_edge",
+    "RECOMP_METAL_FF":             "metal_ff",
+    "RECOMP_VSH_DP_ZERO":          "vsh_dp_zero",
+    "RECOMP_METAL_VSH":            "metal_vsh",
+    "RECOMP_APU_ADPCM_GUARD":      "adpcm_guard",
+    "RECOMP_APU_LIST_MOVE_TO_FRONT": "move_to_front",
 }
 
 
@@ -451,6 +460,29 @@ def summarise(path, var, warmup):
         out.append("  excluded, and NOT counted as either arm:")
         for tag, why in excluded:
             out.append("    %-16s %s" % (tag, why))
+
+    # AND IS THERE ENOUGH OF EACH ARM TO COMPARE AT ALL?
+    #
+    # One run per arm cannot see the effect sizes this project reports. On
+    # 16 Sep 2026 a single pair read 59.4 fps against 62.4 and was very nearly
+    # written up as a 5% win; the next pair's OFF arm read 63.2, i.e. the
+    # "effect" was smaller than the spread between two runs of the SAME arm.
+    # Run-to-run spread on this host is several per cent, so a one-run arm is
+    # a lean, and the rules this tree already states call that not a
+    # measurement.
+    #
+    # Refused rather than warned, because a warning above a table of numbers
+    # is read as a caveat and the numbers are read as a result.
+    n0, n1 = len(arms["0"]), len(arms["1"])
+    if min(n0, n1) < 2 and (n0 or n1):
+        out.append("")
+        out.append("  VOID: ONE RUN PER ARM IS NOT A MEASUREMENT (n=%d vs %d)."
+                   % (n0, n1))
+        out.append("  Run-to-run spread on this host is several per cent, so a"
+                   " single pair cannot separate an effect of that size from"
+                   " noise. Take at least two usable runs per arm -- and note"
+                   " that runs excluded above do not count toward either.")
+        return "\n".join(out)
 
     # Before any comparison: did the arms actually differ? Only the token that
     # belongs to THIS switch can answer that -- see SWITCH_TOKEN above for why

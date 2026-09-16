@@ -66,6 +66,25 @@ for path in sources:
 
 problems = 0
 
+# RULE 4, A RATCHET. 128 of the 152 switches parse their own value, and
+# rewriting all of them in one change would be a large diff over code whose
+# defaults decide whether the picture is correct -- exactly the kind of sweep
+# that flips one by accident. So the set is FROZEN instead: migrate downward at
+# leisure, but a NEW switch must use the helper, whose grammar is stated in one
+# place. The number only ever goes down.
+HANDROLLED_BASELINE = 128
+if len(handrolled) > HANDROLLED_BASELINE:
+    added = len(handrolled) - HANDROLLED_BASELINE
+    print("RATCHET: %d new hand-rolled switch read(s) -- the baseline is %d. "
+          "New switches must use recomp_switch_on(), whose grammar is stated "
+          "once; the hand-rolled form disagrees with it on \"on\", \"yes\" "
+          "and \"false\"." % (added, HANDROLLED_BASELINE))
+    problems += 1
+elif len(handrolled) < HANDROLLED_BASELINE:
+    print("NOTE: hand-rolled reads are down to %d from a baseline of %d -- "
+          "lower HANDROLLED_BASELINE to lock the gain in."
+          % (len(handrolled), HANDROLLED_BASELINE))
+
 # Rule 1
 both = sorted(set(helper) & set(handrolled))
 for name in both:

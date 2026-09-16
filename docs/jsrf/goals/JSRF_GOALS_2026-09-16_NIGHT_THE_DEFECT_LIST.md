@@ -136,6 +136,49 @@ the re-raise, the GPU fixed-function parity, the instruments, the harness.
 
 ---
 
+# Robustness goals — turn the review rules into tests
+
+This tree's failures are rarely "the code is wrong in one file". They are "the
+two arms were not actually different" and "the default was not what the comment
+said" — properties of a *set*, which no file review can see and which a
+discipline written in comments cannot hold. Each goal below converts a rule
+that already exists in prose into something that fails.
+
+## G9 — One grammar for the switches *(ratcheted, then migrate)*
+
+`recomp_switch_on` treats any non-empty value that is not `0` as on, so
+`RECOMP_X=false` reads **ON**. The hand-rolled `atoi(e) != 0` form reads `on`
+and `yes` as **OFF**. They disagree on every spelling a person would type, and
+128 of 152 switches take the hand-rolled path.
+
+**Done when:** the hand-rolled count reaches zero. The audit ratchets it — a
+*new* hand-rolled switch fails the test, so the number can only fall. Lower
+`HANDROLLED_BASELINE` as batches migrate.
+
+## G10 — Every instrument carries a test that forces it to fire
+
+Nine instruments have now been retired for lying, and the switch audit's own
+first version joined them: its default-on rule looked only as far as the first
+semicolon, found nothing, and reported "0 problems". A positive control is the
+discipline; a **test that drives the counter to non-zero** is the structure. If
+one cannot be written, the counter cannot measure anything and should go.
+
+**Done when:** each headline counter — the ADPCM failure counts, the idle-trap
+edge counters, `[APU-POOL]`, the fixed-function refusal counts — has a test
+that makes it fire, in the shape `jsrf_ff_msl_diff_test` already uses with its
+injected fault.
+
+## G11 — The scorer refuses comparisons it cannot make *(done)*
+
+`ab_score.py` already voids arms that reported the same configuration. It now
+also voids **one run per arm**: a single pair read 59.4 fps against 62.4 and
+was nearly written up as a 5% win, while the next pair's *off* arm read 63.2 —
+the effect was smaller than the spread between two runs of the same arm. Six
+switches A/B'd on 16 Sep were also missing from `SWITCH_TOKEN`, which silently
+**skips** the identical-arms check; they are registered.
+
+---
+
 ## R — Refuted. Do not re-derive these.
 
 | Idea | How it died |
