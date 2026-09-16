@@ -488,6 +488,10 @@ struct MCPXAPUState {
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
+    /* Thirds of a microsecond owed by next_frame_time_us. An EP frame is 256
+     * samples at 48 kHz = 5333 AND ONE THIRD microseconds; EP_FRAME_US is the
+     * truncation. See throttle() for why the third matters. */
+    int      ep_frame_frac;
 
     struct {
         struct {

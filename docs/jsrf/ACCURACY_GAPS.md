@@ -95,6 +95,28 @@ Two independent defects, both only visible with a controller in hand:
   the next measurement, not the next edit.
 * **Ring replay.** ~23% of the music ring is the previous lap replayed, because
   CRI's sound server gets 33.4 of the 43.1 passes/s it needs.
+* **ADDED 2026-09-16 — the output clock was 48003 Hz, and it is the drift.**
+  An EP frame is 256 samples at 48 kHz: 5333 **and one third** microseconds.
+  `EP_FRAME_US` was 5333 and `throttle()` added it bare, pacing the model at
+  48003.0 Hz against a device consuming at 48000. Measured from an existing log
+  with no new run: `throttle=50636` over `elapsed=270.0s`, and
+  `subframes/throttle = 7.99984` so one throttle is one 256-sample frame —
+  12,962,816 samples in 270.04 s = **48,003.4 Hz**, exactly the truncation.
+  `queued=` then climbs monotonically within a run (6144 → 10240 bytes over
+  200 s, ~6 ms of audio lag per minute), and `apu_sdl2.c` flushes the whole
+  queue at `APU_MAX_QUEUE_BYTES` — the audible jump at the end of a long
+  session. **Fixed** by carrying the remainder (three frames = 16000 µs
+  exactly); pinned by `jsrf_apu_pace` with no tolerance, because a tolerance is
+  what hides a 62 ppm error. `out_hz=` had been printing 48003–48004 in
+  thousands of report lines the whole time.
+* **ADDED 2026-09-16 — the one-entry cycle above is the narrow case.** VOICE_ON
+  for a handle already *anywhere* in the list takes the same TOP-insert branch
+  and forms a ring of length ≥ 2, which `RECOMP_APU_REON_HEAD_NOP` does not
+  cover and nothing counted. Existing transcripts already show them
+  (`2D:v68[]<-v69` then `2D:v69[]<-v68`). Instrumented as `[APU-CYCLE]` plus a
+  `C` flag in the idle ring; `RECOMP_APU_CYCLE_BREAK` is the behaviour change
+  and is **off** pending a run count. See
+  `handovers/HANDOVER_2026-09-16_THE_INSTRUMENTS_WERE_LYING.txt` §4.
 
 ### 3. Stability
 * ~13% of runs SIGSEGV. *2026-09-15: NOT the OHCI path.* All ten faults recorded

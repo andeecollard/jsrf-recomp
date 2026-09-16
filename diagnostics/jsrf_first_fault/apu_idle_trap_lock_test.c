@@ -61,6 +61,7 @@ int xbox_VideoIsPlaying(void) { return 0; }
 
 extern unsigned long g_idle_trap_raises;
 extern unsigned long g_idle_trap_locked_raises;
+extern unsigned long g_idle_trap_locked_encounters;
 extern unsigned long g_idle_trap_lock_suppressed;
 extern unsigned long g_idle_trap_never_on_raises;
 extern unsigned long g_idle_trap_ring;
@@ -178,6 +179,7 @@ int main(int argc, char **argv)
     CHECK(g_idle_trap_from[last_slot()] == 0xFFFF);  /* straight off TVL */
     CHECK(g_idle_trap_never_on_raises >= 1);
     CHECK(g_idle_trap_locked_raises == 0);
+    CHECK(g_idle_trap_locked_encounters == 0);
     CHECK(g_idle_trap_lock_suppressed == 0);
 
     /* Resume the front end, the way the guest's ISR does, so the next frame is
@@ -192,14 +194,20 @@ int main(int argc, char **argv)
 
     unsigned long raises1 = g_idle_trap_raises;
     unsigned long locked1 = g_idle_trap_locked_raises;
+    unsigned long enc1 = g_idle_trap_locked_encounters;
     unsigned long suppressed1 = g_idle_trap_lock_suppressed;
     mcpx_apu_vp_frame(apu, mixbins);
 
-    /* Counted in BOTH arms. This is what lets a single run with the guard off
-     * say whether the guard would have mattered to the raise that killed it. */
-    CHECK(g_idle_trap_locked_raises == locked1 + 1);
+    /* ENCOUNTERS are counted in both arms -- that is what lets a single run
+     * with the guard off say whether the guard would have mattered to the
+     * raise that killed it. RAISES are not, and must not be: the whole point
+     * of the guard is that it does not raise. Asserting both here is what
+     * keeps the two from being conflated again, which is exactly how the
+     * guard's justification came to quote a ratio of unlike things. */
+    CHECK(g_idle_trap_locked_encounters == enc1 + 1);
 
     if (!guard) {
+        CHECK(g_idle_trap_locked_raises == locked1 + 1);
         /* Default behaviour, unchanged: the locked voice is still reported,
          * and the ring now says it was locked when we reported it. */
         CHECK(g_idle_trap_raises == raises1 + 1);
@@ -214,6 +222,7 @@ int main(int argc, char **argv)
          * carries on, so BEHIND is reported instead. Both halves matter: the
          * first is the fix, the second is the proof that the fix did not just
          * switch the idle-voice machinery off. */
+        CHECK(g_idle_trap_locked_raises == locked1);   /* withheld */
         CHECK(g_idle_trap_lock_suppressed == suppressed1 + 1);
         CHECK(g_idle_trap_raises == raises1 + 1);
         CHECK(r[NV_PAPU_FEDECPARAM / 4] == BEHIND);

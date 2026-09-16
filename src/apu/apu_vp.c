@@ -471,6 +471,13 @@ unsigned long g_idle_trap_ring;
 #define IDLE_TRAP_WHY_NEVER_ON (1u << 1)  /* no VOICE_ON for this handle, ever */
 #define IDLE_TRAP_WHY_PERSIST  (1u << 2)  /* CFG_FMT PERSIST -- the ISR returns */
 #define IDLE_TRAP_WHY_REPEAT   (1u << 3)  /* same handle as the previous raise */
+/* THE FLAG THE FATAL ENTRY WAS MISSING. A run's last ring entry has so far
+ * carried no flags at all -- not locked, not never-on -- which is what says a
+ * third mechanism exists. This one asks the remaining question: was this voice
+ * ever found twice in a single list walk, i.e. is it in a ring our TVL will go
+ * on naming after the guest has removed it? Sticky per voice, set by the walk's
+ * cycle detector, so reading it here costs a bitmap test. */
+#define IDLE_TRAP_WHY_CYCLE    (1u << 4)  /* handle seen twice in one walk */
 uint8_t  g_idle_trap_why[16];
 uint16_t g_idle_trap_from[16];   /* predecessor handle, 0xFFFF = straight off TVL */
 uint32_t g_idle_trap_fmt[16];    /* the voice's CFG_FMT as the raise found it */
@@ -483,6 +490,22 @@ uint8_t  g_idle_trap_list[16];   /* 0 = 2D, 1 = 3D, 2 = MP */
  * g_idle_trap_raises is the positive control for all three: a zero here beside
  * a zero there says only that nothing trapped, which proves nothing about the
  * instrument. Read them as a pair. */
+/* TWO COUNTERS, BECAUSE THEY HAVE DIFFERENT DENOMINATORS AND ONE OF THEM ONCE
+ * MASQUERADED AS THE OTHER.
+ *
+ * _encounters is every time the walk finds an inactive voice whose lock the
+ * guest holds -- 1500 Hz, per voice, per list, whether or not a raise follows.
+ * _raises is the subset that actually became an SE2FE_IDLE_VOICE.
+ *
+ * They were one counter, incremented outside the raise gate and printed beside
+ * `raises` as though it were a subset of it. It is not, and it is not even
+ * bounded by it: 42 of the 152 distinct [APU-IDLE-TRAP] lines in build-macos
+ * read locked > raises, e.g. `raises=10536 locked=16384`. The "56% of raises
+ * happen while locked" figure that justified the lock guard was 13,294
+ * ENCOUNTERS over 23,933 RAISES -- a ratio of two different things, and not a
+ * percentage of anything. Found by audit, 16 Sep 2026; see the guard's own
+ * comment above, which has been corrected. */
+unsigned long g_idle_trap_locked_encounters;
 unsigned long g_idle_trap_locked_raises;
 unsigned long g_idle_trap_never_on_raises;
 unsigned long g_idle_trap_repeat_raises;
@@ -565,11 +588,14 @@ int mcpx_apu_idle_trap_lock_guard(void)
          * for ever. The guard advances the cursors so it cannot pin the WALK,
          * but nothing was checked about what happens to the voice.
          *
-         * THE MEASUREMENT THAT MOTIVATED IT IS STILL GOOD -- 13,294 of 23,933
-         * raises happen while the guest holds that voice's lock, and that
-         * window is real. What is not established is that suppressing the
-         * raise is a safe way to close it. A fix that makes the crash worse is
-         * not a fix, however good the reasoning behind it was.
+         * THE MEASUREMENT THAT MOTIVATED IT WAS NOT WHAT IT SAID IT WAS.
+         * "13,294 of 23,933 raises happen while the guest holds that voice's
+         * lock" is two counters with different denominators divided into each
+         * other -- see the correction further down. The WINDOW is real and was
+         * established by reading VOICE_ON, not by that ratio. What was never
+         * established is either its size or that suppressing the raise is a
+         * safe way to close it. A fix that makes the crash worse is not a fix,
+         * however good the reasoning behind it was.
          *
          * Kept as a switch because the counters behind it are what found the
          * window, and because the next attempt needs this arm to compare
@@ -587,8 +613,24 @@ int mcpx_apu_idle_trap_lock_guard(void)
          *
          *     raises=23933  locked=13294  never_on=0  repeat=23500
          *
-         * 56% of idle-voice raises happen while the guest holds the voice lock
-         * on that voice, which is the window: VOICE_ON publishes the handle to
+         * CORRECTED 16 Sep 2026, AND THE CORRECTION MATTERS. That 13,294 was
+         * not a subset of that 23,933. The `locked` counter lived outside the
+         * raise gate, so it counted every locked ENCOUNTER during a walk --
+         * 1500 Hz, per voice, per list -- while `raises` counted raises. The
+         * "56%" derived from them is a ratio of two different populations and
+         * is not a percentage of anything; in 42 of the 152 distinct report
+         * lines in build-macos the "subset" is larger than the set it was
+         * supposedly a subset of. The counter is now split into
+         * locked_enc and locked_raises and the guard's justification has to be
+         * re-derived from a run that prints the second.
+         *
+         * That mis-sized number is the best available explanation for why this
+         * guard's effect was predicted so badly -- defaulting it on took the
+         * fault from ~5 in 25 runs at t=34-35 s to 4 of 4 at t=24.03 s. Do not
+         * re-enable it on the strength of anything above.
+         *
+         * The MECHANISM below is unaffected by the arithmetic error, and is
+         * still the window: VOICE_ON publishes the handle to
          * the voice list about eighty lines before it sets ACTIVE_VOICE, on a
          * guest thread, and the walk runs on the frame thread. A walk landing
          * in that gap calls an inactive voice idle and hands DirectSound a
@@ -618,6 +660,7 @@ unsigned long g_apu_fedec_held;
 
 unsigned long g_apu_voice_on_count;
 unsigned long g_apu_voice_off_count;
+unsigned long g_apu_voice_off_already_count; /* retired a voice already inactive */
 unsigned long g_apu_voice_release_count;
 unsigned long g_apu_idle_trap_count;
 unsigned long g_apu_voice_process_count;
@@ -816,6 +859,73 @@ unsigned long g_apu_voice_on_inherit_count;
 unsigned long g_apu_voice_on_self_ante_count;
 unsigned long g_apu_voice_on_self_link_count;
 
+/* CYCLES OF LENGTH >= 2, WHICH NOTHING HERE HAS EVER LOOKED FOR.
+ *
+ * g_apu_voice_on_self_link_count catches link(v)==v, the one-entry cycle whose
+ * consequences are written up at length above the REON_HEAD_NOP guard. The
+ * general case is the same failure one notch out and has no instrument at all:
+ * VOICE_ON for a handle that is already somewhere in the list -- not at the
+ * head, so the head_nop guard does not apply -- takes the TOP-insert branch,
+ * writes link(v) = regs[top], and splices v in front of a list that still
+ * reaches v. The result is a ring, and everything behind the splice point is
+ * unreachable.
+ *
+ * Three things follow, and only the first is a waste of CPU:
+ *   - the walk spins to its 256-iteration cap every subframe. The cap's break
+ *     logs through DPRINTF, which compiles to nothing, so it is silent.
+ *   - voices inside the ring are rendered MORE THAN ONCE per subframe, each
+ *     pass advancing cbo and ssl_seg again. A streaming voice drains at 2x and
+ *     starves; a looping voice plays at 2x pitch. That is an audio-sync
+ *     mechanism independent of the output clock.
+ *   - our TVL keeps naming a ring member for ever. The guest's RemoveIdleVoice
+ *     repairs ITS list and clears the owner, but cannot repair ours, so every
+ *     later walk finds the voice inactive and still reachable and raises
+ *     SE2FE_IDLE_VOICE for a handle whose owner is NULL -- which is
+ *     sub_001A2E2E with ecx=0, the top crash site, arrived at without either
+ *     of the two windows the existing guards were built for. A THIRD
+ *     MECHANISM, and the one that fits the fatal ring entry carrying no flags.
+ *
+ * COUNTERS ONLY. The walk still breaks where it always did. cycle_break is the
+ * behaviour change and it is OFF: this repository has already shipped one APU
+ * guard on an argument and made the crash worse, and the rule that came out of
+ * that is a run count, not a better argument. What these answer first is
+ * whether the rings exist at all -- and the existing idle-ring transcripts say
+ * they do, e.g. `2D:v68[]<-v69` followed by `2D:v69[]<-v68`.
+ *
+ * Positive control for relink: g_apu_voice_on_top_count, which is nonzero in
+ * every run. relink must never exceed it, and must be >= self_link. */
+unsigned long g_apu_voice_on_relink_count;   /* VOICE_ON for a handle already in the list */
+unsigned long g_apu_list_cycles_seen;        /* walks that revisited a voice */
+unsigned long g_apu_list_cycle_breaks;       /* ...and stopped early because of it */
+unsigned      g_apu_list_cycle_last;         /* the voice that closed the last one */
+unsigned      g_apu_list_cycle_list;
+static uint64_t g_apu_voice_in_cycle[4];     /* per-voice sticky bit, for the ring flag */
+
+int mcpx_apu_cycle_break(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_CYCLE_BREAK");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
+/* Is `h` reachable from the head of `top_reg`'s list? Bounded by the voice
+ * count, so it terminates on a list that is already a ring. */
+static int voice_list_contains(MCPXAPUState *d, unsigned top_reg, uint16_t h)
+{
+    uint16_t cur = (uint16_t)d->regs[top_reg];
+    int i;
+    for (i = 0; i < MCPX_HW_MAX_VOICES && cur != 0xFFFF; i++) {
+        if (cur >= MCPX_HW_MAX_VOICES) break;
+        if (cur == h) return 1;
+        cur = (uint16_t)voice_get_mask(d, cur, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                       NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+    }
+    return 0;
+}
+
 void mcpx_apu_voice_report(void)
 {
     fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu release=%lu idle_trap=%lu"
@@ -828,6 +938,16 @@ void mcpx_apu_voice_report(void)
             g_apu_fe_method_count, g_apu_set_current_voice_count,
             g_apu_voice_on_loop_count, g_apu_guest_method_count,
             g_apu_voice_off_command_count);
+    /* off_already: see voice_off. raises-vs-idle_trap: g_apu_idle_trap_count
+     * only increments when FETFORCE1 has SE2FE_IDLE_VOICE armed, but fe_method
+     * writes FEDECMETH/FEDECPARAM BEFORE that test -- so if the guest ever
+     * clears FETFORCE1 the two diverge, and each unarmed raise still clobbers
+     * the decode pair the guest's polling ISR reads. Equal in every run so far,
+     * and nothing asserted it; printing the difference is what makes a
+     * divergence visible the first time it happens. */
+    fprintf(stderr, "  [APU-VOICE2] off_already=%lu raises_minus_idle_trap=%ld\n",
+            g_apu_voice_off_already_count,
+            (long)g_idle_trap_raises - (long)g_apu_idle_trap_count);
     {
         unsigned k;
         fprintf(stderr, "  [VOICE-RELINK] links changed behind the model: %lu"
@@ -853,6 +973,13 @@ void mcpx_apu_voice_report(void)
             g_apu_antecedent_set_count, g_apu_voice_on_top_count,
             g_apu_voice_on_inherit_count, g_apu_voice_on_self_ante_count,
             g_apu_voice_on_self_link_count);
+    fprintf(stderr, "  [APU-CYCLE] relink=%lu (of %lu top inserts)"
+            " walks_with_a_cycle=%lu broken=%lu last=v%u/list%u"
+            " (cycle_break %s)\n",
+            g_apu_voice_on_relink_count, g_apu_voice_on_top_count,
+            g_apu_list_cycles_seen, g_apu_list_cycle_breaks,
+            g_apu_list_cycle_last, g_apu_list_cycle_list,
+            mcpx_apu_cycle_break() ? "on" : "OFF");
     mcpx_apu_idle_trap_report(0);
     fflush(stderr);
 }
@@ -890,9 +1017,11 @@ void mcpx_apu_idle_trap_report(int crash)
     unsigned long r = g_idle_trap_ring;
     unsigned i, n, base;
 
-    fprintf(stderr, "  [APU-IDLE-TRAP] raises=%lu locked=%lu never_on=%lu"
+    fprintf(stderr, "  [APU-IDLE-TRAP] raises=%lu locked_raises=%lu"
+            " locked_enc=%lu never_on=%lu"
             " repeat=%lu lock_suppressed=%lu (lock_guard %s)\n",
             g_idle_trap_raises, g_idle_trap_locked_raises,
+            g_idle_trap_locked_encounters,
             g_idle_trap_never_on_raises, g_idle_trap_repeat_raises,
             g_idle_trap_lock_suppressed,
             mcpx_apu_idle_trap_lock_guard() ? "on" : "OFF");
@@ -931,12 +1060,13 @@ void mcpx_apu_idle_trap_report(int crash)
     for (i = 0; i < n; ++i) {
         unsigned k = (base + i) & 15u;
         uint8_t w = g_idle_trap_why[k];
-        char flags[5];
+        char flags[6];
         unsigned f = 0;
         if (w & IDLE_TRAP_WHY_LOCKED)   flags[f++] = 'L';
         if (w & IDLE_TRAP_WHY_NEVER_ON) flags[f++] = 'N';
         if (w & IDLE_TRAP_WHY_PERSIST)  flags[f++] = 'P';
         if (w & IDLE_TRAP_WHY_REPEAT)   flags[f++] = 'R';
+        if (w & IDLE_TRAP_WHY_CYCLE)    flags[f++] = 'C';
         flags[f] = 0;
         static const char *const lname[] = { "2D", "3D", "MP" };
         const char *ln = g_idle_trap_list[k] < 3 ? lname[g_idle_trap_list[k]]
@@ -970,6 +1100,23 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     voice_lifecycle_note(d, v, "retire");
     g_apu_voice_off_count++;
     voice_ev_note(1, v);
+
+    /* RETIRING A VOICE THAT WAS ALREADY RETIRED posts a SECOND
+     * MCPX_HW_NOTIFIER_SSLA_DONE for it, into guest memory, and re-raises
+     * FEVINTSTS|FENINTSTS. If DirectSound has already torn down the object
+     * behind that buffer, the second notification arrives for something that
+     * no longer exists -- a route to the same class of fault as the idle trap
+     * and entirely independent of it.
+     *
+     * Reported rather than suppressed, because suppressing it is a guess about
+     * hardware and this model has already been burned by shipping one of those
+     * (see the lock guard). The arithmetic says it happens: off=415 against
+     * on=409 in gpuvsh565, so at least six voices were retired twice.
+     * Positive control: g_apu_voice_off_count, nonzero in every run. */
+    if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+        g_apu_voice_off_already_count++;
+
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -1171,6 +1318,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
              * untouched.
              *
              * RECOMP_APU_REON_HEAD_NOP=0 restores the overwrite for A/B. */
+            /* BEFORE the insert, because after it the answer is always yes.
+             * head_nop's guard only covers regs[top]==selected; this says how
+             * often selected was already reachable from somewhere DEEPER,
+             * which is the case that forms a ring of length >= 2 and the case
+             * nothing here has ever counted. */
+            if (voice_list_contains(d, top_reg, (uint16_t)selected_handle))
+                g_apu_voice_on_relink_count++;
+
             if (d->regs[top_reg] == selected_handle
                 && mcpx_apu_reon_head_nop()) {
                 g_apu_voice_on_head_nop++;
@@ -1350,7 +1505,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_SET_VOICE_TAR_HRTF: {
         int handle = GET_MASK(argument, NV1BA0_PIO_SET_VOICE_TAR_HRTF_HANDLE);
-        int current_voice = d->regs[NV_PAPU_FECV];
+        /* FECV is stored unmasked (see SET_CURRENT_VOICE) and every other
+         * reader casts it to uint16_t. This one did not, and indexed
+         * d->vp.filters[] with the signed result guarded only from above -- a
+         * negative value passed the test and wrote out of bounds. Match the
+         * other readers. This title never writes a handle >= 0x100, so the
+         * defect is a code property rather than a live bug; the disagreement
+         * between the two idioms is the thing being fixed. */
+        unsigned current_voice = (uint16_t)d->regs[NV_PAPU_FECV];
         voice_set_mask(d, (uint16_t)current_voice,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE, handle);
@@ -2345,11 +2507,21 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
         produced++;
 
         rs->phase += step;
-        while (rs->phase >= 1.0f && rs->ncarry > 0) {
+        while (rs->phase >= 1.0f) {
+            /* SNAPSHOT, because the guest thread can zero ncarry under us.
+             * voice_reset_filters -> voice_resample_reset runs from VOICE_ON on
+             * a guest thread while this runs on the frame thread. Re-reading
+             * rs->ncarry between the test and the length computation meant a
+             * reset landing in that gap made (size_t)(0 - 1) == SIZE_MAX the
+             * memmove length: a host SEGV, in a subsystem that already has an
+             * unexplained crash. The window is narrow and may never have
+             * fired; it costs one local to close. */
+            int n = rs->ncarry;
+            if (n <= 0) break;
             rs->phase -= 1.0f;
             memmove(&rs->carry[0], &rs->carry[1],
-                    (size_t)(rs->ncarry - 1) * sizeof rs->carry[0]);
-            rs->ncarry--;
+                    (size_t)(n - 1) * sizeof rs->carry[0]);
+            rs->ncarry = n - 1;
         }
     }
     voice_short_note(v, produced, requested_num);
@@ -2750,13 +2922,44 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                        == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
         if (!hold) d->regs[current] = d->regs[top];
 
+        uint64_t walk_seen[MCPX_HW_MAX_VOICES / 64] = { 0 };
+        int cycle_noted = 0;
+
         for (int i = 0; cur != 0xFFFF; i++) {
             if (i >= MCPX_HW_MAX_VOICES) {
+                /* DPRINTF compiles to nothing, so this break has been silent
+                 * for the life of the file -- a list that rings burns 256
+                 * iterations here every subframe and says so nowhere. The
+                 * cycle detector below is what makes it visible; this stays as
+                 * the backstop for a list that is long rather than circular. */
                 DPRINTF("Voice list contains invalid entry!\n");
                 break;
             }
 
             uint16_t v = cur;
+
+            /* A VOICE SEEN TWICE IN ONE WALK IS A RING. See the [APU-CYCLE]
+             * block for why that matters and why the break is opt-in. The
+             * bitmap is 32 bytes on the stack, cleared once per list per
+             * subframe; the test is two instructions per voice. */
+            if (v < MCPX_HW_MAX_VOICES) {
+                uint64_t bit = 1ULL << (v & 63);
+                if (walk_seen[v >> 6] & bit) {
+                    if (!cycle_noted) {
+                        cycle_noted = 1;
+                        g_apu_list_cycles_seen++;
+                    }
+                    g_apu_list_cycle_last = v;
+                    g_apu_list_cycle_list = (unsigned)list;
+                    g_apu_voice_in_cycle[v >> 6] |= bit;
+                    if (mcpx_apu_cycle_break()) {
+                        g_apu_list_cycle_breaks++;
+                        break;
+                    }
+                } else {
+                    walk_seen[v >> 6] |= bit;
+                }
+            }
 
             /* NEXT_VOICE_HANDLE is a full 16-bit field (mask 0x0000FFFF) and
              * the terminator is 0xFFFF, so the loop condition above admits
@@ -2889,9 +3092,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * one a guard that silently suppressed would destroy. */
                 int suppress = 0;
                 if (locked) {
-                    g_idle_trap_locked_raises++;
+                    g_idle_trap_locked_encounters++;
                     if (mcpx_apu_idle_trap_lock_guard()) {
-                        g_idle_trap_lock_suppressed++;
+                        /* Only when a raise would otherwise have happened.
+                         * Counting it under trap_held too would have the guard
+                         * claiming credit for raises the coalescing had already
+                         * withheld. */
+                        if (!trap_held) g_idle_trap_lock_suppressed++;
                         suppress = 1;
                     }
                 }
@@ -2911,7 +3118,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         && g_idle_trap_last[(g_idle_trap_ring - 1) & 15u] == v)
                         why |= IDLE_TRAP_WHY_REPEAT;
 
+                    if (locked)   g_idle_trap_locked_raises++;
                     if (!ever_on) g_idle_trap_never_on_raises++;
+                    if (v < MCPX_HW_MAX_VOICES
+                        && (g_apu_voice_in_cycle[v >> 6] & (1ULL << (v & 63))))
+                        why |= IDLE_TRAP_WHY_CYCLE;
                     if (why & IDLE_TRAP_WHY_REPEAT) g_idle_trap_repeat_raises++;
 
                     voice_lifecycle_note(d, v, "idle");

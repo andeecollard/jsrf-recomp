@@ -189,6 +189,15 @@ add_test(NAME jsrf_apu_idle_trap_lock_default
 add_test(NAME jsrf_apu_idle_trap_lock_guard
          COMMAND jsrf_apu_idle_trap_lock_test guard)
 
+# The output CLOCK, which was 48003 Hz for the life of the file because an EP
+# frame is 5333 AND ONE THIRD microseconds and the third was truncated away.
+# Arithmetic, so it is tested as arithmetic and with no tolerance -- a
+# tolerance is exactly what hides a 62 ppm error. The field confirmation is
+# [APU-PACE] out_hz, which now reads 48000.
+add_executable(jsrf_apu_pace_test apu_pace_test.c)
+target_link_libraries(jsrf_apu_pace_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_pace COMMAND jsrf_apu_pace_test)
+
 # The audio OUTPUT path, which nothing here had ever driven. A run whose host
 # audio device fails reads [APU-PACE] gen_hz=0 batches=0 frames=0 -- every one
 # of those a sink counter -- while the engine upstream is fine, and ctest could

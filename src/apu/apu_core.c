@@ -593,6 +593,22 @@ void mcpx_apu_pacing_report(void)
     fflush(stderr);
 }
 
+/* One EP frame later, carrying the third of a microsecond in *frac.
+ *
+ * Exposed rather than inlined so the arithmetic can be tested without a clock
+ * or a device -- see diagnostics/jsrf_first_fault/apu_pace_test.c, which
+ * checks it with NO tolerance over a second and over a thousand, because a
+ * tolerance is exactly what hid a 62 ppm error for the life of the file. */
+int64_t mcpx_apu_ep_frame_advance(int64_t next_us, int *frac)
+{
+    next_us += EP_FRAME_US;
+    if (++*frac >= 3) {      /* 3 frames = 16000 us exactly = 768 samples */
+        *frac = 0;
+        next_us += 1;
+    }
+    return next_us;
+}
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
@@ -609,6 +625,7 @@ static void throttle(MCPXAPUState *d)
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_FRAME_US) {
         d->next_frame_time_us = now_us;
+        d->ep_frame_frac = 0;      /* re-anchored; the owed third goes with it */
     }
 
     int64_t wait_start_us = now_us;
@@ -621,7 +638,27 @@ static void throttle(MCPXAPUState *d)
             break;
         }
     }
-    d->next_frame_time_us += EP_FRAME_US;
+    /* ONE THIRD OF A MICROSECOND PER FRAME, AND IT IS THE AUDIO DRIFT.
+     *
+     * 256 samples at 48 kHz is 5333.333... us. EP_FRAME_US truncates that to
+     * 5333, so a bare `+= EP_FRAME_US` paces the frame thread at 256/0.005333
+     * = 48003.0 Hz against a device consuming at 48000: the model generates
+     * 62.5 ppm more audio than is played, forever, and the difference piles up
+     * in the output queue.
+     *
+     * This is measured, and it has been sitting in every run's report unread.
+     * `[APU-PACE] out_hz=` reads 48003-48004 in 4,000+ report lines across
+     * build-macos and 48000 in 96; and `queued=` climbs monotonically within a
+     * single run -- 6144 bytes to 10240 over 200 s of gpuvsh565, about 21 ms of
+     * added latency, 6 ms of audio lag per minute that never comes back. Long
+     * enough and apu_sdl2.c's APU_MAX_QUEUE_BYTES guard flushes the whole
+     * queue, which is the audible jump at the end of a long session.
+     *
+     * So carry the remainder. Three frames are exactly 16000 us. (The residual
+     * drift after this is host-device clock error, which is not ours; out_hz
+     * should read 48000 and queued should stop trending.) */
+    d->next_frame_time_us =
+        mcpx_apu_ep_frame_advance(d->next_frame_time_us, &d->ep_frame_frac);
 
     /* Measured from before the wait loop. now_us is whatever the loop's last
      * iteration read -- the moment it decided not to wait any longer -- so
@@ -675,8 +712,12 @@ static void se_frame(MCPXAPUState *d)
 
 /* Frame accounting for the sound-engine gate.
  *
- * se_frame is skipped whenever the front end is not free-running, and that
- * includes TRAPPED -- the mode every voice retirement drives. Whether the skip
+ * se_frame is skipped whenever the front end is not free-running. That USED to
+ * include TRAPPED -- the mode every voice retirement drives -- but since
+ * mcpx_apu_se_while_trapped() defaulted on, a trapped frame still runs. So
+ * `trapped` below counts time spent trapped and `trapped_skipped` counts the
+ * frames actually lost to it; with the current default the second is 0 and
+ * that zero is a fact about the switch, not about the title. Whether the skip
  * matters is not answerable from a rate: one frame is 32 samples, 0.67 ms at
  * 48 kHz, so losing scattered single frames is inaudible while losing a run of
  * them is a dropout. So count the reasons separately and keep the longest
@@ -685,7 +726,8 @@ static void se_frame(MCPXAPUState *d)
  * Counters only; nothing here changes what the thread does. */
 unsigned long g_apu_frames_total;
 unsigned long g_apu_frames_se;         /* se_frame ran */
-unsigned long g_apu_frames_trapped;    /* skipped: front end trapped */
+unsigned long g_apu_frames_trapped;    /* front end was trapped this frame */
+unsigned long g_apu_frames_trapped_skipped; /* ...and the frame was skipped */
 unsigned long g_apu_frames_halted;     /* skipped: front end halted */
 unsigned long g_apu_frames_xcnt_off;   /* skipped: sample counter off */
 unsigned long g_apu_frames_tone;       /* skipped: test tone owns the output */
@@ -707,11 +749,13 @@ void mcpx_apu_frame_report(void)
 {
     double ms = g_apu_trapped_run_max * (double)NUM_SAMPLES_PER_FRAME / 48.0;
     fprintf(stderr, "  [APU-FRAME] total=%lu se=%lu trapped=%lu halted=%lu"
+            " trapped_skipped=%lu"
             " xcnt_off=%lu tone=%lu episodes=%lu mean_run=%.1f"
             " longest_trapped_run=%lu (%.2f ms)"
             " lock_handoffs=%lu\n",
             g_apu_frames_total, g_apu_frames_se, g_apu_frames_trapped,
-            g_apu_frames_halted, g_apu_frames_xcnt_off, g_apu_frames_tone,
+            g_apu_frames_halted, g_apu_frames_trapped_skipped,
+            g_apu_frames_xcnt_off, g_apu_frames_tone,
             g_apu_trap_episodes,
             g_apu_trap_episodes ? (double)g_apu_frames_trapped
                                   / (double)g_apu_trap_episodes : 0.0,
@@ -930,11 +974,25 @@ static void *mcpx_apu_frame_thread(void *arg)
                           femethmode != NV_PAPU_FECTL_FEMETHMODE_HALTED;
 
         g_apu_frames_total++;
+        /* TRAPPED FRAMES, WHETHER OR NOT THE FRAME WAS SKIPPED.
+         *
+         * This used to live inside the !apu_active arm below, which made it
+         * "frames skipped BECAUSE trapped" -- and apu_active is true while
+         * trapped once mcpx_apu_se_while_trapped() is on, which has been the
+         * default since 15 Sep. So the counter has been structurally zero ever
+         * since, and printed itself zero next to episodes=17720 and
+         * longest_trapped_run=47 on the same report line without anyone
+         * noticing the contradiction. mean_run divides by it.
+         *
+         * Any earlier conclusion of the form "trapped frames fell to zero" is
+         * an artefact of that default moving, not of whatever was under test. */
+        if (femethmode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+            g_apu_frames_trapped++;
         if (!apu_active) {
             if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF)
                 g_apu_frames_xcnt_off++;
             else if (femethmode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
-                g_apu_frames_trapped++;
+                g_apu_frames_trapped_skipped++;
             else if (femethmode == NV_PAPU_FECTL_FEMETHMODE_HALTED)
                 g_apu_frames_halted++;
         } else if (g_test_tone.active) {

@@ -1,0 +1,410 @@
+HANDOVER 2026-09-16 -- THE INSTRUMENTS WERE LYING
+
+Supersedes nothing about the picture or the frame rate; those stand as
+HANDOVER_2026-09-16_SIXTY_FPS_AND_THE_PICTURE_IS_RIGHT.txt left them. This is
+about a different thing: a session spent auditing rather than changing, and
+what the audit found was that several of the numbers this project has been
+reasoning from do not mean what they say.
+
+Read CLAUDE.md first. The rule "read a counter's trigger before trusting its
+value" was already in it. This session is what happens when you actually do
+that across a whole subsystem.
+
+
+=============================================================================
+1. THE NV2A APERTURE IS NOW ALIASED, AND CLAUDE.MD'S OPEN NOTE IS CLOSED
+=============================================================================
+
+CLAUDE.md carried a rule ending "PCRTC_INTR_0 and PGRAPH_INTR still have this
+shape." They did:
+
+  xbox_Nv2aRaiseVblank          unprotect, |= 1, reprotect -- 60 to 120 times
+                                a second, on the page holding the register the
+                                guest's vsync pump reads
+  xbox_Nv2aRaiseSoftwareMethod  five stores with the whole 16 KB PGRAPH page
+                                writable across all of them, and the reprotect's
+                                return value discarded
+
+A guest store landing in either window completes silently against RAM instead
+of faulting into the model. That is the failure that cost 13.5M windows in 45 s
+on the APU aperture and swallowed every VOICE_ON.
+
+WHY NOBODY NOTICED: the detector cannot see the thing it was built to catch.
+pcrtc_check compares the register against what the runtime last left there, but
+the store at risk is the guest's write-1-to-clear of a bit that is ALREADY 1 --
+so a lost store leaves the register bit-identical and the check compares 1
+against 1 and returns. And its only call site is inside the vblank raise, which
+stops being called once a lost acknowledge latches the pending bit. The
+counter's ceiling is one. It printed zero and read as an all-clear.
+
+THE FIX IS THE ONE MCPX ALREADY HAD: one CreateFileMappingA, two
+MapViewOfFileEx views. The guest's view stays PAGE_READONLY for the life of the
+process; the runtime writes through an alias. No window, so nothing to race and
+nothing to detect.
+
+  [NV2A] aperture aliased at 0x10cf6c000; the guarded view is never unprotected
+  [MCPX] aperture aliased at 0x10df6c000; the guarded view is never unprotected
+
+Verified by a 200 s scripted run: 199 s of presented frames, every one CHANGED,
+no guest fault. The vblank path is the one this change puts at risk and the
+guest advanced through all of it.
+
+ANYTHING NEW THAT MUST WRITE A GUARDED DEVICE REGISTER GOES THROUGH THE ALIAS.
+CLAUDE.md now says so.
+
+
+=============================================================================
+2. THE OUTPUT CLOCK WAS 48003 Hz, AND THAT IS THE AUDIO DRIFT
+=============================================================================
+
+This is the answer to "the sound goes out of sync over the course of a run",
+and it had been printing itself in every run's report since the file was
+written.
+
+An EP frame is 256 samples at 48 kHz: 5333 AND ONE THIRD microseconds.
+EP_FRAME_US is 5333. throttle() added it bare. So the model paced itself at
+256/0.005333 = 48003.0 Hz against a device consuming at 48000 -- 62.5 ppm more
+audio generated than played, for ever.
+
+MEASURED, from an existing log, without needing a new run
+(build-macos/jsrf-first-fault/frame-bisect/last/gpuvsh565/stderr.log):
+
+  [APU-PACE] elapsed=270.0s subframes=405080 ... throttle=50636 ...
+
+  subframes/throttle = 7.99984, so one throttle is one EP frame of 256 samples.
+  50,636 throttles x 256 samples = 12,962,816 samples
+  delivered over elapsed = 270.04 s
+  => 48,003.4 Hz. Exactly the predicted truncation error.
+
+And the consequence, also already printed and never read: `queued=` climbs
+monotonically inside a single run -- 6144 bytes to 10240 over 200 s of
+gpuvsh565. About 21 ms of audio latency added and never given back, roughly
+6 ms per minute. apu_sdl2.c flushes the entire queue once it passes
+APU_MAX_QUEUE_BYTES, which is the audible jump at the end of a long session.
+
+Across build-macos, `out_hz=` reads 48003 or 48004 in thousands of report lines
+and 48000 in 96.
+
+FIXED by carrying the remainder: three EP frames are exactly 16000 us. Pinned
+by diagnostics/jsrf_first_fault/apu_pace_test.c, which tests it as arithmetic
+with NO tolerance -- a tolerance is exactly what hides a 62 ppm error -- over
+one second and over a thousand.
+
+NOTE ON THE REMAINDER: the drift observed in the field is a little larger than
+62.5 ppm. The rest is host-device clock and is not ours. Fixing EP_FRAME_US
+removes the half that is.
+
+CONFIRMED IN THE FIELD, on completed runs: out_hz=48001 (apuclock1, 220.1 s)
+and out_hz=48000 (apuclock2, 220.0 s). Across build-macos before the change it
+reads 48003 or 48004 in thousands of lines. The residual +-1 Hz is the
+resolution of a windowed rate at this length, not drift.
+
+DO NOT QUOTE out_hz FROM A RUN IN PROGRESS. It is a windowed rate and it
+wanders by several Hz early in a run. This session read it mid-run, got 48000,
+said so, and had to withdraw it ten minutes later when the same grep returned
+48002 on the same file. Same class of error as quoting a frame time from an
+unfinished run, which this project has also done. Read the LAST line of a
+COMPLETED run.
+
+
+=============================================================================
+3. COUNTERS THAT LIE -- THREE FOUND, ALL FIXED
+=============================================================================
+
+3a. `locked` was never a subset of `raises`, and the number that justified
+    the lock guard was not the number it was reported as.
+
+    g_idle_trap_locked_raises was incremented OUTSIDE the raise gate, so it
+    counted every locked ENCOUNTER during a walk -- 1500 Hz, per voice, per
+    list -- while g_idle_trap_raises counted actual raises. They were printed
+    side by side as though one were a subset of the other.
+
+    MEASURED: 42 of the 152 distinct [APU-IDLE-TRAP] lines in build-macos have
+    locked > raises. e.g. `raises=10536 locked=16384`.
+
+    CONSEQUENCE, and it is not small. apu_vp.c carried "13,294 of 23,933 raises
+    happen while the guest holds that voice's lock" as the standing
+    justification for RECOMP_APU_IDLE_TRAP_LOCK_GUARD. That is 13,294
+    ENCOUNTERS over 23,933 RAISES. The "56%" is a ratio of two different
+    populations and is not a percentage of anything. It is the best available
+    explanation for why defaulting that guard on was predicted to help and
+    instead took the fault from ~5 in 25 runs at t=34-35 s to 4 of 4 at
+    t=24.03 s.
+
+    NOW: locked_enc and locked_raises are separate and both printed, and the
+    first gameplay run that printed both SETTLES IT (apuclock2, 220 s, reached
+    gameplay, on=388):
+
+      [APU-IDLE-TRAP] raises=17356 locked_raises=7 locked_enc=17657 ...
+
+    SEVEN. Seven of 17,356 raises -- 0.04% -- happen while the guest holds that
+    voice's lock. The old single counter would have printed `locked=17657`
+    beside `raises=17356` on that same line, which reads as "essentially every
+    raise happens while locked" and would have justified the guard harder still.
+
+    THE LOCK GUARD WAS NEVER THE MECHANISM. That is the whole explanation for
+    why turning it on helped nothing and hurt: it addresses four hundredths of
+    one percent of raises. The window it was built for is real -- that came from
+    reading VOICE_ON, not from the ratio -- and it is negligible. Stop here.
+    See section 4 for what the mechanism actually is.
+
+    g_idle_trap_lock_suppressed had the same flaw and now only counts raises
+    that would actually have happened.
+
+3b. `[APU-FRAME] trapped=` is structurally zero.
+
+    g_apu_frames_trapped++ sat inside `if (!apu_active)`, but apu_active is
+    TRUE while trapped once mcpx_apu_se_while_trapped() is on -- the default
+    since 15 Sep. So it counted "frames SKIPPED because trapped", which is now
+    always 0, and printed itself zero on the same line as episodes=17720 and
+    longest_trapped_run=47 without anyone noticing the contradiction. mean_run
+    divided by it.
+
+    ANY EARLIER CONCLUSION OF THE FORM "trapped frames fell to zero" IS AN
+    ARTEFACT OF THAT DEFAULT MOVING, not of whatever was under test. Worth
+    re-reading the se_ab_* notes with this in mind.
+
+    NOW: `trapped=` counts time spent trapped and `trapped_skipped=` counts
+    frames actually lost to it. mean_run is meaningful again. The first
+    gameplay run to print both:
+
+      [APU-FRAME] total=330032 se=320177 trapped=155956 halted=9855
+                  trapped_skipped=0 ... episodes=12428 mean_run=12.5
+                  longest_trapped_run=63 (42.00 ms)
+
+    FORTY-SEVEN PERCENT of frames are trapped, in episodes averaging 12.5
+    frames. The line used to print trapped=0 for this. trapped_skipped=0 is
+    RECOMP_APU_SE_WHILE_TRAPPED doing its job -- the engine renders through the
+    trap, so no audio is lost to it -- but the storm underneath is entirely
+    intact and is now visible for the first time. It is the same storm section
+    4 explains.
+
+3c. `idle_trap=` counts armed dispatches, not raises.
+
+    g_apu_idle_trap_count only increments when FETFORCE1 has SE2FE_IDLE_VOICE
+    armed -- but fe_method writes FEDECMETH/FEDECPARAM BEFORE that test. If the
+    guest ever clears FETFORCE1 the two diverge silently AND every unarmed
+    raise still clobbers the decode pair the guest's polling ISR reads.
+
+    Equal in every run checked, so currently latent -- and nothing asserted it.
+    [APU-VOICE2] now prints raises_minus_idle_trap so a divergence is visible
+    the first time it happens rather than the first time someone looks.
+
+
+=============================================================================
+4. THE THIRD CRASH MECHANISM: VOICE LISTS THAT RING
+=============================================================================
+
+STATUS: MEASURED, and it is the mechanism. The instrument went in and the
+first gameplay run that carried it answered the question outright.
+
+The recorded story is that VOICE_ON for a voice that is ALREADY ITS LIST'S HEAD
+writes link(v) = regs[top] = v, making a one-entry cycle. That is real and
+RECOMP_APU_REON_HEAD_NOP exists for it.
+
+The general case has no instrument at all. VOICE_ON for a handle that is
+already somewhere in the list -- NOT at the head, so the head_nop guard does not
+apply -- takes the same TOP-insert branch, writes link(v) = regs[top], and
+splices v in front of a list that still reaches v. That is a ring of length >= 2
+and everything behind the splice point becomes unreachable.
+
+THE EXISTING TRANSCRIPTS ALREADY SHOW THEM. From
+frame-bisect/vsh/hwdef/stderr.log:
+
+  [APU-IDLE-RING] ... 2D:v69[]<-TVL  2D:v68[]<-v69  2D:v69[]<-v68 ...
+
+link(v69)=v68 followed by link(v68)=v69, within the first three raises of the
+run. From frame-bisect/cap3/cap64/stderr.log: `3D:v1[R]<-v3` fourteen times
+then `3D:v3[]<-v1`. Rings look like the steady state of these lists, not an
+edge case.
+
+THREE CONSEQUENCES, and only the first is a waste of CPU:
+  - the walk spins to its 256-iteration cap every subframe. Its break logs
+    through DPRINTF, which compiles to nothing, so it has been silent for the
+    life of the file.
+  - voices inside the ring are RENDERED MORE THAN ONCE per subframe, each pass
+    advancing cbo and ssl_seg again. A streaming voice drains at 2x and
+    starves; a looping voice plays at 2x pitch. An audio-sync mechanism
+    independent of the output clock in section 2.
+  - our TVL keeps naming a ring member for ever. The guest's RemoveIdleVoice
+    repairs ITS list and clears the owner but cannot repair ours, so every
+    later walk finds the voice inactive and still reachable and raises
+    SE2FE_IDLE_VOICE for a handle whose owner is NULL. That is sub_001A2E2E
+    with ecx=0 -- the top crash site -- reached without either of the two
+    windows the existing guards were built for.
+
+It also fits the one piece of evidence that killed both previous hypotheses:
+the fatal ring entry carried NO FLAGS. Not locked, not never-on. There was no
+flag for "in a ring", because nothing looked.
+
+THE INSTRUMENTS, all counters, no behaviour change:
+  [APU-CYCLE] relink=N (of M top inserts) walks_with_a_cycle=N broken=N last=vX/listY
+  and a new 'C' flag in the [APU-IDLE-RING] entries.
+
+  relink   VOICE_ON for a handle already reachable from the head, counted
+           BEFORE the insert. Positive control: the "of M top inserts"
+           denominator, nonzero in every run. relink must never exceed it and
+           must be >= self_link.
+  walks_with_a_cycle  a list walk that reached the same voice twice.
+  C        that voice has been seen twice in one walk at some point.
+
+RECOMP_APU_CYCLE_BREAK=1 stops the walk at the revisit instead of spinning to
+the cap. IT IS OFF BY DEFAULT AND MUST STAY OFF UNTIL A RUN COUNT SAYS
+OTHERWISE. This repository has already shipped one APU guard on a good argument
+and made the crash worse; the rule that came out of that is five clean runs
+minimum, not a better argument.
+
+THE RESULT (apuclock2, 220 s, reached gameplay, audio device live):
+
+  [APU-CYCLE] relink=209 (of 388 top inserts) walks_with_a_cycle=184983
+              broken=0 last=v1/list1 (cycle_break OFF)
+  [APU-IDLE-RING] last 16 of 17356, oldest first:
+              3D:v1[RC]<-TVL  x15 and one 3D:v1[RC]<-v1
+  [APU-IDLE] 17356 idle-voice traps over 18 distinct voices;
+              busiest: v1=13957 v5=3203 v3=81 ...
+
+Read that in order:
+
+  relink=209 of 388     FIFTY-FOUR PERCENT of VOICE_ON top inserts are for a
+                        handle ALREADY REACHABLE from the list head. Rings are
+                        not an edge case; they are what this title does. The
+                        denominator is the positive control and the ratio is a
+                        real one this time -- both counters are incremented on
+                        the same event, one line apart.
+  walks_with_a_cycle    184,983 list walks reached the same voice twice.
+    =184983
+  every entry carries C every one of the last sixteen raises is for a voice
+                        that has been seen twice in a single walk.
+  v1=13957 of 17356     one voice, in a ring, taking 80% of all traps -- the
+                        same shape as the one-entry cycle written up on 15 Sep,
+                        but at length >= 2 where REON_HEAD_NOP cannot see it.
+
+broken=0 is the control working as intended: the counters moved with the
+behaviour change OFF, so nothing about this number is an artefact of a fix.
+
+WHAT TO DO NEXT, and it is an A/B not an edit: run with
+RECOMP_APU_CYCLE_BREAK=1 and compare against the arm above. The switch stops
+the walk at the revisit instead of spinning to the 256-iteration cap. Expect
+walks_with_a_cycle unchanged, broken to rise to meet it, and the interesting
+question to be what happens to v1's 13,957 traps and to the fault rate.
+
+IT MUST NOT BE DEFAULTED ON UNTIL THAT SAYS SO ACROSS AT LEAST FIVE RUNS. The
+fault fires in roughly one run in five with everything off, so a single clean
+run proves nothing -- this is the exact rule that came out of shipping the lock
+guard on an argument.
+
+CAVEAT ON GETTING THESE RUNS: with a live audio device the scripted boot
+reaches gameplay in roughly one attempt in three (see the long note at the top
+of play_scripted.sh -- the tension is real and there is no trick for it). Run 1
+of this batch stayed on the title screen with on=4; run 2 reached gameplay.
+Budget several attempts per arm.
+
+
+=============================================================================
+5. SMALLER, FIXED
+=============================================================================
+
+- voice_off posted MCPX_HW_NOTIFIER_SSLA_DONE unconditionally, with no check of
+  the prior ACTIVE_VOICE. Retiring an already-retired voice re-posts into guest
+  memory and re-raises FEVINTSTS|FENINTSTS -- a route to DirectSound touching a
+  torn-down object, independent of the idle trap and not in anyone's model of
+  the crash. The arithmetic says it happens: off=415 against on=409 in
+  gpuvsh565, so at least six voices were retired twice. COUNTED, not
+  suppressed: suppressing it is a guess about hardware and this model has been
+  burned by shipping one of those. [APU-VOICE2] off_already=.
+
+- SET_VOICE_TAR_HRTF indexed d->vp.filters[] with FECV as a SIGNED int, guarded
+  only from above, while every other reader casts it to uint16_t. A negative
+  value passed the test and wrote out of bounds. This title never writes a
+  handle >= 0x100 so it is a code property rather than a live bug; the
+  disagreement between the two idioms is what was fixed.
+
+- voice_resample re-read rs->ncarry between testing it and computing the
+  memmove length. voice_reset_filters runs from VOICE_ON on a GUEST thread
+  while this runs on the FRAME thread, so a reset landing in that gap made
+  (size_t)(0 - 1) == SIZE_MAX the memmove length: a host SEGV, in a subsystem
+  that already has an unexplained crash. Closed with one local.
+
+
+=============================================================================
+6. STILL OPEN
+=============================================================================
+
+From the audit, not acted on, in rough order of value:
+
+- THE WALK DOES NOT UNLINK. Nothing in src/apu ever removes a voice from a
+  list; removal is entirely the guest's job (see the comment at apu_core.c:130).
+  That is believed to match hardware, but combined with section 4 it means our
+  view of the lists can only ever diverge from the guest's, never re-converge.
+
+- RECOMP_APU_SELFLINK_END does not honour the driver's contract. link(v)==v is
+  CMcpxVoiceClient's documented "not in any list" marker, written by
+  SetupVoiceProcessor for all 256 voices at boot. With the switch off we treat
+  it as a successor and raise for a voice the guest has told us it removed;
+  with it on we terminate, which is also wrong because our insert has by then
+  overwritten a real successor. The correct reading at the HEAD is "this list
+  is empty", which is neither behaviour on offer.
+
+- THERE IS NO APU INTERRUPT. pci_irq_assert/deassert are empty stubs and
+  nothing in src/kernel or the harness injects one. SE2FE_IDLE_VOICE reaches
+  the guest ONLY by polling FECTL/FEDECMETH/FEDECPARAM. Every comment in
+  apu_vp.c that reasons about "raising an interrupt" or "126,181 guest
+  interrupts" is reasoning about a delivery mechanism that does not exist here.
+  Practical consequence: the window in which the decode pair must hold still is
+  not "until the ISR runs", it is "until the guest's next poll" -- unbounded and
+  not under our control. Nobody has measured that interval, and it is the real
+  width of the FEDEC corruption window. mcpx_apu_read already sees the polls;
+  histogramming raise-to-next-poll is one counter and one run.
+
+- Voice-list heads are zero-initialised, so all three lists are headed by
+  voice 0 between SECTL being enabled and the guest writing TVL.
+  mcpx_apu_reset_locked, which would fix this, HAS NO CALLERS -- it is dead
+  code. Measured currently benign (never_on=0 across every run, with raises in
+  the tens of thousands as the positive control), but the never_on instrument
+  only covers the inactive branch: if voice 0's ACTIVE_VOICE happened to be set
+  in that uninitialised RAM the walk would PROCESS it with no counter anywhere.
+
+- mcpx_apu_shutdown can hang: mcpx_apu_wait_for_idle waits on d->is_idle, which
+  the frame thread only sets when no software-mixer voice is active.
+  Shutdown-only, low priority.
+
+- get_data_ptr is called with max_sge = 0xFFFFFFFF at both call sites, so its
+  bounds assert can never fire. The mask in apu_shim.h prevents a host OOB, but
+  arbitrary guest memory can be played as audio.
+
+- voice_resample extrapolates past its carry window when rate < 1 (a positive
+  PITCH, source above 48 kHz). Measured unreachable so far: every [VOICE-RATE]
+  line in the tree reports rate min >= 1.0, with the same line's max moving as
+  the positive control.
+
+- E1/E2 races, static only, medium confidence: d->regs[top_reg] is
+  read-modify-written unlocked in VOICE_ON while the guest's own TVL write goes
+  through mcpx_apu_write also unlocked. If a guest `TVL = next` lands between
+  our read and our write it is LOST, and the voice the guest just removed is
+  relinked into our list with its owner already cleared -- a second, independent
+  route to the same fatal state as section 4. Depends on DirectSound genuinely
+  submitting from two threads, which was not established. d->vp.ssl[v] is
+  likewise written from both threads with no lock.
+
+Not from the audit, carried forward:
+
+- Performance. 16.37 ms mean at gameplay, p50 16.3, which straddles 60 fps
+  rather than clearing it. The target is p99 < 16.68 ms, not the mean, because
+  the guest is capped at 59.94 Hz by emulated vblank and kernel_bridge.c drops
+  missed periods -- so every frame over 16.683 ms permanently costs a
+  simulation step. Known headroom: depth read-back debt (~1.1-1.5 ms), narrow
+  per-vertex copies (512 bytes copied to deliver ~64, ~0.7-1.0 ms), skipping
+  the surface-swap sync on a cache hit (~1.35 ms, needs a texture-overlap
+  counter first). The architectural prize is fixed-function vertices: 134 ns of
+  frame each against 35 ns on the GPU path, 6.7 ms of a 16.4 ms frame. Note
+  that in the title-screen scene measured today, vsh draws were 396984 GPU and
+  0 CPU -- the fixed-function cost is a gameplay-scene cost.
+
+- Upstream is 80 commits ahead with translator/lifter fixes worth merging.
+
+- Renderer defects recorded and not fixed: clip_position models a vertex shader
+  that does not exist; nv2a_texture_copy_triangle_depth returns 0 mid-pixel-loop
+  after committing pixels; a retained depth buffer is re-read at new surface
+  geometry; "depth ownership is exclusive" is not enforced when hw_depth_upload
+  fails; shade() drops the CPU's modulate clamp; three sinks implement three
+  z-range policies; the HLSL emitter has a 4th divergence around output w.
