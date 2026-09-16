@@ -1556,6 +1556,15 @@ static uint64_t g_queue_drains;
  * clear refused and took the read-back route, which is a measurement, not a
  * silence: read it before believing a frame-time number. */
 static uint64_t g_resident_color_clears, g_resident_depth_clears;
+/* WHY A RESIDENT CLEAR REFUSED, by reason, because the counts alone said the
+ * colour half was refusing 8 times for every one it took and nothing said
+ * which test threw it out. A refusal is not free: clear_surface then calls
+ * nv2a_gpu_invalidate_range, which drops every surface cache slot naming that
+ * pointer, so a refusing colour clear costs the whole retained-surface
+ * machinery for that frame as well as the read-back it was meant to avoid. */
+static uint64_t g_clear_refuse_mask, g_clear_refuse_softtail, g_clear_refuse_invalid,
+                g_clear_refuse_target, g_clear_refuse_geom, g_clear_color_calls,
+                g_clear_depth_calls, g_clear_refuse_rect, g_clear_refuse_components;
 static int queue_drain_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DRAIN"); return on; }
 static int readback_audit_on(void)
@@ -1734,11 +1743,22 @@ void nv2a_metal_report(void)
     fprintf(stderr,"[METAL] colour attachment: %s\n",
             hw_565_on()?"B5G6R5Unorm (metal_565 on)"
                        :"RGBA32Float (metal_565 OFF)");
-    fprintf(stderr,"[METAL] resident clears: %llu colour, %llu depth/stencil"
-            " (each one a drain, a 4.9 MB read-back and a 6.4 MB re-upload"
-            " that did not happen)\n",
+    fprintf(stderr,"[METAL] resident clears: %llu of %llu colour, %llu of %llu"
+            " depth/stencil (each one a drain, a 4.9 MB read-back and a 6.4 MB"
+            " re-upload that did not happen)\n",
             (unsigned long long)g_resident_color_clears,
-            (unsigned long long)g_resident_depth_clears);
+            (unsigned long long)g_clear_color_calls,
+            (unsigned long long)g_resident_depth_clears,
+            (unsigned long long)g_clear_depth_calls);
+    fprintf(stderr,"[METAL] clear refused: mask=%llu components=%llu rect=%llu"
+            " soft-tail=%llu invalidated=%llu target=%llu geometry=%llu\n",
+            (unsigned long long)g_clear_refuse_mask,
+            (unsigned long long)g_clear_refuse_components,
+            (unsigned long long)g_clear_refuse_rect,
+            (unsigned long long)g_clear_refuse_softtail,
+            (unsigned long long)g_clear_refuse_invalid,
+            (unsigned long long)g_clear_refuse_target,
+            (unsigned long long)g_clear_refuse_geom);
     fprintf(stderr,"[METAL] clear discards=%llu (clear_discard %s)\n",
             (unsigned long long)g_mtl_discards,
             g_mtl_discards?"used":"unused");
@@ -1757,10 +1777,19 @@ void nv2a_metal_report(void)
             (unsigned long long)sync_calls,(unsigned long long)sync_clean,
             (unsigned long long)sync_color,(unsigned long long)sync_depth,
             (unsigned long long)surface_uploads);
-    fprintf(stderr,"[METAL] surface cache: %llu rebinds, %llu rebuilds, "
-            "%llu evictions (surface_cache %s)\n",
-            (unsigned long long)surface_hits,
+    /* surface_uploads counts every SWAP -- it is incremented before the cache
+     * lookup, not after -- so printing it as "rebuilds" overstates them by the
+     * number of hits and quietly hides the cache's hit rate. A reader who took
+     * 21,614 as rebuilds against 5,765 rebinds would conclude the cache barely
+     * helps; the real split is 15,849 rebuilds and a 27% hit rate, which is a
+     * different problem with a different fix. Print the swap total, the split,
+     * and the rate, so none of the three has to be inferred. */
+    fprintf(stderr,"[METAL] surface cache: %llu swaps = %llu rebinds + %llu "
+            "rebuilds (%.0f%% hit), %llu evictions (surface_cache %s)\n",
             (unsigned long long)surface_uploads,
+            (unsigned long long)surface_hits,
+            (unsigned long long)(surface_uploads - surface_hits),
+            surface_uploads ? 100.0 * (double)surface_hits / (double)surface_uploads : 0.0,
             (unsigned long long)surface_evictions,
             surface_cache_on()?"on":"OFF");
     if(clip_audit_on())
@@ -2012,9 +2041,12 @@ int nv2a_metal_sync(void)
         }
         if(last_command.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[METAL] command failed: %s\n",last_command.error.description.UTF8String);return 0;}
         size_t pixels=(size_t)surface_width*surface_height;
-        float *rgba=malloc(pixels*16);
-        if(!rgba)return 0;
         int fmt565=hw_565_on();
+        /* SIZED FOR THE FORMAT. This allocated pixels*16 unconditionally, so a
+         * 565 run asked for 4.9 MB per sync and used 614 KB of it -- a malloc,
+         * a page-fault storm and a free, once a frame, for nothing. */
+        float *rgba=malloc(pixels*(fmt565?2:16));
+        if(!rgba)return 0;
         [surface getBytes:rgba bytesPerRow:surface_width*(fmt565?2:16) fromRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0];
         if(surface_dirty&&fmt565) {
             /* Straight back out, no conversion and no rounding -- which is the
@@ -2144,13 +2176,13 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
 static int clear_resident_ok(const uint8_t *target, uint32_t pitch,
                              uint32_t width, uint32_t height)
 {
-    if (!hw_state_on()) return 0;          /* alpha carries depth on the other tail */
-    if (!initialize()) return 0;
-    if (!surface_valid || !depth_valid) return 0;   /* something invalidated */
-    if (!surface || !hw_depth_tex || !hw_stencil_tex) return 0;
-    if (surface_target != target) return 0;
-    if (surface_width != width || surface_height != height) return 0;
-    if (surface_pitch != pitch) return 0;
+    if (!hw_state_on()) { ++g_clear_refuse_softtail; return 0; }
+    if (!initialize()) { ++g_clear_refuse_softtail; return 0; }
+    if (!surface_valid || !depth_valid) { ++g_clear_refuse_invalid; return 0; }
+    if (!surface || !hw_depth_tex || !hw_stencil_tex) { ++g_clear_refuse_invalid; return 0; }
+    if (surface_target != target) { ++g_clear_refuse_target; return 0; }
+    if (surface_width != width || surface_height != height) { ++g_clear_refuse_geom; return 0; }
+    if (surface_pitch != pitch) { ++g_clear_refuse_geom; return 0; }
     return 1;
 }
 
@@ -2178,7 +2210,8 @@ int nv2a_metal_clear_color(uint8_t *target, size_t target_size, uint32_t pitch,
     /* Only a clear that writes all three colour channels over the WHOLE
      * surface can become a load action; anything partial refuses and the CPU
      * loop runs. NV097_CLEAR_SURFACE's R/G/B bits are 0x10/0x20/0x40. */
-    if ((param & 0x70u) != 0x70u) return 0;
+    ++g_clear_color_calls;
+    if ((param & 0x70u) != 0x70u) { ++g_clear_refuse_mask; return 0; }
     if (!clear_resident_ok(target, pitch, width, height)) return 0;
     @autoreleasepool {
         /* SET_COLOR_CLEAR_VALUE arrives already in the surface's own format,
@@ -2223,8 +2256,9 @@ int nv2a_metal_clear_depth_stencil(uint8_t *target, size_t target_size,
     (void)target_size;
     /* Both halves of the D24S8 word, over the whole surface, or refuse.
      * components is NV097_CLEAR_SURFACE's low two bits: 1 depth, 2 stencil. */
-    if ((components & 3u) != 3u) return 0;
-    if (x0 != 0 || y0 != 0 || x1 != width || y1 != height) return 0;
+    ++g_clear_depth_calls;
+    if ((components & 3u) != 3u) { ++g_clear_refuse_components; return 0; }
+    if (x0 != 0 || y0 != 0 || x1 != width || y1 != height) { ++g_clear_refuse_rect; return 0; }
     if (!clear_resident_ok(depth_target == target ? surface_target : NULL,
                            surface_pitch, width, height)) return 0;
     if (depth_target != target || depth_pitch != pitch) return 0;
@@ -2743,7 +2777,17 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
    }else{
    MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
-   surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;float*rgba=malloc(pixels*16);uint8_t*stencil=malloc(pixels);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
+   surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;
+   /* THE STENCIL BUFFER IS FILLED ONLY IN THE NON-565 BRANCH BELOW, and the
+    * replaceRegion that consumes it used to run unconditionally -- so under
+    * RECOMP_METAL_565 the R8Uint stencil surface was uploaded from
+    * uninitialised heap, 307 KB of it per rebuild. Harmless only because 565
+    * implies the hardware tail and stencil_surface is then never attached,
+    * which is a reason it was not VISIBLE, not a reason it was not wrong.
+    * calloc rather than malloc: the cost is a page-zero the allocator does
+    * anyway for a fresh 307 KB, and it makes the uninitialised read impossible
+    * rather than merely unreachable. */
+   float*rgba=malloc(pixels*(hw_565_on()?2:16));uint8_t*stencil=calloc(pixels,1);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
    if(hw_565_on()){
     /* The attachment is the guest's format, so there is nothing to convert:
      * copy the rows in and let the shader's channel swap put each component

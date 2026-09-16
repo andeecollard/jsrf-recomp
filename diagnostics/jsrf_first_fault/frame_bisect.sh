@@ -206,15 +206,43 @@ for ARM in "$@"; do
     #     is not lost, because this script's product is PICTURES: a frame of
     #     the mission is a stronger statement about which scene the run reached
     #     than a state number is. Look at the frames before believing an arm.
-    echo "=== arm $ARM ($(date +%H:%M:%S)) ==="
-    RECOMP_FB_DUMP="$ADIR/fb/" \
-    RECOMP_FB_DUMP_FLIP="$STRIDE:$AFTER" \
-    JSRF_BIN="$BIN" \
-      "$ROOT/diagnostics/jsrf_first_fault/play_scripted.sh" \
-        "frame-bisect-$NAME-$ARM" "@$PAD" "$LIMIT" > "$ADIR/launch.log" 2>&1
+    # RETRY AN ARM THAT FAULTS BEFORE IT REACHES GAMEPLAY.
+    #
+    # A guest SIGSEGV in DSOUND -- sub_001A2E2E+0x670, guest 0xFFFFFFBE, EAX
+    # FFFFFFB4 -- killed four of about twenty runs on 16 Sep 2026, every one of
+    # them between t=34.0 and t=35.1 s, in the boot logos. It is not
+    # deterministic: the same arm re-run immediately afterwards reaches
+    # gameplay and finishes its 280 s. It is a real guest-correctness bug and
+    # it has its own open item; until that is fixed it is a 20% tax on every
+    # measurement, and a bisect that silently loses an arm to it is worse than
+    # one that costs five more minutes.
+    #
+    # RETRYING IS SOUND HERE ONLY BECAUSE THE FAILURE IS TOTAL AND EARLY. The
+    # arm produced no gameplay frame at all, so there is no result to bias by
+    # choosing to re-run it -- this is not discarding an inconvenient number,
+    # it is re-running a trial that did not happen. An arm that reaches
+    # gameplay and THEN faults is kept and reported, because that is a result.
+    ATTEMPT=1
+    while : ; do
+        echo "=== arm $ARM ($(date +%H:%M:%S))${ATTEMPT:+ attempt $ATTEMPT} ==="
+        RECOMP_FB_DUMP="$ADIR/fb/" \
+        RECOMP_FB_DUMP_FLIP="$STRIDE:$AFTER" \
+        JSRF_BIN="$BIN" \
+          "$ROOT/diagnostics/jsrf_first_fault/play_scripted.sh" \
+            "frame-bisect-$NAME-$ARM" "@$PAD" "$LIMIT" > "$ADIR/launch.log" 2>&1
 
-    SRC="$ROOT/build-macos/jsrf-first-fault/render-investigation/frame-bisect-$NAME-$ARM/stderr.log"
-    [ -f "$SRC" ] && cp "$SRC" "$ADIR/stderr.log"
+        SRC="$ROOT/build-macos/jsrf-first-fault/render-investigation/frame-bisect-$NAME-$ARM/stderr.log"
+        [ -f "$SRC" ] && cp "$SRC" "$ADIR/stderr.log"
+
+        GOT=$(ls "$ADIR/fb" 2>/dev/null | grep -c '^flip.*\.bmp$')
+        FAULTED=$(grep -c 'FIRST GUEST FAULT' "$ADIR/stderr.log" 2>/dev/null || echo 0)
+        [ "$GOT" -gt 0 ] && break
+        [ "${FAULTED:-0}" -eq 0 ] && break
+        [ "$ATTEMPT" -ge "${BISECT_RETRIES:-2}" ] && break
+        echo "    arm $ARM faulted before gameplay -- retrying (attempt $ATTEMPT)"
+        ATTEMPT=$((ATTEMPT + 1))
+        rm -rf "$ADIR/fb"; mkdir -p "$ADIR/fb"
+    done
 
     # The arm, as the BACKEND reported it. Everything here is a line the
     # runtime printed about its own state; nothing is echoed back from the
