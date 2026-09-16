@@ -118,8 +118,15 @@ arm_env() {
     RECOMP_METAL_READBACK_AUDIT=0
     RECOMP_METAL_FENCE=0
     RECOMP_METAL_VSH=
+    RECOMP_METAL_FF=
     case "$1" in
         sw)           ;;
+        # THE GLYPH PAIR (16 Sep 2026): GPU fixed-function T&L drew two corrupt
+        # characters in Gum's tutorial text; the CPU fixed-function path draws
+        # them clean. ff-off pins the CPU path, ff-on the GPU path; everything
+        # else is the hardware-state default. Compare the text frames.
+        ff-off)       RECOMP_METAL_HW=1; RECOMP_METAL_FF=0 ;;
+        ff-on)        RECOMP_METAL_HW=1; RECOMP_METAL_FF=1 ;;
         mode1)        RECOMP_METAL_HW=1; RECOMP_METAL_SHADER_BLEND=1 ;;
         hw)           RECOMP_METAL_HW=1; RECOMP_METAL_SHADER_BLEND=1 ;;
         hwdef)        RECOMP_METAL_HW=1 ;;   # identical to hw; named so the
@@ -166,7 +173,7 @@ arm_env() {
     # RECOMP_METAL_565 and RECOMP_METAL_VSH the moment their defaults flipped:
     # the run reported "metal_565 OFF, metal_vsh OFF" while claiming to be the
     # default arm.
-    for _v in RECOMP_METAL_SHADER_BLEND RECOMP_METAL_565 RECOMP_METAL_VSH; do
+    for _v in RECOMP_METAL_SHADER_BLEND RECOMP_METAL_565 RECOMP_METAL_VSH RECOMP_METAL_FF; do
         eval "_val=\${$_v}"
         if [ -n "$_val" ]; then eval "export $_v"; else unset "$_v"; fi
     done
@@ -265,7 +272,9 @@ for ARM in "$@"; do
         echo "         RECOMP_METAL_SURFACE_CACHE=$RECOMP_METAL_SURFACE_CACHE"
         echo "         RECOMP_METAL_BATCH_MAX=$RECOMP_METAL_BATCH_MAX"
         echo "         RECOMP_METAL_SHADER_BLEND=${RECOMP_METAL_SHADER_BLEND-<unset, backend default>}"
-        echo "         RECOMP_METAL_565=$RECOMP_METAL_565"
+        echo "         RECOMP_METAL_565=${RECOMP_METAL_565-<unset, backend default>}"
+        echo "         RECOMP_METAL_VSH=${RECOMP_METAL_VSH-<unset, backend default>}"
+        echo "         RECOMP_METAL_FF=${RECOMP_METAL_FF-<unset, backend default>}"
         echo
         echo "-- what the backend said it was doing --"
         grep -E '^\[METAL\] (hw draws|bisect|one encoder|shader blend|colour attachment|MIXED)' \

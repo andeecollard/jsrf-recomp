@@ -149,6 +149,42 @@ cp -R "$STOCK" "$SCRATCH/hdd"
 echo "schedule: $SCHED"
 echo "binary:   $BIN"
 echo "log:      $OUT/stderr.log   (${LIMIT}s)"
+
+# THE SWITCH SET, EXPLICIT AND REPORTED. On 16 Sep 2026 the harness and the
+# player's build were different software all day: the player's app reads
+# ~/Library/Application Support/JSRF/paths.conf, this script set none of those
+# switches unless the caller remembered, and the fence fix was nearly missed
+# because most A/Bs ran with the fence bug present while the player's build
+# had it fixed. Nothing here adopts the player's config -- an A/B must be able
+# to differ deliberately -- the rule is only that a difference is never
+# silent. Every RECOMP_* in the environment goes to stdout and to
+# $OUT/switches.txt, and each line the player's paths.conf exports is checked
+# against it. The switches on the command line below are the harness's own
+# and are listed as such.
+SWITCHES=$(env | grep '^RECOMP_' | sort)
+printf '%s\n' "$SWITCHES" > "$OUT/switches.txt"
+echo "=== switch set (RECOMP_* in this run's environment) ==="
+if [ -n "$SWITCHES" ]; then printf '%s\n' "$SWITCHES" | sed 's/^/    /'; else echo "    (none)"; fi
+echo "    + harness-fixed: PB_EXEC=1 METAL=1 OHCI_ATTACH=1 PAD_INJECT=1 REPORT_MS=${REPORT_MS:-10000}"
+PCONF="$HOME/Library/Application Support/JSRF/paths.conf"
+if [ -f "$PCONF" ]; then
+    echo "=== against the player's paths.conf ==="
+    DIFFS=0
+    for kv in $(grep -E '^[[:space:]]*export RECOMP_' "$PCONF" | sed -E 's/^[[:space:]]*export //'); do
+        k=${kv%%=*}; want=${kv#*=}; have=$(printenv "$k" || true)
+        if [ "$have" != "$want" ]; then
+            echo "    DIFFERS: player has $kv, this run has $k=${have:-<unset>}"; DIFFS=$((DIFFS+1))
+        fi
+    done
+    printf '%s\n' "$SWITCHES" | while IFS= read -r kv; do
+        [ -n "$kv" ] || continue; k=${kv%%=*}
+        grep -qE "^[[:space:]]*export $k=" "$PCONF" || echo "    DIFFERS: this run has $kv, player's paths.conf does not set $k"
+    done
+    [ "$DIFFS" = 0 ] && echo "    (every switch the player exports matches; see above for extras)"
+else
+    echo "=== no paths.conf at $PCONF -- player comparison skipped ==="
+fi
+echo
 cd "$ROOT" || exit 1
 RECOMP_XBE_PATH="$GAME_DIR/default.xbe" RECOMP_GAME_DIR="$GAME_DIR" \
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 \
