@@ -125,3 +125,50 @@ log in this tree is 32 (`stride=32`, four dumps; no other value appears), so
 nothing measured here has crossed 256. That is why it has not been fixed in the
 same change: the correct mask is obvious, but this is exactly the "obviously
 safe" reasoning that put the black screen in, and it deserves its own run.
+
+## CORRECTION, same day: the 4/4 separation above compared two different scenes
+
+The framebuffer-census separation in section 4 is CONFOUNDED and must not be
+relied on. `caponly1` and `reverted` (the "working" arm) are GAMEPLAY runs --
+`[APU-VOICE] on=316` and `on=453`. `bisectA` and `idxcap` (the "black" arm) are
+ATTRACT-LOOP runs -- `on=4`. The two arms differed in scene as well as in the
+decode, which is the shortcut CLAUDE.md lists under known-bad reasoning:
+"comparing log sizes across scenes". The exact arithmetic in section 3 closed
+because the populations were never comparable, not because the model was right.
+
+The honest table, all eleven 16-Sep runs, black = `[FB] nonzero=0` samples:
+
+    scene      decode IN                          decode OUT
+    attract    idxfix1 192/200, bisectA 35/44,    nv2aalias 0/200, cyclebrk1
+               idxcap 232/241      -> 3/3 black   0/203, apuclock1 0/225,
+                                                  e32_2 0/280  -> 0/4 black
+    gameplay   idxfix2 6/200, idxfix3 5/200       caponly1 0/260,
+               -> render fine                     reverted 0/150 -> fine
+
+WHAT SURVIVES: within the attract scene the association is real -- 3/3 black
+with the decode against 0/4 without. Fisher one-tailed on n=7 gives p = 1/35 =
+0.029. That is suggestive, not established.
+
+WHAT DOES NOT SURVIVE: "DRAW_ARRAYS is the black screen" as a general claim.
+In GAMEPLAY the decode is measured harmless: idxfix2 and idxfix3 drew 59,008
+and 99,422 DRAW_ARRAYS indices with the picture correct for the whole run, and
+idxsplit1 drew 64,596 over 10,719 calls. The defect, whatever it is, is
+specific to the title/attract scene.
+
+ALSO WRONG ABOVE: the "sticky attr" mechanism is not supported. In the black
+runs `draw_arrays_calls` FREEZES at 1,201 from the second report onward while
+`[GPU] draws` climbs to 119,413 and the framebuffer stays at nonzero=0 -- so
+the black frames contain no DRAW_ARRAYS batches at all. Stickiness cannot
+explain frames that never had one. The texture-cache latch (99.3% hits) is a
+consequence of the screen already being black, not a cause.
+
+AND THE STRIDE CLAIM ABOVE IS UNVERIFIABLE, not merely latent. The only stride
+evidence in the tree is four `[ALPHA-IN] attr[3] decl: ... stride=32` lines,
+and that print reads `s_gpu.attr[3].stride` -- the value AFTER the 8-bit mask.
+A true stride of 288 prints as 32. "No observed stride exceeds 255" cannot be
+concluded from any existing log; the field has to be measured at full width.
+
+The attract loop is itself a pre-existing intermittent guest-progress failure
+that happens with and without the decode, and it has been silently
+contaminating render A/Bs. It needs its own investigation before any further
+render comparison is trusted: every arm must be scene-matched.

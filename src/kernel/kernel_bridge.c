@@ -3109,6 +3109,104 @@ void xbox_ReportIrqDelivery(void)
 }
 
 
+/* THE SUMMARY BIT OBSERVED LOST: PCRTC bit 0 set while PMC bit 24 is clear.
+ *
+ * Counted on every mirror pass whether or not the repair below is armed, and
+ * that is the entire point of it. With RECOMP_NV2A_PMC_UPMIRROR off this build
+ * behaves exactly as the one before it and still answers the question the
+ * repair is built on, so one run decides whether the repair is needed at all.
+ * A repair armed by default would have erased the evidence for its own
+ * necessity -- and a guard defaulted on with a good argument behind it has
+ * already made a crash worse in this tree once.
+ *
+ * The [VBLANK] counters cannot answer it. A hung 725 s session reported
+ * delivered=5355 (raised=5651 retried=33312) against deadlines=43263 with
+ * unacked_skips=37571, the skips still climbing at 60/s at the end. That says
+ * only that xbox_Nv2aVblankPending stayed true for the rest of the run: the
+ * source is asserted and the guest never acknowledged it. It does not say why,
+ * and a lost summary is only one of the candidates.
+ *
+ * FOUR NUMBERS, BECAUSE A RAW COUNT CANNOT DECIDE. The signature has a benign
+ * producer. xbox_Nv2aRaiseVblank (xbox_memory_layout.c:2170) sets PCRTC under
+ * mcpx_lock, releases the lock, and only then ORs the summary, so for a few
+ * instructions every single raise looks exactly like a loss. This mirror is
+ * pumped from every blocked waiter and from every kernel thunk -- thousands of
+ * passes a second -- so some of them WILL land inside that window, and a
+ * nonzero `lost` on its own proves nothing whatsoever.
+ *
+ *   lost        passes that saw the signature. Rate-like: once the summary is
+ *               latched lost this climbs at the pump rate for the rest of the
+ *               run, so its size measures how long the latch lasted, not how
+ *               often the summary went missing.
+ *   episodes    distinct runs of consecutive such passes, i.e. the 0->1
+ *               transitions. THIS is how many times it went missing.
+ *   max_run     the longest run, in passes.
+ *   max_run_ms  the longest run, in wall time.
+ *
+ * The raise window closes within a microsecond and the very next pass sees an
+ * agreeing pair, so benign sampling reads as episodes in the thousands with
+ * max_run near 1 and max_run_ms 0. A latch reads as episodes=1 (or a handful)
+ * with max_run in the millions and max_run_ms most of the run. Those two
+ * cannot be mistaken for each other, which is what buys four counters instead
+ * of one.
+ *
+ * The run bookkeeping is deliberately NOT serialised. This is the hottest path
+ * in the bridge and a lock here would cost more than the bug. The races that
+ * leaves can only SHORTEN a run -- an agreeing pass on any thread resets it --
+ * so the race cannot manufacture a long max_run_ms, which is the only
+ * direction the conclusion turns on. The start stamp is a plain DWORD for the
+ * same reason; the worst it can cost is one pump interval of the reported
+ * milliseconds. */
+static volatile LONG g_nv2a_pmc_lost;          /* passes that saw the loss   */
+static volatile LONG g_nv2a_pmc_lost_episodes; /* distinct runs of them      */
+static volatile LONG g_nv2a_pmc_lost_run;      /* consecutive passes, now    */
+static volatile LONG g_nv2a_pmc_lost_run_max;
+static volatile LONG g_nv2a_pmc_lost_ms_max;
+static volatile LONG g_nv2a_pmc_repaired;      /* up-mirrors actually done   */
+static DWORD g_nv2a_pmc_lost_since;            /* start of the current run   */
+
+/* Arm the repair? Default OFF. This changes what the program does, so it is a
+ * value switch through recomp_switch_on rather than a presence test -- the
+ * control arm of an A/B is taken by passing =0, and a presence test reads that
+ * as ON, which has cost three wrong conclusions here already. Its state is
+ * printed beside the counters on the [VBLANK-REG] line, because src/recomp_switch.h
+ * is right that a switch which does not name itself in a report cannot be
+ * compared across arms. */
+static int bridge_nv2a_pmc_upmirror(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_NV2A_PMC_UPMIRROR");
+    return on;
+}
+
+/* One pump pass that saw the source and the summary disagree, in the direction
+ * that latches. Read the comment above before trusting any of these. */
+static void bridge_nv2a_summary_lost(void)
+{
+    LONG run = InterlockedIncrement(&g_nv2a_pmc_lost_run);
+    DWORD now = GetTickCount();
+
+    InterlockedIncrement(&g_nv2a_pmc_lost);
+    if (run == 1) {
+        InterlockedIncrement(&g_nv2a_pmc_lost_episodes);
+        g_nv2a_pmc_lost_since = now;
+    } else {
+        LONG ms = (LONG)(DWORD)(now - g_nv2a_pmc_lost_since);
+        if (ms > g_nv2a_pmc_lost_ms_max)
+            InterlockedExchange(&g_nv2a_pmc_lost_ms_max, ms);
+    }
+    if (run > g_nv2a_pmc_lost_run_max)
+        InterlockedExchange(&g_nv2a_pmc_lost_run_max, run);
+}
+
+/* ...and one that saw them agree, which closes whatever run was open. Both
+ * halves of the mirror call this, because either one leaving the pair
+ * consistent ends the episode. */
+static void bridge_nv2a_summary_agrees(void)
+{
+    if (g_nv2a_pmc_lost_run) InterlockedExchange(&g_nv2a_pmc_lost_run, 0);
+}
+
 /* Make the summary bit follow its source, which is what the hardware does.
  *
  * This must run far more often than the 60Hz raise, because the guest spins on
@@ -3118,10 +3216,88 @@ void xbox_ReportIrqDelivery(void)
 static void bridge_nv2a_mirror_intr(void)
 {
     uint32_t base = g_nv2a_base;
+    uint32_t *pmc;
     if (!base) return;
+    /* PMC_INTR_0 is at 0xFD000100 and is NOT on a guarded page: only the PCRTC
+     * page and the PGRAPH page are (g_nv2a_guard_page and g_nv2a_pgraph_page,
+     * xbox_memory_layout.c:2105 and :2122). So this pointer is ordinary
+     * writable RAM, an atomic RMW on it never faults into mcpx_trap_handler,
+     * and it needs neither the NV2A alias view nor a VirtualProtect. That is
+     * not new: it is the same pointer the down-mirror below has always used,
+     * written out once so the up-mirror's use of it is visibly the same case.
+     * The PCRTC read a line later IS on the guarded page, and a read is what
+     * PAGE_READONLY permits -- see xbox_Nv2aVblankPending's own comment at
+     * xbox_memory_layout.c:2217. */
+    pmc = (uint32_t *)((uintptr_t)base + NV_PMC_INTR_0 + g_xbox_mem_offset);
     if (!(BRIDGE_MEM32(base + NV_PCRTC_INTR_0) & NV_PCRTC_INTR_0_VBLANK)) {
-        __atomic_fetch_and((uint32_t *)((uintptr_t)base + NV_PMC_INTR_0 + g_xbox_mem_offset),
-                           ~NV_PMC_INTR_0_PCRTC, __ATOMIC_SEQ_CST);
+        __atomic_fetch_and(pmc, ~NV_PMC_INTR_0_PCRTC, __ATOMIC_SEQ_CST);
+        bridge_nv2a_summary_agrees();
+    } else if (!(__atomic_load_n(pmc, __ATOMIC_SEQ_CST) & NV_PMC_INTR_0_PCRTC)) {
+        /* THE SUMMARY FOLLOWS ITS SOURCE UP AS WELL AS DOWN.
+         *
+         * PMC_INTR_0 is not state, it is a function of the engine status
+         * registers: on hardware bit 24 IS "PCRTC has an interrupt pending",
+         * recomputed from the source on every read, and it cannot be out of
+         * step with the source for any length of time. This file models half
+         * of that. The branch above follows the source down; nothing follows
+         * it up except xbox_Nv2aRaiseVblank's one-shot OR at the instant of
+         * the raise. So any loss of bit 24 after that OR is PERMANENT:
+         * bridge_vblank_poll will not raise again while PCRTC is still
+         * pending (the "do not re-raise while unacknowledged" gate below), so
+         * there is never another OR, and the guest ISR -- which reads the
+         * summary out of its ServiceContext base and only does the
+         * swap/signal work when bit 24 is set -- runs and returns without
+         * acknowledging, for ever.
+         *
+         * WHY AN UP-MIRROR RATHER THAN A WIDER LOCK. The known way the bit is
+         * lost is a race between this function and the raise: the mirror
+         * reads PCRTC clear, the pump then sets PCRTC and ORs the summary,
+         * and the mirror's fetch_and clears a summary bit it never saw
+         * asserted. Taking mcpx_lock across the read-and-clear here, and
+         * extending it over xbox_Nv2aRaiseVblank's OR, would close that one
+         * interleaving -- at the price of putting the bridge's hottest path
+         * behind the same mutex the guest's MMIO fault handler holds, on
+         * every thunk dispatch. And it would close only that one. The summary
+         * can also be lost to a plain guest store, because PMC is unguarded
+         * RAM here while on hardware PMC_INTR_0 is read-only, and no lock in
+         * this process can stop a store the recompiled code makes directly.
+         * Rebuilding the summary from its source repairs every cause,
+         * including the ones nobody has thought of, and it is what the
+         * hardware does rather than a workaround for what this code does.
+         * The same argument is already written down for the PGRAPH half a few
+         * lines below, which has rebuilt its summary bit this way since the
+         * anti-graffiti-screen hang; this is the missing PCRTC half of it.
+         *
+         * WHAT IT DOES AND DOES NOT MAKE ATOMIC: nothing. The PCRTC read and
+         * the PMC fetch_or are still two operations and another thread can
+         * still slip a raise or an acknowledge between them. The up-mirror is
+         * CONVERGENT, not exclusive. What it buys is that no interleaving can
+         * leave the pair disagreeing for longer than one pump interval,
+         * because whichever way the pair ends up wrong the next pass restores
+         * it: a lost OR (PCRTC=1, PMC=0) is put back here, a lost AND
+         * (PCRTC=0, PMC=1) is taken away by the branch above. The worst a
+         * badly-timed pass can now do is re-assert a summary bit for one
+         * interval after an acknowledge that has already cleared PCRTC --
+         * and it cannot, because it reads PCRTC first and that case takes the
+         * other branch.
+         *
+         * One interleaving still costs a frame and is NOT changed by this: a
+         * guest acknowledge computes its write-1-to-clear result from a read
+         * taken outside mcpx_lock (xbox_memory_layout.c:1883) and stores it
+         * under the lock, so an acknowledge that straddles a raise can store
+         * PCRTC=0 over the fresh raise. That drops one vblank; it does not
+         * latch, because the pending gate then sees a clear source and the
+         * next deadline raises again. Exclusion there would need the raise
+         * and the acknowledge to share a lock, and the acknowledge arrives as
+         * a page fault on a guest thread. Convergence is the property a
+         * mirror should have; exclusion is the property a source needs. */
+        bridge_nv2a_summary_lost();
+        if (bridge_nv2a_pmc_upmirror()) {
+            __atomic_fetch_or(pmc, NV_PMC_INTR_0_PCRTC, __ATOMIC_SEQ_CST);
+            InterlockedIncrement(&g_nv2a_pmc_repaired);
+        }
+    } else {
+        bridge_nv2a_summary_agrees();
     }
 
     /* PMC_INTR_0 is a read-only summary of the engine sources.  The Windows
@@ -3267,6 +3443,67 @@ void xbox_VblankReport(void)
             1000000 / BRIDGE_VBLANK_PERIOD_US,
             g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms,
             g_interrupt_not_ready);
+
+    /* THE REGISTERS THEMSELVES, because the counters above cannot tell three
+     * different faults apart and every one of them prints the same line.
+     *
+     * The hung session's last report read delivered=5355 (raised=5651
+     * retried=33312) over 725405 ms, deadlines=43263, unacked_skips=37571,
+     * not_ready=0 -- 43263 deadlines came due and 37571 were skipped because
+     * xbox_Nv2aVblankPending was still true. The instruments were alive
+     * through it: deadlines climbed at 60/s, retried at ~58/s, [IRQ-VEC] v3
+     * went 16235 -> 140753 and KeInsertQueueDpc kept climbing at ~290/s, so
+     * the poll was running and the guest ISR was still being entered. What
+     * none of that says is what the guest ISR SAW when it ran. This line says
+     * it, and the three readings do not overlap:
+     *
+     *   pcrtc=00000001 pmc=00000000   the PMC summary was LOST. The ISR runs
+     *                                 every poll, reads bit 24 clear, does no
+     *                                 work and acknowledges nothing, and
+     *                                 nothing will ever re-OR the bit because
+     *                                 the raise is gated on the source being
+     *                                 clear. Latched for the rest of the run.
+     *   pcrtc=00000001 pmc=01000000   the summary is INTACT and the fault is
+     *                                 further along the guest's acknowledge
+     *                                 path -- the ISR's own spin, its DPC, or
+     *                                 the event it signals. The up-mirror
+     *                                 below is then irrelevant and the
+     *                                 counters beside it will say so.
+     *   pcrtc=00000000                the reading of the retry branch is
+     *                                 WRONG: unacked_skips cannot be climbing
+     *                                 at 60/s with the source clear, so the
+     *                                 freeze is somewhere else entirely.
+     *
+     * base= is this line's own positive control, and it is load-bearing.
+     * g_nv2a_base is published by bridge_vblank_poll out of the guest's
+     * KINTERRUPT ServiceContext and is zero until the title connects vector 3,
+     * so base=00000000 means the two register fields were NOT READ and are
+     * printed as zero by construction -- not that the registers are zero.
+     * Expect FD000000; anything else means the ServiceContext base the ISR
+     * uses is not the aperture, which would be a finding of its own.
+     *
+     * Read-only by construction: two BRIDGE_MEM32 loads and
+     * xbox_Nv2aVblankPending, which is itself a single load
+     * (xbox_memory_layout.c:2218). Nothing here assigns to a register, takes a
+     * lock, or calls VirtualProtect, so it is safe on the guarded PCRTC page
+     * and safe to leave in unconditionally. */
+    {
+        uint32_t reg_base  = g_nv2a_base;
+        uint32_t reg_pcrtc = reg_base ? (uint32_t)BRIDGE_MEM32(reg_base + NV_PCRTC_INTR_0) : 0u;
+        uint32_t reg_pmc   = reg_base ? (uint32_t)BRIDGE_MEM32(reg_base + NV_PMC_INTR_0)   : 0u;
+        fprintf(stderr,
+                "  [VBLANK-REG] base=%08X pcrtc=%08X pmc=%08X pending=%d"
+                " | summary lost=%ld episodes=%ld run=%ld max_run=%ld"
+                " max_run_ms=%ld repaired=%ld upmirror=%s\n",
+                reg_base, reg_pcrtc, reg_pmc, xbox_Nv2aVblankPending(),
+                (long)InterlockedCompareExchange(&g_nv2a_pmc_lost, 0, 0),
+                (long)InterlockedCompareExchange(&g_nv2a_pmc_lost_episodes, 0, 0),
+                (long)InterlockedCompareExchange(&g_nv2a_pmc_lost_run, 0, 0),
+                (long)InterlockedCompareExchange(&g_nv2a_pmc_lost_run_max, 0, 0),
+                (long)InterlockedCompareExchange(&g_nv2a_pmc_lost_ms_max, 0, 0),
+                (long)InterlockedCompareExchange(&g_nv2a_pmc_repaired, 0, 0),
+                bridge_nv2a_pmc_upmirror() ? "on" : "off");
+    }
     fflush(stderr);
 }
 
