@@ -472,6 +472,18 @@ static struct {
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
     uint16_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
+    /* WHAT THE BATCH ASKED FOR versus what fitted, split by the method that
+     * asked. The first version of this counter was shared across the
+     * submission methods, so 31.9M told us nothing about which one to fix --
+     * split by source, and keep a high-water mark, or the run is wasted.
+     * All of these count INDICES, not parameter words: ARRAY_ELEMENT16
+     * carries two per word and counting words put the sources on different
+     * scales and made the ratio meaningless. */
+    uint32_t   idx_wanted, idx_wanted_max;
+    unsigned long long idx_overflow, idx_overflow_e16, idx_overflow_e32;
+    unsigned long long elem32_seen, elem32_indices, elem32_wide;
+    uint32_t   elem32_batches_dropped;
+    int        batch_wide;              /* an index did not fit uint16_t */
     uint32_t   inline_words[NV_MAX_INLINE_WORDS];
     uint32_t   inline_count;            /* dwords pushed this batch, 0 = none */
     float      vp_offset[4], vp_scale[4];
@@ -3414,6 +3426,13 @@ static void draw_primitive(void)
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
+    /* An index that did not fit uint16_t means the indices we DO hold are a
+     * subset with the gaps closed up, which is a different mesh. Refuse rather
+     * than draw wrong topology; counted so the refusal is never silent. */
+    if (s_gpu.batch_wide) {
+        ++s_gpu.elem32_batches_dropped;
+        return;
+    }
     s_gpu.draws++;
     if ((s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
@@ -3747,6 +3766,10 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_BEGIN_END:
         if (param) {
+            if (s_gpu.idx_wanted > s_gpu.idx_wanted_max)
+                s_gpu.idx_wanted_max = s_gpu.idx_wanted;
+            s_gpu.idx_wanted = 0;
+            s_gpu.batch_wide = 0;
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;
@@ -3803,9 +3826,66 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
-        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+        if (s_gpu.prim) {
+            if (s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+            } else {
+                s_gpu.idx_overflow += 2;
+                s_gpu.idx_overflow_e16 += 2;
+            }
+            s_gpu.idx_wanted += 2;
+        }
+        break;
+
+    /* ONE 32-BIT INDEX PER PARAMETER WORD, AND IT WAS NOT DECODED UNTIL NOW.
+     *
+     * 0x1808 fell through to default:, which recognises only the two
+     * vertex-array register ranges, so it landed in the unhandled-method
+     * histogram -- 164,101 times in one gameplay run of measure/methodaudit,
+     * with 0x1800 and 0x1818 absent from the same table as the control.
+     *
+     * WHAT THAT COST. A batch whose indices arrive this way reaches
+     * SET_BEGIN_END(0) with idx_count == 0, and draw_primitive returns before
+     * it increments s_gpu.draws. So the batch is not drawn, not counted as a
+     * draw, not counted as a vsh reject and not counted as a texture reject --
+     * invisible to every instrument in this file. Worse than dropping: a batch
+     * that mixes ELEMENT16 with ELEMENT32 kept only the 16-bit half, so the
+     * TOPOLOGY was wrong and it was drawn anyway.
+     *
+     * A contributing cause is worth recording: nv2a_pb_scan.c's method-name
+     * table labels 0x1808 "INLINE_ARRAY", which is 0x1818 -- so the one survey
+     * that answers "which methods does this title use" named this method after
+     * a method that was already handled.
+     *
+     * DRAW_ARRAYS (0x1810) is the other undecoded submission method and is
+     * deliberately NOT added here. Decoding it black-screened the title, and
+     * that is a separate mechanism with its own write-up; see
+     * docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-16_THE_BLACK_SCREEN_IS_DRAW_ARRAYS.md.
+     * This method is measured never to arrive during boot (elem32=0/0 in every
+     * black run), which is why it can go in on its own. */
+    case NV097_ARRAY_ELEMENT32:
+        ++s_gpu.elem32_seen;
+        if (s_gpu.prim) {
+            if (param > 0xFFFFu) {
+                /* idx[] is uint16_t because the hardware's own 16-bit path is
+                 * the common one. An index that does not fit is NOT skipped:
+                 * dropping one index of a triangle list shifts every vertex
+                 * after it, so the batch would draw with silently wrong
+                 * topology. Refuse the whole batch instead -- which is what
+                 * happens today anyway, since today it is never assembled --
+                 * and count it, so the next person knows whether widening
+                 * idx[] to uint32_t is work worth doing. */
+                ++s_gpu.elem32_wide;
+                s_gpu.batch_wide = 1;
+            } else if (s_gpu.idx_count < NV_MAX_INDICES) {
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)param;
+                ++s_gpu.elem32_indices;
+            } else {
+                ++s_gpu.idx_overflow;
+                ++s_gpu.idx_overflow_e32;
+            }
+            ++s_gpu.idx_wanted;
         }
         break;
     default:
@@ -4236,6 +4316,18 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "[GPU] draws %u, %u indices; input range not measured"
                         " (RECOMP_VERTEX_RANGE=1)\n",
                 s_gpu.draws, s_gpu.verts);
+    /* Both halves of the submission accounting on one line, because the
+     * question is always "which method, and did it fit". elem32 is the method
+     * that was not decoded at all until 16 Sep 2026; no-room is the cap that
+     * truncated batches silently before it was raised to NV_MAX_INDICES.
+     * Everything here counts indices, so the sources are comparable. */
+    fprintf(stderr, "[GPU] indices by source: elem32=%llu stored of %llu methods"
+                    " (%llu too wide, %u batches refused for it); no-room=%llu"
+                    " (e16=%llu e32=%llu); biggest batch asked for %u of %u\n",
+            s_gpu.elem32_indices, s_gpu.elem32_seen, s_gpu.elem32_wide,
+            s_gpu.elem32_batches_dropped, s_gpu.idx_overflow,
+            s_gpu.idx_overflow_e16, s_gpu.idx_overflow_e32,
+            s_gpu.idx_wanted_max, (unsigned)NV_MAX_INDICES);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
     {

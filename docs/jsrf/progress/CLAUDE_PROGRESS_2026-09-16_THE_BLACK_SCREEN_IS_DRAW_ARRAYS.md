@@ -105,3 +105,23 @@ of the run.
   version; do not let the patch overwrite it.
 - The patch's `static unsigned indices[...],n=0; n=0;` makes `n` static too.
   Harmless as written, but the working tree's split form is the one to keep.
+
+## A latent defect found beside it, deliberately not fixed yet
+
+`src/kernel/nv2a_pb_exec.c`, in the `SET_VERTEX_DATA_ARRAY_FORMAT` decode:
+
+```c
+a->stride = (param >> 8) & 0xFF;
+```
+
+`NV097_SET_VERTEX_DATA_ARRAY_FORMAT_STRIDE` is `0xFFFFFF00` -- a **24-bit**
+field. Masking to 8 bits wraps any stride of 256 or more: a stride of 260
+becomes 4, and every vertex after the first is fetched from inside its
+predecessor. A stride of exactly 256 becomes 0, which `fetch_attr` refuses, so
+that case at least fails loudly.
+
+**It is latent, not a live cause.** Every attribute stride observed in any run
+log in this tree is 32 (`stride=32`, four dumps; no other value appears), so
+nothing measured here has crossed 256. That is why it has not been fixed in the
+same change: the correct mask is obvious, but this is exactly the "obviously
+safe" reasoning that put the black screen in, and it deserves its own run.
