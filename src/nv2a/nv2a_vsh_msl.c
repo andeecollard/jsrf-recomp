@@ -30,9 +30,18 @@
  *                        interpreter has to absorb it or the position it hands
  *                        the rasteriser is in the wrong space.
  *
- * NOT VERIFIED AGAINST THE RENDERER. Nothing in this file has been run against
- * a real draw. It is checked only by vsh_msl_test, which compares emitted text
- * and compiles it with the Metal runtime compiler.
+ * STILL NOT VERIFIED AGAINST THE RENDERER -- nothing here has been run against
+ * a real draw, and nothing in nv2a_metal.m calls it. What it HAS now been
+ * checked against, as of 16 Sep 2026, is the CPU interpreter it is meant to
+ * replace: diagnostics/jsrf_first_fault/vsh_msl_diff_test.m dispatches the
+ * emitted code on a Metal device and diffs all sixteen output registers
+ * against nv2a_vsh_execute, over the 126 vertex programs read out of the
+ * title's own default.xbe plus one synthetic program per opcode. Two real
+ * defects came out of that and are fixed here: fp contraction (see the pragma
+ * in nv2a_vsh_generate_msl) and the multiply-by-zero rule (see MAC_MUL).
+ * Read that file's header for what the result does and does not prove --
+ * DPH, DST, EXP, LOG and LIT appear in no program this title ships, so they
+ * are checked only against fixtures, and LIT is still knowingly wrong.
  */
 #include "nv2a_vsh.h"
 #include <stdio.h>
@@ -249,14 +258,31 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_MUL:
-        /* dst = A * B
-         * NOTE: the interpreter's multiply() forces a*0 and 0*b to +0 so that
-         * an infinity or NaN in the other operand is suppressed. That is NV2A
-         * behaviour and is NOT reproduced here, exactly as it is not
-         * reproduced by the HLSL emitter. See the design note. */
-        sb_append(&expr, "(");
+        /* dst = A * B, through vsh_mul, which carries NV2A's rule that a*0 and
+         * 0*b are +0 even when the other operand is infinite or NaN --
+         * nv2a_vsh.c's multiply().
+         *
+         * THIS USED TO BE A PLAIN `*`, and the comment here said the rule was
+         * "NOT reproduced here, exactly as it is not reproduced by the HLSL
+         * emitter". That was accurate and it was wrong, because the rule is
+         * not an edge case in this title. JSRF's lighting shaders normalise a
+         * vector the obvious way -- DP3 R0.x, R11, R11 / RSQ R1.x, R0.x /
+         * MUL R2, R11, R1.x -- and a vertex whose normal is the zero vector
+         * takes rsqrt(0) = +inf into that multiply. With `*` the GPU produces
+         * NaN where the interpreter produces 0, and a NaN does not stay
+         * local: it reaches oPos and the triangle disappears. Measured in
+         * xbe@001F683C, where the NaN is then laundered back into a finite
+         * but wrong value by a later MIN (min(NaN,x) returns x), so it does
+         * not even announce itself as a NaN downstream.
+         *
+         * THE COST is two compares and a select per MUL, on the hottest path
+         * there is, and it has NOT been measured against frame time. If it has
+         * to go, delete the helper and put `*` back -- but then the CPU and
+         * GPU paths are no longer the same function and the A/B that compares
+         * them is measuring two things at once. */
+        sb_append(&expr, "vsh_mul(");
         emit_source(&expr, &inst->mac_src[0], 0);
-        sb_append(&expr, " * ");
+        sb_append(&expr, ", ");
         emit_source(&expr, &inst->mac_src[1], 0);
         sb_append(&expr, ")");
         break;
@@ -271,12 +297,13 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_MAD:
-        /* dst = A * B + C */
-        sb_append(&expr, "(");
+        /* dst = A * B + C. The product goes through vsh_mul for the same
+         * reason MUL does; the interpreter's MAD is multiply() then +. */
+        sb_append(&expr, "(vsh_mul(");
         emit_source(&expr, &inst->mac_src[0], 0);
-        sb_append(&expr, " * ");
+        sb_append(&expr, ", ");
         emit_source(&expr, &inst->mac_src[1], 0);
-        sb_append(&expr, " + ");
+        sb_append(&expr, ") + ");
         emit_source(&expr, &inst->mac_src[2], 0);
         sb_append(&expr, ")");
         break;
@@ -310,7 +337,10 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_DST:
-        /* dst = float4(1.0, A.y * B.y, A.z, B.w) */
+        /* dst = float4(1.0, A.y * B.y, A.z, B.w).
+         * A PLAIN multiply, deliberately: mac_eval() computes DST in its own
+         * block with `a[1]*b[1]` and does not route it through multiply(), so
+         * matching the interpreter here means NOT applying the zero rule. */
         sb_append(&expr, "float4(1.0f, ");
         emit_source(&expr, &inst->mac_src[0], 0);
         sb_append(&expr, ".y * ");
@@ -421,19 +451,33 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         /* NV2A LIT instruction:
          *   dst.x = 1.0
          *   dst.y = max(src.x, 0.0)
-         *   dst.z = (src.x > 0) ? pow(max(src.y, 0), clamp(src.w, -128, 128)) : 0
+         *   dst.z = (src.x > 0) ? pow(max(src.y,0), clamp(src.w, -B, B)) : 0
          *   dst.w = 1.0
+         * with B = 127.99609375, which is 127 + 255/256 -- the interpreter's
+         * bound, not 128.
          *
-         * Inline expansion rather than a helper, matching the HLSL emitter. */
+         * THIS WAS exp2(w * log2(max(y,0) + 1e-30)) WITH A BOUND OF 128, which
+         * reads as the same function and is not. The epsilon exists to keep
+         * log2 out of -inf, and it changes the answer wherever y <= 0: for a
+         * negative y and a negative exponent the interpreter returns +inf
+         * (powf(0, -n)) while that form returns about 5e25. 59 of 64 fixture
+         * vectors disagreed, because half of a random y is negative. MSL's
+         * pow() follows C here -- pow(+0, y<0) is +inf -- so it is simply the
+         * right primitive, and the emitter now uses it.
+         *
+         * NOT CHECKED AGAINST THE TITLE: no program in JSRF's default.xbe
+         * contains an ILU LIT, so the only evidence for this is the fixture in
+         * vsh_msl_diff_test.m. Inline rather than a helper, matching the HLSL
+         * emitter -- which still carries the old form. */
         sb_append(&expr, "float4(1.0f, max(");
         emit_source(&expr, &inst->ilu_src, 0);
         sb_append(&expr, ".x, 0.0f), (");
         emit_source(&expr, &inst->ilu_src, 0);
-        sb_append(&expr, ".x > 0.0f) ? exp2(clamp(");
+        sb_append(&expr, ".x > 0.0f) ? pow(max(");
         emit_source(&expr, &inst->ilu_src, 0);
-        sb_append(&expr, ".w, -128.0f, 128.0f) * log2(max(");
+        sb_append(&expr, ".y, 0.0f), clamp(");
         emit_source(&expr, &inst->ilu_src, 0);
-        sb_append(&expr, ".y, 0.0f) + 1e-30f)) : 0.0f, 1.0f)");
+        sb_append(&expr, ".w, -127.99609375f, 127.99609375f)) : 0.0f, 1.0f)");
         break;
     }
 
@@ -473,10 +517,37 @@ int nv2a_vsh_generate_msl(const NV2AVshProgram *program,
 
     sb_init(&sb, buf, bufsize);
 
+    /* CONTRACTION OFF, AND THIS IS NOT A STYLE CHOICE.
+     *
+     * MEASURED 16 Sep 2026 on an Apple M1 Max, mathMode = MTLMathModeSafe --
+     * the mode nv2a_metal.m compiles its own shader in. The compiler still
+     * fuses `a * b + c` into a single fma: for a = b = 1.0000001f and
+     * c = -fl(a*b) it returns 1.42e-14 where separate rounding returns exactly
+     * 0. Safe math and contraction are independent switches, and only this
+     * pragma turns the second one off.
+     *
+     * It matters because MAD is emitted as `a * b + c` while the interpreter
+     * computes it as multiply() then +, and multiply()'s zero test is a select
+     * that blocks contraction on the CPU side. The two arithmetics then differ
+     * by one rounding of the product -- normally invisible.
+     *
+     * It is NOT invisible here. NV2A's RCC saturates its reciprocal at 2^64, so
+     * a skinning program that cancels an intermediate to exactly zero, divides,
+     * and multiplies back -- which is what JSRF's do, `R10 = R3*(k - t) + R3*t`
+     * then RCC of a dot product of R10 -- turns that one rounding into a
+     * difference of order 1 in clip space. 51 of 8064 compared vectors across
+     * the title's own 126 programs disagreed by up to 1.78 before this line,
+     * and the disagreements were concentrated in seven programs, all of them
+     * of exactly that shape. See diagnostics/jsrf_first_fault/vsh_msl_diff_test.m.
+     *
+     * The cost is real and unmeasured: the generated code loses fma on every
+     * MAD. Measure it before deciding it is too expensive, and if it is, the
+     * honest alternative is to fuse BOTH sides, not to leave them different. */
     sb_append(&sb,
         "/* Auto-generated NV2A vertex shader */\n"
         "#include <metal_stdlib>\n"
         "using namespace metal;\n"
+        "#pragma clang fp contract(off)\n"
         "\n");
 
     /* Constants are a `constant float4 *` argument on main, declared below. */
@@ -486,6 +557,12 @@ int nv2a_vsh_generate_msl(const NV2AVshProgram *program,
         "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_CONSTANTS * 16);
 
     sb_append(&sb,
+        "/* NV2A suppresses infinity and NaN through a multiply by zero: a*0 and\n"
+        " * 0*b are +0 whatever the other operand is. nv2a_vsh.c's multiply()\n"
+        " * does the same. It is not decoration -- see the note in\n"
+        " * nv2a_vsh_msl.c beside MAC_MUL. */\n"
+        "float4 vsh_mul(float4 a, float4 b) {\n"
+        "    return select(a * b, float4(0.0f), (a == 0.0f) | (b == 0.0f)); }\n"
         "float4 vsh_rcc(float x) { float r = 1.0f / x;\n"
         "    float v = clamp(abs(r), 5.421010862427522e-20f, 1.8446744073709552e19f);\n"
         "    return float4((as_type<uint>(r) & 0x80000000u) != 0u ? -v : v); }\n"

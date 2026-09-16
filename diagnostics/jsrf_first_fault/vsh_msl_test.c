@@ -163,14 +163,14 @@ static void operands_and_opcodes(void)
                         .mac_temp = 2, .mac_mask = 10 /* .xz */,
                         .final = 1 }};
         emit(prog, 1, msl, sizeof(msl));
-        HAS(msl, "float4 mac_result = ((-v1.yyzw) * c[3] + R1);\n");
+        HAS(msl, "float4 mac_result = (vsh_mul((-v1.yyzw), c[3]) + R1);\n");
         HAS(msl, "    R2.xz = (mac_result).xz;\n");
     }
 
     /* The remaining MAC shapes, one instruction each. */
     {
         struct { unsigned op; const char *expect; } cases[] = {
-            { NV2A_VSH_MAC_MUL, "float4 mac_result = (v0 * c[7]);\n" },
+            { NV2A_VSH_MAC_MUL, "float4 mac_result = vsh_mul(v0, c[7]);\n" },
             { NV2A_VSH_MAC_DP3, "float4 mac_result = float4(dot(v0.xyz, c[7].xyz));\n" },
             { NV2A_VSH_MAC_DPH, "float4 mac_result = float4(dot(float4(v0.xyz, 1.0f), c[7]));\n" },
             { NV2A_VSH_MAC_DST, "float4 mac_result = float4(1.0f, v0.y * c[7].y, v0.z, c[7].w);\n" },
@@ -244,19 +244,32 @@ static void ilu_opcodes(void)
         HAS(msl, "    R5 = (ilu_result);\n");
     }
     /* The helpers the generated code calls must be defined in every shader. */
+    /* The helper that carries NV2A's multiply-by-zero rule, and the pragma
+     * that stops the compiler fusing the MAD it feeds. Both are emitter
+     * FIXES, measured against the interpreter in vsh_msl_diff_test; a shader
+     * emitted without either one computes different numbers. */
+    HAS(msl, "float4 vsh_mul(float4 a, float4 b)");
+    HAS(msl, "#pragma clang fp contract(off)");
     HAS(msl, "float4 vsh_rcc(float x)");
     HAS(msl, "as_type<uint>(r)");
     HAS(msl, "float4 vsh_exp(float x)");
     HAS(msl, "float4 vsh_log(float x)");
 
-    /* LIT is expanded inline, on the unscalarised source. */
+    /* LIT is expanded inline, on the unscalarised source.
+     *
+     * pow(), not exp2(w * log2(y + 1e-30)), and the exponent clamp is the
+     * interpreter's 127.99609375 rather than 128. The old form reads as the
+     * same function and is not: for any y <= 0 with a negative exponent the
+     * interpreter returns +inf and it returned a large finite number, which
+     * vsh_msl_diff_test caught on 59 of 64 fixture vectors. No JSRF program
+     * contains a LIT, so that fixture is the only evidence either way. */
     {
         VshIns prog[] = {{ .ilu = NV2A_VSH_ILU_LIT, .c = {1, 2, SWZ_ID, 0},
                         .mac_temp = 3, .ilu_mask = 15, .final = 1 }};
         emit(prog, 1, msl, sizeof(msl));
         HAS(msl, "float4 ilu_result = float4(1.0f, max(R2.x, 0.0f), (R2.x > 0.0f) ?"
-                 " exp2(clamp(R2.w, -128.0f, 128.0f) * log2(max(R2.y, 0.0f) + 1e-30f))"
-                 " : 0.0f, 1.0f);\n");
+                 " pow(max(R2.y, 0.0f),"
+                 " clamp(R2.w, -127.99609375f, 127.99609375f)) : 0.0f, 1.0f);\n");
     }
 }
 
@@ -276,7 +289,7 @@ static void paired_units(void)
                     .mac_temp = 2, .mac_mask = 15,
                     .ilu_mask = 1 /* .w */, .final = 1 }};
     emit(prog, 1, msl, sizeof(msl));
-    const char *mac_value = strstr(msl, "float4 mac_result = (v0 * c[4]);");
+    const char *mac_value = strstr(msl, "float4 mac_result = vsh_mul(v0, c[4]);");
     const char *ilu_value = strstr(msl, "float4 ilu_result = float4(1.0f / R0.w);");
     const char *mac_store = strstr(msl, "R2 = (mac_result);");
     const char *ilu_store = strstr(msl, "R1.w = (ilu_result).w;");

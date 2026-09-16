@@ -421,6 +421,20 @@ if(APPLE)
     set_source_files_properties(vsh_msl_compile_test.m PROPERTIES
                                 COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(jsrf_vsh_msl_compile_test PRIVATE xbox_vsh)
+    # Does the emitted MSL COMPUTE what the CPU interpreter computes? The two
+    # tests above answer "is the text what we meant" and "is the text legal
+    # MSL"; neither has ever executed a shader, and the emitter's own header
+    # said so. This dispatches it as a compute kernel and diffs the sixteen
+    # output registers against nv2a_vsh_execute, over the title's own programs
+    # read out of default.xbe when JSRF_GAME_DIR is set.
+    #
+    # Same group, same reason: it needs a device. It also carries an injected
+    # fault as its positive control, so a run of zeroes can be told apart from
+    # a comparison that is not comparing.
+    add_executable(jsrf_vsh_msl_diff_test vsh_msl_diff_test.m)
+    set_source_files_properties(vsh_msl_diff_test.m PROPERTIES
+                                COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(jsrf_vsh_msl_diff_test PRIVATE xbox_vsh)
     # Explicit GPU tests; do not turn headless CTest runs into device failures.
 endif()
 if(WIN32)

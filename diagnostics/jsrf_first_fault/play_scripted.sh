@@ -81,14 +81,19 @@ if [ ! -x "$BIN" ]; then
     echo "no binary at $BIN" >&2
     exit 1
 fi
-# Same staleness guard as play.sh. *_test.c is excluded: those are separate
-# CMake targets that are NOT linked into jsrf_first_fault, so touching one
-# made this refuse to run a binary that was in fact current. A guard that
-# fires when nothing is wrong is one people start passing JSRF_ALLOW_STALE
-# to, which defeats it entirely. A measurement taken against yesterday's
-# binary is worse than no measurement, because it looks like one.
+# Same staleness guard as play.sh. *_test.c AND *_test.m are excluded: those
+# are separate CMake targets that are NOT linked into jsrf_first_fault, so
+# touching one made this refuse to run a binary that was in fact current. A
+# guard that fires when nothing is wrong is one people start passing
+# JSRF_ALLOW_STALE to, which defeats it entirely. A measurement taken against
+# yesterday's binary is worse than no measurement, because it looks like one.
+#
+# The .m half was missing until 16 Sep 2026 and cost a two-arm bisect: adding
+# vsh_msl_diff_test.m -- a ctest target, never linked into the game -- refused
+# every run until the pattern was widened. The comment above already said what
+# the rule was; the pattern just did not implement it.
 NEWER=$(find "$ROOT/src" "$ROOT/diagnostics/jsrf_first_fault" -name '*.c' -o -name '*.h' -o -name '*.m' 2>/dev/null \
-        | grep -v ' 2\.c$' | grep -vE '_test\.c$' \
+        | grep -v ' 2\.c$' | grep -vE '_test\.(c|m)$' \
         | while read -r f; do [ "$f" -nt "$BIN" ] && echo "$f"; done | head -3)
 if [ -n "$NEWER" ]; then
     echo "WARNING: $BIN is older than these sources -- rebuild, or you are measuring the previous build:" >&2

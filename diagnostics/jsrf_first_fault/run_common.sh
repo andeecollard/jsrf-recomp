@@ -47,7 +47,7 @@ jsrf_require_game() {
 jsrf_binary_sources() {
     find "$ROOT/src" "$ROOT/diagnostics/jsrf_first_fault" \
          \( -name '*.c' -o -name '*.h' -o -name '*.m' \) 2>/dev/null \
-      | grep -vE '_test\.c$' | grep -v ' 2\.c$'
+      | grep -vE '_test\.(c|m)$' | grep -v ' 2\.c$'
 }
 
 jsrf_require_current_binary() {
