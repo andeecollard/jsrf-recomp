@@ -429,6 +429,15 @@ add_test(NAME jsrf_multitexture_fragment COMMAND jsrf_multitexture_fragment_test
 #
 # No device, no game, no build artefacts -- it reads src/ -- so it runs
 # everywhere and costs nothing.
+# G10: an instrument that cannot fire is not an instrument. Two hypotheses
+# about the glyph defect were killed by "0 clip-w vertices, 0 q<=0 vertices in
+# 445,498 batches"; this proves those zeros were the game being clean rather
+# than the counters being dead. No device, no game.
+add_executable(jsrf_ff_refusal_test ff_refusal_test.c)
+target_link_libraries(jsrf_ff_refusal_test PRIVATE xbox_vsh)
+target_include_directories(jsrf_ff_refusal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/nv2a)
+add_test(NAME jsrf_ff_refusal COMMAND jsrf_ff_refusal_test)
+
 add_test(NAME jsrf_switch_audit
          COMMAND ${CMAKE_COMMAND} -E env python3
                  ${CMAKE_CURRENT_SOURCE_DIR}/switch_audit.py
