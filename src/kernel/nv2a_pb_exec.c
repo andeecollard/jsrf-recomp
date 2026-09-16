@@ -513,6 +513,12 @@ static float s_positions[NV_MAX_INDICES][4];
 static uint32_t s_colors[NV_MAX_INDICES];
 /* Retain all shader outputs for texture interpolation and draw captures. */
 static float s_outputs[NV_MAX_INDICES][16][4];
+/* Does s_outputs hold the vertex program's OUTPUTS, or its INPUTS for the GPU
+ * to transform? Every reader of s_outputs assumes the former; the GPU vertex
+ * path makes it the latter, and the two are indistinguishable by inspection --
+ * both are sixteen float4 per vertex. */
+static int s_vsh_gpu_batch;
+static int s_vsh_force_cpu;
 static uint32_t s_methods[0x2000 / 4];
 static uint8_t s_method_seen[0x2000 / 4];
 static int s_capture_selected;
@@ -2576,16 +2582,32 @@ static int prepare_vertices(void)
      * backend keeps the selected program in a static, and a stale one applied
      * to the next batch's vertices would transform them with the wrong
      * program and draw it without an error anywhere. */
+    /* SET WHEN THIS BATCH'S s_outputs HOLDS PROGRAM INPUTS RATHER THAN
+     * TRANSFORMED POSITIONS, so the one consumer that cannot tell the
+     * difference is stopped from reading them. See the fallback in
+     * raster_batch: when nv2a_gpu_draw rejects, the executor rasterises
+     * s_outputs on the CPU, and object-space positions read as screen
+     * coordinates draw nothing recognisable and report no error. Caught by
+     * jsrf_vsh_render, which draws a real JSRF program into an 8x8 surface and
+     * checks every pixel. */
     int gpu_vsh = 0;
 #if defined(__APPLE__) && NV2A_GPU_PATH
+    if (s_vsh_force_cpu) {
+        /* The Metal draw rejected this batch and it is about to be handed to
+         * the CPU rasteriser, which reads s_outputs as SCREEN positions. This
+         * pass re-runs the interpreter so that is what it finds. */
+        nv2a_metal_vsh_clear();
+    } else
     if (programmable && s_vsh.decoded.valid && s_vsh.decoded.length > 0) {
         gpu_vsh = nv2a_metal_vsh_ready(
                       (const uint32_t (*)[4])s_vsh.words[s_vsh.start],
                       s_vsh.decoded.length, s_vsh.decoded.inputs_read);
         if (gpu_vsh) nv2a_metal_vsh_constants(s_vsh.constants);
         else nv2a_metal_vsh_clear();
+        s_vsh_gpu_batch = gpu_vsh;
     } else {
         nv2a_metal_vsh_clear();
+        s_vsh_gpu_batch = 0;
     }
 #endif
     if (vsh_reuse_stats()) {
@@ -3254,6 +3276,22 @@ static void raster_batch(void)
             s_copy.state.target_bpp,s_copy.state.depth_test,s_copy.state.depth_write,s_copy.state.blend,
             s_copy.state.dither,s_copy.state.repeat,s_copy.state.cull_face,
             s_copy.state.clip_x,s_copy.state.clip_y);
+    }
+#endif
+#if defined(__APPLE__) && NV2A_GPU_PATH
+    /* RE-TRANSFORM BEFORE THE CPU RASTERISER TOUCHES THIS. s_outputs currently
+     * holds the program's inputs; every branch below reads it as screen-space
+     * positions. Re-running the interpreter is the whole cost of a rejected
+     * GPU-vertex batch, and a rejected batch is rare by construction -- but it
+     * is the difference between a correct frame and one whose geometry is
+     * drawn from object space with nothing in the log to say so. */
+    if (s_vsh_gpu_batch) {
+        int ok;
+        s_vsh_force_cpu = 1;
+        ok = prepare_vertices();
+        s_vsh_force_cpu = 0;
+        s_vsh_gpu_batch = 0;
+        if (!ok) { ++s_vsh.rejected; return; }
     }
 #endif
     ++s_gpu.cpu_batches;

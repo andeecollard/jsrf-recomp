@@ -781,8 +781,22 @@ static NSString *const shader =
  * wrapper repacks VS_OUT into Out explicitly, field by field. One library per
  * program costs recompiling the shared source 126 times across a session;
  * that is a first-use hitch, not a per-frame cost, and correctness first. */
+/* DEFAULT ON since 16 Sep 2026, measured before flipping it:
+ *
+ *     CPU interpreter   vsh 12.90  submit 5.28  sync 8.30   29.79 ms  33.6 fps
+ *     GPU programs      vsh  3.29  submit 4.99  sync 6.40   18.32 ms  54.6 fps
+ *
+ * 408,205,400 vertices transformed on the GPU across 639,089 draws, 21 distinct
+ * programs compiled, nothing refused by the emitter, the compiler or either
+ * cache, and 24 of 24 gameplay frames clean with the artefact fingerprint at
+ * 31% against the software control's 30%.
+ *
+ * =0 takes the CPU interpreter and stays a real arm: it is the oracle this
+ * path was verified against, it is what runs for any program the emitter
+ * cannot express, and it is the control for every frame-time claim above. */
 static int vsh_gpu_on(void)
-{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_VSH"); return on; }
+{ static int on=-1; if(on<0){const char*e=getenv("RECOMP_METAL_VSH");
+                             on = e ? (atoi(e)!=0) : 1;} return on; }
 /* Both are defined below; this block sits above them because the program cache
  * has to be declared before nv2a_metal_draw, which is above them too. */
 static int hw_state_on(void);
@@ -1141,12 +1155,39 @@ static int hw_565_on(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_METAL_565");
-        on = e ? (atoi(e) != 0) : 0;
+        on = e ? (atoi(e) != 0) : 1;
     }
     return on && hw_state_on();
 }
 
-/* !!! THE IMAGE IS WRONG AT A REAL MISSION. DO NOT DEFAULT THIS ON. !!!
+/* DEFAULT ON since 16 Sep 2026. THE BLOCK BELOW USED TO SAY "DO NOT DEFAULT
+ * THIS ON" AND ITS EVIDENCE HAS BEEN SUPERSEDED, NOT IGNORED. Read on.
+ *
+ * What it described -- "torn rectangular tiles carrying content from elsewhere
+ * in the scene, and a large black band" -- is the artefact that was fixed on
+ * 16 Sep by making every hardware draw read the colour attachment under
+ * raster_order_group(0). It was never a 565 defect. 565 was measured beside it
+ * and inherited the blame, because at the time EVERY hardware-path arm was
+ * corrupt and there was no clean baseline to score against.
+ *
+ * Scored against a clean baseline, on the same binary and pad, 24 captured
+ * gameplay frames: clean by eye, and the artefact's own structural fingerprint
+ * -- the fraction of dark blocks whose left edge lands on a 4-pixel grid --
+ * reads 32% against the software control's 30%, where the broken renderer read
+ * 43% and chance is 25%.
+ *
+ * It is also FASTER and MORE CORRECT, which is why this is not a trade. Two
+ * bytes a pixel instead of sixteen, in the guest's own format: both per-pixel
+ * conversion loops become row memcpys, every colour transfer shrinks
+ * eightfold, and the frame stops requantising between draws, so the double
+ * rounding at the read-back boundary is gone. Measured 18.32 -> 16.37 ms,
+ * 54.6 -> 61.1 fps.
+ *
+ * =0 takes RGBA32Float and remains the control arm.
+ *
+ * ------------------------------------------------------------------------
+ * THE ORIGINAL NOTE FOLLOWS, kept because its METHOD lesson is still the
+ * right one and is the reason the fingerprint above exists at all.
  *
  * 15 Sep 2026, reported by a person watching the game: a flickering grid across
  * the background, with solid black rectangles appearing and disappearing frame

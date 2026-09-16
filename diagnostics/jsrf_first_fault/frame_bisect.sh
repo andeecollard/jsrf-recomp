@@ -111,13 +111,13 @@ arm_env() {
     RECOMP_METAL_SURFACE_CACHE=1
     RECOMP_METAL_BATCH_MAX=0
     RECOMP_METAL_SHADER_BLEND=
-    RECOMP_METAL_565=0
+    RECOMP_METAL_565=
     RECOMP_METAL_CB_STATS=
     RECOMP_METAL_CB_GPU=
     RECOMP_METAL_DRAIN=0
     RECOMP_METAL_READBACK_AUDIT=0
     RECOMP_METAL_FENCE=0
-    RECOMP_METAL_VSH=0
+    RECOMP_METAL_VSH=
     case "$1" in
         sw)           ;;
         mode1)        RECOMP_METAL_HW=1; RECOMP_METAL_SHADER_BLEND=1 ;;
@@ -159,12 +159,17 @@ arm_env() {
     # unset. recomp_switch.h says the same thing one level down: "Empty counts
     # as off too, because `VAR= cmd` is how a shell unsets a variable for one
     # command" -- true there, and exactly the trap here.
-    if [ -n "$RECOMP_METAL_SHADER_BLEND" ]; then
-        export RECOMP_METAL_SHADER_BLEND
-    else
-        unset RECOMP_METAL_SHADER_BLEND
-    fi
-    export RECOMP_METAL_565
+    # EVERY SWITCH WHOSE DEFAULT IS NOT 0 HAS TO BE UNSET RATHER THAN ZEROED.
+    # Zeroing it does not give the arm the default, it gives the arm the OFF
+    # state -- and a `hwdef` arm that silently measures the off state is worse
+    # than no arm, because it looks like a default measurement. This caught
+    # RECOMP_METAL_565 and RECOMP_METAL_VSH the moment their defaults flipped:
+    # the run reported "metal_565 OFF, metal_vsh OFF" while claiming to be the
+    # default arm.
+    for _v in RECOMP_METAL_SHADER_BLEND RECOMP_METAL_565 RECOMP_METAL_VSH; do
+        eval "_val=\${$_v}"
+        if [ -n "$_val" ]; then eval "export $_v"; else unset "$_v"; fi
+    done
     export RECOMP_METAL_CB_STATS RECOMP_METAL_CB_GPU
     export RECOMP_METAL_DRAIN RECOMP_METAL_READBACK_AUDIT
     export RECOMP_METAL_FENCE
