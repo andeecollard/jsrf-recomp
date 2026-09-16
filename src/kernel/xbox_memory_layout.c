@@ -336,6 +336,38 @@ static void *g_mcpx_regs = NULL;
  * If the double mapping cannot be made the code falls back to the old
  * unprotect-and-store path, which is wrong in the same old way but no worse. */
 static void *g_mcpx_alias = NULL;
+/* THE SAME TRICK FOR THE NV2A APERTURE, and the reason it was missing is the
+ * reason CLAUDE.md still lists PCRTC_INTR_0 and PGRAPH_INTR as having "this
+ * shape". MCPX got the alias; NV2A was left a plain VirtualAlloc, so every
+ * runtime write to a guarded NV2A register unprotects the page, writes, and
+ * reprotects -- 60 to 120 times a second for the vblank alone -- and a guest
+ * store landing in that window completes silently against RAM instead of
+ * faulting into the model. That is the 13.5M-lost-writes hazard the rule was
+ * written for, still open on the register the guest's vsync pump depends on.
+ *
+ * THE DETECTOR BUILT TO WATCH FOR IT CANNOT SEE IT, which is why nobody
+ * noticed. pcrtc_check compares the register against what this runtime last
+ * left there -- but the guest's acknowledge is a write-1-to-clear of a bit
+ * that IS ALREADY 1, so a store lost through the window leaves the register
+ * bit-identical and the check compares 1 against 1. And its only caller is
+ * the vblank raise, which stops happening once a lost acknowledge latches the
+ * pending bit: the counter's ceiling is one, and it prints zero as an
+ * all-clear. Found by audit, 16 Sep 2026.
+ *
+ * With the alias there is no window at all, so neither the detector nor its
+ * blindness matters. */
+static void *g_nv2a_mapping = NULL;
+static void *g_nv2a_alias = NULL;
+/* The alias address of a guarded NV2A register, or the register itself when
+ * there is no alias and the caller must fall back to unprotecting. */
+static volatile uint32_t *nv2a_w32(volatile uint32_t *p)
+{
+    uintptr_t off;
+    if (!g_nv2a_alias || !g_nv2a_memory) return p;
+    off = (uintptr_t)p - ((uintptr_t)XBOX_NV2A_BASE + g_memory_offset);
+    if (off >= (uintptr_t)XBOX_NV2A_SIZE) return p;
+    return (volatile uint32_t *)((char *)g_nv2a_alias + off);
+}
 static HANDLE g_mcpx_mapping = NULL;
 
 /* A guest-view pointer, translated to the writable alias. */
@@ -2147,6 +2179,23 @@ void xbox_Nv2aRaiseVblank(void)
         __atomic_fetch_or((uint32_t *)pmc, XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
         return;
     }
+    if (g_nv2a_alias) {
+        /* The alias is the same physical page seen through an unguarded view,
+         * so this store is an ordinary store that never faults into
+         * mcpx_trap_handler and never needs the guard dropped. The guest's
+         * view stays PAGE_READONLY for the whole raise: there is no window,
+         * so there is nothing to race. That is the point of the mapping --
+         * the comment above describes the problem this solves, not a
+         * constraint that still applies. */
+        volatile uint32_t *w = nv2a_w32(pcrtc);
+        mcpx_lock();
+        pcrtc_check("vblank raise");
+        *w |= 0x1u;
+        pcrtc_note_expected(*w);
+        mcpx_unlock();
+        __atomic_fetch_or((uint32_t *)pmc, XBOX_NV2A_PMC_INTR_PCRTC, __ATOMIC_SEQ_CST);
+        return;
+    }
     {
         DWORD old_prot;
         mcpx_lock();
@@ -2179,6 +2228,25 @@ BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
     DWORD old_prot;
     if (!g_nv2a_pgraph_guarded || !parameter || xbox_Nv2aSoftwareMethodPending()) return FALSE;
     mcpx_lock();
+    if (g_nv2a_alias) {
+        /* Five stores through the unguarded alias. The version below held the
+         * whole 16 KB PGRAPH page writable across all five -- a window an
+         * order of magnitude wider than the vblank's, on the page carrying
+         * every PGRAPH register the guest writes, and with no detector
+         * watching it at all. Note also that the old path discarded the
+         * reprotect's return value: a failure there left the page writable
+         * for good, silently. */
+        volatile uint32_t *w = nv2a_w32(regs);
+        w[0x400704/4] = ((subchannel & 7u) << 16) | 0x100u;
+        w[0x400708/4] = parameter;
+        w[0x400108/4] = 1; /* NSOURCE_NOTIFICATION */
+        w[0x400720/4] = 0; /* suspend until the guest restores FIFO access */
+        w[0x400100/4] |= XBOX_NV2A_PGRAPH_ERROR;
+        __atomic_fetch_or((uint32_t *)&w[0x100/4], XBOX_NV2A_PMC_INTR_PGRAPH,
+                          __ATOMIC_SEQ_CST);
+        mcpx_unlock();
+        return TRUE;
+    }
     if (!VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_mcpx_page_size,
                         PAGE_READWRITE, &old_prot)) {
         mcpx_unlock();
@@ -2189,8 +2257,10 @@ BOOL xbox_Nv2aRaiseSoftwareMethod(uint32_t subchannel, uint32_t parameter)
     regs[0x400108/4] = 1; /* NSOURCE_NOTIFICATION */
     regs[0x400720/4] = 0; /* suspend until the guest restores FIFO access */
     regs[0x400100/4] |= XBOX_NV2A_PGRAPH_ERROR;
-    VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_mcpx_page_size,
-                   PAGE_READONLY, &old_prot);
+    if (!VirtualProtect((LPVOID)g_nv2a_pgraph_page, g_mcpx_page_size,
+                        PAGE_READONLY, &old_prot))
+        fprintf(stderr, "  [NV2A] FAILED to reprotect the PGRAPH page; guest"
+                        " writes to it no longer reach the model\n");
     __atomic_fetch_or((uint32_t *)&regs[0x100/4], XBOX_NV2A_PMC_INTR_PGRAPH, __ATOMIC_SEQ_CST);
     mcpx_unlock();
     return TRUE;
@@ -4169,12 +4239,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
-        g_nv2a_memory = VirtualAlloc(
-            (LPVOID)nv2a_native,
-            XBOX_NV2A_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        /* A file mapping viewed twice: once at the guest address, where it is
+         * guarded, and once wherever the host likes, where it never is. The
+         * runtime writes its own registers through the second view, so the
+         * guarded one is never unprotected and no guest store can slip past
+         * the trap. Exactly what the MCPX aperture already does -- see
+         * g_mcpx_alias -- and the reason that one has "no window, so nothing
+         * to race" while this one did. */
+        g_nv2a_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                                            PAGE_READWRITE, 0,
+                                            XBOX_NV2A_SIZE, NULL);
+        if (g_nv2a_mapping) {
+            g_nv2a_memory = MapViewOfFileEx(g_nv2a_mapping, FILE_MAP_ALL_ACCESS,
+                                            0, 0, XBOX_NV2A_SIZE,
+                                            (LPVOID)nv2a_native);
+            if (g_nv2a_memory)
+                g_nv2a_alias = MapViewOfFileEx(g_nv2a_mapping,
+                                               FILE_MAP_ALL_ACCESS, 0, 0,
+                                               XBOX_NV2A_SIZE, NULL);
+            if (!g_nv2a_alias && g_nv2a_memory)
+                fprintf(stderr, "  [NV2A] alias view FAILED; register writes"
+                                " fall back to unprotecting the guest page\n");
+        }
+        if (!g_nv2a_memory) {
+            fprintf(stderr, "  [NV2A] file mapping unavailable, using a plain"
+                            " allocation (no alias, unprotect windows remain)\n");
+            g_nv2a_memory = VirtualAlloc(
+                (LPVOID)nv2a_native,
+                XBOX_NV2A_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
+        }
+        if (g_nv2a_alias)
+            fprintf(stderr, "  [NV2A] aperture aliased at %p; the guarded view"
+                            " is never unprotected\n", g_nv2a_alias);
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL

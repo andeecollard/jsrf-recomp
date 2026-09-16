@@ -103,7 +103,16 @@ aperture is trapped read-only so guest stores reach the model. A thread that
 unprotect/store/reprotects *anything* on that 16 KB page opens a window where
 guest stores complete silently against RAM — this cost 13.5M windows in 45 s and
 swallowed every `VOICE_ON`. Emulate the access in the handler; never open a
-writable window. `PCRTC_INTR_0` and `PGRAPH_INTR` still have this shape.
+writable window.
+
+The fix that scales is a **double mapping**: one `CreateFileMappingA`, two
+`MapViewOfFileEx` views — the guest's, permanently guarded, and an alias the
+runtime writes through. MCPX has had one since the 13.5M-window incident; the
+NV2A aperture got one on 16 Sep 2026, closing the last two windows
+(`PCRTC_INTR_0` on every vblank, `PGRAPH_INTR` on every software method). Look
+for `[NV2A] aperture aliased at` and `[MCPX] aperture aliased at` in a run log
+to confirm both took. Anything new that must write a guarded device register
+goes through the alias, not through `VirtualProtect`.
 
 **Don't patch around a gate until a run proves which value is wrong.** Forcing a
 count nonzero or clearing a flag bit hides the producer bug that set it.
