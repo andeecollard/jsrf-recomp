@@ -55,7 +55,35 @@ Then make it the tree default.
 static while dialogue advances and changed *exactly once* in the GPU arm — on
 the corrupt frame — so any dump there is a candidate rather than noise.
 
-## G3 — The frame tail, which is where the speed now lives
+## G3 — The frame tail — **and it is the surface swap, not the flip**
+
+> **CORRECTED 16 Sep, late.** Every earlier plan here aimed at the flip sync.
+> Per-caller counters say the flip costs **nothing**: 7,918 of its syncs
+> against 7,906 that found nothing dirty — it is already clean by the time it
+> runs, because the surface swap just before it drained. The cost is the
+> **surface swaps**: 15,793 of them, two per frame, and essentially all of the
+> 15,805 syncs that actually drained.
+>
+>     sync callers  15793 surface swap | 0 invalidate | 0 frame end | 7918 flip
+>     23711 calls (7906 already clean), 50627 ms draining + 12005 ms readback
+>     7904 flips, mean 16.45 ms  ->  7.92 ms/frame in sync, 48% of the frame
+>
+> And 15,788 of 15,793 swaps are **rebinds at a 100% cache hit rate** — both
+> surfaces already resident on the GPU. The drain and readback exist to write
+> the outgoing surface back to guest RAM, whose pixels are sitting safely in
+> its slot.
+>
+> The machinery to avoid this **already exists and is used only for clears**:
+> a slot can be marked `owes_guest_ram`, deferring the writeback until
+> eviction. That path ran **zero** times in a whole run while the expensive
+> one ran 15,793 times. Extending it from clears to rendered content is the
+> fix, with the flip and any guest read of the range forcing the writeback.
+>
+> **So the staged flip-sync redesign would have bought approximately nothing.**
+> Do not start it. The old plan is kept below for its census of the surface
+> cache, which is still true and still needed.
+
+## G3 (superseded plan) — the flip sync
 
 The flip sync is 4–9 ms per frame, one call per frame, ~70% of all sync cost,
 and is **untouched**. The frame is serialised into submit → stall the GPU →

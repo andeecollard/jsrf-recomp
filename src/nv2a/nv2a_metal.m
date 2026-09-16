@@ -2013,6 +2013,15 @@ static uint64_t g_queue_drains;
  * silence: read it before believing a frame-time number. */
 static uint64_t g_resident_color_clears, g_resident_depth_clears;
 static uint64_t g_resident_unbound_clears, g_slot_writebacks, g_slot_writeback_skipped;
+/* WHO ASKS FOR THE STALL.
+ *
+ * A 150 s gameplay run reported 24,293 sync calls costing 52.7 s of draining
+ * and 12.5 s of readback -- 8.06 ms per frame against a 16.05 ms frame, i.e.
+ * HALF THE FRAME. The instrument printed one total for every caller, so the
+ * attribution had to be done by arithmetic across two other report lines
+ * (16,181 surface swaps + 8,098 flips = 24,279, against 24,293 syncs). That
+ * worked, but it is not a measurement anyone else will repeat. These are. */
+static uint64_t g_sync_by_swap, g_sync_by_invalidate, g_sync_by_frame_end;
 /* WHY A RESIDENT CLEAR REFUSED, by reason, because the counts alone said the
  * colour half was refusing 8 times for every one it took and nothing said
  * which test threw it out. A refusal is not free: clear_surface then calls
@@ -2243,6 +2252,19 @@ void nv2a_metal_report(void)
             (unsigned long long)g_vsh_refused_compile,
             (unsigned long long)g_vsh_cache_full,
             (unsigned long long)g_vsh_pso_full);
+    /* The attribution, beside the cost, so nobody has to cross-reference two
+     * lines to learn where half the frame went. "external" is the executor's
+     * own calls -- the flip's snapshot and the diagnostic surface dump -- which
+     * reach the backend through a macro rather than from inside this file. */
+    fprintf(stderr,"[METAL] sync callers: %llu surface swap, %llu invalidate,"
+            " %llu frame end, %llu external (of %llu calls, %llu already"
+            " clean)\n",
+            (unsigned long long)g_sync_by_swap,
+            (unsigned long long)g_sync_by_invalidate,
+            (unsigned long long)g_sync_by_frame_end,
+            (unsigned long long)(sync_calls - g_sync_by_swap
+                                 - g_sync_by_invalidate - g_sync_by_frame_end),
+            (unsigned long long)sync_calls, (unsigned long long)sync_clean);
     fprintf(stderr,"[METAL] unbound-surface clears: %llu served from the cache,"
             " %llu slot write-backs (%llu skipped)\n",
             (unsigned long long)g_resident_unbound_clears,
@@ -2954,7 +2976,7 @@ void nv2a_metal_invalidate(uint8_t *target)
   * live binding it must also invalidate in the cache -- otherwise a later swap
   * back would rebind a texture for memory the CPU has since overwritten. */
  surface_cache_drop(target);
- if(!target||target==surface_target||target==depth_target){nv2a_metal_sync();surface_valid=depth_valid=0;}}
+ if(!target||target==surface_target||target==depth_target){++g_sync_by_invalidate;nv2a_metal_sync();surface_valid=depth_valid=0;}}
 const char *nv2a_metal_last_reject(void){return reject_reason?reject_reason:"none";}
 /* A REJECTED DRAW HANDS THE BATCH TO THE CPU RASTERISER, which renders it into
  * guest RAM -- so the retained textures are stale from that moment, and the
@@ -3231,6 +3253,7 @@ static unsigned long long bench_replay(int batched, unsigned long long *cpu_ns)
                         (const float (*)[16][4])d->verts, d->count, d->primitive);
     }
     t1 = mtl_now_ns();
+    ++g_sync_by_frame_end;
     nv2a_metal_sync();                 /* through final GPU completion */
     t2 = mtl_now_ns();
     batch_force = 0;
@@ -3483,7 +3506,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   } else
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
   if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
-   ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");
+   ++surface_uploads;++g_sync_by_swap;if(!nv2a_metal_sync())return reject("surface-sync");
    /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
     * The sync above has already written the outgoing surface out, so the
     * incoming slot's textures still hold exactly what was drawn into them --
