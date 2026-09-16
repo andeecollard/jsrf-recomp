@@ -196,7 +196,7 @@ static int batch_force;
  * now. Keep it working: it is the control for this whole result. */
 static int batch_on(void)
 {static int on=-1;if(batch_force)return batch_force>0;
- if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=e?(atoi(e)!=0):1;}
+ if(on<0){const char*e=getenv("RECOMP_METAL_BATCH");on=(e&&*e)?(atoi(e)!=0):1;}
  return on;}
 /* A cap exists so the effect of unbounded batching can be told apart from the
  * effect of batching at all, and so a pathological scene cannot defer the GPU
@@ -391,7 +391,7 @@ static int surface_cache_on(void)
 {
     static int on = -1;
     if (on < 0) { const char *e = getenv("RECOMP_METAL_SURFACE_CACHE");
-                  on = e ? (atoi(e) != 0) : 1; }
+                  on = (e && *e) ? (atoi(e) != 0) : 1; }
     return on;
 }
 
@@ -802,7 +802,7 @@ static NSString *const shader =
  * cannot express, and it is the control for every frame-time claim above. */
 static int vsh_gpu_on(void)
 { static int on=-1; if(on<0){const char*e=getenv("RECOMP_METAL_VSH");
-                             on = e ? (atoi(e)!=0) : 1;} return on; }
+                             on = (e && *e) ? (atoi(e)!=0) : 1;} return on; }
 /* Both are defined below; this block sits above them because the program cache
  * has to be declared before nv2a_metal_draw, which is above them too. */
 static int hw_state_on(void);
@@ -1218,7 +1218,7 @@ static int hw_565_on(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_METAL_565");
-        on = e ? (atoi(e) != 0) : 1;
+        on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on && hw_state_on();
 }
@@ -1323,7 +1323,7 @@ static int hw_state_on(void)
          * one: it is the reference this path is scored against, and it is the
          * only path that works when a draw's state cannot be translated. */
         const char *e = getenv("RECOMP_METAL_HW");
-        on = e ? (atoi(e) != 0) : 1;
+        on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
 }

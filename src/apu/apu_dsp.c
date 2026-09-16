@@ -33,7 +33,7 @@
 int mcpx_apu_mixdown_all(void)
 { static int on = -1;
   if (on < 0) { const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-                on = e ? (atoi(e) != 0) : 1; }
+                on = (e && *e) ? (atoi(e) != 0) : 1; }
   return on; }
 
 /* ── DSP command doorbell acknowledgement ────────────────────────────────

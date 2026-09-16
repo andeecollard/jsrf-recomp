@@ -926,7 +926,7 @@ int mcpx_apu_se_while_trapped(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_APU_SE_WHILE_TRAPPED");
-        on = e ? (atoi(e) != 0) : 1;
+        on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
 }

@@ -170,12 +170,25 @@ PCONF="$HOME/Library/Application Support/JSRF/paths.conf"
 if [ -f "$PCONF" ]; then
     echo "=== against the player's paths.conf ==="
     DIFFS=0
-    for kv in $(grep -E '^[[:space:]]*export RECOMP_' "$PCONF" | sed -E 's/^[[:space:]]*export //'); do
-        k=${kv%%=*}; want=${kv#*=}; have=$(printenv "$k" || true)
+    # LINE AT A TIME, NOT WORD AT A TIME. `for kv in $(grep ...)` splits on
+    # whitespace, so an export whose VALUE contains a space -- a quoted path,
+    # say -- becomes several bogus entries. This file's own template writes
+    # `export X=1  # comment` lines too. Both forms are now handled: the value
+    # is taken verbatim after the first '=', surrounding quotes are stripped,
+    # and a trailing comment is not treated as part of it.
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        kv=${line#*export }
+        k=${kv%%=*}; want=${kv#*=}
+        case "$want" in \"*\") want=${want#\"}; want=${want%\"} ;; esac
+        have=$(printenv "$k" || true)
         if [ "$have" != "$want" ]; then
-            echo "    DIFFERS: player has $kv, this run has $k=${have:-<unset>}"; DIFFS=$((DIFFS+1))
+            echo "    DIFFERS: player has $k=$want, this run has $k=${have:-<unset>}"
+            DIFFS=$((DIFFS+1))
         fi
-    done
+    done <<EOF_PCONF
+$(grep -E '^[[:space:]]*export RECOMP_' "$PCONF")
+EOF_PCONF
     printf '%s\n' "$SWITCHES" | while IFS= read -r kv; do
         [ -n "$kv" ] || continue; k=${kv%%=*}
         grep -qE "^[[:space:]]*export $k=" "$PCONF" || echo "    DIFFERS: this run has $kv, player's paths.conf does not set $k"

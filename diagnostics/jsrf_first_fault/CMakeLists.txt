@@ -416,6 +416,24 @@ add_test(NAME jsrf_dxt_fragment COMMAND jsrf_dxt_fragment_test)
 add_executable(jsrf_multitexture_fragment_test multitexture_fragment_test.c)
 target_link_libraries(jsrf_multitexture_fragment_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_multitexture_fragment COMMAND jsrf_multitexture_fragment_test)
+# THE SWITCHES OBEY RULES NO HUMAN RE-CHECKS.
+#
+# 204 RECOMP_* switches, and this tree's recorded failures are mostly "the two
+# arms were not actually different" or "the default was not what the comment
+# said" -- properties of the switch SET, which no file review can see. The
+# audit checks three rules that have each been violated at least once, and it
+# found nine real sites the first time it ran with its default-on rule
+# working: every default-on switch in the Metal backend treated an EMPTY value
+# as off rather than as the default, which is why frame_bisect.sh carries a
+# paragraph about unsetting rather than zeroing them.
+#
+# No device, no game, no build artefacts -- it reads src/ -- so it runs
+# everywhere and costs nothing.
+add_test(NAME jsrf_switch_audit
+         COMMAND ${CMAKE_COMMAND} -E env python3
+                 ${CMAKE_CURRENT_SOURCE_DIR}/switch_audit.py
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+
 if(APPLE)
     add_executable(jsrf_metal_copy_test metal_copy_test.c)
     target_link_libraries(jsrf_metal_copy_test PRIVATE xbox_vsh)

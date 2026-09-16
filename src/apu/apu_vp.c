@@ -822,7 +822,7 @@ int mcpx_apu_trap_coalesce(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_APU_TRAP_COALESCE");
-        on = e ? (atoi(e) != 0) : 1;
+        on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
 }
