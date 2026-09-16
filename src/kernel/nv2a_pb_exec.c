@@ -481,6 +481,14 @@ static struct {
      * scales and made the ratio meaningless. */
     uint32_t   idx_wanted, idx_wanted_max;
     unsigned long long idx_overflow, idx_overflow_e16, idx_overflow_e32;
+    /* INLINE_ARRAY is a separate array with a separate cap and was in neither
+     * counter. Words, not indices -- an inline vertex is several words -- so
+     * these are deliberately NOT summed into idx_overflow, which counts
+     * indices. Mixing the two scales is the mistake the e16 note below
+     * records. */
+    unsigned long long inline_overflow;
+    uint32_t   inline_wanted, inline_wanted_max;
+    uint32_t   batches_no_layout;
     unsigned long long elem32_seen, elem32_indices, elem32_wide;
     uint32_t   elem32_batches_dropped;
     int        batch_wide;              /* an index did not fit uint16_t */
@@ -3424,8 +3432,18 @@ static void draw_primitive(void)
     float v[4];
     uint32_t i;
 
-    if (!s_gpu.prim || !s_gpu.idx_count)
+    /* An inline batch whose layout could not be derived arrives here with
+     * idx_count == 0 and leaves without drawing and without a trace. That is
+     * the delivery mechanism for inline_layout()'s refusal of UB_D3D -- the
+     * one format this title declares on every draw -- and it is exactly the
+     * silence the `batch_wide` refusal below refuses to have. Count it. */
+    if (!s_gpu.prim)
         return;
+    if (!s_gpu.idx_count) {
+        if (s_gpu.inline_count)
+            ++s_gpu.batches_no_layout;
+        return;
+    }
     /* An index that did not fit uint16_t means the indices we DO hold are a
      * subset with the gaps closed up, which is a different mesh. Refuse rather
      * than draw wrong topology; counted so the refusal is never silent. */
@@ -3769,6 +3787,9 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
             if (s_gpu.idx_wanted > s_gpu.idx_wanted_max)
                 s_gpu.idx_wanted_max = s_gpu.idx_wanted;
             s_gpu.idx_wanted = 0;
+            if (s_gpu.inline_wanted > s_gpu.inline_wanted_max)
+                s_gpu.inline_wanted_max = s_gpu.inline_wanted;
+            s_gpu.inline_wanted = 0;
             s_gpu.batch_wide = 0;
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
@@ -3820,8 +3841,21 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_INLINE_ARRAY:
-        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE_WORDS)
-            s_gpu.inline_words[s_gpu.inline_count++] = param;
+        /* THE SAME DEFECT THAT WAS THE FENCE, ON THE PATH THAT WAS NOT FIXED.
+         * ARRAY_ELEMENT16 used to stop storing at the cap and draw the batch
+         * anyway, tail missing, reported by nothing; that was measured and the
+         * cap was raised. This line still does it. A truncated inline_count
+         * divides by the stride into a SMALLER BUT STILL VALID vertex count,
+         * so the batch draws a partial mesh -- no rejection, no fallback, and
+         * no term in `no-room`, which splits e16/e32 only and is therefore
+         * blind here. Count the dropped words before trusting no-room=0. */
+        if (s_gpu.prim) {
+            if (s_gpu.inline_count < NV_MAX_INLINE_WORDS)
+                s_gpu.inline_words[s_gpu.inline_count++] = param;
+            else
+                ++s_gpu.inline_overflow;
+            ++s_gpu.inline_wanted;
+        }
         break;
 
     case NV097_ARRAY_ELEMENT16:
@@ -4328,6 +4362,16 @@ void nv2a_pb_exec_report(void)
             s_gpu.elem32_batches_dropped, s_gpu.idx_overflow,
             s_gpu.idx_overflow_e16, s_gpu.idx_overflow_e32,
             s_gpu.idx_wanted_max, (unsigned)NV_MAX_INDICES);
+    /* Inline submission on its own line and in WORDS, because inline_words[]
+     * is a different array with a different cap and putting it beside an index
+     * count would repeat the e16/e32 scale mistake. batches-no-layout is the
+     * whole-batch drop, which no other counter sees. */
+    fprintf(stderr, "[GPU] inline: no-room=%llu words of %u wanted (biggest"
+                    " batch %u of %u words); %u batches dropped for an"
+                    " underivable layout\n",
+            s_gpu.inline_overflow, s_gpu.inline_wanted_max,
+            s_gpu.inline_wanted_max, (unsigned)NV_MAX_INLINE_WORDS,
+            s_gpu.batches_no_layout);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
     {

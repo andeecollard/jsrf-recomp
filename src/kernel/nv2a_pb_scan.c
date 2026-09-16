@@ -81,12 +81,22 @@ static void note(uint32_t subch, uint32_t method)
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
  * answer that -- "0x1808 x412" only means something once it reads
- * INLINE_ARRAY. Unnamed ones still get counted. */
+ * ARRAY_ELEMENT32. Unnamed ones still get counted.
+ *
+ * EVERY ENTRY IS CHECKED AGAINST src/nv2a/nv2a_regs.h, BY THE LITERAL ADDRESS.
+ * Ten were not, and the damage was not cosmetic: 0x1808 read INLINE_ARRAY when
+ * it is ARRAY_ELEMENT32, so the survey that exists to answer "which submission
+ * methods does this title use" answered it wrong, and an undecoded method that
+ * was dropping whole batches stayed hidden. Three more sat on SET_ALPHA_FUNC,
+ * SET_ALPHA_REF and SET_TEXTURE_FILTER -- the alpha test and the mip/LOD
+ * inputs, i.e. exactly what an alpha-cutout investigation has to survey.
+ * 0x0104 and 0x0FD8 were named but appear nowhere in regs.h; they are dropped
+ * rather than guessed at, and an unnamed method still gets counted. */
 static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },
     { 0x0100, "NO_OPERATION" },
-    { 0x0104, "SET_WARNING_ENABLE" },
-    { 0x0130, "SET_FLIP_READ" },
+    { 0x0120, "SET_FLIP_READ" },
+    { 0x0130, "FLIP_STALL" },
     { 0x0200, "SET_SURFACE_CLIP_HORIZONTAL" },
     { 0x0204, "SET_SURFACE_CLIP_VERTICAL" },
     { 0x0208, "SET_SURFACE_FORMAT" },
@@ -95,30 +105,34 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0214, "SET_SURFACE_ZETA_OFFSET" },
     { 0x0300, "SET_ALPHA_TEST_ENABLE" },
     { 0x0304, "SET_BLEND_ENABLE" },
+    { 0x0308, "SET_CULL_FACE_ENABLE" },
     { 0x030C, "SET_DEPTH_TEST_ENABLE" },
     { 0x0310, "SET_DITHER_ENABLE" },
     { 0x0314, "SET_LIGHTING_ENABLE" },
-    { 0x033C, "SET_CULL_FACE_ENABLE" },
-    { 0x0340, "SET_DEPTH_MASK" },
-    { 0x0350, "SET_CLEAR_DEPTH_VALUE" },
-    { 0x1D8C, "SET_CLEAR_DEPTH" },
-    { 0x1D90, "SET_COLOR_CLEAR_VALUE" },
-    { 0x1D94, "CLEAR_SURFACE" },
-    { 0x1D6C, "SET_ZSTENCIL_CLEAR" },
-    { 0x0B80, "SET_TRANSFORM_PROGRAM" },
-    { 0x0B00, "SET_TRANSFORM_CONSTANT" },
+    { 0x033C, "SET_ALPHA_FUNC" },
+    { 0x0340, "SET_ALPHA_REF" },
+    { 0x0350, "SET_BLEND_EQUATION" },
+    { 0x035C, "SET_DEPTH_MASK" },
+    { 0x0B00, "SET_TRANSFORM_PROGRAM" },
+    { 0x0B80, "SET_TRANSFORM_CONSTANT" },
     { 0x1720, "SET_VERTEX_DATA_ARRAY_OFFSET" },
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
     { 0x1B0C, "SET_TEXTURE_CONTROL0" },
-    { 0x1B14, "SET_TEXTURE_IMAGE_RECT" },
-    { 0x0FD8, "SET_COMBINER_*" },
+    { 0x1B14, "SET_TEXTURE_FILTER" },
+    { 0x1B1C, "SET_TEXTURE_IMAGE_RECT" },
+    { 0x1D6C, "SET_SEMAPHORE_OFFSET" },
+    { 0x1D8C, "SET_ZSTENCIL_CLEAR_VALUE" },
+    { 0x1D90, "SET_COLOR_CLEAR_VALUE" },
+    { 0x1D94, "CLEAR_SURFACE" },
+    { 0x1E60, "SET_COMBINER_CONTROL" },
     { 0x0000, NULL },
 };
 
