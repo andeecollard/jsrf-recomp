@@ -1,0 +1,193 @@
+HANDOVER 2026-09-16 (fourth of the day) -- THE VBLANK WAS THE HANG, AND THE
+FENCE TURNS OUT TO BE PER-TRIANGLE
+
+Read CLAUDE.md first. This supersedes the three earlier handovers of 16 Sep
+wherever it contradicts them, and it contradicts them in several places.
+
+=============================================================================
+1. WHAT IS FIXED, MEASURED, COMMITTED AND PUSHED
+=============================================================================
+
+THE VBLANK SUMMARY WAS LOST AND NOTHING COULD RESTORE IT.  bridge_nv2a_mirror
+_intr modelled only half of PMC_INTR_0: it cleared the summary bit when the
+source was clear and never set it when the source was set. Any interleaving
+that lost the bit lost it permanently, because the re-raise is gated on the
+source being clear. Vblank delivery latched shut mid-run in EVERY run:
+
+    off  delivered=1738 raised=1910 unacked_skips=8266   10.2 Hz
+    on   delivered=9859 raised=10133 unacked_skips=2     58.0 Hz
+
+The PGRAPH half of that same function has had the identical repair since the
+anti-graffiti-screen hang, and its comment describes this failure verbatim.
+The PCRTC half was never written. RECOMP_NV2A_PMC_UPMIRROR, default off.
+
+THIS WAS THE PLAYER'S "STUCK ON NOW LOADING" AND THEIR SILENT MUSIC. The
+"[ADX] tick STUCK" line that three sessions read as an audio bug is a CRI
+worker that parks in NtSuspendThread and is resumed once per vblank. No
+vblank, no resume. It is not the ADX server and the fault is nowhere near
+suspend/resume.
+
+THE VOICE LIST SPLICED VOICES IN FRONT OF THEMSELVES.  walks_with_a_cycle
+93,611 -> 0 with relink staying non-zero (67 -> 51) and on_top in the churn
+band both sides. The cross-check holds exactly: mtf_head + mtf_deep = 28 + 23
+= 51 = relink, counted independently by two walks. The 256-iteration walk cap
+fires 93,611 times a run and NOBODY HAD EVER SEEN IT: it reported through a
+DPRINTF compiled out by a DEBUG_MCPX that is never defined.
+
+Also pushed: the index cap raise (4096 -> 16384), ARRAY_ELEMENT32 decode
+(407,055 indices a run that were silently dropped), five kernel defects
+(below), the dot-product zero rule, fixed-function diagnostics, and the
+restored window/fullscreen work.
+
+=============================================================================
+2. FIVE KERNEL DEFECTS, ONE OF WHICH HAD ALREADY RUINED A RUN
+=============================================================================
+
+g_kernel_call_count WAS A SIGNED INT. On overflow it goes negative, which
+turns full per-call tracing permanently ON and the [KERNEL] summary and
+ordinal histogram permanently OFF. Already happened in
+render-investigation/a1-exec-walkers-tutorial-2: last summary at
+2,141,517,829 calls, then 10,632,107 negative-numbered lines, and the call
+rate collapsed 56x. Current builds hit INT_MAX at t=342 s -- inside a player
+session, outside the 240-280 s the harness runs, which is why no A/B crossed
+it. Check any log with: grep -c '\[KERNEL\] #-'
+
+THE TIMER TABLE published the armed flag first and the deadline last with a
+whole GetTickCount() call between, polled lock-free by every guest thread. A
+poller in that window fires the DPC immediately instead of after the delay.
+Now a seqlock. FIRST RUN REPORTED claim_lost=9 -- nine occasions where two
+pollers raced for one firing, so the race was real and being hit.
+
+THE TRAP HANDLER still opened a writable window on the guarded NV2A pages on
+every acknowledge (~60/s) -- the thing CLAUDE.md forbids absolutely -- and
+g_pcrtc_windows read 0 the whole time because its only increment is in a
+branch that stopped executing when the alias landed.
+
+=============================================================================
+3. THE FENCE: EVERYTHING IT IS NOT, AND THE ONE THING IT IS
+=============================================================================
+
+RULED OUT BY MEASUREMENT. Do not re-litigate these without new evidence:
+
+  batch truncation      no-room=0 with biggest batch asked for 9681 of 16384
+  INLINE_ARRAY          biggest batch 12 words of 16384
+  DRAW_ARRAYS           0.9% of batches, 0.01% of indices, <1 batch/frame
+  alpha test / blend    rejected=0 in two gameplay runs two days apart
+  texture cache         a hit requires a full memcmp; stale bytes impossible
+  mip base arithmetic   agrees across all three implementations, term by term
+  levels clamp, filter  correct
+  VIEWPORT_SCALE        VOID -- see below
+  texture matrix zero   TMAT0 is all zeros but its ENABLE is off
+
+THE VIEWPORT SCALE CLAIM WAS THE DANGEROUS ONE. An audit found that
+nv2a_ff.c never applies NV097_SET_VIEWPORT_SCALE, which is true, and
+concluded 58.8% of draws collapse to a dot. Measured instead:
+
+    in=(4505.22 -743.87 0 1) -> clip/w=(768.14 150.33 16785482)  surface 640x480
+
+Screen pixels. D3D bakes the scale into the composite matrix. Applying it
+again multiplies the screen by 320 TWICE. The counter-evidence needed no run:
+the picture is broadly correct and could not be if that were happening.
+
+WHAT THE SYMPTOM ACTUALLY IS, from the player's 23 s capture analysed at the
+game's own frame rate (974 unique frames out of 2,793 captured):
+
+  AN OBJECT DOES NOT VANISH WHOLESALE. It renders as a THIN SKELETAL OUTLINE
+  in one frame, a sliver in the next, and nothing in the next.
+
+That is PER-TRIANGLE dropping, not per-batch, and it reframes the whole
+search: every hypothesis above was about losing a batch. The relevant
+instrument is already in the tree and already says something:
+
+    degenerate split: nonfinite-area=0 strip-stitch(duplicate vertex)=30337822
+    collinear-distinct=265785, of which 260714 were on screen with every w>0
+
+260,714 triangles a run, on screen, every w positive, dropped because
+area() returned exactly 0. area() is a float32 2D cross product
+(nv2a_metal.m:2841) on screen coordinates, and the reject is `ar==0` exactly
+(:2878). NOT YET A CONCLUSION: distinct indices pointing at coincident
+vertices is also how strips legitimately stitch. The next step is to split
+that bucket by whether the three positions are actually distinct, and to
+compute the area in double for comparison.
+
+STILL OPEN AND UNMEASURED: the dot-product zero rule (RECOMP_VSH_DP_ZERO) is
+the last surviving batch-level candidate. It removes all 13 shader-diff
+mismatches over the title's 126 programs and costs nothing measurable (57.3
+-> 58.6 fps), but the scripted A/B could not produce a matched scene, so
+whether it changes the picture is unproven.
+
+=============================================================================
+4. INSTRUMENTS THAT LIE, FOUND TODAY
+=============================================================================
+
+Four, and every one of them had been read as evidence:
+
+  no-room=            has NO term for the INLINE_ARRAY path. Quoted all day as
+                      "nothing is being dropped"; covered two paths of three.
+  texcoord-q=         fires for non-finite OR q<=0, and q<=0 is arithmetically
+                      impossible for 123 of the title's 126 programs, which
+                      never write oT.w. The bucket is mostly NaN.
+  fedec_hold          printed "on (default)" while the accessor defaults to 0.
+                      "held=0 (fedec_hold on (default))" read as "armed, never
+                      needed"; the truth was "off, never once exercised".
+  g_pcrtc_windows     0 while the trap handler opened one 60 times a second.
+
+Add to CLAUDE.md's known-bad list, now done: `N triangles fully off-surface`
+is incremented only in the CPU rasteriser, so it is dead on every Metal run.
+
+AND ONE I BROKE. The [d3d8_gl] blit line -- the instrument that tells
+"picture correct" from "picture black" -- compares the guest centre pixel to
+the drawable centre, and matched exactly only because the drawable was an
+exact 4x the guest. Full screen makes it 4.52x, so the sample is a blend of
+neighbours and the two sides no longer agree (29 51 63 -> 17 46 4D). NOT
+FIXED. Move the sample to a texel centre before reading that line as strict.
+
+=============================================================================
+5. HOW THE EXPERIMENTS KEPT GOING WRONG
+=============================================================================
+
+SCENE-MATCHING IS NOT OPTIONAL AND IT COST A RETRACTION. A confident
+"DRAW_ARRAYS is the black screen", with exact arithmetic over four runs,
+compared two gameplay runs against two attract-loop runs. Check
+[APU-VOICE] on= before scoring any arm: 148-453 is gameplay, 4-12 is parked.
+
+AN ARM THAT PARKS IS NOT A CONTROL. Three A/B arms were scored before the
+positive control was read: relink=0 (of 5 top inserts) means the run never
+reached voice churn and every other counter in it is meaningless.
+
+LIVE AUDIO WAS THE WRONG ARM FOR A VOICE-LIST A/B. With a device live these
+runs barely start voices (on=5-12 against 148-453 with it off), so all three
+arms parked. The ring is a DATA-STRUCTURE bug -- the counters that score it
+do not need an audio device. Only judging how it SOUNDS does.
+
+ZSH DOES NOT WORD-SPLIT UNQUOTED VARIABLES. `env $SW ...` passed both
+switches as ONE argument, so the second was never set and the log said
+`move_to_front OFF` in an arm named "both". Read your own switch-state lines.
+
+THE EARLY ABORT PAYS FOR ITSELF. ~20% of runs never leave the title and used
+to cost 280 s each; ABORT_AT=60 catches them with 2x margin, because
+successful runs reach a mission at t=29.5 s.
+
+=============================================================================
+6. OPEN, RANKED
+=============================================================================
+
+ 1. The fence, as a PER-TRIANGLE problem. Split collinear-distinct by whether
+    the positions are genuinely distinct; compute area in double and compare.
+    Section 3.
+ 2. Does RECOMP_VSH_DP_ZERO change the picture? It is enabled in the player's
+    paths.conf; their eyes are the experiment the harness cannot run.
+ 3. The player reports the character jumping/floating. DP4 transforms
+    position, so it may share a cause with 2. Unmeasured.
+ 4. A large black region along the bottom of several captured frames, in both
+    arms of the last A/B. Unexplained, on no list.
+ 5. Fix the blit instrument's sample point. Section 4.
+ 6. Sound effects never START (on= freezes) -- a self-linked voice pins the
+    idle trap and throttles the guest sound engine. RECOMP_APU_FEDEC_HOLD=1
+    is the untested lever, and until today every log claimed it was already
+    on.
+ 7. The boot question: 3 of 12 runs with the ring patch compiled reached
+    gameplay against 4 of 4 without, with no mechanism found and two
+    explanations tested and falsified.
+ 8. Present from the Metal texture instead of round-tripping through guest
+    RAM; fixed-function T&L on the GPU. Both still unstarted.
