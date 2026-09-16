@@ -23,6 +23,7 @@
 
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
+#include "../recomp_switch.h"
 
 #include <SDL.h>
 #include <epoxy/gl.h>
@@ -31,6 +32,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if !defined(_WIN32)
+#include <unistd.h>   /* _exit, for the window-close path */
+#endif
 
 #ifndef D3D_OK
 #define D3D_OK ((HRESULT)0)
@@ -691,11 +695,87 @@ static int present_guest_framebuffer(void)
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 40, (void *)32);
     }
 
+    /* LETTERBOX RATHER THAN STRETCH.
+     *
+     * This handed the whole drawable to glViewport, which is correct only for
+     * as long as the window happens to match the guest's aspect. That was true
+     * while the window was a fixed, unresizable 640x480 and is true of
+     * nothing the hunk below can produce. The guest surface is 4:3; any window
+     * that is not stretches it, and the stretch is invisible because there is
+     * nothing on screen to compare it against -- 16:10, the ordinary laptop
+     * panel, is 1.60/1.333, exactly 20% too wide. Full screen makes that worse
+     * rather than better, which is why the two changes belong together.
+     *
+     * So fit the guest surface inside the drawable at its own aspect and
+     * centre it. Nothing is cached: w and h come from the g_guest_fb call at
+     * the top of this function on every present, and the guest surface size is
+     * NOT fixed -- nv2a_pb_exec.c reallocs its flip snapshot whenever clip_w /
+     * clip_h change, and the "presenting guest framebuffer %ux%u" line above
+     * exists because that happens. A mid-run resolution change therefore just
+     * produces different bars on the next frame. The window is deliberately
+     * not resized to follow it; the person sized that window.
+     *
+     * THE BARS ARE PAINTED, NOT LEFT ALONE. The draw below writes only inside
+     * the viewport, and after SDL_GL_SwapWindow the back buffer's contents are
+     * UNDEFINED -- which is the same fact the readback further down is built
+     * on. Without this clear the bars are whatever the driver left in that
+     * buffer: stale frames, or garbage, not black.
+     *
+     * glClear is bounded by the SCISSOR box, not by the viewport, so the
+     * scissor disable is the part that makes the clear cover the bars.
+     * dev_Clear happens to disable it too and never re-enable it, but that is
+     * dev_Clear's invariant and not ours -- a scissor left on by any other
+     * path would clip the bars to the guest's last scissor rectangle. Clearing
+     * the colour to black also clobbers the GL clear colour, which is safe
+     * because dev_Clear sets it on every call that clears the target.
+     *
+     * THE BLIT INSTRUMENT STILL READS A GUEST PIXEL. The readback below
+     * samples the drawable centre, (fbw/2, fbh/2). The viewport is centred, so
+     * horizontally the picture covers [(fbw-vw)/2, (fbw-vw)/2 + vw), and
+     * fbw/2 lies inside that for every vw >= 3. Work the integer division
+     * through and the worst case is fbw-vw odd, where the floor costs half a
+     * pixel at each end; below vw = 3 that can push the sample one pixel past
+     * the right edge. The floor SDL enforces for us keeps it far from there:
+     * d3d_CreateDevice sets a 320x240-POINT minimum, so the drawable is never
+     * smaller than 320x240 pixels and a 4:3 picture inside it is 320x240. So
+     * the centre sample cannot land in a bar at any window aspect or guest
+     * resolution the title can reach, and "guest centre == window centre" goes
+     * on meaning exactly what it meant when the measurement that cleared this
+     * blit of causing the black screen was taken. */
     {
         int fbw = 0, fbh = 0;
         SDL_GL_GetDrawableSize(g.window, &fbw, &fbh);
-        if (fbw > 0 && fbh > 0)
-            glViewport(0, 0, fbw, fbh);
+        if (fbw > 0 && fbh > 0) {
+            int vw = fbw, vh = fbh;
+            if ((long)fbw * (long)h > (long)fbh * (long)w)
+                vw = (int)((long)fbh * (long)w / (long)h);   /* pillarbox */
+            else
+                vh = (int)((long)fbw * (long)h / (long)w);   /* letterbox */
+            if (vw < 1) vw = 1;
+            if (vh < 1) vh = 1;
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glViewport((fbw - vw) / 2, (fbh - vh) / 2, vw, vh);
+            {
+                /* Keyed on the drawable and the guest size rather than on the
+                 * picture size: a 4:3 guest in a 1600x900 drawable and in an
+                 * 1800x900 one both give a 1200x900 picture, at different
+                 * offsets, and keying on vw/vh alone would report the first
+                 * and stay silent through the second. */
+                static int said_fbw, said_fbh;
+                static uint32_t said_w, said_h;
+                if (fbw != said_fbw || fbh != said_fbh
+                        || w != said_w || h != said_h) {
+                    said_fbw = fbw; said_fbh = fbh;
+                    said_w = w; said_h = h;
+                    fprintf(stderr, "[d3d8_gl] drawable %dx%d, picture %dx%d"
+                            " at %d,%d (guest %ux%u)\n", fbw, fbh, vw, vh,
+                            (fbw - vw) / 2, (fbh - vh) / 2, w, h);
+                    fflush(stderr);
+                }
+            }
+        }
     }
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -763,7 +843,14 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
             GLubyte px[4] = { 0, 0, 0, 0 };
             glGetIntegerv(GL_VIEWPORT, vp);
             if (vp[2] > 0 && vp[3] > 0) {
-                glReadPixels(vp[2] / 2, vp[3] / 2, 1, 1,
+                /* vp[0] + width/2, not width/2. glReadPixels takes WINDOW
+                 * coordinates, and the viewport stopped being at the origin
+                 * when present_guest_framebuffer started letterboxing -- so
+                 * the old expression sampled half the picture's width in from
+                 * the left edge of the WINDOW, which is not the centre of
+                 * anything. The printed text is unchanged on purpose; only
+                 * the pixel this reads moves. */
+                glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1,
                              GL_RGBA, GL_UNSIGNED_BYTE, px);
             }
             shots++;
@@ -1208,13 +1295,113 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow(g_window_title,
-                                SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                                g.backbuf_w, g.backbuf_h,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+    /* THE WINDOW THE PERSON ACTUALLY LOOKS AT.
+     *
+     * This was created at the guest's back-buffer size with no flags beyond
+     * OPENGL|SHOWN, which is a fixed 640x480 window that cannot be resized,
+     * cannot go full screen, and on a Retina panel is drawn at 640x480 and
+     * then upscaled by the compositor rather than rendered at the panel's real
+     * resolution. "The Mac app doesn't go full screen" is all three of those
+     * at once.
+     *
+     * ALLOW_HIGHDPI is the one that matters most and it costs nothing here,
+     * because present_guest_framebuffer already sizes its viewport from
+     * SDL_GL_GetDrawableSize rather than from SDL_GetWindowSize. With the flag
+     * on, that call starts returning PIXELS instead of POINTS and the blit
+     * draws into the whole backing store. The guest still renders 640x480 --
+     * that is the emulated NV2A surface and nothing here changes it -- but the
+     * upscale then happens once, on the GPU, at the panel's resolution,
+     * instead of twice. Measured with this code in the tree before it was
+     * reverted: drawable 2560x1920 (handover
+     * HANDOVER_2026-09-16_THE_FENCES_THE_RINGS_AND_A_BLACK_SCREEN_I_CAUSED,
+     * section 7), i.e. 2x window scale on a 2x panel.
+     *
+     * RECOMP_WINDOW_SCALE=N sizes the window N times the guest surface,
+     * default 2. It is read with getenv/atoi rather than recomp_switch_on
+     * because its VALUE carries meaning -- recomp_switch.h says so explicitly
+     * for exactly this case. RECOMP_FULLSCREEN is a plain on/off and goes
+     * through recomp_switch_on, so RECOMP_FULLSCREEN=0 means off rather than
+     * on. Neither changes a single pixel the guest renders. */
+    int win_scale = 2;
+    int want_fullscreen = recomp_switch_on("RECOMP_FULLSCREEN");
+    {
+        Uint32 wflags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN
+                      | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+        const char *e = getenv("RECOMP_WINDOW_SCALE");
+        SDL_Rect usable;
+
+        if (e && e[0]) win_scale = atoi(e);
+        if (win_scale < 1) win_scale = 1;
+        if (win_scale > 8) win_scale = 8;
+
+        /* Shrink to fit rather than opening a window taller than the desktop.
+         * SDL_GetDisplayUsableBounds excludes the menu bar and the Dock, which
+         * is exactly the region a window may occupy, and it reports SCREEN
+         * COORDINATES -- the same units SDL_CreateWindow takes. Comparing it
+         * against a drawable size would be the HiDPI mistake in the other
+         * direction: on a 2x panel it would conclude that twice as much fits
+         * as actually does. */
+        if (SDL_GetDisplayUsableBounds(0, &usable) == 0
+            && usable.w > 0 && usable.h > 0) {
+            while (win_scale > 1 && (g.backbuf_w * win_scale > usable.w
+                                     || g.backbuf_h * win_scale > usable.h))
+                --win_scale;
+        }
+
+        /* FULLSCREEN_DESKTOP, not FULLSCREEN. The second changes the display's
+         * video mode; this one takes the desktop at whatever mode it is
+         * already in and gives a borderless window over it. That means no mode
+         * switch to sit through, no black flash while the panel relocks, no
+         * resolution left behind on the display if the process dies -- and it
+         * dies by _exit here, with no chance to restore anything. It also
+         * keeps the window manager's own full-screen gesture working. There is
+         * nothing to gain from a real mode set: the source is a 640x480 guest
+         * surface that gets upscaled either way, and the aspect is handled by
+         * the letterbox in present_guest_framebuffer rather than by the panel. */
+        if (want_fullscreen)
+            wflags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+
+        g.window = SDL_CreateWindow(g_window_title,
+                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    g.backbuf_w * win_scale,
+                                    g.backbuf_h * win_scale, wflags);
+    }
     if (!g.window) {
         fprintf(stderr, "[d3d8_gl] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return D3DERR_INVALIDCALL;
+    }
+    /* A floor of half the guest size IN POINTS, which on a 2x panel is a
+     * drawable of exactly the guest size -- one guest pixel per drawable
+     * pixel, the smallest window that still shows every pixel the guest drew.
+     * It is also what keeps present_guest_framebuffer's centre readback honest:
+     * the proof there that the drawable centre lands inside the picture needs
+     * the picture to be at least 3 pixels on each axis, and the smallest
+     * picture this floor permits is 320x240. */
+    SDL_SetWindowMinimumSize(g.window, g.backbuf_w / 2, g.backbuf_h / 2);
+    /* One line that makes the whole window state visible, because three sizes
+     * are in play and two of them are in different units.
+     *
+     * SDL_GetWindowSize is in POINTS; SDL_GL_GetDrawableSize is in PIXELS.
+     * With ALLOW_HIGHDPI on a Retina panel the second is twice the first, and
+     * everything that touches GL -- glViewport, glReadPixels, the letterbox
+     * maths -- must use the pixel figure. This is the only SDL_GetWindowSize
+     * in the file and it feeds nothing but this printf; anything needing a
+     * size for arithmetic wants the drawable, and printing both is how a
+     * mismatch shows up in a log instead of as a subtly wrong picture.
+     *
+     * The two switches name themselves here because recomp_switch.h requires
+     * it: a switch that appears in no report cannot be checked by ab_score.py,
+     * and "I set the variable" is not "the model read it". */
+    {
+        int ww = 0, wh = 0, dw = 0, dh = 0;
+        SDL_GetWindowSize(g.window, &ww, &wh);
+        SDL_GL_GetDrawableSize(g.window, &dw, &dh);
+        fprintf(stderr, "[d3d8_gl] window %dx%d pt, drawable %dx%d px,"
+                " guest %dx%d (RECOMP_WINDOW_SCALE=%d RECOMP_FULLSCREEN=%d)"
+                " -- Cmd+F or F11 for full screen\n",
+                ww, wh, dw, dh, g.backbuf_w, g.backbuf_h,
+                win_scale, want_fullscreen);
+        fflush(stderr);
     }
     g.glctx = SDL_GL_CreateContext(g.window);
     if (!g.glctx) {
@@ -1300,8 +1487,91 @@ void xbox_d3d8_pump_events(void)
         return;
     }
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            fprintf(stderr, "[d3d8_gl] window close requested\n");
+        switch (ev.type) {
+        case SDL_QUIT:
+            /* THE CLOSE BUTTON USED TO PRINT A LINE AND CARRY ON. Closing the
+             * window left the process running with no window -- still holding
+             * the audio device, still burning a core, and only findable with
+             * pgrep. It has to be killed from a terminal, which is the one
+             * thing a person who just closed a window is not expecting to do.
+             *
+             * _exit, not exit: this harness's convention is that its atexit
+             * handlers dump and flush things that confuse the run that follows
+             * (main.c says so where RECOMP_OBJECT_DUMP_EXIT leaves the same
+             * way), and every report here is written periodically rather than
+             * at exit, so there is nothing to flush but the streams. */
+            fprintf(stderr, "[d3d8_gl] window closed -- exiting\n");
+            fflush(stderr);
+            fflush(stdout);
+            _exit(0);
+            break;
+
+        case SDL_KEYDOWN:
+            /* Cmd+Q is the Mac quit gesture, and SDL only turns it into an
+             * SDL_QUIT for an app with a real menu bar; this one is launched
+             * from a terminal as often as from the bundle. Ctrl+Q for the
+             * same reason everywhere else. Neither collides with the guest:
+             * player input arrives over the emulated USB pad, and nothing in
+             * this file feeds the keyboard to the guest at all. */
+            if (ev.key.keysym.sym == SDLK_q
+                && (ev.key.keysym.mod & (KMOD_GUI | KMOD_CTRL))) {
+                fprintf(stderr, "[d3d8_gl] quit requested -- exiting\n");
+                fflush(stderr);
+                fflush(stdout);
+                _exit(0);
+            }
+            /* Cmd+F is the Mac full-screen gesture; F11 is what everyone else
+             * presses. FULLSCREEN_DESKTOP for the reasons set out over the
+             * flag in d3d_CreateDevice. The STATE is read with the bare
+             * SDL_WINDOW_FULLSCREEN bit, not with FULLSCREEN_DESKTOP:
+             * FULLSCREEN_DESKTOP is the composite FULLSCREEN|0x1000, so
+             * `flags & FULLSCREEN_DESKTOP` is already true for an exclusive
+             * fullscreen window and only reads as though it told the two
+             * apart. The base bit is set in both, which is the question being
+             * asked -- "is this window full screen at all".
+             *
+             * This runs on the main thread, which is the only thread allowed
+             * to resize a Cocoa window, and Present runs on the thread that
+             * owns the GL context -- see the note over this function. The
+             * viewport needs no invalidation on the way through: it is
+             * recomputed from SDL_GL_GetDrawableSize on every present. */
+            if (ev.key.keysym.sym == SDLK_F11
+                || (ev.key.keysym.sym == SDLK_f
+                    && (ev.key.keysym.mod & (KMOD_GUI | KMOD_CTRL)))) {
+                Uint32 wf = SDL_GetWindowFlags(g.window);
+                int want = !(wf & SDL_WINDOW_FULLSCREEN);
+                if (SDL_SetWindowFullscreen(g.window,
+                        want ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0)
+                    fprintf(stderr, "[d3d8_gl] full screen refused: %s\n",
+                            SDL_GetError());
+                else
+                    fprintf(stderr, "[d3d8_gl] %s full screen\n",
+                            want ? "entering" : "leaving");
+                fflush(stderr);
+            }
+            /* Escape leaves full screen and does nothing otherwise, which is
+             * what a person who has just gone full screen by accident expects.
+             * It is deliberately NOT bound to quit: this title uses Escape in
+             * its own menus, and the guest would never see the press. */
+            if (ev.key.keysym.sym == SDLK_ESCAPE
+                && (SDL_GetWindowFlags(g.window) & SDL_WINDOW_FULLSCREEN)) {
+                SDL_SetWindowFullscreen(g.window, 0);
+                fprintf(stderr, "[d3d8_gl] leaving full screen\n");
+                fflush(stderr);
+            }
+            break;
+
+        case SDL_WINDOWEVENT:
+            /* Nothing to do but notice. A resize needs no state of its own
+             * because the viewport is recomputed from SDL_GL_GetDrawableSize
+             * on every present, and the new size is logged there rather than
+             * here -- which also catches a window dragged between a Retina and
+             * a non-Retina display, where the backing scale changes and no
+             * resize event is delivered at all. */
+            break;
+
+        default:
+            break;
         }
     }
 }
