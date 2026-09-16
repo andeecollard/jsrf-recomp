@@ -145,6 +145,7 @@ arm_env() {
         fence)        RECOMP_METAL_HW=1; RECOMP_METAL_FENCE=1 ;;
         fence-sw)     RECOMP_METAL_FENCE=1 ;;
         gpuvsh)       RECOMP_METAL_HW=1; RECOMP_METAL_VSH=1 ;;
+        gpuvsh565)    RECOMP_METAL_HW=1; RECOMP_METAL_VSH=1; RECOMP_METAL_565=1 ;;
         *) echo "unknown arm: $1" >&2; return 1 ;;
     esac
     export RECOMP_METAL_HW RECOMP_METAL_HW_DEPTH_ALWAYS RECOMP_METAL_HW_NO_STENCIL
