@@ -548,7 +548,38 @@ int mcpx_apu_idle_trap_lock_guard(void)
 {
     static int on = -1;
     if (on < 0) {
-        /* DEFAULT ON since 16 Sep 2026, on a measurement that nearly went the
+        /* REVERTED TO OFF, 16 Sep 2026, SAME DAY IT WAS TURNED ON, because
+         * turning it on made the crash it was meant to prevent BOTH MORE
+         * FREQUENT AND DETERMINISTIC.
+         *
+         *     guards off   ~5 faults in ~25 runs, at t=34.05 to t=35.03
+         *     guards on    4 of 4 runs, every one at t=24.03
+         *
+         * Identical to two decimal places across runs, where the original
+         * fault was probabilistic and 10 s later. That is not the same crash
+         * arriving sooner; it is a new one.
+         *
+         * The mechanism is not established, and the likeliest reading is the
+         * obvious one: withholding the raise for a locked voice means that
+         * voice is never retired, so whatever waits on the retirement waits
+         * for ever. The guard advances the cursors so it cannot pin the WALK,
+         * but nothing was checked about what happens to the voice.
+         *
+         * THE MEASUREMENT THAT MOTIVATED IT IS STILL GOOD -- 13,294 of 23,933
+         * raises happen while the guest holds that voice's lock, and that
+         * window is real. What is not established is that suppressing the
+         * raise is a safe way to close it. A fix that makes the crash worse is
+         * not a fix, however good the reasoning behind it was.
+         *
+         * Kept as a switch because the counters behind it are what found the
+         * window, and because the next attempt needs this arm to compare
+         * against. Do not default it on again without a run count: the fault
+         * fires in about one run in five with it off, so five clean runs is
+         * the minimum evidence, not one.
+         *
+         * The original note follows.
+         *
+         * DEFAULT ON since 16 Sep 2026, on a measurement that nearly went the
          * other way. The guard shipped off because its mechanism was static
          * reading and the ring was built to decide it in one run. That run was
          * taken -- and read too early. At t=86 s it showed raises=9, locked=0,
@@ -576,7 +607,7 @@ int mcpx_apu_idle_trap_lock_guard(void)
          * in both arms, so a run with the guard off still says whether it
          * would have mattered. */
         const char *e = getenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD");
-        on = e ? (atoi(e) != 0) : 1;
+        on = e ? (atoi(e) != 0) : 0;   /* REVERTED -- see below */
     }
     return on;
 }
@@ -1034,9 +1065,16 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
      * was given reports locked=0 and never_on=0 over a gameplay run, which by
      * its own decision rule rules it out. */
     {
+        /* ALSO OFF BY DEFAULT, and for a weaker reason than the lock guard:
+         * it has never been run ALONE. Both guards were defaulted on in the
+         * same commit and the next four runs all faulted at t=24.03, so the
+         * regression cannot be attributed to either one. This is the cheaper
+         * half to exonerate -- one run with FEDEC_HOLD=1 and the lock guard
+         * off -- and until somebody takes it, shipping it on would be
+         * shipping an unattributed change. */
         static int hold = -1;
         if (hold < 0) { const char *e = getenv("RECOMP_APU_FEDEC_HOLD");
-                        hold = e ? (atoi(e) != 0) : 1; }
+                        hold = e ? (atoi(e) != 0) : 0; }
         if (hold && (qatomic_read(&d->regs[NV_PAPU_FECTL])
                      & NV_PAPU_FECTL_FEMETHMODE)
                     == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {

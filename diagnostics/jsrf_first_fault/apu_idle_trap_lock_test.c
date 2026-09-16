@@ -98,15 +98,19 @@ int main(int argc, char **argv)
      * for the wrong reason. It has to happen before the first call in this
      * process, which is why it is the first thing in main.
      *
-     * The guard defaults ON since 16 Sep 2026: 13,294 of 23,933 idle-voice
-     * raises in a gameplay run happen while the guest holds that voice's lock.
-     * If somebody moves the default back, this is the line that says so. */
+     * The guard defaults OFF. It was ON for part of 16 Sep 2026 and was
+     * reverted the same day: with it on, four of four runs faulted at t=24.03
+     * where the fault it was meant to prevent had been probabilistic and ten
+     * seconds later. The window it closes is real -- 13,294 of 23,933 raises
+     * happen while the guest holds that voice's lock -- but suppressing the
+     * raise is not a shown-safe way to close it. This line pins the default so
+     * the next attempt has to move it deliberately. */
     {
         int st = 0;
         pid_t pid = fork();
         if (pid == 0) {
             unsetenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD");
-            _exit(mcpx_apu_idle_trap_lock_guard() ? 0 : 3);
+            _exit(mcpx_apu_idle_trap_lock_guard() ? 3 : 0);
         }
         CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
