@@ -3055,6 +3055,50 @@ static KIRQL bridge_vector_irql(uint32_t vector)
  * reasoning -- a test that reimplements the rule it is checking passes against
  * a broken implementation, which this tree has already been bitten by once
  * today. bridge_deliver_isr below is the only production caller. */
+/* RECOMP_IRQ_RETRY_PENDING, default OFF until measured.
+ *
+ * A VBLANK RAISED WHILE ITS OWN ISR IS STILL RUNNING IS DROPPED FOREVER, and
+ * the guest advances its simulation one step per vblank, so each one is a
+ * step the game never takes. Measured in a player session 16 Sep 2026:
+ *
+ *     [VBLANK] delivered=9724 (raised=10170) over 170097 ms
+ *     deadlines 59.75/s, delivered 57.20/s, 446 raises lost = 4.4%
+ *     defer_irql=0 defer_reentry=0 not_ready=0
+ *
+ * so essentially all of them are XBOX_IRQ_DEFER_VECTOR: same vector already
+ * in service. That is ~96% game speed before frame time is counted at all,
+ * and it is independent of the frame-locked loss the earlier handovers
+ * describe. On hardware the PCRTC interrupt stays ASSERTED until the driver
+ * acknowledges it at the source; it is taken when the handler returns, it
+ * does not evaporate because the CPU is busy.
+ *
+ * AND THE NEIGHBOURING BRANCH ALREADY CLAIMED TO HANDLE THIS. The IRQL defer
+ * sets g_vector_pending under the comment "Pending, not dropped. The pumps
+ * revisit every connected vector on a timer" -- but that flag had NO
+ * production reader: set, cleared on success, counted for a peak, and
+ * otherwise read only by xbox_IrqTestPending. Nothing ever re-delivered it.
+ * This switch gives the flag the consumer the comment always promised, and
+ * points the vector deferral at it too.
+ *
+ * BOUNDED BY CONSTRUCTION: one bit per vector, so a storm coalesces into a
+ * single retry. It cannot deliver a burst, which is the failure mode
+ * BRIDGE_VBLANK_PERIOD_US's own comment is written to avoid ("one late
+ * vblank, not five at once").
+ *
+ * THE PREDICTION, so the A/B can refute it: delivered/elapsed moves from
+ * 57.2 Hz toward the 59.75 Hz deadline rate and the game runs ~4% faster
+ * with NO change in frame time. If delivered rises and nothing else moves,
+ * the guest was not the bottleneck and this is not where the speed went. */
+static int irq_retry_pending(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_IRQ_RETRY_PENDING");
+    return on;
+}
+unsigned long g_irq_retry_queued, g_irq_retry_delivered;
+extern unsigned long g_vblank_delivered;  /* defined below; the retry path
+                                           * counts its own vblank deliveries */
+
 static int bridge_irq_decide(uint32_t vector)
 {
     int slot = (vector < BRIDGE_MAX_INTERRUPTS) ? (int)vector : -1;
@@ -3100,6 +3144,9 @@ static uint32_t bridge_deliver_isr_ex(uint32_t iv, int *entered)
     }
     if (decision == XBOX_IRQ_DEFER_VECTOR) {
         InterlockedIncrement(&g_irq_defer_vector);
+        if (irq_retry_pending() && slot >= 0
+            && InterlockedExchange(&g_vector_pending[slot], 1) == 0)
+            g_irq_retry_queued++;
         return 0;
     }
 
@@ -3108,14 +3155,19 @@ static uint32_t bridge_deliver_isr_ex(uint32_t iv, int *entered)
     if (slot >= 0 &&
         InterlockedCompareExchange(&g_vector_in_service[slot], 1, 0) != 0) {
         InterlockedIncrement(&g_irq_defer_vector);
+        if (irq_retry_pending()
+            && InterlockedExchange(&g_vector_pending[slot], 1) == 0)
+            g_irq_retry_queued++;
         return 0;
     }
 
+    int ran_any = 0;
     {
         int ran = 0;
         g_dispatch_depth++;
         result = bridge_run_isr_ex(iv, &ran);
         g_dispatch_depth--;
+        ran_any = ran;
         if (entered) *entered = ran;
         /* Count only what actually entered guest code. bridge_run_isr_ex bails
          * without running when the KINTERRUPT has no routine, or when that
@@ -3131,8 +3183,32 @@ static uint32_t bridge_deliver_isr_ex(uint32_t iv, int *entered)
      * that order, so a concurrent decide() cannot see "free but still pending"
      * and count a spurious deferral. */
     if (slot >= 0) {
-        InterlockedExchange(&g_vector_pending[slot], 0);
+        LONG queued = InterlockedExchange(&g_vector_pending[slot], 0);
         InterlockedExchange(&g_vector_in_service[slot], 0);
+        /* THE CONSUMER THE PENDING FLAG NEVER HAD. The vector is free as of
+         * the line above, so this is a fresh delivery and not a nested one --
+         * g_dispatch_depth has already been decremented, so bridge_irq_decide
+         * will not read it as re-entry. One retry per completion: the flag is
+         * a single bit and was cleared before this call, so a deferral that
+         * arrives DURING the retry queues the next one rather than recursing
+         * without bound. */
+        if (queued && irq_retry_pending() && ran_any) {
+            int again = 0;
+            bridge_deliver_isr_ex(iv, &again);
+            if (again) {
+                g_irq_retry_delivered++;
+                /* AND COUNT IT AS A VBLANK DELIVERY, because it is one.
+                 * g_vblank_delivered is incremented at bridge_vblank_poll's
+                 * own call site only, so the first A/B of this switch read
+                 * "5862 retries delivered" beside a delivered= that had not
+                 * moved -- 55.7 Hz against 56.0 -- and the frame rate rose 5%
+                 * with nothing in the vblank line to explain it. The retries
+                 * WERE reaching the guest; the counter could not see them.
+                 * Exactly the instrument failure this tree keeps retiring,
+                 * introduced by me in the same hour I wrote up two others. */
+                if (vector == BRIDGE_NV2A_VECTOR) g_vblank_delivered++;
+            }
+        }
     }
     return result;
 }
@@ -3539,11 +3615,13 @@ void xbox_VblankReport(void)
     double hz = ms ? (double)g_vblank_delivered * 1000.0 / (double)ms : 0.0;
     fprintf(stderr, "  [VBLANK] delivered=%lu (raised=%lu retried=%lu) over %lu ms = %.1f Hz"
             " (target %d) deadlines=%lu unacked_skips=%lu max_gap=%lu ms"
-            " not_ready=%lu\n",
+            " not_ready=%lu retry_queued=%lu retry_delivered=%lu"
+            " (irq_retry_pending %s)\n",
             g_vblank_delivered, g_vblank_raised, g_vblank_retry_delivered, ms, hz,
             1000000 / BRIDGE_VBLANK_PERIOD_US,
             g_vblank_deadlines, g_vblank_skipped_ack, g_vblank_max_gap_ms,
-            g_interrupt_not_ready);
+            g_interrupt_not_ready, g_irq_retry_queued, g_irq_retry_delivered,
+            irq_retry_pending() ? "on" : "OFF");
 
     /* THE REGISTERS THEMSELVES, because the counters above cannot tell three
      * different faults apart and every one of them prints the same line.
