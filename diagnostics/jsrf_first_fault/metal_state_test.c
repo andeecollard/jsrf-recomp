@@ -15,6 +15,8 @@
 #include "nv2a_metal_state.h"
 #include "nv2a_texture_copy.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include "nv2a_metal.h"
 
 static int failures;
 
@@ -86,10 +88,61 @@ int main(void)
         ++failures;
     }
 
+    /* EVERY HARDWARE DRAW MUST READ THE COLOUR ATTACHMENT.
+     *
+     * This is the invariant the 16 Sep 2026 fix rests on, and it is the only
+     * part of that fix a test without a GPU can hold. The renderer chose its
+     * fragment tail per draw, so opaque geometry -- most of a frame -- wrote
+     * colour(0) with no destination read and no raster_order_group(0). At
+     * gameplay that renders visibly corrupt on every frame.
+     *
+     * BE CLEAR ABOUT WHAT THIS DOES AND DOES NOT CATCH. It cannot see the
+     * artefact: the artefact needs tens of thousands of draws with the GPU
+     * behind the producer, which is exactly why every device gate in this tree
+     * passed for weeks on a renderer a person could see was wrong. What it
+     * catches is the DEFAULT being moved back, or the selector being rewritten
+     * so that some draw class stops reading the destination -- which is how
+     * the defect got in. The artefact itself is gated by the scripted ladder
+     * in frame_bisect.sh; this is the cheap half.
+     *
+     * The modes below are control arms and are asserted to still reproduce the
+     * old behaviours, because a defect you cannot switch back on is a defect
+     * you cannot measure the cost of fixing. */
+    {
+        int blend, dither;
+        for (blend = 0; blend <= 1; ++blend)
+            for (dither = 0; dither <= 1; ++dither) {
+                expect(nv2a_metal_shader_blend_for(3, blend, dither), 1,
+                       "shader_blend mode 3", (uint32_t)(blend * 2 + dither));
+                /* Anything past the named modes is the fix too, so a typo in
+                 * an arm cannot quietly select the broken renderer. */
+                expect(nv2a_metal_shader_blend_for(9, blend, dither), 1,
+                       "shader_blend mode 9", (uint32_t)(blend * 2 + dither));
+                expect(nv2a_metal_shader_blend_for(0, blend, dither), 0,
+                       "shader_blend mode 0", (uint32_t)(blend * 2 + dither));
+                expect(nv2a_metal_shader_blend_for(1, blend, dither),
+                       blend && dither,
+                       "shader_blend mode 1", (uint32_t)(blend * 2 + dither));
+                expect(nv2a_metal_shader_blend_for(2, blend, dither), blend,
+                       "shader_blend mode 2", (uint32_t)(blend * 2 + dither));
+            }
+        /* The default, read through the environment the way a run reads it.
+         * The value matters less than that it answers 1 for every draw, which
+         * is what the two lines below actually assert. */
+        if (!getenv("RECOMP_METAL_SHADER_BLEND")) {
+            int m = nv2a_metal_shader_blend_mode();
+            expect(nv2a_metal_shader_blend_for(m, 0, 0), 1,
+                   "default tail for an opaque undithered draw", (uint32_t)m);
+            expect(nv2a_metal_shader_blend_for(m, 1, 1), 1,
+                   "default tail for a blended dithered draw", (uint32_t)m);
+        }
+    }
+
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
     }
-    printf("nv2a_metal_state: all translations agree\n");
+    printf("nv2a_metal_state: all translations agree,"
+           " and every hardware draw reads the destination\n");
     return 0;
 }

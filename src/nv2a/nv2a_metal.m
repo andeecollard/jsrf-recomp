@@ -1044,62 +1044,89 @@ static void hw_depth_readback(uint8_t *zram, unsigned w, unsigned h,
  * RECOMP_METAL_HW reports pipelines= and refusals= on every run, and the
  * number to watch is refusals staying at 0. */
 #define HW_CACHE 32
-/* WHICH OF THE TWO HARDWARE FRAGMENT TAILS THIS DRAW NEEDS.
+/* EVERY HARDWARE DRAW READS THE COLOUR ATTACHMENT. That is the fix, and this
+ * function is where it lives.
  *
- * Only a draw that blends AND dithers has to take the blend back into the
- * shader, because only then does the ROP-stage ordering matter: dither after
- * blend is what the NV2A does, what fs() does and what the rasteriser does.
- * Blending alone keeps the blend unit; dithering alone is already correct in
- * fs_hw, because with nothing after it the bias IS the last step before
- * quantisation. Everything else pays nothing. */
-static int hw_shader_blend(const NV2ATextureCopy *s)
+ * WHAT WAS WRONG. fs_hw writes colour(0) and never reads it. fs_hw_blend
+ * declares `float4 dst [[color(0), raster_order_group(0)]]`, exactly as the
+ * software tail fs() does. Until 16 Sep 2026 the hardware path chose between
+ * them per draw -- fs_hw_blend only for a draw that both blended and dithered
+ * -- so the great majority of draws, all the opaque world geometry, wrote the
+ * attachment with no destination read and no raster ordering. At gameplay that
+ * renders visibly corrupt: axis-aligned blocks, median 5x5 px, holding black
+ * or fragments of other scene content, on every frame.
+ *
+ * HOW IT IS KNOWN, and the shape of the evidence matters because six image
+ * metrics failed on this artefact before one worked. Four arms, one pinned
+ * binary, one pad, run serially, 24 captured gameplay frames each. The score
+ * is `x0 mod 4`: the fraction of corruption blocks whose left edge lands on a
+ * 4-pixel grid, against 25% by chance -- a within-frame structural ratio,
+ * which is the only kind of statistic that has ever separated arms here.
+ *
+ *     mode 0  no draw reads dst, and no mixing either   36%   corrupt
+ *     mode 1  dithered AND blended draws (the old one)  43%   corrupt
+ *     mode 2  every blended draw                        40%   corrupt
+ *     mode 3  every draw                                30%   CLEAN
+ *     --      the software path, as the control         30%   clean
+ *
+ * Monotone in COVERAGE and nothing else. Mode 2 already takes every blended
+ * draw off the fixed-function blend unit and gives it the read, and is still
+ * corrupt; mode 0 removes fs_hw_blend entirely so the encoder never mixes two
+ * blending modes, and is still corrupt. Only full coverage goes clean, landing
+ * on the software control's own number.
+ *
+ * WHAT IT IS NOT. Not depth (compare forced ALWAYS: corrupt), not stencil
+ * (ignored: corrupt), not the surface cache (off: corrupt), not the read-back
+ * (19,777 gameplay syncs audited, 0 pixels changed after a full queue drain),
+ * not the queue (22,072 explicit drains: corrupt), and not the tile: at 21 and
+ * 7 bytes per pixel a 32 KB tile is 32x32 and 64x64, and the measured
+ * granularity is the same 4x4 in both arms.
+ *
+ * THE COST. For an unblended draw s.blend is 0, so fs_hw_blend skips the
+ * in-shader blend and produces byte-identical colour; only the dependency
+ * changes. raster_order_group(0) serialises overlapping fragments, which is a
+ * real cost and is the first thing to measure if this path disappoints -- see
+ * the frame-time note beside the arms below.
+ *
+ * THE VALUE STILL SELECTS, so the defect is reproducible in one binary. */
+static int hw_shader_blend_mode(int mode, int blend, int dither)
 {
-    /* RECOMP_METAL_SHADER_BLEND=0 restores the defect, in one binary.
-     *
-     * The fix re-introduces raster_order_group(0) for these draws, and every
-     * frame-time number this renderer has predates it -- so the cost has to be
-     * A/B-able without rebuilding, and so does the image. =0 puts the dither
-     * back on the wrong side of the blend, which is the "before" picture.
-     *
-     * A VALUE, not presence: =0 has to mean off, which is the whole point of
-     * an arm. The state is printed in the [METAL] report so ab_score.py can
-     * verify the two arms actually differed. */
+    /* Pure, so it can be tested without a device. metal_state_test walks all
+     * four modes against all four (blend, dither) combinations; a gate that
+     * needs a GPU is a gate that does not run. */
+    switch (mode) {
+    case 0:  return 0;              /* nothing reads dst -- the "before" arm.
+                                     * Also puts the dither on the wrong side
+                                     * of the blend, measured at 8192 of 65536
+                                     * pixels on the dither's own 4x4 lattice,
+                                     * so it carries two defects at once. */
+    case 1:  return blend && dither;/* what shipped until 16 Sep 2026 */
+    case 2:  return blend;          /* every blended draw */
+    default: return 1;              /* every draw -- the fix */
+    }
+}
+
+static int hw_shader_blend_mode_env(void)
+{
+    /* A VALUE, not presence: =0 has to mean off, which is the whole point of
+     * an arm, and recomp_switch.h exists because three switches here were
+     * presence-tested and their control arms silently ran with the guard on.
+     * The default is 3 and the report prints the mode, so an A/B can verify
+     * which arm actually ran rather than which one was asked for. */
     static int on = -1;
     if (on < 0) { const char *e = getenv("RECOMP_METAL_SHADER_BLEND");
-                  on = e ? atoi(e) : 1; }
-    /* =2 takes EVERY blended draw into the shader, not just the dithered ones.
-     * That is the bisect for the blend unit and for the ordering it runs
-     * without: with it, the hardware path blends exactly as the software path
-     * does, under raster_order_group(0), while keeping the real depth and
-     * stencil attachments. Depth and stencil are already ruled out, so if the
-     * lost regions come back here the blend stage owns them. */
-    /* =3 takes EVERY hardware draw into fs_hw_blend, blended or not, and it
-     * is the bisect for PASS ORDERING rather than for blending.
-     *
-     * fs_hw writes colour(0) and never reads it. fs_hw_blend declares
-     * `float4 dst [[color(0), raster_order_group(0)]]`, exactly as the
-     * software tail fs() does -- so with =3 the hardware path acquires the one
-     * structural property the software path has and it lacks: every pass READS
-     * the colour attachment it writes. For an unblended draw s.blend is 0, so
-     * the in-shader blend is skipped and the colour produced is identical;
-     * only the dependency changes.
-     *
-     * Why that is the question. Measured 16 Sep 2026, RECOMP_METAL_BATCH=0:
-     * the corruption is solid black rectangles 64 pixels wide whose left AND
-     * right edges sit on a 64-pixel grid, 17 of 18 against 1% by chance, with
-     * bottoms on a 32-row grid. 64 x 32 x 16 bytes per RGBA32Float pixel is
-     * 32 KB -- one Apple tile. The granularity IS the tile, which means the
-     * passes are not composing in submission order; each tile keeps whichever
-     * pass stored it last.
-     *
-     * It costs what raster_order_group costs -- overlapping fragments
-     * serialise -- so it is a diagnostic first. If it renders clean, the
-     * missing destination dependency is the mechanism and the real fix is to
-     * order the passes, not to pay for a read in every shader. */
-    if (on == 3) return 1;
-    if (on == 2) return s->blend;
-    return on && s->blend && s->dither;
+                  on = e ? atoi(e) : 3; }
+    return on;
 }
+
+static int hw_shader_blend(const NV2ATextureCopy *s)
+{
+    return hw_shader_blend_mode(hw_shader_blend_mode_env(), s->blend, s->dither);
+}
+
+int nv2a_metal_shader_blend_mode(void) { return hw_shader_blend_mode_env(); }
+int nv2a_metal_shader_blend_for(int mode, int blend, int dither)
+{ return hw_shader_blend_mode(mode, blend, dither); }
 
 int nv2a_metal_shader_blend_on(void)
 { NV2ATextureCopy probe; memset(&probe, 0, sizeof probe);
@@ -1618,13 +1645,13 @@ void nv2a_metal_report(void)
     {   /* The MODE, not a boolean. =0 off, =1 dithered blended draws only,
          * =2 every blended draw, =3 every hardware draw. A report that
          * collapses four states into "on" cannot verify which arm ran. */
-        const char *e = getenv("RECOMP_METAL_SHADER_BLEND");
-        int mode = e ? atoi(e) : 1;
-        fprintf(stderr,"[METAL] shader blend mode %d (%s) (metal_shader_blend %s)\n",
+        int mode = hw_shader_blend_mode_env();
+        fprintf(stderr,"[METAL] shader blend mode %d (%s)%s\n",
                 mode,
-                mode==0?"off":mode==1?"dithered blended draws":
+                mode==0?"off -- NO draw reads the destination":
+                mode==1?"dithered blended draws only":
                 mode==2?"every blended draw":"every hardware draw",
-                mode?"on":"OFF");
+                mode>=3?" (default)":" -- A CONTROL ARM, renders incorrectly");
     }
     fprintf(stderr,"[METAL] MIXED draws (software tail while hw on)=%llu, "
             "depth uploads failed=%llu\n",

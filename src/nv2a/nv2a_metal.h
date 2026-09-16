@@ -24,6 +24,13 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
 
 /* Is the dithered-blend shader path active? RECOMP_METAL_SHADER_BLEND=0 off. */
 int nv2a_metal_shader_blend_on(void);
+/* The fragment-tail selector, exported so it can be gated without a device.
+ * nv2a_metal_shader_blend_for() is pure: given a mode and a draw's blend and
+ * dither flags it answers whether that draw takes fs_hw_blend, which is the
+ * tail that reads colour(0) under raster_order_group(0). The invariant the fix
+ * rests on is that the DEFAULT mode answers 1 for every draw. */
+int nv2a_metal_shader_blend_mode(void);
+int nv2a_metal_shader_blend_for(int mode, int blend, int dither);
 /* Stable diagnostic label for the most recent -1 result. */
 const char *nv2a_metal_last_reject(void);
 /* Compact cumulative counters for live performance validation. */

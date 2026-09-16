@@ -110,7 +110,7 @@ arm_env() {
     RECOMP_METAL_BATCH=1
     RECOMP_METAL_SURFACE_CACHE=1
     RECOMP_METAL_BATCH_MAX=0
-    RECOMP_METAL_SHADER_BLEND=1
+    RECOMP_METAL_SHADER_BLEND=
     RECOMP_METAL_565=0
     RECOMP_METAL_CB_STATS=
     RECOMP_METAL_CB_GPU=
@@ -119,7 +119,15 @@ arm_env() {
     RECOMP_METAL_FENCE=0
     case "$1" in
         sw)           ;;
-        hw)           RECOMP_METAL_HW=1 ;;
+        mode1)        RECOMP_METAL_HW=1; RECOMP_METAL_SHADER_BLEND=1 ;;
+        hw)           RECOMP_METAL_HW=1; RECOMP_METAL_SHADER_BLEND=1 ;;
+        hwdef)        RECOMP_METAL_HW=1 ;;   # identical to hw; named so the
+                                             # RESULTS line says the DEFAULT
+                                             # was what ran, with the variable
+                                             # never set. The 15 Sep handover's
+                                             # open item 3 was that no clean
+                                             # capture had ever been taken
+                                             # without it set explicitly.
         depth-always) RECOMP_METAL_HW=1; RECOMP_METAL_HW_DEPTH_ALWAYS=1 ;;
         no-stencil)   RECOMP_METAL_HW=1; RECOMP_METAL_HW_NO_STENCIL=1 ;;
         no-batch)     RECOMP_METAL_HW=1; RECOMP_METAL_BATCH=0 ;;
@@ -139,7 +147,21 @@ arm_env() {
     esac
     export RECOMP_METAL_HW RECOMP_METAL_HW_DEPTH_ALWAYS RECOMP_METAL_HW_NO_STENCIL
     export RECOMP_METAL_BATCH RECOMP_METAL_SURFACE_CACHE RECOMP_METAL_BATCH_MAX
-    export RECOMP_METAL_SHADER_BLEND RECOMP_METAL_565
+    # AN EMPTY EXPORTED VARIABLE IS NOT AN UNSET ONE, and for this switch the
+    # difference is the difference between the fix and the worst arm. The
+    # backend reads a VALUE here -- `e ? atoi(e) : 3` -- so an exported empty
+    # string is a non-NULL getenv, atoi("") is 0, and mode 0 is the arm in
+    # which NO draw reads the destination. `hwdef` exists to prove the DEFAULT
+    # renders clean with the variable never set, so it has to actually be
+    # unset. recomp_switch.h says the same thing one level down: "Empty counts
+    # as off too, because `VAR= cmd` is how a shell unsets a variable for one
+    # command" -- true there, and exactly the trap here.
+    if [ -n "$RECOMP_METAL_SHADER_BLEND" ]; then
+        export RECOMP_METAL_SHADER_BLEND
+    else
+        unset RECOMP_METAL_SHADER_BLEND
+    fi
+    export RECOMP_METAL_565
     export RECOMP_METAL_CB_STATS RECOMP_METAL_CB_GPU
     export RECOMP_METAL_DRAIN RECOMP_METAL_READBACK_AUDIT
     export RECOMP_METAL_FENCE
@@ -205,7 +227,7 @@ for ARM in "$@"; do
         echo "         RECOMP_METAL_BATCH=$RECOMP_METAL_BATCH"
         echo "         RECOMP_METAL_SURFACE_CACHE=$RECOMP_METAL_SURFACE_CACHE"
         echo "         RECOMP_METAL_BATCH_MAX=$RECOMP_METAL_BATCH_MAX"
-        echo "         RECOMP_METAL_SHADER_BLEND=$RECOMP_METAL_SHADER_BLEND"
+        echo "         RECOMP_METAL_SHADER_BLEND=${RECOMP_METAL_SHADER_BLEND-<unset, backend default>}"
         echo "         RECOMP_METAL_565=$RECOMP_METAL_565"
         echo
         echo "-- what the backend said it was doing --"
