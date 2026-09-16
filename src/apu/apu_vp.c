@@ -438,6 +438,125 @@ unsigned long g_idle_trap_by_voice[MCPX_HW_MAX_VOICES];
 uint16_t g_idle_trap_last[16];
 unsigned long g_idle_trap_ring;
 
+/* WHAT THE HANDLE WAS, not just which handle it was.
+ *
+ * The ring above names the voice. It cannot say whether that voice was one the
+ * guest had finished setting up, which is the whole question: the ISR chain
+ * this handle enters is
+ *
+ *   001A25AA  reads FECTL, FEDECMETH, FEDECPARAM; dispatches if trapped
+ *   001A24BE  if (method != 0x8000) return          -- SE2FE_IDLE_VOICE
+ *   001A241F  if (h >= 0x100) return; if (this->+0x2C0) return;
+ *             if (voicereg[h].CFG_FMT & 0x800000) return  -- PERSIST, +4
+ *   001A200D  pBuf = this->owner[h] (+0x2C4 + h*4);  NO NULL CHECK
+ *   001A2E2E  pBuf->... -- the fault, with pBuf == NULL
+ *
+ * -- read out of the generated C and confirmed against 40 crash dumps, whose
+ * WORKER GUEST STACK CODE POINTERS carry 001A25D9 / 001A24D1 / 001A2450 /
+ * 001A2031, the return addresses of exactly those four call sites, and whose
+ * six guest registers are reproduced by that path and no other in the function.
+ *
+ * So the guest dereferences owner[h] unguarded, and it is entitled to: on
+ * hardware a handle only reaches this chain if DirectSound put the voice in a
+ * list, which it does after it has an owner for it. The interesting facts
+ * about a raise are therefore whether the voice was LOCKED (the guest is
+ * mid-VOICE_ON or mid-RELEASE on it), whether it had EVER been VOICE_ON in
+ * this run at all, and what its CFG_FMT read -- a zero fmt is an unconfigured
+ * voice, which is also a voice with no owner and no PERSIST bit to save it.
+ *
+ * Kept in parallel arrays rather than widening g_idle_trap_last, so the
+ * existing crash-dump line and everything that greps for it are unchanged.
+ * 16 slots costs 128 bytes and one branchless store per raise. */
+#define IDLE_TRAP_WHY_LOCKED   (1u << 0)  /* voice_locked bit set at the raise */
+#define IDLE_TRAP_WHY_NEVER_ON (1u << 1)  /* no VOICE_ON for this handle, ever */
+#define IDLE_TRAP_WHY_PERSIST  (1u << 2)  /* CFG_FMT PERSIST -- the ISR returns */
+#define IDLE_TRAP_WHY_REPEAT   (1u << 3)  /* same handle as the previous raise */
+uint8_t  g_idle_trap_why[16];
+uint16_t g_idle_trap_from[16];   /* predecessor handle, 0xFFFF = straight off TVL */
+uint32_t g_idle_trap_fmt[16];    /* the voice's CFG_FMT as the raise found it */
+uint8_t  g_idle_trap_list[16];   /* 0 = 2D, 1 = 3D, 2 = MP */
+
+/* Totals for the same three facts, because a 16-slot ring only survives the
+ * last few milliseconds and the periodic report has to be able to say "this
+ * has been happening all run" or "it has never happened".
+ *
+ * g_idle_trap_raises is the positive control for all three: a zero here beside
+ * a zero there says only that nothing trapped, which proves nothing about the
+ * instrument. Read them as a pair. */
+unsigned long g_idle_trap_locked_raises;
+unsigned long g_idle_trap_never_on_raises;
+unsigned long g_idle_trap_repeat_raises;
+
+/* Every handle the guest has ever issued VOICE_ON for, one bit each.
+ *
+ * Set in the VOICE_ON handler and never cleared: the question it answers is
+ * "has DirectSound ever owned this voice", and a voice it has since retired
+ * still has an owner slot. A handle that is still zero here when we hand it to
+ * the ISR is one the guest has never seen, so owner[h] cannot be anything but
+ * the NULL it was initialised to. */
+uint64_t g_apu_voice_ever_on[MCPX_HW_MAX_VOICES / 64];
+
+/* THE WINDOW THIS SWITCH CLOSES, AND WHY IT IS A SWITCH.
+ *
+ * NV1BA0_PIO_VOICE_LOCK is the driver telling the hardware "do not look at
+ * this voice, I am editing it". We implement the register -- voice_lock() sets
+ * the bit, is_voice_locked() reads it -- and the VOICE_ON and VOICE_RELEASE
+ * handlers take it across their own bodies. Nothing in the voice-list walk has
+ * ever read it. Taking a lock and never honouring it is the whole of the
+ * mechanism proposed here.
+ *
+ * It matters because our VOICE_ON publishes before it activates:
+ *
+ *     d->regs[top_reg] = selected_handle;      <- the voice is now the head
+ *     ... ~80 lines: CBO, SSL, EACUR/EFCUR, ECNT, filters ...
+ *     voice_set_mask(..., ACTIVE_VOICE, 1);    <- only now is it active
+ *
+ * and the whole of that body runs on a GUEST thread without d->lock held
+ * (voice_lock takes and drops the lock around the bitmap store, nothing more),
+ * while the walk runs on the frame thread. A walk that starts inside that gap
+ * reads regs[top], finds the new voice with ACTIVE_VOICE still clear, and
+ * raises SE2FE_IDLE_VOICE for a handle DirectSound has not finished
+ * introducing -- and therefore has no owner[] entry for yet.
+ *
+ * WHAT IS MEASURED AND WHAT IS NOT. Measured: in all 18 crash dumps that
+ * carry the ring, the LAST handle raised is voice 0, and the faulting register
+ * set is the owner[h] == NULL path. Measured, in a surviving run
+ * (build-macos/jsrf-first-fault/measure/DESC2): idle_trap is 0 at the t=30 s
+ * report and 3 at the t=40 s one -- the first retirements of the whole run --
+ * and voice 0's first VOICE_ON is the next VOICE-DESC line after that, inside
+ * the t=40..50 s window. The crash window is t=34..41 s. So the fault
+ * straddles the moment the title first retires voices and first reaches for
+ * voice 0, which is the coincidence that made this hypothesis worth writing
+ * down. NOT measured: that a raise and a VOICE_ON actually overlap, which is
+ * the claim itself, and which needs a run.
+ *
+ * So this ships OFF. The counters below decide it in ONE run without it: every
+ * raise records whether the guard WOULD have suppressed it, so a single
+ * faulting run either shows the fatal raise flagged L -- mechanism proven,
+ * guard proven sufficient -- or does not, and kills this hypothesis outright.
+ * Shipping it ON on the argument above is the mistake RECOMP_APU_REON_HEAD_NOP
+ * was already made with, twenty lines further down this file.
+ *
+ * Cost if it is switched on and the hypothesis is right: nothing. VOICE_ON and
+ * VOICE_RELEASE drop the lock at the end of their handlers, so a voice that is
+ * genuinely idle traps on the next subframe, 1/1500 s later. Cost if a guest
+ * VOICE_LOCK is never released: that voice never retires -- which is why
+ * locked_raises is reported rather than silently swallowed.
+ *
+ * RECOMP_APU_IDLE_TRAP_LOCK_GUARD=1 enables. */
+int mcpx_apu_idle_trap_lock_guard(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
+unsigned long g_idle_trap_lock_suppressed;
+unsigned long g_apu_method_while_trapped;
+
 unsigned long g_apu_voice_on_count;
 unsigned long g_apu_voice_off_count;
 unsigned long g_apu_voice_release_count;
@@ -478,6 +597,7 @@ unsigned long g_apu_selflink_terminated;
 unsigned long g_apu_trap_suppressed;
 
 int mcpx_apu_se_while_trapped(void);   /* apu_core.c */
+void mcpx_apu_idle_trap_report(int crash); /* defined below, beside the ring */
 
 /* On by default. Unlike the self-link guard this is not a new behaviour looking
  * for a justification -- it is the existing "do not overwrite a handle the
@@ -674,7 +794,109 @@ void mcpx_apu_voice_report(void)
             g_apu_antecedent_set_count, g_apu_voice_on_top_count,
             g_apu_voice_on_inherit_count, g_apu_voice_on_self_ante_count,
             g_apu_voice_on_self_link_count);
+    mcpx_apu_idle_trap_report(0);
     fflush(stderr);
+}
+
+/* The idle-trap ring, with what each handle WAS when we raised it.
+ *
+ * Printed from here rather than from the harness so that the flag letters and
+ * the code that sets them cannot drift apart. The harness's crash handler
+ * calls the same function, which is the point: the periodic line and the line
+ * in the crash dump are then the same line, and a run can be read forwards.
+ *
+ * The header text is unchanged from the harness's original, because scripts
+ * and six months of notes grep for it.
+ *
+ * READING IT. Each entry is v<handle>[flags]<-<predecessor>. Flags:
+ *   L  the voice was LOCKED -- the guest was inside VOICE_ON or VOICE_RELEASE
+ *      for it, so it had published the voice but not finished it
+ *   N  the guest has NEVER issued VOICE_ON for this handle in this run, so
+ *      DirectSound cannot have an owner object for it
+ *   P  CFG_FMT PERSIST is set, which means the guest's ISR returns early and
+ *      this raise was harmless
+ *   R  same handle as the previous raise
+ * The predecessor is the voice whose link field pointed here; TVL means it was
+ * the list head, reached straight off the top register.
+ *
+ * THE ONE THAT MATTERS is the LAST entry, because that is the handle the guest
+ * was servicing when it died. L or N on that entry says the raise was ours to
+ * withhold. Neither says it was not, and sends this back to the drawing board.
+ *
+ * raises is the positive control: locked=0 beside raises=0 says nothing at all
+ * about whether the instrument works, so the two are printed together and must
+ * be read together. */
+void mcpx_apu_idle_trap_report(int crash)
+{
+    unsigned long r = g_idle_trap_ring;
+    unsigned i, n, base;
+
+    fprintf(stderr, "  [APU-IDLE-TRAP] raises=%lu locked=%lu never_on=%lu"
+            " repeat=%lu lock_suppressed=%lu (lock_guard %s)\n",
+            g_idle_trap_raises, g_idle_trap_locked_raises,
+            g_idle_trap_never_on_raises, g_idle_trap_repeat_raises,
+            g_idle_trap_lock_suppressed,
+            mcpx_apu_idle_trap_lock_guard() ? "on" : "OFF");
+    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
+            " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
+            " pair the guest has not read yet\n",
+            g_apu_method_while_trapped, g_apu_guest_method_count);
+    if (!g_idle_trap_raises)
+        return;
+
+    /* Same ring-read rule as everywhere else here: slot 0 is the oldest until
+     * the ring wraps, after which the oldest is the one about to be written. */
+    n = r < 16u ? (unsigned)r : 16u;
+    base = r < 16u ? 0u : (unsigned)(r & 15u);
+    /* THE HEADER BELOW STAYS UNIQUE TO THE CRASH DUMP.
+     *
+     * Six months of notes and more than one mining script do
+     * `grep -m1 "LAST IDLE-VOICE TRAPS RAISED"` over a whole run log and read
+     * the line after it as the state at the fault. Printing the same header
+     * every ten seconds would hand all of them the FIRST report instead, and
+     * they would not notice -- the line looks right. The periodic report gets
+     * the same data under its own prefix. */
+    if (crash)
+        fprintf(stderr, "\nLAST IDLE-VOICE TRAPS RAISED (%lu total),"
+                        " oldest first:\n  ", g_idle_trap_raises);
+    else
+        fprintf(stderr, "  [APU-IDLE-RING] last %u of %lu, oldest first: ",
+                n, g_idle_trap_raises);
+    for (i = 0; i < n; ++i) {
+        unsigned k = (base + i) & 15u;
+        uint8_t w = g_idle_trap_why[k];
+        char flags[5];
+        unsigned f = 0;
+        if (w & IDLE_TRAP_WHY_LOCKED)   flags[f++] = 'L';
+        if (w & IDLE_TRAP_WHY_NEVER_ON) flags[f++] = 'N';
+        if (w & IDLE_TRAP_WHY_PERSIST)  flags[f++] = 'P';
+        if (w & IDLE_TRAP_WHY_REPEAT)   flags[f++] = 'R';
+        flags[f] = 0;
+        static const char *const lname[] = { "2D", "3D", "MP" };
+        const char *ln = g_idle_trap_list[k] < 3 ? lname[g_idle_trap_list[k]]
+                                                 : "??";
+        if (g_idle_trap_from[k] == 0xFFFF)
+            fprintf(stderr, " %s:v%u[%s]<-TVL%s", ln,
+                    (unsigned)g_idle_trap_last[k],
+                    flags, g_idle_trap_fmt[k] ? "" : " fmt=0");
+        else
+            fprintf(stderr, " %s:v%u[%s]<-v%u%s", ln,
+                    (unsigned)g_idle_trap_last[k],
+                    flags, (unsigned)g_idle_trap_from[k],
+                    g_idle_trap_fmt[k] ? "" : " fmt=0");
+    }
+    if (!crash) {
+        fprintf(stderr, "\n");
+        return;
+    }
+    fprintf(stderr, "\n  The guest ISR dereferences its own object for"
+                    " the handle it is handed.\n"
+                    "  L = locked (guest mid-VOICE_ON/RELEASE),"
+                    " N = never VOICE_ON in this run, P = PERSIST (ISR returns"
+                    " early), R = repeat of the previous raise.\n"
+                    "  2D/3D/MP is the voice list. fmt=0 is an unconfigured"
+                    " voice. The LAST entry is the"
+                    " handle the guest was servicing.\n");
 }
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
@@ -758,6 +980,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_ON: {
         g_apu_voice_on_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        /* Recorded before anything can fail below: the question this answers
+         * is "has DirectSound ever owned this handle", and the answer becomes
+         * yes the moment the guest asks for the voice, not when we finish
+         * setting it up. */
+        if (selected_handle < MCPX_HW_MAX_VOICES)
+            g_apu_voice_ever_on[selected_handle / 64] |=
+                1ULL << (selected_handle % 64);
         voice_lifecycle_note(d, (uint16_t)selected_handle, "on");
         voice_ev_note(0, selected_handle);
         voice_desc_dump(d, (uint16_t)selected_handle);
@@ -1242,6 +1471,33 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     (void)size;
 
     g_apu_guest_method_count++;
+    /* THE OTHER WAY THE GUEST CAN BE HANDED THE WRONG HANDLE, measured rather
+     * than argued about.
+     *
+     * fe_method writes FEDECMETH and FEDECPARAM for EVERY method, and this
+     * function is how guest methods reach it -- on a guest thread, with no
+     * lock. The frame thread writes the same two registers when it raises
+     * SE2FE_IDLE_VOICE. The guest's ISR reads them as two separate MMIO loads,
+     * back to back (001A25AA: FEDECMETH into ecx, then FEDECPARAM into esi),
+     * and only then tests the method against 0x8000. A guest method landing
+     * between those two loads leaves the ISR with our 0x8000 and somebody
+     * else's argument -- and the argument of a method like
+     * SET_ANTECEDENT_VOICE is a voice handle, so it passes the ISR's
+     * `h >= 0x100` guard and is dereferenced.
+     *
+     * On hardware the window does not exist: a trapped front end has stopped
+     * decoding, so the pair holds still until the guest resumes it. Ours
+     * decodes straight through.
+     *
+     * This counts only arrivals while the front end is TRAPPED, which is
+     * exactly the interval in which an unread pair is outstanding. Zero over a
+     * whole run kills the hypothesis outright, and g_apu_guest_method_count is
+     * the positive control -- a zero here beside a zero there means only that
+     * no methods arrived at all. Counter only; nothing is changed. */
+    if ((qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE)
+            == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+        g_apu_method_while_trapped++;
+
     /* Dispatch known methods through fe_method */
     fe_method(d, (uint32_t)addr, (uint32_t)val);
 }
@@ -2338,6 +2594,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
          * rendered. See mcpx_apu_se_while_trapped. */
         uint16_t cur = (uint16_t)d->regs[top];
         int trap_held = 0;
+        /* Which voice's link field pointed at the one we are looking at.
+         * 0xFFFF means "straight off TVL", i.e. it is the list head. The two
+         * cases want different fixes -- a bad head register and a bad link are
+         * written by different code -- and only this tells them apart. */
+        uint16_t came_from = 0xFFFF;
 
         /* CVL AND NVL ARE ONE CURSOR, AND BOTH HAVE TO HOLD STILL.
          *
@@ -2484,11 +2745,64 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     hold = 1;
                 }
 
-                if (!trap_held) {
+                /* WHAT THIS VOICE WAS WHEN WE DECIDED TO REPORT IT.
+                 *
+                 * Gathered before the raise so it describes the state the
+                 * decision was made on, and gathered whether or not the guard
+                 * below is enabled -- the point is that a run with the guard
+                 * OFF still says whether the guard would have mattered. Three
+                 * guest-RAM reads and a bitmap test per raise, and raises are
+                 * rare by construction (the coalescing above is what makes
+                 * them rare): the whole cost lands on an event that already
+                 * writes two MMIO registers and posts an interrupt. */
+                int locked = is_voice_locked(d, v);
+                uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                              0xFFFFFFFFu);
+                int ever_on = (g_apu_voice_ever_on[v / 64]
+                               & (1ULL << (v % 64))) != 0;
+
+                /* HONOUR THE VOICE LOCK. See mcpx_apu_idle_trap_lock_guard for
+                 * the window, the evidence, and why this is off by default.
+                 *
+                 * Counted whether or not it fires, so one run with the guard
+                 * OFF answers "would it have fired on the raise that killed
+                 * us" -- which is the only question that matters here and the
+                 * one a guard that silently suppressed would destroy. */
+                int suppress = 0;
+                if (locked) {
+                    g_idle_trap_locked_raises++;
+                    if (mcpx_apu_idle_trap_lock_guard()) {
+                        g_idle_trap_lock_suppressed++;
+                        suppress = 1;
+                    }
+                }
+
+                /* Suppressing the RAISE only. The cursors below still advance
+                 * exactly as they would for any voice with nothing to do this
+                 * subframe -- a locked voice must not pin the walk, which is
+                 * the failure mode the self-link guard above exists for. */
+                if (!trap_held && !suppress) {
+                    unsigned slot = (unsigned)(g_idle_trap_ring & 15u);
+                    uint8_t why = 0;
+                    if (locked)   why |= IDLE_TRAP_WHY_LOCKED;
+                    if (!ever_on) why |= IDLE_TRAP_WHY_NEVER_ON;
+                    if (fmt & NV_PAVS_VOICE_CFG_FMT_PERSIST)
+                        why |= IDLE_TRAP_WHY_PERSIST;
+                    if (g_idle_trap_ring
+                        && g_idle_trap_last[(g_idle_trap_ring - 1) & 15u] == v)
+                        why |= IDLE_TRAP_WHY_REPEAT;
+
+                    if (!ever_on) g_idle_trap_never_on_raises++;
+                    if (why & IDLE_TRAP_WHY_REPEAT) g_idle_trap_repeat_raises++;
+
                     voice_lifecycle_note(d, v, "idle");
                     g_idle_trap_raises++;
                     if (v < MCPX_HW_MAX_VOICES) g_idle_trap_by_voice[v]++;
-                    g_idle_trap_last[g_idle_trap_ring & 15u] = (uint16_t)v;
+                    g_idle_trap_last[slot] = (uint16_t)v;
+                    g_idle_trap_why[slot]  = why;
+                    g_idle_trap_from[slot] = came_from;
+                    g_idle_trap_fmt[slot]  = fmt;
+                    g_idle_trap_list[slot] = (uint8_t)list;
                     g_idle_trap_ring++;
                     /* The pair names the voice the guest is about to be told
                      * about. With coalescing off this raise REPLACES an
@@ -2516,6 +2830,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
             if (!hold) d->regs[current] = nxt;
+            came_from = v;
             cur = nxt;
         }
     }
@@ -2552,6 +2867,14 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d)
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)
 {
+    /* Resolve the switch now, on an ordinary thread.
+     *
+     * It is a getenv behind a static, and the only other thing that forces it
+     * is the first idle-trap raise. A run that crashes before ever raising one
+     * would otherwise reach the first getenv from inside the SIGSEGV handler,
+     * which prints this counter line -- and getenv is not async-signal-safe.
+     * One call here removes the case entirely. */
+    (void)mcpx_apu_idle_trap_lock_guard();
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));

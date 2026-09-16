@@ -176,6 +176,19 @@ add_executable(jsrf_apu_register_test apu_register_test.c)
 target_link_libraries(jsrf_apu_register_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_register COMMAND jsrf_apu_register_test)
 
+# The publish-before-activate window in VOICE_ON, which is the top crash site
+# on this host: DirectSound's ISR is handed an idle-voice handle and
+# dereferences its own owner entry for it without a NULL check. Two cases over
+# one binary because the switch caches its getenv, so a process is in one arm
+# for its whole life. The default arm pins today's behaviour AND the new ring
+# provenance; the guard arm pins the fix and its positive control.
+add_executable(jsrf_apu_idle_trap_lock_test apu_idle_trap_lock_test.c)
+target_link_libraries(jsrf_apu_idle_trap_lock_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_idle_trap_lock_default
+         COMMAND jsrf_apu_idle_trap_lock_test)
+add_test(NAME jsrf_apu_idle_trap_lock_guard
+         COMMAND jsrf_apu_idle_trap_lock_test guard)
+
 # The audio OUTPUT path, which nothing here had ever driven. A run whose host
 # audio device fails reads [APU-PACE] gen_hz=0 batches=0 frames=0 -- every one
 # of those a sink counter -- while the engine upstream is fine, and ctest could

@@ -3825,20 +3825,14 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
      * one. Same ring-read rule as the periodic report: slot 0 is the oldest
      * until the ring wraps. */
     {
-        extern unsigned long g_idle_trap_raises, g_idle_trap_ring;
-        extern uint16_t g_idle_trap_last[];
-        if (g_idle_trap_raises) {
-            unsigned long r = g_idle_trap_ring;
-            unsigned i, n = r < 16u ? (unsigned)r : 16u;
-            unsigned base = r < 16u ? 0u : (unsigned)(r & 15u);
-            fprintf(stderr, "\nLAST IDLE-VOICE TRAPS RAISED (%lu total),"
-                            " oldest first:\n  ", g_idle_trap_raises);
-            for (i = 0; i < n; ++i)
-                fprintf(stderr, " v%u",
-                        (unsigned)g_idle_trap_last[(base + i) & 15u]);
-            fprintf(stderr, "\n  The guest ISR dereferences its own object for"
-                            " the handle it is handed.\n");
-        }
+        /* The model owns this one now: the flag letters and the code that sets
+         * them have to be written in the same place or they drift. Same text,
+         * same header, plus what each handle WAS at the moment we raised for
+         * it -- which is the difference between "the guest was handed a voice
+         * it owns" and "the guest was handed a voice it had not finished
+         * introducing". See mcpx_apu_idle_trap_report in src/apu/apu_vp.c. */
+        extern void mcpx_apu_idle_trap_report(int crash);
+        mcpx_apu_idle_trap_report(1);
     }
     fprintf(stderr, "=======================================\n");
     fflush(stderr);
