@@ -565,6 +565,47 @@ static uint64_t g_idle_trap_reported[MCPX_HW_MAX_VOICES / 64];
 unsigned long g_idle_trap_edge_encounters;
 unsigned long g_idle_trap_edge_suppressed;
 unsigned long g_idle_trap_edge_rearm;
+/* THE BOUNDED RE-RAISE. A latched voice that the guest has not reclaimed is
+ * told again after this many withheld subframes. _reraise counts those; a
+ * run where it is zero with suppressed climbing is the pure edge, which
+ * silenced the player's music twice on 16 Sep 2026 (see
+ * mcpx_apu_idle_trap_rearm_subframes). hold[] is per voice, plain stores,
+ * same justification as the bitmap above. */
+unsigned long g_idle_trap_edge_reraise;
+static uint16_t g_idle_trap_edge_hold[MCPX_HW_MAX_VOICES];
+
+/* THE VOICE POOL, so voice theft is measurable. on_active: VOICE_ON for a
+ * handle whose ACTIVE_VOICE bit was still set -- the guest restarted or STOLE
+ * a playing voice. reuse: VOICE_ON for a handle retired earlier in the same
+ * report window. distinct: handles started this window. A healthy pool has
+ * distinct >> reuse and on_active ~ 0; a guest that cannot reclaim voices
+ * (no idle notification) shows distinct collapsing and on_active climbing,
+ * which is what "effects cut off, then the music" sounds like. */
+unsigned long g_pool_on_active, g_pool_reuse;
+/* THE POSITIVE CONTROL [APU-BIN] NEVER HAD.
+ *
+ * "2D heard" counts subframes in which a 2D voice produced a non-zero
+ * amplitude, and it reads ZERO in two completely different worlds: one where
+ * we have lost the music, and one where the guest is simply not playing any
+ * (a menu, a cutscene, a stretch with no BGM). On 16 Sep 2026 a player's
+ * session froze 2D heard at 95,324 for twenty-six report windows and nothing
+ * in the log could tell those apart -- the only way to settle it was to ask
+ * the player whether they could hear music, which is not a measurement.
+ *
+ * on_2d counts VOICE_ON for a handle at or above MCPX_HW_MAX_3D_VOICES, i.e.
+ * the guest ASKING for a 2D voice. Read it against 2D heard:
+ *
+ *   on_2d climbing, 2D heard frozen  -> the guest asked and we dropped it.
+ *                                       OUR defect, and the voice handles in
+ *                                       the ring say which.
+ *   on_2d frozen too                 -> the guest played no music. NOT a
+ *                                       defect; stop looking.
+ *
+ * on_3d is the control for the control: if both read zero the instrument is
+ * dead rather than the audio. */
+unsigned long g_pool_on_2d, g_pool_on_3d;
+static uint64_t g_pool_on_window[MCPX_HW_MAX_VOICES / 64];
+static uint64_t g_pool_off_window[MCPX_HW_MAX_VOICES / 64];
 int mcpx_apu_idle_trap_edge(void);
 
 /* Every handle the guest has ever issued VOICE_ON for, one bit each.
@@ -721,6 +762,20 @@ unsigned long g_apu_voice_off_already_count; /* retired a voice already inactive
 unsigned long g_apu_voice_release_count;
 unsigned long g_apu_idle_trap_count;
 unsigned long g_apu_voice_process_count;
+/* Mixbin fate. See the block in voice_process that increments these. */
+unsigned long g_bin_heard_2d, g_bin_lost_2d, g_bin_heard_3d, g_bin_lost_3d;
+unsigned long g_bin_lost_hist[32];
+/* Mirrored at the write site so the report can name the value that decides
+ * every 3D voice's fate without needing the device pointer. */
+unsigned char g_bin_submix[4]; int g_bin_hrtf_on;
+int mcpx_apu_mixdown_all(void); /* apu_dsp.c: which bins the mixdown sums */
+/* Default 0: the override is NOT applied, because nothing downstream performs
+ * HRTF or mixes its submixes down. =1 restores upstream's unconditional
+ * override for an A/B. */
+static int mcpx_apu_hrtf_bins(void)
+{ static int on=-1;
+  if(on<0){const char*e=getenv("RECOMP_APU_HRTF_BINS"); on = e ? (atoi(e)!=0) : 0;}
+  return on; }
 
 /* fe_methods includes internal SE2FE events. guest_methods counts only
  * arrivals through mcpx_apu_vp_write, independently of idle-trap arming.
@@ -815,6 +870,37 @@ int mcpx_apu_idle_trap_edge(void)
         on = e ? (atoi(e) != 0) : 0;
     }
     return on;
+}
+
+/* RECOMP_APU_IDLE_TRAP_REARM_MS, default 16, only meaningful with the edge on.
+ *
+ * WHY NEITHER ARM WAS RIGHT. The level trap tells the guest about an
+ * inactive-and-linked voice 1500 times a second and the music breaks up under
+ * the interrupt load. The edge trap tells it exactly once -- and the guest's
+ * ISR has three early returns, so if that once lands while it is not ready
+ * the voice is never reclaimed. Player session 16 Sep 2026 16:22, edge on:
+ * 2D heard froze at 29597 twenty seconds in, edge_suppressed=1010411,
+ * rearm=51, off == off_commands == 94. The guest stopped its own voices,
+ * was told once, did not reclaim them, ran out of free voices, and stole
+ * playing ones: effects cut off, then a music voice went.
+ *
+ * The model cannot know when the guest has FINISHED with a notification, so
+ * the honest shape is: report the transition, and if the voice is still
+ * sitting there after one guest tick, report it again. 16 ms is one
+ * DirectSound tick; at 1500 subframes/s that is 24 withheld subframes per
+ * re-raise, 60 raises/s per stuck voice instead of 1500. =0 restores the
+ * pure edge for an A/B. */
+static unsigned mcpx_apu_idle_trap_rearm_subframes(void)
+{
+    static int sf = -1;
+    if (sf < 0) {
+        const char *e = getenv("RECOMP_APU_IDLE_TRAP_REARM_MS");
+        int ms = e ? atoi(e) : 16;
+        sf = ms > 0 ? (ms * 3 + 1) / 2 : 0;
+        if (sf > 65535) sf = 65535;   /* hold[] is uint16_t; past this the
+                                       * latch would silently never re-raise */
+    }
+    return (unsigned)sf;
 }
 
 /* OFF by default, and UNMEASURED. Read that as written: not "measured and found
@@ -1234,9 +1320,30 @@ extern unsigned long g_apu_adpcm_short;
 extern unsigned long g_apu_adpcm_oversize;
 extern unsigned long g_apu_adpcm_silenced;
 int mcpx_apu_adpcm_guard(void);
+int mcpx_apu_segment_spb(void);  /* the streaming block stride; see the definition */
 
 void mcpx_apu_voice_report(void)
 {
+    {   /* Mixbin fate, and the HRTF submix that decides it. */
+        extern unsigned long g_bin_heard_2d, g_bin_lost_2d,
+                             g_bin_heard_3d, g_bin_lost_3d;
+        extern unsigned long g_bin_lost_hist[32];
+        extern unsigned char g_bin_submix[4]; extern int g_bin_hrtf_on;
+        unsigned b; char hist[192]; int n = 0;
+        for (b = 0; b < 32; ++b)
+            if (g_bin_lost_hist[b] && n < (int)sizeof hist - 16)
+                n += snprintf(hist + n, sizeof hist - (size_t)n, " %u:%lu",
+                              b, g_bin_lost_hist[b]);
+        hist[n] = 0;
+        fprintf(stderr,
+            "  [APU-BIN] 2D heard=%lu lost=%lu | 3D heard=%lu lost=%lu"
+            " | hrtf_submix=%u,%u,%u,%u hrtf=%s mixdown=%s | lost by bin:%s\n",
+            g_bin_heard_2d, g_bin_lost_2d, g_bin_heard_3d, g_bin_lost_3d,
+            g_bin_submix[0], g_bin_submix[1],
+            g_bin_submix[2], g_bin_submix[3],
+            g_bin_hrtf_on ? "on" : "OFF",
+            mcpx_apu_mixdown_all() ? "all" : "0-1", n ? hist : " none");
+    }
     fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu release=%lu idle_trap=%lu"
             " processed=%lu"
             " fe_methods=%lu set_current_voice=%lu on_loop=%lu"
@@ -1305,10 +1412,27 @@ void mcpx_apu_voice_report(void)
      * at zero means the latch has shut rather than cycled, which is the way
      * this change fails. */
     fprintf(stderr, "  [APU-IDLE-EDGE] persist=%lu edge_would=%lu"
-            " edge_suppressed=%lu rearm=%lu (of %lu raises)\n",
+            " edge_suppressed=%lu rearm=%lu reraise=%lu (of %lu raises,"
+            " rearm_subframes=%u)\n",
             g_idle_trap_persist_raises, g_idle_trap_edge_encounters,
             g_idle_trap_edge_suppressed, g_idle_trap_edge_rearm,
-            g_idle_trap_raises);
+            g_idle_trap_edge_reraise, g_idle_trap_raises,
+            mcpx_apu_idle_trap_rearm_subframes());
+    {
+        unsigned distinct = 0, b;
+        for (b = 0; b < MCPX_HW_MAX_VOICES / 64; ++b) {
+            uint64_t w = g_pool_on_window[b];          /* portable popcount:
+                                                        * this file also builds
+                                                        * under MSVC */
+            while (w) { w &= w - 1; ++distinct; }
+        }
+        fprintf(stderr, "  [APU-POOL] distinct=%u this window | on_2d=%lu"
+                " on_3d=%lu on_active=%lu reuse=%lu (cumulative)\n",
+                distinct, g_pool_on_2d, g_pool_on_3d,
+                g_pool_on_active, g_pool_reuse);
+        memset(g_pool_on_window, 0, sizeof g_pool_on_window);
+        memset(g_pool_off_window, 0, sizeof g_pool_off_window);
+    }
     /* THE ADPCM DECODE, WHICH HAD NO INSTRUMENT AT ALL. ok is the positive
      * control for fail: both zero means no ADPCM voice played in this run and
      * says nothing about the decoder. oversize is the stack-overrun clamp and
@@ -1318,6 +1442,50 @@ void mcpx_apu_voice_report(void)
             g_apu_adpcm_ok, g_apu_adpcm_fail, g_apu_adpcm_short,
             g_apu_adpcm_oversize, g_apu_adpcm_silenced,
             mcpx_apu_adpcm_guard() ? "on" : "OFF");
+    {
+        extern unsigned long g_adpcm_fail_ring, g_adpcm_fail_first, g_adpcm_fail_last, g_adpcm_fail_mid;
+        extern uint16_t g_adpcm_fail_v[8]; extern uint8_t g_adpcm_fail_stream[8], g_adpcm_fail_ch[8];
+        extern uint32_t g_adpcm_fail_block[8], g_adpcm_fail_nblocks[8], g_adpcm_fail_hdr[8];
+        extern uint32_t g_adpcm_fail_page[8], g_adpcm_fail_prd[8], g_adpcm_fail_lin[8];
+        {
+            extern unsigned long g_adpcm_spb_voice, g_adpcm_spb_seg, g_adpcm_spb_differ;
+            if (g_adpcm_spb_voice)
+                fprintf(stderr, "  [APU-ADPCM-SPB] stream segments=%lu,"
+                        " segment spb used=%lu, disagreed with the voice"
+                        " register=%lu (segment_spb %s)\n",
+                        g_adpcm_spb_voice, g_adpcm_spb_seg, g_adpcm_spb_differ,
+                        mcpx_apu_segment_spb() ? "on" : "OFF");
+        }
+        if (g_adpcm_fail_ring) {
+            unsigned n = g_adpcm_fail_ring < 8 ? (unsigned)g_adpcm_fail_ring : 8u, i;
+            fprintf(stderr, "  [APU-ADPCM-FAIL] first=%lu last=%lu mid=%lu | last %u:",
+                    g_adpcm_fail_first, g_adpcm_fail_last, g_adpcm_fail_mid, n);
+            for (i = 0; i < n; ++i) {
+                unsigned slot = (unsigned)((g_adpcm_fail_ring - n + i) & 7u);
+                fprintf(stderr, " v%u%s%s blk %u/%u pg%u prd=%08X lin=%08X hdr %08X",
+                        g_adpcm_fail_v[slot],
+                        g_adpcm_fail_stream[slot] ? "S" : "", g_adpcm_fail_ch[slot] == 2 ? "st" : "",
+                        g_adpcm_fail_block[slot], g_adpcm_fail_nblocks[slot],
+                        g_adpcm_fail_page[slot], g_adpcm_fail_prd[slot],
+                        g_adpcm_fail_lin[slot], g_adpcm_fail_hdr[slot]);
+            }
+            fprintf(stderr, "\n");
+            {
+                extern unsigned long g_adpcm_fail_page0, g_adpcm_fail_pagehi;
+                extern uint32_t g_adpcm_first_fail_blk[];
+                unsigned vv, shown = 0;
+                fprintf(stderr, "  [APU-ADPCM-PAGE] page0=%lu pagehi=%lu |"
+                        " lowest failing block per voice:",
+                        g_adpcm_fail_page0, g_adpcm_fail_pagehi);
+                for (vv = 0; vv < MCPX_HW_MAX_VOICES && shown < 8; ++vv)
+                    if (g_adpcm_first_fail_blk[vv]) {
+                        fprintf(stderr, " v%u:%u", vv, g_adpcm_first_fail_blk[vv]);
+                        ++shown;
+                    }
+                fprintf(stderr, " (113 = 4096/36, one page of blocks)\n");
+            }
+        }
+    }
     {
         /* THE SCORING LINE FOR "DO SOUND EFFECTS START", WITH ITS CONTROL ON
          * THE SAME LINE.
@@ -1545,6 +1713,7 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     voice_lifecycle_note(d, v, "retire");
     g_apu_voice_off_count++;
     voice_ev_note(1, v);
+    if (v < MCPX_HW_MAX_VOICES) g_pool_off_window[v / 64] |= 1ULL << (v % 64);
 
     /* RETIRING A VOICE THAT WAS ALREADY RETIRED posts a SECOND
      * MCPX_HW_NOTIFIER_SSLA_DONE for it, into guest memory, and re-raises
@@ -1968,6 +2137,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         }
 
         voice_reset_filters(d, (uint16_t)selected_handle);
+        if (selected_handle < MCPX_HW_MAX_VOICES) {
+            uint64_t pbit = 1ULL << (selected_handle % 64);
+            if (voice_get_mask(d, (uint16_t)selected_handle,
+                               NV_PAVS_VOICE_PAR_STATE,
+                               NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                g_pool_on_active++;
+            if (g_pool_off_window[selected_handle / 64] & pbit) g_pool_reuse++;
+            g_pool_on_window[selected_handle / 64] |= pbit;
+            if (selected_handle < MCPX_HW_MAX_3D_VOICES) g_pool_on_3d++;
+            else g_pool_on_2d++;
+        }
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
@@ -2201,6 +2381,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_SET_HRTF_SUBMIXES:
+        g_bin_submix[0] = (unsigned char)((argument >> 0) & 0x1f);
+        g_bin_submix[1] = (unsigned char)((argument >> 8) & 0x1f);
+        g_bin_submix[2] = (unsigned char)((argument >> 16) & 0x1f);
+        g_bin_submix[3] = (unsigned char)((argument >> 24) & 0x1f);
         d->vp.hrtf_submix[0] = (uint8_t)((argument >> 0) & 0x1f);
         d->vp.hrtf_submix[1] = (uint8_t)((argument >> 8) & 0x1f);
         d->vp.hrtf_submix[2] = (uint8_t)((argument >> 16) & 0x1f);
@@ -2725,6 +2909,29 @@ static void voice_fresh_sample(uint16_t v, uint32_t cbo, const float s[2])
  * over a run, this clamp changed nothing in it. */
 unsigned long g_apu_adpcm_ok;
 unsigned long g_apu_adpcm_fail;
+unsigned long g_adpcm_fail_ring, g_adpcm_fail_first, g_adpcm_fail_last, g_adpcm_fail_mid;
+uint16_t g_adpcm_fail_v[8]; uint8_t g_adpcm_fail_stream[8], g_adpcm_fail_ch[8];
+uint32_t g_adpcm_fail_block[8], g_adpcm_fail_nblocks[8], g_adpcm_fail_hdr[8];
+/* THE PAGE THE FAILING BLOCK LANDED IN, AND WHAT THE TABLE SAID ABOUT IT.
+ *
+ * get_data_ptr's bounds parameter is defeated at every call site (max_sge is
+ * 0xFFFFFFFF), so a read past the end of the voice processor's page table
+ * returns a translation built from whatever dword sits at that offset, with
+ * no error and no counter. The ADPCM failures fit that: block 0 of a buffer
+ * NEVER fails, and every observed failing block is above 113 -- which is
+ * 4096/36, the number of 36-byte ADPCM blocks in one 4 KB page.
+ *
+ * This records, per failure, the linear address, its page index, and the
+ * page address the table returned, plus the LOWEST failing block index per
+ * voice. Read them together:
+ *   lowest failing block ~= a page multiple, prd implausible beyond it
+ *        -> the translation is wrong past that page. Carry a real bound.
+ *   failures scattered across pages with plausible prd
+ *        -> the buffer is being reused underneath us; this dies too.
+ * Read-only: it recomputes the address rather than touching the fetch. */
+uint32_t g_adpcm_fail_page[8], g_adpcm_fail_prd[8], g_adpcm_fail_lin[8];
+unsigned long g_adpcm_fail_page0, g_adpcm_fail_pagehi;
+uint32_t g_adpcm_first_fail_blk[MCPX_HW_MAX_VOICES];
 unsigned long g_apu_adpcm_short;
 unsigned long g_apu_adpcm_oversize;
 unsigned long g_apu_adpcm_silenced;
@@ -2736,12 +2943,83 @@ unsigned long g_apu_adpcm_silenced;
  * stack until somebody turns this on. Both halves of that are deliberate: this
  * repository has shipped one APU guard on an argument and made a crash worse,
  * and the rule that came out of it is a run count, not a better argument. */
-int mcpx_apu_adpcm_guard(void)
+/* RECOMP_APU_SEGMENT_SPB, default OFF -- BUILT, MEASURED, AND IT IS NOT THE
+ * ADPCM FIX. Scene-matched gameplay A/B, 16 Sep 2026:
+ *     off  ok=697869 fail=27801  (3.83%)
+ *     on   ok=584716 fail=25224  (4.13%)
+ * i.e. no effect, and [APU-ADPCM-SPB] printed in NEITHER arm, which means
+ * g_adpcm_spb_voice was zero: this scene contains no streaming ADPCM voice at
+ * all, so the switch could not have done anything. The failing voices are
+ * non-stream (the ring reads "v4 blk 161/170", no S flag), and for those the
+ * segment descriptor is never consulted. THE ADPCM DEFECT IS STILL OPEN and
+ * the first block of every buffer still always decodes while later ones fail,
+ * so a stride or base-address error remains the shape to look for -- just not
+ * this one. Default OFF because it is an unmeasured behaviour change for any
+ * scene that DOES stream ADPCM, and default-on would ship that to a player on
+ * the strength of an argument.
+ *
+ * THE BLOCK STRIDE OF A STREAMING VOICE COMES FROM ITS SEGMENT, NOT FROM ITS
+ * VOICE REGISTER. The SSL segment descriptor packs samples-per-block at bits
+ * 18-22 beside the container size at 16-17, and this model already lets the
+ * segment override the container size (container_size_index = seg_cs, and the
+ * ADPCM case then forces sample_size) -- but it decoded seg_spb into a local
+ * and NEVER READ IT, so block_size stayed 36 * the VOICE register's
+ * samples-per-block. When the two disagree every block after the first is
+ * fetched at the wrong offset.
+ *
+ * That is exactly the measured shape. Player session 16 Sep 2026 18:33,
+ * 36,429 decode failures in 170 s:
+ *     [APU-ADPCM-FAIL] first=0 last=1116 mid=44775
+ *     last 8: v11 blk 213/214 hdr 08080808   (the same block, over and over)
+ * first=0 is the whole finding: block 0 starts at offset 0 whatever the
+ * stride is, so it always decodes, and every later block is displaced by a
+ * multiple of the error. 0x08080808 is not a header at all -- byte 3 must be
+ * zero and is 8 -- it is ADPCM sample data being read as one.
+ *
+ * Each failure emits an UNINITIALISED stack array as audio at full scale
+ * (adpcm_decoded is automatic and the caller reads it regardless), so this is
+ * not only silence, it is noise.
+ *
+ * =0 restores the old stride for an A/B. The [APU-ADPCM] line prints which
+ * one ran. */
+int mcpx_apu_segment_spb(void)
 {
     static int on = -1;
     if (on < 0) {
+        const char *e = getenv("RECOMP_APU_SEGMENT_SPB");
+        on = (e && *e) ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+unsigned long g_adpcm_spb_voice, g_adpcm_spb_seg, g_adpcm_spb_differ;
+
+int mcpx_apu_adpcm_guard(void)
+{
+    /* DEFAULT ON since 16 Sep 2026 (night). A refused block used to leave
+     * adpcm_decoded -- an UNINITIALISED automatic array -- for the caller to
+     * read, so every failure handed the mixer stack memory at full scale.
+     * 1,387 refusals in one 200 s run, 27,801 in a 150 s gameplay run.
+     *
+     * The CAUSE IS STILL OPEN and two theories died getting here: the
+     * segment descriptor's samples-per-block (measured, no effect, and the
+     * scene has no streaming ADPCM voice), and a page-table translation going
+     * wrong past the first page (measured: page0=0 pagehi=1387 looked like a
+     * fit, but the returned page address is properly 4 KB-aligned and
+     * plausible, and the lowest failing block per voice is 208 of 219 and 275
+     * -- neither a multiple of the 113 blocks that fit in a page). What the
+     * probe DID establish is that failures cluster in the LAST ~5% of a
+     * buffer: v0 fails from block 208 of 219 onward. That is the shape of
+     * reading past the data the guest actually wrote, not of a broken
+     * translation.
+     *
+     * Turning this on does not fix that. It makes the symptom silence
+     * instead of noise, which is the right default while the cause is open:
+     * emitting uninitialised memory as audio is not a thing to ship. =0
+     * restores the old behaviour for anyone measuring the cause. */
+    static int on = -1;
+    if (on < 0) {
         const char *e = getenv("RECOMP_APU_ADPCM_GUARD");
-        on = e ? (atoi(e) != 0) : 0;
+        on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
 }
@@ -2838,6 +3116,16 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         if (seg_cs == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
             sample_size = NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24;
         }
+        /* The segment's own samples-per-block, which decides the block
+         * stride below. Counted in both arms so a run says whether the two
+         * sources ever disagreed -- if differ=0 this switch changed nothing
+         * and the ADPCM failures are something else. */
+        ++g_adpcm_spb_voice;
+        if ((unsigned)(seg_spb + 1) != samples_per_block) ++g_adpcm_spb_differ;
+        if (mcpx_apu_segment_spb()) {
+            samples_per_block = (unsigned)(seg_spb + 1);
+            ++g_adpcm_spb_seg;
+        }
         assert(seg_len > 0);
         ebo = seg_len - 1;
     }
@@ -2894,6 +3182,47 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                                  fetch, channels);
                 if (decoded <= 0) {
                     g_apu_adpcm_fail++;
+                    /* WHICH BLOCKS FAIL. 15,529 refusals in one player
+                     * session (1.8% of blocks), every one emitting stack
+                     * memory as audio, and nothing recorded which voice,
+                     * which block, or what the header held. The decoder
+                     * refuses on header byte 3 != 0 or a step index > 88,
+                     * i.e. the block is misaligned or is not ADPCM. first/
+                     * last/mid says whether it is the partial last block of
+                     * every buffer or something else; the ring of 8 shows
+                     * the header bytes. Printed by the report. */
+                    {
+                        unsigned slot = (unsigned)(g_adpcm_fail_ring & 7u);
+                        const uint8_t *hb = (const uint8_t *)adpcm_block;
+                        uint32_t nblocks = ebo / ADPCM_SAMPLES_PER_BLOCK + 1;
+                        g_adpcm_fail_v[slot] = (uint16_t)v;
+                        g_adpcm_fail_stream[slot] = (uint8_t)(stream ? 1 : 0);
+                        g_adpcm_fail_ch[slot] = (uint8_t)channels;
+                        g_adpcm_fail_block[slot] = block_index;
+                        g_adpcm_fail_nblocks[slot] = nblocks;
+                        g_adpcm_fail_hdr[slot] = (uint32_t)hb[0] | ((uint32_t)hb[1] << 8)
+                                               | ((uint32_t)hb[2] << 16) | ((uint32_t)hb[3] << 24);
+                        {
+                            uint32_t la = block_index * (uint32_t)block_size
+                                        + (stream ? 0u : ba);
+                            uint32_t pg = la / TARGET_PAGE_SIZE;
+                            g_adpcm_fail_lin[slot] = la;
+                            g_adpcm_fail_page[slot] = pg;
+                            g_adpcm_fail_prd[slot] = stream ? 0u
+                                : (uint32_t)ldl_le_phys(address_space_memory,
+                                      d->regs[NV_PAPU_VPSGEADDR] + pg * 4 * 2);
+                            if (pg == 0) ++g_adpcm_fail_page0;
+                            else ++g_adpcm_fail_pagehi;
+                            if (v < MCPX_HW_MAX_VOICES
+                                && (!g_adpcm_first_fail_blk[v]
+                                    || block_index < g_adpcm_first_fail_blk[v]))
+                                g_adpcm_first_fail_blk[v] = block_index;
+                        }
+                        g_adpcm_fail_ring++;
+                        if (block_index == 0) g_adpcm_fail_first++;
+                        else if (block_index + 1 >= nblocks) g_adpcm_fail_last++;
+                        else g_adpcm_fail_mid++;
+                    }
                     if (mcpx_apu_adpcm_guard()) {
                         memset(adpcm_decoded, 0, sizeof(adpcm_decoded));
                         g_apu_adpcm_silenced++;
@@ -3416,7 +3745,37 @@ static void voice_process(MCPXAPUState *d,
     bin[6] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_V6BIN);
     bin[7] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_V7BIN);
 
-    if (v < MCPX_HW_MAX_3D_VOICES) {
+    /* DO NOT ROUTE INTO AN HRTF SUBMIX WHEN NO HRTF RUNS.
+     *
+     * Every voice below MCPX_HW_MAX_3D_VOICES -- i.e. every positional voice,
+     * i.e. every sound effect -- had its first four bin assignments replaced by
+     * d->vp.hrtf_submix[], discarding the routing the guest asked for. That is
+     * correct only if something downstream then performs HRTF and mixes those
+     * submixes down. Nothing does: .hrtf is false (apu_shim.h), and the GP and
+     * EP are stubs, so mcpx_apu_dsp_frame reads mixbins[0] and mixbins[1] and
+     * throws the other thirty away.
+     *
+     * MEASURED, one 200 s gameplay run, with the positive control moving:
+     *
+     *     [APU-BIN] 2D heard=380614 lost=0 | 3D heard=0 lost=375382
+     *               hrtf_submix=6,8,7,9 | lost by bin: 6,7,8,9,10
+     *
+     * Music is on 2D voices and lands in bins 0 and 1: 380,614 heard, none
+     * lost. Sound effects are the 3D voices: not one heard, 375,382 voice
+     * frames discarded, into bins 6 to 10. The samples were produced
+     * correctly and then dropped on the floor -- which is why every
+     * instrument upstream of here read healthy while the player heard no
+     * effects at all.
+     *
+     * Nothing could see it: dbg->bin[i] below is written and read by nothing,
+     * and no counter anywhere recorded which bin a voice landed in. Thirty of
+     * thirty-two bins were discarded every frame in silence.
+     *
+     * The override is inherited from upstream verbatim. Gating it is one line
+     * and restores the guest's own V0BIN..V3BIN, which is what the hardware
+     * would use with HRTF disabled. RECOMP_APU_HRTF_BINS=1 restores the old
+     * behaviour for an A/B. */
+    if (v < MCPX_HW_MAX_3D_VOICES && mcpx_apu_hrtf_bins()) {
         bin[0] = d->vp.hrtf_submix[0];
         bin[1] = d->vp.hrtf_submix[1];
         bin[2] = d->vp.hrtf_submix[2];
@@ -3486,12 +3845,56 @@ static void voice_process(MCPXAPUState *d,
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
-        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4) && mcpx_apu_hrtf_bins()) {
+            /* Only when the HRTF submix override is applied: with it off,
+             * bin[b] is the guest's own V0BIN..V3BIN and takes that bin's
+             * submix headroom like every other route. Gating this on the
+             * same switch also makes the [APU-BIN] hrtf= field mean the
+             * override, so an A/B on RECOMP_APU_HRTF_BINS can tell its arms
+             * apart -- before, it read "on" in both. */
+            g_bin_hrtf_on = 1;
             hr = (float)(1 << d->vp.hrtf_headroom);
         } else {
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        /* WHICH BIN, AND DOES ANYTHING READ IT.
+         *
+         * apu_dsp.c reads mixbins[0] and mixbins[1] and nothing else -- the GP
+         * and EP are stubs -- so thirty of the thirty-two bins are discarded
+         * every frame with no counter anywhere. And every voice below
+         * MCPX_HW_MAX_3D_VOICES has bin[0..3] overwritten with hrtf_submix[]
+         * a few lines above, unconditionally, even though .hrtf is false and
+         * the HRTF path never runs. Voices 0-63 are the positional ones, i.e.
+         * the sound effects; music sits on 2D voices in the 68-70 range and
+         * survives. That is the whole shape of "music plays, effects do not",
+         * and until now nothing could see it: the per-voice bin assignment is
+         * written to a debug struct that no code reads.
+         *
+         * heard_2d is the positive control. Music is audible, so it MUST move;
+         * if it reads zero the instrument is dead and lost_3d proves nothing.
+         *
+         * "AUDIBLE" MEANS "A BIN THE MIXDOWN SUMS", AND THAT IS NOW A SWITCH.
+         * With RECOMP_APU_MIXDOWN_ALL on, apu_dsp.c sums all 32 bins, so a
+         * voice routed to bin 6 is heard. This test used to hard-code bins 0
+         * and 1, so the first run after the widening reported 3D heard=0
+         * lost=343968 with the effects playing -- the instrument was scoring
+         * the old mixdown. It has to ask the mixdown what it reads. */
+        {
+            int audible = mcpx_apu_mixdown_all()
+                        || (bin[b] == 0 || bin[b] == 1);
+            int is3d = (v < MCPX_HW_MAX_3D_VOICES);
+            float amp = 0.0f;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float x = g * samples[i][b % channels];
+                if (x > amp) amp = x; else if (-x > amp) amp = -x;
+            }
+            if (amp > 0.0f) {
+                if (is3d) { if (audible) ++g_bin_heard_3d; else ++g_bin_lost_3d; }
+                else      { if (audible) ++g_bin_heard_2d; else ++g_bin_lost_2d; }
+                if (!audible && bin[b] < 32) ++g_bin_lost_hist[bin[b]];
+            }
+        }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
@@ -3818,8 +4221,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     && (g_idle_trap_reported[v >> 6] & (1ULL << (v & 63)))) {
                     g_idle_trap_edge_encounters++;
                     if (mcpx_apu_idle_trap_edge()) {
-                        g_idle_trap_edge_suppressed++;
-                        suppress = 1;
+                        unsigned k = mcpx_apu_idle_trap_rearm_subframes();
+                        if (k && ++g_idle_trap_edge_hold[v] >= k) {
+                            /* Still inactive-and-linked one guest tick after
+                             * we last said so: say it again. hold[] is reset
+                             * where the latch is set, below. */
+                            g_idle_trap_edge_reraise++;
+                        } else {
+                            g_idle_trap_edge_suppressed++;
+                            suppress = 1;
+                        }
                     }
                 }
 
@@ -3850,8 +4261,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     /* Latch: this voice has now been reported idle. Set
                      * whether or not the edge rule is enabled, so that the
                      * counters above measure it with the switch off. */
-                    if (v < MCPX_HW_MAX_VOICES)
+                    if (v < MCPX_HW_MAX_VOICES) {
                         g_idle_trap_reported[v >> 6] |= 1ULL << (v & 63);
+                        g_idle_trap_edge_hold[v] = 0;
+                    }
                     if (v < MCPX_HW_MAX_VOICES
                         && (g_apu_voice_in_cycle[v >> 6] & (1ULL << (v & 63))))
                         why |= IDLE_TRAP_WHY_CYCLE;
