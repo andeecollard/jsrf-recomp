@@ -3447,7 +3447,28 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    if(mtl_cb_stats())g_mtl_cbufs++;
   }
   if(mtl_cb_stats()){g_mtl_ns_create+=mtl_now_ns()-_t0;_t0=mtl_now_ns();}
-  Params p={0};p.width=s->clip_w;p.height=s->clip_h;p.dither=s->dither;p.untextured=s->untextured;p.combiner_count=s->combiner_count;p.texture_mask=s->texture_mask;p.add_specular=s->add_specular;p.alpha_test=s->alpha_test;p.alpha_ref=s->alpha_ref;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;{static int legacy=-1;if(legacy<0)legacy=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
+  Params p={0};p.width=s->clip_w;p.height=s->clip_h;p.dither=s->dither;p.untextured=s->untextured;p.combiner_count=s->combiner_count;p.texture_mask=s->texture_mask;p.add_specular=s->add_specular;p.alpha_test=s->alpha_test;p.alpha_ref=s->alpha_ref;
+  /* RECOMP_METAL_NO_ALPHA_TEST=1 -- A DIAGNOSTIC ARM, renders incorrectly.
+   *
+   * A wire fence is alpha-cutout geometry: a mesh texture whose holes are
+   * transparent. That matters for a defect we have measured elsewhere -- a
+   * triangle whose texture coordinate q is <= 0 after transform collapses to
+   * sampling ONE clamped corner texel across its whole area. On opaque
+   * geometry that is a flat-coloured object: wrong, but visible, and nobody
+   * files a bug. On a cutout texture, if that single texel sits in a hole its
+   * alpha is 0, every fragment fails the test, and the object DISAPPEARS.
+   * Transparency is what turns "slightly wrong" into "gone", which is why the
+   * fences are what the player notices.
+   *
+   * Forcing the test off distinguishes the two outcomes in one run without
+   * touching the MSL string (a subtly wrong shader expression compiles fine
+   * and outputs black; that has cost two broken builds here):
+   *   fence APPEARS, flat or garbage -> it is being alpha-discarded, and the
+   *                                     bug is upstream in the coordinate
+   *   fence STILL MISSING            -> the alpha test is not what hides it
+   * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
+  {static int noat=-1;if(noat<0)noat=recomp_switch_on("RECOMP_METAL_NO_ALPHA_TEST");
+   if(noat)p.alpha_test=0;}p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;{static int legacy=-1;if(legacy<0)legacy=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
    p.z_cull=legacy?0u:s->z_cull;}p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *

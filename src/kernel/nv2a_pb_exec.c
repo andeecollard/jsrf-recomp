@@ -2942,6 +2942,18 @@ static int prepare_vertices(void)
                 if(s_gpu.attr[9+unit].size)
                     fetch_vertex(9+unit,s_gpu.idx[i],s_outputs[i][NV2A_VSH_OUT_T0+unit]);
             }
+            /* Hand the executor's seen-table to the fixed-function unit.
+             * nv2a_ff.c needs to tell "the guest uploaded these sixteen zero
+             * words" from "nobody ever wrote this block and s_methods is
+             * still zero-initialised" -- and for a TEXTURE matrix those two
+             * differ by an entire batch of geometry: an unwritten matrix
+             * transforms every coordinate to (0,0,0,0), q becomes 0, and the
+             * sink drops every textured triangle with no counter naming the
+             * cause. Measured: TMAT0 reads all sixteen words zero in a
+             * gameplay run. The composite matrix two lines below has been
+             * gated on exactly this table since long before today; the
+             * texture matrices never were. */
+            nv2a_ff_method_seen = s_method_seen;
             if(s_method_seen[0x680/4] && s_method_seen[0x6bc/4]) {
                 float inputs[16][4];
                 memcpy(inputs,s_vsh.current,sizeof(inputs));
@@ -2949,6 +2961,69 @@ static int prepare_vertices(void)
                     if(!fetch_vertex(a,s_gpu.idx[i],inputs[a])) VSH_REJECT("fixed-function vertex fetch",a);
                 const char *reason=nv2a_ff_vertex(s_methods,inputs,s_outputs[i]);
                 if(reason) VSH_REJECT(reason,0);
+                /* RECOMP_FF_DUMP=1 -- READ-ONLY, answers two questions that
+                 * cannot be settled by argument, and both have a fix attached
+                 * that would WRECK THE PICTURE if the argument were taken on
+                 * trust.
+                 *
+                 * 1. IS THE VIEWPORT SCALE BAKED INTO THE COMPOSITE MATRIX?
+                 * nv2a_ff.c applies NV097_SET_VIEWPORT_OFFSET (0x0A20) and
+                 * never NV097_SET_VIEWPORT_SCALE (0x0AF0), which appears
+                 * nowhere in this tree. The guest programs VPSCL =
+                 * (320,-240,16777215,0). If the scale is genuinely missing,
+                 * 58.8% of gameplay draws collapse to a couple of pixels at
+                 * the screen centre -- and the picture plainly does not do
+                 * that, so D3D is probably folding it into the matrix it
+                 * uploads at 0x680. Applying the scale on top of a matrix that
+                 * already carries it multiplies the screen by 320 twice. Read
+                 * clip.x/clip.w: in [-1,1] the scale is missing; around
+                 * +/-320 it is already there. z and xy are independent
+                 * scales, so read clip.z/clip.w separately.
+                 *
+                 * 2. IS matrix() TRANSPOSED FOR THE TEXTURE MATRIX? It reads
+                 * the register block as M[row][col] and computes M*v, the
+                 * column-vector convention; a D3DMATRIX is row-major with
+                 * row-vector semantics, the transpose. On a texture matrix
+                 * that makes q come out of the TRANSLATION ROW -- a
+                 * data-dependent value that sometimes goes <= 0 -- instead of
+                 * the constant 1 a last-column read gives. That fits the
+                 * measured rejection rate, which is sparse (0.002%) rather
+                 * than uniform. Read TMAT0: last ROW (0,0,0,1) means matrix()
+                 * is right; last COLUMN (0,0,0,1) means it is transposed.
+                 *
+                 * First transformed vertex of the run only, so it costs one
+                 * printf and cannot perturb what it measures. */
+                {
+                    static int ff_dump = -1, ff_shown;
+                    if (ff_dump < 0) ff_dump = recomp_switch_on("RECOMP_FF_DUMP");
+                    if (ff_dump && !ff_shown++) {
+                        const float *cm = (const float *)&s_methods[0x680/4];
+                        const float *tm = (const float *)&s_methods[0x6c0/4];
+                        const float *vs = (const float *)&s_methods[0x0af0/4];
+                        const float *vo = (const float *)&s_methods[0x0a20/4];
+                        fprintf(stderr,
+                            "  [FF-DUMP] VPSCL=(%.3f %.3f %.3f %.3f) seen=%d"
+                            "  VPOFF=(%.3f %.3f %.3f %.3f) seen=%d\n",
+                            vs[0],vs[1],vs[2],vs[3], s_method_seen[0x0af0/4],
+                            vo[0],vo[1],vo[2],vo[3], s_method_seen[0x0a20/4]);
+                        for (int r = 0; r < 4; ++r)
+                            fprintf(stderr, "  [FF-DUMP] CMAT row%d = %12.4f %12.4f"
+                                    " %12.4f %12.4f\n", r,
+                                    cm[r*4+0],cm[r*4+1],cm[r*4+2],cm[r*4+3]);
+                        for (int r = 0; r < 4; ++r)
+                            fprintf(stderr, "  [FF-DUMP] TMAT0 row%d = %12.4f %12.4f"
+                                    " %12.4f %12.4f\n", r,
+                                    tm[r*4+0],tm[r*4+1],tm[r*4+2],tm[r*4+3]);
+                        fprintf(stderr,
+                            "  [FF-DUMP] in=(%.4f %.4f %.4f %.4f) -> out=(%.4f"
+                            " %.4f %.4f %.4f)  surface %ux%u\n",
+                            inputs[0][0],inputs[0][1],inputs[0][2],inputs[0][3],
+                            s_outputs[i][0][0],s_outputs[i][0][1],
+                            s_outputs[i][0][2],s_outputs[i][0][3],
+                            s_gpu.clip_w, s_gpu.clip_h);
+                        fflush(stderr);
+                    }
+                }
                 memcpy(s_positions[i],s_outputs[i][0],sizeof(s_positions[i]));
                 s_colors[i]=pack_color(s_outputs[i][3]);
             }
