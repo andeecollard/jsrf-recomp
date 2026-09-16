@@ -3,6 +3,7 @@
 #include "nv2a_metal.h"
 #include "../recomp_switch.h"
 #include "nv2a_metal_state.h"
+#include "nv2a_vsh.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -752,6 +753,223 @@ static NSString *const shader =
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}o.color=float4(c.rgb,s.depth_write?zn:dst.a);if(s.stencil_test)o.stencil=stupd(stencil,s.stencil_zpass,s);return o;}\n";
 
+/* ===== THE GUEST'S VERTEX PROGRAM, ON THE GPU ==========================
+ *
+ * WHY. Measured at gameplay on 16 Sep 2026 with RECOMP_VSH_SPLIT, over
+ * 206,203,274 vertices in one run: fetching the guest's attributes out of RAM
+ * costs 8.25 s and RUNNING ITS PROGRAM costs 77.19 s. Execution is 89% of the
+ * vertex stage, and the vertex stage is the largest item left in the frame at
+ * about 10.7 ms of 26.3. Moving execution to the GPU is the whole remaining
+ * distance to 60 fps; moving the fetch as well would buy a ninth of it for a
+ * great deal more risk, so the CPU keeps fetching and this runs the program.
+ *
+ * WHAT MAKES IT BELIEVABLE. nv2a_vsh_msl.c emits MSL for these programs and
+ * had never been executed until vsh_msl_diff_test.m dispatched it on a device
+ * against nv2a_vsh_execute over the 126 programs read out of the title's own
+ * default.xbe: 8064 vectors, 0 residual disagreements, with an injected-fault
+ * control that still reports 64 of 64. It found three real defects doing it,
+ * including one where a zero normal produced a NaN that reached oPos and
+ * deleted the triangle.
+ *
+ * THE ONE HAZARD THAT WOULD CORRUPT GEOMETRY SILENTLY, and why it is handled
+ * the way it is. The emitter's VS_OUT is not the Out that fs, fs_hw and
+ * fs_hw_blend consume -- different field count, different order -- and a
+ * vertex function in one MTLLibrary feeding a fragment function in another
+ * matches by position. Getting that wrong does not fail to compile; it draws
+ * the wrong thing. So the program is compiled INTO THE SAME LIBRARY as the
+ * fragment tails, its entry point is rewritten to a plain function, and a
+ * wrapper repacks VS_OUT into Out explicitly, field by field. One library per
+ * program costs recompiling the shared source 126 times across a session;
+ * that is a first-use hitch, not a per-frame cost, and correctness first. */
+static int vsh_gpu_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_VSH"); return on; }
+/* Both are defined below; this block sits above them because the program cache
+ * has to be declared before nv2a_metal_draw, which is above them too. */
+static int hw_state_on(void);
+static int initialize(void);
+
+typedef struct { float f[4]; } float4v;
+#define VSH_CACHE 192
+typedef struct {
+    uint32_t words[NV2A_VS_MAX_INSTRUCTIONS][4];
+    int length;
+    uint32_t hash;
+    uint16_t inputs;
+    unsigned nattrs;
+    id<MTLLibrary> library;
+    id<MTLFunction> fn;
+    int refused;            /* the emitter or the compiler said no; never retry */
+} VshSlot;
+static VshSlot vsh_slot[VSH_CACHE];
+static unsigned vsh_slot_n;
+static VshSlot *vsh_active;          /* the program this draw will use, or NULL */
+static const float (*vsh_constants)[4];
+static uint64_t g_vsh_gpu_draws, g_vsh_cpu_draws, g_vsh_compiles, g_vsh_hits;
+static uint64_t g_vsh_refused_emit, g_vsh_refused_compile, g_vsh_cache_full;
+static uint64_t g_vsh_gpu_vertices;
+
+static uint32_t vsh_hash(const uint32_t (*w)[4], int len)
+{   /* FNV-1a over the words. The hash is a FAST REJECT ONLY -- every candidate
+     * is confirmed with a full word compare below, because a cache that hands
+     * a draw the wrong vertex program produces wrong geometry and no error
+     * anywhere. trace_selected_program() has identified programs by a 32-bit
+     * hash for months without a collision, which is not the same fact. */
+    uint32_t h = 2166136261u; int i, k;
+    for (i = 0; i < len; ++i) for (k = 0; k < 4; ++k) {
+        h ^= w[i][k]; h *= 16777619u;
+    }
+    return h;
+}
+
+/* Rewrite the emitted program so it can live beside the fragment tails.
+ *
+ * Three textual changes, all of them structural rather than cosmetic:
+ *   - the entry point becomes a plain function, because MSL cannot call a
+ *     `vertex` function and the wrapper has to call it;
+ *   - [[stage_in]] becomes an indexed read out of a plain buffer, so this path
+ *     needs no MTLVertexDescriptor and no drawIndexedPrimitives -- it keeps
+ *     the index-in-the-shader shape the existing `vs` already uses and that
+ *     the rest of nv2a_metal_draw is built around;
+ *   - a wrapper repacks VS_OUT into Out field by field.
+ * Returns 0 if the emitted text is not the shape this expects, which is a
+ * refusal and not a guess. */
+static int vsh_wrap(const char *src, uint16_t inputs, unsigned nattrs,
+                    char *out, size_t outsize)
+{
+    const char *sig_in  = "vertex VS_OUT vsh_main(VS_IN input [[stage_in]],\n"
+                          "                      constant float4 *c [[buffer(1)]],\n"
+                          "                      constant VSH_Viewport &viewport [[buffer(2)]]) {\n";
+    const char *sig_non = "vertex VS_OUT vsh_main(constant float4 *c [[buffer(1)]],\n"
+                          "                      constant VSH_Viewport &viewport [[buffer(2)]]) {\n";
+    const char *sig = inputs ? sig_in : sig_non;
+    const char *at = strstr(src, sig);
+    size_t used = 0; unsigned i, slot = 0;
+    if (!at) return 0;
+    /* head, then the rewritten signature */
+    used = (size_t)(at - src);
+    if (used + 4096 > outsize) return 0;
+    memcpy(out, src, used);
+    used += (size_t)snprintf(out + used, outsize - used,
+        "static VS_OUT vsh_body(const device float4 *raw, uint base,\n"
+        "                       constant float4 *c,\n"
+        "                       constant VSH_Viewport &viewport) {\n");
+    /* body, with the stage_in aliases replaced */
+    {
+        const char *body = at + strlen(sig);
+        size_t blen = strlen(body);
+        if (used + blen + 4096 > outsize) return 0;
+        memcpy(out + used, body, blen); out[used + blen] = 0;
+        for (i = 0; i < NV2A_VS_MAX_INPUTS; ++i) {
+            char from[64], to[64], *hit;
+            if (!(inputs & (1u << i))) continue;
+            snprintf(from, sizeof from, "    float4 v%u = input.v%u;\n", i, i);
+            snprintf(to,   sizeof to,   "    float4 v%u = raw[base + %u];\n", i, slot++);
+            hit = strstr(out + used, from);
+            if (!hit) return 0;
+            memmove(hit + strlen(to), hit + strlen(from),
+                    strlen(hit + strlen(from)) + 1);
+            memcpy(hit, to, strlen(to));
+        }
+        used += strlen(out + used);
+    }
+    /* the wrapper. `Out` and the index buffer are the existing pipeline's, so
+     * everything downstream of the vertex stage is untouched. */
+    used += (size_t)snprintf(out + used, outsize - used,
+        "\nvertex Out vs_gpu(uint id [[vertex_id]],\n"
+        "                  const device float4 *raw [[buffer(0)]],\n"
+        "                  constant float4 *c [[buffer(1)]],\n"
+        "                  constant VSH_Viewport &vp [[buffer(2)]],\n"
+        "                  const device uint *indices [[buffer(3)]]) {\n"
+        "  VS_OUT o = vsh_body(raw, indices[id] * %uu, c, vp);\n"
+        "  Out r; r.p=o.oPos; r.d0=o.oD0; r.d1=o.oD1;\n"
+        "  r.t0=o.oT0; r.t1=o.oT1; r.t2=o.oT2; r.t3=o.oT3;\n"
+        "  return r;\n}\n", nattrs ? nattrs : 1u);
+    return used < outsize;
+}
+
+/* Find or build the MTLFunction for this program. Called from the executor
+ * BEFORE it decides whether to run the interpreter, so a refusal here is a
+ * clean CPU draw rather than a half-transformed batch. */
+static VshSlot *vsh_lookup(const uint32_t (*words)[4], int length,
+                           uint16_t inputs)
+{
+    uint32_t h = vsh_hash(words, length);
+    unsigned i, n;
+    for (i = 0; i < vsh_slot_n; ++i) {
+        VshSlot *v = &vsh_slot[i];
+        if (v->hash != h || v->length != length || v->inputs != inputs) continue;
+        if (memcmp(v->words, words, (size_t)length * 16)) continue;   /* full compare */
+        ++g_vsh_hits;
+        return v->refused ? NULL : v;
+    }
+    if (vsh_slot_n >= VSH_CACHE) { ++g_vsh_cache_full; return NULL; }
+    if (length <= 0 || length > NV2A_VS_MAX_INSTRUCTIONS) return NULL;
+
+    {   /* Build it. Everything below happens once per distinct program. */
+        VshSlot *v = &vsh_slot[vsh_slot_n++];
+        NV2AVshProgram prog;
+        char *emitted = malloc(262144), *wrapped = malloc(524288);
+        memcpy(v->words, words, (size_t)length * 16);
+        v->length = length; v->hash = h; v->inputs = inputs;
+        for (n = 0, i = 0; i < NV2A_VS_MAX_INPUTS; ++i)
+            if (inputs & (1u << i)) ++n;
+        v->nattrs = n;
+        v->refused = 1;                    /* until proven otherwise */
+        if (!emitted || !wrapped) { free(emitted); free(wrapped); return NULL; }
+        nv2a_vsh_parse(words, length, &prog);
+        if (!prog.valid || !nv2a_vsh_generate_msl(&prog, emitted, 262144)
+            || !vsh_wrap(emitted, inputs, v->nattrs, wrapped, 524288)) {
+            ++g_vsh_refused_emit; free(emitted); free(wrapped); return NULL;
+        }
+        @autoreleasepool {
+            /* The program is appended to the SHARED source, so vs_gpu and the
+             * fragment tails come out of one library and Out means the same
+             * type on both sides of the stage boundary. */
+            NSString *whole = [shader stringByAppendingString:
+                                 [NSString stringWithUTF8String:wrapped]];
+            NSError *err = nil;
+            MTLCompileOptions *opt = [MTLCompileOptions new];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            /* SAFE MATH, not the default, and not a style preference: the
+             * differential test measured this emitter against the interpreter
+             * under safe math only. Under fast math rsqrt, pow and the
+             * reciprocals are different functions and that result does not
+             * transfer. */
+            if (@available(macOS 15.0,*)) opt.mathMode = MTLMathModeSafe;
+            else opt.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+            v->library = [device newLibraryWithSource:whole
+                          options:opt error:&err];
+            if (!v->library) {
+                static int told;
+                if (!told++) fprintf(stderr,
+                    "[METAL] vsh compile failed: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(no error)");
+                ++g_vsh_refused_compile;
+            } else {
+                v->fn = [v->library newFunctionWithName:@"vs_gpu"];
+                if (v->fn) { v->refused = 0; ++g_vsh_compiles; }
+                else ++g_vsh_refused_compile;
+            }
+        }
+        free(emitted); free(wrapped);
+        return v->refused ? NULL : v;
+    }
+}
+
+int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
+                         uint16_t inputs_read)
+{
+    if (!vsh_gpu_on() || !hw_state_on()) return 0;
+    if (!initialize()) return 0;
+    vsh_active = vsh_lookup(words, length, inputs_read);
+    return vsh_active != NULL;
+}
+
+void nv2a_metal_vsh_constants(const float (*c)[4]) { vsh_constants = c; }
+void nv2a_metal_vsh_clear(void) { vsh_active = NULL; }
+
 static int initialize(void)
 {
     pthread_mutex_lock(&initialization_mutex);
@@ -1183,6 +1401,76 @@ int nv2a_metal_shader_blend_on(void)
 static struct { uint32_t blend,src,dst,sblend; id<MTLRenderPipelineState> pso; }
     hw_pso[HW_CACHE];
 static unsigned hw_pso_n;
+
+/* A pipeline for a generated vertex program.
+ *
+ * Same shape as hw_pipeline_for -- fixed array, linear scan, refuse when full,
+ * never evict -- with the program added to the key, because two draws with
+ * identical blend state and different programs need different pipelines and a
+ * key that cannot tell them apart hands one of them the other's geometry.
+ * Sized from the same census as the program cache: 126 programs in the image,
+ * a handful of blend states, and a refusal is a counted CPU draw rather than a
+ * stall, so a generous fixed size costs pointers and nothing else. */
+#define VSH_PSO_CACHE 256
+static struct { const void *fn; uint32_t blend,src,dst,sblend;
+                id<MTLRenderPipelineState> pso; } vsh_pso[VSH_PSO_CACHE];
+static unsigned vsh_pso_n;
+static uint64_t g_vsh_pso_full;
+
+static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
+                                                   VshSlot *prog)
+{
+    uint32_t sblend = (uint32_t)hw_shader_blend(s);
+    unsigned i;
+    for (i = 0; i < vsh_pso_n; ++i)
+        if (vsh_pso[i].fn == (__bridge const void *)prog->fn
+            && vsh_pso[i].blend == s->blend && vsh_pso[i].src == s->blend_src
+            && vsh_pso[i].dst == s->blend_dst && vsh_pso[i].sblend == sblend)
+            return vsh_pso[i].pso;
+    if (vsh_pso_n >= VSH_PSO_CACHE) { ++g_vsh_pso_full; return nil; }
+    {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        id<MTLRenderPipelineState> pso; NSError *err = nil;
+        int sf = MTLBlendFactorOne, df = MTLBlendFactorZero;
+        if (s->blend) {
+            if (!nv2a_texture_copy_blend_factor_supported(s->blend_src)
+             || !nv2a_texture_copy_blend_factor_supported(s->blend_dst)) return nil;
+            sf = nv2a_metal_blend_factor(s->blend_src);
+            df = nv2a_metal_blend_factor(s->blend_dst);
+            if (sf < 0 || df < 0) return nil;
+        }
+        d.vertexFunction = prog->fn;
+        /* THE FRAGMENT FUNCTION COMES OUT OF THE PROGRAM'S OWN LIBRARY, not
+         * the shared one. Both libraries contain a function of that name
+         * compiled from identical text, but `Out` is a distinct type per
+         * library and a pipeline that straddles them matches its stage_in by
+         * position rather than by name. Taking both halves from one library is
+         * what makes the repacking wrapper sound. */
+        d.fragmentFunction = [prog->library newFunctionWithName:
+                                sblend ? @"fs_hw_blend" : @"fs_hw"];
+        if (!d.fragmentFunction) return nil;
+        d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
+                                                        : MTLPixelFormatRGBA32Float;
+        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+        if (s->blend && !sblend) {
+            d.colorAttachments[0].blendingEnabled = YES;
+            d.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            d.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+            d.colorAttachments[0].sourceRGBBlendFactor = (MTLBlendFactor)sf;
+            d.colorAttachments[0].destinationRGBBlendFactor = (MTLBlendFactor)df;
+            d.colorAttachments[0].sourceAlphaBlendFactor = (MTLBlendFactor)sf;
+            d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
+        }
+        pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!pso) { ++g_hw_state_refusals; return nil; }
+        vsh_pso[vsh_pso_n].fn = (__bridge const void *)prog->fn;
+        vsh_pso[vsh_pso_n].blend = s->blend; vsh_pso[vsh_pso_n].src = s->blend_src;
+        vsh_pso[vsh_pso_n].dst = s->blend_dst; vsh_pso[vsh_pso_n].sblend = sblend;
+        vsh_pso[vsh_pso_n].pso = pso; ++vsh_pso_n;
+        return pso;
+    }
+}
 
 static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
 {
@@ -1771,6 +2059,26 @@ void nv2a_metal_report(void)
             (unsigned long long)g_clear_color_calls,
             (unsigned long long)g_resident_depth_clears,
             (unsigned long long)g_clear_depth_calls);
+    /* THE ARM NAMES ITSELF, in both states, because ab_score.py can only check
+     * a switch that does. gpu draws moving while vertices stays at zero would
+     * mean the counter is on the wrong side of the branch, which is why both
+     * are printed. */
+    fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
+            vsh_gpu_on()?"guest programs on the GPU":"CPU interpreter",
+            vsh_gpu_on()?"on":"OFF");
+    fprintf(stderr,"[METAL] vsh draws: %llu GPU, %llu CPU; %llu vertices on the"
+            " GPU\n",
+            (unsigned long long)g_vsh_gpu_draws,
+            (unsigned long long)g_vsh_cpu_draws,
+            (unsigned long long)g_vsh_gpu_vertices);
+    fprintf(stderr,"[METAL] vsh programs: %llu compiled, %llu cache hits,"
+            " refused: %llu emitter, %llu compiler, %llu cache full,"
+            " %llu pipeline cache full\n",
+            (unsigned long long)g_vsh_compiles, (unsigned long long)g_vsh_hits,
+            (unsigned long long)g_vsh_refused_emit,
+            (unsigned long long)g_vsh_refused_compile,
+            (unsigned long long)g_vsh_cache_full,
+            (unsigned long long)g_vsh_pso_full);
     fprintf(stderr,"[METAL] unbound-surface clears: %llu served from the cache,"
             " %llu slot write-backs (%llu skipped)\n",
             (unsigned long long)g_resident_unbound_clears,
@@ -2494,8 +2802,25 @@ static int vertex_valid(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned 
 static int vertex_why(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned i)
 {for(unsigned k=0;k<4;k++)if(!isfinite(v[i][0][k])||!isfinite(v[i][3][k])||!isfinite(v[i][4][k]))return 1;
  for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){for(unsigned k=0;k<4;k++)if(!isfinite(v[i][9+u][k]))return 2;if(v[i][9+u][3]<=0)return 2;}return 0;}
+/* CULLING NEEDS THE TRANSFORMED POSITION, WHICH IS THE THING THAT MOVED.
+ *
+ * Everything below reads v[i][0] as a SCREEN-SPACE position: area() takes its
+ * winding, front_facing() takes the w components, vertex_valid() tests the
+ * transformed texture coordinates. With the guest's program running on the GPU
+ * that slot holds attribute 0 -- an object-space position -- and every one of
+ * those tests is then computing on the wrong numbers. It does not fail loudly;
+ * it culls the wrong faces, which is a character rendered as a silhouette.
+ *
+ * So on that path the CPU emits the indices and the GPU does the culling,
+ * through setCullMode and setFrontFacingWinding at the encoder. That is where
+ * it belongs anyway: Metal decides facing after the perspective divide, where
+ * the NV2A's own rule needs winding_flipped() to patch up triangles straddling
+ * the camera plane -- a correction this tree's own header calls an open
+ * question and whose obvious sign fix is recorded as WRONG. */
+static int vsh_gpu_culling;
 static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out,unsigned*n,unsigned a,unsigned b,unsigned c)
-{int audit=clip_audit_on();if(audit){++audit_asm_total;
+{if(vsh_gpu_culling){out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;return;}
+ int audit=clip_audit_on();if(audit){++audit_asm_total;
     switch(s->cull_face){case 0:++audit_cull_none;break;case 0x404:++audit_cull_front;break;
     case 0x405:++audit_cull_back;break;case 0x408:++audit_cull_both;break;
     default:++audit_cull_other;}
@@ -2826,6 +3151,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  if((uint64_t)s->target_pitch*s->clip_h>target_size)return reject("target-bounds");
  if((s->depth_test||s->stencil_test)&&(!depth||s->depth_pitch<(uint64_t)s->clip_w*4||(uint64_t)s->depth_pitch*s->clip_h>depth_size))return reject("depth-bounds");
  unsigned indices[12288],n=0;
+ /* Set BEFORE assembly, because triangle() is what reads it. The same
+  * predicate as vsh_gpu_active below, minus the parts that depend on state
+  * this function has not reached yet; if either of those later refuses, the
+  * draw is rejected rather than drawn with the wrong culling. */
+ vsh_gpu_culling = vsh_gpu_on() && vsh_active && hw_state_on() && vsh_constants;
+ if(vsh_gpu_culling && s->cull_face==0x408){reject_reason=NULL;return 0;}
  switch(primitive){case 5:for(unsigned i=0;i+2<count;i+=3)triangle(s,vertices,indices,&n,i,i+1,i+2);break;
  case 6:for(unsigned i=0;i+2<count;i++)triangle(s,vertices,indices,&n,i+(i&1),i+1-(i&1),i+2);break;
  case 7:for(unsigned i=1;i+1<count;i++)triangle(s,vertices,indices,&n,0,i,i+1);break;
@@ -2865,7 +3196,17 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * both the vertices and, when they are too big to inline too, the indices.
    * The private-allocation path is kept as the fallback for a ring that could
    * not allocate, because a slow correct draw beats a rejected one. */
-  Vertex small_vertices[36];size_t vertex_bytes=count*sizeof(Vertex),index_bytes=n*sizeof(indices[0]);
+  /* A program applies only if the executor asked for one for THIS draw and the
+   * hardware tail is in play. vsh_active is cleared by the executor for every
+   * draw that did not go through nv2a_metal_vsh_ready, so a stale program can
+   * never be applied to somebody else's vertices. */
+  int vsh_gpu_active = vsh_gpu_on() && vsh_active && hw_state_on()
+                       && vsh_constants;
+  Vertex small_vertices[36];
+  size_t vertex_bytes = vsh_gpu_active
+      ? (size_t)count * vsh_active->nattrs * 16
+      : count*sizeof(Vertex);
+  size_t index_bytes=n*sizeof(indices[0]);
   int want_vb=vertex_bytes>sizeof(small_vertices),want_ib=index_bytes>4096;
   id<MTLBuffer>vb=nil,ib=nil;size_t vb_offset=0,ib_offset=0;Vertex*v=small_vertices;
   void*ib_cpu=NULL;int pinned_slab=-1;
@@ -2889,6 +3230,20 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    int active=(s->texture_mask&(1u<<u))!=0;const NV2ATextureCopy*t=u&&active?&s->extra_stages[u-1]:s;
    const uint8_t*data=active?(u?s->extra_texture[u-1]:texture):NULL;size_t bytes=active?nv2a_texture_copy_texture_bytes(t):0;
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
+  /* WHAT `vertices` HOLDS DEPENDS ON WHO IS GOING TO RUN THE PROGRAM.
+   *
+   * On the CPU path it is the program's OUTPUTS -- position, two colours, four
+   * texture coordinates -- and the seven float4 the fixed `vs` wants are
+   * copied out of it. With a program active it is the program's INPUTS, and
+   * only the attributes the program actually reads are uploaded, packed in
+   * ascending attribute order, because uploading all sixteen would more than
+   * double this path's bandwidth for slots the shader never names. */
+  if(vsh_gpu_active){
+   float4v *raw=(float4v*)v;
+   for(unsigned i=0;i<count;i++){unsigned slot=0;
+    for(unsigned a=0;a<16;a++) if(vsh_active->inputs&(1u<<a))
+     memcpy(raw[i*vsh_active->nattrs+slot++].f,vertices[i][a],16);}
+  } else
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
   if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
    ++surface_uploads;if(!nv2a_metal_sync())return reject("surface-sync");
@@ -2971,7 +3326,16 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * Chosen per draw rather than per surface because a state this path cannot
    * translate falls back, and a fallback draw needs the old descriptor. */
   int hw = hw_state_on() && hw_depth_tex && hw_stencil_tex;
-  id<MTLRenderPipelineState> hw_pso_use = hw ? hw_pipeline_for(s) : nil;
+  /* A generated program has its own vertex function, so it needs its own
+   * pipeline; hw_pipeline_for's cache is keyed on blend state alone and would
+   * hand this draw the fixed `vs`. A program that cannot get a pipeline is a
+   * CPU draw, not a wrong one -- but the executor has already skipped the
+   * interpreter by then, so this refuses the DRAW rather than silently using
+   * the wrong vertex stage. */
+  if (vsh_gpu_active && !hw) { vsh_gpu_active = 0; vsh_active = NULL; }
+  id<MTLRenderPipelineState> hw_pso_use =
+      vsh_gpu_active ? vsh_pipeline_for(s, vsh_active)
+                     : (hw ? hw_pipeline_for(s) : nil);
   id<MTLDepthStencilState> hw_dss_use = hw ? hw_depth_state_for(s) : nil;
   /* DEPTH OWNERSHIP IS EXCLUSIVE, so there is no "fall back for this draw".
    *
@@ -3089,7 +3453,44 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
           * paths. */
          [encoder setDepthClipMode:MTLDepthClipModeClamp];
          [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;}
-  else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];[encoder setVertexBytes:&p length:sizeof(p) atIndex:1];if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];else[encoder setVertexBytes:indices length:index_bytes atIndex:2];[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+  else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];
+  /* THE TWO PIPELINES HAVE INCOMPATIBLE VERTEX BINDINGS AND THE ENCODER MUST
+   * NOT SET BOTH. The fixed `vs` reads Params at vertex 1 and the indices at
+   * 2; vs_gpu reads the guest's 192 float4 constant file at 1, the viewport at
+   * 2 and the indices at 3. Getting this wrong does not fail -- the shader
+   * reads whatever is bound and draws geometry from it. Params stays at
+   * FRAGMENT 1 in both, which is a separate namespace and is untouched. */
+  if(vsh_gpu_active){
+   /* THE GPU DOES THE CULLING NOW. NV097_SET_CULL_FACE is 0x404 front, 0x405
+    * back, 0x408 both; front_cw says which winding the guest calls front.
+    * 0x408 has no Metal equivalent -- MTLCullMode has no "cull everything" --
+    * and the draw is simply skipped, which is what culling both faces means.
+    *
+    * THE WINDING SENSE IS NOT DERIVED, IT IS MEASURED. The guest's area is
+    * taken in screen space with Y down; the emitted vertex program hands Metal
+    * a clip position, and whether the screen-to-clip step flips the sign of a
+    * triangle's winding is exactly the kind of thing this project has got
+    * wrong from reading before -- the B5G6R5 channel order cost a measurement
+    * that way. RECOMP_METAL_VSH_WINDING=1 flips it, so one binary settles it
+    * by eye in two runs instead of an argument. */
+   {static int flip=-1; if(flip<0) flip=recomp_switch_on("RECOMP_METAL_VSH_WINDING");
+    int cw = s->front_cw ? 1 : 0; if(flip) cw = !cw;
+    [encoder setFrontFacingWinding:cw?MTLWindingClockwise:MTLWindingCounterClockwise];
+    [encoder setCullMode:s->cull_face==0x404?MTLCullModeFront
+                        :s->cull_face==0x405?MTLCullModeBack:MTLCullModeNone];}
+   [encoder setVertexBytes:vsh_constants length:192*16 atIndex:1];
+   {struct { float width, height, depth; } vp =
+      { (float)s->clip_w, (float)s->clip_h, 16777215.0f };
+    [encoder setVertexBytes:&vp length:sizeof vp atIndex:2];}
+   if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:3];
+   else  [encoder setVertexBytes:indices length:index_bytes atIndex:3];
+   ++g_vsh_gpu_draws; g_vsh_gpu_vertices += count;
+  } else {
+   [encoder setVertexBytes:&p length:sizeof(p) atIndex:1];
+   if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];
+   else  [encoder setVertexBytes:indices length:index_bytes atIndex:2];
+   ++g_vsh_cpu_draws;
+  }[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
   if(batch_on()){
    if(pinned_slab>=0)batch_pins|=1u<<(unsigned)pinned_slab;
    ++batch_draws;

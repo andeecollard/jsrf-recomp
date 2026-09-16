@@ -42,6 +42,18 @@ int nv2a_metal_shader_blend_on(void);
  * dither flags it answers whether that draw takes fs_hw_blend, which is the
  * tail that reads colour(0) under raster_order_group(0). The invariant the fix
  * rests on is that the DEFAULT mode answers 1 for every draw. */
+/* The guest's vertex program, on the GPU. RECOMP_METAL_VSH.
+ *
+ * nv2a_metal_vsh_ready() is asked BEFORE the executor decides whether to run
+ * the CPU interpreter: it returns 1 only if this exact program has, or can be
+ * given, an MTLFunction. A 0 is a clean CPU draw. The executor then passes the
+ * program's INPUTS in the array it would otherwise fill with outputs.
+ * nv2a_metal_vsh_clear() must be called for any draw that did not go through
+ * ready(), so a stale program cannot be applied to somebody else's vertices. */
+int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
+                         uint16_t inputs_read);
+void nv2a_metal_vsh_constants(const float (*c)[4]);
+void nv2a_metal_vsh_clear(void);
 int nv2a_metal_shader_blend_mode(void);
 int nv2a_metal_shader_blend_for(int mode, int blend, int dither);
 /* Stable diagnostic label for the most recent -1 result. */

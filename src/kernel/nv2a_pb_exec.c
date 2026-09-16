@@ -2562,6 +2562,32 @@ static int prepare_vertices(void)
      * destabilising the title, and this sits in the hottest loop there is.
      * O(n) with an 8 KB bitmap cleared by re-walking the same indices, so no
      * 64 K memset per batch. */
+    /* CAN THE GPU RUN THIS PROGRAM? Asked once per batch, before the loop, and
+     * the answer decides what the loop writes into s_outputs: the program's
+     * OUTPUTS as always, or its INPUTS for the GPU to transform.
+     *
+     * The order matters. The backend is asked FIRST and the interpreter is
+     * skipped only on a yes, so a program the backend cannot express is a
+     * clean CPU batch rather than a half-transformed one. Everything that can
+     * say no -- the switch, the hardware tail, an emitter refusal, a compile
+     * failure, a full cache -- says it here, before any vertex is touched.
+     *
+     * nv2a_metal_vsh_clear() on the no path is not belt and braces: the
+     * backend keeps the selected program in a static, and a stale one applied
+     * to the next batch's vertices would transform them with the wrong
+     * program and draw it without an error anywhere. */
+    int gpu_vsh = 0;
+#if defined(__APPLE__) && NV2A_GPU_PATH
+    if (programmable && s_vsh.decoded.valid && s_vsh.decoded.length > 0) {
+        gpu_vsh = nv2a_metal_vsh_ready(
+                      (const uint32_t (*)[4])s_vsh.words[s_vsh.start],
+                      s_vsh.decoded.length, s_vsh.decoded.inputs_read);
+        if (gpu_vsh) nv2a_metal_vsh_constants(s_vsh.constants);
+        else nv2a_metal_vsh_clear();
+    } else {
+        nv2a_metal_vsh_clear();
+    }
+#endif
     if (vsh_reuse_stats()) {
         static uint8_t seen[65536 / 8];
         uint32_t uniq = 0, i;
@@ -2660,6 +2686,16 @@ static int prepare_vertices(void)
             }
             if (i == 0 && (s_vsh.batches < 4 || s_vsh.batches == vsh_sample_batch()))
                 trace_vertex_inputs(inputs);
+            /* THE GPU PATH STOPS HERE. s_outputs carries the program's inputs
+             * instead of its outputs, and the backend knows which because it
+             * was asked above. The screen-space snap and the clip transform
+             * that follow on the CPU path are both emitted into the generated
+             * vertex function, so nothing downstream of this is skipped -- it
+             * moves. */
+            if (gpu_vsh) {
+                memcpy(s_outputs[i], inputs, sizeof(s_outputs[i]));
+                continue;
+            }
             if (!nv2a_vsh_execute(&s_vsh.decoded, inputs, s_vsh.constants, &result))
                 VSH_REJECT("shader execution failed", s_vsh.decoded.length);
             if ((result.written[0] & 12) != 12)

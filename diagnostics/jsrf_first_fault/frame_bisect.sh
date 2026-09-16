@@ -117,6 +117,7 @@ arm_env() {
     RECOMP_METAL_DRAIN=0
     RECOMP_METAL_READBACK_AUDIT=0
     RECOMP_METAL_FENCE=0
+    RECOMP_METAL_VSH=0
     case "$1" in
         sw)           ;;
         mode1)        RECOMP_METAL_HW=1; RECOMP_METAL_SHADER_BLEND=1 ;;
@@ -143,6 +144,7 @@ arm_env() {
         rbaudit)      RECOMP_METAL_HW=1; RECOMP_METAL_READBACK_AUDIT=1 ;;
         fence)        RECOMP_METAL_HW=1; RECOMP_METAL_FENCE=1 ;;
         fence-sw)     RECOMP_METAL_FENCE=1 ;;
+        gpuvsh)       RECOMP_METAL_HW=1; RECOMP_METAL_VSH=1 ;;
         *) echo "unknown arm: $1" >&2; return 1 ;;
     esac
     export RECOMP_METAL_HW RECOMP_METAL_HW_DEPTH_ALWAYS RECOMP_METAL_HW_NO_STENCIL
@@ -165,6 +167,7 @@ arm_env() {
     export RECOMP_METAL_CB_STATS RECOMP_METAL_CB_GPU
     export RECOMP_METAL_DRAIN RECOMP_METAL_READBACK_AUDIT
     export RECOMP_METAL_FENCE
+    export RECOMP_METAL_VSH
 }
 
 for ARM in "$@"; do
