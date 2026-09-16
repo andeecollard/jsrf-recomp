@@ -73,6 +73,37 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 NAME="${1:?usage: play_scripted.sh <outname> <schedule|@file> [seconds]}"
 SCHED="${2:?usage: play_scripted.sh <outname> <schedule|@file> [seconds]}"
 LIMIT="${3:-240}"
+
+# THE SCENE INSTRUMENT IS NOW ON BY DEFAULT, and the reason is a measurement.
+#
+# It used to be opt-in because "this title punishes instrumentation weight".
+# That is true of the heavy probes (RECOMP_PAD_TRACE / SEQ_TRACE /
+# FUNC_HIT_TRACE, see the header) but it was never measured for the 100 Hz
+# CActSequence sampler alone. It has been now, over the 149 full-length runs of
+# gameplay_nobarrage.pad under build-macos/jsrf-first-fault/render-investigation:
+#
+#     RECOMP_SEQ_REPORT=1   n=62   84% reached a mission
+#     RECOMP_SEQ_REPORT off n=87   80% reached a mission
+#
+# The sampler costs nothing detectable. Leaving it off, on the other hand, cost
+# 57 of the 63 runs taken on 16 Sep 2026 their only scene gate -- six of those
+# runs never left the attract loop and were scored anyway.
+#
+# Set RECOMP_SEQ_REPORT=0 to suppress it; anything else (including unset) is on.
+case "${RECOMP_SEQ_REPORT-}" in
+    0) ;;
+    *) RECOMP_SEQ_REPORT=1; export RECOMP_SEQ_REPORT ;;
+esac
+
+# Seconds after which a run that has not reached a mission is killed.
+#
+# MEASURED, same 149-run corpus, and both bounds have real margin:
+#   * every crash landed between t=24.0 s and t=43.0 s. Not one after 43 s.
+#   * the latest any run entered state 28-35 was t=44.7 s; the slowest to show
+#     it in the log did so by t=51 s.
+# So by t=60 s the outcome is already decided, and a doomed 280 s run becomes a
+# doomed 60 s one. Set ABORT_AT=0 to disable.
+ABORT_AT="${ABORT_AT:-60}"
 OUT="$ROOT/build-macos/jsrf-first-fault/render-investigation/$NAME"
 SCRATCH="${PLAY_SCRATCH:-/tmp/jsrf-playscripted-$NAME}"
 BIN="${JSRF_BIN:-$ROOT/build-macos/jsrf-first-fault/build/jsrf_first_fault}"
@@ -129,8 +160,42 @@ RECOMP_HDD_ROOT="$SCRATCH/hdd" \
 PID=$!
 ( sleep "$LIMIT"; kill -TERM $PID 2>/dev/null; sleep 5; kill -9 $PID 2>/dev/null ) &
 WATCH=$!
+
+# The early abort, and it deliberately reads the LOG rather than the guest.
+#
+# Nothing here runs inside the process being measured: it is a shell loop over
+# a file the run is already writing. That is the whole design constraint --
+# heavy probes provoke the input-poll stall, so the detector for a bad run must
+# not be able to cause one.
+#
+# The test is the scene marker and nothing else. The NtOpenFile count is NOT
+# used even though it separates these runs perfectly today (1408+ = mission,
+# 1341 = attract, 0 errors over the 65 runs that also carry the scene marker):
+# it reads 131 in EVERY scene once the staged HDD carries a complete
+# Media/Cache, so a threshold on it would abort every run in that regime. See
+# the long note at gate 1.
+EARLY=""
+if [ "$ABORT_AT" != "0" ] && [ "${RECOMP_SEQ_REPORT-}" = "1" ]; then
+    ( sleep "$ABORT_AT"
+      kill -0 $PID 2>/dev/null || exit 0
+      now=$(grep '\[JSRF-SEQ\] now=' "$OUT/stderr.log" 2>/dev/null \
+            | tail -1 | sed -n 's/.*now=\([0-9][0-9]*\).*/\1/p')
+      # No reading at all is NOT a reason to abort. The marker rides the
+      # periodic report, so a raised RECOMP_REPORT_MS -- or a sampler that
+      # failed -- leaves it empty, and killing the run on that would be
+      # guessing. Let it finish; gate 1 already says "INSTRUMENT FAILED".
+      case "${now:-none}" in
+          none)                    exit 0 ;;
+          28|29|30|31|32|33|34|35) exit 0 ;;
+      esac
+      echo "state=${now:-none}" > "$OUT/ABORTED_EARLY"
+      kill -TERM $PID 2>/dev/null; sleep 5; kill -9 $PID 2>/dev/null ) &
+    EARLY=$!
+fi
+
 wait $PID
 kill $WATCH 2>/dev/null
+[ -n "$EARLY" ] && kill $EARLY 2>/dev/null
 rm -rf "$SCRATCH"
 
 # The whole point of the script: say what happened, in the two terms that can
@@ -179,6 +244,12 @@ rm -rf "$SCRATCH"
 # guessing from a counter that cannot see the difference.
 echo
 echo "=== did it reach gameplay, and did it play? ==="
+if [ -f "$OUT/ABORTED_EARLY" ]; then
+    echo "  ABORTED at ${ABORT_AT}s: no mission by then, so there was not going"
+    echo "           to be one ($(cat "$OUT/ABORTED_EARLY")). The counters below"
+    echo "           are from a ${ABORT_AT}s run and are NOT comparable with a"
+    echo "           full-length one. Re-run; do not score this."
+fi
 LAST_VOICE=$(grep '\[APU-VOICE\]' "$OUT/stderr.log" | tail -1)
 LAST_FRAME=$(grep '\[APU-FRAME\]' "$OUT/stderr.log" | tail -1)
 OPENS=$(grep -c 'NtOpenFile' "$OUT/stderr.log")
@@ -216,6 +287,61 @@ if [ "$(/usr/bin/python3 -c "print(1 if $GAP_S >= 10 else 0)" 2>/dev/null || ech
     echo "           that window did not happen; do not attribute anything to input."
 else
     echo "  INPUT:   no poll stall (largest gap ${GAP_S}s)"
+fi
+
+# Gate 0c: did the guest's SOUND SERVER stop before the title handed over?
+#
+# THIS IS WHAT DECIDES A STALLED RUN, and it is not the pad.
+#
+# The title's level-5 sound worker (guest body 0x0013B2A0, tick counter at
+# 0x0025EFB0) is already watched, unconditionally, by jsrf_adx_watch in
+# main.c -- it prints "[ADX] tick=N" on every change and "[ADX] tick STUCK at
+# N for Ds" once the value has been still for ten seconds. No new probe is
+# needed and none is added here.
+#
+# MEASURED over the 149 full-length gameplay_nobarrage runs under
+# build-macos/jsrf-first-fault/render-investigation, classified by scene:
+#
+#     the worker never froze        104 reached a mission,  1 did not
+#     it froze at t >= 25 s          12 reached a mission,  0 did not
+#     it froze at t <  25 s           0 reached a mission,  6 did not
+#
+# The earliest any run has handed the title over to the menu is t=25.0 s. If
+# the worker dies before that, WaitEndTitle never completes and no number of A
+# presses helps: both stalled runs examined in detail (e32_2, idxcap) polled
+# the pad at ~176/s -- a healthy rate -- through all eight scheduled presses.
+#
+# AND THE AUDIO DEVICE IS WHAT CHANGES HOW OFTEN IT FREEZES. Same corpus,
+# non-crashed runs of 100 s or more:
+#
+#     device live (output ready)      2 of 103 froze    ( 2%)
+#     device forced off               13 of 14 froze    (93%)
+#     device failed (CoreAudio)        3 of 6  froze    (50%)
+#
+# which is the OPPOSITE of what this file's header used to claim from n=5.
+# Forcing the device off does not make the boot reliable; it makes the sound
+# worker freeze in nearly every run, and the runs it ruins are the ones where
+# the freeze lands early. Net, by scene: 1.6% of device-live runs stalled
+# against 21% of forced-off runs. Forced-off still has its own advantage --
+# every one of the 20 crashes in the corpus had audio live or failed, none had
+# it off -- so this is a trade between two failures, not a setting to prefer.
+ADX_STUCK=$(grep '\[ADX\] tick STUCK' "$OUT/stderr.log" 2>/dev/null | tail -1)
+if [ -n "$ADX_STUCK" ]; then
+    ADX_FOR=$(printf '%s' "$ADX_STUCK" | sed -n 's/.*for \([0-9]*\)s.*/\1/p')
+    ADX_LAST=$(grep '\[FB\] t=' "$OUT/stderr.log" | tail -1 \
+               | sed 's/.*t= *\([0-9.]*\).*/\1/')
+    ADX_AT=$(/usr/bin/python3 -c "print('%.0f' % ($ADX_LAST - $ADX_FOR))" 2>/dev/null)
+    if [ -n "$ADX_AT" ] && [ "$ADX_AT" -lt 25 ] 2>/dev/null; then
+        echo "  SOUND:   WORKER FROZE AT t=${ADX_AT}s, BEFORE THE TITLE HANDS OVER."
+        echo "           This is the stall. Every run in the corpus that froze"
+        echo "           before t=25 s stayed in the attract loop (6 of 6), and"
+        echo "           every run that froze later reached a mission (12 of 12)."
+        echo "           Nothing about the pad schedule is at fault; re-run."
+    else
+        echo "  SOUND:   worker froze at t=${ADX_AT:-?}s (after the handover; benign)."
+    fi
+else
+    echo "  SOUND:   worker ran to the end of the run (no [ADX] tick STUCK)."
 fi
 
 # Gate 0, and it comes first because it invalidates everything below it.

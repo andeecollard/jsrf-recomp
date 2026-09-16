@@ -118,8 +118,18 @@ goes through the alias, not through `VirtualProtect`.
 count nonzero or clearing a flag bit hides the producer bug that set it.
 
 **Known-bad reasoning shortcuts**, all of which have misled before: `PUSHER
-draws=0`, the D3D11 sink's method list, absent `USB-PAD` lines, and comparing
-log sizes across scenes.
+draws=0`, the D3D11 sink's method list, absent `USB-PAD` lines, comparing
+log sizes across scenes, and `N triangles fully off-surface` — that counter is
+incremented only in the CPU rasteriser, so on any Metal run it reads 0 beside
+`[RASTER] 0 batches + 0 triangles on the CPU` and means nothing at all.
+
+**Scene-match every comparison, and check `[APU-VOICE] on=` before scoring an
+arm.** A run that reaches gameplay reads `on=` in the 148–453 band; one stuck in
+the attract loop reads 4–12. Comparing across that boundary produced a confident
+and completely confounded render conclusion on 16 Sep 2026 — the arms differed
+in scene as well as in the change under test. Counters that look like scene
+markers (kernel ordinal count, `NtOpenFile`) are mostly measuring *elapsed time*
+instead: a healthy run reads 67 ordinals at t=25 s and 73 at t=39 s.
 
 ## Conventions
 

@@ -1,5 +1,42 @@
 # The black screen is DRAW_ARRAYS, and the other seven fixes never ran
 
+> **READ THIS FIRST -- TWO CONCLUSIONS IN THIS FILE ARE RETRACTED.**
+>
+> **1. BATCH TRUNCATION IS NOT THE FENCE BUG. CLOSED BY MEASUREMENT.** The
+> index cap was raised 4096 -> 16384 and it demonstrably works: a post-fix
+> gameplay run reports `no-room=0 (e16=0 e32=0); biggest batch asked for 9681
+> of 16384`. Nine thousand six hundred and eighty-one indices requested, zero
+> capacity failures -- and the fences still disappear. The handover's section 4
+> ("THE FENCES -- CAUSE MEASURED, FIX APPLIED") is wrong about the cause. The
+> cap raise is a real fix for a real defect; it is not this one.
+>
+> **2. DRAW_ARRAYS IS FAR TOO SMALL TO BE THE FENCE.** Measured across four
+> scene-matched gameplay runs that had the decode compiled in: ~0.9% of batches
+> and **0.01% of indices**, under one batch and under eight vertices per frame.
+> A mesh canopy cannot be in there.
+>
+> **WHERE THE FENCE BUG ACTUALLY IS.** The fence's batches are submitted,
+> accepted and drawn, and then produce no visible fragments. Every "was
+> something rejected?" counter reads clean because nothing is rejecting
+> anything: `[TEXTURE] prepared=894355 rejected=0`, `[VSH] rejected=141` (all
+> "fixed-function clip W"), `[METAL] refusals=0`, `0 software fallbacks`, and
+> the same presence-only in the player's own live session. Alpha-test and blend
+> state are measured clean in two independent gameplay runs two days apart.
+> The texture cache is structurally incapable of it -- a hit requires a full
+> memcmp of the texture every time.
+>
+> The question is no longer "where did the fence go?" but **"which stage turns
+> a known-submitted fence draw into zero visible fragments?"** The path to
+> instrument, in order, is **mip selection -> texture sampling -> alpha test**.
+> The leading hypothesis is mip/LOD on an alpha-cutout weave texture: the
+> minified mip averages the holes into a sampled alpha below the test
+> reference, every fragment discards, and the geometry and state are valid
+> throughout -- which is precisely why no refusal counter can see it.
+>
+> The rest of this file remains accurate about the BLACK SCREEN, which is a
+> different bug from the fence. Note its own later correction too.
+
+
 Answers open item 1 of
 `handovers/HANDOVER_2026-09-16_THE_FENCES_THE_RINGS_AND_A_BLACK_SCREEN_I_CAUSED.txt`.
 Static reading plus arithmetic on run logs that already existed; no new run was
