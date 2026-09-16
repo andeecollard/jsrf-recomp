@@ -45,6 +45,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "xbox_memory_layout.h"
 #include "apu.h"
 #include "apu_state.h"
@@ -89,8 +91,37 @@ int main(int argc, char **argv)
 {
 #if !defined(_WIN32) && defined(__aarch64__)
     int guard = (argc > 1 && strcmp(argv[1], "guard") == 0);
-    /* Before anything touches the APU, because the switch caches its getenv. */
-    if (guard) setenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD", "1", 1);
+    /* THE DEFAULT ITSELF, FIRST, IN A CHILD, AND BEFORE ANYTHING READS THE
+     * SWITCH. The switch caches its getenv in a function-static, and fork()
+     * copies that cache -- so a child forked after the parent has already
+     * asked gets the parent's answer and the check silently passes or fails
+     * for the wrong reason. It has to happen before the first call in this
+     * process, which is why it is the first thing in main.
+     *
+     * The guard defaults ON since 16 Sep 2026: 13,294 of 23,933 idle-voice
+     * raises in a gameplay run happen while the guest holds that voice's lock.
+     * If somebody moves the default back, this is the line that says so. */
+    {
+        int st = 0;
+        pid_t pid = fork();
+        if (pid == 0) {
+            unsetenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD");
+            _exit(mcpx_apu_idle_trap_lock_guard() ? 0 : 3);
+        }
+        CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    /* PIN THE ARM EXPLICITLY, NOT THE DEFAULT.
+     *
+     * This used to set the variable only for the guard arm and let the other
+     * arm inherit whatever the default happened to be -- so when the default
+     * flipped to ON on 16 Sep 2026 the "default" arm asserted guard==0 against
+     * a guard that was now on, and failed. The test was right to fail; it was
+     * pinning the wrong thing. An arm that means "the window is open" has to
+     * SAY so, or it is measuring a default rather than a behaviour.
+     *
+     * The default is still pinned, separately and deliberately, below. */
+    setenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD", guard ? "1" : "0", 1);
 
     uint8_t xbe[0x400] = {0};
     apu = calloc(1, sizeof(*apu));

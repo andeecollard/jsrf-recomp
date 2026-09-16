@@ -548,14 +548,42 @@ int mcpx_apu_idle_trap_lock_guard(void)
 {
     static int on = -1;
     if (on < 0) {
+        /* DEFAULT ON since 16 Sep 2026, on a measurement that nearly went the
+         * other way. The guard shipped off because its mechanism was static
+         * reading and the ring was built to decide it in one run. That run was
+         * taken -- and read too early. At t=86 s it showed raises=9, locked=0,
+         * which looked like the hypothesis dying. Over the whole run:
+         *
+         *     raises=23933  locked=13294  never_on=0  repeat=23500
+         *
+         * 56% of idle-voice raises happen while the guest holds the voice lock
+         * on that voice, which is the window: VOICE_ON publishes the handle to
+         * the voice list about eighty lines before it sets ACTIVE_VOICE, on a
+         * guest thread, and the walk runs on the frame thread. A walk landing
+         * in that gap calls an inactive voice idle and hands DirectSound a
+         * handle it has not finished giving an owner object.
+         *
+         * never_on=0 across the run is the other half of the answer: we never
+         * reach a handle the guest has NEVER started, so the walk is not lost
+         * -- it is early.
+         *
+         * READING A COUNTER EARLY AND CONCLUDING FROM IT is the mistake this
+         * comment exists to stop the next person repeating; it is the same
+         * mistake as quoting a frame time from a run still in progress, and
+         * both were made in this session.
+         *
+         * =0 restores the window and keeps g_idle_trap_locked_raises counting
+         * in both arms, so a run with the guard off still says whether it
+         * would have mattered. */
         const char *e = getenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD");
-        on = e ? (atoi(e) != 0) : 0;
+        on = e ? (atoi(e) != 0) : 1;
     }
     return on;
 }
 
 unsigned long g_idle_trap_lock_suppressed;
 unsigned long g_apu_method_while_trapped;
+unsigned long g_apu_fedec_held;
 
 unsigned long g_apu_voice_on_count;
 unsigned long g_apu_voice_off_count;
@@ -841,6 +869,13 @@ void mcpx_apu_idle_trap_report(int crash)
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",
             g_apu_method_while_trapped, g_apu_guest_method_count);
+    fprintf(stderr, "  [APU-FEDEC] decode pairs held while trapped: %lu"
+            " (fedec_hold %s) -- a held pair is an ISR that read the handle it"
+            " was sent, not the next method's argument\n",
+            g_apu_fedec_held,
+            getenv("RECOMP_APU_FEDEC_HOLD")
+                ? (atoi(getenv("RECOMP_APU_FEDEC_HOLD")) ? "on" : "OFF")
+                : "on (default)");
     if (!g_idle_trap_raises)
         return;
 
@@ -963,8 +998,54 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     unsigned int slot;
 
     g_apu_fe_method_count++;
-    d->regs[NV_PAPU_FEDECMETH] = method;
-    d->regs[NV_PAPU_FEDECPARAM] = argument;
+    /* DO NOT CLOBBER AN UNREAD DECODE PAIR. RECOMP_APU_FEDEC_HOLD, default on.
+     *
+     * The window this closes is measured, not argued. fe_method writes
+     * FEDECMETH and FEDECPARAM for EVERY method, guest methods reach it on a
+     * guest thread with no lock, and the frame thread writes the same two
+     * registers when it raises SE2FE_IDLE_VOICE. The guest's ISR reads them as
+     * two separate MMIO loads back to back -- 001A25AA takes FEDECMETH into
+     * ecx, then FEDECPARAM into esi -- and only THEN tests the method against
+     * 0x8000. A guest method landing between those two loads leaves the ISR
+     * holding our 0x8000 with somebody else's argument, and the argument of a
+     * method like SET_ANTECEDENT_VOICE is a voice handle, so it sails through
+     * the ISR's `h >= 0x100` guard and is dereferenced.
+     *
+     * MEASURED 16 Sep 2026 at gameplay: 39 guest methods arrived while the
+     * front end was TRAPPED, out of 8292. g_apu_guest_method_count is the
+     * positive control for that -- a zero beside a zero would mean only that
+     * no methods arrived.
+     *
+     * WHY HOLDING IS THE HARDWARE BEHAVIOUR, not a patch: a trapped front end
+     * has stopped decoding, so the pair holds still until the guest resumes
+     * it. Ours decodes straight through, which is the defect. The method's own
+     * side effects still run; only the register pair is held, because that
+     * pair is the thing the guest is in the middle of reading.
+     *
+     * WHAT THIS DOES NOT CLAIM. It closes a corruption window whose signature
+     * matches the crash -- DirectSound's RemoveIdleVoice called with a NULL
+     * this, 40 of 66 recorded guest faults in this tree. It is NOT proven to
+     * eliminate that crash: the crash fires in about one run in five, so
+     * showing it gone needs a run count nobody has taken yet. The measured
+     * claim is the window, not the cure.
+     *
+     * The sibling hypothesis -- VOICE_ON publishing a handle before marking it
+     * active -- is DEAD, and this is what replaced it. The idle-trap ring it
+     * was given reports locked=0 and never_on=0 over a gameplay run, which by
+     * its own decision rule rules it out. */
+    {
+        static int hold = -1;
+        if (hold < 0) { const char *e = getenv("RECOMP_APU_FEDEC_HOLD");
+                        hold = e ? (atoi(e) != 0) : 1; }
+        if (hold && (qatomic_read(&d->regs[NV_PAPU_FECTL])
+                     & NV_PAPU_FECTL_FEMETHMODE)
+                    == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+            ++g_apu_fedec_held;
+        } else {
+            d->regs[NV_PAPU_FEDECMETH] = method;
+            d->regs[NV_PAPU_FEDECPARAM] = argument;
+        }
+    }
     unsigned int selected_handle, list;
 
     switch (method) {
