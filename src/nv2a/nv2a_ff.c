@@ -1,3 +1,10 @@
+/* NO FUSED MULTIPLY-ADD. This file is the CPU reference the MSL fixed-function
+ * emitter is measured against, and the emitter compiles with
+ * `#pragma clang fp contract(off)`. clang's default on arm64 is
+ * -ffp-contract=on, which fused 71 multiply-adds in nv2a_ff_vertex (28 of them
+ * in the matrix accumulation that produces clip w, on which an EXACT ==0 test
+ * decides a batch refusal). Both sides now round the same way. */
+#pragma clang fp contract(off)
 #include "nv2a_ff.h"
 #include <math.h>
 #include <stdio.h>
@@ -169,10 +176,30 @@ static void dump_first(const uint32_t *m,const float in[16][4],const float clip[
  * default, and RECOMP_FF_TEXMAT_IDENTITY makes it pass the coordinate through.
  * Read the counter before setting the switch: if nv2a_ff_texmat_zero is zero
  * in a gameplay run, the switch has nothing to do. */
-static int texture_matrix_usable(const uint32_t *m,unsigned unit)
+/* THE PREDICATE, WITH NO COUNTERS AND NO OUTPUT.
+ *
+ * Split out so the per-BATCH key path (nv2a_ff_key, below) can ask exactly the
+ * question the per-VERTEX path asks without adding batches into counters whose
+ * header says, in capitals, that they count vertices. Same three answers, in
+ * the same order, from the same two tests:
+ *
+ *   0  enabled and the seen table proves it was never uploaded
+ *   1  enabled and at least one word is non-zero -- transform
+ *   2  enabled and all sixteen words are zero, provenance unknown
+ */
+static int texmat_class(const uint32_t *m,unsigned unit)
 {
     unsigned base=0x6c0+unit*64;
-    if(seen(base)==0||seen(base+60)==0) {
+    if(seen(base)==0||seen(base+60)==0) return 0;
+    for(unsigned w=0;w<16;++w) if(m[(base+w*4)/4]) return 1;
+    return 2;
+}
+static int texmat_identity_on(void)
+{ static int slot=-1; return ff_on("RECOMP_FF_TEXMAT_IDENTITY",&slot); }
+static int texture_matrix_usable(const uint32_t *m,unsigned unit)
+{
+    int klass=texmat_class(m,unit);
+    if(klass==0) {
         if(!nv2a_ff_texmat_unset++)
             fprintf(stderr,"[FF] texture matrix %u is enabled and was never"
                     " uploaded; passing the coordinate through instead of"
@@ -180,9 +207,8 @@ static int texture_matrix_usable(const uint32_t *m,unsigned unit)
                     " loses every triangle on the unit)\n",unit);
         return 0;
     }
-    for(unsigned w=0;w<16;++w) if(m[(base+w*4)/4]) return 1;
-    static int slot=-1;
-    int identity=ff_on("RECOMP_FF_TEXMAT_IDENTITY",&slot);
+    if(klass==1) return 1;
+    int identity=texmat_identity_on();
     if(!nv2a_ff_texmat_zero++)
         fprintf(stderr,"[FF] texture matrix %u is enabled and all sixteen words"
                 " are zero (seen table %s, so uploaded-as-zero and never-"
@@ -376,4 +402,272 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
         else memcpy(out[9+u],generated,4*sizeof(float));
     }
     return 0;
+}
+
+/* ================================================================
+ * THE SAME UNIT, SPLIT INTO A SHADER AND ITS ARGUMENTS.
+ * ================================================================
+ *
+ * Nothing below changes what nv2a_ff_vertex computes. It answers two other
+ * questions about the same state -- what SHAPE is this batch (nv2a_ff_key) and
+ * what NUMBERS does it multiply by (nv2a_ff_params) -- so the shape can be
+ * compiled once into an MSL vertex function and the numbers uploaded per
+ * batch.
+ *
+ * THE RULE THAT MAKES THIS SAFE. The accept set of nv2a_ff_key is a strict
+ * subset of what nv2a_ff_vertex supports, and every predicate here is the
+ * SAME EXPRESSION as the one above it -- seen(), texmat_class(),
+ * texmat_identity_on(), the NORMAL_MAP constant. A divergence between the two
+ * is a wrong picture with nothing in the log, which is why the predicates are
+ * shared rather than restated.
+ *
+ * HIGH RISK, and this is the place to say it. A shader is not like the rest of
+ * this tree: a subtly wrong MSL expression compiles cleanly, runs, and outputs
+ * black or garbage, and this project has lost two builds that way. The gate is
+ * diagnostics/jsrf_first_fault/ff_msl_diff_test.m, which dispatches the emitted
+ * function on a real device and diffs all sixteen output registers against
+ * nv2a_ff_vertex -- the production function, not a transcription of it. Do not
+ * turn RECOMP_METAL_FF on for a build whose emitter that test has not passed.
+ */
+float nv2a_ff_constants[NV2A_FF_C_SLOTS][4];
+unsigned long nv2a_ff_gpu_batches, nv2a_ff_gpu_cpu_batches,
+    nv2a_ff_gpu_backend_refused, nv2a_ff_gpu_clip_w,
+    nv2a_ff_gpu_no_skin, nv2a_ff_gpu_no_texgen, nv2a_ff_gpu_no_light,
+    nv2a_ff_gpu_no_normal, nv2a_ff_gpu_texmat_unset, nv2a_ff_gpu_texmat_zero;
+
+/* Four consecutive slots, arranged so the shader's row r is ff_dot4(c[r], v).
+ *
+ * matrix() reads word (base + row*16 + col*4) as M[row][col] and computes
+ * M*v, so c[slot+row][col] is that word. matrix_row_vector() reads the block
+ * transposed, so the TRANSPOSE is done HERE, when packing, rather than as a
+ * second shader variant: one emitted form instead of two is one fewer hand
+ * written dot product to be wrong about, and RECOMP_FF_TEXMAT_TRANSPOSE then
+ * changes no generated text at all. */
+static void pack_matrix(unsigned slot,const uint32_t *m,unsigned base,int transpose)
+{
+    for(unsigned row=0;row<4;++row)
+        for(unsigned col=0;col<4;++col)
+            nv2a_ff_constants[slot+row][col] =
+                transpose ? value(m,base+col*16+row*4)
+                          : value(m,base+row*16+col*4);
+}
+
+/* THE CLIP-W REFUSAL, FOR THE GPU PATH.
+ *
+ * nv2a_ff_vertex refuses the whole batch when a vertex's composite w is zero
+ * or non-finite ("fixed-function clip W", 1-193 batches in every archived
+ * run). That is a PER-VERTEX condition, so nv2a_ff_key -- which only sees the
+ * batch SHAPE -- cannot express it, and the GPU path was drawing those
+ * batches: oPos.x = clipv.x / 0 is an infinity, the epilogue multiplies it by
+ * w=0, and the vertex goes to NaN with no counter anywhere. The CPU arm and
+ * the GPU arm were therefore drawing different pictures for a reason the
+ * "strict subset" rule did not cover, because that rule is about shapes.
+ *
+ * So the executor asks this per vertex, over the position it has already
+ * fetched, and refuses the batch exactly as the CPU arm does. Four
+ * multiply-adds against the sixty-odd the transform costs, on the path that
+ * no longer runs the transform at all.
+ *
+ * It reads the PACKED constants rather than the method array, because those
+ * are the numbers the shader will use; pack_matrix(...,0) copies them
+ * verbatim, so the two agree to the bit -- with this file's
+ * `#pragma clang fp contract(off)` making "to the bit" true. */
+/* WOULD THE SINK HAVE DROPPED THIS VERTEX?
+ *
+ * nv2a_metal.m's vertex_valid() drops a triangle when an ACTIVE texture
+ * unit's coordinate is non-finite or has q <= 0 -- and triangle() returns
+ * before that test whenever vsh_gpu_culling is set, which is every GPU vertex
+ * path. So the CPU arm drops those triangles and the GPU arm draws them, and
+ * the fragment then computes uv = tc.xy / tc.w on a zero or negative w. That
+ * is the last standing candidate for the two relocated glyphs in Gum's
+ * tutorial text after the ring (single-thread assumption verified) and the
+ * vertex data (FF-WATCH, zero changes) were both eliminated.
+ *
+ * This COUNTS it without changing what is drawn, which is the only honest way
+ * to ask: a zero here kills the candidate, a non-zero locates it. The
+ * coordinate is reproduced exactly as the emitted shader will compute it --
+ * pass-through is the fetched attribute, a texture matrix is the same four
+ * ff_dot4 rows, under this file's contract(off) so the arithmetic matches. */
+unsigned long nv2a_ff_gpu_texq_would_drop;
+void nv2a_ff_count_texq(const NV2AFFKey *key, const float in[16][4],
+                        unsigned texture_mask)
+{
+    unsigned u;
+    if (!key) return;
+    for (u = 0; u < 4; ++u) {
+        float q;
+        if (!(texture_mask & (1u << u))) continue;   /* inactive: not tested */
+        if (key->texmat[u]) {
+            const float *r = nv2a_ff_constants[NV2A_FF_C_TEXMAT + u * 4 + 3];
+            const float *g = in[9 + u];
+            q = r[0]*g[0] + r[1]*g[1] + r[2]*g[2] + r[3]*g[3];
+        } else {
+            q = in[9 + u][3];
+        }
+        if (!isfinite(q) || q <= 0.0f) { ++nv2a_ff_gpu_texq_would_drop; return; }
+    }
+}
+
+int nv2a_ff_clip_w_ok(const float pos[4])
+{
+    const float *r=nv2a_ff_constants[NV2A_FF_C_COMPOSITE+3];
+    float w=r[0]*pos[0]+r[1]*pos[1]+r[2]*pos[2]+r[3]*pos[3];
+    if(isfinite(w)&&w!=0.0f) return 1;
+    {   static int slot=-1;
+        if(ff_on("RECOMP_FF_CLIPW",&slot)) {
+            if(!nv2a_ff_clip_w_drawn++)
+                fprintf(stderr,"[FF] clip w=%.9g on one vertex of a GPU"
+                        " fixed-function batch; drawing it, as RECOMP_FF_CLIPW"
+                        " asks the CPU path to\n",w);
+            return 1;
+        }
+    }
+    ++nv2a_ff_gpu_clip_w;
+    return 0;
+}
+
+int nv2a_ff_key(const uint32_t m[2048],NV2AFFKey *key)
+{
+    static const uint32_t normal_map=0x8511;
+    if(!key) return 0;
+    memset(key,0,sizeof *key);
+    key->version=(uint8_t)NV2A_FF_KEY_VERSION;
+    /* Same first test, same string, as nv2a_ff_vertex. */
+    if(m[0x328/4]) { ++nv2a_ff_gpu_no_skin; ++nv2a_ff_gpu_cpu_batches; return 0; }
+    /* The composite-matrix guard the executor already applies before it calls
+     * nv2a_ff_vertex at all (nv2a_pb_exec.c:2957). Repeated rather than
+     * assumed: a key that accepted an untransformed batch would put object
+     * space on the screen with no reject line anywhere. */
+    if(seen(0x680)==0||seen(0x6bc)==0) { ++nv2a_ff_gpu_cpu_batches; return 0; }
+    key->lighting =m[0x314/4]!=0;
+    key->normalise=m[0x3a4/4]!=0;
+    for(unsigned u=0;u<4;++u) for(unsigned k=0;k<4;++k) {
+        uint32_t mode=m[(0x3c0+u*16+k*4)/4];
+        if(!mode) continue;
+        if(mode==normal_map && k<3) { key->texgen[u][k]=1; key->normal_read=1; continue; }
+        /* The same refusal nv2a_ff_vertex makes, one step earlier: there the
+         * batch is rejected and drawn by nobody, here it simply stays on the
+         * CPU and is rejected there exactly as it is today. */
+        ++nv2a_ff_gpu_no_texgen; ++nv2a_ff_gpu_cpu_batches; return 0;
+    }
+    if(key->lighting) key->normal_read=1;
+    if(key->lighting) {
+        uint32_t light_mask=m[0x3bc/4];
+        for(unsigned light=0;light<8;++light) {
+            unsigned mode=(light_mask>>(2*light))&3;
+            if(mode>1) { ++nv2a_ff_gpu_no_light; ++nv2a_ff_gpu_cpu_batches; return 0; }
+            if(mode==1) key->lights|=(uint8_t)(1u<<light);
+        }
+    }
+    /* A DEGENERATE NORMAL IS THE ONE THING A VERTEX FUNCTION CANNOT DO.
+     *
+     * nv2a_ff_vertex splits it: unread, it zeroes the normal and draws; read,
+     * it REFUSES THE BATCH, because what the NV2A's rsqrt does with zero is
+     * not known here. A vertex function has no way to refuse a batch, and the
+     * condition is per-vertex so the key cannot see it coming -- so by default
+     * the key refuses the SHAPE, and every batch that normalises a normal
+     * something reads stays on the CPU with its behaviour unchanged.
+     *
+     * That is a bounded, counted loss and nv2a_ff_gpu_no_normal is how big it
+     * is. It is expected to be zero or near it: lighting reads 0 in every
+     * archived run (ffguard1/stderr.log:6193 prints "lighting 0x0314=0"), and
+     * the degenerate-normal split has read "0 still rejected" in all of them.
+     * RECOMP_FF_GPU_NORMAL_ZERO=1 takes the other arm -- the GPU zeroes the
+     * normal and draws, which is what hardware certainly does and what the CPU
+     * path's own comment argues for -- at the cost that the two paths then
+     * disagree for exactly those vertices, so the diff test must be run with
+     * the same switch set. */
+    if(key->normalise && key->normal_read) {
+        static int slot=-1;
+        if(!ff_on("RECOMP_FF_GPU_NORMAL_ZERO",&slot)) {
+            ++nv2a_ff_gpu_no_normal; ++nv2a_ff_gpu_cpu_batches; return 0;
+        }
+    }
+    for(unsigned u=0;u<4;++u) {
+        if(!m[(0x420+u*4)/4]) continue;
+        switch(texmat_class(m,u)) {
+        case 0:
+            if(!nv2a_ff_gpu_texmat_unset++)
+                fprintf(stderr,"[FF] texture matrix %u is enabled and was never"
+                        " uploaded; the GPU path passes the coordinate through,"
+                        " as the CPU path does\n",u);
+            break;                                  /* pass through */
+        case 1: key->texmat[u]=1; break;
+        default:
+            /* All sixteen words zero. The CPU path multiplies and gets q=0,
+             * and the SINK then drops every triangle on the unit
+             * (vertex_valid, nv2a_metal.m) -- a per-vertex refusal the GPU
+             * vertex path skips, so the same batch on the GPU would sample
+             * NaN texels instead. Keep it on the CPU unless the identity
+             * switch says pass the coordinate through, which the GPU can do. */
+            ++nv2a_ff_gpu_texmat_zero;
+            if(!texmat_identity_on()) { ++nv2a_ff_gpu_cpu_batches; return 0; }
+            key->texmat[u]=0;
+            break;
+        }
+    }
+    /* THE ATTRIBUTES THE EMITTED FUNCTION READS, and why they are a constant.
+     *
+     * nv2a_ff_vertex reads in[0] position, in[2] normal, in[3] diffuse, in[4]
+     * specular and in[9..12] texture coordinates, and nothing else. The caller
+     * seeds all sixteen from s_vsh.current before overriding the ones that have
+     * a vertex array, so an attribute with no array still arrives with its
+     * latched value and needs no separate constant.
+     *
+     * Seven float4 is 112 bytes per vertex -- EXACTLY the size of the `Vertex`
+     * struct nv2a_metal.m uploads for a CPU-transformed draw, so this path
+     * costs the staging ring nothing extra. The normal is the eighth and is
+     * included only when something reads it. */
+    key->inputs=(uint16_t)(0x1E19u | (key->normal_read?0x0004u:0u));
+    ++nv2a_ff_gpu_batches;
+    return 1;
+}
+
+void nv2a_ff_params(const uint32_t m[2048],const NV2AFFKey *key)
+{
+    static int slot=-1;
+    int transpose=ff_on("RECOMP_FF_TEXMAT_TRANSPOSE",&slot);
+    if(!key) return;
+    /* Only the slots the emitter can name. The rest of the 192 are never read
+     * by any generated text, so zeroing them would be 2 KB of memset per batch
+     * to hide nothing. */
+    memset(nv2a_ff_constants,0,NV2A_FF_C_USED*4*sizeof(float));
+    pack_matrix(NV2A_FF_C_COMPOSITE,m,0x680,0);
+    /* x and y only: nv2a_ff_vertex adds the offset for k<2 and never for z. */
+    nv2a_ff_constants[NV2A_FF_C_VIEWPORT][0]=value(m,0xa20);
+    nv2a_ff_constants[NV2A_FF_C_VIEWPORT][1]=value(m,0xa24);
+    if(key->normal_read) pack_matrix(NV2A_FF_C_NORMAL,m,0x580,0);
+    for(unsigned u=0;u<4;++u)
+        if(key->texmat[u]) pack_matrix(NV2A_FF_C_TEXMAT+u*4,m,0x6c0+u*64,transpose);
+    if(key->lighting) {
+        for(unsigned k=0;k<3;++k) {
+            nv2a_ff_constants[NV2A_FF_C_AMBIENT][k] =value(m,0xa10+4*k);
+            nv2a_ff_constants[NV2A_FF_C_MATERIAL][k]=value(m,0x3a8+4*k);
+        }
+        {   /* NV097_SET_MATERIAL_ALPHA, and the same guard as the CPU path:
+             * a zero-initialised register scales every vertex alpha to zero,
+             * and only the seen table tells "the guest asked for invisible"
+             * from "the guest never asked". Counted with a local rather than
+             * nv2a_ff_material_alpha_unset because that one is documented as
+             * counting VERTICES and this runs once per batch. */
+            float material_alpha=value(m,0x3b4);
+            if(seen(0x3b4)==0) {
+                static int told;
+                if(!told++)
+                    fprintf(stderr,"[FF] lighting is on and MATERIAL_ALPHA was"
+                            " never uploaded; the GPU path uses 1.0, as the CPU"
+                            " path does\n");
+                material_alpha=1.0f;
+            }
+            nv2a_ff_constants[NV2A_FF_C_MATERIAL][3]=material_alpha;
+        }
+        for(unsigned light=0;light<8;++light) if(key->lights&(1u<<light)) {
+            unsigned base=0x1000+light*0x80, at=NV2A_FF_C_LIGHT+light*3;
+            for(unsigned k=0;k<3;++k) {
+                nv2a_ff_constants[at+0][k]=value(m,base+4*k);        /* ambient   */
+                nv2a_ff_constants[at+1][k]=value(m,base+0x0c+4*k);   /* diffuse   */
+                nv2a_ff_constants[at+2][k]=value(m,base+0x34+4*k);   /* direction */
+            }
+        }
+    }
 }

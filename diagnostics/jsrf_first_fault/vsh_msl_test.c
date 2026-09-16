@@ -377,6 +377,13 @@ static void rejections(void)
 
 int main(void)
 {
+    /* The text expectations below describe the emitter with the dot-product
+     * zero rule OFF: plain dot() for DP3/DPH/DP4. RECOMP_VSH_DP_ZERO has
+     * defaulted ON since 16 Sep 2026, so pin the arm here rather than let the
+     * default decide which emitter this test is looking at. The ON emitter
+     * (vsh_dp3/vsh_dp4) is verified numerically over the title's own 126
+     * programs by jsrf_vsh_msl_diff_test, in both modes. */
+    setenv("RECOMP_VSH_DP_ZERO", "0", 1);
     preamble();
     operands_and_opcodes();
     ilu_opcodes();

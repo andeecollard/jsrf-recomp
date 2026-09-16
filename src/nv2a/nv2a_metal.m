@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "nv2a_metal.h"
+#include "nv2a_ff.h"
 #include "../recomp_switch.h"
 #include "nv2a_metal_state.h"
 #include "nv2a_vsh.h"
@@ -818,6 +819,13 @@ typedef struct {
     id<MTLLibrary> library;
     id<MTLFunction> fn;
     int refused;            /* the emitter or the compiler said no; never retry */
+    /* words[] holds an NV2AFFKey rather than a vertex program. The array is
+     * NV2A_VS_MAX_INSTRUCTIONS*16 bytes and the key is 32, so it fits with
+     * room to spare and the cache stays one table. This file never looks
+     * inside the key: it hashes it, memcmp's it, and hands it back to
+     * nv2a_ff_generate_msl, exactly as it does a program's words. */
+    int is_ff;
+    unsigned keysize;
 } VshSlot;
 static VshSlot vsh_slot[VSH_CACHE];
 static unsigned vsh_slot_n;
@@ -909,34 +917,58 @@ static int vsh_wrap(const char *src, uint16_t inputs, unsigned nattrs,
 /* Find or build the MTLFunction for this program. Called from the executor
  * BEFORE it decides whether to run the interpreter, so a refusal here is a
  * clean CPU draw rather than a half-transformed batch. */
-static VshSlot *vsh_lookup(const uint32_t (*words)[4], int length,
-                           uint16_t inputs)
+/* ONE CACHE, TWO KINDS OF VERTEX SHADER.
+ *
+ * A guest program is (words,length); a fixed-function shader is an opaque
+ * NV2AFFKey blob. They differ only in how the entry is keyed and which emitter
+ * produces the MSL -- everything after that is identical, which is the whole
+ * reason the fixed-function path was shaped this way. vsh_wrap(), the pipeline
+ * lookup, the vertex packing and the buffer bindings are untouched: the two
+ * emitters produce a byte-compatible signature block and alias lines, and
+ * nv2a_ff_constants is float[192][4], exactly the 192*16 bytes already sent at
+ * buffer(1). */
+static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
+                              int is_ff, uint16_t inputs)
 {
-    uint32_t h = vsh_hash(words, length);
+    uint32_t h = is_ff ? vsh_hash((const uint32_t (*)[4])blob, (int)(keysize / 16))
+                       : vsh_hash((const uint32_t (*)[4])blob, length);
+    size_t bytes = is_ff ? (size_t)keysize : (size_t)length * 16;
     unsigned i, n;
     for (i = 0; i < vsh_slot_n; ++i) {
         VshSlot *v = &vsh_slot[i];
-        if (v->hash != h || v->length != length || v->inputs != inputs) continue;
-        if (memcmp(v->words, words, (size_t)length * 16)) continue;   /* full compare */
+        if (v->hash != h || v->inputs != inputs) continue;
+        if (v->is_ff != is_ff) continue;
+        if (is_ff ? (v->keysize != keysize) : (v->length != length)) continue;
+        if (memcmp(v->words, blob, bytes)) continue;   /* full compare */
         ++g_vsh_hits;
         return v->refused ? NULL : v;
     }
     if (vsh_slot_n >= VSH_CACHE) { ++g_vsh_cache_full; return NULL; }
-    if (length <= 0 || length > NV2A_VS_MAX_INSTRUCTIONS) return NULL;
+    if (is_ff) { if (!keysize || keysize > sizeof vsh_slot[0].words) return NULL; }
+    else if (length <= 0 || length > NV2A_VS_MAX_INSTRUCTIONS) return NULL;
 
     {   /* Build it. Everything below happens once per distinct program. */
         VshSlot *v = &vsh_slot[vsh_slot_n++];
         NV2AVshProgram prog;
         char *emitted = malloc(262144), *wrapped = malloc(524288);
-        memcpy(v->words, words, (size_t)length * 16);
-        v->length = length; v->hash = h; v->inputs = inputs;
+        memcpy(v->words, blob, bytes);
+        v->length = is_ff ? 0 : length; v->hash = h; v->inputs = inputs;
+        v->is_ff = is_ff; v->keysize = keysize;
         for (n = 0, i = 0; i < NV2A_VS_MAX_INPUTS; ++i)
             if (inputs & (1u << i)) ++n;
         v->nattrs = n;
         v->refused = 1;                    /* until proven otherwise */
         if (!emitted || !wrapped) { free(emitted); free(wrapped); return NULL; }
-        nv2a_vsh_parse(words, length, &prog);
-        if (!prog.valid || !nv2a_vsh_generate_msl(&prog, emitted, 262144)
+        int emitted_ok;
+        if (is_ff) {
+            emitted_ok = nv2a_ff_generate_msl((const NV2AFFKey *)v->words,
+                                              emitted, 262144);
+        } else {
+            nv2a_vsh_parse((const uint32_t (*)[4])blob, length, &prog);
+            emitted_ok = prog.valid
+                      && nv2a_vsh_generate_msl(&prog, emitted, 262144);
+        }
+        if (!emitted_ok
             || !vsh_wrap(emitted, inputs, v->nattrs, wrapped, 524288)) {
             ++g_vsh_refused_emit; free(emitted); free(wrapped); return NULL;
         }
@@ -982,7 +1014,33 @@ int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
 {
     if (!vsh_gpu_on() || !hw_state_on()) return 0;
     if (!initialize()) return 0;
-    vsh_active = vsh_lookup(words, length, inputs_read);
+    vsh_active = vsh_lookup_ex(words, length, 0, 0, inputs_read);
+    return vsh_active != NULL;
+}
+
+/* THE FIXED-FUNCTION UNIT, ON THE GPU. Same contract as the call above, one
+ * layer down: the executor asks BEFORE it decides whether to run
+ * nv2a_ff_vertex on the CPU, and a 0 here is a clean CPU batch rather than a
+ * half-transformed one. 62.8% of this title's index slots are transformed on
+ * the CPU for want of this path -- 520 million of 829 million in one gameplay
+ * run -- because only programmable-shader draws were ever GPU-shaded.
+ *
+ * The key is opaque here on purpose. It is hashed and memcmp'd like a
+ * program's words and handed straight to nv2a_ff_generate_msl, so this file
+ * holds no opinion about fixed-function state and cannot drift from the one
+ * that does.
+ *
+ * GATED: RECOMP_METAL_FF, default off, and the emitter has a differential test
+ * against nv2a_ff_vertex itself -- jsrf_ff_msl_diff_test, residual 0 over 15
+ * states in both modes with an injected fault firing in every one. Do not turn
+ * the switch on for a build whose test has not passed. A subtly wrong MSL
+ * expression compiles clean and outputs black; this tree has lost two builds
+ * that way. */
+int nv2a_metal_ff_ready(const void *key, unsigned keysize, uint16_t inputs_read)
+{
+    if (!vsh_gpu_on() || !hw_state_on()) return 0;
+    if (!initialize()) return 0;
+    vsh_active = vsh_lookup_ex(key, 0, keysize, 1, inputs_read);
     return vsh_active != NULL;
 }
 
@@ -1880,6 +1938,45 @@ static void (*ring_wrap_hook)(void);
 static unsigned ring_current;
 static size_t ring_offset;
 static pthread_mutex_t ring_mutex=PTHREAD_MUTEX_INITIALIZER;
+
+/* IS THE SINGLE-THREAD ASSUMPTION TRUE? The block above states it -- "nv2a_
+ * metal_draw is only ever reached from the pusher thread -- the same
+ * assumption the texture cache, last_command and all of the surface state
+ * already make" -- and states it as an assumption. Nothing has ever checked
+ * it, and it is load-bearing for four separate pieces of mutable state.
+ *
+ * If it is false the consequence is precisely the defect being hunted on
+ * 16 Sep 2026: ring_offset is a plain static, so two threads reserving at
+ * once hand out OVERLAPPING spans and one batch's vertices are written over
+ * another's. The picture that produces is a handful of primitives drawn at
+ * some other batch's coordinates, once, rarely -- which is what the GPU
+ * fixed-function arm did to two quote glyphs in Gum's tutorial text
+ * (frame-bisect/ffglyph2/ff-on/fb/flip013.bmp) while the vertex data the CPU
+ * fetched was byte-identical on every draw.
+ *
+ * One pointer compare per draw, always on, and it names both threads once.
+ * A run that never prints this has PROVED the assumption for that run, which
+ * is worth more than the comment above; a run that does print it has found
+ * the bug. */
+static _Atomic(pthread_t) g_draw_thread;
+static _Atomic(unsigned long) g_draw_other_thread;
+static void draw_thread_check(void)
+{
+    pthread_t me = pthread_self(), none = (pthread_t)0, owner;
+    owner = atomic_load(&g_draw_thread);
+    if (!owner) {
+        if (atomic_compare_exchange_strong(&g_draw_thread, &none, me)) return;
+        owner = atomic_load(&g_draw_thread);
+    }
+    if (pthread_equal(owner, me)) return;
+    if (atomic_fetch_add(&g_draw_other_thread, 1) == 0)
+        fprintf(stderr, "[METAL] THE SINGLE-THREAD ASSUMPTION IS FALSE:"
+                " nv2a_metal_draw reached from thread %p, having been claimed"
+                " by %p. ring_offset, the texture cache, last_command and the"
+                " surface state are all plain statics under that assumption;"
+                " overlapping ring reservations draw one batch's vertices at"
+                " another's coordinates.\n", (void *)me, (void *)owner);
+}
 static pthread_cond_t ring_cond=PTHREAD_COND_INITIALIZER;
 /* Sequentially consistent by default, and deliberately so: the lost-wakeup
  * argument in ring_pin below is stated in terms of one total order over these
@@ -2163,6 +2260,10 @@ void nv2a_metal_report(void)
     fprintf(stderr,"[METAL] clear discards=%llu (clear_discard %s)\n",
             (unsigned long long)g_mtl_discards,
             g_mtl_discards?"used":"unused");
+    {   unsigned long other = atomic_load(&g_draw_other_thread);
+        fprintf(stderr,"[METAL] draw thread: %s (%lu draws from another"
+                " thread)\n", other ? "MORE THAN ONE -- see the warning above"
+                : "one, as the ring assumes", other); }
     fprintf(stderr,"[METAL] texture buffers: %llu requests, %llu cache hits, %llu uploads; vertices: %llu inline, %llu allocated\n",
         (unsigned long long)texture_requests,(unsigned long long)texture_hits,
         (unsigned long long)texture_uploads,(unsigned long long)inline_vertex_batches,
@@ -3261,6 +3362,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
  const float(*vertices)[16][4],unsigned count,unsigned primitive)
 {
+ draw_thread_check();
  if(!s)return reject("null-state");
  if((s->texture_mask&1)&&!texture)return reject("missing-texture");
  if(!target)return reject("missing-target");

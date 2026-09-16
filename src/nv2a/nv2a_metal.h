@@ -50,6 +50,11 @@ int nv2a_metal_shader_blend_on(void);
  * program's INPUTS in the array it would otherwise fill with outputs.
  * nv2a_metal_vsh_clear() must be called for any draw that did not go through
  * ready(), so a stale program cannot be applied to somebody else's vertices. */
+/* The fixed-function unit, on the GPU. RECOMP_METAL_FF, default off.
+ * `key` is an opaque NV2AFFKey blob -- nv2a_metal.m never looks inside it. */
+int nv2a_metal_ff_ready(const void *key, unsigned keysize,
+                        uint16_t inputs_read);
+
 int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
                          uint16_t inputs_read);
 void nv2a_metal_vsh_constants(const float (*c)[4]);

@@ -457,6 +457,20 @@ if(APPLE)
     set_source_files_properties(vsh_msl_diff_test.m PROPERTIES
                                 COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(jsrf_vsh_msl_diff_test PRIVATE xbox_vsh)
+    # The same question for the FIXED-FUNCTION emitter, and the gate that makes
+    # RECOMP_METAL_FF shippable. Stronger than its sibling in one way: the CPU
+    # side of its RAW mode is nv2a_ff_vertex itself, the production function the
+    # shader replaces, so a disagreement implicates one of the two and not a
+    # transcription of a third file.
+    #
+    # Same group, same reason: it needs a device. Carries four positive
+    # controls -- an injected fault, a measured state anchor, per-state
+    # compared counts, and an accept-parity check against nv2a_ff_vertex's own
+    # refusals -- because every headline number in it is an absence.
+    add_executable(jsrf_ff_msl_diff_test ff_msl_diff_test.m)
+    set_source_files_properties(ff_msl_diff_test.m PROPERTIES
+                                COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(jsrf_ff_msl_diff_test PRIVATE xbox_vsh)
     # Explicit GPU tests; do not turn headless CTest runs into device failures.
 endif()
 if(WIN32)

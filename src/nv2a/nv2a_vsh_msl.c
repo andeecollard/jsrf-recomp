@@ -53,6 +53,7 @@
  * shader names the arm it was generated in on its first line.
  */
 #include "nv2a_vsh.h"
+#include "nv2a_ff.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -811,6 +812,290 @@ int nv2a_vsh_generate_msl(const NV2AVshProgram *program,
         "    o.oPts = oPts.x;\n"
         "    o.oB0  = saturate(oB0);\n"
         "    o.oB1  = saturate(oB1);\n"
+        "    return o;\n"
+        "}\n");
+
+    return sb.pos == sb.size - 1 ? 0 : sb.pos;
+}
+
+/* ================================================================
+ * FIXED-FUNCTION T&L, AS AN MSL VERTEX FUNCTION.  RECOMP_METAL_FF.
+ * ================================================================
+ *
+ * WHY IT LIVES IN THIS FILE and not beside nv2a_ff_vertex: the text it
+ * produces has to be interchangeable with the text above. nv2a_metal.m's
+ * vsh_wrap() finds the vsh_main signature with strstr, rewrites the
+ * [[stage_in]] aliases line by line, and appends a vs_gpu wrapper -- and it is
+ * used UNCHANGED for both emitters. So the signature, the VS_IN alias lines,
+ * the VSH_Viewport struct and the VS_OUT struct below are byte-identical to
+ * the ones nv2a_vsh_generate_msl emits, on purpose. Change one and change the
+ * other, or the wrapper silently stops matching and the program is refused.
+ *
+ * THREE PLACES THIS DELIBERATELY DIFFERS FROM THE PROGRAMMABLE EMITTER, each
+ * one a real difference between the two CPU paths rather than a preference:
+ *
+ *   NO SUBPIXEL SNAP. prepare_vertices truncates screen x and y to 1/16 in its
+ *   programmable branch only (nv2a_pb_exec.c:2779); its fixed-function branch
+ *   copies nv2a_ff_vertex's output straight through. Snapping here would move
+ *   every fixed-function vertex by up to a sixteenth of a pixel relative to
+ *   the CPU path it is replacing.
+ *
+ *   NO saturate ON THE COLOURS. The programmable epilogue writes
+ *   saturate(oD0); the fixed-function sink uploads vertices[i][3] raw into
+ *   Vertex.d0. nv2a_ff_vertex clamps only inside its lighting block, with
+ *   clamp01, and that clamp is reproduced below where it belongs.
+ *
+ *   OUTPUT REGISTERS SEED TO ZERO, not to (0,0,0,1). nv2a_vsh_execute seeds
+ *   every output's w to 1 before a program runs; nv2a_ff_vertex memsets its
+ *   whole output array to zero and never writes oFog, oPts, oB0 or oB1. The
+ *   sixteen-register diff test compares those slots, so seeding them wrong
+ *   would be a mismatch in four registers that reach nothing.
+ *
+ * THE ARITHMETIC IS WRITTEN TO MATCH nv2a_ff.c EXPRESSION BY EXPRESSION, not
+ * to be idiomatic MSL, and the differences are not cosmetic:
+ *
+ *   ff_dot4 sums LEFT TO RIGHT FROM 0.0f. matrix() sets out[row]=0 and then
+ *   accumulates, so the sum starts at +0.0. dot() may reassociate over four
+ *   terms; and dropping the leading `0.0f +` changes the sign of the result
+ *   when every product is -0.0, which changes +inf into -inf one line later at
+ *   the perspective divide. Under safe math the compiler must keep it.
+ *
+ *   #pragma clang fp contract(off), for the reason set out at length in
+ *   nv2a_vsh_generate_msl: safe math and contraction are independent switches,
+ *   and a fused multiply-add differs from multiply-then-add by one rounding of
+ *   the product. The CPU side is a plain C loop that does not fuse.
+ *
+ *   ff_clamp01 is spelled out rather than written as clamp() or saturate().
+ *   clamp01() in nv2a_ff.c is `x<0?0:x>1?1:x`, which returns NaN for NaN;
+ *   what Metal's clamp and saturate do with NaN is not specified the same way.
+ *
+ * HIGH RISK. Everything in this comment compiles fine if it is wrong. A
+ * transposed viewport divide, a swapped component in a texgen, a dot product
+ * missing its w term: all of them produce legal MSL and a black or scrambled
+ * screen, and this project has paid for that twice. The only thing that makes
+ * this shippable is diagnostics/jsrf_first_fault/ff_msl_diff_test.m, which
+ * runs the emitted function on a device and diffs all sixteen output registers
+ * against nv2a_ff_vertex itself. Its injected-fault control is what says the
+ * comparison is alive.
+ */
+static void ff_emit_texgen_component(StrBuf *sb, const NV2AFFKey *key,
+                                     int unit, int comp)
+{
+    static const char comps[] = "xyzw";
+    if (key->texgen[unit][comp])
+        sb_append(sb, "    g%d.%c = nrm.%c;\n", unit, comps[comp], comps[comp]);
+    else
+        sb_append(sb, "    g%d.%c = v%d.%c;\n", unit, comps[comp],
+                  9 + unit, comps[comp]);
+}
+
+int nv2a_ff_generate_msl(const NV2AFFKey *key, char *buf, int bufsize)
+{
+    StrBuf sb;
+    int i, u, k;
+    if (!key || !buf || bufsize <= 0) return 0;
+    /* A key from an older emitter is a wrong picture with no error, so it is
+     * refused rather than interpreted. */
+    if (key->version != (uint8_t)NV2A_FF_KEY_VERSION) return 0;
+    if (!(key->inputs & 1u)) return 0;             /* no position, no transform */
+
+    sb_init(&sb, buf, bufsize);
+    sb_append(&sb,
+        "/* Auto-generated NV2A fixed-function transform (key v%u) */\n"
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "#pragma clang fp contract(off)\n"
+        "\n", (unsigned)key->version);
+    sb_append(&sb,
+        "/* Left to right from +0.0, exactly as matrix() in nv2a_ff.c\n"
+        " * accumulates into an out[row] it has just set to zero. */\n"
+        "float ff_dot4(float4 a, float4 b) { float4 p = a * b;\n"
+        "    return (((0.0f + p.x) + p.y) + p.z) + p.w; }\n"
+        "/* clamp01() in nv2a_ff.c, including what it does with NaN. */\n"
+        "float ff_clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }\n"
+        "\n");
+
+    /* VS_IN -- byte-identical in shape to the programmable emitter's, because
+     * vsh_wrap() rewrites these alias lines by exact string match. */
+    sb_append(&sb, "struct VS_IN {\n");
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+        if (key->inputs & (1u << i))
+            sb_append(&sb, "    float4 v%d [[attribute(%d)]];\n", i, i);
+    sb_append(&sb, "};\n\n");
+
+    sb_append(&sb,
+        "struct VSH_Viewport {\n"
+        "    float width;   /* NV097_SET_SURFACE_CLIP width  */\n"
+        "    float height;  /* NV097_SET_SURFACE_CLIP height */\n"
+        "    float depth;   /* z divisor, 16777215 for a 24-bit depth buffer */\n"
+        "};\n\n");
+    sb_append(&sb,
+        "struct VS_OUT {\n"
+        "    float4 oPos [[position]];\n"
+        "    float4 oD0;\n"
+        "    float4 oD1;\n"
+        "    float4 oT0;\n"
+        "    float4 oT1;\n"
+        "    float4 oT2;\n"
+        "    float4 oT3;\n"
+        "    float  oFog;\n"
+        "    float  oPts [[point_size]];\n"
+        "    float4 oB0;\n"
+        "    float4 oB1;\n"
+        "};\n\n");
+
+    sb_append(&sb, "vertex VS_OUT vsh_main(VS_IN input [[stage_in]],\n"
+                   "                      constant float4 *c [[buffer(1)]],\n"
+                   "                      constant VSH_Viewport &viewport [[buffer(2)]]) {\n");
+
+    sb_append(&sb, "    /* Input register aliases */\n");
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+        if (key->inputs & (1u << i))
+            sb_append(&sb, "    float4 v%d = input.v%d;\n", i, i);
+    sb_append(&sb, "\n");
+
+    /* nv2a_ff_vertex memsets its whole output array; these four are never
+     * written after that and the diff test compares them. */
+    sb_append(&sb,
+        "    /* Output registers (all zero, as nv2a_ff_vertex's memset leaves them) */\n"
+        "    float4 oPos = float4(0,0,0,0);\n"
+        "    float4 oD0  = float4(0,0,0,0);\n"
+        "    float4 oD1  = float4(0,0,0,0);\n"
+        "    float4 oFog = float4(0,0,0,0);\n"
+        "    float4 oPts = float4(0,0,0,0);\n"
+        "    float4 oB0  = float4(0,0,0,0);\n"
+        "    float4 oB1  = float4(0,0,0,0);\n"
+        "    float4 oT0  = float4(0,0,0,0);\n"
+        "    float4 oT1  = float4(0,0,0,0);\n"
+        "    float4 oT2  = float4(0,0,0,0);\n"
+        "    float4 oT3  = float4(0,0,0,0);\n"
+        "\n");
+
+    /* 1. composite transform, 2. perspective divide, 3. viewport offset.
+     * The composite matrix already carries the viewport SCALE -- measured, see
+     * the header of nv2a_ff.h -- so only the offset is applied here. */
+    sb_append(&sb,
+        "    /* Composite matrix (0x0680), which already carries the viewport scale */\n"
+        "    float4 clipv = float4(ff_dot4(c[%d], v0), ff_dot4(c[%d], v0),\n"
+        "                          ff_dot4(c[%d], v0), ff_dot4(c[%d], v0));\n"
+        "    oPos = clipv;\n"
+        "    oPos.x = clipv.x / clipv.w + c[%d].x;\n"
+        "    oPos.y = clipv.y / clipv.w + c[%d].y;\n"
+        "    oPos.z = clipv.z / clipv.w;\n"
+        "    oPos.w = clipv.w;\n"
+        "\n",
+        NV2A_FF_C_COMPOSITE + 0, NV2A_FF_C_COMPOSITE + 1,
+        NV2A_FF_C_COMPOSITE + 2, NV2A_FF_C_COMPOSITE + 3,
+        NV2A_FF_C_VIEWPORT, NV2A_FF_C_VIEWPORT);
+
+    /* Colours pass through untouched unless the lighting block below rewrites
+     * D0. D1 is never lit on this path, exactly as nv2a_ff_vertex leaves it. */
+    sb_append(&sb,
+        "    oD0 = v3;\n"
+        "    oD1 = v4;\n"
+        "\n");
+
+    /* THE NORMAL IS COMPUTED ONLY IF SOMETHING READS IT.
+     *
+     * nv2a_ff_vertex multiplies by the 0x0580 matrix unconditionally and then,
+     * with lighting off and no NORMAL_MAP texgen, reads the result nowhere --
+     * sixteen multiply-adds of dead arithmetic per vertex on the CPU, in the
+     * measured-common case. Not emitting it here is not a divergence: an
+     * unread value cannot change an output. */
+    if (key->normal_read) {
+        sb_append(&sb,
+            "    /* Inverse model-view (0x0580) applied to (normal.xyz, 0) */\n"
+            "    float4 nin = float4(v2.x, v2.y, v2.z, 0.0f);\n"
+            "    float4 nrm = float4(ff_dot4(c[%d], nin), ff_dot4(c[%d], nin),\n"
+            "                        ff_dot4(c[%d], nin), 0.0f);\n",
+            NV2A_FF_C_NORMAL + 0, NV2A_FF_C_NORMAL + 1, NV2A_FF_C_NORMAL + 2);
+        if (key->normalise)
+            /* Reached only under RECOMP_FF_GPU_NORMAL_ZERO: without it
+             * nv2a_ff_key refuses this shape, because the CPU path REFUSES THE
+             * BATCH for a degenerate normal something reads and a vertex
+             * function cannot. See the note beside that refusal. */
+            sb_append(&sb,
+                "    /* length3() in nv2a_ff.c: sqrtf(x*x + y*y + z*z) */\n"
+                "    float nlen = sqrt((nrm.x * nrm.x + nrm.y * nrm.y) + nrm.z * nrm.z);\n"
+                "    if (!isfinite(nlen) || nlen == 0.0f) { nrm.x = 0.0f; nrm.y = 0.0f; nrm.z = 0.0f; }\n"
+                "    else { nrm.x = nrm.x / nlen; nrm.y = nrm.y / nlen; nrm.z = nrm.z / nlen; }\n");
+        sb_append(&sb, "\n");
+    }
+
+    if (key->lighting) {
+        /* Component by component and in the interpreter's own order: the CPU
+         * loop recomputes N.L for each of x, y and z and accumulates
+         * `illumination += ambient_k + ndotl * diffuse_k`, which is one add of
+         * a sum and not two separate adds. */
+        sb_append(&sb, "    /* Infinite-light diffuse and ambient, per component,\n"
+                       "     * in nv2a_ff.c's own accumulation order */\n");
+        sb_append(&sb, "    float3 illum = float3(c[%d].x, c[%d].y, c[%d].z);\n",
+                  NV2A_FF_C_AMBIENT, NV2A_FF_C_AMBIENT, NV2A_FF_C_AMBIENT);
+        for (i = 0; i < 8; i++) {
+            int at = NV2A_FF_C_LIGHT + i * 3;
+            if (!(key->lights & (1u << i))) continue;
+            sb_append(&sb,
+                "    {   float3 d%d = float3(c[%d].x, c[%d].y, c[%d].z);\n"
+                "        float ndotl%d = fmax(0.0f, -((nrm.x * d%d.x + nrm.y * d%d.y) + nrm.z * d%d.z));\n"
+                "        illum = illum + (float3(c[%d].x, c[%d].y, c[%d].z)\n"
+                "                         + ndotl%d * float3(c[%d].x, c[%d].y, c[%d].z));\n"
+                "    }\n",
+                i, at + 2, at + 2, at + 2,
+                i, i, i, i,
+                at + 0, at + 0, at + 0,
+                i, at + 1, at + 1, at + 1);
+        }
+        sb_append(&sb,
+            "    oD0.x = ff_clamp01(c[%d].x + v3.x * illum.x);\n"
+            "    oD0.y = ff_clamp01(c[%d].y + v3.y * illum.y);\n"
+            "    oD0.z = ff_clamp01(c[%d].z + v3.z * illum.z);\n"
+            "    oD0.w = ff_clamp01(v3.w * c[%d].w);\n"
+            "\n",
+            NV2A_FF_C_MATERIAL, NV2A_FF_C_MATERIAL, NV2A_FF_C_MATERIAL,
+            NV2A_FF_C_MATERIAL);
+    }
+
+    /* Texgen, then the optional texture matrix, per unit. The transpose lives
+     * in the packer, so there is one form here whatever
+     * RECOMP_FF_TEXMAT_TRANSPOSE says. */
+    for (u = 0; u < 4; u++) {
+        sb_append(&sb, "    float4 g%d;\n", u);
+        for (k = 0; k < 4; k++) ff_emit_texgen_component(&sb, key, u, k);
+        if (key->texmat[u]) {
+            int at = NV2A_FF_C_TEXMAT + u * 4;
+            sb_append(&sb,
+                "    oT%d = float4(ff_dot4(c[%d], g%d), ff_dot4(c[%d], g%d),\n"
+                "                 ff_dot4(c[%d], g%d), ff_dot4(c[%d], g%d));\n",
+                u, at + 0, u, at + 1, u, at + 2, u, at + 3, u);
+        } else {
+            sb_append(&sb, "    oT%d = g%d;\n", u, u);
+        }
+    }
+    sb_append(&sb, "\n");
+
+    /* The epilogue, and ONLY the epilogue, is shared in meaning with the
+     * programmable emitter: the fixed `vs` in nv2a_metal.m, minus the subpixel
+     * snap that the fixed-function CPU branch does not do. The marker text is
+     * the one ff_msl_diff_test.m truncates at, so it must stay recognisable. */
+    sb_append(&sb,
+        "    /* Screen-space fixup (see comment in nv2a_vsh_msl.c) */\n"
+        "    float z = oPos.z / viewport.depth;\n"
+        "\n"
+        "    /* Write outputs */\n"
+        "    VS_OUT o;\n"
+        "    o.oPos = float4((oPos.x / viewport.width * 2.0f - 1.0f) * oPos.w,\n"
+        "                    (1.0f - oPos.y / viewport.height * 2.0f) * oPos.w,\n"
+        "                    z * oPos.w, oPos.w);\n"
+        "    o.oD0  = oD0;\n"
+        "    o.oD1  = oD1;\n"
+        "    o.oT0  = oT0;\n"
+        "    o.oT1  = oT1;\n"
+        "    o.oT2  = oT2;\n"
+        "    o.oT3  = oT3;\n"
+        "    o.oFog = oFog.x;\n"
+        "    o.oPts = oPts.x;\n"
+        "    o.oB0  = oB0;\n"
+        "    o.oB1  = oB1;\n"
         "    return o;\n"
         "}\n");
 

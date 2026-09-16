@@ -195,7 +195,21 @@ static int g_vsh_dp_zero = -1;
 int nv2a_vsh_dp_zero_on(void)
 {
     if (g_vsh_dp_zero < 0) {
-        g_vsh_dp_zero = recomp_switch_on("RECOMP_VSH_DP_ZERO");
+        /* DEFAULT ON since 16 Sep 2026. Evidence: 13 -> 0 mismatches over
+         * the title's 126 programs in the GPU diff test, no frame cost
+         * (57.3 -> 58.6 fps), a player confirming the fences on their own
+         * build, and a scripted run whose log read "vsh_dp_zero OFF" while
+         * the player watched the fences vanish in its window. Only the
+         * literal RECOMP_VSH_DP_ZERO=0 turns it off, so an A/B is still one
+         * token away and the state still prints below. */
+        {   /* An EMPTY variable keeps the default: `VAR= cmd` is how a
+             * shell unsets one for a command (recomp_switch.h), and a
+             * harness that exports it empty must not turn the fence fix
+             * off. Only a non-empty value that is not "0" or "0" itself
+             * decides. */
+            const char *e = getenv("RECOMP_VSH_DP_ZERO");
+            g_vsh_dp_zero = (e && *e) ? recomp_switch_on("RECOMP_VSH_DP_ZERO") : 1;
+        }
         /* recomp_switch.h: a switch that never names itself in a report cannot
          * be checked between the arms of an A/B, and three switches here were
          * believed for a while because nobody could. This file has no periodic

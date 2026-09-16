@@ -348,6 +348,26 @@ unsigned long long g_vsh_reuse_hits, g_vsh_reuse_mismatch;
  * apu_vp.c earlier the same day -- and not swept for anywhere else, which is
  * why it was still here. The right shape for an A/B switch is atoi; the
  * presence test is right only for a trace nobody passes =0 to. */
+/* FIXED-FUNCTION TRANSFORM AND LIGHTING ON THE GPU. Default OFF.
+ *
+ * The sibling of RECOMP_METAL_VSH, one layer down: that switch moved the
+ * guest's own vertex PROGRAMS onto the GPU and left every fixed-function batch
+ * on the CPU, which in a gameplay run is most of them --
+ *
+ *   [METAL] vsh draws: 508174 GPU, 707669 CPU
+ *   render-investigation/idxfix3/stderr.log:36987, [APU-VOICE] on=192..239
+ *
+ * -- and 520 of that run's 829 million index slots. OFF by default because a
+ * generated shader that is subtly wrong compiles cleanly and draws black; the
+ * gate that says this one does not is
+ * diagnostics/jsrf_first_fault/ff_msl_diff_test.m, and it must have passed on
+ * this emitter before the switch is turned on. */
+static int ff_gpu_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_FF");
+    return on;
+}
 static int vsh_reuse_on(void)
 {
     static int on = -1;
@@ -648,6 +668,149 @@ static double trace_seconds(void)
     if (!origin.tv_sec && !origin.tv_nsec) origin = now;
     return (double)(now.tv_sec - origin.tv_sec)
          + (double)(now.tv_nsec - origin.tv_nsec) / 1e9;
+}
+
+/* RECOMP_FF_BATCH_DUMP=<max lines> -- one line per FIXED-FUNCTION batch, the
+ * same record from either arm, so the GPU path (RECOMP_METAL_FF=1) and the CPU
+ * path (=0) can be diffed batch by batch. Exists because on 16 Sep 2026 the
+ * GPU path drew two corrupt glyphs in Gum's tutorial text and the CPU path
+ * did not, and jsrf_ff_msl_diff_test could not see it: that test feeds both
+ * emitters synthetic inputs, and whatever state those two glyph batches carry
+ * that the others do not was never in it. This prints what a real batch
+ * carries: the key, the texture-matrix enables, the stage-0 texture, the
+ * attribute layout, the "current" registers an unsized attribute falls back
+ * to, the first vertex's inputs -- and, in BOTH arms, what nv2a_ff_vertex
+ * says the outputs should be, so the GPU arm's record can be checked against
+ * the CPU transform it replaced without a second run.
+ *
+ *   RECOMP_FF_BATCH_DUMP_AFTER=<seconds>  start printing at this wall-clock
+ *   RECOMP_FF_BATCH_DUMP_TEX=<hex>        only batches whose stage-0 texture
+ *                                         offset (0x1B00) equals this
+ *
+ * Read-only. The CPU transform it runs in the GPU arm bumps nv2a_ff.c's
+ * counters, which is why the [FF] counters are not comparable between a run
+ * with this set and one without. */
+/* RECOMP_FF_BATCH_WATCH_TEX=<hex> -- watch every fixed-function batch whose
+ * stage-0 texture offset is this, in either arm, and say when the vertex data
+ * a STATIC batch carries CHANGES between two draws of the same shape. Built
+ * for the glyph defect: the GPU fixed-function arm drew Gum's/Corn's speech
+ * bubble with two quote glyphs relocated onto the "C" of "Corn" in one frame
+ * of twenty-four (frame-bisect/ffglyph2/ff-on/fb/flip013.bmp), and the CPU
+ * arm never did. The text is static, so its position and texcoord rows must
+ * be identical draw to draw; if this instrument sees them change in the GPU
+ * arm, the data was wrong BEFORE the shader (a fetch from guest memory the
+ * guest had already reused, i.e. a race with the guest), and if it never
+ * sees them change while the picture does, the defect is after the fetch:
+ * packing, the ring, or the vertex function. Keyed by vertex count so the
+ * bubble and the name label are tracked separately. */
+#define FF_WATCH_KEYS 4
+#define FF_WATCH_MAX_VERTS 1024
+static struct {
+    uint32_t verts; unsigned long draws;
+    float pos[FF_WATCH_MAX_VERTS][4], t0[FF_WATCH_MAX_VERTS][4];
+} g_ff_watch[FF_WATCH_KEYS];
+static float g_ff_watch_pos[FF_WATCH_MAX_VERTS][4], g_ff_watch_t0[FF_WATCH_MAX_VERTS][4];
+static unsigned long g_ff_watch_changes;
+static uint32_t ff_watch_tex(void)
+{
+    static int init; static uint32_t tex;
+    if (!init) { const char *e = getenv("RECOMP_FF_BATCH_WATCH_TEX");
+                 tex = e ? (uint32_t)strtoul(e, NULL, 16) : 0; init = 1; }
+    return tex;
+}
+static void ff_watch_vertex(const char *arm, uint32_t i, const float inputs[16][4])
+{
+    uint32_t tex = ff_watch_tex();
+    if (!tex || s_methods[NV097_SET_TEXTURE_OFFSET / 4] != tex) return;
+    uint32_t n = s_gpu.idx_count;
+    if (n > FF_WATCH_MAX_VERTS || i >= n) return;
+    memcpy(g_ff_watch_pos[i], inputs[0], 16);
+    memcpy(g_ff_watch_t0[i], inputs[9], 16);
+    if (i + 1 != n) return;
+    /* last vertex: compare with the previous draw of this shape */
+    int k, free = -1;
+    for (k = 0; k < FF_WATCH_KEYS; ++k) {
+        if (g_ff_watch[k].verts == n) break;
+        if (free < 0 && !g_ff_watch[k].verts) free = k;
+    }
+    if (k == FF_WATCH_KEYS) { if (free < 0) return; k = free; g_ff_watch[k].verts = n; g_ff_watch[k].draws = 0; }
+    if (g_ff_watch[k].draws++) {
+        uint32_t j, diffs = 0, first = n; const char *what = "";
+        for (j = 0; j < n; ++j) {
+            int dp = memcmp(g_ff_watch[k].pos[j], g_ff_watch_pos[j], 16);
+            int dt = memcmp(g_ff_watch[k].t0[j], g_ff_watch_t0[j], 16);
+            if (dp || dt) { if (first == n) { first = j; what = dp && dt ? "pos+t0" : dp ? "pos" : "t0"; } ++diffs; }
+        }
+        if (diffs) {
+            ++g_ff_watch_changes;
+            fprintf(stderr, "[FF-WATCH] t=%.2f arm=%s verts=%u draw#%lu CHANGED %u vertices,"
+                    " first v%u (%s): pos (%g %g %g %g)->(%g %g %g %g) t0 (%g %g)->(%g %g)\n",
+                    trace_seconds(), arm, n, g_ff_watch[k].draws, diffs, first, what,
+                    g_ff_watch[k].pos[first][0], g_ff_watch[k].pos[first][1],
+                    g_ff_watch[k].pos[first][2], g_ff_watch[k].pos[first][3],
+                    g_ff_watch_pos[first][0], g_ff_watch_pos[first][1],
+                    g_ff_watch_pos[first][2], g_ff_watch_pos[first][3],
+                    g_ff_watch[k].t0[first][0], g_ff_watch[k].t0[first][1],
+                    g_ff_watch_t0[first][0], g_ff_watch_t0[first][1]);
+        }
+    } else {
+        fprintf(stderr, "[FF-WATCH] t=%.2f arm=%s verts=%u first draw of this shape, tracking\n",
+                trace_seconds(), arm, n);
+    }
+    memcpy(g_ff_watch[k].pos, g_ff_watch_pos, (size_t)n * 16);
+    memcpy(g_ff_watch[k].t0, g_ff_watch_t0, (size_t)n * 16);
+}
+
+static void ff_batch_dump(const char *arm, const float inputs[16][4],
+                          const void *key, unsigned keysize)
+{
+    static int max = -1, after = 0; static uint32_t tex = 0; static int shown;
+    if (max < 0) {
+        const char *e = getenv("RECOMP_FF_BATCH_DUMP");
+        max = e ? atoi(e) : 0;
+        e = getenv("RECOMP_FF_BATCH_DUMP_AFTER"); after = e ? atoi(e) : 0;
+        e = getenv("RECOMP_FF_BATCH_DUMP_TEX"); tex = e ? (uint32_t)strtoul(e, NULL, 16) : 0;
+    }
+    static unsigned long ff_batches;   /* s_vsh.batches counts PROGRAMMABLE batches only */
+    ++ff_batches;
+    if (!max || shown >= max) return;
+    if (trace_seconds() < (double)after) return;
+    uint32_t tex0 = s_methods[NV097_SET_TEXTURE_OFFSET / 4];
+    if (tex && tex0 != tex) return;
+    ++shown;
+    float expect[16][4]; memset(expect, 0, sizeof expect);
+    const char *why = nv2a_ff_vertex(s_methods, inputs, expect);
+    fprintf(stderr, "[FF-BATCH] t=%.2f arm=%s ffbatch=%lu verts=%u prim=%u"
+            " tex0=%08X fmt0=%08X texmat_en=%u,%u,%u,%u",
+            trace_seconds(), arm, ff_batches,
+            (unsigned)s_gpu.idx_count, (unsigned)s_gpu.prim,
+            tex0, s_methods[NV097_SET_TEXTURE_FORMAT / 4],
+            s_methods[0x420/4], s_methods[0x424/4],
+            s_methods[0x428/4], s_methods[0x42c/4]);
+    if (key) {
+        const uint8_t *kb = (const uint8_t *)key; unsigned k;
+        fprintf(stderr, " key=");
+        for (k = 0; k < keysize; ++k) fprintf(stderr, "%02x", kb[k]);
+    }
+    {
+        static const unsigned want[] = { 0, 3, 4, 9, 10, 11, 12 };
+        unsigned k;
+        for (k = 0; k < sizeof want / sizeof want[0]; ++k) {
+            unsigned a = want[k];
+            fprintf(stderr, " a%u=%u/%u/%u", a, s_gpu.attr[a].type,
+                    s_gpu.attr[a].size, s_gpu.attr[a].stride);
+        }
+    }
+    fprintf(stderr, " cur9=(%g %g %g %g)", s_vsh.current[9][0],
+            s_vsh.current[9][1], s_vsh.current[9][2], s_vsh.current[9][3]);
+    fprintf(stderr, " | v0 pos=(%g %g %g %g) d0=(%g %g %g %g) t0=(%g %g %g %g)",
+            inputs[0][0], inputs[0][1], inputs[0][2], inputs[0][3],
+            inputs[3][0], inputs[3][1], inputs[3][2], inputs[3][3],
+            inputs[9][0], inputs[9][1], inputs[9][2], inputs[9][3]);
+    if (why) fprintf(stderr, " | cpu-transform REFUSED: %s\n", why);
+    else fprintf(stderr, " | expect oPos=(%g %g %g %g) oT0=(%g %g %g %g)\n",
+            expect[0][0], expect[0][1], expect[0][2], expect[0][3],
+            expect[9][0], expect[9][1], expect[9][2], expect[9][3]);
 }
 
 /* Distinct clear values, with the span of time each was live across. */
@@ -1444,6 +1607,87 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
  * NNN.bmp mixed them with nothing to tell them apart. Correlating "how many
  * are blank" against the flip log then counts report snapshots as presented
  * frames. The tag is what keeps the question answerable. */
+/* RECOMP_FB_WATCH=x,y,w,h -- at EVERY flip, compare a region of the presented
+ * copy (s_snap) with the same region at the previous flip and say when it
+ * changed. For a parked scene with static text the region must never change,
+ * so every line this prints is a frame the renderer got wrong -- and unlike
+ * RECOMP_FB_DUMP_FLIP's 24 captures it sees all of them, which is what a
+ * one-frame-in-a-thousand defect needs. Legitimate changes (the text advances,
+ * a cutscene cut) print too, with a large pixel count; corruption is a small
+ * count that reverts on the next flip. */
+static void dump_snapshot_bmp(const char *tag, unsigned seq);
+
+static void fb_watch(void)
+{
+    static int init, on; static uint32_t x0, y0, ww, hh;
+    static uint8_t *prev, *cur; static size_t have;
+    static unsigned long flips, changes;
+    if (!init) {
+        const char *e = getenv("RECOMP_FB_WATCH");
+        init = 1;
+        if (e && sscanf(e, "%u,%u,%u,%u", &x0, &y0, &ww, &hh) == 4 && ww && hh) {
+            on = 1; s_snap_wanted = 1;
+        }
+    }
+    if (!on || !s_snap || !s_snap_w || !s_snap_h) return;
+    if (x0 + ww > s_snap_w || y0 + hh > s_snap_h) return;
+    size_t row = (size_t)ww * s_snap_bpp, len = row * hh, y;
+    if (have != len) { free(prev); free(cur); prev = malloc(len); cur = malloc(len);
+                       have = len; if (!prev || !cur) { on = 0; return; }
+                       memset(prev, 0, len); }
+    for (y = 0; y < hh; ++y)
+        memcpy(cur + y * row,
+               s_snap + ((size_t)(y0 + y) * s_snap_w + x0) * s_snap_bpp, row);
+    ++flips;
+    if (flips > 1 && memcmp(prev, cur, len)) {
+        unsigned diff = 0; size_t p;
+        static unsigned long big, printed;
+        for (p = 0; p < len; p += s_snap_bpp)
+            if (memcmp(prev + p, cur + p, s_snap_bpp)) ++diff;
+        ++changes;
+        /* A whole-region change is the scene moving (gameplay, a fade, a
+         * cut) and would print sixty lines a second in a player's log; the
+         * defect this hunts is a few glyphs, i.e. a SMALL change. Small
+         * changes print, capped; the rest are counted. */
+        if (diff * 4 < ww * hh) {
+            if (printed++ < 2000)
+                fprintf(stderr, "[FB-WATCH] flip %lu t=%.2f region %u,%u %ux%u"
+                        " CHANGED: %u of %u pixels differ from the previous"
+                        " flip (small change #%lu, large so far %lu)\n",
+                        flips, trace_seconds(), x0, y0, ww, hh, diff, ww * hh,
+                        printed, big);
+            /* AND KEEP THE PICTURE. A line saying "643 pixels changed" cannot
+             * be told apart from a line saying "the text is animating", and
+             * the defect this hunts appeared ONCE in twenty-four captures --
+             * a periodic capture stride will almost always miss it. With
+             * RECOMP_FB_DUMP set, every small change writes the presented
+             * copy as watchNNN.bmp, so a long parked run either catches the
+             * corruption with evidence or proves it did not recur. Bounded,
+             * because a scene that animates text would otherwise fill the
+             * disk. */
+            {   /* AND ONLY ONCE THE SCENE HAS SETTLED. The first attempt
+                 * spent its whole budget on the dialogue typing itself out --
+                 * 59 dumps, all of them legitimate animation, before the
+                 * window where the defect was seen. RECOMP_FB_WATCH_AFTER is
+                 * the wall-clock second to start dumping at; in the parked
+                 * tutorial both arms measured ZERO small changes after the
+                 * text settles, so past that point every dump is a candidate
+                 * and the budget is not wasted. */
+                static unsigned dumped, cap = 0; static int after = -1;
+                if (!cap) { const char *e = getenv("RECOMP_FB_WATCH_DUMP");
+                            cap = e ? (unsigned)atoi(e) : 0;
+                            if (!cap) cap = 1; }   /* 1 = disabled sentinel */
+                if (after < 0) { const char *e = getenv("RECOMP_FB_WATCH_AFTER");
+                                 after = e ? atoi(e) : 0; }
+                if (cap > 1 && dumped < cap - 1
+                    && trace_seconds() >= (double)after)
+                    dump_snapshot_bmp("watch", dumped++);
+            }
+        } else ++big;
+    }
+    { uint8_t *t = prev; prev = cur; cur = t; }
+}
+
 static void write_bmp(const char *tag, unsigned seq,
                       const uint8_t *base, uint32_t pitch,
                       uint32_t x0, uint32_t y0,
@@ -2629,7 +2873,9 @@ static int prepare_vertices(void)
      * coordinates draw nothing recognisable and report no error. Caught by
      * jsrf_vsh_render, which draws a real JSRF program into an 8x8 surface and
      * checks every pixel. */
-    int gpu_vsh = 0;
+    int gpu_vsh = 0, gpu_ff = 0;
+    NV2AFFKey ff_key;
+    memset(&ff_key, 0, sizeof ff_key);
 #if defined(__APPLE__) && NV2A_GPU_PATH
     if (s_vsh_force_cpu) {
         /* The Metal draw rejected this batch and it is about to be handed to
@@ -2644,6 +2890,37 @@ static int prepare_vertices(void)
         if (gpu_vsh) nv2a_metal_vsh_constants(s_vsh.constants);
         else nv2a_metal_vsh_clear();
         s_vsh_gpu_batch = gpu_vsh;
+    } else if (!programmable && ff_gpu_on()) {
+        /* THE SAME QUESTION, ASKED OF THE FIXED-FUNCTION UNIT, and asked in the
+         * same place and the same order: the backend FIRST, and the transform
+         * only if it says no. nv2a_ff_key accepts a strict subset of what
+         * nv2a_ff_vertex supports, so a refusal here is the ordinary CPU batch
+         * that already worked, never a half-transformed one.
+         *
+         * The seen-table assignment is the one the CPU branch below already
+         * makes; it is hoisted because nv2a_ff_key reads that table to decide
+         * whether a texture matrix is a transform or an accident, and it runs
+         * before that branch does. */
+        nv2a_ff_method_seen = s_method_seen;
+        if (nv2a_ff_key(s_methods, &ff_key)) {
+            nv2a_ff_params(s_methods, &ff_key);
+            gpu_ff = nv2a_metal_ff_ready(&ff_key, (unsigned)sizeof ff_key,
+                                         ff_key.inputs);
+            /* nv2a_ff_key counted this batch as accepted before the backend
+             * was asked; if the backend refuses (vsh path off, compile
+             * failure, cache full) the batch runs on the CPU below and the
+             * report must say so rather than "0 left on the CPU". */
+            if (!gpu_ff) { --nv2a_ff_gpu_batches; ++nv2a_ff_gpu_cpu_batches;
+                           ++nv2a_ff_gpu_backend_refused; }
+            /* The same binding as a program's constant file, deliberately: the
+             * params are 192 float4, so nv2a_metal.m's existing
+             * setVertexBytes at index 1 needs no change at all. */
+            if (gpu_ff) nv2a_metal_vsh_constants((const float (*)[4])nv2a_ff_constants);
+            else nv2a_metal_vsh_clear();
+        } else {
+            nv2a_metal_vsh_clear();
+        }
+        s_vsh_gpu_batch = gpu_ff;
     } else {
         nv2a_metal_vsh_clear();
         s_vsh_gpu_batch = 0;
@@ -2928,6 +3205,35 @@ static int prepare_vertices(void)
                 fprintf(stderr, "  [VSH] start=%u slots=%d vertex=%u oPos=(%.6g %.6g %.6g %.6g) color=%08X\n",
                         s_vsh.start, s_vsh.decoded.length, i,
                         result.output[0][0], result.output[0][1], result.output[0][2], result.output[0][3], s_colors[i]);
+        } else if (gpu_ff) {
+            /* THE GPU PATH STOPS HERE, exactly as it does for a programmable
+             * program forty lines up: s_outputs carries the fixed-function
+             * unit's INPUTS, and the generated vertex function does the
+             * transform, the divide, the viewport offset and the texgen.
+             *
+             * Only the attributes the emitted function names are fetched. The
+             * CPU branch below fetches position, diffuse and four texture
+             * coordinates, and then fetches EVERY sized attribute again inside
+             * the nv2a_ff_vertex block -- so this is six fewer fetches per
+             * vertex as well as one fewer transform, and the fetch is the half
+             * of this stage the change could not otherwise remove. */
+            float inputs[16][4];
+            memcpy(inputs, s_vsh.current, sizeof(inputs));
+            for (uint32_t a = 0; a < 16; ++a)
+                if ((ff_key.inputs & (1u << a)) && s_gpu.attr[a].size
+                    && !fetch_vertex(a, s_gpu.idx[i], inputs[a]))
+                    VSH_REJECT("fixed-function vertex fetch", a);
+            /* The one refusal the batch KEY cannot carry, because it is a
+             * property of this vertex and not of the batch's shape. Same
+             * string as the CPU arm, so the reject table stays comparable. */
+            if (!nv2a_ff_clip_w_ok(inputs[0]))
+                VSH_REJECT("fixed-function clip W", 0);
+            nv2a_ff_count_texq(&ff_key, (const float (*)[4])inputs,
+                               s_copy.state.texture_mask);
+            memcpy(s_outputs[i], inputs, sizeof(s_outputs[i]));
+            if (i == 0) ff_batch_dump("gpu", (const float (*)[4])inputs,
+                                      &ff_key, (unsigned)sizeof ff_key);
+            ff_watch_vertex("gpu", i, (const float (*)[4])inputs);
         } else {
             float color[4];
             if (!fetch_vertex(0, s_gpu.idx[i], s_positions[i]))
@@ -2960,6 +3266,8 @@ static int prepare_vertices(void)
                 for(unsigned a=0;a<16;++a) if(s_gpu.attr[a].size)
                     if(!fetch_vertex(a,s_gpu.idx[i],inputs[a])) VSH_REJECT("fixed-function vertex fetch",a);
                 const char *reason=nv2a_ff_vertex(s_methods,inputs,s_outputs[i]);
+                if(i==0) ff_batch_dump("cpu",(const float (*)[4])inputs,NULL,0);
+                ff_watch_vertex("cpu", i, (const float (*)[4])inputs);
                 if(reason) VSH_REJECT(reason,0);
                 /* RECOMP_FF_DUMP=1 -- READ-ONLY, answers two questions that
                  * cannot be settled by argument, and both have a fix attached
@@ -3854,6 +4162,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
 #endif
         surface_audit(1);
         snapshot_surface();
+        fb_watch();
         flip_trace();
         break;
 
@@ -4392,6 +4701,32 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "[VSH] degenerate normals: %lu drawn (nothing read it)"
                 ", %lu still rejected (lighting or NORMAL_MAP texgen reads it)\n",
                 nv2a_ff_normal_unread, nv2a_ff_normal_read);
+    /* WHERE THE FIXED-FUNCTION BATCHES WENT. Printed whenever the switch is on
+     * or anything counted, because the whole claim of RECOMP_METAL_FF is that
+     * the first number is large: a build where it is small has a refusal
+     * reason beside it rather than a shrug. accepted + left-on-the-CPU is every
+     * batch the key was asked about, so the columns add up and a missing batch
+     * is visible.
+     *
+     * READ THIS BESIDE "[METAL] vsh draws", not instead of it. Once the switch
+     * is on, a fixed-function batch also counts as a GPU draw over there, so
+     * the identity that used to hold -- executed batches == vsh draws GPU --
+     * no longer does, by design. This line is what restores the split. */
+    if (ff_gpu_on() || nv2a_ff_gpu_batches || nv2a_ff_gpu_cpu_batches)
+        fprintf(stderr, "[VSH] fixed-function on the GPU (metal_ff %s):"
+                " %lu batches accepted, %lu left on the CPU"
+                " (%lu skinning, %lu texgen, %lu local/spot light,"
+                " %lu degenerate-normal shape, %lu backend refused,"
+                " %lu clip-w vertices, %lu q<=0 vertices the sink would have"
+                " dropped); texture matrix:"
+                " %lu never uploaded, %lu all-zero\n",
+                ff_gpu_on() ? "on" : "OFF",
+                nv2a_ff_gpu_batches, nv2a_ff_gpu_cpu_batches,
+                nv2a_ff_gpu_no_skin, nv2a_ff_gpu_no_texgen,
+                nv2a_ff_gpu_no_light, nv2a_ff_gpu_no_normal,
+                nv2a_ff_gpu_backend_refused, nv2a_ff_gpu_clip_w,
+                nv2a_ff_gpu_texq_would_drop,
+                nv2a_ff_gpu_texmat_unset, nv2a_ff_gpu_texmat_zero);
     for (size_t i = 0; i < sizeof s_vsh_reject / sizeof s_vsh_reject[0]; ++i) {
         if (!s_vsh_reject[i].reason) break;
         fprintf(stderr, "[VSH]   %8u  %s (first detail %u)\n",
