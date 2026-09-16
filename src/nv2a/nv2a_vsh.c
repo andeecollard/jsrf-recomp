@@ -4,7 +4,9 @@
  * This implementation uses upload-order words, not an SDK instruction header.
  */
 #include "nv2a_vsh.h"
+#include "../recomp_switch.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 unsigned nv2a_vsh_mac_sources(NV2AVshMacOp op)
@@ -145,12 +147,83 @@ static float multiply(float a, float b)
     return a == 0.0f || b == 0.0f ? 0.0f : a * b;
 }
 
+/* IS THE ZERO RULE ALSO THE DOT PRODUCT'S RULE? RECOMP_VSH_DP_ZERO=1 says yes.
+ *
+ * multiply() above is reached by MAC_MUL and MAC_MAD and by nothing else, so
+ * the same zero that is suppressed through a MUL produces a NaN through a DP3
+ * one slot later. ilu_eval's RSQ is 1/sqrt(|c.x|), which is +inf at c.x == 0
+ * -- a vertex whose normal is the zero vector -- and 0 * inf is NaN wherever a
+ * plain `*` gets hold of it.
+ *
+ * WHAT IT COSTS WHEN IT HAPPENS, and why it is not a cosmetic difference: a
+ * NaN in a dot product that feeds a texture coordinate leaves oPos finite, so
+ * the triangle is still drawn and then samples garbage. On an alpha-cutout
+ * texture -- a wire fence -- the object disappears rather than going visibly
+ * wrong, which is the failure mode that does not announce itself.
+ *
+ * WHY IT IS OFF, and why it stays off until a run says otherwise:
+ *
+ *   - [M] The dot products are the busiest MAC ops this title has. Over the
+ *     126 distinct vertex programs in its own default.xbe: DP4 1248
+ *     instructions, DP3 641, DPH 0. Turning this on puts a compare and a
+ *     select on every component of every one of them, on the hottest path in
+ *     the renderer, and that has NOT been measured against frame time.
+ *   - [M] The population it can actually change is far smaller than that: 102
+ *     of those 1889 dot products (46 DP3, 56 DP4) read an operand produced by
+ *     an RCP, RCC or RSQ, which is where a non-finite operand comes from at
+ *     all. The other 1787 pay the compare and cannot change an answer.
+ *   - The RULE is read across from multiply(), which was itself verified
+ *     against the MSL emitter and not against an NV2A. Nothing here has been
+ *     compared with hardware.
+ *
+ * MAC_DST IS DELIBERATELY NOT COVERED. Its `a[1]*b[1]` below is a plain
+ * multiply, and the note beside DST in nv2a_vsh_msl.c justifies that by saying
+ * the emitter matches the interpreter. That is a MUTUAL-CONSISTENCY argument,
+ * not evidence about hardware: it was equally true of these three dot products
+ * until this switch existed, and it would have justified leaving them alone.
+ * DST is out of scope here for a different and better reason -- [M] it occurs
+ * zero times in the title's 126 programs, so no run can score it, while DP3
+ * and DP4 occur 1889 times.
+ *
+ * THE MSL EMITTER READS THIS PREDICATE, not a second getenv of its own. The
+ * interpreter and the generated shader are the two arms of the comparison in
+ * diagnostics/jsrf_first_fault/vsh_msl_diff_test.m, and that comparison means
+ * nothing if they land on opposite sides of a switch. Not declared in
+ * nv2a_vsh.h: this is a switch, not API. */
+static int g_vsh_dp_zero = -1;
+
+int nv2a_vsh_dp_zero_on(void)
+{
+    if (g_vsh_dp_zero < 0) {
+        g_vsh_dp_zero = recomp_switch_on("RECOMP_VSH_DP_ZERO");
+        /* recomp_switch.h: a switch that never names itself in a report cannot
+         * be checked between the arms of an A/B, and three switches here were
+         * believed for a while because nobody could. This file has no periodic
+         * report to hang it on, so it says so once, in the shape
+         * nv2a_pb_exec.c's [VSH-REUSE] line uses. */
+        fprintf(stderr, "  [VSH] (vsh_dp_zero %s)\n", g_vsh_dp_zero ? "on" : "OFF");
+        fflush(stderr);
+    }
+    return g_vsh_dp_zero;
+}
+
 static void mac_eval(NV2AVshMacOp op, float s[3][4], float out[4])
 {
     const float *a = s[0], *b = s[1], *c = s[2];
     float dot = 0.0f;
     if (op == NV2A_VSH_MAC_DP3 || op == NV2A_VSH_MAC_DPH || op == NV2A_VSH_MAC_DP4) {
-        for (int k = 0; k < (op == NV2A_VSH_MAC_DP4 ? 4 : 3); ++k) dot += a[k]*b[k];
+        const int n = op == NV2A_VSH_MAC_DP4 ? 4 : 3;
+        /* The predicate is read once per dot product and hoisted out of the
+         * component loop -- the same reason the opcode switch below is not
+         * inside one. The OFF arm reads the cached variable directly rather
+         * than calling through nv2a_vsh_dp_zero_on, so it pays a predictable
+         * load and not a call per instruction per vertex. */
+        const int zero = g_vsh_dp_zero < 0 ? nv2a_vsh_dp_zero_on() : g_vsh_dp_zero;
+        if (zero) for (int k = 0; k < n; ++k) dot += multiply(a[k], b[k]);
+        else      for (int k = 0; k < n; ++k) dot += a[k]*b[k];
+        /* DPH's fourth term is 1 * b[3] and the rule cannot touch it: one
+         * operand is never zero, and where b[3] is zero the product is +0
+         * either way. It stays a bare add, so both arms agree here. */
         if (op == NV2A_VSH_MAC_DPH) dot += b[3];
     }
     /* Switch once, then run the component loop -- not the reverse. This used to

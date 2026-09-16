@@ -42,11 +42,27 @@
  * Read that file's header for what the result does and does not prove --
  * DPH, DST, EXP, LOG and LIT appear in no program this title ships, so they
  * are checked only against fixtures, and LIT is still knowingly wrong.
+ *
+ * A THIRD defect of the same family is present but NOT fixed by default: the
+ * dot products carried the plain semantics too, so an infinity the MUL rule
+ * suppresses becomes a NaN one slot later through a DP3. RECOMP_VSH_DP_ZERO=1
+ * turns the rule on in the dot products, in BOTH implementations at once --
+ * the emitter reads nv2a_vsh.c's predicate rather than getenv'ing its own, so
+ * the two arms of the diff cannot separate. Off by default; the argument for
+ * and against is beside nv2a_vsh_dp_zero_on in nv2a_vsh.c, and the emitted
+ * shader names the arm it was generated in on its first line.
  */
 #include "nv2a_vsh.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+
+/* RECOMP_VSH_DP_ZERO -- does the multiply-by-zero rule reach DP3/DPH/DP4?
+ * Defined in nv2a_vsh.c, which carries the whole argument for it; declared
+ * here rather than in nv2a_vsh.h because it is a switch and not API. Read
+ * through that one accessor on purpose: the emitted shader and the
+ * interpreter it is diffed against must never be on opposite sides of it. */
+int nv2a_vsh_dp_zero_on(void);
 
 /* ================================================================
  * MSL Code Generator
@@ -310,7 +326,21 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
 
     case NV2A_VSH_MAC_DP3:
         /* dst.xyzw = dot(A.xyz, B.xyz) replicated.
-         * MSL has no scalar swizzle: splat with float4(). */
+         * MSL has no scalar swizzle: splat with float4().
+         *
+         * RECOMP_VSH_DP_ZERO=1 swaps dot() for vsh_dp3, which is the same
+         * three products taken through vsh_mul and added in the interpreter's
+         * order; see the helper block in nv2a_vsh_generate_msl. The OFF text
+         * is unchanged to the byte, which is what vsh_msl_test.c asserts and
+         * what every measurement of this emitter so far was taken on. */
+        if (nv2a_vsh_dp_zero_on()) {
+            sb_append(&expr, "float4(vsh_dp3(");
+            emit_source(&expr, &inst->mac_src[0], 0);
+            sb_append(&expr, ", ");
+            emit_source(&expr, &inst->mac_src[1], 0);
+            sb_append(&expr, "))");
+            break;
+        }
         sb_append(&expr, "float4(dot(");
         emit_source(&expr, &inst->mac_src[0], 0);
         sb_append(&expr, ".xyz, ");
@@ -319,7 +349,18 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_DPH:
-        /* dst = dot(float4(A.xyz, 1.0), B) */
+        /* dst = dot(float4(A.xyz, 1.0), B).
+         * Under RECOMP_VSH_DP_ZERO the fourth term is B.w added raw, not
+         * vsh_mul(1, B.w): mac_eval adds b[3] raw, and the rule cannot change
+         * a product one of whose operands is 1. */
+        if (nv2a_vsh_dp_zero_on()) {
+            sb_append(&expr, "float4(vsh_dph(");
+            emit_source(&expr, &inst->mac_src[0], 0);
+            sb_append(&expr, ", ");
+            emit_source(&expr, &inst->mac_src[1], 0);
+            sb_append(&expr, "))");
+            break;
+        }
         sb_append(&expr, "float4(dot(float4(");
         emit_source(&expr, &inst->mac_src[0], 0);
         sb_append(&expr, ".xyz, 1.0f), ");
@@ -329,6 +370,14 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
 
     case NV2A_VSH_MAC_DP4:
         /* dst.xyzw = dot(A, B) replicated */
+        if (nv2a_vsh_dp_zero_on()) {
+            sb_append(&expr, "float4(vsh_dp4(");
+            emit_source(&expr, &inst->mac_src[0], 0);
+            sb_append(&expr, ", ");
+            emit_source(&expr, &inst->mac_src[1], 0);
+            sb_append(&expr, "))");
+            break;
+        }
         sb_append(&expr, "float4(dot(");
         emit_source(&expr, &inst->mac_src[0], 0);
         sb_append(&expr, ", ");
@@ -340,7 +389,16 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         /* dst = float4(1.0, A.y * B.y, A.z, B.w).
          * A PLAIN multiply, deliberately: mac_eval() computes DST in its own
          * block with `a[1]*b[1]` and does not route it through multiply(), so
-         * matching the interpreter here means NOT applying the zero rule. */
+         * matching the interpreter here means NOT applying the zero rule.
+         *
+         * THAT REASONING IS WEAKER THAN IT READS, and RECOMP_VSH_DP_ZERO is
+         * why it now says so. It argues only that the two implementations
+         * agree with each other; it says nothing about which one hardware
+         * agrees with, and it was equally true of DP3/DPH/DP4 -- which were
+         * plain on both sides for the same reason, and wrong. DST is left
+         * alone here because [M] it occurs zero times in the title's 126
+         * vertex programs, so nothing can measure it either way, not because
+         * the plain multiply has been shown to be right. */
         sb_append(&expr, "float4(1.0f, ");
         emit_source(&expr, &inst->mac_src[0], 0);
         sb_append(&expr, ".y * ");
@@ -544,11 +602,11 @@ int nv2a_vsh_generate_msl(const NV2AVshProgram *program,
      * MAD. Measure it before deciding it is too expensive, and if it is, the
      * honest alternative is to fuse BOTH sides, not to leave them different. */
     sb_append(&sb,
-        "/* Auto-generated NV2A vertex shader */\n"
+        "/* Auto-generated NV2A vertex shader (dp_zero %s) */\n"
         "#include <metal_stdlib>\n"
         "using namespace metal;\n"
         "#pragma clang fp contract(off)\n"
-        "\n");
+        "\n", nv2a_vsh_dp_zero_on() ? "on" : "OFF");
 
     /* Constants are a `constant float4 *` argument on main, declared below. */
     sb_append(&sb,
@@ -569,6 +627,39 @@ int nv2a_vsh_generate_msl(const NV2AVshProgram *program,
         "float4 vsh_exp(float x) { return float4(exp2(floor(x)), x-floor(x), exp2(x), 1.0f); }\n"
         "float4 vsh_log(float x) { float t=log2(abs(x));\n"
         "    return float4(floor(t), x==0.0f ? 1.0f : abs(x)/exp2(floor(t)), t, 1.0f); }\n\n");
+
+    /* THE HIGH-RISK HALF OF RECOMP_VSH_DP_ZERO, and why it is shaped this way.
+     * Metal has no zero-suppressing dot, so the dot has to be hand expanded,
+     * and a hand-expanded dot that is subtly wrong compiles cleanly and
+     * outputs black. Two decisions are what keep this one honest:
+     *
+     *   - the product goes through vsh_mul, the SAME helper MUL and MAD use
+     *     and the one piece of arithmetic in this file already checked against
+     *     a GPU. Nothing new is written that does the suppressing; the new
+     *     code is three adds.
+     *   - the components are summed left to right with explicit parentheses,
+     *     in the order mac_eval sums them. dot() is free to reassociate and
+     *     over three or four terms that is a real difference, so matching the
+     *     interpreter's association removes a source of residual disagreement
+     *     rather than adding one.
+     *
+     * COMPONENT COUNT CANNOT GO WRONG HERE because none of the three declares
+     * one: all take float4 whatever the opcode, DP3 drops p.w, DP4 uses it,
+     * and DPH adds b.w raw exactly as mac_eval does. The lane a DP3 does not
+     * use is still computed inside vsh_mul -- it cannot trap, and it folds
+     * away. The helpers are emitted only when the switch is on so that the OFF
+     * arm's text stays byte-identical to the text vsh_msl_test.c asserts. */
+    if (nv2a_vsh_dp_zero_on())
+        sb_append(&sb,
+        "/* RECOMP_VSH_DP_ZERO: the dot products carry the multiply-by-zero rule\n"
+        " * too. Each product goes through vsh_mul and the sum is associated left\n"
+        " * to right, matching nv2a_vsh.c's mac_eval. DPH adds b.w raw, as it does. */\n"
+        "float vsh_dp3(float4 a, float4 b) { float4 p = vsh_mul(a, b);\n"
+        "    return (p.x + p.y) + p.z; }\n"
+        "float vsh_dp4(float4 a, float4 b) { float4 p = vsh_mul(a, b);\n"
+        "    return ((p.x + p.y) + p.z) + p.w; }\n"
+        "float vsh_dph(float4 a, float4 b) { float4 p = vsh_mul(a, b);\n"
+        "    return ((p.x + p.y) + p.z) + b.w; }\n\n");
 
     /* Input structure - only declare used inputs.
      * An empty [[stage_in]] struct is not legal MSL, so a program that reads
