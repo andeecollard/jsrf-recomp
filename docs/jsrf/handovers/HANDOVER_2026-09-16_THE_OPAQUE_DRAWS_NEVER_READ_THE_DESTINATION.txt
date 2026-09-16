@@ -1,0 +1,360 @@
+HANDOVER, 16 Sep 2026
+THE OPAQUE DRAWS NEVER READ THE DESTINATION
+
+Supersedes HANDOVER_2026-09-15_SIX_DEFECTS_FIXED_AND_THE_PICTURE_IS_STILL_WRONG.txt.
+
+That file's open item 1 -- "run the depth and stencil bisect arms to a result.
+This is the whole remaining search space" -- is run, and the answer is negative
+on both arms. The search space was not what it said. The cause was found
+elsewhere, on the same day, and one existing switch removes it.
+
+
+1. THE HEADLINE
+================
+RECOMP_METAL_SHADER_BLEND=3 RENDERS THE HARDWARE PATH CLEAN AT GAMEPLAY.
+
+Sixteen arms were run today, each 280 s, one at a time, reaching gameplay, with
+24 captured frames apiece. The decisive three were taken against ONE pinned
+binary, same pad, run serially:
+
+  arm    mode  what it does                          blobs  x0 mod 4  frames
+  hw       1   dithered AND blended draws only        9676     43%    CORRUPT
+  rog2     2   every BLENDED draw reads dst under     11464    40%    CORRUPT
+               raster_order_group(0)
+  rog      3   EVERY draw reads dst under              8133     30%    CLEAN
+               raster_order_group(0)
+  sw       -   software path, the reference               -     30%    CLEAN
+
+`x0 mod 4` is the artefact's structural fingerprint: the fraction of corruption
+blocks whose left edge lands on a 4-pixel grid, against 25% by chance. The
+clean software control reads 30%. Mode 3 returns the hardware path to that
+number, and the frames are clean by eye across all 24.
+
+WHAT THIS LOCALISES. Mode 2 ALREADY takes every blended draw off the
+fixed-function blend unit and gives it a destination read. It is still corrupt.
+Mode 3 adds only the UNBLENDED draws. So the fixed-function blend unit is not
+the cause -- it was already bypassed for blended draws in the arm that failed.
+THE FIX COMES FROM GIVING OPAQUE, UNBLENDED GEOMETRY A DESTINATION READ UNDER
+raster_order_group(0).
+
+A trivial confound is ruled out by the same three arms: rog2 did FEWER draws
+than rog (457,192 against 797,902; 56.9M triangles against 106.6M) and is the
+corrupt one, so "fewer draws renders cleaner" is contradicted outright.
+
+IT IS NOT SLOWER. rog rasterised 106.6M triangles in its 280 s against hw's
+99.6M, with 797,902 hardware draws against 735,206 -- more work in the same
+wall clock. That is one host and one scene, and it is not a frame-time A/B.
+Treat it as "no cost was visible", not as "measured faster".
+
+
+2. WHAT IS STILL OPEN ON THE MECHANISM
+=======================================
+Mode 3 changes TWO things at once, and the arms above cannot separate them:
+
+  (a) opaque draws gain a destination read under raster_order_group(0)
+  (b) the encoder stops MIXING two blending modes against the same pixels --
+      under modes 0..2 a batched encoder alternates between fs_hw (writes
+      colour(0), never reads it, fixed-function blend) and fs_hw_blend (reads
+      colour(0) under raster_order_group(0), blend unit disabled), and nothing
+      flushes the batch between them: batch_flush() fires on
+      `hw != batch_encoder_hw`, not on a pipeline change.
+
+The software path never enters (b). Its one pipeline is built with blending
+disabled, so EVERY software draw is programmable-blend under
+raster_order_group(0): one uniform access mode, forever.
+
+RECOMP_METAL_SHADER_BLEND=0 separates them. It removes fs_hw_blend entirely, so
+there is no mixing AND no raster ordering anywhere. If the block artefact
+survives that, (b) is not the mechanism and (a) is. It is confounded by one
+known effect -- mode 0 deliberately puts the dither on the wrong side of the
+blend, measured in this file at 8192 of 65536 pixels on the dither's own 4x4
+lattice -- which contaminates the `x0 mod 4` statistic but not the eye: a
+flickering checkerboard on blended surfaces looks nothing like black blocks
+holding fragments of other buildings. That arm was running when this was
+written.
+
+DO NOT SHIP MODE 3 BY FLIPPING THE SWITCH. It is still spelled as a diagnostic.
+The principled change is for the hardware path to use ONE uniform access mode
+rather than choosing per draw, with a frame-time A/B behind it and a gate that
+fails without it. That is the next commit, not this one.
+
+
+3. THE SYMPTOM WAS MIS-DESCRIBED, AND THAT IS WHY DEPTH WAS RANKED FIRST
+=========================================================================
+The previous handover, section 4: "the speckle is BLACK -- pixels where nothing
+was written and the clear colour shows through. That is fragments being
+rejected, which is the depth or stencil unit." Measured from frame dumps:
+
+  * Not pixels. BLOCKS -- median 5x5 px, largest 133x51, 528 in one frame.
+  * Not one colour. They hold RECOGNISABLE FRAGMENTS OF OTHER SCENE CONTENT --
+    pieces of buildings, HUD glyphs, rails. A rejected fragment leaves the
+    destination untouched and therefore shows exactly one thing.
+  * Not rare. Every frame, heavily.
+
+The capture is what corrected it. Every earlier attempt scored this with an
+image statistic across arms that never reach the same scene; this one captures
+24 gameplay frames per arm and looks at them.
+
+
+4. THE ELIMINATION TABLE
+=========================
+Every row is a 280 s gameplay run with 24 captured frames unless marked
+otherwise, and each backend NAMED ITS OWN SWITCH STATE in its report -- which
+is new, and is why these are not void (section 6).
+
+  STILL CORRUPT:
+    RECOMP_METAL_HW_DEPTH_ALWAYS=1   depth compare forced ALWAYS (states=6)
+    RECOMP_METAL_HW_NO_STENCIL=1     stencil unit ignored        (states=6)
+    RECOMP_METAL_SURFACE_CACHE=0     no retained surfaces
+    RECOMP_METAL_BATCH_MAX=64        batches bounded
+    RECOMP_METAL_DRAIN=1             every sync drains the whole queue, 22,072
+    RECOMP_METAL_FENCE=1             an MTLFence updated after fragment and
+                                     waited before VERTEX on every pass, 50,149
+                                     updates -- SEE THE CAVEAT IN SECTION 7.2
+    RECOMP_METAL_565=1               colour attachment 16 B/px -> 2 B/px
+    RECOMP_METAL_SHADER_BLEND=2      every blended draw in the shader
+
+  MUCH WORSE:
+    RECOMP_METAL_BATCH=0             one pass per draw. Solid black rectangles
+                                     64 px wide, left AND right edges on a
+                                     64-px grid 17 of 18 times (chance 1.6%),
+                                     bottoms on a 32-row grid 16 of 18.
+                                     64 x 32 x 16 B = 32 KB = one Apple tile.
+                                     THAT coarse artefact is tile-shaped.
+
+  MEASURED ZERO, WITH A POSITIVE CONTROL:
+    RECOMP_METAL_READBACK_AUDIT=1    19,777 gameplay syncs checked, 0 raced,
+                                     0 pixels changed after a full queue drain.
+                                     THE READ-BACK IS FAITHFUL; the corruption
+                                     is already in the texture when it is read.
+    surface.hazardTrackingMode       reads `tracked`, asked of the object. Not
+                                     heap-suballocated, not silently untracked.
+
+  BY CONSTRUCTION, no run needed:
+    the vertex ring      ring_reserve() calls batch_flush() BEFORE checking the
+                         next slab's in-flight count, so a batch can never span
+                         a wrap.
+    the texture cache    a fresh MTLBuffer per upload; the hit path re-verifies
+                         with memcmp. Never mutated under an in-flight buffer.
+    the presenter race   open item 6 of the previous handover. The dumps are
+                         written from the PUSHER THREAD at FLIP_STALL, the same
+                         thread that writes s_snap, so they cannot see it -- and
+                         they show the artefact anyway.
+    the texture path     shade() is shared byte for byte, and the software arm
+                         is clean at the same scene.
+
+THE 4x4 GRANULARITY IS NOT THE TILE, and the arithmetic settles it:
+
+    RGBA32Float   16 + 4 + 1 = 21 B/px  ->  32 KB tile is 32x32
+    B5G6R5Unorm    2 + 4 + 1 =  7 B/px  ->  32 KB tile is 64x64
+
+A tile-derived granularity would have moved 4x between those arms. The measured
+granularity is the SAME 4x4 in both. So the fine artefact is in pixels, not in
+bytes, and only the coarse 64x32 rectangles under RECOMP_METAL_BATCH=0 are the
+tile. The one 4x4 screen-space lattice anywhere in this codebase is the ordered
+dither matrix, b[(xy.y&3)*4+(xy.x&3)].
+
+
+5. A SECOND, SEPARATE BUG: A REPRODUCIBLE GUEST SIGSEGV
+========================================================
+    SIGNAL: SIGSEGV (11)
+    HOST FAULT ADDRESS: 0x00000070FFFFFFBE      (guest 0xFFFFFFBE)
+    HOST PC: sub_001A2E2E +0x670                (DSOUND, VA 0x0019E340..)
+    GUEST REGISTERS: EAX=FFFFFFB4
+
+Identical function, offset and fault address in four runs today. It fires when
+the run's timing is perturbed:
+
+    SDL_AUDIODRIVER=no_such_driver                    died at t=41 s
+    RECOMP_METAL_CB_STATS=1 CB_GPU=1, hardware arm    died at t=35 s
+    RECOMP_METAL_CB_STATS=1 CB_GPU=1, software arm    died at t=35 s
+    RECOMP_METAL_SHADER_BLEND=3, first attempt        died at t=35 s
+
+It is PROBABILISTIC, not deterministic: the same SHADER_BLEND=3 arm re-run
+immediately afterwards reached gameplay and ran the full 280 s. And it is not
+simply "slower crashes" -- RECOMP_METAL_BATCH=0 is far heavier and survived.
+
+CONSEQUENCE FOR TODAY: the hardware/software COMMAND-BUFFER OVERLAP COMPARISON
+IS NOT MEASURED. Both arms died at t=35 s in the logos. The numbers they did
+produce (overlapped 726 against 765) are BOOT-PHASE ONLY and must not be quoted
+as a gameplay result.
+
+
+6. INSTRUMENTS BUILT TODAY
+===========================
+  frame_bisect.sh      Runs arms ONE AT A TIME against a pinned binary,
+                       captures 24 gameplay frames each, writes ARM.txt from
+                       the BACKEND'S OWN REPORT rather than from the
+                       environment it set, and refuses to score an arm that
+                       never reached gameplay -- it prints "*** this arm proves
+                       nothing ***" and says why. That guard fired three times
+                       today and was right every time.
+
+  [METAL] bisect:      RECOMP_METAL_HW_DEPTH_ALWAYS and _NO_STENCIL now name
+                       their state AND count the states they altered. They were
+                       read inline in hw_depth_state_for and were INVISIBLE IN
+                       THE LOG, which is why the earlier pass at this bisect had
+                       to be voided. states>0 is the positive control: the
+                       switch being on is what the environment says; states>0 is
+                       the backend saying it reached the descriptor.
+
+  [METAL] shader blend mode N
+                       Was a boolean over four states. An arm that cannot name
+                       itself cannot be verified, and mode 2 versus mode 3 is
+                       the whole result in section 1.
+
+  [METAL] surface hazard tracking
+                       Asks the MTLTexture what it is rather than assuming what
+                       the descriptor requested.
+
+  RECOMP_METAL_READBACK_AUDIT
+                       Reads the surface, commits and waits an EMPTY command
+                       buffer to drain the queue properly, reads again, counts
+                       pixels that changed. Separates "the corruption is in the
+                       texture" from "the read-back caught it mid-store" -- two
+                       different bugs nothing else here could tell apart.
+
+  RECOMP_METAL_DRAIN   Waits for the QUEUE, not for one command buffer. Apple
+                       documents only that a command buffer STARTS after those
+                       ahead of it start; nothing about completion order. This
+                       backend has always assumed more. Measured: changes no
+                       pixel, so the assumption holds on this host today. It is
+                       still undocumented, and that is now written down.
+
+  RECOMP_METAL_FENCE   An explicit MTLFence between passes. See 7.2 -- the arm
+                       as written may not test what it looks like.
+
+  RECOMP_FB_DUMP_FLIP=<stride>[:<after-seconds>]
+  RECOMP_FB_DUMP_DRAW=<stride>[:<after-seconds>]
+                       The 24 capture slots used to start counting at process
+                       start, so any stride large enough to still be capturing
+                       at gameplay spent most of them on the logos. SECONDS,
+                       NOT A PRESENT INDEX, because the arms do not run at the
+                       same speed -- this project's oldest measurement trap.
+
+
+7. OPEN, RANKED
+================
+  1. TURN MODE 3 INTO A FIX. One uniform access mode for the hardware path
+     rather than a per-draw choice, a frame-time A/B, and a gate that fails
+     without it. Settle section 2 first so the commit message says which of (a)
+     and (b) it is fixing.
+
+  2. THE FENCE ARM MAY NOT HAVE TESTED PASS ORDERING. It waits
+     `beforeStages:MTLRenderStageVertex`. A colour attachment's
+     MTLLoadActionLoad is fragment-side tile setup, not a vertex-stage
+     operation, so a vertex-scoped wait does not obviously order it. The 50,149
+     updates prove the arm RAN, not that it covered the load. Re-run with
+     beforeStages:MTLRenderStageFragment before treating pass ordering as
+     closed.
+
+  3. DOES [[position]].z REFLECT MTLDepthClipModeClamp? setDepthClipMode:Clamp
+     is applied to every encoder, and all three fragment tails then implement
+     the guest's CULL policy from i.p.z. If Metal hands the shader the CLAMPED
+     window-space z, then for JSRF's measured range (z_lo=0, z_hi=16777215)
+     the discard can NEVER fire and the entire z-range policy is inert. One
+     atomic counter on the discard branch and one run answers it.
+
+  4. THE DSOUND SIGSEGV (section 5). Reproducible on demand, blocks the overlap
+     measurement, and is a guest-correctness bug independent of the renderer.
+
+  5. UPSTREAM IS 80 COMMITS AHEAD and none of them touch src/nv2a -- upstream
+     has no Metal backend. Their graphics work is in src/d3d, which this title
+     never calls. WORTH MERGING ANYWAY for the translator and lifter fixes: sar
+     sign-extension, INC/DEC carry, jbe/ja after and/or/xor, MMX flag
+     preservation, x87 rounding, the uninitialised generated ebp. Those are
+     guest-CPU correctness and we have an unexplained guest fault. Separate
+     task: merging means regenerating, which is not bit-stable.
+
+
+8. DEFECTS FOUND BY REVIEW TODAY, NONE OF WHICH IS THE ARTEFACT
+================================================================
+Ranked by the reviewer's own ordering. Each carries a file and a reason.
+
+  1. clip_position() MODELS A VERTEX SHADER THAT DOES NOT EXIST. It clamps z;
+     the real vs() explicitly does not and says so in capitals. The audit then
+     applies Metal's clip volume to the clamped value, so the far plane cannot
+     fire by construction -- and the retraction recorded in nv2a_metal.m
+     ("discarded by the far plane 0 ... the vertex shader clamps z") rests on
+     that model, not on the shader. The 37.7M-triangle measurement quoted there
+     measured the model. audit_z_below/audit_z_above already collect the data
+     to redo it.
+
+  2. nv2a_texture_copy_triangle_depth RETURNS 0 FROM INSIDE THE PIXEL LOOP,
+     after an arbitrary prefix of the triangle's pixels and their depth and
+     stencil updates have already been committed to guest RAM. Its own header
+     promises "no guest memory is accessed here", and the caller counts the
+     return as a clean rejection. Should continue, or hoist the test.
+
+  3. A RETAINED DEPTH BUFFER IS RE-READ AT THE NEW SURFACE'S GEOMETRY. The
+     bounds check is gated on use_zeta, so a depth-less draw at a larger clip
+     size reads the previous zeta at the new width and height -- hundreds of KB
+     past the validated range.
+
+  4. nv2a_metal_discard() AND reject() INVALIDATE THE LIVE BINDING BUT NOT THE
+     SURFACE CACHE, where nv2a_metal_invalidate() does. After a discard the CPU
+     writes the clear into guest RAM, the next draw takes the upload path, the
+     slot matches, and the PRE-CLEAR textures are rebound -- the clear is lost
+     entirely. Latent: RECOMP_CLEAR_DISCARD defaults off and the runs report
+     `clear discards=0`. reject() is a hardware-path-only route into the same
+     hole the moment a fallback occurs.
+
+  5. stencil_surface IS UPLOADED FROM UNINITIALISED HEAP UNDER
+     RECOMP_METAL_565=1 -- the buffer is filled only in the non-565 branch and
+     the replaceRegion is unconditional.
+
+  6. "DEPTH OWNERSHIP IS EXCLUSIVE" IS NOT ENFORCED when hw_depth_upload fails:
+     `hw = hw_state_on() && hw_depth_tex && hw_stencil_tex` silently takes the
+     software tail with the hardware path on, which is exactly what the comment
+     beside it forbids. Should be hw_state_on() alone with a reject().
+
+  7. shade() DROPS THE CPU'S fminf(1,..) CLAMP ON THE MODULATE PATH, so an
+     over-bright vertex colour carries a value above 1 into an RGBA32Float
+     attachment where the CPU rasteriser clamped at the multiply.
+
+  8. THREE SINKS IMPLEMENT THREE DIFFERENT Z-RANGE POLICIES. fs does CULL and
+     CLAMP; fs_hw and fs_hw_blend do CULL only; nv2a_texture_copy_triangle_depth
+     reads none of z_clip_min, z_clip_max or z_cull and saturates
+     unconditionally. The oracle can therefore never disagree with either tail
+     here -- one concrete thing the gate structurally cannot test.
+
+  9. A5: the comment at d.depthWriteEnabled asserts that nv2a_texture_copy.c
+     gates depth writes on the test. It does not -- its zp is non-NULL when
+     depth_test||stencil_test -- so with stencil-only and the depth mask set,
+     the CPU writes depth and both GPU tails do not.
+
+  WITHDRAWN, and worth recording because it was reported as live: the stencil
+  writeMask divergence in hw_depth_state_for. prepare() assigns stencil_write
+  only inside `if (M(0x32c))`, which also sets stencil_test, so
+  stencil_write implies stencil_test for every state the executor can produce.
+  The code divergence is real; it is unreachable.
+
+
+9. HOW TO MEASURE THIS, PROVED AGAIN TODAY
+===========================================
+WHAT WORKS: looking at the frames. 24 per arm as a contact sheet, then
+magnified NEAREST-neighbour on a flat surface. It separated the arms in about a
+minute, on the first attempt, after six metrics had failed over two days.
+
+WHAT WORKS AS A SCORE: only a structural property the artefact has and scene
+content cannot. `x0 mod 4` qualifies -- it is a within-frame ratio against
+chance, and the clean software control reads 30% against the corrupt path's
+43%. That is the same shape of argument fb_score.py's `tile` metric uses, and
+it is the bar.
+
+WHAT STILL DOES NOT WORK: a generic image statistic. An isolated-dark-blob
+count written this morning scored the KNOWN-GOOD software arm at 835
+exact-black pixels against the corrupt hardware arm's 761 -- ranking the good
+arm worse, for the fifth time.
+
+THE MISTAKES MADE TODAY, all one mistake: a source file was edited while a
+bisect was running (the staleness guard refused two arms, correctly), and the
+bisect SCRIPT was edited while running, four times (sh re-reads by byte offset,
+so the trailing summary broke each time). Once this was asserted to be safe
+without checking. No conclusion was corrupted, because the guards held. Do not
+touch a measurement's inputs while it is live, and check rather than assert it.
+
+A NOTE ON WAITING FOR A RUN: `pgrep -f "frame_bisect.sh <name>"` matches the
+WAITER'S OWN command line, so a shell that polls for it waits forever on
+itself. Two of those were left spinning today. ab_switch.sh's header already
+warns about watching the wrong thing; this is the same trap one level up.
