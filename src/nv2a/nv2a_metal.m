@@ -393,6 +393,14 @@ static void surface_cache_drop(const uint8_t *target)
     }
 }
 
+/* RECOMP_METAL_FENCE -- declared here because initialize() is the first user.
+ * See the long note at the encoder, which is where it is actually reasoned
+ * about. */
+static id<MTLFence> g_pass_fence;
+static uint64_t g_fence_waits;
+static int pass_fence_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_FENCE"); return on; }
+
 static uint8_t *surface_target,*depth_target;
 static size_t surface_target_size,depth_target_size;
 static uint32_t surface_width,surface_height,surface_pitch,depth_pitch;
@@ -729,6 +737,7 @@ static int initialize(void)
     pthread_mutex_lock(&initialization_mutex);
     if(attempted){int ready=pipeline!=nil;pthread_mutex_unlock(&initialization_mutex);return ready;}
     device=MTLCreateSystemDefaultDevice();if(!device){attempted=1;pthread_mutex_unlock(&initialization_mutex);return 0;}
+    if(pass_fence_on())g_pass_fence=[device newFence];
     NSError *error=nil;MTLCompileOptions *options=[MTLCompileOptions new];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -820,6 +829,11 @@ unsigned long long g_hw_draws;
  * "every differing pixel had software 0x000000 against hardware 0xFFFFFF".
  * refusals= stays 0 through all of it, because reject() is never reached. */
 static unsigned long long g_hw_mixed, g_hw_upload_fail;
+/* How many depth/stencil states each bisect arm actually altered. Counted at
+ * the build, not the draw -- hw_depth_state_for returns a cached state before
+ * reaching either -- so a non-zero value says the arm reached the descriptor,
+ * which is the fact the report cannot otherwise carry. */
+static unsigned long long g_hw_depth_always_states, g_hw_no_stencil_states;
 
 /* MEASURED, and it is the first frame-time win this renderer has produced.
  *
@@ -1059,6 +1073,30 @@ static int hw_shader_blend(const NV2ATextureCopy *s)
      * does, under raster_order_group(0), while keeping the real depth and
      * stencil attachments. Depth and stencil are already ruled out, so if the
      * lost regions come back here the blend stage owns them. */
+    /* =3 takes EVERY hardware draw into fs_hw_blend, blended or not, and it
+     * is the bisect for PASS ORDERING rather than for blending.
+     *
+     * fs_hw writes colour(0) and never reads it. fs_hw_blend declares
+     * `float4 dst [[color(0), raster_order_group(0)]]`, exactly as the
+     * software tail fs() does -- so with =3 the hardware path acquires the one
+     * structural property the software path has and it lacks: every pass READS
+     * the colour attachment it writes. For an unblended draw s.blend is 0, so
+     * the in-shader blend is skipped and the colour produced is identical;
+     * only the dependency changes.
+     *
+     * Why that is the question. Measured 16 Sep 2026, RECOMP_METAL_BATCH=0:
+     * the corruption is solid black rectangles 64 pixels wide whose left AND
+     * right edges sit on a 64-pixel grid, 17 of 18 against 1% by chance, with
+     * bottoms on a 32-row grid. 64 x 32 x 16 bytes per RGBA32Float pixel is
+     * 32 KB -- one Apple tile. The granularity IS the tile, which means the
+     * passes are not composing in submission order; each tile keeps whichever
+     * pass stored it last.
+     *
+     * It costs what raster_order_group costs -- overlapping fragments
+     * serialise -- so it is a diagnostic first. If it renders clean, the
+     * missing destination dependency is the mechanism and the real fix is to
+     * order the passes, not to pay for a read in every shader. */
+    if (on == 3) return 1;
     if (on == 2) return s->blend;
     return on && s->blend && s->dither;
 }
@@ -1195,6 +1233,32 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     return pso;
 }
 
+/* THE TWO BISECT SWITCHES, AS PREDICATES THAT CAN NAME THEMSELVES.
+ *
+ * They were read inline in hw_depth_state_for, where nothing outside that
+ * function could see their state -- so a run taking one of these arms produced
+ * a report indistinguishable from a run that did not, and the arm could only
+ * be asserted from the command line that launched it. This project has already
+ * paid for that shape three times (recomp_switch.h lists them): an A/B whose
+ * control arm silently ran with the guard on. An earlier pass of exactly this
+ * bisect was reported as "still broken" and then had to be voided.
+ *
+ * So the state is a function, and nv2a_metal_report prints it. "I set the
+ * variable" and "the model read it" are different facts. */
+static int hw_depth_always_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_HW_DEPTH_ALWAYS");
+    return on;
+}
+
+static int hw_no_stencil_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_HW_NO_STENCIL");
+    return on;
+}
+
 /* ELEVEN, and it was nine. The key has to name every field the descriptor
  * below reads, or the cache serves a state built for a different draw.
  * stencil_zfail feeds depthFailureOperation and stencil_func_mask feeds
@@ -1251,11 +1315,7 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
      *
      * It renders incorrectly by construction -- everything draws over
      * everything -- so it is only ever a diagnostic. */
-    {
-        static int always = -1;
-        if (always < 0) always = recomp_switch_on("RECOMP_METAL_HW_DEPTH_ALWAYS");
-        if (always) { cmp = NV2A_MTL_CMP_ALWAYS; }
-    }
+    if (hw_depth_always_on()) { cmp = NV2A_MTL_CMP_ALWAYS; ++g_hw_depth_always_states; }
     d.depthCompareFunction = (MTLCompareFunction)cmp;
     /* GATED ON THE TEST, like the software tail and like the hardware.
      *
@@ -1275,9 +1335,7 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
          * Depth was ruled out by forcing ALWAYS and watching the regions stay
          * missing; this asks the question of the stencil unit. Diagnostic
          * only -- a path that ignores stencil renders wrongly by construction. */
-        static int off = -1;
-        if (off < 0) off = recomp_switch_on("RECOMP_METAL_HW_NO_STENCIL");
-        if (off) goto no_stencil;
+        if (hw_no_stencil_on()) { ++g_hw_no_stencil_states; goto no_stencil; }
     }
     if (s->stencil_test || s->stencil_write) {
         int sc = s->stencil_test ? nv2a_metal_compare_func(s->stencil_func)
@@ -1436,6 +1494,19 @@ static uint64_t sync_calls,sync_clean,sync_color,sync_depth,surface_uploads;
  * versus reading the surface back and converting it. See the comment at the
  * wait. */
 static uint64_t g_sync_drain_ns, g_sync_read_ns;
+/* THE READ-BACK AUDIT. See the block in nv2a_metal_sync.
+ *
+ * races  = syncs whose two reads disagreed at all
+ * diff   = total pixels that changed between the two reads
+ * audits = syncs the audit actually ran on, which is the positive control:
+ *          diff=0 with audits=0 measures nothing. */
+static uint64_t g_readback_races, g_readback_diff, g_readback_audits;
+static uint64_t g_queue_drains;
+static int queue_drain_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DRAIN"); return on; }
+static int readback_audit_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_READBACK_AUDIT");
+  return on; }
 
 static int ring_audit_on(void)
 {static int on=-1;if(on<0)on=getenv("RECOMP_METAL_RING_AUDIT")?1:0;return on;}
@@ -1510,6 +1581,9 @@ static void ring_pin(id<MTLCommandBuffer>command,unsigned slab)
 static void batch_flush(void)
 {
     if(!batch_encoder)return;
+    if(pass_fence_on()&&g_pass_fence){
+        [batch_encoder updateFence:g_pass_fence afterStages:MTLRenderStageFragment];
+        ++g_fence_waits;}
     [batch_encoder endEncoding];
     for(unsigned i=0;i<RING_SLABS;i++)if(batch_pins&(1u<<i))ring_pin(batch_command,i);
     mtl_cb_gpu_watch(batch_command);
@@ -1541,10 +1615,17 @@ void nv2a_metal_report(void)
     fprintf(stderr,"[METAL] one encoder per batch: %s (metal_batch %s)\n",
             batch_on()?"yes":"no (a render pass per draw)",
             batch_on()?"on":"OFF");
-    fprintf(stderr,"[METAL] shader blend for dithered blended draws: %s "
-            "(metal_shader_blend %s)\n",
-            nv2a_metal_shader_blend_on()?"on":"OFF",
-            nv2a_metal_shader_blend_on()?"on":"OFF");
+    {   /* The MODE, not a boolean. =0 off, =1 dithered blended draws only,
+         * =2 every blended draw, =3 every hardware draw. A report that
+         * collapses four states into "on" cannot verify which arm ran. */
+        const char *e = getenv("RECOMP_METAL_SHADER_BLEND");
+        int mode = e ? atoi(e) : 1;
+        fprintf(stderr,"[METAL] shader blend mode %d (%s) (metal_shader_blend %s)\n",
+                mode,
+                mode==0?"off":mode==1?"dithered blended draws":
+                mode==2?"every blended draw":"every hardware draw",
+                mode?"on":"OFF");
+    }
     fprintf(stderr,"[METAL] MIXED draws (software tail while hw on)=%llu, "
             "depth uploads failed=%llu\n",
             (unsigned long long)g_hw_mixed,(unsigned long long)g_hw_upload_fail);
@@ -1553,9 +1634,49 @@ void nv2a_metal_report(void)
             (unsigned long long)g_hw_pipeline_misses,
             (unsigned long long)g_hw_state_refusals,
             hw_state_on()?"on":"OFF");
+    /* THE BISECT ARMS NAME THEMSELVES, in both states and unconditionally.
+     *
+     * Each of these renders incorrectly by construction, so a run carrying one
+     * is a diagnostic and never a result about the renderer. The states= count
+     * is the positive control: the switch being "on" is what the environment
+     * says, and states> 0 is the backend saying it reached the descriptor. A
+     * zero there with the switch on means no hardware draw ever built a state
+     * -- read that as "this arm did nothing", not as "the arm changed
+     * nothing". */
+    fprintf(stderr,"[METAL] bisect: depth forced ALWAYS %s (states=%llu), "
+            "stencil ignored %s (states=%llu)\n",
+            hw_depth_always_on()?"on":"OFF",
+            (unsigned long long)g_hw_depth_always_states,
+            hw_no_stencil_on()?"on":"OFF",
+            (unsigned long long)g_hw_no_stencil_states);
     /* The colour attachment's format, named so an A/B can verify its arms
      * differ rather than assume the environment took. ab_score.py harvests
      * this; it could not for RECOMP_METAL_565 and said so. */
+    if (readback_audit_on())
+        fprintf(stderr,"[METAL] read-back audit: %llu syncs checked, %llu raced,"
+                " %llu pixels changed after a full queue drain\n",
+                (unsigned long long)g_readback_audits,
+                (unsigned long long)g_readback_races,
+                (unsigned long long)g_readback_diff);
+    /* WHAT THE TEXTURE SAYS IT IS, not what the descriptor asked for.
+     *
+     * Metal synchronises two passes over the same texture automatically only
+     * for TRACKED resources; a resource sub-allocated from an MTLHeap defaults
+     * to UNTRACKED and gets no dependency at all. Everything here is created
+     * straight from the device, so this should read tracked -- but "should"
+     * is what every retracted claim in this repo was built on, and the object
+     * can be asked. */
+    if (surface)
+        fprintf(stderr,"[METAL] surface hazard tracking: %s (queue drains %llu,"
+                " metal_drain %s)\n",
+                surface.hazardTrackingMode==MTLHazardTrackingModeTracked
+                    ? "tracked" : "UNTRACKED -- Metal orders nothing",
+                (unsigned long long)g_queue_drains,
+                queue_drain_on()?"on":"OFF");
+    if(pass_fence_on())
+        fprintf(stderr,"[METAL] pass fence: %s, %llu updates (metal_fence on)\n",
+                g_pass_fence?"created":"NOT CREATED -- this arm did nothing",
+                (unsigned long long)g_fence_waits);
     fprintf(stderr,"[METAL] colour attachment: %s\n",
             hw_565_on()?"B5G6R5Unorm (metal_565 on)"
                        :"RGBA32Float (metal_565 OFF)");
@@ -1755,6 +1876,32 @@ int nv2a_metal_sync(void)
         if(!surface_dirty&&!depth_dirty){++sync_clean;
             g_sync_drain_ns += mtl_now_ns()-_t_sync; return 1;}
         [last_command waitUntilCompleted];
+        /* RECOMP_METAL_DRAIN=1 -- wait for the QUEUE, not for one buffer.
+         *
+         * The line above is this backend's oldest load-bearing assumption:
+         * that waiting on the most recently committed command buffer means
+         * every earlier one has finished. Apple does not document that.
+         * MTLCommandBuffer.commit() promises only that "the GPU STARTS the
+         * command buffer after it starts any command buffers that are ahead of
+         * it in the same command queue" -- start order, not completion order --
+         * and the resource-synchronization guide says plainly that "by design,
+         * GPUs can run multiple commands in parallel". getBytes() and
+         * replaceRegion() both carry the same instruction in Apple's own
+         * words: "ensure ALL operations that write or render to the texture
+         * complete" first. Waiting on one buffer is not that.
+         *
+         * An empty command buffer committed now cannot start before everything
+         * already on the queue has started, and waiting on it therefore costs
+         * one round trip to establish what the code above assumes for free.
+         *
+         * Opt-in, because it is a candidate FIX and a candidate fix has to be
+         * A/B-able against the picture it claims to repair. */
+        if (queue_drain_on()) {
+            id<MTLCommandBuffer> drain = [queue commandBuffer];
+            [drain commit];
+            [drain waitUntilCompleted];
+            ++g_queue_drains;
+        }
         /* The split that decides whether a resident clear is worth building.
          *
          * clear_surface pays 11-15 ms a frame, and all of it is attributed to
@@ -1771,6 +1918,39 @@ int nv2a_metal_sync(void)
          * breakdown OF the clear, never added to it. */
         _t_drained = mtl_now_ns();
         g_sync_drain_ns += _t_drained - _t_sync;
+        /* RECOMP_METAL_READBACK_AUDIT=1 -- see the header comment on
+         * g_readback_diff. Drains the queue a second time, properly, and
+         * compares. */
+        if (readback_audit_on() && surface_dirty) {
+            size_t px = (size_t)surface_width * surface_height;
+            size_t stride = hw_565_on() ? 2 : 16;
+            uint8_t *a = malloc(px * stride), *b = malloc(px * stride);
+            if (a && b) {
+                MTLRegion r = MTLRegionMake2D(0,0,surface_width,surface_height);
+                [surface getBytes:a bytesPerRow:surface_width*stride
+                       fromRegion:r mipmapLevel:0];
+                {   /* An empty command buffer committed now cannot be
+                     * scheduled before everything already on the queue, so
+                     * waiting on it drains the queue -- which waiting on
+                     * last_command alone only does if the queue is in order.
+                     * That is the assumption under test. */
+                    id<MTLCommandBuffer> drain = [queue commandBuffer];
+                    [drain commit];
+                    [drain waitUntilCompleted];
+                }
+                [surface getBytes:b bytesPerRow:surface_width*stride
+                       fromRegion:r mipmapLevel:0];
+                ++g_readback_audits;
+                if (memcmp(a, b, px * stride)) {
+                    size_t i, differ = 0;
+                    for (i = 0; i < px; ++i)
+                        if (memcmp(a + i*stride, b + i*stride, stride)) ++differ;
+                    g_readback_diff += differ;
+                    ++g_readback_races;
+                }
+            }
+            free(a); free(b);
+        }
         if(last_command.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[METAL] command failed: %s\n",last_command.error.description.UTF8String);return 0;}
         size_t pixels=(size_t)surface_width*surface_height;
         float *rgba=malloc(pixels*16);
@@ -2422,12 +2602,16 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     batch_command=[queue commandBuffer];
     batch_encoder=batch_command?[batch_command renderCommandEncoderWithDescriptor:pass]:nil;
     if(!batch_command||!batch_encoder){batch_command=nil;batch_encoder=nil;return reject("command-encoder");}
+    if(pass_fence_on()&&g_pass_fence)
+     [batch_encoder waitForFence:g_pass_fence beforeStages:MTLRenderStageVertex];
     if(mtl_cb_stats())g_mtl_cbufs++;
    }
    command=batch_command;encoder=batch_encoder;
   }else{
    command=[queue commandBuffer];encoder=command?[command renderCommandEncoderWithDescriptor:pass]:nil;
    if(!command||!encoder)return reject("command-encoder");
+   if(pass_fence_on()&&g_pass_fence)
+    [encoder waitForFence:g_pass_fence beforeStages:MTLRenderStageVertex];
    if(mtl_cb_stats())g_mtl_cbufs++;
   }
   if(mtl_cb_stats()){g_mtl_ns_create+=mtl_now_ns()-_t0;_t0=mtl_now_ns();}
@@ -2497,6 +2681,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    if(batch_cap()&&batch_draws>=batch_cap())batch_flush();
    if(mtl_cb_stats())g_mtl_ns_commit+=mtl_now_ns()-_t0;
   }else{
+   if(pass_fence_on()&&g_pass_fence){
+    [encoder updateFence:g_pass_fence afterStages:MTLRenderStageFragment];++g_fence_waits;}
    [encoder endEncoding];if(mtl_cb_stats()){g_mtl_ns_encode+=mtl_now_ns()-_t0;_t0=mtl_now_ns();}
    if(pinned_slab>=0)ring_pin(command,(unsigned)pinned_slab);
    mtl_cb_gpu_watch(command);
