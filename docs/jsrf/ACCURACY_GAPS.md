@@ -23,9 +23,26 @@ JSRF is a 60 fps title (measured, `nv2a_pgraph_flip_stall`, same event our
 `[FRAME]` counter uses). Era-typical fixed-step simulation means half the frame
 rate is *half the game speed* — it looks slow, not choppy.
 
-Gameplay frame budget: `vsh 7.52 | submit 8.41 | sync 0.98 | rest (guest CPU)
-15.03` of 31.94 ms, against a 16.67 ms budget. **The guest-CPU half is as large
-as all graphics work combined**, so this is not a pure renderer problem.
+**CORRECTED 2026-09-16, AND THE CORRECTION IS THE POINT.** The budget here was
+quoted as `vsh 7.52 | submit 8.41 | sync 0.98 | rest (guest CPU) 15.03` of
+31.94 ms, concluding "the guest-CPU half is as large as all graphics work
+combined, so this is not a pure renderer problem". That conclusion was wrong,
+in the way this project keeps being wrong: `rest` is a RESIDUAL, not a
+measurement -- its own comment in nv2a_pb_exec.c says so -- and the quote has
+no `clear` term because clear was not a separate stage when the number was
+taken. With clear split out the same instrument reads `clear 12.47 |
+rest 2.87`, and 12.47 + 2.87 = 15.34 against the quoted 15.03.
+
+The 15 ms was the clear. Guest CPU was never half the budget; it was under 3 ms
+then and is 3.6 ms of 16.4 now. It was almost entirely a renderer problem, and
+treating it as one took the frame from 31.75 ms to about 16.4 -- see
+handovers/HANDOVER_2026-09-16_SIXTY_FPS_AND_THE_PICTURE_IS_RIGHT.txt.
+
+Budget as it stands, 2026-09-16, gameplay windows weighted by flips:
+`vsh 3.3 | submit 4.1 | sync 5.2-6.1 | clear 0.06 | rest 3.6` of 16.4-17.0 ms.
+Two runs of the same configuration measured 61.1 and 58.9 fps, so this is AT 60
+rather than past it, and `sync` -- of which roughly 3.6 ms is GPU drain the CPU
+is waiting on -- is where the remaining headroom is.
 
 *Settled 2026-09-14: it is NOT wait-poll latency.* Four runs, paired by `live=`:
 

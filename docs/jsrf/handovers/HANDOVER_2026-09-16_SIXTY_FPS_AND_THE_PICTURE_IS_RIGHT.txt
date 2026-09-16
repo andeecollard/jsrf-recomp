@@ -1,0 +1,287 @@
+HANDOVER, 16 Sep 2026 (late)
+SIXTY FPS, AND THE PICTURE IS RIGHT
+
+Supersedes HANDOVER_2026-09-16_THE_OPAQUE_DRAWS_NEVER_READ_THE_DESTINATION.txt
+and, with it, everything in the 15 Sep handover about the renderer being
+unexplained.
+
+Two things happened today. The render artefact that had been unexplained for
+days was found and fixed, and the frame rate went from 31.5 fps to about 60.
+
+
+1. THE HEADLINE, WITH THE NUMBER STATED HONESTLY
+=================================================
+    31.75 ms / 31.5 fps   ->   16.4-17.0 ms / 58.9-61.1 fps
+
+TWO RUNS OF THE SAME CONFIGURATION MEASURED 61.1 AND 58.9 FPS. The gap is
+entirely in `sync` (5.23 against 6.12 ms) and is run-to-run variation, which
+this session separately established at about 1 ms per stage. So the truthful
+statement is "about 60 fps, straddling the line", not 61.1. p50 is 16.3-17.0 ms
+against a 16.67 ms budget. It needs more headroom before it can be called
+comfortably 60, and section 7 says where that is.
+
+The artefact is gone at every step: 24 of 24 captured gameplay frames clean,
+scored by the structural fingerprint described in section 5 at 31-32% against
+the software control's 30% and chance's 25%.
+
+
+2. WHAT THE RENDER BUG WAS
+===========================
+EVERY HARDWARE DRAW MUST READ THE COLOUR ATTACHMENT.
+
+fs_hw wrote colour(0) and never read it; fs_hw_blend declares
+`float4 dst [[color(0), raster_order_group(0)]]`, as the software tail does.
+The renderer chose between them per draw -- fs_hw_blend only for a draw that
+both blended and dithered -- so all the opaque world geometry wrote the
+attachment with no destination read and no raster ordering. At gameplay that
+rendered visibly corrupt on every frame: axis-aligned blocks, median 5x5 px,
+holding black or fragments of other scene content.
+
+Established by a ladder over four modes, one pinned binary, one pad, serial,
+24 captured gameplay frames each:
+
+    mode 0  no draw reads dst, and no mixing either   36%   corrupt
+    mode 1  dithered AND blended draws (the old one)  43%   corrupt
+    mode 2  every blended draw                        40%   corrupt
+    mode 3  every draw                                30%   CLEAN
+    --      the software path, as the control         30%   clean
+
+Monotone in COVERAGE and nothing else. Mode 2 already took every blended draw
+off the fixed-function blend unit and was still corrupt, so the blend unit was
+not the cause; mode 0 removed fs_hw_blend entirely so the encoder never mixed
+two blending modes, and was still corrupt, so the mixing was not the cause.
+
+THE 15 SEP HANDOVER'S RANKED #1 -- "run the depth and stencil bisect arms to a
+result. This is the whole remaining search space" -- was run and is NEGATIVE on
+both arms. Depth compare forced ALWAYS: corrupt. Stencil ignored: corrupt. The
+search space was not what it said, and the symptom description that led there
+("the speckle is BLACK ... fragments being rejected") was wrong: the artefact
+is blocks holding three or more distinct colours of other scenery, which
+fragment rejection cannot produce.
+
+
+3. HOW 60 FPS WAS REACHED
+==========================
+In the order the changes landed. Each row is its own A/B against the arm
+immediately before it, so they do NOT chain arithmetically.
+
+  a. THE RESIDENT CLEAR                        31.75 -> 27.06 ms, 31.5 -> 37.0
+     nv2a_gpu_clear_color and _clear_depth_stencil were defined for the D3D11
+     backend only, so on macOS every clear drained the GPU, read the whole
+     4.9 MB colour surface back, converted it per pixel into guest RAM, let the
+     CPU memset 1.8 MB, and made the next draw re-upload 6.4 MB. Twice a frame.
+     None of it is necessary when the CPU is about to write one constant over
+     every byte: the GPU writes the constant itself as a load action.
+     `clear` fell 9.57 -> 0.25 ms. 7.4 ms of that reappeared in `sync` because
+     the read-back moved to the guest's own FLIP_STALL, where it always had to
+     happen; what actually disappeared is the drain and the re-upload.
+
+  b. THE UNBOUND-SURFACE CLEAR                 27.06 -> 26.29 ms, 37.0 -> 38.0
+     86% of colour clears named a surface the backend was not bound to -- the
+     guest moves the colour offset register while surface_target only moves on
+     the next DRAW -- and every one fell back to the CPU AND dropped cache
+     slots. The surface cache sat at exactly 50% hit with 10,352 rebuilds a
+     run, each reallocating four textures and re-uploading 6.4 MB. Clearing the
+     cached texture instead took it to 100% hit and 5 rebuilds.
+     `submit` fell 1.67 ms, which the rebuild arithmetic predicts. The 0.77 ms
+     total is inside the noise envelope; the attributable win is `submit`.
+
+  c. THE GUEST'S VERTEX PROGRAM ON THE GPU     29.79 -> 18.32 ms, 33.6 -> 54.6
+     The single largest change. `vsh` fell 12.90 -> 3.29 ms.
+     408,205,400 vertices transformed on the GPU across 639,089 draws, 21
+     distinct programs compiled, NOTHING refused by the emitter, the compiler
+     or either cache.
+
+  d. THE 565 COLOUR ATTACHMENT                 18.32 -> 16.37 ms, 54.6 -> 61.1
+     Two bytes a pixel instead of sixteen, in the guest's own format, so both
+     per-pixel conversion loops become row memcpys and every colour transfer
+     shrinks eightfold. It is also MORE correct: the frame stops requantising
+     between draws, so the double rounding at the read-back boundary is gone.
+
+RECOMP_METAL_HW, RECOMP_METAL_VSH and RECOMP_METAL_565 all now default ON, each
+measured before being flipped, each with =0 still a real arm.
+
+
+4. THE VERTEX WORK, AND WHY IT WAS SAFE TO DO
+==============================================
+nv2a_vsh_msl.c had emitted MSL for these programs for months and had NEVER BEEN
+EXECUTED -- its own header said so. Before wiring it in, a differential test
+dispatched it on a device against nv2a_vsh_execute over THE 126 PROGRAMS READ
+OUT OF THE TITLE'S OWN default.xbe: 8064 vectors, 0 residual disagreements,
+with an injected-fault control (the same program recompiled with oPos.x += 1)
+still reporting 64 of 64.
+
+IT FOUND THREE REAL DEFECTS, none subtle in effect:
+  * Metal fuses a*b+c into an fma even under MTLMathModeSafe; the interpreter
+    cannot, because multiply()'s zero rule is a select. 51 of 8064 vectors,
+    worst 1.78 ABSOLUTE IN CLIP SPACE, concentrated in seven skinning programs.
+  * The NV2A's a*0 rule was not reproduced, so a zero normal took rsqrt(0)=+inf
+    into the normalise multiply: NaN on the GPU, 0 on the CPU, and THE NaN
+    REACHED oPos -- the triangle vanished. In one program a later MIN laundered
+    it into a finite wrong value, so it would not even announce itself.
+  * LIT returned about 5e25 where the interpreter returns +inf.
+
+THE CORPUS ANCHOR EARNED ITS KEEP IMMEDIATELY. The 12-slot program in
+vsh_capture.h, taken from a running frame months ago, is asserted to be found
+byte-identical at file offset 0x18A888. The first scanner stepped four words
+after a failed run and began programs one slot early on a dead double-NOP,
+producing a corpus of subtly wrong programs. Nothing else noticed.
+
+WHAT THE VERTEX WORK STILL DOES NOT COVER:
+  * DPH, DST, EXP, LOG and LIT appear in NO program this title ships. Fixture
+    only. If one ever reaches the GPU path it is untested against the title.
+  * Operand data in the differential test is synthetic uniform [-1.5,1.5]. Real
+    constants are transform rows and bone matrices with very different
+    magnitudes. RECOMP_METAL_VSH_VERIFY, specified in the plan, is not built.
+  * 13 of 8064 vectors differ by up to 4.3e-04 and are classified
+    ill-conditioned by perturbing operands one ulp and watching the
+    INTERPRETER's own answer move as far as the gap. They are still real
+    per-pixel differences in a rendered frame.
+  * nv2a_vsh_hlsl.c STILL CARRIES ALL THREE DEFECTS. The two emitters were
+    deliberate line-for-line siblings and are no longer. The Windows path has
+    the NaN-reaches-oPos bug today.
+
+TWO HAZARDS THE INTEGRATION HAD TO HANDLE, both of which corrupt silently:
+  * The emitter's VS_OUT is not the Out the fragment tails consume -- different
+    fields, different order -- and a vertex function in one MTLLibrary feeding
+    a fragment function in another matches BY POSITION. So the program is
+    compiled into the same library as the fragment tails and a wrapper repacks
+    VS_OUT into Out field by field.
+  * triangle() reads v[i][0] as a SCREEN position for winding, facing and the
+    transformed texture coordinates. With the program on the GPU that slot
+    holds attribute 0, an object-space position. The first attempt rendered
+    characters as black silhouettes. Culling needs the transformed position,
+    which is the thing that moved, so it moved too: setCullMode and
+    setFrontFacingWinding at the encoder.
+  * AND, caught by jsrf_vsh_render in 0.03 s: when nv2a_gpu_draw rejects,
+    raster_batch falls through to the CPU rasteriser, which reads s_outputs as
+    screen positions. On this path it holds INPUTS. Both are sixteen float4 per
+    vertex and indistinguishable by inspection. The fallback now re-runs the
+    interpreter first.
+
+
+5. THE SOUND, WHICH WAS THE FRAME RATE
+=======================================
+Reported as "the sound goes out of sync over the course of a run". Measured
+from three runs' own APU counters:
+
+    frame        APU frames in 280 s   underruns (depth bucket 0)
+    44.23 ms     405,208               0
+    30.97 ms     405,112               0
+    18.18 ms     405,080               0
+
+THE APU EMITS THE SAME NUMBER OF FRAMES AT EVERY FRAME RATE AND NEVER
+UNDERRUNS. It is locked to real time by throttle(), which is what it should be.
+Nothing was wrong with the audio.
+
+JSRF is fixed-step, so at 22-33 fps the WORLD ran at 38-55% of intended speed
+against a real-time soundtrack and the gap widened all run -- which is exactly
+"goes out of sync over the course of a run". At 60 fps the simulation runs at
+about 102% of intended speed. The frame-rate work was the sound fix, and any
+residual drift is now measurable where it was previously buried under a 2x
+speed error.
+
+
+6. HOW TO MEASURE THIS, WHICH IS THE PART THAT GENERALISES
+===========================================================
+WHAT WORKS: capture 24 gameplay frames per arm and LOOK at them, as a contact
+sheet, then magnified nearest-neighbour on a flat surface. It separated the
+arms in about a minute on the first attempt, after six image metrics had failed
+over two days.
+
+WHAT WORKS AS A SCORE: only a structural property the artefact has and scene
+content cannot. `x0 mod 4` -- the fraction of dark blocks whose left edge lands
+on a 4-pixel grid, against 25% by chance -- is a within-frame ratio, so it
+needs no matched scene. The clean software control reads 30%, the broken
+renderer 43%. That is the bar, and it is the same shape of argument fb_score's
+`tile` metric uses.
+
+WHAT STILL DOES NOT WORK: a generic image statistic. An isolated-dark-blob
+count written this morning scored the KNOWN-GOOD software arm at 835
+exact-black pixels against the corrupt hardware arm's 761 -- ranking the good
+arm worse, for the fifth time.
+
+frame_bisect.sh runs arms one at a time against a pinned binary, captures 24
+gameplay frames each, writes ARM.txt from THE BACKEND'S OWN REPORT rather than
+from the environment it set, retries an arm that faults before gameplay, and
+refuses to score one that never got there. That last guard fired three times
+today and was right every time.
+
+MISTAKES MADE TODAY, all of them process rather than analysis:
+  * A source file was edited while a bisect was running, twice; the staleness
+    guard refused the arms, correctly.
+  * The bisect SCRIPT was edited while running, four times. sh re-reads by byte
+    offset, so the trailing summary broke each time. Once this was asserted to
+    be safe without checking.
+  * An instrument was bundled with a change on the same run -- RECOMP_VSH_SPLIT,
+    two clock reads per vertex over 206 million vertices -- so neither could be
+    attributed. The switch's own comment warned it was exactly that weight.
+  * A binary was measured stale after an edit-and-build in the same second,
+    which make skips silently. Always confirm the "Building OBJC object" line,
+    not just "Built target".
+  * A frame-time figure was quoted from a run that was still going. A partial
+    run's mean is not the run's mean.
+  * `git add` on a file another agent was editing swept a test registration
+    into the wrong commit, leaving a commit that referenced an untracked source
+    -- a fresh clone there would have failed at configure. Split and rewritten;
+    nothing was pushed at the time.
+  * frame_bisect.sh's arm_env zeroed every switch as its baseline, so the arm
+    whose whole purpose is measuring DEFAULTS forced the two new ones OFF while
+    reporting itself as the default arm.
+
+
+7. OPEN, RANKED
+================
+  1. HEADROOM. 58.9-61.1 fps over two runs of one configuration is at the line,
+     not past it. `sync` is 5.2-6.1 ms and is the largest remaining stage; of
+     it, roughly 3.6 ms is GPU DRAIN -- the CPU waiting on the GPU because
+     nothing overlaps them -- which none of today's changes touch and which is
+     a pipelining problem. `submit` is 4.0-4.2 ms and is still mostly the
+     surface-swap sync inside nv2a_metal_draw, which a per-slot dirty flag
+     would let a cache hit skip entirely.
+
+  2. THE APU CRASH, DIAGNOSED AND NOT FIXED. sub_001A2E2E is DirectSound's
+     RemoveIdleVoice called with a NULL this; our APU hands its ISR a voice
+     handle DirectSound has no owner object for. All six dumped registers
+     reproduce from ecx=0, the five-frame call chain is read off the stack
+     dumps, and the fatal handle is voice 0 in 18 of 18 rings. 40 of 66
+     recorded guest faults in this tree are this one.
+     The mechanism -- VOICE_ON publishing the handle ~80 lines before setting
+     ACTIVE_VOICE, unlocked, on a guest thread while the walk runs on the frame
+     thread -- IS STATIC READING. The fix ships OFF behind
+     RECOMP_APU_IDLE_TRAP_LOCK_GUARD and ONE RUN DECIDES IT: an `L` on the last
+     ring entry proves it, an `N` without an `L` means the guard will not help,
+     neither means the hypothesis is dead and [APU-FEDEC] is next.
+
+  3. nv2a_vsh_hlsl.c HAS ALL THREE EMITTER DEFECTS (section 4).
+
+  4. RECOMP_METAL_VSH_VERIFY is specified in
+     docs/jsrf/plans/GPU_VERTEX_SHADING.md and not built. It is the only thing
+     that closes the synthetic-operand gap, by running both paths on the
+     title's real vertices and constants and diffing them.
+
+  5. THE FENCE ARM WAS NEVER VALID. It waits beforeStages:MTLRenderStageVertex
+     and a colour attachment's load is fragment-side, so "pass ordering is not
+     the mechanism" is not supported by it. Re-run with
+     beforeStages:MTLRenderStageFragment before treating that as closed.
+
+  6. DOES [[position]].z REFLECT MTLDepthClipModeClamp? Applied to every
+     encoder, and all three fragment tails then implement the guest's CULL
+     policy from i.p.z. If Metal hands the shader the CLAMPED value then for
+     JSRF's range the discard can never fire and the whole z-range policy is
+     inert. One atomic counter and one run.
+
+  7. UPSTREAM IS 80 COMMITS AHEAD and none of them touch src/nv2a. Worth
+     merging for the translator and lifter fixes -- sar sign-extension, INC/DEC
+     carry, jbe/ja after and/or/xor, MMX flag preservation, x87 rounding, the
+     uninitialised generated ebp. Separate task: merging means regenerating,
+     which is not bit-stable.
+
+  8. SMALLER, ALL FOUND BY REVIEW AND NONE OF THEM THE ARTEFACT: clip_position
+     models a vertex shader that does not exist and a recorded retraction rests
+     on it; nv2a_texture_copy_triangle_depth returns 0 from inside the pixel
+     loop after committing pixels, against its own header's promise; a retained
+     depth buffer is re-read at the new surface's geometry, out of bounds; the
+     "depth ownership is exclusive" invariant is not enforced when
+     hw_depth_upload fails; shade() drops the CPU's clamp on the modulate path;
+     three sinks implement three different z-range policies.
