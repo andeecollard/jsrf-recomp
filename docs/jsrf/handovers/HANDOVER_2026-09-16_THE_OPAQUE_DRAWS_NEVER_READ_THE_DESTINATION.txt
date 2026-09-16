@@ -248,10 +248,22 @@ as a gameplay result.
 
 7. OPEN, RANKED
 ================
-  1. TURN MODE 3 INTO A FIX. One uniform access mode for the hardware path
-     rather than a per-draw choice, a frame-time A/B, and a gate that fails
-     without it. Settle section 2 first so the commit message says which of (a)
-     and (b) it is fixing.
+  1. TURN MODE 3 INTO A FIX. Section 2 has settled WHAT it is fixing: every
+     hardware draw needs a destination read under raster_order_group(0), not
+     just the blended ones. So the change is to stop choosing the fragment tail
+     per draw and give the hardware path one access mode, with
+
+       * a frame-time A/B behind it. The "no cost was visible" in section 1 is
+         one host, one scene, and triangle counts from runs that got different
+         distances through the title. It is not a measurement of frame time.
+       * a gate that FAILS without it. Every device gate passed for weeks on
+         this renderer because none of them could get the GPU behind the
+         producer; a gate that cannot reproduce the artefact cannot protect
+         the fix. The cheapest honest one is the ladder in section 2 -- four
+         modes, x0 mod 4 against the software control -- which is a scripted
+         run, not a unit test, and should be named as such.
+       * the switch kept, as the control arm. =0 is the "before" picture and
+         the only way to re-measure the cost later in one binary.
 
   2. THE FENCE ARM MAY NOT HAVE TESTED PASS ORDERING. It waits
      `beforeStages:MTLRenderStageVertex`. A colour attachment's
