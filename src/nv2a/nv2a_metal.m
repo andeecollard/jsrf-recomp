@@ -2103,11 +2103,27 @@ void nv2a_metal_report(void)
     fprintf(stderr,"[METAL] colour attachment: %s\n",
             hw_565_on()?"B5G6R5Unorm (metal_565 on)"
                        :"RGBA32Float (metal_565 OFF)");
-    fprintf(stderr,"[METAL] resident clears: %llu of %llu colour, %llu of %llu"
-            " depth/stencil (each one a drain, a 4.9 MB read-back and a 6.4 MB"
-            " re-upload that did not happen)\n",
-            (unsigned long long)g_resident_color_clears,
+    /* COLOUR CLEARS ARE SERVED BY TWO PATHS AND THIS LINE USED TO NAME ONLY
+     * ONE. g_resident_color_clears counts the bound-surface path;
+     * g_resident_unbound_clears counts the slot cache, which picks up exactly
+     * the clears clear_resident_ok refused for `target` because the guest was
+     * clearing a surface other than the bound one. Printing the first against
+     * the total, with "each one a drain, a 4.9 MB read-back and a 6.4 MB
+     * re-upload that did not happen" attached, reads as though the remainder
+     * pays all of that. It does not: measured 2,115 + 12,293 = 14,408 of
+     * 14,420, so 99.9% of colour clears are already on the GPU and the
+     * `target=12,323` refusals are served a few lines later rather than lost.
+     * An afternoon went into chasing that gap before the two counters were
+     * added up. Print the sum, and the split behind it. */
+    fprintf(stderr,"[METAL] resident clears: %llu of %llu colour (%llu bound +"
+            " %llu via the slot cache), %llu of %llu depth/stencil -- each one"
+            " a drain, a 4.9 MB read-back and a 6.4 MB re-upload that did not"
+            " happen\n",
+            (unsigned long long)(g_resident_color_clears
+                                 + g_resident_unbound_clears),
             (unsigned long long)g_clear_color_calls,
+            (unsigned long long)g_resident_color_clears,
+            (unsigned long long)g_resident_unbound_clears,
             (unsigned long long)g_resident_depth_clears,
             (unsigned long long)g_clear_depth_calls);
     /* THE ARM NAMES ITSELF, in both states, because ab_score.py can only check

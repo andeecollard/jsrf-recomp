@@ -510,6 +510,63 @@ unsigned long g_idle_trap_locked_raises;
 unsigned long g_idle_trap_never_on_raises;
 unsigned long g_idle_trap_repeat_raises;
 
+/* THE RAISE THE GUEST'S ISR IS WRITTEN TO IGNORE, WHICH NOTHING HAS EVER
+ * COUNTED.
+ *
+ * The ISR chain transcribed at the top of this file ends its guard sequence
+ * with, at 001A241F:
+ *
+ *     if (voicereg[h].CFG_FMT & 0x800000) return;      -- PERSIST
+ *
+ * so for a PERSIST voice DirectSound acknowledges the trap and deliberately
+ * does NOTHING: it does not unlink the voice, does not clear the owner, does
+ * not mark it inactive. That is correct -- PERSIST is the driver telling the
+ * hardware the voice keeps its list slot across stop and start -- and it is
+ * also a closed loop against a LEVEL-triggered raise, which is what this model
+ * has. The walk finds the same voice inactive and still linked on the next
+ * subframe, 1500 times a second, for ever.
+ *
+ * The P flag has been recorded in the 16-slot ring since the ring was written
+ * (IDLE_TRAP_WHY_PERSIST), and the ring only survives the last few
+ * milliseconds. There has never been a TOTAL, so no run in this tree can say
+ * what fraction of a 43,000-raise storm was voices whose ISR was always going
+ * to return. That is the one number that separates "the guest is being handed
+ * the wrong handle" from "the guest is being handed the right handle and told
+ * to ignore it", and the two want completely different fixes.
+ *
+ * Positive control: g_idle_trap_raises, printed on the same line. */
+unsigned long g_idle_trap_persist_raises;
+
+/* EDGE, NOT LEVEL: one raise per idle TRANSITION, per voice.
+ *
+ * One bit per voice, set when we raise for it and cleared when the walk next
+ * finds it ACTIVE or when VOICE_ON restarts it. mcpx_apu_trap_coalesce already
+ * withholds a raise while the front end is still TRAPPED; this withholds the
+ * one that comes AFTER the guest has serviced and resumed, which is the one
+ * the coalescing cannot see.
+ *
+ * _encounters counts only raises the rule WOULD have withheld -- it is
+ * incremented at the point a raise would otherwise have happened, so it is a
+ * subset of raises and not the different-denominator trap that
+ * g_idle_trap_locked_encounters fell into. _suppressed counts the ones it
+ * actually withheld, so a run with the switch OFF answers "would this have
+ * mattered" and a run with it ON says whether it took.
+ *
+ * _rearm is the instrument's own liveness: a latch that is set and never
+ * cleared would look exactly like a working fix while silently swallowing
+ * every genuine retirement after the first. Non-zero rearm beside non-zero
+ * suppressed is what says the latch is cycling rather than stuck.
+ *
+ * Plain loads and stores. The bitmap is touched by the frame thread (walk) and
+ * by guest threads (VOICE_ON) without the APU lock, and a lost update costs at
+ * most one extra raise or one withheld raise -- the same order of error as the
+ * race it is reducing, and not worth putting a lock in VOICE_ON's body for. */
+static uint64_t g_idle_trap_reported[MCPX_HW_MAX_VOICES / 64];
+unsigned long g_idle_trap_edge_encounters;
+unsigned long g_idle_trap_edge_suppressed;
+unsigned long g_idle_trap_edge_rearm;
+int mcpx_apu_idle_trap_edge(void);
+
 /* Every handle the guest has ever issued VOICE_ON for, one bit each.
  *
  * Set in the VOICE_ON handler and never cleared: the question it answers is
@@ -711,6 +768,51 @@ int mcpx_apu_trap_coalesce(void)
     if (on < 0) {
         const char *e = getenv("RECOMP_APU_TRAP_COALESCE");
         on = e ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
+
+/* OFF by default. RECOMP_APU_IDLE_TRAP_EDGE=1 enables.
+ *
+ * WHAT IT CHANGES. SE2FE_IDLE_VOICE stops being raised for the level "this
+ * voice is inactive and still in a list" and starts being raised for the edge
+ * "this voice has just become inactive while in a list". A different voice
+ * going idle still raises immediately; only a repeat for a voice we have
+ * already reported and that has not been restarted since is withheld.
+ *
+ * WHY THAT IS THE HARDWARE BEHAVIOUR AND NOT A THROTTLE. The driver's ISR has
+ * three early returns that all leave the voice inactive and still linked --
+ * h >= 0x100, this->+0x2C0 set, and CFG_FMT PERSIST (001A241F). Against a
+ * level-triggered trap every one of them is an infinite interrupt loop with
+ * the driver behaving exactly as written. PERSIST in particular is a
+ * documented DirectSound feature and this model's own stream path implements
+ * it by returning without calling voice_off (see the `persist` branches in
+ * voice_get_samples), i.e. by deliberately leaving a voice inactive and
+ * linked. Hardware that re-raised on that state would make PERSIST unusable.
+ * So the level reading cannot be right, and the edge reading is the only one
+ * that makes the driver's own code sane.
+ *
+ * WHAT IT DOES NOT CLAIM. It is not proven to be why sound effects are silent.
+ * The measured chain -- storm, front end TRAPPED on 91-92% of subframes, guest
+ * write rate into the VP aperture collapsing to zero, [APU-VOICE] on= frozen
+ * -- is consistent with the storm throttling the guest's sound engine, and
+ * this removes the storm's engine. Whether removing it lets voices start again
+ * is a run, not an argument, which is why this ships OFF and why
+ * g_idle_trap_edge_encounters is counted with it off: one run with the switch
+ * OFF says how many raises it would have withheld, and if that is not most of
+ * them the hypothesis is dead before anybody enables it.
+ *
+ * THE RISK IT CARRIES, stated plainly: if the guest ever genuinely needs a
+ * second notification for a voice it failed to service the first time, this
+ * withholds it and that voice stays in the list inactive for ever. Nothing
+ * here can rule that out statically. g_idle_trap_edge_rearm is the counter
+ * that would show the latch cycling normally rather than latching shut. */
+int mcpx_apu_idle_trap_edge(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_IDLE_TRAP_EDGE");
+        on = e ? (atoi(e) != 0) : 0;
     }
     return on;
 }
@@ -1124,6 +1226,15 @@ static void voice_list_unlink_at(MCPXAPUState *d, unsigned top_reg,
                    NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE, nxt);
 }
 
+/* Defined with the decoder they belong to, further down the file; declared
+ * here because the report is above it. */
+extern unsigned long g_apu_adpcm_ok;
+extern unsigned long g_apu_adpcm_fail;
+extern unsigned long g_apu_adpcm_short;
+extern unsigned long g_apu_adpcm_oversize;
+extern unsigned long g_apu_adpcm_silenced;
+int mcpx_apu_adpcm_guard(void);
+
 void mcpx_apu_voice_report(void)
 {
     fprintf(stderr, "  [APU-VOICE] on=%lu off=%lu release=%lu idle_trap=%lu"
@@ -1156,10 +1267,115 @@ void mcpx_apu_voice_report(void)
             fprintf(stderr, " %04X", g_apu_unknown_method[k]);
         fprintf(stderr, "\n");
     }
-    fprintf(stderr, "  [APU-TRAP] suppressed=%lu (coalesce %s, se_while_trapped %s)\n",
+    /* idle_edge rides in these parentheses rather than on a line of its own
+     * because ab_score.py harvests switch state with
+     *   \[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)
+     * and nothing else. A new line would leave an A/B on this switch in the
+     * "assumes the environment took" class that voided the SELFLINK_END A/B.
+     * ab_score.py's SWITCH_TOKEN still wants
+     *   "RECOMP_APU_IDLE_TRAP_EDGE": "idle_edge"
+     * added to it before the VOID rule can check this switch specifically;
+     * without that entry the harvest works and the check is simply skipped. */
+    fprintf(stderr, "  [APU-TRAP] suppressed=%lu (coalesce %s,"
+            " se_while_trapped %s, idle_edge %s)\n",
             g_apu_trap_suppressed,
             mcpx_apu_trap_coalesce() ? "on" : "OFF",
-            mcpx_apu_se_while_trapped() ? "on" : "OFF");
+            mcpx_apu_se_while_trapped() ? "on" : "OFF",
+            mcpx_apu_idle_trap_edge() ? "on" : "OFF");
+    /* THE TWO NUMBERS THAT SEPARATE THE TWO STORM HYPOTHESES.
+     *
+     * persist is raises for a voice whose CFG_FMT says the guest's ISR returns
+     * without acting (001A241F). edge_would is raises that name a voice we had
+     * already reported idle and that has not been restarted since. Read both
+     * against raises= on the line above, which is their denominator and their
+     * positive control.
+     *
+     *   persist ~= raises   -> the storm is the PERSIST loop: the guest is
+     *                          being handed the RIGHT handle and declining it,
+     *                          so RECOMP_APU_FEDEC_HOLD cannot help and
+     *                          RECOMP_APU_IDLE_TRAP_EDGE is the fix.
+     *   persist ~= 0 but edge_would ~= raises -> still a repeat storm, but for
+     *                          voices the ISR should have retired: the handle
+     *                          it acted on was wrong, which is FEDEC_HOLD's
+     *                          hypothesis, and edge only masks it.
+     *   both ~= 0           -> every raise is a distinct fresh retirement and
+     *                          neither switch is the answer.
+     *
+     * rearm is the latch's own liveness: suppressed climbing with rearm stuck
+     * at zero means the latch has shut rather than cycled, which is the way
+     * this change fails. */
+    fprintf(stderr, "  [APU-IDLE-EDGE] persist=%lu edge_would=%lu"
+            " edge_suppressed=%lu rearm=%lu (of %lu raises)\n",
+            g_idle_trap_persist_raises, g_idle_trap_edge_encounters,
+            g_idle_trap_edge_suppressed, g_idle_trap_edge_rearm,
+            g_idle_trap_raises);
+    /* THE ADPCM DECODE, WHICH HAD NO INSTRUMENT AT ALL. ok is the positive
+     * control for fail: both zero means no ADPCM voice played in this run and
+     * says nothing about the decoder. oversize is the stack-overrun clamp and
+     * is the one thing here that is repaired unconditionally. */
+    fprintf(stderr, "  [APU-ADPCM] ok=%lu fail=%lu short=%lu oversize=%lu"
+            " silenced=%lu (adpcm_guard %s)\n",
+            g_apu_adpcm_ok, g_apu_adpcm_fail, g_apu_adpcm_short,
+            g_apu_adpcm_oversize, g_apu_adpcm_silenced,
+            mcpx_apu_adpcm_guard() ? "on" : "OFF");
+    {
+        /* THE SCORING LINE FOR "DO SOUND EFFECTS START", WITH ITS CONTROL ON
+         * THE SAME LINE.
+         *
+         * on= alone cannot answer it. It is the symptom -- it climbs to 55 and
+         * then freezes -- and it is also the scene marker (4-12 parked, 148-453
+         * gameplay), so a frozen 55 is both "SE never start" and "we are
+         * nowhere near either band" and nothing distinguishes them.
+         *
+         * Two separations, both on this line:
+         *
+         *   oneshot vs loop. A looping voice takes cbo = lbo at ebo and runs
+         *   for ever by design, so BGM never retires; one-shots are what
+         *   sound effects are. g_apu_voice_on_loop_count is already split out
+         *   at VOICE_ON for exactly this reason. Music is known to work in
+         *   this tree, so loop climbing is the control that says the guest's
+         *   audio path is alive: oneshot=+0 beside loop=+N is SE silence.
+         *
+         *   DELTAS, not totals. A frozen total had to be found by differencing
+         *   two reports ten seconds apart, which is how "on= is stuck" went
+         *   unnoticed for three sessions. +0 in this window is one glance.
+         *
+         * guest_methods, raises and processed are the instrument-alive
+         * controls: all three climbing beside oneshot=+0 is the signature the
+         * established finding describes, and all three at +0 means the APU
+         * stopped rather than the effects.
+         *
+         * Statics are safe here: this function has one caller, the periodic
+         * reporter thread in diagnostics/jsrf_first_fault/main.c. The crash
+         * handler calls mcpx_apu_idle_trap_report, not this. */
+        static unsigned long p_on, p_loop, p_gm, p_raise, p_proc;
+        long d_on    = (long)(g_apu_voice_on_count      - p_on);
+        long d_loop  = (long)(g_apu_voice_on_loop_count - p_loop);
+        long d_gm    = (long)(g_apu_guest_method_count  - p_gm);
+        long d_raise = (long)(g_idle_trap_raises        - p_raise);
+        long d_proc  = (long)(g_apu_voice_process_count - p_proc);
+        long oneshot = (long)g_apu_voice_on_count
+                     - (long)g_apu_voice_on_loop_count;
+        long d_oneshot = d_on - d_loop;
+        fprintf(stderr,
+                "  [APU-SE] oneshot=%ld loop=%lu | this window:"
+                " oneshot=%+ld loop=%+ld guest_methods=%+ld raises=%+ld"
+                " processed=%+ld%s\n",
+                oneshot, g_apu_voice_on_loop_count,
+                d_oneshot, d_loop, d_gm, d_raise, d_proc,
+                (d_oneshot == 0 && (d_proc > 0 || d_raise > 0 || d_gm > 0))
+                    ? "   <- no one-shot voice started while the engine kept"
+                      " running: SE silence, not a stopped APU"
+                    : (d_proc == 0 && d_raise == 0 && d_gm == 0)
+                        ? "   <- the APU saw nothing at all this window; this"
+                          " line says nothing about SE"
+                        : "");
+        p_on = g_apu_voice_on_count;
+        p_loop = g_apu_voice_on_loop_count;
+        p_gm = g_apu_guest_method_count;
+        p_raise = g_idle_trap_raises;
+        p_proc = g_apu_voice_process_count;
+    }
     fprintf(stderr, "  [APU-SELFLINK] terminated=%lu (guard %s)\n",
             g_apu_selflink_terminated,
             mcpx_apu_selflink_end() ? "on" : "OFF");
@@ -1754,6 +1970,22 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_reset_filters(d, (uint16_t)selected_handle);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
+
+        /* RE-ARM THE IDLE EDGE. The guest has just restarted this voice, so
+         * whatever we last told it about this handle is spent: the next time
+         * the voice goes idle it is a new transition and the guest is entitled
+         * to hear about it. Unconditional, so that a run with
+         * RECOMP_APU_IDLE_TRAP_EDGE off still reports how often the latch
+         * would have been cycling -- a latch that never re-arms is a latch
+         * that would swallow every retirement after the first, and that is the
+         * failure this switch has to be able to show is not happening. */
+        if (selected_handle < MCPX_HW_MAX_VOICES) {
+            uint64_t ebit = 1ULL << (selected_handle % 64);
+            if (g_idle_trap_reported[selected_handle / 64] & ebit) {
+                g_idle_trap_reported[selected_handle / 64] &= ~ebit;
+                g_idle_trap_edge_rearm++;
+            }
+        }
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
@@ -2448,6 +2680,72 @@ static void voice_fresh_sample(uint16_t v, uint32_t cbo, const float s[2])
     f->acc = (f->acc ^ c1.u) * 16777619u;
 }
 
+/* THE ADPCM DECODE HAS NEVER BEEN CHECKED, AND HAS NEVER BEEN COUNTED.
+ *
+ * adpcm_decode_block (apu_state.h) returns the number of frames it produced,
+ * and 0 for a block it refuses. It refuses in two places:
+ *
+ *   * inbufsize < channels * 4  -- before writing anything at all;
+ *   * index[ch] out of 0..88, or the fourth header byte non-zero -- AFTER it
+ *     has already stored that channel's first sample and advanced outbuf.
+ *
+ * The call site ignored the return value entirely and read 64 frames out of
+ * `int16_t adpcm_decoded[65 * 2]`, an UNINITIALISED automatic array. So a
+ * refused block emits up to 129 int16 of whatever was on the stack, converted
+ * by int16_to_float and mixed at full scale. And because adpcm_block_index was
+ * set unconditionally straight afterwards, the refusal was cached: every one
+ * of the block's 64 samples came out of the same garbage, and the block was
+ * never retried.
+ *
+ * WHAT THIS IS AND IS NOT. It is NOT the reason sound effects are silent --
+ * the established finding is that SE voices are never STARTED, and garbage
+ * mixed at full scale is loud, not quiet. It is a separate defect whose
+ * symptom is noise, and JSRF does use ADPCM, so it can fire. The counters are
+ * unconditional and decide in one run whether it is firing at all; the repair
+ * is behind a switch because substituting silence for garbage is a behaviour
+ * change and this tree's rule is that those ship off.
+ *
+ * _fail and _ok share a denominator (blocks decoded) and are printed together,
+ * so _ok is the positive control: fail=0 beside ok=0 means no ADPCM voice ever
+ * played and says nothing about the decoder.
+ *
+ * _short is a block the decoder accepted but for which it produced fewer than
+ * ADPCM_SAMPLES_PER_BLOCK frames -- the tail of the read is then uninitialised
+ * for exactly the same reason, with no error to notice.
+ *
+ * _oversize is the one that is repaired unconditionally, because it is memory
+ * corruption rather than bad audio. block_size is 36 * samples_per_block and
+ * NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK is five bits, so block_size reaches
+ * 1152 -- copied by memcpy into `uint32_t adpcm_block[18]`, 72 bytes, on the
+ * stack. The decoder then overruns `adpcm_decoded` to match: 72 bytes of mono
+ * input yields 137 frames into a 130-entry array. Clamping the fetch to one
+ * 36-byte block per channel bounds both, and loses nothing readable -- the
+ * reader below indexes block_position < ADPCM_SAMPLES_PER_BLOCK frames, and
+ * 36 bytes per channel is exactly 65 frames per channel. If _oversize reads 0
+ * over a run, this clamp changed nothing in it. */
+unsigned long g_apu_adpcm_ok;
+unsigned long g_apu_adpcm_fail;
+unsigned long g_apu_adpcm_short;
+unsigned long g_apu_adpcm_oversize;
+unsigned long g_apu_adpcm_silenced;
+
+/* OFF by default. RECOMP_APU_ADPCM_GUARD=1 substitutes silence for the
+ * uninitialised tail of a refused or short block. Off, the default path is
+ * byte-identical to what it was, so the counters above measure the bug rather
+ * than the fix -- which also means an ADPCM voice keeps reading uninitialised
+ * stack until somebody turns this on. Both halves of that are deliberate: this
+ * repository has shipped one APU guard on an argument and made a crash worse,
+ * and the rule that came out of it is a run count, not a better argument. */
+int mcpx_apu_adpcm_guard(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_ADPCM_GUARD");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
 static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
@@ -2562,14 +2860,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             unsigned int block_position = cbo % ADPCM_SAMPLES_PER_BLOCK;
             if (adpcm_block_index != (int)block_index) {
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
+                /* One 36-byte ADPCM block per channel is the most that either
+                 * adpcm_block (72 bytes) or adpcm_decoded (65 frames per
+                 * channel) can hold, and the most the reader below can
+                 * address. Anything longer is a stack overrun in both
+                 * directions; see the g_apu_adpcm_oversize comment. */
+                size_t fetch = block_size;
+                if (fetch > (size_t)36 * channels) {
+                    fetch = (size_t)36 * channels;
+                    g_apu_adpcm_oversize++;
+                }
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
                     memcpy(adpcm_block, &d->ram_ptr[addr & g_apu_ram_mask],
-                           block_size);
+                           fetch);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
-                         word_index < (9 * samples_per_block); word_index++) {
+                         word_index < fetch / 4; word_index++) {
                         hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
                                                    0xFFFFFFFF, linear_addr);
                         adpcm_block[word_index] =
@@ -2577,8 +2885,37 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         linear_addr += 4;
                     }
                 }
-                adpcm_decode_block(adpcm_decoded, (uint8_t *)adpcm_block,
-                                   block_size, channels);
+                /* THE RETURN VALUE, WHICH WAS DISCARDED. Frames per channel,
+                 * 0 for a block the decoder refused -- and a refusal can
+                 * happen after it has already written the first sample, so
+                 * "0" does not mean "wrote nothing". */
+                int decoded = adpcm_decode_block(adpcm_decoded,
+                                                 (uint8_t *)adpcm_block,
+                                                 fetch, channels);
+                if (decoded <= 0) {
+                    g_apu_adpcm_fail++;
+                    if (mcpx_apu_adpcm_guard()) {
+                        memset(adpcm_decoded, 0, sizeof(adpcm_decoded));
+                        g_apu_adpcm_silenced++;
+                    }
+                } else {
+                    g_apu_adpcm_ok++;
+                    if (decoded < (int)ADPCM_SAMPLES_PER_BLOCK) {
+                        g_apu_adpcm_short++;
+                        if (mcpx_apu_adpcm_guard()) {
+                            size_t got = (size_t)decoded * channels;
+                            memset(&adpcm_decoded[got], 0,
+                                   sizeof(adpcm_decoded)
+                                   - got * sizeof adpcm_decoded[0]);
+                            g_apu_adpcm_silenced++;
+                        }
+                    }
+                }
+                /* Still cached unconditionally, because a refused block is
+                 * refused every time it is fetched and retrying it 63 more
+                 * times this frame would only cost CPU. What has changed is
+                 * that the cached result is now counted, and optionally
+                 * silence rather than stack. */
                 adpcm_block_index = block_index;
             }
 
@@ -3469,6 +3806,23 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     }
                 }
 
+                /* ONE RAISE PER IDLE TRANSITION. See mcpx_apu_idle_trap_edge
+                 * for why the level reading cannot be hardware's.
+                 *
+                 * Gated on !trap_held && !suppress so that _encounters is the
+                 * count of raises this rule would have withheld and nothing
+                 * else -- a subset of g_idle_trap_raises, comparable with it,
+                 * and not the different-denominator mistake the locked
+                 * counters had to be split to undo. */
+                if (v < MCPX_HW_MAX_VOICES && !trap_held && !suppress
+                    && (g_idle_trap_reported[v >> 6] & (1ULL << (v & 63)))) {
+                    g_idle_trap_edge_encounters++;
+                    if (mcpx_apu_idle_trap_edge()) {
+                        g_idle_trap_edge_suppressed++;
+                        suppress = 1;
+                    }
+                }
+
                 /* Suppressing the RAISE only. The cursors below still advance
                  * exactly as they would for any voice with nothing to do this
                  * subframe -- a locked voice must not pin the walk, which is
@@ -3486,6 +3840,18 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
                     if (locked)   g_idle_trap_locked_raises++;
                     if (!ever_on) g_idle_trap_never_on_raises++;
+                    /* The total the ring's P flag has never had. A raise whose
+                     * voice has PERSIST set is one the guest's ISR returns
+                     * from without acting (001A241F), so it can never retire
+                     * the voice and the level-triggered raise can only repeat.
+                     * If this tracks raises, the storm is that loop. */
+                    if (fmt & NV_PAVS_VOICE_CFG_FMT_PERSIST)
+                        g_idle_trap_persist_raises++;
+                    /* Latch: this voice has now been reported idle. Set
+                     * whether or not the edge rule is enabled, so that the
+                     * counters above measure it with the switch off. */
+                    if (v < MCPX_HW_MAX_VOICES)
+                        g_idle_trap_reported[v >> 6] |= 1ULL << (v & 63);
                     if (v < MCPX_HW_MAX_VOICES
                         && (g_apu_voice_in_cycle[v >> 6] & (1ULL << (v & 63))))
                         why |= IDLE_TRAP_WHY_CYCLE;
@@ -3521,6 +3887,20 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     }
                 }
             } else {
+                /* ACTIVE AGAIN, SO THE EDGE IS SPENT. Reaching here means the
+                 * voice has ACTIVE_VOICE set, which is the only state from
+                 * which it can transition to idle again. Clearing here as well
+                 * as in VOICE_ON is what makes the latch self-healing: a voice
+                 * restarted by any path this model does not see -- the voice
+                 * register file lives in guest RAM -- still re-arms the first
+                 * time the walk renders it. Two instructions on the hot path. */
+                if (v < MCPX_HW_MAX_VOICES) {
+                    uint64_t ebit = 1ULL << (v & 63);
+                    if (g_idle_trap_reported[v >> 6] & ebit) {
+                        g_idle_trap_reported[v >> 6] &= ~ebit;
+                        g_idle_trap_edge_rearm++;
+                    }
+                }
                 /* Process voice directly (single-threaded) */
                 g_apu_voice_process_count++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
