@@ -1,0 +1,105 @@
+BUG HUNT 2026-09-16 (night, third) -- HALF THE FRAME IS SPENT WAITING FOR THE
+GPU, AND THE PRESENTER REBUILT ITS TEXTURE SIXTY TIMES A SECOND
+
+A hunt through the PRESENT path, which is goal G3's territory and had never
+been reviewed. One fix landed, and one measurement that resizes G3 entirely.
+
+
+=============================================================================
+1. THE NUMBER THAT MATTERS: 8.06 ms PER FRAME IN nv2a_metal_sync
+=============================================================================
+
+The instrument was already there. Nobody had divided it by the frame count.
+From a 150 s gameplay run with everything on the GPU (render-investigation/
+texq-1):
+
+    [METAL] sync 24293 calls (8100 already clean):
+            52751.3 ms draining the GPU, 12487.1 ms reading back and converting
+    [FRAME] flips=8098 mean=16.05 ms (62.3 fps) p50=17.5 p99=40.5
+
+    syncs per frame     3.00
+    sync ms per frame   8.06   = 6.51 draining + 1.54 reading back
+    frame mean          16.05 ms
+    SHARE OF THE FRAME  50%
+
+HALF THE FRAME IS A STALL. And the shape is not what the earlier handover
+assumed: it described "the flip sync, 4.06-6.91 ms per frame, ONE CALL PER
+FRAME". There are THREE syncs per frame, two thirds of them not the flip, and
+the draining dominates the readback four to one. A mean drain of 3.26 ms per
+real sync is the CPU waiting on waitUntilCompleted while the GPU finishes
+work that was only just submitted.
+
+WHAT THIS CHANGES ABOUT G3. The plan was "remove the flip's readback". That
+addresses 1.54 ms of 8.06. The serialisation itself -- three full pipeline
+drains per frame -- is the other 6.51, and the first question is no longer
+"how do we present without a readback" but "WHY THREE, AND WHO CALLS THEM".
+nv2a_metal_sync's callers need counting before anything is redesigned; the
+instrument prints one total for all of them.
+
+THE 8100 "already clean" CALLS ARE THE OTHER HALF OF THE STORY: a third of
+syncs cost nothing because nothing was dirty. So two thirds of the calls do
+real work, and whether the caller NEEDED the surface at that moment is a
+question nothing in the log can currently answer.
+
+Note the arithmetic against p50 rather than the mean: the median frame is
+17.5 ms against a 16.68 ms budget, so the tail this has to fix is real, and
+8 ms of stall is far more than the 0.8 ms the median is over by.
+
+
+=============================================================================
+2. FIXED: THE PRESENTER DESTROYED AND REBUILT ITS TEXTURE EVERY FRAME
+=============================================================================
+
+present_guest_framebuffer() called glTexImage2D once per Present,
+unconditionally. That call does not upload into existing storage -- it
+DESTROYS the texture's storage and creates it again, at a size that changes
+essentially never. 640x480 RGBA is 1.2 MB of GPU storage torn down and rebuilt
+sixty times a second, and a driver with the old storage still in flight must
+orphan it or wait.
+
+The discipline was already in the same function and applied to the CPU side:
+the `rgba` staging buffer three lines above is reallocated only when the
+dimensions change. The GPU side had no such guard because the size the texture
+was allocated at was never recorded. It now is: glTexImage2D on a size change,
+glTexSubImage2D otherwise, with counters on the [d3d8_gl] blit line so a run
+says which path it took -- "I changed it" and "the change took" being
+different claims.
+
+Identical texels either way, so there is no arm to compare.
+
+
+=============================================================================
+3. NOT DONE: THE CPU CONVERTS 307,200 PIXELS A FRAME THAT THE GPU COULD EAT
+   RAW
+=============================================================================
+
+fb_row_to_rgba expands the guest's RGB565 surface to RGBA8888 in scalar C,
+per pixel, per frame -- 307,200 pixels at 640x480, and it also performs the
+vertical flip while it is there.
+
+GL can take the guest bytes DIRECTLY as GL_RGB / GL_UNSIGNED_SHORT_5_6_5.
+That removes the conversion entirely and HALVES the upload (614 KB instead of
+1.2 MB). The flip moves to the quad's texture coordinates, which is free.
+
+WHY IT IS NOT DONE HERE: the colour expansion would move from this loop's
+explicit bit-replication ((r << 3) | (r >> 2)) to the driver's, and those can
+differ in the low bits. That is a PICTURE change, so it needs a switch and a
+frame comparison, not a confident commit at the end of a long session. The
+blit instrument is the natural verifier -- once its sample point is fixed,
+which is item 1 of G3 and still outstanding.
+
+
+=============================================================================
+4. OPEN, RANKED, FOR G3
+=============================================================================
+
+ 1. COUNT THE SYNC CALLERS. Three per frame, one instrument, no attribution.
+    Everything below is guesswork until this exists.
+ 2. The per-frame sync HISTOGRAM the earlier handover asked for -- but now for
+    all three syncs, not just the flip. Removing a stall moves the median only
+    if the stall is on the median frame.
+ 3. Fix the blit check's sample point (expected bilinear blend, 1 LSB
+    tolerance). It currently means "should be close", not "must be equal",
+    and every later stage is verified with it.
+ 4. Then the direct 565 upload (section 3), then the surface-cache lookup of
+    the flipped address, then the presenter itself.

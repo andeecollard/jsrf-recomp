@@ -616,11 +616,19 @@ static void fb_row_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t w,
  * Reuses the fixed program with u_use_xform off, so the quad's coordinates are
  * already clip space, and u_use_tex on with a white vertex colour so the
  * texture passes through unmodified. Returns non-zero if it drew. */
+/* Full texture allocations against in-place updates on the present path. A
+ * healthy run allocates once and updates every frame after that; allocs
+ * climbing with the frame count means the guard below is not holding. */
+unsigned long g_present_tex_allocs, g_present_tex_updates;
+
 static int present_guest_framebuffer(void)
 {
     static GLuint tex, vbo, vao;
     static uint8_t *rgba;
     static uint32_t rgba_w, rgba_h;
+    /* The size the TEXTURE was allocated at, which is a different fact from
+     * the size the CPU buffer was allocated at and was not tracked at all. */
+    static uint32_t tex_w, tex_h;
     const uint8_t *fb;
     uint32_t w = 0, h = 0, pitch = 0, bpp = 0, y;
 
@@ -671,8 +679,34 @@ static int present_guest_framebuffer(void)
 
     glBindTexture(GL_TEXTURE_2D, tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    /* ALLOCATE ONCE, UPDATE EVERY FRAME.
+     *
+     * This was glTexImage2D unconditionally, once per Present. That call does
+     * not upload into existing storage -- it DESTROYS the texture's storage
+     * and creates it again, every frame, at a size that changes essentially
+     * never. 640x480 RGBA is 1.2 MB of storage torn down and rebuilt sixty
+     * times a second, and a driver that had the old storage in flight has to
+     * either orphan it or wait.
+     *
+     * The discipline was already here and applied to the CPU side: the `rgba`
+     * buffer three lines up is reallocated only when the dimensions change.
+     * The GPU side needed the same guard and did not have one, because the
+     * size it was allocated at was never recorded.
+     *
+     * Identical texels either way -- same format, same size, same data -- so
+     * there is no arm to compare, only a cost to remove. The counters say
+     * which path a run took, because "I changed it" and "the change took" are
+     * different claims. */
+    if (tex_w != w || tex_h != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        tex_w = w; tex_h = h;
+        ++g_present_tex_allocs;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
+                        GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        ++g_present_tex_updates;
+    }
 
     if (!vao) {
         /* pos.xyzw, colour.rgba, uv -- one full-screen triangle strip. */
@@ -808,9 +842,11 @@ static int present_guest_framebuffer(void)
                 glReadPixels(fbw / 2, fbh / 2, 1, 1, GL_RGBA,
                              GL_UNSIGNED_BYTE, px);
             fprintf(stderr, "[d3d8_gl] blit %u: guest centre %02X %02X %02X"
-                    " -> window %02X %02X %02X (gl err 0x%04X)\n",
+                    " -> window %02X %02X %02X (gl err 0x%04X)"
+                    " | present texture: %lu alloc, %lu in-place\n",
                     shots, centre[0], centre[1], centre[2],
-                    px[0], px[1], px[2], glGetError());
+                    px[0], px[1], px[2], glGetError(),
+                    g_present_tex_allocs, g_present_tex_updates);
             fflush(stderr);
         }
     }
