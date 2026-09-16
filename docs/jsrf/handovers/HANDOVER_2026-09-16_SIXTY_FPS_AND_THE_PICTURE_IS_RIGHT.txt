@@ -13,12 +13,19 @@ days was found and fixed, and the frame rate went from 31.5 fps to about 60.
 =================================================
     31.75 ms / 31.5 fps   ->   16.4-17.0 ms / 58.9-61.1 fps
 
-TWO RUNS OF THE SAME CONFIGURATION MEASURED 61.1 AND 58.9 FPS. The gap is
-entirely in `sync` (5.23 against 6.12 ms) and is run-to-run variation, which
-this session separately established at about 1 ms per stage. So the truthful
-statement is "about 60 fps, straddling the line", not 61.1. p50 is 16.3-17.0 ms
-against a 16.67 ms budget. It needs more headroom before it can be called
-comfortably 60, and section 7 says where that is.
+TWO RUNS MEASURED 61.1 AND 58.9 FPS, and calling them "the same configuration"
+was WRONG -- their RESULTS.txt files carry different binaries (9fb5857f against
+a5504fd7) and one additionally ran with the [METAL-CB] instrumentation on. Same
+switches, not same build. The pinned hash is printed in every RESULTS.txt for
+exactly this reason and was not read. So the truthful statement is "about 60
+fps", and the spread is not yet characterised.
+
+AND 60 FPS ON AVERAGE IS NOT THE TARGET. See section 5: the guest is paced by
+an emulated 59.94 Hz vblank whose poll DROPS periods it misses, so every frame
+over 16.683 ms permanently costs one simulation step. The metric is p99, not
+the mean. Measured across gameplay windows: p50 16.5-19.0, p90 19.5-24.0, p99
+21-27.5. Roughly half of frames still overrun. Section 7 is therefore not
+polish; it is the rest of the job.
 
 The artefact is gone at every step: 24 of 24 captured gameplay frames clean,
 scored by the structural fingerprint described in section 5 at 31-32% against
@@ -174,12 +181,29 @@ THE APU EMITS THE SAME NUMBER OF FRAMES AT EVERY FRAME RATE AND NEVER
 UNDERRUNS. It is locked to real time by throttle(), which is what it should be.
 Nothing was wrong with the audio.
 
-JSRF is fixed-step, so at 22-33 fps the WORLD ran at 38-55% of intended speed
-against a real-time soundtrack and the gap widened all run -- which is exactly
-"goes out of sync over the course of a run". At 60 fps the simulation runs at
-about 102% of intended speed. The frame-rate work was the sound fix, and any
-residual drift is now measurable where it was previously buried under a 2x
-speed error.
+AND THE MECHANISM IS IN THE CODE, not inferred. The guest does not free-run:
+bridge_vblank_poll delivers BRIDGE_VBLANK_PERIOD_US = 16683 us, 59.94 Hz, and
+the title's own vsync pump blocks on it -- which is why d3d8_gl.c sets
+SDL_GL_SetSwapInterval(0) and says so. The guest therefore CANNOT run faster
+than 59.94 Hz and being faster than 60 is harmless.
+
+The drift comes from the other side. kernel_bridge.c:2534, deliberately:
+
+    "still reset from `now` rather than advanced from the previous deadline.
+     A late poll DROPS the periods it missed instead of delivering them in a
+     burst."
+
+So a frame that overruns 16.683 ms costs one simulation step, permanently,
+while audio keeps real time. Game speed is 16.683 / mean_frame_ms:
+
+    best window     14.27 ms   p99 17.0    100% (capped by the vblank)
+    typical         16.6-17.4  p99 21-23   96-99%
+    worst           18.2-20.2  p99 23.5-27 83-92%
+
+At 31.75 ms it was 52%, which is why the desync was gross. It is now subtle and
+NOT GONE: about half of frames still overrun. Eliminating it needs p99 under
+16.68 ms, which means a mean nearer 12-13 ms with tight variance -- not the
+16.4 this session reached.
 
 
 6. HOW TO MEASURE THIS, WHICH IS THE PART THAT GENERALISES
@@ -240,7 +264,25 @@ MISTAKES MADE TODAY, all of them process rather than analysis:
      surface-swap sync inside nv2a_metal_draw, which a per-slot dirty flag
      would let a cache hit skip entirely.
 
-  2. THE APU CRASH, DIAGNOSED AND NOT FIXED. sub_001A2E2E is DirectSound's
+  2. THE APU CRASH, DIAGNOSED, AND A FIX FOR IT REVERTED THE SAME DAY.
+     Two windows are measured open -- 13,294 of 23,933 idle-voice raises happen
+     while the guest holds that voice's lock, and 47,919 of 77,141 guest
+     methods arrive while the front end is trapped, clobbering the decode pair
+     the ISR is mid-read of. Guards for both were written, defaulted on, and
+     REVERTED within the hour: with them on, 4 of 4 runs faulted at t=24.03,
+     deterministically, against ~5 in ~25 at t=34-35 with them off. A fix that
+     makes the crash worse is not a fix, however good the reasoning was, and
+     the reasoning was static.
+     The crash also reproduced WITH both guards on, from a ring entry
+     3D:v0[]<-TVL carrying no flags at all -- not locked, not never-started.
+     THERE IS A THIRD MECHANISM AND NOBODY KNOWS WHAT IT IS. The likeliest
+     place to look is whether a released voice is correctly unlinked from the
+     TVL/CVL/NVL cursor triple: a voice left at a list head is found by the
+     walk for ever, and DirectSound cleared its owner long ago.
+     Do not default either guard on again without five clean runs. The fault
+     fires in about one run in five, so one clean run is not evidence.
+
+  2b. THE OLD FORM OF THIS ITEM, kept because the diagnosis stands. sub_001A2E2E is DirectSound's
      RemoveIdleVoice called with a NULL this; our APU hands its ISR a voice
      handle DirectSound has no owner object for. All six dumped registers
      reproduce from ecx=0, the five-frame call chain is read off the stack
