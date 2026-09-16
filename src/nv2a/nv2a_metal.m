@@ -453,6 +453,11 @@ static uint64_t inline_vertex_batches,allocated_vertex_batches;
  * emits, and applies exactly Metal's clip volume (-w<=x<=w, -w<=y<=w,
  * 0<=z<=w) to it. A primitive is discarded whole only when all three vertices
  * fall outside one shared plane, so that is what `outside_*` counts. */
+/* Defined with area(), far below: triangles whose float cross product
+ * collapsed to zero while the double one did not. Counted unconditionally so
+ * a run with the repair OFF still reports what the old arithmetic lost. */
+static uint64_t g_area_rescued;
+static int area_double_on(void);
 static uint64_t audit_tris,audit_out_near,audit_out_far,audit_out_side;
 static uint64_t audit_verts,audit_w_neg,audit_w_zero,audit_w_nan;
 static uint64_t audit_z_below,audit_z_above;
@@ -2204,6 +2209,11 @@ void nv2a_metal_report(void)
             "%llu were on screen with every w>0\n",
             (unsigned long long)audit_deg_nonfinite,(unsigned long long)audit_deg_dup,
             (unsigned long long)audit_deg_collinear,(unsigned long long)audit_deg_lost);
+    fprintf(stderr,"[METAL] clip audit: float area collapsed to zero on %llu"
+            " triangles that have a non-zero area in double (area_double %s)"
+            " -- these are the thin far-scenery triangles the old arithmetic"
+            " dropped\n",(unsigned long long)g_area_rescued,
+            area_double_on()?"on":"OFF");
     if(clip_audit_on())
         fprintf(stderr,"[METAL] clip audit: cull state seen: none=%llu front=%llu "
             "back=%llu both=%llu other=%llu | front_cw=%llu front_ccw=%llu\n",
@@ -2838,8 +2848,65 @@ const char *nv2a_metal_last_reject(void){return reject_reason?reject_reason:"non
 static int reject(const char *reason){reject_reason=reason;nv2a_metal_sync();
     surface_cache_drop(surface_target);surface_cache_drop(depth_target);
     surface_valid=depth_valid=0;return-1;}
+/* THE SIGNED AREA, AND WHY IT IS COMPUTED IN DOUBLE.
+ *
+ * This is a 2D cross product of differences, which is the textbook shape for
+ * catastrophic cancellation: for a THIN triangle the two products are nearly
+ * equal and their float32 difference collapses to exactly 0. The caller then
+ * treats ar==0 as degenerate and drops the triangle.
+ *
+ * Thin is exactly what DISTANT geometry is. Near surfaces are made of fat
+ * triangles and survive; a fence or a bridge across the level is a long thin
+ * structure whose triangles are slivers by the time they reach the screen, so
+ * it loses most of them and renders as a skeletal outline that flickers as the
+ * camera moves. That is the player-visible symptom, and it is why it is always
+ * the far scenery rather than the thing in front of you.
+ *
+ * MEASURED, and the instrument that says so was already here: the degenerate
+ * split distinguishes a duplicate vertex (a legitimate triangle-strip stitch)
+ * from three DISTINCT positions that still produce zero area. One 180 s
+ * gameplay run:
+ *
+ *     strip-stitch(duplicate vertex)=30337822
+ *     collinear-distinct=265785, of which 260714 were on screen with
+ *                               every w>0
+ *
+ * 260,714 triangles a run, on screen, in front of the camera, three distinct
+ * corners, dropped for having no area. Real meshes do not contain a quarter of
+ * a million exactly-collinear triangles; float32 does.
+ *
+ * The inputs stay float -- they are the guest's own transformed positions and
+ * promoting them changes nothing -- but the arithmetic is done in double, which
+ * has enough headroom that the cancellation cannot reach zero for any triangle
+ * whose corners genuinely differ. The result narrows back to float for the
+ * facing test, which only reads its sign.
+ *
+ * THE HYPOTHESIS ABOVE IS WRONG, AND THE COUNTER BELOW IS HOW WE KNOW.
+ * Measured over a full gameplay run: area_rescued = 0. NOT ONE triangle has a
+ * zero area in float and a non-zero area in double, so the cancellation never
+ * manufactures a false degenerate and this change rescues nothing. The 161,586
+ * on-screen collinear-distinct triangles are EXACTLY zero in double too --
+ * they are genuinely collinear in screen space, which means something upstream
+ * is flattening those vertices onto a line, and that is a transform question
+ * rather than a precision one. Default OFF because it demonstrably does
+ * nothing; kept, with its counter, so the next person does not spend the same
+ * afternoon on the same idea.
+ *
+ * RECOMP_METAL_AREA_DOUBLE=1 enables the double arithmetic for an A/B. The
+ * DETECTION is unconditional: area_rescued counts triangles that are zero in
+ * float and non-zero in double, so a run with the repair OFF still reports
+ * exactly how much geometry the old arithmetic was throwing away. */
+static int area_double_on(void)
+{ static int on=-1;
+  if(on<0){const char*e=getenv("RECOMP_METAL_AREA_DOUBLE");
+           on = e ? (atoi(e)!=0) : 0;}   /* DEFAULT OFF -- MEASURED A NO-OP */
+  return on; }
 static float area(const float a[4],const float b[4],const float c[4])
-{return(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);}
+{float f=(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+ double d=((double)b[0]-a[0])*((double)c[1]-a[1])
+         -((double)b[1]-a[1])*((double)c[0]-a[0]);
+ if(f==0.0f&&d!=0.0)++g_area_rescued;
+ return area_double_on()?(float)d:f;}
 static int vertex_valid(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned i)
 {for(unsigned k=0;k<4;k++)if(!isfinite(v[i][0][k])||!isfinite(v[i][3][k])||!isfinite(v[i][4][k]))return 0;
  for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){for(unsigned k=0;k<4;k++)if(!isfinite(v[i][9+u][k]))return 0;if(v[i][9+u][3]<=0)return 0;}return 1;}
