@@ -47,31 +47,44 @@ wall clock. That is one host and one scene, and it is not a frame-time A/B.
 Treat it as "no cost was visible", not as "measured faster".
 
 
-2. WHAT IS STILL OPEN ON THE MECHANISM
-=======================================
-Mode 3 changes TWO things at once, and the arms above cannot separate them:
+2. THE MECHANISM, SETTLED
+==========================
+Mode 3 changes TWO things at once, and the three arms in section 1 cannot
+separate them:
 
   (a) opaque draws gain a destination read under raster_order_group(0)
   (b) the encoder stops MIXING two blending modes against the same pixels --
-      under modes 0..2 a batched encoder alternates between fs_hw (writes
+      under modes 1 and 2 a batched encoder alternates between fs_hw (writes
       colour(0), never reads it, fixed-function blend) and fs_hw_blend (reads
       colour(0) under raster_order_group(0), blend unit disabled), and nothing
       flushes the batch between them: batch_flush() fires on
       `hw != batch_encoder_hw`, not on a pipeline change.
 
-The software path never enters (b). Its one pipeline is built with blending
-disabled, so EVERY software draw is programmable-blend under
-raster_order_group(0): one uniform access mode, forever.
+RECOMP_METAL_SHADER_BLEND=0 separates them, and it was run. Mode 0 removes
+fs_hw_blend entirely: NO mixing anywhere, and NO raster ordering anywhere. It
+is CORRUPT. The full ladder, all on the one pinned binary:
 
-RECOMP_METAL_SHADER_BLEND=0 separates them. It removes fs_hw_blend entirely, so
-there is no mixing AND no raster ordering anywhere. If the block artefact
-survives that, (b) is not the mechanism and (a) is. It is confounded by one
-known effect -- mode 0 deliberately puts the dither on the wrong side of the
-blend, measured in this file at 8192 of 65536 pixels on the dither's own 4x4
-lattice -- which contaminates the `x0 mod 4` statistic but not the eye: a
-flickering checkerboard on blended surfaces looks nothing like black blocks
-holding fragments of other buildings. That arm was running when this was
-written.
+  mode  coverage                              blobs   x0 mod 4   frames
+    0   no draw reads dst; no mixing          12518      36%     CORRUPT
+    1   dithered AND blended draws (default)   9676      43%     CORRUPT
+    2   every blended draw                    11464      40%     CORRUPT
+    3   every draw                             8133      30%     CLEAN
+    -   software control                       8635      30%     CLEAN
+
+Monotone and unambiguous: partial coverage leaves the artefact regardless of
+whether the encoder mixes blending modes, and only FULL coverage goes clean,
+landing on the software control's own number.
+
+SO (b) IS DEAD AND (a) IS THE MECHANISM: opaque, unblended geometry writes the
+colour attachment with no destination read and no raster ordering.
+
+Mode 0 also carries its own separate defect -- it deliberately puts the dither
+on the wrong side of the blend, measured in this file at 8192 of 65536 pixels
+on the dither's own 4x4 lattice -- which is why its blob count is the highest
+of the five. That contaminates the statistic but not the eye, and what mode 0's
+frames show is the BLOCK artefact: black rectangles holding fragments of other
+buildings, not a flickering checkerboard on blended surfaces. The two are not
+confusable and the judgement was made on the pictures.
 
 DO NOT SHIP MODE 3 BY FLIPPING THE SWITCH. It is still spelled as a diagnostic.
 The principled change is for the hardware path to use ONE uniform access mode
