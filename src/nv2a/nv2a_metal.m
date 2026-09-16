@@ -957,8 +957,31 @@ static int hw_state_on(void)
 {
     static int on = -1;
     if (on < 0) {
+        /* DEFAULT ON since 16 Sep 2026, and the reason it was off until then
+         * is now fixed. This path renders with real Depth32Float and Stencil8
+         * attachments and the ROP, against the software tail's depth-in-alpha
+         * and in-shader everything. It was default OFF because it rendered
+         * gameplay visibly corrupt -- axis-aligned blocks holding fragments of
+         * other scene content, on every frame -- which is the defect
+         * hw_shader_blend's comment describes and which is fixed by every
+         * hardware draw reading the colour attachment.
+         *
+         * MEASURED BEFORE FLIPPING IT, 16 Sep 2026, gameplay windows past
+         * t=140 s, weighted by flips, one pinned binary and one pad:
+         *
+         *     hardware path, this default      31.75 ms   31.5 fps   clean
+         *     software path, the control       32.58 ms   30.7 fps   clean
+         *
+         * and the artefact's own structural fingerprint -- the fraction of
+         * dark blocks whose left edge lands on a 4-pixel grid -- reads 31% on
+         * this path against the software control's 30%, where the broken
+         * version read 43%.
+         *
+         * =0 takes the software path, and it is a real arm rather than a dead
+         * one: it is the reference this path is scored against, and it is the
+         * only path that works when a draw's state cannot be translated. */
         const char *e = getenv("RECOMP_METAL_HW");
-        on = e ? (atoi(e) != 0) : 0;
+        on = e ? (atoi(e) != 0) : 1;
     }
     return on;
 }
@@ -1529,6 +1552,10 @@ static uint64_t g_sync_drain_ns, g_sync_read_ns;
  *          diff=0 with audits=0 measures nothing. */
 static uint64_t g_readback_races, g_readback_diff, g_readback_audits;
 static uint64_t g_queue_drains;
+/* Clears the GPU performed itself. Zero with the hardware path on means every
+ * clear refused and took the read-back route, which is a measurement, not a
+ * silence: read it before believing a frame-time number. */
+static uint64_t g_resident_color_clears, g_resident_depth_clears;
 static int queue_drain_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DRAIN"); return on; }
 static int readback_audit_on(void)
@@ -1707,6 +1734,11 @@ void nv2a_metal_report(void)
     fprintf(stderr,"[METAL] colour attachment: %s\n",
             hw_565_on()?"B5G6R5Unorm (metal_565 on)"
                        :"RGBA32Float (metal_565 OFF)");
+    fprintf(stderr,"[METAL] resident clears: %llu colour, %llu depth/stencil"
+            " (each one a drain, a 4.9 MB read-back and a 6.4 MB re-upload"
+            " that did not happen)\n",
+            (unsigned long long)g_resident_color_clears,
+            (unsigned long long)g_resident_depth_clears);
     fprintf(stderr,"[METAL] clear discards=%llu (clear_discard %s)\n",
             (unsigned long long)g_mtl_discards,
             g_mtl_discards?"used":"unused");
@@ -2073,6 +2105,156 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
                       : ((surface_dirty || depth_dirty) ? 1 : 0);
 }
 
+/* THE RESIDENT CLEAR: a full-surface clear that never leaves the GPU.
+ *
+ * WHAT IT REPLACES, and the cost is measured rather than assumed. A clear
+ * currently drains the GPU, reads the whole 4.9 MB colour surface back,
+ * converts it per pixel into guest RAM, lets the CPU memset 1.8 MB of guest
+ * RAM, and then makes the next draw re-upload 6.4 MB with a second per-pixel
+ * conversion. Twice a frame. Measured 16 Sep 2026 at gameplay, that whole
+ * stage is 9.57 ms of a 31.75 ms frame -- 30% of the budget, against a 16.67
+ * ms target -- and the run total is 28,651 ms of read-back and conversion in
+ * 280 s. None of it is necessary when the CPU is about to write one constant
+ * over every byte: the GPU can write the constant itself.
+ *
+ * WHY BOTH HALVES OR NEITHER. clear_surface calls the depth half first and the
+ * colour half second, and each falls back to nv2a_gpu_invalidate_range when
+ * its resident clear refuses. Those two calls are the ONLY invalidate sites in
+ * the executor, so if both halves go resident nothing invalidates and the
+ * surface stays valid across frames -- which is what makes this compound
+ * instead of applying once. But if the depth half refuses and invalidates, a
+ * resident colour clear would be re-uploaded away from guest RAM that never
+ * received the constant, and the clear would be LOST. So each half refuses
+ * unless the surface is still valid, which makes the pair self-limiting: the
+ * first clear after any invalidate takes the slow, correct path.
+ *
+ * WHY HARDWARE-STATE ONLY. On the software tail the colour attachment's ALPHA
+ * IS THE DEPTH BUFFER, so clearing the colour attachment would wipe depth. The
+ * hardware path keeps depth and stencil in their own attachments, which is the
+ * whole reason it exists, and is the path this is for.
+ *
+ * GUEST RAM IS LEFT STALE ON PURPOSE, and marked dirty. The next
+ * nv2a_metal_sync writes it back, and that sync already happens once a frame
+ * at the guest's own FLIP_STALL because the presenter reads guest RAM. So two
+ * read-back-and-re-upload cycles a frame become one read-back.
+ *
+ * REFUSING IS FREE AND COUNTED. Returning 0 tells clear_surface its fast path
+ * did not apply and it performs the byte-exact CPU clear it always did, so
+ * every refusal is a correct frame rather than a wrong one. */
+static int clear_resident_ok(const uint8_t *target, uint32_t pitch,
+                             uint32_t width, uint32_t height)
+{
+    if (!hw_state_on()) return 0;          /* alpha carries depth on the other tail */
+    if (!initialize()) return 0;
+    if (!surface_valid || !depth_valid) return 0;   /* something invalidated */
+    if (!surface || !hw_depth_tex || !hw_stencil_tex) return 0;
+    if (surface_target != target) return 0;
+    if (surface_width != width || surface_height != height) return 0;
+    if (surface_pitch != pitch) return 0;
+    return 1;
+}
+
+/* One empty render pass whose load action is the clear. No draws: the tile is
+ * initialised to the constant and stored, which is the cheapest way a GPU can
+ * write a constant over an attachment. */
+static int clear_encode(MTLRenderPassDescriptor *pass)
+{
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        cb ? [cb renderCommandEncoderWithDescriptor:pass] : nil;
+    if (!cb || !enc) return 0;
+    [enc endEncoding];
+    mtl_cb_gpu_watch(cb);
+    [cb commit];
+    last_command = cb;
+    return 1;
+}
+
+int nv2a_metal_clear_color(uint8_t *target, size_t target_size, uint32_t pitch,
+                           uint32_t width, uint32_t height,
+                           uint32_t param, uint32_t value)
+{
+    (void)target_size;
+    /* Only a clear that writes all three colour channels over the WHOLE
+     * surface can become a load action; anything partial refuses and the CPU
+     * loop runs. NV097_CLEAR_SURFACE's R/G/B bits are 0x10/0x20/0x40. */
+    if ((param & 0x70u) != 0x70u) return 0;
+    if (!clear_resident_ok(target, pitch, width, height)) return 0;
+    @autoreleasepool {
+        /* SET_COLOR_CLEAR_VALUE arrives already in the surface's own format,
+         * so a 16-bit surface takes the low half verbatim as R5G6B5 -- the
+         * same reading clear_surface's CPU loop uses, and for the same reason:
+         * D3D reduced the D3DCOLOR before it reached the pushbuffer, so
+         * reducing again drops the red field. */
+        uint16_t v = (uint16_t)value;
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        batch_flush();
+        pass.colorAttachments[0].texture = surface;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor =
+            MTLClearColorMake((double)(v >> 11) / 31.0,
+                              (double)((v >> 5) & 63) / 63.0,
+                              (double)(v & 31) / 31.0, 1.0);
+        /* The depth and stencil attachments are LOADED, not cleared: this call
+         * is the colour half and must not touch depth. A pass that names them
+         * with MTLLoadActionLoad/StoreActionStore leaves them exactly as they
+         * were. */
+        pass.depthAttachment.texture = hw_depth_tex;
+        pass.depthAttachment.loadAction = MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        pass.stencilAttachment.texture = hw_stencil_tex;
+        pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+        pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        if (!clear_encode(pass)) return 0;
+        ++g_resident_color_clears;
+        /* Guest RAM no longer matches the attachment. The flip's sync carries
+         * it across; nothing else reads it in between. */
+        surface_dirty = 1;
+    }
+    return 1;
+}
+
+int nv2a_metal_clear_depth_stencil(uint8_t *target, size_t target_size,
+        uint32_t pitch, uint32_t width, uint32_t height,
+        uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+        uint32_t components, uint32_t value)
+{
+    (void)target_size;
+    /* Both halves of the D24S8 word, over the whole surface, or refuse.
+     * components is NV097_CLEAR_SURFACE's low two bits: 1 depth, 2 stencil. */
+    if ((components & 3u) != 3u) return 0;
+    if (x0 != 0 || y0 != 0 || x1 != width || y1 != height) return 0;
+    if (!clear_resident_ok(depth_target == target ? surface_target : NULL,
+                           surface_pitch, width, height)) return 0;
+    if (depth_target != target || depth_pitch != pitch) return 0;
+    @autoreleasepool {
+        /* The guest's dword is stencil in byte 0 and 24-bit depth above it,
+         * which is how hw_depth_upload reads it and how hw_depth_readback
+         * writes it back. Normalising by 16777215 here keeps the three in
+         * agreement; a mismatch would show as a depth test that passes on one
+         * path and fails on the other. */
+        uint32_t q = (value >> 8) & 0xFFFFFFu;
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        batch_flush();
+        pass.colorAttachments[0].texture = surface;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.depthAttachment.texture = hw_depth_tex;
+        pass.depthAttachment.loadAction = MTLLoadActionClear;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        pass.depthAttachment.clearDepth = (double)q / 16777215.0;
+        pass.stencilAttachment.texture = hw_stencil_tex;
+        pass.stencilAttachment.loadAction = MTLLoadActionClear;
+        pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        pass.stencilAttachment.clearStencil = value & 0xFFu;
+        if (!clear_encode(pass)) return 0;
+        ++g_resident_depth_clears;
+        depth_dirty = 1;
+    }
+    return 1;
+}
+
 int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth)
 {
     /* ONLY IF THE SURFACE BEING CLEARED IS THE ONE BEING HELD.
@@ -2099,6 +2281,16 @@ int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth)
     @autoreleasepool{
         batch_flush();
         ++g_mtl_discards;
+        /* AND DROP THE CACHED SLOTS, for the reason the cache's own header
+         * gives: a slot is valid only while guest RAM cannot have changed
+         * underneath it. This is the one clear that does not go through
+         * nv2a_metal_invalidate -- that is the whole point of it -- so it has
+         * to do invalidate's cache work itself. Without this the CPU writes
+         * the clear into guest RAM, the next draw's slot lookup matches, the
+         * PRE-CLEAR textures are rebound, and surface_dirty is 0 so nothing
+         * re-uploads the cleared bytes: the clear is lost entirely. */
+        surface_cache_drop(color);
+        surface_cache_drop(depth);
         surface_valid=depth_valid=0;
         surface_dirty=depth_dirty=0;
     }
@@ -2112,7 +2304,15 @@ void nv2a_metal_invalidate(uint8_t *target)
  surface_cache_drop(target);
  if(!target||target==surface_target||target==depth_target){nv2a_metal_sync();surface_valid=depth_valid=0;}}
 const char *nv2a_metal_last_reject(void){return reject_reason?reject_reason:"none";}
-static int reject(const char *reason){reject_reason=reason;nv2a_metal_sync();surface_valid=depth_valid=0;return-1;}
+/* A REJECTED DRAW HANDS THE BATCH TO THE CPU RASTERISER, which renders it into
+ * guest RAM -- so the retained textures are stale from that moment, and the
+ * cache has to be told. It was not: invalidate drops slots, this did not, and
+ * a later swap back would rebind a texture for memory the CPU has since
+ * written, silently discarding everything the fallback drew.
+ * reject("hw-state-untranslatable") is a hardware-path-only route into it. */
+static int reject(const char *reason){reject_reason=reason;nv2a_metal_sync();
+    surface_cache_drop(surface_target);surface_cache_drop(depth_target);
+    surface_valid=depth_valid=0;return-1;}
 static float area(const float a[4],const float b[4],const float c[4])
 {return(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);}
 static int vertex_valid(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned i)

@@ -18,6 +18,19 @@ void nv2a_metal_invalidate(uint8_t *target);
  * something -- the caller must invalidate normally when it returns 0, because
  * the surface being cleared was not the one being held. */
 int nv2a_metal_discard(const uint8_t *color, const uint8_t *depth);
+/* A full-surface clear performed by the GPU, so it costs a load action instead
+ * of a drain, a whole-surface read-back and a re-upload. Both return 0 -- and
+ * the caller then performs its byte-exact CPU clear -- for anything partial,
+ * for the software tail (whose colour alpha carries depth), or when the
+ * surface is not the retained one. See the long note at the implementation for
+ * why the two halves are all-or-nothing. */
+int nv2a_metal_clear_color(uint8_t *target, size_t target_size, uint32_t pitch,
+                           uint32_t width, uint32_t height,
+                           uint32_t param, uint32_t value);
+int nv2a_metal_clear_depth_stencil(uint8_t *target, size_t target_size,
+        uint32_t pitch, uint32_t width, uint32_t height,
+        uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+        uint32_t components, uint32_t value);
 /* Read-only: what the backend currently retains, for RECOMP_SURFACE_AUDIT.
  * owed is -1 nothing retained, 0 retained and clean, 1 retained and dirty. */
 void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed);

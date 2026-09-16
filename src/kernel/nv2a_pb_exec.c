@@ -17,6 +17,8 @@
 #define nv2a_gpu_invalidate  nv2a_metal_invalidate
 #define nv2a_gpu_invalidate_range(target, bytes) nv2a_metal_invalidate(target)
 #define nv2a_gpu_discard(color, depth) nv2a_metal_discard(color, depth)
+#define nv2a_gpu_clear_color nv2a_metal_clear_color
+#define nv2a_gpu_clear_depth_stencil nv2a_metal_clear_depth_stencil
 #define nv2a_gpu_last_reject nv2a_metal_last_reject
 #define nv2a_gpu_report      nv2a_metal_report
 #elif defined(_WIN32)
