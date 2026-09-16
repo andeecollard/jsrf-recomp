@@ -259,8 +259,38 @@ static void kernel_data_init(void)
 /* Ordinal for each slot (read from Xbox memory during init) */
 static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
-/* Log counter - limit output to avoid flooding */
-static int g_kernel_call_count = 0;
+/* Log counter - limit output to avoid flooding.
+ *
+ * SIXTY-FOUR BITS, AND THE WIDTH IS THE WHOLE POINT. This was `int`, and it
+ * overflowed: the counter is bumped once per kernel dispatch, and the two
+ * things that read it both invert when it goes negative.
+ *
+ *   - KERNEL_LOG_ON() is `count <= budget` (budget 200), so a negative count
+ *     turns per-call tracing PERMANENTLY ON;
+ *   - the 2-second summary is gated on `count > 200`, so the `[KERNEL]
+ *     summary` line and the ordinal histogram beneath it go PERMANENTLY
+ *     SILENT -- and the histogram is the single most useful diagnostic this
+ *     runtime prints.
+ *
+ * Nothing announces either flip. Measured, in
+ * build-macos/jsrf-first-fault/render-investigation/a1-exec-walkers-tutorial-2
+ * /stderr.log: the last summary reads 2,141,517,829 total calls, the next
+ * trace line (that file's line 45355) is `[KERNEL] #-2147483647`, and
+ * 10,632,107 negative-ordinal trace lines follow it to the end of the run --
+ * a 1.1 GB log of the trace that was supposed to stop at 200, with no summary
+ * in any of it. Current builds dispatch ~6.28M calls/s, which reaches INT_MAX
+ * at t~342 s; a play session is longer than that, so this is not a corner.
+ *
+ * WHAT IT MAKES ATOMIC: NOTHING, deliberately. The increment stays a plain
+ * read-modify-write from every guest thread, exactly like g_ordinal_calls
+ * below and for the same stated reason -- an atomic RMW on the hottest path
+ * in the runtime costs more than the counter is worth, and the worst a racing
+ * worker can do is lose a count. What the width buys is that no interleaving
+ * can make the value NEGATIVE, because there is no sign bit to reach: 2^64 at
+ * 6.28M/s is ~93,000 years. (A 32-bit host could tear the 64-bit store across
+ * its halves; both supported hosts are 64-bit, where the aligned load/store is
+ * single-copy atomic.) */
+static unsigned long long g_kernel_call_count = 0;
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -283,9 +313,12 @@ static long kernel_log_budget(void)
     return budget;
 }
 
-#define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
+/* kernel_log_budget() is clamped >= 0 above, so the usual-arithmetic
+ * conversion of the long to unsigned long long here cannot produce a huge
+ * positive bound out of a negative budget. */
+#define KERNEL_LOG_ON()      (g_kernel_call_count <= (unsigned long long)kernel_log_budget())
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
-#define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
+#define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= (unsigned long long)(kernel_log_budget() / 2))
 
 /* Read Xbox stack arg as uint32_t.
  * After kernel_thunk_dispatch pops the dummy return address (g_esp += 4),
@@ -2650,7 +2683,42 @@ static void bridge_KeConnectInterrupt(void)
  * the returned KINTERRUPT. */
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
 {
-    return (vector < BRIDGE_MAX_INTERRUPTS) ? g_interrupts[vector] : 0;
+    int i;
+
+    /* SCAN AND MATCH, because g_interrupts is not indexed by vector.
+     *
+     * This used to `return g_interrupts[vector]`. bridge_KeConnectInterrupt
+     * fills the FIRST FREE SLOT, so the table is dense and insertion-ordered,
+     * and the vector lives inside the KINTERRUPT at +8 -- which is how every
+     * other reader in this file gets it (:2977, :3566, :3609, :3752, all
+     * BRIDGE_MEM32(iv + 8)). Indexing by vector only agrees with that when the
+     * title happens to connect its vectors in ascending order from 0.
+     *
+     * JSRF does not. Measured, across all 784 KeConnectInterrupt lines in the
+     * archived runs under build-macos, the order is always 3, 1, 6, 5 -- so
+     * slot 0 holds vector 3, slot 1 vector 1, slot 2 vector 6, slot 3 vector
+     * 5, and the old expression answered vector 1 correctly BY COINCIDENCE
+     * while returning the vector-5 KINTERRUPT for vector 3 and 0 for vectors 5
+     * and 6.
+     *
+     * NOT A LIVE macOS BUG, and the reason is worth writing down rather than
+     * rediscovering: the only caller is ohci_call_isr (src/usb/ohci.c:499),
+     * which asks for OHCI_VECTOR == 1 -- the one vector the coincidence got
+     * right -- and its own only caller is ohci_raise, reached only from
+     * ohci_thread, which is created inside `#if defined(_WIN32)`
+     * (src/usb/ohci.c:877). So on this host the function is unreachable and on
+     * Windows it was accidentally correct. This is correctness for the next
+     * vector anyone asks for, not a fix for anything now failing.
+     *
+     * Acquire, and stop at the first hole, for the same reasons the other
+     * readers do: the slot is published with __ATOMIC_RELEASE after the
+     * KINTERRUPT is filled in, and the table is dense so a zero ends it. */
+    for (i = 0; i < BRIDGE_MAX_INTERRUPTS; i++) {
+        uint32_t iv = __atomic_load_n(&g_interrupts[i], __ATOMIC_ACQUIRE);
+        if (!iv) break;
+        if (BRIDGE_MEM32(iv + 8) == vector) return iv;
+    }
+    return 0;
 }
 
 /* xbox_AllocThreadTib IS STILL NOT DEFINED HERE, AND NOW THERE IS A MEASUREMENT.
@@ -2825,6 +2893,39 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
 /* Set once the GPU interrupt is first delivered; the mirror needs the register
  * base and nothing else knows it. */
 static uint32_t g_nv2a_base;
+/* Refusals of a ServiceContext register base that is not the NV2A aperture,
+ * and the last value refused. Printed on the [VBLANK-REG] line beside base=,
+ * which is where anyone reading that base is already looking. */
+static volatile LONG g_nv2a_base_refused;
+static volatile LONG g_nv2a_base_last_bad;
+
+/* Is this guest VA the NV2A register aperture?
+ *
+ * g_nv2a_base is read out of the guest's KINTERRUPT ServiceContext -- guest
+ * memory, written by guest code -- and then used as the base of ATOMIC
+ * READ-MODIFY-WRITES in bridge_nv2a_mirror_intr (the PMC summary fetch_and /
+ * fetch_or, and the PGRAPH fetch_or). BRIDGE_MEM32 is an unchecked offset add
+ * (see :65), so a wrong base there is not a failed call: it is a wild read AND
+ * a wild WRITE into mapped guest RAM, on the interrupt pump, thousands of
+ * times a second, with nothing counting it. Everything else this runtime does
+ * with guest pointers is bounds-checked; this was not.
+ *
+ * Validated against the mapping the memory layout actually made rather than
+ * against a second copy of 0xFD000000 in this file: xbox_Nv2aRegisterMemory()
+ * returns the host base of the NV2A aperture view, so comparing the
+ * translation of `base` against it checks the one thing that matters -- that
+ * the guest handed us the aperture -- and cannot drift from the layout.
+ *
+ * HARDENING, NOT A LIVE BUG. All 218 [VBLANK-REG] lines in the archived runs
+ * under build-macos read base=FD000000, so the guest has never yet published
+ * anything else. A refusal counter is the honest way to leave it: if the value
+ * ever does change, this says so instead of writing wherever it points. */
+static int bridge_nv2a_base_valid(uint32_t base)
+{
+    const uint8_t *regs = xbox_Nv2aRegisterMemory();
+    if (!base || !regs) return 0;
+    return (const uint8_t *)((uintptr_t)base + g_xbox_mem_offset) == regs;
+}
 
 /* bridge_KeWaitForSingleObject pumps vblank from every blocked guest thread.
  * The TLS ISR/DPC guards only prevent recursion on one host thread; without a
@@ -3491,11 +3592,21 @@ void xbox_VblankReport(void)
         uint32_t reg_base  = g_nv2a_base;
         uint32_t reg_pcrtc = reg_base ? (uint32_t)BRIDGE_MEM32(reg_base + NV_PCRTC_INTR_0) : 0u;
         uint32_t reg_pmc   = reg_base ? (uint32_t)BRIDGE_MEM32(reg_base + NV_PMC_INTR_0)   : 0u;
+        /* base_refused belongs on THIS line and nowhere else: base= is this
+         * line's positive control, and a nonzero refusal count is the only
+         * thing that distinguishes "the guest published the aperture" from
+         * "the guest published something else and we declined to write
+         * through it", both of which otherwise print base=00000000. */
         fprintf(stderr,
-                "  [VBLANK-REG] base=%08X pcrtc=%08X pmc=%08X pending=%d"
+                "  [VBLANK-REG] base=%08X (refused=%ld last_bad=%08lX)"
+                " pcrtc=%08X pmc=%08X pending=%d"
                 " | summary lost=%ld episodes=%ld run=%ld max_run=%ld"
                 " max_run_ms=%ld repaired=%ld upmirror=%s\n",
-                reg_base, reg_pcrtc, reg_pmc, xbox_Nv2aVblankPending(),
+                reg_base,
+                (long)InterlockedCompareExchange(&g_nv2a_base_refused, 0, 0),
+                (unsigned long)(uint32_t)InterlockedCompareExchange(
+                                             &g_nv2a_base_last_bad, 0, 0),
+                reg_pcrtc, reg_pmc, xbox_Nv2aVblankPending(),
                 (long)InterlockedCompareExchange(&g_nv2a_pmc_lost, 0, 0),
                 (long)InterlockedCompareExchange(&g_nv2a_pmc_lost_episodes, 0, 0),
                 (long)InterlockedCompareExchange(&g_nv2a_pmc_lost_run, 0, 0),
@@ -3616,6 +3727,16 @@ static void bridge_vblank_poll(void)
             uint32_t ctx  = BRIDGE_MEM32(iv + 4);
             uint32_t base = ctx ? BRIDGE_MEM32(ctx) : 0;
             if (!base) continue;
+            /* The ONLY assignment to g_nv2a_base in this file, which is why
+             * validating here is enough and bridge_nv2a_mirror_intr does not
+             * repeat the check on its hot path: everything downstream reads a
+             * value that either passed this test or is still zero, and zero is
+             * already handled there. Refuse and count rather than proceed. */
+            if (!bridge_nv2a_base_valid(base)) {
+                InterlockedIncrement(&g_nv2a_base_refused);
+                InterlockedExchange(&g_nv2a_base_last_bad, (LONG)base);
+                continue;
+            }
             g_nv2a_base = base;
 
             /* Do not re-raise while the previous vblank is still unacknowledged.
@@ -3984,12 +4105,98 @@ static void bridge_KeInitializeTimerEx(void)
  */
 #define BRIDGE_MAX_TIMERS 32
 
+/* THE TABLE IS POLLED LOCK-FREE BY EVERY THREAD IN THE PROCESS, so it is
+ * published as a seqlock, not as four plain stores.
+ *
+ * Who reads it: kernel_thunk_dispatch polls it on EVERY kernel dispatch
+ * (~6.28M/s across all guest threads), bridge_KeWaitForSingleObject polls it
+ * from every blocked waiter, and bridge_irq_thread polls it once a
+ * millisecond. Who writes it: any guest thread calling KeSetTimer.
+ *
+ * WHAT WAS WRONG. bridge_arm_timer wrote timer_va -- the ARMED FLAG, the one
+ * field every poller tests first -- BEFORE the deadline, with a GetTickCount()
+ * call between them, so the window was a whole function call wide and visible
+ * in the compiled binary rather than a theoretical store reordering. A poller
+ * landing in it saw a slot marked armed carrying the PREVIOUS occupant's
+ * deadline, which is in the past, and ran the DPC immediately instead of after
+ * the requested delay. Two more races rode along: the free-slot scan was an
+ * unsynchronised read-then-write, so two threads could pick the same slot; and
+ * two pollers could both pass the due test on one slot and run the same DPC
+ * concurrently, which is exactly what DPC delivery is supposed to serialise.
+ *
+ * WHAT THIS MAKES ATOMIC, PRECISELY:
+ *   - `owner` is the slot allocation, and it only ever changes by CAS. Two
+ *     threads cannot claim one slot.
+ *   - `gen` is a seqlock generation: ODD while bridge_arm_timer is rewriting
+ *     the payload, EVEN when it is stable. A poller reads it before and after
+ *     the payload and discards the pass if it was odd or if it moved, so a
+ *     poller can no longer act on half an arming. This is what closes the
+ *     publish-order window, and it closes it in BOTH directions -- the
+ *     release/acquire pair also stops the compiler and the machine reordering
+ *     the payload past the flag.
+ *   - `armed` is the firing claim: the poller takes it with an atomic
+ *     exchange to 0, and EXACTLY ONE thread can observe the old value 1. That
+ *     thread runs the DPC; the rest count a loss and move on.
+ *
+ * WHAT IT DOES NOT MAKE ATOMIC. The DPC body itself is not serialised against
+ * anything but a second firing of the SAME slot -- two different timers still
+ * run their DPCs concurrently, as they did before, and bridge_run_dpc's own
+ * g_in_dpc guard is what keeps them off one thread. A KeCancelTimer that lands
+ * after a poller has won the exchange but before the DPC returns does not
+ * unrun it; that hole predates this and cannot be closed without a lock on the
+ * hot path. The hot path stays lock-free: a poll of an idle slot is one
+ * relaxed load of `armed`, unchanged from before.
+ *
+ * MEASUREMENT, and why the periodic branch is the quiet one: across 765
+ * archived run logs under build-macos carrying a `[KERNEL] ordinals used`
+ * histogram, ordinal 149 (KeSetTimer) appears in every one of them, peaking at
+ * 4410 in a run, and ordinal 150 (KeSetTimerEx) appears in NONE. Every timer
+ * JSRF arms is therefore a one-shot -- period_ms 0, the branch that releases
+ * the slot -- so the periodic re-arm below is correct-by-construction code
+ * this title never executes, and no reading of these counters should be
+ * attributed to it. */
 static struct {
-    uint32_t timer_va;      /* guest KTIMER, 0 = free slot */
-    uint32_t dpc_va;        /* guest KDPC, 0 = no DPC to run */
-    DWORD    deadline;      /* GetTickCount() value it becomes due at */
-    uint32_t period_ms;     /* 0 = one-shot */
+    volatile uint32_t owner;     /* slot allocation: guest KTIMER VA, 0 free */
+    volatile uint32_t gen;       /* seqlock: odd = payload in flux           */
+    volatile uint32_t armed;     /* 1 = due-testable; the firing claim       */
+    volatile uint32_t dpc_va;    /* guest KDPC, 0 = no DPC to run            */
+    volatile uint32_t period_ms; /* 0 = one-shot                             */
+    volatile uint32_t deadline;  /* GetTickCount() value it becomes due at   */
+    /* The two fields below exist ONLY to instrument the race this seqlock
+     * closes, and they are deliberately redundant with `deadline`: a
+     * consistent snapshot always has deadline == armed_at + delay_ms, so a
+     * firing whose measured age is less than the delay the guest asked for is
+     * a snapshot that mixed one arming's deadline with another's. That is a
+     * different witness to the same fault as `gen` moving, taken from fields
+     * the poller does not otherwise need -- so it still fires if a later
+     * change writes a payload field outside the gen bracket. */
+    volatile uint32_t armed_at;  /* GetTickCount() at the arming             */
+    volatile uint32_t delay_ms;  /* what the guest asked for                 */
 } g_timers[BRIDGE_MAX_TIMERS];
+
+/* Timer-table counters, printed beside the ordinal histogram by
+ * xbox_bridge_dump_ordinal_histogram so the positive control is on the
+ * adjacent line rather than in a different report.
+ *
+ * THE POSITIVE CONTROL IS AN IDENTITY, NOT A VIBE: bridge_KeSetTimer and
+ * bridge_KeSetTimerEx call bridge_arm_timer unconditionally, and the only way
+ * out of it without arming is the table-full refusal, so
+ *
+ *     armed + full  ==  (histogram 149=) + (histogram 150=)
+ *
+ * and 150 never appears, so `armed + full` must equal the 149= entry on the
+ * line above. If it does not, these counters are lying and nothing read off
+ * them counts. That matters most for `early`, `torn` and `lost`, which are
+ * ABSENCE measurements: `early=0` is only evidence that the race is gone if
+ * `armed` matches the histogram and `fired` is nonzero in the same block.
+ * Otherwise `early=0` means the instrument never ran. */
+static volatile LONG g_timers_armed;      /* arms published                  */
+static volatile LONG g_timers_full;       /* arms refused, table full        */
+static volatile LONG g_timers_fired;      /* firings claimed (DPCs run)      */
+static volatile LONG g_timers_lost;       /* pollers that lost the exchange  */
+static volatile LONG g_timers_torn;       /* passes discarded mid-publish    */
+static volatile LONG g_timers_claim_lost; /* CAS collisions claiming a slot  */
+static volatile LONG g_timers_early;      /* fired before its own delay      */
 
 /* g_in_dpc is defined near the vblank ISR path above; a second TLS
  * definition here is a redefinition under GCC. */
@@ -4079,20 +4286,105 @@ static void bridge_timers_poll(void)
     }
     now = GetTickCount();
     for (i = 0; i < BRIDGE_MAX_TIMERS; i++) {
-        uint32_t dpc_va;
-        if (!g_timers[i].timer_va) {
+        uint32_t dpc_va, period_ms, deadline, armed_at, delay_ms, owner;
+        uint32_t gen0, gen1;
+
+        /* The cheap reject first: an idle slot costs one relaxed load, which
+         * is what it cost before this became a seqlock. Acquire, so everything
+         * bridge_arm_timer published before the flag is visible if it is 1. */
+        if (!__atomic_load_n(&g_timers[i].armed, __ATOMIC_ACQUIRE)) {
             continue;
         }
+        /* Seqlock read. Odd means bridge_arm_timer is mid-publish; a moved
+         * generation means it finished one while we were reading. Either way
+         * this snapshot may pair one arming's deadline with another's flag --
+         * which is precisely the bug: the old code had no way to tell, so it
+         * fired the DPC against a stale, already-past deadline. Skipping costs
+         * nothing, because the next poll is microseconds away on the dispatch
+         * path. */
+        gen0 = __atomic_load_n(&g_timers[i].gen, __ATOMIC_ACQUIRE);
+        if (gen0 & 1u) {
+            InterlockedIncrement(&g_timers_torn);
+            continue;
+        }
+        /* Relaxed atomic loads rather than plain ones: the payload is written
+         * by another thread, so plain accesses here would be a data race in
+         * the language even though the fences make them correct on the
+         * machine. Relaxed compiles to the same single load on both hosts. */
+        deadline  = __atomic_load_n(&g_timers[i].deadline,  __ATOMIC_RELAXED);
+        dpc_va    = __atomic_load_n(&g_timers[i].dpc_va,    __ATOMIC_RELAXED);
+        period_ms = __atomic_load_n(&g_timers[i].period_ms, __ATOMIC_RELAXED);
+        armed_at  = __atomic_load_n(&g_timers[i].armed_at,  __ATOMIC_RELAXED);
+        delay_ms  = __atomic_load_n(&g_timers[i].delay_ms,  __ATOMIC_RELAXED);
+        owner     = __atomic_load_n(&g_timers[i].owner,     __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        gen1 = __atomic_load_n(&g_timers[i].gen, __ATOMIC_ACQUIRE);
+        if (gen1 != gen0) {
+            InterlockedIncrement(&g_timers_torn);
+            continue;
+        }
+
         /* Wrap-safe compare: signed difference, not `now >= deadline`. */
-        if ((int32_t)(now - g_timers[i].deadline) < 0) {
+        if ((int32_t)(now - deadline) < 0) {
             continue;
         }
-        dpc_va = g_timers[i].dpc_va;
-        if (g_timers[i].period_ms) {
-            g_timers[i].deadline = now + g_timers[i].period_ms;
-        } else {
-            g_timers[i].timer_va = 0;   /* one-shot: disarm before running */
+
+        /* Claim the firing. Exactly one thread can see the old value 1, so
+         * exactly one runs this DPC -- every other poller that passed the same
+         * due test on the same slot lands here and counts a loss. Before this,
+         * all of them ran it, concurrently. */
+        if (__atomic_exchange_n(&g_timers[i].armed, 0u, __ATOMIC_ACQ_REL) == 0u) {
+            InterlockedIncrement(&g_timers_lost);
+            continue;
         }
+
+        /* Did it fire before the delay the guest asked for? See the comment on
+         * armed_at/delay_ms: from a consistent snapshot this cannot happen, so
+         * a nonzero reading names a publish-order fault directly. */
+        if ((int32_t)(now - armed_at) < (int32_t)delay_ms) {
+            InterlockedIncrement(&g_timers_early);
+        }
+
+        if (period_ms) {
+            /* Periodic: re-publish through the seqlock, same order as an arm.
+             * JSRF never reaches this -- ordinal 150 appears in none of the
+             * 765 archived histograms -- so it is correctness, not a path any
+             * reading of these counters comes from.
+             *
+             * `gen` is re-read rather than derived from gen0, because a
+             * KeSetTimer on this same slot may have moved it since. That still
+             * is not mutual exclusion and is not claimed to be: gen is an
+             * ORDERING and DETECTION device, not a lock, so two writers on one
+             * slot can leave it at a value a reader disagrees with. The worst
+             * that costs is a poller counting `torn` and skipping a pass,
+             * microseconds before it polls again -- it can never produce the
+             * failure this patch exists to remove, which is a poller acting on
+             * a deadline from a DIFFERENT arming. */
+            uint32_t g = __atomic_load_n(&g_timers[i].gen, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_timers[i].gen, g + 1u, __ATOMIC_RELAXED);
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            __atomic_store_n(&g_timers[i].deadline, (uint32_t)now + period_ms,
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&g_timers[i].armed_at, (uint32_t)now,
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&g_timers[i].delay_ms, period_ms,
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&g_timers[i].gen, g + 2u, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_timers[i].armed, 1u, __ATOMIC_RELEASE);
+        } else {
+            /* One-shot: already disarmed by the exchange above. Release the
+             * slot as well, so BRIDGE_MAX_TIMERS is a working-set limit and
+             * not a lifetime one -- which is what the old `timer_va = 0` did,
+             * since that field was both the flag and the allocation. CAS, not
+             * a store, so releasing cannot stamp on an owner some other thread
+             * has already claimed. */
+            uint32_t expect = owner;
+            if (expect)
+                __atomic_compare_exchange_n(&g_timers[i].owner, &expect, 0u,
+                                            0, __ATOMIC_RELEASE,
+                                            __ATOMIC_RELAXED);
+        }
+        InterlockedIncrement(&g_timers_fired);
         /* The guest's KTIMER is a dispatcher object a wait can be built on;
          * mark it signalled the way KeSetEvent would. */
         bridge_run_dpc(dpc_va, 0, 0);
@@ -4125,29 +4417,101 @@ static void bridge_arm_timer(uint32_t timer_va, uint32_t due_lo,
         delay_ms = 0;
     }
 
+    /* Already ours? Re-arm in place. This scan is a read of an atomically
+     * written word, so it cannot see a half-claimed slot. */
     for (i = 0; i < BRIDGE_MAX_TIMERS; i++) {
-        if (g_timers[i].timer_va == timer_va) { slot = i; break; }
-        if (slot < 0 && !g_timers[i].timer_va) { slot = i; }
+        if (__atomic_load_n(&g_timers[i].owner, __ATOMIC_ACQUIRE) == timer_va) {
+            slot = i;
+            break;
+        }
+    }
+    /* Otherwise claim a free one by CAS. The old code read the slot and then
+     * wrote it, so two guest threads arming at once could both see slot N free
+     * and both take it -- the loser's timer then silently became the winner's.
+     * A failed CAS here means another thread got in first; retry the next
+     * slot, and count it, because a nonzero reading is direct evidence that
+     * guest threads really do arm concurrently. */
+    if (slot < 0) {
+        for (i = 0; i < BRIDGE_MAX_TIMERS; i++) {
+            uint32_t expect = 0;
+            if (__atomic_compare_exchange_n(&g_timers[i].owner, &expect,
+                                            timer_va, 0, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
+                slot = i;
+                break;
+            }
+            if (expect != 0 && expect != timer_va)
+                InterlockedIncrement(&g_timers_claim_lost);
+        }
     }
     if (slot < 0) {
+        InterlockedIncrement(&g_timers_full);
         fprintf(stderr, "  [KERNEL] KeSetTimer: timer table full (%d)\n",
                 BRIDGE_MAX_TIMERS);
         fflush(stderr);
         return;
     }
-    g_timers[slot].timer_va  = timer_va;
-    g_timers[slot].dpc_va    = dpc_va;
-    g_timers[slot].period_ms = period_ms;
-    g_timers[slot].deadline  = GetTickCount() + delay_ms;
+
+    /* PUBLISH IN THE ORDER A READER CAN SURVIVE.
+     *
+     * This used to be four plain stores with timer_va -- the armed flag -- at
+     * the TOP and the deadline at the BOTTOM, with a GetTickCount() call
+     * between them. Every poller tests the flag first, so for the width of
+     * that call the table advertised an armed timer carrying the previous
+     * occupant's deadline, which is in the past. The DPC fired immediately
+     * instead of after the requested delay.
+     *
+     * Now: drop `armed` first so nothing can act on the slot at all, take the
+     * generation odd, write the payload, take it even with a release, and only
+     * then re-publish `armed` with a release. A poller either sees armed == 0
+     * and skips, or sees the whole payload that the release ordered before it.
+     * The one case that is neither -- a poller already past its acquire load
+     * when we begin -- is caught by the generation check on its way out.
+     *
+     * GetTickCount() is called ONCE and before the bracket, so the window the
+     * bug lived in is not merely ordered, it is gone: nothing slow happens
+     * between the odd and the even. */
+    __atomic_store_n(&g_timers[slot].armed, 0u, __ATOMIC_RELAXED);
+    {
+        DWORD    now = GetTickCount();
+        uint32_t gen = __atomic_load_n(&g_timers[slot].gen, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_timers[slot].gen, gen + 1u, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        __atomic_store_n(&g_timers[slot].dpc_va,    dpc_va,    __ATOMIC_RELAXED);
+        __atomic_store_n(&g_timers[slot].period_ms, period_ms, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_timers[slot].deadline,
+                         (uint32_t)now + delay_ms, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_timers[slot].armed_at,
+                         (uint32_t)now, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_timers[slot].delay_ms,  delay_ms,  __ATOMIC_RELAXED);
+        __atomic_store_n(&g_timers[slot].gen, gen + 2u, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_timers[slot].armed, 1u, __ATOMIC_RELEASE);
+    }
+    InterlockedIncrement(&g_timers_armed);
 }
 
 static int bridge_disarm_timer(uint32_t timer_va)
 {
     int i;
     for (i = 0; i < BRIDGE_MAX_TIMERS; i++) {
-        if (g_timers[i].timer_va == timer_va) {
-            g_timers[i].timer_va = 0;
-            return 1;   /* was armed */
+        uint32_t expect;
+        if (__atomic_load_n(&g_timers[i].owner, __ATOMIC_ACQUIRE) != timer_va)
+            continue;
+        /* Take the armed flag the same way a firing poller does, so cancelling
+         * and firing cannot both happen: whoever gets the 1 owns the outcome.
+         * The return value is the guest-visible BOOLEAN "it was already set",
+         * which is now the truth rather than "a slot still names it". */
+        {
+            uint32_t was = __atomic_exchange_n(&g_timers[i].armed, 0u,
+                                               __ATOMIC_ACQ_REL);
+            /* Release the slot, as the one-shot path does and for the same
+             * reason: the old code's single timer_va field freed the slot as a
+             * side effect of clearing the flag, and 32 slots have to be
+             * reusable across the ~2500 KeSetTimer calls a run makes. */
+            expect = timer_va;
+            __atomic_compare_exchange_n(&g_timers[i].owner, &expect, 0u, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+            return was != 0u;
         }
     }
     return 0;
@@ -7108,6 +7472,26 @@ void xbox_bridge_dump_ordinal_histogram(void)
         fprintf(stderr, "%s\n", line);
     }
 
+    /* The timer table, on the line straight after the histogram ON PURPOSE.
+     *
+     * armed+full is an identity against the 149= entry printed immediately
+     * above (plus 150=, which has never appeared in any archived run), so a
+     * reader can check the instrument against a number that was already there
+     * before believing anything it says. Without that, `early=0 torn=0` is
+     * indistinguishable from a dead counter -- the failure mode this tree has
+     * been bitten by twice. See the declarations near BRIDGE_MAX_TIMERS. */
+    fprintf(stderr,
+            "  [KERNEL] timers: armed=%ld full=%ld (armed+full must equal"
+            " 149= above) fired=%ld early=%ld torn=%ld lost=%ld"
+            " claim_lost=%ld\n",
+            (long)InterlockedCompareExchange(&g_timers_armed, 0, 0),
+            (long)InterlockedCompareExchange(&g_timers_full, 0, 0),
+            (long)InterlockedCompareExchange(&g_timers_fired, 0, 0),
+            (long)InterlockedCompareExchange(&g_timers_early, 0, 0),
+            (long)InterlockedCompareExchange(&g_timers_torn, 0, 0),
+            (long)InterlockedCompareExchange(&g_timers_lost, 0, 0),
+            (long)InterlockedCompareExchange(&g_timers_claim_lost, 0, 0));
+
     /* Call sites for the busiest ordinals only: the point is to locate a spin,
      * and a full dump buries it. */
     for (int i = 0; i < n && i < 8; i++) {
@@ -7198,7 +7582,7 @@ static void kernel_thunk_dispatch(void)
          * function is calling this" into "this call site is", which is the
          * difference between guessing and knowing when a title recurses. */
         fprintf(stderr,
-                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                "  [KERNEL] #%llu: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
                 g_kernel_call_count, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0);
         fflush(stderr);
@@ -7228,7 +7612,7 @@ static void kernel_thunk_dispatch(void)
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             bridge_scan_dialogs();
             bridge_dump_ohci();
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+            fprintf(stderr, "  [KERNEL] summary: %llu total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             xbox_bridge_dump_ordinal_histogram();
             fflush(stderr);
@@ -7264,7 +7648,7 @@ static void kernel_thunk_dispatch(void)
             if (_watch_before != seen) {
                 seen = _watch_before;
                 fprintf(stderr, "  [KWATCH] 0x%08X = %08X before ordinal %u"
-                                " (call #%d)\n",
+                                " (call #%llu)\n",
                         g_kernel_watch_va, _watch_before, ordinal,
                         g_kernel_call_count);
                 fflush(stderr);

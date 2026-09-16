@@ -359,14 +359,23 @@ static void *g_mcpx_alias = NULL;
 static void *g_nv2a_mapping = NULL;
 static void *g_nv2a_alias = NULL;
 /* The alias address of a guarded NV2A register, or the register itself when
- * there is no alias and the caller must fall back to unprotecting. */
-static volatile uint32_t *nv2a_w32(volatile uint32_t *p)
+ * there is no alias and the caller must fall back to unprotecting.
+ *
+ * Byte-granular, and the width matters: mcpx_trap_handler completes the guest's
+ * faulting store at 1, 2, 4 or 8 bytes, so the version of this that only took
+ * a uint32_t* could not serve it. nv2a_w32 below is the same function with the
+ * old signature, kept so the two register writers above read unchanged. */
+static volatile void *nv2a_w(const volatile void *p)
 {
     uintptr_t off;
-    if (!g_nv2a_alias || !g_nv2a_memory) return p;
+    if (!g_nv2a_alias || !g_nv2a_memory) return (volatile void *)p;
     off = (uintptr_t)p - ((uintptr_t)XBOX_NV2A_BASE + g_memory_offset);
-    if (off >= (uintptr_t)XBOX_NV2A_SIZE) return p;
-    return (volatile uint32_t *)((char *)g_nv2a_alias + off);
+    if (off >= (uintptr_t)XBOX_NV2A_SIZE) return (volatile void *)p;
+    return (volatile void *)((char *)g_nv2a_alias + off);
+}
+static volatile uint32_t *nv2a_w32(volatile uint32_t *p)
+{
+    return (volatile uint32_t *)nv2a_w(p);
 }
 static HANDLE g_mcpx_mapping = NULL;
 
@@ -1473,13 +1482,35 @@ static unsigned long g_mcpx_trap_apu_vp_writes; /* ... in the VP region */
 static unsigned long g_mcpx_reprotect_failures; /* guard lost, permanently */
 static unsigned long g_mcpx_ack_windows;        /* ack-thread open/close pairs */
 
+/* How the trap handler completed each store, split by aperture.
+ *
+ * THE COUNTER THAT WAS THERE READ ZERO AND MEANT NOTHING. g_pcrtc_windows is
+ * incremented in exactly one place -- xbox_Nv2aRaiseVblank's no-alias fallback
+ * -- and that branch stopped executing the day the NV2A aperture got its alias
+ * (16 Sep 2026), so the [PCRTC] line in the periodic report has printed
+ * "0 writable windows opened" ever since while the trap handler below was
+ * still opening one on the guarded PCRTC page for every guest acknowledge,
+ * ~60 a second. A zero from a counter whose only trigger is dead is not an
+ * all-clear; it is silence. So the handler now counts its own windows into the
+ * same variable, which makes that report line mean what it says.
+ *
+ * ALIASED IS THE POSITIVE CONTROL FOR WINDOWS. `windows=0` is an absence
+ * measurement and proves nothing on its own -- it also reads 0 if no NV2A
+ * store ever faulted. `aliased` counts the same faults completed through the
+ * unguarded second view, so `nv2a aliased=N windows=0` with N climbing is the
+ * real all-clear, and `aliased=0 windows=0` says the instrument never ran. */
+static unsigned long g_nv2a_trap_aliased;  /* NV2A stores done via the alias */
+static unsigned long g_mcpx_trap_aliased;  /* MCPX stores done via the alias */
+
 void xbox_McpxTrapReport(void)
 {
     fprintf(stderr, "  [MCPX-TRAP] faults=%lu apu=%lu vp=%lu "
-            "ack_windows=%lu reprotect_failures=%lu\n",
+            "ack_windows=%lu reprotect_failures=%lu"
+            " | trap stores: mcpx aliased=%lu, nv2a aliased=%lu windows=%lu\n",
             g_mcpx_trap_faults, g_mcpx_trap_apu_writes,
             g_mcpx_trap_apu_vp_writes, g_mcpx_ack_windows,
-            g_mcpx_reprotect_failures);
+            g_mcpx_reprotect_failures,
+            g_mcpx_trap_aliased, g_nv2a_trap_aliased, g_pcrtc_windows);
     fflush(stderr);
 }
 
@@ -1927,10 +1958,42 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
      * writable and no other thread can slip a semantics-free store past this
      * handler. Without an alias, fall back to the old unprotect. */
     wfault = (uintptr_t)mcpx_w((const volatile void *)fault);
-    /* Aliased only if the fault really was inside the MCPX aperture. NV2A
-     * faults come through this same handler, are not translated, and still
-     * need their page unprotected the old way -- skipping it for them left the
-     * store faulting against a read-only page for ever. */
+    if (wfault != fault) {
+        ++g_mcpx_trap_aliased;
+    } else {
+        /* THE NV2A HALF OF THE SAME TRANSLATION, which was missing.
+         *
+         * mcpx_w translates only addresses inside the MCPX aperture and
+         * returns everything else unchanged, so an NV2A fault -- PCRTC_INTR_0
+         * on every guest vblank acknowledge, PGRAPH_INTR on every software
+         * method -- came out of it with wfault == fault, aliased == 0, and
+         * took the VirtualProtect / store / VirtualProtect path below. That is
+         * a writable window on a guarded device page, roughly 60 a second, and
+         * CLAUDE.md's rule about it is absolute because this runtime has
+         * already paid for it once: 13.5M windows in 45 s on the APU aperture,
+         * which swallowed every VOICE_ON the title submitted. The register
+         * underneath this one is worse -- NV_PCRTC_INTR_0 is write-1-to-clear
+         * and gates the guest's whole vsync path, so a guest acknowledge lost
+         * in the window latches vblank pending for the rest of the run.
+         *
+         * The aperture has had a double mapping since 16 Sep 2026 (see
+         * g_nv2a_alias); nothing was routing the handler's own store through
+         * it. Now it is: the store lands on the same physical page through the
+         * unguarded view, the guest's view is never unprotected, and there is
+         * no window to race. Falls through to the old path only when the alias
+         * could not be mapped at all, which announces itself at startup. */
+        uintptr_t nfault = (uintptr_t)nv2a_w((const volatile void *)fault);
+        if (nfault != fault) {
+            wfault = nfault;
+            ++g_nv2a_trap_aliased;
+        } else if (fault >= (uintptr_t)g_memory_offset + XBOX_NV2A_BASE
+                   && fault <  (uintptr_t)g_memory_offset + XBOX_NV2A_BASE
+                                  + XBOX_NV2A_SIZE) {
+            /* No alias: about to open a real window on a guarded NV2A page.
+             * Count it where the periodic [PCRTC] report already reads. */
+            ++g_pcrtc_windows;
+        }
+    }
     aliased = (wfault != fault);
     /* The bypass check, on the faulting thread and inside the lock.
      *
