@@ -458,6 +458,16 @@ add_test(NAME jsrf_ff_vertex COMMAND jsrf_ff_vertex_test)
 add_executable(jsrf_texture_copy_replay texture_copy_replay.c)
 target_link_libraries(jsrf_texture_copy_replay PRIVATE xbox_vsh)
 
+# Reads the trigger of the RAMHT scan counters before anyone quotes them in a
+# decision about caching the lookup. Also carries the microbenchmark those
+# counters are converted to nanoseconds with: run it as
+#   jsrf_dma_resolve_stats_test --bench
+# The bench is NOT part of the test -- a timing assertion fails on a busy
+# machine for no reason anybody can act on.
+add_executable(jsrf_dma_resolve_stats_test dma_resolve_stats_test.c)
+target_link_libraries(jsrf_dma_resolve_stats_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_dma_resolve_stats COMMAND jsrf_dma_resolve_stats_test)
+
 add_executable(jsrf_pusher_stream_test pusher_stream_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c")
 target_include_directories(jsrf_pusher_stream_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")

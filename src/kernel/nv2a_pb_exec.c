@@ -91,6 +91,9 @@
  *
  *   vsh     prepare_vertices -- the CPU vertex pipeline, nv2a_vsh_execute and
  *           the attribute fetch underneath it. Per batch.
+ *   prepare prepare_texture_copy -- decoding the method state into a draw
+ *           description and resolving its three or more DMA objects. Per batch
+ *           that survives the vertex stage. See the block below it.
  *   submit  nv2a_gpu_draw -- building and committing the command buffer. Per
  *           batch that survives to a draw.
  *   sync    nv2a_gpu_sync_range -- waiting for the GPU and reading the surface
@@ -120,10 +123,61 @@
  * sync: the sync timer covers snapshot synchronisation only, and adding a
  * nested cost to two stages would make the stages overlap and the residual
  * meaningless. That is the whole point of splitting it out. */
-typedef enum { PB_STAGE_VSH, PB_STAGE_SUBMIT, PB_STAGE_SYNC, PB_STAGE_CLEAR,
-               PB_STAGE_N } PbStage;
-static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "submit", "sync",
-                                                       "clear" };
+/* PREPARE is a stage for the same reason CLEAR became one: it ran on the draw
+ * path, once per batch, entirely outside every timer, so whatever it cost was
+ * being reported as `rest` and read as guest CPU. prepare_texture_copy()
+ * memsets a 400-byte NV2ATextureCopy, walks the combiner and texture method
+ * state validating it, and then resolves two to five DMA objects through
+ * nv2a_dma_resolve -- a LINEAR SCAN of the RAMHT hash table, up to 4096
+ * entries. None of that was attributed anywhere.
+ *
+ * MEASURED before adding the timer, on this host, at the build's own -O2
+ * (diagnostics/jsrf_first_fault/dma_resolve_stats_test.c --bench, a standalone
+ * harness so the numbers do not need the title running):
+ *
+ *   nv2a_texture_copy_prepare       20 ns per call (the memset and the
+ *                                   validation loops together)
+ *   xbox_GpuMemoryRange             ~2 ns per call (two range compares)
+ *   nv2a_dma_resolve                0.54 ns PER HASH ENTRY SCANNED
+ *
+ * So everything in prepare except the resolves is ~30 ns a batch, which at the
+ * 69-180 batches a frame the [STAGE] line reports in gameplay is 2-5 us --
+ * 0.002 to 0.005 ms, three orders of magnitude under the 3.4 ms `rest` this
+ * was meant to explain. The resolves are the only part that can matter, and
+ * what they cost depends entirely on how far into RAMHT the title's DMA
+ * handles sit, which cannot be known without a run. That is why [DMA] below
+ * counts entries scanned: it converts the unknown into one printed number.
+ *
+ * READING A SMALL VALUE HERE. pb_now_us has microsecond resolution and a
+ * prepare call is tens of nanoseconds, so almost every individual sample
+ * truncates to 0 us. That is not a dead instrument. t0 and t1 are each floored
+ * independently, so the difference counts the microsecond boundaries crossed
+ * in the interval, which over many samples averages to the true duration --
+ * unbiased, just very noisy per sample. The positive control for a
+ * `prepare=0.00 ms` reading is the call count printed beside it: prepare is
+ * called once per batch that passes the vertex stage, so its calls must equal
+ * vsh's calls minus the vsh rejects in [VSH]. Calls tracking vsh with a zero
+ * time means the stage really is that small; calls at zero means the timer is
+ * not being reached at all.
+ *
+ * WHY THERE IS NO UNCONDITIONAL `walk` STAGE. The obvious next split is the
+ * pushbuffer walk and method dispatch, which is the rest of what `rest`
+ * contains. It cannot be timed the way these are. The only boundary this file
+ * owns is nv2a_pb_exec_method, which runs once per METHOD, not once per batch
+ * -- thousands of times a frame against ~100 batches -- and clock_gettime
+ * costs 21 ns a call on this host (measured, same harness). Two reads per
+ * method at 21 ns each would ADD roughly 0.04 ms per thousand methods a
+ * frame to the frame it is supposed to be explaining, and attribute the
+ * addition to the stage. That is an instrument that manufactures its own
+ * reading. RECOMP_PB_STAGE_WALK=1 turns it on anyway for a dedicated run,
+ * because a biased number with a known bias beats no number; see pb_walk_on()
+ * for how to correct it. It is off by default and costs one predicted branch
+ * per method when off. */
+typedef enum { PB_STAGE_VSH, PB_STAGE_PREPARE, PB_STAGE_SUBMIT, PB_STAGE_SYNC,
+               PB_STAGE_CLEAR, PB_STAGE_WALK, PB_STAGE_N } PbStage;
+static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "prepare",
+                                                       "submit", "sync",
+                                                       "clear", "walk" };
 static struct { unsigned long long us[PB_STAGE_N], n[PB_STAGE_N]; }
     s_stage_run, s_stage_win;
 
@@ -140,6 +194,38 @@ static void pb_stage_add(PbStage s, unsigned long long t0)
     unsigned long long d = pb_now_us() - t0;
     s_stage_run.us[s] += d; s_stage_run.n[s]++;
     s_stage_win.us[s] += d; s_stage_win.n[s]++;
+}
+
+/* RECOMP_PB_STAGE_WALK=1: time nv2a_pb_exec_method itself, so `rest` stops
+ * containing the pushbuffer walk and method dispatch.
+ *
+ * OFF BY DEFAULT AND IT MUST STAY THAT WAY. This is the one stage whose
+ * boundary is per METHOD rather than per batch, and the clock is not free:
+ * clock_gettime(CLOCK_MONOTONIC) measured 21 ns a call on this host
+ * (diagnostics/jsrf_first_fault/dma_resolve_stats_test.c --bench). Two reads
+ * per method is 42 ns of instrument per method dispatched, which for the
+ * ~2,700 methods a captured JSRF segment carries is ~0.12 ms a frame of pure
+ * overhead, added to the frame time AND charged to the stage.
+ *
+ * HOW TO READ THE RESULT. pb_stage_line prints the call count beside every
+ * stage, so a walk run reports methods-per-frame directly. The true walk cost
+ * is approximately
+ *
+ *     walk_true  ~=  walk_reported - calls * 42 ns
+ *
+ * and the frame time it is a fraction of is likewise inflated by the same
+ * amount, so compare the CORRECTED walk against the frame time from a run with
+ * this switch off, never against the inflated one printed on the same line.
+ * 42 ns is this host; re-measure with the bench on another.
+ *
+ * It is a presence-and-value switch through recomp_switch_on rather than
+ * getenv, so RECOMP_PB_STAGE_WALK=0 is a control arm and not a second way of
+ * turning it on -- see recomp_switch.h for the three times that went wrong. */
+static int pb_walk_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_PB_STAGE_WALK");
+    return on;
 }
 
 
@@ -165,6 +251,20 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_GpuMemoryRange(uint32_t address, size_t bytes);
 extern const uint8_t *xbox_Nv2aRegisterMemory(void);
 extern int xbox_HeapDescribe(uint32_t xbox_va, char *buf, size_t size);
+/* Declared here rather than in nv2a_texture_copy.h for the same reason the
+ * four above are: this is a diagnostic read-out with exactly one consumer, and
+ * putting it in the header would put it in front of every translation unit
+ * that includes it. */
+extern void nv2a_dma_resolve_stats(unsigned long long *scans,
+                                   unsigned long long *entries,
+                                   unsigned long long *misses,
+                                   unsigned long long *worst);
+
+/* Forward-declared so the switch caches below can be used by the per-frame
+ * code that sits ABOVE their definitions. The definitions are next to
+ * capture_draw, where the comment explaining the 444-sample getenv profile
+ * lives; moving them up here would separate the code from its evidence. */
+static int pb_env_on(const char *name, int *slot);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 
@@ -1626,15 +1726,75 @@ static void pb_stage_line(unsigned long long frames, unsigned long long frame_us
     if (!frames) return;
     for (i = 0; i < PB_STAGE_N; ++i) {
         per[i] = (double)s_stage_win.us[i] / (double)frames / 1000.0;
-        sum += per[i];
+        /* WALK is deliberately excluded from the sum. Every other stage is
+         * disjoint from the rest by construction -- that is the property that
+         * makes `rest` a residual worth printing -- but WALK brackets the whole
+         * method dispatch and therefore CONTAINS vsh, prepare and submit for
+         * any draw-triggering method. Adding it would double-count them and
+         * drive `rest` negative, which would look like the thread bug the
+         * negative case is reserved for. */
+        if (i != PB_STAGE_WALK) sum += per[i];
     }
     fprintf(stderr, "  [STAGE] per frame:");
-    for (i = 0; i < PB_STAGE_N; ++i)
+    for (i = 0; i < PB_STAGE_N; ++i) {
+        /* WALK prints only when it was switched on. A stage that is always
+         * zero in a normal run trains the eye to skip the line. */
+        if (i == PB_STAGE_WALK && !s_stage_win.n[i]) continue;
         fprintf(stderr, " %s=%.2f ms (%.0f calls)", pb_stage_name[i], per[i],
                 (double)s_stage_win.n[i] / (double)frames);
-    fprintf(stderr, " | rest=%.2f ms of %.2f\n",
+    }
+    fprintf(stderr, " | rest=%.2f ms of %.2f",
             (double)frame_us / (double)frames / 1000.0 - sum,
             (double)frame_us / (double)frames / 1000.0);
+    if (s_stage_win.n[PB_STAGE_WALK])
+        fprintf(stderr, "  [walk overlaps vsh/prepare/submit and inflates the"
+                        " frame by ~42 ns x %.0f calls = %.2f ms; see"
+                        " pb_walk_on]",
+                (double)s_stage_win.n[PB_STAGE_WALK] / (double)frames,
+                (double)s_stage_win.n[PB_STAGE_WALK] / (double)frames
+                    * 42.0 / 1e6);
+    fprintf(stderr, "\n");
+
+    /* What the `prepare` figure above is actually made of.
+     *
+     * prepare is dominated by nv2a_dma_resolve's linear RAMHT scan, and the
+     * scan's cost is entries-walked times a constant. Printing the entries
+     * turns "prepare is 0.04 ms, is that the scan?" into arithmetic: at the
+     * 0.54 ns per entry measured on this host, ns = entries * 0.54. It is also
+     * the only figure that says whether memoising the lookup is worth writing.
+     * A cache can remove at most the scan, so the saving is bounded above by
+     * that product -- and at 27 ms a frame, 0.1 ms is about the smallest
+     * saving worth the risk of caching a hardware table the guest can rewrite.
+     * That threshold is ~185,000 entries a frame. Below it, do not cache.
+     *
+     * The two lines also CHECK EACH OTHER. The `prepare` timer and this entry
+     * count are independent instruments -- a clock and a loop counter -- so
+     * when the scans dominate prepare they must agree: [DMA] reporting 0.53 ms
+     * of scanning beside prepare=0.53 ms means both work AND that the scan is
+     * all of prepare. [DMA] at 0.53 beside prepare at 0.02 means one of them is
+     * wrong, and no decision should be taken from either until that is settled.
+     *
+     * Differenced against the previous report so the window matches [STAGE]'s.
+     * A cumulative average over a run that is several scenes long describes
+     * none of them -- the same reason [FRAME-WIN] exists. */
+    {
+        static unsigned long long prev_scans, prev_entries, prev_misses;
+        unsigned long long scans, entries, misses, worst;
+        unsigned long long d_scans, d_entries, d_misses;
+        nv2a_dma_resolve_stats(&scans, &entries, &misses, &worst);
+        d_scans = scans - prev_scans;
+        d_entries = entries - prev_entries;
+        d_misses = misses - prev_misses;
+        prev_scans = scans; prev_entries = entries; prev_misses = misses;
+        fprintf(stderr, "  [DMA] RAMHT scans/frame=%.1f entries/frame=%.0f"
+                " (%.1f per scan, %.4f ms at 0.54 ns/entry)"
+                " full-table misses/frame=%.2f worst scan=%llu entries\n",
+                (double)d_scans / (double)frames,
+                (double)d_entries / (double)frames,
+                d_scans ? (double)d_entries / (double)d_scans : 0.0,
+                (double)d_entries / (double)frames * 0.54e-6,
+                (double)d_misses / (double)frames, worst);
+    }
 }
 
 static void frame_stats_report(void)
@@ -1664,8 +1824,23 @@ static void flip_trace(void)
         stride = e && *e ? strtol(e, NULL, 0) : 0;
         if (stride < 1) stride = 1;
     }
-    if (!getenv("RECOMP_FLIP_TRACE"))
-        return;
+    /* Cached. This ran a getenv on EVERY flip -- 60 a second in a title that
+     * is already missing its frame budget -- to re-answer a question whose
+     * answer was fixed at startup and had in fact already been read three
+     * lines above. Presence, not recomp_switch_on, because this is a trace and
+     * `stride` carries the value: see the switch-semantics note in
+     * recomp_switch.h for when presence is the right test.
+     *
+     * Honesty about size: this is hygiene, not a fix. One getenv is tens of
+     * nanoseconds and there is one per flip, so it is worth single-digit
+     * MICROseconds a second. It is here because the same mistake at draw rate
+     * cost this file half its CPU once (see pb_env_on), not because it will
+     * move the frame time. */
+    {
+        static int on = -1;
+        if (!pb_env_on("RECOMP_FLIP_TRACE", &on))
+            return;
+    }
     if ((flips++ % (unsigned long)stride) == 0 && traced < 64) {
         traced++;
         fprintf(stderr, "  [FLIPTRACE] flip %lu: surface 0x%08X pitch %u"
@@ -2096,7 +2271,11 @@ static void clear_surface(uint32_t param)
      * zero.
      *
      * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (getenv("RECOMP_RASTER_TEST")) {
+    /* Cached, for the reason above: this sits on the clear path, which runs
+     * two to four times a frame, and the comment right above already promises
+     * "one branch per clear". It was one getenv per clear. */
+    static int raster_test_on = -1;
+    if (pb_env_on("RECOMP_RASTER_TEST", &raster_test_on)) {
         static int announced;
         /* Every clear, not once: the title clears each frame and double-buffers,
          * so a triangle drawn a single time is erased before anyone sees it. */
@@ -2972,7 +3151,15 @@ static void raster_batch(void)
         }
     }
 
+    /* Timed on BOTH exits, the reject as well as the accept. A batch that
+     * fails a DMA range check has already paid for the full RAMHT scan that
+     * failed it -- a miss scans the whole table where a hit stops early -- so
+     * timing only the success path would hide the expensive half. `copy_error`
+     * is taken first and the stage closed before anything looks at it, so the
+     * reject bookkeeping below is not charged here. */
+    unsigned long long _t_prep = pb_now_us();
     const char *copy_error = prepare_texture_copy();
+    pb_stage_add(PB_STAGE_PREPARE, _t_prep);
     trace_combiner(copy_error);
     capture_draw(copy_error);
     if (copy_error) {
@@ -3225,7 +3412,40 @@ static void draw_primitive(void)
     }
 }
 
+/* The dispatch proper. Split out from nv2a_pb_exec_method so the optional walk
+ * timer can bracket it in one place: the body has five early `return`s spread
+ * through its switch, and a timer that has to be closed at every exit is a
+ * timer that will eventually miss one -- silently, as an understated stage. */
+static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param);
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+{
+    /* One predicted branch per method when the switch is off. The alternative
+     * -- taking the timestamp unconditionally and discarding it -- costs the
+     * 21 ns clock read on every method of every run, which is the whole
+     * thing this gate exists to avoid. */
+    if (!pb_walk_on()) {
+        pb_exec_method_body(subch, method, param);
+        return;
+    }
+    {
+        unsigned long long _t_walk = pb_now_us();
+        pb_exec_method_body(subch, method, param);
+        pb_stage_add(PB_STAGE_WALK, _t_walk);
+    }
+}
+
+/* NOTE ON WHAT `walk` DOES AND DOES NOT CONTAIN. It brackets the executor's
+ * handling of one method, which is where the method dispatch lives. It does
+ * NOT contain nv2a_pb_scan's own decode loop -- the header parse, the count
+ * and subchannel extraction, the walk from word to word -- because that lives
+ * in another file and this one owns no boundary around it. The stages it DOES
+ * nest are already counted elsewhere: a draw-triggering method runs vsh,
+ * prepare and submit inside this bracket, so `walk` overlaps them and the
+ * arithmetic that makes `rest` a residual breaks while this switch is on.
+ * pb_stage_line says so on the line itself rather than trusting anyone to
+ * remember. */
+static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
     if (!inited) {
@@ -3419,7 +3639,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* BEFORE the snapshot, because the snapshot syncs: the question is
          * what the GPU still owes guest RAM at the moment the guest calls the
          * frame finished, and a sync answers it by destroying it. */
-        if (getenv("RECOMP_FLIP_TRACE") && nv2a_gpu_on()) {
+        static int flip_trace_on = -1;   /* cached: this runs once per flip */
+        if (pb_env_on("RECOMP_FLIP_TRACE", &flip_trace_on) && nv2a_gpu_on()) {
             fprintf(stderr, "  [FLIPTRACE] pre-sync:\n");
             nv2a_gpu_surface_report();
         }

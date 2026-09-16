@@ -205,16 +205,75 @@ static uint32_t read32(const uint8_t *p)
 {
     return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
 }
+/* HOW FAR THIS SCAN ACTUALLY WALKS, counted rather than guessed.
+ *
+ * nv2a_dma_resolve is a linear scan of the RAMHT hash table -- 512 to 4096
+ * eight-byte entries depending on NV_PFIFO_RAMHT_SIZE -- and prepare_texture_copy
+ * calls it two to five times per draw, so at the 69-180 draws a frame the
+ * [STAGE] line reports that is a few hundred scans a frame. Whether that costs
+ * nothing or half a millisecond depends on ONE number nobody had: how many
+ * entries a scan walks before it stops.
+ *
+ * It is a wide unknown. A hit stops at the matching entry, so it costs whatever
+ * slot the title's handle landed in; a MISS walks the whole table. MEASURED on
+ * this host at the build's own -O2, by
+ * diagnostics/jsrf_first_fault/dma_resolve_stats_test.c --bench:
+ * 0.54 ns per entry scanned, flat across table sizes -- a linear walk is the
+ * one access pattern a prefetcher never misses. So the cost of every resolve in
+ * a frame is entries_scanned * 0.54 ns, and the span between "handles sit at
+ * slot 3" and "every scan misses a 4096-entry table" is 0.001 ms and 0.52 ms a
+ * frame. Three orders of magnitude is not a range anyone can optimise against.
+ *
+ * Counting entries rather than timing them is deliberate. A timer around a
+ * call this short would be dominated by the 21 ns clock read (see
+ * pb_walk_on), and would measure the instrument. A counter costs one subtract
+ * and three adds per CALL -- not per entry -- and is exact.
+ *
+ * POSITIVE CONTROL. `scans` is the control for `entries`: every scan that runs
+ * at all examines at least one entry, so entries==0 with scans>0 is impossible
+ * and would mean the counter is wired to the wrong variable, not that the scan
+ * is free. `scans` in turn must track the prepare stage's call count in
+ * [STAGE], at two to five per draw PLUS one per depth clear -- clear_surface
+ * resolves the zeta DMA object the same way, and that scan is already inside
+ * the clear timer, so it inflates scans/frame without inflating prepare. A
+ * zero here with a moving prepare count means this instrument is dead; both at
+ * zero means the draw path is not being reached at all, which is a different
+ * bug.
+ *
+ * Plain non-atomic statics: the executor is single-threaded and these are
+ * diagnostics. A torn count would misreport a number nobody acts on directly.
+ */
+static unsigned long long s_dma_scans, s_dma_entries, s_dma_misses, s_dma_worst;
+
+void nv2a_dma_resolve_stats(unsigned long long *scans, unsigned long long *entries,
+                            unsigned long long *misses, unsigned long long *worst)
+{
+    if (scans) *scans=s_dma_scans;
+    if (entries) *entries=s_dma_entries;
+    if (misses) *misses=s_dma_misses;
+    if (worst) *worst=s_dma_worst;
+}
+
 int nv2a_dma_resolve(const uint8_t *ramin, size_t size, uint32_t ramht,
                      uint32_t handle, uint32_t *base, uint32_t *limit)
 {
     size_t start=((ramht>>4)&31)<<12, bytes=4096u<<((ramht>>16)&3);
     if (!ramin || start>size || bytes>size-start || !handle) return 0;
+    /* Counted before the loop so an argument-rejected call above is NOT
+     * counted as a scan: it examined no entries, and folding it in would pull
+     * the entries-per-scan average down towards zero and make the table look
+     * cheaper to walk than it is. */
+    ++s_dma_scans;
     for (size_t off=start; off<start+bytes; off+=8) {
         uint32_t context=read32(ramin+off+4);
         /* The CPU method sink currently runs channel zero only. */
         if (read32(ramin+off)!=handle || !(context&0x80000000)
                 || (context&0x1f000000) || (context&0x00020000)) continue;
+        {
+            size_t walked=(off-start)/8+1;
+            s_dma_entries+=walked;
+            if (walked>s_dma_worst) s_dma_worst=walked;
+        }
         size_t instance=(context&0xffff)<<4;
         if (instance>size || 16>size-instance) return 0;
         uint32_t flags=read32(ramin+instance), frame=read32(ramin+instance+8);
@@ -223,6 +282,13 @@ int nv2a_dma_resolve(const uint8_t *ramin, size_t size, uint32_t ramht,
         *limit=read32(ramin+instance+4);
         return 1;
     }
+    /* Fell off the end: the whole table was walked. This is the expensive case
+     * and the one a memoised lookup could not help with anyway -- there is no
+     * entry to cache -- so keeping it separate is what says whether the cost is
+     * cacheable at all. */
+    s_dma_entries+=bytes/8;
+    if (bytes/8>s_dma_worst) s_dma_worst=bytes/8;
+    ++s_dma_misses;
     return 0;
 }
 
