@@ -1,0 +1,324 @@
+HANDOVER 2026-09-16 -- TWO METHODS THE EXECUTOR NEVER DECODED
+
+Companion to HANDOVER_2026-09-16_THE_INSTRUMENTS_WERE_LYING.txt, which covers
+the APU. This one is the renderer, from two read-only audits run the same day:
+the CPU reference rasteriser and texture path, and the pushbuffer executor plus
+the two vertex-program emitters.
+
+Read CLAUDE.md first. The headline finding here was found the same way the APU
+one was -- by checking an instrument against what actually triggers it -- and
+it had been sitting in plain sight in every run's report for months.
+
+
+=============================================================================
+1. ARRAY_ELEMENT32 AND DRAW_ARRAYS WERE NEVER DECODED
+=============================================================================
+
+There are four ways a title hands the NV2A its vertex indices. This executor
+decoded two of them.
+
+  0x1800  NV097_ARRAY_ELEMENT16   handled
+  0x1818  NV097_INLINE_ARRAY      handled
+  0x1808  NV097_ARRAY_ELEMENT32   NOT HANDLED
+  0x1810  NV097_DRAW_ARRAYS       NOT HANDLED
+
+The two unhandled ones fell through to `default:`, which recognises only the
+two vertex-array register ranges, and so landed in the unhandled-method
+histogram -- which prints them, every run, at the top of the report:
+
+    [GPU]   0x1808 x164101
+    [GPU]   0x1810 x10462
+
+with 0x1818 and 0x1800 ABSENT from the same table. That absence is the positive
+control: the histogram does distinguish handled from unhandled, and these two
+were unhandled 174,563 times in a single run of measure/methodaudit.
+
+WHAT IT COST. A batch whose indices arrive that way reaches SET_BEGIN_END(0)
+with idx_count == 0, and draw_primitive returns before it increments
+s_gpu.draws. So the batch is not drawn, not counted as a draw, not counted as a
+vsh reject, not counted as a texture reject -- invisible to every instrument in
+the file. A renderer whose picture has been called "right" was silently
+dropping geometry. And a batch that mixed ELEMENT16 with ELEMENT32 kept only
+the 16-bit half, so its TOPOLOGY was wrong and it was drawn anyway.
+
+WHY IT SURVIVED SO LONG, and this is the part worth remembering.
+src/kernel/nv2a_pb_scan.c's method-name table labelled 0x1808 "INLINE_ARRAY".
+INLINE_ARRAY is 0x1818. So the one survey that answers "which methods does this
+title use" named an unhandled method after a handled one. Anyone who looked at
+that table saw a method they knew was implemented.
+
+Checking the rest of that table against nv2a_regs.h found SEVEN more wrong
+labels: 0x0B00 and 0x0B80 swapped (TRANSFORM_PROGRAM vs TRANSFORM_CONSTANT),
+0x0130 "SET_FLIP_READ" for FLIP_STALL, 0x033C "SET_CULL_FACE_ENABLE" for
+SET_ALPHA_FUNC, 0x0340 "SET_DEPTH_MASK" for SET_ALPHA_REF, 0x0350
+"SET_CLEAR_DEPTH_VALUE" for SET_BLEND_EQUATION, 0x1D6C "SET_ZSTENCIL_CLEAR" for
+SET_SEMAPHORE_OFFSET. All corrected, and INLINE_ARRAY added.
+
+A NAME TABLE IS DOCUMENTATION THAT GETS READ AS EVIDENCE. Cross-check it
+against the register header, not against memory.
+
+BOTH METHODS ARE NOW DECODED, with the index source reported so the change is
+measurable rather than asserted:
+
+    [GPU] indices by source: elem32=N draw_arrays=N (N calls);
+          dropped: too-wide=N no-room=N
+
+elem32/draw_arrays nonzero proves those batches now reach a draw. too-wide and
+no-room nonzero would mean geometry is STILL being dropped -- which is exactly
+what the old code did silently, so they are printed rather than assumed zero.
+idx[] is uint16_t, and an index that does not fit is counted rather than
+truncated: a truncated index is geometry that draws in the wrong place and says
+nothing. (nv2a_regs.h:1493 records that the hardware itself raises an exception
+for a DRAW_ARRAYS start above 0xFFFF, so the guard is the right shape.)
+
+
+=============================================================================
+2. THE LOD GRADIENT WAS SCALED FOR A FORMAT ALREADY IN TEXELS
+=============================================================================
+
+Live on the Metal path, and present identically on the CPU one.
+
+sample_level normalises uv by (w,h) for rgba8/dxt1/dxt3 and NOT for the fourth
+accepted format, LU_IMAGE_R5G6B5 -- an image rectangle, whose coordinates are
+already in texels. sample() in nv2a_texture_copy.c says so in as many words:
+"Nonlinear textures use normalized coordinates, unlike image rectangles."
+
+sample_lod multiplied the gradient by (tw,th) for all four. So an image rect
+got rho multiplied by the texture width a second time: log2(640) = 9.3 where
+the true lod is 0.
+
+The levels<2 guard does not save it. That zeroes the mip INDEX; the
+magnify-vs-minify decision two lines further down reads the RAW lod:
+
+    if(lod+s.lod_bias[u]>0&&s.min_filter[u])linear=(s.min_filter[u]&1)==0;
+
+so an image rect was permanently "minifying" and the MAG filter from
+SET_TEXTURE_FILTER was discarded in favour of the MIN filter's parity. shade()
+calls sample_lod unconditionally, before the combiner split, so there is no
+branch that avoids it on the hardware path.
+
+A 1:1 blit hides it -- bilinear sampled at exact texel centres is nearest --
+and any blit that is offset or scaled does not: a full-screen fade or
+post-process card comes out blocky when it should be smooth, or blurred when it
+should be crisp. Such draws exist in this title today; measured, 30 occurrences
+of
+
+    [METAL] software fallback (initialization): combiner=0 mask=0x1 untextured=0
+            format=0/0 levels=1 size=640x480 bpp=2 ...
+
+format=0/0 is rgba8=0, dxt1=0 with levels=1 at 640x480 -- a
+LU_IMAGE_R5G6B5 draw.
+
+FIXED in both sinks: scale only what is normalised.
+
+
+=============================================================================
+3. THE TWO SINKS DISAGREED ABOUT DEPTH WRITES, AND THE COMMENT SAID THEY DID NOT
+=============================================================================
+
+nv2a_metal.m carried, verbatim:
+
+    * The NV2A does not update depth when the test is disabled, and
+    * neither does nv2a_texture_copy.c.
+
+The second clause was false about the file it named. There, depth_write is
+assigned OUTSIDE the depth-test guard, and the write is gated on
+(depth_test || stencil_test):
+
+    uint8_t *zp = (s->depth_test||s->stencil_test) ? depth + ... : NULL;
+    if (zp && s->depth_write) { ...stamp z24... }
+
+So a stencil-only draw with depth_write set stamped depth on the SOFTWARE arm
+and not on the hardware one. They cannot both be right, and the hardware rule
+is that ZWRITEENABLE does nothing with ZENABLE off -- so Metal was right.
+
+THE REASON THIS MATTERS MORE THAN ONE WRONG PIXEL: the software arm is the
+visual control every render A/B in this project is scored against. A control
+that disagrees with hardware is worse than a wrong result; it is a wrong
+oracle. Exactly the cross-file assertion CLAUDE.md warns about -- written to
+justify the gate in one file, never checked against the sibling it named.
+
+FIXED: the CPU sink now requires depth_test, and the comment records what it
+used to claim.
+
+
+=============================================================================
+4. THE REUSE CACHE LEAKED ON EVERY REJECT PATH
+=============================================================================
+
+prepare_vertices clears its reuse bitmap by re-walking the batch's indices at
+the bottom of the function. The comment above that clear already says what
+happens otherwise: "entries leak across batches and a later batch reuses a
+transform computed from a different vertex array, different constants or a
+different program -- silently wrong geometry rather than a crash."
+
+VSH_REJECT was a bare `return 0` from inside the per-vertex loop. Seven of the
+eight exits skipped the clear. The comment was right about the consequence and
+wrong that the code prevented it. Rejects are not hypothetical -- "[VSH] 21
+oPos is not finite" in boot/on-3/stderr.log.
+
+Latent only because RECOMP_VSH_REUSE is off. That is exactly the switch the
+next person reaches for when chasing the frame-time p99, which is the worst
+possible moment to be handed intermittently wrong geometry.
+
+FIXED: VSH_REJECT now goes to a shared exit that does the same clear.
+reuse_active had to be hoisted above the first reject, because a goto that
+jumps past an initialiser leaves the object indeterminate and the earliest
+reject is a hundred lines above where it was declared.
+
+
+=============================================================================
+5. COUNTERS THAT LIE -- RENDERER EDITION
+=============================================================================
+
+5a. "[GPU] N triangles rasterised" has three meanings and the newest arrived
+    silently. One variable, s_gpu.tris_drawn, three producers: the CPU
+    rasteriser (counts degenerate and culled triangles as drawn), Metal with
+    CPU-side culling (post-cull), and Metal with GPU-side culling, where
+    triangle()'s first statement is
+
+        if(vsh_gpu_culling){out[(*n)++]=a;...;return;}
+
+    skipping vertex_valid, the degenerate test and the cull test entirely.
+    That third definition BECAME THE DEFAULT ON 16 SEP when RECOMP_METAL_VSH
+    flipped on, and nothing said so. Any triangle-count comparison straddling
+    that flip compares two different quantities.
+
+    NOW: [METAL] triangles assembled=N culled here=N (culling on the GPU/CPU),
+    and the line says outright which quantity "rasterised" is reporting.
+
+5b. "[TEXTURE] prepared=N rejected=N" was one counter with two denominators.
+    s_copy.rejected is incremented both when prepare refuses a whole DRAW and
+    when triangle_depth returns 0 for one TRIANGLE. Measured in win-explode:
+    rejected=3382034 beside prepared=279618, with the reasons table underneath
+    summing to 766 -- so 3,381,268 of them were triangles, printed against a
+    batch count, where the line reads as one draw in twelve refused.
+
+    3.38M against 52.31M drawn is 6% of assembled triangles leaving
+    nv2a_texture_copy_triangle_depth by a `return 0`. AND THERE ARE FOUR SUCH
+    EXITS AFTER PIXELS HAVE ALREADY BEEN COMMITTED, not the one that is
+    recorded: :699, :724, :726 and :737. Two of them test the finite-difference
+    probe points at (x+1.5,y+0.5) and (x+0.5,y+1.5), which on a strongly
+    projective triangle sit outside it where q legitimately crosses zero -- so
+    a probe falling off the projective pole abandons the rest of the triangle
+    mid-scanline.
+
+    NOW: rejected_draw and rejected_tri are separate, with the reasons table as
+    rejected_draw's positive control (the two must agree). THE FOUR MID-LOOP
+    EXITS ARE NOT FIXED. Splitting rejected_tri by exit site is the next step,
+    and it is one counter.
+
+5c. "[VSH] executed batches=N rejected=N" -- batches counts only mode==2
+    batches while rejected counts all of them. Measured 56% understatement in
+    boot/pilot-off: executed batches=72798 against [TEXTURE] prepared=166167.
+    NOT FIXED. It reads correct today only because every batch in the recent
+    gameplay runs is programmable, which is why it went unnoticed.
+
+
+=============================================================================
+6. FOUND, VERIFIED, NOT FIXED
+=============================================================================
+
+Ranked. Every one is static unless it says measured.
+
+- inline_layout() accepts only type 2 (F) and type 4 (UB_OGL) and returns on
+  anything else, leaving s_inline_stride 0 -- and the batch then draws nothing
+  with no reject anywhere. Type 0 is UB_D3D, and fetch_attr's own comment
+  records that JSRF declares its diffuse colour as exactly that. s_gpu.attr[]
+  is sticky across batches, so a declaration written for an array batch reaches
+  an inline one. Measured latent: the sampled inline batches declare only
+  a0/a9 with the type-0 attribute at size 0.
+
+- Vertex array stride is truncated from 24 bits to 8:
+  `a->stride = (param >> 8) & 0xFF;` against a 0xFFFFFF00 field. Any stride
+  >= 256 aliases and every vertex of that batch reads from the wrong place,
+  with no reject and no counter. Measured not reached -- every
+  "[VSH] late batch attrs:" line in the tree shows st0 or st32.
+
+- The colour half of CLEAR_SURFACE ignores both the clear rect and the
+  per-channel mask, while the depth half honours the rect. The Metal resident
+  clear REFUSES exactly the partial-mask case and falls straight into the CPU
+  loop that gets it wrong. Measured not reached: [METAL] clear refused: mask=0.
+
+- s_outputs[s_gpu.idx[v]] in the blend trace is indexed by the index VALUE
+  where every other reader uses the index POSITION -- s_outputs is [4096][16][4]
+  and idx is uint16_t, so this reads up to 16 MB past the array. Needs
+  RECOMP_BLEND_TRACE, which is off.
+
+- nv2a_vsh.c scalarises the shared C operand for paired scalar-ILU
+  instructions: `sw->y = sw->z = sw->w = sw->x` destroys the MAC's third
+  operand for any ADD/MAD paired with a scalar ILU. This feeds the interpreter
+  AND both emitters, so it is a shared wrong answer no divergence check could
+  catch. Measured not reached: decoding the 556 captured instructions found
+  mul+rcc, mov+rcp, dp4+rsq, dp3+mov, arl+mov -- and zero add/mad pairings.
+
+- a0-relative constant reads have THREE behaviours: MSL clamps to c[191], HLSL
+  reads off the end of a 192-entry cbuffer, and the interpreter REFUSES the
+  draw. Worse than recorded -- the HLSL header says "nothing here has been
+  measured against a title program that indexes that high", and it has been
+  measured now: 189 of 556 captured instructions use rel-addressing with base
+  indices 107-110, so the margin is a0 <= 81.
+
+- RECOMP_CLEAR_DISCARD does not require the depth clear rect to cover the
+  surface, and if the guest never wrote SET_CLEAR_RECT the default is a 1x1
+  rect. Guarded today by g_clear_refuse_rect reading 0; off by default.
+
+- nv2a_vsh_msl.c's own header understates its file by one fix: it still says
+  "LIT is still knowingly wrong" and names two fixes where the code contains
+  three. The LIT fix is present at :466-482 and is correct.
+
+- The CPU sink implements NO z-range policy at all: z_clip_min/max and z_cull
+  are decoded into the struct and never read again, and nv2a_d3d11.c has no
+  reference either. So it is four policies across four sinks, two of them
+  "none" -- worse than the recorded "three sinks, three policies". And
+  metal_batch_test.c:113 asserts the opposite of the code ("the software path
+  clamps every fragment to [z_clip_min, z_clip_max] when z_cull is off"), which
+  is load-bearing for that fixture's base_state() fix.
+
+- g_hw_state_refusals counts real refusals (return nil, safe) and SILENT
+  SUBSTITUTIONS (cmp forced to ALWAYS, stencil ops forced to KEEP -- the draw
+  renders wrong) in one variable, against a header that promises "refuse the
+  STATE, never silently guess it". Measured never fired: refusals=0 in every
+  metal_hw line in the tree.
+
+- The software fallback pipeline is built once at init as RGBA32Float and the
+  surface is B5G6R5Unorm when hw_565 is on, so any draw taking the software
+  tail while hardware is up binds mismatched formats. Measured never reached:
+  2,396 "MIXED draws" lines, all =0.
+
+Smaller, all measured latent: MSL cmpu has no zero-func default where the CPU's
+compare_value does; MSL shade() drops the diffuse for untextured non-combiner
+state; combiner_input can index past a 14-entry register file and only the
+D3D11 emitter defends; the zeta format is validated only when the depth test is
+on; sample_lod's mip stride omits the rgba8 case; the [BLEND] dedupe key has
+overlapping fields; s_texture_reasons and s_vsh_reject drop reasons past their
+caps with no overflow counter; sa_clear counts clears with nothing retained;
+capture_draw writes object-space inputs under a field named "vertices" whenever
+RECOMP_METAL_VSH is on, which is now the default; the "over-33ms" bin actually
+starts at 33.5 ms.
+
+
+=============================================================================
+7. AUDITED AND FOUND CORRECT -- DO NOT SPEND TIME HERE
+=============================================================================
+
+Verified line by line against the NV2A encodings and, where applicable, across
+all three sinks:
+
+  fill rule and edge functions; barycentrics and perspective correction;
+  register combiners including input mapping, the alpha-half channel select,
+  the register file indices and the final combiner; DXT1/DXT3 decode; the Xbox
+  rectangular Morton swizzle; texture register decode including the signed
+  13-bit lod_bias; the mip walk; stencil in full (ZERO vs KEEP, the two masks,
+  operation order); Z24S8 packing; blending and dither; the `direct` fast path
+  and its guards; every texel and framebuffer bound; primitive assembly across
+  all three sinks; the Metal texture cache (keyed AND memcmp-verified, measured
+  2,738,761 hits of 2,755,903); the enum tables and their static asserts;
+  nv2a_dma_resolve's RAMHT arithmetic; nv2a_pusher.c's header decode; the ring
+  loop in main.c; frame_pct/frame_stats_flip; and the three 15-Sep vertex-shader
+  fixes (fp contraction, the a*0 rule, pow()-based LIT) in BOTH emitters --
+  all three verified correct as landed.
+
+Also confirmed: vertex arrays are not DMA-relative in this title (measured,
+base=0x00000000), so fetch_attr's absolute-VA assumption holds; and
+s_vsh_gpu_batch / s_vsh_force_cpu have no lifetime leak on any path.

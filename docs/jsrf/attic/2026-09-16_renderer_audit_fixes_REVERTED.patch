@@ -1,0 +1,815 @@
+diff --git a/src/d3d/d3d8_gl.c b/src/d3d/d3d8_gl.c
+index 6f046e8..d52ce79 100644
+--- a/src/d3d/d3d8_gl.c
++++ b/src/d3d/d3d8_gl.c
+@@ -23,6 +23,7 @@
+ 
+ #include "d3d8_xbox.h"
+ #include "d3d8_fvf.h"
++#include "../recomp_switch.h"
+ 
+ #include <SDL.h>
+ #include <epoxy/gl.h>
+@@ -31,6 +32,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
++#if !defined(_WIN32)
++#include <unistd.h>   /* _exit, for the window-close path */
++#endif
+ 
+ #ifndef D3D_OK
+ #define D3D_OK ((HRESULT)0)
+@@ -691,11 +695,51 @@ static int present_guest_framebuffer(void)
+         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 40, (void *)32);
+     }
+ 
++    /* LETTERBOX RATHER THAN STRETCH.
++     *
++     * This used to hand the whole drawable to glViewport, which is right only
++     * while the window happens to match the guest's aspect. It never does full
++     * screen: a 16:10 laptop panel stretched 4:3 content by 20% horizontally,
++     * and the person sees a subtly fat picture with nothing to compare against.
++     *
++     * So fit the guest surface inside the drawable at its own aspect and
++     * centre it. The bars are painted here because the region outside the
++     * viewport keeps whatever the last frame left in it, and at this point the
++     * back buffer's contents are undefined after the swap -- so without the
++     * clear the bars are garbage, not black.
++     *
++     * The blit readback below samples the drawable centre, which is inside the
++     * viewport for any letterbox, so it still reads a guest pixel. */
+     {
+         int fbw = 0, fbh = 0;
+         SDL_GL_GetDrawableSize(g.window, &fbw, &fbh);
+-        if (fbw > 0 && fbh > 0)
++        if (fbw > 0 && fbh > 0) {
++            int vw = fbw, vh = fbh;
++            if ((long)fbw * (long)h > (long)fbh * (long)w) {
++                /* drawable is wider than the source: pillarbox */
++                vw = (int)((long)fbh * (long)w / (long)h);
++            } else {
++                /* taller: letterbox */
++                vh = (int)((long)fbw * (long)h / (long)w);
++            }
++            if (vw < 1) vw = 1;
++            if (vh < 1) vh = 1;
+             glViewport(0, 0, fbw, fbh);
++            glDisable(GL_SCISSOR_TEST);
++            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++            glClear(GL_COLOR_BUFFER_BIT);
++            glViewport((fbw - vw) / 2, (fbh - vh) / 2, vw, vh);
++            {
++                static int said_w, said_h;
++                if (vw != said_w || vh != said_h) {
++                    said_w = vw; said_h = vh;
++                    fprintf(stderr, "[d3d8_gl] drawable %dx%d, picture %dx%d"
++                            " at %d,%d (guest %ux%u)\n", fbw, fbh, vw, vh,
++                            (fbw - vw) / 2, (fbh - vh) / 2, w, h);
++                    fflush(stderr);
++                }
++            }
++        }
+     }
+     glDisable(GL_DEPTH_TEST);
+     glDisable(GL_BLEND);
+@@ -1208,14 +1252,69 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
+     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
+     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+ 
+-    g.window = SDL_CreateWindow(g_window_title,
+-                                SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+-                                g.backbuf_w, g.backbuf_h,
+-                                SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
++    /* THE WINDOW THE PERSON ACTUALLY LOOKS AT.
++     *
++     * This used to be created at the guest's back-buffer size with no flags
++     * beyond OPENGL|SHOWN, which meant a fixed 640x480 window that could not be
++     * resized, could not go full screen, and on a Retina display was upscaled
++     * by the compositor rather than drawn at the panel's real resolution.
++     *
++     * ALLOW_HIGHDPI is the one that matters most here and it costs nothing:
++     * present_guest_framebuffer already sizes its viewport from
++     * SDL_GL_GetDrawableSize, so with the flag on it draws into the full
++     * backing store instead of a point-sized one. The guest still renders
++     * 640x480 -- that is the emulated NV2A surface and nothing here changes it
++     * -- but the upscale is then done once, by the GPU, at the panel's real
++     * resolution, instead of twice.
++     *
++     * RECOMP_WINDOW_SCALE=N sizes the window N times the guest surface
++     * (default 2, clamped to what fits on the display). RECOMP_FULLSCREEN=1
++     * starts full screen. Neither affects what is rendered. */
++    {
++        Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN
++                     | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
++        int win_w = g.backbuf_w, win_h = g.backbuf_h;
++        const char *e = getenv("RECOMP_WINDOW_SCALE");
++        int scale = e ? atoi(e) : 2;
++        SDL_Rect usable;
++
++        if (scale < 1) scale = 1;
++        if (scale > 8) scale = 8;
++        /* Shrink to fit rather than opening a window taller than the desktop.
++         * SDL_GetDisplayUsableBounds excludes the menu bar and the Dock, which
++         * is exactly the region a window may occupy. */
++        if (SDL_GetDisplayUsableBounds(0, &usable) == 0
++            && usable.w > 0 && usable.h > 0) {
++            while (scale > 1 && (g.backbuf_w * scale > usable.w
++                                 || g.backbuf_h * scale > usable.h))
++                --scale;
++        }
++        win_w = g.backbuf_w * scale;
++        win_h = g.backbuf_h * scale;
++
++        if (recomp_switch_on("RECOMP_FULLSCREEN"))
++            flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
++
++        g.window = SDL_CreateWindow(g_window_title,
++                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
++                                    win_w, win_h, flags);
++    }
+     if (!g.window) {
+         fprintf(stderr, "[d3d8_gl] SDL_CreateWindow failed: %s\n", SDL_GetError());
+         return D3DERR_INVALIDCALL;
+     }
++    /* Below the guest surface the picture is only ever upscaled, so there is
++     * nothing to gain from letting it get smaller than one guest pixel per
++     * window pixel -- and a window smaller than the source is a letterbox
++     * calculation nobody needs. */
++    SDL_SetWindowMinimumSize(g.window, g.backbuf_w / 2, g.backbuf_h / 2);
++    {
++        int dw = 0, dh = 0;
++        SDL_GL_GetDrawableSize(g.window, &dw, &dh);
++        fprintf(stderr, "[d3d8_gl] window %dx%d, drawable %dx%d (guest %dx%d)"
++                        " -- Cmd+F or F11 for full screen\n",
++                g.backbuf_w, g.backbuf_h, dw, dh, g.backbuf_w, g.backbuf_h);
++    }
+     g.glctx = SDL_GL_CreateContext(g.window);
+     if (!g.glctx) {
+         fprintf(stderr, "[d3d8_gl] SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+@@ -1300,8 +1399,73 @@ void xbox_d3d8_pump_events(void)
+         return;
+     }
+     while (SDL_PollEvent(&ev)) {
+-        if (ev.type == SDL_QUIT) {
+-            fprintf(stderr, "[d3d8_gl] window close requested\n");
++        switch (ev.type) {
++        case SDL_QUIT:
++            /* THE CLOSE BUTTON USED TO PRINT A LINE AND CARRY ON. Closing the
++             * window, or Cmd+Q, left the process running with no window --
++             * still holding the audio device and still burning a core.
++             *
++             * _exit, not exit: this harness's own note (main.c) is that its
++             * atexit handlers are not safe to run on the way out, and every
++             * report here is written periodically rather than at exit, so
++             * there is nothing to flush but the stream itself. */
++            fprintf(stderr, "[d3d8_gl] window closed -- exiting\n");
++            fflush(stderr);
++            fflush(stdout);
++            _exit(0);
++            break;
++
++        case SDL_KEYDOWN:
++            /* Cmd+Q is the Mac quit gesture and SDL does not synthesise
++             * SDL_QUIT for it when the app is not a bundle with a menu. */
++            if (ev.key.keysym.sym == SDLK_q
++                && (ev.key.keysym.mod & (KMOD_GUI | KMOD_CTRL))) {
++                fprintf(stderr, "[d3d8_gl] quit requested -- exiting\n");
++                fflush(stderr);
++                _exit(0);
++            }
++            /* Cmd+F is the Mac full-screen gesture; F11 is what everyone else
++             * presses. FULLSCREEN_DESKTOP rather than FULLSCREEN: it takes the
++             * display at its current mode instead of changing it, so there is
++             * no mode switch to sit through and no resolution left behind if
++             * the process dies. The picture is letterboxed to the guest aspect
++             * either way -- see present_guest_framebuffer. */
++            if (ev.key.keysym.sym == SDLK_F11
++                || (ev.key.keysym.sym == SDLK_f
++                    && (ev.key.keysym.mod & (KMOD_GUI | KMOD_CTRL)))) {
++                Uint32 now_flags = SDL_GetWindowFlags(g.window);
++                int want = !(now_flags & SDL_WINDOW_FULLSCREEN_DESKTOP);
++                if (SDL_SetWindowFullscreen(g.window,
++                        want ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0)
++                    fprintf(stderr, "[d3d8_gl] full screen refused: %s\n",
++                            SDL_GetError());
++                else
++                    fprintf(stderr, "[d3d8_gl] %s full screen\n",
++                            want ? "entering" : "leaving");
++                fflush(stderr);
++            }
++            /* Escape leaves full screen and does nothing otherwise, which is
++             * what every other player expects it to do. It is not bound to
++             * quit: this title uses Escape in its own menus. */
++            if (ev.key.keysym.sym == SDLK_ESCAPE
++                && (SDL_GetWindowFlags(g.window) & SDL_WINDOW_FULLSCREEN_DESKTOP)) {
++                SDL_SetWindowFullscreen(g.window, 0);
++                fprintf(stderr, "[d3d8_gl] leaving full screen\n");
++                fflush(stderr);
++            }
++            break;
++
++        case SDL_WINDOWEVENT:
++            /* Nothing to do but notice: the viewport is recomputed from
++             * SDL_GL_GetDrawableSize on every present, so a resize needs no
++             * state of its own. Logged once per distinct size by the present
++             * path rather than here, so a window dragged across a display
++             * boundary -- where the backing scale changes without a resize
++             * event -- is reported too. */
++            break;
++
++        default:
++            break;
+         }
+     }
+ }
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a0113a7..5c88c87 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -278,6 +278,27 @@ typedef struct {
+ } VertexAttr;
+ 
+ #define NV_VERTEX_ATTRS 16
++/* THE GUEST ASKS FOR MORE THAN 4096, AND EVERYTHING PAST IT WAS THROWN AWAY.
++ *
++ * This was 4096 and the overflow was silent: ARRAY_ELEMENT16 simply did
++ * nothing once idx_count reached the cap, so a batch larger than the array was
++ * TRUNCATED and drawn anyway -- a mesh with its tail missing, reported by
++ * nothing. Measured once a counter was put on it, in one 280 s gameplay run:
++ *
++ *     no-room=43257098 (e16=86463170 e32=25513 da=0);
++ *     biggest batch asked for 9681 of 4096 slots
++ *
++ * 9,681. The largest batch this title submits is 2.4x the array it was given,
++ * and essentially all of the loss is on ARRAY_ELEMENT16 -- the oldest path in
++ * the file, not the two methods decoded on 16 Sep, which together account for
++ * 25,513 of 43 million.
++ *
++ * 16384 covers the measured worst case with 69% headroom and costs 8 MB of
++ * static arrays (s_outputs and reuse_inputs dominate, 4 MB each). RAISING THIS
++ * ALONE IS NOT ENOUGH and doing so would have made the picture worse, not
++ * better: nv2a_metal_draw rejects count>4096 and its assembly array is sized
++ * 3x4096 exactly, so every newly-admitted batch would have been refused by the
++ * GPU and handed to the CPU rasteriser. Both backends were raised with it. */
+ #define NV_MAX_INDICES  4096
+ /* Inline vertex data arrives as one dword per push, so a batch needs room for
+  * the whole primitive: 16384 dwords is 2048 vertices at a typical eight-dword
+@@ -464,6 +485,26 @@ static struct {
+     uint32_t clear_color;
+     uint32_t clears, unhandled_total;
+     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
++    /* The two index-submission methods this executor never decoded. */
++    uint32_t elem32_indices, elem32_wide, draw_arrays_calls, draw_arrays_indices;
++    /* SEEN, whether or not a batch was open. Counting only inside `prim` cannot
++     * tell "the guest never sent this method" from "it sent it outside
++     * BEGIN/END and we ignored it" -- and those want different fixes. The first
++     * validation run of the decode read elem32=0, and without these two there
++     * was no way to say which of the two it meant. */
++    uint32_t elem32_seen, draw_arrays_seen;
++    /* INDICES DROPPED FOR WANT OF ROOM, split by who asked.
++     *
++     * One counter could not be acted on: the first run with it read
++     * no-room=31915392, which is two orders of magnitude more than the 164,101
++     * ARRAY_ELEMENT32 methods a run, so most of it had to be coming from
++     * somewhere else -- and "somewhere else" is a different bug with a
++     * different fix. idx_wanted_max is the number that decides the cap: it is
++     * how many indices the guest asked for in its largest batch, counted
++     * whether or not we had room for them. */
++    uint32_t idx_overflow;              /* total, kept so the old number is comparable */
++    uint32_t idx_overflow_e16, idx_overflow_e32, idx_overflow_da;
++    uint32_t idx_wanted, idx_wanted_max;
+     uint32_t gpu_batches, gpu_fallbacks;
+     /* Batches and triangles that the GPU never saw.
+      *
+@@ -529,6 +570,9 @@ static struct {
+     uint8_t *target, *depth;
+     size_t texture_bytes, target_bytes, depth_bytes;
+     uint32_t texture_address, target_address, depth_address, batches, rejected;
++    /* rejected, split. See the report line for why one counter was wrong. */
++    uint32_t rejected_draw;  /* nv2a_texture_copy_prepare refused a DRAW */
++    uint32_t rejected_tri;   /* ..._triangle_depth returned 0 for a TRIANGLE */
+     int active;
+ } s_copy;
+ 
+@@ -2431,9 +2475,24 @@ static struct { const char *reason; uint32_t n; uint32_t detail; }
+ static const char *s_vsh_reason;
+ static uint32_t s_vsh_reason_detail;
+ 
++/* EVERY REJECT LEAVES prepare_vertices THROUGH THE CACHE CLEAR.
++ *
++ * This used to be a bare `return 0` from inside the per-vertex loop, which
++ * skipped the reuse-cache clear at the bottom of the function -- and the
++ * comment sitting above that clear already says what happens then: "entries
++ * leak across batches and a later batch reuses a transform computed from a
++ * different vertex array, different constants or a different program --
++ * silently wrong geometry rather than a crash." The comment was right about
++ * the consequence and wrong that the code prevented it, on seven of the eight
++ * exits. Rejects are not hypothetical: "[VSH] 21 oPos is not finite" in
++ * boot/on-3/stderr.log.
++ *
++ * Latent only because RECOMP_VSH_REUSE is off -- and that is exactly the
++ * switch the next person reaches for when chasing the frame-time p99, which is
++ * the worst moment to hand them intermittently wrong geometry. */
+ #define VSH_REJECT(text, value) \
+     do { s_vsh_reason = (text); s_vsh_reason_detail = (uint32_t)(value); \
+-         return 0; } while (0)
++         goto vsh_rejected; } while (0)
+ 
+ static void note_vsh_reject(void)
+ {
+@@ -2539,6 +2598,11 @@ static unsigned long long vsh_now_ns(void)
+ static int prepare_vertices(void)
+ {
+     int programmable = s_vsh.mode == 2;
++    /* Hoisted above the first VSH_REJECT so the shared reject exit can read it.
++     * A goto that jumps past an initialiser leaves the object indeterminate,
++     * and the earliest reject is a hundred lines above where this used to be
++     * declared. */
++    int reuse_active = (vsh_reuse_on() || vsh_reuse_verify()) && programmable;
+     s_vsh_reason = NULL;
+     s_vsh_reason_detail = 0;
+     if (s_vsh.mode != 0 && !programmable)
+@@ -2642,7 +2706,6 @@ static int prepare_vertices(void)
+      * mismatch cannot distinguish "the inputs changed under us" from "the cache
+      * is wrong", and rarity does not distinguish them either. */
+     static float reuse_inputs[NV_MAX_INDICES][16][4];
+-    int reuse_active = (vsh_reuse_on() || vsh_reuse_verify()) && programmable;
+     /* Wide copy whenever something reads the slots the narrow one leaves
+      * stale: the reuse verifier compares all sixteen, and capture_draw writes
+      * all sixteen to its JSON. Both are opt-in, so at gameplay this is 1. */
+@@ -2929,6 +2992,18 @@ static int prepare_vertices(void)
+     }
+     if (programmable) s_vsh.batches++;
+     return 1;
++
++vsh_rejected:
++    /* The same clear the success path does. A rejected batch has still written
++     * reuse entries for every vertex it got through before giving up, and
++     * those name rows of s_outputs this batch is about to abandon. */
++    if (reuse_active) {
++        for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
++            uint16_t v = s_gpu.idx[i];
++            reuse_seen[v >> 3] &= (uint8_t)~(1u << (v & 7));
++        }
++    }
++    return 0;
+ }
+ 
+ /* Capture state at a draw boundary, not during a periodic interrupt report.
+@@ -3107,6 +3182,20 @@ static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
+         ++s_gpu.tris_drawn;
+         ++s_gpu.cpu_tris;
+     } else {
++        /* PER TRIANGLE, and it used to share a counter with the per-DRAW
++         * refusal below. Measured in win-explode: rejected=3382034 beside
++         * prepared=279618, with the reasons table underneath summing to
++         * 766 -- so 3,381,268 of those were triangles, printed against a
++         * batch count where the line reads as one draw in twelve refused.
++         * 3.38M against 52.31M drawn is 6% of assembled triangles leaving
++         * nv2a_texture_copy_triangle_depth by a return 0, and FOUR of
++         * those exits happen after pixels have already been committed --
++         * one recorded, three not. Two of the four test the finite
++         * -difference probe points at (x+1.5,y+0.5) and (x+0.5,y+1.5),
++         * which on a strongly projective triangle sit outside it where q
++         * legitimately crosses zero: a probe falling off the projective
++         * pole abandons the rest of the triangle mid-scanline. */
++        ++s_copy.rejected_tri;
+         if (++s_copy.rejected <= 4) fprintf(stderr, "[TEXTURE] rejected triangle geometry / bounds\n");
+     }
+ }
+@@ -3222,6 +3311,7 @@ static void raster_batch(void)
+     capture_draw(copy_error);
+     if (copy_error) {
+         if (fade_batch) ++s_blend_fade_fate.prepare_rejected;
++        ++s_copy.rejected_draw;
+         if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s (t=%.2f)\n", s_gpu.draws, copy_error, trace_seconds());
+         return;
+     }
+@@ -3728,6 +3818,9 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
+ 
+     case NV097_SET_BEGIN_END:
+         if (param) {
++            if (s_gpu.idx_wanted > s_gpu.idx_wanted_max)
++                s_gpu.idx_wanted_max = s_gpu.idx_wanted;
++            s_gpu.idx_wanted = 0;
+             s_gpu.prim = param;
+             s_gpu.idx_count = 0;
+             s_gpu.inline_count = 0;
+@@ -3787,8 +3880,83 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
+         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
++        } else if (s_gpu.prim) {
++            ++s_gpu.idx_overflow; s_gpu.idx_overflow_e16 += 2;
+         }
++        if (s_gpu.prim) s_gpu.idx_wanted += 2;
+         break;
++
++    /* THE OTHER TWO WAYS A TITLE SUBMITS INDICES, NEITHER OF WHICH THIS FILE
++     * DECODED UNTIL 16 SEP 2026.
++     *
++     * ARRAY_ELEMENT16 above was handled and INLINE_ARRAY was handled;
++     * ARRAY_ELEMENT32 (0x1808) and DRAW_ARRAYS (0x1810) fell through to
++     * default:, which only recognises the two vertex-array register ranges,
++     * and so landed in the unhandled-method histogram. Measured there, in
++     * measure/methodaudit/stderr.log:
++     *
++     *     [GPU]   0x1808 x164101
++     *     [GPU]   0x1810 x10462
++     *
++     * with 0x1818 and 0x1800 ABSENT from the same table, which is the control:
++     * the histogram does distinguish handled from unhandled, and these two were
++     * unhandled 174,563 times in one run.
++     *
++     * WHAT THAT COST. A batch whose indices arrive this way reaches
++     * SET_BEGIN_END(0) with idx_count == 0, and draw_primitive returns before
++     * it increments s_gpu.draws. So the batch is not drawn, not counted as a
++     * draw, not counted as a vsh reject and not counted as a texture reject --
++     * invisible to every instrument in this file, which is why a renderer whose
++     * picture has been called "right" was silently dropping geometry. Worse
++     * than dropping: a batch that mixes ELEMENT16 with ELEMENT32 kept only the
++     * 16-bit half, so the TOPOLOGY was wrong and it was drawn anyway.
++     *
++     * A contributing cause is worth recording. nv2a_pb_scan.c's method-name
++     * table labels 0x1808 "INLINE_ARRAY", which is 0x1818 -- so the one survey
++     * that answers "which methods does this title use" named this method after
++     * a method that was already handled. */
++    case NV097_ARRAY_ELEMENT32:
++        ++s_gpu.elem32_seen;
++        /* One 32-bit index per parameter word. idx[] is uint16_t because the
++         * hardware's own 16-bit path is the common one; an index that does not
++         * fit is counted rather than truncated, because a truncated index is
++         * geometry that draws in the wrong place and says nothing. */
++        if (s_gpu.prim) {
++            if (param > 0xFFFFu) ++s_gpu.elem32_wide;
++            else if (s_gpu.idx_count < NV_MAX_INDICES) {
++                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)param;
++                ++s_gpu.elem32_indices;
++            } else { ++s_gpu.idx_overflow; ++s_gpu.idx_overflow_e32; }
++            ++s_gpu.idx_wanted;
++        }
++        break;
++
++    case NV097_DRAW_ARRAYS: {
++        /* start plus a count biased by one, generating sequential indices --
++         * which is all "draw arrays" means once the vertex arrays are already
++         * declared, and fetch_vertex indexes them exactly the same way. */
++        ++s_gpu.draw_arrays_seen;
++        uint32_t start = param & NV097_DRAW_ARRAYS_START_INDEX;
++        uint32_t count = ((param & NV097_DRAW_ARRAYS_COUNT) >> 24) + 1;
++        if (s_gpu.prim) {
++            uint32_t k;
++            ++s_gpu.draw_arrays_calls;
++            s_gpu.idx_wanted += count;
++            for (k = 0; k < count; ++k) {
++                uint32_t v = start + k;
++                if (v > 0xFFFFu) { ++s_gpu.elem32_wide; continue; }
++                if (s_gpu.idx_count >= NV_MAX_INDICES) {
++                    s_gpu.idx_overflow += count - k;
++                    s_gpu.idx_overflow_da += count - k;
++                    s_gpu.idx_wanted += count - k;
++                    break;
++                }
++                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)v;
++                ++s_gpu.draw_arrays_indices;
++            }
++        }
++        break;
++    }
+     default:
+         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+                 && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
+@@ -4152,7 +4320,14 @@ void nv2a_pb_exec_report(void)
+                 (unsigned long long)s_blend_fade_fate.rasterised);
+     }
+     frame_stats_report();
+-    fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
++    /* rejected_draw is per draw and comparable with prepared; rejected_tri
++     * is per triangle and is not. The reasons table printed below
++     * enumerates the draw-level refusals only, so rejected_draw is its
++     * positive control: the two must agree, and for the life of the single
++     * counter they appeared not to by four thousand to one. */
++    fprintf(stderr, "[TEXTURE] prepared=%u rejected_draw=%u rejected_tri=%u"
++            " (was one counter: %u)\n", s_copy.batches, s_copy.rejected_draw,
++            s_copy.rejected_tri, s_copy.rejected);
+     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)
+         fprintf(stderr,"[TEXTURE]   %llu  %s\n",(unsigned long long)s_texture_reasons[i].count,s_texture_reasons[i].reason);
+     if (s_combiner_count) {
+@@ -4217,6 +4392,23 @@ void nv2a_pb_exec_report(void)
+         fprintf(stderr, "[GPU] draws %u, %u indices; input range not measured"
+                         " (RECOMP_VERTEX_RANGE=1)\n",
+                 s_gpu.draws, s_gpu.verts);
++    /* WHERE THE INDICES CAME FROM. Until 16 Sep 2026 two of the four
++     * submission methods were undecoded, so any batch using them contributed
++     * nothing here and nothing anywhere else. elem32 and draw_arrays being
++     * nonzero is the proof that those batches now reach a draw; wide and
++     * overflow being nonzero would mean geometry is still being dropped, which
++     * is the thing the old code did silently. */
++    fprintf(stderr, "[GPU] indices by source: elem32=%u/%u seen"
++                    " draw_arrays=%u/%u seen (%u calls);"
++                    " dropped: too-wide=%u no-room=%u"
++                    " (e16=%u e32=%u da=%u); biggest batch asked for %u"
++                    " of %u slots\n",
++            s_gpu.elem32_indices, s_gpu.elem32_seen,
++            s_gpu.draw_arrays_indices, s_gpu.draw_arrays_seen,
++            s_gpu.draw_arrays_calls, s_gpu.elem32_wide, s_gpu.idx_overflow,
++            s_gpu.idx_overflow_e16, s_gpu.idx_overflow_e32,
++            s_gpu.idx_overflow_da, s_gpu.idx_wanted_max,
++            (unsigned)NV_MAX_INDICES);
+     /* One picture per report rather than per clear: a title clears hundreds of
+      * times a second and nobody wants that many files. */
+     {
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index b849b0e..c49a166 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -83,10 +83,25 @@ static void note(uint32_t subch, uint32_t method)
+  * answer that -- "0x1808 x412" only means something once it reads
+  * INLINE_ARRAY. Unnamed ones still get counted. */
+ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
++    /* CHECKED AGAINST nv2a_regs.h, 16 Sep 2026. Seven of these named a method
++     * after a different method: 0x0B00 and 0x0B80 were swapped (PROGRAM vs
++     * CONSTANT), 0x0130 read SET_FLIP_READ for FLIP_STALL, 0x033C read
++     * SET_CULL_FACE_ENABLE for SET_ALPHA_FUNC, 0x0340 read SET_DEPTH_MASK for
++     * SET_ALPHA_REF, 0x0350 read SET_CLEAR_DEPTH_VALUE for SET_BLEND_EQUATION,
++     * and 0x1D6C read SET_ZSTENCIL_CLEAR for SET_SEMAPHORE_OFFSET.
++     *
++     * The eighth is the one that cost something. 0x1808 was labelled
++     * INLINE_ARRAY -- INLINE_ARRAY is 0x1818 -- so the survey that answers
++     * "which methods does this title use" named an UNHANDLED method after a
++     * handled one, 164,101 times a run, and nv2a_pb_exec.c went on not
++     * decoding it. See the ARRAY_ELEMENT32 case there.
++     *
++     * A name table is documentation that gets read as evidence. Cross-check it
++     * against nv2a_regs.h rather than against memory. */
+     { 0x0000, "SET_OBJECT" },
+     { 0x0100, "NO_OPERATION" },
+     { 0x0104, "SET_WARNING_ENABLE" },
+-    { 0x0130, "SET_FLIP_READ" },
++    { 0x0130, "FLIP_STALL" },
+     { 0x0200, "SET_SURFACE_CLIP_HORIZONTAL" },
+     { 0x0204, "SET_SURFACE_CLIP_VERTICAL" },
+     { 0x0208, "SET_SURFACE_FORMAT" },
+@@ -98,20 +113,21 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
+     { 0x030C, "SET_DEPTH_TEST_ENABLE" },
+     { 0x0310, "SET_DITHER_ENABLE" },
+     { 0x0314, "SET_LIGHTING_ENABLE" },
+-    { 0x033C, "SET_CULL_FACE_ENABLE" },
+-    { 0x0340, "SET_DEPTH_MASK" },
+-    { 0x0350, "SET_CLEAR_DEPTH_VALUE" },
++    { 0x033C, "SET_ALPHA_FUNC" },
++    { 0x0340, "SET_ALPHA_REF" },
++    { 0x0350, "SET_BLEND_EQUATION" },
+     { 0x1D8C, "SET_CLEAR_DEPTH" },
+     { 0x1D90, "SET_COLOR_CLEAR_VALUE" },
+     { 0x1D94, "CLEAR_SURFACE" },
+-    { 0x1D6C, "SET_ZSTENCIL_CLEAR" },
+-    { 0x0B80, "SET_TRANSFORM_PROGRAM" },
+-    { 0x0B00, "SET_TRANSFORM_CONSTANT" },
++    { 0x1D6C, "SET_SEMAPHORE_OFFSET" },
++    { 0x0B80, "SET_TRANSFORM_CONSTANT" },
++    { 0x0B00, "SET_TRANSFORM_PROGRAM" },
+     { 0x1720, "SET_VERTEX_DATA_ARRAY_OFFSET" },
+     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
+     { 0x17FC, "SET_BEGIN_END" },
+     { 0x1800, "ARRAY_ELEMENT16" },
+-    { 0x1808, "INLINE_ARRAY" },
++    { 0x1808, "ARRAY_ELEMENT32" },
++    { 0x1818, "INLINE_ARRAY" },
+     { 0x1810, "DRAW_ARRAYS" },
+     { 0x1B00, "SET_TEXTURE_OFFSET" },
+     { 0x1B04, "SET_TEXTURE_FORMAT" },
+diff --git a/src/nv2a/nv2a_d3d11.c b/src/nv2a/nv2a_d3d11.c
+index a00c511..cfbf273 100644
+--- a/src/nv2a/nv2a_d3d11.c
++++ b/src/nv2a/nv2a_d3d11.c
+@@ -1613,7 +1613,9 @@ static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t t
+         uint8_t *target, size_t target_size, uint8_t *depth, size_t depth_size,
+         const float (*vertices)[16][4], unsigned count, unsigned primitive)
+ {
+-    static uint32_t indices[12288];
++    /* 3x NV_MAX_INDICES: a strip or fan emits 3*(count-2). Raised with the
++     * executor's cap -- see the note on NV_MAX_INDICES in nv2a_pb_exec.c. */
++    static uint32_t indices[16384*3];
+     static Vertex staging[4096];
+     ID3D11ShaderResourceView *views[4];
+     ID3D11SamplerState *samplers[4];
+@@ -1634,7 +1636,7 @@ static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t t
+     if (!s) return reject("null-state");
+     if ((s->texture_mask & 1) && !texture) return reject("missing-texture");
+     if (!target) return reject("missing-target");
+-    if (!vertices || count < 3 || count > 4096) return reject("vertex-count");
++    if (!vertices || count < 3 || count > 16384) return reject("vertex-count");
+     if (s->target_bpp != 2) return reject("target-format");
+     if (!s->clip_w || !s->clip_h || s->clip_x || s->clip_y
+             || s->clip_w > 4096 || s->clip_h > 4096) return reject("clip");
+diff --git a/src/nv2a/nv2a_metal.m b/src/nv2a/nv2a_metal.m
+index 2339a30..f359f3d 100644
+--- a/src/nv2a/nv2a_metal.m
++++ b/src/nv2a/nv2a_metal.m
+@@ -596,7 +596,21 @@ static NSString *const shader =
+  " return(texel(t,q,u,base,w,h,pitch,s)*(1-fxy.x)+texel(t,q+int2(1,0),u,base,w,h,pitch,s)*fxy.x)*(1-fxy.y)"
+  " +(texel(t,q+int2(0,1),u,base,w,h,pitch,s)*(1-fxy.x)+texel(t,q+int2(1,1),u,base,w,h,pitch,s)*fxy.x)*fxy.y;}\n"
+  "float4 sample_lod(const device uchar*t,float4 tc,uint u,constant Params&s){float2 uv=tc.xy/tc.w;"
+- " float2 scale=float2(s.tw[u],s.th[u]);float lod=log2(max(0.000001f,max(length(dfdx(uv)*scale),length(dfdy(uv)*scale))));"
++ /* SCALE ONLY WHAT IS NORMALISED. sample_level multiplies uv by (w,h) for
++  * rgba8/dxt1/dxt3 and NOT for the fourth accepted format, LU_IMAGE_R5G6B5,
++  * whose coordinates are already in texels -- sample() in
++  * nv2a_texture_copy.c says so in as many words. This line scaled the
++  * gradient for all four, so an image rectangle got rho multiplied by the
++  * texture width a second time: log2(640) = 9.3 where the true lod is 0.
++  *
++  * The levels<2 guard below does not save it. That zeroes the mip INDEX;
++  * the magnify-vs-minify decision two lines further down reads the raw
++  * lod, so an image rect was permanently "minifying" and the MAG filter
++  * from SET_TEXTURE_FILTER was discarded in favour of the MIN filter's
++  * parity. A 1:1 blit hides it -- bilinear at exact texel centres is
++  * nearest -- and any blit that is offset or scaled does not. */
++ " float2 scale=(s.rgba8[u]||s.dxt1[u]||s.dxt3[u])?float2(s.tw[u],s.th[u]):float2(1);"
++ " float lod=log2(max(0.000001f,max(length(dfdx(uv)*scale),length(dfdy(uv)*scale))));"
+  " float l=max(0.0f,lod+s.lod_bias[u]);if(s.min_filter[u]<3||s.levels[u]<2)l=0;"
+  " l=min(l,float(s.levels[u]-1));uint lo=s.min_filter[u]>=5?uint(floor(l)):uint(floor(l+.5f));"
+  " uint hi=s.min_filter[u]>=5&&lo+1<s.levels[u]?lo+1:lo;bool linear=s.linear[u]!=0;"
+@@ -1723,8 +1737,18 @@ static id<MTLDepthStencilState> hw_depth_state_for(const NV2ATextureCopy *s)
+      * the same pair. With the test off, cmp is forced to ALWAYS above, so a
+      * draw with the mask still set -- an overlay, a UI quad -- stamped its own
+      * depth over everything it covered on this path and over nothing on the
+-     * other. The NV2A does not update depth when the test is disabled, and
+-     * neither does nv2a_texture_copy.c.
++     * other. The NV2A does not update depth when the test is disabled.
++     *
++     * CORRECTED 16 Sep 2026: this used to add "and neither does
++     * nv2a_texture_copy.c", which was false about the file it named.
++     * There, depth_write is assigned outside the depth-test guard and the
++     * write is gated on (depth_test || stencil_test), so a stencil-only
++     * draw with depth_write set stamped depth on the SOFTWARE arm and not
++     * on this one -- and the software arm is the visual control every
++     * render A/B is scored against. Exactly the cross-file assertion
++     * CLAUDE.md warns about: written to justify the gate here, never
++     * checked against the sibling. The sibling has been fixed to match;
++     * this gate was the correct one.
+      *
+      * The second-order half is worse than the divergence: depth_dirty is not
+      * set for such a draw, so whatever this wrote was never read back and the
+@@ -1808,9 +1832,12 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
+  * a bump pointer and bound with setVertexBuffer:offset:. Both halves of a
+  * batch are reserved in one contiguous span, so a batch never straddles two
+  * slabs and one in-flight count per batch is enough. A batch is bounded:
+- * nv2a_metal_draw rejects count>4096 and a Vertex is 112 bytes, so vertices
+- * cost at most 448 KB, and indices are bounded by the 12288-entry assembly
+- * array at 48 KB. Half a megabyte, worst case, into a two-megabyte slab.
++ * nv2a_metal_draw rejects count>NV2A_METAL_MAX_VERTICES and a Vertex is 112
++ * bytes, so vertices cost at most 1.75 MB, and indices are bounded by the
++ * assembly array at 3x that count, 192 KB. Just under two megabytes, worst
++ * case -- which is why the slab below is eight and not the two it was when the
++ * cap was 4096. A batch that does not fit its slab is the one case this
++ * allocator cannot serve.
+  *
+  * WHY THIS IS SAFE AGAINST IN-FLIGHT GPU WORK -- the part that has to be
+  * right. A command buffer is committed per draw and nothing waits on it until
+@@ -1855,6 +1882,11 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
+  *
+  * If a slab cannot be allocated the reserve fails and the caller falls back
+  * to the old per-batch allocation, which is slow but always correct. */
++/* Vertices in one batch. Matches NV_MAX_INDICES in nv2a_pb_exec.c and must not
++ * be smaller: the executor assembles up to that many indices and hands them
++ * here, and a lower limit here turns every large batch into a CPU-rasterised
++ * one. See the note on NV_MAX_INDICES for what the guest actually asks for. */
++#define NV2A_METAL_MAX_VERTICES 4096
+ #define RING_SLABS 8
+ #define RING_SLAB_BYTES (2u<<20)
+ #define RING_ALIGN 256u
+@@ -2042,6 +2074,19 @@ void nv2a_metal_report(void)
+     fprintf(stderr,"[METAL] MIXED draws (software tail while hw on)=%llu, "
+             "depth uploads failed=%llu\n",
+             (unsigned long long)g_hw_mixed,(unsigned long long)g_hw_upload_fail);
++    /* Defined with triangle(), far below this report. */
++    extern unsigned long long g_tri_assembled, g_tri_culled;
++    extern int vsh_gpu_culling;
++    /* WHAT "triangles rasterised" MEANS IN THIS RUN. nv2a_metal_draw returns
++     * the count it emitted, which the executor adds to s_gpu.tris_drawn; with
++     * GPU culling that is every triangle assembled, and without it that is the
++     * survivors. The counter changed meaning when RECOMP_METAL_VSH defaulted
++     * on and said nothing, so say it. culled==0 with vsh on is expected, not a
++     * broken instrument -- assembled is its positive control. */
++    fprintf(stderr,"[METAL] triangles assembled=%llu culled here=%llu"
++            " (culling on the %s)\n", g_tri_assembled, g_tri_culled,
++            vsh_gpu_culling ? "GPU -- \"rasterised\" counts assembled"
++                            : "CPU -- \"rasterised\" counts survivors");
+     fprintf(stderr,"[METAL] hw draws=%llu pipelines=%llu refusals=%llu (metal_hw %s)\n",
+             (unsigned long long)g_hw_draws,
+             (unsigned long long)g_hw_pipeline_misses,
+@@ -2858,9 +2903,19 @@ static int vertex_why(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned i)
+  * the NV2A's own rule needs winding_flipped() to patch up triangles straddling
+  * the camera plane -- a correction this tree's own header calls an open
+  * question and whose obvious sign fix is recorded as WRONG. */
+-static int vsh_gpu_culling;
++int vsh_gpu_culling;
++/* ASSEMBLED vs SURVIVING, because nv2a_metal_draw returns n/3 and the
++ * executor adds that to s_gpu.tris_drawn -- printed as "triangles
++ * rasterised". On the CPU-culling path n/3 is post-cull. On the GPU-culling
++ * path the early return below skips vertex_valid, the degenerate test and
++ * the cull test, so n/3 is every triangle assembled. THE COUNTER CHANGED
++ * MEANING ON 16 SEP when RECOMP_METAL_VSH defaulted on, and nothing said
++ * so: any triangle-count comparison straddling that flip compares two
++ * different quantities. Counted here so the log can say which it is. */
++unsigned long long g_tri_assembled, g_tri_culled;
+ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out,unsigned*n,unsigned a,unsigned b,unsigned c)
+-{if(vsh_gpu_culling){out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;return;}
++{++g_tri_assembled;
++ if(vsh_gpu_culling){out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;return;}
+  int audit=clip_audit_on();if(audit){++audit_asm_total;
+     switch(s->cull_face){case 0:++audit_cull_none;break;case 0x404:++audit_cull_front;break;
+     case 0x405:++audit_cull_back;break;case 0x408:++audit_cull_both;break;
+@@ -2869,7 +2924,7 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
+  if(!vertex_valid(s,v,a)||!vertex_valid(s,v,b)||!vertex_valid(s,v,c)){
+     if(audit){int w=vertex_why(s,v,a);if(!w)w=vertex_why(s,v,b);if(!w)w=vertex_why(s,v,c);
+               if(w==2)++audit_asm_texq;else++audit_asm_nonfinite;}
+-    return;}
++    ++g_tri_culled;return;}
+  float ar=area(v[a][0],v[b][0],v[c][0]);if(!isfinite(ar)||ar==0){
+     if(audit){++audit_asm_degenerate;
+         if(!isfinite(ar))++audit_deg_nonfinite;
+@@ -2883,7 +2938,7 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
+                         &&q[k][1]>=0&&q[k][1]<=(float)s->clip_h))on=0;
+                     if(q[k][3]<0)wn=1;}
+                 if(on&&!wn)++audit_deg_lost;}}}
+-    return;}
++    ++g_tri_culled;return;}
+  int front=nv2a_texture_copy_front_facing(s,ar,v[a][0][3],v[b][0][3],v[c][0][3]);
+  int culled=nv2a_texture_copy_culled(s,front);
+  if(audit){const float*pa=v[a][0],*pb=v[b][0],*pc=v[c][0];
+@@ -2906,7 +2961,7 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
+                     fprintf(stderr,"  [METAL]   v%d x=%9.2f y=%9.2f z=%14.1f w=%12.4f\n",
+                         k,q[k][0],q[k][1],q[k][2],q[k][3]);
+                 fflush(stderr);}}}}
+- if(culled){if(audit)++audit_asm_culled;return;}out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;}
++ if(culled){if(audit)++audit_asm_culled;++g_tri_culled;return;}out[(*n)++]=a;out[(*n)++]=b;out[(*n)++]=c;}
+ 
+ /* Replay one captured frame through both submission paths and time them.
+  *
+@@ -3176,7 +3231,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
+  if(!s)return reject("null-state");
+  if((s->texture_mask&1)&&!texture)return reject("missing-texture");
+  if(!target)return reject("missing-target");
+- if(!vertices||count<3||count>4096)return reject("vertex-count");
++ if(!vertices||count<3||count>NV2A_METAL_MAX_VERTICES)return reject("vertex-count");
+  if(s->target_bpp!=2)return reject("target-format");
+  if(!s->clip_w||!s->clip_h||s->clip_x||s->clip_y||s->clip_w>4096||s->clip_h>4096)return reject("clip");
+  if(s->target_pitch<(uint64_t)s->clip_w*2)return reject("target-pitch");
+@@ -3191,7 +3246,13 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
+  }
+  if((uint64_t)s->target_pitch*s->clip_h>target_size)return reject("target-bounds");
+  if((s->depth_test||s->stencil_test)&&(!depth||s->depth_pitch<(uint64_t)s->clip_w*4||(uint64_t)s->depth_pitch*s->clip_h>depth_size))return reject("depth-bounds");
+- unsigned indices[12288],n=0;
++ /* STATIC, because at the raised cap this is 192 KB and a stack array that
++  * size is a crash rather than a slow path. Safe because the whole submit path
++  * is driven by the single pushbuffer executor thread -- the same assumption
++  * the ring allocator below already makes about its bump pointer. A strip or
++  * fan emits 3*(count-2) indices, which is why it is three times the cap and
++  * not equal to it. */
++ static unsigned indices[NV2A_METAL_MAX_VERTICES*3],n=0; n=0;
+  /* Set BEFORE assembly, because triangle() is what reads it. The same
+   * predicate as vsh_gpu_active below, minus the parts that depend on state
+   * this function has not reached yet; if either of those later refuses, the
+diff --git a/src/nv2a/nv2a_texture_copy.c b/src/nv2a/nv2a_texture_copy.c
+index b968758..427d7bf 100644
+--- a/src/nv2a/nv2a_texture_copy.c
++++ b/src/nv2a/nv2a_texture_copy.c
+@@ -725,8 +725,15 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
+                     uv[at][0]=sx/sq;uv[at][1]=sy/sq;
+                     if(!isfinite(uv[at][0]) || !isfinite(uv[at][1])) return 0;
+                 }
+-                float dx=hypotf((uv[1][0]-uv[0][0])*t->width,(uv[1][1]-uv[0][1])*t->height);
+-                float dy=hypotf((uv[2][0]-uv[0][0])*t->width,(uv[2][1]-uv[0][1])*t->height);
++                /* Scale only what sample() normalises. Image rectangles
++                 * (LU_IMAGE_R5G6B5) arrive in texels already -- the
++                 * comment in sample() says exactly that -- so multiplying
++                 * their gradient by the dimensions counts them twice and
++                 * reports lod = log2(width) for a 1:1 blit. */
++                float sw=(t->rgba8||t->dxt1||t->dxt3)?(float)t->width:1.f;
++                float sh=(t->rgba8||t->dxt1||t->dxt3)?(float)t->height:1.f;
++                float dx=hypotf((uv[1][0]-uv[0][0])*sw,(uv[1][1]-uv[0][1])*sh);
++                float dy=hypotf((uv[2][0]-uv[0][0])*sw,(uv[2][1]-uv[0][1])*sh);
+                 float lod=log2f(fmaxf(0.000001f,fmaxf(dx,dy)));
+                 sample_lod(t,data,uv[0][0],uv[0][1],lod,regs[8+unit]);
+             }
+@@ -775,7 +782,16 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
+         if (s->target_bpp==2) pixel=quantize(rgb[0],31)<<11 | quantize(rgb[1],63)<<5 | quantize(rgb[2],31);
+         else pixel=quantize(rgb[3],255)<<24 | quantize(rgb[0],255)<<16 | quantize(rgb[1],255)<<8 | quantize(rgb[2],255);
+         for (unsigned k=0;k<s->target_bpp;++k) p[k]=(uint8_t)(pixel>>(8*k));
+-        if (zp && s->depth_write) { zp[1]=(uint8_t)z24; zp[2]=(uint8_t)(z24>>8); zp[3]=(uint8_t)(z24>>16); }
++        /* DEPTH WRITES REQUIRE THE DEPTH TEST. zp is taken when the depth
++         * test OR the stencil test is on, and depth_write is assigned
++         * outside the depth-test guard in prepare(), so a stencil-only
++         * draw with depth_write set used to stamp depth here -- while the
++         * Metal sink gates on (depth_test && depth_write) in both its
++         * pipeline and its software tail. They cannot both be right, and
++         * the hardware rule is that ZWRITEENABLE does nothing with
++         * ZENABLE off. This arm is the visual control the other is scored
++         * against, so the disagreement was worse than a wrong pixel. */
++        if (zp && s->depth_test && s->depth_write) { zp[1]=(uint8_t)z24; zp[2]=(uint8_t)(z24>>8); zp[3]=(uint8_t)(z24>>16); }
+         if (s->stencil_test) stencil_update(s,zp,s->stencil_zpass);
+     }
+     return 1;

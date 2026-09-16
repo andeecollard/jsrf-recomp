@@ -1,0 +1,337 @@
+HANDOVER 2026-09-16 (third of the day) -- THE FENCES, THE RINGS, AND A BLACK
+SCREEN I CAUSED
+
+Read CLAUDE.md first, then the two companion handovers from today:
+
+  HANDOVER_2026-09-16_THE_INSTRUMENTS_WERE_LYING.txt        the APU audit
+  HANDOVER_2026-09-16_TWO_METHODS_THE_EXECUTOR_NEVER_DECODED.txt  the renderer audit
+
+This one is the state at end of session. It supersedes the other two ONLY where
+it says so -- specifically, the renderer-audit handover describes eight fixes
+that are NOT in the tree any more. See section 3 before you trust it.
+
+THIS IS A STATIC RECOMPILER, NOT AN EMULATOR. The title's x86 is translated to
+C ahead of time and compiled native; nothing interprets guest instructions at
+run time. What is emulated is the hardware around it -- NV2A, MCPX APU, the
+kernel, the HDD, vblank. The distinction matters because it tells you where to
+look: "guest CPU" time in the stage breakdown is COMPILED CODE, not an
+interpreter, and no amount of runtime tuning touches it. (I got this wrong
+repeatedly in conversation and was corrected.)
+
+
+=============================================================================
+1. WHAT IS COMMITTED AND PUSHED
+=============================================================================
+
+Two commits, both verified by a run before pushing:
+
+  754c223  Map the NV2A aperture twice, and close the last two unprotect windows
+  9408806  The APU's instruments were lying, and the lock guard was never the
+           mechanism
+
+754c223 closes CLAUDE.md's outstanding "PCRTC_INTR_0 and PGRAPH_INTR still have
+this shape" note by giving the NV2A aperture the same double MapViewOfFileEx
+alias MCPX has had since the 13.5M-window incident. Confirmed in a run:
+
+    [NV2A] aperture aliased at 0x10cf6c000; the guarded view is never unprotected
+    [MCPX] aperture aliased at 0x10df6c000; the guarded view is never unprotected
+
+9408806 is the APU audit. The headline is that three counters were lying, and
+one of them had been the standing justification for a guard. Do not re-derive
+anything from pre-16-Sep APU numbers without reading that handover first.
+
+
+=============================================================================
+2. WHAT IS UNCOMMITTED AND WHY
+=============================================================================
+
+    src/kernel/nv2a_pb_exec.c   NV_MAX_INDICES 4096 -> 16384
+    src/nv2a/nv2a_metal.m       NV2A_METAL_MAX_VERTICES, count guard, static
+                                assembly array, RING_SLAB_BYTES 2 -> 8 MB
+    src/nv2a/nv2a_d3d11.c       the same cap on the Windows backend
+    diagnostics/jsrf_first_fault/packaging/   the .app bundle builder (new)
+    docs/jsrf/handovers/...TWO_METHODS...txt  (new, and see section 3)
+
+THE CAP RAISE IS THE FENCE FIX. Verified not-black in a run (guest centre
+52 71 8C, 73 B6 A5 -- varied colour, window matching) and 35/35 ctest, but the
+gameplay runs confirming it had not finished when the session ended. Commit it
+once they have.
+
+
+=============================================================================
+3. A BLACK SCREEN I CAUSED, AND WHAT IS STILL OUT OF THE TREE
+=============================================================================
+
+READ THIS BEFORE TRUSTING THE RENDERER-AUDIT HANDOVER.
+
+That document describes eight fixes as landed. They were, and then the player
+reported a black screen and they were REVERTED. They are saved, not lost:
+
+    docs/jsrf/attic/2026-09-16_renderer_audit_fixes_REVERTED.patch
+
+(815 lines, committed deliberately. It was first written to a session-scoped
+scratchpad, which would have evaporated with the session and taken a day of
+measured work with it. `git apply` it against the commit named in its header,
+not against a later tree.)
+
+WHAT THE BISECT ESTABLISHED, and it is worth having:
+
+  arm 0  everything reverted          picture RENDERS (6B 69 63, 21 04 08, ...)
+  arm A  audit fixes in, cap at 4096  STILL BLACK
+  arm B  cap at 16384, audit fixes out  picture RENDERS
+
+So the bug is in the EIGHT AUDIT FIXES, and the index-cap raise is INNOCENT.
+That is why the cap is back in the tree alone.
+
+The symptom, same scene and instrument either side:
+
+    before  [d3d8_gl] blit N: guest centre 00 8A 8C -> window 00 8A 8C
+    after   [d3d8_gl] blit N: guest centre 00 00 00 -> window 00 00 00
+
+The window blit is FAITHFUL in both -- window centre equals guest centre -- so
+the presentation path is not the cause. The guest framebuffer itself is black.
+
+WHAT MAKES THIS HARD: every health counter reads clean in the broken build.
+882,085 hardware draws, refusals=0, pipelines=0, zero software fallbacks, 6.9M
+triangles, [VSH] rejected=0, [TEXTURE] rejected_draw=0, no shader or pipeline
+error. The whole [METAL] report is identical to the working run apart from one
+counter line that was added. Whatever is wrong produces no error anywhere.
+
+The two suspects worth checking first, both static reading:
+  - the MSL sample_lod change. The shader is a C string; a subtly wrong
+    expression compiles fine and outputs black, and this one runs for every
+    textured fragment on the live path.
+  - the `extern` forward declarations added for g_tri_assembled, g_tri_culled
+    and vsh_gpu_culling INSIDE a function, hundreds of lines above their real
+    definitions in the same file. If a type disagrees, or if vsh_gpu_culling is
+    read through a declaration that does not match its definition, culling
+    changes with nothing to notice.
+
+An agent was hunting this when the session ended; its answer did not arrive.
+
+DO NOT REAPPLY THE PATCH WHOLESALE. Apply one fix, run gameplay, check the
+blit line, repeat. That is exactly what I failed to do and it cost the player
+two broken builds.
+
+
+=============================================================================
+4. THE FENCES -- CAUSE MEASURED, FIX APPLIED
+=============================================================================
+
+The player reported fences disappearing. It is not a shading bug and it was not
+new: it is batch TRUNCATION, and it had been silent for the life of the file.
+
+NV_MAX_INDICES was 4096. ARRAY_ELEMENT16 simply stopped storing once idx_count
+reached the cap -- no counter, no log line -- and the batch was drawn anyway
+with its tail missing. Measured once an instrument was put on the drop, in one
+280 s gameplay run:
+
+    no-room=43257098 (e16=86463170 e32=25513 da=0);
+    biggest batch asked for 9681 of 4096 slots
+
+9,681 indices in one batch, against an array of 4,096. Essentially all of the
+loss is ARRAY_ELEMENT16 -- the oldest path -- not the two methods decoded
+earlier in the day, which together account for 25,513 of 43 million.
+
+RAISING THE CAP ALONE WOULD HAVE MADE IT WORSE. nv2a_metal_draw rejects
+count>4096 and sizes its assembly array 3x4096 exactly, so every newly-admitted
+batch would have been refused by the GPU and handed to the CPU rasteriser.
+Both backends and the ring allocator were raised together.
+
+NOTE ON THE COUNTER: e16 increments by 2 per dropped word while no-room
+increments by 1, so those totals are not on the same scale. The ratio between
+sources is right; the absolute numbers are not comparable. Fix that when the
+counter comes back with the audit fixes -- it is not in the tree right now.
+
+
+=============================================================================
+5. SOUND -- ONE MECHANISM FIXED, ONE OPEN
+=============================================================================
+
+FIXED, and confirmed in the field. The output clock was 48,003 Hz: an EP frame
+is 256 samples at 48 kHz = 5333 AND ONE THIRD microseconds and EP_FRAME_US
+truncated the third, so the model generated 62.5 ppm more audio than the device
+played, for ever. queued= climbed monotonically until apu_sdl2.c flushed the
+whole queue in one jump -- the audible lurch at the end of a long session. Now:
+
+    out_hz=48000  gen_hz=48000  starved=0  empty=0  min_queued=7168 (37.3 ms)
+
+Pinned by jsrf_apu_pace with NO tolerance, because a tolerance is exactly what
+hid a 62 ppm error.
+
+STILL OPEN, and it is what the player still hears as glitching. Our copy of the
+hardware voice list grows RINGS. VOICE_ON for a handle already reachable from
+the head writes link(v) = regs[top] and sets regs[top] = v, splicing v in front
+of a list that still reaches v. Measured in gameplay:
+
+    [APU-CYCLE] relink=209 (of 388 top inserts) walks_with_a_cycle=184983
+    [APU-IDLE-RING] 3D:v1[RC]<-TVL x15
+    [APU-IDLE] busiest: v1=13957 of 17356 traps
+
+FIFTY-FOUR PERCENT of top inserts. A voice inside a ring is visited twice by
+one walk, so voice_get_samples runs twice and advances cbo/ssl_seg twice: a
+streaming voice drains at 2x and starves, a looping voice plays at 2x pitch.
+Everything behind the splice point is unreachable.
+
+RECOMP_APU_CYCLE_BREAK=1 stops the WALK at the revisit. It is OFF by default
+and should stay off until a run count says otherwise -- the previous APU guard
+was defaulted on with an equally good argument and made the crash WORSE (4 of 4
+faults at t=24.03 s against ~5 in 25 at t=34-35 s). It is also probably only a
+mask: breaking the walk early still leaves voices behind the ring unrendered.
+The real fix is likely at the INSERT, not the walk. An agent was designing that
+when the session ended; its answer did not arrive.
+
+Ring counters are currently OUT of the tree with the audit fixes. Note that
+the ring EVIDENCE above predates the revert and stands on its own.
+
+
+=============================================================================
+6. 60 FPS -- THE DIAGNOSIS IS NOW MEASURED, THE NUMBER HAS NOT MOVED
+=============================================================================
+
+Gameplay, 280 s, reached gameplay:
+
+    [FRAME] mean=14.82 ms (67.5 fps) p50=16.0 p90=19.5 p95=21.0 p99=40.5
+            over-33ms=303
+
+Mean clears 60 fps. p99 does not, and P99 IS THE TARGET, not mean: the guest is
+capped at 59.94 Hz by emulated vblank and kernel_bridge.c DROPS missed periods,
+so every frame over 16.683 ms permanently costs a simulation step. 303 frames
+over 33 ms are visible hitches.
+
+THE TWO STRUCTURAL BLOCKERS, measured this session rather than estimated:
+
+  [STAGE] vsh=2.70 ms (81 calls) prepare=0.02 submit=3.56 sync=6.06 (1 call)
+          clear=0.06 | rest=3.42 of 15.81
+  [METAL] vsh draws: 508174 GPU, 707669 CPU
+  [METAL] sync 38464 calls (12821 clean): 53579.9 ms draining the GPU,
+          20735.0 ms reading back and converting
+
+  (a) SYNC IS THE LARGEST SINGLE STAGE at 6.06 ms of a 15.8 ms frame, and 72%
+      of it is the GPU STALL ([last_command waitUntilCompleted]), not the
+      readback. 74 seconds of a 280 s run. The frame is serialised: submit ->
+      stall for the whole GPU -> read 614 KB back -> convert -> present. That
+      is a GPU->CPU->GPU round trip every frame, and it exists only because the
+      presenter is OpenGL and reads guest RAM. Presenting straight from the
+      Metal texture removes the stall, the readback, the conversion AND the GL
+      re-upload in one change. Biggest single win available, and it is what
+      "use the Metal GPU fully" actually names.
+      NOTE: snapshot_surface() calls the sync BEFORE its `if (!s_snap_wanted)
+      return;` gate, so the comment claiming "a run with no window pays
+      nothing" is false -- the stall is paid unconditionally.
+
+  (b) 58% OF DRAWS STILL SHADE VERTICES ON THE CPU -- 707,669 of 1,215,843 --
+      because fixed-function T&L (nv2a_ff.c) has no GPU path. Only programmable
+      -shader draws are GPU-shaded. Emitting an MSL vertex function for NV2A
+      fixed-function T&L closes that and removes most of the vsh stage.
+
+Neither is a tuning change. Both are structural, and neither was started.
+
+Smaller, still recorded from earlier: depth read-back debt (~1.1-1.5 ms) and
+narrow per-vertex copies (512 bytes copied to deliver ~64, ~0.7-1.0 ms). Note
+the surface-swap sync was estimated at ~1.35 ms in an earlier handover and is
+actually 6 ms -- 4x the estimate. Treat the other two estimates with suspicion.
+
+
+=============================================================================
+7. THE MAC FRONT END
+=============================================================================
+
+New, uncommitted, in diagnostics/jsrf_first_fault/packaging/make_app.sh.
+Builds a double-clickable JSRF.app. Verified launching from Finder with NO
+shell environment: both apertures aliased, HiDPI drawable 2560x1920, picture
+correct, audio open at 48 kHz backend=SDL2.
+
+Window work (currently OUT of the tree with the reverted patch, in d3d8_gl.c):
+resizable + ALLOW_HIGHDPI, aspect-preserving letterbox instead of stretch,
+Cmd+F / F11 full screen, Escape leaves it, and a close button that actually
+exits -- it used to print "window close requested" and carry on, leaving the
+process running with no window. NOTE the window blit was PROVEN INNOCENT of the
+black screen (window centre equals guest centre throughout), so this can go
+back in with more confidence than the renderer half.
+
+THREE TRAPS THE BUNDLE HIT, all worth remembering:
+  - macOS is CASE-INSENSITIVE. CFBundleExecutable "JSRF" and a binary named
+    "jsrf" in Contents/MacOS are THE SAME FILE; the launcher silently
+    overwrote the Mach-O and otool then said "is not an object file" while
+    every install_name_tool call quietly did nothing. The engine is named
+    jsrf-engine for this reason.
+  - sdl2-compat DLOPENS libSDL3.dylib. It appears in no LC_LOAD_DYLIB list;
+    `strings` finds "@loader_path/libSDL3.dylib". Bundling only libSDL2 gives
+    an app that dies at SDL_Init. The script checks for this and fails loudly.
+  - CMake bakes the Cellar and /opt/homebrew/lib into LC_RPATH, and dyld
+    searches rpaths in order -- so a bundle on the build machine loads
+    Homebrew's copies and the bundled ones are never touched. It works, and it
+    proves nothing. The script strips them.
+
+ALSO: a GUI-launched app has its OWN TCC identity, not the Terminal's. A game
+dump in iCloud Drive, Desktop, Documents or Downloads needs consent before the
+first read, and the recomp BLOCKS FOREVER inside fopen() with nothing on screen
+if it is not granted -- measured, 0.0% CPU for two minutes in __open_nocancel.
+The launcher now reads a byte itself first and shows a dialog naming the
+folder. Keeping the game files in Application Support avoids it entirely.
+
+paths.conf is also where a switch can be tried without a rebuild; the generated
+paths.conf.example documents RECOMP_APU_CYCLE_BREAK.
+
+
+=============================================================================
+8. HOW I WASTED THE PLAYER'S TIME, SO YOU DO NOT
+=============================================================================
+
+Every one of these is a rule CLAUDE.md already contains, broken anyway.
+
+BUNDLED THREE RENDER CHANGES AND SHIPPED THEM UNVERIFIED. The window work, the
+eight audit fixes and the cap raise all went in without a gameplay run between
+them. The player found the black screen before I did, twice. When the bisect
+finally ran it took four runs to isolate what one run between changes would
+have caught immediately. ONE CHANGE, ONE RUN, CHECK THE BLIT LINE.
+
+VALIDATED ON THE TITLE SCREEN. The centre pixel is black there in BOTH the
+working and broken builds, so every "looks fine" I reported was measuring
+nothing. Only 1 run in 3 reaches gameplay with a live audio device; budget for
+that instead of accepting the first run that finishes.
+
+QUOTED A COUNTER FROM A RUN IN PROGRESS -- again. Reported out_hz=48000 as
+confirmation a fix had landed; the same grep on the same file read 48002 ten
+minutes later, and only apuclock1 existed at the time. Third occurrence of this
+class in this project. `pgrep -x jsrf_first_fault` BEFORE quoting anything.
+
+COMPARED TWO RUNS FROM DIFFERENT SCENES. 60,477 flips against 31,736 in the
+same wall time is not a frame-time improvement, it is different content.
+CLAUDE.md lists this under known-bad shortcuts.
+
+WROTE A COUNTER I COULD NOT ACT ON. The first no-room counter was shared across
+three submission methods, so 31.9M told me nothing about which. Split it by
+source AND record a high-water mark the first time, or the run is wasted.
+
+SAID "EMULATOR" THROUGHOUT, INCLUDING IN AGENT BRIEFS. It is a recompiler.
+The briefs propagate the error to work you will later read.
+
+
+=============================================================================
+9. OPEN, RANKED
+=============================================================================
+
+ 1. Find the black-screen bug in today_renderer_work.patch, reapply the eight
+    fixes ONE AT A TIME with a gameplay run each. Sections 3 and 8.
+ 2. Finish the cap-only gameplay runs and commit the fence fix. Section 2.
+ 3. Design and land the voice-list ring fix at the INSERT. Section 5. Five
+    clean runs minimum before any default changes -- that rule was paid for.
+ 4. Present from the Metal texture instead of round-tripping through guest RAM.
+    Section 6(a). Biggest single frame-time win and the literal goal.
+ 5. Fixed-function T&L on the GPU. Section 6(b).
+ 6. Upstream contribution. MIT licence, no code coupling (all 125 JSRF
+    references in our src/ diff are comments), and CONTRIBUTING explicitly
+    wants NV2A push-buffer and vertex-microcode work. But origin is NOT a
+    GitHub fork, we are 447 ahead / 80 behind, and 161 files overlap their
+    unmerged commits -- merge upstream first. Start with the nv2a_pb_scan.c
+    method-name corrections: eight labels verifiable against their own
+    nv2a_regs.h, near-zero risk, and it is the bug that hid the big one.
+ 7. Everything in section 6 of the renderer-audit handover: ARRAY_ELEMENT32 and
+    DRAW_ARRAYS decode (part of the reverted patch), inline_layout refusing
+    UB_D3D, the 8-bit stride truncation, the colour clear ignoring rect and
+    mask, and the rest.
+ 8. The APU crash. sub_001A2E2E with a NULL this, ~13% of runs. Both windows
+    measured and both guards made it worse; the ring in section 5 is the third
+    mechanism and the best current candidate.
