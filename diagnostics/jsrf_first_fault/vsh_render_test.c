@@ -14,6 +14,12 @@ void *xbox_GpuMemoryRange(uint32_t address, size_t bytes) {
     return (uint64_t)address+bytes<=sizeof(ram) ? (uint8_t *)ram+address : NULL;
 }
 const uint8_t *xbox_Nv2aRegisterMemory(void) { return gpu_regs; }
+/* The executor's capture gates are wall-clock gated so their 24 slots can be
+ * aimed at gameplay rather than at the boot logos. Nothing in this harness
+ * captures anything, so a constant is the whole requirement: what matters is
+ * that the symbol resolves, because nv2a_pb_exec.c is compiled into this test
+ * without the kernel that defines it. */
+double xbox_TraceSeconds(void) { return 0.0; }
 /* The renderer asks the guest heap who owns a vertex array when it samples a
  * draw. There is no heap in this harness, and the answer does not affect what
  * is rendered. */

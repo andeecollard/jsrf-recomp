@@ -752,8 +752,8 @@ static int jsrf_pb_poll(void)
         static unsigned long presented;
         pgraph_d3d11_flush();
         d3d8_PresentFrame();
-        /* RECOMP_FB_DUMP_FLIP=<stride>: capture finished frames, at the only
-         * moment a frame is finished. Cadence is the question this answers:
+        /* RECOMP_FB_DUMP_FLIP=<stride>[:<after-seconds>]: capture finished
+         * frames, at the only moment a frame is finished. Cadence is the question this answers:
          * whether consecutive presents carry different pictures, not merely
          * whether the surface is non-blank.
          *
@@ -764,21 +764,45 @@ static int jsrf_pb_poll(void)
          * agree, and only the second is a picture anyone saw. */
         {
             extern void nv2a_pb_exec_dump_surface(void);
+            extern double xbox_TraceSeconds(void);
             static long stride = -1;
+            static double after;
             static unsigned captured;
             if (stride < 0) {
+                /* RECOMP_FB_DUMP_FLIP=<stride>[:<after-seconds>].
+                 *
+                 * The optional second field is a wall-clock threshold, and it
+                 * is not a convenience. There are 24 slots and they used to
+                 * start counting at present 0, so a stride large enough to
+                 * still be capturing at gameplay -- which the scripted pad
+                 * reaches at t=105 s, thousands of presents in -- spent most
+                 * of them on the logos and the menu.
+                 *
+                 * SECONDS RATHER THAN A PRESENT INDEX, because the arms of an
+                 * A/B do not run at the same speed. That is this project's
+                 * oldest measurement trap: "a fixed pad schedule lands them in
+                 * different places", which is what invalidated six image
+                 * metrics. Present 3500 is a different moment in each arm; t =
+                 * 120 s is the same moment in all of them, because the pad
+                 * schedule that decides what is on screen is itself in
+                 * seconds. */
                 const char *e = getenv("RECOMP_FB_DUMP_FLIP");
+                const char *colon = e ? strchr(e, ':') : NULL;
                 stride = e && *e ? strtol(e, NULL, 0) : 0;
                 if (stride < 1) stride = 1;
+                after = colon ? strtod(colon + 1, NULL) : 0.0;
+                if (!(after > 0.0)) after = 0.0;
             }
             if (getenv("RECOMP_FB_DUMP_FLIP") && captured < 24
+                    && xbox_TraceSeconds() >= after
                     && (presented % (unsigned long)stride) == 0) {
                 extern uint32_t nv2a_pb_exec_triangles(void);
                 static uint32_t last_tris;
                 uint32_t tris = nv2a_pb_exec_triangles();
-                fprintf(stderr, "  [FLIP] capture %u at frame %lu:"
+                fprintf(stderr, "  [FLIP] capture %u at frame %lu, t=%.2f:"
                         " %u triangles since the previous capture\n",
-                        captured, presented, tris - last_tris);
+                        captured, presented, xbox_TraceSeconds(),
+                        tris - last_tris);
                 last_tris = tris;
                 captured++;
                 nv2a_pb_exec_dump_surface();

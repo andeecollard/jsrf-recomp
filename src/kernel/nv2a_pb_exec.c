@@ -3037,24 +3037,50 @@ batch_complete:
     /* Report-time snapshots may interrupt the clear or raster loops. Capture
      * a few completed batches when inspecting the actual rendered result. */
     if (s_gpu.tris_drawn != drawn_before) {
-        /* RECOMP_FB_DUMP_DRAW=<stride>: capture after every stride-th batch
-         * that actually drew, so the picture is a composed frame rather than
-         * whatever the surface held when a report happened to fire. The first
-         * batches are always the same full-screen blit, so a stride is what
-         * makes the title's own geometry visible; the default keeps the old
-         * behaviour of the first few. */
+        /* RECOMP_FB_DUMP_DRAW=<stride>[:<after-seconds>]: capture after every
+         * stride-th batch that actually drew, so the picture is a composed
+         * frame rather than whatever the surface held when a report happened
+         * to fire. The first batches are always the same full-screen blit, so
+         * a stride is what makes the title's own geometry visible; the default
+         * keeps the old behaviour of the first few.
+         *
+         * THE SECOND FIELD IS WHAT MAKES THIS USABLE AT GAMEPLAY. Without it
+         * the count starts at process start, and a gameplay run issues about
+         * 720,000 batches -- so a stride large enough to still be capturing at
+         * t=120 s puts tens of thousands of draws between captures, which is
+         * whole frames apart and answers a different question. With it, the 24
+         * slots land INSIDE one gameplay frame, consecutively, which is the
+         * only way to see an artefact appear and name the draw that made it.
+         *
+         * WHAT IT COSTS, and it has to be said next to the number it produces:
+         * dump_surface_bmp() calls nv2a_gpu_sync_range(), which on Metal is a
+         * full drain and read-back. Capturing every few draws therefore
+         * removes the GPU's backlog -- and this artefact is load dependent, so
+         * a small stride can hide the very thing being looked for. Read a
+         * clean capture set as "not reproduced at this stride", never as
+         * "absent". */
+        extern double xbox_TraceSeconds(void);
         static unsigned batches, captured;
         static long stride = -1;
+        static double draw_after;
         static const char *dump_slot;
         static int dump_on;
         if (stride < 0) {
             const char *env = pb_env_str("RECOMP_FB_DUMP_DRAW", &dump_slot);
+            const char *colon = env ? strchr(env, ':') : NULL;
             dump_on = env != NULL;
             stride = env && *env ? strtol(env, NULL, 0) : 0;
             if (stride < 1) stride = 1;
+            draw_after = colon ? strtod(colon + 1, NULL) : 0.0;
+            if (!(draw_after > 0.0)) draw_after = 0.0;
         }
         if (stride > 0 && dump_on && captured < 24
+                && xbox_TraceSeconds() >= draw_after
                 && (batches++ % (unsigned long)stride) == 0) {
+            fprintf(stderr, "  [DRAW-CAP] %u at batch %u, t=%.2f,"
+                    " %u triangles\n",
+                    captured, batches - 1, xbox_TraceSeconds(),
+                    s_gpu.tris_drawn);
             dump_surface_bmp("draw", captured++);
         }
     }
