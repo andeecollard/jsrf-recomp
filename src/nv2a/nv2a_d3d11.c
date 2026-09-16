@@ -1609,12 +1609,22 @@ static int write_dynamic(ID3D11Buffer *buffer, const void *data, size_t bytes)
     return 1;
 }
 
+/* Vertices in one batch. Must match NV_MAX_INDICES in nv2a_pb_exec.c: the
+ * executor assembles up to that many and hands them here, and a smaller limit
+ * here refuses every large batch back to the CPU rasteriser. */
+#define NV2A_D3D11_MAX_VERTICES 16384
+
 static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t texture_size,
         uint8_t *target, size_t target_size, uint8_t *depth, size_t depth_size,
         const float (*vertices)[16][4], unsigned count, unsigned primitive)
 {
-    static uint32_t indices[12288];
-    static Vertex staging[4096];
+    /* All three must agree, and the count guard below is the fourth. staging[]
+     * was left at 4096 when the guard was first raised to 16384, which is a
+     * 1.3 MB overflow of a static buffer on a batch this file cannot reach on
+     * macOS -- nv2a_d3d11.c is not compiled there, so nothing caught it. One
+     * constant now, for the same reason nv2a_metal.m has one. */
+    static uint32_t indices[NV2A_D3D11_MAX_VERTICES*3];
+    static Vertex staging[NV2A_D3D11_MAX_VERTICES];
     ID3D11ShaderResourceView *views[4];
     ID3D11SamplerState *samplers[4];
     ID3D11BlendState *blend;
@@ -1634,7 +1644,7 @@ static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t t
     if (!s) return reject("null-state");
     if ((s->texture_mask & 1) && !texture) return reject("missing-texture");
     if (!target) return reject("missing-target");
-    if (!vertices || count < 3 || count > 4096) return reject("vertex-count");
+    if (!vertices || count < 3 || count > NV2A_D3D11_MAX_VERTICES) return reject("vertex-count");
     if (s->target_bpp != 2) return reject("target-format");
     if (!s->clip_w || !s->clip_h || s->clip_x || s->clip_y
             || s->clip_w > 4096 || s->clip_h > 4096) return reject("clip");

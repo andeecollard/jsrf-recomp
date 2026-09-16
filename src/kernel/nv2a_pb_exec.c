@@ -278,7 +278,26 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
+/* THE GUEST ASKS FOR MORE THAN 4096 AND THE REST WAS THROWN AWAY.
+ *
+ * ARRAY_ELEMENT16 simply stopped storing once idx_count reached the cap, so a
+ * batch bigger than the array was TRUNCATED and drawn anyway -- a mesh with its
+ * tail missing, reported by nothing. That is what a fence that is half there,
+ * or not there, looks like. Measured once a counter was put on the drop, in one
+ * 280 s gameplay run:
+ *
+ *     no-room=43257098 (e16=86463170 e32=25513 da=0);
+ *     biggest batch asked for 9681 of 4096 slots
+ *
+ * 9,681 -- 2.4x the array. Essentially all of it on ARRAY_ELEMENT16, the oldest
+ * path in this file.
+ *
+ * 16384 covers that with 69% headroom, at 8 MB of static arrays (s_outputs and
+ * reuse_inputs, 4 MB each). RAISING THIS ALONE WOULD MAKE THINGS WORSE:
+ * nv2a_metal_draw rejects count>4096 and sizes its assembly array 3x4096
+ * exactly, so every newly-admitted batch would be refused by the GPU and handed
+ * to the CPU rasteriser. Both backends were raised with it. */
+#define NV_MAX_INDICES  16384
 /* Inline vertex data arrives as one dword per push, so a batch needs room for
  * the whole primitive: 16384 dwords is 2048 vertices at a typical eight-dword
  * layout, and the index array caps the batch at 4096 either way. */

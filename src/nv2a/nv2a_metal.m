@@ -1808,9 +1808,10 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
  * a bump pointer and bound with setVertexBuffer:offset:. Both halves of a
  * batch are reserved in one contiguous span, so a batch never straddles two
  * slabs and one in-flight count per batch is enough. A batch is bounded:
- * nv2a_metal_draw rejects count>4096 and a Vertex is 112 bytes, so vertices
- * cost at most 448 KB, and indices are bounded by the 12288-entry assembly
- * array at 48 KB. Half a megabyte, worst case, into a two-megabyte slab.
+ * nv2a_metal_draw rejects count>NV2A_METAL_MAX_VERTICES and a Vertex is 112
+ * bytes, so vertices cost at most 1.75 MB, and indices are bounded by the
+ * assembly array at 3x that count, 192 KB. Just under two megabytes worst case,
+ * which is why the slab below is eight and not the two it was at the old cap.
  *
  * WHY THIS IS SAFE AGAINST IN-FLIGHT GPU WORK -- the part that has to be
  * right. A command buffer is committed per draw and nothing waits on it until
@@ -1855,8 +1856,12 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
  *
  * If a slab cannot be allocated the reserve fails and the caller falls back
  * to the old per-batch allocation, which is slow but always correct. */
+/* Vertices in one batch. Must match NV_MAX_INDICES in nv2a_pb_exec.c: the
+ * executor assembles up to that many and hands them here, and a smaller limit
+ * turns every large batch into a CPU-rasterised one. */
+#define NV2A_METAL_MAX_VERTICES 16384
 #define RING_SLABS 8
-#define RING_SLAB_BYTES (2u<<20)
+#define RING_SLAB_BYTES (8u<<20)
 #define RING_ALIGN 256u
 #define RING_ALIGN_UP(n) (((n)+RING_ALIGN-1)&~(size_t)(RING_ALIGN-1))
 
@@ -3176,7 +3181,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  if(!s)return reject("null-state");
  if((s->texture_mask&1)&&!texture)return reject("missing-texture");
  if(!target)return reject("missing-target");
- if(!vertices||count<3||count>4096)return reject("vertex-count");
+ if(!vertices||count<3||count>NV2A_METAL_MAX_VERTICES)return reject("vertex-count");
  if(s->target_bpp!=2)return reject("target-format");
  if(!s->clip_w||!s->clip_h||s->clip_x||s->clip_y||s->clip_w>4096||s->clip_h>4096)return reject("clip");
  if(s->target_pitch<(uint64_t)s->clip_w*2)return reject("target-pitch");
@@ -3191,7 +3196,13 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  }
  if((uint64_t)s->target_pitch*s->clip_h>target_size)return reject("target-bounds");
  if((s->depth_test||s->stencil_test)&&(!depth||s->depth_pitch<(uint64_t)s->clip_w*4||(uint64_t)s->depth_pitch*s->clip_h>depth_size))return reject("depth-bounds");
- unsigned indices[12288],n=0;
+ /* static: at the raised cap this is 192 KB, and a stack array that size is a
+  * crash rather than a slow path. Safe because the submit path is driven by the
+  * single pushbuffer executor thread -- the same assumption the ring allocator
+  * already makes. 3x the cap because a strip or fan emits 3*(count-2).
+  * n stays automatic: only the storage for `indices` needed to move. */
+ static unsigned indices[NV2A_METAL_MAX_VERTICES*3];
+ unsigned n=0;
  /* Set BEFORE assembly, because triangle() is what reads it. The same
   * predicate as vsh_gpu_active below, minus the parts that depend on state
   * this function has not reached yet; if either of those later refuses, the
