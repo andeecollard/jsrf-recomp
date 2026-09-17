@@ -2,8 +2,51 @@ HANDOVER 2026-09-17 -- THE MUSIC TEST COULD NOT ANSWER ITS OWN QUESTION, THE
 GLYPH DEFECT IS CAUGHT ON CAMERA, G3 IS MEASURED AND JUSTIFIED, AND MY OWN
 INSTRUMENT IS IMPLICATED IN A GUEST HALT
 
-Read CLAUDE.md, then docs/jsrf/goals/JSRF_GOALS_2026-09-16_NIGHT_THE_DEFECT_LIST.md.
-Supersedes HANDOVER_2026-09-17_THE_FLIP_WAS_NEVER_THE_PROBLEM.txt.
+Read CLAUDE.md, then docs/jsrf/goals/JSRF_GOALS_2026-09-17_THE_GUEST_STOPS_TALKING.md
+-- NOT the 16 Sep list this document was written against. Supersedes
+HANDOVER_2026-09-17_THE_FLIP_WAS_NEVER_THE_PROBLEM.txt.
+
+=============================================================================
+ADDENDUM, written the same afternoon. READ THIS BEFORE THE BODY.
+=============================================================================
+
+The body below was written at midday and four things changed after it. It is
+kept intact because its reasoning is still sound and its refutations still
+hold; these are the corrections, not a rewrite.
+
+1. THE CRASH, AND THE FIRST PLAYER-CONFIRMED FIX OF THE DAY. The title
+   crashed inside the guest's DirectSound ISR shortly after New Game -- guest
+   stack ending 001A25D9, 62 of 2,555 guest methods dispatched while the front
+   end was TRAPPED. RECOMP_APU_FEDEC_HOLD is the guard for exactly that
+   window; it had been OFF by default since it was written and never once
+   exercised, while apu_vp.c:1793 claimed "default on". With it on the next
+   session ran clean, held=1702 of 1,702. It is now the tree default with a
+   test that makes the DEFAULT itself the property under test. 43 tests.
+
+2. G1 IS MUCH NARROWER. [MCPX-TRAP] vp is frozen and EQUALS guest_methods
+   exactly, so nothing is lost between the trap and the model; and
+   [APU-WRITE] main=16997 vp=11762 gp=7 ep=8 says the guest services our traps
+   through the MAIN registers while submitting no voice work at all. The
+   storm is TWO VOICES -- v1 and v3, alternating, every other voice at two
+   raises or fewer.
+
+3. A REFUTATION IN THE BODY IS RETRACTED. "The idle trap triggers the guest
+   freeze" was struck out on a session where the storm was ALREADY RUNNING
+   before the window examined, so the coexistence seen was an artifact of
+   arriving late. A later session has a clean pre-storm baseline: eight quiet
+   windows, the storm arrives, the guest works four times harder for two
+   windows and is dead six windows later. The storm is the prime suspect
+   again. See G1d.
+
+4. THE MUSIC DECAYS, IT DOES NOT CUT OUT. The player's "slow and then stops"
+   is 2D heard per window: +15008 +14992 +14476 +13896 +13610 +8736 0. And 3D
+   dies FIRST, two windows before 2D finishes decaying -- which is a 2D voice
+   playing out a buffer nobody is refilling. It is NOT the APU falling behind;
+   [APU-FRAME] is flat at ~7,500 frames per window throughout.
+
+Upstream status and what we owe them:
+docs/jsrf/plans/PLAN_2026-09-17_UPSTREAM_STATUS_AND_WHAT_WE_OWE.md
+
 
 READ SECTION 1 BEFORE FORMING ANY THEORY ABOUT THE MUSIC. The previous
 handover's section 0 told you how to answer the music question. Following it
