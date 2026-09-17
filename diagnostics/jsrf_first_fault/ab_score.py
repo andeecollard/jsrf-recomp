@@ -116,7 +116,28 @@ SWITCH_RE = re.compile(r"\[APU-(?:TRAP|SELFLINK|REON)\][^(]*\(([^)]*)\)")
 # rather than falling back to "assumes the environment took".
 SWITCH_BARE_RE = re.compile(r"\[VSH-REUSE\] \((vsh_reuse \w+)")
 # The Metal backend names its own state in parentheses, like the APU reports.
-METAL_SWITCH_RE = re.compile(r"\[METAL\][^(]*\((metal_(?:hw|565|batch) \w+)\)")
+#
+# GENERIC ON PURPOSE, 17 Sep 2026, and the specific version is why. It read
+#
+#     r"\[METAL\][^(]*\((metal_(?:hw|565|batch) \w+)\)"
+#
+# which could not see `defer_swap` for two independent reasons: the token list
+# was hardcoded to three names, and `[^(]*` stops at the FIRST parenthesis, so
+# on
+#
+#     [METAL] swap writeback deferred: 1 (refused: 5747 depth dirty, 0 no
+#     slot) (defer_swap on)
+#
+# it matched "refused: ..." and failed the alternation. ab_score.py's own
+# comment beside RECOMP_METAL_DEFER_SWAP asserted the VOID check could run.
+# It could not, and the defer_swap A/B was scored with the identical-arms
+# check silently skipped -- the same failure that was fixed for RECOMP_SYNC_HIST
+# earlier the same day and not generalised.
+#
+# Now: every `(token on)` or `(token OFF)` group anywhere on a [METAL] line.
+# `(refused: 5747 depth dirty, 0 no slot)` does not match, because a refusal
+# count is not a word followed by on/OFF.
+METAL_SWITCH_RE = re.compile(r"\((\w+ (?:on|OFF))\)")
 
 # WHICH TOKEN IN THAT HARVESTED STATE BELONGS TO WHICH SWITCH.
 #
@@ -281,9 +302,11 @@ def score(path, warmup, pad_path=None):
             m = SWITCH_BARE_RE.search(line)
             if m:
                 switches.add(m.group(1).strip())
-            m = METAL_SWITCH_RE.search(line)
-            if m:
-                switches.add(m.group(1).strip())
+            if line.startswith("  [METAL]") or line.lstrip().startswith("[METAL]"):
+                # findall, not search: one [METAL] line can carry more than one
+                # switch, and search would keep only the first.
+                for tok in METAL_SWITCH_RE.findall(line):
+                    switches.add(tok.strip())
             m = IDLE_RE.search(line)
             if m:
                 apu_counters["idle_trap"] = int(m.group(1))

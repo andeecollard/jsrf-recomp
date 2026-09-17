@@ -58,9 +58,9 @@ counter, and the counter comes first.
 
 ## The order
 
-1. **G3's A/B** — `RECOMP_METAL_DEFER_SWAP`, three trials per arm, and a
-   picture before any decision on the default. A1 and A2 are already built;
-   this is the step that was never taken.
+1. **G3's depth question** — why depth is dirty at nearly every swap, and
+   whether guest RAM ever needs it. The A/B is DONE and says A2 is inert: one
+   deferral per run against thousands of depth refusals. Do not re-run it.
 2. **The three near-free counters**, in one sitting — G14's `js` reachability,
    G10's thunk report, G11's `XC_AUDIO` probe. None changes runtime behaviour.
    **Not during the A/B, though.** They are all `src/` edits, and
@@ -129,7 +129,7 @@ unresolved, suspected `d3dcolor_to_float4` ARGB constant layout. Different
 symptom, same hardware. Their combiner alpha-channel bug is **not** ours;
 checked both backends (`nv2a_d3d11.c:174`, `nv2a_metal.m:647`).
 
-## G3 — The frame tail *(BUILT. What remains is an A/B and a default.)*
+## G3 — The frame tail *(BUILT and MEASURED. A2 is inert; the blocker is depth.)*
 
 **CORRECTED, 17 Sep night. A1 and A2 are already committed and tested.** Two
 earlier documents — this afternoon's plan and the 19:48 goals file — both say
@@ -159,20 +159,49 @@ early return: no drain, no read-back. It refuses rather than guesses — if the
 outgoing surface is in no slot, or if depth is dirty — and counts both
 refusals.
 
-**So the remaining work is a measurement, not a build:**
+### MEASURED 17 Sep night, and A2 is inert. The blocker is DEPTH.
 
-1. `ab_switch.sh` on `RECOMP_METAL_DEFER_SWAP`, three trials per arm, binary
-   pinned by sha256, scene-matched. The number that has to move is the frame
-   **median** against 16.68 ms, not the mean.
-2. **A picture.** It changes WHEN guest RAM becomes correct, and a guest CPU
-   read of the range that is not the flip is not intercepted. A frame-time win
-   with corrupted pixels is not a win, and this tree has shipped two switches
-   on test evidence without a look and backed both out.
-3. Then, and only then, a decision on the default.
+`ab_switch.sh`, three trials per arm, 240 s, binary pinned, ABBA:
 
-**Done when:** median frame under 16.68 ms in a mission with the switch on,
-verified with the `[d3d8_gl]` blit check, and the player has seen a clean
-frame.
+    =0   25.40  18.42  19.40 ms   (mean 21.07, n=3)
+    =1   39.67  20.47        ms   (mean 30.07, n=2; t1_defer1 excluded, scene=12)
+    THE RANGES OVERLAP -- 9.00 ms of difference inside the run-to-run spread.
+
+**The frame times say nothing because the switch does nothing.** Per run:
+
+    deferred: 1   refused: 5747 / 7295 / 12656 depth dirty,  0 no slot
+
+One deferral per run and thousands of refusals, all of them for depth.
+`nv2a_metal.m:3642` is `if(depth_dirty){++g_swap_defer_depth;}` — A2 refuses
+whenever depth is dirty, because `surface_slot_writeback` carries colour only.
+In a mission depth is dirty at essentially every swap, so the swap keeps paying
+its full drain and read-back. The A/B compared not-deferring with
+not-deferring.
+
+**So the question changes.** Not "does deferring help" — the path is live and
+the one deferral per run proves it. Ask instead:
+
+1. Why is depth dirty at nearly every swap in a mission?
+2. **Does guest RAM ever need that depth?** A slot's depth is retained on the
+   GPU for the rebind, and the refusal exists only because the writeback cannot
+   carry it. If nothing reads depth from guest RAM, the refusal is protecting a
+   value nobody consumes. `no slot` refusals are 0, so the other path is idle.
+3. If something does read it, can depth be written back on the same range-aware
+   terms A1 already established for colour?
+
+**Do not re-run this A/B first.** Six more runs would re-measure the same inert
+switch.
+
+**Done when:** that question is answered, and — only if a change makes the
+deferral actually fire — median frame under 16.68 ms in a mission, verified
+with the `[d3d8_gl]` blit check, with the player having seen a clean frame.
+A frame-time win with corrupted pixels is not a win.
+
+**One run to keep in view, not to act on:** `t1_defer1` stopped at scene=12
+with `flips=0`. One occurrence, excluded by the harness by design, and the
+other two `=1` runs reached scene 30. Boot safety is not measured here.
+
+Full account: `docs/jsrf/progress/PROGRESS_2026-09-17_NIGHT_THE_DEFER_SWAP_AB.md`.
 
 **Say the caveat before measuring:** `[SYNC]` p99 is 16.0 ms and `[NOSYNC]`
 p99 is 29.5 ms. This buys the **median**, not the hitches.
@@ -372,6 +401,7 @@ if their counters justify them.
 | **Upstream's contiguous-memory heap bug (PR #60) is live here** | **New, 17 Sep. Real upstream — POSIX `VirtualQuery` hardcodes `AllocationBase=NULL`, so `MmFreeContiguousMemory` always `free()`s an mmap'd pointer — and we have the identical code. But our bridge routes ordinals 165/171 to `xbox_ContiguousAlloc`/`xbox_HeapFree` (guest arena, canonicalised, instrumented). The broken pair is referenced only by the dead thunk table. Latent, not live.** |
 | **The discarded flip range is what makes the label flicker** | **New, 17 Sep. Retracted by A1's own commit (`2b5bdb2`) after the afternoon plan asserted it: every draw sets `surface_dirty` and every swap syncs before it rebinds, so guest RAM is already current for every surface and the range walk finds nothing to pay. A1 is infrastructure for A2, not a fix the player can see.** |
 | **Track A is unstarted and A1 must be built** | **New, 17 Sep night. Said by the afternoon plan AND by the 19:48 goals file, and false in both: A1 and A2 landed at 18:35 as `2b5bdb2` and `ff07677`, with three registered tests. Two documents agreeing does not outrank the commit log.** |
+| **Deferring the surface swap buys the median** | **New, 17 Sep night. Measured and not separated -- but the reason is that `RECOMP_METAL_DEFER_SWAP` deferred ONE swap per run and refused 5,747-12,656 on `depth_dirty`. The switch is inert in a mission, so the A/B compared not-deferring with not-deferring. `[NOSYNC] p50 = 8.0 ms` remains the upper bound; nothing has yet been built that reaches it.** |
 | **A `setcc` after BT/BTS/BTR/BTC tells you something about the lifter** | **New, 17 Sep. Those instructions define CF only; OF, SF, ZF, AF and PF are architecturally UNDEFINED (SDM Vol 2A). 9 of the fuzzer's first 24 "mismatches" were two models' choices of undefined. The generator no longer emits them.** |
 
 ## Rules for this phase
