@@ -81,11 +81,20 @@ acknowledging our traps and declining to submit voice work. So DirectSound
 believes it has nothing to submit, and the question is what our model told it
 that makes it believe that.
 
-**Next action, and the instrument already exists:** `RECOMP_APU_WRITE_TRACE=1`
-prints `[APU-WRITE] main= vp= gp= ep= other=`, which says WHICH registers the
-guest is still writing while the VP region is silent. Add it to the player's
-`paths.conf` for the next session. Thread-id plumbing on the method path is
-the follow-up if that is not enough, not the first move.
+**ANSWERED 17 Sep 2026** by `RECOMP_APU_WRITE_TRACE=1`:
+
+    [APU-WRITE] main=16997 vp=11762 gp=7 ep=8 other=0
+
+`main` climbs ~1,750 per window while `vp` is frozen and `gp`/`ep` are 7 and
+8. The guest services our traps through the main registers and submits no
+voice work. That kills the DSP-doorbell idea, and `vp == guest_methods`
+exactly confirms nothing is lost between the trap and the model.
+
+**Now armed for the next session:** `RECOMP_VOICE_LIFECYCLE=1`, which already
+existed and prints per event — on / idle / release / retire — the voice, its
+full `PAR_STATE`, its list link, `FECTL` and `FETFORCE1`, with a sequence
+number and audio-frame timestamp. Deduped per voice per on-cycle, so the storm
+cannot drown it. That is what answers G1b for v1 and v3.
 
 **Done when:** we know which APU register the guest's DirectSound is
 polling while it refuses to submit, and what our model is answering. The
@@ -93,7 +102,7 @@ third of the three worlds is now the one we are in — the guest is running and
 simply not calling — so the defect is a value our model presents, not a lost
 write and not a dead thread.
 
-## G1a — Make `RECOMP_APU_FEDEC_HOLD` the default *(player-confirmed fix)*
+## G1a — Make `RECOMP_APU_FEDEC_HOLD` the default *(DONE)*
 
 **The first player-confirmed fix of 17 Sep.** With the guard off the title
 crashed inside the guest's DirectSound ISR shortly after New Game, with a
@@ -113,9 +122,17 @@ and `apu_vp.c:1793` claimed "default on" until today while the accessor read
 `hold = e ? (atoi(e) != 0) : 0`. The report line had already been corrected;
 the comment had not, and the comment is what a reader reaches first.
 
-**Done when:** defaulted on in the tree, with a test that drives `held`
-non-zero and a second that shows it staying zero when the front end is not
-trapped. One player session is the confirmation; a second would make it two.
+**DONE 17 Sep 2026.** Defaulted on, with the empty-value-safe grammar
+`(e && *e) ? (atoi(e) != 0) : 1`. `jsrf_apu_fedec_hold_test` is registered
+twice — with and without the variable, because the accessor caches its getenv
+in a static — and asserts both halves: TRAPPED holds the pair and moves the
+counter, FREE_RUNNING writes it and does not. The off arm requires the pair to
+actually be clobbered, so it is a real negative control. Verified by injected
+fault: restoring the old default fails the default arm alone. 43 tests.
+
+**Still owed:** a second player session. One is a confirmation, not a
+measurement — and the crash it fixed is intermittent, so absence of a crash in
+one run is weaker evidence than `held=1702` is.
 
 ## G1b — Why do v1 and v3 never clear the idle condition?
 
