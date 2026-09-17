@@ -233,9 +233,19 @@ fallback list for 27 slots, then reads past its 147 initialisers and logs
 
 Cost is entirely diagnostic — nothing reads the table outside
 `kernel_thunks.c`, the unresolved handler has been called **0** times, and the
-bridge implements three of the four. **Done when** the line reads
-`116/120 resolved, 4 unresolved` and names them, with a test that a short
-table does not borrow the fallback.
+bridge implements three of the four.
+
+**DONE 17 Sep 22:30.** The loop picks its source once instead of per slot and
+stops when the mapped table is exhausted:
+
+    Thunk table: 116/120 resolved, 4 unresolved (from the mapped XBE)
+    WARN  4 kernel import(s) unresolved: ordinal 204, 232, 144, 91. The bridge
+          may still implement them -- this table is only reached if the guest
+          calls through the XBE's thunks.
+
+Exactly the predicted arithmetic. The 231 `Unresolved kernel ordinal 0` lines
+are gone and so is the false "game may crash!". **Still owed:** a test that a
+short mapped table does not borrow the fallback list.
 
 **A second reason to do it:** that dead table is the *only* referent keeping
 `kernel_memory.c`'s contiguous-memory functions alive, and those contain the
@@ -259,11 +269,29 @@ it decides anything.
 **Still gated, and the gate is the point.** It is not established that JSRF
 reads 0x09 at all — the log line is `XBOX_LOG_DEBUG` and player runs are INFO.
 
-**Step 1:** promote the line or add a counter. **Step 2, only if step 1 reads
-nonzero, and then only with a player listen:** flip to `0x00000000` with a test.
+### STEP 1 IS DONE, 17 Sep 22:30, AND THE TITLE DOES ASK.
 
-**Done when:** we know whether the title asks how many speakers it has, and
-what we answer. **Refutable in one run.**
+A 70 s scripted run, with a new one-line-per-index `[EEPROM]` probe at INFO:
+
+    [EEPROM] index 0x011 queried (first time), len=4, answered 0x00000000
+    [EEPROM] index 0x00A queried (first time), len=4, answered 0x00000000
+    [EEPROM] index 0x103 queried (first time), len=4, answered 0x00000000
+    [EEPROM] index 0x008 queried (first time), len=4, answered 0x00080000
+    [EEPROM] index 0x009 queried (first time), len=4, answered 0x00010001
+             <- XC_AUDIO: 0=stereo 1=mono 2=surround, bit16=AC3
+
+**JSRF reads `XC_AUDIO` at start-up, before any voice is submitted, and we
+answer mono-with-AC3.** Step 1 was written as the measurement that could kill
+this hypothesis in one run. It did not kill it.
+
+Also caught: index **0x103** (`XC_FACTORY_AV_REGION`) is queried and falls
+through to the `default:` arm, which returns `STATUS_SUCCESS` with a zeroed
+value. A second unhandled start-up answer nobody had looked at.
+
+**Step 2, unblocked and still gated on a listen:** flip to `0x00000000` with a
+`tests/` case, ship it, and ask. Not on the strength of the encoding alone.
+
+**Done when:** the player has listened to a build that answers stereo PCM.
 
 ## G12 — `MmGetPhysicalAddress` returns a virtual address *(count first)*
 
