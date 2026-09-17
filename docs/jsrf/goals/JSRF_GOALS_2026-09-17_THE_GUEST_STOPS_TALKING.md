@@ -221,6 +221,40 @@ The code and its test stay — they are correct for the state they describe and
 cost nothing off — but the switch is **off in the player's config** and should
 not be re-armed without a session that shows `encounters` moving.
 
+### THE TRIGGER IS A BURST OF VOICE STARTS, AND THE PLAYER FOUND IT
+
+Player, 17 Sep: *"the sound breaks up when you speak to gum"*. That is a
+reproducible trigger, and the log agrees with it exactly — per window, from the
+12:27 session:
+
+    w3   on+1    idle_trap+0        quiet
+    w4   on+7    idle_trap+6        voices start (the dialogue)
+    w5   on+0    idle_trap+1
+    w6   on+7    idle_trap+118      second burst, storm ramping
+    w7   on+5    idle_trap+358      storm at full rate
+    w8   on+1    idle_trap+368
+    w9   on+0    idle_trap+369      no new voices; storm continues for ever
+
+**A burst of VOICE_ON triggers the storm, and the storm outlives the burst.**
+Speaking to Gum starts several speech voices in quick succession; each is used
+and retired; the retired ones stay linked; each then contributes a permanent
+raise per subframe. The ramp 6 -> 118 -> 358 is voices accumulating in the
+list, and the plateau at ~366 is the steady state with them stuck there.
+
+This is why the bug resisted all day: every theory was formed by staring at
+the steady state, where `on+0` and nothing is happening. **The cause is in a
+four-window burst near the start, and the steady state is only its residue.**
+
+**Next measurement, and it is about the burst, not the plateau:** the trap
+carries ONE handle in FEDECPARAM, and the code says so at the raise -- "raising
+again cannot mean anything to hardware: it would overwrite FEDECPARAM, the
+handle the guest has not read". So when several voices retire inside one burst,
+ask how many distinct handles were ever actually DELIVERED to the guest against
+how many went idle. If the answer is "one per burst", the others were never
+named and the guest cannot remove what it was never told about.
+
+That is a counter, not a theory, and it is the next thing to build.
+
 **Done when:** we know why the guest acknowledges a removal request and does
 not perform the removal.
 
