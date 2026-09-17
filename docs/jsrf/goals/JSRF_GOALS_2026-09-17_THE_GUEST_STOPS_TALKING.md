@@ -228,10 +228,11 @@ Measured 17 Sep from the player's own dumps: the watched region
 index** across 39 `watch*.bmp` dumps, with exactly **two** distinct images,
 each byte-identical within its parity.
 
-That is double-buffer rotation, not corruption. The label never changed during
-the whole session; the trap compares frame N against frame N-1, the two
-rotating surfaces differ in that region, so it fires **every frame** and
-catches nothing. The previous handover's premise — "the label changed exactly
+**Rendered and looked at, not inferred:** the odd-frame image is the speaker's
+name label reading `Gum`; the even-frame image is **solid black**. So the
+label is present in one rotating surface and absent in the other, the trap
+compares frame N against frame N-1, and it fires **every frame** while
+catching nothing. The previous handover's premise — "the label changed exactly
 once, on the corrupt frame" — does not hold in the player's build.
 
 It is the tenth instrument this tree has retired for lying, and it explains
@@ -242,6 +243,24 @@ constantly on noise, so a real change was indistinguishable from the rotation.
 comparison on the surface address rather than the frame counter. Until then a
 `watch*.bmp` dump is evidence of nothing, and the player's screenshots remain
 the only real evidence we have.
+
+### A HYPOTHESIS THIS RAISES, flagged as a hypothesis
+
+The player sees the label on screen with **no flicker**. If one of the two
+surfaces genuinely lacked the label, it would flicker at 30 Hz and they would
+have said so. So the more likely reading is that the **dump** is reading a
+surface guest RAM has not received yet — not that the title failed to draw it.
+
+That is the same class of thing G3 is about: `nv2a_gpu_sync_range` throws its
+range away on Metal, so the only surface written back is the BOUND one, and
+the superseded G3 plan already notes the live surface is never the one being
+flipped. A dump that alternates blank/present is exactly what reading an
+un-written-back surface every other frame would look like.
+
+**Not established.** The discriminating test is cheap: dump the same frame
+twice, once before and once after a forced full writeback, and see whether the
+blank half fills in. If it does, the frame dumper has been lying for as long
+as it has existed, and every `[FB]` comparison taken through it is suspect.
 
 **Done when:** the player sees clean text across a session, and a scripted
 pixel diff of a text frame between CPU and GPU arms is empty. The 168 + 58
