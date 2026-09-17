@@ -1790,7 +1790,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     unsigned int slot;
 
     g_apu_fe_method_count++;
-    /* DO NOT CLOBBER AN UNREAD DECODE PAIR. RECOMP_APU_FEDEC_HOLD, default on.
+    /* DO NOT CLOBBER AN UNREAD DECODE PAIR. RECOMP_APU_FEDEC_HOLD, default
+     * OFF -- this comment said "default on" until 17 Sep 2026 and was wrong.
+     * The accessor below is `hold = e ? (atoi(e) != 0) : 0`. The report line
+     * had already been corrected to print "OFF (default)"; this one had not,
+     * so the two disagreed and this is the one a reader reaches first.
+     *
+     * IT IS NOT A THEORETICAL WINDOW. On 17 Sep 2026 the title crashed inside
+     * the guest's DirectSound ISR shortly after New Game, with 62 of 2,555
+     * guest methods dispatched while the front end was TRAPPED and the guard
+     * off. The crash dump's own line says it: "The guest ISR dereferences its
+     * own object for the handle it is handed".
      *
      * The window this closes is measured, not argued. fe_method writes
      * FEDECMETH and FEDECPARAM for EVERY method, guest methods reach it on a

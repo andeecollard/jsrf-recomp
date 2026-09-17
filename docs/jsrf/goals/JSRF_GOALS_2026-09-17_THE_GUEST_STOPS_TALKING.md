@@ -93,6 +93,70 @@ third of the three worlds is now the one we are in — the guest is running and
 simply not calling — so the defect is a value our model presents, not a lost
 write and not a dead thread.
 
+## G1a — Make `RECOMP_APU_FEDEC_HOLD` the default *(player-confirmed fix)*
+
+**The first player-confirmed fix of 17 Sep.** With the guard off the title
+crashed inside the guest's DirectSound ISR shortly after New Game, with a
+guest stack ending in `001A25D9` and 62 of 2,555 guest methods dispatched
+while the front end was TRAPPED. With `RECOMP_APU_FEDEC_HOLD=1` the next
+session ran to completion: `held=1702` of 1,702 such methods, **no crash**.
+
+The guard holds the FEDECMETH/FEDECPARAM pair still while the front end is
+trapped, which is what the hardware does — a trapped front end has stopped
+decoding. Without it a guest method landing between the ISR's two MMIO loads
+hands it our `0x8000` with somebody else's argument; `SET_ANTECEDENT_VOICE`'s
+argument is a voice handle, so it passes the ISR's `h >= 0x100` guard and is
+dereferenced.
+
+It has been **off by default since it was written and never once exercised**,
+and `apu_vp.c:1793` claimed "default on" until today while the accessor read
+`hold = e ? (atoi(e) != 0) : 0`. The report line had already been corrected;
+the comment had not, and the comment is what a reader reaches first.
+
+**Done when:** defaulted on in the tree, with a test that drives `held`
+non-zero and a second that shows it staying zero when the front end is not
+trapped. One player session is the confirmation; a second would make it two.
+
+## G1b — Why do v1 and v3 never clear the idle condition?
+
+The trap storm is **two voices and nothing else**: v1=1,783 raises, v3=1,730,
+every other voice ≤2, alternating `1 3 1 3 1 3` forever. The guest services
+each raise — `[APU-WRITE] main` climbs ~1,750 per window against ~360 raises,
+about five register touches per raise — and the condition never clears.
+
+**NOT a voice-list cycle.** `[APU-CYCLE] walks_with_a_cycle=0` and
+`[APU-WALKCAP] hit=0`. The detector marks each visited voice in a per-walk
+bitmap and never saw a revisit, so no walk ever met a ring.
+
+*How that hypothesis died, recorded because the mistake is reusable:* the
+idle-trap detail lines aggregate to `3D:v3[]<-v1` 71 times and `3D:v1[]<-v3`
+8 times, which reads like a mutual link. Those are separate raises at
+different moments, and the links simply changed over time. Aggregating a
+per-event field across a whole run and reading it as simultaneous state is the
+same class of error as comparing across scenes.
+
+**Done when:** we know what about v1 and v3 reads as inactive-and-linked
+forever. Their trap flags are consistently `[]` — not `L` (locked), not `N`
+(never VOICE_ON), not `P` (ISR returns early), not `R` (repeat) — which is
+itself a clue, since every documented reason for a persistent raise has a
+flag and none of them is set.
+
+## G1c — The music decays, it does not cut out
+
+The player's words were "the in game music slow and then stops", and
+`[APU-BIN] 2D heard` says the same thing per window:
+
+    +15008  +14992  +14476  +13896  +13610  +8736  0  0  0 ...
+
+A progressive decay over roughly thirty seconds, then silence. **It is not the
+APU falling behind:** `[APU-FRAME]` is steady across the same windows at
+~7,500 frames per window, `se` 91–95%, `trapped` flat at 32–36%. So the mixer
+is getting its frames and producing less and less 2D audio from them.
+
+**Done when:** we know what declines. A decay rules out an abrupt voice kill
+and points at starvation — fewer 2D voices contributing per frame, or one
+voice being fed less. The per-voice breakdown is what separates those.
+
 ## G2 — The glyph index error, inside a font batch
 
 Caught on camera at last: `"Let's see how much air $ou can grab"` — `y`
@@ -180,6 +244,8 @@ already printed.
 | **The music death is dropped idle-trap interrupts (G7's pending flag)** | **`[IRQ-VEC]` shows v1, v3, v5, v6 all delivering steadily PAST the death. The ISRs are running.** |
 | **`g_vector_in_service` leaked, so the APU vector defers forever** | **Same evidence. Nothing is stuck in service.** |
 | **Trapping the front end idles the sound engine** | **`[APU-FRAME] trapped_skipped=0`, and `se = total − halted` exactly. `RECOMP_APU_SE_WHILE_TRAPPED` would not have helped.** |
+| **The v1/v3 idle-trap storm is a two-voice list cycle** | `[APU-CYCLE] walks_with_a_cycle=0`, `[APU-WALKCAP] hit=0`. The "cycle" was `v3<-v1` and `v1<-v3` aggregated across a whole run — separate raises at different moments, not simultaneous state. |
+| **The music "slowing" is the APU falling behind** | `[APU-FRAME]` steady at ~7,500 frames/window, se 91–95%, trapped flat 32–36%, across the exact windows where `2D heard` decayed from +15,008 to 0. |
 | **The idle trap triggers the guest freeze** | **The trap ran from report 19 at ~360/report with the guest issuing ~500 methods/report alongside it. It froze at report 26.** |
 
 ## Rules for this phase
