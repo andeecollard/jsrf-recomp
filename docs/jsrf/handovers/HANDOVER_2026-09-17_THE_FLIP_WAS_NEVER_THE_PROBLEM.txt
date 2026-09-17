@@ -1,0 +1,230 @@
+HANDOVER 2026-09-17 -- THREE PLAYER-VISIBLE FIXES, ONE GLYPH DEFECT STILL
+LOOSE, AND THE SPEED PLAN AIMED AT THE WRONG THING FOR A WEEK
+
+Read CLAUDE.md, then docs/jsrf/goals/JSRF_GOALS_2026-09-16_NIGHT_THE_DEFECT_LIST.md
+(the active goal list). READ ITS "REFUTED" TABLE BEFORE FORMING A THEORY:
+eight plausible ideas died in the last day, each cost a run or an evening, and
+every one is re-derivable from the code in minutes.
+
+Everything below is committed and pushed to origin/main (13 commits,
+4c9eea8..a0a9229). Working tree clean, 40 tests passing.
+
+
+=============================================================================
+0. IF YOU DO ONE THING
+=============================================================================
+
+The player's bundle at ~/jsrf-build/JSRF.app was rebuilt 17 Sep 08:41 from the
+current tree. They have not played it yet. Two questions can only be answered
+by them playing:
+
+  1. Does the music still die?  [APU-POOL] now prints on_2d, which counts the
+     guest ASKING for a music voice. on_2d climbing while [APU-BIN] 2D heard
+     is frozen = OUR defect. Both frozen = the game played no music and there
+     is nothing to fix. Nothing in a log could separate those before.
+  2. Does the tutorial text still glitch?  The label trap is armed and writes
+     any candidate frame to ~/Library/Application Support/JSRF/glyphdump/.
+
+COPY ~/Library/Application Support/JSRF/last-run.log BEFORE THEY RELAUNCH. It
+is overwritten on every launch and it has already cost one investigation.
+
+
+=============================================================================
+1. FIXED AND PLAYER-CONFIRMED
+=============================================================================
+
+FENCES. RECOMP_VSH_DP_ZERO is now the default: DP3/DP4 carry the NV2A's
+multiply-by-zero rule, so RSQ(0)=+inf through a dot product stops becoming a
+NaN texcoord. Confirmed by the player on their own build, and by a scripted
+run whose log read "vsh_dp_zero OFF" while the fences vanished in its window.
+
+SOUND EFFECTS. The DSP summed mixbins[0] and [1] and discarded the other
+thirty; the guest routes its 3D voices -- the effects -- to bins 6-10. Every
+effect the title plays was generated correctly and thrown away.
+RECOMP_APU_MIXDOWN_ALL, default on. Player: "sound fx working".
+
+EVERYTHING ON THE GPU. RECOMP_METAL_FF is on in the player's config. Two
+divergences between the CPU and GPU fixed-function paths were found and
+closed: the GPU path skipped the CPU path's clip-w batch refusal, and the CPU
+reference was compiling with fused multiply-add while the shader was not, so
+the diff test's "residual 0" was not the bit-exactness its comment claimed.
+
+
+=============================================================================
+2. FIXED BUT NOT YET CONFIRMED BY A PLAYER
+=============================================================================
+
+THE MUSIC. The idle-voice trap had no setting that worked. Level-triggered it
+tells the guest about an inactive-and-linked voice 1500 times a second and the
+music breaks up. Pure edge it tells it once, and a raise landing while the
+DirectSound ISR takes one of its three early returns is never followed by
+another -- the voice is never reclaimed, the free list empties, and new sounds
+STEAL playing ones. That is the player's own log: effects cut off, then the
+music died twenty seconds in, off == off_commands == 94.
+
+RECOMP_APU_IDLE_TRAP_REARM_MS (default 16) keeps the edge latch and raises
+again if the voice is still inactive-and-linked one guest tick later.
+
+    level        trapped 53%    raises 11731   2D heard 134358
+    pure edge    trapped 0.6%   MUSIC DEAD in the player's session
+    edge+reraise trapped 3.6%   raises 1467    2D heard 203741
+
+A LATER PLAYER SESSION STILL FROZE 2D heard, with the re-raise working
+(reraise=6219, no theft). That is why on_2d exists -- see section 0. Do not
+assume it is broken until that counter says so.
+
+THE ADPCM GUARD IS NOW THE DEFAULT. A refused block left an UNINITIALISED
+automatic array for the caller to read, so 27,801 failures a run handed the
+mixer stack memory at full scale. The guard makes that silence. THE CAUSE IS
+STILL OPEN (section 4).
+
+
+=============================================================================
+3. THE CORRECTION THAT MATTERS MOST: THE FLIP WAS NEVER THE PROBLEM
+=============================================================================
+
+Every speed plan in this tree aimed at the flip sync -- "4.06-6.91 ms per
+frame, one call per frame, ~70% of all sync cost" -- with a staged presenter
+redesign behind it. Per-caller counters were added to nv2a_metal_sync because
+the report printed ONE TOTAL for every caller. Measured, 130 s gameplay:
+
+    [METAL] sync callers: 15857 surface swap, 0 invalidate, 0 frame end,
+                          7950 external (of 23807 calls, 7938 already clean)
+    [METAL] sync 23807 calls: 51266 ms draining, 12294 ms reading back
+    [METAL] surface cache: 15857 swaps = 15852 rebinds + 5 rebuilds (100% hit)
+    [FRAME] flips=7936 mean=16.38 ms  p50=18.0
+
+    already clean 7938  ~= the flip count
+    drained      15869  ~= the swap count
+    -> 7.9 ms per frame in sync, 48% OF THE FRAME
+
+THE FLIP'S SYNC IS ALREADY CLEAN BY THE TIME IT RUNS, because the surface swap
+just before it drained. IT COSTS NOTHING. The staged presenter redesign would
+have bought approximately nothing. DO NOT START IT.
+
+THE COST IS THE SURFACE SWAP: two per frame, and 15,852 of 15,857 are REBINDS
+at a 100% cache hit rate -- both surfaces already resident on the GPU. The
+drain and readback exist to write the outgoing surface back to guest RAM,
+whose pixels are sitting safely in its slot. The only reason to write guest
+RAM is for something that reads guest RAM.
+
+AND THE MACHINERY TO AVOID IT IS ALREADY HERE, used only for clears. A slot
+carries `owes_guest_ram`, deferring the writeback until eviction; a cache hit
+inherits the debt (nv2a_metal.m:3512), a drop pays it (line 411). That path
+ran ZERO times in a whole run while the expensive one ran 15,857 times.
+
+THE WORK, IN ORDER:
+  1. A per-frame sync HISTOGRAM. Removing a stall moves the median only if the
+     stall is on the median frame, and p50=18.0 ms against a 16.68 ms budget
+     is the number that has to move.
+  2. Extend `owes_guest_ram` from clears to rendered content, so a rebind
+     between two resident surfaces stops draining. The flip and any guest read
+     of the range force the writeback.
+  3. Verify with the [d3d8_gl] blit line, which now works (section 5).
+
+NOT ATTEMPTED HERE because it changes WHEN guest RAM becomes correct. Start it
+at the top of a session, not the end of one.
+
+
+=============================================================================
+4. STILL OPEN
+=============================================================================
+
+THE TUTORIAL TEXT GLYPHS. Two glyph quads render at another batch's position,
+once in 24 captures, GPU fixed-function path only. FOUR HYPOTHESES ARE DEAD BY
+MEASUREMENT: overlapping ring reservations from a second thread (0 draws from
+another thread -- the single-thread assumption four subsystems rest on is now
+VERIFIED rather than asserted); stale or changing vertex data (0 changes
+across every font batch); texture-cache eviction under a live command buffer
+(command buffers retain their references); and q<=0 texcoords drawn where the
+CPU drops them (0 in 445,498 batches, with a TEST proving that counter can
+fire). It did not recur in twelve scripted runs, ~40 minutes of tutorial.
+The player has seen it twice, so their sessions are the better trap and it is
+armed. ONE UNTESTED IDEA, recorded so it is not lost: a text overlay is one
+batch of many quads, and an index error INSIDE a batch would draw one glyph's
+quad with another glyph's vertices -- which is exactly what it looks like.
+
+THE ADPCM CAUSE. first=0 in every sample: block 0 of a buffer NEVER fails,
+middle blocks fail 26,314 times. The failing "header" is sample data
+(08080808), so we are reading the wrong bytes, not corrupt ones. The page
+probe says failures cluster in the LAST ~5% of a buffer (v0 fails from block
+208 of 219) -- the shape of reading past what the guest wrote, NOT of a broken
+translation (the returned page address is properly 4 KB-aligned, and 208 and
+275 are not multiples of the 113 blocks that fit in a page).
+
+TWO REAL DEFECTS FOUND AND NOT FIXED, both in docs/jsrf/handovers/
+HANDOVER_2026-09-16_BUG_HUNT_2_THE_PAGE_TABLE_NOBODY_CHECKS.txt:
+  - get_data_ptr takes a bounds parameter and ALL THREE call sites pass
+    0xFFFFFFFF, so the assert is dead code and an out-of-range page-table read
+    silently returns a translation built from whatever dword sits there. Count
+    it before enforcing it: an assert that starts firing in a player's build
+    is a crash.
+  - The PCM path translates once per sample then walks channels on the
+    translated PHYSICAL address, so a stereo sample straddling a 4 KB boundary
+    reads its second channel from whatever page physically follows. Latent --
+    the failing voices are mono. The ADPCM path re-translates per dword, which
+    is the intended discipline.
+
+AND ONE PERFORMANCE FINDING: every texture-cache HIT is confirmed with a full
+memcmp of the whole texture -- half a million whole-texture comparisons a run,
+on the thread the guest waits on. The comparison is what makes the cache safe,
+so it cannot simply be deleted.
+
+
+=============================================================================
+5. THE INSTRUMENTS, WHICH IS WHERE THE DAY'S REAL LESSON IS
+=============================================================================
+
+NINE INSTRUMENTS IN THIS TREE HAVE BEEN RETIRED FOR LYING, AND I ADDED THREE
+MORE TO THAT LIST IN ONE EVENING:
+
+  - [APU-BIN] decided "audible" by hard-coding bins 0 and 1, so the first run
+    after the mixdown widening read "3D heard=0 lost=343968" with the effects
+    plainly playing.
+  - The switch auditor's own first version looked only as far as the first
+    semicolon after a getenv, found zero default-on switches, and reported
+    "0 problems" -- passing by checking nothing.
+  - The vblank retry printed "5862 retries delivered" beside a delivered=
+    that had not moved, because g_vblank_delivered was incremented at one call
+    site only. Fixing THAT counter is what refuted the hypothesis behind it.
+
+The last one is the lesson. I had a number that did not fit and my first move
+was to find a reason the NUMBER was wrong rather than a reason the HYPOTHESIS
+was. The counter was wrong. So was the idea.
+
+SO THE RULES ARE NOW TESTS, not comments:
+  - jsrf_switch_audit checks three rules over all 152 switches. It found NINE
+    real sites where a default-on switch treated an EMPTY value as off --
+    METAL_HW, METAL_VSH, METAL_565, METAL_BATCH, SURFACE_CACHE among them --
+    which is the cause of a workaround frame_bisect.sh already carried a
+    paragraph about. It also ratchets: a NEW hand-rolled switch fails the test.
+  - jsrf_ff_refusal, jsrf_adpcm_decode and jsrf_apu_idle_trap_edge each drive
+    a counter into the state it detects AND into the healthy one, because a
+    counter that fires on everything is as useless as one that never fires.
+    All three were verified BY INJECTED FAULT.
+  - ab_score.py now VOIDS one run per arm. A single pair read 59.4 fps against
+    62.4 and was nearly written up as a 5% win; the next pair's OFF arm read
+    63.2. Six switches A/B'd that day were also missing from SWITCH_TOKEN,
+    which silently SKIPS the identical-arms check.
+  - play_scripted.sh prints its switch set and diffs it against the player's
+    paths.conf in both directions, so the harness can no longer be different
+    software from the player's build in silence.
+  - The [d3d8_gl] blit check computes the expected bilinear blend instead of
+    comparing one texel against a scaled drawable. 17 of 18 checks exact, 1 at
+    +1 LSB, 0 mismatches. It had decayed to "should be close" and it is the
+    instrument G3 is verified with.
+
+
+=============================================================================
+6. RANKED
+=============================================================================
+
+ 1. The player plays. Section 0. Two open questions, both cheap to answer.
+ 2. G3: sync histogram, then `owes_guest_ram` for rendered content. 48% of
+    the frame. Section 3.
+ 3. The ADPCM cause. The guard makes it silent, not correct. Section 4.
+ 4. The glyph defect, via the player's trap rather than more scripted runs.
+ 5. G10's remaining instrument: [APU-POOL] has no test that forces it to fire.
+ 6. G9: 128 switches still hand-roll their grammar. Ratcheted, migrate at
+    leisure.
+ 7. The page-table bound and the stereo page straddle. Section 4.
