@@ -320,6 +320,53 @@ the nearest-even argument and the question is closed for good. If it fires,
 `recomp_fist` is the shape of the answer — at our widths and with our
 indefinites, not upstream's.
 
+## G14 — The SF condition is signed-overflow UB *(new, LIVE in the player's build)*
+
+`js`/`sets`/`cmovs` after a `cmp` emit
+`if (((int32_t)((_fas) - (_fbs)) < 0))`. Signed overflow is UB, so from `-O1`
+the compiler folds it to `_fas < _fbs`, which is a different function whenever
+the subtraction overflows. x86's SF is bit 31 of the **wrapped** result.
+
+Measured on the exact expression with `0x80000000` and `1`, where x86 gives
+SF=0: `-O0` answers 0, `-O1` and `-O2` answer 1. `build-feav` is
+`JSRF_OPT_LEVEL=-O2`, so the player's build takes the wrong branch.
+
+**Five sites in the generated image**, three distinct, all `js`:
+`sub_000A9830`, `sub_00192830`, `sub_000A9851`.
+
+`jl`/`jge`/`jle`/`jg` are NOT affected — SF≠OF is mathematically signed
+less-than, so `_fas < _fbs` is right for those. Only `s`, `ns`, `o`, `no`.
+
+**It also poisons A/Bs:** the defect is optimisation-level dependent, so any
+comparison of an `-O0` tree against an `-O2` tree compared two semantics.
+
+**Done when:** SF is the sign bit of the wrapped result, a regression test pins
+the `0x80000000 / 1` vector at `-O2`, **and the three `js` sites have been
+counted at runtime** — the code is wrong, the reachability is not yet measured.
+
+## G15 — `bts`/`btr`/`btc` report CF after their own write *(new, latent here)*
+
+CF is reconstructed at the consumer by re-reading the bit (`lifter.py:872`),
+but the instruction has already modified it, so CF is always 1 after `bts` and
+0 after `btr`. The test-and-set idiom reading its own answer. Plain `bt` is
+fine. **Zero occurrences in JSRF** — upstream's to have.
+
+**Done when:** the pre-state is snapshotted at the instruction.
+
+## G16 — Narrow rotates rotate at 32 bits *(new, latent here)*
+
+`SET_LO8(eax, ROR32(LO8(eax), 2))` rotates a zero-extended byte inside a 32-bit
+word, so the wrap-around bits are discarded; and the count is not reduced
+modulo the operand width. Same defect class as the `sar` width bug this tree
+already fixed and contributed as PR #57 — the rotates were missed then.
+**Zero narrow rotates in JSRF** — upstream's to have.
+
+**Done when:** `ROL8/ROR8/ROL16/ROR16` exist with the count taken mod width.
+
+*All three found by `tools/conformance/fuzz_unicorn.py`; the evidence, the
+oracle's limits and the adjudication are in
+`docs/jsrf/progress/PROGRESS_2026-09-17_NIGHT_THE_LIFTER_FUZZ.md`.*
+
 ## Carried forward, unchanged and untouched
 
 - **G6** the ADPCM cause (the guard makes it silent, not correct)
