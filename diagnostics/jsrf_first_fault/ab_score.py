@@ -150,6 +150,10 @@ SWITCH_TOKEN = {
     "RECOMP_METAL_VSH":            "metal_vsh",
     "RECOMP_APU_ADPCM_GUARD":      "adpcm_guard",
     "RECOMP_APU_LIST_MOVE_TO_FRONT": "move_to_front",
+    # Added 17 Sep 2026, along with the unconditional token that makes it
+    # work: nv2a_pb_exec.c prints "sync_hist on|OFF" on every report whether
+    # or not the histogram has samples, so the off arm has something to match.
+    "RECOMP_SYNC_HIST":            "sync_hist",
 }
 
 

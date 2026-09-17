@@ -300,8 +300,34 @@ But it is **one run per arm**, which `ab_score.py` voids, and the code is two
 counter reads and arithmetic with no lock, allocation or Metal call. Shipped
 **off** for that reason.
 
-**Done when:** two runs per arm settle it. If it is a pre-existing
-intermittent hang, that is a bigger finding than the instrument.
+**MEASURED 17 Sep: THE HALT DID NOT REPRODUCE.** `ab_switch.sh synchist
+RECOMP_SYNC_HIST 3 240`, binary pinned by sha256, three trials per arm:
+
+    RECOMP_SYNC_HIST=0   frame 20.77  29.74  53.94 ms   crashes 0
+    RECOMP_SYNC_HIST=1   frame 29.35  49.13  34.74 ms   crashes 0
+
+All six reached a mission (scene=30). **Every run prints its final flip count
+once** — the eight-times repetition that defined the halt appears in none of
+them. Running tally: **1 halt in 4 runs with the instrument on, 0 in 4 with it
+off.** That is not causation, and three clean runs with it on substantially
+weaken the morning's reading.
+
+The arms ARE distinct, verified by hand: 0 `[SYNC] frames=` lines in every
+off run, 22 in every on run. The scorer could not verify it itself — see
+below — and the frame-time comparison is void anyway, the ranges overlapping
+completely (20.77–53.94 against 29.35–49.13).
+
+**Still OFF by default.** An unexplained halt seen once is not exonerated by
+three clean runs; it is merely not reproduced. Turning it on needs either an
+explanation or a much larger n, and neither is worth buying yet.
+
+**A harness bug this exposed, now fixed.** `ab_score.py` reported "arms NOT
+verified distinct: no report names RECOMP_SYNC_HIST". A switch whose token
+only prints when it is ON gives the off arm nothing to match,
+`switch_state_for` returns None, and the identical-arms VOID check is silently
+SKIPPED — the same failure that scored six switches on 16 Sep.
+`nv2a_pb_exec.c` now prints `sync_hist on|OFF` on every report regardless, and
+`RECOMP_SYNC_HIST` is registered in `SWITCH_TOKEN`.
 
 ## G5 — Delete or re-word `[APU-POOL] on_2d`
 

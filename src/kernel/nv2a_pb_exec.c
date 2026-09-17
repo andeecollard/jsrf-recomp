@@ -2152,6 +2152,14 @@ static void cost_hist_line(const char *tag, const FrameHist *h)
  * histogram of nothing prints p50=0.0 and that reads like "sync is free". */
 static void sync_stats_line(void)
 {
+    /* UNCONDITIONAL, AND THAT IS THE POINT. ab_score.py's identical-arms check
+     * looks for this switch's token in the harvested state of BOTH arms; a
+     * token that only appears when the switch is ON leaves the off arm with
+     * nothing to match, switch_state_for returns None, and the VOID check is
+     * silently SKIPPED. That is exactly how six switches were scored on
+     * 16 Sep, and how the RECOMP_SYNC_HIST A/B on 17 Sep had to have its arms
+     * verified by hand afterwards. */
+    fprintf(stderr, "  [SYNC] sync_hist %s\n", sync_hist_on() ? "on" : "OFF");
     if (!s_sync.sync_run.n) return;
     cost_hist_line("SYNC", &s_sync.sync_run);
     cost_hist_line("NOSYNC", &s_sync.nosync_run);
