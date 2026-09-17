@@ -1,5 +1,10 @@
 # JSRF goals — finish Track A first, 17 September 2026, night
 
+> Superseded, 17 September 2026 (night, 2). The active list is
+> `JSRF_GOALS_2026-09-17_NIGHT2_TRACK_A_AND_A_COMPILER_THAT_LIES.md`, which
+> keeps the same target and the same G-numbers and adds G14-G16, the upstream
+> debt and three new refutations.
+
 Supersedes `JSRF_GOALS_2026-09-17_THE_GUEST_STOPS_TALKING.md`, which holds the
 full evidence for G1–G5 and should be read for any of it. **The target is
 unchanged** and is still the player's own words:
