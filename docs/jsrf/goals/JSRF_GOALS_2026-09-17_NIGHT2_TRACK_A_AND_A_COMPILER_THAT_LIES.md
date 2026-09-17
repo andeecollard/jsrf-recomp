@@ -24,7 +24,8 @@ same-level comparisons, which is most of them, but it is a confounder nobody
 was controlling for and it goes at the top of the rules.
 
 **The ecosystem was surveyed for the first time.** Four things we owe upstream,
-two things worth taking from them, one dead end closed for good (see *R*).
+two things worth taking from them, and four dead ends closed in *R* — one of
+which is this list's own previous entry for G3.
 
 ## Where we actually are
 
@@ -57,15 +58,17 @@ counter, and the counter comes first.
 
 ## The order
 
-1. **G3 / Track A1** — `nv2a_metal_sync_range`. First, uninterrupted.
-2. **G3 / Track A2** — `owes_guest_ram` for rendered content. Gated on A1.
-3. **The three near-free counters**, in one sitting: G14's `js` reachability,
-   G10's thunk report, G11's `XC_AUDIO` probe. None changes runtime behaviour.
-4. **The upstream debt** — four items now, ranked at *What we owe upstream*.
-5. **G14's fix**, gated on its counter. Expensive: it changes generated code
+1. **G3's A/B** — `RECOMP_METAL_DEFER_SWAP`, three trials per arm, and a
+   picture before any decision on the default. A1 and A2 are already built;
+   this is the step that was never taken.
+2. **The three near-free counters**, in one sitting while the A/B runs occupy
+   the machine: G14's `js` reachability, G10's thunk report, G11's `XC_AUDIO`
+   probe. None changes runtime behaviour, so none can confound a run.
+3. **The upstream debt** — four items, ranked at *What we owe upstream*.
+4. **G14's fix**, gated on its counter. Expensive: it changes generated code
    for every `js` in the image, so it needs a regenerated gen and a re-verified
    baseline.
-6. **G1**, by measurement only — never by another mechanism.
+5. **G1**, by measurement only — never by another mechanism.
 
 G2 and G4 stay parked, with reasons at their entries.
 
@@ -108,8 +111,10 @@ wider than the tutorial. **The label trap is dead** — it alternates ABABAB by
 frame parity and fires every frame catching nothing — so re-arm against frame
 **N−2**, or key on the surface address, before trusting any `watch*.bmp`.
 
-Parked because it is cosmetic and rarer than the flicker, and the flicker may
-fall out of Track A1 for free.
+Parked because it is cosmetic and rarer than the flicker. **Not** because A1
+will fix the flicker: that claim was made in this afternoon's plan and
+retracted by A1's own commit — the swap already syncs eagerly, so the
+discarded range was never what made the label alternate. See *R*.
 
 **Done when:** the player sees clean text across a session, and a scripted
 pixel diff of a text frame between CPU and GPU arms is empty.
@@ -120,28 +125,53 @@ unresolved, suspected `d3dcolor_to_float4` ARGB constant layout. Different
 symptom, same hardware. Their combiner alpha-channel bug is **not** ours;
 checked both backends (`nv2a_d3d11.c:174`, `nv2a_metal.m:647`).
 
-## G3 — The frame tail, and the surface the presenter never gets *(FIRST)*
+## G3 — The frame tail *(BUILT. What remains is an A/B and a default.)*
 
-`snapshot_surface()` passes the real flipped range and the macro throws it
-away: `#define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()`. Metal
-writes back the **bound** surface, and the live surface is never the one being
-flipped — so the presenter asks for the pixels at X and gets whatever was
-bound. One root, two symptoms: stale pixels for the presenter, and no safe way
-to defer the swap's writeback.
+**CORRECTED, 17 Sep night. A1 and A2 are already committed and tested.** Two
+earlier documents — this afternoon's plan and the 19:48 goals file — both say
+"build `nv2a_metal_sync_range` first". That work landed at 18:35 the same day
+and both were stale when written. The commits are the authority:
 
-**A1.** Build `nv2a_metal_sync_range(uint8_t*, size_t)` — walk the surface
-cache, write back every slot whose guest range overlaps, then point the macro
-at it. Mirror `nv2a_d3d11.c:1224 sync_range_inner`. *Risk low: it writes back
-more than today, never less.* Test with `jsrf_metal_copy_test` and the
-`[d3d8_gl]` blit check. No player needed.
+    2b5bdb2  G3 A1: the flip's range is honoured instead of discarded
+    ff07677  G3 A2: mark the debt instead of paying it at every surface swap
 
-**A2.** Extend `owes_guest_ram` from clears to rendered content. Gated on A1.
+`nv2a_metal_sync_range` exists at `nv2a_metal.m:2207`, is declared in
+`nv2a_metal.h:17`, and `nv2a_pb_exec.c:21` points the macro at it. Three tests
+are registered and green in the 48: `jsrf_metal_sync_range`,
+`jsrf_metal_defer_swap_off`, `jsrf_metal_defer_swap_on`. `ab_score.py:162`
+already maps `RECOMP_METAL_DEFER_SWAP` to the token `defer_swap`, so the A/B
+harness is wired too.
 
-**Done when:** median frame under 16.68 ms in a mission, verified with the
-`[d3d8_gl]` blit check.
+**A1 changes nothing on its own, deliberately.** Every draw sets
+`surface_dirty` and every swap syncs before it rebinds, so no slot owes
+anything for rendered content and the range walk finds nothing to pay.
+`paid=0` across a run is the expected reading, and is also the positive
+control that it walked rather than never ran. A1 is what makes A2 *safe*, not
+a fix in itself.
 
-**Say the caveat before measuring:** `[SYNC]` p99 is 16.0 ms and `[NOSYNC]` p99
-is 29.5 ms. This buys the **median**, not the hitches.
+**A2 is `RECOMP_METAL_DEFER_SWAP`, default OFF.** It marks the outgoing slot
+as owing guest RAM and clears `surface_dirty`, so the sync takes its clean
+early return: no drain, no read-back. It refuses rather than guesses — if the
+outgoing surface is in no slot, or if depth is dirty — and counts both
+refusals.
+
+**So the remaining work is a measurement, not a build:**
+
+1. `ab_switch.sh` on `RECOMP_METAL_DEFER_SWAP`, three trials per arm, binary
+   pinned by sha256, scene-matched. The number that has to move is the frame
+   **median** against 16.68 ms, not the mean.
+2. **A picture.** It changes WHEN guest RAM becomes correct, and a guest CPU
+   read of the range that is not the flip is not intercepted. A frame-time win
+   with corrupted pixels is not a win, and this tree has shipped two switches
+   on test evidence without a look and backed both out.
+3. Then, and only then, a decision on the default.
+
+**Done when:** median frame under 16.68 ms in a mission with the switch on,
+verified with the `[d3d8_gl]` blit check, and the player has seen a clean
+frame.
+
+**Say the caveat before measuring:** `[SYNC]` p99 is 16.0 ms and `[NOSYNC]`
+p99 is 29.5 ms. This buys the **median**, not the hitches.
 
 ## G4 — The `RECOMP_SYNC_HIST` halt *(open, OFF, parked)*
 
@@ -336,6 +366,8 @@ if their counters justify them.
 | 235 kernel imports are unresolved and the game may crash | 231 of 235 are empty slots the loop invented; 4 are real and 3 are implemented in the bridge. The handler has been called 0 times. See G10. |
 | **Upstream's DirectSound work could help the music** | **New, 17 Sep. Upstream has exactly one dsound fix ever (`2d2d5e4`, cursor sync) and we already have it — it predates our merge base. And it could not matter: `src/audio/dsound_device.c` is NOT LINKED into `jsrf_first_fault` (checked with `nm`; no `DirectSound*` symbol present). JSRF's DirectSound is the title's own XDK code. The other ecosystem audio branches are Media Foundation and XAudio2; our backend is SDL2.** |
 | **Upstream's contiguous-memory heap bug (PR #60) is live here** | **New, 17 Sep. Real upstream — POSIX `VirtualQuery` hardcodes `AllocationBase=NULL`, so `MmFreeContiguousMemory` always `free()`s an mmap'd pointer — and we have the identical code. But our bridge routes ordinals 165/171 to `xbox_ContiguousAlloc`/`xbox_HeapFree` (guest arena, canonicalised, instrumented). The broken pair is referenced only by the dead thunk table. Latent, not live.** |
+| **The discarded flip range is what makes the label flicker** | **New, 17 Sep. Retracted by A1's own commit (`2b5bdb2`) after the afternoon plan asserted it: every draw sets `surface_dirty` and every swap syncs before it rebinds, so guest RAM is already current for every surface and the range walk finds nothing to pay. A1 is infrastructure for A2, not a fix the player can see.** |
+| **Track A is unstarted and A1 must be built** | **New, 17 Sep night. Said by the afternoon plan AND by the 19:48 goals file, and false in both: A1 and A2 landed at 18:35 as `2b5bdb2` and `ff07677`, with three registered tests. Two documents agreeing does not outrank the commit log.** |
 | **A `setcc` after BT/BTS/BTR/BTC tells you something about the lifter** | **New, 17 Sep. Those instructions define CF only; OF, SF, ZF, AF and PF are architecturally UNDEFINED (SDM Vol 2A). 9 of the fuzzer's first 24 "mismatches" were two models' choices of undefined. The generator no longer emits them.** |
 
 ## Rules for this phase
@@ -343,6 +375,11 @@ if their counters justify them.
 - **The optimisation level is a semantic variable, not just a speed knob.**
   G14 makes `-O0` and `-O2` different programs. Scene-match *and* `-O`-match
   every comparison.
+- **The commit log outranks any prose written earlier the same day.** Two
+  documents said to build something that had been committed three hours before
+  either was written, and a third inherited it. Handovers supersede handovers;
+  `git log` supersedes all of them. Check the code before writing a goal that
+  says "build X".
 - **De-risked work outranks interesting work**, and a new finding is not a
   reason to re-order.
 - **Measure reachability before urgency.** "The code is wrong" is not "this is
