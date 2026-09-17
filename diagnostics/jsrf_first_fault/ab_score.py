@@ -157,6 +157,9 @@ SWITCH_TOKEN = {
     # Added 17 Sep 2026. Rides in the [APU-TRAP] parentheses, which is what
     # the harvester reads; a line of its own would not be seen.
     "RECOMP_APU_IDLE_TRAP_SELFLINK": "idle_selflink",
+    # G3 A2. Token printed unconditionally on the [METAL] swap-deferral line,
+    # so the off arm has something to match and the VOID check can run.
+    "RECOMP_METAL_DEFER_SWAP":     "defer_swap",
 }
 
 

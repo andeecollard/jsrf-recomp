@@ -387,6 +387,41 @@ static struct {
 static uint64_t surf_clock;
 static uint64_t surface_hits, surface_evictions;
 
+/* G3 A2: DO NOT WRITE THE OUTGOING SURFACE BACK JUST BECAUSE WE ARE LEAVING IT.
+ *
+ * RECOMP_METAL_DEFER_SWAP, default OFF.
+ *
+ * Measured, 240 s of gameplay: 18,942 surface swaps against 9,504 flip syncs,
+ * and 18,937 of 18,942 swaps are REBINDS at a 100% cache hit rate -- both
+ * surfaces already resident on the GPU. Each one drains the queue and reads
+ * 614 KB back so that guest RAM holds pixels which are sitting safely in the
+ * slot we are about to keep. Per-frame that is [SYNC] p50 = 9.0 ms of an
+ * 18.5 ms median frame, and [NOSYNC] says the median would be 8.0 ms without
+ * it, inside the 16.68 ms budget.
+ *
+ * So mark the debt instead of paying it: the slot holding the outgoing texture
+ * takes owes_guest_ram, surface_dirty is cleared, and nv2a_metal_sync then
+ * takes its already-clean early return -- no drain, no read-back. The flip
+ * names the range it is about to read and nv2a_metal_sync_range pays there
+ * (A1, which is why the order is not negotiable), and surface_cache_drop pays
+ * on eviction as it always has.
+ *
+ * REFUSES RATHER THAN GUESSES, in two cases, both counted:
+ *   - the outgoing surface is not in a slot, so deferring would throw the only
+ *     copy of those pixels away;
+ *   - depth is dirty. surface_slot_writeback carries COLOUR only, and a slot's
+ *     depth textures are retained for a rebind but never written to guest RAM,
+ *     so deferring a dirty depth would lose it to anything that reads it --
+ *     including the re-upload a cache MISS performs.
+ *
+ * THIS CHANGES WHEN GUEST RAM BECOMES CORRECT, which is why it ships off. A
+ * guest CPU read of the surface range that is not the flip is not intercepted;
+ * that is the same exposure the resident-clear deferral has always accepted,
+ * but it is now on the hot path rather than on clears. */
+static int defer_swap_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DEFER_SWAP"); return on; }
+static uint64_t g_swap_deferred, g_swap_defer_depth, g_swap_defer_noslot;
+
 static int surface_cache_on(void)
 {
     static int on = -1;
@@ -2351,6 +2386,12 @@ void nv2a_metal_report(void)
             (unsigned long long)(sync_calls - g_sync_by_swap
                                  - g_sync_by_invalidate - g_sync_by_frame_end),
             (unsigned long long)sync_calls, (unsigned long long)sync_clean);
+    fprintf(stderr,"[METAL] swap writeback deferred: %llu (refused: %llu depth"
+            " dirty, %llu no slot) (defer_swap %s)\n",
+            (unsigned long long)g_swap_deferred,
+            (unsigned long long)g_swap_defer_depth,
+            (unsigned long long)g_swap_defer_noslot,
+            defer_swap_on()?"on":"OFF");
     fprintf(stderr,"[METAL] unbound-surface clears: %llu served from the cache,"
             " %llu slot write-backs (%llu skipped)\n",
             (unsigned long long)g_resident_unbound_clears,
@@ -3592,6 +3633,20 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   } else
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
   if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
+   /* Mark the debt before the sync, so the sync finds nothing to do and takes
+    * its already-clean early return. Identity on the texture, not on the guest
+    * pointer: two slots can name the same guest address at different sizes,
+    * and only the object we are actually holding is the one whose pixels this
+    * debt is about. */
+   if(defer_swap_on()&&surface_cache_on()&&surface_valid&&surface&&surface_dirty){
+    if(depth_dirty){++g_swap_defer_depth;}
+    else{
+     int owed=0;
+     for(unsigned i=0;i<SURFACE_SLOTS;i++)
+      if(surf_slot[i].valid&&surf_slot[i].colour==surface){
+       surf_slot[i].owes_guest_ram=1;surface_dirty=0;
+       owed=1;++g_swap_deferred;break;}
+     if(!owed)++g_swap_defer_noslot;}}
    ++surface_uploads;++g_sync_by_swap;if(!nv2a_metal_sync())return reject("surface-sync");
    /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
     * The sync above has already written the outgoing surface out, so the

@@ -504,6 +504,17 @@ if(APPLE)
     # and must NOT write back one it does not. The second half is the one that
     # matters -- a sync_range that ignores its argument behaves correctly and
     # silently reintroduces the cost deferring exists to remove.
+    # G3 A2: the swap must really stop writing back, and the debt must really
+    # be payable. Registered twice -- the accessor caches its getenv.
+    add_executable(jsrf_metal_defer_swap_test metal_defer_swap_test.c)
+    target_link_libraries(jsrf_metal_defer_swap_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_defer_swap_off COMMAND jsrf_metal_defer_swap_test)
+    set_tests_properties(jsrf_metal_defer_swap_off PROPERTIES
+                         ENVIRONMENT "JSRF_EXPECT_DEFER=0")
+    add_test(NAME jsrf_metal_defer_swap_on COMMAND jsrf_metal_defer_swap_test)
+    set_tests_properties(jsrf_metal_defer_swap_on PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;JSRF_EXPECT_DEFER=1")
+
     add_executable(jsrf_metal_sync_range_test metal_sync_range_test.c)
     target_link_libraries(jsrf_metal_sync_range_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_sync_range COMMAND jsrf_metal_sync_range_test)
