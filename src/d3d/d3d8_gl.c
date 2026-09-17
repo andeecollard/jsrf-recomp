@@ -629,6 +629,8 @@ static int present_guest_framebuffer(void)
     /* The size the TEXTURE was allocated at, which is a different fact from
      * the size the CPU buffer was allocated at and was not tracked at all. */
     static uint32_t tex_w, tex_h;
+    /* The picture's rect inside the drawable, as glViewport was last given it. */
+    static int vp_x0, vp_y0, vp_w, vp_h;
     const uint8_t *fb;
     uint32_t w = 0, h = 0, pitch = 0, bpp = 0, y;
 
@@ -791,6 +793,11 @@ static int present_guest_framebuffer(void)
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT);
             glViewport((fbw - vw) / 2, (fbh - vh) / 2, vw, vh);
+            /* The check below has to reproduce the mapping this viewport
+             * defines, so it needs the rect rather than guessing it from the
+             * drawable. */
+            vp_x0 = (fbw - vw) / 2; vp_y0 = (fbh - vh) / 2;
+            vp_w = vw; vp_h = vh;
             {
                 /* Keyed on the drawable and the guest size rather than on the
                  * picture size: a 4:3 guest in a 1600x900 drawable and in an
@@ -834,18 +841,74 @@ static int present_guest_framebuffer(void)
     {
         static unsigned shots;
         if (++shots <= 2 || shots % 500 == 0) {
+            /* WHAT SHOULD BE AT THIS PIXEL, COMPUTED RATHER THAN ASSUMED.
+             *
+             * This compared ONE guest texel against the drawable's centre
+             * pixel, and that equality held only while the drawable was an
+             * exact 1x of the guest surface. It is 4x on a 2x panel now, the
+             * sampler is GL_LINEAR, and for an EVEN scale factor no pixel
+             * centre lands on a texel centre at all -- so no choice of sample
+             * point can restore it and the line had quietly decayed from "must
+             * be equal" to "should be close". A presenter check that cannot
+             * say "equal" cannot verify a presenter change, and the whole
+             * surface-writeback plan is verified with this line.
+             *
+             * So reproduce the sampler: map the pixel through the letterboxed
+             * viewport into texture space, take the four texels GL_LINEAR
+             * would take, and blend them the way it would. The comparison is
+             * against `rgba`, which IS the texture that was uploaded, so this
+             * tests upload -> draw -> readback: the part that runs on the GPU
+             * and can silently stop working. TOL is 2 LSB because GL filters
+             * at finite subtexel precision; the actual delta is printed, so
+             * drift shows up long before it trips the bound. */
             GLubyte px[4] = { 0, 0, 0, 0 };
-            const uint8_t *centre = rgba + ((size_t)(h / 2) * w + w / 2) * 4;
-            int fbw = 0, fbh = 0;
-            SDL_GL_GetDrawableSize(g.window, &fbw, &fbh);
-            if (fbw > 0 && fbh > 0)
-                glReadPixels(fbw / 2, fbh / 2, 1, 1, GL_RGBA,
-                             GL_UNSIGNED_BYTE, px);
-            fprintf(stderr, "[d3d8_gl] blit %u: guest centre %02X %02X %02X"
-                    " -> window %02X %02X %02X (gl err 0x%04X)"
-                    " | present texture: %lu alloc, %lu in-place\n",
-                    shots, centre[0], centre[1], centre[2],
-                    px[0], px[1], px[2], glGetError(),
+            int ok = 0, dr = 0, dg = 0, db = 0;
+            unsigned er = 0, eg = 0, eb = 0;
+            const int TOL = 2;
+            if (vp_w > 0 && vp_h > 0 && rgba && rgba_w == w && rgba_h == h) {
+                int px_x = vp_x0 + vp_w / 2;
+                int px_y = vp_y0 + vp_h / 2;
+                /* pixel centre -> [0,1] across the picture -> texel space */
+                double sx = ((px_x - vp_x0) + 0.5) / (double)vp_w;
+                double sy = ((px_y - vp_y0) + 0.5) / (double)vp_h;
+                double tx = sx * (double)w - 0.5;
+                double ty = sy * (double)h - 0.5;
+                int x0i = (int)floor(tx), y0i = (int)floor(ty);
+                double fx = tx - x0i, fy = ty - y0i;
+                int x1i = x0i + 1, y1i = y0i + 1;
+                if (x0i < 0) x0i = 0; if (y0i < 0) y0i = 0;
+                if (x1i < 0) x1i = 0; if (y1i < 0) y1i = 0;
+                if (x0i > (int)w - 1) x0i = (int)w - 1;
+                if (x1i > (int)w - 1) x1i = (int)w - 1;
+                if (y0i > (int)h - 1) y0i = (int)h - 1;
+                if (y1i > (int)h - 1) y1i = (int)h - 1;
+                {
+                    const uint8_t *p00 = rgba + ((size_t)y0i * w + x0i) * 4;
+                    const uint8_t *p10 = rgba + ((size_t)y0i * w + x1i) * 4;
+                    const uint8_t *p01 = rgba + ((size_t)y1i * w + x0i) * 4;
+                    const uint8_t *p11 = rgba + ((size_t)y1i * w + x1i) * 4;
+                    int c;
+                    double e[3];
+                    for (c = 0; c < 3; ++c)
+                        e[c] = (1 - fx) * (1 - fy) * p00[c] + fx * (1 - fy) * p10[c]
+                             + (1 - fx) * fy * p01[c]       + fx * fy * p11[c];
+                    er = (unsigned)(e[0] + 0.5);
+                    eg = (unsigned)(e[1] + 0.5);
+                    eb = (unsigned)(e[2] + 0.5);
+                }
+                glReadPixels(px_x, px_y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                dr = (int)px[0] - (int)er;
+                dg = (int)px[1] - (int)eg;
+                db = (int)px[2] - (int)eb;
+                ok = (dr <= TOL && dr >= -TOL && dg <= TOL && dg >= -TOL
+                      && db <= TOL && db >= -TOL);
+            }
+            fprintf(stderr, "[d3d8_gl] blit %u: expected %02X %02X %02X"
+                    " -> window %02X %02X %02X  delta %+d %+d %+d  %s"
+                    " (gl err 0x%04X) | present texture: %lu alloc,"
+                    " %lu in-place\n",
+                    shots, er, eg, eb, px[0], px[1], px[2], dr, dg, db,
+                    ok ? "MATCH" : "MISMATCH", glGetError(),
                     g_present_tex_allocs, g_present_tex_updates);
             fflush(stderr);
         }
