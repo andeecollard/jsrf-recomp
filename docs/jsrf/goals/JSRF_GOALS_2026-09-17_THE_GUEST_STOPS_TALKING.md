@@ -157,6 +157,40 @@ is getting its frames and producing less and less 2D audio from them.
 and points at starvation — fewer 2D voices contributing per frame, or one
 voice being fed less. The per-voice breakdown is what separates those.
 
+## G1d — The storm precedes the collapse, and is the prime suspect again
+
+The 09:43 session has what the 09:07 session did not: a **pre-storm baseline**.
+
+    window  2-9: idle_trap +0 (a few at 4-5)   guest_methods +250..1450   healthy
+    window 10:   idle_trap +261                guest_methods +2931        storm begins
+    window 11:   idle_trap +348                guest_methods +2244
+    window 12:   idle_trap +365                guest_methods  +540        3D dies
+    window 13:   idle_trap +366                guest_methods  +519        2D decaying
+    window 14:   idle_trap +370                guest_methods  +537        2D silent
+    window 16:   idle_trap +343                guest_methods    +0        guest gives up
+
+Eight quiet windows, then the storm arrives and the guest is dead within six.
+Note windows 10 and 11: the guest works **four times harder than baseline**
+before it collapses. That is a system being driven past its capacity, not one
+that wandered off.
+
+And the audio dies in a specific order — **3D stops dead at window 12, 2D
+decays out over the next two** — which is what a 2D voice playing out an
+unrefilled buffer sounds like, and is exactly the player's "slow and then
+stops". The storm voices v1 and v3 are on the **3D** list, and 3D is what dies
+first.
+
+**This does not prove causation** — the storm and the collapse could share an
+upstream cause, and one session is one session. But the ordering is now clean
+in the arm that has a baseline, so the storm is the prime suspect again rather
+than a refuted one.
+
+**Done when:** a second session reproduces the ordering, and we know what
+makes v1 and v3 stay inactive-and-linked (G1b). If the cause resists,
+`RECOMP_APU_IDLE_TRAP_REARM_MS` bounding the re-raise per voice is the
+mitigation to A/B — but it re-opens the "voice never reclaimed" failure the
+re-raise was added to fix, so it is a trade, not a fix.
+
 ## G2 — The glyph index error, inside a font batch
 
 Caught on camera at last: `"Let's see how much air $ou can grab"` — `y`
@@ -246,7 +280,7 @@ already printed.
 | **Trapping the front end idles the sound engine** | **`[APU-FRAME] trapped_skipped=0`, and `se = total − halted` exactly. `RECOMP_APU_SE_WHILE_TRAPPED` would not have helped.** |
 | **The v1/v3 idle-trap storm is a two-voice list cycle** | `[APU-CYCLE] walks_with_a_cycle=0`, `[APU-WALKCAP] hit=0`. The "cycle" was `v3<-v1` and `v1<-v3` aggregated across a whole run — separate raises at different moments, not simultaneous state. |
 | **The music "slowing" is the APU falling behind** | `[APU-FRAME]` steady at ~7,500 frames/window, se 91–95%, trapped flat 32–36%, across the exact windows where `2D heard` decayed from +15,008 to 0. |
-| **The idle trap triggers the guest freeze** | **The trap ran from report 19 at ~360/report with the guest issuing ~500 methods/report alongside it. It froze at report 26.** |
+| ~~The idle trap triggers the guest freeze~~ **RETRACTED — see G1d** | This was refuted on the 09:07 session, where the storm was ALREADY RUNNING before the window I examined, so "the guest coexisted with it" was an artifact of starting to look too late. The 09:43 session has a clean pre-storm baseline and reverses it. |
 
 ## Rules for this phase
 
