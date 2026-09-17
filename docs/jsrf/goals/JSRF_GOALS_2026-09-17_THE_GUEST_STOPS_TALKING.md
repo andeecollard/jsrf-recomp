@@ -57,16 +57,41 @@ statically linked into the XBE and recompiled — the ISR at guest `001A24BE`.
 The only two levers are what the **APU model** and the **kernel** present to
 it, which usefully bounds the search.
 
-**Next action, and it is a measurement, not a theory:** record the calling
-thread on the guest-method path (`g_apu_guest_method_count`, `apu_vp.c:786`)
-and on the trap acknowledgement. There is no thread-id plumbing there today.
+**NARROWED 17 Sep, from the player's own log, with no new code.** The
+ambiguity `apu_vp.c:781` admits it cannot resolve — "a guest that stopped
+submitting" versus "writes lost before reaching this entry point" — is settled
+by a counter that already existed upstream of the entry point:
 
-**Done when:** one player session says which of three worlds we are in —
-same thread and blocked (look at the kernel object it waits on); different
-threads and the method thread stopped (look at why); or the method thread is
-running and simply not calling (then our APU model put it in that state).
-Each branch leads somewhere different, which is the property the three
-hypotheses that died today all lacked.
+    [MCPX-TRAP] faults=1404969 apu=222538 vp=23212 ack_windows=0
+                reprotect_failures=0 | mcpx aliased=319075 windows=0
+
+`vp` is frozen at 23,212 and **equals `guest_methods` exactly**, so every
+trapped VP write became a method and nothing is being lost. `apu` keeps
+climbing at ~1,680 per report and `faults` keeps climbing with it.
+
+So: **the guest is alive, still faulting on the aperture, still writing APU
+registers — and has stopped writing to the voice-processor region (0x20000–
+0x30000) altogether.** This is not our write path. Both apertures are aliased,
+`ack_windows=0`, `reprotect_failures=0`, `windows=0`: every guard hazard
+CLAUDE.md warns about is clean.
+
+It also identifies who un-traps the front end 38,929 times while
+`guest_methods` is frozen — the guest, through the main APU registers. It is
+acknowledging our traps and declining to submit voice work. So DirectSound
+believes it has nothing to submit, and the question is what our model told it
+that makes it believe that.
+
+**Next action, and the instrument already exists:** `RECOMP_APU_WRITE_TRACE=1`
+prints `[APU-WRITE] main= vp= gp= ep= other=`, which says WHICH registers the
+guest is still writing while the VP region is silent. Add it to the player's
+`paths.conf` for the next session. Thread-id plumbing on the method path is
+the follow-up if that is not enough, not the first move.
+
+**Done when:** we know which APU register the guest's DirectSound is
+polling while it refuses to submit, and what our model is answering. The
+third of the three worlds is now the one we are in — the guest is running and
+simply not calling — so the defect is a value our model presents, not a lost
+write and not a dead thread.
 
 ## G2 — The glyph index error, inside a font batch
 
