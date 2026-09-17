@@ -1,0 +1,260 @@
+HANDOVER 2026-09-17 -- THE MUSIC TEST COULD NOT ANSWER ITS OWN QUESTION, THE
+GLYPH DEFECT IS CAUGHT ON CAMERA, G3 IS MEASURED AND JUSTIFIED, AND MY OWN
+INSTRUMENT IS IMPLICATED IN A GUEST HALT
+
+Read CLAUDE.md, then docs/jsrf/goals/JSRF_GOALS_2026-09-16_NIGHT_THE_DEFECT_LIST.md.
+Supersedes HANDOVER_2026-09-17_THE_FLIP_WAS_NEVER_THE_PROBLEM.txt.
+
+READ SECTION 1 BEFORE FORMING ANY THEORY ABOUT THE MUSIC. The previous
+handover's section 0 told you how to answer the music question. Following it
+would have concluded "there is nothing to fix". That conclusion is WRONG and
+the player's own ears are the counter-evidence.
+
+
+=============================================================================
+0. IF YOU DO ONE THING
+=============================================================================
+
+Find out why the guest stops issuing APU methods two minutes into gameplay.
+Everything else here is either solved, measured, or parked with its evidence.
+
+  [APU-VOICE] guest_methods=23212     frozen for the last 104 reports
+  [APU-BIN]   2D heard=297236          frozen for the last 104 reports
+  [APU-VOICE] idle_trap=41667          still climbing ~360 per report
+
+The guest's audio thread is ALIVE while this happens ([ADX] tick still
+advancing), the game renders fine ([FRAME] flips still advancing), every
+interrupt vector is still being delivered, and the sound engine is still
+running. The guest has simply stopped talking to the APU. Nobody knows why.
+
+Player's log, complete, preserved:
+  ~/Library/Application Support/JSRF/last-run-2026-09-17_0907-player-COMPLETE.log
+The 16 Sep 18:33 session is preserved beside it as last-run-2026-09-16_1833.log.keep.
+
+
+=============================================================================
+1. THE CORRECTION THAT MATTERS MOST: on_2d CANNOT ANSWER THE MUSIC QUESTION
+=============================================================================
+
+The previous handover armed [APU-POOL] on_2d to settle whether the music dying
+was our defect, and stated the rule as:
+
+    on_2d climbing while 2D heard is frozen = OUR defect
+    Both frozen = the game played no music and there is nothing to fix
+
+The player played. BOTH ARE FROZEN -- on_2d=10, 2D heard=297236 -- AND THE
+GAME PLAYED MUSIC. They heard it start and heard it break up. 2D heard climbed
+steadily to 297,236 before it stopped.
+
+THE FLAW: on_2d counts the guest STARTING a 2D voice. A streaming music track
+starts one voice and then feeds it; it never starts another. So on_2d flatlines
+during perfectly healthy playback, during silence, and during a stream that
+died mid-flight. It cannot separate the three, which is the only thing it was
+added to do. It is the tenth instrument this tree has retired for that.
+
+WHAT ACTUALLY SEPARATES THEM, and it was already in the log:
+
+    guest_methods   frozen  ->  the guest has stopped driving the APU
+    idle_trap       climbing ->  we are still telling it to
+
+4,757 raises with not one guest response, in the window I first looked at;
+41,667 raises against a frozen guest_methods over the session. That pair is
+the instrument. on_2d should be deleted or re-worded before it misleads again.
+
+
+=============================================================================
+2. THE MUSIC: WHAT IS ESTABLISHED, AND THREE DEAD HYPOTHESES
+=============================================================================
+
+ESTABLISHED, from the player's 645 s session (129 [APU-VOICE] reports, so a
+report is ~5 s):
+
+  * guest_methods climbs healthily to 23,161 through report 25, then freezes
+    at 23,212 at report 26 -- about TWO MINUTES into gameplay, which matches
+    the player's "the intro music starts well and then glitches out".
+  * The idle trap was ALREADY running from report 19 at ~360 raises per
+    report, with the guest issuing ~500 methods per report alongside it and
+    coexisting perfectly well. The trap is not obviously the trigger.
+  * [ADX] tick advances to the end: the guest's streaming thread is alive.
+  * [FRAME] flips advance to the end: the guest is running the game.
+  * fe_methods 64,879 = our 41,667 raises + the guest's frozen 23,212,
+    EXACTLY. Every front-end method is accounted for; the guest contributed
+    none after the freeze.
+
+REFUTED TODAY. All three were mine, raised and killed within the hour. They
+are recorded so nobody spends an evening on them again:
+
+  | Hypothesis | How it died |
+  |---|---|
+  | The idle-trap interrupt is deferred and dropped (G7's pending flag) | [IRQ-VEC] shows v1, v3, v5 and v6 all delivering steadily PAST the audio death. The ISRs are running. |
+  | g_vector_in_service leaked, so the APU vector defers forever | Same evidence. Nothing is stuck in service. |
+  | Trapping the front end idles the sound engine | [APU-FRAME] trapped_skipped=0, and se = total - halted exactly. The mixer ran throughout. The switch RECOMP_APU_SE_WHILE_TRAPPED governs this path and would NOT have helped; I was one step from asking the player to grind a rail for it. |
+
+WHAT IS STILL TRUE AND UNEXPLAINED: the front end is trapped on 293,206 of
+968,096 frames in 38,929 short episodes (mean 7.5 frames, longest 23). So
+something IS un-trapping it 38,929 times while guest_methods stays frozen.
+Whatever acknowledges the trap is not the thing that issues methods. That is
+the thread to pull.
+
+DIRECTSOUND IS NOT OURS TO REFACTOR. src/audio/dsound_device.c is a 386-line
+stub whose own header says it "accept[s] all method calls silently" with real
+playback "deferred to a later phase". The DirectSound that matters is the
+title's own XDK code, statically linked into the XBE and recompiled -- the ISR
+at guest addresses 001A24BE and 001A25AA that apu_vp.c's comments describe. We
+cannot restructure it. The only levers are what the APU model and the kernel
+present to it. So the question is not "refactor DirectSound", it is "which
+guest thread issues APU methods, and what is it blocked on after report 26".
+
+
+=============================================================================
+3. THE GLYPH DEFECT IS CAUGHT, AND IT IS THE UNTESTED HYPOTHESIS
+=============================================================================
+
+The player's session produced 98 frames in ~/Library/Application Support/JSRF/
+glyphdump/ and, more usefully, screenshots. The decisive one reads:
+
+    "Let's see how much air $ou can grab."
+
+`y` rendered as `$`. That is not a quad at another batch's position -- it is
+ONE GLYPH'S QUAD DRAWN WITH ANOTHER GLYPH'S TEXTURE COORDINATES, inside a
+single text box. Which is precisely the one idea the previous handover
+recorded as untested:
+
+  "a text overlay is one batch of many quads, and an index error INSIDE a
+   batch would draw one glyph's quad with another glyph's vertices -- which is
+   exactly what it looks like."
+
+It is also WIDER than tutorial text, which the previous handover did not know:
+the trick-name overlays show it too ("arside Mi*sou" with the leading F gone,
+a mark over the F in "Farside Stab Soul"), plus small floating marks above
+several speech lines. Same font-batch path, so whatever indexes a glyph quad
+is the place to look, not the tutorial's own code.
+
+This was a HEAD build with RECOMP_METAL_FF=1. Twelve scripted runs never
+caught it; one human session caught it repeatedly. The player's sessions are
+the trap.
+
+
+=============================================================================
+4. G3 IS MEASURED, AND THE ANSWER IS GO
+=============================================================================
+
+The previous handover ranked "a per-frame sync HISTOGRAM" first because the
+cumulative 7.9 ms/frame could not say whether the stall sits on the MEDIAN
+frame or only on the tail. It is built and it has run. 240 s scripted
+gameplay, RECOMP_METAL_FF=1:
+
+  [FRAME]  flips=9480  mean=16.79 ms (59.6 fps) p50=18.5 p90=24.5 p99=40.0
+  [SYNC]   frames=9479 mean=8.36 ms  p50=9.0  p90=13.0 p95=14.0 p99=16.0
+  [NOSYNC] frames=9479 mean=8.43 ms  p50=8.0  p90=13.0 p95=14.0 p99=29.5
+  [SYNC] budget 16.68 ms: reachable without the sync stall
+         (NOSYNC p50=8.0 ms), clamped frames=0
+
+NOSYNC is frame time minus THAT FRAME'S sync -- what the frame would have cost
+had sync been free. Its p50 is 8.0 ms against a 16.68 ms budget, so removing
+the surface-swap stall DOES move the median inside budget. G3's step 2 is
+justified. clamped frames=0 is the positive control: the subtraction was
+legitimate on every frame.
+
+AND A NEW FINDING THE CUMULATIVE SPLIT COULD NOT GIVE: sync owns the MEDIAN
+but NOT the tail. [SYNC] p99 is only 16.0 ms while [NOSYNC] p99 is 29.5 ms and
+its max is 211 ms. This work buys 60 fps. IT WILL NOT FIX THE HITCHES. Do not
+promise that it will; the tail is a different owner and a separate hunt.
+
+It also reproduced the previous handover's census exactly: 18,942 surface
+swaps against 9,504 flip syncs, 18,937 of 18,942 swaps being rebinds at a 100%
+cache hit rate.
+
+STEP 2 NEEDS A RANGE-AWARE WRITEBACK FIRST, which the previous handover did
+not call out. nv2a_pb_exec.c defines
+
+    #define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()
+
+-- it takes the range and throws it away. snapshot_surface() is the flip's read
+of guest RAM and passes the real flipped range, but the Metal side only ever
+writes back the BOUND surface, and the superseded plan already noted the live
+surface is never the one being flipped. So deferring the swap's writeback
+without a range-aware sync would present stale pixels. The D3D11 backend
+already has the shape to copy: sync_range_inner at nv2a_d3d11.c:1224 walks its
+surface cache and syncs every surface overlapping the range.
+
+
+=============================================================================
+5. THE INSTRUMENT SHIPS OFF, BECAUSE IT IS IMPLICATED IN A GUEST HALT
+=============================================================================
+
+RECOMP_SYNC_HIST, default OFF. Read the comment at sync_hist_on() in
+nv2a_pb_exec.c before turning it on.
+
+With the histogram accumulating unconditionally, a 240 s scripted run stopped
+the guest dead at 9,480 flips. It is NOT a rendering freeze: flips,
+guest_methods and 2D heard all froze in the same window and never moved again,
+while the emulator's own threads kept running at 389% CPU. The control at HEAD
+-- same schedule, same switches, same binary directory -- ran to 13,398 flips
+with no repetition, and a player session on HEAD played ten minutes without it.
+
+Every prior run in render-investigation/ prints its final flip count ONCE. The
+instrumented run prints it EIGHT TIMES. That signature is new.
+
+AND YET: that is one run per arm, which ab_score.py voids by policy and which
+this project has already been burned by once. The code is a read of two
+counters plus arithmetic -- no lock, no allocation, no Metal call -- so no
+mechanism is apparent. A pre-existing intermittent hang, or timing
+perturbation of one, fits the evidence as well; play_scripted.sh's own header
+records that heavy probes destabilise this title.
+
+SO IT IS UNRESOLVED, NOT EXONERATED, AND IT IS OFF. [FRAME] is deliberately
+unconditional on the argument that an opt-in perf counter is one nobody has
+switched on when they need it. That argument does not survive being implicated
+in a halt. Two runs per arm before defaulting it on.
+
+
+=============================================================================
+6. WHAT LANDED
+=============================================================================
+
+  src/kernel/frame_hist.h        the bins, the percentile, the per-frame split
+                                 and the budget verdict, extracted from
+                                 nv2a_pb_exec.c so a test can reach them
+  jsrf_frame_hist                41 tests now, was 40. Drives the verdict into
+                                 BOTH states: two synthetic runs with the SAME
+                                 total sync time, one with it on the median
+                                 frame and one with it in the tail, which must
+                                 get opposite answers. Verified by injected
+                                 fault -- removing the clamp is caught as an
+                                 18-quintillion-microsecond frame, and hard-
+                                 wiring the verdict to "reachable" is caught by
+                                 the tail run.
+  nv2a_metal_sync_ns()           cumulative drain+readback, so the executor can
+                                 difference it at the only place that knows
+                                 where a frame ends
+
+A NOTE ON THE TEST, because it is the kind of thing that gets "fixed" later:
+with ONE slow frame in 100, p99 correctly reads the fast bin -- the 99th
+sample is still fast -- and the slow frame survives only in max_us. The test
+asserts that explicitly so nobody corrects a right answer into a wrong one.
+
+
+=============================================================================
+7. RANKED
+=============================================================================
+
+ 1. Why does the guest stop issuing APU methods at ~2 minutes? Section 0 and
+    2. It is the player-facing defect and the cause is not known.
+ 2. The glyph index error INSIDE a font batch. Section 3. The hypothesis is
+    now evidence-backed and the failing path is wider than the tutorial.
+ 3. G3 step 2: range-aware nv2a_metal_sync_range, then owes_guest_ram for
+    rendered content. Section 4. Justified by measurement; buys the median,
+    not the tail.
+ 4. Resolve or exonerate RECOMP_SYNC_HIST's halt, two runs per arm. Section 5.
+ 5. Delete or re-word [APU-POOL] on_2d. Section 1.
+ 6. The ADPCM cause, the page-table bound, the stereo page straddle -- all
+    unchanged from the previous handover, none touched today.
+
+A PROCESS NOTE WORTH MORE THAN ANY OF THE ABOVE. Three hypotheses died today
+inside an hour, each killed by a counter that was already in the log before I
+formed the theory. The pattern in all three: I reasoned from a mechanism I had
+read in the source and did not check the counter that would refute it FIRST.
+CLAUDE.md's "measure, don't infer" is usually read as a rule about runtime
+state. It is also a rule about the order of operations: the refuting
+measurement is cheaper than the theory, so take it first.
