@@ -33,7 +33,17 @@ not a false positive.
 
 ---
 
-## L1 — The SF condition is signed-overflow UB, and the title is built at -O2
+## L1 — The SF condition is signed-overflow UB *(CORRECTED: not reachable here)*
+
+> **Correction, later the same night.** The paragraph below said "this one is
+> live" and gave five sites. The defect and the `-O` demonstration are right;
+> the reachability claim was not. JSRF has **701** SF consumers, not five —
+> five was the count of one *expression form*. 252 are `TEST_S` (an AND, which
+> cannot overflow), 317 more are AND-based, ~127 take the sign of a single
+> value, and the five UB-form sites **all read `cmp <mem>, 0`**, where
+> `_fas - 0` cannot overflow. So the fold is a no-op at every site in this
+> image. I counted a grep and never read the operands. Details in the goals
+> file's G14. The rest of this section stands as written.
 
 **This one is live.** The lifter emits, for `js`/`sets`/`cmovs` after a `cmp`:
 

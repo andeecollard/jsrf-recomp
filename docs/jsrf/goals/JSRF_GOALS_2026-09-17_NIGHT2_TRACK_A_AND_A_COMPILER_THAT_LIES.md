@@ -16,12 +16,12 @@ now a progress note cite G1b, G1d, G3 and G14 by name. Priority lives in
 
 Two things, and neither is a new theory about the music.
 
-**The build is now a variable.** G14 — the SF condition is signed-overflow UB
-and the compiler folds it from `-O1` — means the optimisation level changes
-*semantics*, not just speed. Every A/B this project has run across an `-O0`/`-O2`
-boundary compared two different programs. That does not invalidate the
-same-level comparisons, which is most of them, but it is a confounder nobody
-was controlling for and it goes at the top of the rules.
+**The build is a variable in principle.** G14 — the SF condition is
+signed-overflow UB that the compiler folds from `-O1` — means the optimisation
+level can change *semantics*, not just speed. **In this image it does not**:
+all five UB-form sites compare against zero, so the fold is a no-op here (see
+G14). The rule stays because the next regeneration need not preserve that, and
+because the general point holds for any UB the lifter emits.
 
 **The ecosystem was surveyed for the first time.** Four things we owe upstream,
 two things worth taking from them, and four dead ends closed in *R* — one of
@@ -61,8 +61,10 @@ counter, and the counter comes first.
 1. **G3's depth question** — why depth is dirty at nearly every swap, and
    whether guest RAM ever needs it. The A/B is DONE and says A2 is inert: one
    deferral per run against thousands of depth refusals. Do not re-run it.
-2. **The three near-free counters**, in one sitting — G14's `js` reachability,
-   G10's thunk report, G11's `XC_AUDIO` probe. None changes runtime behaviour.
+2. **The near-free counters.** G14's reachability is **answered** (statically —
+   all five UB-form sites compare against zero, so it cannot fire here). G10's
+   thunk report and G11's `XC_AUDIO` probe are **built**; each needs one run to
+   confirm the line appears. None changes runtime behaviour.
    **Not during the A/B, though.** They are all `src/` edits, and
    `play_scripted.sh:126` fails a run when any `*.c`, `*.h` or `*.m` under
    `src/` or `diagnostics/jsrf_first_fault/` is newer than the binary — so a
@@ -288,31 +290,54 @@ never fires, record that in `recomp_types.h` and close the question.
 
 ---
 
-## G14 — The SF condition is signed-overflow UB *(LIVE in the player's build)*
+## G14 — The SF condition is signed-overflow UB *(real defect, NOT reachable here)*
 
-`js`/`sets`/`cmovs` after a `cmp` emit
-`if (((int32_t)((_fas) - (_fbs)) < 0))`. Signed overflow is UB, so from `-O1`
-the compiler folds it to `_fas < _fbs` — a different function whenever the
-subtraction overflows. x86's SF is bit 31 of the **wrapped** result.
+**CORRECTED 17 Sep night. It is not live in the player's build, and my earlier
+entry saying it was is withdrawn.**
 
-Measured on the exact expression with `0x80000000` and `1`, where x86 gives
-SF=0: `-O0` answers 0, `-O1` and `-O2` answer 1. `build-feav` is
-`JSRF_OPT_LEVEL=-O2`. **Five sites, three distinct, all `js`** —
-`sub_000A9830`, `sub_00192830`, `sub_000A9851`.
+The defect is real. `js`/`sets`/`cmovs` after a `cmp` can emit
+`if (((int32_t)((_fas) - (_fbs)) < 0))`; signed overflow is UB, so from `-O1`
+the compiler folds it to `_fas < _fbs`, which is a different function whenever
+the subtraction overflows. Demonstrated on the exact expression with
+`0x80000000` and `1`, where x86 gives SF=0: `-O0` answers 0, `-O1` and `-O2`
+answer 1.
+
+**What I got wrong: I counted one expression form and called it the site
+count.** JSRF has **701** SF consumers, not 5 — 298 `js`, 403 `jns`, one
+`sets`. Enumerated by form:
+
+    252  TEST_S(_fas, _fbs)                       test/AND -- cannot overflow
+    317  ((int8_t|int32_t)((_fa) & (_fb)) >= 0)   test/AND -- cannot overflow
+     54  (_fas >= 0) / (_fas < 0)                 sign of one value -- safe
+    ~73  ((int32_t)(REG|MEM) < 0)                 sign of a wrapped value -- safe
+      5  ((int32_t)((_fas) - (_fbs)) < 0)         THE UB FORM
+
+`TEST_S` is `RECOMP_SIGNED((uint32_t)(a) & (uint32_t)(b), width) < 0` — an AND,
+so there is no subtraction to overflow.
+
+**And all five of the UB-form sites compare against a literal zero:**
+
+    _fa = (uint32_t)(MEM32(ebp)) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    /* cmp MEM32(ebp), 0 (32-bit) */
+
+`_fas - 0` cannot overflow for any `_fas`, so at every site in this image the
+UB expression is exactly equivalent to the correct one. **No run was needed and
+no counter was built** — the reachability question is answered statically, by
+reading the operands I should have read the first time.
+
+**Still worth fixing, and still worth sending.** The emission is wrong, the fix
+is one expression — `((uint32_t)_fa - (uint32_t)_fb) >> 31` — and relying on
+"every site happens to compare against zero" is relying on a property of one
+title's code that a regeneration or a different title can remove without
+warning. It belongs with G15 and G16 in the upstream debt, not in the
+player-facing queue.
 
 `jl`/`jge`/`jle`/`jg` are **not** affected: SF≠OF is mathematically signed
 less-than. Only `s`, `ns`, `o`, `no`.
 
-**Why it does not displace G3, stated because it is the tempting call.** The
-code is wrong; *the branch being taken is unmeasured*. The fix regenerates
-every `js` in the image, which invalidates archived gens and every baseline
-measured against one — the exact cost CLAUDE.md warns about. A cheap counter
-decides whether that price is worth paying, and the counter is in step 3 of
-*The order*.
-
-**Done when:** SF is the sign bit of the wrapped result
-(`((uint32_t)_fa - (uint32_t)_fb) >> 31`), a regression test pins the
-`0x80000000 / 1` vector **at -O2**, and the three sites have a runtime count.
+**Done when:** SF is the sign bit of the wrapped result, with a regression test
+pinning the `0x80000000 / 1` vector **at -O2**. The runtime count that used to
+be required here is no longer owed.
 
 ## G15 — `bts`/`btr`/`btc` report CF after their own write *(latent here)*
 
@@ -405,6 +430,7 @@ if their counters justify them.
 | **Upstream's contiguous-memory heap bug (PR #60) is live here** | **New, 17 Sep. Real upstream — POSIX `VirtualQuery` hardcodes `AllocationBase=NULL`, so `MmFreeContiguousMemory` always `free()`s an mmap'd pointer — and we have the identical code. But our bridge routes ordinals 165/171 to `xbox_ContiguousAlloc`/`xbox_HeapFree` (guest arena, canonicalised, instrumented). The broken pair is referenced only by the dead thunk table. Latent, not live.** |
 | **The discarded flip range is what makes the label flicker** | **New, 17 Sep. Retracted by A1's own commit (`2b5bdb2`) after the afternoon plan asserted it: every draw sets `surface_dirty` and every swap syncs before it rebinds, so guest RAM is already current for every surface and the range walk finds nothing to pay. A1 is infrastructure for A2, not a fix the player can see.** |
 | **Track A is unstarted and A1 must be built** | **New, 17 Sep night. Said by the afternoon plan AND by the 19:48 goals file, and false in both: A1 and A2 landed at 18:35 as `2b5bdb2` and `ff07677`, with three registered tests. Two documents agreeing does not outrank the commit log.** |
+| **G14's SF bug is live in the player's build** | **New, 17 Sep night, and it was MY claim two hours earlier. The UB form appears at 5 sites and all 5 read `cmp <mem>, 0`, where the subtraction cannot overflow. The other 696 SF consumers use `TEST_S` or a sign-of-one-value form, neither of which subtracts. I counted one expression form, called it the site count, and never read the operands. The defect is real; its reachability here is zero.** |
 | **Deferring the surface swap buys the median** | **New, 17 Sep night. Measured and not separated -- but the reason is that `RECOMP_METAL_DEFER_SWAP` deferred ONE swap per run and refused 5,747-12,656 on `depth_dirty`. The switch is inert in a mission, so the A/B compared not-deferring with not-deferring. `[NOSYNC] p50 = 8.0 ms` remains the upper bound; nothing has yet been built that reaches it.** |
 | **A `setcc` after BT/BTS/BTR/BTC tells you something about the lifter** | **New, 17 Sep. Those instructions define CF only; OF, SF, ZF, AF and PF are architecturally UNDEFINED (SDM Vol 2A). 9 of the fuzzer's first 24 "mismatches" were two models' choices of undefined. The generator no longer emits them.** |
 

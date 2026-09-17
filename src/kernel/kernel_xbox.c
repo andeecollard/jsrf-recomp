@@ -212,6 +212,47 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
     }
 
+    /* G11 PROBE: SAY WHAT WE ANSWERED, ONCE PER INDEX, AT INFO.
+     *
+     * The per-query line above this switch is XBOX_LOG_DEBUG and player runs
+     * are at INFO, so no existing log can answer the question G11 actually
+     * asks -- does the title read XC_AUDIO (0x09) at all, and what do we tell
+     * it? Without that, flipping the constant would be a change nobody could
+     * score.
+     *
+     * Once per distinct index, so it is bounded by the size of the EEPROM
+     * rather than by how often the title polls: 0x12 plus the factory block is
+     * a couple of dozen lines in the worst case, and in practice JSRF touches
+     * a handful. Read-only, allocates nothing, and costs one bitmap test per
+     * query.
+     *
+     * XC_AUDIO's answer is the one to look for. The channel field is
+     * 0 = stereo, 1 = mono, 2 = surround, and bit 16 is AC3, so the current
+     * 0x00010001 says MONO WITH AC3 -- an encoded path this tree does not
+     * have. Whether that matters depends on whether the title asks, which is
+     * exactly what this line is here to find out. Do not flip the constant on
+     * the strength of the encoding alone; flip it when a run shows the query. */
+    {
+        static uint32_t seen[8];   /* indices 0x00-0xFF, plus the 0x1xx block */
+        unsigned slot = (unsigned)(ValueIndex & 0xFF) >> 5;
+        uint32_t bit = 1u << (ValueIndex & 31);
+        unsigned bank = (ValueIndex > 0xFF) ? 4u : 0u;
+        if (slot + bank < 8 && !(seen[slot + bank] & bit)) {
+            seen[slot + bank] |= bit;
+            unsigned long answered = 0;
+            if (ValueLength >= sizeof(ULONG))
+                answered = (unsigned long)*(PULONG)Value;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_XBOX,
+                "[EEPROM] index 0x%03X queried (first time), len=%u, "
+                "answered 0x%08lX%s",
+                (unsigned)ValueIndex, (unsigned)ValueLength, answered,
+                ValueIndex == XC_AUDIO
+                    ? "  <- XC_AUDIO: low bits 0=stereo 1=mono 2=surround,"
+                      " bit16=AC3"
+                    : "");
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 

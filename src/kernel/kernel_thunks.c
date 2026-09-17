@@ -452,11 +452,39 @@ void xbox_kernel_init(void)
      * of the loaded XBE (0x80000000|ordinal per entry, same source the kernel
      * bridge reads). That makes the table match any title's import order.
      * Without a mapped XBE, fall back to the static reference list below. */
+    /* CHOOSE THE SOURCE ONCE, THEN STAY WITH IT.
+     *
+     * This used to test `i < thunk_count` per slot, with the fallback list in
+     * the else. Past the mapped table's last entry that test failed and the
+     * loop silently switched to ANOTHER TITLE'S import order for the rest of
+     * the table -- and then, past the fallback's 147 initialisers, to zeroes.
+     *
+     * The report is what made it worth fixing. JSRF imports 120 ordinals, of
+     * which four do not resolve; the line said:
+     *
+     *     Thunk table: 143/378 resolved, 235 unresolved
+     *     WARNING: 235 kernel imports are unresolved - game may crash!
+     *
+     * 116 real + 27 borrowed = 143, and 4 real + 231 zero slots = 235. Both
+     * numbers described a table the title does not have, the four names that
+     * really are missing were buried under 231 `Unresolved kernel ordinal 0`
+     * lines, and every run has opened with a crash warning that means nothing.
+     *
+     * A mixed table is not a thing any title has. Either the XBE is mapped and
+     * its thunk list is the truth, or it is not and the reference list is. */
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
+    const int from_xbe = (thunk_base && xbox_GetMemoryBase()) ? 1 : 0;
+    ULONG limit = from_xbe ? thunk_count : XBOX_KERNEL_THUNK_TABLE_SIZE;
+    ULONG missing[8];
+    ULONG missing_n = 0;
+
+    if (limit > XBOX_KERNEL_THUNK_TABLE_SIZE)
+        limit = XBOX_KERNEL_THUNK_TABLE_SIZE;
+
+    for (ULONG i = 0; i < limit; i++) {
         ULONG ordinal;
 
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+        if (from_xbe) {
             uint32_t entry = *(volatile uint32_t *)
                 ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
             if (entry == 0) {
@@ -465,6 +493,11 @@ void xbox_kernel_init(void)
             ordinal = entry & 0x7FFFFFFF;
         } else {
             ordinal = g_thunk_ordinals[i];
+            /* The initialiser is shorter than the array, so the tail is zeroed.
+             * Ordinal 0 is not an export; it means "the list ended". */
+            if (ordinal == 0) {
+                break;
+            }
         }
 
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
@@ -476,16 +509,32 @@ void xbox_kernel_init(void)
             /* Point unresolved thunks to our error handler */
             xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
             unresolved++;
+            if (missing_n < sizeof(missing) / sizeof(missing[0]))
+                missing[missing_n++] = ordinal;
         }
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
-        "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        "Thunk table: %u/%u resolved, %u unresolved (%s)",
+        resolved, resolved + unresolved, unresolved,
+        from_xbe ? "from the mapped XBE" : "reference list, no XBE mapped");
 
+    /* Name them. A count cannot be acted on; an ordinal can be looked up. */
     if (unresolved > 0) {
+        char names[160];
+        int off = 0;
+        for (ULONG i = 0; i < missing_n; i++) {
+            int n = snprintf(names + off, sizeof(names) - (size_t)off,
+                             "%s%u", i ? ", " : "", (unsigned)missing[i]);
+            if (n < 0 || (size_t)(off + n) >= sizeof(names)) break;
+            off += n;
+        }
+        names[sizeof(names) - 1] = '\0';
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
-            "WARNING: %u kernel imports are unresolved - game may crash!", unresolved);
+            "%u kernel import(s) unresolved: ordinal %s%s. The bridge may "
+            "still implement them -- this table is only reached if the guest "
+            "calls through the XBE's thunks.",
+            unresolved, names, missing_n < unresolved ? ", ..." : "");
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
