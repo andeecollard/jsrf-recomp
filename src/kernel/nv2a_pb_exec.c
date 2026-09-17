@@ -1900,21 +1900,10 @@ static uint32_t surface_nonzero(uint32_t offset, uint32_t bpp)
  * real, the player pays it, and leaving it out would flatter us.
  *
  * A histogram rather than a running mean, because percentiles are the point.
- * 500 us bins to 128 ms and one overflow bucket: 2 KB of statics, one
- * clock_gettime and one increment per frame, against a [FB] line that already
- * checksums the entire framebuffer once a second. Unconditional for that
- * reason -- an opt-in perf counter is one nobody has switched on when they
- * need the number.
- *
- * Percentiles report their bin's UPPER edge, so p50=16.5 means "half of all
- * frames finished in 16.5 ms or less", accurate to the 0.5 ms bin width.
- * max_us is exact and is not binned. */
-#define FRAME_BIN_US   500u
-#define FRAME_BINS     257u          /* 0..128 ms, plus one overflow bucket */
-typedef struct {
-    unsigned long long n, total_us, bin[FRAME_BINS];
-    unsigned long long max_us;
-} FrameHist;
+ * Unconditional: an opt-in perf counter is one nobody has switched on when
+ * they need the number. The bins, the percentile and the per-frame split live
+ * in frame_hist.h, where a test can reach them without a device. */
+#include "frame_hist.h"
 
 /* Two of them, and the second is the one you usually want.
  *
@@ -1935,6 +1924,74 @@ static struct {
     int started;
 } s_frame;
 
+/* THE GO/NO-GO INSTRUMENT FOR G3, AND IT CAN SAY NO.
+ *
+ * The cumulative split -- 51 s draining and 12 s reading back across 7,936
+ * flips -- gives 7.9 ms of sync per frame, "48% of the frame". That average is
+ * true and it does not settle the question, because the frame time that has to
+ * move is the MEDIAN: p50 = 18.0 ms against a 16.68 ms budget. Removing a
+ * stall from frames that were already inside budget buys a better mean and
+ * exactly nothing a player can feel.
+ *
+ * So bin the same three quantities per frame, from the same pair of samples,
+ * and let the percentiles answer it:
+ *
+ *   [SYNC]  what sync cost on each frame.
+ *   [NOSYNC] frame time MINUS that frame's sync -- what the frame would have
+ *            cost had sync been free.
+ *
+ * NOSYNC's p50 is the decision. Above 16.68 ms and the surface-swap work in
+ * G3 cannot reach 60 fps on its own, whatever the mean says, and the next
+ * question is which OTHER stage owns the median frame. Below it, the work is
+ * worth doing and this line is the number to beat afterwards.
+ *
+ * IT IS AN UPPER BOUND ON THE WIN, NOT A PREDICTION. Removing the stall
+ * removes the serialisation, not the GPU work it was waiting on: some of the
+ * drained time is work that would still have to happen, merely overlapped. A
+ * bound that says "no" is still decisive; a bound that says "yes" is a
+ * permission to try, which is exactly how the flip-sync plan should have been
+ * treated before a week went into it.
+ *
+ * Derived from a cumulative nanosecond total, so it needs the backend to have
+ * one; on a host without the Metal path the two histograms stay empty and
+ * frame_stats_report prints neither, which is an absence that says "not
+ * measured here" rather than a zero that reads like "costs nothing". */
+static struct {
+    FrameHist sync_run, sync_win, nosync_run, nosync_win;
+    unsigned long long last_sync_ns;
+    int have;
+} s_sync;
+/* Frames whose sync interval exceeded the frame interval. See the clamp. */
+static unsigned long long s_sync_clamps;
+
+/* RECOMP_SYNC_HIST -- OFF BY DEFAULT, AND THE REASON IS A GUEST HALT.
+ *
+ * A 240 s scripted run with this accumulating unconditionally stopped the
+ * guest dead at 9,480 flips: flips, [APU-VOICE] guest_methods and [APU-BIN]
+ * 2D heard all froze in the same window and never moved again, while the
+ * emulator's own threads kept running at 389% CPU. The control at HEAD, same
+ * schedule, same switches, ran to 13,398 flips with no repetition, and a
+ * player session on HEAD played for ten minutes without it.
+ *
+ * That is ONE RUN PER ARM, which this project's own scorer voids -- and the
+ * code here is a read of two counters and some arithmetic, with no lock, no
+ * allocation and no Metal call, so a mechanism is not apparent. It may well be
+ * a pre-existing intermittent hang that this run happened to hit, or timing
+ * perturbation of one: play_scripted.sh's header already records that heavy
+ * probes destabilise this title.
+ *
+ * Unproven either way, which is exactly why it ships off. [FRAME] is
+ * deliberately unconditional on the argument that an opt-in perf counter is
+ * one nobody has switched on when they need it; that argument does not
+ * survive being implicated in a halt. Resolve it with two runs per arm before
+ * making this the default. */
+static int sync_hist_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_SYNC_HIST");
+    return on;
+}
+
 static void frame_stats_flip(void)
 {
     struct timespec now;
@@ -1944,43 +2001,35 @@ static void frame_stats_flip(void)
          * unsigned difference reads about 4e9 us once a second. */
         long long us = (long long)(now.tv_sec - s_frame.last.tv_sec) * 1000000LL
                      + ((long long)now.tv_nsec - (long long)s_frame.last.tv_nsec) / 1000LL;
-        unsigned b;
         if (us < 0) us = 0;
-        b = (unsigned)((unsigned long long)us / FRAME_BIN_US);
-        if (b >= FRAME_BINS) b = FRAME_BINS - 1u;
-        s_frame.run.bin[b]++;
-        s_frame.win.bin[b]++;
-        s_frame.run.n++;
-        s_frame.win.n++;
-        s_frame.run.total_us += (unsigned long long)us;
-        s_frame.win.total_us += (unsigned long long)us;
-        if ((unsigned long long)us > s_frame.run.max_us)
-            s_frame.run.max_us = (unsigned long long)us;
-        if ((unsigned long long)us > s_frame.win.max_us)
-            s_frame.win.max_us = (unsigned long long)us;
+        frame_hist_add(&s_frame.run, (unsigned long long)us);
+        frame_hist_add(&s_frame.win, (unsigned long long)us);
+#if defined(__APPLE__)
+        if (sync_hist_on()) {
+            /* Differenced against the PREVIOUS flip, so the interval is
+             * exactly the one the frame time above covers. The first flip
+             * establishes the baseline and is not binned -- its "frame" began
+             * at process start and would bin every sync since boot into one
+             * bucket, which is the shape of the counter that differenced
+             * against the wrong timestamp and read ~0. */
+            unsigned long long ns = nv2a_metal_sync_ns();
+            if (s_sync.have) {
+                unsigned long long sync_us, nosync_us;
+                frame_hist_split((unsigned long long)us,
+                                 (ns - s_sync.last_sync_ns) / 1000ull,
+                                 &sync_us, &nosync_us, &s_sync_clamps);
+                frame_hist_add(&s_sync.sync_run, sync_us);
+                frame_hist_add(&s_sync.sync_win, sync_us);
+                frame_hist_add(&s_sync.nosync_run, nosync_us);
+                frame_hist_add(&s_sync.nosync_win, nosync_us);
+            }
+            s_sync.last_sync_ns = ns;
+            s_sync.have = 1;
+        }
+#endif
     }
     s_frame.last = now;
     s_frame.started = 1;
-}
-
-/* Upper edge of the bin the p-th percentile falls in, in milliseconds. The
- * overflow bucket has no upper edge, so it reports the bottom of the bucket
- * and the caller's max_us is what says how far past it the run actually got. */
-static double frame_pct(const FrameHist *h, double p)
-{
-    unsigned long long want, seen = 0;
-    unsigned i;
-    if (!h->n) return 0.0;
-    want = (unsigned long long)((double)h->n * p);
-    if (want < 1) want = 1;
-    for (i = 0; i < FRAME_BINS; ++i) {
-        seen += h->bin[i];
-        if (seen >= want)
-            return (i + 1u == FRAME_BINS)
-                 ? (double)(FRAME_BINS - 1u) * FRAME_BIN_US / 1000.0
-                 : (double)(i + 1u) * FRAME_BIN_US / 1000.0;
-    }
-    return (double)(FRAME_BINS - 1u) * FRAME_BIN_US / 1000.0;
 }
 
 static void frame_hist_line(const char *tag, const FrameHist *h)
@@ -2086,6 +2135,44 @@ static void pb_stage_line(unsigned long long frames, unsigned long long frame_us
     }
 }
 
+/* Same percentiles as frame_hist_line, without the fps: the reciprocal of a
+ * stage cost is not a frame rate and printing one invites the reader to
+ * subtract two "fps" figures, which is not how time adds up. */
+static void cost_hist_line(const char *tag, const FrameHist *h)
+{
+    fprintf(stderr, "  [%s] frames=%llu mean=%.2f ms"
+            " p50=%.1f p90=%.1f p95=%.1f p99=%.1f max=%.1f ms\n",
+            tag, (unsigned long long)h->n,
+            (double)h->total_us / (double)h->n / 1000.0,
+            frame_pct(h, 0.50), frame_pct(h, 0.90), frame_pct(h, 0.95),
+            frame_pct(h, 0.99), (double)h->max_us / 1000.0);
+}
+
+/* The two lines G3 turns on. Printed only when there are samples, because a
+ * histogram of nothing prints p50=0.0 and that reads like "sync is free". */
+static void sync_stats_line(void)
+{
+    if (!s_sync.sync_run.n) return;
+    cost_hist_line("SYNC", &s_sync.sync_run);
+    cost_hist_line("NOSYNC", &s_sync.nosync_run);
+    if (s_sync.sync_win.n) {
+        cost_hist_line("SYNC-WIN", &s_sync.sync_win);
+        cost_hist_line("NOSYNC-WIN", &s_sync.nosync_win);
+    }
+    /* The positive control for the subtraction. Non-zero means a sync was
+     * timed outside the frame interval it was charged to -- another thread, or
+     * a clock disagreement -- and every percentile above is then suspect. */
+    fprintf(stderr, "  [SYNC] budget %.2f ms: %s (NOSYNC p50=%.1f ms),"
+            " clamped frames=%llu\n", FRAME_BUDGET_MS,
+            frame_hist_budget_ok(&s_sync.nosync_run)
+                ? "reachable without the sync stall"
+                : "NOT reachable by removing the sync stall alone",
+            frame_pct(&s_sync.nosync_run, 0.50),
+            (unsigned long long)s_sync_clamps);
+    memset(&s_sync.sync_win, 0, sizeof s_sync.sync_win);
+    memset(&s_sync.nosync_win, 0, sizeof s_sync.nosync_win);
+}
+
 static void frame_stats_report(void)
 {
     if (!s_frame.run.n) {
@@ -2097,6 +2184,7 @@ static void frame_stats_report(void)
         frame_hist_line("FRAME-WIN", &s_frame.win);
         pb_stage_line(s_frame.win.n, s_frame.win.total_us);
     }
+    sync_stats_line();
     memset(&s_frame.win, 0, sizeof s_frame.win);
     memset(&s_stage_win, 0, sizeof s_stage_win);
 }

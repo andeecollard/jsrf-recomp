@@ -63,6 +63,13 @@ int nv2a_metal_shader_blend_mode(void);
 int nv2a_metal_shader_blend_for(int mode, int blend, int dither);
 /* Stable diagnostic label for the most recent -1 result. */
 const char *nv2a_metal_last_reject(void);
+/* Cumulative nanoseconds spent inside nv2a_metal_sync -- draining the GPU and
+ * reading the surface back -- since process start. Exported so the pushbuffer
+ * executor, which is the only code that knows where a frame ends, can
+ * difference it per flip and build a PER-FRAME distribution. A cumulative
+ * total cannot answer the question that matters: whether the stall sits on
+ * the median frame or only on the tail. See [SYNC] in nv2a_pb_exec.c. */
+unsigned long long nv2a_metal_sync_ns(void);
 /* Compact cumulative counters for live performance validation. */
 void nv2a_metal_report(void);
 /* Command-buffer accounting (RECOMP_METAL_CB_STATS=1). The frame count is

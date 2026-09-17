@@ -2123,6 +2123,20 @@ static void batch_flush(void)
     batch_command=nil;batch_encoder=nil;batch_pins=0;batch_draws=0;
 }
 
+/* THE ONE NUMBER THE CUMULATIVE TOTAL CANNOT GIVE.
+ *
+ * g_sync_drain_ns + g_sync_read_ns already says sync costs 7.9 ms per frame
+ * averaged over a run, which is how G3 got its "48% of the frame". An average
+ * cannot say whether that cost sits on the MEDIAN frame or only on the tail,
+ * and p50 against the 16.68 ms budget is the number that has to move --
+ * removing a stall from frames that were already fast buys nothing. So hand
+ * the running total to the only code that knows where a frame ends, and let
+ * it difference. Read-only, and it allocates nothing: a flip can afford it. */
+unsigned long long nv2a_metal_sync_ns(void)
+{
+    return (unsigned long long)(g_sync_drain_ns + g_sync_read_ns);
+}
+
 void nv2a_metal_report(void)
 {
     fprintf(stderr,"[METAL] sync %llu calls (%llu already clean): %.1f ms draining"
