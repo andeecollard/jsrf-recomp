@@ -454,6 +454,20 @@ add_executable(jsrf_adpcm_decode_test adpcm_decode_test.c)
 target_link_libraries(jsrf_adpcm_decode_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_adpcm_decode COMMAND jsrf_adpcm_decode_test)
 
+# The decode-pair guard, whose absence crashed the title in the guest's
+# DirectSound ISR on 17 Sep 2026. Registered TWICE because the accessor caches
+# its getenv in a static, so one process only ever sees one value -- and the
+# default itself is the property under test, since it silently read "off"
+# while the comment on it said "on".
+add_executable(jsrf_apu_fedec_hold_test apu_fedec_hold_test.c)
+target_link_libraries(jsrf_apu_fedec_hold_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_fedec_hold_default COMMAND jsrf_apu_fedec_hold_test)
+set_tests_properties(jsrf_apu_fedec_hold_default PROPERTIES
+                     ENVIRONMENT "JSRF_EXPECT_HOLD=1")
+add_test(NAME jsrf_apu_fedec_hold_off COMMAND jsrf_apu_fedec_hold_test)
+set_tests_properties(jsrf_apu_fedec_hold_off PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_FEDEC_HOLD=0;JSRF_EXPECT_HOLD=0")
+
 add_executable(jsrf_ff_refusal_test ff_refusal_test.c)
 target_link_libraries(jsrf_ff_refusal_test PRIVATE xbox_vsh)
 target_include_directories(jsrf_ff_refusal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/nv2a)

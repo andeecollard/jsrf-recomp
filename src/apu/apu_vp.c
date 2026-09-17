@@ -1646,9 +1646,9 @@ void mcpx_apu_idle_trap_report(int crash)
              * trusting its value", and it mattered here: this guard is the one
              * that would break the idle-trap storm, so its state is the first
              * thing anyone debugging that storm reads. */
-            getenv("RECOMP_APU_FEDEC_HOLD")
+            (getenv("RECOMP_APU_FEDEC_HOLD") && *getenv("RECOMP_APU_FEDEC_HOLD"))
                 ? (atoi(getenv("RECOMP_APU_FEDEC_HOLD")) ? "on" : "OFF")
-                : "OFF (default)");
+                : "on (default)");
     if (!g_idle_trap_raises)
         return;
 
@@ -1842,10 +1842,21 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
          * regression cannot be attributed to either one. This is the cheaper
          * half to exonerate -- one run with FEDEC_HOLD=1 and the lock guard
          * off -- and until somebody takes it, shipping it on would be
-         * shipping an unattributed change. */
+         * shipping an unattributed change.
+         *
+         * THE ATTRIBUTION ARRIVED 17 Sep 2026. With the guard off the title
+         * crashed inside the guest's DirectSound ISR shortly after New Game
+         * (guest stack ending 001A25D9, 62 of 2,555 methods dispatched while
+         * trapped). With it on, the next player session ran to completion with
+         * held=1702 of 1,702 and no crash. That is the attribution, so it
+         * ships on. */
+        /* DEFAULT ON since 17 Sep 2026. `(e && *e)` rather than `e`, because
+         * the switch audit found nine default-on sites that read an EMPTY
+         * value as off; RECOMP_APU_FEDEC_HOLD= should mean "unset", not
+         * "disabled". RECOMP_APU_FEDEC_HOLD=0 turns it off for an A/B. */
         static int hold = -1;
         if (hold < 0) { const char *e = getenv("RECOMP_APU_FEDEC_HOLD");
-                        hold = e ? (atoi(e) != 0) : 0; }
+                        hold = (e && *e) ? (atoi(e) != 0) : 1; }
         if (hold && (qatomic_read(&d->regs[NV_PAPU_FECTL])
                      & NV_PAPU_FECTL_FEMETHMODE)
                     == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
