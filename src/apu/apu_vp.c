@@ -851,6 +851,33 @@ unsigned long g_apu_selflink_terminated;
 /* Raises withheld because the voice's own link said it was in no list.
  * See mcpx_apu_idle_trap_selflink. */
 unsigned long g_idle_trap_selflink_suppressed;
+/* WAS THE GUEST EVER TOLD ABOUT THIS VOICE AT ALL?
+ *
+ * The trap carries ONE handle. fe_method writes FEDECMETH/FEDECPARAM, the
+ * guest's ISR reads the pair, and the raise site's own comment says re-raising
+ * "would overwrite FEDECPARAM -- the handle the guest has not read". So when a
+ * burst retires several voices at once, only one handle can be outstanding,
+ * and the coalescing deliberately withholds the rest.
+ *
+ * The question that follows, and which nothing in this tree could answer: of
+ * the voices that went idle, how many ever had their handle DELIVERED? A voice
+ * the guest was never told about cannot be removed by it, stays linked, and
+ * contributes a permanent raise per subframe for the rest of the run. That is
+ * the shape of the storm the player hears as "the sound breaks up when you
+ * speak to gum" -- a burst of VOICE_ON, then a plateau that never recovers.
+ *
+ * `seen` is set wherever a voice is found inactive-and-linked, before any
+ * suppression. `delivered` is set only when fe_method actually WROTE the pair:
+ * with RECOMP_APU_FEDEC_HOLD on, a raise arriving at a trapped front end is
+ * held and the handle never reaches the registers, so raising and delivering
+ * are different events and counting the raise would overstate it.
+ *
+ * seen == delivered means every idle voice was named and the guest simply did
+ * not act. seen > delivered names the voices it was never told about, and that
+ * difference is the measurement. */
+static uint64_t g_idle_seen_mask[(MCPX_HW_MAX_VOICES + 63) / 64];
+static uint64_t g_idle_delivered_mask[(MCPX_HW_MAX_VOICES + 63) / 64];
+unsigned long g_idle_seen_distinct, g_idle_delivered_distinct;
 unsigned long g_idle_trap_selflink_encounters;
 unsigned long g_apu_trap_suppressed;
 
@@ -1405,6 +1432,23 @@ void mcpx_apu_voice_report(void)
      * the decode pair the guest's polling ISR reads. Equal in every run so far,
      * and nothing asserted it; printing the difference is what makes a
      * divergence visible the first time it happens. */
+    {
+        /* The names matter more than the counts: these are the voices the
+         * guest was never told about, so it cannot have removed them. */
+        unsigned k, listed = 0;
+        fprintf(stderr, "  [APU-IDLE-DELIVERY] found idle=%lu distinct,"
+                " handle delivered=%lu distinct, never told about=%lu:",
+                g_idle_seen_distinct, g_idle_delivered_distinct,
+                g_idle_seen_distinct - g_idle_delivered_distinct);
+        for (k = 0; k < MCPX_HW_MAX_VOICES && listed < 16; k++)
+            if ((g_idle_seen_mask[k >> 6] & (1ULL << (k & 63)))
+                && !(g_idle_delivered_mask[k >> 6] & (1ULL << (k & 63)))) {
+                fprintf(stderr, " v%u", k);
+                ++listed;
+            }
+        if (!listed) fprintf(stderr, " none");
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "  [APU-VOICE2] off_already=%lu raises_minus_idle_trap=%ld\n",
             g_apu_voice_off_already_count,
             (long)g_idle_trap_raises - (long)g_apu_idle_trap_count);
@@ -3560,6 +3604,14 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
             int count;
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                /* Before any suppression, coalescing or edge latch: this is
+                 * every voice the hardware would have had something to say
+                 * about, which is the denominator delivery is measured against. */
+                if (v < MCPX_HW_MAX_VOICES
+                    && !(g_idle_seen_mask[v >> 6] & (1ULL << (v & 63)))) {
+                    g_idle_seen_mask[v >> 6] |= 1ULL << (v & 63);
+                    ++g_idle_seen_distinct;
+                }
                 voice_short_note(v, produced, requested_num);
                 voice_fill_silence(samples, produced, requested_num);
                 return requested_num;
@@ -4370,7 +4422,21 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                      * already correct; writing them is then a no-op. */
                     d->regs[current] = v;
                     d->regs[next] = nxt;
-                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                    {
+                        /* Delivered means the PAIR WAS WRITTEN, not that we
+                         * raised. FEDEC_HOLD holds it at a trapped front end,
+                         * and a held pair never reaches the guest's ISR. */
+                        extern unsigned long g_apu_fedec_held;
+                        unsigned long held_before = g_apu_fedec_held;
+                        fe_method(d, SE2FE_IDLE_VOICE, v);
+                        if (g_apu_fedec_held == held_before
+                            && v < MCPX_HW_MAX_VOICES
+                            && !(g_idle_delivered_mask[v >> 6]
+                                 & (1ULL << (v & 63)))) {
+                            g_idle_delivered_mask[v >> 6] |= 1ULL << (v & 63);
+                            ++g_idle_delivered_distinct;
+                        }
+                    }
                     if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) ==
                             NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
                         if (!mcpx_apu_se_while_trapped())
