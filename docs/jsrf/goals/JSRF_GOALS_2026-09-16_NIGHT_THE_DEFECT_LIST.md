@@ -1,5 +1,10 @@
 # JSRF goals — the defect list, 16 September 2026 (night)
 
+> Superseded, 17 September 2026. The active list is
+> `JSRF_GOALS_2026-09-17_NIGHT_FINISH_TRACK_A_FIRST.md`. The marker was missing
+> for a day and the stale name cost a session a correction; kept for the
+> history.
+
 Supersedes `JSRF_GOALS_2026-09-16_EVERYTHING_ON_THE_GPU.md`. The **target is
 unchanged** and is still the player's own words:
 

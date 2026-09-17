@@ -1,5 +1,11 @@
 # JSRF goals — the guest stops talking, 17 September 2026
 
+> Superseded, 17 September 2026 (night). The active list is
+> `JSRF_GOALS_2026-09-17_NIGHT_FINISH_TRACK_A_FIRST.md`, which keeps the same
+> target and the same G-numbers, states the order of work, and adds G10-G13.
+> **This file keeps the full evidence for G1-G5** and is the one to read for
+> any of it.
+
 Supersedes `JSRF_GOALS_2026-09-16_NIGHT_THE_DEFECT_LIST.md`. The **target is
 unchanged** and is still the player's own words:
 
