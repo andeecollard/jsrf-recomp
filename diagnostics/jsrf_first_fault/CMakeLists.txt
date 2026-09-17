@@ -459,6 +459,14 @@ target_link_libraries(jsrf_ff_refusal_test PRIVATE xbox_vsh)
 target_include_directories(jsrf_ff_refusal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/nv2a)
 add_test(NAME jsrf_ff_refusal COMMAND jsrf_ff_refusal_test)
 
+# The per-frame sync histogram behind G3's go/no-go. Header-only arithmetic,
+# so this needs no device and no game -- which is the point: the instrument
+# that decides whether to spend a week on the surface swap has to be shown
+# capable of saying no.
+add_executable(jsrf_frame_hist_test frame_hist_test.c)
+target_include_directories(jsrf_frame_hist_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel)
+add_test(NAME jsrf_frame_hist COMMAND jsrf_frame_hist_test)
+
 add_test(NAME jsrf_switch_audit
          COMMAND ${CMAKE_COMMAND} -E env python3
                  ${CMAKE_CURRENT_SOURCE_DIR}/switch_audit.py
