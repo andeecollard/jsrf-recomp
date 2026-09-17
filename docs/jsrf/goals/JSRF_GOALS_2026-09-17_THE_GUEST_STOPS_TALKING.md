@@ -187,8 +187,42 @@ than the raise would silence it.
 `RECOMP_APU_SELFLINK_END=1`, which is the player's configuration and the only
 one where this means anything. Verified by injected fault. 45 tests.
 
-**Done when:** the player hears music that does not stop, and an A/B separates
-the arms on raises-withheld.
+**REFUTED BY ITS OWN COUNTER, same afternoon.** A full player session with
+`RECOMP_APU_IDLE_TRAP_SELFLINK=1`:
+
+    [APU-TRAP] ... idle_selflink on   selflink_raises_withheld=0 of 0
+
+The switch engaged and **never encountered a self-linked voice**. The music
+still stopped. So this is not the cause, and the 12:17 session's self-link was
+one instance of something more general rather than the mechanism.
+
+*What the 12:27 session shows instead:*
+
+    208 x 3D:v1[]<-TVL      v1 is the 3D list HEAD
+    223 x 3D:v3[]<-v1       v3 follows it
+    seq=71 idle voice=1 next=0003     <- linked to v3, NOT to itself
+
+So the list is TVL -> v1 -> v3, both retired and inactive, and the walk raises
+on each in turn for ever. **The general invariant is that retired voices stay
+in the list and the guest never takes them out**, of which a self-linked head
+was one special case.
+
+*The number that sharpens it:*
+
+    [VOICE-TOP] head writes from guest: 2D=3  3D=8  MP=1
+
+**Eight** writes to the 3D list head in a whole session, against thousands of
+raises telling the guest to remove the head voice. It acknowledges every raise
+through the main APU registers and essentially never moves the head. That is
+the thing to explain, and generalising from one session is what produced this
+dead switch.
+
+The code and its test stay — they are correct for the state they describe and
+cost nothing off — but the switch is **off in the player's config** and should
+not be re-armed without a session that shows `encounters` moving.
+
+**Done when:** we know why the guest acknowledges a removal request and does
+not perform the removal.
 
 ## G1c — The music decays, it does not cut out
 
