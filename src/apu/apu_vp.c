@@ -1436,10 +1436,17 @@ void mcpx_apu_voice_report(void)
         /* The names matter more than the counts: these are the voices the
          * guest was never told about, so it cannot have removed them. */
         unsigned k, listed = 0;
+        /* delivered > seen is impossible if both hooks sit in the same walk,
+         * so it is reported as the instrument fault it is rather than
+         * subtracted into a nonsense unsigned. */
         fprintf(stderr, "  [APU-IDLE-DELIVERY] found idle=%lu distinct,"
-                " handle delivered=%lu distinct, never told about=%lu:",
+                " handle delivered=%lu distinct, never told about=%s%lu:",
                 g_idle_seen_distinct, g_idle_delivered_distinct,
-                g_idle_seen_distinct - g_idle_delivered_distinct);
+                g_idle_delivered_distinct > g_idle_seen_distinct
+                    ? "BROKEN INSTRUMENT, delivered exceeds found by " : "",
+                g_idle_delivered_distinct > g_idle_seen_distinct
+                    ? g_idle_delivered_distinct - g_idle_seen_distinct
+                    : g_idle_seen_distinct - g_idle_delivered_distinct);
         for (k = 0; k < MCPX_HW_MAX_VOICES && listed < 16; k++)
             if ((g_idle_seen_mask[k >> 6] & (1ULL << (k & 63)))
                 && !(g_idle_delivered_mask[k >> 6] & (1ULL << (k & 63)))) {
@@ -3604,14 +3611,6 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
             int count;
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                /* Before any suppression, coalescing or edge latch: this is
-                 * every voice the hardware would have had something to say
-                 * about, which is the denominator delivery is measured against. */
-                if (v < MCPX_HW_MAX_VOICES
-                    && !(g_idle_seen_mask[v >> 6] & (1ULL << (v & 63)))) {
-                    g_idle_seen_mask[v >> 6] |= 1ULL << (v & 63);
-                    ++g_idle_seen_distinct;
-                }
                 voice_short_note(v, produced, requested_num);
                 voice_fill_silence(samples, produced, requested_num);
                 return requested_num;
@@ -4260,6 +4259,21 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                /* Before any suppression, coalescing or edge latch: every
+                 * voice the hardware would have had something to say about,
+                 * which is the denominator delivery is measured against.
+                 *
+                 * ANCHORED ON THE `if (!hold)` LINE ABOVE, because the bare
+                 * ACTIVE_VOICE test appears twice in this file -- the other is
+                 * inside voice_resample -- and the first version of this
+                 * counter patched that one. It then reported delivered=18
+                 * against found=6 and underflowed the difference to 1.8e19,
+                 * which is the only reason the mistake was visible at all. */
+                if (v < MCPX_HW_MAX_VOICES
+                    && !(g_idle_seen_mask[v >> 6] & (1ULL << (v & 63)))) {
+                    g_idle_seen_mask[v >> 6] |= 1ULL << (v & 63);
+                    ++g_idle_seen_distinct;
+                }
                 /* Raise the trap once. Re-raising it for a second dead voice
                  * would overwrite the handle the guest has not read yet, and
                  * re-raising it for the SAME voice every frame is what produced
