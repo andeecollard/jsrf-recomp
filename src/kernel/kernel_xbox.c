@@ -10,7 +10,10 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
+
+#include "../recomp_switch.h"
 
 /* ============================================================================
  * Exported Data Objects
@@ -156,9 +159,38 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo + Dolby Digital enabled (0x00000001 = stereo, 0x00010000 = AC3) */
+        /* STEREO PCM. The old answer here was 0x00010001, and its comment
+         * called that "stereo + Dolby Digital".
+         *
+         * It is neither. In XC_AUDIO_FLAGS the channel field is
+         * 0 = stereo, 1 = mono, 2 = surround, and bit 16 is AC3 -- so
+         * 0x00010001 told every title that the console is set to MONO and that
+         * the dashboard wants an AC3 encoded stream, which this tree has no
+         * path to produce. upstream/main 8a78867 reached the same value
+         * independently. This file has been burned by this constant once
+         * already: see the XC_ index block in kernel.h, where a
+         * parental-control query answered with 0x00010001 sent Halo back to
+         * the dashboard.
+         *
+         * MEASURED before changing, 17 Sep 2026, because "the encoding is
+         * wrong" is not the same claim as "the title reads it":
+         *
+         *     [EEPROM] index 0x009 queried (first time), len=4,
+         *              answered 0x00010001
+         *
+         * JSRF asks, at start-up, before it submits a single voice.
+         *
+         * RECOMP_EEPROM_AUDIO_LEGACY restores the old word exactly, so the
+         * listening A/B costs an `export` in the app's paths.conf and no
+         * rebuild. Through recomp_switch_on rather than a hand-rolled getenv:
+         * the switch ratchet refused the first version of this, correctly --
+         * the hand-rolled form disagrees with the stated grammar on "on",
+         * "yes" and "false", and 129 switches already do. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00010001;
+            static int legacy = -1;
+            if (legacy < 0)
+                legacy = recomp_switch_on("RECOMP_EEPROM_AUDIO_LEGACY");
+            *(PULONG)Value = legacy ? 0x00010001u : 0x00000000u;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

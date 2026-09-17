@@ -481,6 +481,24 @@ add_test(NAME jsrf_apu_fedec_hold_off COMMAND jsrf_apu_fedec_hold_test)
 set_tests_properties(jsrf_apu_fedec_hold_off PROPERTIES
                      ENVIRONMENT "RECOMP_APU_FEDEC_HOLD=0;JSRF_EXPECT_HOLD=0")
 
+# XC_AUDIO answered mono-with-AC3 for as long as this tree has existed, while
+# its comment called it "stereo + Dolby Digital". Registered three times: the
+# DEFAULT arm is the one that matters, because the defect was a default -- a
+# test that only drove the override would have passed against the old code.
+# The third arm passes "yes", which the hand-rolled getenv form this tree is
+# full of would read as OFF -- so it also pins the grammar the helper states.
+add_executable(jsrf_eeprom_audio_test eeprom_audio_test.c)
+target_link_libraries(jsrf_eeprom_audio_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_eeprom_audio_default COMMAND jsrf_eeprom_audio_test)
+set_tests_properties(jsrf_eeprom_audio_default PROPERTIES
+                     ENVIRONMENT "JSRF_EXPECT_AUDIO=0")
+add_test(NAME jsrf_eeprom_audio_legacy COMMAND jsrf_eeprom_audio_test)
+set_tests_properties(jsrf_eeprom_audio_legacy PROPERTIES
+                     ENVIRONMENT "RECOMP_EEPROM_AUDIO_LEGACY=1;JSRF_EXPECT_AUDIO=0x10001")
+add_test(NAME jsrf_eeprom_audio_legacy_word_grammar COMMAND jsrf_eeprom_audio_test)
+set_tests_properties(jsrf_eeprom_audio_legacy_word_grammar PROPERTIES
+                     ENVIRONMENT "RECOMP_EEPROM_AUDIO_LEGACY=yes;JSRF_EXPECT_AUDIO=0x10001")
+
 add_executable(jsrf_ff_refusal_test ff_refusal_test.c)
 target_link_libraries(jsrf_ff_refusal_test PRIVATE xbox_vsh)
 target_include_directories(jsrf_ff_refusal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/nv2a)

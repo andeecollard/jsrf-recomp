@@ -288,10 +288,33 @@ Also caught: index **0x103** (`XC_FACTORY_AV_REGION`) is queried and falls
 through to the `default:` arm, which returns `STATUS_SUCCESS` with a zeroed
 value. A second unhandled start-up answer nobody had looked at.
 
-**Step 2, unblocked and still gated on a listen:** flip to `0x00000000` with a
-`tests/` case, ship it, and ask. Not on the strength of the encoding alone.
+### STEP 2 SHIPPED 17 Sep 22:40, AND THE LISTEN IS OWED.
 
-**Done when:** the player has listened to a build that answers stereo PCM.
+Default is now `0x00000000`, stereo PCM. `RECOMP_EEPROM_AUDIO_LEGACY=1`
+restores `0x00010001` exactly, through `recomp_switch_on` — the ratchet refused
+the first version, which hand-rolled its getenv, and was right to.
+
+Three test arms, and the DEFAULT one is the one that matters, because the
+defect was a default: `jsrf_eeprom_audio_default`, `..._legacy`, and
+`..._legacy_word_grammar`, the last passing `yes` so it also pins the grammar
+the hand-rolled form gets wrong. 51/51. **Verified by injected fault:**
+restoring the old constant fails the default arm alone, with
+`XC_AUDIO answered 0x00010001, expected 0x00000000`.
+
+**Verified end to end in the shipped bundle**, not just in the test:
+
+    [EEPROM] index 0x009 queried (first time), len=4, answered 0x00000000
+
+**Done when:** the player has listened. Because the switch is read through
+`paths.conf`, the A/B costs them an `export` and no rebuild:
+
+    export RECOMP_EEPROM_AUDIO_LEGACY=1   # the old mono+AC3 answer
+
+**What a result looks like, stated before the listen so it cannot be fitted
+afterwards.** The music still dying ~2 min in refutes this as the cause of G1;
+it does not refute the constant being wrong, which is settled on the encoding.
+A change in the balance, the positioning or the survival of the music is the
+thing to report either way.
 
 ## G12 — `MmGetPhysicalAddress` returns a virtual address *(count first)*
 
