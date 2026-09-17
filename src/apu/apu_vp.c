@@ -21,6 +21,9 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+/* recomp_switch_on: one grammar for the switches, so a new one does not fail
+ * the jsrf_switch_audit ratchet by hand-rolling its own getenv. */
+#include "../recomp_switch.h"
 #include <time.h>
 
 /* #define DEBUG_MCPX */
@@ -665,6 +668,43 @@ uint64_t g_apu_voice_ever_on[MCPX_HW_MAX_VOICES / 64];
  * locked_raises is reported rather than silently swallowed.
  *
  * RECOMP_APU_IDLE_TRAP_LOCK_GUARD=1 enables. */
+/* DO NOT RAISE THE IDLE TRAP FOR A VOICE THAT IS IN NO LIST.
+ *
+ * RECOMP_APU_IDLE_TRAP_SELFLINK, default OFF pending an A/B.
+ *
+ * The idle trap means one thing: this voice is LINKED INTO A LIST and is not
+ * active, so tell DirectSound to take it out. `link(v) = v` is the driver's
+ * own marker for "not in any list" -- CMcpxCore::SetupVoiceProcessor writes it
+ * for all 256 voices at boot and RemoveIdleVoice writes it for every voice it
+ * removes. A self-linked voice therefore fails the trap's own precondition,
+ * and raising for it asks the guest to remove something already removed.
+ *
+ * WHY IT STILL HAPPENS, and it is the HEAD that does it. RECOMP_APU_SELFLINK_END
+ * already honours the marker, but only for the NEXT pointer: it rewrites nxt to
+ * 0xFFFF so the walk stops after v. The voice itself is still processed, and if
+ * it is inactive the trap is raised. For a voice sitting at a list head that is
+ * every subframe, for ever, because nothing downstream can move a head.
+ *
+ * MEASURED, player session 17 Sep 2026 12:17. v1 retired, went idle, never came
+ * back on, and its antecedent read TVL -- the top of the 3D voice list -- in
+ * 835 of the ring's recorded raises. It collected 13,651 raises against v3's
+ * 173 and every other voice's three or fewer, while selflink_end terminated
+ * 364,626 walks. The guest acknowledged each raise through the main APU
+ * registers and never updated the head.
+ *
+ * SUPPRESSES THE RAISE ONLY, through the same `suppress` path the lock guard
+ * uses, so the cursors still advance and an ACTIVE self-linked voice is still
+ * rendered. That last part is load-bearing: VOICE_ON prepends a voice that
+ * regs[top] already names, so link(selected) = selected, and a legitimate
+ * single-voice list is self-linked AND active. Skipping the walk rather than
+ * the raise would silence it. */
+int mcpx_apu_idle_trap_selflink(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_IDLE_TRAP_SELFLINK");
+    return on;
+}
+
 int mcpx_apu_idle_trap_lock_guard(void)
 {
     static int on = -1;
@@ -808,6 +848,10 @@ unsigned g_apu_unknown_method_n;
  * about the INHERIT arithmetic is wrong. A self-link is a one-entry cycle in
  * the list mcpx_apu_vp_frame walks. */
 unsigned long g_apu_selflink_terminated;
+/* Raises withheld because the voice's own link said it was in no list.
+ * See mcpx_apu_idle_trap_selflink. */
+unsigned long g_idle_trap_selflink_suppressed;
+unsigned long g_idle_trap_selflink_encounters;
 unsigned long g_apu_trap_suppressed;
 
 int mcpx_apu_se_while_trapped(void);   /* apu_core.c */
@@ -1384,11 +1428,15 @@ void mcpx_apu_voice_report(void)
      * added to it before the VOID rule can check this switch specifically;
      * without that entry the harvest works and the check is simply skipped. */
     fprintf(stderr, "  [APU-TRAP] suppressed=%lu (coalesce %s,"
-            " se_while_trapped %s, idle_edge %s)\n",
+            " se_while_trapped %s, idle_edge %s, idle_selflink %s)"
+            " selflink_raises_withheld=%lu of %lu\n",
             g_apu_trap_suppressed,
             mcpx_apu_trap_coalesce() ? "on" : "OFF",
             mcpx_apu_se_while_trapped() ? "on" : "OFF",
-            mcpx_apu_idle_trap_edge() ? "on" : "OFF");
+            mcpx_apu_idle_trap_edge() ? "on" : "OFF",
+            mcpx_apu_idle_trap_selflink() ? "on" : "OFF",
+            g_idle_trap_selflink_suppressed,
+            g_idle_trap_selflink_encounters);
     /* THE TWO NUMBERS THAT SEPARATE THE TWO STORM HYPOTHESES.
      *
      * persist is raises for a voice whose CFG_FMT says the guest's ISR returns
@@ -4149,7 +4197,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
              * RECOMP_APU_SELFLINK_END=0 restores the previous behaviour for
              * A/B, because a fix measured only against its own arm is not
              * measured. */
-            if (nxt == v && mcpx_apu_selflink_end()) {
+            /* Captured BEFORE the guard below rewrites nxt to 0xFFFF, which
+             * is the only record that this voice named itself. */
+            int self_linked = (nxt == v);
+            if (self_linked && mcpx_apu_selflink_end()) {
                 g_apu_selflink_terminated++;
                 nxt = 0xFFFF;
             }
@@ -4218,6 +4269,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * us" -- which is the only question that matters here and the
                  * one a guard that silently suppressed would destroy. */
                 int suppress = 0;
+                /* Counted whether or not it fires, so a run with the switch
+                 * OFF still answers "how many raises would this have taken",
+                 * which is the only number that decides whether to ship it. */
+                if (self_linked) {
+                    g_idle_trap_selflink_encounters++;
+                    if (mcpx_apu_idle_trap_selflink()) {
+                        if (!trap_held) g_idle_trap_selflink_suppressed++;
+                        suppress = 1;
+                    }
+                }
                 if (locked) {
                     g_idle_trap_locked_encounters++;
                     if (mcpx_apu_idle_trap_lock_guard()) {

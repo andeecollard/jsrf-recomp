@@ -154,6 +154,9 @@ SWITCH_TOKEN = {
     # work: nv2a_pb_exec.c prints "sync_hist on|OFF" on every report whether
     # or not the histogram has samples, so the off arm has something to match.
     "RECOMP_SYNC_HIST":            "sync_hist",
+    # Added 17 Sep 2026. Rides in the [APU-TRAP] parentheses, which is what
+    # the harvester reads; a line of its own would not be seen.
+    "RECOMP_APU_IDLE_TRAP_SELFLINK": "idle_selflink",
 }
 
 

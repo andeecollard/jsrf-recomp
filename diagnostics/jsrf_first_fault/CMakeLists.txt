@@ -182,6 +182,19 @@ add_test(NAME jsrf_apu_register COMMAND jsrf_apu_register_test)
 # one binary because the switch caches its getenv, so a process is in one arm
 # for its whole life. The default arm pins today's behaviour AND the new ring
 # provenance; the guard arm pins the fix and its positive control.
+# A voice whose own link says it is in no list must not be reported as an idle
+# voice IN a list. Registered twice: the accessor caches its getenv.
+add_executable(jsrf_apu_idle_trap_selflink_test apu_idle_trap_selflink_test.c)
+target_link_libraries(jsrf_apu_idle_trap_selflink_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_idle_trap_selflink_default
+         COMMAND jsrf_apu_idle_trap_selflink_test)
+set_tests_properties(jsrf_apu_idle_trap_selflink_default PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_SELFLINK_END=1;JSRF_EXPECT_SELFLINK=0")
+add_test(NAME jsrf_apu_idle_trap_selflink_on
+         COMMAND jsrf_apu_idle_trap_selflink_test)
+set_tests_properties(jsrf_apu_idle_trap_selflink_on PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_SELFLINK_END=1;RECOMP_APU_IDLE_TRAP_SELFLINK=1;JSRF_EXPECT_SELFLINK=1")
+
 add_executable(jsrf_apu_idle_trap_lock_test apu_idle_trap_lock_test.c)
 target_link_libraries(jsrf_apu_idle_trap_lock_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_idle_trap_lock_default

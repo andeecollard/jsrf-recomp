@@ -152,11 +152,43 @@ different moments, and the links simply changed over time. Aggregating a
 per-event field across a whole run and reading it as simultaneous state is the
 same class of error as comparing across scenes.
 
-**Done when:** we know what about v1 and v3 reads as inactive-and-linked
-forever. Their trap flags are consistently `[]` — not `L` (locked), not `N`
-(never VOICE_ON), not `P` (ISR returns early), not `R` (repeat) — which is
-itself a clue, since every documented reason for a persistent raise has a
-flag and none of them is set.
+**ANSWERED 17 Sep 2026, 12:17 player session, by `RECOMP_VOICE_LIFECYCLE`.**
+
+    seq=115 retire voice=1 state=00200000 next=0001
+    seq=116 idle   voice=1 state=00000000 next=0001    <- and never `on` again
+    ... 13,651 further raises on v1, none of them a lifecycle event
+
+`next=0001` is v1 naming **itself**: the driver's marker for "not in any
+list". And the trap ring says where it sits — `835 x 3D:v1[R]<-TVL`, TVL being
+the **top of the 3D voice list**. So v1 is the list HEAD, retired, inactive,
+and self-linked, and the guest never moves the head.
+
+**The mechanism, read out of the walk.** `RECOMP_APU_SELFLINK_END` honours the
+marker for the NEXT pointer only:
+
+    if (nxt == v && mcpx_apu_selflink_end()) { nxt = 0xFFFF; }   // stop AFTER v
+    if (!hold) d->regs[next] = nxt;
+    if (!voice_get_mask(d, v, ..._ACTIVE_VOICE)) { ... raise ... }   // v processed
+
+The walk stops after v but still **processes v**, and v is inactive, so it
+raises. At a head that is every subframe for ever, because nothing downstream
+can move a head. `terminated=364626` shows the guard firing the whole time.
+
+**Fix built, `RECOMP_APU_IDLE_TRAP_SELFLINK`, default OFF pending an A/B.** A
+self-linked voice is in no list, so the trap's own precondition — linked AND
+inactive — is false; do not raise. It suppresses the RAISE only, through the
+same counted `suppress` path the lock guard uses, so cursors still advance and
+an ACTIVE self-linked voice is still rendered. That last part is load-bearing:
+VOICE_ON prepends a voice `regs[top]` already names, so a legitimate
+single-voice list is self-linked AND active, and suppressing the walk rather
+than the raise would silence it.
+
+`jsrf_apu_idle_trap_selflink_*` drives all three states and both arms hold
+`RECOMP_APU_SELFLINK_END=1`, which is the player's configuration and the only
+one where this means anything. Verified by injected fault. 45 tests.
+
+**Done when:** the player hears music that does not stop, and an A/B separates
+the arms on raises-withheld.
 
 ## G1c — The music decays, it does not cut out
 
