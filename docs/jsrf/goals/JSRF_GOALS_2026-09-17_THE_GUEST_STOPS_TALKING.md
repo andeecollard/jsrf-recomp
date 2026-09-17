@@ -221,9 +221,32 @@ Mi*sou`, a mark over the F in `Farside Stab Soul`), plus small floating marks
 above speech lines. So look at whatever indexes a glyph quad, not at the
 tutorial's own code.
 
+### THE LABEL TRAP IS DEAD. Re-arm it before trusting another run.
+
+Measured 17 Sep from the player's own dumps: the watched region
+(`RECOMP_FB_WATCH=280,410,80,35`) alternates **strictly ABABAB by frame
+index** across 39 `watch*.bmp` dumps, with exactly **two** distinct images,
+each byte-identical within its parity.
+
+That is double-buffer rotation, not corruption. The label never changed during
+the whole session; the trap compares frame N against frame N-1, the two
+rotating surfaces differ in that region, so it fires **every frame** and
+catches nothing. The previous handover's premise — "the label changed exactly
+once, on the corrupt frame" — does not hold in the player's build.
+
+It is the tenth instrument this tree has retired for lying, and it explains
+why twelve scripted runs "never caught" the defect: the trap was dumping
+constantly on noise, so a real change was indistinguishable from the rotation.
+
+**Re-arm as:** compare frame N against frame **N-2** (same buffer), or key the
+comparison on the surface address rather than the frame counter. Until then a
+`watch*.bmp` dump is evidence of nothing, and the player's screenshots remain
+the only real evidence we have.
+
 **Done when:** the player sees clean text across a session, and a scripted
-pixel diff of a text frame between CPU and GPU arms is empty. 98 candidate
-frames are already in `glyphdump/` from 17 Sep.
+pixel diff of a text frame between CPU and GPU arms is empty. The 168 + 58
+frames already captured on 17 Sep are **not** usable as candidates until the
+trap is re-armed.
 
 ## G3 — The frame tail: extend `owes_guest_ram` to rendered content
 
