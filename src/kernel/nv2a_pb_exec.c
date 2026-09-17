@@ -13,7 +13,12 @@
 #define NV2A_GPU_TAG         "METAL"
 #define nv2a_gpu_draw        nv2a_metal_draw
 #define nv2a_gpu_sync        nv2a_metal_sync
-#define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()
+/* The range is now HONOURED rather than discarded. It used to read
+ * `nv2a_metal_sync()`, so snapshot_surface passed the real flipped range and
+ * got back whichever surface was bound -- harmless only because the swap
+ * writes back eagerly, and the exact thing that would stop being harmless the
+ * moment it does not. See nv2a_metal_sync_range. */
+#define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync_range(target, bytes)
 #define nv2a_gpu_invalidate  nv2a_metal_invalidate
 #define nv2a_gpu_invalidate_range(target, bytes) nv2a_metal_invalidate(target)
 #define nv2a_gpu_discard(color, depth) nv2a_metal_discard(color, depth)

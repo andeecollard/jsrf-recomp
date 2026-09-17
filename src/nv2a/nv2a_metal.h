@@ -9,6 +9,12 @@ int nv2a_metal_draw(const NV2ATextureCopy *state, const uint8_t *texture,
     const float (*vertices)[16][4], unsigned count, unsigned primitive);
 /* Complete queued draws and copy the retained render surface to guest RAM. */
 int nv2a_metal_sync(void);
+/* Complete queued draws and make a NAMED RANGE of guest RAM correct: the bound
+ * surface as nv2a_metal_sync does, plus any retained surface that owes guest
+ * RAM and overlaps [target, target+bytes). A NULL target or zero length means
+ * "all of it". This is what lets the flip name the range it is about to read,
+ * which is the precondition for deferring the surface swap's writeback. */
+int nv2a_metal_sync_range(uint8_t *target, size_t bytes);
 /* Synchronize, then require the next draw to upload CPU-modified pixels. */
 void nv2a_metal_invalidate(uint8_t *target);
 /* Drop the retained surface without reading it back. Only valid when the

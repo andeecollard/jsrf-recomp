@@ -500,6 +500,14 @@ add_test(NAME jsrf_switch_audit
                  ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
 if(APPLE)
+    # G3's precondition: a named range must write back the surface it names,
+    # and must NOT write back one it does not. The second half is the one that
+    # matters -- a sync_range that ignores its argument behaves correctly and
+    # silently reintroduces the cost deferring exists to remove.
+    add_executable(jsrf_metal_sync_range_test metal_sync_range_test.c)
+    target_link_libraries(jsrf_metal_sync_range_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_sync_range COMMAND jsrf_metal_sync_range_test)
+
     add_executable(jsrf_metal_copy_test metal_copy_test.c)
     target_link_libraries(jsrf_metal_copy_test PRIVATE xbox_vsh)
     # Several draws into one encoder, compared against the software rasteriser.

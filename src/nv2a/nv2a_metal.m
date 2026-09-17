@@ -2123,6 +2123,78 @@ static void batch_flush(void)
     batch_command=nil;batch_encoder=nil;batch_pins=0;batch_draws=0;
 }
 
+/* WRITE BACK THE SURFACE THE CALLER ASKED FOR, NOT THE ONE THAT HAPPENS TO BE
+ * BOUND.
+ *
+ * nv2a_pb_exec.c defines, on this host:
+ *
+ *     #define nv2a_gpu_sync_range(target, bytes) nv2a_metal_sync()
+ *
+ * -- it takes the range and throws it away. snapshot_surface() passes the real
+ * flipped range and gets back whichever surface was bound, and the title
+ * rotates surfaces constantly (402,784 rebinds in one session at a 100% cache
+ * hit rate). The D3D11 backend has had the honest version since it was
+ * written: nv2a_d3d11.c:1224 sync_range_inner walks its cache and syncs every
+ * surface the range touches.
+ *
+ * THIS CHANGES NOTHING TODAY, AND THAT IS DELIBERATE. Every draw sets
+ * surface_dirty, and every surface swap syncs before it rebinds, so guest RAM
+ * is already current for every surface and no slot ever owes it anything for
+ * rendered content. A range walk therefore finds nothing to pay and this
+ * behaves exactly as nv2a_metal_sync() does -- which is the point: it lands
+ * with zero behavioural risk, and is the piece that makes deferring the swap's
+ * writeback SAFE rather than a way to present stale pixels.
+ *
+ * Without it, deferring would mean the flip asking for address X and receiving
+ * whatever was bound. With it, the flip names the range it is about to read
+ * and anything owing that range pays first. */
+static size_t surface_slot_bytes(unsigned i)
+{
+    return (size_t)surf_slot[i].pitch * surf_slot[i].h;
+}
+
+/* Subtraction after ordering, so an end pointer cannot overflow. */
+static int guest_ranges_overlap(const uint8_t *a, size_t a_size,
+                                const uint8_t *b, size_t b_size)
+{
+    uintptr_t av, bv;
+    if (!a || !b || !a_size || !b_size) return 0;
+    av = (uintptr_t)a; bv = (uintptr_t)b;
+    return av <= bv ? bv - av < a_size : av - bv < b_size;
+}
+
+/* Calls, and slots that actually owed the range something. paid=0 across a
+ * whole run is the expected reading until the swap starts deferring; it is
+ * also the positive control that says this walked and found nothing, rather
+ * than that it never ran. */
+static uint64_t g_sync_range_calls, g_sync_range_paid;
+
+int nv2a_metal_sync_range(uint8_t *target, size_t bytes)
+{
+    ++g_sync_range_calls;
+    /* No range named means "all of it", which is what a full invalidate and
+     * every internal caller wants. */
+    if (!target || !bytes) return nv2a_metal_sync();
+
+    /* The bound surface first. It is the only one whose DEPTH can be dirty,
+     * and nv2a_metal_sync is the only path that writes depth back. */
+    if (!nv2a_metal_sync()) return 0;
+
+    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+        if (!surf_slot[i].valid || !surf_slot[i].owes_guest_ram) continue;
+        if (!guest_ranges_overlap(target, bytes,
+                                  surf_slot[i].target, surface_slot_bytes(i)))
+            continue;
+        /* Pays the debt and clears it. A slot that is also the bound surface
+         * has already been written by the sync above, and its debt was
+         * transferred to surface_dirty when it was rebound, so it cannot
+         * double-pay. */
+        surface_slot_writeback(i);
+        ++g_sync_range_paid;
+    }
+    return 1;
+}
+
 /* THE ONE NUMBER THE CUMULATIVE TOTAL CANNOT GIVE.
  *
  * g_sync_drain_ns + g_sync_read_ns already says sync costs 7.9 ms per frame
