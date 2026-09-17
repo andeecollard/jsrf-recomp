@@ -61,9 +61,13 @@ counter, and the counter comes first.
 1. **G3's A/B** — `RECOMP_METAL_DEFER_SWAP`, three trials per arm, and a
    picture before any decision on the default. A1 and A2 are already built;
    this is the step that was never taken.
-2. **The three near-free counters**, in one sitting while the A/B runs occupy
-   the machine: G14's `js` reachability, G10's thunk report, G11's `XC_AUDIO`
-   probe. None changes runtime behaviour, so none can confound a run.
+2. **The three near-free counters**, in one sitting — G14's `js` reachability,
+   G10's thunk report, G11's `XC_AUDIO` probe. None changes runtime behaviour.
+   **Not during the A/B, though.** They are all `src/` edits, and
+   `play_scripted.sh:126` fails a run when any `*.c`, `*.h` or `*.m` under
+   `src/` or `diagnostics/jsrf_first_fault/` is newer than the binary — so a
+   counter written mid-A/B kills every remaining run in the loop. `docs/` and
+   `tools/` are not scanned and are safe.
 3. **The upstream debt** — four items, ranked at *What we owe upstream*.
 4. **G14's fix**, gated on its counter. Expensive: it changes generated code
    for every `js` in the image, so it needs a regenerated gen and a re-verified
