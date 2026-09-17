@@ -342,15 +342,19 @@ counted. Upstream's to have.
 
 ---
 
-## What we owe upstream — four items, none sent
+## What we owe upstream — four items, one sent
 
 Ranked. `origin` is not a fork; PR #57 is merged, so this is an established
 path.
 
-1. **The mixbin discard.** `upstream/main:src/apu/apu_dsp.c:150` reads bins 0
-   and 1 and throws away 2–31, so every 3D voice — every sound effect in any
-   title — is computed and discarded. Ours is `RECOMP_APU_MIXDOWN_ALL`, default
-   on, player-confirmed by ear. Smallest, clearest, most general.
+1. ~~**The mixbin discard.**~~ **SENT 17 Sep 2026 night as
+   [PR #67](https://github.com/sp00nznet/xboxrecomp/pull/67)**, from
+   `andeecollard:mixbin-mixdown`. `upstream/main:src/apu/apu_dsp.c:150` reads
+   bins 0 and 1 and throws away 2–31, so every 3D voice — every sound effect in
+   any title — is computed and discarded. Ported as `RECOMP_APU_MIXDOWN_ALL`,
+   default on, with `tests/apu_mixdown` registered twice and **verified by
+   injected fault**: reverted to upstream's version, `apu_mixdown_all` fails and
+   `apu_mixdown_two_bins` passes. Built and run on macOS ARM64.
 2. **G15**, `bts`/`btr`/`btc` CF. Found by the fuzzer, latent for us.
 3. **G16**, narrow rotates. Same, and it completes PR #57's story.
 4. **`get_data_ptr`'s dead bound** (our G7), as an issue rather than a patch —
