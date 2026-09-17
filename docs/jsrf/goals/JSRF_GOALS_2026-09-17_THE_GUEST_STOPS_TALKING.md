@@ -221,6 +221,27 @@ The code and its test stay — they are correct for the state they describe and
 cost nothing off — but the switch is **off in the player's config** and should
 not be re-armed without a session that shows `encounters` moving.
 
+### THREE SYMPTOMS, ONE DEFECT, ONE TABLE
+
+The player described the audio three ways on 17 Sep -- "the sound breaks up
+when you speak to gum", "the music slow and then stops", and "no music in the
+level". They are not three bugs. They are three points on one curve:
+
+    w4   on+7   trap+6     2Dheard+18590   dialogue starts voices; music healthy
+    w5   on+0   trap+1     2Dheard+15008
+    w6   on+7   trap+118   2Dheard+14540   second burst; storm ramping
+    w7   on+5   trap+358   2Dheard+13866   "breaks up when you speak to gum"
+    w8   on+1   trap+368   2Dheard+13776
+    w9   on+0   trap+369   2Dheard+9606    "slow, and then stops"
+    w10  on+0   trap+366   2Dheard+0       "no music in the level"
+    ...  630 further windows, all zero
+
+The burst of VOICE_ON ramps the storm (6 -> 118 -> 358), the music degrades in
+lockstep with it, and at w10 it stops and never returns. **The music is killed
+during the dialogue, before the level begins.** "No music in the level" is the
+aftermath, not a separate defect, and it is the most precise description of
+this failure anyone has produced.
+
 ### THE TRIGGER IS A BURST OF VOICE STARTS, AND THE PLAYER FOUND IT
 
 Player, 17 Sep: *"the sound breaks up when you speak to gum"*. That is a
