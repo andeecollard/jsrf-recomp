@@ -77,6 +77,43 @@ token is inert because `switch_state_for` only matches names in `SWITCH_TOKEN`.
 Re-scoring the archived logs with the fix reads "arms verified distinct", with
 no new runs.
 
+## THE COLOUR RESOLVE: THE SAVING IS REAL AND IS NOT MOVED. NOT YET SEPARATED.
+
+`RECOMP_METAL_NO_COLOUR_SYNC`, 4 trials per arm, 240 s, ABBA, binary pinned
+(same sha256 as the flip-sync A/B), arms verified distinct, one run excluded
+for never reaching a mission.
+
+    =0  frame 23.63 22.04 23.72 ms        (mean 23.13, n=3)
+    =1  frame 21.77 20.75 21.82 22.97 ms  (mean 21.83, n=4)
+    ranges overlap on one run -- VOID by the non-overlap bar
+
+**The stage data is what makes this worth keeping.** Unlike the flip
+read-back, the cost is removed rather than relocated:
+
+    sync    =0  9.60 9.45 8.97          =1  7.73 7.91 8.22 8.07
+    submit  =0  4.85 4.72 4.02          =1  4.08 4.11 4.16 4.11
+
+`sync` separates non-overlappingly -- max(=1) 8.22 < min(=0) 8.97 -- for a mean
+delta of **1.36 ms**, and `submit` does not absorb it. The frame mean moves
+**1.30 ms**, which matches the stage saving to within 0.06 ms. Mechanism and
+effect agree, which is stronger than either number alone.
+
+Compare the flip read-back, where `sync` went to 0.01 and `submit` rose by
+almost exactly as much. That is the difference between a resolve that is never
+performed and a wait that is merely deferred.
+
+**Owed:** four more trials. Depth took 8 usable runs across two A/Bs to
+separate; this has 7, and 3 of the 4 `=1` values already sit below every `=0`
+value.
+
+**A methodological failure worth recording, because it cost a whole A/B.** The
+first colour A/B was run while this session was grinding Python over the 50 MB
+generated tree for the dead-flag and clobber scans -- exactly what the three
+subagents had been instructed not to do, for exactly this reason. Its frame
+spread was 20-44 ms against 20.75-23.72 on the quiet re-run. The stage numbers
+survived contamination because they are per-frame averages within a run, but
+the frame-time arm was worthless. **A frame-time A/B owns the machine.**
+
 ## A1 IS NOT THE FRAME-TIME LEVER. Measured, and the plan is wrong.
 
 `PLAN_2026-09-18_NIGHT3` ranks the NV2A descriptor table as "the biggest lever
