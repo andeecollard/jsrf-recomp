@@ -238,11 +238,26 @@ Microsoft had the source, the PDBs and a build farm, and still did not solve x86
 function-boundary detection. They emit an entry point at **every guest byte** and
 let the ~2/3 that are not instruction starts resync into the runtime through
 stubs. Measured: ~31–34% of map entries are instruction starts at 2.94–3.19 guest
-bytes apiece, an x86 instruction-length histogram. This upgrades
-`ms-fusion-recompiler.md`'s adopt-item 1 ("flat, directly-indexed dispatch, an
-entry point per basic block") from a reasonable idea to a measured one, and it
-says our 8,876 detected functions are not a deficiency to be engineered away by
-better detection — the fallback is the answer, not the detector.
+bytes apiece, an x86 instruction-length histogram. This says our 8,876 detected
+functions are not a deficiency to be engineered away by better detection — the
+fallback is the answer, not the detector.
+
+**And adopt-item 1 is half done already, which I had not checked.**
+`g_flat_table` exists in `tools/recomp/translator.py:2056`, is byte-granular
+(indexed `xbox_va - g_flat_base`), falls back to binary search when it cannot
+allocate, and has a passing test (`tools/recomp/test_dispatch_flat.py`, flat
+table 499,688 bytes). The STRUCTURE is built. What is missing is ENTRIES: it is
+populated from `g_recomp_table`, which holds detected function starts only. So
+the actionable item is not "build a flat table" but "put more in the one we
+have" — basic-block heads at minimum. Microsoft's answer to the same question was
+every guest byte, with two thirds of those being short real translations that
+rejoin the stream rather than error paths.
+
+Correction to a related claim in this plan: I first wrote that the non-instruction
+entries "point at resync stubs". Measured on Blinx, 99.96% of host targets are
+distinct, 61% of a 400-entry sample end in a direct jump after 2-3 instructions
+with 91% landing on another map entry, ~8% are int3-poisoned and only ~7% escape
+to the runtime. See `docs/technical/ms-fusion-corpus.md`.
 
 **G2 may have no general fix, and that is normal.** `VGPUDX12.dll` carries **36
 hand-written per-title shader overrides** (Splinter Cell 1/2, Ninja Gaiden Black,
