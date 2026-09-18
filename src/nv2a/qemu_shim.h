@@ -10,6 +10,7 @@
 #ifndef BURNOUT3_QEMU_SHIM_H
 #define BURNOUT3_QEMU_SHIM_H
 
+#include "../kernel/irq_latency.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -192,8 +193,14 @@ static inline void pci_set_long(uint8_t *config, uint32_t val) {
     *(uint32_t *)config = val;
 }
 
-static inline void pci_irq_assert(PCIDevice *d) { (void)d; }
-static inline void pci_irq_deassert(PCIDevice *d) { (void)d; }
+/* THE RAISE SIDE OF THE WINDOW. xemu drops the device mutex, takes the Big QEMU
+ * Lock and asserts a real PCI IRQ, and the guest takes it at the next
+ * instruction boundary. Here the assert is a no-op and the guest's ISR runs only
+ * when some thread calls a wait function. That gap has been argued about for two
+ * days and never measured, so time it: recomp_irq_latency_raise() is a cached
+ * int read when unarmed. See src/kernel/irq_latency.h. */
+static inline void pci_irq_assert(PCIDevice *d) { (void)d; recomp_irq_latency_raise(); }
+static inline void pci_irq_deassert(PCIDevice *d) { (void)d; recomp_irq_latency_clear(); }
 
 /* ============================================================
  * VGA (stub - minimal needed by NV2A)

@@ -25,6 +25,7 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#include "irq_latency.h"
 #include "kernel.h"
 #include "../recomp_switch.h"
 #include "xbox_memory_layout.h"
@@ -2944,6 +2945,9 @@ static int bridge_nv2a_base_valid(uint32_t base)
  * time, and D3D's DPC mutates shared pending state under that assumption. */
 static uint32_t bridge_run_isr(uint32_t interrupt_va)
 {
+    /* The guest is about to service it: close the outstanding raise. */
+    recomp_irq_latency_deliver();
+
     return bridge_run_isr_ex(interrupt_va, NULL);
 }
 
@@ -7836,6 +7840,7 @@ static void kernel_thunk_dispatch(void)
                     g_kernel_call_count, ordinal, slot, g_esp);
             xbox_bridge_dump_ordinal_histogram();
             xbox_bridge_dump_thread_census((unsigned long)now);
+            recomp_irq_latency_report();
             fflush(stderr);
             last_summary_tick = now;
         }

@@ -19,6 +19,7 @@ set(KERNEL_SOURCES
     kernel_crypto.c
     kernel_thunks.c
     kernel_bridge.c
+    irq_latency.c
     xbox_memory_layout.c
     xbox_usb_ohci.c
     icall_feedback.c

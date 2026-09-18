@@ -494,6 +494,10 @@ add_executable(jsrf_apu_trap_thread_test apu_trap_thread_test.c)
 target_link_libraries(jsrf_apu_trap_thread_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_apu_trap_thread COMMAND jsrf_apu_trap_thread_test)
 
+add_executable(jsrf_irq_latency_test irq_latency_test.c)
+target_link_libraries(jsrf_irq_latency_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_irq_latency COMMAND jsrf_irq_latency_test)
+
 add_executable(jsrf_kernel_thread_census_test kernel_thread_census_test.c)
 target_link_libraries(jsrf_kernel_thread_census_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_kernel_thread_census COMMAND jsrf_kernel_thread_census_test)
