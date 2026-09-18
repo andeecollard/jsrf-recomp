@@ -166,8 +166,16 @@ def lift(code):
     # Use the TRANSLATOR's own predicates, not a guess: lifting with a
     # different needs_cf/needs_zf from production would test a path recomp
     # never takes, which is the same trap the conformance _lift docstring names.
-    lf.needs_cf = FT._function_needs_cf(insns)
-    lf.needs_zf = FT._function_needs_zf(insns)
+    # getattr, because this runs against two trees: _function_needs_zf is a
+    # later addition and upstream's translator does not have it. Falling back
+    # to the mnemonic test rather than to False keeps adc/sbb lifting honest.
+    needs_cf = getattr(FT, "_function_needs_cf", None)
+    lf.needs_cf = (needs_cf(insns) if needs_cf
+                   else any(i.mnemonic in ("sbb", "adc", "rcl", "rcr")
+                            for i in insns))
+    needs_zf = getattr(FT, "_function_needs_zf", None)
+    if needs_zf:
+        lf.needs_zf = needs_zf(insns)
     lines, _ = lift_basic_block(lf, BasicBlock(start=BASE, instructions=insns))
     return list(lines), mnem
 
