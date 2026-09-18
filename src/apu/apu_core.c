@@ -64,6 +64,23 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* IEN gate census -- see the comment at the gate in mcpx_apu_update_irq. */
+unsigned long g_apu_ien_raised;
+unsigned long g_apu_ien_suppressed;
+unsigned long g_apu_ien_writes;
+unsigned int  g_apu_ien_last;          /* last value the guest wrote to IEN */
+unsigned long long g_apu_ien_last_frame;  /* g_apu_out_frames at that write */
+
+void mcpx_apu_ien_report(void)
+{
+    extern unsigned long long g_apu_out_frames;
+    fprintf(stderr, "  [APU-IEN] value=%08X writes=%lu last_written_at=%.3f s"
+                    " | raises allowed=%lu SUPPRESSED BY IEN=%lu\n",
+            g_apu_ien_last, g_apu_ien_writes,
+            (double)g_apu_ien_last_frame / 48000.0,
+            g_apu_ien_raised, g_apu_ien_suppressed);
+}
+
 static void update_irq(MCPXAPUState *d)
 {
     /* FEMETHMODE is a field, not a flag, so it has to be masked before it is
@@ -76,6 +93,25 @@ static void update_irq(MCPXAPUState *d)
             == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
     }
+    /* WHY THIS GATE IS INSTRUMENTED.
+     *
+     * Microsoft's own MCPX model, read on 18 Sep 2026 out of two independent
+     * builds of their emulator, STORES NV_PAPU_IEN AND NEVER READS IT, and
+     * never reads or writes FETFORCE0/1 at all -- not one access in either
+     * build. Ours gates the whole interrupt on IEN here. So a guest that clears
+     * IEN goes permanently silent against us and keeps being serviced by them,
+     * and that is exactly the shape of the freeze: the model stops notifying,
+     * the guest stops being invoked, guest_methods freezes, and rendering
+     * carries on untouched for twenty minutes.
+     *
+     * The FETFORCE1 half of the same worry is already answered:
+     * raises_minus_idle_trap reads 0 in all 304 reports of the 17:55 session,
+     * so the guest never cleared it. IEN was never measured at all.
+     *
+     * `suppressed` is the decisive counter: something wanted to raise and IEN
+     * refused. Zero means this gate is not the mechanism. Nonzero and growing
+     * from the freeze point means it is. The counter costs one increment on a
+     * path that already branches. */
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
@@ -83,11 +119,18 @@ static void update_irq(MCPXAPUState *d)
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
         pci_irq_assert(PCI_DEVICE(d));
+        ++g_apu_ien_raised;
     } else {
+        /* Distinguish "nothing pending" from "pending but MASKED BY IEN". Only
+         * the second is a divergence from Microsoft's model. */
+        if (d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS)
+            ++g_apu_ien_suppressed;
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         pci_irq_deassert(PCI_DEVICE(d));
     }
 }
+
+
 
 /* ============================================================
  * MMIO Read / Write
@@ -321,6 +364,12 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
      * issued one from a store lost before this point. g_apu_w_main is the
      * positive control -- other main-register writes arriving while these stay
      * at zero distinguishes "no write" from "this aperture is deaf". */
+    if (addr == NV_PAPU_IEN) {
+        extern unsigned long long g_apu_out_frames;
+        ++g_apu_ien_writes;
+        g_apu_ien_last = (unsigned int)val;
+        g_apu_ien_last_frame = g_apu_out_frames;
+    }
     if (addr == NV_PAPU_TVL2D || addr == NV_PAPU_TVL3D || addr == NV_PAPU_TVLMP) {
         static int trace = -1;
         int idx = (addr == NV_PAPU_TVL2D) ? 0 : (addr == NV_PAPU_TVL3D) ? 1 : 2;

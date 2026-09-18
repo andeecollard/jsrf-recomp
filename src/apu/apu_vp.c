@@ -1578,6 +1578,7 @@ void mcpx_apu_voice_report(void)
             g_apu_fe_method_count, g_apu_set_current_voice_count,
             g_apu_voice_on_loop_count, g_apu_guest_method_count,
             g_apu_voice_off_command_count);
+    { extern void mcpx_apu_ien_report(void); mcpx_apu_ien_report(); }
     /* off_already: see voice_off. raises-vs-idle_trap: g_apu_idle_trap_count
      * only increments when FETFORCE1 has SE2FE_IDLE_VOICE armed, but fe_method
      * writes FEDECMETH/FEDECPARAM BEFORE that test -- so if the guest ever
