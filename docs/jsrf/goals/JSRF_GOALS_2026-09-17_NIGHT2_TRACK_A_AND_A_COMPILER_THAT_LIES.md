@@ -142,6 +142,42 @@ discarded range was never what made the label alternate. See *R*.
 **Done when:** the player sees clean text across a session, and a scripted
 pixel diff of a text frame between CPU and GPU arms is empty.
 
+### THE TEXTURE MATRIX CONVENTION IS UNMEASURED, AND IT IS TEXCOORD-SHAPED
+
+Found 18 Sep by following the only unclean render number in the player's
+session (8 of 608,249 VSH batches rejected for "fixed-function clip W", with
+`METAL_FF=1`). The rejection itself is small and known — `nv2a_ff.c:32` records
+1–193 such batches per run — but the comment beside it names an open question
+that nobody has closed, and it is about **texture coordinates**:
+
+> For the COMPOSITE matrix the question is already answered by the picture […]
+> For the TEXTURE matrix nothing has measured which way round the driver
+> uploads it, and the consequence is not symmetric: a last-COLUMN read gives
+> `q = q_in`, a constant; a last-ROW read gives
+> `q = tx*s + ty*t + tr*r + tq*q_in`, which is **data-dependent and can reach
+> zero for some vertices and not others**.
+
+Data-dependent, per-vertex, sparse texcoord error is the exact shape of "one
+glyph's quad drawn with another glyph's texture coordinates". The tree already
+measured the residue that fits it — `texcoord-q = 3434 of 172,815,065
+triangles, sparse, stops growing once the scene settles`.
+
+**Everything needed to settle it already exists and has never been run.**
+`RECOMP_FF_DUMP` prints texture matrix 0, and the comment states the decision
+rule outright: *a last row of `(0,0,0,1)` means `matrix()` is right; a last
+COLUMN of `(0,0,0,1)` means the transpose is.* The transpose is already
+available as a switch.
+
+**Checked, not assumed:** no `[FF] texture matrix 0` dump appears in any
+`stderr.log` in `render-investigation/`. The runs that do exist report
+`texture matrix: 0 never uploaded, 0 all-zero`, which says the path was not
+exercised in those scenes rather than that the convention is right.
+
+**Next, one scripted run, no player:** `RECOMP_FF_DUMP=1` into a run that
+reaches a scene with text, and read the last row against the last column. It is
+a print, so it cannot break anything, and it either kills this lead or hands
+over a one-switch fix.
+
 **New, and worth watching rather than acting on:** phobos665's fork is hitting
 a text defect too — *"HUD text draws as solid blocks instead of glyphs"*,
 unresolved, suspected `d3dcolor_to_float4` ARGB constant layout. Different
