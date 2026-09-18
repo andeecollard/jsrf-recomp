@@ -227,6 +227,55 @@ rather than hunt for a uniform 15% saving.
 Caveat: `on=27` here against `on=249` in a mission, so this is a light scene by
 the audio measure. It rules thermal out; it does not characterise the heavy one.
 
+## 4b. What the BC packages changed about goals we already had
+
+Four findings from the 18 Sep BC work that bear on live goals, not on research
+for its own sake. Full detail in `/Users/andrewcollard/jsrf/xex_tools/` and
+`docs/technical/ms-fusion-*.md`.
+
+**Boundary detection is not a problem to solve — G2, G14, and the lifter.**
+Microsoft had the source, the PDBs and a build farm, and still did not solve x86
+function-boundary detection. They emit an entry point at **every guest byte** and
+let the ~2/3 that are not instruction starts resync into the runtime through
+stubs. Measured: ~31–34% of map entries are instruction starts at 2.94–3.19 guest
+bytes apiece, an x86 instruction-length histogram. This upgrades
+`ms-fusion-recompiler.md`'s adopt-item 1 ("flat, directly-indexed dispatch, an
+entry point per basic block") from a reasonable idea to a measured one, and it
+says our 8,876 detected functions are not a deficiency to be engineered away by
+better detection — the fallback is the answer, not the detector.
+
+**G2 may have no general fix, and that is normal.** `VGPUDX12.dll` carries **36
+hand-written per-title shader overrides** (Splinter Cell 1/2, Ninja Gaiden Black,
+Panzer Dragoon Orta, KOTOR I/II, Jade Empire, …), several tagged with internal
+bug numbers, plus depth-restore and screen-extent fixups. G2 has killed seven
+hypotheses looking for a general mechanism behind the glyph defect. Microsoft's
+shipping stack needed per-title graphics fixups on top of a general translator.
+**A per-title hook is legitimate engineering here, not a retreat** — and worth
+designing before it is discovered under pressure. No JSRF entry exists in any of
+the four packages.
+
+**G3 has a named parallel: `xoallowtitletoskipresolves`.** Our largest frame-time
+cost is the drain at surface swaps — 79% of sync time, and D1 now says it is
+scene-driven rather than thermal. Microsoft ships a **per-title** switch granting
+permission to elide resolves (`xoallowtitletoskipresolves` on Blinx,
+`xoallowtitletoskipunsampledselftexresolve` on Conker). Same cost, and their
+answer is a per-title permission rather than a general optimisation. Worth
+reading as licence to ask "does this title ever need this resolve?" the way
+`RECOMP_METAL_NO_DEPTH_SYNC` already asked it of depth — that switch won 9.1%.
+
+**`vertexBuffersWriteProtected`** (Blinx only, not global) applies the
+guarded-page technique we use for the APU and NV2A apertures to guest **vertex
+buffers**. Untried here, and per-title in their stack too.
+
+**Where cross-title technique works, measured.** DSOUND is the most stable
+subsystem across XDK generations (80–82% of same-named functions share a size;
+100% Conker/Crimson). D3D8 drifts violently (13–25%). So the symbol-recovery
+technique that worked on DSOUND should be expected to fail on D3D and to do well
+on the XAPI kernel32-style wrappers (90–98%). Calendar proximity is the wrong
+donor proxy: a DirectSound namespace refactor between Nov 2001 and Oct 2002 makes
+Fuzion Frenzy nearly useless (11 names) despite bracketing JSRF most tightly in
+time, while Blinx and Crimson give 109/111 with zero disagreement.
+
 ## 5. Owed upstream *(cheap, not urgent)*
 
 1. **G15** — `bts`/`btr`/`btc` report CF after their own write. Fuzzer-found,
