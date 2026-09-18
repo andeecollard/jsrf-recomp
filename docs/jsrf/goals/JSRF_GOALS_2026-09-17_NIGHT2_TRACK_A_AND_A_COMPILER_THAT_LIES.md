@@ -58,6 +58,11 @@ counter, and the counter comes first.
 
 ## The order
 
+0. **The player's next session**, with `RECOMP_APU_CYCLE_BREAK=1`. It is one
+   line, it needs no build, and it is the first time there has been a reason to
+   set it. The same session re-tests XC_AUDIO=stereo, which has never been
+   heard, and can finally take G1's delivery measurement — scripted runs cannot,
+   because they do not reach the state.
 1. **G3's depth question** — why depth is dirty at nearly every swap, and
    whether guest RAM ever needs it. The A/B is DONE and says A2 is inert: one
    deferral per run against thousands of depth refusals. Do not re-run it.
@@ -102,9 +107,21 @@ distinct handles were ever *delivered* against how many went idle? The
 
 - **G1a** `RECOMP_APU_FEDEC_HOLD` default — **DONE**, one player confirmation
   still owed; the crash it fixed is intermittent.
-- **G1b** why retired voices stay linked — open. `RECOMP_APU_IDLE_TRAP_SELFLINK`
-  was **refuted by its own counter** (`0 of 0`) and must not be re-armed
-  without a session showing `encounters` moving.
+- **G1b** why retired voices stay linked — open, and **reopened on the cycle
+  hypothesis, 18 Sep**. The player's session:
+
+      [APU-CYCLE] relink=90 (of 212 top inserts) walks_with_a_cycle=88
+                  broken=0 last=v3/list1 (cycle_break OFF)
+      [APU-WALKCAP] hit=87
+
+  88 walks met a ring, the cap was hit 87 times, and the voice closing the last
+  one is v3 — a storm voice. The refutation that closed this was taken from a
+  run that never reached gameplay; a scripted run tonight reproduced that false
+  zero exactly (4 top inserts against 212, gate 1 failed). **`cycle_break` has
+  never been switched on**, so nothing is known about breaking the ring. That
+  is the next thing to try and it costs one line in `paths.conf`.
+  `RECOMP_APU_IDLE_TRAP_SELFLINK` remains refuted by its own counter (`0 of 0`)
+  and must not be re-armed without a session showing `encounters` moving.
 - **G1c** the music decays rather than cuts out — open. Not the APU falling
   behind. **Done when** we know what declines, per voice.
 - **G1d** the storm precedes the collapse — open, one session. **Done when** a
@@ -305,6 +322,11 @@ restoring the old constant fails the default arm alone, with
 
     [EEPROM] index 0x009 queried (first time), len=4, answered 0x00000000
 
+**NOT YET HEARD, 18 Sep.** The player reported "sound still messed up" on a
+session launched at 22:40:02 against an engine written at 22:40:24 — twenty-two
+seconds too early. Their log proves it: `index 0x009 ... answered 0x00010001`,
+the old word. The verdict is void and the flip is still untested by ear.
+
 **Done when:** the player has listened. Because the switch is read through
 `paths.conf`, the A/B costs them an `export` and no rebuild:
 
@@ -472,7 +494,7 @@ if their counters justify them.
 | The music death is dropped idle-trap interrupts | `[IRQ-VEC]` shows v1, v3, v5, v6 delivering steadily PAST the death. |
 | `g_vector_in_service` leaked | Same evidence. Nothing is stuck in service. |
 | Trapping the front end idles the sound engine | `trapped_skipped=0`, and `se = total − halted` exactly. |
-| The v1/v3 storm is a two-voice list cycle | `walks_with_a_cycle=0`, `[APU-WALKCAP] hit=0`. The "cycle" was two per-event fields aggregated across a run. |
+| ~~The v1/v3 storm is a two-voice list cycle~~ **RETRACTED 18 Sep — see G1b** | Refuted on `walks_with_a_cycle=0, hit=0` from a scripted run that **never reached gameplay**, so the rings had no chance to form. The player's own session reads `walks_with_a_cycle=88`, `[APU-WALKCAP] hit=87`, `last=v3/list1`, and 32 idle-trap entries flagged `[C]` on v3. A zero without a positive control is not an absence measurement. |
 | The music "slowing" is the APU falling behind | `[APU-FRAME]` steady ~7,500 frames/window across the exact windows where `2D heard` decayed to 0. |
 | The self-linked head is the mechanism | `selflink_raises_withheld=0 of 0`. The switch engaged and never met one. |
 | ~~The idle trap triggers the guest freeze~~ RETRACTED — see G1d | Refuted on a session where the storm was already running before the window examined. The 09:43 session has a clean baseline and reverses it. |
