@@ -181,6 +181,11 @@ SWITCH_TOKEN = {
     # G3 A2. Token printed unconditionally on the [METAL] swap-deferral line,
     # so the off arm has something to match and the VOID check can run.
     "RECOMP_METAL_DEFER_SWAP":     "defer_swap",
+    # G3's depth question. Printed unconditionally on the [METAL] depth
+    # write-back line, and the generic METAL_SWITCH_RE added 17 Sep can
+    # actually see it -- unlike defer_swap, which the old hardcoded regex
+    # could not, so its A/B ran with the VOID check skipped.
+    "RECOMP_METAL_NO_DEPTH_SYNC":  "no_depth_sync",
 }
 
 

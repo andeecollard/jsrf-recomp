@@ -1756,6 +1756,43 @@ static int hw_no_stencil_on(void)
     return on;
 }
 
+/* G3: IS THE DEPTH WRITE-BACK BUYING ANYTHING?
+ *
+ * RECOMP_METAL_NO_DEPTH_SYNC=1, default OFF, diagnostic in the same sense as
+ * RECOMP_METAL_HW_NO_STENCIL above: a path that never returns depth to guest
+ * RAM is wrong by construction if anything reads it.
+ *
+ * WHY IT IS WORTH ASKING. A2 (RECOMP_METAL_DEFER_SWAP) refuses to defer a swap
+ * whenever depth is dirty, because surface_slot_writeback carries colour only.
+ * Measured on a 160 s gameplay run, that refusal fired 5,747-12,656 times
+ * against ONE successful deferral -- so the depth refusal is the whole reason
+ * A2 is inert, and the whole reason [SYNC] still owns the median frame.
+ *
+ * The same run says where sync's time actually goes:
+ *
+ *     sync 38089 calls (12696 already clean): 83847.0 ms draining the GPU,
+ *                                             22728.8 ms reading back
+ *
+ * The DRAIN is 79% of it, not the read-back. The G3 plan was written as though
+ * the 4.9 MB copy were the cost; it is the wait. That matters here because
+ * skipping the depth read-back removes a drain as well as a copy.
+ *
+ * This switch answers "does anything read depth from guest RAM" the only way
+ * that is cheap: stop writing it and look. If the frame is unchanged, the
+ * write-back is buying nothing and A2's refusal can be narrowed. If the frame
+ * breaks, it says exactly what depends on it.
+ *
+ * Counted either way, so a run with it OFF still reports how many write-backs
+ * it would have skipped -- which is the number that says whether the switch is
+ * worth an A/B at all. */
+static int no_depth_sync_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_NO_DEPTH_SYNC");
+    return on;
+}
+static uint64_t g_depth_syncs_skipped, g_depth_syncs_taken;
+
 /* ELEVEN, and it was nine. The key has to name every field the descriptor
  * below reads, or the cache serves a state built for a different draw.
  * stencil_zfail feeds depthFailureOperation and stencil_func_mask feeds
@@ -2386,6 +2423,12 @@ void nv2a_metal_report(void)
             (unsigned long long)(sync_calls - g_sync_by_swap
                                  - g_sync_by_invalidate - g_sync_by_frame_end),
             (unsigned long long)sync_calls, (unsigned long long)sync_clean);
+    fprintf(stderr,"[METAL] depth write-backs: %llu taken, %llu skipped"
+            " (no_depth_sync %s). Each one is a drain as well as a copy, and"
+            " the depth refusal is why defer_swap is inert.\n",
+            (unsigned long long)g_depth_syncs_taken,
+            (unsigned long long)g_depth_syncs_skipped,
+            no_depth_sync_on()?"on":"OFF");
     fprintf(stderr,"[METAL] swap writeback deferred: %llu (refused: %llu depth"
             " dirty, %llu no slot) (defer_swap %s)\n",
             (unsigned long long)g_swap_deferred,
@@ -2727,12 +2770,17 @@ int nv2a_metal_sync(void)
          * they come back from there rather than out of the colour texture's
          * alpha. Written in the guest's own D24S8 layout either way, so
          * nothing downstream can tell which path produced the frame. */
-        if(depth_dirty&&depth_target&&hw_state_on()&&hw_depth_tex) {
-            ++sync_depth;
+        if(depth_dirty&&depth_target&&no_depth_sync_on()) {
+            /* Counted, and the flag is cleared: leaving it set would make the
+             * next sync try again and the switch would measure nothing. */
+            ++g_depth_syncs_skipped;
+            depth_dirty=0;
+        } else if(depth_dirty&&depth_target&&hw_state_on()&&hw_depth_tex) {
+            ++sync_depth; ++g_depth_syncs_taken;
             hw_depth_readback(depth_target,surface_width,surface_height,depth_pitch);
             depth_dirty=0;
         } else if(depth_dirty&&depth_target) {
-            ++sync_depth;
+            ++sync_depth; ++g_depth_syncs_taken;
             uint8_t *stencil=malloc(pixels);
             if(!stencil){free(rgba);return 0;}
             [stencil_surface getBytes:stencil bytesPerRow:surface_width fromRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0];

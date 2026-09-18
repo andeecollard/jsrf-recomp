@@ -211,6 +211,41 @@ the one deferral per run proves it. Ask instead:
 **Do not re-run this A/B first.** Six more runs would re-measure the same inert
 switch.
 
+### WHERE SYNC'S TIME ACTUALLY GOES, measured 18 Sep
+
+From a completed gameplay run (`t2_defer0`, 160 s, scene 30):
+
+    [METAL] sync 38089 calls (12696 already clean):
+            83847.0 ms draining the GPU, 22728.8 ms reading back and converting
+    [METAL] sync callers: 25372 surface swap, 0 invalidate, 0 frame end,
+            12717 external
+
+**The drain is 79% of it, not the read-back.** The plan this goal inherited was
+written as though the 4.9 MB copy were the cost; it is the *wait*. Deferring
+removes both, so the conclusion is unchanged — but anyone optimising the copy
+alone would have been optimising the smaller fifth.
+
+Also worth keeping: resident clears already handle 16,851 of 16,863 colour and
+25,375 of 25,397 depth/stencil clears, so that optimisation is done and is not
+where the remaining time is.
+
+### `RECOMP_METAL_NO_DEPTH_SYNC`, built 18 Sep, default OFF
+
+The cheap way to ask whether guest RAM needs the depth at all. Diagnostic in
+the same sense as `RECOMP_METAL_HW_NO_STENCIL`: a path that never returns depth
+is wrong by construction *if anything reads it*, and the point is to find out
+whether anything does. Counted in both arms, so a run with it **off** still
+reports how many write-backs it would have skipped — which is what decides
+whether the A/B is worth taking.
+
+Registered with `ab_score.py` as `no_depth_sync`, and the generic
+`METAL_SWITCH_RE` can see it, so its VOID check will actually run.
+
+**Next, and it needs no player:** A/B it for frame time, and check correctness
+with the `[d3d8_gl]` blit check. If the frame is unchanged, A2's depth refusal
+can be narrowed and Track A is unblocked. If it breaks, it says precisely what
+depends on depth reaching guest RAM.
+
 **Done when:** that question is answered, and — only if a change makes the
 deferral actually fire — median frame under 16.68 ms in a mission, verified
 with the `[d3d8_gl]` blit check, with the player having seen a clean frame.
