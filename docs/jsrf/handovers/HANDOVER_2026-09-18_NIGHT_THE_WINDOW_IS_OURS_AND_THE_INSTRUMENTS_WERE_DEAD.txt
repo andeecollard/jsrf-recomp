@@ -1,0 +1,264 @@
+HANDOVER 2026-09-18 NIGHT -- THE CRASH WINDOW IS OURS AND NOT XEMU'S, AND THREE
+OF THE INSTRUMENTS THAT WERE GOING TO ANSWER THINGS WERE NOT RUNNING
+
+Read CLAUDE.md, then the newest file by date in docs/jsrf/goals/ -- do not
+trust a pointer, including this one. Supersedes
+HANDOVER_2026-09-18_EIGHT_HYPOTHESES_DIED_AND_THE_CRASH_IS_THE_BOTTLENECK.txt,
+whose analysis stands but whose prescriptions were stale before it was written.
+
+Tree: 57/57 ctest, clean, 27 commits on 18 Sep, main pushed to origin at
+58f29f2. CLAUDE.md gained a section; read it, it is short.
+
+=============================================================================
+READ THIS FIRST: TWO FINDINGS, AND THE SECOND ONE IS THE CRASH
+=============================================================================
+
+1. THE INSTRUMENTS WERE NOT RUNNING. The player's JSRF.app was built at 11:48.
+   RECOMP_VOICE_TOP_RING and the re-armed surface-keyed FB_WATCH both landed at
+   11:59. Eleven minutes. paths.conf had VOICE_TOP_RING armed against a binary
+   with no such switch in it, so it would have produced nothing and the nothing
+   would have read as data. The engine binary in build-feav was already current
+   at 13:22 -- only the BUNDLE was stale, i.e. somebody built and never
+   packaged. Verified by grepping the binary, with NO_DEPTH_SYNC as the positive
+   control and a nonsense switch name as the negative. Rebuilt, verified, 0->2
+   and 0->1.
+
+   Add "is the bundle newer than every source" to whatever you check before
+   asking the player for a session:
+
+       find src diagnostics -name '*.c' -newer <app>/Contents/MacOS/jsrf-engine
+
+2. THE RAISE/DISPATCH WINDOW IS OURS. Our APU is xemu's -- src/apu/README.md
+   says extracted from xemu -- and the idle-voice trap is xemu's line for line
+   (vp.c:1835 raises it on the same condition in the same walk; vp.c:559-570
+   handles it with the same FECTL writes and set_irq). We did not invent the
+   interrupt. We replaced its DELIVERY:
+
+       xemu   drops the device mutex, takes the Big QEMU Lock, asserts a REAL
+              PCI IRQ (apu.c:279-285). Guest takes it at the next instruction
+              boundary. Microseconds.
+
+       us     pci_irq_assert is `{ (void)d; }` -- qemu_shim.h:195, it discards
+              its argument. No guest-execution lock exists. The ISR runs only
+              when some guest thread calls KeWaitForSingleObject, and then no
+              more often than BRIDGE_DEVICE_IRQ_PERIOD_MS = 8 (kernel_bridge.c
+              :3924). Milliseconds.
+
+   001A200D reads this->owner[h] unguarded and is ENTITLED to: on hardware the
+   trap is serviced before the teardown that clears owner[] can run. On our
+   timing it is not, and owner[0] goes NULL inside the gap.
+
+   This explains the number that never fitted. owner[h] at the raise reads
+   27,937 non-NULL to 9 NULL, and 0 of those NULLs were h==0 -- yet all 26
+   crash dumps name voice 0. Right when we look, wrong when the guest looks,
+   because of how long "when the guest looks" takes to arrive.
+
+   NOT DEMONSTRATED. The crash rate has not been measured against a shorter
+   window. Argued from source on both sides, fits every existing counter, and
+   that is all it is. See docs/jsrf/progress/
+   PROGRESS_2026-09-18_THE_WINDOW_IS_OURS_NOT_XEMUS.md.
+
+=============================================================================
+WHAT IS ARMED FOR THE NEXT SESSION -- FIVE READS, FOUR NEVER READ ONCE
+=============================================================================
+
+All in the player's paths.conf, all riding on ONE session. READ EACH POSITIVE
+CONTROL BEFORE BELIEVING ANY ZERO.
+
+  RECOMP_VOICE_TOP_RING   the ~12-32 successful voice-list head removals.
+                          Control: [VOICE-TOP] 2D=/3D=/MP= (reference session
+                          read 5/26/1 = 32). Ring count must match that total.
+                          "[VOICE-TOP-RING] OFF" means the switch did not take.
+
+  RECOMP_FB_WATCH         280,410,80,35, surface-keyed, eight slots.
+                          Control: comparisons=. No [FB-WATCH] line at all =
+                          not set. comparisons=0 = armed but never looked.
+                          comparisons>0 with changed=0 is the real absence
+                          measurement. DUMP/AFTER stay commented out for the
+                          first read -- get counts, then spend the BMPs.
+
+  RECOMP_ICALL_FEEDBACK_PATH   the indirect-branch database, writing for the
+                          first time since 15 Sep. Control: the line naming the
+                          path with "N resolved, M unresolved".
+
+  RECOMP_IRQ_THREAD=1     THE TIMING EXPERIMENT. Moves delivery to a 1 ms
+                          thread. Control: the [IRQ-THREAD] banner at start --
+                          no banner means the thread never ran and a crash
+                          count from that run measures NOTHING. Watch
+                          [APU-IDLE-EDGE] beside it: delivering ~8x more often
+                          may feed the trap storm.
+
+                          ITS GATE IS A BARE getenv. RECOMP_IRQ_THREAD=0 TURNS
+                          IT ON. To disable, comment the line out.
+
+  D1, free               revisit an early area late in the run. Frame time
+                          recovers -> scene. Holds at 21 ms -> throttling.
+
+CAUTION: IRQ_THREAD changes timing globally. If instruments 1-3 report
+something odd, suspect it before believing the instrument. Comment it out (do
+not set 0) if you want the first session clean.
+
+=============================================================================
+G3/D1 IS ANSWERED, AND IT WAS NEVER BLOCKED ON THE CRASH
+=============================================================================
+
+The previous handover said D1 was blocked because RECOMP_SYNC_HIST died to the
+crash. It was not. The player's 11:47 session ran 339 s and NEVER CRASHED (no
+001A2E2E in it; the 276 "fault" greps are "default"/"faulting"), and every one
+of its 91 report blocks carries a [STAGE] per-frame breakdown. Two plateaus:
+
+              frame     vsh   submit    sync    rest
+    early     15.65    2.40     3.66    5.55    3.94      (win 11-45)
+    late      20.96    2.59     3.81   11.28    3.19      (win 70-91)
+    DELTA     +5.32   +0.19    +0.16   +5.73   -0.75
+
+The regression is ENTIRELY sync -- the GPU drain -- at +5.73 of a +5.32 loss,
+with everything else netting negative. And the GPU is doing LESS work:
+
+    draws/window      28,100 -> 22,900   (-18%)
+    triangles/window  11.43M ->  8.53M   (-25%)
+    texture uploads      320 ->     239   (-25%)
+    sync calls/window    640 ->     510   (-20%)
+    DRAIN PER CALL      2.74 ->    5.17 ms  (+89%)
+    surface rebuilds/evictions: 0 throughout
+
+25% less work, twice the wait. That is a stall, not load. Onset at window 46
+coincides with a draw-count discontinuity, i.e. an area transition ~2.9 min in.
+Scene versus thermal is the open question and the discriminator is free (above).
+
+That log is 4.8 MB and the next launch overwrites it. A copy is at
+~/Library/Application Support/JSRF/last-run.log.reference-1147. Do not lose it.
+
+=============================================================================
+WHAT THE PREVIOUS HANDOVER GOT WRONG -- ITS ANALYSIS STANDS, ITS ORDERS DO NOT
+=============================================================================
+
+ 1. "TRACK A: READ owner[h] BEFORE RAISING." The plan carrying that (PLAN_
+    2026-09-18_NIGHT, 12:40) was refuted by commit 21cb3ce at 13:09 -- 29
+    minutes later, five trials per arm, 2 crashes in 5 both ways. The handover
+    at 13:29 knew; the plan it points at does not. The rule the handover itself
+    added -- the commit log outranks prose written earlier the same day -- bit
+    the plan shipped beside it.
+
+ 2. "A RULE IS IN THE GOALS: NO MORE A/Bs." It is in the PLAN. The newest
+    goals file is still JSRF_GOALS_2026-09-17_NIGHT2.
+
+ 3. "READ THE VOICE-TOP RING -- NEEDS A PLAY SESSION AND NOTHING ELSE." It
+    needed a bundle rebuild. See finding 1.
+
+ 4. "[VOICE-TOP] IS NEW." The COUNTER already existed and reads 32 head writes.
+    What was new is the 16-event RING.
+
+ 5. "FEDEC_HOLD DEMONSTRABLY DOES NOT FULLY CLOSE IT." Not a source claim. The
+    source is weaker and deliberately so (apu_vp.c:2062): "It is NOT proven to
+    eliminate that crash ... The measured claim is the window, not the cure."
+    The "does not close" evidence is the A/B, not the code.
+
+ 6. THE OWNER[] EVIDENCE RESTS ON A POINTER CAPTURED INSIDE THE ISR.
+    g_jsrf_dsound_this has ZERO write sites in src/ -- the only writer is the
+    gen probe, which was reverted, so the raise-time check at apu_vp.c:4577 is
+    DEAD CODE in the committed tree. And the probe captures `this` at ISR
+    ENTRY, so a raise reads owner[h] through whatever the LAST entry left. If
+    there is more than one device object, the 27,937/9 split and "0 were h==0"
+    were read against the wrong table. 16d20e6 makes the probe count DISTINCT
+    values; calls= is its control. Settle that before trusting any owner[]
+    number, including the one in finding 2 above.
+
+=============================================================================
+THREE INSTRUMENTS THAT LIED, ALL THE SAME LIE
+=============================================================================
+
+Not working looked identical to working. All three are fixed to fail loudly.
+
+  apu_core.c:163 said "DEFAULTS ON (RECOMP_VOICE_TOP_RING=0 to silence)" thirty
+  lines above a gate that has always called recomp_switch_on(), which is
+  opt-in. A reader arms nothing, reads an empty ring, and records that the
+  guest removes no voices -- the opposite of what [VOICE-TOP] says. The tree
+  had been bitten by this exact shape before: apu_fedec_hold_test.c exists
+  because "the comment on it said default on while the accessor said
+  otherwise". (fe31f95)
+
+  RECOMP_ICALL_FEEDBACK_PATH was a compile-time constant RELATIVE TO THE
+  WORKING DIRECTORY. A double-clicked .app has none it can write. 91 failures
+  per session, once per report, while the database sat unchanged since 15 Sep
+  -- and this is the Fusion-derived feedback loop, dead on exactly the runs
+  worth feeding it. The header had predicted it: "CUSTOMIZE if your launcher
+  runs from somewhere you would rather not write to." Now resolvable from the
+  environment, cached once, message printed ONCE and naming the variable.
+  regenerate.sh looks in the support dir and builds its merge list in
+  positional parameters -- it word-split before, which "Application Support"
+  would have broken silently. (91f662d)
+
+  The v1 dsound probe matched the MARK the installer greps for, so installing
+  over it printed "already instrumented" and left the old store in place --
+  distinct=0, calls=0, reading exactly like no probe. It now refuses. (16d20e6)
+
+Both new tests have NEGATIVE CONTROLS: break the dedupe, or make the resolver
+ignore the environment, and the tests fail. They are not vacuous.
+
+=============================================================================
+INVESTIGATED AND CLOSED -- DO NOT REOPEN WITHOUT NEW INPUT
+=============================================================================
+
+  MS FUSION SYMBOL RECOVERY (docs/technical/ms-fusion-*.md). Attractive: this
+  title disassembles to 8,876 functions with EXACTLY ONE name among them, and
+  the crash sits in that anonymous block -- five exact function starts inside a
+  region running 144 functions per 16 KB, which is library density. But JSRF
+  links XDK 4134 (all seven libraries; now in CLAUDE.md with the one-command
+  re-derivation), and a byte signature transfers only where the same XDK build
+  emitted the same code. The four BC titles span Nov 2001 to Jun 2005. Blinx
+  (Oct 2002) is nearest and still months off. Also unobtainable: they are
+  Windows Store packages, the player is on Apple Silicon, and CrossOver cannot
+  run the Store or Gaming Services. PARKED, not dead -- if a Windows machine
+  appears, it is Blinx, it is one ~20 MB DLL from Content/, and the
+  coverage-oracle half is version-INDEPENDENT so it pays regardless.
+
+  THE HACKED XEFU PACK (~/jsrf/Hacked_Xefu_Pack). Not the Fusion artifacts:
+  every file is XEX2, i.e. Xbox 360 PowerPC, and "Precompiled" appears zero
+  times in the whole pack. No JSRF config either -- title ID 5345000A is absent
+  from its 116. It is NOT encrypted (encryption_type=0, LZX only, 620 KB ->
+  5.3 MB) so it IS readable for the cost of an LZX decoder -- but it is a
+  DYNAMIC emulator targeting Xenos, unnamed PowerPC, cannot run our title, and
+  xemu answered the question it would have been asked. Closed.
+
+  CONSOLEMODS WIKI. End-user console hardware modding. Nothing for us.
+
+XEMU IS THE REFERENCE AND IS NOWHERE NEAR EXHAUSTED. ~700 lines read of a
+1,881-line vp.c plus a 623-line apu.c, and it cracked the crash mechanism in an
+afternoon. Unread and directly relevant to the MUSIC defect: voice-list
+splicing on VOICE_ON (our LIST_MOVE_TO_FRONT and SELFLINK_END are local
+inventions with xemu's originals right there), voice_lock semantics, and mixbin
+handling for 3D voices. That is the next source, not PowerPC.
+
+=============================================================================
+TWO THINGS I GOT WRONG TODAY
+=============================================================================
+
+ 1. RECOMMENDED CRIMSON SKIES for the signature database, on symbol count --
+    384 named DirectSound functions. By XDK date it is one of the WORST
+    matches, roughly 18 months past this title. Sorted by the wrong column.
+    Blinx. This is written into CLAUDE.md so it is not repeated.
+
+ 2. WROTE OFF THE XEFU PACK AS A SEALED BLOB. Its entropy is 7.98 and I called
+    it encrypted. The header says encryption_type=0; that entropy is LZX. The
+    conclusion happened to survive for other reasons, but the reason I gave was
+    wrong and I had asserted it without reading the header.
+
+=============================================================================
+WHAT TO DO NEXT
+=============================================================================
+
+ 1. GET THE SESSION. Five reads, four never read once. Nothing else here is
+    worth more, and everything below is gated on it.
+ 2. IF THE CRASH RATE FALLS with IRQ_THREAD, the window is the mechanism and
+    the fix is timing -- tune BRIDGE_DEVICE_IRQ_PERIOD_MS, do not add a guard.
+    If it does not move, the dispatch-time check at bridge_deliver_isr earns
+    its turn.
+ 3. SETTLE THE DISTINCT-this COUNT before trusting any owner[] number.
+ 4. D1: scene or thermal, from the same session, free.
+ 5. THE MUSIC, against xemu's vp.c rather than against another theory. Seven
+    have died; none of them was checked against the implementation ours was
+    extracted from.
+
+Upstream unchanged: PR #67 and #69 open, zero comments, maintainer quiet since
+16 Sep. G15 and get_data_ptr still owed as issues.
