@@ -41,9 +41,14 @@ pixels.
 
 ## The order
 
-0. **Diff the matched pair.** Free, no runs, nothing else first.
-1. **G17** — wire the suspend/resume census. The hang has a stack and no counter.
-2. **G2** — raise `RECOMP_FB_WATCH_STILL_PPM`. One line, no rebuild.
+0. ~~**Diff the matched pair.**~~ **DONE** — see the progress note. It killed
+   four explanations, three of them written the same evening, and bottomed out
+   in a missing instrument that turned out not to be missing.
+1. **ONE MORE SESSION. Nothing needs building.** Five switches armed in
+   paths.conf on the unchanged bundle: `VOICE_RATES`, `VOICE_FRESH`,
+   `THREAD_TRACE`, and the glyph trap at `STILL_PPM=10000` with dumps. The
+   next session answers G1, G17 and G2 together, and stays comparable to the
+   22:25/22:30 pair because the engine is untouched.
 3. **G1** — why the 2D bin alone. Blocked on a real 2D instrument (see G5).
 4. **G18** — the cursor pin, unaffected by tonight and still the strongest audio arm.
 5. **G3** — colour resolve needs 4 more trials; `recomp_gpu_own` on Metal.
@@ -80,9 +85,20 @@ Three shapes, and the instruments cannot yet separate them:
 
 **Done when:** we know which of those three it is.
 
-**Blocked on:** a 2D instrument that works. `[APU-POOL] on_2d` counts *starts*
-and flatlines during healthy playback, silence and death alike — see G5, which
-has said so since 17 Sep and is now load-bearing rather than cosmetic.
+**The instrument for this ALSO already existed and was never armed.**
+`RECOMP_VOICE_RATES` / `RECOMP_VOICE_FRESH` (`apu_vp.c:3079`) tracks, per
+voice: `off_frames`, `silent_frames` ("fetched samples were all ~zero"),
+`energy`, `fresh_slots`/`stale_slots`/`max_stale_run`, `w_refill_edges` as a
+cadence in Hz, `starved_loops`, and min/max rate. That separates all three
+shapes above. Its own header comment describes the failure we then measured,
+before we measured it: *"a voice played at the wrong speed drains its buffer
+at the wrong speed — fine in steady state, wrong at the moment a stream is
+switched or refilled."*
+
+Armed 18 Sep night 5. Read voices 64–67 only. No rebuild.
+
+`[APU-POOL] on_2d` remains useless for this (G5), but it is no longer the
+blocker it was described as an hour ago.
 
 ### What is dead, and must not be re-derived
 
@@ -97,7 +113,23 @@ has said so since 17 Sep and is now load-bearing rather than cosmetic.
 
 ---
 
-## G17 — The suspend/resume census *(new, and the hang needs it)*
+## G17 — The suspend/resume census *(ALREADY BUILT. It was never armed.)*
+
+**CORRECTED before a line of it was written.** This goal said "wire the
+census". The census exists: `w32_thread_trace_report()` at
+`win32_compat.c:625`, called from `xinput_device.c:614`, compiled into the
+shipped bundle, gated on `RECOMP_THREAD_TRACE` — **which has never been in
+paths.conf**, so `[THREAD]` appears zero times in every log this project has.
+
+It already carries the exact discriminator, and its own comment states the
+test: *"a resume arriving while the count is already zero is a NO-OP, so if
+the producer signals before the worker parks, the wakeup is LOST and the
+worker sleeps for the life of the process. `lost_resumes` counts exactly that
+case. A stall that begins in the same report as a lost resume is the
+mechanism; a stall with `lost_resumes` flat is not."*
+
+Armed 18 Sep night 5. No rebuild.
+
 
 The 22:30 session hung with the process **alive**, and two `sample` runs 30 s
 apart agree on the stack:
