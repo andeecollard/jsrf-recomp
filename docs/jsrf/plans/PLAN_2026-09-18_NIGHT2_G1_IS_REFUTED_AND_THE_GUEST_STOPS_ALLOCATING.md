@@ -100,7 +100,28 @@ actually does between t=0 and the freeze*, not why removals fail.
 **Done when:** G1 in the goals file describes what is measured, and the seven
 dead hypotheses are in *R* rather than in the entry.
 
-## 2. `-DXBOX_WORKER_STACK_COUNT=1`, then its own session *(one flag)*
+## 2. `-DXBOX_WORKER_STACK_COUNT=1` — BUILT 18 Sep night *(ready, needs a session)*
+
+    binary: /Users/andrewcollard/jsrf-build/jsrf-first-fault/build-irqthread/
+    bundle: /Users/andrewcollard/jsrf-build/irqthread/JSRF.app      <-- NOT the main one
+
+Kept in its own directory so the wrong bundle cannot be launched by accident.
+60/60 ctest in that build; 60/60 also in the default build, unchanged.
+
+**A test now proves which binary you are holding.** `jsrf_worker_stack_pool`
+asserts the allocator against the count the build actually compiled in, so it
+passes in BOTH configurations and says something different in each:
+
+    build-feav       XBOX_WORKER_STACK_COUNT=0   pool absent: alloc refuses
+                     "RECOMP_IRQ_THREAD cannot deliver in this build."
+    build-irqthread  XBOX_WORKER_STACK_COUNT=1   every slice allocated, reuse ok
+                     "RECOMP_IRQ_THREAD can deliver in this build."
+
+That exists because on 18 Sep the switch was armed for a whole player session and
+delivered nothing, and the failure looked exactly like a switch that found
+nothing to report. The pool had no test at all.
+
+### (original note retained)
 
     [IRQ-THREAD] no worker stack slice (XBOX_WORKER_STACK_COUNT=0); not delivering
 

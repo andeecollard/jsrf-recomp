@@ -482,6 +482,10 @@ add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_te
 set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
     ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
 
+add_executable(jsrf_worker_stack_pool_test worker_stack_pool_test.c)
+target_link_libraries(jsrf_worker_stack_pool_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_worker_stack_pool COMMAND jsrf_worker_stack_pool_test)
+
 add_executable(jsrf_apu_trap_thread_test apu_trap_thread_test.c)
 target_link_libraries(jsrf_apu_trap_thread_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_apu_trap_thread COMMAND jsrf_apu_trap_thread_test)
