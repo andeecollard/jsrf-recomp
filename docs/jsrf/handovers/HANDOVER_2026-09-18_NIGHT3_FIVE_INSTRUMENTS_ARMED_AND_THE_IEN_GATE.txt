@@ -1,0 +1,270 @@
+HANDOVER 2026-09-18 NIGHT (3) -- FIVE INSTRUMENTS ARE ARMED, NOBODY HAS READ
+THEM, AND MICROSOFT'S OWN APU MODEL SAYS OUR IEN GATE CAN SILENCE US
+
+Read CLAUDE.md, then the newest file by date in docs/jsrf/goals/ -- do not trust
+a pointer, including this one. Supersedes
+HANDOVER_2026-09-18_NIGHT_THE_WINDOW_IS_OURS_AND_THE_INSTRUMENTS_WERE_DEAD.txt.
+Its finding 1 (check the bundle) stands and is now a standing rule. Its finding
+2 (the raise/dispatch window) is still undemonstrated, and there is finally an
+instrument for it.
+
+Tree: 66/66 ctest, switch audit 0 problems, 45 commits on 18 Sep, HEAD 74396d4.
+The active plan is PLAN_2026-09-18_NIGHT3_TWO_GOALS_AND_ONE_REGENERATION.md.
+
+=============================================================================
+READ THIS FIRST: DO NOT BUILD ANYTHING. FIVE INSTRUMENTS ARE WAITING.
+=============================================================================
+
+This tree has a documented habit of building the next instrument instead of
+reading the last one. Five are armed in the player's paths.conf and NONE has
+been read. The next session is worth more than any code you could write before
+it.
+
+  [APU-IEN]           always printed, no switch. THE BIG ONE -- see below.
+  [IRQ-LATENCY]       RECOMP_IRQ_LATENCY=1. Times raise -> delivery.
+  [APU-TRAP-THREADS]  RECOMP_APU_TRAP_THREADS=1. Forks G1.
+  [KERNEL-THREADS]    RECOMP_KERNEL_THREADS=1. Read once; no thread dies.
+  [FB-WATCH-STILL]    RECOMP_FB_WATCH_STILL=1. Counts only, DUMP deliberately off.
+  [METAL] colour      RECOMP_METAL_NO_COLOUR_SYNC, default OFF and counted in
+                      BOTH arms, so the OFF arm alone sizes the A/B.
+
+REACH ACTUAL GAMEPLAY. The 17:55 session sat at on=27, far below the 148-453
+band CLAUDE.md gives for gameplay, so it never touched the scene where the black
+screen appeared. A session that stays in a light scene answers less.
+
+=============================================================================
+1. THE IEN GATE -- OUR STRONGEST HYPOTHESIS FOR THE MUSIC DYING
+=============================================================================
+
+Microsoft's own MCPX APU model, read today out of TWO independent builds of
+their Xbox-360 emulator, STORES NV_PAPU_IEN AND NEVER READS IT. It never reads
+or writes FETFORCE0/1 either -- not one access in either build.
+
+Ours gates the entire interrupt on IEN (src/apu/apu_core.c, mcpx_apu_update_irq):
+
+    if ((IEN & GINTSTS) && ((ISTS & ~GINTSTS) & IEN)) { raise }
+    else                                              { deassert }
+
+So a guest that clears IEN goes PERMANENTLY SILENT against us and carries on
+being serviced by them. That is the exact shape of the freeze: the model stops
+notifying, the guest stops being invoked, guest_methods stops dead, and
+rendering continues untouched for twenty minutes.
+
+Two days were spent looking for a reason the guest stopped ASKING. This is a
+reason the model stopped TELLING it.
+
+  READ:  [APU-IEN] value= writes= last_written_at= | raises allowed=
+                   SUPPRESSED BY IEN=
+
+  SUPPRESSED BY IEN=0  -> the hypothesis is dead, cheaply. Move on.
+  nonzero and growing from the freeze point -> that is the mechanism, and
+  `value=`/`last_written_at=` name the write that caused it.
+
+The FETFORCE1 half of the same worry IS ALREADY DEAD, from data we had:
+raises_minus_idle_trap reads 0 in all 304 reports of the 17:55 session. A
+comment at apu_vp.c:1582 predicted that divergence and printed the difference so
+it would be visible the first time it happened. It never happened.
+
+This is a HYPOTHESIS WITH A MEASUREMENT ATTACHED, not a finding. It is also
+owed a test -- two agents were editing CMakeLists as it landed and it did not
+race them.
+
+=============================================================================
+2. G1'S FOUNDING INVARIANT IS REFUTED. THE GOAL IS REWRITTEN, NOT EXTENDED.
+=============================================================================
+
+The old text: "retired voices stay in the list and the guest never takes them
+out -- eight guest writes to the 3D list head in a whole session".
+
+Measured, two player sessions, ring armed for the first time:
+
+    [VOICE-TOP-RING] 87 head writes: unlink=81 during-trap=83 on-trapped-voice=83
+                     still-active=7 self-linked=0 into-empty=3 emptied-list=7
+    [APU-IDLE-DELIVERY] found idle=19 distinct, delivered=19, never told about=0
+    reference 11:47:    found idle=15, delivered=15, never told about=0
+
+81 of 87 head writes are textbook unlinks. 83 of 87 happened while the front end
+was TRAPPED with cvl naming exactly the removed voice. self-linked=0. Every idle
+handle was delivered, in both sessions. THE HANDSHAKE WORKS. Do not write
+another hypothesis that assumes it does not.
+
+Caveat that must travel with those numbers: both sessions ran with CYCLE_BREAK,
+FEDEC_HOLD, SELFLINK_END and LIST_MOVE_TO_FRONT armed. A bare-arms session is
+owed.
+
+Also stale and now corrected: the freeze is at t=270 s and t=360 s, not "two
+minutes". And it takes NOTHING with it -- the 17:55 session rendered at a flat
+~29,000 draws per window for the 1,250 seconds after the APU stopped.
+
+=============================================================================
+3. D1 IS ANSWERED, FREE, AND WE ALREADY HIT 60 FPS
+=============================================================================
+
+The 17:55 session sat in one scene at constant workload for 1,250 s, which is a
+better thermal test than the revisit D1 actually asked for:
+
+    t= 300- 450   frame 16.84 ms   28,300 draws/win   drain/call 1.646 ms
+    t=1200-1350         16.42      28,941                        1.635
+    DELTA over 15 min:  frame -0.29 ms (-1.7%)   drain/call -0.003 ms (-0.2%)
+
+THERMAL IS RULED OUT -- it drifted very slightly FASTER. So the 11:47 session's
+drain going 2.74 -> 5.17 ms on 25% LESS work is SCENE-DRIVEN.
+
+And 16.4-16.8 ms against a 16.68 ms budget: we reach 60 fps in a light scene.
+The 19-21 ms figure is scene-dependent, not a uniform deficit. That reframes the
+speed goal from "find 15% everywhere" to "find what the heavy scene does to the
+drain".
+
+=============================================================================
+4. THREE THINGS REFUTED TODAY -- DO NOT RE-DERIVE THEM
+=============================================================================
+
+THE ELEVEN-ORDINAL CENSUS IS NOT THE FREEZE. The 14:59 analysis found eleven
+ordinals -- every allocator, every free, object create/close, timer arming --
+going to exactly zero and read it as characterising the freeze. The 17:55
+control session shows ALL ELEVEN stopping too, across 6.7 million subsequent
+kernel calls, in a run that rendered perfectly for twenty minutes and never went
+black. It is the title reaching STEADY STATE. An accurate measurement and a
+wrong interpretation, for want of a control.
+
+NO GUEST THREAD DIES. RECOMP_KERNEL_THREADS: four threads alive at near-constant
+call rates 1,250 s after the APU froze; a fifth made two calls at t=0 and never
+ran again. One thread (tib=0x00982000) drops ~35% at t=270 and holds. It does
+less; it does not stop.
+
+THE "COVERAGE ORACLE" CANNOT GRADE OUR FUNCTION BOUNDARIES. Microsoft's
+guest->host map has an entry at EVERY GUEST BYTE, so presence is uninformative
+(97.7% of the span is present). It is an INSTRUCTION-boundary oracle in which a
+function start and the instruction after it are indistinguishable, and it cannot
+transfer between titles. We had been carrying it as a validation route it could
+never be. Also fixed: tools/fusion/module.py's map scan used max_delta=16 while
+the real arrays reach 38, recovering as little as 39% of Conker's array.
+
+=============================================================================
+5. WHAT I GOT WRONG TODAY -- SIX THINGS, ALL FROM BAD MEASUREMENT
+=============================================================================
+
+Recorded because every one was caught by checking, and the checks are cheap.
+
+ 1. SAID THE CRASH FAULT SITE WAS OUTSIDE ITS FUNCTION. sub_001A2E2E is 475
+    guest bytes and the fault is reported at +0x670, so I concluded every
+    document had named the wrong function. The line reads "HOST PC: ... +0x670"
+    -- a HOST offset into the recompiled machine code, not a guest offset. A
+    475-byte guest function compiles to far more. No misattribution.
+
+ 2. ANNOUNCED A REFCOUNT BUG THAT DOES NOT EXIST. A grep alternation consumed
+    "int _flags" before it could match "_flags =", so I read 823 declarations
+    against 2 assignments and called an uninitialised read. `_flags` is assigned
+    on the line immediately before every read (1,180 to 17 in that file). The
+    same artifact fooled me TWICE, and I said "found a real one" before looking
+    at the actual generated line.
+
+ 3. WROTE A VACUOUS TEST. The first irq_latency test asserted "ten asserts on a
+    high line produce one sample". True -- and equally true with the
+    rising-edge check DELETED, because ten asserts and one delivery is one
+    sample either way. The negative control passed. The failure is the CLOCK,
+    not the count, so the assertion now holds the line high across a real
+    interval and requires the wait to be timed from the FIRST assert.
+
+ 4. TURNED jsrf_switch_audit RED AND DID NOT NOTICE. Added RECOMP_GUEST_NAMES
+    to paths.conf, never re-ran the suite. Rule 3 searched only src/ and the
+    reader is in diagnostics/. Fixed by widening THAT RULE ONLY -- the ratchet
+    must stay src/-scoped or it sweeps the harness's own getenvs into a baseline
+    meant to police the runtime.
+
+ 5. SHIPPED THE GLYPH TRAP INERT. Verified RECOMP_FB_WATCH_STILL_PPM was in the
+    bundle and armed nothing -- the PPM is the THRESHOLD; the GATE is
+    RECOMP_FB_WATCH_STILL. Now armed.
+
+ 6. UNDERCOUNTED THE BC RESEARCH. Scored it by "did it fix a defect today",
+    which is the wrong test for work that de-risks and reframes, and one this
+    project's own rules reject.
+
+=============================================================================
+6. THE BACKWARD-COMPATIBILITY RESEARCH -- WHAT IT ACTUALLY CHANGED
+=============================================================================
+
+The player obtained all four Microsoft Xbox BC packages (~/jsrf/BC, 13 GB). Five
+agents worked them. Full reports: docs/technical/ms-fusion-*.md and
+~/jsrf/xex_tools/*.md. What bears on open goals:
+
+BOUNDARY DETECTION IS NOT OUR DEFICIENCY. They had the source, the symbols and a
+build farm and did not solve it either: an entry point at every guest byte, and
+the two thirds that are not instruction starts are SHORT REAL TRANSLATIONS that
+rejoin the stream (61% of a sample end in a direct jmp after 2-3 instructions,
+91% of those landing on another map entry). Only ~7% escape to the runtime.
+
+THE NV2A TRANSLATOR TARGETS D3D9, NOT GPU REGISTERS -- an API-level translation
+like ours, so it transfers better than a hardware model would. 2,048-entry
+descriptor table indexed by raw method offset against our ~900-line switch; one
+OR-accumulated dirty word tested once at BEGIN against our single s_vsh.dirty
+flag; NO texture work at method time; fences queued in a ring, never waited.
+This is all src/ work and needs NO regeneration.
+
+G2 MAY HAVE NO GENERAL FIX. VGPUDX12.dll ships 36 hand-written PER-TITLE shader
+overrides, several tagged with internal bug numbers. Seven hypotheses have died
+here hunting a general mechanism. A per-title hook is ordinary engineering in
+this domain.
+
+INTERRUPT DELIVERY: they emit a one-byte poll roughly every 79 guest bytes, so
+generated code is interruptible everywhere and delivery never waits for a
+blocking call. They also keep "advance time" and "deliver interrupts" strictly
+separate; we conflate them in one 8 ms period.
+
+SYMBOLS: 162 of the 410 functions in JSRF's DSOUND section now have names,
+recovered from their symbol tables by size-sequence alignment (Blinx + Crimson;
+Fuzion is nearly useless despite bracketing JSRF most tightly in time, because a
+DirectSound namespace refactor sits between Nov 2001 and Oct 2002). The crash
+function itself is NOT named, but its neighbours are: CMcpxAPU::
+ServiceDeferredCommandsHigh, RemoveDeferredCommandHigh, and
+CMcpxVoiceClient::AllocateVoiceResources. RECOMP_GUEST_NAMES prints them in
+crash reports. DIAGNOSTIC ONLY -- partial coverage, measured error rate.
+
+NO DEBUG SYMBOLS SHIP. Every module carries a CODEVIEW entry with an internal
+PDB path (D:\temp\<build>\obj\xbox\emulator\ppc\...), but no PDBs, and the
+GUID+age are internal builds so no symbol server will have them.
+
+DO NOT MINE FURTHER. The seams are worked. The binding constraint stops being
+availability and becomes the white-room boundary, which matters if any of this
+is upstreamed. One agent decrypted a null-key XEX after I failed to restate the
+limit in its brief; that artifact is in scratch, not the repo.
+
+=============================================================================
+7. THE COST ASYMMETRY THAT ORDERS THE WORK
+=============================================================================
+
+src/ is cheap. tools/ is expensive.
+
+src/nv2a, src/apu, src/kernel compile in minutes against the existing gen tree.
+Anything in tools/recomp needs a FULL REGENERATION, which CLAUDE.md warns is not
+bit-stable and which invalidates every archived baseline and every A/B measured
+against one.
+
+Every GPU improvement the research suggests is src/ work. Every CPU improvement
+is tools/ work. So: do the GPU work now, incrementally, measuring each change
+separately against the 9.1% NO_DEPTH_SYNC won. BATCH EVERY TRANSLATOR CHANGE
+INTO ONE REGENERATION and re-verify the baseline immediately after. Do not spend
+a regeneration on a single idea.
+
+=============================================================================
+8. WHAT TO DO NEXT
+=============================================================================
+
+ 1. GET THE SESSION. Five instruments, none read. Reach gameplay.
+ 2. READ [APU-IEN] FIRST. It is one number and it either kills the strongest
+    hypothesis for the music dying or confirms it.
+ 3. READ [IRQ-LATENCY]. Microseconds -> the poll byte buys nothing and a
+    regeneration is saved. Milliseconds -> it goes into the batched one.
+ 4. READ [APU-TRAP-THREADS] beside [KERNEL-THREADS]. vp= stops while the thread
+    keeps calling -> the guest stopped asking. Both stop -> it stopped being
+    scheduled.
+ 5. READ [FB-WATCH-STILL] still= WITH quiet= BESIDE IT. quiet=0 over thousands
+    of comparisons means the threshold is too tight; the histogram says where to
+    put it. Only then spend the BMPs.
+ 6. SIZE THE COLOUR A/B from the OFF arm's taken= before running a paired A/B.
+ 7. THEN the NV2A descriptor table (A1 in the plan) -- src/, no regeneration,
+    the biggest lever on both frame time and the glyphs.
+
+Owed: a test for the IEN census; a bare-arms APU session; xemu's vp.c still
+unread and still the reference our APU was extracted from; upstream G15, G16 and
+get_data_ptr. PR #67 and #69 open, maintainer quiet since 16 Sep.
