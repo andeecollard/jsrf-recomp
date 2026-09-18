@@ -481,6 +481,7 @@ unsigned long g_idle_trap_ring;
  * on naming after the guest has removed it? Sticky per voice, set by the walk's
  * cycle detector, so reading it here costs a bitmap test. */
 #define IDLE_TRAP_WHY_CYCLE    (1u << 4)  /* handle seen twice in one walk */
+#define IDLE_TRAP_WHY_UNOWNED  (1u << 5)  /* guest does not own it NOW */
 uint8_t  g_idle_trap_why[16];
 uint16_t g_idle_trap_from[16];   /* predecessor handle, 0xFFFF = straight off TVL */
 uint32_t g_idle_trap_fmt[16];    /* the voice's CFG_FMT as the raise found it */
@@ -619,6 +620,38 @@ int mcpx_apu_idle_trap_edge(void);
  * the ISR is one the guest has never seen, so owner[h] cannot be anything but
  * the NULL it was initialised to. */
 uint64_t g_apu_voice_ever_on[MCPX_HW_MAX_VOICES / 64];
+
+/* THE INVARIANT THE ISR IS ENTITLED TO RELY ON, AND WHETHER WE BREAK IT.
+ *
+ * 001A200D does `pBuf = this->owner[h]` with NO NULL CHECK, and the comment
+ * above records why it is allowed to: "on hardware a handle only reaches this
+ * chain if DirectSound put the voice in a list, which it does after it has an
+ * owner for it."
+ *
+ * Our list and DirectSound's ownership have demonstrably diverged --
+ * [APU-IDLE-DELIVERY] says we name every retired voice and the guest removes
+ * almost none, so voices sit in OUR list long after the guest is done with
+ * them. If ownership is dropped while the voice is still in our list, every
+ * later raise for it hands the ISR a handle whose owner[] is NULL.
+ *
+ * That is exactly the observed fault: 26 crash dumps (18 previously recorded,
+ * 8 more on 18 Sep), every one of them the owner[h]==NULL register set, and
+ * every one of them with voice 0 as the last handle raised.
+ *
+ * ever_on cannot answer this -- it is deliberately never cleared, because it
+ * answers "has the guest EVER owned this handle". This pair answers "does it
+ * own it NOW", set at VOICE_ON and cleared at VOICE_RELEASE.
+ *
+ * COUNTER ONLY. Nothing is suppressed. The clear-on-RELEASE half is an
+ * INFERENCE and it may be wrong: the VOICE_RELEASE handler sets envelope
+ * release rates, which is a fade-out and not obviously an object free, so the
+ * guest may well still own a releasing voice. If it does, `unowned` will read
+ * 0 on a crashing run and this hypothesis dies there -- which is the point of
+ * measuring before guarding. The precedent is the voice-lock guard beside it,
+ * which was built the same way and which the 18 Sep crash dumps killed. */
+uint64_t g_apu_voice_owned_now[MCPX_HW_MAX_VOICES / 64];
+unsigned long g_idle_unowned_raises;   /* raises for a voice not owned NOW */
+unsigned long g_idle_owned_raises;     /* the positive control for that zero */
 
 /* THE WINDOW THIS SWITCH CLOSES, AND WHY IT IS A SWITCH.
  *
@@ -1727,7 +1760,24 @@ void mcpx_apu_idle_trap_report(int crash)
             g_idle_trap_never_on_raises, g_idle_trap_repeat_raises,
             g_idle_trap_lock_suppressed,
             mcpx_apu_idle_trap_lock_guard() ? "on" : "OFF");
-    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
+
+    /* PRINTED HERE, NOT IN THE PERIODIC REPORT, AND THAT IS THE POINT.
+     *
+     * This counter first went beside [APU-VOICE2] and read "0 owned, 0
+     * UNOWNED" on a run that crashed with four raises. The counter was right;
+     * it was printed by a function the CRASH PATH DOES NOT CALL, so the last
+     * value on disk was from a periodic report taken before any raise had
+     * happened. The four raises and the fault all landed in the gap.
+     *
+     * An instrument that does not print at the moment of interest measures
+     * nothing, and it fails in the most expensive way available -- it reads
+     * ZERO, which looks like an answer. It sits beside [APU-IDLE-TRAP] now
+     * because that line is in the crash dump, verified by finding it there. */
+    fprintf(stderr, "  [APU-IDLE-OWNER] raises for a voice the guest owns NOW:"
+            " %lu owned, %lu UNOWNED. 001A200D reads owner[h] with no NULL"
+            " check, so an unowned raise is a handle it dereferences anyway."
+            " owned>0 is the positive control for an unowned of 0.\n",
+            g_idle_owned_raises, g_idle_unowned_raises);    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",
             g_apu_method_while_trapped, g_apu_guest_method_count);
@@ -1772,13 +1822,14 @@ void mcpx_apu_idle_trap_report(int crash)
     for (i = 0; i < n; ++i) {
         unsigned k = (base + i) & 15u;
         uint8_t w = g_idle_trap_why[k];
-        char flags[6];
+        char flags[8];
         unsigned f = 0;
         if (w & IDLE_TRAP_WHY_LOCKED)   flags[f++] = 'L';
         if (w & IDLE_TRAP_WHY_NEVER_ON) flags[f++] = 'N';
         if (w & IDLE_TRAP_WHY_PERSIST)  flags[f++] = 'P';
         if (w & IDLE_TRAP_WHY_REPEAT)   flags[f++] = 'R';
         if (w & IDLE_TRAP_WHY_CYCLE)    flags[f++] = 'C';
+        if (w & IDLE_TRAP_WHY_UNOWNED)  flags[f++] = 'O';
         flags[f] = 0;
         static const char *const lname[] = { "2D", "3D", "MP" };
         const char *ln = g_idle_trap_list[k] < 3 ? lname[g_idle_trap_list[k]]
@@ -1803,7 +1854,11 @@ void mcpx_apu_idle_trap_report(int crash)
                     " N = never VOICE_ON in this run, P = PERSIST (ISR returns"
                     " early), R = repeat of the previous raise,"
                     " C = THIS VOICE WAS SEEN TWICE IN ONE LIST WALK"
-                    " (it is in a ring; see [APU-CYCLE]).\n"
+                    " (it is in a ring; see [APU-CYCLE]),"
+                    " O = THE GUEST DOES NOT OWN THIS VOICE NOW (VOICE_ON"
+                    " seen, then VOICE_RELEASE, no VOICE_ON since) -- 001A200D"
+                    " reads owner[h] with NO NULL CHECK, so an O on the LAST"
+                    " entry of a crashing run is the fault explained.\n"
                     "  2D/3D/MP is the voice list. fmt=0 is an unconfigured"
                     " voice. The LAST entry is the"
                     " handle the guest was servicing.\n");
@@ -1986,9 +2041,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
          * is "has DirectSound ever owned this handle", and the answer becomes
          * yes the moment the guest asks for the voice, not when we finish
          * setting it up. */
-        if (selected_handle < MCPX_HW_MAX_VOICES)
+        if (selected_handle < MCPX_HW_MAX_VOICES) {
             g_apu_voice_ever_on[selected_handle / 64] |=
                 1ULL << (selected_handle % 64);
+            /* "owns it now" -- see g_apu_voice_owned_now. */
+            g_apu_voice_owned_now[selected_handle / 64] |=
+                1ULL << (selected_handle % 64);
+        }
         voice_lifecycle_note(d, (uint16_t)selected_handle, "on");
         voice_ev_note(0, selected_handle);
         voice_desc_dump(d, (uint16_t)selected_handle);
@@ -2296,6 +2355,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_RELEASE: {
         g_apu_voice_release_count++;
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        /* See g_apu_voice_owned_now. Clearing here is the INFERENCE under
+         * test: this handler sets envelope release rates, so it may be a
+         * fade-out rather than an object free. If the guest still owns a
+         * releasing voice, `unowned` reads 0 on a crashing run and the
+         * hypothesis dies. */
+        if (selected_handle < MCPX_HW_MAX_VOICES)
+            g_apu_voice_owned_now[selected_handle / 64] &=
+                ~(1ULL << (selected_handle % 64));
         voice_lifecycle_note(d, (uint16_t)selected_handle, "release-command");
         voice_ev_note(2, selected_handle);
 
@@ -2324,6 +2391,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        /* CLEARED HERE TOO, AND THIS IS THE ONE THAT MATTERS.
+         *
+         * The first version of this cleared only on VOICE_RELEASE and
+         * reported "15987 owned, 0 UNOWNED" -- which proved nothing, because
+         * the same report read `on=288 off=258 release=0`. VOICE_RELEASE never
+         * fired in the whole run, so the clear side was never exercised and
+         * the zero was the instrument's silence, not an answer. This title
+         * retires voices with VOICE_OFF. */
+        if ((argument & NV1BA0_PIO_VOICE_OFF_HANDLE) < MCPX_HW_MAX_VOICES)
+            g_apu_voice_owned_now[(argument & NV1BA0_PIO_VOICE_OFF_HANDLE) / 64]
+                &= ~(1ULL << ((argument & NV1BA0_PIO_VOICE_OFF_HANDLE) % 64));
         g_apu_voice_off_command_count++;
         voice_lifecycle_note(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE),
                              "off-command");
@@ -4398,6 +4476,19 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     if (g_idle_trap_ring
                         && g_idle_trap_last[(g_idle_trap_ring - 1) & 15u] == v)
                         why |= IDLE_TRAP_WHY_REPEAT;
+                    /* Does the guest own this handle NOW? 001A200D reads
+                     * owner[h] with no NULL check, so handing it a handle the
+                     * guest has released is the observed fault path. Counted
+                     * BOTH ways: owned_raises is the positive control, without
+                     * which an unowned=0 would prove nothing. */
+                    {
+                        int owned = v < MCPX_HW_MAX_VOICES
+                            && (g_apu_voice_owned_now[v / 64]
+                                & (1ULL << (v % 64))) != 0;
+                        if (owned) ++g_idle_owned_raises;
+                        else { ++g_idle_unowned_raises;
+                               why |= IDLE_TRAP_WHY_UNOWNED; }
+                    }
 
                     if (locked)   g_idle_trap_locked_raises++;
                     if (!ever_on) g_idle_trap_never_on_raises++;
