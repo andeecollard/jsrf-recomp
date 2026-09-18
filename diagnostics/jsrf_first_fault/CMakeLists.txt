@@ -533,6 +533,18 @@ if(APPLE)
     set_tests_properties(jsrf_metal_defer_swap_on PROPERTIES
                          ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;JSRF_EXPECT_DEFER=1")
 
+    # G3 A1 (18 Sep): the depth refusal is narrowed by no_depth_sync, and
+    # ONLY by it. The OFF arm is the control -- it must still refuse, or the
+    # narrowing removed a real guard rather than a pointless one.
+    add_executable(jsrf_metal_defer_depth_test metal_defer_depth_test.c)
+    target_link_libraries(jsrf_metal_defer_depth_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_defer_depth_refuses COMMAND jsrf_metal_defer_depth_test)
+    set_tests_properties(jsrf_metal_defer_depth_refuses PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;JSRF_EXPECT_DEFER=0")
+    add_test(NAME jsrf_metal_defer_depth_narrowed COMMAND jsrf_metal_defer_depth_test)
+    set_tests_properties(jsrf_metal_defer_depth_narrowed PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;RECOMP_METAL_NO_DEPTH_SYNC=1;JSRF_EXPECT_DEFER=1")
+
     add_executable(jsrf_metal_sync_range_test metal_sync_range_test.c)
     target_link_libraries(jsrf_metal_sync_range_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_sync_range COMMAND jsrf_metal_sync_range_test)

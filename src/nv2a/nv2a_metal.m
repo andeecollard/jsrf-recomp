@@ -1792,6 +1792,8 @@ static int no_depth_sync_on(void)
     return on;
 }
 static uint64_t g_depth_syncs_skipped, g_depth_syncs_taken;
+/* Deferrals that only happened because the depth write-back is off. */
+static uint64_t g_swap_deferred_no_depth;
 
 /* ELEVEN, and it was nine. The key has to name every field the descriptor
  * below reads, or the cache serves a state built for a different draw.
@@ -2429,9 +2431,11 @@ void nv2a_metal_report(void)
             (unsigned long long)g_depth_syncs_taken,
             (unsigned long long)g_depth_syncs_skipped,
             no_depth_sync_on()?"on":"OFF");
-    fprintf(stderr,"[METAL] swap writeback deferred: %llu (refused: %llu depth"
+    fprintf(stderr,"[METAL] swap writeback deferred: %llu (of which %llu only"
+            " because depth is not written back at all) (refused: %llu depth"
             " dirty, %llu no slot) (defer_swap %s)\n",
             (unsigned long long)g_swap_deferred,
+            (unsigned long long)g_swap_deferred_no_depth,
             (unsigned long long)g_swap_defer_depth,
             (unsigned long long)g_swap_defer_noslot,
             defer_swap_on()?"on":"OFF");
@@ -3686,9 +3690,30 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * pointer: two slots can name the same guest address at different sizes,
     * and only the object we are actually holding is the one whose pixels this
     * debt is about. */
+   /* THE DEPTH REFUSAL IS NARROWED, AND ONLY BY WHAT MAKES IT POINTLESS.
+    *
+    * `depth_dirty` refuses the deferral because surface_slot_writeback carries
+    * COLOUR only: defer the swap with depth outstanding and the depth is lost,
+    * because a cache MISS would re-upload stale depth from guest RAM.
+    *
+    * That reasoning holds exactly as long as the depth write-back happens at
+    * all. With RECOMP_METAL_NO_DEPTH_SYNC on it does not: the write-back is
+    * skipped and depth_dirty is cleared without the depth ever reaching guest
+    * RAM. Refusing to defer in order to protect a value nobody is going to
+    * write is the whole reason A2 was inert -- the refusal fired 5,747-12,656
+    * times against ONE successful deferral in a 240 s run.
+    *
+    * So the condition becomes "depth is dirty AND somebody is going to write
+    * it". It is not a relaxation of the safety argument; it is the same
+    * argument with its premise checked.
+    *
+    * Counted separately, because "deferred" and "deferred only because depth
+    * is being thrown away" are different facts and a future reader must not
+    * have to infer which one a number describes. */
    if(defer_swap_on()&&surface_cache_on()&&surface_valid&&surface&&surface_dirty){
-    if(depth_dirty){++g_swap_defer_depth;}
+    if(depth_dirty&&!no_depth_sync_on()){++g_swap_defer_depth;}
     else{
+     if(depth_dirty)++g_swap_deferred_no_depth;
      int owed=0;
      for(unsigned i=0;i<SURFACE_SLOTS;i++)
       if(surf_slot[i].valid&&surf_slot[i].colour==surface){
