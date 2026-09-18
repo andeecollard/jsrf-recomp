@@ -503,6 +503,16 @@ add_executable(jsrf_fb_watch_still_test fb_watch_still_test.c
 target_link_libraries(jsrf_fb_watch_still_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_fb_watch_still COMMAND jsrf_fb_watch_still_test)
 
+# The flip read-back is the largest single stage in the frame (measured
+# 18 Sep 2026: [STAGE] sync = 5.19 ms of a 16.43 ms player frame). Its switch
+# is what the A/B hangs off, so pin the two things that have silently broken an
+# A/B here before: the ab_score token must be visible in BOTH arms, and the
+# gate must be recomp_switch_on rather than a bare getenv that reads =0 as on.
+add_executable(jsrf_flip_sync_test flip_sync_test.c
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
+target_link_libraries(jsrf_flip_sync_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_flip_sync COMMAND jsrf_flip_sync_test)
+
 add_executable(jsrf_guest_names_test guest_names_test.c guest_names.c)
 add_test(NAME jsrf_guest_names COMMAND jsrf_guest_names_test)
 

@@ -192,6 +192,12 @@ SWITCH_TOKEN = {
     # `no_colour_sync`, which is not a substring of `no_depth_sync`, so
     # switch_state_for's `token in clause` cannot confuse the two.
     "RECOMP_METAL_NO_COLOUR_SYNC": "no_colour_sync",
+    # The flip read-back, 18 Sep. Measured as 32% of the player's frame
+    # (5.19 ms of 16.43): every FLIP_STALL drains the GPU and copies the whole
+    # colour surface to guest RAM so the GL presenter can upload it back.
+    # Printed unconditionally on the [FLIP-SYNC] line. `no_flip_sync` is not a
+    # substring of the other two tokens, so switch_state_for cannot confuse it.
+    "RECOMP_METAL_NO_FLIP_SYNC":   "no_flip_sync",
 }
 
 
@@ -313,11 +319,21 @@ def score(path, warmup, pad_path=None):
             m = SWITCH_BARE_RE.search(line)
             if m:
                 switches.add(m.group(1).strip())
-            if line.startswith("  [METAL]") or line.lstrip().startswith("[METAL]"):
-                # findall, not search: one [METAL] line can carry more than one
-                # switch, and search would keep only the first.
-                for tok in METAL_SWITCH_RE.findall(line):
-                    switches.add(tok.strip())
+            # ANY line, not just [METAL]. This was restricted to [METAL] and
+            # that is the third time the restriction has cost a VOID check:
+            # defer_swap's token was invisible to the regex of the day, and
+            # RECOMP_METAL_NO_FLIP_SYNC's was invisible to this prefix test
+            # because its counter prints under [FLIP-SYNC]. A switch is not
+            # obliged to report itself on a line named after one subsystem,
+            # and a harvester that assumes so fails silently -- it does not
+            # warn, it just scores the A/B without the check. The token form
+            # "(name on)" / "(name OFF)" is specific enough to harvest
+            # anywhere, and an unrecognised token is harmless: switch_state_for
+            # only matches names that are in SWITCH_TOKEN.
+            # findall, not search: one line can carry more than one switch,
+            # and search would keep only the first.
+            for tok in METAL_SWITCH_RE.findall(line):
+                switches.add(tok.strip())
             m = IDLE_RE.search(line)
             if m:
                 apu_counters["idle_trap"] = int(m.group(1))

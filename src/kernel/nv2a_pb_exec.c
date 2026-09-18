@@ -1450,6 +1450,42 @@ static uint32_t surface_bpp(void)
  * Returns NULL until a clear has established a real surface. The caller runs
  * on the thread owning the GL context and must not touch anything else here.
  */
+/* THE FLIP READBACK, AND THE SWITCH THAT SIZES IT.
+ *
+ * At every FLIP_STALL snapshot_surface() calls nv2a_gpu_sync_range(), which
+ * WAITS FOR THE GPU and reads the whole colour surface back into guest RAM.
+ * The presenter then uploads that CPU buffer back onto the GPU
+ * (d3d8_gl.c, glTexSubImage2D) and draws a quad. So the frame crosses
+ * Metal -> CPU -> OpenGL to reach the screen, once per frame.
+ *
+ * MEASURED 18 Sep 2026, and this is why the switch exists. [STAGE] sync is
+ * that one call and nothing else:
+ *     player session 17:55, no instrumentation   5.19 ms of a 16.43 ms frame
+ *     scripted, heavier scene, walk armed       11.89 ms of 32.82 ms
+ * 32% of the player's frame, and 82% of all Metal sync time is the DRAIN
+ * rather than the copy (69,144 ms against 14,861 ms).
+ *
+ * DIAGNOSTIC, in the same sense as RECOMP_METAL_NO_DEPTH_SYNC: a flip that
+ * never reads the surface back is wrong by construction IF ANYTHING READS IT
+ * -- the presenter does, and so do fb_watch() and the [FB] sampler, which run
+ * immediately after and read guest RAM. Expect a stale or torn picture with
+ * this on. The point is not to ship it; it is to find out whether removing
+ * the wait removes the time, or merely moves the stall somewhere else. Only
+ * a measurement can tell those apart, and the answer decides whether direct
+ * Metal presentation is worth building.
+ *
+ * COUNTED IN BOTH ARMS, deliberately: with it OFF, `taken` is precisely what
+ * the other arm would skip, so one control run sizes the A/B before it is
+ * run. That discipline is what made the depth A/B readable. */
+static int no_flip_sync_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_NO_FLIP_SYNC");
+    return on;
+}
+static unsigned long long g_flip_syncs_taken;
+static unsigned long long g_flip_syncs_skipped;
+
 static uint8_t *s_snap;             /* the last completed frame, packed */
 static uint32_t s_snap_w, s_snap_h, s_snap_bpp;
 static int s_snap_wanted;
@@ -1492,10 +1528,15 @@ static void snapshot_surface(void)
     if (nv2a_gpu_on() && mem && s_gpu.color_offset && s_gpu.pitch
             && s_gpu.clip_h)
     {
-        unsigned long long _t = pb_now_us();
-        nv2a_gpu_sync_range((uint8_t *)mem + s_gpu.color_offset,
-                (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h));
-        pb_stage_add(PB_STAGE_SYNC, _t);
+        if (no_flip_sync_on()) {
+            ++g_flip_syncs_skipped;
+        } else {
+            unsigned long long _t = pb_now_us();
+            nv2a_gpu_sync_range((uint8_t *)mem + s_gpu.color_offset,
+                    (size_t)s_gpu.pitch * (s_gpu.clip_y + s_gpu.clip_h));
+            pb_stage_add(PB_STAGE_SYNC, _t);
+            ++g_flip_syncs_taken;
+        }
     }
 #endif
     if (!s_snap_wanted || !s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h)
@@ -5149,6 +5190,16 @@ uint32_t nv2a_pb_exec_surface_va(void)
 
 void nv2a_pb_exec_report(void)
 {
+    /* THE FLIP READBACK. Printed in BOTH states, unconditionally, so a control
+     * run sizes the A/B and ab_score.py's METAL_SWITCH_RE can see the token
+     * and actually run its identical-arms VOID check. `taken` is one drain per
+     * flip, and [STAGE] sync is the same call timed. */
+    fprintf(stderr, "[FLIP-SYNC] flip read-backs: %llu taken, %llu skipped"
+            " (no_flip_sync %s).  Each one waits for the GPU and copies the"
+            " whole colour surface to guest RAM; the presenter then uploads it"
+            " back. With it OFF, taken IS what the other arm would skip.\n",
+            g_flip_syncs_taken, g_flip_syncs_skipped,
+            no_flip_sync_on() ? "on" : "OFF");
     if (s_vsh_trace.enabled) {
         fprintf(stderr, "[VSH-TRACE] upload words by subchannel:");
         for (int i = 0; i < 8; ++i)
