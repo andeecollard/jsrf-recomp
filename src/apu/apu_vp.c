@@ -664,6 +664,63 @@ uint64_t g_apu_voice_owned_now[MCPX_HW_MAX_VOICES / 64];
  * h != 0 returns harmlessly. h == 0 falls through to the call that faults.
  * That is why all 26 crash dumps name voice 0 and no other. */
 unsigned int g_jsrf_dsound_this;
+
+/* IS THERE ONE DIRECTSOUND OBJECT, OR SEVERAL?
+ *
+ * Every owner[h] number this project has rests on that pointer, and the probe
+ * that captures it writes it AT THE TOP OF THE ISR. So a raise-time read of
+ * owner[h] reads through a `this` captured at some EARLIER ISR entry -- never
+ * the entry about to service that raise. If the title keeps one device object
+ * for the run, the staleness is harmless and every owner[] number stands. If
+ * it keeps more than one, the raise-time check has been indexing the wrong
+ * object's table, and "of those NULLs, 0 were h==0" -- the positive control
+ * that retired the owner guard -- was measuring something else entirely.
+ *
+ * Nobody had checked. The plan that proposed reading owner[h] wrote its own
+ * risk note -- "`this` may be per-device; the probe must catch the right one"
+ * -- and then the guard was measured, refuted and defaulted off without it
+ * ever being answered. Counting distinct values instead of keeping only the
+ * last settles it in one session, for the cost of a scan of eight words.
+ *
+ * READ `calls` FIRST. distinct=0 with calls=0 means the probe is not
+ * installed, NOT that the guest has no device -- the same confident zero this
+ * file warns about everywhere else. distinct=1 with calls>0 is the result
+ * that makes the numbers above trustworthy. Anything higher reopens them.
+ *
+ * Past DSOUND_THIS_MAX the table stops growing and `over` counts the
+ * sightings it could not place. `over` is a yes/no signal, not a census: by
+ * the time it moves, "more than one" is already the answer. */
+#define DSOUND_THIS_MAX 8u
+unsigned int  g_jsrf_dsound_this_seen[DSOUND_THIS_MAX];
+unsigned long g_jsrf_dsound_this_distinct;
+unsigned long g_jsrf_dsound_this_calls;   /* positive control for distinct=0 */
+unsigned long g_jsrf_dsound_this_over;    /* sightings past the table */
+
+/* Called from the gen-tree probe at sub_001A25AA's entry, on the GUEST thread,
+ * while the report reads these from another -- the same arrangement every
+ * other ring in this file already has. Wait-free: a scan of at most eight
+ * words on a path that runs a few thousand times a session. */
+void jsrf_dsound_this_seen(unsigned int t)
+{
+    unsigned long kept = g_jsrf_dsound_this_distinct < DSOUND_THIS_MAX
+                       ? g_jsrf_dsound_this_distinct : DSOUND_THIS_MAX;
+    unsigned long i;
+
+    ++g_jsrf_dsound_this_calls;
+    g_jsrf_dsound_this = t;
+    if (!t)
+        return;
+    for (i = 0; i < kept; ++i)
+        if (g_jsrf_dsound_this_seen[i] == t)
+            return;
+    if (g_jsrf_dsound_this_distinct < DSOUND_THIS_MAX) {
+        g_jsrf_dsound_this_seen[g_jsrf_dsound_this_distinct] = t;
+        ++g_jsrf_dsound_this_distinct;
+    } else {
+        ++g_jsrf_dsound_this_over;
+    }
+}
+
 unsigned long g_idle_owner_null_raises;  /* raises whose owner[h] read NULL */
 unsigned long g_idle_owner_ok_raises;    /* positive control for that zero */
 unsigned long g_idle_owner_null_h0;      /* ...and h==0: the FATAL combination */
@@ -1841,7 +1898,8 @@ void mcpx_apu_idle_trap_report(int crash)
                 " DirectSound `this` was never captured, so owner[h] was never"
                 " read. Install the probe with"
                 " diagnostics/jsrf_first_fault/instrument_dsound_this.py and"
-                " rebuild. This is NOT a zero result.\n");
+                " rebuild. This is NOT a zero result."
+                " (probe entered %lu time(s).)\n", g_jsrf_dsound_this_calls);
     } else {
         fprintf(stderr, "  [APU-IDLE-OWNER] this=0x%08X  owner[h] at the raise:"
                 " %lu non-NULL, %lu NULL. A NULL is a handle 001A200D"
@@ -1856,6 +1914,30 @@ void mcpx_apu_idle_trap_report(int crash)
                 g_idle_owner_null_h0,
                 owner_guard_on() ? "ON" : "OFF",
                 g_idle_owner_suppressed);
+        /* WHETHER THE LINE ABOVE IS ABOUT ONE OBJECT OR SEVERAL. The probe
+         * captures `this` at ISR entry, so a raise reads owner[h] through
+         * whatever the LAST entry left behind. One distinct value means that
+         * staleness cannot matter and the counts stand; more than one means
+         * they were taken against the wrong table and have to be retaken. */
+        {
+            unsigned long n = g_jsrf_dsound_this_distinct;
+            unsigned i, lim = n < DSOUND_THIS_MAX ? (unsigned)n : DSOUND_THIS_MAX;
+            fprintf(stderr, "  [APU-IDLE-OWNER]   `this` captured %lu time(s),"
+                    " %lu distinct%s -- %s\n",
+                    g_jsrf_dsound_this_calls, n,
+                    g_jsrf_dsound_this_over ? " (table full, more exist)" : "",
+                    n == 1 ? "ONE object, so the counts above are read through"
+                             " the right table"
+                           : "NOT ONE OBJECT: the raise-time counts above were"
+                             " read through a table that is not necessarily"
+                             " the ISR's, and must be retaken");
+            if (lim) {
+                fprintf(stderr, "  [APU-IDLE-OWNER]   values:");
+                for (i = 0; i < lim; ++i)
+                    fprintf(stderr, " 0x%08X", g_jsrf_dsound_this_seen[i]);
+                fprintf(stderr, "\n");
+            }
+        }
     }    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",

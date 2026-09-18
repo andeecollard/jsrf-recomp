@@ -472,6 +472,10 @@ add_test(NAME jsrf_adpcm_decode COMMAND jsrf_adpcm_decode_test)
 # its getenv in a static, so one process only ever sees one value -- and the
 # default itself is the property under test, since it silently read "off"
 # while the comment on it said "on".
+add_executable(jsrf_dsound_this_distinct_test dsound_this_distinct_test.c)
+target_link_libraries(jsrf_dsound_this_distinct_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_dsound_this_distinct COMMAND jsrf_dsound_this_distinct_test)
+
 add_executable(jsrf_apu_fedec_hold_test apu_fedec_hold_test.c)
 target_link_libraries(jsrf_apu_fedec_hold_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_fedec_hold_default COMMAND jsrf_apu_fedec_hold_test)

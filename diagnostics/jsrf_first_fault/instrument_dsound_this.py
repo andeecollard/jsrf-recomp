@@ -23,7 +23,16 @@ has to be captured where the guest hands it over.
 WHAT THIS PATCHES. One line at the top of `sub_001A25AA`, where `edi = ecx`
 already records `this`:
 
-    g_jsrf_dsound_this = ecx;   /* DSOUND-THIS probe */
+    jsrf_dsound_this_seen(ecx);   /* DSOUND-THIS probe */
+
+which stores `this` AND counts how many distinct values the run ever sees.
+That second number is the point: the probe fires at ISR ENTRY, so a raise-time
+read of owner[h] goes through a `this` left behind by an EARLIER entry. One
+distinct value means that cannot matter. More than one means every owner[]
+number taken so far -- including "of those NULLs, 0 were h==0", the control
+that retired the owner guard -- was read against a table that may not be the
+ISR's, and has to be retaken. Read the [APU-IDLE-OWNER] `this` captured line in the
+report, and read its calls= before believing a distinct count of 0.
 
 Read-only with respect to the guest. Nothing else is touched.
 
@@ -44,9 +53,14 @@ import sys
 from pathlib import Path
 
 ANCHOR = "loc_001A25AA: ;"
-PROBE = ("    { extern unsigned int g_jsrf_dsound_this;\n"
-         "      g_jsrf_dsound_this = ecx; }  /* DSOUND-THIS probe */\n")
+PROBE = ("    { extern void jsrf_dsound_this_seen(unsigned int);\n"
+         "      jsrf_dsound_this_seen(ecx); }  /* DSOUND-THIS probe */\n")
 MARK = "DSOUND-THIS probe"
+# The v1 probe stored `this` and nothing else. A tree still carrying it looks
+# instrumented to MARK, so check for the CALL as well -- otherwise an upgrade
+# silently no-ops and the distinct count reads 0 with calls=0, which is
+# indistinguishable from "no probe at all".
+CALL = "jsrf_dsound_this_seen(ecx)"
 
 
 def find(gen: Path) -> Path:
@@ -80,8 +94,13 @@ def main() -> int:
 
     text = src.read_text(errors="ignore")
     if MARK in text:
-        print("already instrumented: %s" % src.name)
-        return 0
+        if CALL in text:
+            print("already instrumented: %s" % src.name)
+            return 0
+        sys.exit("%s carries the OLD probe, which records only the last `this`"
+                 " and cannot count distinct objects. Revert it first:\n"
+                 "    %s %s --revert"
+                 % (src.name, Path(sys.argv[0]).name, gen))
     if text.count(ANCHOR) != 1:
         sys.exit("expected exactly one %r in %s, found %d"
                  % (ANCHOR, src.name, text.count(ANCHOR)))
