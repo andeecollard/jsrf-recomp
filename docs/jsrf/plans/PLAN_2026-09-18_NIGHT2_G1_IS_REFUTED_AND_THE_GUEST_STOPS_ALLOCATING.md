@@ -155,9 +155,31 @@ session drain-per-call went 2.74 → 5.17 ms (+89%) while draws fell 18%,
 triangles 25% and surface rebuilds stayed at 0. Twenty-five percent less work,
 twice the wait. That is a stall, not load.
 
-**D1 discriminates it and has never been run**: revisit an early area late in a
-session. Frame time recovers ⇒ scene. Holds at ~21 ms ⇒ thermal. It costs
-nothing and folds into any session.
+### D1 — ANSWERED 18 Sep night, free, from the 17:55 session
+
+That session sat in one scene at a flat ~28,500 draws/window for 1,250 s, which
+is a better thermal test than the revisit D1 originally proposed — constant
+workload, twenty minutes:
+
+    t= 300- 450   frame 16.84 ms   28,300 draws/win   drain/call 1.646 ms
+    t= 750- 900         16.46      28,870                        1.618
+    t=1200-1350         16.42      28,941                        1.635
+    t=1350-1500         16.64      28,571                        1.649
+
+    DELTA over 15 min:  frame -0.29 ms (-1.7%)   drain/call -0.003 ms (-0.2%)
+
+**Thermal is ruled out.** Twenty minutes of sustained load produced no
+degradation whatsoever — it drifted very slightly faster. So the 11:47 session's
+drain-per-call going 2.74 → 5.17 ms (+89%) on 25% LESS work is **scene-driven**,
+and the stall has a cause inside the scene rather than in the machine.
+
+**And this session held 16.4–16.8 ms — at the 16.68 ms budget.** We reach 60 fps
+in a light scene. The 19–21 ms figure is scene-dependent and is not a global
+deficit, which reframes the goal: find what the heavy scene does to the drain,
+rather than hunt for a uniform 15% saving.
+
+Caveat: `on=27` here against `on=249` in a mission, so this is a light scene by
+the audio measure. It rules thermal out; it does not characterise the heavy one.
 
 ## 5. Owed upstream *(cheap, not urgent)*
 
