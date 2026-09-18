@@ -333,12 +333,37 @@ can see a depth-dependent artifact in the middle of the frame. "It ran and
 presented" is not "it rendered correctly", and this is exactly the distinction
 this tree has been burned on before.
 
-**Still owed, in order:** a control arm with n≥2 (re-running), and a
-scene-matched pixel diff between the arms. Until the diff exists this is
-evidence that guest RAM *probably* does not need the depth, not proof.
+### THE REPEAT SEPARATES. First A/B in this phase that does.
 
-If it holds, A2's depth refusal — which fired 5,747–12,656 times against one
-successful deferral — can be narrowed, and Track A is unblocked.
+    RECOMP_METAL_NO_DEPTH_SYNC=0   20.44 - 21.35 ms  (n=2)
+    RECOMP_METAL_NO_DEPTH_SYNC=1   18.85 - 19.15 ms  (n=2)
+    ON is faster and the ranges DO NOT OVERLAP (9.1% less frame time)
+    arms verified distinct: =0 reported "no_depth_sync OFF", =1 "no_depth_sync on"
+
+Across both A/Bs, eight usable runs, and **every `=1` value is below every
+`=0` value**:
+
+    =0   20.56  20.44  21.35                 (n=3)
+    =1   19.05  19.29  19.65  19.15  18.85   (n=5)
+
+`max(=1) = 19.65 < min(=0) = 20.44`. The arms verified distinct this time
+because the generic `METAL_SWITCH_RE` fixed yesterday can see the token — the
+defer_swap A/B could not, and ran with its VOID check skipped.
+
+**Say what it does not buy.** 19 ms against a 16.68 ms budget. This is ~9%, it
+is real, and it is **not 60 fps on its own**. `[NOSYNC] p50 = 8.0 ms` remains
+the upper bound and nothing yet reaches it.
+
+**Correctness, and its limit.** Zero non-MATCH blit checks across all twelve
+runs in both arms. But that is ~30 sampled checks of ONE pixel per run: it
+cannot see a depth-dependent artifact in the middle of a frame. A scene-matched
+full-frame diff is still owed, and until it exists this is evidence that guest
+RAM probably does not need the depth, not proof.
+
+**Next:** narrow A2's depth refusal — which fired 5,747–12,656 times against
+one successful deferral — and A/B `defer_swap` and `no_depth_sync` together.
+That is the combination Track A was always aiming at, and it is now the first
+time the pieces have both been shown to work.
 
 **Done when:** that question is answered, and — only if a change makes the
 deferral actually fire — median frame under 16.68 ms in a mission, verified
