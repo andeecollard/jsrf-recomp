@@ -46,6 +46,21 @@ static const struct {
     { NV_PAPU_TVLMP, NV_PAPU_CVLMP, NV_PAPU_NVLMP }, /* MP */
 };
 
+/* THE LIST CURSOR. See the long comment at mcpx_apu_cursor_pin in apu_core.c:
+ * Microsoft's model writes 0xFFFF into the CVL and NVL registers at reset and
+ * never touches them again, while JSRF's removal routine reads ours and takes
+ * a repair branch on it. */
+int mcpx_apu_cursor_pin(void);
+extern unsigned long g_apu_cursor_published;
+extern unsigned long g_apu_cursor_pinned;
+
+/* Publish a cursor, unless pinned. Counted in BOTH arms: `published` is what
+ * the other arm would withhold, so one control run sizes the A/B. */
+#define CURSOR_SET(reg_, val_) do {                                          \
+        if (mcpx_apu_cursor_pin()) { ++g_apu_cursor_pinned; }                \
+        else { d->regs[(reg_)] = (val_); ++g_apu_cursor_published; }         \
+    } while (0)
+
 /* ============================================================
  * Notify status helper
  * ============================================================ */
@@ -1579,6 +1594,7 @@ void mcpx_apu_voice_report(void)
             g_apu_voice_on_loop_count, g_apu_guest_method_count,
             g_apu_voice_off_command_count);
     { extern void mcpx_apu_ien_report(void); mcpx_apu_ien_report(); }
+    { extern void mcpx_apu_cursor_report(void); mcpx_apu_cursor_report(); }
     /* off_already: see voice_off. raises-vs-idle_trap: g_apu_idle_trap_count
      * only increments when FETFORCE1 has SE2FE_IDLE_VOICE armed, but fe_method
      * writes FEDECMETH/FEDECPARAM BEFORE that test -- so if the guest ever
@@ -4360,7 +4376,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
          * today. */
         int hold = (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
                        == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
-        if (!hold) d->regs[current] = d->regs[top];
+        if (!hold) CURSOR_SET(current, d->regs[top]);
 
         uint64_t walk_seen[MCPX_HW_MAX_VOICES / 64] = { 0 };
         int cycle_noted = 0;
@@ -4497,7 +4513,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 g_apu_selflink_terminated++;
                 nxt = 0xFFFF;
             }
-            if (!hold) d->regs[next] = nxt;
+            if (!hold) CURSOR_SET(next, nxt);
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
@@ -4715,8 +4731,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                      * FEDECPARAM and CVL would name different voices. With
                      * coalescing on this is the first raise and both are
                      * already correct; writing them is then a no-op. */
-                    d->regs[current] = v;
-                    d->regs[next] = nxt;
+                    CURSOR_SET(current, v);
+                    CURSOR_SET(next, nxt);
                     {
                         /* Delivered means the PAIR WAS WRITTEN, not that we
                          * raised. FEDEC_HOLD holds it at a trapped front end,
@@ -4761,7 +4777,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 g_apu_voice_process_count++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
-            if (!hold) d->regs[current] = nxt;
+            if (!hold) CURSOR_SET(current, nxt);
             came_from = v;
             cur = nxt;
         }

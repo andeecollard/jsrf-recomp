@@ -64,6 +64,69 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* THE LIST CURSOR. WE PUBLISH ONE; MICROSOFT DOES NOT.
+ *
+ * Read out of Microsoft's own MCPX model (MS_MCPX_APU_MODEL.md section 3):
+ * across the entire module, in BOTH builds, CVL2D NVL2D CVL3D NVL3D CVLMP are
+ * touched EXACTLY FIVE TIMES -- once each, in reset, set to 0xFFFF -- and a
+ * guest write to any of them lands on the write handler's do-nothing default.
+ * Only the three TVL* head registers are maintained. Their model exposes no
+ * list cursor at all, and the retail XDK DirectSound it ships those titles
+ * with is the same driver family JSRF links.
+ *
+ * Ours republishes CVL/NVL 1500 times a second from the list walk, and JSRF's
+ * driver READS them and branches on them. sub_001A2E2E -- the crash function,
+ * named by 40 of 66 guest faults -- reads both at every voice removal and
+ * takes a repair branch when either names a voice it is removing. Measured on
+ * the player's own session: 83 of 87 removals took that branch. Microsoft's
+ * titles take it on ZERO.
+ *
+ * Handles are 0..255, so with both pinned at 0xFFFF the compare can never
+ * match and the guest takes the two-instruction skip instead. The unlink
+ * itself -- the TVL head write, the predecessor relink, the per-handle
+ * self-link marker -- happens EARLIER and UNCONDITIONALLY, so it is untouched.
+ *
+ * Nothing in our model reads these registers: the walk runs on a local cursor
+ * and voice_top_note reads them only to report. So the pin changes exactly one
+ * thing, which is what the guest sees.
+ *
+ * BOTH HALVES ARE REQUIRED. Stop republishing AND drop guest writes: without
+ * the second, any guest write that did land would stick for ever and the pin
+ * would silently un-pin itself.
+ *
+ * OFF by default. This is an experiment on the handshake seven dead
+ * hypotheses were circling, not a fix with a run behind it. */
+int mcpx_apu_cursor_pin(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_CURSOR_PIN");
+    return on;
+}
+unsigned long g_apu_cursor_guest_reads;
+unsigned long g_apu_cursor_guest_writes;
+unsigned long g_apu_cursor_published;
+unsigned long g_apu_cursor_pinned;
+
+void mcpx_apu_cursor_report(void)
+{
+    fprintf(stderr, "  [APU-CURSOR] guest reads=%lu writes=%lu | published=%lu"
+            " pinned=%lu (cursor_pin %s).  OFF-arm writes=0 means the driver"
+            " never took the repair branch this session; ON-arm writes>0 means"
+            " the pin is NOT taking.\n",
+            g_apu_cursor_guest_reads, g_apu_cursor_guest_writes,
+            g_apu_cursor_published, g_apu_cursor_pinned,
+            mcpx_apu_cursor_pin() ? "on" : "OFF");
+}
+
+/* Is this offset one of the six cursor registers? TVL* deliberately excluded:
+ * the driver's head write is load-bearing and Microsoft maintains those. */
+int mcpx_apu_is_cursor_reg(unsigned addr)
+{
+    return addr == NV_PAPU_CVL2D || addr == NV_PAPU_NVL2D
+        || addr == NV_PAPU_CVL3D || addr == NV_PAPU_NVL3D
+        || addr == NV_PAPU_CVLMP || addr == NV_PAPU_NVLMP;
+}
+
 /* IEN gate census -- see the comment at the gate in mcpx_apu_update_irq. */
 unsigned long g_apu_ien_raised;
 unsigned long g_apu_ien_suppressed;
@@ -140,6 +203,8 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     uint64_t r = 0;
+
+    if (mcpx_apu_is_cursor_reg((unsigned)addr)) ++g_apu_cursor_guest_reads;
 
     switch (addr) {
     case NV_PAPU_ISTS:
@@ -428,6 +493,13 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         qatomic_set(&d->regs[addr], (uint32_t)val);
         break;
     default:
+        if (mcpx_apu_is_cursor_reg((unsigned)addr)) {
+            /* Counted in BOTH arms so one control run sizes the A/B: with the
+             * pin off this is how often the driver writes a cursor at all. */
+            ++g_apu_cursor_guest_writes;
+            if (mcpx_apu_cursor_pin())
+                break;          /* Microsoft's do-nothing default */
+        }
         if (addr < 0x20000) {
             qatomic_set(&d->regs[addr], (uint32_t)val);
         }
@@ -1283,6 +1355,14 @@ static void mcpx_apu_resume(MCPXAPUState *d)
 static void mcpx_apu_reset_locked(MCPXAPUState *d)
 {
     memset(d->regs, 0, sizeof(d->regs));
+    /* Microsoft's reset writes 0xFFFF into all nine list registers; ours left
+     * them at zero and JSRF papers over it in its own init (sub_001A6160).
+     * Inert for this title, a real divergence for one that does not. Seeded
+     * unconditionally -- 0xFFFF is "no voice", which is what an empty list
+     * means, and zero is a valid handle. */
+    d->regs[NV_PAPU_TVL2D] = d->regs[NV_PAPU_CVL2D] = d->regs[NV_PAPU_NVL2D] = 0xFFFF;
+    d->regs[NV_PAPU_TVL3D] = d->regs[NV_PAPU_CVL3D] = d->regs[NV_PAPU_NVL3D] = 0xFFFF;
+    d->regs[NV_PAPU_TVLMP] = d->regs[NV_PAPU_CVLMP] = d->regs[NV_PAPU_NVLMP] = 0xFFFF;
     mcpx_apu_vp_reset(d);
 
     if (d->gp.dsp) {

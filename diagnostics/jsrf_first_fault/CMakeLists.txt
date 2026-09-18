@@ -565,6 +565,22 @@ add_executable(jsrf_dsound_this_distinct_test dsound_this_distinct_test.c)
 target_link_libraries(jsrf_dsound_this_distinct_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_dsound_this_distinct COMMAND jsrf_dsound_this_distinct_test)
 
+# G18. Microsoft's model publishes no list cursor at all; ours republishes it
+# 1500 times a second and JSRF's removal routine branches on it, on 83 of 87
+# removals. Both halves of the pin are pinned separately, because stopping the
+# publish without dropping guest writes lets one stray write stick for ever.
+add_executable(jsrf_apu_cursor_pin_test apu_cursor_pin_test.c)
+target_link_libraries(jsrf_apu_cursor_pin_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_cursor_pin_default COMMAND jsrf_apu_cursor_pin_test)
+set_tests_properties(jsrf_apu_cursor_pin_default PROPERTIES
+                     ENVIRONMENT "JSRF_EXPECT_PIN=0")
+add_test(NAME jsrf_apu_cursor_pin_on COMMAND jsrf_apu_cursor_pin_test)
+set_tests_properties(jsrf_apu_cursor_pin_on PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_CURSOR_PIN=1;JSRF_EXPECT_PIN=1")
+add_test(NAME jsrf_apu_cursor_pin_zero_is_off COMMAND jsrf_apu_cursor_pin_test)
+set_tests_properties(jsrf_apu_cursor_pin_zero_is_off PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_CURSOR_PIN=0;JSRF_EXPECT_PIN=0")
+
 add_executable(jsrf_apu_fedec_hold_test apu_fedec_hold_test.c)
 target_link_libraries(jsrf_apu_fedec_hold_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_fedec_hold_default COMMAND jsrf_apu_fedec_hold_test)

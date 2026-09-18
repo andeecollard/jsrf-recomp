@@ -198,6 +198,10 @@ SWITCH_TOKEN = {
     # Printed unconditionally on the [FLIP-SYNC] line. `no_flip_sync` is not a
     # substring of the other two tokens, so switch_state_for cannot confuse it.
     "RECOMP_METAL_NO_FLIP_SYNC":   "no_flip_sync",
+    # G18, 18 Sep night 5. Microsoft's model publishes no list cursor at all;
+    # JSRF's removal routine reads ours and takes a repair branch on 83 of 87
+    # removals. Printed unconditionally on the [APU-CURSOR] line.
+    "RECOMP_APU_CURSOR_PIN":       "cursor_pin",
 }
 
 
