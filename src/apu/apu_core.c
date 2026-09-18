@@ -160,11 +160,16 @@ extern unsigned long g_apu_top_write_count[3];
  * handler; the report reads the ring from another thread, which is the same
  * arrangement the [APU-IDLE-TRAP] ring already has.
  *
- * DEFAULTS ON (RECOMP_VOICE_TOP_RING=0 to silence). These events happen about
- * a dozen times per session and cannot be re-captured after the fact -- an
- * opt-in nobody remembered to set costs a whole run -- and the cost when it
- * fires is five loads. The state is printed, per recomp_switch.h's rule, so a
- * reader never has to infer it. */
+ * OPT-IN: RECOMP_VOICE_TOP_RING=1. These events happen about a dozen times per
+ * session and cannot be re-captured after the fact -- an opt-in nobody
+ * remembered to set costs a whole run -- and the cost when it fires is five
+ * loads, which is why this was first written default-on. It is not: see
+ * voice_top_ring_on() below for why the convention won. The state is printed,
+ * per recomp_switch.h's rule, so a reader never has to infer it.
+ *
+ * THIS COMMENT SAID "DEFAULTS ON" UNTIL 18 Sep 2026, thirty lines above a gate
+ * that has always called recomp_switch_on(). A reader who trusts it arms
+ * nothing and then reads the empty ring as evidence. Read the gate. */
 #define VOICE_TOP_RING_N 16u
 #define TOP_WHY_ACTIVE  0x01u   /* A */
 #define TOP_WHY_UNLINK  0x02u   /* U */
