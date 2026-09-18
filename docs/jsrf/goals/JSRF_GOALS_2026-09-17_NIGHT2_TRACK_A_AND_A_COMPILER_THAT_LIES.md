@@ -105,8 +105,15 @@ handle in FEDECPARAM. When several voices retire inside one burst, how many
 distinct handles were ever *delivered* against how many went idle? The
 `seen`/`delivered` pair exists and was re-anchored in `5e47836`; it needs a run.
 
-- **G1a** `RECOMP_APU_FEDEC_HOLD` default — **DONE**, one player confirmation
-  still owed; the crash it fixed is intermittent.
+- **G1a** `RECOMP_APU_FEDEC_HOLD` default — **DONE, but it does NOT fully fix
+  the crash.** 18 Sep: the crash it was built for fired **three times in one
+  A/B with the hold ON** — all at `sub_001A2E2E +0x670`, fault `0x70FFFFFFBE`,
+  the known DSOUND signature, in runs reporting `fedec_hold on (default)` and
+  `decode pairs held while trapped: 3`. The hold did its job on those methods
+  and the title crashed anyway. So the decode-pair race is *a* cause, not *the*
+  cause. G1a rested on one player session with `held=1702` and no crash, and
+  its own entry called that a confirmation rather than a measurement — this is
+  what the second session it asked for looks like.
 - **G1b** why retired voices stay linked — open, and **reopened on the cycle
   hypothesis, 18 Sep**. The player's session:
 
@@ -360,10 +367,34 @@ cannot see a depth-dependent artifact in the middle of a frame. A scene-matched
 full-frame diff is still owed, and until it exists this is evidence that guest
 RAM probably does not need the depth, not proof.
 
-**Next:** narrow A2's depth refusal — which fired 5,747–12,656 times against
-one successful deferral — and A/B `defer_swap` and `no_depth_sync` together.
-That is the combination Track A was always aiming at, and it is now the first
-time the pieces have both been shown to work.
+### THE NARROWING WORKS. THE COMBINATION DOES NOT HELP. *(18 Sep)*
+
+A1 landed and did what it was built to do — deferrals per run went from **one**
+to about **twelve thousand**, and the depth refusal to zero:
+
+    [METAL] swap writeback deferred: 11874 (of which 11873 only because depth
+            is not written back at all) (refused: 0 depth dirty, 0 no slot)
+
+`jsrf_metal_defer_depth_refuses` / `_narrowed` both assert — verified with
+`ctest -V` that neither *skipped*.
+
+**And the frame time did not improve. If anything the reverse:**
+
+    NO_DEPTH_SYNC=1 both arms, DEFER_SWAP=0   19.35 ms          (n=1)
+    NO_DEPTH_SYNC=1 both arms, DEFER_SWAP=1   21.06 20.68 20.75 (n=3, mean 20.83)
+    VOID: n=1 vs 3 — four of eight runs unusable
+
+**Provisional and staying that way until a valid A/B says otherwise.** But the
+direction contradicts A2's premise and is worth recording: deferring may not
+remove the swap's cost so much as **move it to the flip**, where
+`nv2a_metal_sync_range` walks the slot list and pays every overlapping debt at
+once — plausibly worse than paying it spread across swaps.
+
+If that holds, **the 9% belongs to `no_depth_sync` alone** and `defer_swap` is
+a cost rather than a saving. Six trials per arm now running.
+
+**Do not ship either switch on this.** `no_depth_sync` still owes its
+full-frame diff, and `defer_swap` may be negative.
 
 **Done when:** that question is answered, and — only if a change makes the
 deferral actually fire — median frame under 16.68 ms in a mission, verified
