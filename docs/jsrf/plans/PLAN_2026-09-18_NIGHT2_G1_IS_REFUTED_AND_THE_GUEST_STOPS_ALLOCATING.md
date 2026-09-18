@@ -125,9 +125,34 @@ not add a guard. If it does not move, the dispatch-time check at
 
 The player hit it at Gum this session, so it has a reproducible location for the
 first time. FB-WATCH has read real counts (31,643 comparisons, 17,872 changed,
-391 small) with `comparisons>0` as its positive control. The next step is
-spending the BMPs: uncomment `RECOMP_FB_WATCH_DUMP` and `_AFTER`, go straight to
-Gum, and get the first images of the defect.
+391 small) with `comparisons>0` as its positive control.
+
+**DO NOT simply uncomment `RECOMP_FB_WATCH_DUMP`.** Measured 18 Sep night from
+the 17:55 log, before spending anything:
+
+- small-change events fire **~100 per minute, uniformly, for the whole run** —
+  2,000 of them between t=0 and t=1090. They are ordinary animation, not the
+  defect. "Small" is not a proxy for the glyph bug.
+- each dump is a **full 640x480 frame, 921,654 bytes** — `dump_snapshot_bmp`
+  writes `s_snap_w x s_snap_h` (`s_gpu.clip_w/h`), NOT the 80x35 watch region.
+  Verified against existing `watch*.bmp` in `glyphdump-2026-09-17_0907/`.
+
+So any workable cap is exhausted within ~30 s of `RECOMP_FB_WATCH_AFTER`, on
+animation, which is exactly the failure `nv2a_pb_exec.c:1830` already records
+("59 dumps, all of them legitimate animation, before the window where the defect
+was seen"). Arming it blind repeats that.
+
+**Two honest ways forward, pick one:**
+
+1. **Targeted `AFTER`.** The player notes roughly the wall-clock second when the
+   Gum text corrupts (the log prints `t=` continuously), then a follow-up run
+   sets `RECOMP_FB_WATCH_AFTER` to just before it with a cap of ~30. Costs one
+   extra session; needs no code.
+2. **Make the trigger selective.** The defect is a wrong glyph in text that
+   should be STATIC between frames, so the discriminator is "this region changed
+   while the scene was otherwise still", not "the change was small". That is a
+   code change to the trap, and it is the one that would make a scripted run able
+   to catch what twelve of them have missed.
 
 Twelve scripted runs never caught this and one human session catches it
 repeatedly — which is also the argument for phobos665's D3D8 capture/replay
