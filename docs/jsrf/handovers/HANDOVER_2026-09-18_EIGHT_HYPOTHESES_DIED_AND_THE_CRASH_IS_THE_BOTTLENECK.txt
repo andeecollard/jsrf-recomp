@@ -1,0 +1,256 @@
+HANDOVER 2026-09-18 -- EIGHT HYPOTHESES DIED, ONE IMPROVEMENT SHIPPED, AND THE
+THING BLOCKING EVERYTHING ELSE WAS NEVER ON THE LIST
+
+Read CLAUDE.md, then the newest file by date in docs/jsrf/goals/ -- do not
+trust a pointer, including this one. Supersedes
+HANDOVER_2026-09-17_THE_MUSIC_TEST_COULD_NOT_ANSWER_ITS_OWN_QUESTION.txt.
+
+Tree: 53/53 ctest, clean, 21 commits on 18 Sep.
+
+=============================================================================
+READ THIS FIRST: THE STRUCTURAL FINDING
+=============================================================================
+
+The DSOUND crash is not an occasional annoyance. It is destroying roughly half
+of every measurement this project takes.
+
+Eight crashed runs on 18 Sep, every one at sub_001A2E2E faulting on guest
+0xFFFFFFBE. Between them they cost nodepth_ab its control arm (scored n=1 vs 3
+and VOIDed), deferdepth_ab three control runs and the same VOID, forced
+deferdepth2_ab to six trials per arm to yield two and four, and killed a 400 s
+sync-histogram run at 6.4 seconds. EVERY VOID VERDICT THIS PROJECT PRINTED ON
+18 SEP TRACES TO IT.
+
+Nobody had been counting crashes per A/B, which is why this went unnoticed for
+so long. Fixing it roughly doubles the value of every run. Until it is fixed,
+budget six trials per arm and expect half to be excluded.
+
+A rule came out of this and is in the goals: NO MORE A/Bs UNTIL THE CRASH IS
+FIXED. That is arithmetic, not preference.
+
+=============================================================================
+WHERE THE TITLE IS
+=============================================================================
+
+Boots, renders, presents, reaches gameplay, produces audio. Three defects the
+player can see, and their status tonight:
+
+  speed   SHIPPED AND CONFIRMED. RECOMP_METAL_NO_DEPTH_SYNC is default on:
+          9.1% less frame time, ranges not overlapping, eight usable runs,
+          arms verified distinct, ~27,000 depth write-backs skipped per 160 s
+          run. The player played a full session with it on and reported the
+          picture clean -- no sorting errors, nothing through walls. That look
+          is why it is a default and not a switch.
+
+          It does NOT reach 60 fps. The same session ran 15.5 ms for ~35
+          windows and then degraded to 21 ms. The storm does not explain the
+          degradation: it climbs linearly from the start while frame time is
+          flat and only then climbs. What changes at the onset is unknown and
+          the instrument for it (RECOMP_SYNC_HIST) died to the crash.
+
+  music   OPEN, and narrower than it has ever been. See below.
+
+  text    OPEN. Four candidate mechanisms died today. The player reports
+          "lines above some letters", which matches the recorded description.
+
+=============================================================================
+WHAT DIED ON 18 SEP -- DO NOT RE-DERIVE ANY OF THESE
+=============================================================================
+
+Eight. Each with the measurement that killed it.
+
+ 1. THE GUEST IS STARVED OF HANDLES (G1's oldest open question).
+    [APU-IDLE-DELIVERY] found idle=10, delivered=10, never told about=0 -- and
+    again on a second session, 15 of 15. On BOTH the music demonstrably died.
+    Every dead voice is named to the guest; it removes none, then we ask
+    103,644 more times. The defect is not what we tell it.
+
+ 2. A VOICE-LIST CYCLE IS THE MECHANISM.
+    Rings are REAL -- the player's 17 Sep session reads walks_with_a_cycle=88,
+    WALKCAP hit=87, last=v3 -- which retracted an earlier refutation taken from
+    a run that never reached gameplay. But the 18 Sep session died with
+    cycle_break ON, broken=0 and walks_with_a_cycle=0. A ring is not necessary.
+
+ 3. THE TEXTURE MATRIX CONVENTION EXPLAINS THE GLYPHS. RECOMP_FF_DUMP run for
+    the first time: TEXTURE_MATRIX_ENABLE=0 on all three units, every matrix
+    all-zero and never uploaded. JSRF does not use one. (My own best lead.)
+
+ 4. UNSUPPORTED TEXTURE FORMATS MIS-DECODE THE FONT ATLAS.
+    [TEXTURE] prepared=1548512 rejected=0. Unsupported formats REJECT the draw
+    rather than mis-decoding it, and nothing was rejected.
+
+ 5. THE VOICE-LOCK RACE CAUSES THE CRASH. apu_vp.c:658 states its own decision
+    rule -- the fatal raise flagged L, or the hypothesis dies. Across every
+    crash: "3D:v0[]<-TVL", flags EMPTY, locked_raises=0. Dead by its own rule.
+
+ 6. THE GUEST HAS RELEASED THE VOICE (ownership by voice state). A proxy read
+    0 owned / 15,524 UNOWNED with the clear side confirmed firing, on a run
+    that did not crash once. VOICE_OFF is voice state; owner[] is buffer
+    lifetime. No APU register traffic reconstructs the second.
+
+ 7. owner[h]==NULL AT THE RAISE CAUSES THE CRASH. A/B, five trials per arm:
+    2 crashes in 5 with the guard off, 2 in 5 with it on. Positive control:
+    "of those NULLs, 0 were h==0" -- the only fatal combination never occurred.
+
+ 8. DEFERRING THE SURFACE SWAP BUYS THE MEDIAN. With the depth refusal
+    narrowed so defer_swap could finally fire (1 deferral per run -> ~12,000),
+    it is 8.2% SLOWER, ranges not overlapping, and a second A/B agrees on
+    direction. Deferring moves the cost to the flip. A2's premise is refuted.
+
+=============================================================================
+THE CRASH, TRACED TO THE INSTRUCTION
+=============================================================================
+
+sub_001A2E2E+0x670, guest fault 0xFFFFFFBE. Every reported register is
+reproduced by one path and no other:
+
+    eax = MEM32(esi + 0x50);              ESI=0 -> page zero -> 0
+    edi = ZX8(MEM8(eax + 0x18));          -> 0, matches EDI
+    eax = eax + 0xFFFFFFB4u;              0-0x4C, matches EAX
+    eax = ZX16(MEM16(eax + edi*2 + 0xA)); 0xFFFFFFBE -- THE FAULT
+
+ESI==0 IS owner[h] being NULL. The chain is apu_vp.c:454. Page 0 is ordinary
+mapped RAM (RECOMP_TRAP_NULL unset), so the NULL does not fault where it is
+read -- it faults 0x4C bytes earlier and several loads later, which is why
+this looked like an ESI bug for so long.
+
+WHY IT IS ALWAYS VOICE 0, from the generated code and not inference: with
+owner[h] NULL the two following loads read page zero, the compare tests the
+handle against 0, and ANY h != 0 returns harmlessly. Only h==0 falls through
+to the faulting call. That is why all 26 crash dumps name voice 0.
+
+WHAT IS LEFT. The fatal handle is not one of our raises carrying a NULL owner
+(item 7 above). So either it does not come from our raise at all -- the
+decode-pair race, which RECOMP_APU_FEDEC_HOLD was built for and DEMONSTRABLY
+DOES NOT FULLY CLOSE (it fired three times in one A/B with the hold on and
+doing its job) -- or owner[h] is valid when we check and NULL by the time the
+ISR reads it. Both are time-of-check/time-of-use. A raise-time check is in the
+wrong place by construction. That is the next place to look.
+
+=============================================================================
+INSTRUMENTS: FOUR THAT LIED, TWO THAT ARE NEW AND UNREAD
+=============================================================================
+
+  RETIRED. "HEAP DIAGNOSTIC: head=/tail=/flags=" reads three HARDCODED guest
+  addresses (main.c:3765) that are not any heap header -- xbox_HeapAlloc keeps
+  its block table host-side. The same three words appear byte-for-byte in an
+  unrelated crash. It carries zero information. I quoted it as evidence and
+  had to retract that.
+
+  FIXED. The [C] flag was emitted in the idle-trap ring and missing from its
+  own legend -- and C was the flag that mattered that day.
+
+  FIXED. ab_score.py's METAL_SWITCH_RE hardcoded three token names AND stopped
+  at the first parenthesis, so it could not see defer_swap. Its A/B ran with
+  the identical-arms VOID check silently skipped. It was hiding FOUR switches:
+  defer_swap, area_double, metal_vsh, surface_cache.
+
+  FIXED, AND THE PRESCRIPTION WAS WRONG TOO. RECOMP_FB_WATCH fired every frame
+  on the surface rotation and caught nothing. The goals said to re-arm against
+  frame N-2. N-2 assumes a two-deep rotation; nv2a_pb_exec.c:2429 has recorded
+  all along that this title uses THREE colour surfaces. It is now keyed on
+  surface address, eight slots, with `comparisons=` as its positive control.
+  NEVER YET RUN.
+
+  NEW, ARMED, NEVER READ. RECOMP_VOICE_TOP_RING captures the ~12 SUCCESSFUL
+  voice-list head removals a session -- the only positive examples of the
+  behaviour we want, against 100,000 failures. Armed in the player's
+  paths.conf. Reading it needs a play session and nothing else. THIS IS THE
+  CHEAPEST OPEN MOVE IN THE AUDIO TRACK.
+
+  NEW. tools/conformance/fuzz_unicorn.py -- differential x86 lifter fuzzing
+  against Unicorn, because this host cannot run 32-bit x86 natively. Found
+  three defect families; two were upstream's and one is fixed and sent.
+
+  NEW. diagnostics/jsrf_first_fault/instrument_dsound_this.py -- captures the
+  guest DirectSound `this` from a gen-tree copy. Reverted after use, revert
+  verified by the script.
+
+=============================================================================
+FOUR THINGS I GOT WRONG AND RETRACTED. READ THESE AS METHOD, NOT CONFESSION.
+=============================================================================
+
+ 1. "TRACK A IS UNSTARTED, BUILD nv2a_metal_sync_range FIRST." It had been
+    committed three hours before I wrote that, and the commits were in the
+    first git log of the session. Two documents said it was unbuilt and I
+    inherited it from both. RULE ADDED: the commit log outranks any prose
+    written earlier the same day.
+
+ 2. "THE HEAP HEADER FIELDS ARE NOT PLAUSIBLE POINTERS." I read a label and
+    not the code behind it. See above.
+
+ 3. "60 FPS IS REACHED AND THE FRAME RATE IS STEADY." I read six [FRAME-WIN]
+    windows mid-session at 15.5 ms and told the player the inconsistency they
+    were reporting must be the audio. The session degraded to 21 ms. THE
+    PLAYER WAS RIGHT. I marked the reading provisional and then did not act as
+    though it were, while quoting the rule that says not to.
+
+ 4. "G14 IS LIVE IN THE PLAYER'S BUILD." The SF condition is signed-overflow
+    UB and the -O demonstration holds, but I counted one expression form and
+    called it the site count. JSRF has 701 SF consumers; 696 cannot overflow,
+    and all five UB-form sites read `cmp <mem>, 0`, where the subtraction
+    cannot overflow. Not reachable here.
+
+TWO INSTRUMENT FAILURES IN THE SAME SESSION, BOTH READING A CONFIDENT ZERO:
+one printed in a function the crash path never calls, so its last value
+predated every raise; one keyed on VOICE_RELEASE, which this title never
+sends. Both would have produced a false refutation. An instrument that is not
+watching reads zero, and zero looks like data. ASK FOR THE POSITIVE CONTROL
+BEFORE WRITING THE CONCLUSION DOWN.
+
+=============================================================================
+UPSTREAM
+=============================================================================
+
+Two PRs open, zero comments: #67 (the mixbin discard -- upstream drops every
+3D voice in any title) and #69 (narrow rotates, found by the fuzzer, verified
+against upstream's own lifter before/after). The maintainer has not pushed
+since 16 Sep and the queue is ten deep. Nothing to do but wait.
+
+Still owed as ISSUES rather than patches: G15 (bts/btr/btc report CF after
+their own write) and get_data_ptr's dead bound. Both need changes to upstream
+internals that are not drive-by work.
+
+=============================================================================
+PORTABILITY -- AND A BUG THAT AFFECTS EVERY NON-ARM64 HOST
+=============================================================================
+
+Prompted by a Steam Deck question. The Windows cross-build now compiles the
+ENTIRE engine for x86-64 and reaches the linker with one unresolved symbol;
+four test executables link as real PEs. Two shims did that, both matching
+patterns already in the tree (sched_yield -> SwitchToThread, clock_gettime ->
+QueryPerformanceCounter).
+
+THE BUG: mcpx_hw_store, mcpx_hw_store_n and mcpx_hw_store_n_or_last are
+defined ONLY inside `#if !defined(_WIN32) && defined(__aarch64__)`, while
+xbox_memory_layout.c calls two of them from unguarded code at :598 and :1249.
+A native x86-64 Linux build fails identically. It has been invisible because
+nothing but macOS ARM64 has been linked since it landed.
+
+NOT FIXED ON PURPOSE. g_mcpx_alias and MCPX_WBASE are already outside the
+guard so it looks tractable, but line 326 explains the double mapping replaced
+the mprotect window discipline -- and that discipline is the fix for the
+incident CLAUDE.md records as 13.5M open windows in 45 s swallowing every
+VOICE_ON. Windows traps MMIO differently. This needs a decision from someone
+who owns that path.
+
+We do NOT use D3DMetal or DXVK and should not on macOS: nv2a_metal.m links
+Metal.framework directly, and every improvement shipped today lives in it.
+Translation layers are for hosts where there is no backend -- Linux and Deck.
+
+=============================================================================
+WHAT TO DO NEXT
+=============================================================================
+
+ 1. THE CRASH. Time-of-check/time-of-use is the remaining shape. Look at the
+    decode pair, not the raise: FEDEC_HOLD does not fully close it.
+ 2. READ THE VOICE-TOP RING. Armed, never read, needs only a play session.
+    Twelve successes is a smaller haystack than 100,000 failures.
+ 3. RUN THE RE-ARMED FRAME WATCH. Nearly free, rides along on any run, and it
+    is the only thing that makes the text defect reproducible headless.
+ 4. G3's REMAINING GAP. What changes when frame time leaves 15.5 ms. Blocked
+    on (1), which is the argument for (1) in one line.
+
+The day's output was mostly negative results. That is the value: the goals now
+say "do not try this" about eight things that each looked reasonable twelve
+hours ago, and every one of them cost a measurement to kill.
