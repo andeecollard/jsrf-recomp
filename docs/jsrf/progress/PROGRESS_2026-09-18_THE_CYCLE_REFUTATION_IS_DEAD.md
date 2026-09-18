@@ -82,8 +82,20 @@ The first two are the known DirectSound ISR crash — `001A24BE` is the ISR and
                      ESI=FFFFFFFF EDI=D95AD9BB EBP=0050FE78 ESP=0050FEDC
     HEAP DIAGNOSTIC: head=BE820381 tail=417D3FCF flags=BEA51F60
 
-`ECX` and `EDI` hold the same non-pointer word, and the heap header fields are
-not plausible pointers. It is the first session on roughly ten hours of commits
+`ECX` and `EDI` hold the same non-pointer word.
+
+> **RETRACTED 18 Sep.** This paragraph originally continued "and the heap
+> header fields are not plausible pointers". That was wrong, and wrong in the
+> way this tree keeps getting caught: I read a label instead of the code behind
+> it. `HEAP DIAGNOSTIC` prints `MEM32(0x00F80180)`, `MEM32(0x00F80184)` and
+> `MEM32(0x00F80018)` — three **hardcoded** guest addresses with no relation to
+> the fault, to `g_ebp`, or to any heap header. `xbox_HeapAlloc` keeps its
+> block table host-side and writes no in-band metadata into guest memory at
+> all. Decisively, the same three words appear byte-for-byte in the unrelated
+> 09:38 DSOUND crash — `head=BE820381 tail=417D3FCF flags=BEA51F60` — a
+> different session, build and faulting site. They are stable data at fixed
+> addresses and carry **zero** information about either crash. See
+> `PROGRESS_2026-09-18_THE_CRASH_IS_A_GARBAGE_TREE_ROOT.md`. It is the first session on roughly ten hours of commits
 the player had not run before, so it is new to them; whether it is new to the
 tree is not established.
 
