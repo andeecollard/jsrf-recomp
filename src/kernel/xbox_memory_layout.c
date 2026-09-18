@@ -1502,6 +1502,116 @@ static unsigned long g_mcpx_ack_windows;        /* ack-thread open/close pairs *
 static unsigned long g_nv2a_trap_aliased;  /* NV2A stores done via the alias */
 static unsigned long g_mcpx_trap_aliased;  /* MCPX stores done via the alias */
 
+/* ── RECOMP_APU_TRAP_THREADS: which guest thread submits APU methods ──────
+ *
+ * WHY THE KERNEL CENSUS COULD NOT ANSWER THIS. RECOMP_KERNEL_THREADS settled
+ * that no guest thread dies at the APU freeze -- four alive with near-constant
+ * call rates 1,250 s afterwards, a fifth dormant since t=0. But it could not
+ * say which thread FEEDS the APU, because APU submission is not a kernel call
+ * at all: it is an MMIO store into the trapped aperture, which is exactly why
+ * [MCPX-TRAP] vp equals guest_methods. No ordinal histogram can see it.
+ *
+ * This counts the same faults the trap already services, bucketed by the guest
+ * TIB, so the periodic report shows per-thread apu/vp submission. A freeze then
+ * reads directly: the thread whose vp count stops growing is the one that
+ * stopped submitting, and the kernel census says separately whether that same
+ * thread is still running.
+ *
+ * ASYNC-SIGNAL-SAFETY GOVERNS EVERY CHOICE HERE. This runs inside a SIGSEGV /
+ * SIGBUS handler:
+ *   - no getenv. recomp_switch_on() caches behind a getenv, so the gate is
+ *     resolved EAGERLY in xbox_McpxTrapInstall(), before any fault can arrive.
+ *     A gate that resolved itself lazily would call getenv in a signal handler.
+ *   - no timestamps. GetTickCount is not safe here, and it is not needed: the
+ *     periodic report is already a time series, so "stopped growing between
+ *     reports" is the reading.
+ *   - no stdio, no allocation. Plain atomics over a static table.
+ *
+ * g_fs_base is RECOMP_TLS and a signal handler runs on the faulting thread, so
+ * it already names the submitting thread with no bookkeeping.
+ */
+#define APU_TH_MAX 8u
+
+typedef struct {
+    uint32_t      fs_base;   /* guest TIB VA; 0 = free slot */
+    unsigned long apu;       /* aperture writes anywhere in the APU range */
+    unsigned long vp;        /* ... of which, in the VP region (0x20000..0x30000) */
+} ApuThreadSlot;
+
+static ApuThreadSlot g_apu_th[APU_TH_MAX];
+unsigned long g_apu_th_distinct;
+unsigned long g_apu_th_over;      /* faults that found no free slot */
+static int    g_apu_th_on = -1;   /* resolved eagerly; -1 means "not yet" */
+
+/* Called from the trap handler. Must stay async-signal-safe. */
+void xbox_apu_trap_note_thread(uint32_t fs_base, int is_vp)
+{
+    unsigned int i;
+
+    if (g_apu_th_on <= 0) return;
+    if (fs_base == 0) fs_base = 0xFFFFFFFFu;  /* a thread with no TIB still counts */
+
+    for (i = 0; i < APU_TH_MAX; ++i) {
+        uint32_t cur = __atomic_load_n(&g_apu_th[i].fs_base, __ATOMIC_ACQUIRE);
+        if (cur == fs_base) break;
+        if (cur == 0) {
+            uint32_t expect = 0;
+            if (__atomic_compare_exchange_n(&g_apu_th[i].fs_base, &expect, fs_base,
+                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                __atomic_fetch_add(&g_apu_th_distinct, 1ul, __ATOMIC_RELAXED);
+                break;
+            }
+            if (expect == fs_base) break;
+        }
+    }
+    if (i == APU_TH_MAX) {
+        __atomic_fetch_add(&g_apu_th_over, 1ul, __ATOMIC_RELAXED);
+        return;
+    }
+    __atomic_fetch_add(&g_apu_th[i].apu, 1ul, __ATOMIC_RELAXED);
+    if (is_vp) __atomic_fetch_add(&g_apu_th[i].vp, 1ul, __ATOMIC_RELAXED);
+}
+
+/* Resolve the gate outside the handler. Safe to call more than once. */
+void xbox_apu_trap_threads_arm(void)
+{
+    if (g_apu_th_on < 0)
+        g_apu_th_on = recomp_switch_on("RECOMP_APU_TRAP_THREADS") ? 1 : 0;
+}
+
+int xbox_apu_trap_thread_slot(unsigned int i, uint32_t *fs_base,
+                              unsigned long *apu, unsigned long *vp)
+{
+    uint32_t fs;
+    if (i >= APU_TH_MAX) return 0;
+    fs = __atomic_load_n(&g_apu_th[i].fs_base, __ATOMIC_ACQUIRE);
+    if (!fs) return 0;
+    if (fs_base) *fs_base = fs;
+    if (apu) *apu = __atomic_load_n(&g_apu_th[i].apu, __ATOMIC_RELAXED);
+    if (vp)  *vp  = __atomic_load_n(&g_apu_th[i].vp, __ATOMIC_RELAXED);
+    return 1;
+}
+
+/* Unarmed reads identical to "no thread ever submitted", so say which it is. */
+void xbox_ApuTrapThreadReport(void)
+{
+    unsigned int i;
+    if (g_apu_th_on <= 0) {
+        fprintf(stderr, "  [APU-TRAP-THREADS] OFF"
+                        " (RECOMP_APU_TRAP_THREADS=1 to arm)\n");
+        return;
+    }
+    fprintf(stderr, "  [APU-TRAP-THREADS] %lu distinct, %lu faults with no slot"
+                    " (cap %u):\n",
+            g_apu_th_distinct, g_apu_th_over, (unsigned)APU_TH_MAX);
+    for (i = 0; i < APU_TH_MAX; ++i) {
+        uint32_t fs; unsigned long apu, vp;
+        if (!xbox_apu_trap_thread_slot(i, &fs, &apu, &vp)) continue;
+        fprintf(stderr, "  [APU-TRAP-THREADS]   tib=0x%08X apu=%-10lu vp=%lu\n",
+                fs, apu, vp);
+    }
+}
+
 void xbox_McpxTrapReport(void)
 {
     fprintf(stderr, "  [MCPX-TRAP] faults=%lu apu=%lu vp=%lu "
@@ -1511,6 +1621,7 @@ void xbox_McpxTrapReport(void)
             g_mcpx_trap_apu_vp_writes, g_mcpx_ack_windows,
             g_mcpx_reprotect_failures,
             g_mcpx_trap_aliased, g_nv2a_trap_aliased, g_pcrtc_windows);
+    xbox_ApuTrapThreadReport();
     fflush(stderr);
 }
 
@@ -1771,6 +1882,11 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
                 g_mcpx_trap_apu_writes++;
                 if (off >= 0x20000u && off < 0x30000u)
                     g_mcpx_trap_apu_vp_writes++;
+                {
+                    extern RECOMP_TLS uint32_t g_fs_base;
+                    xbox_apu_trap_note_thread(g_fs_base,
+                        off >= 0x20000u && off < 0x30000u);
+                }
                 g_apu_trap_host_pc = uc->uc_mcontext->__ss.__pc;
                 g_mcpx_apu_write(off, (uint32_t)value, width);
             }
@@ -1815,6 +1931,11 @@ static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
             g_mcpx_trap_apu_writes++;
             if (off >= 0x20000u && off < 0x30000u)
                 g_mcpx_trap_apu_vp_writes++;
+            {
+                extern RECOMP_TLS uint32_t g_fs_base;
+                xbox_apu_trap_note_thread(g_fs_base,
+                    off >= 0x20000u && off < 0x30000u);
+            }
             g_apu_trap_host_pc = uc->uc_mcontext->__ss.__pc;
             g_mcpx_apu_write(off, (uint32_t)value, width);
             if (++n <= 8 || (n % 1000) == 0) {
@@ -2143,6 +2264,10 @@ static void xbox_McpxTrapInstall(void)
     }
 
     memset(&sa, 0, sizeof(sa));
+    /* Resolve the APU-thread gate BEFORE the handler can fire: its
+     * accessor reads the environment, and getenv in a signal handler is
+     * not async-signal-safe. */
+    xbox_apu_trap_threads_arm();
     sa.sa_sigaction = mcpx_trap_handler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
