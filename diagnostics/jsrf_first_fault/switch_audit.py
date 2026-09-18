@@ -80,17 +80,45 @@ problems = 0
 # leisure, but a NEW switch must use the helper, whose grammar is stated in one
 # place. The number only ever goes down.
 HANDROLLED_BASELINE = 128
-if len(handrolled) > HANDROLLED_BASELINE:
-    added = len(handrolled) - HANDROLLED_BASELINE
+
+# VALUE-CARRYING, THEREFORE NOT SUBJECT TO THE RATCHET.
+#
+# The ratchet's instruction is "use recomp_switch_on()", and its reason is that
+# the hand-rolled form disagrees with the shared grammar on "on", "yes" and
+# "false". Both are about BOOLEANS. recomp_switch_on() returns int; it cannot
+# express a filesystem path, a rectangle or a count, so for a variable that
+# carries a value the instruction is impossible to follow and the ratchet is
+# asking for something that does not exist.
+#
+# Exempted BY NAME, not by pattern. A pattern that tried to infer "this one
+# carries a value" would quietly exempt a boolean somebody wrote carelessly,
+# which is the ratchet's whole purpose defeated. Adding a name here is a
+# deliberate act with a reason attached.
+#
+# Value-carrying switches that predate this list are still inside the frozen
+# 128 and are not enumerated here; migrating them out is a separate pass that
+# would lower the baseline. This list is for NEW ones.
+VALUE_CARRYING = {
+    # A dump path for the indirect-branch feedback database. Was a
+    # compile-time constant relative to the working directory, which a
+    # GUI-launched .app cannot write -- 91 silent fopen failures per session.
+    "RECOMP_ICALL_FEEDBACK_PATH",
+}
+
+ratcheted = set(handrolled) - VALUE_CARRYING
+if len(ratcheted) > HANDROLLED_BASELINE:
+    added = len(ratcheted) - HANDROLLED_BASELINE
     print("RATCHET: %d new hand-rolled switch read(s) -- the baseline is %d. "
           "New switches must use recomp_switch_on(), whose grammar is stated "
           "once; the hand-rolled form disagrees with it on \"on\", \"yes\" "
-          "and \"false\"." % (added, HANDROLLED_BASELINE))
+          "and \"false\". If the new switch carries a VALUE rather than a "
+          "boolean, add it to VALUE_CARRYING with a reason instead."
+          % (added, HANDROLLED_BASELINE))
     problems += 1
-elif len(handrolled) < HANDROLLED_BASELINE:
+elif len(ratcheted) < HANDROLLED_BASELINE:
     print("NOTE: hand-rolled reads are down to %d from a baseline of %d -- "
           "lower HANDROLLED_BASELINE to lock the gain in."
-          % (len(handrolled), HANDROLLED_BASELINE))
+          % (len(ratcheted), HANDROLLED_BASELINE))
 
 # Rule 1
 both = sorted(set(helper) & set(handrolled))

@@ -472,6 +472,16 @@ add_test(NAME jsrf_adpcm_decode COMMAND jsrf_adpcm_decode_test)
 # its getenv in a static, so one process only ever sees one value -- and the
 # default itself is the property under test, since it silently read "off"
 # while the comment on it said "on".
+add_executable(jsrf_icall_feedback_path_test icall_feedback_path_test.c)
+target_link_libraries(jsrf_icall_feedback_path_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_icall_feedback_path_default COMMAND jsrf_icall_feedback_path_test)
+add_test(NAME jsrf_icall_feedback_path_env COMMAND jsrf_icall_feedback_path_test)
+set_tests_properties(jsrf_icall_feedback_path_env PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=/tmp/icall_from_env.dump")
+add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_test)
+set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
+
 add_executable(jsrf_dsound_this_distinct_test dsound_this_distinct_test.c)
 target_link_libraries(jsrf_dsound_this_distinct_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_dsound_this_distinct COMMAND jsrf_dsound_this_distinct_test)

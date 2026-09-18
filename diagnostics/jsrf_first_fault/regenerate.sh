@@ -33,22 +33,37 @@ ICALL_DB="tools/recomp/output/icall_targets.json"
 # fails silently: regeneration re-seeds from the previous cycle's database and
 # looks exactly like a loop that has converged.
 #
-# The dump is written to the *process* working directory, so it lands wherever
-# the title was launched from: the repo root for a hand-run binary, the build
-# tree for a scripted one. Merge every one we can find rather than choosing.
-# The database only ever ORs flags together, so re-merging a dump already
-# merged costs a line of output and nothing else, while missing a new one
-# stalls the convergence.
+# The dump goes where RECOMP_ICALL_FEEDBACK_PATH says, and otherwise to the
+# *process* working directory -- so it lands at the repo root for a hand-run
+# binary and in the build tree for a scripted one. Merge every one we can find
+# rather than choosing. The database only ever ORs flags together, so
+# re-merging a dump already merged costs a line of output and nothing else,
+# while missing a new one stalls the convergence.
 ICALL_DUMPS="${ICALL_DUMPS:-icall_targets.dump $OUT/icall_targets.dump $OUT/build/icall_targets.dump}"
 
-ICALL_FOUND=""
+# THE PLAYER'S DUMP, WHICH IS THE ONE WORTH HAVING. A GUI-launched .app has no
+# writable working directory, so for three days the bundle wrote nothing at all
+# -- 91 fopen failures a session against a database that stayed stale -- while
+# a player's session is precisely the run that reaches code no scripted run
+# does. paths.conf now points RECOMP_ICALL_FEEDBACK_PATH at the support
+# directory, so look there too.
+ICALL_APP_DUMP="${ICALL_APP_DUMP:-$HOME/Library/Application Support/JSRF/icall_targets.dump}"
+
+# Positional parameters, not a space-separated string. "Application Support"
+# contains a space, and the previous `for dump in $ICALL_DUMPS` / `merge
+# $ICALL_FOUND` pair word-splits -- which would hand the merger two paths that
+# do not exist and silently merge nothing.
+set --
 for dump in $ICALL_DUMPS; do
     if [ -f "$dump" ]; then
-        ICALL_FOUND="$ICALL_FOUND $dump"
+        set -- "$@" "$dump"
     fi
 done
+if [ -f "$ICALL_APP_DUMP" ]; then
+    set -- "$@" "$ICALL_APP_DUMP"
+fi
 
-if [ -n "$ICALL_FOUND" ]; then
+if [ "$#" -gt 0 ]; then
     echo "=== merging runtime icall observations ==="
     # Cross-referenced against the previous cycle's functions.json, which is
     # what makes the "NOT a known function start" list meaningful: those are
@@ -61,7 +76,7 @@ if [ -n "$ICALL_FOUND" ]; then
     if ! "$PYTHON" -m tools.recomp.icall_feedback \
         --db "$ICALL_DB" \
         --functions "$OUT/disasm/functions.json" \
-        merge $ICALL_FOUND
+        merge "$@"
     then
         echo "WARNING: no observations merged; the database is unchanged." >&2
         echo "         The dumps exist but are empty -- check the title was" >&2
@@ -70,6 +85,7 @@ if [ -n "$ICALL_FOUND" ]; then
 else
     echo "WARNING: no runtime icall dump found. Looked for:" >&2
     for dump in $ICALL_DUMPS; do echo "           $dump" >&2; done
+    echo "           $ICALL_APP_DUMP" >&2
     echo "         Regenerating against the database as it stands. A run's newly" >&2
     echo "         observed call targets reach discovery only once merged, so if" >&2
     echo "         you have just run the title, find its dump and pass the path" >&2

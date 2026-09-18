@@ -39,11 +39,40 @@
  * targets does not resident 8 MiB. */
 volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
 
+const char *recomp_icall_feedback_path(void)
+{
+    /* Resolved once. The periodic dump, the crash handler and atexit must all
+     * agree about where the run's evidence went, and a getenv re-read could
+     * disagree if anything ever called setenv mid-run. */
+    static const char *cached;
+    if (!cached) {
+        const char *e = getenv("RECOMP_ICALL_FEEDBACK_PATH");
+        cached = (e && *e) ? e : RECOMP_ICALL_FEEDBACK_PATH;
+    }
+    return cached;
+}
+
 void recomp_icall_feedback_dump(const char *path)
 {
     FILE *f = fopen(path, "w");
     if (!f) {
-        fprintf(stderr, "[icall-feedback] cannot write %s\n", path);
+        /* ONCE, NOT ONCE PER REPORT. This fires from the periodic report, so
+         * the old message printed 91 times in one session -- frequent enough
+         * to scroll past and vague enough to ignore, which is how a dead
+         * feedback loop survived three days. Say it once, say what it means,
+         * and name the variable that fixes it. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr,
+                    "[icall-feedback] CANNOT WRITE %s -- no indirect-branch"
+                    " targets from this run will be recorded, and the"
+                    " persisted database will not advance. A GUI-launched app"
+                    " bundle has no writable working directory, which is the"
+                    " usual cause. Set RECOMP_ICALL_FEEDBACK_PATH to an"
+                    " absolute path your launcher can write."
+                    " (Further failures this run are suppressed.)\n", path);
+        }
         return;
     }
 
@@ -70,7 +99,7 @@ void recomp_icall_feedback_dump(const char *path)
 
 static void dump_at_exit(void)
 {
-    recomp_icall_feedback_dump(RECOMP_ICALL_FEEDBACK_PATH);
+    recomp_icall_feedback_dump(recomp_icall_feedback_path());
 }
 
 void recomp_icall_feedback_init(void)

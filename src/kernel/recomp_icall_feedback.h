@@ -55,14 +55,37 @@ extern volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
  */
 void recomp_icall_feedback_dump(const char *path);
 
-/** Register an atexit() dump to RECOMP_ICALL_FEEDBACK_PATH. */
+/** Register an atexit() dump to recomp_icall_feedback_path(). */
 void recomp_icall_feedback_init(void);
 
 /* Default dump location, relative to the working directory. CUSTOMIZE if your
- * launcher runs from somewhere you would rather not write to. */
+ * launcher runs from somewhere you would rather not write to.
+ *
+ * A COMPILE-TIME DEFAULT IS NOT ENOUGH, and this cost three days of feedback to
+ * learn. A double-clicked macOS .app inherits no shell and starts with a
+ * working directory it may not write to, so the relative default fails at
+ * fopen -- on the ONE configuration that matters, because a player's session
+ * reaches code no scripted run does. It failed 91 times in a single JSRF
+ * session, once per periodic report, while the persisted database sat three
+ * days stale and nobody noticed: the message named the file but not the
+ * variable, the cause, or the fact that nothing was being recorded.
+ *
+ * So the path is resolvable at RUNTIME from the environment variable of the
+ * same name, which is what a launcher can actually set. recomp_icall_feedback_path()
+ * does the resolving; the env var wins when set and non-empty. */
 #ifndef RECOMP_ICALL_FEEDBACK_PATH
 #define RECOMP_ICALL_FEEDBACK_PATH "icall_targets.dump"
 #endif
+
+/**
+ * The dump path actually in effect: $RECOMP_ICALL_FEEDBACK_PATH if it is set
+ * and non-empty, otherwise the compile-time RECOMP_ICALL_FEEDBACK_PATH.
+ *
+ * Resolved once and cached, so the answer cannot change between the periodic
+ * dump, the crash handler and atexit -- three callers that must not disagree
+ * about where the run's evidence went. Never returns NULL.
+ */
+const char *recomp_icall_feedback_path(void);
 
 /* Call these from the host program. They are macros so a host can call them
  * unconditionally without #ifdef -- both compile away when the feature is off,
@@ -70,7 +93,7 @@ void recomp_icall_feedback_init(void);
  * instrumentation that rots. */
 #define RECOMP_ICALL_FEEDBACK_INIT() recomp_icall_feedback_init()
 #define RECOMP_ICALL_FEEDBACK_DUMP() \
-    recomp_icall_feedback_dump(RECOMP_ICALL_FEEDBACK_PATH)
+    recomp_icall_feedback_dump(recomp_icall_feedback_path())
 
 #else  /* !RECOMP_ICALL_FEEDBACK */
 
