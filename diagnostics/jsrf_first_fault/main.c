@@ -1428,6 +1428,30 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
 #define ADX_WORKER_VA    0x0025EFB0u
 #define ADX_UNDERRUN_VA  0x002615ACu
 
+/* A monotonic timestamp that exists on both hosts.
+ *
+ * mingw declares neither clock_gettime nor CLOCK_MONOTONIC, so the one call
+ * below stopped the Windows cross-build. QueryPerformanceCounter is the
+ * Windows monotonic clock and the tree already uses it that way --
+ * apu_shim.h's qemu_clock_get_us is the same two calls. struct timespec
+ * itself mingw does provide, so only the reading needs replacing. */
+#if defined(_WIN32)
+static void recomp_monotonic(struct timespec *ts)
+{
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    ts->tv_sec  = (time_t)(count.QuadPart / freq.QuadPart);
+    ts->tv_nsec = (long)((count.QuadPart % freq.QuadPart)
+                         * 1000000000LL / freq.QuadPart);
+}
+#else
+static void recomp_monotonic(struct timespec *ts)
+{
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
+#endif
+
 static void jsrf_adx_rate_report(void)
 {
     static int on = -1;
@@ -1442,7 +1466,7 @@ static void jsrf_adx_rate_report(void)
 
     spin = MEM32(ADX_SPIN_VA); srv = MEM32(ADX_SERVER_VA);
     wrk  = MEM32(ADX_WORKER_VA); under = MEM32(ADX_UNDERRUN_VA);
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    recomp_monotonic(&now);
     if (prev.tv_sec || prev.tv_nsec) {
         dt = (double)(now.tv_sec - prev.tv_sec)
            + (double)(now.tv_nsec - prev.tv_nsec) / 1e9;

@@ -43,6 +43,16 @@
 #include <time.h>
 #include <errno.h>
 #include <sched.h>
+#define recomp_yield() ((void)sched_yield())
+#else
+/* mingw provides no <sched.h> and no sched_yield, so the two spin loops below
+ * called an undeclared function and the Windows cross-build stopped here.
+ * SwitchToThread is the Windows equivalent -- give up the rest of this
+ * thread's slice to another ready thread -- and it is already what the rest of
+ * this tree spins on: xbox_memory_layout.c's aperture waits and apu_core.c's
+ * APU_LOCK_YIELD both use it. The Win32 declaration arrives with <windows.h>,
+ * which kernel.h resolves to on this target. */
+#define recomp_yield() ((void)SwitchToThread())
 #endif
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
@@ -1837,7 +1847,7 @@ static void bridge_KeWaitForSingleObject(void)
                 while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
 #endif
             } else {
-                sched_yield();
+                recomp_yield();
             }
         }
     }
@@ -4845,7 +4855,7 @@ static void bridge_KeSynchronizeExecution(void)
 #if defined(_WIN32)
             Sleep(0);
 #else
-            sched_yield();
+            recomp_yield();
 #endif
         }
         if (!locked && ++g_sync_exec_unsynchronised <= 8) {
