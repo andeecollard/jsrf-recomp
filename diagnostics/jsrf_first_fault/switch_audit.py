@@ -40,8 +40,15 @@ for dirpath, _, names in os.walk(src):
 helper, handrolled, default_on, empty_safe = {}, {}, set(), set()
 for path in sources:
     text = open(path, errors="ignore").read()
-    for name in re.findall(r'recomp_switch_on\(\s*"(RECOMP_[A-Z0-9_]+)"', text):
-        helper.setdefault(name, set()).add(path)
+    # Both helpers count as "via the helper": recomp_switch_on_default states
+    # the SAME grammar for a switch that defaults on, which is the property
+    # this ratchet is protecting. Matching it explicitly rather than letting
+    # the recomp_switch_on pattern catch it by prefix, so a future helper with
+    # a different grammar is not silently waved through.
+    for pat in (r'recomp_switch_on\(\s*"(RECOMP_[A-Z0-9_]+)"',
+                r'recomp_switch_on_default\(\s*"(RECOMP_[A-Z0-9_]+)"'):
+        for name in re.findall(pat, text):
+            helper.setdefault(name, set()).add(path)
     for name in re.findall(r'getenv\(\s*"(RECOMP_[A-Z0-9_]+)"', text):
         handrolled.setdefault(name, set()).add(path)
     # A default-on hand-rolled read looks like

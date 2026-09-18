@@ -419,7 +419,52 @@ would still read as "inert".
 mission. That is the second A/B in a row losing half its runs, and it is now a
 harness problem in its own right rather than bad luck.
 
-**Do not ship on this.** `no_depth_sync` still owes its full-frame diff.
+### `no_depth_sync` IS DEFAULT ON, 18 Sep — and G3 is NOT done
+
+Shipped on the tree's own bar, which is a picture or a listen:
+
+- **speed** 9.1% less frame time, ranges not overlapping, eight usable runs,
+  arms verified distinct; ~27,000 write-backs skipped per 160 s run.
+- **correctness** zero non-MATCH blit checks across twelve runs, **and the
+  player played a full session with it on and reported the picture clean** —
+  no sorting errors, nothing through walls. That is the check the blit
+  sampling could not give, and it is why this is a default rather than a
+  switch.
+
+Through a new `recomp_switch_on_default()` helper rather than a hand-rolled
+getenv. Every default-on switch here had re-decided the grammar, and
+`RECOMP_APU_FEDEC_HOLD` read an exported-but-empty value as OFF for a week
+because of it. The audit now reads `128 hand-rolled` — back to baseline, down
+from 129, without touching the ratchet's number.
+
+### THE FRAME-RATE CLAIM I MADE AND HAD TO WITHDRAW
+
+Mid-session I read six `[FRAME-WIN]` windows at 15.5 ms, called 60 fps reached,
+and told the player the inconsistency they were reporting must be the audio.
+**The player was right and I was wrong.** The full session:
+
+    boot/load   4.4 5.8 7.7 37.6 38.7 26.1 17.4 18.0 22.7 16.6
+    stable      15.5 ... 15.7    (~35 windows at 64 fps)
+    degrading   16.0 16.8 18.4 18.9 19.6 20.9 20.0 19.8 19.2 ...
+    final       21.1 20.8 21.0 20.9 20.9 20.8 21.1 21.0
+
+Sustained 64 fps for ~35 windows, then a progressive climb to 21 ms. I marked
+the reading provisional and then did not act as though it were, while quoting
+the rule that says not to.
+
+**G3's done-criterion is not met.** The median across a session is not reliably
+inside 16.68 ms.
+
+**And the obvious explanation is not supported.** The storm climbs linearly
+from the start — 0, 7, 151, 640, … 16,712, about +250 per report — while frame
+time stays flat for 35 windows and only then climbs. If the storm caused the
+degradation it would have degraded from the beginning.
+
+**The next measurement, and the instrument is parked:** which stage grows.
+`RECOMP_SYNC_HIST` is the per-frame breakdown and it is OFF under G4 (one
+unexplained halt, not reproduced in three later trials). Arming it for a
+*scripted* run is the cheap way to find out, and risks a scripted run rather
+than a player's.
 
 **Done when:** that question is answered, and — only if a change makes the
 deferral actually fire — median frame under 16.68 ms in a mission, verified

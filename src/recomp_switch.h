@@ -42,4 +42,23 @@ static inline int recomp_switch_on(const char *name)
     return v && v[0] != '\0' && strcmp(v, "0") != 0;
 }
 
+/* THE SAME GRAMMAR, FOR A SWITCH THAT DEFAULTS ON.
+ *
+ * recomp_switch_on cannot express this: unset reads as off, which is the one
+ * answer a default-on switch must not give. Every default-on switch in this
+ * tree has therefore hand-rolled its own getenv, and each one re-decided the
+ * grammar -- RECOMP_APU_FEDEC_HOLD read an exported-but-empty value as OFF for
+ * a week because it tested `e` rather than `e && *e`.
+ *
+ * So: unset or empty means the default; anything else goes through the same
+ * rule as recomp_switch_on, so "0" is off and "on", "yes" and "false" are all
+ * ON exactly as they are everywhere else in this tree. Disagreeing with that
+ * is what the switch ratchet exists to prevent. */
+static inline int recomp_switch_on_default(const char *name, int dflt)
+{
+    const char *v = getenv(name);
+    if (!v || v[0] == '\0') return dflt != 0;
+    return strcmp(v, "0") != 0;
+}
+
 #endif /* RECOMP_SWITCH_H */

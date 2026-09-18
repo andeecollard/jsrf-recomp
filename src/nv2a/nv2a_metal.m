@@ -1785,10 +1785,34 @@ static int hw_no_stencil_on(void)
  * Counted either way, so a run with it OFF still reports how many write-backs
  * it would have skipped -- which is the number that says whether the switch is
  * worth an A/B at all. */
+/* DEFAULT ON since 18 Sep 2026, on a player's look and a scene-matched A/B.
+ *
+ *   speed        9.1% less frame time, ranges NOT overlapping, eight usable
+ *                runs, arms verified distinct. ~27,000 write-backs skipped per
+ *                160 s run, each one a GPU drain as well as a 4.9 MB copy.
+ *   correctness  zero non-MATCH blit checks across twelve runs, AND the
+ *                player played a session with it on and reported the picture
+ *                clean -- no sorting errors, nothing through walls.
+ *
+ * That second line is the one that matters. This tree has shipped two switches
+ * on test evidence without a look and backed both out, and the rule that came
+ * from it is that a player-facing default needs a picture or a listen. This
+ * one has a picture.
+ *
+ * RECOMP_METAL_NO_DEPTH_SYNC=0 restores the write-back. The grammar is
+ * empty-value-safe on purpose: `(e && *e)` rather than `e`, because an
+ * exported-but-empty variable must not read as "off" -- that exact bug sat in
+ * RECOMP_APU_FEDEC_HOLD for a week.
+ *
+ * WHAT THIS DOES NOT DO: reach 60 fps. The same session ran 15.5 ms for ~35
+ * windows and then degraded to 21 ms, so the median across a session is not
+ * reliably inside the 16.68 ms budget. The 9% is real and it is not the whole
+ * gap. */
 static int no_depth_sync_on(void)
 {
     static int on = -1;
-    if (on < 0) on = recomp_switch_on("RECOMP_METAL_NO_DEPTH_SYNC");
+    if (on < 0)
+        on = recomp_switch_on_default("RECOMP_METAL_NO_DEPTH_SYNC", 1);
     return on;
 }
 static uint64_t g_depth_syncs_skipped, g_depth_syncs_taken;
