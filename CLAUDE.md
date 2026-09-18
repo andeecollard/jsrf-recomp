@@ -16,6 +16,37 @@ The recompiler translates the guest XBE to C, which is compiled against a
 replacement Xbox kernel, an NV2A graphics model and an MCPX APU model in
 `src/`.
 
+## The title's XDK
+
+JSRF links **XDK build 4134** — uniformly, across all seven libraries:
+
+```
+XAPILIB  D3D8  DSOUND  XBOXKRNL  LIBCMT  LIBCPMT  XGRAPHC     all 1.0.4134
+```
+
+(`D3D8` carries a different flags word, `0x4002` against `0x4001` for the rest;
+the low bits are the QFE revision.) It imports 120 kernel ordinals.
+
+Two things follow, and both have been wanted already:
+
+- It pins the exact API surface the replacement kernel and the D3D/DSOUND
+  translation have to match. "The XDK does X" is only a fact about 4134.
+- It decides whether symbol names can be borrowed from another title at all.
+  `docs/technical/ms-fusion-*.md` describes recovering XDK function names from
+  Microsoft's own shipped BC packages, which is attractive because this title
+  disassembles to **8,876 functions with exactly one name** among them. But a
+  byte signature only transfers where the same XDK build emitted the same code,
+  and the four titles Microsoft shipped that way are Nov 2001 to Jun 2005 —
+  Blinx (Oct 2002) is the nearest to 4134 and is still months off. Check the
+  version before spending anything on that idea; the first attempt picked
+  Crimson Skies on symbol count and it is one of the worst matches by date.
+
+Re-derive rather than trusting this paragraph:
+
+```sh
+python3 -m tools.xbe_parser.xbe_parser <game dir>/default.xbe   # "--- Libraries"
+```
+
 ## Layout
 
 ```
