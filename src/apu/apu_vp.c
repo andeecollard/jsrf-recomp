@@ -650,6 +650,69 @@ uint64_t g_apu_voice_ever_on[MCPX_HW_MAX_VOICES / 64];
  * measuring before guarding. The precedent is the voice-lock guard beside it,
  * which was built the same way and which the 18 Sep crash dumps killed. */
 uint64_t g_apu_voice_owned_now[MCPX_HW_MAX_VOICES / 64];
+
+/* THE GUEST'S DIRECTSOUND OBJECT, CAPTURED BY A GEN PROBE.
+ *
+ * Zero until the probe from diagnostics/jsrf_first_fault/
+ * instrument_dsound_this.py has fired, and zero for good in an uninstrumented
+ * build -- which is exactly what a reader needs, because every use below is
+ * gated on it being non-zero and the report says which it was.
+ *
+ * 001A200D does `pBuf = this->owner[h]` at this+0x2C4+h*4 with NO NULL CHECK,
+ * and a NULL only proves fatal for handle 0: with owner[h] NULL the two loads
+ * that follow read page zero, the `cmp eax, edx` compares h against 0, and any
+ * h != 0 returns harmlessly. h == 0 falls through to the call that faults.
+ * That is why all 26 crash dumps name voice 0 and no other. */
+unsigned int g_jsrf_dsound_this;
+unsigned long g_idle_owner_null_raises;  /* raises whose owner[h] read NULL */
+unsigned long g_idle_owner_ok_raises;    /* positive control for that zero */
+unsigned long g_idle_owner_null_h0;      /* ...and h==0: the FATAL combination */
+unsigned long g_idle_owner_suppressed;   /* raises the guard actually withheld */
+
+/* RECOMP_APU_IDLE_TRAP_OWNER_GUARD -- do not hand the ISR a handle it will
+ * dereference into NULL.
+ *
+ * DEFAULT ON. The tree's rule is that a player-facing default needs a picture
+ * or a listen, and this one has neither -- but it is not a player-facing
+ * behaviour change. It withholds an interrupt the guest cannot service: with
+ * owner[h] NULL, 001A200D reads page zero twice, compares the handle against
+ * 0, and returns for every h except 0, where it falls through and faults. So
+ * the raise is either a no-op or fatal, and suppressing it removes the second
+ * without changing the first.
+ *
+ * Measured before shipping: 9 NULL owners in 27,947 raises, 0.03%, against a
+ * positive control of 27,937 non-NULL. The cost of being wrong is that nine
+ * voices a run go un-reclaimed; the cost of being right is half the project's
+ * runs stop dying. Set =0 to restore the crash.
+ *
+ * DEFAULTED BACK OFF, 18 Sep, BY ITS OWN A/B. Five trials per arm:
+ *
+ *     GUARD=0   2 crashes in 5 runs
+ *     GUARD=1   2 crashes in 5 runs      both at sub_001A2E2E
+ *
+ * and the positive control says why it could not have helped: "of those
+ * NULLs, 0 were h==0" -- the ONLY combination that reaches the faulting call
+ * never occurred in any run, so the guard had nothing fatal to withhold and
+ * the crash arrived regardless.
+ *
+ * What that rules out is worth more than the guard was: the fatal handle is
+ * NOT one of our idle-trap raises with a NULL owner. Either it does not come
+ * from our raise at all -- the decode-pair race, where a guest method landing
+ * between the ISR's two MMIO loads hands it 0x8000 with somebody else's
+ * argument -- or owner[h] is still valid when we check it and becomes NULL
+ * before the ISR reads it. Both are time-of-check/time-of-use, and both mean
+ * a raise-time check is in the wrong place by construction.
+ *
+ * Kept, off, because the counters are the measurement and they cost nothing:
+ * owner[h] at the raise is 27,937 non-NULL to 9 NULL, which is the only
+ * discriminating number this investigation produced. */
+static int owner_guard_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_switch_on("RECOMP_APU_IDLE_TRAP_OWNER_GUARD");
+    return on;
+}
 unsigned long g_idle_unowned_raises;   /* raises for a voice not owned NOW */
 unsigned long g_idle_owned_raises;     /* the positive control for that zero */
 
@@ -1773,11 +1836,27 @@ void mcpx_apu_idle_trap_report(int crash)
      * nothing, and it fails in the most expensive way available -- it reads
      * ZERO, which looks like an answer. It sits beside [APU-IDLE-TRAP] now
      * because that line is in the crash dump, verified by finding it there. */
-    fprintf(stderr, "  [APU-IDLE-OWNER] raises for a voice the guest owns NOW:"
-            " %lu owned, %lu UNOWNED. 001A200D reads owner[h] with no NULL"
-            " check, so an unowned raise is a handle it dereferences anyway."
-            " owned>0 is the positive control for an unowned of 0.\n",
-            g_idle_owned_raises, g_idle_unowned_raises);    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
+    if (!g_jsrf_dsound_this) {
+        fprintf(stderr, "  [APU-IDLE-OWNER] NOT MEASURED -- the guest's"
+                " DirectSound `this` was never captured, so owner[h] was never"
+                " read. Install the probe with"
+                " diagnostics/jsrf_first_fault/instrument_dsound_this.py and"
+                " rebuild. This is NOT a zero result.\n");
+    } else {
+        fprintf(stderr, "  [APU-IDLE-OWNER] this=0x%08X  owner[h] at the raise:"
+                " %lu non-NULL, %lu NULL. A NULL is a handle 001A200D"
+                " dereferences unguarded, and it is fatal only for h==0 --"
+                " which is every crash dump this project has. non-NULL>0 is"
+                " the positive control for a NULL count of 0.\n",
+                g_jsrf_dsound_this,
+                g_idle_owner_ok_raises, g_idle_owner_null_raises);
+        fprintf(stderr, "  [APU-IDLE-OWNER]   of those NULLs, %lu were h==0"
+                " (the only combination that reaches the faulting call);"
+                " guard %s, %lu raise(s) withheld.\n",
+                g_idle_owner_null_h0,
+                owner_guard_on() ? "ON" : "OFF",
+                g_idle_owner_suppressed);
+    }    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",
             g_apu_method_while_trapped, g_apu_guest_method_count);
@@ -4476,18 +4555,44 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     if (g_idle_trap_ring
                         && g_idle_trap_last[(g_idle_trap_ring - 1) & 15u] == v)
                         why |= IDLE_TRAP_WHY_REPEAT;
-                    /* Does the guest own this handle NOW? 001A200D reads
-                     * owner[h] with no NULL check, so handing it a handle the
-                     * guest has released is the observed fault path. Counted
-                     * BOTH ways: owned_raises is the positive control, without
-                     * which an unowned=0 would prove nothing. */
-                    {
-                        int owned = v < MCPX_HW_MAX_VOICES
-                            && (g_apu_voice_owned_now[v / 64]
-                                & (1ULL << (v % 64))) != 0;
-                        if (owned) ++g_idle_owned_raises;
-                        else { ++g_idle_unowned_raises;
-                               why |= IDLE_TRAP_WHY_UNOWNED; }
+                    /* WILL THE GUEST'S ISR DEREFERENCE A NULL FOR THIS?
+                     *
+                     * Read the guest's OWN table rather than a proxy for it.
+                     * 001A200D does `pBuf = this->owner[h]` at
+                     * this+0x2C4+h*4 with no NULL check.
+                     *
+                     * The voice-state proxy that stood here first was wrong
+                     * and the measurement said so: it read 15,524 "unowned"
+                     * raises on a run that did not crash once, because
+                     * VOICE_OFF is a voice-state operation and owner[] is
+                     * buffer lifetime. Those are different things and no
+                     * combination of APU register traffic reconstructs the
+                     * second.
+                     *
+                     * Only meaningful once the gen probe has captured `this`.
+                     * Without it g_jsrf_dsound_this is 0, nothing is read, and
+                     * the report says so rather than reporting a zero that
+                     * looks like an answer -- which is the exact failure this
+                     * counter has already had twice today. */
+                    if (g_jsrf_dsound_this && v < 0x100) {
+                        uint32_t owner = ldl_le_phys(
+                            address_space_memory,
+                            g_jsrf_dsound_this + 0x2C4u + (uint32_t)v * 4u);
+                        if (owner) ++g_idle_owner_ok_raises;
+                        else {
+                            ++g_idle_owner_null_raises;
+                            why |= IDLE_TRAP_WHY_UNOWNED;
+                            /* h==0 AND owner NULL is the only combination that
+                             * reaches the faulting call. Counted separately so
+                             * the guard's value is visible rather than
+                             * inferred from the total. */
+                            if (v == 0) ++g_idle_owner_null_h0;
+                            if (owner_guard_on()) {
+                                ++g_idle_owner_suppressed;
+                                ++g_apu_trap_suppressed;
+                                return;
+                            }
+                        }
                     }
 
                     if (locked)   g_idle_trap_locked_raises++;
