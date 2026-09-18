@@ -1454,6 +1454,18 @@ static uint8_t *s_snap;             /* the last completed frame, packed */
 static uint32_t s_snap_w, s_snap_h, s_snap_bpp;
 static int s_snap_wanted;
 
+/* WHICH surface the copy above came from, and whether it is new.
+ *
+ * s_snap on its own cannot answer either question, and both are needed by
+ * anything that wants to compare one frame against another: this title flips
+ * between several colour surfaces, so two consecutive snapshots are normally
+ * two different buffers, and snapshot_surface() returns without copying
+ * whenever the geometry is not yet real, which leaves s_snap holding a frame
+ * that has already been looked at. See fb_watch, which was dead for twelve
+ * scripted runs for want of exactly this. */
+static uint32_t s_snap_offset;      /* s_gpu.color_offset the copy was taken from */
+static unsigned long s_snap_seq;    /* ++ on every copy actually performed */
+
 /* Take the finished frame at the guest's own frame boundary.
  *
  * Presenting the surface live shows it part-drawn as often as finished, which
@@ -1509,6 +1521,12 @@ static void snapshot_surface(void)
                    + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch
                    + (size_t)s_gpu.clip_x * b,
                (size_t)s_snap_w * b);
+
+    /* Last, so both are true only of a copy that completed. Every early
+     * return above leaves the sequence where it was, which is how a reader
+     * tells "a new frame arrived" from "the old one is still sitting here". */
+    s_snap_offset = s_gpu.color_offset;
+    ++s_snap_seq;
 }
 
 const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
@@ -1613,84 +1631,248 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
  * are blank" against the flip log then counts report snapshots as presented
  * frames. The tag is what keeps the question answerable. */
 /* RECOMP_FB_WATCH=x,y,w,h -- at EVERY flip, compare a region of the presented
- * copy (s_snap) with the same region at the previous flip and say when it
- * changed. For a parked scene with static text the region must never change,
- * so every line this prints is a frame the renderer got wrong -- and unlike
- * RECOMP_FB_DUMP_FLIP's 24 captures it sees all of them, which is what a
- * one-frame-in-a-thousand defect needs. Legitimate changes (the text advances,
- * a cutscene cut) print too, with a large pixel count; corruption is a small
- * count that reverts on the next flip. */
+ * copy (s_snap) against the same region the LAST TIME THIS SAME COLOUR SURFACE
+ * was presented, and say when it changed. For a parked scene with static text
+ * the region must never change, so every line this prints is a frame the
+ * renderer got wrong -- and unlike RECOMP_FB_DUMP_FLIP's 24 captures it sees
+ * all of them, which is what a one-frame-in-a-thousand defect needs.
+ * Legitimate changes (the text advances, a cutscene cut) print too, with a
+ * large pixel count; corruption is a small count that reverts on the next
+ * frame from that surface.
+ *
+ * KEYED ON THE SURFACE, NOT ON THE FRAME COUNTER. This trap used to compare
+ * flip N against flip N-1, and in that form it was DEAD -- it fired on every
+ * single flip of a completely healthy run and could not have caught anything.
+ *
+ * The title double-buffers: it composes into one colour surface, flips it,
+ * composes into another, flips that. Flip N and flip N-1 are therefore two
+ * DIFFERENT buffers holding two different pictures, so "changed since the
+ * previous flip" was always true. Measured 17 Sep 2026 across 39 watch*.bmp
+ * dumps from a parked tutorial: the watched region alternates strictly ABABAB
+ * by flip index, with exactly TWO distinct images, each byte-identical within
+ * its parity -- the odd-flip image is a speaker-name label reading "Gum", the
+ * even-flip image is solid black. Twelve scripted runs "never caught" the
+ * glyph defect because a real change was indistinguishable from the rotation.
+ * Any watch*.bmp produced before this change is evidence of nothing.
+ *
+ * Comparing flip N against flip N-2 would also un-stick it, but only while the
+ * rotation is exactly two deep and never skips -- and that is an assumption
+ * about the title rather than a fact about the frame in hand. It is wrong the
+ * moment the rotation is three deep (surface_audit and the FLIPTRACE surface
+ * list both already report three distinct colour surfaces here), a flip is
+ * dropped, or a cut rebinds. Keying on the surface address makes no such
+ * assumption and is free at this call site: snapshot_surface() runs
+ * immediately before this, inside the same FLIP_STALL dispatch, and now
+ * records the colour offset it copied from. The cost is one uint32_t compare
+ * over at most FB_WATCH_SLOTS entries, once per flip.
+ *
+ * ARMED AND QUIET, OR NOT ARMED AT ALL? The old trap's silence, had it been
+ * silent, would have been indistinguishable from a mistyped rectangle, an
+ * unset variable, or a snapshot that never refreshed -- an absence measurement
+ * with no positive control, which is the failure this tree keeps paying for.
+ * `comparisons` is that control: it counts the times a region was actually
+ * memcmp'd against the same surface's previous frame. comparisons=0 means the
+ * instrument never ran, whatever `changes` says. fb_watch_report() prints the
+ * whole set from nv2a_pb_exec_report(), and prints NOTHING when the watch is
+ * not armed -- so in a report, no [FB-WATCH] line means the variable was not
+ * set, a line with comparisons=0 means it was set but never got to look, and a
+ * line with comparisons>0 and changes=0 is the real absence measurement. */
 static void dump_snapshot_bmp(const char *tag, unsigned seq);
+
+/* One per colour surface in the flip rotation. This title uses three; eight
+ * leaves room for a mode change without the slots thrashing, and a rotation
+ * deeper than this is reported rather than silently mis-compared. */
+#define FB_WATCH_SLOTS 8
+
+static struct {
+    int           init;          /* the environment has been parsed */
+    int           on;            /* ...and it named a usable rectangle */
+    uint32_t      x0, y0, ww, hh;
+    size_t        len;           /* bytes in one captured region */
+    uint8_t      *cur;           /* this flip's region */
+    struct {
+        uint32_t  off;           /* the guest colour offset this slot holds */
+        uint8_t  *px;            /* that surface's region as last presented */
+        int       valid;
+    } slot[FB_WATCH_SLOTS];
+    unsigned long evicted;       /* surfaces dropped for want of a slot */
+    unsigned long oob;           /* flips where the rectangle fell outside the frame */
+    unsigned long snap_seq;      /* the s_snap_seq already looked at */
+    unsigned long flips;         /* flips carrying a fresh snapshot */
+    unsigned long stale;         /* flips whose snapshot had not refreshed */
+    unsigned long first;         /* first sight of a surface: nothing to compare */
+    unsigned long comparisons;   /* THE POSITIVE CONTROL -- read this first */
+    unsigned long changes, small, big;
+    unsigned long printed, dumped;
+    unsigned      cap;           /* RECOMP_FB_WATCH_DUMP; 1 = disabled sentinel */
+    int           after;         /* RECOMP_FB_WATCH_AFTER, wall-clock seconds */
+} s_fbw;
+
+static void fb_watch_drop_slots(void)
+{
+    unsigned i;
+    for (i = 0; i < FB_WATCH_SLOTS; ++i) {
+        free(s_fbw.slot[i].px);
+        s_fbw.slot[i].px = NULL;
+        s_fbw.slot[i].off = 0;
+        s_fbw.slot[i].valid = 0;
+    }
+}
 
 static void fb_watch(void)
 {
-    static int init, on; static uint32_t x0, y0, ww, hh;
-    static uint8_t *prev, *cur; static size_t have;
-    static unsigned long flips, changes;
-    if (!init) {
+    size_t row, len, p;
+    unsigned i, victim, diff;
+    uint32_t y;
+
+    if (!s_fbw.init) {
         const char *e = getenv("RECOMP_FB_WATCH");
-        init = 1;
-        if (e && sscanf(e, "%u,%u,%u,%u", &x0, &y0, &ww, &hh) == 4 && ww && hh) {
-            on = 1; s_snap_wanted = 1;
+        s_fbw.init = 1;
+        s_fbw.after = -1;
+        if (e && sscanf(e, "%u,%u,%u,%u", &s_fbw.x0, &s_fbw.y0,
+                        &s_fbw.ww, &s_fbw.hh) == 4 && s_fbw.ww && s_fbw.hh) {
+            s_fbw.on = 1; s_snap_wanted = 1;
         }
     }
-    if (!on || !s_snap || !s_snap_w || !s_snap_h) return;
-    if (x0 + ww > s_snap_w || y0 + hh > s_snap_h) return;
-    size_t row = (size_t)ww * s_snap_bpp, len = row * hh, y;
-    if (have != len) { free(prev); free(cur); prev = malloc(len); cur = malloc(len);
-                       have = len; if (!prev || !cur) { on = 0; return; }
-                       memset(prev, 0, len); }
-    for (y = 0; y < hh; ++y)
-        memcpy(cur + y * row,
-               s_snap + ((size_t)(y0 + y) * s_snap_w + x0) * s_snap_bpp, row);
-    ++flips;
-    if (flips > 1 && memcmp(prev, cur, len)) {
-        unsigned diff = 0; size_t p;
-        static unsigned long big, printed;
-        for (p = 0; p < len; p += s_snap_bpp)
-            if (memcmp(prev + p, cur + p, s_snap_bpp)) ++diff;
-        ++changes;
-        /* A whole-region change is the scene moving (gameplay, a fade, a
-         * cut) and would print sixty lines a second in a player's log; the
-         * defect this hunts is a few glyphs, i.e. a SMALL change. Small
-         * changes print, capped; the rest are counted. */
-        if (diff * 4 < ww * hh) {
-            if (printed++ < 2000)
-                fprintf(stderr, "[FB-WATCH] flip %lu t=%.2f region %u,%u %ux%u"
-                        " CHANGED: %u of %u pixels differ from the previous"
-                        " flip (small change #%lu, large so far %lu)\n",
-                        flips, trace_seconds(), x0, y0, ww, hh, diff, ww * hh,
-                        printed, big);
-            /* AND KEEP THE PICTURE. A line saying "643 pixels changed" cannot
-             * be told apart from a line saying "the text is animating", and
-             * the defect this hunts appeared ONCE in twenty-four captures --
-             * a periodic capture stride will almost always miss it. With
-             * RECOMP_FB_DUMP set, every small change writes the presented
-             * copy as watchNNN.bmp, so a long parked run either catches the
-             * corruption with evidence or proves it did not recur. Bounded,
-             * because a scene that animates text would otherwise fill the
-             * disk. */
-            {   /* AND ONLY ONCE THE SCENE HAS SETTLED. The first attempt
-                 * spent its whole budget on the dialogue typing itself out --
-                 * 59 dumps, all of them legitimate animation, before the
-                 * window where the defect was seen. RECOMP_FB_WATCH_AFTER is
-                 * the wall-clock second to start dumping at; in the parked
-                 * tutorial both arms measured ZERO small changes after the
-                 * text settles, so past that point every dump is a candidate
-                 * and the budget is not wasted. */
-                static unsigned dumped, cap = 0; static int after = -1;
-                if (!cap) { const char *e = getenv("RECOMP_FB_WATCH_DUMP");
-                            cap = e ? (unsigned)atoi(e) : 0;
-                            if (!cap) cap = 1; }   /* 1 = disabled sentinel */
-                if (after < 0) { const char *e = getenv("RECOMP_FB_WATCH_AFTER");
-                                 after = e ? atoi(e) : 0; }
-                if (cap > 1 && dumped < cap - 1
-                    && trace_seconds() >= (double)after)
-                    dump_snapshot_bmp("watch", dumped++);
-            }
-        } else ++big;
+    if (!s_fbw.on || !s_snap || !s_snap_w || !s_snap_h) return;
+    /* A rectangle outside the frame silently disables the whole instrument,
+     * and a mistyped one looks exactly like a scene that never changed. Count
+     * it so the report can say which happened. */
+    if (s_fbw.x0 + s_fbw.ww > s_snap_w || s_fbw.y0 + s_fbw.hh > s_snap_h) {
+        ++s_fbw.oob; return;
     }
-    { uint8_t *t = prev; prev = cur; cur = t; }
+
+    /* Only a copy taken at THIS flip is a new observation. snapshot_surface()
+     * returns without copying whenever the geometry is not yet real, and
+     * re-reading the previous frame's bytes would spend a comparison on
+     * something already compared -- inflating the positive control with work
+     * that looked at nothing. Counted separately instead. */
+    if (s_snap_seq == s_fbw.snap_seq) { ++s_fbw.stale; return; }
+    s_fbw.snap_seq = s_snap_seq;
+
+    row = (size_t)s_fbw.ww * s_snap_bpp;
+    len = row * s_fbw.hh;
+    if (s_fbw.len != len) {     /* a mode change: every slot is the wrong size */
+        fb_watch_drop_slots();
+        free(s_fbw.cur);
+        s_fbw.cur = (uint8_t *)malloc(len);
+        s_fbw.len = len;
+        if (!s_fbw.cur) { s_fbw.len = 0; s_fbw.on = 0; return; }
+    }
+    for (y = 0; y < s_fbw.hh; ++y)
+        memcpy(s_fbw.cur + (size_t)y * row,
+               s_snap + ((size_t)(s_fbw.y0 + y) * s_snap_w + s_fbw.x0)
+                        * s_snap_bpp, row);
+    ++s_fbw.flips;
+
+    for (i = 0; i < FB_WATCH_SLOTS; ++i)
+        if (s_fbw.slot[i].valid && s_fbw.slot[i].off == s_snap_offset)
+            break;
+    if (i == FB_WATCH_SLOTS) {
+        /* First time this surface has been presented. Remember it; there is
+         * nothing to compare against yet, and inventing one is the whole
+         * mistake being fixed. */
+        for (victim = 0; victim < FB_WATCH_SLOTS; ++victim)
+            if (!s_fbw.slot[victim].valid) break;
+        if (victim == FB_WATCH_SLOTS) {
+            /* More surfaces in the rotation than slots. NEVER reuse a slot as
+             * though it held this surface -- that reintroduces the cross-buffer
+             * compare. Reclaim slot 0 and treat this as a first sighting, and
+             * say so in the report so the number is not mistaken for quiet. */
+            victim = 0;
+            ++s_fbw.evicted;
+            free(s_fbw.slot[0].px);
+            s_fbw.slot[0].px = NULL;
+            s_fbw.slot[0].valid = 0;
+        }
+        if (!s_fbw.slot[victim].px) {
+            s_fbw.slot[victim].px = (uint8_t *)malloc(len);
+            if (!s_fbw.slot[victim].px) return;
+        }
+        memcpy(s_fbw.slot[victim].px, s_fbw.cur, len);
+        s_fbw.slot[victim].off = s_snap_offset;
+        s_fbw.slot[victim].valid = 1;
+        ++s_fbw.first;
+        return;
+    }
+
+    ++s_fbw.comparisons;
+    if (!memcmp(s_fbw.slot[i].px, s_fbw.cur, len))
+        return;                 /* this surface is presenting the same picture */
+
+    diff = 0;
+    for (p = 0; p < len; p += s_snap_bpp)
+        if (memcmp(s_fbw.slot[i].px + p, s_fbw.cur + p, s_snap_bpp)) ++diff;
+    ++s_fbw.changes;
+    /* A whole-region change is the scene moving (gameplay, a fade, a cut) and
+     * would print sixty lines a second in a player's log; the defect this
+     * hunts is a few glyphs, i.e. a SMALL change. Small changes print, capped;
+     * the rest are counted. */
+    if (diff * 4 < s_fbw.ww * s_fbw.hh) {
+        ++s_fbw.small;
+        if (s_fbw.printed++ < 2000)
+            fprintf(stderr, "[FB-WATCH] flip %lu t=%.2f region %u,%u %ux%u"
+                    " surface 0x%08X CHANGED: %u of %u pixels differ from the"
+                    " last frame presented FROM THIS SAME SURFACE"
+                    " (small change #%lu, large so far %lu)\n",
+                    s_fbw.flips, trace_seconds(), s_fbw.x0, s_fbw.y0,
+                    s_fbw.ww, s_fbw.hh, s_snap_offset, diff,
+                    s_fbw.ww * s_fbw.hh, s_fbw.printed, s_fbw.big);
+        /* AND KEEP THE PICTURE. A line saying "643 pixels changed" cannot be
+         * told apart from a line saying "the text is animating", and the
+         * defect this hunts appeared ONCE in twenty-four captures -- a
+         * periodic capture stride will almost always miss it. With
+         * RECOMP_FB_DUMP set, every small change writes the presented copy as
+         * watchNNN.bmp, so a long parked run either catches the corruption
+         * with evidence or proves it did not recur. Bounded, because a scene
+         * that animates text would otherwise fill the disk.
+         *
+         * AND ONLY ONCE THE SCENE HAS SETTLED. The first attempt spent its
+         * whole budget on the dialogue typing itself out -- 59 dumps, all of
+         * them legitimate animation, before the window where the defect was
+         * seen. RECOMP_FB_WATCH_AFTER is the wall-clock second to start
+         * dumping at. */
+        if (!s_fbw.cap) {
+            const char *e = getenv("RECOMP_FB_WATCH_DUMP");
+            s_fbw.cap = e ? (unsigned)atoi(e) : 0;
+            if (!s_fbw.cap) s_fbw.cap = 1;     /* 1 = disabled sentinel */
+        }
+        if (s_fbw.after < 0) {
+            const char *e = getenv("RECOMP_FB_WATCH_AFTER");
+            s_fbw.after = e ? atoi(e) : 0;
+        }
+        if (s_fbw.cap > 1 && s_fbw.dumped < s_fbw.cap - 1
+            && trace_seconds() >= (double)s_fbw.after)
+            dump_snapshot_bmp("watch", (unsigned)s_fbw.dumped++);
+    } else ++s_fbw.big;
+
+    memcpy(s_fbw.slot[i].px, s_fbw.cur, len);
+}
+
+/* What the trap did, whether or not it found anything.
+ *
+ * Silent when the watch is not armed, so this costs an unrelated run nothing;
+ * see the comparisons/changes reading guide on fb_watch above. */
+static void fb_watch_report(void)
+{
+    unsigned i, live = 0;
+
+    if (!s_fbw.on) return;
+    for (i = 0; i < FB_WATCH_SLOTS; ++i)
+        if (s_fbw.slot[i].valid) ++live;
+    fprintf(stderr,
+            "[FB-WATCH] region %u,%u %ux%u keyed on the colour surface:"
+            " %lu comparisons against the same surface's previous frame,"
+            " %lu changed (%lu small, %lu large) | %lu flips,"
+            " %u surfaces in the rotation, %lu first sightings,"
+            " %lu flips with no fresh snapshot,"
+            " %lu flips with the rectangle outside the %ux%u frame,"
+            " %lu slot evictions, %lu lines printed, %lu watch*.bmp written\n",
+            s_fbw.x0, s_fbw.y0, s_fbw.ww, s_fbw.hh,
+            s_fbw.comparisons, s_fbw.changes, s_fbw.small, s_fbw.big,
+            s_fbw.flips, live, s_fbw.first, s_fbw.stale,
+            s_fbw.oob, s_snap_w, s_snap_h,
+            s_fbw.evicted, s_fbw.printed, s_fbw.dumped);
 }
 
 static void write_bmp(const char *tag, unsigned seq,
@@ -4907,6 +5089,10 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[RASTER] %u batches + %u triangles on the CPU;"
                     " %u triangles total\n",
             s_gpu.cpu_batches, s_gpu.cpu_tris, s_gpu.tris_drawn);
+    /* Outside the NV2A_GPU_PATH block below on purpose: the framebuffer watch
+     * runs on every host, and a counter that cannot be read on the host under
+     * investigation is not a counter. */
+    fb_watch_report();
 #if NV2A_GPU_PATH
     if (nv2a_gpu_on())
     {

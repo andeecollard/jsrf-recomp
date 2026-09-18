@@ -138,8 +138,30 @@ distinct handles were ever *delivered* against how many went idle? The
 
 One glyph's quad drawn with another's texture coordinates, inside one batch;
 wider than the tutorial. **The label trap is dead** — it alternates ABABAB by
-frame parity and fires every frame catching nothing — so re-arm against frame
-**N−2**, or key on the surface address, before trusting any `watch*.bmp`.
+frame parity and fires every frame catching nothing.
+
+**RE-ARMED 18 Sep — and the N−2 half of that prescription was itself wrong.**
+N−2 assumes the rotation is exactly two deep and never skips. It is not:
+`nv2a_pb_exec.c:2429`, committed long before any of this, records that the
+title "uses three colour surfaces and swaps between them batch by batch". The
+strict ABAB that motivated N−2 was of the *presented* surfaces in one parked
+scene. A cut, a dropped flip, or the third surface entering rotation would
+silently re-break an N−2 trap **and it would look exactly like the failure it
+replaced**.
+
+So it is keyed on the **surface address**: eight slots, each holding the last
+frame presented from that surface, compared only against its own predecessor;
+a ninth surface evicts rather than silently aliasing.
+
+Positive control, because an absence measurement without one is worthless:
+`comparisons=` counts only real comparisons against a genuine prior frame of
+the same surface — not the stale-snapshot path, not first sightings. The line
+is silent when unarmed, so the reading is four-way: no line = not armed;
+`comparisons=0` with a nonzero out-of-bounds count = armed but the rectangle is
+wrong for the frame size; `comparisons=0` otherwise = armed but never looked;
+`comparisons>0, 0 changed` = the real absence measurement.
+
+Any `watch*.bmp` from before this is still evidence of nothing.
 
 Parked because it is cosmetic and rarer than the flicker. **Not** because A1
 will fix the flicker: that claim was made in this afternoon's plan and

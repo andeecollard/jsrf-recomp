@@ -24,6 +24,10 @@
 #include "apu_sdl2.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+/* recomp_switch_on / recomp_switch_on_default: one grammar for the switches,
+ * so a new one does not fail the jsrf_switch_audit ratchet by hand-rolling its
+ * own getenv. */
+#include "../recomp_switch.h"
 
 /* ============================================================
  * Globals
@@ -119,6 +123,173 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
 extern unsigned long g_apu_top_write_count[3];
 
+/* THE RARE SUCCESSES, CAPTURED. (goal B1)
+ *
+ * Everything else about the idle-voice storm is a measurement of failure:
+ * every dead voice IS named to the guest ([APU-IDLE-DELIVERY] found idle=10,
+ * delivered=10, never told about=0, twice, on two sessions whose music died),
+ * and the trap is then re-raised ~100,000 times. Against that, [VOICE-TOP]
+ * counts 2D=3 3D=8 MP=1 head writes in a whole session -- about a dozen times
+ * the guest DID unlink a voice. Those dozen are the only positive examples of
+ * the behaviour we are trying to explain, and a dozen is a far smaller haystack
+ * than a hundred thousand.
+ *
+ * So: for each guest write to a voice-list head register, record what the list
+ * looked like at that instant. The one thing a counter cannot tell us is which
+ * voice the guest chose to remove and what state that voice was in, and that is
+ * exactly what separates "the guest removes a voice when <condition>" from "the
+ * guest removes a voice at random".
+ *
+ * The fields are the ones that cost nothing at this point:
+ *   old/new   the head register before and after -- the write itself
+ *   next      the old head's TAR_PITCH_LINK NEXT_VOICE_HANDLE, so a reader can
+ *             see by eye whether new == old->next, i.e. whether this was a
+ *             textbook head unlink or something else entirely
+ *   active    the old head's PAR_STATE ACTIVE_VOICE bit, which says whether the
+ *             model still thought the voice it just lost was playing
+ *   cvl/nvl   the walk cursor pair for that list. apu_vp.c is explicit that
+ *             these are how the guest learns which voice idled and what follows
+ *             it -- CVL is held still at the trapped voice precisely so
+ *             RemoveIdleVoice can read it. So cvl == old is the direct test of
+ *             "the guest removed the voice it had just been told about", and it
+ *             is the single most useful bit here.
+ *
+ * READ-ONLY. ldl_le_phys is a masked load off g_apu_ram_ptr (apu_shim.h), the
+ * register reads are qatomic_read, and nothing here writes anything the guest
+ * or the model can observe. It runs on the guest thread inside the trap
+ * handler; the report reads the ring from another thread, which is the same
+ * arrangement the [APU-IDLE-TRAP] ring already has.
+ *
+ * DEFAULTS ON (RECOMP_VOICE_TOP_RING=0 to silence). These events happen about
+ * a dozen times per session and cannot be re-captured after the fact -- an
+ * opt-in nobody remembered to set costs a whole run -- and the cost when it
+ * fires is five loads. The state is printed, per recomp_switch.h's rule, so a
+ * reader never has to infer it. */
+#define VOICE_TOP_RING_N 16u
+#define TOP_WHY_ACTIVE  0x01u   /* A */
+#define TOP_WHY_UNLINK  0x02u   /* U */
+#define TOP_WHY_SELF    0x04u   /* S */
+#define TOP_WHY_EMPTY   0x08u   /* E */
+#define TOP_WHY_ZAP     0x10u   /* Z */
+#define TOP_WHY_TRAPPED 0x20u   /* T */
+#define TOP_WHY_HELD    0x40u   /* H */
+
+typedef struct {
+    unsigned long long at;      /* g_apu_out_frames: an index INTO the WAV */
+    uint16_t old_head, new_head, next, cvl, nvl;
+    uint8_t list, why;
+} VoiceTopEv;
+
+static VoiceTopEv g_top_ev[VOICE_TOP_RING_N];
+static unsigned long g_top_ev_n;            /* total; slot is % VOICE_TOP_RING_N */
+/* Run totals, so a session with more than 16 head writes still reports every
+ * one of them in aggregate after the ring has wrapped. */
+static unsigned long g_top_unlink, g_top_emptied, g_top_into_empty;
+static unsigned long g_top_still_active, g_top_on_trapped, g_top_self;
+static unsigned long g_top_held;
+
+/* OPT-IN, per CLAUDE.md: "Instrumentation is opt-in and read-only".
+ *
+ * This was written default-on, on the reasoning that the events are rare
+ * (~12 a session), unrepeatable after the fact, and nearly free. That
+ * reasoning is good and it is still the wrong call: the convention is stated,
+ * and a tree with 157 switches stays legible only if the stated rule is the
+ * one that is followed. Armed in the player's paths.conf instead, which gets
+ * the capture without spending the convention. */
+static int voice_top_ring_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_VOICE_TOP_RING");
+    return on;
+}
+
+/* One voice register, read-only. Same arithmetic as apu_vp.c's voice_get_mask,
+ * which is static there; duplicated rather than exported because this file is
+ * the only other reader and the task is not to reshape apu_vp.c's interface. */
+static uint32_t voice_top_peek(MCPXAPUState *d, uint16_t v, hwaddr off)
+{
+    hwaddr base = (hwaddr)qatomic_read(&d->regs[NV_PAPU_VPVADDR])
+                  + (hwaddr)v * NV_PAVS_SIZE;
+    return ldl_le_phys(address_space_memory, base + off);
+}
+
+static void voice_top_note(MCPXAPUState *d, int idx,
+                           uint16_t old_head, uint16_t new_head)
+{
+    extern unsigned long long g_apu_out_frames;
+    static const hwaddr cvl_reg[3] = { NV_PAPU_CVL2D, NV_PAPU_CVL3D,
+                                       NV_PAPU_CVLMP };
+    static const hwaddr nvl_reg[3] = { NV_PAPU_NVL2D, NV_PAPU_NVL3D,
+                                       NV_PAPU_NVLMP };
+    VoiceTopEv *e;
+    unsigned why = 0;
+    uint16_t next = 0xFFFF, cvl, nvl;
+    int held;
+
+    if (!voice_top_ring_on()) return;
+
+    cvl = (uint16_t)(qatomic_read(&d->regs[cvl_reg[idx]]) & 0xFFFF);
+    nvl = (uint16_t)(qatomic_read(&d->regs[nvl_reg[idx]]) & 0xFFFF);
+
+    /* WHY THE TRAP STATE IS READ BEFORE CVL IS BELIEVED.
+     *
+     * mcpx_apu_vp_frame does `if (!hold) d->regs[current] = d->regs[top];` at
+     * the head of every list walk, and holds CVL still only while FEMETHMODE is
+     * TRAPPED -- that hold is the handshake, CVL naming the idle voice and NVL
+     * its successor for the guest's RemoveIdleVoice to read. So with the front
+     * end running, CVL is re-seeded from the head register 1500 times a second
+     * and "cvl == the head being removed" is true for free, meaning nothing at
+     * all. It is evidence ONLY while the walk is held. T is therefore the
+     * conjunction, and H is printed separately so a reader can see the trap
+     * state that makes T readable rather than having to know this. */
+    held = (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE)
+               == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+    if (held) why |= TOP_WHY_HELD;
+
+    /* The handle is range-checked for the same reason apu_vp.c range-checks it
+     * before voice_get_mask: 0xFFFF is the list terminator and the guest's own
+     * handles are masked to 16 bits against 256 hardware voices, so an
+     * out-of-range head is not a voice and reading one would address guest RAM
+     * past the end of the voice register file. VPVADDR is checked too -- it is
+     * zero until DirectSound publishes the register file, and a head write
+     * before that would otherwise be measured against offset 0. */
+    if (old_head >= MCPX_HW_MAX_VOICES
+            || !qatomic_read(&d->regs[NV_PAPU_VPVADDR])
+            || !g_apu_ram_ptr) {
+        why |= TOP_WHY_EMPTY;
+    } else {
+        next = (uint16_t)(voice_top_peek(d, old_head,
+                                         NV_PAVS_VOICE_TAR_PITCH_LINK)
+                          & NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        if (voice_top_peek(d, old_head, NV_PAVS_VOICE_PAR_STATE)
+                & NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)
+            why |= TOP_WHY_ACTIVE;
+        if (next == old_head) why |= TOP_WHY_SELF;
+        if (new_head == next) why |= TOP_WHY_UNLINK;
+        if (held && cvl == old_head) why |= TOP_WHY_TRAPPED;
+    }
+    if (new_head >= MCPX_HW_MAX_VOICES) why |= TOP_WHY_ZAP;
+
+    if (why & TOP_WHY_EMPTY)   g_top_into_empty++;
+    if (why & TOP_WHY_UNLINK)  g_top_unlink++;
+    if (why & TOP_WHY_ZAP)     g_top_emptied++;
+    if (why & TOP_WHY_ACTIVE)  g_top_still_active++;
+    if (why & TOP_WHY_TRAPPED) g_top_on_trapped++;
+    if (why & TOP_WHY_SELF)    g_top_self++;
+    if (why & TOP_WHY_HELD)    g_top_held++;
+
+    e = &g_top_ev[g_top_ev_n % VOICE_TOP_RING_N];
+    e->at = g_apu_out_frames;
+    e->old_head = old_head;
+    e->new_head = new_head;
+    e->next = next;
+    e->cvl = cvl;
+    e->nvl = nvl;
+    e->list = (uint8_t)idx;
+    e->why = (uint8_t)why;
+    g_top_ev_n++;
+}
+
 void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                      unsigned int size)
 {
@@ -148,13 +319,16 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr == NV_PAPU_TVL2D || addr == NV_PAPU_TVL3D || addr == NV_PAPU_TVLMP) {
         static int trace = -1;
         int idx = (addr == NV_PAPU_TVL2D) ? 0 : (addr == NV_PAPU_TVL3D) ? 1 : 2;
+        uint16_t old_head = (uint16_t)(qatomic_read(&d->regs[addr]) & 0xFFFF);
         g_apu_top_write_count[idx]++;
+        /* BEFORE the switch below stores the new value, because the old head is
+         * the voice being removed and is unrecoverable one statement later. */
+        voice_top_note(d, idx, old_head, (uint16_t)(val & 0xFFFF));
         if (trace < 0) trace = getenv("RECOMP_VOICE_LIFECYCLE") != NULL;
         if (trace)
             fprintf(stderr, "  [VOICE-TOP] list=%s %04X -> %04X\n",
                     idx == 0 ? "2D" : idx == 1 ? "3D" : "MP",
-                    (unsigned)(qatomic_read(&d->regs[addr]) & 0xFFFF),
-                    (unsigned)(val & 0xFFFF));
+                    (unsigned)old_head, (unsigned)(val & 0xFFFF));
     }
 
     switch (addr) {
@@ -1204,11 +1378,94 @@ static int apu_write_trace_on(void)
 
 unsigned long g_apu_top_write_count[3];
 
+/* The ring above, printed. Read it with the line it follows: that line is the
+ * positive control, because the ring and the counter are incremented by the
+ * same `if` at the same instant. 2D=3 3D=8 MP=1 with an empty ring means the
+ * ring is off or broken, never that nothing happened. */
+static void voice_top_ring_report(void)
+{
+    static const char *const lname[3] = { "2D", "3D", "MP" };
+    unsigned long total = g_apu_top_write_count[0] + g_apu_top_write_count[1]
+                        + g_apu_top_write_count[2];
+    unsigned i, n, base;
+
+    if (!voice_top_ring_on()) {
+        if (total)
+            fprintf(stderr, "  [VOICE-TOP-RING] OFF"
+                    " (RECOMP_VOICE_TOP_RING=0) -- %lu head write%s went"
+                    " uncaptured\n", total, total == 1 ? "" : "s");
+        return;
+    }
+    if (!g_top_ev_n) return;
+
+    fprintf(stderr, "  [VOICE-TOP-RING] %lu head writes seen (ring on):"
+            " unlink=%lu during-trap=%lu on-trapped-voice=%lu still-active=%lu"
+            " self-linked=%lu into-empty=%lu emptied-list=%lu\n",
+            g_top_ev_n, g_top_unlink, g_top_held, g_top_on_trapped,
+            g_top_still_active, g_top_self, g_top_into_empty, g_top_emptied);
+
+    /* Same ring-read rule as everywhere else here: slot 0 is the oldest until
+     * the ring wraps, after which the oldest is the one about to be written. */
+    n = g_top_ev_n < VOICE_TOP_RING_N ? (unsigned)g_top_ev_n : VOICE_TOP_RING_N;
+    base = g_top_ev_n < VOICE_TOP_RING_N
+         ? 0u : (unsigned)(g_top_ev_n % VOICE_TOP_RING_N);
+    fprintf(stderr, "  [VOICE-TOP-RING] last %u of %lu, oldest first:\n",
+            n, g_top_ev_n);
+    for (i = 0; i < n; ++i) {
+        const VoiceTopEv *e = &g_top_ev[(base + i) % VOICE_TOP_RING_N];
+        char flags[12];
+        unsigned f = 0;
+        if (e->why & TOP_WHY_ACTIVE)  flags[f++] = 'A';
+        if (e->why & TOP_WHY_UNLINK)  flags[f++] = 'U';
+        if (e->why & TOP_WHY_SELF)    flags[f++] = 'S';
+        if (e->why & TOP_WHY_EMPTY)   flags[f++] = 'E';
+        if (e->why & TOP_WHY_ZAP)     flags[f++] = 'Z';
+        if (e->why & TOP_WHY_HELD)    flags[f++] = 'H';
+        if (e->why & TOP_WHY_TRAPPED) flags[f++] = 'T';
+        flags[f] = 0;
+        fprintf(stderr, "  [VOICE-TOP-RING]   %10.3f ms %s %04X -> %04X"
+                "  next=%04X cvl=%04X nvl=%04X [%s]\n",
+                (double)e->at / 48.0,
+                e->list < 3 ? lname[e->list] : "??",
+                (unsigned)e->old_head, (unsigned)e->new_head,
+                (unsigned)e->next, (unsigned)e->cvl, (unsigned)e->nvl,
+                flags);
+    }
+    /* EVERY LETTER EMITTED ABOVE IS EXPLAINED HERE, and the legend is printed
+     * beside the entries rather than left in this comment. A reader who greps
+     * one report out of a long log gets the key with it; a missing letter in a
+     * legend has already cost a reader real time once. */
+    fprintf(stderr, "  [VOICE-TOP-RING]   legend: ms is into the WAV capture"
+            " (g_apu_out_frames/48); 2D/3D/MP is the list; OLD -> NEW is the"
+            " head register across the guest's write; next is the OLD head's"
+            " link field as the model reads it; cvl/nvl are that list's walk"
+            " cursor pair, which is what the guest's RemoveIdleVoice reads."
+            " A = the removed head's PAR_STATE ACTIVE_VOICE was still set, so"
+            " the model still thought it was playing."
+            " U = UNLINK: the new head is exactly the old head's next, a"
+            " textbook removal -- no U on an entry without E means the guest"
+            " put something else at the head instead."
+            " S = the old head's next pointed at ITSELF, the one-entry cycle"
+            " the walk pins on."
+            " E = the list was EMPTY before the write (old head 0xFFFF, out of"
+            " range, or VPVADDR not published yet), so nothing was removed and"
+            " next=FFFF here is a placeholder, not a reading -- A, U, S and T"
+            " are not evaluated on an E entry."
+            " Z = the write EMPTIED the list (new head out of range)."
+            " H = the front end was TRAPPED, so the walk was HELD and cvl/nvl"
+            " are the frozen handshake pair rather than this frame's cursor."
+            " T = H and cvl names the removed head: the guest took out exactly"
+            " the voice the idle trap had just told it about. T is defined as"
+            " that conjunction because without H the walk re-seeds cvl from the"
+            " head register every frame, so cvl == old is true for free.\n");
+}
+
 void mcpx_apu_write_report(void)
 {
     fprintf(stderr, "  [VOICE-TOP] head writes from guest: 2D=%lu 3D=%lu MP=%lu\n",
             g_apu_top_write_count[0], g_apu_top_write_count[1],
             g_apu_top_write_count[2]);
+    voice_top_ring_report();
     extern MCPXAPUState *mcpx_apu_get_state(void);
     if (!apu_write_trace_on()) return;
     fprintf(stderr, "  [APU-WRITE] main=%lu vp=%lu gp=%lu ep=%lu other=%lu%s\n",
