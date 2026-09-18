@@ -1801,7 +1801,9 @@ void mcpx_apu_idle_trap_report(int crash)
                     " the handle it is handed.\n"
                     "  L = locked (guest mid-VOICE_ON/RELEASE),"
                     " N = never VOICE_ON in this run, P = PERSIST (ISR returns"
-                    " early), R = repeat of the previous raise.\n"
+                    " early), R = repeat of the previous raise,"
+                    " C = THIS VOICE WAS SEEN TWICE IN ONE LIST WALK"
+                    " (it is in a ring; see [APU-CYCLE]).\n"
                     "  2D/3D/MP is the voice list. fmt=0 is an unconfigured"
                     " voice. The LAST entry is the"
                     " handle the guest was servicing.\n");

@@ -122,3 +122,43 @@ nobody re-forms it.
    `[APU-IDLE-DELIVERY] found idle=0, delivered=0` in tonight's scripted run,
    because the run never reached gameplay. It needs a player session, like
    everything else here.
+
+
+## 6. Two text hypotheses formed and killed inside twenty minutes
+
+Recorded so they are not re-derived. Both came from reading code; both died to
+a number already in the player's log.
+
+**"Unhandled texture formats are mis-decoded as RGB565, so glyphs lose their
+alpha mask."** `nv2a_metal.m:617` falls through to `p.y*pitch + p.x*2` for
+anything that is not RGBA8/DXT1/DXT3, and `nv2a_texture_copy.c:185` only sets
+those three flags — which reads like A8 and A4R4G4B4 glyph atlases being
+decoded as opaque RGB565. It also matched phobos665's independent report of
+"HUD text draws as solid blocks instead of glyphs".
+
+**Dead twice over.** Reading ten lines further, `:180` handles format `0x11`
+(linear R5G6B5) as a fourth case and *everything else returns a rejection
+reason* — an unsupported format does not mis-decode, it refuses the draw. And
+the player's own log settles it:
+
+    [TEXTURE] prepared=1548512 rejected=0
+
+**Zero texture rejections in 1.5 million prepares.** Every texture the title
+presented is one of the four supported formats, so the font atlas is too.
+
+**"The player's debug probes are destabilising the title."** Their `paths.conf`
+carries `RECOMP_APU_WRITE_TRACE`, `RECOMP_VOICE_LIFECYCLE`, `RECOMP_FB_WATCH`
+and `RECOMP_FF_BATCH_WATCH_TEX`, and `play_scripted.sh`'s header warns that
+heavy probes destabilise this title. Measured: **0** `watch*.bmp` files written
+in the session window, 44 `[APU-WRITE]` lines, 772 lifecycle lines in a 43,000
+line log, `[FB]` sampling once per second rather than per frame. Light. Dead.
+
+**What the render side actually reports**, for whoever picks G2 up next:
+
+    [TEXTURE] prepared=1548512 rejected=0
+    [VSH] executed batches=608249 rejected=8   all "fixed-function clip W"
+
+Eight rejected batches in 608,249. Small, but the player runs `METAL_FF=1` and
+the goals already record FF drawing corrupt tutorial glyphs about once in 24
+captured frames — so whether those eight are text batches is worth one look,
+and it is the only render-side number in the session that is not clean.
