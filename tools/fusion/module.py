@@ -192,8 +192,11 @@ class FusionModule:
 
         Do NOT read this as "is this address code?". Presence is uninformative:
         ~97.7% of the guest span is present because there is an entry at every
-        guest BYTE. Only about a third are translations of instruction starts;
-        the rest point at resync stubs. See docs/technical/ms-fusion-corpus.md.
+        guest BYTE. Only about a third are translations of instruction starts.
+        The rest are mostly SHORT REAL TRANSLATIONS of the misaligned decode that
+        rejoin the stream by direct jump (61% of a 400-entry sample, 91% of those
+        jumps landing on another map entry); ~8% are int3-poisoned and only ~7%
+        escape to the runtime helper. See docs/technical/ms-fusion-corpus.md.
         """
         for s in self.pe.sections:
             if s.Name.rstrip(b"\0") != b".rdata":

@@ -32,9 +32,21 @@ The four titles are the only ones Microsoft has shipped through this pipeline as
 > - **§5's "the byte-dense map is a coverage oracle" is wrong.** There is an
 >   entry at every guest byte, so presence tells you nothing. Only ~31–34% are
 >   translations of guest instruction starts (2.94–3.19 guest bytes apiece, an
->   x86 instruction-length histogram); the rest point at resync stubs. It is an
->   INSTRUCTION-boundary oracle, and a function start is indistinguishable in it
->   from the instruction after it. It also cannot transfer between titles — both
+>   x86 instruction-length histogram). It is an INSTRUCTION-boundary oracle, and
+>   a function start is indistinguishable in it from the instruction after it.
+>
+>   **What the OTHER two thirds are, measured 18 Sep on Blinx (corrects an
+>   earlier reading in this file that called them all "resync stubs"):** host
+>   targets are 99.96% DISTINCT (1,505,339 of 1,505,966), so they are not a
+>   shared stub region. Sampling 400 entries and classifying how the host block
+>   terminates: **61.0% end in a direct `jmp` after a median 2–3 instructions,
+>   and 91.4% of those land on another map entry** — a genuine translation of the
+>   misaligned decode that rejoins the instruction stream. 24.0% are longer
+>   blocks with no terminator inside 10 instructions. **7.8% are poisoned with
+>   `int3`.** Only **6.8%** are the escape-to-runtime shape (load the guest
+>   address as an immediate, load a reason code, tail-call through the helper
+>   slot). The stub reading was generalised from a single hand-decoded example
+>   that happened to be one of that 6.8%. It also cannot transfer between titles — both
 >   tables are keyed by that title's guest RVAs — so it grades nothing for JSRF.
 >   What transfers is the design idea: Microsoft did not solve x86 boundary
 >   detection, they gave every byte an entry point and let two-thirds resync.
