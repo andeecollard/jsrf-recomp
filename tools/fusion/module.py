@@ -128,7 +128,7 @@ class FusionModule:
         return c
 
     # ---- address map ------------------------------------------------------
-    def map_pairs(self, max_delta=16):
+    def map_pairs(self, max_delta=64):
         """The (guest_rva, host_rva) pair arrays, aligned. Returns (guest, host)
         numpy uint32 arrays over the longest monotonic guest run in .rdata."""
         for s in self.pe.sections:
@@ -171,12 +171,29 @@ class FusionModule:
             return int(self._mh[i])
         return None
 
-    def map_entry_points(self, max_delta=16):
+    def map_entry_points(self, max_delta=64):
         """Guest RVAs the (guest_rva, host_rva) map covers, as a sorted np array.
 
         Detected as the longest run in .rdata whose guest column is monotonic
-        with small deltas. This is the set of addresses Microsoft treats as a
-        translation entry point -- a coverage oracle for our own detector.
+        with small deltas.
+
+        THIS IS A LOWER BOUND, NOT THE ARRAY. The scan stops at the first gap
+        wider than max_delta, so one wide gap truncates everything after it.
+        The default was 16 and the real arrays reach deltas of 38, which cost
+        (measured 18 Sep 2026, against bounds read from InitPrecompiledDll):
+
+            Blinx    76.7% of 1,505,965      Crimson  77.7% of 2,546,633
+            Fuzion   83.8% of 2,316,973      Conker   39.2% of 5,442,333
+
+        At 64 three of the four recover in full and Conker still reaches only
+        75.3%, so raising the bound improves the heuristic without making it
+        exact. For an exact count read the array bounds out of
+        InitPrecompiledDll (two `lea`s, then `sub`/`sar 3`) rather than scanning.
+
+        Do NOT read this as "is this address code?". Presence is uninformative:
+        ~97.7% of the guest span is present because there is an entry at every
+        guest BYTE. Only about a third are translations of instruction starts;
+        the rest point at resync stubs. See docs/technical/ms-fusion-corpus.md.
         """
         for s in self.pe.sections:
             if s.Name.rstrip(b"\0") != b".rdata":

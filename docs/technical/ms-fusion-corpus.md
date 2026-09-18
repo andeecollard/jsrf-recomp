@@ -16,6 +16,29 @@ The four titles are the only ones Microsoft has shipped through this pipeline as
 
 ---
 
+> **CORRECTED 18 Sep 2026 against package 2608.3123.1.0**, one revision newer
+> than the 2607.x subjects below. Re-derived, not inherited:
+>
+> - **Blinx is build `20F912`, not `20F914`, with 1,786 symbol records, not
+>   1,784.** The other three are unchanged.
+> - **`xefu_69c41281_00027bcf.dll` is now byte-identical across all four**
+>   (md5 `b8e42053…`). The "Conker ships a distinct build of it" finding in §2
+>   **no longer holds for this revision**; the build-drift observation stands for
+>   the revision it was made on.
+> - Coverage figures here were scan-derived. Read from `InitPrecompiledDll`'s
+>   bounds: Fuzion 97.83%, Blinx 97.73%, Crimson 97.56%, Conker 97.70% — Conker
+>   is not 98.0%. Crimson's exact count is 2,546,633, matching the single-title
+>   report.
+> - **§5's "the byte-dense map is a coverage oracle" is wrong.** There is an
+>   entry at every guest byte, so presence tells you nothing. Only ~31–34% are
+>   translations of guest instruction starts (2.94–3.19 guest bytes apiece, an
+>   x86 instruction-length histogram); the rest point at resync stubs. It is an
+>   INSTRUCTION-boundary oracle, and a function start is indistinguishable in it
+>   from the instruction after it. It also cannot transfer between titles — both
+>   tables are keyed by that title's guest RVAs — so it grades nothing for JSRF.
+>   What transfers is the design idea: Microsoft did not solve x86 boundary
+>   detection, they gave every byte an entry point and let two-thirds resync.
+
 ## 1. The four modules
 
 Each package's OG-Xbox game module is `xefu_<hash>…dll`; the source is recoverable from its
