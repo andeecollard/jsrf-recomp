@@ -290,6 +290,7 @@ endif()
 
 add_executable(jsrf_first_fault
     main.c
+    guest_names.c
     startup_probe.c
     draw_one_probe.c
     func_hit_probe.c
@@ -481,6 +482,9 @@ set_tests_properties(jsrf_icall_feedback_path_env PROPERTIES
 add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_test)
 set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
     ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
+
+add_executable(jsrf_guest_names_test guest_names_test.c guest_names.c)
+add_test(NAME jsrf_guest_names COMMAND jsrf_guest_names_test)
 
 add_executable(jsrf_worker_stack_pool_test worker_stack_pool_test.c)
 target_link_libraries(jsrf_worker_stack_pool_test PRIVATE xbox_kernel)

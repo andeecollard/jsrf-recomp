@@ -31,6 +31,7 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 #include "recomp_types.h"
 #include "../../src/recomp_switch.h"
 #include "guest_trace.h"
+#include "guest_names.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
 #include "nv2a_pb_scan.h"
@@ -3696,6 +3697,7 @@ static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
 
 static int install_crash_handlers(void)
 {
+    recomp_guest_names_load();
     return AddVectoredExceptionHandler(1, crash_handler) != NULL;
 }
 #else
@@ -3727,8 +3729,21 @@ static const char *describe_host_address(uintptr_t address, char *out, size_t si
     Dl_info info;
     if (!address || !dladdr((void *)address, &info) || !info.dli_sname)
         return "";
-    snprintf(out, size, "  %s +0x%llX", info.dli_sname,
-             (unsigned long long)(address - (uintptr_t)info.dli_saddr));
+    /* A recompiled function is sub_<GUESTVA>, so the host symbol already
+     * carries the guest address that names it. Append a recovered name when one
+     * is known: this line has read "sub_001A2E2E +0x670" for weeks and told
+     * nobody what the code was. DIAGNOSTIC ONLY -- coverage is partial and the
+     * name transfer has a measured error rate, so the address stays first and
+     * the name is a bracketed suffix that can be ignored. */
+    {
+        uint32_t gva;
+        const char *real = NULL;
+        if (recomp_guest_va_from_symbol(info.dli_sname, &gva))
+            real = recomp_guest_name(gva);
+        snprintf(out, size, "  %s +0x%llX%s%s%s", info.dli_sname,
+                 (unsigned long long)(address - (uintptr_t)info.dli_saddr),
+                 real ? "  [" : "", real ? real : "", real ? "]" : "");
+    }
     return out;
 }
 
@@ -3868,6 +3883,9 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
 static int install_crash_handlers(void)
 {
     struct sigaction sa;
+    /* Before the handler can fire: the loader allocates, and the handler must
+     * not. */
+    recomp_guest_names_load();
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO;
