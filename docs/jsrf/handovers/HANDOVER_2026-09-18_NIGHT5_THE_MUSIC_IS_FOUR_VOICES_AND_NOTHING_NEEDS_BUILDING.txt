@@ -1,0 +1,244 @@
+HANDOVER 2026-09-18 NIGHT (5) -- THE MUSIC IS FOUR VOICES, THEY NEVER STOP,
+AND EVERY INSTRUMENT YOU NEED IS ALREADY ARMED
+
+Read CLAUDE.md, then the newest file by date in docs/jsrf/goals/ -- do not
+trust a pointer, including this one. Supersedes
+HANDOVER_2026-09-18_NIGHT3_FIVE_INSTRUMENTS_ARMED_AND_THE_IEN_GATE.txt. Its
+central hypothesis (the IEN gate) is DEAD -- see section 2.
+
+Tree: 67/67 ctest, switch audit 0 problems, 8 commits tonight, HEAD e73d022.
+Active plan: PLAN_2026-09-18_NIGHT5_THE_MUSIC_DIES_WITH_THE_GUEST_HEALTHY.md
+Active goals: JSRF_GOALS_2026-09-18_NIGHT5_THE_2D_BIN_STOPS_ALONE.md
+
+=============================================================================
+READ THIS FIRST: DO NOT BUILD AN INSTRUMENT. CHECK WHETHER IT EXISTS.
+=============================================================================
+
+Twice tonight this session planned to build an instrument, wrote the plan
+down, and then found it already built, wired, compiled into the player's
+bundle, and never armed. The check cost two minutes each time.
+
+  RECOMP_THREAD_TRACE   w32_thread_trace_report(), win32_compat.c:625,
+                        called from xinput_device.c:614. Counts
+                        lost_resumes. [THREAD] appears ZERO times in every
+                        log this project holds.
+  RECOMP_VOICE_RATES    apu_vp.c:3079, with VOICE_FRESH. Per-voice
+                        off_frames, silent_frames, energy, stale slots,
+                        refill cadence in Hz, min/max rate.
+
+The night-3 handover warned about exactly this habit. Two more were waiting.
+Before writing a counter, grep the bundle:
+
+    strings -a ~/jsrf-build/JSRF.app/Contents/MacOS/jsrf-engine \
+      | grep -oE '^RECOMP_[A-Z0-9_]+$' | sort -u
+
+=============================================================================
+1. THE MUSIC IS FOUR VOICES AND THEY NEVER STOP
+=============================================================================
+
+Two player sessions tonight, same build, same switches: 22:25 HEALTHY and
+22:30 BROKEN. Both preserved in ~/Library/Application Support/JSRF/ as
+last-run-2026-09-18_2225-player-FIVE-INSTRUMENTS.log and
+last-run-2026-09-18_2230-player-MUSIC-DIED-THEN-CRASH.log.
+
+[VOICE-LIFECYCLE] gives one event per voice per transition. Voices 64, 65, 66
+and 67 have EXACTLY ONE EVENT EACH -- event=on at audio_frames=256
+(t=0.005 s) -- and no idle, no off, no retire, IN EITHER SESSION. Four
+voices, matching the four guest writes to the 2D list head. Started before the
+title draws a frame and never touched again.
+
+THE FAILURE IS A FAILED RESTART, NOT A DEATH:
+
+    win 3-7    2D +9040 .. +18358     3D sporadic
+    win 8-15   2D +0                  3D +0      <- transition, "at Gum"
+    win 16-43  2D +0  (36 windows)    3D +4494 .. +20514 sustained
+
+Both bins stop together. 3D comes back at window 16. 2D never does, while its
+four voices are still on.
+
+G1's TITLE IS THE WRONG QUESTION. It is "why the guest stops issuing APU
+methods" and the guest does not stop -- guest_methods runs +2000 to +3300 per
+window through the entire silence. The 17:55 session, where guest_methods DID
+freeze, is either a different failure or a later consequence.
+
+FOUR EXPLANATIONS DIED TONIGHT, THREE OF THEM WRITTEN THE SAME EVENING:
+
+  the guest stops submitting        guest_methods +2000-3300 throughout
+  the guest stops starting 2D       on_2d flat at 10 IN THE HEALTHY RUN TOO
+  the voices were retired/off       no retire, off or idle event, either run
+  ADPCM failure silences it (G6)    biggest failure burst (+5999) lands in
+                                    the HEALTHIEST music window (+18358), and
+                                    the healthy run has 9,510 with music fine
+
+The healthy control killed two of those. Capture one every time.
+
+=============================================================================
+2. THE IEN GATE IS DEAD
+=============================================================================
+
+    [APU-IEN] value=00000AFB writes=3 last_written_at=0.005 s
+              | raises allowed=137 SUPPRESSED BY IEN=0
+
+SUPPRESSED BY IEN=0 was the stated kill condition. The stronger fact is
+writes=3, all before t=0.005 s: the guest writes IEN three times in the first
+five milliseconds and never again, so the write the hypothesis needed at the
+freeze does not exist. This does not depend on reaching the freeze.
+
+Also dead: the idle-trap latch (reraise climbs 7814->8307, rearm=102), and
+DSP recognition (gp=7 ep=8, three sessions now).
+
+=============================================================================
+3. [IRQ-LATENCY] MEASURES A PATH THAT DOES NOT EXIST
+=============================================================================
+
+    [IRQ-LATENCY] 0 delivered, 31 lines dropped undelivered
+
+This is NOT "the interrupt is never delivered". pci_irq_assert is
+{ (void)d; recomp_irq_latency_raise(); } -- a no-op whose only effect is the
+hook. The APU never delivers through bridge_run_isr, so raise and deliver can
+never pair. B0 IS STILL UNANSWERED and the poll byte (B1.1) IS STILL UNGATED.
+Re-wire it to time the path the guest actually takes.
+
+=============================================================================
+4. A HANG, CAUGHT LIVE, WITH THE STACK
+=============================================================================
+
+The 22:30 session hung with the PROCESS STILL ALIVE. Two `sample` runs 30 s
+apart agree:
+
+    sub_00147DAC -> kernel_thunk_dispatch -> bridge_NtSuspendThread
+      -> xbox_NtSuspendThread -> SuspendThread (win32_compat.c:761)
+        -> pthread_cond_wait -> __psynch_cvwait
+
+A guest thread parked in the SELF-SUSPEND path waiting for a resume that never
+came. win32_compat.c names the frame below it in its own comment: "JSRF's XAPI
+worker (sub_00147DAC) did precisely that". Self-suspension is NORMAL and that
+worker does it constantly (tib=0x009A4000, last_ordinal=231 =
+NtSuspendThread, in both sessions). The defect is that nothing resumed it.
+
+SAMPLE A HANG BEFORE KILLING IT. Every previous hang here was killed first.
+
+A coherent chain exists -- transition suspends the audio worker, resume is
+lost, the four music voices are never fed again -- but the link that matters,
+that the parked thread feeds those voices, HAS NO EVIDENCE. Do not promote it.
+
+=============================================================================
+5. FIVE SWITCHES ARMED. NOTHING NEEDS BUILDING. DO NOT REBUILD THE BUNDLE.
+=============================================================================
+
+paths.conf now arms, against the UNCHANGED 19:58 bundle:
+
+    RECOMP_VOICE_RATES=1  RECOMP_VOICE_FRESH=1    read voices 64-67 ONLY
+    RECOMP_THREAD_TRACE=1                          read lost_resumes
+    RECOMP_FB_WATCH_STILL_PPM=10000                the glyph trap
+    RECOMP_FB_WATCH_DUMP=150  AFTER=10  FB_DUMP=.../glyphdump/
+
+The engine is untouched on purpose: it keeps the next session comparable to
+the 22:25/22:30 pair. Two source files (nv2a_pb_exec.c, flip_sync_test.c) are
+newer than the bundle -- that is tonight's default-OFF flip-sync switch and it
+is deliberately NOT in the player's build.
+
+HOW TO READ THE NEXT SESSION:
+  [VOICE-RATE] v64-67  off_frames climbing        -> lost ACTIVE_VOICE
+                       stale_slots/max_stale_run climbing, refill_edges -> 0
+                                                   -> guest stopped refilling
+                       silent_frames up, energy flat, slots fresh
+                                                   -> playing over silence
+  [THREAD]             a stall beginning in the SAME report as a lost resume
+                       is the mechanism; lost_resumes flat means it is not
+  glyphdump/still*.bmp up to 150 rectangles, ~24 KB each
+
+THE GLYPH TRAP MISSED BY 47 PIXELS. The defect was photographed tonight
+("So $ou're the cat Who Wants to join us" -- y->$ and both w->W, rest clean).
+comparisons=5182 still=0 quiet=1546, min_outside=351 against budget=304. The
+threshold works (quiet>0); it just could never fire in a cutscene. The
+substitutions are NOT ASCII-adjacent, so any index error is in FONT-ATLAS
+order, not character order -- a sharper claim than G2 has ever had.
+
+=============================================================================
+6. GRAPHICS: ONE LEVER REFUTED, ONE ALIVE, ONE DEAD
+=============================================================================
+
+THE FLIP READ-BACK IS 32% OF THE FRAME AND NOT RECOVERABLE. Every frame does
+GPU -> CPU -> GPU: Metal renders, FLIP_STALL drains the GPU and reads the
+whole colour surface into guest RAM, d3d8_gl.c uploads it back. [STAGE] sync
+is 5.19 ms of a 16.43 ms player frame. A/B with RECOMP_METAL_NO_FLIP_SYNC:
+sync -> 0.01 and submit ABSORBS IT ONE FOR ONE. The wait is the GPU finishing
+the frame. Direct Metal presentation still removes the copy, the conversion
+and the re-upload -- SIZE IT FROM THOSE, NEVER FROM [STAGE] sync.
+
+THE COLOUR RESOLVE REMOVES COST RATHER THAN MOVING IT. sync -1.36 ms with the
+stage separating non-overlappingly, submit unchanged, frame -1.30 ms -- the
+two agree to 0.06 ms. Frame verdict VOID at n=3 vs 4; four more trials owed.
+NOTE the range test is the wrong bar for a 5.6% effect: it gets HARDER to pass
+with more data.
+
+THE DESCRIPTOR TABLE IS NOT A FRAME-TIME LEVER: ~0.4 ms of a 32.8 ms frame,
+below the resolution of the instrument measuring it. The plan that called it
+"the biggest lever" was wrong, and it is 23 case labels, not 900 lines.
+
+A FRAME-TIME A/B OWNS THE MACHINE. This session polluted one of its own by
+running scans during it -- the exact thing it had told three subagents not to
+do. Spread 20-44 ms contaminated against 20.75-23.72 clean.
+
+=============================================================================
+7. A LIVE CODEGEN DEFECT, AND THREE PRs
+=============================================================================
+
+SIX BRANCHES ASK THE WRONG QUESTION (G19). The result-setter family
+(and/or/xor/add/sub/neg/shifts) rebuilds conditions at the consumer by
+re-reading a destination `mov` may have clobbered. Six live sites in six real
+functions; sub_000A6510 emits an UNCONDITIONAL branch where the guest tested
+ebp+ecx == 0. Same class that hung JSRF's ADX loop when inc/dec did it. Fix
+needs a regeneration. NOT established: that any of the six execute.
+
+Sent upstream tonight, all latent here, all injected-fault verified:
+  #70 bts/btr/btc report CF after their own write
+  #71 SF from a compare is signed-overflow UB
+  #72 popfd tracked as flag-preserving
+With #67 and #69 that is five open. Maintainer quiet since 16 Sep.
+
+=============================================================================
+8. WHAT THIS SESSION GOT WRONG
+=============================================================================
+
+ 1. CALLED THE BUNDLE STALE on a dwarfdump --uuid check that does not apply.
+    install_name_tool and codesign change the UUID. The code was byte-identical
+    (__TEXT,__text same hash). Compare the text section, not the UUID.
+ 2. "CORRECTED" THE GOALS FILE'S SF CLAIM AND WAS WRONG. Checked the expression
+    with literal arguments, clang constant-folded it, got the right answer at
+    every -O, and reported the documented miscompilation as unreproducible. It
+    reproduces fine with operands from an array. Guest operands are never
+    literals.
+ 3. SAID "2D FROZE WHILE 3D CLIMBED" off a live tail. 3D stopped too and then
+    recovered. The whole finding is in the recovery.
+ 4. SAID "THE GUEST STOPS STARTING 2D VOICES" from a cumulative counter. The
+    healthy run has the same flat on_2d=10 with the music playing.
+ 5. POLLUTED ITS OWN A/B (section 6).
+ 6. PLANNED TO BUILD TWO INSTRUMENTS THAT ALREADY EXISTED.
+
+Items 2, 3 and 4 were each caught by a control or an injected fault, not by
+re-reading. That is the argument for both.
+
+=============================================================================
+9. WHAT TO DO NEXT
+=============================================================================
+
+ 1. ONE MORE PLAYER SESSION on the unchanged bundle. Five switches are armed
+    and it answers G1, G17 and G2 together. Reach gameplay, play past the Gum
+    transition, and preserve the log BEFORE relaunching.
+ 2. Read [VOICE-RATE] for v64-67 first. It is the whole of G1 now.
+ 3. THEN the cursor pin (G18) -- proven reachable from the recompiled guest
+    driver, and the branch it removes is inside sub_001A2E2E, the function
+    named by 40 of 66 faults.
+ 4. Colour resolve: four more trials, and report means with dispersion as well
+    as the range test.
+ 5. recomp_gpu_own is armed on D3D11 and NEVER on Metal, so "does the guest
+    read the framebuffer" is unanswerable on this host. It is an instrument,
+    not a fix, and everything deferral-shaped depends on it.
+ 6. The batched regeneration now carries G19's correctness fix as well as the
+    performance items -- and dead-flag elision can be settled on a FILTERED
+    COPY of the existing gen tree without spending the regeneration at all.
+
+Owed: a bare-arms APU session; xemu's vp.c read (DONE tonight -- the list
+ownership is inverted, see the night-4 plan); upstream G7 as an issue.
