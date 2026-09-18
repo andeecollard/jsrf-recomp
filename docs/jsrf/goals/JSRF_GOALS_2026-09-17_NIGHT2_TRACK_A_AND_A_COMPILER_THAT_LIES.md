@@ -173,10 +173,35 @@ available as a switch.
 `texture matrix: 0 never uploaded, 0 all-zero`, which says the path was not
 exercised in those scenes rather than that the convention is right.
 
-**Next, one scripted run, no player:** `RECOMP_FF_DUMP=1` into a run that
-reaches a scene with text, and read the last row against the last column. It is
-a print, so it cannot break anything, and it either kills this lead or hands
-over a one-switch fix.
+**RUN 18 Sep, AND IT KILLS THIS LEAD.** `RECOMP_FF_DUMP=1`, scripted, 200 s,
+reached scene 30 and held it 131.7 s:
+
+    [FF] unit 0: texgen s/t/r/q = 0000 0000 0000 0000, TEXTURE_MATRIX_ENABLE=0
+    [FF] texmat0 0x6C0 (seen first=0 last=0): [0 0 0 0] [0 0 0 0] ...
+    [FF] unit 1: ... TEXTURE_MATRIX_ENABLE=0
+    [FF] unit 2: ... TEXTURE_MATRIX_ENABLE=0
+
+**JSRF never enables a texture matrix, on any unit, and never uploads one.**
+The convention question `nv2a_ff.c:38` leaves open is real and still unanswered
+for other titles — and it cannot affect this one. Dead.
+
+*(First attempt produced nothing because I ran it with `RECOMP_METAL_FF=1`,
+which routes fixed function to the GPU and bypasses the CPU path that does the
+dumping. The dump lives in `nv2a_ff.c`, the CPU implementation.)*
+
+**What the same dump did establish**, since it is the first time anyone has
+read it:
+
+- `clip/w = [768.14, 150.33, …]` against the printed rule — hundreds, not ~1 —
+  so **VIEWPORT_SCALE is baked into the composite matrix**. That is question 1
+  of the two the comment poses, answered.
+- `texgen s/t/r/q = 0000` on every unit: no texture-coordinate generation.
+- `lighting 0x0314=0 … (seen=0)`: the lighting registers are never written.
+
+So this title's fixed-function path is a composite transform and nothing else.
+That narrows what FF could be getting wrong for glyphs to the composite
+transform and the vertex attribute fetch — texgen, texture matrices and
+lighting are all provably not in play.
 
 **New, and worth watching rather than acting on:** phobos665's fork is hitting
 a text defect too — *"HUD text draws as solid blocks instead of glyphs"*,
@@ -572,6 +597,7 @@ if their counters justify them.
 | 235 kernel imports are unresolved and the game may crash | 231 of 235 are empty slots the loop invented; 4 are real and 3 are implemented in the bridge. The handler has been called 0 times. See G10. |
 | **Upstream's DirectSound work could help the music** | **New, 17 Sep. Upstream has exactly one dsound fix ever (`2d2d5e4`, cursor sync) and we already have it — it predates our merge base. And it could not matter: `src/audio/dsound_device.c` is NOT LINKED into `jsrf_first_fault` (checked with `nm`; no `DirectSound*` symbol present). JSRF's DirectSound is the title's own XDK code. The other ecosystem audio branches are Media Foundation and XAudio2; our backend is SDL2.** |
 | **Upstream's contiguous-memory heap bug (PR #60) is live here** | **New, 17 Sep. Real upstream — POSIX `VirtualQuery` hardcodes `AllocationBase=NULL`, so `MmFreeContiguousMemory` always `free()`s an mmap'd pointer — and we have the identical code. But our bridge routes ordinals 165/171 to `xbox_ContiguousAlloc`/`xbox_HeapFree` (guest arena, canonicalised, instrumented). The broken pair is referenced only by the dead thunk table. Latent, not live.** |
+| **The texture matrix convention explains the glyph defect** | **New, 18 Sep, and it was my own lead from four hours earlier. `RECOMP_FF_DUMP` run for the first time: `TEXTURE_MATRIX_ENABLE=0` on all three units and every matrix all-zero and never seen. JSRF does not use a texture matrix, so which way round it would be uploaded cannot matter here.** |
 | **The discarded flip range is what makes the label flicker** | **New, 17 Sep. Retracted by A1's own commit (`2b5bdb2`) after the afternoon plan asserted it: every draw sets `surface_dirty` and every swap syncs before it rebinds, so guest RAM is already current for every surface and the range walk finds nothing to pay. A1 is infrastructure for A2, not a fix the player can see.** |
 | **Track A is unstarted and A1 must be built** | **New, 17 Sep night. Said by the afternoon plan AND by the 19:48 goals file, and false in both: A1 and A2 landed at 18:35 as `2b5bdb2` and `ff07677`, with three registered tests. Two documents agreeing does not outrank the commit log.** |
 | **G14's SF bug is live in the player's build** | **New, 17 Sep night, and it was MY claim two hours earlier. The UB form appears at 5 sites and all 5 read `cmp <mem>, 0`, where the subtraction cannot overflow. The other 696 SF consumers use `TEST_S` or a sign-of-one-value form, neither of which subtracts. I counted one expression form, called it the site count, and never read the operands. The defect is real; its reachability here is zero.** |
