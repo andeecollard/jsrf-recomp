@@ -12,6 +12,21 @@ a crash was the guest going black while the engine carried on.
 
 ## 2. What actually happened, at t≈360 s
 
+> **CORRECTED THE SAME EVENING, BY THE CONTROL SESSION THIS ONE LACKED.**
+> The eleven-ordinal table below is an accurate measurement and a WRONG
+> interpretation. A second player session (17:55, 1,523 s) shows **all eleven
+> ordinals stopping there too** — across 6.7 million subsequent kernel calls and
+> 1,250 seconds — in a run that rendered perfectly throughout and never went
+> black. So "every allocator goes to zero" is the title reaching **steady
+> state** (loading done, pools warm), not the freeze. It is not diagnostic.
+>
+> This is the tree's own rule biting the person who wrote it down: *every
+> absence-measurement needs a positive control.* I had none for the census, read
+> a complete-looking census as a complete-looking answer, and it was neither
+> wrong nor useful. What IS specific to 14:59 is the **draw collapse and the
+> black screen** — those did not happen at 17:55. See §9.
+
+
 Eleven ordinals went to **exactly zero** across the 165,000 kernel calls that
 followed. This is a complete census, not a sample:
 
@@ -174,3 +189,44 @@ size, so compare `dwarfdump --uuid`, not bytes.
 2. **Then** a `-DXBOX_WORKER_STACK_COUNT=1` build for the IRQ-thread timing
    experiment, on its own session.
 3. G1 needs rewriting against §3 rather than extending.
+
+## 9. The 17:55 control session — what survived and what did not
+
+1,523 s, `RECOMP_KERNEL_THREADS=1`, `RECOMP_IRQ_THREAD` commented out.
+
+**Never went black.** Framebuffer full and CHANGED at the end; ~29,000 draws per
+window, flat, for the whole run.
+
+**The APU freeze reproduces**: `guest_methods` stopped at 30,026 at **t=270 s**
+and the run continued **1,250 s** after it with rendering untouched. So G1's
+"music dies" is real and repeatable, and it does not take anything else with it.
+
+**Scene caveat, and it matters.** `on=27` here against `on=249` at 14:59.
+CLAUDE.md puts gameplay at 148–453. These are different scenes, so this session
+does NOT establish that the black screen is non-deterministic — only that it
+does not follow from the APU freeze.
+
+**No thread dies.** The census settles that:
+
+    tib=0x00001000  calls=6,635,713  last_ordinal=145  silent_for=7 ms
+    tib=0x00982000  calls=933,017    last_ordinal=161  silent_for=8 ms
+    tib=0x009A4000  calls=95,871     last_ordinal=231  silent_for=7 ms
+    tib=0x00993000  calls=793,997    last_ordinal=119  silent_for=0 ms
+    tib=0x00971000  calls=2          last_ordinal=294  silent_for=1,523,087 ms
+
+Four threads alive and calling 1,250 s after the APU stopped; rates near
+constant across t=270. The fifth made two calls at t≈0 and never ran again —
+dormant since before the freeze, so not its cause either.
+
+**One real signal:** `tib=0x00982000` drops ~35% (780 → 510 calls/s) exactly at
+t=270 and holds there. It does not stop; it does less.
+
+**Why the kernel census cannot go further.** APU submission is not a kernel
+call. It is MMIO into the trapped aperture — `[MCPX-TRAP] vp` equals
+`guest_methods` exactly — so no ordinal histogram can see it. Per-ordinal rates
+across t=270 confirm it: nothing ceases, several paired ordinals drop modestly
+(277/294 by 112/s, 161/160 by 68/s) and that is all.
+
+**So the next instrument is per-thread attribution on the MCPX aperture trap,
+not the kernel.** The trap handler runs on the faulting thread, so `g_fs_base`
+is available there exactly as it was in the bridge.

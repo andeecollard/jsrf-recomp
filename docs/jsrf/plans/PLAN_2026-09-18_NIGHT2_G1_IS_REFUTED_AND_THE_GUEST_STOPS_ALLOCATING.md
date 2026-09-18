@@ -28,7 +28,33 @@ session after — so it goes first, ahead of work that is more interesting.
 
 ---
 
-## 0. Read the session in flight *(free, gated on the player)*
+## 0. READ, 17:55 — answered, and it corrected the plan's own premise
+
+The session ran **1,523 s and never went black**. The kernel census answered
+what it was built to answer and the answer is negative in a useful way:
+
+- **No thread dies.** Four threads alive with near-constant rates 1,250 s after
+  the APU froze; a fifth dormant since t≈0.
+- **The APU freeze reproduces** at t=270 s, and rendering continued untouched.
+- **The eleven-ordinal census is NOT the freeze.** All eleven stop here too,
+  across 6.7 M calls, in a healthy run. That was steady state. The 14:59 reading
+  of it was wrong for want of a control, which is corrected in the progress note.
+- **Scene caveat:** `on=27` here against `on=249` at 14:59, so this does not
+  show the black screen is non-deterministic — only that it does not follow from
+  the APU freeze.
+- **One signal:** `tib=0x00982000` drops ~35% at t=270 and holds.
+
+**Why it stops there:** APU submission is MMIO into the trapped aperture, not a
+kernel call, so no ordinal histogram can see it. The next instrument is
+per-thread attribution on the **MCPX trap** — same shape, same `g_fs_base`,
+different handler. That is now item 0b.
+
+## 0b. Per-thread MCPX aperture attribution *(next build)*
+
+**Done when:** a run says which guest thread submits APU methods, and whether at
+the freeze it stops submitting or stops being scheduled.
+
+## ~~0. Read the session in flight~~ *(done, see above)*
 
 `RECOMP_KERNEL_THREADS` is armed and confirmed live (5 distinct guest threads,
 0 overflowing a 16-slot table). When the run ends, `[KERNEL-THREADS]` names the
