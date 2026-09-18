@@ -390,11 +390,36 @@ remove the swap's cost so much as **move it to the flip**, where
 `nv2a_metal_sync_range` walks the slot list and pays every overlapping debt at
 once — plausibly worse than paying it spread across swaps.
 
-If that holds, **the 9% belongs to `no_depth_sync` alone** and `defer_swap` is
-a cost rather than a saving. Six trials per arm now running.
+### SETTLED, 18 Sep: `defer_swap` MAKES IT SLOWER. A2's premise is refuted.
 
-**Do not ship either switch on this.** `no_depth_sync` still owes its
-full-frame diff, and `defer_swap` may be negative.
+Six trials per arm, `no_depth_sync=1` in both, arms verified distinct:
+
+    DEFER_SWAP=0   19.08 18.90              (mean 18.99, n=2)
+    DEFER_SWAP=1   20.74 20.88 20.62 20.53  (mean 20.69, n=4)
+    OFF is faster and the ranges DO NOT OVERLAP (8.2% less frame time)
+
+The earlier void A/B pointed the same way (19.35 off, 20.83 on), so two
+independent runs agree on the direction and this one separates.
+
+**So A2 is not merely inert — once it can fire, it is actively harmful.** The
+premise Track A inherited, that the swap's write-back is waste that can be
+deferred for free, is measured false. Deferring does not remove the cost; it
+**moves it to the flip**, where `nv2a_metal_sync_range` walks the slot list and
+pays every overlapping debt in one burst instead of spread across swaps.
+
+**The whole of the win is `no_depth_sync`**, which stands on its own at 9.1%
+across eight runs with non-overlapping ranges.
+
+**`RECOMP_METAL_DEFER_SWAP` should stay off, and the A1 narrowing should stay
+anyway** — it costs nothing with the switch off, it is tested, and it is what
+made this measurable at all. Without it the switch could not fire and this
+would still read as "inert".
+
+**Exclusions, because the rate matters:** six of twelve runs never reached a
+mission. That is the second A/B in a row losing half its runs, and it is now a
+harness problem in its own right rather than bad luck.
+
+**Do not ship on this.** `no_depth_sync` still owes its full-frame diff.
 
 **Done when:** that question is answered, and — only if a change makes the
 deferral actually fire — median frame under 16.68 ms in a mission, verified
@@ -690,6 +715,7 @@ if their counters justify them.
 | **The discarded flip range is what makes the label flicker** | **New, 17 Sep. Retracted by A1's own commit (`2b5bdb2`) after the afternoon plan asserted it: every draw sets `surface_dirty` and every swap syncs before it rebinds, so guest RAM is already current for every surface and the range walk finds nothing to pay. A1 is infrastructure for A2, not a fix the player can see.** |
 | **Track A is unstarted and A1 must be built** | **New, 17 Sep night. Said by the afternoon plan AND by the 19:48 goals file, and false in both: A1 and A2 landed at 18:35 as `2b5bdb2` and `ff07677`, with three registered tests. Two documents agreeing does not outrank the commit log.** |
 | **G14's SF bug is live in the player's build** | **New, 17 Sep night, and it was MY claim two hours earlier. The UB form appears at 5 sites and all 5 read `cmp <mem>, 0`, where the subtraction cannot overflow. The other 696 SF consumers use `TEST_S` or a sign-of-one-value form, neither of which subtracts. I counted one expression form, called it the site count, and never read the operands. The defect is real; its reachability here is zero.** |
+| **Deferring the surface swap is worth the median** | **RESOLVED 18 Sep, and the answer is no. With the depth refusal narrowed so it can actually fire, `defer_swap` is 8.2% SLOWER with non-overlapping ranges at n=2 vs 4, arms verified distinct, and a second A/B agrees on the direction. Deferring moves the write-back to the flip, where sync_range pays every overlapping debt in one burst. The win belongs to `no_depth_sync` alone.** |
 | **Deferring the surface swap buys the median** | **New, 17 Sep night. Measured and not separated -- but the reason is that `RECOMP_METAL_DEFER_SWAP` deferred ONE swap per run and refused 5,747-12,656 on `depth_dirty`. The switch is inert in a mission, so the A/B compared not-deferring with not-deferring. `[NOSYNC] p50 = 8.0 ms` remains the upper bound; nothing has yet been built that reaches it.** |
 | **A `setcc` after BT/BTS/BTR/BTC tells you something about the lifter** | **New, 17 Sep. Those instructions define CF only; OF, SF, ZF, AF and PF are architecturally UNDEFINED (SDM Vol 2A). 9 of the fuzzer's first 24 "mismatches" were two models' choices of undefined. The generator no longer emits them.** |
 
