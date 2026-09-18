@@ -482,6 +482,10 @@ add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_te
 set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
     ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
 
+add_executable(jsrf_kernel_thread_census_test kernel_thread_census_test.c)
+target_link_libraries(jsrf_kernel_thread_census_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_kernel_thread_census COMMAND jsrf_kernel_thread_census_test)
+
 add_executable(jsrf_dsound_this_distinct_test dsound_this_distinct_test.c)
 target_link_libraries(jsrf_dsound_this_distinct_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_dsound_this_distinct COMMAND jsrf_dsound_this_distinct_test)

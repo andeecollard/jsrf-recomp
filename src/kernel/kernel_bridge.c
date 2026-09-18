@@ -7514,6 +7514,135 @@ static unsigned g_ordinal_calls[XBOX_KERNEL_MAX_ORDINAL];
 #define XBOX_ORDINAL_SITES 4
 static uint32_t g_ordinal_sites[XBOX_KERNEL_MAX_ORDINAL][XBOX_ORDINAL_SITES];
 
+/* ── RECOMP_KERNEL_THREADS: which guest thread is still calling ───────────
+ *
+ * WHY THIS EXISTS. A player session on 18 Sep 2026 went black six minutes in
+ * with the process still alive and presenting. The ordinal histogram is a
+ * COMPLETE census and says exactly what stopped: every allocator, every free,
+ * object create/close and timer arming went to zero across the 165,000 calls
+ * that followed, while the per-frame present path kept running. What it cannot
+ * say is WHICH THREAD stopped, because nothing in this tree records one.
+ *
+ * The only thread fingerprint that log carried was the `esp=` printed once per
+ * periodic summary. Bucketed by stack region it does separate three guest
+ * threads -- but at roughly one sample a second it cannot tell "stopped" from
+ * "slowed down fourfold", and in that session it did not: the quiet thread's
+ * last sample lands 26 s AFTER the freeze. Suggestive, and nothing more. That
+ * is the gap this closes.
+ *
+ * g_fs_base is the guest TIB pointer and is RECOMP_TLS, so it already names the
+ * calling guest thread with no bookkeeping at all. Bucket on it, keep the last
+ * ordinal and the tick it arrived, and a freeze reads straight off the report:
+ * thread T, N calls, last ordinal O, silent for M ms.
+ *
+ * The gate is at the CALL SITE, not in here, for two reasons: the hot path then
+ * costs one cached int, and this function stays directly testable without the
+ * environment. Opt-in via recomp_switch_on(), per the convention adopted after
+ * a comment that said "defaults on" sat thirty lines above a gate that never
+ * did.
+ *
+ * A thread with no TIB is still a thread, so fs_base 0 is folded to a sentinel
+ * rather than dropped -- dropping it would silently under-count exactly the
+ * unusual thread most likely to be interesting.
+ */
+#define KTHREAD_MAX 16u
+
+typedef struct {
+    uint32_t fs_base;        /* guest TIB VA; 0 means the slot is free */
+    unsigned long calls;
+    unsigned int  last_ordinal;
+    unsigned long last_tick;
+    unsigned long first_tick;
+} KThreadSlot;
+
+static KThreadSlot g_kthreads[KTHREAD_MAX];
+unsigned long g_kthread_distinct;
+unsigned long g_kthread_over;    /* calls that found no free slot */
+
+void xbox_bridge_note_thread_call(uint32_t fs_base, unsigned int ordinal,
+                                  unsigned long tick)
+{
+    unsigned int i;
+
+    if (fs_base == 0) fs_base = 0xFFFFFFFFu;
+
+    for (i = 0; i < KTHREAD_MAX; ++i) {
+        uint32_t cur = __atomic_load_n(&g_kthreads[i].fs_base, __ATOMIC_ACQUIRE);
+        if (cur == fs_base) break;
+        if (cur == 0) {
+            uint32_t expect = 0;
+            if (__atomic_compare_exchange_n(&g_kthreads[i].fs_base, &expect,
+                                            fs_base, 0, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&g_kthreads[i].first_tick, tick, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_kthread_distinct, 1ul, __ATOMIC_RELAXED);
+                break;
+            }
+            /* Lost the claim. If the winner wanted the same thread, this slot
+             * is still ours to use; otherwise keep walking. */
+            if (expect == fs_base) break;
+        }
+    }
+    if (i == KTHREAD_MAX) {
+        __atomic_fetch_add(&g_kthread_over, 1ul, __ATOMIC_RELAXED);
+        return;
+    }
+    __atomic_fetch_add(&g_kthreads[i].calls, 1ul, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_kthreads[i].last_ordinal, ordinal, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_kthreads[i].last_tick, tick, __ATOMIC_RELAXED);
+}
+
+/* Read-only accessor rather than exposing the table: the test needs to see a
+ * slot, nothing needs to write one. Returns 0 when the slot is free. */
+int xbox_bridge_kthread_slot(unsigned int i, uint32_t *fs_base,
+                             unsigned long *calls, unsigned int *last_ordinal,
+                             unsigned long *last_tick)
+{
+    uint32_t fs;
+    if (i >= KTHREAD_MAX) return 0;
+    fs = __atomic_load_n(&g_kthreads[i].fs_base, __ATOMIC_ACQUIRE);
+    if (!fs) return 0;
+    if (fs_base)      *fs_base      = fs;
+    if (calls)        *calls        = __atomic_load_n(&g_kthreads[i].calls, __ATOMIC_RELAXED);
+    if (last_ordinal) *last_ordinal = __atomic_load_n(&g_kthreads[i].last_ordinal, __ATOMIC_RELAXED);
+    if (last_tick)    *last_tick    = __atomic_load_n(&g_kthreads[i].last_tick, __ATOMIC_RELAXED);
+    return 1;
+}
+
+int xbox_bridge_kthreads_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_KERNEL_THREADS");
+    return on;
+}
+
+/* Silent when unarmed would read exactly like "no threads", so say so. */
+void xbox_bridge_dump_thread_census(unsigned long now)
+{
+    unsigned int i;
+
+    if (!xbox_bridge_kthreads_on()) {
+        fprintf(stderr, "  [KERNEL-THREADS] OFF"
+                        " (RECOMP_KERNEL_THREADS=1 to arm)\n");
+        return;
+    }
+    fprintf(stderr, "  [KERNEL-THREADS] %lu distinct, %lu calls with no slot"
+                    " (cap %u):\n",
+            g_kthread_distinct, g_kthread_over, (unsigned)KTHREAD_MAX);
+    for (i = 0; i < KTHREAD_MAX; ++i) {
+        uint32_t fs = __atomic_load_n(&g_kthreads[i].fs_base, __ATOMIC_ACQUIRE);
+        unsigned long last, calls;
+        if (!fs) continue;
+        last  = __atomic_load_n(&g_kthreads[i].last_tick, __ATOMIC_RELAXED);
+        calls = __atomic_load_n(&g_kthreads[i].calls, __ATOMIC_RELAXED);
+        fprintf(stderr, "  [KERNEL-THREADS]   tib=0x%08X calls=%-10lu"
+                        " last_ordinal=%-4u silent_for=%lu ms\n",
+                fs, calls,
+                __atomic_load_n(&g_kthreads[i].last_ordinal, __ATOMIC_RELAXED),
+                now >= last ? now - last : 0ul);
+    }
+}
+
 static void bridge_note_call_site(ULONG ordinal, uint32_t ret)
 {
     int i;
@@ -7691,6 +7820,9 @@ static void kernel_thunk_dispatch(void)
     if (ordinal < XBOX_KERNEL_MAX_ORDINAL) {
         g_ordinal_calls[ordinal]++;
         bridge_note_call_site(ordinal, g_esp ? BRIDGE_MEM32(g_esp) : 0);
+        if (xbox_bridge_kthreads_on())
+            xbox_bridge_note_thread_call(g_fs_base, (unsigned int)ordinal,
+                                         (unsigned long)GetTickCount());
     }
 
     {
@@ -7703,6 +7835,7 @@ static void kernel_thunk_dispatch(void)
             fprintf(stderr, "  [KERNEL] summary: %llu total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             xbox_bridge_dump_ordinal_histogram();
+            xbox_bridge_dump_thread_census((unsigned long)now);
             fflush(stderr);
             last_summary_tick = now;
         }
