@@ -33,12 +33,15 @@ which is this list's own previous entry for G3.
 |---|---|---|
 | frame median | **18.5 ms** against a 16.68 ms budget | scripted, 240 s, METAL_FF=1 |
 | frame without sync | p50 **8.0** ms, p99 29.5 ms | `[NOSYNC]` |
-| music | **dies ~2 min in, every session** | player, 17 Sep |
-| text | corrupt in speech boxes AND trick names | player screenshots |
+| music | **dies at t=270 s and t=360 s**, every session | player, 18 Sep x2 |
+| ...and it takes nothing with it | rendering held 1,250 s after the freeze | player, 17:55 |
+| freeze/black screen | once in two sessions; **separable from the music** | player, 18 Sep |
+| text | corrupt in speech boxes AND trick names; located at Gum | player, 18 Sep |
 | fences, sound effects | fixed, player-confirmed | — |
-| tests | 48/48 green | `ctest`, build-feav |
+| speed | 9.1% shipped (`NO_DEPTH_SYNC`), 19 ms vs 16.68 ms | 18 Sep A/B, n=8 |
+| tests | **59/59 green** | `ctest`, build-feav |
 | lifter vs Unicorn | 860 mismatches / 13,008 vectors, 3 families | `fuzz_unicorn.py` |
-| tree | `main` at `62eb616`, level with `origin/main` | — |
+| tree | `main` at `9b33793` | — |
 
 ## The rules that order this list
 
@@ -58,11 +61,13 @@ counter, and the counter comes first.
 
 ## The order
 
-0. **The player's next session**, with `RECOMP_APU_CYCLE_BREAK=1`. It is one
-   line, it needs no build, and it is the first time there has been a reason to
-   set it. The same session re-tests XC_AUDIO=stereo, which has never been
-   heard, and can finally take G1's delivery measurement — scripted runs cannot,
-   because they do not reach the state.
+0. **A player session reading `RECOMP_APU_TRAP_THREADS`** (armed 18 Sep night).
+   It forks G1: does the submitting thread stop asking, or stop being scheduled?
+   Nothing else on this list is worth more, and G1 cannot move without it.
+   Reach actual gameplay — the 17:55 session sat at `on=27`, well below the
+   148–453 band, so it never exercised the scene where the black screen appeared.
+   ~~The player's next session with `RECOMP_APU_CYCLE_BREAK=1`~~ — **DONE**,
+   18 Sep, twice. Delivery measured: 19 of 19 and 15 of 15 handles delivered.
 1. **G3's depth question** — why depth is dirty at nearly every swap, and
    whether guest RAM ever needs it. The A/B is DONE and says A2 is inert: one
    deferral per run against thousands of depth refusals. Do not re-run it.
@@ -79,60 +84,107 @@ counter, and the counter comes first.
 4. **G14's fix**, gated on its counter. Expensive: it changes generated code
    for every `js` in the image, so it needs a regenerated gen and a re-verified
    baseline.
-5. **G1**, by measurement only — never by another mechanism.
+5. **G1**, by measurement only — never by another mechanism. Its founding
+   invariant was refuted on 18 Sep; the entry is rewritten, not extended.
 
 G2 and G4 stay parked, with reasons at their entries.
 
 ---
 
-## G1 — Why the guest stops issuing APU methods *(open, method-gated)*
+## G1 — Why the guest stops issuing APU methods *(open, REFOUNDED 18 Sep night)*
 
-Two minutes in, every session, `guest_methods` freezes and the music dies.
-Established and not in doubt: the guest is alive and still faulting on the
-aperture (`[MCPX-TRAP] vp` equals `guest_methods` exactly, so nothing is lost);
-`[APU-WRITE] main=16997 vp=11762` — it services our traps through the main
-registers and submits no voice work; the trigger is a burst of VOICE_ON that
-the player located ("the sound breaks up when you speak to gum"); and the
-invariant is that **retired voices stay in the list and the guest never takes
-them out** — eight guest writes to the 3D list head in a whole session against
-thousands of raises.
+Two minutes in — **make that five to six minutes; see below** — `guest_methods`
+freezes and the music dies. That much is unchanged and reproduces in every
+session.
 
-**Done when:** we know why the guest acknowledges a removal request and does
-not perform the removal.
+### THE INVARIANT THIS GOAL WAS BUILT ON IS REFUTED
 
-**The next measurement, specified and still unbuilt:** the trap carries ONE
-handle in FEDECPARAM. When several voices retire inside one burst, how many
-distinct handles were ever *delivered* against how many went idle? The
-`seen`/`delivered` pair exists and was re-anchored in `5e47836`; it needs a run.
+The previous text read:
 
-- **G1a** `RECOMP_APU_FEDEC_HOLD` default — **DONE, but it does NOT fully fix
-  the crash.** 18 Sep: the crash it was built for fired **three times in one
-  A/B with the hold ON** — all at `sub_001A2E2E +0x670`, fault `0x70FFFFFFBE`,
-  the known DSOUND signature, in runs reporting `fedec_hold on (default)` and
-  `decode pairs held while trapped: 3`. The hold did its job on those methods
-  and the title crashed anyway. So the decode-pair race is *a* cause, not *the*
-  cause. G1a rested on one player session with `held=1702` and no crash, and
-  its own entry called that a confirmation rather than a measurement — this is
-  what the second session it asked for looks like.
-- **G1b** why retired voices stay linked — open, and **reopened on the cycle
-  hypothesis, 18 Sep**. The player's session:
+> the invariant is that **retired voices stay in the list and the guest never
+> takes them out** — eight guest writes to the 3D list head in a whole session
+> against thousands of raises
 
-      [APU-CYCLE] relink=90 (of 212 top inserts) walks_with_a_cycle=88
-                  broken=0 last=v3/list1 (cycle_break OFF)
-      [APU-WALKCAP] hit=87
+Two player sessions on 18 Sep, with the ring armed for the first time:
 
-  88 walks met a ring, the cap was hit 87 times, and the voice closing the last
-  one is v3 — a storm voice. The refutation that closed this was taken from a
-  run that never reached gameplay; a scripted run tonight reproduced that false
-  zero exactly (4 top inserts against 212, gate 1 failed). **`cycle_break` has
-  never been switched on**, so nothing is known about breaking the ring. That
-  is the next thing to try and it costs one line in `paths.conf`.
-  `RECOMP_APU_IDLE_TRAP_SELFLINK` remains refuted by its own counter (`0 of 0`)
-  and must not be re-armed without a session showing `encounters` moving.
-- **G1c** the music decays rather than cuts out — open. Not the APU falling
-  behind. **Done when** we know what declines, per voice.
-- **G1d** the storm precedes the collapse — open, one session. **Done when** a
-  second reproduces the ordering.
+    [VOICE-TOP-RING] 87 head writes seen: unlink=81 during-trap=83
+                     on-trapped-voice=83 still-active=7 self-linked=0
+                     into-empty=3 emptied-list=7
+    [VOICE-TOP]      2D=3 3D=83 MP=1          (reference 11:47: 2D=5 3D=26 MP=1)
+    [APU-IDLE-DELIVERY] found idle=19 distinct, delivered=19, never told about=0
+    reference 11:47:    found idle=15 distinct, delivered=15, never told about=0
+
+**81 of 87 head writes are textbook unlinks** — the new head is exactly the old
+head's `next`. **83 of 87 happened while the front end was TRAPPED with `cvl`
+naming exactly the removed voice**: the guest removed precisely the voice the
+idle trap had just told it about. `self-linked=0`, so no one-entry cycle at any
+head write. And every idle handle was delivered, in both sessions.
+
+So both halves of "the guest acknowledges a removal request and does not perform
+the removal" are measured false. **The handshake works.** Do not write another
+hypothesis that assumes it does not.
+
+**Caveat that must travel with these numbers:** both sessions ran with
+`CYCLE_BREAK`, `FEDEC_HOLD`, `SELFLINK_END` and `LIST_MOVE_TO_FRONT` armed. This
+is that stack's behaviour, not bare behaviour. A bare-arms session is owed.
+
+### WHAT IS ACTUALLY ESTABLISHED
+
+- The freeze is real, reproducible, and lands at **t=270 s and t=360 s** in the
+  two sessions — not "two minutes". The old figure is stale.
+- **It takes nothing else with it.** On 17:55 the APU froze at t=270 and the
+  title rendered at a flat ~29,000 draws per window for the following **1,250
+  seconds** with a full, changing framebuffer. The music dying is not part of a
+  general collapse.
+- **No guest thread dies.** `RECOMP_KERNEL_THREADS` (built 18 Sep) shows four
+  threads alive at near-constant kernel-call rates 1,250 s after the freeze, and
+  a fifth dormant since t≈0. One thread, `tib=0x00982000`, drops ~35% (780 → 510
+  calls/s) exactly at t=270 and holds there. It does less; it does not stop.
+- **The kernel census cannot go further, for a structural reason.** APU
+  submission is not a kernel call — it is an MMIO store into the trapped
+  aperture, which is why `[MCPX-TRAP] vp` equals `guest_methods` exactly. Per-
+  ordinal rates across the freeze show nothing ceasing, a few paired ordinals
+  dropping modestly, and that is all an ordinal histogram can ever see of a
+  store instruction.
+
+### THE NEXT MEASUREMENT, BUILT AND ARMED
+
+`RECOMP_APU_TRAP_THREADS` (18 Sep night) counts aperture faults per guest TIB
+and reports `apu=`/`vp=` per thread beside `[MCPX-TRAP]`. Read across the
+periodic reports it separates the two live explanations:
+
+- the submitting thread's `vp=` stops growing while `[KERNEL-THREADS]` shows it
+  still calling → **the guest stopped asking**, and the question is what its
+  audio code decided;
+- both stop together → **it stopped being scheduled**, and the question is ours.
+
+**Done when:** we know which of those two it is. That is the whole of G1 now.
+Everything below it is subordinate to that fork.
+
+### The sub-goals, re-ranked against the above
+
+- **G1a** `RECOMP_APU_FEDEC_HOLD` — **DONE, and it does not fix the crash.**
+  Unchanged; the hold does its job on those methods and the title crashed anyway
+  on 18 Sep. Note the crash did **not** fire in either 18 Sep player session.
+- **G1b** why retired voices stay linked — **CLOSED AS MIS-STATED.** They do not
+  stay linked; 81 of 87 removals are textbook. The cycle counters
+  (`relink=90 of 212`, `walks_with_a_cycle=88`, `WALKCAP hit=87`) describe the
+  model's own walk, not a guest failure, and must be re-read in that light.
+  `RECOMP_APU_IDLE_TRAP_SELFLINK` remains refuted by its own counter (`0 of 0`).
+- **G1c** the music decays rather than cuts out — open, unchanged, and now the
+  most interesting sub-goal, because the guest is demonstrably still healthy
+  when it happens. **Done when** we know what declines, per voice.
+- **G1d** the storm precedes the collapse — open, one session.
+
+### The reference: xemu's `vp.c`, still unread
+
+Our APU is xemu's, extracted. Seven hypotheses have died and **not one was
+checked against the implementation ours came from**. Unread and directly
+relevant: voice-list splicing on VOICE_ON (`LIST_MOVE_TO_FRONT` and
+`SELFLINK_END` are local inventions with xemu's originals right there),
+`voice_lock` semantics, and mixbin handling for 3D voices. There is no xemu
+source on this disk; fetching it is step one. **That is the next source to
+read, not another theory.**
 
 ## G2 — The glyph index error *(open, parked)*
 
