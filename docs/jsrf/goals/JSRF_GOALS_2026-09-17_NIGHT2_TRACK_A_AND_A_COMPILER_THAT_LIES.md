@@ -302,10 +302,43 @@ whether the A/B is worth taking.
 Registered with `ab_score.py` as `no_depth_sync`, and the generic
 `METAL_SWITCH_RE` can see it, so its VOID check will actually run.
 
-**Next, and it needs no player:** A/B it for frame time, and check correctness
-with the `[d3d8_gl]` blit check. If the frame is unchanged, A2's depth refusal
-can be narrowed and Track A is unblocked. If it breaks, it says precisely what
-depends on depth reaching guest RAM.
+### RUN 18 Sep. The switch works; the frame-time half is VOID.
+
+    =0   20.56 ms                  (n=1 -- two runs excluded, one crashed)
+    =1   19.05  19.29  19.65 ms    (n=3, mean 19.33)
+    VOID: ONE RUN PER ARM IS NOT A MEASUREMENT (n=1 vs 3)
+
+The scorer is right to void it and the exclusions are not the switch's doing —
+both excluded runs are the **control** arm failing to reach a mission
+(`scene=12`), which is boot flakiness this host has shown before.
+
+**What is NOT void is the mechanism**, and it is the point of the switch:
+
+    =0   depth write-backs: 25512 taken,     0 skipped  (no_depth_sync OFF)
+    =1   depth write-backs:     0 taken, 27177 skipped  (no_depth_sync on)
+    =1   depth write-backs:     0 taken, 27143 skipped
+    =1   depth write-backs:     0 taken, 26611 skipped
+
+**~27,000 depth write-backs per 160 s run were skipped entirely, and all three
+runs reached scene 30, held it 159 s, and finished without a crash.** Each
+skipped write-back is a drain as well as a copy.
+
+Rendering survived it, by the checks that exist:
+
+    [d3d8_gl] blit 13500: expected 41 69 53 -> window 41 69 53  delta +0 +0 +0  MATCH
+    [FB] t=239.00 nonzero=153362/153600
+
+**The honest limit:** the blit check is ONE pixel and `[FB]` is a sum. Neither
+can see a depth-dependent artifact in the middle of the frame. "It ran and
+presented" is not "it rendered correctly", and this is exactly the distinction
+this tree has been burned on before.
+
+**Still owed, in order:** a control arm with n≥2 (re-running), and a
+scene-matched pixel diff between the arms. Until the diff exists this is
+evidence that guest RAM *probably* does not need the depth, not proof.
+
+If it holds, A2's depth refusal — which fired 5,747–12,656 times against one
+successful deferral — can be narrowed, and Track A is unblocked.
 
 **Done when:** that question is answered, and — only if a change makes the
 deferral actually fire — median frame under 16.68 ms in a mission, verified
