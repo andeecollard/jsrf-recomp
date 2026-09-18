@@ -483,12 +483,61 @@ add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_te
 set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
     ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
 
+# CAN THE FRAMEBUFFER WATCH SAY NO?
+#
+# RECOMP_FB_WATCH exists to catch G2 -- one glyph's quad drawn with another
+# glyph's texture coordinates -- and could not be used, because its trigger was
+# "the change was small", which in this title fires ~100 times a minute all
+# session on ordinary animation and spends a 921,654-byte BMP on each one.
+# RECOMP_FB_WATCH_STILL triggers on what the defect actually is instead: the
+# watched region changed while the rest of the frame did not.
+#
+# Same shape as jsrf_frame_hist and jsrf_ff_refusal: drive the real method sink
+# into the state the instrument is supposed to detect and assert it detects it,
+# then into the healthy state and assert it does NOT. Ten flips over three
+# rotating colour surfaces, every classification pinned, the threshold moved in
+# both directions, and the four-way armed/looked/found reading checked one
+# process per arm because each gate resolves once.
+add_executable(jsrf_fb_watch_still_test fb_watch_still_test.c
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
+target_link_libraries(jsrf_fb_watch_still_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_fb_watch_still COMMAND jsrf_fb_watch_still_test)
+
 add_executable(jsrf_guest_names_test guest_names_test.c guest_names.c)
 add_test(NAME jsrf_guest_names COMMAND jsrf_guest_names_test)
 
 add_executable(jsrf_worker_stack_pool_test worker_stack_pool_test.c)
 target_link_libraries(jsrf_worker_stack_pool_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_worker_stack_pool COMMAND jsrf_worker_stack_pool_test)
+
+if(APPLE)
+    # G3, the colour half of the question no_depth_sync answered for depth.
+    # Registered HERE rather than beside the other Metal tests further down
+    # only to keep this diff from touching the same lines as another change in
+    # flight; the guard is what makes the placement legal, since nv2a_metal.m
+    # is compiled into xbox_vsh on APPLE alone.
+    #
+    # Three arms, and each fails against a different wrong implementation. The
+    # OFF arm is the control -- it catches a skip that fires in both arms,
+    # which is how this tree scored an A/B against itself once already. The ON
+    # arm catches a skip that never fires, which would make a measured win
+    # somebody else's. The third arm is the one guarding a silent corruption:
+    # on the software tail depth is read back out of the COLOUR buffer's
+    # alpha, so eliding that read because colour is skipped would write the
+    # guest's D24S8 surface from uninitialised heap while the frame still
+    # presents and the sync still returns 1.
+    add_executable(jsrf_metal_colour_sync_test metal_colour_sync_test.c)
+    target_link_libraries(jsrf_metal_colour_sync_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_colour_sync_off COMMAND jsrf_metal_colour_sync_test)
+    set_tests_properties(jsrf_metal_colour_sync_off PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_NO_COLOUR_SYNC=0;JSRF_EXPECT_COLOUR=1")
+    add_test(NAME jsrf_metal_colour_sync_on COMMAND jsrf_metal_colour_sync_test)
+    set_tests_properties(jsrf_metal_colour_sync_on PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_NO_COLOUR_SYNC=1;JSRF_EXPECT_COLOUR=0")
+    add_test(NAME jsrf_metal_colour_sync_depth_alpha COMMAND jsrf_metal_colour_sync_test)
+    set_tests_properties(jsrf_metal_colour_sync_depth_alpha PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_HW=0;RECOMP_METAL_NO_COLOUR_SYNC=1;RECOMP_METAL_NO_DEPTH_SYNC=0;JSRF_EXPECT_COLOUR=0;JSRF_EXPECT_DEPTH=1")
+endif()
 
 add_executable(jsrf_apu_trap_thread_test apu_trap_thread_test.c)
 target_link_libraries(jsrf_apu_trap_thread_test PRIVATE xbox_kernel)

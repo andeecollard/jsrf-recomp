@@ -1677,12 +1677,78 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
  * not armed -- so in a report, no [FB-WATCH] line means the variable was not
  * set, a line with comparisons=0 means it was set but never got to look, and a
  * line with comparisons>0 and changes=0 is the real absence measurement. */
+/* AND THE TRIGGER THAT ACTUALLY DESCRIBES THE DEFECT: RECOMP_FB_WATCH_STILL.
+ *
+ * "Small" is not a proxy for corruption. Measured 18 Sep 2026 over a whole
+ * session: small changes fire about ONE HUNDRED PER MINUTE, uniformly from
+ * t=0 to the end -- 2,000 of them between t=0 and t=1090 in one run -- and
+ * every one looked at was ordinary animation. The dumps are worse than the
+ * lines: dump_snapshot_bmp writes s_snap_w x s_snap_h, the WHOLE frame, which
+ * is 921,654 bytes at 640x480, so any workable RECOMP_FB_WATCH_DUMP cap is
+ * spent within about thirty seconds of RECOMP_FB_WATCH_AFTER -- all of it on
+ * animation. The note further down already records the first attempt dying
+ * exactly that way: 59 dumps, every one legitimate, before the window where
+ * the defect was seen.
+ *
+ * The defect (G2) is one glyph's quad drawn with ANOTHER glyph's texture
+ * coordinates, in a speech box or a trick name. Speech-box text is STATIC
+ * between frames. So the discriminator is not how BIG the change was, it is
+ * what the rest of the frame was doing when it happened: the region changed
+ * WHILE THE SCENE WAS OTHERWISE STILL. This call site can measure that for
+ * nothing, because s_snap is already a whole frame -- keep the whole frame
+ * per surface beside the region, and the pixels OUTSIDE the rectangle answer
+ * "was anything else moving?".
+ *
+ * ADDED, NOT SUBSTITUTED. comparisons/changes/small/large keep counting
+ * exactly what they counted before and the [FB-WATCH] line is unchanged, so a
+ * log taken before this and one taken after are still comparable. What the
+ * switch changes is which event PRINTS and which event spends a BMP, because
+ * that is the part that was unusable.
+ *
+ * THE THRESHOLD IS A TUNABLE, because "still" is not "byte-identical" in a
+ * title that keeps animating behind its own dialogue boxes.
+ * RECOMP_FB_WATCH_STILL_PPM is how many pixels outside the rectangle may
+ * differ while the frame still counts as still, in parts per million of the
+ * pixels outside it. The default 1000 ppm is 0.1%, which is 307 pixels of a
+ * 640x480 frame; a camera move or a fade is tens of thousands. 0 demands a
+ * byte-identical background, 1000000 accepts anything.
+ *
+ * AND THE REPORT CARRIES THE DISTRIBUTION, not just the verdict -- otherwise
+ * the threshold is the next thing nobody can read past. If a run says
+ * still=0, the reader has to be able to tell "the region never changed while
+ * the scene was still" from "the scene is never still at this threshold". So
+ * the still line prints min_outside (the smallest outside change seen on any
+ * region change), a five-bucket histogram of those changes, and quiet= -- the
+ * flips where the scene WAS still and the region did not change, which is the
+ * positive control for the threshold itself. quiet=0 with comparisons in the
+ * thousands means the threshold is too tight, and says so without a BMP.
+ *
+ * THE SAME FOUR-WAY READING, for the new counter: no [FB-WATCH-STILL] line at
+ * all means RECOMP_FB_WATCH_STILL was not set; an "armed nothing" line means
+ * it was set but RECOMP_FB_WATCH named no rectangle; comparisons=0 means it
+ * was armed and never got to look; comparisons>0 with still=0 is the real
+ * absence measurement. */
 static void dump_snapshot_bmp(const char *tag, unsigned seq);
+/* Declared here for the still dumps, which write the RECTANGLE rather than
+ * the frame -- see the dump site in fb_watch(). */
+static void write_bmp(const char *tag, unsigned seq,
+                      const uint8_t *base, uint32_t pitch,
+                      uint32_t x0, uint32_t y0,
+                      uint32_t w, uint32_t h, uint32_t bpp);
 
 /* One per colour surface in the flip rotation. This title uses three; eight
  * leaves room for a mode change without the slots thrashing, and a rotation
  * deeper than this is reported rather than silently mis-compared. */
 #define FB_WATCH_SLOTS 8
+
+/* Parts per million of the pixels OUTSIDE the rectangle that may differ
+ * between two presents of the same surface and the frame still count as
+ * still: 1000 ppm = 0.1% = 307 pixels of 640x480. Overridden by
+ * RECOMP_FB_WATCH_STILL_PPM. */
+#define FB_WATCH_STILL_PPM_DEFAULT 1000UL
+
+/* zero, within budget, within 10x, within 100x, more. */
+#define FB_WATCH_STILL_BUCKETS 5
 
 static struct {
     int           init;          /* the environment has been parsed */
@@ -1693,6 +1759,7 @@ static struct {
     struct {
         uint32_t  off;           /* the guest colour offset this slot holds */
         uint8_t  *px;            /* that surface's region as last presented */
+        uint8_t  *full;          /* ...and its WHOLE frame, for the stillness test */
         int       valid;
     } slot[FB_WATCH_SLOTS];
     unsigned long evicted;       /* surfaces dropped for want of a slot */
@@ -1706,6 +1773,21 @@ static struct {
     unsigned long printed, dumped;
     unsigned      cap;           /* RECOMP_FB_WATCH_DUMP; 1 = disabled sentinel */
     int           after;         /* RECOMP_FB_WATCH_AFTER, wall-clock seconds */
+
+    /* The stillness trigger. Everything below is inert unless still_on. */
+    int           still_on;      /* RECOMP_FB_WATCH_STILL */
+    unsigned long still_ppm;     /* RECOMP_FB_WATCH_STILL_PPM */
+    size_t        full_len;      /* bytes in one whole-frame copy */
+    unsigned long still_outside; /* pixels outside the rectangle, this geometry */
+    unsigned long still_budget;  /* ...and how many of them may differ */
+    unsigned long still_cmp;     /* THE NEW POSITIVE CONTROL -- read this first */
+    unsigned long still_changes; /* THE NEW COUNT: changed while the scene was still */
+    unsigned long still_moving;  /* changed while the scene was moving */
+    unsigned long still_quiet;   /* scene still AND the region unchanged */
+    unsigned long still_min;     /* smallest outside diff seen on a region change */
+    int           still_min_seen;
+    unsigned long still_bucket[FB_WATCH_STILL_BUCKETS];
+    unsigned long still_printed, still_dumped;
 } s_fbw;
 
 static void fb_watch_drop_slots(void)
@@ -1714,9 +1796,161 @@ static void fb_watch_drop_slots(void)
     for (i = 0; i < FB_WATCH_SLOTS; ++i) {
         free(s_fbw.slot[i].px);
         s_fbw.slot[i].px = NULL;
+        free(s_fbw.slot[i].full);
+        s_fbw.slot[i].full = NULL;
         s_fbw.slot[i].off = 0;
         s_fbw.slot[i].valid = 0;
     }
+}
+
+/* The whole-frame copies only.
+ *
+ * They are sized by the FRAME, so the region slots' own size check cannot
+ * stand in for this one: 640x480 and 320x240 hold the same 64x32 rectangle at
+ * the same bpp, so `len` is unchanged while every stored frame is now the
+ * wrong size. Reading one at the new size is a buffer overrun, not a wrong
+ * number. */
+static void fb_watch_drop_full(void)
+{
+    unsigned i;
+    for (i = 0; i < FB_WATCH_SLOTS; ++i) {
+        free(s_fbw.slot[i].full);
+        s_fbw.slot[i].full = NULL;
+    }
+}
+
+/* Resolve the environment ONCE, from either entry point.
+ *
+ * fb_watch_report() calls this too, so a run that armed the watch and never
+ * reached a flip now prints a line with comparisons=0 instead of no line at
+ * all. "Not armed" and "armed but never looked" were otherwise the same
+ * silence, which is the distinction the reading guide above exists to keep. */
+static void fb_watch_init(void)
+{
+    const char *e;
+
+    if (s_fbw.init) return;
+    s_fbw.init = 1;
+    s_fbw.still_ppm = FB_WATCH_STILL_PPM_DEFAULT;
+
+    e = getenv("RECOMP_FB_WATCH");
+    if (e && sscanf(e, "%u,%u,%u,%u", &s_fbw.x0, &s_fbw.y0,
+                    &s_fbw.ww, &s_fbw.hh) == 4 && s_fbw.ww && s_fbw.hh) {
+        s_fbw.on = 1; s_snap_wanted = 1;
+    }
+
+    /* Opt-in through the shared grammar, so "=0" is off -- the convention this
+     * tree adopted after a comment reading "defaults on" sat thirty lines
+     * above a gate that never did. The threshold beside it carries a VALUE and
+     * so cannot go through that helper; it is named in switch_audit.py's
+     * VALUE_CARRYING for exactly that reason. */
+    s_fbw.still_on = recomp_switch_on("RECOMP_FB_WATCH_STILL");
+    e = getenv("RECOMP_FB_WATCH_STILL_PPM");
+    if (e && *e) {
+        char *end = NULL;
+        unsigned long v = strtoul(e, &end, 10);
+        /* A misparse keeps the documented default rather than silently
+         * becoming 0, which would be the strictest possible threshold and
+         * would read in the report as a scene that never holds still. */
+        if (end && end != e && v <= 1000000UL) s_fbw.still_ppm = v;
+    }
+
+    /* Eagerly, like every other gate here. These used to be resolved inside
+     * the small-change branch, so the dump budget was decided by the first
+     * event rather than by the run, and nothing could dump for the still
+     * trigger before the old one had fired at least once. */
+    e = getenv("RECOMP_FB_WATCH_DUMP");
+    s_fbw.cap = e ? (unsigned)atoi(e) : 0;
+    if (!s_fbw.cap) s_fbw.cap = 1;     /* 1 = disabled sentinel */
+    e = getenv("RECOMP_FB_WATCH_AFTER");
+    s_fbw.after = e ? atoi(e) : 0;
+}
+
+/* How many pixels OUTSIDE the watched rectangle differ between this frame and
+ * the last one presented from the SAME surface.
+ *
+ * A row where nothing moved costs one memcmp, which is the case this hunts
+ * for; only a row that differs is walked pixel by pixel. There is deliberately
+ * NO early exit once the budget is blown: the histogram in the report is what
+ * tells the next reader where the threshold belongs, and a truncated count
+ * would make every moving frame read as "just over budget". The cost is one
+ * whole-frame compare per flip on an opt-in switch. */
+static unsigned long fb_watch_outside_diff(const uint8_t *prev)
+{
+    const uint32_t bpp = s_snap_bpp;
+    const size_t stride = (size_t)s_snap_w * bpp;
+    const uint32_t rx1 = s_fbw.x0 + s_fbw.ww, ry1 = s_fbw.y0 + s_fbw.hh;
+    unsigned long diff = 0;
+    uint32_t y, s;
+
+    for (y = 0; y < s_snap_h; ++y) {
+        const uint8_t *a = prev   + (size_t)y * stride;
+        const uint8_t *b = s_snap + (size_t)y * stride;
+        uint32_t span[2][2];        /* {first pixel, pixel count} */
+        uint32_t n = 0;
+
+        if (y < s_fbw.y0 || y >= ry1) {     /* the rectangle misses this row */
+            span[0][0] = 0; span[0][1] = s_snap_w; n = 1;
+        } else {                            /* left of it, then right of it */
+            if (s_fbw.x0)       { span[n][0] = 0;   span[n][1] = s_fbw.x0; ++n; }
+            if (rx1 < s_snap_w) { span[n][0] = rx1; span[n][1] = s_snap_w - rx1; ++n; }
+        }
+
+        for (s = 0; s < n; ++s) {
+            size_t off = (size_t)span[s][0] * bpp;
+            size_t bytes = (size_t)span[s][1] * bpp;
+            uint32_t k;
+
+            if (!memcmp(a + off, b + off, bytes)) continue;
+            if (bpp == 4) {
+                const uint32_t *pa = (const uint32_t *)(const void *)(a + off);
+                const uint32_t *pb = (const uint32_t *)(const void *)(b + off);
+                for (k = 0; k < span[s][1]; ++k) if (pa[k] != pb[k]) ++diff;
+            } else if (bpp == 2) {
+                const uint16_t *pa = (const uint16_t *)(const void *)(a + off);
+                const uint16_t *pb = (const uint16_t *)(const void *)(b + off);
+                for (k = 0; k < span[s][1]; ++k) if (pa[k] != pb[k]) ++diff;
+            } else {
+                for (k = 0; k < span[s][1]; ++k)
+                    if (memcmp(a + off + (size_t)k * bpp,
+                               b + off + (size_t)k * bpp, bpp)) ++diff;
+            }
+        }
+    }
+    return diff;
+}
+
+/* This frame becomes the surface's "last presented" whole frame. A failed
+ * allocation leaves the slot without one, which costs the stillness verdict
+ * for that surface and nothing else -- still_cmp counts what was really
+ * measured, so it shows up as a comparison that did not happen rather than as
+ * a frame that was still. */
+static void fb_watch_remember_full(unsigned i)
+{
+    if (!s_fbw.full_len) return;
+    if (!s_fbw.slot[i].full) {
+        s_fbw.slot[i].full = (uint8_t *)malloc(s_fbw.full_len);
+        if (!s_fbw.slot[i].full) return;
+    }
+    memcpy(s_fbw.slot[i].full, s_snap, s_fbw.full_len);
+}
+
+/* Where this change sat relative to the threshold, for the report's histogram.
+ * With a budget of 0 the upper buckets still separate "a handful of pixels"
+ * from "a tenth of the screen", which is what the +10/+100 are for. */
+static void fb_watch_note_outside(unsigned long outside)
+{
+    unsigned long b = s_fbw.still_budget;
+
+    if (!s_fbw.still_min_seen || outside < s_fbw.still_min) {
+        s_fbw.still_min = outside;
+        s_fbw.still_min_seen = 1;
+    }
+    if (!outside)                         ++s_fbw.still_bucket[0];
+    else if (outside <= b)                ++s_fbw.still_bucket[1];
+    else if (outside <= b * 10 + 10)      ++s_fbw.still_bucket[2];
+    else if (outside <= b * 100 + 100)    ++s_fbw.still_bucket[3];
+    else                                  ++s_fbw.still_bucket[4];
 }
 
 static void fb_watch(void)
@@ -1724,16 +1958,10 @@ static void fb_watch(void)
     size_t row, len, p;
     unsigned i, victim, diff;
     uint32_t y;
+    int still = 0, still_known = 0;
+    unsigned long outside = 0;
 
-    if (!s_fbw.init) {
-        const char *e = getenv("RECOMP_FB_WATCH");
-        s_fbw.init = 1;
-        s_fbw.after = -1;
-        if (e && sscanf(e, "%u,%u,%u,%u", &s_fbw.x0, &s_fbw.y0,
-                        &s_fbw.ww, &s_fbw.hh) == 4 && s_fbw.ww && s_fbw.hh) {
-            s_fbw.on = 1; s_snap_wanted = 1;
-        }
-    }
+    fb_watch_init();
     if (!s_fbw.on || !s_snap || !s_snap_w || !s_snap_h) return;
     /* A rectangle outside the frame silently disables the whole instrument,
      * and a mistyped one looks exactly like a scene that never changed. Count
@@ -1765,6 +1993,22 @@ static void fb_watch(void)
                         * s_snap_bpp, row);
     ++s_fbw.flips;
 
+    /* The whole-frame copies carry their own geometry check -- see
+     * fb_watch_drop_full -- and the budget is a fraction of a pixel count that
+     * only this geometry knows. */
+    if (s_fbw.still_on) {
+        size_t flen = (size_t)s_snap_w * s_snap_h * s_snap_bpp;
+        if (s_fbw.full_len != flen) {
+            fb_watch_drop_full();
+            s_fbw.full_len = flen;
+            s_fbw.still_outside = (unsigned long)s_snap_w * s_snap_h
+                                - (unsigned long)s_fbw.ww * s_fbw.hh;
+            s_fbw.still_budget = (unsigned long)
+                ((unsigned long long)s_fbw.still_outside
+                 * (unsigned long long)s_fbw.still_ppm / 1000000ULL);
+        }
+    }
+
     for (i = 0; i < FB_WATCH_SLOTS; ++i)
         if (s_fbw.slot[i].valid && s_fbw.slot[i].off == s_snap_offset)
             break;
@@ -1783,6 +2027,8 @@ static void fb_watch(void)
             ++s_fbw.evicted;
             free(s_fbw.slot[0].px);
             s_fbw.slot[0].px = NULL;
+            free(s_fbw.slot[0].full);
+            s_fbw.slot[0].full = NULL;
             s_fbw.slot[0].valid = 0;
         }
         if (!s_fbw.slot[victim].px) {
@@ -1792,25 +2038,52 @@ static void fb_watch(void)
         memcpy(s_fbw.slot[victim].px, s_fbw.cur, len);
         s_fbw.slot[victim].off = s_snap_offset;
         s_fbw.slot[victim].valid = 1;
+        if (s_fbw.still_on) fb_watch_remember_full(victim);
         ++s_fbw.first;
         return;
     }
 
     ++s_fbw.comparisons;
-    if (!memcmp(s_fbw.slot[i].px, s_fbw.cur, len))
+
+    /* WAS THE REST OF THE FRAME STILL? Measured before the region compare,
+     * because that one returns the moment the region is unchanged -- and the
+     * still flips where the region did NOT change are the positive control
+     * for the threshold, so they have to be counted on that path too. */
+    if (s_fbw.still_on) {
+        if (s_fbw.slot[i].full) {
+            outside = fb_watch_outside_diff(s_fbw.slot[i].full);
+            still_known = 1;
+            ++s_fbw.still_cmp;
+            still = outside <= s_fbw.still_budget;
+        }
+        fb_watch_remember_full(i);
+    }
+
+    if (!memcmp(s_fbw.slot[i].px, s_fbw.cur, len)) {
+        if (still_known && still) ++s_fbw.still_quiet;
         return;                 /* this surface is presenting the same picture */
+    }
 
     diff = 0;
     for (p = 0; p < len; p += s_snap_bpp)
         if (memcmp(s_fbw.slot[i].px + p, s_fbw.cur + p, s_snap_bpp)) ++diff;
     ++s_fbw.changes;
+    if (still_known) {
+        fb_watch_note_outside(outside);
+        if (still) ++s_fbw.still_changes; else ++s_fbw.still_moving;
+    }
     /* A whole-region change is the scene moving (gameplay, a fade, a cut) and
      * would print sixty lines a second in a player's log; the defect this
      * hunts is a few glyphs, i.e. a SMALL change. Small changes print, capped;
-     * the rest are counted. */
+     * the rest are counted.
+     *
+     * MEASURED, AND IT IS NOT THE DEFECT: ~100 small changes a minute for a
+     * whole session, all animation. The counters stay so old logs still read
+     * the same way, but with the stillness trigger armed the LINES and the
+     * BMPs belong to it -- see the still block below. */
     if (diff * 4 < s_fbw.ww * s_fbw.hh) {
         ++s_fbw.small;
-        if (s_fbw.printed++ < 2000)
+        if (!s_fbw.still_on && s_fbw.printed++ < 2000)
             fprintf(stderr, "[FB-WATCH] flip %lu t=%.2f region %u,%u %ux%u"
                     " surface 0x%08X CHANGED: %u of %u pixels differ from the"
                     " last frame presented FROM THIS SAME SURFACE"
@@ -1832,19 +2105,41 @@ static void fb_watch(void)
          * them legitimate animation, before the window where the defect was
          * seen. RECOMP_FB_WATCH_AFTER is the wall-clock second to start
          * dumping at. */
-        if (!s_fbw.cap) {
-            const char *e = getenv("RECOMP_FB_WATCH_DUMP");
-            s_fbw.cap = e ? (unsigned)atoi(e) : 0;
-            if (!s_fbw.cap) s_fbw.cap = 1;     /* 1 = disabled sentinel */
-        }
-        if (s_fbw.after < 0) {
-            const char *e = getenv("RECOMP_FB_WATCH_AFTER");
-            s_fbw.after = e ? atoi(e) : 0;
-        }
-        if (s_fbw.cap > 1 && s_fbw.dumped < s_fbw.cap - 1
+        if (!s_fbw.still_on && s_fbw.cap > 1 && s_fbw.dumped < s_fbw.cap - 1
             && trace_seconds() >= (double)s_fbw.after)
             dump_snapshot_bmp("watch", (unsigned)s_fbw.dumped++);
     } else ++s_fbw.big;
+
+    /* THE EVENT THE DEFECT ACTUALLY IS: this region changed and nothing else
+     * did. Independent of the small/large split on purpose -- a glyph drawn
+     * with the wrong texture coordinates can rewrite most of a tight
+     * rectangle, and would be classified "large" and never printed. */
+    if (still_known && still) {
+        if (s_fbw.still_printed++ < 2000)
+            fprintf(stderr, "[FB-WATCH-STILL] flip %lu t=%.2f region %u,%u"
+                    " %ux%u surface 0x%08X CHANGED WHILE THE SCENE WAS STILL:"
+                    " %u of %u pixels in the region differ from the last frame"
+                    " presented FROM THIS SAME SURFACE, while %lu of the %lu"
+                    " pixels outside it did (budget %lu)"
+                    " (still change #%lu, moving so far %lu)\n",
+                    s_fbw.flips, trace_seconds(), s_fbw.x0, s_fbw.y0,
+                    s_fbw.ww, s_fbw.hh, s_snap_offset, diff,
+                    s_fbw.ww * s_fbw.hh, outside, s_fbw.still_outside,
+                    s_fbw.still_budget, s_fbw.still_printed, s_fbw.still_moving);
+        /* THE RECTANGLE, NOT THE WHOLE FRAME. dump_snapshot_bmp writes
+         * s_snap_w x s_snap_h -- 921,654 bytes at 640x480 -- which is what
+         * emptied the budget in thirty seconds the first time round. write_bmp
+         * already takes a sub-rectangle, the watched region at 200x40 is 24 KB,
+         * and it is the only part of the frame this instrument has a claim
+         * about. RECOMP_FB_WATCH_DUMP still caps the series,
+         * RECOMP_FB_WATCH_AFTER still delays it, and the files are stillNNN.bmp
+         * so they cannot be confused with the old watchNNN.bmp series. */
+        if (s_fbw.cap > 1 && s_fbw.still_dumped < s_fbw.cap - 1
+            && trace_seconds() >= (double)s_fbw.after)
+            write_bmp("still", (unsigned)s_fbw.still_dumped++, s_snap,
+                      s_snap_w * s_snap_bpp, s_fbw.x0, s_fbw.y0,
+                      s_fbw.ww, s_fbw.hh, s_snap_bpp);
+    }
 
     memcpy(s_fbw.slot[i].px, s_fbw.cur, len);
 }
@@ -1857,7 +2152,17 @@ static void fb_watch_report(void)
 {
     unsigned i, live = 0;
 
-    if (!s_fbw.on) return;
+    fb_watch_init();
+    if (!s_fbw.on) {
+        /* Armed the trigger, named no rectangle. Saying nothing here would
+         * read as "RECOMP_FB_WATCH_STILL was not set", which is the one
+         * mistake this instrument's whole comment block is about. */
+        if (s_fbw.still_on)
+            fprintf(stderr, "[FB-WATCH-STILL] armed nothing:"
+                    " RECOMP_FB_WATCH_STILL is set but RECOMP_FB_WATCH named no"
+                    " rectangle -- set RECOMP_FB_WATCH=x,y,w,h\n");
+        return;
+    }
     for (i = 0; i < FB_WATCH_SLOTS; ++i)
         if (s_fbw.slot[i].valid) ++live;
     fprintf(stderr,
@@ -1873,6 +2178,26 @@ static void fb_watch_report(void)
             s_fbw.flips, live, s_fbw.first, s_fbw.stale,
             s_fbw.oob, s_snap_w, s_snap_h,
             s_fbw.evicted, s_fbw.printed, s_fbw.dumped);
+    if (!s_fbw.still_on) return;
+    /* comparisons= is this line's positive control, exactly as on the line
+     * above: 0 means the trigger was armed and never got to look. still= is
+     * the new count, and everything after the second bar is what says whether
+     * the threshold is worth trusting before anyone spends a BMP on it. */
+    fprintf(stderr,
+            "[FB-WATCH-STILL] region %u,%u %ux%u, the scene outside it held"
+            " still: comparisons=%lu still=%lu moving=%lu quiet=%lu |"
+            " ppm=%lu budget=%lu of %lu pixels outside the rectangle |"
+            " min_outside=%ld | outside-diff over region changes:"
+            " zero=%lu within_budget=%lu upto10x=%lu upto100x=%lu more=%lu |"
+            " lines=%lu dumps=%lu still*.bmp\n",
+            s_fbw.x0, s_fbw.y0, s_fbw.ww, s_fbw.hh,
+            s_fbw.still_cmp, s_fbw.still_changes, s_fbw.still_moving,
+            s_fbw.still_quiet, s_fbw.still_ppm, s_fbw.still_budget,
+            s_fbw.still_outside,
+            s_fbw.still_min_seen ? (long)s_fbw.still_min : -1L,
+            s_fbw.still_bucket[0], s_fbw.still_bucket[1], s_fbw.still_bucket[2],
+            s_fbw.still_bucket[3], s_fbw.still_bucket[4],
+            s_fbw.still_printed, s_fbw.still_dumped);
 }
 
 static void write_bmp(const char *tag, unsigned seq,

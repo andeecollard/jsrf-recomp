@@ -186,6 +186,12 @@ SWITCH_TOKEN = {
     # actually see it -- unlike defer_swap, which the old hardcoded regex
     # could not, so its A/B ran with the VOID check skipped.
     "RECOMP_METAL_NO_DEPTH_SYNC":  "no_depth_sync",
+    # G3's colour question, 18 Sep -- the same question no_depth_sync asked of
+    # depth and won 9.1% with. Printed unconditionally on the [METAL] colour
+    # write-back line, so the OFF arm has a token to differ from; the token is
+    # `no_colour_sync`, which is not a substring of `no_depth_sync`, so
+    # switch_state_for's `token in clause` cannot confuse the two.
+    "RECOMP_METAL_NO_COLOUR_SYNC": "no_colour_sync",
 }
 
 

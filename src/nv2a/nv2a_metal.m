@@ -1819,6 +1819,85 @@ static uint64_t g_depth_syncs_skipped, g_depth_syncs_taken;
 /* Deferrals that only happened because the depth write-back is off. */
 static uint64_t g_swap_deferred_no_depth;
 
+/* G3: AND IS THE COLOUR WRITE-BACK BUYING ANYTHING?
+ *
+ * RECOMP_METAL_NO_COLOUR_SYNC=1, default OFF, diagnostic in exactly the sense
+ * RECOMP_METAL_HW_NO_STENCIL and RECOMP_METAL_NO_DEPTH_SYNC above are: a path
+ * that never returns colour to guest RAM is wrong by construction IF anything
+ * reads it, and the only cheap way to learn whether anything does is to stop
+ * writing it and look.
+ *
+ * WHY THIS IS THE NEXT QUESTION AFTER DEPTH. no_depth_sync asked it of depth
+ * and won 9.1% of the frame -- ~27,000 write-backs skipped per 160 s run, no
+ * crash, eight usable runs with non-overlapping ranges. The same 160 s run
+ * says where what is left of sync's time goes:
+ *
+ *     sync 38089 calls (12696 already clean): 83847.0 ms draining the GPU,
+ *                                             22728.8 ms reading back
+ *
+ * The swap drain is 79% of it, and it is SCENE-driven rather than thermal: a
+ * 1,523 s session at constant workload held frame time and drain-per-call flat
+ * to within 2%, so it is a cost the WORK is paying and not the machine giving
+ * up. Colour is the only remaining thing the swap writes back.
+ *
+ * THERE IS OUTSIDE EVIDENCE THE ANSWER CAN BE "NOTHING READS IT". Microsoft's
+ * own Xbox backward-compatibility packages ship a per-title switch granting
+ * permission to elide resolves -- `xoallowtitletoskipresolves`. Same cost,
+ * same question, and decided PER TITLE, which is the shape of an answer that
+ * is a property of the game rather than of the hardware. It is a reason to
+ * ask; it is not an answer for this title.
+ *
+ * WHAT IS ACTUALLY SKIPPED. The two per-pixel conversion loops and the row
+ * copies, and -- when nothing else wants the pixels -- the 4.9 MB getBytes
+ * that feeds them. The DRAIN above is NOT removed directly: it is paid before
+ * the dirty flags are examined, as it must be while anything might still be
+ * read back. It comes off indirectly, exactly the way depth's did: clearing
+ * surface_dirty without paying it lets every later sync that has no new draw
+ * behind it take the `!surface_dirty && !depth_dirty` early return, which is
+ * the one path in this function that skips the wait.
+ *
+ * COUNTED IN BOTH ARMS, which is the property that decides whether the A/B is
+ * worth taking at all. With the switch OFF, g_color_syncs_taken IS the number
+ * of write-backs the ON arm would have skipped; with it on,
+ * g_color_syncs_skipped is the number it did. So either arm's report sizes the
+ * question on its own, before a single paired run is spent on it -- and if the
+ * taken count in a control run came back small, the honest move is to not run
+ * the A/B at all.
+ *
+ * THE HONEST LIMIT, and it is the same one no_depth_sync carries: "IT RAN AND
+ * PRESENTED" IS NOT "IT RENDERED CORRECTLY". Neither instrument that would
+ * have to notice can see a colour-dependent artifact. d3d8_gl.c's blit check
+ * samples ONE pixel -- the drawable centre against the guest's centre pixel --
+ * and [FB] is a SUM over the framebuffer, which cancels as readily as it
+ * differs. Neither can see mid-frame content that depended on the previous
+ * frame's colour having reached guest RAM: a motion trail, a feedback blur, a
+ * flare composited from the last frame, anything read back as a texture. A
+ * green report from those two means "nothing crashed and the centre pixel
+ * agreed", and that is the whole of what it means.
+ *
+ * So this stays default OFF until a player has LOOKED at a session with it on.
+ * That is not caution for its own sake: this tree has shipped two switches on
+ * test evidence without a look and backed both out, and no_depth_sync only
+ * became a default because it had a picture behind it as well as eight runs.
+ *
+ * Grammar note: recomp_switch_on(), so "0" and empty are off and "1", "on",
+ * "yes" are on -- the one grammar stated in recomp_switch.h, not a fourth
+ * hand-rolled getenv. */
+static int no_colour_sync_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_NO_COLOUR_SYNC");
+    return on;
+}
+/* Both arms, so the OFF arm still reports the size of the ON arm's saving.
+ * g_color_readbacks_elided is the narrower fact: syncs where the skip also
+ * removed the 4.9 MB getBytes, because no depth write-back wanted the alpha
+ * out of the same buffer. Separate because "skipped the loop" and "skipped
+ * the copy" are different amounts of time and a reader must not have to guess
+ * which one a number describes. */
+static uint64_t g_color_syncs_skipped, g_color_syncs_taken;
+static uint64_t g_color_readbacks_elided;
+
 /* ELEVEN, and it was nine. The key has to name every field the descriptor
  * below reads, or the cache serves a state built for a different draw.
  * stencil_zfail feeds depthFailureOperation and stencil_func_mask feeds
@@ -2455,6 +2534,21 @@ void nv2a_metal_report(void)
             (unsigned long long)g_depth_syncs_taken,
             (unsigned long long)g_depth_syncs_skipped,
             no_depth_sync_on()?"on":"OFF");
+    /* THE SAME SHAPE, AND THE SAME REASON FOR THE SHAPE. Printed in BOTH
+     * states: with no_colour_sync OFF the `taken` count is precisely what the
+     * other arm would skip, so one control run sizes the A/B before it is
+     * run. The token is unconditional so ab_score.py's generic METAL_SWITCH_RE
+     * can harvest it and the identical-arms VOID check can actually run --
+     * defer_swap's A/B was scored with that check silently skipped because its
+     * token was invisible to the regex of the day. */
+    fprintf(stderr,"[METAL] colour write-backs: %llu taken, %llu skipped"
+            " (of which %llu also elided the 4.9 MB read-back, the rest still"
+            " owing it to the depth path's alpha) (no_colour_sync %s)."
+            "  With it OFF, taken IS what the other arm would skip.\n",
+            (unsigned long long)g_color_syncs_taken,
+            (unsigned long long)g_color_syncs_skipped,
+            (unsigned long long)g_color_readbacks_elided,
+            no_colour_sync_on()?"on":"OFF");
     fprintf(stderr,"[METAL] swap writeback deferred: %llu (of which %llu only"
             " because depth is not written back at all) (refused: %llu depth"
             " dirty, %llu no slot) (defer_swap %s)\n",
@@ -2769,23 +2863,53 @@ int nv2a_metal_sync(void)
         if(last_command.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[METAL] command failed: %s\n",last_command.error.description.UTF8String);return 0;}
         size_t pixels=(size_t)surface_width*surface_height;
         int fmt565=hw_565_on();
+        /* RECOMP_METAL_NO_COLOUR_SYNC -- see the header comment on
+         * no_colour_sync_on. Resolved ONCE, here, rather than at each of the
+         * three places below that need it: the branches must agree about
+         * whether this sync is writing colour back, and re-asking a predicate
+         * per branch is how a skip that clears the dirty flag ends up paired
+         * with a read-back that still ran.
+         *
+         * WHAT STILL NEEDS THE PIXELS WHEN COLOUR DOES NOT. On the software
+         * tail depth lives in the colour attachment's ALPHA, so the depth
+         * write-back below reads rgba[at+3] out of this same buffer. Eliding
+         * the getBytes while that branch is live would hand it uninitialised
+         * heap and write it into the guest's D24S8 surface -- a corruption
+         * with no symptom here at all, since this function would still return
+         * 1. So the elision asks for the state of the depth path rather than
+         * assuming it: hardware depth reads its own texture and wants nothing
+         * from here, and a skipped depth write-back reads nothing at all. */
+        int skip_color=surface_dirty&&no_colour_sync_on();
+        int alpha_depth=depth_dirty&&depth_target&&!no_depth_sync_on()
+                        &&!(hw_state_on()&&hw_depth_tex);
+        int want_pixels=(surface_dirty&&!skip_color)||alpha_depth;
         /* SIZED FOR THE FORMAT. This allocated pixels*16 unconditionally, so a
          * 565 run asked for 4.9 MB per sync and used 614 KB of it -- a malloc,
          * a page-fault storm and a free, once a frame, for nothing. */
-        float *rgba=malloc(pixels*(fmt565?2:16));
-        if(!rgba)return 0;
-        [surface getBytes:rgba bytesPerRow:surface_width*(fmt565?2:16) fromRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0];
-        if(surface_dirty&&fmt565) {
+        float *rgba=NULL;
+        if(want_pixels) {
+            rgba=malloc(pixels*(fmt565?2:16));
+            if(!rgba)return 0;
+            [surface getBytes:rgba bytesPerRow:surface_width*(fmt565?2:16) fromRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0];
+        } else if(skip_color) ++g_color_readbacks_elided;
+        if(skip_color) {
+            /* Counted, and the flag is cleared -- the same pair no_depth_sync
+             * needs. Leaving surface_dirty set would make the next sync try
+             * again, so the switch would measure nothing and the frame would
+             * still pay for the write-back at the next opportunity. */
+            ++g_color_syncs_skipped;
+            surface_dirty=0;
+        } else if(surface_dirty&&fmt565) {
             /* Straight back out, no conversion and no rounding -- which is the
              * whole point: a wider attachment has to round twice, here and
              * again at the 565 grid. */
-            ++sync_color;
+            ++sync_color; ++g_color_syncs_taken;
             const uint16_t*w16=(const uint16_t*)rgba;
             for(unsigned y=0;y<surface_height;++y)
                 memcpy(surface_target+(size_t)y*surface_pitch,w16+(size_t)y*surface_width,(size_t)surface_width*2);
             surface_dirty=0;
         } else if(surface_dirty) {
-            ++sync_color;
+            ++sync_color; ++g_color_syncs_taken;
             for(unsigned y=0;y<surface_height;++y) for(unsigned x=0;x<surface_width;++x) {
                 size_t at=((size_t)y*surface_width+x)*4;
                 unsigned c=(unsigned)(fminf(1,fmaxf(0,rgba[at]))*31+.5f)<<11|(unsigned)(fminf(1,fmaxf(0,rgba[at+1]))*63+.5f)<<5|(unsigned)(fminf(1,fmaxf(0,rgba[at+2]))*31+.5f);
@@ -2807,7 +2931,13 @@ int nv2a_metal_sync(void)
             ++sync_depth; ++g_depth_syncs_taken;
             hw_depth_readback(depth_target,surface_width,surface_height,depth_pitch);
             depth_dirty=0;
-        } else if(depth_dirty&&depth_target) {
+        } else if(depth_dirty&&depth_target&&rgba) {
+            /* `&&rgba` states the invariant `alpha_depth` was computed from --
+             * this is the one branch that reads depth out of the colour
+             * buffer's alpha, so it is the one branch that keeps the getBytes
+             * alive. The two must agree, and if they ever stop agreeing the
+             * failure is a retry on the next sync (depth_dirty stays set)
+             * rather than a D24S8 surface written from uninitialised heap. */
             ++sync_depth; ++g_depth_syncs_taken;
             uint8_t *stencil=malloc(pixels);
             if(!stencil){free(rgba);return 0;}

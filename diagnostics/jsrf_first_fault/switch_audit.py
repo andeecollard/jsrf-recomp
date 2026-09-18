@@ -103,6 +103,11 @@ VALUE_CARRYING = {
     # compile-time constant relative to the working directory, which a
     # GUI-launched .app cannot write -- 91 silent fopen failures per session.
     "RECOMP_ICALL_FEEDBACK_PATH",
+    # A parts-per-million threshold deciding when the frame outside the watch
+    # rectangle counts as "still", so the glyph trap can fire on "changed while
+    # the scene was static" instead of "changed a little" -- the latter fires
+    # ~100 times a minute and is ordinary animation.
+    "RECOMP_FB_WATCH_STILL_PPM",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING
@@ -140,15 +145,38 @@ for name in sorted(default_on):
         problems += 1
 
 # Rule 3
+#
+# SCOPE. This rule asks a different question from the ratchet above and needs a
+# wider answer. The ratchet is about discipline in src/ -- the runtime the guest
+# executes against. Rule 3 asks only "does this paths.conf line do ANYTHING",
+# and a switch the HARNESS reads is not dead: paths.conf feeds the launcher,
+# which feeds the harness as much as the runtime.
+#
+# Scanning diagnostics/ for the ratchet would be wrong -- it would sweep the
+# harness's own hand-rolled getenvs into a baseline meant to police src/ -- so
+# the wider scan is used for this rule and nothing else.
+#
+# Found the hard way: RECOMP_GUEST_NAMES was added on 18 Sep 2026, is read in
+# diagnostics/jsrf_first_fault/guest_names.c, and was reported DEAD.
+harness = os.path.join(root, "diagnostics")
+harness_text = ""
+for dirpath, _, names in os.walk(harness):
+    for n in names:
+        if n.endswith((".c", ".m", ".h")):
+            harness_text += open(os.path.join(dirpath, n), errors="ignore").read()
+
 conf = os.path.expanduser("~/Library/Application Support/JSRF/paths.conf")
 if os.path.exists(conf):
     known = set(helper) | set(handrolled)
     for line in open(conf, errors="ignore"):
         m = re.match(r'\s*export\s+(RECOMP_[A-Z0-9_]+)=', line)
-        if m and m.group(1) not in known:
-            print("DEAD: %s is exported by paths.conf and read nowhere in src/"
-                  % m.group(1))
-            problems += 1
+        if not m or m.group(1) in known:
+            continue
+        if ('"%s"' % m.group(1)) in harness_text:
+            continue                 # read by the harness: not dead
+        print("DEAD: %s is exported by paths.conf and read nowhere in "
+              "src/ or diagnostics/" % m.group(1))
+        problems += 1
 
 print("switch audit: %d switches (%d via the helper, %d hand-rolled, "
       "%d default-on), %d problem(s)"
