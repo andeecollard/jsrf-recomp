@@ -2066,27 +2066,51 @@ class Lifter:
                 % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
                 self._result_snapshot(ops, "adc")]
 
-    def _lift_shld(self, insn, ops):
-        """SHLD: double-precision shift left."""
+    def _lift_double_shift(self, insn, ops, m):
+        """SHLD/SHRD, with x86's count rules rather than C's.
+
+        Two defects, both live: JSRF runs `shrd eax, edx, cl` twice in its own
+        text section, and cl is a RUNTIME count.
+
+        THE COUNT IS MASKED TO FIVE BITS by the hardware, and was not here.
+        _lift_shift already states the rule for shl/shr/sar -- "C leaves a
+        shift of 32 or more UNDEFINED, and the compiler is entitled to assume
+        it never happens" -- and the double-precision pair never got it.
+
+        A COUNT OF ZERO IS A NO-OP ON x86, and was the worse half. The old
+        expression built `src >> (32 - cnt)`, so cnt == 0 shifted by 32: C
+        calls that undefined, and on this target the variable shift takes the
+        amount modulo 32, so it shifts by 0 and returns src whole. The write
+        came out `dst | src` where the instruction should have changed
+        nothing at all.
+
+        Masked to 1..31 the complement is 31..1, so nothing here can shift by
+        the width again. The 16-bit form additionally refuses counts above
+        15, which Intel leaves undefined -- the point is to keep C defined,
+        not to invent an answer.
+
+        The flag snapshot moves inside the guard on purpose: x86 leaves the
+        flags alone when the count is zero, so leaving `_fa` holding the
+        previous setter's result is exactly right.
+        """
         if len(ops) < 3:
-            return [f"/* shld: bad operands */"]
+            return [f"/* {m}: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
         cnt = _fmt_operand_read(ops[2])
-        return [_fmt_operand_write(ops[0],
-            f"({dst} << {cnt}) | ({src} >> (32 - {cnt}))") + " /* shld */",
-            self._result_snapshot(ops, "shld")]
+        w = (_operand_width(ops[0]) or 4) * 8
+        expr = (f"({dst} << _c) | ({src} >> ({w} - _c))" if m == "shld"
+                else f"({dst} >> _c) | ({src} << ({w} - _c))")
+        return ["{ uint32_t _c = (uint32_t)(%s) & 31u; if (_c && _c < %uu) {"
+                " %s %s } }  /* %s */"
+                % (cnt, w, _fmt_operand_write(ops[0], expr),
+                   self._result_snapshot(ops, m), m)]
+
+    def _lift_shld(self, insn, ops):
+        return self._lift_double_shift(insn, ops, "shld")
 
     def _lift_shrd(self, insn, ops):
-        """SHRD: double-precision shift right."""
-        if len(ops) < 3:
-            return [f"/* shrd: bad operands */"]
-        dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
-        cnt = _fmt_operand_read(ops[2])
-        return [_fmt_operand_write(ops[0],
-            f"({dst} >> {cnt}) | ({src} << (32 - {cnt}))") + " /* shrd */",
-            self._result_snapshot(ops, "shrd")]
+        return self._lift_double_shift(insn, ops, "shrd")
 
     def _lift_imul(self, insn, ops):
         nops = len(ops)
