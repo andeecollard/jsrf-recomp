@@ -3973,7 +3973,7 @@ static unsigned voice_rate_rows(void)
 
 void mcpx_apu_voice_rate_report(void)
 {
-    unsigned v, shown = 0, any = 0, eligible = 0;
+    unsigned v, shown = 0, any = 0, eligible = 0, hidden_2d = 0, seen = 0;
     const unsigned rows = voice_rate_rows();
     unsigned long tot = 0, tot_off = 0;
     if (!voice_rate_on()) return;
@@ -3982,7 +3982,13 @@ void mcpx_apu_voice_rate_report(void)
         tot += g_voice_rate[v].frames;
         tot_off += g_voice_rate[v].off_frames;
         if (g_voice_rate[v].off_frames) any++;
-        if (g_voice_rate[v].frames) eligible++;
+        if (g_voice_rate[v].frames) {
+            eligible++;
+            /* Would this row be reached before the budget ran out? The print
+             * loop below scans the same order, so counting it here is the
+             * same selection. */
+            if (seen++ >= rows && v >= MCPX_HW_MAX_3D_VOICES) hidden_2d++;
+        }
     }
     /* eligible/rows is the positive control the table never had. A row that is
      * absent because its voice never ran and a row that is absent because
@@ -4001,6 +4007,19 @@ void mcpx_apu_voice_rate_report(void)
                   " ever processed, not the active ones."
                   " RECOMP_VOICE_RATES_ROWS raises the cap"
                 : "");
+    /* AND NAME IT WHEN THE HIDDEN ROWS ARE THE 2D BIN, because that is the
+     * music and that is what G1 is about. 2D voices are handles at or above
+     * MCPX_HW_MAX_3D_VOICES (64) and this table scans upward from 0, so every
+     * 3D voice that has ever run takes a slot ahead of them. In a session that
+     * has touched all 64, nothing below RECOMP_VOICE_RATES_ROWS=65 can show a
+     * single 2D voice -- and "the music is voices 64-67" was read off an early
+     * report, before the 3D voices had crowded them out. */
+    if (hidden_2d)
+        fprintf(stderr, "  [VOICE-RATE] %u of the hidden voice(s) are 2D"
+                " (handle >= %u) -- THAT IS THE BIN THE MUSIC IS IN. Set"
+                " RECOMP_VOICE_RATES_ROWS=%u to see the whole pool.\n",
+                hidden_2d, (unsigned)MCPX_HW_MAX_3D_VOICES,
+                (unsigned)MCPX_HW_MAX_VOICES);
     for (v = 0; v < MCPX_HW_MAX_VOICES && shown < rows; v++) {
         const VoiceRate *r = &g_voice_rate[v];
         if (!r->frames) continue;
