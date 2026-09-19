@@ -662,9 +662,21 @@ static struct {
  *
  * Deliberately not trace_seconds(): several unit tests link this
  * translation unit without the platform library, and referencing it there
- * costs a link error for a diagnostic none of them enable. The origin is the
- * first traced write, which the guest issues during D3D initialisation, so
- * this reads within a millisecond of the [FB] timeline it is compared against. */
+ * costs a link error for a diagnostic none of them enable.
+ *
+ * THE ORIGIN IS THE FIRST CALL, WHICH IS NOT THE START OF THE RUN. The
+ * comment here used to claim the origin was "the first traced write, which
+ * the guest issues during D3D initialisation" -- true only when some trace
+ * that fires during init is armed. Arm only a late-firing one and the origin
+ * slides to wherever that first fires. On 19 Sep 2026 the only armed consumer
+ * was the glyph trap, its first event was flip 2429, and t started at 0.00
+ * there -- so RECOMP_FB_WATCH_AFTER=10, documented as a wall-clock second,
+ * silently discarded the first 88 of 110 captures.
+ *
+ * fb_watch_init() now primes it on the first flip, which happens long before
+ * any trap can fire, so `after` is measured from a point that does not depend
+ * on which switches are set. Anything else that wants a run-start origin
+ * should prime it the same way rather than assuming it is already set. */
 static double trace_seconds(void)
 {
     static struct timespec origin;
@@ -1829,6 +1841,12 @@ static struct {
     int           still_min_seen;
     unsigned long still_bucket[FB_WATCH_STILL_BUCKETS];
     unsigned long still_printed, still_dumped;
+    /* Region changes that qualified but were thrown away because
+     * trace_seconds() had not yet reached `after`. On 19 Sep 2026 this was 88
+     * of 110 and the log said nothing at all: `still=110 ... dumps=22` reads
+     * as a dump cap, and the cap was 149. Count them, or AFTER is a silent
+     * filter on the evidence. */
+    unsigned long still_too_early;
 } s_fbw;
 
 static void fb_watch_drop_slots(void)
@@ -1872,6 +1890,11 @@ static void fb_watch_init(void)
 
     if (s_fbw.init) return;
     s_fbw.init = 1;
+    /* Pin the trace clock's origin here, on the first flip, BEFORE any trap
+     * can fire. RECOMP_FB_WATCH_AFTER is measured against it, and a clock
+     * whose zero is "whenever the first trap happened to fire" makes AFTER
+     * mean something different in every run. See trace_seconds(). */
+    (void)trace_seconds();
     s_fbw.still_ppm = FB_WATCH_STILL_PPM_DEFAULT;
 
     e = getenv("RECOMP_FB_WATCH");
@@ -2175,11 +2198,14 @@ static void fb_watch(void)
          * about. RECOMP_FB_WATCH_DUMP still caps the series,
          * RECOMP_FB_WATCH_AFTER still delays it, and the files are stillNNN.bmp
          * so they cannot be confused with the old watchNNN.bmp series. */
-        if (s_fbw.cap > 1 && s_fbw.still_dumped < s_fbw.cap - 1
-            && trace_seconds() >= (double)s_fbw.after)
-            write_bmp("still", (unsigned)s_fbw.still_dumped++, s_snap,
-                      s_snap_w * s_snap_bpp, s_fbw.x0, s_fbw.y0,
-                      s_fbw.ww, s_fbw.hh, s_snap_bpp);
+        if (s_fbw.cap > 1 && s_fbw.still_dumped < s_fbw.cap - 1) {
+            if (trace_seconds() >= (double)s_fbw.after)
+                write_bmp("still", (unsigned)s_fbw.still_dumped++, s_snap,
+                          s_snap_w * s_snap_bpp, s_fbw.x0, s_fbw.y0,
+                          s_fbw.ww, s_fbw.hh, s_snap_bpp);
+            else
+                ++s_fbw.still_too_early;
+        }
     }
 
     memcpy(s_fbw.slot[i].px, s_fbw.cur, len);
@@ -2239,6 +2265,15 @@ static void fb_watch_report(void)
             s_fbw.still_bucket[0], s_fbw.still_bucket[1], s_fbw.still_bucket[2],
             s_fbw.still_bucket[3], s_fbw.still_bucket[4],
             s_fbw.still_printed, s_fbw.still_dumped);
+    /* Only when it bit, so a run that never hit the gate stays as quiet as it
+     * was before. dumps= alone cannot distinguish "the cap ran out" from "the
+     * clock had not got there yet", and those want opposite fixes. */
+    if (s_fbw.still_too_early)
+        fprintf(stderr, "  [FB-WATCH-STILL] discarded_before_after=%lu of %lu"
+                " still change(s) DISCARDED UNDUMPED: trace_seconds() had not"
+                " reached RECOMP_FB_WATCH_AFTER=%ds. dumps= is not the whole"
+                " story; lower AFTER to keep them.\n",
+                s_fbw.still_too_early, s_fbw.still_changes, s_fbw.after);
 }
 
 static void write_bmp(const char *tag, unsigned seq,

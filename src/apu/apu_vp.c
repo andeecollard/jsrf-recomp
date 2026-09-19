@@ -1742,7 +1742,9 @@ void mcpx_apu_voice_report(void)
             {
                 extern unsigned long g_adpcm_fail_page0, g_adpcm_fail_pagehi;
                 extern uint32_t g_adpcm_first_fail_blk[];
-                unsigned vv, shown = 0;
+                unsigned vv, shown = 0, failing = 0;
+                for (vv = 0; vv < MCPX_HW_MAX_VOICES; ++vv)
+                    if (g_adpcm_first_fail_blk[vv]) ++failing;
                 fprintf(stderr, "  [APU-ADPCM-PAGE] page0=%lu pagehi=%lu |"
                         " lowest failing block per voice:",
                         g_adpcm_fail_page0, g_adpcm_fail_pagehi);
@@ -1751,6 +1753,12 @@ void mcpx_apu_voice_report(void)
                         fprintf(stderr, " v%u:%u", vv, g_adpcm_first_fail_blk[vv]);
                         ++shown;
                     }
+                /* Same trap as the VOICE-RATE table: this lists the eight
+                 * LOWEST-numbered failing voices, so a truncated list reads
+                 * exactly like a short one. Say how many were left out. */
+                if (failing > shown)
+                    fprintf(stderr, " ...and %u more failing voice(s) not shown",
+                            failing - shown);
                 fprintf(stderr, " (113 = 4096/36, one page of blocks)\n");
             }
         }
@@ -3929,9 +3937,44 @@ static double voice_fresh_window_s(void)
 
 static double g_voice_fresh_window_s = 1.0;
 
+/* How many per-voice rows the report prints, of MCPX_HW_MAX_VOICES.
+ *
+ * THIS CAP IS WHY THE TABLE LIED FOR A WEEK, so it is a switch now and it
+ * reports what it suppressed. The rows are chosen by scanning v upward and
+ * taking the first `rows` voices with frames != 0 -- and `frames` is
+ * CUMULATIVE for the life of the process, never reset. So once `rows` voices
+ * have each been processed even once, those same voices hold every slot for
+ * the rest of the run and no higher-numbered voice can ever appear again.
+ *
+ * The 19 Sep 2026 black-screen run reports on=160 voices started, of 256, and
+ * printed twelve -- voices 0-11, from the first report to the last. Voices
+ * 64-67 appear only in the early reports and were read as "retired"; they were
+ * not, they were crowded out. Eleven of the twelve shown do stop being
+ * processed, at staggered times, and that is real -- but "the music stopped"
+ * was never measurable here, because the music could have moved to any of the
+ * other 244 rows the table had already become incapable of printing.
+ *
+ * Default 12 so logs stay comparable with every run taken before this. Raise
+ * it when the question is about the pool rather than about voices 0-11. */
+#define VOICE_RATE_ROWS_DEFAULT 12u
+
+static unsigned voice_rate_rows(void)
+{
+    static unsigned rows;
+    if (!rows) {
+        const char *e = getenv("RECOMP_VOICE_RATES_ROWS");
+        long n = e ? strtol(e, NULL, 0) : 0;
+        if (n <= 0) n = VOICE_RATE_ROWS_DEFAULT;
+        if (n > MCPX_HW_MAX_VOICES) n = MCPX_HW_MAX_VOICES;
+        rows = (unsigned)n;
+    }
+    return rows;
+}
+
 void mcpx_apu_voice_rate_report(void)
 {
-    unsigned v, shown = 0, any = 0;
+    unsigned v, shown = 0, any = 0, eligible = 0;
+    const unsigned rows = voice_rate_rows();
     unsigned long tot = 0, tot_off = 0;
     if (!voice_rate_on()) return;
     g_voice_fresh_window_s = voice_fresh_window_s();
@@ -3939,12 +3982,26 @@ void mcpx_apu_voice_rate_report(void)
         tot += g_voice_rate[v].frames;
         tot_off += g_voice_rate[v].off_frames;
         if (g_voice_rate[v].off_frames) any++;
+        if (g_voice_rate[v].frames) eligible++;
     }
+    /* eligible/rows is the positive control the table never had. A row that is
+     * absent because its voice never ran and a row that is absent because
+     * twelve lower-numbered voices got there first read identically, and the
+     * second kind is the one that misleads. Say which. */
     fprintf(stderr, "  [VOICE-RATE] %lu voice-frames, %lu needing resampling "
             "(%.2f%%), %u voice(s) affected%s\n",
             tot, tot_off, tot ? 100.0 * (double)tot_off / (double)tot : 0.0, any,
             tot ? "" : "   <- NO VOICE FRAMES: nothing is being processed");
-    for (v = 0; v < MCPX_HW_MAX_VOICES && shown < 12; v++) {
+    fprintf(stderr, "  [VOICE-RATE] showing %u of %u voice(s) with frames, of"
+            " %u in the pool%s\n",
+            eligible < rows ? eligible : rows, eligible,
+            (unsigned)MCPX_HW_MAX_VOICES,
+            eligible > rows
+                ? "   <- ROWS SUPPRESSED: rows are the LOWEST-numbered voices"
+                  " ever processed, not the active ones."
+                  " RECOMP_VOICE_RATES_ROWS raises the cap"
+                : "");
+    for (v = 0; v < MCPX_HW_MAX_VOICES && shown < rows; v++) {
         const VoiceRate *r = &g_voice_rate[v];
         if (!r->frames) continue;
         shown++;

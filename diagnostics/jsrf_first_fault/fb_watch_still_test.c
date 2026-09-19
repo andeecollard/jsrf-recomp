@@ -365,6 +365,36 @@ int main(int argc, char **argv)
     check("still count", kv(l, " still="), 3);
     check("moving count", kv(l, " moving="), 1);
 
+    /* 6b. RECOMP_FB_WATCH_AFTER IS A FILTER ON THE EVIDENCE, AND IT MUST SAY
+     *     SO. On 19 Sep 2026 a session logged `still=110 ... dumps=22` with a
+     *     dump cap of 149, and the missing 88 were not capped -- they were
+     *     thrown away because trace_seconds() had not reached AFTER=10 yet.
+     *     Nothing in the log said that, and "dumps=22 of cap 149" reads as
+     *     "the trap only found 22". The two want opposite fixes, so the
+     *     report has to distinguish them.
+     *
+     *     No RECOMP_FB_DUMP here on purpose: write_bmp no-ops without a path
+     *     prefix, so the accounting is exercised and no files are written. */
+    printf("scenario, DUMP armed and AFTER unreachable:\n");
+    run(WATCH STILL "RECOMP_FB_WATCH_DUMP=150 RECOMP_FB_WATCH_AFTER=100000 ",
+        "scenario", exe);
+    l = line("[FB-WATCH-STILL] region");
+    check("still changes still counted", kv(l, " still="), 2);
+    check("nothing was dumped", kv(l, " dumps="), 0);
+    check("the discard is reported",
+          line("DISCARDED UNDUMPED") != NULL, 1);
+    check("and it accounts for every one of them",
+          kv(line("discarded_before_after="), "discarded_before_after="), 2);
+
+    /*     ...and with AFTER reachable the extra line must stay away, so a run
+     *     that never hits the gate reads exactly as it did before. */
+    printf("scenario, DUMP armed and AFTER=0:\n");
+    run(WATCH STILL "RECOMP_FB_WATCH_DUMP=150 RECOMP_FB_WATCH_AFTER=0 ",
+        "scenario", exe);
+    l = line("[FB-WATCH-STILL] region");
+    check("dumps happened", kv(l, " dumps="), 2);
+    check("no discard line", line("discarded_before_after=") != NULL, 0);
+
     /* 7. THE SWITCH GRAMMAR. recomp_switch_on() means "=0" is off, and off
      *    means the instrument behaves exactly as it did before this change --
      *    including printing its small-change lines. */

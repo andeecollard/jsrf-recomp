@@ -108,6 +108,14 @@ VALUE_CARRYING = {
     # the scene was static" instead of "changed a little" -- the latter fires
     # ~100 times a minute and is ordinary animation.
     "RECOMP_FB_WATCH_STILL_PPM",
+    # How many per-voice rows [VOICE-RATE] prints, of the 256-voice pool. The
+    # cap was a hardcoded 12 and the rows are the LOWEST-numbered voices ever
+    # processed, chosen against a counter that is never reset -- so after
+    # twelve low voices have run once they hold every slot for the rest of the
+    # run. A 19 Sep 2026 session reporting on=160 printed voices 0-11 from the
+    # first report to the last, and "voices 64-67 were retired" was read off
+    # rows that had merely been crowded out.
+    "RECOMP_VOICE_RATES_ROWS",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING
