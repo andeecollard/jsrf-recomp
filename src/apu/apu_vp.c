@@ -1742,15 +1742,42 @@ void mcpx_apu_voice_report(void)
             {
                 extern unsigned long g_adpcm_fail_page0, g_adpcm_fail_pagehi;
                 extern uint32_t g_adpcm_first_fail_blk[];
+                extern uint32_t g_adpcm_fail_nblocks_v[];
                 unsigned vv, shown = 0, failing = 0;
+                /* THE GAP IS THE FINDING, so the line computes it.
+                 *
+                 * Measured on the 19 Sep 2026 black-screen run, by hand, off
+                 * a log that did not print the buffer size: every voice
+                 * starts failing EXACTLY 11 blocks before the end of its
+                 * buffer -- v0 208/219, v1 126/137, v2 182/193, v3 190/201,
+                 * v5 159/170, v6 181/192, v7 144/155. Seven voices, buffers
+                 * from 137 to 219 blocks, the same 11 every time.
+                 *
+                 * A constant DIFFERENCE is not a stride error, which would
+                 * leave a constant ratio, and 11 is not a page of blocks
+                 * (113) -- so it is neither of the two theories this defect
+                 * has already buried. It is a fixed over-read: the fetch
+                 * runs off the end of the data by a constant amount, which
+                 * is why block 0 always decodes and only the tail turns into
+                 * 0x08080808.
+                 *
+                 * None of that was visible, because the line printed the
+                 * failing block and not the buffer it was in. It prints both
+                 * now, and the gap, so the next run reads the constant off
+                 * the log instead of rediscovering it. */
                 for (vv = 0; vv < MCPX_HW_MAX_VOICES; ++vv)
                     if (g_adpcm_first_fail_blk[vv]) ++failing;
                 fprintf(stderr, "  [APU-ADPCM-PAGE] page0=%lu pagehi=%lu |"
                         " lowest failing block per voice:",
                         g_adpcm_fail_page0, g_adpcm_fail_pagehi);
-                for (vv = 0; vv < MCPX_HW_MAX_VOICES && shown < 8; ++vv)
+                for (vv = 0; vv < MCPX_HW_MAX_VOICES && shown < 24; ++vv)
                     if (g_adpcm_first_fail_blk[vv]) {
-                        fprintf(stderr, " v%u:%u", vv, g_adpcm_first_fail_blk[vv]);
+                        uint32_t nb = g_adpcm_fail_nblocks_v[vv];
+                        fprintf(stderr, " v%u:%u/%u", vv,
+                                g_adpcm_first_fail_blk[vv], nb);
+                        if (nb > g_adpcm_first_fail_blk[vv])
+                            fprintf(stderr, "(gap%u)",
+                                    nb - g_adpcm_first_fail_blk[vv]);
                         ++shown;
                     }
                 /* Same trap as the VOICE-RATE table: this lists the eight
@@ -3318,6 +3345,10 @@ uint32_t g_adpcm_fail_block[8], g_adpcm_fail_nblocks[8], g_adpcm_fail_hdr[8];
 uint32_t g_adpcm_fail_page[8], g_adpcm_fail_prd[8], g_adpcm_fail_lin[8];
 unsigned long g_adpcm_fail_page0, g_adpcm_fail_pagehi;
 uint32_t g_adpcm_first_fail_blk[MCPX_HW_MAX_VOICES];
+/* The buffer's block count beside the first block that failed in it. Without
+ * this the per-voice line cannot be read at all: a first failure at block 208
+ * means nothing until you know the buffer holds 219. See the report. */
+uint32_t g_adpcm_fail_nblocks_v[MCPX_HW_MAX_VOICES];
 unsigned long g_apu_adpcm_short;
 unsigned long g_apu_adpcm_oversize;
 unsigned long g_apu_adpcm_silenced;
@@ -3601,8 +3632,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                             else ++g_adpcm_fail_pagehi;
                             if (v < MCPX_HW_MAX_VOICES
                                 && (!g_adpcm_first_fail_blk[v]
-                                    || block_index < g_adpcm_first_fail_blk[v]))
+                                    || block_index < g_adpcm_first_fail_blk[v])) {
                                 g_adpcm_first_fail_blk[v] = block_index;
+                                g_adpcm_fail_nblocks_v[v] = nblocks;
+                            }
                         }
                         g_adpcm_fail_ring++;
                         if (block_index == 0) g_adpcm_fail_first++;
