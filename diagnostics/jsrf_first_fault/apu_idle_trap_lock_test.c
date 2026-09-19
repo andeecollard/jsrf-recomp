@@ -40,6 +40,31 @@
  *
  * Run as two ctest cases over one binary because the switch caches its getenv
  * in a static, so a process can only be in one arm.
+ *
+ * THE FIRST TWO ARMS RUN WITH RECOMP_APU_IDLE_TRAP_EDGE=0, set in
+ * CMakeLists.txt. They require a raise from each of three back-to-back frames
+ * for the same voice, and the edge latch -- on by default since 19 Sep 2026 --
+ * reports a transition once and withholds the repeats. Holding it off keeps
+ * those two arms about the lock guard and nothing else.
+ *
+ * THE THIRD ARM, `shipping`, IS THE COMBINATION A PLAYER ACTUALLY RUNS: lock
+ * guard on AND edge on, both at the values the tree now ships, and it exists
+ * because for one commit the edge was a default that no test drove. It was
+ * nearly not written, on the belief that the latch waits on a clock a test
+ * cannot advance. THAT WAS WRONG, and the wrongness is worth recording: the
+ * re-raise counts SUBFRAMES, not milliseconds. RECOMP_APU_IDLE_TRAP_REARM_MS
+ * is converted to a subframe count ONCE, at
+ * mcpx_apu_idle_trap_rearm_subframes, and thereafter the latch only ever
+ * compares g_idle_trap_edge_hold[v] -- incremented once per encounter -- with
+ * that count. There is no clock anywhere on the path, so a test advances it
+ * by calling mcpx_apu_vp_frame, which is the only thing this file does
+ * anyway. jsrf_apu_idle_trap_edge had been doing exactly that since 16 Sep.
+ *
+ * So the third arm changes NOTHING to be testable: no switch is loosened, no
+ * seam is added, and RECOMP_APU_IDLE_TRAP_REARM_MS keeps its shipping default
+ * rather than being shortened to suit the loop. The arm simply pumps
+ * subframes until the latch re-raises, and asserts it was withheld before it
+ * did. See step 3.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -68,7 +93,10 @@ extern unsigned long g_idle_trap_ring;
 extern uint16_t g_idle_trap_last[];
 extern uint8_t  g_idle_trap_why[];
 extern uint16_t g_idle_trap_from[];
+extern unsigned long g_idle_trap_edge_suppressed;
+extern unsigned long g_idle_trap_edge_reraise;
 extern int mcpx_apu_idle_trap_lock_guard(void);
+extern int mcpx_apu_idle_trap_edge(void);
 extern void mcpx_apu_idle_trap_report(int crash);
 
 #define WHY_LOCKED   (1u << 0)
@@ -91,7 +119,10 @@ static unsigned last_slot(void) { return (unsigned)((g_idle_trap_ring - 1) & 15u
 int main(int argc, char **argv)
 {
 #if !defined(_WIN32) && defined(__aarch64__)
-    int guard = (argc > 1 && strcmp(argv[1], "guard") == 0);
+    /* `shipping` implies the guard: it is the guard-on arm with the edge left
+     * at its default instead of pinned off. */
+    int shipping = (argc > 1 && strcmp(argv[1], "shipping") == 0);
+    int guard = shipping || (argc > 1 && strcmp(argv[1], "guard") == 0);
     /* THE DEFAULT ITSELF, FIRST, IN A CHILD, AND BEFORE ANYTHING READS THE
      * SWITCH. The switch caches its getenv in a function-static, and fork()
      * copies that cache -- so a child forked after the parent has already
@@ -127,6 +158,16 @@ int main(int argc, char **argv)
      *
      * The default is still pinned, separately and deliberately, below. */
     setenv("RECOMP_APU_IDLE_TRAP_LOCK_GUARD", guard ? "1" : "0", 1);
+    /* The edge is pinned OFF for the first two arms by CMakeLists.txt. The
+     * shipping arm deliberately does NOT set it: the whole point is to run
+     * the tree's default, so setting it here -- even to the value the default
+     * already has -- would mean the arm still passed if the default were
+     * quietly taken back off. It is ASSERTED instead, once, below. Everything
+     * in this file after that line runs in the player's configuration. */
+    if (shipping) {
+        unsetenv("RECOMP_APU_IDLE_TRAP_EDGE");
+        CHECK(mcpx_apu_idle_trap_edge() == 1);
+    }
 
     uint8_t xbe[0x400] = {0};
     apu = calloc(1, sizeof(*apu));
@@ -242,11 +283,67 @@ int main(int argc, char **argv)
     mcpx_apu_mmio_write(apu, 0x20000 + NV1BA0_PIO_VOICE_LOCK, 0, 4);
 
     unsigned long raises2 = g_idle_trap_raises;
-    mcpx_apu_vp_frame(apu, mixbins);
-    CHECK(g_idle_trap_raises == raises2 + 1);
-    CHECK(r[NV_PAPU_FEDECPARAM / 4] == HEAD);
-    CHECK(g_idle_trap_last[last_slot()] == HEAD);
-    CHECK(!(g_idle_trap_why[last_slot()] & WHY_LOCKED));
+    if (!shipping) {
+        mcpx_apu_vp_frame(apu, mixbins);
+        CHECK(g_idle_trap_raises == raises2 + 1);
+        CHECK(r[NV_PAPU_FEDECPARAM / 4] == HEAD);
+        CHECK(g_idle_trap_last[last_slot()] == HEAD);
+        CHECK(!(g_idle_trap_why[last_slot()] & WHY_LOCKED));
+    } else {
+        /* THE SHIPPING PAIR, AND THE ONE QUESTION ONLY IT CAN ANSWER: when
+         * the lock guard and the edge latch are both on, does a voice that
+         * was withheld while locked still get told once the lock is gone?
+         *
+         * Each arm alone says nothing about this. With the edge off, the
+         * frame above answers immediately and the latch is never exercised.
+         * With the guard off, HEAD is raised at step 2 and never reaches the
+         * guard's suppression path at all. Only together does a voice go
+         * guard-suppressed -> unlocked -> latch-suppressed -> re-raised, and
+         * that is the sequence the player's music rides on: a voice the guest
+         * stopped, not reclaimed on the first telling, and told again.
+         *
+         * NOTE WHICH SUPPRESSION RAN AT STEP 2. The guard's `suppress = 1`
+         * is set BEFORE the edge block, and the edge block is gated on
+         * !suppress, so a guard-suppressed voice does not advance its own
+         * re-raise counter. HEAD therefore arrives here with hold[] at zero
+         * and owes the full wait -- which is the conservative direction, and
+         * is why this loop cannot pass by accident on a leftover count.
+         *
+         * NO VALUE IS SHORTENED TO FIT. RECOMP_APU_IDLE_TRAP_REARM_MS keeps
+         * its shipping default and the loop simply runs as long as the latch
+         * asks. The bound is a runaway guard, not the expected count: at the
+         * default 16 ms the wait is 24 subframes, and 256 is far enough above
+         * that to survive a change to the default while still failing in a
+         * second rather than hanging ctest.
+         *
+         * The assertions are on the SHAPE, not on the number, for the same
+         * reason: withheld at least once (the edge is doing its job, so this
+         * is not just the level trap in disguise), then raised, on HEAD, with
+         * the re-raise counter moving -- that last one because
+         * [APU-IDLE-EDGE] reraise is the line the handover tells the next
+         * person to read first if the music dies, and a counter nobody has
+         * forced is not evidence. */
+        unsigned long sup0 = g_idle_trap_edge_suppressed;
+        unsigned long rer0 = g_idle_trap_edge_reraise;
+        unsigned n = 0, raised = 0;
+        while (n < 256 && !raised) {
+            r[NV_PAPU_FECTL / 4] = 0;
+            r[NV_PAPU_ISTS / 4] = NV_PAPU_ISTS_FETINTSTS;
+            r[NV_PAPU_FETFORCE1 / 4] = NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE;
+            mcpx_apu_vp_frame(apu, mixbins);
+            ++n;
+            raised = (g_idle_trap_raises != raises2);
+        }
+        CHECK(raised);                                   /* it is told again */
+        CHECK(n > 1);                        /* and it was withheld first -- */
+        CHECK(g_idle_trap_edge_suppressed > sup0);    /* by the edge, not by
+                                                       * something else */
+        CHECK(g_idle_trap_edge_reraise == rer0 + 1);
+        CHECK(g_idle_trap_raises == raises2 + 1);
+        CHECK(r[NV_PAPU_FEDECPARAM / 4] == HEAD);
+        CHECK(g_idle_trap_last[last_slot()] == HEAD);
+        CHECK(!(g_idle_trap_why[last_slot()] & WHY_LOCKED));
+    }
 
     /* The report has to survive being called -- the crash handler calls it on
      * the faulting thread and a format bug there costs a whole run. */

@@ -225,10 +225,41 @@ set_tests_properties(jsrf_apu_idle_trap_selflink_on PROPERTIES
 
 add_executable(jsrf_apu_idle_trap_lock_test apu_idle_trap_lock_test.c)
 target_link_libraries(jsrf_apu_idle_trap_lock_test PRIVATE xbox_kernel xbox_apu)
+# THREE ARMS, AND THE THIRD IS THE ONE A PLAYER RUNS.
+#
+# The first two pin RECOMP_APU_IDLE_TRAP_EDGE=0, which is not a workaround:
+# their question is the LOCK guard, and they ask it by driving one voice
+# through three back-to-back mcpx_apu_vp_frame calls and requiring a raise
+# from each. The edge latch -- default ON since 19 Sep 2026 -- reports an idle
+# TRANSITION once and withholds repeats, so with it left at the default those
+# two arms would fail at the edge rather than at their own subject. Pinned off
+# in BOTH of them so they still differ in one thing only.
+#
+# `shipping` is the third arm and it takes the pair as the tree ships it:
+# lock guard ON, edge at its default, RECOMP_APU_IDLE_TRAP_REARM_MS at its
+# default too. It exists because for one commit the edge became a default that
+# no test drove -- the configuration every player runs was the one
+# configuration nothing exercised -- and because the reason given for not
+# writing it was wrong. The claim was that the latch waits on a clock a test
+# cannot advance. It does not: the re-arm is a SUBFRAME counter
+# (g_idle_trap_edge_hold[] against mcpx_apu_idle_trap_rearm_subframes()), no
+# clock is read on that path, and the arm advances it by doing the only thing
+# this test does anyway, which is call mcpx_apu_vp_frame. Nothing was loosened
+# and no value was shortened to make it fit; see step 3 of the test.
+#
+# The arm does NOT set RECOMP_APU_IDLE_TRAP_EDGE, on purpose -- it asserts the
+# default instead, so that taking the default back off fails here loudly
+# rather than leaving an arm that quietly tests the wrong thing.
 add_test(NAME jsrf_apu_idle_trap_lock_default
          COMMAND jsrf_apu_idle_trap_lock_test)
+set_tests_properties(jsrf_apu_idle_trap_lock_default PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_IDLE_TRAP_EDGE=0")
 add_test(NAME jsrf_apu_idle_trap_lock_guard
          COMMAND jsrf_apu_idle_trap_lock_test guard)
+set_tests_properties(jsrf_apu_idle_trap_lock_guard PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_IDLE_TRAP_EDGE=0")
+add_test(NAME jsrf_apu_idle_trap_lock_shipping
+         COMMAND jsrf_apu_idle_trap_lock_test shipping)
 
 # The output CLOCK, which was 48003 Hz for the life of the file because an EP
 # frame is 5333 AND ONE THIRD microseconds and the third was truncated away.

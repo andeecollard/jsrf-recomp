@@ -1005,9 +1005,43 @@ unsigned long g_idle_owned_raises;     /* the positive control for that zero */
  * measured it as never happening. If it is non-zero HERE while the raise-time
  * count is still zero, the TOCTOU mechanism is measured rather than argued.
  *
- * RECOMP_APU_IDLE_HANDOFF_GUARD, default OFF until a run says _null_h0 moves.
- * Defaulting it on before that would be shipping the same argument that put
- * the raise-time guard in and took it out again. */
+ * RECOMP_APU_IDLE_HANDOFF_GUARD, DEFAULT ON since 19 Sep 2026. It shipped OFF
+ * "until a run says _null_h0 moves", because defaulting it on before that
+ * would have been the same argument that put the raise-time guard in and took
+ * it out again. A run said it moves.
+ *
+ * SIX SCRIPTED RUNS (13294ff), gameplay_nobarrage.pad, 240 s, scored on the
+ * FAULT SITE rather than on "did it crash" -- which matters, because two of
+ * the six died somewhere else entirely and a third never left the attract
+ * loop:
+ *
+ *   run            arm  scene raises  at the hand-over          fault
+ *   apu1-measure   OFF   12      4    reads=6    h0=1  w=0   sub_001A2E2E +0x6A4
+ *   handoff-off-2  OFF   12      0    reads=0                VOID
+ *   handoff-off-3  OFF   30      7    reads=10   h0=0  w=0   sub_0013DE40 +0x124
+ *   guardon-1      ON    30    986    reads=974  h0=3  w=3   none
+ *   handoff-on-2   ON    30   1583    reads=1561 h0=0  w=0   sub_00011D00 +0xA20
+ *   handoff-on-3   ON    30      7    reads=14   h0=0  w=0   none
+ *
+ * The first row is the finding: at the RAISE the model read owner[h] non-NULL
+ * every time, and six hand-overs later the guest read the handle out of
+ * FEDECMETH with owner[0] already cleared and died at sub_001A2E2E +0x6A4 --
+ * the fault this project has 26 dumps of. guardon-1 is the save: h0=3
+ * withheld=3, the fatal combination met three times and refused three times,
+ * and the run played to state 30.
+ *
+ * WHAT THIS DEFAULT IS NOT. The off arm is n=1 on the fault site
+ * (HANDOVER_2026-09-19_DAY section 4 asks for three top-up trials and they
+ * have not been taken), so the A/B is not finished. What carries the default
+ * is that the guard is a NULL test in front of a dereference the guest's own
+ * teardown has already been read to permit -- 001A241F begins
+ * "if (this->0x2C0 != 0) return" -- plus a player session on it that read
+ * reads=6 owned=6 NULL=0 h0=0 withheld=0: the guard never fired, so it costs
+ * nothing when the race does not happen.
+ *
+ * RECOMP_APU_IDLE_HANDOFF_GUARD=0 turns it off, and the counters on
+ * [APU-IDLE-OWNER] keep reporting either way, so the off arm still measures.
+ * Empty keeps the default -- see recomp_switch.h. */
 unsigned long g_idle_handoff_reads;     /* IDLE_VOICE methods collected */
 unsigned long g_idle_handoff_owned;     /* ...with a live owner[h] */
 unsigned long g_idle_handoff_null;      /* ...with owner[h] == NULL */
@@ -1019,7 +1053,7 @@ static int idle_handoff_guard_on(void)
 {
     static int on = -1;
     if (on < 0)
-        on = recomp_switch_on("RECOMP_APU_IDLE_HANDOFF_GUARD");
+        on = recomp_switch_on_default("RECOMP_APU_IDLE_HANDOFF_GUARD", 1);
     return on;
 }
 
@@ -1342,7 +1376,36 @@ int mcpx_apu_trap_coalesce(void)
     return on;
 }
 
-/* OFF by default. RECOMP_APU_IDLE_TRAP_EDGE=1 enables.
+/* DEFAULT ON since 19 Sep 2026, AND ONLY BECAUSE THE RE-RAISE BELOW IS ALSO
+ * ON. Read that note before touching either: the pure edge -- this switch with
+ * RECOMP_APU_IDLE_TRAP_REARM_MS=0 -- killed the player's music twice, and the
+ * second time with the log to prove it. The two are one fix and the default
+ * moves for the pair, not for this switch alone.
+ *
+ * THE THREE-ARM MEASUREMENT, scripted mission run, 150 s, live audio, scene 30
+ * held 90 s (HANDOVER_2026-09-16_NIGHT2 section 1, and the same table is in
+ * the player's paths.conf beside the line that enables it):
+ *
+ *   level (edge off)   trapped 53%    raises 11731   2D heard 134358
+ *   pure edge          trapped 0.6%   MUSIC DEAD in the player's session
+ *   edge + re-raise    trapped 3.6%   raises 1467    2D heard 203741
+ *                      reraise=1387 rearm=70 starved=0 effects lost=0
+ *
+ * 2D heard is the positive control and it is HIGHEST in the shipping arm, so
+ * this is not a counter going quiet because the instrument died. [APU-POOL]
+ * on_active read 0 in that arm: no voice theft, which is the mechanism the
+ * pure edge failed by. jsrf_apu_idle_trap_edge drives both arms as a test
+ * (06f1720), and its `pureedge` arm asserts the failure so that disabling the
+ * re-raise costs a red test rather than a player's evening.
+ *
+ * STILL OPEN, and it is why the counters stay: a later player session froze
+ * 2D heard with the re-raise demonstrably working (reraise=6219, rearm=136,
+ * on_active=0). [APU-POOL] on_2d exists to say whether that is a stretch of
+ * the game with no music or a voice we dropped. If the music dies, read
+ * [APU-IDLE-EDGE] first: reraise must climb.
+ *
+ * RECOMP_APU_IDLE_TRAP_EDGE=0 restores the level trap. Empty keeps the
+ * default (recomp_switch.h).
  *
  * WHAT IT CHANGES. SE2FE_IDLE_VOICE stops being raised for the level "this
  * voice is inactive and still in a list" and starts being raised for the edge
@@ -1367,23 +1430,22 @@ int mcpx_apu_trap_coalesce(void)
  * write rate into the VP aperture collapsing to zero, [APU-VOICE] on= frozen
  * -- is consistent with the storm throttling the guest's sound engine, and
  * this removes the storm's engine. Whether removing it lets voices start again
- * is a run, not an argument, which is why this ships OFF and why
- * g_idle_trap_edge_encounters is counted with it off: one run with the switch
- * OFF says how many raises it would have withheld, and if that is not most of
- * them the hypothesis is dead before anybody enables it.
+ * is a run, not an argument, which is why this shipped OFF while the question
+ * was open and why g_idle_trap_edge_encounters is still counted with it off:
+ * one run with the switch OFF says how many raises it would have withheld,
+ * and that control is worth keeping now the default has moved the other
+ * way.
  *
  * THE RISK IT CARRIES, stated plainly: if the guest ever genuinely needs a
  * second notification for a voice it failed to service the first time, this
  * withholds it and that voice stays in the list inactive for ever. Nothing
- * here can rule that out statically. g_idle_trap_edge_rearm is the counter
- * that would show the latch cycling normally rather than latching shut. */
+ * here can rule that out statically -- and it is exactly what happened, twice,
+ * before the bounded re-raise below existed. g_idle_trap_edge_rearm is the
+ * counter that shows the latch cycling normally rather than latching shut. */
 int mcpx_apu_idle_trap_edge(void)
 {
     static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_IDLE_TRAP_EDGE");
-        on = e ? (atoi(e) != 0) : 0;
-    }
+    if (on < 0) on = recomp_switch_on_default("RECOMP_APU_IDLE_TRAP_EDGE", 1);
     return on;
 }
 
@@ -1502,18 +1564,79 @@ static unsigned mcpx_apu_idle_trap_rearm_subframes(void)
  * mcpx_apu_se_while_trapped, which were written correctly. The other switches
  * in this tree documented as `=0`-disableable -- RECOMP_GPU_OWN and
  * RECOMP_PHYSICAL_HEAP_ALIAS -- were checked the same day and honour it. */
+/* STILL OFF BY DEFAULT, WITH mcpx_apu_list_move_to_front, and the two move
+ * together because neither reaches the criterion alone: move-to-front is
+ * idempotent in the head case and deliberately writes nothing, so a
+ * link(v) == v the GUEST wrote survives it and the walk still meets a
+ * one-entry ring. terminated=88826 in the run below is that sentinel being
+ * honoured. 83-96% of re-inserts are the head case across ten runs.
+ *
+ * THE A/B (4e2c9cd), two scene-matched gameplay runs, both reaching voice
+ * churn:
+ *
+ *   off  relink=67 (of 169 top inserts)  walks_with_a_cycle=93611  walkcap=93611
+ *   on   relink=51 (of 154 top inserts)  walks_with_a_cycle=0      walkcap=0
+ *        mtf_head=28 mtf_deep=23  selflink terminated=88826
+ *
+ * relink stays non-zero on both sides, which is the control that matters: if
+ * it collapsed too, the run never reached churn and the zero would mean
+ * nothing. on_top of 154 and 169 are both inside the 148-453 band a run that
+ * reaches gameplay produces. And the cross-check holds exactly --
+ * mtf_head + mtf_deep = 28 + 23 = 51 = relink, counted independently on the
+ * same event by two different walks, so disagreement would have meant the
+ * instrument was lying rather than the fix working.
+ *
+ * SO WHY IS THIS STILL OFF? The A/B above settles the RING. It does not
+ * settle the separate question 4e2c9cd left behind, and that question is the
+ * gate: "do not enable these by default, and do not put them in a player's
+ * paths.conf, until that is settled with a controlled run" -- the "that"
+ * being a boot anomaly of 3 of 12 runs with the ring patch compiled reaching
+ * gameplay against 4 of 4 without, with no mechanism found. It is item 7 of
+ * HANDOVER_2026-09-16_THE_VBLANK_WAS_THE_HANG and it is OPEN.
+ *
+ * ONE ATTEMPT AT IT, RECORDED BECAUSE IT IS SUGGESTIVE AND NOT BECAUSE IT
+ * COUNTS. Classifying the 166 completed runs under build-macos/
+ * jsrf-first-fault/render-investigation that carry a [JSRF-SEQ] marker by
+ * each run's own switches.txt, and scoring on reaching state 28-35:
+ *
+ *   both switches set      45 of 55   (82%)
+ *   neither set            78 of 114  (68%)
+ *
+ * and on 16 Sep itself, the day the twelve were taken, the armed arm reads
+ * 27 of 35. That points away from the anomaly. It is also OBSERVATIONAL --
+ * the arms differ in pad, date and binary, and nobody chose which runs went
+ * where -- so it is not the controlled run the gate asks for, and this tree
+ * has paid repeatedly for accepting that substitution. The default therefore
+ * does NOT move on it. (A mechanism does exist for the anomaly if anyone
+ * wants one: HANDOVER_2026-09-19_DAY section 8 found the pad is fps-fragile,
+ * parking at the title at 117-136 fps and reaching gameplay at 64-86, so
+ * anything that makes a run cheaper pushes it toward the parking band. That
+ * is inference and settles nothing either.)
+ *
+ * THE RUN THAT WOULD LICENSE THE PROMOTION, precisely, so it can be flipped
+ * in one line by whoever takes it: five runs per arm of one pad -- the plan
+ * in docs/jsrf/plans/PLAN_2026-09-16_THE_VOICE_LIST_RING_FIX.md says five and
+ * that number was paid for by the lock guard -- from ONE binary, alternating
+ * the arms rather than running them in blocks, with
+ * RECOMP_APU_SELFLINK_END and RECOMP_APU_LIST_MOVE_TO_FRONT both =1 in one
+ * arm and both =0 in the other and NOTHING else differing. Score reaching
+ * [JSRF-SEQ] now=28-35, and void any run that fails the gates in
+ * HANDOVER_2026-09-19_DAY section 8. If the armed arm is not worse at
+ * reaching gameplay, change the 0 below to a 1 and this paragraph to the
+ * result. Both switches flip together; they are one fix.
+ *
+ * STILL WORTH KNOWING: both switches are LOCAL INVENTIONS. xemu's vp.c has
+ * originals for voice-list splicing on VOICE_ON and they have not been read.
+ * RECOMP_APU_SELFLINK_END=1 enables it; [APU-SELFLINK] prints the state. */
 int mcpx_apu_selflink_end(void)
 {
     static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_SELFLINK_END");
-        on = e ? (atoi(e) != 0) : 0;
-    }
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_SELFLINK_END");
     return on;
 }
 
-/* OFF by default, pending an A/B, and the story of that default is the useful
- * part of this comment.
+/* Was OFF by default pending an A/B, and the story of that default is the
+ * useful part of this comment; the A/B and the default are at the bottom.
  *
  * WHAT IT DOES. VOICE_ON for a voice that is already its list's head stores
  * that voice's own handle over its successor, so everything behind it in the
@@ -1649,11 +1772,18 @@ int mcpx_apu_reon_head_nop(void)
  * the trade, stated rather than hidden. It is not a claim that the insert is
  * atomic. The real fix is the lock discipline, and it is not this.
  *
- * OFF by default. This repository shipped one APU guard on the strength of a
- * good argument and made the crash worse, and the rule that came out of that is
- * a run count, not a better argument: five clean runs per arm before the
- * default moves, where "clean" is defined by the positive control on the
- * [APU-CYCLE] line. RECOMP_APU_LIST_MOVE_TO_FRONT=1 enables it. */
+ * STILL OFF BY DEFAULT, with mcpx_apu_selflink_end. That comment carries the
+ * A/B, the boot anomaly that is the actual gate, and -- written out in full --
+ * the exact run that would license promoting BOTH. Read it before changing
+ * either; they are one fix in two switches, neither reaches its criterion
+ * alone, and they flip together or not at all.
+ *
+ * The rule this default has to clear is a run count, not a better argument:
+ * this repository shipped one APU guard on the strength of a good argument
+ * and made the crash worse. Five clean runs per arm, and an observational
+ * sweep over runs that already existed is not that, however it comes out.
+ * RECOMP_APU_LIST_MOVE_TO_FRONT=1 enables it and [APU-REON] prints the
+ * state. */
 unsigned long g_apu_list_mtf_head;     /* re-ON of a voice already at the head */
 unsigned long g_apu_list_mtf_deep;     /* ...already deeper in: the ring case */
 unsigned long g_apu_list_mtf_inherit;  /* ...unlinked from the INHERIT branch */
@@ -1661,10 +1791,7 @@ unsigned long g_apu_list_mtf_inherit;  /* ...unlinked from the INHERIT branch */
 int mcpx_apu_list_move_to_front(void)
 {
     static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_LIST_MOVE_TO_FRONT");
-        on = e ? (atoi(e) != 0) : 0;
-    }
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_LIST_MOVE_TO_FRONT");
     return on;
 }
 
@@ -3862,6 +3989,59 @@ static int adpcm_extent_on(void)
 int g_adpcm_hw_header;
 unsigned long g_adpcm_hw_header_accepted;
 
+/* STILL OFF BY DEFAULT, and the reason is a rule rather than a doubt about
+ * the mechanism: what this changes is AUDIBLE, and a player-facing default in
+ * this tree needs a picture or a listen. It does not have one.
+ *
+ * WHAT IT FIXES (3a02922). adpcm_decode_block refused any block whose fourth
+ * header byte was non-zero. That is a generic IMA-ADPCM guard, not an Xbox
+ * one: on this hardware the byte is reserved, not validated. The tell that it
+ * is ours and not hardware's is that it returned 0 AFTER already writing the
+ * first sample of each channel, which no hardware pipeline does. It cost 704
+ * samples (11 blocks x 64) per lap of every looping ADPCM voice -- nine
+ * voices across three sessions, all exactly 11 -- and lbo=0, so the pad
+ * played every lap.
+ *
+ * WHY THE REFUSAL WAS WRONG RATHER THAN EARLY. RECOMP_APU_ADPCM_EXTENT walked
+ * the buffer through the model's own translation and found zero decodable
+ * blocks below the base and a 0x08 fill running from exactly
+ * first_fail*block_size to exactly nblocks*block_size, in both voices, to the
+ * byte. We are reading INSIDE the declared buffer, into a region nothing
+ * wrote audio into, and the declared length is the guest's own, captured at
+ * the two PIO methods that carry it.
+ *
+ * THE RUN: player session 19 Sep 2026, ~/Library/Application Support/JSRF/
+ * last-run-2026-09-19_ADPCM-HWHEADER-STILL-STUTTERS.log --
+ *   [APU-ADPCM] ok=47041 fail=0 short=0 oversize=0 silenced=0
+ *               (adpcm_guard on, hw_header on, 1469 block(s) accepted that
+ *                the strict header test refuses)
+ * ok= is the positive control for fail=0: "fail=0 beside ok=0" means no ADPCM
+ * played, and the early windows of that same log read exactly that.
+ *
+ * WHERE THE EVIDENCE STOPS, AND WHY THE DEFAULT DOES NOT MOVE. The trade is
+ * a 32 ms hole replaced by a DC step -- 36 bytes of 0x08 decode to a flat
+ * 2055, 6.27% of full scale, pinned by jsrf_adpcm_decode_test -- and whether
+ * that is an improvement or an audible click is decided by listening, not by
+ * a counter. What exists is that the player played the session above with the
+ * switch engaged, reported on the intro sound, and did not mention a click.
+ * That is ABSENCE OF A REPORT, not a listen: this tree's own rule is that
+ * every absence-measurement needs a positive control, and there is none for
+ * "the player would have said". The counters cannot supply one, because the
+ * defect this switch could introduce is inaudible to every counter in the
+ * model.
+ *
+ * THE LISTEN THAT WOULD LICENSE THE PROMOTION, precisely, so it can be
+ * flipped in one line by whoever takes it: one player session through the
+ * intro with RECOMP_APU_ADPCM_HW_HEADER=1, asked BEFOREHAND to listen for a
+ * click or a buzz where a gap used to be -- asked beforehand because a
+ * question put afterwards is answered from memory of something nobody was
+ * attending to -- against one session with it unset, same scene, same build.
+ * Confirm the arm from [APU-ADPCM]'s "N block(s) accepted" rather than from
+ * what was intended; it read 1469 in the engaged arm and must read 0 in the
+ * control. If the player hears no new artefact, change recomp_switch_on
+ * below to recomp_switch_on_default(..., 1) and this paragraph to the result.
+ *
+ * Until then RECOMP_APU_ADPCM_HW_HEADER=1 opts in. */
 static int adpcm_hw_header_on(void)
 {
     static int on = -1;

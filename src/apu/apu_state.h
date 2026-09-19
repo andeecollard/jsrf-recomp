@@ -307,11 +307,14 @@ static inline void hrtf_filter_process(HrtfFilter *f,
  * dropped: step_table has 89 entries and index is int8_t, so removing the
  * bound would be an out-of-bounds read.
  *
- * DEFAULT OFF, and it has never been run. What it changes is audible -- the
- * 0x08 pad decodes to a flat 2055, 6.27% of full scale, where the guard
- * currently substitutes silence -- so it is a player-facing behaviour change
- * and this tree's rule is that those need a listen, not an argument. The
- * decoder half is covered by jsrf_adpcm_decode; the title half is not.
+ * DEFAULT OFF. What it changes is audible -- the 0x08 pad decodes to a flat
+ * 2055, 6.27% of full scale, where the guard substitutes silence -- so it is
+ * a player-facing behaviour change and this tree's rule is that those need a
+ * listen, not an argument. It has been RUN now and it works: a player session
+ * with the switch engaged read ok=47041 fail=0 silenced=0 with 1,469 blocks
+ * recovered. What it has not had is the listen. adpcm_hw_header_on() in
+ * apu_vp.c writes out exactly which session would supply one. The decoder
+ * half is covered by jsrf_adpcm_decode.
  *
  * g_adpcm_hw_header is a plain int rather than a getenv here because this
  * function is called from the frame thread thousands of times a second and
