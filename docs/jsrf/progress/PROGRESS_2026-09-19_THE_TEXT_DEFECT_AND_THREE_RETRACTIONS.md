@@ -285,3 +285,64 @@ know, and there is no pattern search. The instrument is small -- scan the guest
 RAM range for a supplied byte string, print hits with their addresses -- and it
 would serve every future "did the guest or did we?" question, which this
 project asks constantly.
+
+---
+
+# ADDENDUM 3: the instrument, and the answer it gave
+
+## RECOMP_RAM_FIND
+
+`diagnostics/jsrf_first_fault/ram_find.{c,h}`, pure functions in the shape of
+`wild_ptr.{c,h}` beside them, driven from the periodic report in `main.c`.
+`RECOMP_RAM_FIND=<pattern>[;<pattern>...]`, plain text with `\xNN` escapes;
+`RECOMP_RAM_FIND_AFTER=<seconds>` delays the first scan. Read-only and off
+unless set. Both are value-carrying and registered as such in
+`switch_audit.py`. New ctest `jsrf_ram_find`; suite is 79/79.
+
+EVERY BLOCK CARRIES A POSITIVE CONTROL. Eight bytes are read out of guest
+`.text` at `00011000` and searched for on the same pass. If that reads 0 the
+block says "SCAN IS DEAD, every count below is void". The instrument exists to
+make ZEROS meaningful and a zero from a scan pointed at unmapped memory is
+indistinguishable from a real one -- this tree has drawn that false conclusion
+before.
+
+The test leans on the negative cases, including the trap that matters: a search
+for `llect 10 Spray` matches INSIDE `Collect 10 Spray`, so an unanchored search
+for a truncated string proves nothing. `ram_find_test.c` asserts that directly.
+
+Cost, measured rather than claimed: 127 MB, three patterns plus the control,
+**19-22 ms**, once per report interval.
+
+## THE ANSWER: the guest's string is intact, so the truncation is OURS
+
+29 scans over a replay of the player's session, every one with a passing
+control:
+
+    27 scans   "Collect 10 Spray"        1 hit at 00C2EF1B
+    27 scans   "llect 10 Spray"          1 hit at 00C2EF1D   <- +2, INSIDE it
+    27 scans   "Spray Cans and perform"  1 hit at 00C2EF26
+     2 scans   (boot, before the mission file was loaded)  0 hits
+
+Exactly ONE copy of the line exists in guest RAM and it is COMPLETE. The
+truncated form is found only as a substring of the intact one, at exactly +2.
+No guest routine ever built a short copy.
+
+So the missing characters are lost on OUR side, in the renderer's iteration or
+layout -- not in the guest's string handling. That closes the question addendum
+2 could not, and it means the string-table hunt is over: the string was never
+the problem.
+
+THE LIMIT, stated: scans are one per report interval, so a copy built and freed
+entirely between two scans would be missed. A buffer persisting while the line
+is on screen would not, and the line is displayed for far longer than the
+interval.
+
+## And one observation from the player, watching the replay
+
+"lines above the letters and flickering". Thin artefacts along the top edge of
+the glyphs is ATLAS BLEED -- sampling a texel row outside the glyph's cell and
+picking up its neighbour. That is direct evidence for the UV/addressing branch
+of the substitution defect rather than the selection branch: a fractional
+overreach bleeds a neighbouring row, while a whole-cell error would swap the
+glyph outright. Both symptoms may be the same addressing error at two
+magnitudes, which is now a testable claim rather than a guess.

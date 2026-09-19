@@ -367,6 +367,7 @@ add_executable(jsrf_first_fault
     main.c
     guest_names.c
     wild_ptr.c
+    ram_find.c
     startup_probe.c
     draw_one_probe.c
     func_hit_probe.c
@@ -658,6 +659,13 @@ add_test(NAME jsrf_guest_names COMMAND jsrf_guest_names_test)
 # parent node rather than at whatever else happened to be on the stack.
 add_executable(jsrf_wild_ptr_test wild_ptr_test.c wild_ptr.c)
 add_test(NAME jsrf_wild_ptr COMMAND jsrf_wild_ptr_test)
+
+# The guest-memory pattern search. Its value is in its ZEROS -- "the guest
+# never built those bytes" -- so the test leans on the negative cases and on
+# the anchoring trap: searching for a truncated string without a boundary byte
+# matches inside the intact original and proves nothing.
+add_executable(jsrf_ram_find_test ram_find_test.c ram_find.c)
+add_test(NAME jsrf_ram_find COMMAND jsrf_ram_find_test)
 
 add_executable(jsrf_worker_stack_pool_test worker_stack_pool_test.c)
 target_link_libraries(jsrf_worker_stack_pool_test PRIVATE xbox_kernel)

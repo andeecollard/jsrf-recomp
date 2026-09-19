@@ -33,6 +33,7 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 #include "guest_trace.h"
 #include "guest_names.h"
 #include "wild_ptr.h"
+#include "ram_find.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
 #include "nv2a_pb_scan.h"
@@ -1014,6 +1015,10 @@ static void jsrf_find_renderer(void)
 
 /* Periodic pusher report. Separate from the ADX tick so it survives that
  * probe being removed. */
+/* Defined below, beside the other guest-memory instruments: it needs
+ * JSRF_RAM_TOP, which is declared further down this file. */
+static void jsrf_ram_find_report(void);
+
 static void jsrf_pusher_report(void)
 {
     static DWORD last;
@@ -1293,6 +1298,7 @@ static void jsrf_pusher_report(void)
         }
         prev_methods = st.methods;
     }
+    jsrf_ram_find_report();
 }
 
 static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
@@ -3898,6 +3904,122 @@ static void jsrf_wild_ptr_report(uint32_t fault_va, uint32_t wild)
  * into guest memory to set up, and this instrument is read-only -- so it is
  * pinned by jsrf_wild_ptr_test instead, which builds the whole crash.
  */
+
+/* RECOMP_RAM_FIND=<pattern>[;<pattern>...] -- read-only, opt-in.
+ *
+ * Answers "did the guest do it, or did we?" for anything that leaves bytes in
+ * memory. The case it was built for: a tutorial line renders as
+ * "llect 10 Spray Cans" while mssn0101.bin contains "Collect 10 Spray Cans".
+ * If the truncated bytes exist in guest RAM then a guest routine built a short
+ * copy; if only the full string is there, the loss is in our layout or
+ * iteration. Nothing else in this tree could ask that -- RECOMP_DUMP_VA prints
+ * dwords at addresses you already know.
+ *
+ * EVERY SCAN CARRIES ITS OWN POSITIVE CONTROL, because the whole value of this
+ * instrument is in its zeros and a zero from a scan pointed at unmapped memory
+ * is indistinguishable from a zero from a scan that worked. Eight bytes are
+ * read out of guest .text and searched for on the same pass; the control line
+ * prints beside the results and must read >= 1. If it reads 0, every other
+ * number in the block is void and the block says so.
+ *
+ * Patterns are plain text with \xNN for raw bytes, separated by ';'. A search
+ * for a truncated form should be ANCHORED -- "\x00llect 10" rather than
+ * "llect 10" -- or it will match inside the intact original and prove nothing;
+ * ram_find_test.c asserts exactly that trap.
+ *
+ * RECOMP_RAM_FIND_AFTER=<seconds> delays the first scan. Seconds are counted
+ * from the FIRST PERIODIC REPORT, not from process start, because this file
+ * has no process-start clock to borrow.
+ *
+ * COST, measured and printed on every block rather than claimed here: one pass
+ * of memchr over the arena per pattern. It runs inside the periodic report,
+ * so it is paid once per report interval and never per frame.
+ */
+static void jsrf_ram_find_report(void)
+{
+    enum { RF_MAX_PAT = 8, RF_MAX_HITS = 6 };
+    static int inited, armed, npat;
+    static unsigned char pats[RF_MAX_PAT][JSRF_RF_MAX_PATTERN];
+    static int patlen[RF_MAX_PAT];
+    static char patname[RF_MAX_PAT][96];
+    static DWORD base_tick, after_ms;
+    const unsigned char *ram;
+    JsrfRfHit hits[RF_MAX_HITS];
+    unsigned char ctrl[8];
+    uint32_t ctrl_n;
+    DWORD t0;
+    int i;
+
+    if (!inited) {
+        const char *spec = getenv("RECOMP_RAM_FIND");
+        const char *aft  = getenv("RECOMP_RAM_FIND_AFTER");
+        inited = 1;
+        base_tick = GetTickCount();
+        after_ms = aft ? (DWORD)(strtol(aft, NULL, 10) * 1000L) : 0;
+        if (spec && *spec) {
+            char buf[1024];
+            char *p, *save = NULL;
+            strncpy(buf, spec, sizeof buf - 1);
+            buf[sizeof buf - 1] = 0;
+            for (p = strtok_r(buf, ";", &save); p && npat < RF_MAX_PAT;
+                 p = strtok_r(NULL, ";", &save)) {
+                int n = jsrf_rf_parse(p, pats[npat], JSRF_RF_MAX_PATTERN);
+                if (n < 0) {
+                    fprintf(stderr, "[RAM-FIND] REFUSED pattern \"%s\": bad"
+                            " escape, empty, or longer than %d bytes. Use"
+                            " \\xNN for raw bytes; \\n is not accepted because"
+                            " $n is this title's own newline code.\n",
+                            p, JSRF_RF_MAX_PATTERN);
+                    continue;
+                }
+                patlen[npat] = n;
+                strncpy(patname[npat], p, sizeof patname[0] - 1);
+                patname[npat][sizeof patname[0] - 1] = 0;
+                ++npat;
+            }
+            armed = npat > 0;
+            if (armed)
+                fprintf(stderr, "[RAM-FIND] armed with %d pattern(s) over"
+                        " guest %08X-%08X, scanned once per report\n",
+                        npat, 0x10000u, JSRF_RAM_TOP);
+        }
+    }
+    if (!armed) return;
+    if (after_ms && GetTickCount() - base_tick < after_ms) return;
+
+    ram = (const unsigned char *)xbox_GetMemoryOffset();
+    if (!ram) { fprintf(stderr, "[RAM-FIND] no guest memory base\n"); return; }
+
+    t0 = GetTickCount();
+
+    /* The control first, so it is impossible to read the results without it. */
+    memcpy(ctrl, ram + 0x00011000u, sizeof ctrl);
+    ctrl_n = jsrf_rf_scan(ram, 0x10000u, JSRF_RAM_TOP, ctrl, (uint32_t)sizeof ctrl,
+                          NULL, 0);
+    fprintf(stderr, "[RAM-FIND] control: 8 bytes read from .text at 00011000"
+            " found %u time(s) -- %s\n", ctrl_n,
+            ctrl_n ? "scan is reading guest memory" :
+            "SCAN IS DEAD, every count below is void");
+
+    for (i = 0; i < npat; ++i) {
+        uint32_t n = jsrf_rf_scan(ram, 0x10000u, JSRF_RAM_TOP, pats[i],
+                                  (uint32_t)patlen[i], hits, RF_MAX_HITS);
+        fprintf(stderr, "[RAM-FIND]   \"%s\" (%d bytes): %u hit(s)",
+                patname[i], patlen[i], n);
+        if (n) {
+            uint32_t k, shown = n < RF_MAX_HITS ? n : RF_MAX_HITS;
+            fprintf(stderr, " at");
+            for (k = 0; k < shown; ++k) fprintf(stderr, " %08X", hits[k].va);
+            if (n > shown) fprintf(stderr, " ...");
+        }
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[RAM-FIND] %u pattern(s) + control over %u MB in %lu ms\n",
+            (unsigned)npat, (unsigned)((JSRF_RAM_TOP - 0x10000u) >> 20),
+            (unsigned long)(GetTickCount() - t0));
+    fflush(stderr);
+}
+
 static void jsrf_wild_ptr_startup(void)
 {
     const unsigned char *base;

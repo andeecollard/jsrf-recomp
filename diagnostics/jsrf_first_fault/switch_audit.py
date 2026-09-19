@@ -136,6 +136,13 @@ VALUE_CARRYING = {
     # recording. The boolean that turns recording on, RECOMP_PAD_RECORD, goes
     # through the helper like anything else.
     "RECOMP_PAD_RECORD_PATH",
+    # The guest-memory pattern search. Both carry values by necessity: one is
+    # the byte pattern to look for (text with \xNN escapes, ';'-separated) and
+    # the other a delay in seconds before the first scan. Neither can be a
+    # boolean -- a search with no pattern is not a search. The instrument is
+    # read-only and off unless RECOMP_RAM_FIND is set.
+    "RECOMP_RAM_FIND",
+    "RECOMP_RAM_FIND_AFTER",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING
