@@ -1212,6 +1212,10 @@ static void jsrf_pusher_report(void)
         {
             extern void xbox_InputPollReport(void);
             xbox_InputPollReport();
+            /* The scheduler's absolute-deadline counter. It lives in
+             * kernel_bridge.c, which xbox_input does not link, so it is
+             * reported from here rather than beside the pad poll. */
+            { extern void bridge_sched_report(void); bridge_sched_report(); }
         }
         jsrf_guest_trace_report();
         pad_sentinel_scan();
@@ -2382,6 +2386,10 @@ static void jsrf_object_dump(void)
         {
             extern void xbox_InputPollReport(void);
             xbox_InputPollReport();
+            /* The scheduler's absolute-deadline counter. It lives in
+             * kernel_bridge.c, which xbox_input does not link, so it is
+             * reported from here rather than beside the pad poll. */
+            { extern void bridge_sched_report(void); bridge_sched_report(); }
         }
         /* And how that drawing was done.
          *

@@ -2393,6 +2393,25 @@ void nv2a_metal_report(void)
             "  A resident clear could remove the second only.\n",
             (unsigned long long)sync_calls,(unsigned long long)sync_clean,
             g_sync_drain_ns/1e6,g_sync_read_ns/1e6);
+    /* The RANGE walk, whose two counters were written as a positive control
+     * -- their own comment says "paid=0 across a whole run is the expected
+     * reading ... it is also the positive control that says this walked and
+     * found nothing, rather than that it never ran" -- and were then printed
+     * nowhere, which is the one thing that makes that control useless.
+     *
+     * This is also the line G3 wants. The goals note says to size direct
+     * Metal presentation from the copy, the conversion and the re-upload and
+     * never from [STAGE] sync; paid is how many of those writebacks actually
+     * happened. */
+    fprintf(stderr,"[METAL] sync_range %llu calls, %llu slot writeback(s)"
+            " paid%s\n",
+            (unsigned long long)g_sync_range_calls,
+            (unsigned long long)g_sync_range_paid,
+            g_sync_range_calls == 0
+                ? "   <- never called: nothing asked for a ranged sync"
+                : (g_sync_range_paid == 0
+                    ? " (walked and found nothing owing -- expected until the"
+                      " swap defers)" : ""));
     /* A full clear discards the surface instead of syncing it, so each of
      * these is one drain and one 4.9 MB readback that did not happen. Printed
      * with the state of the switch so an A/B can see the arms differ. */

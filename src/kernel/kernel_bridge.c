@@ -1565,6 +1565,27 @@ static void bridge_restore_regs(const BridgeGuestRegs *r)
 /* Guest waits that passed an absolute deadline; see the return below. */
 unsigned long g_sched_absolute_deadlines;
 
+/* ...AND THE LINE THAT MAKES IT A MEASUREMENT.
+ *
+ * The comment at the increment says the cost of finding out whether JSRF ever
+ * passes an absolute deadline "is a counter", and that zero means the
+ * shortcut is free while anything else means a thread is burning a core on a
+ * wait that never waits. The counter was written and printed nowhere, so the
+ * question it was raised to settle stayed open -- and it is not an idle one
+ * while every guest thread in the black-screen hang is sitting in a wait.
+ *
+ * Printed in both states on purpose: zero is the answer the comment wants,
+ * and an absent line would be indistinguishable from a build without it. */
+void bridge_sched_report(void)
+{
+    fprintf(stderr, "  [SCHED] absolute-deadline waits: %lu%s\n",
+            g_sched_absolute_deadlines,
+            g_sched_absolute_deadlines
+                ? "   <- these return immediately instead of waiting; a thread"
+                  " spinning on one reads as \"the title is slow\""
+                : " (the relative-timeout shortcut is free)");
+}
+
 static DWORD bridge_nt_timeout_to_ms(uint32_t timeout_va)
 {
     int64_t t;
