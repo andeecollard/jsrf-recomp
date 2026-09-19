@@ -34,12 +34,25 @@ Two things follow, and both have been wanted already:
 - It decides whether symbol names can be borrowed from another title at all.
   `docs/technical/ms-fusion-*.md` describes recovering XDK function names from
   Microsoft's own shipped BC packages, which is attractive because this title
-  disassembles to **8,876 functions with exactly one name** among them. But a
-  byte signature only transfers where the same XDK build emitted the same code,
-  and the four titles Microsoft shipped that way are Nov 2001 to Jun 2005 —
-  Blinx (Oct 2002) is the nearest to 4134 and is still months off. Check the
-  version before spending anything on that idea; the first attempt picked
-  Crimson Skies on symbol count and it is one of the worst matches by date.
+  disassembles to **8,876 functions with exactly one name** among them. A byte
+  signature transfers best where the same XDK build emitted the same code, so
+  the donor is chosen on **XDK build number** — not on symbol count, and not on
+  release date. Both of those have been tried and both picked the wrong donor.
+
+  The four donors' XDK builds, measured 19 Sep 2026 from their extracted
+  guest XBEs (`docs/jsrf/progress/PROGRESS_2026-09-19_THE_BC_DONORS_…`):
+
+  | donor | XDK | vs JSRF's 4134 |
+  |---|---|---|
+  | **Fuzion Frenzy** | **3911 / 3925** | **~210 below — the nearest** |
+  | Blinx | 4831 | 697 above |
+  | Crimson Skies | 5659 | 1,525 above |
+  | Conker | 5849 | 1,715 above |
+
+  **Fuzion Frenzy is the donor**, and it is the only one that brackets JSRF
+  from below. For scale, `tools/symbols/map_names.py` measured 99.1% name
+  agreement across a 190-build gap, so ~210 is in the range that has actually
+  been shown to work; 697 and 1,525 are not.
 
 Re-derive rather than trusting this paragraph:
 

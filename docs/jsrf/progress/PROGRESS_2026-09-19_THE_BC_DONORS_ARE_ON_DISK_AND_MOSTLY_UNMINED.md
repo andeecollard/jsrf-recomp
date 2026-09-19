@@ -118,62 +118,90 @@ Blinx validated cleanly through our own parser: *BLiNX: the time sweeper*,
 title id `0x4D530013`, built 2002-09-13, 56 sections, `.text` / `D3D` /
 `D3DX` / `XGRPH` / `DSOUND`.
 
-## THE NUMBER — and a retraction
+## All four donors extracted and graded
 
-**WITHDRAWN: the Blinx figure of 6.6% was measured on a corrupt image.** It is
-wrong and it pointed the opposite way from the truth. What follows replaces it.
+Every donor's guest `default.xbe` is now out of its BC package, validated, and
+graded against Microsoft's own function starts. Each oracle run below was
+re-run here directly rather than relayed.
 
-### The SVOD chunks are hash-interleaved; a flat copy is silently corrupt
+| donor | XDK | MS starts | hit | under-seg | uncovered |
+|---|---|---:|---|---:|---:|
+| **Fuzion Frenzy** | **3911 / 3925** | 1,482 | **97.6%** | 2 | 34 |
+| **JSRF (target)** | **4134** | — | — | — | — |
+| Blinx | 4831 | 1,786 | **98.0%** | 3 | 32 |
+| Crimson Skies | 5659 | 3,106 | **98.9%** | 16 | 17 |
+| Conker | 5849 | 3,228 | **99.1%** | 12 | 16 |
 
-Verified arithmetically, not taken on trust:
+**Our function-boundary detection agrees with Microsoft's ground truth on
+97.6–99.1% of named starts, across four independent titles, on bare runs with
+no seed files.** The handful of under-segmentation misses are not a general
+weakness: they cluster in Dolby/FFT kernels, where MS names each radix variant
+separately inside one blob, and in MSVC scalar-deleting-destructor thunks that
+genuinely share a body. The uncovered ones are cold library stubs reachable
+only through data-table dispatch — USB/XID/MU device entry points, unreferenced
+`D3DDevice_SetRenderState_*` pushbuffer stubs, CRT leftovers.
 
-    0xA290000 / 0x1000            = 41,616 blocks per full Data file
-    1 + 203 x (1 + 204)           = 41,616      <- exact
-    => block 0 is an L1 hash block, then 203 groups of
-       [1 L0 hash block + 204 data blocks], 41,412 logical blocks per file
+### RETRACTED: the 6.6% I published first
 
-Logical block n therefore lives at
+That figure was measured on a corrupt image and pointed the opposite way. The
+same title now reads 98.0%.
+
+**The SVOD `Data*` chunks are hash-interleaved.** Verified arithmetically:
+
+    0xA290000 / 0x1000   = 41,616 blocks per full Data file
+    1 + 203 x (1 + 204)  = 41,616      <- exact
+
+so block 0 is an L1 hash block, then 203 groups of [1 L0 hash + 204 data],
+giving 41,412 logical blocks per file:
 
     file = n // 41412
     off  = (2 + (n % 41412) // 204 * 205 + (n % 41412) % 204) * 0x1000
 
-**Why the validation gate did not catch it.** The XBE header and section table
-sit inside the first clean 204-block run, so `xbe_parser` printed a correct
-title, build date, base address and 56 plausible sections for a file that is
-corrupt from roughly 832 KB in. A gate that only parses the header proves
-nothing about the body. The honest checks are: map the directory entry's
-start_sector through the de-interleave and confirm it lands on one of the raw
-`XBEH` hits, and confirm the last section's raw end falls inside the file.
+A flat contiguous copy silently splices hash blocks into the payload. Proven
+independently of the arithmetic: for a hash block at H,
+`sha1(data[H+0x1000:H+0x2000]) == data[H:H+20]`.
 
-### The real number, from Crimson Skies
+The corrupt-vs-correct pairs make the size of the effect plain: Blinx 6.6% →
+**98.0%**, Fuzion 15.9% → **97.6%**.
 
-Extracted with de-interleaving, integrity-checked, and re-run independently:
+### The validation gate that failed, and the one that works
 
-    module: default.xbe [20F90F]   MS-named function starts: 3,106
-      hit (we detect a start there):      3,073   (98.9%)
-      missed, inside a detected function:    16   <- under-segmentation
-      missed, in no detected function:       17   <- uncovered
+My gate — parse the XBE and check title, date, base and section names — **passes
+on a corrupt file**. Every one of those fields was correct on all three corrupt
+extractions, including the XDK version. Two cheap fields are the real tells:
 
-**98.9%**, on a bare run with no seed files. Our function-boundary detection
-agrees with Microsoft's ground truth almost everywhere. The 16 under-
-segmentation misses are not a general weakness: they cluster in Dolby/FFT
-kernels, where MS names each radix variant separately inside one blob, and in
-MSVC scalar-deleting-destructor thunks that genuinely share a body.
+- **Kernel imports.** Correct Blinx: 0 `Unknown_*`. Corrupt: hundreds, with
+  absurd ordinals. Conker corrupt: 288 bogus against 145 named.
+- **TLS.** Correct Blinx: `0x0 - 0x0`, zero-fill 12. Corrupt: `0x20202020`,
+  zero-fill 1,931,507,823.
 
-That is the opposite of the conclusion the corrupt Blinx run supported, and it
-changes what the oracle says about adoption-plan item 5: on this evidence
-"keep the sweep in phase at source" is not buying a large correctness win.
+I saw that TLS block on the corrupt Blinx, called it "an unused TLS, fine", and
+moved on. It was the signal.
 
-### Blinx remains unextracted, and its layout is not Crimson's
+A third, stronger check: the header declares a kernel-thunk VA, and the
+`0x8000xxxx` ordinal run must actually be there. On corrupt Conker it sat
+0x6000 high — exactly six hash blocks.
 
-Its descriptor parses (`MICROSOFT*XBOX*MEDIA` at logical block 0) but the root
-directory it names is outside the stored data: root sector 1,693,790 needs
-logical block 846,879 and the package holds 417,798. There is exactly one
-volume descriptor in the whole package, and no valid `default.xbe` directory
-entry appears in the first 4,000 logical blocks. Crimson's root sits at sector
-34; Blinx's does not. Blinx is DVD_X2 media, so a partition base is the
-obvious suspect, but deriving one from the root-sector-minus-two assumption
-lands on hash data. Unresolved, and a separate piece of work.
+### The sector base is per-title, and is not 32
+
+`GDF sector 32 -> logical block 0` holds for Crimson and Fuzion and **fails for
+Blinx and Conker**, whose dirent sectors are absolute on a larger disc:
+
+| donor | base | root sector |
+|---|---:|---:|
+| Crimson Skies | 32 | 34 |
+| Fuzion Frenzy | 32 | 66 |
+| Blinx | 880,036 | 1,693,790 |
+| Conker | 956,202 | 1,711,833 |
+
+Recover it by solving the root sector against a known `XBEH` physical offset,
+then confirm the root directory table parses into sane entries. Blinx's root
+holds exactly three: `default.xbe`, `media`, `xdemos`.
+
+Note also that `attr` is not a discriminator — 0x21 on Crimson, 0x80 on Blinx
+and Conker. `namelen == 11` plus a size consistent with the XBE's last section
+end is what identifies the real dirent; most ASCII `default.xbe` hits are
+in-XBE path strings whose preceding bytes decode as garbage entries.
 
 ## And the version gap is wider than the date suggested
 
