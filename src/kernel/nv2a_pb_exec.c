@@ -2382,29 +2382,30 @@ static void fb_watch_report(void)
                 s_fbw.still_too_early, s_fbw.still_changes, s_fbw.after);
 }
 
-static void write_bmp(const char *tag, unsigned seq,
-                      const uint8_t *base, uint32_t pitch,
-                      uint32_t x0, uint32_t y0,
-                      uint32_t w, uint32_t h, uint32_t bpp)
+/* Write one surface region to an explicit path. The prefix-and-sequence
+ * naming the dumpers use is built by write_bmp below; a mark supplies its
+ * own path (see nv2a_pb_exec_snapshot_to_file) so it can never land in, or
+ * overwrite, the RECOMP_FB_DUMP directory. Returns 1 if a file was written. */
+static int write_bmp_path(const char *path,
+                          const uint8_t *base, uint32_t pitch,
+                          uint32_t x0, uint32_t y0,
+                          uint32_t w, uint32_t h, uint32_t bpp)
 {
-    const char *prefix = getenv("RECOMP_FB_DUMP");
-    char path[512];
     uint32_t y, x;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
 
-    if (!prefix || !base || !w || !h || (bpp != 2 && bpp != 4))
-        return;
+    if (!path || !base || !w || !h || (bpp != 2 && bpp != 4))
+        return 0;
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%s%03u.bmp", prefix, tag, seq);
     f = fopen(path, "wb");
     if (!f)
-        return;
+        return 0;
 
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 'B'; hdr[1] = 'M';
@@ -2447,6 +2448,31 @@ static void write_bmp(const char *tag, unsigned seq,
             fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u, %ubpp)\n",
                     path, w, h, bpp);
     }
+    return 1;
+}
+
+static void write_bmp(const char *tag, unsigned seq,
+                      const uint8_t *base, uint32_t pitch,
+                      uint32_t x0, uint32_t y0,
+                      uint32_t w, uint32_t h, uint32_t bpp)
+{
+    const char *prefix = getenv("RECOMP_FB_DUMP");
+    char path[512];
+    if (!prefix)
+        return;
+    snprintf(path, sizeof path, "%s%s%03u.bmp", prefix, tag, seq);
+    write_bmp_path(path, base, pitch, x0, y0, w, h, bpp);
+}
+
+/* The presented frame, to a path the caller names. For a mark: the picture
+ * the player was looking at when they pressed the key. Independent of
+ * RECOMP_FB_DUMP by design. */
+int nv2a_pb_exec_snapshot_to_file(const char *path)
+{
+    if (!s_snap || !s_snap_w || !s_snap_h)
+        return 0;
+    return write_bmp_path(path, s_snap, s_snap_w * s_snap_bpp, 0, 0,
+                          s_snap_w, s_snap_h, s_snap_bpp);
 }
 
 /* The surface as it stands right now, wherever the guest last pointed it. */

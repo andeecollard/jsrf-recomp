@@ -1906,6 +1906,10 @@ unsigned long long xbox_PadRecordHash(void) { return g_pad_rec_hash; }
  * line a person is waiting on, and a session that crashes ten seconds later
  * must still have it. Not a pad event, so the checkpoint hash is unchanged
  * and a marked recording replays identically to an unmarked one. */
+static void (*g_pad_mark_hook)(unsigned long, const char *);
+void xbox_PadRecordSetMarkHook(void (*fn)(unsigned long, const char *))
+{ g_pad_mark_hook = fn; }
+
 void xbox_PadRecordMark(const char *label)
 {
     unsigned long f = g_pad_guest_frame;
@@ -1925,6 +1929,7 @@ void xbox_PadRecordMark(const char *label)
             g_pad_rec_f ? " (written to the recording)"
                         : " (no recording open: log only)");
     fflush(stderr);
+    if (g_pad_mark_hook) g_pad_mark_hook(f, lab);
 }
 
 int xbox_PadNearMark(unsigned long frame, unsigned long slack, const char **label)

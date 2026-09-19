@@ -152,6 +152,9 @@ void xbox_PadRecordClose(void);
  * only fire around a symptom asks. */
 void xbox_PadRecordMark(const char *label);
 int  xbox_PadNearMark(unsigned long frame, unsigned long slack, const char **label);
+/* Called from inside xbox_PadRecordMark, after the mark is written, with
+ * the frame and label -- the harness hangs a picture off it. NULL clears. */
+void xbox_PadRecordSetMarkHook(void (*fn)(unsigned long frame, const char *label));
 unsigned long long xbox_PadRecordHash(void);
 #endif /* !_WIN32 */
 

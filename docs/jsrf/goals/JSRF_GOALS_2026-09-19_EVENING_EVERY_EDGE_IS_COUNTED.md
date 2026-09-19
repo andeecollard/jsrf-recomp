@@ -236,6 +236,78 @@ third. Each is a C change and a rebuild; none needs a regeneration. The mark
 needs one player session to try, and that session should be recorded on
 whatever gen is current then.
 
+**16:18 — the first two are built, tested and in the player's bundle.**
+
+- **Mark: press `M` in the game window.** It writes `#!mark <frame> M` into
+  the open recording (flushed at once) and `[PAD-MARK] #k frame=… t=…` to
+  the log; a replay echoes each mark at its frame; the harness verdict lists
+  them. `jsrf_pad_record` proves a marked recording replays identically and
+  that the mark comes back from the file. `~/jsrf-build/JSRF.app` was
+  rebuilt from this binary at 16:18 and is current.
+- **State trace: `RECOMP_STATE_TRACE=<path>`.** One line per guest frame:
+  scene anchor, playtime, running indirect-call count, running draw count.
+  `state_trace_diff.py a b [--marks rec]` names the first frame each field
+  differs, tells drift from a step, and finds the nearest mark.
+- **The floor, measured 16:27, and it is the whole signal.** Two 240 s runs
+  of `gameplay_nobarrage.pad` on the same build: indirect calls differ from
+  **frame 1** (3,019 vs 3,013), draws from frame 2, the per-frame call gap
+  swings by ±2–3k every few frames (work straddling the flip), and the runs
+  reach the first scene **50 frames apart** (f2471 vs f2521) with different
+  frame counts in 240 s (14,400 vs 14,067). So a per-frame cumulative trace
+  of two free-running runs cannot name a first divergence: boot pacing
+  misaligns them before gameplay starts, and the scene anchor reads 0 in a
+  scripted run because it is save-data. **What step 4 needs instead:** key
+  the trace on the recording's checkpoint runs (input-defined, so aligned by
+  construction across replays of the SAME recording), record per-run deltas
+  not cumulative counts, and compare only replays. The frame-keyed trace
+  stays as a raw instrument; `state_trace_diff.py` should grow a
+  `--align-on-runs` mode that reads the `.padrec` and folds frames into its
+  runs before diffing. Not started.
+
+## G24 — "the wire fence transparency bug is back", 16:28
+
+The player saw it **in a harness window**, not in the bundle (confirmed;
+no bundle session has logged since the 16:18 rebuild). What is known:
+
+- The 16 Sep cause is not it: `[VSH] (vsh_dp_zero on)` in every harness
+  run today, and the switch defaults on in code (`nv2a_vsh.c:211`).
+- **The harness and the bundle render on different paths.** The player's
+  `paths.conf` exports `RECOMP_METAL_FF=1` (fixed-function vertex work on the
+  GPU); the harness does not, so its fixed-function batches take the CPU
+  path. `d911171` is the commit where "the GPU fixed-function path stops
+  drawing a different picture from the CPU one" — the two paths have
+  disagreed on this exact class of geometry before. The renderer's other
+  self-named banners are identical between the player's 13:29 log and a
+  harness run (diffed), so this is the one rendering difference.
+- A CPU-vs-GPU pair (`ffpair-cpu`, `ffpair-gpu`, 200 s each, 13 captures
+  each after 60 s) did not land on a fence at a comparable moment: the two
+  runs drift apart in guest time before gameplay, as the floor measurement
+  above predicts. Contact sheets in the session scratchpad; nothing
+  conclusive in them.
+- A watch run (`fence-watch`, 300 s) was put on screen with the mark key
+  live; **no mark was pressed** before it ended.
+
+**The mark now takes a picture.** `M` in any window — bundle or harness —
+saves the presented frame to
+`~/Library/Application Support/JSRF/marks/mark-<date>-f<frame>-<label>.bmp`
+and logs the frame. It is the frame the window is fed, not the live
+surface, and it can tear (main thread reads, push-buffer thread writes);
+either is evidence. Not gated on `RECOMP_FB_DUMP` and never written there.
+
+**Next, and it needs the player's eyes for one press:** run
+`play_scripted.sh` again (any schedule that reaches the garage), watch for
+the fence, press `M`. Then the same with `RECOMP_METAL_FF=1` exported. If
+only the CPU arm shows it, the defect is in a path the player does not use
+and the priority is the harness, not the picture. If both show it, it is
+in the bundle too and G24 outranks G21.
+
+**A decision for the player, not made here:** the harness renders on the
+CPU fixed-function path by default and the bundle on the GPU one, so a
+harness window is not the player's picture. Making `play_scripted.sh`
+default to the player's rendering exports (`METAL_FF=1` at least) would
+close that — at the cost that the 782-run corpus and every frame-time A/B
+in it were taken on the other path. Written down rather than flipped.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is

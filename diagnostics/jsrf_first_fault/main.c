@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <ctype.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -2117,6 +2119,43 @@ static void jsrf_state_trace_frame(unsigned long f)
 static void jsrf_state_trace_flush(void)
 {
     if (g_state_trace) fflush(g_state_trace);
+}
+
+/* A mark takes a picture. "The fence is see-through HERE" is a frame number
+ * and a label without this; with it, the presented frame the player was
+ * looking at lands beside the recording as
+ *   ~/Library/Application Support/JSRF/marks/mark-<date>-f<frame>-<label>.bmp
+ * whichever window the M was pressed in -- the bundle or a harness run. The
+ * copy dumped is s_snap, the frame the window is fed, not the live surface,
+ * so it is what the viewer saw; it may be a frame or two later than the
+ * press, and the key is read on the main thread while the flip copies on
+ * the push-buffer thread, so a torn picture is possible and is still
+ * evidence. Not gated on RECOMP_FB_DUMP, and it never touches that
+ * directory: a mark must never overwrite a dump, and a dump must never be
+ * mistaken for a mark. */
+static void jsrf_mark_picture(unsigned long frame, const char *label)
+{
+    extern int nv2a_pb_exec_snapshot_to_file(const char *path);
+    const char *home = getenv("HOME");
+    char dir[512], path[640], stamp[32], safe[32];
+    time_t now = time(NULL);
+    struct tm tmv;
+    size_t i;
+    if (!home || !*home) return;
+    snprintf(dir, sizeof dir, "%s/Library/Application Support/JSRF/marks", home);
+    mkdir(dir, 0755);
+    localtime_r(&now, &tmv);
+    strftime(stamp, sizeof stamp, "%Y-%m-%d_%H%M%S", &tmv);
+    for (i = 0; label[i] && i + 1 < sizeof safe; i++)
+        safe[i] = (isalnum((unsigned char)label[i])) ? label[i] : '_';
+    safe[i] = 0;
+    snprintf(path, sizeof path, "%s/mark-%s-f%lu-%s.bmp", dir, stamp, frame, safe);
+    if (nv2a_pb_exec_snapshot_to_file(path))
+        fprintf(stderr, "  [PAD-MARK]   picture: %s\n", path);
+    else
+        fprintf(stderr, "  [PAD-MARK]   no picture: nothing has been presented"
+                " yet, or the file could not be written\n");
+    fflush(stderr);
 }
 #endif /* !_WIN32 */
 
@@ -4622,6 +4661,7 @@ int main(int argc, char **argv)
 #endif
         );
     xbox_PadRecordSetAnchorFn(jsrf_pad_anchor);
+    xbox_PadRecordSetMarkHook(jsrf_mark_picture);
 #endif
     fflush(stderr);
     printf("XBE: %s\nGame dir: %s\n", xbe_path, game_dir);
