@@ -736,6 +736,135 @@ void jsrf_dsound_this_seen(unsigned int t)
     }
 }
 
+/* THE SAME POINTER, WITHOUT A GEN PROBE -- AND IT WAS ALWAYS IN OUR HANDS.
+ *
+ * Everything above is written as though `this` can only be captured by
+ * patching the generated C, because "it is a thiscall parameter, never loaded
+ * from a guest global". The parameter part is true. The conclusion is not:
+ * the title HANDED US that pointer at boot and the kernel wrote it down.
+ *
+ * The APU is IRQ vector 5 (kernel_bridge.c says so where it pumps the device
+ * interrupts), and an Xbox ISR is
+ *
+ *     BOOLEAN __stdcall ISR(PKINTERRUPT Interrupt, PVOID ServiceContext)
+ *
+ * so the context travels in the KINTERRUPT the title passed to
+ * KeConnectInterrupt, at +4. Read out of the generation this tree builds
+ * against, the whole path from that word to `this` is three instructions:
+ *
+ *     sub_001A2681:  ecx = MEM32(esp + 8);        <- ServiceContext
+ *                    call sub_001A2638
+ *     sub_001A2638:  esi = ecx;  ...  call sub_001A25AA   (ecx untouched)
+ *     sub_001A25AA:  edi = ecx;                   <- `this`
+ *
+ * and 0x001A2681 is exactly the routine the log records for vector 5.
+ *
+ * THREE INDEPENDENT CONFIRMATIONS, which is why this is allowed to replace the
+ * probe rather than sit beside it:
+ *
+ *   1. The dataflow above, which is not an inference -- ecx is never written
+ *      between the ISR's prologue and 001A25AA.
+ *   2. The recovered symbol, and it is an EXACT byte-signature match rather
+ *      than one of the position-inferred names the table marks with a leading
+ *      `~`. 001A25AA is `?HandleFETrap@CMcpxAPU@@IAEXXZ`, i.e.
+ *      `protected: void __thiscall CMcpxAPU::HandleFETrap(void)`. A
+ *      __thiscall with NO parameters takes its only input in ecx, so ecx is
+ *      `this` by the calling convention, and the object is a CMcpxAPU -- the
+ *      class that owns the voice table. The two calls this function ends with
+ *      are `?SetFrontEndState@CMcpxCore@DirectSound@@IAEXW4MCPX_FE_STATE@@@Z`
+ *      on `this+8`, the CMcpxCore subobject, which is only coherent if `this`
+ *      is the APU object. (Its caller 001A2638 is named
+ *      `~?ServiceApuInterrupt@CMcpxAPU@@IAEHXZ` -- inferred, so worth nothing
+ *      on its own, but the bytes agree: it reads ISTS at 0xFE801000,
+ *      acknowledges it, and dispatches on bit 0x10.)
+ *   3. The runs that carried instrument_dsound_this.py report
+ *      `this=0x008EA8B4`, and the same session's KeConnectInterrupt line reads
+ *      `context=0x008EA8B4 vector=5`. Two captures, one value.
+ *   4. The crash dump's own guest stack. Under the faulting frame it reads
+ *      001A2031 / 001A2450 / 001A24D1 / 001A25D9 / 001A2660 / 001A268A and
+ *      then 001BA718 -- which is the KINTERRUPT the log records for vector 5.
+ *      The chain this walks up is the chain the crash walks down.
+ *
+ * The 0x2C4 offset is NOT from the symbols -- signature transfer recovers
+ * names, never field offsets. It comes from 001A200D's own
+ * `ecx = MEM32(ecx + eax*4 + 0x2C4)`, and nothing else.
+ *
+ * WHY IT MATTERS THAT THIS IS NOT A PROBE. Every owner[] number this project
+ * has was taken from an instrumented gen tree, which means no shipped build
+ * could ever act on one: the guard below was gated on a pointer that is zero
+ * in every build a player runs. Resolving it here makes the check a property
+ * of the model instead of a property of somebody's debugging tree.
+ *
+ * The probe still wins if it has fired -- it observes the value the ISR is
+ * actually using, this only observes the value the ISR was registered with --
+ * and a disagreement is counted rather than silently preferred.
+ *
+ * A WEAK DEFINITION, not a weak reference, and the difference was measured:
+ * a weak *reference* still makes ld64 pull kernel_bridge.c.o out of the
+ * archive to satisfy it, and that object needs recomp_lookup, which the small
+ * APU unit tests do not have. jsrf_apu_pace_test failed to link on exactly
+ * that. A weak DEFINITION here satisfies the reference without pulling
+ * anything in, and is overridden by the kernel's strong definition in every
+ * link that already contains it.
+ *
+ * Which of the two ran is not left to inference: the stub records that it was
+ * called, and the report says so rather than printing an unexplained zero. */
+#define JSRF_APU_IRQ_VECTOR 5u
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+/* Set only if the fallback below answered -- i.e. the kernel's interrupt
+ * table is not in this link. A positive control for `this` reading zero. */
+int g_jsrf_dsound_no_kernel;
+#if !defined(_MSC_VER)
+__attribute__((weak)) uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
+{
+    (void)vector;
+    g_jsrf_dsound_no_kernel = 1;
+    return 0;
+}
+#endif
+
+/* 0 nothing, 1 the gen probe, 2 the connected KINTERRUPT. Printed, because a
+ * reader of an owner[] count has to know which table it came out of. */
+int g_jsrf_dsound_this_src;
+/* The probe and the KINTERRUPT disagreed. Non-zero retires the claim that
+ * they are the same object and every count below has to be retaken. */
+unsigned long g_jsrf_dsound_this_disagree;
+unsigned int  g_jsrf_dsound_this_kint;
+
+unsigned int jsrf_dsound_this(void)
+{
+    static unsigned int cached;
+    uint32_t iv, ctx;
+
+    /* The probe, if it fired: it sees the live thiscall, not the
+     * registration. Cross-check it against the KINTERRUPT once. */
+    if (g_jsrf_dsound_this) {
+        if (g_jsrf_dsound_this_src != 1) {
+            g_jsrf_dsound_this_src = 1;
+            if (g_jsrf_dsound_this_kint
+                && g_jsrf_dsound_this_kint != g_jsrf_dsound_this)
+                ++g_jsrf_dsound_this_disagree;
+        }
+        return g_jsrf_dsound_this;
+    }
+    if (cached) return cached;
+    iv = xbox_GetConnectedInterrupt(JSRF_APU_IRQ_VECTOR);
+    if (!iv) return 0;                      /* not connected yet */
+    /* The routine is the field whose correctness can be checked rather than
+     * assumed -- a half-built KINTERRUPT has it zero. Same reasoning as
+     * bridge_interrupt_ready, which this deliberately mirrors. */
+    if (!ldl_le_phys(address_space_memory, iv + 0)) return 0;
+    ctx = (uint32_t)ldl_le_phys(address_space_memory, iv + 4);
+    /* owner[] is read at ctx+0x2C4+h*4 for h < 0x100, so the whole table has
+     * to be inside the RAM ldl_le_phys can address. Anything else is a
+     * context that is not a DirectSound object and must not be indexed. */
+    if (!ctx || ((ctx + 0x2C4u + 0xFFu * 4u) & ~g_apu_ram_mask) != 0) return 0;
+    cached = ctx;
+    g_jsrf_dsound_this_kint = ctx;
+    if (!g_jsrf_dsound_this_src) g_jsrf_dsound_this_src = 2;
+    return cached;
+}
+
 unsigned long g_idle_owner_null_raises;  /* raises whose owner[h] read NULL */
 unsigned long g_idle_owner_ok_raises;    /* positive control for that zero */
 unsigned long g_idle_owner_null_h0;      /* ...and h==0: the FATAL combination */
@@ -1964,20 +2093,35 @@ void mcpx_apu_idle_trap_report(int crash)
      * nothing, and it fails in the most expensive way available -- it reads
      * ZERO, which looks like an answer. It sits beside [APU-IDLE-TRAP] now
      * because that line is in the crash dump, verified by finding it there. */
-    if (!g_jsrf_dsound_this) {
+    unsigned int dsound_this = jsrf_dsound_this();
+    if (!dsound_this) {
         fprintf(stderr, "  [APU-IDLE-OWNER] NOT MEASURED -- the guest's"
-                " DirectSound `this` was never captured, so owner[h] was never"
-                " read. Install the probe with"
-                " diagnostics/jsrf_first_fault/instrument_dsound_this.py and"
-                " rebuild. This is NOT a zero result."
-                " (probe entered %lu time(s).)\n", g_jsrf_dsound_this_calls);
+                " DirectSound `this` was never resolved, so owner[h] was never"
+                " read. It is the ServiceContext of the KINTERRUPT the title"
+                " connects on vector 5 (the APU), so a zero here means the"
+                " title had not connected it yet%s. This is NOT a zero"
+                " result. (gen probe entered %lu time(s).)\n",
+                g_jsrf_dsound_no_kernel
+                    ? " -- except that it means NEITHER: the weak fallback"
+                      " answered, so the kernel's interrupt table is not in"
+                      " this link at all"
+                    : "",
+                g_jsrf_dsound_this_calls);
     } else {
-        fprintf(stderr, "  [APU-IDLE-OWNER] this=0x%08X  owner[h] at the raise:"
+        fprintf(stderr, "  [APU-IDLE-OWNER] this=0x%08X (from %s)  owner[h] at the raise:",
+                dsound_this,
+                g_jsrf_dsound_this_src == 1 ? "the gen probe"
+                                            : "vector 5's ServiceContext");
+        if (g_jsrf_dsound_this_disagree)
+            fprintf(stderr, " -- WARNING: the probe (0x%08X) and the"
+                    " KINTERRUPT (0x%08X) DISAGREE, so every owner[] count"
+                    " below is read through one of two tables and has to be"
+                    " retaken --", g_jsrf_dsound_this, g_jsrf_dsound_this_kint);
+        fprintf(stderr, "\n  [APU-IDLE-OWNER] "
                 " %lu non-NULL, %lu NULL. A NULL is a handle 001A200D"
                 " dereferences unguarded, and it is fatal only for h==0 --"
                 " which is every crash dump this project has. non-NULL>0 is"
                 " the positive control for a NULL count of 0.\n",
-                g_jsrf_dsound_this,
                 g_idle_owner_ok_raises, g_idle_owner_null_raises);
         fprintf(stderr, "  [APU-IDLE-OWNER]   of those NULLs, %lu were h==0"
                 " (the only combination that reaches the faulting call);"
@@ -4911,10 +5055,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                      * the report says so rather than reporting a zero that
                      * looks like an answer -- which is the exact failure this
                      * counter has already had twice today. */
-                    if (g_jsrf_dsound_this && v < 0x100) {
+                    unsigned int dsound_this = jsrf_dsound_this();
+                    if (dsound_this && v < 0x100) {
                         uint32_t owner = ldl_le_phys(
                             address_space_memory,
-                            g_jsrf_dsound_this + 0x2C4u + (uint32_t)v * 4u);
+                            dsound_this + 0x2C4u + (uint32_t)v * 4u);
                         if (owner) ++g_idle_owner_ok_raises;
                         else {
                             ++g_idle_owner_null_raises;
