@@ -583,6 +583,70 @@ reading is still wrong or the buffer holds something else at that moment.
 It does not change the finding above — which rests on the absence of a GPU
 copy, not on the decode — but it is not understood.
 
+## G2 ROOT CAUSE LOCATED, 21:05 — THE FONT HAS TWO LATIN PAGES AND WE GET THE SECOND ONE WRONG
+
+**`Media/Font/jetfont.dat` decoded.** It is a "NORM" archive of six textures,
+each behind a 0x10-byte descriptor chain and a 0x20-byte texture header
+(width at +0x14, format byte at +0x18: 0x06 DXT3, 0x05 DXT1):
+
+| blob | size | what |
+|---|---|---|
+| 0-3 | 512x512 DXT3 | **CJK** sheets, 26x26 grid, 19x19 = 361 cells each |
+| 4 | 256x256 DXT3 | **Latin page 0**, 21x34 grid, 12 cols |
+| 5 | 256x256 DXT3 | **Latin page 1** |
+
+**Latin page 0 holds codes 0x21..0x75 — `!` through `u` — 84 cells, with
+`\` (0x5C) omitted. It ENDS at `u`.** Page 1 row 0 is:
+
+```
+col 0 = 0x76 'v'   col 1 = 0x77 'w'   col 2 = 0x78 'x'
+col 3 = 0x79 'y'   col 4 = 0x7A 'z'   col 5.. = Latin-1 supplement
+```
+
+**The page boundary is at character code 0x76, and the corrupted letters are
+exactly 0x76-0x79.** Every sighting on record — `Now`, `next`, `spray`, `how`,
+`you`, `new`, `without`, `try`, `memory`, `save`, `saving` — is a page-1
+character, and no page-0 character has ever been caught wrong.
+
+**What the replacements are.** The runtime resource the text draws sample at
+VA 0x01737000 is 262,144 bytes, which the earlier measurement read as
+"512x512, 4 bytes/pixel, linear" — that is a **misreading of a 512x512 DXT3
+blob** (DXT3 is exactly 1 byte per pixel, so 512x512 = 262,144). It is a
+**CJK sheet**, not a Latin page. Which is why the decode never looked like
+text, and why the wrong glyphs are TALLER than their neighbours and shaped
+like kanji: **a page-1 character is sampling a CJK sheet.**
+
+**The mechanism, stated as inference and not yet proven in code:** a line
+containing a page-1 character needs a second draw with a different texture
+bound, and that binding is wrong — the CJK sheet stays bound, or page 1 is
+never bound. That also explains what the player sees as text "flickering in
+layers": text spanning both pages is drawn in more than one pass, and only
+the second pass is wrong. It explains the leading-character loss the same
+way, if a pass is dropped rather than mis-bound.
+
+**What is now cheap to check, and needs no player:**
+1. Find where the title selects the font page and binds the texture; confirm
+   whether our recompilation of it ever binds blob 5.
+2. Watch the six texture loads out of `jetfont.dat` and record the guest VA
+   each blob lands at; then a text draw naming a 512x512 VA where a 256x256
+   Latin page belongs is the defect, caught directly.
+3. The Latin pages are 256x256 DXT3 = 65,536 bytes. Any draw sampling
+   262,144 bytes for text is on a CJK sheet by construction.
+
+**Method note, paid for twice today:** a texture's SIZE IN BYTES does not give
+its dimensions without its format. 262,144 bytes is 512x512 DXT3, 256x256 at
+4 bytes, or 512x512 at 1 byte, and the wrong choice produced two images of
+stripes and an hour chasing a GPU staleness hypothesis that the same bytes
+had already refuted. The format byte is in the asset header; read it.
+
+**Not yet reproduced in my own captures.** Two 190-230 s runs with the glyph
+dump armed caught 1,435 textured draws and none of them were text — the
+font's load address varies per run, so a filter on 0x01737000 excluded
+everything in one run, and in the other the text draws fell outside the
+capture window. The finding above rests on the decoded asset and the
+player's photographs, not on a captured corrupt draw. Capturing one is
+step 2 above.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is

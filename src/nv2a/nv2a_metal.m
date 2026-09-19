@@ -4170,9 +4170,9 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
      &&(!glyph_tex||s->texture_offset==glyph_tex)
      &&xbox_TraceSeconds()>=glyph_after){
    unsigned quads=count/vpq;
-   fprintf(stderr,"  [GLYPH] draw: %u quads, tex0 %08X %ux%u fmt%s%s, prim %u,"
-           " target %08X\n",
-           quads,s->texture_offset,s->width,s->height,
+   fprintf(stderr,"  [GLYPH] draw: t=%.1fs %u quads, tex0 %08X %ux%u fmt%s%s,"
+           " prim %u, target %08X\n",
+           xbox_TraceSeconds(),quads,s->texture_offset,s->width,s->height,
            s->dxt1?" dxt1":"",s->rgba8?" rgba8":"",primitive,s->target_offset);
    /* Pitch and swizzle decide how the dumped bytes are read back, and
     * guessing cost two decodes: a linear atlas whose pitch is not width*bpp
