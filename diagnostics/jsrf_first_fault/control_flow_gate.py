@@ -188,9 +188,11 @@ def scan_gen(gen_dir):
                     break
             owners_of_table[int(m.group(1), 16)].add(owner)
     stub_path = os.path.join(gen_dir, "recomp_stubs_unresolved.c")
-    stubs = 0
+    stub_names = set()
     if os.path.exists(stub_path):
-        stubs = len(DEF_RE.findall(open(stub_path, errors="ignore").read()))
+        stub_names = set(DEF_RE.findall(open(stub_path, errors="ignore").read()))
+    stubs = len(stub_names)
+    scan_gen.stub_names = stub_names
     itail_classified = sum(counts[k] for k in
                            ("switch_unresolved", "switch_default", "itail_vtable",
                             "itail_abs", "itail_reg", "itail_manual"))
@@ -228,6 +230,7 @@ def walk_arms(xbe_path, owners_of_table, defined, window):
 
     arms_total = arms_missing = tables_hit = 0
     rows = []
+    arms_of = {}
     for table, owners in sorted(owners_of_table.items()):
         starts = [int(o[4:], 16) for o in owners if o]
         anchor = min(starts) if starts else table
@@ -247,9 +250,10 @@ def walk_arms(xbe_path, owners_of_table, defined, window):
         if missing:
             tables_hit += 1
         rows.append((table, sorted(o or "?" for o in owners), len(tight), len(missing)))
+        arms_of[table] = tight
     return {"switch_arms_tight": arms_total,
             "switch_arms_no_body": arms_missing,
-            "switch_tables_with_missing_arm": tables_hit}, rows
+            "switch_tables_with_missing_arm": tables_hit}, rows, arms_of
 
 
 def coverage(functions_path):
@@ -293,7 +297,7 @@ def main():
     measures.update(coverage(args.functions))
     arm_rows = None
     if xbe:
-        arm_measures, arm_rows = walk_arms(xbe, owners_of_table, defined, args.window)
+        arm_measures, arm_rows, _ = walk_arms(xbe, owners_of_table, defined, args.window)
         measures.update(arm_measures)
 
     print("control-flow edges in %s" % args.gen)

@@ -117,19 +117,32 @@ sides. The 122 sites are `bound`, `arpl`, `hlt`, `outsb`, `sti`, `enter`,
 and one scripted run with `RECOMP_UNIMPL_TRAP=1` either completes or names a
 live site by address. Either answer is a result.
 
-**Two things the TODO list says that need a look, no run needed:** `popfd`
-has 4 sites although the handover says upstream #72 (popfd) was applied
-locally — either the applied form does not cover these operands or the gen
-predates it; and `hlt` has 7, which the lifter deliberately refuses to no-op
-because it would turn a wait into a spin.
+**The `popfd` question is closed, no run needed.** The lifter's own note at
+`lifter.py:450` says every `popfd` in this title disassembles inside data —
+the zero-padded regions of `DOLBY` (0x0027Exxx) and `DSOUND` (0x001Axxxx) —
+and the four gen sites bear it out: each sits between an `ebx = 0xDE00129Bu`
+and a `hlt`, i.e. a linear sweep reading bytes. Upstream #72 is about the
+instruction's semantics, not these sites. `hlt` has 7 sites in the same
+regions; the lifter deliberately refuses to no-op it because that would turn
+a wait into a spin, and the marker will say whether any is ever reached.
 
-### G22c — the runtime side, per run — OPEN
+### G22c — the runtime side, per run — TOOL DONE, corpus pass open
 
-The static classes above have runtime counterparts: `[ITAIL]`, `[ICALL]`,
-`[UNIMPL]`. Nothing joins them. A per-run summary — which unresolved sites
-were *reached*, how often, in which class — beside the gate's static counts
-would say which of the 152 dispatches and 122 sites the title actually
-touches. The corpus tooling that tallied 17 freezes is the place to add it.
+`diagnostics/jsrf_first_fault/edge_runtime_summary.py` reads a run's
+`stderr.log`, takes every VA the runtime reported — `[ITAIL]` unresolved,
+`[ICALL]` failed, not-code, runaway, `[UNIMPL]` reached — and says which
+static class each is: an arm of which unresolved table (and its owner), a
+stub, a body the gen defines (a dispatch-table miss, a different bug), an
+untranslated site, or unknown to the detector. It prints the log's own
+`[GEN]` line beside the gen's manifest, because a VA is only meaningful on
+the gen that produced the log: run on the 08:25 crash log it correctly
+reports that log as translator `b6f29140`, not the current gen, and
+`0x000A5B8C` reads `unknown` there because on *this* gen it is no longer an
+arm of anything — it lifts to a goto inside `sub_000A5B60`.
+
+**Open:** run it over the 782-run corpus and the player logs, per gen, and
+fold the reached-set into the handover. Until then the gate's 152 / 168 /
+122 are upper bounds on what the title touches, not counts of what it does.
 
 ### G22d — the reference execution — OPEN, and bounded
 
@@ -150,17 +163,55 @@ Unchanged from the midday file: the remaining unresolved tables need a
 the lifter's ≥2-arms rule, was measured unnecessary. Do not reopen it without
 a number.
 
-### G22f — explain the drop from 84 to 62 — OPEN
+### G22f — explain the drop from 84 to 62 — HALF ANSWERED, and the method is now fixed
 
 The midday file counted **84** unresolved tables, **607** arms and **8,866**
 starts and quoted coverage **1,614,033**. The 12:45 regeneration reads **62 /
-487 / 8,846 / 1,613,483**. The two detector fixes account for four or five
-tables by their own commit messages, not twenty-two. The discovery loop is
-stateful (`vtable_seeds_accum.json`, `icall_seed.json`), so a regeneration is
-not bit-stable and the earlier numbers were taken on the shared gen and on
-worktree trees, not this one. Until someone diffs the two `functions.json`
-files, **do not describe 84→62 as "22 tables fixed".** The gate pins the
-current numbers so the next drift is at least visible.
+487 / 8,846 / 1,613,483**. The earlier numbers were taken on the shared gen
+and on worktree trees that no longer exist, so they cannot be diffed. What
+CAN be said, measured at 15:40:
+
+**The detector is deterministic given its seed state, and one pass takes
+17 seconds.** With `RECOMP_SEED_INTERIOR=1` — which `regenerate.sh` exports
+by default and which turns on the pass that drops interior vtable seeds — a
+single `tools.disasm` pass fed the final `vtable_seeds_accum.json` reproduces
+the live `functions.json` **exactly**: 8,846 starts, 1,613,483 bytes, every
+extent identical. Without that switch the same pass keeps 1,129 extra
+`seed_vtable_thunk` starts (9,975), which is what a reader who runs the
+detector by hand will see and should not mistake for a regression.
+
+| pass | starts | covered | vs live |
+|---|---:|---:|---|
+| live 12:44 database | 8,846 | 1,613,483 | — |
+| final accumulator + demotion (one pass) | 8,846 | 1,613,483 | **identical** |
+| final accumulator, no demotion | 9,975 | 1,619,541 | +1,129 vtable-thunk starts |
+| empty accumulator + demotion (the round-1 oracle) | 8,557 | 1,593,703 | 444 only here, 733 only live |
+
+So the numbers drift only through the accumulator, and the accumulator is
+built by the discovery loop from `func_id`'s vtable scanner — whose first
+entry, `0x000207C2`, is arm 0 of the table at `0x000208E4`, the first
+unresolved table in the gate's list. The scanner seeds jump-table arms as
+functions; that was already known and is the reason the demotion pass exists.
+
+Against the round-1 oracle the causes tool reads **54 of 62** tables
+resolvable by the lifter's own ≥2-arms rule, 7 not-a-table, 1 with no body —
+the same proportions as the midday 76 of 84. The eight that are not
+resolvable even there are the real translation-quality backlog; the 54 are
+extents carved from under the lifter, as before.
+
+**Still open:** why this tree has 62 rather than 84. The likeliest reading is
+that the midday 84 was measured on the pre-merge shared gen, whose
+accumulator was built before the `wt-icall` short-table map existed, and the
+merged discovery loop simply carves fewer arms; but that is a reading, not a
+measurement, and it stays here as one. **What is fixed now is the method:**
+every future number comes from the pass above, on a named gen, so the next
+two counts will be comparable.
+
+**A cheap gate this suggests:** a ctest that reruns that 17-second pass into
+scratch and diffs it against the live `functions.json`. It would say
+"the database on disk is not what the detector in the tree produces" — the
+function-database analogue of `jsrf_gen_header_current`. Needs capstone on
+the interpreter ctest uses; `/usr/bin/python3` has it, Homebrew's does not.
 
 ## The order
 
@@ -168,6 +219,45 @@ current numbers so the next drift is at least visible.
    the only recording, it is bound to the current gen, and the four questions
    in the midday file's §3 are answered by it or not at all. This costs no
    player time.
+
+   **In flight at 15:11**, as `render-investigation/replay-1309-silent`, 1300 s,
+   `SDL_AUDIODRIVER=no_such_driver` so the player does not hear it. The
+   runtime accepted the recording: 48,511 events over 59,112 frames, 189
+   checkpoints. At t=4 min: `[JSRF-SEQ] now=30`, 7 checkpoints ok, 0 bad,
+   `state=aligned in sync`, zero unresolved branches. **Caveat carried into
+   the verdict:** the harness compares the run's switch set with the player's
+   `paths.conf` and five exports are unset here. Three of those became code
+   defaults on 19 Sep (`ee31f41`), so they are on regardless; two are
+   genuinely off in this replay — `RECOMP_VSH_DP_ZERO` and
+   `RECOMP_APU_LIST_MOVE_TO_FRONT`. Neither touches guest input, and the
+   checkpoints are the arbiter of alignment, but the run is not
+   switch-identical to the session it replays. Audio counters are void by
+   construction; the crash, the recorder and the frame time are what it can
+   answer.
+
+   **RESULT, 15:33 — the replay ran the whole 1300 s and the harness's timer
+   ended it, not a fault.** Verdict lines, from the completed log:
+
+   | question | reading |
+   |---|---|
+   | alignment | `checkpoints ok=189 BAD=0 unreached=0 state=aligned`; recording exhausted at frame 59,112, run continued neutral to 66,469 |
+   | the skating crash (G20) | **no fault**. `[ITAIL]` unresolved 0, `[ICALL]` failed 0, not-code 0, `[UNIMPL]` 0 — and the positive control is the run's own feedback dump: **444 resolved, 0 unresolved** targets written at 15:33 |
+   | scene | `now=30 WaitEndStoryOrVsMission` held 1014.9 s; `off=255` retired voices (a human playthrough reads ~103): PLAYED |
+   | the three promoted defaults | `[APU-IDLE-OWNER] … handoff_guard ON`; `[APU-IDLE-EDGE] reraise=95306` of 95,501 raises; `[VBLANK-REG] base=FD000000 refused=0` (the line does not literally say `upmirror=on`; that is what it prints when the mirror holds) |
+   | frame time, whole run | `flips=66530 mean=19.40 ms (51.6 fps) p50=19.5 p90=26.5 p99=32.5 over-33ms=454` — the boot and title are in that mean |
+   | frame time, last window | `flips=591 mean=16.92 ms (59.1 fps) p50=17.0 p99=24.0 over-33ms=0` |
+   | the recorder | not exercised: `RECOMP_PAD_RECORD` was off in this run, by design (it replays) |
+   | input | `no poll stall (largest gap 0.0s)`; audio OFF BY REQUEST, its counters void |
+
+   So the 13:09 recording is now a **regression case that needs no player**:
+   `play_scripted.sh <name> @…/graffiti-2026-09-19_1309.padrec 1300` with
+   `SDL_AUDIODRIVER=no_such_driver`, 22 minutes, and the pass condition is
+   the row above — 189/189, zero unresolved, no fault. It is bound to gen
+   `c4400dbb0025f56d`; it dies at the next regeneration unless the player
+   records again on the new gen, which the midday file's §3 already asks for.
+
+   `edge_runtime_summary.py` on this log reports no reached edge, with its
+   positive-control caveat printed; the feedback dump is that control.
 2. **G22b's regeneration rides with the next deliberate one.** Not before.
    When it happens: run the gate (expect `todo_silent` 0, nothing else
    rising), then one scripted run under `RECOMP_UNIMPL_TRAP=1`.
