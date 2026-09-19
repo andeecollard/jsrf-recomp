@@ -1,0 +1,463 @@
+HANDOVER 2026-09-19 DAY -- THE STUTTER IS THE FRAME RATE, THE FREEZE IS THE
+GATE, AND I WAS WRONG FOUR TIMES ON THE WAY
+
+Read CLAUDE.md, then the newest file in docs/jsrf/goals/ -- do not trust a
+pointer, including this one. Supersedes
+HANDOVER_2026-09-19_NIGHT_THE_BUNDLE_IS_READY_AND_FOUR_DONORS_ARE_OPEN.txt.
+Its "one gameplay run" happened five times over; what those runs said is
+below, and most of it is not what that handover expected.
+
+Tree: main at 78fab24, ctest 71/71, pytest tools/ 481 passed 2 skipped,
+switch audit 0 problems. Upstream v0.10.0 (80 commits) is merged.
+
+Written by the assistant that did the day's work, at the player's request,
+after they asked for a review of the approach. Section 9 is that review and
+section 10 is the list of things I said that turned out to be wrong. Read
+those two before trusting the rest.
+
+=============================================================================
+0. WHAT TO DO NEXT, IN ORDER
+=============================================================================
+
+  1. THE ADX FREEZE. Every unattended run this afternoon died at t=60-90 s
+     with "[ADX] tick STUCK": the guest stops flipping and the log grows by
+     a million lines with no frames. Older logs wave it through as "SOUND:
+     worker froze at t=69s (after the handover; benign)". It is not benign.
+     It caps every scripted measurement at about a minute of live frames,
+     which is why the render agent never reached the scene it was sent to
+     fix and why no fps-vs-stutter comparison has been clean. Nothing else
+     in this file can be measured properly until this is.
+
+  2. INPUT RECORDING AND REPLAY. There is none -- only RECOMP_PAD_INJECT,
+     _SCRIPT, _SENTINEL, _TRACE. The pad is a fixed-time schedule, its own
+     header says the logos vary by ten seconds, and today it parked at the
+     title in every run above ~117 fps (reached gameplay at 64-86 fps). A
+     recorder keyed to FRAME COUNT, writing a pad script, would make the
+     player's next crash reproducible on demand, forever. The game is
+     frame-locked, so a frame-keyed replay is deterministic. This is the
+     single change that takes the player out of the measurement loop.
+
+  3. THE SKATING CRASH needs one more piece of evidence and it is known
+     exactly which: the `this` value at each entry of sub_00011D00. It
+     cannot be read off the stack (section 3). Regenerate with 0x00011D00
+     added to diagnostics/jsrf_first_fault/reach_trace.json and have
+     recomp_trace_enter print g_ecx -- ecx is `#define ecx g_ecx`, a TLS
+     global, so no signature change. Regenerate into a SEPARATE gen dir;
+     the shared one is what every build points at.
+
+  4. PROMOTE THE PROVEN SWITCHES TO CODE DEFAULTS. 29 switches differ
+     between a scripted run and the player's bundle (measured by
+     play_scripted.sh's own DIFFERS list). The harness has never once run
+     the game the player reports on. VSH_DP_ZERO, NV2A_PMC_UPMIRROR,
+     APU_SELFLINK_END, APU_LIST_MOVE_TO_FRONT, APU_IDLE_TRAP_EDGE,
+     APU_ADPCM_HW_HEADER and APU_IDLE_HANDOFF_GUARD all have runs behind
+     them. Bake them in; leave paths.conf for what is under test; one
+     experimental switch at a time.
+
+  5. The texture path. `shade()` samples out of a raw `device uchar*` --
+     software Morton addressing, hand-decoded DXT, its own bilinear, four
+     fetches per unit per fragment, no texture unit anywhere. `sync` is
+     8.5 ms of a 16.4 ms frame and 93% of it is the CPU waiting for the GPU
+     at the flip. Real MTLTextures with samplers is the real win and it is
+     large. The early-Z variant (846217b, RECOMP_METAL_EARLY_Z, off) is the
+     cheap probe; read "[METAL] depth test before the shader: N early, M
+     late" first.
+
+=============================================================================
+1. THE INTRO STUTTER: DIAGNOSED, NOT FIXED, AND NOT AN AUDIO BUG
+=============================================================================
+
+Reported by the player six times today as "intro sound still stuttering" /
+"the sound is hanging from the intro into the game". Every rival cause is
+measured at zero with a live positive control beside it:
+
+  [APU-BIN]    2D lost=0  3D lost=0            heard 67,450 / 2,718
+  [APU-PACE]   starved=0  empty=0              min_queued 26.7 ms, 48,000 Hz
+  [APU-IEN]    0 suppressed                    42 raises allowed
+  [APU-SGE]    0 implausible                   8.4M + 4.1M translations
+  [APU-ADPCM]  fail=0 silenced=0 (fixed today) 1,469 blocks recovered
+
+The mechanism, from the APU agent, with the arithmetic:
+
+  The CRI sound server (sub_0013B1C0) blocks in exactly one place, a
+  reset-then-wait with Timeout=NULL on one object via KeWaitForSingleObject
+  (thunk 46 -> ordinal 159). It moves AT MOST 1024 samples per pass (clamp
+  at guest 0x0013E965), so 44.1 kHz needs >= 43.1 passes/s. Its pass rate
+  tracks the FRAME RATE: bridge_KeWaitForSingleObject is a spin-poll that
+  pumps vblank/device/timer delivery on the blocked thread itself, so the
+  server delivers the very interrupt that wakes it.
+
+  Below ~43 fps the producer falls short and the voice ring replays for the
+  deficit. The shortfall equals the replay fraction EXACTLY, three times:
+
+    32,513 written / 44,123 consumed  = 26.3% short  = 26.3% stale  (25.5 fps)
+    35,471 / 44,079                   = 19.5%        = 19.5%        (21.1 fps)
+    44,117 / 44,117                   =  0.0%        =  0.0%        (49.8 fps)
+
+  At >= ~49 fps the guest writes precisely 44,100 samples/s = 43.07 x 1024,
+  the clamp, saturated.
+
+  Pre-registered and confirmed: RECOMP_IRQ_THREAD (which now runs -- see
+  section 6) changed nothing, because nothing on the APU interrupt path
+  signals the server's event. The title imports only KeSetEvent and
+  NtSetEvent, ten call sites, and the APU's own DPC (0x001A26C1 ->
+  0x001A2497) signals none of them. Vblanks were delivered at 57.8 Hz
+  throughout while the server got 25-34 passes/s.
+
+What was NOT established:
+  - That the player's 21-25 fps is a SUSTAINED rate. The render agent
+    measured 39-44 fps mean at mission entry with a p90-p99 tail at 21-25
+    ms and 129 of 391 frames over 33 ms. So the criterion is the TAIL, not
+    the mean, and the stutter is intermittent -- which matches the report.
+  - That the server's object is the same event the vblank DPC sets. The
+    agent proved the negative (nothing on the APU path signals) and walked
+    the DPC two levels, not to closure.
+
+So: get the intro's frame-time TAIL under 23.2 ms and the stutter goes.
+Speed is the same problem -- the game is frame-locked.
+
+Two things the "stutter" is NOT, both refuted with positive controls:
+  - The staging ring recycling under an in-flight draw: 4,681 wraps, 0
+    waits in the shipping config; squeezed to 2 x 256 KiB the same counter
+    reads 49,871, so the instrument fires; an unpinned arm with ~56,000
+    unprotected reuses rendered correctly.
+  - The 99.8%-stale "voice B": it is voice 69, a static looping effect at
+    0.84 laps; stale is what looping MEANS for a non-streamed buffer. The
+    counter now withholds its verdict below two laps (1c47e9f).
+
+=============================================================================
+2. WHERE THE FRAME GOES, AND WHAT I GOT WRONG ABOUT IT
+=============================================================================
+
+Measured by the render agent with per-caller nanosecond attribution that did
+not exist before (2fb4f6d), completed runs, player's own 35-switch set:
+
+  sync cost by caller: external 4835 calls, 22974 ms waiting, 1608 ms reading back
+  sync cost by caller: swap     9624 calls,  2425 ms waiting, 1566 ms reading back
+
+Against 59.7 s of frame time: the FLIP's wait is 38.5% of everything, the
+swap's is 4.1%. `rest` (the wall-clock residual = the recompiled guest) is
+flat at 3.3 +/- 0.1 ms while the frame swings 16 -> 26 ms. The slow frames
+are made of `sync`, i.e. the CPU blocked in [last_command
+waitUntilCompleted] waiting for the GPU.
+
+Three leads I gave that agent, and their fate:
+  - "7,493 clears, each a drain and a 4.9 MB read-back" -- FALSE. The log
+    line ends "...that did not happen" and I quoted it truncated at 150
+    characters. clear_encode is an empty render pass with
+    MTLLoadActionClear, no wait; [STAGE] clear is 0.07-0.09 ms per frame.
+  - "5,335 surface swaps forcing a sync" -- TRUE but 4% of the bill. Gone
+    now; worth 2-3% on scene-matched windows. The general fix is right: a
+    sync's wait exists only to make a read-back valid, so a sync with
+    nothing to read back must not take it. RECOMP_METAL_DEFER_SWAP was
+    inert because depth_dirty stayed set after surface_dirty cleared.
+  - "rest = 15.49 ms is the largest single item" -- FALSE, vsh+submit
+    exceeded it in the very line I quoted, and it is not the variable part.
+
+Two real bugs found on the way, both fixed and counted:
+  - The LRU pick inside a surface rebuild is not surface_cache_drop and
+    never paid owes_guest_ram: it overwrote the only copy of an unbound
+    surface. One eviction a run today.
+  - Render-to-texture uploads straight from guest RAM while
+    clear_unbound_slot leaves 7,164 deferred debts a run with defer_swap
+    OFF: 8 texture uploads per run were reading PRE-CLEAR contents in the
+    shipping configuration.
+
+And one gate: jsrf_ff_msl_diff_test was FAILING in the shipping switch set
+and passing only with RECOMP_FF_TEXMAT_IDENTITY=1, which the player does
+not set. RECOMP_METAL_FF=1 was enabled BECAUSE that test passed. The agent
+found the TEST was wrong (nv2a_ff_key is right to refuse an all-zero
+enabled texture matrix) and fixed the test, not the default (158ca90). Do
+not flip the switch to make it green.
+
+RECOMP_METAL_DEFER_SWAP: do not turn on yet. Hazards closed, but n=1 per
+arm and it changes when guest RAM becomes correct. Wants a second pair.
+
+=============================================================================
+3. THE SKATING CRASH: CHARACTERISED, DETERMINISTIC, NOT FIXED
+=============================================================================
+
+Four times today, same walker, same call chain, same nodes, same offsets:
+
+  EXC_BAD_ACCESS at guest 0xFFEEFFF2 (first crash: 0xFF555559)
+  sub_00011D00 x10-13 recursive
+    <- sub_000123E0 <- sub_00013A80 <- sub_00013F80 <- sub_0006F9E0
+    <- sub_00147FB4 <- kernel_thunk_dispatch <- sub_00147F53 (main thread)
+  ECX=EDI=FFEEFFEE  EBX=00FFFFFF (first crash) / FFEEFFEE  ESI=80000000
+  EDX=3F800000  572-644 bytes of guest stack used
+
+sub_00011D00 is a scene-graph walker: [edi+0x28] child, [edi+0x30]
+sibling, recursing on the child, iterating siblings. It faulted on
+MEM32(edi+4). Its prologue saves the caller's `this` on the guest stack
+(push ecx; push ebp; mov ebp,ecx) so the parent survives the fault.
+
+Established, all measured:
+  - OUR TRANSLATION IS BYTE-EXACT. All 157 bytes of the guest function
+    disassembled and compared instruction by instruction against the
+    generated C. The recompiler is not at fault. The merge is cleared too:
+    every function on that stack is byte-identical across upstream v0.10.0
+    except the outermost, which gained `ebp = g_ebp` at a thread entry
+    where g_ebp is thread-local and zero.
+  - 0xFFEEFFEE IS THE GAME'S OWN SENTINEL, not corruption and not ours. It
+    sits in guest RAM as 224 isolated words in 155 runs, longest run 2 (a
+    colour buffer would be thousands in a row -- that hypothesis is dead).
+    Our tree writes it nowhere. It appears once in the guest image, at
+    .text 0x00148F34: `mov dword ptr [esi+0x10], 0xffeeffee` inside
+    sub_00148E69 (0x00148E69..0x00148F87), allocator bookkeeping surrounded
+    by page-shift arithmetic. 0xFF555555 from the first crash appears 24
+    times in the image -- also guest data.
+  - The guest's own recursion guard is `test ecx, ecx` -- a ZERO check. A
+    sentinel passes it. On hardware [edi+0x28] is presumably zero or a
+    node; in our run it holds an allocator marker.
+  - The wild-pointer instrument (section 5) found four objects holding the
+    value and NONE of them was the field the walker read. Two of them --
+    040FFF40 -> 040FFFA0 (the CActSequence object) -- have real .rdata
+    vtables. The region it descended into, 0x04000500-0x04000640, is a run
+    of self-linked LIST_ENTRY pairs (InitializeListHead output) whose
+    "vtable" points at itself. The walk marched 0x28 bytes at a time through
+    a list-head array until it hit the sentinel.
+
+What is NOT established, and the retraction:
+  - WHICH real node handed the walk a list-head array as a child. I
+    reconstructed a chain from the dumped stack (04838934 -> 04000508 ->
+    040004D8 -> 04000500 -> 04000528) and reported it. It is UNSOUND: at
+    0x00011D1E the function does `mov [esp+0x10], ebx`, reusing the saved-
+    ecx slot as an ebx spill, so the slot I read as "`this` passed in"
+    holds ebx for every frame past that point. The saved edi at +8 IS
+    sound (never spilled), and the descent decoder in main.c (98be4bb)
+    now reads that and prints MEM32(edi+0x28) beside it -- but it has not
+    fired on a real crash yet. Item 0.3 is the sure route.
+  - The scripted pad cannot reach this crash. It dies first at the
+    DirectSound ISR (section 4) or parks at the title.
+
+=============================================================================
+4. THE DIRECTSOUND ISR CRASH: MEASURED AND GUARDED
+=============================================================================
+
+sub_001A2E2E +0x6A4, 26 prior dumps all naming voice 0, and the one that
+gated every scripted run at the title screen.
+
+The post-mortem instrument printed what the old report dropped:
+  IMPLIED GUEST VA: 0xFFFFFFBE     FAULT CARRIED BY: EAX(FFFFFFB4)+0xA
+0xFFFFFFB4 = 0 - 0x4C: a CONTAINING_RECORD on NULL, confirmed in the
+disassembly (001A2E8F `add eax, -0x4c`; 001A2E95 faults).
+
+I first said the NULL was [esi+0x50]. WRONG: esi ITSELF is NULL -- ECX reads
+exactly 0x6C4 = MEM32(esi+8) + h*8 + 0x6C4, which needs both terms zero,
+and ESI=00000000 is printed outright. Page 0 is mapped RAM here, so +8,
++0x50 and +0x18 all read zero without faulting, and [esi+0x50] was just
+the last zero to reach a register. Same in every archived dump.
+
+The mechanism (APU agent, 13294ff): a TOCTOU. The guest's teardown
+(sub_001A1E01) raises an interlock at this->0x2C0, strikes out the handle,
+clears owner[h], drops the interlock; the frame above the unguarded read
+begins "if (this->0x2C0 != 0) return". That is why the ISR may skip a NULL
+test on hardware. Ours fails both halves: the raise comes from OUR list and
+pci_irq_assert is a no-op so delivery is up to 8 ms late, after the
+interlock is released. So the check belongs at the HAND-OVER (001A25AA's
+read of FEDECMETH), not at the raise.
+
+Six 240 s runs scored on FAULT SITE, not "did it crash" (two died elsewhere
+entirely, one never left the attract loop):
+  guard OFF, owner[0] cleared at the hand-over -> died at sub_001A2E2E+0x6A4
+  guard ON,  same combination x3             -> all withheld, played to 30
+RECOMP_APU_IDLE_HANDOFF_GUARD=1 is in the player's config. The player's
+run with it: reads=6 owned=6 NULL=0 h0=0 withheld=0, no crash.
+
+Also: "[APU-IDLE-OWNER] NOT MEASURED" is gone for good. The DirectSound
+object was in the kernel's interrupt table all along as vector 5's
+ServiceContext (43068ed), confirmed against the exact byte-matched symbol
+?HandleFETrap@CMcpxAPU@@IAEXXZ, a thiscall with no parameters. And
+owner[]'s free marker IS the literal zero (three writers in the image), so
+the sentinel concern from section 3 does not apply to this array.
+
+Still wanted: three guard-off top-up trials to finish the A/B. n=1 per arm
+today because I kept taking the run slot off the agent.
+
+=============================================================================
+5. WHAT LANDED, WITH VERIFICATION STATUS
+=============================================================================
+
+All on main, all pushed, ctest 71/71 at each step.
+
+  afb28dd  Wild-pointer post-mortem (RECOMP_WILD_PTR, _SELFTEST). Implied
+           guest VA and "FAULT CARRIED BY: reg+offset" now unconditional.
+           Verified: rebuilt from clean against the shared gen, 71/71,
+           getenv-gated, both selftest controls PASS on the real title.
+  6cf5317  The launcher rotates last-run.log instead of truncating it. A
+           log with a guest fault is kept under its own timestamp. This cost
+           one crash today: the instrument was armed, the player crashed,
+           relaunched, and the report was gone. Only the .ips survived.
+  ef2a39d  DSOUND naming 188 -> 239 of 410 by link-order alignment
+           (tools/fusion/align.py). Hold-out precision 96/97/100% on
+           class::method across three seeds; the same method with donor
+           order shuffled scores 0/7/18%, which is the control that says
+           the order is doing the work. My first control counted names and
+           read 47 vs 51 -- it was the wrong measurement. Aligned names
+           carry a leading '~'. Table: ~/Library/Application Support/JSRF/
+           jsrf_guest_names_v2.tsv (490 names image-wide).
+  ba3486d  APU: hand-over guard, DirectSound `this` from the interrupt
+           table, ADPCM header switch. Verified 71/71 on main.
+  4e55b6e  Render audit: ring hypothesis refuted, one real binding bug
+           fixed (losing hardware attachments mid-draw bound a raw
+           attribute stream to a function expecting a 112-byte Vertex).
+  98be4bb  Descent decoder in the crash report. NOT YET FIRED on a real
+           crash.
+  71d1275  -DJSRF_WORKER_STACKS=N CMake option. The IRQ thread borrows a
+           guest stack slice; the pool was 0 because 16 slices = 4 MB, but
+           ONE is 256 KB against ~2 MB of headroom. At 1: "[IRQ-THREAD]
+           live", state 30, 0 faults, heap census identical to stock.
+  8986daf  jsrf_require_idle now sees jsrf-engine (the player), not just
+           jsrf_first_fault, and a mid-run watcher yields to a player who
+           launches later, leaving YIELDED_TO_PLAYER. Logic tested with
+           pgrep stubbed; could not stand up a real process of that name
+           in the sandbox.
+  78fab24  Frame-time work (section 2).
+  36ecf51, 9ab2446, 93d7e36  Upstream v0.10.0 merge: 1,422 of 9,102 bodies
+           changed (~1,018 x87 cc refactor, 404 `ebp = g_ebp` seeds, 18
+           sar-CF respellings, 4 bounds FIXES removing overlaps). Regen
+           cf24eed44d1bcd3c -> b6f29140efaf1b21, same 8,866 functions,
+           scripted run to state 30 with 0 faults. Previous gen kept at
+           gen.pre-upstream-v0.10.0.
+
+The ADPCM refusal (3a02922) deserves its own line because it is a real fix
+that is NOT the audible bug: adpcm_decode_block rejected any block whose
+fourth header byte was non-zero -- a generic IMA guard, not an Xbox one;
+that byte is reserved. It returned 0 AFTER writing the first sample of each
+channel, which no hardware pipeline does. 704 samples (11 x 64) per lap of
+every looping voice, nine voices across three sessions all exactly 11. The
+0x08 fill runs from exactly first_fail*bs to exactly nblocks*bs -- INSIDE
+the buffer, into a region nothing wrote audio into; lbo=0 so the pad plays
+every lap. RECOMP_APU_ADPCM_HW_HEADER=1 recovers 1,469 blocks in the
+player's run with no click reported. Why the declared length is 11 blocks
+longer than the audio is still unknown. G7 (the scatter-gather bound) is
+CLOSED by its own stated condition and must not be reopened.
+
+=============================================================================
+6. THE GLYPH TRAP HAS BEEN WATCHING THE ROAD
+=============================================================================
+
+The speech bubble FLOATS with the speaker across the whole height of the
+frame. Measured across seven saved frames of one session: rows 43-123,
+217-264, 309-422, absent in three. No fixed rectangle can sit on it; three
+successive aimings each measured scenery and read like absence. The
+speaker NAME LABEL is fixed (y 417-436 for "Corn", 413-425 for a longer
+name; two frames, not twelve) and is what the photographed corruption drew
+its stray glyphs onto. paths.conf now reads RECOMP_FB_WATCH=120,410,400,30.
+
+Two corrections from the render agent to what the previous handover
+believed: "the vertex data the CPU fetched never changed" rested on a
+discriminator that keyed on vertex count alone and compared different
+batches with each other; and every report*.bmp is a MID-FRAME capture
+(nv2a_pb_exec.c:5302 says so), so omissions in the corpus prove nothing.
+Use RECOMP_FB_DUMP_FLIP and score snap*.bmp. A new structural fact: the
+dialogue line is drawn in at least two passes and `y` and `w` -- the
+characters the defect hits -- are in the later one.
+
+=============================================================================
+7. STATE OF THE MACHINE
+=============================================================================
+
+Bundles (~/jsrf-build/):
+  JSRF.app             78fab24, UUID 63A83F60. Finder shows it as "Jet Set
+                       Radio Future". The player launched the inner Unix
+                       executable twice today because I rebuilt the bundle
+                       under an open Finder window; `open ~/jsrf-build/
+                       JSRF.app` cannot pick the wrong thing.
+  JSRF-irqthread.app   built from build-irq1 (JSRF_WORKER_STACKS=1). Same
+                       audio as stock, as predicted. Keep for the
+                       RECOMP_IRQ_THREAD_GPU=1 experiment, which "may
+                       break the ISR/DPC handoff" and has not been run.
+
+paths.conf: 607 lines, 34 switches. Added today: WILD_PTR, WILD_PTR_SELFTEST,
+APU_IDLE_HANDOFF_GUARD, APU_ADPCM_HW_HEADER, IRQ_THREAD (harmless on stock),
+GUEST_NAMES -> v2, FB_WATCH re-aimed. Backup: paths.conf.before-2026-09-19-
+merge-session.
+
+Preserved logs (~/Library/Application Support/JSRF/):
+  last-run-2026-09-19_MERGE-PLAYER-CRASH-ON-SKATE.log   first skating crash
+  last-run-2026-09-19_0817-WILDPTR-ANSWER.log           instrument fired
+  last-run-2026-09-19_0825-CRASH3.log                   same, third time
+  last-run-2026-09-19_SOUND-HANGING.log                 pre-fix baseline,
+                                                        ok=92118 fail=3509
+  last-run-2026-09-19_ADPCM-HWHEADER-STILL-STUTTERS.log switch engaged
+  last-run-2026-09-19_STUTTER-3.log                     IRQ bundle, the
+                                                        pre-registered test
+  glyphdump-2026-09-19-0738-MERGE-CRASH-KEEP/           14 captures
+  glyphdump-2026-09-19-0644-KEEP/                       9 captures
+
+Discovery A/B for the merge: scratchpad only, gone with the session.
+
+=============================================================================
+8. FOR THE NEXT PERSON WHO RUNS THE HARNESS
+=============================================================================
+
+  - Gate every trial on ALL of: [JSRF-SEQ] now=30, [APU-VOICE] on= in the
+    148-453 band (4-12 is the attract loop), ADPCM ok>0. A trial failing
+    any of them is VOID, not a slow arm. I voided two A/Bs today by not
+    doing this; one of them looked like a dramatic result.
+  - The pad is fps-fragile: parked at the title at 117-136 fps, reached
+    gameplay at 64-86. A busy machine lands more often, which inverts the
+    usual advice. new_game.pad stops at t=73 and parks in
+    WaitEndStoryOrVsMission with on=12; that is expected for an INTRO
+    measurement but means gate 2 is weak there.
+  - Only one of this title may run machine-wide, and the player is
+    jsrf-engine, not jsrf_first_fault. The guard now knows.
+  - `pgrep -f "play_scripted"` self-matches (the shell's own command line
+    contains the pattern). Use `pgrep -f "[p]lay_scripted"`.
+  - The bundle and the build tree are separate artifacts. Check the
+    [BUILD] line and the switch banners before charging a symptom to a
+    change; I nearly attributed a stutter report to a switch that was not
+    in the binary the player ran.
+  - "fail=0" beside "ok=0" means no ADPCM played, not that the decoder is
+    fine. The line now prints `accepted=` as the control.
+
+=============================================================================
+9. THE REVIEW THE PLAYER ASKED FOR
+=============================================================================
+
+The individual bugs are real. The problem is that the measurement loop runs
+through the player, and three structural things keep it that way.
+
+FRAME RATE IS THE MASTER VARIABLE and is chased as five bugs. Speed IS
+frame time (frame-locked). Audio IS frame time (section 1). The glyph
+defect is timing-dependent. "Everything on the GPU" is the right goal; it
+needs a hard budget: 43 fps is the audio floor, 60 the target, measured in
+the intro's TAIL, not gameplay's mean.
+
+THE HARNESS HAS NEVER RUN THE PLAYER'S GAME. 29 switches differ. Every A/B
+today tested a different configuration from the one reported on. Item 0.4.
+
+THE PLAYER IS THE ONLY PATH TO THE SCENE. Every hypothesis costs their
+time and returns one bit per fifteen minutes. Items 0.1 and 0.2.
+
+And the day's process failures, all mine: two agent runs collided with the
+player's sessions (the guard could not see them); I armed two switches at
+once and then had to separate their effects; I quoted a truncated log line
+and sent an agent after a phantom; I reconstructed a call chain from a
+spilled register slot and reported it; I called a field NULL when the
+object was; I nearly scored a scene-mismatched A/B; and I landed an
+80-commit upstream merge on a debugging day. Three agents against one run
+slot was one agent too many -- the right shape is one that runs and others
+that read.
+
+=============================================================================
+10. THINGS I SAID TODAY THAT WERE WRONG
+=============================================================================
+
+  "The DSOUND NULL is [esi+0x50]"           -> esi itself is NULL
+  "The descent chain is 04838934 -> ..."   -> read from a spilled slot
+  "7,493 clears each a 4.9 MB read-back"   -> the line says "did not happen"
+  "rest is the largest single item"        -> vsh+submit exceeded it
+  "The IRQ thread will fix the stutter"    -> nothing on the APU path
+                                              signals the server's event
+  "Voice B is stuck replaying for 313 ms"  -> a static loop at 0.84 laps
+  "Shuffled donor order placed 47 vs 51,
+   so order is not doing the work"         -> counting was the wrong metric;
+                                              hold-out precision 96% vs 0-18%
+  "The A/B shows the IRQ thread breaks
+   the producer" (nearly)                  -> arms were at states 12 and 30
+  "The player's 08:20 stutter is the
+   header switch" (nearly)                 -> that binary predated it by 6 min
+
+Each was caught by a measurement, mostly somebody else's. Keep that habit.
