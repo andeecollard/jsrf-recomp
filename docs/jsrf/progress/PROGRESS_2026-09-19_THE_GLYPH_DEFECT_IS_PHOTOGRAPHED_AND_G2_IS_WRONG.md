@@ -141,3 +141,63 @@ cheap to settle: dump `s_snap` whole next to the region.
 3. **Play the dialogue-heavy tutorial and collect boxes.** The defect rate is
    ~40% of boxes; twenty boxes is a corpus that can name the trigger.
 4. Settle section 9 with a whole-`s_snap` dump beside the region.
+
+---
+
+# Addendum, same day: what the three corrupt glyphs are, and the instrument
+# that was already watching
+
+## The three replacements are three DIFFERENT glyphs
+
+Thresholded bitmaps of all three, from the preserved capture:
+
+| frame | replaced | rows occupied | baseline | shape |
+|---|---|---|---|---|
+| `report011` | `w` | 348–370 (**23**) | 370 | dense, multi-stroke; a smaller mark stacked above a larger one |
+| `report014` | `x` | 351–370 (**20**) | 370 | a clean vertical stem with a wide crossbar — 十 |
+| `report026` | `y` | 350–370 (**21**) | 370 | dense, multi-stroke, horizontal bars |
+
+Neighbouring Latin glyphs (`a`, `c`, `e`) occupy **15** rows, 356–370.
+
+So: **not one fixed fallback glyph.** Three different ones, each bottom-aligned
+on the correct baseline, each in a correct-width cell with the correct advance,
+each 5–8 rows TALLER than the Latin cell. `report011`'s appears to contain
+fragments of two stacked atlas rows.
+
+Together with the earlier finding that the same characters render correctly in
+other boxes, that rules out both a fixed wrong index and a fixed wrong glyph.
+The wrong sample location **varies per draw**.
+
+## RECOMP_FF_BATCH_WATCH_TEX was armed the whole time, and unread
+
+It has been in `paths.conf` since 17 Sep at `01737000`, and it produced
+**14,273 lines in the very run that photographed the defect**. Nobody read
+them. That is the third instrument in this defect's history to be built, armed
+and never read.
+
+Reading them found the instrument was broken rather than the title: it keyed
+on the **vertex count alone**, so every six-vertex glyph quad collided into one
+slot and every comparison between two different quads counted as a change. Its
+documented discriminator — change means the data was wrong *before* the shader,
+i.e. a race with the guest — would have been read off those 14,269 changes and
+would have been wrong.
+
+Fixed in `b362f37`: the key now carries the draw's ordinal within the frame.
+Same texture and scene, the count goes from 14,273 to 145.
+
+**So the discriminator is still unanswered, and is now answerable.** Arm
+`RECOMP_FF_BATCH_WATCH_TEX` on the font atlas, reach a dialogue box, and read
+the summary line:
+
+- batches changing → the vertex data is wrong before the shader;
+- nothing changing while a box renders corrupt → the defect is after the
+  fetch: packing, the ring, or the vertex function.
+
+**First, get the right texture offset.** `01737000` was never drawn in four
+boot runs here. Offsets ARE stable across runs (75 of 75 identical between two
+runs), so harvest the atlas's offset with `RECOMP_FF_BATCH_DUMP` in a run that
+reaches dialogue and read `tex0=` off a six-vertex text batch — do not reuse
+the number in `paths.conf`, which no run has confirmed.
+
+Watch `slots`/`dropped` in the new summary: a font atlas draws dozens of quads
+a line, and a change count taken while batches went unwatched means nothing.
