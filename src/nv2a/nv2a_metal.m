@@ -82,7 +82,7 @@ static inline unsigned long long mtl_now_ns(void)
  * first turns that deadlock into an ordinary wait. */
 /* Full clears that dropped the surface instead of syncing it. Each one is
  * a GPU drain and a 4.9 MB readback that did not happen. */
-static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend;
+static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend, hw_fs_early;
 static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
@@ -775,6 +775,36 @@ static NSString *const shader =
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
  " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
+/* THE SAME FUNCTION WITH THE DEPTH TEST IN FRONT OF IT.
+  *
+  * WHY THERE HAS TO BE A SECOND ONE. fs_hw_blend can call discard_fragment(),
+  * for the guest's z-range CULL policy and for the alpha test, and a fragment
+  * function that may discard forces Metal to run the shader BEFORE the depth
+  * test -- otherwise the depth write would already have happened for a
+  * fragment the shader then throws away. So every occluded fragment in the
+  * scene pays the whole combiner chain and up to four texture samples first,
+  * and those samples are not hardware samples: sample_lod walks a software
+  * Morton address, decodes DXT1/DXT3 by hand and does its own bilinear, four
+  * texel fetches at a time, out of a `device uchar*`. Losing early-Z in front
+  * of that is the expensive kind of losing it.
+  *
+  * A draw with s.alpha_test == 0 and s.z_cull == 0 cannot reach either
+  * discard, so for that draw the two orderings are indistinguishable and
+  * [[early_fragment_tests]] is exact rather than approximate. This is that
+  * draw's entry point, with both dead branches removed so the attribute is
+  * not merely ignored. Everything else -- shade(), the blend, the dither --
+  * is the same text.
+  *
+  * The COLOUR read stays. It is raster_order_group(0) and it is what shader
+  * blend mode 3 exists for; dropping it here would reintroduce the corruption
+  * that mode measured, and early-Z is orthogonal to it. */
+ "[[early_fragment_tests]] fragment float4 fs_hw_early(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3);"
+ " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
+ " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
+ " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
+ " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
@@ -1100,6 +1130,7 @@ static int initialize(void)
          * per distinct blend state rather than once here. */
         hw_vs=[library newFunctionWithName:@"vs"];hw_fs=[library newFunctionWithName:@"fs_hw"];
         hw_fs_blend=[library newFunctionWithName:@"fs_hw_blend"];
+        hw_fs_early=[library newFunctionWithName:@"fs_hw_early"];
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
         pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -1519,6 +1550,55 @@ static int hw_shader_blend_mode_env(void)
     return on;
 }
 
+/* THE TWO DIAGNOSTIC SWITCHES THAT DECIDE WHETHER THE SHADER CAN DISCARD.
+ *
+ * Both were read inline, at the one place that builds Params, with a local
+ * static each. The pipeline key now has to ask the same two questions -- the
+ * early-Z variant is only sound for a draw that cannot reach a discard -- and
+ * two copies of "what does this switch mean" is exactly how a pipeline ends
+ * up selected for state the shader was not given. One reader each, both
+ * callers. */
+static int no_alpha_test_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_NO_ALPHA_TEST");
+  return on; }
+static int legacy_zclamp_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
+  return on; }
+
+/* RECOMP_METAL_EARLY_Z -- put the depth test in front of the shader for the
+ * draws where that is exact.
+ *
+ * A fragment function that may call discard_fragment() cannot have its depth
+ * test run first: the write would already have happened for a fragment the
+ * shader then throws away. Metal therefore runs the whole shader for every
+ * occluded fragment, and on this backend the whole shader is the register
+ * combiner chain plus up to four SOFTWARE texture samples -- Morton address
+ * arithmetic, hand-decoded DXT, hand-written bilinear, four `device uchar*`
+ * fetches per sample. That is a great deal to spend on a fragment the depth
+ * buffer was going to reject.
+ *
+ * fs_hw_blend discards for exactly two reasons, the guest's z-range CULL
+ * policy and the alpha test, and both are Params fields. A draw with neither
+ * cannot discard, so for that draw early and late tests are
+ * indistinguishable and fs_hw_early is not an approximation. The predicate
+ * has to mirror the Params build exactly, including the two diagnostic
+ * switches that force either field to zero -- hence the readers above.
+ *
+ * Off by default until a scene-matched A/B has scored it: a pipeline variant
+ * doubles the key space, and the number to watch beside any frame-time change
+ * is refusals staying at 0. */
+static int early_z_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_EARLY_Z");
+  return on; }
+static uint64_t g_early_z_draws, g_late_z_draws;
+static int hw_early_z(const NV2ATextureCopy *s)
+{
+    if (!early_z_on()) return 0;
+    if (s->alpha_test && !no_alpha_test_on()) return 0;
+    if (s->z_cull && !legacy_zclamp_on()) return 0;
+    return 1;
+}
+
 static int hw_shader_blend(const NV2ATextureCopy *s)
 {
     return hw_shader_blend_mode(hw_shader_blend_mode_env(), s->blend, s->dither);
@@ -1537,7 +1617,7 @@ int nv2a_metal_shader_blend_on(void)
  * enabled and fs_hw, one with it disabled and fs_hw_blend. Keying on blend
  * alone would hand the second draw the first one's pipeline and blend twice,
  * or not at all. */
-static struct { uint32_t blend,src,dst,sblend; id<MTLRenderPipelineState> pso; }
+static struct { uint32_t blend,src,dst,sblend,early; id<MTLRenderPipelineState> pso; }
     hw_pso[HW_CACHE];
 static unsigned hw_pso_n;
 
@@ -1551,7 +1631,7 @@ static unsigned hw_pso_n;
  * a handful of blend states, and a refusal is a counted CPU draw rather than a
  * stall, so a generous fixed size costs pointers and nothing else. */
 #define VSH_PSO_CACHE 256
-static struct { const void *fn; uint32_t blend,src,dst,sblend;
+static struct { const void *fn; uint32_t blend,src,dst,sblend,early;
                 id<MTLRenderPipelineState> pso; } vsh_pso[VSH_PSO_CACHE];
 static unsigned vsh_pso_n;
 static uint64_t g_vsh_pso_full;
@@ -1560,11 +1640,17 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
                                                    VshSlot *prog)
 {
     uint32_t sblend = (uint32_t)hw_shader_blend(s);
+    /* The variant is part of the key, not a property of the draw: two draws
+     * with identical blend state and different discard state need different
+     * pipelines, and a key that cannot tell them apart would hand an
+     * alpha-tested draw the function whose depth write has already happened. */
+    uint32_t early = (uint32_t)(sblend && hw_early_z(s));
     unsigned i;
     for (i = 0; i < vsh_pso_n; ++i)
         if (vsh_pso[i].fn == (__bridge const void *)prog->fn
             && vsh_pso[i].blend == s->blend && vsh_pso[i].src == s->blend_src
-            && vsh_pso[i].dst == s->blend_dst && vsh_pso[i].sblend == sblend)
+            && vsh_pso[i].dst == s->blend_dst && vsh_pso[i].sblend == sblend
+            && vsh_pso[i].early == early)
             return vsh_pso[i].pso;
     if (vsh_pso_n >= VSH_PSO_CACHE) { ++g_vsh_pso_full; return nil; }
     {
@@ -1586,7 +1672,8 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
          * position rather than by name. Taking both halves from one library is
          * what makes the repacking wrapper sound. */
         d.fragmentFunction = [prog->library newFunctionWithName:
-                                sblend ? @"fs_hw_blend" : @"fs_hw"];
+                                early  ? @"fs_hw_early"
+                              : sblend ? @"fs_hw_blend" : @"fs_hw"];
         if (!d.fragmentFunction) return nil;
         d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
                                                         : MTLPixelFormatRGBA32Float;
@@ -1606,6 +1693,7 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
         vsh_pso[vsh_pso_n].fn = (__bridge const void *)prog->fn;
         vsh_pso[vsh_pso_n].blend = s->blend; vsh_pso[vsh_pso_n].src = s->blend_src;
         vsh_pso[vsh_pso_n].dst = s->blend_dst; vsh_pso[vsh_pso_n].sblend = sblend;
+        vsh_pso[vsh_pso_n].early = early;
         vsh_pso[vsh_pso_n].pso = pso; ++vsh_pso_n;
         return pso;
     }
@@ -1615,9 +1703,11 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
 {
     unsigned i;
     uint32_t sblend = (uint32_t)hw_shader_blend(s);
+    uint32_t early = (uint32_t)(sblend && hw_early_z(s));
     for (i = 0; i < hw_pso_n; ++i)
         if (hw_pso[i].blend == s->blend && hw_pso[i].src == s->blend_src
-            && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend)
+            && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend
+            && hw_pso[i].early == early)
             return hw_pso[i].pso;
     if (hw_pso_n >= HW_CACHE) { ++g_hw_state_refusals; return nil; }
 
@@ -1654,8 +1744,8 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = hw_vs;
-    d.fragmentFunction = sblend ? hw_fs_blend : hw_fs;
-    if (sblend && !hw_fs_blend) { ++g_hw_state_refusals; return nil; }
+    d.fragmentFunction = early ? hw_fs_early : sblend ? hw_fs_blend : hw_fs;
+    if (!d.fragmentFunction) { ++g_hw_state_refusals; return nil; }
     /* STILL RGBA32Float, AND THE REASON RECORDED HERE BEFORE WAS WRONG.
      *
      * That comment said the software rasteriser prefers float because float
@@ -1725,6 +1815,7 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     ++g_hw_pipeline_misses;
     hw_pso[hw_pso_n].blend = s->blend; hw_pso[hw_pso_n].src = s->blend_src;
     hw_pso[hw_pso_n].dst = s->blend_dst; hw_pso[hw_pso_n].sblend = sblend;
+    hw_pso[hw_pso_n].early = early;
     hw_pso[hw_pso_n].pso = pso;
     ++hw_pso_n;
     return pso;
@@ -2272,6 +2363,34 @@ static uint64_t g_resident_unbound_clears, g_slot_writebacks, g_slot_writeback_s
  * (16,181 surface swaps + 8,098 flips = 24,279, against 24,293 syncs). That
  * worked, but it is not a measurement anyone else will repeat. These are. */
 static uint64_t g_sync_by_swap, g_sync_by_invalidate, g_sync_by_frame_end;
+/* AND WHAT EACH CALLER COSTS, WHICH THE COUNTS ABOVE DO NOT SAY.
+ *
+ * Measured 19 Sep 2026, new_game.pad, 4,913 flips: 9,810 surface swaps, 4,928
+ * external (the flip), 4,924 "already clean", 24,831 ms of draining. Those
+ * four numbers admit two readings that differ by the whole bill -- the swaps
+ * drain and the flip is clean, or one swap a frame is clean and the flip
+ * drains -- and nothing printed could tell them apart. An afternoon of
+ * arithmetic over three lines is what this replaces.
+ *
+ * `who` is set by the caller immediately before the call and consumed on
+ * entry, so anything that does not set it is attributed to `external`, which
+ * is what the flip and the diagnostic dumps are. Two adds against ~15,000
+ * syncs a run: unmeasurable beside a 2.5 ms drain. */
+typedef enum { SYNC_WHO_EXTERNAL, SYNC_WHO_SWAP, SYNC_WHO_INVALIDATE,
+               SYNC_WHO_FRAME_END, SYNC_WHO_N } SyncWho;
+static SyncWho g_sync_who = SYNC_WHO_EXTERNAL;
+static uint64_t g_sync_who_calls[SYNC_WHO_N], g_sync_who_drained[SYNC_WHO_N];
+static uint64_t g_sync_who_drain_ns[SYNC_WHO_N], g_sync_who_read_ns[SYNC_WHO_N];
+static const char *const g_sync_who_name[SYNC_WHO_N] = {
+    "external", "swap", "invalidate", "frame-end" };
+/* Syncs that found dirty flags nobody was going to pay, and so skipped the
+ * wait. See the block at the top of nv2a_metal_sync. */
+static uint64_t g_sync_drainless;
+/* Deferred slot debts paid because something was about to READ those guest
+ * bytes as a texture, or rebuild the surface from them. Zero is the expected
+ * reading and it is also the positive control for the walk: see
+ * surface_pay_debt_for_range. */
+static uint64_t g_debt_paid_on_read, g_debt_paid_on_rebuild, g_debt_paid_on_evict;
 /* WHY A RESIDENT CLEAR REFUSED, by reason, because the counts alone said the
  * colour half was refusing 8 times for every one it took and nothing said
  * which test threw it out. A refusal is not free: clear_surface then calls
@@ -2451,6 +2570,41 @@ int nv2a_metal_sync_range(uint8_t *target, size_t bytes)
     return 1;
 }
 
+/* THE SAME PAYMENT, FOR EVERY OTHER READER OF THOSE GUEST BYTES.
+ *
+ * nv2a_metal_sync_range closes the hole for the ONE reader that names its
+ * range: the flip. Deferring a swap's write-back creates a slot whose pixels
+ * exist only on the GPU, and defer_swap's own header admits the gap it leaves
+ * -- "a guest CPU read of the surface range that is not the flip is not
+ * intercepted". Inside this backend there are exactly two such readers and
+ * both are reachable on an ordinary frame:
+ *
+ *   - a TEXTURE whose guest bytes are a surface this title has rendered into
+ *     and not yet handed back. texture_buffer uploads straight from guest RAM
+ *     and would upload the pre-render contents, which is render-to-texture
+ *     silently sampling last frame.
+ *   - a surface REBUILD. The slot lookup is exact on seven fields, so a
+ *     surface whose depth pointer moved misses the cache and is re-uploaded
+ *     from guest RAM while a slot still owes those very bytes.
+ *
+ * Four slots and a pointer-range compare, so the walk costs nothing when
+ * nothing is owed -- which, with the deferral off, is always. g_debt_paid_*
+ * are the positive controls: they say this ran and found nothing, rather than
+ * that it never ran. */
+static void surface_pay_debt_for_range(const uint8_t *p, size_t bytes,
+                                       uint64_t *counter)
+{
+    if (!p || !bytes) return;
+    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+        if (!surf_slot[i].valid || !surf_slot[i].owes_guest_ram) continue;
+        if (!guest_ranges_overlap(p, bytes, surf_slot[i].target,
+                                  surface_slot_bytes(i)))
+            continue;
+        surface_slot_writeback(i);
+        ++*counter;
+    }
+}
+
 /* THE ONE NUMBER THE CUMULATIVE TOTAL CANNOT GIVE.
  *
  * g_sync_drain_ns + g_sync_read_ns already says sync costs 7.9 ms per frame
@@ -2597,6 +2751,16 @@ void nv2a_metal_report(void)
      * a switch that does. gpu draws moving while vertices stays at zero would
      * mean the counter is on the wrong side of the branch, which is why both
      * are printed. */
+    /* BOTH ARMS NAME THEMSELVES. With the switch off every draw is counted
+     * late, which is the control that says this counter is on the draw path
+     * at all; with it on, the split is how much of the scene can take the
+     * variant, and that bound is a property of the title rather than of the
+     * change. */
+    fprintf(stderr,"[METAL] depth test before the shader: %llu draws early,"
+            " %llu late (early_z %s)\n",
+            (unsigned long long)g_early_z_draws,
+            (unsigned long long)g_late_z_draws,
+            early_z_on()?"on":"OFF");
     fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
             vsh_gpu_on()?"guest programs on the GPU":"CPU interpreter",
             vsh_gpu_on()?"on":"OFF");
@@ -2626,9 +2790,39 @@ void nv2a_metal_report(void)
             (unsigned long long)(sync_calls - g_sync_by_swap
                                  - g_sync_by_invalidate - g_sync_by_frame_end),
             (unsigned long long)sync_calls, (unsigned long long)sync_clean);
+    /* AND WHAT EACH OF THEM PAID. The line above says who called; without
+     * this one the 24.8 s bill has to be attributed by arithmetic across
+     * three counters, and the two readings that arithmetic admits differ by
+     * all of it. `drained` is the calls that actually took
+     * waitUntilCompleted -- the rest either found nothing outstanding or
+     * found nothing anybody was going to collect. */
+    for (unsigned w = 0; w < SYNC_WHO_N; ++w) {
+        if (!g_sync_who_calls[w]) continue;
+        fprintf(stderr,"[METAL] sync cost by caller: %-10s %llu calls,"
+                " %llu drained, %.1f ms waiting, %.1f ms reading back\n",
+                g_sync_who_name[w],
+                (unsigned long long)g_sync_who_calls[w],
+                (unsigned long long)g_sync_who_drained[w],
+                g_sync_who_drain_ns[w]/1e6, g_sync_who_read_ns[w]/1e6);
+    }
+    fprintf(stderr,"[METAL] syncs that skipped the wait because nothing was"
+            " going to be written back: %llu\n",
+            (unsigned long long)g_sync_drainless);
+    fprintf(stderr,"[METAL] deferred debts paid on demand: %llu texture read,"
+            " %llu surface rebuild, %llu eviction\n",
+            (unsigned long long)g_debt_paid_on_read,
+            (unsigned long long)g_debt_paid_on_rebuild,
+            (unsigned long long)g_debt_paid_on_evict);
+    /* "the depth refusal is why defer_swap is inert" stood here and was
+     * wrong, or at least a generation out of date: the refusal had already
+     * been narrowed to "depth is dirty AND somebody is going to write it",
+     * and the deferral still bought nothing because clearing surface_dirty
+     * alone never reached nv2a_metal_sync's early return -- depth_dirty was
+     * still set, so the wait was taken anyway. The wait is now decided by
+     * what will actually be written; see the block at the top of that
+     * function. */
     fprintf(stderr,"[METAL] depth write-backs: %llu taken, %llu skipped"
-            " (no_depth_sync %s). Each one is a drain as well as a copy, and"
-            " the depth refusal is why defer_swap is inert.\n",
+            " (no_depth_sync %s). Each one is a drain as well as a copy.\n",
             (unsigned long long)g_depth_syncs_taken,
             (unsigned long long)g_depth_syncs_skipped,
             no_depth_sync_on()?"on":"OFF");
@@ -2890,15 +3084,66 @@ int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
 int nv2a_metal_sync(void)
 {
     unsigned long long _t_sync = mtl_now_ns(), _t_drained = 0;
+    SyncWho who = g_sync_who;
+    g_sync_who = SYNC_WHO_EXTERNAL;
     @autoreleasepool{
-        ++sync_calls;
+        ++sync_calls; ++g_sync_who_calls[who];
         /* BEFORE the dirty test and before the wait. An open batch is work the
          * GPU has not been told about, so last_command would be the previous
          * committed buffer and waiting on it would read a surface that is
          * missing every draw in the batch. */
         batch_flush();
         if(!surface_dirty&&!depth_dirty){++sync_clean;
-            g_sync_drain_ns += mtl_now_ns()-_t_sync; return 1;}
+            g_sync_drain_ns += mtl_now_ns()-_t_sync;
+            g_sync_who_drain_ns[who] += mtl_now_ns()-_t_sync; return 1;}
+        /* THE WAIT EXISTS ONLY TO MAKE A READ-BACK VALID, SO A SYNC THAT IS
+         * GOING TO READ NOTHING BACK MUST NOT TAKE IT.
+         *
+         * The dirty test above asks "is anything outstanding"; it does not ask
+         * "is anybody going to collect it". Those came apart the moment the
+         * two write-backs became skippable. With RECOMP_METAL_NO_DEPTH_SYNC on
+         * -- which is the default and is what the player runs -- a batch that
+         * wrote depth or stencil leaves depth_dirty set, the three branches
+         * below then SKIP the write-back and clear the flag, and the only
+         * thing the flag bought was `[last_command waitUntilCompleted]`. That
+         * is the drain, and the drain is 89% of this function's cost: measured
+         * 19 Sep 2026 over 4,913 flips, 24,831 ms draining against 3,204 ms
+         * reading back and converting.
+         *
+         * It is also exactly why RECOMP_METAL_DEFER_SWAP was inert. Its own
+         * header says it clears surface_dirty "and nv2a_metal_sync then takes
+         * its already-clean early return". It did not: depth_dirty was still
+         * set, so the early return was never reached and every deferred swap
+         * still paid the full stall for a read-back it had just cancelled. The
+         * deferral saved the 614 KB copy and none of the 2.5 ms wait.
+         *
+         * So resolve the skip predicates HERE, before the wait, in the same
+         * order and from the same state the branches below use -- the one
+         * thing that must not happen is a sync that skips the wait and then
+         * finds a branch that wanted the pixels. depth_dirty is left alone
+         * when there is no depth_target, because that is the one case the
+         * branches below also leave alone, and a flag this function does not
+         * own is not a flag it should clear. Nothing is lost by that: without
+         * a target no branch can write depth either, so no drain is taken for
+         * it on this call or on any later one. */
+        {
+            int will_colour = surface_dirty && !no_colour_sync_on();
+            int will_depth  = depth_dirty && depth_target && !no_depth_sync_on();
+            if (!will_colour && !will_depth) {
+                if (surface_dirty) {
+                    ++g_color_syncs_skipped; ++g_color_readbacks_elided;
+                    surface_dirty = 0;
+                }
+                if (depth_dirty && depth_target) {
+                    ++g_depth_syncs_skipped; depth_dirty = 0;
+                }
+                ++g_sync_drainless;
+                g_sync_drain_ns += mtl_now_ns()-_t_sync;
+                g_sync_who_drain_ns[who] += mtl_now_ns()-_t_sync;
+                return 1;
+            }
+        }
+        ++g_sync_who_drained[who];
         [last_command waitUntilCompleted];
         /* RECOMP_METAL_DRAIN=1 -- wait for the QUEUE, not for one buffer.
          *
@@ -2942,6 +3187,7 @@ int nv2a_metal_sync(void)
          * breakdown OF the clear, never added to it. */
         _t_drained = mtl_now_ns();
         g_sync_drain_ns += _t_drained - _t_sync;
+        g_sync_who_drain_ns[who] += _t_drained - _t_sync;
         /* RECOMP_METAL_READBACK_AUDIT=1 -- see the header comment on
          * g_readback_diff. Drains the queue a second time, properly, and
          * compares. */
@@ -3068,6 +3314,7 @@ int nv2a_metal_sync(void)
         }
         free(rgba);
         g_sync_read_ns += mtl_now_ns()-_t_drained;
+        g_sync_who_read_ns[who] += mtl_now_ns()-_t_drained;
         return 1;}
 }
 
@@ -3424,7 +3671,7 @@ void nv2a_metal_invalidate(uint8_t *target)
   * live binding it must also invalidate in the cache -- otherwise a later swap
   * back would rebind a texture for memory the CPU has since overwritten. */
  surface_cache_drop(target);
- if(!target||target==surface_target||target==depth_target){++g_sync_by_invalidate;nv2a_metal_sync();surface_valid=depth_valid=0;}}
+ if(!target||target==surface_target||target==depth_target){++g_sync_by_invalidate;g_sync_who=SYNC_WHO_INVALIDATE;nv2a_metal_sync();surface_valid=depth_valid=0;}}
 const char *nv2a_metal_last_reject(void){return reject_reason?reject_reason:"none";}
 /* A REJECTED DRAW HANDS THE BATCH TO THE CPU RASTERISER, which renders it into
  * guest RAM -- so the retained textures are stale from that moment, and the
@@ -3702,6 +3949,7 @@ static unsigned long long bench_replay(int batched, unsigned long long *cpu_ns)
     }
     t1 = mtl_now_ns();
     ++g_sync_by_frame_end;
+    g_sync_who = SYNC_WHO_FRAME_END;
     nv2a_metal_sync();                 /* through final GPU completion */
     t2 = mtl_now_ns();
     batch_force = 0;
@@ -3937,6 +4185,11 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   for(unsigned u=0;u<4;u++){
    int active=(s->texture_mask&(1u<<u))!=0;const NV2ATextureCopy*t=u&&active?&s->extra_stages[u-1]:s;
    const uint8_t*data=active?(u?s->extra_texture[u-1]:texture):NULL;size_t bytes=active?nv2a_texture_copy_texture_bytes(t):0;
+   /* Render-to-texture, and the one place a deferred write-back could be
+    * read straight past. texture_buffer uploads these bytes out of guest
+    * RAM; if a slot is still holding them on the GPU it has to hand them
+    * over first. Four slots and a pointer compare when nothing is owed. */
+   surface_pay_debt_for_range(data,bytes,&g_debt_paid_on_read);
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
   /* WHAT `vertices` HOLDS DEPENDS ON WHO IS GOING TO RUN THE PROGRAM.
    *
@@ -3989,7 +4242,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
        surf_slot[i].owes_guest_ram=1;surface_dirty=0;
        owed=1;++g_swap_deferred;break;}
      if(!owed)++g_swap_defer_noslot;}}
-   ++surface_uploads;++g_sync_by_swap;if(!nv2a_metal_sync())return reject("surface-sync");
+   ++surface_uploads;++g_sync_by_swap;g_sync_who=SYNC_WHO_SWAP;
+   if(!nv2a_metal_sync())return reject("surface-sync");
    /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
     * The sync above has already written the outgoing surface out, so the
     * incoming slot's textures still hold exactly what was drawn into them --
@@ -4019,6 +4273,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     surf_slot[slot_hit].owes_guest_ram=0;
     surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
    }else{
+   /* This branch is about to re-upload the surface FROM GUEST RAM, so any
+    * slot still owing those bytes must hand them back first or the
+    * rebuild starts from pre-render contents. The lookup above is exact
+    * on seven fields, so a surface whose depth pointer merely moved lands
+    * here with its colour debt outstanding. */
+   surface_pay_debt_for_range(target,target_size,&g_debt_paid_on_rebuild);
    MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;
    /* THE STENCIL BUFFER IS FILLED ONLY IN THE NON-565 BRANCH BELOW, and the
@@ -4054,6 +4314,16 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     for(unsigned i=0;i<SURFACE_SLOTS;i++){
      if(!surf_slot[i].valid){pick=i;break;}
      if(surf_slot[i].stamp<surf_slot[pick].stamp)pick=i;}
+    /* EVICTION HAS TO PAY THE DEBT, AND DID NOT. defer_swap's header says
+     * "surface_cache_drop pays on eviction as it always has" -- but this
+     * is not surface_cache_drop, it is the LRU pick inside the rebuild,
+     * and it overwrote the slot without looking at owes_guest_ram. The
+     * texture is then released with the only copy of whatever was
+     * rendered or cleared into it while it was unbound. Latent today at
+     * one eviction a run, and the first thing deferring every swap would
+     * have turned into lost pixels. */
+    if(surf_slot[pick].valid&&surf_slot[pick].owes_guest_ram){
+     surface_slot_writeback(pick);++g_debt_paid_on_evict;}
     if(surf_slot[pick].valid)++surface_evictions;
     surf_slot[pick].target=target;surf_slot[pick].target_size=target_size;
     surf_slot[pick].w=surface_width;surf_slot[pick].h=surface_height;
@@ -4185,9 +4455,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  {static int noat=-1;if(noat<0)noat=recomp_switch_on("RECOMP_METAL_NO_ALPHA_TEST");
-   if(noat)p.alpha_test=0;}p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;{static int legacy=-1;if(legacy<0)legacy=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
-   p.z_cull=legacy?0u:s->z_cull;}p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
+  if(no_alpha_test_on())p.alpha_test=0;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:
@@ -4243,7 +4511,22 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
           * geometry crossing the near plane renders differently on the two
           * paths. */
          [encoder setDepthClipMode:MTLDepthClipModeClamp];
-         [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;}
+         [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;
+         /* WHICH VARIANT THIS DRAW GOT, counted where the draw happens rather
+          * than where the pipeline is cached: a cache hit does not re-ask, so
+          * counting inside hw_early_z would measure pipeline misses and be
+          * read as draws. early=0 with the switch on is not a failure -- it
+          * is the alpha-tested and z-culled geometry, which is the number
+          * that says how much of the scene the change can reach at all.
+          *
+          * The test is the pipeline key's test, character for character,
+          * including the shader-blend term: fs_hw_early is the variant that
+          * reads the colour attachment, so under a shader-blend mode that
+          * does not take every draw there is no early variant to select and
+          * a counter that said otherwise would be counting an arm that did
+          * not run. */
+         if(hw_shader_blend(s)&&hw_early_z(s))++g_early_z_draws;
+         else++g_late_z_draws;}
   else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];
   /* THE TWO PIPELINES HAVE INCOMPATIBLE VERTEX BINDINGS AND THE ENCODER MUST
    * NOT SET BOTH. The fixed `vs` reads Params at vertex 1 and the indices at

@@ -209,8 +209,40 @@ static int build_corpus(FFState *out, int cap)
                    for (unsigned u = 0; u < 4; ++u) state_add_texmat(&out[n], u, 1, 0); ++n; }
     if (n < cap) { state_base(&out[n], "texmat0-never-uploaded");
                    state_add_texmat(&out[n], 0, 0, 0);                        ++n; }
+    /* AN ALL-ZERO TEXTURE MATRIX IS A SWITCHED STATE, LIKE normalise+normalmap
+     * BELOW, AND THIS ASKED FOR THE WRONG ANSWER.
+     *
+     * The expectation was the default 1 -- the key must accept -- and the key
+     * refuses, so this one state has been failing the parity control in the
+     * shipping switch set ever since nv2a_ff_key learned about the case. That
+     * read as "the gate for RECOMP_METAL_FF is red", and it is not: the key is
+     * right and the expectation was written before the reason existed.
+     *
+     * The reason is in nv2a_ff.c beside the refusal. The two paths do not
+     * merely differ in speed here, they draw different pictures. The CPU path
+     * multiplies the coordinate by the zero matrix, gets q=0, and the SINK
+     * then drops every triangle on that unit per vertex (vertex_valid in
+     * nv2a_metal.m). The generated vertex function has no per-vertex drop, so
+     * the same batch on the GPU keeps those triangles and samples them at a
+     * degenerate coordinate. Accepting would put geometry on screen that the
+     * CPU path removes -- the mirror image of the failure this control exists
+     * to catch, and just as visible.
+     *
+     * RECOMP_FF_TEXMAT_IDENTITY=1 changes the CPU path to pass the coordinate
+     * through, which the GPU can reproduce exactly, and the key then accepts.
+     * So the expected answer is a function of the switch, and it is read from
+     * the environment the same way normalise+normalmap reads
+     * RECOMP_FF_GPU_NORMAL_ZERO four states down. Run both arms. */
     if (n < cap) { state_base(&out[n], "texmat0-all-zero");
-                   state_add_texmat(&out[n], 0, 1, 1);                        ++n; }
+                   state_add_texmat(&out[n], 0, 1, 1);
+                   /* PRESENCE, not value, because that is literally what
+                    * nv2a_ff.c's ff_on() tests -- `getenv(name) != NULL`. An
+                    * expectation that read the value would disagree with the
+                    * predicate under test for RECOMP_FF_TEXMAT_IDENTITY=0 and
+                    * blame the key for it. */
+                   out[n].expect_key =
+                       getenv("RECOMP_FF_TEXMAT_IDENTITY") != NULL;
+                   ++n; }
     if (n < cap) { state_base(&out[n], "texgen-normalmap-u0");
                    put_u(&out[n], 0x03c0, 0x8511);
                    put_u(&out[n], 0x03c4, 0x8511);
