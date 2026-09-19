@@ -242,9 +242,18 @@ if [ "$ABORT_AT" != "0" ] && [ "${RECOMP_SEQ_REPORT-}" = "1" ]; then
     EARLY=$!
 fi
 
+YIELD=$(jsrf_yield_to_player $PID "$OUT")
+
 wait $PID
 kill $WATCH 2>/dev/null
 [ -n "$EARLY" ] && kill $EARLY 2>/dev/null
+[ -n "$YIELD" ] && kill $YIELD 2>/dev/null
+if [ -f "$OUT/YIELDED_TO_PLAYER" ]; then
+    echo
+    echo "=== THIS TRIAL IS VOID: a player launched while it was running ==="
+    echo "    It measures CPU contention, not whatever it was testing."
+    echo "    Re-run it when the machine is free."
+fi
 rm -rf "$SCRATCH"
 
 # The whole point of the script: say what happened, in the two terms that can

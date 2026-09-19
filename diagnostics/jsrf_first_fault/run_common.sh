@@ -66,11 +66,53 @@ jsrf_require_current_binary() {
     fi
 }
 
+# TWO processes can be this title, and the guard only ever knew about one.
+#
+# A scripted run is jsrf_first_fault. A PERSON playing is jsrf-engine, inside
+# JSRF.app -- a different name for the same game, and pgrep -x does not match
+# it. So the check passed cleanly while a human was mid-session, which is how
+# an agent's run and a playtest collided twice on 19 Sep 2026. The second one
+# cost the player a launch that never came up; a run of this title saturates
+# the CPU, and the session beside it is both a bad experience and a worthless
+# measurement.
 jsrf_require_idle() {
     if pgrep -x jsrf_first_fault >/dev/null 2>&1; then
         echo "REFUSING: jsrf_first_fault is already running (pid $(pgrep -x jsrf_first_fault | tr '\n' ' '))" >&2
         exit 2
     fi
+    if pgrep -x jsrf-engine >/dev/null 2>&1; then
+        echo "REFUSING: somebody is PLAYING (jsrf-engine pid $(pgrep -x jsrf-engine | tr '\n' ' '))." >&2
+        echo "  Only one of this title may run at a time, and a scripted run" >&2
+        echo "  would saturate the CPU under them. Wait for them to finish." >&2
+        exit 2
+    fi
+}
+
+# ...and checking once, at the start, is not enough either.
+#
+# The collision that actually happened went the other way round: the run
+# started on an idle machine and the human launched two minutes later. Nothing
+# made the run stand down, so it kept the CPU for its full limit. This watches
+# for a player appearing MID-RUN and gets out of their way, leaving a marker
+# so the trial is discarded rather than scored -- a run that shared the
+# machine with a playtest measures the contention, not the change under test.
+#
+# Call it after the run starts, with the run's pid; kill the returned pid when
+# the run ends.
+jsrf_yield_to_player() {
+    _run_pid=$1; _out=$2
+    ( while kill -0 "$_run_pid" 2>/dev/null; do
+          if pgrep -x jsrf-engine >/dev/null 2>&1; then
+              echo "YIELDING: a player launched JSRF.app; abandoning this run" >&2
+              echo "a player launched mid-run; this trial measures contention" \
+                  > "$_out/YIELDED_TO_PLAYER"
+              kill -TERM "$_run_pid" 2>/dev/null
+              sleep 5; kill -9 "$_run_pid" 2>/dev/null
+              return 0
+          fi
+          sleep 2
+      done ) &
+    echo $!
 }
 
 # Content, not provenance: every regular file's size and SHA-256, sorted, so
