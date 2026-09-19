@@ -4105,6 +4105,128 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   * single pushbuffer executor thread -- the same assumption the ring allocator
   * already makes. 3x the cap because a strip or fan emits 3*(count-2).
   * n stays automatic: only the storage for `indices` needed to move. */
+
+ /* ── RECOMP_GLYPH_DUMP: WHICH ATLAS CELL DID EACH CHARACTER COME FROM? ──
+  *
+  * G2. Every corrupted letter on record is v, w, x or y -- character codes
+  * 0x76-0x79, four consecutive values -- and the replacement is TALLER than
+  * its neighbours and shaped like a kanji, on a baseline shared with the
+  * Latin glyphs. JSRF's font carries both (the disc ships tex_eng.dat beside
+  * tex_jpn.dat). So the standing hypothesis is an INDEX that walks off the
+  * end of the Latin range for those four codes and lands in the Japanese
+  * block -- arithmetic, not a race, because a race cannot respect character
+  * codes.
+  *
+  * This is the measurement that decides it. Text is drawn as one quad per
+  * character, so the quad's TEXCOORD0 rectangle IS the glyph's cell in the
+  * atlas. Print, per quad, the screen span and that rectangle: read a line of
+  * dialogue left to right and the v/w/x/y cells either sit beside their
+  * neighbours or they do not.
+  *
+  * IT INSTRUMENTS nv2a_metal_draw AND NOT THE FIXED-FUNCTION BATCH WATCHER,
+  * deliberately. RECOMP_FF_BATCH_WATCH_TEX has both of its call sites inside
+  * the fixed-function branches, and this title draws its text through guest
+  * vertex programs -- 8 million VP draws in the 17:39 session. That watcher
+  * has been armed in the player's config for days and is blind to the thing
+  * it was pointed at. This site is the common draw entry for BOTH paths.
+  *
+  *   RECOMP_GLYPH_DUMP=<max lines>        off unless set
+  *   RECOMP_GLYPH_DUMP_AFTER=<seconds>    start late; text needs gameplay
+  *   RECOMP_GLYPH_DUMP_MAXQ=<n>           only draws with <= n quads (default
+  *                                        64) -- a line of text is tens of
+  *                                        quads and the world is thousands,
+  *                                        so this is what separates them
+  *
+  * Read-only: it prints and returns. */
+ {
+  static int glyph_cap=-1; static double glyph_after; static unsigned glyph_maxq;
+  static unsigned glyph_lines; static uint32_t glyph_tex;
+  extern double xbox_TraceSeconds(void);
+  /* Attribute slots, from nv2a_regs.h, spelled out because this file does not
+   * include it: 0 = POSITION, 9 = TEXCOORD0. */
+  enum { GLYPH_ATTR_POS = 0, GLYPH_ATTR_TEX0 = 9 };
+  if(glyph_cap<0){
+   const char*e=getenv("RECOMP_GLYPH_DUMP"); glyph_cap=(e&&*e)?atoi(e):0;
+   const char*a=getenv("RECOMP_GLYPH_DUMP_AFTER"); glyph_after=(a&&*a)?atof(a):0.0;
+   const char*q=getenv("RECOMP_GLYPH_DUMP_MAXQ"); glyph_maxq=(q&&*q)?(unsigned)atoi(q):64u;
+   const char*t=getenv("RECOMP_GLYPH_DUMP_TEX"); glyph_tex=(t&&*t)?(uint32_t)strtoul(t,NULL,16):0u;
+   if(glyph_cap>0)
+    fprintf(stderr,"  [GLYPH] dumping up to %d quad lines for textured draws of"
+            " <= %u quads, after t=%.0fs. One line per character-sized quad:"
+            " screen span, then the TEXCOORD0 cell it samples.\n",
+            glyph_cap,glyph_maxq,glyph_after);
+  }
+  /* HOW MANY VERTICES MAKE ONE CHARACTER depends on the primitive, and
+   * getting this wrong silently mis-groups the dump: JSRF submits its text as
+   * TRIANGLES (prim 5), so a character is SIX vertices -- two triangles --
+   * not four. Grouping by four produced quads whose "cell" spanned half of
+   * one glyph and half of the next, and the first pass at this instrument
+   * reported no text-like draws at all because of it. */
+  unsigned vpq = (primitive==8u) ? 4u        /* QUADS */
+               : (primitive==5u) ? 6u        /* TRIANGLES: 2 per character */
+               : 0u;                         /* strips/fans: not grouped */
+  if(glyph_cap>0&&(int)glyph_lines<glyph_cap&&(s->texture_mask&1)
+     &&vpq&&count>=vpq&&(count%vpq)==0&&(count/vpq)<=glyph_maxq
+     &&(!glyph_tex||s->texture_offset==glyph_tex)
+     &&xbox_TraceSeconds()>=glyph_after){
+   unsigned quads=count/vpq;
+   fprintf(stderr,"  [GLYPH] draw: %u quads, tex0 %08X %ux%u fmt%s%s, prim %u,"
+           " target %08X\n",
+           quads,s->texture_offset,s->width,s->height,
+           s->dxt1?" dxt1":"",s->rgba8?" rgba8":"",primitive,s->target_offset);
+   /* Pitch and swizzle decide how the dumped bytes are read back, and
+    * guessing cost two decodes: a linear atlas whose pitch is not width*bpp
+    * shears into stripes, and a swizzled one read linearly looks like noise.
+    * Print them beside the dump rather than inferring them later. */
+   fprintf(stderr,"  [GLYPH]  atlas layout: pitch %u, %s, levels %u\n",
+           s->pitch, s->linear?"LINEAR":"swizzled", s->levels);
+   /* RECOMP_GLYPH_DUMP_TEXFILE=<path>: the sampled texture's guest bytes,
+    * once, exactly as they are handed to the GPU. Decoded offline rather than
+    * here: the atlas is DXT1 and a decoder in the draw path would be a second
+    * implementation to keep honest. Seeing the atlas is what says whether the
+    * text is composed INTO it (a strip of rendered line) or looked up FROM it
+    * (a grid of glyph cells) -- the single-quad draws sampling 1,1..511,111
+    * point at the former and that would move the whole defect into the
+    * guest's own compositing, not our sampler. */
+   {
+    static int wrote;
+    const char*tf=getenv("RECOMP_GLYPH_DUMP_TEXFILE");
+    if(tf&&*tf&&!wrote&&texture&&texture_size){
+     FILE*f=fopen(tf,"wb");
+     if(f){ fwrite(texture,1,texture_size,f); fclose(f); wrote=1;
+      fprintf(stderr,"  [GLYPH] wrote %zu texture bytes to %s (%ux%u%s)\n",
+              texture_size,tf,s->width,s->height,s->dxt1?" dxt1":
+              s->rgba8?" rgba8":" other"); }
+    }
+   }
+   for(unsigned qi=0;qi<quads&&(int)glyph_lines<glyph_cap;qi++,glyph_lines++){
+    /* The character's extent is the BOUNDING BOX over its vertices, in both
+     * screen space and texture space. Taking two corners by index assumes a
+     * winding order, and a triangle pair does not have one. */
+    float x0=1e30f,x1=-1e30f,y0=1e30f,y1=-1e30f;
+    float u0=1e30f,u1=-1e30f,v0=1e30f,v1=-1e30f;
+    for(unsigned k=0;k<vpq;k++){
+     const float*pp=vertices[qi*vpq+k][GLYPH_ATTR_POS];
+     const float*tt=vertices[qi*vpq+k][GLYPH_ATTR_TEX0];
+     if(pp[0]<x0)x0=pp[0]; if(pp[0]>x1)x1=pp[0];
+     if(pp[1]<y0)y0=pp[1]; if(pp[1]>y1)y1=pp[1];
+     if(tt[0]<u0)u0=tt[0]; if(tt[0]>u1)u1=tt[0];
+     if(tt[1]<v0)v0=tt[1]; if(tt[1]>v1)v1=tt[1];
+    }
+    const float p0[2]={x0,y0}, p2[2]={x1,y1};
+    /* Cell in TEXELS as well as normalised: a cell index is what the
+     * hypothesis is about, and texels are what you compare against the
+     * atlas image. */
+    fprintf(stderr,"  [GLYPH]  q%02u screen x %7.1f..%7.1f y %7.1f..%7.1f  "
+            "uv %.4f,%.4f..%.4f,%.4f  texel %6.1f,%6.1f..%6.1f,%6.1f\n",
+            qi,(double)p0[0],(double)p2[0],(double)p0[1],(double)p2[1],
+            (double)u0,(double)v0,(double)u1,(double)v1,
+            (double)(u0*s->width),(double)(v0*s->height),
+            (double)(u1*s->width),(double)(v1*s->height));
+   }
+   fflush(stderr);
+  }
+ }
  static unsigned indices[NV2A_METAL_MAX_VERTICES*3];
  unsigned n=0;
  /* Set BEFORE assembly, because triangle() is what reads it. The same
