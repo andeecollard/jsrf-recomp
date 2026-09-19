@@ -3754,6 +3754,64 @@ static void jsrf_wild_ptr_report(uint32_t fault_va, uint32_t wild)
                         va, MEM32(va), MEM32(va + 4),
                         MEM32(va + 8), MEM32(va + 0xC));
         }
+
+        /* THE DESCENT, WHICH IS WHAT ACTUALLY ANSWERS THE QUESTION.
+         *
+         * A self-recursive walker leaves one frame per level, and the frame
+         * says which node that level was working on. sub_00011D00's prologue
+         * pushes ecx, ebp, edi, ebx, esi, so a frame is 5 saves plus the
+         * return address -- 24 bytes -- and the saved edi at +8 is the node
+         * the CALLER was walking when it recursed.
+         *
+         * Read edi and not the saved ecx, even though ecx is the `this` the
+         * call passed. At 0x00011D1E the function does `mov [esp+0x10], ebx`
+         * and reuses the saved-ecx slot as a spill, so by the time of the
+         * recursive call that slot holds ebx. Reading it as `this` produces a
+         * chain that looks plausible and is wrong; it cost me an hour and a
+         * retraction on 19 Sep. edi is never spilled, and the child the
+         * caller passed is simply MEM32(edi + 0x28), which is printed beside
+         * it -- so the level where a real node yields a child that is not a
+         * node is visible directly rather than inferred.
+         *
+         * Frames are accepted only while the return address is the recursive
+         * call site, so the walk stops at the outermost level instead of
+         * marching off into stale stack and reporting it as depth. */
+        {
+            const uint32_t RET_RECURSE = 0x00011D8Du;  /* after call 0x11D00 */
+            const uint32_t FRAME = 0x18u;
+            uint32_t va = g_esp, n = 0;
+            if (MEM32(va + 0x14) == RET_RECURSE) {
+                fprintf(stderr, "[WILD-PTR] descent through the walker,"
+                        " innermost first (node = the caller's edi):\n");
+                while (va + 0x14u < stack_hi && MEM32(va + 0x14) == RET_RECURSE
+                       && n < 64u) {
+                    uint32_t node = MEM32(va + 8);
+                    int plausible = node >= 0x10000u && node < JSRF_RAM_TOP
+                                    && (node & 3u) == 0u;
+                    fprintf(stderr, "[WILD-PTR]   %2u  node=%08X", n, node);
+                    if (plausible) {
+                        uint32_t child = MEM32(node + 0x28);
+                        uint32_t flags = MEM32(node + 4);
+                        fprintf(stderr, "  [+0x28]=%08X  [+4]=%08X%s",
+                                child, flags,
+                                (child < 0x10000u || child >= JSRF_RAM_TOP)
+                                    ? "   <== this child is not a guest address"
+                                    : "");
+                    } else {
+                        fprintf(stderr, "  (not a plausible object pointer)");
+                    }
+                    fprintf(stderr, "\n");
+                    va += FRAME;
+                    n++;
+                }
+                fprintf(stderr, "[WILD-PTR]   %u level(s); the frame above"
+                        " returns to %08X\n", n, MEM32(va + 0x14));
+            } else {
+                fprintf(stderr, "[WILD-PTR] esp does not sit on a walker frame"
+                        " (word at +0x14 is %08X, not the recursive call"
+                        " site) -- no descent to decode\n", MEM32(g_esp + 0x14));
+            }
+        }
     } else {
         fprintf(stderr, "[WILD-PTR] esp=%08X is in no known stack, so the"
                 " stack search would be searching nothing\n", g_esp);
