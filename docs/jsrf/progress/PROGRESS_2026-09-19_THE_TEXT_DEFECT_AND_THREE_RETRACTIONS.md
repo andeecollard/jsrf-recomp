@@ -346,3 +346,73 @@ of the substitution defect rather than the selection branch: a fractional
 overreach bleeds a neighbouring row, while a whole-cell error would swap the
 glyph outright. Both symptoms may be the same addressing error at two
 magnitudes, which is now a testable claim rather than a guess.
+
+---
+
+# ADDENDUM 4: the text is ANIMATED, which retracts "stable"
+
+## The retraction
+
+Addendum 1 says the corruption is "STABLE, not transient", on the strength of
+five `report*.bmp` rendering one line identically. THAT WAS THE WRONG
+TIMESCALE. `report*.bmp` is written ONE PER REPORT, so those five frames are
+tens of seconds apart, not adjacent. They show the line was static once
+settled; they cannot see frame-to-frame behaviour at all, and the claim was
+never tested where it mattered.
+
+The player, watching a replay: "lines above the letters and flickering",
+"Gum also glitches - its animated", "Corn's pizza line also glitches".
+
+## The evidence that settles it
+
+`fbdump/report018.bmp` catches a speech box MID-REVEAL:
+
+    rendered:  The ne<corrupt>t technique
+    source:    The next technique is a Grind.
+
+so the box is typed out progressively rather than drawn whole. The corrupt
+glyph is the `x`, which is the SAME instance
+`PROGRESS_2026-09-19_THE_GLYPH_DEFECT_IS_PHOTOGRAPHED_AND_G2_IS_WRONG.md`
+recorded at 04:13:36 -- it reproduces exactly.
+
+And in the same frame the soul banner reads `arside Stab Soul`: ONE character
+lost, where the same banner lost FIVE in the 13:29 session. THE TRUNCATION
+VARIES OVER TIME FOR THE SAME STRING. It is not a fixed offset, which is what
+addendum 1 implicitly assumed and what the variable 2/1/5 losses were already
+hinting at.
+
+Both of those are consistent with the missing characters being a function of an
+ANIMATION's progress rather than of a layout or lookup constant. That does not
+contradict addendum 3 -- the string in guest RAM is intact and whole, measured
+29 times -- it just means what we get wrong is WHICH SPAN of that intact string
+we draw, and that the wrong span moves.
+
+## The path question is STILL open, and this run did not settle it
+
+200,000 fixed-function batches were captured over t=170.00-253.87, 85 distinct
+textures, and the widest texcoord spread on any of them is SIX distinct pairs
+(`01737000`, in 6/15/18-vertex batches). Nothing with the many-distinct-texcoord
+signature of glyph rendering. Only two textures sit below 0x01000000: the
+framebuffer `005F0000` and `00DCC000`.
+
+BUT THE POSITIVE CONTROL FAILS FOR THAT WINDOW. Of 55 full-size framebuffer
+dumps, `report043`-`report050` contain no bright pixels at all: there was no
+text on screen for most of t=170-250. Text returns at `report051` (+255 s) and
+`report052` (+260 s), which is exactly where the 200,000-line cap ran out. So
+"no glyph quads on the fixed-function path" is once again a statement about a
+window with nothing to find in it.
+
+THE TARGETED RUN THAT WOULD SETTLE IT, now that the timing is known: capture
+with `RECOMP_FF_BATCH_DUMP_AFTER=250`, which puts the window on the speech box
+at +255 s, with framebuffer dumps alongside as the control. If a texture with
+many distinct texcoords appears there, text is fixed-function and the existing
+batch watcher can see it; if it does not, text is on the programmable path and
+the watcher is structurally blind, as addendum 1 suspected.
+
+## Incidental, and useful
+
+`jetfont.dat` is resident in guest RAM at `00CAC842` (file offset 0x882), and
+read the SAME in two separate runs -- so texture offsets really are stable
+across runs, as paths.conf's own note claims. `font1.dat` is NOT resident at
+all: searched for and found zero times, with the control passing. Whatever
+draws the glyphs, it is not reading font1.dat's file image.
