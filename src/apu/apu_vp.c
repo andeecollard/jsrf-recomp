@@ -4069,6 +4069,56 @@ void mcpx_apu_voice_rate_report(void)
      * has touched all 64, nothing below RECOMP_VOICE_RATES_ROWS=65 can show a
      * single 2D voice -- and "the music is voices 64-67" was read off an early
      * report, before the 3D voices had crowded them out. */
+    /* THE STALE-BUFFER CENSUS, ACROSS THE WHOLE POOL.
+     *
+     * The per-voice [VOICE-FRESH] line already prints its own verdict, "the
+     * guest is not refilling this buffer". In the 19 Sep 2026 black-screen
+     * run it printed that 457 times and nobody read it, because it is one
+     * line per voice per report, buried among eleven others, and there was
+     * no total anywhere.
+     *
+     * What that run actually says, read voice by voice afterwards: voice 68
+     * is 4.3% stale and every other producing voice is 99.3% to 99.9%, with
+     * voice 3 replaying one 32-sample slot for 65,933 ms. Voice 68 is the
+     * positive control and it is why the rest cannot be dismissed as a dead
+     * instrument -- the guest demonstrably CAN refill a buffer, and for
+     * everything else it stopped.
+     *
+     * So the census is printed as one line, over all 256 voices rather than
+     * the dozen the table shows, and it names the healthiest voice beside
+     * the count so the control travels with the finding. */
+    if (voice_fresh_on()) {
+        unsigned stale_voices = 0, classified_voices = 0, best_v = 0;
+        double worst_ms = 0.0, best_pct = 101.0;
+        for (v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+            const VoiceRate *r = &g_voice_rate[v];
+            unsigned long cl = r->fresh_slots + r->stale_slots;
+            double pct;
+            if (!cl) continue;
+            ++classified_voices;
+            pct = 100.0 * (double)r->stale_slots / (double)cl;
+            if (pct >= 90.0) {
+                ++stale_voices;
+                if (r->max_stale_run * NUM_SAMPLES_PER_FRAME / 48.0 > worst_ms)
+                    worst_ms = r->max_stale_run * NUM_SAMPLES_PER_FRAME / 48.0;
+            }
+            if (pct < best_pct) { best_pct = pct; best_v = v; }
+        }
+        if (classified_voices)
+            fprintf(stderr, "  [VOICE-FRESH] census: %u of %u voice(s) are"
+                    " >=90%% STALE, worst replay %.0f ms | freshest is"
+                    " voice %u at %.1f%% stale%s\n",
+                    stale_voices, classified_voices, worst_ms,
+                    best_v, best_pct,
+                    (stale_voices && best_pct < 50.0)
+                        ? "   <- that one IS being refilled, so the rest are"
+                          " not an instrument failure"
+                        : (stale_voices == classified_voices
+                            ? "   <- NO healthy voice to compare against:"
+                              " cannot tell a stalled guest from a dead"
+                              " instrument" : ""));
+    }
+
     if (hidden_2d)
         fprintf(stderr, "  [VOICE-RATE] %u of the hidden voice(s) are 2D"
                 " (handle >= %u) -- THAT IS THE BIN THE MUSIC IS IN. Set"
