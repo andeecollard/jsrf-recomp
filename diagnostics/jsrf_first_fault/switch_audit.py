@@ -116,6 +116,17 @@ VALUE_CARRYING = {
     # first report to the last, and "voices 64-67 were retired" was read off
     # rows that had merely been crowded out.
     "RECOMP_VOICE_RATES_ROWS",
+    # How many of the Metal staging ring's eight slabs rotate, and how much of
+    # a slab the bump pointer may hand out. Both are stress knobs for one
+    # question -- can the ring come round onto storage the GPU is still
+    # reading? -- and both have to carry a number: the shipping ring is 8 x
+    # 8 MB and comes round twice a second, which is far too slow to reach the
+    # hazard, so a run that wants to reach it has to say by how much to
+    # squeeze. Booleans could not express either. (The third switch of the
+    # set, RECOMP_METAL_RING_NOPIN, is a plain boolean and goes through
+    # recomp_switch_on.)
+    "RECOMP_METAL_RING_SLABS",
+    "RECOMP_METAL_RING_SLAB_KB",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING
