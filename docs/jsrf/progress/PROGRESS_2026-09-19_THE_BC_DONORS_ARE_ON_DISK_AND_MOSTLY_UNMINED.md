@@ -118,26 +118,62 @@ Blinx validated cleanly through our own parser: *BLiNX: the time sweeper*,
 title id `0x4D530013`, built 2002-09-13, 56 sections, `.text` / `D3D` /
 `D3DX` / `XGRPH` / `DSOUND`.
 
-## The number
+## THE NUMBER — and a retraction
 
-    module: default.xbe [20F912]   MS-named function starts: 1,786
-      hit (we detect a start there):        118   (6.6%)
-      missed, inside a detected function: 1,486   <- under-segmentation
-      missed, in no detected function:      182   <- uncovered
+**WITHDRAWN: the Blinx figure of 6.6% was measured on a corrupt image.** It is
+wrong and it pointed the opposite way from the truth. What follows replaces it.
 
-We detect **17,859** functions in Blinx — ten times what Microsoft names —
-and agree on 118 of their 1,786 starts. **83% of MS's starts land inside
-something we already called one function.** The samples are unambiguous:
-`0x000F2B80` contains `_XWriteTitleInfoNoReboot@24`, `_XGetLaunchInfo@8` and
-`_XWriteTitleInfoAndRebootA@20`; `0x000F33FC` contains three more.
+### The SVOD chunks are hash-interleaved; a flat copy is silently corrupt
 
-That is the adoption plan's item 5 — *"Keep the sweep in phase at source"* —
-with a number against it for the first time.
+Verified arithmetically, not taken on trust:
 
-**Caveat.** JSRF's pipeline feeds `--seed-functions` and `--function-bounds`
-from title-specific analysis; Blinx has none, so this was a bare run. Seeds
-can only ADD starts, so 6.6% is a floor. It is also the honest figure for a
-cold title, which is what every new game is.
+    0xA290000 / 0x1000            = 41,616 blocks per full Data file
+    1 + 203 x (1 + 204)           = 41,616      <- exact
+    => block 0 is an L1 hash block, then 203 groups of
+       [1 L0 hash block + 204 data blocks], 41,412 logical blocks per file
+
+Logical block n therefore lives at
+
+    file = n // 41412
+    off  = (2 + (n % 41412) // 204 * 205 + (n % 41412) % 204) * 0x1000
+
+**Why the validation gate did not catch it.** The XBE header and section table
+sit inside the first clean 204-block run, so `xbe_parser` printed a correct
+title, build date, base address and 56 plausible sections for a file that is
+corrupt from roughly 832 KB in. A gate that only parses the header proves
+nothing about the body. The honest checks are: map the directory entry's
+start_sector through the de-interleave and confirm it lands on one of the raw
+`XBEH` hits, and confirm the last section's raw end falls inside the file.
+
+### The real number, from Crimson Skies
+
+Extracted with de-interleaving, integrity-checked, and re-run independently:
+
+    module: default.xbe [20F90F]   MS-named function starts: 3,106
+      hit (we detect a start there):      3,073   (98.9%)
+      missed, inside a detected function:    16   <- under-segmentation
+      missed, in no detected function:       17   <- uncovered
+
+**98.9%**, on a bare run with no seed files. Our function-boundary detection
+agrees with Microsoft's ground truth almost everywhere. The 16 under-
+segmentation misses are not a general weakness: they cluster in Dolby/FFT
+kernels, where MS names each radix variant separately inside one blob, and in
+MSVC scalar-deleting-destructor thunks that genuinely share a body.
+
+That is the opposite of the conclusion the corrupt Blinx run supported, and it
+changes what the oracle says about adoption-plan item 5: on this evidence
+"keep the sweep in phase at source" is not buying a large correctness win.
+
+### Blinx remains unextracted, and its layout is not Crimson's
+
+Its descriptor parses (`MICROSOFT*XBOX*MEDIA` at logical block 0) but the root
+directory it names is outside the stored data: root sector 1,693,790 needs
+logical block 846,879 and the package holds 417,798. There is exactly one
+volume descriptor in the whole package, and no valid `default.xbe` directory
+entry appears in the first 4,000 logical blocks. Crimson's root sits at sector
+34; Blinx's does not. Blinx is DVD_X2 media, so a partition base is the
+obvious suspect, but deriving one from the root-sector-minus-two assumption
+lands on hash data. Unresolved, and a separate piece of work.
 
 ## And the version gap is wider than the date suggested
 
