@@ -549,3 +549,85 @@ void recomp_icall_not_code_log(uint32_t va)
         fflush(stderr);
     }
 }
+
+/* ── Untranslated instructions ───────────────────────────────────────────
+ *
+ * The lifter emits RECOMP_UNIMPL(text, va) at every instruction it has no
+ * translation for, in place of the bare comment it used to leave. This is the
+ * runtime half: say the site was REACHED, with what state, and how often --
+ * because the translator's tally lists 122 such sites in JSRF and cannot tell
+ * a dead one (a linear sweep reading `bound` or `arpl` over data) from a live
+ * one (Wreckless's `bsf`, which was live, and cost a bring-up).
+ *
+ * The instruction is still a no-op. This changes no behaviour; it only stops
+ * the omission being silent. RECOMP_UNIMPL_TRAP=1 aborts at the first hit,
+ * which is the validation-build mode: stop at the cause, not downstream.
+ *
+ * Cadence is the ICALL one -- powers of ten per site -- so a live site in a
+ * hot loop prints about twenty lines a run and a healthy run prints nothing,
+ * because a healthy run reaches none of these. */
+#include "../../src/recomp_switch.h"
+
+#define UNIMPL_SLOTS 64
+
+static uint64_t s_unimpl_total;
+
+void recomp_unimpl(const char *text, uint32_t va)
+{
+    static uint32_t addr[UNIMPL_SLOTS];
+    static uint64_t hits[UNIMPL_SLOTS];
+    static int used;
+    static int trap = -1;
+    uint64_t n;
+    int i;
+
+    if (trap < 0) trap = recomp_switch_on("RECOMP_UNIMPL_TRAP");
+    s_unimpl_total++;
+
+    for (i = 0; i < used; i++) {
+        if (addr[i] == va) break;
+    }
+    if (i == used) {
+        if (used >= UNIMPL_SLOTS) {
+            /* More distinct live sites than slots: not tracked per site, but
+             * never silent. Print the overflow once, and still honour the
+             * trap. */
+            static int overflow_said;
+            if (!overflow_said) {
+                overflow_said = 1;
+                fprintf(stderr, "[UNIMPL] more than %d distinct untranslated"
+                        " sites reached; further ones are counted but not"
+                        " listed\n", UNIMPL_SLOTS);
+            }
+            if (!trap) return;
+            n = 1;
+        } else {
+            addr[used] = va;
+            hits[used] = 0;
+            used++;
+            n = ++hits[i];
+        }
+    } else {
+        n = ++hits[i];
+    }
+
+    if (trap || recomp_icall_log_cadence(n)) {
+        fprintf(stderr,
+                "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
+                " (%llu times at this site; %llu untranslated hits in all)\n"
+                "[UNIMPL]   eax=%08X ecx=%08X edx=%08X ebx=%08X"
+                " esi=%08X edi=%08X seh_ebp=%08X esp=%08X\n"
+                "[UNIMPL]   it was a no-op: the guest continues with the state"
+                " above. RECOMP_UNIMPL_TRAP=1 stops here instead.\n",
+                text, va, (unsigned long long)n,
+                (unsigned long long)s_unimpl_total,
+                g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_seh_ebp, g_esp);
+        fflush(stderr);
+    }
+    if (trap) {
+        fprintf(stderr, "[UNIMPL] RECOMP_UNIMPL_TRAP is on: stopping at the"
+                " first untranslated instruction, at its own address.\n");
+        fflush(stderr);
+        abort();
+    }
+}
