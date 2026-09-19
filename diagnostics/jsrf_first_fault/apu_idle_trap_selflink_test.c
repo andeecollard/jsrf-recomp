@@ -34,6 +34,8 @@
  * means anything: without it a self-linked voice rings the walk to its
  * 256-iteration cap instead of terminating, which is a different bug with a
  * different fix. Holding it on in both arms keeps this test about one switch.
+ * It is set EXPLICITLY and must stay that way even if the default ever moves:
+ * a test that leans on a default is measuring the default.
  */
 #include <stdint.h>
 #include <stdio.h>

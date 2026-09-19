@@ -73,13 +73,16 @@ for path in sources:
 
 problems = 0
 
-# RULE 4, A RATCHET. 128 of the 152 switches parse their own value, and
-# rewriting all of them in one change would be a large diff over code whose
-# defaults decide whether the picture is correct -- exactly the kind of sweep
-# that flips one by accident. So the set is FROZEN instead: migrate downward at
-# leisure, but a NEW switch must use the helper, whose grammar is stated in one
-# place. The number only ever goes down.
-HANDROLLED_BASELINE = 128
+# RULE 4, A RATCHET. Most of the switches parse their own value, and rewriting
+# all of them in one change would be a large diff over code whose defaults
+# decide whether the picture is correct -- exactly the kind of sweep that flips
+# one by accident. So the set is FROZEN instead: migrate downward at leisure,
+# but a NEW switch must use the helper, whose grammar is stated in one place.
+# The number only ever goes down. It was 128 until 19 Sep 2026, when promoting
+# RECOMP_APU_SELFLINK_END, RECOMP_APU_LIST_MOVE_TO_FRONT and
+# RECOMP_APU_IDLE_TRAP_EDGE to default-on moved their three hand-rolled reads
+# onto recomp_switch_on_default.
+HANDROLLED_BASELINE = 125
 
 # VALUE-CARRYING, THEREFORE NOT SUBJECT TO THE RATCHET.
 #

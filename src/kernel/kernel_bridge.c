@@ -3377,17 +3377,59 @@ static volatile LONG g_nv2a_pmc_lost_ms_max;
 static volatile LONG g_nv2a_pmc_repaired;      /* up-mirrors actually done   */
 static DWORD g_nv2a_pmc_lost_since;            /* start of the current run   */
 
-/* Arm the repair? Default OFF. This changes what the program does, so it is a
- * value switch through recomp_switch_on rather than a presence test -- the
- * control arm of an A/B is taken by passing =0, and a presence test reads that
- * as ON, which has cost three wrong conclusions here already. Its state is
- * printed beside the counters on the [VBLANK-REG] line, because src/recomp_switch.h
- * is right that a switch which does not name itself in a report cannot be
- * compared across arms. */
+/* Arm the repair? DEFAULT ON since 19 Sep 2026; it shipped OFF on 16 Sep so
+ * that the detector above could prove the loss with the repair disarmed, and
+ * that job is done. Its state is printed beside the counters on the
+ * [VBLANK-REG] line, because src/recomp_switch.h is right that a switch which
+ * does not name itself in a report cannot be compared across arms.
+ *
+ * THE A/B THAT BUILT IT (4111a6b), two scene-matched 180 s runs that both
+ * reached a mission and played:
+ *
+ *   upmirror=off  delivered=1738 raised=1910 unacked_skips=8266  10.2 Hz
+ *                 summary lost=302477 episodes=7 max_run_ms=138028
+ *                 ADX worker frozen
+ *   upmirror=on   delivered=9859 raised=10133 unacked_skips=2     58.0 Hz
+ *                 summary lost=12 episodes=12 max_run=1 max_run_ms=0
+ *                 repaired=12, ADX worker never froze
+ *
+ * AND THE CORPUS AGREES AT SCALE, which is what moved the default rather than
+ * the argument. Completed runs under build-macos/jsrf-first-fault/
+ * render-investigation, classified by each run's own switches.txt and
+ * RESTRICTED TO 16-19 SEP, which is the window in which both arms exist --
+ * this switch was not in any binary before 16 Sep, so a whole-corpus sweep
+ * silently compares different software and the first version of this note
+ * did exactly that:
+ *
+ *                     clean    "[ADX] tick STUCK"     NULL storm     n
+ *   upmirror set        86              0                  1         87
+ *   not set            117             70                 13        200
+ *
+ * 0 of 87 against 70 of 200, under the date control.
+ *
+ * THE THIRD COLUMN IS A SECOND BUG WEARING THE SAME WATCHDOG LINE, and
+ * separating it is what makes the second column mean anything. Some frozen
+ * runs are an unresolved indirect call spinning on NULL at 0x00114B66, up to
+ * 2.3e10 calls; those are 17 runs and this repair does not touch them (1 of
+ * 87 armed still storms). The other 70 are a vblank-delivery failure and
+ * this repair removes them. Two bugs, one symptom, two fixes: do not score a
+ * freeze without checking which one it is.
+ *
+ * That is observational and not a controlled A/B -- the arms still differ in
+ * other switches -- but it is the same direction as the controlled pair
+ * above, it survives the confound that mattered most, and the ADX freeze is
+ * what caps every unattended measurement this harness takes. Defaulting it
+ * on is how the harness stops measuring a configuration nobody plays.
+ *
+ * RECOMP_NV2A_PMC_UPMIRROR=0 restores the 16 Sep behaviour, and the detector
+ * keeps counting either way, so the control arm is still one token. The
+ * grammar is recomp_switch_on_default's: unset or empty keeps the default,
+ * because `VAR= cmd` is how a shell unsets a variable for one command and a
+ * harness that did that must not silently disarm the repair. */
 static int bridge_nv2a_pmc_upmirror(void)
 {
     static int on = -1;
-    if (on < 0) on = recomp_switch_on("RECOMP_NV2A_PMC_UPMIRROR");
+    if (on < 0) on = recomp_switch_on_default("RECOMP_NV2A_PMC_UPMIRROR", 1);
     return on;
 }
 

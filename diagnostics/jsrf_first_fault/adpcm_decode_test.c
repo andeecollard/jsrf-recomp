@@ -115,20 +115,22 @@ int main(void)
 
     /* RECOMP_APU_ADPCM_HW_HEADER: the reserved byte is not a hardware check.
      *
-     * Every case above is the default path and must stay exactly as it is --
-     * the switch is off by default and this proves it. What follows is the
-     * other arm, and it is tested here because the title run that would show
-     * `fail` going to zero has not been taken: the decoder half can at least
-     * be settled without one.
+     * Every case above is the STRICT path -- g_adpcm_hw_header still 0 --
+     * which is both the default and the control arm the switch is compared
+     * against, and it must stay exactly as it is. Note that the test drives
+     * the global directly rather than the environment, so if the default
+     * ever moves, not a line of this file changes meaning. What follows is
+     * the lenient arm.
      *
      * The value 2055 is not a magic number. It is what 36 bytes of 0x08 --
      * the pad every ADPCM buffer in this title ends in, measured to the byte
      * by RECOMP_APU_ADPCM_EXTENT -- decodes to once the refusal is lifted:
      * predictor 0x0808, step index 8, then nibbles that walk the index down
      * to 0 where the delta becomes zero and the value holds. 6.27% of full
-     * scale, flat. That is what the hardware plays where this model
-     * currently plays silence, and it is the reason the switch ships off:
-     * substituting a DC step for silence is audible and needs a listen. */
+     * scale, flat. That is what the hardware plays where this model plays
+     * silence with the switch off. Substituting a DC step for silence is
+     * audible, and that is why the switch still ships off: see
+     * adpcm_hw_header_on() in apu_vp.c for the listen it is waiting on. */
     g_adpcm_hw_header = 1;
     g_adpcm_hw_header_accepted = 0;
     memset(out, 0x5A, sizeof out);
