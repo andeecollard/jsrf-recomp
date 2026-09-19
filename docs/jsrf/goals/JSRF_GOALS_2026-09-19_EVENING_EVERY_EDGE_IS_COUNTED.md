@@ -301,12 +301,23 @@ only the CPU arm shows it, the defect is in a path the player does not use
 and the priority is the harness, not the picture. If both show it, it is
 in the bundle too and G24 outranks G21.
 
-**A decision for the player, not made here:** the harness renders on the
-CPU fixed-function path by default and the bundle on the GPU one, so a
-harness window is not the player's picture. Making `play_scripted.sh`
-default to the player's rendering exports (`METAL_FF=1` at least) would
-close that — at the cost that the 782-run corpus and every frame-time A/B
-in it were taken on the other path. Written down rather than flipped.
+**Decided by the player at 16:58: the harness is for repeating and
+debugging what they see, so it renders on their path.** `play_scripted.sh`
+now adopts every `export RECOMP_X=0|1` line from `paths.conf` by default —
+13 switches on 19 Sep, `METAL_FF=1` among them — and never anything named
+like an instrument or an output (`FB_`, `DUMP`, `WATCH`, `TRACE`,
+`RECORD`, `LIFECYCLE`, `RATES`, `FRESH`, `RING`, `PATH`, `NAMES`), so a
+harness run cannot write into the player's dump or recording directories.
+The environment wins, so an A/B arm set explicitly stays as set, and
+`JSRF_PLAYER_SWITCHES=0` runs bare. Verified on `adopt-check`: the
+adopted list printed, `[VSH] fixed-function on the GPU (metal_ff on)`,
+and no `FB_DUMP` or `PAD_RECORD` in the run's switch set.
+
+**Consequence, stated once:** every frame-time number in the corpus and
+every A/B before this point was taken on the CPU fixed-function path.
+Numbers from after it are on the GPU path and do not compare to them.
+`ab_switch.sh` remains internally valid because both arms inherit the same
+adoption. The `earlyz` A/B above was the last one on the old path.
 
 ## The order
 

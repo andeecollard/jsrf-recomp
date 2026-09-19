@@ -171,6 +171,49 @@ echo "log:      $OUT/stderr.log   (${LIMIT}s)"
 # $OUT/switches.txt, and each line the player's paths.conf exports is checked
 # against it. The switches on the command line below are the harness's own
 # and are listed as such.
+# THE HARNESS RENDERS WHAT THE PLAYER SEES. On 19 Sep 2026 the player watched
+# a harness window and reported the wire-fence transparency bug back; the
+# harness was drawing fixed-function geometry on the CPU while their bundle
+# (RECOMP_METAL_FF=1 in paths.conf) draws it on the GPU. A window that is not
+# the player's picture cannot repeat what the player saw, and repeating is
+# what this script is for. So the player's BEHAVIOUR switches are adopted
+# from paths.conf by default:
+#   - only `export RECOMP_X=0` or `=1` lines: booleans are behaviour; a path,
+#     a rectangle or a count is an instrument's argument and is not adopted;
+#   - never anything named like an instrument or an output (FB_, DUMP, WATCH,
+#     TRACE, RECORD, LIFECYCLE, RATES, FRESH, RING, PATH, NAMES): paths.conf
+#     arms RECOMP_FB_DUMP into the shared glyphdump directory, and a harness
+#     run must never overwrite the player's pictures or recordings;
+#   - the environment wins: an A/B arm set explicitly stays as set, and an
+#     empty value (`RECOMP_X= cmd`) counts as set.
+# JSRF_PLAYER_SWITCHES=0 runs bare, which is what every run before this date
+# did; frame-time numbers from before and after are on different paths.
+PCONF="$HOME/Library/Application Support/JSRF/paths.conf"
+ADOPTED=""
+if [ -f "$PCONF" ] && [ "${JSRF_PLAYER_SWITCHES:-1}" != 0 ]; then
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        kv=${line#*export }
+        k=${kv%%=*}; v=${kv#*=}
+        v=${v%%#*}
+        v=$(printf '%s' "$v" | sed 's/[[:space:]]*$//')
+        case "$v" in \"*\") v=${v#\"}; v=${v%\"} ;; esac
+        case "$k" in
+            *FB_*|*DUMP*|*WATCH*|*TRACE*|*RECORD*|*LIFECYCLE*|*RATES*|*FRESH*|*RING*|*PATH*|*NAMES*) continue ;;
+        esac
+        case "$v" in 0|1) ;; *) continue ;; esac
+        if ! printenv "$k" >/dev/null 2>&1; then
+            export "$k=$v"
+            ADOPTED="$ADOPTED $k=$v"
+        fi
+    done <<EOF_ADOPT
+$(grep -E '^[[:space:]]*export RECOMP_' "$PCONF")
+EOF_ADOPT
+fi
+if [ -n "$ADOPTED" ]; then
+    echo "=== adopted from the player's paths.conf (JSRF_PLAYER_SWITCHES=0 to run bare) ==="
+    for kv in $ADOPTED; do echo "    $kv"; done
+fi
 SWITCHES=$(env | grep '^RECOMP_' | sort)
 printf '%s\n' "$SWITCHES" > "$OUT/switches.txt"
 echo "=== switch set (RECOMP_* in this run's environment) ==="
