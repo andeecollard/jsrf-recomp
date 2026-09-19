@@ -149,6 +149,25 @@ CONF="$SUPPORT/paths.conf"
 LOG="$SUPPORT/last-run.log"
 mkdir -p "$SUPPORT"
 
+# ROTATE BEFORE TRUNCATING. This log is the only record of what the engine saw,
+# and the launcher used to overwrite it on every start -- so the way to destroy
+# a crash report was to do the natural thing after a crash, which is launch the
+# game again. It cost the 08:11 crash on 19 Sep 2026: the wild-pointer
+# instrument was armed and had run, and its output went under a relaunch two
+# minutes later, leaving only the macOS .ips to work from.
+#
+# A log that recorded a guest fault is kept for good under its own timestamp.
+# Everything else moves to last-run-previous.log, so even an ordinary session
+# survives exactly one relaunch -- which is the case where someone quits, then
+# realises they wanted the log.
+if [ -f "$LOG" ]; then
+    if grep -qa 'FIRST GUEST FAULT' "$LOG" 2>/dev/null; then
+        mv "$LOG" "$SUPPORT/last-run-$(date -r "$LOG" +%Y-%m-%d_%H%M%S)-CRASH.log"
+    else
+        mv "$LOG" "$SUPPORT/last-run-previous.log"
+    fi
+fi
+
 die() {
     osascript -e "display alert \"Jet Set Radio Future\" message \"$1\" as critical" \
         >/dev/null 2>&1 || true
