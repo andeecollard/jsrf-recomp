@@ -203,3 +203,85 @@ report207, with the count beside it (`16`, `19`) rendering correctly. That is
 the player's "spray cans not rendering" reproduced in preserved evidence rather
 than in a screenshot, and it sits beside the 140,801 `combiner output mode`
 draw refusals as the leading candidate for the same cause.
+
+---
+
+# ADDENDUM 2: chasing the truncation to the string source
+
+## The strings are found, and the exact one is known
+
+They are NOT in `List_eng.dat`. They are plain text inside
+`Media/Mission/mssn*.bin`, mixed ASCII and Shift-JIS, with `$`-escapes. The
+tutorial set is in `mssn0101.bin` (and duplicated in `mssn3400.bin`).
+
+The line the player photographed is at `mssn0101.bin:0xBF26`, and in full:
+
+    \0 $n\x81@$n\x81@$n\x81@$n\x81@$n\x81@$n
+    Collect 10 Spray Cans and perform a
+    $n$c5Boost Dash$c1 with the $c5\x81gB button\x81h$c1!$r$e$r\0
+
+`$n` = newline, `$c<digit>` = colour, `$r`/`$e`/`$a` = other controls,
+`\x81\x40` = the SJIS full-width space, `\x81\x67`/`\x81\x68` = SJIS quotes.
+So the intended render is
+`Collect 10 Spray Cans and perform a / Boost Dash with the "B button"!`
+
+Note the structure: FIVE `$n` + full-width-space pairs, then a BARE `$n`
+immediately before `Collect`.
+
+## What the frames show against that source
+
+    line 1   Collect 10 Spray Cans and perform a   ->  llect 10 Spra? Cans and perform a
+    line 2   Boost Dash with the "B button"!       ->  Boost Dash With the "B button" !
+
+LINE 2 IS COMPLETE. Only line 1 loses characters, and both lines come from one
+string in one record. So the truncation is PER-LINE, not per-string, and
+whatever drops the characters runs after the newline split.
+
+The difference between them is what sits between the `$n` and the text:
+line 1 is `$n` + `Collect`, line 2 is `$n` + `$c5` + `Boost`.
+
+## Not clipped: the glyph is whole
+
+At 7x magnification the first surviving character of line 1 is a COMPLETE `l`
+with clean background to its left -- no sliced pixels. Across three affected
+strings the losses are 2, 1 and 5 characters, all landing exactly on glyph
+boundaries; a scissor rectangle would have cut through at least one. Combined
+with the left-margin measurement in addendum 1, both clipping explanations are
+dead and the characters are genuinely never laid out.
+
+## The parser could not be found statically, and the searches are validated
+
+Four searches, each with a positive control, because three of them returned
+zero and a zero from a broken search is worth nothing:
+
+  - `$`-escape dispatch as a compare chain: 9,019 functions scanned. 11 compare
+    against `0x24`, 14 against `n`/`c`/`r`/`e`, NONE does both.
+  - The 11 `0x24` functions are not character tests. The best-shaped candidate,
+    `sub_0002E9D0` (466 bytes, byte loads, 7 jump tables), uses it as a SWITCH
+    RANGE BOUND: `cmp ecx, 0x24; ja default` over 37 cases, dispatching through
+    a byte index table at `0x2EBB8` and a jump table at `0x2EBA4`.
+  - 8-bit compares exist (53 in one file alone) but NONE against `0x24`
+    anywhere in the tree.
+  - A first attempt found "only immediates 0-8 exist", which was MY REGEX:
+    `(-?\d+|0x[0-9A-Fa-f]+)` matched the leading `0` of `0x10` because the
+    decimal alternative came first. Fixed before any conclusion was drawn.
+
+So there is no `$` character test in the generated code at all. The escape
+handling is table-driven, or happens somewhere a comparison search cannot see.
+Static hunting is exhausted.
+
+## The decisive experiment, and it needs one small instrument
+
+Search guest RAM for the TRUNCATED byte sequence while the line is on screen:
+
+  - if `llect 10 Spray` exists in RAM, a guest routine built a truncated copy
+    and the defect is in string processing;
+  - if only `Collect 10 Spray` exists, the string is intact and the loss is in
+    the renderer's iteration or layout.
+
+That single bit decides which half of the pipeline to open, and nothing in the
+tree can do it today: `RECOMP_DUMP_VA` prints dwords at addresses you already
+know, and there is no pattern search. The instrument is small -- scan the guest
+RAM range for a supplied byte string, print hits with their addresses -- and it
+would serve every future "did the guest or did we?" question, which this
+project asks constantly.
