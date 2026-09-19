@@ -362,6 +362,27 @@ texture cache (16 Sep: "a hit requires a full memcmp") is the first thing
 to read: what it compares, over how many rows, and what refreshes it on
 the one frame in forty.
 
+**18:07 — the first real replay hit the starting-conditions gap, exactly
+as the player's step 1 predicted.** Replayed from the stock HDD, the 17:39
+recording stayed `checkpoints ok … BAD=0 state=aligned` and at mark #1
+(frame 3623) showed **the title screen** where the player's own picture
+shows the tutorial. The input stream was identical; the guest was ~30
+seconds behind. Two causes, both in the HDD the run boots from: the stock
+tree has an **empty `Cache/`** (the title rebuilds it at boot — the 1,410
+`NtOpenFile`s the harness calls "boot/cache-build only") and **no save
+slot** (`UDATA/5345000a/99271B32E8BB/` exists only in the player's
+`~/Library/Application Support/JSRF/hdd`). The anchor could not say so:
+every `#!ck` in the recording carries anchor `00000000`, because it reads
+save-data fields that this title leaves at zero in the tutorial, so
+"state=aligned" was two zeros agreeing. Two consequences, both now G23
+work: (a) a replay of a player recording must stage a **copy of the
+player's HDD** (`JSRF_HDD_SRC` pointed at it; the harness copies, never
+uses it in place); (b) the recording header must carry an HDD identity — a
+hash over `UDATA/` and whether `Cache/` is populated — and the replay must
+refuse or warn on a mismatch, the way it does for the gen; and (c) the
+anchor needs a field that actually moves in the tutorial. The matrix was
+relaunched from the player's HDD at 18:09.
+
 **The recording is the way in.** Replay `graffiti-2026-09-19_1739.padrec`
 unattended, it echoes mark #2 at frame 5111, and G23's frame window (not
 built yet) would arm the texture dump for ±120 frames around it. That is the
@@ -373,6 +394,59 @@ reading `p50=6.5 ms p90=38.0 ms over-33ms=86 of 335` beside windows at
 21 ms and 18 ms — bimodal frames, exactly the tail the day handover named as
 the stutter's mechanism (the CRI server's pass rate tracks the frame rate).
 Still G21, not an audio bug.
+
+## G25 — the emulated hard disk, read against Microsoft's
+
+Full comparison in
+`docs/jsrf/progress/PROGRESS_2026-09-19_THE_HDD_MODEL_AGAINST_MICROSOFTS.md`
+(ours, upstream's, and the 360 BC emulator's, with citations).
+
+**The architectural fact that frames everything else:** JSRF statically links
+XAPILIB 4134, so `XapiSelectCachePartition`, `XMountUtilityDrive`,
+`XapiFormatFATVolumeEx` and friends are **inside the recompiled title** and
+call down to our `Nt*` layer. Microsoft's BC emulator **reimplements** them —
+their per-title modules export exactly those names. They had to decide what a
+cache partition is; we only have to answer the title's `Nt*` calls correctly.
+
+**The defect, measured:** `NtQueryVolumeInformationFile` gets FATX geometry
+right (512 x 32 = 16 KB clusters, load-bearing: HL2's CRT aborts otherwise)
+and **capacity wrong**. POSIX `fstatvfs` reports the host volume, so the title
+is told its cache drive holds **1,858 GB with 690 GB free** where a real Xbox
+cache partition is **750 MB**. 900x over. Whether that changes what JSRF
+caches is a hypothesis with a cheap test: clamp per volume, compare the cache
+build against today's 258 files / 119 MB.
+
+**The boot cost, measured:** empty cache = **1,410** file opens at boot,
+populated = **131**. The build writes 258 files / 119 MB under `Cache/Media/`,
+ending with `Z:\Media\Cache\JSRF_CACHE_COMPLETE%02d.CMP` (a string in the
+title's own image, beside `D:\Media\Cache\DmCache%02d.tbl` — it is copying
+media off the disc). **Deterministic**: the player's cache and a run-built one
+are byte-identical; two independently built caches differ in exactly two
+files, `Cache/Media/Mark/DEFAULT/JSRF_TEXS0/1.JTX`, across ~295 KB of
+texture-like data. Those are graffiti tag textures. **A lead, not a finding** —
+the checkerboards where tags belong were in the 13:09 session.
+
+**Every corpus run replayed a first launch.** The harness copies the stock
+tree (empty cache) per run, so all 782 spent their first ~30 s on a build the
+player never pays. A warm tree now exists at `~/jsrf-build/emulated-hdd-warm`;
+nothing points at it yet. Switching the default re-bases boot-window numbers,
+the same way this afternoon's render-path change did.
+
+**Cache policy, and what is NOT known.** Neither we nor upstream clear,
+format or retain by policy, and neither has title-ID logic. The console
+formats the cache when a *different* title launches and keeps it otherwise, so
+a populated cache is the faithful steady state for a title you have played.
+What BC does is **undetermined**: it names three cache roots
+(`cache:\Xbox0/1/2` on the 360's own Cache partition) and keeps per-title data
+at `Y:\Xbox1\TDATA\%08x`, but nothing in the packages states persistence, and
+no partition-size or free-space constant appears anywhere. JSRF's official BC
+config (`5345000A`) carries no storage override at all.
+
+**Order:** (1) clamp free space per volume and measure; (2) warm HDD as the
+harness default; (3) HDD identity in the recording header, refused on mismatch
+like the gen id — it would have caught today's misaligned replay at once;
+(4) stub `IoDismountVolumeByName` (ordinal 91), JSRF's one unresolved import;
+(5) upstream's RootDirectory handling on the bridge side.
 
 ## The order
 
