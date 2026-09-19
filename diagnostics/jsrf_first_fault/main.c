@@ -32,6 +32,7 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 #include "../../src/recomp_switch.h"
 #include "guest_trace.h"
 #include "guest_names.h"
+#include "wild_ptr.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
 #include "nv2a_pb_scan.h"
@@ -3622,6 +3623,214 @@ void jsrf_trace_block(uint32_t guest_block)
     }
 }
 
+/* ── Naming the object that held a wild pointer ──────────────
+ *
+ * Everything the report prints below describes the VICTIM of a bad
+ * dereference: the host PC, the guest registers, the code pointers on the
+ * stack. On the scene-graph walkers that is the wrong end of the problem.
+ * sub_00011D00 -- CActBase::recursiveExec1Default -- reads a child out of
+ * MEM32(this+0x28) and recurses on it, so when the child is garbage the
+ * faulting frame contains nothing but the garbage. The register file says EDI
+ * was 0xFF555555 and stops, which is the question, not the answer.
+ *
+ * One step backwards is recoverable after the fact, because the walker leaves
+ * it in guest memory. Its generated prologue is
+ *
+ *     PUSH32(esp, ecx); PUSH32(esp, ebp); ebp = ecx;
+ *
+ * so the caller's `this` is saved on the guest stack before the callee
+ * overwrites ebp, and the parent object itself is untouched by the fault --
+ * its +0x28 still holds the value that killed the child. Walking the faulting
+ * thread's stack for any word that could be an object, and each such object's
+ * first 0x100 bytes for the wild value, therefore names the parent and the
+ * field offset with nothing instrumented and nothing to arm in advance.
+ *
+ * The same search over guest RAM answers a second question this crash raises
+ * on its own. 0xFF555555 is opaque mid-grey in ARGB8888, and 0x55 is exactly
+ * the DXT1 one-third interpolant between black and white, so "the walk
+ * followed a pointer into colour data" is a live hypothesis rather than a
+ * decoration. A corrupted pointer field is one isolated word; a decoded
+ * surface is thousands in a row. Run lengths separate the two, and nothing
+ * else available at a crash does.
+ *
+ * Opt-in via RECOMP_WILD_PTR because it walks up to 128 MB inside a signal
+ * handler that has already suppressed re-entry: a mistake in here would cost
+ * the existing report, which is worth more than this one. The switch is read
+ * at startup, not in the handler, so the handler adds no getenv to the list
+ * of things it does that it should not. RECOMP_WILD_PTR_SELFTEST proves the
+ * scan is armed and reaching real guest memory before anyone has to trust a
+ * zero from it.
+ */
+#define JSRF_WP_DISP_WINDOW   0x1000u  /* largest plausible field displacement */
+#define JSRF_WP_FIELD_WINDOW  0x100u   /* how far into an object to look */
+#define JSRF_WP_MAX_PARENTS   8u
+#define JSRF_WP_MAX_RUNS      8u
+#define JSRF_WP_LONG_RUN      64u      /* above this, the value is a buffer */
+
+static int jsrf_wild_ptr_armed(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_WILD_PTR") ? 1 : 0;
+    return on;
+}
+
+/* Offsets are CActBase's, the same ones RECOMP_OBJECT_DUMP already uses:
+ * +00 vtable, +04 eACTFLAG, +08 own id, +0C draw child mask, +24 parent,
+ * +28 child, +2C/+30 siblings. A candidate that decodes to a code-range
+ * vtable and a small id is a node; one that does not is the more interesting
+ * answer, because it means the graph is linked to something that was never a
+ * node at all. */
+static void jsrf_wp_dump_node(uint32_t node)
+{
+    uint32_t i;
+    fprintf(stderr,
+            "[WILD-PTR]   as CActBase: vtable=%08X flags=%08X id=%08X"
+            " parent=%08X child=%08X sib=%08X/%08X\n",
+            MEM32(node), MEM32(node + 4), MEM32(node + 8),
+            MEM32(node + 0x24), MEM32(node + 0x28),
+            MEM32(node + 0x2C), MEM32(node + 0x30));
+    for (i = 0; i < 0x50u; i += 0x10u)
+        fprintf(stderr, "[WILD-PTR]   +%02X: %08X %08X %08X %08X\n",
+                i, MEM32(node + i), MEM32(node + i + 4),
+                MEM32(node + i + 8), MEM32(node + i + 0xC));
+}
+
+static void jsrf_wild_ptr_report(uint32_t fault_va, uint32_t wild)
+{
+    const unsigned char *base = (const unsigned char *)xbox_GetMemoryOffset();
+    JsrfWpParent parents[JSRF_WP_MAX_PARENTS];
+    JsrfWpHit hits[JSRF_WP_MAX_RUNS];
+    uint32_t stack_lo, stack_hi, n, i, total, runs, longest;
+
+    fprintf(stderr, "\n[WILD-PTR] hunting 0x%08X (the base of the faulting"
+            " read at guest 0x%08X)\n", wild, fault_va);
+
+    /* The same stack resolution the block above performs, repeated rather
+     * than threaded down through it. This runs after a fault that has already
+     * cost the process; a self-contained function is one fewer way to lose
+     * the report it exists to print. */
+    stack_lo = (uint32_t)XBOX_STACK_BASE;
+    stack_hi = XBOX_STACK_TOP;
+    if (!(g_esp >= stack_lo && g_esp < stack_hi) &&
+        !xbox_GuestStackRangeFor(g_esp, &stack_lo, &stack_hi))
+        stack_hi = 0;
+
+    if (stack_hi) {
+        n = jsrf_wp_parents(base, g_esp, stack_hi, 0x10000u, JSRF_RAM_TOP,
+                            wild, JSRF_WP_FIELD_WINDOW, parents,
+                            JSRF_WP_MAX_PARENTS);
+        fprintf(stderr, "[WILD-PTR] %u object(s) reachable from the faulting"
+                " stack hold it\n", n);
+        for (i = 0; i < n && i < JSRF_WP_MAX_PARENTS; ++i) {
+            fprintf(stderr, "[WILD-PTR] PARENT node=%08X field=+0x%02X"
+                    " (its pointer was saved at stack[%08X])\n",
+                    parents[i].node, parents[i].field, parents[i].via);
+            jsrf_wp_dump_node(parents[i].node);
+        }
+        if (!n)
+            fprintf(stderr, "[WILD-PTR] no holder on the stack: the parent was"
+                    " not saved there, or the field is past +0x%X\n",
+                    JSRF_WP_FIELD_WINDOW);
+
+        /* The used stack as raw words, so a reader can do by hand what the
+         * search above does mechanically.
+         *
+         * The scan directly above this reports only stack slots that pass a
+         * content test, and the existing code-pointer scan reports only
+         * slots inside .text. Between them they hide every saved `this`,
+         * which on these walkers is the interesting half of the frame: at
+         * the crash of 19 Sep the parent node sat at [esp+0x0C] and no line
+         * of the report printed it. When the mechanical search comes back
+         * empty this is what is left to reason from, so it is printed then
+         * as well -- especially then. */
+        {
+            uint32_t va, used = stack_hi - g_esp, cap = 0x400u;
+            if (used > cap) used = cap;
+            fprintf(stderr, "[WILD-PTR] faulting stack, %u byte(s) from"
+                    " esp=%08X%s:\n", used, g_esp,
+                    (stack_hi - g_esp) > cap ? " (truncated)" : "");
+            for (va = g_esp; va + 16u <= g_esp + used; va += 16u)
+                fprintf(stderr, "[WILD-PTR]   %08X: %08X %08X %08X %08X\n",
+                        va, MEM32(va), MEM32(va + 4),
+                        MEM32(va + 8), MEM32(va + 0xC));
+        }
+    } else {
+        fprintf(stderr, "[WILD-PTR] esp=%08X is in no known stack, so the"
+                " stack search would be searching nothing\n", g_esp);
+    }
+
+    total = jsrf_wp_scan(base, 0x10000u, JSRF_RAM_TOP, wild, hits,
+                         JSRF_WP_MAX_RUNS, &runs, &longest);
+    fprintf(stderr, "[WILD-PTR] guest RAM 00010000..%08X holds it in %u"
+            " word(s), %u run(s), longest %u word(s)\n",
+            JSRF_RAM_TOP, total, runs, longest);
+    for (i = 0; i < runs && i < JSRF_WP_MAX_RUNS; ++i)
+        fprintf(stderr, "[WILD-PTR]   run at %08X x%u\n",
+                hits[i].va, hits[i].run);
+    fprintf(stderr, "[WILD-PTR] VERDICT: %s\n",
+            longest >= JSRF_WP_LONG_RUN
+              ? "long runs present, so this value is DATA somewhere in RAM"
+                " (colour, material or a cleared buffer) and a pointer reached"
+                " into it"
+              : total == 0u
+              ? "nothing in RAM holds it, so the value was computed rather"
+                " than loaded from a field"
+              : "isolated words only, consistent with a corrupted pointer"
+                " field rather than a buffer full of this value");
+    fflush(stderr);
+}
+
+/* Positive control, and the negative one beside it.
+ *
+ * "No holder found" is the answer this instrument will most often give, and
+ * on its own it cannot be told apart from a scanner that never looked. So
+ * before any zero from it is worth anything, ask it for a value that must be
+ * there and a value that must not be.
+ *
+ * The positive probe is READ OUT of guest memory and then searched for, so it
+ * cannot be wrong about what it is looking for: whatever the first word of
+ * .text happens to be, the scan has to find at least that address. The
+ * negative probe is a sentinel shaped like nothing the title or the runtime
+ * writes. Both print PASS or FAIL, because a control nobody reads is not a
+ * control. The parent search is not exercised here -- it would need a write
+ * into guest memory to set up, and this instrument is read-only -- so it is
+ * pinned by jsrf_wild_ptr_test instead, which builds the whole crash.
+ */
+static void jsrf_wild_ptr_startup(void)
+{
+    const unsigned char *base;
+    const uint32_t probe_va = 0x00011000u;   /* first byte of .text */
+    uint32_t probe, total, runs, longest;
+    JsrfWpHit hit;
+
+    /* Prime the switch here so the signal handler never has to call getenv. */
+    if (jsrf_wild_ptr_armed())
+        fprintf(stderr, "[WILD-PTR] armed: a guest fault will try to name the"
+                " object that held the bad pointer\n");
+
+    if (!getenv("RECOMP_WILD_PTR_SELFTEST")) { fflush(stderr); return; }
+
+    base = (const unsigned char *)xbox_GetMemoryOffset();
+    probe = MEM32(probe_va);
+    total = jsrf_wp_scan(base, 0x10000u, JSRF_RAM_TOP, probe, &hit, 1,
+                         &runs, &longest);
+    fprintf(stderr, "[WILD-PTR] selftest positive: the word at %08X is %08X;"
+            " scanned RAM and found it %u time(s), first at %08X -- %s\n",
+            probe_va, probe, total, total ? hit.va : 0u,
+            total ? "PASS" : "FAIL, the scan is not reading guest memory");
+
+    total = jsrf_wp_scan(base, 0x10000u, JSRF_RAM_TOP, 0xDEADBE55u, NULL, 0,
+                         NULL, NULL);
+    fprintf(stderr, "[WILD-PTR] selftest negative: the sentinel 0xDEADBE55"
+            " was found %u time(s) -- %s\n", total,
+            total ? "UNEXPECTED, choose another sentinel" : "PASS");
+
+    if (!jsrf_wild_ptr_armed())
+        fprintf(stderr, "[WILD-PTR] selftest ran but RECOMP_WILD_PTR is NOT"
+                " set, so a crash will print no wild-pointer section\n");
+    fflush(stderr);
+}
+
 #if defined(_WIN32)
 static LONG CALLBACK crash_handler(PEXCEPTION_POINTERS ep)
 {
@@ -3760,6 +3969,8 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
     uintptr_t fault = si ? (uintptr_t)si->si_addr : 0;
     uintptr_t host_pc = 0, host_lr = 0, host_sp = 0;
     uint32_t guest_fault = 0;
+    uint32_t wild_va = 0, wild_base = 0;
+    int wild_mapped = 0;
     uint32_t count = g_guest_trace_index;
     uint32_t available = count < GUEST_TRACE_SIZE ? count : GUEST_TRACE_SIZE;
 
@@ -3792,8 +4003,71 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
     fprintf(stderr, "HOST SP: 0x%016llX\n", (unsigned long long)host_sp);
     if (xbox_HostAddressToGuest(fault, &guest_fault)) {
         fprintf(stderr, "VALID MAPPED GUEST ADDRESS: 0x%08X\n", guest_fault);
+        wild_va = guest_fault;
+        wild_mapped = 1;
     } else {
         fprintf(stderr, "HOST ADDRESS IS NOT A VALID MAPPED GUEST ADDRESS\n");
+    }
+    /* The guest address the translated code MEANT, even when nothing is
+     * mapped there.
+     *
+     * xbox_HostAddressToGuest only answers for ranges that exist, so the one
+     * case where the number matters most -- a pointer so wild that it lands
+     * outside every view -- is the case where the report used to drop it and
+     * print a sentence instead. Every translated access goes through
+     * XBOX_PTR, which is guest VA plus one offset, so the inverse is always
+     * available whether or not the result is mapped. The crash of 19 Sep 2026
+     * read 0x00000070FF555559 here and said nothing; it was guest 0xFF555559.
+     */
+    {
+        uint32_t implied = (uint32_t)((uintptr_t)fault
+                                      - (uintptr_t)xbox_GetMemoryOffset());
+        uint32_t regs[JSRF_WP_NREG];
+        int i, any = 0;
+
+        /* Keyed on whether the range LOOKUP answered, not on whether the
+         * answer was non-zero: guest VA 0 is mapped here (the fake TIB lives
+         * at address 0), so a null `this` faults at a perfectly valid guest
+         * address and must not be reported as unmapped. */
+        if (!wild_mapped) {
+            fprintf(stderr, "IMPLIED GUEST VA (nothing mapped there): 0x%08X\n",
+                    implied);
+            wild_va = implied;
+        }
+
+        /* Which register carried it, and at what field offset. A translated
+         * read is MEM32(reg + k) for a small constant k, so the base is the
+         * register sitting just below the faulting address -- and k is the
+         * structure field, which is the part a reader actually wants. Several
+         * registers often hold the same garbage, so print every one that
+         * fits rather than picking a winner and hiding the ambiguity. */
+        regs[JSRF_WP_EAX] = g_eax; regs[JSRF_WP_ECX] = g_ecx;
+        regs[JSRF_WP_EDX] = g_edx; regs[JSRF_WP_EBX] = g_ebx;
+        regs[JSRF_WP_ESI] = g_esi; regs[JSRF_WP_EDI] = g_edi;
+        regs[JSRF_WP_EBP] = g_ebp; regs[JSRF_WP_ESP] = g_esp;
+        fprintf(stderr, "FAULT CARRIED BY:");
+        for (i = 0; i < JSRF_WP_NREG; ++i) {
+            uint32_t disp = wild_va - regs[i];
+            if (disp > JSRF_WP_DISP_WINDOW) continue;
+            fprintf(stderr, " %s(%08X)+0x%X", jsrf_wp_reg_names[i],
+                    regs[i], disp);
+            any = 1;
+        }
+        fprintf(stderr, "%s\n", any ? "" :
+                " no register is within 0x1000 bytes below it --"
+                " the base was overwritten before the handler ran");
+        /* The wild value to hunt for is the BASE, not the faulting address:
+         * the parent's field holds the pointer, not the pointer plus the
+         * field offset that broke it. */
+        {
+            int reg = -1;
+            uint32_t disp = 0;
+            if (jsrf_wp_attribute(wild_va, regs, JSRF_WP_DISP_WINDOW,
+                                  &reg, &disp))
+                wild_base = regs[reg];
+            else
+                wild_base = wild_va;
+        }
     }
     fprintf(stderr, "LAST INSTRUMENTED GUEST FUNCTION (may have returned): sub_%08X\n", g_current_guest_function);
     if (available) {
@@ -3865,6 +4139,11 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
                     g_esp, (uint32_t)XBOX_STACK_BASE, XBOX_STACK_TOP);
         }
     }
+    /* One step back up the walk: which object held the pointer that killed
+     * us. Opt-in, and last in the report, so that if it goes wrong it takes
+     * nothing above it with it. */
+    if (jsrf_wild_ptr_armed())
+        jsrf_wild_ptr_report(wild_va, wild_base);
     /* What the APU last asked the guest to service. Printed HERE and not only
      * by the periodic report, because waiting for a run that both crashes and
      * has the report land at the right moment is a worse experiment than making
@@ -4164,6 +4443,14 @@ int main(int argc, char **argv)
         extern void xbox_TextChecksumReport(void);
         xbox_TextChecksumReport();
     }
+
+    /* Guest memory is up, so the wild-pointer scan can prove it reaches it.
+     * Here and not earlier for exactly that reason: a self-test that ran
+     * before the arena existed would report a confident zero. Here and not
+     * LATER so that the switch is cached before anything can fault -- which
+     * includes RECOMP_DUMP_VA immediately below, whose whole job is to
+     * dereference an address someone typed. */
+    jsrf_wild_ptr_startup();
 
     /* RECOMP_DUMP_VA=<addr>[,<addr>...] prints those guest dwords once, here,
      * after the image is loaded and the runtime's own writes to it are done

@@ -291,6 +291,7 @@ endif()
 add_executable(jsrf_first_fault
     main.c
     guest_names.c
+    wild_ptr.c
     startup_probe.c
     draw_one_probe.c
     func_hit_probe.c
@@ -515,6 +516,13 @@ add_test(NAME jsrf_flip_sync COMMAND jsrf_flip_sync_test)
 
 add_executable(jsrf_guest_names_test guest_names_test.c guest_names.c)
 add_test(NAME jsrf_guest_names COMMAND jsrf_guest_names_test)
+
+# The crash reporter names the victim of a wild pointer; this names the object
+# that held it. Pure functions over a flat guest image, so the test can build
+# the scene-graph crash of 19 Sep 2026 and check the scanner points at the
+# parent node rather than at whatever else happened to be on the stack.
+add_executable(jsrf_wild_ptr_test wild_ptr_test.c wild_ptr.c)
+add_test(NAME jsrf_wild_ptr COMMAND jsrf_wild_ptr_test)
 
 add_executable(jsrf_worker_stack_pool_test worker_stack_pool_test.c)
 target_link_libraries(jsrf_worker_stack_pool_test PRIVATE xbox_kernel)
