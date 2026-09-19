@@ -1,0 +1,425 @@
+HANDOVER 2026-09-19 MIDDAY -- THE FREEZE AND THE SKATING CRASH WERE THE SAME
+BUG, IT IS FIXED, AND THE PLAYER'S SESSION FOUND THREE MORE
+
+Read CLAUDE.md, then the newest file in docs/jsrf/goals/ -- do not trust a
+pointer, including this one. Supersedes
+HANDOVER_2026-09-19_DAY_THE_STUTTER_IS_THE_FRAME_RATE_AND_THE_FREEZE_IS_THE_GATE.txt.
+Its items 0.1 and 0.3 turned out to be one defect; its item 0.5's first
+instruction cannot be followed. Section 9 is what I got wrong.
+
+Tree: main at f13622e, UNCHANGED. Four branches finished and unmerged, all
+merging clean together at ctest 77/77. Three uncommitted files in main (see
+section 7).
+
+Written by the assistant that did the work. The player played the fixed build
+at 12:23-12:28 and that session is the most important artefact of the day.
+
+=============================================================================
+0. WHAT TO DO NEXT, IN ORDER
+=============================================================================
+
+  1. MERGE THE FOUR BRANCHES, THEN REGENERATE ONCE. In that order, and the
+     order is not a preference. regenerate.sh copies
+     templates/runtime/recomp_types.h into the gen tree and the generated C
+     includes THAT copy. wt-icall changes that header. Merging and building
+     against an existing gen produces SILENTLY DEAD CODE -- measured: the
+     merged build's gen/recomp_0004.c.o references only _recomp_icall_fail_log
+     while the correctly-built one references _recomp_itail_fail_log too. A
+     new ctest, jsrf_gen_header_current, goes RED until you regenerate. That
+     is deliberate. Do not downgrade it.
+
+  2. THE BLACK SCREEN AT t=245. New, and the top open defect. In the player's
+     12:28 session the framebuffer went from sum=0090D557 nonzero=153338 at
+     t=244.01 to sum=00000000 nonzero=0 at t=245.01 and stayed black to the
+     end. NO segfault, NO guest fault, NO macOS crash report, and frames kept
+     presenting (28,800) with [ADX] ticking throughout. The guest did not
+     crash; the picture went black while everything else carried on.
+
+  3. G1, AND IT IS FINALLY CLEAN. Same session, the 2D bin froze while 3D
+     climbed -- the discriminator G1 is named after, with lost=0 and the
+     output pipeline provably healthy. Numbers in section 3. This is the best
+     evidence G1 has ever had and it cost one player session.
+
+  4. THE SPRAY-CAN STENCIL. Reported ("spray can stencil issues eg black")
+     and NOT INVESTIGATED: no stencil counter fired and both bisect switches
+     read states=0, meaning they were not armed. This is a paths.conf edit and
+     a relaunch, not a build.
+
+  5. G21, the texture path. Sizing is in the goals file. Read the correction
+     in section 6 before following the old handover's instruction.
+
+=============================================================================
+1. THE ROOT CAUSE: A SWITCH ARM THE LIFTER COULD NOT PLACE
+=============================================================================
+
+The previous handover treats the ADX freeze (its 0.1) and the skating crash
+(its 0.3) as separate problems, one audio and one scene-graph. They are one
+defect and neither is what it looked like.
+
+A `jmp dword ptr [reg*4 + table]` is a C switch. The lifter turns it into
+gotos only when it can prove the arms lie inside the function being lifted
+(lifter.py _analyze_switch_table, >=2 arms inside [start,end)). When it
+cannot, the dispatch falls through to RECOMP_ITAIL, whose failure path at
+templates/runtime/recomp_types.h:1380 is
+
+    recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0;
+
+`g_esp += 4` is CORRECT for a real tail jump -- the epilogue has run and esp
+sits on the return address. It is CATASTROPHIC for a misidentified switch,
+where esp still holds the whole frame. The function returns with the guest
+stack short by its locals plus its pushes and NO EPILOGUE RUN, and since
+ebx/esi/edi are globals in this ABI every caller up the chain then pops them
+from the wrong slots.
+
+It presents two ways, which is why it was chased as two bugs:
+  - in a POLLING LOOP the caller gets eax=0 forever and spins. That is the
+    "ADX freeze": 10.8 to 23.4 BILLION NULL indirect calls, 1.7M log lines,
+    the picture frozen. 15 of 17 runaway storms in the corpus.
+  - in a TREE WALK the corrupted unwind surfaces later as a wild pointer.
+    That is the skating crash at sub_00011D00 +0x244.
+
+Both fixed. Both verified. Details in section 2.
+
+WHAT THE OLD HANDOVER GOT RIGHT AND WRONG about its own item 0.1: right that
+nothing could be measured until it was fixed; wrong that it was the ADX
+worker. jsrf_adx_watch is a watchdog on a tick counter -- it reports that the
+sound worker stopped and never says why, and for weeks nobody asked what the
+guest did in the seconds before.
+
+A SECOND, UNRELATED FREEZE WEARS THE SAME WATCHDOG LINE. Do not score a
+freeze without checking which one it is. Restricted to 16-19 Sep, the window
+in which the switch exists at all (before 16 Sep no run has it, so a
+whole-corpus comparison silently compares different binaries):
+
+                       clean   ADX_STUCK, no storm   NULL storm    n
+  UPMIRROR=1             86             0                 1        87
+  not set               117            70                13       200
+
+RECOMP_NV2A_PMC_UPMIRROR removes the common one entirely and does not touch
+the storm. The harness has been running without it all along.
+
+=============================================================================
+2. WHAT IS FIXED, AND HOW IT WAS VERIFIED
+=============================================================================
+
+Only THREE of the nine unresolved VAs in the corpus were ever live on the
+current gen. The other five -- 0x0007E575, 0x0006D7A8, 0x000960C3,
+0x000FDB9F, 0x000F8B54 -- already resolve to gotos; the corpus tally mixed
+runs taken against different gens. Check before chasing one.
+
+  0x00114B66  THE FREEZE.  Owner sub_00114A80 truncated by a SPURIOUS START
+              at 0x00114D34. Fixed at the detector (wt-icall): short
+              two-entry jump tables get their own map, and a start the pass
+              has already dropped no longer counts as code separating an arm
+              from its dispatch. 2 starts removed, 0 added, 3 extents
+              changed, unique bytes covered IDENTICAL at 1,614,033.
+
+  0x000A5B8C  THE PLAYER'S CRASH.  Its containing function DID NOT EXIST.
+              Fixed by seeding the real prologue 0x000A5B60 (wt-walker):
+
+                  000A5B5E  ret
+                  000A5B5F  nop              <- alignment padding
+                  000A5B60  sub  esp, 0x50   <- prologue
+                  000A5B63  push ebx/ebp/esi/edi
+                  000A5B67  mov  esi, ecx    <- __thiscall
+
+              0x50 + 4 pushes = 0x60, exactly the stack deficit derived
+              independently from four crash ESPs. A 44-byte "Recovered entry"
+              stub ending in a bare RECOMP_ITAIL with no epilogue became a
+              1348-byte function with POP32 edi/esi/ebp/ebx, esp+0x50, and
+              the five-arm switch lifted to gotos. Audit 607 -> 603, coverage
+              +93 bytes = 0xA5BE9 - 0xA5B8C exactly, starts net unchanged.
+
+              SEED THE PROLOGUE, NEVER THE ARM. Seeding an arm truncates its
+              container and manufactures this very defect. The two cases look
+              identical in a log and are opposites. That is why the seed lives
+              in its own file, missed_prologue_seed.json, whose name states
+              the precondition.
+
+  0x001063CF  OPEN. Container exists, clamped by two spurious starts at
+              0x0010651D and 0x0010651F. Both are bogus and here are the
+              bytes:
+                  0010651B  eb 04  jmp 0x106521
+                  0010651D  dd d8  fstp st(0)
+                  0010651F  dd d8  fstp st(0)
+                  00106521  8b 46 44  mov eax,[esi+0x44]
+              An x87 cleanup pair with two entry points. The second "function
+              start" is the second instruction of a two-instruction sequence.
+
+=============================================================================
+3. THE PLAYER'S SESSION -- THE CRASH IS GONE AND THREE THINGS ARE NOT
+=============================================================================
+
+12:23-12:28 on JSRF-crashfix.app (wt-walker's binary: the 0x000A5B8C fix
+ALONE, deliberately, so one variable moved). Preserved as
+  ~/Library/Application Support/JSRF/
+    last-run-2026-09-19_1228-CRASHFIX-PLAYER-GRAFFITI-CRASH-KEEP.log
+
+THE CRASH IS FIXED:
+                                 before            this session
+  Failed to resolve 0x000A5B8C   6 of 6 crash logs      0
+  guest fault                    sub_00011D00 x4      none
+  session length                 ~35 s to crash       245 s+, through graffiti
+  voices retired (off=)          0-5 every run        163
+
+off=163 against on=168 deserves its own line: no scripted run in this
+project's history has ever retired a voice. This is the first session with a
+full voice lifecycle, and it is a better audio corpus than anything in the
+782-run scripted set.
+
+THREE THINGS THE SESSION FOUND:
+
+  a) THE BLACK SCREEN, t=245.01. See item 0.2. Not a crash -- no fault, no
+     .ips, frames still presenting. The player experienced it as a crash "at
+     the beginning of the graffiti part".
+
+  b) G1, THE 2D BIN, CLEANLY. Per report window:
+
+        win 18   2D=232604   3D=236352    2D frozen
+        win 19   2D=232604   3D=267816    2D frozen, 3D climbing
+        win 20   2D=233048   3D=309108    recovers
+        win 22   2D=260998   3D=320295
+        win 25   2D=260998   3D=334008    BOTH frozen, to the end
+
+     With [APU-BIN] lost=0 and [APU-PACE] starved=0 empty=0
+     min_queued=26.7 ms. The music is not being dropped downstream; it stops
+     being produced. Then at win 25 BOTH bins freeze, which coincides with
+     the black screen -- so (a) and the second phase of (b) are probably one
+     event and should be investigated together.
+
+  c) THE SPRAY-CAN STENCIL. Reported, not investigated, no instrument armed.
+
+=============================================================================
+4. WHAT LANDED, WITH VERIFICATION STATUS -- ALL UNMERGED
+=============================================================================
+
+  wt-walker   688c12b  The prologue seed (above) + switch_arm_audit.py, the
+                       tool that makes all of this measurable WITHOUT running
+                       the game. 1563e11 is the tool, 688c12b the fix.
+                       Verified: audit 607->603, coverage +93, ctest 71/71.
+
+  wt-icall    3999ce2  The detector fix for 0x00114B66; RECOMP_ITAIL failures
+                       now announce themselves as stack-corruption events
+                       with a size; the runaway is named once instead of
+                       spewing; jsrf_gen_header_current (the stale-header
+                       gate); switch_arm_causes.py (the classification).
+                       Verified: ctest 76/76 AND a real run, section 5.
+
+  wt-padrec   b753d8f  Frame-keyed pad record/replay. A recording IS a pad
+                       script in the same grammar, keyed to NV097_FLIP_STALL
+                       (verified: [PAD-POLL] polls= is a flat ~120 Hz timer,
+                       [PUSHER] flips= varies sevenfold -- keying on polls
+                       would have been wrong). Carries a CSaveData anchor so a
+                       slid scene reports as STATE misalignment, not input
+                       divergence. ctest 72/72. NEVER EXERCISED IN A REAL
+                       SESSION -- four assumptions listed in its own report.
+
+  wt-switches ee31f41  Three switches promoted to code defaults
+                       (NV2A_PMC_UPMIRROR, APU_IDLE_TRAP_EDGE,
+                       APU_IDLE_HANDOFF_GUARD), three deliberately NOT
+                       (APU_SELFLINK_END, APU_LIST_MOVE_TO_FRONT,
+                       APU_ADPCM_HW_HEADER) because only observation decided
+                       them -- each carries the licensing run in a comment.
+                       Plus jsrf_apu_idle_trap_lock_shipping, which covers the
+                       shipping pair and FAILS under REARM_MS=0 (the setting
+                       that killed the music). ctest 72/72.
+
+  wt-icall-fixpoint-probe  a9b254f  A PROBE. MUST NOT BE MERGED. See section 8.
+
+=============================================================================
+5. THE ONE RUN THIS SESSION TOOK, AND ITS PRE-REGISTERED RESULT
+=============================================================================
+
+build-itail, gameplay_nobarrage, 110 s, reached state 30, 28 pad events.
+Four criteria were written down BEFORE the run. Three confirmed, one refuted:
+
+  CONFIRMED  [ITAIL] Unresolved tail jump to 0x00114B66
+  CONFIRMED  guest esp=0x0050FE3C holds 0x040D3A70, which is NOT CODE
+  CONFIRMED  the runaway named once instead of a flood
+  REFUTED    stranded frame read 72 bytes against a predicted 164
+
+The refutation was the INSTRUMENT, not the model. The scan asked "is this a
+code address?" and a live frame is full of code addresses that are not return
+addresses. The frame really is 164: sub_00114A80 does `sub esp,0x98` plus 3
+pushes (0xA4), and independently reads its own argument at [esp+0xA8] and ends
+`ret 4`, so esp_entry = esp + 0xA4. The scan now requires a call instruction
+to end exactly at the candidate, and says "AT LEAST n -- a FLOOR" when it
+finds nothing.
+
+THE HEADLINE, same schedule, against base1:
+
+                    log lines      "skipped not-code"    last count
+  base1 (old)       1,752,787           1,735,601        10,863,700,000
+  itail-confirm2       15,770                   7               100,000
+
+111x smaller, 248,000x fewer spam lines, cause named in words. NOTE: those
+last-count figures are NOT like-for-like -- see section 9.
+
+The run also exposed two bugs invisible until the banner fires in anger: the
+"recent resolved targets" list printed EMPTY (the spin overwrites the ring it
+reports), and the banner printed TWICE each counting its own million (the
+find-or-add over the slot table is not atomic). Both fixed on wt-icall.
+
+=============================================================================
+6. CORRECTIONS TO THE PREVIOUS HANDOVER
+=============================================================================
+
+  - Its item 0.1 is not an audio bug. Section 1.
+  - Its item 0.3 is the same bug as 0.1. Section 1.
+  - Its item 0.5 says to read "[METAL] depth test before the shader: N early,
+    M late" FIRST. THAT LINE HAS NEVER BEEN PRINTED BY ANY RUN IN THE CORPUS
+    -- the commit that added it (846217b, 09:41) landed nine minutes before
+    the handover was written. Worse, hw_early_z() returns 0 whenever the
+    switch is off (nv2a_metal.m:1594), so at the default the counter cannot
+    read anything but "0 early, N late". Its own comment says the split is
+    informative only with the switch ON. Item 0.5 starts with a RUN.
+  - Its section 3's open question "which real node handed the walk a
+    list-head array" is answered and then dissolved: under the stack-deficit
+    reading no real node ever had a bad child. Reviving that hypothesis needs
+    a crash with this walker signature and NO preceding unresolved indirect
+    branch. Zero of six so far.
+  - sub_00011C90 is ONE BYTE (0xc3), the empty default virtual method. It is
+    not a candidate for anything.
+
+=============================================================================
+7. STATE OF THE MACHINE
+=============================================================================
+
+MAIN IS UNCHANGED at f13622e, with three uncommitted files:
+  M  diagnostics/jsrf_first_fault/play_scripted.sh   <- a real fix, see below
+  ?? docs/jsrf/goals/JSRF_GOALS_2026-09-19_ONE_ROOT_CAUSE_UNDER_TWO_ITEMS.md
+  ?? docs/jsrf/progress/PROGRESS_2026-09-19_THE_FREEZE_AND_THE_CRASH_ARE_ONE_SWITCH_ARM.md
+
+THE HARNESS FIX, and it matters: play_scripted.sh never sourced
+run_common.sh. 8986daf added a call to jsrf_yield_to_player (line 255 now
+that the fix has shifted it down) without the source, so the function has been UNDEFINED on every run of that
+script since -- the shell printed "command not found" into the middle of the
+output and carried on. The yield guard, which exists so an unattended run
+stands down when the player launches the game, HAS NEVER FIRED from the one
+script that takes the long unattended runs and the one the collisions in the
+previous handover's section 9 were reported against. One line added.
+
+Bundles (~/jsrf-build/):
+  JSRF.app            78fab24, this morning's build, no fixes.
+  JSRF-crashfix.app   wt-walker's binary -- the 0x000A5B8C fix ALONE. This is
+                      what the player played at 12:23. Discriminator: it does
+                      NOT contain _sub_000A5BE9 (the alias the fix absorbs);
+                      the old bundle does. Checking for _sub_000A5B60 does NOT
+                      work -- both contain it, the old one as the 44-byte stub.
+  JSRF-irqthread.app  kept for the RECOMP_IRQ_THREAD_GPU experiment.
+
+~/jsrf-build was cleaned 21G -> 16G at the player's request: nine superseded
+JSRF.app.* backups and play-hdd-prev. Kept deliberately: the 805-run
+render-investigation corpus (it is evidence and today's conclusions rest on
+it), the shared gen, build-feav, play-hdd, all three live bundles.
+
+Private build roots, NOT under ~/jsrf-build:
+  ~/jsrf-build-walker   wt-walker's gen and binary (has the crash fix)
+  ~/jsrf-build-icall    wt-icall's gen and binary (has the hardening)
+
+A scratch merge worktree exists at the session scratchpad path and is
+disposable; `git worktree prune` after deleting it.
+
+=============================================================================
+8. THE 76 REMAINING TABLES, AND BOTH ROUTES ARE MEASURED DEAD
+=============================================================================
+
+switch_arm_audit.py: 196 RECOMP_ITAIL dispatches through 84 tables, 607 of
+711 arms with no translated body, 76 of 84 tables affected. 484 switches do
+lift correctly. switch_arm_causes.py classifies them:
+
+    walk-stopped-in-open-space  71      not-a-table  7
+    short-table                  2      clamped-by-neighbour  2
+    no-owner-in-database         1      arm-is-a-start  1
+
+ROUTE (b), REWRITING _analyze_switch_table: UNNECESSARY. Given the round-1
+oracle's extents, the EXISTING >=2-arms rule resolves 76 of 84. The rule is
+not too strict; it is handed extents carved out from under it. Nobody needs
+to risk the 484.
+
+THE PASS-ORDERING FIXPOINT: CONVERGES AND BUYS NOTHING. Measured on the probe
+branch -- converges in 4 rounds, adds 38 starts, removes none, coverage +274
+bytes, and resolves the SAME 4 tables the detector fix already resolves.
+
+WHY ITERATION CANNOT WORK, which is what makes this final: the derive passes
+are MONOTONE. _pass_tail_jump_targets skips any target already in
+_candidates; _pass_demote_interior_seeds deletes only candidates whose method
+is seed_vtable_thunk (functions.py:513). A start minted from carved geometry
+is never retracted, so no number of rounds retracts it. Reaching the 76 needs
+RETRACTION, not iteration. The one retraction tried removed 3 starts, missed
+the target and cost 32 bytes; reverted.
+
+THE ORACLE, AND ITS CAVEAT. "Round 1 of the discovery loop with an empty
+vtable_seeds_accum.json" carves both problem functions correctly, so it is a
+free regression oracle. It is an oracle for THE EXTENTS OF THE BODIES IT HAS
+and NOT a replacement function set: it holds 8,448 functions against 8,866
+and covers 34,420 FEWER bytes. Do not read "round 1 is correct" as "drop the
+accumulator". The accumulator is right to add starts and wrong only in
+letting arm-shaped ones truncate.
+
+A GATE THAT WAS RETRACTED: "no function smaller than the oracle's" is
+worthless -- it reads 1,433 on the shipping tree, 1,433 on the fixed tree and
+1,433 on the fixpoint tree. That is the accumulator legitimately splitting
+bodies the oracle sees as one. A gate that fires on a known-good tree would
+wave a real regression through. The gates that work are coverage
+(>= 1,614,033) and the 84-table count.
+
+NEXT THREAD IF ANYONE PULLS ONE: 74 of the 84 tables ARE resynced, so
+_alias_end's re-measure should have fired for them and did not. The stall is
+inside _find_function_end's stopping rule on alias bodies.
+
+=============================================================================
+9. THINGS I SAID TODAY THAT WERE WRONG
+=============================================================================
+
+  "The freeze is caused by pressing START"      -> START is how the pad
+                                                   schedule reaches it; two
+                                                   storms have no pad input
+  "It never happens in gameplay, so it is
+   lower priority"                              -> in gameplay the same defect
+                                                   CRASHES instead. Zero
+                                                   gameplay freezes is not
+                                                   immunity
+  "sub_00011C90 is a named candidate for the
+   node that handed over the array"             -> it is one byte, 0xc3
+  "Fix it with function_bounds.json"            -> bounds only CLAMP; they
+                                                   cannot extend a function or
+                                                   create a start. I sent an
+                                                   agent down this route
+  "A declared bound can only clamp"             -> also incomplete: it can
+                                                   widen indirectly by
+                                                   demoting a seed inside the
+                                                   declared extent, for the
+                                                   seed_vtable_thunk class
+                                                   only (3 of 76)
+  "last count 100,000 vs base1's 10.8 billion"  -> per-slot figures from the
+                                                   duplicated-banner bug, NOT
+                                                   like-for-like. The LINE
+                                                   counts are
+  "0x000A5B8C is absent from the shared gen"    -> present as a 44-byte stub;
+                                                   my first grep used the
+                                                   wrong label width and said
+                                                   all nine VAs were
+                                                   unresolved
+
+Two of those were caught by an agent's measurement and three by my own
+re-check. The pattern worth keeping: every one was a plausible mechanism
+asserted without reading the thing it rested on, and every one was a single
+grep from refutation.
+
+=============================================================================
+10. FOR THE NEXT PERSON WHO RUNS THE HARNESS
+=============================================================================
+
+  - play_scripted.sh takes a SCHEDULE, and a bare name is parsed as an inline
+    schedule, not a file. "gameplay_nobarrage" silently yields
+    "pad events fired: 0". Use @<absolute path to the .pad>.
+  - Gate every trial on ALL of: [JSRF-SEQ] now=30, [APU-VOICE] on= in the
+    148-453 band, ADPCM ok>0. A run reading on=4-12 is the attract loop.
+  - The .app bundle is what the player runs. Rebuild it or they test stale
+    code, and verify WHICH build with a discriminator symbol -- section 7.
+  - Preserve a player log BEFORE doing anything else, and re-copy it after the
+    process exits: I copied one mid-write and got a truncated 3.76 MB against
+    the final 3.91 MB.
+  - A macOS crash report is not guaranteed. The 12:28 session produced NO .ips
+    at all, because it did not segfault.
