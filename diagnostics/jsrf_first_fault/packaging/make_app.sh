@@ -210,6 +210,26 @@ JSRF_HDD_ROOT="$HOME/Library/Application Support/JSRF/hdd"
 #                                    # the crash worse, so this one waits for
 #                                    # a run count rather than an argument.
 #   export RECOMP_REPORT_MS=5000     # counter reports twice as often
+#
+# RECORDING WHAT YOU PLAYED, so a crash can be reproduced without you:
+#
+#   export RECOMP_PAD_RECORD=1
+#
+# Every session then writes one file to
+#   ~/Library/Application Support/JSRF/padrec/jsrf-<date>_<time>-<pid>.padrec
+# holding your controller input keyed to the game's own frame count. It costs
+# well under a microsecond per pad poll and writes nothing while you are not
+# touching the pad. Look for "[PAD-RECORD] recording to ..." near the top of
+# last-run.log; if it says CANNOT WRITE instead, nothing was recorded and the
+# line says why.
+#
+# PLAYING ONE BACK, hands off:
+#
+#   export RECOMP_PAD_SCRIPT="@$HOME/Library/Application Support/JSRF/padrec/<the file>"
+#
+# The replay refuses to run against a binary that is not the one the
+# recording was made with, and says so rather than producing a run that
+# looks like a reproduction and is not one.
 EX
     die "No game files configured.\n\nEdit:\n$CONF\n\nAn example has been written to:\n$CONF.example\n\nJSRF_GAME_DIR must be a folder containing default.xbe."
 fi

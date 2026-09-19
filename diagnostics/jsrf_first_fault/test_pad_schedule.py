@@ -26,6 +26,13 @@ rather than described:
     get through logos of unpredictable length -- say so with the waiver
     comment, so that the exception is a decision and not an oversight.
 
+  * A SCHEDULE WRITTEN IN SECONDS AT ALL. Kept for the boot prefixes, which
+    have to cope with logos of unpredictable length, but a timestamp of the
+    form f<N> keys the event to the guest's own frame count instead, and that
+    is the form a recording uses. Frame-keyed events are parsed here and
+    skipped by the wall-clock rules below, which cannot say anything about
+    them.
+
 The grammar below mirrors pad_script_parse()/pad_script_buttons(). If the C
 changes, this must change with it: the point is to be the same parser, not a
 reasonable approximation of one.
@@ -36,7 +43,10 @@ import unittest
 
 PAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pad")
 
-PAD_SCRIPT_MAX = 256        # PAD_SCRIPT_MAX
+PAD_SCRIPT_MAX = 256        # PAD_SCRIPT_MAX -- still a hard cap for a
+                            # hand-written schedule. A recording declares
+                            # itself with "#!padrec" and grows without limit;
+                            # nothing in pad/ is a recording.
 PAD_SCRIPT_HOLD = 0.20      # PAD_SCRIPT_HOLD
 GAMEPLAY_T = 48.0           # every boot prefix here has finished by t=47.2
 WAIVER = "PAD-LINT: allow-late-start"
@@ -45,11 +55,14 @@ DIGITAL = ("START", "BACK", "LTHUMB", "RTHUMB", "UP", "DOWN", "LEFT", "RIGHT")
 ANALOG = ("A", "B", "X", "Y", "WHITE", "BLACK", "LT", "RT")
 STICK = {"LLEFT": "lx", "LRIGHT": "lx", "LDOWN": "ly", "LUP": "ly",
          "RLEFT": "rx", "RRIGHT": "rx", "RDOWN": "ry", "RUP": "ry"}
-KNOWN = set(DIGITAL) | set(ANALOG) | set(STICK)
+# The raw axes and the raw button word, which a recording uses because no
+# name can say -12000. They take a value; the named deflections do not.
+AXIS = ("LX", "LY", "RX", "RY")
+KNOWN = set(DIGITAL) | set(ANALOG) | set(STICK) | set(AXIS) | {"BTN"}
 
 
 def parse(text):
-    """(events, errors); an event is (t0, t1, names)."""
+    """(events, errors); an event is (t0, t1, names), t0 None when frame-keyed."""
     events, errors = [], []
     for raw in text.splitlines():
         line = raw.split("#", 1)[0]
@@ -59,8 +72,11 @@ def parse(text):
                 errors.append("%r: expected <t>:<BUTTONS>" % token)
                 continue
             buttons, _, hold = rest.partition(":")
+            frame_keyed = head[:1] in ("f", "F")
             try:
-                t0 = float(head)
+                t0 = None if frame_keyed else float(head)
+                if frame_keyed:
+                    int(head[1:])
             except ValueError:
                 errors.append("%r: bad timestamp" % token)
                 continue
@@ -71,12 +87,13 @@ def parse(text):
                 continue
             if h <= 0.0:
                 h = PAD_SCRIPT_HOLD          # matches the C
-            names = [n.upper() for n in buttons.split("+") if n]
+            # A token may carry "=<value>"; the name is what is checked.
+            names = [n.split("=", 1)[0].upper() for n in buttons.split("+") if n]
             unknown = [n for n in names if n not in KNOWN]
             if unknown or not names:
                 errors.append("%r: unknown button(s) %s" % (token, unknown))
                 continue
-            events.append((t0, t0 + h, names))
+            events.append((t0, None if t0 is None else t0 + h, names))
     return events, errors
 
 
@@ -111,6 +128,8 @@ class PadScheduleTest(unittest.TestCase):
                 events, _ = parse(f.read())
             held = []           # (axis, t0, t1, names)
             for t0, t1, names in events:
+                if t0 is None:
+                    continue    # frame-keyed: not on the wall clock at all
                 for axis in {STICK[n] for n in names if n in STICK}:
                     for (a, p0, p1, pn) in held:
                         if a == axis and t0 < p1 and p0 < t1:
@@ -130,7 +149,7 @@ class PadScheduleTest(unittest.TestCase):
                 continue
             events, _ = parse(text)
             late = [t0 for t0, _, names in events
-                    if "START" in names and t0 >= GAMEPLAY_T]
+                    if "START" in names and t0 is not None and t0 >= GAMEPLAY_T]
             self.assertEqual(
                 late, [],
                 "%s fires START at %s, past gameplay (t=%.0f), where START is "

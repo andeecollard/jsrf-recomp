@@ -752,6 +752,15 @@ static int jsrf_pb_poll(void)
      * pgraph deliberately does not do it itself. */
     if (pgraph_d3d11_take_frame()) {
         static unsigned long presented;
+        /* THE GUEST'S FRAME, counted where the guest defines it.
+         *
+         * FLIP_STALL is the only thing in the ring that means "the frame is
+         * complete", and the title writes it, so this is the one counter in
+         * the process that advances with the game rather than with the host.
+         * RECOMP_PAD_RECORD and a frame-keyed RECOMP_PAD_SCRIPT are both
+         * keyed to it; nothing else advances it, so a run with the push-buffer
+         * executor off records every sample onto frame 0 and says so. */
+        xbox_InputFrameAdvance();
         pgraph_d3d11_flush();
         d3d8_PresentFrame();
         /* RECOMP_FB_DUMP_FLIP=<stride>[:<after-seconds>]: capture finished
@@ -1995,6 +2004,41 @@ static void pad_inject_start(void)
 #define JSRF_SD_CHAPTER_FLAGS   0x018u
 #define JSRF_SD_GLOBAL_FLAGS    0x058u
 #define JSRF_SD_SPECIAL_FLAGS   0x098u
+
+#if !defined(_WIN32)
+/* THE MARKER A FRAME COUNT CANNOT SUPPLY.
+ *
+ * A frame-keyed replay guarantees that frame N gets the input frame N got.
+ * It does not guarantee that frame N is the same MOMENT: the boot path is
+ * not frame-locked, so a slower texture load spends more frames on the logos
+ * and everything after it slides. The pad recorder writes this word beside
+ * each of its checkpoints and the replay compares it, so a slide is reported
+ * rather than silently producing a run that looks like a reproduction.
+ *
+ * Chapter and mission are the title's own idea of where it is; playtime in
+ * SECONDS is the low field, compared with a small tolerance by the input
+ * layer, and it is also the one number that separates a run parked in the
+ * attract loop -- where it does not move -- from one that reached gameplay.
+ * All three come from the CSaveData singleton jsrf_save_dump reads below;
+ * see its comment for the offsets and where they came from.
+ *
+ * Read-only, 12 bytes, and it runs at checkpoint cadence rather than per
+ * poll. It may read zeroes before the title has filled the structure in,
+ * which is fine: it is compared against what the recording saw at the same
+ * frame, and at that frame the recording saw zeroes too. */
+static unsigned long jsrf_pad_anchor(void)
+{
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t ch = 0, mi = 0, pt = 0;
+    if (!base) return 0;
+    memcpy(&ch, base + JSRF_SAVEDATA_VA + JSRF_SD_RETURN_CHAPTER, 4);
+    memcpy(&mi, base + JSRF_SAVEDATA_VA + JSRF_SD_RETURN_MISSION, 4);
+    memcpy(&pt, base + JSRF_SAVEDATA_VA + JSRF_SD_PLAYTIME, 4);
+    return ((unsigned long)(ch & 0xFFu) << 24)
+         | ((unsigned long)(mi & 0xFFu) << 16)
+         | (unsigned long)((pt / 60u) & 0xFFFFu);
+}
+#endif /* !_WIN32 */
 
 static void jsrf_save_dump(void)
 {
@@ -4052,6 +4096,10 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
     char pc_name[256], lr_name[256];
 
     fprintf(stderr, "\n========== FIRST GUEST FAULT ==========\n");
+    /* FIRST, before any of the reporting below, because the recording is the
+     * thing that makes this crash reproducible tomorrow. It will not block:
+     * the record lock may be held by the very thread this signal landed on. */
+    xbox_PadRecordFlush();
     fprintf(stderr, "SIGNAL: %s (%d)\n", sig == SIGBUS ? "SIGBUS" : "SIGSEGV", sig);
     fprintf(stderr, "HOST FAULT ADDRESS: 0x%016llX\n", (unsigned long long)fault);
     fprintf(stderr, "HOST PC: 0x%016llX%s\n", (unsigned long long)host_pc,
@@ -4357,6 +4405,26 @@ int main(int argc, char **argv)
 #else
     fprintf(stderr, "  [BUILD] title optimisation UNKNOWN (no JSRF_BUILD_OPT)"
                     ", binary %s\n", argv[0]);
+#endif
+#if !defined(_WIN32)
+    /* The same two identities the banner above prints, handed to the pad
+     * recorder so that a recording carries them and a replay can refuse a
+     * binary they do not match. "It replayed and the crash did not
+     * reproduce" is a conclusion somebody will draw, and it is worthless if
+     * the code underneath changed. */
+    xbox_PadRecordSetIdentity(
+#ifdef JSRF_BUILD_OPT
+        JSRF_BUILD_OPT,
+#else
+        "unstamped",
+#endif
+#ifdef JSRF_GEN_TRANSLATOR
+        JSRF_GEN_TRANSLATOR
+#else
+        "unstamped"
+#endif
+        );
+    xbox_PadRecordSetAnchorFn(jsrf_pad_anchor);
 #endif
     fflush(stderr);
     printf("XBE: %s\nGame dir: %s\n", xbe_path, game_dir);

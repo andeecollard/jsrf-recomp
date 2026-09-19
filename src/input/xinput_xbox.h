@@ -86,6 +86,64 @@ typedef struct XBOX_INPUT_CAPABILITIES {
  * xbox_InputInit. */
 double xbox_InputSeconds(void);
 
+/* ── THE GUEST'S FRAME, AND THE RECORD/REPLAY BUILT ON IT ────────────────
+ *
+ * The wall clock above is the wrong key for input. A schedule written in
+ * seconds is a different schedule on every run, because the title's boot
+ * time is not constant -- 19 Sep 2026 measured the same .pad file reaching
+ * gameplay at 64-86 fps and never leaving the title screen above ~117 fps.
+ * The title is frame-locked, so the frame is the key that holds still.
+ *
+ * xbox_InputFrameAdvance() is called by whoever consumes the guest's own
+ * end-of-frame signal (FLIP_STALL in its push buffer), once per guest frame,
+ * and by nothing else. Everything below counts in those frames.
+ */
+void          xbox_InputFrameAdvance(void);
+unsigned long xbox_InputFrame(void);
+
+#if !defined(_WIN32)
+/* Stamp the binary's identity into a recording's header, so a replay can
+ * refuse a recording taken against other code. Both strings are copied. */
+void xbox_PadRecordSetIdentity(const char *build, const char *gen);
+
+/* Finish the open run and push stdio's buffer out. Safe from a crash handler
+ * or a signal handler: it will not block on the record lock. */
+void xbox_PadRecordFlush(void);
+
+/* Counters for the periodic report; prints nothing when neither recording
+ * nor replaying. */
+void xbox_PadRecordReport(void);
+
+/* ── the format, exposed so a test can drive it without a game ───────────
+ *
+ * These are the same parser, the same applier and the same writer the
+ * runtime uses; there is no second implementation for tests to agree with.
+ * The *AtFrame forms take the frame explicitly, which is what makes a
+ * record -> replay round trip a pure function of (frame, state) pairs.
+ */
+int  xbox_PadScriptLoad(const char *spec);      /* "@path" or inline text.
+                                                 * Events loaded, or -1 if a
+                                                 * recording was refused. */
+void xbox_PadScriptApplyAtFrame(XBOX_INPUT_STATE *st, unsigned long frame);
+void xbox_PadScriptReset(void);
+int  xbox_PadReplayStatus(int *ck_ok, int *ck_bad, unsigned long *frame,
+                          int *state_bad);
+
+/* One word of guest-visible state, sampled at each checkpoint and compared
+ * on replay. A frame key cannot guarantee that frame N is the same MOMENT --
+ * the boot path is not frame-locked, so a slower disc read spends more
+ * frames on the logos -- and this is what makes that visible instead of
+ * silent. Low 16 bits: a slow counter, compared with a small tolerance.
+ * Above them: identity, compared exactly. NULL or unset means no check. */
+void xbox_PadRecordSetAnchorFn(unsigned long (*fn)(void));
+unsigned long long xbox_PadReplayHash(void);
+
+int  xbox_PadRecordOpen(const char *path);
+void xbox_PadRecordSampleAtFrame(const XBOX_INPUT_STATE *st, unsigned long frame);
+void xbox_PadRecordClose(void);
+unsigned long long xbox_PadRecordHash(void);
+#endif /* !_WIN32 */
+
 /* ================================================================
  * Public API
  * ================================================================ */
