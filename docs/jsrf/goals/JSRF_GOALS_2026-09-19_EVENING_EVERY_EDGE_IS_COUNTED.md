@@ -647,6 +647,80 @@ capture window. The finding above rests on the decoded asset and the
 player's photographs, not on a captured corrupt draw. Capturing one is
 step 2 above.
 
+## G2 — THE `$` PROVES IT, 21:07
+
+The glyph path is now read end to end in the guest image, and one
+prediction closes the case.
+
+**The routines** (all verified against capstone; **our translation of every
+one of them is faithful** — no mistranslation found):
+
+| VA | role |
+|---|---|
+| `sub_0003CF20` | string walker; Shift-JIS lead bytes 0x80-0x9F take the two-byte path |
+| `sub_0003CBC0` | Latin lookup + quad emitter |
+| `sub_0003C860` | char code -> table index, outward scan from a hint |
+| `sub_0003C150` | font init: creates page textures from resource id `desc[+4] + page` |
+| `sub_0003C310` | flush: binds `tex[type][layer][page]` and draws that page's sprites |
+
+**The data.** Glyph table at `0x001F8640`, 156 entries of 8 bytes
+`{u16 code; u16 cell; s16 x_texel; s16 y_width}`. Latin descriptor at
+`0x1F8B48`: **2 pages**, base texture id **4**, 256-pixel pages, **84 cells
+per page**, 12 columns x 7 rows, cell 21x34.
+
+**The split is not a bound on the character code.** It is the `idiv` by 84 at
+`0x0003CC15` that turns a cell number into page and cell-within-page:
+
+```
+u 0x75 -> cell 84 -> page 0, row 6, col 11   <- last cell of page 0
+v 0x76 -> cell 85 -> page 1, row 0, col 0    <- first cell of page 1
+w 0x77 -> page 1 row 0 col 1
+x 0x78 -> page 1 row 0 col 2
+y 0x79 -> page 1 row 0 col 3
+z 0x7A -> page 1 row 0 col 4
+```
+
+So "the corruption is exactly 0x76-0x79" means **"everything on Latin font
+page 1 is wrong"**. `z` is the only other page-1 glyph English reaches, and
+it is rare.
+
+**THE PREDICTION THAT PROVES IT.** If page 1's texture is not bound, a
+page-1 glyph samples its cell rectangle out of whatever IS bound. `y` is
+page 1 row 0 col 3. **Page 0 row 0 col 3 is `$`.** The player's own
+screenshot of Gum's speech box reads **`$ou`** for "you", and a capture from
+the morning records **`Spra$ Cans`**. That substitution was photographed
+days before anyone knew the font had two pages, and it is exactly what this
+mechanism predicts. Sampling the same rectangle against a 512x512 **kanji**
+page instead accounts for the other observed form: taller, Japanese-looking
+replacements on the same baseline.
+
+**Where it goes wrong is a binding, not a lookup.** `sub_0003C310` at
+`0x0003C3CD` reads the page's texture and **skips the SetTexture call when it
+equals the cached last-texture global `0x00251D54`**:
+
+```
+mov eax,[esi+eax*4+0x5c]      ; this page's texture
+cmp dword ptr [0x251d54],eax  ; same as last time?
+je  0x3c404                   ; then don't set it
+```
+
+Our translation of that is faithful too — checked. So the guest's cache is
+correct on its own terms, and the defect is that **our renderer does not
+apply the texture change where the guest expects it relative to the draws
+around it**. Page 1 is bound for a handful of glyphs and page 0 for the rest,
+so any reordering between a texture change and its draws hits page 1 almost
+exclusively. That is also exactly what "the text flickers in layers" looks
+like: the pages are separate passes and only one of them is wrong.
+
+**In flight at 21:07:** `RECOMP_METAL_BATCH` on against off, 230 s each on
+the playing schedule with dense capture. Batching draws across a texture
+change is the most obvious way to reorder one, and it has a switch.
+
+**Two guest-side notes, neither ours.** `sub_0003C860`'s forward probe
+bounds `hint+k < 0x9C` with no lower bound, so a negative hint would read
+before the table — unreachable on the normal path. And no Shift-JIS
+lead-byte test for 0xE0-0xFC exists anywhere in the image; only 0x80-0x9F.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is
