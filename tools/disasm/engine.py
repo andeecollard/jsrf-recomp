@@ -94,6 +94,15 @@ class DisasmEngine:
         # Populated by resync_jump_tables() from the indexed indirect jumps
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
+        # Dispatch tables too short for resync_jump_tables to act on, recorded
+        # anyway: table VA -> end VA. Resyncing is destructive -- it DELETES
+        # the instructions the sweep decoded over the table -- so it holds out
+        # for enough entries to be sure the bytes are really data. Knowing
+        # WHICH ADDRESSES A SWITCH DISPATCHES TO costs nothing and deletes
+        # nothing, and the seed-interior pass needs exactly that to recognise
+        # an arm. Keeping the two in one dict made the cautious answer to the
+        # destructive question silently become the answer to the harmless one.
+        self.short_jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
         # Table VA -> the addresses of the `jmp [reg*4 + table]` instructions
         # that dispatch through it. A table entry is a switch arm of whatever
@@ -283,6 +292,19 @@ class DisasmEngine:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
+                #
+                # Record it as a short table all the same. The caution above is
+                # about deleting instructions, and that is not the only
+                # question asked of a table: a switch arm has to be told from a
+                # function start before a vtable-thunk seed carves it out, and
+                # the evidence for that is the dispatch alone. JSRF has 19
+                # two-entry tables with a real `jmp [reg*4 + T]` behind them,
+                # and one of them -- 0x00114FB0, arms 0x00114D34 and
+                # 0x00114D49 -- is why sub_00114A80 was cut at its own switch
+                # and why the first arm of its OTHER table, 0x00114B66, could
+                # never resolve.
+                if entries >= 2 and self._jt_sites.get(tbl):
+                    self.short_jump_tables[tbl] = tbl + entries * 4
                 continue
 
             end = tbl + entries * 4
@@ -303,8 +325,15 @@ class DisasmEngine:
         return sorted(self._jt_sites.get(tbl, ()))
 
     def jump_table_entries(self, tbl: int) -> List[int]:
-        """Code pointers held by a resynced jump table, or [] if unknown."""
+        """Code pointers held by a dispatch table, or [] if unknown.
+
+        Short tables answer this too. Reading the entries is not the
+        destructive half of resync, so withholding them bought no safety and
+        cost the seed-interior pass its evidence.
+        """
         end = self.jump_tables.get(tbl)
+        if end is None:
+            end = self.short_jump_tables.get(tbl)
         if end is None:
             return []
         return [self.image.read_u32_at_va(a) or 0

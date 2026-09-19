@@ -126,6 +126,42 @@ void recomp_icall_fail_log(uint32_t va)
     fflush(stderr);
 }
 
+/* An indirect TAIL JUMP whose target could not be resolved.
+ *
+ * Separate from the call case above because the consequence is different and
+ * worse. RECOMP_ITAIL's failure path does `esp += 4`, which is correct only if
+ * the jumping function has already run its epilogue -- true of a real tail
+ * call, false of the thing that actually produces most of these: an MSVC
+ * switch dispatch, `jmp [reg*4 + table]`, whose arms the function detector
+ * carved out of the enclosing body. Then esp is still deep inside a live
+ * frame, and popping four bytes off it returns the caller through a local.
+ *
+ * So the first thing to print is whether the epilogue ran, and the dword at
+ * esp answers that: if it is not a code address, it is not a return address,
+ * and the frame is still on the stack. See
+ * diagnostics/jsrf_first_fault/recomp_manual.c for a version that also sizes
+ * the stranded frame.
+ *
+ * The fix for one of these is almost never to seed the target as a function.
+ * An arm is interior to its dispatcher, and seeding an interior address
+ * truncates the container so that IT loses its epilogue too. Widen the
+ * container's extent instead.
+ */
+void recomp_itail_fail_log(uint32_t va)
+{
+    uint32_t sp = g_esp;
+    uint32_t at_sp = (sp && !(sp & 3u)) ? MEM32(sp) : 0u;
+    int epilogue_ran = (g_xbox_code_hi != 0u
+                        && at_sp >= g_xbox_code_lo && at_sp < g_xbox_code_hi);
+
+    fprintf(stderr,
+            "[ITAIL] Unresolved tail jump to 0x%08X; esp=0x%08X holds 0x%08X (%s)\n",
+            va, sp, at_sp,
+            epilogue_ran ? "a return address: genuine tail call, stack intact"
+                         : "NOT code: the epilogue never ran, the frame is stranded");
+    fflush(stderr);
+}
+
 /* An indirect call whose target is not code: a null or wild function pointer.
  *
  * Skipping these is right -- calling a data address is worse -- but skipping

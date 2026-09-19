@@ -476,6 +476,31 @@ void recomp_icall_fail_log(uint32_t va);
  * vtable call into an unexplained hang. */
 void recomp_icall_not_code_log(uint32_t va);
 
+/* Called when an indirect TAIL JUMP target cannot be resolved.
+ *
+ * Split from recomp_icall_fail_log because the two failures do not mean the
+ * same thing and cannot be answered the same way. A failed indirect CALL
+ * leaves the guest where it was, minus one call: bad, recoverable, usually a
+ * vtable slot the translator never saw.
+ *
+ * A failed indirect TAIL JUMP is a stack corruption of a size the runtime can
+ * work out. RECOMP_ITAIL's failure path does `g_esp += 4` because a genuine
+ * tail jump happens AFTER the jumping function's epilogue, with esp already
+ * resting on the return address. The tail jumps that fail are overwhelmingly
+ * not that: they are MSVC switch dispatches whose arm the function detector
+ * carved out of the enclosing body, so the epilogue has not run, esp is still
+ * pointing into the frame, and popping four bytes off it returns the caller to
+ * whatever local happened to sit there. Measured on JSRF 19 Sep 2026: 196 such
+ * dispatch sites through 84 tables, 607 of 711 arms with no translated body.
+ *
+ * The same event presents two ways, which is why it went unrecognised for so
+ * long. Land it in a polling loop and the guest spins on a null pointer until
+ * the run is killed -- 17 of 782 corpus runs, one of them 23.4 billion skipped
+ * calls. Land it in a tree walk and the guest faults on a wild pointer within
+ * a few hundred lines, which is what all four of the player's skating crashes
+ * look like. */
+void recomp_itail_fail_log(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen
@@ -1377,7 +1402,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL_K(_va, _fn, 'T'); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+           recomp_itail_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /* ================================================================

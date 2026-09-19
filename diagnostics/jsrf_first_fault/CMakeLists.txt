@@ -512,6 +512,66 @@ add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_te
 set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
     ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
 
+# A SKIPPED INDIRECT CALL THAT NEVER STOPS IS AN INFINITE LOOP, AND THE
+# RUNTIME NOW SAYS SO.
+#
+# Two of the 19 Sep corpus runs reached 10.9 and 23.4 BILLION skipped calls on
+# one target, which the old "every ten-thousandth" limit rendered as 1.09M and
+# 2.34M copies of a line that named the symptom and not the cause. The cause
+# is an earlier indirect call the dispatch table could not resolve at all;
+# recomp_manual.c now remembers that VA and prints it beside the spin.
+#
+# Registered four times because both accessors cache their getenv in a static,
+# so one process can observe one answer -- the same reason
+# jsrf_icall_feedback_path_test is registered three times. The default arm
+# matters most: the threshold defaulting to something other than 1e6, or the
+# abort defaulting to ON, are both changes a healthy run would feel.
+add_executable(jsrf_icall_runaway_test icall_runaway_test.c
+    "${CMAKE_CURRENT_LIST_DIR}/recomp_manual.c")
+target_link_libraries(jsrf_icall_runaway_test PRIVATE xbox_kernel)
+target_include_directories(jsrf_icall_runaway_test PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}"
+    "${XBOXRECOMP_DIR}/templates/runtime"
+    "${XBOXRECOMP_DIR}/include"
+)
+add_test(NAME jsrf_icall_runaway_default COMMAND jsrf_icall_runaway_test)
+add_test(NAME jsrf_icall_runaway_threshold COMMAND jsrf_icall_runaway_test)
+set_tests_properties(jsrf_icall_runaway_threshold PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_RUNAWAY=250000")
+add_test(NAME jsrf_icall_runaway_empty COMMAND jsrf_icall_runaway_test)
+set_tests_properties(jsrf_icall_runaway_empty PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_RUNAWAY=")
+add_test(NAME jsrf_icall_runaway_abort_armed COMMAND jsrf_icall_runaway_test)
+set_tests_properties(jsrf_icall_runaway_abort_armed PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_RUNAWAY_ABORT=1")
+
+# IS THE HEADER THE GENERATED CODE COMPILES AGAINST THE ONE IN THE REPO?
+#
+# The four tests above are green whether or not the hardening they describe is
+# reachable, and that is not a hypothetical: the RECOMP_ITAIL split shipped as
+# dead code in its first build. regenerate.sh copies recomp_types.h into the
+# gen tree, RECOMP_GEN_DIR precedes templates/runtime on the include path, and
+# so the generated C expands the macro as it was at the last regeneration.
+# recomp_manual.c is compiled from the repo and always current, so the new
+# function is defined and linked and every instrument short of `nm -u` on a
+# generated object reports success.
+#
+# There is already a configure-time WARNING for this, from the sha in
+# GENERATION_MANIFEST.txt. It fired, in my own log, and I read past it -- which
+# is what a warning in two hundred lines of configure output is for. Make it a
+# test so it stops the suite instead.
+#
+# It compares the two files rather than the manifest, because the manifest
+# records what the header WAS at generation time and the question is what it is
+# now. Copying the current header into a gen tree by hand -- to test a runtime
+# change without paying for a regeneration -- is legitimate, and the manifest
+# calls it stale when it is not.
+add_executable(jsrf_gen_header_current_test gen_header_current_test.c)
+target_compile_definitions(jsrf_gen_header_current_test PRIVATE
+    JSRF_REPO_RUNTIME_TYPES="${XBOXRECOMP_DIR}/templates/runtime/recomp_types.h"
+    JSRF_GEN_RUNTIME_TYPES="${RECOMP_GEN_DIR}/recomp_types.h")
+add_test(NAME jsrf_gen_header_current COMMAND jsrf_gen_header_current_test)
+
 # CAN THE FRAMEBUFFER WATCH SAY NO?
 #
 # RECOMP_FB_WATCH exists to catch G2 -- one glyph's quad drawn with another
