@@ -1706,6 +1706,19 @@ void mcpx_apu_voice_report(void)
      * control for fail: both zero means no ADPCM voice played in this run and
      * says nothing about the decoder. oversize is the stack-overrun clamp and
      * is the one thing here that is repaired unconditionally. */
+    {   /* G7, beside the failures it was raised to explain. calls= is the
+         * positive control: oob=0 with calls=0 means no voice used the
+         * scatter-gather path at all and says nothing about the table. */
+        extern unsigned long g_apu_sge_oob, g_apu_sge_calls;
+        fprintf(stderr, "  [APU-SGE] %lu translations, %lu with an implausible"
+                " page-table entry%s\n",
+                g_apu_sge_calls, g_apu_sge_oob,
+                g_apu_sge_calls == 0
+                    ? "   <- the SG path was never used this run"
+                    : (g_apu_sge_oob
+                        ? "   <- reading PAST the page table; see G7"
+                        : " (the table bound is holding)"));
+    }
     fprintf(stderr, "  [APU-ADPCM] ok=%lu fail=%lu short=%lu oversize=%lu"
             " silenced=%lu (adpcm_guard %s)\n",
             g_apu_adpcm_ok, g_apu_adpcm_fail, g_apu_adpcm_short,
@@ -2960,12 +2973,56 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
  * SGE data pointer resolution
  * ============================================================ */
 
+/* Scatter-gather translations whose page-table entry did not look like one.
+ *
+ * G7. `max_sge` is the bound, and EVERY call site passes 0xFFFFFFFF, so the
+ * assert below has never been able to fire. A read past the end of the voice
+ * processor's page table therefore returns a translation built from whatever
+ * dword happens to sit at that offset -- no error, no counter, and an address
+ * plausible enough to read from.
+ *
+ * The honest bound is the table's length, and nothing in the register file
+ * gives it to us: NV_PAPU_VPSGEADDR is a base with no companion limit. So
+ * this checks the ENTRY instead of the index. A real PRD entry is a 4 KB
+ * page address inside guest RAM; zero, unaligned, or out of range means we
+ * read past the table and are about to translate through rubbish.
+ *
+ * COUNTED, NOT REFUSED, by default. Substituting a different address is a
+ * behaviour change, and this tree ships those off -- see the adpcm_guard
+ * comment for the same argument. RECOMP_APU_SGE_GUARD=1 makes it return 0
+ * instead, which the caller will read as a zero page rather than as audio.
+ *
+ * WHAT THIS IS NOT EVIDENCE FOR, yet. The ADPCM over-read is the reason this
+ * exists, but the failure-ring note a few hundred lines down already states
+ * the discriminator, and the 19 Sep data leans the other way: the failing
+ * pages are many and various (54, 56, 61, 63, 66, 81, 90, 104) and their PRDs
+ * are plausible and page-aligned, which is that note's "the buffer is being
+ * reused underneath us" reading rather than its "the translation is wrong
+ * past that page" one. If sge_oob stays at 0 across a run that still refuses
+ * 4% of its ADPCM blocks, G7 is not the cause and should be written off. */
+unsigned long g_apu_sge_oob, g_apu_sge_calls;
+
+static int apu_sge_guard(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_SGE_GUARD");
+    return on;
+}
+
 static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
     assert(entry <= max_sge);
     uint32_t prd_address =
         ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
+    ++g_apu_sge_calls;
+    if (prd_address == 0
+            || (prd_address & (TARGET_PAGE_SIZE - 1)) != 0
+            || (prd_address & ~g_apu_ram_mask) != 0) {
+        ++g_apu_sge_oob;
+        if (apu_sge_guard())
+            return 0;
+    }
     return prd_address + addr % TARGET_PAGE_SIZE;
 }
 
