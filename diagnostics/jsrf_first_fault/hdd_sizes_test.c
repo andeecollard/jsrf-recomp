@@ -167,6 +167,31 @@ int main(void)
 
         if (!query("T:\\save.bin", &dtotal, &davail, &bps, &spc))
             return 1;
+        /* THE DEFECT THAT REACHED THE PLAYER, 19 Sep 19:42. The first version
+         * walked the WHOLE save root for the data partition's used bytes. A
+         * real emulated-HDD tree also holds Partition0-5.img -- 5,000 MB of
+         * them -- and Cache/, which is a different volume, so used came out
+         * above the partition size, available clamped to zero, and JSRF put
+         * up "Insufficient memory. To create a new save game, 5 more free
+         * blocks are required." before the title screen. This test makes that
+         * unrepeatable: a big file that is NOT on the data partition must not
+         * consume its free space. */
+        {
+            char blob[640];
+            unsigned long long t2 = 0, a2 = 0;
+            snprintf(blob, sizeof blob, "%s/Partition1.img", root);
+            write_bytes(blob, 8u * 1024u * 1024u);
+            if (!query("T:\\save.bin", &t2, &a2, &bps, &spc)) return 1;
+            CHECK(a2 == davail,
+                  "an 8 MB file in the save ROOT changed the data partition's"
+                  " free space (%llu MB -> %llu MB); only what lives ON the"
+                  " partition may count against it",
+                  davail / MB, a2 / MB);
+            CHECK(a2 > 4000 * MB,
+                  "the data partition reports %llu MB free; the player's save"
+                  " dialog is what zero here looks like", a2 / MB);
+            unlink(blob);
+        }
         CHECK(dtotal > 4000 * MB && dtotal < 5000 * MB,
               "data volume reports %llu MB total, expected the ~4.8 GB"
               " partition", dtotal / MB);

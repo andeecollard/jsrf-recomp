@@ -91,6 +91,11 @@
  * a long session caches differently once the disc cache is warm. RECOMP_HDD_SIZES=0
  * restores the host-volume answer and is the control for any of that.
  */
+#if defined(_WIN32)
+#define SEP '\\'
+#else
+#define SEP '/'
+#endif
 #define XBOX_CACHE_PARTITION_BYTES   (750ull * 1024ull * 1024ull)
 #define XBOX_DATA_PARTITION_BYTES   (4787ull * 1024ull * 1024ull)
 
@@ -167,13 +172,8 @@ static int xbox_volume_capacity(const char *host_path,
         *out_avail = 0;
         return 1;
     }
-    if (snprintf(cache_root, sizeof cache_root, "%s%cCache", save,
-#if defined(_WIN32)
-                 '\\'
-#else
-                 '/'
-#endif
-                 ) >= (int)sizeof cache_root)
+    if (snprintf(cache_root, sizeof cache_root, "%s%cCache", save, SEP)
+            >= (int)sizeof cache_root)
         return 0;
 
     if (!strncmp(host_path, cache_root, strlen(cache_root))) {
@@ -184,10 +184,34 @@ static int xbox_volume_capacity(const char *host_path,
         used = cached_used;
         *out_total = XBOX_CACHE_PARTITION_BYTES;
     } else {
+        /* THE DATA PARTITION IS NOT THE WHOLE SAVE ROOT, and walking the root
+         * was a defect that reached the player within the hour: the tree also
+         * holds Partition0-5.img (5,000 MB of them) and Cache/ (a DIFFERENT
+         * volume), so `used` came out at 5,120 MB against a 4,787 MB
+         * partition, available clamped to zero, and JSRF put up "Insufficient
+         * memory. To create a new save game, 5 more free blocks are required."
+         * before the title screen. The real content is ~1 MB.
+         *
+         * Only the directories that actually live on Partition1 are counted.
+         * Anything else in the tree belongs to another volume or is not a
+         * filesystem at all. */
+        static const char *const data_dirs[] = {
+            "TDATA", "UDATA", "TitleData", "UserData", "SystemData"
+        };
         static unsigned long long cached_used;
         static time_t cached_at;
         time_t now = time(NULL);
-        if (now != cached_at) { cached_used = dir_bytes_used(save); cached_at = now; }
+        if (now != cached_at) {
+            size_t i;
+            unsigned long long sum = 0;
+            for (i = 0; i < sizeof data_dirs / sizeof data_dirs[0]; i++) {
+                char sub[MAX_PATH];
+                if (snprintf(sub, sizeof sub, "%s%c%s", save, SEP, data_dirs[i])
+                        < (int)sizeof sub)
+                    sum += dir_bytes_used(sub);
+            }
+            cached_used = sum; cached_at = now;
+        }
         used = cached_used;
         *out_total = XBOX_DATA_PARTITION_BYTES;
     }
