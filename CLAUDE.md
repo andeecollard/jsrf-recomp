@@ -82,9 +82,11 @@ The generated C is **not** in git — it is hundreds of MB, rebuilt by
 ```sh
 cmake -S diagnostics/jsrf_first_fault -B <build> -DRECOMP_GEN_DIR=<gen dir>
 cmake --build <build> -j
-ctest --test-dir <build>            # 34/34. Those 34 are
-                                   # diagnostics/jsrf_first_fault's; tests/
-                                   # at the repo root is built by nothing
+ctest --test-dir <build>            # all green, 70 of them on 19 Sep 2026.
+                                   # They are diagnostics/jsrf_first_fault's;
+                                   # tests/ at the repo root is built by
+                                   # nothing. The count grows -- what matters
+                                   # is that none fails, not that it reads 70
 ```
 
 ```sh
