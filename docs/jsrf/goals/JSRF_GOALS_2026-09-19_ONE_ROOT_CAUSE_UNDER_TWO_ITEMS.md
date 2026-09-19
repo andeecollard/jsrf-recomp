@@ -1,5 +1,9 @@
 # JSRF goals — one root cause under two items, 19 September 2026
 
+> Superseded, 19 September 2026 (evening). The active list is
+> `JSRF_GOALS_2026-09-19_EVENING_EVERY_EDGE_IS_COUNTED.md`. G20's two fixes
+> are regenerated and built; the evidence for G20 and G21 stays here.
+
 Supersedes `JSRF_GOALS_2026-09-18_NIGHT5_THE_2D_BIN_STOPS_ALONE.md` and the
 "what to do next" list in
 `HANDOVER_2026-09-19_DAY_THE_STUTTER_IS_THE_FRAME_RATE_AND_THE_FREEZE_IS_THE_GATE.txt`.

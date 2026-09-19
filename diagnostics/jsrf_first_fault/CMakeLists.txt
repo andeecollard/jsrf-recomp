@@ -777,6 +777,29 @@ add_test(NAME jsrf_switch_audit
                  ${CMAKE_CURRENT_SOURCE_DIR}/switch_audit.py
                  ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
+# IS EVERY CONTROL-FLOW EDGE ACCOUNTED FOR, AND CAN THE COUNT GO BACKWARDS?
+#
+# The freeze and the skating crash were one switch arm the lifter could not
+# place (G20). switch_arm_audit.py counted the damage and switch_arm_causes.py
+# named the cause, but neither was a test, and the goals file's two working
+# gates -- covered bytes and the unresolved-table count -- lived in prose. A
+# regeneration that stranded a hundred more arms would have built green.
+#
+# control_flow_gate.py classifies every transfer the gen tree emits -- direct,
+# indirect, switch, stub, ignored, untranslated -- and holds each unresolved or
+# silent count at or below the checked-in baseline, coverage at or above it. A
+# shape it does not know fails the run: new lifter output is classified on
+# purpose or not at all. The switch-arm walk needs the XBE and takes it from
+# JSRF_GAME_DIR; without it that part prints SKIPPED and the static counts
+# still gate. Accept a deliberate change with --write-baseline, in a commit
+# that says why.
+add_test(NAME jsrf_control_flow_gate
+         COMMAND ${CMAKE_COMMAND} -E env python3
+                 ${CMAKE_CURRENT_SOURCE_DIR}/control_flow_gate.py
+                 --gen "${RECOMP_GEN_DIR}"
+                 --functions "${RECOMP_GEN_DIR}/../disasm/functions.json"
+                 --baseline "${CMAKE_CURRENT_SOURCE_DIR}/control_flow_baseline.json")
+
 if(APPLE)
     # G3's precondition: a named range must write back the surface it names,
     # and must NOT write back one it does not. The second half is the one that

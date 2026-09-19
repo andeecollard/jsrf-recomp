@@ -1,0 +1,44 @@
+{
+ "gen": {
+  "generated_utc": "2026-09-19T11:45:46Z",
+  "git_head": "2bf7c1d",
+  "runtime_types_sha": "445170e778a1bf80",
+  "translator_sha": "c4400dbb0025f56d",
+  "xbe_sha": "bb2410618c35ccab"
+ },
+ "measures": {
+  "cond_indirect": 0,
+  "coverage_bytes": 1613483,
+  "direct_call": 43170,
+  "direct_tail": 3578,
+  "functions": 8846,
+  "goto": 65878,
+  "icall": 7418,
+  "icall_static": 5,
+  "icall_total": 7423,
+  "ignored_priv": 41,
+  "itail_abs": 13,
+  "itail_manual": 0,
+  "itail_reg": 13,
+  "itail_total": 956,
+  "itail_vtable": 291,
+  "jmp_no_target": 0,
+  "switch_arms_goto": 3757,
+  "switch_arms_no_body": 487,
+  "switch_arms_tight": 571,
+  "switch_default": 487,
+  "switch_resolved": 487,
+  "switch_tables_with_missing_arm": 55,
+  "switch_unresolved": 152,
+  "switch_unresolved_tables": 62,
+  "todo": 122,
+  "todo_silent": 122,
+  "unclassified_icall": 0,
+  "unclassified_itail": 0,
+  "unresolved_stubs": 168
+ },
+ "method": {
+  "coverage_bytes": "union of [start,end) over functions.json",
+  "switch_arms": "switch_arm_audit tight bound, window 0x2000"
+ }
+}
