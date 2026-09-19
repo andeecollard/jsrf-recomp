@@ -442,11 +442,51 @@ at `Y:\Xbox1\TDATA\%08x`, but nothing in the packages states persistence, and
 no partition-size or free-space constant appears anywhere. JSRF's official BC
 config (`5345000A`) carries no storage override at all.
 
-**Order:** (1) clamp free space per volume and measure; (2) warm HDD as the
-harness default; (3) HDD identity in the recording header, refused on mismatch
-like the gen id — it would have caught today's misaligned replay at once;
-(4) stub `IoDismountVolumeByName` (ordinal 91), JSRF's one unresolved import;
-(5) upstream's RootDirectory handling on the bridge side.
+### G25a — free space per volume — DONE, and the hypothesis is REFUTED
+
+`RECOMP_HDD_SIZES`, **default ON**. `NtQueryVolumeInformationFile` now answers
+from the emulated volume the handle sits on: 750 MB for the cache drives,
+~4.8 GB for the data partition, 6.8 GB read-only for the disc. Free space is
+**measured** — the bytes actually in the directory are walked and subtracted,
+cached for a second because ordinal 218 is called a few hundred times a run —
+so a title with a full cache is not told it may write 750 MB more.
+
+**The prediction was that this would change what JSRF caches. It does not.**
+Cold-boot pair from the stock tree, empty cache, switch off and on:
+
+| | opens at boot | cache built |
+|---|---:|---|
+| off (host disk: 1,858 GB / 693 GB free) | 1,410 | 258 files, 119 MB |
+| on (750 MB / 747 MB free) | 1,413 | 258 files, 119 MB |
+
+Byte-identical to the player's own cache **except** `JSRF_TEXS0/1.JTX`, the
+two graffiti sheets that differ between *any* two builds regardless of the
+switch (below). So default-on is not a risk taken on argument: the OFF value
+was a wrong answer no Xbox ever gave, and the one consequence anybody
+predicted for fixing it has been measured and is absent. Four ctest arms,
+including the default and the empty-value spelling. **Not covered by that
+pair:** save-game writes, and whether a long session caches differently once
+warm. `RECOMP_HDD_SIZES=0` is the control.
+
+### The graffiti sheets: two variants, not noise
+
+`Cache/Media/Mark/DEFAULT/JSRF_TEXS0.JTX` and `...S1.JTX`, 1 MiB each, are
+**built by transformation and not copied** — the disc holds individual tag
+files (`GRF_M_XL.1P` etc., 512 KB) and neither half of a sheet matches any of
+them. Across 16 surviving cache builds there are exactly **two** versions of
+each sheet, 12 runs sharing one and 4 the other. The player's own disk and the
+warm tree hold the majority version. **A run that booted from the player's
+already-complete cache overwrote them with the minority version**, so the
+title rewrites these during play, not only at first boot. What decides which
+version appears is **unknown** and is not guessed at here. It is a lead
+because the checkerboards where tags belong were in the player's 13:09
+session; it is not a finding.
+
+**Order for the rest:** (1) warm HDD as the harness default; (2) HDD identity
+in the recording header, refused on mismatch like the gen id — it would have
+caught today's misaligned replay at once; (3) stub `IoDismountVolumeByName`
+(ordinal 91), JSRF's one unresolved import; (4) upstream's RootDirectory
+handling on the bridge side.
 
 ## The order
 
