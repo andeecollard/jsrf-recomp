@@ -917,6 +917,146 @@ static int owner_guard_on(void)
 unsigned long g_idle_unowned_raises;   /* raises for a voice not owned NOW */
 unsigned long g_idle_owned_raises;     /* the positive control for that zero */
 
+/* THE CHECK AT THE HAND-OVER, WHICH IS WHERE THE RAISE-TIME ONE SHOULD HAVE
+ * BEEN ALL ALONG.
+ *
+ * The A/B above retired the raise-time owner guard and wrote down why: "either
+ * it does not come from our raise at all ... or owner[h] is still valid when
+ * we check it and becomes NULL before the ISR reads it. Both are
+ * time-of-check/time-of-use, and both mean a raise-time check is in the wrong
+ * place by construction." This is the other place.
+ *
+ * On hardware the two are the same instant. The APU asserts its PCI line and
+ * the guest takes the interrupt at the next instruction boundary, so there is
+ * no interval in which DirectSound can free the buffer between the hardware
+ * choosing a handle and the ISR reading it. In this runtime there is:
+ * pci_irq_assert is a no-op, the ISR runs only when a guest thread reaches
+ * bridge_KeWaitForSingleObject, and the device-IRQ pump is on an 8 ms period.
+ * The handle we chose can be up to 8 ms stale by the time it is collected.
+ *
+ * So the hand-over is not the raise. It is the guest's LOAD of FEDECMETH --
+ * 001A25AA's `ecx = MEM32(0xFE801300)`, which on this host faults into
+ * mcpx_apu_read. That load is the last instant at which the model still owns
+ * the decision, and it happens on the guest's own thread microseconds before
+ * 001A200D indexes owner[h]. Checking there closes the window that a
+ * raise-time check cannot.
+ *
+ * IT DEPENDS ON RECOMP_APU_FEDEC_HOLD, which is default ON. The handle this
+ * reads is FEDECPARAM, taken at the FEDECMETH load rather than at the guest's
+ * own second load, and the two are only guaranteed to be the same pair
+ * because a trapped front end holds the pair still. With FEDEC_HOLD=0 the
+ * pair can be overwritten between the guest's two loads -- which is the
+ * decode-pair race that switch exists for -- and this check would then be
+ * validating a handle the ISR is not about to use. Run them together or not
+ * at all; the report prints both states.
+ *
+ * WHAT IS WITHHELD. Not the interrupt, and not the handle: the METHOD. A
+ * method that is not 0x8000 makes 001A24BE return without calling 001A241F,
+ * which is the same nothing the ISR already does for h >= 0x100 and for a
+ * PERSIST voice. The rest of 001A25AA -- the two sub_001A5B27 calls on
+ * this+8 that resume the front end -- runs unchanged, so nothing is left
+ * latched.
+ *
+ * IS NULL REALLY THE ONLY INVALID STATE? Asked because this title writes
+ * sentinels into its own fields -- 0xFFEEFFEE and 0xFF555555 have both come
+ * back as wild pointers from the scene-graph walker, and 0xFFEEFFEE appears
+ * in the XBE itself -- so a slot holding a sentinel would sail through a test
+ * that only compares against zero. Checked against the disassembly rather
+ * than assumed, and for owner[] the answer is yes, NULL is the whole of it.
+ * There are exactly three writers of `this+0x2C4+h*4` in the image:
+ *
+ *   001A1D9D, 001A1DD6 (sub_001A1CED)  owner[h] = pBuf, a real object
+ *   001A1E37 (sub_001A1E01)            `and dword ptr [esi+ecx*4+0x2C4], 0`
+ *
+ * and the allocator in 001A1CED picks a slot by scanning for `owner[h] == edx`
+ * with edx set by `xor edx, edx` and never reassigned. The guest's own free
+ * marker is the literal zero, so testing for it is complete.
+ *
+ * WHY THE ISR IS ENTITLED TO SKIP THE CHECK, finally read off the guest's own
+ * code rather than argued. sub_001A1E01 is the teardown, and it does:
+ *
+ *     this->0x2C0 += 1                       <- an interlock
+ *     for each voice of the buffer:
+ *         pBuf->[0xC + i*2] |= 0xFFFF        <- handle retired
+ *         this->owner[h] = 0
+ *     this->0x2C0 -= 1
+ *
+ * and 001A241F -- one frame above the unguarded read -- begins
+ * `if (this->0x2C0 != 0) return`. So on hardware an idle-voice trap that
+ * overlaps the teardown is refused outright, and one that arrives afterwards
+ * names a handle the teardown has already struck out of the guest's own list.
+ * Neither can reach 001A200D with a NULL. Ours can, on both counts: the raise
+ * comes from OUR voice list, which the guest does not maintain, and it is
+ * delivered late enough that 0x2C0 is back to zero by the time it lands.
+ *
+ * COUNTERS FIRST, and they answer the question the raise-time guard could not.
+ * _reads is the positive control: it counts every IDLE_VOICE method the guest
+ * collected, so a NULL count of zero beside a _reads of zero means the read
+ * trap never fired and says nothing at all. _null_h0 is the whole hypothesis
+ * -- h==0 with owner[0] NULL is the only combination that reaches
+ * sub_001A2E2E, it is what all 26 crash dumps are, and the raise-time probe
+ * measured it as never happening. If it is non-zero HERE while the raise-time
+ * count is still zero, the TOCTOU mechanism is measured rather than argued.
+ *
+ * RECOMP_APU_IDLE_HANDOFF_GUARD, default OFF until a run says _null_h0 moves.
+ * Defaulting it on before that would be shipping the same argument that put
+ * the raise-time guard in and took it out again. */
+unsigned long g_idle_handoff_reads;     /* IDLE_VOICE methods collected */
+unsigned long g_idle_handoff_owned;     /* ...with a live owner[h] */
+unsigned long g_idle_handoff_null;      /* ...with owner[h] == NULL */
+unsigned long g_idle_handoff_null_h0;   /* ...and h == 0: the fatal one */
+unsigned long g_idle_handoff_withheld;  /* methods the guard actually blanked */
+unsigned long g_idle_handoff_nothis;    /* collected before `this` resolved */
+
+static int idle_handoff_guard_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_switch_on("RECOMP_APU_IDLE_HANDOFF_GUARD");
+    return on;
+}
+
+/* RESOLVE THE SWITCH BEFORE A FAULT CAN ARRIVE, because the place that asks
+ * is a signal handler.
+ *
+ * mcpx_apu_read runs inside the AArch64 MMIO trap, on the guest's own thread,
+ * and getenv is not async-signal-safe. xbox_memory_layout.c hit this first
+ * and wrote the rule down where it resolves the USB diagnostics: "first use
+ * is inside the write trap's signal handler, where getenv is not
+ * async-signal-safe". A lazy static here would do the first getenv in exactly
+ * that context. Called once from mcpx_apu_init_standalone, on the main
+ * thread, before the aperture is guarded. */
+void mcpx_apu_idle_handoff_init(void)
+{
+    (void)idle_handoff_guard_on();
+}
+
+/* Called from mcpx_apu_read on the guest thread, inside the read trap, for
+ * the FEDECMETH load only. Read-only with respect to the guest. */
+uint32_t mcpx_apu_idle_handoff_method(void *opaque, uint32_t method)
+{
+    MCPXAPUState *d = (MCPXAPUState *)opaque;
+    unsigned int self;
+    uint32_t h, owner;
+
+    if (method != SE2FE_IDLE_VOICE || !d) return method;
+    ++g_idle_handoff_reads;
+    self = jsrf_dsound_this();
+    if (!self) { ++g_idle_handoff_nothis; return method; }
+    h = qatomic_read(&d->regs[NV_PAPU_FEDECPARAM]);
+    /* 001A241F's own bound. Above it the ISR returns before touching
+     * owner[], so there is nothing here to withhold. */
+    if (h >= 0x100) return method;
+    owner = (uint32_t)ldl_le_phys(address_space_memory,
+                                  self + 0x2C4u + h * 4u);
+    if (owner) { ++g_idle_handoff_owned; return method; }
+    ++g_idle_handoff_null;
+    if (h == 0) ++g_idle_handoff_null_h0;
+    if (!idle_handoff_guard_on()) return method;
+    ++g_idle_handoff_withheld;
+    return 0;
+}
+
 /* THE WINDOW THIS SWITCH CLOSES, AND WHY IT IS A SWITCH.
  *
  * NV1BA0_PIO_VOICE_LOCK is the driver telling the hardware "do not look at
@@ -2153,7 +2293,27 @@ void mcpx_apu_idle_trap_report(int crash)
                 fprintf(stderr, "\n");
             }
         }
-    }    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
+    }
+    /* THE SAME TABLE, READ AT THE HAND-OVER INSTEAD OF AT THE RAISE.
+     *
+     * reads is the positive control and has to be read first: it counts every
+     * SE2FE_IDLE_VOICE method the guest actually collected through the read
+     * trap, so reads=0 means the trap never fired on FEDECMETH and the two
+     * numbers after it are silence, not zeros. null_h0 is the hypothesis --
+     * the only combination that reaches sub_001A2E2E. Non-zero here beside a
+     * zero on the raise-time line IS the time-of-check/time-of-use race,
+     * measured. */
+    fprintf(stderr, "  [APU-IDLE-OWNER]   at the HAND-OVER (the guest's"
+            " FEDECMETH load): reads=%lu owned=%lu NULL=%lu h0=%lu"
+            " withheld=%lu no-this=%lu (handoff_guard %s)%s\n",
+            g_idle_handoff_reads, g_idle_handoff_owned, g_idle_handoff_null,
+            g_idle_handoff_null_h0, g_idle_handoff_withheld,
+            g_idle_handoff_nothis,
+            idle_handoff_guard_on() ? "ON" : "OFF",
+            g_idle_handoff_reads ? ""
+              : "   <- reads=0: the FEDECMETH read trap never fired, so"
+                " NULL=0 measures NOTHING");
+    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",
             g_apu_method_while_trapped, g_apu_guest_method_count);
