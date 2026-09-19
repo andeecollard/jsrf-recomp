@@ -22,7 +22,62 @@
 #     jsrf_stage_hdd
 # Escape hatches are explicit: JSRF_ALLOW_STALE=1, JSRF_SKIP_HDD_MANIFEST=1.
 
-JSRF_HDD_SRC="${JSRF_HDD_SRC:-$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd}"
+# WHICH DISK DOES THE TITLE BOOT FROM, AND IS ITS CACHE WARM?
+#
+# A console keeps the Z: cache across launches of the same title and formats it
+# only when a DIFFERENT title launches, so the player's steady state is a WARM
+# cache. Every run in the 782-run corpus booted from the stock tree, whose
+# Cache/ is empty, and so replayed a FIRST launch the player never performs:
+# 1,410 file opens rebuilding 258 files and 119 MB of media cache, against 131
+# opens warm, and about 30 s of guest time. Measured 19 Sep 2026; it is why
+# replaying the player's own recording from the stock tree landed ~30 s behind
+# their session with the input stream identical.
+#
+# A WARM TREE IS THE DEFAULT, and the obvious objection was measured and is
+# wrong. Every schedule in pad/ is keyed to wall-clock seconds, so the fear was
+# that a boot 30 s shorter would land the presses in the wrong places. Two
+# 240 s runs of gameplay_nobarrage.pad, same binary, same schedule:
+#
+#     cold   1,413 opens   off=271 retired voices
+#     warm     131 opens   off=281
+#
+# No penalty; if anything the warm arm plays slightly more. The scare came
+# from a pair of 110 s runs that both read off=10 -- COLD as well as warm --
+# because this schedule's presses run to t=96 s and 110 s is simply too short
+# to accumulate voices. Run length, not disk. (For scale, today: 110 s -> 10,
+# 150 s -> ~90, 240 s -> ~270, 300 s -> 362.)
+#
+# JSRF_HDD_SRC set by the caller still wins, and pointing it at the cold tree
+# is how a first launch is measured deliberately.
+#
+# Neither tree is beside the repo on this machine -- the repo was moved out of
+# iCloud and the 4.9 GB trees were not -- so both known locations are tried
+# rather than one being assumed. Neither is vendored and neither can be.
+JSRF_HDD_WARM="${JSRF_HDD_WARM:-}"
+if [ -z "$JSRF_HDD_WARM" ]; then
+    for _c in "$HOME/jsrf-build/emulated-hdd-warm" \
+              "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/emulated-hdd-warm"; do
+        if [ -d "$_c" ]; then JSRF_HDD_WARM="$_c"; break; fi
+    done
+fi
+JSRF_HDD_COLD="${JSRF_HDD_COLD:-}"
+if [ -z "$JSRF_HDD_COLD" ]; then
+    for _c in "$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd" \
+              "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd"; do
+        if [ -d "$_c" ]; then JSRF_HDD_COLD="$_c"; break; fi
+    done
+fi
+JSRF_HDD_SRC="${JSRF_HDD_SRC:-${JSRF_HDD_WARM:-$JSRF_HDD_COLD}}"
+
+# Say which tree, and whether its cache is warm. A boot-time number read
+# without this line is not comparable with one read from a different tree.
+jsrf_say_hdd() {
+    if ls "$JSRF_HDD_SRC"/Cache/Media/Cache/*COMPLETE* >/dev/null 2>&1; then
+        echo "hdd:      $JSRF_HDD_SRC (cache WARM -- the title skips its cache build)"
+    else
+        echo "hdd:      $JSRF_HDD_SRC (cache COLD -- the title spends ~30 s rebuilding it)"
+    fi
+}
 
 # Where the title itself lives.  main.c falls back to a relative "game/", which
 # exists nowhere, so a script that forgets to pass this gets "failed to load

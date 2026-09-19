@@ -146,9 +146,12 @@ if pgrep -x jsrf_first_fault >/dev/null 2>&1; then
     exit 2
 fi
 
-STOCK="${JSRF_HDD_SRC:-$ROOT/../upstream_xboxrecomp_clean/build-windows-jsrf/emulated-hdd}"
+# Which tree, and whether it is warm, is decided and reported in run_common.sh
+# -- the one definition every harness script sources. See the note there.
+STOCK="$JSRF_HDD_SRC"
 [ -d "$STOCK" ] || {
     echo "no emulated-hdd at $STOCK -- set JSRF_HDD_SRC" >&2; exit 1; }
+jsrf_say_hdd
 GAME_DIR="${JSRF_GAME_DIR:-$ROOT/../Jet Set Radio Future (US)}"
 [ -f "$GAME_DIR/default.xbe" ] || {
     echo "no default.xbe under $GAME_DIR -- set JSRF_GAME_DIR" >&2; exit 1; }

@@ -106,6 +106,45 @@ static int hdd_sizes_on(void)
     return on;
 }
 
+/* RECOMP_HDD_DATA_FREE_MB=<n> -- force the DATA partition's reported free
+ * space, in megabytes. A diagnostic, and a deliberate one.
+ *
+ * On 19 Sep 2026 a defect in the walk below reported zero free bytes on that
+ * partition, and JSRF answered with its save-check dialog before the title
+ * screen ever appeared:
+ *
+ *   "Insufficient memory. To create a new save game, 5 more free blocks are
+ *    required. Press the A button to continue without saving, ..."
+ *
+ * That dialog turned out to be the cheapest reproduction of the glyph defect
+ * (G2) this project has had. It renders at BOOT, needs no player, no
+ * gameplay and no save, sits on a flat box over black with a handful of
+ * draws behind it, and it is text-heavy -- and it showed the corruption
+ * plainly: new->ne(wide), save->sate, try->tr(wide), continue->contInue,
+ * Insufficient->hsu..cIent. Characters substituted AND dropped, in a font and
+ * a code path completely separate from the tutorial speech bubbles that
+ * carried every previous sighting.
+ *
+ * Fixing the defect removed the repro, so the repro is now on purpose. Set
+ * this to 0 and the dialog appears at boot, every time.
+ *
+ * Unset means "measure it", which is the shipping behaviour. Any value,
+ * including 0, forces. It is read once.
+ */
+static long long hdd_data_free_forced(void)
+{
+    static long long mb = -2;   /* -2 = not looked yet, -1 = not set */
+    if (mb == -2) {
+        const char *e = getenv("RECOMP_HDD_DATA_FREE_MB");
+        mb = (e && *e) ? strtoll(e, NULL, 10) : -1;
+        if (mb >= 0)
+            fprintf(stderr, "  [HDD] data partition free space FORCED to"
+                    " %lld MB (RECOMP_HDD_DATA_FREE_MB). The title's save"
+                    " check will act on this.\n", mb);
+    }
+    return mb;
+}
+
 /* Bytes used below `root`, following directories, not following symlinks.
  * Best effort: an unreadable subtree contributes nothing rather than
  * aborting the answer. */
@@ -214,6 +253,13 @@ static int xbox_volume_capacity(const char *host_path,
         }
         used = cached_used;
         *out_total = XBOX_DATA_PARTITION_BYTES;
+        {
+            long long forced = hdd_data_free_forced();
+            if (forced >= 0) {
+                unsigned long long want = (unsigned long long)forced * 1024ull * 1024ull;
+                used = (want >= *out_total) ? 0 : (*out_total - want);
+            }
+        }
     }
     *out_avail = (used >= *out_total) ? 0 : (*out_total - used);
     return 1;

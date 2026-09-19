@@ -488,6 +488,54 @@ caught today's misaligned replay at once; (3) stub `IoDismountVolumeByName`
 (ordinal 91), JSRF's one unresolved import; (4) upstream's RootDirectory
 handling on the bridge side.
 
+## G2 BREAKTHROUGH, 19:57 — THE HARNESS REPRODUCES IT. NO PLAYER NEEDED.
+
+The player photographed the **harness's own window** (`jsrf_first_fault`,
+run `glyph-gum`) showing a corrupt **trick name**: `arside Mi*sou` — leading
+characters lost and one glyph replaced. Same defect family, in an unattended
+scripted run.
+
+**That retires the hardest constraint on G2.** Every previous sighting needed
+the player at the controller. It can now be chased with runs.
+
+**Three independent text systems are now confirmed affected**, which places
+the fault in the shared font/glyph renderer and not in any one of them:
+
+| system | seen in | sample |
+|---|---|---|
+| tutorial speech bubbles | player's bundle, 17:40 | `hoW much air $ou` |
+| system save dialog | player's bundle, 19:42 | `hsu..cIent`, `neW`, `sate`, `contInue` |
+| trick-name overlay | **harness**, 19:57 | `arside Mi*sou` |
+
+Each uses a different font and a different draw path. All three lose leading
+characters AND substitute glyphs.
+
+**Two causes are measured dead.** Same binary, same schedule, warm disk whose
+cache is byte-identical to the player's:
+- **not the disk** — 24 consecutive frames clean;
+- **not the instruments** — 24 more clean with the player's ENTIRE probe load
+  armed (`FB_WATCH`, `FF_BATCH_WATCH_TEX`, `FF_BATCH_DUMP`, `APU_WRITE_TRACE`,
+  `VOICE_*`, `THREAD_TRACE`, `WILD_PTR`).
+
+**Why the clean runs are not a contradiction.** All 48 clean frames are the
+Corn tutorial dialogue at t=35-70 s. The corruption the player photographed
+is a trick name during *gameplay*, later. The 19 Sep morning evidence already
+said corruption is intermittent *within* a run — report026 corrupt and
+report028 clean for the same word — so a clean sample proves nothing about a
+later frame. **`RECOMP_FB_DUMP_FLIP=40:35` sampled the wrong window.**
+
+**Next, and it needs no player:** capture during gameplay, not dialogue — a
+later `after-seconds` and a denser stride — and put the trick-name region
+under `RECOMP_FB_WATCH` so a still frame is dumped when it changes. Then the
+glyph indices and the atlas the quads sample can be read at a frame that is
+known corrupt.
+
+**One caveat carried from the same run:** the player reported the harness
+window *hanging* at 19:57, during a 200 s run with the full instrument load.
+`CLAUDE.md` warns that heavy probes destabilise this title. Whether the hang
+is the probes, the length, or unrelated is unmeasured; it is recorded here so
+the next run that hangs is not read as new.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is

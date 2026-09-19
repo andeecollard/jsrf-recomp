@@ -102,6 +102,13 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    # Megabytes of free space to claim on the emulated data partition, in
+    # place of measuring it. Forcing it low makes JSRF put up its save-check
+    # dialog at boot -- which is the cheapest reproduction of the glyph
+    # defect this project has: text-heavy, no player, no gameplay, a handful
+    # of draws behind it. 0 is a meaningful value, so presence is the test
+    # and recomp_switch_on() cannot express it.
+    "RECOMP_HDD_DATA_FREE_MB",
     # A dump path for the indirect-branch feedback database. Was a
     # compile-time constant relative to the working directory, which a
     # GUI-launched .app cannot write -- 91 silent fopen failures per session.
