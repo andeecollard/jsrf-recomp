@@ -111,5 +111,50 @@ class FlagClassificationTest(unittest.TestCase):
                                      f"{an} and {bn} both claim {overlap}")
 
 
+class MnemonicAmbiguityTest(unittest.TestCase):
+    """"movsd" is two instructions, and the dispatcher must tell them apart.
+
+    The string MOVSD copies a dword from [esi] to es:[edi]. The SSE2 MOVSD
+    moves a scalar double in or out of an xmm register. They share a mnemonic
+    and nothing else, and the string branch of lift_instruction sits ahead of
+    the SSE branch -- so before the operand test an SSE movsd was lifted as a
+    string copy, silently and with the wrong operands.
+
+    JSRF has none: all 143 of its movsd are the string form. That is why this
+    never bit, and why it needs a test rather than a run.
+    """
+
+    def test_string_movsd_still_lifts_as_a_string_copy(self):
+        from .lifter import Lifter
+        from .disasm import Instruction
+        insn = Instruction(0, 2, "movsd", "dword ptr es:[edi], dword ptr [esi]",
+                           "", operands=[])
+        out = " ".join(Lifter().lift_instruction(insn))
+        self.assertIn("edi", out)
+        self.assertIn("esi", out)
+        self.assertNotIn("xmm", out)
+
+    def test_sse_movsd_does_not_lift_as_a_string_copy(self):
+        from .lifter import Lifter
+        from .disasm import Instruction, Operand
+        ops = [Operand(type="reg", reg="xmm0"),
+               Operand(type="mem", mem_base="eax", mem_size=8)]
+        insn = Instruction(0, 5, "movsd", "xmm0, qword ptr [eax]", "",
+                           operands=ops)
+        out = " ".join(Lifter().lift_instruction(insn))
+        # The string lifter walks esi/edi and knows nothing about xmm; if this
+        # came out of it, the move went to the wrong place entirely.
+        self.assertNotIn("edi", out)
+        self.assertNotIn("esi", out)
+
+    def test_the_operand_test_is_what_decides(self):
+        from .lifter import _has_xmm_operand
+        from .disasm import Operand
+        self.assertFalse(_has_xmm_operand([]))
+        self.assertFalse(_has_xmm_operand(None))
+        self.assertFalse(_has_xmm_operand([Operand(type="reg", reg="eax")]))
+        self.assertTrue(_has_xmm_operand([Operand(type="reg", reg="xmm7")]))
+
+
 if __name__ == "__main__":
     unittest.main()
