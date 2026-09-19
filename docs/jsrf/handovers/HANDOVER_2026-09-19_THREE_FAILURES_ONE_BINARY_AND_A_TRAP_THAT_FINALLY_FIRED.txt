@@ -1,0 +1,178 @@
+HANDOVER 2026-09-19 -- THREE DISTINCT FAILURES ON ONE BINARY, THE GLYPH TRAP
+FIRED FOR THE FIRST TIME, AND THE PARKED-THREAD STORY IS DEAD
+
+Read CLAUDE.md, then the newest file by date in docs/jsrf/goals/ -- do not
+trust a pointer, including this one. Supersedes
+HANDOVER_2026-09-18_NIGHT5_THE_MUSIC_IS_FOUR_VOICES_AND_NOTHING_NEEDS_BUILDING.txt.
+Its section 4 (the self-suspend hang) is REFUTED -- see section 3 below.
+
+Tree: 70/70 ctest, switch audit 0 problems, HEAD 6bb92ef.
+Player bundle: UNCHANGED since 18 Sep 19:58. Do not rebuild it without
+deciding to -- three captured failures are all on that one binary and that is
+what makes them comparable.
+
+=============================================================================
+0. WHAT IS CAPTURED. THIS IS THE ASSET.
+=============================================================================
+
+Three distinct failures, one binary, in ~/Library/Application Support/JSRF/ :
+
+  last-run-2026-09-18_2225-player-FIVE-INSTRUMENTS.log        HEALTHY control
+  last-run-2026-09-18_2230-player-MUSIC-DIED-THEN-CRASH.log   music dies,
+                                                              guest healthy
+  last-run-2026-09-19_BLACKSCREEN-FULL-GUEST-STOP.log         black screen,
+                                                              full guest stop
+  hang-2026-09-18_2230-selfsuspend.sample.gz                  live stack
+  hang-2026-09-19_full-stop-{3,4}.sample.gz                   live stacks
+  glyphdump/still*.bmp                                        99 captures
+
+THESE ARE NOT THE SAME BUG. Treating them as one is probably why this has
+resisted diagnosis for a week.
+
+=============================================================================
+1. THE GLYPH TRAP FIRED. 99 IMAGES. FIRST TIME EVER.
+=============================================================================
+
+    [FB-WATCH-STILL] comparisons=63938 still=110 moving=6275 quiet=56497
+
+still went from 0 to 110 and 99 rectangles are on disk. The only change was
+RECOMP_FB_WATCH_STILL_PPM 1000 -> 10000, in paths.conf, NO REBUILD.
+
+Why it never fired before: min_outside was 351 pixels against a 304-pixel
+budget, so "the scene outside held still" was unsatisfiable in a cutscene.
+It missed by 47 pixels for days.
+
+NOBODY HAS LOOKED AT THE 99 IMAGES YET. That is the cheapest high-value job
+on this list and it needs no run. The defect photographed on 18 Sep was
+"So $ou're the cat Who Wants to join us" -- y->$ and both w->W, rest clean.
+The substitutions are NOT ASCII-adjacent, so any index error is in FONT-ATLAS
+order, not character order.
+
+=============================================================================
+2. THE BLACK-SCREEN FREEZE IS TWO EVENTS, NOT ONE
+=============================================================================
+
+Per 5 s report, ending at the hang:
+
+    guest_methods      0    0    0    0    0    0    0    0    0   0
+    tib=0x00001000  7930 8190 7940 7780 7580 6600 6170 2780 5230   0
+    tib=0x00982000  2525 2438 2410 2585 2488 2281 2256 1818 2242   8
+
+THE APU FROZE ~50 SECONDS BEFORE THE THREADS DID. guest_methods is already
+flat while the guest is still making eight thousand kernel calls per report.
+Then, much later, the threads stop too.
+
+At the full stop the process is ALIVE and presenting flat out -- flips
+32798 -> 36553 in ten seconds -- onto an ENTIRELY BLACK framebuffer
+(nonzero=0/153600). Every guest thread is blocked in a wait:
+
+    4 x bridge_KeWaitForSingleObject -> WaitForSingleObject
+    1 x bridge_NtSuspendThread -> SuspendThread
+    1 x bridge_PsCreateSystemThreadEx
+    3 x Sleep
+
+THE OBVIOUS STORY IS NOT SAFE TO TELL. "All threads are inside waits, and our
+interrupts only run when a thread CALLS a wait" is tempting and wrong as
+stated: bridge_KeWaitForSingleObject explicitly pumps vblank from inside the
+wait, from every blocked thread. Something else is required. Do not write it
+up as the mechanism without showing what the pump does at that moment.
+
+=============================================================================
+3. THE PARKED-THREAD STORY IS DEAD
+=============================================================================
+
+Last night's handover built a chain on a guest thread parked in the
+self-suspend path of SuspendThread. RECOMP_THREAD_TRACE was armed for exactly
+this and it refutes it:
+
+    suspends=21730 resumes=22255 lost_resumes=537 parked_now=1
+
+  * lost_resumes climbs at a STEADY ~15-25 per report ALL RUN, including
+    while everything works. Its author's test -- "a stall that begins in the
+    same report as a lost resume is the mechanism; a stall with lost_resumes
+    flat is not" -- cannot discriminate, because it is never flat. Losing
+    resumes is normal here, roughly four a second.
+  * The "parked" worker is NOT stuck: tib=0x009A4000, 15,557 kernel calls,
+    last call 14 ms before the stop. It cycles ~450 times a report.
+  * The sample showing it parked 1185 of 1185 slices just reflects where it
+    spends the wait between rapid cycles. win32_compat.c's own comment warned
+    that "a parked worker is normal, so the fraction alone proves nothing".
+
+An instrument built for a hypothesis killed it in one session. That is the
+best outcome available and it cost a paths.conf line.
+
+=============================================================================
+4. THE PER-VOICE DATA, AND WHY IT IS NOT YET THE ANSWER
+=============================================================================
+
+RECOMP_VOICE_RATES was armed and produced per-voice data across the freeze.
+
+    voice 64: 0/115677 frames resampled, rate 1.0000
+              short=0 (dry=0)  energy=0.0  silent_frames=115677/115677
+              loopbacks=115677 of which 0 played NOTHING first
+
+Identical for 65, 66, 67: active, fetching at exactly the right rate, NOT
+starved, and looping on EVERY SINGLE FRAME over a region that reads as zeros.
+
+WHAT STOPS THIS BEING THE ANSWER, and it nearly was reported as one:
+
+  * The voices that actually produced audio this run are 4 through 11
+    (energy 2,960 to 284,206). Voices 64-67 produced NOTHING from the FIRST
+    report, not from the transition.
+  * So 64-67 may simply be idle reserved slots whose resting state is to spin
+    on silence. That would make this finding normal and irrelevant.
+  * There is NO healthy-session VOICE_RATES capture to compare against,
+    because the switch was not armed on 18 Sep.
+
+THE NEXT SESSION MUST CAPTURE A HEALTHY RUN WITH VOICE_RATES ARMED. Without
+that contrast this data cannot be read at all. That is the single most
+valuable run available.
+
+(The 18 Sep reading that "the music is voices 64-67" came from
+VOICE-LIFECYCLE, where those four are the only voices with one event=on and
+no retire. That is still true and still interesting; it does not establish
+that they carry the music.)
+
+=============================================================================
+5. WHAT TO DO NEXT, IN ORDER
+=============================================================================
+
+ 1. LOOK AT THE 99 GLYPH IMAGES. No run, no build. glyphdump/still*.bmp.
+    Either the corrupt text is in there or the trigger is still wrong, and
+    both answers are worth having immediately.
+ 2. ONE HEALTHY SESSION WITH VOICE_RATES ARMED. Everything is already armed
+    in paths.conf and the bundle is unchanged. Play, do NOT reach the freeze,
+    and stop. That gives the contrast section 4 needs.
+ 3. THEN read voices 4-11 across a freeze, not 64-67.
+ 4. The full stop (section 2): find what bridge_KeWaitForSingleObject's pump
+    is doing at the moment all threads are inside it. That is the only
+    unexplored half of the black screen.
+ 5. G18 (the cursor pin) is BUILT, default OFF, 70/70, verified by two
+    injected faults. It is not in the player's bundle on purpose -- shipping
+    it in the same run as the instruments would confound both. Ship it only
+    after 2 and 3.
+ 6. Graphics, unchanged: colour resolve needs four more trials (mechanism
+    confirmed, frame verdict void); recomp_gpu_own is armed on D3D11 and
+    never on Metal.
+
+=============================================================================
+6. RULES THIS SESSION PAID FOR
+=============================================================================
+
+ * CHECK WHETHER THE INSTRUMENT EXISTS BEFORE BUILDING IT. Twice in one
+   night. RECOMP_THREAD_TRACE and RECOMP_VOICE_RATES were both fully built,
+   wired, compiled into the bundle, and never armed -- one of them with a
+   header comment describing the failure we then measured.
+       strings -a ~/jsrf-build/JSRF.app/Contents/MacOS/jsrf-engine \
+         | grep -oE '^RECOMP_[A-Z0-9_]+$' | sort -u
+ * SAMPLE A HANG BEFORE KILLING IT. Three live samples now exist.
+ * A COUNTER'S TIME SERIES BEATS ITS FINAL VALUE. "2D froze while 3D climbed"
+   was read off a live tail; 3D had stopped too and recovered, and the
+   recovery was the whole finding.
+ * THE CONTROL IS WORTH AS MUCH AS THE BROKEN RUN, and section 4 is what it
+   costs to not have one.
+ * WATCH FOR SAME-SECOND MTIME. A restored source and its object both stamped
+   22:59:36 kept a stale binary and produced a test failure that looked like a
+   code defect.
+ * A FRAME-TIME A/B OWNS THE MACHINE. This session ruined one of its own by
+   running scans during it.
