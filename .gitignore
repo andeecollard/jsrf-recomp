@@ -49,3 +49,6 @@ output/
 
 # Generic split-tool output
 tools/split/output/
+
+# Claude Code session state and agent worktrees
+.claude/

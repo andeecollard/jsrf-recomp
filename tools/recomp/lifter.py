@@ -1396,6 +1396,10 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        # Set per-function by the translator from the SAME predicate that
+        # decides whether _fa/_fas are declared. Default True so a Lifter used
+        # standalone (the unit tests) still publishes.
+        self.needs_result_snapshot = True
         # Set per-function by translator when a je/jne lands on a jump target,
         # i.e. when a ZF join is possible at all. Gated because publishing at
         # every cmp/test in the image is 65,024 extra stores, and the gate
@@ -2458,6 +2462,8 @@ class Lifter:
         write by the caller, because `sub eax, eax` would otherwise snapshot
         the source after it had already been overwritten.
         """
+        if not self.needs_result_snapshot:
+            return ""          # the translator did not declare the pair
         size = _operand_width(ops[0])
         if size not in self._SNAP_MASK:
             size = 4
@@ -4027,7 +4033,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # Handle jecxz/jcxz specially (not flag-based)
         if curr.mnemonic in ("jecxz", "jcxz"):
             results = lifter._lift_jcc(curr)
-            stmts.extend(results)
+            stmts.extend(st for st in results if st)
             i += 1
             continue
 
@@ -4115,7 +4121,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 curr, curr.operands, preserve_carry=preserve)
         else:
             results = lifter.lift_instruction(insns[i])
-        stmts.extend(results)
+        stmts.extend(st for st in results if st)
 
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:

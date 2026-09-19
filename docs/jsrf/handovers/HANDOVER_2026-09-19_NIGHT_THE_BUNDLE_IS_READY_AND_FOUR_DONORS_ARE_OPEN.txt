@@ -1,0 +1,201 @@
+HANDOVER 2026-09-19 NIGHT -- THE BUNDLE IS READY FOR ONE RUN, AND ALL FOUR BC
+DONORS ARE OPEN
+
+Read CLAUDE.md, then the newest file in docs/jsrf/goals/ -- do not trust a
+pointer, including this one. Supersedes
+HANDOVER_2026-09-19_THREE_FAILURES_ONE_BINARY_AND_A_TRAP_THAT_FINALLY_FIRED.txt.
+Its item 1 is done and its G2 framing is refuted (section 3 below).
+
+Tree: 70/70 ctest, 205 translator tests, switch audit 0 problems.
+Plan: docs/jsrf/plans/PLAN_2026-09-19_NIGHT_EVERYTHING_CONVERGES_ON_ONE_RUN.md
+
+=============================================================================
+0. WHAT TO DO NEXT: ONE GAMEPLAY RUN. EVERYTHING IS PREPARED.
+=============================================================================
+
+The bundle, paths.conf and glyphdump are all staged. Play to gameplay, reach
+dialogue, keep going until the music dies if it will. One run answers five
+questions.
+
+  THE BUNDLE WAS REBUILT (19 Sep 06:41). The old one is preserved at
+  ~/jsrf-build/JSRF-2026-09-18-1958-THREE-CAPTURES.app -- it is the binary the
+  three captured failures were produced on, keep it.
+
+  paths.conf changed, backup at paths.conf.bak-before-2026-09-19-run:
+    RECOMP_FB_WATCH      280,410,80,35 -> 150,346,360,28   (see section 3)
+    RECOMP_FB_WATCH_AFTER           10 -> 0
+    RECOMP_VOICE_RATES_ROWS        new -> 256
+    RECOMP_FF_BATCH_DUMP           new -> 400
+  glyphdump/ emptied. The 19 Sep capture is safe in glyphdump-2026-09-19-KEEP/.
+
+  Verified armed, by running the bundle's own environment for 50 s:
+    [FB-WATCH] region 150,346 360x28 ... 1043 comparisons
+    [FF-BATCH] x400, [APU-SGE] x9, [VOICE-FRESH] census x9
+
+  HARVEST THE FONT ATLAS OFFSET FIRST. RECOMP_FF_BATCH_WATCH_TEX is still
+  01737000 and that texture was never drawn in four runs. Read tex0= off a
+  six-vertex text batch in the [FF-BATCH] dump, set the switch to it, run
+  again. Offsets are stable across runs (75 of 75 identical).
+
+=============================================================================
+1. THE AUDIO FINDINGS, BOTH FROM LOGS NOBODY HAD READ
+=============================================================================
+
+NINE OF ELEVEN VOICES ARE REPLAYING STALE BUFFERS. RECOMP_VOICE_FRESH was
+armed on 19 Sep and its per-voice line carries its own verdict, "the guest is
+not refilling this buffer". It printed that 457 times and nobody read it.
+Voices 1,2,3,4,5,7,8,9,11,69 are 99.3-99.9% stale; voice 3 replayed one
+32-sample slot for 65,933 ms. VOICE 68 IS 4.3% -- that is the positive
+control, in the same run on the same instrument, and it is why the rest is a
+measurement and not a dead counter.
+
+  NOT ESTABLISHED: "the guest is not refilling" is one of two readings. The
+  classifier hashes what WE read, so unchanged contents mean either the guest
+  never wrote or its writes are not reaching us -- the distinction this tree
+  paid 13.5M lost MMIO windows for once already. RECOMP_APU_WRITE_TRACE is
+  armed; that decides it.
+
+THE ADPCM REFUSALS START EXACTLY 11 BLOCKS FROM THE END OF EVERY BUFFER.
+193,693 blocks refused of 4,376,878 (4.4%), all silenced by the guard.
+v0 208/219, v1 126/137, v2 182/193, v3 190/201, v5 159/170, v6 181/192,
+v7 144/155 -- seven voices, buffers 137 to 219 blocks, gap 11 every time. A
+constant DIFFERENCE is not a stride error (that gives a constant fraction) and
+11 is not the 113 blocks in a page. All 464 recorded failures carry the same
+header, 0x08080808. It is a fixed over-read.
+
+  The ring now prints bs, ba, ebo and ba_blocks, which decides base-too-high
+  against buffer-shorter-than-ebo in one run.
+
+G7 IS INSTRUMENTED AND LEANING TOWARDS DEAD. get_data_ptr's bound could never
+fire (every call site passes 0xFFFFFFFF). It now validates the page-table
+ENTRY and counts implausible ones as [APU-SGE]. A 50 s boot: 9,999,595
+translations, 0 implausible. The failing pages are scattered with plausible
+page-aligned PRDs, which is the failure ring's "buffer reused underneath us"
+reading, not its "translation wrong past that page" one. IF sge_oob STAYS 0
+ACROSS A GAMEPLAY RUN THAT STILL REFUSES 4%, WRITE G7 OFF.
+
+=============================================================================
+2. FOUR INSTRUMENTS WERE ARMED AND UNREAD. THREE HAD PRINTED THE ANSWER.
+=============================================================================
+
+This was the session's most productive habit: read what is already on, before
+building anything.
+
+  VOICE_FRESH      armed, 457 verdict lines, unread  -> section 1
+  VOICE_RATES      armed, but the table shows 12 of 256 voices, scanning from
+                   0, against counters that never reset. Once twelve low
+                   voices have run, NO 2D voice can ever appear -- and 2D
+                   (handle >= 64) is where the music is. "Voices 64-67 were
+                   retired" was rows being crowded out.
+  FF_BATCH_WATCH   armed since 17 Sep, 14,273 lines, unread. It keyed on
+                   VERTEX COUNT alone, so every six-vertex glyph quad collided
+                   into one slot and every comparison counted as a change. Its
+                   documented discriminator would have read "race with the
+                   guest" off pure noise. Re-keyed on the draw's ordinal
+                   within the frame: 14,273 -> 145.
+  FB_WATCH_AFTER   discarded 88 of 110 captures silently. Now counted.
+
+  Also now printed, having been incremented and output nowhere: the FF watch's
+  own change counter, g_sched_absolute_deadlines (answer: zero, so the missing
+  absolute-deadline implementation can stay missing) and the Metal
+  sync_range pair.
+
+=============================================================================
+3. G2: THE DEFECT IS PHOTOGRAPHED, AND THE OLD FRAMING IS WRONG
+=============================================================================
+
+Three corrupt glyphs in seven dialogue lines: report011 "No[w]", report014
+"ne[x]t", report026 "spra[y]". But the SAME characters render correctly in
+other boxes in the same run -- report028 renders "spray," perfectly, the same
+word corrupt in report026. A static atlas-order index error would corrupt
+every occurrence. It does not.
+
+The replacements are CJK glyphs, not ASCII punctuation: bottom-aligned on the
+same baseline, 20-23 rows against 15 for their neighbours, normal cell width
+and correct advance. report014's is recognisably a vertical stem with a wide
+crossbar. So the 18 Sep readings "y -> $" and "w -> W" were misreads of small
+kanji, and the inference built on them -- "not ASCII-adjacent, so the index
+error is in font-atlas order" -- rests on that misread. Do not carry it.
+
+THE STILL TRAP NEVER SAW ANY OF THIS. Its rectangle was at y=410-444; the
+dialogue text is at y~348-396. It was never on the text. Moved.
+
+=============================================================================
+4. ALL FOUR BC DONORS ARE EXTRACTED. NAMES: 162 -> 439.
+=============================================================================
+
+The BC packages were filed as "unobtainable, DO NOT REOPEN". They are on disk
+and they open. SVOD -> XDVDFS -> default.xbe.
+
+  donor          XDK         oracle hit   symbols
+  Fuzion Frenzy  3911/3925   97.6%        1,482
+  JSRF (target)  4134
+  Blinx          4831        98.0%        1,786
+  Crimson Skies  5659        98.9%        3,106
+  Conker         5849        99.1%        3,228
+
+OUR FUNCTION DETECTOR IS 97.6-99.1% AGAINST MICROSOFT'S GROUND TRUTH, on bare
+runs with no seed files. That kills the argument for adoption-plan item 5.
+Caveat: the oracle grades only MS-named LIBRARY functions, and JSRF is mostly
+game code.
+
+tools/fusion/signatures.py had never been runnable (build needs a donor XBE).
+Run on all four: 313 addresses, 308 distinct names, 0 ambiguous, 93.8%
+cross-donor agreement. Merged with the old size-sequence set: 439 names, 4.9%
+of 8,876, at ~/Library/Application Support/JSRF/jsrf_guest_names_merged.tsv
+(NOT swapped in; point RECOMP_GUEST_NAMES at it). 57 are audio, 29 CMcpx.
+
+  XDK DISTANCE BARELY MATTERED: Fuzion at ~210 builds named 231, Blinx at 697
+  named 235, Crimson at 1,525 named 233. Use the union; stop optimising the
+  donor choice.
+
+  EXTRACTION IS NOT OBVIOUS AND A FLAT COPY LOOKS FINE. The Data chunks are
+  hash-interleaved (1 + 203*(1+204) = 41,616 exactly). A flat copy passes a
+  header check completely -- right title, date, base, sections, AND the right
+  XDK version. The tells are kernel imports resolving to real names and a sane
+  TLS block. The sector base is per-title: 32, 32, 880,036, 956,202.
+  Donor XBEs and signature DBs kept in bc-donors-2026-09-19/ so this is never
+  re-derived.
+
+=============================================================================
+5. UPSTREAM
+=============================================================================
+
+Three PRs sent today, all ported onto upstream/main and tested there, each
+with a negative control:
+  #75 SHLD/SHRD ignore x86's count rules, and a zero count writes
+  #76 "movsd" is two instructions, and the dispatcher picked by name
+  #77 the result-setter family rebuilds its condition at the consumer
+With #67/#69/#70/#71/#72 that is EIGHT open. Maintainer quiet since 16 Sep.
+Do not re-send popfd -- it is #72 already; today's local change was applying
+it, not finding it.
+
+We are 80 commits behind upstream/main (v0.10.0), 43 of them in tools/recomp.
+A merge is in progress on a branch. Conflict risk is real: upstream built
+their own cross-block comparison-snapshot merge and we built ours.
+
+=============================================================================
+6. IN THE TOOL, NOT IN THE TITLE
+=============================================================================
+
+G19 (result-setter clobber), the SHRD count fix, sal, popfd and movsd are all
+fixed in the translator and NOT in any running binary. They need a
+regeneration, which is not bit-stable and re-bases every comparison.
+
+DO IT AFTER THE RUN. The run is worth more against the existing gen, because
+the 18/19 Sep captures are the only comparison class we have.
+
+=============================================================================
+7. RULES THIS SESSION PAID FOR
+=============================================================================
+
+ * IN A PER-VOICE REPORT, head/tail SELECT A VOICE, NOT A TIME. Two false
+   conclusions in one hour from this, both nearly written up.
+ * RUN THE POSITIVE CONTROL ON YOUR OWN SCAN. "No XBEH anywhere" came from
+   grep -c without -a, which prints nothing on binaries. Grepping for a string
+   I knew was present returned empty too -- that is what caught it.
+ * A VALIDATION GATE THAT ONLY PARSES A HEADER PROVES NOTHING. Three corrupt
+   extractions passed one.
+ * CHECK WHETHER THE INSTRUMENT IS ARMED **AND WHETHER ANYONE READ IT**.
+   Four were armed and unread; three had already printed the answer.
+ * A CAPPED LIST MUST SAY WHAT IT DROPPED. Three tables silently truncated.
