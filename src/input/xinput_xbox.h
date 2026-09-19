@@ -141,6 +141,17 @@ unsigned long long xbox_PadReplayHash(void);
 int  xbox_PadRecordOpen(const char *path);
 void xbox_PadRecordSampleAtFrame(const XBOX_INPUT_STATE *st, unsigned long frame);
 void xbox_PadRecordClose(void);
+
+/* A MARK: "the text was wrong HERE". Stamps the current guest frame and a
+ * label into the open recording as a `#!mark <frame> <label>` directive and
+ * onto stderr as [PAD-MARK]; the replay echoes each mark when it reaches
+ * that frame, so a symptom the player saw becomes a frame number in the log
+ * of every replay of that session. Marks from a loaded recording and marks
+ * made live are the same table; xbox_PadNearMark answers whether `frame` is
+ * within `slack` frames of any of them, which is what a probe that should
+ * only fire around a symptom asks. */
+void xbox_PadRecordMark(const char *label);
+int  xbox_PadNearMark(unsigned long frame, unsigned long slack, const char **label);
 unsigned long long xbox_PadRecordHash(void);
 #endif /* !_WIN32 */
 

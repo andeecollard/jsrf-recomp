@@ -29,6 +29,10 @@ extern _Bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #include <xbox/xboxrecomp.h>
 #include "recomp_types.h"
+#if !defined(_WIN32)
+static void jsrf_state_trace_frame(unsigned long f);   /* RECOMP_STATE_TRACE */
+static void jsrf_state_trace_flush(void);
+#endif
 #include "../../src/recomp_switch.h"
 #include "guest_trace.h"
 #include "guest_names.h"
@@ -762,6 +766,9 @@ static int jsrf_pb_poll(void)
          * keyed to it; nothing else advances it, so a run with the push-buffer
          * executor off records every sample onto frame 0 and says so. */
         xbox_InputFrameAdvance();
+#if !defined(_WIN32)
+        jsrf_state_trace_frame(xbox_InputFrame());
+#endif
         pgraph_d3d11_flush();
         d3d8_PresentFrame();
         /* RECOMP_FB_DUMP_FLIP=<stride>[:<after-seconds>]: capture finished
@@ -2043,6 +2050,73 @@ static unsigned long jsrf_pad_anchor(void)
     return ((unsigned long)(ch & 0xFFu) << 24)
          | ((unsigned long)(mi & 0xFFu) << 16)
          | (unsigned long)((pt / 60u) & 0xFFFFu);
+}
+
+/* RECOMP_STATE_TRACE=<path>: one line per guest frame, so two runs of the
+ * same recording can be diffed to the FIRST frame they disagree on.
+ *
+ * The pad recorder's checkpoints say whether the INPUT diverged and whether
+ * the title is in the same scene; neither can say where two builds' execution
+ * first parted. This can, to the frame: each line carries the guest frame,
+ * the scene anchor the recorder uses, the save-data playtime, the running
+ * count of every indirect call the title has made (g_icall_count, which is
+ * as close to an execution fingerprint as this runtime has for free), and
+ * the running hardware draw count. A build that translates one branch
+ * differently changes the call count on the frame it first matters, and
+ * state_trace_diff.py names that frame -- usually long before anything is
+ * visible. Two runs of the SAME build put a floor under it: whatever they
+ * disagree on is timing, not translation, and the diff says how early.
+ *
+ * Read-only, opt-in, ~60 bytes a frame, flushed every ten seconds of guest
+ * time and from the same handler that flushes the pad recorder. */
+static FILE *g_state_trace;
+static int   g_state_trace_tried;
+
+static void jsrf_state_trace_frame(unsigned long f)
+{
+    const uint8_t *base;
+    uint32_t pt = 0;
+    extern unsigned long long g_hw_draws;
+    if (!g_state_trace) {
+        const char *path;
+        if (g_state_trace_tried) return;
+        g_state_trace_tried = 1;
+        path = getenv("RECOMP_STATE_TRACE");
+        if (!path || !*path) return;
+        g_state_trace = fopen(path, "w");
+        if (!g_state_trace) {
+            fprintf(stderr, "  [STATE-TRACE] CANNOT WRITE %s: %s -- no trace"
+                    " from this run\n", path, strerror(errno));
+            return;
+        }
+        fprintf(g_state_trace, "# JSRF state trace: f<frame> a=<anchor>"
+                " pt=<playtime> ic=<indirect calls> dr=<hw draws>\n"
+                "#!build %s\n#!gen %s\n",
+#ifdef JSRF_BUILD_OPT
+                JSRF_BUILD_OPT,
+#else
+                "unstamped",
+#endif
+#ifdef JSRF_GEN_TRANSLATOR
+                JSRF_GEN_TRANSLATOR
+#else
+                "unstamped"
+#endif
+                );
+        fprintf(stderr, "  [STATE-TRACE] writing %s, one line per guest frame\n", path);
+    }
+    base = (const uint8_t *)xbox_GetMemoryOffset();
+    if (base) memcpy(&pt, base + JSRF_SAVEDATA_VA + JSRF_SD_PLAYTIME, 4);
+    fprintf(g_state_trace, "f%lu a=%08lx pt=%u ic=%llu dr=%llu\n",
+            f, jsrf_pad_anchor(), (unsigned)pt,
+            (unsigned long long)g_icall_count,
+            (unsigned long long)g_hw_draws);
+    if ((f % 600ul) == 0) fflush(g_state_trace);
+}
+
+static void jsrf_state_trace_flush(void)
+{
+    if (g_state_trace) fflush(g_state_trace);
 }
 #endif /* !_WIN32 */
 
@@ -4222,6 +4296,7 @@ static void crash_handler(int sig, siginfo_t *si, void *context)
      * thing that makes this crash reproducible tomorrow. It will not block:
      * the record lock may be held by the very thread this signal landed on. */
     xbox_PadRecordFlush();
+    jsrf_state_trace_flush();
     fprintf(stderr, "SIGNAL: %s (%d)\n", sig == SIGBUS ? "SIGBUS" : "SIGSEGV", sig);
     fprintf(stderr, "HOST FAULT ADDRESS: 0x%016llX\n", (unsigned long long)fault);
     fprintf(stderr, "HOST PC: 0x%016llX%s\n", (unsigned long long)host_pc,
