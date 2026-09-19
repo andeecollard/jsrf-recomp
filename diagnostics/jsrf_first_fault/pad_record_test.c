@@ -331,6 +331,62 @@ int main(void)
         remove(cheap);
     }
 
+    /* ── 7. a mark round-trips, and does not touch the input hash ───── */
+    {
+        char marked[128];
+        const char *lab = NULL;
+        unsigned long long h_plain, h_marked;
+        int n;
+        snprintf(marked, sizeof marked, "/tmp/jsrf_padrec_mark_%d.padrec", (int)getpid());
+        /* Record the same sequence twice, once with a mark in the middle.
+         * The mark must come back from the file with its frame and label,
+         * must answer a near-mark query within slack and not outside it,
+         * and must leave the pad hash IDENTICAL: a mark is not input. */
+        xbox_PadRecordSetIdentity("test-build", "test-gen");
+        record_sequence(path, seq, FRAMES);
+        h_plain = xbox_PadRecordHash();
+        CHECK(xbox_PadRecordOpen(marked), "could not open %s", marked);
+        for (f = 0; f < FRAMES; f++) {
+            unsigned p, np = polls_for_frame(f);
+            g_anchor_frame = f;
+            if (f == 100) {
+                /* the mark is stamped with the guest frame counter, which
+                 * this test does not drive; so drive it to 100 for the
+                 * press and back to where the recorder expects it. */
+                while (xbox_InputFrame() < 100) xbox_InputFrameAdvance();
+                xbox_PadRecordMark("text wrong here");
+            }
+            for (p = 0; p < np; p++)
+                xbox_PadRecordSampleAtFrame(&seq[f], f);
+        }
+        xbox_PadRecordClose();
+        h_marked = xbox_PadRecordHash();
+        CHECK(h_marked == h_plain, "a mark changed the pad hash (%016llx vs"
+              " %016llx); a marked recording would diverge on replay",
+              (unsigned long long)h_marked, (unsigned long long)h_plain);
+
+        xbox_PadScriptReset();
+        CHECK(!xbox_PadNearMark(100, 0, &lab), "a mark survived reset");
+        snprintf(spec, sizeof spec, "@%s", marked);
+        n = xbox_PadScriptLoad(spec);
+        CHECK(n > 0, "the marked recording did not load (%d)", n);
+        CHECK(xbox_PadNearMark(100, 0, &lab) && lab && !strcmp(lab, "text wrong here"),
+              "the mark did not come back from the file (label %s)", lab ? lab : "(null)");
+        CHECK(xbox_PadNearMark(130, 30, &lab), "a frame 30 away with slack 30 is not near");
+        CHECK(!xbox_PadNearMark(131, 30, &lab), "a frame 31 away with slack 30 is near");
+        /* and the replay of it is still exact: the directive is not an event */
+        mismatches = 0;
+        for (f = 0; f < FRAMES; f++) {
+            XBOX_INPUT_STATE got;
+            memset(&got, 0, sizeof got);
+            g_anchor_frame = f;
+            xbox_PadScriptApplyAtFrame(&got, f);
+            if (!gamepad_eq(&got.Gamepad, &want[f].Gamepad)) { mismatches++; }
+        }
+        CHECK(mismatches == 0, "the marked recording replays differently");
+        remove(marked);
+    }
+
     remove(path);
     free(seq);
     free(want);

@@ -1619,6 +1619,18 @@ void xbox_d3d8_pump_events(void)
                 fflush(stdout);
                 _exit(0);
             }
+#if !defined(_WIN32)
+            /* M, unmodified: mark this moment. The keyboard never reaches the
+             * guest (see above), so a bare letter is free to take, and a
+             * player who sees the text go wrong can press one key without
+             * taking a hand off the pad for long. The mark lands in the open
+             * recording and in the log; see xbox_PadRecordMark. */
+            if (ev.key.keysym.sym == SDLK_m
+                && !(ev.key.keysym.mod & (KMOD_GUI | KMOD_CTRL | KMOD_ALT))) {
+                extern void xbox_PadRecordMark(const char *label);
+                xbox_PadRecordMark("M");
+            }
+#endif
             /* Cmd+F is the Mac full-screen gesture; F11 is what everyone else
              * presses. FULLSCREEN_DESKTOP for the reasons set out over the
              * flag in d3d_CreateDevice. The STATE is read with the bare

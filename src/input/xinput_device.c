@@ -1039,6 +1039,30 @@ struct pad_ck { unsigned long run, frame, anchor; unsigned long long hash; };
 static struct pad_ck *g_padrec_ck;
 static int g_padrec_ck_n, g_padrec_ck_cap;
 
+/* Marks: "the text was wrong HERE", as a guest frame and a label. One table
+ * for both directions -- a `#!mark` read from a recording and a mark made
+ * live while recording land in the same place -- so a probe asking "am I
+ * near a symptom" gets one answer whichever way the session is being run.
+ * Fixed-size: a session with more than 64 marks is a session that should
+ * have been several. */
+#define PAD_MARK_MAX 64
+#define PAD_MARK_LABEL 48
+struct pad_mark { unsigned long frame; char label[PAD_MARK_LABEL]; };
+static struct pad_mark g_pad_marks[PAD_MARK_MAX];
+static int g_pad_marks_n;
+static int g_pad_mark_echoed;            /* replay: marks already announced */
+
+static void pad_mark_push(unsigned long frame, const char *label, size_t n)
+{
+    struct pad_mark *m;
+    if (g_pad_marks_n >= PAD_MARK_MAX) return;
+    m = &g_pad_marks[g_pad_marks_n++];
+    m->frame = frame;
+    if (n >= sizeof m->label) n = sizeof m->label - 1;
+    memcpy(m->label, label, n);
+    m->label[n] = 0;
+}
+
 static void pad_ck_push(unsigned long run, unsigned long frame,
                         unsigned long long h, unsigned long anchor)
 {
@@ -1091,6 +1115,12 @@ static void pad_script_directive(const char *s, size_t len)
         unsigned long long h = q ? strtoull(q, &q, 16) : 0;
         unsigned long an = q ? strtoul(q, NULL, 16) : 0;
         pad_ck_push(run, fr, h, an);
+    } else if (pad_name_is(w, wn, "mark")) {
+        char *q = NULL;
+        unsigned long fr = strtoul(p, &q, 10);
+        const char *lab = q ? q : end;
+        while (lab < end && isspace((unsigned char)*lab)) lab++;
+        pad_mark_push(fr, lab, (size_t)(end - lab));
     } else {
         fprintf(stderr, "  [PAD-SCRIPT] unknown directive '%.*s'\n", (int)wn, w);
     }
@@ -1335,6 +1365,18 @@ static void pad_replay_apply(XBOX_INPUT_STATE *st, unsigned long f)
         return;
     }
     g_pad_replay_frame = f;
+    /* A mark is announced once, when the replay reaches its frame, so the
+     * log of every replay of this session carries the player's "here" at
+     * the same guest frame the player pressed it. Marks are kept in file
+     * order, which is frame order for a recording. */
+    while (g_pad_mark_echoed < g_pad_marks_n
+           && g_pad_marks[g_pad_mark_echoed].frame <= f) {
+        const struct pad_mark *m = &g_pad_marks[g_pad_mark_echoed++];
+        fprintf(stderr, "  [PAD-MARK] replay reached mark #%d: frame=%lu"
+                " \"%s\" (now t=%.1fs)\n", g_pad_mark_echoed, m->frame,
+                m->label, xbox_InputSeconds());
+        fflush(stderr);
+    }
     while (g_pad_run_cursor < g_pad_runs_n && g_pad_runs[g_pad_run_cursor].f1 <= f)
         g_pad_run_cursor++;
     while (g_pad_run_folded < g_pad_run_cursor) {
@@ -1397,6 +1439,7 @@ static void pad_script_reset_state(void)
     g_pad_replay_past_end = 0;
     g_padrec_seen = g_padrec_version = g_padrec_refused = 0;
     g_padrec_frames = 0; g_padrec_switches = 0;
+    g_pad_marks_n = g_pad_mark_echoed = 0;
     g_padrec_build[0] = g_padrec_gen[0] = 0;
     g_pad_replay_force = -1;
 }
@@ -1855,6 +1898,49 @@ void xbox_PadRecordClose(void)
 }
 
 unsigned long long xbox_PadRecordHash(void) { return g_pad_rec_hash; }
+
+/* Mark this moment. The frame is the guest's own (xbox_InputFrameAdvance),
+ * which is the key everything else in a recording uses, so a replay reaches
+ * the mark at the same guest frame however fast the host runs. Written to
+ * the open recording as a directive, and flushed at once: a mark is the one
+ * line a person is waiting on, and a session that crashes ten seconds later
+ * must still have it. Not a pad event, so the checkpoint hash is unchanged
+ * and a marked recording replays identically to an unmarked one. */
+void xbox_PadRecordMark(const char *label)
+{
+    unsigned long f = g_pad_guest_frame;
+    const char *lab = (label && *label) ? label : "mark";
+    int k;
+    pthread_mutex_lock(&g_pad_rec_lock);
+    pad_mark_push(f, lab, strlen(lab));
+    k = g_pad_marks_n;
+    if (g_pad_rec_f) {
+        g_pad_rec_bytes += (unsigned long long)
+            fprintf(g_pad_rec_f, "#!mark %lu %s\n", f, lab);
+        fflush(g_pad_rec_f);
+    }
+    pthread_mutex_unlock(&g_pad_rec_lock);
+    fprintf(stderr, "  [PAD-MARK] #%d frame=%lu t=%.1fs \"%s\"%s\n", k, f,
+            xbox_InputSeconds(), lab,
+            g_pad_rec_f ? " (written to the recording)"
+                        : " (no recording open: log only)");
+    fflush(stderr);
+}
+
+int xbox_PadNearMark(unsigned long frame, unsigned long slack, const char **label)
+{
+    int i;
+    for (i = 0; i < g_pad_marks_n; i++) {
+        unsigned long m = g_pad_marks[i].frame;
+        unsigned long d = m > frame ? m - frame : frame - m;
+        if (d <= slack) {
+            if (label) *label = g_pad_marks[i].label;
+            return 1;
+        }
+    }
+    if (label) *label = NULL;
+    return 0;
+}
 
 static int pad_record_on(void)
 {

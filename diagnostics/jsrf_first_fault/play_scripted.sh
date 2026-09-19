@@ -520,3 +520,13 @@ else
     echo "           this file exists to eliminate. Void for anything about"
     echo "           voice retirement, the trap storm, or audio uptime."
 fi
+# Marks: the player's own "here" moments, echoed by the replay at the frame
+# they were made. Listed so the verdict says where to look before anyone
+# opens an 8 MB log.
+MARKS=$(grep -c '\[PAD-MARK\]' "$OUT/stderr.log" 2>/dev/null || echo 0)
+if [ "$MARKS" -gt 0 ]; then
+    echo "  MARKS:   $MARKS -- the player marked these moments:"
+    grep '\[PAD-MARK\]' "$OUT/stderr.log" | head -12 | sed 's/^/           /'
+else
+    echo "  MARKS:   none in this run."
+fi
