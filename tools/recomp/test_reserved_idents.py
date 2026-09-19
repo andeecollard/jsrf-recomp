@@ -63,6 +63,17 @@ def _compile(body):
         return r.returncode, r.stderr
 
 
+def _is_declared(name):
+    """Do the headers a generated TU includes declare this name at all?
+
+    Only asked of a name that redeclared cleanly. A function-like macro never
+    gets here -- it fails the redeclaration first -- so taking its address is
+    a sound probe for the rest.
+    """
+    rc, _ = _compile(f"int _probe(void) {{ (void)sizeof(&{name}); return 0; }}")
+    return rc == 0
+
+
 class ReservedIdentTest(unittest.TestCase):
     def setUp(self):
         if not _find_cc():
@@ -86,17 +97,33 @@ class ReservedIdentTest(unittest.TestCase):
         Guards the sweep above. If the reserved set were emptied, every name
         would compile as an ordinary identifier and that test would still
         pass.
+
+        Membership in the reserved set is asserted on every platform, because
+        the set has to cover every toolchain the generated C is built with,
+        not whichever one is running the test. The *collision* is only
+        asserted where the headers actually declare the name: `onexit` is
+        MSVC's `<stdlib.h>`, and on a macOS or Linux libc `void onexit(void);`
+        is an ordinary identifier that compiles clean. Skipping on a clean
+        compile alone would hide the case this control exists for, so a clean
+        compile is only excused once _is_declared has confirmed the platform
+        does not have the name at all.
         """
         for name in SHARP:
             with self.subTest(name=name):
                 self.assertIn(name, _FUNC_RESERVED_IDENT,
                               f"{name} is missing from the reserved set")
                 rc, _ = _compile(f"void {name}(void);\nvoid {name}(void) {{ }}")
+                if rc == 0 and not _is_declared(name):
+                    self.skipTest(
+                        f"{name} is not declared by this platform's headers, "
+                        f"so it cannot collide here; it stays in the reserved "
+                        f"set for the toolchains that do declare it")
                 self.assertNotEqual(
                     rc, 0,
-                    f"`void {name}(void);` compiled clean, so it does not "
-                    f"need to be in the reserved set -- or the headers this "
-                    f"test includes no longer match a generated TU")
+                    f"`void {name}(void);` compiled clean although this "
+                    f"platform declares {name}, so it does not need to be in "
+                    f"the reserved set -- or the headers this test includes "
+                    f"no longer match a generated TU")
 
     def test_ordinary_names_are_left_alone(self):
         """Mangling is not free: it shows up in every trace and backtrace."""

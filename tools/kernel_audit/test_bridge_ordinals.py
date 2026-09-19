@@ -174,7 +174,13 @@ def test_avsendtvencoderoption_route_and_abi():
         "ordinal 2 is not routed to bridge_AvSendTVEncoderOption")
 
     src = open(BRIDGE_C, encoding="utf-8", errors="replace").read()
-    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    # `static int`, as the sibling test above has. Without it the non-greedy
+    # match starts at the first *mention* of the name -- a comment 4,500
+    # lines earlier -- and then ends at the next `\n}`, so what gets searched
+    # for `case 2:` is an unrelated function body. It reported
+    # AvSendTVEncoderOption as unsized while the table said `case 2: return
+    # 16;` all along.
+    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
     assert m and re.search(r"case\s+2:\s*return\s+16;", m.group(0)), (
         "AvSendTVEncoderOption must pop four 32-bit stdcall arguments")
 

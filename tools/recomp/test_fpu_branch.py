@@ -93,15 +93,18 @@ def test_fnstsw_to_memory_writes_the_status_word():
         _Insn("fnstsw", [_Op("word ptr [eax]", type="mem", mem_size=2,
                              mem_base="eax")],
               "word ptr [eax]")))
+    # `RECOMP_MEM_WRITE16` rather than upstream's bare `MEM16(eax) =`: our
+    # stores stay wrapped so the diagnostics tree still sees them.
     assert "RECOMP_MEM_WRITE16(" in out, out
-    assert "g_fp_cmp" in out, out
-    # equal -> C3 (0x4000), less -> C0 (0x0100), greater -> 0
-    assert "0x4000u" in out and "0x0100u" in out, out
-    # Upstream's addition: fnstsw now reports the shared x87 condition-code
-    # byte, which fxam writes too. The untraced `MEM16(eax) =` spelling it
-    # also asserted is NOT adopted -- our stores stay wrapped in
-    # RECOMP_MEM_WRITE so the diagnostics tree still sees them.
+    # Both fnstsw forms now read the shared condition-code byte that the
+    # compare family and `fxam` both publish, instead of open-coding C3/C0
+    # from `g_fp_cmp` at each use. The bit values that spelling used to
+    # assert here -- equal 0x4000, less 0x0100, greater 0, unordered 0x4500 --
+    # moved into `RECOMP_FCMP_CC`, and test_x87_classification.py now checks
+    # them by running the emitted code at every value of TOP, which is
+    # strictly more than a string match could.
     assert "g_fp_cc" in out, out
+    assert "(g_fp_top & 7u) << 11" in out, out
 
 
 C_HELPER = r"""

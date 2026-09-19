@@ -908,9 +908,24 @@ class FunctionDetector:
             # immediate can point into a decoded instruction: JSRF's
             # 0x1600CA is the C9 byte of `test ecx, ecx`, which also decodes as
             # `leave`. Promoting it split QueryInterface and lost its stack
-            # cleanup. Only a recognisable prologue can override the sweep.
+            # cleanup. Only a shape that is recognisably the start of a
+            # function may override the sweep.
+            #
+            # The constant-stub and vcall-thunk exceptions came from upstream,
+            # and this tree carried only the prologue one for a while because
+            # 0x1600CA was the reason the guard exists and nobody had measured
+            # whether widening it brought that split back. Measured 19 Sep
+            # 2026: discovery run twice over JSRF's XBE with identical seeds,
+            # once with each form, produces the same 8,866 functions with the
+            # same bounds -- no address is added, none is lost, and
+            # QueryInterface stays whole at 0x00160080-0x00160108 because
+            # `leave` is neither shape. The widening is free here and it is
+            # what finds MSVC's vtable-only accessors elsewhere, so there is
+            # nothing left to diverge over.
             if (self.engine.instruction_covering(target) is not None
-                    and not self.engine.probes_as_prologue(target)):
+                    and not (self.engine.probes_as_prologue(target)
+                             or self.engine.probes_as_constant_stub(target)
+                             or self.engine.probes_as_vcall_thunk(target))):
                 continue
             # A ret, not merely a terminator: an immediate is weak evidence,
             # so the probe has to reject data that happens to disassemble. The
