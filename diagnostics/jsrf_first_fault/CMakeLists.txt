@@ -399,6 +399,25 @@ target_compile_definitions(xbox_kernel PRIVATE RECOMP_ICALL_FEEDBACK)
 # build produced it is a log two people can read as two different experiments,
 # and that has already happened here: five harness scripts defaulted to the
 # -O0 tree while every measurement was taken with JSRF_BIN pointed elsewhere.
+# WHICH GUEST INSTRUCTION WROTE THIS ADDRESS?
+#
+# The generated code already emits RECOMP_MEM_WRITE32(pc, function, ...) for
+# every translated store -- 17,651 of them in one translation unit alone --
+# but the macro collapses to a plain store unless RECOMP_MEM_WATCH_RUNTIME is
+# defined, so RECOMP_MEM_WATCH has never had anything to watch. Defining it
+# puts one predictable, perfectly-predicted branch on every guest store, which
+# is not free, so it is opt-in:
+#
+#   cmake -S diagnostics/jsrf_first_fault -B <build> -DJSRF_MEM_WATCH=ON
+#   RECOMP_MEM_WATCH=0x01737000:262144 <binary>
+#
+# It rebuilds every generated translation unit, so expect a full build.
+option(JSRF_MEM_WATCH "Compile the translated-store trace into the guest code" OFF)
+if(JSRF_MEM_WATCH)
+    target_compile_definitions(jsrf_first_fault PRIVATE RECOMP_MEM_WATCH_RUNTIME)
+    message(STATUS "jsrf: translated-store trace COMPILED IN (RECOMP_MEM_WATCH is live)")
+endif()
+
 target_compile_definitions(jsrf_first_fault PRIVATE
     JSRF_BUILD_OPT="${JSRF_OPT_LEVEL}"
     JSRF_GEN_TRANSLATOR="${JSRF_GEN_TRANSLATOR}"
