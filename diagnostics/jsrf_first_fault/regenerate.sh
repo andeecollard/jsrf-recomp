@@ -14,7 +14,21 @@ PYTHON="${PYTHON:-python3}"
 RECOMP_SEED_INTERIOR="${RECOMP_SEED_INTERIOR:-1}"
 export RECOMP_SEED_INTERIOR
 
-XBE="../Jet Set Radio Future (US)/default.xbe"
+# The game dump cannot be vendored, so it lives outside the tree. The default
+# below is the old sibling layout and is nobody else's; every other script in
+# this directory already reads JSRF_GAME_DIR for the same reason. Honour it
+# here too rather than making a regeneration the one step that needs a
+# symlink.
+if [ -n "${JSRF_GAME_DIR:-}" ]; then
+    XBE="$JSRF_GAME_DIR/default.xbe"
+else
+    XBE="../Jet Set Radio Future (US)/default.xbe"
+fi
+[ -f "$XBE" ] || {
+    echo "no default.xbe at: $XBE" >&2
+    echo "set JSRF_GAME_DIR to the directory holding it" >&2
+    exit 1
+}
 OUT=build-macos/jsrf-first-fault
 ACCUM="$OUT/vtable_seeds_accum.json"
 

@@ -32,6 +32,7 @@ reaches a label it does not define is rejected rather than patched around.
 import argparse
 import bisect
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -58,8 +59,13 @@ def dangling_labels(code):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    # Same reasoning as regenerate.sh, which invokes this: the game dump is
+    # outside the tree and the sibling default is nobody else's layout.
+    # JSRF_GAME_DIR is what every other script in this directory already reads.
+    _game_dir = os.environ.get("JSRF_GAME_DIR")
     parser.add_argument("--xbe", type=Path,
-                        default=ROOT.parent / "Jet Set Radio Future (US)/default.xbe")
+                        default=(Path(_game_dir) / "default.xbe") if _game_dir
+                        else ROOT.parent / "Jet Set Radio Future (US)/default.xbe")
     parser.add_argument("--output", type=Path,
                         default=ROOT / "build-macos/jsrf-first-fault")
     parser.add_argument("--dry-run", action="store_true")

@@ -1133,10 +1133,22 @@ class FunctionTranslator:
         # `_fa`/`_fas` after their write, exactly as inc/dec have since the
         # ADX loop, so any function containing one needs the pair declared or
         # the emitted snapshot does not compile.
-        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr",
-                                 "cmpxchg", "lock cmpxchg")
-               or insn.mnemonic in _RESULT_ZF_SF_SETTERS
-               for insn in instructions):
+        # ONE DECISION, USED TWICE. The declaration is emitted here and the
+        # snapshot is emitted later by the lifter, so if the two ever disagree
+        # the generated C does not compile -- and they did: a mid-function
+        # entry recovered by recover_midfunction_entries.py is translated over
+        # a DIFFERENT instruction range than the owner this scan saw, so a
+        # function could contain an `add` the lifter snapshotted and this scan
+        # never looked at. 25 of 8,920 functions came out that way.
+        #
+        # So the predicate is computed once and handed to the lifter, which
+        # emits nothing when it is false. They cannot disagree now.
+        needs_snap = any(insn.mnemonic in ("cmp", "test", "bsf", "bsr",
+                                           "cmpxchg", "lock cmpxchg")
+                         or insn.mnemonic in _RESULT_ZF_SF_SETTERS
+                         for insn in instructions)
+        self.lifter.needs_result_snapshot = needs_snap
+        if needs_snap:
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
             lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")

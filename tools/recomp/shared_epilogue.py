@@ -76,6 +76,13 @@ def recover_shared_epilogue(translator, address, name):
     # A fresh lifter keeps this recovery from changing the last translated
     # function's flags, frame classification, or referenced-call collection.
     lifter = Lifter()
+    # A shared epilogue is pop/add-esp/ret and ends at the ret, so nothing in
+    # it ever reads the flags its arithmetic sets. It also writes its own
+    # prologue below rather than going through translate_function, so the
+    # _fa/_fas pair the result-setter snapshot needs is never declared here --
+    # emitting one produced C that did not compile, in 25 of 8,920 functions.
+    # Say so rather than declaring a pair nothing would read.
+    lifter.needs_result_snapshot = False
     lines = [f"/* Recovered shared epilogue at 0x{address:08X}: " +
              " ".join(insn.bytes_hex for insn in sequence) + " */",
              f"void {name}(void)", "{",
