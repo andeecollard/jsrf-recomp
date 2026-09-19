@@ -202,6 +202,13 @@ static int voice_ev_on(void)
 
 static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr);
 
+/* Defined beside the ADPCM extent probe; written by the two PIO methods that
+ * declare a voice's buffer, which are handled long before that point. */
+extern uint32_t g_voice_guest_ebo[MCPX_HW_MAX_VOICES];
+extern uint32_t g_voice_guest_ba[MCPX_HW_MAX_VOICES];
+extern uint32_t g_voice_guest_ebo_sets[MCPX_HW_MAX_VOICES];
+extern uint32_t g_voice_guest_ba_sets[MCPX_HW_MAX_VOICES];
+
 /* Everything voice_get_samples will consult, printed at VOICE_ON.
  *
  * Voice 70 -- the one the title uses to cover its music track change -- is
@@ -1989,10 +1996,13 @@ void mcpx_apu_voice_report(void)
                         : " (the table bound is holding)"));
     }
     fprintf(stderr, "  [APU-ADPCM] ok=%lu fail=%lu short=%lu oversize=%lu"
-            " silenced=%lu (adpcm_guard %s)\n",
+            " silenced=%lu (adpcm_guard %s, hw_header %s, %lu block(s)"
+            " accepted that the strict header test refuses)\n",
             g_apu_adpcm_ok, g_apu_adpcm_fail, g_apu_adpcm_short,
             g_apu_adpcm_oversize, g_apu_adpcm_silenced,
-            mcpx_apu_adpcm_guard() ? "on" : "OFF");
+            mcpx_apu_adpcm_guard() ? "on" : "OFF",
+            g_adpcm_hw_header ? "on" : "OFF",
+            g_adpcm_hw_header_accepted);
     {
         extern unsigned long g_adpcm_fail_ring, g_adpcm_fail_first, g_adpcm_fail_last, g_adpcm_fail_mid;
         extern uint16_t g_adpcm_fail_v[8]; extern uint8_t g_adpcm_fail_stream[8], g_adpcm_fail_ch[8];
@@ -2078,6 +2088,8 @@ void mcpx_apu_voice_report(void)
             }
         }
     }
+    { extern void mcpx_apu_adpcm_extent_report(void);
+      mcpx_apu_adpcm_extent_report(); }
     {
         /* THE SCORING LINE FOR "DO SOUND EFFECTS START", WITH ITS CONTROL ON
          * THE SAME LINE.
@@ -3043,6 +3055,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
+        if (d->regs[NV_PAPU_FECV] < MCPX_HW_MAX_VOICES) {
+            g_voice_guest_ba[d->regs[NV_PAPU_FECV]] =
+                argument & NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE_OFFSET;
+            ++g_voice_guest_ba_sets[d->regs[NV_PAPU_FECV]];
+        }
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_CUR_PSL_START,
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
@@ -3058,6 +3075,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
+        if (d->regs[NV_PAPU_FECV] < MCPX_HW_MAX_VOICES) {
+            g_voice_guest_ebo[d->regs[NV_PAPU_FECV]] =
+                argument & NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO_OFFSET;
+            ++g_voice_guest_ebo_sets[d->regs[NV_PAPU_FECV]];
+        }
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
@@ -3733,6 +3755,338 @@ unsigned long g_apu_adpcm_short;
 unsigned long g_apu_adpcm_oversize;
 unsigned long g_apu_adpcm_silenced;
 
+/* WHERE THE DATA ACTUALLY IS. RECOMP_APU_ADPCM_EXTENT=1, default OFF.
+ *
+ * The two theories left standing produce the SAME signature -- failures
+ * beginning exactly 11 blocks before the end of every buffer, whatever its
+ * length and whatever its block size -- and the discriminator this file
+ * already carries cannot separate them, because it tried to read the answer
+ * out of `ba / block_size` and `ba` is an absolute offset in the voice's
+ * scatter-gather space, not an error term. Both readings it predicted are
+ * refuted (5389 and 1051, against 11 and 0).
+ *
+ *   the BASE is 11 blocks too high    -> the audio starts at ba - 11*bs, so
+ *                                        blocks -1 .. -11 hold real ADPCM
+ *   the BUFFER is 11 blocks shorter   -> nothing decodable below block 0, and
+ *                                        the tail is simply never written
+ *
+ * They differ in ONE observable and it costs a read: what is immediately
+ * BELOW the base. So walk the buffer with the model's own translation and ask
+ * each block whether adpcm_decode_block would accept it -- reserved byte zero
+ * and step index 0..88, which is the decoder's exact refusal test and nothing
+ * more. Random bytes pass that with probability about 1/300 per channel, so a
+ * run of eleven consecutive passes below the base is not chance.
+ *
+ * WHAT IT IS NOT. It is not a fix and it does not touch the fetch: the scan
+ * recomputes addresses beside the real one, reads through ldl_le_phys, and
+ * writes only its own record. It runs ONCE per voice, on that voice's first
+ * refusal, so its cost is a few hundred loads a session.
+ *
+ * It does add to g_apu_sge_calls, because it translates through get_data_ptr
+ * on purpose -- a scan that used a different translation would be measuring a
+ * different bug. Leave it off when reading [APU-SGE].
+ *
+ * The 0x08 run is recorded because every failure on record carries the header
+ * 0x08080808, and "the tail is fill" is only established if the fill is
+ * actually there and actually stops somewhere. */
+#define ADPCM_EXTENT_SLOTS   8
+#define ADPCM_EXTENT_BELOW   40   /* blocks probed below the base */
+#define ADPCM_EXTENT_ABOVE   40   /* blocks probed past the nominal end */
+
+typedef struct {
+    uint16_t v;
+    uint8_t  used, stream, channels;
+    uint32_t bs, ba, ebo, nblocks, first_fail;
+    uint32_t seg;                 /* segment_offset, stream voices only */
+    uint32_t good_below;          /* consecutive decodable blocks below base */
+    uint32_t good_in_buf, bad_in_buf;
+    uint32_t bad_run;             /* consecutive bad blocks from first_fail */
+    uint32_t fill_run;            /* ...of which are all-0x08 */
+    uint32_t good_above;          /* decodable blocks in [nblocks, +ABOVE) */
+    uint32_t hdr_below1, hdr_last_good, hdr_first_bad, hdr_end;
+    /* Byte-exact, relative to ba, because block granularity cannot say
+     * whether the written data ends ON a block boundary. If it does not, the
+     * producer is not counting in blocks and neither should the theory. */
+    int64_t  fill_begin, fill_end;
+    uint32_t before[4];           /* the four dwords immediately below ba */
+    /* What the GUEST declared, as opposed to what we read back out of the
+     * voice register file. */
+    uint32_t guest_ebo, guest_ba;
+    uint32_t guest_ebo_sets, guest_ba_sets;
+    /* NOT YET EXERCISED BY A RUN -- added with the rest of the record but
+     * after the only session that had a scene with ADPCM in it, so nothing
+     * has printed these. They are here because the one thing the measurement
+     * could not settle is why the declared buffer is ELEVEN blocks longer
+     * than the audio, and a loop that wraps somewhere other than ebo would
+     * answer it: lbo == first_fail * ADPCM_SAMPLES_PER_BLOCK would mean the
+     * data end is in LBO and this model is wrapping on the wrong field. */
+    uint32_t lbo, cbo_at_fail;
+    uint8_t  loop, persist, spb;
+} AdpcmExtent;
+
+/* THE GUEST'S OWN DECLARATION, RECORDED WHERE IT ARRIVES.
+ *
+ * ebo and ba are read back out of the voice register file, which lives in
+ * guest RAM -- so a read-back cannot distinguish "the guest set this for this
+ * buffer" from "this is left over from the last thing that used this voice".
+ * The PIO methods can: NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE and
+ * ..._BUF_EBO are the only two ways either value is supposed to arrive.
+ *
+ * A set count of ZERO on a voice that is decoding is the interesting reading,
+ * and it is the one a read-back can never produce: it would mean the length
+ * the fetch is using was never declared for this buffer at all. Which is why
+ * the counts are printed beside the values and not instead of them.
+ *
+ * Two stores on a path that already does a masked read-modify-write into
+ * guest RAM, so unconditional -- the same standing as g_apu_adpcm_ok. Only
+ * the printing is behind the switch. */
+uint32_t g_voice_guest_ebo[MCPX_HW_MAX_VOICES];
+uint32_t g_voice_guest_ba[MCPX_HW_MAX_VOICES];
+uint32_t g_voice_guest_ebo_sets[MCPX_HW_MAX_VOICES];
+uint32_t g_voice_guest_ba_sets[MCPX_HW_MAX_VOICES];
+
+static AdpcmExtent g_adpcm_extent[ADPCM_EXTENT_SLOTS];
+static unsigned g_adpcm_extent_n;
+unsigned long g_adpcm_extent_scans;
+
+static int adpcm_extent_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_ADPCM_EXTENT");
+    return on;
+}
+
+/* See the note over adpcm_decode_block in apu_state.h. Set once per voice
+ * from the frame thread, read by the decoder, so the pure function stays
+ * getenv-free. */
+int g_adpcm_hw_header;
+unsigned long g_adpcm_hw_header_accepted;
+
+static int adpcm_hw_header_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_ADPCM_HW_HEADER");
+    return on;
+}
+
+/* adpcm_decode_block's refusal test, and only that: it returns 0 when the
+ * fourth header byte of any channel is non-zero or its step index is outside
+ * 0..88. Anything this accepts, the decoder accepts. */
+static int adpcm_hdr_ok(hwaddr addr, unsigned channels)
+{
+    unsigned ch;
+    for (ch = 0; ch < channels; ++ch) {
+        uint32_t w = (uint32_t)ldl_le_phys(address_space_memory,
+                                           addr + (hwaddr)ch * 4);
+        if ((w >> 24) != 0) return 0;
+        if (((w >> 16) & 0xFF) > 88) return 0;
+    }
+    return 1;
+}
+
+static int adpcm_all_08(hwaddr addr, unsigned channels)
+{
+    unsigned ch;
+    for (ch = 0; ch < channels; ++ch)
+        if (ldl_le_phys(address_space_memory, addr + (hwaddr)ch * 4)
+                != 0x08080808u)
+            return 0;
+    return 1;
+}
+
+/* The address the fetch would use for block k, with k allowed to go negative
+ * so the region below the base can be probed. Deliberately the same
+ * translation the fetch uses. */
+static hwaddr adpcm_block_addr(MCPXAPUState *d, int stream, hwaddr seg,
+                               uint32_t ba, size_t bs, int32_t k)
+{
+    int64_t lin = (int64_t)k * (int64_t)bs;
+    if (stream) return (hwaddr)((int64_t)seg + lin);
+    lin += (int64_t)ba;
+    if (lin < 0) return 0;
+    return get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFFu,
+                        (uint32_t)lin);
+}
+
+static void adpcm_extent_scan(MCPXAPUState *d, uint32_t v, int stream,
+                              unsigned channels, size_t bs, uint32_t ba,
+                              uint32_t ebo, hwaddr seg, uint32_t nblocks,
+                              uint32_t first_fail, uint32_t lbo, uint32_t cbo,
+                              int loop, int persist, unsigned spb)
+{
+    AdpcmExtent *e;
+    int32_t k;
+    hwaddr a;
+
+    if (!adpcm_extent_on()) return;
+    if (g_adpcm_extent_n >= ADPCM_EXTENT_SLOTS) return;
+    for (unsigned i = 0; i < g_adpcm_extent_n; ++i)
+        if (g_adpcm_extent[i].v == (uint16_t)v) return;   /* once per voice */
+
+    e = &g_adpcm_extent[g_adpcm_extent_n++];
+    e->v = (uint16_t)v;
+    e->used = 1;
+    e->stream = (uint8_t)(stream ? 1 : 0);
+    e->channels = (uint8_t)channels;
+    e->bs = (uint32_t)bs;
+    e->ba = ba;
+    e->ebo = ebo;
+    e->seg = (uint32_t)seg;
+    e->nblocks = nblocks;
+    e->first_fail = first_fail;
+    e->lbo = lbo;
+    e->cbo_at_fail = cbo;
+    e->loop = (uint8_t)(loop ? 1 : 0);
+    e->persist = (uint8_t)(persist ? 1 : 0);
+    e->spb = (uint8_t)spb;
+    if (v < MCPX_HW_MAX_VOICES) {
+        e->guest_ebo = g_voice_guest_ebo[v];
+        e->guest_ba = g_voice_guest_ba[v];
+        e->guest_ebo_sets = g_voice_guest_ebo_sets[v];
+        e->guest_ba_sets = g_voice_guest_ba_sets[v];
+    }
+    ++g_adpcm_extent_scans;
+
+    /* Below the base. THE discriminator: real ADPCM here means the buffer
+     * starts lower than ba says. */
+    for (k = -1; k >= -(int32_t)ADPCM_EXTENT_BELOW; --k) {
+        if (!stream && (int64_t)ba + (int64_t)k * (int64_t)bs < 0) break;
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (!adpcm_hdr_ok(a, channels)) break;
+        ++e->good_below;
+    }
+    a = adpcm_block_addr(d, stream, seg, ba, bs, -1);
+    e->hdr_below1 = (uint32_t)ldl_le_phys(address_space_memory, a);
+
+    /* Inside the buffer, as the model believes it to be. */
+    for (k = 0; k < (int32_t)nblocks && k < (int32_t)(nblocks + 1); ++k) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (adpcm_hdr_ok(a, channels)) ++e->good_in_buf;
+        else ++e->bad_in_buf;
+    }
+    if (first_fail > 0) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs,
+                             (int32_t)first_fail - 1);
+        e->hdr_last_good = (uint32_t)ldl_le_phys(address_space_memory, a);
+    }
+    a = adpcm_block_addr(d, stream, seg, ba, bs, (int32_t)first_fail);
+    e->hdr_first_bad = (uint32_t)ldl_le_phys(address_space_memory, a);
+    a = adpcm_block_addr(d, stream, seg, ba, bs, (int32_t)nblocks);
+    e->hdr_end = (uint32_t)ldl_le_phys(address_space_memory, a);
+
+    /* How far the refusal runs, and how much of it is the 0x08 fill. */
+    for (k = (int32_t)first_fail;
+         k < (int32_t)(nblocks + ADPCM_EXTENT_ABOVE); ++k) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (adpcm_hdr_ok(a, channels)) break;
+        ++e->bad_run;
+        if (adpcm_all_08(a, channels)) ++e->fill_run;
+    }
+    for (k = (int32_t)nblocks;
+         k < (int32_t)(nblocks + ADPCM_EXTENT_ABOVE); ++k) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (adpcm_hdr_ok(a, channels)) ++e->good_above;
+    }
+
+    /* THE FILL, TO THE BYTE. A dword at a time through the same translation,
+     * from four blocks before the first refusal to ADPCM_EXTENT_ABOVE blocks
+     * past the nominal end. Both offsets are relative to ba, so fill_begin is
+     * literally "how many bytes of this buffer were written". */
+    e->fill_begin = -1;
+    e->fill_end = -1;
+    {
+        int64_t lo = ((int64_t)first_fail - 4) * (int64_t)bs;
+        int64_t hi = ((int64_t)nblocks + ADPCM_EXTENT_ABOVE) * (int64_t)bs;
+        int64_t off;
+        if (lo < 0) lo = 0;
+        for (off = lo; off + 4 <= hi; off += 4) {
+            hwaddr w = stream ? (hwaddr)((int64_t)seg + off)
+                              : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                             0xFFFFFFFFu,
+                                             (uint32_t)((int64_t)ba + off));
+            uint32_t v32 = (uint32_t)ldl_le_phys(address_space_memory, w);
+            if (e->fill_begin < 0) {
+                if (v32 == 0x08080808u) e->fill_begin = off;
+            } else if (v32 != 0x08080808u) {
+                e->fill_end = off;
+                break;
+            }
+        }
+    }
+    for (k = 0; k < 4; ++k) {
+        int64_t off = -(int64_t)(4 - k) * 4;
+        hwaddr w;
+        if (!stream && (int64_t)ba + off < 0) { e->before[k] = 0; continue; }
+        w = stream ? (hwaddr)((int64_t)seg + off)
+                   : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFFu,
+                                  (uint32_t)((int64_t)ba + off));
+        e->before[k] = (uint32_t)ldl_le_phys(address_space_memory, w);
+    }
+}
+
+void mcpx_apu_adpcm_extent_report(void)
+{
+    unsigned i;
+
+    if (!adpcm_extent_on()) return;
+    fprintf(stderr, "  [APU-ADPCM-EXTENT] %u voice(s) scanned%s\n",
+            g_adpcm_extent_n,
+            g_adpcm_extent_n ? "" : "  <- NOTHING SCANNED: no ADPCM voice"
+                                    " refused a block, so this says nothing");
+    for (i = 0; i < g_adpcm_extent_n; ++i) {
+        const AdpcmExtent *e = &g_adpcm_extent[i];
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]   v%u%s%s bs=%u ba=%u ebo=%u"
+                " nblocks=%u first_fail=%u gap=%d\n",
+                e->v, e->stream ? " S" : "", e->channels == 2 ? " st" : "",
+                e->bs, e->ba, e->ebo, e->nblocks, e->first_fail,
+                (int)e->nblocks - (int)e->first_fail);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     below base: %u decodable"
+                " block(s) (>=11 means THE BASE IS TOO HIGH; 0 means the"
+                " buffer is genuinely short), hdr[-1]=%08X\n",
+                e->good_below, e->hdr_below1);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     in buffer: %u good %u bad"
+                " | refusal runs %u block(s), %u of them all-0x08"
+                " | %u decodable past the end\n",
+                e->good_in_buf, e->bad_in_buf, e->bad_run, e->fill_run,
+                e->good_above);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     hdr last_good=%08X"
+                " first_bad=%08X at_nblocks=%08X | before ba:"
+                " %08X %08X %08X %08X\n",
+                e->hdr_last_good, e->hdr_first_bad, e->hdr_end,
+                e->before[0], e->before[1], e->before[2], e->before[3]);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     the 0x08 fill runs"
+                " [%lld,%lld) bytes from ba; the buffer is %u bytes and"
+                " %u block(s) of it were written%s\n",
+                (long long)e->fill_begin, (long long)e->fill_end,
+                e->nblocks * e->bs,
+                e->bs ? (unsigned)(e->fill_begin > 0
+                                   ? e->fill_begin / e->bs : 0) : 0,
+                (e->fill_begin >= 0 && e->bs
+                 && (uint32_t)e->fill_begin % e->bs)
+                    ? "  <- NOT on a block boundary" : "");
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     the guest DECLARED"
+                " ebo=%u (%u set%s) ba=%u (%u set%s)%s%s\n",
+                e->guest_ebo, e->guest_ebo_sets,
+                e->guest_ebo_sets == 1 ? "" : "s",
+                e->guest_ba, e->guest_ba_sets,
+                e->guest_ba_sets == 1 ? "" : "s",
+                e->guest_ebo_sets == 0
+                    ? "  <- EBO WAS NEVER DECLARED FOR THIS VOICE: the length"
+                      " the fetch used is left over in the voice register file"
+                    : "",
+                (e->guest_ebo_sets && e->guest_ebo != e->ebo)
+                    ? "  <- and it is NOT what the fetch read back" : "");
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     loop=%u persist=%u spb=%u"
+                " lbo=%u cbo=%u%s\n",
+                e->loop, e->persist, e->spb, e->lbo, e->cbo_at_fail,
+                (e->lbo && e->lbo == e->first_fail * ADPCM_SAMPLES_PER_BLOCK)
+                    ? "  <- LBO IS THE DATA END: the wrap point is in LBO and"
+                      " this model wraps on EBO"
+                    : "");
+    }
+    fflush(stderr);
+}
+
 /* OFF by default. RECOMP_APU_ADPCM_GUARD=1 substitutes silence for the
  * uninitialised tail of a refused or short block. Off, the default path is
  * byte-identical to what it was, so the counters above measure the bug rather
@@ -3932,6 +4286,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     if (adpcm) {
         block_size = 36;
+        /* Cached accessor; this is the frame thread, not the trap handler. */
+        g_adpcm_hw_header = adpcm_hw_header_on();
     } else {
         block_size = container_size;
     }
@@ -4019,6 +4375,14 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                 g_adpcm_first_fail_blk[v] = block_index;
                                 g_adpcm_fail_nblocks_v[v] = nblocks;
                             }
+                            /* Once per voice, on its first refusal, and only
+                             * with RECOMP_APU_ADPCM_EXTENT set. */
+                            adpcm_extent_scan(d, v, stream ? 1 : 0, channels,
+                                              block_size, ba, ebo,
+                                              segment_offset, nblocks,
+                                              block_index, lbo, cbo,
+                                              loop, persist,
+                                              samples_per_block);
                         }
                         g_adpcm_fail_ring++;
                         if (block_index == 0) g_adpcm_fail_first++;

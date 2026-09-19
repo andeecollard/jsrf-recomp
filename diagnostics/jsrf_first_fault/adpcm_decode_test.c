@@ -113,6 +113,51 @@ int main(void)
                        "decoder assumes", n);
     }
 
+    /* RECOMP_APU_ADPCM_HW_HEADER: the reserved byte is not a hardware check.
+     *
+     * Every case above is the default path and must stay exactly as it is --
+     * the switch is off by default and this proves it. What follows is the
+     * other arm, and it is tested here because the title run that would show
+     * `fail` going to zero has not been taken: the decoder half can at least
+     * be settled without one.
+     *
+     * The value 2055 is not a magic number. It is what 36 bytes of 0x08 --
+     * the pad every ADPCM buffer in this title ends in, measured to the byte
+     * by RECOMP_APU_ADPCM_EXTENT -- decodes to once the refusal is lifted:
+     * predictor 0x0808, step index 8, then nibbles that walk the index down
+     * to 0 where the delta becomes zero and the value holds. 6.27% of full
+     * scale, flat. That is what the hardware plays where this model
+     * currently plays silence, and it is the reason the switch ships off:
+     * substituting a DC step for silence is audible and needs a listen. */
+    g_adpcm_hw_header = 1;
+    g_adpcm_hw_header_accepted = 0;
+    memset(out, 0x5A, sizeof out);
+    memset(blk, 0x08, sizeof blk);
+    n = adpcm_decode_block(out, blk, sizeof blk, 1);
+    CHECK(n == 65, "with hw_header on, the 0x08 pad block decoded %d frames, "
+                   "expected 65 -- the whole point of the switch is that this "
+                   "block stops being refused", n);
+    CHECK(g_adpcm_hw_header_accepted == 1,
+          "the counter that makes the switch visible in a report read %lu, "
+          "expected 1", g_adpcm_hw_header_accepted);
+    CHECK(out[0] == 2056 && out[64] == 2055,
+          "the pad decoded to out[0]=%d out[64]=%d, expected 2056 then a flat "
+          "2055: if this moved, the 6.27%%-of-full-scale figure in the notes "
+          "is stale", out[0], out[64]);
+
+    /* AND THE INDEX BOUND IS STILL A BOUND. step_table has 89 entries, so the
+     * lenient path must CLAMP rather than pass 89 through -- otherwise this
+     * switch turns a refusal into an out-of-bounds read. */
+    build_block(blk, 0, 200, 0x00, 0x00);
+    n = adpcm_decode_block(out, blk, sizeof blk, 1);
+    CHECK(n == 65, "with hw_header on, an out-of-range step index was still "
+                   "refused (%d frames); it is supposed to be clamped", n);
+    g_adpcm_hw_header = 0;
+    build_block(blk, 0, 200, 0x00, 0x00);
+    n = adpcm_decode_block(out, blk, sizeof blk, 1);
+    CHECK(n == 0, "with hw_header back OFF, an out-of-range step index was "
+                  "accepted -- the default path must be unchanged");
+
     if (failures) {
         fprintf(stderr, "%d ADPCM decoder check(s) failed\n", failures);
         return 1;
@@ -120,6 +165,7 @@ int main(void)
     puts("ADPCM decoder: refuses a non-zero fourth header byte (the 08080808 "
          "the logs report), refuses an out-of-range step index, accepts index "
          "88, and writes its first sample before refusing -- which is why the "
-         "guard is not redundant");
+         "guard is not redundant. With RECOMP_APU_ADPCM_HW_HEADER the pad "
+         "decodes to a flat 2055 instead, and the index bound still clamps");
     return 0;
 }
