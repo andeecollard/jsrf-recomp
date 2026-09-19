@@ -127,6 +127,12 @@ VALUE_CARRYING = {
     # recomp_switch_on.)
     "RECOMP_METAL_RING_SLABS",
     "RECOMP_METAL_RING_SLAB_KB",
+    # Where a pad recording is written. It has to be a path and it has to
+    # default to an absolute one: a GUI-launched .app has no writable working
+    # directory, and the player's own session is precisely the run worth
+    # recording. The boolean that turns recording on, RECOMP_PAD_RECORD, goes
+    # through the helper like anything else.
+    "RECOMP_PAD_RECORD_PATH",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

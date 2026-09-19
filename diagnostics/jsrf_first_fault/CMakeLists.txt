@@ -314,6 +314,22 @@ if(NOT WIN32)
     add_executable(jsrf_input_release_test input_release_test.c)
     target_link_libraries(jsrf_input_release_test PRIVATE xbox_input)
     add_test(NAME jsrf_input_release COMMAND jsrf_input_release_test)
+
+    # The record -> replay round trip, at the format level.
+    #
+    # Until somebody plays a session there is no run behind any claim about
+    # the recorder, so this is the whole of the evidence: it drives the frame
+    # explicitly, records a 5,000-frame session with 0-3 polls per frame,
+    # replays it and compares every frame; then checks that a recording taken
+    # against another build is REFUSED, that cutting one event out of the
+    # middle is CAUGHT by the checkpoints, and that a scene that has slid
+    # relative to the frames is reported as a state misalignment rather than
+    # as an input divergence. What it cannot cover is whether the guest's
+    # frame counter advances in a live run; see the note at the foot of the
+    # test.
+    add_executable(jsrf_pad_record_test pad_record_test.c)
+    target_link_libraries(jsrf_pad_record_test PRIVATE xbox_input)
+    add_test(NAME jsrf_pad_record COMMAND jsrf_pad_record_test)
 endif()
 
 add_executable(jsrf_first_fault
