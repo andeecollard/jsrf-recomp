@@ -80,14 +80,56 @@ adoption plan's item 5, *"Keep the sweep in phase at source"*, is still
 It grades the detector on a title Microsoft named, not on JSRF — Microsoft
 never BC'd JSRF — but the detector is what carries over.
 
+## CORRECTION: the oracle cannot be run, and I said it could
+
+An earlier revision of this note said "run the coverage oracle on Blinx —
+version-independent, no new input". **The first half is true and the second is
+wrong.** Tried, 19 Sep:
+
+`coverage_oracle.py` takes `<module.dll> <our_functions.json>`, and that second
+argument is *our* function detection **for the donor title**. Producing it
+means disassembling Blinx's own `default.xbe`, and we do not have it:
+
+- the BC package ships the **recompiled 360 module** plus its symbol table,
+  not the original Xbox executable;
+- the original game is in `Content/Game/DefaultPackage`, an Xbox 360 **STFS
+  package** (`PIRS` magic) spanning 11 chunks and 1.6 GB;
+- `default.xbe` appears there **by name**, so the guest filesystem is inside —
+  but there is no `XBEH` magic anywhere in the chunks, so the image is stored
+  compressed or nested rather than plainly.
+
+So the oracle is blocked on an STFS extractor, which is a documented format and
+a bounded job, but a job — not "no new input". The Fusion side is fine and was
+verified: the module parses, build `20F912`, 1,786 symbols.
+
 ## What to do, cheapest first
 
-1. **Run the coverage oracle on Blinx**, against our `functions.json` for it.
-   Version-independent, no new input, and it puts a number on the detector.
-2. **Mine `CMcpx` from the Blinx donor** with the same size-sequence alignment
-   that produced the DSOUND names. 142 names into the subsystem with the two
-   open audio defects.
-3. **Then `D3DX`/`XG*`**, for G2 and G3.
+1. **Mine `CMcpx` from the Blinx donor.** This is the one that is genuinely
+   unblocked: the size-sequence alignment that produced the 165 DSOUND names
+   works from the donor's *symbol table* and our own detected function sizes,
+   and needs no donor XBE. 142 names into the subsystem holding both open
+   audio defects.
+2. **Then `D3DX`/`XG*`**, 611 names, for G2 and G3.
+3. **The oracle, after an STFS extractor** — worth it, but price it as its own
+   piece of work.
+
+## A tension in the tree worth settling
+
+`CLAUDE.md` says a byte signature "only transfers where the same XDK build
+emitted the same code", and treats Blinx being months off 4134 as close to
+fatal. `tools/symbols/map_names.py`'s own docstring records the opposite,
+measured:
+
+> Donors do NOT have to share the target's XDK version. Measured: ATV3 (XDK
+> 5849) named 504 functions in Burnout 3 (also 5849), and Starcraft Ghost (XDK
+> 5659) named 657 in the same binary at the same precision. Where both named
+> the same address they agreed 99.1% of the time.
+
+A 190-build gap, 99.1% agreement. If that generalises, the version pessimism is
+overstated and the byte-signature path is worth more than CLAUDE.md implies —
+though it still needs donor *bytes*, which is the same STFS blocker.
+
+Not resolved here. Whichever is right, it should be written down once.
 
 ## What this does not claim
 
