@@ -82,7 +82,7 @@ static inline unsigned long long mtl_now_ns(void)
  * first turns that deadlock into an ordinary wait. */
 /* Full clears that dropped the surface instead of syncing it. Each one is
  * a GPU drain and a 4.9 MB readback that did not happen. */
-static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend;
+static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend, hw_fs_early;
 static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
@@ -775,6 +775,36 @@ static NSString *const shader =
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
  " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
+/* THE SAME FUNCTION WITH THE DEPTH TEST IN FRONT OF IT.
+  *
+  * WHY THERE HAS TO BE A SECOND ONE. fs_hw_blend can call discard_fragment(),
+  * for the guest's z-range CULL policy and for the alpha test, and a fragment
+  * function that may discard forces Metal to run the shader BEFORE the depth
+  * test -- otherwise the depth write would already have happened for a
+  * fragment the shader then throws away. So every occluded fragment in the
+  * scene pays the whole combiner chain and up to four texture samples first,
+  * and those samples are not hardware samples: sample_lod walks a software
+  * Morton address, decodes DXT1/DXT3 by hand and does its own bilinear, four
+  * texel fetches at a time, out of a `device uchar*`. Losing early-Z in front
+  * of that is the expensive kind of losing it.
+  *
+  * A draw with s.alpha_test == 0 and s.z_cull == 0 cannot reach either
+  * discard, so for that draw the two orderings are indistinguishable and
+  * [[early_fragment_tests]] is exact rather than approximate. This is that
+  * draw's entry point, with both dead branches removed so the attribute is
+  * not merely ignored. Everything else -- shade(), the blend, the dither --
+  * is the same text.
+  *
+  * The COLOUR read stays. It is raster_order_group(0) and it is what shader
+  * blend mode 3 exists for; dropping it here would reintroduce the corruption
+  * that mode measured, and early-Z is orthogonal to it. */
+ "[[early_fragment_tests]] fragment float4 fs_hw_early(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3);"
+ " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
+ " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
+ " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
+ " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
@@ -1100,6 +1130,7 @@ static int initialize(void)
          * per distinct blend state rather than once here. */
         hw_vs=[library newFunctionWithName:@"vs"];hw_fs=[library newFunctionWithName:@"fs_hw"];
         hw_fs_blend=[library newFunctionWithName:@"fs_hw_blend"];
+        hw_fs_early=[library newFunctionWithName:@"fs_hw_early"];
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
         pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -1519,6 +1550,55 @@ static int hw_shader_blend_mode_env(void)
     return on;
 }
 
+/* THE TWO DIAGNOSTIC SWITCHES THAT DECIDE WHETHER THE SHADER CAN DISCARD.
+ *
+ * Both were read inline, at the one place that builds Params, with a local
+ * static each. The pipeline key now has to ask the same two questions -- the
+ * early-Z variant is only sound for a draw that cannot reach a discard -- and
+ * two copies of "what does this switch mean" is exactly how a pipeline ends
+ * up selected for state the shader was not given. One reader each, both
+ * callers. */
+static int no_alpha_test_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_NO_ALPHA_TEST");
+  return on; }
+static int legacy_zclamp_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
+  return on; }
+
+/* RECOMP_METAL_EARLY_Z -- put the depth test in front of the shader for the
+ * draws where that is exact.
+ *
+ * A fragment function that may call discard_fragment() cannot have its depth
+ * test run first: the write would already have happened for a fragment the
+ * shader then throws away. Metal therefore runs the whole shader for every
+ * occluded fragment, and on this backend the whole shader is the register
+ * combiner chain plus up to four SOFTWARE texture samples -- Morton address
+ * arithmetic, hand-decoded DXT, hand-written bilinear, four `device uchar*`
+ * fetches per sample. That is a great deal to spend on a fragment the depth
+ * buffer was going to reject.
+ *
+ * fs_hw_blend discards for exactly two reasons, the guest's z-range CULL
+ * policy and the alpha test, and both are Params fields. A draw with neither
+ * cannot discard, so for that draw early and late tests are
+ * indistinguishable and fs_hw_early is not an approximation. The predicate
+ * has to mirror the Params build exactly, including the two diagnostic
+ * switches that force either field to zero -- hence the readers above.
+ *
+ * Off by default until a scene-matched A/B has scored it: a pipeline variant
+ * doubles the key space, and the number to watch beside any frame-time change
+ * is refusals staying at 0. */
+static int early_z_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_EARLY_Z");
+  return on; }
+static uint64_t g_early_z_draws, g_late_z_draws;
+static int hw_early_z(const NV2ATextureCopy *s)
+{
+    if (!early_z_on()) return 0;
+    if (s->alpha_test && !no_alpha_test_on()) return 0;
+    if (s->z_cull && !legacy_zclamp_on()) return 0;
+    return 1;
+}
+
 static int hw_shader_blend(const NV2ATextureCopy *s)
 {
     return hw_shader_blend_mode(hw_shader_blend_mode_env(), s->blend, s->dither);
@@ -1537,7 +1617,7 @@ int nv2a_metal_shader_blend_on(void)
  * enabled and fs_hw, one with it disabled and fs_hw_blend. Keying on blend
  * alone would hand the second draw the first one's pipeline and blend twice,
  * or not at all. */
-static struct { uint32_t blend,src,dst,sblend; id<MTLRenderPipelineState> pso; }
+static struct { uint32_t blend,src,dst,sblend,early; id<MTLRenderPipelineState> pso; }
     hw_pso[HW_CACHE];
 static unsigned hw_pso_n;
 
@@ -1551,7 +1631,7 @@ static unsigned hw_pso_n;
  * a handful of blend states, and a refusal is a counted CPU draw rather than a
  * stall, so a generous fixed size costs pointers and nothing else. */
 #define VSH_PSO_CACHE 256
-static struct { const void *fn; uint32_t blend,src,dst,sblend;
+static struct { const void *fn; uint32_t blend,src,dst,sblend,early;
                 id<MTLRenderPipelineState> pso; } vsh_pso[VSH_PSO_CACHE];
 static unsigned vsh_pso_n;
 static uint64_t g_vsh_pso_full;
@@ -1560,11 +1640,17 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
                                                    VshSlot *prog)
 {
     uint32_t sblend = (uint32_t)hw_shader_blend(s);
+    /* The variant is part of the key, not a property of the draw: two draws
+     * with identical blend state and different discard state need different
+     * pipelines, and a key that cannot tell them apart would hand an
+     * alpha-tested draw the function whose depth write has already happened. */
+    uint32_t early = (uint32_t)(sblend && hw_early_z(s));
     unsigned i;
     for (i = 0; i < vsh_pso_n; ++i)
         if (vsh_pso[i].fn == (__bridge const void *)prog->fn
             && vsh_pso[i].blend == s->blend && vsh_pso[i].src == s->blend_src
-            && vsh_pso[i].dst == s->blend_dst && vsh_pso[i].sblend == sblend)
+            && vsh_pso[i].dst == s->blend_dst && vsh_pso[i].sblend == sblend
+            && vsh_pso[i].early == early)
             return vsh_pso[i].pso;
     if (vsh_pso_n >= VSH_PSO_CACHE) { ++g_vsh_pso_full; return nil; }
     {
@@ -1586,7 +1672,8 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
          * position rather than by name. Taking both halves from one library is
          * what makes the repacking wrapper sound. */
         d.fragmentFunction = [prog->library newFunctionWithName:
-                                sblend ? @"fs_hw_blend" : @"fs_hw"];
+                                early  ? @"fs_hw_early"
+                              : sblend ? @"fs_hw_blend" : @"fs_hw"];
         if (!d.fragmentFunction) return nil;
         d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
                                                         : MTLPixelFormatRGBA32Float;
@@ -1606,6 +1693,7 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
         vsh_pso[vsh_pso_n].fn = (__bridge const void *)prog->fn;
         vsh_pso[vsh_pso_n].blend = s->blend; vsh_pso[vsh_pso_n].src = s->blend_src;
         vsh_pso[vsh_pso_n].dst = s->blend_dst; vsh_pso[vsh_pso_n].sblend = sblend;
+        vsh_pso[vsh_pso_n].early = early;
         vsh_pso[vsh_pso_n].pso = pso; ++vsh_pso_n;
         return pso;
     }
@@ -1615,9 +1703,11 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
 {
     unsigned i;
     uint32_t sblend = (uint32_t)hw_shader_blend(s);
+    uint32_t early = (uint32_t)(sblend && hw_early_z(s));
     for (i = 0; i < hw_pso_n; ++i)
         if (hw_pso[i].blend == s->blend && hw_pso[i].src == s->blend_src
-            && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend)
+            && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend
+            && hw_pso[i].early == early)
             return hw_pso[i].pso;
     if (hw_pso_n >= HW_CACHE) { ++g_hw_state_refusals; return nil; }
 
@@ -1654,8 +1744,8 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = hw_vs;
-    d.fragmentFunction = sblend ? hw_fs_blend : hw_fs;
-    if (sblend && !hw_fs_blend) { ++g_hw_state_refusals; return nil; }
+    d.fragmentFunction = early ? hw_fs_early : sblend ? hw_fs_blend : hw_fs;
+    if (!d.fragmentFunction) { ++g_hw_state_refusals; return nil; }
     /* STILL RGBA32Float, AND THE REASON RECORDED HERE BEFORE WAS WRONG.
      *
      * That comment said the software rasteriser prefers float because float
@@ -1725,6 +1815,7 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     ++g_hw_pipeline_misses;
     hw_pso[hw_pso_n].blend = s->blend; hw_pso[hw_pso_n].src = s->blend_src;
     hw_pso[hw_pso_n].dst = s->blend_dst; hw_pso[hw_pso_n].sblend = sblend;
+    hw_pso[hw_pso_n].early = early;
     hw_pso[hw_pso_n].pso = pso;
     ++hw_pso_n;
     return pso;
@@ -2660,6 +2751,16 @@ void nv2a_metal_report(void)
      * a switch that does. gpu draws moving while vertices stays at zero would
      * mean the counter is on the wrong side of the branch, which is why both
      * are printed. */
+    /* BOTH ARMS NAME THEMSELVES. With the switch off every draw is counted
+     * late, which is the control that says this counter is on the draw path
+     * at all; with it on, the split is how much of the scene can take the
+     * variant, and that bound is a property of the title rather than of the
+     * change. */
+    fprintf(stderr,"[METAL] depth test before the shader: %llu draws early,"
+            " %llu late (early_z %s)\n",
+            (unsigned long long)g_early_z_draws,
+            (unsigned long long)g_late_z_draws,
+            early_z_on()?"on":"OFF");
     fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
             vsh_gpu_on()?"guest programs on the GPU":"CPU interpreter",
             vsh_gpu_on()?"on":"OFF");
@@ -4354,9 +4455,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  {static int noat=-1;if(noat<0)noat=recomp_switch_on("RECOMP_METAL_NO_ALPHA_TEST");
-   if(noat)p.alpha_test=0;}p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;{static int legacy=-1;if(legacy<0)legacy=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
-   p.z_cull=legacy?0u:s->z_cull;}p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
+  if(no_alpha_test_on())p.alpha_test=0;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:
@@ -4412,7 +4511,22 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
           * geometry crossing the near plane renders differently on the two
           * paths. */
          [encoder setDepthClipMode:MTLDepthClipModeClamp];
-         [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;}
+         [encoder setStencilReferenceValue:(uint32_t)(s->stencil_ref&255)];++g_hw_draws;
+         /* WHICH VARIANT THIS DRAW GOT, counted where the draw happens rather
+          * than where the pipeline is cached: a cache hit does not re-ask, so
+          * counting inside hw_early_z would measure pipeline misses and be
+          * read as draws. early=0 with the switch on is not a failure -- it
+          * is the alpha-tested and z-culled geometry, which is the number
+          * that says how much of the scene the change can reach at all.
+          *
+          * The test is the pipeline key's test, character for character,
+          * including the shader-blend term: fs_hw_early is the variant that
+          * reads the colour attachment, so under a shader-blend mode that
+          * does not take every draw there is no early variant to select and
+          * a counter that said otherwise would be counting an arm that did
+          * not run. */
+         if(hw_shader_blend(s)&&hw_early_z(s))++g_early_z_draws;
+         else++g_late_z_draws;}
   else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];
   /* THE TWO PIPELINES HAVE INCOMPATIBLE VERTEX BINDINGS AND THE ENCODER MUST
    * NOT SET BOTH. The fixed `vs` reads Params at vertex 1 and the indices at
