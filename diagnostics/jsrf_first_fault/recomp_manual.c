@@ -164,6 +164,104 @@ static int itail_slot_is_code(uint32_t sp, uint32_t *out)
     return v >= g_xbox_code_lo && v < g_xbox_code_hi;
 }
 
+static int itail_code_u8(uint32_t va, uint8_t *out)
+{
+    if (g_xbox_code_hi == 0u || va < g_xbox_code_lo || va >= g_xbox_code_hi)
+        return 0;
+    *out = MEM8(va);
+    return 1;
+}
+
+/* Length of an `FF /2` or `FF /3` (call r/m32) starting at `at`, or 0.
+ *
+ * ModRM and SIB only; no prefixes. A call reached through a segment override
+ * or an operand-size prefix does not happen in compiled 32-bit code, and
+ * guessing at prefixes would cost the precision this whole function exists to
+ * buy. */
+static int itail_ff_call_len(uint32_t at)
+{
+    uint8_t modrm, sib;
+    int mod, rm, n;
+
+    if (!itail_code_u8(at + 1, &modrm)) return 0;
+    if (((modrm >> 3) & 7) != 2 && ((modrm >> 3) & 7) != 3) return 0;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    n = 2;                                   /* FF + ModRM */
+    sib = 0;
+    if (mod != 3 && rm == 4) {               /* SIB present */
+        if (!itail_code_u8(at + 2, &sib)) return 0;
+        n += 1;
+    }
+    if (mod == 1) n += 1;                    /* disp8 */
+    else if (mod == 2) n += 4;               /* disp32 */
+    else if (mod == 0) {
+        if (rm == 5) n += 4;                 /* disp32, no base */
+        else if (rm == 4 && (sib & 7) == 5) n += 4;
+    }
+    return n;
+}
+
+/* Is `va` the address immediately after a call instruction?
+ *
+ * THIS IS THE WHOLE CORRECTION. The first version asked only whether a stack
+ * slot held a CODE ADDRESS, and a frame is full of code addresses that are not
+ * return addresses -- vtable pointers, callbacks, function pointers in locals.
+ * On the player's run of 19 Sep 2026 the scan stopped at esp+72 on one of
+ * those and reported a 72-byte stranded frame for sub_00114A80, whose frame is
+ * 0xA4 = 164 bytes: `sub esp,0x98` plus ebx, ebp and esi, confirmed to the
+ * byte by its own `mov eax,[esp+0xa8]` reading the stdcall argument that sits
+ * at esp_entry+4, and by the `ret 4` it never reached. The instrument
+ * understated the damage by a factor of 2.3 while sounding exact, which is
+ * worse than not measuring it.
+ *
+ * A return address is not merely a code address: it is the address AFTER a
+ * call. A function pointer in a local points at a function START, and a
+ * function start is not preceded by a call. That one extra question separates
+ * them, costs a handful of byte reads, and needs no disassembler. */
+static int itail_is_return_site(uint32_t va)
+{
+    uint8_t op;
+    int len;
+
+    if (va < g_xbox_code_lo + 8 || va >= g_xbox_code_hi) return 0;
+    if (itail_code_u8(va - 5, &op) && op == 0xE8) return 1;   /* call rel32  */
+    if (itail_code_u8(va - 7, &op) && op == 0x9A) return 1;   /* far call    */
+    for (len = 2; len <= 7; len++) {                          /* call r/m32  */
+        if (!itail_code_u8(va - len, &op) || op != 0xFF) continue;
+        if (itail_ff_call_len(va - len) == len) return 1;
+    }
+    return 0;
+}
+
+/* The nearest slot above `sp` that really holds a return address.
+ *
+ * Returns its guest address, or 0 if none within `limit` bytes. `loose_out`
+ * receives the nearest slot holding ANY code address -- the answer the first
+ * version gave -- because when the strict scan finds nothing that number is
+ * still a floor, and a floor reported as a floor is honest where a floor
+ * reported as a measurement is not.
+ *
+ * Split out from the logger so a test can drive it over a synthetic stack;
+ * diagnostics/jsrf_first_fault/icall_runaway_test.c builds exactly the shape
+ * that fooled it -- a function pointer nearer than the real return address --
+ * and pins that the strict answer steps over it. */
+uint32_t recomp_itail_frame_top(uint32_t sp, uint32_t limit, uint32_t *loose_out)
+{
+    uint32_t probe, value, loose = 0;
+
+    for (probe = sp + 4; probe <= sp + limit; probe += 4) {
+        if (!itail_slot_is_code(probe, &value)) continue;
+        if (!loose) loose = probe;
+        if (itail_is_return_site(value)) {
+            if (loose_out) *loose_out = loose;
+            return probe;
+        }
+    }
+    if (loose_out) *loose_out = loose;
+    return 0;
+}
+
 void recomp_itail_fail_log(uint32_t va)
 {
     static uint32_t addr[ITAIL_FAIL_SLOTS];
@@ -212,12 +310,9 @@ void recomp_itail_fail_log(uint32_t va)
                 "[ITAIL]   The epilogue had run, so this is a genuine tail call to an\n"
                 "[ITAIL]   untranslated target: one call lost, stack intact.\n");
     } else {
-        uint32_t probe, found = 0;
-        unsigned depth = 0;
-        for (probe = sp + 4; probe <= sp + ITAIL_FRAME_SCAN; probe += 4) {
-            if (itail_slot_is_code(probe, NULL)) { found = probe; break; }
-        }
-        depth = found ? (unsigned)(found - sp) : 0u;
+        uint32_t loose = 0;
+        uint32_t found = recomp_itail_frame_top(sp, ITAIL_FRAME_SCAN, &loose);
+        unsigned depth = found ? (unsigned)(found - sp) : 0u;
         fprintf(stderr,
                 "[ITAIL]   THE EPILOGUE NEVER RAN. esp is still inside the jumping\n"
                 "[ITAIL]   function's frame, so `esp += 4` has just returned its caller\n"
@@ -228,13 +323,30 @@ void recomp_itail_fail_log(uint32_t va)
                 va);
         if (found) {
             fprintf(stderr,
-                    "[ITAIL]   Nearest plausible return address is at esp+%u (0x%08X), so\n"
-                    "[ITAIL]   about %u bytes of frame have just been stranded.\n",
+                    "[ITAIL]   Nearest RETURN SITE (a code address preceded by a call) is at\n"
+                    "[ITAIL]   esp+%u (0x%08X), so about %u bytes of frame are stranded.\n",
                     depth, found, depth);
+            if (loose && loose < found) {
+                /* Say when the cheap test would have answered differently.
+                 * That gap is the bug this scan was rewritten for, and seeing
+                 * it in a log is how anyone would notice it coming back. */
+                fprintf(stderr,
+                        "[ITAIL]   (a code pointer sits nearer, at esp+%u -- a local, not a\n"
+                        "[ITAIL]   return address; the earlier scan stopped there and"
+                        " understated this.)\n",
+                        (unsigned)(loose - sp));
+            }
+        } else if (loose) {
+            fprintf(stderr,
+                    "[ITAIL]   No return site within %u bytes above esp. AT LEAST %u bytes\n"
+                    "[ITAIL]   are stranded -- that is a FLOOR from the nearest code pointer\n"
+                    "[ITAIL]   at esp+%u, not a measurement of the frame.\n",
+                    (unsigned)ITAIL_FRAME_SCAN, (unsigned)(loose - sp),
+                    (unsigned)(loose - sp));
         } else {
             fprintf(stderr,
-                    "[ITAIL]   No plausible return address within %u bytes above esp: the\n"
-                    "[ITAIL]   guest stack is already too far gone to size the frame.\n",
+                    "[ITAIL]   No return site and no code pointer within %u bytes above esp:\n"
+                    "[ITAIL]   the guest stack is already too far gone to size the frame.\n",
                     (unsigned)ITAIL_FRAME_SCAN);
         }
     }
@@ -329,9 +441,22 @@ void recomp_icall_not_code_log(uint32_t va)
     static uint32_t addr[NOT_CODE_SLOTS];
     static uint64_t hits[NOT_CODE_SLOTS];
     static char named[NOT_CODE_SLOTS];
+    /* THE RING, SNAPSHOT BEFORE THE SPIN DESTROYS IT.
+     *
+     * The banner used to print g_icall_trace live and, on the player's run of
+     * 19 Sep 2026, printed nothing at all: "recent resolved targets:" followed
+     * by an empty line. Of course it did. RECOMP_ICALL writes every target
+     * into that ring including the bad one, and the spin calls the bad one
+     * millions of times, so sixteen iterations in the entire ring is zeros and
+     * the `if (t)` filter drops all of it. The one piece of context the banner
+     * exists to carry is erased by the very event it describes.
+     *
+     * Take the copy on the FIRST sighting of an address, when the ring still
+     * holds what the guest was doing before it went wrong. */
+    static uint32_t before[NOT_CODE_SLOTS][ICALL_TRACE_SIZE];
     static int used;
-    uint64_t limit;
-    int i;
+    uint64_t limit, total;
+    int i, k;
 
     for (i = 0; i < used; i++) {
         if (addr[i] == va) break;
@@ -341,6 +466,11 @@ void recomp_icall_not_code_log(uint32_t va)
         addr[used] = va;
         hits[used] = 0;
         named[used] = 0;
+        for (k = 0; k < ICALL_TRACE_SIZE; k++) {
+            before[used][k] =
+                g_icall_trace[(g_icall_trace_idx - ICALL_TRACE_SIZE + k)
+                              & (ICALL_TRACE_SIZE - 1)];
+        }
         used++;
     }
     hits[i]++;
@@ -349,14 +479,31 @@ void recomp_icall_not_code_log(uint32_t va)
 
     limit = recomp_icall_runaway_threshold();
     if (limit && hits[i] >= limit) {
-        int k;
         named[i] = 1;
+        /* SUM ACROSS SLOTS, AND STAY QUIET IF ANOTHER ALREADY SPOKE.
+         *
+         * The find-or-add above is not atomic, so two guest threads spinning
+         * on the same target can each end up with their own slot. That is
+         * exactly what the player's run did: the banner printed TWICE, both
+         * copies reading "skipped 1000000 times", because each slot counted
+         * its own million. The message was duplicated and the total halved.
+         *
+         * Locking the fast path of a diagnostic that runs a million times in
+         * a spin is the wrong trade, so leave the race and repair the
+         * REPORT: add up every slot holding this address, and if one of them
+         * has already been named, this thread has nothing to add. */
+        total = 0;
+        for (k = 0; k < used; k++) {
+            if (addr[k] != va) continue;
+            total += hits[k];
+            if (k != i && named[k]) return;
+        }
         fprintf(stderr,
                 "[ICALL] RUNAWAY: target 0x%08X skipped %llu times -- the guest is not\n"
                 "[ICALL] RUNAWAY:   going to recover. A skipped indirect call returns as if the\n"
                 "[ICALL] RUNAWAY:   callee ran, so its caller resumed on registers nothing\n"
                 "[ICALL] RUNAWAY:   restored and is now looping on a pointer that is not code.\n",
-                va, (unsigned long long)hits[i]);
+                va, (unsigned long long)total);
         if (s_last_unresolved_va) {
             fprintf(stderr,
                     "[ICALL] RUNAWAY:   THE CAUSE IS UPSTREAM. The last guest VA the dispatch\n"
@@ -375,11 +522,12 @@ void recomp_icall_not_code_log(uint32_t va)
                     "[ICALL] RUNAWAY:   bad pointer came from somewhere else -- an uninitialised\n"
                     "[ICALL] RUNAWAY:   object, or a caller whose stack was already wrong.\n");
         }
-        fprintf(stderr, "[ICALL] RUNAWAY:   recent resolved targets:");
+        /* The ring AS IT WAS when this target first appeared. Printing it
+         * live shows sixteen copies of the bad target and nothing else. */
+        fprintf(stderr, "[ICALL] RUNAWAY:   targets in flight when it first"
+                        " appeared:");
         for (k = 0; k < ICALL_TRACE_SIZE; k++) {
-            uint32_t t = g_icall_trace[(g_icall_trace_idx - ICALL_TRACE_SIZE + k)
-                                       & (ICALL_TRACE_SIZE - 1)];
-            if (t) fprintf(stderr, " %08X", t);
+            if (before[i][k]) fprintf(stderr, " %08X", before[i][k]);
         }
         fprintf(stderr, "\n");
         if (recomp_icall_runaway_aborts()) {

@@ -36,10 +36,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 
 extern int recomp_icall_log_cadence(uint64_t hits);
 extern uint64_t recomp_icall_runaway_threshold(void);
 extern int recomp_icall_runaway_aborts(void);
+extern uint32_t recomp_itail_frame_top(uint32_t sp, uint32_t limit,
+                                       uint32_t *loose_out);
+
+/* The guest memory window the scan reads through, and the code range it
+ * judges an address against. Writing them is how this test gives the scanner
+ * a stack to walk without a game. */
+extern ptrdiff_t g_xbox_mem_offset;
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
 
 static int fails;
 
@@ -138,6 +148,74 @@ int main(void)
     } else {
         check(recomp_icall_runaway_aborts() == 1,
               "RECOMP_ICALL_RUNAWAY_ABORT must arm the abort");
+    }
+
+    /* 6. THE STRANDED-FRAME SCAN, and the exact shape that fooled it.
+     *
+     * Pre-registered on 19 Sep 2026: sub_00114A80's frame is 0xA4 bytes
+     * (`sub esp,0x98` plus ebx, ebp, esi), confirmed to the byte by its own
+     * `mov eax,[esp+0xa8]` reading the stdcall argument at esp_entry+4 and by
+     * the `ret 4` it never reaches. The player's run reported 72. The frame
+     * arithmetic was right and the SCAN was wrong: it stopped at the first
+     * stack slot holding any code address, and a live frame is full of code
+     * addresses that are not return addresses.
+     *
+     * So build that frame. A function pointer at esp+72 pointing at a
+     * function START, the real return address at esp+164 pointing just past a
+     * `call rel32`, and nothing else. The old scan answers 72. The scan has
+     * to answer 164 and offer 72 only as the thing it stepped over. */
+    {
+        enum { BASE = 0x00400000, SIZE = 0x2000 };
+        enum { CODE_LO = BASE, CODE_HI = BASE + 0x1000 };
+        enum { STACK = BASE + 0x1800 };
+        enum { FUNC_START = BASE + 0x0100 };   /* a callee, not a return site */
+        enum { RET_SITE   = BASE + 0x0200 };   /* immediately after a call    */
+        unsigned char *mem = calloc(SIZE, 1);
+        ptrdiff_t saved_off = g_xbox_mem_offset;
+        uint32_t saved_lo = g_xbox_code_lo, saved_hi = g_xbox_code_hi;
+        uint32_t loose = 0, top;
+
+        if (!mem) { printf("FAIL out of memory\n"); return 1; }
+        g_xbox_mem_offset = (ptrdiff_t)((uintptr_t)mem - (uintptr_t)BASE);
+        g_xbox_code_lo = CODE_LO;
+        g_xbox_code_hi = CODE_HI;
+
+        /* A function start: `push ebp` preceded by int3 padding. Nothing that
+         * could be read as a call ends here. */
+        mem[FUNC_START - BASE - 1] = 0xCC;
+        mem[FUNC_START - BASE] = 0x55;
+        /* A return site: `E8 rel32` ends exactly at RET_SITE. */
+        mem[RET_SITE - BASE - 5] = 0xE8;
+
+        /* The frame. */
+        *(uint32_t *)(mem + (STACK - BASE) + 0)   = 0x040D3A70;  /* saved esi */
+        *(uint32_t *)(mem + (STACK - BASE) + 72)  = FUNC_START;  /* the decoy */
+        *(uint32_t *)(mem + (STACK - BASE) + 164) = RET_SITE;    /* the truth */
+
+        top = recomp_itail_frame_top(STACK, 256, &loose);
+        check(top == STACK + 164,
+              "the scan must step over a function pointer and find the return"
+              " address at esp+164");
+        check(loose == STACK + 72,
+              "and must still report the nearer code pointer as what it"
+              " stepped over");
+        printf("  frame scan: return site at esp+%u, nearest code pointer at"
+               " esp+%u\n",
+               top ? (unsigned)(top - STACK) : 0u,
+               loose ? (unsigned)(loose - STACK) : 0u);
+
+        /* With no return site at all the answer must be zero -- the caller
+         * then reports a FLOOR rather than inventing a frame size. */
+        *(uint32_t *)(mem + (STACK - BASE) + 164) = FUNC_START;
+        loose = 0;
+        top = recomp_itail_frame_top(STACK, 256, &loose);
+        check(top == 0, "no return site must report none, not the decoy");
+        check(loose == STACK + 72, "and must still hand back the floor");
+
+        g_xbox_mem_offset = saved_off;
+        g_xbox_code_lo = saved_lo;
+        g_xbox_code_hi = saved_hi;
+        free(mem);
     }
 
     printf("  RECOMP_ICALL_RUNAWAY=%s -> threshold %llu\n",
