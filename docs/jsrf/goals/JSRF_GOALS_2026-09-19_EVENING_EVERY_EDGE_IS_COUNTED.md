@@ -213,6 +213,29 @@ scratch and diffs it against the live `functions.json`. It would say
 function-database analogue of `jsrf_gen_header_current`. Needs capstone on
 the interpreter ctest uses; `/usr/bin/python3` has it, Homebrew's does not.
 
+## G23 — the recording is the debugging case
+
+Proposed by the player on 19 Sep evening: record inputs and starting
+conditions, mark a problem while playing, replay unattended with diagnostics
+around the mark, compare builds to the earliest execution difference, keep
+the recording as a regression case. Measured against `xinput_device.c`:
+
+| step | exists | missing |
+|---|---|---|
+| record inputs + conditions | frame-keyed on the guest's `FLIP_STALL`, analog exact, header carries build / gen / switch hash | the save and HDD state: the harness stages stock, the bundle uses the player's, nothing records which |
+| mark a problem | nothing | a host key that writes `#!mark f<N> <label>` into the recording and `[PAD-MARK]` to the log |
+| targeted diagnostics on replay | replay is the one mechanism; probes are per run | a frame window (`RECOMP_PROBE_FRAMES=a-b`, default ±300 around each mark) the dumpers and traces consult |
+| earliest execution difference | per-checkpoint input hash AND guest-state anchor, reported separately | a per-frame state trace (esp at flip, icall count, draws, voices, seq state) beside the recording, and a diff that names the first frame two runs disagree |
+| keep across regeneration | refused outright on `#!gen` mismatch, by design | **policy call, the player's:** with the trace, a cross-gen replay is a measurement of drift; accept with a banner and a first-drift verdict, refuse only on format version |
+| delivery boundary | per frame; the guest polls at 120 Hz | key on the poll ordinal (the counter exists) so which of a frame's polls sees a press is fixed too |
+
+**Order inside G23:** mark first (cheapest, and it turns "the text was wrong"
+into a frame number); the state trace and diff second (they are what make
+step 4 and the cross-gen policy possible); the HDD hash and the poll key
+third. Each is a C change and a rebuild; none needs a regeneration. The mark
+needs one player session to try, and that session should be recorded on
+whatever gen is current then.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is
@@ -265,10 +288,24 @@ the interpreter ctest uses; `/usr/bin/python3` has it, Homebrew's does not.
    GPU" goal's real content. First step is unchanged: a run with
    `RECOMP_METAL_EARLY_Z=1`, because the early/late counter reads nothing
    with the switch off.
-4. **G2, the text** — now known to be a wrong *span* of a whole string, moving
+4. **G23's mark and state trace** — the player asked for them, they need no
+   regeneration, and the mark is what makes the next G2 session cheap.
+5. **G2, the text** — now known to be a wrong *span* of a whole string, moving
    over time. Aim the next capture at the speech box directly; the timing is
    known.
-5. G22c, G22d, G22f as background work that needs no player.
+6. G22c, G22d, G22f as background work that needs no player.
+
+**G21 addendum, 16:07:** the early-depth A/B is a null result by construction.
+Two trials per arm at the same mission, `19.00 ms` off against `19.64 ms` on,
+and **0 draws early of 1.3 million in both on-arms**: every draw carries the
+guest's z-range cull (`0x1d78` nibble = CULL, the default), the shader
+implements it with a discard, and a shader that may discard cannot test
+depth first. The probe measured why, not how much. The refinement to try
+next is treating a cull whose range is the full 0..16777215 as no cull — for
+those draws the early variant is exact — with a per-draw eligibility
+breakdown (alpha-tested / narrow cull / full-range cull / eligible) printed
+with the switch off, so the instrument is never blind again. Runs in
+`measure/earlyz_ab_20260919-155106`.
 
 ## Rules added today
 
