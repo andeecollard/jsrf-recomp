@@ -319,6 +319,61 @@ Numbers from after it are on the GPU path and do not compare to them.
 `ab_switch.sh` remains internally valid because both arms inherit the same
 adoption. The `earlyz` A/B above was the last one on the old path.
 
+## G2 — photographed by the player's own mark, 17:40
+
+The player pressed `M` twice in the bundle, in a session recorded to
+`padrec/graffiti-2026-09-19_1739.padrec` (gen `c4400dbb0025f56d`):
+
+| mark | frame | t | picture | shows |
+|---|---:|---:|---|---|
+| #1 | 3623 | 41.8 s | `marks/mark-2026-09-19_174010-f3623-M.bmp` | trick counter, no dialogue; the "3 TRICKS" HUD glyphs are the game's own |
+| #2 | 5111 | 69.4 s | `marks/mark-2026-09-19_174038-f5111-M.bmp` | **Gum's bubble: "Let's see hoW much air $ou can grab."** — `w` drawn as a wider glyph, `y` as a `$`-like one, every other letter right |
+
+**The corrupted letters are always w, x or y.** Across both sessions the
+instances are `No[w]`, `ne[x]t`, `spra[y]` (13:09) and `ho[w]`, `[y]ou`
+(17:40): five of five from the last four lowercase letters, and never
+another letter in the same line. That is not what a random atlas-index error
+looks like; it is what the *tail of a glyph page* looks like. A hypothesis,
+stated as one: the text renderer fills a glyph cache page per string, w–z
+land at the page's end, and when that page is recycled between boxes the
+tail slots are read before they are rewritten, showing whatever glyphs sat
+there — small kanji, which is exactly what the 19 Sep morning read them as.
+"The wrong span moves" and "the text is animated" (`c6ed54a`) both fit a
+cache that refills as the box types itself out. **Unverified.** The
+measurement that would decide it: at frame 5111 of a replay of this
+recording, dump the texture the bubble's glyph quads sample and the glyph
+index each quad carries; the vertex-program draw path is where the text is
+(8M guest VP draws in that session), not the fixed-function watcher.
+
+**17:52 — the player's screen recording changes the picture.**
+`~/Desktop/Screen Recording 2026-09-19 at 17.52.54.mov`, 2.7 s at 120 Hz on
+Gum's box. Extracted frame by frame: native frames 50–57 read `hoW … $ou`,
+**frames 58–60 read `how … you` correctly**, 61 onward corrupt again — one
+game frame right in roughly forty. And in that same frame the name label
+under the box reads **`Gum`** where every other frame reads **`m`**. The
+substitution and the truncation switch off together, for one frame, as a
+unit. So the state that decides both is **per frame and shared by every
+glyph drawn that frame**, not per string, not per glyph index — which
+retracts the glyph-page-tail hypothesis above as the *primary* mechanism
+and points at the texture the glyph quads sample: on the correct frame
+the atlas the GPU reads is current; on the others it is stale, and stale
+in the rows that hold w, x, y and the label's first letters. The runtime's
+texture cache (16 Sep: "a hit requires a full memcmp") is the first thing
+to read: what it compares, over how many rows, and what refreshes it on
+the one frame in forty.
+
+**The recording is the way in.** Replay `graffiti-2026-09-19_1739.padrec`
+unattended, it echoes mark #2 at frame 5111, and G23's frame window (not
+built yet) would arm the texture dump for ±120 frames around it. That is the
+next G2 step and it needs no player.
+
+**The stutter, from the same live log (provisional, session still open at
+17:42):** `[APU-PACE] starved=0 empty=0`, stale 0.0%, and a frame window
+reading `p50=6.5 ms p90=38.0 ms over-33ms=86 of 335` beside windows at
+21 ms and 18 ms — bimodal frames, exactly the tail the day handover named as
+the stutter's mechanism (the CRI server's pass rate tracks the frame rate).
+Still G21, not an audio bug.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is

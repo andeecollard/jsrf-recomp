@@ -1051,6 +1051,7 @@ struct pad_mark { unsigned long frame; char label[PAD_MARK_LABEL]; };
 static struct pad_mark g_pad_marks[PAD_MARK_MAX];
 static int g_pad_marks_n;
 static int g_pad_mark_echoed;            /* replay: marks already announced */
+static void (*g_pad_mark_hook)(unsigned long, const char *);
 
 static void pad_mark_push(unsigned long frame, const char *label, size_t n)
 {
@@ -1376,6 +1377,11 @@ static void pad_replay_apply(XBOX_INPUT_STATE *st, unsigned long f)
                 " \"%s\" (now t=%.1fs)\n", g_pad_mark_echoed, m->frame,
                 m->label, xbox_InputSeconds());
         fflush(stderr);
+        /* And take the picture, the same way the press did: a replay of a
+         * marked recording under a different switch set yields the SAME
+         * frame from the other arm, which is the comparison a mark exists
+         * to make possible without a person at the keyboard. */
+        if (g_pad_mark_hook) g_pad_mark_hook(m->frame, m->label);
     }
     while (g_pad_run_cursor < g_pad_runs_n && g_pad_runs[g_pad_run_cursor].f1 <= f)
         g_pad_run_cursor++;
@@ -1906,7 +1912,6 @@ unsigned long long xbox_PadRecordHash(void) { return g_pad_rec_hash; }
  * line a person is waiting on, and a session that crashes ten seconds later
  * must still have it. Not a pad event, so the checkpoint hash is unchanged
  * and a marked recording replays identically to an unmarked one. */
-static void (*g_pad_mark_hook)(unsigned long, const char *);
 void xbox_PadRecordSetMarkHook(void (*fn)(unsigned long, const char *))
 { g_pad_mark_hook = fn; }
 
