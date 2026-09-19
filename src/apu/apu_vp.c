@@ -1716,6 +1716,7 @@ void mcpx_apu_voice_report(void)
         extern uint16_t g_adpcm_fail_v[8]; extern uint8_t g_adpcm_fail_stream[8], g_adpcm_fail_ch[8];
         extern uint32_t g_adpcm_fail_block[8], g_adpcm_fail_nblocks[8], g_adpcm_fail_hdr[8];
         extern uint32_t g_adpcm_fail_page[8], g_adpcm_fail_prd[8], g_adpcm_fail_lin[8];
+        extern uint32_t g_adpcm_fail_bs[8], g_adpcm_fail_ba[8], g_adpcm_fail_ebo[8];
         {
             extern unsigned long g_adpcm_spb_voice, g_adpcm_spb_seg, g_adpcm_spb_differ;
             if (g_adpcm_spb_voice)
@@ -1731,12 +1732,17 @@ void mcpx_apu_voice_report(void)
                     g_adpcm_fail_first, g_adpcm_fail_last, g_adpcm_fail_mid, n);
             for (i = 0; i < n; ++i) {
                 unsigned slot = (unsigned)((g_adpcm_fail_ring - n + i) & 7u);
-                fprintf(stderr, " v%u%s%s blk %u/%u pg%u prd=%08X lin=%08X hdr %08X",
+                fprintf(stderr, " v%u%s%s blk %u/%u pg%u prd=%08X lin=%08X hdr %08X"
+                        " bs=%u ba=%u ebo=%u ba_blocks=%u",
                         g_adpcm_fail_v[slot],
                         g_adpcm_fail_stream[slot] ? "S" : "", g_adpcm_fail_ch[slot] == 2 ? "st" : "",
                         g_adpcm_fail_block[slot], g_adpcm_fail_nblocks[slot],
                         g_adpcm_fail_page[slot], g_adpcm_fail_prd[slot],
-                        g_adpcm_fail_lin[slot], g_adpcm_fail_hdr[slot]);
+                        g_adpcm_fail_lin[slot], g_adpcm_fail_hdr[slot],
+                        g_adpcm_fail_bs[slot], g_adpcm_fail_ba[slot],
+                        g_adpcm_fail_ebo[slot],
+                        g_adpcm_fail_bs[slot]
+                            ? g_adpcm_fail_ba[slot] / g_adpcm_fail_bs[slot] : 0u);
             }
             fprintf(stderr, "\n");
             {
@@ -3343,6 +3349,19 @@ uint32_t g_adpcm_fail_block[8], g_adpcm_fail_nblocks[8], g_adpcm_fail_hdr[8];
  *        -> the buffer is being reused underneath us; this dies too.
  * Read-only: it recomputes the address rather than touching the fetch. */
 uint32_t g_adpcm_fail_page[8], g_adpcm_fail_prd[8], g_adpcm_fail_lin[8];
+/* THE DISCRIMINATOR THE GAP NEEDS. Every voice starts failing exactly 11
+ * blocks before the end of its buffer (see the 19 Sep progress note), which
+ * is a fixed over-read -- but two different faults produce it and they have
+ * different fixes:
+ *
+ *   the BASE is 11 blocks too high            -> ba / block_size == 11
+ *   the BUFFER is 11 blocks shorter than ebo  -> ba / block_size == 0-ish
+ *                                                and ebo is the wrong field
+ *
+ * Neither is decidable from what this ring printed, because it recorded the
+ * translated address and not the two numbers the address was built from.
+ * Recording them makes the next gameplay run answer it off one line. */
+uint32_t g_adpcm_fail_bs[8], g_adpcm_fail_ba[8], g_adpcm_fail_ebo[8];
 unsigned long g_adpcm_fail_page0, g_adpcm_fail_pagehi;
 uint32_t g_adpcm_first_fail_blk[MCPX_HW_MAX_VOICES];
 /* The buffer's block count beside the first block that failed in it. Without
@@ -3617,6 +3636,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         g_adpcm_fail_ch[slot] = (uint8_t)channels;
                         g_adpcm_fail_block[slot] = block_index;
                         g_adpcm_fail_nblocks[slot] = nblocks;
+                        g_adpcm_fail_bs[slot] = (uint32_t)block_size;
+                        g_adpcm_fail_ba[slot] = stream ? 0u : ba;
+                        g_adpcm_fail_ebo[slot] = ebo;
                         g_adpcm_fail_hdr[slot] = (uint32_t)hb[0] | ((uint32_t)hb[1] << 8)
                                                | ((uint32_t)hb[2] << 16) | ((uint32_t)hb[3] << 24);
                         {
