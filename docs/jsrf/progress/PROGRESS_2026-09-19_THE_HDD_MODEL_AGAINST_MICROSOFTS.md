@@ -12,39 +12,51 @@ disk is worth reading properly.
 
 ## 0. The one-paragraph answer
 
-Our HDD model is a **path translator over host directories**, and Microsoft's
-BC emulator is a **volume manager over real partitions**. Ours is simpler than
-the console in three ways that are deliberate and one that is a defect: we
-collapse X:, Y: and Z: onto a single `Cache/` directory, we answer every
+Our HDD model is a **path translator over host directories**. Microsoft's is
+the **Xbox kernel's own FATX implementation, recompiled** — they did not model
+the disk, they shipped the console's code for it (see §1, corrected). Ours is
+simpler than the console in three ways that are deliberate and one that is a
+defect: we collapse X:, Y: and Z: onto a single `Cache/` directory, we answer every
 free-space question with the host's whole disk, we model no I/O latency, and we
 give the title a **900x overstatement of its cache space**. The first three are
 defensible. The fourth is measurable and should be fixed.
 
-## 1. Where the storage logic lives — the architectural difference
+## 1. Where the storage logic lives
 
-This is the difference that explains most of the others, and it is not a
-quality gap.
+**CORRECTED 19 Sep, evening.** The first version of this section said
+Microsoft "reimplemented the XAPI storage layer" while we "recompile the
+title's own copy of it". That is wrong, and `docs/technical/ms-fusion-recompiler.md`
+§6 already had the answer: in the BC package the `XapiSelectCachePartition`,
+`XMountUtilityDrive` and `XapiFormatFATVolumeEx` names come from the game
+module's `PrecompiledSymbolTable`, which lists **recompiled guest functions**,
+not replacements. "All of these are recompiled verbatim. None are replaced.
+Microsoft's HLE line sits at the `xboxkrnl` import boundary and nowhere else."
 
-**JSRF statically links XAPILIB 4134** (`CLAUDE.md:24`). So
-`XapiSelectCachePartition`, `XMountUtilityDrive`, `XapiFormatFATVolumeEx`,
-`XSetFileCacheSize` and `XCreateSaveGame` are **inside the title's own code**,
-recompiled to C by `tools/recomp` like everything else, and they call down to
-our `Nt*` layer. Verified: none of those names is implemented anywhere in
-`src/kernel/`, and none appears as an import in `default.xbe`.
+So on this point **we and Microsoft do the same thing**: JSRF statically links
+XAPILIB 4134 (`CLAUDE.md:24`), that code is translated along with everything
+else, and it calls down to a kernel. Verified on our side: none of those names
+is implemented in `src/kernel/`, and none appears as an XBE import.
 
-On the 360 those same names are what the BC title modules **export**: the
-per-title `xefu_<guid>.dll` symbol blobs list `_XapiSelectCachePartition@12`,
-`_XMountUtilityDrive@4`, `_XapiValidateDiskPartitionEx@8`,
-`_XapiFormatFATVolumeEx@8`, `_XapiMapLetterToDirectory@24`,
-`_XapiSetupPerTitleDriveLetters@8`, `_XGetDiskClusterSizeA@4`,
-`_XCreateSaveGame@24`, `_XapiNukeDirectory@8`. Microsoft **reimplemented the
-XAPI storage layer**; we **recompile the title's own copy of it**.
+**The real difference is one layer lower, and it is sharper.** Both projects
+draw the line at `xboxkrnl`. What sits under it differs:
 
-Consequence: Microsoft had to decide what a cache partition *is*, because their
-code creates and formats one. We inherit those decisions from the title, and
-only have to make its `Nt*` calls come out right. That is why our layer is
-1,800 lines and theirs is a volume manager — and also why a wrong answer from
-our layer is invisible until the title's own XAPI does something odd with it.
+| | under the kernel boundary |
+|---|---|
+| Microsoft | `xb1krnl.exe` — **the Xbox kernel itself**, their own 2002 code, recompiled to x86-64 like any other guest binary |
+| us | `src/kernel/`, a from-scratch reimplementation written against observed behaviour and the XDK's documented surface |
+
+That is why their disk behaviour needs no design decisions: it *is* the
+console's behaviour, because it is the console's code. Ours is a
+reimplementation, so every question this document asks — what happens to the
+cache at launch, what free space is reported, which FATX rules bind — is a
+decision somebody here has to make correctly. It also means **"what does BC
+do?" and "what did the real Xbox do?" are the same question**, which is why
+the answer to both is the standard to match.
+
+One practical consequence for mining: their kernel module
+(`xefu_69c41281_*.dll`, `FileDescription` = `xb1krnl.exe`) is the recompiled
+Xbox kernel. Its symbol table is the closest thing to a specification for this
+layer that exists outside Microsoft, and it has not been mined.
 
 ## 2. Path and partition mapping
 
@@ -221,6 +233,12 @@ what makes replay-from-the-player's-disk viable at all.
    `kernel_file.c` supports RootDirectory-relative names on Win32 but the bridge
    sets `oa->RootDirectory = NULL`, so it is unreachable from guest code; POSIX
    supports it on neither side.
+
+6. **Mine `xb1krnl.exe`'s symbol table.** Their kernel module is the Xbox
+   kernel recompiled, and its names are the closest thing to a specification
+   for this layer outside Microsoft. The BC mining done today read the
+   *title* modules; this one was not touched, and the symbol work that has
+   already named 439 of our functions used the same technique.
 
 And worth sending upstream, in this order: Partition1 → save side (upstream
 writes TDATA into the game dump), the synthetic Partition0/Partition5 devices
