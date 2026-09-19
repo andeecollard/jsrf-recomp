@@ -202,7 +202,17 @@ def _build_source(condition_for):
     cases, table = [], []
     for probe in _probes():
         if probe.direct:
-            write = "eax = a; (void)b; (void)cnt;"
+            # G19: the condition is a pure function of the RESULT, but since
+            # the family started publishing that result it reads `_fa` rather
+            # than the live destination. A direct probe therefore has to
+            # publish the value it is planting, exactly as the real setter
+            # would -- masked and sign-extended at the probe's own width.
+            # Without this the probe measures an uninitialised `_fa`, which is
+            # not a statement about the expression at all.
+            mask = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}[probe.width]
+            write = (f"eax = a; (void)b; (void)cnt;"
+                     f" _fa = (uint32_t)({probe.dest}) & {mask};"
+                     f" _fas = (int32_t){_CAST[probe.width]}(_fa);")
         else:
             write = _lifted_write(probe.mnemonic, probe.operands, probe.op_str)
         for jcc, code in probe.jccs:
@@ -282,7 +292,10 @@ class ResultFlagWidthEmissionTest(unittest.TestCase):
                             ("jle", "<="), ("jg", ">")):
                 with self.subTest(mnemonic=mnemonic, jcc=jcc):
                     cond = _condition(jcc, mnemonic, [_reg("al"), _reg("bl")])
-                    self.assertEqual(f"((int8_t)(LO8(eax)) {op} 0)", cond)
+                    # Reads the published result (G19), still at 8 bits, and
+                    # still with no overflow reconstruction -- which is the
+                    # property this test is about.
+                    self.assertEqual(f"((int8_t)(_fa) {op} 0)", cond)
 
     def test_neg_signed_conditions_no_longer_answer_with_the_sign_bit(self):
         for width, lo, _hi, _d in _WIDTHS:
@@ -300,10 +313,20 @@ class ResultFlagWidthEmissionTest(unittest.TestCase):
                     # back out of the result.
                     self.assertIn("0u -", cond)
 
-    def test_touched_branches_never_reference_the_cmp_snapshot(self):
-        # _fa/_fas are declared by translator.py only for functions holding a
-        # cmp/test/bsf/bsr/inc/dec/cmpxchg. Emitting them from any of these
-        # setters produces C that does not compile.
+    def test_touched_branches_read_the_published_result(self):
+        # INVERTED BY G19, DELIBERATELY. This test used to assert the opposite
+        # -- that these branches must never mention _fa -- for one stated
+        # reason: translator.py declared the pair only for functions holding a
+        # cmp/test/bsf/bsr/inc/dec/cmpxchg, so referencing it anywhere else
+        # produced C that would not compile.
+        #
+        # That was a constraint about the DECLARATION, not about what the
+        # condition should read, and re-reading a destination at the branch is
+        # wrong whenever anything has written it since. The declaration list
+        # now includes the whole result-setter family, so the branches read
+        # the snapshot their setter published -- and the guard becomes the
+        # assertion that they do. The declaration half is pinned separately by
+        # test_translator_declares_the_pair_for_the_family below.
         setters = (
             ("adc", [_reg("al"), _reg("bl")]),
             ("sbb", [_reg("al"), _reg("bl")]),
@@ -323,7 +346,21 @@ class ResultFlagWidthEmissionTest(unittest.TestCase):
                 if made is None:
                     continue
                 with self.subTest(mnemonic=mnemonic, jcc=jcc):
-                    self.assertNotIn("_fa", made[0])
+                    # The invariant is that NOTHING here re-reads the live
+                    # destination. Some conditions reach that by reading _fa,
+                    # others by reading only _cf, and a couple are outright
+                    # constants (and/or/xor's jb is 0 because CF is). All
+                    # three are fine; a mention of LO8(eax) is not.
+                    self.assertNotIn("LO8(eax)", made[0])
+                    self.assertNotIn("LO16(eax)", made[0])
+
+    def test_translator_declares_the_pair_for_the_family(self):
+        """The other half: every setter that publishes must be declared for."""
+        src = (Path(__file__).resolve().parent / "translator.py").read_text()
+        decl = src.split("uint32_t _fa = 0, _fb = 0;")[0].rsplit("if any(", 1)[1]
+        self.assertIn("_RESULT_ZF_SF_SETTERS", decl,
+                      "the family publishes _fa but the declaration gate "
+                      "does not cover it -- the generated C will not compile")
 
     def test_adc_and_sbb_still_refuse_the_ordered_signed_conditions(self):
         # OF after adc/sbb needs the original destination and the carry-in;
@@ -507,6 +544,11 @@ _HARNESS = r'''
 
 ptrdiff_t g_xbox_mem_offset;
 static uint32_t eax, ebx, ecx;
+/* G19: the result-setter family publishes its flags into this pair
+   where the result is computed, so a jcc reads the snapshot rather
+   than a destination something may have overwritten since. */
+uint32_t _fa, _fb;
+int32_t _fas, _fbs;
 static int _cf;
 static uint32_t g_dest;
 

@@ -1129,8 +1129,17 @@ class FunctionTranslator:
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
-        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "inc", "dec",
-                                 "cmpxchg", "lock cmpxchg")
+        # The result-setter family joined this list with G19: they publish
+        # `_fa`/`_fas` after their write, exactly as inc/dec have since the
+        # ADX loop, so any function containing one needs the pair declared or
+        # the emitted snapshot does not compile.
+        # "sal" is not in _RESULT_ZF_SF_SETTERS -- it never becomes a flag
+        # setter, so nothing reads its flags -- but it shares _lift_shift with
+        # shl and so still emits the snapshot. Named here or a function whose
+        # only member of the family is a `sal` does not compile.
+        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr",
+                                 "cmpxchg", "lock cmpxchg", "sal")
+               or insn.mnemonic in _RESULT_ZF_SF_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")

@@ -62,7 +62,10 @@ class ResultFlagMergeTest(unittest.TestCase):
         )
 
         self.assertEqual(incoming[0], MERGED_RESULT_SETTER)
-        self.assertIn("if ((edi == 0)) goto loc_00140508;", generated)
+        # G19: the join reads the snapshot both edges published, not live edi.
+        # A `mov edi, ...` between either setter and this branch used to make
+        # it ask about the wrong value; _fa cannot be clobbered that way.
+        self.assertIn("if ((_fa == 0)) goto loc_00140508;", generated)
         self.assertNotIn("_flags", generated)
 
     def test_wxcireqrd_length_check_resolves(self):
@@ -75,7 +78,7 @@ class ResultFlagMergeTest(unittest.TestCase):
             address=0x001404DB,
         )
 
-        self.assertIn("if ((eax != 0)) goto loc_00140524;", generated)
+        self.assertIn("if ((_fa != 0)) goto loc_00140524;", generated)
         self.assertNotIn("_flags", generated)
 
     def test_sign_condition_uses_the_operand_width(self):

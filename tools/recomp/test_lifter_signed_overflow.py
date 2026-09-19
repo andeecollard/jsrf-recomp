@@ -153,6 +153,11 @@ _HARNESS = r'''
 
 ptrdiff_t g_xbox_mem_offset;
 static uint32_t eax, ebx;
+/* G19: the result-setter family publishes its flags into this pair
+   where the result is computed, so a jcc reads the snapshot rather
+   than a destination something may have overwritten since. */
+uint32_t _fa, _fb;
+int32_t _fas, _fbs;
 
 enum { J_S, J_NS, J_L, J_GE, J_LE, J_G };
 
@@ -235,6 +240,11 @@ _NAMED = r'''
 
 ptrdiff_t g_xbox_mem_offset;
 static uint32_t eax, ebx;
+/* G19: the result-setter family publishes its flags into this pair
+   where the result is computed, so a jcc reads the snapshot rather
+   than a destination something may have overwritten since. */
+uint32_t _fa, _fb;
+int32_t _fas, _fbs;
 
 int main(void) {
     /* 1. 8-bit sub, overflowing: al = -128, bl = 1 leaves 0x7F with SF=0 and

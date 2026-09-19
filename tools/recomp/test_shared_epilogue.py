@@ -50,6 +50,11 @@ class SharedEpilogueTest(unittest.TestCase):
 #include <assert.h>
 RECOMP_TLS uint32_t g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi, g_esp, g_ebp, g_seh_ebp, g_fs_base;
 ptrdiff_t g_xbox_mem_offset;
+/* G19: the result-setter family publishes its flags into this pair
+   where the result is computed, so a jcc reads the snapshot rather
+   than a destination something may have overwritten since. */
+uint32_t _fa, _fb;
+int32_t _fas, _fbs;
 static uint32_t memory[1024];
 ''' + "\n".join(bodies) + r'''
 int main(void) {

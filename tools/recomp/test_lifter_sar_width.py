@@ -56,9 +56,16 @@ class SarEmissionTest(unittest.TestCase):
                 self.assertIn(cast, _emit(lo, hi))
 
     def test_narrow_sar_is_not_emitted_as_int32(self):
+        # The SHIFT is what must not be widened -- that is the defect this
+        # guards. Since G19 the emission also carries a result snapshot, whose
+        # `_fas = (int32_t)(int8_t)(_fa)` is a sign-extension of an already
+        # width-masked value and is correct at every width, so the assertion
+        # looks at the shift statement rather than the whole emission.
         for _width, lo, hi in ((1, "al", "cl"), (2, "ax", "cx")):
             with self.subTest(reg=lo):
-                self.assertNotIn("(int32_t)", _emit(lo, hi))
+                shift = _emit(lo, hi).split("_fa =")[0]
+                self.assertIn(">>", shift)          # we are looking at the shift
+                self.assertNotIn("(int32_t)", shift)
 
 
 _HARNESS = r'''
@@ -68,6 +75,11 @@ _HARNESS = r'''
 
 ptrdiff_t g_xbox_mem_offset;
 static uint32_t eax, ecx;
+/* G19: the result-setter family publishes its flags into this pair
+   where the result is computed, so a jcc reads the snapshot rather
+   than a destination something may have overwritten since. */
+uint32_t _fa, _fb;
+int32_t _fas, _fbs;
 
 /* x86 sar, done honestly in a signed type of the operand's own width. */
 static uint32_t reference(uint32_t a, uint32_t count, int width) {
