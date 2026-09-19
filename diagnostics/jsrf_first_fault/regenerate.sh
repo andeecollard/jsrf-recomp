@@ -145,6 +145,19 @@ while [ "$round" -le "$MAX_ROUNDS" ]; do
     # initializer tables call into named XDK sections (D3D/DSOUND/XPP)
     # indirectly, so restricting the pass to .text omits valid guest functions
     # before func_id can inspect them.
+    # Prologues no pass finds. A function whose only inbound edge is a direct
+    # jmp is filed as a tail-jump alias of the body the sweep was already in,
+    # never as a start -- so if it dispatches a switch, the table's arms fall
+    # outside every extent that contains the jump and the lifter emits an
+    # unresolvable RECOMP_ITAIL. That macro's failure path pops a return
+    # address the jmp never pushed, so the guest returns with esp short by the
+    # whole frame and its caller restores ebx/esi/edi from the wrong slots.
+    # Hand-curated and separate from the other three seed files on purpose:
+    # these are not thread starts, not observed indirect-call targets and not
+    # startup entries, and filing them under one of those names would lose the
+    # one thing that has to be checked before adding another -- that the
+    # address is a PROLOGUE and not a switch arm. Seeding an arm creates this
+    # defect rather than fixing it.
     "$PYTHON" -m tools.disasm \
         "$XBE" \
         --analysis-json "$OUT/jsrf_analysis.json" \
@@ -152,6 +165,7 @@ while [ "$round" -le "$MAX_ROUNDS" ]; do
         --seed-functions diagnostics/jsrf_first_fault/thread_start_seed.json \
         --seed-functions diagnostics/jsrf_first_fault/icall_seed.json \
         --seed-functions diagnostics/jsrf_first_fault/startup_entries.json \
+        --seed-functions diagnostics/jsrf_first_fault/missed_prologue_seed.json \
         --seed-functions "$ACCUM" \
         ${ICALL_DB:+--seed-functions "$ICALL_DB"} \
         --function-bounds diagnostics/jsrf_first_fault/function_bounds.json \
