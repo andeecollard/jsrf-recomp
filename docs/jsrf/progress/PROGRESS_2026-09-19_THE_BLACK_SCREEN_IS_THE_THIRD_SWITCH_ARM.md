@@ -183,3 +183,94 @@ is not named in the tree, and this regeneration merged the player's 12:28 icall
 dump, which the handover's trees did not have, so the function sets differ by
 construction. Not treated as a regression, and not treated as a pass either;
 the structural checks above are what the two fixes were verified on.
+
+---
+
+# RESULT: the prediction held, 13:09-13:29
+
+Appended after the player's session on the regenerated build, so the
+prediction above and its outcome stay in one file. Preserved as
+`last-run-2026-09-19_1329-NEWBUILD-PLAYER-GRAFFITI-KEEP.log` (17.7 MB) and
+`padrec/graffiti-2026-09-19_1309.padrec.KEEP` (1.9 MB), both verified
+byte-identical to the live files after the process exited.
+
+|                     | morning, crashfix | afternoon, merged |
+|---------------------|------------------:|------------------:|
+| session length      |          307.02 s |        1209.00 s  |
+| ITAIL/ICALL failures|                 1 |                **0** |
+| black frames        |                63 |                **0** |
+| guest faults        |                 0 |                 0 |
+| ADX freezes         |                 0 |                 0 |
+| voices on / off     |       168 / 163   |       **289 / 279** |
+
+1,209 seconds is 4.9x the 245 s at which the crashfix build went black, and
+the failure path did not fire once. `off=279` is the most voices this project
+has ever retired in a session; the previous best was that morning's 163, and
+before 19 Sep no scripted run had retired a single one.
+
+That closes the black screen as an ITAIL stack-corruption event. It does NOT
+close the three defects the player photographed, none of which the switch-arm
+fix was predicted to touch:
+
+  - TEXT. Glyph substitution AND variable leading-character loss. The
+    substitution corroborates the existing note's section 5 rather than
+    contradicting it: `Try it again` renders the `y` correctly while
+    `ot too shabbS, kid.` renders the same letter wrong, minutes apart in one
+    session. The truncation is new and may be the cheaper half --
+    `llect 10 SpraS Cans` begins flush against the left edge of the window,
+    which is what a line centred on a mis-measured width looks like. If a
+    wrong glyph carries a wrong advance, both symptoms are one bug. The
+    `Farside Stab Soul` -> `de Stab Soul` banner is NOT flush left, so that
+    case is unexplained by this and may be a second mechanism.
+  - GRAFFITI DOES NOT PLANT. New, in no handover. The sound fires and the can
+    count decrements, and nothing is committed to the wall. The HUD keeps
+    showing the spray-can graphic after the challenge completes.
+  - SPRAY CANS. Partial, not absent: cans on the ground render correctly while
+    others render as black silhouettes, and the blue/orange checkerboard
+    rectangles in the 13:11-13:12 captures sit exactly where tags belong.
+    Black, checkerboard or absent reads like one broken texture path rather
+    than three faults.
+
+## The glyph instrument may be blind to the defect
+
+Checked before anyone spends a session on it. `ff_watch_vertex` stores
+`inputs[0]` and `inputs[9]` (`nv2a_pb_exec.c:781`), so it has the right data,
+but:
+
+  1. It is a CHANGE detector. It prints only when a batch differs from the
+     previous draw of the same batch ordinal, and only the first differing
+     vertex. It cannot say which atlas cell a malformed letter sampled, which
+     is the measurement actually wanted.
+  2. It needs the font atlas address up front: `RECOMP_FF_BATCH_WATCH_TEX` is
+     a hex texture offset and it early-returns unless
+     `NV097_SET_TEXTURE_OFFSET` matches exactly. Nothing checks that the
+     address given is the font.
+  3. BOTH call sites (`nv2a_pb_exec.c:4026`, `:4060`) are inside the
+     fixed-function branches. Neither is on the guest vertex-program path.
+     This session ran 8,288,270 GPU vsh draws against 5,099,920 fixed-function
+     batches, and nothing establishes which path draws the text.
+
+If the glyphs go through a guest vertex program, the watcher reads "0 changes"
+forever against a live defect -- the absence-measurement trap -- and that is a
+candidate explanation for why it "initially produced misleading results".
+Establish the path first, with a positive control beside it.
+
+## Two smaller things this session settled
+
+A lead REFUTED, so it is not chased again: 200,070 fixed-function batches
+reported "left on the CPU (degenerate-normal shape)", and on a Metal run the
+CPU rasteriser draws nothing -- which looked like it could explain missing
+glyphs. It cannot. The same report reads `vsh draws: 1635392 GPU, 190963 CPU`
+against `hw draws=1826355`, and 1,635,392 + 190,963 = 1,826,355 exactly. Every
+one of those batches became a hardware draw; the CPU does the vertex transform
+and Metal still rasterises. What IS real is that `nv2a_ff.c:571` says the
+degenerate-normal rejection "is expected to be zero or near it" and that
+archived runs all read "0 still rejected" -- it read 200,070, pushing 11% of
+batches onto the CPU vertex path for nothing. A G21 item, not a correctness
+one; `RECOMP_FF_GPU_NORMAL_ZERO=1` is the arm.
+
+And the recorder writes NO end marker on a clean quit. 48,511 events over
+59,110 frames were captured and the file is sound, but a replay of it will
+report "NO END MARKER (the recorded run was killed or crashed)", which is
+wrong and will mislead someone. The flush is on the crash handler and the
+SIGTERM path; a normal window close reaches neither.
