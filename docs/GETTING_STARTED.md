@@ -4,11 +4,34 @@ This guide walks you through recompiling your first Xbox game, from extracting t
 
 ## What You Need
 
-- **Windows 11** (or 10 with recent updates)
+The Python pipeline — Steps 1 through 5, everything that turns an XBE into C
+— is pure Python plus Capstone and runs anywhere. The platform question is
+only about building and running the *game*:
+
+| | Pipeline | Game build | Graphics backend |
+|---|---|---|---|
+| **Windows 10/11** | yes | MSVC | D3D11, the complete path |
+| **Linux** | yes | GCC/Clang | OpenGL 3.3 (`d3d8_gl.c`), less complete |
+| **macOS** | yes | Clang | OpenGL 3.3, least exercised |
+
+Start on Windows if you have the choice — the D3D11 backend is six files of
+translation against one for OpenGL, so a title that renders there may not
+render elsewhere yet. If you are on Linux or macOS you can still do the whole
+analysis half, and reports of what breaks on the OpenGL path are welcome.
+
 - **Python 3.10+** with `capstone` installed (`pip install capstone`)
-- **Visual Studio 2022** (MSVC compiler) with C/C++ desktop workload
 - **CMake 3.20+**
+- A C compiler: **Visual Studio 2022** (MSVC, C/C++ desktop workload) on
+  Windows; GCC or Clang elsewhere
+- **Linux**: `bash tools/linux/install_deps.sh` installs SDL2, libepoxy,
+  OpenSSL and ffmpeg for the OpenGL backend (apt/pacman/dnf, needs sudo)
+- **macOS**: `brew install sdl2 libepoxy`
 - An original Xbox game disc image (ISO/XISO) — you must own the game
+
+> **On the `py -3` in every command below.** That is the Windows Python
+> Launcher. On Linux and macOS use `python3` instead — `python3 -m tools.disasm
+> ...` and so on. Some Windows installs (notably the Microsoft Store one) have
+> no `py` either; `python` works there.
 - A tool to extract ISO files ([extract-xiso](https://github.com/XboxDev/extract-xiso) or [xdvdfs](https://github.com/antangelo/xdvdfs))
 
 Optional but very helpful:
@@ -103,7 +126,24 @@ This classifies functions into categories:
 - **GAME** — Game-specific code — your main focus
 - **STUB** — Empty/trivial functions — safe to ignore
 
-## Step 4.5 (optional): Recover real names with Ghidra
+## Step 4.5: Recover Calling Conventions
+
+```bash
+py -3 -m tools.abi_analysis game_files/default.xbe -v
+#    Output: tools/abi_analysis/output/abi_functions.json
+```
+
+**Do not skip this one.** `tools.recomp` looks for `abi_functions.json`, and
+when it is missing it warns once and then falls back to `cdecl` / 0 parameters
+/ `int_or_void` for *every function in the game*. That is not a failure you
+see — the recompile succeeds, the code builds, and the signatures are wrong,
+which is the same quiet shape as most of the bugs in the changelog.
+
+It recovers the calling convention (including `thiscall`, from a read of `ecx`
+before any write), the parameter count from the `ret` immediate, return-type
+hints and the frame shape.
+
+## Step 4.6 (optional): Recover real names with Ghidra
 
 Everything is `sub_0004F8B5` by default, and reading a 500,000-line call graph
 of those is the slow part of every bring-up. If you have Ghidra, its Function ID
@@ -151,7 +191,7 @@ Ghidra export is cached, so it takes seconds.
 
 ## Step 5: Recompile
 
-Steps 2-5 all run from inside the `xboxrecomp` clone (that's where `tools/` lives).
+Steps 2-4.6 all run from inside the `xboxrecomp` clone (that's where `tools/` lives).
 Point the generated code at **your** project with `--gen-dir`:
 
 ```bash

@@ -114,7 +114,7 @@ def test_arg_size_comments_match_their_ordinal():
     exports = load_exports()
     with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
         src = fh.read()
-    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
     assert m, "could not locate stdcall_args_for_ordinal"
 
     bad = []
@@ -152,7 +152,7 @@ def test_every_routed_ordinal_has_an_arg_size():
     exports = load_exports()
     with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
         src = fh.read()
-    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
     assert m, "could not locate stdcall_args_for_ordinal"
     sized = {int(o) for o in
              re.findall(r"case\s+(\d+):\s*return\s+\d+;", m.group(0))}
@@ -189,7 +189,7 @@ def test_arg_sizes_are_dword_multiples():
     """stdcall cleanup pops whole dwords; an odd size corrupts the stack."""
     with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
         src = fh.read()
-    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
     assert m, "could not locate stdcall_args_for_ordinal"
     bad = [
         f"ordinal {o} pops {b} bytes"

@@ -41,6 +41,9 @@
 #include <sys/mman.h>
 #endif
 #include <setjmp.h>
+#if !defined(_WIN32)
+#include <unistd.h>   /* _exit */
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -158,6 +161,12 @@ static void *g_mcpx_memory = NULL;
 #define XBOX_FLASH_BASE 0xFF000000u
 #define XBOX_FLASH_SIZE (1u * 1024u * 1024u)
 static void *g_flash_memory = NULL;
+/* The contiguous window's backing section. It is a file mapping rather than
+ * plain committed memory for one reason: the tiled aperture has to be a
+ * second view of the very same bytes, and only a mapping can be mapped
+ * twice. See the tiled aperture below for why that matters.
+ */
+static HANDLE g_contig_mapping = NULL;
 /* How much of the tiled aperture can exist.
  *
  * Two ceilings, both below the mapped RAM size once that is large:
@@ -3105,7 +3114,6 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
-
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */
@@ -3182,6 +3190,40 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
     return 0;
 }
 
+/* A real swap happened: advance every registered counter, and remember when.
+ *
+ * The timer below exists for a title nothing presents for. Once the
+ * pushbuffer executor is actually running flips, the timer is the wrong
+ * clock and an actively harmful one: Half-Life 2's loader paces its intro on
+ * this count, so a 62 Hz timer against an executor managing a fraction of a
+ * frame per second ran the video forward in virtual time far faster than it
+ * could be drawn. Only every few hundredth frame was ever presented, each one
+ * sampled part way through its own decode -- which looks exactly like a
+ * stalling, blocky video rather than a clock running away.
+ */
+static DWORD g_frame_counter_flip_ms;
+
+void xbox_Nv2aFrameCounterFlip(void)
+{
+    int i;
+
+    g_frame_counter_flip_ms = GetTickCount();
+    if (!g_frame_counter_flip_ms)
+        g_frame_counter_flip_ms = 1;          /* 0 means "never" */
+    for (i = 0; i < g_frame_counter_count; i++) {
+        uint32_t dev;
+
+        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
+            continue;
+        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
+                               + g_memory_offset) += 1;
+    }
+}
+
 static void frame_counters_tick(void)
 {
     DWORD now = GetTickCount();
@@ -3192,6 +3234,13 @@ static void frame_counters_tick(void)
     if (g_frame_counter_last_ms
             && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
         return;
+    /* Something is presenting: let it drive the count instead. Two seconds,
+     * because the executor's flips are not evenly spaced and a title that
+     * genuinely stops presenting still has to be got moving again. */
+    if (g_frame_counter_flip_ms && (now - g_frame_counter_flip_ms) < 2000) {
+        g_frame_counter_last_ms = now;
+        return;
+    }
     g_frame_counter_last_ms = now;
 
     for (i = 0; i < g_frame_counter_count; i++) {
@@ -3378,7 +3427,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * screen. Nothing here scans out, so this is the one place that says
          * whether the guest is producing an image at all -- and where it is.
          * Gated, because it is a bring-up question, not a runtime one. */
-        if (s_nv2a_trace) {
+        /* Not gated on the trace flag: nv2a_pb_scan is what drives the
+         * executor, and it already returns unless RECOMP_PB_SCAN or
+         * RECOMP_PB_EXEC asked for it. Gating the call as well meant
+         * RECOMP_PB_EXEC on its own did nothing at all, and the executor
+         * only ran when someone happened to also be tracing. */
+        {
             /* Is the title submitting GPU work at all? PUT is where the
              * title's pushbuffer writer has got to; if it never moves, nothing
              * is being drawn and the missing piece is upstream of the GPU. */
@@ -3413,14 +3467,31 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
-                    if (now_ms - last_report > 10000) {
+                    if (s_nv2a_trace && now_ms - last_report > 10000) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
                 }
                 last_put = put; last_put_ms = now_ms;
+                /* GET as well as PUT. A title that stops submitting has either
+                 * finished or is spinning on the GPU catching up, and only GET
+                 * tells those apart -- D3D waits for GET to reach PUT before it
+                 * reuses the buffer, so GET stuck behind PUT is the shape of a
+                 * pushbuffer-full hang. Also show the same pair as the Xbox
+                 * Dashboard reads them: its D3D holds a register-block pointer
+                 * in its device struct rather than assuming 0xFD800000, and
+                 * mirroring the wrong block leaves it spinning on a GET that
+                 * never moves.
+                 *
+                 * Upstream's text, on OUR gate: theirs read s_nv2a_trace,
+                 * which is a different switch in this tree -- s_nv2a_trace_print
+                 * is the one that owns this line. */
                 if (s_nv2a_trace_print) {
-                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X\n", put);
+                    uint32_t g = *(volatile uint32_t *)
+                                 ((char *)regs + NV2A_USER_DMA_GET);
+                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
+                            "0x%08X%s\n", put, g,
+                            g == put ? "" : "  (GPU behind)");
                     fflush(stderr);
                 }
             }
@@ -3617,6 +3688,7 @@ RECOMP_TLS int g_fp_top = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;
@@ -4390,12 +4462,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
-        g_contig_memory = VirtualAlloc(
-            (LPVOID)contig_native,
-            XBOX_CONTIG_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        g_contig_mapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+            0, (DWORD)XBOX_CONTIG_SIZE, NULL);
+        g_contig_memory = g_contig_mapping
+            ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
+                              0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
+            : NULL;
+        if (!g_contig_memory)
+            g_contig_memory = VirtualAlloc(
+                (LPVOID)contig_native,
+                XBOX_CONTIG_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
         if (g_contig_memory) {
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
@@ -4780,13 +4860,35 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t tiled_native = XBOX_TILED_BASE + g_memory_offset;
         size_t tiled_size = xbox_TiledApertureSize();
-        g_tiled_view = MapViewOfFileEx(
-            g_mapping_handle,
-            FILE_MAP_ALL_ACCESS,
-            0, 0,
-            tiled_size,
-            (LPVOID)tiled_native
-        );
+        /* A view of the CONTIGUOUS window, not of RAM.
+         *
+         * On hardware all three -- physical P, 0x80000000+P and 0xF0000000+P
+         * -- are one and the same memory. Here they cannot be: the XBE image
+         * is loaded at its own VA in the RAM mapping, so aliasing the
+         * contiguous window onto RAM would drop a title's pinned physical
+         * pools on top of its own code (Halo pins 3.4 MB at 0x61000, which is
+         * inside its image). The contiguous window therefore has separate
+         * storage, and the question becomes which of the two the tiled
+         * aperture should be a view of.
+         *
+         * It is the contiguous one. A tiled address is a GPU surface address
+         * by construction, and GPU surfaces come from
+         * MmAllocateContiguousMemory -- so the pairing that has to hold is
+         * tiled to contiguous. Against RAM instead, Half-Life 2's loader wrote
+         * every decoded video frame through 0xF1C63000 while D3D sampled the
+         * texture at 0x81C63000, and the sampler read zeros: 1.8 billion black
+         * pixels rasterised, perfectly, from an empty texture.
+         */
+        if (tiled_size > XBOX_CONTIG_SIZE)
+            tiled_size = XBOX_CONTIG_SIZE;
+        g_tiled_view = g_contig_mapping
+            ? MapViewOfFileEx(
+                g_contig_mapping,
+                FILE_MAP_ALL_ACCESS,
+                0, 0,
+                tiled_size,
+                (LPVOID)tiled_native)
+            : NULL;
         if (g_tiled_view) {
             /* Prove the alias rather than assert it. Everything the title
              * renders goes through this window and is read back through the
@@ -4798,21 +4900,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 volatile uint32_t *via_tiled =
                     (volatile uint32_t *)((uintptr_t)(XBOX_TILED_BASE + 0x1000)
                                           + g_memory_offset);
-                volatile uint32_t *via_ram =
-                    (volatile uint32_t *)((uintptr_t)0x1000 + g_memory_offset);
-                uint32_t saved = *via_ram;
+                volatile uint32_t *via_contig =
+                    (volatile uint32_t *)((uintptr_t)(XBOX_CONTIG_BASE + 0x1000)
+                                          + g_memory_offset);
+                uint32_t saved = *via_contig;
 
                 *via_tiled = 0xA5C30F17u;
-                if (*via_ram != 0xA5C30F17u)
+                if (*via_contig != 0xA5C30F17u)
                     fprintf(stderr, "  WARNING: tiled aperture does NOT alias"
-                            " RAM (wrote A5C30F17, read %08X) -- rendering"
-                            " will read empty buffers\n", *via_ram);
+                            " the contiguous window (wrote A5C30F17, read"
+                            " %08X) -- the GPU will sample empty textures\n",
+                            *via_contig);
                 else
-                    fprintf(stderr, "  Tiled aperture alias verified\n");
-                *via_ram = saved;
+                    fprintf(stderr, "  Tiled aperture alias verified"
+                            " (tiled 0x%08X == contiguous 0x%08X)\n",
+                            XBOX_TILED_BASE, XBOX_CONTIG_BASE);
+                *via_contig = saved;
             }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
-                    " (aliases RAM)\n",
+                    " (aliases the contiguous window)\n",
                     (unsigned)(g_memory_size / (1024 * 1024)),
                     XBOX_TILED_BASE);
         } else {

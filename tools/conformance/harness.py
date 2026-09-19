@@ -4,6 +4,8 @@ Newlines inside generated C string literals are written as @NL@ and substituted
 at the end, so the escape survives however this file is edited.
 """
 
+import re
+
 MARK = ["nop", "nop", "nop"]
 _MARK_BYTES = "90 90 90"
 
@@ -75,17 +77,63 @@ unsigned char *g_scratch_ptr;
 """
 
 
-def native_source(cases):
+# The globals the setup/capture blocks reach for. Listed by name rather than
+# matched with a general regex because the failure is silent: MASM reads a bare
+# symbol as a memory operand, GAS assembles the *address* instead, and a harness
+# comparing against a pointer rather than the input still builds and still runs.
+_GLOBALS = ("g_scratch_ptr", "g_out_eax", "g_out_xmm", "g_out_st",
+            "g_out_sw", "g_fp_cw", "g_in_a", "g_in_b")
+
+_CLOBBER = {
+    "gpr": '"eax","ecx","edx","cc","memory"',
+    "fpu": '"eax","ecx","edx","cc","memory",'
+           '"st","st(1)","st(2)","st(3)","st(4)","st(5)","st(6)","st(7)"',
+    "sse": '"eax","ecx","edx","cc","memory",'
+           '"xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7"',
+}
+
+
+def _masm_to_gas(text):
+    """Rewrite MASM operand forms into the GAS Intel dialect (-masm=intel).
+
+    Three rewrites: a bare global becomes `[sym]`, MASM's `g_out_st[8]`
+    indexing becomes `[g_out_st+8]`, and a MASM hex literal `07FFFFFFFh`
+    becomes `0x7FFFFFFF`.
+    """
+    for g in _GLOBALS:
+        text = re.sub(rf"\b{g}\[(\d+)\]", rf"[{g}+\1]", text)
+        text = re.sub(rf"(?<![\[\w]){g}\b(?![\w\]])(?!\s*\[)", f"[{g}]", text)
+    # Requiring a leading digit is what keeps this off the 8-bit high registers
+    # -- ah/bh/ch/dh start with a letter and so never match.
+    text = re.sub(r"\b([0-9][0-9A-Fa-f]*)h\b",
+                  lambda m: "0x" + (m.group(1)[1:]
+                                    if len(m.group(1)) > 1 and m.group(1)[0] == "0"
+                                    else m.group(1)),
+                  text)
+    return text
+
+
+def native_source(cases, dialect="masm"):
+    """The native side. `dialect` is "masm" (MSVC __asm{}) or "gas" (GCC)."""
     out = ["/* generated -- native side: the real instructions on the real CPU */",
            _SHARED_STATE]
     for c in cases:
         body = "\n".join(f"        {i}" for i in MARK + c["asm"] + MARK)
-        out.append(f"""void nat_{c['name']}(void) {{
+        block = "\n".join((_SETUP[c["kind"]], body, _CAPTURE[c["kind"]]))
+        if dialect == "masm":
+            out.append(f"""void nat_{c['name']}(void) {{
     __asm {{
-{_SETUP[c['kind']]}
-{body}
-{_CAPTURE[c['kind']]}
+{block}
     }}
+}}""")
+        else:
+            asm = "\n".join(f'        "{l.strip()}\\n\\t"'
+                            for l in _masm_to_gas(block).splitlines() if l.strip())
+            out.append(f"""void nat_{c['name']}(void)
+{{
+    __asm__ __volatile__(
+{asm}
+        ::: {_CLOBBER[c['kind']]});
 }}""")
     return "\n".join(out)
 
@@ -103,7 +151,7 @@ RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
 RECOMP_TLS int g_df;   /* EFLAGS.DF: the direction the string ops walk */
 RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
-RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp;
+RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
 RECOMP_TLS RecompMmx g_mm0,g_mm1,g_mm2,g_mm3,g_mm4,g_mm5,g_mm6,g_mm7;
 volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
@@ -121,8 +169,28 @@ extern unsigned char *g_scratch_ptr;
 /* Guest addresses are host addresses here (g_xbox_mem_offset stays 0), so a
    memory operand reads the same bytes on both sides. 16-byte aligned for the
    aligned SSE moves. */
+#if defined(_MSC_VER)
 static __declspec(align(16)) unsigned char g_scratch[64];
+#else
+static unsigned char g_scratch[64] __attribute__((aligned(16)));
+#endif
 static unsigned char g_guest_stack[64 * 1024];
+
+/* The native side deliberately runs at PC=53 so the hardware carries no more
+   bits than the model's C doubles can (see FP_CONTROL_WORD). That setting is
+   global CPU state, and it must not still be in force when the lifted side
+   runs: musl's i386 libm implements sin/cos/tan with x87 and needs extended
+   precision for its argument reduction, so at PC=53 cos(100.0) comes back as
+   -1.27e16 rather than 0.862. The lifted side is compiled -mfpmath=sse, so its
+   own arithmetic is unaffected by the x87 precision control either way. */
+#if defined(__GNUC__) && defined(__i386__)
+static void fp_restore_default(void) {
+    unsigned short cw = 0x037F;
+    __asm__ __volatile__("fldcw %0" :: "m"(cw));
+}
+#else
+static void fp_restore_default(void) { }
+#endif
 
 /* What the lifted run produced, in the same shape as the native capture. */
 static unsigned int  l_eax;
@@ -133,7 +201,7 @@ static unsigned char l_xmm[128];
 
 _LIFTED_PROLOGUE = {
     "gpr": """    g_eax = g_in_a; g_ecx = g_in_b; g_edx = 0;""",
-    "fpu": """    g_fp_top = 0; g_fp_control_word = 0x027Fu; g_fp_cmp = 0;
+    "fpu": """    g_fp_top = 0; g_fp_control_word = 0x027Fu; g_fp_cmp = 0; g_fp_cc = 0x4000;
 @FPMACROS@
     memset(g_fp_stack, 0, sizeof(g_fp_stack));
     g_eax = (uint32_t)(uintptr_t)g_scratch; g_ecx = 0; g_edx = 0;""",
@@ -288,7 +356,8 @@ def harness_source(prepared, why_of, tol_of):
                        + ("\n      n_depth = (8 - ((g_out_sw >> 11) & 7)) & 7;"
                           "\n      memcpy(n_st, g_out_st, sizeof n_st);"
                           if kind == "fpu" else ""))
-            out.append(f"      lif_{name}(); g_total++;")
+            out.append("      fp_restore_default();"
+                   f"\n      lif_{name}(); g_total++;")
             out.append(f"      cmp_{kind}(\"{name}\", \"{why_of[name]}\", "
                        f"&shown, {vec}"
                        + (f", {tol_of[name]!r}" if kind == "fpu" else "") + "); }")

@@ -22,7 +22,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 /* Returns the presentation surface selected by the NV2A executor. */

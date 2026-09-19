@@ -447,6 +447,26 @@ CASES = [
     Case("js_cmp_i8", "sign flag after an 8-bit cmp, which truncates first",
          ["cmp al, cl", "sets al", "movzx eax, al"], _PAIRS),
 
+    # Unsigned word saturation must clamp each lane, not wrap or drop the op.
+    *[Case("mmx_" + op + "_" + form + "_" + str(half),
+           "unsigned word arithmetic saturates all four lanes",
+           ["movd mm0, eax", "punpckldq mm0, mm0",
+            "movd mm1, ecx", "punpckldq mm1, mm1"]
+           + ([op + " mm0, mm1"] if form == "reg" else
+              ["sub esp, 8", "movq qword ptr [esp], mm1",
+               op + " mm0, qword ptr [esp]", "add esp, 8"])
+           + (["psrlq mm0, 32"] if half else [])
+           + ["sub esp, 8", "movq qword ptr [esp], mm0",
+              "mov eax, dword ptr [esp]", "add esp, 8", "emms"],
+           [(a, b) for a in (0, 1, 0x0001ffff, 0x80007fff, 0xfffeffff, 0xffffffff)
+                   for b in (0, 1, 0x0001ffff, 0x80007fff, 0xfffeffff, 0xffffffff)])
+      for op in ("paddusw", "psubusw") for form in ("reg", "mem") for half in (0, 1)],
+
+    *[Case("mmx_" + op + "_flags", "unsigned saturated arithmetic preserves EFLAGS",
+           ["pxor mm0, mm0", "pxor mm1, mm1", "cmp eax, 0", op + " mm0, mm1",
+            "sete al", "movzx eax, al", "emms"], [(0, 0), (1, 0)])
+      for op in ("paddusw", "psubusw")],
+
     # bt/btr/bts/btc are 386 instructions, so real Xbox code has them. They
     # were unhandled until the corpus lifted the CRT's float-to-int helper,
     # which uses btr to clear a rounding-control bit of the x87 control word.
@@ -526,3 +546,22 @@ CASES = [
          ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fucompp",
           "fnstsw ax", "and eax, 04500h"], _FP_NAN, "fpu"),
 ]
+
+# MMX arithmetic/conversions preserve EFLAGS. Exercise the deferred condition,
+# not only the MMX result, with both true and false incoming comparisons.
+for _op in (
+        "paddsb mm0, mm1", "paddsw mm0, mm1", "paddusb mm0, mm1",
+        "psubsb mm0, mm1", "psubsw mm0, mm1", "psubusb mm0, mm1",
+        "pavgb mm0, mm1", "pavgw mm0, mm1", "pminsw mm0, mm1",
+        "pmaxsw mm0, mm1", "psadbw mm0, mm1",
+        "cvtps2pi mm0, xmm0", "cvttps2pi mm0, xmm0",
+        "pinsrw mm0, ecx, 0", "pextrw edx, mm0, 0"):
+    for _consumer, _before, _after in (
+            ("sete", ["cmp eax, 0"], ["sete al", "movzx eax, al"]),
+            ("cmove", ["cmp eax, 0"], ["cmove eax, ecx"]),
+            ("sbb", ["neg eax"], ["sbb eax, eax"])):
+        CASES.append(Case(
+            "mmx_flags_" + _op.split()[0] + "_" + _consumer,
+            "MMX preserves the comparison/carry consumed afterward",
+            ["pxor mm0, mm0", "pxor mm1, mm1", "xorps xmm0, xmm0"]
+            + _before + [_op] + _after + ["emms"], [(0, 7), (1, 7)]))

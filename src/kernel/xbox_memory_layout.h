@@ -176,6 +176,10 @@ uint32_t xbox_OhciPortWrite(uint32_t current, uint32_t value);
  *
  * Returns 0 on success, -1 if the table is full. */
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
+/* Advance those counters now, because a swap really completed. Called by the
+ * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
+ * stands down, so the count follows what was actually drawn. */
+void xbox_Nv2aFrameCounterFlip(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -272,7 +276,7 @@ void xbox_WatchdogStart(void);
 #define KDATA_FILE_OBJ_TYPE     0x0C0  /* IoFileObjectType (4 bytes) */
 #define KDATA_TIME_INCREMENT    0x0D0  /* KeTimeIncrement (4 bytes) */
 #define KDATA_BOOT_SMC_VIDEO    0x0E0  /* HalBootSMCVideoMode (4 bytes) */
-#define KDATA_IDEX_CHANNEL      0x0F0  /* IdexChannelObject (opaque) */
+#define KDATA_IDEX_CHANNEL      0x500  /* IDE_CHANNEL_OBJECT (512-byte reserved region) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */

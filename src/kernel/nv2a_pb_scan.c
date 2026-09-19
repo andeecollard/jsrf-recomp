@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_pb_scan.h"

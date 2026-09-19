@@ -45,22 +45,43 @@ def _store(mnemonic, size):
 
 class FistHelperSelectionTest(unittest.TestCase):
     def test_each_destination_width_gets_its_own_helper(self):
+        # The per-width RECOMP_F2I*_ROUND helpers were replaced at the merge
+        # with upstream's recomp_fist, which takes the width as an argument
+        # and additionally honours the guest's x87 rounding-control bits
+        # instead of assuming nearest-even. The property this test exists for
+        # is unchanged: the destination's width must reach the conversion, so
+        # that an out-of-range value yields THAT width's integer indefinite.
         for mnemonic in ("fist", "fistp"):
-            for size, helper in ((2, "RECOMP_F2I16_ROUND"),
-                                 (4, "RECOMP_F2I_ROUND"),
-                                 (8, "RECOMP_F2I64_ROUND")):
+            for size, bits in ((2, 16), (4, 32), (8, 64)):
                 with self.subTest(mnemonic=mnemonic, size=size):
-                    self.assertIn(helper + "(fp_top())", _store(mnemonic, size))
+                    out = _store(mnemonic, size)
+                    self.assertIn(
+                        f"recomp_fist(fp_top(), g_fp_control_word, {bits})",
+                        out)
+                    # and the store is made at that width, through the
+                    # traced-write macro rather than a raw pointer store.
+                    self.assertIn(f"RECOMP_MEM_WRITE{bits}(", out)
 
     def test_no_llrint_and_no_bare_narrowing_cast_survives(self):
-        # Both halves of the old emission, guarded directly.
+        # The defect this guards is converting the x87 value with a bare C
+        # cast or with llrint: both disagree with x86 exactly at NaN, the
+        # infinities and the range bounds -- llrint saturates on AArch64, and
+        # narrowing its long long is undefined for the very values the
+        # integer-indefinite sentinel is about.
+        #
+        # A cast of recomp_fist's RESULT is not that defect: it has already
+        # clamped to the destination width's indefinite (see recomp_fist in
+        # templates/runtime/recomp_types.h), so the cast is exact by
+        # construction. What must not appear is a cast of the raw value.
         for size in (2, 4, 8):
             with self.subTest(size=size):
                 out = _store("fistp", size)
                 self.assertNotIn("llrint", out)
-                self.assertNotIn("(int16_t)", out)
-                self.assertNotIn("(int32_t)", out)
-                self.assertNotIn("(int64_t)", out)
+                for cast in ("(int16_t)fp_top()", "(int32_t)fp_top()",
+                             "(int64_t)fp_top()", "(int16_t)llrint",
+                             "(int32_t)llrint", "(int64_t)llrint"):
+                    self.assertNotIn(cast, out)
+                self.assertIn("recomp_fist(fp_top(), g_fp_control_word,", out)
 
     def test_fist_does_not_pop_and_fistp_does(self):
         # The helper swap must not disturb the stack discipline around it.

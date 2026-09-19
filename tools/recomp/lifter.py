@@ -14,11 +14,106 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import os
 import re
 import struct
 
 from .disasm import Instruction, Operand
 from .config import is_code_address, is_data_address, va_to_file_offset
+
+# Function export names of the Windows libraries the host exe links
+# (kernel32/user32/gdi32/advapi32/winmm/ws2_32/ole32/dbghelp/...). A guest
+# function that shares one of these names collides with the import at link
+# time (LNK2005) -- every Xbox-era game re-exports shims named like Win32
+# APIs (CreateThread, GetLastError, QueryPerformanceCounter, SetEvent, ...).
+# Generated from the x64 import libs of the Windows SDK with:
+#   Get-ChildItem "$env:WINSDK/Lib/*/um/x64" -Filter *.lib | ForEach-Object {
+#     & dumpbin /exports $_ }  # then keep the indent-only identifier lines
+_WIN32_EXPORTS = set()
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_WIN32_EXPORTS_FILE = os.path.join(_DATA_DIR, "win32_api_names.txt")
+if os.path.exists(_WIN32_EXPORTS_FILE):
+    with open(_WIN32_EXPORTS_FILE, encoding="ascii") as _f:
+        _WIN32_EXPORTS.update(line.strip() for line in _f if line.strip())
+
+
+# C identifiers a recompiled function name must not be: the generated TUs
+# include the C standard headers (math.h/string.h through recomp_types.h,
+# stdlib.h in the dispatch TU), and a recompiled image carries its own copies
+# of the CRT helpers -- Black has a function literally named `onexit`.
+# Emitting `void onexit(void);` next to UCRT's `onexit_t __cdecl onexit(
+# onexit_t)` is a redefinition with different type modifiers and cl fails with
+# C2373. The host Win32 export names are folded in too: the host exe links
+# kernel32.lib et al., and Xbox games re-export shims named exactly like the
+# APIs they wrap, so the same clash happens there for the linker. Mangle with
+# the address, the same suffixed-<addr> scheme func_id already uses for
+# duplicate names.
+#
+# This is the last guard before a name becomes a C token, and the only one
+# every name source passes through -- Ghidra, IDA, a hand-written symbols
+# file. tools/ghidra_naming/merge_names.py filters a similar set earlier, but
+# it only sees the Ghidra path, so this list must not be the smaller of the
+# two. Over-mangling costs an address suffix on a name; under-mangling costs
+# a build.
+_FUNC_RESERVED_IDENT = frozenset({
+    # C and C++ keywords
+    "asm", "auto", "break", "case", "char", "const", "continue",
+    "default", "do", "double", "else", "enum", "extern", "float",
+    "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static",
+    "struct", "switch", "typedef", "union", "unsigned", "void",
+    "volatile", "while",
+    # <string.h>
+    "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
+    "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
+    "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
+    "strspn", "strstr", "strtok", "strxfrm", "strdup", "strnlen",
+    # <math.h> C89
+    "acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp",
+    "fabs", "floor", "fmod", "frexp", "ldexp", "log", "log10", "modf",
+    "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+    # <math.h> C99 classification and comparison. These are function-like
+    # *macros*, which makes them the worst members of this set: a function
+    # named `isnan` does not collide, it expands. `void isnan(void);` becomes
+    # `void (fpclassify(void) == FP_NAN);` and the compiler reports a bad
+    # parameter declarator inside corecrt_math.h, naming neither the guest
+    # function nor the clash. Reported from a FIFA Street 2 port.
+    "fpclassify", "isfinite", "isgreater", "isgreaterequal", "isinf",
+    "isless", "islessequal", "islessgreater", "isnan", "isnormal",
+    "isunordered", "signbit",
+    # <math.h> C99 functions
+    "acosh", "asinh", "atanh", "cbrt", "copysign", "erf", "erfc", "exp2",
+    "expm1", "fdim", "fma", "fmax", "fmin", "hypot", "ilogb", "lgamma",
+    "llrint", "llround", "log1p", "log2", "logb", "lrint", "lround",
+    "nan", "nearbyint", "nextafter", "nexttoward", "remainder", "remquo",
+    "rint", "round", "scalbln", "scalbn", "tgamma", "trunc",
+    # <stdlib.h>
+    "abort", "abs", "atexit", "atof", "atoi", "atol", "bsearch",
+    "calloc", "div", "exit", "free", "getenv", "labs", "ldiv", "malloc",
+    "mblen", "mbstowcs", "mbtowc", "onexit", "qsort", "rand", "realloc",
+    "srand", "strtod", "strtol", "strtoul", "system", "wctomb",
+    "wcstombs",
+    # <stdlib.h> C99
+    "atoll", "llabs", "lldiv", "strtof", "strtold", "strtoll", "strtoull",
+    # <setjmp.h>
+    "longjmp", "setjmp",
+    # Host Win32 API export names (data/win32_api_names.txt) so a guest
+    # function named like a linked import does not collide at link time.
+}) | _WIN32_EXPORTS
+
+
+def _func_ident(addr, name):
+    """C identifier for the recompiled function at addr.
+
+    Every place a func_db name becomes a C token -- the function definition,
+    its forward declaration, call sites and the dispatch table -- must agree,
+    or the link fails. Reserved names get the same ``_<addr>`` suffix func_id
+    already gives duplicate names.
+    """
+    base = name if name else f"sub_{addr:08X}"
+    if base in _FUNC_RESERVED_IDENT:
+        return f"{base}_{addr:08X}"
+    return base
 
 
 # ── Operand formatting ──────────────────────────────────────
@@ -398,9 +493,12 @@ _EFLAGS_PRESERVE = frozenset({
     "addpd", "subpd", "mulpd", "divpd",
     # SSE/MMX integer
     "movd", "movq", "movntq",
+    "cvtps2pi", "cvttps2pi", "pinsrw", "pextrw",
     "emms",
     "paddb", "paddw", "paddd", "paddq",
     "psubb", "psubw", "psubd",
+    "paddsb", "paddsw", "paddusb", "psubsb", "psubsw", "psubusb",
+    "pavgb", "pavgw", "pminsw", "pmaxsw", "psadbw",
     "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
     "pand", "pandn", "por", "pxor",
     "pcmpeqb", "pcmpeqw", "pcmpeqd",
@@ -413,6 +511,7 @@ _EFLAGS_PRESERVE = frozenset({
     "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq",
     "packsswb", "packssdw", "packuswb",
     "pmovmskb",
+    "paddusw", "psubusw",
     # String operations (without rep prefix)
     "stosb", "stosw", "stosd",
     "movsb", "movsw", "movsd",
@@ -825,6 +924,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
         # MOV/LEA/POP may overwrite the destination before flags are consumed.
         # JSRF's ADX loop reloads ECX with its input pointer after DEC ECX;
         # testing live ECX made that sixteen-iteration loop run indefinitely.
+        lhs = "_fa"  # Result at the flag-setting instruction, before later MOVs.
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        if jcc in ("ja", "jnbe"):
+            return f"(!_cf && {lhs} != 0)", desc
+        if jcc in ("jbe", "jna"):
+            return f"(_cf || {lhs} == 0)", desc
         if jcc in ("je", "jz"):
             return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
@@ -834,12 +942,35 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jns":
             return "(_fas >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
+            # OF for inc/dec is "the result is the width's extreme": inc
+            # overflows exactly when it lands on INT_MIN, dec exactly when it
+            # lands on INT_MAX. Computed here from _fa at the operand's width.
+            #
+            # Upstream spells the same predicate at the snapshot instead,
+            # storing it in _fb. We do NOT take that: our _result_snapshot
+            # publishes only _fa/_fas for inc/dec (_fb belongs to add/sub, as
+            # its docstring says), so `_fb != 0` here would read whatever the
+            # last cmp or add left in it. Same formula, computed where the
+            # value it needs actually lives.
             bits = (_operand_width(flag_ops[0]) or 4) * 8
             overflow_result = (1 << (bits - 1)) - (flag_setter == "dec")
             less = f"((_fas < 0) != (_fa == 0x{overflow_result:X}u))"
             return {"jl": less, "jge": f"(!{less})",
                     "jle": f"((_fa == 0) || {less})",
                     "jg": f"((_fa != 0) && !{less})"}[jcc], desc
+        if jcc in ("jo", "jno"):
+            # Same predicate, for the flag itself. Upstream gained these with
+            # the _fb spelling; keeping them costs nothing once OF is written
+            # out here, and refusing them would fall back to the dead `_flags`.
+            bits = (_operand_width(flag_ops[0]) or 4) * 8
+            overflow_result = (1 << (bits - 1)) - (flag_setter == "dec")
+            of = f"(_fa == 0x{overflow_result:X}u)"
+            return (of if jcc == "jo" else f"(!{of})"), desc
+        if jcc in ("jp", "jpe", "jnp", "jpo"):
+            # PF is the parity of the low byte of the result, which _fa holds.
+            # Upstream's, kept as-is: it needs no _fb.
+            return ("RECOMP_PARITY8(_fa)" if jcc in ("jp", "jpe")
+                    else "!RECOMP_PARITY8(_fa)"), desc
         return None
 
     # ── neg: flags from (0 - a_orig), result is -a ──
@@ -1297,6 +1428,9 @@ class Lifter:
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
+        # Addresses loaded as immediates into a register inside the current
+        # function, used to resolve `jmp <reg>`. See _lift_jmp.
+        self.imm_code_refs = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1314,6 +1448,7 @@ class Lifter:
             name = self.label_db[addr]
         else:
             name = f"sub_{addr:08X}"
+        name = _func_ident(addr, name)
         self.referenced_calls[addr] = name
         return name
 
@@ -1572,9 +1707,13 @@ class Lifter:
         # Dispatched on the operands rather than the mnemonic, because the
         # integer SIMD names are shared with SSE: `paddw mm0, mm1` and
         # `paddw xmm0, xmm1` differ only in register file.
+        # cvtpi2ps is named here as well: its source may be m64 rather than
+        # an mm register, and dispatching purely on the operands then sent
+        # that form past the MMX lifter to a TODO comment -- the same silent
+        # drop, one addressing mode along.
         if any(op.type == "reg" and op.reg and op.reg.startswith("mm")
                and not op.reg.startswith("xmm") for op in ops) or m in (
-                   "emms", "femms"):
+                   "emms", "femms", "cvtpi2ps"):
             return self._lift_mmx(insn, m, ops)
 
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
@@ -2208,28 +2347,35 @@ class Lifter:
         return out
 
     def _lift_sar(self, insn, ops):
-        """Arithmetic right shift, at the OPERAND's width.
+        """Arithmetic shift right, at the operand's own width.
 
-        The cast has to match the destination's size, not always be int32_t.
-        Every narrow read here arrives zero-extended -- LO8/LO16 mask, and
-        MEM8/MEM16 are unsigned pointers -- so `(int32_t)LO8(eax) >> n` is a
-        LOGICAL shift wearing an arithmetic cast, and the sign bits it should
-        be feeding in are zeros that were never there.
+        Two things have to be right that a bare "(int32_t)dst >> cnt" gets
+        wrong.
 
-        Measured, not reasoned: `sar al, 1` with al=0x80 produced 0x40 where
-        x86 gives 0xC0. Same defect at 16 bits. That is a wrong VALUE, not a
-        wrong flag -- it silently halves a negative number instead of
-        propagating its sign, which is exactly how a fixed-point divide or a
-        signed average goes quietly wrong.
+        The cast must match the operand. Every narrow read arrives
+        zero-extended - LO8/HI8/LO16 mask, and MEM8/MEM16 are unsigned - so
+        casting an 8- or 16-bit operand to int32_t produces a positive number
+        and the ">>" is a logical shift wearing an arithmetic cast. "sar al, 1"
+        with al = 0x80 gave 0x40 where x86 gives 0xC0: a negative value halved
+        into a positive one, which is how a fixed-point divide or a signed
+        average goes quietly wrong without ever faulting. int8_t/int16_t
+        promote to int before the shift, so a count at or above the operand
+        width still sign-fills and stays well defined.
 
-        The count keeps its 5-bit mask: x86 masks to 5 bits for 8-, 16- and
-        32-bit operands alike. A masked count larger than the operand is then
-        fine, because int8_t/int16_t promote to int before the shift, so the
-        result is sign-filled rather than undefined.
+        The count must be masked to 5 bits, as x86 does for 8-, 16- and 32-bit
+        operands. Unmasked, "sar eax, 33" asks C for a shift of 33 on a 32-bit
+        type, which is undefined - the host may fold it to 33 & 31 and look
+        correct, which is exactly why it cannot be left to chance.
 
-        CF is unaffected by the change. It is bit (count-1) of the ORIGINAL
-        value, and zero-extension cannot disturb bits that are inside the
-        operand's own width.
+        CF reads the sign-extended value too, not the raw operand. For a
+        count below the operand width either spelling gives the same bit, but
+        x86 keeps sign-filling past that width: "sar al, 31" on al = 0x80
+        leaves CF = 1. Reading bit 30 of the zero-extended 0x80 gives 0, and
+        reading it of the sign-extended 0xFFFFFF80 gives 1. It takes the count
+        mask for the same reason the value does.
+
+        The result snapshot in the body is ours and is kept: sar is a result
+        setter, so it publishes _fa/_fas next to the write for a later jcc.
         """
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
@@ -2237,10 +2383,25 @@ class Lifter:
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31)"   # see _lift_shift
         width = _operand_width(ops[0]) or 4
         scast = {1: "(int8_t)", 2: "(int16_t)"}.get(width, "(int32_t)")
+        # Sign-extend FIRST, then shift, for the VALUE and for CF alike.
+        #
+        # The CF half is upstream's finding and is kept: CF is bit (count-1)
+        # of the SIGN-EXTENDED value, not of the zero-extended operand, because
+        # x86 keeps sign-filling past the operand's width. `sar al, 31` on
+        # al = 0x80 leaves CF = 1; reading bit 30 of the zero-extended 0x80
+        # gives 0, which is what this used to do.
+        #
+        # Spelled with the narrow cast rather than upstream's
+        # `(int32_t)(int8_t)(x)`: int8_t/int16_t promote to int anyway, so the
+        # shift is identical and well defined at any masked count, and the
+        # emitted shift stays free of a widening (int32_t) at 8 and 16 bits --
+        # which is exactly what test_lifter_sar_width's negative control
+        # checks for.
+        signed = f"{scast}{dst}"
         out = []
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({scast}{dst} >> {cnt})"))
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed} >> (({cnt}) - 1))) & 1);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({signed} >> {cnt})"))
         out.append(self._result_snapshot(ops, "sar"))
         return out
 
@@ -2271,7 +2432,8 @@ class Lifter:
 
     # ── Compare / Test (standalone) ──
 
-    # Widths for the flag snapshot below.
+    # Sign-extending cast and mask per operand width, shared by the flag
+    # snapshot below and by the arithmetic shift above.
     _SNAP_MASK = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}
     _SNAP_SX = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}
 
@@ -2659,6 +2821,31 @@ class Lifter:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
+            # `jmp <reg>` where the register was loaded with an address
+            # inside this same function: a hand-written continuation chain,
+            # not a call. The XMV YUV-to-RGB converter in Half-Life 2's
+            # loader is built this way -- four blocks that each do
+            # `mov ebx, <next>; jmp <shared tail>`, and the shared tail ends
+            # `jmp ebx`. Treated as an indirect tail call it resolved to
+            # nothing, so the shared tail never came back and the function's
+            # epilogue never ran: every call leaked 0x2C bytes of guest stack
+            # and the converter wrote past its surface until it walked out of
+            # the tiled aperture, 144 MB later.
+            #
+            # The targets are labels in this function, so this is a goto, and
+            # the same shape the memory-operand switch above emits.
+            if ops[0].type == "reg" and self.imm_code_refs:
+                inside = sorted(t for t in self.imm_code_refs
+                                if self.func_start <= t < self.func_end)
+                if inside:
+                    target_expr = _fmt_operand_read(ops[0])
+                    lines = [f"{{ uint32_t _jt = {target_expr};"
+                             f" /* intra-function indirect jmp:"
+                             f" {len(inside)} targets */"]
+                    for t in inside:
+                        lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    return lines
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
         return ["/* jmp: no target */"]
@@ -2916,6 +3103,7 @@ class Lifter:
         "paddsb": "MMX_PADDSB", "paddsw": "MMX_PADDSW",
         "psubsb": "MMX_PSUBSB", "psubsw": "MMX_PSUBSW",
         "paddusb": "MMX_PADDUSB", "psubusb": "MMX_PSUBUSB",
+        "paddusw": "MMX_PADDUSW", "psubusw": "MMX_PSUBUSW",
         "pmullw": "MMX_PMULLW", "pmulhw": "MMX_PMULHW",
         "pmaddwd": "MMX_PMADDWD",
         "pavgb": "MMX_PAVGB", "pavgw": "MMX_PAVGW",
@@ -2987,6 +3175,25 @@ class Lifter:
             else:
                 return [f"/* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
+
+        # cvtpi2ps: the other direction -- two dwords in, two singles out,
+        # into the LOW half of an xmm whose upper lanes are preserved. The
+        # destination is an xmm and the source an mm register or m64, so
+        # neither goes through the mm paths above and it fell through to a
+        # TODO comment: in Half-Life 2's loader that silently deleted every
+        # integer-to-float step of the XMV YUV-to-RGB converter, which then
+        # ran its whole float pipeline on stale registers and painted every
+        # frame of the intro solid red.
+        if m == "cvtpi2ps" and len(ops) >= 2 and dst.type == "reg" \
+                and dst.reg and dst.reg.startswith("xmm"):
+            s_op = ops[1]
+            if s_op.type == "reg" and s_op.reg and s_op.reg.startswith("mm"):
+                a = s_op.reg
+            elif s_op.type == "mem":
+                a = f"MMX_MEM({_fmt_mem(s_op)})"
+            else:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = XMM_FROM_PI({dst.reg}, {a}); /* cvtpi2ps */"]
 
         # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
         # an xmm register or a 64-bit memory operand -- never an mm register,
@@ -3498,30 +3705,32 @@ class Lifter:
                 function = getattr(op, "function_address", self.func_start)
                 addr = _fmt_store_address(op)
                 pop = " fp_pop();" if m == "fistp" else ""
-                # The same float -> int rule the SSE path already uses, which
-                # this one was simply missed by. `(int_type)llrint(x)` is wrong
-                # twice over: llrint saturates on AArch64 where x86 stores the
-                # integer indefinite (NaN reads back as 0, not 0x80000000), and
-                # narrowing its long long result is undefined behaviour for
-                # exactly the out-of-range values the sentinel is about.
-                # FIST/FISTP rounds -- under the x87 control word rather than
-                # MXCSR, but with the same nearest-even default -- so it is the
-                # ROUND helper at the destination's own width, never TRUNC.
+                # BOTH sides kept. The VALUE is upstream's recomp_fist,
+                # which honours the guest x87 rounding-control bits and
+                # stores the signed integer indefinite on a masked invalid
+                # conversion -- the two things `(int_type)llrint(x)` got
+                # wrong (llrint saturates on AArch64 where x86 stores the
+                # indefinite, and narrowing its long long result is UB for
+                # exactly the out-of-range values the sentinel is about).
                 #
-                # Not a corner of the title: sub_0017C3E8 is MSVC's _ftol2 --
-                # 432 call sites across 129 functions in JSRF, i.e. it is *the*
-                # (int)float conversion for the whole image -- and its
-                # `fistp qword ptr [esp+0x10]` lands here. That routine does
-                # NOT reprogram the control word: it converts nearest-even,
-                # reloads with fild, and corrects toward zero with the residue
-                # (fsubp / add 0x7FFFFFFF / adc-sbb), all of which is ordinary
-                # arithmetic we already lift. So nearest-even is the right mode
-                # to hand it, and the truncation falls out of the guest's code.
-                helper = {16: "RECOMP_F2I16_ROUND",
-                          64: "RECOMP_F2I64_ROUND"}.get(bits, "RECOMP_F2I_ROUND")
+                # The STORE stays wrapped in RECOMP_MEM_WRITE, which is ours:
+                # the diagnostics tree reads that write trace, and upstream's
+                # bare `*(type *)addr = ...` would have silently dropped it.
+                #
+                # Nearest-even stays the common case for this title anyway.
+                # sub_0017C3E8 is MSVC's _ftol2 -- 432 call sites across 129
+                # functions, i.e. *the* (int)float conversion for the whole
+                # image -- and its `fistp qword ptr [esp+0x10]` lands here.
+                # That routine does NOT reprogram the control word: it
+                # converts nearest-even, reloads with fild, and corrects
+                # toward zero with the residue, all ordinary arithmetic we
+                # already lift. Reading the live control word gives it the
+                # same answer, and additionally gets right the callers that
+                # DO reprogram it.
                 return [f"RECOMP_MEM_WRITE{bits}(0x{pc:08X}u, "
                         f"0x{function:08X}u, {addr}, "
-                        f"{helper}(fp_top()));{pop} /* {m} */"]
+                        f"(int{bits}_t)recomp_fist(fp_top(), "
+                        f"g_fp_control_word, {bits}));{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
@@ -3658,8 +3867,10 @@ class Lifter:
         if m == "fldln2":
             return [f"fp_push(0.69314718055994530942); /* fldln2 */"]
         if m == "ftst":
-            return [f"g_fp_cmp = (fp_top() < 0.0) ? -1 : "
-                    f"(fp_top() > 0.0) ? 1 : 0; /* ftst */"]
+            return ["g_fp_cmp = RECOMP_FCMP(fp_top(), 0.0); "
+                    "g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp); /* ftst */"]
+        if m == "fxam":
+            return ["g_fp_cc = recomp_fxam(fp_top()); /* fxam */"]
         if m == "fxch":
             # fxch st(i) swaps st0 with st(i); the bare form is st(1). Was
             # hardcoded to st1, so fxch st(2)/st(3)/st(4) (86/7/1 sites in Halo)
@@ -3693,6 +3904,7 @@ class Lifter:
             npop = 2 if m.endswith("pp") else (1 if m.endswith("p") else 0)
             pops = " fp_pop();" * npop
             return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
+                    " g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp);"
                     f"{pops} /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
@@ -3719,10 +3931,7 @@ class Lifter:
             # `test ah, 0x44; jp` -- the standard isnan idiom -- reads exactly
             # those two bits. Reporting equal for a NaN compare sends every
             # float classification in a title down the wrong branch.
-            status = ("(uint16_t)(((g_fp_top & 7u) << 11) |"
-                      " (g_fp_cmp == 2 ? 0x4500u :"
-                      " g_fp_cmp < 0 ? 0x0100u :"
-                      " g_fp_cmp > 0 ? 0x0000u : 0x4000u))")
+            status = "(uint16_t)(((g_fp_top & 7u) << 11) | g_fp_cc)"
             if insn.op_str.strip() in ("ax", "eax"):
                 # `fnstsw ax` writes the whole of AX, not just AH.
                 return [f"eax = (eax & 0xFFFF0000u) | (uint32_t){status};"

@@ -12,6 +12,8 @@
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
 #define _GNU_SOURCE
+/* Darwin: exposes memset_s, its explicit_bzero equivalent. */
+#define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
 
@@ -21,6 +23,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <time.h>
+#include <signal.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
@@ -80,6 +83,12 @@ LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
+{
+    __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cmp;
+}
+
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return cmp;
@@ -147,6 +156,71 @@ VOID DeleteCriticalSection(LPCRITICAL_SECTION cs)
 }
 
 /* ===================================================================== */
+/* Slim reader/writer locks                                              */
+/* ===================================================================== */
+
+/* An SRWLOCK is usable straight from SRWLOCK_INIT, so the pthread_rwlock_t
+ * behind it has to appear on first use. Unlike the condition variables below
+ * -- whose lazy init is covered by the caller holding the paired CRITICAL
+ * SECTION -- an SRWLOCK is by definition taken from several threads at once
+ * with nothing else held, so first use genuinely races. Serialise just that:
+ * once Ptr is published, every acquire is a plain atomic load. */
+static pthread_rwlock_t *srw_lazy_init(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&lock->Ptr,
+                                           __ATOMIC_ACQUIRE);
+    if (!rw) {
+        static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        rw = (pthread_rwlock_t *)lock->Ptr;
+        if (!rw) {
+            rw = (pthread_rwlock_t *)malloc(sizeof(*rw));
+            pthread_rwlock_init(rw, NULL);
+            __atomic_store_n((pthread_rwlock_t **)&lock->Ptr, rw, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&init_lock);
+    }
+    return rw;
+}
+
+VOID InitializeSRWLock(PSRWLOCK lock)
+{
+    lock->Ptr = NULL;
+    srw_lazy_init(lock);
+}
+
+VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+
+/* ===================================================================== */
+/* One-time initialisation                                               */
+/* ===================================================================== */
+
+/* Win32 semantics: the callback runs at most once for a given INIT_ONCE, and
+ * a callback returning FALSE leaves it un-run so a later call retries. Ptr
+ * doubles as the "done" flag. One global mutex covers every INIT_ONCE --
+ * initialisation is rare, and the fast path never touches it. */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context)
+{
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    if (__atomic_load_n(&once->Ptr, __ATOMIC_ACQUIRE))
+        return TRUE;
+
+    pthread_mutex_lock(&once_lock);
+    BOOL ok = TRUE;
+    if (!once->Ptr) {
+        ok = fn(once, param, context);
+        if (ok)
+            __atomic_store_n(&once->Ptr, (PVOID)1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&once_lock);
+    return ok;
+}
+
+/* ===================================================================== */
 /* Condition variables (paired with a CRITICAL_SECTION)                  */
 /* ===================================================================== */
 
@@ -203,7 +277,7 @@ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 /* ===================================================================== */
 
 typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
-               K_FILEMAP, K_FILE } w32_kind;
+               K_FILEMAP, K_FILE, K_WAITABLE_TIMER } w32_kind;
 
 #define W32_MAX_APC 16
 
@@ -246,6 +320,12 @@ typedef struct w32_object {
     DWORD           timer_period;
     WAITORTIMERCALLBACK timer_cb;
     PVOID           timer_param;
+
+    /* waitable timer */
+    int             waitable_manual_reset;
+    struct timespec waitable_due_time;
+    int             waitable_triggered;
+    int             waitable_armed;
 
     /* file mapping / fd-backed file handle */
     int             fd;
@@ -293,6 +373,8 @@ static void obj_release(w32_object *o)
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
+    } else if (o->kind == K_WAITABLE_TIMER) {
+        /* Waitable timers: no special cleanup needed */
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
@@ -377,6 +459,24 @@ static int drain_apcs(void)
     return run;
 }
 
+static int timespec_before(const struct timespec *a, const struct timespec *b)
+{
+    return a->tv_sec != b->tv_sec ? a->tv_sec < b->tv_sec : a->tv_nsec < b->tv_nsec;
+}
+
+/* Signalled once the due time passes; latched, so a manual-reset timer stays
+ * signalled until it is set or cancelled again. Caller holds o->lock. */
+static int waitable_due(w32_object *o)
+{
+    struct timespec now;
+    if (o->waitable_triggered) return 1;
+    if (!o->waitable_armed) return 0;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (timespec_before(&now, &o->waitable_due_time)) return 0;
+    o->waitable_triggered = 1;
+    return 1;
+}
+
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
@@ -399,18 +499,34 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         case K_MUTEX:
             ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
             break;
+        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
         default:       ready = 1; break;
         }
         if (ready) break;
 
-        int rc = timed ? pthread_cond_timedwait(&o->cond, &o->lock, &ts)
-                       : pthread_cond_wait(&o->cond, &o->lock);
-        if (rc == ETIMEDOUT) { result = WAIT_TIMEOUT; break; }
+        /* An armed timer has its own deadline. Waiting on the caller's alone
+         * would sleep straight past the due time, so take whichever comes
+         * first and re-test. */
+        struct timespec until = ts;
+        int bounded = timed;
+        if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
+            (!timed || timespec_before(&o->waitable_due_time, &ts))) {
+            until = o->waitable_due_time;
+            bounded = 1;
+        }
+        int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
+                         : pthread_cond_wait(&o->cond, &o->lock);
+        if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
+            result = WAIT_TIMEOUT; break;
+        }
     }
 
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
         case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_WAITABLE_TIMER:
+            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
+            break;
         case K_SEM:   o->sem_count--; break;
         case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
         default: break;
@@ -966,6 +1082,63 @@ BOOL TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
 }
 
 /* ===================================================================== */
+/* Waitable timers                                                       */
+/* ===================================================================== */
+
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+{
+    (void)sa;
+    (void)name;
+    w32_object *o = obj_alloc(K_WAITABLE_TIMER);
+    o->waitable_manual_reset = manualReset;
+    return (HANDLE)o;
+}
+
+BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                      PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
+{
+    w32_object *o = (w32_object *)h;
+    (void)completion; (void)arg; (void)resume;
+    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    /* Win32 100ns units: negative is relative to now, positive is an absolute
+     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
+     * title actually arms a repeating timer. */
+    if (dueTime->QuadPart <= 0) {
+        clock_gettime(CLOCK_REALTIME, &o->waitable_due_time);
+        LONGLONG ns = -dueTime->QuadPart * 100LL;
+        o->waitable_due_time.tv_sec  += (time_t)(ns / 1000000000LL);
+        o->waitable_due_time.tv_nsec += (long)(ns % 1000000000LL);
+        if (o->waitable_due_time.tv_nsec >= 1000000000L) {
+            o->waitable_due_time.tv_sec++;
+            o->waitable_due_time.tv_nsec -= 1000000000L;
+        }
+    } else {
+        /* FILETIME epoch is 1601-01-01; Unix is 1970-01-01. */
+        LONGLONG unix100ns = dueTime->QuadPart - 116444736000000000LL;
+        o->waitable_due_time.tv_sec  = (time_t)(unix100ns / 10000000LL);
+        o->waitable_due_time.tv_nsec = (long)((unix100ns % 10000000LL) * 100LL);
+    }
+    (void)period;
+    o->waitable_armed = 1;
+    o->waitable_triggered = 0;
+    pthread_mutex_unlock(&o->lock);
+    pthread_cond_broadcast(&o->cond);
+    return TRUE;
+}
+
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    o->waitable_triggered = 0;
+    o->waitable_armed = 0;
+    pthread_mutex_unlock(&o->lock);
+    return TRUE;
+}
+
+/* ===================================================================== */
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
 
@@ -1260,6 +1433,16 @@ DWORD GetFileSize(HANDLE h, LPDWORD high)
     if (fstat(fd, &st) != 0) return INVALID_FILE_SIZE;
     if (high) *high = (DWORD)(((uint64_t)st.st_size >> 32) & 0xFFFFFFFFu);
     return (DWORD)(st.st_size & 0xFFFFFFFFu);
+}
+
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    int fd = w32_handle_fd(h);
+    if (fd < 0 || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
 }
 
 BOOL FlushFileBuffers(HANDLE h)

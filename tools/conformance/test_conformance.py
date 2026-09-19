@@ -15,7 +15,7 @@ class ConformanceTest(unittest.TestCase):
         if conformance._find_vcvars() is None:
             self.skipTest("needs a 32-bit MSVC (vcvars32.bat) to assemble and "
                           "build the harness")
-        rc = conformance.main_with_args([])
+        rc = conformance.main_with_args([], allow_container=False)
         self.assertEqual(rc, 0, "the lifted C disagreed with the CPU; run "
                                 "`py -3 -m tools.conformance` for the detail")
 

@@ -120,6 +120,18 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 
+static HRESULT d3d8_present(void)
+{
+    HRESULT hr = d3d8_gamma_begin(g_device_state.default_rtv);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: Gamma presentation failed: 0x%08lX\n", hr);
+        return hr;
+    }
+    hr = IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    d3d8_gamma_end(g_device_state.default_rtv);
+    return hr;
+}
+
 /* ================================================================
  * Public frame pump (called from recompiled game code)
  * ================================================================ */
@@ -135,7 +147,7 @@ void d3d8_PresentFrame(void)
 
     /* Present the backbuffer (VSync = 1) */
     if (g_device_state.swap_chain)
-        IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+        d3d8_present();
 }
 
 /* ================================================================
@@ -352,6 +364,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     if (ref <= 0) {
         /* Cleanup subsystems first */
         up_ring_shutdown();
+        d3d8_gamma_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
@@ -450,7 +463,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         DispatchMessageA(&msg);
     }
 
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return d3d8_present();
 }
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
@@ -1331,12 +1344,14 @@ static HRESULT __stdcall dev_SetPixelShaderConstant(IDirect3DDevice8 *self, INT 
 
 static void __stdcall dev_SetGammaRamp(IDirect3DDevice8 *self, DWORD Flags, const D3DGAMMARAMP *pRamp)
 {
-    (void)self; (void)Flags; (void)pRamp;
+    (void)self; (void)Flags; /* Applied at the next presentation on both flag paths. */
+    d3d8_gamma_set(pRamp);
 }
 
 static void __stdcall dev_GetGammaRamp(IDirect3DDevice8 *self, D3DGAMMARAMP *pRamp)
 {
-    (void)self; (void)pRamp;
+    (void)self;
+    d3d8_gamma_get(pRamp);
 }
 
 static HRESULT __stdcall dev_SetPalette(IDirect3DDevice8 *self, DWORD PaletteNumber, const void *pEntries)
@@ -1381,7 +1396,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return d3d8_present();
 }
 
 /* ================================================================

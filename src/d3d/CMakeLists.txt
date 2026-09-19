@@ -5,6 +5,7 @@
 if(WIN32)
     add_library(xbox_d3d8 STATIC
         d3d8_device.c
+        d3d8_gamma.c
         d3d8_resources.c
         d3d8_shaders.c
         d3d8_states.c

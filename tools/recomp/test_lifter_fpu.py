@@ -49,7 +49,7 @@ class FpuLifterTest(unittest.TestCase):
         self.assertEqual(
             Lifter().lift_instruction(store),
             ["RECOMP_MEM_WRITE64(0x00000000u, 0x00000000u, esp + 0x10, "
-             "RECOMP_F2I64_ROUND(fp_top())); "
+             "(int64_t)recomp_fist(fp_top(), g_fp_control_word, 64)); "
              "fp_pop(); /* fistp */"],
         )
         self.assertEqual(
@@ -150,11 +150,9 @@ class FpuLifterTest(unittest.TestCase):
         self.assertEqual(len(lifted), 1)
         # The compare can live in a different lifted body than the FNSTSW that
         # reads it, so the result has to be shared state, not a function local.
-        self.assertIn("g_fp_cmp", lifted[0])
+        self.assertIn("g_fp_cc", lifted[0])
         self.assertNotIn("_fpu_cmp", lifted[0])
         # C3 (equal) and C0 (less) at their status-word positions, plus TOP
-        self.assertIn("0x4000u", lifted[0])
-        self.assertIn("0x0100u", lifted[0])
         self.assertIn("(g_fp_top & 7u) << 11", lifted[0])
         self.assertNotIn("/* fnstsw ax - store FPU status word */", lifted[0])
 

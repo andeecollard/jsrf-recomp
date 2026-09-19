@@ -11,14 +11,15 @@ implementation -- an oracle no model can be wrong about.
 
 The flow, per case:
 
-  1. MSVC assembles the snippet (we never hand-encode), bracketed by nop
-     markers, and /FAc hands back the exact bytes it produced.
+  1. The assembler assembles the snippet (we never hand-encode), bracketed by
+     nop markers, and hands back the exact bytes it produced
+     MSVC via /FAc or gcc plus objdump.
   2. Those bytes go through our real Disassembler + Lifter.
   3. A harness runs both versions over the same inputs and compares eax.
 
-Needs a 32-bit MSVC (vcvars32). Guest addresses map 1:1 onto host addresses
-here (g_xbox_mem_offset = 0), so a memory operand reads the same bytes on both
-sides.
+Needs a 32-bit MSVC (vcvars32) or Docker linux/386 container.
+Guest addresses map 1:1 onto host addresses here (g_xbox_mem_offset = 0),
+so a memory operand reads the same bytes on both sides.
 """
 
 import argparse
@@ -73,7 +74,71 @@ def _cl(vcvars, workdir, args):
     return subprocess.run(cmd, cwd=workdir, shell=True, capture_output=True,
                           text=True)
 
+_IMAGE = "xboxrecomp-conf-i386"
 
+def _docker_image_present():
+    # Not just a non-zero exit: with no docker on PATH at all this raises
+    # FileNotFoundError, and the caller is the code whose whole job is to
+    # print a readable "no toolchain" message instead of a traceback.
+    try:
+        return subprocess.run(["docker", "image", "inspect", _IMAGE],
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+class _Container:
+    """One Docker container held open for the whole run, not one per command."""
+
+    def __init__(self, workdir, mounts=()):
+        cmd = ["docker", "run", "-d", "--rm", "--platform", "linux/386",
+               "-v", f"{workdir}:/w", "-w", "/w"]
+        for src, dst in mounts:
+            cmd += ["-v", f"{src}:{dst}:ro"]
+        cmd += [_IMAGE, "sleep", "7200"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        self.cid = r.stdout.strip() if r.returncode == 0 else None
+        self.error = "" if self.cid else (r.stdout + r.stderr)
+
+    def run(self, script):
+        """Run a shell script inside it; the workdir is /w."""
+        return subprocess.run(["docker", "exec", self.cid, "sh", "-c", script],
+                              capture_output=True, text=True)
+
+    def close(self):
+        if self.cid:
+            subprocess.run(["docker", "rm", "-f", self.cid], capture_output=True)
+            self.cid = None
+
+# "   1a:\t90                   \tnop"  ->  addr, bytes. objdump wraps a long
+# instruction onto a continuation line carrying an address but no mnemonic, so
+# both forms feed the same byte stream -- dropping a continuation would drop
+# every 32-bit immediate, the exact failure the .cod parser guards against too.
+_OBJ_LINE = re.compile(r"^\s*[0-9a-f]+:\t([0-9a-f]{2}(?: [0-9a-f]{2})*)")
+_OBJ_PROC = re.compile(r"^[0-9a-f]+ <([^>]+)>:")
+
+def _bytes_from_objdump(dump_text, name):
+    """Pull the bytes between the two nop markers out of one function."""
+    want, inside, chunks = f"nat_{name}", False, []
+    for line in dump_text.splitlines():
+        m = _OBJ_PROC.match(line)
+        if m:
+            if inside:
+                break
+            inside = (m.group(1) == want)
+            continue
+        if not inside:
+            continue
+        m = _OBJ_LINE.match(line)
+        if m:
+            chunks.append(m.group(1).strip())
+    stream = " ".join(chunks)
+    first = stream.find(_MARK_BYTES)
+    last = stream.rfind(_MARK_BYTES)
+    if first < 0 or last <= first:
+        raise RuntimeError(f"{name}: could not find both nop markers")
+    mid = stream[first + len(_MARK_BYTES):last].strip()
+    return bytes.fromhex(mid.replace(" ", ""))
 
 def _bytes_from_listing(cod_text, name):
     """Pull the bytes between the two nop markers out of one function."""
@@ -104,7 +169,6 @@ def _bytes_from_listing(cod_text, name):
     mid = stream[first + len(_MARK_BYTES):last].strip()
     return bytes.fromhex(mid.replace(" ", ""))
 
-
 def _lift(code_bytes):
     """Lift raw bytes through the real pipeline, exactly as recomp would.
 
@@ -129,9 +193,7 @@ def _lift(code_bytes):
                                                    instructions=insns))
     return list(lines), mnemonics
 
-
-
-def main_with_args(argv):
+def main_with_args(argv, allow_container=True):
     ap = argparse.ArgumentParser(prog="python -m tools.conformance",
                                  description=__doc__.splitlines()[0])
     ap.add_argument("-k", metavar="SUBSTR", help="only cases whose name matches")
@@ -148,9 +210,19 @@ def main_with_args(argv):
     args = ap.parse_args(argv)
 
     vcvars = _find_vcvars()
-    if not vcvars:
-        print("ERROR: no 32-bit MSVC found (looked for vcvars32.bat under "
-              "Visual Studio 2022).", file=sys.stderr)
+    backend = "msvc" if vcvars else None
+
+    # allow_container is what keeps containers out of `pytest tools/`. The
+    # MSVC check above is not a substitute: it happens to skip on macOS, but a
+    # Linux CI box with Docker and no MSVC would otherwise start spinning up
+    # containers during a unit-test pass.
+    if not backend and allow_container and _docker_image_present():
+        backend = "docker"
+
+    if not backend:
+        print("ERROR: no 32-bit x86 toolchain. Either a 32-bit MSVC "
+              "(vcvars32.bat under Visual Studio 2022), or Docker running so a "
+              "linux/386 container can supply the CPU.", file=sys.stderr)
         return 2
 
     cases = [c for c in CASES if not args.k or args.k in c["name"]]
@@ -164,6 +236,16 @@ def main_with_args(argv):
     workdir = tempfile.mkdtemp(prefix="xboxrecomp-conf-")
     if args.verbose or args.keep:
         print(f"workdir: {workdir}")
+
+    dk = None
+    if backend == "docker":
+        dk = _Container(workdir, mounts=[(runtime_inc, "/rt")])
+        if not dk.cid:
+            print("could not start the linux/386 container:\n" + dk.error,
+                  file=sys.stderr)
+            if dk:
+                dk.close()
+            return 2
 
     if args.xbe:
         rc = _run_xbe(vcvars, workdir, runtime_inc, args)
@@ -179,20 +261,41 @@ def main_with_args(argv):
             shutil.rmtree(workdir, ignore_errors=True)
         return rc
 
-    # 1. MSVC assembles the snippets and tells us the exact bytes.
-    with open(os.path.join(workdir, "native.c"), "w") as f:
-        f.write(native_source(cases))
-    r = _cl(vcvars, workdir, "/c /FAc /Fanative.cod native.c")
-    if r.returncode != 0:
-        print("native assembly failed:\n" + r.stdout + r.stderr, file=sys.stderr)
-        return 1
-    with open(os.path.join(workdir, "native.cod"), errors="replace") as f:
-        cod = f.read()
+    # 1. The toolchain assembles the snippets and tells us the exact bytes.
+    #    We never hand-encode: whichever assembler runs is the authority on what
+    #    the instruction actually is.
+    if backend == "msvc":
+        with open(os.path.join(workdir, "native.c"), "w") as f:
+            f.write(native_source(cases))
+        r = _cl(vcvars, workdir, "/c /FAc /Fanative.cod native.c")
+        if r.returncode != 0:
+            print("native assembly failed:\n" + r.stdout + r.stderr,
+                  file=sys.stderr)
+            if dk:
+                dk.close()
+            return 1
+        with open(os.path.join(workdir, "native.cod"), errors="replace") as f:
+            listing = f.read()
+        extract = _bytes_from_listing
+    else:
+        with open(os.path.join(workdir, "native.c"), "w") as f:
+            f.write(native_source(cases, dialect="gas"))
+        # -fno-pic: produce a fixed-address executable and guest addresses have to stay 1:1 with host addresses
+        r = dk.run("gcc -m32 -masm=intel -msse -fno-pic -O0 -c native.c "
+                         "-o native.o && objdump -d -M intel native.o")
+        if r.returncode != 0:
+            print("native assembly failed:\n" + r.stdout + r.stderr,
+                  file=sys.stderr)
+            if dk:
+                dk.close()
+            return 1
+        listing = r.stdout
+        extract = _bytes_from_objdump
 
     # 2. Lift those bytes with the real pipeline.
     prepared, unlifted = [], []
     for c in cases:
-        code = _bytes_from_listing(cod, c["name"])
+        code = extract(listing, c["name"])
         lines, mnemonics = _lift(code)
         dropped = [l for l in lines if l.strip().startswith("/*")]
         if dropped:
@@ -204,13 +307,29 @@ def main_with_args(argv):
     # 3. Run both and compare.
     with open(os.path.join(workdir, "harness.c"), "w") as f:
         f.write(harness_source(prepared, _WHY, _TOL))
-    r = _cl(vcvars, workdir,
-            f'/W3 /I"{runtime_inc}" harness.c native.obj /Feharness.exe')
-    if r.returncode != 0:
-        print("harness build failed:\n" + r.stdout + r.stderr, file=sys.stderr)
-        return 1
-    run = subprocess.run([os.path.join(workdir, "harness.exe")],
-                         capture_output=True, text=True)
+    if backend == "msvc":
+        r = _cl(vcvars, workdir,
+                f'/W3 /I"{runtime_inc}" harness.c native.obj /Feharness.exe')
+        if r.returncode != 0:
+            print("harness build failed:\n" + r.stdout + r.stderr,
+                  file=sys.stderr)
+            if dk:
+                dk.close()
+            return 1
+        run = subprocess.run([os.path.join(workdir, "harness.exe")],
+                             capture_output=True, text=True)
+    else:
+        r = dk.run("gcc -m32 -msse2 -mfpmath=sse -fno-pic -no-pie -O0 -I/rt "
+                   "harness.c native.o "
+                   "-o harness -lm")
+        if r.returncode != 0:
+            print("harness build failed:\n" + r.stdout + r.stderr,
+                  file=sys.stderr)
+            if dk:
+                dk.close()
+            return 1
+
+        run = dk.run("./harness")
     print(run.stdout.strip())
     if run.returncode < 0 or run.returncode > 1:
         # A snippet faulted on the native side (idiv overflow, a bad memory
@@ -220,6 +339,8 @@ def main_with_args(argv):
               f"the one after the last line printed above.", file=sys.stderr)
         if run.stderr.strip():
             print(run.stderr.strip(), file=sys.stderr)
+        if dk:
+            dk.close()
         return 1
 
     if unlifted:
@@ -235,6 +356,8 @@ def main_with_args(argv):
     if args.only != "snippets":
         rc = _run_corpus(vcvars, workdir, runtime_inc, args) or rc
 
+    if dk:
+        dk.close()
     if not args.keep:
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
@@ -246,6 +369,11 @@ def main_with_args(argv):
 def _run_corpus(vcvars, workdir, runtime_inc, args):
     """Phase two: real C functions -- compiled, linked, lifted, compared."""
     nl = chr(10)
+    if not vcvars:
+        print(nl + "corpus phase SKIPPED: needs a 32-bit MSVC (PE/DLL linking). "
+              "The snippet phase above did run and did compare.",
+              file=sys.stderr)
+        return 0
     fns = [f for f in CORPUS if not args.k or args.k in f["name"]]
     if not fns:
         return 0
@@ -330,6 +458,10 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
 def _run_xbe(vcvars, workdir, runtime_inc, args):
     """Phase three: a real title's own functions, lifted and run against it."""
     nl = chr(10)
+    if not vcvars:
+        print(nl + "xbe phase SKIPPED: needs a 32-bit MSVC to build its harness.",
+              file=sys.stderr)
+        return 0
     from tools.recomp.disasm import Disassembler
 
     data, sections, base = xbe_run.load(args.xbe)

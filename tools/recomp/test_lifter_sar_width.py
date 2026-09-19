@@ -39,7 +39,10 @@ _WIDTHS = ((1, "al", "cl"), (2, "ax", "cx"), (4, "eax", "ecx"))
 _VALUES = (0x00000000, 0x00000001, 0x0000007F, 0x00000080, 0x000000FF,
            0x00007FFF, 0x00008000, 0x0000FFFF, 0x7FFFFFFF, 0x80000000,
            0xFFFFFFFF, 0xDEADBE80, 0xDEADBE7F, 0x12345678)
-_COUNTS = (1, 2, 3, 7, 8, 15, 16, 31)
+_COUNTS = (1, 2, 3, 7, 8, 15, 16, 31, 32, 33, 47, 63)
+# 32, 33, 47 and 63 are upstream's addition: x86 masks the count to 5
+# bits at every operand width, so they must behave as 0, 1, 15 and 31.
+# Without them nothing in this file proved the mask was still applied.
 
 
 def _emit(lo, hi):

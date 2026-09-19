@@ -36,6 +36,13 @@ HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 
+/* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
+void d3d8_gamma_set(const D3DGAMMARAMP *ramp);
+void d3d8_gamma_get(D3DGAMMARAMP *ramp);
+HRESULT d3d8_gamma_begin(ID3D11RenderTargetView *target);
+void d3d8_gamma_end(ID3D11RenderTargetView *target);
+void d3d8_gamma_shutdown(void);
+
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
 const DWORD         *d3d8_GetTSS(DWORD stage);
