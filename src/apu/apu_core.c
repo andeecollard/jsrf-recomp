@@ -214,6 +214,17 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
     case NV_PAPU_XGSCNT:
         r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
         break;
+    /* THE HAND-OVER. This load is 001A25AA's `ecx = MEM32(0xFE801300)` -- the
+     * last instant at which the model still decides whether the guest's ISR
+     * acts on the handle in FEDECPARAM. See mcpx_apu_idle_handoff_method in
+     * apu_vp.c for why the check belongs here and not at the raise. Counters
+     * always; the method is only altered with the guard switched on. */
+    case NV_PAPU_FEDECMETH: {
+        extern uint32_t mcpx_apu_idle_handoff_method(void *, uint32_t);
+        r = qatomic_read(&d->regs[addr]);
+        r = mcpx_apu_idle_handoff_method(d, (uint32_t)r);
+        break;
+    }
     default:
         if (addr < 0x20000) {
             r = qatomic_read(&d->regs[addr]);
@@ -1406,6 +1417,14 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
     g_state = d;
     d->ram_ptr = ram_ptr;
+    /* Resolve the hand-over guard's switch here, on the main thread, before
+     * the aperture is guarded: the only place that asks is mcpx_apu_read,
+     * which runs inside the MMIO trap where getenv is not async-signal-safe.
+     * Same reason xbox_McpxTrapInstall resolves the USB diagnostics eagerly. */
+    {
+        extern void mcpx_apu_idle_handoff_init(void);
+        mcpx_apu_idle_handoff_init();
+    }
 
     d->set_irq = false;
     d->exiting = false;

@@ -289,6 +289,36 @@ static inline void hrtf_filter_process(HrtfFilter *f,
  * ADPCM Decoder - from vp/adpcm.h
  * ============================================================ */
 
+/* THE RESERVED BYTE IS A SOFTWARE CHECK, NOT A HARDWARE ONE.
+ *
+ * adpcm_decode_block refuses a block whose fourth header byte is non-zero.
+ * That is inherited from a generic IMA-ADPCM decoder and it is the reason
+ * 3.5-4.4% of this title's blocks are refused: every ADPCM buffer ends in a
+ * pad of 0x08 bytes (see the [APU-ADPCM-EXTENT] note in apu_vp.c, where the
+ * pad's extent is measured to the byte), and 0x08 in byte 3 trips it.
+ *
+ * The Xbox APU has no such test. The byte is reserved in the format, not
+ * validated by the decoder, and the giveaway that this refusal is software
+ * is that it returns 0 AFTER it has already written the first sample of each
+ * channel -- no hardware pipeline does that.
+ *
+ * With RECOMP_APU_ADPCM_HW_HEADER set, the reserved byte is ignored and the
+ * step index is CLAMPED into 0..88 rather than refused. Clamped, not
+ * dropped: step_table has 89 entries and index is int8_t, so removing the
+ * bound would be an out-of-bounds read.
+ *
+ * DEFAULT OFF, and it has never been run. What it changes is audible -- the
+ * 0x08 pad decodes to a flat 2055, 6.27% of full scale, where the guard
+ * currently substitutes silence -- so it is a player-facing behaviour change
+ * and this tree's rule is that those need a listen, not an argument. The
+ * decoder half is covered by jsrf_adpcm_decode; the title half is not.
+ *
+ * g_adpcm_hw_header is a plain int rather than a getenv here because this
+ * function is called from the frame thread thousands of times a second and
+ * is otherwise pure; apu_vp.c sets it from the switch. */
+extern int g_adpcm_hw_header;
+extern unsigned long g_adpcm_hw_header_accepted;
+
 static inline int adpcm_decode_block(int16_t *outbuf, const uint8_t *inbuf,
                                       size_t inbufsize, int channels) {
     #define ADPCM_CLIP(data, mn, mx) \
@@ -314,7 +344,11 @@ static inline int adpcm_decode_block(int16_t *outbuf, const uint8_t *inbuf,
     for (int ch = 0; ch < channels; ch++) {
         *outbuf++ = pcmdata[ch] = (int16_t)(inbuf[0] | (inbuf[1] << 8));
         index[ch] = inbuf[2];
-        if (index[ch] < 0 || index[ch] > 88 || inbuf[3]) return 0;
+        if (index[ch] < 0 || index[ch] > 88 || inbuf[3]) {
+            if (!g_adpcm_hw_header) return 0;
+            ++g_adpcm_hw_header_accepted;
+            ADPCM_CLIP(index[ch], 0, 88);
+        }
         inbufsize -= 4;
         inbuf += 4;
     }

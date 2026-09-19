@@ -202,6 +202,13 @@ static int voice_ev_on(void)
 
 static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr);
 
+/* Defined beside the ADPCM extent probe; written by the two PIO methods that
+ * declare a voice's buffer, which are handled long before that point. */
+extern uint32_t g_voice_guest_ebo[MCPX_HW_MAX_VOICES];
+extern uint32_t g_voice_guest_ba[MCPX_HW_MAX_VOICES];
+extern uint32_t g_voice_guest_ebo_sets[MCPX_HW_MAX_VOICES];
+extern uint32_t g_voice_guest_ba_sets[MCPX_HW_MAX_VOICES];
+
 /* Everything voice_get_samples will consult, printed at VOICE_ON.
  *
  * Voice 70 -- the one the title uses to cover its music track change -- is
@@ -736,6 +743,135 @@ void jsrf_dsound_this_seen(unsigned int t)
     }
 }
 
+/* THE SAME POINTER, WITHOUT A GEN PROBE -- AND IT WAS ALWAYS IN OUR HANDS.
+ *
+ * Everything above is written as though `this` can only be captured by
+ * patching the generated C, because "it is a thiscall parameter, never loaded
+ * from a guest global". The parameter part is true. The conclusion is not:
+ * the title HANDED US that pointer at boot and the kernel wrote it down.
+ *
+ * The APU is IRQ vector 5 (kernel_bridge.c says so where it pumps the device
+ * interrupts), and an Xbox ISR is
+ *
+ *     BOOLEAN __stdcall ISR(PKINTERRUPT Interrupt, PVOID ServiceContext)
+ *
+ * so the context travels in the KINTERRUPT the title passed to
+ * KeConnectInterrupt, at +4. Read out of the generation this tree builds
+ * against, the whole path from that word to `this` is three instructions:
+ *
+ *     sub_001A2681:  ecx = MEM32(esp + 8);        <- ServiceContext
+ *                    call sub_001A2638
+ *     sub_001A2638:  esi = ecx;  ...  call sub_001A25AA   (ecx untouched)
+ *     sub_001A25AA:  edi = ecx;                   <- `this`
+ *
+ * and 0x001A2681 is exactly the routine the log records for vector 5.
+ *
+ * THREE INDEPENDENT CONFIRMATIONS, which is why this is allowed to replace the
+ * probe rather than sit beside it:
+ *
+ *   1. The dataflow above, which is not an inference -- ecx is never written
+ *      between the ISR's prologue and 001A25AA.
+ *   2. The recovered symbol, and it is an EXACT byte-signature match rather
+ *      than one of the position-inferred names the table marks with a leading
+ *      `~`. 001A25AA is `?HandleFETrap@CMcpxAPU@@IAEXXZ`, i.e.
+ *      `protected: void __thiscall CMcpxAPU::HandleFETrap(void)`. A
+ *      __thiscall with NO parameters takes its only input in ecx, so ecx is
+ *      `this` by the calling convention, and the object is a CMcpxAPU -- the
+ *      class that owns the voice table. The two calls this function ends with
+ *      are `?SetFrontEndState@CMcpxCore@DirectSound@@IAEXW4MCPX_FE_STATE@@@Z`
+ *      on `this+8`, the CMcpxCore subobject, which is only coherent if `this`
+ *      is the APU object. (Its caller 001A2638 is named
+ *      `~?ServiceApuInterrupt@CMcpxAPU@@IAEHXZ` -- inferred, so worth nothing
+ *      on its own, but the bytes agree: it reads ISTS at 0xFE801000,
+ *      acknowledges it, and dispatches on bit 0x10.)
+ *   3. The runs that carried instrument_dsound_this.py report
+ *      `this=0x008EA8B4`, and the same session's KeConnectInterrupt line reads
+ *      `context=0x008EA8B4 vector=5`. Two captures, one value.
+ *   4. The crash dump's own guest stack. Under the faulting frame it reads
+ *      001A2031 / 001A2450 / 001A24D1 / 001A25D9 / 001A2660 / 001A268A and
+ *      then 001BA718 -- which is the KINTERRUPT the log records for vector 5.
+ *      The chain this walks up is the chain the crash walks down.
+ *
+ * The 0x2C4 offset is NOT from the symbols -- signature transfer recovers
+ * names, never field offsets. It comes from 001A200D's own
+ * `ecx = MEM32(ecx + eax*4 + 0x2C4)`, and nothing else.
+ *
+ * WHY IT MATTERS THAT THIS IS NOT A PROBE. Every owner[] number this project
+ * has was taken from an instrumented gen tree, which means no shipped build
+ * could ever act on one: the guard below was gated on a pointer that is zero
+ * in every build a player runs. Resolving it here makes the check a property
+ * of the model instead of a property of somebody's debugging tree.
+ *
+ * The probe still wins if it has fired -- it observes the value the ISR is
+ * actually using, this only observes the value the ISR was registered with --
+ * and a disagreement is counted rather than silently preferred.
+ *
+ * A WEAK DEFINITION, not a weak reference, and the difference was measured:
+ * a weak *reference* still makes ld64 pull kernel_bridge.c.o out of the
+ * archive to satisfy it, and that object needs recomp_lookup, which the small
+ * APU unit tests do not have. jsrf_apu_pace_test failed to link on exactly
+ * that. A weak DEFINITION here satisfies the reference without pulling
+ * anything in, and is overridden by the kernel's strong definition in every
+ * link that already contains it.
+ *
+ * Which of the two ran is not left to inference: the stub records that it was
+ * called, and the report says so rather than printing an unexplained zero. */
+#define JSRF_APU_IRQ_VECTOR 5u
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+/* Set only if the fallback below answered -- i.e. the kernel's interrupt
+ * table is not in this link. A positive control for `this` reading zero. */
+int g_jsrf_dsound_no_kernel;
+#if !defined(_MSC_VER)
+__attribute__((weak)) uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
+{
+    (void)vector;
+    g_jsrf_dsound_no_kernel = 1;
+    return 0;
+}
+#endif
+
+/* 0 nothing, 1 the gen probe, 2 the connected KINTERRUPT. Printed, because a
+ * reader of an owner[] count has to know which table it came out of. */
+int g_jsrf_dsound_this_src;
+/* The probe and the KINTERRUPT disagreed. Non-zero retires the claim that
+ * they are the same object and every count below has to be retaken. */
+unsigned long g_jsrf_dsound_this_disagree;
+unsigned int  g_jsrf_dsound_this_kint;
+
+unsigned int jsrf_dsound_this(void)
+{
+    static unsigned int cached;
+    uint32_t iv, ctx;
+
+    /* The probe, if it fired: it sees the live thiscall, not the
+     * registration. Cross-check it against the KINTERRUPT once. */
+    if (g_jsrf_dsound_this) {
+        if (g_jsrf_dsound_this_src != 1) {
+            g_jsrf_dsound_this_src = 1;
+            if (g_jsrf_dsound_this_kint
+                && g_jsrf_dsound_this_kint != g_jsrf_dsound_this)
+                ++g_jsrf_dsound_this_disagree;
+        }
+        return g_jsrf_dsound_this;
+    }
+    if (cached) return cached;
+    iv = xbox_GetConnectedInterrupt(JSRF_APU_IRQ_VECTOR);
+    if (!iv) return 0;                      /* not connected yet */
+    /* The routine is the field whose correctness can be checked rather than
+     * assumed -- a half-built KINTERRUPT has it zero. Same reasoning as
+     * bridge_interrupt_ready, which this deliberately mirrors. */
+    if (!ldl_le_phys(address_space_memory, iv + 0)) return 0;
+    ctx = (uint32_t)ldl_le_phys(address_space_memory, iv + 4);
+    /* owner[] is read at ctx+0x2C4+h*4 for h < 0x100, so the whole table has
+     * to be inside the RAM ldl_le_phys can address. Anything else is a
+     * context that is not a DirectSound object and must not be indexed. */
+    if (!ctx || ((ctx + 0x2C4u + 0xFFu * 4u) & ~g_apu_ram_mask) != 0) return 0;
+    cached = ctx;
+    g_jsrf_dsound_this_kint = ctx;
+    if (!g_jsrf_dsound_this_src) g_jsrf_dsound_this_src = 2;
+    return cached;
+}
+
 unsigned long g_idle_owner_null_raises;  /* raises whose owner[h] read NULL */
 unsigned long g_idle_owner_ok_raises;    /* positive control for that zero */
 unsigned long g_idle_owner_null_h0;      /* ...and h==0: the FATAL combination */
@@ -787,6 +923,146 @@ static int owner_guard_on(void)
 }
 unsigned long g_idle_unowned_raises;   /* raises for a voice not owned NOW */
 unsigned long g_idle_owned_raises;     /* the positive control for that zero */
+
+/* THE CHECK AT THE HAND-OVER, WHICH IS WHERE THE RAISE-TIME ONE SHOULD HAVE
+ * BEEN ALL ALONG.
+ *
+ * The A/B above retired the raise-time owner guard and wrote down why: "either
+ * it does not come from our raise at all ... or owner[h] is still valid when
+ * we check it and becomes NULL before the ISR reads it. Both are
+ * time-of-check/time-of-use, and both mean a raise-time check is in the wrong
+ * place by construction." This is the other place.
+ *
+ * On hardware the two are the same instant. The APU asserts its PCI line and
+ * the guest takes the interrupt at the next instruction boundary, so there is
+ * no interval in which DirectSound can free the buffer between the hardware
+ * choosing a handle and the ISR reading it. In this runtime there is:
+ * pci_irq_assert is a no-op, the ISR runs only when a guest thread reaches
+ * bridge_KeWaitForSingleObject, and the device-IRQ pump is on an 8 ms period.
+ * The handle we chose can be up to 8 ms stale by the time it is collected.
+ *
+ * So the hand-over is not the raise. It is the guest's LOAD of FEDECMETH --
+ * 001A25AA's `ecx = MEM32(0xFE801300)`, which on this host faults into
+ * mcpx_apu_read. That load is the last instant at which the model still owns
+ * the decision, and it happens on the guest's own thread microseconds before
+ * 001A200D indexes owner[h]. Checking there closes the window that a
+ * raise-time check cannot.
+ *
+ * IT DEPENDS ON RECOMP_APU_FEDEC_HOLD, which is default ON. The handle this
+ * reads is FEDECPARAM, taken at the FEDECMETH load rather than at the guest's
+ * own second load, and the two are only guaranteed to be the same pair
+ * because a trapped front end holds the pair still. With FEDEC_HOLD=0 the
+ * pair can be overwritten between the guest's two loads -- which is the
+ * decode-pair race that switch exists for -- and this check would then be
+ * validating a handle the ISR is not about to use. Run them together or not
+ * at all; the report prints both states.
+ *
+ * WHAT IS WITHHELD. Not the interrupt, and not the handle: the METHOD. A
+ * method that is not 0x8000 makes 001A24BE return without calling 001A241F,
+ * which is the same nothing the ISR already does for h >= 0x100 and for a
+ * PERSIST voice. The rest of 001A25AA -- the two sub_001A5B27 calls on
+ * this+8 that resume the front end -- runs unchanged, so nothing is left
+ * latched.
+ *
+ * IS NULL REALLY THE ONLY INVALID STATE? Asked because this title writes
+ * sentinels into its own fields -- 0xFFEEFFEE and 0xFF555555 have both come
+ * back as wild pointers from the scene-graph walker, and 0xFFEEFFEE appears
+ * in the XBE itself -- so a slot holding a sentinel would sail through a test
+ * that only compares against zero. Checked against the disassembly rather
+ * than assumed, and for owner[] the answer is yes, NULL is the whole of it.
+ * There are exactly three writers of `this+0x2C4+h*4` in the image:
+ *
+ *   001A1D9D, 001A1DD6 (sub_001A1CED)  owner[h] = pBuf, a real object
+ *   001A1E37 (sub_001A1E01)            `and dword ptr [esi+ecx*4+0x2C4], 0`
+ *
+ * and the allocator in 001A1CED picks a slot by scanning for `owner[h] == edx`
+ * with edx set by `xor edx, edx` and never reassigned. The guest's own free
+ * marker is the literal zero, so testing for it is complete.
+ *
+ * WHY THE ISR IS ENTITLED TO SKIP THE CHECK, finally read off the guest's own
+ * code rather than argued. sub_001A1E01 is the teardown, and it does:
+ *
+ *     this->0x2C0 += 1                       <- an interlock
+ *     for each voice of the buffer:
+ *         pBuf->[0xC + i*2] |= 0xFFFF        <- handle retired
+ *         this->owner[h] = 0
+ *     this->0x2C0 -= 1
+ *
+ * and 001A241F -- one frame above the unguarded read -- begins
+ * `if (this->0x2C0 != 0) return`. So on hardware an idle-voice trap that
+ * overlaps the teardown is refused outright, and one that arrives afterwards
+ * names a handle the teardown has already struck out of the guest's own list.
+ * Neither can reach 001A200D with a NULL. Ours can, on both counts: the raise
+ * comes from OUR voice list, which the guest does not maintain, and it is
+ * delivered late enough that 0x2C0 is back to zero by the time it lands.
+ *
+ * COUNTERS FIRST, and they answer the question the raise-time guard could not.
+ * _reads is the positive control: it counts every IDLE_VOICE method the guest
+ * collected, so a NULL count of zero beside a _reads of zero means the read
+ * trap never fired and says nothing at all. _null_h0 is the whole hypothesis
+ * -- h==0 with owner[0] NULL is the only combination that reaches
+ * sub_001A2E2E, it is what all 26 crash dumps are, and the raise-time probe
+ * measured it as never happening. If it is non-zero HERE while the raise-time
+ * count is still zero, the TOCTOU mechanism is measured rather than argued.
+ *
+ * RECOMP_APU_IDLE_HANDOFF_GUARD, default OFF until a run says _null_h0 moves.
+ * Defaulting it on before that would be shipping the same argument that put
+ * the raise-time guard in and took it out again. */
+unsigned long g_idle_handoff_reads;     /* IDLE_VOICE methods collected */
+unsigned long g_idle_handoff_owned;     /* ...with a live owner[h] */
+unsigned long g_idle_handoff_null;      /* ...with owner[h] == NULL */
+unsigned long g_idle_handoff_null_h0;   /* ...and h == 0: the fatal one */
+unsigned long g_idle_handoff_withheld;  /* methods the guard actually blanked */
+unsigned long g_idle_handoff_nothis;    /* collected before `this` resolved */
+
+static int idle_handoff_guard_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_switch_on("RECOMP_APU_IDLE_HANDOFF_GUARD");
+    return on;
+}
+
+/* RESOLVE THE SWITCH BEFORE A FAULT CAN ARRIVE, because the place that asks
+ * is a signal handler.
+ *
+ * mcpx_apu_read runs inside the AArch64 MMIO trap, on the guest's own thread,
+ * and getenv is not async-signal-safe. xbox_memory_layout.c hit this first
+ * and wrote the rule down where it resolves the USB diagnostics: "first use
+ * is inside the write trap's signal handler, where getenv is not
+ * async-signal-safe". A lazy static here would do the first getenv in exactly
+ * that context. Called once from mcpx_apu_init_standalone, on the main
+ * thread, before the aperture is guarded. */
+void mcpx_apu_idle_handoff_init(void)
+{
+    (void)idle_handoff_guard_on();
+}
+
+/* Called from mcpx_apu_read on the guest thread, inside the read trap, for
+ * the FEDECMETH load only. Read-only with respect to the guest. */
+uint32_t mcpx_apu_idle_handoff_method(void *opaque, uint32_t method)
+{
+    MCPXAPUState *d = (MCPXAPUState *)opaque;
+    unsigned int self;
+    uint32_t h, owner;
+
+    if (method != SE2FE_IDLE_VOICE || !d) return method;
+    ++g_idle_handoff_reads;
+    self = jsrf_dsound_this();
+    if (!self) { ++g_idle_handoff_nothis; return method; }
+    h = qatomic_read(&d->regs[NV_PAPU_FEDECPARAM]);
+    /* 001A241F's own bound. Above it the ISR returns before touching
+     * owner[], so there is nothing here to withhold. */
+    if (h >= 0x100) return method;
+    owner = (uint32_t)ldl_le_phys(address_space_memory,
+                                  self + 0x2C4u + h * 4u);
+    if (owner) { ++g_idle_handoff_owned; return method; }
+    ++g_idle_handoff_null;
+    if (h == 0) ++g_idle_handoff_null_h0;
+    if (!idle_handoff_guard_on()) return method;
+    ++g_idle_handoff_withheld;
+    return 0;
+}
 
 /* THE WINDOW THIS SWITCH CLOSES, AND WHY IT IS A SWITCH.
  *
@@ -1720,10 +1996,13 @@ void mcpx_apu_voice_report(void)
                         : " (the table bound is holding)"));
     }
     fprintf(stderr, "  [APU-ADPCM] ok=%lu fail=%lu short=%lu oversize=%lu"
-            " silenced=%lu (adpcm_guard %s)\n",
+            " silenced=%lu (adpcm_guard %s, hw_header %s, %lu block(s)"
+            " accepted that the strict header test refuses)\n",
             g_apu_adpcm_ok, g_apu_adpcm_fail, g_apu_adpcm_short,
             g_apu_adpcm_oversize, g_apu_adpcm_silenced,
-            mcpx_apu_adpcm_guard() ? "on" : "OFF");
+            mcpx_apu_adpcm_guard() ? "on" : "OFF",
+            g_adpcm_hw_header ? "on" : "OFF",
+            g_adpcm_hw_header_accepted);
     {
         extern unsigned long g_adpcm_fail_ring, g_adpcm_fail_first, g_adpcm_fail_last, g_adpcm_fail_mid;
         extern uint16_t g_adpcm_fail_v[8]; extern uint8_t g_adpcm_fail_stream[8], g_adpcm_fail_ch[8];
@@ -1809,6 +2088,8 @@ void mcpx_apu_voice_report(void)
             }
         }
     }
+    { extern void mcpx_apu_adpcm_extent_report(void);
+      mcpx_apu_adpcm_extent_report(); }
     {
         /* THE SCORING LINE FOR "DO SOUND EFFECTS START", WITH ITS CONTROL ON
          * THE SAME LINE.
@@ -1964,20 +2245,35 @@ void mcpx_apu_idle_trap_report(int crash)
      * nothing, and it fails in the most expensive way available -- it reads
      * ZERO, which looks like an answer. It sits beside [APU-IDLE-TRAP] now
      * because that line is in the crash dump, verified by finding it there. */
-    if (!g_jsrf_dsound_this) {
+    unsigned int dsound_this = jsrf_dsound_this();
+    if (!dsound_this) {
         fprintf(stderr, "  [APU-IDLE-OWNER] NOT MEASURED -- the guest's"
-                " DirectSound `this` was never captured, so owner[h] was never"
-                " read. Install the probe with"
-                " diagnostics/jsrf_first_fault/instrument_dsound_this.py and"
-                " rebuild. This is NOT a zero result."
-                " (probe entered %lu time(s).)\n", g_jsrf_dsound_this_calls);
+                " DirectSound `this` was never resolved, so owner[h] was never"
+                " read. It is the ServiceContext of the KINTERRUPT the title"
+                " connects on vector 5 (the APU), so a zero here means the"
+                " title had not connected it yet%s. This is NOT a zero"
+                " result. (gen probe entered %lu time(s).)\n",
+                g_jsrf_dsound_no_kernel
+                    ? " -- except that it means NEITHER: the weak fallback"
+                      " answered, so the kernel's interrupt table is not in"
+                      " this link at all"
+                    : "",
+                g_jsrf_dsound_this_calls);
     } else {
-        fprintf(stderr, "  [APU-IDLE-OWNER] this=0x%08X  owner[h] at the raise:"
+        fprintf(stderr, "  [APU-IDLE-OWNER] this=0x%08X (from %s)  owner[h] at the raise:",
+                dsound_this,
+                g_jsrf_dsound_this_src == 1 ? "the gen probe"
+                                            : "vector 5's ServiceContext");
+        if (g_jsrf_dsound_this_disagree)
+            fprintf(stderr, " -- WARNING: the probe (0x%08X) and the"
+                    " KINTERRUPT (0x%08X) DISAGREE, so every owner[] count"
+                    " below is read through one of two tables and has to be"
+                    " retaken --", g_jsrf_dsound_this, g_jsrf_dsound_this_kint);
+        fprintf(stderr, "\n  [APU-IDLE-OWNER] "
                 " %lu non-NULL, %lu NULL. A NULL is a handle 001A200D"
                 " dereferences unguarded, and it is fatal only for h==0 --"
                 " which is every crash dump this project has. non-NULL>0 is"
                 " the positive control for a NULL count of 0.\n",
-                g_jsrf_dsound_this,
                 g_idle_owner_ok_raises, g_idle_owner_null_raises);
         fprintf(stderr, "  [APU-IDLE-OWNER]   of those NULLs, %lu were h==0"
                 " (the only combination that reaches the faulting call);"
@@ -2009,7 +2305,27 @@ void mcpx_apu_idle_trap_report(int crash)
                 fprintf(stderr, "\n");
             }
         }
-    }    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
+    }
+    /* THE SAME TABLE, READ AT THE HAND-OVER INSTEAD OF AT THE RAISE.
+     *
+     * reads is the positive control and has to be read first: it counts every
+     * SE2FE_IDLE_VOICE method the guest actually collected through the read
+     * trap, so reads=0 means the trap never fired on FEDECMETH and the two
+     * numbers after it are silence, not zeros. null_h0 is the hypothesis --
+     * the only combination that reaches sub_001A2E2E. Non-zero here beside a
+     * zero on the raise-time line IS the time-of-check/time-of-use race,
+     * measured. */
+    fprintf(stderr, "  [APU-IDLE-OWNER]   at the HAND-OVER (the guest's"
+            " FEDECMETH load): reads=%lu owned=%lu NULL=%lu h0=%lu"
+            " withheld=%lu no-this=%lu (handoff_guard %s)%s\n",
+            g_idle_handoff_reads, g_idle_handoff_owned, g_idle_handoff_null,
+            g_idle_handoff_null_h0, g_idle_handoff_withheld,
+            g_idle_handoff_nothis,
+            idle_handoff_guard_on() ? "ON" : "OFF",
+            g_idle_handoff_reads ? ""
+              : "   <- reads=0: the FEDECMETH read trap never fired, so"
+                " NULL=0 measures NOTHING");
+    fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",
             g_apu_method_while_trapped, g_apu_guest_method_count);
@@ -2739,6 +3055,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
+        if (d->regs[NV_PAPU_FECV] < MCPX_HW_MAX_VOICES) {
+            g_voice_guest_ba[d->regs[NV_PAPU_FECV]] =
+                argument & NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE_OFFSET;
+            ++g_voice_guest_ba_sets[d->regs[NV_PAPU_FECV]];
+        }
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_CUR_PSL_START,
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
@@ -2754,6 +3075,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
+        if (d->regs[NV_PAPU_FECV] < MCPX_HW_MAX_VOICES) {
+            g_voice_guest_ebo[d->regs[NV_PAPU_FECV]] =
+                argument & NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO_OFFSET;
+            ++g_voice_guest_ebo_sets[d->regs[NV_PAPU_FECV]];
+        }
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
@@ -3429,6 +3755,338 @@ unsigned long g_apu_adpcm_short;
 unsigned long g_apu_adpcm_oversize;
 unsigned long g_apu_adpcm_silenced;
 
+/* WHERE THE DATA ACTUALLY IS. RECOMP_APU_ADPCM_EXTENT=1, default OFF.
+ *
+ * The two theories left standing produce the SAME signature -- failures
+ * beginning exactly 11 blocks before the end of every buffer, whatever its
+ * length and whatever its block size -- and the discriminator this file
+ * already carries cannot separate them, because it tried to read the answer
+ * out of `ba / block_size` and `ba` is an absolute offset in the voice's
+ * scatter-gather space, not an error term. Both readings it predicted are
+ * refuted (5389 and 1051, against 11 and 0).
+ *
+ *   the BASE is 11 blocks too high    -> the audio starts at ba - 11*bs, so
+ *                                        blocks -1 .. -11 hold real ADPCM
+ *   the BUFFER is 11 blocks shorter   -> nothing decodable below block 0, and
+ *                                        the tail is simply never written
+ *
+ * They differ in ONE observable and it costs a read: what is immediately
+ * BELOW the base. So walk the buffer with the model's own translation and ask
+ * each block whether adpcm_decode_block would accept it -- reserved byte zero
+ * and step index 0..88, which is the decoder's exact refusal test and nothing
+ * more. Random bytes pass that with probability about 1/300 per channel, so a
+ * run of eleven consecutive passes below the base is not chance.
+ *
+ * WHAT IT IS NOT. It is not a fix and it does not touch the fetch: the scan
+ * recomputes addresses beside the real one, reads through ldl_le_phys, and
+ * writes only its own record. It runs ONCE per voice, on that voice's first
+ * refusal, so its cost is a few hundred loads a session.
+ *
+ * It does add to g_apu_sge_calls, because it translates through get_data_ptr
+ * on purpose -- a scan that used a different translation would be measuring a
+ * different bug. Leave it off when reading [APU-SGE].
+ *
+ * The 0x08 run is recorded because every failure on record carries the header
+ * 0x08080808, and "the tail is fill" is only established if the fill is
+ * actually there and actually stops somewhere. */
+#define ADPCM_EXTENT_SLOTS   8
+#define ADPCM_EXTENT_BELOW   40   /* blocks probed below the base */
+#define ADPCM_EXTENT_ABOVE   40   /* blocks probed past the nominal end */
+
+typedef struct {
+    uint16_t v;
+    uint8_t  used, stream, channels;
+    uint32_t bs, ba, ebo, nblocks, first_fail;
+    uint32_t seg;                 /* segment_offset, stream voices only */
+    uint32_t good_below;          /* consecutive decodable blocks below base */
+    uint32_t good_in_buf, bad_in_buf;
+    uint32_t bad_run;             /* consecutive bad blocks from first_fail */
+    uint32_t fill_run;            /* ...of which are all-0x08 */
+    uint32_t good_above;          /* decodable blocks in [nblocks, +ABOVE) */
+    uint32_t hdr_below1, hdr_last_good, hdr_first_bad, hdr_end;
+    /* Byte-exact, relative to ba, because block granularity cannot say
+     * whether the written data ends ON a block boundary. If it does not, the
+     * producer is not counting in blocks and neither should the theory. */
+    int64_t  fill_begin, fill_end;
+    uint32_t before[4];           /* the four dwords immediately below ba */
+    /* What the GUEST declared, as opposed to what we read back out of the
+     * voice register file. */
+    uint32_t guest_ebo, guest_ba;
+    uint32_t guest_ebo_sets, guest_ba_sets;
+    /* NOT YET EXERCISED BY A RUN -- added with the rest of the record but
+     * after the only session that had a scene with ADPCM in it, so nothing
+     * has printed these. They are here because the one thing the measurement
+     * could not settle is why the declared buffer is ELEVEN blocks longer
+     * than the audio, and a loop that wraps somewhere other than ebo would
+     * answer it: lbo == first_fail * ADPCM_SAMPLES_PER_BLOCK would mean the
+     * data end is in LBO and this model is wrapping on the wrong field. */
+    uint32_t lbo, cbo_at_fail;
+    uint8_t  loop, persist, spb;
+} AdpcmExtent;
+
+/* THE GUEST'S OWN DECLARATION, RECORDED WHERE IT ARRIVES.
+ *
+ * ebo and ba are read back out of the voice register file, which lives in
+ * guest RAM -- so a read-back cannot distinguish "the guest set this for this
+ * buffer" from "this is left over from the last thing that used this voice".
+ * The PIO methods can: NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE and
+ * ..._BUF_EBO are the only two ways either value is supposed to arrive.
+ *
+ * A set count of ZERO on a voice that is decoding is the interesting reading,
+ * and it is the one a read-back can never produce: it would mean the length
+ * the fetch is using was never declared for this buffer at all. Which is why
+ * the counts are printed beside the values and not instead of them.
+ *
+ * Two stores on a path that already does a masked read-modify-write into
+ * guest RAM, so unconditional -- the same standing as g_apu_adpcm_ok. Only
+ * the printing is behind the switch. */
+uint32_t g_voice_guest_ebo[MCPX_HW_MAX_VOICES];
+uint32_t g_voice_guest_ba[MCPX_HW_MAX_VOICES];
+uint32_t g_voice_guest_ebo_sets[MCPX_HW_MAX_VOICES];
+uint32_t g_voice_guest_ba_sets[MCPX_HW_MAX_VOICES];
+
+static AdpcmExtent g_adpcm_extent[ADPCM_EXTENT_SLOTS];
+static unsigned g_adpcm_extent_n;
+unsigned long g_adpcm_extent_scans;
+
+static int adpcm_extent_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_ADPCM_EXTENT");
+    return on;
+}
+
+/* See the note over adpcm_decode_block in apu_state.h. Set once per voice
+ * from the frame thread, read by the decoder, so the pure function stays
+ * getenv-free. */
+int g_adpcm_hw_header;
+unsigned long g_adpcm_hw_header_accepted;
+
+static int adpcm_hw_header_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_APU_ADPCM_HW_HEADER");
+    return on;
+}
+
+/* adpcm_decode_block's refusal test, and only that: it returns 0 when the
+ * fourth header byte of any channel is non-zero or its step index is outside
+ * 0..88. Anything this accepts, the decoder accepts. */
+static int adpcm_hdr_ok(hwaddr addr, unsigned channels)
+{
+    unsigned ch;
+    for (ch = 0; ch < channels; ++ch) {
+        uint32_t w = (uint32_t)ldl_le_phys(address_space_memory,
+                                           addr + (hwaddr)ch * 4);
+        if ((w >> 24) != 0) return 0;
+        if (((w >> 16) & 0xFF) > 88) return 0;
+    }
+    return 1;
+}
+
+static int adpcm_all_08(hwaddr addr, unsigned channels)
+{
+    unsigned ch;
+    for (ch = 0; ch < channels; ++ch)
+        if (ldl_le_phys(address_space_memory, addr + (hwaddr)ch * 4)
+                != 0x08080808u)
+            return 0;
+    return 1;
+}
+
+/* The address the fetch would use for block k, with k allowed to go negative
+ * so the region below the base can be probed. Deliberately the same
+ * translation the fetch uses. */
+static hwaddr adpcm_block_addr(MCPXAPUState *d, int stream, hwaddr seg,
+                               uint32_t ba, size_t bs, int32_t k)
+{
+    int64_t lin = (int64_t)k * (int64_t)bs;
+    if (stream) return (hwaddr)((int64_t)seg + lin);
+    lin += (int64_t)ba;
+    if (lin < 0) return 0;
+    return get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFFu,
+                        (uint32_t)lin);
+}
+
+static void adpcm_extent_scan(MCPXAPUState *d, uint32_t v, int stream,
+                              unsigned channels, size_t bs, uint32_t ba,
+                              uint32_t ebo, hwaddr seg, uint32_t nblocks,
+                              uint32_t first_fail, uint32_t lbo, uint32_t cbo,
+                              int loop, int persist, unsigned spb)
+{
+    AdpcmExtent *e;
+    int32_t k;
+    hwaddr a;
+
+    if (!adpcm_extent_on()) return;
+    if (g_adpcm_extent_n >= ADPCM_EXTENT_SLOTS) return;
+    for (unsigned i = 0; i < g_adpcm_extent_n; ++i)
+        if (g_adpcm_extent[i].v == (uint16_t)v) return;   /* once per voice */
+
+    e = &g_adpcm_extent[g_adpcm_extent_n++];
+    e->v = (uint16_t)v;
+    e->used = 1;
+    e->stream = (uint8_t)(stream ? 1 : 0);
+    e->channels = (uint8_t)channels;
+    e->bs = (uint32_t)bs;
+    e->ba = ba;
+    e->ebo = ebo;
+    e->seg = (uint32_t)seg;
+    e->nblocks = nblocks;
+    e->first_fail = first_fail;
+    e->lbo = lbo;
+    e->cbo_at_fail = cbo;
+    e->loop = (uint8_t)(loop ? 1 : 0);
+    e->persist = (uint8_t)(persist ? 1 : 0);
+    e->spb = (uint8_t)spb;
+    if (v < MCPX_HW_MAX_VOICES) {
+        e->guest_ebo = g_voice_guest_ebo[v];
+        e->guest_ba = g_voice_guest_ba[v];
+        e->guest_ebo_sets = g_voice_guest_ebo_sets[v];
+        e->guest_ba_sets = g_voice_guest_ba_sets[v];
+    }
+    ++g_adpcm_extent_scans;
+
+    /* Below the base. THE discriminator: real ADPCM here means the buffer
+     * starts lower than ba says. */
+    for (k = -1; k >= -(int32_t)ADPCM_EXTENT_BELOW; --k) {
+        if (!stream && (int64_t)ba + (int64_t)k * (int64_t)bs < 0) break;
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (!adpcm_hdr_ok(a, channels)) break;
+        ++e->good_below;
+    }
+    a = adpcm_block_addr(d, stream, seg, ba, bs, -1);
+    e->hdr_below1 = (uint32_t)ldl_le_phys(address_space_memory, a);
+
+    /* Inside the buffer, as the model believes it to be. */
+    for (k = 0; k < (int32_t)nblocks && k < (int32_t)(nblocks + 1); ++k) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (adpcm_hdr_ok(a, channels)) ++e->good_in_buf;
+        else ++e->bad_in_buf;
+    }
+    if (first_fail > 0) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs,
+                             (int32_t)first_fail - 1);
+        e->hdr_last_good = (uint32_t)ldl_le_phys(address_space_memory, a);
+    }
+    a = adpcm_block_addr(d, stream, seg, ba, bs, (int32_t)first_fail);
+    e->hdr_first_bad = (uint32_t)ldl_le_phys(address_space_memory, a);
+    a = adpcm_block_addr(d, stream, seg, ba, bs, (int32_t)nblocks);
+    e->hdr_end = (uint32_t)ldl_le_phys(address_space_memory, a);
+
+    /* How far the refusal runs, and how much of it is the 0x08 fill. */
+    for (k = (int32_t)first_fail;
+         k < (int32_t)(nblocks + ADPCM_EXTENT_ABOVE); ++k) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (adpcm_hdr_ok(a, channels)) break;
+        ++e->bad_run;
+        if (adpcm_all_08(a, channels)) ++e->fill_run;
+    }
+    for (k = (int32_t)nblocks;
+         k < (int32_t)(nblocks + ADPCM_EXTENT_ABOVE); ++k) {
+        a = adpcm_block_addr(d, stream, seg, ba, bs, k);
+        if (adpcm_hdr_ok(a, channels)) ++e->good_above;
+    }
+
+    /* THE FILL, TO THE BYTE. A dword at a time through the same translation,
+     * from four blocks before the first refusal to ADPCM_EXTENT_ABOVE blocks
+     * past the nominal end. Both offsets are relative to ba, so fill_begin is
+     * literally "how many bytes of this buffer were written". */
+    e->fill_begin = -1;
+    e->fill_end = -1;
+    {
+        int64_t lo = ((int64_t)first_fail - 4) * (int64_t)bs;
+        int64_t hi = ((int64_t)nblocks + ADPCM_EXTENT_ABOVE) * (int64_t)bs;
+        int64_t off;
+        if (lo < 0) lo = 0;
+        for (off = lo; off + 4 <= hi; off += 4) {
+            hwaddr w = stream ? (hwaddr)((int64_t)seg + off)
+                              : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                             0xFFFFFFFFu,
+                                             (uint32_t)((int64_t)ba + off));
+            uint32_t v32 = (uint32_t)ldl_le_phys(address_space_memory, w);
+            if (e->fill_begin < 0) {
+                if (v32 == 0x08080808u) e->fill_begin = off;
+            } else if (v32 != 0x08080808u) {
+                e->fill_end = off;
+                break;
+            }
+        }
+    }
+    for (k = 0; k < 4; ++k) {
+        int64_t off = -(int64_t)(4 - k) * 4;
+        hwaddr w;
+        if (!stream && (int64_t)ba + off < 0) { e->before[k] = 0; continue; }
+        w = stream ? (hwaddr)((int64_t)seg + off)
+                   : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFFu,
+                                  (uint32_t)((int64_t)ba + off));
+        e->before[k] = (uint32_t)ldl_le_phys(address_space_memory, w);
+    }
+}
+
+void mcpx_apu_adpcm_extent_report(void)
+{
+    unsigned i;
+
+    if (!adpcm_extent_on()) return;
+    fprintf(stderr, "  [APU-ADPCM-EXTENT] %u voice(s) scanned%s\n",
+            g_adpcm_extent_n,
+            g_adpcm_extent_n ? "" : "  <- NOTHING SCANNED: no ADPCM voice"
+                                    " refused a block, so this says nothing");
+    for (i = 0; i < g_adpcm_extent_n; ++i) {
+        const AdpcmExtent *e = &g_adpcm_extent[i];
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]   v%u%s%s bs=%u ba=%u ebo=%u"
+                " nblocks=%u first_fail=%u gap=%d\n",
+                e->v, e->stream ? " S" : "", e->channels == 2 ? " st" : "",
+                e->bs, e->ba, e->ebo, e->nblocks, e->first_fail,
+                (int)e->nblocks - (int)e->first_fail);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     below base: %u decodable"
+                " block(s) (>=11 means THE BASE IS TOO HIGH; 0 means the"
+                " buffer is genuinely short), hdr[-1]=%08X\n",
+                e->good_below, e->hdr_below1);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     in buffer: %u good %u bad"
+                " | refusal runs %u block(s), %u of them all-0x08"
+                " | %u decodable past the end\n",
+                e->good_in_buf, e->bad_in_buf, e->bad_run, e->fill_run,
+                e->good_above);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     hdr last_good=%08X"
+                " first_bad=%08X at_nblocks=%08X | before ba:"
+                " %08X %08X %08X %08X\n",
+                e->hdr_last_good, e->hdr_first_bad, e->hdr_end,
+                e->before[0], e->before[1], e->before[2], e->before[3]);
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     the 0x08 fill runs"
+                " [%lld,%lld) bytes from ba; the buffer is %u bytes and"
+                " %u block(s) of it were written%s\n",
+                (long long)e->fill_begin, (long long)e->fill_end,
+                e->nblocks * e->bs,
+                e->bs ? (unsigned)(e->fill_begin > 0
+                                   ? e->fill_begin / e->bs : 0) : 0,
+                (e->fill_begin >= 0 && e->bs
+                 && (uint32_t)e->fill_begin % e->bs)
+                    ? "  <- NOT on a block boundary" : "");
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     the guest DECLARED"
+                " ebo=%u (%u set%s) ba=%u (%u set%s)%s%s\n",
+                e->guest_ebo, e->guest_ebo_sets,
+                e->guest_ebo_sets == 1 ? "" : "s",
+                e->guest_ba, e->guest_ba_sets,
+                e->guest_ba_sets == 1 ? "" : "s",
+                e->guest_ebo_sets == 0
+                    ? "  <- EBO WAS NEVER DECLARED FOR THIS VOICE: the length"
+                      " the fetch used is left over in the voice register file"
+                    : "",
+                (e->guest_ebo_sets && e->guest_ebo != e->ebo)
+                    ? "  <- and it is NOT what the fetch read back" : "");
+        fprintf(stderr, "  [APU-ADPCM-EXTENT]     loop=%u persist=%u spb=%u"
+                " lbo=%u cbo=%u%s\n",
+                e->loop, e->persist, e->spb, e->lbo, e->cbo_at_fail,
+                (e->lbo && e->lbo == e->first_fail * ADPCM_SAMPLES_PER_BLOCK)
+                    ? "  <- LBO IS THE DATA END: the wrap point is in LBO and"
+                      " this model wraps on EBO"
+                    : "");
+    }
+    fflush(stderr);
+}
+
 /* OFF by default. RECOMP_APU_ADPCM_GUARD=1 substitutes silence for the
  * uninitialised tail of a refused or short block. Off, the default path is
  * byte-identical to what it was, so the counters above measure the bug rather
@@ -3628,6 +4286,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     if (adpcm) {
         block_size = 36;
+        /* Cached accessor; this is the frame thread, not the trap handler. */
+        g_adpcm_hw_header = adpcm_hw_header_on();
     } else {
         block_size = container_size;
     }
@@ -3715,6 +4375,14 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                 g_adpcm_first_fail_blk[v] = block_index;
                                 g_adpcm_fail_nblocks_v[v] = nblocks;
                             }
+                            /* Once per voice, on its first refusal, and only
+                             * with RECOMP_APU_ADPCM_EXTENT set. */
+                            adpcm_extent_scan(d, v, stream ? 1 : 0, channels,
+                                              block_size, ba, ebo,
+                                              segment_offset, nblocks,
+                                              block_index, lbo, cbo,
+                                              loop, persist,
+                                              samples_per_block);
                         }
                         g_adpcm_fail_ring++;
                         if (block_index == 0) g_adpcm_fail_first++;
@@ -4911,10 +5579,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                      * the report says so rather than reporting a zero that
                      * looks like an answer -- which is the exact failure this
                      * counter has already had twice today. */
-                    if (g_jsrf_dsound_this && v < 0x100) {
+                    unsigned int dsound_this = jsrf_dsound_this();
+                    if (dsound_this && v < 0x100) {
                         uint32_t owner = ldl_le_phys(
                             address_space_memory,
-                            g_jsrf_dsound_this + 0x2C4u + (uint32_t)v * 4u);
+                            dsound_this + 0x2C4u + (uint32_t)v * 4u);
                         if (owner) ++g_idle_owner_ok_raises;
                         else {
                             ++g_idle_owner_null_raises;
