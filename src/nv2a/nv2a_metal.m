@@ -2272,6 +2272,34 @@ static uint64_t g_resident_unbound_clears, g_slot_writebacks, g_slot_writeback_s
  * (16,181 surface swaps + 8,098 flips = 24,279, against 24,293 syncs). That
  * worked, but it is not a measurement anyone else will repeat. These are. */
 static uint64_t g_sync_by_swap, g_sync_by_invalidate, g_sync_by_frame_end;
+/* AND WHAT EACH CALLER COSTS, WHICH THE COUNTS ABOVE DO NOT SAY.
+ *
+ * Measured 19 Sep 2026, new_game.pad, 4,913 flips: 9,810 surface swaps, 4,928
+ * external (the flip), 4,924 "already clean", 24,831 ms of draining. Those
+ * four numbers admit two readings that differ by the whole bill -- the swaps
+ * drain and the flip is clean, or one swap a frame is clean and the flip
+ * drains -- and nothing printed could tell them apart. An afternoon of
+ * arithmetic over three lines is what this replaces.
+ *
+ * `who` is set by the caller immediately before the call and consumed on
+ * entry, so anything that does not set it is attributed to `external`, which
+ * is what the flip and the diagnostic dumps are. Two adds against ~15,000
+ * syncs a run: unmeasurable beside a 2.5 ms drain. */
+typedef enum { SYNC_WHO_EXTERNAL, SYNC_WHO_SWAP, SYNC_WHO_INVALIDATE,
+               SYNC_WHO_FRAME_END, SYNC_WHO_N } SyncWho;
+static SyncWho g_sync_who = SYNC_WHO_EXTERNAL;
+static uint64_t g_sync_who_calls[SYNC_WHO_N], g_sync_who_drained[SYNC_WHO_N];
+static uint64_t g_sync_who_drain_ns[SYNC_WHO_N], g_sync_who_read_ns[SYNC_WHO_N];
+static const char *const g_sync_who_name[SYNC_WHO_N] = {
+    "external", "swap", "invalidate", "frame-end" };
+/* Syncs that found dirty flags nobody was going to pay, and so skipped the
+ * wait. See the block at the top of nv2a_metal_sync. */
+static uint64_t g_sync_drainless;
+/* Deferred slot debts paid because something was about to READ those guest
+ * bytes as a texture, or rebuild the surface from them. Zero is the expected
+ * reading and it is also the positive control for the walk: see
+ * surface_pay_debt_for_range. */
+static uint64_t g_debt_paid_on_read, g_debt_paid_on_rebuild, g_debt_paid_on_evict;
 /* WHY A RESIDENT CLEAR REFUSED, by reason, because the counts alone said the
  * colour half was refusing 8 times for every one it took and nothing said
  * which test threw it out. A refusal is not free: clear_surface then calls
@@ -2451,6 +2479,41 @@ int nv2a_metal_sync_range(uint8_t *target, size_t bytes)
     return 1;
 }
 
+/* THE SAME PAYMENT, FOR EVERY OTHER READER OF THOSE GUEST BYTES.
+ *
+ * nv2a_metal_sync_range closes the hole for the ONE reader that names its
+ * range: the flip. Deferring a swap's write-back creates a slot whose pixels
+ * exist only on the GPU, and defer_swap's own header admits the gap it leaves
+ * -- "a guest CPU read of the surface range that is not the flip is not
+ * intercepted". Inside this backend there are exactly two such readers and
+ * both are reachable on an ordinary frame:
+ *
+ *   - a TEXTURE whose guest bytes are a surface this title has rendered into
+ *     and not yet handed back. texture_buffer uploads straight from guest RAM
+ *     and would upload the pre-render contents, which is render-to-texture
+ *     silently sampling last frame.
+ *   - a surface REBUILD. The slot lookup is exact on seven fields, so a
+ *     surface whose depth pointer moved misses the cache and is re-uploaded
+ *     from guest RAM while a slot still owes those very bytes.
+ *
+ * Four slots and a pointer-range compare, so the walk costs nothing when
+ * nothing is owed -- which, with the deferral off, is always. g_debt_paid_*
+ * are the positive controls: they say this ran and found nothing, rather than
+ * that it never ran. */
+static void surface_pay_debt_for_range(const uint8_t *p, size_t bytes,
+                                       uint64_t *counter)
+{
+    if (!p || !bytes) return;
+    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+        if (!surf_slot[i].valid || !surf_slot[i].owes_guest_ram) continue;
+        if (!guest_ranges_overlap(p, bytes, surf_slot[i].target,
+                                  surface_slot_bytes(i)))
+            continue;
+        surface_slot_writeback(i);
+        ++*counter;
+    }
+}
+
 /* THE ONE NUMBER THE CUMULATIVE TOTAL CANNOT GIVE.
  *
  * g_sync_drain_ns + g_sync_read_ns already says sync costs 7.9 ms per frame
@@ -2626,9 +2689,39 @@ void nv2a_metal_report(void)
             (unsigned long long)(sync_calls - g_sync_by_swap
                                  - g_sync_by_invalidate - g_sync_by_frame_end),
             (unsigned long long)sync_calls, (unsigned long long)sync_clean);
+    /* AND WHAT EACH OF THEM PAID. The line above says who called; without
+     * this one the 24.8 s bill has to be attributed by arithmetic across
+     * three counters, and the two readings that arithmetic admits differ by
+     * all of it. `drained` is the calls that actually took
+     * waitUntilCompleted -- the rest either found nothing outstanding or
+     * found nothing anybody was going to collect. */
+    for (unsigned w = 0; w < SYNC_WHO_N; ++w) {
+        if (!g_sync_who_calls[w]) continue;
+        fprintf(stderr,"[METAL] sync cost by caller: %-10s %llu calls,"
+                " %llu drained, %.1f ms waiting, %.1f ms reading back\n",
+                g_sync_who_name[w],
+                (unsigned long long)g_sync_who_calls[w],
+                (unsigned long long)g_sync_who_drained[w],
+                g_sync_who_drain_ns[w]/1e6, g_sync_who_read_ns[w]/1e6);
+    }
+    fprintf(stderr,"[METAL] syncs that skipped the wait because nothing was"
+            " going to be written back: %llu\n",
+            (unsigned long long)g_sync_drainless);
+    fprintf(stderr,"[METAL] deferred debts paid on demand: %llu texture read,"
+            " %llu surface rebuild, %llu eviction\n",
+            (unsigned long long)g_debt_paid_on_read,
+            (unsigned long long)g_debt_paid_on_rebuild,
+            (unsigned long long)g_debt_paid_on_evict);
+    /* "the depth refusal is why defer_swap is inert" stood here and was
+     * wrong, or at least a generation out of date: the refusal had already
+     * been narrowed to "depth is dirty AND somebody is going to write it",
+     * and the deferral still bought nothing because clearing surface_dirty
+     * alone never reached nv2a_metal_sync's early return -- depth_dirty was
+     * still set, so the wait was taken anyway. The wait is now decided by
+     * what will actually be written; see the block at the top of that
+     * function. */
     fprintf(stderr,"[METAL] depth write-backs: %llu taken, %llu skipped"
-            " (no_depth_sync %s). Each one is a drain as well as a copy, and"
-            " the depth refusal is why defer_swap is inert.\n",
+            " (no_depth_sync %s). Each one is a drain as well as a copy.\n",
             (unsigned long long)g_depth_syncs_taken,
             (unsigned long long)g_depth_syncs_skipped,
             no_depth_sync_on()?"on":"OFF");
@@ -2890,15 +2983,66 @@ int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
 int nv2a_metal_sync(void)
 {
     unsigned long long _t_sync = mtl_now_ns(), _t_drained = 0;
+    SyncWho who = g_sync_who;
+    g_sync_who = SYNC_WHO_EXTERNAL;
     @autoreleasepool{
-        ++sync_calls;
+        ++sync_calls; ++g_sync_who_calls[who];
         /* BEFORE the dirty test and before the wait. An open batch is work the
          * GPU has not been told about, so last_command would be the previous
          * committed buffer and waiting on it would read a surface that is
          * missing every draw in the batch. */
         batch_flush();
         if(!surface_dirty&&!depth_dirty){++sync_clean;
-            g_sync_drain_ns += mtl_now_ns()-_t_sync; return 1;}
+            g_sync_drain_ns += mtl_now_ns()-_t_sync;
+            g_sync_who_drain_ns[who] += mtl_now_ns()-_t_sync; return 1;}
+        /* THE WAIT EXISTS ONLY TO MAKE A READ-BACK VALID, SO A SYNC THAT IS
+         * GOING TO READ NOTHING BACK MUST NOT TAKE IT.
+         *
+         * The dirty test above asks "is anything outstanding"; it does not ask
+         * "is anybody going to collect it". Those came apart the moment the
+         * two write-backs became skippable. With RECOMP_METAL_NO_DEPTH_SYNC on
+         * -- which is the default and is what the player runs -- a batch that
+         * wrote depth or stencil leaves depth_dirty set, the three branches
+         * below then SKIP the write-back and clear the flag, and the only
+         * thing the flag bought was `[last_command waitUntilCompleted]`. That
+         * is the drain, and the drain is 89% of this function's cost: measured
+         * 19 Sep 2026 over 4,913 flips, 24,831 ms draining against 3,204 ms
+         * reading back and converting.
+         *
+         * It is also exactly why RECOMP_METAL_DEFER_SWAP was inert. Its own
+         * header says it clears surface_dirty "and nv2a_metal_sync then takes
+         * its already-clean early return". It did not: depth_dirty was still
+         * set, so the early return was never reached and every deferred swap
+         * still paid the full stall for a read-back it had just cancelled. The
+         * deferral saved the 614 KB copy and none of the 2.5 ms wait.
+         *
+         * So resolve the skip predicates HERE, before the wait, in the same
+         * order and from the same state the branches below use -- the one
+         * thing that must not happen is a sync that skips the wait and then
+         * finds a branch that wanted the pixels. depth_dirty is left alone
+         * when there is no depth_target, because that is the one case the
+         * branches below also leave alone, and a flag this function does not
+         * own is not a flag it should clear. Nothing is lost by that: without
+         * a target no branch can write depth either, so no drain is taken for
+         * it on this call or on any later one. */
+        {
+            int will_colour = surface_dirty && !no_colour_sync_on();
+            int will_depth  = depth_dirty && depth_target && !no_depth_sync_on();
+            if (!will_colour && !will_depth) {
+                if (surface_dirty) {
+                    ++g_color_syncs_skipped; ++g_color_readbacks_elided;
+                    surface_dirty = 0;
+                }
+                if (depth_dirty && depth_target) {
+                    ++g_depth_syncs_skipped; depth_dirty = 0;
+                }
+                ++g_sync_drainless;
+                g_sync_drain_ns += mtl_now_ns()-_t_sync;
+                g_sync_who_drain_ns[who] += mtl_now_ns()-_t_sync;
+                return 1;
+            }
+        }
+        ++g_sync_who_drained[who];
         [last_command waitUntilCompleted];
         /* RECOMP_METAL_DRAIN=1 -- wait for the QUEUE, not for one buffer.
          *
@@ -2942,6 +3086,7 @@ int nv2a_metal_sync(void)
          * breakdown OF the clear, never added to it. */
         _t_drained = mtl_now_ns();
         g_sync_drain_ns += _t_drained - _t_sync;
+        g_sync_who_drain_ns[who] += _t_drained - _t_sync;
         /* RECOMP_METAL_READBACK_AUDIT=1 -- see the header comment on
          * g_readback_diff. Drains the queue a second time, properly, and
          * compares. */
@@ -3068,6 +3213,7 @@ int nv2a_metal_sync(void)
         }
         free(rgba);
         g_sync_read_ns += mtl_now_ns()-_t_drained;
+        g_sync_who_read_ns[who] += mtl_now_ns()-_t_drained;
         return 1;}
 }
 
@@ -3424,7 +3570,7 @@ void nv2a_metal_invalidate(uint8_t *target)
   * live binding it must also invalidate in the cache -- otherwise a later swap
   * back would rebind a texture for memory the CPU has since overwritten. */
  surface_cache_drop(target);
- if(!target||target==surface_target||target==depth_target){++g_sync_by_invalidate;nv2a_metal_sync();surface_valid=depth_valid=0;}}
+ if(!target||target==surface_target||target==depth_target){++g_sync_by_invalidate;g_sync_who=SYNC_WHO_INVALIDATE;nv2a_metal_sync();surface_valid=depth_valid=0;}}
 const char *nv2a_metal_last_reject(void){return reject_reason?reject_reason:"none";}
 /* A REJECTED DRAW HANDS THE BATCH TO THE CPU RASTERISER, which renders it into
  * guest RAM -- so the retained textures are stale from that moment, and the
@@ -3702,6 +3848,7 @@ static unsigned long long bench_replay(int batched, unsigned long long *cpu_ns)
     }
     t1 = mtl_now_ns();
     ++g_sync_by_frame_end;
+    g_sync_who = SYNC_WHO_FRAME_END;
     nv2a_metal_sync();                 /* through final GPU completion */
     t2 = mtl_now_ns();
     batch_force = 0;
@@ -3937,6 +4084,11 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   for(unsigned u=0;u<4;u++){
    int active=(s->texture_mask&(1u<<u))!=0;const NV2ATextureCopy*t=u&&active?&s->extra_stages[u-1]:s;
    const uint8_t*data=active?(u?s->extra_texture[u-1]:texture):NULL;size_t bytes=active?nv2a_texture_copy_texture_bytes(t):0;
+   /* Render-to-texture, and the one place a deferred write-back could be
+    * read straight past. texture_buffer uploads these bytes out of guest
+    * RAM; if a slot is still holding them on the GPU it has to hand them
+    * over first. Four slots and a pointer compare when nothing is owed. */
+   surface_pay_debt_for_range(data,bytes,&g_debt_paid_on_read);
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
   /* WHAT `vertices` HOLDS DEPENDS ON WHO IS GOING TO RUN THE PROGRAM.
    *
@@ -3989,7 +4141,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
        surf_slot[i].owes_guest_ram=1;surface_dirty=0;
        owed=1;++g_swap_deferred;break;}
      if(!owed)++g_swap_defer_noslot;}}
-   ++surface_uploads;++g_sync_by_swap;if(!nv2a_metal_sync())return reject("surface-sync");
+   ++surface_uploads;++g_sync_by_swap;g_sync_who=SYNC_WHO_SWAP;
+   if(!nv2a_metal_sync())return reject("surface-sync");
    /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
     * The sync above has already written the outgoing surface out, so the
     * incoming slot's textures still hold exactly what was drawn into them --
@@ -4019,6 +4172,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     surf_slot[slot_hit].owes_guest_ram=0;
     surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
    }else{
+   /* This branch is about to re-upload the surface FROM GUEST RAM, so any
+    * slot still owing those bytes must hand them back first or the
+    * rebuild starts from pre-render contents. The lookup above is exact
+    * on seven fields, so a surface whose depth pointer merely moved lands
+    * here with its colour debt outstanding. */
+   surface_pay_debt_for_range(target,target_size,&g_debt_paid_on_rebuild);
    MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;
    /* THE STENCIL BUFFER IS FILLED ONLY IN THE NON-565 BRANCH BELOW, and the
@@ -4054,6 +4213,16 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     for(unsigned i=0;i<SURFACE_SLOTS;i++){
      if(!surf_slot[i].valid){pick=i;break;}
      if(surf_slot[i].stamp<surf_slot[pick].stamp)pick=i;}
+    /* EVICTION HAS TO PAY THE DEBT, AND DID NOT. defer_swap's header says
+     * "surface_cache_drop pays on eviction as it always has" -- but this
+     * is not surface_cache_drop, it is the LRU pick inside the rebuild,
+     * and it overwrote the slot without looking at owes_guest_ram. The
+     * texture is then released with the only copy of whatever was
+     * rendered or cleared into it while it was unbound. Latent today at
+     * one eviction a run, and the first thing deferring every swap would
+     * have turned into lost pixels. */
+    if(surf_slot[pick].valid&&surf_slot[pick].owes_guest_ram){
+     surface_slot_writeback(pick);++g_debt_paid_on_evict;}
     if(surf_slot[pick].valid)++surface_evictions;
     surf_slot[pick].target=target;surf_slot[pick].target_size=target_size;
     surf_slot[pick].w=surface_width;surf_slot[pick].h=surface_height;
