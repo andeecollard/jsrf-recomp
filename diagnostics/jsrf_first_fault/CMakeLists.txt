@@ -5,6 +5,34 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 get_filename_component(XBOXRECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+# Guest stack slices for the tick-driven delivery path.
+#
+# RECOMP_IRQ_THREAD moves device interrupt delivery onto a dedicated 1 ms
+# thread, so an interrupt no longer waits for some guest thread to block --
+# ours are otherwise up to 8 ms late because pci_irq_assert is a no-op. The
+# thread borrows a guest stack slice, and the pool is 0 by default, so for
+# weeks every attempt printed "no worker stack slice
+# (XBOX_WORKER_STACK_COUNT=0); not delivering" and the switch had never once
+# delivered anything.
+#
+# The pool is 0 for a good reason that does not apply at 1. The header
+# suggests 16 slices for a tick-driven title, and 16 x 256 KB is 4 MB of
+# address space sitting under the arena -- which matters, because JSRF loads
+# a 235-texture startup set and then fails allocations of a few hundred bytes
+# with about 2 MB to spare. ONE slice is 256 KB, an eighth of that headroom.
+#
+# Measured 19 Sep 2026 with JSRF_WORKER_STACKS=1: "[IRQ-THREAD] live" for the
+# first time, 3,848 flips at 64.4 fps, reached state 30, zero faults, and the
+# heap census identical to the stock build (frees=2560 matched=2560 missed=0
+# blocks=3104). Still a memory-layout change, so it is opt-in and off.
+set(JSRF_WORKER_STACKS 0 CACHE STRING
+    "Guest stack slices to reserve (256 KB each). 1 enables RECOMP_IRQ_THREAD.")
+if(NOT JSRF_WORKER_STACKS EQUAL 0)
+    add_compile_definitions(XBOX_WORKER_STACK_COUNT=${JSRF_WORKER_STACKS})
+    message(STATUS "Worker stack slices: ${JSRF_WORKER_STACKS} "
+                   "(${JSRF_WORKER_STACKS} x 256 KB off the guest arena)")
+endif()
+
 set(RECOMP_GEN_DIR "${XBOXRECOMP_DIR}/build-macos/jsrf-first-fault/gen"
     CACHE PATH "Instrumented generated JSRF source directory")
 
