@@ -108,6 +108,16 @@ OUT="$ROOT/build-macos/jsrf-first-fault/render-investigation/$NAME"
 SCRATCH="${PLAY_SCRATCH:-/tmp/jsrf-playscripted-$NAME}"
 BIN="${JSRF_BIN:-$ROOT/build-macos/jsrf-first-fault/build/jsrf_first_fault}"
 
+# 8986daf added the jsrf_yield_to_player call below without this line, so the
+# function has been undefined on every run of this script since: the shell
+# printed "jsrf_yield_to_player: command not found" into the middle of the
+# output and carried on, and YIELD stayed empty. The yield guard -- which
+# exists so an unattended run stands down when the player launches the game --
+# has therefore never fired from here, which is the one script that takes the
+# long unattended runs and the one the collisions were reported against.
+# run_scripted.sh, ab_switch.sh, boot_trial.sh and measure.sh all source it.
+. "$ROOT/diagnostics/jsrf_first_fault/run_common.sh"
+
 if [ ! -x "$BIN" ]; then
     echo "no binary at $BIN" >&2
     exit 1
