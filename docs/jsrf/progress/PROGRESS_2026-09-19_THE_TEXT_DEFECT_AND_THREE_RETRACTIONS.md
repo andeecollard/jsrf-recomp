@@ -122,3 +122,84 @@ t=257 with the player's full switch set. The remaining differences are audio
 forced off and the possibility that it is content-gated beyond what 257 seconds
 of replay reached. That counter says nothing about text; it is a lead for the
 spray cans and the wall tags.
+
+---
+
+# ADDENDUM: the positive control exists, and it splits the two symptoms apart
+
+Taken after the above, from framebuffer dumps of the player's own 13:09-13:29
+session. Preserved in
+`glyphdump-2026-09-19-1329-PLAYER-SESSION-KEEP/` with a README (178 frames,
+indices 063-240).
+
+## FIRST, DAMAGE I CAUSED, so the next person checks
+
+`paths.conf` line **479** carries an ACTIVE
+`export RECOMP_FB_DUMP=".../glyphdump/"`. The commented-out line at 199 is
+superseded by it. The dump sequence RESTARTS AT 000 every run, so the replays
+I ran at 13:43-13:56 -- which sourced paths.conf for fidelity -- overwrote the
+low indices of the player's session. Frames below 063, roughly 13:09-13:14, are
+GONE. Those covered the 13:11-13:12 dialogue captures. They survive only as the
+player's own screenshots.
+
+There is a memory note saying exactly this ("every run overwrites the
+RECOMP_FB_DUMP images; preserve first") and I did not apply it when sourcing
+someone else's config. Reading line 199 and stopping was the error: grep the
+WHOLE file for a later active export of the same variable.
+
+## The positive control, which the earlier window lacked
+
+Text IS rendered and IS captured. `report150` shows
+`Pull the "Right Trigger" near / the round-shaped mark to tag!` rendering
+CORRECTLY, digits included (`x 16` in the HUD). So "no glyph quads on the
+fixed-function path" is now a real finding about the path and not an artefact
+of nothing being drawn -- though it still wants the two measurements taken in
+the same window to be airtight.
+
+## The corruption is STABLE, not transient
+
+Frames 205, 207, 209, 210 and 212 all render the same line identically:
+`llect 10 Spra$ Cans and perform a`. Same two characters missing, same corrupt
+glyph where `y` belongs, every frame. An earlier suggestion of mine that the
+corruption might be per-frame or racy is NOT supported.
+
+## THE TRUNCATION IS NOT A RENDERING FAULT
+
+Measured, near-white text pixels, line 1:
+
+    report212 (truncated)  x = 147 .. 515   (368 px wide)
+    report150 (correct)    x = 149 .. 489   (340 px wide)
+
+Both begin at the same left margin, and the LONGER line does not begin further
+left -- so the text is LEFT-ALIGNED at x~148, not centred. And there is no gap
+at the left of the truncated line: the `l` sits at the box edge, so the layout
+never reserved space for the two missing characters.
+
+Three consequences:
+
+  - MY LEFT-EDGE CLIPPING HYPOTHESIS IS REFUTED. The line has a ~148 px left
+    margin and is not against the screen edge; nothing is being clipped.
+  - MY "ONE BUG" HYPOTHESIS IS REFUTED. It required a wrong glyph to carry a
+    wrong advance, mis-measuring the line and pushing it off the edge. There
+    is no centring and no clipping, so that chain cannot run.
+  - The string the renderer lays out genuinely BEGINS at `l`. The leading
+    characters are absent from the string or the iteration start, not lost
+    in glyph selection, sampling or upload.
+
+So the two symptoms are most likely TWO DEFECTS:
+
+  - TRUNCATION -> string source or iteration start. Look at the string-table
+    lookup and whatever formats it, not at the atlas. Note the loss is a
+    VARIABLE prefix (`Collect`->`llect` 2, `Not`->`ot` 1,
+    `Farside Stab Soul`->`de Stab Soul` 5), so a constant pointer bias does
+    not explain it on its own.
+  - SUBSTITUTION -> still open, still the glyph pipeline, and still needs the
+    programmable-path capture and an atlas dump described above.
+
+## Also captured, and it corroborates the player
+
+The spray-can HUD icon renders as a SOLID BLACK silhouette in report150 and
+report207, with the count beside it (`16`, `19`) rendering correctly. That is
+the player's "spray cans not rendering" reproduced in preserved evidence rather
+than in a screenshot, and it sits beside the 140,801 `combiner output mode`
+draw refusals as the leading candidate for the same cause.
