@@ -190,13 +190,29 @@ Blinx and Conker**, whose dirent sectors are absolute on a larger disc:
 | donor | base | root sector |
 |---|---:|---:|
 | Crimson Skies | 32 | 34 |
-| Fuzion Frenzy | 32 | 66 |
+| Fuzion Frenzy | 32 | 34 |
 | Blinx | 880,036 | 1,693,790 |
 | Conker | 956,202 | 1,711,833 |
 
 Recover it by solving the root sector against a known `XBEH` physical offset,
 then confirm the root directory table parses into sane entries. Blinx's root
 holds exactly three: `default.xbe`, `media`, `xdemos`.
+
+Two corrections to the table above, found while turning this into a tool:
+
+- **Fuzion's root sector is 34, not 66.** 66 is its `default.xbe` start
+  sector; the two got crossed. Root is at 34 on both base-32 titles.
+- **`attr & 0x10` IS a reliable directory flag** on all four. The warning
+  below applies to *file* attributes only.
+
+And the base is recoverable from the package header rather than searched for:
+the SVOD volume descriptor at `+0x379` of the PIRS header carries a 3-byte
+data-block offset at `+0x1C`, and twice that little-endian value gives
+32 / 32 / 880,038 / 956,204 against true bases 32 / 32 / 880,036 / 956,202 —
+exact on the two `device_features == 0x00` titles and two sectors over on the
+two `0x40` ones. It is a seed, not an answer: Conker's root table parses
+cleanly at **seven** consecutive bases and only the right one also resolves
+`default.xbe` to `XBEH`, so the two-stage gate is load-bearing.
 
 Note also that `attr` is not a discriminator — 0x21 on Crimson, 0x80 on Blinx
 and Conker. `namelen == 11` plus a size consistent with the XBE's last section
