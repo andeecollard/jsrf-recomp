@@ -243,7 +243,13 @@ COND_MAP = {
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
-    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
+    # "sal" is the same opcode as "shl" and sets the same flags. It was in
+    # none of these sets, so it fell to the conservative "unknown instruction"
+    # branch that clears flag tracking, and a `sal; jcc` lost its branch.
+    # Every one of the 27 in this title is inside data disassembled as code,
+    # so nothing observable changed -- but the arithmetic path already handled
+    # sal, and having the two halves disagree is how the next one gets missed.
+    "inc", "dec", "neg", "shl", "sal", "shr", "sar", "imul", "adc", "sbb",
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
@@ -256,7 +262,7 @@ FLAG_SETTERS = frozenset({
 # imul/bt/rol are excluded because they leave ZF and SF undefined or untouched.
 _RESULT_ZF_SF_SETTERS = frozenset({
     "and", "or", "xor", "inc", "dec", "add", "sub", "adc", "sbb", "neg",
-    "shl", "shr", "sar", "shld", "shrd",
+    "shl", "sal", "shr", "sar", "shld", "shrd",
 })
 
 # The state _merge_predecessor_flag_states produces for such a join. It answers
@@ -863,7 +869,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── shift: result-based ──
-    if flag_setter in ("shl", "shr", "sar"):
+    if flag_setter in ("shl", "sal", "shr", "sar"):
         if jcc in ("je", "jz"):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):

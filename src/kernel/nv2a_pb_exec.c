@@ -720,12 +720,50 @@ static double trace_seconds(void)
  * sees them change while the picture does, the defect is after the fetch:
  * packing, the ring, or the vertex function. Keyed by vertex count so the
  * bubble and the name label are tracked separately. */
-#define FF_WATCH_KEYS 4
+/* THE VERTEX COUNT IS NOT AN IDENTITY, AND KEYING ON IT ALONE VOIDED THIS
+ * INSTRUMENT'S ONE CONCLUSION.
+ *
+ * The comment above says the watch is "keyed by vertex count so the bubble and
+ * the name label are tracked separately". They have different vertex counts,
+ * so that worked for those two -- and stops working the moment two batches
+ * with the SAME count use the watched texture, which for a font atlas is the
+ * normal case: every glyph quad is six vertices.
+ *
+ * Measured on the 19 Sep 2026 black-screen run, which had this armed at
+ * 01737000 and produced 14,273 lines nobody read: the verts=15 slot alternates
+ * between exactly two vertex sets, A->B->A->B, for all 7,140 of its draws, and
+ * verts=6 cycles three. That is not one batch changing. That is two and three
+ * DIFFERENT batches per frame being compared against each other, and every one
+ * of those comparisons was reported as a CHANGE.
+ *
+ * It matters because of what the report is for. Its stated discriminator is:
+ * change means the data was wrong BEFORE the shader (a race with the guest),
+ * no change while the picture is wrong means the defect is after the fetch.
+ * Read off 14,269 changes, that says "race with the guest" -- confidently, and
+ * on no evidence at all.
+ *
+ * So the key carries the draw's ORDINAL WITHIN THE FRAME as well. A static UI
+ * element is drawn at the same point in every frame's sequence, so (count,
+ * ordinal) names one batch and compares it against itself. Two batches that
+ * merely share a vertex count no longer collide. */
+/* Four was enough when the key was the vertex count and the question was
+ * "the bubble or the name label". Keyed per batch it is not: a font atlas is
+ * drawn as one six-vertex quad per glyph, and a line of dialogue is dozens.
+ * Measured on a 55 s boot watching one texture, 8 slots left 29,331 draws
+ * unwatched. At 32 KB a slot (two 1024-vertex float4 arrays) 64 costs 2 MB of
+ * BSS in a diagnostic that is off unless asked for, and the exhaustion
+ * counter says when even that is not enough. */
+#define FF_WATCH_KEYS 64
 #define FF_WATCH_MAX_VERTS 1024
 static struct {
-    uint32_t verts; unsigned long draws;
+    uint32_t verts; unsigned long ordinal, draws, changes;
     float pos[FF_WATCH_MAX_VERTS][4], t0[FF_WATCH_MAX_VERTS][4];
 } g_ff_watch[FF_WATCH_KEYS];
+/* Draws issued so far in this frame, reset at the flip. */
+static unsigned long g_ff_watch_ordinal;
+/* Batches the watch could not track because every slot was taken. Counted so
+ * "no changes" cannot be read off a watch that was never looking. */
+static unsigned long g_ff_watch_nokey;
 static float g_ff_watch_pos[FF_WATCH_MAX_VERTS][4], g_ff_watch_t0[FF_WATCH_MAX_VERTS][4];
 static unsigned long g_ff_watch_changes;
 static uint32_t ff_watch_tex(void)
@@ -744,13 +782,22 @@ static void ff_watch_vertex(const char *arm, uint32_t i, const float inputs[16][
     memcpy(g_ff_watch_pos[i], inputs[0], 16);
     memcpy(g_ff_watch_t0[i], inputs[9], 16);
     if (i + 1 != n) return;
-    /* last vertex: compare with the previous draw of this shape */
+    /* last vertex: compare with the previous draw of THIS batch -- the same
+     * vertex count AND the same place in the frame's draw sequence. Keying on
+     * the count alone compared different batches with each other; see the
+     * note on g_ff_watch. */
+    unsigned long ord = g_ff_watch_ordinal++;
     int k, free = -1;
     for (k = 0; k < FF_WATCH_KEYS; ++k) {
-        if (g_ff_watch[k].verts == n) break;
-        if (free < 0 && !g_ff_watch[k].verts) free = k;
+        if (g_ff_watch[k].verts == n && g_ff_watch[k].draws
+                && g_ff_watch[k].ordinal == ord) break;
+        if (free < 0 && !g_ff_watch[k].draws) free = k;
     }
-    if (k == FF_WATCH_KEYS) { if (free < 0) return; k = free; g_ff_watch[k].verts = n; g_ff_watch[k].draws = 0; }
+    if (k == FF_WATCH_KEYS) {
+        if (free < 0) { ++g_ff_watch_nokey; return; }
+        k = free; g_ff_watch[k].verts = n; g_ff_watch[k].ordinal = ord;
+        g_ff_watch[k].draws = 0;
+    }
     if (g_ff_watch[k].draws++) {
         uint32_t j, diffs = 0, first = n; const char *what = "";
         for (j = 0; j < n; ++j) {
@@ -760,9 +807,12 @@ static void ff_watch_vertex(const char *arm, uint32_t i, const float inputs[16][
         }
         if (diffs) {
             ++g_ff_watch_changes;
-            fprintf(stderr, "[FF-WATCH] t=%.2f arm=%s verts=%u draw#%lu CHANGED %u vertices,"
+            ++g_ff_watch[k].changes;
+            fprintf(stderr, "[FF-WATCH] t=%.2f arm=%s verts=%u batch#%lu draw#%lu"
+                    " CHANGED %u vertices,"
                     " first v%u (%s): pos (%g %g %g %g)->(%g %g %g %g) t0 (%g %g)->(%g %g)\n",
-                    trace_seconds(), arm, n, g_ff_watch[k].draws, diffs, first, what,
+                    trace_seconds(), arm, n, g_ff_watch[k].ordinal,
+                    g_ff_watch[k].draws, diffs, first, what,
                     g_ff_watch[k].pos[first][0], g_ff_watch[k].pos[first][1],
                     g_ff_watch[k].pos[first][2], g_ff_watch[k].pos[first][3],
                     g_ff_watch_pos[first][0], g_ff_watch_pos[first][1],
@@ -771,8 +821,10 @@ static void ff_watch_vertex(const char *arm, uint32_t i, const float inputs[16][
                     g_ff_watch_t0[first][0], g_ff_watch_t0[first][1]);
         }
     } else {
-        fprintf(stderr, "[FF-WATCH] t=%.2f arm=%s verts=%u first draw of this shape, tracking\n",
-                trace_seconds(), arm, n);
+        fprintf(stderr, "[FF-WATCH] t=%.2f arm=%s verts=%u batch#%lu (draw %lu of"
+                " its frame) first sighting, tracking\n",
+                trace_seconds(), arm, n, g_ff_watch[k].ordinal,
+                g_ff_watch[k].ordinal);
     }
     memcpy(g_ff_watch[k].pos, g_ff_watch_pos, (size_t)n * 16);
     memcpy(g_ff_watch[k].t0, g_ff_watch_t0, (size_t)n * 16);
@@ -2209,6 +2261,60 @@ static void fb_watch(void)
     }
 
     memcpy(s_fbw.slot[i].px, s_fbw.cur, len);
+}
+
+/* What the FF batch watch saw, whether or not it saw anything.
+ *
+ * g_ff_watch_changes was incremented from the day the watch was written and
+ * printed nowhere, so the only way to read the instrument was to count its
+ * per-event lines by hand -- and those are capped by nothing, so a busy run
+ * buries them. "A counter that is never printed is not an instrument."
+ *
+ * Silent when the watch is not armed. The four-way reading: no line means
+ * RECOMP_FF_BATCH_WATCH_TEX was not set; tracked=0 means it was set and no
+ * batch ever used that texture (check the offset); changes=0 with tracked>0
+ * is the real absence measurement; and dropped>0 means slots ran out, so a
+ * low change count is not evidence of anything. */
+static void ff_watch_report(void)
+{
+    unsigned k, tracked = 0;
+    unsigned long draws = 0;
+    if (!ff_watch_tex()) return;
+    for (k = 0; k < FF_WATCH_KEYS; ++k)
+        if (g_ff_watch[k].draws) { ++tracked; draws += g_ff_watch[k].draws; }
+    fprintf(stderr, "  [FF-WATCH] texture 0x%08X: %u batch(es) tracked over"
+            " %lu draws, %lu reported a change%s | slots %u%s\n",
+            ff_watch_tex(), tracked, draws, g_ff_watch_changes,
+            tracked ? "" : "   <- NO BATCH EVER USED THIS TEXTURE: the offset"
+                           " is wrong, or the arm never drew it",
+            FF_WATCH_KEYS,
+            g_ff_watch_nokey
+                ? "   <- SLOTS EXHAUSTED, batches went unwatched; a low change"
+                  " count here means nothing"
+                : "");
+    /* Only the batches that actually changed, and at most a dozen: with 64
+     * slots the full list is 64 lines a report, which buries the summary the
+     * reader came for. A batch that never changed is the expected case and
+     * `tracked` already counts it. */
+    {
+        unsigned listed = 0, changed = 0;
+        for (k = 0; k < FF_WATCH_KEYS; ++k)
+            if (g_ff_watch[k].changes) ++changed;
+        for (k = 0; k < FF_WATCH_KEYS && listed < 12; ++k)
+            if (g_ff_watch[k].changes) {
+                ++listed;
+                fprintf(stderr, "  [FF-WATCH]   batch#%lu: %u verts, %lu draws,"
+                        " %lu changed\n", g_ff_watch[k].ordinal,
+                        g_ff_watch[k].verts, g_ff_watch[k].draws,
+                        g_ff_watch[k].changes);
+            }
+        if (changed > listed)
+            fprintf(stderr, "  [FF-WATCH]   ...and %u more batch(es) that"
+                    " changed\n", changed - listed);
+    }
+    if (g_ff_watch_nokey)
+        fprintf(stderr, "  [FF-WATCH]   %lu draw(s) had no free slot\n",
+                g_ff_watch_nokey);
 }
 
 /* What the trap did, whether or not it found anything.
@@ -4828,6 +4934,9 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_FLIP_STALL:
         /* First, so the interval covers the whole frame -- see frame_stats_flip. */
         frame_stats_flip();
+        /* The FF watch keys on the draw's place in the frame, so the count
+         * restarts here. See the note on g_ff_watch. */
+        g_ff_watch_ordinal = 0;
 #if defined(__APPLE__)
         g_mtl_frames++;   /* command buffers per frame needs a frame */
         nv2a_metal_frame_bench_flip();
@@ -5504,6 +5613,7 @@ void nv2a_pb_exec_report(void)
      * runs on every host, and a counter that cannot be read on the host under
      * investigation is not a counter. */
     fb_watch_report();
+    ff_watch_report();
 #if NV2A_GPU_PATH
     if (nv2a_gpu_on())
     {
