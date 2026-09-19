@@ -80,27 +80,71 @@ adoption plan's item 5, *"Keep the sweep in phase at source"*, is still
 It grades the detector on a title Microsoft named, not on JSRF — Microsoft
 never BC'd JSRF — but the detector is what carries over.
 
-## CORRECTION: the oracle cannot be run, and I said it could
+## CORRECTION, TWICE OVER: the oracle CAN be run, and it has been
 
-An earlier revision of this note said "run the coverage oracle on Blinx —
-version-independent, no new input". **The first half is true and the second is
-wrong.** Tried, 19 Sep:
+Two wrong claims of mine, in sequence, both corrected by doing the thing.
 
-`coverage_oracle.py` takes `<module.dll> <our_functions.json>`, and that second
-argument is *our* function detection **for the donor title**. Producing it
-means disassembling Blinx's own `default.xbe`, and we do not have it:
+**First** I said the oracle needed "no new input". It needs our function
+detection for the DONOR title, so it needs the donor's own `default.xbe`.
 
-- the BC package ships the **recompiled 360 module** plus its symbol table,
-  not the original Xbox executable;
-- the original game is in `Content/Game/DefaultPackage`, an Xbox 360 **STFS
-  package** (`PIRS` magic) spanning 11 chunks and 1.6 GB;
-- `default.xbe` appears there **by name**, so the guest filesystem is inside —
-  but there is no `XBEH` magic anywhere in the chunks, so the image is stored
-  compressed or nested rather than plainly.
+**Then** I said that was blocked, because the game data is an SVOD/PIRS
+package and "there is no `XBEH` magic anywhere in the chunks, so the image is
+stored compressed or nested". **That scan was broken.** `grep -c` without
+`-a` prints nothing at all on these binaries, and my loop turned that into
+"0". The positive control I should have run first — grepping for a string I
+already knew was present — also came back empty, which is what finally caught
+it.
 
-So the oracle is blocked on an STFS extractor, which is a documented format and
-a bounded job, but a job — not "no new input". The Fusion side is fine and was
-verified: the module parses, build `20F912`, 1,786 symbols.
+With `grep -a`, `XBEH` appears five times. The XBE is stored plainly.
+
+## Extracting a donor XBE — the recipe, verified on Blinx
+
+1. **Symbols** are in `Content/xefu_*.dll`, NOT the larger `xeo3_*.dll`
+   modules, which carry none. Searching the biggest file first gives a clean
+   false negative.
+2. **The game** is `Content/Game/DefaultPackage` (0xB000 PIRS/SVOD header)
+   plus `DefaultPackage.data/Data0000..N`. The inner filesystem is XDVDFS —
+   `MICROSOFT*XBOX*MEDIA` at `Data0000:0x2000`.
+3. **Find the XBE** with `grep -a XBEH`. Several hits are false; validate by
+   header (base `0x00010000`, sane section count, sane header size).
+4. **Take the size from the filesystem, not the header.** The XDVDFS
+   directory entry is the 14 bytes before the ASCII filename:
+   `struct.unpack('<HHIIBB', d[i-14:i])` → `(l, r, start_sector, size, attr,
+   namelen)`. Blinx: 44,728,320 bytes.
+5. **Copy that many bytes**, spanning into the next `Data` file. No
+   hash-block interleaving corrupted it — the region was contiguous.
+
+Blinx validated cleanly through our own parser: *BLiNX: the time sweeper*,
+title id `0x4D530013`, built 2002-09-13, 56 sections, `.text` / `D3D` /
+`D3DX` / `XGRPH` / `DSOUND`.
+
+## The number
+
+    module: default.xbe [20F912]   MS-named function starts: 1,786
+      hit (we detect a start there):        118   (6.6%)
+      missed, inside a detected function: 1,486   <- under-segmentation
+      missed, in no detected function:      182   <- uncovered
+
+We detect **17,859** functions in Blinx — ten times what Microsoft names —
+and agree on 118 of their 1,786 starts. **83% of MS's starts land inside
+something we already called one function.** The samples are unambiguous:
+`0x000F2B80` contains `_XWriteTitleInfoNoReboot@24`, `_XGetLaunchInfo@8` and
+`_XWriteTitleInfoAndRebootA@20`; `0x000F33FC` contains three more.
+
+That is the adoption plan's item 5 — *"Keep the sweep in phase at source"* —
+with a number against it for the first time.
+
+**Caveat.** JSRF's pipeline feeds `--seed-functions` and `--function-bounds`
+from title-specific analysis; Blinx has none, so this was a bare run. Seeds
+can only ADD starts, so 6.6% is a floor. It is also the honest figure for a
+cold title, which is what every new game is.
+
+## And the version gap is wider than the date suggested
+
+**Blinx links XDK 4831**, uniformly across all seven libraries. JSRF is 4134 —
+a **697-build gap**. `CLAUDE.md` records only the date ("Oct 2002 … still
+months off"). For comparison, `map_names.py` measured 99.1% name agreement
+across a 190-build gap; 697 is well outside anything measured here.
 
 ## What to do, cheapest first
 
