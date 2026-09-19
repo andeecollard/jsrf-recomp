@@ -339,6 +339,24 @@ _IGNORED_PRIVILEGED = {
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
+    # POPFD REPLACES EVERY ARITHMETIC FLAG with a word off the stack, so the
+    # last tracked setter says nothing about the flags a following jcc reads.
+    # It sat in _EFLAGS_PRESERVE, which told the tracker to carry the previous
+    # setter straight across it -- and that setter can be any instruction at
+    # all, so the branch was not merely unresolved but resolved against
+    # something unrelated.
+    #
+    # The list was already known to be wrong here: lift_basic_block's neg/sbb
+    # carry scan walks forward over _EFLAGS_PRESERVE and spells out
+    # `and insns[j].mnemonic != "popfd"` to step around it. One call site
+    # patched around the entry instead of fixing it, and the main flag-
+    # tracking path a few lines below never got the same exception.
+    #
+    # Every popfd in this title disassembles inside data -- DOLBY 0x0027Exxx
+    # and DSOUND 0x001Axxxx, the zero-padded regions -- so nothing observable
+    # changes. It is one word, it is unambiguous, and the next title need not
+    # rediscover it.
+    "popfd",
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -352,7 +370,9 @@ _EFLAGS_PRESERVE = frozenset({
     "call",
     "int3", "int", "wait",
     "cld", "std", "cli", "sti",
-    "pushfd", "popfd", "pushal",
+    # pushfd READS the flags; popfd WRITES all of them and is in
+    # _FLAGS_UNDEFINED, not here. See the note there.
+    "pushfd", "pushal",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -3830,7 +3850,6 @@ def lift_basic_block(lifter, bb, flag_state=None):
             j = i + 1
             while (j < len(insns)
                     and insns[j].mnemonic in _EFLAGS_PRESERVE
-                    and insns[j].mnemonic != "popfd"
                     and not insns[j].is_branch
                     and not insns[j].is_call
                     and not insns[j].is_ret):
