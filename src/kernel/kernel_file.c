@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "../recomp_switch.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -26,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -35,6 +37,163 @@
 
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
+/* ── HOW BIG IS THE VOLUME THE TITLE JUST ASKED ABOUT? ───────────────────
+ *
+ * The geometry above is right and load-bearing. The CAPACITY beside it was
+ * not: both platforms answered every FileFsSizeInformation query from the
+ * HOST volume -- fstatvfs on POSIX, GetDiskFreeSpaceExW(NULL) on Win32,
+ * which is the current directory's disk and not even the handle's. Measured
+ * on this machine 19 Sep 2026, the title asking how much room its cache
+ * drive has was told 1,858 GB total and 690 GB free, where a retail Xbox
+ * cache partition is 750 MB. Nine hundred times over.
+ *
+ * Retail 8 GB drive, which is what a 2002 title was built against:
+ *
+ *   Partition0   the whole device
+ *   Partition1   E:  ~4.8 GB   game and title data (TDATA/UDATA)
+ *   Partition2   C:   500 MB   system
+ *   Partition3   X:   750 MB   cache      <- all three are the same size,
+ *   Partition4   Y:   750 MB   cache         and all three land in one
+ *   Partition5   Z:   750 MB   cache         Cache/ directory here
+ *
+ * The volume is decided by where the handle's host path sits relative to the
+ * save root, because that is what the path layer's own rules key on. A path
+ * under <save>/Cache is a cache partition; anything else under <save> is
+ * Partition1; anything else at all is the disc, which is read-only and whose
+ * free space is zero on a console.
+ *
+ * FREE SPACE IS MEASURED, NOT ASSUMED. Reporting a fixed 750 MB free would
+ * tell a title with a full cache that it may write another 750 MB. So the
+ * bytes actually in the directory are walked and subtracted. The walk is
+ * cached for a second: ordinal 218 is called a few hundred times a run
+ * (221 and 353 in two runs read today) and the cache holds 258 files, so an
+ * uncached walk would be tens of thousands of stat calls for a number that
+ * cannot move meaningfully between two calls in the same frame.
+ *
+ * DEFAULT ON since 19 Sep 2026, and the promotion is a measurement rather
+ * than an argument. The prediction was that a title told it has 690 GB might
+ * cache differently from one told 750 MB, so a cold-boot pair was run from
+ * the stock tree (empty cache) with the switch off and on:
+ *
+ *   off   1,410 file opens at boot
+ *   on    1,413 file opens at boot
+ *   cache built, both arms: 258 files, 119 MB, and byte-identical to the
+ *   player's own cache except JSRF_TEXS0/1.JTX -- the two graffiti sheets
+ *   that differ between ANY two builds, switch or no switch.
+ *
+ * So it changes nothing the title does, which is exactly why it can be on:
+ * the OFF value is not a conservative choice, it is a wrong answer (no Xbox
+ * ever reported 690 GB free), and the one consequence anybody predicted for
+ * fixing it has been measured and is absent.
+ *
+ * NOT covered by that pair, and worth saying: save-game writes, and whether
+ * a long session caches differently once the disc cache is warm. RECOMP_HDD_SIZES=0
+ * restores the host-volume answer and is the control for any of that.
+ */
+#define XBOX_CACHE_PARTITION_BYTES   (750ull * 1024ull * 1024ull)
+#define XBOX_DATA_PARTITION_BYTES   (4787ull * 1024ull * 1024ull)
+
+static int hdd_sizes_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_HDD_SIZES", 1);
+    return on;
+}
+
+/* Bytes used below `root`, following directories, not following symlinks.
+ * Best effort: an unreadable subtree contributes nothing rather than
+ * aborting the answer. */
+static unsigned long long dir_bytes_used(const char *root)
+{
+    unsigned long long total = 0;
+#if defined(_WIN32)
+    WIN32_FIND_DATAA fd;
+    char pattern[MAX_PATH];
+    HANDLE h;
+    snprintf(pattern, sizeof pattern, "%s\\*", root);
+    h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        char child[MAX_PATH];
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        snprintf(child, sizeof child, "%s\\%s", root, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            total += dir_bytes_used(child);
+        else
+            total += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(root);
+    struct dirent *e;
+    if (!d) return 0;
+    while ((e = readdir(d)) != NULL) {
+        char child[MAX_PATH];
+        struct stat st;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (snprintf(child, sizeof child, "%s/%s", root, e->d_name) >= (int)sizeof child)
+            continue;
+        if (lstat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) total += dir_bytes_used(child);
+        else if (S_ISREG(st.st_mode)) total += (unsigned long long)st.st_size;
+    }
+    closedir(d);
+#endif
+    return total;
+}
+
+/* Which emulated volume does this host path belong to, and how big is it?
+ * Returns 0 if the switch is off or the volume cannot be decided, in which
+ * case the caller keeps the host-volume answer. */
+static int xbox_volume_capacity(const char *host_path,
+                                unsigned long long *out_total,
+                                unsigned long long *out_avail)
+{
+    const char *save = xbox_path_save_root();
+    char cache_root[MAX_PATH];
+    size_t save_len;
+    unsigned long long used;
+
+    if (!hdd_sizes_on() || !out_total || !out_avail)
+        return 0;
+    if (!save || !host_path)
+        return 0;
+    save_len = strlen(save);
+    if (strncmp(host_path, save, save_len) != 0) {
+        /* Not on the emulated disk at all: the disc. Read-only, and a console
+         * reports no free space on it. Total is the DVD-9 the game shipped on. */
+        *out_total = 6800ull * 1024ull * 1024ull;
+        *out_avail = 0;
+        return 1;
+    }
+    if (snprintf(cache_root, sizeof cache_root, "%s%cCache", save,
+#if defined(_WIN32)
+                 '\\'
+#else
+                 '/'
+#endif
+                 ) >= (int)sizeof cache_root)
+        return 0;
+
+    if (!strncmp(host_path, cache_root, strlen(cache_root))) {
+        static unsigned long long cached_used;
+        static time_t cached_at;
+        time_t now = time(NULL);
+        if (now != cached_at) { cached_used = dir_bytes_used(cache_root); cached_at = now; }
+        used = cached_used;
+        *out_total = XBOX_CACHE_PARTITION_BYTES;
+    } else {
+        static unsigned long long cached_used;
+        static time_t cached_at;
+        time_t now = time(NULL);
+        if (now != cached_at) { cached_used = dir_bytes_used(save); cached_at = now; }
+        used = cached_used;
+        *out_total = XBOX_DATA_PARTITION_BYTES;
+    }
+    *out_avail = (used >= *out_total) ? 0 : (*out_total - used);
+    return 1;
+}
 
 static void close_dir_context(HANDLE handle);
 
@@ -795,6 +954,20 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+            unsigned long long vtotal = 0, vavail = 0;
+            /* The emulated volume's own capacity first, when RECOMP_HDD_SIZES
+             * is on. The call below asks the CURRENT DIRECTORY's disk, which
+             * is not even the handle's -- see xbox_volume_capacity. */
+            if (xbox_volume_capacity(w32_handle_path(FileHandle), &vtotal, &vavail)) {
+                ULONGLONG cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->TotalAllocationUnits.QuadPart = (LONGLONG)(vtotal / cs);
+                info->AvailableAllocationUnits.QuadPart = (LONGLONG)(vavail / cs);
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
+                return STATUS_SUCCESS;
+            }
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
@@ -1465,10 +1638,21 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
+            unsigned long long vtotal = 0, vavail = 0;
             /* Xbox geometry, not the host's -- see the note on
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+            /* The emulated volume's own capacity, when RECOMP_HDD_SIZES is on
+             * and the handle can be placed. See xbox_volume_capacity. */
+            if (xbox_volume_capacity(w32_handle_path(FileHandle), &vtotal, &vavail)) {
+                ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
+                info->TotalAllocationUnits.QuadPart = (LONGLONG)(vtotal / cs);
+                info->AvailableAllocationUnits.QuadPart = (LONGLONG)(vavail / cs);
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
+                return STATUS_SUCCESS;
+            }
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;

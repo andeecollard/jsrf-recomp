@@ -759,6 +759,35 @@ add_test(NAME jsrf_eeprom_audio_legacy_word_grammar COMMAND jsrf_eeprom_audio_te
 set_tests_properties(jsrf_eeprom_audio_legacy_word_grammar PROPERTIES
                      ENVIRONMENT "RECOMP_EEPROM_AUDIO_LEGACY=yes;JSRF_EXPECT_AUDIO=0x10001")
 
+# HOW BIG DOES THE TITLE THINK ITS CACHE DRIVE IS?
+#
+# Both platforms answered FileFsSizeInformation from the HOST volume, so JSRF
+# asking about its cache drive was told 690 GB free where a retail Xbox cache
+# partition is 750 MB. RECOMP_HDD_SIZES=1 answers from the emulated volume.
+# Registered twice: the OFF arm is the negative control, and it is the arm
+# that matters, because a test that only drove the new behaviour would pass
+# against the old code. The geometry assertion runs in both -- 512 x 32 is
+# load-bearing (HL2's CRT aborts otherwise) and must survive the change.
+add_executable(jsrf_hdd_sizes_test hdd_sizes_test.c)
+target_link_libraries(jsrf_hdd_sizes_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_hdd_sizes_off COMMAND jsrf_hdd_sizes_test)
+set_tests_properties(jsrf_hdd_sizes_off PROPERTIES
+                     ENVIRONMENT "RECOMP_HDD_SIZES=0;JSRF_EXPECT_HDD_SIZES=0")
+add_test(NAME jsrf_hdd_sizes_on COMMAND jsrf_hdd_sizes_test)
+set_tests_properties(jsrf_hdd_sizes_on PROPERTIES
+                     ENVIRONMENT "RECOMP_HDD_SIZES=1;JSRF_EXPECT_HDD_SIZES=1")
+# THE DEFAULT ARM, and the one that matters now the switch is default-on: the
+# defect was a default, and a test that only drove the overrides would pass
+# against a tree where the default had been flipped back. Registered twice --
+# unset, and set to empty, which is how `VAR= cmd` unsets one for a command
+# and is the spelling a hand-rolled getenv would read as OFF.
+add_test(NAME jsrf_hdd_sizes_default COMMAND jsrf_hdd_sizes_test)
+set_tests_properties(jsrf_hdd_sizes_default PROPERTIES
+                     ENVIRONMENT "JSRF_EXPECT_HDD_SIZES=1")
+add_test(NAME jsrf_hdd_sizes_empty_is_default COMMAND jsrf_hdd_sizes_test)
+set_tests_properties(jsrf_hdd_sizes_empty_is_default PROPERTIES
+                     ENVIRONMENT "RECOMP_HDD_SIZES=;JSRF_EXPECT_HDD_SIZES=1")
+
 add_executable(jsrf_ff_refusal_test ff_refusal_test.c)
 target_link_libraries(jsrf_ff_refusal_test PRIVATE xbox_vsh)
 target_include_directories(jsrf_ff_refusal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/nv2a)

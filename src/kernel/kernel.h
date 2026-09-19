@@ -558,6 +558,11 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
 
+/* The save-side root (the emulated-HDD tree), as it was handed to
+ * xbox_path_init. NULL before init. Used to decide which emulated VOLUME a
+ * host path belongs to, which is what free-space answers depend on. */
+const char* xbox_path_save_root(void);
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on

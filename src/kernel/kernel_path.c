@@ -186,6 +186,17 @@ static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
 static BOOL  s_initialized = FALSE;
 
+/* Win32 twin of the POSIX accessor below: the save root as UTF-8, converted
+ * once into a static buffer. Same contract -- NULL before init. */
+const char* xbox_path_save_root(void)
+{
+    static char utf8[MAX_PATH * 4];
+    if (!s_save_dir[0]) return NULL;
+    if (!utf8[0])
+        WideCharToMultiByte(CP_UTF8, 0, s_save_dir, -1, utf8, sizeof utf8, NULL, NULL);
+    return utf8[0] ? utf8 : NULL;
+}
+
 /*
  * The raw disk device, \Device\Harddisk0\Partition0.
  *
@@ -516,6 +527,11 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+const char* xbox_path_save_root(void)
+{
+    return s_save_dir[0] ? s_save_dir : NULL;
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
