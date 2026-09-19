@@ -512,6 +512,39 @@ add_test(NAME jsrf_icall_feedback_path_empty COMMAND jsrf_icall_feedback_path_te
 set_tests_properties(jsrf_icall_feedback_path_empty PROPERTIES
     ENVIRONMENT "RECOMP_ICALL_FEEDBACK_PATH=")
 
+# A SKIPPED INDIRECT CALL THAT NEVER STOPS IS AN INFINITE LOOP, AND THE
+# RUNTIME NOW SAYS SO.
+#
+# Two of the 19 Sep corpus runs reached 10.9 and 23.4 BILLION skipped calls on
+# one target, which the old "every ten-thousandth" limit rendered as 1.09M and
+# 2.34M copies of a line that named the symptom and not the cause. The cause
+# is an earlier indirect call the dispatch table could not resolve at all;
+# recomp_manual.c now remembers that VA and prints it beside the spin.
+#
+# Registered four times because both accessors cache their getenv in a static,
+# so one process can observe one answer -- the same reason
+# jsrf_icall_feedback_path_test is registered three times. The default arm
+# matters most: the threshold defaulting to something other than 1e6, or the
+# abort defaulting to ON, are both changes a healthy run would feel.
+add_executable(jsrf_icall_runaway_test icall_runaway_test.c
+    "${CMAKE_CURRENT_LIST_DIR}/recomp_manual.c")
+target_link_libraries(jsrf_icall_runaway_test PRIVATE xbox_kernel)
+target_include_directories(jsrf_icall_runaway_test PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}"
+    "${XBOXRECOMP_DIR}/templates/runtime"
+    "${XBOXRECOMP_DIR}/include"
+)
+add_test(NAME jsrf_icall_runaway_default COMMAND jsrf_icall_runaway_test)
+add_test(NAME jsrf_icall_runaway_threshold COMMAND jsrf_icall_runaway_test)
+set_tests_properties(jsrf_icall_runaway_threshold PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_RUNAWAY=250000")
+add_test(NAME jsrf_icall_runaway_empty COMMAND jsrf_icall_runaway_test)
+set_tests_properties(jsrf_icall_runaway_empty PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_RUNAWAY=")
+add_test(NAME jsrf_icall_runaway_abort_armed COMMAND jsrf_icall_runaway_test)
+set_tests_properties(jsrf_icall_runaway_abort_armed PROPERTIES
+    ENVIRONMENT "RECOMP_ICALL_RUNAWAY_ABORT=1")
+
 # CAN THE FRAMEBUFFER WATCH SAY NO?
 #
 # RECOMP_FB_WATCH exists to catch G2 -- one glyph's quad drawn with another

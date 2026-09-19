@@ -346,7 +346,13 @@ class FunctionDetector:
         tables = getattr(self, "_arm_tables", None)
         if tables is None:
             tables = {}
-            for tbl in self.engine.jump_tables:
+            # Short tables as well as resynced ones. A table's length decides
+            # whether resync dares delete the bytes it covers; it says nothing
+            # about whether the addresses in it are switch arms.
+            seen = dict.fromkeys(self.engine.jump_tables)
+            seen.update(dict.fromkeys(
+                getattr(self.engine, "short_jump_tables", {})))
+            for tbl in seen:
                 sites = self.engine.jump_table_sites(tbl)
                 if not sites:
                     continue
@@ -413,10 +419,23 @@ class FunctionDetector:
         dispatch -- which is exactly what
         test_a_table_entry_far_from_its_dispatch_is_not_a_first_arm pins down,
         and why that case is still left alone.
+
+        A start this pass has ALREADY DROPPED is not unrelated code either, and
+        crossing one must not veto the arm behind it. One function may hold
+        more than one switch, and then the arms of the first sit between the
+        second's arms and its dispatch: sub_00114A80 dispatches at 0x00114B5F
+        through 0x00114F90 and again at 0x00114D2D through 0x00114FB0, so the
+        arm 0x00114F7D is separated from its own dispatch by 0x00114D34, an arm
+        of the OTHER table. Judged on the table alone that reads as unrelated
+        code and 0x00114F7D stayed a function, which truncated the owner just
+        as the carve it replaced did. The walk is ascending, so by the time an
+        arm is judged every start below it has already been decided -- this
+        asks what was decided rather than guessing again.
         """
         starts = getattr(self, "_seed_walk_starts", None)
         if not starts:
             return None
+        demoted = getattr(self, "_demoted_starts", ())
         for site, tbl in self._arm_table_map().get(addr, ()):
             if not site < addr:
                 continue
@@ -429,7 +448,7 @@ class FunctionDetector:
             entries = set(self.engine.jump_table_entries(tbl))
             crossed = starts[bisect.bisect_right(starts, starts[i]):
                              bisect.bisect_left(starts, addr)]
-            if all(x in entries for x in crossed):
+            if all(x in entries or x in demoted for x in crossed):
                 return site
         return None
 
@@ -518,6 +537,10 @@ class FunctionDetector:
         forced_starts = [b[0] for b in forced]
         self.dropped_seeds: List[dict] = []
         kept: List[dict] = []
+        # Starts this pass has already decided are not functions. The walk is
+        # ascending, so this is complete for everything below the address
+        # under test -- which is all _arm_of_a_carved_run looks at.
+        self._demoted_starts: Set[int] = set()
         owner = None
         owner_end = 0
 
@@ -557,6 +580,7 @@ class FunctionDetector:
                     del self._candidates[start_addr]
                     self._alias_entries.pop(start_addr, None)
                     self.dropped_seeds.append(record)
+                    self._demoted_starts.add(start_addr)
                     continue
                 kept.append(record)
             owner = start_addr
