@@ -3979,7 +3979,34 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * CPU draw, not a wrong one -- but the executor has already skipped the
    * interpreter by then, so this refuses the DRAW rather than silently using
    * the wrong vertex stage. */
-  if (vsh_gpu_active && !hw) { vsh_gpu_active = 0; vsh_active = NULL; }
+  /* AND THIS IS THE LINE THAT DID NOT DO THAT.
+   *
+   * It used to read `if (vsh_gpu_active && !hw) { vsh_gpu_active = 0;
+   * vsh_active = NULL; }` -- clear the flag and carry on. But the flag was
+   * read a hundred and thirty lines above, to decide the SHAPE of the vertex
+   * buffer: with a generated program the batch is packed as the program's
+   * inputs, nattrs float4 per vertex in ascending attribute order, and
+   * without one it is packed as the fixed `vs`'s 112-byte Vertex. Clearing
+   * the flag here does not repack anything. It binds a raw attribute stream
+   * to a vertex function that reads it as Vertex, at buffer(0), with the
+   * index buffer moved from binding 3 to binding 2 as well -- so the draw
+   * takes its positions out of whatever the stride mismatch lands on and
+   * reads past the end of its own reservation into the next batch's
+   * vertices. That is the same picture as a staging-ring hazard and it is
+   * not one; it is a binding the encoder was never told about.
+   *
+   * The comment directly above already said what the rule is -- refuse the
+   * draw rather than silently use the wrong vertex stage -- so this is the
+   * comment being implemented rather than a new policy. reject() is the
+   * counted route the executor already handles.
+   *
+   * NOT OBSERVED, and the counter says so rather than an argument: a 150 s
+   * gameplay run with RECOMP_METAL_FF=1 reports `vsh draws: 311949 GPU, 0
+   * CPU`, and the zero is this branch -- every draw that falls out of the
+   * generated-program path increments g_vsh_cpu_draws. The depth and stencil
+   * textures existed for all 311,949 of them. The repair is for the case
+   * where they do not, which is an allocation failure away. */
+  if (vsh_gpu_active && !hw) { vsh_active = NULL; return reject("hw-lost-under-program"); }
   id<MTLRenderPipelineState> hw_pso_use =
       vsh_gpu_active ? vsh_pipeline_for(s, vsh_active)
                      : (hw ? hw_pipeline_for(s) : nil);
