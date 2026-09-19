@@ -536,6 +536,53 @@ window *hanging* at 19:57, during a 200 s run with the full instrument load.
 is the probes, the length, or unrelated is unmeasured; it is recorded here so
 the next run that hangs is not read as new.
 
+## G2, 20:23 — THE RENDERER IS EXONERATED. THE TEXT IS WRONG BEFORE IT REACHES US.
+
+`RECOMP_GLYPH_DUMP` now prints, per character-sized quad, the atlas cell it
+samples, the texture's guest address, the render target, and the atlas
+layout. It sits in `nv2a_metal_draw`, the common draw entry for both paths —
+the player's `RECOMP_FF_BATCH_WATCH_TEX` has been armed at `01737000` for
+days and is blind, because its call sites are inside the fixed-function
+branches and this title draws text through guest vertex programs.
+
+**What it found.** Texture `01737000` (the address the player's watcher
+names) is the text texture: 512x512, 4 bytes/pixel, **LINEAR**, pitch 2048,
+one mip level, and 262,144 bytes — 512 wide by 128 rows. Two shapes of draw
+sample it: single quads covering `1,1..511,111`, and 60-quad batches.
+
+**And `RECOMP_GLYPH_GPU_DIFF` settles where the corruption enters.** At every
+one of the 8 text draws it looked for a GPU surface slot overlapping the
+sampled range, to read it back and diff it against the guest bytes we upload:
+
+| | |
+|---|---:|
+| draws where a GPU slot overlapped the text texture | **0** |
+| draws where guest RAM was the only copy | **8 of 8** |
+
+**So the text texture is never a render target, the GPU never holds a version
+of it that guest RAM lacks, and what we sample is exactly what the guest
+wrote.** That exonerates the sampler, the texture cache, the surface cache
+and the write-back debt — every GPU-side hypothesis this defect has had,
+including the stale-source one raised twenty minutes earlier in this file.
+
+**Therefore the corruption is in the guest's own composition of the text**,
+and the guest is our recompiled code. This is a translation defect, not a
+rendering one, which puts G2 back under G22: the text routine is composing
+into that buffer through code we lifted, and something in it takes a wrong
+path for character codes 0x76-0x79 and drops leading characters.
+
+**Next, and it needs no player.** Find the guest routine that writes
+`0x01737000` — `RECOMP_MEM_WATCH` on that address gives the writing VA — then
+read our translation of it against the disassembly. The four affected codes
+are contiguous, so the arithmetic that separates 0x75 from 0x76 is a small
+target.
+
+**Still unexplained and not to be forgotten:** the decoded atlas does not
+look like text at t=38 s under any interpretation tried. Either the format
+reading is still wrong or the buffer holds something else at that moment.
+It does not change the finding above — which rests on the absence of a GPU
+copy, not on the decode — but it is not understood.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is

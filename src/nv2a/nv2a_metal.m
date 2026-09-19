@@ -4180,6 +4180,67 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * Print them beside the dump rather than inferring them later. */
    fprintf(stderr,"  [GLYPH]  atlas layout: pitch %u, %s, levels %u\n",
            s->pitch, s->linear?"LINEAR":"swizzled", s->levels);
+   /* IS THE GPU HOLDING A DIFFERENT PICTURE OF THIS TEXTURE THAN GUEST RAM?
+    *
+    * The atlas the text samples is also something the title RENDERS INTO --
+    * these draws sample 01737000 while targeting another surface, and the
+    * decoded guest-RAM copy is not text. This tree already carries the
+    * hazard in surface_pay_debt_for_range's neighbourhood: a slot cleared
+    * residently while another surface is bound leaves the GPU holding pixels
+    * guest RAM has not got. If the text is composed on the GPU and we sample
+    * the stale guest-RAM copy, the drawn text is whatever that copy last
+    * held -- which is exactly the shape of the defect, and "flickers in
+    * layers" is what an intermittently stale source looks like.
+    *
+    * So: find a surface slot overlapping the sampled range, read its colour
+    * texture back, and diff it against the bytes we are about to upload.
+    * Reports the slot's debt state either way, because "no overlap at all"
+    * is itself an answer -- it would mean the atlas is never a render target
+    * and the composition happens somewhere else.
+    *
+    * Costs a drain and a read-back, so it is behind its own switch and off
+    * unless asked for. */
+   if(getenv("RECOMP_GLYPH_GPU_DIFF")){
+    int found=0;
+    for(unsigned i=0;i<SURFACE_SLOTS;i++){
+     if(!surf_slot[i].target) continue;
+     if(!guest_ranges_overlap(texture,texture_size,
+                              surf_slot[i].target,surface_slot_bytes(i))) continue;
+     found=1;
+     fprintf(stderr,"  [GLYPH]  GPU slot %u overlaps the sampled range:"
+             " valid=%d owes_guest_ram=%d %ux%u pitch %u\n",
+             i,surf_slot[i].valid,surf_slot[i].owes_guest_ram,
+             surf_slot[i].w,surf_slot[i].h,surf_slot[i].pitch);
+     if(surf_slot[i].valid&&surf_slot[i].colour){
+      size_t stride=(size_t)surf_slot[i].w*(hw_565_on()?2:16);
+      size_t need=stride*surf_slot[i].h;
+      uint8_t*gpu=(uint8_t*)malloc(need);
+      if(gpu){
+       id<MTLCommandBuffer> drain=[queue commandBuffer]; [drain commit];
+       [drain waitUntilCompleted];
+       [surf_slot[i].colour getBytes:gpu bytesPerRow:stride
+            fromRegion:MTLRegionMake2D(0,0,surf_slot[i].w,surf_slot[i].h)
+            mipmapLevel:0];
+       /* Compare only what both sides have, byte for byte, and say WHERE
+        * they first part rather than only that they do. */
+       size_t n=need<texture_size?need:texture_size, differ=0, first=(size_t)-1;
+       for(size_t k=0;k<n;k++) if(gpu[k]!=texture[k]){ if(first==(size_t)-1)first=k; differ++; }
+       fprintf(stderr,"  [GLYPH]  GPU vs guest RAM over %zu bytes: %zu differ"
+               " (%.1f%%), first at %zu%s\n",
+               n,differ,n?100.0*differ/n:0.0,
+               first==(size_t)-1?0:first,
+               differ?"  <<< THE SAMPLED COPY IS NOT WHAT THE GPU HAS":
+                      "  (identical -- guest RAM is current)");
+       free(gpu);
+      }
+     }
+    }
+    if(!found)
+     fprintf(stderr,"  [GLYPH]  no GPU surface slot overlaps this texture:"
+             " it is not a render target here, so guest RAM is the only copy"
+             " and the composition happens before it reaches us\n");
+    fflush(stderr);
+   }
    /* RECOMP_GLYPH_DUMP_TEXFILE=<path>: the sampled texture's guest bytes,
     * once, exactly as they are handed to the GPU. Decoded offline rather than
     * here: the atlas is DXT1 and a decoder in the draw path would be a second
