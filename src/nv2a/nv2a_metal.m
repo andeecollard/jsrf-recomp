@@ -2111,6 +2111,79 @@ static id<MTLBuffer> ring_slab[RING_SLABS];
  * round is a wrap the GPU has always finished with by the time it matters, and
  * a hazard that cannot be reached cannot be tested for. */
 static unsigned ring_limit = RING_SLABS;
+/* THE SAME SQUEEZE, IN THE LIVE TITLE. RECOMP_METAL_RING_SLABS=<2..8>.
+ *
+ * The self-test can only drive a copy of the draw path's SHAPE. The question
+ * a real run has to answer is different: with eight 8 MB slabs, does the ring
+ * ever come round at all while the game is drawing? A run whose wrap count is
+ * zero has PROVED that no staging byte was ever handed out twice, and no
+ * amount of argument about pins and fences is needed to explain a defect --
+ * the ring cannot have caused it.
+ *
+ * That proof is only worth having with a positive control beside it, because
+ * "wraps=0" is an absence measurement and this project has been burned by
+ * those. Squeezing the ring to two slabs makes wraps unavoidable in the real
+ * title, so a run with RECOMP_METAL_RING_SLABS=2 says what a wrapping ring
+ * looks like, and RECOMP_METAL_RING_NOPIN=1 below says what an UNPROTECTED
+ * wrapping ring looks like. Three arms, and only the third may corrupt.
+ *
+ * Read once, in ring_configure(), because the self-test assigns ring_limit
+ * directly and must not have it read back out from under it. */
+static int ring_limit_configured;
+static int ring_selftest_active;
+/* HOW MUCH OF A SLAB A RUN IS ALLOWED TO USE. RECOMP_METAL_RING_SLAB_KB=<n>.
+ *
+ * Squeezing the slab COUNT is not by itself a stress, and the control run
+ * says why: this backend drains the GPU on every surface swap -- 9,388 of
+ * them in a 150 s gameplay run, about 63 a second -- so the CPU cannot get a
+ * whole slab ahead however few slabs there are. 8 x 8 MB came round 2,501
+ * times in that run and the in-flight count was zero on every one of them.
+ *
+ * A hazard the stress cannot reach is a hazard the stress says nothing
+ * about, so the usable span of a slab is settable too. At 256 KB the ring
+ * comes round several times a frame instead of twice a second, which is the
+ * only regime in which "the GPU is still reading this" can be true. The slab
+ * is still ALLOCATED at RING_SLAB_BYTES -- only the bump pointer's ceiling
+ * moves -- so a batch too large for the squeezed span takes the private
+ * allocation fallback and is counted there rather than silently overrunning. */
+static size_t ring_usable = RING_SLAB_BYTES;
+/* RECOMP_METAL_RING_NOPIN=1 -- A DELIBERATE CORRUPTION ARM. It renders
+ * incorrectly by construction and exists only to be the positive control for
+ * the arms above: with the pin removed the wrap gate can never block, so
+ * staging memory is handed back while the GPU is still reading it. If a
+ * defect blamed on the ring does not appear in THIS arm, the ring is not what
+ * produces it. Never leave it on. */
+static int ring_nopin_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_RING_NOPIN"); return on; }
+static void ring_configure(void)
+{
+    const char *e;
+    if (ring_limit_configured) return;
+    ring_limit_configured = 1;
+    e = getenv("RECOMP_METAL_RING_SLABS");
+    if (e && *e) {
+        int n = atoi(e);
+        if (n < 2) n = 2;
+        if (n > RING_SLABS) n = RING_SLABS;
+        ring_limit = (unsigned)n;
+    }
+    e = getenv("RECOMP_METAL_RING_SLAB_KB");
+    if (e && *e) {
+        long kb = atol(e);
+        if (kb < 64) kb = 64;                 /* still holds a real batch */
+        if ((size_t)kb * 1024u > RING_SLAB_BYTES) kb = RING_SLAB_BYTES / 1024u;
+        ring_usable = (size_t)kb * 1024u;
+    }
+    if (ring_limit != RING_SLABS || ring_usable != RING_SLAB_BYTES
+        || ring_nopin_on())
+        fprintf(stderr, "[METAL] RING DIAGNOSTIC ARM: %u of %d slabs, %zu KiB"
+                " usable of %u%s. This is not a mode -- with the pin removed"
+                " the ring hands staging memory back while the GPU is still"
+                " reading it, and the frame is wrong by construction.\n",
+                ring_limit, RING_SLABS, ring_usable >> 10,
+                (unsigned)(RING_SLAB_BYTES >> 10),
+                ring_nopin_on() ? ", PINNING REMOVED" : ", pinning intact");
+}
 static void (*ring_wrap_hook)(void);
 static unsigned ring_current;
 static size_t ring_offset;
@@ -2171,7 +2244,7 @@ static _Atomic unsigned ring_waiters;
  * unconditional because they cost what the existing inline/allocated vertex
  * counters cost -- nothing measurable next to a draw -- but the report line
  * is gated, so a normal run's output does not change. */
-static uint64_t ring_reserves,ring_bytes,ring_wraps,ring_waits,ring_fallbacks,ring_slabs_live;
+static uint64_t ring_reserves,ring_bytes,ring_wraps,ring_waits,ring_fallbacks,ring_slabs_live,ring_pins_skipped;
 static uint64_t sync_calls,sync_clean,sync_color,sync_depth,surface_uploads;
 /* Nanoseconds inside nv2a_metal_sync, split: waiting for the GPU to drain
  * versus reading the surface back and converting it. See the comment at the
@@ -2223,9 +2296,10 @@ static int ring_audit_on(void)
  * request at all, and the caller must then allocate privately. */
 static id<MTLBuffer> ring_reserve(size_t bytes,size_t*offset_out,void**cpu_out,unsigned*slab_out)
 {
-    if(!bytes||bytes>RING_SLAB_BYTES){++ring_fallbacks;return nil;}
+    ring_configure();
+    if(!bytes||bytes>ring_usable){++ring_fallbacks;return nil;}
     size_t need=RING_ALIGN_UP(bytes);
-    if(ring_offset+need>RING_SLAB_BYTES){
+    if(ring_offset+need>ring_usable){
         unsigned next=(ring_current+1u)%ring_limit;
         ++ring_wraps;
         /* Before looking at the next slab's in-flight count: see the flushing
@@ -2267,6 +2341,11 @@ static id<MTLBuffer> ring_reserve(size_t bytes,size_t*offset_out,void**cpu_out,u
  * finished buffer and miss its own decrement. */
 static void ring_pin(id<MTLCommandBuffer>command,unsigned slab)
 {
+    /* The corruption arm. Gated on the self-test flag as well, because that
+     * test drives ring_pin directly and its own pin_mode 0 is already the
+     * control it needs -- an environment variable must not be able to turn
+     * its two protected cases into a third copy of that control. */
+    if(!ring_selftest_active&&ring_nopin_on()){++ring_pins_skipped;return;}
     atomic_fetch_add(&ring_inflight[slab],1);
     [command addCompletedHandler:^(id<MTLCommandBuffer>done){(void)done;
         /* The lock is only for the sleeping case. Suppose a reserve is about
@@ -2604,11 +2683,14 @@ void nv2a_metal_report(void)
     if(ring_audit_on())
         fprintf(stderr,"[METAL] ring audit: %llu reservations, %llu MiB staged, "
             "%llu slabs live, %llu wraps of which %llu had to wait, %llu fallbacks "
-            "to a private allocation | syncs: %llu calls, %llu already clean, "
+            "to a private allocation; %u of %d slabs in use, %zu KiB usable, %llu pins skipped%s | syncs: %llu calls, %llu already clean, "
             "%llu colour read-backs, %llu depth read-backs; %llu surface re-uploads\n",
             (unsigned long long)ring_reserves,(unsigned long long)(ring_bytes>>20),
             (unsigned long long)ring_slabs_live,(unsigned long long)ring_wraps,
             (unsigned long long)ring_waits,(unsigned long long)ring_fallbacks,
+            ring_limit,RING_SLABS,ring_usable>>10,
+            (unsigned long long)ring_pins_skipped,
+            ring_nopin_on()?", PINNING REMOVED -- this frame is wrong by construction":"",
             (unsigned long long)sync_calls,(unsigned long long)sync_clean,
             (unsigned long long)sync_color,(unsigned long long)sync_depth,
             (unsigned long long)surface_uploads);
@@ -2732,17 +2814,29 @@ int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
                              unsigned per_batch, unsigned *corrupt_out)
 {
     const size_t span = 64u * 1024u;       /* 32 to a 2 MB slab */
-    unsigned saved_limit = ring_limit, corrupt = 0, i;
+    unsigned saved_limit, corrupt = 0, i;
+    size_t saved_usable;
     id<MTLBuffer> dst;
     int failed = 0;
 
     if (!initialize()) return 0;
+    /* Settle the environment's own ring configuration first, so saved_limit
+     * below restores what a real run would have had rather than the compiled
+     * default. */
+    ring_configure();
+    saved_limit = ring_limit;
+    saved_usable = ring_usable;
     if (slabs < 2 || slabs > RING_SLABS || !iters || !per_batch) return 0;
     dst = [device newBufferWithLength:span * iters options:MTLResourceStorageModeShared];
     if (!dst) return 0;
     memset(dst.contents, 0, span * iters);
 
+    /* Lock the corruption arm out: this test brings its own control, and an
+     * environment variable must not be able to turn its two protected cases
+     * into a third copy of it. */
+    ring_selftest_active = 1;
     ring_limit = slabs;
+    ring_usable = RING_SLAB_BYTES;   /* the test sizes its own reservations */
     ring_current = 0; ring_offset = 0;
     st_cmd = nil; st_blit = nil; st_pins = 0; st_in_batch = 0; st_pin_mode = (unsigned)pin_mode;
     ring_wrap_hook = selftest_flush;
@@ -2786,6 +2880,8 @@ int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
         }
     }
     ring_limit = saved_limit;
+    ring_usable = saved_usable;
+    ring_selftest_active = 0;
     ring_current = 0; ring_offset = 0;
     if (corrupt_out) *corrupt_out = failed ? 0xFFFFFFFFu : corrupt;
     return 1;
@@ -3979,7 +4075,34 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * CPU draw, not a wrong one -- but the executor has already skipped the
    * interpreter by then, so this refuses the DRAW rather than silently using
    * the wrong vertex stage. */
-  if (vsh_gpu_active && !hw) { vsh_gpu_active = 0; vsh_active = NULL; }
+  /* AND THIS IS THE LINE THAT DID NOT DO THAT.
+   *
+   * It used to read `if (vsh_gpu_active && !hw) { vsh_gpu_active = 0;
+   * vsh_active = NULL; }` -- clear the flag and carry on. But the flag was
+   * read a hundred and thirty lines above, to decide the SHAPE of the vertex
+   * buffer: with a generated program the batch is packed as the program's
+   * inputs, nattrs float4 per vertex in ascending attribute order, and
+   * without one it is packed as the fixed `vs`'s 112-byte Vertex. Clearing
+   * the flag here does not repack anything. It binds a raw attribute stream
+   * to a vertex function that reads it as Vertex, at buffer(0), with the
+   * index buffer moved from binding 3 to binding 2 as well -- so the draw
+   * takes its positions out of whatever the stride mismatch lands on and
+   * reads past the end of its own reservation into the next batch's
+   * vertices. That is the same picture as a staging-ring hazard and it is
+   * not one; it is a binding the encoder was never told about.
+   *
+   * The comment directly above already said what the rule is -- refuse the
+   * draw rather than silently use the wrong vertex stage -- so this is the
+   * comment being implemented rather than a new policy. reject() is the
+   * counted route the executor already handles.
+   *
+   * NOT OBSERVED, and the counter says so rather than an argument: a 150 s
+   * gameplay run with RECOMP_METAL_FF=1 reports `vsh draws: 311949 GPU, 0
+   * CPU`, and the zero is this branch -- every draw that falls out of the
+   * generated-program path increments g_vsh_cpu_draws. The depth and stencil
+   * textures existed for all 311,949 of them. The repair is for the case
+   * where they do not, which is an allocation failure away. */
+  if (vsh_gpu_active && !hw) { vsh_active = NULL; return reject("hw-lost-under-program"); }
   id<MTLRenderPipelineState> hw_pso_use =
       vsh_gpu_active ? vsh_pipeline_for(s, vsh_active)
                      : (hw ? hw_pipeline_for(s) : nil);
