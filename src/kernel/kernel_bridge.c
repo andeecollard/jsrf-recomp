@@ -428,6 +428,51 @@ static uint32_t bridge_checked_out_va(uint32_t va, uint32_t bytes,
     return 0;
 }
 
+/* A GUEST BUFFER THE HOST IS ABOUT TO READ OR WRITE THROUGH.
+ *
+ * bridge_checked_out_va covers the small fixed-size out-parameter: a handle
+ * slot, an IO_STATUS_BLOCK, a LARGE_INTEGER. This covers the other shape, and
+ * it is the dangerous one -- a base and a LENGTH that both come from the
+ * guest, handed to a host call that will read or write that many bytes.
+ *
+ * NtReadFile is the worst of them: the host WRITES `length` bytes through the
+ * pointer, so a length the guest got wrong, or a buffer near the top of the
+ * mapping, walks the host past the end of guest memory writing file contents.
+ * Nothing above this layer can catch it -- xbox_NtReadFile receives a host
+ * pointer and a count and has no way to know where the mapping ends.
+ *
+ * STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot
+ * touch, and it is a great deal more useful to a title than a host crash: the
+ * call fails, the guest sees a status it has a branch for, and the log names
+ * the export, the buffer and the length.
+ */
+static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
+{
+    static const char *seen[16];
+    static int distinct;
+    int i;
+
+    if (!bytes)                                   /* nothing is accessed */
+        return 1;
+    if (va && bridge_va_mapped(va, bytes))
+        return 1;
+
+    for (i = 0; i < distinct; ++i)
+        if (seen[i] == export_name)
+            return 0;
+    if (distinct < (int)(sizeof(seen) / sizeof(seen[0])))
+        seen[distinct++] = export_name;
+
+    fprintf(stderr,
+            "  [KERNEL] %s: buffer 0x%08X length %u is not mapped guest "
+            "memory; returning STATUS_ACCESS_VIOLATION. guest caller=0x%08X\n",
+            export_name, va, (unsigned)bytes,
+            g_esp ? (uint32_t)BRIDGE_MEM32(g_esp - 4) : 0);
+    fflush(stderr);
+    return 0;
+}
+
+
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
  * Each bridge reads args from the Xbox stack, translates pointer
@@ -2004,6 +2049,12 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
 
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    /* count is bounded above, so this reads at most 256 bytes -- but it still
+     * reads them from a guest address nothing has checked. */
+    if (!bridge_buf_ok(handles_va, count * 4u, "NtWaitForMultipleObjectsEx")) {
+        g_eax = 0xC0000005u;             /* STATUS_ACCESS_VIOLATION */
         return;
     }
     for (i = 0; i < count; i++)
@@ -5094,6 +5145,30 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
     uint16_t length=BRIDGE_MEM16(ansi_str_va);
+    /* `path` is sized UINT16_MAX+1 so a uint16 Length can never overrun the
+     * DESTINATION. The SOURCE is the side that needed checking: Length and
+     * Buffer both come from a guest ANSI_STRING, and nothing here established
+     * that Buffer+Length is inside the mapping. A string near the top of guest
+     * memory, or one whose Length does not match the buffer it names, walked
+     * the host off the end of the mapping for up to 64 KB -- a read fault in
+     * the bridge with no recompiled frame on the stack, which is precisely the
+     * diagnosis problem bridge_va_mapped exists to prevent.
+     *
+     * Refusing the path is the right failure: every caller treats NULL as "no
+     * object name", which is an error the guest gets told about, rather than a
+     * host crash it cannot be told about. */
+    if (length && !bridge_va_mapped(buf_va, length)) {
+        static int warned;
+        if (warned++ < 4) {
+            fprintf(stderr,
+                    "  [KERNEL] object name: ANSI_STRING at 0x%08X names "
+                    "buffer 0x%08X length %u, which is not mapped guest "
+                    "memory; refusing the path\n",
+                    ansi_str_va, buf_va, (unsigned)length);
+            fflush(stderr);
+        }
+        return NULL;
+    }
     memcpy(path,XBOX_TO_NATIVE(buf_va),length);
     path[length]='\0';
     return path;
@@ -5907,6 +5982,11 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
+        bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
@@ -5972,6 +6052,11 @@ static void bridge_NtWriteFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(buffer_va, length, "NtWriteFile")) {
+        bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
@@ -5995,6 +6080,11 @@ static void bridge_NtQueryInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -6012,6 +6102,11 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtSetInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -6029,6 +6124,11 @@ static void bridge_NtQueryVolumeInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryVolumeInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FS_INFORMATION_CLASS)infoclass);
@@ -6087,12 +6187,22 @@ static void bridge_NtQueryDirectoryFile(void)
     PXBOX_ANSI_STRING    pfn = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryDirectoryFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (filename_va) {
         /* Xbox ANSI_STRING: 0=Length(u16), 2=MaximumLength(u16), 4=Buffer(u32) */
         uint32_t fn_buf  = BRIDGE_MEM32(filename_va + 4);
         fn.Length        = BRIDGE_MEM16(filename_va);
         fn.MaximumLength = BRIDGE_MEM16(filename_va + 2);
-        fn.Buffer        = fn_buf ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
+        /* The pattern is a guest string too, and the match walks Length bytes
+         * of it. Dropping an unmapped one to NULL means "no pattern", which is
+         * a restart-scan with no filter -- a wrong answer the caller can see,
+         * rather than a host read off the end of the mapping. */
+        fn.Buffer        = (fn_buf && bridge_va_mapped(fn_buf, fn.Length))
+                             ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
         if (fn.Buffer) pfn = &fn;
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
