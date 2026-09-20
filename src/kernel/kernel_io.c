@@ -433,3 +433,44 @@ NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName)
     entry->target[0] = '\0';
     return STATUS_SUCCESS;
 }
+
+/* ============================================================================
+ * IoDismountVolumeByName (ordinal 91)
+ *
+ * NTSTATUS IoDismountVolumeByName(POBJECT_STRING VolumeName)
+ *
+ * Tears down the mounted filesystem behind a device name -- "\\??\\D:" for the
+ * DVD, "\\??\\E:" for the game partition, a memory-unit name for a unit the
+ * player pulled. On hardware the next open of that name re-mounts it.
+ *
+ * There is no mount to tear down here. Guest paths are translated to host
+ * paths per open (see kernel_path.c); no volume object sits between the title
+ * and the filesystem, so there is no cached state a dismount would invalidate.
+ *
+ * That makes success the honest answer rather than a convenient one: the
+ * postcondition the caller is entitled to -- "nothing is holding that volume
+ * mounted any more" -- already holds. Returning an error instead would be
+ * reporting a failure that did not happen, and the callers that check tend to
+ * respond by retrying forever or refusing to touch the device again.
+ *
+ * The name is validated and logged, because a dismount of a name the title
+ * never mounted is worth seeing, and because a run that dismounts the wrong
+ * device should leave a trace of which one.
+ * ============================================================================ */
+NTSTATUS __stdcall xbox_IoDismountVolumeByName(PXBOX_ANSI_STRING VolumeName)
+{
+    char name[64];
+
+    if (!VolumeName)
+        return STATUS_INVALID_PARAMETER;
+
+    xbox_copy_ansi(name, sizeof(name), VolumeName);
+    if (name[0] == '\0')
+        return STATUS_INVALID_PARAMETER;
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_IO,
+        "IoDismountVolumeByName: '%s' (no volume object to dismount; guest "
+        "paths are translated per open)", name);
+
+    return STATUS_SUCCESS;
+}

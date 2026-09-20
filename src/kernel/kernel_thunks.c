@@ -140,7 +140,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 
     /* ---- Debug ---- */
     case   5: return (ULONG_PTR)xbox_DbgBreakPoint;
-    case   8: return (ULONG_PTR)xbox_Unknown_8;  /* DbgPrint */
+    case   8: return (ULONG_PTR)xbox_DbgPrint;
 
     /* ---- Executive / pool ---- */
     case  14: return (ULONG_PTR)xbox_ExAllocatePool;
@@ -190,6 +190,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case  85: return (ULONG_PTR)xbox_IoSynchronousFsdRequest;
     case  86: return (ULONG_PTR)xbox_IofCallDriver;
     case  87: return (ULONG_PTR)xbox_IofCompleteRequest;
+    case  91: return (ULONG_PTR)xbox_IoDismountVolumeByName;
     case 359: return (ULONG_PTR)xbox_IoMarkIrpMustComplete;
 
     /* ---- Kernel core ---- */
@@ -214,6 +215,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 139: return (ULONG_PTR)xbox_KeRestoreFloatingPointState;
     case 142: return (ULONG_PTR)xbox_KeSaveFloatingPointState;
     case 143: return (ULONG_PTR)xbox_KeSetBasePriorityThread;
+    case 144: return (ULONG_PTR)xbox_KeSetDisableBoostThread;
     case 145: return (ULONG_PTR)xbox_KeSetEvent;
     case 149: return (ULONG_PTR)xbox_KeSetTimer;
     case 150: return (ULONG_PTR)xbox_KeSetTimerEx;

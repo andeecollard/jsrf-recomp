@@ -264,6 +264,45 @@ LONG __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread)
 }
 
 /* ============================================================================
+ * KeSetDisableBoostThread (ordinal 144)
+ *
+ * BOOLEAN KeSetDisableBoostThread(PKTHREAD Thread, BOOLEAN Disable)
+ *
+ * Turns off the scheduler's priority boost for one thread and returns whether
+ * it was already off. Titles use it on threads that must not drift up in
+ * priority when they come out of a wait -- audio mixers and streaming threads,
+ * typically, where a boost would starve the very thread that feeds them.
+ *
+ * Disable has the same polarity as Win32's bDisablePriorityBoost, so this is a
+ * direct forward. What it is NOT is a scheduling change on this host: see
+ * SetThreadPriorityBoost in win32_compat.c -- POSIX has no wakeup boost to
+ * disable, so the flag is tracked and returned, not applied.
+ *
+ * The return value is the *previous* Disable state, which is the whole reason
+ * to track it: the idiom is save-set-restore, and a version that always
+ * returned FALSE would have every caller restore the wrong state.
+ * ============================================================================ */
+BOOLEAN __stdcall xbox_KeSetDisableBoostThread(PVOID Thread, BOOLEAN Disable)
+{
+    HANDLE hThread = (HANDLE)Thread;
+    BOOL previous = FALSE;
+
+    /* A thread we do not know is not an error the caller can act on -- it gets
+     * the documented default, FALSE, the same answer a never-set thread gives. */
+    if (!GetThreadPriorityBoost(hThread, &previous))
+        previous = FALSE;
+
+    SetThreadPriorityBoost(hThread, Disable ? TRUE : FALSE);
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,
+        "KeSetDisableBoostThread: thread=%p, disable=%u, prev=%u (tracked, "
+        "not applied -- no POSIX wakeup boost exists)",
+        Thread, (unsigned)Disable, (unsigned)previous);
+
+    return previous ? TRUE : FALSE;
+}
+
+/* ============================================================================
  * KeAlertThread
  *
  * Sends an alert to a thread, which can wake it from an alertable wait.

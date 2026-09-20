@@ -753,6 +753,7 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval);
 LONG     __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment);
 LONG     __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread);
+BOOLEAN  __stdcall xbox_KeSetDisableBoostThread(PVOID Thread, BOOLEAN Disable);
 NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);
@@ -892,6 +893,7 @@ NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName,
  * Looked up by exact link name, e.g. "\\??\\Z:". */
 const char* xbox_LookupSymbolicLink(const char* link);
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
+NTSTATUS __stdcall xbox_IoDismountVolumeByName(PXBOX_ANSI_STRING VolumeName);
 
 /* ============================================================================
  * Crypto (kernel_crypto.c)
@@ -1074,9 +1076,11 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_VIDEO_FLAGS_480p         AV_FLAGS_HDTV_480p
 
 /* Unknown ordinals - stub */
-VOID    __stdcall xbox_Unknown_8(void);
 VOID    __stdcall xbox_Unknown_23(void);
 VOID    __stdcall xbox_Unknown_42(void);
+
+/* DbgPrint (8) is __cdecl varargs, unlike every other export here. */
+ULONG   __cdecl   xbox_DbgPrint(const char* Format, ...);
 
 /* ============================================================================
  * Debug/Logging

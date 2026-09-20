@@ -174,6 +174,8 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+BOOL   SetThreadPriorityBoost(HANDLE h, BOOL disable);
+BOOL   GetThreadPriorityBoost(HANDLE h, PBOOL disabled);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 

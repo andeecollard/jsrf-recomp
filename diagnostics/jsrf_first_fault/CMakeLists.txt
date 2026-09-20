@@ -295,6 +295,12 @@ add_executable(jsrf_av_encoder_option_test av_encoder_option_test.c)
 target_link_libraries(jsrf_av_encoder_option_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_av_encoder_option COMMAND jsrf_av_encoder_option_test)
 
+# The three exports JSRF imports that had no implementation. The boot run shows
+# them resolving; this shows them behaving.
+add_executable(jsrf_kernel_new_exports_test kernel_new_exports_test.c)
+target_link_libraries(jsrf_kernel_new_exports_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_kernel_new_exports COMMAND jsrf_kernel_new_exports_test)
+
 add_executable(jsrf_heap_alloc_test heap_alloc_test.c)
 target_link_libraries(jsrf_heap_alloc_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_heap_alloc COMMAND jsrf_heap_alloc_test)

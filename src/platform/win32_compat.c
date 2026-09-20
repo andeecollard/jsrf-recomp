@@ -310,6 +310,7 @@ typedef struct w32_object {
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
+    int             priority_boost_disabled;
     PAPCFUNC        apc_func[W32_MAX_APC];
     ULONG_PTR       apc_data[W32_MAX_APC];
     int             apc_count;
@@ -939,6 +940,50 @@ int GetThreadPriority(HANDLE h)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+/* Priority boosting is a Windows scheduler behaviour with no POSIX equivalent:
+ * neither Linux nor Darwin raises a thread's priority on wakeup, so there is
+ * nothing here to switch off. Tracked rather than applied, exactly as
+ * SetThreadPriority above is, so a caller that saves the previous value and
+ * restores it later reads back what it set instead of a guess.
+ *
+ * The process's initial thread has no w32_object -- t_self_obj is set in
+ * CreateThread's trampoline, so a thread this layer did not create has none.
+ * SetThreadPriority can shrug that off because nothing reads its answer back,
+ * but this pair is a save-restore contract: with no store for the main thread,
+ * the setter would report success, the getter would keep answering FALSE, and
+ * a caller restoring the previous value would quietly restore the wrong one.
+ * A thread-local flag covers exactly that thread, which is the one case the
+ * object table cannot. */
+static __thread int t_boost_disabled = 0;
+
+static int *boost_slot(HANDLE h)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (o && o->kind == K_THREAD) return &o->priority_boost_disabled;
+    /* Only the calling thread can be meant by a handle with no object behind
+     * it: another thread's flag lives in its object, and there is no way to
+     * reach another thread's TLS from here. */
+    if (h == PSEUDO_CURRENT_THREAD || (o == NULL && h == (HANDLE)t_self_obj))
+        return &t_boost_disabled;
+    return NULL;
+}
+
+BOOL SetThreadPriorityBoost(HANDLE h, BOOL disable)
+{
+    int *slot = boost_slot(h);
+    if (!slot) return FALSE;
+    *slot = disable ? 1 : 0;
+    return TRUE;
+}
+
+BOOL GetThreadPriorityBoost(HANDLE h, PBOOL disabled)
+{
+    int *slot = boost_slot(h);
+    if (!slot || !disabled) return FALSE;
+    *disabled = *slot ? TRUE : FALSE;
+    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }

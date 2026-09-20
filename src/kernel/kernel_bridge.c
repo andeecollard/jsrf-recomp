@@ -31,6 +31,7 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
+#include <string.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
  * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
@@ -7036,6 +7037,461 @@ static void bridge_XcDESKeyParity(void)
     g_eax = 0;
 }
 
+/* ── DbgPrint (ordinal 8) ─────────────────────────────────
+ *
+ * ULONG __cdecl DbgPrint(PCSTR Format, ...)
+ *
+ * The one varargs export in the table, and the reason it needs its own
+ * formatter rather than a forward to xbox_DbgPrint: the arguments are on the
+ * *guest* stack, in guest layout, and a `%s` among them is a guest VA. Handing
+ * that list to the host's vsnprintf would print host memory at a guest
+ * address. So the conversions are walked here and each one is rendered
+ * individually, pulling exactly as many guest dwords as its type spends.
+ *
+ * What the width of a guest argument is, per conversion:
+ *   d i u o x X c   one dword           (char/short are promoted to int)
+ *   ll / I64 forms  two dwords, low first (little-endian)
+ *   f e E g G a A   two dwords -- a float is promoted to double by the
+ *                   default argument promotions, so 8 bytes even for %f
+ *   s p             one dword, a guest VA
+ *
+ * %p prints the guest VA, not the host address it maps to. A pointer in this
+ * title's log is only useful if it can be matched against the title's own
+ * addresses.
+ */
+static uint32_t bridge_dbgprint_arg(int *slot)
+{
+    return (uint32_t)BRIDGE_MEM32(g_esp + (*slot)++ * 4);
+}
+
+/* Render one conversion into `out`. `spec` is the format the guest wrote, with
+ * any length modifier already stripped -- the host's own modifier is supplied
+ * here to match the C type actually being passed. */
+static int bridge_dbgprint_one(char *out, size_t out_sz, const char *spec,
+                               char conv, int is64, int *slot)
+{
+    char host[64];
+    size_t n = strlen(spec);
+
+    if (n + 8 >= sizeof(host))
+        return 0;
+
+    switch (conv) {
+    case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
+        if (is64) {
+            uint32_t lo = bridge_dbgprint_arg(slot);
+            uint32_t hi = bridge_dbgprint_arg(slot);
+            uint64_t v  = ((uint64_t)hi << 32) | lo;
+            /* Splice "ll" in ahead of the conversion character. */
+            memcpy(host, spec, n - 1);
+            host[n - 1] = 'l'; host[n] = 'l'; host[n + 1] = conv; host[n + 2] = '\0';
+            if (conv == 'd' || conv == 'i')
+                return snprintf(out, out_sz, host, (long long)v);
+            return snprintf(out, out_sz, host, (unsigned long long)v);
+        } else {
+            uint32_t v = bridge_dbgprint_arg(slot);
+            memcpy(host, spec, n + 1);
+            if (conv == 'd' || conv == 'i')
+                return snprintf(out, out_sz, host, (int)(int32_t)v);
+            return snprintf(out, out_sz, host, (unsigned)v);
+        }
+    }
+    case 'c': {
+        uint32_t v = bridge_dbgprint_arg(slot);
+        memcpy(host, spec, n + 1);
+        return snprintf(out, out_sz, host, (int)(v & 0xFF));
+    }
+    case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+    case 'a': case 'A': {
+        uint32_t lo = bridge_dbgprint_arg(slot);
+        uint32_t hi = bridge_dbgprint_arg(slot);
+        uint64_t bits = ((uint64_t)hi << 32) | lo;
+        double d;
+        memcpy(&d, &bits, sizeof(d));
+        memcpy(host, spec, n + 1);
+        return snprintf(out, out_sz, host, d);
+    }
+    case 's': {
+        uint32_t va = bridge_dbgprint_arg(slot);
+        const char *p = va ? (const char *)XBOX_TO_NATIVE(va) : NULL;
+        memcpy(host, spec, n + 1);
+        /* A null or unmapped string is a title bug worth seeing spelled out
+         * rather than a crash inside the logger. */
+        return snprintf(out, out_sz, host, p ? p : "(null)");
+    }
+    case 'p': {
+        uint32_t va = bridge_dbgprint_arg(slot);
+        return snprintf(out, out_sz, "0x%08X", va);
+    }
+    default:
+        /* An unrecognised conversion consumes nothing: guessing a width here
+         * would desynchronise every argument after it, which turns one unknown
+         * conversion into a whole garbled line. Show it verbatim instead. */
+        return snprintf(out, out_sz, "%s", spec);
+    }
+}
+
+static void bridge_DbgPrint(void)
+{
+    uint32_t fmt_va = STACK_ARG(0);
+    const char *fmt;
+    char buf[1024];
+    size_t out = 0;
+    int slot = 1;              /* guest dword 0 is the format pointer */
+    int i = 0;
+
+    if (!fmt_va) {
+        g_eax = 0;
+        return;
+    }
+    fmt = (const char *)XBOX_TO_NATIVE(fmt_va);
+
+    /* The format string is guest memory and nothing guarantees it is
+     * terminated. Bounding the walk keeps a corrupt one from reading its way
+     * out of the mapping; no real format is anywhere near this long. */
+    while (i < 4096 && fmt[i] && out + 1 < sizeof(buf)) {
+        if (fmt[i] != '%') {
+            buf[out++] = fmt[i++];
+            continue;
+        }
+        if (fmt[i + 1] == '%') {
+            buf[out++] = '%';
+            i += 2;
+            continue;
+        }
+
+        /* Copy the whole conversion through to its conversion character,
+         * dropping the guest's length modifier -- the host's is decided by the
+         * argument width above, not by what the guest wrote. */
+        {
+            char spec[48];
+            size_t sn = 0;
+            int is64 = 0;
+            char conv = '\0';
+            int n;
+
+            spec[sn++] = fmt[i++];                       /* '%' */
+            while (fmt[i] && strchr("-+ #0", fmt[i]) && sn + 1 < sizeof(spec))
+                spec[sn++] = fmt[i++];                   /* flags */
+            while (fmt[i] && (fmt[i] == '*' || (fmt[i] >= '0' && fmt[i] <= '9'))
+                   && sn + 1 < sizeof(spec)) {
+                /* `*` takes its width from an argument; consume that dword so
+                 * the ones after it still line up. Rendered as a literal
+                 * width so the host format needs no extra argument. */
+                if (fmt[i] == '*') {
+                    int w = (int)(int32_t)bridge_dbgprint_arg(&slot);
+                    n = snprintf(spec + sn, sizeof(spec) - sn, "%d", w);
+                    if (n < 0 || (size_t)n >= sizeof(spec) - sn) break;
+                    sn += (size_t)n;
+                    i++;
+                } else {
+                    spec[sn++] = fmt[i++];
+                }
+            }
+            if (fmt[i] == '.' && sn + 1 < sizeof(spec)) {
+                spec[sn++] = fmt[i++];                   /* precision */
+                while (fmt[i] && (fmt[i] == '*' || (fmt[i] >= '0' && fmt[i] <= '9'))
+                       && sn + 1 < sizeof(spec)) {
+                    if (fmt[i] == '*') {
+                        int w = (int)(int32_t)bridge_dbgprint_arg(&slot);
+                        n = snprintf(spec + sn, sizeof(spec) - sn, "%d", w);
+                        if (n < 0 || (size_t)n >= sizeof(spec) - sn) break;
+                        sn += (size_t)n;
+                        i++;
+                    } else {
+                        spec[sn++] = fmt[i++];
+                    }
+                }
+            }
+            /* Length modifiers. MSVC's I64 spelling is what an XDK-era title
+             * emits; ll is accepted too. Both mean two guest dwords. */
+            for (;;) {
+                if (fmt[i] == 'l' && fmt[i + 1] == 'l') { is64 = 1; i += 2; continue; }
+                if (fmt[i] == 'I' && fmt[i + 1] == '6' && fmt[i + 2] == '4') {
+                    is64 = 1; i += 3; continue;
+                }
+                /* `l`, `h`, `hh`, `w`, `L`, `z`, `t` all still arrive as one
+                 * promoted dword on a 32-bit guest, so they are dropped. */
+                if (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'w'
+                    || fmt[i] == 'L' || fmt[i] == 'z' || fmt[i] == 't') {
+                    i++;
+                    continue;
+                }
+                break;
+            }
+            if (!fmt[i]) break;                          /* truncated format */
+            conv = fmt[i++];
+            if (sn + 2 >= sizeof(spec)) break;
+            spec[sn++] = conv;
+            spec[sn] = '\0';
+
+            n = bridge_dbgprint_one(buf + out, sizeof(buf) - out, spec,
+                                    conv, is64, &slot);
+            if (n < 0) break;
+            out += (size_t)n;
+            if (out >= sizeof(buf)) { out = sizeof(buf) - 1; break; }
+        }
+    }
+    buf[out] = '\0';
+
+    fprintf(stderr, "[GUEST] %s", buf);
+    if (out == 0 || buf[out - 1] != '\n')
+        fputc('\n', stderr);
+    fflush(stderr);
+
+    /* DbgPrint returns the character count. __cdecl: the caller cleans, and
+     * stdcall_args_for_ordinal() already reports 0 for this ordinal. */
+    g_eax = (uint32_t)out;
+}
+
+/* ── IoDismountVolumeByName (ordinal 91) ──────────────────
+ *
+ * The ANSI_STRING is rebuilt locally with its Buffer translated, the same way
+ * bridge_RtlEqualString does it: the struct's Buffer field holds a guest VA,
+ * so handing the guest struct straight to a native function would have it
+ * dereference a guest address as a host pointer.
+ */
+static void bridge_IoDismountVolumeByName(void)
+{
+    uint32_t name_va = STACK_ARG(0);
+    XBOX_ANSI_STRING name;
+
+    if (!name_va) {
+        g_eax = 0xC000000Du;                 /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    name.Length        = BRIDGE_MEM16(name_va + 0);
+    name.MaximumLength = BRIDGE_MEM16(name_va + 2);
+    name.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(name_va + 4));
+
+    g_eax = (uint32_t)xbox_IoDismountVolumeByName(&name);
+}
+
+/* ── KeSetDisableBoostThread (ordinal 144) ────────────────
+ *
+ * BOOLEAN KeSetDisableBoostThread(PKTHREAD Thread, BOOLEAN Disable)
+ *
+ * The argument is a guest PKTHREAD, and this runtime never materialises KTHREAD
+ * objects in guest memory -- host threads are reached through the handle tokens
+ * bridge_handle_token issues. So there is no general guest-pointer-to-thread
+ * mapping to consult, and inventing one by casting the VA to a HANDLE is the
+ * mistake bridge_resolve_handle's note spells out at length.
+ *
+ * What the contract actually requires is narrower than "change the schedule",
+ * and it is worth separating the two:
+ *
+ *   - The scheduling half does not exist on this host at all. POSIX has no
+ *     wakeup priority boost, so there is nothing to disable; see
+ *     SetThreadPriorityBoost in win32_compat.c.
+ *   - The bookkeeping half does matter. The idiom is save-set-restore, and a
+ *     version that always answered FALSE would have every caller restore a
+ *     state the thread was never in.
+ *
+ * So the flag is kept per guest thread pointer. A title that passes a handle
+ * token instead -- some do, the argument is a pointer either way -- is routed
+ * to the real thread object, which keeps it consistent with anything else that
+ * reads the flag back through the host.
+ */
+#define BRIDGE_BOOST_MAX 64
+static struct { uint32_t va; uint8_t disabled; } s_boost_flags[BRIDGE_BOOST_MAX];
+
+static void bridge_KeSetDisableBoostThread(void)
+{
+    uint32_t thread_va = STACK_ARG(0);
+    uint32_t disable   = STACK_ARG(1);
+    HANDLE   h         = bridge_resolve_handle(thread_va);
+    int i;
+
+    if (h) {
+        BOOL previous = FALSE;
+        if (!GetThreadPriorityBoost(h, &previous))
+            previous = FALSE;
+        SetThreadPriorityBoost(h, disable ? TRUE : FALSE);
+        g_eax = previous ? 1 : 0;
+        return;
+    }
+
+    if (!thread_va) {
+        g_eax = 0;
+        return;
+    }
+
+    for (i = 0; i < BRIDGE_BOOST_MAX; i++) {
+        if (s_boost_flags[i].va == thread_va) {
+            g_eax = s_boost_flags[i].disabled;
+            s_boost_flags[i].disabled = (uint8_t)(disable != 0);
+            return;
+        }
+    }
+    for (i = 0; i < BRIDGE_BOOST_MAX; i++) {
+        if (s_boost_flags[i].va == 0) {
+            s_boost_flags[i].va = thread_va;
+            s_boost_flags[i].disabled = (uint8_t)(disable != 0);
+            g_eax = 0;      /* never set before, so it was not disabled */
+            return;
+        }
+    }
+
+    /* More distinct thread objects than the table holds. Reporting the
+     * previous state as FALSE is what a never-seen thread gets anyway; say so
+     * once rather than silently starting to lie about save-restore. */
+    {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "  [KERNEL] KeSetDisableBoostThread: more than %d "
+                    "thread objects seen; previous-state tracking stops here\n",
+                    BRIDGE_BOOST_MAX);
+            fflush(stderr);
+        }
+    }
+    g_eax = 0;
+}
+
+/* ── Wrappers over existing xbox_* implementations ────────
+ *
+ * Every one of these forwards to a function in src/kernel that was written for
+ * a native caller. That is only safe where the function does nothing with an
+ * address except read or write the bytes at it: an allocator, a free, or
+ * anything returning a pointer would put a host address into the guest ABI,
+ * which is the failure tools/kernel_audit/coverage.py describes. So the ones
+ * that allocate (MmAllocateSystemMemory, MmFreeSystemMemory) and the ones that
+ * take IRP or DEVICE_OBJECT graphs (IoStartPacket, IofCompleteRequest,
+ * IoInvalidDeviceRequest, IoMarkIrpMustComplete) are deliberately still
+ * unrouted -- they need a design decision about who owns the object, not a
+ * wrapper.
+ */
+
+/* ── AvSetSavedDataAddress (4) ────────────────────────────
+ * A stored value, not a dereferenced one: what goes in is a guest VA and the
+ * same guest VA comes back out, so there is no translation to do and none to
+ * get wrong. The matching getter (ordinal 1) is bridge_AvGetSavedDataAddress,
+ * already defined with the Halo wrapper group above. */
+static void bridge_AvSetSavedDataAddress(void)
+{
+    xbox_AvSetSavedDataAddress((ULONG)STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── HalReadWritePCISpace (46) ────────────────────────────
+ * Bus/slot/register/length are scalars; only Buffer is an address, and it is
+ * read or written in place. */
+static void bridge_HalReadWritePCISpace(void)
+{
+    xbox_HalReadWritePCISpace(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
+                              XBOX_TO_NATIVE(STACK_ARG(3)),
+                              STACK_ARG(4), (BOOLEAN)(STACK_ARG(5) != 0));
+    g_eax = 0;
+}
+
+/* ── IoDeleteSymbolicLink (69) ────────────────────────────
+ * The ANSI_STRING is rebuilt with a translated Buffer, the same reason
+ * bridge_IoDismountVolumeByName does it. */
+static void bridge_IoDeleteSymbolicLink(void)
+{
+    uint32_t name_va = STACK_ARG(0);
+    XBOX_ANSI_STRING name;
+
+    if (!name_va) {
+        g_eax = 0xC000000Du;                 /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    name.Length        = BRIDGE_MEM16(name_va + 0);
+    name.MaximumLength = BRIDGE_MEM16(name_va + 2);
+    name.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(name_va + 4));
+
+    g_eax = (uint32_t)xbox_IoDeleteSymbolicLink(&name);
+}
+
+/* ── KeRemoveQueueDpc (137) ───────────────────────────────
+ *
+ * The one in this group that must NOT forward to its xbox_* function, and the
+ * reason is invisible to a coverage tool: there are two DPC queues, and the
+ * native one is not the live one.
+ *
+ * bridge_KeInsertQueueDpc never calls xbox_KeInsertQueueDpc. A DPC raised
+ * inside an ISR is parked in g_pending_dpc and run when the ISR returns; one
+ * raised outside is run immediately by bridge_run_dpc. Either way the native
+ * queue stays empty, so xbox_KeRemoveQueueDpc would search a list nothing ever
+ * inserts into and answer FALSE every time -- while the DPC the caller was
+ * trying to cancel stayed parked in g_pending_dpc and fired anyway.
+ *
+ * A cancel that reports success and then fires is worse than no cancel at all,
+ * so this reads the queue that actually holds the DPC.
+ */
+static void bridge_KeRemoveQueueDpc(void)
+{
+    uint32_t dpc_va = STACK_ARG(0);
+
+    if (dpc_va && g_pending_dpc == dpc_va) {
+        g_pending_dpc = 0;
+        g_pending_dpc_sys1 = 0;
+        g_pending_dpc_sys2 = 0;
+        g_eax = 1;               /* it was queued, and now it is not */
+        return;
+    }
+    /* Not queued: either it already ran -- bridge_run_dpc is synchronous
+     * outside an ISR, so most DPCs are finished before anyone could cancel
+     * them -- or it was never inserted. FALSE is correct for both. */
+    g_eax = 0;
+}
+
+/* ── MmLockUnlockPhysicalPage (176) ───────────────────────
+ * Both arguments are scalars. The native implementation tracks the request
+ * without pinning anything, which is the honest model here: guest physical
+ * memory is a host mapping that never moves. */
+static void bridge_MmLockUnlockPhysicalPage(void)
+{
+    xbox_MmLockUnlockPhysicalPage((ULONG_PTR)STACK_ARG(0),
+                                  (BOOLEAN)(STACK_ARG(1) != 0));
+    g_eax = 0;
+}
+
+/* ── RtlCompareMemoryUlong (269) ──────────────────────────
+ * Reads Length bytes at Source and returns how many matched. Nothing escapes. */
+static void bridge_RtlCompareMemoryUlong(void)
+{
+    uint32_t src = STACK_ARG(0);
+
+    if (!src) {
+        g_eax = 0;
+        return;
+    }
+    g_eax = (uint32_t)xbox_RtlCompareMemoryUlong(XBOX_TO_NATIVE(src),
+                                                 STACK_ARG(1), STACK_ARG(2));
+}
+
+/* ── RtlTimeFieldsToTime (304) ────────────────────────────
+ * TIME_FIELDS is eight SHORTs and LARGE_INTEGER is eight bytes -- neither
+ * carries a pointer, so both translate directly. */
+static void bridge_RtlTimeFieldsToTime(void)
+{
+    uint32_t fields_va = STACK_ARG(0);
+    uint32_t time_va   = bridge_checked_out_va(STACK_ARG(1), 8,
+                                               "RtlTimeFieldsToTime", "Time");
+
+    if (!fields_va || !time_va) {
+        g_eax = 0;                           /* FALSE */
+        return;
+    }
+    g_eax = xbox_RtlTimeFieldsToTime(
+                (PXBOX_TIME_FIELDS)XBOX_TO_NATIVE(fields_va),
+                (PLARGE_INTEGER)XBOX_TO_NATIVE(time_va)) ? 1 : 0;
+}
+
+/* ── HalIsResetOrShutdownPending (358) / HalInitiateShutdown (360) ──
+ * Both are void-in, and neither touches guest memory. */
+static void bridge_HalIsResetOrShutdownPending(void)
+{
+    g_eax = xbox_HalIsResetOrShutdownPending() ? 1 : 0;
+}
+
+static void bridge_HalInitiateShutdown(void)
+{
+    xbox_HalInitiateShutdown();
+    g_eax = 0;
+}
+
 /* ── Dispatch table: ordinal → bridge function + stack arg bytes ── */
 
 typedef void (*bridge_func_t)(void);
@@ -7414,6 +7870,41 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  96: return bridge_KeBugCheckEx;
     case 186: return bridge_NtClearEvent;
     case 205: return bridge_NtPulseEvent;
+    /* Four of the wrappers the NOT-ROUTED note below left for individual
+     * review, checked one at a time against the bar it sets and cleared:
+     *
+     *   100  KeDisconnectInterrupt  reads and clears one BOOLEAN field of the
+     *        caller's KINTERRUPT and returns the previous value. One address,
+     *        dereferenced in place, nothing allocated.
+     *   252  PhyGetLinkState        scalar in, scalar out.
+     *   253  PhyInitialize          scalars; its second argument is ignored.
+     *   346  XcDESKeyParity         a no-op over a caller-supplied key buffer.
+     *
+     * XcRC4Key (338) and XcRC4Crypt (339) are NOT here, although they are the
+     * same shape and the note names the Xc* group as one that should be fine.
+     * They carry their own BISECT-OFF markers further down, and a bisect
+     * result is a measurement -- outranking a judgement about the shape of the
+     * code. Re-routing them needs a run that says they are safe, not an
+     * argument that they ought to be. */
+    case 100: return bridge_KeDisconnectInterrupt;
+    case 252: return bridge_PhyGetLinkState;
+    case 253: return bridge_PhyInitialize;
+    case 346: return bridge_XcDESKeyParity;
+
+    case   1: return bridge_AvGetSavedDataAddress;
+    case   4: return bridge_AvSetSavedDataAddress;
+    case  46: return bridge_HalReadWritePCISpace;
+    case  69: return bridge_IoDeleteSymbolicLink;
+    case 137: return bridge_KeRemoveQueueDpc;
+    case 176: return bridge_MmLockUnlockPhysicalPage;
+    case 269: return bridge_RtlCompareMemoryUlong;
+    case 304: return bridge_RtlTimeFieldsToTime;
+    case 358: return bridge_HalIsResetOrShutdownPending;
+    case 360: return bridge_HalInitiateShutdown;
+
+    case   8: return bridge_DbgPrint;
+    case  91: return bridge_IoDismountVolumeByName;
+    case 144: return bridge_KeSetDisableBoostThread;
     case 225: return bridge_NtSetEvent;
     case 233: return bridge_NtWaitForSingleObject;
     case 234: return bridge_NtWaitForSingleObjectEx;
@@ -7484,9 +7975,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * Left in place rather than deleted: the wrappers are correct as argument
      * marshalling, and re-deriving them is the easy half of the work.
      */
-    /* case   1: bridge_AvGetSavedDataAddress */
     /* case  97: bridge_KeCancelTimer */
-    /* case 100: bridge_KeDisconnectInterrupt */
     /* Routed. Both clear the memory-model bar above: neither allocates,
      * frees, nor hands back a host pointer. KeStallExecutionProcessor takes a
      * microsecond count and busy-waits -- no pointers at all.
@@ -7543,8 +8032,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 124: return bridge_KeQueryBasePriorityThread;
     case 143: return bridge_KeSetBasePriorityThread;
     case 250: return bridge_ObfDereferenceObject;
-    /* case 252: bridge_PhyGetLinkState */
-    /* case 253: bridge_PhyInitialize */
     /* Routed. The memory-model note above already names this group as the
      * safe kind: each one reads or writes bytes at an address the caller
      * supplied, and none allocates, frees, or hands back a host pointer.

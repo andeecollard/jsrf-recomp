@@ -12,6 +12,9 @@
  */
 
 #include "kernel.h"
+#include <stdarg.h>   /* xbox_DbgPrint is varargs */
+#include <stdio.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -698,11 +701,6 @@ VOID __stdcall xbox_HalRegisterShutdownNotification(
  * Unknown Ordinal Stubs
  * ============================================================================ */
 
-VOID __stdcall xbox_Unknown_8(void)
-{
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL, "Unknown ordinal 8 called (stubbed)");
-}
-
 VOID __stdcall xbox_Unknown_23(void)
 {
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL, "Unknown ordinal 23 called (stubbed)");
@@ -716,6 +714,53 @@ VOID __stdcall xbox_Unknown_42(void)
 /* ============================================================================
  * Debug / Timing
  * ============================================================================ */
+
+/* ============================================================================
+ * DbgPrint (ordinal 8)
+ *
+ * ULONG __cdecl DbgPrint(PCSTR Format, ...)
+ *
+ * The title's own running commentary. It was a stub that logged "Unknown
+ * ordinal 8 called (stubbed)" and dropped the message -- which is the one
+ * thing that must not happen to it, because during bring-up the title's
+ * description of what it thinks is happening is the most valuable output
+ * there is, and a stub turns every one of those lines into noise about the
+ * stub itself.
+ *
+ * Routed to the same [GUEST] stream as the INT 2D debug trap in
+ * recomp_debug.c, because they are the same output: OutputDebugStringA takes
+ * the trap, a direct call to this export takes the thunk, and a reader of the
+ * log should not have to know which path a given line came through.
+ *
+ * __cdecl, not __stdcall: DbgPrint is the one varargs export in the table and
+ * the caller cleans the stack. kernel_bridge.c's argument-size table already
+ * says 0 bytes for ordinal 8 for exactly this reason.
+ * ============================================================================ */
+ULONG __cdecl xbox_DbgPrint(const char* Format, ...)
+{
+    char buffer[1024];
+    va_list args;
+    int n;
+
+    if (!Format)
+        return 0;
+
+    va_start(args, Format);
+    n = vsnprintf(buffer, sizeof(buffer), Format, args);
+    va_end(args);
+
+    if (n < 0)
+        return 0;
+
+    fprintf(stderr, "[GUEST] %s", buffer);
+    /* Titles are inconsistent about trailing newlines and an unterminated one
+     * runs into whatever the next subsystem prints. */
+    if (buffer[0] && buffer[strlen(buffer) - 1] != '\n')
+        fputc('\n', stderr);
+    fflush(stderr);
+
+    return (ULONG)n;
+}
 
 VOID __stdcall xbox_DbgBreakPoint(void)
 {
