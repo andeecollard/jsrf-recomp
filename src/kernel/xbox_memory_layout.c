@@ -3254,7 +3254,7 @@ static int fence_readable(uint32_t va, uint32_t bytes)
      * just "not null": the device pointer is zero until the title creates the
      * device, and this thread polls from before that. Rejecting only 0 let
      * dev + get_ptr_off through as 0x34 and faulted on the very first tick. */
-    if (g_memory_base == NULL || va < XBOX_FS_BASE)
+    if (g_memory_base == NULL || va < XBOX_TIB_MAIN)
         return 0;
     /* The contiguous window is mapped separately and sits far above the main
      * range, so a size check against g_memory_size rejects it. The fence a

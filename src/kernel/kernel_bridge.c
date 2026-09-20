@@ -351,7 +351,15 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
     uint64_t end = (uint64_t)va + bytes;
     uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
-    if (va < XBOX_FS_BASE)      /* page zero is deliberately unmapped */
+    /* XBOX_TIB_MAIN, not XBOX_FS_BASE. Both named 0x1000 until upstream made
+     * the TIB per-thread, at which point XBOX_FS_BASE became g_fs_base -- and
+     * this is a LOWER BOUND on the mapped guest range, not a question about
+     * the calling thread. On a thread that allocated its own TIB, g_fs_base is
+     * that allocation, so the test rejected every address below it: the whole
+     * image, the heap, and every buffer a guest thread passed to NtReadFile,
+     * each of which came back STATUS_ACCESS_VIOLATION from bridge_buf_ok.
+     * The title stalled in WaitEndTitle with its reads failing. */
+    if (va < XBOX_TIB_MAIN)     /* page zero is deliberately unmapped */
         return 0;
     if (end <= mapped)
         return 1;
