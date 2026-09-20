@@ -2071,6 +2071,13 @@ static unsigned long jsrf_pad_anchor(void)
  *
  * Read-only, opt-in, ~60 bytes a frame, flushed every ten seconds of guest
  * time and from the same handler that flushes the pad recorder. */
+/* The guest's own pad reads (xbox_InputGetState). Delivery is frame-exact --
+ * xbox_InputFrameAdvance() runs once per FLIP_STALL -- but CONSUMPTION is not,
+ * and 20 Sep measured two identical runs parting on a START tap held for seven
+ * frames. A per-frame poll count says whether the guest sampled the pad at all
+ * while a tap was asserted, which is the difference between "the press was
+ * never delivered" and "the press was never read". */
+extern unsigned long g_pad_polls;
 static FILE *g_state_trace;
 static int   g_state_trace_tried;
 
@@ -2092,7 +2099,8 @@ static void jsrf_state_trace_frame(unsigned long f)
             return;
         }
         fprintf(g_state_trace, "# JSRF state trace: f<frame> a=<anchor>"
-                " pt=<playtime> ic=<indirect calls> dr=<hw draws>\n"
+                " pt=<playtime> ic=<indirect calls> dr=<hw draws>"
+                " pp=<guest pad polls>\n"
                 "#!build %s\n#!gen %s\n",
 #ifdef JSRF_BUILD_OPT
                 JSRF_BUILD_OPT,
@@ -2109,10 +2117,11 @@ static void jsrf_state_trace_frame(unsigned long f)
     }
     base = (const uint8_t *)xbox_GetMemoryOffset();
     if (base) memcpy(&pt, base + JSRF_SAVEDATA_VA + JSRF_SD_PLAYTIME, 4);
-    fprintf(g_state_trace, "f%lu a=%08lx pt=%u ic=%llu dr=%llu\n",
+    fprintf(g_state_trace, "f%lu a=%08lx pt=%u ic=%llu dr=%llu pp=%lu\n",
             f, jsrf_pad_anchor(), (unsigned)pt,
             (unsigned long long)g_icall_count,
-            (unsigned long long)g_hw_draws);
+            (unsigned long long)g_hw_draws,
+            g_pad_polls);
     if ((f % 600ul) == 0) fflush(g_state_trace);
 }
 
