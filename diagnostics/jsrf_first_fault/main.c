@@ -36,6 +36,7 @@ static void jsrf_state_trace_frame(unsigned long f);   /* RECOMP_STATE_TRACE */
 static void jsrf_state_trace_flush(void);
 #endif
 #include "../../src/recomp_switch.h"
+#include "../../src/kernel/d3d8_ring.h"
 #include "guest_trace.h"
 #include "guest_names.h"
 #include "wild_ptr.h"
@@ -70,6 +71,10 @@ extern void xbox_HeapReport(const char *why);
 #include "d3d8_xbox.h"   /* PROBE: D3D8 HLE layer */
 #include "xinput_xbox.h"
 #include "xbox_usb_ohci.h"
+#if !defined(_WIN32)
+static int jsrf_stage_pad(XBOX_INPUT_STATE *state);
+static void jsrf_stage_start(void);
+#endif
 
 /* 0 unless the gen tree defines it -- see the definition further down and the
  * [PROBES] NOT ARMED gate in the periodic report. */
@@ -109,9 +114,21 @@ extern MCPXAPUState *g_apu_state;
  * writes now are, and learn the notifier address from the channel setup; until
  * that exists this is the honest stand-in, kept out of the shared runtime.
  */
-#define JSRF_D3D_CHANNEL_PTR 0x0019DCE0u
-#define JSRF_D3D_PUT_OFFSET  0x30u
-#define JSRF_D3D_GETPTR_OFFSET 0x34u
+/* THESE ADDRESSES ARE NO LONGER THIS TITLE'S -- see src/kernel/d3d8_ring.h.
+ *
+ * 0x0019DCE0 is `D3D8__D3D_g_pDevice`, which XbSymbolDatabase reports from a
+ * signature scan of any statically-linked XDK title, and the four ring VAs
+ * below are that device plus {0x00, 0x04, 0x24, 0x28} -- 0x0019B200 + 0x24 is
+ * 0x0019B224, which is how the hand-derived constants and the SDK layout were
+ * shown to be the same thing. The paragraph above says the pump stays here
+ * "because the addresses are this title's", and that the general fix is to
+ * learn them; that is now done, so what remains here is the FALLBACK for a run
+ * with no symbol table, and the macros resolve through the runtime. */
+#define JSRF_D3D_CHANNEL_PTR_DEFAULT 0x0019DCE0u
+#define JSRF_PB_DEVICE_DEFAULT       0x0019B200u
+#define JSRF_D3D_CHANNEL_PTR   (d3d8_ring_device_global())
+#define JSRF_D3D_PUT_OFFSET    D3D8_DEV_PUT
+#define JSRF_D3D_GETPTR_OFFSET D3D8_DEV_FENCE_PTR
 
 static volatile int g_pushbuf_ack_stop;
 
@@ -125,10 +142,15 @@ static volatile int g_pushbuf_ack_stop;
  * The +0x30/+0x34 index acknowledgement is sampled before consumption, and
  * only that sampled index is acknowledged after the published span is read.
  */
-#define JSRF_PB_PUT_VA    0x0019B200u
-#define JSRF_PB_LIMIT_VA  0x0019B204u
-#define JSRF_PB_START_VA  0x0019B224u   /* pb_ring_start, per the BO3 map */
-#define JSRF_PB_END_VA    0x0019B228u   /* pb_ring_end */
+/* The +0x24/+0x28 pair the BO3 map suggested is the live one, and it is no
+ * longer a suggestion: D3D_MakeRequestedSpace_8 reads [dev+0x24] and
+ * [dev+0x28] throughout its wrap logic and never touches +0x08/+0x0C. That
+ * settles the question jsrf_pb_poll raises below about which pair holds the
+ * ring bounds. */
+#define JSRF_PB_PUT_VA    (d3d8_ring_field_va(D3D8_DEV_WRITE_CURSOR))
+#define JSRF_PB_LIMIT_VA  (d3d8_ring_field_va(D3D8_DEV_LIMIT))
+#define JSRF_PB_START_VA  (d3d8_ring_field_va(D3D8_DEV_RING_LO))
+#define JSRF_PB_END_VA    (d3d8_ring_field_va(D3D8_DEV_RING_HI))
 
 /* Observe the reserve decision before changing its address contract. */
 void jsrf_pb_reserve_probe(uint32_t pc, uint32_t dev, uint32_t get,
@@ -1399,7 +1421,12 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
                 last = now_ms;
             }
         }
-        if (getp && consumed && MEM32(getp)!=submitted) MEM32(getp)=submitted;
+        /* The fence the title spins on. `consumed` is jsrf_pb_poll's own
+         * verdict -- `!stream_fault && g_pb_last==now` -- so the
+         * acknowledgement has always been gated on a full drain, and the
+         * runtime now enforces that invariant for any title rather than
+         * trusting each pump to remember it. */
+        d3d8_ring_publish_fence(getp, consumed, submitted);
         Sleep(0);
     }
     return 0;
@@ -1854,6 +1881,9 @@ static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
     const SHORT *thumb;
     int i;
 
+#if !defined(_WIN32)
+    if (!jsrf_stage_pad(&state))
+#endif
     if (xbox_InputGetState(0, &state) != ERROR_SUCCESS)
         return 0;                 /* no controller: the endpoint NAKs */
 
@@ -2864,6 +2894,10 @@ static uint32_t jsrf_seq_index(const uint8_t *base)
     if (!obj) return 0xFFu;
     return *(const uint32_t *)(base + obj + JSRF_SEQ_NEXT_OFF);
 }
+
+#if !defined(_WIN32)
+#include "stage_harness/bridge.h"
+#endif
 
 static DWORD WINAPI jsrf_seq_thread(LPVOID arg)
 {
@@ -4670,6 +4704,9 @@ static HWND jsrf_create_window(int visible)
 
 int main(int argc, char **argv)
 {
+    /* Before anything can read a ring field. A symbol table, if one is given,
+     * overrides this on first resolution and says so in the log. */
+    d3d8_ring_set_defaults(JSRF_D3D_CHANNEL_PTR_DEFAULT, JSRF_PB_DEVICE_DEFAULT);
     const char *xbe_path = argc > 1 ? argv[1] : getenv("RECOMP_XBE_PATH");
     const char *game_dir = argc > 2 ? argv[2] : getenv("RECOMP_GAME_DIR");
     if (!xbe_path || !*xbe_path) xbe_path = JSRF_XBE_PATH;
@@ -5060,6 +5097,9 @@ int main(int argc, char **argv)
     }
 #endif
 
+#if !defined(_WIN32)
+    jsrf_stage_start();
+#endif
     printf("Starting translated entry 0x%08X with ESP 0x%08X\n",
            JSRF_ENTRY_POINT, g_esp);
     entry();

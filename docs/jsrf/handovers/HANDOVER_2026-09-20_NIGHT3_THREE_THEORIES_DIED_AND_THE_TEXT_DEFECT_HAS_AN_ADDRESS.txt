@@ -1,0 +1,352 @@
+HANDOVER -- 20 September 2026, night (third of the day)
+THREE THEORIES DIED, AND THE TEXT DEFECT NOW HAS AN ADDRESS
+
+Read this first. The two Markdown handovers of the same night carry the
+evidence and the disassembly:
+
+  CLAUDE_HANDOVER_2026-09-20_NIGHT2_THE_TEXT_DEFECT_IS_AN_ACKNOWLEDGEMENT_ORDERING_BUG.md
+  CLAUDE_HANDOVER_2026-09-20_NIGHT3_THE_FENCE_WAS_NEVER_LYING.md
+
+The second one has a REFUTED box at the top. Read the box; the title is wrong
+and the body is kept only for the measurements.
+
+This session produced one solid measurement, one fast reproducer, a working
+symbol layer, one runtime generalisation -- and three wrong causes, each killed
+by its own test. Nothing here claims G2 is fixed. It is not.
+
+
+====================================================================
+0. START HERE -- WHAT IS DIFFERENT SINCE THIS MORNING
+====================================================================
+
+(a) G2 REPRODUCES IN 60 SECONDS. The 6-minute padrec replay is no longer
+    needed for the search -- Corn's dialogue at the Garage corrupts too.
+
+    run.py --scenario .../stage_harness/garage.json \
+      --binary <build>/jsrf_first_fault --game ... \
+      --hdd ~/jsrf-build/emulated-hdd-warm --out /tmp/jsrf-NN \
+      --env SDL_AUDIODRIVER=no_such_driver \
+      --env RECOMP_GLYPH_DUMP=20000 --env RECOMP_GLYPH_DUMP_LATIN=1 \
+      --env RECOMP_GLYPH_DUMP_MAXQ=64 --debug-seconds 25
+
+    python3 diagnostics/jsrf_first_fault/clobber.py /tmp/jsrf-NN/runtime.log
+
+    Garage scores 3 of 177 opportunities (1.69%). SCORE TWO RUNS: at that rate
+    a clean run happens by chance about 5% of the time. The replay (5.97%,
+    149 of 2,494) stays the confirmation.
+
+(b) THE GUEST HAS NAMES NOW. 1,695 of them, in one table:
+
+      ~/jsrf-build/jsrf-symbols-merged.tsv
+
+    symbolize.py --symbols <that> lookup 0x00191440
+      -> D3D8__D3D_BlockOnTime
+
+    Regenerate: section 4.
+
+(c) EIGHT INSTRUMENTS MOVED INTO THE REPO from the session scratchpad, which
+    does not survive: clobber.py, glyphs.py, lines.py, guestdis.py, callers.py,
+    vtable.py, slots.py, merge_symbols.py, all in
+    diagnostics/jsrf_first_fault/, all runnable as shown above.
+
+
+====================================================================
+1. THE TEXT DEFECT (G2) -- THE MEASUREMENT, WHICH STANDS
+====================================================================
+
+A page-0 text batch is rasterised with its OPENING QUADS REPLACED by the
+page-1 batch that follows it. One frame, decoded from the glyph dump:
+
+  corrupt  q00 x409.2 y60 r0c1      q01 x468.2 y60 r0c3      q02 'm' x325.9
+  page-1   q00 x409.2 y60 r0c1='w'  q01 x468.2 y60 r0c3='y'
+  correct  q00 'G' x302  q01 'u' x314  q02 'm' x325.9
+
+Same screen positions, same atlas cells, identical tails. The page-1 glyphs sit
+on the `G` and `u` of the `Gum` name label in a draw that has page 0 bound, so
+they sample page 0's cells of the same number and come out `"` and `$`.
+
+**`$ou` for "you" and the vanished leading characters are ONE event.** The
+corpus had been treating them as two defects since 19 Sep.
+
+Rates: 149 of 2,494 opportunities in the replay (268 glyphs), 3 of 177 at the
+Garage (9 glyphs). An "opportunity" is a page-0 draw with a page-1 pass behind
+it; clobber.py counts them so a scene that meets less two-page text cannot look
+like an improvement.
+
+AND THE QUADS HAVE AN ADDRESS. RECOMP_FONT_TRACE now prints attribute 0's base
+and stride. Both font pages draw from ONE vertex buffer:
+
+  page 0  00DAC000   batches of 300/330/312/240/84/24 verts   vtx=0x00B8B000 s=32
+  page 1  00DBC000   batches of 24/12/6 verts                 vtx=0x00B8B000 s=32
+
+One line, two passes, one buffer, refilled from the base for the second pass.
+That is the glyph dump's finding from the other end.
+
+SCOPE CORRECTION: the speech bubble is NOT unaffected. Every corrupt draw
+caught this session is Gum's or Corn's dialogue box. "The banner font is
+affected and the bubble font is not" (20 Sep, morning) was a sampling artifact
+of a defect that fires on a few percent of opportunities.
+
+
+====================================================================
+2. THREE CAUSES THAT DIED, IN ORDER, AND WHAT KILLED EACH
+====================================================================
+
+Written out because each cost a run and the next session should not re-derive
+them.
+
+(i) "nv2a_ack_thread acknowledges before executing."
+    DEAD -- THE CODE NEVER RUNS. That branch is guarded by
+    `!g_nv2a_pusher_owns_dma_get`, and main.c:1348 sets that flag to 1 at the
+    top of jsrf_pushbuffer_ack, which is live in every run (169 and 171
+    [PB-ACK] reports in the two logs). The A/B "refuting" it compared two
+    different scenes with identical behaviour. CHECK A BRANCH IS REACHABLE
+    BEFORE SPENDING A RUN ON IT.
+
+(ii) "The guest's D3D fence is published as `submitted` regardless of what the
+     parser has read."
+     DEAD -- IT WAS ALWAYS GATED. jsrf_pb_poll ends
+
+       return !stream_fault && g_pb_last==now;
+
+     and the ack is `if (getp && consumed && ...)`. `consumed` IS the drained
+     verdict, and the comment above it says so. I quoted the assignment and
+     missed the guard two tokens to its left. In a healthy run 119,388 polls
+     did not drain and every one correctly withheld the fence.
+
+     The "fix" built on this WEDGED THE TITLE at flips=1: it wrote the parser's
+     ring cursor into *(dev+0x34), which is a COUNTER, not an address. The run
+     read `idx put=11 get=5695356`, so the title computed PUT - *fence as a
+     huge unsigned value, decided it had no room, and blocked in
+     D3D_BlockOnTime for ever. 50 seconds to find out.
+
+     Watch for a counter measuring something other than its name while you are
+     at it: [PB-ACK]'s `already` reads 0 in that run, because main.c compares
+     MEM32(getp)==submitted and the published value was no longer submitted.
+
+(iii) "Text vertices are inline in the push buffer via SetVertexData4f, so the
+      ring fence protects them."
+      DEAD BOTH WAYS. A scan for direct callers of D3DDevice_SetVertexData4f
+      finds twelve, ALL in CMGameGLFont::draw -- the OVERLAY font -- and a
+      stencil helper. None in the 0x3Cxxx banner path, which draws from the
+      vertex buffer above. And the follow-on claim that the buffer is therefore
+      outside the fence's protection is also wrong: D3DVertexBuffer_Lock
+      (0x001997C0) blocks via 0x001917B0, which reads the resource's last-use
+      fence at [resource+8] and calls D3D_BlockOnTime -- the same routine
+      reading the same *(dev+0x34). Ring and resource share one fence.
+
+
+====================================================================
+3. THE ONE QUESTION LEFT, AND HOW TO ANSWER IT
+====================================================================
+
+The buffer IS fence-protected, PROVIDED the title locks it without
+D3DLOCK_NOOVERWRITE (0x10) or DISCARD/NOSYSLOCK (0xa0). Lock skips the block
+for those. The single Lock call site is a pass-through wrapper at 0x00155E30
+whose flags come from ITS caller, reached through a vtable, so a direct-call
+scan cannot see them.
+
+DO THIS FIRST -- measure the thing, not the mechanism:
+
+  recomp_mem_watch on [0x00B8B000, +stride*verts) counting guest writes that
+  land while a draw referencing that range is still pending. Non-zero is the
+  race, proven. It also answers the flags question without reading them: a
+  title that blocked could not be writing.
+
+ONLY THEN, if that is zero, read the flags: find 0x00155E30 in a vtable with
+slots.py, then the callers of that slot, the way [0x251d6c]+0x144 was resolved
+to CMGameGL::setTextureByIndex.
+
+Twice this session the mechanism I argued for was wrong while the measurement
+held. Measure first.
+
+
+====================================================================
+4. THE SYMBOL LAYER -- WHAT IT IS AND HOW TO REBUILD IT
+====================================================================
+
+Two databases, disjoint, both needed. Neither existed in this tree this morning
+in usable form.
+
+THE GAME: KeybadeBlox' decompilation, same US XBE we translate.
+
+  cd ~/jsrf && git clone --depth 1 \
+    https://codeberg.org/KeybadeBlox/JSRF-Decompilation.git
+
+  1,332 named functions, 99.0% exact match on our function starts. symbolize.py
+  reads ../JSRF-Decompilation/ghidra/symboltable.tsv in place. The checkout had
+  gone missing when the repo left iCloud.
+
+  ITS LICENCE: none published, and it asks that no language-model output be
+  contributed back. Read it in place. Do not vendor it. Do not push to it.
+  Judge it by its NAMES -- its own decompiled C is at 0.71% and does not cover
+  the text path.
+
+THE XDK: Cxbx-Reloaded/XbSymbolDatabase (MIT).
+
+  git clone --depth 1 https://github.com/Cxbx-Reloaded/XbSymbolDatabase.git
+  cmake -S XbSymbolDatabase -B XbSymbolDatabase/build -DCMAKE_BUILD_TYPE=Release
+  cmake --build XbSymbolDatabase/build -j8      # UnitTest fails to compile
+                                                # (std::c16rtomb); the CLI, which
+                                                # is the one that matters, builds
+  XbSymbolDatabase/build/projects/cli/XbSymbolDatabaseCLI <default.xbe> \
+      > ~/jsrf-build/jsrf-xbsymbols.txt
+  python3 diagnostics/jsrf_first_fault/merge_symbols.py
+
+  363 symbols: 163 D3D8, 137 DSOUND, 59 XAPILIB, 4 XGRAPHC. The pip package
+  pyxbsymboldatabase does NOT build here.
+
+  Validation, measured: of its 360 addresses, 319 land exactly on function
+  starts our disassembler already found and 41 are data (globals and struct
+  offsets) -- a 100% hit rate on actual functions.
+
+WHAT IT NAMED. Every one of these was inferred from raw disassembly first and
+confirmed by the database afterwards:
+
+  0x0019DCE0  D3D_g_pDevice          = main.c's JSRF_D3D_CHANNEL_PTR
+  0x00199640  D3DDevice_SetVertexData4f
+  0x001916B0  D3DDevice_MakeSpace
+  0x00191530  D3D_MakeRequestedSpace_8
+  0x00191440  D3D_BlockOnTime        <- the routine the whole argument is about
+  0x00191710  D3D_KickOffAndWaitForIdle
+  0x00191390  D3D_SetFence
+  0x001997C0  D3DVertexBuffer_Lock
+  0x00191730  D3D_BlockOnResource
+  0x0018DF10  D3DDevice_SetTexture
+  0x0018CE50  D3DDevice_BlockUntilVerticalBlank   <- "every D3D thread blocked
+                                                     in sub_0018CE50 for ever",
+                                                     unnamed since 10 Sep
+
+AND 137 DSOUND NAMES LAND ON THE AUDIO PROBLEM: CMcpxBuffer_Play (0x001A490D),
+_Stop, _SetBufferData, _GetStatus, the CMcpxVoiceClient_* and
+CDirectSoundVoice_* surface. "A guarded MMIO page swallowed every VOICE_ON" now
+has a guest-side entry point to trace from rather than an inference.
+
+THE TEXT PATH, NAMED END TO END:
+
+  TextRenderer_MAYBE::draw          0x0003C310
+    CMGameGL::setAlphaBlendEnabled  vtable +0x124   (vtable at 0x001E0F00)
+    CMGameGL::setTextureByIndex     vtable +0x144 -> 0x0014FDE0
+        D3DDevice_SetTexture        0x0018DF10
+    bind cache [0x251D54], stage-1 cache [0x251D58]
+
+Also settled on the way: jsrf_pb_poll asks whether the ring bounds are device
++0x24/+0x28 or +0x08/+0x0C and says "they have never been compared on one
+line". D3D_MakeRequestedSpace_8 reads +0x24 and +0x28 throughout its wrap logic
+and never touches +0x08/+0x0C. The BO3 map's pair is the live one.
+
+
+====================================================================
+5. THE RUNTIME CHANGE -- THE PUMP IS NO LONGER PER-TITLE
+====================================================================
+
+NEW: src/kernel/d3d8_ring.{c,h}, in the shared runtime.
+
+  - resolves D3D8__D3D_g_pDevice from a symbol table (RECOMP_XDK_SYMBOLS,
+    taking either file format), with RECOMP_D3D8_DEVICE_GLOBAL as an override
+    and the calling title's constant as the fallback;
+  - names the SDK field offsets, each read out of the shipped library:
+    +0x00 write cursor, +0x04 limit, +0x24/+0x28 ring bounds, +0x30 submitted,
+    +0x34 fence pointer;
+  - d3d8_ring_publish_fence() enforces the invariant -- publish only when the
+    pump reports drained, count refusals, which stay at 0 for a correct pump
+    and are therefore a positive control, not a knob.
+
+main.c keeps its constants AS DEFAULTS ONLY; the macros resolve through the
+runtime, so all twenty use-sites are untouched and a run with no symbol table
+behaves exactly as before. JSRF_PB_DEVICE_DEFAULT is 0x0019B200, and
+0x0019B200 + 0x24 = 0x0019B224, which is how the hand-derived ring VAs and the
+SDK layout were shown to be the same thing.
+
+Proved live: [D3D8-RING] D3D_g_pDevice = 0x0019DCE0 (.../jsrf-symbols-merged.tsv)
+
+TESTS: jsrf_d3d8_ring, five cases (CLI format, TSV format, override, no table,
+missing file). Every case passes a default that is NEVER the expected value,
+because the first TSV parser matched nothing, fell back to the default, and a
+scratch check called that a PASS -- the default happened to be right.
+
+SUITE: 90 tests, 2 failures, NEITHER NEW. Verified against `git archive HEAD`
+in a temp tree rather than assumed:
+  - jsrf_switch_audit: 8 hand-rolled switch reads over its baseline of 125, and
+    HEAD is also 8. This session took it to 14 and brought it back.
+  - jsrf_input_hotplug: reads live hardware, reports
+    "[PAD] port 0: PS4 Controller (opened)". It fails because a controller is
+    plugged into this machine.
+
+SWITCHES ADDED, all opt-in and read-only:
+  RECOMP_GLYPH_DUMP_LATIN=1   dump only draws the Latin-page detector accepts.
+                              Without it the cap is spent on menu atlases --
+                              400,000 quad lines gone by t=32 s of a boot.
+  RECOMP_FONT_TRACE=<n>       the line cap, and the trace now prints the vertex
+                              base and stride. 4,000 was spent in the first
+                              seconds of a boot.
+  RECOMP_FONT_TRACE_HASH=1    the 64 KB-per-draw content hash, now opt-in. It
+                              answered its question on 20 Sep and a trace that
+                              costs a frame changes the race it is watching.
+  RECOMP_XDK_SYMBOLS=<path>   the symbol table.
+  RECOMP_D3D8_DEVICE_GLOBAL   override the device global.
+  RECOMP_PB_ACK_AFTER_EXEC=1  the dead branch from theory (i). UNTESTED, and it
+                              cannot be tested while the pusher owns GET.
+
+
+====================================================================
+6. THE AUDIO BISECT -- WHERE IT STOPPED
+====================================================================
+
+Re-established on this binary first, because the earlier 14 arms were scored on
+92ad42df and a bisect whose baseline was never re-checked can eliminate a
+switch that is no longer the one dying.
+
+  arm                        dropouts   first
+  control (the player's 17)        34   150.2 s
+  RECOMP_WILD_PTR=0                43    55.5 s
+  RECOMP_METAL_NO_DEPTH_SYNC=0      7   214.8 s
+
+WILD_PTR and METAL_NO_DEPTH_SYNC are eliminated by the presence rule. Stopped
+at the player's request with three untested: METAL_FF, VSH_DP_ZERO,
+WILD_PTR_SELFTEST.
+
+FLAG ON METAL_NO_DEPTH_SYNC: 7 dropouts against the control's 34, with an onset
+later than any previously recorded (the historical maximum was 158.7 s). n=1,
+and the corpus rule is that a later death is not an improvement -- but if the
+remaining three all come back dirty, replicate that arm before concluding
+anything about UPMIRROR by elimination.
+
+The sweep runner is diagnostics/jsrf_first_fault/apu_sweep.py. It takes switch
+names on the command line, understands a `control` arm that forces nothing, and
+rejects an arm whose scenario failed, whose log does not say backend=none, or
+whose fps is above 100:
+
+  SWEEP_OUT=/tmp/jsrf-round4 python3 diagnostics/jsrf_first_fault/apu_sweep.py \
+      control RECOMP_METAL_FF RECOMP_VSH_DP_ZERO RECOMP_WILD_PTR_SELFTEST
+
+It edits BINARY at the top; point that at your build.
+
+NOT THE FENCE. Tempting, and ruled out: the fence publication is unconditional
+in the sense that no switch touches it, so it is identical in the --bare arms
+that never lose music (1,109 and 1,107 voice spans, 42,750 idle traps) and the
+player-switch arms that always do. A constant cannot discriminate between them.
+
+
+====================================================================
+7. WHY THIS SESSION WENT THE WAY IT DID
+====================================================================
+
+  - THREE CAUSES, ALL WRONG, ALL MINE. Each was argued from code I had read
+    partially: a guard I did not notice, a field whose units I did not check, a
+    function I generalised from without checking it was the right one. Every
+    measurement I took held. Every mechanism I inferred fell over.
+
+  - THE PLAYER ASKED THREE TIMES ABOUT DECOMPILATION BEFORE I LOOKED. The
+    symbol table was already wired into this tree -- symbolize.py has read it
+    since 10 Sep -- and the checkout was simply missing. Ten minutes of looking
+    would have named D3D_BlockOnTime before any of the three theories.
+
+  - THE FAST REPRODUCER EXISTED ALL DAY. Every G2 experiment cost six minutes
+    because the tutorial banner was assumed to be the only place the defect
+    shows. It is not; the Garage does it in sixty seconds. Look for the
+    cheapest reproducer before starting a search, not after.
+
+  - THE TEST THAT CAUGHT THE MOST WAS THE SMALLEST. jsrf_d3d8_ring found a
+    parser bug in seconds that a scratch check had passed, because its default
+    was chosen so a silent fallback could not look like success.

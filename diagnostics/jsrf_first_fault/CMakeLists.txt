@@ -200,6 +200,16 @@ add_subdirectory("${XBOXRECOMP_DIR}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 enable_testing()
 
+# The push-buffer device is found by symbol now, not hardcoded, so the lookup
+# is load-bearing for every title. One case per process: d3d8_ring caches its
+# resolution on first use.
+add_executable(jsrf_d3d8_ring_test d3d8_ring_test.c)
+target_link_libraries(jsrf_d3d8_ring_test PRIVATE xbox_kernel)
+foreach(case fallback cli tsv override missing)
+    add_test(NAME jsrf_d3d8_ring_${case}
+             COMMAND jsrf_d3d8_ring_test ${case})
+endforeach()
+
 add_executable(jsrf_apu_register_test apu_register_test.c)
 target_link_libraries(jsrf_apu_register_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_register COMMAND jsrf_apu_register_test)

@@ -27,6 +27,7 @@ set(KERNEL_SOURCES
     recomp_debug.c
     recomp_mem_watch.c
     recomp_tsc.c
+    d3d8_ring.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
 )

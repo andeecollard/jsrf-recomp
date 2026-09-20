@@ -4541,6 +4541,73 @@ static void raster_batch(void)
         return;
     }
     if (fade_batch) ++s_blend_fade_fate.rasterised;
+    /* RECOMP_FONT_TRACE -- which sheet a text draw samples.
+     *
+     * jetfont.dat holds six textures: four 512x512 DXT3 CJK sheets and two
+     * 256x256 DXT3 Latin pages. Page 0 is codes 0x21..0x75, `!` through `u`;
+     * page 1 begins at 0x76, and the corrupted letters on record are exactly
+     * v w x y z. The standing inference is that a page-1 character samples a
+     * CJK sheet, and it has never been proven in code.
+     *
+     * Size settles it without decoding anything: a Latin page is 256x256 DXT3
+     * = 65,536 bytes, a CJK sheet is 512x512 DXT3 = 262,144. A text draw
+     * naming 262,144 bytes is on the wrong sheet by construction. Read-only,
+     * opt-in, and it prints the address so two draws can be told apart. */
+    {
+        static int on = -1; static unsigned cap;
+        if (on < 0) {
+            on = recomp_switch_on("RECOMP_FONT_TRACE");
+            /* RECOMP_FONT_TRACE=<n> raises the line cap. 4,000 lines is spent
+             * in the first seconds of a boot, and a tutorial banner arrives
+             * minutes into a replay, so the default cap traces the wrong
+             * part of the run. */
+            const char *want = getenv("RECOMP_FONT_TRACE");
+            long n = (want && *want) ? strtol(want, NULL, 10) : 0;
+            cap = (n > 1) ? (unsigned)n : 4000u;
+        }
+        if (on && !s_copy.state.untextured && s_copy.state.dxt3
+                && s_copy.state.width == s_copy.state.height
+                && (s_copy.state.width == 256 || s_copy.state.width == 512)) {
+            /* Content hash of the first mip level. If the two Latin pages
+             * hash the same, the loader put one page's pixels at both
+             * addresses, and a page-1 glyph would draw page 0's cell with
+             * perfectly correct UVs -- which is what `y` -> `$` looks like. */
+            /* The hash walks 64 KB per draw and the page identity question it
+             * was written for is closed, so it is now its own switch. A trace
+             * that costs a frame changes the race it is watching. */
+            static int want_hash = -1;
+            if (want_hash < 0) want_hash = recomp_switch_on("RECOMP_FONT_TRACE_HASH");
+            unsigned long long h = 1469598103934665603ULL;
+            if (want_hash && s_copy.texture) {
+                size_t level0 = (size_t)s_copy.state.width * s_copy.state.height;
+                if (level0 > s_copy.texture_bytes) level0 = s_copy.texture_bytes;
+                for (size_t i = 0; i < level0; i++) {
+                    h ^= s_copy.texture[i];
+                    h *= 1099511628211ULL;
+                }
+            }
+            static unsigned shown;
+            if (shown++ < cap)
+                /* WHERE THE VERTICES CAME FROM, beside which sheet they
+                 * sampled. The two passes of one line of text were shown on
+                 * 20 Sep 2026 to be reading the SAME buffer, the second having
+                 * overwritten the head of the first; printing attribute 0's
+                 * base and stride is what turns that from an inference about
+                 * quad contents into the address it happened at, and it is
+                 * what a memory watch would need. */
+                fprintf(stderr, "  [FONT-TRACE] draw=%u %ux%u dxt3 bytes=%zu addr=0x%08X"
+                        " verts=%u fmt=%08X rect=%08X off=%08X lv=%u hash=%016llX"
+                        " vtx=0x%08X stride=%u\n",
+                        s_gpu.draws, s_copy.state.width,
+                        s_copy.state.height, s_copy.texture_bytes, s_copy.texture_address,
+                        (unsigned)s_gpu.idx_count,
+                        s_methods[NV097_SET_TEXTURE_FORMAT / 4],
+                        s_methods[NV097_SET_TEXTURE_IMAGE_RECT / 4],
+                        s_methods[NV097_SET_TEXTURE_OFFSET / 4],
+                        s_copy.state.levels, h,
+                        s_gpu.attr[0].offset, s_gpu.attr[0].stride);
+        }
+    }
     if (s_vsh.mode == 0 && !(s_method_seen[0x680/4] && s_method_seen[0x6bc/4]) && !batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         /* RECOMP_PB_EXEC_NOCLIPTEST: rasterise anyway, to tell "the vertices
@@ -5150,8 +5217,33 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         uint32_t start = param & 0x00FFFFFFu;
         uint32_t count = ((param >> 24) & 0xFFu) + 1u;
         uint32_t i;
-
-        if (!s_gpu.prim)
+        /* This case arrived with the v0.11.0 merge (be74a7c, 13:53 on 20 Sep
+         * 2026) and it changes what gets drawn: before it, a BEGIN_END whose
+         * geometry came as an implicit run ended with idx_count == 0 and was
+         * dropped in silence. Geometry that was invisible yesterday is drawn
+         * today, which is a picture change nothing measured at the time.
+         *
+         * RECOMP_PB_DRAW_ARRAYS=0 restores the old behaviour, so the merge's
+         * effect on a picture is an A/B inside ONE binary rather than two
+         * builds that differ in every other way as well. The banner fires once
+         * either way: if this title never submits the method, both arms are
+         * the same run and the comparison must not be reported as a result. */
+        static int suppressed = -1;
+        static int announced;
+        /* Default ON through the shared helper rather than a hand-rolled
+         * read. Same meaning -- unset draws, "0" drops -- and it differs only
+         * for a malformed value like "0abc", which the hand-rolled form read
+         * as OFF and the stated grammar reads as ON. The grammar is the point
+         * of the ratchet. */
+        if (suppressed < 0)
+            suppressed = !recomp_switch_on_default("RECOMP_PB_DRAW_ARRAYS", 1);
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "[PB-DRAW-ARRAYS] the guest submits DRAW_ARRAYS;"
+                    " this build %s it (RECOMP_PB_DRAW_ARRAYS=%s)\n",
+                    suppressed ? "DROPS" : "draws", suppressed ? "0" : "1");
+        }
+        if (suppressed || !s_gpu.prim)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);

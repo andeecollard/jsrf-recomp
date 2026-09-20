@@ -150,6 +150,21 @@ VALUE_CARRYING = {
     # read-only and off unless RECOMP_RAM_FIND is set.
     "RECOMP_RAM_FIND",
     "RECOMP_RAM_FIND_AFTER",
+    # Where the XDK symbol table is, and which address in it to believe. The
+    # push-buffer pump stopped being per-title when it learned to find
+    # D3D8__D3D_g_pDevice by name instead of carrying 0x0019DCE0 by hand, and
+    # a path and an address are the two things that lookup needs. A boolean
+    # cannot express either, and the override exists so a title whose scan
+    # misfires can still be pumped.
+    "RECOMP_XDK_SYMBOLS",
+    "RECOMP_D3D8_DEVICE_GLOBAL",
+    # Now carries the trace's LINE CAP as well as turning it on. The cap was a
+    # hardcoded 4,000, which a boot spends in its first seconds -- 400,000 quad
+    # lines were gone by t=32 s of one run, all of it menu -- while the banner
+    # the instrument was written for arrives minutes into a replay. Presence
+    # still means on, so recomp_switch_on() still decides that; the number is
+    # read separately.
+    "RECOMP_FONT_TRACE",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

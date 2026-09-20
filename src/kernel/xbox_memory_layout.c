@@ -3521,6 +3521,26 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* DEFAULT OFF, because it was tested and it is not the gate.
+ *
+ * Acknowledging only what has been executed is the honest order and the
+ * comment at NV2A_USER_DMA_PUT argues for it. It was measured on 20 Sep 2026
+ * against the defect it was written for -- text drawn from a buffer the guest
+ * had already refilled -- and the clobber rate did NOT go to zero: 149 of
+ * 2,494 opportunities before, 1,224 of 12,167 after. A guest that waited on
+ * GET would have gone to zero, so this guest does not wait on GET, and the
+ * ordering is not what releases it. Kept, switchable, off: an unproven change
+ * does not get to be the default, and the next theory needs it out of the way.
+ *
+ * RECOMP_PB_ACK_AFTER_EXEC=1 turns it on. */
+static int pb_ack_after_exec(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_switch_on("RECOMP_PB_ACK_AFTER_EXEC");
+    return on;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -3556,19 +3576,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *r |= NV2A_IDLE[i].idle_mask;
             }
         }
-        {
+        /* THE ACKNOWLEDGEMENT MOVED BELOW THE EXECUTION, and the paragraph
+         * that used to live here is now beside it. Measured on 20 Sep 2026:
+         * acknowledging first let the guest refill a vertex buffer that the
+         * executor had not read yet, and 149 of 7,449 text draws in one replay
+         * were rasterised from the refilled contents. RECOMP_PB_ACK_AFTER_EXEC=0
+         * restores the old order for an A/B. */
+        if (!pb_ack_after_exec()) {
             volatile uint32_t *put =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             volatile uint32_t *get =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            /* Copying PUT into GET says "the GPU has consumed everything you
-             * submitted" the instant it is submitted. For a title whose push
-             * buffer nothing executes that is the honest acknowledgement, and
-             * it is why this exists. For one whose buffer IS being executed it
-             * is a lie with consequences: the producer believes the ring is
-             * free, laps the parser, and overwrites the commands it is part way
-             * through reading. When something owns GET it publishes the point
-             * it has actually reached, and this must keep out of the way. */
             if (!g_nv2a_pusher_owns_dma_get && *get != *put) {
                 *get = *put;
             }
@@ -3632,6 +3650,38 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     }
                 }
                 last_put = put; last_put_ms = now_ms;
+                /* ACKNOWLEDGE ONLY WHAT HAS BEEN EXECUTED.
+                 *
+                 * Copying PUT into GET says "the GPU has consumed everything
+                 * you submitted". For a title whose push buffer nothing
+                 * executes that is the honest answer and the reason this
+                 * exists. For one whose buffer IS being executed it is a lie
+                 * with consequences: the guest spins on GET catching PUT
+                 * before it reuses a buffer (the wait is quoted at
+                 * NV2A_USER_DMA_PUT above), so an early acknowledgement
+                 * releases it to overwrite data this thread has not read yet.
+                 *
+                 * That is not a hazard in the abstract. JSRF draws a line of
+                 * text in two passes out of ONE sprite buffer -- page 0, then
+                 * the v/w/x/y/z page refilled from offset 0 -- and with the
+                 * acknowledgement first, 149 of 7,449 page-0 draws in a single
+                 * replay were submitted with their opening quads already
+                 * replaced by the page-1 batch. The head of the label was
+                 * gone and the page-1 glyphs sampled page 0, which is both
+                 * halves of the reported corruption at once: `$ou` for "you",
+                 * and leading characters that vanish.
+                 *
+                 * Ordering is the whole fix: everything up to `put` has been
+                 * scanned and executed by the time the guest is told so, and
+                 * the guest cannot refill before it is told. `put` rather than
+                 * a re-read, so a PUT the guest advanced DURING the scan is
+                 * not acknowledged unexecuted. */
+                if (pb_ack_after_exec() && !g_nv2a_pusher_owns_dma_get) {
+                    volatile uint32_t *get = (volatile uint32_t *)
+                        ((char *)regs + NV2A_USER_DMA_GET);
+                    if (*get != put)
+                        *get = put;
+                }
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
                  * tells those apart -- D3D waits for GET to reach PUT before it

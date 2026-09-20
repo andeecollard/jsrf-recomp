@@ -4151,11 +4151,21 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   *                                        64) -- a line of text is tens of
   *                                        quads and the world is thousands,
   *                                        so this is what separates them
+  *   RECOMP_GLYPH_DUMP_LATIN=1            only draws the Latin-page detector
+  *                                        below accepts: 256x256, with cells
+  *                                        of glyph proportions. The cap counts
+  *                                        QUAD LINES and the title screen
+  *                                        spends it before gameplay -- 400,000
+  *                                        lines were gone by t=32 s of a boot,
+  *                                        on menu atlases that are 256x256 and
+  *                                        not the font. A tutorial banner
+  *                                        arrives minutes into a replay, so
+  *                                        without this the dump is all menu.
   *
   * Read-only: it prints and returns. */
  {
   static int glyph_cap=-1; static double glyph_after; static unsigned glyph_maxq;
-  static unsigned glyph_lines; static uint32_t glyph_tex;
+  static unsigned glyph_lines; static uint32_t glyph_tex; static int glyph_latin;
   extern double xbox_TraceSeconds(void);
   /* Attribute slots, from nv2a_regs.h, spelled out because this file does not
    * include it: 0 = POSITION, 9 = TEXCOORD0. */
@@ -4165,6 +4175,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    const char*a=getenv("RECOMP_GLYPH_DUMP_AFTER"); glyph_after=(a&&*a)?atof(a):0.0;
    const char*q=getenv("RECOMP_GLYPH_DUMP_MAXQ"); glyph_maxq=(q&&*q)?(unsigned)atoi(q):64u;
    const char*t=getenv("RECOMP_GLYPH_DUMP_TEX"); glyph_tex=(t&&*t)?(uint32_t)strtoul(t,NULL,16):0u;
+   glyph_latin=recomp_switch_on("RECOMP_GLYPH_DUMP_LATIN");
    if(glyph_cap>0)
     fprintf(stderr,"  [GLYPH] dumping up to %d quad lines for textured draws of"
             " <= %u quads, after t=%.0fs. One line per character-sized quad:"
@@ -4184,6 +4195,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * inside the print-capped block first, so capping output to one line
    * silently disabled it and the run reported nothing at all. Counting is
    * not printing. */
+  int latin_draw=0;
   if(glyph_cap>0&&(s->texture_mask&1)&&vpq&&count>=vpq&&(count%vpq)==0){
    unsigned quads=count/vpq;
    /* Latin-page geometry is the filter; the argument is below.
@@ -4218,6 +4230,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     }
     if(nc){ cw/=nc; chh/=nc;
      if(cw>16.0f&&cw<26.0f&&chh>28.0f&&chh<40.0f){
+      latin_draw=1;
       unsigned i; for(i=0;i<g_latin_tex_n;i++) if(g_latin_tex[i]==s->texture_offset) break;
       if(i==g_latin_tex_n&&g_latin_tex_n<16){ g_latin_tex[g_latin_tex_n]=s->texture_offset;
        g_latin_tex_quads[g_latin_tex_n]=0; g_latin_tex_n++; }
@@ -4230,6 +4243,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   if(glyph_cap>0&&(int)glyph_lines<glyph_cap&&(s->texture_mask&1)
      &&vpq&&count>=vpq&&(count%vpq)==0&&(count/vpq)<=glyph_maxq
      &&(!glyph_tex||s->texture_offset==glyph_tex)
+     &&(!glyph_latin||latin_draw)
      &&xbox_TraceSeconds()>=glyph_after){
    unsigned quads=count/vpq;
    fprintf(stderr,"  [GLYPH] draw: t=%.1fs %u quads, tex0 %08X %ux%u fmt%s%s,"

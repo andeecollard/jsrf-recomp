@@ -57,3 +57,7 @@ tools/split/output/
 
 # Claude Code session state and agent worktrees
 .claude/
+
+# Derived from the game binary, which is not vendored; the instruments in
+# diagnostics/jsrf_first_fault regenerate it on demand.
+diagnostics/jsrf_first_fault/default_analysis.json
