@@ -344,6 +344,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <signal.h>      /* release the pad on SIGTERM/SIGINT */
 #include <ctype.h>      /* RECOMP_PAD_SCRIPT parses its schedule */
 #include <strings.h>    /* strncasecmp, so button names are case-insensitive */
@@ -2117,6 +2118,54 @@ static void pad_note_state(const XBOX_INPUT_STATE *st)
     pad_record_sample(st);
 }
 
+/* NOTHING DEADZONED THE STICKS, and a worn pad put that straight into the game.
+ *
+ * Measured 20 Sep 2026 on the player's DS4, from graffiti-2026-09-20_0331.padrec:
+ * the right stick X rests at -8867 for 3,954 frames and at -8610 for 3,264 more
+ * -- a sustained -27% deflection, four times this file's own +/-4096 "the stick
+ * moved" threshold. The left stick rests near centre (LX ~1670, LY ~642).
+ *
+ * Real hardware does not present that to a title. XInput publishes
+ * XINPUT_GAMEPAD_LEFT/RIGHT_THUMB_DEADZONE (7849 / 8689) and an XDK game is
+ * written against a stick that reads zero at rest. Passing SDL's raw axis
+ * through hands the guest a stick permanently pushed left.
+ *
+ * WHY IT MAY MATTER BEYOND CAMERA DRIFT: JSRF performs graffiti as right-stick
+ * motions. A recogniser fed a constant offset fights it on every stroke, which
+ * matches the reported symptom -- cans consumed, spray sound fired, no tag
+ * committed, tutorial never advancing. THAT LINK IS A HYPOTHESIS; the deadzone
+ * is correct whether or not it turns out to be the cause.
+ *
+ * Radial, not per-axis. Clamping each axis on its own squares off the diagonal
+ * and changes a stroke's DIRECTION, which is the one thing a gesture recogniser
+ * reads. Outside the zone the magnitude is rescaled from zero, so full
+ * deflection still reaches full range and no reach is lost.
+ *
+ * RECOMP_PAD_DEADZONE sets the radius for both sticks; 0 restores the raw
+ * behaviour for an A/B. */
+static void pad_apply_deadzone(XBOX_GAMEPAD *gp)
+{
+    static int dz = -1;
+    int i;
+    if (dz < 0) {
+        const char *e = getenv("RECOMP_PAD_DEADZONE");
+        dz = e ? atoi(e) : -2;            /* -2: use the XInput constants */
+    }
+    for (i = 0; i < 2; i++) {
+        SHORT *px = i ? &gp->sThumbRX : &gp->sThumbLX;
+        SHORT *py = i ? &gp->sThumbRY : &gp->sThumbLY;
+        double x = *px, y = *py, mag, scale;
+        double zone = (dz == -2) ? (i ? 8689.0 : 7849.0) : (double)dz;
+        if (zone <= 0.0) continue;
+        mag = sqrt(x * x + y * y);
+        if (mag <= zone) { *px = 0; *py = 0; continue; }
+        scale = ((mag - zone) / (32767.0 - zone)) * 32767.0 / mag;
+        x *= scale; y *= scale;
+        *px = (SHORT)(x >  32767.0 ?  32767.0 : x < -32768.0 ? -32768.0 : x);
+        *py = (SHORT)(y >  32767.0 ?  32767.0 : y < -32768.0 ? -32768.0 : y);
+    }
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
@@ -2224,6 +2273,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+    pad_apply_deadzone(&pState->Gamepad);
 
     /* MERGE, not replace: RECOMP_FAKE_PAD replaces the real pad and so
      * silently eats every press a person makes, which cost an afternoon. A
