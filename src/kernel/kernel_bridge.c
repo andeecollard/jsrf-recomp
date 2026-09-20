@@ -964,7 +964,11 @@ static void bridge_reserve_commit(uint32_t base, uint32_t size)
 static void bridge_NtAllocateVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);  /* PVOID* in Xbox VA */
-    uint32_t zero_bits = STACK_ARG(1);
+    /* ZeroBits (arg 1) constrains how many high bits of the returned address
+     * must be zero. This allocator cannot honour it -- the guest heap hands
+     * back whatever is next -- and it has never been read. Named and ignored
+     * on purpose: a caller that passes a real constraint gets an address that
+     * may violate it, which is worth knowing when one eventually does. */
     uint32_t size_ptr = STACK_ARG(2);  /* PULONG in Xbox VA */
     uint32_t alloc_type = STACK_ARG(3);
     uint32_t protect = STACK_ARG(4);
@@ -1012,19 +1016,22 @@ static void bridge_NtAllocateVirtualMemory(void)
      * Until then, say so: silent aliasing surfaces as corrupted data
      * structures far from here, which is the worst way to find it.
      */
-    if (base_hint >= (g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram)) {
+    /* `mapped` is named once rather than re-evaluated three times, and it is
+     * checked: with both sizes still zero -- a bridge call before the memory
+     * layout is up -- the test below reduces to `base_hint >= 0`, which is
+     * always true, and the modulo in the message then divides by zero. The
+     * warning is about aliasing against a mapping, so with no mapping there is
+     * nothing to warn about. */
+    uint32_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    if (mapped && base_hint >= mapped) {
         static unsigned warned;
         if (warned++ < 8)
             fprintf(stderr,
                     "  [KERNEL] WARNING: allocation at 0x%08X is above "
                     "%u MB mapped; it aliases 0x%08X\n",
                     base_hint,
-                    (unsigned)((g_xbox_map_size ? g_xbox_map_size
-                                                : g_xbox_total_ram)
-                               / (1024 * 1024)),
-                    (uint32_t)(base_hint % (g_xbox_map_size
-                                            ? g_xbox_map_size
-                                            : g_xbox_total_ram)));
+                    (unsigned)(mapped / (1024 * 1024)),
+                    (uint32_t)(base_hint % mapped));
         fflush(stderr);
     }
 
@@ -2924,7 +2931,7 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
                             (g_current_isr_handoff % 1000) == 0;
         }
         if (handoff_trace) {
-            fprintf(stderr, "  [ISR-HANDOFF] #%ld guest-enter routine=%08X esp=%08X\n",
+            fprintf(stderr, "  [ISR-HANDOFF] #%d guest-enter routine=%08X esp=%08X\n",
                     g_current_isr_handoff, routine, g_esp);
             fflush(stderr);
         }
@@ -2951,7 +2958,7 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
         isr_result = g_eax;
         if (handoff_trace) {
             fprintf(stderr,
-                    "  [ISR-HANDOFF] #%ld guest-return result=%02X pending-dpc=%08X\n",
+                    "  [ISR-HANDOFF] #%d guest-return result=%02X pending-dpc=%08X\n",
                     g_current_isr_handoff, isr_result & 0xFF, g_pending_dpc);
             fflush(stderr);
         }
@@ -2986,13 +2993,13 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
         uint32_t s1 = g_pending_dpc_sys1, s2 = g_pending_dpc_sys2;
         g_pending_dpc = 0;
         if (handoff_trace) {
-            fprintf(stderr, "  [ISR-HANDOFF] #%ld dpc-enter dpc=%08X\n",
+            fprintf(stderr, "  [ISR-HANDOFF] #%d dpc-enter dpc=%08X\n",
                     g_current_isr_handoff, dpc);
             fflush(stderr);
         }
         bridge_run_dpc(dpc, s1, s2);
         if (handoff_trace) {
-            fprintf(stderr, "  [ISR-HANDOFF] #%ld dpc-return\n",
+            fprintf(stderr, "  [ISR-HANDOFF] #%d dpc-return\n",
                     g_current_isr_handoff);
             fflush(stderr);
         }
@@ -3389,13 +3396,13 @@ void xbox_ReportIrqDelivery(void)
         per[0] = 0;
         for (v = 0; v < BRIDGE_MAX_INTERRUPTS && n < (int)sizeof per - 16; v++)
             if (g_irq_delivered_vec[v])
-                n += snprintf(per + n, sizeof per - n, " v%d=%ld",
+                n += snprintf(per + n, sizeof per - n, " v%d=%d",
                               v, g_irq_delivered_vec[v]);
         fprintf(stderr, "  [IRQ-VEC]%s\n", per[0] ? per : " (none delivered)");
     }
     fprintf(stderr,
-            "  [IRQ] delivered=%ld deferred: irql=%ld reentry=%ld vector=%ld"
-            " | pending now=%ld peak=%ld | legacy-interlock-blocks=%ld%s\n",
+            "  [IRQ] delivered=%d deferred: irql=%d reentry=%d vector=%d"
+            " | pending now=%d peak=%d | legacy-interlock-blocks=%d%s\n",
             g_irq_delivered, g_irq_defer_irql, g_irq_defer_reentry,
             g_irq_defer_vector, pend, g_irq_pending_peak, g_irq_legacy_hits,
             bridge_legacy_irq_interlock() ? " (LEGACY MODE)" : "");
@@ -3734,11 +3741,11 @@ void xbox_PgraphIrqReport(void)
     acked       = InterlockedCompareExchange(&g_pgraph_notify_acked, 0, 0);
 
     fprintf(stderr,
-            "  [PGRAPH-ISR] +poll=%ld +pending=%ld +tls-skip=%ld "
-            "+interlock-skip=%ld +no-vector=%ld +pmc-blocked=%ld "
-            "+ctx-off=%ld +en-off=%ld +dispatch=%ld +handled=%ld +acked=%ld "
-            "(last ctx-a0=%08lX ctx-b0=%08lX intr-en=%08lX; totals "
-            "dispatch=%ld acked=%ld)\n",
+            "  [PGRAPH-ISR] +poll=%d +pending=%d +tls-skip=%d "
+            "+interlock-skip=%d +no-vector=%d +pmc-blocked=%d "
+            "+ctx-off=%d +en-off=%d +dispatch=%d +handled=%d +acked=%d "
+            "(last ctx-a0=%08X ctx-b0=%08X intr-en=%08X; totals "
+            "dispatch=%d acked=%d)\n",
             poll - prev_poll, pending - prev_pending, tls - prev_tls,
             interlock - prev_interlock, no_vector - prev_no_vector,
             pmc_blocked - prev_pmc_blocked, ctx_disabled - prev_ctx_disabled,
@@ -4809,7 +4816,7 @@ static void bridge_KeInsertQueueDpc(void)
         g_pending_dpc_sys2 = STACK_ARG(2);
         if (getenv("RECOMP_PGRAPH_ISR_TRACE") && g_current_isr_handoff) {
             fprintf(stderr,
-                    "  [ISR-HANDOFF] #%ld queue-dpc dpc=%08X sys1=%08X sys2=%08X\n",
+                    "  [ISR-HANDOFF] #%d queue-dpc dpc=%08X sys1=%08X sys2=%08X\n",
                     g_current_isr_handoff, dpc_va,
                     g_pending_dpc_sys1, g_pending_dpc_sys2);
             fflush(stderr);
@@ -5910,6 +5917,16 @@ static void bridge_RtlUnwind(void)
     if (!exc_record) {
         g_esp -= 0x50;
         scratch = g_esp;
+        /* XBOX_TO_NATIVE maps a guest 0 to NULL, and a synthesised record is
+         * built at whatever g_esp happens to be -- so this memset is one bad
+         * stack pointer away from writing through NULL inside the bridge. */
+        if (!scratch || !bridge_va_mapped(scratch, 0x50)) {
+            fprintf(stderr, "  [KERNEL] RtlUnwind: cannot synthesise an "
+                    "exception record at esp 0x%08X\n", scratch);
+            fflush(stderr);
+            g_eax = 0;
+            return;
+        }
         memset((uint8_t *)XBOX_TO_NATIVE(scratch), 0, 0x50);
         BRIDGE_MEM32(scratch) = 0xC0000027u;   /* STATUS_UNWIND */
         exc_record = scratch;
@@ -6028,6 +6045,10 @@ static void bridge_NtReadFile(void)
     {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
+        /* A zero-length read passes the buffer check without the buffer having
+         * to be anything, so p can be NULL here while got is not trusted to be
+         * zero. Only the pointer makes the dereferences below safe. */
+        if (!p) got = 0;
         fprintf(stderr, "  [READ] want=%u got=%u st=0x%08X %02X %02X %02X %02X\n",
                 length, got, (uint32_t)ios.Status,
                 got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
@@ -6666,8 +6687,15 @@ static void bridge_MmMapIoSpace(void)
     uint32_t protect = STACK_ARG(2);
     uint32_t xbox_va = xbox_HeapAlloc(num_bytes, 4096);
 
-    fprintf(stderr, "  [KERNEL] MmMapIoSpace: phys=0x%08X size=%u → Xbox VA 0x%08X\n",
-            phys_addr, num_bytes, xbox_va);
+    /* The Protect argument was read and then dropped, so a caller that mapped
+     * I/O space read-only and later asked MmQueryAddressProtect what it had
+     * got back the ledger's default instead of its own value. Recorded here
+     * for the same reason NtProtectVirtualMemory records it. */
+    if (xbox_va && protect)
+        bridge_prot_set(xbox_va, num_bytes, protect);
+
+    fprintf(stderr, "  [KERNEL] MmMapIoSpace: phys=0x%08X size=%u prot=0x%X → Xbox VA 0x%08X\n",
+            phys_addr, num_bytes, protect, xbox_va);
     fflush(stderr);
 
     g_eax = xbox_va;
