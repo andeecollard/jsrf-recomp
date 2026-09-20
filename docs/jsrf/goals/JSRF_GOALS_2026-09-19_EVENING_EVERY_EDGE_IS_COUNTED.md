@@ -935,3 +935,91 @@ handover describes is the right instrument, not another whole-run counter.
   hashed into the recording header; the HDD is not. Two runs of the same
   recording on the same gen with the same switches can still start in
   different worlds.
+
+## G23, 02:45 — THE REPLAY IS NOT REPRODUCIBLE, AND THE DIVERGENCE IS ONE MISSED `START`
+
+Four replays of `graffiti-2026-09-19_1739.padrec` today, same gen, same
+switches, same binary, same warm HDD with the save restored:
+
+| run | audio | f3623 | f5111 | where Beat was at f5111 | verdict |
+|---|---|---:|---:|---|---|
+| `saveslotfix-1739` | off | 42.5 s | 73.9 s | speaker-stack plaza | ok=46 BAD=0 **aligned** |
+| `audioon-1739` | on | 41.2 s | 66.4 s | tiled corridor | ok=61 BAD=0 **aligned** |
+| `determinism-b` | off | 40.4 s | 68.0 s | ramp by the chain-link fence | ok=55 BAD=0 **aligned** |
+| the player, 17:39 | on | 41.8 s | 69.4 s | Gum's speech bubble | — |
+
+`saveslotfix-1739` and `determinism-b` are **byte-identical configurations**
+and differ by 5.9 s at f5111 — more than the audio-on/off difference the
+02:20 entry hypothesised. **That hypothesis is refuted:** a live device does
+change the wall-clock rate (73.9 s to 66.4 s at the same frame, 11%), but it
+moves the replay past the player rather than onto them, and two runs with the
+device in the same state disagree by more.
+
+Every one of those runs reports `state=aligned in sync`. The gate cannot fail.
+
+### The state trace names the frame, and it is a button
+
+Two more identical runs with `RECOMP_STATE_TRACE` on, `traced-A` and
+`traced-B`. **Arm A played the tutorial; arm B never left the title screen**
+(`12:WaitEndTitle=33.9s`) — same configuration, different game.
+
+`state_trace_diff.py` says "first differs at f2", and **that is phase, not
+divergence**: `ic` is a running total and the gap at f2 (+3,643) is one
+frame's boot work landing either side of a flip. It closes immediately.
+
+| frame | A `ic` | B `ic` | gap |
+|---:|---:|---:|---:|
+| f10 | 9,559 | 9,492 | +67 |
+| f1000 | 281,682 | 281,212 | +470 |
+| f2100 | 550,946 | 550,054 | +892 (0%) |
+| f2200 | 876,600 | 873,959 | +2,641 (0%) |
+| **f2300** | 1,681,231 | 1,571,924 | **+109,307 (6%)** |
+| f2500 | 3,356,222 | 3,750,397 | −394,175 |
+
+The two runs execute within **0.2%** of each other for 2,200 frames and then
+part. And the recording holds `START` at exactly **f2298–f2304**. Arm A
+consumed it and left the title in 6.8 s; arm B did not.
+
+**The recording's buttons are short taps** — every `START` window in the file:
+f1572..1573 (2), f1575..1579 (5), f1581..1588 (8), f1590..1594 (5),
+f1596 (1), f1598..1599 (2), f1601 (1), f1603..1604 (2), f1606..1608 (3),
+f2298..2304 (7), f2322..2325 (4), f2327 (1). Forty-one frames in total, in
+twelve taps, four of them one or two frames long. `pad_state_to_report`
+REPLACES the pad state each frame, so a tap is asserted on those frames and
+on no others. A guest sample that lands in a gap never sees the press.
+
+This is the distinction Codex's handover drew and it is now measured:
+**identical inputs at identical flip counts are not identical inputs at
+simulation updates.** `xbox_InputFrameAdvance()` is called once per
+`FLIP_STALL` from one place (`main.c:770`), so the delivery is frame-exact;
+what consumes it is not pinned to the same frames.
+
+**A second difference, unexplained and possibly the cause rather than the
+effect:** arm B ran at **21 fps against arm A's 61** (3,880 frames against
+11,068 in the same 180 s). A run a third of the speed samples and schedules
+differently throughout. Which way the causation runs — slow run misses the
+press, or missed press leaves it grinding the title — is **not established**.
+That is the next measurement, and `RECOMP_PAD_TRACE` on a pair of arms with
+per-sample frame numbers would decide it.
+
+### What this costs
+
+The boot lottery in `play_scripted.sh`'s header — "2 of 3 reached New Game"
+against "0 of 2" — has been read as an audio-device effect since 14 Sep. It
+is at least partly this: whether a short `START` tap is sampled. Today's
+score is 4 of 5 runs reaching gameplay.
+
+And **no replay-dependent investigation is currently sound**. A fix for
+graffiti, text or frame pacing cannot be A/B'd against a replay that lands in
+a different part of the level, and `state=aligned` will bless both arms.
+Codex's isolated texture-cache oracle does not depend on this and stands.
+
+## Rules added, 20 Sep (second)
+
+- **A running total diffed frame-by-frame reports phase as divergence.** The
+  first differing frame of a cumulative counter is nearly always the first
+  frame whose work straddles a boundary. Compare the gap's TREND; a real
+  split is where the percentage moves, not where the equality breaks.
+- **A recording of taps is a recording of races.** The recorder stores the
+  frames a button was down. One- and two-frame taps survive only if the guest
+  samples those frames. Recording the press is not recording the effect.
