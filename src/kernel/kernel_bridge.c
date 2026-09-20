@@ -2446,11 +2446,34 @@ static void bridge_HalReadSMCTrayState(void)
  * Initializes a DPC object. The Xbox KDPC structure is 32 bytes.
  * We zero it and set the routine and context pointers.
  */
+/* THE THREE INITIALISERS TAKE A GUEST POINTER AND ZERO IT BEFORE USING IT.
+ *
+ * Each of these memsets the caller's object before filling it in, and each
+ * built the destination as XBOX_TO_NATIVE(STACK_ARG(0)) with nothing checking
+ * the argument first. That macro maps a guest 0 to NULL, so a title passing a
+ * null object pointer -- or a pointer into unmapped guest space -- crashed the
+ * HOST inside memset, in a frame belonging to the kernel bridge rather than to
+ * the guest code that supplied the pointer.
+ *
+ * bridge_checked_out_va reports the bad argument with the guest's own stack
+ * frame and return address, which is the difference between "the host died in
+ * memset" and "this export was handed 0x%08X by this caller". It passes a null
+ * through unchanged, so a null check still follows it.
+ *
+ * All three exports return void, so refusing is doing nothing -- which is what
+ * the real kernel does with an object it cannot write. */
+
 static void bridge_KeInitializeDpc(void)
 {
-    uint32_t dpc_va = STACK_ARG(0);
+    uint32_t dpc_va = bridge_checked_out_va(STACK_ARG(0), 32,
+                                            "KeInitializeDpc", "Dpc");
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
+
+    if (!dpc_va) {
+        g_eax = 0;
+        return;
+    }
 
     /* Zero the structure (32 bytes) */
     memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
@@ -2499,10 +2522,17 @@ static void bridge_note_vector_irql(uint32_t vector, uint32_t irql);
 
 static void bridge_KeInitializeInterrupt(void)
 {
-    uint32_t interrupt_va = STACK_ARG(0);
+    uint32_t interrupt_va = bridge_checked_out_va(STACK_ARG(0), 44,
+                                                  "KeInitializeInterrupt",
+                                                  "Interrupt");
     uint32_t routine      = STACK_ARG(1);
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
+
+    if (!interrupt_va) {
+        g_eax = 0;
+        return;
+    }
 
     /* Xbox KINTERRUPT is 44 bytes. */
     memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
@@ -4220,8 +4250,14 @@ static void bridge_HalRegisterShutdownNotification(void)
  */
 static void bridge_KeInitializeTimerEx(void)
 {
-    uint32_t timer_va = STACK_ARG(0);
+    uint32_t timer_va = bridge_checked_out_va(STACK_ARG(0), 40,
+                                              "KeInitializeTimerEx", "Timer");
     uint32_t type = STACK_ARG(1);
+
+    if (!timer_va) {
+        g_eax = 0;
+        return;
+    }
 
     /* Zero the structure (40 bytes) */
     memset(XBOX_TO_NATIVE(timer_va), 0, 40);

@@ -23,7 +23,7 @@ Each entry shows: **ordinal**, function prototype, description, and suggested Wi
 |-----|----------|-------------|
 | 184 | `NTSTATUS NtAllocateVirtualMemory(PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect)` | Allocate or reserve virtual memory pages. |
 | 199 | `NTSTATUS NtFreeVirtualMemory(PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType)` | Free virtual memory. |
-| 217 | `NTSTATUS NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInformation, ULONG Length, PULONG ReturnLength)` | Query virtual memory region info. |
+| 217 | `NTSTATUS NtQueryVirtualMemory(PVOID BaseAddress, PMEMORY_BASIC_INFORMATION MemoryInformation)` | Query virtual memory region info. Two arguments, not NT's four. |
 
 **Win32 replacement**: Direct mapping to `VirtualAlloc`, `VirtualFree`, `VirtualQuery`. The API is nearly identical.
 

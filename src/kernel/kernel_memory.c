@@ -319,26 +319,48 @@ NTSTATUS __stdcall xbox_NtFreeVirtualMemory(
     return STATUS_SUCCESS;
 }
 
+/*
+ * TWO ARGUMENTS, NOT NT'S FOUR.
+ *
+ * The Xbox export is
+ *
+ *     NTSTATUS NtQueryVirtualMemory(PVOID BaseAddress,
+ *                                   PMEMORY_BASIC_INFORMATION Info);
+ *
+ * and this was declared with NT's desktop signature -- BaseAddress, Info,
+ * Length and ReturnLength. stdcall_args_for_ordinal() has always said 8 bytes
+ * for ordinal 217 and bridge_NtQueryVirtualMemory has always read two
+ * arguments, so the guest path was right; it was this declaration, the header
+ * and docs/formats/kernel-exports.md that carried the wrong one.
+ *
+ * It mattered because xbox_resolve_ordinal() registers this function at
+ * ordinal 217. A guest calling through that slot pushes two arguments and the
+ * callee returns with `ret 16`, popping eight bytes that belong to the caller
+ * -- the silent stack-rotation failure stdcall_args_for_ordinal() warns about
+ * at length, arriving frames away from its cause.
+ *
+ * WHAT THIS STILL CANNOT DO, and why the guest path does not come here: it
+ * fills a HOST MEMORY_BASIC_INFORMATION, whose pointer fields are 64 bits on
+ * an x64 build, so every field after BaseAddress lands at the wrong offset for
+ * a 32-bit guest reader. bridge_NtQueryVirtualMemory writes the guest layout
+ * field by field for exactly that reason. This one is for a native caller,
+ * where the host layout is the right layout.
+ */
 NTSTATUS __stdcall xbox_NtQueryVirtualMemory(
     PVOID BaseAddress,
-    PVOID MemoryInformation,
-    ULONG MemoryInformationLength,
-    PULONG ReturnLength)
+    PVOID MemoryInformation)
 {
     MEMORY_BASIC_INFORMATION mbi;
+
+    if (!MemoryInformation)
+        return STATUS_INVALID_PARAMETER;
 
     if (!VirtualQuery(BaseAddress, &mbi, sizeof(mbi)))
         return STATUS_INVALID_PARAMETER;
 
-    /*
-     * Xbox NtQueryVirtualMemory returns a MEMORY_BASIC_INFORMATION-like struct.
-     * Copy what fits into the caller's buffer.
-     */
-    ULONG copy_size = (MemoryInformationLength < sizeof(mbi)) ? MemoryInformationLength : (ULONG)sizeof(mbi);
-    memcpy(MemoryInformation, &mbi, copy_size);
-
-    if (ReturnLength)
-        *ReturnLength = copy_size;
+    /* No length argument exists on this export, so the caller's buffer is the
+     * full structure by definition. */
+    memcpy(MemoryInformation, &mbi, sizeof(mbi));
 
     return STATUS_SUCCESS;
 }

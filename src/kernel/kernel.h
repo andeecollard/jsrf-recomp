@@ -662,7 +662,9 @@ VOID    __stdcall xbox_MmDeleteKernelStack(PVOID StackBase, PVOID StackLimit);
 
 NTSTATUS __stdcall xbox_NtAllocateVirtualMemory(PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
 NTSTATUS __stdcall xbox_NtFreeVirtualMemory(PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType);
-NTSTATUS __stdcall xbox_NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInformation, ULONG MemoryInformationLength, PULONG ReturnLength);
+/* Two arguments, not NT's four: the Xbox export takes BaseAddress and the
+ * info block only. See the note on bridge_NtQueryVirtualMemory. */
+NTSTATUS __stdcall xbox_NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInformation);
 
 /* ============================================================================
  * File I/O (kernel_file.c)
