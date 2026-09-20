@@ -3943,7 +3943,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     );
     if (!g_mapping_handle) {
         fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %u)\n",
-                GetLastError());
+                (unsigned)GetLastError());
         return FALSE;
     }
 
@@ -4482,7 +4482,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
                     "(error %u); pinned physical allocations will fault\n",
-                    XBOX_CONTIG_BASE, GetLastError());
+                    XBOX_CONTIG_BASE, (unsigned)GetLastError());
         }
     }
 
@@ -4555,7 +4555,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
                     "(error %u); D3D register access will fault\n",
-                    XBOX_NV2A_BASE, GetLastError());
+                    XBOX_NV2A_BASE, (unsigned)GetLastError());
         }
     }
 
@@ -4690,7 +4690,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %u); USB/audio register access will fault\n",
-                    XBOX_MCPX_BASE, GetLastError());
+                    XBOX_MCPX_BASE, (unsigned)GetLastError());
         }
     }
 
@@ -4711,7 +4711,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: flash aperture at 0x%08X failed "
                     "(error %u); a title reading flash will fault\n",
-                    XBOX_FLASH_BASE, GetLastError());
+                    XBOX_FLASH_BASE, (unsigned)GetLastError());
         }
     }
 
@@ -4836,7 +4836,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 g_mirror_mask |= 1u << m;
             } else {
                 fprintf(stderr, "  Mirror %d: FAILED at %p (error %u)\n",
-                        m + 1, (void *)mirror_base, GetLastError());
+                        m + 1, (void *)mirror_base, (unsigned)GetLastError());
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
@@ -4924,7 +4924,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
                     " (error %u); rendering writes will fault\n",
-                    XBOX_TILED_BASE, GetLastError());
+                    XBOX_TILED_BASE, (unsigned)GetLastError());
         }
     }
 
@@ -5012,7 +5012,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
 
     if (!VirtualFree((LPVOID)expected, 0, MEM_RELEASE)) {
         fprintf(stderr, "  Physical heap alias: releasing the window failed"
-                        " (error %lu)\n", (unsigned long)GetLastError());
+                        " (error %lu)\n", (unsigned long)(unsigned)GetLastError());
         free(low_copy);
         return FALSE;
     }
@@ -5026,7 +5026,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
         fprintf(stderr, "  Physical heap alias: FATAL, could not re-reserve"
                         " 0x%08X..0x%08X (error %lu)\n",
                 XBOX_CONTIG_BASE, XBOX_CONTIG_BASE + start,
-                (unsigned long)GetLastError());
+                (unsigned long)(unsigned)GetLastError());
         free(low_copy);
         g_contig_memory = NULL;
         return FALSE;
@@ -5047,7 +5047,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         fprintf(stderr, "  Physical heap alias: mapping failed (error %lu);"
                         " window restored unaliased\n",
-                (unsigned long)GetLastError());
+                (unsigned long)(unsigned)GetLastError());
         return FALSE;
     }
     if (end < XBOX_CONTIG_SIZE) {
@@ -5058,7 +5058,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
             fprintf(stderr, "  WARNING: contiguous window above 0x%08X is"
                             " unmapped (error %lu); GPU instance memory will"
                             " fault\n",
-                    XBOX_CONTIG_BASE + end, (unsigned long)GetLastError());
+                    XBOX_CONTIG_BASE + end, (unsigned long)(unsigned)GetLastError());
     }
 
     /* Prove the alias rather than assert it, the way the tiled aperture does.
@@ -5105,7 +5105,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
     if (g_physical_heap_view!=target) {
         if (g_physical_heap_view) UnmapViewOfFile(g_physical_heap_view);
         g_physical_heap_view=NULL;
-        fprintf(stderr,"  Physical heap alias: mapping failed (error %lu)\n",(unsigned long)GetLastError());
+        fprintf(stderr,"  Physical heap alias: mapping failed (error %lu)\n",(unsigned long)(unsigned)GetLastError());
         return FALSE;
     }
     recomp_mem_watch_add_ram_alias(XBOX_CONTIG_BASE + start, start,

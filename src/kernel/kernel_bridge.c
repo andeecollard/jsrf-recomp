@@ -2932,7 +2932,7 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
         }
         if (handoff_trace) {
             fprintf(stderr, "  [ISR-HANDOFF] #%d guest-enter routine=%08X esp=%08X\n",
-                    g_current_isr_handoff, routine, g_esp);
+                    (int)g_current_isr_handoff, routine, g_esp);
             fflush(stderr);
         }
         bridge_save_regs(&saved);
@@ -2959,7 +2959,7 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
         if (handoff_trace) {
             fprintf(stderr,
                     "  [ISR-HANDOFF] #%d guest-return result=%02X pending-dpc=%08X\n",
-                    g_current_isr_handoff, isr_result & 0xFF, g_pending_dpc);
+                    (int)g_current_isr_handoff, isr_result & 0xFF, g_pending_dpc);
             fflush(stderr);
         }
         bridge_restore_regs(&saved);
@@ -2994,13 +2994,13 @@ static uint32_t bridge_run_isr_ex(uint32_t interrupt_va, int *entered)
         g_pending_dpc = 0;
         if (handoff_trace) {
             fprintf(stderr, "  [ISR-HANDOFF] #%d dpc-enter dpc=%08X\n",
-                    g_current_isr_handoff, dpc);
+                    (int)g_current_isr_handoff, dpc);
             fflush(stderr);
         }
         bridge_run_dpc(dpc, s1, s2);
         if (handoff_trace) {
             fprintf(stderr, "  [ISR-HANDOFF] #%d dpc-return\n",
-                    g_current_isr_handoff);
+                    (int)g_current_isr_handoff);
             fflush(stderr);
         }
     }
@@ -3403,8 +3403,9 @@ void xbox_ReportIrqDelivery(void)
     fprintf(stderr,
             "  [IRQ] delivered=%d deferred: irql=%d reentry=%d vector=%d"
             " | pending now=%d peak=%d | legacy-interlock-blocks=%d%s\n",
-            g_irq_delivered, g_irq_defer_irql, g_irq_defer_reentry,
-            g_irq_defer_vector, pend, g_irq_pending_peak, g_irq_legacy_hits,
+            (int)g_irq_delivered, (int)g_irq_defer_irql,
+            (int)g_irq_defer_reentry, (int)g_irq_defer_vector, (int)pend,
+            (int)g_irq_pending_peak, (int)g_irq_legacy_hits,
             bridge_legacy_irq_interlock() ? " (LEGACY MODE)" : "");
     fflush(stderr);
 }
@@ -3746,11 +3747,14 @@ void xbox_PgraphIrqReport(void)
             "+ctx-off=%d +en-off=%d +dispatch=%d +handled=%d +acked=%d "
             "(last ctx-a0=%08X ctx-b0=%08X intr-en=%08X; totals "
             "dispatch=%d acked=%d)\n",
-            poll - prev_poll, pending - prev_pending, tls - prev_tls,
-            interlock - prev_interlock, no_vector - prev_no_vector,
-            pmc_blocked - prev_pmc_blocked, ctx_disabled - prev_ctx_disabled,
-            en_disabled - prev_en_disabled, dispatch - prev_dispatch,
-            handled - prev_handled, acked - prev_acked,
+            (int)(poll - prev_poll), (int)(pending - prev_pending),
+            (int)(tls - prev_tls), (int)(interlock - prev_interlock),
+            (int)(no_vector - prev_no_vector),
+            (int)(pmc_blocked - prev_pmc_blocked),
+            (int)(ctx_disabled - prev_ctx_disabled),
+            (int)(en_disabled - prev_en_disabled),
+            (int)(dispatch - prev_dispatch), (int)(handled - prev_handled),
+            (int)(acked - prev_acked),
             InterlockedCompareExchange(&g_pgraph_last_ctx_a0, 0, 0),
             InterlockedCompareExchange(&g_pgraph_last_ctx_b0, 0, 0),
             InterlockedCompareExchange(&g_pgraph_last_intr_en, 0, 0),
@@ -4817,7 +4821,7 @@ static void bridge_KeInsertQueueDpc(void)
         if (getenv("RECOMP_PGRAPH_ISR_TRACE") && g_current_isr_handoff) {
             fprintf(stderr,
                     "  [ISR-HANDOFF] #%d queue-dpc dpc=%08X sys1=%08X sys2=%08X\n",
-                    g_current_isr_handoff, dpc_va,
+                    (int)g_current_isr_handoff, dpc_va,
                     g_pending_dpc_sys1, g_pending_dpc_sys2);
             fflush(stderr);
         }
