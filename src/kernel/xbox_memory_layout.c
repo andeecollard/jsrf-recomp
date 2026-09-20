@@ -177,6 +177,34 @@ static void *g_flash_memory = NULL;
  * twice. See the tiled aperture below for why that matters.
  */
 static HANDLE g_contig_mapping = NULL;
+/* Whether g_contig_memory is a MAPPED VIEW or a VirtualAlloc reservation.
+ * They are released by different calls, and getting it wrong is not a leak:
+ * VirtualFree(MEM_RELEASE) on a view fails with ERROR_INVALID_PARAMETER and
+ * the caller then takes its failure path. See contig_release_window. */
+static int g_contig_is_view = 0;
+
+/* Release the contiguous window, whichever way it was made.
+ *
+ * The window is PREFERENTIALLY a view of g_contig_mapping, because the tiled
+ * aperture aliases it and only a view can be aliased; VirtualAlloc is the
+ * fallback. Releasing it as a reservation therefore fails on exactly the
+ * configuration that is working correctly, which is how it read on Windows:
+ * "Physical heap alias: releasing the window failed (error 87)", the alias
+ * never came up, and MmAllocateContiguousMemory fell back to handing out raw
+ * physical offsets -- which climb through the guest's own stacks and heap.
+ * JSRF's depth clear then painted 0xFFFFFF00 over them, and the title died
+ * later writing through a list head that had been inside the surface.
+ *
+ * POSIX is left on the original call deliberately: there VirtualFree is
+ * munmap, which already releases either kind, and that path is known good. */
+static BOOL contig_release_window(void *p)
+{
+#if defined(_WIN32)
+    if (g_contig_is_view)
+        return UnmapViewOfFile((LPVOID)p);
+#endif
+    return VirtualFree((LPVOID)p, 0, MEM_RELEASE);
+}
 /* How much of the tiled aperture can exist.
  *
  * Two ceilings, both below the mapped RAM size once that is large:
@@ -4750,6 +4778,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
                               0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
             : NULL;
+        g_contig_is_view = (g_contig_memory != NULL);
         if (!g_contig_memory)
             g_contig_memory = VirtualAlloc(
                 (LPVOID)contig_native,
@@ -5303,7 +5332,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
     }
     memcpy(low_copy, (const void *)expected, start);
 
-    if (!VirtualFree((LPVOID)expected, 0, MEM_RELEASE)) {
+    if (!contig_release_window((void *)expected)) {
         fprintf(stderr, "  Physical heap alias: releasing the window failed"
                         " (error %lu)\n", (unsigned long)(unsigned)GetLastError());
         free(low_copy);
@@ -5324,6 +5353,7 @@ BOOL xbox_EnablePhysicalHeapAlias(void)
         g_contig_memory = NULL;
         return FALSE;
     }
+    g_contig_is_view = 0;          /* rebuilt below as reservations + a view */
     memcpy((void *)expected, low_copy, start);
     free(low_copy);
 
@@ -5490,7 +5520,7 @@ void xbox_MemoryLayoutShutdown(void)
         g_tiled_view = NULL;
     }
     if (g_contig_memory) {
-        VirtualFree(g_contig_memory, 0, MEM_RELEASE);
+        contig_release_window(g_contig_memory);
         g_contig_memory = NULL;
     }
     if (g_mcpx_memory) {
