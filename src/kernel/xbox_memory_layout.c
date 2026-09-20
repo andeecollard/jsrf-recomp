@@ -1325,6 +1325,10 @@ void xbox_SetApuMmioWriteHook(void (*fn)(uint32_t, uint32_t, unsigned))
  * (unsupported host, or install failed) the ack thread keeps re-applying
  * MCPX_READY instead, which is all it could ever do for this aperture. */
 static int g_mcpx_trap_active = 0;
+/* Common scope, not AArch64-only: the Windows VEH arms and reads this too.
+ * It lived inside the AArch64 branch while that was the only path that
+ * could guard the aperture. */
+static int g_mcpx_apu_guarded = 0;
 
 /* Apply MCPX_READY to the aperture. Called once when the aperture is mapped so
  * the first reader sees the bit without having to race the ack thread -- the
@@ -1454,7 +1458,6 @@ static int       g_nv2a_guarded;
 static size_t g_mcpx_guard_pages = 0;
 static size_t g_mcpx_page_size = 0;
 
-static int g_mcpx_apu_guarded = 0;
 /* Set when the model answers reads for the span below MCPX_APU_MODEL_SIZE, so
  * nothing else has to keep a plausible value in that RAM. */
 static int g_mcpx_apu_read_trapped = 0;
@@ -2828,6 +2831,36 @@ int xbox_Nv2aHandleWin32Fault(PCONTEXT ctx, uintptr_t fault, uint32_t guest_va)
             ohci_trace_control_ed(written);
     }
 
+    /* THE APU APERTURE GOES TO THE MODEL, AND NOTHING IS REPLAYED TO MEMORY.
+     *
+     * This branch is why the trap exists at all on Windows. Until it was added
+     * g_mcpx_trap_active was set only under `!_WIN32 && __aarch64__`, so on
+     * Windows it stayed 0 forever and every consumer took its
+     * `if (!g_mcpx_trap_active) { *p = value; return; }` path: guest stores to
+     * the APU landed in ordinary RAM and the model never saw one. The APU
+     * still initialised and still logged, which is what made it invisible.
+     *
+     * EMULATED, NOT REPLAYED. The completion path below unprotects the page,
+     * performs the store and re-protects it, and that window is the failure
+     * the AArch64 branch documents at length -- any store landing inside it
+     * completes as plain memory and is lost. On the voice-submission page that
+     * cost every NV1BA0_PIO_VOICE_ON in a 45-second run. Handing the decoded
+     * value straight to the model needs no window, so there is none to lose a
+     * store in.
+     *
+     * Writes only. PAGE_READONLY faults stores and not loads, so a guest read
+     * of a model register still returns the aperture's own memory here; the
+     * AArch64 side traps those separately with PROT_NONE and this does not.
+     * That is a smaller gap than it replaces and is called out rather than
+     * hidden. */
+    if (g_mcpx_apu_guarded && g_mcpx_apu_write &&
+        guest_va >= XBOX_MCPX_BASE &&
+        guest_va <  XBOX_MCPX_BASE + MCPX_APU_MODEL_SIZE) {
+        g_mcpx_apu_write(guest_va - XBOX_MCPX_BASE, written, width);
+        ctx->Rip += (DWORD64)ilen;
+        return 1;
+    }
+
     /* AC97 bus-master reset is WRITE-CLEAR: the bit must never stick.
      * sub_001A6F52 writes RR, reads the register back ONCE outside its loop,
      * then spins on that stale value -- so suppressing the bit at the store is
@@ -3087,6 +3120,23 @@ static void xbox_McpxTrapInstall(void)
     g_nv2a_pgraph_guarded = VirtualProtect((LPVOID)g_nv2a_pgraph_page,
                                            g_nv2a_page_size, PAGE_READONLY,
                                            &old_prot) != 0;
+    /* The APU model's register window. Guarded as one range rather than a
+     * page at a time: it is 192 KB and every page of it carries registers the
+     * model interprets. g_mcpx_trap_active is what switches mcpx_hw_store and
+     * its _n/_n_or_last siblings off their "write straight to RAM" path, so it
+     * is set only if the guard actually took -- a half-armed trap that claims
+     * to be live would lose the runtime's own writes as well as the guest's. */
+    if (g_mcpx_regs && g_mcpx_apu_write) {
+        uintptr_t apu = (uintptr_t)g_mcpx_regs + MCPX_APU_MMIO_OFFSET;
+        g_mcpx_apu_guarded = VirtualProtect((LPVOID)apu, MCPX_APU_MODEL_SIZE,
+                                            PAGE_READONLY, &old_prot) != 0;
+        if (g_mcpx_apu_guarded)
+            g_mcpx_trap_active = 1;
+    }
+    fprintf(stderr, "  MCPX: APU aperture %s (%u KB)\n",
+            g_mcpx_apu_guarded ? "routed to the model"
+                               : "NOT routed -- writes will not reach it",
+            (unsigned)(MCPX_APU_MODEL_SIZE / 1024));
     fprintf(stderr, "  NV2A: PCRTC_INTR_0 page %s for write-1-to-clear\n",
             g_nv2a_pcrtc_guarded ? "guarded" : "NOT guarded");
     fprintf(stderr, "  AC97: bus-master page %s for write-clear (RR)\n",
