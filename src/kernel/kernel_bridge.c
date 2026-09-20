@@ -5156,6 +5156,19 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
     uint16_t length=BRIDGE_MEM16(ansi_str_va);
+    /* TWO CHECKS, AND THEY ANSWER DIFFERENT QUESTIONS.
+     *
+     * This one -- Length must not exceed MaximumLength -- came from upstream's
+     * 0472a59 and is an ancestor of this tree, but the line is not in it: a
+     * merge resolved this hunk in favour of our side and dropped it silently.
+     * Nothing in the history explains the removal, and the function's own log
+     * shows no commit that took it out, which is what a merge resolution looks
+     * like after the fact. Restored rather than reinvented.
+     *
+     * It says the ANSI_STRING is SELF-CONSISTENT: a Length longer than the
+     * buffer the string itself claims is malformed, and cheap to reject before
+     * anything is dereferenced. It does not say the buffer is real. */
+    if (length > BRIDGE_MEM16(ansi_str_va + 2)) return NULL;
     /* `path` is sized UINT16_MAX+1 so a uint16 Length can never overrun the
      * DESTINATION. The SOURCE is the side that needed checking: Length and
      * Buffer both come from a guest ANSI_STRING, and nothing here established
