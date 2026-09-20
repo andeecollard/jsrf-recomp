@@ -843,3 +843,95 @@ with the switch off, so the instrument is never blind again. Runs in
   subtract two measurements of two different trees and call it progress.
 - **A recording is bound to a translator hash.** Editing `tools/recomp` is
   free; regenerating is what spends the recording.
+
+## G23, 02:20 on 20 Sep — THE REPLAY WAS BOOTING WITH NO SAVE, AND NOW IT PLAYS
+
+The 18:07 note named two causes for the replay landing on the title screen
+where the player's picture showed the tutorial: an empty `Cache/` and a
+missing save slot. Warm fixed the first. **The second was still there.**
+
+`emulated-hdd-warm` is byte-identical to the player's HDD in all six
+partition images — `cmp` reports no differing byte in Partition1 (2.3 GB) or
+Partition2 — and differed by exactly two entries out of 298:
+
+    UDATA/5345000a/99271B32E8BB
+    UDATA/5345000a/99271B32E8BB/SaveMeta.xbx
+
+`kernel_file.c:238` serves Partition1 from the loose tree, so the guest
+enumerates saves from `UDATA/`. Every replay staged from warm booted with no
+save. The slot was written 16 Sep 12:19; the warm tree was staged 19 Sep
+18:16 and never carried it.
+
+`jsrf_stage_hdd` could not see it: it compares the copy with its source, and
+both were equally wrong. And `play_scripted.sh` — the script every replay
+goes through — does its own `cp -R` and never called `jsrf_stage_hdd` at all.
+`jsrf_check_save_root` now exists and both paths call it (`9df141b`,
+`9d342d0`); it compares PATHS, not hashes, and warns rather than refuses,
+because the player's HDD changes every time they play.
+
+**RESULT — the same recording, the same frame, the save restored:**
+
+| | mark #1, frame 3623 |
+|---|---|
+| 18:07 replay | the title screen, "PLEASE PRESS START BUTTON" |
+| 02:13 replay | in the tutorial: Beat on skates, trick counter, spray-can HUD |
+
+The run's own verdict: `SCENE: state 30`, `WaitEndStoryOrVsMission held
+233.4s`, `PLAYED: yes -- off=66 retired voices`, no poll stall, both marks
+reached. Pictures at `marks/mark-2026-09-20_021357-f3623-M.bmp` and
+`…_021428-f5111-M.bmp`.
+
+### But it is not yet the player's session, and the gate cannot say so
+
+At mark #2 the player's picture shows Gum's speech bubble; this replay shows
+Beat beside the speaker stack, elsewhere in the level. The mark times drift
+too — frame 3623 at t=42.5 s against the player's 41.8 s, frame 5111 at
+73.9 s against 69.4 s. Same frames, later clock, different world.
+
+**`state=aligned` cannot detect this.** All 300 `#!ck` anchors in
+`graffiti-2026-09-19_1739.padrec` are `00000000` — one distinct value,
+checked across every line. The third field is a fold over the PAD STREAM, so
+`checkpoints ok=189 BAD=0` says the input replayed identically and nothing
+more. The 13:09 replay was promoted to "a regression case that needs no
+player" on exactly that evidence. It is a case that proves input fidelity;
+it cannot fail on guest-state divergence. G23c's anchor is not optional.
+
+**A candidate for the remaining drift, stated as one.** This replay ran
+`SDL_AUDIODRIVER=no_such_driver`; the player's session had a live device.
+This script's own header records that the APU throttles to real time against
+the device, so the two arms advance at different wall-clock rates — and the
+mark drift grows with time (+0.7 s by frame 3623, +4.5 s by 5111), which is
+the shape that predicts. **Unverified.** The measurement that decides it: the
+same replay with a device present, mark times compared. If it holds, a
+recording taken with audio on cannot be reproduced with audio off, and the
+canonical replay configuration has to choose.
+
+### Codex's BC draw-state handover, checked
+
+`docs/jsrf/handovers/CODEX_HANDOVER_2026-09-20_BC_DRAW_STATE_REGRESSION.md`,
+uncommitted alongside `diagnostics/bc_draw_state/`. Its checkable claims hold:
+`capture_draw` does call `nv2a_gpu_sync()` before recording
+(`nv2a_pb_exec.c:4261`), `NV097_BACK_END_WRITE_SEMAPHORE_RELEASE` has a case
+only in `nv2a_pgraph_d3d11.c:550` with no Metal counterpart, and `2fb4f6d`
+says what it is said to say. Its scope claim is true: `git status` shows those
+two untracked entries and no modified tracked file.
+
+Two consequences for G2. **The Metal texture cache is narrowed, not cleared** —
+an independent pixel oracle passes it for alternating DXT3 font pages,
+same-address replacement and eviction, which makes "the runtime's texture
+cache is stale" a weaker hypothesis than the 20:23 note left it. And **the
+capture we were about to take would have been blind**: `capture_draw` syncs
+the GPU before recording, so a clean captured draw cannot disprove an
+ordering fault in the original sequence. The bounded per-draw trace that
+handover describes is the right instrument, not another whole-run counter.
+
+## Rules added, 20 Sep
+
+- **A gate that cannot fail is not a gate.** 189/189 checkpoints and
+  `state=aligned` were quoted as proof a replay reproduced a session. Every
+  anchor in that comparison is zero. Ask what value would have to appear for
+  the check to go red, and if there is none, the check is a decoration.
+- **The starting state is part of the configuration.** The switch set is
+  hashed into the recording header; the HDD is not. Two runs of the same
+  recording on the same gen with the same switches can still start in
+  different worlds.
