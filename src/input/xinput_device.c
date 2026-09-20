@@ -2130,11 +2130,20 @@ static void pad_note_state(const XBOX_INPUT_STATE *st)
  * written against a stick that reads zero at rest. Passing SDL's raw axis
  * through hands the guest a stick permanently pushed left.
  *
- * WHY IT MAY MATTER BEYOND CAMERA DRIFT: JSRF performs graffiti as right-stick
- * motions. A recogniser fed a constant offset fights it on every stroke, which
- * matches the reported symptom -- cans consumed, spray sound fired, no tag
- * committed, tutorial never advancing. THAT LINK IS A HYPOTHESIS; the deadzone
- * is correct whether or not it turns out to be the cause.
+ * WHY IT MAY MATTER BEYOND CAMERA DRIFT. Corrected by the player, 20 Sep: a
+ * tag is STARTED with the right trigger, not with stick motions. The recording
+ * confirms the trigger arrives intact -- RT=24, 214, then 255 held from f15782
+ * through the marks -- and the mark at f15793 shows the mini-game running with
+ * its three directional prompts drawn correctly. So the trigger and the
+ * prompt UI are not the defect.
+ *
+ * The sticks are still in the loop, because those prompts are matched with
+ * direction, and RX reads -5012 and -4755 on those very frames. A constant
+ * offset above this file's own +/-4096 threshold, while the player aims at a
+ * specific direction, is a candidate for a gesture that never completes --
+ * cans consumed, no tag committed. STILL A HYPOTHESIS, and a narrower one
+ * than the first version of this comment claimed. The deadzone is correct
+ * whether or not it is the cause.
  *
  * Radial, not per-axis. Clamping each axis on its own squares off the diagonal
  * and changes a stroke's DIRECTION, which is the one thing a gesture recogniser
