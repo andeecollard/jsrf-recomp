@@ -201,4 +201,46 @@ jsrf_stage_hdd() {
         exit 3
     fi
     echo "hdd:    $(wc -l < "$OUT/hdd-source.manifest" | tr -d ' ') files, sha256 of manifest $(shasum -a 256 < "$OUT/hdd-source.manifest" | cut -c1-16)"
+
+    # THE STARTING SAVE STATE IS PART OF THE CONFIGURATION, and nothing checked
+    # it. Measured 20 Sep 2026: emulated-hdd-warm was byte-identical to the
+    # player's HDD in all six partition images and differed by exactly two
+    # entries -- UDATA/5345000a/99271B32E8BB/ and its empty SaveMeta.xbx, the
+    # save slot. kernel_file.c serves Partition1 from this loose tree, so the
+    # guest enumerates saves from UDATA/ and a replay staged from warm booted
+    # with NO SAVE. That is half of the 18:07 starting-conditions gap (the
+    # other half, an empty Cache/, warm already fixes), and the check above
+    # could not see it: it compares the copy with its source, and both were
+    # equally wrong.
+    #
+    # PATHS, NOT HASHES. The player's HDD changes every time they play, so a
+    # content diff would cry wolf on every run and a refusal would be wrong.
+    # A missing or added PATH under the save root is the failure that silently
+    # changes where a replay starts, and it is cheap to see.
+    [ -n "${JSRF_SKIP_HDD_PLAYER_CHECK:-}" ] && return 0
+    _phdd="$HOME/Library/Application Support/JSRF/hdd"
+    [ -d "$_phdd" ] || return 0
+    # Same tree under two names is not a divergence.
+    [ "$(cd "$_phdd" && pwd -P)" = "$(cd "$JSRF_HDD_SRC" && pwd -P)" ] && return 0
+    # POSIX sh, sourced by #!/bin/sh scripts: no process substitution here.
+    _save_paths() {
+        ( cd "$1" 2>/dev/null && find TDATA UDATA TitleData UserData SystemData \
+            2>/dev/null | LC_ALL=C sort ) > "$2"
+    }
+    _save_paths "$_phdd"       "$SCRATCH/.save-paths-player"
+    _save_paths "$SCRATCH/hdd" "$SCRATCH/.save-paths-staged"
+    _pd=$(diff "$SCRATCH/.save-paths-player" "$SCRATCH/.save-paths-staged" 2>/dev/null)
+    rm -f "$SCRATCH/.save-paths-player" "$SCRATCH/.save-paths-staged"
+    if [ -n "$_pd" ]; then
+        echo "WARNING: this run's save root differs from the player's HDD" >&2
+        echo "  player: $_phdd" >&2
+        echo "  staged: $JSRF_HDD_SRC" >&2
+        printf '%s\n' "$_pd" | sed 's/^/    /' | head -20 >&2
+        echo "  (< only the player has it, > only this run has it)" >&2
+        echo "  A replay that starts from a different save is not replaying" >&2
+        echo "  the session it recorded. JSRF_SKIP_HDD_PLAYER_CHECK=1 to silence." >&2
+        printf '%s\n' "$_pd" > "$OUT/hdd-player-divergence.txt"
+    else
+        echo "hdd:    save root matches the player's HDD"
+    fi
 }
