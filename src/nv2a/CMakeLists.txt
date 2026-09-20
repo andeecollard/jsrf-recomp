@@ -43,6 +43,12 @@ if(APPLE)
     target_sources(xbox_vsh PRIVATE nv2a_metal.m)
     set_source_files_properties(nv2a_metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(xbox_vsh PUBLIC "-framework Metal" "-framework Foundation")
+    # nv2a_metal.m timestamps its traces with xbox_TraceSeconds, which lives in
+    # platform. PUBLIC, not PRIVATE: xbox_vsh is a static library, so the symbol
+    # is still unresolved when an executable links it, and every consumer needs
+    # platform on its own link line. Nine test targets link xbox_vsh alone and
+    # none of them had linked since that call was added.
+    target_link_libraries(xbox_vsh PUBLIC platform)
 endif()
 if(NOT MSVC)
     target_compile_options(xbox_vsh PRIVATE -Wall -Wextra -O2)
