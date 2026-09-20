@@ -7492,6 +7492,132 @@ static void bridge_HalInitiateShutdown(void)
     g_eax = 0;
 }
 
+/* ── MmAllocateSystemMemory (167) / MmFreeSystemMemory (172) ──
+ *
+ * PVOID MmAllocateSystemMemory(ULONG NumberOfBytes, ULONG Protect)
+ * VOID  MmFreeSystemMemory(PVOID BaseAddress, ULONG NumberOfBytes)
+ *
+ * Written against the guest memory model rather than forwarded, for the reason
+ * the NOT-ROUTED note gives and this pair demonstrates exactly:
+ * xbox_MmAllocateSystemMemory returns VirtualAlloc's pointer, which is a host
+ * address in the host's address space. The guest receives it in eax, 32 bits
+ * wide, and then dereferences it -- so forwarding would hand the title a
+ * truncated host pointer for every allocation. It is the IoCreateDevice
+ * failure with the truncation moved from an out-parameter into the return
+ * value.
+ *
+ * So the allocation comes from the guest heap, which is what the title can
+ * actually address, and the protection is recorded in the same ledger
+ * NtProtectVirtualMemory and MmQueryAddressProtect read. A title that
+ * allocates with PAGE_READWRITE and later asks what the page is now gets the
+ * answer it set rather than a default.
+ *
+ * MmFreeSystemMemory goes to xbox_HeapFree, which is a bump allocator's no-op.
+ * That is not a leak this bridge introduces -- it is the heap's existing
+ * behaviour, shared with MmFreeContiguousMemory -- but it is the reason the
+ * size argument is accepted and ignored rather than checked against the block.
+ */
+static void bridge_MmAllocateSystemMemory(void)
+{
+    uint32_t size    = STACK_ARG(0);
+    uint32_t protect = STACK_ARG(1);
+    uint32_t xbox_va;
+
+    if (!size) {
+        g_eax = 0;
+        return;
+    }
+
+    /* Page granularity: this export's callers treat the result as page-backed,
+     * and MmQueryAddressProtect answers per page. */
+    xbox_va = xbox_HeapAlloc(size, 4096);
+    if (!xbox_va) {
+        g_eax = 0;          /* NULL, which is this export's failure return */
+        return;
+    }
+
+    if (protect)
+        bridge_prot_set(xbox_va, (size + 0xFFFu) & ~0xFFFu, protect);
+
+    if (KERNEL_LOG_ON_HALF()) {
+        fprintf(stderr, "  [KERNEL] MmAllocateSystemMemory: size=%u protect=0x%X"
+                " → Xbox VA 0x%08X\n", size, protect, xbox_va);
+        fflush(stderr);
+    }
+
+    g_eax = xbox_va;
+}
+
+static void bridge_MmFreeSystemMemory(void)
+{
+    uint32_t addr = STACK_ARG(0);
+
+    /* NumberOfBytes (STACK_ARG(1)) is deliberately unread: the heap frees by
+     * base address and a partial free is not something it can express. */
+    if (addr)
+        xbox_HeapFree(addr);
+    g_eax = 0;
+}
+
+/* ── The IRP group (74, 81, 83, 87, 359) ──────────────────
+ *
+ * These are the last of JSRF's imports, and they are routed together because
+ * the same sentence covers all five: there is no IRP model here. The title
+ * links the XDK's device-driver surface, the XDK references these exports, and
+ * nothing in this runtime builds or dispatches an IRP -- file I/O goes through
+ * the Nt* exports directly to the host filesystem, so no packet is ever
+ * constructed to start, complete or mark.
+ *
+ * Four of them are therefore no-ops, and their xbox_* implementations already
+ * were. Routing them changes no behaviour; what it changes is that "no bridge
+ * for ordinal N" stops being printed for a decision that has been made. A
+ * warning that fires for deliberate no-ops teaches the reader to ignore it,
+ * and it is the only thing standing between a genuinely missing export and
+ * being noticed.
+ *
+ * IoInvalidDeviceRequest is the exception and the reason this group was worth
+ * touching at all. It is not a stub: it is the default dispatch entry for
+ * major functions a driver does not implement, and its entire contract is to
+ * REJECT. Unrouted, the generic stub answered 0 -- STATUS_SUCCESS -- so every
+ * unhandled major function reported that it had worked. It now returns what it
+ * is for.
+ *
+ * If a title ever does drive real IRPs, none of this is sufficient and the
+ * no-ops become wrong rather than merely empty. That needs an IRP model and a
+ * decision about which side owns the packet, which is a larger piece of work
+ * than a wrapper.
+ */
+static void bridge_IoInvalidDeviceRequest(void)
+{
+    /* Neither argument is read; the answer does not depend on them. */
+    g_eax = 0xC0000010u;                 /* STATUS_INVALID_DEVICE_REQUEST */
+}
+
+static void bridge_IoStartPacket(void)
+{
+    g_eax = 0;                           /* VOID */
+}
+
+static void bridge_IoStartNextPacket(void)
+{
+    g_eax = 0;                           /* VOID */
+}
+
+/* __fastcall: Irp in ecx, PriorityBoost in edx, and no stack arguments --
+ * which is why stdcall_args_for_ordinal() reports 0 for this ordinal. Reading
+ * STACK_ARG(0) here would pick up the caller's frame instead. */
+static void bridge_IofCompleteRequest(void)
+{
+    (void)g_ecx;
+    (void)g_edx;
+    g_eax = 0;                           /* VOID */
+}
+
+static void bridge_IoMarkIrpMustComplete(void)
+{
+    g_eax = 0;                           /* VOID */
+}
+
 /* ── Dispatch table: ordinal → bridge function + stack arg bytes ── */
 
 typedef void (*bridge_func_t)(void);
@@ -7896,6 +8022,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  46: return bridge_HalReadWritePCISpace;
     case  69: return bridge_IoDeleteSymbolicLink;
     case 137: return bridge_KeRemoveQueueDpc;
+    case  74: return bridge_IoInvalidDeviceRequest;
+    case  81: return bridge_IoStartNextPacket;
+    case  83: return bridge_IoStartPacket;
+    case  87: return bridge_IofCompleteRequest;
+    case 359: return bridge_IoMarkIrpMustComplete;
+    case 167: return bridge_MmAllocateSystemMemory;
+    case 172: return bridge_MmFreeSystemMemory;
     case 176: return bridge_MmLockUnlockPhysicalPage;
     case 269: return bridge_RtlCompareMemoryUlong;
     case 304: return bridge_RtlTimeFieldsToTime;
