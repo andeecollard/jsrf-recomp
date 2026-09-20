@@ -721,6 +721,45 @@ bounds `hint+k < 0x9C` with no lower bound, so a negative hint would read
 before the table — unreachable on the normal path. And no Shift-JIS
 lead-byte test for 0xE0-0xFC exists anywhere in the image; only 0x80-0x9F.
 
+## G2, 01:50 on 20 Sep — BOTH PAGES ARE BOUND. "PAGE 1 IS NEVER BOUND" IS REFUTED.
+
+A detector rather than a photograph: count the distinct textures that text
+is drawn against, using the Latin page geometry as the filter (256x256, cells
+21x34). Over a 230 s playing run:
+
+| page texture | character quads |
+|---|---:|
+| `00DAC000` | 102,729 |
+| `00DBC000` | 4,610 |
+
+**Two textures, 0x10000 apart — exactly one 256x256 DXT3 page — so these are
+the two Latin pages, and page 1 IS bound and IS drawn**, 4,610 character
+quads' worth. The ratio, about 22:1, is what English letter frequency
+predicts for `v w x y z` against everything else.
+
+So the defect is **not** a missing bind. Both pages are bound, most of the
+time correctly, and the corruption is intermittent — which the 16 Sep
+observation already said (the same word correct in a later box) and which
+the `$` substitution is still the signature of. It is an ORDERING fault
+between a texture change and the draws around it, not an absent one.
+
+**And the batching A/B did not settle it.** Both arms ran 230 s, but they
+captured different moments, so the comparison is invalid and is not scored.
+What the captures do show is the defect present with batching OFF — a trick
+name reading `arside Stab Soul`, leading characters gone — so batching alone
+is not the cause.
+
+**A defect I have been wrongly treating as one thing.** Lost leading
+characters (`arside...`, `hsu..cIent` for "Insufficient") may be separate
+from wrong glyphs (`$ou`, the tall kanji). The page mechanism explains the
+substitutions precisely and does not obviously explain truncation. Two
+faults should be assumed until one is shown to cause both.
+
+**Instrument bug worth remembering:** the detector first sat inside the
+print-capped block, so running it with a cap of 1 line silently disabled the
+counting and the run reported nothing. Counting is not printing; a counter
+behind a print cap is a counter that lies when you quieten it.
+
 ## The order
 
 1. **Replay the 13:09 recording once, before anything regenerates.** It is

@@ -1591,6 +1591,11 @@ static int early_z_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_EARLY_Z");
   return on; }
 static uint64_t g_early_z_draws, g_late_z_draws;
+/* Latin font pages seen by the text detector above: distinct texture
+ * addresses whose cells match the 21x34 Latin grid, and how many character
+ * quads each drew. Two is correct; one means page 1 is never bound. */
+static uint32_t g_latin_tex[16]; static uint64_t g_latin_tex_quads[16];
+static unsigned g_latin_tex_n;
 static int hw_early_z(const NV2ATextureCopy *s)
 {
     if (!early_z_on()) return 0;
@@ -2756,6 +2761,16 @@ void nv2a_metal_report(void)
      * at all; with it on, the split is how much of the scene can take the
      * variant, and that bound is a property of the title rather than of the
      * change. */
+    if(g_latin_tex_n){
+     fprintf(stderr,"[METAL] Latin font pages bound for text: %u distinct"
+             " texture(s)%s\n", g_latin_tex_n,
+             g_latin_tex_n<2?"  <<< JSRF HAS TWO LATIN PAGES. Only one was"
+                             " ever bound, so every glyph on the other page"
+                             " (v w x y z) sampled the wrong sheet.":"");
+     for(unsigned i=0;i<g_latin_tex_n;i++)
+      fprintf(stderr,"[METAL]   page texture %08X: %llu character quads\n",
+              g_latin_tex[i],(unsigned long long)g_latin_tex_quads[i]);
+    }
     fprintf(stderr,"[METAL] depth test before the shader: %llu draws early,"
             " %llu late (early_z %s)\n",
             (unsigned long long)g_early_z_draws,
@@ -4165,6 +4180,53 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   unsigned vpq = (primitive==8u) ? 4u        /* QUADS */
                : (primitive==5u) ? 6u        /* TRIANGLES: 2 per character */
                : 0u;                         /* strips/fans: not grouped */
+  /* THE DETECTOR RUNS ON EVERY DRAW, not only the printed ones. It lived
+   * inside the print-capped block first, so capping output to one line
+   * silently disabled it and the run reported nothing at all. Counting is
+   * not printing. */
+  if(glyph_cap>0&&(s->texture_mask&1)&&vpq&&count>=vpq&&(count%vpq)==0){
+   unsigned quads=count/vpq;
+   /* Latin-page geometry is the filter; the argument is below.
+    *
+    * JSRF's Latin font is TWO 256x256 pages of 84 cells on a 21x34 grid
+    * (descriptor at guest 0x1F8B48: 2 pages, 12 cols x 7 rows, base texture
+    * id 4). Codes 0x21-0x75 are page 0; 0x76-0x7A -- v w x y z -- are the
+    * first five cells of page 1, and EVERY corrupted letter ever recorded is
+    * one of those. The guest binds a page's texture only when it differs
+    * from the one cached at 0x00251D54, so a page-1 glyph drawn while page 0
+    * is still bound samples page 0's cell of the same number: y is page 1
+    * row 0 col 3, page 0 row 0 col 3 is '$', and the player's capture reads
+    * "$ou" for "you".
+    *
+    * So the question is not what a frame looks like, it is HOW MANY DISTINCT
+    * TEXTURES the text is drawn against. A correct run binds both Latin
+    * pages. A run that only ever binds one has the defect by construction,
+    * and this counts them without anybody catching a frame.
+    *
+    * Latin-page geometry is the filter: 256x256, cells about 21 wide and 34
+    * tall. Reported once at exit. */
+   if(s->width==256&&s->height==256){
+    float cw=0,chh=0; unsigned nc=0;
+    for(unsigned qi=0;qi<quads;qi++){
+     float u0=1e30f,u1=-1e30f,v0=1e30f,v1=-1e30f;
+     for(unsigned k=0;k<vpq;k++){
+      const float*tt=vertices[qi*vpq+k][GLYPH_ATTR_TEX0];
+      if(tt[0]<u0)u0=tt[0]; if(tt[0]>u1)u1=tt[0];
+      if(tt[1]<v0)v0=tt[1]; if(tt[1]>v1)v1=tt[1];
+     }
+     cw+=(u1-u0)*256.0f; chh+=(v1-v0)*256.0f; nc++;
+    }
+    if(nc){ cw/=nc; chh/=nc;
+     if(cw>16.0f&&cw<26.0f&&chh>28.0f&&chh<40.0f){
+      unsigned i; for(i=0;i<g_latin_tex_n;i++) if(g_latin_tex[i]==s->texture_offset) break;
+      if(i==g_latin_tex_n&&g_latin_tex_n<16){ g_latin_tex[g_latin_tex_n]=s->texture_offset;
+       g_latin_tex_quads[g_latin_tex_n]=0; g_latin_tex_n++; }
+      if(i<16) g_latin_tex_quads[i]+=quads;
+     }
+    }
+   }
+  }
+
   if(glyph_cap>0&&(int)glyph_lines<glyph_cap&&(s->texture_mask&1)
      &&vpq&&count>=vpq&&(count%vpq)==0&&(count/vpq)<=glyph_maxq
      &&(!glyph_tex||s->texture_offset==glyph_tex)
