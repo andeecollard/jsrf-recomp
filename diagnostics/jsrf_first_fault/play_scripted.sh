@@ -158,6 +158,9 @@ GAME_DIR="${JSRF_GAME_DIR:-$ROOT/../Jet Set Radio Future (US)}"
 
 rm -rf "$OUT" "$SCRATCH"; mkdir -p "$OUT" "$SCRATCH"
 cp -R "$STOCK" "$SCRATCH/hdd"
+# A replay that starts from a different save is not replaying the session
+# it recorded -- see jsrf_check_save_root in run_common.sh.
+jsrf_check_save_root "$SCRATCH/hdd"
 
 echo "schedule: $SCHED"
 echo "binary:   $BIN"

@@ -184,24 +184,11 @@ jsrf_hdd_manifest() {
         | xargs -0 openssl dgst -sha256 -r 2>/dev/null )
 }
 
-jsrf_stage_hdd() {
-    if [ ! -d "$JSRF_HDD_SRC" ]; then
-        echo "no emulated HDD at $JSRF_HDD_SRC" >&2
-        echo "  set JSRF_HDD_SRC to the directory holding it" >&2
-        exit 1
-    fi
-    cp -R "$JSRF_HDD_SRC" "$SCRATCH/hdd" || exit 1
-    [ -n "${JSRF_SKIP_HDD_MANIFEST:-}" ] && return 0
-
-    jsrf_hdd_manifest "$JSRF_HDD_SRC" > "$OUT/hdd-source.manifest"
-    jsrf_hdd_manifest "$SCRATCH/hdd"  > "$OUT/hdd-copy.manifest"
-    if ! cmp -s "$OUT/hdd-source.manifest" "$OUT/hdd-copy.manifest"; then
-        echo "REFUSING: the disposable HDD copy does not match its source" >&2
-        diff "$OUT/hdd-source.manifest" "$OUT/hdd-copy.manifest" | head -20 >&2
-        exit 3
-    fi
-    echo "hdd:    $(wc -l < "$OUT/hdd-source.manifest" | tr -d ' ') files, sha256 of manifest $(shasum -a 256 < "$OUT/hdd-source.manifest" | cut -c1-16)"
-
+# Shared by every harness script that stages an HDD. play_scripted.sh does its
+# own cp -R and never called jsrf_stage_hdd, so a check that lived only in
+# that function protected the scripts that needed it least.
+jsrf_check_save_root() {
+    _staged="$1"
     # THE STARTING SAVE STATE IS PART OF THE CONFIGURATION, and nothing checked
     # it. Measured 20 Sep 2026: emulated-hdd-warm was byte-identical to the
     # player's HDD in all six partition images and differed by exactly two
@@ -221,26 +208,47 @@ jsrf_stage_hdd() {
     _phdd="$HOME/Library/Application Support/JSRF/hdd"
     [ -d "$_phdd" ] || return 0
     # Same tree under two names is not a divergence.
-    [ "$(cd "$_phdd" && pwd -P)" = "$(cd "$JSRF_HDD_SRC" && pwd -P)" ] && return 0
+    [ "$(cd "$_phdd" && pwd -P)" = "$(cd "$_staged" && pwd -P)" ] && return 0
     # POSIX sh, sourced by #!/bin/sh scripts: no process substitution here.
     _save_paths() {
         ( cd "$1" 2>/dev/null && find TDATA UDATA TitleData UserData SystemData \
             2>/dev/null | LC_ALL=C sort ) > "$2"
     }
-    _save_paths "$_phdd"       "$SCRATCH/.save-paths-player"
-    _save_paths "$SCRATCH/hdd" "$SCRATCH/.save-paths-staged"
-    _pd=$(diff "$SCRATCH/.save-paths-player" "$SCRATCH/.save-paths-staged" 2>/dev/null)
-    rm -f "$SCRATCH/.save-paths-player" "$SCRATCH/.save-paths-staged"
+    _save_paths "$_phdd"       "${TMPDIR:-/tmp}/.jsrf-save-paths-player"
+    _save_paths "$_staged" "${TMPDIR:-/tmp}/.jsrf-save-paths-staged"
+    _pd=$(diff "${TMPDIR:-/tmp}/.jsrf-save-paths-player" "${TMPDIR:-/tmp}/.jsrf-save-paths-staged" 2>/dev/null)
+    rm -f "${TMPDIR:-/tmp}/.jsrf-save-paths-player" "${TMPDIR:-/tmp}/.jsrf-save-paths-staged"
     if [ -n "$_pd" ]; then
         echo "WARNING: this run's save root differs from the player's HDD" >&2
         echo "  player: $_phdd" >&2
-        echo "  staged: $JSRF_HDD_SRC" >&2
+        echo "  staged: $_staged" >&2
         printf '%s\n' "$_pd" | sed 's/^/    /' | head -20 >&2
         echo "  (< only the player has it, > only this run has it)" >&2
         echo "  A replay that starts from a different save is not replaying" >&2
         echo "  the session it recorded. JSRF_SKIP_HDD_PLAYER_CHECK=1 to silence." >&2
-        printf '%s\n' "$_pd" > "$OUT/hdd-player-divergence.txt"
+        printf '%s\n' "$_pd" > "${OUT:-${TMPDIR:-/tmp}}/hdd-player-divergence.txt"
     else
         echo "hdd:    save root matches the player's HDD"
     fi
+}
+
+jsrf_stage_hdd() {
+    if [ ! -d "$JSRF_HDD_SRC" ]; then
+        echo "no emulated HDD at $JSRF_HDD_SRC" >&2
+        echo "  set JSRF_HDD_SRC to the directory holding it" >&2
+        exit 1
+    fi
+    cp -R "$JSRF_HDD_SRC" "$SCRATCH/hdd" || exit 1
+    [ -n "${JSRF_SKIP_HDD_MANIFEST:-}" ] && return 0
+
+    jsrf_hdd_manifest "$JSRF_HDD_SRC" > "$OUT/hdd-source.manifest"
+    jsrf_hdd_manifest "$SCRATCH/hdd"  > "$OUT/hdd-copy.manifest"
+    if ! cmp -s "$OUT/hdd-source.manifest" "$OUT/hdd-copy.manifest"; then
+        echo "REFUSING: the disposable HDD copy does not match its source" >&2
+        diff "$OUT/hdd-source.manifest" "$OUT/hdd-copy.manifest" | head -20 >&2
+        exit 3
+    fi
+    echo "hdd:    $(wc -l < "$OUT/hdd-source.manifest" | tr -d ' ') files, sha256 of manifest $(shasum -a 256 < "$OUT/hdd-source.manifest" | cut -c1-16)"
+
+    jsrf_check_save_root "$SCRATCH/hdd"
 }
