@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "name": "watch-somebody-play",
+  "outcome": "review_required",
+  "claim": "Watches a session somebody else drives and records what the guest state did. Presses nothing, proves nothing about input, and holds until the debug window expires so the drive can be as long as it needs to be.",
+  "steps": [
+    {
+      "name": "gameplay-observed",
+      "kind": "wait",
+      "timeout": 600,
+      "expect": {
+        "sequence": [
+          30,
+          34
+        ],
+        "players": [
+          44
+        ]
+      },
+      "stable": 1
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+{
+  "schema": 1,
+  "name": "tutorial-corn-then-gum",
+  "outcome": "review_required",
+  "claim": "Boots, dismisses Corn's introduction to the first objective marker, walks player 44 to the other registered CPlayer, opens an interaction there with one RT and advances it to the second objective marker. Whether that player is Gum, and whether these are the tutorial's own objectives, are not established here.",
+  "steps": [
+    {
+      "name": "title-observed",
+      "kind": "wait",
+      "expect": {
+        "sequence": [
+          12
+        ]
+      },
+      "timeout": 60,
+      "stable": 2
+    },
+    {
+      "name": "leave-title",
+      "kind": "navigate",
+      "act_in": [
+        12
+      ],
+      "settle": 1,
+      "attempts": 4,
+      "timeout": 35,
+      "actions": [
+        {
+          "button": "START",
+          "after": 1.2
+        },
+        {
+          "button": "A",
+          "after": 2
+        }
+      ],
+      "expect": {
+        "sequence": [
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34
+        ]
+      }
+    },
+    {
+      "name": "load-selection",
+      "kind": "navigate",
+      "act_in": [
+        16
+      ],
+      "settle": 1,
+      "attempts": 3,
+      "timeout": 45,
+      "actions": [
+        {
+          "button": "A",
+          "after": 2
+        }
+      ],
+      "expect": {
+        "sequence": [
+          30,
+          34
+        ],
+        "players": [
+          44,
+          45
+        ]
+      }
+    },
+    {
+      "name": "corn-introduction",
+      "kind": "talk",
+      "timeout": 20,
+      "seconds": 60,
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "players": [
+          44
+        ]
+      },
+      "field": "manager.progress_7930",
+      "equals": 1,
+      "count": 14,
+      "accept": [
+        "reached"
+      ]
+    },
+    {
+      "name": "walk-to-the-other-player",
+      "kind": "goto",
+      "timeout": 10,
+      "seconds": 90,
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "players": [
+          44,
+          45
+        ],
+        "fields": {
+          "players.44.state": 1
+        }
+      },
+      "target_player": 45,
+      "tolerance": 25,
+      "accept": [
+        "arrived",
+        "scene_changed"
+      ]
+    },
+    {
+      "name": "greet-the-other-player",
+      "kind": "talk",
+      "timeout": 10,
+      "seconds": 30,
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "players": [
+          44,
+          45
+        ]
+      },
+      "opener": "RT",
+      "button": "A",
+      "field": "players.44.state",
+      "equals": 2,
+      "count": 4,
+      "accept": [
+        "reached"
+      ]
+    },
+    {
+      "name": "advance-that-dialogue",
+      "kind": "talk",
+      "timeout": 10,
+      "seconds": 60,
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "players": [
+          44
+        ]
+      },
+      "button": "A",
+      "field": "manager.progress_7930",
+      "equals": 2,
+      "count": 20,
+      "accept": [
+        "reached"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,153 @@
+{
+  "schema": 1,
+  "name": "corn-introduction-and-movement-smoke",
+  "outcome": "passed",
+  "claim": "Corn introduction dismissed, progress markers 1/2 observed, and same-player movement exceeded the neutral baseline. Does not certify tutorial completion, movement speed, rendering or audio correctness.",
+  "steps": [
+    {
+      "name": "title-observed",
+      "kind": "wait",
+      "expect": {
+        "sequence": [
+          12
+        ]
+      },
+      "timeout": 60,
+      "stable": 2
+    },
+    {
+      "name": "leave-title",
+      "kind": "navigate",
+      "act_in": [
+        12
+      ],
+      "settle": 1,
+      "attempts": 4,
+      "timeout": 35,
+      "actions": [
+        {
+          "button": "START",
+          "after": 1.2
+        },
+        {
+          "button": "A",
+          "after": 2
+        }
+      ],
+      "expect": {
+        "sequence": [
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34
+        ]
+      }
+    },
+    {
+      "name": "load-selection",
+      "kind": "navigate",
+      "act_in": [
+        16
+      ],
+      "settle": 1,
+      "attempts": 3,
+      "timeout": 45,
+      "actions": [
+        {
+          "button": "A",
+          "after": 2
+        }
+      ],
+      "expect": {
+        "sequence": [
+          30,
+          34
+        ],
+        "players": [
+          44,
+          45
+        ]
+      }
+    },
+    {
+      "name": "corn-dialogue-observed",
+      "kind": "wait",
+      "timeout": 10,
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "text_contains": "This is the GG's Garage."
+      }
+    },
+    {
+      "name": "corn-introduction-dismissed",
+      "kind": "navigate",
+      "timeout": 35,
+      "act_in": [
+        30
+      ],
+      "act_when": {
+        "sequence": [
+          30
+        ],
+        "fields": {
+          "players.44.state": 23
+        }
+      },
+      "settle": 0.5,
+      "attempts": 10,
+      "actions": [
+        {
+          "button": "A",
+          "seconds": 0.6,
+          "after": 0.7
+        }
+      ],
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "players": [
+          44
+        ],
+        "fields": {
+          "manager.progress_7930": 1,
+          "manager.progress_7934": 2,
+          "players.44.state": 1
+        }
+      }
+    },
+    {
+      "name": "controlled-movement",
+      "kind": "motion",
+      "timeout": 8,
+      "seconds": 2,
+      "button": "LUP",
+      "player": 44,
+      "minimum_distance": 20,
+      "baseline_factor": 4,
+      "expect": {
+        "sequence": [
+          30
+        ],
+        "players": [
+          44
+        ],
+        "fields": {
+          "players.44.state": 1,
+          "manager.fatal": 0
+        }
+      }
+    }
+  ]
+}

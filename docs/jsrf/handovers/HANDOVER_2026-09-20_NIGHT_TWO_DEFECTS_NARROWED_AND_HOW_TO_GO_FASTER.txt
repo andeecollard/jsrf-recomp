@@ -1,0 +1,227 @@
+HANDOVER -- 20 September 2026, night
+TWO DEFECTS NARROWED, AND HOW TO GO FASTER NEXT TIME
+
+Read this first. It supersedes nothing; the two Markdown handovers of the same
+date carry the full evidence:
+
+  CLAUDE_HANDOVER_2026-09-20_G2_THE_STRING_IS_PERFECT_AND_THE_PAGES_ARE_FINE.md
+  CLAUDE_HANDOVER_2026-09-20_THE_AUDIO_DEFECT_HAS_A_SILENT_REPRODUCER.md
+  CLAUDE_HANDOVER_2026-09-20_THE_HARNESS_DRIVES_THE_GAME.md
+
+The player's verdict on the day was "little to no progress, in fact I think
+we've regressed", and for the first half they were right. What follows is
+written so the next session does not repeat it.
+
+
+====================================================================
+0. START HERE -- THE THREE COMMANDS THAT MOVE THINGS
+====================================================================
+
+All three are unattended, silent, and need no save and no recording.
+
+(a) TEXT, the pass-splitting trace. ~2 minutes. Highest value.
+
+    REC="$HOME/Library/Application Support/JSRF/padrec/jsrf-2026-09-20_195259-54912.padrec"
+    python3 diagnostics/jsrf_first_fault/stage_harness/run.py \
+      --scenario diagnostics/jsrf_first_fault/stage_harness/watch.json \
+      --binary <build>/jsrf_first_fault \
+      --game "$HOME/Library/Application Support/JSRF/game" \
+      --hdd "$HOME/jsrf-build/emulated-hdd-warm" \
+      --out /tmp/jsrf-text --observe \
+      --env SDL_AUDIODRIVER=no_such_driver --env RECOMP_FONT_TRACE=1 \
+      --env "RECOMP_PAD_SCRIPT=@$REC" --debug-seconds 600
+
+    That replay passes BOTH test strings in one run:
+       "Grind a rail!"                       -- no char >= 0x76 -- draws CORRECTLY
+       "Collect 10 Spray Cans ... B button"  -- has y and w     -- draws CORRUPT
+    Same font, same scene, same markup. Compare how each line is split into
+    passes: where the page-0 pass ends, where the page-1 pass starts, the order
+    they are submitted, and the cell index on each quad.
+
+(b) AUDIO, finish the bisect. ~4.5 minutes per arm, 5 arms left.
+
+    Five switches remain untested individually. One of them kills the music:
+       RECOMP_WILD_PTR  RECOMP_METAL_NO_DEPTH_SYNC  RECOMP_WILD_PTR_SELFTEST
+       RECOMP_METAL_FF  RECOMP_VSH_DP_ZERO
+    Force ONE to 0, keep the player's other sixteen, drive continuously for
+    200 s, count dropouts in the WAV at 50 ms resolution. Zero dropouts names
+    the switch. (RECOMP_NV2A_PMC_UPMIRROR cannot be tested this way -- see 3.)
+
+(c) Anything visual: the harness now renders on the PLAYER'S path by default.
+    Before today it did not, and every screenshot it ever produced was CPU
+    fixed-function while the player's bundle runs METAL_FF on the GPU.
+
+
+====================================================================
+1. THE TEXT DEFECT (G2) -- TRIGGER PROVEN, MECHANISM OPEN
+====================================================================
+
+PROVEN: the corruption is entirely ours. At the frame the player photographed,
+the guest's own string read:
+
+  $x314 $n$x308<8140>x5 $n$x120Collect 10 Spray Cans and perform a
+  $n$x128$c5Boost Dash$c1 with the $c5<8167>B button<8168>$c1!
+
+Drawn as "llect 10 Spra$ Cans and perform a / Boost Dash With the "B button" !".
+The string in memory is whole. Evidence in /tmp/jsrf-g2-evidence/.
+
+PROVEN: the trigger is the font page boundary at 0x76. A line containing v w x
+y or z draws wrong; a line without one draws perfectly, in the same font at the
+same scene with identical markup. The leading-character loss tracks it too, so
+"characters vanish from the start" and "glyphs are substituted" are ONE defect.
+
+REFUTED, with code measurements (RECOMP_FONT_TRACE=1, new, opt-in, read-only):
+  - "page 1 is never bound"        -- both pages are bound, interleaved 16:3
+  - "page-1 chars sample a CJK sheet" -- both Latin pages are 256x256, correct
+                                         format (08870E29 = log2 8/8, 7 mips),
+                                         and every font page hashes distinct
+                                         and stable content
+  - the 19 Sep size test could never have fired: a Latin page is 87,376 bytes
+    and a CJK sheet 349,520, not 65,536 and 262,144 -- the byte count includes
+    the mip chain
+
+ALSO REFUTED, and it was this session's own theory: that $c directives or
+Shift-JIS 0x81 sequences desynchronise the glyph walker. "Grind a rail!" has
+all of that markup and draws perfectly.
+
+SCOPE: the banner font is affected; the speech-bubble font is not. Corn's
+"where's" contains page-1 'w' and draws correctly on BOTH render paths.
+
+SO: a line needing both pages really is drawn in two passes, and the fault is
+in how those passes are split or ordered. That is measurement (a).
+
+
+====================================================================
+2. THE AUDIO DEFECT -- ONE OF SIX SWITCHES, AND THE SINK MATTERS
+====================================================================
+
+A silent, unattended reproducer now exists. Standing still, the music never
+dies. Driving, it always does. ~4.5 minutes a run, no sound leaves the machine:
+SDL_AUDIODRIVER=no_such_driver gives backend=none, while RECOMP_APU_WAV still
+captures the mix (apu_core.c:557 -- the tap "exists even when none is").
+
+FOURTEEN VALID RUNS, interleaved:
+  the player's 17 paths.conf switches   6 runs   6 died
+  bare runtime defaults                 3 runs   0 died
+  the 17 minus the 8 APU switches       2 runs   2 died, 3.5x WORSE (429, 470)
+  the 17 minus the 9 non-APU switches   2 runs   0 died
+  the 17 minus the 3 scheduling ones    1 run    died -- so not those three
+
+=> the culprit is one of: METAL_FF, METAL_NO_DEPTH_SYNC, NV2A_PMC_UPMIRROR,
+   VSH_DP_ZERO, WILD_PTR, WILD_PTR_SELFTEST.
+=> the APU eight are PROTECTIVE. Removing them quadrupled the defect.
+
+ELIMINATED with controls: engine stall (out_frames held 48,000 Hz THROUGH the
+dropouts), idle decay, ADX thread wedging, idle-trap rate (the arms with the
+MOST traps never break), voice leak.
+
+THE SINK MATTERS, and the silent runs understate the defect by an order of
+magnitude. With backend=none the dropouts are 0.05-2.45 s. In the player's live
+session with backend=SDL2 they are 17, 25, 21, 28 s, and from t=256 s the music
+stops for good. Every sink counter (gen_hz, starved, queued) is void under
+backend=none, so a device-side component cannot be ruled out by any silent run.
+
+NOTE FOR SCORING: first_dropout scatters 27-159 s. Only the PRESENCE of
+dropouts discriminates. A later death is not an improvement.
+
+
+====================================================================
+3. LOAD-BEARING SWITCHES CANNOT BE TESTED BY SUBTRACTION
+====================================================================
+
+RECOMP_NV2A_PMC_UPMIRROR=0 gives a BLACK SCREEN with flips free-running at
+~600 fps. The player saw it and reported it before the guard existed. It is
+the switch that closes the PCRTC_INTR_0-on-every-vblank window (CLAUDE.md).
+
+So if the other five all still die, UPMIRROR is implicated BY ELIMINATION, and
+the fix is not "turn it off" -- it is whatever the mirror does to the MCPX
+guard. CLAUDE.md already records that class of fault swallowing every VOICE_ON.
+
+
+====================================================================
+4. VOID ARMS: THREE WAYS A SWEEP SCORED A RUN THAT NEVER RAN
+====================================================================
+
+Each was caught by a cross-check, never by the number looking wrong. Any batch
+harness must reject all three:
+
+  1. SCENARIO FAILED. run.py now serves the debugger window after a FAILED
+     step -- right for debugging, wrong for a batch, because waiting for
+     "DEBUG READY" stopped proving the scenario passed. One arm reached the
+     window having never left the title and scored 0 dropouts off an empty WAV.
+     Read result.json's outcome.
+  2. A BACKEND WAS OPENED. Check the log says backend=none before trusting a
+     silent arm.
+  3. PRESENTATION BROKEN. Anything above 100 fps is not pacing on vblank.
+
+Of 14 scored arms, 13 were valid; the audit is in the audio handover.
+
+
+====================================================================
+5. WHAT THE HARNESS CAN DO NOW (diagnostics/jsrf_first_fault/stage_harness)
+====================================================================
+
+  - Boots to the Garage in ~50 s, unattended: no save, no recording, no frame
+    numbers. State-keyed, so the boot lottery costs a retry and not a run.
+  - ADOPTS THE PLAYER'S paths.conf SWITCHES (17 of them) by play_scripted.sh's
+    own rule. This was the bug that mattered most: before today every picture
+    this harness produced was on the CPU fixed-function path. --bare opts out.
+  - OBSERVE MODE (--observe): the bridge steps aside, a real controller or a
+    replay drives, and the observer records world positions at 20 Hz plus every
+    objective transition. This is how a route gets made.
+  - route.py turns an observed drive into waypoints. The player's 20 Sep
+    session is 200 waypoints in /tmp/jsrf-tutorial-route.json. Coordinates are
+    game data, so a route survives a regeneration that retires a recording.
+  - goto / talk scenario steps; enumerates every CPlayer rather than the two
+    the Garage starts with (Gum is id 46, 570 units away, outside).
+  - Reads the guest's own dialogue string at 2 Hz -- the +0x54 node is the span
+    CURRENTLY being typed -- and captures a frame under the same command id.
+    That pairing is what settled G2's central question.
+
+LIMITS, stated so nobody rediscovers them: navigation is line-of-sight with a
+wall-follow escape and NO pathfinding; it reaches ~11 units at best and cannot
+cross the level. Two boots are never comparable. There is NO save on either
+HDD -- SaveMeta.xbx is 0 bytes -- so every session starts at Corn.
+
+
+====================================================================
+6. NEW SWITCHES ADDED TODAY (both opt-in, read-only)
+====================================================================
+
+  RECOMP_FONT_TRACE=1     per draw, for every square DXT3 texture of 256 or
+                          512: size, resolved address, vertex count, the raw
+                          SET_TEXTURE_FORMAT / IMAGE_RECT / OFFSET methods,
+                          mip level count, and an FNV hash of level 0.
+
+  RECOMP_PB_DRAW_ARRAYS=0 restores the pre-merge behaviour of NV097_DRAW_ARRAYS,
+                          which arrived with the v0.11.0 merge (be74a7c, 13:53
+                          on 20 Sep) and changed what gets drawn. JSRF DOES
+                          submit the method -- the banner says so once per run.
+                          Measured: no difference in batch counts (157,897 on
+                          against 160,295 off), so it is not the bridge/fence
+                          regression, but the switch is there to re-test.
+
+
+====================================================================
+7. WHY THE DAY WAS SLOW -- READ THIS BEFORE STARTING
+====================================================================
+
+  - HOURS WENT INTO A NAVIGATION CONTROLLER THAT PRODUCED NOTHING. Steering,
+    wall-following, waypoint routes. The player stopped it twice. If the task
+    is "get further", take the shortest route that gets further; if an
+    experiment needs more than about two rounds of tuning, it is the wrong
+    experiment.
+  - FOUR CONTROLLER ARMS WERE TUNED ACROSS SEPARATE BOOTS before anyone
+    noticed two boots are not comparable. Everything after that was tuned
+    within one boot.
+  - RUNS WERE LONGER THAN THE EFFECT NEEDED. The dropout outcome is binary
+    with no overlap -- clean arms score exactly 0, failing arms 69 to 470 --
+    and the latest onset ever seen is 158.7 s. 200 s and n=1 classify an arm;
+    spend replication on the final answer only. That took a round from 30
+    minutes to 14.
+  - TWO MEASUREMENTS WERE READ AT THE WRONG RESOLUTION OR AGAINST THE WRONG
+    CLOCK. One-second buckets invented a 19-second period that vanished at
+    50 ms. A driver's own timeout produced 42 s of silence that looked exactly
+    like the defect until the position trace was laid beside the audio.
+  - PREDICTIONS WERE WRITTEN DOWN BEFORE THEIR RUNS, and two were wrong. That
+    is the only reason they cost one run each instead of an evening.

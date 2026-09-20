@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "name": "startup-to-tutorial-candidate",
+  "outcome": "review_required",
+  "claim": "Mission/tutorial sequence reached with two validated CPlayer objects. Tutorial identity and input-driven movement require verification; this is not a completed tutorial or determinism pass.",
+  "steps": [
+    {"name": "title-observed", "kind": "wait", "expect": {"sequence": [12]}, "timeout": 60, "stable": 2},
+    {"name": "leave-title", "kind": "navigate", "act_in": [12], "settle": 1, "attempts": 4, "timeout": 35,
+     "actions": [{"button": "START", "after": 1.2}, {"button": "A", "after": 2}],
+     "expect": {"sequence": [13, 14, 15, 16, 17, 18, 19, 28, 29, 30, 32, 33, 34]}},
+    {"name": "load-selection", "kind": "navigate", "act_in": [16], "settle": 1, "attempts": 3, "timeout": 45,
+     "actions": [{"button": "A", "after": 2}], "expect": {"sequence": [30, 34], "players": [44, 45]}}
+  ]
+}
