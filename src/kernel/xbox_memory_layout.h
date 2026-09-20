@@ -244,6 +244,10 @@ void xbox_ProtectMirrorsForDebug(void);
  * does nothing unless that variable is set. */
 void xbox_WatchdogStart(void);
 
+/* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
+ * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
+void xbox_PeekSample(const char *label);
+
 /* ================================================================
  * Xbox stack for recompiled code
  * ================================================================ */
@@ -414,17 +418,6 @@ typedef union RecompXmm {
                              + XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
 
 /** Base VA of the stack area (above last XBE section). */
-/* Where the fake TIB lives -- the linear address fs: is based at.
- *
- * Deliberately not 0. The TIB used to sit on page zero, because the lifter
- * dropped the fs prefix and fs:[N] became linear [N]. That made a null
- * dereference read or write the TIB instead of faulting: a null check of the
- * form `cmp byte [ecx], 0` saw the exception-chain head's 0xFF and passed, and
- * a store through a null pointer quietly overwrote that head. Both then
- * surfaced somewhere else entirely. With the TIB up here, page zero is left
- * unmapped and either mistake faults where it happens.
- *
- * Sits below every XBE's image base (0x00010000), so it displaces nothing. */
 /* Base of the fixed low block: primary TLS data, the kernel data exports, the
  * TLS/PRCB stand-ins, and above them the stack and then the heap arena.
  *
@@ -442,7 +435,41 @@ typedef union RecompXmm {
 #define XBOX_LOW_BASE_DEFAULT 0x00700000u
 extern uint32_t g_xbox_low_base;
 
-#define XBOX_FS_BASE        0x00001000
+/* Where the fake TIB lives -- the linear address fs: is based at.
+ *
+ * Deliberately not 0. The TIB used to sit on page zero, because the lifter
+ * dropped the fs prefix and fs:[N] became linear [N]. That made a null
+ * dereference read or write the TIB instead of faulting: a null check of the
+ * form `cmp byte [ecx], 0` saw the exception-chain head's 0xFF and passed, and
+ * a store through a null pointer quietly overwrote that head. Both then
+ * surfaced somewhere else entirely. With the TIB up here, page zero is left
+ * unmapped and either mistake faults where it happens.
+ *
+ * Sits below every XBE's image base (0x00010000), so it displaces nothing.
+ *
+ * 0x4000 rather than 0x1000 because protection is applied at *host* page
+ * granularity. Apple Silicon pages are 16 KB, so RECOMP_TRAP_NULL asking to
+ * protect guest page zero actually covers guest 0..0x3FFF -- which reached a
+ * TIB at 0x1000 and killed the run, so the guard disabled itself on every
+ * such host and the diagnostic quietly did nothing. At 0x4000 the largest
+ * page any supported host uses fits below the TIB and the guard installs.
+ * Nothing else lives in the low 64 KB, and no guest code names the address:
+ * fs: resolves through g_fs_base.
+ *
+ * Per-thread, because a TIB is. It used to be one constant address for the
+ * whole process, which meant every guest thread shared one SEH chain head
+ * and -- through fs:[4] -- one CRT per-thread data block. Half-Life 2
+ * deadlocked on that: two threads in _lock() each holding the CRT lock the
+ * other wanted, because the bookkeeping that decides who owns what was
+ * shared between them.
+ *
+ * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
+ * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
+ * it. */
+#define XBOX_TIB_MAIN       0x00004000
+extern RECOMP_TLS uint32_t g_fs_base;
+#define XBOX_FS_BASE        g_fs_base
+
 
 #define XBOX_STACK_BASE     (g_xbox_low_base + 0x80000u)
 
@@ -452,7 +479,9 @@ extern uint32_t g_xbox_low_base;
 #define XBOX_THREAD_STACK_MIN  (64 * 1024)    /* floor for a stated size */
 
 /* Primary-thread storage used by the title's own Xbox TLS bootstrap. */
-#define XBOX_PRIMARY_TIB_VA          XBOX_FS_BASE
+/* The constant, not XBOX_FS_BASE: that is now g_fs_base itself, and
+ * g_fs_base is initialised from this. */
+#define XBOX_PRIMARY_TIB_VA          XBOX_TIB_MAIN
 #define XBOX_PRIMARY_TLS_CONTEXT_VA  (g_xbox_low_base + 0x60000u)
 #define XBOX_PRIMARY_TLS_DATA_VA     (g_xbox_low_base)
 

@@ -272,6 +272,83 @@ extern void nv2a_dma_resolve_stats(unsigned long long *scans,
 static int pb_env_on(const char *name, int *slot);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+
+/* Upstream carries three functions here -- surface_hits_image,
+ * surface_write_refused and dma_resolve -- which decide whether a surface
+ * offset is a guest VA or a physical address, and refuse a write that would
+ * land on the loaded image. They are not kept, because this tree answers both
+ * questions properly rather than by inference.
+ *
+ * dma_resolve guesses from the contiguous arena's high-water mark: below it,
+ * add XBOX_CONTIG_BASE; above it, hope. nv2a_dma_resolve does the real RAMHT
+ * lookup for the DMA object the method actually names, which is the base
+ * upstream's comment says it lacks ("getting the address right needs the DMA
+ * object base this ignores").
+ *
+ * The image guard is nv2a_range_hits_image, fed by nv2a_set_image_bounds from
+ * the XBE's own section extents (see xbox_MemoryLayoutInit). Same refusal,
+ * live, and already wired into the depth path.
+ *
+ * Restoring either of upstream's would reintroduce the heuristic beside the
+ * lookup that replaced it, so the two would disagree on the same surface. */
+
+/* NV097 methods this executor acts on. */
+#define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
+#define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
+#define NV097_SET_SURFACE_FORMAT          0x0208
+#define NV097_SET_SURFACE_PITCH           0x020C
+#define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
+#define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
+#define NV097_CLEAR_SURFACE               0x1D94
+#define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
+#define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
+#define NV097_SET_BEGIN_END               0x17FC
+#define NV097_SET_TEXTURE_OFFSET          0x1B00   /* +i*0x40 */
+#define NV097_SET_TEXTURE_FORMAT          0x1B04
+#define NV097_SET_TEXTURE_ADDRESS         0x1B08
+#define NV097_SET_TEXTURE_CONTROL1        0x1B10
+#define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
+/* The buffer flip. A title double-buffers by telling the GPU which buffer
+ * the CRTC reads and which it draws into, advancing the write index and
+ * then stalling until the flip has happened. Ignoring these means the
+ * stall never clears: Half-Life 2's loader submits its initialisation,
+ * asks for a flip, and waits for it in a loop that makes no kernel calls
+ * and burns no dispatch, which reads as a hang with no cause.
+ *
+ * ponytail: the flip completes the moment it is asked for, because there is
+ * no scanout to be in the middle of. That makes every frame land instantly
+ * and a title that paces itself on the flip runs as fast as it can draw.
+ * Pacing wants the vblank clock in the kernel, not a sleep in here. */
+#define NV097_SET_FLIP_READ               0x0120
+#define NV097_SET_FLIP_WRITE              0x0124
+#define NV097_SET_FLIP_MODULO             0x0128
+#define NV097_FLIP_INCREMENT_WRITE        0x012C
+#define NV097_FLIP_STALL                  0x0130
+#define NV097_ARRAY_ELEMENT16             0x1800
+/* Draw a run of vertices straight out of the arrays, with no index list:
+ * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
+ * appear several times inside one BEGIN_END to draw a longer run. */
+#define NV097_DRAW_ARRAYS                 0x1810
+#define NV097_INLINE_ARRAY                0x1818
+/* Immediate-mode vertices. SET_VERTEX3F/4F carry the position, and writing
+ * its last component completes a vertex using whatever the SET_VERTEX_DATA*
+ * registers currently hold for the other attributes. This is how Half-Life
+ * 2's Xbox loader and the game's own 2D drawing submit every quad -- neither
+ * uses INLINE_ARRAY -- so without these the executor saw SET_BEGIN_END pairs
+ * with nothing attached and reported `draws 0` while a million and a half
+ * textured quads a minute went past it. */
+#define NV097_SET_VERTEX3F                0x1500   /* +0..0x08, 3 floats */
+#define NV097_SET_VERTEX4F                0x1518   /* +0..0x0C, 4 floats */
+#define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
+#define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
+#define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  D3DCOLOR */
+
+/* One immediate vertex, as this file packs it for the shared draw path:
+ * position float4, diffuse D3DCOLOR, texcoord0 float2. */
+#define IMM_VERTEX_DWORDS 7
+
+#define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
 /* One vertex attribute stream, as the title describes it. Attribute 0 is
  * position; the rest are colours, texture coordinates and so on. */
@@ -5060,6 +5137,26 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
             ++s_gpu.inline_wanted;
         }
         break;
+
+    case NV097_DRAW_ARRAYS: {
+        /* The method this title actually draws with, and the reason the
+         * executor reported zero draws while geometry was being submitted the
+         * whole time: BEGIN_END arrived, END arrived, and in between came a
+         * run description rather than the index list the draw path wanted, so
+         * every batch ended with idx_count == 0 and was dropped in silence.
+         *
+         * Expanded into indices because that is what the rasteriser consumes,
+         * and an implicit run is just the indices start..start+count-1. */
+        uint32_t start = param & 0x00FFFFFFu;
+        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+        uint32_t i;
+
+        if (!s_gpu.prim)
+            break;
+        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+        break;
+    }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */

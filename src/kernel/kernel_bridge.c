@@ -1365,6 +1365,7 @@ static void bridge_HalReturnToFirmware(void)
         fflush(stderr);
     }
 
+    xbox_PeekSample("exit peek");
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
@@ -2299,10 +2300,12 @@ static void bridge_NtYieldExecution(void)
 static void bridge_MmGetPhysicalAddress(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Xbox uses identity mapping (physical == virtual) for the lower 64MB.
-     * Just return the Xbox VA as-is. Don't call xbox_MmGetPhysicalAddress
-     * which would return a native pointer. */
-    g_eax = addr;
+    /* Calls the same xbox_* the thunk table exposes, so there is one
+     * implementation rather than two that have to be kept in agreement.
+     * Note this bridge itself is not covered by any test: bridge functions
+     * are static and driven by guest CPU state, and nothing in tests/ can
+     * reach them. */
+    g_eax = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)addr);
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -5113,6 +5116,31 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000008: g_eax = 6; break;          /* STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE */
     case 0xC0000017: g_eax = 8; break;          /* STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY */
     case 0xC000000D: g_eax = 87; break;         /* STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER */
+    /* The informational and warning codes, which are not failures and must
+     * not fall through to the generic answer.
+     *
+     * 317 is ERROR_MR_MID_NOT_FOUND -- "there is no message text for this
+     * number" -- and as a default for a status nobody has mapped yet it is
+     * honest. As an answer to "is this request still in flight?" it is not:
+     * a caller comparing against ERROR_IO_PENDING gets "no" and takes the
+     * branch for a request that never started.
+     *
+     * Shin Megami Tensei: Nine does exactly that. Its resource loader issues
+     * a read, sees the call fail, asks for the error, and marks the object as
+     * loading only when the answer is ERROR_IO_PENDING. With 317 the object
+     * stayed idle, the poll that finishes the load returned "not started" on
+     * every frame, and the title sat in its first boot state forever with
+     * everything else working. */
+    case 0x00000103: g_eax = 997; break;        /* STATUS_PENDING → ERROR_IO_PENDING */
+    case 0x00000102: g_eax = 1460; break;       /* STATUS_TIMEOUT → ERROR_TIMEOUT */
+    case 0x00000104: g_eax = 0; break;          /* STATUS_REPARSE → ERROR_SUCCESS */
+    case 0x80000005: g_eax = 234; break;        /* STATUS_BUFFER_OVERFLOW → ERROR_MORE_DATA */
+    case 0x80000006: g_eax = 18; break;         /* STATUS_NO_MORE_FILES → ERROR_NO_MORE_FILES */
+    case 0xC0000011: g_eax = 38; break;         /* STATUS_END_OF_FILE → ERROR_HANDLE_EOF */
+    case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
+    case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
+    case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
+
     default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
     }
 }
@@ -5323,6 +5351,35 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     oa->Attributes    = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va+8) : 0;
 }
 
+/*
+ * The DVD drive as a device, not as a directory.
+ *
+ * A title that checks its media opens "\\Device\\CdRom0" itself -- the bare
+ * device, with nothing after it -- and then issues IOCTLs on the handle. The
+ * path table in kernel_path.c only carries the "\\Device\\CdRom0\\" form with
+ * the separator, which is the prefix for reading a *file* off the disc, so the
+ * bare open matched no rule, was reported as "Unrecognized Xbox path", and came
+ * back STATUS_OBJECT_PATH_NOT_FOUND. DDS9 reads that as "no disc" and exits
+ * through HalReturnToFirmware before it draws a frame.
+ *
+ * There is nothing on the host to open here: the game directory is a
+ * directory, and a directory handle would not answer the IOCTLs that follow.
+ * So the open returns a synthetic handle, in the same style as the ones
+ * NtCreateDirectoryObject and the partition devices already hand out. It is
+ * deliberately untagged, which bridge_resolve_handle passes through unchanged,
+ * and distinct so bridge_NtDeviceIoControlFile can recognise it by value.
+ *
+ * Accepts the "\??\" prefix, since titles reach the device both ways.
+ */
+#define BRIDGE_CDROM_HANDLE 0xDECD0001u
+
+static int bridge_is_cdrom_device(const char *path)
+{
+    if (!path) return 0;
+    if (_strnicmp(path, "\\??\\", 4) == 0) path += 4;
+    return _stricmp(path, "\\Device\\CdRom0") == 0;
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -5340,6 +5397,16 @@ static NTSTATUS bridge_create_file_impl(
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+
+    if (bridge_is_cdrom_device(name.Buffer)) {
+        fprintf(stderr, "  [FILE] %s -> synthetic DVD device handle\n",
+                name.Buffer);
+        if (handle_va)
+            BRIDGE_MEM32(handle_va) = BRIDGE_CDROM_HANDLE;
+        bridge_write_iostatus(iostatus_va, 0, 1 /* FILE_OPENED */);
+        return 0;
+    }
+
     memset(&ios, 0, sizeof(ios));
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
@@ -6337,19 +6404,116 @@ static void bridge_IoCreateFile(void)
  */
 static void bridge_NtDeviceIoControlFile(void)
 {
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    uint32_t ios_va = STACK_ARG(4);
-    uint32_t input_va = STACK_ARG(6);
-    uint32_t output_va = STACK_ARG(8);
-    XBOX_IO_STATUS_BLOCK ios;
+    uint32_t handle_id = STACK_ARG(0);
+    uint32_t ios_va    = STACK_ARG(4);
+    uint32_t ioctl     = STACK_ARG(5);
+    uint32_t out_va    = STACK_ARG(8);
+    uint32_t out_len   = STACK_ARG(9);
 
-    memset(&ios, 0, sizeof(ios));
-    g_eax = (uint32_t)xbox_NtDeviceIoControlFile(
-        handle, NULL, NULL, NULL, &ios, STACK_ARG(5),
-        input_va ? XBOX_TO_NATIVE(input_va) : NULL, STACK_ARG(7),
-        output_va ? XBOX_TO_NATIVE(output_va) : NULL, STACK_ARG(9));
-    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
-    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), ios_va);
+    /* IOCTLs aimed at the DVD device (see bridge_is_cdrom_device).
+     *
+     * These are the media check: the title asks the drive to confirm a disc is
+     * present and that it is the one it expects. There is no drive here and no
+     * disc to describe, so the honest answer is the one that lets the title
+     * proceed -- the alternative is STATUS_NOT_SUPPORTED, which it reads as a
+     * failed check and answers with HalReturnToFirmware.
+     *
+     * Reported rather than silent: which codes a title sends is the useful
+     * fact when the check still fails, and guessing at them from documentation
+     * is how this layer accumulates handlers for IOCTLs nothing ever sends. The
+     * output buffer is zeroed, so a title that reads a result field back sees a
+     * defined value instead of whatever was on its heap. */
+    if (handle_id == BRIDGE_CDROM_HANDLE) {
+        uint32_t in_va  = STACK_ARG(6);
+        uint32_t in_len = STACK_ARG(7);
+
+        /* The media check arrives as a SCSI pass-through, so the answer the
+         * title reads is not the IOCTL's output buffer -- that is NULL here,
+         * with length zero -- but the DataBuffer the request points at.
+         * Returning STATUS_SUCCESS alone leaves that buffer as the title
+         * zeroed it, which it reads as a failed check; DDS9 retries five
+         * times and then exits through HalReturnToFirmware.
+         *
+         * SCSI_PASS_THROUGH_DIRECT, 32-bit layout, 44 bytes:
+         *   0 Length(USHORT)  2 ScsiStatus  3 PathId  4 TargetId  5 Lun
+         *   6 CdbLength  7 SenseInfoLength  8 DataIn
+         *   12 DataTransferLength  16 TimeOutValue  20 DataBuffer
+         *   24 SenseInfoOffset  28 Cdb[16] */
+        if (in_va && in_len >= 44 && BRIDGE_MEM8(in_va + 28) == 0x5A) {
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t page     = BRIDGE_MEM8(in_va + 30) & 0x3F;
+
+            fprintf(stderr, "  [FILE] DVD MODE SENSE(10) page 0x%02X, "
+                            "%u bytes -> authentication page\n", page, data_len);
+
+            if (data_va && data_len) {
+                uint32_t i;
+                for (i = 0; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+
+                /* An 8-byte MODE SENSE(10) parameter header, then the page.
+                 * The three bytes that matter are named by the title's own
+                 * validation at guest 0x0021EA56-0x0021EA6D, which is the only
+                 * specification of this page there is: byte 11 must be exactly
+                 * 1, and bytes 10 and 12 must both be non-zero. Anything else
+                 * is read as "not the expected disc". */
+                if (data_len >= 2) {
+                    BRIDGE_MEM8(data_va + 0) = 0;
+                    BRIDGE_MEM8(data_va + 1) = 26;   /* mode data length */
+                }
+                if (data_len >= 10) {
+                    BRIDGE_MEM8(data_va + 8) = 0x3E; /* page code */
+                    BRIDGE_MEM8(data_va + 9) = 18;   /* page length */
+                }
+                if (data_len >= 13) {
+                    BRIDGE_MEM8(data_va + 10) = 1;   /* non-zero */
+                    BRIDGE_MEM8(data_va + 11) = 1;   /* exactly 1 */
+                    BRIDGE_MEM8(data_va + 12) = 1;   /* non-zero */
+                }
+            }
+
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
+        fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
+                        "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
+        if (out_va && out_len) {
+            uint32_t i;
+            for (i = 0; i < out_len; i++)
+                BRIDGE_MEM8(out_va + i) = 0;
+        }
+        bridge_write_iostatus(ios_va, 0, out_len);
+        g_eax = 0;
+        return;
+    }
+
+    /* Everything else belongs to the kernel implementation, which already
+     * owns the raw-disk geometry and partition queries AND Partition5's
+     * sparse-cache semantics -- upstream answers the first two here instead,
+     * and repeating them in the bridge would shadow the Partition5 case with
+     * a plain fixed-disk answer. The result marshals back through the common
+     * completion path so an asynchronous caller is signalled.
+     *
+     * The DVD branch above cannot come through here: BRIDGE_CDROM_HANDLE is a
+     * pseudo-handle with no host file behind it, so bridge_resolve_handle has
+     * nothing to hand to xbox_NtDeviceIoControlFile. */
+    {
+        HANDLE handle = bridge_resolve_handle(handle_id);
+        uint32_t input_va = STACK_ARG(6);
+        XBOX_IO_STATUS_BLOCK ios;
+
+        memset(&ios, 0, sizeof(ios));
+        g_eax = (uint32_t)xbox_NtDeviceIoControlFile(
+            handle, NULL, NULL, NULL, &ios, ioctl,
+            input_va ? XBOX_TO_NATIVE(input_va) : NULL, STACK_ARG(7),
+            out_va ? XBOX_TO_NATIVE(out_va) : NULL, out_len);
+        bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+        bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), ios_va);
+    }
 }
 
 /* ── NtFsControlFile (ordinal 200, 10 args = 40 bytes) ──── */

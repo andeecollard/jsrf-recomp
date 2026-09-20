@@ -42,6 +42,11 @@ REFERENCE = {
 SOURCE = r"""
 #include <stdint.h>
 #include <stdio.h>
+/* and/or/xor publish their result here next to the write, so the condition
+   reads what the instruction produced rather than a destination something
+   may have overwritten between the two. */
+static uint32_t _fa, _fb;
+static int32_t _fas, _fbs;
 int main(void) {
     static const uint32_t VS[] = {
         0u, 1u, 2u, 3u, 0xFFu, 0x100u, 0x8000u, 0xFFFFu, 0x10000u,
@@ -59,9 +64,8 @@ int main(void) {
                mistaken for the result. Generated code declares the pair --
                see the declaration gate in translator.py -- so mirror it. */
             uint32_t eax = VS[i] OP VS[j];
-            const uint32_t _fa = eax;
-            const int32_t _fas = (int32_t)eax;
-            (void)_fas;
+            /* ...and the condition reads the published result. */
+            _fa = eax; _fas = (int32_t)_fa;
             /* x86: and/or/xor clear CF and OF, and set ZF from the result. */
             const int cf = 0;
             const int zf = (eax == 0);
@@ -163,6 +167,9 @@ class LogicAboveBelowTest(unittest.TestCase):
 
         sub is CF-tracked, so it emits the full form. With CF = 0 -- which is
         what and/or/xor leave -- it reduces to what and/or/xor should emit.
+
+        Both spell the result `_fa`, the snapshot the setter published next
+        to its write, rather than re-reading the destination at the branch.
         """
         self.assertEqual(
             _make_condition("jbe", "sub", self.ops)[0], "(_cf || _fa == 0)")

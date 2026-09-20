@@ -34,6 +34,7 @@
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <math.h>
 
@@ -157,6 +158,30 @@ static void print_guest_context(void *rip)
     }
 }
 
+/* The emulated APU.
+ *
+ * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
+ * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
+ * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
+ * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
+ * APU's registers were unmapped to be trapped, and every trap was then
+ * declined and surfaced as an access violation on the first register
+ * DirectSound touched.
+ *
+ * Declared rather than included so this does not depend on src/apu being on
+ * the include path. */
+typedef struct MCPXAPUState MCPXAPUState;
+extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+extern MCPXAPUState *g_apu_state;
+extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                 uint32_t fault_xbox_va, int is_write);
+
+/* The trapped span, matching what MemoryLayoutInit unmaps: the APU's own
+ * 512 KB, not the whole MCPX aperture. AC'97 above it stays plain memory,
+ * which is what the codec-ready bit needs. */
+#define APU_TRAP_BASE 0xFE800000u
+#define APU_TRAP_END  0xFE880000u
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -171,6 +196,26 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          */
         if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
             return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        /* APU registers -> the emulated APU.
+         *
+         * The other half of RECOMP_AC97_READY: reporting the codec ready is
+         * what lets DirectSoundCreate past its first gate, and from there it
+         * drives the APU directly, so the registers have to fault to be seen.
+         * "Handled" means the access was decoded and the instruction stepped
+         * over, so execution resumes instead of unwinding. */
+        {
+            uint32_t xbox_va =
+                (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+
+            if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
+                    && apu_hook_handle_mmio(
+                           ep->ContextRecord, fault_addr, xbox_va,
+                           ep->ExceptionRecord->ExceptionInformation[0]
+                               ? 1 : 0)) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
@@ -262,6 +307,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+
+    /* Bring up the emulated APU.
+     *
+     * Gated on the same variable that unmaps its registers, because the two
+     * halves are useless apart: a trap with no model declines every access,
+     * and a model nothing traps into never sees a register. The APU walks
+     * Xbox physical RAM to find voice buffers, so it gets the guest RAM
+     * base. */
+    if (getenv("RECOMP_AC97_READY")) {
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+        fprintf(stderr, "[BOOT] emulated APU %s\n",
+                g_apu_state ? "up" : "FAILED to initialise");
+    }
 
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");

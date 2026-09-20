@@ -124,6 +124,16 @@ static HANDLE g_mapping_handle = NULL;
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 static uint32_t g_mirror_mask;
+
+/* The base view and its 28 mirrors occupy one contiguous span. Reserving that
+ * span up front is what makes the mirrors placeable at all: each one sits at
+ * base + N * 64 MB, and on a host that chose the base for us, those addresses
+ * run through whatever the loader already owns. Placing them one at a time
+ * means ~3 of 28 collide, and *which* three changes with ASLR. Claiming the
+ * whole range first, then carving views out of ground we hold, removes the
+ * question. */
+static void *g_span_base = NULL;
+static size_t g_span_size = 0;
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -298,8 +308,39 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 #define NV2A_USER_DMA_GET 0x800044u
 
 /*
- * Free-running counters in the MCPX aperture -- the fallback for a target that
- * has no APU model behind the aperture.
+ * The same channel's pointers on the PFIFO side of the aperture.
+ *
+ * The USER area above is the window software writes through; PFIFO holds the
+ * engine's own copy, and D3D reads it back on the path where the USER pointer
+ * is not usable. The title's channel context switch saves and restores all
+ * four of these as one block (DDS9 0x002FE2xx), which is what identifies them:
+ *
+ *   0x3240 CACHE1_DMA_PUT          0x3248 CACHE1_REF
+ *   0x3244 CACHE1_DMA_GET          0x324C CACHE1_DMA_SUBROUTINE
+ *
+ * DMA_SUBROUTINE matters because it is not a flag: bits 31:1 are the offset
+ * the engine returns to when a pushbuffer subroutine ends, and bit 0 says
+ * whether one is running. DDS9's free-space calculation (sub_002F6CC0) reads
+ * the USER GET first and falls back to this register's return offset when
+ * that lands outside the ring -- i.e. "the GPU is off in a subroutine, so ask
+ * where it will come back to". Zeroed RAM answers 0 to both, which is below
+ * the ring base, and the free-space subtraction then goes negative and is
+ * clamped to zero. The reserve wants 0x2000 bytes, gets 0, and spins.
+ *
+ * Not acknowledged here, only reported. DDS9 reads the USER pair and never
+ * reaches the fallback, so every value in this block is zero for the one
+ * title that was traced -- mirroring PUT to GET would be a guess dressed as
+ * a handshake. The watchdog prints them so the next title to spin here is
+ * diagnosed from data instead.
+ */
+#define NV2A_PFIFO_DMA_PUT        0x003240u
+#define NV2A_PFIFO_DMA_GET        0x003244u
+#define NV2A_PFIFO_REF            0x003248u
+#define NV2A_PFIFO_DMA_SUBROUTINE 0x00324Cu
+
+/*
+ * Free-running counters in the MCPX aperture -- the fallback for a target
+ * that has no APU model behind the aperture.
  *
  * Some hardware registers are clocks, not flags: software reads them and waits
  * until the value passes a target. Against zeroed RAM the value never moves and
@@ -3869,6 +3910,72 @@ static uint32_t *s_watchdog_esp;
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
 
+/* Can RECOMP_PEEK dereference this guest address?
+ *
+ * It used to accept only the first 64 MB, which reads as "RAM" but is not the
+ * question -- every window this file maps is mapped at va + g_memory_offset,
+ * so the register apertures are just as dereferenceable as RAM is. Rejecting
+ * them silently printed nothing for an address that was perfectly readable,
+ * and a hang spinning on a GPU register is exactly the case where the value
+ * that matters lives at 0xFD......  Peeking one is how the busy-wait in
+ * DDS9's pushbuffer reserve was pinned to a DMA pointer rather than a flag.
+ *
+ * Every window is checked against its own pointer, because they are mapped
+ * independently and any of them can be absent for this run. The 4 is the
+ * width of the read below: an address one or two bytes short of the end is
+ * inside the window and still faults. */
+static int peek_readable(uint32_t va)
+{
+    struct { const void *mapped; uint32_t base; uint64_t size; } win[] = {
+        { g_memory_base,   XBOX_BASE_ADDRESS, (uint64_t)g_memory_size },
+        { g_contig_memory, XBOX_CONTIG_BASE,  XBOX_CONTIG_SIZE },
+        { g_nv2a_memory,   XBOX_NV2A_BASE,    XBOX_NV2A_SIZE },
+        { g_mcpx_memory,   XBOX_MCPX_BASE,    XBOX_MCPX_SIZE },
+        { g_flash_memory,  XBOX_FLASH_BASE,   XBOX_FLASH_SIZE },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(win) / sizeof(win[0]); i++) {
+        if (!win[i].mapped || !win[i].size)
+            continue;
+        if (va >= win[i].base
+                && (uint64_t)va + 4 <= (uint64_t)win[i].base + win[i].size)
+            return 1;
+    }
+    return 0;
+}
+
+/* Print the RECOMP_PEEK globals. Shared, because the two moments worth
+ * sampling are a hang and an early exit, and only the first had it: a title
+ * whose main() returns during init never reaches the watchdog, so the one
+ * question that mattered -- which of its init calls failed -- was the one the
+ * tooling could not answer. Silent unless RECOMP_PEEK is set. */
+void xbox_PeekSample(const char *label)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    const char *spec = getenv("RECOMP_PEEK");
+    char buf[256], *q, *end;
+
+    if (!spec || !*spec || g_memory_base == NULL)
+        return;
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    fprintf(stderr, "  %s:", label ? label : "peek");
+    for (q = buf; *q; ) {
+        unsigned long va = strtoul(q, &end, 0);
+        if (end == q)
+            break;
+        if (peek_readable((uint32_t)va))
+            fprintf(stderr, " [%08lX]=%08X", va,
+                    *(const uint32_t *)(mem + va));
+        else
+            fprintf(stderr, " [%08lX]=??", va);
+        q = (*end == ',') ? end + 1 : end;
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
@@ -3911,24 +4018,30 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * makes no kernel calls is invisible to RECOMP_KERNEL_WATCH too. A pure
      * CPU loop polling a global is exactly the case neither of those covers.
      */
-    {
-        const char *spec = getenv("RECOMP_PEEK");
-        char buf[256], *q, *end;
-        if (spec && *spec) {
-            strncpy(buf, spec, sizeof buf - 1);
-            buf[sizeof buf - 1] = 0;
-            fprintf(stderr, "  peek:");
-            for (q = buf; *q; ) {
-                unsigned long va = strtoul(q, &end, 0);
-                if (end == q)
-                    break;
-                if (va >= XBOX_BASE_ADDRESS && va < XBOX_TOTAL_RAM)
-                    fprintf(stderr, " [%08lX]=%08X", va,
-                            *(const uint32_t *)(mem + va));
-                q = (*end == ',') ? end + 1 : end;
-            }
-            fprintf(stderr, "\n");
-        }
+    xbox_PeekSample("peek");
+    /* The pushbuffer pointers, unconditionally.
+     *
+     * "Extend the table as more handshakes turn up -- run the title and the
+     * watchdog sample will name the register" is only true if the sample
+     * actually shows them. It did not: a title spinning on a DMA pointer made
+     * no kernel calls and no indirect calls, so every other line the watchdog
+     * prints was identical between two samples taken 40 seconds apart, and the
+     * register that was stuck did not appear at all.
+     *
+     * Both sides of the channel, because which one the title consults is a
+     * property of its D3D and not of the hardware: Halo waits on the USER
+     * pair, DDS9 reads USER first and falls back to PFIFO's DMA_SUBROUTINE.
+     * Printing only the pair that some other title used is how this stayed
+     * invisible. */
+    if (g_nv2a_memory) {
+        const char *r = (const char *)g_nv2a_memory;
+#define WD_NV2A(off) (*(const volatile uint32_t *)(r + (off)))
+        fprintf(stderr, "  NV2A USER  PUT=%08X GET=%08X\n"
+                        "  NV2A PFIFO PUT=%08X GET=%08X REF=%08X SUBR=%08X\n",
+                WD_NV2A(NV2A_USER_DMA_PUT), WD_NV2A(NV2A_USER_DMA_GET),
+                WD_NV2A(NV2A_PFIFO_DMA_PUT), WD_NV2A(NV2A_PFIFO_DMA_GET),
+                WD_NV2A(NV2A_PFIFO_REF), WD_NV2A(NV2A_PFIFO_DMA_SUBROUTINE));
+#undef WD_NV2A
     }
 
     for (i = 0; i < 400 && esp; i++) {
@@ -4089,13 +4202,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        /* macOS portability: iterate ALL entries including the trailing 0 (NULL)
-         * sentinel. On macOS the low fixed addresses (0x10000..0x10000000) are
-         * reserved and MAP_FIXED fails for every one of them, so the run only
-         * succeeds via the final NULL hint (OS chooses a high address). The old
-         * condition `try_bases[i] != 0 || i == 0` stopped at the sentinel without
-         * trying it, which masked fine on Linux (low VA is mappable there). */
-        for (size_t i = 0; i < sizeof(try_bases) / sizeof(try_bases[0]); i++) {
+        /* Iterate the whole array, sentinel included. The old condition
+         * (try_bases[i] != 0 || i == 0) stopped *at* the zero rather than
+         * using it, so the "let the OS choose" fallback never ran: the loop
+         * tried the fixed addresses and gave up. Invisible on Windows, where
+         * one of the low bases succeeds -- fatal on arm64 macOS, where all of
+         * them sit inside the 4 GB __PAGEZERO segment and none can. */
+        /* Reserve base + mirrors as one range, and map the base at its head.
+         * VirtualFree releases just the slice about to be used, so each view
+         * replaces our own reservation rather than racing for free space. */
+        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (g_span_base) {
+            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+            g_memory_base = MapViewOfFileEx(g_mapping_handle,
+                                            FILE_MAP_ALL_ACCESS, 0, 0,
+                                            g_memory_size, g_span_base);
+            if (!g_memory_base) {
+                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+                g_span_base = NULL;
+                g_span_size = 0;
+            }
+        }
+
+        const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
+        for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
@@ -4160,9 +4291,38 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Best-effort: failing to protect it costs only the diagnostic. */
     if (XBOX_MAP_START == 0 && getenv("RECOMP_TRAP_NULL")) {
         DWORD old_protect;
-        if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect))
-            fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
-                            " (null dereferences fault)\n");
+        /* Protection is applied at host page granularity, and the host page
+         * is not always the guest's 4 KB -- Apple Silicon uses 16 KB, so this
+         * 0x1000 request actually covers guest 0..0x3FFF. That is why
+         * XBOX_TIB_MAIN sits at 0x4000: the widest page any supported host
+         * uses fits below the TIB, so the rounding costs nothing and the
+         * guard installs everywhere.
+         *
+         * The check below is what remains of an earlier bug rather than dead
+         * code. With the TIB at 0x1000 the rounding reached it, init wrote the
+         * TIB moments later, and every run that asked for the guard died at
+         * startup -- so the guard disabled itself on all of Apple Silicon and
+         * the diagnostic silently did nothing. It stays as a floor for a host
+         * with pages wider than the TIB offset, where skipping really is
+         * better than breaking the run. */
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        long host_page;
+        GetSystemInfo(&si);
+        host_page = (long)si.dwPageSize;
+#else
+        long host_page = sysconf(_SC_PAGESIZE);
+#endif
+        if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
+            fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
+                    "is %ld bytes, so trapping guest page zero would also trap "
+                    "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
+        } else {
+            if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect)) {
+                fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
+                                " (null dereferences fault)\n");
+            }
+        }
     }
 
     if (g_memory_offset == 0) {
@@ -4223,6 +4383,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
+        int sections_short = 0;
         size_t total_bytes = 0;
 
         if (num_sections > 64) num_sections = 64;  /* sanity cap */
@@ -4257,9 +4418,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Zero the full virtual size first (handles BSS) */
             memset(XBOX_VA(sec_va), 0, sec_vsize);
 
-            /* Copy initialized data from XBE */
-            if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
+            /*
+             * Copy initialized data from XBE.
+             *
+             * A section whose raw data runs past the end of the buffer is a
+             * truncated or corrupt image, not a BSS section, and it must not
+             * be counted among the sections loaded. Reporting it as loaded is
+             * how a 4MB title read through a 1MB buffer produced "Loaded
+             * 17/17 sections" with every byte of every section still zero --
+             * including the kernel thunk table, which then resolved 0 imports
+             * and looked like a title that calls no kernel functions.
+             */
+            int have_data = (copy_size == 0) ||
+                            (sec_raw_off + copy_size <= xbe_size);
+            if (copy_size > 0 && have_data) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
+            } else if (!have_data) {
+                fprintf(stderr,
+                        "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
+                        "the %zu-byte image -- left zeroed\n",
+                        si, sec_name, sec_raw_off, copy_size, xbe_size);
+                sections_short++;
             }
 
             /* The section actually holding instructions, as distinct from the
@@ -4292,8 +4471,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (sec_va + sec_vsize > g_xbox_image_hi)
                 g_xbox_image_hi = sec_va + sec_vsize;
 
-            sections_loaded++;
-            total_bytes += copy_size;
+            /* Only sections whose bytes actually arrived count as loaded --
+             * see the have_data note above. The image BOUNDS are set from the
+             * section headers either way: the low block has to clear the
+             * address range a short section still occupies. */
+            if (have_data) {
+                sections_loaded++;
+                total_bytes += copy_size;
+            }
 
             fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
                     si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
@@ -4302,6 +4487,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
+        if (sections_short) {
+            fprintf(stderr,
+                    "  ERROR: %d section(s) had no data in the image -- the XBE "
+                    "is truncated or was read short; the title will not run\n",
+                    sections_short);
+        }
 
         /* Tell the GPU model where the image is, so it can refuse to render
          * into it. See nv2a_range_hits_image. */
@@ -4767,6 +4958,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
+                /* Upstream arms a VEH here that unprotects the page,
+                 * single-steps the guest's store with the trap flag and
+                 * reprotects. This tree does not: that is the writable window
+                 * the memory model exists to avoid, and the trap flag is x86
+                 * only. The same page is guarded in the common arming path
+                 * beside PCRTC, OHCI and PGRAPH (see g_ac97_guarded), and the
+                 * store is completed in the handler instead. */
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
@@ -4914,6 +5112,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_CONTIG_BASE);
                 continue;
             }
+            /* Inside the reservation this hands back the slice we are about
+             * to use; outside it (no reservation) this is a no-op on an
+             * address we never held. */
+            if (g_span_base)
+                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -5277,12 +5480,42 @@ void xbox_MemoryLayoutShutdown(void)
         g_host_reservation_size = 0;
     }
 #endif
+    /* The apertures. Left mapped, a second init cannot place them: the first
+     * run still owns 0x80000000, 0xFD000000, 0xFE800000, 0xFF000000 and the
+     * tiled alias, and every one of those comes back as "failed" while init
+     * still returns TRUE because they are best-effort. The result is a layout
+     * that looks initialised and has no device apertures at all. */
+    if (g_tiled_view) {
+        UnmapViewOfFile(g_tiled_view);
+        g_tiled_view = NULL;
+    }
+    if (g_contig_memory) {
+        VirtualFree(g_contig_memory, 0, MEM_RELEASE);
+        g_contig_memory = NULL;
+    }
+    if (g_mcpx_memory) {
+        VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
+        g_mcpx_memory = NULL;
+    }
+    if (g_flash_memory) {
+        VirtualFree(g_flash_memory, 0, MEM_RELEASE);
+        g_flash_memory = NULL;
+    }
+
     /* Close file mapping handle */
     if (g_mapping_handle) {
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
     }
     reserve_reset();
+
+    /* Whatever is left of the base+mirrors reservation. The views carved out
+     * of it are already unmapped above; this releases the range itself. */
+    if (g_span_base) {
+        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+        g_span_base = NULL;
+        g_span_size = 0;
+    }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 

@@ -35,7 +35,12 @@ if(MSVC)
 endif()
 
 if(WIN32)
-    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm ole32 xaudio2_8)
+    # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
+    # It was missing: nothing had ever referenced this library from a linked
+    # target, so the archive was built and never pulled in, and the first
+    # target to actually call into the APU failed at link with an undefined
+    # XAudio2Create rather than at build time here.
+    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)

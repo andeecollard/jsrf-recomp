@@ -102,7 +102,6 @@ def _merge_predecessor_flag_states(states):
         # actually executed.
         return first
 
-    # A destination-writing join.  The destination is compared by the C
     # A MIX of cmp and test. Neither's ZF is reconstructable from _fa/_fb at
     # the join -- cmp writes (a == b), test writes ((a & b) == 0), and both use
     # the same pair -- so the lifter publishes ZF into _zf at each comparison
@@ -114,6 +113,7 @@ def _merge_predecessor_flag_states(states):
             and all(len(state[1]) >= 2 for state in states)):
         return (MERGED_ZF_PUBLISHED, [])
 
+    # A destination-writing join.  The destination is compared by the C
     # expression that reads it and by its width, so `and eax, m` and `inc eax`
     # merge while `and eax, m` and `inc ecx` do not.
     allowed = _RESULT_ZF_SF_SETTERS | {MERGED_RESULT_SETTER}
@@ -398,6 +398,20 @@ def xbe_title(xbe_data, xbe_path):
         pass
     return os.path.splitext(os.path.basename(xbe_path))[0]
 
+
+
+def _seh_prologs_of(lifter):
+    """Every __SEH_prolog address a lifter knows about, as a set.
+
+    Reads SEH_PROLOGS when present and falls back to the scalar SEH_PROLOG,
+    so a lifter stub that only sets the old attribute still works -- the test
+    suite builds exactly such a stub, and so may callers outside this repo.
+    """
+    prologs = getattr(lifter, "SEH_PROLOGS", None)
+    if prologs:
+        return set(prologs)
+    one = getattr(lifter, "SEH_PROLOG", None)
+    return {one} if one is not None else set()
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -849,7 +863,7 @@ class FunctionTranslator:
     @staticmethod
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
-        from .lifter import (FLAG_SETTERS, CF_TRACKED,
+        from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
                              _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
 
         last_setter = None
@@ -868,7 +882,9 @@ class FunctionTranslator:
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
-                    and (last_setter in CF_TRACKED or last_setter in ("inc", "dec"))):
+                    and (last_setter in CF_TRACKED
+                         or last_setter in ("inc", "dec")
+                         or last_setter in BT_MODIFY)):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -904,32 +920,24 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = _seh_prologs_of(self.lifter)
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
-    def translate_function(self, func_addr, func_info):
-        """
-        Translate a single function to C code.
-        Returns a string of C source code, or None on failure.
-        """
-        start = func_addr
+    def decode_function(self, start, end):
+        """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
-        end = recovered["end"] if recovered else func_info.get("end")
-        if not end:
-            end = start + func_info.get("size", 0)
+        if recovered:
+            end = recovered["end"]
         if end <= start:
-            return None
-
-        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
-        size = end - start
+            return [], []
 
         # Read bytes from XBE
         raw_bytes = self._read_func_bytes(start, end)
         if not raw_bytes:
-            return None
+            return [], []
 
         # Set function bounds for the lifter
         self.lifter.func_start = start
@@ -941,7 +949,7 @@ class FunctionTranslator:
         instructions = (recovered["instructions"] if recovered else
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
-            return None
+            return [], []
 
         # Memory-watch provenance is cheapest and most reliable as generated
         # constants. This boundary is already authoritative for the body being
@@ -999,6 +1007,24 @@ class FunctionTranslator:
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None)
+        return instructions, blocks
+
+    def translate_function(self, func_addr, func_info):
+        """
+        Translate a single function to C code.
+        Returns a string of C source code, or None on failure.
+        """
+        start = func_addr
+        recovered = self._recovered_cfg.get(start)
+        end = recovered["end"] if recovered else func_info.get("end")
+        if not end:
+            end = start + func_info.get("size", 0)
+        if end <= start:
+            return None
+
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
+        size = end - start
+        instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
 
@@ -1071,8 +1097,10 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = _seh_prologs_of(self.lifter)
+        epilog = getattr(self.lifter, "SEH_EPILOG", None)
+        if epilog is not None:
+            seh_funcs = seh_funcs | {epilog}
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
@@ -1298,7 +1326,7 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
-        label_addrs |= imm_refs
+        label_addrs |= self.lifter.imm_code_refs
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -1555,9 +1583,9 @@ class BatchTranslator:
         # Detect the SEH helpers once here rather than per-Lifter, so the
         # result can be reported and overridden from the command line.
         if seh_prolog is None or seh_epilog is None:
-            found_prolog, found_epilog = detect_seh_helpers(
+            found_prologs, found_epilog = detect_seh_helpers(
                 self.func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.seh_prolog = seh_prolog
         self.seh_epilog = seh_epilog

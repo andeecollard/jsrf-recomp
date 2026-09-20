@@ -130,8 +130,59 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         }
     }
 
-    /* Class requests. The Xbox pad answers a vendor-defined capabilities
-     * request on the interface; anything else is not ours to guess at. */
+    /* Vendor requests on the interface -- the XID protocol.
+     *
+     * This is how XAPI tells a controller from any other USB device. The
+     * standard descriptors say "interface class 0x58", which gets the device
+     * enumerated and no further: XAPI then asks for the XID descriptor to
+     * learn what kind of controller it is and how big its reports are, and a
+     * stall there means "not a controller", so the device is enumerated,
+     * configured, and then ignored. Which is exactly what it looked like --
+     * a clean enumeration and a title that still saw no gamepad.
+     */
+    if ((setup->bmRequestType & 0x60u) == 0x40u) {   /* vendor */
+        static const uint8_t xid_desc[16] = {
+            0x10,           /* bLength                                  */
+            0x42,           /* bDescriptorType: XID                     */
+            0x00, 0x01,     /* bcdXid 1.00                              */
+            0x01,           /* bType: gamepad                           */
+            0x02,           /* bSubType: gamepad S                      */
+            20,             /* bMaxInputReportSize                      */
+            6,              /* bMaxOutputReportSize                     */
+            0xFF, 0xFF, 0xFF, 0xFF,   /* wAlternateProductIds[0..1]     */
+            0xFF, 0xFF, 0xFF, 0xFF    /* wAlternateProductIds[2..3]     */
+        };
+        /* Capabilities are the report with every supported field set to all
+         * ones: the same layout, read as a mask. A gamepad S supports every
+         * field of both, so both are filled in apart from the id and length
+         * bytes, which are values rather than flags. */
+        static const uint8_t caps_in[20] = {
+            0x00, 20,
+            0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+        };
+        static const uint8_t caps_out[6] = {
+            0x00, 6, 0xFF, 0xFF, 0xFF, 0xFF
+        };
+
+        if (!is_in)
+            return 0;                     /* accept, nothing to send back */
+        if (setup->bRequest == REQ_GET_DESCRIPTOR
+                && (setup->wValue >> 8) == 0x42)
+            return copy_out(out, max, xid_desc, (int)sizeof xid_desc,
+                            setup->wLength);
+        if (setup->bRequest == 0x01) {    /* GET_CAPABILITIES */
+            if ((setup->wValue >> 8) == 0x01)
+                return copy_out(out, max, caps_in, (int)sizeof caps_in,
+                                setup->wLength);
+            if ((setup->wValue >> 8) == 0x02)
+                return copy_out(out, max, caps_out, (int)sizeof caps_out,
+                                setup->wLength);
+        }
+        return -1;
+    }
+
+    /* Class requests: not ours to guess at. */
     return -1;
 }
 

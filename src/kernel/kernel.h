@@ -36,13 +36,21 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes.  These generic names collide with fields in the Windows
- * SDK when the runtime is cross-compiled with MinGW; no runtime code uses the
- * names on Windows. */
-#if !defined(_WIN32)
-#define KernelMode  0
-#define UserMode    1
-#endif
+/* Processor modes.
+ *
+ * Enum constants, not #defines. "KernelMode" and "UserMode" are ordinary
+ * words, and the Windows SDK uses both as struct member names: WINBOOL
+ * KernelMode in <rpcasync.h>, and the KernelMode/UserMode bitfields of
+ * SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION in <winnt.h>. An
+ * object-like macro rewrites those declarations to "WINBOOL 0;" in any
+ * translation unit that reaches an SDK header after this one -- which is
+ * every kernel .c file under MinGW. Enum constants sit in the ordinary
+ * identifier namespace; struct members have their own, so the names coexist.
+ * The values are what they were. */
+enum {
+    KernelMode = 0,
+    UserMode   = 1
+};
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0

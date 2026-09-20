@@ -1,18 +1,18 @@
 {
  "gen": {
-  "generated_utc": "2026-09-19T11:45:46Z",
-  "git_head": "2bf7c1d",
-  "runtime_types_sha": "445170e778a1bf80",
-  "translator_sha": "c4400dbb0025f56d",
+  "generated_utc": "2026-09-20T12:52:08Z",
+  "git_head": "3b9d2fc",
+  "runtime_types_sha": "b96a2e9a7953bb50",
+  "translator_sha": "46bb115cdb053f4e",
   "xbe_sha": "bb2410618c35ccab"
  },
  "measures": {
   "cond_indirect": 0,
-  "coverage_bytes": 1613483,
-  "direct_call": 43170,
-  "direct_tail": 3578,
+  "coverage_bytes": 1613435,
+  "direct_call": 43163,
+  "direct_tail": 3574,
   "functions": 8846,
-  "goto": 65878,
+  "goto": 65873,
   "icall": 7418,
   "icall_static": 5,
   "icall_total": 7423,
@@ -32,7 +32,7 @@
   "switch_unresolved": 152,
   "switch_unresolved_tables": 62,
   "todo": 122,
-  "todo_silent": 122,
+  "todo_silent": 0,
   "unclassified_icall": 0,
   "unclassified_itail": 0,
   "unresolved_stubs": 168

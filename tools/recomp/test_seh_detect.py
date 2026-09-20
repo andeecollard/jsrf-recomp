@@ -38,6 +38,26 @@ SEH_PROLOG_BYTES = bytes.fromhex(
     "c3"                # ret
 )
 
+# Real bytes from Shin Megami Tensei: Nine, 0x00237DA4.
+#
+# The same helper, built with three pushes before the lea instead of four, so
+# the frame offset is 0x0C rather than 0x10. Requiring 0x10 made this form
+# undetectable, and detection returning None is indistinguishable from a CRT
+# that has no __SEH_prolog at all -- so nothing reported it. Every SEH function
+# in the title then kept its caller's stale ebp.
+SEH_PROLOG_3PUSH_BYTES = bytes.fromhex(
+    "6aff"              # push   -1
+    "50"                # push   eax
+    "64a100000000"      # mov    eax, fs:[0]
+    "50"                # push   eax
+    "8b44240c"          # mov    eax, [esp+0xc]
+    "64892500000000"    # mov    fs:[0], esp
+    "896c240c"          # mov    [esp+0xc], ebp
+    "8d6c240c"          # lea    ebp, [esp+0xc]
+    "50"                # push   eax
+    "c3"                # ret
+)
+
 # Real bytes from the same binary, 0x001DD601.
 SEH_EPILOG_BYTES = bytes.fromhex(
     "8b4df0"            # mov    ecx, [ebp-0x10]
@@ -93,10 +113,44 @@ def test_detects_both():
         e_va: _fn(e_va, len(SEH_EPILOG_BYTES)),
         d_va: _fn(d_va, len(DECOY_BYTES)),
     }
-    prolog, epilog = detect_seh_helpers(func_db, data)
-    assert prolog == p_va, hex(prolog or 0)
+    prologs, epilog = detect_seh_helpers(func_db, data)
+    assert prologs == (p_va,), [hex(a) for a in prologs]
     assert epilog == e_va, hex(epilog or 0)
     print("ok  detects_both")
+
+
+def test_detects_three_push_prolog_variant():
+    """The lea offset counts pushes, so 0x0C is as valid a prolog as 0x10."""
+    _layout()
+    p_va = BASE + 0x100
+    data = _image([(RAW + 0x100, SEH_PROLOG_3PUSH_BYTES)])
+    func_db = {p_va: _fn(p_va, len(SEH_PROLOG_3PUSH_BYTES))}
+    prologs, _ = detect_seh_helpers(func_db, data)
+    assert prologs == (p_va,), [hex(a) for a in prologs]
+    print("ok  detects_three_push_prolog_variant")
+
+
+def test_detects_both_prolog_variants_in_one_binary():
+    """A title can link more than one __SEH_prolog; all of them must be found.
+
+    Shin Megami Tensei: Nine carries both forms. Returning only the first match
+    meant whichever had the lower address won, and every function calling the
+    other silently lost its frame read-back -- which is worse than finding
+    neither, because it is invisible and half the title still works.
+    """
+    _layout()
+    a_va, b_va = BASE + 0x100, BASE + 0x200
+    data = _image([
+        (RAW + 0x100, SEH_PROLOG_3PUSH_BYTES),
+        (RAW + 0x200, SEH_PROLOG_BYTES),
+    ])
+    func_db = {
+        a_va: _fn(a_va, len(SEH_PROLOG_3PUSH_BYTES)),
+        b_va: _fn(b_va, len(SEH_PROLOG_BYTES)),
+    }
+    prologs, _ = detect_seh_helpers(func_db, data)
+    assert prologs == (a_va, b_va), [hex(a) for a in prologs]
+    print("ok  detects_both_prolog_variants_in_one_binary")
 
 
 def test_decoy_alone_is_not_a_prolog():
@@ -104,8 +158,8 @@ def test_decoy_alone_is_not_a_prolog():
     _layout()
     d_va = BASE + 0x300
     data = _image([(RAW + 0x300, DECOY_BYTES)])
-    prolog, epilog = detect_seh_helpers({d_va: _fn(d_va, len(DECOY_BYTES))}, data)
-    assert prolog is None
+    prologs, epilog = detect_seh_helpers({d_va: _fn(d_va, len(DECOY_BYTES))}, data)
+    assert prologs == ()
     assert epilog is None
     print("ok  decoy_alone_is_not_a_prolog")
 
@@ -113,8 +167,8 @@ def test_decoy_alone_is_not_a_prolog():
 def test_absent_helpers_are_not_an_error():
     """A title whose CRT does not use these must detect cleanly as None."""
     _layout()
-    prolog, epilog = detect_seh_helpers({}, b"")
-    assert prolog is None and epilog is None
+    prologs, epilog = detect_seh_helpers({}, b"")
+    assert prologs == () and epilog is None
     print("ok  absent_helpers_are_not_an_error")
 
 
@@ -126,8 +180,8 @@ def test_accepts_int_end_from_batch_translator():
     info = _fn(p_va, len(SEH_PROLOG_BYTES))
     info["end"] = p_va + len(SEH_PROLOG_BYTES)   # int, not hex string
     del info["size"]                             # force the end-based path
-    prolog, _ = detect_seh_helpers({p_va: info}, data)
-    assert prolog == p_va
+    prologs, _ = detect_seh_helpers({p_va: info}, data)
+    assert prologs == (p_va,)
     print("ok  accepts_int_end_from_batch_translator")
 
 
@@ -137,8 +191,8 @@ def test_oversized_match_is_rejected():
     va = BASE + 0x100
     padded = SEH_PROLOG_BYTES + b"\x90" * 400
     data = _image([(RAW + 0x100, padded)])
-    prolog, _ = detect_seh_helpers({va: _fn(va, len(padded))}, data)
-    assert prolog is None
+    prologs, _ = detect_seh_helpers({va: _fn(va, len(padded))}, data)
+    assert prologs == ()
     print("ok  oversized_match_is_rejected")
 
 
@@ -146,9 +200,9 @@ def test_unmapped_address_is_skipped():
     """va_to_file_offset returns None outside every section; not a crash."""
     _layout()
     data = _image([(RAW + 0x100, SEH_PROLOG_BYTES)])
-    prolog, epilog = detect_seh_helpers(
+    prologs, epilog = detect_seh_helpers(
         {0x7FFFFFFF: _fn(0x7FFFFFFF, len(SEH_PROLOG_BYTES))}, data)
-    assert prolog is None and epilog is None
+    assert prologs == () and epilog is None
     print("ok  unmapped_address_is_skipped")
 
 
@@ -157,12 +211,14 @@ def test_missing_xbe_data_is_skipped():
     _layout()
     p_va = BASE + 0x100
     func_db = {p_va: _fn(p_va, len(SEH_PROLOG_BYTES))}
-    assert detect_seh_helpers(func_db, None) == (None, None)
+    assert detect_seh_helpers(func_db, None) == ((), None)
     print("ok  missing_xbe_data_is_skipped")
 
 
 if __name__ == "__main__":
     test_detects_both()
+    test_detects_three_push_prolog_variant()
+    test_detects_both_prolog_variants_in_one_binary()
     test_decoy_alone_is_not_a_prolog()
     test_absent_helpers_are_not_an_error()
     test_accepts_int_end_from_batch_translator()

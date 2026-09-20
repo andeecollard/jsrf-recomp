@@ -201,6 +201,18 @@ nothing else finds them. It is now covered by `_pass_imm_ref_targets` and
 `_pass_data_ptr_targets`, which reached the same conclusion from the other
 direction.
 
+- **Deterministic x86 differential fuzzing (#62)** — seeded instruction
+  sequences and boundary-heavy inputs through the existing native-versus-lifted
+  runner, reproducible by seed and case index.
+- **`tools/doctor.py`, a bring-up report (#64)** — function recovery,
+  identification and ABI artifacts, translation statistics and runtime warnings
+  in one read-only pass, with ranked investigation priorities.
+- **A Media Foundation WMA-to-PCM backend (#65)** — with a synthetic CC0
+  fixture and an injected read-error case, so the failure path is tested rather
+  than assumed.
+- **An inventory of flat basic-block dispatch (#63)** — measures what a
+  byte-indexed x64 dispatch table would cost before anyone writes one.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it
@@ -340,6 +352,27 @@ direction.
   in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
   SDL2/epoxy) rather than a request, which is the useful kind of issue.
 
+- **The Xbox memory model on a POSIX host (#60)** — and five bugs found by
+  making it actually run. The sentinel bug: `for (i = 0; try_bases[i] != 0 || i
+  == 0; i++)` stopped *at* the zero rather than using it, so the "let the OS
+  choose" fallback never ran — invisible on Windows, fatal on arm64 macOS where
+  every fixed base sits inside `__PAGEZERO`. `MapViewOfFileEx` used bare
+  `MAP_FIXED`, which silently unmaps whatever occupies the range while Win32's
+  contract is to fail, so with an OS-chosen base the 28 mirrors landed straight
+  through the process's own libraries: the SIGSEGV was not a failed mapping but
+  a successful one on top of something live. `VirtualFree(ptr, 0, MEM_RELEASE)`
+  returned TRUE without unmapping. Shutdown released none of five regions. And
+  `MmGetPhysicalAddress` had two implementations that disagreed — the bridge
+  translated, the kernel returned its argument unchanged — so the answer a
+  title got depended on which dispatch path it took.
+- **Docker and macOS setup for the conformance suite (#59)** — two images,
+  because no single one does both halves on Apple Silicon: `link.exe` never
+  finishes under 32-bit emulation, and Rosetta cannot execute 32-bit x86 at
+  all. Build on amd64, execute on i386.
+- **`test_unmangled_names_are_rejected` asserted a fact about Windows (#61)** —
+  `onexit` is a Microsoft CRT name and free everywhere else, so the negative
+  control demanded a compile failure that could not happen off MSVC.
+
 ### GTTeancum — [@GTTeancum](https://github.com/GTTeancum)
 Fourteen fixes in two days, found by driving a real title through the pipeline
 and chasing each wrong answer back to its cause. Every one arrived with a
@@ -464,6 +497,140 @@ real thunk through synthetic guest memory, so they need no game files.
   feeds the identical harness the pre-fix expression and requires it to fail, on
   the grounds that a sweep which passes against both spellings is testing
   nothing.
+
+- **Rotates ran at 32 bits whatever the operand was (#69)** — every narrow read
+  in the lifter arrives zero-extended, so a byte rotate happened inside a
+  32-bit word: the bits that should wrap at bit 7 landed in bits 31..8 and the
+  store discarded them. `ror al, 2` on 0x01 gave 0x00 where x86 gives 0x40, and
+  `rol al, 16` — the identity, since the count is masked to five bits and
+  *then* reduced modulo the width — gave zero. Same defect class as the `sar`
+  width bug next to it, which was found while the rotates beside it were
+  missed. Also fixed `ROL32(val, 0)`, which evaluated `val >> 32`.
+- **`bts`/`btr`/`btc` reported the bit they left, not the bit they found
+  (#70)** — all four bit-test instructions copy the tested bit into CF, but
+  only `bt` leaves it alone. The carry condition was rebuilt at the consumer by
+  reading the bit a second time, which for the other three reads back what the
+  instruction had just written: `jb` after `bts` was always taken, after `btr`
+  never, after `btc` exactly backwards. That is the test-and-set idiom — *did
+  I claim this, or was it already taken?* — reading its own answer. MSVC emits
+  it for lock acquisition and for the character-map loops behind
+  `strpbrk`/`strspn`/`strcspn`.
+- **SF after a compare was computed with signed overflow (#71)** — `js` came
+  out as `(int32_t)(_fas - _fbs) < 0`, and that subtraction overflows for
+  exactly the inputs the sign flag is being asked about. `cmp 0x80000000, 1`
+  leaves 0x7FFFFFFF on the hardware so SF is 0; in C it is `INT_MIN - 1`, and
+  from -O1 the compiler folds `a - b < 0` into `a < b` and answers 1. The
+  emitted program's meaning changed with the optimisation level. Subtracting
+  unsigned at the operand's own width and taking the top bit is SF exactly,
+  with no undefined case.
+- **`popfd` was in the set of instructions that preserve EFLAGS (#72)** — next
+  to `pushfd`, which belongs there. `popfd` replaces every flag, so `cmp eax,
+  ebx; popfd; je` resolved the branch from the comparison the restore existed
+  to discard. The file already knew: the `neg`/`sbb` peephole four hundred
+  lines away carries an explicit `!= "popfd"` guard that the main tracking loop
+  never got.
+- **`shld`/`shrd` ignored x86's count rules, and a zero count wrote (#75)** —
+  the count is masked to five bits and a masked count of zero must leave the
+  destination alone. The emitted expression built `src >> (32 - cnt)`, so a
+  count of zero shifted by the full width: undefined in C, and where the host
+  reduces the shift amount modulo the width it returns `src` whole, landing
+  `dst | src` for an instruction that must not write at all. `_lift_shift`
+  states the rule for `shl`/`shr`/`sar` next door; the double-precision pair
+  never got it.
+- **`movsd` is two instructions and the dispatcher picked by name (#76)** —
+  the string `MOVSD` copies a dword `[esi]` to `es:[edi]`; the SSE2 one moves a
+  scalar double in or out of an xmm register. The string branch runs first and
+  matched on the mnemonic, so `movsd xmm0, qword ptr [eax]` walked `esi` and
+  `edi` and touched neither operand the instruction names. Silent: a load that
+  never happens and a register that keeps its old value.
+- **The result-setter family rebuilt its condition at the consumer (#77)** —
+  `and`/`or`/`xor`, `add`/`sub`, `adc`/`sbb`, `neg` and the shifts all write
+  their destination, and the jcc reading their flags can be blocks later, so
+  `and eax, 0x0F; mov eax, 0x99; jne` asked about 0x99. `inc`/`dec` already
+  published `_fa` at the write for exactly this reason — two instructions out
+  of fourteen — and this extends that rule to the rest.
+
+All seven found by differential fuzzing against an independent x86 core, and
+every one paired with the negative control described above.
+
+### fearkov — [@fearkov](https://github.com/fearkov)
+A bring-up batch on *Shin Megami Tensei: Nine* and DDS9, each item a place
+where the runtime stopped one step short of something a title needed and said
+nothing about it.
+
+- **`RtlNtStatusToDosError` answered 317 for every status it did not know
+  (#80)** — 317 is `ERROR_MR_MID_NOT_FOUND`, an honest default for an unmapped
+  failure and the wrong answer entirely for a status that is not one. A
+  resource loader that starts an asynchronous read and marks the object as
+  loading only on `ERROR_IO_PENDING` never marked it, so the poll that finishes
+  the load reported "not started" on every frame and the title sat in its first
+  boot state forever with input, audio and rendering all working.
+- **`NV097_DRAW_ARRAYS` was not handled by the pushbuffer executor (#81)** —
+  and the gap is silent: `BEGIN_END` arrives, `END` arrives, and in between
+  comes a run description rather than the index list the draw path wants, so
+  every batch is dropped with `idx_count == 0` and the report says `draws 0`. A
+  title submitting geometry every frame looked exactly like one submitting
+  none. Decoding the run into indices turns the same seconds of the same title
+  into 30,541 draws — checked against the pixel count rather than asserted.
+- **The AC'97 channel reset had to complete on the write (#82)** — MSVC
+  hoisted the load out of the wait loop, so the title reads the control
+  register exactly once, a few instructions after writing it, and spins forever
+  on that one value. A thread clearing the bit afterwards is racing a window a
+  few instructions wide and loses. Trapping the write instead — read-only page,
+  single-step, mask RR out — is the only version that is there in time.
+- **The watchdog could not read the registers a title hangs on (#83)** — the
+  peek accepted only addresses below 64 MB, which reads as "RAM" but is not the
+  question: every aperture this runtime maps is just as dereferenceable.
+  Peeking `0xFD800044` printed nothing at all, not a value and not an error —
+  so the design note saying *"run the title and the watchdog sample will name
+  the register"* was not true for the case it was written for.
+- **The emulated APU was unreachable (#84)** — `src/apu/` is a working ~2,500
+  line extraction of xemu's MCPX APU that nothing in the tree could call.
+  `apu_hook_handle_mmio` sits under a comment reading *"called from VEH in
+  main.c"* and no `main.c` called it; `g_apu_state` was never assigned; and
+  `xbox_apu` never linked `xaudio2_8`, which stayed invisible for as long as
+  nothing referenced the archive. Three independent gaps, each sufficient
+  alone.
+- **USB enumeration stopped one step short (#85)** — six faults, each fatal on
+  its own. A driver starting a fresh reset writes `SetPortReset` and
+  `ClearPortResetStatusChange` in the same word, and the write-1-to-clear line
+  ran *after* the handler set PRSC and wiped the bit that write had just
+  raised, so the port reset forever while looking connected, enabled and
+  powered the whole time. Plus: descriptors live in the contiguous window that
+  the bounds check rejected, no frame clock, a control data stage that
+  restarted every descriptor, only the control list walked, and a done queue
+  never retired.
+- **The DVD device open and the media check behind it (#74)** — a title
+  checking its media opens `\Device\CdRom0` itself, the bare device, and the
+  path table carried only the form with the trailing separator. The open
+  failed, the title read that as "no disc" and exited through
+  `HalReturnToFirmware` before drawing a frame.
+- **Cross-compiling the runtime with MinGW (#73)** — two macro collisions, 51
+  errors. `KernelMode`/`UserMode` are ordinary words that the Windows SDK uses
+  as struct member names, so object-like macros rewrote those declarations to
+  `WINBOOL 0;`; enum constants coexist with them. And the `__debugbreak` guard
+  tested `_MSC_VER` where it needed `_WIN32`, since MinGW is neither and
+  declares a real one.
+- **A loop head lost its exit test because the back edge had no state yet
+  (#86)** — blocks are lifted in address order, so the predecessor on a back
+  edge sits *after* the block it reaches and has no out-state on a single pass.
+  The join correctly refuses to guess, the `jcc` at the top falls back to
+  `_flags` — a variable nothing ever assigns — and the branch compiles as never
+  taken. In the middle of a function that costs a little accuracy; at the top
+  of a counted loop it removes the loop's only exit. In DDS9's XMV row padding
+  the loop stored eight bytes and advanced `edi` by sixteen forever, walked off
+  the framebuffer, and took the process with it. Settling the state to a fixed
+  point before emitting fixes it; `sub eax, ecx` and `dec eax` are different
+  setters that agree on the one thing a `jz` is asking.
+- **`__SEH_prolog` detection required the four-push form (#87)** — the second
+  byte marker is `lea ebp, [esp+0x10]`, and that offset counts the slots the
+  helper pushed before it: the three-push form lands on `0x0C` and was
+  undetectable. Silent, because "not found" is indistinguishable from a CRT
+  that has no `__SEH_prolog`, so every SEH function kept its caller's stale
+  `ebp` — the first frame-relative store landed in the caller's frame and the
+  epilogue cut the stack back to it. A title can also link more than one:
+  DDS9 carries both forms, and returning the first match meant which one won
+  depended on nothing but the lower address.
 
 ---
 
