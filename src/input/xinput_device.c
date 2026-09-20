@@ -1993,6 +1993,30 @@ static void pad_record_sample(const XBOX_INPUT_STATE *st)
     xbox_PadRecordSampleAtFrame(st, f);
 }
 
+/* ARE THE ANCHORS WORTH COMPARING AT ALL?
+ *
+ * Every #!ck in every recording taken so far carries anchor 00000000. The
+ * anchor reads save-data fields this title leaves at zero until a save has
+ * been written, so through the tutorial "aligned" was two zeros agreeing.
+ *
+ * Measured 20 Sep 2026: all 300 checkpoints of graffiti-2026-09-19_1739.padrec
+ * hold ONE distinct anchor value, while four replays of that recording put the
+ * character in four different parts of the level -- and every one of them
+ * reported "state=aligned in sync". A comparison whose reference side never
+ * varies cannot fail, and a verdict that cannot fail must never be printed as
+ * a pass. It is reported as UNVERIFIED instead, which is what it is.
+ *
+ * The pad hash is unaffected: it folds the input stream and it does discriminate.
+ * This is only about the anchor, which is the scene half of the verdict. */
+static int pad_anchor_informative(void)
+{
+    int i;
+    if (g_padrec_ck_n < 2) return 0;
+    for (i = 1; i < g_padrec_ck_n; i++)
+        if (g_padrec_ck[i].anchor != g_padrec_ck[0].anchor) return 1;
+    return 0;
+}
+
 void xbox_PadRecordReport(void)
 {
     if (g_pad_rec_f)
@@ -2007,8 +2031,12 @@ void xbox_PadRecordReport(void)
                 g_pad_replay_frame, g_padrec_frames, g_pad_run_cursor,
                 g_pad_runs_n, g_pad_ck_ok, g_pad_ck_bad,
                 g_padrec_ck_n - g_pad_ck_next,
-                g_pad_anchor_bad ? "MISALIGNED" : "aligned",
+                g_pad_anchor_bad ? "MISALIGNED"
+                : pad_anchor_informative() ? "aligned"
+                : "UNVERIFIED(anchor constant)",
                 g_pad_ck_bad ? "<<< DIVERGED"
+                : !pad_anchor_informative()
+                    ? "input replayed; SCENE NOT CHECKED"
                 : g_pad_replay_past_end ? "(past the end; pad is neutral)"
                 : "in sync");
 }

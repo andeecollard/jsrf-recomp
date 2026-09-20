@@ -1082,3 +1082,66 @@ another reason and the readiness jitter is a symptom.
 1e observed), it is read on the presenting thread so it belongs to the frame
 it is printed with, and `state_trace_diff.py` reads it without change. A gate
 built on it can fail, which `a=00000000` never could.
+
+## G23, 03:30 — HOLDING START DOES NOT RESCUE THE BOOT, IT PREVENTS IT
+
+The experiment the 03:05 entry asked for, with the control it also needed.
+All arms identical but for the recording; orig and hold interleaved so host
+drift could not land on one group.
+
+| recording | title exits | exit frame |
+|---|---:|---|
+| original | **5 of 6** | f2418 every time |
+| null rewrite (same expansion, same `#!ck` drop, no button added) | **3 of 4** | f2418 every time |
+| START held f2298–f2357 (60 frames) | **0 of 6** | never |
+
+**The null control matters and it is clean.** The variant is built by expanding
+runs to per-frame lines and dropping the 300 `#!ck` directives, because editing
+input invalidates their cumulative hashes. Rebuilt with the identical
+transformation and no button added, the recording is byte-for-byte the same
+input (verified: 0 of 89,416 frames differ) and boots 3 of 4. So the 0 of 6 is
+the held button, not the rewrite.
+
+**The readiness-jitter hypothesis of 03:05 is not supported by this.** If a
+late-ramping title simply needed more press, a 60-frame hold would have helped.
+It did the opposite, every time.
+
+**What fits instead, as a hypothesis:** the title latches a press EDGE, not the
+button being down. The original supplies three edges (f2298, f2322, f2327); the
+hold collapses them into one at f2298 and then holds, so if that edge lands
+before the menu is ready there is no second chance until release at f2357.
+**Not established** — no instrument here sees the menu's accept path, and one
+alternative is that a held START is read as a different intent entirely.
+
+**Do not build a repeated-tap variant on this.** Title exit is 8 of 10 across
+orig and null. It is a 20% cost on unattended batches, not a blocker, and the
+edge question can wait for a reason to answer it.
+
+### The title is deterministic; gameplay is not, and the evidence is visual
+
+All five orig arms follow the SAME scene sequence at the SAME frames:
+`f2418:0d, f2419:0e, f2421:12, f2422:1e`. `sq` is then constant through
+gameplay, so it cannot localise anything after entry.
+
+**A claim retracted before it was relied on.** Ten runs produced ten distinct
+f5111 BMP hashes and that was called nondeterministic gameplay. Different
+pixels are not different simulation state: animation phase, particles or a
+rendering race change bytes with the player standing still. Checked properly,
+by looking: one arm has Beat facing the camera against a grey wall on red-brown
+ground, another has him facing away in an alley between blue-grey buildings.
+**Different position, established visually.** The hash argument is withdrawn
+either way — identical hashes would not have proven the converse.
+
+The `ic` gap between two orig arms is already −5% at entry and stays flat
+through gameplay rather than compounding. The divergence exists before entry
+and expresses later; it is not gameplay accumulating error.
+
+### Two graffiti leads closed
+
+- The "flickering checkerboard" at `nv2a_metal.m:749` is a dither-lattice
+  artifact `fs_hw_blend` already fixes. It is not the blue/orange rectangles
+  where tags belong. Not the same defect.
+- The tag sheets `Cache/Media/Mark/DEFAULT/JSRF_TEXS0/S1.JTX` have two known
+  variants and the title rewrites them during play, so they could have
+  confounded every run. They do not: the player's HDD and the warm tree are
+  byte-identical across the whole of `Cache/`, sheets included.
