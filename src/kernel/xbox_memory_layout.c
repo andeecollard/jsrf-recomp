@@ -2585,6 +2585,46 @@ static void mcpx_hw_store_n(const uint32_t *offset, const uint32_t *value,
     InterlockedExchange(&g_nv2a_pcrtc_lock, 0);
 }
 
+/* THE OR FORM, WHICH THIS BRANCH NEVER GOT.
+ *
+ * mcpx_hw_store_n_or_last was added to the AArch64 branch for the OHCI
+ * write-back-done interrupt and never mirrored here, while the call site in
+ * xbox_McpxApplyService is unguarded -- so this file compiled on both
+ * platforms and linked on only one. It surfaced the first time anyone built
+ * for Windows since.
+ *
+ * Same contract as the AArch64 version: the first n-1 registers are written,
+ * and the LAST is read-modify-ORed rather than assigned, inside the same
+ * unprotect window as the others. The read and the OR belong in here, not in
+ * the caller, so a guest acknowledge landing before this line is preserved and
+ * one landing after it is outside anything this function controls. */
+static void mcpx_hw_store_n_or_last(const uint32_t *offset, const uint32_t *value,
+                                    unsigned n, uint32_t or_bits)
+{
+    DWORD old_prot;
+
+    if (!g_mcpx_regs || n == 0) return;
+    if (!g_ohci_guarded) {
+        for (unsigned i = 0; i + 1 < n; ++i)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        *(volatile uint32_t *)((char *)g_mcpx_regs + offset[n - 1]) |= or_bits;
+        return;
+    }
+
+    while (InterlockedCompareExchange(&g_nv2a_pcrtc_lock, 1, 0) != 0)
+        SwitchToThread();
+    if (VirtualProtect((LPVOID)g_ohci_page, g_nv2a_page_size,
+                       PAGE_READWRITE, &old_prot)) {
+        for (unsigned i = 0; i + 1 < n; ++i)
+            *(volatile uint32_t *)((char *)g_mcpx_regs + offset[i]) = value[i];
+        *(volatile uint32_t *)((char *)g_mcpx_regs + offset[n - 1]) |= or_bits;
+        if (!VirtualProtect((LPVOID)g_ohci_page, g_nv2a_page_size,
+                            PAGE_READONLY, &old_prot))
+            g_ohci_guarded = 0;
+    }
+    InterlockedExchange(&g_nv2a_pcrtc_lock, 0);
+}
+
 void xbox_Nv2aRaiseVblank(void)
 {
     if (!g_memory_offset) return;

@@ -20,7 +20,23 @@
  * ============================================================ */
 #include "../nv2a/qemu_shim.h"
 
+/* M_PI and M_E are POSIX, not ISO C: MinGW's <math.h> defines them only when
+ * _USE_MATH_DEFINES is set BEFORE it is included, and apu_core.c/apu_vp.c both
+ * use them. Defined here rather than per-file because this header is where
+ * <math.h> enters the APU. */
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
 #include <math.h>
+/* Belt and braces: a libm that still withholds them leaves the sources below
+ * failing on a name, which is a confusing way to learn about a feature-test
+ * macro. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E  2.7182818284590452354
+#endif
 
 /* ============================================================
  * Additional atomic ops needed by APU code

@@ -22,6 +22,9 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <time.h>      /* time_t / time(): used by the cache-size
+                        * cache below. Reached transitively on this
+                        * host; not on MinGW. */
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -1028,7 +1031,18 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             /* The emulated volume's own capacity first, when RECOMP_HDD_SIZES
              * is on. The call below asks the CURRENT DIRECTORY's disk, which
              * is not even the handle's -- see xbox_volume_capacity. */
-            if (xbox_volume_capacity(w32_handle_path(FileHandle), &vtotal, &vavail)) {
+            /* w32_handle_path is the POSIX shim's accessor and does not exist
+             * on Windows -- this line was copied from the POSIX branch below
+             * and broke the Windows build outright. GetFinalPathNameByHandleA
+             * is the platform's own answer to the same question; an empty
+             * result leaves the path NULL, which xbox_volume_capacity already
+             * treats as "ask the current directory's volume". */
+            char handle_path[MAX_PATH];
+            const char *vol_path = NULL;
+            if (GetFinalPathNameByHandleA(FileHandle, handle_path,
+                                          (DWORD)sizeof handle_path, 0) > 0)
+                vol_path = handle_path;
+            if (xbox_volume_capacity(vol_path, &vtotal, &vavail)) {
                 ULONGLONG cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER;
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;

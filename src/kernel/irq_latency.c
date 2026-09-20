@@ -1,5 +1,10 @@
 #include "irq_latency.h"
 #include "../recomp_switch.h"
+/* LARGE_INTEGER and QueryPerformanceCounter/Frequency are Win32. This host
+ * reaches them through the POSIX shim that irq_latency.h drags in; a real
+ * Windows build has to be told, or they are implicitly declared and QuadPart
+ * is a member of nothing. */
+#include "platform/xbox_winnt.h"
 #include <stdio.h>
 #include <time.h>
 
