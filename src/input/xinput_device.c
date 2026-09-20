@@ -1257,6 +1257,8 @@ static unsigned long pad_anchor_now(void)
     return g_pad_anchor_fn ? g_pad_anchor_fn() : 0ul;
 }
 
+static int pad_anchor_informative(void);
+
 static int pad_anchor_agrees(unsigned long a, unsigned long b)
 {
     unsigned long la = a & 0xFFFFul, lb = b & 0xFFFFul;
@@ -1324,7 +1326,21 @@ static void pad_replay_check_ck(unsigned long run, unsigned long frame,
     if (g_pad_ck_next >= g_padrec_ck_n) return;
     if (g_padrec_ck[g_pad_ck_next].run != run) return;
     anchor = pad_anchor_now();
-    if (!pad_anchor_agrees(anchor, g_padrec_ck[g_pad_ck_next].anchor)) {
+    /* ONLY WHEN THE REFERENCE SIDE CAN DISAGREE.
+     *
+     * A recording whose anchors never vary cannot fail this comparison in any
+     * way that means anything, and the report already says so by printing
+     * UNVERIFIED rather than a pass. Counting a mismatch against such a
+     * recording would turn that honest UNVERIFIED into a MISALIGNED, because
+     * g_pad_anchor_bad takes precedence in the verdict -- and the thing it
+     * would be reporting is that the recording predates the anchor carrying
+     * anything, not that the title is in the wrong place.
+     *
+     * Every recording taken before 20 Sep 2026 is exactly that: 00000000 at
+     * every checkpoint. They must keep reading UNVERIFIED, not start reading
+     * DIVERGED. */
+    if (pad_anchor_informative()
+        && !pad_anchor_agrees(anchor, g_padrec_ck[g_pad_ck_next].anchor)) {
         /* SEPARATE FROM THE HASH, because it means something different. A
          * hash mismatch says the input being fed in is not the input that
          * was recorded. This says the input IS right and the GAME is

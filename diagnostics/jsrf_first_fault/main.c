@@ -2041,16 +2041,58 @@ static void pad_inject_start(void)
  * poll. It may read zeroes before the title has filled the structure in,
  * which is fine: it is compared against what the recording saw at the same
  * frame, and at that frame the recording saw zeroes too. */
+static uint32_t jsrf_seq_index(const uint8_t *base);
+
+/* THE SCENE HALF OF A REPLAY'S VERDICT, AND WHY IT NOW LEADS WITH THE SEQUENCE.
+ *
+ * This used to be chapter, mission and playtime alone. All three read zero
+ * until a save has been written, so every checkpoint in every recording taken
+ * before 20 Sep 2026 carries anchor 00000000 -- and four replays of
+ * graffiti-2026-09-19_1739.padrec put the character in four different parts of
+ * the level while all four reported the anchors agreeing. A reference that
+ * never varies cannot disagree, so the verdict could not fail and therefore
+ * said nothing.
+ *
+ * CActSequence::m_dwNextMethod is the title's own top-level state and it does
+ * move -- it is what RECOMP_SEQ_REPORT reports, and jsrf_seq_index validates
+ * the object before reading it rather than assuming the pointer. Putting it in
+ * the anchor is what makes the scene half of the verdict able to fail.
+ *
+ * LAYOUT, in 32 bits, because `unsigned long` is 32-bit on MSVC and this value
+ * is written to the recording as %08lx:
+ *
+ *   31..24  sequence index, 0-63, or 0xFF when the object did not validate
+ *   23..20  return chapter, low 4 bits
+ *   19..16  return mission, low 4 bits
+ *   15.. 0  playtime in minutes
+ *
+ * The top 16 bits are identity and are compared exactly; the low 16 are a
+ * counter and are compared with PAD_ANCHOR_SLACK. That split is the input
+ * layer's contract and is unchanged.
+ *
+ * Chapter and mission were 8 bits each and are now 4, which is a real loss:
+ * chapter 16 aliases chapter 0. It is deliberate and it is the cheap half of
+ * the trade -- those two fields have been zero in every recording ever taken
+ * here, while the sequence index distinguishes 64 states and changes several
+ * times through a boot. A scene check that can actually fail is worth more
+ * than four bits of a field that has never been non-zero.
+ *
+ * 0xFF for unresolved is a different reading from index 0, and it stays in the
+ * exactly-compared half on purpose: a run where the object stopped validating
+ * is not the same run as one sitting in sequence 0, and it should say so.
+ */
 static unsigned long jsrf_pad_anchor(void)
 {
     const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t ch = 0, mi = 0, pt = 0;
+    uint32_t ch = 0, mi = 0, pt = 0, seq;
     if (!base) return 0;
     memcpy(&ch, base + JSRF_SAVEDATA_VA + JSRF_SD_RETURN_CHAPTER, 4);
     memcpy(&mi, base + JSRF_SAVEDATA_VA + JSRF_SD_RETURN_MISSION, 4);
     memcpy(&pt, base + JSRF_SAVEDATA_VA + JSRF_SD_PLAYTIME, 4);
-    return ((unsigned long)(ch & 0xFFu) << 24)
-         | ((unsigned long)(mi & 0xFFu) << 16)
+    seq = jsrf_seq_index(base);
+    return ((unsigned long)(seq & 0xFFu) << 24)
+         | ((unsigned long)(ch & 0x0Fu) << 20)
+         | ((unsigned long)(mi & 0x0Fu) << 16)
          | (unsigned long)((pt / 60u) & 0xFFFFu);
 }
 
@@ -2087,7 +2129,6 @@ extern unsigned long g_pad_polls;
  * rather than from the 10 ms sampler's g_seq_obj, so the value belongs to THIS
  * frame and not to whenever that thread last woke. 0xFF means unresolved, which
  * is a different reading from "index 0". */
-static uint32_t jsrf_seq_index(const uint8_t *base);
 static FILE *g_state_trace;
 static int   g_state_trace_tried;
 

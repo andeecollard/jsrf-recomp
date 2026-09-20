@@ -110,6 +110,10 @@ static unsigned polls_for_frame(unsigned long f)
 
 static unsigned long g_anchor_frame;                 /* drives the anchor */
 static unsigned long test_anchor(void) { return 0x0102u << 16 | (g_anchor_frame / 60u); }
+/* Every recording taken before 20 Sep 2026 carries this at every
+ * checkpoint: the fields the anchor read stayed zero until a save was
+ * written, so the reference side could never disagree. */
+static unsigned long test_anchor_constant(void) { return 0ul; }
 
 static void record_sequence(const char *path, const XBOX_INPUT_STATE *seq,
                             unsigned long frames)
@@ -385,6 +389,51 @@ int main(void)
         }
         CHECK(mismatches == 0, "the marked recording replays differently");
         remove(marked);
+    }
+
+    /* ── 10. a recording whose anchor never varies stays UNVERIFIED ──
+     *
+     * The scene half of the verdict is only meaningful when the reference side
+     * can disagree. Recorded with a constant anchor and replayed against one
+     * that moves, this must NOT be reported as a state misalignment: the
+     * recording predates the anchor carrying anything, which is a different
+     * fact from the title being in the wrong place, and conflating them would
+     * turn every old recording into a false DIVERGED. */
+    {
+        char b[600];
+        char cpath[600];
+        int ck_ok2 = 0, ck_bad2 = 0, state_bad2 = 0;
+        unsigned long at2 = 0;
+
+        snprintf(cpath, sizeof cpath, "%s.constanchor", path);
+        xbox_PadRecordSetAnchorFn(test_anchor_constant);
+        xbox_PadRecordClose();
+        xbox_PadRecordOpen(cpath);
+        for (f = 0; f <= FRAMES; f++) {
+            g_anchor_frame = f;
+            xbox_PadRecordSampleAtFrame(&seq[f % FRAMES], f);
+        }
+        xbox_PadRecordClose();
+
+        /* Replay it with an anchor that does move and disagrees throughout. */
+        xbox_PadRecordSetAnchorFn(test_anchor);
+        xbox_PadScriptReset();
+        snprintf(b, sizeof b, "@%s", cpath);
+        xbox_PadScriptLoad(b);
+        for (f = 0; f <= FRAMES; f++) {
+            XBOX_INPUT_STATE got;
+            memset(&got, 0, sizeof got);
+            g_anchor_frame = f;
+            xbox_PadScriptApplyAtFrame(&got, f);
+        }
+        xbox_PadReplayStatus(&ck_ok2, &ck_bad2, &at2, &state_bad2);
+        CHECK(state_bad2 == 0, "a recording with a constant anchor reported %d"
+              " state misalignment(s); a reference that cannot disagree must"
+              " not be scored as a disagreement", state_bad2);
+        CHECK(ck_bad2 == 0, "the input round trip broke while checking the"
+              " constant-anchor case, so its verdict means nothing");
+        remove(cpath);
+        xbox_PadRecordSetAnchorFn(test_anchor);
     }
 
     remove(path);
