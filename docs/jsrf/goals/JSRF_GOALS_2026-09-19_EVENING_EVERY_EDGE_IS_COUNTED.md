@@ -1023,3 +1023,62 @@ Codex's isolated texture-cache oracle does not depend on this and stands.
 - **A recording of taps is a recording of races.** The recorder stores the
   frames a button was down. One- and two-frame taps survive only if the guest
   samples those frames. Recording the press is not recording the effect.
+
+## G23, 03:05 — THE TITLE BECOMES READY AT A VARIABLE FRAME, AND THE PRESS IS FIXED
+
+Five arms, identical configuration, `sq=` (CActSequence::m_dwNextMethod) now
+in the per-frame trace. **Four reached the tutorial, one never left state 12.**
+
+**Two retractions of the 02:45 entry.**
+
+*"The split is one missed START tap at f2298" is wrong.* That came from a
+100-frame bisect in which the nearest input happened to be the START. At
+5-frame resolution the arms part at **f2228–f2230**, sixty-eight frames
+BEFORE the press, and the recording holds nothing there but analog resting
+jitter. No input causes it.
+
+*"The guest polls ~7 times per frame" was measured only on arms that
+succeeded, and only after the ramp.* Before the ramp every arm polls **1.47**
+times a frame; after it, **6.8**. The stalled arm reaches 6.82 as well. The
+poll rate is a function of where the title is, not of whether the run is
+healthy, and quoting it from three good arms was sampling on the outcome.
+
+**What actually varies is when the title starts drawing.** Draws per frame
+go from ~24 to ~570 as the title brings up its 3D scene. The frame that
+happens on:
+
+| arm | ramp | outcome |
+|---|---:|---|
+| 5 | f2216 | tutorial |
+| 4 | f2227 | tutorial |
+| 2 | f2228 | tutorial |
+| 3 | f2231 | tutorial |
+| **1** | **f2267** | **stuck in state 12** |
+
+The four healthy arms cluster in fifteen frames; the stalled one is
+thirty-six frames later than the latest of them. And all four healthy arms
+leave state `0c` at **exactly f2418** — the transition itself is
+frame-deterministic once it happens at all.
+
+**The hypothesis this supports.** The recording asserts START at fixed frames
+(f2298–2304, f2322–2325, f2327). The menu's readiness arrives at a frame that
+varies by ~50 across runs. A run that ramps late has less settling time before
+a fixed press, and the press does not take. Arm 1 had 31 frames of margin
+against the healthy arms' 70–85.
+
+**It is one failure sample and it is not proven.** Against it: arm 1 also
+ignored the presses at f2322 and f2327, by which point it had 55–60 frames of
+margin — close to what arm 2 had. So "too early" may be the wrong shape, or
+the menu may latch a state on the first press it discards.
+
+**The test that decides it, and would also fix the boot lottery:** synthesise
+a variant of this recording holding START for ~60 frames instead of 7, run ten
+arms, and compare stall rates. If holding the press removes the stall, the
+mechanism is press-versus-readiness timing and every player recording can be
+made replayable by widening its taps. If it does not, the menu is refusing for
+another reason and the readiness jitter is a symptom.
+
+**`sq=` is G23c's anchor.** It moves (00, 03, 06, 07, 08, 0a, 0c, 0d, 0e, 12,
+1e observed), it is read on the presenting thread so it belongs to the frame
+it is printed with, and `state_trace_diff.py` reads it without change. A gate
+built on it can fail, which `a=00000000` never could.

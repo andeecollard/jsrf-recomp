@@ -2078,13 +2078,23 @@ static unsigned long jsrf_pad_anchor(void)
  * while a tap was asserted, which is the difference between "the press was
  * never delivered" and "the press was never read". */
 extern unsigned long g_pad_polls;
+/* THE SCENE, PER FRAME, AND THE ANCHOR THAT SHOULD HAVE BEEN.
+ * a=<anchor> reads save-data fields the title leaves at zero in the tutorial,
+ * so every checkpoint in every recording carries 00000000 and "state=aligned"
+ * compares zero with zero. CActSequence::m_dwNextMethod DOES move -- it is what
+ * RECOMP_SEQ_REPORT reports -- and jsrf_seq_object is a handful of validated
+ * derefs, cheap enough for once a frame. Read here on the presenting thread
+ * rather than from the 10 ms sampler's g_seq_obj, so the value belongs to THIS
+ * frame and not to whenever that thread last woke. 0xFF means unresolved, which
+ * is a different reading from "index 0". */
+static uint32_t jsrf_seq_index(const uint8_t *base);
 static FILE *g_state_trace;
 static int   g_state_trace_tried;
 
 static void jsrf_state_trace_frame(unsigned long f)
 {
     const uint8_t *base;
-    uint32_t pt = 0;
+    uint32_t pt = 0, sq = 0xFFu;
     extern unsigned long long g_hw_draws;
     if (!g_state_trace) {
         const char *path;
@@ -2100,7 +2110,7 @@ static void jsrf_state_trace_frame(unsigned long f)
         }
         fprintf(g_state_trace, "# JSRF state trace: f<frame> a=<anchor>"
                 " pt=<playtime> ic=<indirect calls> dr=<hw draws>"
-                " pp=<guest pad polls>\n"
+                " pp=<guest pad polls> sq=<scene index, ff=unresolved>\n"
                 "#!build %s\n#!gen %s\n",
 #ifdef JSRF_BUILD_OPT
                 JSRF_BUILD_OPT,
@@ -2117,11 +2127,12 @@ static void jsrf_state_trace_frame(unsigned long f)
     }
     base = (const uint8_t *)xbox_GetMemoryOffset();
     if (base) memcpy(&pt, base + JSRF_SAVEDATA_VA + JSRF_SD_PLAYTIME, 4);
-    fprintf(g_state_trace, "f%lu a=%08lx pt=%u ic=%llu dr=%llu pp=%lu\n",
+    if (base) sq = jsrf_seq_index(base);
+    fprintf(g_state_trace, "f%lu a=%08lx pt=%u ic=%llu dr=%llu pp=%lu sq=%02x\n",
             f, jsrf_pad_anchor(), (unsigned)pt,
             (unsigned long long)g_icall_count,
             (unsigned long long)g_hw_draws,
-            g_pad_polls);
+            g_pad_polls, (unsigned)sq);
     if ((f % 600ul) == 0) fflush(g_state_trace);
 }
 
@@ -2801,6 +2812,16 @@ static uint32_t jsrf_seq_object(const uint8_t *base)
     if (*(const uint32_t *)(base + p + JSRF_SEQ_NEXT_OFF) >= JSRF_SEQ_COUNT)
         return 0;
     return p;
+}
+
+/* The current sequence index, or 0xFF if the object does not validate. Kept
+ * beside jsrf_seq_object so the +0x48 offset stays with the rest of the
+ * CActSequence knowledge; jsrf_state_trace_frame calls it once a frame. */
+static uint32_t jsrf_seq_index(const uint8_t *base)
+{
+    uint32_t obj = jsrf_seq_object(base);
+    if (!obj) return 0xFFu;
+    return *(const uint32_t *)(base + obj + JSRF_SEQ_NEXT_OFF);
 }
 
 static DWORD WINAPI jsrf_seq_thread(LPVOID arg)
