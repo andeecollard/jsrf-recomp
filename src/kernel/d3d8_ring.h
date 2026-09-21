@@ -23,8 +23,25 @@
  *   +0x24  ring low        D3D_MakeRequestedSpace_8 wraps between these two
  *   +0x28  ring high       and never reads +0x08/+0x0C, which settles which
  *                          of the two candidate pairs is the live one
- *   +0x30  submitted PUT   D3D_BlockOnTime computes free space as
- *   +0x34  fence POINTER   PUT - *(*(dev+0x34)) and spins on it
+ *   +0x2C  submitted PUT   CDevice_KickOff shadows the value it just wrote
+ *                          to the channel's DMA_PUT register into this field
+ *   +0x30  fence COUNTER   the generation D3D_SetFence releases, += 2 a fence
+ *   +0x34  fence POINTER   D3D_BlockOnTime spins on *(*(dev+0x34)), comparing
+ *                          it against the counter at +0x30
+ *
+ * +0x2C AND +0x30 ARE NOT THE SAME KIND OF THING, AND THIS FILE USED TO SAY
+ * THEY WERE. Until 21 Sep 2026 the +0x30 row above read "submitted PUT" and
+ * the macro was called D3D8_DEV_PUT. It is a fence generation counter, and
+ * the submitted PUT is one field lower:
+ *
+ *   CDevice_KickOff   001912FE  mov [eax+0x40],edx   ; the real DMA_PUT
+ *                     00191305  mov [edx+0x2c],ecx   ; shadowed at +0x2C
+ *
+ * The counter's own arithmetic, and why publishing it into the fence made
+ * every wait in the title vacuous, is set out under "THE FENCE, WRITTEN WHERE
+ * THE HARDWARE WRITES IT" below -- it is not repeated here. What belongs here
+ * is the lesson the name carries: D3D8_DEV_PUT made that bug easy to write
+ * and hard to see, and it survived the fix by five hours.
  *
  * The fence is the one that matters. Publishing the producer's own PUT into it
  * tells the title its ring is entirely free, whatever the parser has actually
@@ -40,7 +57,8 @@
 #define D3D8_DEV_LIMIT        0x04u
 #define D3D8_DEV_RING_LO      0x24u
 #define D3D8_DEV_RING_HI      0x28u
-#define D3D8_DEV_PUT          0x30u
+#define D3D8_DEV_SUBMITTED_PUT 0x2Cu
+#define D3D8_DEV_FENCE_COUNTER 0x30u
 #define D3D8_DEV_FENCE_PTR    0x34u
 
 /* A title's own answer, used only when no symbol says otherwise. `global` is
@@ -60,10 +78,18 @@ uint32_t d3d8_ring_field_va(unsigned offset);
 
 /* Publish into the fence the title spins on.
  *
- * `submitted` is written verbatim, and ONLY when `parser_drained` says
- * everything submitted has been consumed. Publishing with work outstanding
- * would tell the title its ring is free while the parser is still reading it,
- * so the function refuses and counts the refusal: for a correct pump that
+ * `fence_counter` is [dev+0x30], written verbatim, and ONLY when
+ * `parser_drained` says everything submitted has been consumed.
+ *
+ * THAT VALUE IS ONE GENERATION HIGH BY CONSTRUCTION -- see the invariant at
+ * the top of this file -- so this path tells the title every wait is already
+ * satisfied. It is kept because it is the only thing that carries a title
+ * whose D3D8 never emits 0x1D70, and it is SUPPRESSED the moment
+ * d3d8_ring_fence_release sees a real release packet. Which arm a run took is
+ * a counter, not a guess.
+ *
+ * Publishing with work outstanding would tell the title its ring is free while
+ * the parser is still reading it, so the function refuses and counts it: for a correct pump that
  * counter stays at zero, which makes it a positive control rather than a knob.
  *
  * WHY A VERDICT AND NOT A CURSOR. The first version took the parser's ring
@@ -75,7 +101,7 @@ uint32_t d3d8_ring_field_va(unsigned offset);
  *
  * Returns 1 if the word was changed. */
 int d3d8_ring_publish_fence(uint32_t fence_word_va, int parser_drained,
-                            uint32_t submitted);
+                            uint32_t fence_counter);
 
 /* THE FENCE, WRITTEN WHERE THE HARDWARE WRITES IT.
  *

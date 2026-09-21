@@ -128,7 +128,7 @@ extern MCPXAPUState *g_apu_state;
 #define JSRF_D3D_CHANNEL_PTR_DEFAULT 0x0019DCE0u
 #define JSRF_PB_DEVICE_DEFAULT       0x0019B200u
 #define JSRF_D3D_CHANNEL_PTR   (d3d8_ring_device_global())
-#define JSRF_D3D_PUT_OFFSET    D3D8_DEV_PUT
+#define JSRF_D3D_FENCE_COUNTER_OFFSET D3D8_DEV_FENCE_COUNTER
 #define JSRF_D3D_GETPTR_OFFSET D3D8_DEV_FENCE_PTR
 
 static volatile int g_pushbuf_ack_stop;
@@ -1311,13 +1311,18 @@ static void jsrf_pusher_report(void)
     {
         PgraphD3D11Stats ps;
         pgraph_d3d11_get_stats(&ps);
+        /* `counter` is [dev+0x30] and `word` is *[dev+0x34], so these two are
+         * the fence invariant printed side by side: word <= counter - 2 while
+         * the hardware is driving it, and word == counter only if something
+         * published the counter verbatim -- the bug fixed in 5358eec. They
+         * used to be labelled "idx put" and "get", which named neither. */
         fprintf(stderr, "  [PUSHER] runs=%lu dwords=%lu methods=%lu "
                 "unhandled=%lu bad_headers=%lu | clears=%u flips=%u draws=%u"
-                " | put=0x%08X limit=0x%08X idx put=%u get=%u\n",
+                " | put=0x%08X limit=0x%08X fence: counter=%u word=%u\n",
                 st.runs, st.dwords, st.methods, st.unhandled, st.bad_headers,
                 ps.clears, ps.flips, ps.draw_calls,
                 MEM32(JSRF_PB_PUT_VA), MEM32(JSRF_PB_LIMIT_VA),
-                jsrf_pb_index(JSRF_D3D_PUT_OFFSET),
+                jsrf_pb_index(JSRF_D3D_FENCE_COUNTER_OFFSET),
                 jsrf_pb_index(JSRF_D3D_GETPTR_OFFSET));
     }
     fflush(stderr);
@@ -1386,7 +1391,7 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
          * afterwards acknowledged newer, unconsumed work and allowed the
          * producer to overwrite the ring underneath the parser. */
         uint32_t getp = dev ? MEM32(dev + JSRF_D3D_GETPTR_OFFSET) : 0;
-        uint32_t submitted = dev ? MEM32(dev + JSRF_D3D_PUT_OFFSET) : 0;
+        uint32_t fence_counter = dev ? MEM32(dev + JSRF_D3D_FENCE_COUNTER_OFFSET) : 0;
         int consumed = jsrf_pb_poll();
         jsrf_pusher_report();
         /* Cheap and constant: the guest-clock anchor must not inherit the
@@ -1410,7 +1415,7 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
             ++loops;
             if (!getp)                        ++no_dev;
             else if (!consumed)               ++no_consume;
-            else if (MEM32(getp)==submitted)  ++already;
+            else if (MEM32(getp)==fence_counter) ++already;
             else                              ++acked;
             if (!last) last = now_ms;
             if (now_ms - last >= 2000) {
@@ -1428,7 +1433,7 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
          * acknowledgement has always been gated on a full drain, and the
          * runtime now enforces that invariant for any title rather than
          * trusting each pump to remember it. */
-        d3d8_ring_publish_fence(getp, consumed, submitted);
+        d3d8_ring_publish_fence(getp, consumed, fence_counter);
         Sleep(0);
     }
     return 0;

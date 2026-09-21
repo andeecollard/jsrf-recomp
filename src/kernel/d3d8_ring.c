@@ -197,7 +197,7 @@ int d3d8_ring_fence_release(uint32_t value)
 unsigned long d3d8_ring_fence_release_count(void) { return s_releases; }
 
 int d3d8_ring_publish_fence(uint32_t fence_word_va, int parser_drained,
-                            uint32_t submitted)
+                            uint32_t fence_counter)
 {
     static unsigned long refused, published, reported, suppressed;
 
@@ -230,9 +230,9 @@ int d3d8_ring_publish_fence(uint32_t fence_word_va, int parser_drained,
         }
         return 0;
     }
-    if (guest_u32(fence_word_va) == submitted)
+    if (guest_u32(fence_word_va) == fence_counter)
         return 0;
-    guest_store_u32(fence_word_va, submitted);
+    guest_store_u32(fence_word_va, fence_counter);
     ++published;
     if ((published & 0xFFFFFu) == 0 && reported != published) {
         reported = published;
