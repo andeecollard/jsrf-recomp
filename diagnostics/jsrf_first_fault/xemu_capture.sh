@@ -45,6 +45,7 @@ SECONDS_LIMIT=75
 MAX_MB=768
 OUT=
 DRY=0
+FULL_ARGV=0
 AUDIO=0
 
 XEMU=${XEMU:-/Applications/xemu.app/Contents/MacOS/xemu}
@@ -58,7 +59,7 @@ usage() {
     sed -n '2,45p' "$0"
     echo
     echo "usage: $0 [--preset surfaces|methods|full] [--seconds N] [--max-mb N]"
-    echo "          [--out DIR] [--audio] [--dry-run]"
+    echo "          [--out DIR] [--audio] [--dry-run] [--full-argv]"
     exit 1
 }
 
@@ -70,6 +71,7 @@ while [ $# -gt 0 ]; do
         --out)      OUT=$2; shift 2 ;;
         --audio)    AUDIO=1; shift ;;
         --dry-run)  DRY=1; shift ;;
+        --full-argv) FULL_ARGV=1; shift ;;
         -h|--help)  usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
@@ -113,17 +115,38 @@ XLOG="$OUT/xemu-stdout.log"
     esac
 } > "$EVENTS"
 
-set -- \
-    -machine "xbox,bootrom=$BOOTROM,kernel-irqchip=off,avpack=hdtv" \
-    -device "smbus-storage,file=$EEPROM" \
-    -bios "$BIOS" \
-    -m 128 \
-    -drive "index=0,media=disk,file=$HDD,locked=on" \
-    -drive "index=1,media=cdrom,file=$ISO" \
-    -display xemu \
-    -device usb-hub,port=1,ports=4 \
-    -gdb tcp:127.0.0.1:1234 \
-    -trace "events=$EVENTS,file=$TRACE"
+# THE GUI BUILDS THE MACHINE, WE ONLY ADD THE TRACE.
+#
+# xemu 0.8.136 constructs its OWN QEMU launch parameters from xemu.toml and
+# then APPENDS whatever it was given, so passing -machine/-bios/-drive here
+# duplicates every one of them and the run dies in under a second:
+#
+#   xemu: -drive index=0,media=disk,file=...qcow2,locked=on:
+#         drive with bus=0, unit=0 (index=0) exists
+#
+# Its own line is visible in xemu-stdout.log under "Created QEMU launch
+# parameters", and it already carries the right bootrom, BIOS, EEPROM, HDD and
+# the JSRF ISO -- the settings the GUI was configured with. So the machine
+# description is the GUI's job and the trace is ours. The paths this script
+# checks are still checked, because a differential against the wrong ISO is
+# worse than no differential, and they are recorded in capture.json.
+#
+# --full-argv restores the old behaviour for an xemu that does not self-build.
+if [ "$FULL_ARGV" = 1 ]; then
+    set -- \
+        -machine "xbox,bootrom=$BOOTROM,kernel-irqchip=off,avpack=hdtv" \
+        -device "smbus-storage,file=$EEPROM" \
+        -bios "$BIOS" \
+        -m 128 \
+        -drive "index=0,media=disk,file=$HDD,locked=on" \
+        -drive "index=1,media=cdrom,file=$ISO" \
+        -display xemu \
+        -device usb-hub,port=1,ports=4 \
+        -gdb tcp:127.0.0.1:1234 \
+        -trace "events=$EVENTS,file=$TRACE"
+else
+    set -- -trace "events=$EVENTS,file=$TRACE"
+fi
 
 printf '%s' "$XEMU"; for a in "$@"; do printf " '%s'" "$a"; done; echo
 if [ "$DRY" = 1 ]; then
