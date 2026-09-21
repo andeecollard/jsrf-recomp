@@ -70,3 +70,66 @@ int nv2a_metal_stencil_op(uint32_t guest)
     default:     return -1;
     }
 }
+
+/* WHICH HALF OF THE PIPELINE STILL HAS THE PICTURE. See the header for what
+ * the four answers mean and why NOTHING_HELD is not a fifth spelling of black.
+ *
+ * ORDER IS THE WHOLE ALGORITHM, so it is written out rather than nested:
+ *
+ *  1. An entry whose texture was not read tells us nothing. If NO entry was
+ *     read, say so and stop. Counting unread slots as black is the exact
+ *     mistake this file's own header warns about.
+ *  2. OWED outranks PICTURE_HELD. A frame that exists on the GPU and not in
+ *     guest RAM is a lost write-back, and it stays the answer even when some
+ *     other slot happens to be in both -- the frame going missing is the
+ *     finding, not the one that made it.
+ *  3. PICTURE_HELD needs pixels in BOTH. A texture with pixels whose guest
+ *     count was not read is not evidence that the write-back worked, so it
+ *     falls through to OWED only when guest RAM was read and came back zero;
+ *     otherwise it is PICTURE_HELD on the texture alone, which is the weaker
+ *     but still honest claim that rasterisation produced something.
+ *  4. Only when every read texture is zero is the answer GPU_BLACK, and that
+ *     is the one that says the draws themselves produced no pixels -- the
+ *     fork that sends the next session to RECOMP_FB_DUMP_DRAW instead of to
+ *     the write-back path. */
+int nv2a_surface_census_verdict(const NV2ASurfaceCensus *entries, unsigned n)
+{
+    unsigned i, read = 0;
+    int held = 0;
+
+    if (!entries) return NV2A_SURFACE_CENSUS_NOTHING_HELD;
+    for (i = 0; i < n; ++i) {
+        if (entries[i].gpu_nonzero < 0) continue;
+        ++read;
+        if (entries[i].gpu_nonzero == 0) continue;
+        if (entries[i].guest_nonzero == 0)
+            return NV2A_SURFACE_CENSUS_OWED;
+        held = 1;
+    }
+    if (!read) return NV2A_SURFACE_CENSUS_NOTHING_HELD;
+    if (held)  return NV2A_SURFACE_CENSUS_PICTURE_HELD;
+    return NV2A_SURFACE_CENSUS_GPU_BLACK;
+}
+
+const char *nv2a_surface_census_verdict_text(int verdict)
+{
+    switch (verdict) {
+    case NV2A_SURFACE_CENSUS_GPU_BLACK:
+        return "GPU-BLACK -- every surface the backend holds is black in its "
+               "own texture too, so the draws produced no pixels; the loss is "
+               "BEFORE the write-back (transform, shading or target), and the "
+               "next measurement is RECOMP_FB_DUMP_DRAW inside one frame";
+    case NV2A_SURFACE_CENSUS_OWED:
+        return "OWED -- a surface holds pixels in its texture that guest RAM "
+               "does not, so the frame was drawn and the write-back lost it; "
+               "the loss is AFTER rasterisation and the target address on that "
+               "line names the surface";
+    case NV2A_SURFACE_CENSUS_PICTURE_HELD:
+        return "PICTURE-HELD -- a surface has pixels in both its texture and "
+               "guest RAM; if the screen is still black the loss is past this "
+               "point, in the flip, the snapshot or the presenter";
+    default:
+        return "NOTHING-HELD -- no texture was read, so this census says "
+               "nothing at all; it is not a black frame";
+    }
+}

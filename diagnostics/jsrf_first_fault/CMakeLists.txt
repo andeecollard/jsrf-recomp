@@ -624,6 +624,13 @@ add_executable(jsrf_metal_state_test metal_state_test.c)
 target_link_libraries(jsrf_metal_state_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_metal_state COMMAND jsrf_metal_state_test)
 
+# The reading of RECOMP_SURFACE_CENSUS. The gathering needs a Metal device and
+# lives in nv2a_metal.m; the verdict is pure and is the half that can lie in a
+# log -- "black" from a census that read nothing looks exactly like a finding.
+add_executable(jsrf_surface_census_test surface_census_test.c)
+target_link_libraries(jsrf_surface_census_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_surface_census COMMAND jsrf_surface_census_test)
+
 add_executable(jsrf_dxt_fragment_test dxt_fragment_test.c)
 target_link_libraries(jsrf_dxt_fragment_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_dxt_fragment COMMAND jsrf_dxt_fragment_test)

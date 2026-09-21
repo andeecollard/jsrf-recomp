@@ -41,6 +41,17 @@ int nv2a_metal_clear_depth_stencil(uint8_t *target, size_t target_size,
  * owed is -1 nothing retained, 0 retained and clean, 1 retained and dirty. */
 void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed);
 
+/* RECOMP_SURFACE_CENSUS -- what every retained colour surface holds, on the
+ * GPU and in guest RAM, side by side. `guest_base` is xbox_GetMemoryOffset(),
+ * used only to print guest offsets rather than host pointers, and
+ * `presented_offset` is the surface the guest has named at this flip so the
+ * line can mark it. Read-only: it counts pixels and throws them away, and in
+ * particular it does NOT pay a slot's owes_guest_ram debt, because doing so
+ * would repair the disagreement it exists to find. Drains and reads back every
+ * held surface, so the caller must stride it. See NV2ASurfaceCensus. */
+void nv2a_metal_surface_census_report(const uint8_t *guest_base,
+                                      uint32_t presented_offset);
+
 /* Is the dithered-blend shader path active? RECOMP_METAL_SHADER_BLEND=0 off. */
 int nv2a_metal_shader_blend_on(void);
 /* The fragment-tail selector, exported so it can be gated without a device.

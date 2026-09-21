@@ -76,6 +76,61 @@ int nv2a_metal_blend_factor(uint32_t guest);
 int nv2a_metal_compare_func(uint32_t guest);
 int nv2a_metal_stencil_op(uint32_t guest);
 
+/* A READ-ONLY CENSUS OF THE COLOUR SURFACES THE BACKEND IS HOLDING.
+ *
+ * WHY THIS IS NOT ALREADY ANSWERABLE ON macOS. nv2a_pb_exec.c's [FLIPTRACE]
+ * line prints, for every surface the guest has ever named, how many nonzero
+ * pixels GUEST RAM holds -- and its own comment says why one number is not
+ * enough: "Printing one number cannot tell 'nothing was drawn' from 'it was
+ * drawn in the other window'". It answers that with nv2a_gpu_surface_report(),
+ * "what the GPU holds rather than what guest RAM holds. Where they disagree is
+ * where the frame goes missing" -- which is #define'd on the D3D11 branch
+ * ONLY. Every one of those blocks compiles out on the Metal path.
+ *
+ * On Metal that hole is not theoretical, because this backend deliberately
+ * leaves guest RAM stale: clear_unbound_slot() clears a slot's TEXTURE and
+ * skips the CPU clear, setting owes_guest_ram, and the debt is paid only on a
+ * swap, a drop or an overlapping texture read. So a surface can hold a
+ * finished frame in its Metal texture while guest RAM -- and therefore [FB],
+ * [FLIPTRACE], the presenter and the player's screen -- reads all zeroes.
+ * Every instrument we have would call that "nothing was drawn".
+ *
+ * The census closes it: for each retained slot, the nonzero pixel count of the
+ * BACKEND'S OWN TEXTURE beside the count guest RAM holds for the same surface.
+ *
+ * The struct is plain C with no Metal types so the verdict below can be a
+ * ctest case; nv2a_metal.m fills it and prints it. -1 in either count means
+ * "not read", never "zero" -- the distinction an absence-measurement lives on.
+ */
+typedef struct {
+    uint32_t target;          /* guest offset of the surface */
+    uint32_t w, h;            /* pixels */
+    int bound;                /* the backend is rendering into it right now */
+    int presented;            /* the guest named it at this flip */
+    int owes_guest_ram;       /* the texture is ahead of guest RAM by design */
+    long gpu_nonzero;         /* nonzero pixels in the backend's texture, -1 unread */
+    long guest_nonzero;       /* nonzero pixels in guest RAM, -1 unread */
+} NV2ASurfaceCensus;
+
+/* THE FORK THE INSTRUMENT EXISTS TO DECIDE, and nothing more. It does not
+ * name a cause; it says which half of the pipeline still has the picture, so
+ * the next measurement is chosen rather than guessed.
+ *
+ * NOTHING_HELD is not "black". It is "this census read no texture at all", and
+ * it is a separate answer because reporting a black screen from a census that
+ * never ran is precisely how an absence-measurement lies. Pair a run with a
+ * stride that also samples a frame the player can SEE: that frame must come
+ * back PICTURE_HELD, and if it does not, the instrument is broken and its
+ * zeroes mean nothing. */
+enum {
+    NV2A_SURFACE_CENSUS_NOTHING_HELD = 0,
+    NV2A_SURFACE_CENSUS_GPU_BLACK,     /* every texture read is black too */
+    NV2A_SURFACE_CENSUS_OWED,          /* a texture has pixels guest RAM has not */
+    NV2A_SURFACE_CENSUS_PICTURE_HELD   /* a texture has pixels and so has RAM */
+};
+int nv2a_surface_census_verdict(const NV2ASurfaceCensus *entries, unsigned n);
+const char *nv2a_surface_census_verdict_text(int verdict);
+
 /* NV097_SET_DEPTH_FUNC is 0 on a title that never wrote it, and the shader's
  * cmpf treats 0 as LEQUAL ("if(!f)f=0x203"). Kept here so the hardware path
  * and the shader path cannot disagree about an unwritten register. */

@@ -3517,6 +3517,115 @@ static void surface_slot_writeback(unsigned i)
     surf_slot[i].owes_guest_ram = 0;
 }
 
+/* THE CENSUS: what every retained colour surface holds, on the GPU and in
+ * guest RAM, side by side. RECOMP_SURFACE_CENSUS. See NV2ASurfaceCensus in
+ * nv2a_metal_state.h for why guest RAM alone cannot answer the question and
+ * why the D3D11 branch's nv2a_gpu_surface_report() does not exist here.
+ *
+ * READ-ONLY, and it must stay that way. It drains and getBytes: exactly what
+ * surface_slot_writeback does, minus the store into guest RAM and minus
+ * clearing owes_guest_ram. Paying the debt here would destroy the very
+ * disagreement the census is for -- the run would report a healthy frame
+ * BECAUSE the instrument had repaired it -- so the pixels are counted and
+ * thrown away.
+ *
+ * IT IS NOT FREE. Each report drains the GPU and reads back every held
+ * surface. At 240 fps that is unaffordable every frame, which is why the
+ * caller strides it; the cost is the reason the switch takes a stride and an
+ * after-time rather than being a plain on/off trace. */
+void nv2a_metal_surface_census_report(const uint8_t *guest_base,
+                                      uint32_t presented_offset)
+{
+    NV2ASurfaceCensus census[SURFACE_SLOTS];
+    unsigned n = 0, i;
+
+    if (!hw_state_on() || !initialize()) {
+        fprintf(stderr, "  [SURFACE-CENSUS] the hardware path is not up; "
+                        "nothing to census\n");
+        return;
+    }
+    @autoreleasepool {
+        int fmt565 = hw_565_on();
+        batch_flush();
+        [last_command waitUntilCompleted];
+        for (i = 0; i < surface_slots_used() && n < SURFACE_SLOTS; ++i) {
+            NV2ASurfaceCensus *e;
+            uint32_t w = surf_slot[i].w, h = surf_slot[i].h;
+            uint32_t pitch = surf_slot[i].pitch;
+            const uint8_t *target = surf_slot[i].target;
+            uint8_t *buf;
+            uint32_t x, y;
+
+            if (!surf_slot[i].valid || !surf_slot[i].colour || !w || !h)
+                continue;
+            e = &census[n++];
+            memset(e, 0, sizeof *e);
+            e->target = (guest_base && target >= guest_base)
+                      ? (uint32_t)(size_t)(target - guest_base) : 0;
+            e->w = w; e->h = h;
+            e->bound = (target == surface_target);
+            e->presented = (e->target && e->target == presented_offset);
+            e->owes_guest_ram = surf_slot[i].owes_guest_ram;
+            e->gpu_nonzero = -1;
+            e->guest_nonzero = -1;
+
+            /* Guest RAM, in the guest's own RGB565 layout -- the same bytes
+             * [FB] and the presenter read, so a disagreement with the texture
+             * below is a disagreement with what the player sees. */
+            if (target && pitch) {
+                long nz = 0;
+                for (y = 0; y < h; ++y) {
+                    const uint8_t *row = target + (size_t)y * pitch;
+                    for (x = 0; x < w; ++x)
+                        if (row[x * 2] || row[x * 2 + 1]) ++nz;
+                }
+                e->guest_nonzero = nz;
+            }
+
+            /* The backend's own texture. The float arm converts to RGB565
+             * before counting so both numbers mean the same thing: "pixels the
+             * guest would see as nonzero". Counting raw float bits instead
+             * would call a pixel that rounds to black nonzero, and the whole
+             * point of the line is that the two counts are comparable. */
+            buf = malloc((size_t)w * h * (fmt565 ? 2 : 16));
+            if (!buf) continue;
+            [surf_slot[i].colour getBytes:buf bytesPerRow:w * (fmt565 ? 2 : 16)
+                              fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+            {
+                long nz = 0;
+                if (fmt565) {
+                    const uint16_t *src = (const uint16_t *)buf;
+                    for (y = 0; y < (size_t)w * h; ++y) if (src[y]) ++nz;
+                } else {
+                    const float *src = (const float *)buf;
+                    for (y = 0; y < (size_t)w * h; ++y) {
+                        size_t at = (size_t)y * 4;
+                        unsigned c = (unsigned)(fminf(1,fmaxf(0,src[at]))*31+.5f)<<11
+                                   | (unsigned)(fminf(1,fmaxf(0,src[at+1]))*63+.5f)<<5
+                                   | (unsigned)(fminf(1,fmaxf(0,src[at+2]))*31+.5f);
+                        if (c) ++nz;
+                    }
+                }
+                e->gpu_nonzero = nz;
+            }
+            free(buf);
+        }
+    }
+    for (i = 0; i < n; ++i)
+        fprintf(stderr, "  [SURFACE-CENSUS]   surface 0x%08X %ux%u%s%s%s"
+                " gpu_nonzero=%ld guest_nonzero=%ld of %u\n",
+                census[i].target, census[i].w, census[i].h,
+                census[i].bound ? " BOUND" : "",
+                census[i].presented ? " PRESENTED" : "",
+                census[i].owes_guest_ram ? " owes-guest-ram" : "",
+                census[i].gpu_nonzero, census[i].guest_nonzero,
+                census[i].w * census[i].h);
+    fprintf(stderr, "  [SURFACE-CENSUS]   %u surface(s) held; verdict: %s\n",
+            n, nv2a_surface_census_verdict_text(
+                    nv2a_surface_census_verdict(census, n)));
+    fflush(stderr);
+}
+
 /* CLEAR A SURFACE THE GUEST NAMES BUT THE BACKEND IS NOT CURRENTLY BOUND TO.
  *
  * Measured at gameplay, 16 Sep 2026: of 14,603 colour clears, 12,507 -- 86% --

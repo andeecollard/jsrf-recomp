@@ -272,6 +272,11 @@ extern void nv2a_dma_resolve_stats(unsigned long long *scans,
  * capture_draw, where the comment explaining the 444-sample getenv profile
  * lives; moving them up here would separate the code from its evidence. */
 static int pb_env_on(const char *name, int *slot);
+/* Its sibling, for the same reason: surface_census() reads a value-carrying
+ * switch (RECOMP_SURFACE_CENSUS=<stride>[:<after>]), which recomp_switch.h
+ * explicitly excludes from recomp_switch_on, and it sits above the
+ * definition next to capture_draw. */
+static const char *pb_env_str(const char *name, const char **slot);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
@@ -3243,9 +3248,63 @@ static void surface_audit_report(void)
         (unsigned long long)sa_flip, (unsigned long long)sa_flip_nothing,
         (unsigned long long)sa_flip_other, (unsigned long long)sa_flip_other_owed);
 }
+
+/* RECOMP_SURFACE_CENSUS=<stride>[:<after-seconds>] -- every stride-th flip
+ * from `after` onwards, print what each retained colour surface holds on the
+ * GPU beside what guest RAM holds for it, and a verdict. Up to 200 reports.
+ *
+ * THE QUESTION IT SETTLES, and no instrument on the Metal path could settle it
+ * before. When the screen is black, every number we have is read from GUEST
+ * RAM: [FB] samples it, [FLIPTRACE]'s surface list samples it, the presenter
+ * uploads it, and the player sees it. If the frame was rasterised but never
+ * written back, all four say "black" and every one of them is telling the
+ * truth about a picture that exists. The D3D11 branch answers this with
+ * nv2a_gpu_surface_report() -- "what the GPU holds rather than what guest RAM
+ * holds. Where they disagree is where the frame goes missing" -- and that
+ * macro is defined on Windows ONLY, so on macOS the block compiles out.
+ *
+ * It is NOT free: each report drains the GPU and reads back every held
+ * surface. That is why it takes a stride instead of being a plain trace, and
+ * it is also why the stride must be chosen to sample frames the player can SEE
+ * as well as black ones. The verdict's GPU_BLACK arm is an absence
+ * measurement, and an absence measurement with no positive control beside it
+ * proves nothing -- so a run that reports GPU-BLACK on a black frame is only
+ * evidence if the same run reports PICTURE-HELD on a visible one.
+ *
+ * BEFORE snapshot_surface(), which syncs: a sync pays the write-back debt and
+ * so destroys the very disagreement this is looking for. */
+static void surface_census(uint32_t presented_offset)
+{
+    static const char *slot;
+    static long stride = -1;
+    static double after;
+    static int on, reports;
+    static unsigned long flips;
+    const uint8_t *mem;
+
+    if (stride < 0) {
+        const char *env = pb_env_str("RECOMP_SURFACE_CENSUS", &slot);
+        const char *colon = env ? strchr(env, ':') : NULL;
+        on = env != NULL;
+        stride = env && *env ? strtol(env, NULL, 0) : 0;
+        if (stride < 1) stride = 1;
+        after = colon ? strtod(colon + 1, NULL) : 0.0;
+        if (!(after > 0.0)) after = 0.0;
+    }
+    if (!on || !nv2a_gpu_on() || reports >= 200) return;
+    if (trace_seconds() < after) return;
+    if ((flips++ % (unsigned long)stride) != 0) return;
+    ++reports;
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+    fprintf(stderr, "  [SURFACE-CENSUS] t=%.2f report %d, guest names"
+                    " 0x%08X at this flip\n",
+            trace_seconds(), reports, presented_offset);
+    nv2a_metal_surface_census_report(mem, presented_offset);
+}
 #else
 static void surface_audit(int at_flip) { (void)at_flip; }
 static void surface_audit_report(void) { }
+static void surface_census(uint32_t presented_offset) { (void)presented_offset; }
 #endif
 
 static void clear_surface(uint32_t param)
@@ -5211,6 +5270,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         if (nv2a_gpu_on() && nv2a_d3d11_event_trace())
             fprintf(stderr, "  [EV] FLIP   bound=%08X\n", s_gpu.color_offset);
 #endif
+        surface_census(s_gpu.color_offset);
         surface_audit(1);
         snapshot_surface();
         fb_watch();
