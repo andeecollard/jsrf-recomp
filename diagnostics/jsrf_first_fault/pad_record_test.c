@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "xinput_xbox.h"
+#include "jsrf_anchor.h"
 
 static int failures;
 
@@ -114,6 +115,20 @@ static unsigned long test_anchor(void) { return 0x0102u << 16 | (g_anchor_frame 
  * checkpoint: the fields the anchor read stayed zero until a save was
  * written, so the reference side could never disagree. */
 static unsigned long test_anchor_constant(void) { return 0ul; }
+
+/* Two anchors in JSRF's own packing that differ in EXACTLY ONE named field:
+ * sequence<<24 | chapter<<20 | mission<<16 | minutes, sequence 30 vs 31.
+ *
+ * The minute counter has to MOVE in both. A recording whose anchors never
+ * vary is UNVERIFIED by design -- section 8 is that rule -- so a constant
+ * reference here would be refused before any comparison happened, and the
+ * field-naming check would pass by never running. It moves identically on
+ * both sides, so the only difference the comparison can see is the one this
+ * section is about. */
+static unsigned long test_anchor_seq30(void)
+{ return 0x1E120000ul | ((g_anchor_frame / 60u) & 0xFFFFul); }
+static unsigned long test_anchor_seq31(void)
+{ return 0x1F120000ul | ((g_anchor_frame / 60u) & 0xFFFFul); }
 
 static void record_sequence(const char *path, const XBOX_INPUT_STATE *seq,
                             unsigned long frames)
@@ -433,6 +448,101 @@ int main(void)
         CHECK(ck_bad2 == 0, "the input round trip broke while checking the"
               " constant-anchor case, so its verdict means nothing");
         remove(cpath);
+        xbox_PadRecordSetAnchorFn(test_anchor);
+    }
+
+    /* ── 9. the replay's misalignment report NAMES the field ────────────
+     *
+     * Sections 7 and 8 prove the anchor comparison can fail and that a
+     * constant anchor is not scored as a failure. Neither exercises what a
+     * human then reads. Until now that was two hex words, and the describer
+     * added to name the field was covered only by its own unit test -- the
+     * callback had never fired through the actual record-and-replay path.
+     *
+     * So: record with one anchor, replay with another differing in exactly
+     * one field, and read back the line the input layer emitted. stderr is
+     * redirected around the replay because the emitted TEXT is the thing
+     * under test; asserting on the callback's arguments instead would pass
+     * even if the layer never printed what it was given. */
+    {
+        char mpath[600], lpath[600], line[4096];
+        int ck_ok3 = 0, ck_bad3 = 0, state_bad3 = 0, named = 0, saw_misalign = 0;
+        unsigned long at3 = 0;
+        size_t n;
+        FILE *cap;
+
+        snprintf(mpath, sizeof mpath, "%s.named", path);
+        snprintf(lpath, sizeof lpath, "%s.namedlog", path);
+
+        xbox_PadRecordSetAnchorFn(test_anchor_seq30);
+        xbox_PadRecordSetAnchorDescribeFn(jsrf_pad_anchor_describe);
+        xbox_PadRecordClose();
+        xbox_PadRecordOpen(mpath);
+        for (f = 0; f <= FRAMES; f++) {
+            g_anchor_frame = f;
+            xbox_PadRecordSampleAtFrame(&seq[f % FRAMES], f);
+        }
+        xbox_PadRecordClose();
+
+        /* The controlled mismatch: same recording, sequence one higher. */
+        xbox_PadRecordSetAnchorFn(test_anchor_seq31);
+        xbox_PadScriptReset();
+        snprintf(line, sizeof line, "@%s", mpath);
+        xbox_PadScriptLoad(line);
+
+        /* dup2, not freopen. Restoring with freopen("/dev/tty") loses stderr
+         * outright when there is no tty -- which is every ctest run, and is
+         * how this check first "passed" by printing nothing at all. Saving
+         * the descriptor and putting it back has no such dependency. */
+        fflush(stderr);
+        {
+            int saved = dup(fileno(stderr));
+            FILE *to = fopen(lpath, "w");
+            if (to) {
+                dup2(fileno(to), fileno(stderr));
+                for (f = 0; f <= FRAMES; f++) {
+                    XBOX_INPUT_STATE got;
+                    memset(&got, 0, sizeof got);
+                    g_anchor_frame = f;
+                    xbox_PadScriptApplyAtFrame(&got, f);
+                }
+                fflush(stderr);
+                fclose(to);
+            }
+            if (saved >= 0) {
+                dup2(saved, fileno(stderr));
+                close(saved);
+            }
+        }
+        xbox_PadReplayStatus(&ck_ok3, &ck_bad3, &at3, &state_bad3);
+
+        cap = fopen(lpath, "r");
+        if (cap) {
+            while (fgets(line, sizeof line, cap)) {
+                if (strstr(line, "STATE MISALIGNED")) {
+                    saw_misalign = 1;
+                    if (strstr(line, "Differs in: sequence 30->31"))
+                        named = 1;
+                    /* The fields that did NOT move must not be mentioned. */
+                    if (strstr(line, "chapter") || strstr(line, "mission")
+                            || strstr(line, "minutes"))
+                        named = -1;
+                }
+            }
+            fclose(cap);
+        }
+        remove(lpath);
+        remove(mpath);
+
+        CHECK(state_bad3 > 0, "a one-field anchor mismatch was not reported"
+              " as a state misalignment at all");
+        CHECK(saw_misalign, "no STATE MISALIGNED line was emitted for a"
+              " mismatch the status call counted");
+        CHECK(named == 1, "the misalignment line did not name the changed"
+              " field as \"sequence 30->31\" (named=%d); a report that names"
+              " the wrong field is worse than the hex it replaced", named);
+
+        xbox_PadRecordSetAnchorDescribeFn(NULL);
         xbox_PadRecordSetAnchorFn(test_anchor);
     }
 

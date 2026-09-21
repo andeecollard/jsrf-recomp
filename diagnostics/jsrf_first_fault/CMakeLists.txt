@@ -406,7 +406,10 @@ if(NOT WIN32)
     # as an input divergence. What it cannot cover is whether the guest's
     # frame counter advances in a live run; see the note at the foot of the
     # test.
-    add_executable(jsrf_pad_record_test pad_record_test.c)
+    # jsrf_anchor.c so section 9 drives the REAL describer through the real
+    # replay path, rather than a stand-in that could agree with a bug.
+    add_executable(jsrf_pad_record_test pad_record_test.c jsrf_anchor.c)
+    target_include_directories(jsrf_pad_record_test PRIVATE .)
     target_link_libraries(jsrf_pad_record_test PRIVATE xbox_input)
     add_test(NAME jsrf_pad_record COMMAND jsrf_pad_record_test)
 endif()
@@ -1047,6 +1050,22 @@ add_test(NAME jsrf_pusher_stream COMMAND jsrf_pusher_stream_test)
 # dead-branch population the ratchet gates on.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    # state_trace_diff.py restates jsrf_anchor.c's packing and cannot link
+    # against it, so the C side is made the oracle and the Python decoder is
+    # checked against vectors it emits. Two readers of one definition, with no
+    # way to make one import the other, is how the jump-table detector drifted.
+    # -B, and it is not cosmetic. Python invalidates a cached .pyc on source
+    # mtime AND size; an edit that changes neither is imported stale. Caught
+    # here for real on 21 Sep 2026 -- reverting a one-character perturbation
+    # (0x1F back to 0x0F) kept both, and this test went on reporting the
+    # mismatch it had already been fixed for. That is the same-second-mtime
+    # trap this project has already paid for once with a stale binary.
+    add_test(NAME jsrf_anchor_decode_python
+             COMMAND "${Python3_EXECUTABLE}" -B
+                     "${CMAKE_CURRENT_LIST_DIR}/test_anchor_decode_matches_c.py"
+                     "$<TARGET_FILE:jsrf_anchor_test>")
+    set_tests_properties(jsrf_anchor_decode_python PROPERTIES
+                         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     add_test(NAME jsrf_adx_loop_flags
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/backport_adx_loop_flags.py"

@@ -35,9 +35,47 @@ static void expect(const char *what, unsigned long rec, unsigned long live,
     ++failures;
 }
 
-int main(void)
+/* --vectors: emit (recorded, live, phrase) triples for the Python decoder in
+ * state_trace_diff.py to check itself against.
+ *
+ * That decoder cannot link against this one -- different language, different
+ * process -- so it is a second reader of a layout only this file owns, and
+ * the jump-table bug earlier today was exactly two readers of one definition
+ * drifting apart. It cannot be prevented here the way that one was; it can be
+ * DETECTED, by making the C side the oracle and having the test compare.
+ *
+ * Each field alone, boundary values at both ends of every field, and the
+ * combinations that exercise carry between adjacent fields. */
+static void emit_vectors(void)
+{
+    static const unsigned long v[][2] = {
+        { 0x1E120005ul, 0x1F120005ul },   /* sequence, mid-range      */
+        { 0x00120005ul, 0xFE120005ul },   /* sequence, 0 and max-1    */
+        { 0xFE120005ul, 0x00120005ul },   /* ...and back down         */
+        { 0x1E020005ul, 0x1EF20005ul },   /* chapter, 0 -> 15         */
+        { 0x1E100005ul, 0x1E1F0005ul },   /* mission, 0 -> 15         */
+        { 0x1E120000ul, 0x1E12FFFFul },   /* minutes, 0 -> 65535      */
+        { 0x1E12FFFFul, 0x1E120000ul },   /* minutes, wrap back       */
+        { 0x00000000ul, 0xFFFFFFFFul },   /* every field at once      */
+        { 0x1E120005ul, 0x1E120005ul },   /* identical: empty phrase  */
+        { 0x1E120005ul, 0x1F1F0006ul },   /* three fields at once     */
+    };
+    unsigned i;
+    for (i = 0; i < sizeof v / sizeof v[0]; ++i) {
+        char b[192];
+        jsrf_pad_anchor_describe(v[i][0], v[i][1], b, sizeof b);
+        printf("%08lx %08lx %s\n", v[i][0], v[i][1], b);
+    }
+}
+
+int main(int argc, char **argv)
 {
     char buf[192];
+
+    if (argc > 1 && !strcmp(argv[1], "--vectors")) {
+        emit_vectors();
+        return 0;
+    }
 
     /* Layout: sequence<<24 | chapter<<20 | mission<<16 | minutes */
     expect("sequence moved", 0x1E000003ul, 0x1F000003ul, "sequence 30->31");

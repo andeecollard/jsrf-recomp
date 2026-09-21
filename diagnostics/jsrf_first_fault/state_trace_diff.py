@@ -14,8 +14,11 @@ before the symptom, which is the whole point.
 READ THE FLOOR FIRST. Two runs of the SAME binary on the same recording do
 not produce identical traces: audio threads, kernel timers and the host's
 scheduler all move things the title does per frame. Diff those two first;
-that is the noise floor, and a cross-build difference is only a finding
-where it is EARLIER or LARGER than the floor. The tool prints the running
+that is the same-build divergence baseline, and a cross-build difference is
+only a finding where it is EARLIER or LARGER than that. "Same build" does not
+make a difference timing -- it narrows the candidates and no more; the
+transition table is what separates skew from divergent control flow. The tool
+prints the running
 gap in indirect calls so a slow drift can be told from a step.
 
     python3 diagnostics/jsrf_first_fault/state_trace_diff.py a.trace b.trace
@@ -36,6 +39,62 @@ FIELDS = ("a", "pt", "ic", "dr")
 # too. Field order matches the C describer deliberately.
 ANCHOR_FIELDS = (("sequence", 24, 0xFF), ("chapter", 20, 0x0F),
                  ("mission", 16, 0x0F), ("minutes", 0, 0xFFFF))
+
+
+def sq_transitions(rows, frames):
+    """(frame, state) for each change in the scene index, in order.
+
+    Taken from the ANCHOR's top byte rather than the line's own sq= field:
+    the parser already decodes the anchor, it is the same value by
+    construction (both are jsrf_seq_index), and using one source keeps this
+    tied to ANCHOR_FIELDS above. 0xFF is "the object did not validate", which
+    is not a state and must not read as a transition into one.
+    """
+    shift, mask = ANCHOR_FIELDS[0][1], ANCHOR_FIELDS[0][2]
+    out, last = [], None
+    for fr in frames:
+        s = (rows[fr]["a"] >> shift) & mask
+        if s == 0xFF or s == last:
+            continue
+        out.append((fr, s))
+        last = s
+    return out
+
+
+def report_transitions(A, B, frames):
+    """Separate a uniform time shift from divergent control flow.
+
+    THIS IS THE CHECK THAT LICENSES THE WORD "TIMING". Two runs of one build
+    disagreeing on a per-frame counter says only that they disagree. If the
+    scene states occur in the SAME ORDER with the SAME VALUES and the frame
+    offsets are uniform, a scheduling skew explains everything and nothing
+    took a different path. A missing, extra or reordered state cannot be
+    explained that way and is a real finding.
+    """
+    ta, tb = sq_transitions(A, frames), sq_transitions(B, frames)
+    sa, sb = [s for _, s in ta], [s for _, s in tb]
+    print("  scene transitions: a=%d b=%d" % (len(ta), len(tb)))
+    if sa != sb:
+        print("    ORDER OR CONTENT DIFFERS -- not a time shift, investigate")
+        print("      a: %s" % sa)
+        print("      b: %s" % sb)
+        return
+    print("    same states in the same order")
+    offs = []
+    print("    %-7s %-9s %-9s %s" % ("state", "a frame", "b frame", "a-b"))
+    for (fa, st), (fb, _) in zip(ta, tb):
+        offs.append(fa - fb)
+        print("    %-7d %-9d %-9d %+d" % (st, fa, fb, fa - fb))
+    nz = [o for o in offs if o]
+    if not nz:
+        print("    every transition on the same frame")
+    elif len(set(nz)) == 1:
+        print("    a single uniform shift of %+d frames, from state %d onward"
+              " -- consistent with skew, not with a different path taken"
+              % (nz[0], ta[offs.index(nz[0])][1]))
+    else:
+        print("    offsets are NOT uniform (%s) -- skew alone does not explain"
+              " this" % sorted(set(nz)))
 
 
 def anchor_fields(a, b):
@@ -105,12 +164,20 @@ def main():
     if ha.get("gen") != hb.get("gen"):
         print("  the two runs are on DIFFERENT gens: differences below are translation OR timing")
     else:
-        print("  same gen: differences below are timing (this is the floor)")
+        # NOT "these are timing". Same build narrows the cause; it does not
+        # establish one. Scheduling is the likely explanation, but uninitialised
+        # state, an address-dependent branch, or any other nondeterminism looks
+        # identical here. The transition table below is what distinguishes them:
+        # same states in the same order, uniformly shifted, is consistent with
+        # skew; missing, extra or reordered states is not, and is a finding.
+        print("  same gen: same-build divergence; cause UNCLASSIFIED"
+              " (see the transition table)")
     common = sorted(set(A) & set(B))
     if not common:
         print("  no common frames")
         return 2
     print("  frames compared: %d (f%d..f%d)" % (len(common), common[0], common[-1]))
+    report_transitions(A, B, common)
     print()
 
     first = {}
