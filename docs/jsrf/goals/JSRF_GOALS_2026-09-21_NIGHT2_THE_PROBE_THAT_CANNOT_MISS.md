@@ -142,6 +142,75 @@ The night handover's six arms all read these same questions off half-composed
 frames and every one of them is UNVERIFIED rather than refuted — they can now
 be re-asked properly.
 
+## G27 — THE LOAD SCREEN IS RENDER-TO-TEXTURE, 21 September, 17:00
+
+**Found with the xemu differential, which is the first one this project has
+ever run.** Driven to the Load screen: 119 s, 23,269,892 trace lines, 1.79 GB,
+3,671 flips. The player confirms xemu ANIMATES that screen where ours is
+black, so the two sides are matched on the thing that matters.
+
+### The correction first, because it changes what three runs meant
+
+Mode 4 reported TEXCOORD0 as flat and out of range, and that was read as the
+collapsed-q defect. **It is not.** The Load screen's stage-0 texture format is
+`0x11129`, and format `0x11` is `LU_IMAGE_R5G6B5` — **linear** — with its size
+coming from `SET_TEXTURE_IMAGE_RECT = 0x028001e0`, which is **640×480**, not
+from the log2 fields. Linear textures take **unnormalised** coordinates.
+
+Mode 4's `oor` flag tests against `[0,1]`, so **blue everywhere is the correct
+result for a linear texture** and indicates nothing. And `fract(q) = 0.5`
+uniformly is precisely a 1:1 full-screen blit with half-texel centring: at
+pixel *x* the coordinate is *x+0.5*, so `fract` is 0.5 at every pixel. The
+coordinates were right all along, and our own code already knew it —
+`nv2a_metal.m:674` clamps `uv` to `[0,w]×[0,h]` when linear.
+
+### What is actually happening
+
+Last 500 flips of the xemu trace:
+
+    render_to_texture : 500        exactly once per frame
+    surface_download  : 0
+    surface_upload    : 0
+
+    nv2a_pgraph_surface_render_to_texture
+        Rendering surface 0x03ec4000 to texture (640x480)
+
+`0x03ec4000` is one of the four `SET_TEXTURE_OFFSET[0]` values bound on that
+screen. **The Load screen composites itself by sampling a surface it has just
+rendered into**, once per frame, through a full-screen linear texture.
+
+That accounts for every measurement taken today, with nothing left over:
+
+| measurement | explained by |
+| --- | --- |
+| coverage 307200/307200 | a full-screen quad — what a composite is |
+| PRIMARY_COLOR white | modulate, so the texture carries the whole image |
+| TEXCOORD0 0..640 / 0..480 | a 1:1 blit, correct |
+| **TEXTURE0 black** | **the source surface never reached the sampler** |
+| the menu renders | drawn directly, no round trip |
+| the fade is correct | still direct |
+| then black | the first frame composited rather than drawn |
+
+### Why this is a lead and not a rewrite
+
+`nv2a_metal.m:4879` already calls `surface_pay_debt_for_range` before
+uploading each stage's bytes, and its comment names this exact case: *"a
+TEXTURE whose guest bytes are a surface this title has rendered into and not
+yet handed back … which is render-to-texture silently sampling last frame."*
+It also notes the walk "costs nothing when nothing is owed — which, with the
+deferral off, is always."
+
+**The next measurement is `RECOMP_SURFACE_CENSUS`**, which exists for exactly
+this question: it reads back every held surface and prints what the GPU holds
+beside what guest RAM holds, and "where they disagree is where the frame goes
+missing". GPU has the picture and guest RAM is black → the write-back is the
+defect, and `g_debt_paid_on_read` is the counter that says so.
+
+**NOT YET VERIFIED ON OUR SIDE:** that our Load screen binds a texture whose
+offset is one of our own surfaces. The guest code is identical and the title
+streams agreed method for method, so it should — but the next run carries
+`RECOMP_PB_SCAN=1` alongside the census and shows it rather than assuming it.
+
 ## WHAT IS EXPLICITLY NOT THE NEXT MOVE
 
 - **The white test first.** Player-driven, depends on being on the right
