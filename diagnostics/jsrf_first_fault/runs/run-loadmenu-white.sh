@@ -1,78 +1,80 @@
 #!/bin/sh
-# COVERAGE OR SHADING. One run, binary outcome.
+# THE WHITE TEST, ARMED BY THE DEFECT INSTEAD OF BY A CLOCK.
 #
-# EARNED, NOT ASSUMED. The unforced runs at 15:52 and 15:55 established the
-# defect and reproduced it twice, with fresh snapshots both times:
-#   - the MAIN MENU renders perfectly, then fades out correctly
-#   - the screen after it never arrives: 33 s of nonzero=0/307200
-#   - 0 stale repeats, 0 never-published -- the snapshot is not lying
-#   - [STAGE] 28 draw calls per frame THROUGHOUT, which is the evening
-#     handover's own signature for being on the Load screen
-#   - [TEXTURE] rejected=0, [METAL] hw refusals=0, and the triangle total
-#     climbs by ~38,000 a second while the screen is black
+# G26 answered the first half on 21 Sep 2026: across a 66-report player-driven
+# run, including 35 seconds of black, the guest's render target and ours agreed
+# every single time (66 MATCH, 0 COVERAGE, bound-ever=yes throughout, ring
+# check never failed). So the batches are aimed at a surface we parse and
+# present. What is left is whether they COVER any of it.
 #
-# So 28 batches a frame are accepted, submitted and rasterised, and put no
-# non-zero pixel on the presented surface. Two ways that happens and they need
-# opposite fixes:
-#   COVERAGE  they are not landing on the surface we present
-#   SHADING   they land on it and write zero
+# RECOMP_FRAG_FORCE=3 replaces every fragment with white at the end of shade(),
+# which both the fixed-function and the programmable path go through. If the 28
+# batches a frame cover pixels on the presented surface, the black screen turns
+# WHITE. If it stays black, they are covering nothing -- the geometry is being
+# thrown away somewhere between acceptance and rasterisation.
 #
-# RECOMP_FRAG_FORCE=3 returns opaque white from shade() for every fragment,
-# after the combiner, before the blend. Then:
-#   WHITE SHAPES APPEAR -> the batches DO cover the presented surface, and
-#                          their colour is the fault. A shading question.
-#   STILL BLACK         -> they never reach it. A coverage question, and the
-#                          next stop is D3D8__D3DDevice_SetRenderTarget
-#                          (0x0018d0f0) and CMGameGL::setRenderTargetFromArray
-#                          (0x0014d340) -- read the guest's own render target
-#                          and compare it with ours.
+# WHY THIS SCRIPT EXISTS IN THIS FORM. Mode 3 paints the MENU white too, so the
+# run cannot be navigated while it is on. The first attempt (15:57) ran 66
+# seconds pinned at 307200/307200 and never once reached the Load screen's 28
+# batches per frame. The second was stopped before its force was due. Then
+# RECOMP_FRAG_FORCE_AFTER=<seconds> was added -- and the player took 30 s to
+# reach the Load screen in one run and 50 s in the next, so any fixed second is
+# either early enough to blind the menu or late enough to miss the window.
 #
-# THE OBJECTION TO MODE 3 IS DEAD. Under a DST_COLOR/ZERO multiply, white is a
-# no-op and this test would prove nothing -- which is why it was worth checking
-# first. [BLEND-FADE] froze at 72 batches for the whole run, all rasterised,
-# none rejected, and did not move during the black. No multiply blend is
-# running on this screen, so white is a real signal.
+# So this arms on RECOMP_FRAG_FORCE_ON_BLACK instead: the force holds off until
+# the PRESENTED frame has been entirely black for N consecutive reports. A menu
+# is never all-zero and the defect is 33-35 seconds of it, so the trigger
+# cannot fire early and cannot be missed. It latches once armed.
 #
-# Renders incorrectly by construction. Snap dumps are on, so read snapNNN.
-#
-# DRIVE IT: title -> START -> main menu -> LOAD. Sit ~20 s, then close.
+# DRIVE IT: title -> START -> main menu -> LOAD. Then sit still. The screen
+# goes black, the force arms itself about three seconds later, and the next
+# frames answer the question. Give it 20 s after the black before closing.
 set -u
+
 SUPPORT="$HOME/Library/Application Support/JSRF"
 APP="$HOME/jsrf-build/JSRF.app"
+BLACK="${1:-3}"
 STAMP=$(date +%Y-%m-%d_%H%M%S)
 LOG="$HOME/jsrf-build/preserved-logs/last-run_${STAMP}_LOADMENU-WHITE-KEEP.log"
 DUMP="$HOME/jsrf-build/fbdump-${STAMP}-LOADMENU-WHITE-KEEP"
+
 . "$SUPPORT/paths.conf"
 : "${JSRF_HDD_ROOT:=$SUPPORT/hdd}"
 mkdir -p "$HOME/jsrf-build/preserved-logs" "$DUMP"
+
 echo "  log:  $LOG"
 echo "  dump: $DUMP"
 echo
-echo "  DRIVE THE MENUS NORMALLY. The force holds off until t=${AFTER:-45}s."
-echo "  START -> main menu -> LOAD, and BE SITTING ON THE BLACK SCREEN at t=${AFTER:-45}s."
-echo "  Everything turns white then. Sit ~20 s more, then close the window."
-echo "  Override with:  AFTER=60 ./run-loadmenu-white.sh"
+echo "  START -> main menu -> LOAD -> SIT STILL. The force arms itself"
+echo "  after $BLACK black reports. Give it 20 s, then close the window."
 echo
+
 RECOMP_XBE_PATH="$JSRF_GAME_DIR/default.xbe" \
 RECOMP_GAME_DIR="$JSRF_GAME_DIR" \
 RECOMP_HDD_ROOT="$JSRF_HDD_ROOT" \
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
-RECOMP_FRAG_FORCE=3 \
-RECOMP_FRAG_FORCE_AFTER=${AFTER:-45} \
+RECOMP_FRAG_FORCE=3 RECOMP_FRAG_FORCE_ON_BLACK="$BLACK" \
 RECOMP_FB_DUMP="$DUMP/" \
 RECOMP_REPORT_MS=1000 \
 "$APP/Contents/MacOS/jsrf-engine" >"$LOG" 2>&1
+
 echo
-echo "=== the switch was read? ==="
-grep -a 'FRAG-FORCE' "$LOG" | head -1
-echo "=== presented coverage, last 12 ==="
-grep -a '\[SNAP\]' "$LOG" | awk '{t="";n="";for(i=1;i<=NF;i++){if($i ~ /^t=/)t=$i; if($i ~ /^nonzero=/)n=$i} print t,n}' | tail -12
-echo "=== freshness: repeats=$(grep -ac 'SAME FRAME AS THE LAST DUMP' "$LOG") nothing-published=$(grep -ac 'NOTHING PUBLISHED' "$LOG") ==="
-echo "=== DID WE REACH THE LOAD SCREEN? 28 batches a frame is the signature ==="
-grep -ac '(28 calls)' "$LOG"
-grep -a '\[STAGE\] per frame' "$LOG" | grep -o '([0-9]* calls)' | sort -n -t'(' -k2 | uniq -c | tail -8
-echo "=== lowest presented coverage reached ==="
-grep -a '\[SNAP\]' "$LOG" | awk '{for(i=1;i<=NF;i++) if($i ~ /^nonzero=/){split($i,a,"[=/]"); print a[2]}}' | sort -n | head -3
+echo "=== did the run reach the Load screen? (black reports) ==="
+grep -ac 'nonzero=0/307200' "$LOG"
+echo "=== DID THE FORCE ARM? (if not, the experiment never ran) ==="
+grep -a 'FRAG-FORCE' "$LOG"
+echo "=== snapshot freshness -- both must be 0 ==="
+grep -ac 'SAME FRAME AS THE LAST DUMP' "$LOG"
+grep -ac 'NOTHING PUBLISHED' "$LOG"
+echo
+echo "=== THE ANSWER: presented coverage across the arm ==="
+echo "    black ... black ... ARMED ... then WHITE means the batches were"
+echo "    covering the surface (SHADING); still black means they were not."
+grep -a '\[SNAP\]' "$LOG" | sed -E 's/.* (t=[0-9.]+) .*nonzero=([0-9]+).*/  \1 nonzero=\2/' | tail -30
+echo
+echo "=== G26 stayed consistent? (should still be all MATCH) ==="
+printf '  %-10s %s\n' MATCH    "$(grep -ac '| MATCH' "$LOG")"
+printf '  %-10s %s\n' COVERAGE "$(grep -ac '| COVERAGE' "$LOG")"
 echo
 echo "log:  $LOG"
 echo "dump: $DUMP"

@@ -1688,13 +1688,47 @@ static int legacy_zclamp_on(void)
  * device RECOMP_GLYPH_DUMP_AFTER and RECOMP_FF_BATCH_DUMP_AFTER already use
  * for the same reason. Drive the menus normally, stop on the screen under
  * test, and the force arrives on top of it. */
+/* RECOMP_FRAG_FORCE_ON_BLACK=<reports> -- ARM OFF THE DEFECT, NOT OFF A CLOCK.
+ *
+ * RECOMP_FRAG_FORCE_AFTER fixed the "the menu is white so it cannot be
+ * navigated" problem and left a second one: the person driving has to reach
+ * the screen under test BEFORE the second you guessed. They took 30 s to
+ * reach the Load screen in one run and 50 s in the next, so any fixed
+ * `after` is either early enough to blind the menu or late enough to miss the
+ * window. That is the same failure that made the white test worthless twice.
+ *
+ * This arms on the thing being investigated instead. The presented frame is
+ * all-zero for 33-35 seconds on the Load screen and is never all-zero on a
+ * menu, so N consecutive black reports IS the condition -- it cannot fire
+ * early and it cannot be missed. Once armed it LATCHES: the force turns the
+ * screen white, the black that armed it goes away, and switching off then
+ * would destroy the reading.
+ *
+ * Read it as: black, then armed, then either the screen goes WHITE -- the
+ * batches do cover the presented surface and the defect is shading -- or it
+ * STAYS BLACK, and they never covered it. The run carries its own positive
+ * control, because the same run shows the menu rendering beforehand. */
+static int s_frag_force_armed;
+
+void nv2a_metal_frag_force_arm(void)
+{
+  if(s_frag_force_armed) return;
+  s_frag_force_armed=1;
+  fprintf(stderr,"  [FRAG-FORCE] ARMED by the black itself. Everything from"
+      " here is painted by the force, so a white screen now means the batches"
+      " were covering the surface all along.\n");
+  fflush(stderr);
+}
+
 static uint32_t frag_force_mode(void)
-{ static int init; static uint32_t mode; static double after;
+{ static int init; static uint32_t mode; static double after; static long on_black;
   extern double xbox_TraceSeconds(void);
   if(!init){ const char*e=getenv("RECOMP_FRAG_FORCE");
              mode=(e&&*e)?(uint32_t)strtoul(e,NULL,10):0u; init=1;
              { const char*a=getenv("RECOMP_FRAG_FORCE_AFTER");
                after=(a&&*a)?atof(a):0.0; }
+             { const char*b=getenv("RECOMP_FRAG_FORCE_ON_BLACK");
+               on_black=(b&&*b)?strtol(b,NULL,10):0; }
              if(mode) fprintf(stderr,"  [FRAG-FORCE] mode %u -- every fragment"
                  " is replaced by %s. THIS RENDERS INCORRECTLY.\n", mode,
                  mode==1?"its TEXTURE0 sample":mode==2?"its PRIMARY_COLOR":
@@ -1702,8 +1736,13 @@ static uint32_t frag_force_mode(void)
                  "nothing -- shade() ignores an unknown mode");
              if(mode&&after>0.0)
                  fprintf(stderr,"  [FRAG-FORCE] holding off until t=%.0fs --"
-                     " drive the menus normally until then.\n", after); }
+                     " drive the menus normally until then.\n", after);
+             if(mode&&on_black>0)
+                 fprintf(stderr,"  [FRAG-FORCE] holding off until the presented"
+                     " frame has been BLACK for %ld reports. Drive the menus"
+                     " normally; the defect arms this itself.\n", on_black); }
   /* Checked per draw, not cached: the whole point is that it changes. */
+  if(mode&&on_black>0&&!s_frag_force_armed) return 0u;
   if(mode&&after>0.0&&xbox_TraceSeconds()<after) return 0u;
   return mode; }
 

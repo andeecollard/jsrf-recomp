@@ -76,6 +76,12 @@ int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
                          uint16_t inputs_read);
 void nv2a_metal_vsh_constants(const float (*c)[4]);
 void nv2a_metal_vsh_clear(void);
+
+/* Arm RECOMP_FRAG_FORCE_ON_BLACK. Called by whoever can see the PRESENTED
+ * frame -- the pushbuffer's report timer -- because the backend cannot: it
+ * sees draws, not what reached the screen. Latches; calling it twice is a
+ * no-op. */
+void nv2a_metal_frag_force_arm(void);
 int nv2a_metal_shader_blend_mode(void);
 int nv2a_metal_shader_blend_for(int mode, int blend, int dither);
 /* Stable diagnostic label for the most recent -1 result. */

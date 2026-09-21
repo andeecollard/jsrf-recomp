@@ -6136,6 +6136,35 @@ void nv2a_pb_exec_report(void)
                     t.back0_surface, t.back0_data, t.device);
         }
     }
+    /* ARM THE FRAGMENT FORCE OFF THE BLACK ITSELF.
+     *
+     * The white test has twice been worth nothing because it depends on a
+     * person reaching the screen under test before a second chosen in
+     * advance -- 30 s in one run, 50 s in the next. The presented frame is
+     * all-zero for 33-35 s on the Load screen and is never all-zero on a
+     * menu, so the defect is a better trigger than any clock: it cannot fire
+     * early and it cannot be missed.
+     *
+     * Counted on the report timer rather than per flip because
+     * snapshot_nonzero() walks the whole 640x480 frame, and because [SNAP]
+     * already prints the number this reads, so the log shows the arm's own
+     * input beside its decision. */
+    {
+        static long on_black = -1;
+        static unsigned black_reports;
+        if (on_black < 0) {
+            const char *e = getenv("RECOMP_FRAG_FORCE_ON_BLACK");
+            on_black = (e && *e) ? strtol(e, NULL, 10) : 0;
+        }
+        if (on_black > 0) {
+            if (snapshot_nonzero() == 0) {
+                if (++black_reports == (unsigned)on_black)
+                    nv2a_metal_frag_force_arm();
+            } else {
+                black_reports = 0;
+            }
+        }
+    }
     frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     nv2a_texture_copy_census();
