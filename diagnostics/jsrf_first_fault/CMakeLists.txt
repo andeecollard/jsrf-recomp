@@ -265,6 +265,16 @@ add_executable(jsrf_combiner_graffiti_test combiner_graffiti_test.c
 target_include_directories(jsrf_combiner_graffiti_test PRIVATE .)
 add_test(NAME jsrf_combiner_graffiti COMMAND jsrf_combiner_graffiti_test)
 
+# THE OUTPUT CONTROL WORD'S BIT LAYOUT. This tree had two decoders for it and
+# they disagreed about CD and AB for two handovers, both of which wrote the
+# disagreement down and neither of which resolved it -- because d3d8_combiners.c
+# builds only on Windows and includes <d3d11.h> from its own header, so nothing
+# in the suite could reach its copy. The layout lives in d3d8_combiner_bits.h
+# now and both paths call it; this pins every field against xemu's
+# parse_combiner_output, plus the real output word of JSRF's graffiti shader.
+add_executable(jsrf_combiner_output_word_test combiner_output_word_test.c)
+add_test(NAME jsrf_combiner_output_word COMMAND jsrf_combiner_output_word_test)
+
 add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")

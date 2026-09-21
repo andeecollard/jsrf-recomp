@@ -34,6 +34,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
+#include "d3d8_combiner_bits.h"
 #include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
@@ -154,25 +155,57 @@ static void parse_four_inputs(DWORD dword, NV2ACombinerInput inputs[4])
 /**
  * Parse a 32-bit output configuration DWORD for one channel.
  *
- * Output DWORD layout:
- *   [3:0]   AB destination register
- *   [7:4]   CD destination register
+ * Output DWORD layout (xemu parse_combiner_output; see d3d8_combiners.h for
+ * what reading CD and AB the other way round cost this path):
+ *   [3:0]   CD destination register      <-- LOW nibble is CD, not AB
+ *   [7:4]   AB destination register
  *   [11:8]  SUM destination register
  *   [12]    CD dot product flag
  *   [13]    AB dot product flag
  *   [14]    mux_sum flag (mux instead of sum)
  *   [17:15] output mapping (scale/bias)
- *   Bits 18-31 are reserved/unused.
+ *   [18]    CD blue-to-alpha
+ *   [19]    AB blue-to-alpha
+ *   Bits 20-31 are unmodelled. nv2a_texture_copy.c REFUSES a program that
+ *   sets one; this path has no refusal, so it shades them as if they were
+ *   clear. Same blind spot as before this fix, now written down.
  */
 static void parse_output(DWORD dword, NV2ACombinerOutput *output)
 {
-    output->ab_dst     = (NV2ACombinerRegister)((dword >>  0) & 0xF);
-    output->cd_dst     = (NV2ACombinerRegister)((dword >>  4) & 0xF);
-    output->sum_dst    = (NV2ACombinerRegister)((dword >>  8) & 0xF);
-    output->cd_dot     = (dword >> 12) & 1;
-    output->ab_dot     = (dword >> 13) & 1;
-    output->mux_sum    = (dword >> 14) & 1;
-    output->output_map = (NV2AOutputMapping)((dword >> 15) & 0x7);
+    /* d3d8_combiner_bits.h, not a second copy of the shifts -- a second copy
+     * is what let this path read CD and AB the wrong way round while the NV2A
+     * path had them right. */
+    NV2AOutputWord w;
+    nv2a_parse_output_word((uint32_t)dword, &w);
+    output->cd_dst     = (NV2ACombinerRegister)w.cd_dst;
+    output->ab_dst     = (NV2ACombinerRegister)w.ab_dst;
+    output->sum_dst    = (NV2ACombinerRegister)w.sum_dst;
+    output->cd_dot     = (int)w.cd_dot;
+    output->ab_dot     = (int)w.ab_dot;
+    output->mux_sum    = (int)w.mux_sum;
+    output->output_map = (NV2AOutputMapping)w.output_map;
+    output->cd_blue_to_alpha = (int)w.cd_blue_to_alpha;
+    output->ab_blue_to_alpha = (int)w.ab_blue_to_alpha;
+}
+
+/* The alpha word has no dot and no blue-to-alpha; see the header. This path
+ * read bits 12 and 13 out of it as dot flags, which is how a stage with an
+ * alpha mux could also claim an alpha dot product -- harmless only because
+ * nothing downstream reads alpha_out->ab_dot. Parsed correctly now so that
+ * stays true by construction rather than by luck. */
+static void parse_alpha_output(DWORD dword, NV2ACombinerOutput *output)
+{
+    NV2AOutputWord w;
+    nv2a_parse_alpha_output_word((uint32_t)dword, &w);
+    output->cd_dst     = (NV2ACombinerRegister)w.cd_dst;
+    output->ab_dst     = (NV2ACombinerRegister)w.ab_dst;
+    output->sum_dst    = (NV2ACombinerRegister)w.sum_dst;
+    output->cd_dot     = 0;
+    output->ab_dot     = 0;
+    output->mux_sum    = (int)w.mux_sum;
+    output->output_map = (NV2AOutputMapping)w.output_map;
+    output->cd_blue_to_alpha = 0;
+    output->ab_blue_to_alpha = 0;
 }
 
 /* ================================================================
@@ -182,7 +215,6 @@ static void parse_output(DWORD dword, NV2ACombinerOutput *output)
 void d3d8_combiners_parse_token(DWORD token, const DWORD *rs,
                                 NV2ACombinerState *state)
 {
-    int i;
     memset(state, 0, sizeof(*state));
 
     /* Bits [3:0]: number of active combiner stages (1-8) */
@@ -249,7 +281,7 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
     for (i = 0; i < NV2A_MAX_COMBINER_STAGES; i++) {
         parse_output(rs[D3DRS_PSRGBOUTPUTS0 + i],
                      &state->stages[i].rgb_output);
-        parse_output(rs[D3DRS_PSALPHAOUTPUTS0 + i],
+        parse_alpha_output(rs[D3DRS_PSALPHAOUTPUTS0 + i],
                      &state->stages[i].alpha_output);
     }
 
@@ -589,6 +621,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          * AB_rgb = map(A) * map(B)    (component-wise, or dot3 if ab_dot)
          * CD_rgb = map(C) * map(D)    (component-wise, or dot3 if cd_dot)
          */
+        /* Blue-to-alpha has to be written AFTER the alpha block, and ab_rgb
+         * is scoped to the RGB block, so the blue it needs is carried out in
+         * a scalar declared here. Emitted only for a stage that asks for it,
+         * so an ordinary stage's HLSL is unchanged. */
+        /* NAMED PER STAGE. These are declared at function scope in the
+         * emitted HLSL -- they have to outlive the RGB block and be readable
+         * after the alpha block -- so a single name would be redeclared by
+         * the second stage that asks for blue-to-alpha, and JSRF's tag shader
+         * is the title's only EIGHT-stage program. */
+        if (rgb_out->ab_blue_to_alpha && rgb_out->ab_dst != NV2A_REG_ZERO)
+            EMIT("    float ab_b2a_%d = 0;\n", i);
+        if (rgb_out->cd_blue_to_alpha && rgb_out->cd_dst != NV2A_REG_ZERO)
+            EMIT("    float cd_b2a_%d = 0;\n", i);
         EMIT("    {\n");
 
         /* AB product */
@@ -647,6 +692,14 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  reg_name(rgb_out->sum_dst), omp, oms);
         }
 
+        /* The mapped product's blue, carried past this block's closing brace.
+         * Parenthesised because omp/oms are a call wrapper -- `saturate(x)` --
+         * and `.b` has to bind to the whole of it. */
+        if (rgb_out->ab_blue_to_alpha && rgb_out->ab_dst != NV2A_REG_ZERO)
+            EMIT("        ab_b2a_%d = (%sab_rgb%s).b;\n", i, omp, oms);
+        if (rgb_out->cd_blue_to_alpha && rgb_out->cd_dst != NV2A_REG_ZERO)
+            EMIT("        cd_b2a_%d = (%scd_rgb%s).b;\n", i, omp, oms);
+
         EMIT("    }\n");
 
         /*
@@ -695,6 +748,29 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         }
 
         EMIT("    }\n\n");
+
+        /* BLUE-TO-ALPHA, AND IT HAS TO BE LAST.
+         *
+         * The flag REPLACES the destination register's alpha with the RGB
+         * product's blue; it does not compete with the alpha combiner for it.
+         * Emitting it before the alpha block lets the alpha combiner overwrite
+         * the very value the flag exists to deliver, and the surface still
+         * draws -- plausibly, and with the wrong mask. nv2a_texture_copy.c
+         * records paying for exactly that ordering once already.
+         *
+         * It reads the RGB output word's destinations and the RGB products,
+         * because the alpha word carries neither a dot nor this flag. Its own
+         * block, after the alpha block's closing brace, so `ab_rgb` has to be
+         * recomputed -- hence the dot/mapping repeat below rather than a
+         * reference to the RGB block's locals, which are out of scope.
+         *
+         * This is what lets a shader move a mask it extracted with a dot
+         * product into alpha, which is what JSRF's tag decal does: its output
+         * word 0x000820D0 sets AB_DOT and AB_BLUE_TO_ALPHA together. */
+        if (rgb_out->ab_blue_to_alpha && rgb_out->ab_dst != NV2A_REG_ZERO)
+            EMIT("    %s.a = ab_b2a_%d;\n", reg_name(rgb_out->ab_dst), i);
+        if (rgb_out->cd_blue_to_alpha && rgb_out->cd_dst != NV2A_REG_ZERO)
+            EMIT("    %s.a = cd_b2a_%d;\n", reg_name(rgb_out->cd_dst), i);
     }
 
     /* ---- Final combiner ----

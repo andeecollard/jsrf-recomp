@@ -6,6 +6,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include "../recomp_switch.h"   /* RECOMP_TEXMODE_APPROX */
+#include "../d3d/d3d8_combiner_bits.h"
 
 #define M(a) m[(a)/4]
 
@@ -33,6 +36,23 @@ static unsigned long s_rej_const, s_rej_texmode, s_rej_texstage, s_rej_alpha;
  * bursty number: the shape of an effect that only appears sometimes, which is
  * what "boost flickers" would look like from in here. */
 static unsigned long s_texmode_seen[32][4];
+static unsigned long s_texmode_approx[32][4];
+
+/* RECOMP_TEXMODE_APPROX: draw unimplemented bump modes flat rather than
+ * dropping the draw. Read once; see the note at the gate.
+ *
+ * THROUGH THE HELPER, not `getenv(...) != NULL`. This switch changes what
+ * reaches the screen, and the A/B the handover asked for -- "run with
+ * RECOMP_TEXMODE_APPROX=0; if the flicker persists it is not mine" -- is
+ * exactly the arm a presence test cannot express: =0 would have turned the
+ * approximation ON and reported the two arms as agreeing. recomp_switch.h
+ * records three earlier conclusions lost to that reading. */
+static int texmode_approx_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_TEXMODE_APPROX");
+    return on;
+}
 static unsigned long s_rej_count_hist[10];
 #define VR_OCW_SLOTS 16
 static uint32_t s_bad_ocw[VR_OCW_SLOTS]; static unsigned long s_bad_ocw_n[VR_OCW_SLOTS];
@@ -163,6 +183,31 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     }
     for (unsigned u=0;u<4;++u) {
         unsigned mode=(M(0x1e70)>>(5*u))&31;
+        /* REFUSING A DRAW IS THE WORST AVAILABLE FALLBACK, and for BUMPENVMAP
+         * it is what we have been doing.
+         *
+         * Modes 6 and 7 (BUMPENVMAP, BUMPENVMAP_LUMINANCE -- xemu psh.c)
+         * sample this unit's texture at coordinates perturbed by the previous
+         * stage's output. We implement neither, and an unimplemented mode
+         * drops the ENTIRE draw: not a flat effect, a hole where the geometry
+         * should be. A player reported exactly that on 21 Sep 2026 -- "almost
+         * black and purple transition between title card/intro/corn" -- in a
+         * session whose only renderer refusal was 179 draws, unit 1 mode 6,
+         * in one ten-second burst.
+         *
+         * Approximating the perturbation as ZERO makes it a plain 2D fetch.
+         * The distortion is lost and the surface is drawn, which is strictly
+         * closer to the frame than nothing at all. It is an approximation and
+         * it is named as one, so the census below still reports what was
+         * approximated rather than pretending the mode is implemented.
+         *
+         * Off by default like every other behaviour switch here: it changes
+         * what reaches the screen and has to be measurable against its own
+         * absence. */
+        if ((mode==6 || mode==7) && texmode_approx_on()) {
+            s_texmode_approx[mode][u]++;
+            mode=1;
+        }
         if (mode>1) {
             unsigned m2, u2;
             /* Record the whole program's modes, not just the one that tripped:
@@ -308,11 +353,34 @@ target_state:
 void nv2a_texture_copy_census(void)
 {
     unsigned f;
+    int approxed = 0;
+    {   /* AN APPROXIMATION THAT SUCCEEDS IS STILL NOT THE HARDWARE, so it has
+         * to keep this census alive on its own. Placed before the early-out
+         * because the first version of RECOMP_TEXMODE_APPROX sat after it:
+         * the moment the approximation removed the last refusal, the whole
+         * report went silent and took the record of what had been
+         * approximated with it. Working and invisible is not better than
+         * broken and visible. */
+        unsigned m, u;
+        for (m = 0; m < 32 && !approxed; ++m)
+            for (u = 0; u < 4 && !approxed; ++u) approxed = s_texmode_approx[m][u] != 0;
+    }
+    /* THE SWITCH STATE OUTLIVES THE SILENCE RULE, because the arm that needs
+     * it is the arm with nothing to report. The handover's A/B is
+     * "RECOMP_TEXMODE_APPROX=0; if the flicker persists it is not mine", and
+     * the =0 arm can legitimately refuse nothing and approximate nothing --
+     * at which point every line below is suppressed and the run cannot say
+     * which arm it was. ab_score.py then compares two arms that name no
+     * switch state and reports them as the same arm. One line is not the
+     * table of zeroes the rule is about. */
+    fprintf(stderr, "[COMBINER] RECOMP_TEXMODE_APPROX %s\n",
+            texmode_approx_on() ? "on" : "OFF");
+
     /* Silent when there is nothing to report: a clean run should not carry a
      * table of zeroes that a later reader has to check is a table of zeroes. */
     if (!s_reject_hdr && !s_reject_dma && !s_reject_combiner_out && !s_rej_final
             && !s_rej_control && !s_rej_outreg && !s_rej_inreg && !s_rej_const
-            && !s_rej_texmode && !s_rej_texstage && !s_rej_alpha)
+            && !s_rej_texmode && !s_rej_texstage && !s_rej_alpha && !approxed)
         return;
     fprintf(stderr, "[TEXFMT] gate refusals by texture format"
             " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06/0x07 rgba8,"
@@ -338,6 +406,27 @@ void nv2a_texture_copy_census(void)
         if (s_rej_count_hist[f])
             fprintf(stderr, "[COMBINER]   refused with stage count %u: %lu\n",
                     f, s_rej_count_hist[f]);
+    {   /* What was DRAWN FLAT rather than dropped. Reported whether or not
+         * anything was refused: an approximation that silently succeeds is
+         * still a difference from the hardware and has to be visible here.
+         *
+         * THE SWITCH NAMES ITSELF whether or not it did anything. ab_score.py
+         * refuses to compare two arms that report the same switch state, and
+         * it can only check a switch that says what it read -- which is the
+         * difference between "I set the variable" and "the model read it".
+         * The state itself is printed above, before the early-out. */
+        unsigned m, u;
+        if (approxed) {
+            fprintf(stderr, "[COMBINER]   texture shader modes APPROXIMATED as"
+                            " plain 2D (RECOMP_TEXMODE_APPROX):\n");
+            for (m = 0; m < 32; ++m)
+                for (u = 0; u < 4; ++u)
+                    if (s_texmode_approx[m][u])
+                        fprintf(stderr, "[COMBINER]     unit %u mode %2u  x%lu"
+                                "   <-- drawn without the displacement\n",
+                                u, m, s_texmode_approx[m][u]);
+        }
+    }
     if (s_rej_texmode) {
         unsigned m, u;
         fprintf(stderr, "[COMBINER]   texture shader modes on refused draws"
@@ -770,12 +859,18 @@ static float combiner_map(unsigned mode,float x)
 static void combiner_stage_output(float regs[14][4],uint32_t cw,uint32_t aw,
                                   float ab[4],float cd[4],float r0_alpha)
 {
-    unsigned cd_dst=cw&15, ab_dst=(cw>>4)&15, sum_dst=(cw>>8)&15;
-    unsigned a_cd_dst=aw&15, a_ab_dst=(aw>>4)&15, a_sum_dst=(aw>>8)&15;
-    unsigned cd_dot=(cw>>12)&1, ab_dot=(cw>>13)&1;
-    unsigned mux=(cw>>14)&1, map=(cw>>15)&7;
-    unsigned cd_b2a=(cw>>18)&1, ab_b2a=(cw>>19)&1;
-    unsigned a_mux=(aw>>14)&1, a_map=(aw>>15)&7;
+    /* THROUGH THE SHARED DECODER. These shifts were right and d3d8_combiners.c's
+     * copy of them was inverted, for at least two handovers, because there were
+     * two copies. There is one now; this path's numbers are unchanged. */
+    NV2AOutputWord C, A;
+    nv2a_parse_output_word(cw, &C);
+    nv2a_parse_alpha_output_word(aw, &A);
+    unsigned cd_dst=C.cd_dst, ab_dst=C.ab_dst, sum_dst=C.sum_dst;
+    unsigned a_cd_dst=A.cd_dst, a_ab_dst=A.ab_dst, a_sum_dst=A.sum_dst;
+    unsigned cd_dot=C.cd_dot, ab_dot=C.ab_dot;
+    unsigned mux=C.mux_sum, map=C.output_map;
+    unsigned cd_b2a=C.cd_blue_to_alpha, ab_b2a=C.ab_blue_to_alpha;
+    unsigned a_mux=A.mux_sum, a_map=A.output_map;
     float ab_rgb[3], cd_rgb[3], sum_rgb[3];
     unsigned k;
 

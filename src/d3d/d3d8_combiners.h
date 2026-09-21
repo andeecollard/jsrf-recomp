@@ -162,14 +162,30 @@ typedef struct NV2ACombinerInput {
  * Output configuration for one channel (RGB or alpha) of a stage.
  *
  * Packed in hardware output word:
- *   [3:0]  ab_dst       - destination register for AB product
- *   [7:4]  cd_dst       - destination register for CD product
+ *   [3:0]  cd_dst       - destination register for CD product
+ *   [7:4]  ab_dst       - destination register for AB product
  *   [11:8] sum_dst      - destination register for AB+CD sum
  *   [12]   cd_dot       - 1: CD uses dot product instead of multiply
  *   [13]   ab_dot       - 1: AB uses dot product instead of multiply
  *   [14]   mux_sum      - 1: mux instead of sum (R0.a selects AB or CD)
  *   [17:15] output_map  - output scale/bias (NV2AOutputMapping)
- *   [18]   ab_cd_mux    - unused alias, same as mux_sum
+ *   [18]   cd_blue_to_alpha - CD's blue REPLACES that register's alpha
+ *   [19]   ab_blue_to_alpha - AB's blue REPLACES that register's alpha
+ *
+ * THE FIRST TWO FIELDS WERE THE WRONG WAY ROUND HERE, and so was bit 18,
+ * which this comment called "an unused alias, same as mux_sum". CD is the
+ * LOW nibble. Checked against xemu's parse_combiner_output --
+ * `out->cd = value & 0xF; out->ab = (value >> 4) & 0xF;` -- and against
+ * nv2a_texture_copy.c's combiner_stage_output, which had it right and said
+ * in its own comment that this file was inverted. Two handovers recorded that
+ * disagreement and neither resolved it.
+ *
+ * What it cost: JSRF's graffiti shader emits colour output word 0x000820D0,
+ * which is CD=0, AB=13(R1), AB_DOT, AB_BLUE_TO_ALPHA. Read the old way that
+ * is ab_dst=0 -- NV2A_REG_ZERO, which the emitter treats as "discard" -- so
+ * the tag's dot product was thrown away and the unused CD product was written
+ * to R1 in its place. The same shader was fixed on the NV2A path in 777f04a
+ * ("The tags paint"); on the D3D11 path it was still broken, for this reason.
  *
  * The "dot product" flag means AB = dot3(A, B) instead of A * B
  * component-wise. This is the key to bump mapping on NV2A.
@@ -182,6 +198,12 @@ typedef struct NV2ACombinerOutput {
     int                  cd_dot;     /* 1 = dot product for CD */
     int                  mux_sum;    /* 1 = mux(R0.a, AB, CD) instead of AB+CD */
     NV2AOutputMapping    output_map; /* Scale/bias applied to results */
+    /* Blue-to-alpha: the product's BLUE component is written to the
+     * destination register's ALPHA, replacing whatever the alpha combiner put
+     * there. Only the RGB output word carries these; the alpha word has no
+     * dot and no blue-to-alpha. */
+    int                  ab_blue_to_alpha;
+    int                  cd_blue_to_alpha;
 } NV2ACombinerOutput;
 
 /* ================================================================
