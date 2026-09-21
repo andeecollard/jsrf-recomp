@@ -15,6 +15,11 @@ there, beside the build rather than inside the repository, and
 `$SUPPORT/paths.conf` supplies the game and HDD roots. Running them from this
 directory or from `~/jsrf-build` makes no difference.
 
+**`~/jsrf-build/run-*.sh` are now SYMLINKS INTO THIS DIRECTORY.** Editing
+either path edits the same file, which is the point — they drifted out of
+version control once already. If you want a throwaway variant, copy it to a
+new name rather than breaking the link.
+
 ## The ones that matter right now
 
 | script | what it asks |
@@ -25,6 +30,7 @@ directory or from `~/jsrf-build` makes no difference.
 | `run-loadmenu-white.sh` | `FRAG_FORCE=3` with `AFTER` set. **Has never reached its own condition** — see the handover of 21 Sep night 2. |
 | `run-vshcpu.sh [secs]` | The CPU-interpreter arm, the only one where the census can see `oT0`. |
 | `run-t0census.sh [secs]` | The flat-texture-coordinate census. |
+| `run-rtprobe.sh [secs]` | **G26's positive control.** Unattended boot into the attract loop; asks only whether the `[RT]` probe itself is believable on a screen that visibly renders. Prove it here before believing it on a black screen. |
 
 ## The rule they exist to enforce
 
