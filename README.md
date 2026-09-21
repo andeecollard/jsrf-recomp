@@ -10,7 +10,8 @@ fork specialised to get one title running, with the general fixes sent back
 upstream where they belong.
 
 > **This is a work in progress, not a release.** It boots, renders, plays music
-> and reaches gameplay. It also runs at about half the frame rate it should,
+> and reaches gameplay, and as of 21 September 2026 the Load and character
+> select screens render as they do in xemu. It also runs at about half the frame rate it should,
 > faults in 46 of 390 recorded runs (11.8%) — with the hazard concentrated at
 > the title-menu-to-first-mission transition rather than spread through the
 > run — and gets the intro card transitions wrong. The honest state is in

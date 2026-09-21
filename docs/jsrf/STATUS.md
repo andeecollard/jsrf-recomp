@@ -1,8 +1,29 @@
 # Where Jet Set Radio Future has got to
 
 Last measured 14 September 2026, against the tree at `a113ae9`, title built
-`-O2`, on an Apple M1 Max. Every number here came from a run; where something
-is believed rather than measured it says so.
+`-O2`, on an Apple M1 Max, with the 21 September section below added against
+`49ff7e2`. Every number here came from a run; where something is believed
+rather than measured it says so.
+
+## Fixed 21 September 2026 — the Load screen, the light, and the character select
+
+Three menu screens that were black or wrong now match xemu, each confirmed
+on screen by the player in the same session (`49ff7e2`, build
+`5E867133`). The account is
+`handovers/HANDOVER_2026-09-21_NIGHT4_THREE_FIXES_AND_THE_FORCE_MODES_ONLY_EVER_SHOWED_THE_LAST_DRAW.txt`.
+
+| | what it was | evidence |
+|---|---|---|
+| Load screen black | every fragment failed the depth test. The per-frame composite binds a back buffer with the render target's depth pointer, so the surface cache held two depth textures for one guest depth buffer and the frame's clear only ever reached one | 24 consecutive draws captured, every triangle accepted, surface unchanged; `RECOMP_METAL_HW_DEPTH_ALWAYS=1` restored the screen in one run; the fix reports 12,896 sibling-slot depth clears in the confirming run |
+| Load screen brown | the fixed-function infinite-light dot product was negated; lit surfaces got scene ambient only | xemu's emitter forms `max(0, dot(tNormal, lightDirection))`; the guest's scene ambient on that screen is (0.26,0.13,0), the brown we drew |
+| Character select's two 3D panels black | the texture-copy gate refused any draw whose window clip was smaller than the surface | 495,110 "partial window clip" refusals in one 90 s session; 0 after the window clip became a scissor |
+
+Not measured yet: gameplay under the corrected light sign, and whether the
+intro's black stretch and the missing fence and graffiti are the same stale
+depth copy. The C suite reads 110 of 112 on this host: `jsrf_input_hotplug`
+fails whenever a controller is attached during a session, and
+`jsrf_switch_audit` carries six hand-rolled switch reads over its ratchet
+from before this session.
 
 ## Working
 
