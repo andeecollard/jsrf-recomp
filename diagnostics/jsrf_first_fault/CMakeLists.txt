@@ -316,6 +316,37 @@ add_test(NAME jsrf_apu_idle_trap_selflink_on
 set_tests_properties(jsrf_apu_idle_trap_selflink_on PROPERTIES
                      ENVIRONMENT "RECOMP_APU_SELFLINK_END=1;RECOMP_APU_IDLE_TRAP_SELFLINK=1;JSRF_EXPECT_SELFLINK=1")
 
+# VOICE_ON MUST NOT LEAVE A CYCLE IN THE VOICE LIST.
+#
+# Drives the real front-end dispatch -- SET_ANTECEDENT_VOICE then VOICE_ON
+# through mcpx_apu_vp_write -- over the state the player's 21 Sep session was
+# in at t=181.152 s (TVL3D=5, link(5)=15, link(15)=15), and asserts the SHAPE
+# of the list afterwards by walking guest RAM, not a counter.
+#
+# FOUR ARMS OVER TWO SWITCHES, because both accessors cache their getenv in a
+# static, so a process is in one arm for its whole life:
+#
+#   default   nothing set: the shipping configuration. The one that matters.
+#   mtf       RECOMP_APU_LIST_MOVE_TO_FRONT=1, the player's paths.conf.
+#   off       RECOMP_APU_LIST_DEEP_UNLINK=0 -- the NEGATIVE CONTROL. It
+#             requires the 15 -> 5 -> 15 ring, so a repair that quietly stopped
+#             doing anything fails here instead of passing everywhere. It is
+#             also the arm that fails before the fix and passes after, run the
+#             other way round.
+#   bothoff   both off: the pre-fix insert, still required to ring.
+add_executable(jsrf_apu_list_cycle_test apu_list_cycle_test.c)
+target_link_libraries(jsrf_apu_list_cycle_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_apu_list_cycle_default COMMAND jsrf_apu_list_cycle_test on)
+add_test(NAME jsrf_apu_list_cycle_mtf COMMAND jsrf_apu_list_cycle_test on)
+set_tests_properties(jsrf_apu_list_cycle_mtf PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_LIST_MOVE_TO_FRONT=1")
+add_test(NAME jsrf_apu_list_cycle_off COMMAND jsrf_apu_list_cycle_test off)
+set_tests_properties(jsrf_apu_list_cycle_off PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_LIST_DEEP_UNLINK=0")
+add_test(NAME jsrf_apu_list_cycle_bothoff COMMAND jsrf_apu_list_cycle_test off)
+set_tests_properties(jsrf_apu_list_cycle_bothoff PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_LIST_DEEP_UNLINK=0;RECOMP_APU_LIST_MOVE_TO_FRONT=0")
+
 add_executable(jsrf_apu_idle_trap_lock_test apu_idle_trap_lock_test.c)
 target_link_libraries(jsrf_apu_idle_trap_lock_test PRIVATE xbox_kernel xbox_apu)
 # THREE ARMS, AND THE THIRD IS THE ONE A PLAYER RUNS.

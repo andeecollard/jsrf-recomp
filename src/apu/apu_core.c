@@ -1798,6 +1798,21 @@ static const char *apu_writer_symbol(unsigned long long pc)
 }
 #endif
 
+/* THE SAME ANSWER, FOR THE OTHER CENSUS THAT NEEDS IT.
+ *
+ * apu_vp.c records the methods the front end could not decode, and the one
+ * fact that would say what they are is which guest routine emits them. The
+ * resolver is here because the trap PC is here; exporting it is cheaper than
+ * a second copy, and it keeps the dladdr call in one place.
+ *
+ * RESOLVE AT REPORT TIME, NOT IN THE HANDLER. dladdr is not async-signal-safe
+ * and the store arrives inside a signal handler, so the raw PC is what gets
+ * recorded and this runs later, on the reporting thread. */
+const char *mcpx_apu_writer_symbol(unsigned long long pc)
+{
+    return apu_writer_symbol(pc);
+}
+
 /* Which guest function is doing the store, supplied by the harness because the
  * model has no way to know. Optional: unset, the trace still prints the
  * register traffic. */

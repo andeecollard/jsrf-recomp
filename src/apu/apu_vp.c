@@ -1048,12 +1048,79 @@ unsigned long g_idle_handoff_null;      /* ...with owner[h] == NULL */
 unsigned long g_idle_handoff_null_h0;   /* ...and h == 0: the fatal one */
 unsigned long g_idle_handoff_withheld;  /* methods the guard actually blanked */
 unsigned long g_idle_handoff_nothis;    /* collected before `this` resolved */
+/* ...and the same TOCTOU one state over: the voice is PLAYING AGAIN. */
+unsigned long g_idle_handoff_active;       /* collected for an ACTIVE voice */
+unsigned long g_idle_handoff_active_held;  /* ...and the method was blanked */
 
 static int idle_handoff_guard_on(void)
 {
     static int on = -1;
     if (on < 0)
         on = recomp_switch_on_default("RECOMP_APU_IDLE_HANDOFF_GUARD", 1);
+    return on;
+}
+
+/* THE SAME LATE HAND-OVER, WITH THE VOICE PLAYING RATHER THAN THE BUFFER GONE.
+ *
+ * The comment above states the window: on hardware the raise and the ISR's
+ * collection of the handle are the same instant, and here they are up to 8 ms
+ * apart because the device-IRQ pump is on an 8 ms period. The owner[h] test
+ * covers one thing that can change in that gap -- DirectSound freeing the
+ * buffer. This covers the other, and it is the one that strands a voice
+ * instead of crashing.
+ *
+ * SE2FE_IDLE_VOICE says exactly one thing: voice h is in a list and is NOT
+ * ACTIVE. If h has been re-ONd since, that statement is false, and hardware
+ * could not be making it -- its front end is TRAPPED while the pair is
+ * outstanding, so it is not processing a VOICE_ON for h at all. Ours decodes
+ * straight through a trapped front end (measured: 208,001 of 759,378 guest
+ * methods in the run below), so the model has to invalidate the claim it can
+ * no longer honour.
+ *
+ * WHAT IT COSTS TO NOT DO THIS, from the player's session
+ * last-run_2026-09-21_ROBOY-BLACKSCREEN-FIRST-ITAIL-KEEP.log, voice 15 (a 3D
+ * positional effect -- the boost), at 181.147 s:
+ *
+ *   af=8695040  off-command v15, retire v15, idle v15   <- raise, FECTL TRAPPED
+ *   af=8695296  VOICE_ON v15                            <- fectl=00001FEF, still
+ *                                                          TRAPPED; v15 ACTIVE
+ *   af=8695296  guest writes TVL3D 000F -> 0005         <- [AUHT]
+ *
+ * The A on that head write is the model saying the removed head was still
+ * ACTIVE, and the T is cvl naming exactly v15: the guest's RemoveIdleVoice
+ * retired the voice our front end had re-started 5.3 ms earlier. From that
+ * instant DirectSound believes it does not own v15, and v15's lifecycle ends:
+ * it is the last of its 3 off-command/retire cycles, while v1, v3, v5, v7,
+ * v12, v14 and v18 keep cycling normally for another 894 s. The voice is
+ * looping (on_loop counts it), so nothing in the model ever retires it either
+ * -- it is walked and rendered every subframe for the rest of the run, which
+ * is the sound effect the player reports never stops.
+ *
+ * WHAT IS WITHHELD is the METHOD, exactly as for owner[h]: a method that is
+ * not 0x8000 makes 001A24BE return without calling RemoveIdleVoice, and the
+ * rest of 001A25AA -- the two sub_001A5B27 calls on this+8 that resume the
+ * front end -- runs unchanged, so nothing is left latched. The trap is not
+ * lost either: a voice that goes inactive again is still inactive-and-linked
+ * at the next walk and raises again.
+ *
+ * DEFAULT ON, and the argument for that default is narrower than the crash
+ * guard's. It cannot fire unless the model itself says the voice is playing,
+ * in which case the method it blanks is one hardware would not have been
+ * sending; and the counters report in both arms, so an off run still measures
+ * how often the race happened. RECOMP_APU_IDLE_HANDOFF_ACTIVE=0 disables.
+ *
+ * WHAT IT DOES NOT CLAIM, and only a player session can settle it: this closes
+ * the ordering in which the guest's FEDECMETH load happens AFTER the VOICE_ON.
+ * The log cannot resolve which came first -- both are guest threads and FECTL
+ * was TRAPPED across the whole interval -- so if the ISR had already collected
+ * the handle before the VOICE_ON arrived, this guard cannot help and the fix
+ * has to be at the method dispatch instead. g_idle_handoff_active is the
+ * measurement that decides it: non-zero means this ordering is real. */
+static int idle_handoff_active_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_switch_on_default("RECOMP_APU_IDLE_HANDOFF_ACTIVE", 1);
     return on;
 }
 
@@ -1082,9 +1149,39 @@ uint32_t mcpx_apu_idle_handoff_method(void *opaque, uint32_t method)
 
     if (method != SE2FE_IDLE_VOICE || !d) return method;
     ++g_idle_handoff_reads;
+    h = qatomic_read(&d->regs[NV_PAPU_FEDECPARAM]);
+    /* BEFORE the owner test and before the `this` bail, because this one needs
+     * neither: it is answered out of the voice register file, which exists
+     * from the moment DirectSound publishes VPVADDR. Putting it behind
+     * jsrf_dsound_this() would make it silent on any run where the gen probe
+     * did not capture `this` -- and [APU-IDLE-OWNER] in the 21 Sep session says
+     * that is not hypothetical: "`this` captured 0 time(s)". */
+    {
+        /* VPVADDR is read through qatomic_read rather than through
+         * voice_get_mask, which takes it plainly. This runs inside the MMIO
+         * read trap on the guest's thread while the frame thread is walking
+         * the same register file, so the racing load is the one thing here
+         * that has to be spelled -- voice_top_peek in apu_core.c reads it the
+         * same way for the same reason. The voice-register load itself is a
+         * plain aligned dword out of guest RAM, which is what every other
+         * reader in both files does and what the guest's own ISR is about to
+         * do two instructions later. */
+        uint32_t vpv = (uint32_t)qatomic_read(&d->regs[NV_PAPU_VPVADDR]);
+        if (h < MCPX_HW_MAX_VOICES && vpv && g_apu_ram_ptr
+            && (ldl_le_phys(address_space_memory,
+                            (hwaddr)vpv + (hwaddr)h * NV_PAVS_SIZE
+                                + NV_PAVS_VOICE_PAR_STATE)
+                & NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+            ++g_idle_handoff_active;
+            if (idle_handoff_active_on()) {
+                ++g_idle_handoff_active_held;
+                ++g_idle_handoff_withheld;
+                return 0;
+            }
+        }
+    }
     self = jsrf_dsound_this();
     if (!self) { ++g_idle_handoff_nothis; return method; }
-    h = qatomic_read(&d->regs[NV_PAPU_FEDECPARAM]);
     /* 001A241F's own bound. Above it the ISR returns before touching
      * owner[], so there is nothing here to withhold. */
     if (h >= 0x100) return method;
@@ -1306,10 +1403,119 @@ unsigned long g_apu_voice_off_command_count;
 unsigned long g_apu_set_current_voice_count;
 unsigned long g_apu_voice_on_loop_count;
 
+/* WHAT THE DROPPED COMMANDS ACTUALLY WERE.
+ *
+ * The first version of this census recorded the method NUMBERS and a total:
+ *
+ *     [APU-FE-UNKNOWN] dropped=69 distinct=7: 02A4 02B0 02A0 02A8 02AC 0350 0370
+ *
+ * which names the gate and not the input -- the mistake this file's own rule
+ * exists to prevent. Seven numbers cannot say whether one method arrived 63
+ * times and six arrived once, whether they carry a voice handle or a volume,
+ * or whether they all landed in the first second of the run. Every one of
+ * those changes what the next session should do, and none of them is
+ * recoverable from a run that has already finished.
+ *
+ * So: per method, the count, the FIRST and LAST argument seen (identical
+ * arguments say "configuration", varying ones say "per-frame data"), the
+ * current voice at the first and last occurrence, and the seconds into the
+ * run at both. Nine words per method, 64 methods, written on a path that is
+ * already the slow one.
+ *
+ * WHAT THIS DOES NOT DO is decode them from a register table. Checked 21 Sep
+ * 2026 against xemu's own hw/xbox/mcpx/apu/apu_regs.h, which is where the
+ * NV1BA0_PIO_* map in apu_regs.h came from: THE REFERENCE DOES NOT DEFINE
+ * THESE SEVEN EITHER. Our map and xemu's agree method for method, so
+ * "findable statically from the register definitions" is not available.
+ *
+ * THE GUEST SIDE ANSWERED IT INSTEAD, and this is what it said. Recording the
+ * faulting store's host PC and symbolising it names the emitting routine, and
+ * reading that routine's other stores puts each unknown method in the company
+ * it keeps. JSRF's seven are TWO GROUPS, not seven of a kind:
+ *
+ *   0x2A0 0x2A4 0x2A8 0x2AC 0x2B0   sub_001A5671, a one-time DSOUND APU
+ *   ONCE EACH, at t=0, voice 0      bring-up. It loads the main-region mixbin
+ *   all carrying the IMMEDIATE      registers 0x202C/0x2030/0x2034/0x2038/
+ *   0xFFF                          0x203C from a table, then writes the
+ *                                  literal 0xFFF to these five, then
+ *                                  SET_CURRENT_INBUF_SGE (0x804) <- 0x7FF.
+ *                                  Five registers set to an all-ones default
+ *                                  at init, next to a 0x7FF sibling. They
+ *                                  are between SET_HRTF_HEADROOM (0x280) and
+ *                                  SET_HRTF_SUBMIXES (0x2C0), which the same
+ *                                  routine writes last.
+ *
+ *   0x350 0x370                     sub_001A368A, inside
+ *   ONCE PER VOICE, argument 0      DSOUND::CMcpxVoiceClient::SetFilter
+ *                                  (0x001A332D..0x001A3804). That routine
+ *                                  commits a whole voice in method order:
+ *
+ *      2F8 SET_CURRENT_VOICE     360 TAR_VOLA
+ *      300 CFG_VBIN              364 TAR_VOLB
+ *      304 CFG_FMT               368 TAR_VOLC
+ *      308 CFG_ENV0              36C LFO_ENV
+ *      30C CFG_ENVA          ->  370 <-- UNKNOWN
+ *      310 CFG_ENV1              374 TAR_FCA
+ *      314 CFG_ENVF              378 TAR_FCB
+ *      318 CFG_MISC              37C TAR_PITCH
+ *      31C TAR_HRTF
+ *  ->  350 <-- UNKNOWN
+ *
+ *                                  Eighteen per-voice registers, sixteen of
+ *                                  them named and modelled. 0x370 is a single
+ *                                  four-byte hole in an otherwise complete
+ *                                  SET_VOICE_TAR_* run, so it is very likely
+ *                                  the missing member of that series; 0x350
+ *                                  falls inside the SSL_A (0x320) .. SSL_B
+ *                                  (0x35C) block. NEITHER IS CONFIRMED -- the
+ *                                  company they keep is evidence, not a
+ *                                  definition, and no reference names them.
+ *
+ * SO THEY ARE NOT WHY THE MUSIC IS MISSING. Five are one-time init writes of a
+ * constant, before any voice exists. The other two are a zero written once per
+ * voice by a routine that successfully delivers the other sixteen registers of
+ * the same voice. A handover proposed "Dropped voice commands would chop a
+ * vocal and silence a stream, which fits both symptoms"; that does not survive
+ * knowing what they are. A non-empty output ring rules out underrun and a
+ * non-zero drop count rules nothing in.
+ *
+ * Still counted, because the day one of them starts carrying a varying value
+ * or a different voice, this census is what says so. */
 #define APU_UNKNOWN_METHOD_MAX 64
 unsigned long g_apu_unknown_method_count;
 uint32_t g_apu_unknown_method[APU_UNKNOWN_METHOD_MAX];
 unsigned g_apu_unknown_method_n;
+
+struct apu_unknown_method_ev {
+    unsigned long n;
+    uint32_t arg_first, arg_last;
+    uint32_t voice_first, voice_last;
+    double   t_first, t_last;
+    int      arg_varies;
+    /* WHICH GUEST ROUTINE EMITTED IT -- the one fact that says what these
+     * methods are, since neither our register map nor xemu's defines them.
+     * The store traps in a signal handler, which leaves the host PC of the
+     * store instruction in g_apu_trap_host_pc; the generated function that
+     * owns that PC is the guest function, and dladdr names it. Stored raw
+     * here and symbolised at report time, because dladdr is not
+     * async-signal-safe. */
+    unsigned long long pc_first, pc_last;
+    int      pc_varies;
+};
+static struct apu_unknown_method_ev g_apu_unknown_ev[APU_UNKNOWN_METHOD_MAX];
+
+/* Seconds since the first call. Its own base, so it cannot be differenced
+ * against the wrong timestamp -- the flaw that made two counters in this tree
+ * read ~0 and had to be retired. */
+static double apu_census_now_s(void)
+{
+    static struct timespec base;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!base.tv_sec && !base.tv_nsec) base = now;
+    return (double)(now.tv_sec - base.tv_sec)
+         + (double)(now.tv_nsec - base.tv_nsec) / 1e9;
+}
 
 /* Where a voice's forward link comes from at VOICE_ON.
  *
@@ -1795,11 +2001,64 @@ int mcpx_apu_list_move_to_front(void)
     return on;
 }
 
+/* THE HALF OF move_to_front THAT IS NOT A POLICY CHOICE, SPLIT OUT AND ON.
+ *
+ * The comment above move_to_front separates its two populations itself, and
+ * they are not the same kind of change:
+ *
+ *   v IS ALREADY THE HEAD   unlink-then-prepend writes back the two values it
+ *                           just read, so the switch's only effect is to skip
+ *                           two stores. That is a behaviour change with no
+ *                           list-shape argument behind it -- it subsumes
+ *                           RECOMP_APU_REON_HEAD_NOP, which this repository
+ *                           shipped once on a good argument and made the crash
+ *                           worse -- and it is what the five-runs-per-arm gate
+ *                           in that comment is about. It stays behind
+ *                           RECOMP_APU_LIST_MOVE_TO_FRONT, untouched.
+ *
+ *   v IS DEEPER IN          the insert writes link(v) = regs[top] and
+ *                           regs[top] = v while the list still reaches v. That
+ *                           is not a slower list or a lost voice, it is a
+ *                           CYCLE written into guest RAM, and no setting of any
+ *                           switch makes it correct. Prepending a node that is
+ *                           already in a singly linked list is only defined
+ *                           once it has been taken out.
+ *
+ * Measured on this state, which is the player's own (voice 15 at t=181.15 s of
+ * last-run_2026-09-21_ROBOY-BLACKSCREEN-FIRST-ITAIL-KEEP, reconstructed from
+ * its [VOICE-LINK]/[VOICE-TOP] stream): TVL3D = 5, link(5) = 15,
+ * link(15) = 15. VOICE_ON(15) without the unlink leaves link(15) = 5 and
+ * TVL3D = 15, i.e. 15 -> 5 -> 15. jsrf_apu_list_cycle_test drives exactly that
+ * and asserts the outcome is acyclic.
+ *
+ * Splitting it NARROWS the arm under that gate rather than widening it: with
+ * this on and move_to_front off, the head case takes the pre-existing path
+ * byte for byte. RECOMP_APU_LIST_DEEP_UNLINK=0 restores the old unconditional
+ * splice for a bisect; it is default ON because the state it repairs is one
+ * the hardware cannot be in.
+ *
+ * mtf_head and mtf_deep keep counting the same two events they always did, so
+ * the cross-check that made the original A/B readable -- mtf_head + mtf_deep
+ * == relink, counted by two independent walks -- still holds whichever of the
+ * two switches is set. [APU-REON] prints both states. */
+int mcpx_apu_list_deep_unlink(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_APU_LIST_DEEP_UNLINK", 1);
+    return on;
+}
+
 unsigned long g_apu_antecedent_set_count;
 unsigned long g_apu_voice_on_top_count;
 unsigned long g_apu_voice_on_inherit_count;
 unsigned long g_apu_voice_on_self_ante_count;
 unsigned long g_apu_voice_on_self_link_count;
+/* ...and how many of those this insert rewrote to 0xFFFF. Separate from the
+ * count above so the event is still measured after the repair: self_link is
+ * how often the state arose, normalised is how often we corrected it, and
+ * self_link > normalised would mean a branch reached link_after == v without
+ * passing the repair. */
+unsigned long g_apu_voice_on_self_link_normalised;
 
 /* CYCLES OF LENGTH >= 2, WHICH NOTHING HERE HAS EVER LOOKED FOR.
  *
@@ -2041,6 +2300,45 @@ void mcpx_apu_voice_report(void)
         for (k = 0; k < g_apu_unknown_method_n; k++)
             fprintf(stderr, " %04X", g_apu_unknown_method[k]);
         fprintf(stderr, "\n");
+        /* ONE ROW PER METHOD, because the list above cannot say which of them
+         * matters. An argument that never changes is configuration the guest
+         * set once; one that changes every call is per-frame data, and a voice
+         * number that tracks the voice census is a command aimed at a specific
+         * voice. Those three readings ask for different work. */
+        for (k = 0; k < g_apu_unknown_method_n; k++) {
+            const struct apu_unknown_method_ev *e = &g_apu_unknown_ev[k];
+            extern const char *mcpx_apu_writer_symbol(unsigned long long pc);
+            fprintf(stderr,
+                "  [APU-FE-UNKNOWN]   %04X  x%-6lu arg %08X%s%08X  voice %u..%u"
+                "  t %.1f..%.1f s\n",
+                g_apu_unknown_method[k], e->n, e->arg_first,
+                e->arg_varies ? " .. " : " == ", e->arg_last,
+                e->voice_first, e->voice_last, e->t_first, e->t_last);
+            /* THE NAME IS THE POINT. A method number with no definition
+             * anywhere is answered by the routine that writes it: run the
+             * name below through diagnostics/jsrf_first_fault/symbolize.py to
+             * get the DSOUND / game-side symbol. `..` means more than one
+             * routine emits this method, which is itself worth knowing. */
+            fprintf(stderr,
+                "  [APU-FE-UNKNOWN]     written by %s%s\n",
+                mcpx_apu_writer_symbol(e->pc_first),
+                e->pc_varies ? "  .. and at least one other site" : "");
+        }
+        /* WHAT THE NUMBER ABOVE DOES NOT ESTABLISH, said here so it is not
+         * read off a log as a conclusion again. A nonempty output ring rules
+         * out ONE mechanism for chopped audio -- underrun -- and a nonzero
+         * drop count here rules nothing IN. These commands are dropped whether
+         * or not the music is missing; nothing yet ties a specific drop to a
+         * specific silence. What would: a run where the guest's voice for the
+         * missing stream is named, and one of these methods is seen carrying
+         * that voice number in the column above. */
+        if (g_apu_unknown_method_count)
+            fprintf(stderr,
+                "  [APU-FE-UNKNOWN]   dropped, and IDENTIFIED BY EMITTER rather"
+                " than by a register table -- no reference defines them. JSRF's"
+                " seven are init-time constants (02A0-02B0) and two slots in a"
+                " per-voice commit block (0350/0370); see the note above the"
+                " census. Watch for a VARYING argument: that would be new.\n");
     }
     /* idle_edge rides in these parentheses rather than on a line of its own
      * because ab_score.py harvests switch state with
@@ -2288,11 +2586,15 @@ void mcpx_apu_voice_report(void)
      * move_to_front A/B in the "assumes the environment took" class that the
      * SELFLINK_END A/B died of. */
     fprintf(stderr, "  [APU-REON] head_nop=%lu mtf_head=%lu mtf_deep=%lu"
-            " mtf_inherit=%lu (reon_head_nop %s, move_to_front %s)\n",
+            " mtf_inherit=%lu (reon_head_nop %s, move_to_front %s,"
+            " deep_unlink %s, self_link normalised %lu of %lu)\n",
             g_apu_voice_on_head_nop, g_apu_list_mtf_head, g_apu_list_mtf_deep,
             g_apu_list_mtf_inherit,
             mcpx_apu_reon_head_nop() ? "on" : "OFF",
-            mcpx_apu_list_move_to_front() ? "on" : "OFF");
+            mcpx_apu_list_move_to_front() ? "on" : "OFF",
+            mcpx_apu_list_deep_unlink() ? "on" : "OFF",
+            g_apu_voice_on_self_link_normalised,
+            g_apu_voice_on_self_link_count);
     fprintf(stderr, "  [APU-LINK] antecedent_sets=%lu on_top=%lu"
             " on_inherit=%lu self_ante=%lu self_link=%lu\n",
             g_apu_antecedent_set_count, g_apu_voice_on_top_count,
@@ -2452,6 +2754,19 @@ void mcpx_apu_idle_trap_report(int crash)
             g_idle_handoff_reads ? ""
               : "   <- reads=0: the FEDECMETH read trap never fired, so"
                 " NULL=0 measures NOTHING");
+    /* THE STALE-IDLE RACE, ON ITS OWN LINE BECAUSE IT HAS ITS OWN
+     * DENOMINATOR. `active` counts hand-overs whose voice had been re-ONd and
+     * was playing again -- the guest about to retire a live voice -- and it is
+     * counted with the switch either way, so an OFF run still says how often
+     * the race happened. `held` is what the guard actually refused. reads
+     * above is the positive control for both: zero there makes zero here mean
+     * nothing at all. */
+    fprintf(stderr, "  [APU-IDLE-OWNER]   ...and ACTIVE again at the"
+            " hand-over: %lu (of %lu reads), withheld=%lu"
+            " (handoff_active %s)\n",
+            g_idle_handoff_active, g_idle_handoff_reads,
+            g_idle_handoff_active_held,
+            idle_handoff_active_on() ? "ON" : "OFF");
     fprintf(stderr, "  [APU-FEDEC] guest methods dispatched while TRAPPED:"
             " %lu (of %lu) -- each one overwrites the FEDECMETH/FEDECPARAM"
             " pair the guest has not read yet\n",
@@ -2834,16 +3149,27 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
              * voice_get_mask on one would address guest RAM past the end of the
              * voice register file. */
             int mtf_is_head = 0;
-            if (mcpx_apu_list_move_to_front()
-                && selected_handle < MCPX_HW_MAX_VOICES) {
+            if (selected_handle < MCPX_HW_MAX_VOICES
+                && (mcpx_apu_list_move_to_front()
+                    || mcpx_apu_list_deep_unlink())) {
                 uint16_t mtf_pred = 0xFFFF;
                 if (voice_list_find_pred(d, top_reg,
                                          (uint16_t)selected_handle,
                                          &mtf_pred)) {
                     if (mtf_pred == 0xFFFF) {
+                        /* Counted whichever switch brought us here, so the
+                         * mtf_head + mtf_deep == relink cross-check survives
+                         * the split. The no-op itself is still move_to_front's
+                         * alone; with only deep_unlink on this falls through to
+                         * the original chain below. */
                         g_apu_list_mtf_head++;
-                        mtf_is_head = 1;
+                        mtf_is_head = mcpx_apu_list_move_to_front();
                     } else {
+                        /* EITHER switch repairs the deep case, so turning
+                         * deep_unlink off does not silently take the repair
+                         * away from a paths.conf that has move_to_front on --
+                         * which is the player's. The split is about the HEAD
+                         * case; nothing here loses a behaviour it had. */
                         g_apu_list_mtf_deep++;
                         voice_list_unlink_at(d, top_reg, mtf_pred,
                                              (uint16_t)selected_handle);
@@ -2906,7 +3232,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
              * a different wrong answer -- it would drop v from its list and
              * leave the sentinel set. self_ante=0 in all 5,372 of those report
              * lines; the counter one line above is what would say otherwise. */
-            if (mcpx_apu_list_move_to_front()
+            if ((mcpx_apu_list_move_to_front() || mcpx_apu_list_deep_unlink())
                 && selected_handle < MCPX_HW_MAX_VOICES
                 && antecedent_voice != selected_handle) {
                 int mtf_l;
@@ -2943,6 +3269,49 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d, (uint16_t)selected_handle, NV_PAVS_VOICE_TAR_PITCH_LINK,
             NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
         if (link_after == selected_handle) g_apu_voice_on_self_link_count++;
+
+        /* A VOICE THIS INSERT HAS JUST PUT IN A LIST MUST NOT STILL CARRY THE
+         * DRIVER'S "IN NO LIST" MARKER.
+         *
+         * link(v) == v is CMcpxCore::SetupVoiceProcessor's boot value and what
+         * RemoveIdleVoice writes for every voice it retires; this file's own
+         * walk, voice_list_unlink_at and the idle-trap guard all already read
+         * it as "not in any list". VOICE_ON has just made that false. Whatever
+         * wrote it -- the guest before re-ONing v, or the old unconditional
+         * splice with regs[top] == v -- leaving it is the model publishing a
+         * successor pointer it knows to be wrong, and the only consumer of a
+         * successor pointer is a walk, for which self means a one-entry ring
+         * whose tail is unreachable.
+         *
+         * 0xFFFF is the truthful value and loses nothing: by the time the
+         * marker is there, whatever v used to point at is already unreachable
+         * THROUGH v, which is the same argument RECOMP_APU_SELFLINK_END makes
+         * at the read. This makes the write agree with the read instead of
+         * leaving the repair to a switch that is off by default, and it makes
+         * the two insert branches agree with voice_list_unlink_at, which has
+         * normalised the marker (`if (nxt == h) nxt = 0xFFFF`) since it was
+         * written.
+         *
+         * UNCONDITIONAL, and not behind a switch, because it is not a choice
+         * about list policy: every other reader in this file already treats
+         * these two values as the same thing, and this is the one place that
+         * stored the one they cannot both mean. g_apu_voice_on_self_link_count
+         * is read BEFORE it, so the counter still reports how often the state
+         * arose -- an A/B that cannot see the event it prevents is not an A/B,
+         * and this tree has already paid for one of those. */
+        if (link_after == selected_handle
+            && selected_handle < MCPX_HW_MAX_VOICES) {
+            /* Range-checked for the reason the insert above is: VOICE_ON masks
+             * the handle to 16 bits (apu_regs.h:137) while the hardware has
+             * 256 voices, and voice_set_mask on an out-of-range one addresses
+             * guest RAM past the end of the voice register file. */
+            voice_set_mask(d, (uint16_t)selected_handle,
+                           NV_PAVS_VOICE_TAR_PITCH_LINK,
+                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
+                           0xFFFF);
+            g_apu_voice_on_self_link_normalised++;
+            link_after = 0xFFFF;
+        }
         link_shadow_set((uint16_t)selected_handle, link_after);
         voice_link_note(d, (uint16_t)selected_handle, feav_before, list,
                         ante_before, link_before, link_after);
@@ -3350,6 +3719,27 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                 if (k == g_apu_unknown_method_n &&
                     g_apu_unknown_method_n < APU_UNKNOWN_METHOD_MAX)
                     g_apu_unknown_method[g_apu_unknown_method_n++] = method;
+                if (k < APU_UNKNOWN_METHOD_MAX) {
+                    struct apu_unknown_method_ev *e = &g_apu_unknown_ev[k];
+                    uint32_t voice = (uint16_t)d->regs[NV_PAPU_FECV];
+                    double t = apu_census_now_s();
+                    extern unsigned long long g_apu_trap_host_pc;
+                    unsigned long long pc = g_apu_trap_host_pc;
+                    if (!e->n) {
+                        e->arg_first = argument;
+                        e->voice_first = voice;
+                        e->t_first = t;
+                        e->pc_first = pc;
+                    } else {
+                        if (argument != e->arg_last) e->arg_varies = 1;
+                        if (pc != e->pc_last)        e->pc_varies = 1;
+                    }
+                    e->n++;
+                    e->arg_last = argument;
+                    e->voice_last = voice;
+                    e->t_last = t;
+                    e->pc_last = pc;
+                }
             }
             DPRINTF("Unknown FE method: 0x%08X arg=0x%08X\n", method, argument);
         }
