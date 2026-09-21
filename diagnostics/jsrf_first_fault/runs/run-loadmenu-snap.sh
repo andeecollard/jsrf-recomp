@@ -54,6 +54,20 @@ grep -ao '\[APU-VOICE\] on=[0-9]*' "$LOG" | tail -1
 echo "=== snapshot freshness: fresh frames vs repeats ==="
 grep -ac 'SAME FRAME AS THE LAST DUMP' "$LOG"
 grep -ac 'NOTHING PUBLISHED' "$LOG"
+echo "=== G26: DOES THE GUEST AGREE WITH US ABOUT WHERE IT IS DRAWING? ==="
+echo "--- the probe must be believable before its answer is ---"
+printf '  device never found : %s  (must be 0)\n' "$(grep -ac 'D3D_g_pDevice is still empty' "$LOG")"
+printf '  ring check failed  : %s  (must be 0)\n' "$(grep -ac 'FIX THE PROBE' "$LOG")"
+echo "--- the tally. NO SINGLE LINE IS A VERDICT: this title rotates three"
+echo "    surfaces and the report samples at an arbitrary instant ---"
+printf '  %-12s %s\n' MATCH      "$(grep -ac '| MATCH' "$LOG")"
+printf '  %-12s %s\n' COVERAGE   "$(grep -ac '| COVERAGE' "$LOG")"
+printf '  %-12s %s\n' ALIAS      "$(grep -ac '| ALIAS' "$LOG")"
+printf '  %-12s %s\n' off-target "$(grep -ac 'sampled off-target' "$LOG")"
+grep -ao 'bound-ever=[a-zA-Z]*' "$LOG" | sort | uniq -c
+echo "--- the lines from the BLACK part of the run are the ones that matter ---"
+grep -a '^\[RT\] guest target' "$LOG" | tail -12
+echo
 echo "=== the last 25 snapshots ==="
 grep -a '\[SNAP\]' "$LOG" | tail -25
 echo

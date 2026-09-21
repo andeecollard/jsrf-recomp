@@ -61,6 +61,85 @@
 #define D3D8_DEV_FENCE_COUNTER 0x30u
 #define D3D8_DEV_FENCE_PTR    0x34u
 
+/* WHERE THE GUEST THINKS IT IS DRAWING.
+ *
+ * These three are not SDK folklore either: they were derived from this
+ * title's own default.xbe and they are rows of
+ * diagnostics/jsrf_first_fault/jsrf-d3ddevice-offsets.tsv, with their method
+ * and confidence recorded there.
+ *
+ *   +0x2070  m_RenderTarget   D3DDevice_SetRenderTarget stores the new target
+ *                             at 0018D390 mov [esi+0x2070],edi and releases
+ *                             the old one read at 0018D363; the 4039 OOVPA
+ *                             XREF_ENTRY(0x18) on SetRenderTarget@0018D0F0
+ *                             reads the same 0x2070
+ *   +0x2074  m_DepthStencil   GetDepthStencilSurface 0018DA75 mov eax,[eax+0x2074]
+ *   +0x207C  m_BackBuffer[0]  GetBackBuffer 0018D63D mov eax,[ecx+eax*4+0x207C]
+ */
+#define D3D8_DEV_RENDER_TARGET 0x2070u
+#define D3D8_DEV_DEPTH_STENCIL 0x2074u
+#define D3D8_DEV_BACK_BUFFER0  0x207Cu
+
+/* A D3DSurface, and the ONE FIELD THAT SETTLES THE LOAD-SCREEN QUESTION.
+ *
+ * Derived 21 September 2026 from SetRenderTarget, because nothing in this tree
+ * knew the layout and the offsets table stops at the device struct. The
+ * function reads the incoming render target's +0x04 and the incoming depth
+ * stencil's +0x04 and then emits both, VERBATIM AND UNMASKED, as the payloads
+ * of the two surface-offset methods:
+ *
+ *     0018D3E2  mov ecx,[edi+4]          ; render target ->Data, to [esp+0x30]
+ *     0018D3EB  mov edx,[ebp+4]          ; depth stencil ->Data, to [esp+0x20]
+ *     ...
+ *     0018D449  mov [eax+8],0x40210      ; NV097_SET_SURFACE_COLOR_OFFSET
+ *     0018D450  mov [eax+0xc],ebp        ;   payload = [esp+0x30], unchanged
+ *     0018D46B  mov [eax+8],0x40214      ; NV097_SET_SURFACE_ZETA_OFFSET
+ *     0018D472  mov [eax+0xc],ebp        ;   payload = [esp+0x20], unchanged
+ *
+ * NO MASK, NO SHIFT, NO ALIAS BIT STRIPPED anywhere between the field and the
+ * method. Our own parser latches that payload just as verbatim
+ * (`s_gpu.color_offset = param`), so the two numbers are comparable BYTE FOR
+ * BYTE and a difference of any kind is a real disagreement rather than a
+ * units problem. That is the whole reason this probe can give a verdict.
+ *
+ * The same function corroborates the rest of the layout: it reads [edx+0x0C]
+ * as Format (shr 0x14, and 0xF -- the U/V size nibbles) and [edx+0x10] as
+ * Size (and 0xFFF, inc), which is D3DPixelContainer exactly.
+ */
+#define D3D8_SURFACE_COMMON 0x00u
+#define D3D8_SURFACE_DATA   0x04u
+#define D3D8_SURFACE_LOCK   0x08u
+#define D3D8_SURFACE_FORMAT 0x0Cu
+#define D3D8_SURFACE_SIZE   0x10u
+
+/* What one read of the device says about the target. Every field is raw: no
+ * masking, because the guest does none (above). */
+typedef struct {
+    int      trusted;       /* the ring self-check below held */
+    uint32_t device;        /* 0 when the global is not populated yet */
+    uint32_t put, ring_lo, ring_hi;   /* what the self-check looked at */
+    uint32_t rt_surface,    rt_data;
+    uint32_t depth_surface, depth_data;
+    uint32_t back0_surface, back0_data;
+} D3D8RingTarget;
+
+/* Read the guest's idea of its render target.
+ *
+ * THIS PROBE VALIDATES ITSELF, AND IT HAS TO. It is a chain of guest-VA
+ * dereferences through xbox_GetMemoryOffset(), and a device pointer that is
+ * null, stale, or reached through an address-space assumption that does not
+ * hold would come back as a MISMATCH -- that is, as the answer, and as the
+ * wrong one. So the same read also takes the write cursor at +0x00 and the
+ * ring bounds at +0x24/+0x28 and checks that lo < hi and lo <= put <= hi.
+ * Those three fields are "certain" in the offsets table and the ring is the
+ * one structure whose contents cannot be coincidental.
+ *
+ * `trusted` is that check. When it is 0 the caller must report NO VERDICT,
+ * not a divergence.
+ *
+ * Returns 1 if a device was found at all, 0 if the global is still empty. */
+int d3d8_ring_read_target(D3D8RingTarget *out);
+
 /* A title's own answer, used only when no symbol says otherwise. `global` is
  * the VA of D3D_g_pDevice; `device_fallback` is the device struct itself, for
  * the window before the global has been populated. Either may be 0. */

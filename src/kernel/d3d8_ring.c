@@ -167,6 +167,51 @@ uint32_t d3d8_ring_field_va(unsigned offset)
     return dev ? dev + offset : 0;
 }
 
+/* The guest's own answer to "where am I drawing?". See the header for the
+ * disassembly that fixes every offset here, and for why the self-check is not
+ * optional. */
+int d3d8_ring_read_target(D3D8RingTarget *out)
+{
+    uint32_t dev;
+
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof *out);
+
+    dev = d3d8_ring_device();
+    if (!dev)
+        return 0;                   /* the global is still empty; say so */
+    out->device = dev;
+
+    /* THE SELF-CHECK, BEFORE ANY OF THE INTERESTING FIELDS. A garbage device
+     * pointer reads as a mismatch, and a mismatch is the answer this probe
+     * exists to give, so it must not be possible to manufacture one by
+     * accident. The ring is the structure that cannot be coincidental: a
+     * cursor inside its own bounds, with those bounds in order. */
+    out->put     = guest_u32(dev + D3D8_DEV_WRITE_CURSOR);
+    out->ring_lo = guest_u32(dev + D3D8_DEV_RING_LO);
+    out->ring_hi = guest_u32(dev + D3D8_DEV_RING_HI);
+    out->trusted = out->ring_lo && out->ring_hi
+                && out->ring_lo < out->ring_hi
+                && out->put >= out->ring_lo && out->put <= out->ring_hi;
+
+    out->rt_surface    = guest_u32(dev + D3D8_DEV_RENDER_TARGET);
+    out->depth_surface = guest_u32(dev + D3D8_DEV_DEPTH_STENCIL);
+    out->back0_surface = guest_u32(dev + D3D8_DEV_BACK_BUFFER0);
+
+    /* ->Data on each, raw. The guest emits these verbatim as the payloads of
+     * NV097_SET_SURFACE_COLOR_OFFSET and _ZETA_OFFSET, so they are directly
+     * comparable with what the parser latched -- no mask, no alias bit. */
+    if (out->rt_surface)
+        out->rt_data = guest_u32(out->rt_surface + D3D8_SURFACE_DATA);
+    if (out->depth_surface)
+        out->depth_data = guest_u32(out->depth_surface + D3D8_SURFACE_DATA);
+    if (out->back0_surface)
+        out->back0_data = guest_u32(out->back0_surface + D3D8_SURFACE_DATA);
+
+    return 1;
+}
+
 /* The GPU's own fence write-back. See the header for the disassembly that
  * fixes the units and for why publishing [dev+0x30] made every wait vacuous. */
 static unsigned long s_releases;

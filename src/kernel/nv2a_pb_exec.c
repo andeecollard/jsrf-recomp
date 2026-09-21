@@ -6053,6 +6053,89 @@ void nv2a_pb_exec_report(void)
                 (unsigned long long)s_blend_fade_fate.prepare_rejected,
                 (unsigned long long)s_blend_fade_fate.rasterised);
     }
+    /* G26: DOES THE GUEST AGREE WITH US ABOUT WHERE IT IS DRAWING?
+     *
+     * During the Load-screen black, 28 batches a frame are accepted,
+     * submitted and rasterised and put no non-zero pixel on the presented
+     * surface. Either they are not landing on the surface we present
+     * (COVERAGE) or they land on it and write zero (SHADING). This line
+     * decides that, and it needs no forced fragment colour, no timing window
+     * and no player on the right screen at the right second: it is passive,
+     * it runs every report, and it CANNOT FAIL TO REACH ITS OWN CONDITION --
+     * which is exactly what the white test could not promise, having twice
+     * been driven by a menu that its own force had painted white.
+     *
+     * The comparison is BYTE FOR BYTE, and that is not luck. The guest emits
+     * pSurface->Data verbatim as the payload of NV097_SET_SURFACE_COLOR_OFFSET
+     * and we latch that payload just as verbatim into s_gpu.color_offset, so
+     * no unit or mask stands between the two numbers. See d3d8_ring.h for the
+     * disassembly that establishes it.
+     *
+     * The 0x80000000 alias gets its own verdict rather than being masked
+     * away. A contiguous allocation's physical P is visible to the CPU at
+     * 0x80000000 + P, "the same surface through the other window" is a
+     * distinction this renderer has already been wrong about, and collapsing
+     * it here would hide precisely the kind of near-miss that is worth
+     * knowing about. */
+    {
+        D3D8RingTarget t;
+        if (!d3d8_ring_read_target(&t)) {
+            fprintf(stderr, "[RT] NO VERDICT -- D3D_g_pDevice is still empty;"
+                    " the title has not created its device yet\n");
+        } else if (!t.trusted) {
+            /* The ring self-check failed, so the device pointer is not a
+             * device. Reporting a divergence off this would be reporting the
+             * probe's own bug as the renderer's. */
+            fprintf(stderr, "[RT] NO VERDICT -- 0x%08X does not look like a"
+                    " device: put=0x%08X ring=[0x%08X,0x%08X]."
+                    " FIX THE PROBE, NOT THE RENDERER.\n",
+                    t.device, t.put, t.ring_lo, t.ring_hi);
+        } else {
+            /* WHETHER WE HAVE EVER BOUND IT, not whether we are on it right
+             * now. This distinction was measured before it was needed: a
+             * 45 s attract-loop boot on 21 Sep read MATCH 43 times and
+             * DIVERGE once, on a screen that was visibly rendering the whole
+             * time. Nothing was wrong. s_gpu.color_offset legitimately moves
+             * several times a frame -- this title uses three surfaces and
+             * rotates them -- and the report timer samples it at an arbitrary
+             * instant, so ONE LINE IS NOT A VERDICT.
+             *
+             * s_surfaces is every distinct colour offset the parser has
+             * latched. If the guest's target is not in it, we have never
+             * pointed at that surface at all, and no amount of sampling luck
+             * explains that away. THAT is the coverage test. */
+            const char *verdict;
+            int bound_ever = 0;
+            unsigned i;
+            for (i = 0; i < s_surface_count; ++i)
+                if (s_surfaces[i] == t.rt_data) { bound_ever = 1; break; }
+
+            if (!bound_ever && (t.rt_data & 0x7FFFFFFFu)
+                                  == (s_gpu.color_offset & 0x7FFFFFFFu))
+                verdict = "ALIAS -- the same surface through the other window;"
+                          " we differ from the guest only in bit 31";
+            else if (!bound_ever)
+                verdict = "COVERAGE -- the guest's target has NEVER been a"
+                          " surface we parsed; the batches cannot be landing"
+                          " where we present";
+            else if (t.rt_data == s_gpu.color_offset
+                        || t.rt_data == s_snap_offset)
+                verdict = "MATCH -- we present what the guest targets, so a"
+                          " black frame here is SHADING";
+            else
+                verdict = "sampled off-target -- bound at some point, on"
+                          " another of this title's surfaces at this instant."
+                          " NOT A VERDICT: read the tally";
+            fprintf(stderr, "[RT] guest target=0x%08X data=0x%08X |"
+                    " live=0x%08X presented=0x%08X | bound-ever=%s | %s\n",
+                    t.rt_surface, t.rt_data, s_gpu.color_offset, s_snap_offset,
+                    bound_ever ? "yes" : "NO", verdict);
+            fprintf(stderr, "[RT]   depth=0x%08X data=0x%08X  backbuffer0="
+                    "0x%08X data=0x%08X  device=0x%08X, ring checked\n",
+                    t.depth_surface, t.depth_data,
+                    t.back0_surface, t.back0_data, t.device);
+        }
+    }
     frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     nv2a_texture_copy_census();
