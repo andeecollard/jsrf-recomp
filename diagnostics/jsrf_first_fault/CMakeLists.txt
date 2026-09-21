@@ -233,6 +233,32 @@ add_executable(jsrf_thread_priority_roundtrip_test thread_priority_roundtrip_tes
 target_link_libraries(jsrf_thread_priority_roundtrip_test PRIVATE xbox_kernel)
 add_test(NAME jsrf_thread_priority_roundtrip COMMAND jsrf_thread_priority_roundtrip_test)
 
+# CRI's ADX lock was mutual exclusion by priority elevation, and serialising
+# the two BODIES does not restore it -- the poisoning interleave is five calls
+# that are already serial. This forces those five steps and asks whether B can
+# enter the region while A is inside it.
+#
+# THREE ARMS, and the first two are the point. `off` and `zero` must both
+# reproduce the poison: if `=0` turned the guard ON, they would disagree, which
+# is the presence-test bug recomp_switch.h was written for. `off` is also the
+# positive control -- without it a green `on` arm proves nothing.
+add_executable(jsrf_adx_guard_test adx_guard_test.c adx_guard.c)
+find_package(Threads REQUIRED)
+target_link_libraries(jsrf_adx_guard_test PRIVATE Threads::Threads)
+target_include_directories(jsrf_adx_guard_test PRIVATE .)
+
+add_test(NAME jsrf_adx_guard_off COMMAND jsrf_adx_guard_test off)
+set_tests_properties(jsrf_adx_guard_off PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=")
+
+add_test(NAME jsrf_adx_guard_zero COMMAND jsrf_adx_guard_test off)
+set_tests_properties(jsrf_adx_guard_zero PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=0")
+
+add_test(NAME jsrf_adx_guard_on COMMAND jsrf_adx_guard_test on)
+set_tests_properties(jsrf_adx_guard_on PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=1")
+
 add_executable(jsrf_combiner_graffiti_test combiner_graffiti_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")
@@ -439,6 +465,7 @@ add_executable(jsrf_first_fault
     draw_one_probe.c
     func_hit_probe.c
     jsrf_manual_overrides.c
+    adx_guard.c
     "${CMAKE_CURRENT_LIST_DIR}/recomp_manual.c"
     ${RECOMP_GEN_SOURCES}
 )

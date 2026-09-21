@@ -6799,7 +6799,14 @@ static void bridge_ObfDereferenceObject(void)
  * changes" from "we never found the object", which need opposite fixes.
  *
  * Under RECOMP_SCHED_TRACE only; bounded to eight handles and printed once. */
-static struct { uint32_t handle; unsigned long hits; long last; int unresolved; }
+/* THE FIELD IS AN OBJECT POINTER, NOT A HANDLE, and calling it `handle` cost a
+ * session: the 21 Sep report printed `handle=0x009A4090`, which was then chased
+ * through bridge_thread_handle_for_token and the TIB list looking for a thread
+ * it could never name. STACK_ARG(0) here is the guest VA of the
+ * XboxGuestObject, as the note above says in words. The thread identity is the
+ * token INSIDE that object, so record it beside the pointer. */
+static struct { uint32_t object_va; uint32_t token; unsigned long hits;
+                long last; int unresolved; }
     s_qbp[8];
 static unsigned s_qbp_n;
 static unsigned long s_qbp_over;
@@ -6808,12 +6815,114 @@ void bridge_query_priority_report(void)
 {
     unsigned i;
     if (!s_qbp_n) return;
-    fprintf(stderr, "  [SCHED] KeQueryBasePriorityThread by handle"
+    fprintf(stderr, "  [SCHED] KeQueryBasePriorityThread by object"
                     " (overflow %lu):\n", s_qbp_over);
-    for (i = 0; i < s_qbp_n; ++i)
-        fprintf(stderr, "  [SCHED]   handle=0x%08X queries=%-12lu last=%ld%s\n",
-                s_qbp[i].handle, s_qbp[i].hits, s_qbp[i].last,
-                s_qbp[i].unresolved ? "   <-- HANDLE DID NOT RESOLVE" : "");
+    for (i = 0; i < s_qbp_n; ++i) {
+        uint32_t tok = s_qbp[i].token;
+        char who[64];
+        /* A token tagged BRIDGE_TID_TOKEN_TAG stands for "the thread that
+         * asked" and carries a thread id; anything else is a handle token this
+         * bridge issued, which is what CreateThread handed the guest. Printing
+         * which kind it is decides where to look next without another run. */
+        if ((tok & 0xFF000000u) == BRIDGE_TID_TOKEN_TAG)
+            snprintf(who, sizeof who, "tid=%lu",
+                     (unsigned long)(tok & BRIDGE_TID_TOKEN_MASK));
+        else
+            snprintf(who, sizeof who, "handle_token=0x%08X", tok);
+        fprintf(stderr, "  [SCHED]   obj=0x%08X %-26s queries=%-12lu"
+                        " last=%ld%s\n",
+                s_qbp[i].object_va, who, s_qbp[i].hits, s_qbp[i].last,
+                s_qbp[i].unresolved ? "   <-- OBJECT DID NOT RESOLVE" : "");
+    }
+    fflush(stderr);
+}
+
+/* ── The CRI ADX thread block, read straight out of guest .data ──────────
+ *
+ * WHY THESE ADDRESSES ARE NOT A GUESS. XbSymbolDatabase names XAPI's
+ * CreateThread at 0x00147F53 and Set/GetThreadPriority at 0x00147CC0 /
+ * 0x00147D12; the decompilation names the surrounding block CRI::*. The XBE has
+ * exactly one function that calls CreateThread four times -- sub_0013B330 --
+ * and each call's lpStartAddress is the FOURTH of six stdcall pushes, three
+ * before the call, not the one adjacent to it. Reading them that way gives four
+ * thread entries and the four globals their handles are stored into, and the
+ * defaults the same function writes when the caller passes no config.
+ *
+ * WHAT THE FREEZE NEEDS FROM HERE. sub_001437B0 -- CRI's guard on file I/O,
+ * reached from cvfssetbuf / wxCiOpen / wxci_filesize_lower -- spins while
+ * GetThreadPriority(self) reads 15, calling the registered unlock each pass.
+ * XAPI maps base priority 16 to 15 on the way out and 15 to 16 on the way in,
+ * so "the poll returns 16 for ever" and "the guard never exits" are one fact.
+ *
+ * The unlock is sub_0013B0E0, and it opens `dec [LOCK_COUNT] / jne skip`: it
+ * acts only on the pass where the count reaches exactly zero, and is a
+ * permanent no-op once the guard has driven the count negative. So the loop
+ * gets ONE chance to lower the priority, and takes it only if SAVED_PRIORITY
+ * holds something other than 15. Those two words decide it, and both are static
+ * guest addresses -- no player input, no extra run.
+ *
+ * Printed under RECOMP_SCHED_TRACE beside the poll census, because the census
+ * says which objects are being polled and this says what they are waiting on.
+ *
+ * THE ADDRESSES ARE CORROBORATED, not just derived. main.c already carries an
+ * ADX address set found empirically for the [ADX]/[ADX-RATE] instruments, and
+ * six of its six overlap this disassembly exactly:
+ *
+ *     ADX_FLAG_VA     0x0025EFA4  set by adxm_goto_mwidle_border, cleared
+ *                                 by the worker at 0x0013B2E2
+ *     ADX_THREAD_VA   0x0027D0E8  the worker's handle, entry 0x0013B2A0
+ *     ADX_WORKER_VA   0x0025EFB0  inc at 0x0013B2B5, inside the worker
+ *     ADX_SPIN_VA     0x0025EFA8  inc at 0x0013B195, the counting-spin thread
+ *     ADX_SERVER_VA   0x0025EFAC  inc at 0x0013B1DA AND 0x0013B24B
+ *     ADX_SHUTDOWN_VA 0x0025EFD8  the worker's exit test at 0x0013B312
+ *
+ * The ADX_SERVER_VA row also explains a comment already in main.c -- "counted
+ * by two threads, so ~N true passes/s". There are two vblank pump threads,
+ * entries 0x0013B1C0 and 0x0013B230, and they increment one counter. That was
+ * inferred from the rate; here it is visible in the instructions.
+ *
+ * The three addresses below that main.c does NOT have -- LOCK_COUNT,
+ * SAVED_PRIORITY, CFG_RAISED_PRIORITY -- sit inside those same two clusters.
+ * They are the ones the freeze turns on, which is why they are new. */
+#define ADX_CFG_RAISED_PRIORITY 0x0025EF8Cu  /* default 15 -> base 16 */
+#define ADX_CFG_IDLE_PRIORITY   0x0025EF9Cu  /* default -15 */
+#define ADX_LOCK_COUNT          0x0025EFA0u  /* refcount; negative = wedged */
+#define ADX_MWIDLE_FLAG         0x0025EFA4u  /* handshake with the worker */
+#define ADX_SAVED_PRIORITY      0x0027D0F8u  /* what the unlock restores */
+#define ADX_H_SPINNER           0x0027D0E0u  /* entry 0x0013B180, prio 2 */
+#define ADX_H_PUMP_A            0x0027D0FCu  /* entry 0x0013B1C0, prio 1 */
+#define ADX_H_PUMP_B            0x0027D104u  /* entry 0x0013B230, prio 1 */
+#define ADX_H_MWIDLE            0x0027D0E8u  /* entry 0x0013B2A0, prio -15 */
+
+void bridge_adx_thread_report(void)
+{
+    int32_t  count, saved, raised, idle, flag;
+    if (!sched_trace_on()) return;
+    if (!g_xbox_mem_offset) return;   /* nothing mapped; say nothing */
+
+    count  = (int32_t)BRIDGE_MEM32(ADX_LOCK_COUNT);
+    saved  = (int32_t)BRIDGE_MEM32(ADX_SAVED_PRIORITY);
+    raised = (int32_t)BRIDGE_MEM32(ADX_CFG_RAISED_PRIORITY);
+    idle   = (int32_t)BRIDGE_MEM32(ADX_CFG_IDLE_PRIORITY);
+    flag   = (int32_t)BRIDGE_MEM32(ADX_MWIDLE_FLAG);
+
+    fprintf(stderr, "  [ADX] lock_count=%d saved_priority=%d"
+                    " raised=%d idle=%d mwidle_flag=%d\n",
+            count, saved, raised, idle, flag);
+    fprintf(stderr, "  [ADX] handles spinner=0x%08X pumpA=0x%08X"
+                    " pumpB=0x%08X mwidle=0x%08X\n",
+            BRIDGE_MEM32(ADX_H_SPINNER), BRIDGE_MEM32(ADX_H_PUMP_A),
+            BRIDGE_MEM32(ADX_H_PUMP_B), BRIDGE_MEM32(ADX_H_MWIDLE));
+
+    /* The two conditions that close the chain, stated rather than left for a
+     * reader to infer from two numbers. Either alone is survivable; together
+     * the guard at sub_001437B0 cannot terminate. */
+    if (saved == 15)
+        fprintf(stderr, "  [ADX] saved_priority is 15 -- the unlock restores"
+                        " base 16, so the I/O guard cannot exit\n");
+    if (count < 0)
+        fprintf(stderr, "  [ADX] lock_count is negative -- the unlock has"
+                        " stopped acting; no further pass can lower it\n");
     fflush(stderr);
 }
 
@@ -6824,14 +6933,17 @@ static void bridge_KeQueryBasePriorityThread(void)
     g_eax = obj ? (uint32_t)obj->BasePriority : 0;
     if (sched_trace_on()) {
         unsigned i;
-        for (i = 0; i < s_qbp_n; ++i) if (s_qbp[i].handle == h) break;
+        for (i = 0; i < s_qbp_n; ++i) if (s_qbp[i].object_va == h) break;
         if (i == s_qbp_n) {
-            if (s_qbp_n < 8) { s_qbp[s_qbp_n].handle = h; ++s_qbp_n; }
+            if (s_qbp_n < 8) { s_qbp[s_qbp_n].object_va = h; ++s_qbp_n; }
             else { ++s_qbp_over; return; }
         }
         ++s_qbp[i].hits;
         s_qbp[i].last = (long)(int32_t)g_eax;
-        if (!obj) s_qbp[i].unresolved = 1;
+        /* Only an object that resolved can name its thread; leave the token at
+         * zero otherwise rather than inventing one. */
+        if (obj) s_qbp[i].token = obj->HandleToken;
+        else     s_qbp[i].unresolved = 1;
     }
 }
 
@@ -7325,10 +7437,29 @@ static int sched_trace_on(void)
 static void sched_note(const char *what, uint32_t handle, uint32_t extra)
 {
     static unsigned long seen;
-    unsigned long n = ++seen;
-    /* Every call early, then a thinning sample: the pattern is what matters
-     * and a three-minute run makes millions of these. */
-    if (n > 200 && (n % 5000) != 0) return;
+    unsigned long n;
+    /* THE COUNTER HAS TO BE PER KIND, and one shared counter cost the 21 Sep
+     * player log its most important minutes. `seen` reached 445,000 -- almost
+     * all of it NtSuspendThread / NtResumeThread -- so after the first 200
+     * calls every kind was sampled 1 in 5000, including KeSetBasePriority,
+     * which fires a few dozen times in a whole session. The result reads like
+     * data and is not: the log's late priority changes are six survivors of an
+     * unknown population, and counting raises against restores in them says
+     * nothing. A rare event must not be thinned by a common one's volume.
+     *
+     * Priority changes are the freeze's whole question and are cheap, so they
+     * are never thinned. Everything else keeps the old behaviour, now counted
+     * against its own kind rather than the total. */
+    if (strcmp(what, "KeSetBasePriority") == 0) {
+        static unsigned long seen_prio;
+        ++seen_prio;
+        n = seen_prio;
+    } else {
+        n = ++seen;
+        /* Every call early, then a thinning sample: the pattern is what
+         * matters and a three-minute run makes millions of these. */
+        if (n > 200 && (n % 5000) != 0) return;
+    }
     fprintf(stderr, "  [SCHED] %-18s #%lu host_thread=%lu handle=0x%08X"
                     " stack_top=0x%08X ra=0x%08X extra=0x%08X\n",
             what, n, (unsigned long)GetCurrentThreadId(), handle,

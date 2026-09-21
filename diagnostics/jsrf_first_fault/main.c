@@ -37,6 +37,7 @@ static void jsrf_state_trace_flush(void);
 #endif
 #include "../../src/recomp_switch.h"
 #include "../../src/kernel/d3d8_ring.h"
+#include "adx_guard.h"
 #include "guest_trace.h"
 #include "guest_names.h"
 #include "wild_ptr.h"
@@ -1264,9 +1265,20 @@ static void jsrf_pusher_report(void)
              * reported from here rather than beside the pad poll. */
             { extern void bridge_sched_report(void); bridge_sched_report(); }
             /* Which thread the priority poll is waiting on, and whether its
-             * handle even resolves. See the note at the bridge. */
+             * object even resolves. See the note at the bridge. */
             { extern void bridge_query_priority_report(void);
               bridge_query_priority_report(); }
+            /* And what it is waiting ON: the CRI ADX lock count and the
+             * priority its unlock would restore. The census says which objects
+             * spin; this says whether the guest can ever stop them. */
+            { extern void bridge_adx_thread_report(void);
+              bridge_adx_thread_report(); }
+            /* And what OUR side of it did. The two guest words above say
+             * whether the poison formed; this says whether the guard that is
+             * supposed to prevent it was on, how deep the guest nested, and
+             * how many unlocks arrived with no matching lock -- which is the
+             * sub_001437B0 spin, counted rather than inferred. */
+            adx_guard_report();
         }
         jsrf_guest_trace_report();
         pad_sentinel_scan();
@@ -1600,7 +1612,19 @@ static void jsrf_adx_rate_report(void)
     uint32_t spin, srv, wrk, under;
     double dt;
 
-    if (on < 0) on = getenv("RECOMP_ADX_RATE") != NULL;
+    /* THROUGH THE HELPER, and it says so once when it is off.
+     *
+     * "[ADX-RATE] printed nothing at all in either session" was carried into a
+     * handover as a second thread to pull on the missing music. It is not a
+     * finding: the instrument is opt-in and the switch was not set. An
+     * absent report and an absent server pass look identical in a log, so
+     * this one announces which it is, once, and then goes quiet. */
+    if (on < 0) {
+        on = recomp_switch_on("RECOMP_ADX_RATE");
+        if (!on)
+            fprintf(stderr, "  [ADX-RATE] OFF (RECOMP_ADX_RATE unset) --"
+                            " no ADX rate lines will follow\n");
+    }
     if (!on) return;
 
     spin = MEM32(ADX_SPIN_VA); srv = MEM32(ADX_SERVER_VA);
