@@ -51,6 +51,7 @@ static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
 static void jsrf_save_dump(void);
 static void jsrf_scene_report(void);
+static void jsrf_actman_report(void);
 static void jsrf_seq_trace_start(void);
 static void jsrf_seq_report(void);
 static uint32_t jsrf_root_va(const uint8_t *base, uint32_t *via_out,
@@ -1269,6 +1270,7 @@ static void jsrf_pusher_report(void)
         jsrf_seq_report();
         jsrf_save_dump();
         jsrf_scene_report();
+        jsrf_actman_report();
         jsrf_object_dump();
         jsrf_func_hit_report();
         /* The allocator prints its owner breakdown once, when a request
@@ -3244,6 +3246,80 @@ static void jsrf_draw_list_report(const uint8_t *base, uint32_t root)
     }
     fprintf(stderr, "  [JSRF-DRAW] list=%u id44=%s id45=%s\n",
             n, saw44 ? "present" : "ABSENT", saw45 ? "present" : "ABSENT");
+    fflush(stderr);
+}
+
+/* CActMan's mode machine, and the REQUESTS underneath it.
+ *
+ * The banner shows the PREVIOUS objective's string. Not lingering pixels -- the
+ * wrong string. setShowText(1, new) replaces the live banner within ~2 guest
+ * frames unconditionally, so the old one survives only because the call is
+ * never issued; and DrawTextForFrame is reached by exactly one instruction,
+ * the tail of CMission::Exec0Default, which runs only while CActMan is in
+ * Default mode. A mode entered and never left would hold it forever.
+ *
+ * WHY THIRTEEN FIELDS AND NOT FOUR. The four mode flags at +0x40..+0x4C are
+ * derived state. The eight at +0x50..+0x6C are the REQUESTS -- a Set and a No
+ * per mode -- that sub_00013A80 tests each tick and clears. startup_probe.c
+ * found that structure by disassembly on 4 Sep and never named it; the XDK
+ * decompilation names the same fields m_b*NextFrame / m_bNo*NextFrame.
+ *
+ * Reading only the derived flags cannot tell these apart:
+ *
+ *   nobody asked to leave        -- No*NextFrame stays 0; the fault is
+ *                                   upstream of the mode machine entirely
+ *   asked, and the request was   -- No*NextFrame sets and the flag does not
+ *   dropped                         clear; the fault is at the tick boundary
+ *
+ * Different bugs, different fixes, one printf. Transitions are what matter, so
+ * this prints on CHANGE rather than on a timer -- a flag that enters and stays
+ * produces exactly one line, which is the finding.
+ *
+ * TWELVE dwords, 0x40..0x6C, and the count is load-bearing: 0x70 is
+ * m_bDrawChildren, which is not part of the mode machine and toggles, so
+ * reading thirteen makes this print identical-looking lines forever.
+ *
+ * WHAT THIS CANNOT SEE, stated because a silent instrument is the easiest kind
+ * to over-trust: it samples inside the periodic report, so a mode entered and
+ * left between two samples leaves no trace. All-zero here means "not latched
+ * at any sample", NOT "Event mode never ran". Proving the banner defect absent
+ * needs the sampler moved onto sub_00013A80's own tick, which is the next step
+ * if a latch is not caught this way first. */
+static void jsrf_actman_report(void)
+{
+    static uint32_t last[12];
+    static int primed;
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t root, via, now[12];
+    const char *how;
+    unsigned i;
+
+    if (!base || !recomp_switch_on("RECOMP_ACTMAN_REPORT")) return;
+    root = jsrf_root_va(base, &via, &how, 0);
+    if (!root || !jsrf_va_ok(root + 0x6Cu + 3u)) return;
+
+    for (i = 0; i < 12; ++i)
+        now[i] = *(const uint32_t *)(base + root + 0x40u + 4u * i);
+    if (primed && !memcmp(now, last, sizeof now)) return;
+    primed = 1;
+    memcpy(last, now, sizeof now);
+
+    /* The derived flags first, then the requests that produce them, in the
+     * precedence order the mode machine itself uses:
+     * CoveredPause > Event > FreezeCam > UncoveredPause > Default. */
+    fprintf(stderr, "  [ACTMAN] t=%u root=%08X mode: CoveredPause=%u Event=%u"
+            " FreezeCam=%u UncoveredPause=%u\n",
+            GetTickCount(), root, now[0], now[1], now[2], now[3]);
+    fprintf(stderr, "  [ACTMAN]   requests: CoveredPause set=%u no=%u |"
+            " Event set=%u no=%u | FreezeCam set=%u no=%u |"
+            " UncoveredPause set=%u no=%u\n",
+            now[4], now[5], now[6], now[7], now[8], now[9], now[10], now[11]);
+    /* Default mode is the absence of the other four, and it is the one that
+     * lets the banner redraw -- so say it outright rather than making a reader
+     * AND four numbers together at 3am. */
+    fprintf(stderr, "  [ACTMAN]   effective=%s\n",
+            now[0] ? "CoveredPause" : now[1] ? "Event" :
+            now[2] ? "FreezeCam"    : now[3] ? "UncoveredPause" : "Default");
     fflush(stderr);
 }
 
