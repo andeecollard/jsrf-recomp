@@ -327,7 +327,17 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
             for(unsigned light=0;light<8;++light) if(((light_mask>>(2*light))&3)==1) {
                 unsigned base=0x1000+light*0x80;
                 float direction[3]={value(m,base+0x34),value(m,base+0x38),value(m,base+0x3c)};
-                float ndotl=fmaxf(0,-(normal[0]*direction[0]+normal[1]*direction[1]+normal[2]*direction[2]));
+                /* NO NEGATION. NV097_SET_LIGHT_INFINITE_DIRECTION already
+                 * holds the direction TO the light: D3D negates and
+                 * normalises D3DLIGHT_DIRECTIONAL.Direction before writing
+                 * it. xemu's fixed-function emitter forms
+                 * max(0, dot(tNormal, lightDirection)) on the register as
+                 * given. The negated form here lit every surface FACING the
+                 * light at zero and left it scene-ambient only -- measured
+                 * 21 Sep 2026 on the Load screen: ambient (0.26,0.13,0)
+                 * is exactly the brown we drew where xemu draws the
+                 * light's yellow. The GPU emitter carries the same fix. */
+                float ndotl=fmaxf(0,(normal[0]*direction[0]+normal[1]*direction[1]+normal[2]*direction[2]));
                 illumination+=value(m,base+4*k)+ndotl*value(m,base+0x0c+4*k);
             }
             out[3][k]=clamp01(value(m,0x3a8+4*k)+in[3][k]*illumination);

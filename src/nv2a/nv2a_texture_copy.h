@@ -45,6 +45,16 @@ typedef struct NV2ATextureCopy {
     uint32_t stencil_func, stencil_fail, stencil_zfail, stencil_zpass;
     uint32_t target_handle, target_offset, target_pitch, target_bpp;
     uint32_t clip_x, clip_y, clip_w, clip_h;
+    /* NV097_SET_WINDOW_CLIP_HORIZONTAL/VERTICAL, inclusive pixel bounds,
+     * already intersected with the surface clip above. The rasteriser --
+     * Metal's scissor, or the software loop's bounds -- draws inside it and
+     * nowhere else. Until 21 Sep 2026 any window clip smaller than the
+     * surface refused the whole draw ("partial window clip"), and the
+     * character-select screen draws its character view through exactly
+     * such a rectangle: 495,110 draws refused in one 90 s session, two
+     * black panels on screen. */
+    uint32_t wc_x0, wc_y0, wc_x1, wc_y1;   /* all zero: no window clip (see
+                                            * nv2a_texture_copy_window) */
     /* The guest's own depth range and what it wants done outside it.
      * NV097_SET_CLIP_MIN/MAX (0x394/0x398) are IEEE floats in the same
      * 0..16777215 units as oPos.z; ZMIN_MAX_CONTROL (0x1D78) selects
@@ -53,6 +63,21 @@ typedef struct NV2ATextureCopy {
     float z_clip_min, z_clip_max;
     uint32_t z_cull;
 } NV2ATextureCopy;
+
+/* The rectangle the rasteriser may touch: the window clip when the state
+ * carries one, the surface clip when it does not. A state built by hand --
+ * the unit tests, a replay -- leaves the four fields zero, and a 1x1 clip at
+ * the origin is not something this title asks for, so all-zero means "the
+ * whole surface" rather than "one pixel". Inclusive bounds. */
+static inline void nv2a_texture_copy_window(const NV2ATextureCopy *s,
+                                            uint32_t *x0, uint32_t *y0,
+                                            uint32_t *x1, uint32_t *y1)
+{
+    if (!s->wc_x0 && !s->wc_y0 && !s->wc_x1 && !s->wc_y1) {
+        *x0 = s->clip_x; *y0 = s->clip_y;
+        *x1 = s->clip_x + s->clip_w - 1; *y1 = s->clip_y + s->clip_h - 1;
+    } else { *x0 = s->wc_x0; *y0 = s->wc_y0; *x1 = s->wc_x1; *y1 = s->wc_y1; }
+}
 
 const char *nv2a_texture_copy_prepare_image(const uint32_t methods[2048], unsigned unit, NV2ATextureCopy *state);
 

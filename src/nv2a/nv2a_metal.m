@@ -1346,6 +1346,42 @@ static unsigned long long g_hw_depth_always_states, g_hw_no_stencil_states;
  * RECOMP_METAL_BATCH is still waiting on. */
 static int hw_state_on(void);
 
+/* A DRAW THAT SAMPLES THE SURFACE IT IS RENDERING INTO. RECOMP_METAL_FEEDBACK_SYNC.
+ *
+ * Measured on xemu, 21 Sep 2026, last 800 flips of the Load-screen trace:
+ * 21,573 draws target the render target and 15,162 of them bind that SAME
+ * surface as TEXTURE0 (linear R5G6B5, 640x480) -- nineteen a flip. The title
+ * screen does it too, 829 times in 2,688 flips, on its fades. On the NV2A the
+ * sample reads the surface as it stands at that draw.
+ *
+ * texture_buffer uploads from GUEST RAM, and the bound surface's rendering
+ * is only written back to guest RAM at a sync -- a flip, a clear, a target
+ * change. So every one of those draws sampled the surface as it was at the
+ * last sync, not as it is: the frame's fresh content was never in the bytes
+ * it read. surface_pay_debt_for_range cannot help, because the bound
+ * surface's debt is surface_dirty, not owes_guest_ram, and it walks the
+ * latter.
+ *
+ * MEASURED AND REFUTED THE SAME NIGHT. The nineteen were a tally reading
+ * the LATCHED texture offset on untextured draws; our counter and xemu's
+ * own render_to_texture line both say ONE such draw a flip, and it is the
+ * composite. The switch stays as a negative control (it changed nothing);
+ * the counter stays because one-a-flip is the cheapest sighting of the
+ * composite there is.
+ *
+ * g_feedback_draws counts the aliasing draws whether or not the switch is
+ * on, so a run says how many there were before anyone argues about the
+ * cost. With the switch on, each such draw syncs the bound surface first --
+ * a drain and a 614 KB read-back per draw, nineteen a flip on that screen,
+ * which is why it is opt-in until a run has said what it buys. */
+static uint64_t g_feedback_draws, g_feedback_syncs;
+static int feedback_sync_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_METAL_FEEDBACK_SYNC");
+    return on;
+}
+
 /* A true RGB565 colour attachment: two bytes a pixel against sixteen.
  *
  * It is what xemu allocates for a 565 guest surface on both of its backends
@@ -2540,6 +2576,8 @@ static uint64_t g_queue_drains;
  * silence: read it before believing a frame-time number. */
 static uint64_t g_resident_color_clears, g_resident_depth_clears;
 static uint64_t g_resident_unbound_clears, g_slot_writebacks, g_slot_writeback_skipped;
+static uint64_t g_resident_depth_sibling_clears;   /* see nv2a_metal_clear_depth_stencil */
+static uint64_t g_scissored_draws;   /* draws whose window clip was smaller than the surface */
 /* WHO ASKS FOR THE STALL.
  *
  * A 150 s gameplay run reported 24,293 sync calls costing 52.7 s of draining
@@ -2933,6 +2971,12 @@ void nv2a_metal_report(void)
             (unsigned long long)g_resident_unbound_clears,
             (unsigned long long)g_resident_depth_clears,
             (unsigned long long)g_clear_depth_calls);
+    fprintf(stderr,"[METAL] scissored draws (window clip smaller than the surface): %llu\n",
+            (unsigned long long)g_scissored_draws);
+    fprintf(stderr,"[METAL] depth clears applied to a sibling slot sharing the same"
+            " guest depth buffer: %llu (the render target's copy, which the"
+            " bound-surface clear used to miss)\n",
+            (unsigned long long)g_resident_depth_sibling_clears);
     /* THE ARM NAMES ITSELF, in both states, because ab_score.py can only check
      * a switch that does. gpu draws moving while vertices stays at zero would
      * mean the counter is on the wrong side of the branch, which is why both
@@ -3093,6 +3137,11 @@ void nv2a_metal_report(void)
      * helps; the real split is 15,849 rebuilds and a 27% hit rate, which is a
      * different problem with a different fix. Print the swap total, the split,
      * and the rate, so none of the three has to be inferred. */
+    fprintf(stderr,"[METAL] feedback reads: %llu draws sampled the surface they"
+            " render into, %llu synced it first (feedback_sync %s)\n",
+            (unsigned long long)g_feedback_draws,
+            (unsigned long long)g_feedback_syncs,
+            feedback_sync_on()?"on":"OFF");
     fprintf(stderr,"[METAL] surface cache: %llu swaps = %llu rebinds + %llu "
             "rebuilds (%.0f%% hit), %llu evictions (surface_cache %s)\n",
             (unsigned long long)surface_uploads,
@@ -3903,6 +3952,52 @@ int nv2a_metal_clear_depth_stencil(uint8_t *target, size_t target_size,
     ++g_clear_depth_calls;
     if ((components & 3u) != 3u) { ++g_clear_refuse_components; return 0; }
     if (x0 != 0 || y0 != 0 || x1 != width || y1 != height) { ++g_clear_refuse_rect; return 0; }
+    /* EVERY SLOT THAT SHARES THIS DEPTH BUFFER, NOT ONLY THE BOUND ONE.
+     *
+     * The slot key is exact on seven fields including the depth pointer, and
+     * a draw that neither depth-tests nor stencil-tests keeps the previous
+     * depth binding (see "A DRAW WITH NO DEPTH DOES NOT NEED THE RETAINED
+     * DEPTH THROWN AWAY" in nv2a_metal_draw). So this title's per-frame
+     * composite -- render target sampled into a back buffer, depth off --
+     * builds the back buffer's slot with the RENDER TARGET's depth pointer,
+     * and from then on two slots hold two separate depth textures for one
+     * guest depth buffer. The frame's depth clear arrives while the back
+     * buffer is bound, passes the bound-surface test below, and clears the
+     * back buffer's copy. The render target's copy is never cleared, never
+     * re-uploaded on a rebind, and never written back, so it keeps last
+     * frame's depth for good.
+     *
+     * Measured 21 Sep 2026 on the Load screen: 24 consecutive draws, every
+     * triangle accepted, every one with the depth test on, and the render
+     * target stays black; RECOMP_METAL_HW_DEPTH_ALWAYS=1 brings the whole
+     * screen back. A static screen is the worst case -- identical depth every
+     * frame fails LESS everywhere -- but every scene pays some of it.
+     *
+     * So the clear is applied to every valid slot whose depth pointer is the
+     * one being cleared, at the same geometry. The bound slot is handled by
+     * the path below as before; the others get a depth/stencil-only pass,
+     * which Metal permits. Counted separately so the report can say how many
+     * copies existed. */
+    for (unsigned i = 0; i < surface_slots_used(); ++i) {
+        if (!surf_slot[i].valid || surf_slot[i].depth != target) continue;
+        if (surf_slot[i].depth_pitch != pitch || surf_slot[i].w != width || surf_slot[i].h != height) continue;
+        if (!surf_slot[i].hw_depth || !surf_slot[i].hw_stencil) continue;
+        if (surf_slot[i].hw_depth == hw_depth_tex) continue;   /* the bound copy, below */
+        @autoreleasepool {
+            uint32_t q = (value >> 8) & 0xFFFFFFu;
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            batch_flush();
+            pass.depthAttachment.texture = surf_slot[i].hw_depth;
+            pass.depthAttachment.loadAction = MTLLoadActionClear;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            pass.depthAttachment.clearDepth = (double)q / 16777215.0;
+            pass.stencilAttachment.texture = surf_slot[i].hw_stencil;
+            pass.stencilAttachment.loadAction = MTLLoadActionClear;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            pass.stencilAttachment.clearStencil = value & 0xFFu;
+            if (clear_encode(pass)) ++g_resident_depth_sibling_clears;
+        }
+    }
     if (!clear_resident_ok(depth_target == target ? surface_target : NULL,
                            surface_pitch, width, height)) return 0;
     if (depth_target != target || depth_pitch != pitch) return 0;
@@ -4480,6 +4575,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  if(!vertices||count<3||count>NV2A_METAL_MAX_VERTICES)return reject("vertex-count");
  if(s->target_bpp!=2)return reject("target-format");
  if(!s->clip_w||!s->clip_h||s->clip_x||s->clip_y||s->clip_w>4096||s->clip_h>4096)return reject("clip");
+ /* The window clip (scissor). prepare() has intersected it with the surface
+  * clip and refused an empty one, so it lies inside the target; clamp again
+  * against what Metal will actually be bound to, because a scissor outside
+  * the attachment is a validation failure, not a clip. */
+ uint32_t wc_x0,wc_y0,wc_x1,wc_y1;nv2a_texture_copy_window(s,&wc_x0,&wc_y0,&wc_x1,&wc_y1);
+ if(wc_x1<wc_x0||wc_y1<wc_y0||wc_x0>=s->clip_w||wc_y0>=s->clip_h)return reject("window-clip");
  if(s->target_pitch<(uint64_t)s->clip_w*2)return reject("target-pitch");
  /* See the note on g_t0_flat. Bounded: one pass over the batch's vertices,
   * and only when the switch has been read as set. */
@@ -4881,6 +4982,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * RAM; if a slot is still holding them on the GPU it has to hand them
     * over first. Four slots and a pointer compare when nothing is owed. */
    surface_pay_debt_for_range(data,bytes,&g_debt_paid_on_read);
+   /* The bound surface itself: see feedback_sync_on. Counted always, paid
+    * only when asked. The sync flushes the open batch, so the sample sees
+    * every draw before this one. */
+   if(data&&surface_valid&&surface_target&&guest_ranges_overlap(data,bytes,surface_target,surface_target_size)){
+    ++g_feedback_draws;
+    if(feedback_sync_on()&&surface_dirty){nv2a_metal_sync();++g_feedback_syncs;}}
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
   /* WHAT `vertices` HOLDS DEPENDS ON WHO IS GOING TO RUN THE PROGRAM.
    *
@@ -5255,7 +5362,14 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    if(ib)[encoder setVertexBuffer:ib offset:ib_offset atIndex:2];
    else  [encoder setVertexBytes:indices length:index_bytes atIndex:2];
    ++g_vsh_cpu_draws;
-  }[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+  }[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];
+  {/* Per draw, because the encoder is shared across the batch and the
+    * previous draw's rectangle would otherwise stay in force. */
+   MTLScissorRect sc;sc.x=wc_x0;sc.y=wc_y0;
+   sc.width=(wc_x1<s->clip_w?wc_x1:s->clip_w-1)-wc_x0+1;
+   sc.height=(wc_y1<s->clip_h?wc_y1:s->clip_h-1)-wc_y0+1;
+   [encoder setScissorRect:sc];if(sc.width<s->clip_w||sc.height<s->clip_h)++g_scissored_draws;}
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
   if(batch_on()){
    if(pinned_slab>=0)batch_pins|=1u<<(unsigned)pinned_slab;
    ++batch_draws;

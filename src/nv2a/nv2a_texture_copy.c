@@ -334,9 +334,20 @@ target_state:
         return "target dimensions / pitch";
     if ((s->depth_test || s->stencil_test) && s->depth_pitch<(s->clip_x+s->clip_w)*4u)
         return "depth dimensions / pitch";
-    if ((M(0x2c0)&0xfff)>s->clip_x || ((M(0x2c0)>>16)&0xfff)<s->clip_x+s->clip_w-1
-            || (M(0x2e0)&0xfff)>s->clip_y || ((M(0x2e0)>>16)&0xfff)<s->clip_y+s->clip_h-1)
-        return "partial window clip";
+    /* The window clip is a SCISSOR, not a reason to refuse. Inclusive on
+     * both ends (type 0; the exclusive type is refused above with the colour
+     * mask). Intersect it with the surface clip and hand the rectangle to the
+     * rasteriser; only an empty rectangle has nothing to draw. */
+    {
+        uint32_t x0=M(0x2c0)&0xfff, x1=(M(0x2c0)>>16)&0xfff;
+        uint32_t y0=M(0x2e0)&0xfff, y1=(M(0x2e0)>>16)&0xfff;
+        if (x0<s->clip_x) x0=s->clip_x;
+        if (y0<s->clip_y) y0=s->clip_y;
+        if (x1>s->clip_x+s->clip_w-1) x1=s->clip_x+s->clip_w-1;
+        if (y1>s->clip_y+s->clip_h-1) y1=s->clip_y+s->clip_h-1;
+        if (x0>x1 || y0>y1) return "empty window clip";
+        s->wc_x0=x0; s->wc_y0=y0; s->wc_x1=x1; s->wc_y1=y1;
+    }
     return NULL;
 }
 /* WHICH format is being refused, not merely that one was.
@@ -1103,8 +1114,10 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
     int front = nv2a_texture_copy_front_facing(s, area, v[0][0][3],
                                                v[1][0][3], v[2][0][3]);
     if (nv2a_texture_copy_culled(s, front)) return 1;
-    float left=(float)s->clip_x,right=(float)(s->clip_x+s->clip_w);
-    float top=(float)s->clip_y,bottom=(float)(s->clip_y+s->clip_h);
+    /* The window clip, already intersected with the surface clip. */
+    uint32_t wx0,wy0,wx1,wy1; nv2a_texture_copy_window(s,&wx0,&wy0,&wx1,&wy1);
+    float left=(float)wx0,right=(float)(wx1+1);
+    float top=(float)wy0,bottom=(float)(wy1+1);
     int x0=(int)floorf(fmaxf(left,fminf(right,fminf(a[0][0],fminf(b[0][0],c[0][0])))));
     int x1=(int)ceilf(fmaxf(left,fminf(right,fmaxf(a[0][0],fmaxf(b[0][0],c[0][0])))));
     int y0=(int)floorf(fmaxf(top,fminf(bottom,fminf(a[0][1],fminf(b[0][1],c[0][1])))));

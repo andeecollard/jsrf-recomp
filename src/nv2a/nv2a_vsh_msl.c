@@ -1027,6 +1027,8 @@ int nv2a_ff_generate_msl(const NV2AFFKey *key, char *buf, int bufsize)
          * loop recomputes N.L for each of x, y and z and accumulates
          * `illumination += ambient_k + ndotl * diffuse_k`, which is one add of
          * a sum and not two separate adds. */
+        /* No negation of the dot product: see nv2a_ff.c, the CPU reference,
+         * for why (the register already points TO the light). */
         sb_append(&sb, "    /* Infinite-light diffuse and ambient, per component,\n"
                        "     * in nv2a_ff.c's own accumulation order */\n");
         sb_append(&sb, "    float3 illum = float3(c[%d].x, c[%d].y, c[%d].z);\n",
@@ -1036,7 +1038,7 @@ int nv2a_ff_generate_msl(const NV2AFFKey *key, char *buf, int bufsize)
             if (!(key->lights & (1u << i))) continue;
             sb_append(&sb,
                 "    {   float3 d%d = float3(c[%d].x, c[%d].y, c[%d].z);\n"
-                "        float ndotl%d = fmax(0.0f, -((nrm.x * d%d.x + nrm.y * d%d.y) + nrm.z * d%d.z));\n"
+                "        float ndotl%d = fmax(0.0f, ((nrm.x * d%d.x + nrm.y * d%d.y) + nrm.z * d%d.z));\n"
                 "        illum = illum + (float3(c[%d].x, c[%d].y, c[%d].z)\n"
                 "                         + ndotl%d * float3(c[%d].x, c[%d].y, c[%d].z));\n"
                 "    }\n",

@@ -34,8 +34,17 @@ int main(void)
     m[0x3cc/4]=0x8511;CHECK(nv2a_ff_vertex(m,in,out));m[0x3cc/4]=0;
     m[0x3c0/4]=0x8512;CHECK(nv2a_ff_vertex(m,in,out));m[0x3c0/4]=0;
     /* Ambient plus one infinite directional light, the path measured in the
-     * first rejected JSRF city batch. */
-    in[2][0]=in[2][1]=0;in[2][2]=1;in[3][0]=in[3][1]=in[3][2]=.5f;in[3][3]=.75f;
+     * first rejected JSRF city batch.
+     *
+     * THE NORMAL POINTS ALONG THE REGISTER, NOT AGAINST IT. The infinite
+     * direction register already holds the direction TO the light (D3D
+     * negates D3DLIGHT_DIRECTIONAL.Direction before writing it), and the
+     * dot product is taken as given: xemu forms max(0, dot(tNormal,
+     * lightDirection)). This test used to put the normal at +z against a
+     * register of -z and expect full diffuse, which encoded the negated
+     * form; that form drew JSRF's lit Load screen scene-ambient brown where
+     * xemu draws the light's yellow (21 Sep 2026). */
+    in[2][0]=in[2][1]=0;in[2][2]=-1;in[3][0]=in[3][1]=in[3][2]=.5f;in[3][3]=.75f;
     for(unsigned k=0;k<3;++k) { put(m,0xa10+4*k,.25f);put(m,0x3a8+4*k,.1f);put(m,0x1000+4*k,.2f);put(m,0x100c+4*k,.5f); }
     put(m,0x3b4,.8f);put(m,0x1034,0);put(m,0x1038,0);put(m,0x103c,-1);
     m[0x3bc/4]=1;m[0x314/4]=1;
