@@ -100,6 +100,48 @@ not hold, the line says NOT TRUSTED and reports no verdict at all.
                      only.
     NOT TRUSTED   -> fix the probe, not the renderer.
 
+## G26 IS ANSWERED, AND SO IS THE STEP AFTER IT — 21 September, 16:35
+
+**SHADING, twice over, and the second measurement is stronger than the
+first.**
+
+The passive probe, across a player-driven run with 35 seconds of black:
+**66 MATCH, 0 COVERAGE, bound-ever=yes throughout**, device never missing,
+ring check never failed, 0 stale snapshots, frame sequence 7711 → 10585. The
+guest's `m_RenderTarget->Data` and the offset our parser latched are the same
+number, byte for byte, while the screen is black.
+
+Then the white test, armed by the defect itself:
+
+| t | presented nonzero | |
+| --- | --- | --- |
+| 33–35 | 306195 → 306506 | the Load menu, rendering |
+| 36–37 | 279022 → 99034 | the fade, behaving correctly |
+| 38–40 | **0** | the defect. 28.0 draws/flip throughout |
+| 41+ | **307200 / 307200** | the force armed, and every pixel lit |
+
+**THE 28 BATCHES A FRAME COVER THE ENTIRE 640×480 SURFACE.** Not part of it,
+not a sliver — all 307,200 pixels, on the frame we present, while the screen
+is black. Nothing is missing, misaimed or clipped away. The geometry is
+exactly where it should be and the fragment shading resolves to zero.
+
+That closes the binary question this file was written around, and it kills a
+whole family of theories with it: missing geometry, a wrong render target, a
+viewport or clip problem, a surface we never followed. None of them survive a
+measurement that lights every pixel of the same frame.
+
+**What it leaves is narrow and cheap to test.** `shade()`'s inputs are
+already switchable and the arm now costs nothing to reuse:
+
+    RECOMP_FRAG_FORCE=1   raw TEXTURE0      black here -> the texture is black
+    RECOMP_FRAG_FORCE=2   PRIMARY_COLOR     black here -> the vertex colour is
+    RECOMP_FRAG_FORCE=4   TEXCOORD0         shows the coordinates outright
+
+Three player-driven runs, each self-arming, each answering a different half.
+The night handover's six arms all read these same questions off half-composed
+frames and every one of them is UNVERIFIED rather than refuted — they can now
+be re-asked properly.
+
 ## WHAT IS EXPLICITLY NOT THE NEXT MOVE
 
 - **The white test first.** Player-driven, depends on being on the right
@@ -115,10 +157,10 @@ not hold, the line says NOT TRUSTED and reports no verdict at all.
 
 ## ORDER OF WORK
 
-1. **G26.** The render-target probe. Closes the last binary question on a
-   defect the player can see.
-2. **FRAG_FORCE on the Load screen**, with `AFTER` set — only on the SHADING
-   branch, only after G26.
+1. ~~**G26.** The render-target probe.~~ **DONE, 16:30. SHADING.**
+2. ~~**FRAG_FORCE on the Load screen.**~~ **DONE, 16:35. Full coverage,
+   307200/307200.** Next is `FRAG_FORCE=1`, then `=2`, then `=4`, to find
+   which of `shade()`'s inputs is the black one.
 3. **`snapNNN` becomes the default for every run**, and `reportNNN` gets a name
    that cannot be mistaken for the frame. The name is what caused the error,
    six arms deep, twice.
