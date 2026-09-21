@@ -1,0 +1,418 @@
+diff --git a/src/OOVPADatabase/D3D8/3911.inl b/src/OOVPADatabase/D3D8/3911.inl
+index 971e428..772e805 100644
+--- a/src/OOVPADatabase/D3D8/3911.inl
++++ b/src/OOVPADatabase/D3D8/3911.inl
+@@ -177,7 +177,7 @@ OOVPA_XREF(D3DDevice_GetTexture2, 3911, 1 + 23, // Also for 3948, ?4361?
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0E, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x0E, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+@@ -221,7 +221,7 @@ OOVPA_XREF(D3DDevice_SetTexture,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x11, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x11, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x51 },
+             { 0x01, 0x53 },
+@@ -479,7 +479,7 @@ OOVPA_XREF(D3DDevice_GetDepthStencilSurface,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x07, XREF_OFFSET_D3DDevice__m_DepthStencil), // Derived
++    XREF_ENTRY(0x07, XREF_D3DDevice__m_DepthStencil_OFFSET), // Derived
+ #endif
+         { 0x00, 0xA1 },
+ 
+@@ -1649,7 +1649,7 @@ OOVPA_XREF(D3DDevice_SetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x17, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x17, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0x20
+         OV_MATCH(0x00, 0x83, 0xEC),
+@@ -1849,7 +1849,7 @@ OOVPA_XREF(D3DDevice_SetPixelShader,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x10, XREF_OFFSET_D3DDevice__m_PixelShader), // Derived
++    XREF_ENTRY(0x10, XREF_D3DDevice__m_PixelShader_OFFSET), // Derived
+ #endif
+         // D3DDevice_SetPixelShader+0x00 : mov eax, [esp+arg_0]
+         { 0x00, 0x8B },
+@@ -2210,7 +2210,7 @@ OOVPA_XREF(D3DDevice_SetPalette,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x10, XREF_OFFSET_D3DDevice__m_Palettes), // Derived verified on 3911
++    XREF_ENTRY(0x10, XREF_D3DDevice__m_Palettes_OFFSET), // Derived verified on 3911
+ #endif
+         // D3DDevice_SetPalette+0x0D : mov eax, [edi+esi*4+0x0BB0]
+         { 0x0D, 0x8B },
+@@ -2944,7 +2944,7 @@ OOVPA_SIG_MATCH(
+     XREF_ENTRY(0x01, XREF_D3D_g_pDevice),
+ 
+     // TODO: Uncomment when WIP_LessVertexPatching is defined
+-    // XREF_ENTRY(0x07, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    // XREF_ENTRY(0x07, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ 
+     // call D3DResource_AddRef
+     XREF_ENTRY(0x17, XREF_D3DResource_AddRef),
+diff --git a/src/OOVPADatabase/D3D8/3947.inl b/src/OOVPADatabase/D3D8/3947.inl
+index e0e6462..c1baf2c 100644
+--- a/src/OOVPADatabase/D3D8/3947.inl
++++ b/src/OOVPADatabase/D3D8/3947.inl
+@@ -13,7 +13,7 @@ OOVPA_XREF(D3DDevice_SetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x1D, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x1D, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0xXX
+         OV_MATCH(0x00, 0x83, 0xEC),
+diff --git a/src/OOVPADatabase/D3D8/4034.inl b/src/OOVPADatabase/D3D8/4034.inl
+index 2274a11..6e68244 100644
+--- a/src/OOVPADatabase/D3D8/4034.inl
++++ b/src/OOVPADatabase/D3D8/4034.inl
+@@ -874,7 +874,7 @@ OOVPA_XREF(D3DDevice_SetTexture, 4034, 1 + 10, // TODO : Alias 3911 instead ?
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x13, XREF_OFFSET_D3DDevice__m_Textures), // Derived - verified for 4432 DolphinClassic 0x00021D10(SetTexture)+0x10=00021D20 : 8B 84 B7 78 0A 00 00 mov eax,[edi+esi*4+$00000A78]
++    XREF_ENTRY(0x13, XREF_D3DDevice__m_Textures_OFFSET), // Derived - verified for 4432 DolphinClassic 0x00021D10(SetTexture)+0x10=00021D20 : 8B 84 B7 78 0A 00 00 mov eax,[edi+esi*4+$00000A78]
+ #endif
+         // D3DDevice_SetTexture+0x09 : push edi
+         { 0x09, 0x57 },
+@@ -911,7 +911,7 @@ OOVPA_XREF(D3DDevice_SetPalette,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x10, XREF_OFFSET_D3DDevice__m_Palettes), // Derived
++    XREF_ENTRY(0x10, XREF_D3DDevice__m_Palettes_OFFSET), // Derived
+ #endif
+         { 0x00, 0x53 },
+             { 0x08, 0x57 },
+@@ -1246,7 +1246,7 @@ OOVPA_NO_XREF(D3DDevice_SetRenderTarget, 4034, 10)
+ OOVPA_XREF(D3DDevice_SetRenderTarget, 4034, 1 + 10, XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x17, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived TODO : Verify offset
++    XREF_ENTRY(0x17, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived TODO : Verify offset
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0xXX
+         OV_MATCH(0x00, 0x83, 0xEC),
+@@ -1276,7 +1276,7 @@ OOVPA_XREF(D3DDevice_SetPixelShader,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x10, XREF_OFFSET_D3DDevice__m_PixelShader), // Derived
++    XREF_ENTRY(0x10, XREF_D3DDevice__m_PixelShader_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+@@ -1412,7 +1412,7 @@ OOVPA_SIG_MATCH(
+     XREF_ENTRY(0x0B, XREF_D3DRS_MultiSampleMode),
+ 
+     // TODO: enable below for WIP_LessVertexPatching
+-    //XREF_ENTRY(0x11, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    //XREF_ENTRY(0x11, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ 
+     // mov e??,[esp + param_1]
+     OV_MATCH(0x00, 0x8B),
+@@ -1440,14 +1440,14 @@ OOVPA_SIG_MATCH(
+     XREF_ENTRY(0x0B, XREF_D3DRS_MultiSampleRenderTargetMode),
+ 
+     // TODO: enable below for WIP_LessVertexPatching
+-    // mov e??,[e?? + XREF_OFFSET_D3DDevice__m_RenderTarget]
+-    //XREF_ENTRY(0x11, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    // mov e??,[e?? + XREF_D3DDevice__m_RenderTarget_OFFSET]
++    //XREF_ENTRY(0x11, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ 
+     // mov e??,[esp + param_1]
+     OV_MATCH(0x00, 0x8B),
+     OV_MATCH(0x02, 0x24, 0x04),
+ 
+-    // mov e??,[e?? + XREF_OFFSET_D3DDevice__m_RenderTarget]
++    // mov e??,[e?? + XREF_D3DDevice__m_RenderTarget_OFFSET]
+     OV_MATCH(0x0F, 0x8B),
+ 
+     // cmp e??,[e?? + XREF_OFFSET_D3DDevice__m_????]
+diff --git a/src/OOVPADatabase/D3D8/4039.inl b/src/OOVPADatabase/D3D8/4039.inl
+index d1184d1..04ca1d8 100644
+--- a/src/OOVPADatabase/D3D8/4039.inl
++++ b/src/OOVPADatabase/D3D8/4039.inl
+@@ -75,7 +75,7 @@ OOVPA_XREF(D3DDevice_SetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x18, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x18, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0xXX
+         OV_MATCH(0x00, 0x83, 0xEC),
+diff --git a/src/OOVPADatabase/D3D8/4134.inl b/src/OOVPADatabase/D3D8/4134.inl
+index a77adee..1c4b60c 100644
+--- a/src/OOVPADatabase/D3D8/4134.inl
++++ b/src/OOVPADatabase/D3D8/4134.inl
+@@ -597,7 +597,7 @@ OOVPA_XREF(D3DDevice_GetTexture2, 4134, 1 + 23, // Up to 4531
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0E, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x0E, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+diff --git a/src/OOVPADatabase/D3D8/4361.inl b/src/OOVPADatabase/D3D8/4361.inl
+index e52cb5d..6e06a7c 100644
+--- a/src/OOVPADatabase/D3D8/4361.inl
++++ b/src/OOVPADatabase/D3D8/4361.inl
+@@ -43,7 +43,7 @@ OOVPA_XREF(D3DDevice_SetTexture,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x13, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x13, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x83 },
+             { 0x01, 0xEC },
+diff --git a/src/OOVPADatabase/D3D8/4627.inl b/src/OOVPADatabase/D3D8/4627.inl
+index e880870..19b49cd 100644
+--- a/src/OOVPADatabase/D3D8/4627.inl
++++ b/src/OOVPADatabase/D3D8/4627.inl
+@@ -95,7 +95,7 @@ OOVPA_XREF(D3D_CommonSetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x18, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x18, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+         // D3D_CommonSetRenderTarget+0x00 : sub esp, 0x20
+         { 0x00, 0x83 },
+@@ -329,7 +329,7 @@ OOVPA_SIG_MATCH(
+     XREF_ENTRY(0x01, XREF_D3D_g_pDevice),
+ 
+     // TODO: Uncomment when WIP_LessVertexPatching is defined
+-    //XREF_ENTRY(0x08, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    //XREF_ENTRY(0x08, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ 
+     // call D3DResource_AddRef
+     XREF_ENTRY(0x12, XREF_D3DResource_AddRef),
+@@ -391,7 +391,7 @@ OOVPA_XREF(D3DDevice_GetDepthStencilSurface2,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x08, XREF_OFFSET_D3DDevice__m_DepthStencil), // Derived
++    XREF_ENTRY(0x08, XREF_D3DDevice__m_DepthStencil_OFFSET), // Derived
+ #endif
+         { 0x00, 0xA1 },
+ 
+@@ -702,7 +702,7 @@ OOVPA_XREF(D3DDevice_SetPixelShader,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0A, XREF_OFFSET_D3DDevice__m_PixelShader), // Derived
++    XREF_ENTRY(0x0A, XREF_D3DDevice__m_PixelShader_OFFSET), // Derived
+ #endif
+         { 0x03, 0x1D },
+ 
+@@ -1261,7 +1261,7 @@ OOVPA_XREF(D3DDevice_GetTexture2, 4627, 1 + 23, // Up to 5233. Also for 5344, 55
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0E, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x0E, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+diff --git a/src/OOVPADatabase/D3D8/4831.inl b/src/OOVPADatabase/D3D8/4831.inl
+index 1ace960..c995be9 100644
+--- a/src/OOVPADatabase/D3D8/4831.inl
++++ b/src/OOVPADatabase/D3D8/4831.inl
+@@ -37,7 +37,7 @@ OOVPA_XREF(D3DDevice_SetTexture,
+            XRefOne)
+     {
+ 
+-        XREF_ENTRY(0x13, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++        XREF_ENTRY(0x13, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+ #if 0 // PatrickvL preparations // 1+31,
+         { 0x00, 0x83 },
+diff --git a/src/OOVPADatabase/D3D8/5028.inl b/src/OOVPADatabase/D3D8/5028.inl
+index feaa508..d205455 100644
+--- a/src/OOVPADatabase/D3D8/5028.inl
++++ b/src/OOVPADatabase/D3D8/5028.inl
+@@ -308,7 +308,7 @@ OOVPA_XREF(D3D_CommonSetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x18, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived TODO : Verify offset
++    XREF_ENTRY(0x18, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived TODO : Verify offset
+ #endif
+         { 0x02, 0x1C },
+             { 0x1A, 0x15 },
+diff --git a/src/OOVPADatabase/D3D8/5233.inl b/src/OOVPADatabase/D3D8/5233.inl
+index 2665b7d..9506507 100644
+--- a/src/OOVPADatabase/D3D8/5233.inl
++++ b/src/OOVPADatabase/D3D8/5233.inl
+@@ -36,7 +36,7 @@ OOVPA_XREF(D3DDevice_SetRenderTargetFast,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x15, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x15, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+         // D3DDevice_SetRenderTargetFast+0x00 : push ebp
+         { 0x00, 0x55 },
+diff --git a/src/OOVPADatabase/D3D8/5344.inl b/src/OOVPADatabase/D3D8/5344.inl
+index a2ee91b..a5d5b27 100644
+--- a/src/OOVPADatabase/D3D8/5344.inl
++++ b/src/OOVPADatabase/D3D8/5344.inl
+@@ -237,7 +237,7 @@ OOVPA_XREF(D3DDevice_SetRenderTarget,
+ {
+ 
+     // D3DDevice_SetRenderTarget+0x16 : mov eax,[edi+0x________]
+-    XREF_ENTRY(0x18, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived // NOTE 5455+ is at offset 0x19
++    XREF_ENTRY(0x18, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived // NOTE 5455+ is at offset 0x19
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0x0C
+         OV_MATCH(0x00, 0x83, 0xEC, 0x0C),
+@@ -651,7 +651,7 @@ OOVPA_XREF(D3DDevice_GetTexture2, 5344, 1 + 23, // Up to 5455
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0E, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x0E, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+diff --git a/src/OOVPADatabase/D3D8/5455.inl b/src/OOVPADatabase/D3D8/5455.inl
+index c49897b..a348cfb 100644
+--- a/src/OOVPADatabase/D3D8/5455.inl
++++ b/src/OOVPADatabase/D3D8/5455.inl
+@@ -289,7 +289,7 @@ OOVPA_XREF(D3DDevice_SetRenderTarget,
+ {
+ 
+     // D3DDevice_SetRenderTarget+0x17 : mov eax,[edi+0x________]
+-    XREF_ENTRY(0x19, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived // NOTE 5344 is at offset 0x18
++    XREF_ENTRY(0x19, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived // NOTE 5344 is at offset 0x18
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0x0C
+         OV_MATCH(0x00, 0x83, 0xEC, 0x0C),
+diff --git a/src/OOVPADatabase/D3D8/5558.inl b/src/OOVPADatabase/D3D8/5558.inl
+index 1211cc0..113540b 100644
+--- a/src/OOVPADatabase/D3D8/5558.inl
++++ b/src/OOVPADatabase/D3D8/5558.inl
+@@ -373,7 +373,7 @@ OOVPA_XREF(D3DDevice_GetTexture2, 5558, 1 + 23, // Up to 5659
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0E, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x0E, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+diff --git a/src/OOVPADatabase/D3D8/5788.inl b/src/OOVPADatabase/D3D8/5788.inl
+index 1a4eb03..82569d3 100644
+--- a/src/OOVPADatabase/D3D8/5788.inl
++++ b/src/OOVPADatabase/D3D8/5788.inl
+@@ -230,7 +230,7 @@ OOVPA_XREF(D3DDevice_GetTexture2, 5788, 1 + 23, // Up to 5849
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x0E, XREF_OFFSET_D3DDevice__m_Textures), // Derived
++    XREF_ENTRY(0x0E, XREF_D3DDevice__m_Textures_OFFSET), // Derived
+ #endif
+         { 0x00, 0x8B },
+             { 0x01, 0x44 },
+diff --git a/src/OOVPADatabase/D3D8LTCG/3911.inl b/src/OOVPADatabase/D3D8LTCG/3911.inl
+index 443c111..fa6279f 100644
+--- a/src/OOVPADatabase/D3D8LTCG/3911.inl
++++ b/src/OOVPADatabase/D3D8LTCG/3911.inl
+@@ -1084,7 +1084,7 @@ OOVPA_XREF(D3DDevice_SetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x17, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x17, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+         // D3DDevice_SetRenderTarget+0x00 : sub esp, 0x20
+         OV_MATCH(0x00, 0x83, 0xEC),
+diff --git a/src/OOVPADatabase/D3D8LTCG/4627.inl b/src/OOVPADatabase/D3D8LTCG/4627.inl
+index 96544b9..26c6527 100644
+--- a/src/OOVPADatabase/D3D8LTCG/4627.inl
++++ b/src/OOVPADatabase/D3D8LTCG/4627.inl
+@@ -989,7 +989,7 @@ OOVPA_XREF(D3D_CommonSetRenderTarget,
+            XRefOne)
+ {
+ 
+-    XREF_ENTRY(0x18, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    XREF_ENTRY(0x18, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ #endif
+ 
+         { 0x00, 0x83 },
+@@ -1186,7 +1186,7 @@ OOVPA_SIG_MATCH(
+     XREF_ENTRY(0x01, XREF_D3D_g_pDevice),
+ 
+     // TODO: Uncomment when WIP_LessVertexPatching is defined
+-    // XREF_ENTRY(0x08, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    // XREF_ENTRY(0x08, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ 
+     // call D3DResource_AddRef
+     XREF_ENTRY(0x2E, XREF_D3DResource_AddRef),
+diff --git a/src/OOVPADatabase/D3D8LTCG/4928.inl b/src/OOVPADatabase/D3D8LTCG/4928.inl
+index bd9d0dd..3912c69 100644
+--- a/src/OOVPADatabase/D3D8LTCG/4928.inl
++++ b/src/OOVPADatabase/D3D8LTCG/4928.inl
+@@ -81,7 +81,7 @@ OOVPA_SIG_MATCH(
+     XREF_ENTRY(0x01, XREF_D3D_g_pDevice),
+ 
+     // TODO: Uncomment when WIP_LessVertexPatching is defined
+-    // XREF_ENTRY(0x07, XREF_OFFSET_D3DDevice__m_RenderTarget), // Derived
++    // XREF_ENTRY(0x07, XREF_D3DDevice__m_RenderTarget_OFFSET), // Derived
+ 
+     // call D3DResource_AddRef
+     XREF_ENTRY(0x2D, XREF_D3DResource_AddRef),
+diff --git a/src/OOVPADatabase/D3D8LTCG_OOVPA.c b/src/OOVPADatabase/D3D8LTCG_OOVPA.c
+index 9a048aa..85962c5 100644
+--- a/src/OOVPADatabase/D3D8LTCG_OOVPA.c
++++ b/src/OOVPADatabase/D3D8LTCG_OOVPA.c
+@@ -1,3 +1,4 @@
++#define WIP_LessVertexPatching 1
+ // SPDX-License-Identifier: ODbL-1.0
+ 
+ // Titles which did compiled with full libary version
+diff --git a/src/OOVPADatabase/D3D8_OOVPA.c b/src/OOVPADatabase/D3D8_OOVPA.c
+index f4ec935..20b4678 100644
+--- a/src/OOVPADatabase/D3D8_OOVPA.c
++++ b/src/OOVPADatabase/D3D8_OOVPA.c
+@@ -1,3 +1,4 @@
++#define WIP_LessVertexPatching 1
+ // SPDX-License-Identifier: ODbL-1.0
+ 
+ // Titles which did compiled with full library version
+diff --git a/src/lib/manual_d3d8__ltcg.h b/src/lib/manual_d3d8__ltcg.h
+index b7ac08d..be62d36 100644
+--- a/src/lib/manual_d3d8__ltcg.h
++++ b/src/lib/manual_d3d8__ltcg.h
+@@ -764,5 +764,11 @@ static inline void manual_register_d3d8__ltcg(XbSDBiContext* pContext)
+ {
+     // TODO: Require to be here until self register functionality is implement.
+     XbSDBi_RegisterValidXRefAddr(pContext, LIB_D3D8, XBSDBLIB_D3D8, XREF_D3DDevice__m_VertexShader_OFFSET, 0, "D3DDevice__m_VertexShader_OFFSET", symbol_variable, call_none, 0, NULL);
+-    // NOTE: D3DDevice__m_PixelShader_OFFSET is not accessible to the user.
++    // LOCAL PATCH (not upstream): forward the remaining derived field offsets.
++    // These only print when the XREF was actually resolved from the scanned XBE.
++    XbSDBi_RegisterValidXRefAddr(pContext, LIB_D3D8, XBSDBLIB_D3D8, XREF_D3DDevice__m_PixelShader_OFFSET, 0, "D3DDevice__m_PixelShader_OFFSET", symbol_variable, call_none, 0, NULL);
++    XbSDBi_RegisterValidXRefAddr(pContext, LIB_D3D8, XBSDBLIB_D3D8, XREF_D3DDevice__m_Textures_OFFSET, 0, "D3DDevice__m_Textures_OFFSET", symbol_variable, call_none, 0, NULL);
++    XbSDBi_RegisterValidXRefAddr(pContext, LIB_D3D8, XBSDBLIB_D3D8, XREF_D3DDevice__m_Palettes_OFFSET, 0, "D3DDevice__m_Palettes_OFFSET", symbol_variable, call_none, 0, NULL);
++    XbSDBi_RegisterValidXRefAddr(pContext, LIB_D3D8, XBSDBLIB_D3D8, XREF_D3DDevice__m_RenderTarget_OFFSET, 0, "D3DDevice__m_RenderTarget_OFFSET", symbol_variable, call_none, 0, NULL);
++    XbSDBi_RegisterValidXRefAddr(pContext, LIB_D3D8, XBSDBLIB_D3D8, XREF_D3DDevice__m_DepthStencil_OFFSET, 0, "D3DDevice__m_DepthStencil_OFFSET", symbol_variable, call_none, 0, NULL);
+ }

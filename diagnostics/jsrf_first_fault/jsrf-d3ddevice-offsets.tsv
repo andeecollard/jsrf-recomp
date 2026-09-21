@@ -1,0 +1,38 @@
+# D3DDevice struct field offsets for Jet Set Radio Future (US), XDK D3D8 build 4134.
+# Produced 2026-09-21. Every value below was DERIVED FROM THIS TITLE'S OWN default.xbe.
+# No value is copied from another XDK version.
+#
+# XBE: ~/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future/Jet Set Radio Future (US)/default.xbe
+# Device pointer global: D3D8__D3D_g_pDevice = 0x0019DCE0 (the device struct address is *that*).
+# All offsets are byte offsets from the start of the D3DDevice struct.
+#
+# METHOD codes
+#   xbsdb-patched   XbSymbolDatabase CLI, locally patched (see ~/jsrf-build/xbsymboldatabase-d3ddevice-offsets.patch);
+#                   the library's own OOVPA signature scan derived the value out of this XBE.
+#   xbsdb-stock     Emitted by the stock, unpatched XbSymbolDatabase CLI (run of 20 Sep 2026).
+#   disasm          Hand disassembly of this XBE (capstone, x86-32) at a named D3D8 function.
+#   xref-replay     XbSymbolDatabase's own XREF_ENTRY byte offset applied by hand to this XBE:
+#                   read the little-endian dword at (function address + XREF_ENTRY offset).
+#
+field	offset	dec	method	confidence	evidence
+D3DDevice.m_Pusher.m_pPut (write cursor)	0x0000	0	disasm	certain	D3D_SetFence 0x00191397 mov eax,[esi]; cmp eax,[esi+4]; D3D_MakeRequestedSpace_8 stores back at 0x001915F7 mov [esi],ecx
+D3DDevice.m_Pusher.m_pLimit	0x0004	4	disasm	certain	D3D_SetFence 0x00191399 cmp eax,[esi+4] gates the MakeSpace call
+D3DDevice.m_Flags/state word	0x0008	8	disasm	high	CDevice_KickOff 0x001912A5 test [ecx+8],0x2000/0x20; SetRenderTarget 0x0018D317 or ecx,0x8000; MakeRequestedSpace 0x0019153A test byte [esi+8],4
+D3DDevice.m_PushBufferStart (ring low)	0x0024	36	disasm	certain	D3D_MakeRequestedSpace_8 0x00191583/0x001915DD/0x001915E3 cmp+reload of [esi+0x24]; wrap JUMP is built from it
+D3DDevice.m_PushBufferEnd (ring high)	0x0028	40	disasm	certain	D3D_MakeRequestedSpace_8 0x00191593/0x001915AC cmp against [esi+0x28]
+D3DDevice.m_SubmittedPut (KickOff shadow)	0x002C	44	disasm	high	CDevice_KickOff 0x00191305 mov [edx+0x2c],ecx immediately after writing ecx&0x3FFFFFF to the channel DMA_PUT
+D3DDevice.m_Fence (semaphore COUNTER)	0x0030	48	disasm	certain	D3D_SetFence 0x001913AD reads [esi+0x30] as the NV097 0x1D70 release payload, then 0x00191420 add 2 / store back; SetTexture 0x0018DF33 copies it into pResource->Lock
+D3DDevice.m_pFenceWord (POINTER to semaphore)	0x0034	52	disasm	certain	D3D_BlockOnTime 0x0019144C mov eax,[edi+0x34]; mov ecx,[eax] -- dereferenced, so it is a pointer
+D3DDevice.m_PixelShader	0x0370	880	xbsdb-patched; disasm; xref-replay	certain	CLI prints D3D8__D3DDevice__m_PixelShader_OFFSET = 0x00000370; D3DDevice_SetPixelShader 0x00199BEE/0x00199BF4 load+store [ebx+0x370]; 4034 OOVPA XREF_ENTRY(0x10) on SetPixelShader@0x00199BE0 reads 0x370
+D3DDevice.m_VertexShader	0x0380	896	xbsdb-stock; disasm	certain	Stock CLI already printed 0x00000380; D3DDevice_SetVertexShader 0x001904A1 mov eax,[esi+0x380]
+D3DDevice.m_Textures[0]	0x0A78	2680	xbsdb-patched; disasm; xref-replay	certain	CLI prints 0x00000A78; D3DDevice_GetTexture2 0x0018DEDB lea esi,[ecx+eax*4+0xA78]; SetTexture 0x0018DF20/0x0018DF59; 4134 OOVPA XREF_ENTRY(0x0E) on GetTexture2@0x0018DED0 reads 0x0A78
+D3DDevice.m_Palettes[0]	0x0A88	2696	disasm	high	NOT emitted by the patched CLI because D3DDevice_SetPalette/GetPalette are not linked into JSRF at all (zero Palette symbols in the scan), so no OOVPA could derive it. Derived instead from the device teardown loop at 0x00192644: lea edi,[esi+0xA88]; mov ebx,4; each iteration releases [edi-0x10] (= m_Textures[i]) and [edi] (= m_Palettes[i]), i.e. the two 4-entry arrays sit exactly 0x10 apart. Corroborated by the 4134 OOVPA comment "GetTexture 780A vs GetPalette 880A".
+D3DDevice.m_RenderTarget	0x2070	8304	xbsdb-patched; disasm; xref-replay	certain	CLI prints 0x00002070; D3DDevice_SetRenderTarget stores the new target at 0x0018D390 mov [esi+0x2070],edi and releases the old one read at 0x0018D363; 4039 OOVPA XREF_ENTRY(0x18) on SetRenderTarget@0x0018D0F0 reads 0x2070
+D3DDevice.m_DepthStencil	0x2074	8308	xbsdb-patched; disasm; xref-replay	certain	CLI prints 0x00002074; D3DDevice_GetDepthStencilSurface 0x0018DA75 mov eax,[eax+0x2074]; SetRenderTarget stores at 0x0018D3B9; 3911 OOVPA XREF_ENTRY(0x07) on GetDepthStencilSurface@0x0018DA70 reads 0x2074
+D3DDevice.m_BackBuffer[0]	0x207C	8316	disasm	high	D3DDevice_GetBackBuffer 0x0018D63D mov eax,[ecx+eax*4+0x207C] with index 0/1/2; SetRenderTarget fast-paths on cmp edi,[esi+0x207C]
+D3DDevice.m_pChannelUser (DMA_PUT/GET regs)	0x2264	8804	disasm	certain	CDevice_KickOff 0x001912F0 mov eax,[eax+0x2264]; mov [eax+0x40],put ; D3D_MakeRequestedSpace_8 0x00191576 reads GET from [[esi+0x2264]+0x44]
+D3DDevice.m_pNv2aRegisterBase	0x2268	8808	disasm	high	CDevice_KickOff 0x001912C0 mov eax,[eax+0x2268] then touches [eax+0x100410] (PFB flush) before publishing PUT
+D3DDevice.m_SwapCallback	0x2428	9256	xbsdb-stock	certain	Emitted by the stock CLI on 20 Sep 2026 (manual callback scan)
+D3DDevice.m_VBlankCallback	0x242C	9260	xbsdb-stock; disasm	certain	Stock CLI printed 0x0000242C; D3DDevice_SetVerticalBlankCallback 0x0018CE3A mov [ecx+0x242c],eax
+D3DDevice.m_VerticalBlankEvent	0x2430	9264	xbsdb-stock; disasm	certain	Stock CLI printed 0x00002430; D3DDevice_BlockUntilVerticalBlank 0x0018CE5B zeroes [eax+0x2434] (DISPATCHER_HEADER.SignalState) and 0x0018CE67 add eax,0x2430 before KeWaitForSingleObject
+D3DDevice.m_BlockEvent (KEVENT)	0x2440	9280	disasm	high	D3D_BlockOnTime 0x00191501 lea esi,[edi+0x2440] then calls the same KeWaitForSingleObject thunk (0x001C4018) BlockUntilVerticalBlank uses; its SignalState at 0x2444 is zeroed first at 0x00191497. Matches diagnostics/jsrf_first_fault/startup_probe.c's "device+0x2440".
