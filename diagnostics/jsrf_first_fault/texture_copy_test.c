@@ -118,10 +118,20 @@ int main(void) {
     CHECK(!nv2a_texture_copy_prepare(methods,&s));CHECK(s.combiner_count==6);
     CHECK(s.color_ocw[0]==0xc0 && s.alpha_ocw[1]==0xd0);
     modulate_methods(methods);
-    /* Unsupported output destinations and nonzero constants reject explicitly. */
+    /* A write to a CONSTANT register is still refused: registers 1 and 2 are
+     * inputs, and a stage that names one as a destination is a program we do
+     * not understand rather than one we can shade. This survived the 21 Sep
+     * widening only because it was asserted here -- the first version of that
+     * change accepted every destination <= 13. */
     methods[0xaa0/4]=0xc01; CHECK(nv2a_texture_copy_prepare(methods,&s)); methods[0xaa0/4]=0xc00;
-    methods[0xac0/4]=0x01200000;methods[0xa60/4]=1;
-    CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"combiner constant"));
+    /* NONZERO PER-STAGE CONSTANTS ARE NOW SUPPORTED, not refused. This used to
+     * assert the refusal; the graffiti shader programs three of them to pure
+     * channel masks and they carry the effect, so refusing them dropped the
+     * draw. The contract changed deliberately on 21 Sep 2026: accept, and
+     * carry the value through to the state the backends read. */
+    methods[0xac0/4]=0x01200000;methods[0xa60/4]=0x00FF8040;
+    CHECK(!nv2a_texture_copy_prepare(methods,&s));
+    CHECK(s.const0[0]==0x00FF8040);
     methods[0xac0/4]=0x08040000;methods[0xa60/4]=0;
     methods[0x300/4]=1; CHECK(!strcmp(nv2a_texture_copy_prepare(methods,&s),"alpha test"));
     methods[0x300/4]=0; methods[0x304/4]=1;methods[0x344/4]=0x300;

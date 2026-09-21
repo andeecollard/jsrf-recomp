@@ -31,6 +31,20 @@ static unsigned long s_rej_count_hist[10];
 static uint32_t s_bad_ocw[VR_OCW_SLOTS]; static unsigned long s_bad_ocw_n[VR_OCW_SLOTS];
 static unsigned s_bad_ocw_used;
 
+/* Every distinct nonzero per-stage constant seen on a refused draw. Item 3 of
+ * the graffiti blocker list cannot be counted by s_rej_const, because the
+ * output-mode check returns first and that counter never increments. */
+static uint32_t s_bad_c0[VR_OCW_SLOTS]; static unsigned s_bad_c0_used;
+static unsigned long s_bad_dst_reg[16];
+
+static void note_bad_c0(uint32_t v)
+{
+    unsigned i;
+    if (!v) return;
+    for (i = 0; i < s_bad_c0_used; ++i) if (s_bad_c0[i] == v) return;
+    if (s_bad_c0_used < VR_OCW_SLOTS) s_bad_c0[s_bad_c0_used++] = v;
+}
+
 static void note_bad_ocw(uint32_t w)
 {
     for (unsigned i=0;i<s_bad_ocw_used;++i)
@@ -63,13 +77,58 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
         s->color_ocw[i]=M(0x1e40+4*i);s->alpha_ocw[i]=M(0xaa0+4*i);
         uint32_t outputs[2]={s->color_ocw[i],s->alpha_ocw[i]};
         for(unsigned j=0;j<2;++j) {
-            if(outputs[j]&~0xfffu) {
+            /* WHICH BITS THIS RUNTIME MODELS, from xemu's parse_combiner_output
+             * -- the reference this file's header already names:
+             *
+             *    0..3   CD destination      12  CD dot product
+             *    4..7   AB destination      13  AB dot product
+             *    8..11  SUM destination     14  mux instead of sum
+             *    15..17 output mapping      18  CD blue-to-alpha
+             *                               19  AB blue-to-alpha
+             *
+             * Everything above bit 19 is still unmodelled and still refused,
+             * so a program using something we have never seen is dropped
+             * rather than shaded wrong.
+             *
+             * THE BIT LAYOUT WAS WORTH CHECKING. `d3d8_combiners.c:169` reads
+             * bits 0..3 as the AB destination and 4..7 as CD -- the opposite
+             * way round -- so the two decoders in this tree disagreed, and the
+             * D3D11 path is the one that is inverted. That is a separate bug;
+             * this file was already right. And "bit 19 is AB blue-to-alpha"
+             * appeared in a handover with no source anywhere, citing only
+             * itself, until it was checked against xemu. */
+            if(outputs[j]&~0xfffffu) {
+                unsigned st, sh, k;
+                for (st = 0; st < s->combiner_count; ++st) {
+                    uint32_t ow[2] = { M(0x1e40+4*st), M(0xaa0+4*st) };
+                    for (k = 0; k < 2; ++k)
+                        for (sh = 0; sh < 12; sh += 4)
+                            s_bad_dst_reg[(ow[k] >> sh) & 15]++;
+                }
+                for (st = 0; st < 8; ++st) {
+                    note_bad_c0(M(0xa60+4*st));
+                    note_bad_c0(M(0xa80+4*st));
+                }
                 s_reject_combiner_out++; note_bad_ocw(outputs[j]);
                 return "combiner output mode";
             }
+            /* Destinations 8..11 are the texture registers T0..T3, and the
+             * register file has always had room for them -- only the gate
+             * stood in front. The graffiti shader writes T0 and T2 and reads
+             * them back in a later stage, which is why refusing them dropped
+             * the whole program.
+             *
+             * WHAT IS *NOT* WIDENED, and the existing suite is why. The first
+             * version of this accepted anything <= 13, which let a stage write
+             * the CONSTANT registers 1 and 2 -- they are inputs, a write to
+             * them is meaningless, and jsrf_texture_copy has asserted since
+             * long before today that 0xc01 must be refused. It failed, which
+             * is the test doing its job. 0 is discard, 8..13 are T0..T3/R0/R1;
+             * 1..7 and 14..15 stay refused and will show up in the census if a
+             * program ever asks for one. */
             for(unsigned shift=0;shift<12;shift+=4) {
                 unsigned dst=(outputs[j]>>shift)&15;
-                if(dst && dst!=12 && dst!=13) {
+                if(dst && (dst<8 || dst>13)) {
                     s_rej_outreg++; note_bad_ocw(outputs[j]);
                     return "combiner output register";
                 }
@@ -86,11 +145,14 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
                 uses_constant|=regs[k]==1 || regs[k]==2;
             }
         }
-        /* The captured program enables per-stage constants but programs them
-         * all to zero. Refuse nonzero constants until their full routing is
-         * represented rather than silently shading with the wrong value. */
-        if(uses_constant) for(unsigned j=0;j<8;++j)
-            if(M(0xa60+4*j) || M(0xa80+4*j)) { s_rej_const++; return "combiner constant"; }
+        /* Per-stage constants are now LOADED rather than refused. They used
+         * to be dropped on the reasoning that the one captured program set
+         * them all to zero, so representing them could wait; the graffiti
+         * shader sets three of them to channel masks and they carry the
+         * effect. `uses_constant` is no longer a reason to refuse, only a
+         * note that this stage reads reg 1 or 2. */
+        (void)uses_constant;
+        s->const0[i]=M(0xa60+4*i); s->const1[i]=M(0xa80+4*i);
     }
     for (unsigned u=0;u<4;++u) {
         unsigned mode=(M(0x1e70)>>(5*u))&31;
@@ -259,10 +321,46 @@ void nv2a_texture_copy_census(void)
         if (s_rej_count_hist[f])
             fprintf(stderr, "[COMBINER]   refused with stage count %u: %lu\n",
                     f, s_rej_count_hist[f]);
-    for (f = 0; f < s_bad_ocw_used; ++f)
+    for (f = 0; f < s_bad_ocw_used; ++f) {
+        uint32_t w = s_bad_ocw[f];
         fprintf(stderr, "[COMBINER]   refused output word 0x%08X  x%lu%s\n",
-                s_bad_ocw[f], s_bad_ocw_n[f],
-                s_bad_ocw[f]==0x000820D0u ? "   <-- the graffiti shader" : "");
+                w, s_bad_ocw_n[f],
+                w==0x000820D0u ? "   <-- the graffiti shader" : "");
+        /* Which bits above 0xfff, named where this tree agrees on them.
+         * 12/13/14 and 15..17 are decoded identically by d3d8_combiners.c and
+         * by combiner_output() here. 18 and up are NOT: d3d8_combiners.c
+         * calls them "reserved/unused" and this word has bit 19 set, so they
+         * are printed raw rather than guessed at. */
+        fprintf(stderr, "[COMBINER]     dst cd=%u ab=%u sum=%u |%s%s%s"
+                " map=%u | UNMODELLED bits 18+ = 0x%05X\n",
+                w & 15u, (w >> 4) & 15u, (w >> 8) & 15u,
+                (w & (1u<<12)) ? " CD_DOT" : "",
+                (w & (1u<<13)) ? " AB_DOT" : "",
+                (w & (1u<<14)) ? " MUX" : "",
+                (w >> 15) & 7u, w >> 18);
+    }
+    /* Items 2 and 3 of the blocker list, which the early return hides. */
+    {
+        unsigned r; int any = 0;
+        fprintf(stderr, "[COMBINER]   destination registers named by refused"
+                " programs:");
+        for (r = 0; r < 16; ++r)
+            if (s_bad_dst_reg[r]) {
+                fprintf(stderr, " %u=%lu%s", r, s_bad_dst_reg[r],
+                        (r >= 8 && r <= 11) ? "(TEX!)" : "");
+                any = 1;
+            }
+        fprintf(stderr, "%s\n", any ? "" : " none");
+        if (s_bad_c0_used) {
+            fprintf(stderr, "[COMBINER]   nonzero per-stage constants:");
+            for (r = 0; r < s_bad_c0_used; ++r)
+                fprintf(stderr, " 0x%08X", s_bad_c0[r]);
+            fprintf(stderr, "   <-- blocker 3 IS live\n");
+        } else {
+            fprintf(stderr, "[COMBINER]   per-stage constants all zero"
+                    " -- blocker 3 is NOT live\n");
+        }
+    }
     fflush(stderr);
 }
 
@@ -620,12 +718,86 @@ static float combiner_input(unsigned input,unsigned channel,const float regs[14]
     }
 }
 
-static void combiner_output(float regs[14][4],uint32_t word,unsigned channel,float ab,float cd)
+/* One combiner stage's outputs, all four channels at once.
+ *
+ * IT HAS TO BE ALL FOUR AT ONCE. A dot product collapses RGB to one scalar,
+ * and blue-to-alpha copies the BLUE result into a register's alpha -- neither
+ * can be expressed by a function that sees one channel at a time, which is
+ * what this used to be. `ab` and `cd` arrive as [r,g,b,a].
+ *
+ * Mapping is applied to the stage's own outputs, after the dot product and
+ * before the register write, which is the order the hardware documents. */
+static float combiner_map(unsigned mode,float x)
 {
-    unsigned destination[3]={word&15,(word>>4)&15,(word>>8)&15};
-    float value[3]={cd,ab,ab+cd};
-    for(unsigned i=0;i<3;++i) if(destination[i])
-        regs[destination[i]][channel]=fmaxf(-1,fminf(1,value[i]));
+    switch(mode) {
+    case 1: return x-0.5f;              /* BIAS                */
+    case 2: return x*2.0f;              /* SHIFTLEFTBY1        */
+    case 3: return (x-0.5f)*2.0f;       /* SHIFTLEFTBY1_BIAS   */
+    case 4: return x*4.0f;              /* SHIFTLEFTBY2        */
+    case 6: return x*0.5f;              /* SHIFTRIGHTBY1       */
+    default: return x;                  /* 0,5,7: identity     */
+    }
+}
+
+static void combiner_stage_output(float regs[14][4],uint32_t cw,uint32_t aw,
+                                  float ab[4],float cd[4],float r0_alpha)
+{
+    unsigned cd_dst=cw&15, ab_dst=(cw>>4)&15, sum_dst=(cw>>8)&15;
+    unsigned a_cd_dst=aw&15, a_ab_dst=(aw>>4)&15, a_sum_dst=(aw>>8)&15;
+    unsigned cd_dot=(cw>>12)&1, ab_dot=(cw>>13)&1;
+    unsigned mux=(cw>>14)&1, map=(cw>>15)&7;
+    unsigned cd_b2a=(cw>>18)&1, ab_b2a=(cw>>19)&1;
+    unsigned a_mux=(aw>>14)&1, a_map=(aw>>15)&7;
+    float ab_rgb[3], cd_rgb[3], sum_rgb[3];
+    unsigned k;
+
+    /* A dot product is RGB-only and broadcasts to all three components. The
+     * alpha combiner has no dot; its bits 12/13 are not this. */
+    if(ab_dot) {
+        float d=ab[0]+ab[1]+ab[2];
+        ab_rgb[0]=ab_rgb[1]=ab_rgb[2]=d;
+    } else { for(k=0;k<3;++k) ab_rgb[k]=ab[k]; }
+    if(cd_dot) {
+        float d=cd[0]+cd[1]+cd[2];
+        cd_rgb[0]=cd_rgb[1]=cd_rgb[2]=d;
+    } else { for(k=0;k<3;++k) cd_rgb[k]=cd[k]; }
+
+    /* MUX selects on R0's alpha rather than summing. */
+    for(k=0;k<3;++k)
+        sum_rgb[k]= mux ? (r0_alpha>=0.5f?ab_rgb[k]:cd_rgb[k]) : ab_rgb[k]+cd_rgb[k];
+
+    for(k=0;k<3;++k) {
+        ab_rgb[k]=combiner_map(map,ab_rgb[k]);
+        cd_rgb[k]=combiner_map(map,cd_rgb[k]);
+        sum_rgb[k]=combiner_map(map,sum_rgb[k]);
+    }
+
+#define WR(dst,ch,v) do { if(dst) regs[dst][ch]=fmaxf(-1,fminf(1,(v))); } while(0)
+    for(k=0;k<3;++k) {
+        WR(ab_dst,k,ab_rgb[k]);
+        WR(cd_dst,k,cd_rgb[k]);
+        WR(sum_dst,k,sum_rgb[k]);
+    }
+    /* The alpha combiner writes only alpha, and has no dot or blue-to-alpha. */
+    {
+        float a_ab=combiner_map(a_map,ab[3]), a_cd=combiner_map(a_map,cd[3]);
+        float a_sum=combiner_map(a_map, a_mux ? (r0_alpha>=0.5f?ab[3]:cd[3])
+                                              : ab[3]+cd[3]);
+        WR(a_ab_dst,3,a_ab);
+        WR(a_cd_dst,3,a_cd);
+        WR(a_sum_dst,3,a_sum);
+    }
+    /* Blue-to-alpha, LAST, because it REPLACES that register's alpha rather
+     * than competing with the alpha combiner for it. Ordering it before the
+     * alpha block -- which is how this was first written -- lets the alpha
+     * combiner overwrite the very value the flag exists to deliver, and the
+     * tag would carry the wrong mask while still drawing something plausible.
+     *
+     * This is what lets a shader move a mask it extracted with a dot product
+     * into alpha, which is what the tag decal does. */
+    if(ab_b2a) WR(ab_dst,3,ab_rgb[2]);
+    if(cd_b2a) WR(cd_dst,3,cd_rgb[2]);
+#undef WR
 }
 
 static void combine(const NV2ATextureCopy *s,float regs[14][4],float out[4])
@@ -634,6 +806,17 @@ static void combine(const NV2ATextureCopy *s,float regs[14][4],float out[4])
     regs[12][3]=(s->texture_mask&1)?regs[8][3]:1;
     for(unsigned stage=0;stage<s->combiner_count;++stage) {
         float ab[4],cd[4];
+        /* Per-stage constants land in registers 1 and 2 before the stage runs.
+         * D3DCOLOR is A8R8G8B8, so the channel order here is not incidental. */
+        { uint32_t c0=s->const0[stage], c1=s->const1[stage];
+          regs[1][0]=(float)((c0>>16)&255)/255.0f;
+          regs[1][1]=(float)((c0>>8)&255)/255.0f;
+          regs[1][2]=(float)(c0&255)/255.0f;
+          regs[1][3]=(float)((c0>>24)&255)/255.0f;
+          regs[2][0]=(float)((c1>>16)&255)/255.0f;
+          regs[2][1]=(float)((c1>>8)&255)/255.0f;
+          regs[2][2]=(float)(c1&255)/255.0f;
+          regs[2][3]=(float)((c1>>24)&255)/255.0f; }
         for(unsigned k=0;k<4;++k) {
             unsigned word=k==3?s->alpha_icw[stage]:s->color_icw[stage];
             unsigned channel=k==3?2:k; /* Alpha ICW selects blue or alpha. */
@@ -641,10 +824,8 @@ static void combine(const NV2ATextureCopy *s,float regs[14][4],float out[4])
             float c=combiner_input((word>>8)&255,channel,regs),d=combiner_input(word&255,channel,regs);
             ab[k]=a*b;cd[k]=c*d;
         }
-        for(unsigned k=0;k<4;++k) {
-            uint32_t word=k==3?s->alpha_ocw[stage]:s->color_ocw[stage];
-            combiner_output(regs,word,k,ab[k],cd[k]);
-        }
+        combiner_stage_output(regs,s->color_ocw[stage],s->alpha_ocw[stage],
+                              ab,cd,regs[12][3]);
     }
     for(unsigned k=0;k<4;++k)
         out[k]=fmaxf(0,fminf(1,regs[12][k]+(s->add_specular && k<3?regs[5][k]:0)));

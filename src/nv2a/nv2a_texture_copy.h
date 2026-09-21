@@ -26,6 +26,12 @@ typedef struct NV2ATextureCopy {
     float lod_bias;
     uint32_t combiner_count, color_icw[8], alpha_icw[8];
     uint32_t color_ocw[8], alpha_ocw[8], add_specular;
+    /* Per-stage constants, NV097_SET_COMBINER_FACTOR0/1 (0x0A60/0x0A80).
+     * D3DCOLOR, i.e. A8R8G8B8. They were refused outright until 21 Sep 2026;
+     * the graffiti shader programs them to the pure channel masks 0x0000FF00,
+     * 0x00FF0000 and 0x000000FF, which with a dot product is channel
+     * extraction -- so they are not incidental, they ARE the effect. */
+    uint32_t const0[8], const1[8];
     uint32_t texture_mask;
     const struct NV2ATextureCopy *extra_stages;
     const uint8_t *extra_texture[3];

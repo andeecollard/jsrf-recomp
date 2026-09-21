@@ -596,7 +596,8 @@ static NSString *const shader =
  "  uint z_cull; float z_lo,z_hi;"
  " uint stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;"
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
- " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8]; };\n"
+ " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8];"
+ " uint const0[8]; uint const1[8]; };\n"
  "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; };\n"
  "struct Frag { float4 color [[color(0)]]; uint stencil [[color(1)]]; };\n"
  "vertex Out vs(uint id [[vertex_id]], const device Vertex *v [[buffer(0)]], constant Params &s [[buffer(1)]],const device uint*indices [[buffer(2)]]) {\n"
@@ -669,17 +670,37 @@ static NSString *const shader =
   * upstream's D3D11 backend puts them in one too -- while blending, depth and
   * stencil only live here because depth was packed into alpha. One copy, two
   * tails. */
+ "float cmap1(uint m,float x){switch(m){case 1:return x-0.5f;case 2:return x*2.0f;case 3:return (x-0.5f)*2.0f;case 4:return x*4.0f;case 6:return x*0.5f;default:return x;}}\n"
+ "float3 cmap3(uint m,float3 v){return float3(cmap1(m,v.x),cmap1(m,v.y),cmap1(m,v.z));}\n"
  "float4 shade(Out i, const device uchar*t0, constant Params&s, const device uchar*t1, const device uchar*t2, const device uchar*t3){\n"
  " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
  " if(s.texture_mask&1)tex=sample_lod(t0,i.t0,0,s);"
  " if(s.combiner_count){float4 r[14];for(uint n=0;n<14;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
  " if(s.texture_mask&2)r[9]=sample_lod(t1,i.t1,1,s);if(s.texture_mask&4)r[10]=sample_lod(t2,i.t2,2,s);if(s.texture_mask&8)r[11]=sample_lod(t3,i.t3,3,s);"
  " r[12].a=(s.texture_mask&1)?r[8].a:1;for(uint stage=0;stage<s.combiner_count;stage++){float4 ab,cd;"
+ " uint k0=s.const0[stage],k1=s.const1[stage];"
+ " r[1]=float4(float((k0>>16)&255),float((k0>>8)&255),float(k0&255),float((k0>>24)&255))/255.0f;"
+ " r[2]=float4(float((k1>>16)&255),float((k1>>8)&255),float(k1&255),float((k1>>24)&255))/255.0f;"
  " for(uint k=0;k<4;k++){uint word=k==3?s.alpha_icw[stage]:s.color_icw[stage];uint ch=k==3?2:k;"
  " float a=input(word>>24,ch,r),b=input((word>>16)&255,ch,r),cc=input((word>>8)&255,ch,r),d=input(word&255,ch,r);"
- " ab[k]=a*b;cd[k]=cc*d;}for(uint k=0;k<4;k++){uint word=k==3?s.alpha_ocw[stage]:s.color_ocw[stage];"
- " uint dd=word&15,da=(word>>4)&15,ds=(word>>8)&15;if(dd)r[dd][k]=clamp(cd[k],-1.0f,1.0f);"
- " if(da)r[da][k]=clamp(ab[k],-1.0f,1.0f);if(ds)r[ds][k]=clamp(ab[k]+cd[k],-1.0f,1.0f);}}"
+ " ab[k]=a*b;cd[k]=cc*d;}"
+ " uint cw=s.color_ocw[stage],aw=s.alpha_ocw[stage];"
+ " float3 abr=((cw>>13)&1)?float3(ab.r+ab.g+ab.b):ab.rgb;"
+ " float3 cdr=((cw>>12)&1)?float3(cd.r+cd.g+cd.b):cd.rgb;"
+ " uint mx=(cw>>14)&1,mp=(cw>>15)&7;"
+ " float3 sm=mx?((r[12].a>=0.5f)?abr:cdr):(abr+cdr);"
+ " abr=cmap3(mp,abr);cdr=cmap3(mp,cdr);sm=cmap3(mp,sm);"
+ " uint dcd=cw&15,dab=(cw>>4)&15,dsm=(cw>>8)&15;"
+ " if(dcd)r[dcd].rgb=clamp(cdr,-1.0f,1.0f);"
+ " if(dab)r[dab].rgb=clamp(abr,-1.0f,1.0f);"
+ " if(dsm)r[dsm].rgb=clamp(sm,-1.0f,1.0f);"
+ " uint amx=(aw>>14)&1,amp=(aw>>15)&7;"
+ " uint acd=aw&15,aab=(aw>>4)&15,asum=(aw>>8)&15;"
+ " if(acd)r[acd].a=clamp(cmap1(amp,cd.a),-1.0f,1.0f);"
+ " if(aab)r[aab].a=clamp(cmap1(amp,ab.a),-1.0f,1.0f);"
+ " if(asum)r[asum].a=clamp(cmap1(amp,amx?((r[12].a>=0.5f)?ab.a:cd.a):(ab.a+cd.a)),-1.0f,1.0f);"
+ " if(((cw>>19)&1)&&dab)r[dab].a=clamp(abr.b,-1.0f,1.0f);"
+ " if(((cw>>18)&1)&&dcd)r[dcd].a=clamp(cdr.b,-1.0f,1.0f);}"
  " c=clamp(r[12]+(s.add_specular?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
  " else if(!s.untextured){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(s.modulate?c.a:1);if(s.modulate)c.rgb*=max(float3(0),d0.rgb);}"
  " return c;}\n"
@@ -2977,7 +2998,8 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     uint32_t stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;
     uint32_t tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4];
     float lod_bias[4];
-    uint32_t color_icw[8],alpha_icw[8],color_ocw[8],alpha_ocw[8];}Params;
+    uint32_t color_icw[8],alpha_icw[8],color_ocw[8],alpha_ocw[8];
+    uint32_t const0[8],const1[8];}Params;
 
 /* Does the ring actually protect staging memory from the GPU?
  *
@@ -4714,7 +4736,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  if(no_alpha_test_on())p.alpha_test=0;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));
+  if(no_alpha_test_on())p.alpha_test=0;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:
