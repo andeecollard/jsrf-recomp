@@ -1,0 +1,466 @@
+HANDOVER -- 21 September 2026 (afternoon/evening)
+THE CUTSCENE PASSED, AND THE TWO BLACK SCREENS ARE NOT ONE BUG
+
+The freeze fix from this morning could not have worked, was rewritten, and is
+now PROVEN -- the player cleared a cutscene and a whole level for the first
+time. Three bugs were found by tools this tree does not routinely run. The
+player then hit three new faults, and the two that look identical in a summary
+are different defects.
+
+Supersedes the ADX and RECOMP_TEXMODE_APPROX sections of
+HANDOVER_2026-09-21_MORNING_THE_LOCK_WAS_A_PRIORITY_AND_WE_NEVER_ENFORCED_IT.txt.
+The long evidence for sections 1-3 is in
+docs/jsrf/progress/CLAUDE_PROGRESS_2026-09-21_THE_LOCK_DID_NOT_SPAN_THE_CRITICAL_SECTION.md
+-- this file is the state transfer, that one is the working.
+
+
+====================================================================
+0. READ THIS FIRST. THE METHOD NOTE, AND IT IS ABOUT ME
+====================================================================
+
+I was wrong three times today and measurement caught all three. Two of the
+three were the SAME mistake, so it gets a rule:
+
+    SCENE-MATCH BEFORE YOU GENERALISE A SIGNATURE.
+
+  - I read "[VOICE-TOP-RING] 3D 000F -> 0005" then "3D 0005 -> 000F" as a
+    15 -> 5 -> 15 CYCLE. It is not. voice_top_note() is called from inside
+    mcpx_apu_write (apu_core.c:452), so that ring records GUEST MMIO writes to
+    the head register ONLY -- our own VOICE_ON insert writes d->regs[] directly
+    and never appears there. Two entries are the guest removing v15 from the
+    head and then v5, 373 ms apart. I then told the player twice that
+    RECOMP_APU_LIST_MOVE_TO_FRONT=0 was the one-switch A/B. It would have made
+    that insert WORSE: at that exact moment move-to-front PREVENTED the cycle.
+
+  - I read the Roboy run's signature -- "pure programmable vertex shader, fixed
+    function frozen" -- and asserted it also described the Load-menu run. It
+    does not. In the Load run fixed-function climbs ~29,800 batches per report
+    and 25 of its 28 draws per frame are fixed-function. I put that false
+    equivalence into an agent's brief; it measured both runs and rejected it.
+
+And one counter that invites the wrong read, now also in CLAUDE.md:
+
+    [GPU] N triangles rasterised COUNTS TRIANGLES SUBMITTED. It is
+    s_gpu.tris_drawn += nv2a_metal_draw(...)'s return value
+    (nv2a_pb_exec.c). "2,129 triangles per frame" proves the guest asked and
+    Metal accepted. It proves NOTHING about what covered a pixel. The word
+    "rasterised" is the trap.
+
+What worked, three times: ORDER THE EVIDENCE BEFORE EXPLAINING IT, and the
+per-flip rate rather than the cumulative total. The two black screens look
+identical in every summary line in the log and are told apart instantly by
+draws-per-flip.
+
+
+====================================================================
+1. FIXED AND PROVEN: THE CUTSCENE FREEZE
+====================================================================
+
+THE MORNING'S FIX COULD NOT HAVE WORKED. It took a recursive mutex at the top
+of each of sub_0013B0A0 / sub_0013B0E0 and dropped it at the bottom. Read the
+poisoning interleave again:
+
+    A locks / B locks / A unlocks / B unlocks / A locks
+
+Five complete calls, already in a serial order. A mutex held only INSIDE each
+body permits that order unchanged. What the priority elevation prevented was B
+ENTERING THE REGION WHILE A IS INSIDE IT -- a statement about the span between
+A's lock and A's unlock, not about either body. The 430 s confirming run was
+equally consistent with the interleave simply not occurring.
+
+NOW: diagnostics/jsrf_first_fault/adx_guard.c. The guard is taken by the guest
+lock and released by the MATCHING guest unlock, with the guest's own work in
+between. Recursive (the guest nests, measured depth 3), owner-tracked (the spin
+at sub_001437B0 issues unlocks it never matched with a lock), and bounded (a
+lock never unlocked would otherwise wedge every other guest thread with no
+diagnosis; after a timeout the waiter takes it and counts a steal).
+
+    THE PROOF, from the player's session -- and it is the first time the
+    mechanism has EVER been exercised:
+
+        [ADX-GUARD] serialize on: locks=35525 unlocks=35525 matched
+                    (+0 UNMATCHED) contended=43 max_depth=3 held=0
+        [ADX] lock_count=0 saved_priority=1 raised=15 idle=-15
+
+    contended=43 means 43 times a thread had to WAIT for another to leave the
+    region. Every previous run in this project's history read contended=0 --
+    the guard had never done anything. Those 43 are exactly the interleavings
+    the per-body mutex would have let straight through.
+
+    lock_count=0, not negative. saved_priority=1, not 15. Zero "lock_count is
+    negative" lines. The old freeze signature is absent: the priority poll
+    reads queries=27363, not the 32.6 MILLION of the frozen session.
+
+THE PLAYER CLEARED THE CUTSCENE AND THEN THE WHOLE FIRST LEVEL.
+
+jsrf_adx_guard_{off,zero,on} forces the five steps from a third thread with the
+guest's two words and XAPI's 15<->16 mapping modelled exactly. The `off` arm is
+the positive control and MUST poison. Run against the previous implementation
+the `on` arm fails in under a second.
+
+
+====================================================================
+2. THE OTHER FIVE REVIEW ITEMS
+====================================================================
+
+`=0` TURNED BOTH NEW SWITCHES ON. RECOMP_TEXMODE_APPROX and
+RECOMP_ADX_SERIALIZE were `getenv(...) != NULL`. The A/B the morning handover
+asked for -- "run with RECOMP_TEXMODE_APPROX=0; if the flicker persists it is
+not mine" -- is precisely the arm a presence test cannot express. Both go
+through recomp_switch.h now. The [COMBINER] switch state moved BEFORE the
+census's early-out, because the =0 arm can legitimately refuse nothing and
+approximate nothing, at which point every line was suppressed and the run could
+not say which arm it was. jsrf_switch_audit is GREEN for the first time since
+ee31f41.
+
+THE FLIP SNAPSHOT WAS ONE BUFFER WITH FOUR READERS, and worse than its comment
+admitted: the same function REALLOCS it, so a reader mid-memcpy could be in
+freed storage, and its dimensions arrived as four separate loads.
+src/kernel/frame_pool.h publishes pixels, dimensions, surface identity and
+sequence as one object and reuses a slot only when unheld. jsrf_frame_pool
+finds 90,647 torn frames of 90,790 against the single-buffer version and zero
+against the pool; ThreadSanitizer agrees, and was shown to catch the
+single-buffer race so that "clean" means something.
+
+THE CONTROL-FLOW GATE NOW HAS ADDRESSES. Totals move for two unrelated reasons
+and cannot tell them apart -- switch_resolved 487 -> 481 failed the gate this
+morning while every unresolved measure IMPROVED. A ratio would have passed that
+AND passed six sites genuinely going unresolved while six duplicates vanished.
+The baseline now records switch tables, TODO addresses and stub names by GUEST
+ADDRESS, and a falling total is EXPLAINED rather than failed when no site
+regressed. Verified both directions against perturbed baselines.
+
+THE PRESENT PATH, MEASURED -- and it is not where the last handover said:
+
+    drain (GPU wait)        3141.4 ms over the run
+    readback                2010.8 ms over the run
+    snap copy               0.02 ms/frame   <-- the one everybody blamed
+    convert+upload+draw     0.31 ms/frame
+
+The copy is one part in four hundred of [STAGE] sync. The drain is the larger
+half, and direct GPU presentation does NOT remove it. At most ~39% of the sync
+cost, not the whole judder.
+
+THE SEVEN DROPPED AUDIO METHODS ARE IDENTIFIED AND INERT. Not from a register
+table -- checked against xemu's own apu_regs.h, which does not define them
+either. From the GUEST: the trap leaves the faulting store's host PC in
+g_apu_trap_host_pc and dladdr names the emitting routine.
+
+    0x2A0 0x2A4 0x2A8 0x2AC 0x2B0  sub_001A5671, a one-time DSOUND APU
+                                   bring-up. ONCE each, at t=0, voice 0, all
+                                   carrying the IMMEDIATE 0xFFF, beside
+                                   SET_CURRENT_INBUF_SGE <- 0x7FF.
+    0x350 0x370                    sub_001A368A, inside
+                                   DSOUND::CMcpxVoiceClient::SetFilter. That
+                                   routine commits a whole voice in method
+                                   order; these are two slots in an otherwise
+                                   fully-named 18-register block, both written
+                                   ZERO, once per voice.
+
+So they are NOT why music is missing. "Dropped voice commands would chop a
+vocal and silence a stream" does not survive knowing what they are.
+
+
+====================================================================
+3. THREE BUGS FOUND BY TOOLS WE DO NOT ROUTINELY RUN
+====================================================================
+
+THE WINDOWS BUILD HAD NOT LINKED SINCE 4537424 (yesterday).
+kernel_thread.c calls GetThreadPriorityXboxExact / SetThreadPriorityXboxExact
+unconditionally at three sites. Both are DEFINED only in win32_compat.c and
+DECLARED only inside that header's `#if !defined(_WIN32)` -- and on Windows
+src/platform/CMakeLists.txt makes `platform` an INTERFACE library, so that file
+is not compiled at all. Implicit declarations (mingw calls them errors), then
+unresolved externals. They are not Win32 API; they are ours, added by the
+priority commit. Windows now gets the same exact-value contract, keyed by
+thread id. TWO CAVEATS: nothing retires an entry on thread exit, so a reused
+tid inherits a stale priority (the POSIX side cannot have this -- its store
+dies with the object); and it is UNTESTED AT RUNTIME, syntax-checked with
+x86_64-w64-mingw32-gcc only.
+
+THE D3D11 COMBINER READ CD AND AB SWAPPED. Two handovers recorded the
+disagreement between d3d8_combiners.c and nv2a_texture_copy.c and neither
+resolved it. Checked against xemu's parse_combiner_output: `out->cd = value &
+0xF; out->ab = (value >> 4) & 0xF`. CD IS THE LOW NIBBLE. What it cost: JSRF's
+graffiti shader emits 0x000820D0 = AB->R1, AB_DOT, AB_BLUE_TO_ALPHA. Read
+inverted that is ab_dst = 0 = NV2A_REG_ZERO, which the emitter treats as
+DISCARD -- so the tag's dot product was not written at all and the unused CD
+product went to R1 instead. Fixed on the NV2A path in 777f04a; still broken on
+Windows for this reason. It survived because it produced a MISSING WRITE, not a
+wrong colour: a wrong picture gets reported, a missing write gets lived with.
+The layout now lives in src/d3d/d3d8_combiner_bits.h and BOTH paths call it.
+
+UNDEFINED BEHAVIOUR, 14 SITES. UBSan caught (0xFF << 24) at runtime; sweeping
+for the shape found 13 signed-shift overflows (apu_regs.h x5, nv2a_regs.h x8,
+all `1 << 31`). Plus a hand-rolled offsetof through a null pointer in
+kernel_file.c -- in a file that already uses real offsetof 700 lines earlier.
+After the fixes the whole suite is clean under -fsanitize=address,undefined:
+0 findings over 111 passing tests.
+
+  WATCH OUT: `ctest --output-on-failure` prints only FAILING tests' output, so
+  a sanitizer finding inside a test that still PASSES is invisible. The first
+  "zero findings" reading was an artefact of that flag. Re-run with -V it was
+  62, all one benign class (UBSan's alignment check on the kernel-supplied
+  ucontext_t in mcpx_trap_handler -- macOS's address, not ours; no sigaltstack
+  here). Suppressed with no_sanitize("alignment") on that one function.
+
+Also: nv2a_pb_test.c had a #ifndef fallback defining OP_TRIANGLES as 0x04 --
+that is LINE_STRIP; the real value is 0x05. Dead only because nv2a_regs.h is
+included four lines above it. Deleted.
+
+
+====================================================================
+4. THE PLAYER SESSION: A LEVEL, AND A SAVE THAT WORKS
+====================================================================
+
+Cutscene cleared, first level cleared, save point reached, SAVE WRITTEN AND
+VERIFIED: UDATA/5345000a/99271B32E8BB/JSRFDATA.SAV, 41,088 bytes, "JSRF" magic,
+read back complete on the next boot. As far as the record goes this is the
+first time the save path has been exercised successfully.
+
+PRESERVED (all outside the repo, none of it regenerable):
+  ~/jsrf-build/preserved-logs/last-run_2026-09-21_ROBOY-BLACKSCREEN-FIRST-ITAIL-KEEP.log  (64 MB)
+  ~/jsrf-build/preserved-logs/last-run_2026-09-21_LOADMENU-BLACK-30s-REPRO-KEEP.log       (6 MB)
+  ~/jsrf-build/preserved-logs/last-run_2026-09-21_1015_PRE-REBUILD.log                    (16 MB)
+  ~/jsrf-build/marks-2026-09-21-KEEP/                111 full-frame marks (M key)
+  ~/jsrf-build/glyphdump-2026-09-21-SAVEPOINT-KEEP/  756 files
+  ~/jsrf-build/save-2026-09-21-FIRST-LEVEL-KEEP/     the save itself
+
+THE TEXT DEFECT, CORROBORATED FROM A NEW SCENE. The save screen renders its
+headings cleanly, its in-box labels partly wrong, and its short buttons
+completely unreadable. That ORDERING is a discriminator, not just a symptom:
+corruption severity scales INVERSELY with string length, which is what "a
+page-0 batch with its OPENING QUADS REPLACED by the page-1 batch" (G2) predicts
+and what a bad glyph atlas or texture format would not.
+
+
+====================================================================
+5. THE TWO BLACK SCREENS ARE NOT ONE BUG
+====================================================================
+
+They are identical in every summary line in the log. They are told apart by the
+PER-FLIP rate:
+
+                          Roboy (t>=1086)     Load menu (t>=24)
+    draws / flip                      1.0                  28.0
+    triangles / flip                  1.0               2,129
+    indices / flip                      3               6,387
+    pushbuffer dwords / frame       1,098   (was 71,286)
+    fixed-function                 FROZEN            CLIMBING (+29,800/report)
+
+ROBOY IS NOT A RENDERER FAULT. The guest stops submitting a scene: one
+3-vertex triangle per frame, forever. The [ITAIL] to 0x00075EB3 at t~1082 sits
+exactly at the step where it collapses from 12.8 draws/flip to 1.0. (I earlier
+called that ITAIL "downstream, not the cause" from 1-second [FB] sampling; the
+draw-rate collapse orders it better and points back at it. Section 7.)
+
+LOAD MENU IS THE RENDERER CASE, and it is a ~30 SECOND REPRODUCER: boot, main
+menu, select Load. The geometry IS submitted -- 28 draws, 6,387 indices, 2,129
+triangles per flip -- with EVERY refusal counter at zero ([TEXFMT] 0,
+[COMBINER] 0, [VSH] rejected 0, metal hw refusals 0, batches dropped 0). It
+renders exactly zero pixels.
+
+RULED OUT, each with a measurement:
+  - Save-slot thumbnails. SaveImage.xbx and TitleImage.xbx are NEVER READ (the
+    [READ] line is unconditional per NtReadFile). Zero texture uploads in the
+    entire black period -- 802 before, 802 after, every request a cache hit.
+  - A fade-to-black multiply blend. [BLEND] src=0x306 dst=0x0 appears right as
+    the screen darkens -- and appears at the SAME BOOT POSITION in the Roboy
+    run, which then rendered for another 1,050 s. Not a discriminator.
+  - Clear-after-draw, within the backend's binding: all 1,193 colour clears in
+    the black period were refused for `target` and served by
+    clear_unbound_slot, and surface_target only moves on a draw.
+  - The filesystem. ZERO failed file operations in the whole run. Pressing Load
+    opens Z:\Media\Disp\ (which exists: sprites, charicon, map) and U:\. The
+    save reads back complete, 41,068 bytes, "JSRF" magic.
+  - `want=280 got=52`, which appears 5 times in the failing run and ZERO in the
+    good one -- a clean correlation and a dead end. It is SaveMeta.xbx, written
+    by the TITLE (nothing in src/ writes it), containing
+    `Name=JSRF Game Save Data` in UTF-16. The guest asks for a fixed 280-byte
+    buffer and gets the 52 bytes that exist; bridge_write_iostatus passes the
+    ACTUAL count with STATUS_SUCCESS, which is correct NT semantics. The
+    correlation is just "a save exists".
+
+WHY IT COULD NOT BE SETTLED FROM THE LOG. Three explanations remain --
+geometry off-screen/zero-area, shaded black, or drawn to a surface we do not
+present -- and on macOS EVERY number we have is read from GUEST RAM ([FB],
+[FLIPTRACE], the presenter, the player's eyes). This backend deliberately
+leaves guest RAM stale: clear_unbound_slot() clears the TEXTURE and sets
+owes_guest_ram. So "the frame is in a Metal texture and the write-back lost it"
+is INDISTINGUISHABLE from "nothing was drawn". nv2a_pb_exec.c already had the
+right hook, with a comment saying so -- "what the GPU holds rather than what
+guest RAM holds. Where they disagree is where the frame goes missing" -- and it
+is #define'd on the WINDOWS branch only. That hole is now closed for Metal.
+
+
+====================================================================
+6. THE BOOST SOUND: A STALE IDLE HAND-OVER, NOT A CYCLE
+====================================================================
+
+Voice 15 went `on` at t=181.15 s and never received another off-command or
+release-command; 894 s later it was still sounding. The guest kept issuing
+off-commands for v1 (398 more starts), v14 (78), v3, v5, v12, v7, v18
+throughout -- that is the positive control. Only v15 stopped.
+
+MECHANISM: the guest's RemoveIdleVoice retired a voice our front end had
+already RESTARTED 5.3 ms earlier. The ring entry's own flags say it:
+`A` = the removed head still had PAR_STATE ACTIVE_VOICE set; `T` = cvl named
+exactly v15, so the guest was servicing the idle trap for that voice. From that
+instant DirectSound does not believe it owns v15, so no path will ever issue
+VOICE_OFF. It is a LOOP voice (every voice this title starts is), so it never
+ends by itself.
+
+THE ENABLING DIVERGENCE IS MEASURED, and the existing instrument already said
+it in words:
+
+    guest methods dispatched while TRAPPED: 208001 (of 759378)
+      -- each one overwrites the FEDECMETH/FEDECPARAM pair the guest has not
+         read yet
+
+On hardware a trapped front end has stopped decoding, so a VOICE_ON cannot be
+processed while an idle-voice pair is outstanding. Ours decodes straight
+through.
+
+NOT A CYCLE, and NOT move-to-front -- see section 0. The relink count splits
+mtf_head=499 (benign re-ON of the voice already at the head) + mtf_deep=207;
+only the 207 can form one.
+
+Changed, all in src/apu/apu_vp.c, all with =0 kill switches:
+  RECOMP_APU_IDLE_HANDOFF_ACTIVE (default ON)  withhold the idle hand-over when
+                                               the named voice is ACTIVE again
+  RECOMP_APU_LIST_DEEP_UNLINK    (default ON)  prepending a node already in a
+                                               singly linked list without
+                                               taking it out writes a cycle
+                                               into guest RAM; that is not a
+                                               policy
+  VOICE_ON self-link normalisation (unconditional)
+RECOMP_APU_LIST_MOVE_TO_FRONT's default is DELIBERATELY UNCHANGED -- its
+boot-anomaly gate is still open.
+
+jsrf_apu_list_cycle_{default,mtf,off,bothoff} drives the real front-end
+dispatch and asserts the SHAPE OF THE LIST READ BACK OUT OF GUEST RAM, not a
+counter. Proven failing 4/3/2 assertions in three pre-fix configurations. The
+off/bothoff arms REQUIRE the ring, so a repair that silently stops working
+fails there instead of passing everywhere.
+
+STILL A GENUINE CYCLE AT END OF RUN, and it is NOT the boost: [APU-IDLE-RING]
+reads 3D 1 -> 3 -> 34 -> 1, built entirely from guest link writes the model
+never saw (links changed behind the model: 1055), and it freezes `processed` at
+6906548 for the last ~90 reports. Total silence, not a looping effect. Its own
+investigation.
+
+
+====================================================================
+7. THE FIRST [ITAIL] IN THIS PROJECT'S HISTORY
+====================================================================
+
+    [ITAIL] Unresolved tail jump to 0x00075EB3 (1 times)
+    [ITAIL]   THE EPILOGUE NEVER RAN. esp is still inside the jumping
+    [ITAIL]   function's frame, so `esp += 4` has just returned its caller
+    [ITAIL]   through a local variable
+
+0x00075EB3 is arm 0 of the jump table at 0x00076610, whose only dispatcher is
+sub_00075E90, inside CreateFullRoboyMenu. Three previous long runs had ZERO
+[ITAIL] lines. This is the G20 stack-corruption class, live.
+
+THE PLUMBING GAP: recover_midfunction_entries.py (already run by
+regenerate.sh) builds a real body for "an address at an instruction boundary
+inside an already-detected function" -- exactly this shape. But it only
+operates on STUBS, i.e. addresses something statically CALLS. An arm reached
+only through an unresolved indirect table never becomes a stub, so the recovery
+pass never sees it. 445 arms are in that state.
+
+AND A BODY IS NOT ENOUGH -- this is the part I had wrong in the brief:
+
+    static const size_t g_recomp_table_size = 8875;   /* a LITERAL the lookup
+                                                         loops over */
+    sub_00075E90 in recomp_dispatch.c : 0 rows
+    sub_00075E90 in recomp_stubs_unresolved.c : 1 body
+
+Recovered stubs run because a caller has a static RECOMP_ABI_CALL to them. An
+arm has NO call site; its only route in is RECOMP_ITAIL -> recomp_lookup ->
+g_recomp_table. Every recovered arm needs a ROW and that size literal bumped.
+(Latent bug found on the way: recover_icall_entries.py inserts rows and never
+updates g_recomp_table_size, so its rows would be invisible. It is not run by
+regenerate.sh, so nothing has paid for it yet.)
+
+Built: switch_arm_entries.py joins the gate's existing arm walk to the recovery
+pass; recover_midfunction_entries.py gained a second phase; regenerate.sh needs
+no change. Dry run: 431 of 437 arms translate cleanly INCLUDING 0x00075EB3
+(823 bytes, proper tail). The 6 refused are one cluster sharing a tail with an
+untranslated `enter` -- a pre-existing lifter gap, correctly refused.
+
+NOT PROVEN END TO END. It needs a REGENERATION to take effect and nobody has
+run one. Measured effect on the gate: switch_unresolved +0, todo +0,
+switch_arms_no_body 445 -> ~14, switch_resolved +49. Cost:
+recomp_stubs_unresolved.c 1.7 MB -> 5.8 MB, that file's compile time roughly
+triples.
+
+
+====================================================================
+8. STATE OF THE TREE
+====================================================================
+
+112 ctest, 111 pass. The one failure is jsrf_input_hotplug, which opens the
+player's real PS4 controller. switch_audit: 202 switches, 0 problems (green for
+the first time since ee31f41). control_flow_gate: holds, with the XBE arm walk.
+Clean under -fsanitize=address,undefined and under ThreadSanitizer for the two
+concurrency tests. x86_64-w64-mingw32-gcc reports no errors on any file
+changed today.
+
+28 files modified, 13 new. NOTHING IS COMMITTED.
+
+New files:
+  src/kernel/frame_pool.h                 src/d3d/d3d8_combiner_bits.h
+  src/nv2a/nv2a_metal_state.{c,h}         (surface census)
+  diagnostics/jsrf_first_fault/adx_guard.{c,h}
+  diagnostics/jsrf_first_fault/switch_arm_entries.py
+  diagnostics/jsrf_first_fault/{adx_guard,frame_pool,combiner_output_word,
+                                apu_list_cycle,surface_census}_test.c
+  diagnostics/jsrf_first_fault/test_switch_arm_entries.py
+
+NO REGENERATION WAS RUN. The gen tree is untouched at 10:03:03 and the
+jsrf_manual_overrides.c changes did not need one (only the bodies of two
+already-excluded functions changed). BACK THE GEN TREE UP BEFORE THE NEXT
+REGENERATION -- regenerate.sh overwrites it in place and the old tree is
+unrecoverable, which cost us the `todo 122 -> 123` attribution this morning.
+
+
+====================================================================
+9. OPEN, WITH THE EVIDENCE EACH ONE HAS, AND WHAT SETTLES IT
+====================================================================
+
+THE LOAD-MENU BLACK SCREEN. Blocking: the player cannot load a save. One run,
+~40 s, settles which of three explanations it is:
+
+    RECOMP_SURFACE_CENSUS=120:10  RECOMP_FB_DUMP_DRAW=1:26
+    boot -> main menu -> Load -> wait ~15 s -> quit
+
+    READ THE POSITIVE CONTROL FIRST. Reports at t=16-22, while the main menu is
+    on screen, MUST say `verdict: PICTURE-HELD`. If they do not, the instrument
+    did not look and no later zero means anything.
+      GPU-BLACK     the draws produced no pixels; loss is BEFORE the write-back
+      OWED          the frame is in a Metal texture and guest RAM never got it
+      PICTURE-HELD  while the screen is black -> loss is past the surface
+      NOTHING-HELD  the census read nothing. Not a finding.
+    Each report drains the GPU, so stride 120 is intended; it stops after 200.
+
+THE ROBOY COLLAPSE. Probably the [ITAIL]. Settled by landing section 7 and
+regenerating, then walking to Roboy again.
+
+THE BOOST SOUND. Fix is in with a test but no run behind it. Reproduce with
+RECOMP_VOICE_LIFECYCLE=1 and check that the stranded 3D voice keeps getting
+off-command after its on. g_idle_handoff_active on the new [APU-IDLE-OWNER]
+line decides whether the guard sits early enough -- non-zero means the ordering
+is real and the guard is doing work; read it against `reads` on the same line.
+
+THE END-OF-RUN 1 -> 3 -> 34 -> 1 RING. Untouched by anything today.
+
+THE TEXT DEFECT (G2). Unchanged; new corroboration in section 4.
+
+THE BOOST FLICKER. RECOMP_TEXMODE_APPROX=0 is a genuine A/B for the first time
+as of today. Nothing has run it.
+
+d3d8_combiners.c's emitted HLSL has NOT been run -- Windows session needed.
+
+The Windows exact-priority store has NOT been run -- Windows session needed.

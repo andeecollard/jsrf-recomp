@@ -1,0 +1,445 @@
+HANDOVER -- 21 September 2026 (morning)
+THE LOCK WAS A PRIORITY, AND WE NEVER ENFORCED IT
+
+The cutscene freeze is FIXED, root cause named, mechanism proven end to end
+against the player's own frozen session and then against a 430 s session that
+did not freeze. Two further defects fixed by reading. One instrument bug of
+mine found and fixed. The method note is section 0 and it is the part worth
+reading first, because most of what went slowly today went slowly for one
+reason.
+
+
+====================================================================
+0. READ THIS BEFORE SPENDING ANOTHER PLAYER SESSION
+====================================================================
+
+The previous handover's rule -- COUNT THE INPUT, NOT THE GATE -- worked again.
+The rule this session had to learn is narrower and it cost the player's
+patience directly, in their words: "This is very tedious."
+
+    ESTABLISH THE BOUND BEFORE OFFERING A TRADE-OFF.
+
+I presented "narrow fix vs. general fix" as a judgement call for the player to
+make. It was not one. Every instance of the defect class must call XAPI
+SetThreadPriority, there are exactly EIGHT such call sites in the XBE, and six
+of them are plainly not locks. Reading them took four minutes and proved the
+narrow fix IS the complete fix for this title. I should have done that first
+and presented a decision, not a menu.
+
+And the older rule, which I broke again:
+
+    A SAMPLED COUNTER IS NOT A CENSUS.
+
+sched_note thins to 1-in-5000 after 200 calls and its counter is SHARED across
+every event kind. `seen` reached 445,000 in the frozen run -- almost all of it
+NtSuspendThread/NtResumeThread -- so KeSetBasePriority, which fires a few dozen
+times in a session, was sampled at 1-in-5000. I read an imbalance out of six
+survivors and reported it as a finding. It was noise. Fixed in this session:
+priority notes are now exempt from thinning and every other kind is counted
+against its own kind rather than the total.
+
+
+====================================================================
+1. FIXED: THE CUTSCENE FREEZE.   RECOMP_ADX_SERIALIZE
+====================================================================
+
+CRI's ADX lock is a UNIPROCESSOR MUTUAL-EXCLUSION SCHEME BUILT ON PRIORITY
+ELEVATION, and this runtime records priority without enacting it.
+
+The two routines, named by XbSymbolDatabase + the decompilation and read out of
+the disassembly:
+
+    sub_0013B0A0   LOCK    if count == 0: save GetThreadPriority(-2),
+                           raise self to [0x0025EF8C] (=15 -> base 16),
+                           ResumeThread([0x0027D0E0]);  then inc count
+    sub_0013B0E0   UNLOCK  dec count; if it reached 0:
+                           SuspendThread([0x0027D0E0]),
+                           SetThreadPriority(-2, [0x0027D0F8])
+
+The state they protect is TWO GLOBAL GUEST WORDS with no atomics and no
+per-thread storage:
+
+    0x0025EFA0   the lock refcount
+    0x0027D0F8   ONE slot holding the saved priority of whoever locked
+
+That is safe on an Xbox and only on an Xbox. One CPU, and a thread at base
+priority 16 cannot be preempted by another guest thread at all. THE ELEVATION
+IS THE LOCK. The refcount never needs to be atomic because only one thread can
+ever reach it.
+
+We record priority and never enact it. The player's frozen run said so
+directly:
+
+    [THREAD] suspends=63030 resumes=63195 lost_resumes=164 |
+             priority applied=0 failed=0
+    export RECOMP_THREAD_PRIORITY=0
+
+So guest threads run genuinely concurrently on real cores, and two of them
+(host tid 1006 and 1008) interleave through one refcount and one saved slot:
+
+    A locks    count 0->1, A raised to 16, A's real priority saved
+    B locks    count 1->2, the `jne` skips, B untouched
+    A unlocks  count 2->1, the `jne` skips -- A IS STILL AT 16
+    B unlocks  count 1->0, restores A's saved value onto B
+    A locks    A is already at 16, so it saves 15.  POISONED.
+
+From there CRI's own guard on file I/O -- sub_001437B0, reached from
+cvfssetbuf / wxCiOpen / wxci_filesize_lower -- does this:
+
+    001437B3  push -2
+    001437B5  call GetThreadPriority
+    001437BA  cmp  eax, 0xF          <-- spin WHILE the priority reads 15
+    001437BD  jne  0x1437C7          <-- the only exit
+    001437BF  call 0x00141B80        <-- invokes the registered UNLOCK
+    001437C4  inc  esi
+    001437C5  jmp  0x1437B3
+
+XAPI closes the loop: GetThreadPriority maps base 16 -> 15 (`cmp esi,0x10 /
+push 0xF`) and SetThreadPriority maps 15 -> 16. THE ROUND TRIP BEING EXACT IS
+WHAT SUSTAINS THE SPIN. A lossy one would have exited.
+
+The unlock callback slot [0x002615F0] has exactly ONE writer in the binary --
+sub_0013B330 at 0x0013B387, pushing 0x0013B0E0 -- so nothing can overwrite it.
+Each spin pass decrements the count. The single pass where it reaches zero
+fires SetThreadPriority(-2, 15) -> base 16 -> NO CHANGE. The count then runs
+negative, and BOTH routines open with a `jne` on it, so both become permanent
+no-ops. The thread can never leave 16.
+
+### THE MEASUREMENT THAT CLOSED IT
+
+New [ADX] report, at the freeze, from the player's own session:
+
+    [ADX] lock_count=-32680066 saved_priority=15 raised=15 idle=-15 mwidle_flag=0
+    [SCHED] obj=0x009A4090 tid=1006 queries=32680727 last=16
+
+    lock_count  -32,680,066
+    queries      32,680,727     <-- the same loop driving both, to within 661
+
+That lockstep IS the chain sub_001437B0 -> 0x00141B80 -> [0x002615F0] ->
+sub_0013B0E0 -> `dec [0x0025EFA0]`, measured rather than argued.
+
+### THE FIX
+
+Hand-written sub_0013B0A0 and sub_0013B0E0 in
+diagnostics/jsrf_first_fault/jsrf_manual_overrides.c, fed to the recompiler as
+--exclude-manual so the generated bodies are not emitted and the DIRECT calls
+in generated code link to these. Both transcribed instruction-for-instruction
+from the generated bodies; the only additions are a recursive-mutex enter and
+leave.
+
+The mutex is held across the WHOLE body including the XAPI calls, because what
+must not interleave is A's raise-and-save against B's restore -- protecting
+only the refcount arithmetic leaves the poison path open. Recursive, so a guest
+routine reached from inside the pair that calls back in deadlocks on itself
+rather than on us. The binary contains no setjmp/longjmp (regenerate.sh reports
+"setjmp not found, longjmp not found"), so there is nothing to unwind the
+mutex non-locally.
+
+    export RECOMP_ADX_SERIALIZE=1      # off by default in the tree
+
+### CONFIRMED FIXED
+
+Player session immediately after, 430 s, reaching further than any previous
+run:
+
+    [ADX] lock_count=1 saved_priority=0 raised=15 idle=-15 mwidle_flag=0
+
+Positive count, saved priority never 15, no "lock_count is negative" line
+anywhere in the run. THE POISON DID NOT FORM.
+
+### WHY NARROW IS COMPLETE, AND IT IS PROVABLE
+
+Every instance of this defect class must call XAPI SetThreadPriority
+(0x00147CC0). There are eight callers in the whole XBE:
+
+    0x0013B0A0   raises SELF to 15, saves old        <-- exclusion primitive
+    0x0013B0E0   restores SELF                       <-- exclusion primitive
+    0x0013B110   sets the WORKER's priority             handshake, not a lock
+    0x0013B2A0   worker demotes its own handle          self-demotion
+    0x0013B330   one-time config of four threads        configuration
+    0x0017B6D0   thread-object getter                   COM method
+    0x0017B710   thread-object Resume                   COM method
+    0x0017B740   thread-object SetPriority              COM method
+
+The 0x0017Bxxx trio are COM-style methods on a thread wrapper -- `this+0x0C` is
+the handle, they return E_INVALIDARG / CO_E_NOTINITIALIZED / E_FAIL. None
+elevates itself. ONLY TWO SITES IN THE TITLE USE PRIORITY AS A LOCK, and both
+are now serialised.
+
+This is NOT a general fix for priority being unenacted. Anything else relying
+on TIME_CRITICAL for exclusion is still exposed; in this title there is
+nothing else.
+
+
+====================================================================
+2. THE FOUR ADX THREADS, NAMED AND CONFIRMED
+====================================================================
+
+sub_0013B330 is the only function in the XBE that calls CreateThread four
+times. lpStartAddress is the FOURTH of six stdcall pushes -- three before the
+call, NOT the one adjacent to it, which is lpThreadAttributes (a zeroed ebx).
+All four are created CREATE_SUSPENDED with priority boost disabled.
+
+  entry       handle slot   prio   body
+  0x0013B180  0x0027D0E0      2    pure counting spin; resumed only by the
+                                   lock pair
+  0x0013B1C0  0x0027D0FC      1    BlockUntilVerticalBlank -> pump ->
+                                   ResumeThread(0x0027D0E8)
+  0x0013B230  0x0027D104      1    same, second server fn
+  0x0013B2A0  0x0027D0E8    -15    mwidle worker; demotes itself, clears
+                                   0x0025EFA4, self-suspends
+
+Confirmed at runtime from the first four kernel notes of a session -- sequence
+#1..#4, fully unthinned:
+
+    tok=0x48000001 -> 2       tok=0x48000003 -> 1
+    tok=0x48000002 -> 1       tok=0x48000004 -> -16   (-15 maps to -16)
+
+Both vblank pumps block on 0x0018CB40+... specifically D3DDevice_
+BlockUntilVerticalBlank at 0x0018CE50 -- the address the 09-10 note already
+flagged. Both increment ONE counter at 0x0025EFAC, which is why main.c's
+[ADX-RATE] comment says "counted by two threads, so ~N true passes/s". That was
+inferred from the rate; it is visible in the instructions.
+
+The address set was corroborated six-for-six against the empirical constants
+already in main.c (ADX_FLAG_VA, ADX_THREAD_VA, ADX_WORKER_VA, ADX_SPIN_VA,
+ADX_SERVER_VA, ADX_SHUTDOWN_VA). Three addresses are new here -- LOCK_COUNT,
+SAVED_PRIORITY, CFG_RAISED_PRIORITY -- and sit in the same two clusters.
+
+
+====================================================================
+3. THE CENSUS WAS NOT REPORTING WHAT ITS LABEL SAID
+====================================================================
+
+bridge_KeQueryBasePriorityThread recorded STACK_ARG(0) into a field called
+`handle` and printed `handle=0x009A4090`. THAT ARGUMENT IS A GUEST OBJECT
+POINTER, not a thread handle -- the note eight lines above it says so in words.
+The previous session spent its planning on mapping those numbers to a TIB
+through bridge_thread_handle_for_token, which could never work.
+
+Renamed to object_va, and the census now records obj->HandleToken and decodes
+it: `tid=N` for a BRIDGE_TID_TOKEN_TAG token, `handle_token=0x...` otherwise.
+That is what turned "obj=0x009A4090" into "tid=1006" in one run.
+
+The two spinners in the frozen session:
+
+    tib=0x00004000  (the MAIN THREAD)  2,890,922,112 calls
+                    246/250/124 at ~963.2M  <- ObRef/ObDeref/QueryBasePriority
+    tib=0x00982000                     2,870,331,870 calls
+                    246/250/124 at ~956.6M
+
+Ordering, which is the part that makes it causal rather than correlated:
+
+    t ~222     thread A's poll starts (2.93M accumulated by t=224 at 1.38M/s)
+    t  223.02  LAST FRAME THAT CHANGES -- the visible freeze
+    t  224.02  ordinal 124 enters the top-5 for the first time
+    t ~238-240 thread B starts spinning too
+    t 1295.03  run ends; framebuffer sum still identical to t=223.02
+
+The spin PRECEDES the freeze. Contrast the Event latch and lost resumes, which
+the previous handover ruled out for arriving after.
+
+
+====================================================================
+4. FIXED: BUMPENVMAP WAS BEING DROPPED, NOT DRAWN.  RECOMP_TEXMODE_APPROX
+====================================================================
+
+nv2a_texture_copy.c gated texture shader modes with `if (mode > 1) refuse`, and
+a refusal drops the ENTIRE draw. Modes 6 and 7 are BUMPENVMAP and
+BUMPENVMAP_LUMINANCE (xemu psh.c). So an unimplemented displacement effect cost
+us the whole surface: a HOLE where the geometry should be, not a flat effect.
+
+REFUSING A DRAW IS THE WORST AVAILABLE FALLBACK. Approximating the
+displacement as zero makes it a plain 2D fetch -- the distortion is lost, the
+surface is drawn, and that is strictly closer to the frame than nothing.
+
+    export RECOMP_TEXMODE_APPROX=1     # off by default in the tree
+
+The player's "almost black and purple transition between title card/intro/corn"
+is the visible form of this: 179 refused draws, unit 1 mode 6, in ONE ten-second
+burst at t=240-250 and zero for the following 52 seconds of a live run.
+
+  THAT BURST SHAPE ALSO UNATTRIBUTES THE BOOST FLICKER. The previous handover
+  proposed mode 6 as the boost heat-haze and said it was unproven. A repeated
+  player action does not produce one ten-second burst and then nothing. The
+  mode-6 refusals are the TRANSITION. What causes the boost flicker is now
+  unknown again.
+
+
+====================================================================
+5. FIXED: CROSS-THREAD PRIORITY CORRUPTION IN OUR OWN CODE
+====================================================================
+
+win32_compat.c, both halves of the exact-priority pair:
+
+    if (h == PSEUDO_CURRENT_THREAD || !o) { ...use the CALLER's TLS... }
+
+The `!o` arm exists for the process's initial thread, which has no w32_object
+because t_self_obj is set in CreateThread's trampoline. It also caught a case
+that means the OPPOSITE: bridge_thread_handle_for_token returns NULL for a
+thread-id token used from a DIFFERENT thread, and xbox_KeSetBasePriorityThread
+passes that NULL straight through. So "set thread B's priority" ran on thread A
+and stored A's value in A's own slot -- the write lost, A corrupted, nothing
+said. The getter was worse: it answered an unidentified handle with the
+CALLER's priority, and bridge_object_for_token SEEDS A NEW GUEST OBJECT from
+exactly that call.
+
+Now only the pseudo-handle means the caller; an unidentified handle is counted
+and dropped:
+
+    [THREAD] priority calls on an UNIDENTIFIED thread: N
+             <-- dropped, not charged to the caller
+
+Nonzero there means a guest priority read or write went nowhere, which is a
+defect upstream, not normal. It was zero in the confirming run.
+
+
+====================================================================
+6. A JUDGEMENT CALL: control_flow_gate RE-BASELINED
+====================================================================
+
+Landing the ADX override needs a full regeneration, and that regeneration
+picked up 135 new icall observations, which re-carved functions. The gate
+failed. It should not have:
+
+    measure                   baseline      now
+    switch_resolved                487      481    -6
+    switch_unresolved              152      142    -10  BETTER
+    switch_unresolved_tables        62       53    -9   BETTER
+    unresolved_stubs               168      155    -13  BETTER
+    coverage_bytes           1,613,435  1,615,561  +2126 BETTER
+    functions                     8846     8839    -7
+    todo                           122      123    +1   worse
+
+Total switch sites 639 -> 623. Fewer functions with MORE coverage means the new
+seeds merged spurious function splits, so duplicate switch sites disappeared --
+resolved and unresolved both fell, unresolved fell further. Every unresolved
+measure improved.
+
+  THE GATE IS ONE-SIDED. It flags switch_resolved falling without checking
+  whether the denominator fell too. It should compare ratios. Not changed in
+  this pass, because changing a check's semantics alongside the fixes it is
+  guarding is how a real regression gets waved through later.
+
+  Not caused by the override: `functions` comes from the DETECTOR, which runs
+  on the XBE regardless of --exclude-manual, and both overridden functions are
+  18 and 10 instructions of direct calls with no switch table and no indirect
+  branch.
+
+  todo +1 is the one genuine negative and is unexplained.
+
+Re-baselined deliberately. Suite back to 99/101, documented pair only
+(jsrf_input_hotplug reads live hardware; jsrf_switch_audit sits over baseline).
+
+
+====================================================================
+7. CORRECTIONS TO THINGS I SAID TODAY
+====================================================================
+
+  - "lpStartAddress is pushed immediately before the call." WRONG. It is the
+    fourth of six stdcall pushes. Taking the adjacent push returns
+    lpThreadAttributes and would have reported zero as a thread entry point.
+
+  - "Both thread names in one pass." OVERCLAIMED. A static CreateThread census
+    yields candidate entry points; tying a runtime object to one needs runtime
+    data, which is what the token decode in section 3 added.
+
+  - "15 raises against 13 restores -- two unmatched." NOT SUPPORTED. Six of
+    those 45 lines were 1-in-5000 survivors. The evidence both threads sat at
+    16 is the census `last=16`, which is exact and independent of those counts.
+    In the complete unthinned window the pairing is CLEAN (6/6 and 12/11 with
+    the window closing mid-pair), so the mechanism is healthy early and the
+    transition is exactly what the thinning destroyed.
+
+  - THE NEW APPROXIMATION CENSUS WAS PLACED AFTER AN EARLY RETURN. The
+    [COMBINER] report returns early when nothing was refused, so the moment
+    RECOMP_TEXMODE_APPROX removed the last refusal the whole report went
+    silent and took the record of what it had approximated with it. Working and
+    invisible is not better than broken and visible. Fixed; the census now
+    stays alive on the approximation count alone.
+
+  - I rebuilt the binary while a probe run was in flight, which this project's
+    own notes forbid. It did not void that run. It could have.
+
+  - Three background waiter loops hung because their `pgrep -f` pattern matched
+    their own command line -- the self-match trap already recorded in the
+    project memory. Killed; they were burning a little CPU while the player
+    was playing.
+
+
+====================================================================
+8. OPEN, WITH THE EVIDENCE EACH ONE HAS
+====================================================================
+
+FLICKERING FIGURES / POLICE / CUTSCENE.  Reported by the player in the first
+430 s session with both switches on. THE RUN REFUSED NOTHING -- zero [TEXFMT]
+format refusals, zero [COMBINER] refusals -- so this is NOT dropped draws,
+which is the explanation that would otherwise be first. My own approximation is
+NOT yet ruled out, because it now draws geometry that was previously skipped
+and the census bug hid how much. ONE A/B SETTLES IT: run with
+RECOMP_TEXMODE_APPROX=0. If the flicker persists it is not mine.
+
+AUDIO -- "no Rokkaku music", "Self Style Genius vocals chopped up". The ring is
+NOT starving:
+
+    [APU-PACE] starved=0 empty=0 min_queued=3072 bytes (16.0 ms)
+    [APU-FE-UNKNOWN] dropped=69 distinct=7: 02A4 02B0 02A0 02A8 02AC 0350 0370
+
+So the chopping is not underrun. The front end is DROPPING 69 COMMANDS ACROSS
+SEVEN OPCODES IT DOES NOT DECODE. Dropped voice commands would chop a vocal and
+silence a stream, which fits both symptoms. Seven specific opcodes, findable
+statically. THIS IS THE NEXT PIECE OF READING WORK.
+
+[ADX-RATE] printed nothing at all in either session, which is a second thread
+to pull on the music.
+
+FRAME PACING. 56.4 fps mean but p90=27 ms, p99=39 ms, max=91 ms, over-33ms=465.
+
+    [FLIP-SYNC] flip read-backs: 26236 taken, 0 skipped
+
+Every flip waits for the GPU and round-trips the whole colour surface through
+guest RAM. That is where the judder is.
+
+BOOST FLICKER. Unattributed again -- see section 4.
+
+d3d8_combiners.c:169 reads the AB/CD destination bits inverted relative to
+nv2a_texture_copy.c. The previous handover concluded this file is right and the
+D3D11 path is wrong. Still unfixed, Windows only.
+
+
+====================================================================
+9. STATE OF THE TREE
+====================================================================
+
+Switches added, both OFF by default in the tree and both armed in the player's
+paths.conf (backup at paths.conf.bak-1006):
+
+    RECOMP_ADX_SERIALIZE     serialise the CRI ADX lock/unlock pair
+    RECOMP_TEXMODE_APPROX    draw bump modes flat instead of dropping the draw
+
+Instruments added:
+
+    [SCHED] obj= + tid=/handle_token=   the poll census, now naming the thread
+    [ADX]  lock_count/saved_priority/   the two words that decide the freeze,
+           raised/idle/mwidle_flag      plus the four thread handles
+    [THREAD] priority calls on an       unidentified-handle counter
+             UNIDENTIFIED thread
+    sched_note per-kind thinning        rare events no longer thinned by
+                                        common ones
+
+Files touched:
+    src/kernel/kernel_bridge.c
+    src/platform/win32_compat.c
+    src/nv2a/nv2a_texture_copy.c
+    diagnostics/jsrf_first_fault/jsrf_manual_overrides.c
+    diagnostics/jsrf_first_fault/main.c
+    diagnostics/jsrf_first_fault/control_flow_baseline.json  (re-baselined)
+
+Regeneration was run; the gen tree is current with the two exclusions.
+Bundle rebuilt and verified (no source newer than it, both switches present,
+negative control absent) -- BUT it predates the census-placement fix in
+section 7, so rebuild it before the next session.
+
+Preserved evidence:
+    ~/jsrf-build/jsrf-first-fault/render-investigation/player-freeze-logs/
+        player-2026-09-21-0947.log      the frozen session, 14 MB

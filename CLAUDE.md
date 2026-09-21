@@ -169,6 +169,26 @@ log sizes across scenes, and `N triangles fully off-surface` — that counter is
 incremented only in the CPU rasteriser, so on any Metal run it reads 0 beside
 `[RASTER] 0 batches + 0 triangles on the CPU` and means nothing at all.
 
+**`[GPU] N triangles rasterised` counts triangles SUBMITTED.** It is
+`s_gpu.tris_drawn += nv2a_metal_draw(...)`'s return value, so "2,129 triangles
+per frame" proves the guest asked for them and the backend accepted them, and
+proves nothing about what covered a pixel. On 21 Sep 2026 a black screen was
+read as "the GPU is still working" off exactly this counter. The word
+"rasterised" is the trap.
+
+**A CUMULATIVE TOTAL AND A PER-FLIP RATE ARE DIFFERENT INSTRUMENTS.** The two
+black screens of 21 Sep 2026 are identical in every summary line the log
+prints, and are told apart instantly by draws-per-flip: 1.0 where the guest had
+stopped submitting a scene, 28.0 where it was submitting one that rendered
+nothing. Difference two report blocks and divide by the flips between them
+before concluding anything about a renderer.
+
+**A signature belongs to the run it was measured in.** Carrying one scene's
+signature to another scene cost two wrong readings on 21 Sep 2026 — "fixed
+function is frozen" was true of one black screen and false of the other, and
+`[VOICE-TOP-RING]` records only GUEST head writes, so reading our own inserts
+out of it invented a list cycle that was not there. Scene-match first.
+
 **Scene-match every comparison, and check `[APU-VOICE] on=` before scoring an
 arm.** A run that reaches gameplay reads `on=` in the 148–453 band; one stuck in
 the attract loop reads 4–12. Comparing across that boundary produced a confident
