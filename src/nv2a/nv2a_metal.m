@@ -362,7 +362,45 @@ void nv2a_metal_cb_report(void)
  *
  * RECOMP_METAL_SURFACE_CACHE=0 restores the rebuild-every-swap behaviour, and
  * is the control for any measurement of this. */
-#define SURFACE_SLOTS 4
+/* HOW MANY RENDER TARGETS THE CACHE CAN HOLD AT ONCE.
+ *
+ * Four, since this cache was written, and never measured against what the
+ * title actually keeps live. The player's 21 Sep session logged 92 EVICTIONS
+ * and 455 rebuilds: an eviction only happens when a fifth surface is wanted
+ * while four are held, so the working set demonstrably exceeds four. A
+ * render target evicted and rebuilt mid-effect is a frame drawn against a
+ * surface that has just been re-read from guest RAM, which is what a flicker
+ * looks like -- and "boost dash flickers" is an open report.
+ *
+ * AND MORE SLOTS IS NOT THE FIX. Measured 21 Sep: at eight the title renders
+ * a BLACK SCREEN -- [FB] sum=00000000 nonzero=0/153600 -- and never leaves the
+ * logos. The reason is `owes_guest_ram` below: a slot that was cleared
+ * residently holds pixels guest RAM has not got, and EVICTION IS WHAT WRITES
+ * THEM BACK. Raise the slot count and evictions stop; stop evictions and guest
+ * RAM never catches up, so everything that reads it reads zeroes.
+ *
+ * So the cache size is not independently tunable. It is coupled to the
+ * writeback policy, and a bigger cache needs writeback on some trigger other
+ * than eviction before it can be considered. That is the real work here, and
+ * it is not done.
+ *
+ * The array is eight and SURFACE_SLOTS_USED is a RUNTIME cap, DEFAULTING TO
+ * FOUR, so the experiment is repeatable without shipping its result. A slot
+ * is a few pointers and texture handles, not pixels, so the unused ones cost
+ * nothing. */
+#define SURFACE_SLOTS 8
+static unsigned surface_slots_used(void)
+{
+    static unsigned n;
+    if (!n) {
+        const char *e = getenv("RECOMP_METAL_SURFACE_SLOTS");
+        long v = e ? strtol(e, NULL, 10) : 4;   /* measured: see above */
+        if (v < 1) v = 1;
+        if (v > SURFACE_SLOTS) v = SURFACE_SLOTS;
+        n = (unsigned)v;
+    }
+    return n;
+}
 static struct {
     uint8_t *target; size_t target_size;
     uint32_t w, h, pitch;
@@ -436,7 +474,7 @@ static void surface_slot_writeback(unsigned i);
 static int clear_encode(MTLRenderPassDescriptor *pass);
 static void surface_cache_drop(const uint8_t *target)
 {
-    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+    for (unsigned i = 0; i < surface_slots_used(); ++i) {
         if (!surf_slot[i].valid) continue;
         if (target && surf_slot[i].target != target && surf_slot[i].depth != target)
             continue;
@@ -2581,7 +2619,7 @@ int nv2a_metal_sync_range(uint8_t *target, size_t bytes)
      * and nv2a_metal_sync is the only path that writes depth back. */
     if (!nv2a_metal_sync()) return 0;
 
-    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+    for (unsigned i = 0; i < surface_slots_used(); ++i) {
         if (!surf_slot[i].valid || !surf_slot[i].owes_guest_ram) continue;
         if (!guest_ranges_overlap(target, bytes,
                                   surf_slot[i].target, surface_slot_bytes(i)))
@@ -2621,7 +2659,7 @@ static void surface_pay_debt_for_range(const uint8_t *p, size_t bytes,
                                        uint64_t *counter)
 {
     if (!p || !bytes) return;
-    for (unsigned i = 0; i < SURFACE_SLOTS; ++i) {
+    for (unsigned i = 0; i < surface_slots_used(); ++i) {
         if (!surf_slot[i].valid || !surf_slot[i].owes_guest_ram) continue;
         if (!guest_ranges_overlap(p, bytes, surf_slot[i].target,
                                   surface_slot_bytes(i)))
@@ -3509,14 +3547,14 @@ static int clear_unbound_slot(uint8_t *target, uint32_t pitch,
 {
     unsigned i;
     if (!surface_cache_on() || !hw_state_on() || !initialize()) return 0;
-    for (i = 0; i < SURFACE_SLOTS; ++i) {
+    for (i = 0; i < surface_slots_used(); ++i) {
         if (!surf_slot[i].valid || surf_slot[i].target != target) continue;
         if (surf_slot[i].w != width || surf_slot[i].h != height) return 0;
         if (surf_slot[i].pitch != pitch) return 0;
         if (!surf_slot[i].colour) return 0;
         break;
     }
-    if (i == SURFACE_SLOTS) return 0;            /* not a surface we hold */
+    if (i == surface_slots_used()) return 0;     /* not a surface we hold */
     @autoreleasepool {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         batch_flush();
@@ -4300,7 +4338,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * unless asked for. */
    if(getenv("RECOMP_GLYPH_GPU_DIFF")){
     int found=0;
-    for(unsigned i=0;i<SURFACE_SLOTS;i++){
+    for(unsigned i=0;i<surface_slots_used();i++){
      if(!surf_slot[i].target) continue;
      if(!guest_ranges_overlap(texture,texture_size,
                               surf_slot[i].target,surface_slot_bytes(i))) continue;
@@ -4518,7 +4556,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     else{
      if(depth_dirty)++g_swap_deferred_no_depth;
      int owed=0;
-     for(unsigned i=0;i<SURFACE_SLOTS;i++)
+     for(unsigned i=0;i<surface_slots_used();i++)
       if(surf_slot[i].valid&&surf_slot[i].colour==surface){
        surf_slot[i].owes_guest_ram=1;surface_dirty=0;
        owed=1;++g_swap_deferred;break;}
@@ -4532,7 +4570,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * draws that made the round trip. */
    int slot_hit=-1;
    if(surface_cache_on())
-    for(unsigned i=0;i<SURFACE_SLOTS;i++)
+    for(unsigned i=0;i<surface_slots_used();i++)
      if(surf_slot[i].valid&&surf_slot[i].target==target&&surf_slot[i].target_size==target_size
         &&surf_slot[i].w==s->clip_w&&surf_slot[i].h==s->clip_h&&surf_slot[i].pitch==s->target_pitch
         &&surf_slot[i].depth==next_depth&&surf_slot[i].depth_pitch==next_depth_pitch
@@ -4592,7 +4630,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * first; a dropped slot only costs the rebuild it would have saved. */
    if(surface_cache_on()){
     unsigned pick=0;
-    for(unsigned i=0;i<SURFACE_SLOTS;i++){
+    for(unsigned i=0;i<surface_slots_used();i++){
      if(!surf_slot[i].valid){pick=i;break;}
      if(surf_slot[i].stamp<surf_slot[pick].stamp)pick=i;}
     /* EVICTION HAS TO PAY THE DEBT, AND DID NOT. defer_swap's header says
