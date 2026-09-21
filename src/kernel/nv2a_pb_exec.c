@@ -5715,6 +5715,7 @@ void nv2a_pb_exec_report(void)
     }
     frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
+    if (s_copy.rejected) nv2a_texture_copy_census();
     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)
         fprintf(stderr,"[TEXTURE]   %llu  %s\n",(unsigned long long)s_texture_reasons[i].count,s_texture_reasons[i].reason);
     if (s_combiner_count) {

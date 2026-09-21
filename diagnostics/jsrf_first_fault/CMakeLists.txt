@@ -210,6 +210,19 @@ foreach(case fallback cli tsv override missing)
              COMMAND jsrf_d3d8_ring_test ${case})
 endforeach()
 
+# SZ_X1R5G5B5 (0x03) and SZ_X8R8G8B8 (0x07) were refused on 100% of the draws
+# that used them until 21 Sep 2026. X8R8G8B8's top byte is UNDEFINED, so the
+# fix is not "accept format 7" but "accept it and force alpha opaque" -- read
+# as alpha it is transparent wherever the padding is zero, which looks exactly
+# like the object not drawing at all. The alpha-regression case guards the
+# other direction.
+add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")
+foreach(case x8r8g8b8 x1r5g5b5 alpha-regression)
+    add_test(NAME jsrf_texfmt_${case} COMMAND jsrf_texfmt_swizzled_test ${case})
+endforeach()
+
 # The guest's GPU fence. Until 20 Sep 2026 the pump published [dev+0x30] into
 # the word the title spins on -- the one value the hardware can never deposit --
 # and every D3DVertexBuffer_Lock / D3D_BlockOnResource wait became a no-op.

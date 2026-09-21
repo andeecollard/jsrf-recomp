@@ -8,6 +8,11 @@
 #include <stdio.h>
 
 #define M(a) m[(a)/4]
+
+static unsigned long s_fmt_seen[256], s_fmt_rejected[256];
+static unsigned long s_reject_hdr, s_reject_dma, s_reject_combiner_out;
+static unsigned long s_dma_rejected[4];
+
 const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s)
 {
     memset(s, 0, sizeof(*s));
@@ -25,7 +30,7 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
         s->color_ocw[i]=M(0x1e40+4*i);s->alpha_ocw[i]=M(0xaa0+4*i);
         uint32_t outputs[2]={s->color_ocw[i],s->alpha_ocw[i]};
         for(unsigned j=0;j<2;++j) {
-            if(outputs[j]&~0xfffu) return "combiner output mode";
+            if(outputs[j]&~0xfffu) { s_reject_combiner_out++; return "combiner output mode"; }
             for(unsigned shift=0;shift<12;shift+=4) {
                 unsigned dst=(outputs[j]>>shift)&15;
                 if(dst && dst!=12 && dst!=13) return "combiner output register";
@@ -165,6 +170,36 @@ target_state:
         return "partial window clip";
     return NULL;
 }
+/* WHICH format is being refused, not merely that one was.
+ *
+ * The player's 21 Sep run rejected 69,950 draws of 3,118,918 -- 2.2% of
+ * everything the title tried to rasterise -- and the log said only
+ * "texture format / mip layout". That names the gate, not the input, so it
+ * cannot say whether the missing pixels are one unsupported format or
+ * twenty. Wall graffiti does not render at all, and a decal is exactly the
+ * kind of surface that would arrive in a format this gate does not list.
+ *
+ * Counters only, printed once with the existing [TEXTURE] report. */
+
+void nv2a_texture_copy_census(void)
+{
+    unsigned f;
+    fprintf(stderr, "[TEXFMT] gate refusals by texture format"
+            " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06 rgba8)\n");
+    fprintf(stderr, "[TEXFMT]   header/mip-layout bits wrong=%lu  dma class wrong=%lu"
+            "  combiner output=%lu\n",
+            s_reject_hdr, s_reject_dma, s_reject_combiner_out);
+    for (f = 0; f < 256; ++f)
+        if (s_fmt_seen[f] || s_fmt_rejected[f])
+            fprintf(stderr, "[TEXFMT]   format 0x%02X  seen=%lu  REFUSED=%lu%s\n",
+                    f, s_fmt_seen[f], s_fmt_rejected[f],
+                    s_fmt_rejected[f] ? "   <-- never reaches the screen" : "");
+    for (f = 0; f < 4; ++f)
+        if (s_dma_rejected[f])
+            fprintf(stderr, "[TEXFMT]   dma class %u refused=%lu\n", f, s_dma_rejected[f]);
+    fflush(stderr);
+}
+
 const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned unit, NV2ATextureCopy *s)
 {
     if(unit>3) return "texture unit";
@@ -172,7 +207,13 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
     uint32_t control=M(b+12), f=M(b+4), dma=f&3, format=(f>>8)&255;
     if ((control&0xc000003fu)!=0x40000000u || (control&0x3ffc0000u))
         return "texture control / colour key / alpha kill";
-    if ((f&0xf00000fcu)!=0x28 || (dma!=1 && dma!=2)) return "texture format / mip layout";
+    s_fmt_seen[format]++;
+    if ((f&0xf00000fcu)!=0x28 || (dma!=1 && dma!=2)) {
+        if ((f&0xf00000fcu)!=0x28) s_reject_hdr++;
+        else { s_reject_dma++; s_dma_rejected[dma & 3]++; }
+        s_fmt_rejected[format]++;
+        return "texture format / mip layout";
+    }
     s->levels=(f>>16)&15;
     if(!s->levels) return "texture mip levels";
     if(s->levels>1 && (control&0x3ffc0u)!=0x3ffc0u)
@@ -181,14 +222,21 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
         if(s->levels!=1) return "linear texture mip levels";
         s->width=M(b+28)>>16; s->height=M(b+28)&65535; s->pitch=M(b+16)>>16;
         if(!s->width || !s->height || s->pitch<s->width*2u) return "texture dimensions / pitch";
-    } else if(format==0xc || format==0xe || format==6) {
-        s->dxt1=format==0xc; s->dxt3=format==0xe; s->rgba8=format==6;
+    } else if(format==0xc || format==0xe || format==6 || format==7 || format==3) {
+        /* 0x07 SZ_X8R8G8B8 and 0x03 SZ_X1R5G5B5 are swizzled like the others,
+         * so they take the log2 dimensions here rather than the linear
+         * image-rectangle path. Refusing them dropped 2.2% of every draw in
+         * the player's 21 Sep session. */
+        s->dxt1=format==0xc; s->dxt3=format==0xe;
+        s->rgba8=(format==6 || format==7);
+        s->xrgb8=(format==7); s->sz16=(format==3);
         unsigned lw=(f>>20)&15,lh=(f>>24)&15;
         if(lw>12 || lh>12 || s->levels>1+(lw>lh?lw:lh)) return "texture dimensions / pitch";
         s->width=1u<<lw; s->height=1u<<lh;
         s->pitch=s->dxt1 ? ((s->width+3)/4)*8 :
-            s->dxt3 ? ((s->width+3)/4)*16 : s->width*4;
-    } else return "texture format / mip layout";
+            s->dxt3 ? ((s->width+3)/4)*16 :
+            s->sz16 ? s->width*2 : s->width*4;
+    } else { s_fmt_rejected[format]++; return "texture format / mip layout"; }
     /* Repeat or clamp-to-edge; all three wrap components must agree. */
     if(M(b+8)==0x10101 && format!=0x11) s->repeat=1;
     else if(M(b+8)!=0x10303 && M(b+8)!=0x30303) return "texture address mode";
@@ -310,6 +358,24 @@ static void unpack565(uint32_t v, float rgba[4])
     rgba[0]=(float)(v>>11)/31; rgba[1]=(float)((v>>5)&63)/63; rgba[2]=(float)(v&31)/31;
     rgba[3]=1;
 }
+/* X1R5G5B5: the top bit is undefined, so alpha is opaque rather than read. */
+static void unpack555(uint32_t v, float rgba[4])
+{
+    rgba[0]=(float)((v>>10)&31)/31; rgba[1]=(float)((v>>5)&31)/31;
+    rgba[2]=(float)(v&31)/31; rgba[3]=1;
+}
+
+/* Rectangular Morton order: interleave only the dimensions still active. */
+static unsigned swizzle_index(const NV2ATextureCopy *s, unsigned x, unsigned y)
+{
+    unsigned index=0,bit=0;
+    for(unsigned b=1;b<s->width || b<s->height;b<<=1) {
+        if(b<s->width)  { if(x&b) index|=1u<<bit; ++bit; }
+        if(b<s->height) { if(y&b) index|=1u<<bit; ++bit; }
+    }
+    return index;
+}
+
 static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, float rgba[4])
 {
     if (s->repeat) {
@@ -320,14 +386,16 @@ static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, f
         if (y<0) y=0; else if ((uint32_t)y>=s->height) y=(int)s->height-1;
     }
     if(s->rgba8) {
-        unsigned index=0,bit=0;
-        /* Rectangular Morton order: interleave only dimensions still active. */
-        for(unsigned b=1;b<s->width || b<s->height;b<<=1) {
-            if(b<s->width) { if((unsigned)x&b) index|=1u<<bit; ++bit; }
-            if(b<s->height) { if((unsigned)y&b) index|=1u<<bit; ++bit; }
-        }
-        const uint8_t *p=data+4*(size_t)index;
-        rgba[0]=p[2]/255.0f; rgba[1]=p[1]/255.0f; rgba[2]=p[0]/255.0f; rgba[3]=p[3]/255.0f;
+        const uint8_t *p=data+4*(size_t)swizzle_index(s,(unsigned)x,(unsigned)y);
+        rgba[0]=p[2]/255.0f; rgba[1]=p[1]/255.0f; rgba[2]=p[0]/255.0f;
+        /* X8R8G8B8 leaves the top byte undefined; sampling it gives a texture
+         * that is transparent wherever the padding happens to be zero. */
+        rgba[3]=s->xrgb8 ? 1.0f : p[3]/255.0f;
+        return;
+    }
+    if(s->sz16) {
+        const uint8_t *p=data+2*(size_t)swizzle_index(s,(unsigned)x,(unsigned)y);
+        unpack555(p[0] | (uint32_t)p[1]<<8, rgba);
         return;
     }
     if (s->dxt1 || s->dxt3) {
@@ -355,7 +423,7 @@ static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, f
 }
 static void sample(const NV2ATextureCopy *s, const uint8_t *data, float u, float v, float rgba[4])
 {
-    if (s->dxt1 || s->dxt3 || s->rgba8) {
+    if (s->dxt1 || s->dxt3 || s->rgba8 || s->sz16) {
         /* Nonlinear textures use normalized coordinates, unlike image rectangles. */
         if (s->repeat) { u-=floorf(u); v-=floorf(v); }
         else { u=fmaxf(0,fminf(1,u)); v=fmaxf(0,fminf(1,v)); }
@@ -427,14 +495,18 @@ int nv2a_texture_copy_decode_level(const NV2ATextureCopy *s, const uint8_t *data
     for(unsigned l=0;l<level;++l) {
         offset+=t.dxt1?(size_t)((t.width+3)/4)*((t.height+3)/4)*8:
             t.dxt3?(size_t)((t.width+3)/4)*((t.height+3)/4)*16:
-            t.rgba8?(size_t)t.width*t.height*4:(size_t)t.pitch*t.height;
+            t.rgba8?(size_t)t.width*t.height*4:
+            t.sz16?(size_t)t.width*t.height*2:(size_t)t.pitch*t.height;
         t.width=t.width>1?t.width/2:1; t.height=t.height>1?t.height/2:1;
+        /* A swizzled level's pitch follows its width; a linear image
+         * rectangle's does not, which is why this is not one expression. */
         t.pitch=t.dxt1?((t.width+3)/4)*8:t.dxt3?((t.width+3)/4)*16:
-            t.rgba8?t.width*4:t.pitch;
+            t.rgba8?t.width*4:t.sz16?t.width*2:t.pitch;
     }
     size_t level_bytes=t.dxt1?(size_t)((t.width+3)/4)*((t.height+3)/4)*8:
         t.dxt3?(size_t)((t.width+3)/4)*((t.height+3)/4)*16:
-        t.rgba8?(size_t)t.width*t.height*4:(size_t)t.pitch*t.height;
+        t.rgba8?(size_t)t.width*t.height*4:
+        t.sz16?(size_t)t.width*t.height*2:(size_t)t.pitch*t.height;
     if(offset>size || level_bytes>size-offset) return 0;
     if((size_t)t.width*t.height*4>out_size) return 0;
     const uint8_t *p=data+offset;

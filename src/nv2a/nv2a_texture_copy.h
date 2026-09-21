@@ -11,6 +11,12 @@ typedef struct NV2ATextureCopy {
     uint32_t texture_handle, texture_offset, width, height, pitch, linear, dither;
     uint32_t modulate;
     uint32_t rgba8, levels, min_filter;
+    /* SZ_X8R8G8B8 (0x07) is SZ_A8R8G8B8 with the top byte undefined, so it
+     * shares the rgba8 path and only forces alpha opaque. SZ_X1R5G5B5 (0x03)
+     * is swizzled 16-bit, which is neither the linear image-rectangle path
+     * nor any of the block formats. Both were refused outright until
+     * 21 Sep 2026; see the [TEXFMT] census. */
+    uint32_t xrgb8, sz16;
     float lod_bias;
     uint32_t combiner_count, color_icw[8], alpha_icw[8];
     uint32_t color_ocw[8], alpha_ocw[8], add_specular;
@@ -48,6 +54,11 @@ int nv2a_texture_copy_decode_level(const NV2ATextureCopy *state,
     uint8_t *out, size_t out_size, unsigned *out_w, unsigned *out_h);
 
 const char *nv2a_texture_copy_prepare(const uint32_t methods[2048], NV2ATextureCopy *state);
+
+/* Which texture formats the gate above refused, and how often. The reason
+ * string names the gate, not the input, so a run cannot otherwise say whether
+ * the missing pixels are one unsupported format or twenty. */
+void nv2a_texture_copy_census(void);
 int nv2a_dma_resolve(const uint8_t *ramin, size_t size, uint32_t ramht,
                      uint32_t handle, uint32_t *base, uint32_t *limit);
 /* Buffers start at the resolved surface offsets. Sizes include row padding.
