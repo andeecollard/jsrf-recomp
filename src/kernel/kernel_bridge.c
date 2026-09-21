@@ -8597,12 +8597,31 @@ static uint32_t g_ordinal_sites[XBOX_KERNEL_MAX_ORDINAL][XBOX_ORDINAL_SITES];
  */
 #define KTHREAD_MAX 16u
 
+/* WHICH ordinals, not just the most recent one.
+ *
+ * `last_ordinal` names whatever this thread happened to call last, which is
+ * a sample of one. On 21 Sep 2026 two guest threads read last_ordinal=250
+ * (ObfDereferenceObject) with 302 and 214 MILLION calls during a cutscene
+ * hang, against 765k and 352k on ordinal 159 (KeWaitForSingleObject) in a
+ * healthy run of the same build. That says the threads stopped waiting and
+ * started spinning -- but NOT what they are spinning ON, because a loop of
+ * five kernel calls reports only its last one, and a dereference is what
+ * most handle-based idioms end with.
+ *
+ * A histogram names the loop. KORD_HIST is a cap, not the ordinal count: the
+ * table is per thread and this is a diagnostic. It matches
+ * XBOX_KERNEL_MAX_ORDINAL rather than being a round number: 384 would drop
+ * the top sixteen ordinals silently, which is the kind of cap that makes an
+ * instrument read zero for the one thing it was armed to find. */
+#define KORD_HIST 400u
+
 typedef struct {
     uint32_t fs_base;        /* guest TIB VA; 0 means the slot is free */
     unsigned long calls;
     unsigned int  last_ordinal;
     unsigned long last_tick;
     unsigned long first_tick;
+    unsigned long ord[KORD_HIST];
 } KThreadSlot;
 
 static KThreadSlot g_kthreads[KTHREAD_MAX];
@@ -8638,6 +8657,8 @@ void xbox_bridge_note_thread_call(uint32_t fs_base, unsigned int ordinal,
         return;
     }
     __atomic_fetch_add(&g_kthreads[i].calls, 1ul, __ATOMIC_RELAXED);
+    if (ordinal < KORD_HIST)
+        __atomic_fetch_add(&g_kthreads[i].ord[ordinal], 1ul, __ATOMIC_RELAXED);
     __atomic_store_n(&g_kthreads[i].last_ordinal, ordinal, __ATOMIC_RELAXED);
     __atomic_store_n(&g_kthreads[i].last_tick, tick, __ATOMIC_RELAXED);
 }
@@ -8690,6 +8711,34 @@ void xbox_bridge_dump_thread_census(unsigned long now)
                 fs, calls,
                 __atomic_load_n(&g_kthreads[i].last_ordinal, __ATOMIC_RELAXED),
                 now >= last ? now - last : 0ul);
+        /* The five ordinals this thread actually spends its calls on. A
+         * spinning thread names its loop here; a blocked one shows almost
+         * nothing. Selection sort over a small fixed table, printed once every
+         * few seconds, is not worth a better algorithm. */
+        {
+            unsigned shown, o;
+            unsigned long best_n; unsigned best_o;
+            unsigned long seen[5]; unsigned which[5];
+            unsigned used = 0;
+            for (shown = 0; shown < 5; ++shown) {
+                best_n = 0; best_o = 0;
+                for (o = 0; o < KORD_HIST; ++o) {
+                    unsigned long c = __atomic_load_n(&g_kthreads[i].ord[o],
+                                                      __ATOMIC_RELAXED);
+                    unsigned d, dup = 0;
+                    for (d = 0; d < used; ++d) if (which[d] == o) dup = 1;
+                    if (!dup && c > best_n) { best_n = c; best_o = o; }
+                }
+                if (!best_n) break;
+                seen[used] = best_n; which[used] = best_o; ++used;
+            }
+            if (used) {
+                fprintf(stderr, "  [KERNEL-THREADS]     top ordinals:");
+                for (shown = 0; shown < used; ++shown)
+                    fprintf(stderr, " %u=%lu", which[shown], seen[shown]);
+                fprintf(stderr, "\n");
+            }
+        }
     }
 }
 
