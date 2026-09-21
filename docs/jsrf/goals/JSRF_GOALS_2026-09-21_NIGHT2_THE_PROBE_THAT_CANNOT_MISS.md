@@ -249,3 +249,34 @@ The snap dump is the finding, and as of tonight it exists only as an
 uncommitted diff. `jsrf-d3ddevice-offsets.tsv` and every `run-*.sh` live in
 `~/jsrf-build`, outside git entirely. Losing them costs the week they bought.
 They get committed before G26 is run, not after.
+
+## G27 — CORRECTED, 21 September, night 4
+
+The Load screen was not a render-to-texture fault. It was the DEPTH TEST:
+the composite's back-buffer slot carried the render target's depth pointer,
+so two depth textures stood for one guest depth buffer and the frame's
+clear only ever reached one of them. Fixed in `nv2a_metal_clear_depth_stencil`
+(sibling-slot clears). Two more fixes followed on the same screens: the
+infinite-light dot product was negated (`nv2a_ff.c`, `nv2a_vsh_msl.c`), and
+the window clip refused draws instead of scissoring them
+(`nv2a_texture_copy.c`, `nv2a_metal.m`). See
+`HANDOVER_2026-09-21_NIGHT4_THREE_FIXES_AND_THE_FORCE_MODES_ONLY_EVER_SHOWED_THE_LAST_DRAW.txt`.
+
+## G28 — THE OTHER BLACK SCREENS UNDER THE DEPTH MECHANISM
+
+Re-run the intro (t=18), the title overlay, the map screen and gameplay's
+missing geometry with the night-4 build and RECOMP_DRAW_MIX. Expect several
+of them to be the same stale-depth copy. Unattended where possible.
+
+## G29 — THE BOOT PHASE RENDERS INTO A8R8G8B8 SURFACES
+
+xemu's first 300 flips render into 0x3628000 (1280x480) and two 1024x512
+targets in A8R8G8B8 and sample them back; our Metal path rejects any
+non-16-bit target. "NOW LOADING" lives there. Measure first: does OUR guest
+issue those targets at all (RECOMP_FLIP_TRACE's surface list never showed
+them, but note_surface skips offset 0).
+
+## G30 — GAMEPLAY LIGHTING AGAINST xemu
+
+The light sign changed. Every lit surface in the city now shades the other
+way. Compare a matched scene against xemu before believing either side.

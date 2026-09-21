@@ -1,0 +1,293 @@
+HANDOVER -- 21 September 2026 (night, fourth)
+THREE FIXES, AND THE FORCE MODES ONLY EVER SHOWED THE LAST DRAW
+
+FOLLOWS HANDOVER_2026-09-21_NIGHT3_THIS_TITLE_COMPOSITES_EVERY_FRAME_AND_WE_HAND_IT_AN_EMPTY_TEXTURE.txt
+and SUPERSEDES its section 0. The composite was never the fault. Night 3's
+open item 1 (the census) is CLOSED, its section 5 unification is CONFIRMED
+in a different form, and three player-visible defects are FIXED and seen
+fixed by the player.
+
+Goals file: docs/jsrf/goals/JSRF_GOALS_2026-09-21_NIGHT2_THE_PROBE_THAT_CANNOT_MISS.md
+(G27 answered and corrected; G28-G30 opened at the end of that file).
+
+
+====================================================================
+0. THE ANSWER, IN ONE PARAGRAPH
+====================================================================
+
+THE LOAD SCREEN WAS BLACK BECAUSE EVERY FRAGMENT FAILED THE DEPTH TEST.
+This title's per-frame composite binds a back buffer with the render
+target's depth pointer (a draw with depth off keeps the previous depth
+binding), so the surface cache held TWO depth textures for ONE guest depth
+buffer. The frame's depth clear landed on the back buffer's copy; the
+render target's copy was never cleared, never re-uploaded on a rebind, and
+never written back, so it kept last frame's depth for good. A static
+screen -- identical geometry every frame -- fails LESS on every pixel.
+RECOMP_METAL_HW_DEPTH_ALWAYS=1 brought the whole screen back in one run
+(the player's screenshot at 18:05), and the fix is a depth clear that
+reaches every slot sharing the cleared depth buffer.
+
+BEHIND IT, TWO MORE. Once the Load screen drew, it drew BROWN: our
+fixed-function lighting negated the infinite-light dot product, so every
+surface facing the light got scene ambient only. xemu forms
+max(0, dot(tNormal, lightDirection)) on the register as given; the sign is
+now the same in the CPU reference and the GPU emitter. And the
+character-select screen's two 3D panels were black because the
+texture-copy gate REFUSED any draw whose window clip was smaller than the
+surface ("partial window clip", 495,110 refusals in one 90 s session); the
+window clip is now a scissor on both rasterisers.
+
+The player drove every run below and confirmed all three fixes on screen:
+the Load screen in xemu's yellow, the character select with both panels.
+
+
+====================================================================
+1. HOW IT WAS FOUND, IN ORDER, AND WHAT EACH STEP RULED OUT
+====================================================================
+
+Every run is player-driven to the Load screen unless marked unattended.
+Freshness ([SNAP]) was 0 repeats / 0 never-published on every one.
+
+1. THE CENSUS WAS ALREADY ON RECORD. last-run_2026-09-21_1400_LOADMENU-
+   CENSUS-KEEP had 142 GPU-BLACK verdicts on the Load screen: every held
+   surface black on the GPU too. Night 3's three-way split was answered
+   before the night began: "both black -> we never rendered it correctly
+   in the first place". The write-back branch was dead on arrival.
+
+2. THE xemu TITLE TRACE, TALLIED BY METHOD NUMBER (the names carry an
+   NV097_ prefix and an [n] suffix; matching on names silently matches
+   nothing -- that cost one empty run of the tally). The title's render
+   target 0x3ec4000 is set 4x as often as the two back buffers and is
+   rendered-to-texture once a flip: THE COMPOSITE IS THE RENDER TARGET
+   DRAWN INTO A BACK BUFFER. Our G26 probe agrees: m_RenderTarget =
+   0x005F0000 is never presented; 0x00688000/0x0071E000 are.
+
+3. THE OFFSCREEN ARGB8 RENDERS ARE BOOT-ONLY. xemu's title also renders
+   into 0x3628000 (1280x480 A8R8G8B8), two 1024x512 ones and 0x32a4000, and
+   samples them back. All of it sits in flips 0-299. Scene difference, as
+   night 3 found for the 25 missing methods. Our Metal path rejects any
+   non-16-bit target ("target-format"), which will matter for the boot
+   phase and NOW LOADING (G29) but not for anything after the title.
+
+4. A WRONG TURN, CAUGHT BY ITS OWN INSTRUMENT. A per-draw tally of the
+   xemu Load screen read 19 of 27 draws a flip binding the render target
+   as TEXTURE0 while rendering into it. I built RECOMP_METAL_FEEDBACK_SYNC
+   (sync the bound surface before a draw that samples it) and a counter.
+   The counter said ONE such draw a flip on our side, and xemu's own
+   render_to_texture line says one a flip too. The 19 were the LATCHED
+   texture offset on UNTEXTURED draws -- the tally read a stale register.
+   The switch stays as a negative control; the counter stays because it is
+   the cheap way to see the composite.
+
+5. RECOMP_DRAW_MIX, the instrument that then did the work: every draw's
+   target, texture, format, combiner words, vertex mode, diffuse source,
+   accepted triangle count, cull and depth state, tallied per report. On
+   the Load screen, per flip: 20 untextured and 5 DXT3 draws through the
+   FIXED-FUNCTION path (vmode 0, no diffuse stream, white current colour),
+   2 programmable DXT3 draws, 1 composite. Every triangle of every one
+   accepted. The DXT3 bytes present in guest RAM. Nothing culled or
+   degenerate (RECOMP_CLIP_AUDIT). And on the visible main menu every draw
+   is programmable.
+
+6. THE PER-DRAW CAPTURE, ARMED BY THE DEFECT (RECOMP_FB_DUMP_DRAW_ON_BLACK):
+   24 consecutive Load-screen draws each leave the render target entirely
+   zero. Not black pixels: NO pixels. (The first arm, at 2 reports, fired
+   on the intro at t=18; six reports is what the Load screen needs.)
+
+7. RECOMP_METAL_FF=0 -- fixed function on the CPU -- still black. The
+   transform was not it.
+
+8. THE GATE SPLIT. Every vanishing draw has depth test AND alpha test on;
+   the only draws that visibly work there, the composites, have both off.
+   RECOMP_METAL_HW_DEPTH_ALWAYS=1: THE SCREEN CAME BACK. One run, one
+   picture, the gate named.
+
+9. THE MECHANISM, from the code and one counter: "resident clears: 12345
+   of 12363 depth/stencil" -- the clears WERE landing, on the wrong copy.
+   Section 0 says the rest.
+
+10. BROWN. With depth fixed the Load screen rendered in scene-ambient
+    brown where xemu draws yellow. The xemu trace for that screen sets
+    lighting on for 25 draws a flip, light diffuse yellow-orange, scene
+    ambient (0.26,0.13,0). Ambient-only is exactly a zero N.L. xemu's
+    fixed-function emitter (hw/xbox/nv2a/pgraph/glsl/vsh-ff.c) forms
+    max(0, dot(tNormal, lightDirection)); ours negated. The unit test
+    (ff_vertex_test.c) had encoded the negation with a +z normal against
+    a -z register; it now points the normal along the register and keeps
+    the same arithmetic.
+
+11. THE CHARACTER SELECT. Two black panels; the log said why in one line:
+    [TEXTURE] rejected=495110, all "partial window clip". Scissor.
+
+
+====================================================================
+2. WHAT I GOT WRONG, AND WHAT CAUGHT IT
+====================================================================
+
+THE FORCE MODES WERE READ AS PROPERTIES OF THE SCREEN. THEY ARE PROPERTIES
+OF THE LAST DRAW THAT COVERS IT. Night 3's mode 1 "TEXTURE0 is black",
+mode 2 "PRIMARY_COLOR is white", mode 3 "every pixel covered" and mode 4
+"coordinates correct" were all measured on the COMPOSITE -- the one draw
+that paints the whole presented frame last -- and said nothing about the
+27 draws before it, which were the ones failing. Every conclusion drawn
+from them about "the inner draws" was unfounded. THE RULE: a
+whole-frame instrument on a composited title measures the composite.
+Per-draw capture is the only way to see the draws under it.
+
+THE FEEDBACK-READ THEORY (section 1 item 4): a tally that reads a latched
+register for draws that do not use it. Caught by the counter it prompted,
+before any fix was attempted -- the switch was built as an opt-in A/B and
+its own counter refuted it in the first run.
+
+THE UNBOUND-DEPTH-CLEAR THEORY, briefly: I first read the refusal counter
+as "the depth clear is refused". It was the colour clears being refused
+and then served by the slot cache; the depth clears were resident and
+wrong. The counters said so once they were read together.
+
+TWO ENGINES AT ONCE, once: I launched a run while the player's window was
+still open. Killed within seconds, no evidence taken from it. Check pgrep
+before every launch; the recipes do not.
+
+
+====================================================================
+3. THE FIXES, EXACTLY
+====================================================================
+
+src/nv2a/nv2a_metal.m  nv2a_metal_clear_depth_stencil()
+  Before the bound-surface path, walk the slots: every valid slot whose
+  depth pointer is the one being cleared, at the same pitch and geometry,
+  and whose depth texture is not the bound one, gets a depth/stencil-only
+  clear pass. Counted as "[METAL] depth clears applied to a sibling slot":
+  12,896 in the player's confirming run. The bound path is unchanged.
+
+src/nv2a/nv2a_ff.c and src/nv2a/nv2a_vsh_msl.c
+  ndotl = max(0, +(n . direction)). Both, so ff_msl_diff_test still holds.
+  diagnostics/jsrf_first_fault/ff_vertex_test.c updated with the reason.
+
+src/nv2a/nv2a_texture_copy.{h,c} and nv2a_metal.m
+  NV2ATextureCopy carries wc_x0/y0/x1/y1, the window clip intersected with
+  the surface clip (inclusive). prepare() refuses only an EMPTY one
+  ("empty window clip"); the exclusive type was already refused with the
+  colour mask. Metal sets an MTLScissorRect per draw (the encoder is
+  shared across a batch); the software rasteriser bounds its triangle
+  loop by the same rectangle. nv2a_texture_copy_window() maps an all-zero
+  rectangle to the whole surface, because the unit tests build states by
+  hand. "[METAL] scissored draws" counts the ones that were smaller.
+
+BUILD 42D71122-11B9-3DCA-9AC0-284BCA42C036 in build-feav and in
+~/jsrf-build/JSRF.app, verified by dwarfdump --uuid. ctest: 110 of 112.
+The two failures are NOT tonight's: jsrf_input_hotplug fails whenever the
+player's PS4 controller is attached and a game is running, and
+jsrf_switch_audit was already 6 over its ratchet at HEAD af983c2 before
+this session (measured in a worktree of HEAD). Tonight's three new
+switches use the helper or the VALUE_CARRYING table and add nothing.
+
+
+====================================================================
+4. THE INSTRUMENTS BUILT
+====================================================================
+
+RECOMP_DRAW_MIX=1            [DRAW-MIX] per report: distinct rows of
+                             (target, tex0, fmt, stage-1, combiner words,
+                             vmode, a0/a3 stream state, current diffuse,
+                             prim, verts, TRIS-ACCEPTED, cull, depth state,
+                             z range, z clear, viewport z, first vertex,
+                             blend), with a nonzero-byte sample of the
+                             texture. THE instrument of the night.
+RECOMP_FB_DUMP_DRAW_ON_BLACK=<reports>
+                             arm RECOMP_FB_DUMP_DRAW off the black-with-
+                             scene condition (all-zero presented frame,
+                             >=10 draws/flip, N consecutive reports). Set
+                             RECOMP_FB_DUMP_DRAW's after-seconds past the
+                             run. Six reports for the Load screen; two
+                             fires on the intro.
+RECOMP_METAL_FEEDBACK_SYNC   opt-in, refuted; its counter "[METAL]
+                             feedback reads" stays (one a flip = the
+                             composite).
+[METAL] scissored draws, [METAL] depth clears applied to a sibling slot.
+
+diagnostics/jsrf_first_fault/runs/  (symlinked from ~/jsrf-build)
+  run-title-surfaces.sh        unattended: FLIPTRACE surface list + census
+  run-loadmenu-feedback.sh     on|off  the refuted A/B, with DRAW-MIX
+  run-loadmenu-draws.sh        DRAW-MIX + CLIP_AUDIT + black-armed capture
+  run-loadmenu-draws-t50.sh    the same, time-armed at 50 s, + FF batch dump
+  run-loadmenu-ff.sh           cpu|gpu  fixed function on the CPU / GPU
+  run-loadmenu-gate.sh         depth|alpha|stencil  the per-fragment gates
+
+scratchpad tooling worth keeping in mind (not committed): an awk that
+tallies the xemu trace per method NUMBER, and drawdiff.py, which diffs
+drawNNN.bmp captures pixel by pixel (nonzero, changed, mean new colour).
+
+
+====================================================================
+5. RECORDED, NOT CHASED
+====================================================================
+
+THE INTRO'S BLACK STRETCH (t=18) is FF draws with d0 white, z near the far
+plane, every one leaving the surface at zero -- captured by accident by
+the first black arm. Very possibly the same depth mechanism (it is a
+static scene too); nobody has looked since the fix.
+
+"NOW LOADING" (G29): xemu's boot phase renders into A8R8G8B8 surfaces of
+1280x480 and 1024x512 and samples them back; our Metal path rejects
+non-16-bit targets outright ("target-format") and the surface cache only
+ever held the three 565 swap-chain surfaces. That is a coverage story of
+its own and nothing tonight touched it.
+
+THE UNTEXTURED FIXED-FUNCTION DRAWS on the Load screen are 3D boxes (28
+vertices each) with material alpha 1.0, 0.5, 0.4 and 0.2 -- the guest's
+translucent shading. With the depth fix they sit where they should.
+
+The GPU FF path is ON for the player: paths.conf line 126 exports
+RECOMP_METAL_FF=1. The source comment still says "Default OFF".
+
+xemu trace field guide, extended: names are NV097_<NAME>[<offset>]; match
+on $5 (method number, lower-case hex, four digits: 0x0210). The
+render-target tallies of night 3 section 8 stand.
+
+
+====================================================================
+6. STATE OF THE TREE
+====================================================================
+
+Branch jsrf/g2-text-clobber-and-the-symbol-layer, HEAD af983c2, WORKING
+TREE MODIFIED AND UNCOMMITTED at the time of writing -- eight files and
+six new recipes, listed by git status. The player was asked whether to
+commit; commit in the order fixes, instruments, recipes, handover.
+
+PRESERVED, all -KEEP, all 21 Sep:
+  172407 / 172916  TITLE-SURFACES      the unattended surface list + census
+  173802           LOADMENU-FEEDBACK-ON   the refuted arm, 1 feedback/flip
+  174058           LOADMENU-FEEDBACK-OFF  DRAW-MIX first light
+  174434           LOADMENU-DRAWS      capture armed on the intro (t=18)
+  174621           LOADMENU-DRAWS      24 Load-screen draws, all zero
+  174933 / 175534 / 180312  LOADMENU-DRAWS  combiner, colour source, tris
+  175949           LOADMENU-FF-CPU     fixed function on the CPU: black
+  180518           LOADMENU-GATE-DEPTH depth ALWAYS: the screen returns
+  181700           LOADMENU-SNAP       depth fix only: yellow is brown
+  183502           LOADMENU-SNAP       + lighting: Load screen correct,
+                                       character select minus two panels
+  184023           LOADMENU-SNAP       + scissor: the player says it works
+
+
+====================================================================
+7. OPEN, IN THE ORDER I WOULD TAKE THEM
+====================================================================
+
+1. COMMIT (see section 6), then RE-READ THE WEEK'S BLACK-SCREEN CLAIMS
+   against the depth mechanism: the intro at t=18, the title overlay's
+   "23 black draws", the map's flat silhouettes, the missing graffiti and
+   the flickering fence are all things a stale depth copy would do to a
+   moving scene. Cheap: run each and look.
+2. GAMEPLAY UNDER THE NEW LIGHT SIGN. The player has seen menus only.
+   Under the old sign, surfaces facing a light were ambient-only; the city
+   will look different. Compare against xemu, not against memory.
+3. "NOW LOADING" and the boot phase: the A8R8G8B8 render targets (G29).
+4. The switch-audit debt (6 hand-rolled reads over the ratchet, all older
+   than tonight) and the hotplug test's dependence on the room.
+5. Everything from night 3's section 10 items 5-7, untouched.
+
+AND THE RULE THIS SESSION PAID FOR: A WHOLE-FRAME PICTURE ON A COMPOSITED
+TITLE IS A PICTURE OF THE COMPOSITE. Three nights of force modes measured
+one draw. The per-draw capture, armed by the defect, found the gate in
+one run, and the gate switch named it in the next.
