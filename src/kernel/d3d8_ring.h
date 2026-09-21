@@ -77,4 +77,39 @@ uint32_t d3d8_ring_field_va(unsigned offset);
 int d3d8_ring_publish_fence(uint32_t fence_word_va, int parser_drained,
                             uint32_t submitted);
 
+/* THE FENCE, WRITTEN WHERE THE HARDWARE WRITES IT.
+ *
+ * D3D_SetFence (0x00191390) emits NV097_BACK_END_WRITE_SEMAPHORE_RELEASE
+ * carrying the CURRENT value of [dev+0x30], and only THEN does [dev+0x30] += 2:
+ *
+ *     001913AD  mov edi, [esi+0x30]        ; the value being issued
+ *     001913B8  mov dword [eax],   0x41d70 ; method 0x1D70, count 1
+ *     001913BE  mov dword [eax+4], edi     ;   payload = that value
+ *     00191420  mov ecx, [esi+0x30] / add ecx,2 / mov [esi+0x30], ecx
+ *
+ * So the hardware invariant is  *fence <= [dev+0x30] - 2 : the semaphore only
+ * ever receives values that have ALREADY been issued, and it can never equal
+ * the counter. Publishing [dev+0x30] itself -- which is what this runtime did
+ * -- is the one value the field cannot hold, and it makes every wait vacuous:
+ *
+ *     0019144C  mov eax,[edi+0x34] / mov ecx,[eax]   ; *fence
+ *     00191451  mov eax,[edi+0x30]                   ; cur
+ *     00191456  sub edx,ecx                          ; edx = cur - *fence
+ *     0019145A  sub ecx,esi                          ; ecx = cur - want
+ *     0019145C  cmp ecx,edx / jae <return>           ; UNSIGNED
+ *
+ * With *fence == cur, edx is 0 and `jae` is taken for every possible `want`.
+ * D3D_BlockOnTime returns immediately, always, and so does every caller:
+ * D3DVertexBuffer_Lock's block via 0x001917B0, and D3D_BlockOnResource.
+ *
+ * Call this as the parser EXECUTES the release packet, with the payload the
+ * packet carries. No unit conversion: the payload is already in [dev+0x30]'s
+ * counter space because D3D_SetFence copied it from there. Returns 1 if the
+ * word was written. */
+int d3d8_ring_fence_release(uint32_t value);
+
+/* How many release packets have been executed. Zero means the case was never
+ * reached -- the positive control for the fallback below, not a statistic. */
+unsigned long d3d8_ring_fence_release_count(void);
+
 #endif /* D3D8_RING_H */

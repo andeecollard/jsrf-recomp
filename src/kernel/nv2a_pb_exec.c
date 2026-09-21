@@ -1,4 +1,5 @@
 #include "nv2a_ff.h"
+#include "d3d8_ring.h"
 #include "../recomp_switch.h"
 /* The accelerated raster path, under one set of names.
  *
@@ -5054,6 +5055,32 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     switch (method) {
+    /* THE GPU'S FENCE WRITE-BACK -- the one method in this stream that tells
+     * the guest work is FINISHED.
+     *
+     * D3D_SetFence (0x00191390) emits this carrying the pre-increment value of
+     * [dev+0x30]; the guest's D3D_BlockOnTime spins on *(*(dev+0x34)) until it
+     * passes. This executor did not decode 0x1D70 at all, so the word was left
+     * to the pump, which published [dev+0x30] verbatim -- a value the hardware
+     * can never deposit, and one that makes the wait's unsigned compare
+     * succeed for every target. Every D3DVertexBuffer_Lock, every
+     * D3D_BlockOnResource, returned instantly.
+     *
+     * Writing it HERE is what makes it honest: this runs on the pusher thread,
+     * in stream order, after the preceding SET_BEGIN_END END dispatch has
+     * already run raster_batch() and copied that draw's vertices out of guest
+     * RAM. So the guest is released exactly when the data is safe, which is
+     * what the hardware semaphore means.
+     *
+     * The other sink handles this too (nv2a_pgraph_d3d11.c), but through
+     * SET_SEMAPHORE_OFFSET, which this title sets to 0 -- it puts the base in
+     * the semaphore DMA object, which nothing here resolves. That path logs
+     * "semaphore offset 0x00000000 not usable" and signals nothing. Going via
+     * [dev+0x34] needs no DMA object: it is the address the guest itself
+     * dereferences. */
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        d3d8_ring_fence_release(param);
+        break;
     case NV097_SET_TRANSFORM_EXECUTION_MODE:
         if (s_vsh_trace.enabled) ++s_vsh_trace.modes;
         s_vsh.mode = param & 3; break;

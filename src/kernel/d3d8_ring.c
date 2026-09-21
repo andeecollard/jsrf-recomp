@@ -167,13 +167,58 @@ uint32_t d3d8_ring_field_va(unsigned offset)
     return dev ? dev + offset : 0;
 }
 
+/* The GPU's own fence write-back. See the header for the disassembly that
+ * fixes the units and for why publishing [dev+0x30] made every wait vacuous. */
+static unsigned long s_releases;
+
+int d3d8_ring_fence_release(uint32_t value)
+{
+    uint32_t fence_ptr_va = d3d8_ring_field_va(D3D8_DEV_FENCE_PTR);
+    uint32_t fence_word_va;
+
+    if (!fence_ptr_va)
+        return 0;
+    /* +0x34 holds a POINTER; the fence word is what it points at. Storing
+     * into the field itself would overwrite the title's own pointer. */
+    fence_word_va = guest_u32(fence_ptr_va);
+    if (!fence_word_va)
+        return 0;
+
+    guest_store_u32(fence_word_va, value);
+    if (++s_releases == 1) {
+        fprintf(stderr, "  [D3D8-RING] GPU fence live: first release value=%u"
+                " at 0x%08X (the pump's fallback is now suppressed)\n",
+                value, fence_word_va);
+        fflush(stderr);
+    }
+    return 1;
+}
+
+unsigned long d3d8_ring_fence_release_count(void) { return s_releases; }
+
 int d3d8_ring_publish_fence(uint32_t fence_word_va, int parser_drained,
                             uint32_t submitted)
 {
-    static unsigned long refused, published, reported;
+    static unsigned long refused, published, reported, suppressed;
 
     if (!fence_word_va)
         return 0;
+
+    /* THE FALLBACK. Once the parser has executed a real release packet the
+     * guest's fence is being driven by the GPU's own write-back, at the right
+     * value and at the right point in the stream, and this pump must stop
+     * overwriting it -- publishing [dev+0x30] here would put the counter back
+     * and make every wait vacuous again.
+     *
+     * Kept, rather than deleted, because it is the only thing that carries a
+     * title whose D3D8 never emits 0x1D70. Which arm a run took is a counter,
+     * not a guess: releases=0 with suppressed=0 means this path is still
+     * live. */
+    if (s_releases) {
+        ++suppressed;
+        return 0;
+    }
+
     if (!parser_drained) {
         /* Not a knob. A pump that reaches here has told the title the ring is
          * free while its own parser is still reading, and the count is how a
@@ -191,8 +236,9 @@ int d3d8_ring_publish_fence(uint32_t fence_word_va, int parser_drained,
     ++published;
     if ((published & 0xFFFFFu) == 0 && reported != published) {
         reported = published;
-        fprintf(stderr, "  [D3D8-RING] fence published=%lu refused=%lu\n",
-                published, refused);
+        fprintf(stderr, "  [D3D8-RING] fence published=%lu refused=%lu"
+                " suppressed=%lu releases=%lu\n",
+                published, refused, suppressed, s_releases);
         fflush(stderr);
     }
     return 1;

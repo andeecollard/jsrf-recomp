@@ -210,6 +210,17 @@ foreach(case fallback cli tsv override missing)
              COMMAND jsrf_d3d8_ring_test ${case})
 endforeach()
 
+# The guest's GPU fence. Until 20 Sep 2026 the pump published [dev+0x30] into
+# the word the title spins on -- the one value the hardware can never deposit --
+# and every D3DVertexBuffer_Lock / D3D_BlockOnResource wait became a no-op.
+# The `arithmetic` case reimplements D3D_BlockOnTime's own unsigned compare, so
+# a regression shows up as "the guest no longer waits", not as a missing write.
+add_executable(jsrf_d3d8_fence_test d3d8_fence_test.c)
+target_link_libraries(jsrf_d3d8_fence_test PRIVATE xbox_kernel)
+foreach(case arithmetic nodevice)
+    add_test(NAME jsrf_d3d8_fence_${case} COMMAND jsrf_d3d8_fence_test ${case})
+endforeach()
+
 add_executable(jsrf_apu_register_test apu_register_test.c)
 target_link_libraries(jsrf_apu_register_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_apu_register COMMAND jsrf_apu_register_test)
@@ -504,7 +515,8 @@ target_link_libraries(jsrf_vsh_msl_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_vsh_msl COMMAND jsrf_vsh_msl_test)
 
 add_executable(jsrf_vsh_render_test vsh_render_test.c
-    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c"
+    "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")
 target_link_libraries(jsrf_vsh_render_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_vsh_render COMMAND jsrf_vsh_render_test)
 
@@ -671,7 +683,8 @@ add_test(NAME jsrf_gen_header_current COMMAND jsrf_gen_header_current_test)
 # both directions, and the four-way armed/looked/found reading checked one
 # process per arm because each gate resolves once.
 add_executable(jsrf_fb_watch_still_test fb_watch_still_test.c
-    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c"
+    "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")
 target_link_libraries(jsrf_fb_watch_still_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_fb_watch_still COMMAND jsrf_fb_watch_still_test)
 
@@ -681,7 +694,8 @@ add_test(NAME jsrf_fb_watch_still COMMAND jsrf_fb_watch_still_test)
 # A/B here before: the ab_score token must be visible in BOTH arms, and the
 # gate must be recomp_switch_on rather than a bare getenv that reads =0 as on.
 add_executable(jsrf_flip_sync_test flip_sync_test.c
-    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c")
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c"
+    "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")
 target_link_libraries(jsrf_flip_sync_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_flip_sync COMMAND jsrf_flip_sync_test)
 
