@@ -1209,6 +1209,35 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME jsrf_pad_schedule
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_LIST_DIR}/test_pad_schedule.py")
+    # The switch-arm half of mid-function entry recovery.
+    #
+    # recover_midfunction_entries.py builds a body for an entry discovery
+    # missed, and regenerate.sh runs it as a mandatory post-pass -- but until
+    # 21 Sep 2026 it only ever looked at STUBS, addresses something statically
+    # calls. An arm reached only through a jump table the lifter could not
+    # place is called by nothing, so it never became a stub and the pass never
+    # saw it. Nothing failed: the pass ran, reported success, and the 445 arm
+    # slots switch_arm_audit.py counts stayed exactly where they were. The
+    # player found it instead, as the first [ITAIL] failure this project has
+    # logged (0x00075EB3, in CreateFullRoboyMenu, on a live session).
+    #
+    # This is the gate on the wire between the arm walk and the recovery. It
+    # checks selection, the ordering that makes a recovered stub body's own
+    # dispatches visible, the dispatch-table registration WITHOUT which the
+    # recovered bodies are unreachable dead code, and -- the part everything
+    # else can pass while being useless -- that the post-pass still calls it.
+    #
+    # Hermetic: a synthetic gen tree and a synthetic image, no XBE and no
+    # capstone, so it does not care which interpreter was found above. Given
+    # a real tree it also asserts the actual address out of the actual log,
+    # and says so when it skips that half. RECOMP_GEN_DIR always points
+    # somewhere; the test decides for itself whether what is there is usable.
+    add_test(NAME jsrf_switch_arm_entries
+             COMMAND "${Python3_EXECUTABLE}" -B
+                     "${CMAKE_CURRENT_LIST_DIR}/test_switch_arm_entries.py"
+                     --gen "${RECOMP_GEN_DIR}")
+    set_tests_properties(jsrf_switch_arm_entries PROPERTIES
+                         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     # A ratchet on the REACHABLE dead-branch count, not on the tree total.
     # A conditional branch that reaches the `_flags` fallback has a constant
     # zero for a condition and can never be taken -- the defect that cost the
