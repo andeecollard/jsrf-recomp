@@ -237,6 +237,105 @@ static LONG win32_priority_to_xbox(int priority)
     }
 }
 
+/* THE EXACT-PRIORITY STORE ON WINDOWS.
+ *
+ * SetThreadPriorityXboxExact / GetThreadPriorityXboxExact live in
+ * src/platform/win32_compat.c, whose entire body -- declarations included --
+ * is inside `#if !defined(_WIN32)`, and which the Windows build does not
+ * compile at all: src/platform/CMakeLists.txt makes `platform` an INTERFACE
+ * library there, because Windows has the real <windows.h>.
+ *
+ * They are not Win32 API, though. They are OURS, added by 4537424 ("The guest
+ * sets base priority 16 and could only ever read back 15"), and the calls
+ * below are unconditional. So on Windows they were implicitly declared and
+ * then had nothing to link against. mingw-w64 reports the first half as an
+ * error; the second half is an unresolved external.
+ *
+ * The POSIX pair keys the exact value off this layer's own w32_object, which
+ * dies with the thread. Windows hands us a real OS handle instead, so the
+ * store is keyed by thread id.
+ *
+ * SAME CONTRACT AS THE POSIX PAIR, deliberately: a handle that cannot be named
+ * is COUNTED AND DROPPED rather than charged to the caller. Answering an
+ * unidentified handle with the caller's priority is the confident wrong answer
+ * that win32_compat.c's own comment records paying for.
+ *
+ * KNOWN LIMITATION, stated rather than discovered later: nothing removes an
+ * entry when a thread exits, so a thread id the OS reuses inherits the old
+ * thread's exact priority. The POSIX side cannot have this because the store
+ * dies with the object. JSRF creates a handful of threads and never churns
+ * them, and a stale entry is a far smaller defect than a platform that does
+ * not link -- but it is a defect, and a title that cycles threads needs the
+ * table keyed on something that retires.
+ *
+ * UNTESTED AT RUNTIME. This was written on macOS and syntax-checked with
+ * x86_64-w64-mingw32-gcc; no Windows session has run it. */
+#if defined(_WIN32)
+
+#define XBOX_EXACT_SLOTS 128
+static SRWLOCK s_exact_lock = SRWLOCK_INIT;
+static struct { DWORD tid; int prio; } s_exact[XBOX_EXACT_SLOTS];
+static unsigned s_exact_n;
+
+/* Counted, not silent -- the same reading win32_compat.c's
+ * g_w32_priority_unnamed carries: nonzero means a guest priority read or write
+ * went nowhere, which is a defect upstream and not normal. */
+unsigned long g_w32_priority_unnamed_win32;
+unsigned long g_w32_exact_table_full;
+
+static DWORD xbox_exact_tid(HANDLE h)
+{
+    /* The pseudo-handle is resolved explicitly rather than relying on
+     * GetThreadId accepting it. */
+    if (h == GetCurrentThread()) return GetCurrentThreadId();
+    if (!h) return 0;
+    return GetThreadId(h);              /* 0 when the handle cannot be named */
+}
+
+void SetThreadPriorityXboxExact(HANDLE h, int xbox_priority)
+{
+    DWORD tid = xbox_exact_tid(h);
+    unsigned i;
+
+    if (!tid) { ++g_w32_priority_unnamed_win32; return; }
+
+    AcquireSRWLockExclusive(&s_exact_lock);
+    for (i = 0; i < s_exact_n; ++i)
+        if (s_exact[i].tid == tid) break;
+    if (i < s_exact_n) {
+        s_exact[i].prio = xbox_priority;
+    } else if (s_exact_n < XBOX_EXACT_SLOTS) {
+        s_exact[s_exact_n].tid  = tid;
+        s_exact[s_exact_n].prio = xbox_priority;
+        ++s_exact_n;
+    } else {
+        ++g_w32_exact_table_full;       /* the value is lost; say so */
+    }
+    ReleaseSRWLockExclusive(&s_exact_lock);
+}
+
+int GetThreadPriorityXboxExact(HANDLE h, int *have)
+{
+    DWORD tid = xbox_exact_tid(h);
+    unsigned i;
+    int value = 0, found = 0;
+
+    if (!tid) {
+        ++g_w32_priority_unnamed_win32;
+        if (have) *have = 0;
+        return 0;
+    }
+    AcquireSRWLockShared(&s_exact_lock);
+    for (i = 0; i < s_exact_n; ++i)
+        if (s_exact[i].tid == tid) { value = s_exact[i].prio; found = 1; break; }
+    ReleaseSRWLockShared(&s_exact_lock);
+
+    if (have) *have = found;
+    return value;
+}
+
+#endif /* _WIN32 */
+
 /* THE ROUND TRIP MUST BE EXACT, and for a long time it was not.
  *
  * xbox_priority_to_win32 collapses the Xbox base priority into one of seven

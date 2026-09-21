@@ -758,6 +758,11 @@ unsigned long g_w32_parked;
  * so "applied" must be a counter and not an assumption. */
 unsigned long g_w32_priority_applied;
 unsigned long g_w32_priority_failed;
+/* Priority calls naming a thread this layer could not identify. Was silently
+ * charged to the CALLING thread until 21 Sep 2026; see the note at
+ * SetThreadPriorityXboxExact. Nonzero here means a guest priority write or
+ * read went nowhere, which is a defect somewhere upstream, not normal. */
+unsigned long g_w32_priority_unnamed;
 
 void w32_thread_trace_report(void)
 {
@@ -768,6 +773,10 @@ void w32_thread_trace_report(void)
             " parked_now=%lu | priority applied=%lu failed=%lu\n",
             g_w32_suspends, g_w32_resumes, g_w32_lost_resumes, g_w32_parked,
             g_w32_priority_applied, g_w32_priority_failed);
+    if (g_w32_priority_unnamed)
+        fprintf(stderr, "  [THREAD] priority calls on an UNIDENTIFIED thread:"
+                        " %lu   <-- dropped, not charged to the caller\n",
+                g_w32_priority_unnamed);
     fflush(stderr);
 }
 
@@ -1060,12 +1069,29 @@ void SetThreadPriorityXboxExact(HANDLE h, int xbox_priority)
         o->xbox_priority_set = 1;
         return;
     }
-    /* Only the calling thread can be meant by a handle with no object behind
-     * it; another thread's value lives in its object. */
-    if (h == PSEUDO_CURRENT_THREAD || !o) {
+    /* A NULL HANDLE IS NOT "ME", and treating it as such wrote one thread's
+     * priority into another's.
+     *
+     * The fallback exists for the process's initial thread: it has no
+     * w32_object, because t_self_obj is set in CreateThread's trampoline, so
+     * PSEUDO_CURRENT_THREAD legitimately arrives here with o == NULL. The old
+     * condition was `h == PSEUDO_CURRENT_THREAD || !o`, and the second arm
+     * also caught a case that means the opposite: kernel_bridge's
+     * bridge_thread_handle_for_token returns NULL for a thread-id token used
+     * from a DIFFERENT thread, and xbox_KeSetBasePriorityThread passes that
+     * NULL straight through. So "set thread B's priority" ran on thread A and
+     * silently stored A's value in A's own slot -- the write was lost and A
+     * was corrupted, with nothing said.
+     *
+     * Only the pseudo-handle means the caller. An unidentified handle is
+     * counted and dropped, because guessing which thread was meant is what
+     * caused the defect. */
+    if (h == PSEUDO_CURRENT_THREAD) {
         t_xbox_priority = xbox_priority;
         t_xbox_priority_set = 1;
+        return;
     }
+    ++g_w32_priority_unnamed;
 }
 
 int GetThreadPriorityXboxExact(HANDLE h, int *have)
@@ -1075,10 +1101,15 @@ int GetThreadPriorityXboxExact(HANDLE h, int *have)
         if (have) *have = 1;
         return o->xbox_priority;
     }
-    if ((h == PSEUDO_CURRENT_THREAD || !o) && t_xbox_priority_set) {
+    /* Same asymmetry as the setter, and worse on this side: answering an
+     * unidentified handle with the CALLER's priority is a confident wrong
+     * answer, and bridge_object_for_token seeds a new guest object from
+     * exactly this call. Report "not known" instead. */
+    if (h == PSEUDO_CURRENT_THREAD && t_xbox_priority_set) {
         if (have) *have = 1;
         return t_xbox_priority;
     }
+    if (h != PSEUDO_CURRENT_THREAD && !o) ++g_w32_priority_unnamed;
     if (have) *have = 0;
     return 0;
 }
