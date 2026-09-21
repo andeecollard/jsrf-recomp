@@ -1274,7 +1274,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
     entry->FileNameLength = name_len;
     {
-        ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
+        /* offsetof, not a member access through a null pointer. The hand-rolled
+     * form is UB and UndefinedBehaviorSanitizer says so outright -- "member
+     * access within null pointer of type struct
+     * _XBOX_FILE_DIRECTORY_INFORMATION". Same number, defined. */
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
         ULONG copied = (ULONG)name_len;
         if (copied > Length - header_size)
             copied = Length - header_size;
@@ -1922,7 +1926,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
     entry->FileNameLength = name_len;
 
-    ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
+    /* offsetof, not a member access through a null pointer. The hand-rolled
+     * form is UB and UndefinedBehaviorSanitizer says so outright -- "member
+     * access within null pointer of type struct
+     * _XBOX_FILE_DIRECTORY_INFORMATION". Same number, defined. */
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
     ULONG copied=(ULONG)name_len;
     if (copied>Length-header_size) copied=Length-header_size;
     if (copied) memcpy(entry->FileName,de->d_name,copied);

@@ -35,14 +35,19 @@ extern ptrdiff_t g_xbox_mem_offset;
  * Use nv2a_regs.h if available; these are fallbacks for standalone use. */
 #include "nv2a_regs.h"
 
-/* All NV097 defines come from nv2a_regs.h above.
- * Supplemental defines not in the register file: */
-#ifndef NV097_SET_BEGIN_END_OP_END
-#define NV097_SET_BEGIN_END_OP_END      0x00
-#endif
-#ifndef NV097_SET_BEGIN_END_OP_TRIANGLES
-#define NV097_SET_BEGIN_END_OP_TRIANGLES 0x04
-#endif
+/* All NV097 defines come from nv2a_regs.h above, INCLUDING THE PRIMITIVE
+ * OPS. There were two #ifndef fallbacks here under the heading "Supplemental
+ * defines not in the register file", and both names are in fact in it:
+ *
+ *     NV097_SET_BEGIN_END_OP_END        0x00   agreed
+ *     NV097_SET_BEGIN_END_OP_TRIANGLES  0x05   the fallback said 0x04
+ *
+ * 0x04 is LINE_STRIP. The fallback never fired -- nv2a_regs.h is included
+ * above it, so the guard was always false -- which is the only reason this
+ * test drew triangles. Reorder the include, or drop the name from the
+ * register file, and it would have quietly drawn a line strip while the
+ * comment beside it said "triangle list". Deleted rather than corrected: a
+ * fallback for a name that is always defined is a landmine with no upside. */
 
 /* Push buffer command encoding */
 #define PB_METHOD_INC(subchannel, method, count) \

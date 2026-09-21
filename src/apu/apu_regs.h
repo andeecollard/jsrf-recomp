@@ -243,7 +243,7 @@
 #       define NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16            1
 #       define NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24            2
 #       define NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32            3
-#   define NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE             (0x3 << 30)
+#   define NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE             (0x3u << 30)
 #       define NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B8          0
 #       define NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16         1
 #       define NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM       2
@@ -251,13 +251,13 @@
 #define NV_PAVS_VOICE_CFG_ENV0                           0x00000008
 #   define NV_PAVS_VOICE_CFG_ENV0_EA_ATTACKRATE             (0xFFF << 0)
 #   define NV_PAVS_VOICE_CFG_ENV0_EA_DELAYTIME              (0xFFF << 12)
-#   define NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE             (0xFF << 24)
+#   define NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE             (0xFFu << 24)
 #define NV_PAVS_VOICE_CFG_ENVA                           0x0000000C
 #   define NV_PAVS_VOICE_CFG_ENVA_EA_DECAYRATE              (0xFFF << 0)
 #   define NV_PAVS_VOICE_CFG_ENVA_EA_HOLDTIME               (0xFFF << 12)
-#   define NV_PAVS_VOICE_CFG_ENVA_EA_SUSTAINLEVEL           (0xFF << 24)
+#   define NV_PAVS_VOICE_CFG_ENVA_EA_SUSTAINLEVEL           (0xFFu << 24)
 #define NV_PAVS_VOICE_CFG_ENV1                           0x00000010
-#   define NV_PAVS_VOICE_CFG_ENV1_EF_FCSCALE                (0xFF << 24)
+#   define NV_PAVS_VOICE_CFG_ENV1_EF_FCSCALE                (0xFFu << 24)
 #define NV_PAVS_VOICE_CFG_ENVF                           0x00000014
 #define NV_PAVS_VOICE_CFG_MISC                           0x00000018
 #   define NV_PAVS_VOICE_CFG_MISC_EF_RELEASERATE            (0xFFF << 0)
@@ -286,7 +286,7 @@
 #      define NV_PAVS_VOICE_PAR_STATE_EFCUR_SUSTAIN             5
 #      define NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE             6
 #      define NV_PAVS_VOICE_PAR_STATE_EFCUR_FORCE_RELEASE       7
-#   define NV_PAVS_VOICE_PAR_STATE_EACUR                    (0xF << 28)
+#   define NV_PAVS_VOICE_PAR_STATE_EACUR                    (0xFu << 28)
 #define NV_PAVS_VOICE_PAR_OFFSET                         0x00000058
 #   define NV_PAVS_VOICE_PAR_OFFSET_CBO                     0x00FFFFFF
 #   define NV_PAVS_VOICE_PAR_OFFSET_EALVL                   0xFF000000

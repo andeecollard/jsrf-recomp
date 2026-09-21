@@ -65,7 +65,7 @@
 #   define NV_PMC_INTR_0_PGRAPH                               (1 << 12)
 #   define NV_PMC_INTR_0_PCRTC                                (1 << 24)
 #   define NV_PMC_INTR_0_PBUS                                 (1 << 28)
-#   define NV_PMC_INTR_0_SOFTWARE                             (1 << 31)
+#   define NV_PMC_INTR_0_SOFTWARE                             (1u << 31)
 #define NV_PMC_INTR_EN_0                                 0x00000140
 #   define NV_PMC_INTR_EN_0_HARDWARE                            1
 #   define NV_PMC_INTR_EN_0_SOFTWARE                            2
@@ -228,7 +228,7 @@
 #   define NV_PGRAPH_CTX_USER_CHANNEL_3D_VALID                  (1 << 4)
 #   define NV_PGRAPH_CTX_USER_SUBCH                           0x0000E000
 #   define NV_PGRAPH_CTX_USER_CHID                            0x1F000000
-#   define NV_PGRAPH_CTX_USER_SINGLE_STEP                      (1 << 31)
+#   define NV_PGRAPH_CTX_USER_SINGLE_STEP                      (1u << 31)
 #define NV_PGRAPH_CTX_SWITCH1                            0x0000014C
 #   define NV_PGRAPH_CTX_SWITCH1_GRCLASS                      0x000000FF
 #   define NV_PGRAPH_CTX_SWITCH1_CHROMA_KEY                    (1 << 12)
@@ -245,7 +245,7 @@
 #   define NV_PGRAPH_CTX_SWITCH1_CONTEXT_ROP                   (1 << 28)
 #   define NV_PGRAPH_CTX_SWITCH1_CONTEXT_BETA1                 (1 << 29)
 #   define NV_PGRAPH_CTX_SWITCH1_CONTEXT_BETA4                 (1 << 30)
-#   define NV_PGRAPH_CTX_SWITCH1_VOLATILE_RESET                (1 << 31)
+#   define NV_PGRAPH_CTX_SWITCH1_VOLATILE_RESET                (1u << 31)
 #define NV_PGRAPH_CTX_SWITCH2                            0x00000150
 #define NV_PGRAPH_CTX_SWITCH3                            0x00000154
 #define NV_PGRAPH_CTX_SWITCH4                            0x00000158
@@ -325,7 +325,7 @@
 #   define NV_PGRAPH_CSV0_C_EMISSION                            (3 << 25)
 #   define NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE                (1 << 27)
 #   define NV_PGRAPH_CSV0_C_LOCALEYE                            (1 << 30)
-#   define NV_PGRAPH_CSV0_C_LIGHTING                            (1 << 31)
+#   define NV_PGRAPH_CSV0_C_LIGHTING                            (1u << 31)
 #define NV_PGRAPH_CSV1_B                                 0x00000FBC
 #define NV_PGRAPH_CSV1_A                                 0x00000FC0
 #   define NV_PGRAPH_CSV1_A_T0_ENABLE                           (1 << 0)
@@ -515,7 +515,7 @@
 #   define NV_PGRAPH_SETUPRASTER_FRONTFACE                      (1 << 23)
 #   define NV_PGRAPH_SETUPRASTER_CULLENABLE                     (1 << 28)
 #   define NV_PGRAPH_SETUPRASTER_Z_FORMAT                       (1 << 29)
-#   define NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE                 (1 << 31)
+#   define NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE                 (1u << 31)
 #define NV_PGRAPH_SHADERCLIPMODE                         0x00001994
 #define NV_PGRAPH_SHADERCTL                              0x00001998
 #define NV_PGRAPH_SHADERPROG                             0x0000199C
@@ -575,7 +575,7 @@
 #   define NV_PGRAPH_TEXFILTER0_ASIGNED                         (1 << 28)
 #   define NV_PGRAPH_TEXFILTER0_RSIGNED                         (1 << 29)
 #   define NV_PGRAPH_TEXFILTER0_GSIGNED                         (1 << 30)
-#   define NV_PGRAPH_TEXFILTER0_BSIGNED                         (1 << 31)
+#   define NV_PGRAPH_TEXFILTER0_BSIGNED                         (1u << 31)
 #define NV_PGRAPH_TEXFILTER1                             0x000019F8
 #define NV_PGRAPH_TEXFILTER2                             0x000019FC
 #define NV_PGRAPH_TEXFILTER3                             0x00001A00
@@ -751,7 +751,7 @@
 #   define NV_PRAMDAC_PLL_TEST_COUNTER_PDIV_RST                (1 << 28)
 #   define NV_PRAMDAC_PLL_TEST_COUNTER_NVPLL_LOCK              (1 << 29)
 #   define NV_PRAMDAC_PLL_TEST_COUNTER_MPLL_LOCK               (1 << 30)
-#   define NV_PRAMDAC_PLL_TEST_COUNTER_VPLL_LOCK               (1 << 31)
+#   define NV_PRAMDAC_PLL_TEST_COUNTER_VPLL_LOCK               (1u << 31)
 #define NV_PRAMDAC_GENERAL_CONTROL                       0x00000600
 #   define NV_PRAMDAC_GENERAL_CONTROL_ALT_MODE_SEL             (1 << 12)
 #define NV_PRAMDAC_FP_VDISPLAY_END                       0x00000800
@@ -1249,7 +1249,7 @@
 #       define NV097_SET_TEXTURE_FILTER_ASIGNED                   (1 << 28)
 #       define NV097_SET_TEXTURE_FILTER_RSIGNED                   (1 << 29)
 #       define NV097_SET_TEXTURE_FILTER_GSIGNED                   (1 << 30)
-#       define NV097_SET_TEXTURE_FILTER_BSIGNED                   (1 << 31)
+#       define NV097_SET_TEXTURE_FILTER_BSIGNED                   (1u << 31)
 #   define NV097_SET_TEXTURE_IMAGE_RECT                       0x00001B1C
 #       define NV097_SET_TEXTURE_IMAGE_RECT_WIDTH                 0xFFFF0000
 #       define NV097_SET_TEXTURE_IMAGE_RECT_HEIGHT                0x0000FFFF

@@ -1899,6 +1899,28 @@ static uint64_t mcpx_apply_write_clear(uint32_t guest_va, uint64_t value,
     return value;
 }
 
+/* THE SIGNAL CONTEXT IS THE KERNEL'S, AND IT IS NOT 16-BYTE ALIGNED.
+ *
+ * UndefinedBehaviorSanitizer's `alignment` check fires on every access through
+ * `uc` here -- 62 reports across the suite on 21 Sep 2026, all from this one
+ * function. macOS declares `ucontext_t` with a 16-byte requirement because of
+ * the NEON state it reaches, and hands the handler a frame on the interrupted
+ * thread's stack that is 8-byte aligned. We do not choose that address: there
+ * is no sigaltstack here and no SA_ONSTACK, so it is entirely the kernel's.
+ * The members actually read are pointers and 64-bit words at their own natural
+ * alignment, which arm64 loads fine.
+ *
+ * Suppressed ON THIS FUNCTION ONLY, rather than with an environment variable
+ * or a build-wide flag, because the value of a sanitizer run is that anything
+ * it prints is worth reading -- and 62 lines of known-benign noise is how a
+ * real finding gets scrolled past. Everything else in the suite is clean under
+ * -fsanitize=address,undefined as of 21 Sep 2026; see the progress note for
+ * the two real ones this run did find. */
+#if defined(__has_attribute)
+#  if __has_attribute(no_sanitize)
+__attribute__((no_sanitize("alignment")))
+#  endif
+#endif
 static void mcpx_trap_handler(int sig, siginfo_t *si, void *context)
 {
     ucontext_t *uc = (ucontext_t *)context;
