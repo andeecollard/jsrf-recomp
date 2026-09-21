@@ -24,15 +24,34 @@ import os
 import subprocess
 import sys
 
-# A cached .pyc is invalidated on source mtime AND size, so an edit changing
-# neither is imported stale -- which happened to this very test on 21 Sep 2026
-# and made it report a mismatch that had already been reverted. The drift
-# check must read what is on disk.
-sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+DECODER = os.path.join(HERE, "state_trace_diff.py")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from state_trace_diff import anchor_fields  # noqa: E402
+def load_anchor_fields():
+    """Compile state_trace_diff.py from source, every time.
+
+    NOT `import state_trace_diff`. A cached .pyc is invalidated on source
+    mtime AND size, so an edit that changes neither is imported stale -- and
+    that happened to THIS test on 21 Sep 2026: reverting a one-character
+    perturbation (0x1F back to 0x0F) kept both, Python served the cached
+    bytecode, and the drift check went on reporting a mismatch that had
+    already been fixed.
+
+    `-B` and PYTHONDONTWRITEBYTECODE were the first attempt and are not
+    enough: they stop this run WRITING bytecode, not READING what an earlier
+    run left behind. Reading the file and compiling it takes the cache out of
+    the path altogether, which is the only version of this that cannot be
+    fooled by a same-size same-second edit.
+
+    __name__ is set to something other than "__main__" so the module's own
+    command-line entry point does not run on import.
+    """
+    with open(DECODER) as f:
+        src = f.read()
+    ns = {"__name__": "state_trace_diff_under_test", "__file__": DECODER}
+    exec(compile(src, DECODER, "exec"), ns)
+    return ns["anchor_fields"]
 
 
 def main():
@@ -51,6 +70,7 @@ def main():
         print("the C oracle produced no vectors", file=sys.stderr)
         return 1
 
+    anchor_fields = load_anchor_fields()
     failures = 0
     for line in out:
         parts = line.split(" ", 2)

@@ -61,6 +61,26 @@ def sq_transitions(rows, frames):
     return out
 
 
+def classify_ic_gap(A, B, frames):
+    """Phase noise or a real step? The sign is what tells them apart."""
+    gaps = [A[f]["ic"] - B[f]["ic"] for f in frames]
+    if not gaps:
+        return
+    neg, pos = min(gaps), max(gaps)
+    zeros = sum(1 for g in gaps if g == 0)
+    crosses = neg < 0 < pos
+    print("  indirect-call gap shape: range %d..%d, %d frame(s) at exactly 0"
+          % (neg, pos, zeros))
+    if crosses or zeros:
+        print("    crosses zero -- SAMPLING PHASE, not a divergence. A"
+              " thread-global counter read at frame boundaries cannot be"
+              " compared frame to frame; do not chase the first differing"
+              " frame.")
+    else:
+        print("    never crosses zero -- a persistent offset, which IS worth"
+              " investigating: one run made calls the other did not.")
+
+
 def report_transitions(A, B, frames):
     """Separate a uniform time shift from divergent control flow.
 
@@ -178,6 +198,7 @@ def main():
         return 2
     print("  frames compared: %d (f%d..f%d)" % (len(common), common[0], common[-1]))
     report_transitions(A, B, common)
+    classify_ic_gap(A, B, common)
     print()
 
     first = {}
@@ -189,6 +210,25 @@ def main():
         if k in first:
             fr = first[k]
             extra = ""
+            if k == "ic":
+                # "first differs at f1" is NOT a divergence, and reporting it
+                # like one sent an investigation after it on 21 Sep 2026.
+                #
+                # g_icall_count is a SINGLE GLOBAL with no thread-local
+                # qualifier, incremented by every guest thread (five were live
+                # in these runs) and sampled on the presenting thread at each
+                # frame boundary. It is never reset, so a frame's value is
+                # "every indirect call any thread has made since process
+                # start, as of whenever this thread looked". Two runs sampling
+                # at slightly different points in the same work produce a
+                # different number without anything having taken a different
+                # path.
+                #
+                # The frame it FIRST differs on is therefore meaningless. What
+                # carries information is the SHAPE of the gap, below: one that
+                # changes sign or returns to zero is phase, and one that steps
+                # once and stays is a candidate.
+                extra = "  [thread-global, sampled -- see the gap shape]"
             if k == "a":
                 what = anchor_fields(A[fr][k], B[fr][k])
                 if what:

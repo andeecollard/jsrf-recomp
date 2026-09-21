@@ -1054,12 +1054,11 @@ if(Python3_Interpreter_FOUND)
     # against it, so the C side is made the oracle and the Python decoder is
     # checked against vectors it emits. Two readers of one definition, with no
     # way to make one import the other, is how the jump-table detector drifted.
-    # -B, and it is not cosmetic. Python invalidates a cached .pyc on source
-    # mtime AND size; an edit that changes neither is imported stale. Caught
-    # here for real on 21 Sep 2026 -- reverting a one-character perturbation
-    # (0x1F back to 0x0F) kept both, and this test went on reporting the
-    # mismatch it had already been fixed for. That is the same-second-mtime
-    # trap this project has already paid for once with a stale binary.
+    # The stale-bytecode defence is IN THE TEST, which compiles
+    # state_trace_diff.py from source rather than importing it. -B here only
+    # stops this run leaving a .pyc behind for someone else; it does NOT stop
+    # a stale one being read, which was the actual failure on 21 Sep 2026 and
+    # which the first version of this fix did not address.
     add_test(NAME jsrf_anchor_decode_python
              COMMAND "${Python3_EXECUTABLE}" -B
                      "${CMAKE_CURRENT_LIST_DIR}/test_anchor_decode_matches_c.py"
