@@ -16,6 +16,7 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
+#include "../recomp_switch.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -1004,10 +1005,11 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 static int thread_priority_apply_on(void)
 {
     static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_THREAD_PRIORITY");
-        on = e && e[0] == '1';
-    }
+    /* A THIRD GRAMMAR, retired. This read accepted only the literal "1", so
+     * RECOMP_THREAD_PRIORITY=on and =yes -- which turn every other switch in
+     * this tree on -- silently took the control arm here. The A/B above was
+     * run on a switch nobody could be sure they had set. */
+    if (on < 0) on = recomp_switch_on("RECOMP_THREAD_PRIORITY");
     return on;
 }
 

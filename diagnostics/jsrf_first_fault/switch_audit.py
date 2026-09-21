@@ -165,6 +165,29 @@ VALUE_CARRYING = {
     # still means on, so recomp_switch_on() still decides that; the number is
     # read separately.
     "RECOMP_FONT_TRACE",
+    # The glyph dump's five knobs. RECOMP_GLYPH_DUMP is a CAP -- how many
+    # glyph draws to write out -- not a boolean, because the defect is text
+    # that renders wrong and a run that dumps every glyph in a menu fills a
+    # disk before the interesting one arrives. The other four say when to
+    # start (seconds), how many queued dumps to allow, which texture id to
+    # follow (hex), and where to write the texture. recomp_switch_on() returns
+    # int and can express none of them.
+    "RECOMP_GLYPH_DUMP",
+    "RECOMP_GLYPH_DUMP_AFTER",
+    "RECOMP_GLYPH_DUMP_MAXQ",
+    "RECOMP_GLYPH_DUMP_TEX",
+    "RECOMP_GLYPH_DUMP_TEXFILE",
+    # How many surface slots the Metal backend keeps. A count: 95020c0 is the
+    # commit where raising it rendered black, because eviction is the
+    # writeback, so the number is the experiment and a boolean would delete it.
+    "RECOMP_METAL_SURFACE_SLOTS",
+    # The analogue stick dead zone, as a number. Zero is a meaningful setting
+    # -- it is the arm that asks whether the dead zone is what is eating small
+    # stick deflections -- so presence is the right test and "0" must not mean
+    # "unset".
+    "RECOMP_PAD_DEADZONE",
+    # Which USB port to attach the pad to. A port number, and port 0 exists.
+    "RECOMP_USB_PORT",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

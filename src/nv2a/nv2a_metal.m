@@ -4445,7 +4445,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     *
     * Costs a drain and a read-back, so it is behind its own switch and off
     * unless asked for. */
-   if(getenv("RECOMP_GLYPH_GPU_DIFF")){
+   if(recomp_switch_on("RECOMP_GLYPH_GPU_DIFF")){
     int found=0;
     for(unsigned i=0;i<surface_slots_used();i++){
      if(!surf_slot[i].target) continue;

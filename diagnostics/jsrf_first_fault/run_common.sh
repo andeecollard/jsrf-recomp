@@ -105,13 +105,53 @@ jsrf_binary_sources() {
       | grep -vE '_test\.(c|m)$' | grep -v ' 2\.c$'
 }
 
+# WHICH OF THOSE THIS PLATFORM ACTUALLY COMPILES.
+#
+# The same false positive as the *_test.c one above, from a different cause:
+# src/d3d/d3d8_*.c and nv2a_d3d11.c are inside `if(WIN32)` in their
+# CMakeLists, so on macOS they are not compiled into anything. Editing
+# d3d8_combiners.c -- which is where the Windows combiner bug lives -- refused
+# every macOS run, for a file that is provably not in the binary.
+#
+# Asked of the BUILD rather than of a hardcoded list, so it stays true when
+# the platform split moves: a source the build compiled has an object named
+# after it. Headers are always counted, because a header can reach anything
+# and has no object of its own.
+#
+# If the build tree has no objects at all -- a layout this has not seen -- the
+# set is empty and every source is counted, which is the old behaviour. A
+# guard that fails open is worse than one that fires too often.
+jsrf_built_objects() {
+    find "${BIN%/*}" \( -name '*.c.o' -o -name '*.m.o' \) 2>/dev/null \
+      | sed 's|.*/||'
+}
+
 jsrf_require_current_binary() {
     if [ ! -x "$BIN" ]; then
         echo "no binary at $BIN" >&2
         echo "  build it:  cmake --build ${BIN%/*} -j 8" >&2
         exit 1
     fi
-    NEWER=$(jsrf_binary_sources | while read -r f; do [ "$f" -nt "$BIN" ] && echo "$f"; done | head -5)
+    OBJS=$(jsrf_built_objects)
+    NEWER=$(jsrf_binary_sources | while read -r f; do
+        [ "$f" -nt "$BIN" ] || continue
+        # The patterns carry a LEADING '(' so their ')' is balanced. This
+        # case sits inside $( ), and an unbalanced ')' in a pattern closes the
+        # command substitution early -- `syntax error near unexpected token
+        # ;;', pointing at a line that is fine. POSIX allows the open paren
+        # exactly for this.
+        case "$f" in
+        (*.h)
+            echo "$f"
+            ;;
+        (*)
+            if [ -z "$OBJS" ] ||
+               printf '%s\n' "$OBJS" | grep -qxF "$(basename "$f").o"; then
+                echo "$f"
+            fi
+            ;;
+        esac
+    done | head -5)
     if [ -n "$NEWER" ]; then
         echo "REFUSING: $BIN is older than these sources -- you would be measuring the previous build:" >&2
         echo "$NEWER" | sed 's/^/    /' >&2
