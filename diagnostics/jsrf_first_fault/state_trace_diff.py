@@ -61,24 +61,63 @@ def sq_transitions(rows, frames):
     return out
 
 
-def classify_ic_gap(A, B, frames):
-    """Phase noise or a real step? The sign is what tells them apart."""
-    gaps = [A[f]["ic"] - B[f]["ic"] for f in frames]
+def classify_gap(A, B, frames, key, label):
+    """Transient phase, a deterministic prefix, or a real step?
+
+    "First differs at fN" is the wrong question for a counter that is sampled
+    rather than checkpointed, and asking it sent an investigation after a -1
+    on frame 1 (see ic below). Three things actually carry information:
+
+      how long the two runs agree EXACTLY from the start -- a long prefix
+      means the counter is deterministic over that phase and a difference
+      inside it would be real;
+
+      whether differences are TRANSIENT (return to zero) or persistent -- a
+      counter read while another thread is mid-work differs for one sample
+      and reconciles;
+
+      whether the gap ever crosses zero, which no accumulating divergence
+      does.
+
+    Measured 21 Sep 2026 on two runs of one build, and the two counters could
+    not be less alike. ic differs on frame 1, crosses zero, swings over
+    340,000 and touches zero exactly once: it is a single global with no
+    thread-local qualifier, incremented by every guest thread and read on the
+    presenting thread, so it has no deterministic phase at all. dr agrees
+    EXACTLY for 656 frames, takes one isolated -1, agrees again, and holds
+    exact agreement over 2,235 frames before the state-12-to-13 load pulls the
+    runs apart. Treating those the same would throw away a real signal.
+    """
+    gaps = [A[f][key] - B[f][key] for f in frames]
     if not gaps:
         return
-    neg, pos = min(gaps), max(gaps)
+    prefix = 0
+    for g in gaps:
+        if g:
+            break
+        prefix += 1
     zeros = sum(1 for g in gaps if g == 0)
-    crosses = neg < 0 < pos
-    print("  indirect-call gap shape: range %d..%d, %d frame(s) at exactly 0"
-          % (neg, pos, zeros))
-    if crosses or zeros:
-        print("    crosses zero -- SAMPLING PHASE, not a divergence. A"
-              " thread-global counter read at frame boundaries cannot be"
-              " compared frame to frame; do not chase the first differing"
-              " frame.")
+    lastzero = None
+    for f, g in zip(frames, gaps):
+        if g == 0:
+            lastzero = f
+    neg, pos = min(gaps), max(gaps)
+    print("  %s gap: range %d..%d, exact for the first %d frame(s),"
+          " %d frame(s) at zero%s"
+          % (label, neg, pos, prefix, zeros,
+             ", last at f%d" % lastzero if lastzero else ""))
+    if prefix >= len(gaps):
+        print("    identical throughout -- deterministic over this whole run")
+    elif prefix > 1:
+        print("    DETERMINISTIC for f1..f%d, so a difference inside that"
+              " prefix would be real; after it, compare with care"
+              % frames[prefix - 1])
+    elif neg < 0 < pos or (lastzero and lastzero > frames[0]):
+        print("    differs from the start and reconciles later -- sampled,"
+              " not checkpointed; the first differing frame means nothing")
     else:
-        print("    never crosses zero -- a persistent offset, which IS worth"
-              " investigating: one run made calls the other did not.")
+        print("    never returns to zero -- a persistent offset, which IS"
+              " worth investigating")
 
 
 def report_transitions(A, B, frames):
@@ -198,7 +237,8 @@ def main():
         return 2
     print("  frames compared: %d (f%d..f%d)" % (len(common), common[0], common[-1]))
     report_transitions(A, B, common)
-    classify_ic_gap(A, B, common)
+    classify_gap(A, B, common, "ic", "indirect-call")
+    classify_gap(A, B, common, "dr", "hw-draw")
     print()
 
     first = {}
@@ -229,6 +269,8 @@ def main():
                 # changes sign or returns to zero is phase, and one that steps
                 # once and stays is a candidate.
                 extra = "  [thread-global, sampled -- see the gap shape]"
+            if k == "dr":
+                extra = "  [see the gap shape: exact for a long prefix]"
             if k == "a":
                 what = anchor_fields(A[fr][k], B[fr][k])
                 if what:
