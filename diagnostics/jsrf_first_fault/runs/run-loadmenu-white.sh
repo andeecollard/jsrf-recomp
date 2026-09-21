@@ -21,10 +21,18 @@
 # reach the Load screen in one run and 50 s in the next, so any fixed second is
 # either early enough to blind the menu or late enough to miss the window.
 #
-# So this arms on RECOMP_FRAG_FORCE_ON_BLACK instead: the force holds off until
-# the PRESENTED frame has been entirely black for N consecutive reports. A menu
-# is never all-zero and the defect is 33-35 seconds of it, so the trigger
-# cannot fire early and cannot be missed. It latches once armed.
+# So this arms on RECOMP_FRAG_FORCE_ON_BLACK instead. AND BLACK ALONE IS NOT
+# THE CONDITION -- the first version of that fired at t=18 in a real run,
+# nowhere near the Load screen, because somebody who has not pressed START yet
+# sits through black transitions. The Load screen is not "black": it is black
+# WHILE THE GUEST IS STILL SUBMITTING A WHOLE SCENE, 28 draw calls a frame,
+# every frame. So the arm requires N consecutive reports that are both
+# all-zero and above 10 draws per flip. The boot black that fooled the first
+# version drew nothing at all -- it stayed black for four reports AFTER
+# arming, which is what gave it away. It latches once armed.
+#
+# Every report prints [FRAG-ARM] with the arm's own inputs beside its
+# decision, so a run that does not arm says why.
 #
 # DRIVE IT: title -> START -> main menu -> LOAD. Then sit still. The screen
 # goes black, the force arms itself about three seconds later, and the next
@@ -63,6 +71,8 @@ echo "=== did the run reach the Load screen? (black reports) ==="
 grep -ac 'nonzero=0/307200' "$LOG"
 echo "=== DID THE FORCE ARM? (if not, the experiment never ran) ==="
 grep -a 'FRAG-FORCE' "$LOG"
+echo "=== what the arm was looking at, around the decision ==="
+grep -a '\[FRAG-ARM\]' "$LOG" | tail -12
 echo "=== snapshot freshness -- both must be 0 ==="
 grep -ac 'SAME FRAME AS THE LAST DUMP' "$LOG"
 grep -ac 'NOTHING PUBLISHED' "$LOG"

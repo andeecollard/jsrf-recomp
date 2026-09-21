@@ -6150,19 +6150,59 @@ void nv2a_pb_exec_report(void)
      * already prints the number this reads, so the log shows the arm's own
      * input beside its decision. */
     {
+        /* BLACK ALONE IS NOT THE CONDITION, AND THAT WAS MEASURED THE HARD
+         * WAY. The first version armed on N consecutive all-zero reports and
+         * fired at t=18 in a player-driven run, long before the Load screen:
+         * a person who has not pressed START yet sits through black
+         * transitions, and this run had five reports of them. Across two
+         * clean runs the boot's own black stretches are 1, 1, 1 and 2 reports
+         * -- but that is how long they happen to be when somebody is driving
+         * briskly, not a bound on anything.
+         *
+         * THE LOAD SCREEN IS NOT "BLACK". IT IS BLACK WHILE THE GUEST IS
+         * STILL SUBMITTING A WHOLE SCENE -- 28 draw calls a frame, every
+         * frame, which is the evening handover's own signature for it, and
+         * the thing that tells it apart from the other black screen, where
+         * the guest had stopped submitting and the rate was 1.0. A boot
+         * transition that draws nothing can no longer arm this.
+         *
+         * Differenced per window and divided by the flips between, because a
+         * cumulative total and a per-flip rate are different instruments and
+         * this file has been wrong about that before. s_snap_seq counts
+         * copies actually performed, so it is flips that carried a frame. */
         static long on_black = -1;
         static unsigned black_reports;
+        static uint32_t last_draws;
+        static unsigned long last_seq;
         if (on_black < 0) {
             const char *e = getenv("RECOMP_FRAG_FORCE_ON_BLACK");
             on_black = (e && *e) ? strtol(e, NULL, 10) : 0;
         }
         if (on_black > 0) {
-            if (snapshot_nonzero() == 0) {
-                if (++black_reports == (unsigned)on_black)
+            unsigned long dseq = s_snap_seq - last_seq;
+            uint32_t ddraws = s_gpu.draws - last_draws;
+            /* 28 on the Load screen, 1.0 where the guest stopped submitting.
+             * Ten is not near either of them. */
+            double per_flip = dseq ? (double)ddraws / (double)dseq : 0.0;
+            int submitting = per_flip >= 10.0;
+            int black = snapshot_nonzero() == 0;
+            last_seq = s_snap_seq;
+            last_draws = s_gpu.draws;
+
+            if (black && submitting) {
+                ++black_reports;
+                if (black_reports == (unsigned)on_black)
                     nv2a_metal_frag_force_arm();
             } else {
                 black_reports = 0;
             }
+            /* The arm's own inputs, beside its decision. The run that armed
+             * early printed nothing but the fact that it had. */
+            fprintf(stderr, "  [FRAG-ARM] black=%s draws/flip=%.1f (%u over %lu"
+                    " flips) -> %s, run=%u/%ld\n",
+                    black ? "yes" : "no", per_flip, ddraws, dseq,
+                    (black && submitting) ? "counting" : "reset",
+                    black_reports, on_black);
         }
     }
     frame_stats_report();
