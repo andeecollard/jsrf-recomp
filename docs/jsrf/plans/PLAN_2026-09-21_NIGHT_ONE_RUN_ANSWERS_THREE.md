@@ -354,8 +354,25 @@ audio defect has a cause and this bisect is measuring a symptom.
     nothing back. 0a is designed around this and the design is not optional.
   - **The decompilation names, it does not explain.** Its own source is under
     1% matched. A name is a lead, not a mechanism.
-  - `[PB-ACK] already=` reads ~0 by design now and is NOT a health signal. It
-    has misled this project once already, for this reason.
+  - **`[PB-ACK] already=` is DEAD, not merely small, and the pusher-rate
+    figure has now been wrong twice.** Both measured 21 Sep on the
+    post-`5358eec` binary, 124 s of gameplay, 89 samples:
+
+    | claim | where | truth on this binary |
+    |---|---|---|
+    | "GET moves about four times a second" | `main.c`, original | median **64,631 loops/s** |
+    | "stale by ~30x; 6,810-6,932 loops/s" | 20 Sep correction | also stale, **~9x low** |
+    | "`already` reads ~0" | 21 Sep handover | **frozen at 27,838, never incremented once** |
+
+    The 20 Sep figure was taken before the guest ever blocked; making it wait
+    where the hardware says it should gave this thread roughly nine times the
+    CPU. `already` counts `MEM32(getp) == fence_counter`, which `5358eec` made
+    impossible -- its 27,838 accumulated during boot before the release path
+    went live, and it has not moved since. Read `acked` (99.21% of 10,286,519)
+    and `not-consumed`. If `already` ever climbs again, the fence regressed.
+
+    **The general rule this keeps paying for:** a rate written into a comment
+    is true of one binary. Date it or do not write it.
   - `clobber.py` scoring 0 means "the clobber is fixed", never "the text is
     fixed". Step 6 exists because it is blind here.
   - Preserve `RECOMP_FB_DUMP` output before the next run; every run overwrites

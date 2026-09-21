@@ -1399,15 +1399,36 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
          * instants. Self-gating and a no-op unless RECOMP_OBJECT_DUMP_AT is
          * set. */
         jsrf_object_dump();
-        /* Why the guest gets so few grants.
+        /* The rate this loop actually runs at, and why the old answer here
+         * was wrong twice over.
          *
          * The title's pushbuffer reserve spins until GET catches up with PUT,
-         * and this line is the only thing that moves GET. Measured, it moves
-         * about four times a second, against the hundreds a frame needs -- so
-         * either this loop barely runs, or it runs and takes an early exit.
-         * Those need opposite fixes, and only the counts tell them apart:
-         * `loops` is the thread's own rate, and each `no_*` is one reason the
-         * acknowledgement did not happen. */
+         * and this line is the only thing that moves GET. This comment used to
+         * say it moved "about four times a second, against the hundreds a
+         * frame needs", and posed a dilemma: either the loop barely runs, or
+         * it runs and takes an early exit.
+         *
+         * NEITHER. Measured 21 Sep 2026 on the post-5358eec binary, 124 s of
+         * gameplay, 89 samples: a MEDIAN OF 64,631 loops/s (min 4,930 while
+         * loading, max 75,064), and of 10,286,519 iterations 99.21% reached
+         * `acked`. The loop is not starved and it is not bailing out. Anything
+         * reasoning from pusher lag is reasoning from a dead fact.
+         *
+         * AND THE 20 SEP CORRECTION IS ALSO STALE. That measurement -- 6,810
+         * to 6,932 loops/s -- was taken before the fence fix, when the guest
+         * never blocked. Making it wait where the hardware says it should wait
+         * gave this thread roughly nine times the CPU. A number here is only
+         * ever true of one binary; date it or do not write it.
+         *
+         * `already` IS DEAD, NOT MERELY SMALL. It counts MEM32(getp) ==
+         * fence_counter, and the whole point of 5358eec is that the fence word
+         * is now driven by the GPU's own release packet to counter-2 or lower,
+         * so that equality can no longer happen. In this run it read 27,838 at
+         * the first report -- accumulated during boot, before the release path
+         * went live -- and then did not increment once in 124 seconds. It is
+         * not a health signal, it is a fossil, and it has already misled this
+         * project once. Read `acked` and `not-consumed`; if `already` ever
+         * climbs again, the fence has regressed. */
         {
             static unsigned long loops, no_dev, no_consume, already, acked;
             static DWORD last;
