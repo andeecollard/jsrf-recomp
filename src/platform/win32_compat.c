@@ -313,6 +313,18 @@ typedef struct w32_object {
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
+    /* THE XBOX VALUE, VERBATIM.
+     *
+     * `priority` above is one of seven Win32 buckets, and the Xbox kernel's
+     * base priority is a full integer. Quantising to a bucket and converting
+     * back loses everything outside {-15,-2,-1,0,1,2,15}: a guest that sets 16
+     * reads 15. JSRF sets 16 and polls until the query agrees, which it never
+     * does -- 64.5 MILLION iterations of
+     * ObReferenceObjectByHandle/KeQueryBasePriorityThread/ObfDereferenceObject
+     * in the 21 Sep cutscene hang. The bucket is for the HOST scheduler; this
+     * is what the guest must read back. */
+    int             xbox_priority;
+    int             xbox_priority_set;
     int             priority_boost_disabled;
     PAPCFUNC        apc_func[W32_MAX_APC];
     ULONG_PTR       apc_data[W32_MAX_APC];
@@ -1025,6 +1037,51 @@ static void w32_apply_thread_priority(w32_object *o, int priority)
     (void)o; (void)priority;
 }
 #endif
+
+/* The guest's own base-priority value, stored and returned without
+ * quantisation. SetThreadPriority still runs for the host scheduler; these two
+ * exist so the round trip is exact, which is the whole defect.
+ *
+ * THE THREAD-LOCAL FALLBACK IS NOT OPTIONAL, for the same reason
+ * priority_boost_disabled has one a few lines below: a thread this layer did
+ * not create has no w32_object, because t_self_obj is set in CreateThread's
+ * trampoline. Without it the initial thread stores nothing, reads back the
+ * bucket, and the save-restore contract this pair exists to keep is broken on
+ * exactly the thread most likely to be asked. The first version of this had no
+ * fallback and its own test read 0 for every value. */
+static __thread int t_xbox_priority;
+static __thread int t_xbox_priority_set;
+
+void SetThreadPriorityXboxExact(HANDLE h, int xbox_priority)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (o && o->kind == K_THREAD) {
+        o->xbox_priority = xbox_priority;
+        o->xbox_priority_set = 1;
+        return;
+    }
+    /* Only the calling thread can be meant by a handle with no object behind
+     * it; another thread's value lives in its object. */
+    if (h == PSEUDO_CURRENT_THREAD || !o) {
+        t_xbox_priority = xbox_priority;
+        t_xbox_priority_set = 1;
+    }
+}
+
+int GetThreadPriorityXboxExact(HANDLE h, int *have)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (o && o->kind == K_THREAD && o->xbox_priority_set) {
+        if (have) *have = 1;
+        return o->xbox_priority;
+    }
+    if ((h == PSEUDO_CURRENT_THREAD || !o) && t_xbox_priority_set) {
+        if (have) *have = 1;
+        return t_xbox_priority;
+    }
+    if (have) *have = 0;
+    return 0;
+}
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {

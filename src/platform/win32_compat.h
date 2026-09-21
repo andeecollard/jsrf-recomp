@@ -42,6 +42,9 @@ extern "C" {
 void w32_thread_suspend_point(void);
 #define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000u
 
+void SetThreadPriorityXboxExact(HANDLE h, int xbox_priority);
+int  GetThreadPriorityXboxExact(HANDLE h, int *have);
+
 #define THREAD_PRIORITY_IDLE          (-15)
 #define THREAD_PRIORITY_LOWEST        (-2)
 #define THREAD_PRIORITY_BELOW_NORMAL  (-1)

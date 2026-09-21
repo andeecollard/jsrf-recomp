@@ -227,6 +227,12 @@ add_test(NAME jsrf_anchor COMMAND jsrf_anchor_test)
 # The graffiti shader's combiner program. A refused draw renders nothing; a
 # wrongly-shaded one renders something plausible and wrong, so this asserts
 # both that the program is accepted AND that the gate can still refuse.
+# The guest sets base priority 16 and polls until the query agrees. Bucketing
+# made that impossible and cost a 64.5-million-iteration spin.
+add_executable(jsrf_thread_priority_roundtrip_test thread_priority_roundtrip_test.c)
+target_link_libraries(jsrf_thread_priority_roundtrip_test PRIVATE xbox_kernel)
+add_test(NAME jsrf_thread_priority_roundtrip COMMAND jsrf_thread_priority_roundtrip_test)
+
 add_executable(jsrf_combiner_graffiti_test combiner_graffiti_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")

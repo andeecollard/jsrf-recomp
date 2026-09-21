@@ -237,16 +237,37 @@ static LONG win32_priority_to_xbox(int priority)
     }
 }
 
+/* THE ROUND TRIP MUST BE EXACT, and for a long time it was not.
+ *
+ * xbox_priority_to_win32 collapses the Xbox base priority into one of seven
+ * Win32 buckets, and win32_priority_to_xbox expands a bucket back to one
+ * representative value. Everything outside {-15,-2,-1,0,1,2,15} does not
+ * survive: set 16, read 15.
+ *
+ * JSRF sets 16. Measured 21 Sep 2026 from the scheduler trace --
+ * `KeSetBasePriority ... ra=0x00147CF8 extra=0x00000010` -- with ra inside
+ * XAPI's SetThreadPriority. Something then polls until the query agrees, and
+ * it never can: the per-thread ordinal histogram shows 64,522,063 /
+ * 64,522,064 / 64,517,185 calls to ObReferenceObjectByHandle,
+ * ObfDereferenceObject and KeQueryBasePriorityThread on ONE thread during a
+ * cutscene hang -- a three-call cycle run 64.5 million times.
+ *
+ * The bucket is still what the host scheduler is told, because a bucket is
+ * all it can use. The exact value is stored beside it and is what the guest
+ * reads back. */
 LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
 {
     HANDLE hThread = (HANDLE)Thread;
     LONG previous;
+    int have_exact = 0;
+    LONG prev_exact = (LONG)GetThreadPriorityXboxExact(hThread, &have_exact);
 
     /* Get previous priority before setting new one */
     int prev_win32 = GetThreadPriority(hThread);
-    previous = win32_priority_to_xbox(prev_win32);
+    previous = have_exact ? prev_exact : win32_priority_to_xbox(prev_win32);
 
     int new_win32 = xbox_priority_to_win32(Increment);
+    SetThreadPriorityXboxExact(hThread, (int)Increment);
     SetThreadPriority(hThread, new_win32);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,
@@ -259,8 +280,13 @@ LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
 LONG __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread)
 {
     HANDLE hThread = (HANDLE)Thread;
-    int win32_priority = GetThreadPriority(hThread);
-    return win32_priority_to_xbox(win32_priority);
+    int have_exact = 0;
+    int exact = GetThreadPriorityXboxExact(hThread, &have_exact);
+    /* The exact value when this thread's priority was ever set through the
+     * Xbox path; the bucket only for a thread that never was, where there is
+     * nothing exact to remember. */
+    if (have_exact) return (LONG)exact;
+    return win32_priority_to_xbox(GetThreadPriority(hThread));
 }
 
 /* ============================================================================
