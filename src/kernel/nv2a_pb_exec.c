@@ -1,6 +1,7 @@
 #include "nv2a_ff.h"
 #include "d3d8_ring.h"
 #include "../recomp_switch.h"
+#include "frame_pool.h"
 /* The accelerated raster path, under one set of names.
  *
  * macOS reaches it through Metal and Windows through D3D11. The two backends
@@ -1628,6 +1629,17 @@ static int no_flip_sync_on(void)
 static unsigned long long g_flip_syncs_taken;
 static unsigned long long g_flip_syncs_skipped;
 
+/* THE PRODUCER'S VIEW of the frame it published last, and the pool the frame
+ * actually lives in. The bare pointers below are read by code that runs on the
+ * PUSHER THREAD only -- fb_watch() and the flip trace, both called from the
+ * FLIP_STALL handler a few lines after the copy -- and they stay valid because
+ * the producer holds a reference to that frame until it publishes the next
+ * one. Anything reading from ANOTHER thread goes through
+ * frame_pool_acquire/release instead; see frame_pool.h for what the single
+ * shared buffer they replace was doing wrong. */
+static FramePool s_snap_pool = FRAME_POOL_INIT;
+static const FramePoolSlot *s_snap_held;   /* the producer's own reference */
+
 static uint8_t *s_snap;             /* the last completed frame, packed */
 static uint32_t s_snap_w, s_snap_h, s_snap_bpp;
 static int s_snap_wanted;
@@ -1688,28 +1700,49 @@ static void snapshot_surface(void)
     if (!mem)
         return;
 
-    if (s_snap_w != s_gpu.clip_w || s_snap_h != s_gpu.clip_h || s_snap_bpp != b) {
-        uint8_t *n = (uint8_t *)realloc(s_snap,
-                                        (size_t)s_gpu.clip_w * s_gpu.clip_h * b);
-        if (!n)
-            return;
-        s_snap = n;
-        s_snap_w = s_gpu.clip_w;
-        s_snap_h = s_gpu.clip_h;
-        s_snap_bpp = b;
-    }
-    for (y = 0; y < s_snap_h; y++)
-        memcpy(s_snap + (size_t)y * s_snap_w * b,
-               mem + s_gpu.color_offset
-                   + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch
-                   + (size_t)s_gpu.clip_x * b,
-               (size_t)s_snap_w * b);
+    {
+        const uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h;
+        /* Into a slot NOBODY IS READING. The buffer this replaces was
+         * realloc'd here while the presenter was memcpy'ing out of it. */
+        FramePoolSlot *f = frame_pool_begin(&s_snap_pool, w, h, b);
+        if (!f)
+            return;                 /* every slot spoken for; pool counts it */
 
-    /* Last, so both are true only of a copy that completed. Every early
-     * return above leaves the sequence where it was, which is how a reader
-     * tells "a new frame arrived" from "the old one is still sitting here". */
-    s_snap_offset = s_gpu.color_offset;
-    ++s_snap_seq;
+        {
+            unsigned long long _t_snap = pb_now_us();
+            for (y = 0; y < h; y++)
+                memcpy(f->px + (size_t)y * w * b,
+                       mem + s_gpu.color_offset
+                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch
+                           + (size_t)s_gpu.clip_x * b,
+                       (size_t)w * b);
+            pb_stage_add(PB_STAGE_SNAP, _t_snap);
+        }
+
+        /* Pixels, size, surface and sequence become visible TOGETHER, so a
+         * reader can never pair one frame's width with another's height.
+         * Every early return above leaves the published frame where it was,
+         * which is how a reader still tells "a new frame arrived" from "the
+         * old one is still sitting here". */
+        frame_pool_publish(&s_snap_pool, f, w, h, b, s_gpu.color_offset);
+
+        /* Hold it on the producer's behalf, and only then drop the frame
+         * before it: fb_watch() runs next, on this thread, off the pointers
+         * below. */
+        {
+            const FramePoolSlot *prev = s_snap_held;
+            s_snap_held = frame_pool_acquire(&s_snap_pool);
+            if (prev) frame_pool_release(&s_snap_pool, prev);
+        }
+        if (s_snap_held) {
+            s_snap        = s_snap_held->px;
+            s_snap_w      = s_snap_held->w;
+            s_snap_h      = s_snap_held->h;
+            s_snap_bpp    = s_snap_held->bpp;
+            s_snap_offset = s_snap_held->offset;
+            s_snap_seq    = s_snap_held->seq;
+        }
+    }
 }
 
 const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
@@ -1736,13 +1769,28 @@ const void *nv2a_pb_exec_surface(uint32_t *w, uint32_t *h,
      * moving under either. */
     {
         static int live = -1;
+        /* ONE HELD FRAME PER CALLING THREAD, swapped here.
+         *
+         * This entry point returns a pointer and has no release call, and its
+         * callers -- the GL presenter's hook and the Win32 window thread --
+         * use the pixels after it returns. Giving them the producer's live
+         * buffer is what let a frame be realloc'd and rewritten underneath
+         * them. Asking for the next frame is what gives the last one back, so
+         * the contract is unchanged for the caller: the pointer stays valid
+         * until that same thread calls again. */
+        static FRAME_POOL_TLS const FramePoolSlot *t_held;
+        const FramePoolSlot *f;
+
         if (live < 0) live = recomp_switch_on("RECOMP_FB_LIVE");
-        if (!live && s_snap && s_snap_w && s_snap_h) {
-            if (w) *w = s_snap_w;
-            if (h) *h = s_snap_h;
-            if (pitch) *pitch = s_snap_w * s_snap_bpp;   /* the copy is packed */
-            if (bpp) *bpp = s_snap_bpp;
-            return s_snap;
+        if (!live) {
+            f = frame_pool_reacquire(&s_snap_pool, &t_held);
+            if (f && f->px && f->w && f->h) {
+                if (w) *w = f->w;
+                if (h) *h = f->h;
+                if (pitch) *pitch = f->w * f->bpp;  /* the copy is packed */
+                if (bpp) *bpp = f->bpp;
+                return f->px;
+            }
         }
     }
 
@@ -2547,10 +2595,13 @@ static void write_bmp(const char *tag, unsigned seq,
  * RECOMP_FB_DUMP by design. */
 int nv2a_pb_exec_snapshot_to_file(const char *path)
 {
-    if (!s_snap || !s_snap_w || !s_snap_h)
-        return 0;
-    return write_bmp_path(path, s_snap, s_snap_w * s_snap_bpp, 0, 0,
-                          s_snap_w, s_snap_h, s_snap_bpp);
+    const FramePoolSlot *f = frame_pool_acquire(&s_snap_pool);
+    int ok = 0;
+    if (f && f->px && f->w && f->h)
+        ok = write_bmp_path(path, f->px, f->w * f->bpp, 0, 0,
+                            f->w, f->h, f->bpp);
+    frame_pool_release(&s_snap_pool, f);
+    return ok;
 }
 
 /* The surface as it stands right now, wherever the guest last pointed it. */
@@ -2583,31 +2634,41 @@ static void dump_surface_bmp(const char *tag, unsigned seq)
  * parser finishes its bounded step, which can carry it into the next frame's
  * clear and can even re-point color_offset at another surface. This dumps the
  * copy, which is the only thing the display path reads. */
+/* ACQUIRES, because this one has two callers on two threads: fb_watch() on the
+ * pusher, and nv2a_pb_exec_dump_surface() on the report timer. The second was
+ * reading the producer's buffer while the producer was filling it. */
 static void dump_snapshot_bmp(const char *tag, unsigned seq)
 {
-    if (!s_snap || !s_snap_w || !s_snap_h)
-        return;
-    write_bmp(tag, seq, s_snap, s_snap_w * s_snap_bpp, 0, 0,
-              s_snap_w, s_snap_h, s_snap_bpp);
+    const FramePoolSlot *f = frame_pool_acquire(&s_snap_pool);
+    if (f && f->px && f->w && f->h)
+        write_bmp(tag, seq, f->px, f->w * f->bpp, 0, 0, f->w, f->h, f->bpp);
+    frame_pool_release(&s_snap_pool, f);
 }
 
 /* Non-black pixels in the presented copy. "Blank" is the whole question at the
  * flip, and a number answers it in the log without opening a file. */
-static uint32_t snapshot_nonzero(void)
+static uint32_t snapshot_nonzero_of(const FramePoolSlot *f)
 {
     uint32_t n = 0, i, count;
 
-    if (!s_snap || !s_snap_w || !s_snap_h)
+    if (!f || !f->px || !f->w || !f->h)
         return 0;
-    count = s_snap_w * s_snap_h;
-    if (s_snap_bpp == 2) {
-        const uint16_t *p = (const uint16_t *)s_snap;
+    count = f->w * f->h;
+    if (f->bpp == 2) {
+        const uint16_t *p = (const uint16_t *)f->px;
         for (i = 0; i < count; i++) if (p[i]) n++;
-    } else if (s_snap_bpp == 4) {
-        const uint32_t *p = (const uint32_t *)s_snap;
+    } else if (f->bpp == 4) {
+        const uint32_t *p = (const uint32_t *)f->px;
         for (i = 0; i < count; i++) if (p[i] & 0x00FFFFFFu) n++;
     }
     return n;
+}
+
+/* The producer's own frame. Only correct on the pusher thread; every other
+ * caller acquires. */
+static uint32_t snapshot_nonzero(void)
+{
+    return snapshot_nonzero_of(s_snap_held);
 }
 
 /* Whoever owns the ring lends its recent-method dump.
@@ -5564,9 +5625,10 @@ uint32_t nv2a_pb_exec_triangles(void)
  * being composed rather than the one being shown. */
 int nv2a_pb_exec_snapshot_nonzero(void)
 {
-    if (!s_snap || !s_snap_w || !s_snap_h)
-        return -1;
-    return (int)snapshot_nonzero();
+    const FramePoolSlot *f = frame_pool_acquire(&s_snap_pool);
+    int n = (f && f->px && f->w && f->h) ? (int)snapshot_nonzero_of(f) : -1;
+    frame_pool_release(&s_snap_pool, f);
+    return n;
 }
 
 uint32_t nv2a_pb_exec_surface_va(void)
@@ -5586,6 +5648,37 @@ void nv2a_pb_exec_report(void)
             " back. With it OFF, taken IS what the other arm would skip.\n",
             g_flip_syncs_taken, g_flip_syncs_skipped,
             no_flip_sync_on() ? "on" : "OFF");
+    /* AND WHERE THE COST OF THAT SENTENCE IS ACTUALLY MEASURED, because the
+     * count above is not a cost and has been read as one. Four numbers, four
+     * different lines, and only the sum of them is what direct GPU
+     * presentation would be traded against:
+     *
+     *   drain     [METAL] ... ms draining the GPU      stays either way
+     *   readback  [METAL] ... ms reading back          removed
+     *   snap      [STAGE] snap=                        removed
+     *   convert   [PRESENT] convert/upload             removed
+     *
+     * no_flip_sync=1 is NOT that trade. It removes the drain and the readback
+     * and leaves the presenter reading whatever guest RAM holds, which is the
+     * previous frame or half of one -- its own comment at no_flip_sync_on()
+     * says so. It is an upper bound on the saving, not a fix. */
+    /* AND WHETHER THE PRESENTED FRAME IS THE ONE THAT WAS JUST DRAWN. A
+     * publish with no free slot keeps the PREVIOUS frame on screen, which
+     * looks exactly like a title that drew nothing -- the reading this file
+     * has already had to retire once. Zero is the expected value and it is
+     * also the positive control for `publishes`. */
+    {
+        unsigned long pub = s_snap_pool.publishes, drp = s_snap_pool.dropped;
+        if (pub || drp)
+            fprintf(stderr, "[FLIP-SNAP] %lu frames published, %lu DROPPED"
+                    " for want of a free slot%s (%d slots)\n", pub, drp,
+                    drp ? "   <-- the presenter showed the previous frame"
+                        : "", FRAME_POOL_SLOTS);
+    }
+    fprintf(stderr, "[FLIP-SYNC]   cost of it: [METAL] drain + readback,"
+                    " [STAGE] snap, [PRESENT] convert + upload.  Four lines,"
+                    " and no_flip_sync=1 is an upper bound on the saving,"
+                    " not a candidate fix -- it presents stale guest RAM.\n");
     if (s_vsh_trace.enabled) {
         fprintf(stderr, "[VSH-TRACE] upload words by subchannel:");
         for (int i = 0; i < 8; ++i)

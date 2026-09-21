@@ -927,6 +927,17 @@ add_executable(jsrf_frame_hist_test frame_hist_test.c)
 target_include_directories(jsrf_frame_hist_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel)
 add_test(NAME jsrf_frame_hist COMMAND jsrf_frame_hist_test)
 
+# THE FLIP SNAPSHOT'S PUBLICATION. One buffer, written by the pusher and read
+# by the presenter, the BMP dumper and the blank-frame counter -- and realloc'd
+# under all three when the surface geometry changed. The header is free-standing
+# so the invariant can be tested with no device and no game: a producer running
+# flat out against three readers, every frame checked for pixels from more than
+# one publish. The single-buffer version fails this in well under a second.
+add_executable(jsrf_frame_pool_test frame_pool_test.c)
+find_package(Threads REQUIRED)
+target_link_libraries(jsrf_frame_pool_test PRIVATE Threads::Threads)
+add_test(NAME jsrf_frame_pool COMMAND jsrf_frame_pool_test)
+
 add_test(NAME jsrf_switch_audit
          COMMAND ${CMAKE_COMMAND} -E env python3
                  ${CMAKE_CURRENT_SOURCE_DIR}/switch_audit.py
