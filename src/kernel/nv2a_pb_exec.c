@@ -1350,6 +1350,129 @@ static void contig_verify(const char *what, uint32_t address, size_t bytes)
     fflush(stderr);
 }
 
+/* WHAT EACH DRAW TARGETS AND SAMPLES, TALLIED PER REPORT WINDOW. RECOMP_DRAW_MIX.
+ *
+ * The xemu Load-screen trace, per flip: 19 draws that bind the render target
+ * as TEXTURE0 while rendering into it, 8 with DXT3 art, 2 composites into a
+ * back buffer. Our side counted ONE draw a flip sampling the surface it
+ * renders into (21 Sep 2026, LOADMENU-FEEDBACK-ON). Either our guest does
+ * not issue the other eighteen with that texture, or they resolve to another
+ * address. This is the same tally taken on our stream: raw target and
+ * texture payloads beside the resolved addresses, so a DMA-base difference
+ * shows as a mismatch between the two columns. Rows reset every report. */
+static int s_draw_dump_black_armed;   /* RECOMP_FB_DUMP_DRAW_ON_BLACK, see the report */
+#define DRAW_MIX_ROWS 48
+static struct { uint32_t tgt, tex, fmt, tex_addr, tgt_addr, untex, blend, mask, tex1, fmt1, icw0, icw1, icw2, ncomb, vmode, a3size, a3type, a0size, cull, front_cw, depth_test, alpha_test, prim, depth_func, depth_write, z_cull, zclear, vp_off_z, vp_scale_z; float cur3[4], v0[4], z_lo, z_hi; unsigned n, verts; long tris; size_t tex_nz, tex_n; }
+    s_draw_mix[DRAW_MIX_ROWS];
+static unsigned s_draw_mix_rows, s_draw_mix_overflow;
+static int s_draw_mix_last = -1;   /* the row the draw in flight belongs to */
+static void draw_mix_note(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_DRAW_MIX");
+    if (!on) return;
+    const NV2ATextureCopy *c = &s_copy.state;
+    uint32_t tgt = c->target_offset, tex = c->untextured ? 0 : c->texture_offset;
+    uint32_t fmt = c->untextured ? 0 : s_methods[NV097_SET_TEXTURE_FORMAT / 4];
+    uint32_t blend = c->blend ? (c->blend_src << 16 | c->blend_dst) : 0;
+    /* Stage 1 and the combiner, because the Load screen's config multiplies
+     * by TEXTURE1 in its second stage and the shader reads an unbound stage
+     * as zero. Which texture, in which format, under which program, is the
+     * whole question for a draw that comes out black. */
+    uint32_t mask = c->texture_mask;
+    uint32_t tex1 = (mask & 2) ? s_methods[(0x1B40) / 4] : 0;
+    uint32_t fmt1 = (mask & 2) ? s_methods[(0x1B44) / 4] : 0;
+    uint32_t icw0 = c->combiner_count > 0 ? c->color_icw[0] : 0;
+    uint32_t icw1 = c->combiner_count > 1 ? c->color_icw[1] : 0;
+    uint32_t icw2 = c->combiner_count > 2 ? c->color_icw[2] : 0;
+    /* Where PRIMARY_COLOR comes from: the vertex mode (0 = fixed function,
+     * else the program start slot), whether attribute 3 (diffuse) is read
+     * from a stream at all, and the 'current' register it falls back to when
+     * it is not. A UI quad drawn with no diffuse stream takes its colour
+     * from that register; if we hold zero there the quad is transparent. */
+    uint32_t vmode = s_vsh.mode, a3size = s_gpu.attr[3].size, a3type = s_gpu.attr[3].type;
+    uint32_t a0size = s_gpu.attr[0].size;
+    uint32_t cull = c->cull_face, front_cw = c->front_cw, depth_test = c->depth_test, alpha_test = c->alpha_test;
+    uint32_t depth_func = c->depth_func, depth_write = c->depth_write, z_cull = c->z_cull;
+    uint32_t zclear = s_methods[0x1D8C / 4], vp_off_z = s_methods[0x0A28 / 4], vp_scale_z = s_methods[0x0AF8 / 4];
+    unsigned i;
+    s_draw_mix_last = -1;
+    for (i = 0; i < s_draw_mix_rows; i++)
+        if (s_draw_mix[i].tgt == tgt && s_draw_mix[i].tex == tex
+                && s_draw_mix[i].vmode == vmode && s_draw_mix[i].a3size == a3size
+                && s_draw_mix[i].cull == cull && s_draw_mix[i].front_cw == front_cw
+                && s_draw_mix[i].depth_test == depth_test && s_draw_mix[i].alpha_test == alpha_test
+                && s_draw_mix[i].prim == s_gpu.prim
+                && s_draw_mix[i].depth_func == depth_func && s_draw_mix[i].depth_write == depth_write
+                && s_draw_mix[i].z_cull == z_cull && s_draw_mix[i].zclear == zclear
+                && s_draw_mix[i].vp_off_z == vp_off_z && s_draw_mix[i].vp_scale_z == vp_scale_z
+                && s_draw_mix[i].z_lo == c->z_clip_min && s_draw_mix[i].z_hi == c->z_clip_max
+                && s_draw_mix[i].fmt == fmt && s_draw_mix[i].untex == c->untextured
+                && s_draw_mix[i].blend == blend && s_draw_mix[i].mask == mask
+                && s_draw_mix[i].tex1 == tex1 && s_draw_mix[i].fmt1 == fmt1
+                && s_draw_mix[i].icw0 == icw0 && s_draw_mix[i].icw1 == icw1
+                && s_draw_mix[i].icw2 == icw2 && s_draw_mix[i].ncomb == c->combiner_count)
+            { s_draw_mix[i].n++; s_draw_mix[i].verts += s_gpu.idx_count; s_draw_mix_last = (int)i; return; }
+    if (s_draw_mix_rows >= DRAW_MIX_ROWS) { s_draw_mix_overflow++; return; }
+    s_draw_mix[i].tgt = tgt; s_draw_mix[i].tex = tex; s_draw_mix[i].fmt = fmt;
+    s_draw_mix[i].tex_addr = s_copy.texture_address; s_draw_mix[i].tgt_addr = s_copy.target_address;
+    s_draw_mix[i].untex = c->untextured; s_draw_mix[i].blend = blend; s_draw_mix[i].n = 1;
+    s_draw_mix[i].mask = mask; s_draw_mix[i].tex1 = tex1; s_draw_mix[i].fmt1 = fmt1;
+    s_draw_mix[i].vmode = vmode; s_draw_mix[i].a3size = a3size; s_draw_mix[i].a3type = a3type; s_draw_mix[i].a0size = a0size;
+    s_draw_mix[i].cull = cull; s_draw_mix[i].front_cw = front_cw; s_draw_mix[i].depth_test = depth_test; s_draw_mix[i].alpha_test = alpha_test;
+    s_draw_mix[i].prim = s_gpu.prim; s_draw_mix[i].verts = s_gpu.idx_count; s_draw_mix[i].tris = 0;
+    s_draw_mix[i].depth_func = depth_func; s_draw_mix[i].depth_write = depth_write; s_draw_mix[i].z_cull = z_cull;
+    s_draw_mix[i].zclear = zclear; s_draw_mix[i].vp_off_z = vp_off_z; s_draw_mix[i].vp_scale_z = vp_scale_z;
+    s_draw_mix[i].z_lo = c->z_clip_min; s_draw_mix[i].z_hi = c->z_clip_max;
+    /* The first vertex as the backend receives it: screen x,y and w on the
+     * CPU-transformed paths, object space when a GPU program will run. */
+    memcpy(s_draw_mix[i].v0, s_outputs[0][0], sizeof s_draw_mix[i].v0);
+    s_draw_mix_last = (int)i;
+    memcpy(s_draw_mix[i].cur3, s_vsh.current[3], sizeof s_draw_mix[i].cur3);
+    s_draw_mix[i].icw0 = icw0; s_draw_mix[i].icw1 = icw1; s_draw_mix[i].icw2 = icw2; s_draw_mix[i].ncomb = c->combiner_count;
+    /* Are the bytes we hand the sampler anything at all? A texture that is
+     * all zero in guest RAM decodes to transparent black in every format
+     * this backend accepts, and no shader test can tell that from a decode
+     * fault. Sampled once per row, capped, at the row's first draw. */
+    s_draw_mix[i].tex_nz = s_draw_mix[i].tex_n = 0;
+    if (!c->untextured && s_copy.texture) {
+        size_t k, n = s_copy.texture_bytes < 262144 ? s_copy.texture_bytes : 262144, nz = 0;
+        for (k = 0; k < n; k++) if (s_copy.texture[k]) nz++;
+        s_draw_mix[i].tex_nz = nz; s_draw_mix[i].tex_n = n;
+    }
+    s_draw_mix_rows++;
+}
+static void draw_mix_result(int triangles)
+{
+    if (s_draw_mix_last >= 0 && s_draw_mix_last < (int)s_draw_mix_rows)
+        s_draw_mix[s_draw_mix_last].tris += triangles < 0 ? 0 : triangles;
+}
+static void draw_mix_report(void)
+{
+    unsigned i;
+    if (!s_draw_mix_rows) return;
+    fprintf(stderr, "[DRAW-MIX] %u distinct (target, tex0, fmt, blend) rows this window%s\n",
+            s_draw_mix_rows, s_draw_mix_overflow ? " (OVERFLOWED)" : "");
+    for (i = 0; i < s_draw_mix_rows; i++)
+        fprintf(stderr, "[DRAW-MIX]   %6u  target %08X (addr %08X)  tex0 %08X (addr %08X) fmt %08X%s tex-nonzero=%zu/%zu  mask %X tex1 %08X fmt1 %08X  comb %u icw %08X %08X %08X  vmode %u a0size %u a3 type %u size %u cur3=(%g %g %g %g)  prim %u verts %u TRIS-ACCEPTED %ld cull %X cw %u ztest %u zfunc %X zwrite %u zcull %u zrange %g..%g zclear %08X vpz off %08X scale %08X atest %u v0=(%g %g %g %g)  blend %08X%s\n",
+                s_draw_mix[i].n, s_draw_mix[i].tgt, s_draw_mix[i].tgt_addr,
+                s_draw_mix[i].tex, s_draw_mix[i].tex_addr, s_draw_mix[i].fmt,
+                s_draw_mix[i].untex ? " UNTEXTURED" : "",
+                s_draw_mix[i].tex_nz, s_draw_mix[i].tex_n,
+                s_draw_mix[i].mask, s_draw_mix[i].tex1, s_draw_mix[i].fmt1,
+                s_draw_mix[i].ncomb, s_draw_mix[i].icw0, s_draw_mix[i].icw1, s_draw_mix[i].icw2,
+                s_draw_mix[i].vmode, s_draw_mix[i].a0size, s_draw_mix[i].a3type, s_draw_mix[i].a3size,
+                s_draw_mix[i].cur3[0], s_draw_mix[i].cur3[1], s_draw_mix[i].cur3[2], s_draw_mix[i].cur3[3],
+                s_draw_mix[i].prim, s_draw_mix[i].verts, s_draw_mix[i].tris, s_draw_mix[i].cull, s_draw_mix[i].front_cw, s_draw_mix[i].depth_test,
+                s_draw_mix[i].depth_func, s_draw_mix[i].depth_write, s_draw_mix[i].z_cull, s_draw_mix[i].z_lo, s_draw_mix[i].z_hi, s_draw_mix[i].zclear, s_draw_mix[i].vp_off_z, s_draw_mix[i].vp_scale_z,
+                s_draw_mix[i].alpha_test,
+                s_draw_mix[i].v0[0], s_draw_mix[i].v0[1], s_draw_mix[i].v0[2], s_draw_mix[i].v0[3],
+                s_draw_mix[i].blend,
+                (!s_draw_mix[i].untex && s_draw_mix[i].tex_addr == s_draw_mix[i].tgt_addr)
+                    ? "  <<< SAMPLES ITS OWN TARGET" : "");
+    s_draw_mix_rows = 0; s_draw_mix_overflow = 0;
+}
+
 static const char *prepare_texture_copy(void)
 {
     s_copy.active = 0;
@@ -4936,11 +5059,13 @@ static void raster_batch(void)
         if (trace_fallbacks < 0)
             trace_fallbacks = getenv("RECOMP_GPU_FALLBACK_TRACE")
                 || getenv("RECOMP_METAL_FALLBACK_TRACE") ? 1 : 0;
+        draw_mix_note();
         unsigned long long _t_sub = pb_now_us();
         int triangles=nv2a_gpu_draw(&s_copy.state,s_copy.texture,s_copy.texture_bytes,
             s_copy.target,s_copy.target_bytes,s_copy.depth,s_copy.depth_bytes,
             s_outputs,s_gpu.idx_count,s_gpu.prim);
         pb_stage_add(PB_STAGE_SUBMIT, _t_sub);
+        draw_mix_result(triangles);
         if(triangles>=0) {
             static unsigned reported;
             s_gpu.tris_drawn+=(unsigned)triangles;
@@ -5058,7 +5183,7 @@ batch_complete:
             if (!(draw_after > 0.0)) draw_after = 0.0;
         }
         if (stride > 0 && dump_on && captured < 24
-                && xbox_TraceSeconds() >= draw_after
+                && (xbox_TraceSeconds() >= draw_after || s_draw_dump_black_armed)
                 && (batches++ % (unsigned long)stride) == 0) {
             fprintf(stderr, "  [DRAW-CAP] %u at batch %u, t=%.2f,"
                     " %u triangles\n",
@@ -6170,15 +6295,23 @@ void nv2a_pb_exec_report(void)
          * cumulative total and a per-flip rate are different instruments and
          * this file has been wrong about that before. s_snap_seq counts
          * copies actually performed, so it is flips that carried a frame. */
-        static long on_black = -1;
+        static long on_black = -1, dump_on_black;
         static unsigned black_reports;
         static uint32_t last_draws;
         static unsigned long last_seq;
         if (on_black < 0) {
             const char *e = getenv("RECOMP_FRAG_FORCE_ON_BLACK");
             on_black = (e && *e) ? strtol(e, NULL, 10) : 0;
+            /* RECOMP_FB_DUMP_DRAW_ON_BLACK=<reports>: the same arm, but what
+             * it starts is the per-draw capture (RECOMP_FB_DUMP_DRAW, whose
+             * after-seconds field should then be set past the run's end).
+             * The Load screen arrives at t=30 in one run and t=50 in the
+             * next, so a wall-clock start lands its 24 slots on the wrong
+             * screen; the defect itself is the only reliable trigger. */
+            e = getenv("RECOMP_FB_DUMP_DRAW_ON_BLACK");
+            dump_on_black = (e && *e) ? strtol(e, NULL, 10) : 0;
         }
-        if (on_black > 0) {
+        if (on_black > 0 || dump_on_black > 0) {
             unsigned long dseq = s_snap_seq - last_seq;
             uint32_t ddraws = s_gpu.draws - last_draws;
             /* 28 on the Load screen, 1.0 where the guest stopped submitting.
@@ -6191,8 +6324,14 @@ void nv2a_pb_exec_report(void)
 
             if (black && submitting) {
                 ++black_reports;
-                if (black_reports == (unsigned)on_black)
+                if (on_black > 0 && black_reports == (unsigned)on_black)
                     nv2a_metal_frag_force_arm();
+                if (dump_on_black > 0 && black_reports == (unsigned)dump_on_black
+                        && !s_draw_dump_black_armed) {
+                    s_draw_dump_black_armed = 1;
+                    fprintf(stderr, "  [DRAW-CAP] ARMED by the black condition"
+                                    " at t=%.2f\n", trace_seconds());
+                }
             } else {
                 black_reports = 0;
             }
@@ -6208,6 +6347,7 @@ void nv2a_pb_exec_report(void)
     frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     nv2a_texture_copy_census();
+    draw_mix_report();
     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)
         fprintf(stderr,"[TEXTURE]   %llu  %s\n",(unsigned long long)s_texture_reasons[i].count,s_texture_reasons[i].reason);
     if (s_combiner_count) {

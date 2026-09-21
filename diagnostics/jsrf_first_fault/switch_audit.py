@@ -102,6 +102,12 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    # How many consecutive reports of "all-zero presented frame with a scene
+    # still being submitted" arm the per-draw capture. A count, not a
+    # boolean: the boot's own black stretches armed it at 2 (t=18, on the
+    # intro) and the Load screen needed 6. Its sibling
+    # RECOMP_FRAG_FORCE_ON_BLACK carries the same count for the same reason.
+    "RECOMP_FB_DUMP_DRAW_ON_BLACK",
     # Megabytes of free space to claim on the emulated data partition, in
     # place of measuring it. Forcing it low makes JSRF put up its save-check
     # dialog at boot -- which is the cheapest reproduction of the glyph
