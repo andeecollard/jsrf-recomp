@@ -34,8 +34,15 @@
 # DRIVE IT: title -> START -> main menu -> LOAD -> SIT STILL for ~20 s.
 set -u
 
-MODE="${1:?usage: run-loadmenu-frag.sh <1|2|3|4> [black-reports]}"
+MODE="${1:?usage: run-loadmenu-frag.sh <1|2|3|4> [black-reports] [vsh]}"
 BLACK="${2:-3}"
+# The third argument picks the VERTEX arm: 1 (default) runs the guest's vertex
+# programs on the GPU, 0 runs them through the CPU interpreter. That is not a
+# performance knob here, it is the A/B -- the census can only see oT0 at all on
+# the CPU arm, because with the programs on the GPU s_outputs carries their
+# INPUTS. If a coordinate defect appears on one arm and not the other, the
+# vertex path is where it lives.
+VSH="${3:-1}"
 SUPPORT="$HOME/Library/Application Support/JSRF"
 APP="$HOME/jsrf-build/JSRF.app"
 STAMP=$(date +%Y-%m-%d_%H%M%S)
@@ -46,7 +53,8 @@ DUMP="$HOME/jsrf-build/fbdump-${STAMP}-LOADMENU-FRAG${MODE}-KEEP"
 : "${JSRF_HDD_ROOT:=$SUPPORT/hdd}"
 mkdir -p "$HOME/jsrf-build/preserved-logs" "$DUMP"
 
-echo "  mode: $MODE   arms after $BLACK black reports at >=10 draws/flip"
+echo "  mode: $MODE   vsh arm: $VSH ($([ "$VSH" = 0 ] && echo 'CPU interpreter' || echo 'GPU'))"
+echo "  arms after $BLACK black reports at >=10 draws/flip"
 echo "  log:  $LOG"
 echo "  dump: $DUMP"
 echo
@@ -58,6 +66,7 @@ RECOMP_GAME_DIR="$JSRF_GAME_DIR" \
 RECOMP_HDD_ROOT="$JSRF_HDD_ROOT" \
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
 RECOMP_FRAG_FORCE="$MODE" RECOMP_FRAG_FORCE_ON_BLACK="$BLACK" \
+RECOMP_METAL_VSH="$VSH" \
 RECOMP_FB_DUMP="$DUMP/" \
 RECOMP_REPORT_MS=1000 \
 "$APP/Contents/MacOS/jsrf-engine" >"$LOG" 2>&1
