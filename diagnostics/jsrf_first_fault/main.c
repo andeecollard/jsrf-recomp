@@ -1399,38 +1399,49 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
          * instants. Self-gating and a no-op unless RECOMP_OBJECT_DUMP_AT is
          * set. */
         jsrf_object_dump();
-        /* The rate this loop actually runs at, and why the old answer here
-         * was wrong twice over.
+        /* What this loop's rate is -- ASKED OF THE INSTRUMENT, NOT OF THIS
+         * COMMENT.
          *
          * The title's pushbuffer reserve spins until GET catches up with PUT,
-         * and this line is the only thing that moves GET. This comment used to
-         * say it moved "about four times a second, against the hundreds a
-         * frame needs", and posed a dilemma: either the loop barely runs, or
-         * it runs and takes an early exit.
+         * and this line is the only thing that moves GET. So the rate matters,
+         * and for seventeen days it was written down here instead of measured:
          *
-         * NEITHER. Measured 21 Sep 2026 on the post-5358eec binary, 124 s of
-         * gameplay, 89 samples: a MEDIAN OF 64,631 loops/s (min 4,930 while
-         * loading, max 75,064), and of 10,286,519 iterations 99.21% reached
-         * `acked`. The loop is not starved and it is not bailing out. Anything
-         * reasoning from pusher lag is reasoning from a dead fact.
+         *   "about four times a second"      the original claim
+         *   "stale by ~30x, 6,810-6,932/s"   the 20 Sep correction to it
          *
-         * AND THE 20 SEP CORRECTION IS ALSO STALE. That measurement -- 6,810
-         * to 6,932 loops/s -- was taken before the fence fix, when the guest
-         * never blocked. Making it wait where the hardware says it should wait
-         * gave this thread roughly nine times the CPU. A number here is only
-         * ever true of one binary; date it or do not write it.
+         * BOTH WERE WRONG, and the second was wrong within a day of being
+         * written -- 5358eec made the guest block where it never blocked,
+         * which gave this thread roughly nine times the CPU. A rate that
+         * depends on thread interleaving is a fact about one binary, and a
+         * comment cannot hold one. The [PB-ACK] line now prints n, min,
+         * median, max and the acked share every two seconds, so the question
+         * this paragraph used to answer badly is answered by reading a run.
          *
-         * `already` IS DEAD, NOT MERELY SMALL. It counts MEM32(getp) ==
-         * fence_counter, and the whole point of 5358eec is that the fence word
-         * is now driven by the GPU's own release packet to counter-2 or lower,
-         * so that equality can no longer happen. In this run it read 27,838 at
-         * the first report -- accumulated during boot, before the release path
-         * went live -- and then did not increment once in 124 seconds. It is
-         * not a health signal, it is a fossil, and it has already misled this
-         * project once. Read `acked` and `not-consumed`; if `already` ever
-         * climbs again, the fence has regressed. */
+         * It also prints them CUMULATIVELY and self-contained, because every
+         * run here ends in kill -9: there is no atexit summary, and a reader
+         * who greps one line must get the whole verdict from it.
+         *
+         * WHAT TO READ. `acked` is the healthy outcome and dominates. `already`
+         * counts MEM32(getp) == fence_counter, which 5358eec made impossible --
+         * the fence word is driven by the GPU's own release packet to
+         * counter-2 or lower, so the equality cannot occur. Its total is boot
+         * residue from before the release path went live, and it MUST stay
+         * frozen. The line says so in words, and latches CLIMBING if it ever
+         * moves, which turns a dead counter into a fence-regression alarm.
+         * That counter has misled this project once already. */
         {
+/* Rate buckets. 2,500/s each, 64 of them, so the top bucket starts at 157,500
+ * -- comfortably above the 75,064 peak seen on 21 Sep without making the
+ * median coarser than +/-1,250, which is far finer than any decision taken
+ * from this number. A histogram rather than a sample array because a long run
+ * has tens of thousands of samples and the median must not need all of them. */
+#define PB_ACK_BUCKET 2500ul
+#define PB_ACK_BUCKETS 64u
             static unsigned long loops, no_dev, no_consume, already, acked;
+            static unsigned long rate_hist[PB_ACK_BUCKETS];
+            static unsigned long rate_n, rate_min, rate_max;
+            static unsigned long already_prev;
+            static int already_climbed;
             static DWORD last;
             DWORD now_ms = GetTickCount();
             ++loops;
@@ -1440,14 +1451,53 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
             else                              ++acked;
             if (!last) last = now_ms;
             if (now_ms - last >= 2000) {
+                unsigned long rate = loops * 1000ul / (now_ms - last);
+                unsigned long total = acked + already + no_consume + no_dev;
+                unsigned long b = rate / PB_ACK_BUCKET, cum = 0, median = 0;
+                unsigned i;
+                if (b >= PB_ACK_BUCKETS) b = PB_ACK_BUCKETS - 1;
+                rate_hist[b]++;
+                if (!rate_n || rate < rate_min) rate_min = rate;
+                if (!rate_n || rate > rate_max) rate_max = rate;
+                ++rate_n;
+                for (i = 0; i < PB_ACK_BUCKETS; ++i) {
+                    cum += rate_hist[i];
+                    if (cum * 2ul >= rate_n) {
+                        median = (unsigned long)i * PB_ACK_BUCKET + PB_ACK_BUCKET / 2;
+                        break;
+                    }
+                }
+                /* `already` must stay frozen. Latch the moment it does not:
+                 * a regression that heals before anyone reads the log is still
+                 * a regression, and a one-shot sample would miss it. */
+                if (rate_n > 1 && already > already_prev) already_climbed = 1;
+                already_prev = already;
+
                 fprintf(stderr, "  [PB-ACK] %lu loops/s: acked=%lu already=%lu"
                         " not-consumed=%lu no-device=%lu (totals)\n",
-                        loops * 1000ul / (now_ms - last),
-                        acked, already, no_consume, no_dev);
+                        rate, acked, already, no_consume, no_dev);
+                /* THE LINE THAT REPLACES A COMMENT. Every figure this carries
+                 * was hardcoded in prose above this block until 21 Sep 2026,
+                 * went stale twice in seventeen days, and was twice corrected
+                 * by hand from a log someone had to aggregate. It is cheaper
+                 * to print it. Self-contained on purpose: every run here ends
+                 * in kill -9, so there is no atexit summary and any single
+                 * line has to stand alone. */
+                fprintf(stderr, "  [PB-ACK]   rate n=%lu min=%lu median=~%lu"
+                        " max=%lu | acked %lu.%02lu%% of %lu | already %s\n",
+                        rate_n, rate_min, median, rate_max,
+                        total ? acked * 100ul / total : 0ul,
+                        total ? acked * 10000ul / total % 100ul : 0ul,
+                        total,
+                        already_climbed
+                            ? "CLIMBING -- THE FENCE HAS REGRESSED, see d3d8_ring.h"
+                            : "frozen (fence healthy)");
                 fflush(stderr);
                 loops = 0;
                 last = now_ms;
             }
+#undef PB_ACK_BUCKET
+#undef PB_ACK_BUCKETS
         }
         /* The fence the title spins on. `consumed` is jsrf_pb_poll's own
          * verdict -- `!stream_fault && g_pb_last==now` -- so the
