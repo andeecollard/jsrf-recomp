@@ -136,6 +136,23 @@ int  xbox_PadReplayStatus(int *ck_ok, int *ck_bad, unsigned long *frame,
  * silent. Low 16 bits: a slow counter, compared with a small tolerance.
  * Above them: identity, compared exactly. NULL or unset means no check. */
 void xbox_PadRecordSetAnchorFn(unsigned long (*fn)(void));
+
+/* Optional: name the fields two anchors disagree on.
+ *
+ * The anchor is one opaque word HERE, deliberately -- this layer carries no
+ * knowledge of any particular title, and must not start. But "was 1E000003,
+ * now 1E000004" names nothing, and a misalignment report that cannot say
+ * WHICH piece of state moved leaves the reader to decode a bitfield by hand
+ * at the exact moment they are already debugging something else.
+ *
+ * So the title may register a describer. It receives both anchors and writes
+ * a human phrase naming only what differs; the input layer appends it to the
+ * misalignment line and otherwise does not care what it says. Unset means the
+ * line keeps its bare hex, which is the pre-existing behaviour. The callback
+ * must not trust either value -- a recorded anchor comes off disk. */
+void xbox_PadRecordSetAnchorDescribeFn(
+        void (*fn)(unsigned long recorded, unsigned long live,
+                   char *out, unsigned long out_size));
 unsigned long long xbox_PadReplayHash(void);
 
 int  xbox_PadRecordOpen(const char *path);

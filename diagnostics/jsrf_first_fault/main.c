@@ -2204,6 +2204,11 @@ static unsigned long jsrf_pad_anchor(void)
          | (unsigned long)((pt / 60u) & 0xFFFFu);
 }
 
+/* The anchor field decoder lives in jsrf_anchor.c so its unit test can link
+ * the real function; see that file for the per-field provenance. */
+#include "jsrf_anchor.h"
+
+
 /* RECOMP_STATE_TRACE=<path>: one line per guest frame, so two runs of the
  * same recording can be diffed to the FIRST frame they disagree on.
  *
@@ -4921,6 +4926,7 @@ int main(int argc, char **argv)
 #endif
         );
     xbox_PadRecordSetAnchorFn(jsrf_pad_anchor);
+    xbox_PadRecordSetAnchorDescribeFn(jsrf_pad_anchor_describe);
     xbox_PadRecordSetMarkHook(jsrf_mark_picture);
 #endif
     fflush(stderr);

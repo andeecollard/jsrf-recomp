@@ -28,6 +28,29 @@ import sys
 
 LINE = re.compile(r"^f(\d+) a=([0-9a-fA-F]+) pt=(\d+) ic=(\d+) dr=(\d+)")
 FIELDS = ("a", "pt", "ic", "dr")
+# The anchor packs four fields into one word. Printing it as a decimal --
+# "a=218103808 b=201326592" -- is the same unreadability the replay's
+# misalignment line used to have, and the answer there was to name the field
+# that moved. THE LAYOUT LIVES IN jsrf_anchor.c; this is a second reader of it
+# and will not be linked against it, so if that packing changes, change this
+# too. Field order matches the C describer deliberately.
+ANCHOR_FIELDS = (("sequence", 24, 0xFF), ("chapter", 20, 0x0F),
+                 ("mission", 16, 0x0F), ("minutes", 0, 0xFFFF))
+
+
+def anchor_fields(a, b):
+    """Name only the anchor fields that differ, as jsrf_anchor.c does."""
+    parts = []
+    for name, shift, mask in ANCHOR_FIELDS:
+        x, y = (a >> shift) & mask, (b >> shift) & mask
+        if x != y:
+            slow = " (slow counter)" if name == "minutes" else ""
+            parts.append("%s %d->%d%s" % (name, x, y, slow))
+    if not parts and a != b:
+        return "no named field (layout mismatch?)"
+    return ", ".join(parts)
+
+
 NAMES = {"a": "scene anchor", "pt": "playtime", "ic": "indirect calls",
          "dr": "hw draws"}
 
@@ -98,8 +121,13 @@ def main():
     for k in FIELDS:
         if k in first:
             fr = first[k]
-            print("  %-15s first differs at f%-7d a=%-12d b=%-12d" % (
-                NAMES[k], fr, A[fr][k], B[fr][k]))
+            extra = ""
+            if k == "a":
+                what = anchor_fields(A[fr][k], B[fr][k])
+                if what:
+                    extra = "  [%s]" % what
+            print("  %-15s first differs at f%-7d a=%-12d b=%-12d%s" % (
+                NAMES[k], fr, A[fr][k], B[fr][k], extra))
         else:
             print("  %-15s identical over all %d frames" % (NAMES[k], len(common)))
     print()

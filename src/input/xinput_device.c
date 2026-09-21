@@ -1252,6 +1252,31 @@ void xbox_PadRecordSetAnchorFn(unsigned long (*fn)(void))
     g_pad_anchor_fn = fn;
 }
 
+static void (*g_pad_anchor_describe_fn)(unsigned long, unsigned long,
+                                        char *, unsigned long);
+
+void xbox_PadRecordSetAnchorDescribeFn(
+        void (*fn)(unsigned long recorded, unsigned long live,
+                   char *out, unsigned long out_size))
+{
+    g_pad_anchor_describe_fn = fn;
+}
+
+/* Never returns NULL, so the caller has no branch: with no describer, or a
+ * describer that declines to say anything, the phrase is empty and the line
+ * reads exactly as it did before. */
+static const char *pad_anchor_describe(unsigned long recorded,
+                                       unsigned long live,
+                                       char *buf, unsigned long n)
+{
+    if (!n) return "";
+    buf[0] = 0;
+    if (g_pad_anchor_describe_fn)
+        g_pad_anchor_describe_fn(recorded, live, buf, n);
+    buf[n - 1] = 0;
+    return buf;
+}
+
 static unsigned long pad_anchor_now(void)
 {
     return g_pad_anchor_fn ? g_pad_anchor_fn() : 0ul;
@@ -1348,13 +1373,18 @@ static void pad_replay_check_ck(unsigned long run, unsigned long frame,
          * different number of frames, and it is the failure a frame key
          * cannot prevent. Not fatal; loud. */
         g_pad_anchor_bad++;
-        if (g_pad_anchor_bad <= 8)
+        if (g_pad_anchor_bad <= 8) {
+            char what[192];
+            pad_anchor_describe(g_padrec_ck[g_pad_ck_next].anchor, anchor,
+                                what, (unsigned long)sizeof what);
             fprintf(stderr, "  [PAD-REPLAY] STATE MISALIGNED at frame %lu:"
                     " the recording was at guest state %08lX here, this run is"
-                    " at %08lX. The input is being replayed correctly but the"
-                    " title is not in the same place, so frame %lu is not the"
-                    " same moment it was.\n",
-                    frame, g_padrec_ck[g_pad_ck_next].anchor, anchor, frame);
+                    " at %08lX.%s%s The input is being replayed correctly but"
+                    " the title is not in the same place, so frame %lu is not"
+                    " the same moment it was.\n",
+                    frame, g_padrec_ck[g_pad_ck_next].anchor, anchor,
+                    what[0] ? " Differs in: " : "", what, frame);
+        }
     }
     if (g_padrec_ck[g_pad_ck_next].hash == h &&
         g_padrec_ck[g_pad_ck_next].frame == frame) {

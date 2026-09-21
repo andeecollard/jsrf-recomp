@@ -216,6 +216,14 @@ endforeach()
 # as alpha it is transparent wherever the padding is zero, which looks exactly
 # like the object not drawing at all. The alpha-regression case guards the
 # other direction.
+# The state anchor's field decoder. Split out of main.c precisely so this test
+# links the real function: a transcribed copy could agree with a mislabelling
+# bug, and a report that names the WRONG field is worse than the hex it
+# replaced. Provenance for each field is recorded in jsrf_anchor.c.
+add_executable(jsrf_anchor_test jsrf_anchor_test.c jsrf_anchor.c)
+target_include_directories(jsrf_anchor_test PRIVATE .)
+add_test(NAME jsrf_anchor COMMAND jsrf_anchor_test)
+
 add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")
@@ -405,6 +413,7 @@ endif()
 
 add_executable(jsrf_first_fault
     main.c
+    jsrf_anchor.c
     guest_names.c
     wild_ptr.c
     ram_find.c
