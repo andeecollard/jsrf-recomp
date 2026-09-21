@@ -107,6 +107,56 @@ int main(int argc, char **argv)
         }
         if (!failures) printf("  ok   %-46s\n", "swizzled 555 texels decode correctly");
 
+    } else if (!strcmp(mode, "a4r4g4b4")) {
+        /* The last format in the shipped set, and the one place a plausible
+         * implementation is quietly wrong: a 4-bit channel spans the FULL
+         * range, so 0xF is 255, not 0xF0. Expanding by a left shift costs
+         * 1/17th of every channel and can never produce white -- a uniform
+         * dimming that survives any number of screenshot reviews.
+         *
+         * Unlike 0x03 and 0x07 this format carries real alpha, so the
+         * opaque-forcing those two need must NOT happen here. */
+        s.sz16 = 1; s.argb4 = 1; s.pitch = W * 2;
+        for (y = 0; y < H; ++y) for (x = 0; x < W; ++x) {
+            unsigned v = (0xFu << 12) | (0xFu << 8) | ((y * 5u) << 4) | (x * 5u);
+            unsigned char *p = src + 2u * morton(x, y);
+            p[0] = (unsigned char)(v & 0xFF);
+            p[1] = (unsigned char)(v >> 8);
+        }
+        check("decoded", nv2a_texture_copy_decode_level(&s, src, sizeof src, 0,
+                                                        out, sizeof out, &ow, &oh), 1);
+        check("width", ow, W); check("height", oh, H);
+        /* THE TWO THAT MATTER. A shift-by-four expansion gives 240 for both. */
+        check("R nibble 0xF expands to 255, not 240", out[0], 255);
+        check("A nibble 0xF expands to 255, not 240", out[3], 255);
+        for (y = 0; y < H; ++y) for (x = 0; x < W; ++x) {
+            const unsigned char *q = out + ((size_t)y * W + x) * 4;
+            unsigned want_g = (unsigned)((y * 5u) / 15.0f * 255 + 0.5f);
+            unsigned want_b = (unsigned)((x * 5u) / 15.0f * 255 + 0.5f);
+            if (q[1] != want_g || q[2] != want_b) {
+                printf("  FAIL texel (%u,%u) g=%02X want %02X, b=%02X want %02X\n",
+                       x, y, q[1], want_g, q[2], want_b);
+                ++failures;
+            }
+        }
+        if (!failures) printf("  ok   %-46s\n", "swizzled 4444 texels decode correctly");
+
+    } else if (!strcmp(mode, "a4r4g4b4-alpha")) {
+        /* The other direction: 0x04 alpha must be READ, not forced opaque.
+         * Sharing sz16 with X1R5G5B5 -- which does force it -- is exactly the
+         * shape of mistake that would make every 4444 texture solid. */
+        s.sz16 = 1; s.argb4 = 1; s.pitch = W * 2;
+        memset(src, 0, sizeof src);
+        for (y = 0; y < H; ++y) for (x = 0; x < W; ++x) {
+            unsigned v = (4u << 12);               /* alpha 4/15, rgb zero */
+            unsigned char *p = src + 2u * morton(x, y);
+            p[0] = (unsigned char)(v & 0xFF);
+            p[1] = (unsigned char)(v >> 8);
+        }
+        check("decoded", nv2a_texture_copy_decode_level(&s, src, sizeof src, 0,
+                                                        out, sizeof out, &ow, &oh), 1);
+        check("A4R4G4B4 alpha is read, not forced opaque", out[3], 68); /* 4/15*255 */
+
     } else if (!strcmp(mode, "alpha-regression")) {
         /* A8R8G8B8 must KEEP its alpha -- the fix must not make every
          * 32-bit texture opaque. This is the other half of the trap. */

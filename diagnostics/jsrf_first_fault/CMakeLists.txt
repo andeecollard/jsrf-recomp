@@ -219,7 +219,7 @@ endforeach()
 add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")
-foreach(case x8r8g8b8 x1r5g5b5 alpha-regression)
+foreach(case x8r8g8b8 x1r5g5b5 a4r4g4b4 a4r4g4b4-alpha alpha-regression)
     add_test(NAME jsrf_texfmt_${case} COMMAND jsrf_texfmt_swizzled_test ${case})
 endforeach()
 

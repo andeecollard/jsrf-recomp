@@ -236,7 +236,8 @@ void nv2a_texture_copy_census(void)
             && !s_rej_texmode && !s_rej_texstage && !s_rej_alpha)
         return;
     fprintf(stderr, "[TEXFMT] gate refusals by texture format"
-            " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06 rgba8)\n");
+            " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06/0x07 rgba8,"
+            " 0x03 x1r5g5b5, 0x04 a4r4g4b4)\n");
     fprintf(stderr, "[TEXFMT]   header/mip-layout bits wrong=%lu  dma class wrong=%lu"
             "  combiner output=%lu\n",
             s_reject_hdr, s_reject_dma, s_reject_combiner_out);
@@ -287,14 +288,19 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
         if(s->levels!=1) return "linear texture mip levels";
         s->width=M(b+28)>>16; s->height=M(b+28)&65535; s->pitch=M(b+16)>>16;
         if(!s->width || !s->height || s->pitch<s->width*2u) return "texture dimensions / pitch";
-    } else if(format==0xc || format==0xe || format==6 || format==7 || format==3) {
-        /* 0x07 SZ_X8R8G8B8 and 0x03 SZ_X1R5G5B5 are swizzled like the others,
-         * so they take the log2 dimensions here rather than the linear
-         * image-rectangle path. Refusing them dropped 2.2% of every draw in
-         * the player's 21 Sep session. */
+    } else if(format==0xc || format==0xe || format==6 || format==7 || format==3
+              || format==4) {
+        /* 0x07 SZ_X8R8G8B8, 0x03 SZ_X1R5G5B5 and 0x04 SZ_A4R4G4B4 are
+         * swizzled like the others, so they take the log2 dimensions here
+         * rather than the linear image-rectangle path. Refusing the first two
+         * dropped 2.2% of every draw in the player's 21 Sep session. 0x04 is
+         * the last member of {0x0C,0x0E,0x03,0x06,0x07,0x04}, the complete set
+         * an enumeration of the 1,056 shipped .dat containers says this title
+         * can produce -- 11 textures, e.g. Media/Stage/Stg52_t.dat. */
         s->dxt1=format==0xc; s->dxt3=format==0xe;
         s->rgba8=(format==6 || format==7);
-        s->xrgb8=(format==7); s->sz16=(format==3);
+        s->xrgb8=(format==7); s->sz16=(format==3 || format==4);
+        s->argb4=(format==4);
         unsigned lw=(f>>20)&15,lh=(f>>24)&15;
         if(lw>12 || lh>12 || s->levels>1+(lw>lh?lw:lh)) return "texture dimensions / pitch";
         s->width=1u<<lw; s->height=1u<<lh;
@@ -429,6 +435,17 @@ static void unpack555(uint32_t v, float rgba[4])
     rgba[0]=(float)((v>>10)&31)/31; rgba[1]=(float)((v>>5)&31)/31;
     rgba[2]=(float)(v&31)/31; rgba[3]=1;
 }
+/* A4R4G4B4. THE DIVISOR IS 15, NOT 16, and it is the whole of what is easy to
+ * get wrong here: a 4-bit channel spans the full range, so 0xF must come back
+ * as 1.0 (255), not 0xF0/255 = 0.94. Shifting left by four -- the obvious
+ * expansion -- loses 1/17th of the range on every channel and can never reach
+ * white. That is a dimming no screenshot review catches. Unlike the other two
+ * 16-bit formats this one has REAL alpha. */
+static void unpack4444(uint32_t v, float rgba[4])
+{
+    rgba[0]=(float)((v>>8)&15)/15; rgba[1]=(float)((v>>4)&15)/15;
+    rgba[2]=(float)(v&15)/15;      rgba[3]=(float)((v>>12)&15)/15;
+}
 
 /* Rectangular Morton order: interleave only the dimensions still active. */
 static unsigned swizzle_index(const NV2ATextureCopy *s, unsigned x, unsigned y)
@@ -460,7 +477,8 @@ static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, f
     }
     if(s->sz16) {
         const uint8_t *p=data+2*(size_t)swizzle_index(s,(unsigned)x,(unsigned)y);
-        unpack555(p[0] | (uint32_t)p[1]<<8, rgba);
+        uint32_t v=p[0] | (uint32_t)p[1]<<8;
+        if(s->argb4) unpack4444(v,rgba); else unpack555(v,rgba);
         return;
     }
     if (s->dxt1 || s->dxt3) {

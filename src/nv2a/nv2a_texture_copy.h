@@ -15,8 +15,14 @@ typedef struct NV2ATextureCopy {
      * shares the rgba8 path and only forces alpha opaque. SZ_X1R5G5B5 (0x03)
      * is swizzled 16-bit, which is neither the linear image-rectangle path
      * nor any of the block formats. Both were refused outright until
-     * 21 Sep 2026; see the [TEXFMT] census. */
-    uint32_t xrgb8, sz16;
+     * 21 Sep 2026; see the [TEXFMT] census.
+     *
+     * SZ_A4R4G4B4 (0x04) is the last member of the set the shipped assets can
+     * produce, and it is swizzled 16-bit too -- so it rides sz16 for layout
+     * and needs argb4 only to pick its unpack. It is the one 16-bit format
+     * here that carries REAL alpha, which is why it cannot simply reuse the
+     * 555 path. */
+    uint32_t xrgb8, sz16, argb4;
     float lod_bias;
     uint32_t combiner_count, color_icw[8], alpha_icw[8];
     uint32_t color_ocw[8], alpha_ocw[8], add_specular;
