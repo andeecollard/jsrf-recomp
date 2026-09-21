@@ -1,0 +1,205 @@
+HANDOVER -- 21 September 2026 (night)
+THE SILHOUETTES WERE THE CAMERA, NOT THE GAME
+
+NARROWS one line of
+HANDOVER_2026-09-21_EVENING_THE_MAGENTA_CLEAR_SPLIT_THE_BLACK_SCREENS_AND_FIVE_THEORIES_DIED.txt
+-- the "INTRO SILHOUETTES" reading, and with it open item 5. Everything that
+file says about the Load screen, the combiner, the arm recovery and the APU
+stands and is untouched.
+
+SCOPE, AND I OVERSTATED IT IN THE FIRST DRAFT OF THIS FILE. What is settled is
+that the TITLE-SCREEN silhouettes are an artifact of the capture. What is NOT
+settled is any other black-screen claim in the tree. This file said they should
+all be re-read; that is still the right thing to do, but "needs checking" is
+not "wrong", and one of them has already survived -- see section 1a. Nothing
+here is a licence to throw away a week of measurements wholesale.
+
+
+====================================================================
+0. WHAT WAS WRONG, AND IT IS THE INSTRUMENT AGAIN
+====================================================================
+
+EVERY FRAMEBUFFER PICTURE THIS PROJECT HAS EVER LOOKED AT IS THE LIVE SURFACE,
+SAMPLED PART WAY THROUGH COMPOSING A FRAME.
+
+  reportNNN   dump_surface_bmp on the report timer      LIVE, mid-frame
+  drawNNN     dump_surface_bmp per batch                LIVE, explicitly mid-frame
+  flipNNN     dump_surface_bmp at the flip              LIVE
+  watchNNN    dump_snapshot_bmp, but only on a small-change event
+  stillNNN    the watched RECTANGLE only, not the frame
+
+nv2a_pb_exec.c has a function whose whole job is to write the presented frame,
+nv2a_pb_exec_dump_surface(), and the long note above dump_snapshot_bmp names
+the report timer as its caller. IT HAD NO CALLERS. It was written, documented,
+reasoned about and never wired up.
+
+THE PROOF, and it is a single run, a single instant, a single sequence number.
+Report and snapshot are now written as a PAIR from the report timer, so
+reportNNN and snapNNN are the same moment:
+
+  snap031    the JSRF title screen, complete. Skull logo with its eye sockets
+             and teeth, textured city, overpass, cars, plaza, wordmark.
+  report031  the same scene as a SOLID BLACK SILHOUETTE. Skull black, wordmark
+             black, buildings a flat distant skyline.
+
+Same run. Same instant. One of them is what the player sees and the other is a
+half-drawn frame. THE SILHOUETTES ARE THE BASE PASS, PHOTOGRAPHED BEFORE THE
+DETAIL PASSES LANDED ON IT.
+
+
+====================================================================
+1. WHAT THIS RETRACTS
+====================================================================
+
+"INTRO SILHOUETTES: 56,997 pixels ZERO on a magenta surface -- covered, written
+as zero -> a SHADING fault." There is no shading fault. The scene composes
+correctly and is presented correctly.
+
+The 96,603/153,600 reading at t=12-16 of last-run_2026-09-21_1453 is not
+evidence of one either: at that point in the boot the title is showing the SEGA
+anti-graffiti notice, which is red and white text on black and is MEANT to be
+mostly black. A control boot reads nonzero=13% with mean colour (23,10,10)
+across snap010-015 -- that is the notice, not a defect. snap018-020 are the
+city FADING IN from black, also by design.
+
+1a. AND ONE BLACK SCREEN IS REAL, MEASURED THE SAME NIGHT
+---------------------------------------------------------
+The freshness instrument's own positive control found it. In a 30 s unattended
+boot with the frame sequence advancing normally -- 163, 324, 451, 626, 766 --
+snap001, snap004 and snap009 read nonzero=0/307200. FRESH FRAMES, FULLY BLACK,
+published and presented. Whatever those are, they are not a capture artifact
+and not a stale repeat, and they sit inside the same boot window this file is
+otherwise explaining away. So the correct reading of section 0 is narrow: the
+LIVE-SURFACE CAPTURES cannot be used as pictures. It is not "there are no black
+frames".
+
+AND IT NARROWS A NIGHT OF MY OWN WORK. Off those pictures I built two
+instruments and ran six arms to chase a texture that was never black. The chain
+looked clean at every step and every step was reading a half-composed frame:
+
+  "the combiner is innocent, so TEXTURE0 or PRIMARY_COLOR is black going in"
+  "forcing the raw TEXTURE0 sample leaves the object flat, so it is the texture"
+  "mode 4 shows a flat texture coordinate over the whole object"
+
+The last of those was already contradicted by a measurement I had in hand and
+had not yet read: on the CPU-interpreter arm, where the census can see oT0 at
+all, ZERO of 7,454 textured draws carry one coordinate on every vertex and the
+largest flat draw in the run is SIX PIXELS. A large object painted in one texel
+does not exist in this title.
+
+The one thing that did break the chain was not a counter. It was pairing the
+capture with the presented frame and looking at both.
+
+
+====================================================================
+2. THE INSTRUMENTS, ALL UNCOMMITTED
+====================================================================
+
+src/kernel/nv2a_pb_exec.c
+  snapNNN beside reportNNN on the report timer. Three lines. This is the fix
+  for section 0 and it should probably be the default for every run from now
+  on -- a picture that cannot be read as the picture is worse than no picture.
+
+src/nv2a/nv2a_metal.m
+  RECOMP_FRAG_FORCE=<1|2|3|4>  replaces every fragment with one of shade()'s
+    own inputs: the raw TEXTURE0 sample, PRIMARY_COLOR, white, or TEXCOORD0
+    after the perspective divide (fract, with blue for out of range). It sits
+    at the END of shade(), the one function both the fixed-function and the
+    programmable path share, so it overrides every draw in one branch.
+  [SNAP] on every snapshot dump: the pool's frame sequence, the source colour
+    surface, the dimensions and the presented nonzero count, and it says
+    outright when the sequence HAS NOT MOVED since the last dump. s_snap is
+    republished at FLIP_STALL, so a guest that stops flipping makes the pool
+    hand out the last good frame over and over -- a series of healthy-looking
+    files taken while the screen is black. That is the snapshot lying in the
+    opposite direction from the live surface, and it had to be closed before
+    any snapNNN could be trusted. Verified on a 30 s boot: 0 repeats,
+    0 never-published, sequence advancing about 140 publishes a second.
+  RECOMP_T0_CENSUS=<lines>, RECOMP_T0_CENSUS_MINAREA=<px>  counts draws whose
+    TEXCOORD0 is identical on every vertex, keyed by texture, and reports the
+    LARGEST single draw per key as well as the total.
+
+BOTH CARRY A WARNING THEY EARNED. The census reads s_outputs, and with the
+guest's vertex programs on the GPU s_outputs carries the program's INPUTS, not
+its outputs -- see "THE GPU PATH STOPS HERE" in nv2a_pb_exec.c. So on the
+default arm it measures v9 and its screen boxes are pre-transform, which is why
+its first run reported a biggest flat draw of 100 px in object space. It only
+measures oT0 under RECOMP_METAL_VSH=0.
+
+Run scripts in ~/jsrf-build, outside the repo: run-fragforce.sh <mode> [secs]
+and run-vshcpu.sh [secs]. Both are unattended, silent (SDL_AUDIODRIVER=
+no_such_driver) and preserve their own log and dump directory.
+
+
+====================================================================
+3. THE FF BATCH WATCHERS CANNOT ANSWER THE LOAD-SCREEN QUESTION
+====================================================================
+
+Open item 1 of the evening handover says to arm RECOMP_FF_BATCH_WATCH_TEX and
+RECOMP_FF_BATCH_DUMP_TEX on the Load screen because "they dump what a batch's
+texture actually holds". They do not, and they cannot:
+
+  - All four call sites are inside the FIXED-FUNCTION branches
+    (nv2a_pb_exec.c:4392, 4394, 4427, 4428). This title draws through guest
+    vertex programs -- 317,384 GPU vsh draws against 0 CPU in a 45 s boot. The
+    note at RECOMP_GLYPH_DUMP in nv2a_metal.m:4311 already records exactly this
+    blindness, in those words.
+  - Neither reports texel CONTENTS. ff_batch_dump prints the stage-0 texture
+    OFFSET and FORMAT registers and the vertex attributes; FF_BATCH_WATCH_TEX
+    reports whether vertex data CHANGED between two draws.
+  - Both need the texture offset in hex up front, which for the Load screen
+    nobody has.
+
+That run would have come back empty and read as "the texture is fine".
+
+RECOMP_FRAG_FORCE is the instrument that question actually wants, and it is now
+built. Arm it on the Load screen reproducer -- WITH the snap dumps, and read
+snapNNN, not reportNNN.
+
+
+====================================================================
+4. "NOW LOADING" -- THE PLAYER REMEMBERS IT BECAUSE IT WAS BROKEN
+====================================================================
+
+The player reported tonight that the screen is missing before the title
+animation, and then that "we were loading the now loading last week".
+
+That is reading (b) of the evening handover's section 4, and the player's own
+memory is the best evidence for it yet. From HANDOVER_2026-09-16: "THIS WAS THE
+PLAYER'S 'STUCK ON NOW LOADING' AND THEIR SILENT MUSIC" -- vblank delivery
+latched shut, the build ran at 10.2 Hz, and the CRI worker resumed once per
+vblank never resumed. They saw that screen last week BECAUSE THE GAME WAS STUCK
+ON IT. RECOMP_NV2A_PMC_UPMIRROR took the frame rate to 58 Hz and loads off an
+SSD now finish in about two seconds, where the Xbox took 8-15 off DVD. The
+title shows the screen for exactly as long as the load takes.
+
+NOT SETTLED, and the honest state is: no capture of the window exists. A
+90-second CPU-interpreter boot -- slow, which stretches the load window the way
+the pre-fix build did -- produced no turquoise-dominant frame in 56 captures,
+but it also never left the attract loop, so it never performed a level load.
+Settle it by arming snap dumps with a small stride across a real level
+transition.
+
+
+====================================================================
+5. OPEN, IN THE ORDER I WOULD TAKE THEM
+====================================================================
+
+1. THE LOAD MENU, with NORMAL rendering and snap captures, driven by a person.
+   ~/jsrf-build/run-loadmenu-snap.sh. Nothing forced: the only question is
+   whether the defect the PLAYER SEES survives, and what the frames the player
+   actually saw look like. Read the [SNAP] freshness lines first, the images
+   second, the counters last. Choose the next experiment from that result --
+   NOT from this file.
+2. RE-READ EVERY BLACK-SCREEN CLAIM IN THE LAST WEEK against snapNNN -- as
+   unverified, not as refuted. The Load screen census, the GPU-BLACK verdicts
+   and the "four surfaces held, every one zero" reading are all from the live
+   surface or from guest RAM, so none of them has been CHECKED. Section 1a is
+   the reminder that some will survive.
+3. THE LOAD SCREEN with RECOMP_FRAG_FORCE, but only AFTER item 1 has said what
+   the unforced picture is. Section 3.
+4. "NOW LOADING": snap dumps across a level transition. Section 4.
+5. Make snapNNN the default and consider retiring reportNNN, or renaming it to
+   something that cannot be mistaken for the frame.
+6. Everything else in the evening handover's section 10 from item 2 onward is
+   untouched by this and still stands.

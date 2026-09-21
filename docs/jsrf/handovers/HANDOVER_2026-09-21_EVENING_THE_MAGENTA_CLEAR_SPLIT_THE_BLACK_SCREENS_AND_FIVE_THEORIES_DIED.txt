@@ -1,0 +1,401 @@
+HANDOVER -- 21 September 2026 (evening)
+THE MAGENTA CLEAR SPLIT THE TWO BLACK SCREENS, AND FIVE THEORIES DIED
+
+Supersedes
+HANDOVER_2026-09-21_AFTERNOON_THE_CUTSCENE_PASSED_AND_THE_TWO_BLACK_SCREENS_ARE_NOT_ONE_BUG.txt
+for sections 5 and 9. Everything that file says about the ADX guard, the
+combiner nibble, the UB sweep and the seven APU methods still stands.
+
+No renderer bug was FIXED today. What changed is that the black screens are
+now separated by mechanism instead of by guesswork, and the search space for
+each one is small. Read section 0 before trusting anything in here.
+
+
+====================================================================
+0. THE METHOD NOTE, AND IT IS AGAIN ABOUT ME
+====================================================================
+
+FIVE HYPOTHESES DIED TODAY AND FOUR OF THEM WERE MINE. Each one was stated
+with more confidence than its evidence carried. They are listed here because
+the pattern matters more than any of them:
+
+  "Drawn to a surface we never present."   Killed by the census: during the
+    black, the surface BOUND FOR DRAWING reads gpu_nonzero=0 in its own Metal
+    texture. There is no picture anywhere to be presenting wrongly. I pushed
+    this one hardest, off the player's report that both symptoms are screens
+    drawn while the 3D scene is not.
+
+  "RECOMP_TEXMODE_APPROX draws bump surfaces black."   MEASUREMENT ERROR, and
+    the worst of the day. I scored a FIXED SCREEN RECTANGLE across two runs of
+    a PANNING ATTRACT CAMERA. A second run with the switch OFF reads exactly
+    (0,0,0) in 24/24 frames where the first read it in 0/24. The two off-arms
+    disagree with each other, so the rectangle was measuring where the camera
+    pointed. CLAUDE.md's scene-match rule, broken in the documented way, one
+    day after it was written down.
+
+  "Clip-W rejection is dropping the loading screen."   4 rejections against
+    510,381 accepted batches. Dead in one grep.
+
+  "The viewport scale has collapsed."   The viewport alternates between
+    offset=(320.5,240.5) and offset=(0.5,0.5), and (0.5,0.5) also appears in a
+    579-draws-per-frame gameplay window that renders perfectly. [RASTER-WIN]
+    samples whichever pass ran last; it cannot attribute state to a draw.
+
+  "The combiner discards the write, like the CD/AB nibble."   The Load
+    screen's config is an ordinary modulate chain and its output control word
+    WRITES the sum. Nothing is discarded. See section 3.
+
+AND ONE FACTUAL ERROR I PUT INTO AN AGENT BRIEF AS FACT: I claimed
+last-run_2026-09-21_1332 "cleared a level", inferred from its 3.1M draws. It
+is a 10.5-minute unattended idle on one screen -- on=12 frozen, 21 pad events
+in the whole run, no content load after t=25 s. An agent measured it and threw
+it out. THE DRAW COUNT OF A LONG RUN IS NOT EVIDENCE OF PROGRESS THROUGH IT.
+
+WHAT ACTUALLY WORKED, every time: change something the guest cannot produce by
+itself, and look. The magenta clear did more in ninety seconds than six hours
+of counter reading, because it turned an ambiguous zero into two different
+pictures.
+
+
+====================================================================
+1. THE INSTRUMENT THAT SPLIT THEM: RECOMP_CLEAR_COLOR_FORCE
+====================================================================
+
+THE PROBLEM IT SOLVES. gpu_nonzero counts NONZERO pixels. So
+
+    "nothing covered these pixels"        and
+    "something covered them and wrote 0"
+
+are THE SAME READING, and they need OPPOSITE fixes. Every instrument this
+project has had reads a black screen identically whichever it is.
+
+RECOMP_CLEAR_COLOR_FORCE=<hex> clears to that colour instead. 0xF81F is R5G6B5
+magenta and nothing in this title is magenta, so anything magenta on screen is
+bare cleared surface no draw ever touched. s_gpu.clear_color is left alone, so
+[CLEAR-WIN] keeps reporting what the GUEST asked for rather than the override
+-- an instrument that reported our own override back would be measuring itself.
+
+THE RESULT, and it is the finding of the day:
+
+    NOW LOADING       TOTALLY MAGENTA        nothing covers it
+                                             -> a COVERAGE fault
+    LOAD SCREEN       MAGENTA FADING IN
+                      AND OUT                covered, driven to zero
+                                             -> a SHADING fault
+    INTRO SILHOUETTES 56,997 pixels ZERO     covered, written as zero
+                      on a magenta surface   -> a SHADING fault
+
+Only a draw writing zero can turn a magenta pixel black. THE TWO BLACK SCREENS
+ARE NOT ONE BUG AND NEVER WERE, and now that is measured rather than argued.
+
+Both readings came from the player's eyes. The 56,997 figure is from [FB]
+nonzero=96603/153600 at t=12-16 of last-run_2026-09-21_1453_MAGENTA-CLEAR.
+
+THREE MAGENTA RUNS MEASURED NOTHING because they never left the attract loop
+([APU-VOICE] on=5, and the 4-12 band is the attract loop). CHECK on= BEFORE
+READING A RUN. The Load-screen numbers below come from the fourth.
+
+
+====================================================================
+2. THE LOAD SCREEN, AND WHAT COVERS IT
+====================================================================
+
+REPRODUCER: boot -> START -> main menu -> Load. ~40 s. Signature is 28 draws
+per frame in [STAGE], which is how you know you are on it.
+
+MEASURED, last-run_2026-09-21_1400_LOADMENU-CENSUS:
+  positive control PICTURE-HELD t=17.86-46.09 on the visible main menu,
+  then GPU-BLACK from t=46.09 to the end, 142 of 155 reports, four surfaces
+  held, every one zero on the GPU AND in guest RAM.
+
+MEASURED, last-run_2026-09-21_1505_COMBINER-LOADSCREEN:
+  viewport scale=(320.0 -240.0 16777215.0 0.0), clip 640x480+0+0  -- textbook
+  [CLEAR-WIN] the guest asks for 0x00000000 and nothing else, ~1200 times a
+    window. THE CLEAR IS NOT THE BUG. It clears to black because games do.
+  blend states in use include src=0x306 dst=0x0 -- GL_DST_COLOR, GL_ZERO, a
+    MULTIPLY. That is what the player sees eating the magenta.
+
+THE AFTERNOON HANDOVER DISMISSED THAT BLEND and I repeated the dismissal. The
+reasoning was "it appears at the same boot position in the Roboy run, which
+then rendered for another 1,050 s, so it is not a discriminator". That is
+wrong. A fade-to-black multiply is NORMAL -- every game has one. Multiply by
+white is a no-op; multiply by zero is permanent black. The existence of the
+blend was never the question. THE SOURCE COLOUR IS.
+
+
+====================================================================
+3. THE COMBINER IS INNOCENT, AND THAT IS THE USEFUL PART
+====================================================================
+
+RECOMP_COMBINER_TRACE=1 with RECOMP_PB_EXEC_TOP=400, on the Load screen. First
+time either has been armed in a preserved run. 15 distinct configs, all
+`result=prepared`, all `rejected=0 inline=0 invalid-position=0
+collapsed-xy=0`. Config 14, running on that screen:
+
+    COLOR_ICW  08040000   TEXTURE0 x PRIMARY_COLOR  -> SPARE0
+               090C0000   TEXTURE1 x SPARE0         -> SPARE0
+               0C200000   SPARE0 x 1                -> SPARE0  (pass-through)
+    COLOR_OCW  00000C00   AB discard, CD discard, sum -> SPARE0
+    FACTOR0/1  FFFFFFFF   white
+
+An ordinary modulate chain, and the output control word WRITES THE SUM. So the
+CD/AB-nibble class of fault -- a missing write rather than a wrong colour --
+is NOT what is happening here.
+
+WHICH LEAVES THE INPUTS. Anything times zero is zero, so if SPARE0 comes out
+black then TEXTURE0 or PRIMARY_COLOR is black going in. That is now the whole
+question for this screen.
+
+TWO PIECES OF INDEPENDENT SUPPORT FOR THE TEXTURE SIDE:
+  - The map screen renders as FLAT UNTEXTURED SILHOUETTES with the place names
+    legible on top (glyphdump report104.bmp, and the player's 14:34 capture).
+    That is what a texture sampling to a flat colour looks like.
+  - The afternoon handover records ZERO texture uploads in the whole black
+    period, 802 before and 802 after, EVERY REQUEST A CACHE HIT. A cache hit
+    that returns an empty texture is indistinguishable, in that counter, from
+    a correct one. The counter was read as exonerating; it is not.
+
+THE NEXT RUN, and it is narrow: RECOMP_FF_BATCH_WATCH_TEX and
+RECOMP_FF_BATCH_DUMP_TEX exist and NEITHER HAS EVER BEEN ARMED. They dump what
+a batch's texture actually holds. If TEXTURE0 on those draws is empty or
+wrong, that names the bug -- and unlike everything chased today it would
+explain the flat map, the black Load screen and the black silhouettes
+together.
+
+
+====================================================================
+4. "NOW LOADING" IS A DIFFERENT BUG, AND IT MAY NOT BE MISSING
+====================================================================
+
+TOTALLY MAGENTA. Nothing covers it. That is the opposite of the Load screen
+and it rules out the entire shading branch for this symptom.
+
+AGAINST THAT, MEASURED BY AN AGENT from the ROBOY log: the level-load windows
+are ~1 draw/flip, 322-829 TRIANGLES per flip, ~400 fps, lasting ~2 seconds,
+with guest RAM black throughout -- the same triangles-per-draw as the gameplay
+either side. So geometry IS submitted and accepted (0 backend refusals) and
+covers nothing. Off-screen or zero-area.
+
+THE SCREEN IS NOT ALWAYS ABSENT. The player saw it "briefly appear before the
+cutscene" on 21 Sep. And every in-session level load in every log that reaches
+one reads LIT in the load second (ROBOY t=251/459/547/1034; the 14:18
+playthrough t=280/487/538; the 10:15 run t=211).
+
+TWO READINGS AND THEY ARE NOT SETTLED:
+  (a) it renders and we lose it -- a coverage fault, as above;
+  (b) it renders and FLASHES PAST. Our loads finish in ~2 s off an SSD where
+      the Xbox took 8-15 s off DVD, and the title shows the screen for exactly
+      as long as the load takes. The player remembers a turquoise Now Loading
+      screen before every title animation and Corn dialogue, from when the
+      build was slower -- before the vblank fix took the frame rate from
+      10.2 Hz to 58.
+
+NO LOADING-SCREEN FRAME EXISTS IN ANY CAPTURE. The windows are ~2 s and the
+dumps fire every ~5 s. Searching every preserved BMP for a turquoise-dominant
+frame returns six, and all six are the MAP screen -- turquoise is simply
+JSRF's UI colour. To settle (a) against (b), capture the window: arm
+RECOMP_FB_DUMP_DRAW with a small stride across a level transition.
+
+The loading screen has a name and its asset is fine: CProgress::Show
+0x000666F0, DrawListDefault 0x00066550, and Media/Progress/Progress.dat,
+27,776 bytes, magic NORM, read successfully at boot in every run. NOTHING
+MEASURES WHETHER CProgress RUNS. Every instrument here watches the pushbuffer.
+
+
+====================================================================
+5. THE ARM RECOVERY LANDED, AND THE CHANGE I COMMITTED WAS BROKEN
+====================================================================
+
+0x00075EB3 is now genuinely reachable: body in recomp_stubs_unresolved.c, row
+1790 in recomp_dispatch.c, g_recomp_table_size 8875 -> 9306, declaration in
+recomp_funcs.h, and `_sub_00075EB3` verified present in the linked binary by
+nm. All 431 recovered addresses resolve in the binary.
+
+THE FIRST REGENERATION SILENTLY DID NOTHING. It printed healthy numbers -- 424
+arms in 52 tables, recovered 418 -- and produced a tree with NO TRACE of
+0x00075EB3 anywhere. sub_00075E90, the only dispatcher of table 0x00076610, is
+reached by a BACKWARD JUMP, so it lands in the recovery pass's `extra` set,
+which main() appends AFTER the arm walk has already scanned. 13 arms invisible,
+including the one the change exists for. The dry run in ed236fd could not
+catch it: it ran against a tree already patched 17 times, so those bodies were
+on disk. THE NUMBERS IN THAT COMMIT MESSAGE WERE TRUE AND INSUFFICIENT.
+Fixed; the pass is now a fixpoint.
+
+Also repaired on the way: recover_icall_entries.py never bumped the size
+literal or widened the flat span, so its rows were dead on arrival; and
+test_switch_arm_entries.py could only pass on an UNREPAIRED tree, so it would
+have gone red at the exact moment it was satisfied.
+
+GATE: one metric failed, unresolved_stubs 155 -> 596. It counts every
+definition in recomp_stubs_unresolved.c, and that file is also where recovered
+bodies land, so it has been measuring FILE MEMBERSHIP rather than stub-ness.
+Verified independently: the real placeholder shape (`g_esp += 4`, "not
+detected") is 31 before and 31 after -- NOT ONE NEW STUB. The baseline was
+rewritten to accept it and that change is UNCOMMITTED in the working tree.
+Worth a follow-up: make the metric count the shape, not the file.
+
+ctest 111/112 (the failure is jsrf_input_hotplug, which opens the player's
+real controller). Cost: recomp_stubs_unresolved.c 1.72 -> 5.99 MB, its compile
+5.60 -> 9.72 s (1.74x, not the 3x predicted), binary 29.94 -> 30.65 MB.
+
+NOT PROVEN. [ITAIL] reads 0 across an 18-minute playthrough that reached deep
+gameplay (on=1224), BUT THE PLAYER CONFIRMS THEY DID NOT REACH ROBOY. The
+failure path was not exercised. Walking to Roboy is the outstanding test.
+
+TWO ICALL DUMPS ARE STILL UN-MERGED, deliberately: icall_targets.dump at the
+repo root (11:17) and ~/Library/Application Support/JSRF/icall_targets.dump
+(the player's 13:32 session). Holding them out was the control that made the
+arm numbers attributable -- every recomp_000N.c came back byte-identical.
+Merging them is a separate, attributable regeneration.
+
+
+====================================================================
+6. THE APU FIX WORKED, AND THE AUDIO SPLITS IN TWO
+====================================================================
+
+MEASURED, the 18-minute playthrough against the ROBOY run, which is LONGER and
+on the old binary:
+
+                            ROBOY (old)     today (new)
+    voice starts                   1379            1224
+    walks_with_a_cycle          735,156          15,309      48x fewer
+    stranded voices (on-off)         35               2
+
+That is the boost improvement the player felt, and the new guard is doing
+exactly its job: withheld=104 at the hand-over, every one a case where the
+guest was retiring a voice the front end had already restarted.
+
+THE CHOPPINESS IS REAL AND IT IS NOT THE CENSUS. I claimed the census's
+GPU drain was causing it. Measured with NOTHING armed, it is still choppy. Two
+distinct problems:
+
+  DURING PLAY: the device is FED -- the healthy depth bucket accumulates
+    normally all run. So it is content, not starvation: repeated or
+    discontinuous samples. The player called this before I did.
+  LAST ~20 s: a hard stall. processed frozen at 6716917, no new voice starts
+    or stops, 295 sub-one-buffer events -- while the GPU kept drawing to the
+    final line. `processed` freezes in the OLD build too (6906548), so the
+    stall is pre-existing. The 295 underruns are new against a ROBOY control
+    that read zero, and are NOT attributed.
+
+
+====================================================================
+7. NEW INSTRUMENTS, ALL UNCOMMITTED
+====================================================================
+
+src/kernel/nv2a_pb_exec.c:
+  RECOMP_CLEAR_COLOR_FORCE=<hex>   clear to this instead. The value carries
+    meaning so it is read directly, NOT through recomp_switch.h -- 0x0000 is a
+    legitimate force-to-black and strcmp(v,"0") must not swallow it.
+  [CLEAR-WIN]   per-report histogram of the colours the guest asked for. The
+    old trace printed first sightings only, so all eight of its lines land in
+    the first minute and it is mute by the time anything goes black. Prints
+    "no colour clear since the last report" too, because that is a finding.
+  [RASTER-WIN]  per-report viewport and clip. USE WITH CARE: it samples
+    whichever pass ran last and CANNOT attribute state to a draw. It already
+    produced one false lead.
+
+Run scripts in ~/jsrf-build (outside the repo): run-baseline.sh (nothing
+armed), run-census.sh, run-levelload.sh, run-magenta.sh, run-combiner.sh,
+run-texmode-off.sh. Each sources the player's paths.conf, writes to its own
+preserved log and leaves last-run.log alone.
+
+From another agent, untracked and unrun: diagnostics/jsrf_first_fault/
+xemu_capture.sh and gpu_stream_diff.py (selftest passes, 20 assertions), plus
+docs/jsrf/plans/PLAN_2026-09-21_THE_XEMU_DIFFERENTIAL_AND_WHICH_SCENE.md. The
+disc was verified first: our dump and the ISO differ by EXACTLY 4 BYTES, both
+in the certificate (AllowedMedia, GameRegion). Same build, same timestamp, so
+a differential against xemu is against the identical image.
+
+
+====================================================================
+8. THE TEXT DEFECT HAS A SECOND MODE, AND IT IS TODAY'S MODE
+====================================================================
+
+MEASURED FROM PIXELS by an agent, in scenes nobody had scored:
+
+  MODE A, head replacement. Confirmed independently: `w` -> `"` and `y` -> `$`,
+    which is exactly page-1 cell indices drawn against page 0, with BOTH
+    glyphs still present underneath (more ink in the corrupt frame, not less).
+  MODE B, NEW AND NEVER WRITTEN DOWN. The page-1 batch draws NOTHING -- no
+    substitution, no extra ink -- and the count of missing characters equals
+    the count of 0x76-0x7F characters in the line, exactly, across four
+    distinct strings. Mode A appears in ZERO of today's nine bubble frames.
+  A THIRD STATE: only the CJK-page batch survives; both Latin batches and the
+    name label vanish.
+
+RULED OUT: atlas corruption and wrong texture format -- the same glyph renders
+right and wrong in ONE frame. Re-layout, truncation and typewriter artefact --
+the surviving glyph sits at the identical x.
+
+THE INVERSE-LENGTH RULE SHOULD BE DROPPED AS EVIDENCE. Every mode-A victim in
+the corpus is the same 3-quad NAME-LABEL batch, so "short" is confounded with
+"which batch"; and mode B's damage tracks the page-1 character count, which
+grows WITH length. The save-screen ordering satisfies both modes and
+discriminates nothing. Treat "which batch, and what happened to it" as the
+variable.
+
+CORPUS HYGIENE: glyphdump-2026-09-21-SAVEPOINT-KEEP is FOUR RUNS IN ONE
+DIRECTORY -- report indices are reused, so a short run leaves an older run's
+higher-numbered frames in place. 348 of its 607 frames are from 19 September
+and it contains no save screen.
+
+
+====================================================================
+9. STATE OF THE TREE
+====================================================================
+
+HEAD is 4a27e15. Twelve commits landed today, split by finding:
+
+  4a27e15 The two black screens are not one bug, and a signature belongs to it
+  ed236fd A recovered arm needs a table row, not just a body -- NOT PROVEN
+  3bf1d9b A total moves for two unrelated reasons and cannot tell them apart
+  6cc7b22 `=0` turned both new switches on, and the audit could not see them
+  c04c72e The Windows build has not linked since yesterday, and it is our own
+  f7c3260 Fourteen shifts into the sign bit, and one offsetof through a null
+  ff3645e The boost sound is a stale idle hand-over, and it is not a list cycle
+  fd61028 The snap copy is one part in four hundred, and it was inside `rest`
+  08a8718 On macOS every number we have about a black screen is from guest RAM
+  a079b67 The flip snapshot was one buffer with four readers, and it reallocs
+  c614e89 CD is the low nibble, and reading it inverted threw the dot product
+  57366d5 A mutex inside each body was never what the priority elevation bought
+
+Nothing is pushed. UNCOMMITTED: the arm-recovery repairs (four .py files), the
+rewritten control_flow_baseline.json, the three new instruments in
+nv2a_pb_exec.c, and another agent's two xemu tools plus its plan.
+
+The gen tree is post-regeneration. gen-2026-09-21-1003-PRE-ARMS-KEEP is the
+backup and is untouched. build-feav and ~/jsrf-build/JSRF.app carry the same
+UUID; the bundle was rebuilt after every source change today and verified by
+dwarfdump --uuid and nm, never by mtime.
+
+
+====================================================================
+10. OPEN, IN THE ORDER I WOULD TAKE THEM
+====================================================================
+
+1. THE LOAD SCREEN. Arm RECOMP_FF_BATCH_WATCH_TEX / RECOMP_FF_BATCH_DUMP_TEX
+   on the 40-second reproducer and find out whether TEXTURE0 is empty. Section
+   3. This is the narrowest open question in the project and it may explain
+   three symptoms at once.
+2. ROBOY. Walk to it. The arm fix is landed, built and unproven.
+3. "NOW LOADING". Settle (a) against (b) with RECOMP_FB_DUMP_DRAW across a
+   level transition. Section 4.
+4. THE VOCAL CHOPPINESS. Content, not starvation. Nothing has looked at the
+   sample stream.
+5. THE INTRO SILHOUETTES. Covered and written as zero. Same class as the Load
+   screen and probably the same cause; do not chase separately until 1 lands.
+6. THE END-OF-RUN APU STALL and the 295 underruns. Pre-existing and
+   unattributed respectively.
+7. THE TEXT DEFECT. Mode B is the live one. Section 8.
+8. THE DUPLICATE SURFACE SLOTS. The cache key is eight fields
+   (target, target_size, w, h, pitch, depth, depth_pitch, depth_size) and the
+   census prints three, so two slots at one address may differ legitimately in
+   the DEPTH PAIRING. Print the whole key before calling it a coherency bug.
+   Not the Load-menu cause: during the black, all four slots read zero.
+9. THE FIRST EVER `OWED` VERDICT, at t~17 of the level-load run: the bound
+   surface held 11,449 pixels guest RAM never received. Real, and nothing to
+   do with the black screens.
+10. unresolved_stubs should count the placeholder shape, not file membership.
+11. Windows: the exact-priority store and the D3D11 combiner path are both
+    unrun. A Windows session is needed.

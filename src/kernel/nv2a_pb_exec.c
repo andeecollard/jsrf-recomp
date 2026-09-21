@@ -2661,11 +2661,52 @@ static void dump_surface_bmp(const char *tag, unsigned seq)
 /* ACQUIRES, because this one has two callers on two threads: fb_watch() on the
  * pusher, and nv2a_pb_exec_dump_surface() on the report timer. The second was
  * reading the producer's buffer while the producer was filling it. */
+/* Defined just below; the freshness report needs it. */
+static uint32_t snapshot_nonzero_of(const FramePoolSlot *f);
+
+/* A SNAPSHOT THAT IS NOT FRESH LIES IN THE OPPOSITE DIRECTION, AND SILENTLY.
+ *
+ * s_snap is republished at FLIP_STALL. If the guest stops flipping -- which is
+ * one of the things a black screen can BE -- the pool keeps handing out the
+ * last frame it was given, and a series of snapNNN files then shows the last
+ * good picture over and over while the screen the player is looking at is
+ * black. Read naively that says "the renderer is fine", which is exactly the
+ * error the live-surface captures made in reverse.
+ *
+ * FramePoolSlot already carries what settles it: `seq`, which increments on
+ * every publish and is 0 when nothing was ever published, and `offset`, the
+ * colour surface the copy was taken from. So each dump records the identity of
+ * the frame it wrote and says when that identity has NOT MOVED since the last
+ * one. A repeat is still written to disk -- the file is evidence either way --
+ * but it can no longer be mistaken for a fresh frame.
+ *
+ * NOT-PUBLISHED and REPEAT are distinguished, because they mean different
+ * things: the first is a pool nothing ever reached, the second is a producer
+ * that has stopped. */
 static void dump_snapshot_bmp(const char *tag, unsigned seq)
 {
+    static unsigned long last_seq;
+    static unsigned last_offset;
+    static int have_last;
     const FramePoolSlot *f = frame_pool_acquire(&s_snap_pool);
-    if (f && f->px && f->w && f->h)
+    if (f && f->px && f->w && f->h) {
+        int repeat = have_last && f->seq == last_seq;
         write_bmp(tag, seq, f->px, f->w * f->bpp, 0, 0, f->w, f->h, f->bpp);
+        fprintf(stderr, "  [SNAP] %s%03u t=%.2f frame=%lu surface=%08X"
+                " %ux%u %ubpp nonzero=%u/%u%s%s\n",
+                tag, seq, trace_seconds(), f->seq, f->offset,
+                f->w, f->h, f->bpp * 8,
+                snapshot_nonzero_of(f), f->w * f->h,
+                repeat ? "   <<< SAME FRAME AS THE LAST DUMP -- the guest has"
+                         " not flipped since, so this file is a REPEAT" : "",
+                (have_last && f->offset != last_offset)
+                    ? "   (surface changed)" : "");
+        last_seq = f->seq; last_offset = f->offset; have_last = 1;
+    } else {
+        fprintf(stderr, "  [SNAP] %s%03u t=%.2f NOTHING PUBLISHED -- no frame"
+                " has ever reached the snapshot pool, so no file was written\n",
+                tag, seq, trace_seconds());
+    }
     frame_pool_release(&s_snap_pool, f);
 }
 
@@ -3326,6 +3367,130 @@ static void surface_audit_report(void) { }
 static void surface_census(uint32_t presented_offset) { (void)presented_offset; }
 #endif
 
+/* RECOMP_CLEAR_COLOR_FORCE=<hex> -- CLEAR TO THIS INSTEAD, AND SEE WHAT
+ * SURVIVES IT. The last discriminator for a black screen, and the only one
+ * the census cannot supply.
+ *
+ * gpu_nonzero counts NONZERO pixels, so "the draws wrote nothing" and "the
+ * draws wrote black" are the same reading -- and they are different bugs:
+ *
+ *   geometry off-screen or zero-area   nothing is covered
+ *   shaded/blended to nothing          the pixels are covered and come out 0
+ *
+ * Clear to magenta and the two separate instantly. If the screen comes back
+ * MAGENTA the draws never covered it and the fault is in the transform. If it
+ * comes back BLACK they covered it and wrote zero, and the fault is in the
+ * shading. One run, one glance, no counter to misread.
+ *
+ * The VALUE carries meaning, so this is read directly rather than through
+ * recomp_switch.h, which that header asks for explicitly -- 0x0000 is a
+ * legitimate force-to-black and strcmp(v,"0") must not swallow it. Unset is
+ * off; -1 is the sentinel for "no override".
+ *
+ * s_gpu.clear_color is left ALONE so [CLEAR-WIN] keeps reporting what the
+ * GUEST asked for. An instrument that reported our own override back to us
+ * would be measuring this switch. */
+static uint32_t clear_colour_effective(void)
+{
+    static long forced = -2;
+    if (forced == -2) {
+        const char *e = getenv("RECOMP_CLEAR_COLOR_FORCE");
+        forced = (e && *e) ? strtol(e, NULL, 0) : -1;
+        if (forced >= 0)
+            fprintf(stderr, "  [CLEAR-WIN] FORCING every colour clear to"
+                            " 0x%08lX -- what stays this colour was never"
+                            " covered by a draw\n", forced);
+    }
+    return forced >= 0 ? (uint32_t)forced : s_gpu.clear_color;
+}
+
+/* THE RASTER STATE THIS WINDOW ACTUALLY RAN WITH.
+ *
+ * The magenta probe on 21 Sep 2026 split the two black screens apart: the
+ * intro's silhouettes write ZERO over a magenta clear (covered, shaded to
+ * nothing) while the Now-Loading window stays FULLY MAGENTA (never covered at
+ * all). The second one is a coverage fault, and coverage is decided by three
+ * things nothing in this log has ever printed: the viewport scale, the
+ * viewport offset and the surface clip.
+ *
+ * A zero or near-zero viewport SCALE collapses every triangle to a point and
+ * is indistinguishable, in every counter we have, from geometry that was
+ * never submitted -- 510,381 batches were ACCEPTED in the run that showed
+ * this, with 0 backend refusals and 4 clip-w rejections, so the geometry
+ * reaches the GPU and covers nothing.
+ *
+ * Printed per window rather than on change, because "unchanged" is the
+ * interesting answer when the scene has changed. */
+static void raster_state_report(void)
+{
+    fprintf(stderr, "  [RASTER-WIN] viewport scale=(%.1f %.1f %.1f %.1f)"
+                    " offset=(%.1f %.1f %.1f %.1f) seen=%d |"
+                    " clip %ux%u+%u+%u\n",
+            s_gpu.vp_scale[0], s_gpu.vp_scale[1],
+            s_gpu.vp_scale[2], s_gpu.vp_scale[3],
+            s_gpu.vp_offset[0], s_gpu.vp_offset[1],
+            s_gpu.vp_offset[2], s_gpu.vp_offset[3],
+            s_gpu.vp_seen,
+            s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y);
+}
+
+/* WHAT THE GUEST ASKED FOR IN THIS REPORTING WINDOW, not just the first time
+ * it ever asked.
+ *
+ * The distinct-colour trace inside clear_surface prints one line per new
+ * value and then goes quiet for the rest of the run -- eight lines, all of
+ * them in the first minute. By the time a black window arrives it can no
+ * longer say what colour was in force, and the two readings it cannot tell
+ * apart are different bugs:
+ *
+ *   cleared to black, nothing drew over it   the draws are the fault
+ *   cleared to a COLOUR, screen came out 0   the clear or the surface is
+ *
+ * The ROBOY run makes that concrete: its last distinct-colour line is
+ * 0x000044B2 -- a non-black R5G6B5 -- at t~502, and the level-load blackouts
+ * are at t=548 and beyond. Whether that colour was still in force there is
+ * exactly the question, and the trace as written cannot answer it.
+ *
+ * Per window rather than per clear: a clear happens once or twice a frame, so
+ * a line each would bury the log, and the question is about the window. */
+#define CLEAR_WIN_SLOTS 8
+static uint32_t s_clear_win_col[CLEAR_WIN_SLOTS];
+static unsigned long s_clear_win_n[CLEAR_WIN_SLOTS];
+static unsigned s_clear_win_used, s_clear_win_over;
+
+static void clear_colour_note(uint32_t c)
+{
+    unsigned i;
+    for (i = 0; i < s_clear_win_used; ++i)
+        if (s_clear_win_col[i] == c) { s_clear_win_n[i]++; return; }
+    if (s_clear_win_used < CLEAR_WIN_SLOTS) {
+        s_clear_win_col[s_clear_win_used] = c;
+        s_clear_win_n[s_clear_win_used++] = 1;
+    } else {
+        s_clear_win_over++;
+    }
+}
+
+/* Printed UNCONDITIONALLY, including the no-clear case. "No colour clear in
+ * this window" is a finding of its own -- a title that stops clearing is not
+ * the same as one clearing to black -- and an absent line would read as the
+ * instrument being off. */
+static void clear_colour_report(void)
+{
+    unsigned i;
+    if (!s_clear_win_used) {
+        fprintf(stderr, "  [CLEAR-WIN] no colour clear since the last report\n");
+        return;
+    }
+    fprintf(stderr, "  [CLEAR-WIN] colours asked for since the last report:");
+    for (i = 0; i < s_clear_win_used; ++i)
+        fprintf(stderr, " 0x%08X x%lu", s_clear_win_col[i], s_clear_win_n[i]);
+    if (s_clear_win_over)
+        fprintf(stderr, " (+%u more past the slots)", s_clear_win_over);
+    fprintf(stderr, "\n");
+    s_clear_win_used = s_clear_win_over = 0;
+}
+
 static void clear_surface(uint32_t param)
 {
     unsigned long long _t_clear = pb_now_us();
@@ -3509,7 +3674,7 @@ static void clear_surface(uint32_t param)
             if (bpp == 2)
                 gpu_cleared = nv2a_gpu_clear_color(mem + s_gpu.color_offset,
                         bytes, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
-                        param, s_gpu.clear_color);
+                        param, clear_colour_effective());
 #endif
             if (!gpu_cleared && !discarded)
                 nv2a_gpu_invalidate_range(mem + s_gpu.color_offset, bytes);
@@ -3550,7 +3715,7 @@ static void clear_surface(uint32_t param)
              * (32,28,32), matching xemu's (227,226,229) and (30,27,30) on the
              * same cards. Only the black case agreed before, and black is the
              * one value both readings share. */
-                uint16_t v = (uint16_t)s_gpu.clear_color;
+                uint16_t v = (uint16_t)clear_colour_effective();
                 uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
                 for (x = 0; x < s_gpu.clip_w; x++)
                     p[x] = v;
@@ -3558,6 +3723,7 @@ static void clear_surface(uint32_t param)
         }
     }
     s_gpu.clears++;
+    clear_colour_note(s_gpu.clear_color);
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
      * activity says what the title was doing when it stopped. */
@@ -5717,6 +5883,8 @@ uint32_t nv2a_pb_exec_surface_va(void)
 
 void nv2a_pb_exec_report(void)
 {
+    clear_colour_report();
+    raster_state_report();
     /* THE FLIP READBACK. Printed in BOTH states, unconditionally, so a control
      * run sizes the A/B and ab_score.py's METAL_SWITCH_RE can see the token
      * and actually run its identical-arms VOID check. `taken` is one drain per
@@ -6002,9 +6170,32 @@ void nv2a_pb_exec_report(void)
             s_gpu.batches_no_layout);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
+    /* TWO PICTURES, AND THE SECOND IS THE ONE PEOPLE ACTUALLY WANT.
+     *
+     * reportNNN is the LIVE SURFACE, sampled on the report timer, which is a
+     * moment part way through composing a frame. Read as "what the picture
+     * looks like" it is a trap, and on 21 Sep 2026 it sprang: a title-screen
+     * report frame showed wide black bars across the scene, and the same run's
+     * `presented nonzero` read 306,830 of 307,200 at that moment -- there were
+     * no black bars in the frame anybody saw. Half-composed frames had already
+     * been the evidence for two theories that died that day.
+     *
+     * snapNNN is s_snap, the copy taken at FLIP_STALL, which is the only thing
+     * nv2a_pb_exec_surface ever hands the window. The long note at
+     * dump_snapshot_bmp says exactly this and names the report timer as a
+     * caller -- but nv2a_pb_exec_dump_surface, the function that would have
+     * been that caller, HAD NONE. It was written, documented and never wired
+     * up, so every framebuffer picture this project has looked at has been the
+     * live surface.
+     *
+     * Both are kept and both are named. The live surface is still the right
+     * thing to look at for "what did the parser leave behind"; it is simply
+     * not the right thing to look at for "what does the game look like". */
     {
         static unsigned seq;
-        dump_surface_bmp("report", seq++);
+        dump_surface_bmp("report", seq);
+        dump_snapshot_bmp("snap", seq);
+        ++seq;
     }
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed

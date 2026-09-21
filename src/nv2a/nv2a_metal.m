@@ -635,7 +635,7 @@ static NSString *const shader =
  " uint stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;"
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
  " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8];"
- " uint const0[8]; uint const1[8]; };\n"
+ " uint const0[8]; uint const1[8]; uint frag_force; };\n"
  "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; };\n"
  "struct Frag { float4 color [[color(0)]]; uint stencil [[color(1)]]; };\n"
  "vertex Out vs(uint id [[vertex_id]], const device Vertex *v [[buffer(0)]], constant Params &s [[buffer(1)]],const device uint*indices [[buffer(2)]]) {\n"
@@ -741,6 +741,50 @@ static NSString *const shader =
  " if(((cw>>18)&1)&&dcd)r[dcd].a=clamp(cdr.b,-1.0f,1.0f);}"
  " c=clamp(r[12]+(s.add_specular?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
  " else if(!s.untextured){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(s.modulate?c.a:1);if(s.modulate)c.rgb*=max(float3(0),d0.rgb);}"
+  /* RECOMP_FRAG_FORCE -- REPLACE THE FRAGMENT WITH ONE OF ITS OWN INPUTS.
+  *
+  * The intro attract camera draws a scene in which the distant city is
+  * correct and textured while the near geometry is SOLID BLACK, and the
+  * magenta clear proved those pixels are covered and written as zero rather
+  * than left bare. So the question is which input to this function is black,
+  * `tex` or `d0`, and nothing in the tree can answer it: the combiner trace
+  * reports the CONFIGURATION and RECOMP_FF_BATCH_DUMP_TEX reports the texture
+  * OFFSET. Neither reports a colour, and both are wired into the
+  * fixed-function branches -- which this title does not draw through. See the
+  * note at RECOMP_GLYPH_DUMP, which records that same blindness.
+  *
+  * This returns the input itself, so the answer is a picture:
+  *   1  TEXTURE0 raw          still black -> the texture is black
+  *   2  PRIMARY_COLOR raw     still black -> the diffuse is black
+  *   3  white                 which pixels this draw covers at all
+  *   4  TEXCOORD0 after the perspective divide, red/green, with BLUE where
+  *      w <= 0. A flat single colour across a whole object is the collapsed-q
+  *      defect: sample_lod divides by tc.w and sample_level then clamps, so
+  *      one corner texel is smeared over the primitive.
+  *
+  * It sits at the END of shade(), after the combiner, so one branch overrides
+  * every path -- combiner, modulate and untextured alike. The blend, alpha
+  * test and dither downstream are deliberately LEFT ALONE: they are the next
+  * question, not this one, and changing two things at once is how five
+  * theories died on 21 Sep 2026.
+  *
+  * Renders incorrectly by construction. Off unless set. */
+ " if(s.frag_force==1u)return float4(tex.rgb,1);"
+ " if(s.frag_force==2u)return float4(clamp(d0.rgb,0.0f,1.0f),1);"
+ " if(s.frag_force==3u)return float4(1,1,1,1);"
+  /* FRACT, NOT CLAMP, and the first version of this got it wrong.
+  *
+  * Clamping made "constant across the primitive" and "off the end of the
+  * texture" the SAME flat colour, and those two have opposite fixes: one is a
+  * vertex stage that never varied the coordinate, the other is a tiled
+  * surface whose wrap mode we dropped. fract keeps a gradient visible however
+  * far out of range the coordinate runs, and BLUE marks the pixels that are
+  * outside [0,1]. So: flat and blue is one texel smeared over a primitive;
+  * striped and blue is a tiled surface addressed correctly; flat and black is
+  * a coordinate that genuinely never changed. */
+ " if(s.frag_force==4u){float2 q=(i.t0.w!=0.0f)?i.t0.xy/i.t0.w:float2(0);"
+ " bool oor=q.x<0.0f||q.x>1.0f||q.y<0.0f||q.y>1.0f;"
+ " return float4(fract(q),oor?1.0f:0.0f,1);}"
  " return c;}\n"
  /* THE HARDWARE-STATE ENTRY POINT.
   *
@@ -1623,6 +1667,45 @@ static int no_alpha_test_on(void)
 static int legacy_zclamp_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
   return on; }
+
+/* RECOMP_FRAG_FORCE=<mode> -- the modes are documented in shade(), which is
+ * where they act. Read DIRECTLY rather than through recomp_switch.h, for the
+ * same reason RECOMP_CLEAR_COLOR_FORCE is: the value carries meaning, and
+ * recomp_switch_on maps every string that is not "0" to 1, which would
+ * collapse all four modes into mode 1 without saying so. */
+/* RECOMP_FRAG_FORCE_AFTER=<seconds> -- ARRIVE LATE, BECAUSE THE MENU HAS TO BE
+ * READABLE TO GET TO THE SCREEN UNDER TEST.
+ *
+ * Mode 3 paints every fragment white, including the main menu, so a run that
+ * needs a person to drive "title -> START -> main menu -> LOAD" cannot be
+ * driven: there is nothing on screen to navigate by. The 15:57 run is the
+ * evidence -- 66 seconds, presented coverage pinned at 307200/307200
+ * throughout, and NOT ONE window at the Load screen's 28 batches per frame.
+ * The experiment never reached its own condition and the result was worth
+ * nothing.
+ *
+ * So the force holds off until this wall-clock second, which is the same
+ * device RECOMP_GLYPH_DUMP_AFTER and RECOMP_FF_BATCH_DUMP_AFTER already use
+ * for the same reason. Drive the menus normally, stop on the screen under
+ * test, and the force arrives on top of it. */
+static uint32_t frag_force_mode(void)
+{ static int init; static uint32_t mode; static double after;
+  extern double xbox_TraceSeconds(void);
+  if(!init){ const char*e=getenv("RECOMP_FRAG_FORCE");
+             mode=(e&&*e)?(uint32_t)strtoul(e,NULL,10):0u; init=1;
+             { const char*a=getenv("RECOMP_FRAG_FORCE_AFTER");
+               after=(a&&*a)?atof(a):0.0; }
+             if(mode) fprintf(stderr,"  [FRAG-FORCE] mode %u -- every fragment"
+                 " is replaced by %s. THIS RENDERS INCORRECTLY.\n", mode,
+                 mode==1?"its TEXTURE0 sample":mode==2?"its PRIMARY_COLOR":
+                 mode==3?"white":mode==4?"its TEXCOORD0 after the divide":
+                 "nothing -- shade() ignores an unknown mode");
+             if(mode&&after>0.0)
+                 fprintf(stderr,"  [FRAG-FORCE] holding off until t=%.0fs --"
+                     " drive the menus normally until then.\n", after); }
+  /* Checked per draw, not cached: the whole point is that it changes. */
+  if(mode&&after>0.0&&xbox_TraceSeconds()<after) return 0u;
+  return mode; }
 
 /* RECOMP_METAL_EARLY_Z -- put the depth test in front of the shader for the
  * draws where that is exact.
@@ -2835,6 +2918,8 @@ void nv2a_metal_report(void)
             (unsigned long long)g_early_z_draws,
             (unsigned long long)g_late_z_draws,
             early_z_on()?"on":"OFF");
+    /* Defined beside nv2a_metal_draw, which is where it measures. */
+    { extern void t0_census_report(void); t0_census_report(); }
     fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
             vsh_gpu_on()?"guest programs on the GPU":"CPU interpreter",
             vsh_gpu_on()?"on":"OFF");
@@ -3037,7 +3122,8 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     uint32_t tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4];
     float lod_bias[4];
     uint32_t color_icw[8],alpha_icw[8],color_ocw[8],alpha_ocw[8];
-    uint32_t const0[8],const1[8];}Params;
+    uint32_t const0[8],const1[8];
+    uint32_t frag_force;}Params;
 
 /* Does the ring actually protect staging memory from the GPU?
  *
@@ -4261,6 +4347,89 @@ void nv2a_metal_frame_bench_flip(void)
     }
 }
 
+/* ── RECOMP_T0_CENSUS: WHICH DRAWS CARRY ONE TEXTURE COORDINATE ─────────
+ *
+ * WHAT IT IS FOR. On 21 Sep 2026 RECOMP_FRAG_FORCE=4 painted the attract
+ * scene with its own TEXCOORD0 and the answer was visible in one frame: the
+ * plaza floor is a wrapping gradient, and the Rokkaku-dai disc and the window
+ * mullions are ONE FLAT COLOUR, in range, with no blue. A primitive whose
+ * every vertex carries the same texture coordinate samples ONE TEXEL over its
+ * whole area, and a large object painted in one texel is exactly what the
+ * handovers have been calling a silhouette.
+ *
+ * That ruled the combiner, the diffuse, the clear, the wrap mode and the
+ * negative-q collapse out one at a time. What it cannot say is WHICH draws
+ * they are or why their coordinate never varies, because a picture has no
+ * batch numbers in it. This counts them.
+ *
+ * WHY IT SITS HERE and not in the fixed-function batch watcher: this title
+ * draws through guest vertex programs, and RECOMP_FF_BATCH_WATCH_TEX has both
+ * of its call sites inside the fixed-function branches -- the same blindness
+ * the note at RECOMP_GLYPH_DUMP records. nv2a_metal_draw is the common entry
+ * for both paths, so it sees every draw either way.
+ *
+ * FLAT IS NOT AUTOMATICALLY WRONG. A two-triangle quad drawn with a single
+ * solid colour texel is a legitimate way to fill a rectangle, and the NV2A
+ * does the same thing when no coordinate array is bound: every vertex takes
+ * the "current" register. So the report prints the AREA as well as the count
+ * -- what needs explaining is a flat coordinate over a large object, not a
+ * flat coordinate as such.
+ *
+ *   RECOMP_T0_CENSUS=<max lines>   off unless set; 0 counts without printing
+ *
+ * Read-only. */
+#define T0_CENSUS_KEYS 96
+static struct { uint32_t tex, w, h; float u, v;
+                unsigned long draws; double area;
+                /* THE SUM IS THE WRONG STATISTIC and the first run proved it:
+                 * every key came back with a big total built out of draws a
+                 * few pixels across, and the object actually painted in one
+                 * texel was nowhere in the table. Keep the biggest single
+                 * draw and its screen box. */
+                double maxarea; float bx0,by0,bx1,by1;
+                unsigned maxverts; } g_t0_flat[T0_CENSUS_KEYS];
+static unsigned g_t0_flat_n;
+static unsigned long g_t0_draws, g_t0_flat_draws, g_t0_flat_overflow;
+static double g_t0_flat_area, g_t0_varying_area;
+
+static int t0_census_cap(void)
+{ static int cap=-1;
+  if(cap<0){ const char*e=getenv("RECOMP_T0_CENSUS"); cap=(e&&*e)?atoi(e):-1;
+             if(cap<0&&e) cap=0; }
+  return cap; }
+
+void t0_census_report(void)
+{
+    if(!g_t0_draws) return;
+    fprintf(stderr,"[T0] textured draws=%lu, of which ONE COORDINATE ON EVERY"
+            " VERTEX=%lu (%.1f%%); screen area flat=%.0f varying=%.0f\n",
+            g_t0_draws, g_t0_flat_draws,
+            g_t0_draws?100.0*(double)g_t0_flat_draws/(double)g_t0_draws:0.0,
+            g_t0_flat_area, g_t0_varying_area);
+    if(g_t0_flat_overflow)
+        fprintf(stderr,"[T0]   %lu flat draws did not fit the %u-key table\n",
+                g_t0_flat_overflow,(unsigned)T0_CENSUS_KEYS);
+    /* Sorted by AREA, because one flat draw covering a third of the screen is
+     * the defect and ten thousand covering four pixels each are not. */
+    for(unsigned n=0;n<g_t0_flat_n;n++){
+        unsigned best=0; double top=-1.0;
+        for(unsigned i=0;i<g_t0_flat_n;i++)
+            if(g_t0_flat[i].maxarea>top){top=g_t0_flat[i].maxarea;best=i;}
+        if(top<0.0) break;
+        fprintf(stderr,"[T0]   tex %08X %ux%u  draws=%lu  biggest=%.0f px"
+                " (%u verts, screen %.0f,%.0f..%.0f,%.0f)  total=%.0f"
+                "  coord=(%.4f,%.4f)\n",
+                g_t0_flat[best].tex,g_t0_flat[best].w,g_t0_flat[best].h,
+                g_t0_flat[best].draws,g_t0_flat[best].maxarea,
+                g_t0_flat[best].maxverts,
+                (double)g_t0_flat[best].bx0,(double)g_t0_flat[best].by0,
+                (double)g_t0_flat[best].bx1,(double)g_t0_flat[best].by1,
+                g_t0_flat[best].area,
+                (double)g_t0_flat[best].u,(double)g_t0_flat[best].v);
+        g_t0_flat[best].maxarea=-1.0;
+    }
+}
+
 int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
  uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
  const float(*vertices)[16][4],unsigned count,unsigned primitive)
@@ -4273,6 +4442,61 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  if(s->target_bpp!=2)return reject("target-format");
  if(!s->clip_w||!s->clip_h||s->clip_x||s->clip_y||s->clip_w>4096||s->clip_h>4096)return reject("clip");
  if(s->target_pitch<(uint64_t)s->clip_w*2)return reject("target-pitch");
+ /* See the note on g_t0_flat. Bounded: one pass over the batch's vertices,
+  * and only when the switch has been read as set. */
+ if(t0_census_cap()>=0&&(s->texture_mask&1)&&count>=3){
+  extern double xbox_TraceSeconds(void);
+  enum { T0_POS=0, T0_TEX0=9 };
+  const float*t0=vertices[0][T0_TEX0];
+  int flat=1;
+  float x0=vertices[0][T0_POS][0],x1=x0,y0=vertices[0][T0_POS][1],y1=y0;
+  for(unsigned i=1;i<count;i++){
+   const float*p=vertices[i][T0_POS],*t=vertices[i][T0_TEX0];
+   if(p[0]<x0)x0=p[0]; if(p[0]>x1)x1=p[0];
+   if(p[1]<y0)y0=p[1]; if(p[1]>y1)y1=p[1];
+   /* memcmp, not ==: the question is whether the vertex stage produced the
+    * same BITS, and a tolerance here would hide a coordinate that varies in
+    * the last place -- which still samples one texel but is a different bug
+    * from one that never varied at all. */
+   if(flat&&memcmp(t,t0,16)) flat=0;
+  }
+  double area=(double)(x1-x0)*(double)(y1-y0);
+  g_t0_draws++;
+  if(!flat) g_t0_varying_area+=area;
+  else {
+   g_t0_flat_draws++; g_t0_flat_area+=area;
+   float w=t0[3]!=0.0f?t0[3]:1.0f, u=t0[0]/w, v=t0[1]/w;
+   unsigned k;
+   for(k=0;k<g_t0_flat_n;k++) if(g_t0_flat[k].tex==s->texture_offset) break;
+   if(k==g_t0_flat_n){
+    if(g_t0_flat_n<T0_CENSUS_KEYS){
+     g_t0_flat[k].tex=s->texture_offset; g_t0_flat[k].w=s->width;
+     g_t0_flat[k].h=s->height; g_t0_flat_n++;
+    } else { g_t0_flat_overflow++; k=T0_CENSUS_KEYS; }
+   }
+   if(k<T0_CENSUS_KEYS){
+    g_t0_flat[k].draws++; g_t0_flat[k].area+=area;
+    g_t0_flat[k].u=u; g_t0_flat[k].v=v;
+    if(area>g_t0_flat[k].maxarea){ g_t0_flat[k].maxarea=area;
+     g_t0_flat[k].maxverts=count;
+     g_t0_flat[k].bx0=x0; g_t0_flat[k].by0=y0;
+     g_t0_flat[k].bx1=x1; g_t0_flat[k].by1=y1; }
+   }
+   {static int shown; static double minarea=-1.0; int cap=t0_census_cap();
+    /* RECOMP_T0_CENSUS_MINAREA: the run that printed the first 40 flat draws
+     * printed 40 slivers a few pixels across, because those are simply what
+     * a frame has most of. The question is about LARGE flat objects. */
+    if(minarea<0.0){const char*e=getenv("RECOMP_T0_CENSUS_MINAREA");
+                    minarea=(e&&*e)?atof(e):0.0;}
+    if(shown<cap&&area>=minarea){ shown++;
+     fprintf(stderr,"  [T0] t=%.2f verts=%u prim=%u tex %08X %ux%u%s"
+             " screen %.0f,%.0f..%.0f,%.0f (%.0f px) coord=(%g,%g,%g,%g)\n",
+             xbox_TraceSeconds(),count,primitive,s->texture_offset,
+             s->width,s->height,s->dxt1?" dxt1":s->rgba8?" rgba8":"",
+             (double)x0,(double)y0,(double)x1,(double)y1,area,
+             (double)t0[0],(double)t0[1],(double)t0[2],(double)t0[3]);}}
+  }
+ }
  for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){
     if(u&&!s->extra_stages)return reject("missing-stage-state");
     const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;
@@ -4883,7 +5107,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  if(no_alpha_test_on())p.alpha_test=0;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));
+  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:

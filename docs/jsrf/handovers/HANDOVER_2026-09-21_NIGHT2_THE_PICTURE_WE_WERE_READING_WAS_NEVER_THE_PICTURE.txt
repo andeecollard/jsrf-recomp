@@ -1,0 +1,357 @@
+HANDOVER -- 21 September 2026 (night, second)
+THE PICTURE WE WERE READING WAS NEVER THE PICTURE
+
+SUPERSEDES HANDOVER_2026-09-21_NIGHT_THE_SILHOUETTES_WERE_THE_CAMERA_AND_NOT_THE_GAME.txt
+entirely. That file was written before the Load menu was re-measured, and two
+of its conclusions moved afterwards. Read this one.
+
+NARROWS, but does not refute, section 1 of the EVENING handover. Its Load
+screen finding SURVIVED verification and is now confirmed on presented frames.
+Its "intro silhouettes" line does not.
+
+A PLAYER-VISIBLE DEFECT IS NOW LOCATED TO ONE BINARY QUESTION, and a class of
+measurement error that has been in this project since the beginning is closed.
+
+
+====================================================================
+0. THE PLAYER PLAYED THROUGH AN ENTIRE LEVEL TODAY
+====================================================================
+
+Reported by the player at the end of the session. THERE IS NO PRESERVED LOG OF
+IT -- the newest file in ~/jsrf-build/preserved-logs is 15:59 and it is a
+Load-menu run, so the playthrough was either the 14:18 session the evening
+handover describes (18 minutes, on=1224, deep gameplay, did NOT reach Roboy) or
+a direct launch of JSRF.app, which does not write there.
+
+RECORDED AS THE PLAYER'S REPORT, not as a measurement, so that a later session
+does not go hunting for a log that was never written. If a full-level
+playthrough needs to be evidence for anything, it has to be run again under
+run_common.sh or a preserving script.
+
+WHAT IT MEANS ANYWAY: the build is in good enough shape to complete a level.
+That is the context every renderer defect below sits in. None of them stop the
+game being playable.
+
+
+====================================================================
+1. THE INSTRUMENT ERROR, AND IT IS THE BIGGEST THING HERE
+====================================================================
+
+EVERY FRAMEBUFFER PICTURE THIS PROJECT HAD EVER LOOKED AT WAS THE LIVE SURFACE,
+SAMPLED PART WAY THROUGH COMPOSING A FRAME.
+
+  reportNNN   dump_surface_bmp on the report timer      LIVE, mid-frame
+  drawNNN     dump_surface_bmp per batch                LIVE, explicitly mid-frame
+  flipNNN     dump_surface_bmp at the flip              LIVE
+  watchNNN    dump_snapshot_bmp, but only on a small-change event
+  stillNNN    the watched RECTANGLE only, not the frame
+
+nv2a_pb_exec.c has a function whose entire job is to write the PRESENTED frame,
+nv2a_pb_exec_dump_surface(), and the long note above dump_snapshot_bmp names the
+report timer as its caller. IT HAD NO CALLERS. Written, documented, reasoned
+about, never wired up.
+
+THE PROOF is one run, one instant, one sequence number. report and snap are now
+written as a PAIR, so reportNNN and snapNNN are the same moment:
+
+  snap031    the JSRF title screen, COMPLETE. Skull logo with eye sockets and
+             teeth, textured city, overpass, cars, plaza, wordmark.
+  report031  the same instant as a SOLID BLACK SILHOUETTE.
+
+The silhouettes are the base pass photographed before the detail passes landed.
+
+SO THE "INTRO SILHOUETTES" DEFECT IS NOT ONE. And the 96,603/153,600 reading at
+t=12-16 of the magenta run is not evidence of one either: at that point the
+title is showing the SEGA anti-graffiti notice, which is red and white text on
+black and is MEANT to be mostly black (a control boot reads 13% nonzero, mean
+colour (23,10,10), across snap010-015), and the frames either side are the city
+FADING IN.
+
+AND THE SNAPSHOT CAN LIE THE OTHER WAY, so that was closed before trusting it.
+s_snap is republished at FLIP_STALL; a guest that stops flipping makes the pool
+hand out the last good frame forever, and a series of healthy-looking files
+taken while the screen is black is the same error in reverse. Every dump now
+prints [SNAP] with the pool's frame sequence and the source surface and says
+outright when the sequence HAS NOT MOVED. Positive control on a 30 s boot:
+0 repeats, 0 never-published, sequence advancing ~140 publishes/second.
+
+WHAT TO DO ABOUT THE ARCHIVE: treat every black-screen claim from the last week
+as UNVERIFIED, not as refuted. Section 2 is one that survived. Section 3 has
+one that did not.
+
+
+====================================================================
+2. THE LOAD MENU: THE DEFECT IS REAL, CONFIRMED ON PRESENTED FRAMES
+====================================================================
+
+Two player-driven runs, NORMAL rendering, nothing forced:
+last-run_2026-09-21_155253_LOADMENU-SNAP-KEEP and _155516_LOADMENU-BLEND-KEEP.
+
+  t=38.05  snap037  frame=3184  nonzero=306820/307200
+           THE MAIN MENU, RENDERED PERFECTLY. "New Game / Load Game / VS Mode"
+           with Load Game highlighted in orange, full city background, skull,
+           wordmark. Nothing wrong with it at all.
+  t=39.05  snap038  frame=3215  nonzero= 99795/307200   faded almost to black
+  t=40.05  snap039  frame=3245  nonzero= 30463/307200
+  t=41.05+ snap040..snap072    nonzero=     0/307200   for THIRTY-THREE SECONDS
+
+  0 stale repeats. 0 never-published. Frame sequence 3429 -> 10766 throughout.
+  Reproduced in the second run with the black starting at t=29 instead.
+
+SO THE MENU IS NOT FAILING TO DRAW. It renders, it fades out CORRECTLY -- an
+ordinary fade -- and the screen that should follow never arrives. That is a
+different defect from "the Load screen renders black", which is how it has been
+described until now.
+
+WHAT IS HAPPENING DURING THE BLACK, all measured:
+  [STAGE]   28 draw calls per frame, every frame. That is the EVENING
+            HANDOVER'S OWN SIGNATURE for being on the Load screen, so its
+            finding is CONFIRMED rather than retracted.
+  [TEXTURE] prepared=283142 rejected=0
+  [METAL]   hw draws=283142 pipelines=0 refusals=0
+  [VSH]     195870 fixed-function batches accepted, 0 backend refused
+  [GPU]     the triangle total climbs by about 38,000 a second, 40.67M -> 40.76M
+  the flip rate JUMPS 7.7x at the transition, from ~30 publishes/s to ~230/s
+
+28 batches a frame are accepted, submitted and rasterised, and put no non-zero
+pixel on the presented surface.
+
+THE REMAINING QUESTION IS BINARY:
+  COVERAGE   they are not landing on the surface we present
+  SHADING    they land on it and write zero
+
+
+====================================================================
+3. WHAT DIED TONIGHT
+====================================================================
+
+THE MULTIPLY-BLEND ABSORBING STATE. The best theory of the evening: the screen
+carries a DST_COLOR/ZERO blend, multiply is absorbing, so once the surface is
+exactly zero every later multiply keeps it zero forever. It is a good mechanism
+and it is NOT what happens here. RECOMP_BLEND_TRACE armed on the Load screen for
+the first time:
+
+  [BLEND-FADE] batches under DST_COLOR=72 short=0 vsh-rejected=0
+               prepare-rejected=0 rasterised=72
+
+FROZEN AT 72 across every report, all rasterised, none rejected, and NOT MOVING
+during the black. No multiply blend runs on this screen at all. The fade is not
+a per-frame multiply that fails to stop.
+
+MY OWN NIGHT'S WORK, and it was six arms deep. Off the live-surface pictures I
+built two instruments and ran six runs chasing a texture that was never black:
+  "the combiner is innocent, so TEXTURE0 or PRIMARY_COLOR is black going in"
+  "forcing the raw TEXTURE0 sample leaves the object flat, so it is the texture"
+  "mode 4 shows a flat texture coordinate over the whole object"
+Every step read clean. Every step was reading a half-composed frame. And the
+contradiction was already in hand and unread: on the CPU-interpreter arm, where
+the census can see oT0 at all, ZERO of 7,454 textured draws carry one coordinate
+on every vertex and the largest flat draw in the run is SIX PIXELS.
+
+THE WHITE TEST FAILED TWICE, BOTH TIMES MY FAULT, and the reason is worth
+keeping. RECOMP_FRAG_FORCE=3 paints every fragment white INCLUDING THE MENU, so
+a run that needs a person to drive "title -> START -> main menu -> LOAD" cannot
+be driven: there is nothing on screen to navigate by. Run _155702 spent 66
+seconds pinned at 307200/307200 and never once hit 28 batches per frame -- the
+experiment never reached its own condition. The second attempt was stopped at
+t=22, before the force was due at t=45. NEITHER RUN SAYS ANYTHING about coverage
+vs shading. Fixed with RECOMP_FRAG_FORCE_AFTER (section 5), but see section 6:
+there is a better experiment that needs no timing window at all.
+
+
+====================================================================
+4. THE FF BATCH WATCHERS CANNOT ANSWER THE LOAD-SCREEN QUESTION
+====================================================================
+
+Open item 1 of the evening handover says to arm RECOMP_FF_BATCH_WATCH_TEX and
+RECOMP_FF_BATCH_DUMP_TEX there because "they dump what a batch's texture
+actually holds". They do not, and they cannot:
+
+  - All four call sites are inside the FIXED-FUNCTION branches
+    (nv2a_pb_exec.c:4392, 4394, 4427, 4428). This title draws through guest
+    vertex programs: 317,384 GPU vsh draws against 0 CPU in a 45 s boot. The
+    note at RECOMP_GLYPH_DUMP in nv2a_metal.m:4311 already records exactly this
+    blindness, in those words, and has since 19 September.
+  - Neither reports texel CONTENTS. ff_batch_dump prints the stage-0 texture
+    OFFSET and FORMAT registers and the vertex attributes; FF_BATCH_WATCH_TEX
+    reports whether vertex data CHANGED between two draws.
+  - Both need the texture offset in hex up front, which nobody has for this
+    screen.
+
+That run would have come back empty and been read as "the texture is fine".
+
+
+====================================================================
+5. THE INSTRUMENTS, ALL UNCOMMITTED
+====================================================================
+
+src/kernel/nv2a_pb_exec.c
+  snapNNN written beside reportNNN on the report timer. THE important one.
+  [SNAP] freshness and identity on every snapshot dump: pool frame sequence,
+    source colour surface, dimensions, presented nonzero, and an explicit
+    "SAME FRAME AS THE LAST DUMP" when the sequence has not moved, and
+    "NOTHING PUBLISHED" when the pool was never reached.
+
+src/nv2a/nv2a_metal.m
+  RECOMP_FRAG_FORCE=<1|2|3|4>  replaces every fragment with one of shade()'s own
+    inputs -- raw TEXTURE0, PRIMARY_COLOR, white, or TEXCOORD0 after the divide
+    (fract, blue for out of range). At the END of shade(), the one function the
+    fixed-function and programmable paths share, so one branch covers every draw.
+  RECOMP_FRAG_FORCE_AFTER=<seconds>  hold the force off until this wall-clock
+    second, so the menus can be driven normally first. Same device as
+    RECOMP_GLYPH_DUMP_AFTER. Added because of section 3.
+  RECOMP_T0_CENSUS=<lines>, RECOMP_T0_CENSUS_MINAREA=<px>  counts draws whose
+    TEXCOORD0 is identical on every vertex, keyed by texture, reporting the
+    LARGEST single draw per key as well as the total.
+
+  THE CENSUS CARRIES A WARNING IT EARNED. It reads s_outputs, and with the
+  guest's vertex programs on the GPU s_outputs carries the program's INPUTS --
+  see "THE GPU PATH STOPS HERE" in nv2a_pb_exec.c. On the default arm it
+  measures v9 and its screen boxes are pre-transform. It only measures oT0
+  under RECOMP_METAL_VSH=0.
+
+Run scripts in ~/jsrf-build, outside the repo. All preserve their own log and
+dump directory and none touches last-run.log:
+  run-loadmenu-snap.sh    normal rendering + snap captures. THE REPRODUCER.
+  run-loadmenu-blend.sh   the same plus RECOMP_BLEND_TRACE. Counters only.
+  run-loadmenu-white.sh   FRAG_FORCE=3 with AFTER=45, player-driven
+  run-fragforce.sh <mode> [secs]   unattended, silent, any mode
+  run-vshcpu.sh [secs]             the CPU-interpreter arm
+  run-t0census.sh [secs]           the flat-coordinate census
+
+
+====================================================================
+6. THE NEXT EXPERIMENT, AND IT NEEDS NO TIMING WINDOW
+====================================================================
+
+DO NOT re-run the white test first. It is player-driven, it depends on being on
+the right screen at the right second, and it has already burned two runs. There
+is a passive measurement that answers the same binary question from ANY run
+that reaches the Load screen.
+
+The symbol work already in this tree gives it for free. jsrf-d3ddevice-offsets.tsv
+derives 38 D3DDevice fields FROM THIS TITLE'S OWN default.xbe, each with its
+evidence. The three that matter:
+
+  D3D8__D3D_g_pDevice          0x0019DCE0   the device pointer global
+  D3DDevice.m_RenderTarget     0x2070       certain
+      CLI prints 0x00002070; SetRenderTarget stores at 0x0018D390
+      mov [esi+0x2070],edi; 4039 OOVPA XREF_ENTRY(0x18) on
+      SetRenderTarget@0x0018D0F0 reads 0x2070
+  D3DDevice.m_BackBuffer[0]    0x207C       high
+  D3DDevice.m_DepthStencil     0x2074       certain
+
+So: deref 0x0019DCE0 -> device -> +0x2070, resolve that D3DSurface to its guest
+offset, and log it beside s_gpu.color_offset every report.
+
+  THEY MATCH    -> the guest and we agree on the target, the batches land
+                   there, and it is a SHADING fault. FRAG_FORCE then earns its
+                   run, with AFTER set.
+  THEY DIVERGE  -> the guest pointed somewhere we never followed. That is the
+                   bug, named and located, and Cxbx-Reloaded's HLE D3D8 is the
+                   authority on what SetRenderTarget is supposed to do to the
+                   pushbuffer.
+
+It cannot fail to reach its own condition, which is exactly what the white test
+could not promise.
+
+
+====================================================================
+7. "NOW LOADING" -- PROBABLY NOT BROKEN, AND THE PLAYER SAID WHY
+====================================================================
+
+The player reported it missing before the title animation, then said "we were
+loading the now loading last week".
+
+That is reading (b) of the evening handover's section 4, and the player's own
+memory is the best evidence for it yet. From HANDOVER_2026-09-16: "THIS WAS THE
+PLAYER'S 'STUCK ON NOW LOADING' AND THEIR SILENT MUSIC" -- vblank delivery
+latched shut, the build ran at 10.2 Hz, and the CRI worker resumed once per
+vblank never resumed. THEY SAW THAT SCREEN LAST WEEK BECAUSE THE GAME WAS STUCK
+ON IT. RECOMP_NV2A_PMC_UPMIRROR took the frame rate to 58 Hz; loads off an SSD
+now finish in about two seconds where the Xbox took 8-15 off DVD, and the title
+shows the screen for exactly as long as the load takes.
+
+NOT SETTLED. No capture of the window exists. A 90 s CPU-interpreter boot --
+slow, which stretches the load window the way the pre-fix build did -- produced
+no turquoise-dominant frame in 56 captures, but it never left the attract loop
+so it never performed a level load. Settle it with snap dumps at a small stride
+across a REAL level transition, which the player can now reach (section 0).
+
+
+====================================================================
+8. THE OUTSIDE PROJECTS, CHECKED AGAINST THE TREE
+====================================================================
+
+From the player's list, ordered by what they answer. Items 1, 3 and 7 are
+ALREADY DONE and merged -- worth knowing before anyone spends a session on them.
+
+  1. XbSymbolDatabase -- DONE, INCLUDING THE D3D8LTCG CASE. Cloned and built at
+     ~/jsrf/XbSymbolDatabase. jsrf-symbols-merged.tsv carries 156 D3D8__,
+     137 DSOUND__ and 46 XAPILIB__ entries, and the LTCG handling is visibly
+     working: LTCG::Nop1Arg, LTCG::Nop0Arg, LTCG::GetFirstDWORDMember and
+     LTCG::GetSecondDWORDMember all came through with their deduplication notes.
+     dev+0x30 and dev+0x34 ARE NO LONGER GUESSES -- they are m_Fence and
+     m_pFenceWord in jsrf-d3ddevice-offsets.tsv, both "certain", with the
+     disassembly cited (D3D_SetFence 0x001913AD; D3D_BlockOnTime 0x0019144C
+     mov eax,[edi+0x34]; mov ecx,[eax] -- dereferenced, so a pointer).
+  2. Cxbx-Reloaded (source) -- NOT PRESENT, and the one I would actually pull,
+     but ONLY on the coverage branch of section 6. Authoritative on what
+     SetRenderTarget / KickOff / BlockUntilIdle do to the pushbuffer.
+  3. KeybadeBlox/JSRF-Decompilation -- DONE. Cloned at ~/jsrf/JSRF-Decompilation
+     and merged; sub_0003C310 already comes back as TextRenderer_MAYBE::draw,
+     and docs/jsrf/plans/PLAN_2026-09-21_WHAT_THE_SYMBOLS_MAKE_POSSIBLE.md is
+     built on it.
+  4. silveriviere/Project-Graffiti-Soul -- NOT PRESENT. Unassessed.
+  5. XboxDev/ghidra-xbe + ghidra-xbox-extensions -- NOT PRESENT. Would replace
+     capstone listings with a decompiler view.
+  6. FaithStudio/JSRF_ModTool -- NOT PRESENT, but jetfont.dat's layout already
+     came from the JSRF Inside write-ups.
+  7. xemu -- PRESENT at ~/jsrf/xemu-debug-session, plus the untracked
+     diagnostics/jsrf_first_fault/xemu_capture.sh and gpu_stream_diff.py and
+     PLAN_2026-09-21_THE_XEMU_DIFFERENTIAL_AND_WHICH_SCENE.md. The disc was
+     verified first: our dump and the ISO differ by EXACTLY 4 BYTES, both in the
+     certificate (AllowedMedia, GameRegion).
+
+
+====================================================================
+9. STATE OF THE TREE
+====================================================================
+
+HEAD is still 4a27e15. NOTHING WAS COMMITTED TODAY IN THIS SESSION.
+
+Uncommitted and carried over from the evening: the arm-recovery repairs (four
+.py files), the rewritten control_flow_baseline.json, the three instruments in
+nv2a_pb_exec.c (RECOMP_CLEAR_COLOR_FORCE, [CLEAR-WIN], [RASTER-WIN]), and
+another agent's two xemu tools plus its plan.
+
+Added by this session and uncommitted: the snap dump and [SNAP] freshness in
+nv2a_pb_exec.c; RECOMP_FRAG_FORCE, RECOMP_FRAG_FORCE_AFTER and
+RECOMP_T0_CENSUS in nv2a_metal.m; this file; and the superseded
+HANDOVER_2026-09-21_NIGHT_THE_SILHOUETTES_WERE_THE_CAMERA_AND_NOT_THE_GAME.txt,
+which should be kept -- it is the record of the retraction being narrowed.
+
+build-feav and ~/jsrf-build/JSRF.app carry UUID 9DAA0997-4245-3E02-B084-9DFBD1F0C282.
+The bundle was rebuilt after every source change and verified by dwarfdump
+--uuid against the binary, never by mtime.
+
+
+====================================================================
+10. OPEN, IN THE ORDER I WOULD TAKE THEM
+====================================================================
+
+1. THE RENDER-TARGET PROBE. Section 6. Passive, cannot miss its condition, and
+   it closes the last binary question on a defect the player can see.
+2. Then, and only then, FRAG_FORCE on the Load screen with AFTER set.
+3. "NOW LOADING" across a real level transition, with snap dumps. Section 7.
+4. RE-READ the last week's black-screen claims against snapNNN, as UNVERIFIED
+   rather than refuted. Section 2 is one that survived a check; there will be
+   others.
+5. Make snapNNN the default for every run, and consider renaming reportNNN to
+   something that cannot be mistaken for the frame.
+6. PRESERVE A REAL PLAYTHROUGH. Section 0: the player completed a level and
+   there is no log of it. The next one should run under a preserving script.
+7. Everything in the evening handover's section 10 from item 2 onward -- Roboy,
+   the vocal choppiness, the APU stall, the text defect mode B, the duplicate
+   surface slots, the OWED verdict, unresolved_stubs, Windows -- is untouched
+   by tonight and still stands.
