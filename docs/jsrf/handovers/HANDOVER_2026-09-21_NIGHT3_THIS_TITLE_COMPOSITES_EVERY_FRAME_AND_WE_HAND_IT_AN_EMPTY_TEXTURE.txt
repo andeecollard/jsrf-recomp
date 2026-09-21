@@ -1,0 +1,475 @@
+HANDOVER -- 21 September 2026 (night, third)
+THIS TITLE COMPOSITES EVERY FRAME, AND WE HAND IT AN EMPTY TEXTURE
+
+FOLLOWS HANDOVER_2026-09-21_NIGHT2_THE_PICTURE_WE_WERE_READING_WAS_NEVER_THE_PICTURE.txt
+and does not supersede it. That file's instrument finding stands unchanged and
+is the reason anything here is trustworthy. Its OPEN list is worked through
+below: items 1 and 2 are CLOSED, item 3 has a new and better explanation, and
+item 4 gained a method.
+
+A PLAYER-VISIBLE DEFECT IS NOW LOCATED TO A MECHANISM, not a suspect. Three
+screens are candidates to share it. One run gates the fix.
+
+Goals file: docs/jsrf/goals/JSRF_GOALS_2026-09-21_NIGHT2_THE_PROBE_THAT_CANNOT_MISS.md
+(G26 answered, G27 opened).
+
+
+====================================================================
+0. THE ANSWER, IN ONE PARAGRAPH
+====================================================================
+
+JSRF COMPOSITES EVERY FRAME BY RENDERING INTO A SURFACE AND THEN SAMPLING
+THAT SURFACE AS A FULL-SCREEN LINEAR TEXTURE. Measured on xemu: 3,700
+render-to-texture events across 3,671 flips, a flat ~250 per 250 flips from
+boot through the title to the Load screen. Our TEXTURE0 sample on the Load
+screen is BLACK while coverage is complete and the coordinates are correct.
+So the composite source never reaches our sampler, and every screen loses
+exactly as much as it composites: the title loses its overlay and keeps its
+city, the Load screen is composited in full and loses everything.
+
+THE MECHANISM IS OURS. Not the guest, not the recompilation, not the
+pushbuffer parse -- all three were measured and cleared today.
+
+
+====================================================================
+1. WHAT WAS PROVEN, IN ORDER, AND EVERY LINE OF IT ON PRESENTED FRAMES
+====================================================================
+
+All of this is on snapNNN, the presented frame, with [SNAP] freshness printed
+beside every dump. Every run below reports 0 stale repeats and 0
+never-published. That is the night-2 instrument doing its job.
+
+G26 -- DOES THE GUEST AGREE WITH US ABOUT WHERE IT IS DRAWING?
+
+  A passive probe on the report timer:
+      D3D_g_pDevice 0x0019DCE0 -> device -> +0x2070 m_RenderTarget
+                               -> that D3DSurface -> +0x04 Data
+  against s_gpu.color_offset, byte for byte.
+
+  D3DSurface.Data = +0x04 IS NEW and was derived from this title's own XBE.
+  SetRenderTarget reads [edi+4] at 0018D3E2 and emits it as the payload of
+  0x40210 (SET_SURFACE_COLOR_OFFSET) at 0018D450 -- VERBATIM, no mask, no
+  shift. Our parser latches that payload just as verbatim. That is what makes
+  a byte-for-byte verdict possible at all. The offsets table stopped at the
+  device struct; this row extends it.
+
+  Player-driven run to the Load screen, 35 seconds of black (t=30..65,
+  reproducing night 2's 33):
+
+      MATCH 66   COVERAGE 0   ALIAS 0   sampled-off-target 0
+      bound-ever=yes 66   device never missing   ring check never failed
+      0 stale snapshots   frame sequence 7711 -> 10585
+
+  THE COVERAGE BRANCH IS DEAD. The batches are aimed at a surface we parse
+  and present. Cxbx-Reloaded, which was the pull reserved for that branch, is
+  not needed.
+
+THE FOUR FORCE MODES, each armed by the defect itself (section 3):
+
+      mode 3  white           307200/307200   the batches cover EVERY pixel
+      mode 2  PRIMARY_COLOR   307200/307200   and it is (248,252,248), which
+                                              is (31,63,31) in the RGB565 the
+                                              surface is stored in: pure white
+      mode 1  TEXTURE0                0/307200 for 22 straight reports
+      mode 4  TEXCOORD0       flat, "out of range" -- SEE SECTION 2, THIS ONE
+                                              MEANS THE OPPOSITE OF WHAT IT
+                                              LOOKS LIKE
+
+  Throughout: 28.0 draws per flip, [TEXTURE] prepared=327050 rejected=0,
+  [METAL] hw draws=327050 refusals=0.
+
+THE XEMU DIFFERENTIAL -- THE FIRST ONE THIS PROJECT HAS EVER RUN
+
+  Title screen, cold boot both sides, ~76 s each. xemu 0.8.136.
+      xemu : 10,544,071 lines, 2,688 flips, 812 MB
+      ours : 513 distinct (subchannel, method) pairs, 3,955 flips
+
+      METHODS WE RECORDED AND XEMU DID NOT:  0
+      METHODS XEMU SAW AND WE NEVER DID:    25  -- ALL EXPLAINED, section 2
+
+  AT THE TITLE SCREEN THE TWO PUSHBUFFER STREAMS AGREE. The plan file wrote
+  down what that means before the run: "the same stream on both sides -> the
+  fault is in our backend ... the difference between 'the guest asked for a
+  black quad' and 'we made a quad black'." WE MAKE IT BLACK.
+
+THE LOAD SCREEN ON XEMU -- 119 s, 23,269,892 lines, 1.79 GB, 3,671 flips.
+The player confirms xemu ANIMATES that screen where ours is black, so the
+scenes are matched on the thing that matters.
+
+      render_to_texture : 500 in the last 500 flips -- once per frame
+      surface_download  : 0
+      surface_upload    : 0
+      "Rendering surface 0x03ec4000 to texture (640x480)"
+
+  and 0x03ec4000 is one of the four SET_TEXTURE_OFFSET[0] values bound there.
+  Stage-0 format is 0x11129: 0x11 is LU_IMAGE_R5G6B5, LINEAR, sized by
+  SET_TEXTURE_IMAGE_RECT=0x028001e0 = 640x480.
+
+AND THEN THE FINDING GOT BIGGER. render_to_texture is not a Load-screen
+feature. Bucketed across the WHOLE run: 3,700 events over 3,671 flips, a flat
+250 per 250-flip bucket from the first bucket to the last. THIS TITLE
+COMPOSITES EVERY FRAME, EVERYWHERE.
+
+
+====================================================================
+2. WHAT I GOT WRONG, AND WHAT CAUGHT IT
+====================================================================
+
+Three of them, all caught by measurement rather than by review, and all three
+would have sent a later session somewhere expensive.
+
+THE COLLAPSED-Q READING, AND IT IS THE IMPORTANT ONE. Mode 4 showed TEXCOORD0
+flat (fract(q)=0.5 everywhere) and "out of range" (blue everywhere), and the
+shader's own comment names that pattern as the collapsed-q defect: one corner
+texel smeared over the primitive. I reported it as such. IT IS NOT.
+
+  Mode 4's `oor` flag tests q against [0,1]. The Load screen's texture is
+  LINEAR, and linear textures take UNNORMALISED coordinates, 0..640 and
+  0..480. So blue everywhere is the CORRECT result and indicates nothing at
+  all. And fract(q)=0.5 uniformly is exactly what a 1:1 full-screen blit with
+  half-texel centring produces -- at pixel x the coordinate is x+0.5, so
+  fract is 0.5 at every pixel.
+
+  THE COORDINATES WERE RIGHT THE WHOLE TIME, and our own code already knew
+  it: nv2a_metal.m:674 clamps uv to [0,w]x[0,h] when linear, and
+  nv2a_texture_copy.c:725 says "Nonlinear textures use normalized
+  coordinates, unlike image rectangles."
+
+  WHAT THIS COSTS A LATER SESSION IF UNREAD: mode 4 is now a TRAP on any
+  linear texture. Do not read its blue as a defect without checking the
+  stage's format first.
+
+THE TRUNCATING-PARSER READING. The differential's 25 missing methods included
+texture stage 3 (0x1BC0 x8160) and transform constants 16-23
+(0x0BC0-0x0BDC), and our own lists stop exactly one slot short in BOTH cases
+-- the precise shape of a parser that truncates. It is not one. Bucketed by
+flip position, every single one stops dead at flip 300 and never appears
+again in the remaining 2,388 flips. They belong to the boot and intro phase,
+which xemu spends far longer in: it loads off a DVD image and played the NOW
+LOADING animation, ours loads off an SSD. A SCENE DIFFERENCE, which is what
+CLAUDE.md's scene-match rule exists to catch.
+
+  Checked before concluding, and both innocent explanations died too: the
+  pair table holds PB_MAX_METHODS=4096 so the 513 is genuine saturation and
+  not a recording cap, and nv2a_pb_exec.c:5333 already decodes the whole
+  0x0B80-0x0BFC constant window.
+
+THE ARM-DIFFERENCE HYPOTHESIS. Night 2 recorded that on the CPU-interpreter
+arm ZERO of 7,454 textured draws carry one coordinate on every vertex. I read
+that as localising a coordinate collapse to the GPU vertex path and predicted
+mode 4 would look different under RECOMP_METAL_VSH=0. It does not. The CPU
+arm genuinely engaged ([METAL] vsh: CPU interpreter, 472 CPU draws, 0 GPU),
+armed on the Load screen at 28.0 draws/flip, and produced a picture
+BYTE-IDENTICAL in colour distribution to the GPU arm -- RGB(128,128,248) and
+RGB(120,124,248), 1092 and 1091 samples, the same two values in the same
+proportions. Refuted, and the player called the approach before I did.
+
+  With section 2's first correction this is no longer even a puzzle: the
+  coordinates are correct on both arms because they were always correct.
+
+AND ONE FROM THE INSTRUMENT SIDE: the first RECOMP_FRAG_FORCE_ON_BLACK armed
+at t=18 on a boot transition and painted the title white before it could be
+navigated. The assumption under it -- "a menu is never all-zero" -- was mine
+and said nothing about the BOOT. See section 3.
+
+
+====================================================================
+3. THE INSTRUMENTS BUILT, ALL COMMITTED
+====================================================================
+
+src/kernel/d3d8_ring.{h,c}
+  d3d8_ring_read_target() -- the guest's own render target, depth stencil and
+  back buffer 0, with D3DSurface field offsets carrying the disassembly that
+  derived them.
+
+  IT VALIDATES ITSELF, AND IT HAS TO. A null or stale device pointer would
+  read as a MISMATCH -- as the answer, and the wrong one. So every read also
+  takes the write cursor at +0x00 and the ring bounds at +0x24/+0x28 and
+  checks lo < hi and lo <= put <= hi. When that fails the line says
+  "FIX THE PROBE, NOT THE RENDERER" and gives NO verdict.
+
+src/kernel/nv2a_pb_exec.c
+  [RT] every report: guest target, its Data, our live offset, the PRESENTED
+  offset, bound-ever, and a verdict.
+
+  ONE LINE IS NOT A VERDICT, and that was measured rather than assumed. The
+  first version compared against s_gpu.color_offset alone and read MATCH 43 /
+  DIVERGE 1 across a 45 s attract boot -- on a screen that was visibly
+  rendering the whole time. This title rotates three surfaces (0x005F0000,
+  0x00688000, 0x0071E000) and the report samples an arbitrary instant inside
+  a frame. The test is now whether the guest's target has EVER been a surface
+  we parsed. READ THE TALLY, NOT A LINE.
+
+src/nv2a/nv2a_metal.m
+  RECOMP_FRAG_FORCE_ON_BLACK=<reports> -- arm the fragment force off the
+  DEFECT instead of off a clock.
+
+  WHY IT IS NOT A WALL-CLOCK: the player reached the Load screen at t=30 in
+  one run and t=50 in the next, so any fixed RECOMP_FRAG_FORCE_AFTER is
+  either early enough to blind the menu or late enough to miss the window.
+  That is what made the white test worthless twice before today.
+
+  AND WHY BLACK ALONE IS NOT THE CONDITION: version one armed at t=18 on a
+  boot transition. The Load screen is not "black", it is BLACK WHILE THE
+  GUEST IS STILL SUBMITTING A WHOLE SCENE -- 28 draws a flip, confirmed in
+  [STAGE] as vsh=28 prepare=28 submit=28 calls per frame. The arm now
+  requires all-zero AND >=10 draws per flip, differenced per window and
+  divided by the flips between. [FRAG-ARM] prints its inputs beside its
+  decision every report.
+
+  POSITIVE CONTROL FOR THE FORCE ITSELF, free from the failed run: after it
+  armed at t=18 the screen pinned to 307200/307200 from t=22. FRAG_FORCE=3
+  does turn the presented frame white, so a black frame under mode 1 is a
+  fact about the sample and not about the switch.
+
+diagnostics/jsrf_first_fault/runs/   -- and they are IN THE REPOSITORY now
+  Thirteen recipes plus jsrf-d3ddevice-offsets.tsv lived in ~/jsrf-build,
+  outside version control entirely, one rm from gone. ~/jsrf-build/run-*.sh
+  are now SYMLINKS into this directory; editing either path edits one file.
+      run-rtprobe.sh              G26's positive control, unattended
+      run-loadmenu-frag.sh <mode> [black] [vsh]   the force modes, self-arming
+      run-loadmenu-white.sh       mode 3, kept as the record
+      run-ours-title.sh           our side of the differential, unattended
+
+diagnostics/jsrf_first_fault/xemu_capture.sh -- FIXED, see section 6.
+
+
+====================================================================
+4. THE ONE RUN THAT GATES THE FIX, AND WHY I DID NOT JUST FIX IT
+====================================================================
+
+I WENT LOOKING FOR THE MISSING READ-BACK AND IT ALREADY EXISTS:
+
+  nv2a_metal_sync()        writes the BOUND surface back to guest RAM
+  nv2a_metal_sync_range()  additionally pays any cache slot that OWES guest
+                           RAM and overlaps a named range
+  and the backend already reads back "at a flip, a clear, a capture, a
+  surface [target] change" (nv2a_metal.m:76), with the rebind path syncing
+  when surface_target != target.
+
+Render-to-texture REQUIRES a target change -- you cannot render into
+0x03ec4000 and sample it in the same bind -- so the write-back a naive fix
+would add is plausibly already happening. Adding a second one would be
+patching over a bug that lives elsewhere, with no way to tell a real fix from
+a coincidence. That is CLAUDE.md's own rule: do not patch around a gate until
+a run proves which value is wrong.
+
+ALSO RULED OUT BEFORE PROPOSING ANYTHING: RECOMP_METAL_DEFER_SWAP ships OFF
+("THIS CHANGES WHEN GUEST RAM BECOMES CORRECT, which is why it ships off")
+and our Load-menu runs contain zero DEFER lines. So surface_pay_debt_for_range
+had nothing to pay and the deferred-swap path is NOT the culprit.
+
+THE RUN: our side at the Load menu with
+
+    RECOMP_SURFACE_CENSUS   what the GPU holds beside what guest RAM holds,
+                            "and where they disagree is where the frame goes
+                            missing"
+    RECOMP_PB_SCAN=1        because "our Load screen binds one of OUR OWN
+                            surfaces as a texture" is still INFERRED from the
+                            guest being identical, not measured
+
+IT SPLITS THREE WAYS AND ONLY ONE OF THEM IS THE DOZEN-LINE FIX:
+
+  GPU has the picture, guest RAM black -> the read-back is not reaching this
+        surface. Small and localised: extend the overlap check on the texture
+        upload path (nv2a_metal.m:4879 is where it would go).
+  both black -> we never rendered it correctly in the first place. A
+        different bug, upstream of coherency.
+  guest RAM has it -> the RTT theory is wrong and the fault is in the
+        texture BINDING, not its contents.
+
+
+====================================================================
+5. THREE SCREENS, PROBABLY ONE CAUSE
+====================================================================
+
+THE LOAD SCREEN. Confirmed shading fault, full-screen composite, black.
+
+THE TITLE SCREEN. Night 2's own capture recorded "the overlay ellipse, bars
+and lettering shade to exactly (0,0,0) for 23 consecutive draws with correct
+coverage and correct occlusion" (fbdump-2026-09-21_1400-LOADMENU-CENSUS-KEEP).
+SAME SIGNATURE. The title still shows its city because only part of that
+screen is composited; the Load screen is composited in full.
+
+"NOW LOADING" -- A BETTER EXPLANATION THAN THE ONE ON RECORD. The standing
+theory is that it passes too quickly: loads finish in ~2 s since the vblank
+fix while captures were ~5 s apart. If compositing is broken everywhere, the
+screen does not need to be brief to be missing -- IT NEVER DRAWS.
+
+  THE EVIDENCE ALREADY ON RECORD SUPPORTS THE NEW READING. Night 2: "A 90 s
+  CPU-interpreter boot -- slow, which stretches the load window the way the
+  pre-fix build did -- produced no turquoise-dominant frame in 56 captures."
+  If the screen were merely brief, slowing it down should have caught it.
+  Media/Progress/Progress.dat reads successfully, so it is not a missing file.
+  The player reports the screen is ANIMATED on xemu.
+
+  NOT PROVEN. I cannot yet map which flips of the xemu trace are the NOW
+  LOADING phase, and that 90 s boot never performed a real level load. Settle
+  it with snap dumps at a small stride across a REAL level transition, which
+  is night 2's open item 3 and still the right experiment -- but expect it to
+  confirm "never drawn" rather than "too fast".
+
+
+====================================================================
+6. THE XEMU RIG, WHICH NOW WORKS
+====================================================================
+
+xemu 0.8.136 at /Applications/xemu.app. Prerequisites all present and
+verified: mcpx_1.0.bin, Complex_4627.bin, xbox_hdd.qcow2, the JSRF ISO,
+eeprom.bin.
+
+THE BUG THAT STOPPED THE FIRST CAPTURE DEAD, and it is in our script, not in
+xemu. xemu 0.8.136 CONSTRUCTS ITS OWN QEMU LAUNCH PARAMETERS from xemu.toml
+and then APPENDS whatever argv it is given, so every -machine, -bios, -device
+and -drive the script passed arrived twice:
+
+    xemu: -drive index=0,media=disk,file=...qcow2,locked=on:
+          drive with bus=0, unit=0 (index=0) exists
+
+Its own line is in xemu-stdout.log under "Created QEMU launch parameters" and
+already carries the right bootrom, BIOS, EEPROM, HDD and ISO. The script now
+passes -trace ALONE; --full-argv restores the old behaviour. The path checks
+stay, because a differential against the wrong ISO is worse than none.
+
+SIZING, MEASURED: the `full` preset writes ~8-10 MB/s and 10.5M lines in 77 s.
+--max-mb 768 stops it at ~77 s, which is NOT enough for a person to navigate
+anywhere. For a driven capture use --seconds 300 --max-mb 6000; the time
+bound binds and the trace lands around 1.8 GB. Tracing makes the emulation
+visibly slow -- that is the trace, not the scene.
+
+ONE TRANSIENT CRASH: the first Load-menu attempt died in 1 s with a real
+crash report (~/Library/Logs/DiagnosticReports/xemu-2026-09-21-165902.ips).
+It ran fine on the retry. Worth knowing before diagnosing a script that is
+not broken.
+
+TRACE FORMAT, because the field indices cost two attempts:
+    nv2a_pgraph_method <chan>: <class> -> <method> <name> <param>
+    $3 = class (0x97 is the 3D class), $5 = method, $6 = NAME, $7 = PARAM.
+macOS awk has NO strtonum -- match the hex strings.
+
+WHAT THE ORACLE CAN AND CANNOT SAY, unchanged from the plan: it is ground
+truth for WHAT THE GUEST SUBMITTED and worthless for anything about our host
+code. Methods on xemu that never reach us mean our parse is losing them; the
+same stream on both sides means the fault is in our backend.
+
+
+====================================================================
+7. THE OUTSIDE PROJECTS, RE-RANKED BY TODAY
+====================================================================
+
+  1. XbSymbolDatabase -- DONE AND IT PAID OFF TODAY. D3D_g_pDevice=0x0019DCE0
+     and m_RenderTarget=+0x2070 out of its table are what made G26 possible.
+     Its stated goal, naming dev+0x30 / dev+0x34, is achieved: m_Fence and
+     m_pFenceWord, both "certain". Nothing left to pull.
+  2. Cxbx-Reloaded -- I WOULD NOW SKIP IT, and the reason matters. It is HLE
+     D3D8: it intercepts D3D8 API calls. We run the guest's own D3D8
+     recompiled and parse the pushbuffer, a layer below. Today's differential
+     says the stream is correct and the fault is BENEATH it. Cxbx is
+     authoritative for the layer we are not failing at. It was the right pull
+     on the coverage branch, and that branch is refuted.
+  3. JSRF-Decompilation -- DONE, cloned and merged.
+  4. Project-Graffiti-Soul -- absent, unassessed, answers nothing we are asking.
+  5. ghidra-xbe -- absent. Mildly useful for the x86 that SETS UP a vertex
+     program; NV2A vertex microcode is not x86, so it will not decompile the
+     thing we care about.
+  6. JSRF_ModTool -- absent, file formats, not today's question.
+  7. xemu -- PROMOTE TO FIRST. Same layer as our fault, produced today's
+     result, and the only reference that runs the same program against the
+     same texture.
+
+
+====================================================================
+8. RECORDED, NOT CHASED
+====================================================================
+
+OUR PER-FLIP METHOD RATES ARE AN ORDER OF MAGNITUDE ABOVE XEMU'S on the same
+scene: NO_OPERATION 204 per flip against 18, WAIT_FOR_IDLE 102 against 9.
+Counts are not comparable across the two sides by construction and the plan
+says so -- but a 10x gap on a SPIN-WAIT method is worth a measurement of its
+own. The guest may be waiting on something we are slow to give it.
+
+OUR SURFACES SIT AT 0x005F0000 / 0x00688000 / 0x0071E000; xemu's Load-screen
+textures are at 0x038FE000, 0x03958000, 0x03968000 and 0x03EC4000. Different
+regions entirely. Probably just a different allocation history (xemu booted
+through its dashboard), but it has not been checked and a differential that
+ever needs to match addresses will trip over it.
+
+M_RENDERTARGET AND M_BACKBUFFER[0] ARE THE SAME OBJECT and never move off
+0x005F0000, while the presented surface is always one of the other two. True
+on the working attract loop as well as the broken Load screen, so it is not
+what distinguishes them -- recorded so nobody re-derives it as a lead.
+
+
+====================================================================
+9. STATE OF THE TREE
+====================================================================
+
+Branch jsrf/g2-text-clobber-and-the-symbol-layer, HEAD f584c45, WORKING TREE
+CLEAN. Fifteen commits today, from 4a27e15:
+
+  f7b59e9  The picture we were reading was never the picture
+  b4b1b87  The arm-recovery repairs, carried over uncommitted from the evening
+  fc80f38  The xemu differential tools, from another agent, unrun here
+  e116145  The instruments come into the repository
+  e5aaaa4  G26: ask the guest where it thinks it is drawing
+  eae3cd5  The build directory's run scripts are links, not copies
+  4927b04  G26 IS ANSWERED: ... so the Load screen is SHADING
+  1e401be  Black is not the condition; black with a scene behind it is
+  d54cf6b  The batches cover every pixel of the black frame
+  5e02b60  The TEXTURE0 sample is black
+  8b1b4fb  PRIMARY_COLOR is pure white
+  c3790d5  TEXCOORD0 is flat AND out of range  <- SEE SECTION 2, SUPERSEDED
+  afcf52e  xemu builds its own machine
+  f6af305  The xemu differential says the guest asks for the same thing
+  f584c45  The Load screen is render-to-texture, and my collapsed-q reading
+           was wrong
+
+NIGHT 2'S UNCOMMITTED WORK IS ALL COMMITTED, including the snap dump itself,
+the arm-recovery .py repairs (unit tests pass; the real-tree half still SKIPS
+without --gen and an XBE, so the end-to-end claim is no stronger than before)
+and another agent's xemu tools, which I committed WITHOUT RUNNING and said so.
+
+BUILD: 416DED91-C4C8-3D0D-8F77-5BDB1C1A85BE in both
+build-macos/jsrf-first-fault/build-feav/jsrf_first_fault and
+~/jsrf-build/JSRF.app, verified by dwarfdump --uuid after every source change,
+never by mtime.
+
+PRESERVED THIS SESSION, all -KEEP:
+  ..._163003_LOADMENU-SNAP-KEEP     G26's answer, 35 s of black
+  ..._163455_LOADMENU-WHITE-KEEP    mode 3, the coverage proof
+  ..._164138_LOADMENU-FRAG1-KEEP    mode 1, TEXTURE0 black
+  ..._164306_LOADMENU-FRAG2-KEEP    mode 2, PRIMARY_COLOR white
+  ..._164448_LOADMENU-FRAG4-KEEP    mode 4, GPU arm
+  ..._164630_LOADMENU-FRAG4-KEEP    mode 4, CPU arm
+  ..._165152_OURS-TITLE-KEEP        our side of the differential
+  ~/jsrf-build/xemu-title-full/     812 MB
+  ~/jsrf-build/xemu-loadmenu-full/  1.79 GB
+
+
+====================================================================
+10. OPEN, IN THE ORDER I WOULD TAKE THEM
+====================================================================
+
+1. THE CENSUS RUN. Section 4. One player-driven Load-menu run with
+   RECOMP_SURFACE_CENSUS and RECOMP_PB_SCAN=1. It gates a fix that is
+   probably a dozen lines, and it cannot be skipped: the read-back it would
+   add already exists, so a blind patch cannot be told from a coincidence.
+2. THE FIX, on the first branch of that split only.
+3. THE TITLE SCREEN'S 23 BLACK DRAWS, re-read against snapNNN, as the same
+   defect at smaller scale. It is the cheapest confirmation that section 5's
+   unification is real, and it needs NO player: the title is unattended.
+4. "NOW LOADING" across a REAL level transition with snap dumps at a small
+   stride. Section 5. Expect "never drawn", not "too fast".
+5. THE SPIN-WAIT GAP. Section 8. 204 NO_OPERATION per flip against xemu's 18.
+6. RE-READ the rest of the week's black-screen claims against snapNNN as
+   UNVERIFIED. Night 2's open item 4, still standing, and section 5 suggests
+   several of them are one defect.
+7. Everything in night 2's section 10 item 7 -- Roboy, vocal choppiness, the
+   APU stall, the text defect mode B, duplicate surface slots, the OWED
+   verdict, unresolved_stubs, Windows -- untouched by today.
+
+AND THE RULE THIS SESSION PAID FOR, which belongs with the instrument rule
+from night 2: A PICTURE OF AN INPUT IS ONLY EVIDENCE ONCE YOU KNOW WHAT THAT
+INPUT'S UNITS ARE. Mode 4's blue meant "outside [0,1]" on a texture whose
+coordinates are supposed to run 0..640. The instrument was right, the frame
+was fresh, the reading was still wrong.
