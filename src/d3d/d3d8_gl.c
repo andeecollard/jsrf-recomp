@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit, for the window-close path */
 #endif
@@ -621,6 +622,34 @@ static void fb_row_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t w,
  * climbing with the frame count means the guard below is not holding. */
 unsigned long g_present_tex_allocs, g_present_tex_updates;
 
+/* THE THIRD COST IN THE PRESENT PATH, WHICH NOTHING TIMED.
+ *
+ * [STAGE] measures what the pusher thread spends, and the two halves of the
+ * flip readback are in [METAL] -- draining the GPU and copying its memory back
+ * to guest RAM. What happens AFTER that was never measured at all: this
+ * function converts the guest surface to RGBA on the CPU, uploads it, and
+ * draws it, once per Present, on the presenter's thread.
+ *
+ * "Every flip waits for the GPU and round-trips the whole colour surface
+ * through guest RAM. That is where the judder is" was written with two of
+ * those three numbers in hand. Presenting a completed GPU texture directly
+ * would remove the readback, the snap copy and everything below; how much
+ * that is worth is a question about all three, so all three are now printed.
+ *
+ * Two clock reads per PRESENT -- once per frame, not once per method -- so
+ * unlike the walk stage this one cannot manufacture its own reading. */
+unsigned long long g_present_convert_ns, g_present_upload_ns, g_present_draw_ns;
+unsigned long g_present_frames;
+static unsigned long long g_present_upload_t0;
+
+static unsigned long long gl_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull
+         + (unsigned long long)ts.tv_nsec;
+}
+
 static int present_guest_framebuffer(void)
 {
     static GLuint tex, vbo, vao;
@@ -675,10 +704,16 @@ static int present_guest_framebuffer(void)
 
     /* The guest surface is top-down and a GL texture is bottom-up, so flip
      * while converting rather than with a second pass or a flipped quad. */
-    for (y = 0; y < h; y++)
-        fb_row_to_rgba(rgba + (size_t)(h - 1 - y) * w * 4,
-                       fb + (size_t)y * pitch, w, bpp);
+    {
+        unsigned long long _t = gl_now_ns();
+        for (y = 0; y < h; y++)
+            fb_row_to_rgba(rgba + (size_t)(h - 1 - y) * w * 4,
+                           fb + (size_t)y * pitch, w, bpp);
+        g_present_convert_ns += gl_now_ns() - _t;
+        g_present_frames++;
+    }
 
+    g_present_upload_t0 = gl_now_ns();
     glBindTexture(GL_TEXTURE_2D, tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     /* ALLOCATE ONCE, UPDATE EVERY FRAME.
@@ -709,6 +744,7 @@ static int present_guest_framebuffer(void)
                         GL_RGBA, GL_UNSIGNED_BYTE, rgba);
         ++g_present_tex_updates;
     }
+    g_present_upload_ns += gl_now_ns() - g_present_upload_t0;
 
     if (!vao) {
         /* pos.xyzw, colour.rgba, uv -- one full-screen triangle strip. */
@@ -824,15 +860,26 @@ static int present_guest_framebuffer(void)
     glDepthMask(GL_FALSE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    glUseProgram(g.prog);
-    glUniform1i(g.u_use_xform, 0);
-    glUniform1i(g.u_use_tex, 1);
-    glUniform1i(g.u_tex0, 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glBindVertexArray(vao);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glBindVertexArray(g.vao);
+    /* WHAT THIS TIMER MEASURES, SAID BEFORE ANYONE DIVIDES BY IT. GL commands
+     * are asynchronous: this is the cost of BUILDING the draw, not of the GPU
+     * executing it, and the execution lands in SDL_GL_SwapWindow or later. A
+     * small `draw` here therefore does not mean presentation is cheap -- it
+     * means the submission is. `convert` and `upload` are CPU work and are
+     * real; read those two as the cost that presenting a GPU texture directly
+     * would remove. */
+    {
+        unsigned long long _t = gl_now_ns();
+        glUseProgram(g.prog);
+        glUniform1i(g.u_use_xform, 0);
+        glUniform1i(g.u_use_tex, 1);
+        glUniform1i(g.u_tex0, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(g.vao);
+        g_present_draw_ns += gl_now_ns() - _t;
+    }
 
     /* Read the centre pixel back straight after the draw, not at the top of
      * the next Present: after a swap the back buffer's contents are undefined,
@@ -910,6 +957,19 @@ static int present_guest_framebuffer(void)
                     shots, er, eg, eb, px[0], px[1], px[2], dr, dg, db,
                     ok ? "MATCH" : "MISMATCH", glGetError(),
                     g_present_tex_allocs, g_present_tex_updates);
+            /* THE THIRD OF THE THREE COSTS, per frame and in the same units
+             * as [METAL]'s drain and readback and [STAGE]'s snap. Read all
+             * four together before deciding what direct GPU presentation
+             * would buy -- it removes readback, snap, convert and upload, and
+             * leaves the drain where it is. */
+            if (g_present_frames)
+                fprintf(stderr, "[PRESENT] %lu frames: convert %.2f ms,"
+                        " upload %.2f ms, draw-submit %.2f ms per frame"
+                        " (CPU only; the GPU's own work lands in the swap)\n",
+                        g_present_frames,
+                        g_present_convert_ns / 1e6 / (double)g_present_frames,
+                        g_present_upload_ns  / 1e6 / (double)g_present_frames,
+                        g_present_draw_ns    / 1e6 / (double)g_present_frames);
             fflush(stderr);
         }
     }

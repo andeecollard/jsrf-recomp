@@ -180,11 +180,30 @@
  * because a biased number with a known bias beats no number; see pb_walk_on()
  * for how to correct it. It is off by default and costs one predicted branch
  * per method when off. */
+/* `snap` IS NOT PART OF `sync`, AND THE DIFFERENCE IS THE WHOLE QUESTION.
+ *
+ * A handover read "[FLIP-SYNC] flip read-backs: 26236 taken, 0 skipped" beside
+ * p99=39 ms and concluded "Every flip waits for the GPU and round-trips the
+ * whole colour surface through guest RAM. That is where the judder is." Three
+ * different costs are named in that one sentence and only two of them were
+ * ever timed separately:
+ *
+ *     drain     waiting for the GPU to finish     [METAL] g_sync_drain_ns
+ *     readback  GPU memory -> guest RAM           [METAL] g_sync_read_ns
+ *     snap      guest RAM -> the presented copy   NOTHING MEASURED IT
+ *
+ * The third is this file's own memcpy at FLIP_STALL, 1.2 MB a frame at
+ * 640x480x4, and it was inside `rest`. Presenting a completed GPU texture
+ * directly -- the fix that keeps getting proposed for this -- removes the
+ * readback and the snap and keeps the drain. Which of the three dominates
+ * decides whether that is worth a week, so measure it before claiming it. */
 typedef enum { PB_STAGE_VSH, PB_STAGE_PREPARE, PB_STAGE_SUBMIT, PB_STAGE_SYNC,
-               PB_STAGE_CLEAR, PB_STAGE_WALK, PB_STAGE_N } PbStage;
+               PB_STAGE_SNAP, PB_STAGE_CLEAR, PB_STAGE_WALK,
+               PB_STAGE_N } PbStage;
 static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "prepare",
                                                        "submit", "sync",
-                                                       "clear", "walk" };
+                                                       "snap", "clear",
+                                                       "walk" };
 static struct { unsigned long long us[PB_STAGE_N], n[PB_STAGE_N]; }
     s_stage_run, s_stage_win;
 
