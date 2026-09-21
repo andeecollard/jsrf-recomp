@@ -1,0 +1,278 @@
+HANDOVER -- 21 September 2026
+COUNT THE INPUT, NOT THE GATE
+
+Two defects fixed and measured. Three more located precisely, none of them
+where the previous handover pointed. One method underneath all of it, which
+is worth more than any of the fixes.
+
+Read PLAN_2026-09-21_WHAT_THE_SYMBOLS_MAKE_POSSIBLE.md beside this.
+
+
+====================================================================
+0. THE METHOD. THIS IS THE PART THAT GENERALISES.
+====================================================================
+
+Both fixes today came from the same move, and neither needed a new theory:
+
+    A REJECTION PATH THAT NAMES THE GATE AND NOT THE VALUE IS A BLIND
+    SPOT. Count the input.
+
+  - "texture format / mip layout" had been in every run log for weeks. It
+    says which gate refused, never which format arrived. One counter, one
+    run: formats 0x03 and 0x07, refused on 100% of the draws that used
+    them. 69,950 of 3,118,918 draws in the player's own session.
+
+  - `d3d8_ring_publish_fence` logged that it published and never what. The
+    value was one fence generation too high, so every D3D_BlockOnTime in
+    the title returned instantly and had done since this runtime was
+    written.
+
+The corpus rule "every absence-measurement needs a positive control" has a
+sibling, and today paid for it:
+
+    EVERY REFUSAL NEEDS THE REFUSED VALUE. A counter that says a gate
+    fired is not evidence about what fired it.
+
+Applied to the whole runtime this is a finite, mechanical job: every
+`return "some reason"` in src/nv2a and src/kernel should carry the value it
+refused. Two censuses exist now (`[TEXFMT]`, `[COMBINER]`, both in
+nv2a_texture_copy.c, both silent when clean). The rest do not.
+
+
+====================================================================
+1. FIXED, MEASURED, COMMITTED
+====================================================================
+
+(a) THE GUEST WAS NEVER WAITING FOR THE GPU.   commit 5358eec
+
+D3D_SetFence (0x00191390) emits BACK_END_WRITE_SEMAPHORE_RELEASE carrying
+the PRE-increment [dev+0x30] and only then does += 2, so the hardware
+invariant is *fence <= [dev+0x30]-2 and the semaphore can NEVER equal the
+counter. We published [dev+0x30] verbatim. D3D_BlockOnTime's test is
+unsigned:
+
+    edx = cur - *fence ; ecx = cur - want ; if (ecx >= edx) return;
+
+with *fence == cur, edx is 0 and every possible target returns at once.
+D3DVertexBuffer_Lock, D3D_BlockOnResource, all of it: no-ops.
+
+The real writer was missing because nv2a_pb_exec.c did not decode 0x1D70 at
+all. The other sink does, but through SET_SEMAPHORE_OFFSET, which this
+title sets to 0 -- confirmed in the log:
+    [PGRAPH] semaphore offset 0x00000000 not usable as a guest address
+Going via [dev+0x34] needs no DMA object: it is the address the guest
+itself dereferences.
+
+  clobbered text draws   before 1/181, 2/183     after 0/177, 0/173, 0/313
+  frame cost ~1.3% (4641 flips against 4708). The title now waits where it
+  never waited; that is the change working.
+
+(b) TWO TEXTURE FORMATS REFUSED ON EVERY DRAW.   commit 83a9390
+
+  0x07 SZ_X8R8G8B8 -- byte-identical to the 0x06 we decode, top byte
+       UNDEFINED. THE ALPHA IS THE WHOLE FIX. Accepting the format while
+       sampling that byte as alpha yields a texture transparent wherever
+       the padding is zero, which looks exactly like the object still not
+       drawing.
+  0x03 SZ_X1R5G5B5 -- swizzled 16-bit, neither the linear image-rectangle
+       path nor a block format, so it fell through to the reject.
+
+  tutorial   before prepared=388839 rejected=1217   after rejected=0
+  scene-matched: 5400 presented frames and 4 VSH rejects on both sides.
+
+
+====================================================================
+2. LOCATED, NOT YET FIXED -- AND NONE OF IT IS WHERE WE WERE LOOKING
+====================================================================
+
+(a) GRAFFITI: THE COMBINER, NOT THE TEXTURE. Verified byte-for-byte.
+
+The tag is a decal mesh (Media/Mark/Wall.dat, 12 MDLB models, no textures)
+drawn ONLY in pass 6 -- 0x0003F9E0 begins `cmp [esp+4],6 / jne` -- through
+0x00042EE0, which has exactly one caller. It samples ONE 1024x1024 DXT3
+atlas (ids 0x102/0x103, JSRF_TEXS0/S1.JTX, 1,048,576 bytes each, byte-exact)
+on all four texture units.
+
+DXT3 WAS ALWAYS ACCEPTED. The texture-format fix above is NOT the graffiti.
+
+The blocker is its pixel shader, def at 0x0020C0B8 (magic 'PSB0'), the
+title's only 8-stage program. Read out of the image:
+
+  PSRGBOutputs  000820D0 000000A0 000820D0 00000A00 00000080 000820D0 ...
+  PSCombinerCount 00011108      PSConstant0 0000FF00 / 00FF0000 / 000000FF
+
+0x000820D0 = AB_BLUE_TO_ALPHA (bit 19) | AB_DOT_PRODUCT (bit 13) | 0xD0.
+Our gate is `if (outputs[j] & ~0xfffu) return "combiner output mode"`.
+
+To render wall graffiti the runtime needs, in priority order:
+  1. output words above 0xfff -- DOT_PRODUCT and BLUE_TO_ALPHA
+  2. outputs routed to texture registers T0-T3 (dst 8-11); the gate models
+     only discard/R0/R1. Stages 1, 3 and 4 do this.
+  3. nonzero per-stage C0 constants. Four OTHER shaders share this case.
+Metal is not a separate job: nv2a_metal.m takes color_ocw[]/alpha_ocw[]
+straight from this parsed state, and the CPU gate refuses the draw before
+Metal sees it. One model, expressed twice.
+
+(b) BLACK GEOMETRY IS NOT BEING REFUSED. This kills the obvious theory.
+
+The player's DJ intro cutscene renders as black silhouettes with sky and a
+few surfaces coming through; spray cans render black until collected. A
+REFUSED DRAW RENDERS NOTHING, so these are rasterising and shading to zero.
+
+Measured 21 Sep, tutorial scenario, with both censuses armed:
+    [TEXTURE] prepared=419738 rejected=0
+    no [COMBINER] lines at all -- every refusal counter zero
+So in that scenario nothing is refused for any reason, and gameplay frames
+render correctly (see picture-160.bmp). The black is a shading error in a
+path we ACCEPT, not a gate.
+
+NOT YET REPRODUCED IN A SCRIPTED RUN. Both stage_harness scenarios press
+START at the title and skip the intro. A scenario that boots and waits is
+the cheapest next step, and it would also give the combiner census
+something to say -- the player's real session shows 59 draws refused with
+"combiner output mode", the tutorial shows none.
+
+(c) THE THIN HORIZONTAL LINES REPRODUCE IN A 90-SECOND RUN.
+
+Visible in the player's Gum dialogue AND in our own tutorial capture
+(combiner/picture-11.bmp, Corn's "This is th"): short horizontal marks
+sitting at the TOP of the glyph cell, above the `i` characters. That is
+atlas-cell bleed -- the quad's V reaching into the neighbouring cell --
+not a clobber. clobber.py cannot see it: it compares quad POSITIONS and
+CELLS, not pixels, and scored 0 on the very runs that show it.
+
+This is now the cheapest open defect to work: crop the text region out of
+a scripted capture and iterate.
+
+(d) THE STALE BANNER, AND A POSSIBLE LINK TO THE AUDIO.
+
+The banner shows the PREVIOUS objective's string. Not lingering pixels --
+the wrong string.
+
+ACT 0x1166 is the shared glyph renderer, NOT the banner; the banner is ACT
+0x1165 (setShowText 0x000FEA80 pushes 0x1165), slot 1 of 7.
+
+The text machinery is innocent, and this was verified rather than assumed:
+count[page] is reset at 0x0003C671 on every mode-8 flush, and for slot 1
+any setShowText(1,...) replaces the live banner within ~2 guest frames
+unconditionally (the "already busy" path queues and nudges; the item's
+bit30 hold is set in ONE place, reachable only on the slot==0 branch, so
+slot 1 cannot stall there).
+
+So the old string survives only because setShowText(1, new) is never
+issued. DrawTextForFrame (0x0004C400) has ZERO direct callers -- verified
+-- and is reached by exactly one instruction:
+
+    00051FFC  jmp 0x4c400        ; tail of CMission::Exec0Default
+
+which runs only when CActMan is in Default mode. The four mode flags at
+g_lpActMan +0x40 CoveredPause / +0x44 Event / +0x48 FreezeCam / +0x4C
+UncoveredPause are tested in order at 0x00012418..0x0001245E (verified) and
+are LATCHED -- entered and never exited is permanent, while the objective
+still advances underneath through the other dispatch tables.
+
+    THE LEAD: Event mode is left by an act whose sibling channel drives an
+    ADX voice line (playVoiceLine 0x00117140 from 0x0004C663). AN AUDIO
+    STREAM THAT NEVER REPORTS COMPLETION WOULD HOLD EVENT MODE FOREVER.
+    The player reports sound is broken. That would make one root cause for
+    two symptoms.
+
+  Cheapest test: a periodic reporter in main.c reading [0x0022FCE0] and its
+  +0x40/+0x44/+0x48/+0x4C. No generated rebuild. Do this before anything
+  else on the banner.
+
+(e) BOOST DASH FLICKERS. Reported 21 Sep, uninvestigated. Worth noting it
+    is the first symptom that could plausibly be caused by the fence fix --
+    boost dash is the kind of effect that uses a render target the guest
+    now waits on. Check whether it predates 5358eec before assuming not.
+
+
+====================================================================
+3. WHAT WAS THROWN AWAY, AND WHY
+====================================================================
+
+RECOMP_VTX_RACE -- a counting watch for guest writes into a vertex buffer
+with a draw pending. Built, 12 ctest cases green, then BACKED OUT before
+commit. It broke three test harnesses at link time, and on real data it
+read fills=5 against draws=297656 -- its own consistency check, written in
+so the number could not be quoted, failing. Two causes: registration
+happened at DRAW time, which is after the guest filled the buffer, and the
+256/512-DXT3 filter caught far more than text so the slot table thrashed
+(10,775 evictions in 68 s).
+
+It was never needed. The answer was in the guest's own code.
+
+ALSO NOTE: arming a guest-store watch perturbs what it measures. The three
+runs with RECOMP_MEM_WATCH live all scored BELOW the unperturbed 1.69%
+clobber baseline. Prefer pusher-side instruments.
+
+
+====================================================================
+4. CORRECTIONS TO THE CORPUS
+====================================================================
+
+  - 0x00B8B000 IS A HEAP BLOCK, not the font's vertex buffer. The same run
+    that named it logs `[HEAP] free va=0x00B8B000 size=1180160` and two
+    reuses at other sizes; the next boot drew the Latin pages from ten
+    other bases at stride 36, not 32. The 20 Sep "the text defect has an
+    address" is an address of one boot.
+
+  - main.c's "GET moves about four times a second" IS STALE by ~30x.
+    Measured 20 Sep: 6,810-6,932 poll loops/s, ring ALREADY DRAINED on
+    96.9-97.1% of ~1.29M polls, zero stream faults. Anything reasoning from
+    pusher lag is reasoning from a dead fact.
+
+  - [PB-ACK] already= IS NOW MEANINGLESS as a health signal. It compares
+    MEM32(getp)==submitted and the published value is deliberately no
+    longer `submitted`. It will read ~0. The same counter misled this
+    project once already, for the same reason.
+
+  - THE XDK 4134 LOCK BITS ARE NOT THE PC ONES: 0x10 NOFLUSH, 0x20
+    NOOVERWRITE, 0x40 TILED, 0x80 READONLY, read out of the title's own
+    linked D3D8. The night-3 handover's "NOOVERWRITE (0x10) /
+    DISCARD|NOSYSLOCK (0xa0)" were the PC D3D8 numbers. And the text path
+    locks with Flags=0 -- a genuinely BLOCKING lock, whole-buffer,
+    OffsetToLock a hardcoded 0 -- so the buffer was always inside the
+    fence's protection. That question is closed.
+
+  - JSRF_MEM_WATCH IS A DEAD CMAKE OPTION. xbox_kernel exports
+    RECOMP_MEM_WATCH_RUNTIME=1 as PUBLIC and xboxrecomp is an INTERFACE
+    library, so the define reaches the generated code transitively. The
+    store hook has been compiled into every build. Its comment promising
+    "expect a full build" would cost the next session one for nothing.
+
+  - clobber.py MEASURES QUAD POSITIONS AND CELLS, NOT PIXELS. It is sound
+    for the clobber and blind to the line artifact and to a wrong string.
+    It scored 0/663 on runs that still show both. Do not read it as "the
+    text is fixed"; read it as "the clobber is fixed".
+
+
+====================================================================
+5. THE REMAINING FORMAT HOLE
+====================================================================
+
+An enumeration of the shipped .dat texture headers (1,056 NORM/MULT
+containers) says the complete set the title can produce is
+{0x0C, 0x0E, 0x03, 0x06, 0x07, 0x04}. Everything but 0x04 is now accepted.
+
+  0x04 A4R4G4B4 swizzled -- 11 textures, e.g. Media/Stage/Stg52_t.dat.
+No asset asks for DXT5, and none is palettised.
+
+
+====================================================================
+6. SUITE
+====================================================================
+
+2 failures, neither new, both documented:
+  jsrf_switch_audit    8 hand-rolled switch reads over its baseline of 125;
+                       HEAD is also 8.
+  jsrf_input_hotplug   reads live hardware; fails because a controller is
+                       attached.
+
+New tests: jsrf_d3d8_fence_{arithmetic,nodevice},
+jsrf_texfmt_{x8r8g8b8,x1r5g5b5,alpha-regression}. The fence `arithmetic`
+case reimplements D3D_BlockOnTime's own unsigned compare and asserts the
+OLD value does not block and the correct one does -- a test that only
+checked "a word was written" would have passed for the whole life of that
+bug. The texfmt alpha case fails with "got 0 want 255" if the one alpha
+line is reverted.

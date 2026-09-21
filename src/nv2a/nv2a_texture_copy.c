@@ -13,15 +13,48 @@ static unsigned long s_fmt_seen[256], s_fmt_rejected[256];
 static unsigned long s_reject_hdr, s_reject_dma, s_reject_combiner_out;
 static unsigned long s_dma_rejected[4];
 
+/* WHICH combiner state is refused, not merely that one was.
+ *
+ * The texture census settled the format question in one run by counting the
+ * INPUT rather than the gate. The combiner gate has nine distinct refusals
+ * all reported through four strings, and the graffiti pixel shader
+ * (def 0x0020C0B8, the title's only 8-stage program) is known statically to
+ * trip at least three of them -- output words 0x000820D0 carrying
+ * AB_DOT_PRODUCT and AB_BLUE_TO_ALPHA, outputs routed to texture registers
+ * T0-T3, and nonzero per-stage C0. Four other shaders share the constant
+ * case. Counting says which of those actually fires, and how much of the
+ * frame each one costs. */
+static unsigned long s_rej_final, s_rej_control, s_rej_outreg, s_rej_inreg;
+static unsigned long s_rej_const, s_rej_texmode, s_rej_texstage, s_rej_alpha;
+static unsigned long s_rej_count_hist[10];
+#define VR_OCW_SLOTS 16
+static uint32_t s_bad_ocw[VR_OCW_SLOTS]; static unsigned long s_bad_ocw_n[VR_OCW_SLOTS];
+static unsigned s_bad_ocw_used;
+
+static void note_bad_ocw(uint32_t w)
+{
+    for (unsigned i=0;i<s_bad_ocw_used;++i)
+        if (s_bad_ocw[i]==w) { s_bad_ocw_n[i]++; return; }
+    if (s_bad_ocw_used<VR_OCW_SLOTS) {
+        s_bad_ocw[s_bad_ocw_used]=w; s_bad_ocw_n[s_bad_ocw_used]=1; s_bad_ocw_used++;
+    }
+}
+
 const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s)
 {
     memset(s, 0, sizeof(*s));
-    if ((M(0x288)!=0xc && M(0x288)!=0xe) || M(0x28c)!=0x1c80)
+    if ((M(0x288)!=0xc && M(0x288)!=0xe) || M(0x28c)!=0x1c80) {
+        s_rej_final++;
         return "combiner / texture program";
+    }
     uint32_t control=M(0x1e60),count=control&0xf;
     /* Count occupies the low nibble. The three high flags select mux and
      * per-stage C0/C1; the captured six-stage program sets all three. */
-    if (count<1 || count>8 || (control&~0x0001110fu)) return "combiner / texture program";
+    if (count<1 || count>8 || (control&~0x0001110fu)) {
+        s_rej_control++;
+        if (count<10) s_rej_count_hist[count]++;
+        return "combiner / texture program";
+    }
     s->combiner_count=count; s->add_specular=M(0x288)==0xe;
     /* The measured programs use plain AB, CD, or AB+CD routing to R0/R1.
      * Keep dot, mux, bias and scale modes explicitly unsupported. */
@@ -30,10 +63,16 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
         s->color_ocw[i]=M(0x1e40+4*i);s->alpha_ocw[i]=M(0xaa0+4*i);
         uint32_t outputs[2]={s->color_ocw[i],s->alpha_ocw[i]};
         for(unsigned j=0;j<2;++j) {
-            if(outputs[j]&~0xfffu) { s_reject_combiner_out++; return "combiner output mode"; }
+            if(outputs[j]&~0xfffu) {
+                s_reject_combiner_out++; note_bad_ocw(outputs[j]);
+                return "combiner output mode";
+            }
             for(unsigned shift=0;shift<12;shift+=4) {
                 unsigned dst=(outputs[j]>>shift)&15;
-                if(dst && dst!=12 && dst!=13) return "combiner output register";
+                if(dst && dst!=12 && dst!=13) {
+                    s_rej_outreg++; note_bad_ocw(outputs[j]);
+                    return "combiner output register";
+                }
             }
         }
         s->color_icw[i]=M(0xac0+4*i); s->alpha_icw[i]=M(0x260+4*i);
@@ -41,7 +80,9 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
             unsigned regs[2]={(s->color_icw[i]>>(8*j))&15,(s->alpha_icw[i]>>(8*j))&15};
             for(unsigned k=0;k<2;++k) {
                 if (regs[k]!=0 && regs[k]!=1 && regs[k]!=2 && regs[k]!=4 && regs[k]!=5 &&
-                        !(regs[k]>=8 && regs[k]<=13)) return "combiner input register";
+                        !(regs[k]>=8 && regs[k]<=13)) {
+                    s_rej_inreg++; return "combiner input register";
+                }
                 uses_constant|=regs[k]==1 || regs[k]==2;
             }
         }
@@ -49,13 +90,15 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
          * all to zero. Refuse nonzero constants until their full routing is
          * represented rather than silently shading with the wrong value. */
         if(uses_constant) for(unsigned j=0;j<8;++j)
-            if(M(0xa60+4*j) || M(0xa80+4*j)) return "combiner constant";
+            if(M(0xa60+4*j) || M(0xa80+4*j)) { s_rej_const++; return "combiner constant"; }
     }
     for (unsigned u=0;u<4;++u) {
         unsigned mode=(M(0x1e70)>>(5*u))&31;
-        if (mode>1) return "texture shader mode";
+        if (mode>1) { s_rej_texmode++; return "texture shader mode"; }
         if (mode) {
-            if (!(M(0x1b0c+64*u)&0x40000000)) return "disabled texture shader stage";
+            if (!(M(0x1b0c+64*u)&0x40000000)) {
+                s_rej_texstage++; return "disabled texture shader stage";
+            }
             s->texture_mask|=1u<<u;
         }
     }
@@ -65,7 +108,9 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
             s->color_icw[0]==0x08200000 && s->alpha_icw[0]==0x14200000) {
         s->combiner_count=0; s->modulate=0;
     }
-    if (M(0x300) && (M(0x300)!=1 || M(0x33c)!=0x204 || M(0x340)>255)) return "alpha test";
+    if (M(0x300) && (M(0x300)!=1 || M(0x33c)!=0x204 || M(0x340)>255)) {
+        s_rej_alpha++; return "alpha test";
+    }
     s->alpha_test=M(0x300); s->alpha_ref=M(0x340);
     /* Depth range and policy, straight from the guest rather than assumed.
      * ZCLAMP_EN is a FOUR-BIT field at 0xF0, not bit 0 -- JSRF writes 1,
@@ -184,6 +229,12 @@ target_state:
 void nv2a_texture_copy_census(void)
 {
     unsigned f;
+    /* Silent when there is nothing to report: a clean run should not carry a
+     * table of zeroes that a later reader has to check is a table of zeroes. */
+    if (!s_reject_hdr && !s_reject_dma && !s_reject_combiner_out && !s_rej_final
+            && !s_rej_control && !s_rej_outreg && !s_rej_inreg && !s_rej_const
+            && !s_rej_texmode && !s_rej_texstage && !s_rej_alpha)
+        return;
     fprintf(stderr, "[TEXFMT] gate refusals by texture format"
             " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06 rgba8)\n");
     fprintf(stderr, "[TEXFMT]   header/mip-layout bits wrong=%lu  dma class wrong=%lu"
@@ -197,6 +248,20 @@ void nv2a_texture_copy_census(void)
     for (f = 0; f < 4; ++f)
         if (s_dma_rejected[f])
             fprintf(stderr, "[TEXFMT]   dma class %u refused=%lu\n", f, s_dma_rejected[f]);
+
+    fprintf(stderr, "[COMBINER] refusals: final-cw=%lu control=%lu output-mode=%lu"
+            " output-reg=%lu input-reg=%lu constant=%lu texmode=%lu texstage=%lu"
+            " alpha-test=%lu\n",
+            s_rej_final, s_rej_control, s_reject_combiner_out, s_rej_outreg,
+            s_rej_inreg, s_rej_const, s_rej_texmode, s_rej_texstage, s_rej_alpha);
+    for (f = 0; f < 10; ++f)
+        if (s_rej_count_hist[f])
+            fprintf(stderr, "[COMBINER]   refused with stage count %u: %lu\n",
+                    f, s_rej_count_hist[f]);
+    for (f = 0; f < s_bad_ocw_used; ++f)
+        fprintf(stderr, "[COMBINER]   refused output word 0x%08X  x%lu%s\n",
+                s_bad_ocw[f], s_bad_ocw_n[f],
+                s_bad_ocw[f]==0x000820D0u ? "   <-- the graffiti shader" : "");
     fflush(stderr);
 }
 
