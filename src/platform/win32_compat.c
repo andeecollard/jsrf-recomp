@@ -741,6 +741,11 @@ unsigned long g_w32_suspends;
 unsigned long g_w32_resumes;
 unsigned long g_w32_lost_resumes;
 unsigned long g_w32_parked;
+/* Defined with SetThreadPriority below; reported here. A priority that is
+ * asked for and not applied is the defect this pair exists to make visible,
+ * so "applied" must be a counter and not an assumption. */
+unsigned long g_w32_priority_applied;
+unsigned long g_w32_priority_failed;
 
 void w32_thread_trace_report(void)
 {
@@ -748,8 +753,9 @@ void w32_thread_trace_report(void)
     if (on < 0) on = getenv("RECOMP_THREAD_TRACE") != NULL;
     if (!on) return;
     fprintf(stderr, "  [THREAD] suspends=%lu resumes=%lu lost_resumes=%lu"
-            " parked_now=%lu\n",
-            g_w32_suspends, g_w32_resumes, g_w32_lost_resumes, g_w32_parked);
+            " parked_now=%lu | priority applied=%lu failed=%lu\n",
+            g_w32_suspends, g_w32_resumes, g_w32_lost_resumes, g_w32_parked,
+            g_w32_priority_applied, g_w32_priority_failed);
     fflush(stderr);
 }
 
@@ -932,11 +938,102 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
     return TRUE;
 }
 
+/* APPLY the priority on Darwin, do not merely remember it.
+ *
+ * This was "tracked only" with the note that real RT priorities need
+ * privileges. That is true of absolute realtime bands and irrelevant here:
+ * THREAD_PRECEDENCE_POLICY is a RELATIVE importance within the task, it needs
+ * no entitlement, and relative is exactly what is wanted.
+ *
+ * WHY IT MATTERS, measured 21 Sep 2026. kernel_bridge.c has said for months
+ * that "JSRF runs threads whose entire body is a counting spin loop, and such
+ * a thread is only affordable if it actually runs at the bottom of the
+ * scheduler". It did not. During a cutscene hang two guest threads made 302
+ * and 214 MILLION kernel calls, and the XDK symbols name their call sites as
+ * XAPILIB SetThreadPriority / GetThreadPriority / SetThreadPriorityBoost --
+ * a busy-wait donating priority to the thread it is waiting for. With the
+ * donation a no-op the spinner competes on equal terms with the thread it
+ * waits for, and under a cutscene's contention that thread can starve.
+ *
+ * The mapping is deliberately coarse. The guest asks for one of seven bands
+ * and what it needs is ordering, not a number: IDLE must lose to NORMAL, and
+ * TIME_CRITICAL must win. Precision beyond that would be invented.
+ *
+ * DEFAULT OFF, AND THE MEASUREMENT IS WHY. Scene-matched A/B on still.pad,
+ * both arms reaching sequence 30:
+ *
+ *     applied      54.4 fps   lost_resumes 438
+ *     tracked-only 57.5 fps   lost_resumes 129
+ *
+ * Applying the priority costs about three frames a second and TRIPLES lost
+ * resumes -- a thread that runs less often is more likely to be signalled
+ * before it parks, which is exactly the wakeup this layer drops. Trading
+ * frame rate for a hang it has not been shown to fix is a bad bargain, so
+ * RECOMP_THREAD_PRIORITY=1 turns it on and the default leaves it off.
+ *
+ * n=1 per arm. What would settle it is the arm that matters: a cutscene, which
+ * no scripted pad reaches. Until then this is a switch and an instrument, not
+ * a fix -- `priority applied=` is the positive control that it does anything
+ * at all, and it reads 46028 with zero failures. */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+
+static int thread_priority_apply_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_THREAD_PRIORITY");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+static int w32_priority_to_mach_importance(int priority)
+{
+    if (priority <= THREAD_PRIORITY_IDLE)         return -31;
+    if (priority <= THREAD_PRIORITY_LOWEST)       return -16;
+    if (priority <= THREAD_PRIORITY_BELOW_NORMAL) return  -8;
+    if (priority == THREAD_PRIORITY_NORMAL)       return   0;
+    if (priority == THREAD_PRIORITY_ABOVE_NORMAL) return   8;
+    if (priority == THREAD_PRIORITY_HIGHEST)      return  16;
+    return 31;   /* TIME_CRITICAL and anything above it */
+}
+
+static void w32_apply_thread_priority(w32_object *o, int priority)
+{
+    thread_precedence_policy_data_t pol;
+    mach_port_t port;
+    kern_return_t kr;
+
+    if (!thread_priority_apply_on()) return;
+    /* A thread this layer did not create has no pthread_t to reach. */
+    if (!o->thread) return;
+    port = pthread_mach_thread_np(o->thread);
+    if (port == MACH_PORT_NULL) { ++g_w32_priority_failed; return; }
+    pol.importance = w32_priority_to_mach_importance(priority);
+    kr = thread_policy_set(port, THREAD_PRECEDENCE_POLICY,
+                           (thread_policy_t)&pol,
+                           THREAD_PRECEDENCE_POLICY_COUNT);
+    if (kr == KERN_SUCCESS) ++g_w32_priority_applied;
+    else                    ++g_w32_priority_failed;
+}
+#else
+static void w32_apply_thread_priority(w32_object *o, int priority)
+{
+    (void)o; (void)priority;
+}
+#endif
+
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    if (o && o->kind == K_THREAD) o->priority = priority;
-    return TRUE;   /* real RT priorities need privileges; tracked only */
+    if (o && o->kind == K_THREAD) {
+        o->priority = priority;
+        w32_apply_thread_priority(o, priority);
+    }
+    return TRUE;
 }
 
 int GetThreadPriority(HANDLE h)
