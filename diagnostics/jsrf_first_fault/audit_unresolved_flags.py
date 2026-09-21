@@ -123,9 +123,18 @@ else:
           f"{len(unreach)} function(s)")
 
 if a.list:
+    # MARKED, because the ratchet gates on the REACHABLE count and this list
+    # was the only way to find them -- and it did not say which they were. A
+    # run that fails the gate printed 90 lines and named none of the 2 it
+    # actually failed on, so the next step was to re-derive the split by hand.
+    # `REACHABLE` is greppable for the same reason `UNRESOLVED FLAGS` is.
     for (va, name), sites in sorted(dead.items()):
+        mark = "REACHABLE" if called_by.get(va) else "         "
         for fname, lineno, cond in sites:
-            print(f"    0x{va:08X} {name:20s} {fname}:{lineno}  {cond}")
+            print(f"    {mark} 0x{va:08X} {name:20s} {fname}:{lineno}  {cond}")
+    if reachable:
+        print(f"    ({reachable} marked REACHABLE -- those are the ones the"
+              f" ratchet gates on)")
 
 # The gate is the REACHABLE count. Name the number in the failure so nobody
 # has to work out which of the three printed above the ratchet meant -- the

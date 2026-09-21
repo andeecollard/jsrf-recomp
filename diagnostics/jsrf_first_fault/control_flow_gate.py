@@ -62,13 +62,44 @@ lifter output must be classified deliberately, not counted as fine by default.
                         there was not recorded, so this one is: the union of
                         [start, end) over functions.json.
 
-THE GATE. A baseline JSON holds the last accepted numbers. Counts of anything
-unresolved or silent must not RISE; coverage and resolved switches must not
-FALL. A regeneration that moves a number the wrong way fails the suite and
-says which number. Accept a new state deliberately with --write-baseline, and
-say why in the commit. The baseline records which gen it was taken on; a
-mismatch is printed, not failed, because the rule is that the numbers hold
-ACROSS regenerations -- that is the whole point.
+THE GATE, IN TWO HALVES.
+
+TOTALS. A baseline JSON holds the last accepted numbers. Counts of anything
+unresolved or silent must not RISE; coverage must not FALL. Accept a new state
+deliberately with --write-baseline, and say why in the commit. The baseline
+records which gen it was taken on; a mismatch is printed, not failed, because
+the rule is that the numbers hold ACROSS regenerations -- that is the whole
+point.
+
+ADDRESSES, WHICH ARE THE HALF THAT CAN ACTUALLY SEE A REGRESSION. Totals move
+for two unrelated reasons and cannot tell them apart. On 21 Sep 2026 a
+regeneration picked up 135 new icall observations, which re-carved functions
+and merged spurious splits; switch_resolved fell 487 -> 481 and the gate failed
+on it, while every unresolved measure IMPROVED. The fall was duplicate
+dispatches disappearing. A ratio would have passed that -- and would equally
+have passed six sites genuinely going unresolved while six duplicates vanished.
+
+So the identity of a site is its GUEST ADDRESS, which survives re-carving
+because it is a fact about the binary and not about how the lifter chopped it
+up:
+
+  switch sites   the jump TABLE's address, recorded with how many dispatches
+                 reached it resolved and how many unresolved. FAILS when a
+                 table's unresolved count RISES -- which is the "previously
+                 resolved site is now unresolved" case, and also the case
+                 where an already-unresolved table acquires another one.
+  todo sites     the address in RECOMP_UNIMPL(..., 0xVA), with its mnemonic.
+                 FAILS on a new ADDRESS. "todo 122 -> 123" went into a handover
+                 as "the one genuine negative and is unexplained" because the
+                 number was all there was; the address and the instruction are
+                 both right there in the generated line.
+  stub sites     the sub_XXXXXXXX names in recomp_stubs_unresolved.c. FAILS on
+                 a new one: that is a call target the detector never defined.
+
+Tables and sites that DISAPPEAR, and counts that fall, are reported and never
+failed -- that is what re-carving does, and it is not a regression. A gen with
+no site record in its baseline skips this half and says so; write one with
+--write-baseline.
 
 Two things this does not do, stated so a green run is not over-read. It does
 not say whether an edge is ever TAKEN: that is the runtime's job ([ITAIL],
@@ -131,6 +162,16 @@ SHAPES = [
 TODO_RE = re.compile(r"^(.*)/\* TODO: ([a-z0-9]+)", re.M)
 UNRESOLVED_TABLE_RE = re.compile(
     r"RECOMP_ITAIL\(MEM32\(" + REG + r" \* 4 \+ 0x([0-9A-F]+)\)\)")
+# The SAME table address, on the side of the fence where the lifter placed the
+# arms. Checked against the generated tree when this was written: all 481
+# resolved dispatches carry it, so the two regexes between them see every
+# switch site the tree has.
+RESOLVED_TABLE_RE = re.compile(
+    r"\{ uint32_t _jt = MEM32\(" + REG + r" \* 4 \+ 0x([0-9A-F]+)\)")
+# The untranslated instruction's own address and text, which the generated line
+# already carries -- `RECOMP_UNIMPL("cli", 0x0001FCD8u); /* TODO: cli */`.
+TODO_SITE_RE = re.compile(
+    r'RECOMP_UNIMPL\("([^"]*)",\s*0x([0-9A-F]+)u\);\s*/\* TODO:')
 
 # The classes whose count must not go UP, and the ones that must not go DOWN.
 MUST_NOT_RISE = ["switch_unresolved", "switch_unresolved_tables",
@@ -151,12 +192,37 @@ def read_manifest(gen_dir):
     return out
 
 
-def scan_gen(gen_dir):
-    """Counts per shape over the translated units, the stub file separately."""
+def scan_gen(gen_dir, sources=None):
+    """Counts per shape over the translated units, the stub file separately.
+
+    `sources` maps a unit's path to the text to read INSTEAD of the file. It
+    exists for one caller: recover_midfunction_entries.py, which patches
+    recomp_stubs_unresolved.c in memory and then has to ask this what the tree
+    it is about to write looks like. Scanning the copy still on disk would be
+    wrong in exactly the interesting direction -- the recovered stub bodies are
+    where several of the unresolved dispatches live (sub_00075E90's table at
+    0x00076610 among them), so a pre-patch scan cannot see the arms they open
+    and the recovery would silently do half the job. Reading through one
+    accessor also means the override cannot be applied to some files and
+    forgotten on others.
+    """
+    sources = {os.path.abspath(k): v for k, v in (sources or {}).items()}
+
+    def read(path):
+        override = sources.get(os.path.abspath(path))
+        return open(path, errors="ignore").read() if override is None else override
+
     counts = collections.Counter()
     todo_by_mnemonic = collections.Counter()
     todo_silent = 0
     owners_of_table = collections.defaultdict(set)
+    # Sites, keyed by GUEST address. A table can be dispatched from more than
+    # one lifted body -- 481 dispatches over 428 distinct tables in the 21 Sep
+    # gen -- and the same table can be resolved in one copy and unresolved in
+    # another, so each side is counted rather than flagged.
+    switch_sites = collections.defaultdict(lambda: {"r": 0, "u": 0})
+    todo_sites = collections.Counter()
+    todo_text = {}
     defined = set()
     itail_total = icall_total = 0
     # The stub file is scanned with the rest: its "Recovered entry" bodies
@@ -166,7 +232,7 @@ def scan_gen(gen_dir):
     if not units:
         sys.exit("no generated units in %s" % gen_dir)
     for path in units:
-        src = open(path, errors="ignore").read()
+        src = read(path)
         defined.update(DEF_RE.findall(src))
         for name, rx in SHAPES:
             counts[name] += len(rx.findall(src))
@@ -176,6 +242,14 @@ def scan_gen(gen_dir):
             todo_by_mnemonic[m.group(2)] += 1
             if "RECOMP_UNIMPL(" not in m.group(1):
                 todo_silent += 1
+        for m in RESOLVED_TABLE_RE.finditer(src):
+            switch_sites[int(m.group(1), 16)]["r"] += 1
+        for m in UNRESOLVED_TABLE_RE.finditer(src):
+            switch_sites[int(m.group(1), 16)]["u"] += 1
+        for m in TODO_SITE_RE.finditer(src):
+            va = int(m.group(2), 16)
+            todo_sites[va] += 1
+            todo_text[va] = m.group(1)
         # Which function owns each unresolved dispatch: the nearest body
         # start above it in the file.
         starts = [(m.start(), m.group(1)) for m in DEF_RE.finditer(src)]
@@ -190,7 +264,7 @@ def scan_gen(gen_dir):
     stub_path = os.path.join(gen_dir, "recomp_stubs_unresolved.c")
     stub_names = set()
     if os.path.exists(stub_path):
-        stub_names = set(DEF_RE.findall(open(stub_path, errors="ignore").read()))
+        stub_names = set(DEF_RE.findall(read(stub_path)))
     stubs = len(stub_names)
     scan_gen.stub_names = stub_names
     itail_classified = sum(counts[k] for k in
@@ -205,12 +279,18 @@ def scan_gen(gen_dir):
     measures["unclassified_icall"] = icall_total - icall_classified
     measures["itail_total"] = itail_total
     measures["icall_total"] = icall_total
-    return measures, dict(todo_by_mnemonic), owners_of_table, defined
+    sites = {
+        "switch": {"0x%08X" % va: dict(v)
+                   for va, v in sorted(switch_sites.items())},
+        "todo": {"0x%08X" % va: {"n": todo_sites[va], "text": todo_text[va]}
+                 for va in sorted(todo_sites)},
+        "stubs": sorted(stub_names),
+    }
+    return measures, dict(todo_by_mnemonic), owners_of_table, defined, sites
 
 
-def walk_arms(xbe_path, owners_of_table, defined, window):
-    """switch_arm_audit's tight-bound count: arms within WINDOW of the owner,
-    and how many of those have no translated body."""
+def load_image(xbe_path):
+    """(read32, text_lo, text_hi) for the guest image. switch_arm_audit's."""
     from tools.xbe_parser.xbe_parser import XBEParser
     import struct
     xbe = XBEParser(xbe_path).parse()
@@ -218,7 +298,6 @@ def walk_arms(xbe_path, owners_of_table, defined, window):
     sections = [(s.virtual_addr, s.virtual_size, s.raw_addr, s.name)
                 for s in xbe.sections]
     text = next(s for s in sections if s[3] == ".text")
-    text_lo, text_hi = text[0], text[0] + text[1]
 
     def read32(va):
         for va0, vsize, raw, _ in sections:
@@ -227,6 +306,22 @@ def walk_arms(xbe_path, owners_of_table, defined, window):
                 if off + 4 <= len(data):
                     return struct.unpack_from("<I", data, off)[0]
         return None
+
+    return read32, text[0], text[0] + text[1]
+
+
+def walk_arms(xbe_path, owners_of_table, defined, window, image=None):
+    """switch_arm_audit's tight-bound count: arms within WINDOW of the owner,
+    and how many of those have no translated body.
+
+    `image` is (read32, text_lo, text_hi) already loaded, for a caller that has
+    one -- or for a test, which needs to exercise the WALK without shipping a
+    2 MB XBE into the repository. The walk is the part with the rules in it
+    (the tight bound, the stop at the first non-.text word, the 64-arm cap);
+    parsing the XBE is not, so only the walk is worth testing and only the
+    parse is worth skipping. With `image` given, `xbe_path` is unused.
+    """
+    read32, text_lo, text_hi = image if image else load_image(xbe_path)
 
     arms_total = arms_missing = tables_hit = 0
     rows = []
@@ -271,6 +366,75 @@ def coverage(functions_path):
     return {"functions": len(fns), "coverage_bytes": total}
 
 
+def compare_sites(now, base):
+    """(problems, notes) from the per-address records.
+
+    A regression is a site that got WORSE at an address that existed before.
+    A site that vanished, or one that is new, is re-carving: reported, never
+    failed, because the lifter chopping the binary differently is not the same
+    event as an arm it can no longer place."""
+    problems, notes = [], []
+
+    bsw, nsw = base.get("switch", {}), now.get("switch", {})
+    worse, gone, fresh, better = [], [], [], []
+    for va, cur in sorted(nsw.items()):
+        old_site = bsw.get(va)
+        if old_site is None:
+            fresh.append((va, cur))
+        elif cur["u"] > old_site["u"]:
+            worse.append((va, old_site, cur))
+        elif cur["u"] < old_site["u"]:
+            better.append((va, old_site, cur))
+    for va in sorted(bsw):
+        if va not in nsw:
+            gone.append((va, bsw[va]))
+
+    for va, o, c in worse:
+        problems.append(
+            "switch table %s: unresolved dispatches %d -> %d"
+            " (resolved %d -> %d) -- a site the lifter could place before"
+            % (va, o["u"], c["u"], o["r"], c["r"]))
+    if gone:
+        notes.append("%d switch tables are no longer dispatched anywhere"
+                     " (re-carving): %s" % (len(gone),
+                     ", ".join(v for v, _ in gone[:8])
+                     + (" ..." if len(gone) > 8 else "")))
+    if fresh:
+        nu = sum(1 for _, c in fresh if c["u"])
+        notes.append("%d switch tables are new to this gen, %d of them with an"
+                     " unresolved dispatch: %s" % (len(fresh), nu,
+                     ", ".join(v for v, _ in fresh[:8])
+                     + (" ..." if len(fresh) > 8 else "")))
+    if better:
+        notes.append("%d switch tables lost unresolved dispatches" % len(better))
+
+    btd, ntd = base.get("todo", {}), now.get("todo", {})
+    new_todo = [va for va in sorted(ntd) if va not in btd]
+    gone_todo = [va for va in sorted(btd) if va not in ntd]
+    for va in new_todo:
+        problems.append("untranslated instruction is NEW at %s: `%s`"
+                        " (in %d lifted bodies)"
+                        % (va, ntd[va]["text"], ntd[va]["n"]))
+    if gone_todo:
+        notes.append("%d untranslated sites are gone: %s"
+                     % (len(gone_todo), ", ".join(gone_todo[:8])
+                        + (" ..." if len(gone_todo) > 8 else "")))
+    dup = [va for va in sorted(ntd)
+           if va in btd and ntd[va]["n"] != btd[va]["n"]]
+    if dup:
+        notes.append("%d untranslated sites changed how many lifted bodies"
+                     " carry them (duplicate bodies, not new instructions)"
+                     % len(dup))
+
+    bst, nst = set(base.get("stubs", [])), set(now.get("stubs", []))
+    for name in sorted(nst - bst):
+        problems.append("new unresolved stub %s: a call target the detector"
+                        " never defined" % name)
+    if bst - nst:
+        notes.append("%d unresolved stubs are gone" % len(bst - nst))
+    return problems, notes
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -293,7 +457,7 @@ def main():
             xbe = cand
 
     manifest = read_manifest(args.gen)
-    measures, todo_by_mnemonic, owners_of_table, defined = scan_gen(args.gen)
+    measures, todo_by_mnemonic, owners_of_table, defined, sites = scan_gen(args.gen)
     measures.update(coverage(args.functions))
     arm_rows = None
     if xbe:
@@ -326,6 +490,38 @@ def main():
     print("  detector")
     for k in ("functions", "coverage_bytes"):
         print("    %-28s %7d" % (k, measures[k]))
+
+    # WHICH HALF OF THE UNRESOLVED DISPATCHES ALREADY HAS ITS ANSWER.
+    #
+    # A jump table's contents do not depend on which site reads it, so a table
+    # this tree resolves at one dispatch and not at another is one where the
+    # arm list is already known. Splitting the total says how much of it is
+    # missing information and how much is missing plumbing -- two different
+    # pieces of work, and the totals cannot tell them apart.
+    #
+    # MEASURED 21 Sep 2026: 72 of 142 unresolved dispatches, in 32 tables.
+    # That is NOT 72 easy wins. Checked on 0x0007C9C0
+    # (CActSequence::ReturnFromFullRoboyMenu, 5 arms): four functions dispatch
+    # through it, the one that resolves it is the one whose body contains the
+    # arms, and for the other three the arms are labels inside somebody else's
+    # function -- four of the five have no body of their own to call. So the
+    # blocker is switch_arms_no_body, not the table lookup, and the fix is an
+    # ENTRY POINT for each arm. recover_midfunction_entries.py already builds
+    # exactly that, but only for stubs -- addresses something statically calls
+    # -- and an arm reached only through an unresolved table never becomes a
+    # stub, so the recovery pass never sees it.
+    _sw = sites["switch"]
+    _u_both = sum(v["u"] for v in _sw.values() if v["u"] and v["r"])
+    _n_both = sum(1 for v in _sw.values() if v["u"] and v["r"])
+    _u_only = sum(v["u"] for v in _sw.values() if v["u"] and not v["r"])
+    _n_only = sum(1 for v in _sw.values() if v["u"] and not v["r"])
+    if _u_both or _u_only:
+        print("  unresolved dispatches, split by whether the table is"
+              " resolved somewhere else")
+        print("    %-28s %7d   in %d tables -- arm list known, arms need an"
+              " entry point" % ("table resolved elsewhere", _u_both, _n_both))
+        print("    %-28s %7d   in %d tables -- arm list not known here"
+              % ("resolved nowhere", _u_only, _n_only))
     if args.verbose:
         print()
         print("  TODO sites by mnemonic:")
@@ -343,6 +539,7 @@ def main():
               " before accepting this tree.")
 
     problems = []
+    explained = []
     if args.write_baseline:
         old = {}
         if os.path.exists(args.baseline):
@@ -355,8 +552,13 @@ def main():
                            ("translator_sha", "runtime_types_sha", "xbe_sha",
                             "git_head", "generated_utc")},
                    "method": {"coverage_bytes": "union of [start,end) over functions.json",
-                              "switch_arms": "switch_arm_audit tight bound, window 0x%X" % args.window},
-                   "measures": merged},
+                              "switch_arms": "switch_arm_audit tight bound, window 0x%X" % args.window,
+                              "sites": "guest addresses: switch tables by"
+                                       " resolved/unresolved dispatch count,"
+                                       " untranslated instructions by"
+                                       " RECOMP_UNIMPL address, stubs by name"},
+                   "measures": merged,
+                   "sites": sites},
                   open(args.baseline, "w"), indent=1, sort_keys=True)
         print()
         print("  baseline written to %s" % args.baseline)
@@ -374,15 +576,52 @@ def main():
               " The numbers must still hold." % (
                   base.get("gen", {}).get("translator_sha"),
                   manifest.get("translator_sha")))
+    # THE ADDRESS GATE FIRST, because its answer decides how to read the
+    # totals below.
+    base_sites = base.get("sites")
+    site_problems, site_notes = [], []
+    if base_sites:
+        site_problems, site_notes = compare_sites(sites, base_sites)
+        problems.extend(site_problems)
+    else:
+        print()
+        print("  no site record in %s: the per-address gate is SKIPPED."
+              " Write one with --write-baseline -- until then a regression"
+              " that is masked by a falling total cannot be seen here."
+              % args.baseline)
+
     for k in MUST_NOT_RISE:
         if k in measures and k in bm and measures[k] > bm[k]:
             problems.append("%s rose %d -> %d" % (k, bm[k], measures[k]))
     for k in MUST_NOT_FALL:
         if k in measures and k in bm and measures[k] < bm[k]:
-            problems.append("%s fell %d -> %d" % (k, bm[k], measures[k]))
+            # A FALL THAT THE ADDRESSES ACCOUNT FOR IS NOT A REGRESSION. This
+            # is the 487 -> 481 case: duplicate dispatches disappearing when
+            # re-carving merged spurious function splits. The totals cannot
+            # tell that from six sites going unresolved; the addresses can, and
+            # they have just been checked. Only switch_resolved is excused this
+            # way -- coverage_bytes has no per-site record to excuse it.
+            if (k == "switch_resolved" and base_sites
+                    and not site_problems):
+                explained.append(
+                    "switch_resolved fell %d -> %d, and no switch table gained"
+                    " an unresolved dispatch: these are duplicate dispatches"
+                    " that stopped being emitted, not sites the lifter can no"
+                    " longer place" % (bm[k], measures[k]))
+            else:
+                problems.append("%s fell %d -> %d" % (k, bm[k], measures[k]))
     if measures["unclassified_itail"] or measures["unclassified_icall"]:
         problems.append("unclassified transfer shapes: %d itail, %d icall" % (
             measures["unclassified_itail"], measures["unclassified_icall"]))
+    for n in site_notes:
+        print("  note: " + n)
+    for e in explained:
+        print("  explained: " + e)
+    if args.verbose and base_sites:
+        print()
+        print("  site record: %d switch tables, %d untranslated addresses,"
+              " %d stubs" % (len(sites["switch"]), len(sites["todo"]),
+                             len(sites["stubs"])))
     print()
     if problems:
         print("  GATE FAILED against %s:" % args.baseline)
