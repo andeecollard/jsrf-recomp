@@ -6785,10 +6785,54 @@ static void bridge_ObfDereferenceObject(void)
  * handle, and handing it to GetThreadPriority reads host memory at a guest
  * address. Resolve the object to the token it stands for, and let the
  * existing helpers take the real handle. */
+/* WHAT THE POLL ACTUALLY READS, because the count says it is a spin.
+ *
+ * This is queried 82 MILLION times in a hung session against 213 sets in the
+ * whole run, as one leg of an ObReferenceObjectByHandle / QueryBasePriority /
+ * ObfDereferenceObject cycle. A ratio like that is not bookkeeping, it is a
+ * thread waiting for a value that never arrives.
+ *
+ * `obj ? ... : 0` is the line to watch: a handle that does not resolve reads
+ * ZERO and says nothing about it, so a poll waiting for a nonzero priority on
+ * a thread this bridge cannot find would spin exactly like this and leave no
+ * trace. Counting resolved against unresolved separates "the value never
+ * changes" from "we never found the object", which need opposite fixes.
+ *
+ * Under RECOMP_SCHED_TRACE only; bounded to eight handles and printed once. */
+static struct { uint32_t handle; unsigned long hits; long last; int unresolved; }
+    s_qbp[8];
+static unsigned s_qbp_n;
+static unsigned long s_qbp_over;
+
+void bridge_query_priority_report(void)
+{
+    unsigned i;
+    if (!s_qbp_n) return;
+    fprintf(stderr, "  [SCHED] KeQueryBasePriorityThread by handle"
+                    " (overflow %lu):\n", s_qbp_over);
+    for (i = 0; i < s_qbp_n; ++i)
+        fprintf(stderr, "  [SCHED]   handle=0x%08X queries=%-12lu last=%ld%s\n",
+                s_qbp[i].handle, s_qbp[i].hits, s_qbp[i].last,
+                s_qbp[i].unresolved ? "   <-- HANDLE DID NOT RESOLVE" : "");
+    fflush(stderr);
+}
+
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    XboxGuestObject *obj = bridge_guest_object(STACK_ARG(0));
+    uint32_t h = STACK_ARG(0);
+    XboxGuestObject *obj = bridge_guest_object(h);
     g_eax = obj ? (uint32_t)obj->BasePriority : 0;
+    if (sched_trace_on()) {
+        unsigned i;
+        for (i = 0; i < s_qbp_n; ++i) if (s_qbp[i].handle == h) break;
+        if (i == s_qbp_n) {
+            if (s_qbp_n < 8) { s_qbp[s_qbp_n].handle = h; ++s_qbp_n; }
+            else { ++s_qbp_over; return; }
+        }
+        ++s_qbp[i].hits;
+        s_qbp[i].last = (long)(int32_t)g_eax;
+        if (!obj) s_qbp[i].unresolved = 1;
+    }
 }
 
 static void bridge_KeRestoreFloatingPointState(void)

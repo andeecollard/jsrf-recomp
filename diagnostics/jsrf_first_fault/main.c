@@ -1263,6 +1263,10 @@ static void jsrf_pusher_report(void)
              * kernel_bridge.c, which xbox_input does not link, so it is
              * reported from here rather than beside the pad poll. */
             { extern void bridge_sched_report(void); bridge_sched_report(); }
+            /* Which thread the priority poll is waiting on, and whether its
+             * handle even resolves. See the note at the bridge. */
+            { extern void bridge_query_priority_report(void);
+              bridge_query_priority_report(); }
         }
         jsrf_guest_trace_report();
         pad_sentinel_scan();

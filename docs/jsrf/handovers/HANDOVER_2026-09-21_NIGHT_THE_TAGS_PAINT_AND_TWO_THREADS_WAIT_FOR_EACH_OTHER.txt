@@ -1,0 +1,232 @@
+HANDOVER -- 21 September 2026 (night)
+THE TAGS PAINT, AND TWO THREADS ARE WAITING FOR EACH OTHER
+
+One defect fixed and seen on screen by the player. Two more located to a
+precise, named mechanism with the measurement that names it. And a method
+note that cost most of today's player time, which is the part worth reading
+first.
+
+
+====================================================================
+0. READ THIS BEFORE ASKING THE PLAYER FOR ANOTHER SESSION
+====================================================================
+
+Today burned roughly eight player sessions, and at least four of them were
+spent on theories that a cheaper measurement would have killed first. The
+player's own words at the end were "this process is tedious", and they were
+right.
+
+    EVERY SYMPTOM TODAY HAD A DOWNSTREAM SIGNATURE THAT LOOKED LIKE A CAUSE.
+
+  - Event mode "latched" with nobody requesting exit. Real, measured, and a
+    CONSEQUENCE: the Event latch precedes the pusher freeze by ~1000 log
+    lines and has nothing to do with why the guest stopped.
+  - Eleven voices never retired. Also a consequence: a wedged guest issues no
+    off-commands.
+  - A lost thread resume, 783 of them. Arrived ~2200 log lines AFTER the
+    stall, and win32_compat.c's own comment states the rule -- "a stall that
+    begins in the same report as a lost resume is the mechanism; a stall with
+    lost_resumes flat is not".
+  - Thread priority being a no-op on Darwin. Real defect, implemented, and it
+    did NOT fix the hang. It also cost 3 fps and TRIPLED lost resumes.
+
+The rule that would have saved the time:
+
+    ORDER THE EVIDENCE BEFORE EXPLAINING IT. Find the log line where the
+    symptom starts, then ask what changed BEFORE it, not what looks wrong
+    after it.
+
+And the one that actually worked, three times:
+
+    COUNT THE INPUT, NOT THE GATE -- AND COUNT IT PER CALLER.
+    Every census added today named its defect within one run.
+
+
+====================================================================
+1. FIXED AND SEEN: WALL GRAFFITI PAINTS.   commit 777f04a
+====================================================================
+
+The tag was never a texture problem. Its atlas is DXT3, always accepted. Its
+PIXEL SHADER was refused, and every draw using it was dropped before either
+backend saw it -- 24,821 refusals in one player session, all on output word
+0x000820D0.
+
+Three blockers, ALL live, proven in ONE run by widening the census to record
+the whole refused program instead of the first check that failed:
+
+  bits above 0xfff      AB_DOT_PRODUCT (13), AB blue-to-alpha (19)
+  texture destinations  the program writes T0 and T2 and reads them back
+  per-stage constants   0x0000FF00 0x00FF0000 0x000000FF -- channel masks,
+                        which with a dot product is channel extraction
+
+THE BIT LAYOUT WAS NOT KNOWN AND THE HANDOVER'S CLAIM CITED ONLY ITSELF.
+"Bit 19 is AB_BLUE_TO_ALPHA" appeared in a handover, then in a comment
+quoting that handover, and grep found no third source anywhere. It is now
+checked against xemu's parse_combiner_output, which this file's own header
+already names as the reference. That also settled a contradiction inside this
+tree: d3d8_combiners.c:169 reads bits 0..3 as the AB destination and 4..7 as
+CD, the opposite way round from nv2a_texture_copy.c. THIS FILE WAS RIGHT AND
+THE D3D11 PATH IS INVERTED. Still unfixed; Windows only.
+
+
+====================================================================
+2. THE FREEZE: TWO THREADS POLL EACH OTHER'S PRIORITY, FOREVER
+====================================================================
+
+This is the most valuable thing in this handover. It is a livelock, it is
+named, and the next session should start here.
+
+The per-thread ordinal histogram (commit 2637f2f) and the per-handle poll
+census both point at the same thing. During a frozen cutscene:
+
+    tib=0x00004000  calls=399,895,135
+    tib=0x00982000  calls=313,091,095
+    top ordinals: 246=81975287 250=81975286 124=81966199
+
+246/250/124 in near-perfect lockstep is ObReferenceObjectByHandle /
+ObfDereferenceObject / KeQueryBasePriorityThread -- GetThreadPriority in a
+tight spin, 82 million iterations on one thread.
+
+And the poll census names the target and the answer:
+
+    handle=0x009A4090  queries=132,012,383  last=16
+    handle=0x00B71000  queries=103,324,931  last=16
+
+BOTH HANDLES RESOLVE, AND BOTH RETURN 16 EVERY TIME. Against 213 total
+KeSetBasePriorityThread calls in the entire session.
+
+So this is NOT "we lost the object" and NOT "the value is wrong". Two guest
+threads are each waiting for a base priority of 16 to drop, neither drops,
+and both spin. Whatever the boosted thread was supposed to finish before
+lowering itself, it never finishes -- and because both are spinning, neither
+can.
+
+  NEXT MEASUREMENT, and it needs no player: name the two threads. The handles
+  are 0x009A4090 and 0x00B71000; bridge_thread_handle_for_token and the
+  KERNEL-THREADS tib values should tie each handle to a TIB, and the XDK
+  symbols will name whoever created it. Then read what that thread does
+  between boosting to 16 and dropping back. The XAPI call sites are already
+  known: 0x00147D01/0x00147D52/0x00147D9B, inside XAPILIB SetThreadPriority /
+  GetThreadPriority / SetThreadPriorityBoost.
+
+  DO NOT chase Event mode, stuck voices, or lost resumes again. All three are
+  downstream of this and were each measured to be so.
+
+
+====================================================================
+3. BOOST FLICKER: IT IS BUMPENVMAP, AND WE REFUSE IT
+====================================================================
+
+After the graffiti work, `texmode` was the ONLY refusal left in the renderer
+-- output-mode, output-reg, input-reg, constant, texstage and alpha-test are
+all zero. Widening that census to name the mode and unit gave, in one run:
+
+    unit 0 mode 1   plain 2D
+    unit 1 mode 6   <-- refused
+    unit 2 mode 0   off
+    unit 3 mode 0   off
+
+Mode 6 is PS_TEXTUREMODES_BUMPENVMAP (xemu psh.c): per-pixel displacement
+driven by a texture. That is a heat-haze / distortion effect, which is what a
+speed boost draws, and it is refused on every draw that uses it.
+
+  Small and bursty -- 179 refused draws in one session -- which is the shape
+  of an effect that only appears sometimes. That is consistent with "boost
+  flickers": it draws when the rest of the frame does not need the mode and
+  vanishes when it does.
+
+  NOT YET PROVEN TO BE BOOST. It is one unimplemented mode on one unit, and
+  the correlation with boost is timing and plausibility, not a marked frame.
+  A player pressing M during a boost would settle it in one session.
+
+  The work is nv2a_texture_copy.c:157 and the matching Metal path, the same
+  shape as the combiner widening that landed today.
+
+
+====================================================================
+4. AUDIO: THE BEST IT HAS BEEN, AND THE SWITCH THAT HURT IT
+====================================================================
+
+Voice staleness -- the APU replaying buffers the guest has not refilled, which
+is what "chopping" and "distorted" sound like:
+
+    baseline (SESSION3)            6.9% stale, starved=1
+    RECOMP_THREAD_PRIORITY=1       4.6-5.5% stale, starved=6, SILENT to the
+                                   player
+    priority off, round-trip fix   3.2% stale, starved=0, empty=0
+
+RECOMP_THREAD_PRIORITY applies real Mach priority. It is IMPLEMENTED, it
+demonstrably works (`priority applied=46028 failed=0`), and it should stay
+OFF: it costs ~3 fps, triples lost resumes, made the game silent once, and did
+not fix the hang. Default is off in win32_compat.c.
+
+The decompilation named the whole audio subsystem for this and it is worth
+reusing: CTrtADXStreamManagerXbox::{play,exec,stop,setPause,setWaitPlayStart,
+setVolumes}, playVoiceLine at 0x00117140 exactly where the previous handover
+said, getVoiceLinePath, pauseMusicVoiceStreams. The XDK symbols named what
+exec calls: CRI::ADXT_GetErrCode, ShowProblemWithDisc,
+DirectSoundEnterCriticalSection. THE DISC-ERROR PATH IS NOT FIRING in any of
+the preserved sessions -- ruled out, not suspected.
+
+
+====================================================================
+5. CORRECTIONS TO THINGS I SAID TODAY
+====================================================================
+
+  - THE PRIORITY ROUND-TRIP FIX (4537424) IS INERT ON THE GUEST'S PATH. The
+    round trip through xbox_priority_to_win32 really was lossy -- set 16, read
+    15 -- and the fix and its test are correct. But the guest goes through
+    bridge_KeQueryBasePriorityThread, which returns obj->BasePriority
+    directly and was always exact. I told the player this fix was why they
+    "got further". That was wrong, and the real reason is unestablished.
+
+  - A BIGGER SURFACE CACHE RENDERS BLACK. SURFACE_SLOTS=8 gives
+    nonzero=0/153600 and never leaves the logos, because `owes_guest_ram`
+    means EVICTION IS THE WRITEBACK. The cache size is coupled to the
+    writeback policy. Default stays 4; RECOMP_METAL_SURFACE_SLOTS exists to
+    repeat the experiment.
+
+  - REPLAY CANNOT REACH A CUTSCENE. Two attempts, one with audio off and one
+    with audio on to match the recording's conditions. Both replayed input
+    exactly -- 12/12 checkpoints, 0 BAD -- and both left the game somewhere
+    else entirely (effective=Default, no cutscene, no spin). This is what
+    `state=UNVERIFIED(anchor constant)` has been saying: we reproduce the
+    INPUT and cannot yet prove we reproduce the GAME.
+
+  - THE ANCHOR NOW CARRIES REAL STATE AND STILL CANNOT FAIL. The player's
+    recordings read 1e000000 at all twelve checkpoints -- sequence 30, not the
+    old all-zeros -- but constant, because a whole gameplay session sits in
+    one sequence index. The anchor needs a field that moves DURING gameplay.
+
+
+====================================================================
+6. INSTRUMENTS ADDED TODAY, ALL SILENT WHEN CLEAN
+====================================================================
+
+  [KERNEL-THREADS] top ordinals   per-thread ordinal histogram; names a spin
+                                  loop instead of its last call
+  [SCHED] query by handle         KeQueryBasePriorityThread per handle, with
+                                  an explicit unresolved flag
+  [COMBINER] texture shader modes which mode on which unit, for every refused
+                                  program rather than the first failure
+  [COMBINER] dst registers / C0   the rest of a refused combiner program
+  [ACTMAN]                        twelve mode fields, prints on change
+  [PB-ACK] rate n/min/median/max  the pusher rate, emitted instead of written
+                                  into a comment that goes stale
+
+  THE GENERAL LESSON: every one of these turned a multi-session guess into a
+  single-run answer, and each was cheaper to build than the session it saved.
+
+
+====================================================================
+7. SUITE
+====================================================================
+
+98/101. The two failures are the documented pair: jsrf_input_hotplug reads
+live hardware and fails because a controller is attached; jsrf_switch_audit
+sits 8 over its baseline of 125, identical on a clean HEAD.
+
+New today: jsrf_combiner_graffiti (10 checks, pins output word 0x000820D0 and
+asserts the gate can still refuse), jsrf_texfmt_a4r4g4b4{,-alpha},
+jsrf_thread_priority_roundtrip (17 values including the 16 that mattered),
+jsrf_anchor, jsrf_anchor_decode_python.

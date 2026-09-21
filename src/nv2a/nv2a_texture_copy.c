@@ -26,6 +26,13 @@ static unsigned long s_dma_rejected[4];
  * frame each one costs. */
 static unsigned long s_rej_final, s_rej_control, s_rej_outreg, s_rej_inreg;
 static unsigned long s_rej_const, s_rej_texmode, s_rej_texstage, s_rej_alpha;
+/* WHICH texture shader mode, and on which unit. "texture shader mode" is the
+ * last refusal left in this gate after the graffiti work, and it names the
+ * gate rather than the value -- the same blind spot the format census fixed
+ * in one run. 179 refused draws in the player's 21 Sep session is a small,
+ * bursty number: the shape of an effect that only appears sometimes, which is
+ * what "boost flickers" would look like from in here. */
+static unsigned long s_texmode_seen[32][4];
 static unsigned long s_rej_count_hist[10];
 #define VR_OCW_SLOTS 16
 static uint32_t s_bad_ocw[VR_OCW_SLOTS]; static unsigned long s_bad_ocw_n[VR_OCW_SLOTS];
@@ -156,7 +163,17 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     }
     for (unsigned u=0;u<4;++u) {
         unsigned mode=(M(0x1e70)>>(5*u))&31;
-        if (mode>1) { s_rej_texmode++; return "texture shader mode"; }
+        if (mode>1) {
+            unsigned m2, u2;
+            /* Record the whole program's modes, not just the one that tripped:
+             * a unit refused for mode 3 while another wants mode 2 is two
+             * features, and the early return hides the second. */
+            for (u2 = 0; u2 < 4; ++u2) {
+                m2 = (M(0x1e70) >> (5*u2)) & 31;
+                s_texmode_seen[m2][u2]++;
+            }
+            s_rej_texmode++; return "texture shader mode";
+        }
         if (mode) {
             if (!(M(0x1b0c+64*u)&0x40000000)) {
                 s_rej_texstage++; return "disabled texture shader stage";
@@ -321,6 +338,17 @@ void nv2a_texture_copy_census(void)
         if (s_rej_count_hist[f])
             fprintf(stderr, "[COMBINER]   refused with stage count %u: %lu\n",
                     f, s_rej_count_hist[f]);
+    if (s_rej_texmode) {
+        unsigned m, u;
+        fprintf(stderr, "[COMBINER]   texture shader modes on refused draws"
+                " (mode 0 = off, 1 = plain 2D, >1 unimplemented):\n");
+        for (m = 0; m < 32; ++m)
+            for (u = 0; u < 4; ++u)
+                if (s_texmode_seen[m][u])
+                    fprintf(stderr, "[COMBINER]     unit %u mode %2u  x%lu%s\n",
+                            u, m, s_texmode_seen[m][u],
+                            m > 1 ? "   <-- this is what is refused" : "");
+    }
     for (f = 0; f < s_bad_ocw_used; ++f) {
         uint32_t w = s_bad_ocw[f];
         fprintf(stderr, "[COMBINER]   refused output word 0x%08X  x%lu%s\n",
