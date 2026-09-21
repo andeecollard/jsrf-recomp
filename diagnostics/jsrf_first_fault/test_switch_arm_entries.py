@@ -40,6 +40,7 @@ address out of the actual log -- and is skipped, loudly, when it is not.
 """
 import argparse
 import ast
+import glob
 import os
 import re
 import sys
@@ -282,29 +283,72 @@ def test_the_arm_phase_is_wired_into_the_mandatory_post_pass():
 
 
 def test_against_the_real_tree(gen, xbe):
-    """0x00075EB3, out of the player's log, through the table at 0x00076610."""
+    """0x00075EB3, out of the player's log, through the table at 0x00076610.
+
+    TWO STATES ARE CORRECT and the test has to accept both, which the first
+    version of it did not. Before the post-pass has run on a tree, the address
+    must be SELECTED, through the table sub_00075E90 dispatches on -- that is
+    the wire being tested. After it has run, the address is defined, so it is
+    no longer selected and the same assertion would fail on a tree that had
+    just been repaired: the gate would go red at the exact moment it was
+    satisfied, which is how a gate gets disabled instead of read.
+
+    So the repaired state is asserted on its own terms, and they are harder:
+    a BODY, a ROW in g_recomp_table, and the size literal beside it covering
+    that row. A body with no row is dead code and a row past the count is
+    invisible to both the binary search and the flat-table build, so any one
+    of the three missing means the [ITAIL] repeats unchanged.
+    """
     if not gen or not os.path.isdir(gen) or not xbe or not os.path.exists(xbe):
         print("  real tree: SKIPPED (need --gen with a generated tree and an"
               " XBE via --xbe or $JSRF_GAME_DIR)")
         return
-    if not os.path.exists(os.path.join(gen, "recomp_dispatch.c")):
+    dispatch_path = os.path.join(gen, "recomp_dispatch.c")
+    if not os.path.exists(dispatch_path):
         print("  real tree: SKIPPED (%s has no recomp_dispatch.c)" % gen)
         return
-    arms, stats = switch_arm_entries.select(gen, xbe)
     target = 0x00075EB3
+    name = "sub_%08X" % target
+    dispatch = open(dispatch_path, errors="ignore").read()
+    defined = set()
+    for unit in sorted(glob.glob(os.path.join(gen, "*.c"))):
+        defined |= set(control_flow_gate.DEF_RE.findall(
+            open(unit, errors="ignore").read()))
+
+    if name in defined:
+        registered = switch_arm_entries.registered_addresses(dispatch)
+        check(target in registered,
+              "real tree: %s has a body but NO row in g_recomp_table. Its only"
+              " route in is RECOMP_ITAIL -> recomp_lookup, so the body is dead"
+              " code and the [ITAIL] at 0x%08X repeats unchanged." % (name, target))
+        size = switch_arm_entries.SIZE_RE.search(dispatch)
+        rows = switch_arm_entries.DISPATCH_ROW_RE.findall(dispatch)
+        index = next((i for i, (va, _n) in enumerate(rows)
+                      if int(va, 16) == target), None)
+        if check(size is not None, "real tree: no g_recomp_table_size literal"):
+            declared = int(size.group(2))
+            check(declared == len(rows),
+                  "real tree: g_recomp_table_size is %d but the array has %d"
+                  " rows; the lookup loops over the LITERAL, so %d rows are"
+                  " invisible" % (declared, len(rows), len(rows) - declared))
+            check(index is not None and index < declared,
+                  "real tree: 0x%08X is row %s of %d, past the declared"
+                  " g_recomp_table_size of %d -- registered and unreachable"
+                  % (target, index, len(rows), declared))
+        print("  real tree: 0x%08X REPAIRED -- body present, row %s of %s,"
+              " within g_recomp_table_size" % (target, index, len(rows)))
+        return
+
+    arms, stats = switch_arm_entries.select(gen, xbe)
     if not check(target in arms,
                  "real tree: 0x%08X -- the address in the first [ITAIL]"
-                 " failure this project ever logged -- is not selected for"
-                 " recovery. %d arms were." % (target, len(arms))):
+                 " failure this project ever logged -- has no body and is not"
+                 " selected for recovery either. %d arms were." % (target, len(arms))):
         return
     check(0x00076610 in arms[target],
           "real tree: 0x%08X is selected, but not through the table at"
           " 0x00076610 that sub_00075E90 dispatches on: %s"
           % (target, ["0x%08X" % t for t in arms[target]]))
-    registered = switch_arm_entries.registered_addresses(
-        open(os.path.join(gen, "recomp_dispatch.c")).read())
-    check(target not in registered or stats["arms_no_body"] == 0,
-          "real tree: 0x%08X is registered but still selected" % target)
     print("  real tree: 0x%08X selected via %s; %d arms with no entry point"
           " across %d unresolved tables"
           % (target, ", ".join("0x%08X" % t for t in arms[target]),

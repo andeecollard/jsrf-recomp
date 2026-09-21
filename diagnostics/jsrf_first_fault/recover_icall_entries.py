@@ -17,6 +17,19 @@ is decoded rather than declared, so a mistaken address cannot register a body
 that runs off into whatever follows it.
 
 icall_entries.json also feeds a full regeneration through --seed-functions.
+
+THE ROWS WERE INVISIBLE, fixed 21 Sep 2026. Registration here appended rows to
+g_recomp_table and never touched the `g_recomp_table_size` literal beside it --
+and that literal, not the array's real length, is what recomp_lookup's binary
+search and recomp_dispatch_init's flat-table build both loop to. Every row this
+script added past the declared count was therefore dead: the body existed, the
+row existed, the address still failed to resolve, and nothing said so. Nothing
+has paid for it because regenerate.sh does not run this script, which is
+exactly the state a latent bug is in before it costs a day.
+
+The same array has four invariants -- sorted, counted, spanned, unique --
+and switch_arm_entries.register_dispatch keeps all four in one tested place.
+Use it rather than restating any of them here.
 """
 import json
 from pathlib import Path
@@ -24,9 +37,12 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(HERE))
 from tools.recomp.config import configure_from_xbe
 from tools.recomp.translator import FunctionTranslator
+import switch_arm_entries
 
 TERMINATORS = ("ret", "retn", "jmp", "int3", "ud2", "hlt")
 
@@ -91,20 +107,20 @@ def main():
     for name in translator.lifter.referenced_calls.values():
         assert re.search(rf"\bvoid {re.escape(name)}\(void\)", header), name
 
-    match = re.search(
-        r"(static const recomp_entry_t g_recomp_table\[\] = \{\n)(.*?)(\n\};)",
-        dispatch, re.S)
-    assert match
-    rows = match.group(2).splitlines()
     for start, end, name, code in generated:
-        rows.append(f"    {{ 0x{start:08X}u, (recomp_func_t){name} }},")
         declaration = f"void {name}(void);"
         if declaration not in header:
             header += "\n" + declaration + "\n"
         bodies += ("\n/* Indirect-call target the detector never found; "
                    f"0x{start:08X}-0x{end:08X}. */\n" + code)
-    rows.sort(key=lambda line: int(re.search(r"0x([0-9A-F]+)u", line).group(1), 16))
-    dispatch = dispatch[:match.start(2)] + "\n".join(rows) + dispatch[match.end(2):]
+    # Sorted, counted, spanned, unique -- see the note at the top of the file.
+    # The count is the one that used to be missed, and it is the one that
+    # decides whether any of this is reachable at all.
+    dispatch, added = switch_arm_entries.register_dispatch(
+        dispatch, [(start, name) for start, _end, name, _code in generated])
+    assert len(added) == len(generated), (
+        "rows refused by register_dispatch: %r" % (
+            sorted({n for _s, _e, n, _c in generated} - {n for _v, n in added}),))
 
     for path in (dispatch_path, header_path, bodies_path):
         backup = path.with_suffix(path.suffix + ".before-icall-entries")

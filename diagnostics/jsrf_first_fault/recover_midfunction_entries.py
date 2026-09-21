@@ -46,6 +46,16 @@ the same refusals. Two differences, both forced:
     write, because recovered stub bodies are themselves a source of unresolved
     dispatches -- sub_00075E90, which owns the table 0x00075EB3 comes from, is
     a recovered stub. Ordering them the other way finds a strict subset.
+
+    "The tree that phase is about to write" has to mean ALL of it, which the
+    first version of this did not: sub_00075E90 is reached by a backward jump
+    from a recovered stub, so it lands in `extra` and was appended after the
+    arm walk had already run. The first real regeneration, 21 Sep 2026, then
+    saw 52 tables and 424 arms instead of 53 and 437, and the 13 it missed
+    included 0x00075EB3 -- the address the whole pass exists for, absent from
+    the tree while every printed number looked healthy. The walk now reads the
+    patched text, the by-reference bodies and the arms recovered so far, and
+    repeats until a round adds nothing.
   * an arm is REGISTERED in g_recomp_table, which a stub never needs. A stub
     is reached by a static call to its name; an arm is reached only by
     recomp_lookup, so a body with no row is dead code. switch_arm_entries.py's
@@ -165,38 +175,98 @@ def manual_definitions():
     return names
 
 
-def recover_switch_arms(recovery, gen_dir, xbe, stub_source, window):
+EXTRA_NOTE = "/* Reached by a backward jump from a recovered entry. */"
+ARM_NOTE = ("/* Switch arm with no entry point of its own; reached"
+            " only through an unresolved jump table. */")
+
+
+def with_extra_bodies(text, extra):
+    """`text` plus every body pulled in by reference, as main() will write it.
+
+    One function because two callers must agree. main() appends these at the
+    end; the arm phase has to SEE them before that, and a copy of the loop in
+    each place is how the arm phase came to scan a tree that was missing
+    sub_00075E90 -- the dispatcher of the one table this whole pass exists
+    for. Whatever main() writes is what the arm walk reads.
+    """
+    for name in sorted(extra):
+        text += "\n" + EXTRA_NOTE + "\n" + extra[name].rstrip() + "\n"
+    return text
+
+
+# A recovered body can open a table nobody could see before it existed, so one
+# round is not the answer -- it is only the answer that happens to be right on
+# a tree some earlier run already patched. Eight is regenerate.sh's bound for
+# the same shape of loop and this converges in far fewer; not converging is
+# reported rather than silently truncated.
+ARM_ROUNDS = 8
+
+
+def recover_switch_arms(recovery, gen_dir, xbe, stub_source, window,
+                        rounds=ARM_ROUNDS):
     """Bodies for the arms of every table the lifter could not place.
 
     Returns (entries, skipped, stats): entries is [(VA, name, body or None)],
     with None meaning the body is already in recovery.extra because something
     recovered earlier called it -- it still needs a dispatch row, which is the
     whole reason an arm is different from a stub.
-    """
-    # Only the manual definitions are excluded from SELECTION. An arm already
-    # in recovery.extra deliberately stays in the list: it has a body, but a
-    # body is half the repair and the dispatch row is the half the runtime can
-    # see, so it is carried through to registration with body=None.
-    tables_of, stats = switch_arm_entries.select(
-        gen_dir, xbe, window=window,
-        sources={os.path.join(gen_dir, "recomp_stubs_unresolved.c"): stub_source},
-        already_named=manual_definitions())
 
-    entries, skipped = [], {}
-    for arm in tables_of:
-        name = "sub_%08X" % arm
-        if name in recovery.extra:
-            # Pulled in as a callee while recovering something else. The body
-            # exists; only the registration is missing.
-            entries.append((arm, name, None))
-            continue
-        result = recovery.translate(arm, name)
-        if not result.startswith("/*"):
-            skipped["0x%08X" % arm] = result
-            continue
-        entries.append((arm, name, result))
+    ITERATED, and the reason is 0x00075EB3 itself. The text handed to the walk
+    must contain every body this run will write, because an unresolved
+    dispatch inside one of them is the only evidence its table exists:
+    sub_00075E90 is reached by a backward jump from a recovered stub, lands in
+    recovery.extra rather than in the stub text, and a single round over
+    `stub_source` alone therefore saw 52 tables and 424 arms where the written
+    tree has 53 and 437. The 13 it could not see included the one address the
+    player's [ITAIL] named. Each round rescans with everything recovered so
+    far in place and stops when a round adds nothing.
+    """
+    stub_path = os.path.join(gen_dir, "recomp_stubs_unresolved.c")
+    manual = manual_definitions()
+    entries, skipped, stats = [], {}, {}
+    seen = set()
+    for _round in range(rounds):
+        # Everything this run will write, in the order main() writes it: the
+        # patched stub text, the bodies pulled in by reference, then the arm
+        # bodies recovered so far.
+        prospective = with_extra_bodies(stub_source, recovery.extra)
+        for _va, _name, body in entries:
+            if body is not None:
+                prospective += "\n" + ARM_NOTE + "\n" + body.rstrip() + "\n"
+        # Only the manual definitions are excluded from SELECTION. A name this
+        # run created stays in the list: it has a body, but a body is half the
+        # repair and the dispatch row is the half the runtime can see, so it
+        # is carried through to registration with body=None.
+        tables_of, stats = switch_arm_entries.select(
+            gen_dir, xbe, window=window,
+            sources={stub_path: prospective},
+            already_named=manual,
+            defined_by_this_run=set(recovery.extra) | {n for _v, n, _b in entries})
+
+        fresh = [arm for arm in tables_of
+                 if arm not in seen and ("0x%08X" % arm) not in skipped]
+        if not fresh:
+            break
+        for arm in fresh:
+            seen.add(arm)
+            name = "sub_%08X" % arm
+            if name in recovery.extra:
+                # Pulled in as a callee while recovering something else. The
+                # body exists; only the registration is missing.
+                entries.append((arm, name, None))
+                continue
+            result = recovery.translate(arm, name)
+            if not result.startswith("/*"):
+                skipped["0x%08X" % arm] = result
+                continue
+            entries.append((arm, name, result))
+    else:
+        print("WARNING: switch-arm recovery did not converge in %d rounds;"
+              " a table opened by one of the last round's bodies is"
+              " unrecovered." % rounds)
     stats["arms_recovered"] = len(entries)
     stats["arms_skipped"] = len(skipped)
+    stats["arms_no_body"] = len(entries) + len(skipped)
     return entries, skipped, stats
 
 
@@ -286,16 +356,13 @@ def main():
             dispatch, [(va, name) for va, name, _ in arm_entries])
 
     extra = recovery.extra
+    patched = with_extra_bodies(patched, extra)
     for name in sorted(extra):
-        patched += ("\n/* Reached by a backward jump from a recovered entry. */\n"
-                    + extra[name].rstrip() + "\n")
         header += f"\nvoid {name}(void);\n"
     for _va, name, body in arm_entries:
         if body is None:
             continue          # already appended above, out of `extra`
-        patched += ("\n/* Switch arm with no entry point of its own; reached"
-                    " only through an unresolved jump table. */\n"
-                    + body.rstrip() + "\n")
+        patched += "\n" + ARM_NOTE + "\n" + body.rstrip() + "\n"
         declaration = f"void {name}(void);"
         if declaration not in header:
             header += "\n" + declaration + "\n"

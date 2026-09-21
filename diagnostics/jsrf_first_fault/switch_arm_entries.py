@@ -101,7 +101,7 @@ def registered_addresses(dispatch_text):
 
 
 def select(gen_dir, xbe_path, window=WINDOW, sources=None, image=None,
-           already_named=()):
+           already_named=(), defined_by_this_run=()):
     """Arms with no body of their own: {arm VA: [table VA, ...]}, plus stats.
 
     The three filters, in the order they are cheapest to apply:
@@ -117,6 +117,17 @@ def select(gen_dir, xbe_path, window=WINDOW, sources=None, image=None,
         which covers the bodies the stub pass pulled in by reference and has
         not written out yet.
 
+    `defined_by_this_run` is the exception to the second filter and it is
+    there for one reason, found 21 Sep 2026 by regenerating. The scanned text
+    has to include the bodies the stub phase pulled in BY REFERENCE, because
+    sub_00075E90 -- the only dispatcher of the table 0x00075EB3 is an arm of
+    -- is one of them, and a scan without it cannot see that table at all.
+    But putting those bodies in the text also makes their names `defined`,
+    which would drop them from the selection, and an arm that has a body and
+    no row in g_recomp_table is exactly as unreachable as one with neither.
+    So they are handed in here and exempted: seen as text, not counted as
+    somebody else's work.
+
     Registration is filtered separately, by the caller, against
     registered_addresses() -- an address can be defined and not registered
     (every recovered stub is) and the two questions have different answers.
@@ -126,7 +137,7 @@ def select(gen_dir, xbe_path, window=WINDOW, sources=None, image=None,
     _am, _rows, arms_of = control_flow_gate.walk_arms(
         xbe_path, owners_of_table, defined, window, image=image)
 
-    known = set(defined) | set(already_named)
+    known = (set(defined) | set(already_named)) - set(defined_by_this_run)
     tables_of = {}
     slots = 0
     for table, arms in sorted(arms_of.items()):
