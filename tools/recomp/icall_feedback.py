@@ -77,6 +77,80 @@ def parse_dump(path):
     return out
 
 
+DEFAULT_SITES_DB = os.path.join(SCRIPT_DIR, "output", "icall_sites.json")
+
+
+def parse_sites_dump(path):
+    """{site: (set(targets), saturated)} from an icall_sites.dump.
+
+    Same tolerance for truncation as parse_dump: the file is written from a
+    process that may be dying."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or parts[0].startswith("#"):
+                continue  # comment, blank, or a truncated tail
+            try:
+                site = int(parts[0], 16)
+                saturated = parts[-1] == "+"
+                targets = {int(t, 16) for t in parts[1:len(parts) - (1 if saturated else 0)]}
+            except ValueError:
+                continue  # truncated tail
+            if not site:
+                continue
+            prev = out.get(site, (set(), False))
+            out[site] = (prev[0] | targets, prev[1] or saturated)
+    return out
+
+
+def load_sites(path=None):
+    path = path or DEFAULT_SITES_DB
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    return {int(k, 16): ({int(t, 16) for t in v.get("targets", [])},
+                         bool(v.get("saturated")))
+            for k, v in raw.items()}
+
+
+def save_sites(path, sites):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {"0x%08X" % site: {"targets": ["0x%08X" % t for t in sorted(ts)],
+                              "saturated": sat}
+            for site, (ts, sat) in sorted(sites.items())}
+    with open(path, "w") as f:
+        json.dump(data, f, indent=1)
+        f.write("\n")
+
+
+def sites_dump_beside(targets_dump):
+    """The icall_sites.dump the runtime writes next to a targets dump."""
+    if targets_dump.endswith("targets.dump"):
+        return targets_dump[:-len("targets.dump")] + "sites.dump"
+    return targets_dump + ".sites"
+
+
+def merge_sites(db_path, dumps):
+    """Union each dump's per-site sets into the cumulative database. A site
+    once seen saturated stays saturated: the lifter must never guard it on
+    the strength of a later, shorter run."""
+    sites = load_sites(db_path)
+    seen = 0
+    for path in dumps:
+        if not os.path.exists(path):
+            continue
+        d = parse_sites_dump(path)
+        seen += len(d)
+        for site, (ts, sat) in d.items():
+            prev = sites.get(site, (set(), False))
+            sites[site] = (prev[0] | ts, prev[1] or sat)
+    if seen:
+        save_sites(db_path, sites)
+    return sites, seen
+
+
 def load_db(path):
     """Load the cumulative database as {va: flags}."""
     if not os.path.exists(path):
@@ -191,6 +265,14 @@ def cmd_merge(args):
     promoted = sorted(va for va in before if before[va] != db[va])
 
     save_db(args.db, db)
+
+    sites_db = getattr(args, "sites_db", None) or DEFAULT_SITES_DB
+    sites, seen = merge_sites(sites_db, [sites_dump_beside(p) for p in args.dumps])
+    if seen:
+        small = sum(1 for ts, sat in sites.values() if not sat and len(ts) <= 4)
+        print("  sites database: %s -- %d sites, %d guardable (<= 4 targets), %d saturated"
+              % (sites_db, len(sites), small,
+                 sum(1 for _, sat in sites.values() if sat)))
 
     print()
     print("database : %s" % args.db)

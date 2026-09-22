@@ -53,6 +53,25 @@ extern volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
  * handler, since a title that dies mid-boot is exactly the one whose targets
  * you want.
  */
+/* Per-site record: which targets each `call` site has reached. The inline
+ * part is a 64K-entry (site, last target) cache keyed by a multiplicative
+ * hash of the site, so a site that keeps calling the same target costs two
+ * loads and a compare; the out-of-line insert runs only when the pair
+ * changes. Collisions between sites only cost extra inserts, never wrong
+ * records -- the table behind the call keys on the exact site. Races between
+ * threads can lose or duplicate an insert; this is an instrument, and the
+ * merge tool unions the results. */
+extern uint32_t g_icall_site_hs[65536];
+extern uint32_t g_icall_site_hl[65536];
+void recomp_icall_observe_site(uint32_t site, uint32_t va);
+#define RECOMP_ICALL_OBSERVE_SITE(site, va) do { \
+    uint32_t _os = (uint32_t)(site), _ot = (uint32_t)(va); \
+    uint32_t _oh = (_os * 2654435761u) >> 16; \
+    if (g_icall_site_hs[_oh] != _os || g_icall_site_hl[_oh] != _ot) { \
+        g_icall_site_hs[_oh] = _os; g_icall_site_hl[_oh] = _ot; \
+        recomp_icall_observe_site(_os, _ot); \
+    } \
+} while (0)
 void recomp_icall_feedback_dump(const char *path);
 
 /** Register an atexit() dump to recomp_icall_feedback_path(). */
@@ -98,6 +117,7 @@ const char *recomp_icall_feedback_path(void);
 #else  /* !RECOMP_ICALL_FEEDBACK */
 
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+#define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
 #define RECOMP_ICALL_FEEDBACK_INIT()   ((void)0)
 #define RECOMP_ICALL_FEEDBACK_DUMP()   ((void)0)
 

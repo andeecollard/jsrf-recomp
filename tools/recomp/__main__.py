@@ -199,6 +199,10 @@ def main():
                         help="Path to abi_functions.json (overrides --abi-dir)")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="Allow disassembly recorded for a different binary")
+    parser.add_argument("--icall-sites", metavar="FILE", default=None,
+                        help="Per-site indirect-call targets from "
+                             "tools.recomp.icall_feedback merge (default: "
+                             "tools/recomp/output/icall_sites.json)")
     parser.add_argument("--manual-functions", metavar="FILE",
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
@@ -275,6 +279,9 @@ def main():
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
         jump_tables_json_path=data_files.get("jump_tables"),
+        icall_sites_json_path=args.icall_sites or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "output",
+            "icall_sites.json"),
     )
 
     t_load = time.time() - t0

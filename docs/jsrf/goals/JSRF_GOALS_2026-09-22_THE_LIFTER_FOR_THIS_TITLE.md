@@ -197,6 +197,53 @@ misses; a scene-matched A/B shows frame time neutral or better; the ABI
 checker (`RECOMP_ABI_CHECK`) reports no new violation. Value is unmeasured
 and the frame is not here (see above), so this is third, not first.
 
+### G29 outcome, 22–23 Sep 2026 (night)
+
+Built as specified. The lifter now names every indirect call's site to the
+runtime (`RECOMP_ICALL_SAFE_AT`); under `RECOMP_ICALL_FEEDBACK` the runtime
+keeps a per-site target set (inline 64K-entry (site, last target) cache in
+front of an open-addressed table, saturating at six) and writes
+`icall_sites.dump` beside `icall_targets.dump`; `icall_feedback merge`
+unions it into `tools/recomp/output/icall_sites.json`, cumulative, with
+saturation sticky; and a site whose whole recorded set is at most four
+translated functions is emitted as guarded direct calls
+(`RECOMP_ABI_CALL_G`) with the generic dispatch as the fallback. The gate
+counts `icall_guarded` and `icall_guard_arm`.
+
+One 150 s tutorial run recorded **1,379 sites, 1,327 of them with exactly
+one target, 20 saturated**. The next gen guards **1,243 sites with 1,276
+arms** (the rest name a target the gen does not define). Gate passes with
+no baseline change.
+
+**Runs, all `measure.sh` 150 s, tutorial `live=61`, 0 faults, 0 `[ITAIL]`:**
+
+| arm | binary | frame mean | sync | rest | draws/flip | guards |
+|---|---|---:|---:|---:|---:|---|
+| g28 (earlier, same schedule) | before G29 | 17.83 ms | 13.41 | 4.45 | 68.3 | – |
+| **B1** | guarded | **18.15 ms** | 13.38 | 4.99 | 70.5 | **hit 13,174,538, missed 0** |
+| A1 | site-aware, unguarded | 30.54 ms | 28.52 | 7.88 | 69.0 | – |
+| B2 | guarded | 34.22 ms | 25.26 | 10.03 | 69.5 | hit 6,699,364, missed 0 |
+| A2 | site-aware, unguarded | 30.27 ms | 24.66 | 6.97 | 58.1 | – |
+
+**A1, B2 and A2 are confounded and are not scored.** Every stage doubled in
+them at once, including `sync`, which is GPU execution time the call path
+cannot touch: the host was loaded for the last three arms (they ran after
+an hour of full rebuilds and two regenerations, with the gen tree freshly
+rewritten). The pair that ran under equal conditions, g28 against B1, says
+what the goals file predicted: **frame time neutral** (`rest` 4.45 → 4.99 ms
+is inside run-to-run variance), and the guards take **every** executed call
+at a guarded site -- zero misses across 13.2 million.
+
+**What G29 bought, then:** not frame time -- that was never where the frame
+was -- but 1,243 sites whose callee is now a name in the generated C, a
+per-site record for the next diagnosis, and no shared trace-ring writes on
+those paths. It is kept ON because it is measured neutral and never wrong:
+an unseen target falls through to the dispatch it always used. The A/B
+should be repeated once on an idle host; that is a run, not a build.
+
+The per-site database is a run product, like the target database: it is
+not in git, and a fresh clone guards nothing until a run has been merged.
+
 ## G30 — the lifter fuzz, re-scored on the current lifter
 
 The 17 Sep run (`PROGRESS_2026-09-17_NIGHT_THE_LIFTER_FUZZ.md`) scored **860

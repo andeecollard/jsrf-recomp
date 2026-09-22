@@ -536,6 +536,7 @@ void recomp_unimpl(const char *text, uint32_t va);
 #include "recomp_icall_feedback.h"
 #else
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+#define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
 #endif
 
 /**
@@ -1372,6 +1373,16 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 /* Direct calls are the overwhelming majority and the lifter emits thousands of
  * them, so they keep the short spelling. */
 #define RECOMP_ABI_CALL(va, fn) RECOMP_ABI_CALL_K((va), (fn), 'C')
+/* A guarded arm of an indirect call: the lifter saw this site reach `fn` in
+ * a recorded run and calls it directly when the target matches, so the
+ * dispatch-table lookup and the shared trace-ring writes are skipped. Spelt
+ * apart from RECOMP_ABI_CALL so the control-flow gate counts the two
+ * separately. */
+#define RECOMP_ABI_CALL_G(va, fn) RECOMP_ABI_CALL_K((va), (fn), 'G')
+extern volatile uint64_t g_icall_guard_hits;
+extern volatile uint64_t g_icall_guard_misses;
+#define RECOMP_ICALL_GUARD_HIT()  ((void)g_icall_guard_hits++)
+#define RECOMP_ICALL_GUARD_MISS() ((void)g_icall_guard_misses++)
 
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
@@ -1426,6 +1437,33 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
         recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL_K(_va, _fn, 'I'); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/**
+ * RECOMP_ICALL_SAFE_AT - RECOMP_ICALL_SAFE that also names the call SITE.
+ *
+ * `site` is the guest address of the `call` instruction. Under
+ * RECOMP_ICALL_FEEDBACK the runtime records which targets each site reaches
+ * (icall_sites.dump), which is what lets the lifter guard a site with direct
+ * calls on the next generation. Everything else is RECOMP_ICALL_SAFE.
+ */
+#define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
+        g_esp = (saved_esp); eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \

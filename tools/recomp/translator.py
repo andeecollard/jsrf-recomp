@@ -203,7 +203,7 @@ def _fixup_icall_esp_save(lines):
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line:
+        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             icall_indices.append(i)
 
     if not icall_indices:
@@ -297,8 +297,10 @@ def _fixup_icall_esp_save(lines):
         if i in caller_cleans:
             line = line.replace(", _icall_esp)",
                                 f", _icall_esp - {caller_cleans[i]})")
+            line = line.replace(", _icall_esp, ",
+                                f", _icall_esp - {caller_cleans[i]}, ")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line:
+        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
@@ -419,9 +421,11 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None, jump_tables=None):
+                 trace_functions=None, jump_tables=None, icall_sites=None):
         """
         xbe_data: bytes - raw XBE file contents
+        icall_sites: dict - call-site VA -> [target VAs] the title was
+                     measured reaching (tools/recomp/output/icall_sites.json)
         jump_tables: dict - table VA -> [arm VAs], every switch table the
                      disassembler measured (disasm/jump_tables.json)
         func_db: dict - addr → function info from functions.json
@@ -433,6 +437,7 @@ class FunctionTranslator:
         self.xbe_data = xbe_data
         self.func_db = func_db
         self.jump_tables = dict(jump_tables or {})
+        self.icall_sites = dict(icall_sites or {})
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
@@ -951,6 +956,7 @@ class FunctionTranslator:
         self.lifter.jump_table_targets = dict(self.jump_tables)
         if recovered:
             self.lifter.jump_table_targets.update(recovered["jump_tables"])
+        self.lifter.icall_site_targets = self.icall_sites
 
         # Disassemble
         instructions = (recovered["instructions"] if recovered else
@@ -1537,8 +1543,17 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None, jump_tables_json_path=None):
+                 trace_functions=None, jump_tables_json_path=None,
+                 icall_sites_json_path=None):
         self.xbe_path = xbe_path
+        self.icall_sites = {}
+        if icall_sites_json_path and os.path.exists(icall_sites_json_path):
+            with open(icall_sites_json_path, "r") as f:
+                for key, rec in json.load(f).items():
+                    if rec.get("saturated"):
+                        continue
+                    self.icall_sites[int(key, 16)] = [
+                        int(t, 16) for t in rec.get("targets", [])]
         self.jump_tables = {}
         if jump_tables_json_path and os.path.exists(jump_tables_json_path):
             with open(jump_tables_json_path, "r") as f:
@@ -1613,7 +1628,7 @@ class BatchTranslator:
             seh_prolog=seh_prolog, seh_epilog=seh_epilog,
             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
             trace_functions=trace_functions,
-            jump_tables=self.jump_tables)
+            jump_tables=self.jump_tables, icall_sites=self.icall_sites)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 

@@ -814,7 +814,15 @@ static void ohci_trace_control_ed(uint32_t ed_va)
     uint32_t *ed;
     uint32_t td_va, tail_va;
 
-    if (!getenv("RECOMP_OHCI_TRANSFER_TRACE") || ++dumps > 32)
+    /* Cached. This is reached from ohci_periodic_tick() on the PB-ACK thread,
+     * which spins at ~1M iterations/s, and getenv takes a process-global lock
+     * in libc -- both freeze samples of 21 Sep 2026 caught that thread parked
+     * in _os_unfair_lock_lock_slow underneath this call. The switch cannot
+     * change after start, so read it once. xbox_usb_ohci.c:71 already caches
+     * the same variable; this was the copy that did not. */
+    static int trace = -1;
+    if (trace < 0) trace = getenv("RECOMP_OHCI_TRANSFER_TRACE") ? 1 : 0;
+    if (!trace || ++dumps > 32)
         return;
     ed_va &= ~0xFu;
     ed = (uint32_t *)ohci_resolve(ed_va, 16u);

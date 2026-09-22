@@ -137,7 +137,7 @@ DEF_RE = re.compile(r"^void (sub_[0-9A-F]{8})\(void\)", re.M)
 # Every RECOMP_ITAIL / RECOMP_ICALL occurrence, so the classified sum can be
 # checked against the total.
 ITAIL_ANY = re.compile(r"RECOMP_ITAIL\(")
-ICALL_ANY = re.compile(r"RECOMP_ICALL(?:_SAFE)?\(")
+ICALL_ANY = re.compile(r"RECOMP_ICALL(?:_SAFE)?(?:_AT)?\(")
 
 REG = r"e(?:[a-d]x|[sd]i|[bs]p)"
 SHAPES = [
@@ -146,8 +146,10 @@ SHAPES = [
     ("goto", re.compile(r"\bgoto loc_[0-9A-F]{8};")),
     ("switch_resolved", re.compile(r"\{ uint32_t _jt = ")),
     ("switch_arms_goto", re.compile(r"if \(_jt == 0x[0-9A-F]{8}u\) goto")),
-    ("icall", re.compile(r"RECOMP_ICALL(?:_SAFE)?\(_icall_target")),
-    ("icall_static", re.compile(r"RECOMP_ICALL(?:_SAFE)?\(0x[0-9A-F]+u")),
+    ("icall", re.compile(r"RECOMP_ICALL(?:_SAFE)?(?:_AT)?\(_icall_target")),
+    ("icall_guarded", re.compile(r"/\* indirect call, guarded \d+ \*/")),
+    ("icall_guard_arm", re.compile(r"RECOMP_ABI_CALL_G\(")),
+    ("icall_static", re.compile(r"RECOMP_ICALL(?:_SAFE)?(?:_AT)?\(0x[0-9A-F]+u")),
     ("switch_unresolved", re.compile(r"RECOMP_ITAIL\(MEM32\(" + REG + r" \* 4 \+ 0x[0-9A-F]+\)\)")),
     ("switch_default", re.compile(r"RECOMP_ITAIL\(_jt\)")),
     ("itail_vtable", re.compile(r"RECOMP_ITAIL\(MEM32\(" + REG + r"(?: \+ (?:0x[0-9A-F]+|\d+))?\)\)")),
@@ -470,8 +472,9 @@ def main():
         manifest.get("generated_utc", "?")))
     print()
     print("  translated statically")
-    for k in ("direct_call", "direct_tail", "goto", "switch_resolved", "switch_arms_goto"):
-        print("    %-28s %7d" % (k, measures[k]))
+    for k in ("direct_call", "direct_tail", "goto", "switch_resolved", "switch_arms_goto",
+              "icall_guarded", "icall_guard_arm"):
+        print("    %-28s %7d" % (k, measures.get(k, 0)))
     print("  resolved at runtime through the dispatch table")
     for k in ("icall", "itail_vtable", "itail_abs", "itail_reg", "switch_default"):
         print("    %-28s %7d" % (k, measures[k]))
