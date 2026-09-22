@@ -84,8 +84,15 @@ def gen_case(rng, i):
         body = [f"{op} {lo}, {cnt}"]
         if w != 32: body.append("movzx eax, ax" if w==16 else "movzx eax, al")
     elif fam == "incdec":
-        body = [f"{rng.choice(('inc','dec','neg','not'))} {lo}"]
-        if rng.random() < .5: body += [f"set{rng.choice(CONDS)} dl", "movzx eax, dl"]
+        op = rng.choice(('inc','dec','neg','not'))
+        body = [f"{op} {lo}"]
+        # NOT leaves EFLAGS alone (SDM Vol 2B), so a setcc after it reads
+        # whatever was there before the case: undefined in both models, and
+        # the one thing the 22 Sep 2026 re-score still flagged (24 vectors,
+        # one case, `not ax ; setnz dl`). Only the flag-writing three get a
+        # consumer.
+        if op != "not" and rng.random() < .5:
+            body += [f"set{rng.choice(CONDS)} dl", "movzx eax, dl"]
         elif w != 32: body.append("movzx eax, ax" if w==16 else "movzx eax, al")
     elif fam == "ext":
         src = rng.choice(("al","cl","ax","cx"))
@@ -198,6 +205,7 @@ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va){(void)va;}
+void recomp_unimpl(const char *text, uint32_t va){(void)text;(void)va;}
 static unsigned char g_guest_stack[64*1024];
 """
 
@@ -248,8 +256,12 @@ def main():
             lines, mnem = lift(code)
         except Exception as e:
             skipped.append((c["name"], f"lift: {type(e).__name__}: {e}")); continue
-        dropped = [l for l in lines if l.strip().startswith("/*")
-                   and l.strip() != "/* nop */"]
+        # An instruction the lifter cannot translate used to leave a bare
+        # comment; since G22b it leaves a RECOMP_UNIMPL(...) call beside the
+        # comment. Both are coverage loss, not a mismatch, so both skip.
+        dropped = [l for l in lines if (l.strip().startswith("/*")
+                                        and l.strip() != "/* nop */")
+                   or "RECOMP_UNIMPL(" in l]
         if dropped:
             skipped.append((c["name"], "unlifted: " + "; ".join(d.strip() for d in dropped[:2])))
             continue

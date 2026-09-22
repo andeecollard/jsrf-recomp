@@ -216,6 +216,41 @@ per-family mismatch table is in this file, and each surviving family is
 either fixed with a test under `tools/recomp/` or recorded with a count of
 sites in the JSRF gen that emit that form.
 
+### G30 outcome, 22 Sep 2026 (night)
+
+Environment: `~/jsrf-build/fuzz-venv` (unicorn 2.1.4, capstone 5.0.7). The
+fuzzer itself needed two repairs before it would run at all: since G22b the
+lifter emits `RECOMP_UNIMPL(...)` instead of a bare comment for an
+instruction it cannot translate, which the harness's stub runtime did not
+define (every batch failed to link) and which its "unlifted, skip" test did
+not recognise. Both fixed in `tools/conformance/fuzz_unicorn.py`.
+
+| run | cases ran | vectors | mismatches |
+|---|---:|---:|---:|
+| 17 Sep, seed 7, count 600 | 542 | 13,008 | **860 across 60 cases** (bit 34, shift 20, cmov 3, incdec 2, cmpset 1) |
+| 22 Sep, seed 7, count 600, HEAD lifter | 542 | 13,008 | **24 across 1 case** (incdec 1) |
+| 22 Sep, seed 7, generator fixed | 545 | 13,080 | **0** |
+| 22 Sep, seed 0x11, count 600 | 539 | 12,936 | **0** |
+
+The one surviving case was `not ax ; setnz dl`. NOT leaves EFLAGS alone
+(the lifter already lists it in `_EFLAGS_PRESERVE`), so the `setnz` read
+flags from before the case: undefined in both models, and the fuzzer's
+inc/dec family was emitting it as if it were a producer. Generator fixed;
+the lifter was right. The 18–19 Sep fixes (SF from a compare, bts/btr/btc,
+narrow rotates, flag settle at a loop head) account for the rest of the
+860, and this is the first time that has been shown rather than assumed.
+
+**The DirectSound fault is not the lifter's.** The player's 2040 s session
+log records it exactly: `sub_001A2E2E +0x6A4`, `EAX=FFFFFFB4`, read at
+`EAX+0xA`. The guest code is `mov eax, [esi+0x50]` (a voice's prev link),
+`cmp ecx, eax` against the list head, and on "not the head":
+`movzx edi, byte [eax+0x18]; add eax, -0x4c; movzx eax, word [eax+edi*2+0xa]`.
+The link was **0**: neither the head it is compared against nor a node, and
+the lifted C is exactly that x86. A NULL prev-link in the voice list is a
+guest-state defect (ours or the APU model's), and no fuzz can reach it.
+G30's claim on that symptom is withdrawn; the fault keeps its own line in
+ACCURACY_GAPS.
+
 ## G31 — the decompilation as a verifier for what we do not translate
 
 The gate's 123 `todo` sites are all `bound`, `arpl`, `hlt`, `sti`, `daa`…
@@ -229,6 +264,27 @@ confirms every `todo` site lies in a region the decompilation marks as data
 or padding, and one scripted run with `RECOMP_UNIMPL_TRAP=1` completes. Any
 site that fails either test is a real untranslated instruction and gets its
 own line here.
+
+### G31 outcome, 22 Sep 2026 (night)
+
+After G28 the gen carries **38** untranslated sites (from 123). The
+decompilation cannot judge any of them: its 405 data rows lie thousands of
+bytes from every site and it names no function containing one -- the
+checker (`~/jsrf-build/decomp-check/check_todo_sites.py`) reports 0 of 38
+inside a decomp data row. So the verdict comes from our own detector:
+
+| class | sites |
+|---|---:|
+| inside a function's extent but **unreachable from its entry** by any flow (dead bytes: a five-entry `enter` table at `0x2CC01`, a `daa` byte run at `0x1028F9`, …) | 29 |
+| at the head of a **fake function carved from data**: `sub_000465A0` (a 16-byte vtable-thunk seed over `3f 65 04 00 61`) and three `cc_boundary` starts inside XDK data (`0x1A7788`, `0x1BC778`, `0x1C3F18`) | 9 |
+| a real instruction the lifter cannot translate | **0** |
+
+Two 150 s tutorial runs, one with `RECOMP_UNIMPL_TRAP=1`, reached `live=61`
+with **0 `[UNIMPL]` hits and 0 faults**. The trap arms lazily on the first
+hit, so a clean run shows no banner; the instrument is the hit counter on
+the ICALL cadence, present at all 38 sites. G31 is done. The four fake
+functions are a detector item for later: a seed that decodes to `aas` and a
+cc-boundary start inside a data section should both be refused.
 
 ## The order
 
