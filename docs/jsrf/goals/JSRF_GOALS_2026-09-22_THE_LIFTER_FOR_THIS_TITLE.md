@@ -336,10 +336,20 @@ cc-boundary start inside a data section should both be refused.
 ## The order
 
 1. **G28** — the only item with a known-wrong branch in shipped code.
+   **DONE 22 Sep** (`09c038e`): unresolved dispatches 142 → 1.
 2. **G30** — an afternoon, local, and the one item with a player-visible
-   symptom to claim.
+   symptom to claim. **DONE 22 Sep** (`33efd68`): 0 mismatches on two
+   seeds; the symptom was not the lifter's.
 3. **G29** — largest, unmeasured value, needs a run to feed it.
+   **DONE 23 Sep** (`e6f6b3a`): 1,243 sites guarded, frame neutral on the
+   one clean pair; the A/B wants one repeat on an idle host.
 4. **G31** — cleanliness unless the trap run says otherwise.
+   **DONE 22 Sep** (`33efd68`): all 38 sites are data.
+
+What the list leaves open, in one place: the five coverage holes under G28;
+the four fake functions carved from data under G31; the NULL prev-link in
+the DirectSound voice list under G30, which is guest state and not a lifter
+item; and the A/B repeat under G29.
 
 Exit for the file as a whole: the regeneration that G28 needs carries every
 pending translator change (G28, any G30 fix), the gate is re-baselined once
