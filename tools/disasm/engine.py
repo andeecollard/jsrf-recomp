@@ -14,7 +14,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
 from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
 
 from . import config
-from .loader import BinaryImage, SectionInfo
+from .loader import BinaryImage, SectionInfo, DATA_SECTION_NAMES
 
 
 @dataclass
@@ -280,8 +280,25 @@ class DisasmEngine:
             home = self.image.get_section_at_va(tbl)
             if home is None:
                 continue
-            lo = home.virtual_addr
-            hi = lo + home.virtual_size
+            # A table parked in a data section is still a switch table when
+            # its dispatch is in code and its entries point back into that
+            # code section: JSRF's 0x00216148 in .rdata carries the arms of
+            # sub_000C3D90. Measure it against the DISPATCH's section rather
+            # than its own, and record it without resyncing -- the sweep
+            # never decoded .rdata, so there is nothing to delete and nothing
+            # to realign. Requiring every entry to stay inside one section is
+            # still what keeps an array of data pointers from passing.
+            data_home = home.name in DATA_SECTION_NAMES
+            code = home
+            if data_home:
+                sites = self._jt_sites.get(tbl)
+                if not sites:
+                    continue
+                code = self.image.get_section_at_va(min(sites))
+                if code is None or code.name in DATA_SECTION_NAMES:
+                    continue
+            lo = code.virtual_addr
+            hi = lo + code.virtual_size
             entries = 0
             while entries < max_entries:
                 target = self.image.read_u32_at_va(tbl + entries * 4)
@@ -308,13 +325,15 @@ class DisasmEngine:
                 continue
 
             end = tbl + entries * 4
+            self.jump_tables[tbl] = end
+            if data_home:
+                continue
             for insn in self.get_instructions_in_range(
                     tbl - 16, end):
                 if insn.end_address > tbl and insn.address < end:
                     del self.instructions[insn.address]
             self._sorted_addrs = None
 
-            self.jump_tables[tbl] = end
             self.decode_at(end)
             resynced += 1
 
@@ -457,38 +476,67 @@ class DisasmEngine:
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
             return False
-        data = self.image.read_bytes_at_va(addr, max_insns * 8)
-        if not data:
-            return False
-
-        limit = addr + len(data)
         count = 0
-        for decoded in self._cs.disasm(data, addr):
-            count += 1
-            mnemonic = decoded.mnemonic.lower()
-            if mnemonic in config.RET_MNEMONICS:
-                return True
-            if mnemonic in config.JMP_MNEMONICS:
-                # An unconditional jump forward, still inside the window being
-                # probed, is ordinary control flow -- MSVC emits it constantly
-                # to skip an else-branch. Only a jump that leaves the window,
-                # or goes backwards, is tail-call shaped and ends the probe.
-                #
-                # Rejecting every jmp cost Half-Life 2 its CreateInterface list
-                # walk (0x00427F80): a clean 90-byte function that happens to
-                # contain one `jmp` over four instructions.
-                try:
-                    ops = decoded.operands
-                except Exception:
-                    return False
-                if not ops or ops[0].type != CS_OP_IMM:
-                    return False
-                target = ops[0].imm & 0xFFFFFFFF
-                if not (decoded.address < target < limit):
-                    return False
-            if count >= max_insns:
+        resume = addr
+        # One pass per straight-line segment. A segment ends at a ret (yes),
+        # at anything tail-call shaped (no), or at a switch dispatch through
+        # a table this engine has already measured -- which is neither: the
+        # function continues in its arms, so the probe resumes at the first
+        # arm past the jump and keeps its instruction budget. JSRF's
+        # 0x000D1440 and 0x000D4470 are reached only as immediates, have no
+        # prologue, and open with exactly that dispatch; refusing them left
+        # the 21 switch tables they own translated nowhere.
+        while resume is not None and count < max_insns:
+            data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
+            if not data:
                 return False
+            limit = resume + len(data)
+            start = resume
+            resume = None
+            for decoded in self._cs.disasm(data, start):
+                count += 1
+                mnemonic = decoded.mnemonic.lower()
+                if mnemonic in config.RET_MNEMONICS:
+                    return True
+                if mnemonic in config.JMP_MNEMONICS:
+                    # An unconditional jump forward, still inside the window
+                    # being probed, is ordinary control flow -- MSVC emits it
+                    # constantly to skip an else-branch. Only a jump that
+                    # leaves the window, or goes backwards, is tail-call
+                    # shaped and ends the probe.
+                    #
+                    # Rejecting every jmp cost Half-Life 2 its
+                    # CreateInterface list walk (0x00427F80): a clean 90-byte
+                    # function that happens to contain one `jmp` over four
+                    # instructions.
+                    try:
+                        ops = decoded.operands
+                    except Exception:
+                        return False
+                    if not ops:
+                        return False
+                    if ops[0].type == CS_OP_MEM and ops[0].mem.index != 0:
+                        arm = self._first_arm_after(
+                            ops[0].mem.disp & 0xFFFFFFFF, decoded.address)
+                        if arm is None:
+                            return False
+                        resume = arm
+                        break
+                    if ops[0].type != CS_OP_IMM:
+                        return False
+                    target = ops[0].imm & 0xFFFFFFFF
+                    if not (decoded.address < target < limit):
+                        return False
+                if count >= max_insns:
+                    return False
         return False
+
+    def _first_arm_after(self, table: int, site: int) -> Optional[int]:
+        """The lowest entry of a measured jump table that lies past `site`,
+        or None when `table` is not one this engine has measured."""
+        entries = self.jump_table_entries(table)
+        later = [a for a in entries if a > site]
+        return min(later) if later else None
 
     def probes_as_vcall_thunk(self, addr: int) -> bool:
         """Is this MSVC's virtual-call thunk?

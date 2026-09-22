@@ -2925,9 +2925,21 @@ class Lifter:
         if not op.mem_disp or not (op.mem_index or op.mem_base):
             return []
         table_va = op.mem_disp
-        targets = self.jump_table_targets.get(table_va)
-        if targets is None:
-            targets = self._read_jump_table(table_va)
+        measured = self.jump_table_targets.get(table_va)
+        if measured is not None:
+            # The disassembler measured this table, so every entry is an
+            # arm and none is overrun. An arm inside the function is a goto;
+            # one that is another function's start is a tail call (MSVC
+            # emits `case N: return other(...)` that way, and JSRF's
+            # 0x001FA008 has 21 entries alternating between the two); an
+            # entry that is neither is left to the runtime fallback below.
+            # Two placeable arms is still the smallest thing worth calling
+            # a switch.
+            placeable = [t for t in measured
+                         if self.func_start <= t < self.func_end
+                         or t in self.func_db or t in self.manual_functions]
+            return placeable if len(placeable) >= 2 else []
+        targets = self._read_jump_table(table_va)
         if not targets:
             return []
         # Truncate at the first entry outside the function rather than
@@ -2956,6 +2968,14 @@ class Lifter:
         if len(inside) >= 2:
             return inside
         return []
+
+    def _tail_jump_stmt(self, target):
+        """The statement a `jmp <function>` lifts to, without trace tags."""
+        if target in self.manual_functions:
+            return (f"g_seh_ebp = ebp; RECOMP_ITAIL(0x{target:08X}u); return; "
+                    f"/* manual tail jmp 0x{target:08X} */")
+        name = self._call_target_name(target)
+        return f"g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{target:08X} */"
 
     def _lift_jmp(self, insn, ops):
         if insn.jump_target:
@@ -2995,7 +3015,13 @@ class Lifter:
                 unique_targets = sorted(set(switch_targets))
                 lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
                 for t in unique_targets:
-                    lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                    if self._is_external_target(t):
+                        # A measured arm that is another function: the
+                        # same tail jump a direct `jmp sub_X` becomes.
+                        lines.append(f"if (_jt == 0x{t:08X}u) {{ "
+                                     f"{self._tail_jump_stmt(t)} }}")
+                    else:
+                        lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
             # `jmp <reg>` where the register was loaded with an address

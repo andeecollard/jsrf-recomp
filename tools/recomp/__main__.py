@@ -47,12 +47,13 @@ def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=N
         "identified": os.path.join(func_id_dir, "identified_functions.json"),
         "abi": os.path.join(abi_dir, "abi_functions.json"),
         "summary": os.path.join(disasm_dir, "summary.json"),
+        "jump_tables": os.path.join(disasm_dir, "jump_tables.json"),
     }
     paths.update({k: v for k, v in (overrides or {}).items() if v})
 
     for key, path in paths.items():
         if not os.path.exists(path):
-            if key != "summary":
+            if key not in ("summary", "jump_tables"):
                 print(f"WARNING: {key} not found at {path}", file=sys.stderr)
             paths[key] = None
 
@@ -273,6 +274,7 @@ def main():
         trace_functions=_load_addrs(args.trace_functions),
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
+        jump_tables_json_path=data_files.get("jump_tables"),
     )
 
     t_load = time.time() - t0

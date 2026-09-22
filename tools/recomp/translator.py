@@ -419,9 +419,11 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None):
+                 trace_functions=None, jump_tables=None):
         """
         xbe_data: bytes - raw XBE file contents
+        jump_tables: dict - table VA -> [arm VAs], every switch table the
+                     disassembler measured (disasm/jump_tables.json)
         func_db: dict - addr → function info from functions.json
         label_db: dict - addr → name from labels.json
         classification_db: dict - addr → classification from identified_functions.json
@@ -430,6 +432,7 @@ class FunctionTranslator:
         """
         self.xbe_data = xbe_data
         self.func_db = func_db
+        self.jump_tables = dict(jump_tables or {})
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
@@ -942,8 +945,12 @@ class FunctionTranslator:
         # Set function bounds for the lifter
         self.lifter.func_start = start
         self.lifter.func_end = end
-        self.lifter.jump_table_targets = (
-            recovered["jump_tables"] if recovered else {})
+        # Measured tables first, then whatever CFG recovery read locally for
+        # this function; the two agree where they overlap, and the measured
+        # set is the one that knows a table's real length.
+        self.lifter.jump_table_targets = dict(self.jump_tables)
+        if recovered:
+            self.lifter.jump_table_targets.update(recovered["jump_tables"])
 
         # Disassemble
         instructions = (recovered["instructions"] if recovered else
@@ -1530,8 +1537,14 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None):
+                 trace_functions=None, jump_tables_json_path=None):
         self.xbe_path = xbe_path
+        self.jump_tables = {}
+        if jump_tables_json_path and os.path.exists(jump_tables_json_path):
+            with open(jump_tables_json_path, "r") as f:
+                for key, rec in json.load(f).items():
+                    self.jump_tables[int(key, 16)] = [
+                        int(e, 16) for e in rec.get("entries", [])]
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
 
@@ -1599,7 +1612,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=seh_prolog, seh_epilog=seh_epilog,
             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-            trace_functions=trace_functions)
+            trace_functions=trace_functions,
+            jump_tables=self.jump_tables)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 

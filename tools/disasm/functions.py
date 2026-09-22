@@ -205,6 +205,28 @@ class FunctionDetector:
 
         self._build_alias_entries()
 
+        # The gap-testing passes above were told an alias claims everything
+        # to the body end it was recorded with. Now that aliases end where
+        # their flow ends, bytes those passes rejected as covered may be open
+        # gap -- and on JSRF the dispatcher that owns 21 switch tables sat in
+        # exactly such a gap, its address taken as an immediate at 0x000D3A28
+        # and its body starting with `mov ecx, [slot]` rather than a prologue.
+        # Ask again with the real coverage. A start found here can expose
+        # another, so iterate to a fixpoint; the bound is a safety net, not a
+        # budget.
+        for _round in range(4):
+            before = len(self._candidates)
+            added = self._pass_imm_ref_targets(sections)
+            added = self._pass_gap_prologues(sections) or added
+            if not added:
+                break
+            print(f"  post-alias gap pass {_round}: "
+                  f"+{len(self._candidates) - before} standalone")
+            self.functions.clear()
+            self._build_functions(sections)
+            self._pass_seed_aliases()
+            self._build_alias_entries()
+
         # Populate call graph
         self._build_call_graph()
 
@@ -279,6 +301,16 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
+            # Not on a jump table either. MSVC parks a switch's table after
+            # the function's last ret, behind up to three bytes of hot-patch
+            # or alignment padding, and `mov edi, edi` probes as a prologue.
+            # JSRF's 0x000208E2 and 0x000D632A are both that: two bytes of
+            # padding, then the table, decoded onwards as a "function" whose
+            # calls went to garbage.
+            known = getattr(self.engine, "jump_tables", {})
+            short = getattr(self.engine, "short_jump_tables", {})
+            if any(t in known or t in short for t in range(nxt, nxt + 4)):
+                continue
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,
@@ -897,10 +929,23 @@ class FunctionDetector:
         """
         bounds = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bounds]
+        # Bodies overlap once aliases are materialised -- an alias runs from
+        # its entry to wherever its own flow ends, inside the function it
+        # shares -- so the range nearest below addr is not always the one
+        # that covers it. Carry the furthest end seen, as _pass_gap_prologues
+        # does. Asked with the nearest-range test after aliases existed, this
+        # pass carved five starts out of JSRF's sub_0003FEC0 (0x000401A8 and
+        # four more), and the function's own `je 0x40299` became a call to a
+        # stub.
+        furthest_end: List[int] = []
+        reach = 0
+        for _, end in bounds:
+            reach = max(reach, end)
+            furthest_end.append(reach)
 
         def inside_a_function(addr: int) -> bool:
             i = bisect.bisect_right(starts, addr) - 1
-            return i >= 0 and addr < bounds[i][1]
+            return i >= 0 and addr < furthest_end[i]
 
         # Collect distinct targets first. The instruction dict holds millions of
         # entries and the same address is taken over and over, so probing per
@@ -1146,10 +1191,23 @@ class FunctionDetector:
 
         bounds = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bounds]
+        # Bodies overlap once aliases are materialised -- an alias runs from
+        # its entry to wherever its own flow ends, inside the function it
+        # shares -- so the range nearest below addr is not always the one
+        # that covers it. Carry the furthest end seen, as _pass_gap_prologues
+        # does. Asked with the nearest-range test after aliases existed, this
+        # pass carved five starts out of JSRF's sub_0003FEC0 (0x000401A8 and
+        # four more), and the function's own `je 0x40299` became a call to a
+        # stub.
+        furthest_end: List[int] = []
+        reach = 0
+        for _, end in bounds:
+            reach = max(reach, end)
+            furthest_end.append(reach)
 
         def inside_a_function(addr: int) -> bool:
             i = bisect.bisect_right(starts, addr) - 1
-            return i >= 0 and addr < bounds[i][1]
+            return i >= 0 and addr < furthest_end[i]
 
         # Deliberately NOT filtering out targets inside a function. That guard
         # belongs to the immediate pass, which creates function *starts* and
@@ -1377,6 +1435,26 @@ class FunctionDetector:
         # zeroed esi -- measured as the registry root going 040D3A70 -> 0, the
         # scene reading back as pixel data, and the state machine resetting to
         # Init in the middle of the tutorial.
+        # The other way an alias's end goes wrong, and the one _alias_end
+        # did not repair until 22 Sep 2026: the boundary that GAVE it that end
+        # no longer exists. The tail-jump and seed passes record an alias as
+        # running to the end of the body it lands in, and that body was
+        # measured while a switch arm was still a seeded start -- so the body,
+        # and every alias inside it, ended at the arm. _pass_demote_interior_
+        # seeds then drops the arm, _build_functions re-measures the real
+        # bodies, and _alias_entries keeps the stale end. The alias's own
+        # flow ends at its ret long before that point, so its body is padded
+        # with bytes it can never reach: on JSRF gen 46bb115c, 139 of the
+        # gate's 142 unresolved switch dispatches were exactly this -- a
+        # `jmp [reg*4 + table]` translated as dead code inside an over-long
+        # alias, while the function that really owns it (0x000D1440, its
+        # address taken as an immediate, no prologue) was never found because
+        # the imm-ref pass tested coverage and the dead padding covered it.
+        #
+        # A boundary that still exists as a start is kept, since the alias
+        # really may share the body up to it. One that exists nowhere any
+        # more is not a boundary, and the alias ends where its flow ends.
+        stale = self._alias_boundary_gone(end)
         tables = []
         probe = addr
         while probe < end:
@@ -1386,10 +1464,9 @@ class FunctionDetector:
             if insn.jump_table is not None and insn.jump_table not in tables:
                 tables.append(insn.jump_table)
             probe = insn.end_address
-        if not tables:
-            return end
         arms = [a for tbl in tables for a in self.engine.jump_table_entries(tbl)]
-        if not arms or all(addr <= arm < end for arm in arms):
+        truncated = bool(arms) and not all(addr <= arm < end for arm in arms)
+        if not truncated and not stale:
             return end
 
         # Where the re-measure must stop: the next REAL function start.
@@ -1422,7 +1499,29 @@ class FunctionDetector:
         section = self.image.get_section_at_va(addr)
         sec_end = (section.virtual_addr + section.virtual_size
                    if section else None)
-        return max(end, self._find_function_end(addr, nxt, sec_end))
+        flow = self._find_function_end(addr, nxt, sec_end)
+        if stale:
+            # Whichever direction the flow says: shorter when the alias is
+            # padded, longer when the vanished boundary was cutting it.
+            return flow
+        return max(end, flow)
+
+    def _alias_boundary_gone(self, end: int) -> bool:
+        """True when nothing any longer starts, or is declared to end, at
+        `end` -- so an alias recorded as running to it was measured against
+        a boundary that a later pass removed."""
+        if end in self.functions or end in getattr(self, "_candidates", {}):
+            return False
+        if end in self._alias_entries:
+            return False
+        for _lo, hi in self._forced_bounds:
+            if hi == end:
+                return False
+        section = self.image.get_section_at_va(end - 1)
+        if section is not None and end == (section.virtual_addr
+                                           + section.virtual_size):
+            return False
+        return True
 
     def _build_alias_entries(self) -> None:
         """
@@ -1440,6 +1539,10 @@ class FunctionDetector:
             if addr in self.functions:
                 continue
             end = self._alias_end(addr, end)
+            # Keep the record current: _pass_gap_prologues reads
+            # _alias_entries as claimed territory, and a stale end there
+            # would hide from it the very bytes the re-measure just released.
+            self._alias_entries[addr] = end
             insns = self.engine.get_instructions_in_range(addr, end)
             if not insns:
                 continue

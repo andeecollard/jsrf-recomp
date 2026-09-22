@@ -1,41 +1,41 @@
 {
  "gen": {
-  "generated_utc": "2026-09-21T13:08:31Z",
-  "git_head": "4a27e15",
+  "generated_utc": "2026-09-22T21:58:40Z",
+  "git_head": "16062f9",
   "runtime_types_sha": "b96a2e9a7953bb50",
-  "translator_sha": "46bb115cdb053f4e",
+  "translator_sha": "52b6b3f88651d5cf",
   "xbe_sha": "bb2410618c35ccab"
  },
  "measures": {
   "cond_indirect": 0,
-  "coverage_bytes": 1615561,
-  "direct_call": 46504,
-  "direct_tail": 4814,
-  "functions": 8839,
-  "goto": 70238,
-  "icall": 7395,
+  "coverage_bytes": 1613800,
+  "direct_call": 39513,
+  "direct_tail": 2937,
+  "functions": 8744,
+  "goto": 61576,
+  "icall": 6942,
   "icall_static": 5,
-  "icall_total": 7400,
-  "ignored_priv": 42,
+  "icall_total": 6947,
+  "ignored_priv": 18,
   "itail_abs": 13,
   "itail_manual": 0,
   "itail_reg": 10,
-  "itail_total": 988,
-  "itail_vtable": 290,
+  "itail_total": 786,
+  "itail_vtable": 258,
   "jmp_no_target": 0,
-  "switch_arms_goto": 4310,
-  "switch_arms_no_body": 6,
-  "switch_arms_tight": 522,
-  "switch_default": 533,
-  "switch_resolved": 533,
-  "switch_tables_with_missing_arm": 1,
-  "switch_unresolved": 142,
-  "switch_unresolved_tables": 53,
-  "todo": 123,
+  "switch_arms_goto": 3930,
+  "switch_arms_no_body": 0,
+  "switch_arms_tight": 19,
+  "switch_default": 504,
+  "switch_resolved": 504,
+  "switch_tables_with_missing_arm": 0,
+  "switch_unresolved": 1,
+  "switch_unresolved_tables": 1,
+  "todo": 39,
   "todo_silent": 0,
   "unclassified_icall": 0,
   "unclassified_itail": 0,
-  "unresolved_stubs": 596
+  "unresolved_stubs": 110
  },
  "method": {
   "coverage_bytes": "union of [start,end) over functions.json",
@@ -49,49 +49,12 @@
    "sub_000156B0",
    "sub_0001BF40",
    "sub_0001DF48",
-   "sub_0002011B",
-   "sub_000207C2",
-   "sub_00020814",
-   "sub_000208BA",
-   "sub_00020DC2",
-   "sub_00020DF4",
-   "sub_00020E95",
-   "sub_00020EE7",
    "sub_00022043",
    "sub_00022F30",
-   "sub_000267BC",
    "sub_000273C1",
    "sub_000273C5",
    "sub_000273C9",
-   "sub_000287C4",
    "sub_00029FE0",
-   "sub_0002C176",
-   "sub_0002C404",
-   "sub_0002C44D",
-   "sub_0002C485",
-   "sub_0002C48F",
-   "sub_0002C4DB",
-   "sub_0002C53A",
-   "sub_0002C544",
-   "sub_0002C590",
-   "sub_0002C5F4",
-   "sub_0002C5FE",
-   "sub_0002C64A",
-   "sub_0002C6AA",
-   "sub_0002C6D2",
-   "sub_0002C728",
-   "sub_0002C764",
-   "sub_0002C76E",
-   "sub_0002C7BA",
-   "sub_0002C80C",
-   "sub_0002C816",
-   "sub_0002C862",
-   "sub_0002C8C8",
-   "sub_0002C8D2",
-   "sub_0002C922",
-   "sub_0002C940",
-   "sub_0002C9BD",
-   "sub_0002CA05",
    "sub_0002F830",
    "sub_0002FF70",
    "sub_000331CE",
@@ -99,38 +62,17 @@
    "sub_00034087",
    "sub_000340A1",
    "sub_00034688",
-   "sub_0003C9C3",
    "sub_0003D8E2",
    "sub_00040921",
    "sub_00041D10",
    "sub_00042890",
    "sub_00043FE0",
-   "sub_000540CD",
-   "sub_000580F2",
-   "sub_00067EAA",
-   "sub_00067EB7",
-   "sub_00067EE0",
-   "sub_00067EF7",
-   "sub_00067F98",
-   "sub_0006802F",
-   "sub_00068049",
-   "sub_000680F7",
-   "sub_00068123",
    "sub_0006FE40",
    "sub_0006FFA0",
    "sub_00070038",
    "sub_0007003B",
    "sub_0007004E",
    "sub_00070060",
-   "sub_00070CB1",
-   "sub_00070E01",
-   "sub_00070E08",
-   "sub_00074712",
-   "sub_0007493F",
-   "sub_000749F6",
-   "sub_00074AB4",
-   "sub_00074B66",
-   "sub_00074B90",
    "sub_00075E90",
    "sub_00075EB3",
    "sub_00075ECD",
@@ -154,475 +96,49 @@
    "sub_00076805",
    "sub_00077000",
    "sub_00078887",
-   "sub_0007AB5B",
-   "sub_0007AB65",
-   "sub_0007ABAA",
-   "sub_0007ABF8",
-   "sub_0007ACA3",
-   "sub_0007AD38",
-   "sub_0007AD80",
-   "sub_0007ADB7",
-   "sub_0007ADCE",
-   "sub_0007C8C1",
-   "sub_0007C8F1",
-   "sub_0007C96A",
-   "sub_0007C982",
-   "sub_0007C99A",
    "sub_0007E4A5",
-   "sub_0007E673",
-   "sub_00085519",
-   "sub_00085532",
-   "sub_00085571",
    "sub_000861A0",
-   "sub_0008661A",
-   "sub_00086634",
-   "sub_0008667E",
-   "sub_0008AB64",
    "sub_0008FF70",
    "sub_00091FC0",
    "sub_00092060",
-   "sub_000963E3",
-   "sub_0009A970",
-   "sub_000A59E3",
    "sub_000AFFF4",
    "sub_000B0060",
    "sub_000B07A3",
    "sub_000B07D2",
-   "sub_000B29A4",
    "sub_000B5ECE",
-   "sub_000B67A3",
-   "sub_000B67B7",
-   "sub_000B7FE2",
    "sub_000BFFE0",
-   "sub_000C67A0",
-   "sub_000C6820",
-   "sub_000CD8DE",
-   "sub_000CD910",
-   "sub_000CD929",
-   "sub_000CD942",
-   "sub_000CD95B",
-   "sub_000CD974",
-   "sub_000CD98D",
-   "sub_000CD9A6",
-   "sub_000CD9BF",
-   "sub_000CD9D8",
-   "sub_000CD9F1",
-   "sub_000CDA0A",
-   "sub_000CDA23",
-   "sub_000CDA3C",
-   "sub_000D146E",
-   "sub_000D1487",
-   "sub_000D14C4",
-   "sub_000D14DD",
-   "sub_000D14F6",
-   "sub_000D150F",
-   "sub_000D1531",
-   "sub_000D154A",
-   "sub_000D1563",
-   "sub_000D157C",
-   "sub_000D3C84",
-   "sub_000D3C99",
-   "sub_000D3CAE",
-   "sub_000D3CC2",
-   "sub_000D3CCA",
-   "sub_000D404D",
-   "sub_000D4066",
-   "sub_000D407F",
-   "sub_000D40BF",
-   "sub_000D40E4",
-   "sub_000D40F0",
-   "sub_000D449B",
-   "sub_000D44A4",
-   "sub_000D44B0",
-   "sub_000D44BC",
-   "sub_000D44D9",
-   "sub_000D44E0",
-   "sub_000D4519",
-   "sub_000D4538",
-   "sub_000D4551",
    "sub_000D52A0",
-   "sub_000D5D72",
-   "sub_000D5D7C",
-   "sub_000D5D87",
-   "sub_000D7E62",
    "sub_000D9920",
    "sub_000D9A10",
    "sub_000DA3E0",
    "sub_000DA710",
    "sub_000DB0F0",
-   "sub_000DB342",
-   "sub_000DB36D",
-   "sub_000DB388",
-   "sub_000DB3B0",
-   "sub_000DB5DC",
-   "sub_000DB602",
-   "sub_000DB61B",
-   "sub_000DB63C",
-   "sub_000DB867",
-   "sub_000DB86B",
-   "sub_000DB872",
-   "sub_000DB879",
-   "sub_000DB880",
-   "sub_000DB885",
-   "sub_000DB89D",
-   "sub_000DCA1B",
-   "sub_000DCA1F",
-   "sub_000DCA5C",
-   "sub_000DCA75",
-   "sub_000DCA8E",
-   "sub_000DCAAE",
-   "sub_000DCAD0",
-   "sub_000DCAE9",
-   "sub_000DCB02",
-   "sub_000DCB1B",
-   "sub_000DCB34",
-   "sub_000DCB4D",
-   "sub_000DCB66",
-   "sub_000E03C7",
-   "sub_000E03CB",
-   "sub_000E03D2",
-   "sub_000E03D9",
-   "sub_000E03DE",
-   "sub_000E03F6",
-   "sub_000E1BCB",
-   "sub_000E209B",
-   "sub_000E209F",
-   "sub_000E20A6",
-   "sub_000E20E3",
-   "sub_000E20FC",
-   "sub_000E2115",
-   "sub_000E212E",
-   "sub_000E2151",
-   "sub_000E216A",
-   "sub_000E2183",
-   "sub_000E219C",
-   "sub_000E21B5",
-   "sub_000E21CE",
-   "sub_000E21E7",
-   "sub_000E2A4E",
-   "sub_000E2A52",
-   "sub_000E2A8F",
-   "sub_000E2AA8",
-   "sub_000E2AC1",
-   "sub_000E2ADA",
-   "sub_000E2AFD",
-   "sub_000E2B16",
-   "sub_000E2B2F",
-   "sub_000E2B48",
-   "sub_000E2B66",
-   "sub_000E2B6B",
-   "sub_000E2B84",
-   "sub_000E374E",
-   "sub_000E3784",
-   "sub_000E379D",
-   "sub_000E37B6",
-   "sub_000E37D4",
-   "sub_000E37F2",
    "sub_000E6590",
    "sub_000E7260",
-   "sub_000E7F51",
-   "sub_000E7F55",
-   "sub_000E7F59",
-   "sub_000E7FAC",
    "sub_000EAFC0",
    "sub_000EB440",
-   "sub_000EB777",
-   "sub_000EB77B",
-   "sub_000EB782",
-   "sub_000EB789",
-   "sub_000EB790",
-   "sub_000EB797",
-   "sub_000EB79E",
-   "sub_000EB7A5",
-   "sub_000EB7AC",
-   "sub_000EB7B1",
-   "sub_000EB7C9",
-   "sub_000F0B2C",
-   "sub_000F0BD9",
-   "sub_000F0BF2",
-   "sub_000F0D17",
-   "sub_000F0D1B",
-   "sub_000F0D22",
-   "sub_000F0D29",
-   "sub_000F0D30",
-   "sub_000F0D37",
-   "sub_000F0D3E",
-   "sub_000F0D45",
-   "sub_000F0D4C",
-   "sub_000F0D51",
-   "sub_000F0D69",
-   "sub_000F2FE4",
-   "sub_000F2FF3",
-   "sub_000F302C",
-   "sub_000F303B",
-   "sub_000F3074",
-   "sub_000F3083",
-   "sub_000F30BC",
-   "sub_000F30CB",
-   "sub_000F30EE",
-   "sub_000F30FD",
-   "sub_000F3120",
-   "sub_000F46DB",
-   "sub_000F4718",
-   "sub_000F4731",
-   "sub_000F4751",
-   "sub_000F476A",
-   "sub_000F4783",
-   "sub_000F4788",
-   "sub_000F479E",
-   "sub_000F47BC",
-   "sub_000F47DA",
-   "sub_000F4CAE",
-   "sub_000F4CB2",
-   "sub_000F4CEF",
-   "sub_000F4D08",
-   "sub_000F4D28",
-   "sub_000F4D41",
-   "sub_000F4D5A",
-   "sub_000F4D78",
-   "sub_000F4D96",
-   "sub_000FADBB",
-   "sub_000FAE04",
-   "sub_000FAE20",
-   "sub_000FAE4A",
-   "sub_000FAE58",
-   "sub_000FAE6E",
-   "sub_000FAEBE",
-   "sub_000FAED9",
-   "sub_000FAEFC",
-   "sub_000FAF03",
-   "sub_000FAF2A",
-   "sub_000FAF87",
-   "sub_000FAFF1",
-   "sub_000FB01E",
-   "sub_000FB0A8",
-   "sub_000FB0DA",
-   "sub_000FB101",
-   "sub_000FB151",
-   "sub_000FBA20",
-   "sub_000FBA6C",
-   "sub_000FBA95",
-   "sub_000FBAC3",
-   "sub_000FBACE",
-   "sub_000FBAF8",
-   "sub_000FBB03",
-   "sub_000FBC00",
-   "sub_000FBC2C",
-   "sub_000FBC33",
-   "sub_000FBC52",
-   "sub_000FBC9C",
-   "sub_000FBCEF",
-   "sub_000FBD9F",
-   "sub_000FBE75",
-   "sub_000FBEA8",
-   "sub_000FBF4F",
    "sub_00102050",
-   "sub_001022AC",
-   "sub_001022B0",
    "sub_00102936",
-   "sub_00102DFE",
-   "sub_00102FEF",
-   "sub_00103B2E",
-   "sub_00103D10",
-   "sub_0010460B",
-   "sub_001063B2",
-   "sub_00107106",
-   "sub_0010710A",
    "sub_00109FA0",
-   "sub_0010A788",
-   "sub_0010AB86",
    "sub_0010B078",
-   "sub_0010BB53",
-   "sub_001101FE",
-   "sub_0011021A",
-   "sub_001102C3",
-   "sub_00110301",
-   "sub_00110314",
-   "sub_001117C7",
-   "sub_001117CE",
-   "sub_001117E9",
-   "sub_00111808",
-   "sub_0011181C",
    "sub_00111C10",
-   "sub_001161B6",
-   "sub_001161BA",
    "sub_00119C20",
    "sub_00119CE0",
    "sub_00119DA0",
    "sub_00119DE0",
    "sub_00119E20",
    "sub_00119E60",
-   "sub_0011A0AB",
-   "sub_0011A1BF",
-   "sub_00121A42",
-   "sub_00121AA8",
-   "sub_00121AFA",
-   "sub_00121B99",
-   "sub_00121BE4",
-   "sub_00121C0C",
-   "sub_00121C41",
-   "sub_00121C64",
-   "sub_00121D70",
-   "sub_00121DE3",
-   "sub_00121E1D",
-   "sub_00121E57",
-   "sub_00121EB7",
    "sub_00123B6A",
    "sub_00123B6E",
-   "sub_00125190",
-   "sub_001251C7",
-   "sub_001251F3",
-   "sub_00125208",
-   "sub_00125269",
-   "sub_001252EF",
-   "sub_0012537B",
-   "sub_00125407",
-   "sub_00125493",
-   "sub_001254CE",
-   "sub_00125504",
-   "sub_001255A2",
-   "sub_001255F4",
-   "sub_0012565B",
-   "sub_00125683",
-   "sub_001256B3",
-   "sub_001256DC",
-   "sub_001256F1",
-   "sub_0012594F",
-   "sub_0012596A",
-   "sub_001259DE",
-   "sub_00125A20",
-   "sub_00125AB0",
-   "sub_00125AE3",
-   "sub_00125B1D",
-   "sub_00125B51",
-   "sub_00125B5F",
-   "sub_00125B6C",
-   "sub_00125C51",
-   "sub_00125C74",
-   "sub_00125C96",
-   "sub_00125CB7",
-   "sub_00125CE7",
-   "sub_00125D17",
-   "sub_00125D5D",
-   "sub_00127917",
-   "sub_00127921",
-   "sub_00127944",
-   "sub_00127983",
-   "sub_001279BC",
-   "sub_00127BDC",
-   "sub_00127D4B",
-   "sub_00127D98",
-   "sub_00127DEB",
-   "sub_00129348",
-   "sub_00129367",
-   "sub_00129392",
-   "sub_001293A8",
-   "sub_001293E4",
-   "sub_00129485",
-   "sub_001294D8",
-   "sub_001295DC",
-   "sub_001296BA",
-   "sub_001296E5",
-   "sub_00129712",
-   "sub_001297EC",
-   "sub_00129849",
-   "sub_0012986E",
-   "sub_001298CA",
-   "sub_0012994A",
-   "sub_0012997E",
-   "sub_00129ACF",
-   "sub_00129AF3",
-   "sub_00129B7F",
-   "sub_00129BBB",
-   "sub_00129BEF",
-   "sub_00129D2A",
-   "sub_00129DDE",
-   "sub_00129E51",
-   "sub_00129E6E",
-   "sub_00129E8A",
-   "sub_00129F54",
-   "sub_00129FE7",
-   "sub_0012A00F",
-   "sub_0012A0D2",
-   "sub_0012A0F7",
-   "sub_0012A11C",
-   "sub_0012A141",
-   "sub_0012A166",
-   "sub_0012A18B",
-   "sub_0012A1BC",
-   "sub_0012A1DA",
-   "sub_0012A20C",
-   "sub_0012A234",
-   "sub_0012A55B",
-   "sub_00134D19",
    "sub_00134D86",
    "sub_00134D92",
    "sub_0014005D",
    "sub_0014006A",
    "sub_00152DE0",
-   "sub_0015538F",
-   "sub_0015557E",
-   "sub_001555AA",
-   "sub_001555B7",
-   "sub_001555C3",
-   "sub_001555CF",
-   "sub_001555FE",
-   "sub_0015560A",
-   "sub_00155614",
-   "sub_00155621",
-   "sub_0015562E",
-   "sub_0015565D",
-   "sub_00155698",
-   "sub_001556A5",
-   "sub_001556B2",
-   "sub_001556BF",
-   "sub_001556CC",
-   "sub_001556D9",
-   "sub_001556E6",
-   "sub_001556F2",
-   "sub_00155729",
-   "sub_00155736",
-   "sub_00155743",
-   "sub_0015574F",
-   "sub_0015575C",
-   "sub_001557BB",
-   "sub_001557C2",
-   "sub_001557C9",
-   "sub_001557D0",
-   "sub_00155802",
-   "sub_0015583C",
-   "sub_00155846",
-   "sub_00155850",
-   "sub_0015585A",
-   "sub_00155864",
-   "sub_0015586E",
-   "sub_00155878",
-   "sub_00155888",
-   "sub_001558A8",
-   "sub_001558B2",
-   "sub_001558BC",
-   "sub_001558CB",
-   "sub_001558DA",
-   "sub_001558E7",
-   "sub_001558F4",
-   "sub_00155901",
    "sub_001625A0",
    "sub_001625F0",
    "sub_001626C0",
-   "sub_00162AEE",
-   "sub_00162B15",
-   "sub_00162B2A",
-   "sub_00162B43",
-   "sub_00162B64",
-   "sub_00162DAE",
-   "sub_00162DE6",
-   "sub_00162E2E",
-   "sub_00162E4A",
-   "sub_00162E5F",
-   "sub_001670B3",
    "sub_0016B090",
-   "sub_00178882",
-   "sub_0017888A",
    "sub_0017DBE3",
    "sub_0017FD31",
    "sub_0017FF7F",
@@ -637,9 +153,7 @@
    "sub_001C37AF",
    "sub_001C3F86",
    "sub_001C3F96",
-   "sub_220FC7E7",
-   "sub_3F0383B6",
-   "sub_EAF9ECB8"
+   "sub_3F0383B6"
   ],
   "switch": {
    "0x000153EC": {
@@ -652,11 +166,11 @@
    },
    "0x000208E4": {
     "r": 1,
-    "u": 5
+    "u": 0
    },
    "0x00020EF4": {
     "r": 1,
-    "u": 5
+    "u": 0
    },
    "0x000224F0": {
     "r": 1,
@@ -703,19 +217,19 @@
     "u": 0
    },
    "0x0002C340": {
-    "r": 4,
+    "r": 1,
     "u": 0
    },
    "0x0002CBB4": {
     "r": 1,
-    "u": 4
+    "u": 0
    },
    "0x0002CC34": {
-    "r": 3,
+    "r": 2,
     "u": 0
    },
    "0x0002CC44": {
-    "r": 4,
+    "r": 2,
     "u": 0
    },
    "0x0002D224": {
@@ -743,11 +257,11 @@
     "u": 0
    },
    "0x0002F3F4": {
-    "r": 1,
+    "r": 3,
     "u": 0
    },
    "0x0002F408": {
-    "r": 1,
+    "r": 5,
     "u": 0
    },
    "0x0002F690": {
@@ -1063,7 +577,7 @@
     "u": 0
    },
    "0x0005D390": {
-    "r": 2,
+    "r": 1,
     "u": 0
    },
    "0x000651D0": {
@@ -1072,7 +586,7 @@
    },
    "0x00068198": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x0006D958": {
     "r": 1,
@@ -1088,7 +602,7 @@
    },
    "0x00070E10": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x0007131C": {
     "r": 1,
@@ -1128,7 +642,7 @@
    },
    "0x00074BB4": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00074D14": {
     "r": 1,
@@ -1147,7 +661,7 @@
     "u": 0
    },
    "0x00076818": {
-    "r": 3,
+    "r": 1,
     "u": 0
    },
    "0x000769C8": {
@@ -1180,7 +694,7 @@
    },
    "0x0007ADE8": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x0007BE08": {
     "r": 1,
@@ -1188,7 +702,7 @@
    },
    "0x0007C9C0": {
     "r": 1,
-    "u": 3
+    "u": 0
    },
    "0x0007E524": {
     "r": 1,
@@ -1204,7 +718,7 @@
    },
    "0x000855AC": {
     "r": 1,
-    "u": 2
+    "u": 0
    },
    "0x000865B4": {
     "r": 1,
@@ -1212,7 +726,7 @@
    },
    "0x000866C8": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00089A44": {
     "r": 1,
@@ -1503,31 +1017,31 @@
     "u": 0
    },
    "0x000CDA44": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x000D1584": {
-    "r": 0,
-    "u": 21
+    "r": 1,
+    "u": 0
    },
    "0x000D3D6C": {
     "r": 1,
-    "u": 5
+    "u": 0
    },
    "0x000D413C": {
     "r": 1,
-    "u": 5
+    "u": 0
    },
    "0x000D4558": {
-    "r": 0,
-    "u": 11
+    "r": 1,
+    "u": 0
    },
    "0x000D5DD8": {
     "r": 1,
-    "u": 19
+    "u": 0
    },
    "0x000D632C": {
-    "r": 6,
+    "r": 1,
     "u": 0
    },
    "0x000D6804": {
@@ -1538,21 +1052,25 @@
     "r": 1,
     "u": 0
    },
+   "0x000D7E68": {
+    "r": 1,
+    "u": 0
+   },
    "0x000DB3B4": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x000DB65C": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x000DB754": {
     "r": 1,
     "u": 0
    },
    "0x000DB8A4": {
-    "r": 0,
-    "u": 2
+    "r": 1,
+    "u": 0
    },
    "0x000DBD5C": {
     "r": 1,
@@ -1563,12 +1081,12 @@
     "u": 0
    },
    "0x000DCB6C": {
-    "r": 0,
-    "u": 6
+    "r": 1,
+    "u": 0
    },
    "0x000E03FC": {
-    "r": 0,
-    "u": 3
+    "r": 1,
+    "u": 0
    },
    "0x000E0870": {
     "r": 1,
@@ -1578,17 +1096,25 @@
     "r": 2,
     "u": 0
    },
+   "0x000E1BD0": {
+    "r": 1,
+    "u": 0
+   },
    "0x000E21EC": {
-    "r": 0,
-    "u": 2
+    "r": 1,
+    "u": 0
    },
    "0x000E2B8C": {
-    "r": 0,
-    "u": 4
+    "r": 1,
+    "u": 0
    },
    "0x000E37F8": {
-    "r": 0,
-    "u": 4
+    "r": 1,
+    "u": 0
+   },
+   "0x000E7F2C": {
+    "r": 1,
+    "u": 0
    },
    "0x000E84DC": {
     "r": 1,
@@ -1607,8 +1133,8 @@
     "u": 0
    },
    "0x000EB7D0": {
-    "r": 0,
-    "u": 2
+    "r": 1,
+    "u": 0
    },
    "0x000EC07C": {
     "r": 1,
@@ -1622,6 +1148,10 @@
     "r": 1,
     "u": 0
    },
+   "0x000EDBD8": {
+    "r": 1,
+    "u": 0
+   },
    "0x000EE1FC": {
     "r": 1,
     "u": 0
@@ -1632,23 +1162,23 @@
    },
    "0x000F0C08": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x000F0D70": {
-    "r": 0,
-    "u": 2
+    "r": 1,
+    "u": 0
    },
    "0x000F3130": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x000F47E0": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x000F4D9C": {
-    "r": 0,
-    "u": 2
+    "r": 1,
+    "u": 0
    },
    "0x000F7708": {
     "r": 1,
@@ -1700,14 +1230,14 @@
    },
    "0x000FB238": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x000FB25C": {
-    "r": 4,
+    "r": 1,
     "u": 0
    },
    "0x000FB26C": {
-    "r": 9,
+    "r": 1,
     "u": 0
    },
    "0x000FB50C": {
@@ -1720,14 +1250,14 @@
    },
    "0x000FBF84": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x000FBFA8": {
-    "r": 4,
+    "r": 1,
     "u": 0
    },
    "0x000FBFB8": {
-    "r": 9,
+    "r": 1,
     "u": 0
    },
    "0x000FC158": {
@@ -1840,11 +1370,11 @@
    },
    "0x00102FFC": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00103D20": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00104094": {
     "r": 1,
@@ -1879,7 +1409,7 @@
     "u": 0
    },
    "0x00106564": {
-    "r": 2,
+    "r": 1,
     "u": 0
    },
    "0x0010678C": {
@@ -1936,7 +1466,7 @@
    },
    "0x0010AB94": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x0010AED8": {
     "r": 1,
@@ -1967,7 +1497,7 @@
     "u": 0
    },
    "0x0010CA40": {
-    "r": 1,
+    "r": 2,
     "u": 0
    },
    "0x0010CF38": {
@@ -2000,7 +1530,7 @@
    },
    "0x0011031C": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00110B04": {
     "r": 1,
@@ -2008,7 +1538,7 @@
    },
    "0x001118DC": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00112430": {
     "r": 1,
@@ -2056,7 +1586,7 @@
    },
    "0x0011A1D0": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x0011A88C": {
     "r": 1,
@@ -2080,7 +1610,7 @@
    },
    "0x00121EDC": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00123B24": {
     "r": 1,
@@ -2100,10 +1630,10 @@
    },
    "0x00125D64": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00125DD0": {
-    "r": 4,
+    "r": 1,
     "u": 0
    },
    "0x00126844": {
@@ -2120,7 +1650,7 @@
    },
    "0x00127E3C": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00128294": {
     "r": 1,
@@ -2136,18 +1666,18 @@
    },
    "0x0012A588": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x0012A5A0": {
-    "r": 4,
+    "r": 1,
     "u": 0
    },
    "0x0012A5BC": {
-    "r": 13,
+    "r": 1,
     "u": 0
    },
    "0x0012A5F8": {
-    "r": 10,
+    "r": 3,
     "u": 0
    },
    "0x0012B014": {
@@ -2215,7 +1745,7 @@
     "u": 0
    },
    "0x00134D40": {
-    "r": 1,
+    "r": 2,
     "u": 0
    },
    "0x001350F4": {
@@ -2280,7 +1810,7 @@
    },
    "0x00155910": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00155ED4": {
     "r": 1,
@@ -2304,11 +1834,11 @@
    },
    "0x00162BA8": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x001630AC": {
     "r": 1,
-    "u": 1
+    "u": 0
    },
    "0x00167044": {
     "r": 1,
@@ -2407,63 +1937,39 @@
     "u": 0
    },
    "0x001FA008": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x0020D9DC": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x00216148": {
     "r": 1,
     "u": 0
    },
    "0x002174BC": {
-    "r": 0,
-    "u": 2
+    "r": 2,
+    "u": 0
    },
    "0x0021FF88": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x0021FFA0": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x0021FFA8": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    },
    "0x0021FFB0": {
-    "r": 0,
-    "u": 1
+    "r": 1,
+    "u": 0
    }
   },
   "todo": {
-   "0x0001FCD8": {
-    "n": 1,
-    "text": "cli"
-   },
-   "0x0001FCE9": {
-    "n": 1,
-    "text": "sti"
-   },
-   "0x0001FCED": {
-    "n": 1,
-    "text": "sti"
-   },
-   "0x000261F1": {
-    "n": 1,
-    "text": "popal"
-   },
-   "0x00026750": {
-    "n": 1,
-    "text": "pushal"
-   },
-   "0x0002675C": {
-    "n": 1,
-    "text": "les esp, ptr [esi + 2]"
-   },
    "0x00027314": {
     "n": 1,
     "text": "pushal"
@@ -2471,22 +1977,6 @@
    "0x00027C54": {
     "n": 1,
     "text": "int1"
-   },
-   "0x0002B32D": {
-    "n": 1,
-    "text": "scasb al, byte ptr es:[edi]"
-   },
-   "0x0002B330": {
-    "n": 1,
-    "text": "cmpsd dword ptr [esi], dword ptr es:[edi]"
-   },
-   "0x0002B331": {
-    "n": 1,
-    "text": "scasd eax, dword ptr es:[edi]"
-   },
-   "0x0002B334": {
-    "n": 1,
-    "text": "hlt"
    },
    "0x0002CC01": {
     "n": 1,
@@ -2508,22 +1998,6 @@
     "n": 1,
     "text": "enter 2, 0x22"
    },
-   "0x0002EBA8": {
-    "n": 1,
-    "text": "salc"
-   },
-   "0x0002EBA9": {
-    "n": 1,
-    "text": "ljmp 2:0xeab10002"
-   },
-   "0x0002EBB0": {
-    "n": 1,
-    "text": "sti"
-   },
-   "0x0002EBB1": {
-    "n": 1,
-    "text": "ljmp 2:0xeb1d0002"
-   },
    "0x00034054": {
     "n": 1,
     "text": "das"
@@ -2544,10 +2018,6 @@
     "n": 1,
     "text": "bound ecx, qword ptr [edx + 3]"
    },
-   "0x00035628": {
-    "n": 1,
-    "text": "sti"
-   },
    "0x00035D48": {
     "n": 1,
     "text": "outsb dx, byte ptr [esi]"
@@ -2555,10 +2025,6 @@
    "0x00035D64": {
     "n": 1,
     "text": "aas"
-   },
-   "0x00037348": {
-    "n": 1,
-    "text": "insb byte ptr es:[edi], dx"
    },
    "0x00037FF0": {
     "n": 1,
@@ -2576,10 +2042,6 @@
     "n": 1,
     "text": "aad 0x7d"
    },
-   "0x0003C9E9": {
-    "n": 1,
-    "text": "enter 3, 0x1e"
-   },
    "0x000465A0": {
     "n": 1,
     "text": "aas"
@@ -2588,110 +2050,6 @@
     "n": 1,
     "text": "popal"
    },
-   "0x00057CDC": {
-    "n": 1,
-    "text": "lcall 0x56b, 0xaa00056b"
-   },
-   "0x00057CF9": {
-    "n": 1,
-    "text": "insd dword ptr es:[edi], dx"
-   },
-   "0x00057D01": {
-    "n": 1,
-    "text": "insd dword ptr es:[edi], dx"
-   },
-   "0x00057D09": {
-    "n": 1,
-    "text": "outsd dx, dword ptr [esi]"
-   },
-   "0x00089A48": {
-    "n": 1,
-    "text": "arpl word ptr [ecx - 0x668bfff8], bx"
-   },
-   "0x0008AB84": {
-    "n": 1,
-    "text": "cmpsb byte ptr [esi], byte ptr es:[edi]"
-   },
-   "0x0008AB85": {
-    "n": 1,
-    "text": "cmpsd dword ptr [esi], dword ptr es:[edi]"
-   },
-   "0x0008AB99": {
-    "n": 1,
-    "text": "cmpsd dword ptr [esi], dword ptr es:[edi]"
-   },
-   "0x0008ABB0": {
-    "n": 1,
-    "text": "scasd eax, dword ptr es:[edi]"
-   },
-   "0x0009155C": {
-    "n": 1,
-    "text": "int 0x14"
-   },
-   "0x00091560": {
-    "n": 1,
-    "text": "hlt"
-   },
-   "0x0009321C": {
-    "n": 1,
-    "text": "insd dword ptr es:[edi], dx"
-   },
-   "0x00093224": {
-    "n": 1,
-    "text": "cmpsd dword ptr [esi], dword ptr es:[edi]"
-   },
-   "0x0009637D": {
-    "n": 1,
-    "text": "pushal"
-   },
-   "0x0009A9D0": {
-    "n": 1,
-    "text": "hlt"
-   },
-   "0x0009A9D1": {
-    "n": 1,
-    "text": "cmpsb byte ptr [esi], byte ptr es:[edi]"
-   },
-   "0x0009A9E5": {
-    "n": 1,
-    "text": "cmpsb byte ptr [esi], byte ptr es:[edi]"
-   },
-   "0x0009A9F9": {
-    "n": 1,
-    "text": "cmpsb byte ptr [esi], byte ptr es:[edi]"
-   },
-   "0x000B224C": {
-    "n": 1,
-    "text": "pushfd"
-   },
-   "0x000B2250": {
-    "n": 1,
-    "text": "lds ebx, ptr [edx]"
-   },
-   "0x000B226C": {
-    "n": 1,
-    "text": "outsb dx, byte ptr [esi]"
-   },
-   "0x000BA254": {
-    "n": 1,
-    "text": "aam 0x9f"
-   },
-   "0x000BA258": {
-    "n": 1,
-    "text": "bound esp, qword ptr [eax - 0x5f4dfff5]"
-   },
-   "0x000D6335": {
-    "n": 6,
-    "text": "bound ecx, qword ptr [0xd62f200]"
-   },
-   "0x000D633D": {
-    "n": 6,
-    "text": "bound ecx, qword ptr [0xd630000]"
-   },
-   "0x000D6345": {
-    "n": 6,
-    "text": "arpl word ptr [0xd630e00], cx"
-   },
    "0x000E9BFD": {
     "n": 2,
     "text": "lcall 0xe, 0x9bd0000e"
@@ -2699,22 +2057,6 @@
    "0x000EC260": {
     "n": 1,
     "text": "into"
-   },
-   "0x000FAB22": {
-    "n": 1,
-    "text": "ltr word ptr [esi - 0x57]"
-   },
-   "0x000FAB26": {
-    "n": 1,
-    "text": "str word ptr [edi - 0x56]"
-   },
-   "0x000FAB2A": {
-    "n": 1,
-    "text": "sldt word ptr [eax]"
-   },
-   "0x000FFFAE": {
-    "n": 1,
-    "text": "lldt ax"
    },
    "0x001028F9": {
     "n": 1,
@@ -2744,62 +2086,6 @@
     "n": 1,
     "text": "iretd"
    },
-   "0x00106355": {
-    "n": 1,
-    "text": "arpl word ptr [eax], dx"
-   },
-   "0x00106798": {
-    "n": 1,
-    "text": "outsd dx, dword ptr [esi]"
-   },
-   "0x00109838": {
-    "n": 1,
-    "text": "aaa"
-   },
-   "0x0010B708": {
-    "n": 1,
-    "text": "popal"
-   },
-   "0x0010CA44": {
-    "n": 1,
-    "text": "int 0xc6"
-   },
-   "0x0010CA4C": {
-    "n": 1,
-    "text": "sti"
-   },
-   "0x00116161": {
-    "n": 1,
-    "text": "popal"
-   },
-   "0x0012A5F1": {
-    "n": 1,
-    "text": "popfd"
-   },
-   "0x0012A5F4": {
-    "n": 1,
-    "text": "outsb dx, byte ptr [esi]"
-   },
-   "0x0012A608": {
-    "n": 1,
-    "text": "outsb dx, byte ptr [esi]"
-   },
-   "0x0012F4B9": {
-    "n": 1,
-    "text": "hlt"
-   },
-   "0x0012F4BD": {
-    "n": 1,
-    "text": "hlt"
-   },
-   "0x0012F4C0": {
-    "n": 1,
-    "text": "hlt"
-   },
-   "0x00135CF0": {
-    "n": 1,
-    "text": "iretd"
-   },
    "0x0013A534": {
     "n": 1,
     "text": "aad 0xa3"
@@ -2807,38 +2093,6 @@
    "0x00150120": {
     "n": 1,
     "text": "aad 0xff"
-   },
-   "0x00155ED4": {
-    "n": 1,
-    "text": "bound ebx, qword ptr [esi + 0x15]"
-   },
-   "0x0016704D": {
-    "n": 1,
-    "text": "insd dword ptr es:[edi], dx"
-   },
-   "0x00167051": {
-    "n": 1,
-    "text": "insd dword ptr es:[edi], dx"
-   },
-   "0x00167055": {
-    "n": 1,
-    "text": "insd dword ptr es:[edi], dx"
-   },
-   "0x00167059": {
-    "n": 1,
-    "text": "outsb dx, byte ptr [esi]"
-   },
-   "0x0016705D": {
-    "n": 1,
-    "text": "outsb dx, byte ptr [esi]"
-   },
-   "0x00192BA0": {
-    "n": 1,
-    "text": "bound ebp, qword ptr [ebx]"
-   },
-   "0x00192DD8": {
-    "n": 1,
-    "text": "scasd eax, dword ptr es:[edi]"
    },
    "0x001A77A5": {
     "n": 1,

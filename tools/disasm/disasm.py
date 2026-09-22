@@ -62,6 +62,32 @@ class Disassembler:
         self.func_detector: Optional[FunctionDetector] = None
         self.strings: List[dict] = []
 
+    def _write_jump_tables(self) -> None:
+        """Every switch table the engine measured, with its arms.
+
+        The lifter reads a table straight out of the XBE and has to guess
+        where it ends, so it stops at the first entry outside the function
+        it is translating. A table whose cases alternate between local arms
+        and other functions -- JSRF's 0x001FA008 in .rdata, 21 entries, half
+        of them one shared handler -- then resolves to one arm and is thrown
+        away. The engine knows the exact length (see resync_jump_tables), and
+        this hands it over: tools.recomp reads the file from --disasm-dir.
+        """
+        import json
+        tables = {}
+        for tbl, end in sorted(list(self.engine.jump_tables.items())
+                               + list(self.engine.short_jump_tables.items())):
+            tables[f"0x{tbl:08X}"] = {
+                "end": f"0x{end:08X}",
+                "entries": [f"0x{e:08X}"
+                            for e in self.engine.jump_table_entries(tbl)],
+                "sites": [f"0x{a:08X}"
+                          for a in self.engine.jump_table_sites(tbl)],
+            }
+        with open(os.path.join(self.output_dir, "jump_tables.json"), "w") as f:
+            json.dump(tables, f, indent=1)
+            f.write("\n")
+
     def run(self) -> bool:
         """
         Execute the full disassembly pipeline.
@@ -311,6 +337,7 @@ class Disassembler:
                 self.output_dir, self.engine, self.func_detector,
                 self.xrefs, self.labels, self.image, self.strings)
             writer.write_all(sections_to_disasm=sections, verbose=self.verbose)
+            self._write_jump_tables()
 
             # Save cache
             json_path = self._find_analysis_json()

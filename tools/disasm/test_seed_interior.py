@@ -467,8 +467,11 @@ class SeedInteriorTest(unittest.TestCase):
         # The trigger is a provably wrong end, not merely an old one. An alias
         # whose body already contains every arm of the switch it dispatches is
         # correct, and re-measuring 2,557 aliases that are fine is not a fix.
+        # Its recorded end is a real function start, as an alias's end is
+        # whenever the body it shares was clamped by its neighbour; a boundary
+        # that no longer exists is the other trigger (test_alias_flow_end).
         det = _alias_detector(
-            functions=[(0x00030000, 0x00030040)],
+            functions=[(0x00030000, 0x00030040), (0x00030200, 0x00030300)],
             aliases={0x00030100: 0x00030200},
             tables={0x000301F0: [0x00030120, 0x00030130]},
             dispatch_at={0x000301FF: 0x000301F0},
