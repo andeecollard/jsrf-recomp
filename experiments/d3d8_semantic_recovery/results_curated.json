@@ -1,0 +1,189 @@
+{
+  "summary": {
+    "model": "qwen3.8-27b-uncensored-mlx",
+    "base_url": "http://127.0.0.1:1234/v1",
+    "cases": 16,
+    "attempts": 16,
+    "correct": 13,
+    "accuracy": 0.8125,
+    "stable_cases": null,
+    "fully_observed_cases": null,
+    "choice_counts": {
+      "swap": 1,
+      "insufficient_evidence": 3,
+      "draw_indexed": 1,
+      "draw_vertices": 1,
+      "clear": 1,
+      "set_texture": 1,
+      "set_texture_state": 1,
+      "set_render_target": 1,
+      "set_vertex_shader_constant": 1,
+      "block_on_fence": 1,
+      "state_block": 3,
+      "set_light": 1
+    },
+    "stability_measured": false
+  },
+  "rows": [
+    {
+      "id": "swap_pair",
+      "expected": "swap",
+      "attempt": 1,
+      "choice": "swap",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 1.7311,
+      "raw": "{\"choice\": \"swap\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "flip_stall_alone",
+      "expected": "insufficient_evidence",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.9,
+      "correct": true,
+      "latency_seconds": 1.318,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.9}"
+    },
+    {
+      "id": "indexed_draw",
+      "expected": "draw_indexed",
+      "attempt": 1,
+      "choice": "draw_indexed",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 4.3395,
+      "raw": "{\"choice\": \"draw_indexed\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "inline_draw",
+      "expected": "draw_up",
+      "attempt": 1,
+      "choice": "draw_vertices",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 4.2966,
+      "raw": "{\"choice\": \"draw_vertices\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "plain_draw",
+      "expected": "draw_vertices",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 1.556,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "clear",
+      "expected": "clear",
+      "attempt": 1,
+      "choice": "clear",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 1.2096,
+      "raw": "{\"choice\": \"clear\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "texture",
+      "expected": "set_texture",
+      "attempt": 1,
+      "choice": "set_texture",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 4.2946,
+      "raw": "{\"choice\": \"set_texture\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "texture_state",
+      "expected": "set_texture_state",
+      "attempt": 1,
+      "choice": "set_texture_state",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 1.5247,
+      "raw": "{\"choice\": \"set_texture_state\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "render_target",
+      "expected": "set_render_target",
+      "attempt": 1,
+      "choice": "set_render_target",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 1.4935,
+      "raw": "{\"choice\": \"set_render_target\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "vertex_constant",
+      "expected": "set_vertex_shader_constant",
+      "attempt": 1,
+      "choice": "set_vertex_shader_constant",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 4.387,
+      "raw": "{\"choice\": \"set_vertex_shader_constant\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "fence",
+      "expected": "block_on_fence",
+      "attempt": 1,
+      "choice": "block_on_fence",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 1.3085,
+      "raw": "{\"choice\": \"block_on_fence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "unknown",
+      "expected": "insufficient_evidence",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 4.3914,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "broad_incidental_light",
+      "expected": "state_block",
+      "attempt": 1,
+      "choice": "state_block",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 2.6744,
+      "raw": "{\"choice\": \"state_block\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "broad_decisive_draw",
+      "expected": "draw_indexed",
+      "attempt": 1,
+      "choice": "state_block",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 1.8745,
+      "raw": "{\"choice\": \"state_block\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "small_light",
+      "expected": "set_light",
+      "attempt": 1,
+      "choice": "set_light",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 4.2908,
+      "raw": "{\"choice\": \"set_light\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "broad_weak_texture",
+      "expected": "state_block",
+      "attempt": 1,
+      "choice": "state_block",
+      "confidence": 0.85,
+      "correct": true,
+      "latency_seconds": 1.8916,
+      "raw": "{\"choice\": \"state_block\", \"confidence\": 0.85}"
+    }
+  ]
+}

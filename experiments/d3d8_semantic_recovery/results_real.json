@@ -1,0 +1,99 @@
+{
+  "summary": {
+    "model": "qwen3.8-27b-uncensored-mlx",
+    "base_url": "http://127.0.0.1:1234/v1",
+    "cases": 8,
+    "attempts": 8,
+    "correct": 1,
+    "accuracy": 0.125,
+    "stable_cases": null,
+    "fully_observed_cases": null,
+    "choice_counts": {
+      "set_fog_state": 1,
+      "insufficient_evidence": 7
+    },
+    "stability_measured": false
+  },
+  "rows": [
+    {
+      "id": "real_0018eb40",
+      "expected": "set_fog_state",
+      "attempt": 1,
+      "choice": "set_fog_state",
+      "confidence": 0.95,
+      "correct": true,
+      "latency_seconds": 6.4555,
+      "raw": "{\"choice\": \"set_fog_state\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_0018ec80",
+      "expected": "set_pixel_shader_state",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 4.6413,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_001905b0",
+      "expected": "set_vertex_shader_constant",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 4.6596,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_00199020",
+      "expected": "draw_vertices",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 5.5319,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_00199180",
+      "expected": "draw_vertices",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 4.9342,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_001992c0",
+      "expected": "draw_vertices",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 4.9357,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_00199360",
+      "expected": "draw_vertices",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 4.9458,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    },
+    {
+      "id": "real_00199660",
+      "expected": "draw_vertices",
+      "attempt": 1,
+      "choice": "insufficient_evidence",
+      "confidence": 0.95,
+      "correct": false,
+      "latency_seconds": 5.008,
+      "raw": "{\"choice\": \"insufficient_evidence\", \"confidence\": 0.95}"
+    }
+  ]
+}

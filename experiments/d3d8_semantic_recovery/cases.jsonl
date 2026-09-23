@@ -1,0 +1,17 @@
+{"id":"swap_pair","methods":["NV097_FLIP_STALL","NV097_FLIP_INCREMENT_WRITE"],"facts":{"distinct_method_count":2,"location":"D3D section"},"expected":"swap"}
+{"id":"flip_stall_alone","methods":["NV097_FLIP_STALL"],"facts":{"distinct_method_count":1,"note":"FLIP_STALL also occurs during device setup"},"expected":"insufficient_evidence"}
+{"id":"indexed_draw","methods":["NV097_SET_BEGIN_END","NV097_ARRAY_ELEMENT32"],"facts":{"distinct_method_count":2},"expected":"draw_indexed"}
+{"id":"inline_draw","methods":["NV097_SET_BEGIN_END","NV097_INLINE_ARRAY"],"facts":{"distinct_method_count":2},"expected":"draw_up"}
+{"id":"plain_draw","methods":["NV097_SET_BEGIN_END"],"facts":{"distinct_method_count":1,"forbidden_markers_absent":["NV097_ARRAY_ELEMENT","NV097_INLINE_ARRAY"]},"expected":"draw_vertices"}
+{"id":"clear","methods":["NV097_CLEAR_SURFACE","NV097_SET_CLEAR_RECT_HORIZONTAL","NV097_SET_CLEAR_RECT_VERTICAL"],"facts":{"distinct_method_count":3},"expected":"clear"}
+{"id":"texture","methods":["NV097_SET_TEXTURE_OFFSET0","NV097_SET_TEXTURE_FORMAT0"],"facts":{"distinct_method_count":2},"expected":"set_texture"}
+{"id":"texture_state","methods":["NV097_SET_TEXTURE_CONTROL0_0","NV097_SET_TEXTURE_FILTER0"],"facts":{"distinct_method_count":2,"texture_offset_absent":true},"expected":"set_texture_state"}
+{"id":"render_target","methods":["NV097_SET_SURFACE_COLOR_OFFSET","NV097_SET_SURFACE_ZETA_OFFSET","NV097_SET_SURFACE_PITCH"],"facts":{"distinct_method_count":3},"expected":"set_render_target"}
+{"id":"vertex_constant","methods":["NV097_SET_TRANSFORM_CONSTANT_LOAD","NV097_SET_TRANSFORM_CONSTANT"],"facts":{"distinct_method_count":2},"expected":"set_vertex_shader_constant"}
+{"id":"fence","methods":["NV097_SET_SEMAPHORE_OFFSET","NV097_BACK_END_WRITE_SEMAPHORE_RELEASE"],"facts":{"distinct_method_count":2},"expected":"block_on_fence"}
+{"id":"unknown","methods":["NV097_NO_OPERATION"],"facts":{"distinct_method_count":1},"expected":"insufficient_evidence"}
+{"id":"broad_incidental_light","methods":["NV097_FLIP_STALL","NV097_NO_OPERATION","NV097_SET_DEPTH_TEST_ENABLE","NV097_SET_LIGHT_AMBIENT_COLOR","NV097_SET_STENCIL_TEST_ENABLE","NV097_SET_SURFACE_CLIP_HORIZONTAL","NV097_SET_SURFACE_COLOR_OFFSET","NV097_SET_SURFACE_FORMAT","NV097_SET_SURFACE_PITCH","NV097_SET_SURFACE_ZETA_OFFSET","NV097_WAIT_FOR_IDLE"],"facts":{"distinct_method_count":11,"note":"real JSRF shape that was once misclassified from its incidental light method"},"expected":"state_block"}
+{"id":"broad_decisive_draw","methods":["NV097_SET_BEGIN_END","NV097_ARRAY_ELEMENT32","NV097_SET_SURFACE_CLIP_HORIZONTAL","NV097_SET_SURFACE_PITCH","NV097_SET_LIGHT_AMBIENT_COLOR","NV097_SET_FOG_COLOR","NV097_SET_TEXTURE_CONTROL0","NV097_WAIT_FOR_IDLE"],"facts":{"distinct_method_count":8},"expected":"draw_indexed"}
+{"id":"small_light","methods":["NV097_SET_LIGHT_AMBIENT_COLOR"],"facts":{"distinct_method_count":1},"expected":"set_light"}
+{"id":"broad_weak_texture","methods":["NV097_SET_TEXTURE_OFFSET0","NV097_SET_DEPTH_TEST_ENABLE","NV097_SET_STENCIL_TEST_ENABLE","NV097_SET_SURFACE_COLOR_OFFSET","NV097_SET_SURFACE_FORMAT","NV097_SET_SURFACE_PITCH","NV097_WAIT_FOR_IDLE"],"facts":{"distinct_method_count":7,"note":"weak single-operation markers must not name broad pipeline setup"},"expected":"state_block"}
+

@@ -1,0 +1,161 @@
+{
+  "model": "Qwen/Qwen3.5-4B",
+  "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "backend": "SemIf direct MLX",
+  "input_sha256": "df2c85c3f92498094563c8434f97cbe6e47c9f7b2f2dbf61d1f2ee5c17631745",
+  "rows": [
+    {
+      "id": "symbol_0018cdd0",
+      "function_address": "0x0018CDB0",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.5033,
+      "scanner_label": null,
+      "prompt_sha256": "8e232388ac06f5a7571dc85679a1a92482cc597037fdc41882c8883e787ce9cb"
+    },
+    {
+      "id": "symbol_00193830",
+      "function_address": "0x001937F0",
+      "expected": "clear",
+      "predicted": "insufficient_evidence",
+      "score": 0.5416,
+      "scanner_label": null,
+      "prompt_sha256": "ca47a7b1ffb90d3589c49780437b01c3b084c810609a26218c1f8ab0a2163f0d"
+    },
+    {
+      "id": "symbol_001993a0",
+      "function_address": "0x00199360",
+      "expected": "draw_indexed",
+      "predicted": "draw_indexed",
+      "score": 0.4095,
+      "scanner_label": "D3DDevice_DrawVertices",
+      "prompt_sha256": "56d15a50bb2363b38327fcf87ddd5941ab3ce6b986d78b325509c44974439114"
+    },
+    {
+      "id": "symbol_001991c0",
+      "function_address": "0x00199180",
+      "expected": "draw_indexed",
+      "predicted": "insufficient_evidence",
+      "score": 0.3604,
+      "scanner_label": "D3DDevice_DrawVertices",
+      "prompt_sha256": "1e70497d003e32f7880bb63475fbc4ad0d43d0b93355ca25b05db7b3f98a43e0"
+    },
+    {
+      "id": "symbol_00199300",
+      "function_address": "0x001992C0",
+      "expected": "draw_vertices",
+      "predicted": "draw_indexed",
+      "score": 0.4771,
+      "scanner_label": "D3DDevice_DrawVertices",
+      "prompt_sha256": "6ea3ac0212eee516d950dfe877b78b72f007f81eb6f328de434d8ae1e109c3df"
+    },
+    {
+      "id": "symbol_00199060",
+      "function_address": "0x00199020",
+      "expected": "draw_up",
+      "predicted": "insufficient_evidence",
+      "score": 0.2611,
+      "scanner_label": "D3DDevice_DrawVertices",
+      "prompt_sha256": "2daad3bba4541550a8e4bbeee8f3342a234eeef0f524d42a8453f4abf8d8d9ee"
+    },
+    {
+      "id": "symbol_0018d620",
+      "function_address": "0x0018D620",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.722,
+      "scanner_label": null,
+      "prompt_sha256": "afc94c97d41762cbede301070e738eb38093a7ef1210214a5773830f79ff54ed"
+    },
+    {
+      "id": "symbol_0018da70",
+      "function_address": "0x0018DA60",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.7593,
+      "scanner_label": null,
+      "prompt_sha256": "b2e94a56b936736bed7fce40fd53ff7875d5209efa7d27fcb3e2d08e18006ab5"
+    },
+    {
+      "id": "symbol_0018cb40",
+      "function_address": "0x0018CB20",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.5499,
+      "scanner_label": null,
+      "prompt_sha256": "5e66177d9e278c460853a332306792f2b7d86dd405ce16e681b055660b729258"
+    },
+    {
+      "id": "symbol_0018cbc0",
+      "function_address": "0x0018CBB0",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.7268,
+      "scanner_label": null,
+      "prompt_sha256": "9be9daf4931012af70f2d98721b07478c0c14f903d1e1bfe37312f09a079e68f"
+    },
+    {
+      "id": "symbol_0018cd70",
+      "function_address": "0x0018CD60",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.3392,
+      "scanner_label": null,
+      "prompt_sha256": "7e1238a76e0bbe7461ee99e3326923ed33ab3ce82f1f28ce5685a3934111df0e"
+    },
+    {
+      "id": "symbol_0018e120",
+      "function_address": "0x0018E120",
+      "expected": "insufficient_evidence",
+      "predicted": "insufficient_evidence",
+      "score": 0.4763,
+      "scanner_label": null,
+      "prompt_sha256": "eb1db0e183b5da733fb99f18543b670430e708b59c26fce92ebb4d30d697cc5e"
+    },
+    {
+      "id": "symbol_0018dc00",
+      "function_address": "0x0018DBC0",
+      "expected": "set_light",
+      "predicted": "insufficient_evidence",
+      "score": 0.6678,
+      "scanner_label": null,
+      "prompt_sha256": "a1b950ecea785393f19dc6e5c99f6ecd90b0a812fa6422805ea4d67cbb8dd685"
+    },
+    {
+      "id": "symbol_0018d0f0",
+      "function_address": "0x0018D0B0",
+      "expected": "set_render_target",
+      "predicted": "insufficient_evidence",
+      "score": 0.522,
+      "scanner_label": null,
+      "prompt_sha256": "687633f085be871f46d88c3c5bae945ee7ef1daa94e0d58f2d0554c26e0040ec"
+    },
+    {
+      "id": "symbol_0018df10",
+      "function_address": "0x0018DED0",
+      "expected": "set_texture",
+      "predicted": "insufficient_evidence",
+      "score": 0.3852,
+      "scanner_label": null,
+      "prompt_sha256": "1eceba476406bf873467118c02d18687283303e799861149b2acf41100cca6db"
+    },
+    {
+      "id": "symbol_001905f0",
+      "function_address": "0x001905B0",
+      "expected": "set_vertex_shader_constant",
+      "predicted": "set_vertex_shader_constant",
+      "score": 0.557,
+      "scanner_label": "D3DDevice_SetVertexShaderConstant",
+      "prompt_sha256": "cf02482d1d50b47ef6cd346613553abdaa28700c56eead8fab4c4dd76547c0bb"
+    },
+    {
+      "id": "symbol_00198f10",
+      "function_address": "0x00198ED0",
+      "expected": "swap",
+      "predicted": "insufficient_evidence",
+      "score": 0.4062,
+      "scanner_label": null,
+      "prompt_sha256": "68191345f9b40018f244fa344a3a9362c94fc453d5689294b0adb29008021324"
+    }
+  ]
+}
