@@ -102,6 +102,9 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    # A path, not a boolean: where the DSOUND lift tees its mixed output as a
+    # WAV (G48 §2a, src/apu/dsound_host_out.c).
+    "RECOMP_DSOUND_LIFT_WAV",
     # Names what to tally, not whether: "ring" counts guest stores into the
     # live D3D push-buffer ring by function (G33, recomp_mem_watch.c). Other
     # values are reserved for other regions, so only the literal "ring" arms it.
