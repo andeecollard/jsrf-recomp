@@ -190,6 +190,19 @@ def main():
                 wrappers.append("static void %s(void) { if (d3d8_lift_clear_mode()) d3d8_lift_clear();"
                                 " else d3d8c_orig_%s(); }" % (body, name))
                 manifest.append("lift: %s -> d3d8_lift_clear.h" % name)
+            if a.mirror and name in ("sub_0018F6C0", "sub_0018F760"):
+                hooked = "d3d8c_hooked_%s" % name
+                fn = "d3d8m_zenable" if name == "sub_0018F6C0" else "d3d8m_stencilenable"
+                wrappers.append("void %s(uint32_t v);" % fn)
+                wrappers.append("static void %s(void) { uint32_t v = MEM32(esp + 4u); %s(); %s(v); }" % (hooked, body, fn))
+                body = hooked
+                manifest.append("mirror: %s (%s)" % (name, fn))
+            if a.mirror and name == "sub_0018E930":
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_simple(uint32_t hdr, uint32_t value);")
+                wrappers.append("static void %s(void) { uint32_t h = ecx, v = edx; %s(); d3d8m_simple(h, v); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (render state)" % name)
             if a.mirror and name in ("sub_0018DF10", "sub_001993A0", "sub_00199300"):
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex); void d3d8m_after_draw(void);")

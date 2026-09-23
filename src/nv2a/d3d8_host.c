@@ -2,6 +2,7 @@
 #include "d3d8_host.h"
 #include "nv2a_pusher.h"
 #include <stdatomic.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,11 @@ static _Atomic unsigned s_mismatch_printed, s_surf_printed;
 static _Atomic unsigned long long s_rt_cmp, s_rt_match, s_rt_addr, s_rt_pitch,
                                   s_zs_cmp, s_zs_match, s_zs_missing, s_zs_addr, s_zs_pitch;
 static uint32_t size_pitch(uint32_t size) { return ((size >> 24) + 1u) * 64u; }
+static const uint32_t k_state_methods[11] = D3D8_HOST_STATE_METHODS;
+static _Atomic unsigned long long s_vp_cmp, s_vp_match, s_vp_win, s_vp_z;
+static _Atomic unsigned long long s_st_cmp[11], s_st_match[11], s_st_unseen[11];
+static _Atomic unsigned s_vp_printed, s_st_printed;
+static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
 /* NV2A format byte from a D3D Format word, and the shape it implies. */
@@ -80,6 +86,38 @@ static void check_draw(const D3D8HostDrawCheck *c)
             fprintf(stderr, "[D3D8-MIRROR] draw %u %s MISMATCH: d3d zs=%08X data=%08X fmt=%08X size=%08X (pitch %u)"
                             " | exec depth=%08X pitch=%u\n", c->serial, why, c->zs, c->zs_data, c->zs_format,
                     c->zs_size, size_pitch(c->zs_size), e.depth_addr, e.depth_pitch);
+    }
+    /* Viewport: D3D's rectangle, supersample-scaled and cut to the surface clip,
+     * against the executor's effective scissor; MinZ/MaxZ against its z range. */
+    {
+        const char *why = NULL;
+        int32_t x0 = trunc_scaled(c->vp_x, c->ss_x), y0 = trunc_scaled(c->vp_y, c->ss_y);
+        int32_t x1 = trunc_scaled(c->vp_x + c->vp_w, c->ss_x) - 1, y1 = trunc_scaled(c->vp_y + c->vp_h, c->ss_y) - 1;
+        int32_t cx0 = (int32_t)e.clip_x, cy0 = (int32_t)e.clip_y;
+        int32_t cx1 = (int32_t)(e.clip_x + e.clip_w) - 1, cy1 = (int32_t)(e.clip_y + e.clip_h) - 1;
+        if (x0 < cx0) x0 = cx0; if (y0 < cy0) y0 = cy0; if (x1 > cx1) x1 = cx1; if (y1 > cy1) y1 = cy1;
+        float zmin = c->vp_minz * 16777215.0f, zmax = c->vp_maxz * 16777215.0f;
+        atomic_fetch_add(&s_vp_cmp, 1);
+        if ((uint32_t)x0 != e.win_x0 || (uint32_t)y0 != e.win_y0 || (uint32_t)x1 != e.win_x1 || (uint32_t)y1 != e.win_y1) {
+            atomic_fetch_add(&s_vp_win, 1); why = "window";
+        } else if (fabsf(zmin - e.z_min) > 1.0f || fabsf(zmax - e.z_max) > 1.0f) {
+            atomic_fetch_add(&s_vp_z, 1); why = "z range";
+        } else atomic_fetch_add(&s_vp_match, 1);
+        if (why && atomic_fetch_add(&s_vp_printed, 1) < 10)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u viewport MISMATCH (%s): d3d vp=%d,%d %dx%d z=%g..%g ss=%g,%g -> %d,%d..%d,%d"
+                            " | exec window=%u,%u..%u,%u clip=%u,%u %ux%u z=%g..%g\n", c->serial, why,
+                    c->vp_x, c->vp_y, c->vp_w, c->vp_h, c->vp_minz, c->vp_maxz, c->ss_x, c->ss_y, x0, y0, x1, y1,
+                    e.win_x0, e.win_y0, e.win_x1, e.win_y1, e.clip_x, e.clip_y, e.clip_w, e.clip_h, e.z_min, e.z_max);
+    }
+    /* Blend / alpha / depth / stencil registers: D3D's last Simple push against
+     * the executor's register file at this draw. */
+    for (unsigned k = 0; k < 11; ++k) {
+        if (!(c->st_seen & (1u << k))) { atomic_fetch_add(&s_st_unseen[k], 1); continue; }
+        atomic_fetch_add(&s_st_cmp[k], 1);
+        if (c->st_val[k] == e.st_reg[k]) atomic_fetch_add(&s_st_match[k], 1);
+        else if (atomic_fetch_add(&s_st_printed, 1) < 12)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u state MISMATCH method %04X: d3d pushed %08X, executor has %08X\n",
+                    c->serial, k_state_methods[k], c->st_val[k], e.st_reg[k]);
     }
 }
 
@@ -156,6 +194,12 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->zs_compared = atomic_load(&s_zs_cmp); o->zs_match = atomic_load(&s_zs_match);
     o->zs_missing = atomic_load(&s_zs_missing); o->zs_addr = atomic_load(&s_zs_addr);
     o->zs_pitch = atomic_load(&s_zs_pitch);
+    o->vp_compared = atomic_load(&s_vp_cmp); o->vp_match = atomic_load(&s_vp_match);
+    o->vp_window = atomic_load(&s_vp_win); o->vp_z = atomic_load(&s_vp_z);
+    for (unsigned k = 0; k < 11; ++k) {
+        o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
+        o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
+    }
 }
 
 void d3d8_host_report(const char *why)
@@ -173,4 +217,11 @@ void d3d8_host_report(const char *why)
                         " | depth compared=%llu MATCH=%llu (missing %llu, address %llu, pitch %llu)\n",
                 why, st.rt_compared, st.rt_match, st.rt_addr, st.rt_pitch,
                 st.zs_compared, st.zs_match, st.zs_missing, st.zs_addr, st.zs_pitch);
+    if (st.checks) {
+        fprintf(stderr, "[D3D8-MIRROR] %s viewport: compared=%llu MATCH=%llu (window %llu, z range %llu)\n",
+                why, st.vp_compared, st.vp_match, st.vp_window, st.vp_z);
+        for (unsigned k = 0; k < 11; ++k)
+            fprintf(stderr, "[D3D8-MIRROR] %s state %04X: compared=%llu MATCH=%llu never-pushed-by-D3D=%llu\n",
+                    why, k_state_methods[k], st.st_compared[k], st.st_match[k], st.st_unseen[k]);
+    }
 }

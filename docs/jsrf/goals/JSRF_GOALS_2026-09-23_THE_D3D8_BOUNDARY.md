@@ -635,3 +635,44 @@ can see a wrong surface, so the full match is evidence.
 and depth buffer from D3D's device, with no reference to the NV2A surface
 commands. Next in G39: viewport and blend/depth/alpha state, then the
 shader handles.
+
+### G39, third slice: viewport and blend/alpha/depth/stencil state, 23 Sep 2026
+
+**Viewport.** D3D keeps it in the device at `+0x9D0..+0x9E4` (X, Y, W, H,
+MinZ, MaxZ). `SetViewport` turns it into SET_VIEWPORT_OFFSET/SCALE, SET_CLIP_MIN/MAX
+and, through `SetScissors`, the window clip. The mirror scales the rectangle
+by the supersample factors (`+0x454/+0x458`), cuts it to the surface clip and
+compares it with the executor's effective scissor. It also compares
+MinZ/MaxZ x 16777215 with the executor's z range.
+
+**State.** Eleven registers: alpha test enable/func/ref; blend
+enable/sfactor/dfactor/equation; depth test enable/func/mask; stencil test
+enable.
+- **Nine** reach the GPU through `SetRenderState_Simple`, whose wrapper now
+  records each method's last value (`--mirror` hooks 0x18E930).
+- **Depth and stencil enable** go through their own setters instead,
+  `SetRenderState_ZEnable` (0x18F6C0) and `_StencilEnable` (0x18F760). The
+  first run showed them "never pushed by D3D", so those two are now hooked
+  as well. The mirror holds "enabled or not".
+
+**150 s silenced tutorial:** 579,984 draws.
+- **Viewport:** **579,984 match**, 0 window and 0 z-range mismatches.
+- **State:** all 11 registers **579,984/579,984**, with none left unpushed.
+- **Surfaces:** still 579,984/579,984.
+- **Textures:** the same 4 address mismatches as before.
+- **Checks and faults.** The convention check ran 7,433,475 calls with 0
+  mismatches. live=61, 0 faults.
+
+**Positive control** (`RECOMP_D3D8_MIRROR_CONTROL=1` shifts viewport X by 1
+and MinZ by 0.5, and flips every state value). 60 s, 259,960 draws: **0
+matches** for the surfaces, the viewport and every state register. The
+window test fires before the z-range test, so the z-range comparison's own
+sensitivity is not separately shown.
+
+**Where G39 stands.** From D3D alone, the host now knows each draw's
+textures, render target, depth buffer, viewport and scissor, and its
+blend/alpha/depth/stencil state, and all of it agrees with what the
+executor drew. Still to check: the vertex and pixel shaders (programs,
+constants and combiner setup), vertex streams and index data, and the
+texture-stage states (filter and wrap). That is everything else a Metal
+renderer fed at the D3D boundary needs.

@@ -6664,6 +6664,11 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
     out->depth_used = (c->depth_test || c->stencil_test) && s_copy.depth;
     out->depth_addr = s_copy.depth_address;
     out->depth_pitch = c->depth_pitch;
+    nv2a_texture_copy_window(c, &out->win_x0, &out->win_y0, &out->win_x1, &out->win_y1);
+    out->clip_x = c->clip_x; out->clip_y = c->clip_y; out->clip_w = c->clip_w; out->clip_h = c->clip_h;
+    out->z_min = c->z_clip_min; out->z_max = c->z_clip_max;
+    {   static const uint32_t m[11] = D3D8_HOST_STATE_METHODS;
+        for (unsigned k = 0; k < 11; ++k) out->st_reg[k] = s_methods[m[k] / 4u]; }
     for (unsigned u = 0; u < 4; ++u) {
         const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;
         if (!(out->mask & (1u << u))) continue;

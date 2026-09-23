@@ -46,7 +46,14 @@ typedef struct {
      * (12-23) and pitch/64-1 (24-31). */
     uint32_t rt, rt_data, rt_format, rt_size;
     uint32_t zs, zs_data, zs_format, zs_size;
+    /* Viewport as D3D stores it (device +0x9D0..+0x9E4: X, Y, W, H, MinZ, MaxZ)
+     * and the supersample scales (+0x454/+0x458). */
+    int32_t vp_x, vp_y, vp_w, vp_h; float vp_minz, vp_maxz, ss_x, ss_y;
+    /* The last value D3D pushed through SetRenderState_Simple for each method
+     * in D3D8_HOST_STATE_METHODS, and which of them it has pushed at all. */
+    uint32_t st_val[11], st_seen;
 } D3D8HostDrawCheck;
+#define D3D8_HOST_STATE_METHODS { 0x300, 0x304, 0x30C, 0x32C, 0x33C, 0x340, 0x344, 0x348, 0x350, 0x354, 0x35C }
 
 /* What the executor made of the draw it just ran. */
 typedef struct {
@@ -58,6 +65,10 @@ typedef struct {
     uint32_t target_addr, target_pitch, target_bpp;
     int      depth_used;       /* depth or stencil test on: depth_addr is meaningful */
     uint32_t depth_addr, depth_pitch;
+    uint32_t win_x0, win_y0, win_x1, win_y1;   /* effective scissor, inclusive */
+    uint32_t clip_x, clip_y, clip_w, clip_h;   /* surface clip */
+    float    z_min, z_max;
+    uint32_t st_reg[11];                       /* executor registers, same method list */
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -68,6 +79,8 @@ typedef struct {
                        units_missing, units_addr, units_shape;
     unsigned long long rt_compared, rt_match, rt_addr, rt_pitch,
                        zs_compared, zs_match, zs_missing, zs_addr, zs_pitch;
+    unsigned long long vp_compared, vp_match, vp_window, vp_z;
+    unsigned long long st_compared[11], st_match[11], st_unseen[11];
 } D3D8HostStats;
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);

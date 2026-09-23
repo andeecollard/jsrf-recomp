@@ -28,6 +28,30 @@ static int d3d8m_on(void)
     return m;
 }
 static uint32_t m_tex[4], m_serial;
+static const uint32_t m_state_methods[11] = D3D8_HOST_STATE_METHODS;
+static uint32_t m_state_val[11], m_state_seen;
+
+/* SetRenderState_ZEnable / _StencilEnable(value): these reach the GPU through
+ * their own setters, not Simple. What the renderer needs is "enabled or not",
+ * so the mirror holds value != 0 against the register's 0/1. */
+static void m_set_state(uint32_t method, uint32_t value)
+{
+    for (unsigned k = 0; k < 11; ++k)
+        if (m_state_methods[k] == method) { m_state_val[k] = value; m_state_seen |= 1u << k; }
+}
+void d3d8m_zenable(uint32_t v)       { m_set_state(0x30Cu, v != 0); }
+void d3d8m_stencilenable(uint32_t v) { m_set_state(0x32Cu, v != 0); }
+
+/* SetRenderState_Simple(ecx = method header, edx = value): record each state
+ * method's last value -- the render state a host renderer would receive. A
+ * header with a count above 1 is not a render-state push and is ignored. */
+void d3d8m_simple(uint32_t hdr, uint32_t value)
+{
+    uint32_t method = hdr & 0x1FFCu;
+    if (((hdr >> 18) & 0x7FFu) != 1u || ((hdr >> 13) & 7u)) return;
+    for (unsigned k = 0; k < 11; ++k)
+        if (m_state_methods[k] == method) { m_state_val[k] = value; m_state_seen |= 1u << k; }
+}
 static unsigned long long m_no_token;
 
 void d3d8m_set_texture(uint32_t stage, uint32_t tex)
@@ -50,13 +74,20 @@ void d3d8m_after_draw(void)
     {   uint32_t d = MEM32(0x0019DCE0u);            /* D3D_g_pDevice */
         c.rt = MEM32(d + 0x2070u); c.zs = MEM32(d + 0x2074u);
         if (c.rt) { c.rt_data = MEM32(c.rt + 4u); c.rt_format = MEM32(c.rt + 0xCu); c.rt_size = MEM32(c.rt + 0x10u); }
-        if (c.zs) { c.zs_data = MEM32(c.zs + 4u); c.zs_format = MEM32(c.zs + 0xCu); c.zs_size = MEM32(c.zs + 0x10u); } }
+        if (c.zs) { c.zs_data = MEM32(c.zs + 4u); c.zs_format = MEM32(c.zs + 0xCu); c.zs_size = MEM32(c.zs + 0x10u); }
+        c.vp_x = (int32_t)MEM32(d + 0x9D0u); c.vp_y = (int32_t)MEM32(d + 0x9D4u);
+        c.vp_w = (int32_t)MEM32(d + 0x9D8u); c.vp_h = (int32_t)MEM32(d + 0x9DCu);
+        { uint32_t u; u = MEM32(d + 0x9E0u); memcpy(&c.vp_minz, &u, 4); u = MEM32(d + 0x9E4u); memcpy(&c.vp_maxz, &u, 4);
+          u = MEM32(d + 0x454u); memcpy(&c.ss_x, &u, 4); u = MEM32(d + 0x458u); memcpy(&c.ss_y, &u, 4); } }
+    memcpy(c.st_val, m_state_val, sizeof c.st_val); c.st_seen = m_state_seen;
         {   /* Positive control for the surface check: RECOMP_D3D8_MIRROR_CONTROL=1
          * swaps the colour and depth addresses, so every draw MUST mismatch. */
         static int ctl = -1;
         if (ctl < 0) { const char *e = getenv("RECOMP_D3D8_MIRROR_CONTROL"); ctl = e && e[0] == '1';
                        if (ctl) fprintf(stderr, "[D3D8-MIRROR] POSITIVE CONTROL: colour/depth addresses swapped\n"); }
-        if (ctl) { uint32_t t = c.rt_data; c.rt_data = c.zs_data; c.zs_data = t; } }
+        if (ctl) { uint32_t t = c.rt_data; c.rt_data = c.zs_data; c.zs_data = t;
+                   c.vp_x += 1; c.vp_minz += 0.5f;                      /* viewport must mismatch */
+                   for (unsigned k = 0; k < 11; ++k) c.st_val[k] ^= 1u; } }   /* every state too */
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);
