@@ -707,6 +707,11 @@ add_executable(jsrf_adpcm_decode_test adpcm_decode_test.c)
 target_link_libraries(jsrf_adpcm_decode_test PRIVATE xbox_kernel xbox_apu)
 add_test(NAME jsrf_adpcm_decode COMMAND jsrf_adpcm_decode_test)
 
+# G48 phase 2: the host DSOUND model, checked without the title.
+add_executable(jsrf_dsound_host_test dsound_host_test.c)
+target_link_libraries(jsrf_dsound_host_test PRIVATE xbox_kernel xbox_apu)
+add_test(NAME jsrf_dsound_host COMMAND jsrf_dsound_host_test)
+
 # The decode-pair guard, whose absence crashed the title in the guest's
 # DirectSound ISR on 17 Sep 2026. Registered TWICE because the accessor caches
 # its getenv in a static, so one process only ever sees one value -- and the
