@@ -133,3 +133,50 @@ has not yet fired in a session.
 3. **G43**, discovery first, because it covers 88% of draws. Then **G42**.
 4. **G44.**
 5. **G36 and G46** alongside, as sessions allow.
+
+## Added late on 23 September
+
+### G45 — status
+
+`21fcbc3` leaves a half-built control TD queued instead of stalling it, and
+retries the control list from the periodic tick. The player's session showed
+one such TD: a rumble SET_REPORT SETUP read with CBP 0 and NextTD 0 behind a
+TailP already past it. `tds_incomplete` on the `[OHCI-WDH]` line counts them.
+**Still owed:** a police chase played through with rumble.
+
+### G47 — the DSOUND crash is DISPATCH_LEVEL that only one thread honours
+
+The same session crashed at t≈523 s in `sub_001A2E2E`, which sits in
+DSOUND's APU driver between `CMcpxAPU_ServiceDeferredCommandsLow` (0x1A21ED)
+and `CMcpxVoiceClient_SetFilter` (0x1A332D). It walked a voice list whose
+owner pointer read 0, so the list head's forward link was NULL and the record
+pointer came out as −0x4C (EAX=FFFFFFB4). The main thread was inside
+DrawIndexedVertices when it ran, so this was DSOUND's DPC delivered on the
+main thread.
+
+**The mechanism, measured statically.** DSOUND protects its voice lists
+with the XDK's scoped IRQL guard at 0x1A1B7C/0x1A1BAF: raise to
+DISPATCH_LEVEL if below it, lower on exit. 56 call sites take it. On the
+Xbox, one CPU makes that a process-wide exclusion of every DPC. In
+`kernel_hal.c`, IRQL is a thread-local, and the bridge's DPC delivery checks
+only the delivering thread. A DSOUND DPC can therefore run on one host thread
+while another is halfway through a list edit at "DISPATCH_LEVEL". The one
+crash is consistent with that, but no run has yet caught the overlap.
+
+**Short-term fix (G47a).** Model the uniprocessor: a process-wide recursive
+dispatch lock, taken when a thread raises to DISPATCH_LEVEL or above and by
+every DPC and ISR delivery, released when IRQL drops. Count contention.
+First instrument it (count DPC deliveries while another thread holds
+DISPATCH_LEVEL) so the fix has a measured before.
+
+**The real fix (G47b): lift DSOUND at its boundary, as for D3D.**
+XbSymbolDatabase finds 137 DSOUND symbols in JSRF at XDK 4134
+(`experiments/dsound_boundary/xbsymbol_dsound_4134.tsv`):
+`DirectSoundCreate`, `CreateSoundBuffer`, `IDirectSoundBuffer_Play/Stop/
+SetFrequency/SetVolume/SetBufferData/Lock/SetLoopRegion/GetCurrentPosition`,
+the 3D setters, `DirectSoundDoWork`. Cxbx-Reloaded
+(`src/core/hle/DSOUND`) replaces exactly these with host audio and never runs
+the title's APU driver. Doing the same here removes the MCPX voice model,
+the DSOUND DPC, this race, and the ADX guard's reason to exist. Every audio
+report in G46 lives downstream of that model. Spec it the way the D3D lift
+was specced: census the call sites first, then mirror, then replace.
