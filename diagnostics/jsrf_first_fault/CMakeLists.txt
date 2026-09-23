@@ -1144,6 +1144,13 @@ add_executable(jsrf_pusher_token_test pusher_token_test.c
 target_include_directories(jsrf_pusher_token_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_pusher_token COMMAND jsrf_pusher_token_test)
 
+# G37: the host-work queue behind a token -- commands computed by a replaced
+# D3D entry point replay where the token sits, once, through ring dispatch.
+add_executable(jsrf_d3d8_host_test d3d8_host_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c")
+target_include_directories(jsrf_d3d8_host_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_d3d8_host COMMAND jsrf_d3d8_host_test)
+
 # The backport checks below patch specific sites in the GENERATED tree, from
 # when that tree was preserved rather than regenerated. A backport is retired
 # the moment the lifter emits the fixed form by itself: the check then passes

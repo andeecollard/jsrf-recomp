@@ -143,6 +143,9 @@ def main():
     ap.add_argument("source", type=Path)
     ap.add_argument("destination", type=Path)
     ap.add_argument("--entries", type=Path, required=True)
+    ap.add_argument("--lift-clear", action="store_true",
+                    help="route D3DDevice_Clear through d3d8_lift_clear.h (G37); "
+                         "RECOMP_D3D8_LIFT_CLEAR=shadow|1 selects the mode at run time")
     a = ap.parse_args()
 
     src, dst = a.source.resolve(), a.destination.resolve()
@@ -177,12 +180,19 @@ def main():
             manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), path.name))
             renamed = body.replace("void %s(void)" % name, "static void d3d8c_orig_%s(void)" % name, 1)
             text = text[:start] + renamed + text[end:]
+            body = "d3d8c_orig_%s" % name
+            if a.lift_clear and name == "sub_00193830":
+                body = "d3d8c_lift_body_%s" % name
+                wrappers.append('#include "d3d8_lift_clear.h"')
+                wrappers.append("static void %s(void) { if (d3d8_lift_clear_mode()) d3d8_lift_clear();"
+                                " else d3d8c_orig_%s(); }" % (body, name))
+                manifest.append("lift: %s -> d3d8_lift_clear.h" % name)
             wrappers.append(
-                "void %s(void) { if (!g_d3d8_census_on) { d3d8c_orig_%s(); return; }"
-                " d3d8_census_hit(%du, MEM32(esp)); if (g_d3d8_census_on <= 0) { d3d8c_orig_%s(); return; }"
-                " uint32_t e0 = esp, b0[3] = { ebx, esi, edi }; d3d8c_orig_%s();"
+                "void %s(void) { if (!g_d3d8_census_on) { %s(); return; }"
+                " d3d8_census_hit(%du, MEM32(esp)); if (g_d3d8_census_on <= 0) { %s(); return; }"
+                " uint32_t e0 = esp, b0[3] = { ebx, esi, edi }; %s();"
                 " uint32_t b1[3] = { ebx, esi, edi }; d3d8_census_abi(%du, e0, esp, b0, b1); }"
-                % (name, name, idx, name, name, idx))
+                % (name, body, idx, body, body, idx))
         # the renamed statics must be declared before any earlier use in this file
         decls = "\n".join("static void d3d8c_orig_%s(void);" % n for _, _, n, _ in items)
         first = min(s for s, _, _, _ in items)
@@ -196,6 +206,8 @@ def main():
         names=", ".join('"%s"' % n for n in names),
         lo=D3D_LO, hi=D3D_HI, swap=SWAP,
         rets=", ".join("%du" % (e["ret_bytes"][0] if e["ret_bytes"] else 0) for e in entries)))
+    if a.lift_clear:
+        shutil.copyfile(Path(__file__).with_name("d3d8_lift_clear.h"), dst / "d3d8_lift_clear.h")
     (dst / "D3D8_CENSUS_MANIFEST.txt").write_text("\n".join(manifest) + "\n")
     print("staged %d wrappers in %d files -> %s" % (len(plan), len(by_file), dst))
 

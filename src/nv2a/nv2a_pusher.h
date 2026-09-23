@@ -88,6 +88,8 @@ void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler);
 #define NV2A_HOST_TOKEN_METHOD     0x1FFCu
 typedef void (*NV2AHostTokenHandler)(uint32_t parameter);
 void nv2a_pusher_set_host_token_handler(NV2AHostTokenHandler handler);
+/* Dispatch one command as if it had come from the ring (d3d8_host.c's replay). */
+void nv2a_pusher_dispatch_host(uint32_t subchannel, uint32_t method, uint32_t param);
 
 /* Walk a segment exactly as run_segment does, but dispatch nothing and count
  * nothing. For asking "would this data have parsed?" of a buffer that has

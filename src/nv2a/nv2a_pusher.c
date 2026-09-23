@@ -103,6 +103,14 @@ static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
     }
 }
 
+/* Host replay of queued commands (d3d8_host.c): the same dispatch a ring
+ * command takes, on the same thread. Never re-enters the token path. */
+void nv2a_pusher_dispatch_host(uint32_t subchannel, uint32_t method, uint32_t param)
+{
+    if (subchannel == NV2A_HOST_TOKEN_SUBCHANNEL) return;
+    dispatch(subchannel, method, param);
+}
+
 static int g_scan_only;
 
 NV2APusherResult nv2a_pusher_scan_segment(const uint32_t *data,

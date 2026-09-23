@@ -378,6 +378,57 @@ self-contained).
 3. a silenced tutorial run with the replacement on shows 0 faults, the same
    scene, and `host_tokens` equal to the `Clear` call count.
 
+### G37 outcome, 23 Sep 2026: D3DDevice_Clear is computed by host code
+
+**Done; all three gates pass.**
+
+**1. What the original does**, read from its code (`0x193830`, 924 bytes):
+- **Swizzled target.** When the render target's format-table bit 0 is set,
+  it emits `SET_SURFACE_FORMAT` from helper `0x192C70` with bit 9 cleared
+  and bit 8 set, and restores the saved word at the end. When there is no
+  depth surface and nothing is left to clear, it returns without restoring.
+- **Colour.** Packed to 555 or 565 by a table at `0x193BD8`.
+- **Depth.** One of four conversions by depth format (`0x2A`–`0x31`, table
+  at `0x193BF4`): D24, float-24 through `z*1e30`, D16, and float-16 through
+  `z*511.9375`. The stencil is ORed in unmasked.
+- **Rectangles.** Each is clipped to the device clip at `+0x9D0`, scaled by
+  the anti-aliasing factors at `+0x454`/`+0x458` plus 0.5, and truncated.
+- **Commands.** Per rectangle: `CLEAR_RECT_H/V`, then one packet of three,
+  `ZSTENCIL_CLEAR_VALUE`, `COLOR_CLEAR_VALUE` and `CLEAR_SURFACE`=flags.
+
+**The code.**
+- **The transcription.** `diagnostics/jsrf_first_fault/d3d8_lift_clear.h`.
+  It reads the format tables from guest memory and calls the pure helper
+  through the generated code.
+- **The staging option.** `stage_d3d8_census.py --lift-clear`, with
+  `RECOMP_D3D8_LIFT_CLEAR=shadow|1`.
+- **Delivery.** `src/nv2a/d3d8_host.c` is the queue, and
+  `nv2a_pusher_dispatch_host` replays each queued command through the ring's
+  own dispatch. `jsrf_d3d8_host_test` covers ordering, single replay and bad
+  tokens.
+
+**2. Differential (shadow mode, 150 s tutorial):**
+- **22,000 calls.** 21,997 match command for command, and 1 matches after a
+  reservation prefix. That prefix is the semaphore at `0x1D70` that D3D's
+  reservation routine writes when the ring is full. The replacement calls
+  the same routine under the same condition before its token, so the same
+  words precede it.
+- **0 mismatch.** 1 call was unverifiable, a ring wrap inside the window.
+
+**3. Replace mode, 150 s tutorial.**
+- **Replacements.** 19,999 clears replaced by host tokens; 19,999 enqueued
+  and 19,999 replayed, carrying 99,995 commands. 0 bad tokens, 0 queue-full
+  fallbacks, 0 unsupported.
+- **Checks.** The G34 convention check ran around the replacement: 7,440,877
+  calls, 0 mismatches. The run reached live=61 with 0 guest faults and
+  `subch7_other=0`.
+
+**What it is and is not.** This is the first D3D entry point whose NV2A
+commands are computed by host C rather than guest D3D, delivered in ring
+order. The replay still runs through the NV2A executor. The next step for
+Clear is to call the Metal backend's clear directly from the token handler,
+which removes the executor from this entry point.
+
 ### G38 — can the depth-writing alpha-tested draws ever discard?
 
 The 2.3 ms early-Z ceiling is entirely in draws that are alpha-tested with
