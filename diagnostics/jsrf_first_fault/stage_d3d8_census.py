@@ -216,6 +216,21 @@ def main():
                 wrappers.append("static void %s(void) { uint32_t st = MEM32(esp + 4u), pm = MEM32(esp + 8u); %s(); d3d8m_set_transform(st, pm); }" % (hooked, body))
                 body = hooked
                 manifest.append("mirror: %s (transforms)" % name)
+            if a.mirror and name in ("sub_001900D0", "sub_0018E090"):
+                # G41 cross-check hooks. SetStreamSource(StreamNumber,
+                # pStreamData, Stride) ret 0xC; SetIndices(pIndexData,
+                # BaseVertexIndex) ret 8.
+                hooked = "d3d8c_hooked_%s" % name
+                if name == "sub_001900D0":
+                    wrappers.append("void d3d8m_set_stream_source(uint32_t stream, uint32_t vb, uint32_t stride);")
+                    wrappers.append("static void %s(void) { uint32_t s = MEM32(esp + 4u), vb = MEM32(esp + 8u),"
+                                    " st = MEM32(esp + 12u); %s(); d3d8m_set_stream_source(s, vb, st); }" % (hooked, body))
+                else:
+                    wrappers.append("void d3d8m_set_indices(uint32_t ib, uint32_t base);")
+                    wrappers.append("static void %s(void) { uint32_t ib = MEM32(esp + 4u), b = MEM32(esp + 8u);"
+                                    " %s(); d3d8m_set_indices(ib, b); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (streams/indices)" % name)
             if a.mirror and name == "sub_0018E930":
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_simple(uint32_t hdr, uint32_t value);")
@@ -224,12 +239,18 @@ def main():
                 manifest.append("mirror: %s (render state)" % name)
             if a.mirror and name in ("sub_0018DF10", "sub_001993A0", "sub_00199300"):
                 hooked = "d3d8c_hooked_%s" % name
-                wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex); void d3d8m_after_draw(void);")
+                wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex);"
+                                " void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);")
                 if name == "sub_0018DF10":
                     wrappers.append("static void %s(void) { uint32_t st = MEM32(esp + 4u), tx = MEM32(esp + 8u);"
                                     " %s(); d3d8m_set_texture(st, tx); }" % (hooked, body))
                 else:
-                    wrappers.append("static void %s(void) { %s(); d3d8m_after_draw(); }" % (hooked, body))
+                    # G41: the draw's three stdcall arguments, read before the
+                    # original pops them. DrawIndexedVertices (kind 2) takes
+                    # (prim, count, pIndexData); DrawVertices (kind 1) (prim, start, count).
+                    kind = 2 if name == "sub_001993A0" else 1
+                    wrappers.append("static void %s(void) { uint32_t a1 = MEM32(esp + 4u), a2 = MEM32(esp + 8u),"
+                                    " a3 = MEM32(esp + 12u); %s(); d3d8m_after_draw(%du, a1, a2, a3); }" % (hooked, body, kind))
                 body = hooked
                 manifest.append("mirror: %s" % name)
             wrappers.append(

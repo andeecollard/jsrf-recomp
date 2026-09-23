@@ -8,7 +8,12 @@
  * into a check item and writes a host token behind the draw's commands. The
  * token reaches the executor right after the draw it describes, and d3d8_host.c
  * compares the two. Read-only with respect to the title: the token is the only
- * thing written, and it never reaches PGRAPH. */
+ * thing written, and it never reaches PGRAPH.
+ *
+ * G41 adds vertex streams and indices: each draw wrapper passes the draw's
+ * three arguments, the snapshot derives every NV2A array slot's offset and
+ * format from D3D's stream table and vertex shader object (d3d8m_streams),
+ * and SetStreamSource / SetIndices hooks are carried along as a cross-check. */
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include "d3d8_host.h"
@@ -86,13 +91,70 @@ void d3d8m_set_texture(uint32_t stage, uint32_t tex)
     if (stage < 4) m_tex[stage] = tex;
 }
 
-void d3d8m_after_draw(void)
+/* G41 cross-check: what SetStreamSource(StreamNumber, pStreamData, Stride)
+ * and SetIndices(pIndexData, BaseVertexIndex) were handed, after the original
+ * ran. The check itself reads the device's own state at the draw. */
+static uint32_t m_hk_stride[16], m_hk_vb[16], m_hk_stream_seen, m_hk_ib, m_hk_base, m_hk_ib_seen;
+void d3d8m_set_stream_source(uint32_t stream, uint32_t vb, uint32_t stride)
+{
+    if (stream < 16) { m_hk_vb[stream] = vb; m_hk_stride[stream] = stride; m_hk_stream_seen |= 1u << stream; }
+}
+void d3d8m_set_indices(uint32_t ib, uint32_t base) { m_hk_ib = ib; m_hk_base = base; m_hk_ib_seen = 1; }
+
+/* G41: D3D's own stream/index state at the draw, and what its array setup
+ * (sub_00196520, called by both draws) derives from it per NV2A array slot:
+ *   D3D_g_Stream[16] at 0x19DCE8, 12 bytes: Stride, Offset, pVertexBuffer
+ *   device +0x380   the vertex shader object; obj+4 bit 0x10 selects the
+ *                   slot->attribute table at 0x22E554 (+0x10 when set)
+ *   obj + 16*attr + 0x14/0x18/0x1C  the attribute's stream, offset, format
+ *   0x1720+4i = pVB->Data + attr.offset + Stream.Offset + base*Stride
+ *   0x1760+4i = Stride << 8 | attr.format      (format 0x02 = disabled)
+ * base is device +0x1C for DrawIndexedVertices and 0 for DrawVertices. */
+static void d3d8m_streams(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    uint32_t d = MEM32(0x0019DCE0u), obj, tbl;
+    c->draw_kind = kind; c->prim = a1;
+    c->base_vertex = MEM32(d + 0x1Cu); c->ib = MEM32(d + 0x38Cu); c->ib_data = MEM32(0x0019DED4u);
+    if (kind == 2) {                 /* DrawIndexedVertices(prim, count, pIndexData) */
+        c->count = a2;
+        c->nidx = a2 < D3D8_HOST_IDX_N ? a2 : D3D8_HOST_IDX_N;
+        for (uint32_t k = 0; k < c->nidx; ++k) c->idx[k] = MEM16(a3 + 2u * k);
+    } else {                         /* DrawVertices(prim, start, count) */
+        c->start = a2; c->count = a3;
+        c->nidx = a3 < D3D8_HOST_IDX_N ? a3 : D3D8_HOST_IDX_N;
+        for (uint32_t k = 0; k < c->nidx; ++k) c->idx[k] = (uint16_t)(a2 + k);
+    }
+    for (unsigned s = 0; s < 16; ++s) {
+        c->st_stride[s] = MEM32(0x0019DCE8u + 12u * s);
+        c->st_offset[s] = MEM32(0x0019DCECu + 12u * s);
+        c->st_vb[s]     = MEM32(0x0019DCF0u + 12u * s);
+        c->st_data[s]   = c->st_vb[s] ? MEM32(c->st_vb[s] + 4u) : 0;
+    }
+    obj = MEM32(d + 0x380u);
+    if (obj) {
+        uint32_t base = kind == 2 ? c->base_vertex : 0;
+        tbl = 0x0022E554u + (MEM32(obj + 4u) & 0x10u);
+        for (unsigned i = 0; i < 16; ++i) {
+            uint32_t at = obj + 16u * MEM8(tbl + i), s = MEM32(at + 0x14u) & 15u, fmt = MEM32(at + 0x1Cu);
+            c->va_stream[i] = MEM32(at + 0x14u);
+            c->va_format[i] = (c->st_stride[s] << 8) + fmt;
+            if (fmt == 2u || !c->st_vb[s]) continue;
+            c->va_offset[i] = c->st_data[s] + MEM32(at + 0x18u) + c->st_offset[s] + base * c->st_stride[s];
+            if ((fmt >> 4) & 0xFu) c->va_on |= 1u << i;
+        }
+    }
+    memcpy(c->hk_stride, m_hk_stride, sizeof c->hk_stride); memcpy(c->hk_vb, m_hk_vb, sizeof c->hk_vb);
+    c->hk_stream_seen = m_hk_stream_seen; c->hk_ib = m_hk_ib; c->hk_base = m_hk_base; c->hk_ib_seen = m_hk_ib_seen;
+}
+
+void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     D3D8HostDrawCheck c;
     uint32_t tok, dev, put;
     if (!d3d8m_on()) return;
     memset(&c, 0, sizeof c);
     c.serial = ++m_serial;
+    d3d8m_streams(&c, kind, a1, a2, a3);
     /* G40: the bound textures come from the DEVICE, not from a SetTexture
      * hook. XbSymbolDatabase's offset dump names m_Textures at device +0xA78,
      * one pointer per stage. The hook mirror is kept beside it and every
@@ -171,7 +233,15 @@ void d3d8m_after_draw(void)
                    for (unsigned k = 0; k < 57; ++k) c.ps[k] ^= 0x1u;          /* and every shader word */
                    for (unsigned u = 0; u < 4; ++u) c.tss[u][0] ^= 0x2u;     /* and every stage's address */
                    if (c.vs_nwords) c.vs_words[0] ^= 1u;                     /* and every program */
-                   c.xf_world[12] += 10.0f; } }                                /* and the world translation */
+                   c.xf_world[12] += 10.0f;                                   /* and the world translation */
+                   /* G41: the first enabled array's stream moves 1 MB, so every array that
+                    * stream feeds misses both the exact and the inside-a-stream
+                    * test; and the first index (or the run start) is off by one. */
+                   if (c.va_on) {
+                       unsigned s0 = c.va_stream[__builtin_ctz(c.va_on)] & 15u;
+                       c.st_data[s0] += 0x100000u;
+                       for (unsigned i = 0; i < 16; ++i) if ((c.va_stream[i] & 15u) == s0) c.va_offset[i] += 0x100000u; }
+                   if (c.nidx) c.idx[0] ^= 1u; } }
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);

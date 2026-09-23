@@ -70,7 +70,30 @@ typedef struct {
     /* SetTransform: WORLD (6), VIEW (0), PROJECTION (1) in XDK 4134, as handed to D3D. */
     float    xf_world[16], xf_view[16], xf_proj[16];
     uint32_t xf_seen;          /* bit0 world, bit1 view, bit2 proj */
+    /* ---- G41: vertex streams and indices ----
+     * draw_kind: 0 unknown, 1 DrawVertices(prim, start, count), 2
+     * DrawIndexedVertices(prim, count, pIndexData). idx[] holds the first
+     * nidx (<= D3D8_HOST_IDX_N) indices D3D was handed; for DrawVertices the
+     * implied run start..start+count-1. */
+    uint32_t draw_kind, prim, count, start, nidx;
+    uint16_t idx[16];
+    /* The device's streams at the draw (D3D_g_Stream, 0x19DCE8, 12 bytes each:
+     * Stride, Offset, pVertexBuffer) and each vertex buffer's Data (+4). */
+    uint32_t st_stride[16], st_offset[16], st_vb[16], st_data[16];
+    /* The index state: BaseVertexIndex (device +0x1C), the index buffer
+     * (device +0x38C) and D3D's index base (0x19DED4 = pIB->Data). */
+    uint32_t base_vertex, ib, ib_data;
+    /* What D3D's array setup (sub_00196520) derives per NV2A array slot from
+     * the vertex shader object's attribute records (device +0x380; record at
+     * obj + 16*attr + 0x14: stream, offset, format) -- the 0x1720 offset
+     * Data + attr.offset + Stream.Offset + base*Stride and the 0x1760 word
+     * Stride << 8 | attr.format. va_on marks slots D3D enables (format size
+     * nibble nonzero and a vertex buffer bound). */
+    uint32_t va_on, va_stream[16], va_offset[16], va_format[16];
+    /* Cross-check: what the SetStreamSource / SetIndices hooks were handed. */
+    uint32_t hk_stride[16], hk_vb[16], hk_stream_seen, hk_ib, hk_base, hk_ib_seen;
 } D3D8HostDrawCheck;
+#define D3D8_HOST_IDX_N 16u
 /* Register <- definition word, exactly as SetPixelShader (0x199BE0) emits them. */
 #define D3D8_HOST_PS_PAIRS { {0x260,0}, {0x264,1}, {0x268,2}, {0x26C,3}, {0x270,4}, {0x274,5}, {0x278,6}, {0x27C,7}, {0xA60,10}, {0xA64,11}, {0xA68,12}, {0xA6C,13}, {0xA70,14}, {0xA74,15}, {0xA78,16}, {0xA7C,17}, {0xA80,18}, {0xA84,19}, {0xA88,20}, {0xA8C,21}, {0xA90,22}, {0xA94,23}, {0xA98,24}, {0xA9C,25}, {0xAA0,26}, {0xAA4,27}, {0xAA8,28}, {0xAAC,29}, {0xAB0,30}, {0xAB4,31}, {0xAB8,32}, {0xABC,33}, {0xAC0,34}, {0xAC4,35}, {0xAC8,36}, {0xACC,37}, {0xAD0,38}, {0xAD4,39}, {0xAD8,40}, {0xADC,41}, {0x17F8,42}, {0x1E20,43}, {0x1E24,44}, {0x1E40,45}, {0x1E44,46}, {0x1E48,47}, {0x1E4C,48}, {0x1E50,49}, {0x1E54,50}, {0x1E58,51}, {0x1E5C,52}, {0x1E60,53}, {0x1E74,55}, {0x1E78,56} }
 #define D3D8_HOST_PS_N 54
@@ -96,6 +119,11 @@ typedef struct {
     uint32_t vs_words[136 * 4];                /* the executor's program memory, slot 0 up */
     float    ff_modelview[16], ff_composite[16], ff_projection[16];   /* 0x480, 0x680, 0x440 */
     uint32_t exec_mode, prog_start, composite_ever_written, vsh_mode_internal;
+    /* G41: filled whether or not `active` is set. The executor's raw vertex
+     * array registers (0x1720/0x1760 + 4i) and the indices it drew last. */
+    int      va_valid;
+    uint32_t va_offset[16], va_format[16];
+    uint32_t idx_count, idx[16];
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -114,7 +142,15 @@ typedef struct {
     unsigned long long tss_compared, tss_match, tss_addr, tss_mag, tss_min, tss_bias;
     unsigned long long vs_draws_prog, vs_draws_fixed, vs_draws_unparsed, vs_draws_match, vs_words_compared;
     unsigned long long ff_compared, ff_match, ff_mv, ff_comp, ff_other;
+    /* G41 streams: arrays = NV2A array slots the executor enabled. */
+    unsigned long long va_draws, va_draws_all_match, va_arrays, va_exact, va_in_stream,
+                       va_no_d3d, va_stride, va_offset, va_format, va_exec_missing;
+    unsigned long long idx_draws, idx_match, idx_count_bad, idx_value_bad, idx_indexed, idx_indexed_match;
+    unsigned long long hk_stream_cmp, hk_stream_match, hk_ib_cmp, hk_ib_match;
 } D3D8HostStats;
+/* G41's comparison on its own, for the unit test: counts into the stats and
+ * returns 1 if every executor array and the indices agree with D3D. */
+int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);
 #endif
