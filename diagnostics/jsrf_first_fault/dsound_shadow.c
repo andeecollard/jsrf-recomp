@@ -157,7 +157,20 @@ static unsigned s_logged_outlier;
 
 /* Format lookup for the position comparison: kept beside the owned table. */
 #define FMT_MAX 4096
-static struct { uint32_t handle; uint32_t bytes_per_ms_x100; } s_fmt[FMT_MAX];
+static struct { uint32_t handle; uint32_t bytes_per_ms_x100; uint32_t size; } s_fmt[FMT_MAX];
+static void fmt_size(uint32_t h, uint32_t size)
+{
+    uint32_t k = (h >> 3) % FMT_MAX;
+    for (unsigned i = 0; i < FMT_MAX && s_fmt[k].handle; ++i, k = (k + 1) % FMT_MAX)
+        if (s_fmt[k].handle == h) { s_fmt[k].size = size; return; }
+}
+static uint32_t fmt_get_size(uint32_t h)
+{
+    uint32_t k = (h >> 3) % FMT_MAX;
+    for (unsigned i = 0; i < FMT_MAX && s_fmt[k].handle; ++i, k = (k + 1) % FMT_MAX)
+        if (s_fmt[k].handle == h) return s_fmt[k].size;
+    return 0;
+}
 static void fmt_note(uint32_t h, const dsh_format *f)
 {
     uint32_t k = (h >> 3) % FMT_MAX;
@@ -188,6 +201,7 @@ void dss_after(const char *name, const uint32_t *a, uint32_t eax)
         if (dsh_buffer_create(h, &f, 0, bytes) == 0) {
             atomic_fetch_add(&s_create_ok, 1);
             fmt_note(h, &f);
+            fmt_size(h, bytes);
             if (bytes && s_owned_n < OWNED_MAX) {
                 s_owned[s_owned_n].handle = h; s_owned[s_owned_n].bytes = bytes; s_owned[s_owned_n].base = 0;
                 s_owned_n++;
@@ -199,6 +213,7 @@ void dss_after(const char *name, const uint32_t *a, uint32_t eax)
         }
     } else if (!strcmp(n, "IDirectSoundBuffer_SetBufferData")) {
         dsh_set_buffer_data(a[0], a[1], a[2]);
+        fmt_size(a[0], a[2]);
     } else if (!strcmp(n, "IDirectSoundBuffer_Lock")) {
         uint32_t p1 = MEM32(a[3]);
         for (unsigned i = 0; i < s_owned_n; ++i)
@@ -248,6 +263,10 @@ void dss_after(const char *name, const uint32_t *a, uint32_t eax)
         dsh_get_current_position(a[0], &mp, NULL);
         uint32_t bpms = fmt_bpms(a[0]);
         uint32_t diff = dp > mp ? dp - mp : mp - dp;
+        /* Circular: a stream buffer wraps, and a model just past the end is
+         * a few ms ahead of a DSOUND just before it, not a buffer apart. */
+        uint32_t size = fmt_get_size(a[0]);
+        if (size && diff > size / 2u) diff = size - diff;
         uint32_t ms = bpms ? (uint32_t)((uint64_t)diff * 100u / bpms) : 0xFFFFFFFFu;
         static const uint32_t edge[7] = { 1, 5, 10, 20, 50, 100, 500 };
         unsigned b = 7;

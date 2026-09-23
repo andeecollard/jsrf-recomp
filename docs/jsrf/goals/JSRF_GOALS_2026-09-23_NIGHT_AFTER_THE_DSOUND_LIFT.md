@@ -139,3 +139,33 @@ glitches. None of this is explained yet.
 4. §3, once the player confirms.
 5. §6.1 in a later player session. §5 continues between sessions.
 6. §2f when the Windows build is next touched.
+
+## Results of §2, 23 Sep (night)
+
+- **§2a: done** (`34ca455`). `RECOMP_DSOUND_LIFT_WAV` and `wav_report.py`.
+  A 150 s tutorial on the lift: 0 clipped samples, 1 dropout.
+- **§2b: done, with a limit.** The player's hung-session recording
+  (`graffiti-2026-09-23_2025.padrec`) replayed on the lift:
+  - 1,226 s, 0 faults, 0 ABI mismatches over 1,282,391 calls;
+  - every one-second frame sample non-black (1,219 of 1,219).
+
+  The recording's anchors are constant, so the scene is UNVERIFIED. The run
+  stayed in game sequence 58 and started only 25 sounds; it almost certainly
+  drifted off the player's route. So it proves stability, not that the
+  cop-fight hang is gone. That still needs the player.
+- **§2c: done** (`07cd6aa`). 3D is the only ignored feature the title uses.
+  - 161 of 231 buffers are 3D.
+  - The listener moves every frame.
+  - Reverb is always off.
+  - EG, LFO, filter, effect data and mix bins are never called.
+
+  3D distance falloff and pan are now modelled and tested. Its absence
+  explains the replay WAV's 21 clipped samples.
+- **§2d: done.** Nearly all of the "outliers" were the comparison ignoring
+  wrap-around in the circular stream buffers. Measured wrap-aware, 2,570 of
+  2,570 cursor answers agree within 20 ms (96.6% within 10 ms), with the
+  model slightly ahead. The cursor does not explain the reported speed changes.
+- **§2e: done** (`07cd6aa`). The `JSRF_DSOUND_LIFT` configure-time overlay;
+  build-feav carries the lift.
+- **§2f: code done** (`07cd6aa`). XAudio2 output compiles under mingw-w64.
+  Not yet run on Windows; the overlay stays off there.
