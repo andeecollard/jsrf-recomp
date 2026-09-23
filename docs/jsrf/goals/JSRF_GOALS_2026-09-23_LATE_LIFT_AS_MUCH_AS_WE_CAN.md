@@ -209,3 +209,8 @@ against a known-bad frame and not from memory.
 - **Agents, 24 Sep:** G43's static transcription of D3D's fixed-function
   combiner builder, and G41 (streams and indices in the mirror), each in its
   own worktree. Neither runs the game; the lead runs their builds.
+- **G54.2: done (24 Sep).** `RECOMP_DSOUND_LIFT` is default ON in code;
+  `=0` is the APU path.
+- **Upstream:** PR #121 (ADPCM reserved byte and index clamp, with
+  tests/adpcm_decode) opened. The KeSetEvent and OHCI fixes were checked
+  and do not port.

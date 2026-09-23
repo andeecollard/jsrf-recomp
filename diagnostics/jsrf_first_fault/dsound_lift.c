@@ -38,8 +38,13 @@ static int g_lift = -1;
 int dsl_on(void)
 {
     if (g_lift < 0) {
+        /* DEFAULT ON since 24 Sep 2026 (G54.2): three player sessions of
+         * 23 Sep on the lift -- 797 s, 1,005 s and the music check -- with 0
+         * faults, 1,340 and 1,857 plays, 0 bad handles or missing data, the
+         * cop-fight hang gone and "music seems to work great". Unset or any
+         * value but "0" is on; RECOMP_DSOUND_LIFT=0 is the old APU path. */
         const char *v = getenv("RECOMP_DSOUND_LIFT");
-        g_lift = v && strcmp(v, "1") == 0;
+        g_lift = !(v && strcmp(v, "0") == 0);
         fprintf(stderr, "[DSOUND-LIFT] RECOMP_DSOUND_LIFT=%s\n", g_lift ? "on" : "off");
     }
     return g_lift;
