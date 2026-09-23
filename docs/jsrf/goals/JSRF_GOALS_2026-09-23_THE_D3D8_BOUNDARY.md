@@ -339,3 +339,65 @@ surface, not a surface of its own. The candidates, by the census, are
 - Launch runs detached. Check `pgrep` before quoting counters.
 - Don't edit sources during a run. `play_scripted.sh` exits on a stale binary.
 - The working tree carries uncommitted ADX/USB work that is not this track's. Builds for this track include it, and every report says so.
+
+## Next goals, 23 Sep 2026 (evening): G36–G38
+
+The player said "set goals keep pushing" after the idle-host A/Bs.
+
+### G36 — hardware texture sampling becomes the default
+
+`RECOMP_METAL_HW_TEX=1` is in the player's `paths.conf` as of 23 Sep, and
+JSRF.app is rebuilt from the build that carries it. Checked with `strings`:
+the switch is present, the positive control is present, the nonsense
+control is absent. The previous `paths.conf` and `last-run.log` were saved
+as `*.bak-20260923-hwtex`.
+
+**Done when:** one played session with the switch on reports nothing wrong
+with textures. Then the default flips in `nv2a_metal.m` (`hw_tex_on`), with
+empty treated as the default under the switch audit's rule 2, in a commit
+that quotes the session.
+
+### G37 — the first D3D entry point drawn by the host (G35, step 2)
+
+**Target: `D3DDevice_Clear`** (2.5 calls per frame, 6 stack arguments, and
+self-contained).
+- **The replacement.** It queues its arguments and writes one host token
+  into the ring in place of the original's commands. At token time, on the
+  executor thread and in ring order, the handler sets the clear rectangle
+  and the colour and depth/stencil values the original's methods would have
+  set, then runs the executor's own `clear_surface()`.
+- **What must be read first.** The exact commands and device-field writes
+  of the original, from its code (`0x193830`, 24-byte pop). Anything it
+  changes that later draws depend on must be reproduced.
+
+**Done when:**
+1. the command list and state effects are written down from the disassembly;
+2. an in-process differential test shows that the executor state after
+   running the original's commands equals the state after the token
+   handler, over the clear-state fields, for a table of argument cases;
+3. a silenced tutorial run with the replacement on shows 0 faults, the same
+   scene, and `host_tokens` equal to the `Clear` call count.
+
+### G38 — can the depth-writing alpha-tested draws ever discard?
+
+The 2.3 ms early-Z ceiling is entirely in draws that are alpha-tested with
+reference 0 AND write depth (G27b above). A fragment of such a draw is
+discarded only if its final alpha rounds to 0.
+
+**First, measure; do not build.** Classify those draws per frame by where
+their final alpha comes from:
+- no combiners: diffuse alpha, optionally times texture alpha;
+- combiners: the alpha output chain.
+
+For the diffuse alpha, which the guest vertex program writes, read the
+program: is `oD0.w` a constant register, an input attribute, or computed?
+
+**Done when** a table says how many of those draws have an alpha source
+provably above 0. That decides whether an exact early-Z for them is days of
+work or impossible.
+
+### Order
+
+1. **G36.** It waits on the player and costs nothing meanwhile.
+2. **G37.** The lift track's next step.
+3. **G38.** It measures before any build.
