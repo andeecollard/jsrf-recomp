@@ -18,6 +18,7 @@
  * written, and freed by the consumer after replay; a producer that finds its
  * slot still busy gets 0 back and must fall back to the original. */
 #include <stdint.h>
+#include "d3d8_ff_combiner.h"
 
 #define D3D8_HOST_MAX_METHODS 64u
 
@@ -92,7 +93,47 @@ typedef struct {
     uint32_t va_on, va_stream[16], va_offset[16], va_format[16];
     /* Cross-check: what the SetStreamSource / SetIndices hooks were handed. */
     uint32_t hk_stride[16], hk_vb[16], hk_stream_seen, hk_ib, hk_base, hk_ib_seen;
+    /* ---- G43: fixed-function combiners ----
+     * D3D builds them LAZILY: the flusher 0x1964A0 runs the builder 0x197F90
+     * only when dirty bit 0x800 of 0x19DED8 is set, and the fog updater
+     * 0x195610 (SPECULAR_FOG_CW0/1) only on 0x2000. So the executor's
+     * registers at a draw are whatever those last emitted. The mirror keeps
+     * both the builder's inputs at its last EMITTING entry (a hook on
+     * 0x197F90 / 0x195610 in the staged gen) and the same inputs read at the
+     * draw; the check transcribes the former and reports how often the
+     * latter would have differed. ffc_valid = the mirror filled this block. */
+    uint32_t ffc_valid;
+    uint32_t ffc_ps;                    /* device +0x370 at the draw: nonzero = not fixed-function */
+    D3D8FFCombinerIn ffc_cur;           /* the builder's inputs, read at the draw */
+    uint32_t ffc_emit_seen;             /* 0x197F90 has emitted since the mirror armed */
+    uint32_t ffc_emit_fresh;            /* ... and did so inside this draw's flush */
+    D3D8FFCombinerIn ffc_emit;          /* its inputs at the last emission */
+    uint32_t tfactor;                   /* D3D_g_RenderState[129] (0x19E2E4) at the draw */
+    /* Fog updater inputs {RS[82] FOGENABLE, RS[93] SPECULARENABLE, device
+     * +0x370, device +0x374}: at the draw, and at its last CW-writing entry. */
+    uint32_t fog_cur[4], fog_emit_seen, fog_emit[4];
+    uint32_t ffc_control;               /* RECOMP_D3D8_MIRROR_CONTROL: perturb one transcribed word */
 } D3D8HostDrawCheck;
+/* G43: the combiner registers compared, one word each, in this order. */
+#define D3D8_HOST_FFC_N 51u
+typedef struct {
+    uint32_t w[D3D8_HOST_FFC_N];
+} D3D8CombinerRegs;
+/* NV2A method of word k of D3D8CombinerRegs. Inline so the executor, which
+ * some unit tests build without d3d8_host.c, can use it. */
+static inline uint32_t d3d8_host_ffc_method(unsigned k)
+{
+    if (k == 0) return 0x1E60u;                      /* COMBINER_CONTROL */
+    if (k < 9)  return 0x0AC0u + 4u * (k - 1u);      /* COLOR_ICW[0..7] */
+    if (k < 17) return 0x1E40u + 4u * (k - 9u);      /* COLOR_OCW[0..7] */
+    if (k < 25) return 0x0260u + 4u * (k - 17u);     /* ALPHA_ICW[0..7] */
+    if (k < 33) return 0x0AA0u + 4u * (k - 25u);     /* ALPHA_OCW[0..7] */
+    if (k < 41) return 0x0A60u + 4u * (k - 33u);     /* FACTOR0[0..7] */
+    if (k < 49) return 0x0A80u + 4u * (k - 41u);     /* FACTOR1[0..7] */
+    return k == 49 ? 0x0288u : 0x028Cu;              /* SPECULAR_FOG_CW0/1 */
+}
+/* A name for word k, for the report. */
+const char *d3d8_host_ffc_name(unsigned k, char *buf, unsigned n);
 #define D3D8_HOST_IDX_N 16u
 /* Register <- definition word, exactly as SetPixelShader (0x199BE0) emits them. */
 #define D3D8_HOST_PS_PAIRS { {0x260,0}, {0x264,1}, {0x268,2}, {0x26C,3}, {0x270,4}, {0x274,5}, {0x278,6}, {0x27C,7}, {0xA60,10}, {0xA64,11}, {0xA68,12}, {0xA6C,13}, {0xA70,14}, {0xA74,15}, {0xA78,16}, {0xA7C,17}, {0xA80,18}, {0xA84,19}, {0xA88,20}, {0xA8C,21}, {0xA90,22}, {0xA94,23}, {0xA98,24}, {0xA9C,25}, {0xAA0,26}, {0xAA4,27}, {0xAA8,28}, {0xAAC,29}, {0xAB0,30}, {0xAB4,31}, {0xAB8,32}, {0xABC,33}, {0xAC0,34}, {0xAC4,35}, {0xAC8,36}, {0xACC,37}, {0xAD0,38}, {0xAD4,39}, {0xAD8,40}, {0xADC,41}, {0x17F8,42}, {0x1E20,43}, {0x1E24,44}, {0x1E40,45}, {0x1E44,46}, {0x1E48,47}, {0x1E4C,48}, {0x1E50,49}, {0x1E54,50}, {0x1E58,51}, {0x1E5C,52}, {0x1E60,53}, {0x1E74,55}, {0x1E78,56} }
@@ -124,6 +165,10 @@ typedef struct {
     int      va_valid;
     uint32_t va_offset[16], va_format[16];
     uint32_t idx_count, idx[16];
+    /* G43: filled whether or not `active` is set. The executor's latched
+     * combiner registers (method shadow) in D3D8CombinerRegs order. */
+    int      ffc_valid;
+    D3D8CombinerRegs ffc;
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -147,10 +192,26 @@ typedef struct {
                        va_no_d3d, va_stride, va_offset, va_format, va_exec_missing;
     unsigned long long idx_draws, idx_match, idx_count_bad, idx_value_bad, idx_indexed, idx_indexed_match;
     unsigned long long hk_stream_cmp, hk_stream_match, hk_ib_cmp, hk_ib_match;
+    /* G43 fixed-function combiners. */
+    unsigned long long ffc_draws, ffc_ps_skipped, ffc_all_match, ffc_builder_match, ffc_factor_match,
+                       ffc_final_match, ffc_final_skipped, ffc_unresolved, ffc_no_emit, ffc_fresh,
+                       ffc_lazy_differs, ffc_exec_cur_only, ffc_exec_emit_only;
+    unsigned long long ffc_word_mismatch[D3D8_HOST_FFC_N];
+    unsigned long long ffc_tally_overflow;
+    unsigned ffc_tally_pairs;
 } D3D8HostStats;
 /* G41's comparison on its own, for the unit test: counts into the stats and
  * returns 1 if every executor array and the indices agree with D3D. */
 int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
+/* G43's comparison on its own, for the unit test: the transcription of the
+ * builder (on the last-emitted inputs), SetRenderState_TextureFactor and the
+ * fog updater, against the executor's latched registers. Returns 1 if every
+ * compared register agrees (or the draw is not compared), 0 otherwise.
+ * `expect`, when not NULL, receives the transcribed register set. */
+int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e, D3D8CombinerRegs *expect);
+/* G43 discovery: the distinct (stage words, TFACTOR) -> register pairings seen
+ * at fixed-function draws, the `top` most frequent printed. */
+void d3d8_host_ffc_tally_report(const char *why, unsigned top);
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);
 #endif

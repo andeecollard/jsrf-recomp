@@ -138,6 +138,257 @@ int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextur
     return all && ix_ok;
 }
 
+/* ---- G43: fixed-function combiners ----
+ *
+ * WHICH D3D STATE THE REGISTERS CAME FROM. D3D builds the combiners lazily:
+ * the flusher 0x1964A0 (called at the head of every draw) runs the builder
+ * 0x197F90 only when dirty bit 0x800 of 0x19DED8 is set, and the fog updater
+ * 0x195610 (the only fixed-function writer of SPECULAR_FOG_CW0/1) only on
+ * 0x2000. Whatever the executor holds at a draw is what those two last
+ * emitted. So the reference is the transcription evaluated on the inputs they
+ * had when they last EMITTED -- captured by hooks on their entries in the
+ * staged gen (ffc_emit / fog_emit) -- and not on the state at the draw.
+ *
+ * The state at the draw is still transcribed beside it, and every draw where
+ * the two disagree is counted, with which of the two the executor matched.
+ * Read statically, they should never disagree: every input the builder reads
+ * dirties 0x800 when it changes -- SetTexture (0x18DF10) sets 0x800 on a
+ * change to or from NULL, SetPixelShader(NULL) (0x199BE0) sets 0x4800 -- and
+ * the draw itself changes none of them between its flush and the mirror's
+ * snapshot. A nonzero count is a dirty-bit path the static read missed.
+ *
+ * FACTOR0/1 are NOT lazy. SetRenderState_TextureFactor (0x18ECC0) writes all
+ * sixteen at once whenever no pixel shader is bound and otherwise only stores
+ * D3D_g_RenderState[129]; SetPixelShader(NULL) clears device +0x370 and then
+ * calls it with RenderState[129]. So at a fixed-function draw the registers
+ * hold the current RenderState[129], and that is what is transcribed. */
+static _Atomic unsigned long long s_ffc_draws, s_ffc_ps, s_ffc_all, s_ffc_builder, s_ffc_factor, s_ffc_final,
+                                  s_ffc_final_skip, s_ffc_unres, s_ffc_noemit, s_ffc_fresh, s_ffc_lazy,
+                                  s_ffc_cur_only, s_ffc_emit_only, s_ffc_word_mm[D3D8_HOST_FFC_N];
+static _Atomic unsigned s_ffc_printed;
+
+const char *d3d8_host_ffc_name(unsigned k, char *buf, unsigned n)
+{
+    static const char *const grp[6] = { "COLOR_ICW", "COLOR_OCW", "ALPHA_ICW", "ALPHA_OCW", "FACTOR0", "FACTOR1" };
+    if (k == 0) snprintf(buf, n, "COMBINER_CONTROL");
+    else if (k < 49) snprintf(buf, n, "%s[%u]", grp[(k - 1u) / 8u], (k - 1u) % 8u);
+    else snprintf(buf, n, "SPECULAR_FOG_CW%u", k - 49u);
+    return buf;
+}
+#define FFC_BUILDER_END 33u   /* words 0..32 come from 0x197F90 */
+#define FFC_FACTOR_END  49u   /* 33..48 from 0x18ECC0, 49..50 from 0x195610 */
+static void ffc_from_builder(const D3D8FFCombiners *o, D3D8CombinerRegs *x)
+{
+    x->w[0] = o->combiner_control;
+    memcpy(&x->w[1], o->color_icw, 32); memcpy(&x->w[9], o->color_ocw, 32);
+    memcpy(&x->w[17], o->alpha_icw, 32); memcpy(&x->w[25], o->alpha_ocw, 32);
+}
+static int ffc_builder_eq(const D3D8CombinerRegs *a, const D3D8CombinerRegs *b)
+{
+    return !memcmp(a->w, b->w, FFC_BUILDER_END * sizeof a->w[0]);
+}
+/* The builder's inputs, one group per stage until the chain ends. */
+static void ffc_fmt_inputs(char *buf, size_t n, const D3D8FFCombinerIn *in, uint32_t tfactor, const uint32_t fog[4])
+{
+    size_t at = 0;
+    at += (size_t)snprintf(buf + at, n - at, "sprite=%u spec=%u tex=%X dev8=%08X tf=%08X fog=%u |",
+                           in->point_sprite_enable, in->specular_enable, in->texture_bound_mask,
+                           in->device_flags, tfactor, fog[0]);
+    for (unsigned s = in->point_sprite_enable ? 3u : 0u; s < 4 && at < n; ++s) {
+        const uint32_t *t = in->tss[s];
+        at += (size_t)snprintf(buf + at, n - at, " s%u cop %u(%X,%X,%X) aop %u(%X,%X,%X) res %u", s,
+                               t[12], t[13], t[14], t[15], t[16], t[17], t[18], t[19], t[20]);
+        if (t[12] == D3D8FF_TOP_DISABLE) break;
+    }
+}
+static void ffc_fmt_regs(char *buf, size_t n, const D3D8CombinerRegs *r, unsigned stages)
+{
+    size_t at = (size_t)snprintf(buf, n, "ctl=%X", r->w[0]);
+    for (unsigned i = 0; i < stages && at < n; ++i)
+        at += (size_t)snprintf(buf + at, n - at, " [%u] c %08X>%08X a %08X>%08X", i,
+                               r->w[1 + i], r->w[9 + i], r->w[17 + i], r->w[25 + i]);
+    if (at < n)
+        snprintf(buf + at, n - at, " f0=%08X f1=%08X cw=%08X,%08X", r->w[33], r->w[41], r->w[49], r->w[50]);
+}
+
+/* Discovery tally: key = the inputs the registers were built from (the stage
+ * words of the stages the builder consumed, their texture-bound bits, the
+ * COLOROP that ended the chain, point sprite, TFACTOR, FOGENABLE,
+ * SPECULARENABLE); value = the executor's registers. Filled on the ring
+ * consumer thread; the lock only keeps a print from reading a half-written
+ * entry. */
+#define FFC_KEY_N 42u
+#define FFC_TALLY_SLOTS 4096u
+typedef struct { uint64_t hash; unsigned long long count; uint32_t key[FFC_KEY_N]; D3D8CombinerRegs regs; } FfcTally;
+static FfcTally s_ffc_tally[FFC_TALLY_SLOTS];
+static unsigned s_ffc_tally_used;
+static _Atomic unsigned long long s_ffc_tally_overflow;
+static atomic_flag s_ffc_tally_lock = ATOMIC_FLAG_INIT;
+static void ffc_lock(void) { while (atomic_flag_test_and_set_explicit(&s_ffc_tally_lock, memory_order_acquire)) { } }
+static void ffc_unlock(void) { atomic_flag_clear_explicit(&s_ffc_tally_lock, memory_order_release); }
+static uint64_t fnv(uint64_t h, const uint32_t *w, unsigned n)
+{
+    for (unsigned i = 0; i < n; ++i) { h ^= w[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+static void ffc_key(uint32_t key[FFC_KEY_N], const D3D8FFCombinerIn *in, const D3D8FFCombiners *o, int unres,
+                    uint32_t tfactor, const uint32_t fog[4])
+{
+    unsigned first = in->point_sprite_enable ? 3u : 0u, count = o->combiner_control & 0xFu, last;
+    memset(key, 0, FFC_KEY_N * sizeof key[0]);
+    last = unres || !count ? 4u : first + count;       /* one past the last consumed stage */
+    for (unsigned s = first; s < 4; ++s) {
+        if (s < last) {
+            for (unsigned k = 0; k < 9; ++k) key[9u * s + k] = in->tss[s][12 + k];
+            key[36] |= in->texture_bound_mask & (1u << s);
+        } else { key[9u * s] = in->tss[s][12]; break; }  /* the COLOROP that ended the chain */
+    }
+    key[37] = in->point_sprite_enable != 0; key[38] = tfactor; key[39] = fog[0] != 0; key[40] = in->specular_enable != 0;
+    key[41] = (uint32_t)unres;
+}
+static void ffc_tally_add(const uint32_t key[FFC_KEY_N], const D3D8CombinerRegs *r)
+{
+    uint64_t h = fnv(fnv(0xCBF29CE484222325ull, key, FFC_KEY_N), r->w, D3D8_HOST_FFC_N);
+    if (!h) h = 1;
+    ffc_lock();
+    for (unsigned p = 0; p < FFC_TALLY_SLOTS; ++p) {
+        FfcTally *t = &s_ffc_tally[(h + p) % FFC_TALLY_SLOTS];
+        if (!t->hash) {
+            if (s_ffc_tally_used >= FFC_TALLY_SLOTS * 3u / 4u) break;
+            t->hash = h; t->count = 1; memcpy(t->key, key, sizeof t->key); t->regs = *r;
+            ++s_ffc_tally_used; ffc_unlock(); return;
+        }
+        if (t->hash == h && !memcmp(t->key, key, sizeof t->key) && !memcmp(&t->regs, r, sizeof *r)) {
+            ++t->count; ffc_unlock(); return;
+        }
+    }
+    ffc_unlock();
+    atomic_fetch_add(&s_ffc_tally_overflow, 1);
+}
+void d3d8_host_ffc_tally_report(const char *why, unsigned top)
+{
+    static FfcTally snap[FFC_TALLY_SLOTS];
+    static char line[2600], a[1024], b[1200];
+    unsigned n = 0, inputs = 0, ambiguous = 0;
+    unsigned long long total = 0;
+    ffc_lock();
+    for (unsigned i = 0; i < FFC_TALLY_SLOTS; ++i) if (s_ffc_tally[i].hash) snap[n++] = s_ffc_tally[i];
+    ffc_unlock();
+    for (unsigned i = 0; i < n; ++i) {
+        int seen = 0, other = 0;
+        total += snap[i].count;
+        for (unsigned j = 0; j < n; ++j) {
+            if (j == i || memcmp(snap[j].key, snap[i].key, sizeof snap[i].key)) continue;
+            if (j < i) seen = 1;
+            other = 1;
+        }
+        if (!seen) { ++inputs; if (other) ++ambiguous; }
+    }
+    fprintf(stderr, "[D3D8-MIRROR] %s ff combiner setups: %u distinct (stage words, TFACTOR) -> executor-register pairings"
+                    " over %llu fixed-function draws; %u distinct inputs, %u of them seen with more than one register set;"
+                    " tally overflow %llu\n", why, n, total, inputs, ambiguous, atomic_load(&s_ffc_tally_overflow));
+    for (unsigned r = 0; r < top && r < n; ++r) {
+        unsigned best = r, first;
+        size_t at = 0;
+        for (unsigned j = r + 1; j < n; ++j) if (snap[j].count > snap[best].count) best = j;
+        if (best != r) { FfcTally t = snap[r]; snap[r] = snap[best]; snap[best] = t; }
+        const uint32_t *k = snap[r].key;
+        first = k[37] ? 3u : 0u;
+        a[0] = 0;
+        for (unsigned s = first; s < 4 && at < sizeof a; ++s) {
+            const uint32_t *t = &k[9u * s];
+            if (!t[0] && !k[41]) break;
+            if (t[0] == D3D8FF_TOP_DISABLE && s > first) {
+                at += (size_t)snprintf(a + at, sizeof a - at, " s%u:end", s); break; }
+            at += (size_t)snprintf(a + at, sizeof a - at, " s%u:c%u(%X,%X,%X) a%u(%X,%X,%X) r%u%s", s,
+                                   t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8],
+                                   (k[36] >> s) & 1u ? "" : " notex");
+        }
+        {   unsigned st = snap[r].regs.w[0] & 0xFu; if (!st) st = 1; if (st > 8) st = 8;
+            ffc_fmt_regs(b, sizeof b, &snap[r].regs, st); }
+        snprintf(line, sizeof line, "[D3D8-MIRROR] %s ff setup #%u: %llu draws (%.2f%%)%s tf=%08X fog=%u spec=%u%s%s -> %s\n",
+                 why, r + 1, snap[r].count, total ? 100.0 * (double)snap[r].count / (double)total : 0.0, a,
+                 k[38], k[39], k[40], k[37] ? " pointsprite" : "", k[41] ? " UNRESOLVED" : "", b);
+        fputs(line, stderr);
+    }
+    fflush(stderr);
+}
+
+int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e, D3D8CombinerRegs *expect)
+{
+    D3D8FFCombiners o, oc;
+    D3D8CombinerRegs x, xc;
+    const D3D8FFCombinerIn *in;
+    const uint32_t *fog;
+    uint32_t key[FFC_KEY_N];
+    int unres, fin, all = 1, ok_b = 1, ok_f = 1, ok_c = 1;
+    unsigned nbad = 0;
+    if (!c->ffc_valid || !e->ffc_valid) return 1;
+    if (c->ffc_ps) { atomic_fetch_add(&s_ffc_ps, 1); return 1; }
+    atomic_fetch_add(&s_ffc_draws, 1);
+    if (c->ffc_emit_fresh) atomic_fetch_add(&s_ffc_fresh, 1);
+    if (!c->ffc_emit_seen) atomic_fetch_add(&s_ffc_noemit, 1);
+    in = c->ffc_emit_seen ? &c->ffc_emit : &c->ffc_cur;
+    fog = c->fog_emit_seen ? c->fog_emit : c->fog_cur;
+    memset(&x, 0, sizeof x); memset(&o, 0, sizeof o);
+    unres = d3d8_ff_combiners(in, &o) < 0;
+    if (unres) atomic_fetch_add(&s_ffc_unres, 1);
+    ffc_from_builder(&o, &x);
+    d3d8_ff_texture_factor(c->tfactor, 0, &x.w[33], &x.w[41]);
+    fin = d3d8_ff_final_combiner(fog[0], fog[1], fog[2], fog[3], &x.w[49], &x.w[50]);
+    if (!fin) atomic_fetch_add(&s_ffc_final_skip, 1);
+    /* Laziness, measured: would the state at the draw have given other words? */
+    if (c->ffc_emit_seen) {
+        memset(&xc, 0, sizeof xc); memset(&oc, 0, sizeof oc);
+        d3d8_ff_combiners(&c->ffc_cur, &oc);
+        ffc_from_builder(&oc, &xc);
+        if (!ffc_builder_eq(&x, &xc)) {
+            int m_emit = ffc_builder_eq(&x, &e->ffc), m_cur = ffc_builder_eq(&xc, &e->ffc);
+            atomic_fetch_add(&s_ffc_lazy, 1);
+            if (m_cur && !m_emit) atomic_fetch_add(&s_ffc_cur_only, 1);
+            if (m_emit && !m_cur) atomic_fetch_add(&s_ffc_emit_only, 1);
+        }
+    }
+    if (c->ffc_control) x.w[1] ^= 1u;       /* positive control: COLOR_ICW[0] must mismatch */
+    if (expect) *expect = x;
+    for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k) {
+        if (k < FFC_BUILDER_END && unres) continue;
+        if (k >= FFC_FACTOR_END && !fin) continue;
+        if (x.w[k] == e->ffc.w[k]) continue;
+        atomic_fetch_add(&s_ffc_word_mm[k], 1);
+        ++nbad; all = 0;
+        if (k < FFC_BUILDER_END) ok_b = 0; else if (k < FFC_FACTOR_END) ok_f = 0; else ok_c = 0;
+    }
+    if (!unres && ok_b) atomic_fetch_add(&s_ffc_builder, 1);
+    if (ok_f) atomic_fetch_add(&s_ffc_factor, 1);
+    if (fin && ok_c) atomic_fetch_add(&s_ffc_final, 1);
+    if (all && !unres && fin) atomic_fetch_add(&s_ffc_all, 1);
+    if (!all && atomic_fetch_add(&s_ffc_printed, 1) < 8) {
+        char ib[1024], rb[1200], nm[32];
+        unsigned st = x.w[0] & 0xFu, se = e->ffc.w[0] & 0xFu;
+        if (se > st) st = se;
+        if (!st) st = 1;
+        if (st > 8) st = 8;
+        ffc_fmt_inputs(ib, sizeof ib, in, c->tfactor, fog);
+        fprintf(stderr, "[D3D8-MIRROR] draw %u ff combiner MISMATCH, %u registers%s: inputs (%s, %s) %s\n",
+                c->serial, nbad, c->ffc_control ? " [control]" : "",
+                c->ffc_emit_seen ? "as last emitted" : "at the draw, no emission seen",
+                c->ffc_emit_fresh ? "emitted in this draw's flush" : "emitted by an earlier draw", ib);
+        for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k) {
+            if ((k < FFC_BUILDER_END && unres) || (k >= FFC_FACTOR_END && !fin) || x.w[k] == e->ffc.w[k]) continue;
+            fprintf(stderr, "[D3D8-MIRROR]   %-18s %04X: d3d %08X | exec %08X\n",
+                    d3d8_host_ffc_name(k, nm, sizeof nm), d3d8_host_ffc_method(k), x.w[k], e->ffc.w[k]);
+        }
+        ffc_fmt_regs(rb, sizeof rb, &x, st);
+        fprintf(stderr, "[D3D8-MIRROR]   d3d  %s\n", rb);
+        ffc_fmt_regs(rb, sizeof rb, &e->ffc, st);
+        fprintf(stderr, "[D3D8-MIRROR]   exec %s\n", rb);
+    }
+    ffc_key(key, in, &o, unres, c->tfactor, fog);
+    ffc_tally_add(key, &e->ffc);
+    return all;
+}
+
 /* NV2A format byte from a D3D Format word, and the shape it implies. */
 static void check_draw(const D3D8HostDrawCheck *c)
 {
@@ -147,6 +398,15 @@ static void check_draw(const D3D8HostDrawCheck *c)
     memset(&e, 0, sizeof e);
     s_exec_source(&e);
     d3d8_host_check_streams(c, &e);
+    /* G43: the combiner registers are latched method words, meaningful
+     * whether or not the executor drew. The tally is printed cumulatively
+     * every 100,000 fixed-function draws, because runs here end in kill -9
+     * and an atexit print alone would never be seen. */
+    d3d8_host_check_combiners(c, &e, NULL);
+    {
+        unsigned long long n = atomic_load(&s_ffc_draws);
+        if (n && n % 100000u == 0 && c->ffc_valid && !c->ffc_ps) d3d8_host_ffc_tally_report("periodic", 20);
+    }
     if (!e.active) { atomic_fetch_add(&s_chk_inactive, 1); return; }
     for (unsigned u = 0; u < 4; ++u) {
         if (!(e.mask & (1u << u))) continue;
@@ -434,6 +694,16 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->idx_indexed = atomic_load(&s_ix_indexed); o->idx_indexed_match = atomic_load(&s_ix_indexed_match);
     o->hk_stream_cmp = atomic_load(&s_hk_st_cmp); o->hk_stream_match = atomic_load(&s_hk_st_match);
     o->hk_ib_cmp = atomic_load(&s_hk_ib_cmp); o->hk_ib_match = atomic_load(&s_hk_ib_match);
+    o->ffc_draws = atomic_load(&s_ffc_draws); o->ffc_ps_skipped = atomic_load(&s_ffc_ps);
+    o->ffc_all_match = atomic_load(&s_ffc_all); o->ffc_builder_match = atomic_load(&s_ffc_builder);
+    o->ffc_factor_match = atomic_load(&s_ffc_factor); o->ffc_final_match = atomic_load(&s_ffc_final);
+    o->ffc_final_skipped = atomic_load(&s_ffc_final_skip); o->ffc_unresolved = atomic_load(&s_ffc_unres);
+    o->ffc_no_emit = atomic_load(&s_ffc_noemit); o->ffc_fresh = atomic_load(&s_ffc_fresh);
+    o->ffc_lazy_differs = atomic_load(&s_ffc_lazy); o->ffc_exec_cur_only = atomic_load(&s_ffc_cur_only);
+    o->ffc_exec_emit_only = atomic_load(&s_ffc_emit_only);
+    for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k) o->ffc_word_mismatch[k] = atomic_load(&s_ffc_word_mm[k]);
+    o->ffc_tally_overflow = atomic_load(&s_ffc_tally_overflow);
+    ffc_lock(); o->ffc_tally_pairs = s_ffc_tally_used; ffc_unlock();
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -479,6 +749,23 @@ void d3d8_host_report(const char *why)
         fprintf(stderr, "[D3D8-MIRROR] %s stream hooks: SetStreamSource bindings compared=%llu MATCH=%llu"
                         " | SetIndices compared=%llu MATCH=%llu\n", why, st.hk_stream_cmp, st.hk_stream_match,
                 st.hk_ib_cmp, st.hk_ib_match);
+        fprintf(stderr, "[D3D8-MIRROR] %s ff combiners: fixed-function draws %llu (pixel-shader draws skipped %llu),"
+                        " all registers matching in %llu | builder CONTROL+COLOR/ALPHA ICW/OCW MATCH=%llu,"
+                        " FACTOR0/1 MATCH=%llu, SPECULAR_FOG_CW0/1 MATCH=%llu (not written %llu)"
+                        " | unresolved %llu, before any emission %llu\n", why, st.ffc_draws, st.ffc_ps_skipped,
+                st.ffc_all_match, st.ffc_builder_match, st.ffc_factor_match, st.ffc_final_match, st.ffc_final_skipped,
+                st.ffc_unresolved, st.ffc_no_emit);
+        fprintf(stderr, "[D3D8-MIRROR] %s ff combiner laziness: builder ran in this draw's flush %llu of %llu;"
+                        " state at the draw transcribes differently from the last emission in %llu"
+                        " (executor matches the draw-time state only %llu, the last emission only %llu)"
+                        " | distinct setups %u\n", why, st.ffc_fresh, st.ffc_draws, st.ffc_lazy_differs,
+                st.ffc_exec_cur_only, st.ffc_exec_emit_only, st.ffc_tally_pairs);
+        for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k)
+            if (st.ffc_word_mismatch[k]) {
+                char nm[32];
+                fprintf(stderr, "[D3D8-MIRROR] %s ff combiner reg %04X %s: %llu mismatches\n", why,
+                        d3d8_host_ffc_method(k), d3d8_host_ffc_name(k, nm, sizeof nm), st.ffc_word_mismatch[k]);
+            }
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k)
             if (st.ps_word_mismatch[k])
                 fprintf(stderr, "[D3D8-MIRROR] %s pixel shader reg %04X (def word %u): %llu mismatches\n",
