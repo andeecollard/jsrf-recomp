@@ -33,7 +33,8 @@ static _Atomic unsigned s_vp_printed, s_st_printed, s_vc_printed;
 static _Atomic unsigned long long s_vc_cmp, s_vc_match, s_vc_all, s_vc_draws;
 static const uint32_t k_ps_pairs[D3D8_HOST_PS_N][2] = D3D8_HOST_PS_PAIRS;
 static _Atomic unsigned long long s_ps_draws, s_ps_fixed, s_ps_all, s_ps_cmp, s_ps_match, s_ps_word_mm[D3D8_HOST_PS_N];
-static _Atomic unsigned s_ps_printed;
+static _Atomic unsigned s_ps_printed, s_tss_printed;
+static _Atomic unsigned long long s_tss_cmp, s_tss_match, s_tss_addr, s_tss_mag, s_tss_min, s_tss_bias;
 static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
@@ -145,6 +146,30 @@ static void check_draw(const D3D8HostDrawCheck *c)
         }
         if (all) atomic_fetch_add(&s_ps_all, 1);
     }
+    /* Texture-stage state against the unit's NV2A registers, per the mapping the
+     * 23 Sep discovery pass showed: ADDRESSU/V/W (words 0-2) are the address
+     * bytes; MAGFILTER (3) is filter bits 24-27; MINFILTER (4) and MIPFILTER (5)
+     * give the min field as MIN + 2*MIP; MIPMAPLODBIAS (6, float) is the low 13
+     * bits as bias*256 truncated. */
+    for (unsigned u = 0; u < 4; ++u) {
+        if (!(e.mask & (1u << u))) continue;
+        const uint32_t *t = c->tss[u];
+        uint32_t f = e.tex_filter[u];
+        float bias; memcpy(&bias, &t[6], 4);
+        float scaled = (float)((double)bias * 256.0);
+        uint32_t want_bias = ((scaled >= -2147483648.0f && scaled < 2147483648.0f) ? (uint32_t)(int32_t)scaled : 0x80000000u) & 0x1FFFu;
+        const char *why = NULL;
+        atomic_fetch_add(&s_tss_cmp, 1);
+        if ((t[0] | (t[1] << 8) | (t[2] << 16)) != e.tex_address[u]) { atomic_fetch_add(&s_tss_addr, 1); why = "address"; }
+        else if (((f >> 24) & 0xFu) != t[3]) { atomic_fetch_add(&s_tss_mag, 1); why = "mag filter"; }
+        else if (((f >> 16) & 0xFFu) != t[4] + 2u * t[5]) { atomic_fetch_add(&s_tss_min, 1); why = "min/mip filter"; }
+        else if ((f & 0x1FFFu) != want_bias) { atomic_fetch_add(&s_tss_bias, 1); why = "lod bias"; }
+        else atomic_fetch_add(&s_tss_match, 1);
+        if (why && atomic_fetch_add(&s_tss_printed, 1) < 12)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u unit %u texture-stage MISMATCH (%s): d3d addr %u,%u,%u mag %u min %u mip %u bias %g"
+                            " | nv2a address=%08X filter=%08X\n", c->serial, u, why, t[0], t[1], t[2], t[3], t[4], t[5],
+                    bias, e.tex_address[u], f);
+    }
     /* Blend / alpha / depth / stencil registers: D3D's last Simple push against
      * the executor's register file at this draw. */
     for (unsigned k = 0; k < 11; ++k) {
@@ -238,6 +263,9 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->ps_draws_all_match = atomic_load(&s_ps_all); o->ps_words_compared = atomic_load(&s_ps_cmp);
     o->ps_words_match = atomic_load(&s_ps_match);
     for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k) o->ps_word_mismatch[k] = atomic_load(&s_ps_word_mm[k]);
+    o->tss_compared = atomic_load(&s_tss_cmp); o->tss_match = atomic_load(&s_tss_match);
+    o->tss_addr = atomic_load(&s_tss_addr); o->tss_mag = atomic_load(&s_tss_mag);
+    o->tss_min = atomic_load(&s_tss_min); o->tss_bias = atomic_load(&s_tss_bias);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -267,6 +295,8 @@ void d3d8_host_report(const char *why)
         fprintf(stderr, "[D3D8-MIRROR] %s pixel shader: draws %llu (fixed-function %llu), all registers matching in %llu;"
                         " words compared=%llu MATCH=%llu\n", why, st.ps_draws, st.ps_draws_fixed,
                 st.ps_draws_all_match, st.ps_words_compared, st.ps_words_match);
+        fprintf(stderr, "[D3D8-MIRROR] %s texture stages: units compared=%llu MATCH=%llu (address %llu, mag %llu, min/mip %llu, lod bias %llu)\n",
+                why, st.tss_compared, st.tss_match, st.tss_addr, st.tss_mag, st.tss_min, st.tss_bias);
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k)
             if (st.ps_word_mismatch[k])
                 fprintf(stderr, "[D3D8-MIRROR] %s pixel shader reg %04X (def word %u): %llu mismatches\n",

@@ -742,3 +742,31 @@ still needs.
 - the vertex program's identity;
 - vertex streams and index data;
 - the 4 texture address mismatches (one object).
+
+### G39, sixth slice: texture-stage states, 23 Sep 2026
+
+D3D keeps deferred texture-stage state at `0x19DEE0`: 4 stages x 32 words.
+A discovery pass paired each stage's first 16 words with the unit's NV2A
+registers. Six distinct pairings in 120 s were enough to read the mapping
+off:
+
+| D3D stage word | NV2A |
+|---|---|
+| 0, 1, 2 ADDRESSU/V/W (1 wrap, 3 clamp) | TEXTURE_ADDRESS bytes 0/1/2, same values |
+| 3 MAGFILTER (1 point, 2 linear) | TEXTURE_FILTER bits 24–27 |
+| 4 MINFILTER, 5 MIPFILTER (0 none, 1 point, 2 linear) | TEXTURE_FILTER bits 16–23 = MIN + 2 x MIP |
+| 6 MIPMAPLODBIAS (float) | TEXTURE_FILTER bits 0–12 = bias x 256, truncated (−0.8 -> 0x1F34) |
+
+**150 s silenced tutorial:** **947,042 of 947,042** texture units match on
+address, mag filter, min/mip filter and LOD bias. 0 faults, live=61.
+
+**Positive control** (address word flipped): 414,160 units, **0 match**.
+The control flips only the address, which is tested first, so the
+sensitivity of the filter and bias tests is not separately shown.
+
+**G39 still open:**
+- fixed-function combiner generation from texture-stage states, words 12
+  and up (COLOROP/ARG and so on), 88% of draws;
+- the vertex program's identity;
+- vertex streams and index data;
+- the 4 texture address mismatches (one object).

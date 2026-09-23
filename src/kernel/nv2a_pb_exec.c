@@ -6673,6 +6673,11 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
     {   static const uint32_t pp[D3D8_HOST_PS_N][2] = D3D8_HOST_PS_PAIRS;
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k) out->ps_reg[k] = s_methods[pp[k][0] / 4u]; }
     for (unsigned u = 0; u < 4; ++u) {
+        out->tex_address[u]  = s_methods[(0x1B08u + 64u * u) / 4u];
+        out->tex_control0[u] = s_methods[(0x1B0Cu + 64u * u) / 4u];
+        out->tex_filter[u]   = s_methods[(0x1B14u + 64u * u) / 4u];
+    }
+    for (unsigned u = 0; u < 4; ++u) {
         const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;
         if (!(out->mask & (1u << u))) continue;
         out->addr[u] = u ? s_copy.extra_address[u - 1] : s_copy.texture_address;
