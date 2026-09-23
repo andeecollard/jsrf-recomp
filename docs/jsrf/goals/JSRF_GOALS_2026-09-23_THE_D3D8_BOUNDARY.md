@@ -489,6 +489,43 @@ on the CPU when the draw is prepared), or a computed value? If the first
 two cover most of these draws, the exact early-Z is days of work. If
 lighting computes it, it is not reachable this way.
 
+### G38b answer, 23 Sep 2026: diffuse alpha is a constant in 122 of 126 programs
+
+`experiments/d3d8_boundary/vsh_od0w.c` parses every program in the
+title's corpus (`vsh_xbe_corpus.h`) with the production decoder. It finds
+the last slot that writes `oD0` with the w bit, and traces the w lane back
+through MOV/MUL/MAD/ADD/MIN/MAX and temporaries to what it bottoms out in:
+
+| oD0.w source | programs |
+|---|---:|
+| constant registers only | 79 |
+| never written (the output's default) | 43 |
+| input register, possibly times constants | 3 |
+| computed (a dot product, an ILU op, or a0-relative) | 1 |
+
+**So for 122 of 126 programs, diffuse alpha is known on the CPU at draw
+time**, from the constant file the draw already uploads. For three more it
+is vertex data the CPU prepares.
+
+**The exact early-Z this makes buildable (G38c):**
+1. **Texture minimum.** The minimum alpha of every level, recorded when G27
+   decodes a texture. Formats outside G27 count as [0, 1].
+2. **Diffuse range.** Evaluate each program's traced `oD0.w` expression with
+   the draw's constants. Programs that never write it take the output
+   default. Input and computed ones count as [0, 1] for now.
+3. **The combiner chain over ranges.** Run the draw's combiner alpha program
+   (`shade()`'s input mappings, products, sums, mux, output mapping and
+   clamps) over [lo, hi] ranges instead of values. The inputs are zero, the
+   constant alphas, diffuse and specular, texture ranges, and the spare0 and
+   spare1 initial values.
+4. **The rule.** Early-Z (`fs_hw_early`: no discard can happen) when the
+   final alpha's lower bound is at least 1/255. The discard threshold is
+   1/510.
+
+**Done when:** the early-Z image check extends to these draws and stays
+byte-identical; the positive control still differs; and an idle-host A/B
+scores `sync`.
+
 ### Order
 
 1. **G36.** It waits on the player and costs nothing meanwhile.
