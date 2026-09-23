@@ -1150,6 +1150,11 @@ add_executable(jsrf_d3d8_host_test d3d8_host_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c")
 target_include_directories(jsrf_d3d8_host_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_host COMMAND jsrf_d3d8_host_test)
+# G41: the mirror's vertex-stream and index comparison, driven directly.
+add_executable(jsrf_d3d8_streams_test d3d8_streams_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c")
+target_include_directories(jsrf_d3d8_streams_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
 
 # The backport checks below patch specific sites in the GENERATED tree, from
 # when that tree was preserved rather than regenerated. A backport is retired

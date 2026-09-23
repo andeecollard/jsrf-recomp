@@ -41,6 +41,103 @@ static _Atomic unsigned long long s_ff_cmp, s_ff_match, s_ff_mv, s_ff_comp, s_ff
 static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
+/* ---- G41: vertex streams and indices ---- */
+static _Atomic unsigned long long s_va_draws, s_va_all, s_va_arrays, s_va_exact, s_va_in, s_va_nod3d,
+                                  s_va_stride, s_va_offset, s_va_format, s_va_exmiss;
+static _Atomic unsigned long long s_ix_draws, s_ix_match, s_ix_count, s_ix_value, s_ix_indexed, s_ix_indexed_match;
+static _Atomic unsigned long long s_hk_st_cmp, s_hk_st_match, s_hk_ib_cmp, s_hk_ib_match;
+static _Atomic unsigned s_va_printed, s_ix_printed, s_hk_printed;
+static int va_enabled(uint32_t format) { return ((format >> 4) & 0xFu) != 0; }
+
+/* Does `off` lie within the first element of a bound stream whose stride is
+ * `stride`? The element starts at Data + Stream.Offset + base*Stride; an
+ * attribute sits inside it, so off - start < Stride. The XDK's vertex buffer
+ * carries no size, so this is as much of "inside the buffer" as D3D knows. */
+static int in_bound_stream(const D3D8HostDrawCheck *c, uint32_t off, uint32_t stride)
+{
+    for (unsigned s = 0; s < 16; ++s) {
+        if (!c->st_vb[s] || c->st_stride[s] != stride) continue;
+        uint32_t start = (c->st_data[s] + c->st_offset[s] + c->base_vertex * c->st_stride[s]) & 0x03FFFFFFu;
+        uint32_t d = (off & 0x03FFFFFFu) - start;
+        if (d < (stride ? stride : 1u)) return 1;
+    }
+    return 0;
+}
+
+int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e)
+{
+    int all = 1, ix_ok = 1;
+    if (!c->draw_kind || !e->va_valid) return 1;
+    /* Streams: every array the executor enabled, against D3D's derivation. */
+    atomic_fetch_add(&s_va_draws, 1);
+    for (unsigned i = 0; i < 16; ++i) {
+        int ex = va_enabled(e->va_format[i]), d3 = (c->va_on >> i) & 1u;
+        const char *why = NULL;
+        if (!ex) {
+            if (d3) { atomic_fetch_add(&s_va_exmiss, 1); why = "D3D enables it, the executor does not"; }
+        } else {
+            uint32_t stride = e->va_format[i] >> 8;
+            atomic_fetch_add(&s_va_arrays, 1);
+            if (in_bound_stream(c, e->va_offset[i], stride)) atomic_fetch_add(&s_va_in, 1);
+            if (!d3) { atomic_fetch_add(&s_va_nod3d, 1); why = "no D3D stream"; }
+            else if (stride != (c->va_format[i] >> 8)) { atomic_fetch_add(&s_va_stride, 1); why = "stride"; }
+            else if ((e->va_format[i] & 0xFFu) != (c->va_format[i] & 0xFFu)) { atomic_fetch_add(&s_va_format, 1); why = "format"; }
+            else if (e->va_offset[i] != c->va_offset[i]) { atomic_fetch_add(&s_va_offset, 1); why = "offset"; }
+            else atomic_fetch_add(&s_va_exact, 1);
+        }
+        if (!why) continue;
+        all = 0;
+        if (atomic_fetch_add(&s_va_printed, 1) < 12) {
+            uint32_t s = c->va_stream[i] & 15u;
+            fprintf(stderr, "[D3D8-MIRROR] draw %u array %u MISMATCH (%s): d3d stream %u vb=%08X data=%08X stride=%u"
+                            " offset=%u base=%u -> %08X fmt=%08X | exec offset=%08X fmt=%08X\n",
+                    c->serial, i, why, c->va_stream[i], c->st_vb[s], c->st_data[s], c->st_stride[s],
+                    c->st_offset[s], c->base_vertex, c->va_offset[i], c->va_format[i],
+                    e->va_offset[i], e->va_format[i]);
+        }
+    }
+    if (all) atomic_fetch_add(&s_va_all, 1);
+    /* Indices: the count, and the first few, as D3D was handed them. */
+    atomic_fetch_add(&s_ix_draws, 1);
+    if (c->draw_kind == 2) atomic_fetch_add(&s_ix_indexed, 1);
+    {
+        const char *why = NULL; unsigned k = 0, n = c->nidx < D3D8_HOST_IDX_N ? c->nidx : D3D8_HOST_IDX_N;
+        if (e->idx_count != c->count) { atomic_fetch_add(&s_ix_count, 1); why = "count"; }
+        else {
+            for (k = 0; k < n; ++k) if (c->idx[k] != e->idx[k]) break;
+            if (k < n) { atomic_fetch_add(&s_ix_value, 1); why = "value"; }
+        }
+        if (!why) {
+            atomic_fetch_add(&s_ix_match, 1);
+            if (c->draw_kind == 2) atomic_fetch_add(&s_ix_indexed_match, 1);
+        } else {
+            ix_ok = 0;
+            if (atomic_fetch_add(&s_ix_printed, 1) < 12)
+                fprintf(stderr, "[D3D8-MIRROR] draw %u indices MISMATCH (%s) %s prim %u: d3d count=%u first %u %u %u %u"
+                                " | exec count=%u first %u %u %u %u\n", c->serial, why,
+                        c->draw_kind == 2 ? "DrawIndexedVertices" : "DrawVertices", c->prim, c->count,
+                        c->idx[0], c->idx[1], c->idx[2], c->idx[3], e->idx_count, e->idx[0], e->idx[1], e->idx[2], e->idx[3]);
+        }
+    }
+    /* Cross-check: the hooks' view of the bindings against the device's. */
+    for (unsigned s = 0; s < 16; ++s) {
+        if (!(c->hk_stream_seen & (1u << s))) continue;
+        atomic_fetch_add(&s_hk_st_cmp, 1);
+        if (c->hk_vb[s] == c->st_vb[s] && c->hk_stride[s] == c->st_stride[s]) atomic_fetch_add(&s_hk_st_match, 1);
+        else if (atomic_fetch_add(&s_hk_printed, 1) < 8)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u stream %u hook/device MISMATCH: SetStreamSource vb=%08X stride=%u"
+                            " | device vb=%08X stride=%u\n", c->serial, s, c->hk_vb[s], c->hk_stride[s], c->st_vb[s], c->st_stride[s]);
+    }
+    if (c->hk_ib_seen) {
+        atomic_fetch_add(&s_hk_ib_cmp, 1);
+        if (c->hk_ib == c->ib && c->hk_base == c->base_vertex) atomic_fetch_add(&s_hk_ib_match, 1);
+        else if (atomic_fetch_add(&s_hk_printed, 1) < 8)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u indices hook/device MISMATCH: SetIndices ib=%08X base=%u | device ib=%08X base=%u\n",
+                    c->serial, c->hk_ib, c->hk_base, c->ib, c->base_vertex);
+    }
+    return all && ix_ok;
+}
+
 /* NV2A format byte from a D3D Format word, and the shape it implies. */
 static void check_draw(const D3D8HostDrawCheck *c)
 {
@@ -49,6 +146,7 @@ static void check_draw(const D3D8HostDrawCheck *c)
     if (!s_exec_source) return;
     memset(&e, 0, sizeof e);
     s_exec_source(&e);
+    d3d8_host_check_streams(c, &e);
     if (!e.active) { atomic_fetch_add(&s_chk_inactive, 1); return; }
     for (unsigned u = 0; u < 4; ++u) {
         if (!(e.mask & (1u << u))) continue;
@@ -326,6 +424,16 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->vs_words_compared = atomic_load(&s_vs_words);
     o->ff_compared = atomic_load(&s_ff_cmp); o->ff_match = atomic_load(&s_ff_match);
     o->ff_mv = atomic_load(&s_ff_mv); o->ff_comp = atomic_load(&s_ff_comp); o->ff_other = atomic_load(&s_ff_other);
+    o->va_draws = atomic_load(&s_va_draws); o->va_draws_all_match = atomic_load(&s_va_all);
+    o->va_arrays = atomic_load(&s_va_arrays); o->va_exact = atomic_load(&s_va_exact);
+    o->va_in_stream = atomic_load(&s_va_in); o->va_no_d3d = atomic_load(&s_va_nod3d);
+    o->va_stride = atomic_load(&s_va_stride); o->va_offset = atomic_load(&s_va_offset);
+    o->va_format = atomic_load(&s_va_format); o->va_exec_missing = atomic_load(&s_va_exmiss);
+    o->idx_draws = atomic_load(&s_ix_draws); o->idx_match = atomic_load(&s_ix_match);
+    o->idx_count_bad = atomic_load(&s_ix_count); o->idx_value_bad = atomic_load(&s_ix_value);
+    o->idx_indexed = atomic_load(&s_ix_indexed); o->idx_indexed_match = atomic_load(&s_ix_indexed_match);
+    o->hk_stream_cmp = atomic_load(&s_hk_st_cmp); o->hk_stream_match = atomic_load(&s_hk_st_match);
+    o->hk_ib_cmp = atomic_load(&s_hk_ib_cmp); o->hk_ib_match = atomic_load(&s_hk_ib_match);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -361,6 +469,16 @@ void d3d8_host_report(const char *why)
                         " | other fixed-function draws %llu\n", why, st.ff_compared, st.ff_match, st.ff_mv, st.ff_comp, st.ff_other);
         fprintf(stderr, "[D3D8-MIRROR] %s texture stages: units compared=%llu MATCH=%llu (address %llu, mag %llu, min/mip %llu, lod bias %llu)\n",
                 why, st.tss_compared, st.tss_match, st.tss_addr, st.tss_mag, st.tss_min, st.tss_bias);
+        fprintf(stderr, "[D3D8-MIRROR] %s streams: draws %llu, all arrays matching in %llu | executor arrays=%llu EXACT=%llu"
+                        " inside-a-bound-stream=%llu (no D3D stream %llu, stride %llu, format %llu, offset %llu)"
+                        " | D3D-enabled arrays the executor lacks %llu\n", why, st.va_draws, st.va_draws_all_match,
+                st.va_arrays, st.va_exact, st.va_in_stream, st.va_no_d3d, st.va_stride, st.va_format, st.va_offset,
+                st.va_exec_missing);
+        fprintf(stderr, "[D3D8-MIRROR] %s indices: draws %llu MATCH=%llu (count %llu, values %llu) | DrawIndexedVertices %llu MATCH=%llu\n",
+                why, st.idx_draws, st.idx_match, st.idx_count_bad, st.idx_value_bad, st.idx_indexed, st.idx_indexed_match);
+        fprintf(stderr, "[D3D8-MIRROR] %s stream hooks: SetStreamSource bindings compared=%llu MATCH=%llu"
+                        " | SetIndices compared=%llu MATCH=%llu\n", why, st.hk_stream_cmp, st.hk_stream_match,
+                st.hk_ib_cmp, st.hk_ib_match);
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k)
             if (st.ps_word_mismatch[k])
                 fprintf(stderr, "[D3D8-MIRROR] %s pixel shader reg %04X (def word %u): %llu mismatches\n",

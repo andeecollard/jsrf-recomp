@@ -6655,6 +6655,17 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
 {
     const NV2ATextureCopy *c = &s_copy.state;
     memset(out, 0, sizeof *out);
+    /* G41: the vertex arrays and indices the last batch used, independent of
+     * whether the texture/surface state below is meaningful. Raw registers:
+     * the 0x1760 stride is bits 8-31 and VertexAttr keeps only 8 of them.
+     * idx[] survives SET_BEGIN_END(0); the next BEGIN resets it. */
+    out->va_valid = 1;
+    for (unsigned i = 0; i < 16; ++i) {
+        out->va_offset[i] = s_methods[(NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 4u * i) / 4u];
+        out->va_format[i] = s_methods[(NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 4u * i) / 4u];
+    }
+    out->idx_count = s_gpu.idx_count;
+    for (unsigned k = 0; k < 16 && k < s_gpu.idx_count; ++k) out->idx[k] = s_gpu.idx[k];
     out->active = s_copy.active;
     if (!s_copy.active) return;
     out->mask = c->untextured ? 0u : (c->texture_mask & 0xFu);
