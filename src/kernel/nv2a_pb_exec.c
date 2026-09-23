@@ -6677,7 +6677,10 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
         out->tex_control0[u] = s_methods[(0x1B0Cu + 64u * u) / 4u];
         out->tex_filter[u]   = s_methods[(0x1B14u + 64u * u) / 4u];
     }
-    memcpy(out->vs_words, s_vsh.words, sizeof out->vs_words < sizeof s_vsh.words ? sizeof out->vs_words : sizeof s_vsh.words);
+    memcpy(out->ff_modelview, &s_methods[0x480u / 4u], sizeof out->ff_modelview);
+    memcpy(out->ff_composite, &s_methods[0x680u / 4u], sizeof out->ff_composite);
+    memcpy(out->ff_projection, &s_methods[0x440u / 4u], sizeof out->ff_projection);
+        memcpy(out->vs_words, s_vsh.words, sizeof out->vs_words < sizeof s_vsh.words ? sizeof out->vs_words : sizeof s_vsh.words);
     for (unsigned u = 0; u < 4; ++u) {
         const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;
         if (!(out->mask & (1u << u))) continue;

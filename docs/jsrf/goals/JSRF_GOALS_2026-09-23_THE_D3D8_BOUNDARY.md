@@ -811,3 +811,34 @@ host renderer can take from D3D exactly.
   states;
 - vertex streams and index data;
 - the 4 texture address mismatches.
+
+### Reference: Cxbx-Reloaded, and the fixed-function question (23 Sep 2026)
+
+Cloned read-only beside the repo (`../Cxbx-Reloaded`, 585c49a, GPL, used for
+reference only and not copied). Its `XbD3D8Types.h` confirms three things this
+track found by measurement:
+- `X_D3DTS_*`: 0 VIEW, 1 PROJECTION, 2–5 TEXTURE0–3, 6 WORLD, 7–9 WORLD1–3.
+- `X_D3DTSS_*`: words 0–6 as mapped above. 12 COLOROP, 13–15 COLORARG0–2,
+  16 ALPHAOP, 17–19 ALPHAARG0–2, 20 RESULTARG, 21 TEXTURETRANSFORMFLAGS,
+  28 TEXCOORDINDEX.
+- `X_D3DVertexShader`: Flags at +4, where 0x10 is PROGRAM;
+  ProgramAndConstantsDwords at +0xC; the program at +0x114 after a 0x100-byte
+  attribute format.
+
+**How Cxbx does the fixed-function pipeline.** It does not reproduce D3D's
+NV2A fixed-function registers. It keeps D3D-level state (transforms, lights,
+material, texture-stage states, render states: `FixedFunctionState.*`) and
+implements fixed-function vertex and pixel processing in host shaders
+(`Direct3D9/FixedFunction{Vertex,Pixel}Shader.hlsl`). That is the model for
+this track's host renderer.
+
+**Open, found while checking transforms.** `SetTransform` is now mirrored
+(world, view and projection, with XDK numbering). But at this title's
+fixed-function-vertex draws, the executor's NV2A FF matrix registers
+(0x480 model-view, 0x680 composite, 0x440 projection) are all zero in
+`s_methods`, which records every method. Those draws still render. So this
+title's vertex-format draws reach the GPU some other way than NV2A FF
+transform, perhaps through a D3D-internal program with constants. That has
+to be settled before the host FF vertex path is designed. Handles seen
+include pre-transformed `XYZRHW` (0x1C4) and untransformed `XYZ` formats
+(0x1C2, 0x202, 0x112, 0x142).

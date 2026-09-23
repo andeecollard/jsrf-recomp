@@ -54,6 +54,17 @@ void d3d8m_vs_constant(uint32_t reg, uint32_t data, uint32_t count)
     }
 }
 static uint32_t m_ps_handle;
+static float m_xf[3][16]; static uint32_t m_xf_seen;
+/* SetTransform(State, pMatrix): WORLD, VIEW, PROJECTION. */
+void d3d8m_set_transform(uint32_t state, uint32_t pm)
+{
+    /* XDK 4134 numbering, measured 23 Sep: 0 VIEW, 1 PROJECTION, 2-5 TEXTURE0-3,
+     * 6 WORLD, 7-9 WORLD1-3. */
+    int k = state == 6u ? 0 : state == 0u ? 1 : state == 1u ? 2 : -1;
+    if (k < 0) return;
+    for (unsigned i = 0; i < 16; ++i) { uint32_t u = MEM32(pm + 4u * i); memcpy(&m_xf[k][i], &u, 4); }
+    m_xf_seen |= 1u << k;
+}
 void d3d8m_set_pixel_shader(uint32_t handle) { m_ps_handle = handle; }
 void d3d8m_zenable(uint32_t v)       { m_set_state(0x30Cu, v != 0); }
 void d3d8m_stencilenable(uint32_t v) { m_set_state(0x32Cu, v != 0); }
@@ -99,6 +110,8 @@ void d3d8m_after_draw(void)
     memcpy(c.vc, m_vc, sizeof c.vc); memcpy(c.vc_written, m_vc_written, sizeof c.vc_written);
     for (unsigned u = 0; u < 4; ++u)
         for (unsigned k = 0; k < 32; ++k) c.tss[u][k] = MEM32(0x0019DEE0u + 4u * (32u * u + k));
+    memcpy(c.xf_world, m_xf[0], sizeof c.xf_world); memcpy(c.xf_view, m_xf[1], sizeof c.xf_view);
+    memcpy(c.xf_proj, m_xf[2], sizeof c.xf_proj); c.xf_seen = m_xf_seen;
     {   uint32_t d = MEM32(0x0019DCE0u), h = MEM32(d + 0x384u);
         c.vs_handle = h;
 

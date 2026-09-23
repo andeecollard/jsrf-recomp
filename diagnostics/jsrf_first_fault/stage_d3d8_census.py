@@ -210,6 +210,12 @@ def main():
                 wrappers.append("static void %s(void) { uint32_t h = MEM32(esp + 4u); %s(); d3d8m_set_pixel_shader(h); }" % (hooked, body))
                 body = hooked
                 manifest.append("mirror: %s (pixel shader)" % name)
+            if a.mirror and name == "sub_0018CC60":
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_set_transform(uint32_t state, uint32_t pm);")
+                wrappers.append("static void %s(void) { uint32_t st = MEM32(esp + 4u), pm = MEM32(esp + 8u); %s(); d3d8m_set_transform(st, pm); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (transforms)" % name)
             if a.mirror and name == "sub_0018E930":
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_simple(uint32_t hdr, uint32_t value);")

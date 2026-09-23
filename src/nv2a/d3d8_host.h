@@ -67,6 +67,9 @@ typedef struct {
      * program words extracted from it. vs_kind: 0 none/fixed, 1 programmable,
      * 2 programmable but its fragment did not parse. */
     uint32_t vs_kind, vs_handle, vs_nwords, vs_words[136 * 4];
+    /* SetTransform: WORLD (6), VIEW (0), PROJECTION (1) in XDK 4134, as handed to D3D. */
+    float    xf_world[16], xf_view[16], xf_proj[16];
+    uint32_t xf_seen;          /* bit0 world, bit1 view, bit2 proj */
 } D3D8HostDrawCheck;
 /* Register <- definition word, exactly as SetPixelShader (0x199BE0) emits them. */
 #define D3D8_HOST_PS_PAIRS { {0x260,0}, {0x264,1}, {0x268,2}, {0x26C,3}, {0x270,4}, {0x274,5}, {0x278,6}, {0x27C,7}, {0xA60,10}, {0xA64,11}, {0xA68,12}, {0xA6C,13}, {0xA70,14}, {0xA74,15}, {0xA78,16}, {0xA7C,17}, {0xA80,18}, {0xA84,19}, {0xA88,20}, {0xA8C,21}, {0xA90,22}, {0xA94,23}, {0xA98,24}, {0xA9C,25}, {0xAA0,26}, {0xAA4,27}, {0xAA8,28}, {0xAAC,29}, {0xAB0,30}, {0xAB4,31}, {0xAB8,32}, {0xABC,33}, {0xAC0,34}, {0xAC4,35}, {0xAC8,36}, {0xACC,37}, {0xAD0,38}, {0xAD4,39}, {0xAD8,40}, {0xADC,41}, {0x17F8,42}, {0x1E20,43}, {0x1E24,44}, {0x1E40,45}, {0x1E44,46}, {0x1E48,47}, {0x1E4C,48}, {0x1E50,49}, {0x1E54,50}, {0x1E58,51}, {0x1E5C,52}, {0x1E60,53}, {0x1E74,55}, {0x1E78,56} }
@@ -91,6 +94,7 @@ typedef struct {
     uint32_t ps_reg[D3D8_HOST_PS_N];           /* executor registers for D3D8_HOST_PS_PAIRS */
     uint32_t tex_address[4], tex_filter[4], tex_control0[4];   /* raw NV2A texture registers per unit */
     uint32_t vs_words[136 * 4];                /* the executor's program memory, slot 0 up */
+    float    ff_modelview[16], ff_composite[16], ff_projection[16];   /* 0x480, 0x680, 0x440 */
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);

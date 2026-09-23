@@ -186,6 +186,23 @@ static void check_draw(const D3D8HostDrawCheck *c)
             fprintf(stderr, "[D3D8-MIRROR] draw %u vertex program MISMATCH handle %08X at word %u of %u: d3d %08X | exec %08X\n",
                     c->serial, c->vs_handle, k, c->vs_nwords, c->vs_words[k], e.vs_words[k]);
     }
+    /* Fixed-function transform discovery: D3D's matrices beside the executor's
+     * FF registers, for the first few fixed-function draws with distinct worlds. */
+    if (c->vs_kind == 0 && (c->xf_seen & 7u) == 7u) {
+        static float seen_w[8][16]; static _Atomic unsigned nw;
+        unsigned n = atomic_load(&nw), i;
+        for (i = 0; i < n; ++i) if (!memcmp(seen_w[i], c->xf_world, sizeof seen_w[i])) break;
+        if (i == n && n < 6) {
+            memcpy(seen_w[n], c->xf_world, sizeof seen_w[n]); atomic_store(&nw, n + 1);
+            const float *m[6] = { c->xf_world, c->xf_view, c->xf_proj, e.ff_modelview, e.ff_composite, e.ff_projection };
+            const char *nm[6] = { "d3d world", "d3d view", "d3d proj", "nv2a 0x480", "nv2a 0x680", "nv2a 0x440" };
+            for (unsigned q = 0; q < 6; ++q) {
+                fprintf(stderr, "[D3D8-XF] draw %u %-10s", c->serial, nm[q]);
+                for (unsigned k = 0; k < 16; ++k) fprintf(stderr, " %.6g", m[q][k]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     /* Blend / alpha / depth / stencil registers: D3D's last Simple push against
      * the executor's register file at this draw. */
     for (unsigned k = 0; k < 11; ++k) {
