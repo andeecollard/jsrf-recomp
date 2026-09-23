@@ -703,7 +703,28 @@ unsigned xbox_OhciServiceList(xbox_ohci_service *s)
              * "completing successfully" and "completing with errors" cannot be
              * read as the same thing. */
             g_ohci_tds_retired++;
-            if (cc != XBOX_OHCI_CC_NOERROR) g_ohci_tds_error++;
+            if (cc != XBOX_OHCI_CC_NOERROR) {
+                g_ohci_tds_error++;
+                /* G45: EVERY failed TD, with what XPP's completion path will see.
+                 * The 23 Sep police-chase freeze followed the session's one
+                 * error and left XPP's sub_001C29F7 walking the endpoint's TD
+                 * chain for a TD marked end-of-transfer. Whether the walk
+                 * started from the tail is the question these fields answer.
+                 * Bounded; errors are rare (1 in 42,712 that session). */
+                static unsigned shown;
+                if (shown++ < 32) {
+                    fprintf(stderr,
+                            "  [OHCI-TD-ERROR] #%u cc=%u pid=%u ed_flags=%08X (FA=%u EN=%u) dev_addr=%u"
+                            " td=%08X td_flags=%08X cbp=%08X next=%08X be=%08X want=%u"
+                            " tail=%08X next_is_tail=%d setup=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                            shown, cc, pid, flags, ED_FA(flags), ED_EN(flags), g_dev.address,
+                            td_va, td[0], td[1], td_next, td[3], want,
+                            tail, td_next == tail,
+                            g_dev.setup[0], g_dev.setup[1], g_dev.setup[2], g_dev.setup[3],
+                            g_dev.setup[4], g_dev.setup[5], g_dev.setup[6], g_dev.setup[7]);
+                    fflush(stderr);
+                }
+            }
 
             /* The carry bit records the toggle the next transaction on this
              * endpoint should use. Control transfers force DATA0 on every
