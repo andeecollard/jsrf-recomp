@@ -11,6 +11,7 @@ add_library(xbox_nv2a STATIC
     nv2a_pb_replay.c
     nv2a_pusher.c
     d3d8_host.c
+    d3d8_ff_combiner.c
     nv2a_mmio_hook.c
     nv2a_pb_test.c
 )
