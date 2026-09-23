@@ -56,7 +56,13 @@ typedef struct {
      * NV2A slot = D3D register + 96. vc_written marks slots D3D has written. */
     float    vc[192][4];
     uint32_t vc_written[6];
+    /* The pixel shader definition D3D was given (SetPixelShader's handle +8),
+     * 57 words; ps_bound = 0 means fixed-function combiners. */
+    uint32_t ps_bound, ps[57];
 } D3D8HostDrawCheck;
+/* Register <- definition word, exactly as SetPixelShader (0x199BE0) emits them. */
+#define D3D8_HOST_PS_PAIRS { {0x260,0}, {0x264,1}, {0x268,2}, {0x26C,3}, {0x270,4}, {0x274,5}, {0x278,6}, {0x27C,7}, {0xA60,10}, {0xA64,11}, {0xA68,12}, {0xA6C,13}, {0xA70,14}, {0xA74,15}, {0xA78,16}, {0xA7C,17}, {0xA80,18}, {0xA84,19}, {0xA88,20}, {0xA8C,21}, {0xA90,22}, {0xA94,23}, {0xA98,24}, {0xA9C,25}, {0xAA0,26}, {0xAA4,27}, {0xAA8,28}, {0xAAC,29}, {0xAB0,30}, {0xAB4,31}, {0xAB8,32}, {0xABC,33}, {0xAC0,34}, {0xAC4,35}, {0xAC8,36}, {0xACC,37}, {0xAD0,38}, {0xAD4,39}, {0xAD8,40}, {0xADC,41}, {0x17F8,42}, {0x1E20,43}, {0x1E24,44}, {0x1E40,45}, {0x1E44,46}, {0x1E48,47}, {0x1E4C,48}, {0x1E50,49}, {0x1E54,50}, {0x1E58,51}, {0x1E5C,52}, {0x1E60,53}, {0x1E74,55}, {0x1E78,56} }
+#define D3D8_HOST_PS_N 54
 #define D3D8_HOST_STATE_METHODS { 0x300, 0x304, 0x30C, 0x32C, 0x33C, 0x340, 0x344, 0x348, 0x350, 0x354, 0x35C }
 
 /* What the executor made of the draw it just ran. */
@@ -74,6 +80,7 @@ typedef struct {
     float    z_min, z_max;
     uint32_t st_reg[11];                       /* executor registers, same method list */
     float    vc[192][4];                       /* the executor's constant file */
+    uint32_t ps_reg[D3D8_HOST_PS_N];           /* executor registers for D3D8_HOST_PS_PAIRS */
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -87,6 +94,8 @@ typedef struct {
     unsigned long long vp_compared, vp_match, vp_window, vp_z;
     unsigned long long st_compared[11], st_match[11], st_unseen[11];
     unsigned long long vc_slots_compared, vc_slots_match, vc_draws_all_match, vc_draws;
+    unsigned long long ps_draws, ps_draws_fixed, ps_draws_all_match, ps_words_compared, ps_words_match;
+    unsigned long long ps_word_mismatch[D3D8_HOST_PS_N];
 } D3D8HostStats;
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);

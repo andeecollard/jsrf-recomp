@@ -53,6 +53,8 @@ void d3d8m_vs_constant(uint32_t reg, uint32_t data, uint32_t count)
         m_vc_written[slot / 32] |= 1u << (slot % 32);
     }
 }
+static uint32_t m_ps_handle;
+void d3d8m_set_pixel_shader(uint32_t handle) { m_ps_handle = handle; }
 void d3d8m_zenable(uint32_t v)       { m_set_state(0x30Cu, v != 0); }
 void d3d8m_stencilenable(uint32_t v) { m_set_state(0x32Cu, v != 0); }
 
@@ -95,6 +97,16 @@ void d3d8m_after_draw(void)
           u = MEM32(d + 0x454u); memcpy(&c.ss_x, &u, 4); u = MEM32(d + 0x458u); memcpy(&c.ss_y, &u, 4); } }
     memcpy(c.st_val, m_state_val, sizeof c.st_val); c.st_seen = m_state_seen;
     memcpy(c.vc, m_vc, sizeof c.vc); memcpy(c.vc_written, m_vc_written, sizeof c.vc_written);
+    if (m_ps_handle) {
+        /* D3D's own current view of the pixel-shader registers: SetPixelShader
+         * copies the 57-word definition into D3D_g_RenderState[0..56]
+         * (0x19E0E0), and SetPixelShaderConstant's per-stage constant writes go
+         * through SetRenderStateNotInline into the same array. The definition
+         * alone carries placeholders there (23 Sep: word 13 == 1 on every
+         * programmable draw, the executor 0). */
+        c.ps_bound = 1;
+        for (unsigned k = 0; k < 57; ++k) c.ps[k] = MEM32(0x0019E0E0u + 4u * k);
+    }
         {   /* Positive control for the surface check: RECOMP_D3D8_MIRROR_CONTROL=1
          * swaps the colour and depth addresses, so every draw MUST mismatch. */
         static int ctl = -1;
@@ -103,7 +115,8 @@ void d3d8m_after_draw(void)
         if (ctl) { uint32_t t = c.rt_data; c.rt_data = c.zs_data; c.zs_data = t;
                    c.vp_x += 1; c.vp_minz += 0.5f;                      /* viewport must mismatch */
                    for (unsigned k = 0; k < 11; ++k) c.st_val[k] ^= 1u;       /* every state too */
-                   for (unsigned k = 0; k < 192; ++k) c.vc[k][0] += 1.0f; } } /* and every constant */
+                   for (unsigned k = 0; k < 192; ++k) c.vc[k][0] += 1.0f;     /* and every constant */
+                   for (unsigned k = 0; k < 57; ++k) c.ps[k] ^= 0x1u; } }      /* and every shader word */
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);

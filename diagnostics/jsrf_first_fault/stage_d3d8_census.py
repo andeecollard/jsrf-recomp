@@ -204,6 +204,12 @@ def main():
                                 " %s(); d3d8m_vs_constant(r, d, n); }" % (hooked, body))
                 body = hooked
                 manifest.append("mirror: %s (vertex constants)" % name)
+            if a.mirror and name == "sub_00199BE0":
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_set_pixel_shader(uint32_t handle);")
+                wrappers.append("static void %s(void) { uint32_t h = MEM32(esp + 4u); %s(); d3d8m_set_pixel_shader(h); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (pixel shader)" % name)
             if a.mirror and name == "sub_0018E930":
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_simple(uint32_t hdr, uint32_t value);")

@@ -698,3 +698,47 @@ So the constant numbering (D3D register + 96) is confirmed, and every
 constant a draw reads through D3D's API reaches the GPU unchanged. Next: the
 pixel shader. In XDK 4134 its combiner setup lives in D3D's render-state
 array, which the engine writes inline, so the array's layout comes first.
+
+### G39, fifth slice: programmable pixel shaders, 23 Sep 2026
+
+`SetPixelShader(handle)` (0x199BE0) takes the 57-word definition from
+`handle+8` and emits it directly, and the code shows the register-to-word
+mapping:
+- words 0–7 go to COMBINER_ALPHA_ICW;
+- words 10–41 go to 0x0A60–0x0ADC (FACTOR0, FACTOR1, ALPHA_OCW, COLOR_ICW);
+- word 42 goes to 0x17F8, and words 43–44 to 0x1E20/24;
+- words 45–53 go to COLOR_OCW and COMBINER_CONTROL, and words 55–56 to
+  0x1E74/78;
+- words 8–9 go to 0x288/0x28C when the final combiner is used.
+It also copies the 57 words into `D3D_g_RenderState[0..56]`.
+
+`SetPixelShaderConstant` (0x199DB0) packs each float4 to a colour. For every
+stage whose constant-mapping nibble (definition `+0xE4/+0xE8/+0xEC`) names
+that register, it calls `SetRenderStateNotInline(10+i / 18+i / 43+i)`, which
+rewrites the stage's FACTOR register and the same render-state entry.
+
+**The first check read the definition and failed on exactly one
+register.** 0x0A6C (word 13) differed on all 65,339 programmable draws:
+d3d 1, executor 0. The word is a placeholder that the constant mapping
+overwrites. The mirror now reads `D3D_g_RenderState[0..56]`, which is D3D's
+own current view of those registers, with the constant writes applied.
+
+**150 s silenced tutorial:**
+- **Programmable draws.** 559,967 draws in all, of which **66,054** used a
+  programmable pixel shader. All 54 registers matched on every one of them:
+  **3,566,916 of 3,566,916 words**.
+- **Faults.** 0, live=61.
+
+**Positive control** (every word flipped): 1,283,310 words and **0 match**.
+
+**The finding that sets the next goal: 493,913 of 559,967 draws (88%) use
+fixed-function combiners.** D3D builds their combiner registers at draw
+time from the texture-stage states (0x197F90, 1,313 bytes). No host
+mirror covers that yet, and it is the largest piece a D3D-fed renderer
+still needs.
+
+**G39 still open:**
+- fixed-function combiners and texture-stage states (88% of draws);
+- the vertex program's identity;
+- vertex streams and index data;
+- the 4 texture address mismatches (one object).
