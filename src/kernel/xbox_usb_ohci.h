@@ -145,6 +145,16 @@ int xbox_UsbInterruptIn(uint8_t endpoint, uint8_t *out, uint32_t out_max,
  */
 void xbox_SetUsbPadStateHook(int (*fn)(uint8_t report[XBOX_USB_PAD_REPORT]));
 
+/* The pad's output report -- the XID rumble packet, six bytes: report id 0,
+ * length 6, left motor and right motor as little-endian 16-bit speeds. It
+ * reaches the device two ways and both land here: as the data stage of a
+ * SET_REPORT class request on the control pipe, and as a packet on the
+ * interrupt OUT endpoint. The hook is how the runtime turns it into rumble on
+ * the host pad; without one the report is consumed and forgotten, which is
+ * still a completed transfer rather than a stalled one. */
+void xbox_SetUsbPadRumbleHook(void (*fn)(uint16_t left, uint16_t right));
+int xbox_UsbOutputReport(const uint8_t *data, uint32_t len);
+
 /**
  * Forget the device's addressing and configuration state.
  *

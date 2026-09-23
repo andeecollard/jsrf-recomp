@@ -27,6 +27,7 @@
  * in the retire loop for why TDs rather than ordinal 175 or ISR entries. */
 unsigned long g_ohci_tds_retired;
 unsigned long g_ohci_tds_error;
+unsigned long g_ohci_out_reports;   /* rumble packets consumed */
 
 /* ================================================================
  * Descriptor field accessors
@@ -166,6 +167,40 @@ void xbox_SetUsbPadStateHook(int (*fn)(uint8_t report[XBOX_USB_PAD_REPORT]))
     g_pad_state = fn;
 }
 
+static void (*g_pad_rumble)(uint16_t left, uint16_t right);
+
+void xbox_SetUsbPadRumbleHook(void (*fn)(uint16_t left, uint16_t right))
+{
+    g_pad_rumble = fn;
+}
+
+/* Consume one output report. Only the XID rumble report (id 0, length 6) is
+ * known; anything else is accepted and dropped, because a device that stalls
+ * an output it does not understand gets torn down by XPP -- see the
+ * SET_REPORT note in usb_control_request. */
+int xbox_UsbOutputReport(const uint8_t *data, uint32_t len)
+{
+    static unsigned shown;
+    uint16_t left, right;
+
+    g_ohci_out_reports++;
+    if (!data || len < 6 || data[0] != 0x00)
+        return 0;
+    left  = (uint16_t)(data[2] | (data[3] << 8));
+    right = (uint16_t)(data[4] | (data[5] << 8));
+    /* Bounded and unconditional: the first few say the path is live in a log
+     * that was not armed for it, which is the log a player session produces. */
+    if (shown < 4 || g_trace) {
+        shown++;
+        fprintf(stderr, "  [USB] output report %u bytes: rumble left=%u right=%u%s\n",
+                len, left, right, g_pad_rumble ? "" : " (no host hook)");
+        fflush(stderr);
+    }
+    if (g_pad_rumble)
+        g_pad_rumble(left, right);
+    return 0;
+}
+
 /* Control-transfer state.
  *
  * A control transfer spans several TDs and the title is free to add them in
@@ -180,6 +215,12 @@ static struct {
     uint8_t  data[XBOX_USB_CTRL_MAX];
     uint32_t data_len;
     uint32_t data_off;
+    /* A host-to-device request with a data stage: the SETUP that opened it,
+     * and the OUT bytes collected until its status stage retires. */
+    uint8_t  setup[8];
+    uint8_t  out_expect;
+    uint8_t  out_buf[XBOX_USB_CTRL_MAX];
+    uint32_t out_len;
 } g_dev;
 
 void xbox_UsbDeviceReset(void)
@@ -314,13 +355,31 @@ static int usb_control_request(const uint8_t setup[8], uint8_t *out,
         }
     }
 
-    if (g_trace) {
+    /* SET_REPORT, the class request that carries the rumble packet the other
+     * way: 21 09 00 02 00 00 06 00 -- host-to-device, CLASS, INTERFACE, report
+     * type 2 (output), report id 0, six bytes. The bytes arrive in the OUT
+     * data stage, which ohci_run_td collects and xbox_UsbOutputReport reads
+     * once the status stage retires. Refusing this is not harmless: a stalled
+     * control pipe is a dead device to XPP, and the title then puts up
+     * "please reconnect the controller". Measured 21 Sep 2026: the first car
+     * hit of a session, 44 stalled TDs, and the reconnect screen. */
+    if ((bmRequestType & 0x60u) == 0x20u && (bmRequestType & 0x1Fu) == 0x01u
+            && !(bmRequestType & 0x80u) && bRequest == 0x09
+            && (wValue >> 8) == 0x02) {
+        return 0;
+    }
+
+    {
+        static unsigned shown;
+        if (g_trace || shown < 8) {
+        shown++;
         fprintf(stderr,
                 "  [USB] unhandled setup %02X %02X %02X %02X %02X %02X %02X %02X"
                 " -> STALL\n",
                 setup[0], setup[1], setup[2], setup[3],
                 setup[4], setup[5], setup[6], setup[7]);
         fflush(stderr);
+        }
     }
     return -1;
 }
@@ -461,12 +520,19 @@ static uint32_t ohci_run_td(const xbox_ohci_service *s, uint32_t ed_flags,
         g_dev.data_off = 0;
         g_dev.set_address_valid = 0;
         g_dev.stalled = 0;
+        g_dev.out_expect = 0;
+        g_dev.out_len = 0;
         if (xbox_UsbControlRequest(setup, g_dev.data, sizeof(g_dev.data),
                                    &g_dev.data_len) != 0) {
             /* A device may not stall the SETUP transaction itself; the refusal
              * shows up on the stage that follows it. */
             g_dev.stalled = 1;
             g_dev.data_len = 0;
+        } else if (!(setup[0] & 0x80u) && (setup[6] | setup[7])) {
+            /* Host-to-device with a data stage: the OUT TDs that follow carry
+             * the payload, and the request completes at its status stage. */
+            memcpy(g_dev.setup, setup, 8);
+            g_dev.out_expect = 1;
         }
         moved = 8;
     } else if (g_dev.stalled) {
@@ -513,9 +579,20 @@ static uint32_t ohci_run_td(const xbox_ohci_service *s, uint32_t ed_flags,
                 cc = XBOX_OHCI_CC_NOERROR;
         }
     } else {                                  /* TD_PID_OUT */
-        /* Either the status stage of a device-to-host transfer, or rumble data
-         * on EP2. Nothing consumes the latter yet; accepting it is honest,
-         * since the device would. */
+        /* One of three things: the status stage of a device-to-host transfer
+         * (zero bytes), the data stage of a host-to-device control request
+         * (collected here, consumed at its status stage), or a packet on the
+         * interrupt OUT endpoint, which is the output report itself. */
+        if (ED_EN(ed_flags) != 0) {
+            if (want && buf)
+                xbox_UsbOutputReport(buf, want);
+        } else if (g_dev.out_expect && want && buf) {
+            uint32_t room = (uint32_t)sizeof(g_dev.out_buf) - g_dev.out_len;
+            uint32_t n = want < room ? want : room;
+            if (n)
+                memcpy(g_dev.out_buf + g_dev.out_len, buf, n);
+            g_dev.out_len += n;
+        }
         moved = want;
     }
 
@@ -538,6 +615,15 @@ static void ohci_end_of_transfer(uint32_t pid, uint32_t want)
     if (g_dev.set_address_valid) {
         g_dev.address = g_dev.set_address;
         g_dev.set_address_valid = 0;
+    }
+    if (g_dev.out_expect) {
+        /* The data stage is complete. SET_REPORT(output) is the pad's rumble
+         * packet; any other host-to-device payload is accepted and dropped. */
+        if ((g_dev.setup[0] & 0x60u) == 0x20u && g_dev.setup[1] == 0x09
+                && g_dev.setup[3] == 0x02)
+            xbox_UsbOutputReport(g_dev.out_buf, g_dev.out_len);
+        g_dev.out_expect = 0;
+        g_dev.out_len = 0;
     }
     g_dev.stalled = 0;
     g_dev.data_len = 0;

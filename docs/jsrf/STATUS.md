@@ -2,8 +2,11 @@
 
 Last measured 14 September 2026, against the tree at `a113ae9`, title built
 `-O2`, on an Apple M1 Max, with the 21 September section below added against
-`49ff7e2`. Every number here came from a run; where something is believed
-rather than measured it says so.
+`49ff7e2`, and the drain, vertex-path, batching-default and ADX entries
+corrected on the night of 21 September against the 1167 s player session in
+`progress/CLAUDE_PROGRESS_2026-09-21_NIGHT5_THE_STEAL_PUT_THE_POISON_BACK.md`.
+Every number here came from a run; where something is believed rather than
+measured it says so.
 
 ## Fixed 21 September 2026 — the Load screen, the light, and the character select
 
@@ -55,21 +58,166 @@ about them. Recorded at `462b656`; the detail is in
 ## Not working
 
 **Frame rate.** 27–30 fps at a scene-verified mission against a title that
-holds 60.1 fps in xemu. The `clear_surface` cost is now split: over a 20-minute
-play session, 443,738 ms went on draining the GPU and 125,914 ms on reading back
-and converting — **78% drain, 22% readback**. The code's own note says what that
-means: drain-dominated leaves pipelining as the only win, and a resident clear
-could remove the readback half only. `RECOMP_METAL_BATCH` is the pipelining
-lever and is measured; what it lacks is a stability verdict, not performance
-evidence.
+holds 60.1 fps in xemu. **That number has not been re-measured since the GPU
+vertex path became the default** and should not be quoted as current; the
+21 Sep night player session read 43–53 fps in ordinary play and 28–34 with
+heavy traffic, but in different scenes, and scene-matching every comparison is
+the rule this tree learned the hard way. `measure.sh` on the same scene
+settles it.
 
-Separately, and larger: **NV2A vertex programs are interpreted on the CPU on
-macOS** (`nv2a_vsh_execute`, ~7.5 ms of a ~32 ms frame). The D3D11 path emits
-HLSL instead. An MSL emitter now exists with full opcode coverage and tests, but
-it is not wired into the renderer and must not be until its outputs are compared
-against the interpreter — moving vertex work to the GPU also moves triangle
-assembly, culling and the reject paths, which all currently read the shader's
-CPU-side output.
+**THE GPU WORK ITSELF IS THE COST, AND IT IS SOFTWARE TEXTURE SAMPLING.**
+Found 21 Sep 2026 night by reading how the Metal backend drives the hardware:
+
+    grep -c 'MTLSamplerState|newSamplerStateWithDescriptor|texture2d<'  ->  0
+
+**Not one hardware sampler exists in the renderer.** `MTLTextureDescriptor`
+appears only for the depth texture, the stencil texture and the render
+surface — never for a guest texture. Guest textures live in
+`const device uchar*` buffers (`[METAL] texture buffers: 13,100,361
+requests`) and `sample_lod()` samples them **in software inside the fragment
+shader**: perspective divide, `dfdx`/`dfdy` gradients and a `log2` for LOD,
+then two `sample_level` calls, each walking a Morton address, decoding
+DXT1/DXT3 by hand and doing its own bilinear — up to **eight software texel
+fetches** where hardware does one on dedicated silicon with a texture cache.
+
+That is why the drain is expensive. `sync` waits on `waitUntilCompleted`, so
+its 6.94–9 ms per flip IS GPU execution time — for a **640×480** scene on an
+M1 Max, which should be comfortably under a millisecond. The drain is not
+mainly a presenter problem; it is the GPU genuinely taking that long.
+
+Early-Z compounds it and the code says so: with `[[early_fragment_tests]]`
+off, "every occluded fragment in the scene pays the whole combiner chain and
+up to four texture samples first". The run reads
+`depth test before the shader: 0 draws early, 7807313 late (early_z OFF)`,
+and an `fs_hw_early` variant already exists, gated.
+
+**The change:** upload guest textures as `MTLTexture` with native BC1/BC2/BC3
+(Apple Silicon supports them), de-swizzle once at upload — 50,341 uploads
+against 13.1 M sample requests, so the cost moves to the right side — and
+sample through a real `sampler` carrying the guest's filter and wrap state.
+Early-Z then becomes viable for the draws that cannot discard.
+
+This supersedes the earlier framing that direct GPU presentation was the
+largest opportunity. Presentation removes readback, snap, convert and upload;
+it leaves the drain, and the drain is the GPU doing software texture
+filtering. Fix the sampling first — it needs no presenter rewrite.
+
+Where the drain is, measured over a 1167 s player session (49,889 flips),
+`progress/CLAUDE_PROGRESS_2026-09-21_NIGHT5_THE_STEAL_PUT_THE_POISON_BACK.md`:
+
+| caller | calls | wait | readback | per flip |
+|---|---|---|---|---|
+| **external** | 50,121 | **346.4 s** | 30.2 s | **6.94 ms** |
+| swap | 100,075 | 33.6 s | 29.3 s | 0.67 ms |
+| invalidate | 441 | 0.0 s | 0.4 s | ~0 |
+
+**`external` is 91% of all drain waiting** — one call per flip, the flip
+readback, not the diagnostics. Swaps drain twice as often and ten times more
+cheaply, because by then the GPU has usually caught up; the flip readback
+drains immediately after the frame's work was submitted. The flip round trip
+— drain, copy the colour surface to guest RAM, upload it back to present — is
+the target, not the swap. `no_flip_sync=1` is not the fix and
+`nv2a_pb_exec.c` says why: it presents stale guest RAM.
+
+An earlier revision of this file attributed 443,738 ms of drain and
+125,914 ms of readback to a `clear_surface` caller. **There is no such
+caller** — the instrument has four (`SYNC_WHO_EXTERNAL`, `SWAP`,
+`INVALIDATE`, `FRAME_END`, `nv2a_metal.m:2603`) — and the figure predates the
+current naming. `RECOMP_METAL_BATCH` remains the pipelining lever; it is on by
+default and measured, and what it lacks is a stability verdict.
+
+Separately: **NV2A vertex programs run on the GPU.** `vsh_gpu_on()`
+(`nv2a_metal.m:971`) defaults to 1, and the session above reads
+`[METAL] vsh: guest programs on the GPU (metal_vsh on)` with
+`vsh draws: 7646170 GPU, 161143 CPU` — 98% of draws, 33 programs compiled
+against 7,646,746 cache hits. The CPU interpreter is the fallback and the
+control arm. *(This paragraph previously said the opposite — that the MSL
+emitter "is not wired into the renderer". It is, and has been by default.)*
+
+What is still on the CPU is vertex **marshalling**, and as of 21 Sep 2026
+night it is measured rather than inferred. Two scene-matched `measure.sh` runs
+(Corn tutorial, `nodes=61`, 0 guest faults, 59.9 and 60.2 fps) with
+`RECOMP_METAL_CB_STATS=1` split a 19.46 ms frame at 66 draws:
+
+| | ms/frame | % frame | µs/draw |
+|---|---|---|---|
+| `sync` — the GPU drain | 8.95 | 46% | — |
+| **our own draw code** | **6.03** | **31%** | **91** |
+| Metal create+encode+commit | 0.127 | 0.7% | 1.9 |
+
+**Metal is 0.7% of the frame.** Every "make the Metal calls cheaper" idea is
+aimed at nothing. Inside our 91 µs per draw:
+
+| region | µs/draw |
+|---|---|
+| `prepare_vertices` (the `vsh` stage) | **47** |
+| setup + ring reserve + vertex pack | 16.2 |
+| surface + texture + pipeline state | 14.7 |
+| validation + triangle assembly | 8.8 |
+
+`prepare_vertices` alone is half the per-draw cost. **It has no hot spot.**
+`RECOMP_VSH_SPLIT` measured it at **13,615 vertices/frame, 212 ns each**, of
+which attribute fetch is only 39 ns (18%); the other 82% is loop overhead
+spread across the per-vertex body. `execute` reads 0.0 ms over 0 vertices,
+confirming the GPU takes 100% of the programs.
+
+The one candidate that looked obvious — the per-vertex 256-byte seed copy —
+was tried and **measured null**: `RECOMP_VSH_HOIST_INPUTS` hoists it to once
+per batch (provably equivalent; `s_vsh.current` is loop-invariant and
+`fetch_vertex` never touches it) and a scene-matched A/B moved vsh
+2.88 → 2.80 ms/frame, 0.4% of frame, inside variance. The switch is kept as a
+control arm so nobody retries it.
+
+So this stage does not have a copy to remove; it has **13,615 CPU iterations
+per frame to stop doing**, which means uploading the guest vertex buffer and
+letting the GPU fetch its own attributes. That is the "everything on the GPU"
+endgame and it is a project, not a patch.
+
+Three things were checked and ruled OUT before this split was taken, each of
+which looked like the answer: Metal batching is coalescing (17.8 draws/flush
+here, ~183 in a heavy scene), the vertex upload already narrows to
+`vsh_active->nattrs`, and CPU triangle culling is already skipped whenever
+`vsh_gpu_culling` is on, which it is.
+
+**Scene caveat:** absolute µs/draw is scene-dependent — the tutorial runs 66
+draws/frame at 91 µs, a heavy street scene 549 at ~42 µs. The proportions are
+what transfer, not the absolute figure.
+
+**The ADX priority lock — fixed on the night of 21 September, NOT yet
+validated in play.** CRI's ADX lock is mutual exclusion built on priority
+elevation, which this runtime records without enacting, so `adx_guard`
+restores it with a host mutex spanning the guest critical section
+(`RECOMP_ADX_SERIALIZE=1`). That guard had a hole: its 5000 ms steal let a
+second thread into the region while the holder was inside, which is precisely
+the interleave it exists to prevent. Player session 10 hit it at Beat's race
+challenge — `saved_priority` 1 → 15, 0.4 fps for the last 171 s of a 1167 s
+run, one 5000 ms frame per five-second window.
+
+**VALIDATED IN PLAY, 22 Sep 2026.** A 2040 s player session ran to a crash
+from an unrelated fault with the guard perfectly balanced throughout:
+`locks=357285 unlocks=357285 matched (+0 UNMATCHED, 0 SKIPPED)`, `held=0`,
+**271 contended acquisitions, 0 stalls, 0 steals, 0 poison**. Sessions 11 and
+12 had both wedged by ~620 s; this one ran more than three times longer under
+three times the contention and never stalled. Log
+`last-run-2026-09-22-SESSION14-CRASH-AFTER-COPS.log`.
+
+The history below is kept because the intermediate state is the interesting
+part. Both steal paths are closed and unit-tested with a positive control, and
+the poisoning has not recurred. **The fix did first freeze two player sessions
+hard at ~620 s** — `saved_priority` stayed healthy at 1 through 169
+contended acquisitions, yet the main thread parked in `adx_guard_lock_enter`
+for good while the ADX spinner burned a core, with no thread anywhere inside
+the guest critical section. It traded a 0.4 fps crawl for a deadlock and the
+player got less playtime than before.
+
+The host-thread-migration hypothesis for those freezes was **refuted** from
+the logs (`+0 UNMATCHED` across 477,689 locks in three sessions, so lock and
+unlock always pair on the same host thread), and the 22 Sep session then
+declined to reproduce the freeze at all. The guard now also names its holder
+by `pthread_threadid_np` when it stalls, so a recurrence identifies the
+holding thread directly instead of by inference from a sample.
+Full account, with samples, in
+`progress/CLAUDE_PROGRESS_2026-09-21_NIGHT5_THE_STEAL_PUT_THE_POISON_BACK.md`.
 
 **Intermittent crash — now attributed, and the rate was overstated here.**
 Across 390 recorded runs, 46 end in a guest fault (11.8%), and the hazard is
@@ -107,14 +255,29 @@ value is lost in recompiled guest code rather than in the renderer. Whether the
 same path carries other tints in the game is **not established**, and if it
 does this matters well beyond the intro.
 
-**Metal command-buffer batching** is implemented, measured and **off by
-default**. Replaying one captured 492-draw frame through both submission paths,
-25 alternating trials: 69.2 ms to GPU completion per-draw against 46.5 ms
-batched, distributions not overlapping. It was briefly the default and a person
-playing interactively got stuck on the SEGA screen; twelve scripted boots could
-not reproduce that, and it is opt-in until it is understood. A measured
-rendering win does not outrank a title that will not start.
-`RECOMP_METAL_BATCH=1`.
+**Metal command-buffer batching** is implemented, measured, and **ON by
+default — which is not what this file, the code comment above it, or the
+decision that followed the SEGA-screen report all say.** Replaying one
+captured 492-draw frame through both submission paths, 25 alternating trials:
+69.2 ms to GPU completion per-draw against 46.5 ms batched, distributions not
+overlapping. It was made the default, a person playing interactively got stuck
+on the SEGA screen, twelve scripted boots could not reproduce it, and the
+stated resolution on 14 Sep 2026 was to revert to opt-in until understood.
+
+**That revert never reached the code.** `batch_on()` (`nv2a_metal.m:197`)
+reads `on = (e && *e) ? (atoi(e)!=0) : 1` — unset means on. The comment
+directly above it still says "the default goes back to off". No player
+`paths.conf` sets the switch, so every session since has run batched: all five
+hung or frozen player sessions of 21 Sep log
+`[METAL] one encoder per batch: yes (metal_batch on)`.
+
+This is not a claim that batching causes them — session 10's hang is fully
+attributed to the ADX poisoning below, and sessions 3, 5, 8 and 9 show zero
+ADX steals, so they are a separate and still-unexplained mode. It is a claim
+that **the configuration everyone believed was disabled has been live the
+whole time**, and that `RECOMP_METAL_BATCH=0` is now an untried A/B against
+those four. Decide the default deliberately; do not leave three documents
+disagreeing with one line of code.
 
 **Vertex reuse** is implemented and off. Its correctness gate is unresolved: one
 unexplained output mismatch in around 225M shader invocations.

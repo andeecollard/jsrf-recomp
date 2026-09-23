@@ -1217,6 +1217,7 @@ static void jsrf_pusher_report(void)
                 extern unsigned long g_ohci_wdh_blocked, g_ohci_wdh_cleared,
                                      g_ohci_wdh_longest_ms;
                 extern unsigned long g_ohci_tds_retired, g_ohci_tds_error;
+                extern unsigned long g_ohci_out_reports;
                 extern unsigned long g_pcrtc_untrapped, g_pcrtc_windows;
                 extern unsigned long g_sched_absolute_deadlines;
                 /* HcInterruptEnable and the published HCCA done head, every
@@ -1233,11 +1234,12 @@ static void jsrf_pusher_report(void)
                     unsigned ist = 0, hd = 0, ien = nv2a_ohci_snapshot(&ist, &hd);
                     fprintf(stderr,
                             "  [OHCI-WDH] blocked=%lu cleared=%lu longest=%lu ms"
-                            " | tds_retired=%lu tds_error=%lu"
+                            " | tds_retired=%lu tds_error=%lu out_reports=%lu"
                             " | ien=%08X ist=%08X hcca_done=%08X\n",
                             g_ohci_wdh_blocked, g_ohci_wdh_cleared,
                             g_ohci_wdh_longest_ms,
                             g_ohci_tds_retired, g_ohci_tds_error,
+                            g_ohci_out_reports,
                             ien, ist, hd);
                     fprintf(stderr,
                             "  [PCRTC] %lu writable windows opened, %lu stores"
@@ -1978,6 +1980,17 @@ void jsrf_voice_submit_probe(uint32_t pc, uint32_t a, uint32_t b, uint32_t c)
  * report's digital bit assignments, and bAnalogButtons is in report order
  * (A, B, X, Y, Black, White, LeftTrigger, RightTrigger), so the only work here
  * is the two-byte header and little-endian thumbsticks. */
+/* The other direction: the pad's output report is rumble, and it reaches the
+ * host controller through the same input layer that reads it. Port 0 is the
+ * one usb_pad_state_shim reads, so it is the one that shakes. */
+static void usb_pad_rumble_shim(uint16_t left, uint16_t right)
+{
+    XBOX_VIBRATION vib;
+    vib.wLeftMotorSpeed  = left;
+    vib.wRightMotorSpeed = right;
+    (void)xbox_InputSetState(0, &vib);
+}
+
 static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
 {
     XBOX_INPUT_STATE state;
@@ -4993,6 +5006,7 @@ int main(int argc, char **argv)
      * poll after enumeration already sees real pad state. */
     xbox_InputInit();
     xbox_SetUsbPadStateHook(usb_pad_state_shim);
+    xbox_SetUsbPadRumbleHook(usb_pad_rumble_shim);
     /* Put the executor's output on screen. Harmless when RECOMP_PB_EXEC is
      * unset: the getter simply reports no surface and Present just swaps. */
 #if !defined(_WIN32)

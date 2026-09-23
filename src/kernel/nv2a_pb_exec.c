@@ -536,6 +536,49 @@ static int clear_discard_on(void)
     return on;
 }
 
+/* HOIST THE PER-VERTEX DEFAULTS OUT OF THE PER-VERTEX LOOP.
+ *
+ * prepare_vertices() opened every vertex with
+ * memcpy(inputs, s_vsh.current, sizeof inputs) -- 256 bytes, 16 attributes by
+ * four floats -- to seed the attributes the fetch loop then overwrites. That
+ * copy was measured on 21 Sep 2026 as part of the 47 us/draw the `vsh` stage
+ * costs, which is HALF the 91 us our own code spends per draw (Metal's own
+ * create+encode+commit is 1.9 us of it).
+ *
+ * It is the same 256 bytes every vertex, because s_vsh.current does not
+ * change inside a batch. Seeding it once per batch is not an approximation:
+ * every vertex overwrites exactly the attributes the fetch loop writes, and
+ * an attribute the loop skips (not in inputs_read, or size 0) is never
+ * written by any vertex, so it holds the same s_vsh.current value under
+ * either scheme. The array stays fully initialised, so the reuse-verify path
+ * that copies all sixteen (memcpy(reuse_inputs[i], ...)) is unaffected.
+ *
+ * MEASURED, AND IT BUYS ESSENTIALLY NOTHING. Scene-matched A/B the same
+ * night (tutorial, nodes=61, 0 faults, 150 s each): vsh 2.88 -> 2.80 ms/frame,
+ * -0.08 ms, which is 0.4% of an 18.7 ms frame and inside run-to-run variance
+ * -- the whole-frame numbers moved -2.0% while cumulative fps moved -1.6, so
+ * the two disagree on sign. Treat it as zero.
+ *
+ * KEPT ANYWAY, as a control arm, because the null result is the useful part:
+ * it proves the per-vertex 256-byte seed is NOT where the vsh stage's time
+ * goes, so nobody needs to try this again. RECOMP_VSH_SPLIT then said where
+ * it does go -- 13,615 vertices/frame at 212 ns each, of which attribute
+ * fetch is only 39 ns (18%). The remaining 82% is loop overhead spread
+ * across the per-vertex body, not any one copy. This stage does not have a
+ * hot spot to remove; it has 13,615 iterations to stop doing, which means
+ * uploading the guest vertex buffer and letting the GPU fetch.
+ *
+ * OFF by default. RECOMP_VSH_HOIST_INPUTS=1. */
+static int vsh_hoist_inputs(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VSH_HOIST_INPUTS");
+        on = e ? (atoi(e) != 0) : 0;
+    }
+    return on;
+}
+
 static int vsh_narrow_outputs(void)
 {
     static int on = -1;
@@ -1591,11 +1634,32 @@ void nv2a_pb_exec_dump_program(void)
     fflush(stderr);
 }
 
+/* Slot + 1 of each in-range method in s_unhandled, 0 for none. A 5 s sample
+ * of the combo trick stage on 23 Sep 2026 put the linear scan this replaces
+ * at 7% of the pushbuffer thread's busy time: 244 million unhandled methods
+ * in one session, each walking the table. NV2A methods are dword offsets
+ * below 0x2000, so a direct index covers every one the title emits; anything
+ * else keeps the scan. */
+static int16_t s_unhandled_slot[0x2000 / 4];
+
 static void note_unhandled(uint32_t method)
 {
     int i;
-
     s_gpu.unhandled_total++;
+    if (method < 0x2000 && !(method & 3)) {
+        int16_t k = s_unhandled_slot[method >> 2];
+        if (k) {
+            s_unhandled[k - 1].count++;
+            return;
+        }
+        if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
+            s_unhandled[s_unhandled_count].method = method;
+            s_unhandled[s_unhandled_count].count = 1;
+            s_unhandled_count++;
+            s_unhandled_slot[method >> 2] = (int16_t)s_unhandled_count;
+        }
+        return;
+    }
     for (i = 0; i < s_unhandled_count; i++) {
         if (s_unhandled[i].method == method) {
             s_unhandled[i].count++;
@@ -4280,6 +4344,10 @@ static int prepare_vertices(void)
      * mismatch cannot distinguish "the inputs changed under us" from "the cache
      * is wrong", and rarity does not distinguish them either. */
     static float reuse_inputs[NV_MAX_INDICES][16][4];
+    /* Seeded once per batch when vsh_hoist_inputs() is on; the draw
+     * thread check upstream is what makes one static safe here, the
+     * same assumption reuse_inputs above already makes. */
+    static float batch_inputs[16][4];
     int reuse_active = (vsh_reuse_on() || vsh_reuse_verify()) && programmable;
     /* Wide copy whenever something reads the slots the narrow one leaves
      * stale: the reuse verifier compares all sixteen, and capture_draw writes
@@ -4287,9 +4355,13 @@ static int prepare_vertices(void)
     const int narrow_outputs = vsh_narrow_outputs() && !vsh_reuse_verify()
                                && !getenv("RECOMP_DRAW_CAPTURE");
 
+    const int hoist_inputs = vsh_hoist_inputs();
+    if (hoist_inputs) memcpy(batch_inputs, s_vsh.current, sizeof batch_inputs);
+
     for (uint32_t i = 0; i < s_gpu.idx_count; ++i) {
         if (programmable) {
-            float inputs[16][4];
+            float inputs_own[16][4];
+            float (*inputs)[4] = hoist_inputs ? batch_inputs : inputs_own;
             uint16_t reuse_key = s_gpu.idx[i];
             int reuse_from = -1;
             if (reuse_active &&
@@ -4307,7 +4379,8 @@ static int prepare_vertices(void)
             }
             NV2AVshResult result;
             unsigned long long _t_fetch = vsh_split_on() ? vsh_now_ns() : 0;
-            memcpy(inputs, s_vsh.current, sizeof(inputs));
+            if (!hoist_inputs)
+                memcpy(inputs_own, s_vsh.current, sizeof inputs_own);
             for (uint32_t a = 0; a < 16; ++a) {
                 if (!(s_vsh.decoded.inputs_read & (1u << a))) continue;
                 if (a == 3 && s_gpu.attr[3].size) s_fetched_alpha_seen = 1;
@@ -4435,7 +4508,7 @@ static int prepare_vertices(void)
                     reuse_seen[reuse_key >> 3] |= (uint8_t)(1u << (reuse_key & 7));
                     reuse_at[reuse_key] = (uint16_t)i;
                     if (vsh_reuse_verify() && i < NV_MAX_INDICES)
-                        memcpy(reuse_inputs[i], inputs, sizeof(inputs));
+                        memcpy(reuse_inputs[i], inputs, sizeof reuse_inputs[i]);
                 }
             }
             /* Sample a late batch as well as the first few. The early ones
@@ -6539,18 +6612,25 @@ void nv2a_pb_exec_report(void)
         }
         n_top = top;
     }
-    for (i = 0; i < n_top && i < s_unhandled_count; i++) {
-        int best = i;
-        for (j = i + 1; j < s_unhandled_count; j++)
-            if (s_unhandled[j].count > s_unhandled[best].count)
-                best = j;
-        if (best != i) {
-            PbUnhandled t = s_unhandled[i];
-            s_unhandled[i] = s_unhandled[best];
-            s_unhandled[best] = t;
+    /* Sorted on a copy: the live table is indexed by s_unhandled_slot, and
+     * swapping its entries in place would point every slot at the wrong
+     * method from the first report onwards. */
+    {
+        static PbUnhandled sorted[PB_EXEC_MAX_UNHANDLED];
+        memcpy(sorted, s_unhandled, (size_t)s_unhandled_count * sizeof sorted[0]);
+        for (i = 0; i < n_top && i < s_unhandled_count; i++) {
+            int best = i;
+            for (j = i + 1; j < s_unhandled_count; j++)
+                if (sorted[j].count > sorted[best].count)
+                    best = j;
+            if (best != i) {
+                PbUnhandled t = sorted[i];
+                sorted[i] = sorted[best];
+                sorted[best] = t;
+            }
+            fprintf(stderr, "  [GPU]   0x%04X x%u\n",
+                    sorted[i].method, sorted[i].count);
         }
-        fprintf(stderr, "  [GPU]   0x%04X x%u\n",
-                s_unhandled[i].method, s_unhandled[i].count);
     }
     if (getenv("RECOMP_PB_EXEC_PROGRAM"))
         nv2a_pb_exec_dump_program();

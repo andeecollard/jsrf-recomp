@@ -516,6 +516,117 @@ static void test_interrupt_in_report(void)
     xbox_SetUsbPadStateHook(NULL);
 }
 
+/* ---- the output report: rumble ---------------------------------------- */
+
+static unsigned g_rumble_calls;
+static uint16_t g_rumble_left, g_rumble_right;
+
+static void rumble_hook(uint16_t left, uint16_t right)
+{
+    g_rumble_calls++;
+    g_rumble_left = left;
+    g_rumble_right = right;
+}
+
+static void test_set_report_rumble(void)
+{
+    /* 21 09 00 02 00 00 06 00 -- SET_REPORT(output), the XID rumble packet on
+     * the control pipe. Before 21 Sep 2026 this stalled, XPP tore the pad down
+     * on the stall, and the first car hit of a session put up "please
+     * reconnect the controller to port 3". */
+    static const uint8_t set_report[8] = { 0x21, 0x09, 0x00, 0x02,
+                                           0x00, 0x00, 0x06, 0x00 };
+    static const uint8_t packet[6] = { 0x00, 0x06, 0x34, 0x12, 0x78, 0x56 };
+    xbox_ohci_service s;
+
+    xbox_UsbDeviceReset();
+    xbox_SetUsbPadRumbleHook(rumble_hook);
+    g_rumble_calls = 0;
+
+    /* SETUP, a six-byte OUT data stage, a zero-length IN status stage. */
+    memset(ram, 0, RAM_SIZE);
+    put_ed(ED_VA, 0x00080000u, TD_TAIL, TD_SETUP, 0);
+    put_td(TD_SETUP, 0xE2E00000u, BUF_SETUP, TD_IN, BUF_SETUP + 7u);
+    put_td(TD_IN, 0xE3080000u, BUF_IN, TD_OUT, BUF_IN + 5u);     /* OUT data */
+    put_td(TD_OUT, 0xE3F00000u, 0, TD_TAIL, 0);                  /* IN status */
+    memcpy(ram + BUF_SETUP, set_report, 8);
+    memcpy(ram + BUF_IN, packet, 6);
+
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 3, "SET_REPORT retires all three TDs");
+    check(td_cc(TD_SETUP) == XBOX_OHCI_CC_NOERROR, "its SETUP completes");
+    check(td_cc(TD_IN) == XBOX_OHCI_CC_NOERROR,
+          "its OUT data stage completes instead of stalling");
+    check(td_cc(TD_OUT) == XBOX_OHCI_CC_NOERROR, "and so does its status stage");
+    check((at(ED_VA)[2] & 1u) == 0u, "the control endpoint is not halted");
+    check(g_rumble_calls == 1, "the host rumble hook is called once");
+    check(g_rumble_left == 0x1234 && g_rumble_right == 0x5678,
+          "with the little-endian motor speeds from the packet");
+
+    /* The status stage is what completes it: the hook must not fire on the
+     * data stage alone, or a driver that splits the packet would rumble on
+     * half of one. */
+    xbox_UsbDeviceReset();
+    g_rumble_calls = 0;
+    memset(ram, 0, RAM_SIZE);
+    put_ed(ED_VA, 0x00080000u, TD_TAIL, TD_SETUP, 0);
+    put_td(TD_SETUP, 0xE2E00000u, BUF_SETUP, TD_IN, BUF_SETUP + 7u);
+    put_td(TD_IN, 0xE3080000u, BUF_IN, TD_TAIL, BUF_IN + 5u);
+    memcpy(ram + BUF_SETUP, set_report, 8);
+    memcpy(ram + BUF_IN, packet, 6);
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 2 && g_rumble_calls == 0,
+          "no status stage yet, no rumble yet");
+    put_td(TD_OUT, 0xE3F00000u, 0, TD_TAIL, 0);
+    at(ED_VA)[2] = TD_OUT;
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 1 && g_rumble_calls == 1,
+          "the status stage on a later pass completes it");
+
+    /* A class request this device still does not know keeps stalling: the
+     * fix is for the report, not a blanket yes. */
+    {
+        static const uint8_t set_idle[8] = { 0x21, 0x0A, 0x00, 0x00,
+                                             0x00, 0x00, 0x00, 0x00 };
+        xbox_UsbDeviceReset();
+        build_control(set_idle, 0);
+        s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+        check(td_cc(TD_IN) == XBOX_OHCI_CC_STALL,
+              "an unknown class request still stalls");
+    }
+    xbox_SetUsbPadRumbleHook(NULL);
+}
+
+static void test_interrupt_out_rumble(void)
+{
+    /* The same packet on the interrupt OUT endpoint the configuration
+     * descriptor advertises (EP2), which is the other way a driver sends it. */
+    static const uint8_t packet[6] = { 0x00, 0x06, 0xFF, 0xFF, 0x00, 0x00 };
+    xbox_ohci_service s;
+
+    xbox_UsbDeviceReset();
+    xbox_SetUsbPadRumbleHook(rumble_hook);
+    g_rumble_calls = 0;
+    memset(ram, 0, RAM_SIZE);
+    /* endpoint 2, direction OUT (bits 11-12 = 01), MPS 32 */
+    put_ed(ED_VA, 0x00200000u | (2u << 7) | (1u << 11), TD_TAIL, TD_SETUP, 0);
+    put_td(TD_SETUP, 0xE3080000u, BUF_IN, TD_TAIL, BUF_IN + 5u);
+    memcpy(ram + BUF_IN, packet, 6);
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 1, "the interrupt OUT TD retires");
+    check(td_cc(TD_SETUP) == XBOX_OHCI_CC_NOERROR, "without error");
+    check(g_rumble_calls == 1 && g_rumble_left == 0xFFFF && g_rumble_right == 0,
+          "and the packet reaches the host rumble hook");
+
+    /* No hook installed: the packet is still consumed, never refused. */
+    xbox_SetUsbPadRumbleHook(NULL);
+    at(ED_VA)[2] = TD_SETUP;
+    put_td(TD_SETUP, 0xE3080000u, BUF_IN, TD_TAIL, BUF_IN + 5u);
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 1 && td_cc(TD_SETUP) == XBOX_OHCI_CC_NOERROR,
+          "with no host hook the report is accepted and dropped");
+}
+
 int main(void)
 {
     test_captured_get_descriptor();
@@ -528,6 +639,8 @@ int main(void)
     test_deferred_writeback();
     test_bounds_and_list_safety();
     test_interrupt_in_report();
+    test_set_report_rumble();
+    test_interrupt_out_rumble();
 
     if (failures) return 1;
     puts("ohci_transfer_test: all checks passed");

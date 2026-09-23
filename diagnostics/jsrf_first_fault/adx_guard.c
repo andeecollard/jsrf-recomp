@@ -21,6 +21,24 @@ static pthread_mutex_t g_m  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 
 static unsigned long g_owner;        /* t_id of the holder; 0 when free */
+/* THE HOLDER BY NAME, NOT BY COUNTER.
+ *
+ * "holder 2" is an internal sequence number and identifies nothing. Sessions
+ * 11 and 12 of 21 Sep 2026 both froze with a holder that never released, and
+ * working out WHICH thread that was took a `sample` and an inference. This is
+ * the id `sample` itself prints, so the next freeze names it directly. */
+static unsigned long long g_owner_tid;
+
+static unsigned long long adx_self_tid(void)
+{
+#ifdef __APPLE__
+    unsigned long long t = 0;
+    pthread_threadid_np(NULL, &t);
+    return t;
+#else
+    return (unsigned long long)(uintptr_t)pthread_self();
+#endif
+}
 static unsigned      g_depth;        /* the holder's nesting */
 static unsigned long g_next_id = 1;  /* hands out t_id under g_m */
 
@@ -47,6 +65,15 @@ unsigned adx_guard_timeout_ms(void)
         read = 1;
     }
     return ms;
+}
+
+/* OFF by default. See adx_guard.h: the steal was measured to cause the wedge
+ * it was meant to diagnose, and never measured to rescue one. */
+int adx_guard_steal_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on("RECOMP_ADX_LOCK_STEAL");
+    return on;
 }
 
 static unsigned long my_id(void)
@@ -85,8 +112,34 @@ static void guard_acquire(void)
                 }
                 while (g_owner != 0 && g_owner != me) {
                     if (pthread_cond_timedwait(&g_cv, &g_m, &deadline) != 0) {
-                        timed_out = 1;
-                        break;
+                        if (adx_guard_steal_on()) {
+                            timed_out = 1;
+                            break;
+                        }
+                        /* Do NOT take it. Entering while the holder is inside
+                         * is what poisons the guest's one saved-priority
+                         * slot, and a poisoned run is worse than a stalled
+                         * one: it corrupts quietly and then crawls. Say who
+                         * we are waiting for and go back to waiting. */
+                        ++g_st.stalls;
+                        fprintf(stderr,
+                                "  [ADX-GUARD] STALLED %u ms: waiter %lu"
+                                " (thread %llu) wants the region, holder %lu"
+                                " (THREAD %llu) is still inside (stall #%lu)."
+                                " Match that thread id against `sample` to"
+                                " name it. NOT stealing -- that is what"
+                                " poisons 0x0027D0F8.\n",
+                                ms, me, adx_self_tid(), g_owner,
+                                g_owner_tid, g_st.stalls);
+                        fflush(stderr);
+                        gettimeofday(&now, NULL);
+                        deadline.tv_sec  = now.tv_sec + (time_t)(ms / 1000u);
+                        deadline.tv_nsec = now.tv_usec * 1000L
+                                         + (long)(ms % 1000u) * 1000000L;
+                        if (deadline.tv_nsec >= 1000000000L) {
+                            deadline.tv_sec  += 1;
+                            deadline.tv_nsec -= 1000000000L;
+                        }
                     }
                 }
                 if (timed_out && g_owner != 0 && g_owner != me) {
@@ -97,6 +150,7 @@ static void guard_acquire(void)
                 }
             }
             g_owner = me;
+            g_owner_tid = adx_self_tid();
             ++t_depth;          /* not "= 1": a steal victim may re-enter */
             g_depth = t_depth;
         }
@@ -105,6 +159,39 @@ static void guard_acquire(void)
         g_st.owner = g_owner;
     }
     pthread_mutex_unlock(&g_m);
+}
+
+/* Take one level WITHOUT waiting and WITHOUT stealing: 1 if it is now ours
+ * (it was free, or already ours), 0 if another thread is inside the region.
+ * This is the unmatched unlock's only way in -- see adx_guard.h. */
+static int guard_try_acquire(void)
+{
+    int got;
+    pthread_mutex_lock(&g_m);
+    {
+        unsigned long me = my_id();
+
+        if (t_depth > 0 && g_owner == me) {
+            ++t_depth;
+            g_depth = t_depth;
+            got = 1;
+        } else if (g_owner == 0) {
+            g_owner = me;
+            g_owner_tid = adx_self_tid();
+            ++t_depth;
+            g_depth = t_depth;
+            got = 1;
+        } else {
+            got = 0;
+        }
+        if (got) {
+            if (t_depth > g_st.max_depth) g_st.max_depth = t_depth;
+            g_st.depth = g_depth;
+            g_st.owner = g_owner;
+        }
+    }
+    pthread_mutex_unlock(&g_m);
+    return got;
 }
 
 /* Give one level back. A thread that was stolen from drops its own nesting and
@@ -140,18 +227,36 @@ void adx_guard_lock_enter(void)
 
 int adx_guard_unlock_enter(void)
 {
-    int matched;
     if (!adx_guard_on()) return 0;
 
-    matched = (t_depth > 0);
-    if (!matched)
-        guard_acquire();        /* serialise this body; own nothing after it */
+    /* t_depth is this thread's own, so reading it unlocked is safe: nobody
+     * else writes it. A thread that was stolen from still reads > 0 here and
+     * is still a matched unlock -- guard_release() sorts that out and counts
+     * it as stolen_from. */
+    if (t_depth > 0) {
+        pthread_mutex_lock(&g_m);
+        ++g_st.unlocks_matched;
+        pthread_mutex_unlock(&g_m);
+        return 1;
+    }
+
+    /* Unmatched: sub_001437B0's I/O guard calling the registered unlock on a
+     * spin pass. Take the guard only if it is FREE. Waiting here and then
+     * stealing is what poisoned 0x0027D0F8 on 21 Sep 2026 -- the body drove
+     * the refcount to zero underneath a holder that was still elevated. On
+     * hardware this pass could not have run at all, so when another thread is
+     * inside we refuse the body rather than serialise it late. */
+    if (!guard_try_acquire()) {
+        pthread_mutex_lock(&g_m);
+        ++g_st.unlocks_skipped;
+        pthread_mutex_unlock(&g_m);
+        return -1;
+    }
 
     pthread_mutex_lock(&g_m);
-    if (matched) ++g_st.unlocks_matched;
-    else         ++g_st.unlocks_unmatched;
+    ++g_st.unlocks_unmatched;
     pthread_mutex_unlock(&g_m);
-    return matched;
+    return 0;
 }
 
 void adx_guard_unlock_leave(void)
@@ -176,18 +281,35 @@ void adx_guard_report(void)
     adx_guard_read_stats(&s);
     fprintf(stderr,
             "  [ADX-GUARD] serialize %s: locks=%lu unlocks=%lu matched"
-            " (+%lu UNMATCHED) contended=%lu max_depth=%u held=%u\n",
+            " (+%lu UNMATCHED, %lu SKIPPED) contended=%lu max_depth=%u"
+            " held=%u\n",
             adx_guard_on() ? "on" : "OFF",
             s.locks, s.unlocks_matched, s.unlocks_unmatched,
-            s.contended, s.max_depth, s.depth);
+            s.unlocks_skipped, s.contended, s.max_depth, s.depth);
+    if (s.depth)
+        fprintf(stderr, "  [ADX-GUARD] held right now by t_id %lu, thread %llu"
+                        " -- if this is the same thread every report, it is"
+                        " not making progress\n", s.owner, g_owner_tid);
+    /* Skipped passes are the fix working, not a fault: each one is a spin
+     * pass that hardware would not have run either. They are printed because
+     * a number that only ever appears when something is wrong teaches nobody
+     * what its healthy value looks like. */
     /* stolen_from rides on the same line as steals rather than a line of its
      * own: it is the other half of one event, and a counter that is collected
      * and never printed is one this tree has had to retire before. */
+    if (s.stalls)
+        fprintf(stderr,
+                "  [ADX-GUARD] %lu STALLS of %u ms waiting for a holder that"
+                " was still inside -- waited rather than stole, so the region"
+                " stayed serialised and 0x0027D0F8 was not rewritten\n",
+                s.stalls, adx_guard_timeout_ms());
     if (s.steals || s.stolen_from)
         fprintf(stderr,
-                "  [ADX-GUARD] %lu STEALS after %u ms, %lu releases by a thread"
-                " already stolen from -- a lock was held with no unlock, and"
-                " that region ran unserialised\n",
+                "  [ADX-GUARD] %lu LOCK-PATH STEALS after %u ms"
+                " (RECOMP_ADX_LOCK_STEAL is ON), %lu releases by a thread"
+                " already stolen from -- that region ran unserialised and may"
+                " have poisoned the saved-priority slot. Unmatched unlocks"
+                " never steal; they are the SKIPPED count above\n",
                 s.steals, adx_guard_timeout_ms(), s.stolen_from);
     if (s.locks && s.unlocks_unmatched > s.locks)
         fprintf(stderr,

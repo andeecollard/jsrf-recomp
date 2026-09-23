@@ -1300,3 +1300,22 @@ if(JSRF_STARTUP_ABI_CHECK OR JSRF_ABI_CHECK_ALL)
     endif()
     target_compile_definitions(xbox_kernel PRIVATE RECOMP_ABI_CHECK)
 endif()
+
+# G27 step one. Moving guest textures into an MTLTexture only counts if the
+# pixels survive it, so the CPU decoder is checked against the rules read out
+# of texel() in nv2a_metal.m -- not against itself. The cases that matter are
+# the ones a fresh implementation gets wrong: DXT1 index 3 under c0 <= c1 is
+# TRANSPARENT black, DXT3 never takes that branch, RGBA8 is BGRA and Morton
+# addressed, and morton() must be a bijection or the decode drops texels.
+add_executable(jsrf_texture_decode_test
+    texture_decode_test.c ../../src/nv2a/nv2a_texture_decode.c)
+target_include_directories(jsrf_texture_decode_test PRIVATE . ../../src/nv2a)
+add_test(NAME jsrf_texture_decode COMMAND jsrf_texture_decode_test)
+
+# Does enforcing guest thread priority remove the need for adx_guard? The two
+# arms are the experiment: with the scheduler off the ADX poison MUST form
+# (that arm reproduces today's runtime, and without it a green result proves
+# nothing), and with it on the poison must be unwritable WITH NO GUARD.
+add_executable(jsrf_sched_priority_test sched_priority_test.c)
+target_link_libraries(jsrf_sched_priority_test PRIVATE Threads::Threads)
+add_test(NAME jsrf_sched_priority COMMAND jsrf_sched_priority_test)

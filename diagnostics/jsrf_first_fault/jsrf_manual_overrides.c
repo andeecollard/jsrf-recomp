@@ -170,7 +170,16 @@ loc_0013B0D3:
 
 void sub_0013B0E0(void)
 {
-    adx_guard_unlock_enter();
+    /* An unlock from a thread that never locked, arriving while another
+     * thread is inside the region, is a spin pass that an elevated holder
+     * would have prevented from running at all. Drop it: the body would
+     * decrement the refcount and rewrite the one saved-priority slot
+     * underneath the holder, which is how 0x0027D0F8 came to hold 15 on
+     * 21 Sep 2026. CRI's guard at sub_001437B0 calls this again next pass. */
+    if (adx_guard_unlock_enter() < 0) {
+        g_esp += 4;     /* ret, with the guest's words untouched */
+        return;
+    }
 
     RECOMP_MEM_WRITE32(0x0013B0E0u, 0x0013B0E0u, 0x25EFA0, MEM32(0x25EFA0) - 1);
     if (MEM32(0x25EFA0) != 0) goto loc_0013B101;    /* jne */

@@ -57,7 +57,9 @@ static void guest_lock(int t)
 
 static void guest_unlock(int t)
 {
-    adx_guard_unlock_enter();
+    /* Mirrors sub_0013B0E0: a refused pass returns without touching either
+     * shared word and without a leave, because nothing was taken. */
+    if (adx_guard_unlock_enter() < 0) return;
     --g_count;
     if (g_count == 0)                   /* the `jne` */
         xapi_set(t, g_saved);
@@ -272,6 +274,80 @@ static void run_unmatched(void)
     }
 }
 
+/* ── session 10: an unmatched unlock while A is inside the region ───────── */
+
+static int r_contended;      /* what adx_guard_unlock_enter() told thread B */
+
+static void *contended_unmatched(void *unused)
+{
+    (void)unused;
+    /* B never locked, and A is inside its region. Under the guard this must
+     * be refused outright. The old code waited adx_guard_timeout_ms() and
+     * then STOLE, which let this body run underneath A -- the whole defect. */
+    r_contended = adx_guard_unlock_enter();
+    if (r_contended >= 0) {             /* let in: run the body it would run */
+        --g_count;
+        if (g_count == 0) xapi_set(1, g_saved);
+        adx_guard_unlock_leave();
+    }
+    mark_done(6);
+    return NULL;
+}
+
+static void run_unmatched_contended(int guarded)
+{
+    struct adx_guard_stats s;
+    pthread_t t;
+
+    g_count = 0; g_saved = 0; g_base[0] = 1; g_base[1] = 1;
+    step = 0; done = 0; r_contended = 99;
+    adx_guard_reset_for_test();
+
+    guest_lock(0);          /* A: count 0->1, saves its real priority 1 */
+    CHECK(g_saved == 1, "A's lock should have saved 1, saved %d", g_saved);
+    CHECK(g_base[0] == 16, "A's lock should have raised it, base=%d", g_base[0]);
+
+    pthread_create(&t, NULL, contended_unmatched, NULL);
+
+    /* PROMPTLY, in both arms. A refusal that takes the timeout is still the
+     * 5000 ms frame the player watched, so "not stolen" is not enough on its
+     * own -- it also has to not wait. */
+    CHECK(done_within(6, 1000),
+          "the unmatched unlock neither ran nor was refused within 1 s --"
+          " it is waiting out the %u ms timeout", adx_guard_timeout_ms());
+    pthread_join(t, NULL);
+
+    if (guarded)
+        CHECK(r_contended < 0,
+              "a contended unmatched unlock was let into the region (%d)",
+              r_contended);
+
+    /* A's nested lock, the step that poisons. Guarded, the count is still 1,
+     * so the `jne` skips and the slot is never rewritten. */
+    guest_lock(0);
+
+    adx_guard_read_stats(&s);
+    if (guarded) {
+        CHECK(g_saved == 1,
+              "THE POISON FORMED UNDER THE GUARD: saved=%d (want 1)", g_saved);
+        CHECK(g_count == 2, "the refused pass changed the count (%d)", g_count);
+        CHECK(s.unlocks_skipped == 1,
+              "the refused pass was not counted (%lu)", s.unlocks_skipped);
+        CHECK(s.steals == 0,
+              "an unmatched unlock stole the guard (%lu steals)", s.steals);
+        guest_unlock(0);
+        guest_unlock(0);
+        CHECK(g_base[0] == 1, "A was not restored, base=%d", g_base[0]);
+    } else {
+        /* The positive control. Without the guard this exact sequence is the
+         * one the log recorded, and it must still reach 15 -- otherwise the
+         * test has stopped modelling the thing it guards. */
+        CHECK(g_saved == 15,
+              "the poison did NOT form unguarded (saved=%d) -- this sequence"
+              " no longer reproduces session 10", g_saved);
+    }
+}
+
 int main(int argc, char **argv)
 {
     int guarded = adx_guard_on();
@@ -294,6 +370,7 @@ int main(int argc, char **argv)
     run_interleave(guarded);
     run_recursive();
     run_unmatched();
+    run_unmatched_contended(guarded);
     adx_guard_report();
 
     fprintf(stderr, "%s\n", fail ? "FAILED" : "ok");

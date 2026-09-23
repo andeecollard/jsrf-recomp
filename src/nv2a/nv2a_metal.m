@@ -31,6 +31,12 @@ static id<MTLCommandBuffer> last_command;
  * and time the three phases separately before changing any of it. */
 unsigned long long g_mtl_cbufs, g_mtl_frames;
 unsigned long long g_mtl_ns_create, g_mtl_ns_encode, g_mtl_ns_commit;
+/* The three regions of nv2a_metal_draw that ran BEFORE the first timer.
+ * Measured 21 Sep 2026: create+encode+commit came to 0.133 ms of a
+ * 2.89 ms submit -- 4.6% -- so 95% of the draw cost was in code no
+ * counter covered. Same RECOMP_METAL_CB_STATS gate, so a run either has
+ * all six or none and the arithmetic always closes. */
+unsigned long long g_mtl_ns_valid, g_mtl_ns_pack, g_mtl_ns_state;
 static int mtl_cb_stats(void)
 {
     static int on = -1;
@@ -92,16 +98,25 @@ static void batch_flush(void);
 /* -1 forces off, 1 forces on, 0 defers to the switch. The frame benchmark
  * drives both paths inside one process, so it cannot use the environment. */
 static int batch_force;
-/* OPT-IN again as of 14 Sep 2026, after being on by default for one commit.
+/* READ batch_on() BELOW BEFORE TRUSTING THIS PARAGRAPH: THE DEFAULT IS 1.
  *
- * It was turned on by default on the evidence below, and then a person playing
- * the title interactively got stuck on the SEGA screen. That is a report from
- * the only test that actually matters, and it is not something the scripted
- * runs saw -- a scripted boot on the same binary reaches NtOpenFile 1408 and
- * 61 scene nodes. So the default goes back to off until that is either
- * reproduced and fixed or shown to be something else. Nothing below is
- * retracted; a measured rendering win does not outrank a title that will not
- * boot for the user, and the switch costs nothing to keep.
+ * The decision recorded here was to go back to opt-in, and it was never
+ * carried out. `batch_on()` reads `(e && *e) ? (atoi(e)!=0) : 1`, so unset
+ * means ON, and no player paths.conf sets the switch -- every interactive
+ * session since 14 Sep 2026 has run batched, including all five that hung or
+ * froze on 21 Sep. Noted 21 Sep 2026 night; the default is left alone here
+ * because changing it is a decision, not a documentation fix, and it wants
+ * the A/B below. See docs/jsrf/STATUS.md, "Metal command-buffer batching".
+ *
+ * The decision, for the record: it was turned on by default on the evidence
+ * below, and then a person playing the title interactively got stuck on the
+ * SEGA screen. That is a report from the only test that actually matters, and
+ * it is not something the scripted runs saw -- a scripted boot on the same
+ * binary reaches NtOpenFile 1408 and 61 scene nodes. So the default was to go
+ * back to off until that is either reproduced and fixed or shown to be
+ * something else. Nothing below is retracted; a measured rendering win does
+ * not outrank a title that will not boot for the user, and the switch costs
+ * nothing to keep.
  *
  * RECOMP_METAL_BATCH=1 enables it. What the evidence below establishes:
  *
@@ -309,6 +324,11 @@ void nv2a_metal_cb_report(void)
             g_mtl_cbufs, g_mtl_frames,
             g_mtl_frames ? (double)g_mtl_cbufs / (double)g_mtl_frames : 0.0,
             g_mtl_ns_create / 1e6, g_mtl_ns_encode / 1e6, g_mtl_ns_commit / 1e6);
+    fprintf(stderr,
+            "  [METAL-CB] before the command buffer: validate+assemble %.2fms,"
+            " vertex pack %.2fms, state+texture %.2fms (totals) -- this is the"
+            " 95%% the six-counter split was missing\n",
+            g_mtl_ns_valid / 1e6, g_mtl_ns_pack / 1e6, g_mtl_ns_state / 1e6);
     if (batch_on())
         fprintf(stderr,
                 "  [METAL-CB] batched: %llu flushes, %llu draws, %.1f draws/flush,"
@@ -509,10 +529,37 @@ typedef struct {
     size_t size;
     id<MTLBuffer> buffer;
     uint64_t stamp;
+    uint64_t verified_frame;   /* texture_frame when the full compare last matched */
 } TextureBuffer;
 static TextureBuffer texture_cache[TEXTURE_CACHE_SIZE];
 static id<MTLBuffer> dummy_buffer;
 static uint64_t texture_clock,texture_requests,texture_hits,texture_uploads;
+/* The cache used to memcmp the whole texture against guest RAM on EVERY
+ * request, and a frame requests the same textures hundreds of times: a 5 s
+ * sample of the combo trick stage (23 Sep 2026) put that memcmp at 28% of the
+ * pushbuffer thread's busy time, 13.1 M requests against 50 K uploads in a
+ * session. Now the full compare runs once per frame per entry; every other
+ * hit in the same frame compares a fixed sample of the bytes -- both ends and
+ * eight strided lines -- so a wholesale rewrite mid-frame is still caught at
+ * once, and a partial edit is caught at the next frame's full compare.
+ * texture_partial_caught counts the first kind: a change the once-per-frame
+ * rule alone would have drawn stale. A nonzero count in a session is the
+ * signal to revisit this. */
+static uint64_t texture_frame=1,texture_full_compares,texture_partial_compares,
+                texture_partial_caught,texture_changed;
+#define TEXTURE_PROBE 64
+static int texture_probe_differs(const uint8_t *a,const uint8_t *b,size_t size)
+{
+    if(size<=4*TEXTURE_PROBE) return memcmp(a,b,size)!=0;
+    if(memcmp(a,b,TEXTURE_PROBE)) return 1;
+    if(memcmp(a+size-TEXTURE_PROBE,b+size-TEXTURE_PROBE,TEXTURE_PROBE)) return 1;
+    size_t step=(size-2*TEXTURE_PROBE)/9;
+    for(unsigned i=1;i<=8;i++) {
+        size_t off=TEXTURE_PROBE+step*i;
+        if(memcmp(a+off,b+off,TEXTURE_PROBE)) return 1;
+    }
+    return 0;
+}
 static uint64_t inline_vertex_batches,allocated_vertex_batches;
 
 /* Opt-in clip audit (RECOMP_METAL_CLIP_AUDIT), read-only.
@@ -1813,11 +1860,51 @@ static uint64_t g_early_z_draws, g_late_z_draws;
  * quads each drew. Two is correct; one means page 1 is never bound. */
 static uint32_t g_latin_tex[16]; static uint64_t g_latin_tex_quads[16];
 static unsigned g_latin_tex_n;
+/* WHY the predicate refused, not just that it did. The 22 Sep A/B read
+ * "0 draws early" in BOTH arms with the switch demonstrably on -- a failed
+ * positive control, and the report could not say which of the two terms was
+ * responsible across 761,548 draws. These only move when early_z_on(), so
+ * they read zero in the control arm by construction. */
+static uint64_t g_ez_no_alpha, g_ez_no_alpha_ref0, g_ez_no_zcull, g_ez_eligible;
+
+/* RECOMP_METAL_EARLY_Z_REF0 -- MEASURES A CEILING, AND IS NOT A CANDIDATE
+ * DEFAULT.
+ *
+ * Measured 22 Sep 2026: every one of 1,368,416 alpha-test refusals in a
+ * scene-matched tutorial run had alpha_ref == 0. The title enables the alpha
+ * test globally and never sets a cutout threshold, so the shader's discard is
+ * `alpha <= 0` -- it rejects a FULLY TRANSPARENT fragment and nothing else.
+ * That single state bit is what makes early-Z unreachable on every draw.
+ *
+ * With this on, such a draw is treated as non-discarding so its depth test
+ * moves in front. That is NOT exact: a fully transparent fragment would write
+ * depth and could occlude what is behind it. The point is to find out what
+ * early-Z is worth before anyone pays for a correct version of it -- a depth
+ * pre-pass, or splitting the alpha-zero texels out. If the ceiling is small
+ * the whole item dies here; if it is large, it justifies the real work.
+ *
+ * The picture is the gate, not the frame time. */
+static int early_z_ref0_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_EARLY_Z_REF0");
+  return on; }
+
 static int hw_early_z(const NV2ATextureCopy *s)
 {
     if (!early_z_on()) return 0;
-    if (s->alpha_test && !no_alpha_test_on()) return 0;
-    if (s->z_cull && !legacy_zclamp_on()) return 0;
+    if (s->alpha_test && !no_alpha_test_on()) {
+        /* Split by the reference value. The shader discards on
+         * alpha <= alpha_ref, so ref==0 rejects only a FULLY transparent
+         * fragment: those draws are the ones where early-Z might be made
+         * reachable, and ref>0 is a real cutout that never can be. */
+        ++g_ez_no_alpha;
+        if (s->alpha_ref == 0) {
+            ++g_ez_no_alpha_ref0;
+            if (early_z_ref0_on()) { ++g_ez_eligible; return 1; }
+        }
+        return 0;
+    }
+    if (s->z_cull && !legacy_zclamp_on())     { ++g_ez_no_zcull;  return 0; }
+    ++g_ez_eligible;
     return 1;
 }
 
@@ -2331,8 +2418,22 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
         TextureBuffer *entry=&texture_cache[i];
         if(entry->source==data&&entry->size==size) {
             slot=entry;
-            if(entry->buffer&&!memcmp(entry->buffer.contents,data,size)) {
-                entry->stamp=++texture_clock;++texture_hits;return entry->buffer;
+            if(entry->buffer) {
+                const uint8_t *have=entry->buffer.contents;
+                if(entry->verified_frame==texture_frame) {
+                    ++texture_partial_compares;
+                    if(!texture_probe_differs(have,data,size)) {
+                        entry->stamp=++texture_clock;++texture_hits;return entry->buffer;
+                    }
+                    ++texture_partial_caught;
+                } else {
+                    ++texture_full_compares;
+                    if(!memcmp(have,data,size)) {
+                        entry->verified_frame=texture_frame;
+                        entry->stamp=++texture_clock;++texture_hits;return entry->buffer;
+                    }
+                }
+                ++texture_changed;
             }
             break;
         }
@@ -2343,6 +2444,7 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
     id<MTLBuffer> buffer=[device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
     if(!buffer)return nil;
     slot->source=data;slot->size=size;slot->buffer=buffer;slot->stamp=++texture_clock;++texture_uploads;
+    slot->verified_frame=texture_frame;   /* just copied from data: equal by construction */
     return buffer;
 }
 
@@ -3001,6 +3103,20 @@ void nv2a_metal_report(void)
             (unsigned long long)g_early_z_draws,
             (unsigned long long)g_late_z_draws,
             early_z_on()?"on":"OFF");
+    if (early_z_on() && early_z_ref0_on())
+        fprintf(stderr,"[METAL]   early_z_ref0 ON -- alpha_ref==0 draws are"
+                " treated as non-discarding. CEILING MEASUREMENT, not exact:"
+                " a fully transparent fragment can write depth\n");
+    if (early_z_on())
+        fprintf(stderr,"[METAL]   early-Z predicate: %llu eligible, refused"
+                " %llu for alpha_test (of which %llu have alpha_ref==0,"
+                " i.e. they reject only a fully transparent fragment),"
+                " %llu for z_cull -- a draw that can discard cannot have its"
+                " depth test moved in front\n",
+                (unsigned long long)g_ez_eligible,
+                (unsigned long long)g_ez_no_alpha,
+                (unsigned long long)g_ez_no_alpha_ref0,
+                (unsigned long long)g_ez_no_zcull);
     /* Defined beside nv2a_metal_draw, which is where it measures. */
     { extern void t0_census_report(void); t0_census_report(); }
     fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
@@ -3116,6 +3232,10 @@ void nv2a_metal_report(void)
         (unsigned long long)texture_requests,(unsigned long long)texture_hits,
         (unsigned long long)texture_uploads,(unsigned long long)inline_vertex_batches,
         (unsigned long long)allocated_vertex_batches);
+    fprintf(stderr,"[METAL] texture cache: %llu full compares, %llu partial compares, %llu changed;"
+        " partial-caught=%llu (a mid-frame rewrite the once-per-frame rule alone would have missed)\n",
+        (unsigned long long)texture_full_compares,(unsigned long long)texture_partial_compares,
+        (unsigned long long)texture_changed,(unsigned long long)texture_partial_caught);
     if(ring_audit_on())
         fprintf(stderr,"[METAL] ring audit: %llu reservations, %llu MiB staged, "
             "%llu slabs live, %llu wraps of which %llu had to wait, %llu fallbacks "
@@ -3335,6 +3455,7 @@ int nv2a_metal_sync(void)
     unsigned long long _t_sync = mtl_now_ns(), _t_drained = 0;
     SyncWho who = g_sync_who;
     g_sync_who = SYNC_WHO_EXTERNAL;
+    ++texture_frame;   /* every sync is at least a frame boundary for the texture cache */
     @autoreleasepool{
         ++sync_calls; ++g_sync_who_calls[who];
         /* BEFORE the dirty test and before the wait. An open batch is work the
@@ -4569,6 +4690,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  const float(*vertices)[16][4],unsigned count,unsigned primitive)
 {
  draw_thread_check();
+ unsigned long long _tf=mtl_cb_stats()?mtl_now_ns():0;
  if(!s)return reject("null-state");
  if((s->texture_mask&1)&&!texture)return reject("missing-texture");
  if(!target)return reject("missing-target");
@@ -4910,6 +5032,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
  case 7:for(unsigned i=1;i+1<count;i++)triangle(s,vertices,indices,&n,0,i,i+1);break;
  case 8:for(unsigned i=0;i+3<count;i+=4){triangle(s,vertices,indices,&n,i,i+1,i+2);triangle(s,vertices,indices,&n,i,i+2,i+3);}break;
  case 9:for(unsigned i=0;i+3<count;i+=2){triangle(s,vertices,indices,&n,i,i+1,i+3);triangle(s,vertices,indices,&n,i,i+3,i+2);}break;default:return reject("primitive");}
+ if(mtl_cb_stats()){g_mtl_ns_valid+=mtl_now_ns()-_tf;_tf=mtl_now_ns();}
  if(!n){reject_reason=NULL;return 0;}
  if(clip_audit_on())clip_audit(vertices,indices,n,s->clip_w,s->clip_h);
  if(bench_state==2)bench_capture(s,texture,texture_size,target,target_size,depth,depth_size,vertices,count,primitive);
@@ -5004,6 +5127,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
      memcpy(raw[i*vsh_active->nattrs+slot++].f,vertices[i][a],16);}
   } else
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
+  if(mtl_cb_stats()){g_mtl_ns_pack+=mtl_now_ns()-_tf;_tf=mtl_now_ns();}
   if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
    /* Mark the debt before the sync, so the sync finds nothing to do and takes
     * its already-clean early return. Identity on the texture, not on the guest
@@ -5210,6 +5334,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * switches, so nothing saw it. */
   if(batch_on()&&batch_encoder&&hw!=batch_encoder_hw){batch_flush();}
   batch_encoder_hw=hw;
+  if(mtl_cb_stats())g_mtl_ns_state+=mtl_now_ns()-_tf;
   unsigned long long _t0=mtl_cb_stats()?mtl_now_ns():0;
   id<MTLCommandBuffer>command;id<MTLRenderCommandEncoder>encoder;
   if(batch_on()){
