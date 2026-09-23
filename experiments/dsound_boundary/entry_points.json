@@ -1,0 +1,1027 @@
+[
+ {
+  "address": "0x0019E4BC",
+  "name": "sub_0019E4BC",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_00116EC0",
+   "sub_00168480"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019E4C1",
+  "name": "sub_0019E4C1",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168480",
+   "sub_00168500"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 2
+  }
+ },
+ {
+  "address": "0x0019E4C6",
+  "name": "IDirectSound_AddRef",
+  "call_sites": 5,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168400",
+   "sub_00169DE0",
+   "sub_0016BAA0",
+   "sub_0016FAD0",
+   "sub_00172640"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 5
+  }
+ },
+ {
+  "address": "0x0019E4DC",
+  "name": "IDirectSound_Release",
+  "call_sites": 9,
+  "data_refs": 0,
+  "callers": [
+   "sub_00116EC0",
+   "sub_00168130",
+   "sub_00168F60",
+   "sub_00169DE0",
+   "sub_0016B180",
+   "sub_0016E5E0",
+   "sub_0016E7E0",
+   "sub_0016FAD0",
+   "sub_001721D0"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 9
+  }
+ },
+ {
+  "address": "0x0019E4F2",
+  "name": "IDirectSoundBuffer_Unlock",
+  "call_sites": 5,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141700",
+   "sub_00141A00",
+   "sub_0016C6A0",
+   "sub_00170A50"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "5": 5
+  }
+ },
+ {
+  "address": "0x0019E4F7",
+  "name": "IDirectSoundBuffer_AddRef",
+  "call_sites": 4,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016BAA0",
+   "sub_0016C6A0",
+   "sub_0016FAD0",
+   "sub_00171030"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 4
+  }
+ },
+ {
+  "address": "0x0019E50D",
+  "name": "IDirectSoundBuffer_Release",
+  "call_sites": 10,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141530",
+   "sub_0016C6A0",
+   "sub_0016E5E0",
+   "sub_0016E7E0",
+   "sub_00170D60",
+   "sub_00172070"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 11
+  }
+ },
+ {
+  "address": "0x0019E523",
+  "name": "sub_0019E523",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168480"
+  ],
+  "ret_bytes": [
+   0
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "0": 1
+  }
+ },
+ {
+  "address": "0x0019E6BD",
+  "name": "CDirectSound_GetSpeakerConfig",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "0019F054"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 1
+  }
+ },
+ {
+  "address": "0x0019F024",
+  "name": "IDirectSound_GetCaps",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168500"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 1
+  }
+ },
+ {
+  "address": "0x0019F040",
+  "name": "IDirectSound_GetSpeakerConfig",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_001684E0"
+  ],
+  "ret_bytes": [
+   0,
+   4,
+   8,
+   12,
+   16,
+   20,
+   24,
+   32
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {}
+ },
+ {
+  "address": "0x0019F05C",
+  "name": "IDirectSound_DownloadEffectsImage",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168130"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "None": 1
+  }
+ },
+ {
+  "address": "0x0019F083",
+  "name": "IDirectSound_GetEffectData",
+  "call_sites": 20,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016BAE0",
+   "sub_00170200"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "5": 20
+  }
+ },
+ {
+  "address": "0x0019F0AA",
+  "name": "IDirectSound_SetEffectData",
+  "call_sites": 30,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   24
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "6": 30
+  }
+ },
+ {
+  "address": "0x0019F0D4",
+  "name": "IDirectSoundBuffer_SetVolume",
+  "call_sites": 3,
+  "data_refs": 0,
+  "callers": [
+   "sub_001418D0",
+   "sub_0016C4F0",
+   "sub_00170890"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 1,
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019F0F0",
+  "name": "IDirectSoundBuffer_SetLFO",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 2
+  }
+ },
+ {
+  "address": "0x0019F10C",
+  "name": "IDirectSoundBuffer_SetEG",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 2
+  }
+ },
+ {
+  "address": "0x0019F128",
+  "name": "IDirectSoundBuffer_SetFilter",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 2
+  }
+ },
+ {
+  "address": "0x0019F144",
+  "name": "IDirectSoundBuffer_SetHeadroom",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141380"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 1
+  }
+ },
+ {
+  "address": "0x0019F160",
+  "name": "IDirectSoundBuffer_SetMixBins",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 2
+  }
+ },
+ {
+  "address": "0x0019F17C",
+  "name": "IDirectSoundBuffer_Play",
+  "call_sites": 4,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141560",
+   "sub_0016CFF0",
+   "sub_0016F4B0",
+   "sub_00171B50"
+  ],
+  "ret_bytes": [
+   16
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "4": 5
+  }
+ },
+ {
+  "address": "0x0019F1A0",
+  "name": "IDirectSoundBuffer_Stop",
+  "call_sites": 6,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141640",
+   "sub_0016CFF0",
+   "sub_0016E3C0",
+   "sub_0016E5E0",
+   "sub_00170C50",
+   "sub_00172070"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 5,
+   "None": 1,
+   "3": 1
+  }
+ },
+ {
+  "address": "0x0019F1B8",
+  "name": "IDirectSoundBuffer_SetLoopRegion",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016C6A0",
+   "sub_0016F4B0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "4": 1,
+   "3": 1
+  }
+ },
+ {
+  "address": "0x0019F1D8",
+  "name": "IDirectSoundBuffer_GetStatus",
+  "call_sites": 4,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141640",
+   "sub_00170A50",
+   "sub_00171B50"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 4,
+   "3": 1
+  }
+ },
+ {
+  "address": "0x0019F1F4",
+  "name": "IDirectSoundBuffer_GetCurrentPosition",
+  "call_sites": 7,
+  "data_refs": 0,
+  "callers": [
+   "sub_001417B0",
+   "sub_0016C310",
+   "sub_0016C440",
+   "sub_0016CFF0",
+   "sub_00170970",
+   "sub_00171B50"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 7
+  }
+ },
+ {
+  "address": "0x0019F214",
+  "name": "IDirectSoundBuffer_SetCurrentPosition",
+  "call_sites": 11,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141560",
+   "sub_0016C310",
+   "sub_0016C6A0",
+   "sub_0016CFF0",
+   "sub_0016E130",
+   "sub_0016F4B0",
+   "sub_00170C50",
+   "sub_00170D60"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 9,
+   "None": 2
+  }
+ },
+ {
+  "address": "0x0019F230",
+  "name": "IDirectSoundBuffer_Lock",
+  "call_sites": 5,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141700",
+   "sub_00141A00",
+   "sub_0016C6A0",
+   "sub_00171A20"
+  ],
+  "ret_bytes": [
+   32
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "9": 2,
+   "8": 2,
+   "6": 1
+  }
+ },
+ {
+  "address": "0x0019F260",
+  "name": "DirectSoundDoWork",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168550"
+  ],
+  "ret_bytes": [
+   0
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "0": 1
+  }
+ },
+ {
+  "address": "0x0019FE28",
+  "name": "IDirectSound_CommitDeferredSettings",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168550",
+   "sub_0016E5E0"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "1": 1,
+   "3": 1
+  }
+ },
+ {
+  "address": "0x0019FE40",
+  "name": "IDirectSoundBuffer_SetFrequency",
+  "call_sites": 3,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141560",
+   "sub_0016C550",
+   "sub_001708F0"
+  ],
+  "ret_bytes": [
+   8
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "2": 1
+  }
+ },
+ {
+  "address": "0x0019FE5C",
+  "name": "IDirectSoundBuffer_SetAllParameters",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019FE7C",
+  "name": "IDirectSoundBuffer_SetConeAngles",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   16
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "4": 2
+  }
+ },
+ {
+  "address": "0x0019FEA0",
+  "name": "IDirectSoundBuffer_SetConeOrientation",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "5": 2
+  }
+ },
+ {
+  "address": "0x0019FED5",
+  "name": "IDirectSoundBuffer_SetConeOutsideVolume",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019FEF5",
+  "name": "IDirectSoundBuffer_SetMaxDistance",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019FF19",
+  "name": "IDirectSoundBuffer_SetMinDistance",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019FF3D",
+  "name": "IDirectSoundBuffer_SetMode",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019FF5D",
+  "name": "IDirectSoundBuffer_SetPosition",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "None": 1,
+   "5": 1
+  }
+ },
+ {
+  "address": "0x0019FF92",
+  "name": "IDirectSoundBuffer_SetVelocity",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "5": 2
+  }
+ },
+ {
+  "address": "0x0019FFC7",
+  "name": "IDirectSoundBuffer_SetDistanceFactor",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x0019FFEB",
+  "name": "IDirectSoundBuffer_SetDopplerFactor",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x001A000F",
+  "name": "IDirectSoundBuffer_SetRolloffFactor",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x001A0033",
+  "name": "IDirectSoundBuffer_SetI3DL2Source",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300",
+   "sub_001710E0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 2
+  }
+ },
+ {
+  "address": "0x001A081E",
+  "name": "IDirectSound_SetAllParameters",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 1
+  }
+ },
+ {
+  "address": "0x001A083E",
+  "name": "IDirectSound_SetDistanceFactor",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 1
+  }
+ },
+ {
+  "address": "0x001A0862",
+  "name": "IDirectSound_SetDopplerFactor",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 1
+  }
+ },
+ {
+  "address": "0x001A0886",
+  "name": "IDirectSound_SetOrientation",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   32
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "10": 1
+  }
+ },
+ {
+  "address": "0x001A08D0",
+  "name": "IDirectSound_SetPosition",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "None": 1
+  }
+ },
+ {
+  "address": "0x001A0905",
+  "name": "IDirectSound_SetRolloffFactor",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 1
+  }
+ },
+ {
+  "address": "0x001A0929",
+  "name": "IDirectSound_SetVelocity",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   20
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "5": 1
+  }
+ },
+ {
+  "address": "0x001A095E",
+  "name": "IDirectSound_SetI3DL2Listener",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016D300"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 1
+  }
+ },
+ {
+  "address": "0x001A097E",
+  "name": "IDirectSoundBuffer_SetBufferData",
+  "call_sites": 2,
+  "data_refs": 0,
+  "callers": [
+   "sub_0016C6A0"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 3
+  }
+ },
+ {
+  "address": "0x001A0BE2",
+  "name": "IDirectSound_CreateSoundBuffer",
+  "call_sites": 6,
+  "data_refs": 0,
+  "callers": [
+   "sub_00141380",
+   "sub_0016C6A0",
+   "sub_00170D60"
+  ],
+  "ret_bytes": [
+   16
+  ],
+  "reads_ecx": false,
+  "tail_jump": null,
+  "site_pushes": {
+   "4": 6
+  }
+ },
+ {
+  "address": "0x001A0D9C",
+  "name": "DirectSoundCreate",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_00168480"
+  ],
+  "ret_bytes": [
+   12
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {
+   "3": 1
+  }
+ },
+ {
+  "address": "0x001A24A3",
+  "name": "sub_001A24A3",
+  "call_sites": 1,
+  "data_refs": 0,
+  "callers": [
+   "sub_0014B774"
+  ],
+  "ret_bytes": [
+   4
+  ],
+  "reads_ecx": true,
+  "tail_jump": null,
+  "site_pushes": {}
+ }
+]

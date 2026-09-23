@@ -180,3 +180,18 @@ the title's APU driver. Doing the same here removes the MCPX voice model,
 the DSOUND DPC, this race, and the ADX guard's reason to exist. Every audio
 report in G46 lives downstream of that model. Spec it the way the D3D lift
 was specced: census the call sites first, then mirror, then replace.
+
+### G48 — the DSOUND lift (started 23 Sep, at the player's request)
+
+Spec: `../plans/JSRF_PLAN_2026-09-23_LIFT_AT_THE_DSOUND_BOUNDARY.md`. It
+supersedes G47a: with DSOUND replaced, its DPC no longer runs.
+- **Phase 1, census: done.**
+  - Static: 193 game call sites into 55 DSOUND entry points, all stdcall,
+    none reached through data.
+  - Runtime: 194,156 calls through the wrappers, 0 ABI mismatches, 0 faults.
+- **Phase 2, next:** the host model (`src/apu/dsound_host.c`) and its unit
+  tests.
+- **Then** shadow mode against the running DSOUND, then replacement.
+
+**Done when** the tutorial and the police chase play on the lift with
+correct audio, and the player confirms the G46 reports are gone.
