@@ -74,6 +74,23 @@ void     dsh_set_headroom(uint32_t handle, uint32_t centibels);
 #define DSH_MIXBIN_MAX 8
 void     dsh_set_mixbins(uint32_t handle, uint32_t n, const uint32_t *bins, const int32_t *vols);
 
+/* 3D (G48 §2c: 161 of 231 buffers in a gameplay replay carry DSBCAPS_CTRL3D;
+ * the listener moves every frame; I3DL2 reverb is always set to "off").
+ * DirectSound's model: below min distance full volume, then -6 dB per
+ * doubling of distance times the rolloff factor, no further falloff past max.
+ * Distances are in the title's units times the distance factor. Pan is a soft
+ * equal-ish split from the source's direction against the listener's right
+ * vector (top x front, DirectSound's left-handed axes); the Xbox's HRTF is
+ * not modelled. Mode: 0 normal, 1 head-relative, 2 disabled. Defaults are
+ * the XDK's: position 0, min 1, max 1e9, mode normal. */
+void     dsh_set_3d(uint32_t handle, int enabled);
+void     dsh_set_3d_position(uint32_t handle, float x, float y, float z);
+void     dsh_set_3d_distances(uint32_t handle, float min_d, float max_d);   /* <0 leaves one unchanged */
+void     dsh_set_3d_mode(uint32_t handle, uint32_t mode);
+void     dsh_set_listener_position(float x, float y, float z);
+void     dsh_set_listener_orientation(float fx, float fy, float fz, float tx, float ty, float tz);
+void     dsh_set_listener_factors(float distance_factor, float rolloff_factor);   /* <0 leaves one unchanged */
+
 uint32_t dsh_get_status(uint32_t handle);
 /* The play cursor, and a write cursor one mix quantum ahead of it, both
  * wrapped into the buffer. Either pointer may be NULL. */

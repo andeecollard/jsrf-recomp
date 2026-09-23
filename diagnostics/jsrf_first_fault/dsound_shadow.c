@@ -140,6 +140,21 @@ static int armed(void)
     return s_on;
 }
 
+/* Per-buffer last Play / SetCurrentPosition / Stop time, to place each cursor
+ * outlier (G48 §2d) against the event before it. */
+#define EV_MAX 1024
+static struct { uint32_t handle; double t_play, t_setpos, t_stop, t_lock; uint32_t last_ds, last_mo; } s_ev[EV_MAX];
+static pthread_mutex_t s_ev_m = PTHREAD_MUTEX_INITIALIZER;
+static void *ev_get(uint32_t h)
+{
+    uint32_t k = (h >> 3) % EV_MAX;
+    for (unsigned i = 0; i < EV_MAX; ++i, k = (k + 1) % EV_MAX)
+        if (!s_ev[k].handle || s_ev[k].handle == h) { s_ev[k].handle = h; return &s_ev[k]; }
+    return NULL;
+}
+#define EV(h) ((__typeof__(&s_ev[0]))ev_get(h))
+static unsigned s_logged_outlier;
+
 /* Format lookup for the position comparison: kept beside the owned table. */
 #define FMT_MAX 4096
 static struct { uint32_t handle; uint32_t bytes_per_ms_x100; } s_fmt[FMT_MAX];
@@ -195,10 +210,13 @@ void dss_after(const char *name, const uint32_t *a, uint32_t eax)
         dsh_set_loop_region(a[0], a[1], a[2]);
     } else if (!strcmp(n, "IDirectSoundBuffer_SetCurrentPosition")) {
         dsh_set_current_position(a[0], a[1]);
+        pthread_mutex_lock(&s_ev_m); { __typeof__(&s_ev[0]) e = EV(a[0]); if (e) e->t_setpos = now_s(); } pthread_mutex_unlock(&s_ev_m);
     } else if (!strcmp(n, "IDirectSoundBuffer_Play")) {
         dsh_play(a[0], a[3]);
+        pthread_mutex_lock(&s_ev_m); { __typeof__(&s_ev[0]) e = EV(a[0]); if (e) e->t_play = now_s(); } pthread_mutex_unlock(&s_ev_m);
     } else if (!strcmp(n, "IDirectSoundBuffer_Stop")) {
         dsh_stop(a[0]);
+        pthread_mutex_lock(&s_ev_m); { __typeof__(&s_ev[0]) e = EV(a[0]); if (e) e->t_stop = now_s(); } pthread_mutex_unlock(&s_ev_m);
     } else if (!strcmp(n, "IDirectSoundBuffer_SetFrequency")) {
         dsh_set_frequency(a[0], a[1]);
     } else if (!strcmp(n, "IDirectSoundBuffer_SetVolume")) {
@@ -235,6 +253,21 @@ void dss_after(const char *name, const uint32_t *a, uint32_t eax)
         unsigned b = 7;
         for (unsigned i = 0; i < 7; ++i) if (ms < edge[i]) { b = i; break; }
         atomic_fetch_add(&s_pos_hist[b], 1);
+        pthread_mutex_lock(&s_ev_m);
+        {
+            __typeof__(&s_ev[0]) e = EV(a[0]);
+            double t = now_s();
+            if (e && ms >= 100u && ms != 0xFFFFFFFFu && s_logged_outlier < 120) {
+                s_logged_outlier++;
+                fprintf(stderr, "[DSOUND-SHADOW] cursor outlier buf=%08X dsound=%u model=%u (%u ms) prev dsound=%u model=%u"
+                        " | since play %.0f ms, setpos %.0f ms, stop %.0f ms | model status %u\n",
+                        a[0], dp, mp, ms, e->last_ds, e->last_mo,
+                        e->t_play ? (t - e->t_play) * 1e3 : -1.0, e->t_setpos ? (t - e->t_setpos) * 1e3 : -1.0,
+                        e->t_stop ? (t - e->t_stop) * 1e3 : -1.0, dsh_get_status(a[0]));
+            }
+            if (e) { e->last_ds = dp; e->last_mo = mp; }
+        }
+        pthread_mutex_unlock(&s_ev_m);
     }
     {
         static _Atomic unsigned long next = 20000;

@@ -184,6 +184,40 @@ static void test_mixbins(void)
     CHECK(out[0] == 10000 && out[1] == 10000, "n=0 restores the default: %d %d", out[0], out[1]);
 }
 
+/* 8. 3D: -6 dB per doubling past min distance, clamped at max, soft pan. */
+static void test_3d(void)
+{
+    dsh_reset();
+    for (int i = 0; i < 10; ++i) put16(0x7000 + 2u * i, 10000);
+    const uint32_t h = 0x80007000u;
+    dsh_buffer_create(h, &MONO16, 0x7000, 20);
+    dsh_set_headroom(h, 0);
+    dsh_set_3d(h, 1);
+    dsh_set_3d_distances(h, 10.0f, 100.0f);
+    dsh_set_listener_position(0, 0, 0);
+    dsh_set_listener_orientation(0, 0, 1, 0, 1, 0);
+    dsh_set_listener_factors(1.0f, 1.0f);
+    dsh_play(h, DSH_PLAY_LOOPING);
+    int16_t out[2];
+
+    dsh_set_3d_position(h, 0, 0, 5);  dsh_mix(out, 1);
+    CHECK(out[0] == 10000 && out[1] == 10000, "inside min distance: full, centred: %d %d", out[0], out[1]);
+    dsh_set_3d_position(h, 0, 0, 20); dsh_mix(out, 1);
+    CHECK(abs(out[0] - 5000) <= 1 && abs(out[1] - 5000) <= 1, "twice min: -6 dB: %d %d", out[0], out[1]);
+    dsh_set_3d_position(h, 0, 0, 400); dsh_mix(out, 1);
+    CHECK(abs(out[0] - 1000) <= 1, "past max: clamped at min/max: %d", out[0]);
+    dsh_set_3d_position(h, 10, 0, 0); dsh_mix(out, 1);
+    CHECK(out[1] == 10000 && abs(out[0] - 3000) <= 1, "hard right (+x): R full, L 30%%: %d %d", out[0], out[1]);
+    dsh_set_listener_orientation(0, 0, -1, 0, 1, 0);                 /* turned round */
+    dsh_mix(out, 1);
+    CHECK(out[0] == 10000 && abs(out[1] - 3000) <= 1, "listener turned: now on the left: %d %d", out[0], out[1]);
+    dsh_set_3d_mode(h, 2);
+    dsh_set_3d_position(h, 0, 0, 400); dsh_mix(out, 1);
+    CHECK(out[0] == 10000 && out[1] == 10000, "mode disabled: no 3D: %d %d", out[0], out[1]);
+    dsh_set_3d(h, 0); dsh_set_3d_mode(h, 0); dsh_mix(out, 1);
+    CHECK(out[0] == 10000, "a 2D buffer ignores its position: %d", out[0]);
+}
+
 int main(void)
 {
     g_adpcm_hw_header = 0;
@@ -195,6 +229,7 @@ int main(void)
     test_adpcm_voice();
     test_table();
     test_mixbins();
+    test_3d();
     if (failures) { printf("dsound_host_test: %d failure(s)\n", failures); return 1; }
     puts("dsound_host_test: all checks passed");
     return 0;

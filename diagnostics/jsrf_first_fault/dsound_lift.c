@@ -169,6 +169,7 @@ void dsl_IDirectSound_CreateSoundBuffer(void)
         dsh_format f = { MEM16(wf), MEM16(wf + 2u), MEM32(wf + 4u), MEM16(wf + 14u), MEM16(wf + 12u) };
         if (dsh_buffer_create(h, &f, owned, owned ? bytes : 0u) == 0) {
             set_mixbins_from(h, MEM32(d + 16u));
+            dsh_set_3d(h, (MEM32(d + 4u) & 0x10u) != 0);        /* DSBCAPS_CTRL3D */
         } else if (atomic_fetch_add(&g_refused, 1) < 20) {
             fprintf(stderr, "[DSOUND-LIFT] REFUSED format tag=%u ch=%u rate=%u bits=%u align=%u flags=%08X bytes=%u"
                     " -> silent buffer %08X\n", f.tag, f.channels, f.rate, f.bits, f.block_align,
@@ -258,15 +259,42 @@ void dsl_IDirectSound_GetEffectData(void)
     ret_(20, 0);
 }
 
-/* The listener. Recorded nowhere yet: buffers in this title are 2D (no
- * DSBCAPS_CTRL3D in any descriptor the census saw), so it moves nothing. */
 #define NOOP(name, pop) void dsl_##name(void) { atomic_fetch_add(&g_calls, 1); ret_(pop, 0); }
-NOOP(IDirectSound_SetAllParameters, 12)
-NOOP(IDirectSound_SetDistanceFactor, 12)
+static float F(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+/* The listener (G48 §2c: moved every frame, 181,169 SetPosition calls in a
+ * 13-minute replay). Deferred and immediate settings are both applied at
+ * once; the title commits every frame anyway. I3DL2 is always "room -10000"
+ * (reverb off) in this title, so it is accepted and ignored. */
+void dsl_IDirectSound_SetPosition(void)
+{
+    atomic_fetch_add(&g_calls, 1);
+    dsh_set_listener_position(F(ARG(1)), F(ARG(2)), F(ARG(3)));
+    ret_(20, 0);
+}
+void dsl_IDirectSound_SetOrientation(void)
+{
+    atomic_fetch_add(&g_calls, 1);
+    dsh_set_listener_orientation(F(ARG(1)), F(ARG(2)), F(ARG(3)), F(ARG(4)), F(ARG(5)), F(ARG(6)));
+    ret_(32, 0);
+}
+void dsl_IDirectSound_SetDistanceFactor(void) { atomic_fetch_add(&g_calls, 1); dsh_set_listener_factors(F(ARG(1)), -1.0f); ret_(12, 0); }
+void dsl_IDirectSound_SetRolloffFactor(void)  { atomic_fetch_add(&g_calls, 1); dsh_set_listener_factors(-1.0f, F(ARG(1))); ret_(12, 0); }
+/* DS3DLISTENER: size, position +4, velocity +16, front +28, top +40,
+ * distance factor +52, rolloff +56, doppler +60. */
+void dsl_IDirectSound_SetAllParameters(void)
+{
+    uint32_t p = ARG(1);
+    atomic_fetch_add(&g_calls, 1);
+    if (p) {
+        dsh_set_listener_position(F(MEM32(p + 4u)), F(MEM32(p + 8u)), F(MEM32(p + 12u)));
+        dsh_set_listener_orientation(F(MEM32(p + 28u)), F(MEM32(p + 32u)), F(MEM32(p + 36u)),
+                                     F(MEM32(p + 40u)), F(MEM32(p + 44u)), F(MEM32(p + 48u)));
+        dsh_set_listener_factors(F(MEM32(p + 52u)), F(MEM32(p + 56u)));
+    }
+    ret_(12, 0);
+}
 NOOP(IDirectSound_SetDopplerFactor, 12)
-NOOP(IDirectSound_SetRolloffFactor, 12)
-NOOP(IDirectSound_SetOrientation, 32)
-NOOP(IDirectSound_SetPosition, 20)
 NOOP(IDirectSound_SetVelocity, 20)
 NOOP(IDirectSound_SetI3DL2Listener, 12)
 NOOP(IDirectSound_CommitDeferredSettings, 4)
@@ -381,19 +409,34 @@ void dsl_IDirectSoundBuffer_SetVolume(void)    { BUF_OR_BAIL(8); dsh_set_volume(
 void dsl_IDirectSoundBuffer_SetHeadroom(void)  { BUF_OR_BAIL(8); dsh_set_headroom(h, ARG(1)); ret_(8, 0); }
 void dsl_IDirectSoundBuffer_SetMixBins(void)   { BUF_OR_BAIL(8); set_mixbins_from(h, ARG(1)); ret_(8, 0); }
 
-/* Envelope, LFO, filter and the 3D setters: accepted, not modelled yet. */
+/* 3D (G48 §2c). DS3DBUFFER: size, position +4, velocity +16, cone angles
+ * +28/+32, cone orientation +36, cone outside volume +48, min +52, max +56,
+ * mode +60. Cones, velocity and doppler are not modelled. */
+void dsl_IDirectSoundBuffer_SetPosition(void) { BUF_OR_BAIL(20); dsh_set_3d_position(h, F(ARG(1)), F(ARG(2)), F(ARG(3))); ret_(20, 0); }
+void dsl_IDirectSoundBuffer_SetMinDistance(void) { BUF_OR_BAIL(12); dsh_set_3d_distances(h, F(ARG(1)), -1.0f); ret_(12, 0); }
+void dsl_IDirectSoundBuffer_SetMaxDistance(void) { BUF_OR_BAIL(12); dsh_set_3d_distances(h, -1.0f, F(ARG(1))); ret_(12, 0); }
+void dsl_IDirectSoundBuffer_SetMode(void) { BUF_OR_BAIL(12); dsh_set_3d_mode(h, ARG(1)); ret_(12, 0); }
+void dsl_IDirectSoundBuffer_SetAllParameters(void)
+{
+    BUF_OR_BAIL(12);
+    uint32_t p = ARG(1);
+    if (p) {
+        dsh_set_3d_position(h, F(MEM32(p + 4u)), F(MEM32(p + 8u)), F(MEM32(p + 12u)));
+        dsh_set_3d_distances(h, F(MEM32(p + 52u)), F(MEM32(p + 56u)));
+        dsh_set_3d_mode(h, MEM32(p + 60u));
+    }
+    ret_(12, 0);
+}
+
+/* Envelope, LFO, filter, cones, velocity, doppler and per-source I3DL2:
+ * accepted, not modelled. A 13-minute replay never called the first three. */
 #define BUF_NOOP(name, pop) void dsl_##name(void) { BUF_OR_BAIL(pop); ret_(pop, 0); }
 BUF_NOOP(IDirectSoundBuffer_SetLFO, 8)
 BUF_NOOP(IDirectSoundBuffer_SetEG, 8)
 BUF_NOOP(IDirectSoundBuffer_SetFilter, 8)
-BUF_NOOP(IDirectSoundBuffer_SetAllParameters, 12)
 BUF_NOOP(IDirectSoundBuffer_SetConeAngles, 16)
 BUF_NOOP(IDirectSoundBuffer_SetConeOrientation, 20)
 BUF_NOOP(IDirectSoundBuffer_SetConeOutsideVolume, 12)
-BUF_NOOP(IDirectSoundBuffer_SetMaxDistance, 12)
-BUF_NOOP(IDirectSoundBuffer_SetMinDistance, 12)
-BUF_NOOP(IDirectSoundBuffer_SetMode, 12)
-BUF_NOOP(IDirectSoundBuffer_SetPosition, 20)
 BUF_NOOP(IDirectSoundBuffer_SetVelocity, 20)
 BUF_NOOP(IDirectSoundBuffer_SetDistanceFactor, 12)
 BUF_NOOP(IDirectSoundBuffer_SetDopplerFactor, 12)

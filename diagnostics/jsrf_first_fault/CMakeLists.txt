@@ -130,6 +130,64 @@ if(NOT RECOMP_GEN_SOURCES)
     message(FATAL_ERROR "No instrumented sources in ${RECOMP_GEN_DIR}")
 endif()
 
+# THE DSOUND LIFT, IN EVERY BUILD (G48 §2e). The host bodies that replace the
+# title's DSOUND lived only in a gen staged by hand, so a player bundle rebuilt
+# from an ordinary build dropped them without a word. Here the staging script
+# runs at configure time in --overlay mode: it writes ONLY the files it
+# changes (the two generated files holding the 55 entry points) and the ones
+# it adds (census, lift), into the build directory, and those replace the
+# gen's own. The gen tree itself is never modified.
+#
+# Compiled in is not switched on: RECOMP_DSOUND_LIFT=1 still decides at run
+# time, and with it unset every wrapper runs the original DSOUND after one
+# predictable branch. Off on Windows until dsound_host_out.c has output there.
+if(WIN32)
+    set(_jsrf_dsound_lift_default OFF)
+else()
+    set(_jsrf_dsound_lift_default ON)
+endif()
+option(JSRF_DSOUND_LIFT "Compile the DSOUND lift's host bodies over the gen (RECOMP_DSOUND_LIFT=1 arms them)"
+       ${_jsrf_dsound_lift_default})
+if(JSRF_DSOUND_LIFT AND EXISTS "${RECOMP_GEN_DIR}/DSOUND_CENSUS_MANIFEST.txt")
+    # A gen staged by hand (stage_dsound_census.py without --overlay) already
+    # carries its wrappers; wrapping them again would fail on the renamed bodies.
+    message(STATUS "DSOUND lift: gen is already staged (${RECOMP_GEN_DIR}); no overlay")
+elseif(JSRF_DSOUND_LIFT)
+    find_program(JSRF_PYTHON3 NAMES python3 REQUIRED)
+    set(_ds_overlay "${CMAKE_BINARY_DIR}/dsound_overlay")
+    set(_ds_stage "${CMAKE_CURRENT_SOURCE_DIR}/stage_dsound_census.py")
+    set(_ds_entries "${XBOXRECOMP_DIR}/experiments/dsound_boundary/entry_points.json")
+    execute_process(
+        COMMAND "${JSRF_PYTHON3}" "${_ds_stage}" "${RECOMP_GEN_DIR}" "${_ds_overlay}"
+                --entries "${_ds_entries}" --lift --overlay
+        RESULT_VARIABLE _ds_rc OUTPUT_VARIABLE _ds_out ERROR_VARIABLE _ds_err)
+    if(NOT _ds_rc EQUAL 0)
+        message(FATAL_ERROR "DSOUND lift overlay failed (set -DJSRF_DSOUND_LIFT=OFF to build without it):\n${_ds_out}${_ds_err}")
+    endif()
+    file(GLOB _ds_overlay_sources "${_ds_overlay}/*.c")
+    set(_ds_replaced 0)
+    foreach(_f IN LISTS _ds_overlay_sources)
+        get_filename_component(_n "${_f}" NAME)
+        list(FIND RECOMP_GEN_SOURCES "${RECOMP_GEN_DIR}/${_n}" _i)
+        if(NOT _i EQUAL -1)
+            list(REMOVE_AT RECOMP_GEN_SOURCES ${_i})
+            math(EXPR _ds_replaced "${_ds_replaced} + 1")
+        endif()
+        list(APPEND RECOMP_GEN_SOURCES "${_f}")
+    endforeach()
+    # Re-stage when any input changes, including the two generated files.
+    file(STRINGS "${_ds_overlay}/DSOUND_CENSUS_MANIFEST.txt" _ds_manifest REGEX "^sub_.* file=")
+    set(_ds_deps "${_ds_stage}" "${_ds_entries}" "${CMAKE_CURRENT_SOURCE_DIR}/dsound_lift.c")
+    foreach(_l IN LISTS _ds_manifest)
+        string(REGEX REPLACE ".* file=" "" _gf "${_l}")
+        list(APPEND _ds_deps "${RECOMP_GEN_DIR}/${_gf}")
+    endforeach()
+    list(REMOVE_DUPLICATES _ds_deps)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_ds_deps})
+    list(LENGTH _ds_overlay_sources _ds_n)
+    message(STATUS "DSOUND lift: ${_ds_n} overlay sources, ${_ds_replaced} replacing gen files (RECOMP_DSOUND_LIFT=1 arms it)")
+endif()
+
 # Optimisation.
 #
 # The recompiled title -- 1.3M lines of generated C, and the guest's own code,

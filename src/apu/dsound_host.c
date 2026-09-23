@@ -21,6 +21,9 @@ typedef struct voice {
     int      playing, looping;
     uint64_t pos;                   /* frames, 32.32 fixed point */
     float    mat[2][2];             /* [source channel][out L/R] */
+    int      is3d;
+    uint32_t mode3d;
+    float    pos3d[3], min_d, max_d;
     /* one decoded ADPCM block */
     uint32_t cache_block;           /* block index + 1; 0 = empty */
     int16_t  cache[ADPCM_FRAMES * 2];
@@ -31,6 +34,8 @@ static atomic_flag g_lock = ATOMIC_FLAG_INIT;
 static dsh_mem_fn  g_mem;
 static uint32_t    g_out_rate = 48000;
 static dsh_stats   g_st;
+static float       g_lpos[3], g_lfront[3] = { 0, 0, 1 }, g_ltop[3] = { 0, 1, 0 };
+static float       g_ldist = 1.0f, g_lroll = 1.0f;
 
 static void lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire)) ; }
 static void unlock(void) { atomic_flag_clear_explicit(&g_lock, memory_order_release); }
@@ -126,6 +131,7 @@ int dsh_buffer_create(uint32_t handle, const dsh_format *fmt, uint32_t data_va, 
     v->bytes = bytes;
     v->headroom = DSH_HEADROOM_DEFAULT;
     default_mat(v);
+    v->min_d = 1.0f; v->max_d = 1e9f;
     g_st.created++;
     unlock();
     return 0;
@@ -250,6 +256,75 @@ void dsh_set_mixbins(uint32_t handle, uint32_t n, const uint32_t *bins, const in
         }
     }
     unlock();
+}
+
+void dsh_set_3d(uint32_t handle, int enabled)
+{
+    lock(); voice *v = find(handle); if (v) v->is3d = enabled != 0; unlock();
+}
+void dsh_set_3d_position(uint32_t handle, float x, float y, float z)
+{
+    lock(); voice *v = find(handle); if (v) { v->pos3d[0] = x; v->pos3d[1] = y; v->pos3d[2] = z; } unlock();
+}
+void dsh_set_3d_distances(uint32_t handle, float min_d, float max_d)
+{
+    lock();
+    voice *v = find(handle);
+    if (v) { if (min_d >= 0.0f) v->min_d = min_d; if (max_d >= 0.0f) v->max_d = max_d; }
+    unlock();
+}
+void dsh_set_3d_mode(uint32_t handle, uint32_t mode)
+{
+    lock(); voice *v = find(handle); if (v) v->mode3d = mode; unlock();
+}
+void dsh_set_listener_position(float x, float y, float z)
+{
+    lock(); g_lpos[0] = x; g_lpos[1] = y; g_lpos[2] = z; unlock();
+}
+void dsh_set_listener_orientation(float fx, float fy, float fz, float tx, float ty, float tz)
+{
+    lock();
+    g_lfront[0] = fx; g_lfront[1] = fy; g_lfront[2] = fz;
+    g_ltop[0] = tx; g_ltop[1] = ty; g_ltop[2] = tz;
+    unlock();
+}
+void dsh_set_listener_factors(float distance_factor, float rolloff_factor)
+{
+    lock();
+    if (distance_factor > 0.0f) g_ldist = distance_factor;
+    if (rolloff_factor >= 0.0f) g_lroll = rolloff_factor;
+    unlock();
+}
+
+/* Left and right gains for a 3D voice, from the listener. Lock held. */
+static void gains_3d(const voice *v, float *gl, float *gr)
+{
+    float d[3];
+    *gl = *gr = 1.0f;
+    if (!v->is3d || v->mode3d == 2u) return;
+    for (int i = 0; i < 3; ++i) d[i] = v->mode3d == 1u ? v->pos3d[i] : v->pos3d[i] - g_lpos[i];
+    float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) * g_ldist;
+    float mn = v->min_d * g_ldist, mx = v->max_d * g_ldist;
+    if (mn <= 0.0f) mn = 1e-3f;
+    float dc = dist < mn ? mn : dist > mx ? mx : dist;
+    float g = g_lroll == 0.0f ? 1.0f : powf(mn / dc, g_lroll);
+    float pan = 0.0f;
+    if (dist > 1e-4f) {
+        float r[3], rl;
+        if (v->mode3d == 1u) { r[0] = 1; r[1] = 0; r[2] = 0; }
+        else {
+            r[0] = g_ltop[1] * g_lfront[2] - g_ltop[2] * g_lfront[1];
+            r[1] = g_ltop[2] * g_lfront[0] - g_ltop[0] * g_lfront[2];
+            r[2] = g_ltop[0] * g_lfront[1] - g_ltop[1] * g_lfront[0];
+        }
+        rl = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        if (rl > 1e-6f) pan = (d[0] * r[0] + d[1] * r[1] + d[2] * r[2]) / (rl * dist / g_ldist);
+        if (pan > 1.0f) pan = 1.0f;
+        if (pan < -1.0f) pan = -1.0f;
+    }
+    /* Soft: a source hard to one side keeps 30% on the other ear. */
+    *gl = g * (pan > 0.0f ? 1.0f - 0.7f * pan : 1.0f);
+    *gr = g * (pan < 0.0f ? 1.0f + 0.7f * pan : 1.0f);
 }
 
 uint32_t dsh_get_status(uint32_t handle)
@@ -385,6 +460,8 @@ void dsh_mix(int16_t *out, uint32_t frames)
             if (!v->bytes || !v->data_va) { g_st.missing_data++; continue; }
             g_st.playing++;
             const float g = gain_of(v);
+            float g3l, g3r;
+            gains_3d(v, &g3l, &g3r);
             const uint32_t rate = v->freq ? v->freq : v->fmt.rate;
             const uint64_t step = ((uint64_t)rate << FRAC_BITS) / g_out_rate;
             const uint32_t tot = total_frames(v);
@@ -412,11 +489,11 @@ void dsh_mix(int16_t *out, uint32_t frames)
                 float c0 = (float)l0 + t * (float)(l1 - l0);
                 float c1 = (float)r0 + t * (float)(r1 - r0);
                 if (v->fmt.channels == 1) {
-                    acc[2 * i]     += (int32_t)(g * c0 * v->mat[0][0]);
-                    acc[2 * i + 1] += (int32_t)(g * c0 * v->mat[0][1]);
+                    acc[2 * i]     += (int32_t)(g * g3l * c0 * v->mat[0][0]);
+                    acc[2 * i + 1] += (int32_t)(g * g3r * c0 * v->mat[0][1]);
                 } else {
-                    acc[2 * i]     += (int32_t)(g * (c0 * v->mat[0][0] + c1 * v->mat[1][0]));
-                    acc[2 * i + 1] += (int32_t)(g * (c0 * v->mat[0][1] + c1 * v->mat[1][1]));
+                    acc[2 * i]     += (int32_t)(g * g3l * (c0 * v->mat[0][0] + c1 * v->mat[1][0]));
+                    acc[2 * i + 1] += (int32_t)(g * g3r * (c0 * v->mat[0][1] + c1 * v->mat[1][1]));
                 }
                 v->pos += step;
             }
