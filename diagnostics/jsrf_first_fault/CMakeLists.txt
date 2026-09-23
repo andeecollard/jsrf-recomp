@@ -335,6 +335,15 @@ add_test(NAME jsrf_combiner_graffiti COMMAND jsrf_combiner_graffiti_test)
 add_executable(jsrf_combiner_output_word_test combiner_output_word_test.c)
 add_test(NAME jsrf_combiner_output_word COMMAND jsrf_combiner_output_word_test)
 
+# G43: D3D's fixed-function combiner builder (guest 0x00197F90) transcribed to
+# a pure host function. The vectors are hand-derived from the disassembly; see
+# experiments/d3d8_boundary/ff_combiner_notes.md. Compiled straight in so the
+# test needs neither xbox_nv2a's platform deps nor a gen tree.
+add_executable(jsrf_d3d8_ff_combiner_test d3d8_ff_combiner_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+target_include_directories(jsrf_d3d8_ff_combiner_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_d3d8_ff_combiner COMMAND jsrf_d3d8_ff_combiner_test)
+
 add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")
