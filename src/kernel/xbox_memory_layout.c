@@ -888,7 +888,27 @@ static void ohci_trace_control_ed(uint32_t ed_va)
  * stores. */
 static uint32_t g_ohci_frame;
 
+static unsigned ohci_service_walk(uint32_t head_ed, xbox_ohci_service *svc);
+
+/* One walker at a time. The control list is walked from the doorbell (the
+ * fault handler, on whichever guest thread rang it) and, since G45, from the
+ * periodic tick's retry on the PB-ACK thread; two concurrent walks would run
+ * the same TD twice and splice two done queues. A spin, not a mutex, because
+ * one side is a signal handler; the holder only walks guest RAM, which is not
+ * guarded, so it can never fault back in here. */
+static volatile int g_ohci_walk_lock;
+
 static unsigned ohci_service(uint32_t head_ed, xbox_ohci_service *svc)
+{
+    unsigned r;
+    while (__atomic_exchange_n(&g_ohci_walk_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    r = ohci_service_walk(head_ed, svc);
+    __atomic_store_n(&g_ohci_walk_lock, 0, __ATOMIC_RELEASE);
+    return r;
+}
+
+static unsigned ohci_service_walk(uint32_t head_ed, xbox_ohci_service *svc)
 {
     /* head_ed 0 is legitimate: it means "publish whatever is already sitting
      * in HcDoneHead", which is how a writeback deferred behind an
@@ -1304,6 +1324,26 @@ static void ohci_periodic_tick(void)
         g_ohci_wdh_since = 0;
         g_ohci_wdh_cleared++;
         g_ohci_wdh_last_clear_ms = GetTickCount();
+    }
+
+    /* G45: a control TD found half-built was left queued (xbox_usb_ohci.c);
+     * its doorbell has already rung, so walk the control list again here,
+     * once this thread can see the rest of the driver's stores. */
+    {
+        extern volatile int g_ohci_retry_control;
+        if (g_ohci_retry_control && (*ctl & 0x10u)) {      /* ControlListEnable */
+            g_ohci_retry_control = 0;
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            uint32_t chead = *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_OHCI_CONTROL_HEAD);
+            if (chead && ohci_service(chead, &svc)) {
+                uint32_t off[3], val[3];
+                off[0] = MCPX_OHCI_DONE_HEAD;   val[0] = svc.done_head;
+                off[1] = MCPX_OHCI_FM_NUMBER;   val[1] = svc.frame_number;
+                off[2] = MCPX_OHCI_INTR_STATUS; val[2] = 0;
+                mcpx_hw_store_n_or_last(off, val, 3, svc.intr_status & XBOX_OHCI_INTR_WDH);
+                return;     /* one writeback per tick; the periodic list runs next tick */
+            }
+        }
     }
 
     /* This frame's interrupt-table entry, if the HCCA has one. A zero head is

@@ -28,6 +28,10 @@
 unsigned long g_ohci_tds_retired;
 unsigned long g_ohci_tds_error;
 unsigned long g_ohci_out_reports;   /* rumble packets consumed */
+/* G45: TDs found half-built -- NextTD 0 short of TailP, or a SETUP with no
+ * 8-byte buffer -- and left queued instead of failed. See the walk. */
+unsigned long g_ohci_tds_incomplete;
+volatile int g_ohci_retry_control;   /* the periodic tick re-services the control list */
 
 /* ================================================================
  * Descriptor field accessors
@@ -675,6 +679,23 @@ unsigned xbox_OhciServiceList(xbox_ohci_service *s)
             want = td[1] ? (td[3] >= td[1] ? td[3] - td[1] + 1u : 0u) : 0u;
             toggle = TD_TOGGLE(td[0]);
             td_next = td[2] & ~0xFu;
+
+            /* A TD THE DRIVER HAS NOT FINISHED WRITING. A consistent schedule
+             * never has one: every TD between HeadP and TailP links onward, and
+             * a SETUP always carries eight bytes. But the control list is walked
+             * from whichever guest thread rang ControlListFilled, and the other
+             * threads' stores reach it in no guaranteed order -- the Xbox's x86
+             * made them visible in program order, Apple silicon does not. So a
+             * thread can see XPP's new TailP before the SETUP it guards: 23 Sep
+             * police chase, SET_REPORT (rumble) SETUP with CBP 0 and NextTD 0,
+             * STALLed, the endpoint halted, and XPP's completion path
+             * (sub_001C29F7) walked a half-built chain for ever. Hardware would
+             * never have seen it; leave it queued and let the tick retry. */
+            if ((!td_next && td_va != tail) || (pid == TD_PID_SETUP && want < 8u)) {
+                g_ohci_tds_incomplete++;
+                g_ohci_retry_control = 1;
+                break;
+            }
 
             cc = ohci_run_td(s, flags, td);
             if (cc == XBOX_OHCI_CC_NOTACCESSED) {

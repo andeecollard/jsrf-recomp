@@ -1230,17 +1230,19 @@ static void jsrf_pusher_report(void)
                  * missing bit explains nothing. A snapshot at the moment of
                  * failure cannot answer that; only the time series can. */
                 {
+                    extern unsigned long g_ohci_tds_incomplete;
                     extern unsigned nv2a_ohci_snapshot(unsigned *ist,
                                                        unsigned *hcca_done);
                     unsigned ist = 0, hd = 0, ien = nv2a_ohci_snapshot(&ist, &hd);
                     fprintf(stderr,
                             "  [OHCI-WDH] blocked=%lu cleared=%lu longest=%lu ms"
                             " | tds_retired=%lu tds_error=%lu out_reports=%lu"
+                            " tds_incomplete=%lu"
                             " | ien=%08X ist=%08X hcca_done=%08X\n",
                             g_ohci_wdh_blocked, g_ohci_wdh_cleared,
                             g_ohci_wdh_longest_ms,
                             g_ohci_tds_retired, g_ohci_tds_error,
-                            g_ohci_out_reports,
+                            g_ohci_out_reports, g_ohci_tds_incomplete,
                             ien, ist, hd);
                     fprintf(stderr,
                             "  [PCRTC] %lu writable windows opened, %lu stores"

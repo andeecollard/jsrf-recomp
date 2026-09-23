@@ -597,6 +597,61 @@ static void test_set_report_rumble(void)
     xbox_SetUsbPadRumbleHook(NULL);
 }
 
+/* G45, 23 Sep 2026. The police chase: a rumble SET_REPORT whose SETUP TD the
+ * walker saw with CBP 0 and NextTD 0, although TailP was already past it --
+ * the driver's TD stores had not reached the walking thread yet. It used to
+ * STALL, halting the endpoint. It must be left queued, untouched, and run
+ * once its fields arrive. */
+extern unsigned long g_ohci_tds_incomplete;
+extern volatile int g_ohci_retry_control;
+
+static void test_half_built_td_is_left_queued(void)
+{
+    static const uint8_t set_report[8] = { 0x21, 0x09, 0x00, 0x02,
+                                           0x00, 0x00, 0x06, 0x00 };
+    static const uint8_t packet[6] = { 0x00, 0x06, 0x34, 0x12, 0x78, 0x56 };
+    unsigned long before;
+    xbox_ohci_service s;
+
+    xbox_UsbDeviceReset();
+    xbox_SetUsbPadRumbleHook(rumble_hook);
+    g_rumble_calls = 0;
+    g_ohci_retry_control = 0;
+    before = g_ohci_tds_incomplete;
+
+    /* The captured shape: flags written, CBP/NextTD/BE not yet visible. */
+    memset(ram, 0, RAM_SIZE);
+    put_ed(ED_VA, 0x00080000u, TD_TAIL, TD_SETUP, 0);
+    put_td(TD_SETUP, 0xE2E00000u, 0, 0, 0);
+    memcpy(ram + BUF_SETUP, set_report, 8);
+    memcpy(ram + BUF_IN, packet, 6);
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 0, "a half-built SETUP retires nothing");
+    check(td_cc(TD_SETUP) == 0xEu, "its condition code is left NOTACCESSED");
+    check((at(ED_VA)[2] & 1u) == 0u, "the endpoint is not halted");
+    check((at(ED_VA)[2] & ~0xFu) == TD_SETUP, "HeadP still points at it");
+    check(g_ohci_tds_incomplete == before + 1, "it is counted");
+    check(g_ohci_retry_control == 1, "and a control-list retry is owed");
+
+    /* A SETUP whose link is in but whose buffer is not: also not ready. */
+    put_td(TD_SETUP, 0xE2E00000u, 0, TD_IN, 0);
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 0 && g_ohci_tds_incomplete == before + 2,
+          "a SETUP with a link but no buffer waits too");
+
+    /* The rest of the driver's stores arrive; the retry runs it all. */
+    put_td(TD_SETUP, 0xE2E00000u, BUF_SETUP, TD_IN, BUF_SETUP + 7u);
+    put_td(TD_IN, 0xE3080000u, BUF_IN, TD_OUT, BUF_IN + 5u);
+    put_td(TD_OUT, 0xE3F00000u, 0, TD_TAIL, 0);
+    s = run(HCCA_VA, XBOX_OHCI_INTR_MIE);
+    check(s.tds_retired == 3, "once complete, the retry retires all three");
+    check(td_cc(TD_SETUP) == XBOX_OHCI_CC_NOERROR
+          && td_cc(TD_OUT) == XBOX_OHCI_CC_NOERROR, "without error");
+    check(g_rumble_calls == 1, "and the rumble arrives once");
+    check(g_ohci_tds_incomplete == before + 2, "no further deferral counted");
+    xbox_SetUsbPadRumbleHook(NULL);
+}
+
 static void test_interrupt_out_rumble(void)
 {
     /* The same packet on the interrupt OUT endpoint the configuration
@@ -641,6 +696,7 @@ int main(void)
     test_interrupt_in_report();
     test_set_report_rumble();
     test_interrupt_out_rumble();
+    test_half_built_td_is_left_queued();
 
     if (failures) return 1;
     puts("ohci_transfer_test: all checks passed");
