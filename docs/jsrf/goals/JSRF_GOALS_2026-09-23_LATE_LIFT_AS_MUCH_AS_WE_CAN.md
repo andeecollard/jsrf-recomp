@@ -172,3 +172,17 @@ against a known-bad frame and not from memory.
 - **G54.1: done.** On the intro, the stream lead measures 0 underruns at 0 ms
   now that CRI gets 59.5 passes/s. The default is back to 0, which removes
   100 ms of audio latency.
+- **G53: closed, the premise was wrong.** No regression is shown.
+  - The "16.4–17.0 ms on 16 Sep" was a different scene from the tutorial's
+    20.4 ms.
+  - In the harness's own mission scene (scene=30, `ab_switch.sh`), the
+    idle-host A/B of 23 Sep 15:45 (`measure/idlehwtex_ab_20260923-154534`)
+    reads 17.0 ms with HW_TEX: 59 fps, at the line.
+  - What stands between us and 60 is heavy scenes: the player's p10 is
+    42 fps. There, `sync` (GPU time, 7–9 ms) is the largest stage, then
+    submit and vertex shading. That is G51/G52's target, not a switch to
+    turn off.
+- **Metal refusals in the player's 1,005 s session: none** — 0 texture
+  formats refused, 0 rejected draws, 0 software fallbacks. So the cutscene
+  flicker and Poison Jam's missing elements are draws made wrongly or at the
+  wrong moment, not draws dropped.
