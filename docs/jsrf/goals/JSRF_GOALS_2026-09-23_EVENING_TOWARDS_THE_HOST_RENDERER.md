@@ -195,7 +195,18 @@ supersedes G47a: with DSOUND replaced, its DPC no longer runs.
   88% of cursors agree within 10 ms. The GetStatus disagreement is DSOUND
   never clearing PLAYING after Stop, which spins CRI's `mwSndStop`; the
   23 Sep black-screen hang sat in that loop. See the plan's shadow section.
-- **Phase 4, next:** replacement, with `RECOMP_DSOUND_LIFT=1`.
+- **Phase 4, built:** `stage_dsound_census.py --lift`, host bodies in
+  `dsound_lift.c`. A silenced tutorial run on it:
+  - 0 faults, 0 ABI mismatches over 179,679 calls;
+  - 384 of 384 buffers, 0 bad handles, the effects image understood
+    (20 effects);
+  - `[APU-VOICE] on=0`: the APU path never ran.
+  JSRF.app is built from it, with `RECOMP_DSOUND_LIFT=1` in the player's
+  `paths.conf` (backup `paths.conf.bak-20260923-dsound-lift`).
+- **Not yet modelled:** DSP/reverb, 3D, filters, envelopes, LFO. Windows
+  output.
+- **Owed:** the player's session — tutorial audio, the police chase, the cop
+  fight without the hang.
 
 **Done when** the tutorial and the police chase play on the lift with
 correct audio, and the player confirms the G46 reports are gone.

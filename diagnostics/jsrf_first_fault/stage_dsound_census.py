@@ -182,6 +182,9 @@ def main():
     ap.add_argument("--shadow", action="store_true",
                     help="G48 phase 3: replay every logged call into the host model (dsound_shadow.c) and "
                          "compare its GetStatus/GetCurrentPosition with DSOUND's; RECOMP_DSOUND_SHADOW=1 arms it")
+    ap.add_argument("--lift", action="store_true",
+                    help="G48 phase 4: every entry point gets a host body from dsound_lift.c, run instead of "
+                         "the original when RECOMP_DSOUND_LIFT=1")
     a = ap.parse_args()
     src, dst = a.source.resolve(), a.destination.resolve()
     if dst == src or src in dst.parents:
@@ -197,6 +200,12 @@ def main():
         if len(found) != 1 or found[0][1] is None:
             raise SystemExit("expected exactly one body for %s, found %d" % (name, len(found)))
         plan[name] = (idx, e, found[0][0], found[0][1])
+    lift_text = Path(__file__).with_name("dsound_lift.c").read_text() if a.lift else ""
+    if a.lift:
+        missing = [e["name"] for e in entries if ("void dsl_%s(void)" % e["name"]) not in lift_text
+                   and ("NOOP(%s," % e["name"]) not in lift_text]
+        if missing:
+            raise SystemExit("dsound_lift.c has no body for: %s" % ", ".join(missing))
     shutil.copytree(src, dst)
     manifest = ["source=%s" % src, "switch=RECOMP_DSOUND_CENSUS=1", "entries=%d" % len(entries)]
     by_file = {}
@@ -214,6 +223,11 @@ def main():
             body = text[start:end]
             manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), path.name))
             text = text[:start] + body.replace("void %s(void)" % name, "static void dsc_orig_%s(void)" % name, 1) + text[end:]
+            run = "dsc_orig_%s" % name
+            if a.lift:
+                run = "dsc_run_%s" % name
+                wrappers.append("int dsl_on(void); void dsl_%s(void);" % e["name"])
+                wrappers.append("static void %s(void) { if (dsl_on()) dsl_%s(); else dsc_orig_%s(); }" % (run, e["name"], name))
             nargs = LOGGED.get(e["name"], 0)
             cap = ""
             log = ""
@@ -223,11 +237,11 @@ def main():
                 if a.shadow:
                     log += ' dss_after("%s", ar, eax);' % e["name"]
             wrappers.append(
-                "void %s(void) { if (!g_dsound_census_on || (g_dsound_census_on < 0 && !dsc_arm())) { dsc_orig_%s(); return; }"
+                "void %s(void) { if (!g_dsound_census_on || (g_dsound_census_on < 0 && !dsc_arm())) { %s(); return; }"
                 " uint32_t ra = MEM32(esp); dsound_census_hit(%du, ra);%s"
-                " uint32_t e0 = esp, b0[3] = { ebx, esi, edi }; dsc_orig_%s();"
+                " uint32_t e0 = esp, b0[3] = { ebx, esi, edi }; %s();"
                 " uint32_t b1[3] = { ebx, esi, edi }; dsound_census_abi(%du, e0, esp, b0, b1);%s }"
-                % (name, name, idx, cap, name, idx, log))
+                % (name, run, idx, cap, run, idx, log))
         decls = "\n".join("static void dsc_orig_%s(void);" % n for _, _, n, _, _ in items)
         first = min(s for s, _, _, _, _ in items)
         text = text[:first] + decls + "\n" + text[first:] + "\n".join(wrappers) + "\n"
@@ -241,6 +255,9 @@ def main():
         addrs=", ".join("0x%08Xu" % int(e["address"], 16) for e in entries),
         names=", ".join('"%s"' % e["name"] for e in entries),
         rets=", ".join("%du" % r for r in rets), lo=DS_LO, hi=DS_HI))
+    if a.lift:
+        shutil.copyfile(Path(__file__).with_name("dsound_lift.c"), dst / "recomp_zz_dsound_lift.c")
+        manifest.append("lift: recomp_zz_dsound_lift.c (RECOMP_DSOUND_LIFT=1)")
     if a.shadow:
         shutil.copyfile(Path(__file__).with_name("dsound_shadow.c"), dst / "recomp_zz_dsound_shadow.c")
         manifest.append("shadow: recomp_zz_dsound_shadow.c (RECOMP_DSOUND_SHADOW=1)")

@@ -13,6 +13,7 @@ add_library(xbox_apu STATIC
     apu_sdl2.c
     apu_xaudio2.c
     dsound_host.c
+    dsound_host_out.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

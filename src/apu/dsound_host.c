@@ -20,6 +20,7 @@ typedef struct voice {
     uint32_t headroom;              /* centibels */
     int      playing, looping;
     uint64_t pos;                   /* frames, 32.32 fixed point */
+    float    mat[2][2];             /* [source channel][out L/R] */
     /* one decoded ADPCM block */
     uint32_t cache_block;           /* block index + 1; 0 = empty */
     int16_t  cache[ADPCM_FRAMES * 2];
@@ -100,6 +101,13 @@ static uint32_t loop_end_f(const voice *v)
     return e > t ? t : e;
 }
 
+static void default_mat(voice *v)
+{
+    memset(v->mat, 0, sizeof v->mat);
+    if (v->fmt.channels == 1) { v->mat[0][0] = v->mat[0][1] = 1.0f; }
+    else { v->mat[0][0] = 1.0f; v->mat[1][1] = 1.0f; }
+}
+
 int dsh_buffer_create(uint32_t handle, const dsh_format *fmt, uint32_t data_va, uint32_t bytes)
 {
     int ok = fmt && fmt->channels >= 1 && fmt->channels <= 2 && fmt->rate
@@ -117,6 +125,7 @@ int dsh_buffer_create(uint32_t handle, const dsh_format *fmt, uint32_t data_va, 
     v->data_va = data_va;
     v->bytes = bytes;
     v->headroom = DSH_HEADROOM_DEFAULT;
+    default_mat(v);
     g_st.created++;
     unlock();
     return 0;
@@ -216,6 +225,30 @@ void dsh_set_headroom(uint32_t handle, uint32_t cb)
     lock();
     voice *v = find(handle);
     if (v) v->headroom = cb;
+    unlock();
+}
+
+void dsh_set_mixbins(uint32_t handle, uint32_t n, const uint32_t *bins, const int32_t *vols)
+{
+    lock();
+    voice *v = find(handle);
+    if (v) {
+        if (!n) default_mat(v);
+        else {
+            memset(v->mat, 0, sizeof v->mat);
+            for (uint32_t i = 0; i < n && i < DSH_MIXBIN_MAX; ++i) {
+                int32_t cb = vols[i] > 0 ? 0 : vols[i];
+                float g = cb <= -10000 ? 0.0f : powf(10.0f, (float)cb / 2000.0f);
+                unsigned c = v->fmt.channels == 1 ? 0u : i % 2u;
+                switch (bins[i]) {
+                case 0: case 4: v->mat[c][0] += g; break;
+                case 1: case 5: v->mat[c][1] += g; break;
+                case 2: v->mat[c][0] += 0.7071f * g; v->mat[c][1] += 0.7071f * g; break;
+                default: break;
+                }
+            }
+        }
+    }
     unlock();
 }
 
@@ -376,8 +409,15 @@ void dsh_mix(int16_t *out, uint32_t frames)
                     break;
                 }
                 float t = (float)(uint32_t)(v->pos & 0xFFFFFFFFu) * (1.0f / 4294967296.0f);
-                acc[2 * i]     += (int32_t)(g * ((float)l0 + t * (float)(l1 - l0)));
-                acc[2 * i + 1] += (int32_t)(g * ((float)r0 + t * (float)(r1 - r0)));
+                float c0 = (float)l0 + t * (float)(l1 - l0);
+                float c1 = (float)r0 + t * (float)(r1 - r0);
+                if (v->fmt.channels == 1) {
+                    acc[2 * i]     += (int32_t)(g * c0 * v->mat[0][0]);
+                    acc[2 * i + 1] += (int32_t)(g * c0 * v->mat[0][1]);
+                } else {
+                    acc[2 * i]     += (int32_t)(g * (c0 * v->mat[0][0] + c1 * v->mat[1][0]));
+                    acc[2 * i + 1] += (int32_t)(g * (c0 * v->mat[0][1] + c1 * v->mat[1][1]));
+                }
                 v->pos += step;
             }
         }

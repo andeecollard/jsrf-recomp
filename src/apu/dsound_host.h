@@ -64,6 +64,16 @@ void     dsh_set_frequency(uint32_t handle, uint32_t hz);   /* 0 = the format's 
 void     dsh_set_volume(uint32_t handle, int32_t centibels);  /* <= 0 */
 void     dsh_set_headroom(uint32_t handle, uint32_t centibels);
 
+/* IDirectSoundBuffer_SetMixBins / DSBUFFERDESC.lpMixBins: `n` (bin, volume)
+ * pairs, volume in centibels. Bins 0/4 (front/back left) feed the left
+ * output, 1/5 the right, 2 (centre) both at -3 dB; the rest (LFE, crosstalk,
+ * I3DL2 and FX sends) are not mixed yet. For a mono buffer every pair applies
+ * to its one channel; for stereo, pair i applies to channel i % 2. n = 0
+ * restores the default: mono to both sides, stereo left-to-left,
+ * right-to-right. */
+#define DSH_MIXBIN_MAX 8
+void     dsh_set_mixbins(uint32_t handle, uint32_t n, const uint32_t *bins, const int32_t *vols);
+
 uint32_t dsh_get_status(uint32_t handle);
 /* The play cursor, and a write cursor one mix quantum ahead of it, both
  * wrapped into the buffer. Either pointer may be NULL. */
@@ -80,6 +90,12 @@ void     dsh_mix(int16_t *out, uint32_t frames);
  * shorter than a block. */
 int      dsh_adpcm_decode_block(int16_t *out, const uint8_t *in,
                                 uint32_t in_bytes, int channels);
+
+/* Start pulling dsh_mix to the host's audio device, 48 kHz stereo. If no
+ * device opens (a silenced harness run), a thread mixes into scratch at real
+ * time instead, so cursors and status still advance as they would with one.
+ * Returns 1 for a device, 2 for the paced thread, 0 if neither started. */
+int      dsh_output_start(void);
 
 typedef struct dsh_stats {
     unsigned long buffers, playing, created, refused_format, released;

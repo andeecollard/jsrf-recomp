@@ -162,6 +162,28 @@ static void test_table(void)
     CHECK(s.missing_data == 1 && out[0] == 0, "a playing voice with no data is counted, not mixed");
 }
 
+/* 7. Mix bins: a mono effect panned hard left, then centre at -3 dB. */
+static void test_mixbins(void)
+{
+    dsh_reset();
+    for (int i = 0; i < 10; ++i) put16(0x6000 + 2u * i, 10000);
+    dsh_buffer_create(0x80006000u, &MONO16, 0x6000, 20);
+    dsh_set_headroom(0x80006000u, 0);
+    uint32_t bins[2] = { 0, 3 }; int32_t vols[2] = { 0, 0 };        /* front left, LFE */
+    dsh_set_mixbins(0x80006000u, 2, bins, vols);
+    dsh_play(0x80006000u, DSH_PLAY_LOOPING);
+    int16_t out[4];
+    dsh_mix(out, 1);
+    CHECK(out[0] == 10000 && out[1] == 0, "front-left only: %d %d", out[0], out[1]);
+    uint32_t c[1] = { 2 }; int32_t cv[1] = { 0 };
+    dsh_set_mixbins(0x80006000u, 1, c, cv);
+    dsh_mix(out, 1);
+    CHECK(abs(out[0] - 7071) <= 1 && abs(out[1] - 7071) <= 1, "centre at -3 dB: %d %d", out[0], out[1]);
+    dsh_set_mixbins(0x80006000u, 0, NULL, NULL);
+    dsh_mix(out, 1);
+    CHECK(out[0] == 10000 && out[1] == 10000, "n=0 restores the default: %d %d", out[0], out[1]);
+}
+
 int main(void)
 {
     g_adpcm_hw_header = 0;
@@ -172,6 +194,7 @@ int main(void)
     test_frequency_and_volume();
     test_adpcm_voice();
     test_table();
+    test_mixbins();
     if (failures) { printf("dsound_host_test: %d failure(s)\n", failures); return 1; }
     puts("dsound_host_test: all checks passed");
     return 0;
