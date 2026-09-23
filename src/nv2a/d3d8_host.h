@@ -95,6 +95,7 @@ typedef struct {
     uint32_t tex_address[4], tex_filter[4], tex_control0[4];   /* raw NV2A texture registers per unit */
     uint32_t vs_words[136 * 4];                /* the executor's program memory, slot 0 up */
     float    ff_modelview[16], ff_composite[16], ff_projection[16];   /* 0x480, 0x680, 0x440 */
+    uint32_t exec_mode, prog_start, composite_ever_written, vsh_mode_internal;
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -112,6 +113,7 @@ typedef struct {
     unsigned long long ps_word_mismatch[D3D8_HOST_PS_N];
     unsigned long long tss_compared, tss_match, tss_addr, tss_mag, tss_min, tss_bias;
     unsigned long long vs_draws_prog, vs_draws_fixed, vs_draws_unparsed, vs_draws_match, vs_words_compared;
+    unsigned long long ff_compared, ff_match, ff_mv, ff_comp, ff_other;
 } D3D8HostStats;
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);

@@ -842,3 +842,40 @@ transform, perhaps through a D3D-internal program with constants. That has
 to be settled before the host FF vertex path is designed. Handles seen
 include pre-transformed `XYZRHW` (0x1C4) and untransformed `XYZ` formats
 (0x1C2, 0x202, 0x112, 0x142).
+
+### G39, eighth slice: fixed-function transform, 23 Sep 2026
+
+**How vertex-format draws reach the GPU** (a trace of execution mode, program
+start and whether the composite was written, per distinct handle):
+- **Pre-transformed** `XYZRHW` (0x1C4): execution mode 6, a D3D pass-through
+  program. It needs no matrices.
+- **Every untransformed format** (0x1C2, 0x202, 0x112, 0x142, 0x42, 0x1118,
+  0x212, 0x102): execution mode 4, the NV2A fixed-function transform, with
+  the composite written.
+The earlier "all zero" reading came from the first two worlds the discovery
+print happened to pick; both were on pre-transformed draws.
+
+**The composition, read off mode-4 draws and then checked on all of them.**
+D3D's matrices are row-vector:
+- NV2A model-view (0x480) = transpose(WORLD x VIEW).
+- NV2A composite (0x680) = transpose(WORLD x VIEW x PROJECTION x VIEWPORT).
+  VIEWPORT scales x by W/2 and y by −H/2 about the viewport centre
+  (supersample-scaled), and z by 16777215 x (MaxZ − MinZ), offset by
+  16777215 x MinZ.
+- Worked by hand for draw 7728: composite entries −358.2, 19.88 and
+  −7.934e6 match to four digits.
+
+**150 s silenced tutorial.** Relative tolerance 1e-4 for model-view and
+1e-3 for composite, because D3D composes in single precision.
+- **Mode-4 draws.** **381,234 of 381,234 match**: 0 model-view, 0 composite.
+- **Pre-transformed draws.** 23,175, no matrices needed.
+- **Faults.** 0, live=61.
+
+**Positive control** (world translation +10): 156,449 mode-4 draws, **0
+match**.
+
+**Consequence for the host renderer.** Every fixed-function draw's
+transform follows from D3D's matrices and viewport, which is Cxbx's model
+too. **Still to cover on the fixed-function side:** lighting and material,
+texture transforms and texgen, fog, and the fixed-function combiners
+(texture-stage words 12–21). Also still open: vertex streams and index data.

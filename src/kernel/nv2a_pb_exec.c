@@ -6680,6 +6680,10 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
     memcpy(out->ff_modelview, &s_methods[0x480u / 4u], sizeof out->ff_modelview);
     memcpy(out->ff_composite, &s_methods[0x680u / 4u], sizeof out->ff_composite);
     memcpy(out->ff_projection, &s_methods[0x440u / 4u], sizeof out->ff_projection);
+    out->exec_mode = s_methods[0x1E94u / 4u];
+    out->prog_start = s_methods[0x1EA0u / 4u];
+    out->composite_ever_written = s_method_seen[0x680u / 4u];
+    out->vsh_mode_internal = s_vsh.mode;
         memcpy(out->vs_words, s_vsh.words, sizeof out->vs_words < sizeof s_vsh.words ? sizeof out->vs_words : sizeof s_vsh.words);
     for (unsigned u = 0; u < 4; ++u) {
         const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;

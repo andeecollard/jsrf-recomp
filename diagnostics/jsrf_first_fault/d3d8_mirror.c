@@ -151,7 +151,8 @@ void d3d8m_after_draw(void)
                    for (unsigned k = 0; k < 192; ++k) c.vc[k][0] += 1.0f;     /* and every constant */
                    for (unsigned k = 0; k < 57; ++k) c.ps[k] ^= 0x1u;          /* and every shader word */
                    for (unsigned u = 0; u < 4; ++u) c.tss[u][0] ^= 0x2u;     /* and every stage's address */
-                   if (c.vs_nwords) c.vs_words[0] ^= 1u; } }                 /* and every program */
+                   if (c.vs_nwords) c.vs_words[0] ^= 1u;                     /* and every program */
+                   c.xf_world[12] += 10.0f; } }                                /* and the world translation */
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);

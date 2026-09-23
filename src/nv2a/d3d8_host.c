@@ -36,7 +36,8 @@ static _Atomic unsigned long long s_ps_draws, s_ps_fixed, s_ps_all, s_ps_cmp, s_
 static _Atomic unsigned s_ps_printed, s_tss_printed;
 static _Atomic unsigned long long s_tss_cmp, s_tss_match, s_tss_addr, s_tss_mag, s_tss_min, s_tss_bias;
 static _Atomic unsigned long long s_vs_prog, s_vs_fixed, s_vs_unparsed, s_vs_match, s_vs_words;
-static _Atomic unsigned s_vs_printed;
+static _Atomic unsigned s_vs_printed, s_ff_printed;
+static _Atomic unsigned long long s_ff_cmp, s_ff_match, s_ff_mv, s_ff_comp, s_ff_other;
 static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
@@ -186,23 +187,44 @@ static void check_draw(const D3D8HostDrawCheck *c)
             fprintf(stderr, "[D3D8-MIRROR] draw %u vertex program MISMATCH handle %08X at word %u of %u: d3d %08X | exec %08X\n",
                     c->serial, c->vs_handle, k, c->vs_nwords, c->vs_words[k], e.vs_words[k]);
     }
-    /* Fixed-function transform discovery: D3D's matrices beside the executor's
-     * FF registers, for the first few fixed-function draws with distinct worlds. */
-    if (c->vs_kind == 0 && (c->xf_seen & 7u) == 7u) {
-        static float seen_w[8][16]; static _Atomic unsigned nw;
-        unsigned n = atomic_load(&nw), i;
-        for (i = 0; i < n; ++i) if (!memcmp(seen_w[i], c->xf_world, sizeof seen_w[i])) break;
-        if (i == n && n < 6) {
-            memcpy(seen_w[n], c->xf_world, sizeof seen_w[n]); atomic_store(&nw, n + 1);
-            const float *m[6] = { c->xf_world, c->xf_view, c->xf_proj, e.ff_modelview, e.ff_composite, e.ff_projection };
-            const char *nm[6] = { "d3d world", "d3d view", "d3d proj", "nv2a 0x480", "nv2a 0x680", "nv2a 0x440" };
-            for (unsigned q = 0; q < 6; ++q) {
-                fprintf(stderr, "[D3D8-XF] draw %u %-10s", c->serial, nm[q]);
-                for (unsigned k = 0; k < 16; ++k) fprintf(stderr, " %.6g", m[q][k]);
-                fprintf(stderr, "\n");
-            }
+    /* Fixed-function transform (execution mode 4). Measured 23 Sep: the NV2A
+     * model-view register block is transpose(WORLD*VIEW) and the composite is
+     * transpose(WORLD*VIEW*PROJECTION*VIEWPORT), D3D's row-vector matrices, with
+     * VIEWPORT scaling x by W/2 and y by -H/2 about the centre (supersample
+     * scaled) and z by 16777215*(MaxZ-MinZ) from 16777215*MinZ. Checked with a
+     * relative tolerance: D3D composes in single precision in its own order. */
+    if (c->vs_kind == 0 && e.exec_mode == 4u && (c->xf_seen & 7u) == 7u) {
+        double wv[4][4], wvp[4][4], m[4][4], vp[4][4] = {{0}};
+        const float *W = c->xf_world, *V = c->xf_view, *P = c->xf_proj;
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double a = 0; for (int k = 0; k < 4; ++k) a += (double)W[i*4+k] * V[k*4+j]; wv[i][j] = a; }
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double a = 0; for (int k = 0; k < 4; ++k) a += wv[i][k] * P[k*4+j]; wvp[i][j] = a; }
+        double sx = c->vp_w * 0.5 * c->ss_x, sy = c->vp_h * 0.5 * c->ss_y;
+        vp[0][0] = sx; vp[1][1] = -sy; vp[2][2] = 16777215.0 * (c->vp_maxz - c->vp_minz); vp[3][3] = 1;
+        vp[3][0] = c->vp_x * c->ss_x + sx; vp[3][1] = c->vp_y * c->ss_y + sy; vp[3][2] = 16777215.0 * c->vp_minz;
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double a = 0; for (int k = 0; k < 4; ++k) a += wvp[i][k] * vp[k][j]; m[i][j] = a; }
+        double worst_mv = 0, worst_c = 0, scale_mv = 1e-6, scale_c = 1e-6;
+        for (int r = 0; r < 4; ++r) for (int q = 0; q < 4; ++q) {
+            if (fabs(wv[q][r]) > scale_mv) scale_mv = fabs(wv[q][r]);
+            if (fabs(m[q][r]) > scale_c) scale_c = fabs(m[q][r]);
         }
-    }
+        for (int r = 0; r < 4; ++r) for (int q = 0; q < 4; ++q) {
+            double d1 = fabs(wv[q][r] - e.ff_modelview[r*4+q]) / scale_mv;   /* register r*4+q = M[q][r] */
+            double d2 = fabs(m[q][r] - e.ff_composite[r*4+q]) / scale_c;
+            if (d1 > worst_mv) worst_mv = d1; if (d2 > worst_c) worst_c = d2;
+        }
+        atomic_fetch_add(&s_ff_cmp, 1);
+        if (worst_mv <= 1e-4 && worst_c <= 1e-3) atomic_fetch_add(&s_ff_match, 1);
+        else {
+            if (worst_mv > 1e-4) atomic_fetch_add(&s_ff_mv, 1); else atomic_fetch_add(&s_ff_comp, 1);
+            if (atomic_fetch_add(&s_ff_printed, 1) < 8)
+                fprintf(stderr, "[D3D8-MIRROR] draw %u fixed-function transform MISMATCH: worst relative error model-view %.3g composite %.3g"
+                                " | expected composite row0 %g %g %g %g, exec %g %g %g %g\n", c->serial, worst_mv, worst_c,
+                        m[0][0], m[1][0], m[2][0], m[3][0], e.ff_composite[0], e.ff_composite[1], e.ff_composite[2], e.ff_composite[3]);
+        }
+    } else if (c->vs_kind == 0) atomic_fetch_add(&s_ff_other, 1);
     /* Blend / alpha / depth / stencil registers: D3D's last Simple push against
      * the executor's register file at this draw. */
     for (unsigned k = 0; k < 11; ++k) {
@@ -302,6 +324,8 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->vs_draws_prog = atomic_load(&s_vs_prog); o->vs_draws_fixed = atomic_load(&s_vs_fixed);
     o->vs_draws_unparsed = atomic_load(&s_vs_unparsed); o->vs_draws_match = atomic_load(&s_vs_match);
     o->vs_words_compared = atomic_load(&s_vs_words);
+    o->ff_compared = atomic_load(&s_ff_cmp); o->ff_match = atomic_load(&s_ff_match);
+    o->ff_mv = atomic_load(&s_ff_mv); o->ff_comp = atomic_load(&s_ff_comp); o->ff_other = atomic_load(&s_ff_other);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -333,6 +357,8 @@ void d3d8_host_report(const char *why)
                 st.ps_draws_all_match, st.ps_words_compared, st.ps_words_match);
         fprintf(stderr, "[D3D8-MIRROR] %s vertex program: programmable draws %llu, identical %llu (words %llu) | fixed-function %llu, unparsed %llu\n",
                 why, st.vs_draws_prog, st.vs_draws_match, st.vs_words_compared, st.vs_draws_fixed, st.vs_draws_unparsed);
+        fprintf(stderr, "[D3D8-MIRROR] %s fixed-function transform: mode-4 draws compared=%llu MATCH=%llu (model-view %llu, composite %llu)"
+                        " | other fixed-function draws %llu\n", why, st.ff_compared, st.ff_match, st.ff_mv, st.ff_comp, st.ff_other);
         fprintf(stderr, "[D3D8-MIRROR] %s texture stages: units compared=%llu MATCH=%llu (address %llu, mag %llu, min/mip %llu, lod bias %llu)\n",
                 why, st.tss_compared, st.tss_match, st.tss_addr, st.tss_mag, st.tss_min, st.tss_bias);
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k)
