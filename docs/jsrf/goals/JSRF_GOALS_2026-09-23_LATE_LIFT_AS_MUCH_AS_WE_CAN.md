@@ -250,3 +250,28 @@ function splitting (flags live across a split point), not missing instruction
 support. The census must classify each site as "producer in this function"
 or "producer across a boundary"; the fixes differ: lifter semantics versus
 merging or carrying flags at split entries.
+
+## Progress, 24 Sep
+
+- **G41: done** (agent, merged `5a64476`). The mirror derives each draw's
+  vertex arrays from D3D's stream table (0x19DCE8, 16 x {stride, offset,
+  VB}) and the vertex-shader object's attribute records, and its indices
+  from SetIndices (device+0x38C/+0x1C, 0x19DED4).
+
+  | tutorial, 120 s | draws | arrays exact | indices match | hooks agree |
+  |---|---|---|---|---|
+  | normal | 479,980 | 1,772,326 / 1,772,326 | 479,980 / 479,980 | 479,980 / 479,980 |
+  | positive control | 499,960 | 0 / 1,847,829 | 0 | — |
+
+  So every draw's textures, surfaces, viewport, state, constants, shaders,
+  transforms, vertex arrays and indices now follow from D3D alone. What is
+  left is the fixed-function combiner and lighting state (G43 runtime half,
+  G42).
+- **G43 static half: done** (agent, merged).
+  - `src/nv2a/d3d8_ff_combiner.c` transcribes D3D's fixed-function
+    combiner builder 0x197F90, SetRenderState_TextureFactor 0x18ECC0 and the
+    final-combiner tail of 0x195610, with 96 hand-derived checks
+    (`jsrf_d3d8_ff_combiner`).
+  - Notes: `experiments/d3d8_boundary/ff_combiner_notes.md`.
+  - Render-state indices in 4134 are 10 lower than Cxbx's 5933 numbering
+    (SPECULARENABLE 93, POINTSPRITEENABLE 108, TEXTUREFACTOR 129).
