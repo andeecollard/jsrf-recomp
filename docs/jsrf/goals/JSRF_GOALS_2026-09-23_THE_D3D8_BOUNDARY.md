@@ -165,6 +165,12 @@ can see a real difference.
 | off | 18.41, 18.78 | 9.18, 9.41 | 3.13, 3.19 | 3.09, 3.08 |
 | on  | 16.92, 17.22 | **7.41, 7.47** | 3.34, 3.35 | 3.09, 3.12 |
 
+**Repeated on an idle host, 23 Sep 15:45** (`idlehwtex`, after the Zoom run
+above had been flagged as preliminary): off 18.37 / 18.27 ms with sync
+9.20 / 8.71; on 16.96 / 17.10 ms with sync 7.42 / 7.32. That is 7.0% less
+frame time, with no overlap between arms. 1.57 M and 1.59 M units were
+sampled in hardware, and there were 0 faults. The result holds.
+
 That is 8.2% less frame time, with no overlap between arms, and GPU sync
 down about 1.85 ms per frame. The on arms sampled 1.54 M and 1.57 M units in
 hardware, about 99% of texture requests, with 218 textures built,
@@ -217,9 +223,26 @@ selection rather than shader compilation.
 - **Positive control.** The inexact `EARLY_Z_REF0` arm differs by 16,900
   bytes, so the scene can see a wrong early test.
 
-**Still owed.** The scene-matched A/B of `RECOMP_METAL_EARLY_Z` with
-`RECOMP_METAL_HW_TEX=1` in both arms, on an idle host. Timings taken while
-Zoom or a build is running are preliminary.
+**Idle-host A/B, 23 Sep 15:55.** `ab_switch.sh idleearlyz RECOMP_METAL_EARLY_Z 2 150`,
+with `RECOMP_METAL_HW_TEX=1` in both arms, scene 30 held, 0 faults:
+
+| arm | frame ms | sync ms | draws early (all via `fs_hw_early_nw`) | late |
+|---|---|---|---|---|
+| off | 17.88, 16.99 | 7.70, 7.34 | 0 | 923,595 / 939,255 |
+| on  | 17.19, 16.86 | 7.46, 7.33 | 18,027 / 21,681 | 898,237 / 918,317 |
+
+**The ranges overlap; this does not separate the arms.** The difference of
+means, 0.41 ms, is inside the run-to-run spread. The draw counts say why:
+- **The exact class is about 2% of draws.** Selection is proven, since every
+  early draw went through `fs_hw_early_nw`.
+- **No draw can take the plain early variant.** Every other draw is
+  alpha-tested (reference 0) AND writes depth, so it stays late.
+
+The 2.3 ms ceiling measured on 22 Sep lives entirely in that second class.
+Reaching it exactly means proving a draw's final alpha is never 0. That
+depends on vertex alpha from the GPU vertex program and on the combiner
+alpha chain, as the spec's section 7 audit says. **`RECOMP_METAL_EARLY_Z`
+stays off; turning it on gains nothing measurable.**
 
 ## G34 — pass-through skeleton (spec Phase 1)
 
