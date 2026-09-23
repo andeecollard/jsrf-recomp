@@ -44,6 +44,7 @@ static void jsrf_state_trace_flush(void);
 #include "ram_find.h"
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
+#include "d3d8_host.h"
 #include "nv2a_pb_scan.h"
 #include "recomp_icall_feedback.h"
 extern void nv2a_pb_exec_report(void);
@@ -5022,6 +5023,10 @@ int main(int argc, char **argv)
         /* The ADX guard models priority elevation, which a blocked holder no
          * longer exerts -- see adx_guard.h, THE GUARD IS PRIORITY. */
         {   extern void xbox_SetBlockingWaitHooks(unsigned (*)(void), void (*)(unsigned));
+            {   /* G39: the executor is the reference the host D3D mirror is checked
+                 * against; harmless when nothing writes a mirror token. */
+                extern void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *);
+                d3d8_host_set_exec_source(nv2a_pb_exec_last_draw_textures); }
             if (adx_guard_on()) {
                 xbox_SetBlockingWaitHooks(adx_guard_block_begin, adx_guard_block_end);
                 fprintf(stderr, "  [ADX-GUARD] blocking-wait release installed: a holder that"

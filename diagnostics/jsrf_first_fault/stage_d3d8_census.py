@@ -143,6 +143,9 @@ def main():
     ap.add_argument("source", type=Path)
     ap.add_argument("destination", type=Path)
     ap.add_argument("--entries", type=Path, required=True)
+    ap.add_argument("--mirror", action="store_true",
+                    help="G39: keep a host mirror of D3D texture bindings and check it against the "
+                         "executor after every draw (d3d8_mirror.c); RECOMP_D3D8_MIRROR=1 arms it")
     ap.add_argument("--lift-clear", action="store_true",
                     help="route D3DDevice_Clear through d3d8_lift_clear.h (G37); "
                          "RECOMP_D3D8_LIFT_CLEAR=shadow|1 selects the mode at run time")
@@ -187,6 +190,16 @@ def main():
                 wrappers.append("static void %s(void) { if (d3d8_lift_clear_mode()) d3d8_lift_clear();"
                                 " else d3d8c_orig_%s(); }" % (body, name))
                 manifest.append("lift: %s -> d3d8_lift_clear.h" % name)
+            if a.mirror and name in ("sub_0018DF10", "sub_001993A0", "sub_00199300"):
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex); void d3d8m_after_draw(void);")
+                if name == "sub_0018DF10":
+                    wrappers.append("static void %s(void) { uint32_t st = MEM32(esp + 4u), tx = MEM32(esp + 8u);"
+                                    " %s(); d3d8m_set_texture(st, tx); }" % (hooked, body))
+                else:
+                    wrappers.append("static void %s(void) { %s(); d3d8m_after_draw(); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s" % name)
             wrappers.append(
                 "void %s(void) { if (!g_d3d8_census_on) { %s(); return; }"
                 " d3d8_census_hit(%du, MEM32(esp)); if (g_d3d8_census_on <= 0) { %s(); return; }"
@@ -208,6 +221,8 @@ def main():
         rets=", ".join("%du" % (e["ret_bytes"][0] if e["ret_bytes"] else 0) for e in entries)))
     if a.lift_clear:
         shutil.copyfile(Path(__file__).with_name("d3d8_lift_clear.h"), dst / "d3d8_lift_clear.h")
+    if a.mirror:
+        shutil.copyfile(Path(__file__).with_name("d3d8_mirror.c"), dst / "recomp_zz_d3d8_mirror.c")
     (dst / "D3D8_CENSUS_MANIFEST.txt").write_text("\n".join(manifest) + "\n")
     print("staged %d wrappers in %d files -> %s" % (len(plan), len(by_file), dst))
 

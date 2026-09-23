@@ -573,3 +573,39 @@ longer A/B separates it. At n=2 the saving is inside the spread.
 1. **G36.** It waits on the player and costs nothing meanwhile.
 2. **G37.** The lift track's next step.
 3. **G38.** It measures before any build.
+
+## G39 — the host knows each draw from D3D alone (first slice: textures), 23 Sep 2026
+
+The replay path of G37 proves the mechanism. A renderer fed at the D3D boundary
+needs more than that: the state of every draw, taken from D3D rather than from
+the NV2A commands it emits. G39 builds that host mirror and checks it against
+the executor draw by draw.
+
+**The mechanism.**
+- **The staging option.** `stage_d3d8_census.py --mirror` wraps `SetTexture`
+  (0x18DF10) to record `(stage, texture)`, and `DrawIndexedVertices` and
+  `DrawVertices` to snapshot the bound textures' Data/Format/Size after the
+  original runs (`d3d8_mirror.c`, `RECOMP_D3D8_MIRROR=1`).
+- **The check token.** Each snapshot rides a host token written behind the
+  draw's commands, so it reaches the executor just after the draw it
+  describes. There, `d3d8_host.c` compares it with the executor's
+  reconstruction (`nv2a_pb_exec_last_draw_textures`: address, NV2A format
+  byte, width, height and levels for every unit in use).
+
+**Result.** 150 s silenced tutorial, census convention check on:
+- **Draws.** 599,961 checked; the executor was active for all of them.
+- **Texture units.** 976,530 compared, **976,526 match** (99.9996%). Missing
+  in D3D 0, format or shape 0, **address 4**.
+- **Checks and faults.** The convention check ran 7,721,721 calls with 0
+  mismatches. live=61, 0 faults.
+
+**The four mismatches** are one texture object, `0x0436C410`, on four draws
+(138049, 138051, 138631, 138634). D3D's object reads 256x256 X1R5G5B5 at
+`0xF93000`, but the executor drew a 64x64 DXT1 at `0xF92000`. Either that
+stage was rebound by a path that is not `SetTexture`, or the object was
+changed after the draw. Open; it names the next thing to hook.
+
+**Next for G39:** the same check for the render target and depth surface,
+the viewport, the blend, depth and alpha state from D3D's render-state array,
+and the vertex and pixel shader handles. Each one checked is a piece of the
+draw a host renderer can take from D3D.

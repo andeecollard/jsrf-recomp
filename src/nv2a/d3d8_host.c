@@ -10,6 +10,8 @@
                                      * replay, and a full queue falls back, never waits */
 typedef struct {
     _Atomic uint32_t state;         /* 0 free, 1 filling, 2 published */
+    uint32_t kind;                  /* 0 methods, 1 draw check */
+    D3D8HostDrawCheck check;
     uint32_t n;
     uint32_t method[D3D8_HOST_MAX_METHODS], param[D3D8_HOST_MAX_METHODS];
 } Slot;
@@ -17,6 +19,56 @@ static Slot s_slot[SLOTS];
 static _Atomic uint32_t s_next;
 static _Atomic unsigned long long s_enq, s_rep, s_mrep, s_full, s_bad;
 static atomic_int s_installed;
+static void (*s_exec_source)(D3D8ExecDrawTextures *);
+static _Atomic unsigned long long s_chk, s_chk_inactive, s_u_cmp, s_u_match, s_u_missing, s_u_addr, s_u_shape;
+static _Atomic unsigned s_mismatch_printed;
+void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
+
+/* NV2A format byte from a D3D Format word, and the shape it implies. */
+static void check_draw(const D3D8HostDrawCheck *c)
+{
+    D3D8ExecDrawTextures e;
+    atomic_fetch_add(&s_chk, 1);
+    if (!s_exec_source) return;
+    memset(&e, 0, sizeof e);
+    s_exec_source(&e);
+    if (!e.active) { atomic_fetch_add(&s_chk_inactive, 1); return; }
+    for (unsigned u = 0; u < 4; ++u) {
+        if (!(e.mask & (1u << u))) continue;
+        atomic_fetch_add(&s_u_cmp, 1);
+        const char *why = NULL;
+        if (!c->tex[u]) { atomic_fetch_add(&s_u_missing, 1); why = "D3D has no texture bound"; }
+        else if ((c->data[u] & 0x03FFFFFFu) != (e.addr[u] & 0x03FFFFFFu)) { atomic_fetch_add(&s_u_addr, 1); why = "address"; }
+        else {
+            uint32_t f = c->format[u], fb = (f >> 8) & 0xFFu, lv = (f >> 16) & 0xFu;
+            uint32_t w = 1u << ((f >> 20) & 0xFu), h = 1u << ((f >> 24) & 0xFu);
+            if (fb == 0x11u) { w = (c->size[u] & 0xFFFu) + 1u; h = ((c->size[u] >> 12) & 0xFFFu) + 1u; lv = 1; }
+            if (fb != e.fmt[u] || w != e.width[u] || h != e.height[u] || lv != e.levels[u]) {
+                atomic_fetch_add(&s_u_shape, 1); why = "format/shape";
+            } else atomic_fetch_add(&s_u_match, 1);
+        }
+        if (why && atomic_fetch_add(&s_mismatch_printed, 1) < 12)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u unit %u MISMATCH (%s): d3d tex=%08X data=%08X fmt=%08X size=%08X"
+                            " | exec addr=%08X fmt=%02X %ux%u levels=%u\n",
+                    c->serial, u, why, c->tex[u], c->data[u], c->format[u], c->size[u],
+                    e.addr[u], e.fmt[u], e.width[u], e.height[u], e.levels[u]);
+    }
+}
+
+uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c)
+{
+    uint32_t i, expect = 0;
+    d3d8_host_install();
+    i = atomic_fetch_add(&s_next, 1u) % SLOTS;
+    if (!atomic_compare_exchange_strong(&s_slot[i].state, &expect, 1u)) {
+        atomic_fetch_add(&s_full, 1);
+        return 0;
+    }
+    s_slot[i].kind = 1; s_slot[i].n = 0; s_slot[i].check = *c;
+    atomic_store_explicit(&s_slot[i].state, 2u, memory_order_release);
+    atomic_fetch_add(&s_enq, 1);
+    return i + 1u;
+}
 
 /* Token parameter = slot index + 1, so 0 never names a slot. */
 static void on_token(uint32_t parameter)
@@ -27,6 +79,7 @@ static void on_token(uint32_t parameter)
         atomic_fetch_add(&s_bad, 1);
         return;
     }
+    if (s_slot[i].kind == 1) check_draw(&s_slot[i].check);
     for (uint32_t k = 0; k < s_slot[i].n; ++k)
         nv2a_pusher_dispatch_host(0, s_slot[i].method[k], s_slot[i].param[k]);
     atomic_fetch_add(&s_mrep, s_slot[i].n);
@@ -52,6 +105,7 @@ uint32_t d3d8_host_enqueue(const uint32_t *methods, const uint32_t *params, unsi
         atomic_fetch_add(&s_full, 1);
         return 0;
     }
+    s_slot[i].kind = 0;
     s_slot[i].n = n;
     memcpy(s_slot[i].method, methods, n * sizeof *methods);
     memcpy(s_slot[i].param, params, n * sizeof *params);
@@ -65,6 +119,10 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->enqueued = atomic_load(&s_enq); o->replayed = atomic_load(&s_rep);
     o->methods_replayed = atomic_load(&s_mrep); o->full = atomic_load(&s_full);
     o->bad_token = atomic_load(&s_bad);
+    o->checks = atomic_load(&s_chk); o->check_inactive = atomic_load(&s_chk_inactive);
+    o->units_compared = atomic_load(&s_u_cmp); o->units_match = atomic_load(&s_u_match);
+    o->units_missing = atomic_load(&s_u_missing); o->units_addr = atomic_load(&s_u_addr);
+    o->units_shape = atomic_load(&s_u_shape);
 }
 
 void d3d8_host_report(const char *why)
@@ -72,4 +130,9 @@ void d3d8_host_report(const char *why)
     D3D8HostStats st; d3d8_host_get_stats(&st);
     fprintf(stderr, "[D3D8-HOST] %s enqueued=%llu replayed=%llu methods=%llu full=%llu bad_token=%llu\n",
             why, st.enqueued, st.replayed, st.methods_replayed, st.full, st.bad_token);
+    if (st.checks)
+        fprintf(stderr, "[D3D8-MIRROR] %s draws checked=%llu (executor inactive %llu) texture units compared=%llu"
+                        " MATCH=%llu | missing-in-d3d=%llu address=%llu format/shape=%llu\n",
+                why, st.checks, st.check_inactive, st.units_compared, st.units_match,
+                st.units_missing, st.units_addr, st.units_shape);
 }

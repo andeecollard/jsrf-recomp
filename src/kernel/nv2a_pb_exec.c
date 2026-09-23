@@ -739,6 +739,7 @@ static struct {
     uint8_t *target, *depth;
     size_t texture_bytes, target_bytes, depth_bytes;
     uint32_t texture_address, target_address, depth_address, batches, rejected;
+    uint32_t extra_address[3];   /* G39: stage 1-3 guest addresses, like texture_address */
     int active;
 } s_copy;
 
@@ -1585,6 +1586,7 @@ static const char *prepare_texture_copy(void)
                 || (uint64_t)t->texture_offset+bytes>(uint64_t)limit+1
                 || (uint64_t)base+t->texture_offset+bytes>UINT32_MAX) return "texture DMA range";
         uint32_t address=base+t->texture_offset;
+        s_copy.extra_address[unit-1]=address;
         if((uint64_t)address+bytes>s_copy.target_address &&
                 (uint64_t)s_copy.target_address+s_copy.target_bytes>address)
             return "overlapping texture and target";
@@ -6635,4 +6637,32 @@ void nv2a_pb_exec_report(void)
     if (getenv("RECOMP_PB_EXEC_PROGRAM"))
         nv2a_pb_exec_dump_program();
     fflush(stderr);
+}
+
+/* G39: what this executor made of the draw it ran last, for the host D3D
+ * mirror's check (d3d8_host.c). Runs on the pusher thread, from a token that
+ * sits behind the draw's commands, so s_copy is that draw. */
+#include "d3d8_host.h"
+static uint32_t exec_fmt_byte(const NV2ATextureCopy *t)
+{
+    if (t->dxt1) return 0x0Cu;
+    if (t->dxt3) return 0x0Eu;
+    if (t->rgba8) return t->xrgb8 ? 0x07u : 0x06u;
+    if (t->sz16) return t->argb4 ? 0x04u : 0x03u;
+    return 0x11u;
+}
+void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
+{
+    const NV2ATextureCopy *c = &s_copy.state;
+    memset(out, 0, sizeof *out);
+    out->active = s_copy.active;
+    if (!s_copy.active) return;
+    out->mask = c->untextured ? 0u : (c->texture_mask & 0xFu);
+    for (unsigned u = 0; u < 4; ++u) {
+        const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;
+        if (!(out->mask & (1u << u))) continue;
+        out->addr[u] = u ? s_copy.extra_address[u - 1] : s_copy.texture_address;
+        out->width[u] = t->width; out->height[u] = t->height; out->levels[u] = t->levels;
+        out->fmt[u] = exec_fmt_byte(t);
+    }
 }

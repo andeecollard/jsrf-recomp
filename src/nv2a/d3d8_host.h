@@ -28,8 +28,36 @@ uint32_t d3d8_host_enqueue(const uint32_t *methods, const uint32_t *params, unsi
 /* Installs the pusher's token handler. Idempotent; d3d8_host_enqueue calls it. */
 void d3d8_host_install(void);
 
+/* ---- G39: the host's D3D state mirror, checked draw by draw ----
+ *
+ * The replaced/observed D3D entry points keep a host-side mirror of what D3D
+ * has bound. After each draw, the mirror is snapshotted into a check item and
+ * a token is written behind the draw's commands; when the ring consumer
+ * reaches it, the executor has just run that draw, and the snapshot is
+ * compared with what the executor reconstructed from the NV2A commands.
+ * Agreement means the host can describe the draw from D3D alone -- which is
+ * what a renderer fed at the D3D boundary needs. */
+typedef struct {
+    uint32_t serial;           /* D3D draw number, for the report */
+    uint32_t tex[4];           /* D3DBaseTexture* per stage, 0 = none */
+    uint32_t data[4], format[4], size[4];   /* ->Data, ->Format, ->Size */
+} D3D8HostDrawCheck;
+
+/* What the executor made of the draw it just ran. */
+typedef struct {
+    int      active;           /* 0: the executor refused or has not drawn */
+    uint32_t mask;             /* texture units in use */
+    uint32_t addr[4];          /* guest address of each unit's texture */
+    uint32_t width[4], height[4], levels[4];
+    uint32_t fmt[4];           /* the NV2A format byte, decoded class for linear */
+} D3D8ExecDrawTextures;
+void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
+uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
+
 typedef struct {
     unsigned long long enqueued, replayed, methods_replayed, full, bad_token;
+    unsigned long long checks, check_inactive, units_compared, units_match,
+                       units_missing, units_addr, units_shape;
 } D3D8HostStats;
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);
