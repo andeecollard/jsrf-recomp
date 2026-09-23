@@ -230,6 +230,33 @@ convention recorded in G32, still calling the original.
 faults, and the ring contents are word-for-word identical to a run without
 wrappers over the same frames.
 
+### G34, re-scoped and done, 23 Sep 2026
+
+**Why the gate changed.** The gate as written above compared the ring word
+for word between runs with and without pass-through wrappers. A wrapper that
+only calls the original is identical by construction, and a cross-run
+comparison is timing-noisy, so that gate cannot fail for a real reason. The
+skeleton's actual risk is the convention table the G35 replacements will
+rely on: how many bytes each entry pops, and which registers it preserves.
+
+**What was built.** `stage_d3d8_census.py` wrappers now snapshot `esp` and
+the callee-saved `ebx`/`esi`/`edi` around every original body. They check
+that `esp` moved by exactly `4 + ret_bytes` from `entry_points.json` and that
+the three registers came back unchanged. `ebp` is excluded because the
+recompiler keeps it as a C local per generated function, so it is not guest
+state across a call. Output is `[D3D8-ABI]`, periodic and at exit.
+
+**Result.** One silenced 150 s `measure.sh` run, while Zoom was running,
+which does not matter for a correctness count:
+- **Calls checked.** 7,704,313, game and internal together, every entry
+  point that fired, with **0 mismatches**.
+- **Scene and faults.** live=61, the tutorial, with 0 guest faults.
+
+So every entry point the tutorial reaches is described correctly, and a
+replacement body can use the generic epilogue, `esp += 4 + ret_bytes` with
+`eax` as the result. The 20 entry points that never fired are still
+unchecked; the first scene that reaches them will check them.
+
 ## G35 — first pixels through Metal (spec Phase 2)
 
 Device, present, clear, `UP` and immediate-mode draws. Textures come from
@@ -245,7 +272,7 @@ Phases 3 and 4 of the spec are opened as goals when G35 passes, not before.
 1. **G32.** Reading only. It is needed by both G33 and G34. **DONE 23 Sep.**
 2. **G33a–c.** Build, then one silenced scripted run. **DONE 23 Sep**, all three gates pass.
 3. **G27.** It proceeds whatever G33 finds, and it is the renderer track's head. **Hardware sampling DONE 23 Sep, behind `RECOMP_METAL_HW_TEX=1`, default off**; see "G27 outcome" below. Early-Z (G27b) is next on this item.
-4. **G34**, only if G33's gate 3 passes.
+4. **G34**, only if G33's gate 3 passes. **DONE 23 Sep** (re-scoped: the runtime convention check, 7.7 M calls, 0 mismatches).
 5. **G35.**
 
 ## Standing rules that apply here
