@@ -526,6 +526,48 @@ is vertex data the CPU prepares.
 byte-identical; the positive control still differs; and an idle-host A/B
 scores `sync`.
 
+### G38c outcome, 23 Sep 2026: exact, audited, and worth about 0.4 ms of GPU time
+
+**Built** in `nv2a_metal.m`, behind `RECOMP_METAL_EARLY_Z_EXACT=1|audit|audit-control`
+(value-carrying, so it is listed in `switch_audit.py`). It needs
+`RECOMP_METAL_EARLY_Z=1` and `RECOMP_METAL_HW_TEX=1`.
+- **Texture ranges.** Each hardware texture's alpha range is recorded over
+  every uploaded level at decode.
+- **Vertex programs.** Each program's `oD0.w`/`oD1.w` becomes a small
+  expression tree over the constant file (`vsh_out_alpha`, saturated as the
+  emitter does). The default output alpha is 1, and anything opaque is
+  unknown.
+- **The combiner chain.** `comb_alpha_floor` runs `shade()`'s alpha chain
+  over ranges: the input mappings, products, sum and mux, output mapping,
+  clamps, and the colour half's blue-to-alpha writes.
+- **The rule.** A draw is proven when its floor is at least 1/255 and its z
+  cull cannot fire. JSRF sets CULL with the full range [0, 16777215] on every
+  draw, so the z cull is only a risk if a fragment's z leaves [0, 1].
+
+**Audit, which proves the proof.** `audit` keeps proven draws late and has
+the shader count, in a device atomic, any alpha-test or z-cull discard of a
+proven draw.
+- **Audit arm.** 150 s tutorial: 346,642 proven predicate calls, **0
+  discards**.
+- **Positive control.** `audit-control` marks every alpha-tested draw:
+  **1,274,067,809 discards**. The counter sees real discards, so the 0 is
+  evidence.
+
+**Idle-host A/B** (`ab_switch.sh ezexact`, 2 x 150 s, early-Z and hardware
+textures on in both arms, scene 30 held, 0 faults):
+
+| arm | frame ms | sync ms | draws early / late |
+|---|---|---|---|
+| off | 17.37, 18.22 | 8.34, 8.75 | 18,846 / 804,870 and 17,090 / 837,506 |
+| on  | 17.60, 17.61 | 8.12, 8.15 | 335,184 / 560,917 and 335,217 / 559,986 |
+
+**The ranges overlap on frame time.** Sync is lower in both on runs, by
+about 0.4 ms. About 37% of draws move early. The rest of the 2.3 ms ceiling
+sits in draws that genuinely CAN discard, because their textures hold
+alpha-0 texels. No exact rule moves those; only a depth pre-pass or an
+approximation would. **`RECOMP_METAL_EARLY_Z_EXACT` stays off** until a
+longer A/B separates it. At n=2 the saving is inside the spread.
+
 ### Order
 
 1. **G36.** It waits on the player and costs nothing meanwhile.

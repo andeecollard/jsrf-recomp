@@ -537,6 +537,7 @@ typedef struct {
      * pitch and mip count -- one guest allocation can be bound two ways. */
     id<MTLTexture> hw;
     uint32_t hw_key[5];
+    uint8_t hw_min_a, hw_max_a;   /* G38c: alpha range over every uploaded level */
 } TextureBuffer;
 static TextureBuffer texture_cache[TEXTURE_CACHE_SIZE];
 static id<MTLBuffer> dummy_buffer;
@@ -692,7 +693,7 @@ static NSString *const shader =
  " uint stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;"
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
  " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8];"
- " uint const0[8]; uint const1[8]; uint frag_force; uint hw[4]; };\n"
+ " uint const0[8]; uint const1[8]; uint frag_force; uint hw[4]; uint ez_proven; };\n"
  "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; };\n"
  "struct Frag { float4 color [[color(0)]]; uint stencil [[color(1)]]; };\n"
  "vertex Out vs(uint id [[vertex_id]], const device Vertex *v [[buffer(0)]], constant Params &s [[buffer(1)]],const device uint*indices [[buffer(2)]]) {\n"
@@ -875,15 +876,16 @@ static NSString *const shader =
  "fragment float4 fs_hw(Out i [[stage_in]],"
  " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
  " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
- " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]],"
+ " device atomic_uint *ezv [[buffer(5)]]){\n"
  " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  /* discard_fragment() does NOT return in MSL -- execution continues and the
   * write is dropped at the end -- so each discard returns explicitly. The
   * returned value is immaterial; the explicit return is what stops the rest
   * of the shader running for a fragment that is already gone. */
  " float zg=i.p.z*16777215.0f;"
- " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
- " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
+ " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){if(s.ez_proven)atomic_fetch_add_explicit(ezv,1u,memory_order_relaxed);discard_fragment();return c;}"
+ " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){if(s.ez_proven)atomic_fetch_add_explicit(ezv,1u,memory_order_relaxed);discard_fragment();return c;}"
  /* Byte-for-byte the dither fs() uses. It is per-channel because the guest
   * target is RGB565 and the quantisation step differs between green and the
   * other two; a uniform bias would dither green twice as hard. */
@@ -937,11 +939,12 @@ static NSString *const shader =
  "fragment float4 fs_hw_blend(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
  " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
  " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
- " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]],"
+ " device atomic_uint *ezv [[buffer(5)]]){\n"
  " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  " float zg=i.p.z*16777215.0f;"
- " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
- " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
+ " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){if(s.ez_proven)atomic_fetch_add_explicit(ezv,1u,memory_order_relaxed);discard_fragment();return c;}"
+ " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){if(s.ez_proven)atomic_fetch_add_explicit(ezv,1u,memory_order_relaxed);discard_fragment();return c;}"
  " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
@@ -958,11 +961,12 @@ static NSString *const shader =
  "[[early_fragment_tests]] fragment float4 fs_hw_early_nw(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
  " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
  " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
- " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]],"
+ " device atomic_uint *ezv [[buffer(5)]]){\n"
  " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  " float zg=i.p.z*16777215.0f;"
- " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
- " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
+ " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){if(s.ez_proven)atomic_fetch_add_explicit(ezv,1u,memory_order_relaxed);discard_fragment();return c;}"
+ " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){if(s.ez_proven)atomic_fetch_add_explicit(ezv,1u,memory_order_relaxed);discard_fragment();return c;}"
  " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
@@ -993,7 +997,8 @@ static NSString *const shader =
  "[[early_fragment_tests]] fragment float4 fs_hw_early(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
  " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
  " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
- " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]],"
+ " device atomic_uint *ezv [[buffer(5)]]){\n"
  " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
@@ -1004,7 +1009,8 @@ static NSString *const shader =
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
  " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
  " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
- " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]],"
+ " device atomic_uint *ezv [[buffer(5)]]){\n"
  " Frag o;o.color=dst;o.stencil=stencil;float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  /* The guest's depth-range policy, per fragment, in guest z units.
   * NV097_SET_ZMIN_MAX_CONTROL selects discard (CULL) or saturate (CLAMP)
@@ -1087,10 +1093,156 @@ typedef struct {
      * nv2a_ff_generate_msl, exactly as it does a program's words. */
     int is_ff;
     unsigned keysize;
+    /* G38c: oD0.w and oD1.w as small expression trees over the constant file,
+     * built once from the parsed program (vsh_out_alpha_build). od_ready: 0 not
+     * built, 1 built, -1 unusable (fixed function, parse failure, too deep). */
+    int od_ready;
+    int16_t od_root[2];
+    struct { uint8_t op, neg, comp; int16_t a, b, c; uint16_t idx; } od_node[96];
+    int od_n;
 } VshSlot;
 static VshSlot vsh_slot[VSH_CACHE];
 static unsigned vsh_slot_n;
 static VshSlot *vsh_active;          /* the program this draw will use, or NULL */
+
+/* ---- G38c: the diffuse/specular alpha a guest vertex program writes, as a range ----
+ *
+ * experiments/d3d8_boundary/vsh_od0w.c measured the title's 126 programs:
+ * oD0.w is built from constant registers alone in 79, never written in 43 (the
+ * emitter's default, float4(0,0,0,1): alpha 1), from input registers in 3 and
+ * computed in 1. So for almost every draw the value is a function of the
+ * constant file this draw uploads, and can be evaluated here. The emitter
+ * saturates both colour outputs, so the result is clamped to [0,1]. Anything
+ * the tree cannot see through -- an input register, an a0-relative constant,
+ * a dot product, an ILU op other than MOV -- evaluates to "unknown", which
+ * makes the draw ineligible, never wrong. */
+enum { OD_UNK = 0, OD_CONST, OD_ONE, OD_MOV, OD_MUL, OD_ADD, OD_MAD, OD_MIN, OD_MAX };
+static NV2AVshProgram g_od_prog;   /* pusher thread only */
+
+static int od_new(VshSlot *v, uint8_t op)
+{
+    if (v->od_n >= (int)(sizeof v->od_node / sizeof v->od_node[0])) return -1;
+    memset(&v->od_node[v->od_n], 0, sizeof v->od_node[0]);
+    v->od_node[v->od_n].op = op;
+    return v->od_n++;
+}
+static int od_temp(VshSlot *v, int before, int reg, int lane, int depth);
+static int od_src(VshSlot *v, int slot, const NV2AVshSrcOperand *o, int lane, int depth)
+{
+    int c = lane == 0 ? o->swizzle.x : lane == 1 ? o->swizzle.y : lane == 2 ? o->swizzle.z : o->swizzle.w;
+    int n;
+    if (o->reg_type == NV2A_VSH_REG_CONST && !o->rel_addr) {
+        if ((n = od_new(v, OD_CONST)) < 0) return -1;
+        v->od_node[n].idx = (uint16_t)o->reg_index; v->od_node[n].comp = (uint8_t)c;
+        v->od_node[n].neg = (uint8_t)(o->negate != 0);
+        return n;
+    }
+    if (o->reg_type == NV2A_VSH_REG_TEMP) {
+        int t = od_temp(v, slot, o->reg_index, c, depth + 1);
+        if (t < 0 || !o->negate) return t;
+        if ((n = od_new(v, OD_MOV)) < 0) return -1;
+        v->od_node[n].a = (int16_t)t; v->od_node[n].neg = 1;
+        return n;
+    }
+    return od_new(v, OD_UNK);
+}
+static int od_mac(VshSlot *v, int slot, int lane, int depth)
+{
+    const NV2AVshInstruction *in = &g_od_prog.insns[slot];
+    int n, a = -1, b = -1, c = -1; uint8_t op;
+    switch (in->mac_op) {
+    case NV2A_VSH_MAC_MOV: return od_src(v, slot, &in->mac_src[0], lane, depth);
+    case NV2A_VSH_MAC_MUL: op = OD_MUL; break;
+    case NV2A_VSH_MAC_ADD: op = OD_ADD; break;
+    case NV2A_VSH_MAC_MAD: op = OD_MAD; break;
+    case NV2A_VSH_MAC_MIN: op = OD_MIN; break;
+    case NV2A_VSH_MAC_MAX: op = OD_MAX; break;
+    default: return od_new(v, OD_UNK);
+    }
+    a = od_src(v, slot, &in->mac_src[0], lane, depth);
+    if (op != OD_ADD) b = od_src(v, slot, &in->mac_src[1], lane, depth);
+    if (op == OD_ADD || op == OD_MAD) c = od_src(v, slot, &in->mac_src[2], lane, depth);
+    if (a < 0 || (op != OD_ADD && b < 0) || ((op == OD_ADD || op == OD_MAD) && c < 0)) return -1;
+    if ((n = od_new(v, op)) < 0) return -1;
+    v->od_node[n].a = (int16_t)a; v->od_node[n].b = (int16_t)b; v->od_node[n].c = (int16_t)c;
+    return n;
+}
+static int od_temp(VshSlot *v, int before, int reg, int lane, int depth)
+{
+    if (depth > 24) return od_new(v, OD_UNK);
+    for (int i = before - 1; i >= 0; --i) {
+        const NV2AVshInstruction *in = &g_od_prog.insns[i];
+        uint8_t bit = (uint8_t)(1u << (3 - lane));
+        if (in->mac_op != NV2A_VSH_MAC_NOP && in->mac_dst.temp_reg == reg && (in->mac_dst.write_mask & bit))
+            return od_mac(v, i, lane, depth);
+        if (in->ilu_op != NV2A_VSH_ILU_NOP && in->ilu_dst.temp_reg == reg && (in->ilu_dst.write_mask & bit))
+            return in->ilu_op == NV2A_VSH_ILU_MOV ? od_src(v, i, &in->ilu_src, lane, depth) : od_new(v, OD_UNK);
+    }
+    return od_new(v, OD_UNK);
+}
+static void vsh_out_alpha_build(VshSlot *v)
+{
+    if (v->od_ready) return;
+    v->od_ready = -1; v->od_n = 0;
+    if (v->is_ff || nv2a_vsh_parse(&v->words[0][0], v->length * 4, &g_od_prog) < 0) return;
+    for (int k = 0; k < 2; ++k) {
+        NV2AVshOutputReg out = k ? NV2A_VSH_OUT_D1 : NV2A_VSH_OUT_D0;
+        int last = -1, mac = 0, root;
+        for (int i = 0; i < g_od_prog.length; ++i) {
+            const NV2AVshInstruction *in = &g_od_prog.insns[i];
+            if (in->mac_op != NV2A_VSH_MAC_NOP && in->mac_dst.output_reg == out && (in->mac_dst.output_mask & 1)) { last = i; mac = 1; }
+            if (in->ilu_op != NV2A_VSH_ILU_NOP && in->ilu_dst.output_reg == out && (in->ilu_dst.output_mask & 1)) { last = i; mac = 0; }
+        }
+        if (last < 0) root = od_new(v, OD_ONE);          /* the emitter's default: float4(0,0,0,1) */
+        else if (mac) root = od_mac(v, last, 3, 0);
+        else root = g_od_prog.insns[last].ilu_op == NV2A_VSH_ILU_MOV
+                  ? od_src(v, last, &g_od_prog.insns[last].ilu_src, 3, 0) : od_new(v, OD_UNK);
+        if (root < 0) return;
+        v->od_root[k] = (int16_t)root;
+    }
+    v->od_ready = 1;
+}
+typedef struct { float lo, hi; } Rng;
+static Rng rng_mul(Rng a, Rng b)
+{
+    float p[4] = { a.lo*b.lo, a.lo*b.hi, a.hi*b.lo, a.hi*b.hi }; Rng r = { p[0], p[0] };
+    for (int i = 1; i < 4; ++i) { if (p[i] < r.lo) r.lo = p[i]; if (p[i] > r.hi) r.hi = p[i]; }
+    if (r.lo != r.lo || r.hi != r.hi) { r.lo = -INFINITY; r.hi = INFINITY; }   /* 0*inf */
+    return r;
+}
+static Rng od_eval(const VshSlot *v, int n, const float (*c)[4])
+{
+    const __typeof__(v->od_node[0]) *d = &v->od_node[n]; Rng r, x, y, z;
+    switch (d->op) {
+    case OD_CONST: if (!c || d->idx >= 192) { r.lo = -INFINITY; r.hi = INFINITY; return r; }
+                   r.lo = r.hi = d->neg ? -c[d->idx][d->comp] : c[d->idx][d->comp];
+                   if (r.lo != r.lo) { r.lo = -INFINITY; r.hi = INFINITY; }
+                   return r;
+    case OD_ONE:   r.lo = r.hi = 1.0f; return r;
+    case OD_MOV:   x = od_eval(v, d->a, c); if (d->neg) { r.lo = -x.hi; r.hi = -x.lo; return r; } return x;
+    case OD_MUL:   return rng_mul(od_eval(v, d->a, c), od_eval(v, d->b, c));
+    case OD_ADD:   x = od_eval(v, d->a, c); z = od_eval(v, d->c, c); r.lo = x.lo + z.lo; r.hi = x.hi + z.hi; return r;
+    case OD_MAD:   x = rng_mul(od_eval(v, d->a, c), od_eval(v, d->b, c)); z = od_eval(v, d->c, c);
+                   r.lo = x.lo + z.lo; r.hi = x.hi + z.hi; return r;
+    case OD_MIN:   x = od_eval(v, d->a, c); y = od_eval(v, d->b, c);
+                   r.lo = fminf(x.lo, y.lo); r.hi = fminf(x.hi, y.hi); return r;
+    case OD_MAX:   x = od_eval(v, d->a, c); y = od_eval(v, d->b, c);
+                   r.lo = fmaxf(x.lo, y.lo); r.hi = fmaxf(x.hi, y.hi); return r;
+    default:       r.lo = -INFINITY; r.hi = INFINITY; return r;
+    }
+}
+/* The saturated output alpha range of oD0 (k=0) or oD1 (k=1); [0,1] if unknown. */
+static Rng vsh_out_alpha(VshSlot *v, int k, const float (*c)[4])
+{
+    Rng r = { 0.0f, 1.0f };
+    if (!v) return r;
+    vsh_out_alpha_build(v);
+    if (v->od_ready != 1) return r;
+    r = od_eval(v, v->od_root[k], c);
+    if (!(r.lo >= 0.0f)) r.lo = 0.0f; if (r.lo > 1.0f) r.lo = 1.0f;    /* saturate(), NaN-safe */
+    if (!(r.hi <= 1.0f)) r.hi = 1.0f; if (r.hi < 0.0f) r.hi = 0.0f;
+    return r;
+}
 static const float (*vsh_constants)[4];
 static uint64_t g_vsh_gpu_draws, g_vsh_cpu_draws, g_vsh_compiles, g_vsh_hits;
 static uint64_t g_vsh_refused_emit, g_vsh_refused_compile, g_vsh_cache_full;
@@ -2004,6 +2156,96 @@ static void alpha_census_report(void)
     }
 }
 
+/* G38c -- RECOMP_METAL_EARLY_Z_EXACT=1 (needs RECOMP_METAL_EARLY_Z=1 and
+ * RECOMP_METAL_HW_TEX=1). An alpha-tested draw at alpha_ref 0 discards only a
+ * fragment whose final alpha is below 1/510. When a lower bound on that alpha,
+ * over every fragment the draw can produce, is at least 1/255, no fragment can
+ * be discarded and fs_hw_early is exact. The bound comes from running the
+ * draw's combiner alpha chain -- shade()'s exact steps -- over [lo,hi] ranges:
+ * textures by the alpha range recorded at decode, diffuse/specular by the
+ * vertex program's traced output (vsh_out_alpha). Anything not known is its
+ * full possible range, which can only make a draw ineligible. */
+static int early_z_exact_mode(void)   /* 0 off, 1 on, 2 audit: prove, stay late, count violations */
+{ static int m=-1;
+  if(m<0){const char*e=getenv("RECOMP_METAL_EARLY_Z_EXACT");
+          if(!e||e[0]==0||!strcmp(e,"0"))m=0;          /* default OFF; empty is the default */
+          else if(!strcmp(e,"audit"))m=2;
+          else if(!strcmp(e,"audit-control"))m=3;   /* positive control: mark EVERY alpha-tested draw */
+          else m=1;
+          fprintf(stderr,"[METAL] RECOMP_METAL_EARLY_Z_EXACT=%s\n",m==3?"audit-control":m==2?"audit":m?"on":"off");}
+  return m; }
+static int early_z_exact_on(void) { return early_z_exact_mode() != 0; }
+static id<MTLBuffer> g_ez_violation_buf;   /* device atomic_uint, fragment buffer 5 */
+static float g_draw_alpha_floor = -1.0f;   /* this draw's proven alpha lower bound; -1 none */
+static int hw_zcull_cannot_fire(const NV2ATextureCopy *s)
+{
+    return !(s->z_cull && !legacy_zclamp_on())
+        || (s->z_clip_min <= 0.0f && s->z_clip_max >= 16777215.0f);
+}
+static uint64_t g_ez_exact, g_ez_exact_refused;
+
+static Rng rng_c(float lo, float hi) { Rng r = { lo, hi }; return r; }
+static float cl(float x, float a, float b) { return x < a ? a : x > b ? b : x; }
+static Rng comb_input(uint32_t code, const Rng *alpha, uint32_t k0, uint32_t k1)
+{
+    uint32_t src = code & 15u; Rng x;
+    if (code & 16u) x = alpha[src];
+    else x = src == 0 ? rng_c(0, 0) : src == 1 ? rng_c((k0 & 255u) / 255.0f, (k0 & 255u) / 255.0f)
+           : src == 2 ? rng_c((k1 & 255u) / 255.0f, (k1 & 255u) / 255.0f) : rng_c(-1.0f, 1.0f);   /* blue lane */
+    float plo = fmaxf(0.0f, x.lo), phi = fmaxf(0.0f, x.hi);
+    switch (code >> 5) {
+    case 0: return rng_c(plo, phi);
+    case 1: return rng_c(1.0f - fminf(1.0f, phi), 1.0f - fminf(1.0f, plo));
+    case 2: return rng_c(2 * plo - 1, 2 * phi - 1);
+    case 3: return rng_c(1 - 2 * phi, 1 - 2 * plo);
+    case 4: return rng_c(plo - 0.5f, phi - 0.5f);
+    case 5: return rng_c(0.5f - phi, 0.5f - plo);
+    case 6: return x;
+    default: return rng_c(-x.hi, -x.lo);
+    }
+}
+static Rng comb_map(uint32_t m, Rng x)   /* cmap1, monotone increasing; then the [-1,1] clamp */
+{
+    float lo = x.lo, hi = x.hi;
+    switch (m) { case 1: lo -= .5f; hi -= .5f; break; case 2: lo *= 2; hi *= 2; break;
+                 case 3: lo = (lo - .5f) * 2; hi = (hi - .5f) * 2; break; case 4: lo *= 4; hi *= 4; break;
+                 case 6: lo *= .5f; hi *= .5f; break; default: break; }
+    return rng_c(cl(lo, -1, 1), cl(hi, -1, 1));
+}
+static float comb_alpha_floor(const NV2ATextureCopy *s, Rng d0, Rng d1, const Rng tex[4])
+{
+    Rng a[16];
+    if (!s->combiner_count || s->combiner_count > 8) return -1.0f;
+    for (int i = 0; i < 16; ++i) a[i] = rng_c(0, 0);
+    a[4] = d0; a[5] = d1;
+    for (int u = 0; u < 4; ++u) a[8 + u] = (s->texture_mask & (1u << u)) ? tex[u] : rng_c(0, 0);
+    a[12] = (s->texture_mask & 1u) ? tex[0] : rng_c(1, 1);
+    for (uint32_t st = 0; st < s->combiner_count; ++st) {
+        uint32_t k0 = s->const0[st], k1 = s->const1[st], w = s->alpha_icw[st];
+        uint32_t aw = s->alpha_ocw[st], cw = s->color_ocw[st];
+        a[1] = rng_c((k0 >> 24) / 255.0f, (k0 >> 24) / 255.0f);
+        a[2] = rng_c((k1 >> 24) / 255.0f, (k1 >> 24) / 255.0f);
+        Rng A = comb_input(w >> 24, a, k0, k1), B = comb_input((w >> 16) & 255u, a, k0, k1);
+        Rng C = comb_input((w >> 8) & 255u, a, k0, k1), D = comb_input(w & 255u, a, k0, k1);
+        Rng ab = rng_mul(A, B), cd = rng_mul(C, D);
+        uint32_t amx = (aw >> 14) & 1u, amp = (aw >> 15) & 7u, acd = aw & 15u, aab = (aw >> 4) & 15u, asum = (aw >> 8) & 15u;
+        if (acd) a[acd] = comb_map(amp, cd);
+        if (aab) a[aab] = comb_map(amp, ab);
+        if (asum) {
+            Rng sum;
+            if (!amx) sum = rng_c(ab.lo + cd.lo, ab.hi + cd.hi);
+            else if (a[12].lo >= 0.5f) sum = ab;
+            else if (a[12].hi < 0.5f) sum = cd;
+            else sum = rng_c(fminf(ab.lo, cd.lo), fmaxf(ab.hi, cd.hi));
+            a[asum] = comb_map(amp, sum);
+        }
+        /* blue-to-alpha from the colour half, written last in shade() */
+        if (((cw >> 19) & 1u) && ((cw >> 4) & 15u)) a[(cw >> 4) & 15u] = rng_c(-1, 1);
+        if (((cw >> 18) & 1u) && (cw & 15u)) a[cw & 15u] = rng_c(-1, 1);
+    }
+    return cl(a[12].lo, 0.0f, 1.0f);   /* c = clamp(r[12] + ..., 0, 1); alpha gets no specular */
+}
+
 /* 0: late tests. 1: early, the draw cannot discard (fs_hw_early).
  * 2: early, the draw may discard but writes no depth or stencil
  *    (fs_hw_early_nw). Both early variants are exact. */
@@ -2013,6 +2255,20 @@ static int hw_early_z(const NV2ATextureCopy *s)
     int may_discard = (s->alpha_test && !no_alpha_test_on())
                    || (s->z_cull && !legacy_zclamp_on());
     if (may_discard && hw_draw_writes_nothing_early(s)) { ++g_ez_nowrite; ++g_ez_eligible; return 2; }
+    /* G38c: an alpha test that provably cannot fire, and a z-range cull that
+     * cannot either because its range is the whole depth range -- this title
+     * sets CULL with [0, 16777215] on every draw (see z_clip_min). Whether a
+     * fragment's z can still fall outside [0,1] here is checked, not assumed:
+     * the audit counts z-cull discards of proven draws too. */
+    if (early_z_exact_on() && s->alpha_test && !no_alpha_test_on() && s->alpha_ref == 0
+        && hw_zcull_cannot_fire(s)) {
+        if (g_draw_alpha_floor >= 1.0f / 255.0f) {
+            ++g_ez_exact;
+            if (early_z_exact_mode() >= 2) return 0;   /* audit: stay late, the shader counts */
+            ++g_ez_eligible; return 1;
+        }
+        ++g_ez_exact_refused;
+    }
     if (s->alpha_test && !no_alpha_test_on()) {
         /* What an exact version for the remaining draws would have to see
          * through: with no combiners the fragment alpha is diffuse alpha times
@@ -2617,6 +2873,7 @@ static int hw_tex_format(const NV2ATextureCopy *t)
 static int hw_tex_mipped(const NV2ATextureCopy *t){return t->min_filter>=3&&t->levels>=2;}
 
 /* Build (or reuse) the MTLTexture for the slot texture_buffer() just returned. */
+static uint8_t hw_last_min_a = 0, hw_last_max_a = 255;  /* of the texture texture_hw() last returned */
 static id<MTLTexture> texture_hw(const NV2ATextureCopy *t)
 {
     TextureBuffer *slot=texture_last_slot;
@@ -2624,7 +2881,8 @@ static id<MTLTexture> texture_hw(const NV2ATextureCopy *t)
     unsigned mips=hw_tex_mipped(t)?t->levels:1;
     uint32_t key[5]={(uint32_t)fmt,t->width,t->height,t->pitch,mips};
     if(!slot||!slot->buffer||!fmt)return nil;
-    if(slot->hw&&!memcmp(slot->hw_key,key,sizeof key)){++hw_tex_reuses;return slot->hw;}
+    if(slot->hw&&!memcmp(slot->hw_key,key,sizeof key)){++hw_tex_reuses;
+        hw_last_min_a=slot->hw_min_a;hw_last_max_a=slot->hw_max_a;return slot->hw;}
     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
         width:t->width height:t->height mipmapped:NO];
     d.mipmapLevelCount=mips;d.usage=MTLTextureUsageShaderRead;d.storageMode=MTLStorageModeShared;
@@ -2633,16 +2891,19 @@ static id<MTLTexture> texture_hw(const NV2ATextureCopy *t)
     const uint8_t *src=slot->buffer.contents;size_t left=slot->size,off=0;
     unsigned w=t->width,h=t->height,pitch=t->pitch;
     int ok=tex&&rgba;
+    uint8_t amin=255,amax=0;
     for(unsigned l=0;ok&&l<mips;l++){
         size_t level=nv2a_texture_level_bytes(fmt,w,h,pitch);
         if(off>left||!nv2a_texture_decode_rgba8(src+off,left-off,w,h,pitch,fmt,rgba)){ok=0;break;}
         [tex replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:l withBytes:rgba bytesPerRow:(NSUInteger)w*4];
+        for(size_t q=3;q<(size_t)w*h*4;q+=4){uint8_t a=rgba[q];if(a<amin)amin=a;if(a>amax)amax=a;}
         hw_tex_bytes+=(uint64_t)w*h*4;
         off+=level;pitch=nv2a_texture_next_pitch(fmt,w,pitch);w=w>1?w/2:1;h=h>1?h/2:1;
     }
     free(rgba);
     if(!ok){++hw_tex_failed;return nil;}
     slot->hw=tex;memcpy(slot->hw_key,key,sizeof key);++hw_tex_builds;
+    slot->hw_min_a=amin;slot->hw_max_a=amax;hw_last_min_a=amin;hw_last_max_a=amax;
     return tex;
 }
 
@@ -3352,6 +3613,15 @@ void nv2a_metal_report(void)
                 " %llu without combiners, %llu with combiners\n",
                 (unsigned long long)g_ez_nowrite,(unsigned long long)g_ez_alpha_writes_cc0,
                 (unsigned long long)g_ez_alpha_writes_cc);
+    if (early_z_on() && early_z_exact_on())
+        fprintf(stderr,"[METAL]   early-Z G38c (RECOMP_METAL_EARLY_Z_EXACT=on): %llu predicate calls proven"
+                " alpha >= 1/255 (fs_hw_early), %llu alpha-tested calls not proven\n",
+                (unsigned long long)g_ez_exact,(unsigned long long)g_ez_exact_refused);
+    if (early_z_exact_mode() >= 2)
+        fprintf(stderr,"[METAL]   early-Z G38c AUDIT%s: %u fragments of proven draws were DISCARDED"
+                " (must be 0; any nonzero value means the proof is wrong)\n",
+                early_z_exact_mode() == 3 ? " POSITIVE CONTROL (every alpha-tested draw marked; must be NONZERO)" : "",
+                g_ez_violation_buf ? *(const uint32_t *)g_ez_violation_buf.contents : 0u);
     alpha_census_report();
     /* Defined beside nv2a_metal_draw, which is where it measures. */
     { extern void t0_census_report(void); t0_census_report(); }
@@ -3573,6 +3843,7 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     uint32_t const0[8],const1[8];
     uint32_t frag_force;
     uint32_t hw[4];   /* G27: unit u samples texture(u) with sampler(u), not the buffer */
+    uint32_t ez_proven;  /* G38c audit: the alpha test was proven unable to fire */
 }Params;
 
 /* Does the ring actually protect staging memory from the GPU?
@@ -5340,6 +5611,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   if(ib_cpu)memcpy(ib_cpu,indices,index_bytes);
   id<MTLBuffer>tb[4];
   id<MTLTexture>ht[4]={nil,nil,nil,nil};id<MTLSamplerState>hs[4]={nil,nil,nil,nil};unsigned hwmask=0;
+  uint8_t tamin[4]={0,0,0,0},tamax[4]={255,255,255,255};
+  g_draw_alpha_floor=-1.0f;
   for(unsigned u=0;u<4;u++){
    int active=(s->texture_mask&(1u<<u))!=0;const NV2ATextureCopy*t=u&&active?&s->extra_stages[u-1]:s;
    const uint8_t*data=active?(u?s->extra_texture[u-1]:texture):NULL;size_t bytes=active?nv2a_texture_copy_texture_bytes(t):0;
@@ -5357,7 +5630,13 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");
    if(active&&bytes&&hw_tex_on()&&(t->rgba8||t->dxt1||t->dxt3)){
     ht[u]=texture_hw(t);
-    if(ht[u]){hs[u]=hw_sampler(t);hwmask|=1u<<u;++hw_tex_units;}}}
+    if(ht[u]){hs[u]=hw_sampler(t);hwmask|=1u<<u;++hw_tex_units;tamin[u]=hw_last_min_a;tamax[u]=hw_last_max_a;}}}
+  if(early_z_exact_on()&&s->alpha_test&&s->combiner_count){
+   Rng tr[4];
+   for(unsigned u=0;u<4;u++)tr[u]=(hwmask&(1u<<u))?rng_c(tamin[u]/255.0f,tamax[u]/255.0f):rng_c(0.0f,1.0f);
+   Rng d0=vsh_gpu_active?vsh_out_alpha(vsh_active,0,vsh_constants):rng_c(0.0f,1.0f);
+   Rng d1=vsh_gpu_active?vsh_out_alpha(vsh_active,1,vsh_constants):rng_c(0.0f,1.0f);
+   g_draw_alpha_floor=comb_alpha_floor(s,d0,d1,tr);}
   /* WHAT `vertices` HOLDS DEPENDS ON WHO IS GOING TO RUN THE PROGRAM.
    *
    * On the CPU path it is the program's OUTPUTS -- position, two colours, four
@@ -5625,6 +5904,9 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
   if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
+  p.ez_proven=(uint32_t)(early_z_exact_mode()==2&&s->alpha_test&&s->alpha_ref==0&&hw_zcull_cannot_fire(s)
+                         &&g_draw_alpha_floor>=1.0f/255.0f);
+  if(early_z_exact_mode()==3)p.ez_proven=(uint32_t)(s->alpha_test!=0);   /* the audit's positive control */
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:
@@ -5737,6 +6019,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    ++g_vsh_cpu_draws;
   }[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];
   hw_bind_defaults();
+  if(!g_ez_violation_buf){uint32_t z=0;g_ez_violation_buf=[device newBufferWithBytes:&z length:4 options:MTLResourceStorageModeShared];}
+  [encoder setFragmentBuffer:g_ez_violation_buf offset:0 atIndex:5];
   for(unsigned u=0;u<4;u++){[encoder setFragmentTexture:ht[u]?ht[u]:hw_dummy_texture atIndex:u];
    [encoder setFragmentSamplerState:hs[u]?hs[u]:hw_default_sampler atIndex:u];}
   {/* Per draw, because the encoder is shared across the batch and the

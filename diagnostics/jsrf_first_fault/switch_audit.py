@@ -106,6 +106,10 @@ VALUE_CARRYING = {
     # live D3D push-buffer ring by function (G33, recomp_mem_watch.c). Other
     # values are reserved for other regions, so only the literal "ring" arms it.
     "RECOMP_MEM_WATCH_TALLY",
+    # off / on / "audit": audit proves each draw's alpha floor but keeps it
+    # late and has the shader count discards the proof said were impossible
+    # (G38c, nv2a_metal.m). A boolean cannot name the third arm.
+    "RECOMP_METAL_EARLY_Z_EXACT",
     # How many consecutive reports of "all-zero presented frame with a scene
     # still being submitted" arm the per-draw capture. A count, not a
     # boolean: the boot's own black stretches armed it at 2 (t=18, on the
