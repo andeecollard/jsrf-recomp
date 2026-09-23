@@ -609,3 +609,29 @@ changed after the draw. Open; it names the next thing to hook.
 the viewport, the blend, depth and alpha state from D3D's render-state array,
 and the vertex and pixel shader handles. Each one checked is a piece of the
 draw a host renderer can take from D3D.
+
+### G39, second slice: render target and depth surface, 23 Sep 2026
+
+At each draw the mirror now also reads D3D's current colour and depth surfaces
+straight from the device (`+0x2070`, `+0x2074`), with their Data and the pitch
+packed in Size (`(Size >> 24) + 1` units of 64 bytes). They are compared with
+the executor's target and depth for the same draw: guest address and pitch.
+Depth is compared where the executor used it, meaning a depth or stencil test.
+
+**150 s silenced tutorial:**
+- **Draws.** 579,985 checked.
+- **Colour.** 579,985 compared, **579,985 match**: 0 address, 0 pitch.
+- **Depth.** 579,985 compared, **579,985 match**: 0 missing, 0 address, 0 pitch.
+- **Textures.** The same 4 address mismatches as before, still open.
+- **Checks and faults.** The convention check ran 7,404,350 calls with 0
+  mismatches. live=61, 0 faults.
+
+**Positive control.** `RECOMP_D3D8_MIRROR_CONTROL=1` swaps the colour and
+depth addresses in the snapshot. Over a 60 s run: 259,987 draws, **0 colour
+matches and 0 depth matches**, all of them address mismatches. The check
+can see a wrong surface, so the full match is evidence.
+
+**What this means.** A host renderer can take every draw's render target
+and depth buffer from D3D's device, with no reference to the NV2A surface
+commands. Next in G39: viewport and blend/depth/alpha state, then the
+shader handles.

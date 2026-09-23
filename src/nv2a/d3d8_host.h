@@ -41,6 +41,11 @@ typedef struct {
     uint32_t serial;           /* D3D draw number, for the report */
     uint32_t tex[4];           /* D3DBaseTexture* per stage, 0 = none */
     uint32_t data[4], format[4], size[4];   /* ->Data, ->Format, ->Size */
+    /* The device's current colour and depth surfaces (device +0x2070/+0x2074)
+     * and their Data/Format/Size. Size packs width-1 (bits 0-11), height-1
+     * (12-23) and pitch/64-1 (24-31). */
+    uint32_t rt, rt_data, rt_format, rt_size;
+    uint32_t zs, zs_data, zs_format, zs_size;
 } D3D8HostDrawCheck;
 
 /* What the executor made of the draw it just ran. */
@@ -50,6 +55,9 @@ typedef struct {
     uint32_t addr[4];          /* guest address of each unit's texture */
     uint32_t width[4], height[4], levels[4];
     uint32_t fmt[4];           /* the NV2A format byte, decoded class for linear */
+    uint32_t target_addr, target_pitch, target_bpp;
+    int      depth_used;       /* depth or stencil test on: depth_addr is meaningful */
+    uint32_t depth_addr, depth_pitch;
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -58,6 +66,8 @@ typedef struct {
     unsigned long long enqueued, replayed, methods_replayed, full, bad_token;
     unsigned long long checks, check_inactive, units_compared, units_match,
                        units_missing, units_addr, units_shape;
+    unsigned long long rt_compared, rt_match, rt_addr, rt_pitch,
+                       zs_compared, zs_match, zs_missing, zs_addr, zs_pitch;
 } D3D8HostStats;
 void d3d8_host_get_stats(D3D8HostStats *out);
 void d3d8_host_report(const char *why);

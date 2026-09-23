@@ -21,7 +21,10 @@ static _Atomic unsigned long long s_enq, s_rep, s_mrep, s_full, s_bad;
 static atomic_int s_installed;
 static void (*s_exec_source)(D3D8ExecDrawTextures *);
 static _Atomic unsigned long long s_chk, s_chk_inactive, s_u_cmp, s_u_match, s_u_missing, s_u_addr, s_u_shape;
-static _Atomic unsigned s_mismatch_printed;
+static _Atomic unsigned s_mismatch_printed, s_surf_printed;
+static _Atomic unsigned long long s_rt_cmp, s_rt_match, s_rt_addr, s_rt_pitch,
+                                  s_zs_cmp, s_zs_match, s_zs_missing, s_zs_addr, s_zs_pitch;
+static uint32_t size_pitch(uint32_t size) { return ((size >> 24) + 1u) * 64u; }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
 /* NV2A format byte from a D3D Format word, and the shape it implies. */
@@ -52,6 +55,31 @@ static void check_draw(const D3D8HostDrawCheck *c)
                             " | exec addr=%08X fmt=%02X %ux%u levels=%u\n",
                     c->serial, u, why, c->tex[u], c->data[u], c->format[u], c->size[u],
                     e.addr[u], e.fmt[u], e.width[u], e.height[u], e.levels[u]);
+    }
+    /* Colour target: every draw has one. */
+    {
+        const char *why = NULL;
+        atomic_fetch_add(&s_rt_cmp, 1);
+        if ((c->rt_data & 0x03FFFFFFu) != (e.target_addr & 0x03FFFFFFu)) { atomic_fetch_add(&s_rt_addr, 1); why = "colour address"; }
+        else if (size_pitch(c->rt_size) != e.target_pitch) { atomic_fetch_add(&s_rt_pitch, 1); why = "colour pitch"; }
+        else atomic_fetch_add(&s_rt_match, 1);
+        if (why && atomic_fetch_add(&s_surf_printed, 1) < 12)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u %s MISMATCH: d3d rt=%08X data=%08X fmt=%08X size=%08X (pitch %u)"
+                            " | exec target=%08X pitch=%u bpp=%u\n", c->serial, why, c->rt, c->rt_data,
+                    c->rt_format, c->rt_size, size_pitch(c->rt_size), e.target_addr, e.target_pitch, e.target_bpp);
+    }
+    /* Depth: only where the executor used one (depth or stencil test on). */
+    if (e.depth_used) {
+        const char *why = NULL;
+        atomic_fetch_add(&s_zs_cmp, 1);
+        if (!c->zs) { atomic_fetch_add(&s_zs_missing, 1); why = "depth surface missing in D3D"; }
+        else if ((c->zs_data & 0x03FFFFFFu) != (e.depth_addr & 0x03FFFFFFu)) { atomic_fetch_add(&s_zs_addr, 1); why = "depth address"; }
+        else if (size_pitch(c->zs_size) != e.depth_pitch) { atomic_fetch_add(&s_zs_pitch, 1); why = "depth pitch"; }
+        else atomic_fetch_add(&s_zs_match, 1);
+        if (why && atomic_fetch_add(&s_surf_printed, 1) < 12)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u %s MISMATCH: d3d zs=%08X data=%08X fmt=%08X size=%08X (pitch %u)"
+                            " | exec depth=%08X pitch=%u\n", c->serial, why, c->zs, c->zs_data, c->zs_format,
+                    c->zs_size, size_pitch(c->zs_size), e.depth_addr, e.depth_pitch);
     }
 }
 
@@ -123,6 +151,11 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->units_compared = atomic_load(&s_u_cmp); o->units_match = atomic_load(&s_u_match);
     o->units_missing = atomic_load(&s_u_missing); o->units_addr = atomic_load(&s_u_addr);
     o->units_shape = atomic_load(&s_u_shape);
+    o->rt_compared = atomic_load(&s_rt_cmp); o->rt_match = atomic_load(&s_rt_match);
+    o->rt_addr = atomic_load(&s_rt_addr); o->rt_pitch = atomic_load(&s_rt_pitch);
+    o->zs_compared = atomic_load(&s_zs_cmp); o->zs_match = atomic_load(&s_zs_match);
+    o->zs_missing = atomic_load(&s_zs_missing); o->zs_addr = atomic_load(&s_zs_addr);
+    o->zs_pitch = atomic_load(&s_zs_pitch);
 }
 
 void d3d8_host_report(const char *why)
@@ -135,4 +168,9 @@ void d3d8_host_report(const char *why)
                         " MATCH=%llu | missing-in-d3d=%llu address=%llu format/shape=%llu\n",
                 why, st.checks, st.check_inactive, st.units_compared, st.units_match,
                 st.units_missing, st.units_addr, st.units_shape);
+    if (st.checks)
+        fprintf(stderr, "[D3D8-MIRROR] %s surfaces: colour compared=%llu MATCH=%llu (address %llu, pitch %llu)"
+                        " | depth compared=%llu MATCH=%llu (missing %llu, address %llu, pitch %llu)\n",
+                why, st.rt_compared, st.rt_match, st.rt_addr, st.rt_pitch,
+                st.zs_compared, st.zs_match, st.zs_missing, st.zs_addr, st.zs_pitch);
 }

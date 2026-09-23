@@ -47,7 +47,17 @@ void d3d8m_after_draw(void)
         c.tex[u] = t;
         if (t) { c.data[u] = MEM32(t + 4u); c.format[u] = MEM32(t + 0xCu); c.size[u] = MEM32(t + 0x10u); }
     }
-    tok = d3d8_host_enqueue_check(&c);
+    {   uint32_t d = MEM32(0x0019DCE0u);            /* D3D_g_pDevice */
+        c.rt = MEM32(d + 0x2070u); c.zs = MEM32(d + 0x2074u);
+        if (c.rt) { c.rt_data = MEM32(c.rt + 4u); c.rt_format = MEM32(c.rt + 0xCu); c.rt_size = MEM32(c.rt + 0x10u); }
+        if (c.zs) { c.zs_data = MEM32(c.zs + 4u); c.zs_format = MEM32(c.zs + 0xCu); c.zs_size = MEM32(c.zs + 0x10u); } }
+        {   /* Positive control for the surface check: RECOMP_D3D8_MIRROR_CONTROL=1
+         * swaps the colour and depth addresses, so every draw MUST mismatch. */
+        static int ctl = -1;
+        if (ctl < 0) { const char *e = getenv("RECOMP_D3D8_MIRROR_CONTROL"); ctl = e && e[0] == '1';
+                       if (ctl) fprintf(stderr, "[D3D8-MIRROR] POSITIVE CONTROL: colour/depth addresses swapped\n"); }
+        if (ctl) { uint32_t t = c.rt_data; c.rt_data = c.zs_data; c.zs_data = t; } }
+        tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);
     if (put >= MEM32(dev + 4u)) {                  /* the XDK's own reservation, as Clear uses it */

@@ -6658,6 +6658,12 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
     out->active = s_copy.active;
     if (!s_copy.active) return;
     out->mask = c->untextured ? 0u : (c->texture_mask & 0xFu);
+    out->target_addr = s_copy.target_address;
+    out->target_pitch = c->target_pitch;
+    out->target_bpp = c->target_bpp;
+    out->depth_used = (c->depth_test || c->stencil_test) && s_copy.depth;
+    out->depth_addr = s_copy.depth_address;
+    out->depth_pitch = c->depth_pitch;
     for (unsigned u = 0; u < 4; ++u) {
         const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;
         if (!(out->mask & (1u << u))) continue;
