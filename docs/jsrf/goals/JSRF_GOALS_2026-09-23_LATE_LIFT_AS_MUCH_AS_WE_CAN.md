@@ -157,3 +157,18 @@ against a known-bad frame and not from memory.
    the player sees most.
 4. **G51.2, G51.3, G52.**
 5. **G54.2–G54.4 and G55** alongside, as sessions confirm.
+
+## Progress, 23 Sep (late)
+
+- **G49: built, awaiting the player** (`5249f6e`).
+  - The input lift reaches the tutorial with the USB model idle (0 TDs), 0
+    faults, and 0 ABI mismatches over 208,949 lifted calls.
+  - Four title dependencies were found and matched to XPP's own code: the
+    packed capabilities struct, the shared device-type object, insertion
+    after enumeration latency, and a handle that is a real device record.
+  - `RECOMP_XINPUT_LIFT=1` is in the player's `paths.conf` (backup
+    `paths.conf.bak-20260923-xinput-lift`).
+  - Owed: rumble in play, and a controller unplugged and replugged.
+- **G54.1: done.** On the intro, the stream lead measures 0 underruns at 0 ms
+  now that CRI gets 59.5 passes/s. The default is back to 0, which removes
+  100 ms of audio latency.

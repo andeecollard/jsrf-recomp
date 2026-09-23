@@ -214,13 +214,13 @@ void dsl_IDirectSound_CreateSoundBuffer(void)
                 static int lead_ms = -1;
                 if (lead_ms < 0) {
                     const char *e = getenv("RECOMP_DSOUND_STREAM_LEAD_MS");
-                    /* Default 100: on the untouched intro, 90 s silenced, the
-                     * cursor overtook CRI's writer 680 times at 0 ms, 12 at
-                     * 100, 4 at 150. The cost is sync: anything the title
-                     * times off this cursor runs that much ahead of what is
-                     * heard, so keep it as small as does the job. */
-                    lead_ms = e && *e ? atoi(e) : 100;
-                    if (lead_ms < 0 || lead_ms > 300) lead_ms = 100;
+                    /* Default 0. It was 100 while CRI was starved of vblank
+                     * wakeups (680 underruns at 0 ms, 12 at 100 on the intro);
+                     * with that fixed (f3a9b33) the intro reads 0 underruns at
+                     * 0 ms, so the lead would only add 100 ms of latency. Kept
+                     * as a switch in case a heavier scene needs cushion. */
+                    lead_ms = e && *e ? atoi(e) : 0;
+                    if (lead_ms < 0 || lead_ms > 300) lead_ms = 0;
                     fprintf(stderr, "[DSOUND-LIFT] stream cursor lead %d ms\n", lead_ms);
                 }
                 dsh_set_cursor_lead(h, (uint32_t)((uint64_t)MEM32(h + 24u) * (uint32_t)lead_ms / 1000u));
