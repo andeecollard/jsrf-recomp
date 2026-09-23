@@ -1045,6 +1045,11 @@ if(APPLE)
     #     RECOMP_METAL_BATCH=1 build/jsrf_metal_batch_test
     add_executable(jsrf_metal_batch_test metal_batch_test.c)
     target_link_libraries(jsrf_metal_batch_test PRIVATE xbox_vsh)
+    # G27: hardware texture sampling against the software sampler, per case,
+    # within a stated tolerance. Two invocations (RECOMP_METAL_HW_TEX=0 / =1);
+    # metal_hwtex_check.sh runs both and scores them with hwtex_compare.py.
+    add_executable(jsrf_metal_hwtex_test metal_hwtex_test.c)
+    target_link_libraries(jsrf_metal_hwtex_test PRIVATE xbox_vsh)
     # Staging-ring lifetime, including the pin-once-per-batch pattern batching
     # introduced. Carries its own positive control.
     add_executable(jsrf_metal_ring_test metal_ring_test.c)

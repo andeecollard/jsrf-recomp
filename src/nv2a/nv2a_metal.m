@@ -5,6 +5,7 @@
 #include "../recomp_switch.h"
 #include "nv2a_metal_state.h"
 #include "nv2a_vsh.h"
+#include "nv2a_texture_decode.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -530,10 +531,19 @@ typedef struct {
     id<MTLBuffer> buffer;
     uint64_t stamp;
     uint64_t verified_frame;   /* texture_frame when the full compare last matched */
+    /* G27: the same bytes as an MTLTexture, built from `buffer` on first
+     * hardware use and dropped whenever `buffer` is replaced. hw_key says
+     * which reading of the bytes it holds: format, width, height, level-0
+     * pitch and mip count -- one guest allocation can be bound two ways. */
+    id<MTLTexture> hw;
+    uint32_t hw_key[5];
 } TextureBuffer;
 static TextureBuffer texture_cache[TEXTURE_CACHE_SIZE];
 static id<MTLBuffer> dummy_buffer;
 static uint64_t texture_clock,texture_requests,texture_hits,texture_uploads;
+/* The entry texture_buffer() last returned, so texture_hw() can attach its
+ * MTLTexture to the same cache slot. Single pushbuffer thread; see ring. */
+static TextureBuffer *texture_last_slot;
 /* The cache used to memcmp the whole texture against guest RAM on EVERY
  * request, and a frame requests the same textures hundreds of times: a 5 s
  * sample of the combo trick stage (23 Sep 2026) put that memcmp at 28% of the
@@ -682,7 +692,7 @@ static NSString *const shader =
  " uint stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;"
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
  " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8];"
- " uint const0[8]; uint const1[8]; uint frag_force; };\n"
+ " uint const0[8]; uint const1[8]; uint frag_force; uint hw[4]; };\n"
  "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; };\n"
  "struct Frag { float4 color [[color(0)]]; uint stencil [[color(1)]]; };\n"
  "vertex Out vs(uint id [[vertex_id]], const device Vertex *v [[buffer(0)]], constant Params &s [[buffer(1)]],const device uint*indices [[buffer(2)]]) {\n"
@@ -730,6 +740,12 @@ static NSString *const shader =
  " if(lod+s.lod_bias[u]>0&&s.min_filter[u])linear=(s.min_filter[u]&1)==0;"
  " float4 a=sample_level(t,uv,u,lo,linear,s),b=hi==lo?a:sample_level(t,uv,u,hi,linear,s);"
  " return mix(a,b,hi==lo?0.0f:l-float(lo));}\n"
+ /* G27: THE SAME SAMPLE, BY THE SAMPLER HARDWARE. The texture holds exactly
+  * what texel() would have returned for each texel (nv2a_texture_decode.c,
+  * checked by texture_decode_test.c), with the mip chain present only when
+  * sample_lod() would have walked it; the sampler carries the filter, mip
+  * and wrap choices sample_lod() makes by hand, and bias() the LOD bias. */
+ "float4 hw_sample(texture2d<float> h,sampler q,float4 tc,uint u,constant Params&s){return h.sample(q,tc.xy/tc.w,bias(s.lod_bias[u]));}\n"
  "float input(uint code,uint channel,thread float4 *r){uint source=code&15;float x=r[source][(code&16)?3:channel];"
  " switch(code>>5){case 0:return max(0.0f,x);case 1:return 1-min(1.0f,max(0.0f,x));"
  " case 2:return 2*max(0.0f,x)-1;case 3:return 1-2*max(0.0f,x);"
@@ -757,11 +773,12 @@ static NSString *const shader =
   * tails. */
  "float cmap1(uint m,float x){switch(m){case 1:return x-0.5f;case 2:return x*2.0f;case 3:return (x-0.5f)*2.0f;case 4:return x*4.0f;case 6:return x*0.5f;default:return x;}}\n"
  "float3 cmap3(uint m,float3 v){return float3(cmap1(m,v.x),cmap1(m,v.y),cmap1(m,v.z));}\n"
- "float4 shade(Out i, const device uchar*t0, constant Params&s, const device uchar*t1, const device uchar*t2, const device uchar*t3){\n"
+ "float4 shade(Out i, const device uchar*t0, constant Params&s, const device uchar*t1, const device uchar*t2, const device uchar*t3,"
+ " texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3, sampler q0, sampler q1, sampler q2, sampler q3){\n"
  " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
- " if(s.texture_mask&1)tex=sample_lod(t0,i.t0,0,s);"
+ " if(s.texture_mask&1)tex=s.hw[0]?hw_sample(h0,q0,i.t0,0,s):sample_lod(t0,i.t0,0,s);"
  " if(s.combiner_count){float4 r[14];for(uint n=0;n<14;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
- " if(s.texture_mask&2)r[9]=sample_lod(t1,i.t1,1,s);if(s.texture_mask&4)r[10]=sample_lod(t2,i.t2,2,s);if(s.texture_mask&8)r[11]=sample_lod(t3,i.t3,3,s);"
+ " if(s.texture_mask&2)r[9]=s.hw[1]?hw_sample(h1,q1,i.t1,1,s):sample_lod(t1,i.t1,1,s);if(s.texture_mask&4)r[10]=s.hw[2]?hw_sample(h2,q2,i.t2,2,s):sample_lod(t2,i.t2,2,s);if(s.texture_mask&8)r[11]=s.hw[3]?hw_sample(h3,q3,i.t3,3,s):sample_lod(t3,i.t3,3,s);"
  " r[12].a=(s.texture_mask&1)?r[8].a:1;for(uint stage=0;stage<s.combiner_count;stage++){float4 ab,cd;"
  " uint k0=s.const0[stage],k1=s.const1[stage];"
  " r[1]=float4(float((k0>>16)&255),float((k0>>8)&255),float(k0&255),float((k0>>24)&255))/255.0f;"
@@ -856,8 +873,10 @@ static NSString *const shader =
   * and what MTLCompareFunction compares. That is why this change does not
   * touch the vertex stage. */
  "fragment float4 fs_hw(Out i [[stage_in]],"
- " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
- " float4 c=shade(i,t0,s,t1,t2,t3);"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
+ " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  /* discard_fragment() does NOT return in MSL -- execution continues and the
   * write is dropped at the end -- so each discard returns explicitly. The
   * returned value is immaterial; the explicit return is what stops the rest
@@ -916,8 +935,10 @@ static NSString *const shader =
   * this attachment's alpha on this path -- depth comes from hw_depth_readback
   * and the 565 attachment has no alpha at all. */
  "fragment float4 fs_hw_blend(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
- " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
- " float4 c=shade(i,t0,s,t1,t2,t3);"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
+ " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  " float zg=i.p.z*16777215.0f;"
  " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
  " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
@@ -949,8 +970,10 @@ static NSString *const shader =
   * blend mode 3 exists for; dropping it here would reintroduce the corruption
   * that mode measured, and early-Z is orthogonal to it. */
  "[[early_fragment_tests]] fragment float4 fs_hw_early(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
- " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
- " float4 c=shade(i,t0,s,t1,t2,t3);"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
+ " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
@@ -958,8 +981,10 @@ static NSString *const shader =
  /* The software-state path: everything the hardware is not being allowed to
   * do. Unchanged in behaviour; it just calls shade() for its colour now. */
  "fragment Frag fs(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],uint stencil [[color(1),raster_order_group(0)]],"
- " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]]){\n"
- " Frag o;o.color=dst;o.stencil=stencil;float4 c=shade(i,t0,s,t1,t2,t3);"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
+ " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " Frag o;o.color=dst;o.stencil=stencil;float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
  /* The guest's depth-range policy, per fragment, in guest z units.
   * NV097_SET_ZMIN_MAX_CONTROL selects discard (CULL) or saturate (CLAMP)
   * outside SET_CLIP_MIN/MAX. JSRF asks for CULL. */
@@ -2423,14 +2448,14 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
                 if(entry->verified_frame==texture_frame) {
                     ++texture_partial_compares;
                     if(!texture_probe_differs(have,data,size)) {
-                        entry->stamp=++texture_clock;++texture_hits;return entry->buffer;
+                        entry->stamp=++texture_clock;++texture_hits;texture_last_slot=entry;return entry->buffer;
                     }
                     ++texture_partial_caught;
                 } else {
                     ++texture_full_compares;
                     if(!memcmp(have,data,size)) {
                         entry->verified_frame=texture_frame;
-                        entry->stamp=++texture_clock;++texture_hits;return entry->buffer;
+                        entry->stamp=++texture_clock;++texture_hits;texture_last_slot=entry;return entry->buffer;
                     }
                 }
                 ++texture_changed;
@@ -2445,7 +2470,108 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
     if(!buffer)return nil;
     slot->source=data;slot->size=size;slot->buffer=buffer;slot->stamp=++texture_clock;++texture_uploads;
     slot->verified_frame=texture_frame;   /* just copied from data: equal by construction */
+    slot->hw=nil;                         /* built from the old bytes */
+    texture_last_slot=slot;
     return buffer;
+}
+
+/* G27 -- SAMPLE TEXTURES IN HARDWARE. RECOMP_METAL_HW_TEX=1, OFF BY DEFAULT.
+ *
+ * The fragment shader has always decoded guest textures itself out of a raw
+ * MTLBuffer (texel/sample_level/sample_lod above): Morton addressing, DXT
+ * block decode, bilinear and mip blending as arithmetic, up to eight software
+ * texel fetches per sample. Measured 22 Sep 2026: that is the bulk of `sync`,
+ * 8.9 ms of GPU execution per 640x480 frame on an M1 Max.
+ *
+ * Here the same bytes become an RGBA8 MTLTexture, decoded ONCE per upload by
+ * nv2a_texture_decode_rgba8(), whose output is checked texel-for-texel
+ * against the shader's own texel() rules by texture_decode_test.c; and the
+ * sampler hardware does the filtering. Scope, deliberately narrow: the
+ * swizzled formats whose coordinates sample_level() normalises -- RGBA8
+ * (0x06/0x07), DXT1, DXT3 -- which are all but a few thousand of the title's
+ * samples. Everything else (linear 565, the swizzled 16-bit formats) keeps the
+ * software path, per unit, in the same draw.
+ *
+ * Off by default until the goal's exit criteria both pass: a scene-matched
+ * A/B with `sync` down, AND image equality against the software sampler. */
+static int hw_tex_on(void)
+{
+    static int on=-1;
+    if(on<0){on=recomp_switch_on("RECOMP_METAL_HW_TEX");
+        fprintf(stderr,"[METAL] RECOMP_METAL_HW_TEX=%s (G27 hardware texture sampling)\n",on?"on":"off");}
+    return on;
+}
+static uint64_t hw_tex_builds,hw_tex_reuses,hw_tex_units,hw_tex_failed,hw_tex_bytes;
+static id<MTLTexture> hw_dummy_texture;
+static id<MTLSamplerState> hw_samplers[64],hw_default_sampler;
+
+static int hw_tex_format(const NV2ATextureCopy *t)
+{
+    return t->dxt1?NV2A_TEXFMT_DXT1:t->dxt3?NV2A_TEXFMT_DXT3:t->rgba8?NV2A_TEXFMT_RGBA8:0;
+}
+/* sample_lod() walks the mip chain only when min_filter selects a mip mode
+ * (3..6) and there is more than one level; otherwise it always reads level 0. */
+static int hw_tex_mipped(const NV2ATextureCopy *t){return t->min_filter>=3&&t->levels>=2;}
+
+/* Build (or reuse) the MTLTexture for the slot texture_buffer() just returned. */
+static id<MTLTexture> texture_hw(const NV2ATextureCopy *t)
+{
+    TextureBuffer *slot=texture_last_slot;
+    int fmt=hw_tex_format(t);
+    unsigned mips=hw_tex_mipped(t)?t->levels:1;
+    uint32_t key[5]={(uint32_t)fmt,t->width,t->height,t->pitch,mips};
+    if(!slot||!slot->buffer||!fmt)return nil;
+    if(slot->hw&&!memcmp(slot->hw_key,key,sizeof key)){++hw_tex_reuses;return slot->hw;}
+    MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:t->width height:t->height mipmapped:NO];
+    d.mipmapLevelCount=mips;d.usage=MTLTextureUsageShaderRead;d.storageMode=MTLStorageModeShared;
+    id<MTLTexture> tex=[device newTextureWithDescriptor:d];
+    uint8_t *rgba=malloc((size_t)t->width*t->height*4);
+    const uint8_t *src=slot->buffer.contents;size_t left=slot->size,off=0;
+    unsigned w=t->width,h=t->height,pitch=t->pitch;
+    int ok=tex&&rgba;
+    for(unsigned l=0;ok&&l<mips;l++){
+        size_t level=nv2a_texture_level_bytes(fmt,w,h,pitch);
+        if(off>left||!nv2a_texture_decode_rgba8(src+off,left-off,w,h,pitch,fmt,rgba)){ok=0;break;}
+        [tex replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:l withBytes:rgba bytesPerRow:(NSUInteger)w*4];
+        hw_tex_bytes+=(uint64_t)w*h*4;
+        off+=level;pitch=nv2a_texture_next_pitch(fmt,w,pitch);w=w>1?w/2:1;h=h>1?h/2:1;
+    }
+    free(rgba);
+    if(!ok){++hw_tex_failed;return nil;}
+    slot->hw=tex;memcpy(slot->hw_key,key,sizeof key);++hw_tex_builds;
+    return tex;
+}
+
+/* The choices sample_lod() makes by hand, as sampler state:
+ *   magnification: s.linear (mag filter 2 = linear)
+ *   minification : (min_filter & 1) == 0 is linear -- 1,3,5 nearest; 2,4,6 linear
+ *   mip          : none unless hw_tex_mipped(); 3,4 nearest level; 5,6 blend two
+ *   wrap         : repeat, else clamp to edge (texel() clamps the coordinate) */
+static id<MTLSamplerState> hw_sampler(const NV2ATextureCopy *t)
+{
+    unsigned mipped=(unsigned)hw_tex_mipped(t);
+    unsigned key=(t->linear?1u:0u)|((t->min_filter&7u)<<1)|(mipped<<4)|((t->repeat?1u:0u)<<5);
+    if(hw_samplers[key&63])return hw_samplers[key&63];
+    MTLSamplerDescriptor *d=[MTLSamplerDescriptor new];
+    d.magFilter=t->linear?MTLSamplerMinMagFilterLinear:MTLSamplerMinMagFilterNearest;
+    d.minFilter=(t->min_filter&1u)==0?MTLSamplerMinMagFilterLinear:MTLSamplerMinMagFilterNearest;
+    d.mipFilter=!mipped?MTLSamplerMipFilterNotMipmapped:t->min_filter>=5?MTLSamplerMipFilterLinear:MTLSamplerMipFilterNearest;
+    d.sAddressMode=d.tAddressMode=t->repeat?MTLSamplerAddressModeRepeat:MTLSamplerAddressModeClampToEdge;
+    d.normalizedCoordinates=YES;
+    return hw_samplers[key&63]=[device newSamplerStateWithDescriptor:d];
+}
+
+/* Always bind SOMETHING to texture(u)/sampler(u): the shader only reads them
+ * under s.hw[u], but an unbound argument is a validation error. */
+static void hw_bind_defaults(void)
+{
+    if(!hw_dummy_texture){
+        MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+        d.usage=MTLTextureUsageShaderRead;hw_dummy_texture=[device newTextureWithDescriptor:d];
+        uint32_t zero=0;[hw_dummy_texture replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0 withBytes:&zero bytesPerRow:4];
+    }
+    if(!hw_default_sampler)hw_default_sampler=[device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
 }
 
 /* Vertex and index staging: one ring of persistent slabs, not a driver
@@ -3236,6 +3362,10 @@ void nv2a_metal_report(void)
         " partial-caught=%llu (a mid-frame rewrite the once-per-frame rule alone would have missed)\n",
         (unsigned long long)texture_full_compares,(unsigned long long)texture_partial_compares,
         (unsigned long long)texture_changed,(unsigned long long)texture_partial_caught);
+    fprintf(stderr,"[METAL] hw textures (RECOMP_METAL_HW_TEX=%s): %llu built, %llu reused, %llu units sampled in hardware,"
+        " %llu decode failures (fell back to software), %.1f MiB decoded\n",
+        hw_tex_on()?"on":"off",(unsigned long long)hw_tex_builds,(unsigned long long)hw_tex_reuses,
+        (unsigned long long)hw_tex_units,(unsigned long long)hw_tex_failed,hw_tex_bytes/1048576.0);
     if(ring_audit_on())
         fprintf(stderr,"[METAL] ring audit: %llu reservations, %llu MiB staged, "
             "%llu slabs live, %llu wraps of which %llu had to wait, %llu fallbacks "
@@ -3331,7 +3461,9 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     float lod_bias[4];
     uint32_t color_icw[8],alpha_icw[8],color_ocw[8],alpha_ocw[8];
     uint32_t const0[8],const1[8];
-    uint32_t frag_force;}Params;
+    uint32_t frag_force;
+    uint32_t hw[4];   /* G27: unit u samples texture(u) with sampler(u), not the buffer */
+}Params;
 
 /* Does the ring actually protect staging memory from the GPU?
  *
@@ -5097,6 +5229,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   }
   if(ib_cpu)memcpy(ib_cpu,indices,index_bytes);
   id<MTLBuffer>tb[4];
+  id<MTLTexture>ht[4]={nil,nil,nil,nil};id<MTLSamplerState>hs[4]={nil,nil,nil,nil};unsigned hwmask=0;
   for(unsigned u=0;u<4;u++){
    int active=(s->texture_mask&(1u<<u))!=0;const NV2ATextureCopy*t=u&&active?&s->extra_stages[u-1]:s;
    const uint8_t*data=active?(u?s->extra_texture[u-1]:texture):NULL;size_t bytes=active?nv2a_texture_copy_texture_bytes(t):0;
@@ -5111,7 +5244,10 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    if(data&&surface_valid&&surface_target&&guest_ranges_overlap(data,bytes,surface_target,surface_target_size)){
     ++g_feedback_draws;
     if(feedback_sync_on()&&surface_dirty){nv2a_metal_sync();++g_feedback_syncs;}}
-   tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");}
+   tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");
+   if(active&&bytes&&hw_tex_on()&&(t->rgba8||t->dxt1||t->dxt3)){
+    ht[u]=texture_hw(t);
+    if(ht[u]){hs[u]=hw_sampler(t);hwmask|=1u<<u;++hw_tex_units;}}}
   /* WHAT `vertices` HOLDS DEPENDS ON WHO IS GOING TO RUN THE PROGRAM.
    *
    * On the CPU path it is the program's OUTPUTS -- position, two colours, four
@@ -5378,7 +5514,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));
+  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
   /* Depth clipping is NOT losing geometry. Retracted 13 Sep 2026, measured.
    *
    * This switch and the paragraph that used to stand here claimed the opposite:
@@ -5488,6 +5624,9 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    else  [encoder setVertexBytes:indices length:index_bytes atIndex:2];
    ++g_vsh_cpu_draws;
   }[encoder setFragmentBuffer:tb[0] offset:0 atIndex:0];[encoder setFragmentBuffer:tb[1] offset:0 atIndex:2];[encoder setFragmentBuffer:tb[2] offset:0 atIndex:3];[encoder setFragmentBuffer:tb[3] offset:0 atIndex:4];[encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];
+  hw_bind_defaults();
+  for(unsigned u=0;u<4;u++){[encoder setFragmentTexture:ht[u]?ht[u]:hw_dummy_texture atIndex:u];
+   [encoder setFragmentSamplerState:hs[u]?hs[u]:hw_default_sampler atIndex:u];}
   {/* Per draw, because the encoder is shared across the batch and the
     * previous draw's rectangle would otherwise stay in force. */
    MTLScissorRect sc;sc.x=wc_x0;sc.y=wc_y0;
