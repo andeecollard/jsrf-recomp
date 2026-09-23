@@ -1,0 +1,7 @@
+{
+ "0x0018D660": "D3DDevice_GetRasterStatus (inferred: reads the CRTC raster register, one out-pointer)",
+ "0x0018E5D0": "D3DTexture_GetLevelDesc (inferred: tail-jumps to Get2DSurfaceDesc, 3 stack args)",
+ "0x00199B60": "D3D_FreeContiguousMemory (inferred: thunk to kernel ordinal 171 MmFreeContiguousMemory)",
+ "0x00199AE0": "D3D_CheckDeviceMultiSampleType (inferred: 5 stack args, returns D3DERR_* from a format table)",
+ "0x00199820": "D3D_GetAdapterCount (inferred: returns 1)"
+}

@@ -1,0 +1,1932 @@
+[
+ {
+  "address": "0x0018CB60",
+  "name": "D3DDevice_SetGammaRamp",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001521B0",
+   "sub_00152210"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CBC0",
+  "name": "D3DDevice_GetGammaRamp",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2,
+   "2": 1
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_00152170",
+   "sub_001521E0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CBF0",
+  "name": "D3DDevice_CreateTexture",
+  "ret_bytes": [
+   28
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "7": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_0014F720"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CC20",
+  "name": "D3DDevice_CreateVolumeTexture",
+  "ret_bytes": [
+   32
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "8": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014F720"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CC50",
+  "name": "D3DDevice_CreateImageSurface",
+  "ret_bytes": [
+   16
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "4": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001526E0"
+  ],
+  "notes": [
+   "tail-jumps to 0018E800"
+  ]
+ },
+ {
+  "address": "0x0018CC60",
+  "name": "D3DDevice_SetTransform",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 5
+  },
+  "call_sites": 5,
+  "callers": [
+   "sub_00153EC0",
+   "sub_00154420"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CD70",
+  "name": "D3DDevice_GetTransform",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001542A0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CDA0",
+  "name": "D3DDevice_SetMaterial",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00150C70"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CDD0",
+  "name": "D3DDevice_AddRef",
+  "ret_bytes": [
+   0
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "0": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00155150"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CDF0",
+  "name": "D3DDevice_Release",
+  "ret_bytes": [
+   0
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "0": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00154FD0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CE30",
+  "name": "D3DDevice_SetVerticalBlankCallback",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {},
+  "call_sites": 2,
+  "callers": [
+   "sub_0015F9E0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CE50",
+  "name": "D3DDevice_BlockUntilVerticalBlank",
+  "ret_bytes": [
+   0
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "0": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0013B1C0",
+   "sub_0013B230"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018CE80",
+  "name": "D3DDevice_GetTile",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 3,
+   "3": 1
+  },
+  "call_sites": 4,
+  "callers": [
+   "sub_0014E580",
+   "sub_0014F340"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018D040",
+  "name": "D3DDevice_Reset",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018D0F0",
+  "name": "D3DDevice_SetRenderTarget",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014D340"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018D620",
+  "name": "D3DDevice_GetBackBuffer",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 7,
+   "None": 1
+  },
+  "call_sites": 8,
+  "callers": [
+   "sub_0014D110",
+   "sub_0014F340",
+   "sub_0014F720",
+   "sub_00152A60",
+   "sub_00155150",
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018D660",
+  "name": "D3DDevice_GetRasterStatus (inferred: reads the CRTC raster register, one out-pointer)",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_00154BB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018D7C0",
+  "name": "D3DDevice_CopyRects",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00152780"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018DA70",
+  "name": "D3DDevice_GetDepthStencilSurface",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00155150",
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018DAA0",
+  "name": "D3DDevice_SetViewport",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1,
+   "2": 1
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00153E30",
+   "sub_001541E0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018DC00",
+  "name": "D3DDevice_SetLight",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 9,
+   "None": 2
+  },
+  "call_sites": 12,
+  "callers": [
+   "sub_0014FA40",
+   "sub_0014FB20",
+   "sub_0014FBB0",
+   "sub_0014FC20",
+   "sub_00152FE0",
+   "sub_001533D0",
+   "sub_00153520"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018DDE0",
+  "name": "D3DDevice_LightEnable",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 9
+  },
+  "call_sites": 12,
+  "callers": [
+   "sub_0014FA40",
+   "sub_0014FBB0",
+   "sub_0014FC20",
+   "sub_0014FDA0",
+   "sub_00152BC0",
+   "sub_00152E30",
+   "sub_00153080",
+   "sub_00153240",
+   "sub_001532A0",
+   "sub_001533D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018DED0",
+  "name": "D3DDevice_GetTexture2",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00150FE0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018DF10",
+  "name": "D3DDevice_SetTexture",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 10
+  },
+  "call_sites": 10,
+  "callers": [
+   "sub_0014FDE0",
+   "sub_00150FE0",
+   "sub_001510D0",
+   "sub_00154AE0",
+   "sub_00154B20"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E090",
+  "name": "D3DDevice_SetIndices",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 4
+  },
+  "call_sites": 4,
+  "callers": [
+   "sub_00155EF0",
+   "sub_00155F40",
+   "sub_00155F90",
+   "sub_00155FE0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E160",
+  "name": "D3DDevice_SetTile",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_0014E580",
+   "sub_0014F340"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E440",
+  "name": "D3D_SetPushBufferSize",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E460",
+  "name": "Direct3D_CreateDevice",
+  "ret_bytes": [
+   24
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "6": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E5D0",
+  "name": "D3DTexture_GetLevelDesc (inferred: tail-jumps to Get2DSurfaceDesc, 3 stack args)",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014EF20",
+   "sub_00152810"
+  ],
+  "notes": [
+   "tail-jumps to 00192F50"
+  ]
+ },
+ {
+  "address": "0x0018E5E0",
+  "name": "D3DTexture_GetSurfaceLevel",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "4": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014D340"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E630",
+  "name": "D3DTexture_LockRect",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 1,
+   "None": 1
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014EF20",
+   "sub_00152960"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E660",
+  "name": "D3DVolumeTexture_LockBox",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "None": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014F1E0"
+  ],
+  "notes": [
+   "tail-jumps to 001932E0"
+  ]
+ },
+ {
+  "address": "0x0018E730",
+  "name": "D3DSurface_GetDesc",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 6,
+   "None": 1
+  },
+  "call_sites": 7,
+  "callers": [
+   "sub_0014D110",
+   "sub_0014D340",
+   "sub_0014F340",
+   "sub_0014F720",
+   "sub_00152780"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E750",
+  "name": "D3DSurface_LockRect",
+  "ret_bytes": [
+   16
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "None": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00152740"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E8A0",
+  "name": "D3DDevice_SetRenderState_MultiSampleMode",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E8D0",
+  "name": "D3DDevice_SetRenderState_MultiSampleRenderTargetMode",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E900",
+  "name": "D3DDevice_SetRenderState_PSTextureModes",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018E930",
+  "name": "D3DDevice_SetRenderState_Simple",
+  "ret_bytes": [
+   0
+  ],
+  "ret_consistent": true,
+  "reg_args": [
+   "ecx",
+   "edx"
+  ],
+  "site_pushes": {
+   "0": 51,
+   "1": 9,
+   "None": 1
+  },
+  "call_sites": 61,
+  "callers": [
+   "sub_001504D0",
+   "sub_001507E0",
+   "sub_00150810",
+   "sub_00150890",
+   "sub_001508B0",
+   "sub_001508F0",
+   "sub_00150910",
+   "sub_00150930",
+   "sub_001511B0",
+   "sub_00151200",
+   "sub_001512E0",
+   "sub_00151330",
+   "sub_00151520",
+   "sub_001515D0",
+   "sub_00151670",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EB00",
+  "name": "D3DDevice_SetRenderState_EdgeAntiAlias",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_00150480",
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EB40",
+  "name": "D3DDevice_SetRenderState_ShadowFunc",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EB80",
+  "name": "D3DDevice_SetRenderState_FogColor",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_001504A0",
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EBD0",
+  "name": "D3DDevice_SetRenderState_CullMode",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 8
+  },
+  "call_sites": 8,
+  "callers": [
+   "sub_00150440",
+   "sub_001504D0",
+   "sub_00151200",
+   "sub_001512E0",
+   "sub_00151330",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EC40",
+  "name": "D3DDevice_SetRenderState_FrontFace",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": [
+   "tail-jumps to 0018EBD0"
+  ]
+ },
+ {
+  "address": "0x0018EC80",
+  "name": "D3DDevice_SetRenderState_NormalizeNormals",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_001504C0",
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018ECC0",
+  "name": "D3DDevice_SetRenderState_TextureFactor",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_0014FE50",
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018ED20",
+  "name": "D3DDevice_SetRenderState_LineWidth",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_001504D0",
+   "sub_00150FA0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018ED90",
+  "name": "D3DDevice_SetRenderState_Dxt1NoiseEnable",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EE10",
+  "name": "D3DDevice_SetRenderState_ZBias",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EE90",
+  "name": "D3DDevice_SetRenderState_LogicOp",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EEF0",
+  "name": "D3DDevice_SetRenderState_FillMode",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 5
+  },
+  "call_sites": 5,
+  "callers": [
+   "sub_001503F0",
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EF40",
+  "name": "D3DDevice_SetRenderState_BackFillMode",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018EFA0",
+  "name": "D3DDevice_SetRenderState_TwoSidedLighting",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F010",
+  "name": "D3DDevice_SetRenderState_VertexBlend",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 3
+  },
+  "call_sites": 3,
+  "callers": [
+   "sub_001504D0",
+   "sub_00150FB0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F060",
+  "name": "D3DDevice_SetTextureState_TexCoordIndex",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 3,
+   "3": 1
+  },
+  "call_sites": 4,
+  "callers": [
+   "sub_0014FE30",
+   "sub_00150130",
+   "sub_001502F0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F180",
+  "name": "D3DDevice_SetTextureState_BumpEnv",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 14,
+   "4": 1
+  },
+  "call_sites": 15,
+  "callers": [
+   "sub_0014FE60",
+   "sub_001502F0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F1F0",
+  "name": "D3DDevice_SetTextureState_BorderColor",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001502F0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F230",
+  "name": "D3DDevice_SetTextureState_ColorKeyColor",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001502F0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F6C0",
+  "name": "D3DDevice_SetRenderState_ZEnable",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1,
+   "None": 1
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F760",
+  "name": "D3DDevice_SetRenderState_StencilEnable",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 7
+  },
+  "call_sites": 7,
+  "callers": [
+   "sub_001504D0",
+   "sub_00151120",
+   "sub_00151180",
+   "sub_001511A0",
+   "sub_00151330",
+   "sub_00151670",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F7F0",
+  "name": "D3DDevice_SetRenderState_StencilFail",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001504D0",
+   "sub_001564B0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F860",
+  "name": "D3DDevice_SetRenderState_YuvEnable",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F890",
+  "name": "D3DDevice_SetRenderState_OcclusionCullEnable",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F900",
+  "name": "D3DDevice_SetRenderState_StencilCullEnable",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F970",
+  "name": "D3DDevice_SetRenderState_RopZCmpAlwaysRead",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F990",
+  "name": "D3DDevice_SetRenderState_RopZRead",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F9B0",
+  "name": "D3DDevice_SetRenderState_DoNotCullUncompressed",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018F9D0",
+  "name": "D3DDevice_SetRenderState_MultiSampleAntiAlias",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018FA30",
+  "name": "D3DDevice_SetRenderState_MultiSampleMask",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_001504D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x0018FF90",
+  "name": "D3DDevice_CreateVertexShader",
+  "ret_bytes": [
+   16
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "4": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014E240"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001900D0",
+  "name": "D3DDevice_SetStreamSource",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00155B20"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00190240",
+  "name": "D3DDevice_SetShaderConstantMode",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014D9D0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00190380",
+  "name": "D3DDevice_DeleteVertexShader",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014E2B0"
+  ],
+  "notes": [
+   "tail-jumps to 0014A85B"
+  ]
+ },
+ {
+  "address": "0x00190490",
+  "name": "D3DDevice_SetVertexShader",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 5
+  },
+  "call_sites": 5,
+  "callers": [
+   "sub_0014D1E0",
+   "sub_0014D9F0",
+   "sub_00151330",
+   "sub_00151840",
+   "sub_00155B40"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001905F0",
+  "name": "D3DDevice_SetVertexShaderConstant",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 1,
+   "3": 28
+  },
+  "call_sites": 29,
+  "callers": [
+   "sub_0014DB70"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00192790",
+  "name": "D3DResource_GetType",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00154B00"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00192950",
+  "name": "D3DResource_AddRef",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 6
+  },
+  "call_sites": 6,
+  "callers": [
+   "sub_00152A60",
+   "sub_00152B60",
+   "sub_00155150",
+   "sub_00155E50"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00192990",
+  "name": "D3DResource_Release",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 18,
+   "2": 1
+  },
+  "call_sites": 19,
+  "callers": [
+   "sub_0014D110",
+   "sub_0014D340",
+   "sub_0014D4C0",
+   "sub_0014D5F0",
+   "sub_0014F340",
+   "sub_0014F640",
+   "sub_00150FE0",
+   "sub_00152A60",
+   "sub_00152AE0",
+   "sub_00152B60",
+   "sub_00155150",
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001929E0",
+  "name": "D3DResource_Register",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014D640",
+   "sub_0014F340"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00193830",
+  "name": "D3DDevice_Clear",
+  "ret_bytes": [
+   24
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "6": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014D030"
+  ],
+  "notes": [
+   "indirect jmp at 001938B7",
+   "indirect jmp at 00193926"
+  ]
+ },
+ {
+  "address": "0x00198F10",
+  "name": "D3DDevice_Swap",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 4
+  },
+  "call_sites": 4,
+  "callers": [
+   "sub_0014D090",
+   "sub_0014D0D0",
+   "sub_0014D110"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199060",
+  "name": "D3DDevice_DrawVerticesUP",
+  "ret_bytes": [
+   16
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "4": 5
+  },
+  "call_sites": 5,
+  "callers": [
+   "sub_0014D200",
+   "sub_0014D230",
+   "sub_0014D2B0",
+   "sub_0014D2E0",
+   "sub_0014D310"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001991C0",
+  "name": "D3DDevice_DrawIndexedVerticesUP",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014D270"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199300",
+  "name": "D3DDevice_DrawVertices",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 11,
+   "4": 1
+  },
+  "call_sites": 12,
+  "callers": [
+   "sub_00155B80",
+   "sub_00155BC0",
+   "sub_00155C00",
+   "sub_00155C30",
+   "sub_00155C70",
+   "sub_00155CB0",
+   "sub_00155CE0",
+   "sub_00155D20",
+   "sub_00155D60",
+   "sub_00155DA0",
+   "sub_00155DD0",
+   "sub_00155E00"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001993A0",
+  "name": "D3DDevice_DrawIndexedVertices",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 4
+  },
+  "call_sites": 4,
+  "callers": [
+   "sub_00155EF0",
+   "sub_00155F40",
+   "sub_00155F90",
+   "sub_00155FE0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199600",
+  "name": "D3DDevice_SetVertexData2f",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 7,
+   "5": 1
+  },
+  "call_sites": 8,
+  "callers": [
+   "sub_00151330",
+   "sub_00151840"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199640",
+  "name": "D3DDevice_SetVertexData4f",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 12
+  },
+  "call_sites": 12,
+  "callers": [
+   "sub_00151330",
+   "sub_00151840"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001996A0",
+  "name": "D3DDevice_Begin",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00151330",
+   "sub_00151840"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001996E0",
+  "name": "D3DDevice_End",
+  "ret_bytes": [
+   0
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "0": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00151330",
+   "sub_00151840"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199720",
+  "name": "D3DDevice_CreateIndexBuffer",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014D4C0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199760",
+  "name": "D3DDevice_CreateVertexBuffer",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014D4C0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001997C0",
+  "name": "D3DVertexBuffer_Lock",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00155E30"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199820",
+  "name": "D3D_GetAdapterCount (inferred: returns 1)",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1,
+   "2": 1
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00155380",
+   "sub_00155A60"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199830",
+  "name": "D3D_GetAdapterModeCount",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "None": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001559D0",
+   "sub_001569A0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x001998D0",
+  "name": "D3D_EnumAdapterModes",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_001559D0",
+   "sub_001569A0"
+  ],
+  "notes": [
+   "indirect jmp at 001999BE"
+  ]
+ },
+ {
+  "address": "0x00199A30",
+  "name": "D3D_GetDeviceCaps",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "None": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00155A60",
+   "sub_00156AB0"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199A60",
+  "name": "D3D_CheckDeviceFormat",
+  "ret_bytes": [
+   24
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "6": 4
+  },
+  "call_sites": 4,
+  "callers": [
+   "sub_0014F720",
+   "sub_001549A0",
+   "sub_00156A30"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199AE0",
+  "name": "D3D_CheckDeviceMultiSampleType (inferred: 5 stack args, returns D3DERR_* from a format table)",
+  "ret_bytes": [
+   20
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "5": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014F720",
+   "sub_00156A30"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199B40",
+  "name": "D3D_AllocContiguousMemory",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_0014F340"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199B60",
+  "name": "D3D_FreeContiguousMemory (inferred: thunk to kernel ordinal 171 MmFreeContiguousMemory)",
+  "ret_bytes": [],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_0014E580",
+   "sub_0014F340"
+  ],
+  "notes": [
+   "import thunk [001C404C]",
+   "indirect jmp at 00199B60"
+  ]
+ },
+ {
+  "address": "0x00199B70",
+  "name": "D3DDevice_CreatePixelShader",
+  "ret_bytes": [
+   8
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "2": 2
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00153800",
+   "sub_00153890"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199BC0",
+  "name": "D3DDevice_DeletePixelShader",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00153850"
+  ],
+  "notes": [
+   "tail-jumps to 0014A85B"
+  ]
+ },
+ {
+  "address": "0x00199BE0",
+  "name": "D3DDevice_SetPixelShader",
+  "ret_bytes": [
+   4
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "1": 1
+  },
+  "call_sites": 2,
+  "callers": [
+   "sub_00153760",
+   "sub_00153780"
+  ],
+  "notes": []
+ },
+ {
+  "address": "0x00199DB0",
+  "name": "D3DDevice_SetPixelShaderConstant",
+  "ret_bytes": [
+   12
+  ],
+  "ret_consistent": true,
+  "reg_args": [],
+  "site_pushes": {
+   "3": 1
+  },
+  "call_sites": 1,
+  "callers": [
+   "sub_00153790"
+  ],
+  "notes": []
+ }
+]

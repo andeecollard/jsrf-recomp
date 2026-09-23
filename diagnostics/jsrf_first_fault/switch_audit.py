@@ -102,6 +102,10 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    # Names what to tally, not whether: "ring" counts guest stores into the
+    # live D3D push-buffer ring by function (G33, recomp_mem_watch.c). Other
+    # values are reserved for other regions, so only the literal "ring" arms it.
+    "RECOMP_MEM_WATCH_TALLY",
     # How many consecutive reports of "all-zero presented frame with a scene
     # still being submitted" arm the per-draw capture. A count, not a
     # boolean: the boot's own black stretches armed it at 2 (t=18, on the

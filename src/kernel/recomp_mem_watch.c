@@ -4,8 +4,10 @@
  * sources do not have a translated guest instruction PC and need separate
  * provenance when they are added. */
 #include "recomp_mem_watch.h"
+#include "d3d8_ring.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,7 @@ static size_t s_heap_alias_span;
 static uint32_t s_watch_ram_lo;
 static uint32_t s_watch_length;
 static int s_watch_raw_va;
+static int s_tally_ring;          /* RECOMP_MEM_WATCH_TALLY=ring, see below */
 
 static int checked_end(uint32_t start, size_t bytes, uint64_t *end)
 {
@@ -105,7 +108,8 @@ static int configure(const char *spec)
     uint32_t va, length, normalized;
     uint64_t range_end;
 
-    g_recomp_mem_watch_enabled = 0;
+    g_recomp_mem_watch_enabled = s_tally_ring;
+    s_watch_length = 0;
     if (!spec || !*spec)
         return 0;
     if (!parse_u32(spec, &end, &va) || *end != ':' ||
@@ -140,6 +144,179 @@ static int configure(const char *spec)
     return 1;
 }
 
+
+/* ── Ring-store tally: RECOMP_MEM_WATCH_TALLY=ring (G33, 23 Sep 2026) ───────
+ *
+ * The D3D8-lift plan needs one fact no static scan can give: does anything
+ * outside the D3D library write the GPU command ring, including through a
+ * pointer the game computed? This mode answers it by counting, per guest
+ * function, every translated store and block write that lands in the live
+ * ring (device +0x24 .. +0x28, read through d3d8_ring's self-checked
+ * accessor and compared as RAM identity, so any mirror of the ring counts).
+ *
+ * It prints nothing per store. A table goes to stderr every 2^22 ring stores
+ * and at exit; classify the functions afterwards against the D3D section.
+ * Stores made by host code (kernel bridges, devices) have no guest PC and are
+ * not seen, which is the right scope: the question is about guest code. */
+#define TALLY_SLOTS 4096u
+static _Atomic uint32_t s_tally_fn[TALLY_SLOTS];
+static _Atomic uint64_t s_tally_stores[TALLY_SLOTS];
+static _Atomic uint64_t s_tally_block_bytes[TALLY_SLOTS];
+static _Atomic uint64_t s_tally_total, s_tally_dropped, s_tally_seen;
+static _Atomic uint32_t s_ring_lo_ram, s_ring_hi_ram;   /* hi == 0: unknown */
+static _Atomic uint32_t s_ring_lo_raw, s_ring_hi_raw;   /* the VAs as the device holds them */
+
+static void tally_refresh_ring(void)
+{
+    D3D8RingTarget t;
+    uint32_t lo;
+
+    if (!d3d8_ring_read_target(&t) || !t.trusted)
+        return;
+    /* Raw bounds always; RAM identity too when the ring lies in a window the
+     * alias model knows, so a store through another mirror still counts. */
+    atomic_store_explicit(&s_ring_lo_raw, t.ring_lo, memory_order_relaxed);
+    atomic_store_explicit(&s_ring_hi_raw, t.ring_hi, memory_order_relaxed);
+    if (!normalize_ram(t.ring_lo, (size_t)(t.ring_hi - t.ring_lo), &lo))
+        return;
+    atomic_store_explicit(&s_ring_lo_ram, lo, memory_order_relaxed);
+    atomic_store_explicit(&s_ring_hi_ram, lo + (t.ring_hi - t.ring_lo),
+                          memory_order_relaxed);
+}
+
+static void tally_add(uint32_t function, uint64_t stores, uint64_t bytes)
+{
+    uint32_t key = function ? function : 1u;   /* 0 marks an empty slot */
+    uint32_t slot = (key * 2654435761u) >> 20;
+
+    for (unsigned probe = 0; probe < TALLY_SLOTS; ++probe) {
+        uint32_t i = (slot + probe) & (TALLY_SLOTS - 1u);
+        uint32_t cur = atomic_load_explicit(&s_tally_fn[i], memory_order_relaxed);
+        if (cur == 0) {
+            uint32_t expect = 0;
+            if (!atomic_compare_exchange_strong(&s_tally_fn[i], &expect, key))
+                cur = expect;
+            else
+                cur = key;
+        }
+        if (cur == key) {
+            atomic_fetch_add_explicit(&s_tally_stores[i], stores, memory_order_relaxed);
+            atomic_fetch_add_explicit(&s_tally_block_bytes[i], bytes, memory_order_relaxed);
+            return;
+        }
+    }
+    atomic_fetch_add_explicit(&s_tally_dropped, 1, memory_order_relaxed);
+}
+
+void recomp_mem_watch_tally_report(const char *why)
+{
+    uint32_t lo, hi;
+    unsigned used = 0;
+
+    if (!s_tally_ring)
+        return;
+    lo = atomic_load_explicit(&s_ring_lo_ram, memory_order_relaxed);
+    hi = atomic_load_explicit(&s_ring_hi_ram, memory_order_relaxed);
+    fprintf(stderr,
+            "[RING-TALLY] %s ring=0x%08X..0x%08X ring_ram=0x%08X..0x%08X"
+            " total=%llu dropped=%llu\n",
+            why, atomic_load(&s_ring_lo_raw), atomic_load(&s_ring_hi_raw), lo, hi,
+            (unsigned long long)atomic_load(&s_tally_total),
+            (unsigned long long)atomic_load(&s_tally_dropped));
+    for (uint32_t i = 0; i < TALLY_SLOTS; ++i) {
+        uint32_t fn = atomic_load_explicit(&s_tally_fn[i], memory_order_relaxed);
+        if (!fn)
+            continue;
+        ++used;
+        fprintf(stderr, "[RING-TALLY] function=0x%08X stores=%llu block_bytes=%llu\n",
+                fn,
+                (unsigned long long)atomic_load(&s_tally_stores[i]),
+                (unsigned long long)atomic_load(&s_tally_block_bytes[i]));
+    }
+    fprintf(stderr, "[RING-TALLY] %s functions=%u\n", why, used);
+    fflush(stderr);
+}
+
+static void tally_report_at_exit(void) { recomp_mem_watch_tally_report("exit"); }
+
+static void tally_reset(void)
+{
+    for (uint32_t i = 0; i < TALLY_SLOTS; ++i) {
+        atomic_store(&s_tally_fn[i], 0);
+        atomic_store(&s_tally_stores[i], 0);
+        atomic_store(&s_tally_block_bytes[i], 0);
+    }
+    atomic_store(&s_tally_total, 0);
+    atomic_store(&s_tally_dropped, 0);
+    atomic_store(&s_tally_seen, 0);
+    atomic_store(&s_ring_lo_ram, 0);
+    atomic_store(&s_ring_hi_ram, 0);
+    atomic_store(&s_ring_lo_raw, 0);
+    atomic_store(&s_ring_hi_raw, 0);
+}
+
+/* Does the guest range [va, va+len) touch the ring, by raw VA or by RAM
+ * identity? Bounds refresh lazily: every 4096 checks until known, then every
+ * 2^20, which also follows a device Reset. */
+static int tally_hits_ring(uint32_t va, uint64_t len)
+{
+    uint64_t seen = atomic_fetch_add_explicit(&s_tally_seen, 1, memory_order_relaxed);
+    uint32_t hi_raw = atomic_load_explicit(&s_ring_hi_raw, memory_order_relaxed);
+    uint32_t lo, hi, ram;
+
+    if ((!hi_raw && (seen & 4095u) == 0) || (seen & ((1u << 20) - 1u)) == 0) {
+        tally_refresh_ring();
+        hi_raw = atomic_load_explicit(&s_ring_hi_raw, memory_order_relaxed);
+    }
+    if (!hi_raw)
+        return 0;
+    lo = atomic_load_explicit(&s_ring_lo_raw, memory_order_relaxed);
+    if ((uint64_t)va < hi_raw && (uint64_t)lo < (uint64_t)va + len)
+        return 1;
+    hi = atomic_load_explicit(&s_ring_hi_ram, memory_order_relaxed);
+    if (!hi || len > UINT32_MAX || !normalize_ram(va, (size_t)len, &ram))
+        return 0;
+    lo = atomic_load_explicit(&s_ring_lo_ram, memory_order_relaxed);
+    return (uint64_t)ram < hi && (uint64_t)lo < (uint64_t)ram + len;
+}
+
+static void tally_store(uint32_t function, uint32_t va, unsigned width)
+{
+    if (!tally_hits_ring(va, width))
+        return;
+    tally_add(function, 1, 0);
+    if ((atomic_fetch_add_explicit(&s_tally_total, 1, memory_order_relaxed)
+         & ((1u << 22) - 1u)) == ((1u << 22) - 1u))
+        recomp_mem_watch_tally_report("periodic");
+}
+
+static void tally_block(uint32_t function, uint32_t dst, uint32_t len)
+{
+    uint32_t lo = len < dst ? dst - len : 0;
+
+    /* Same conservative two-direction span as the range watch below. */
+    if (tally_hits_ring(lo, (uint64_t)(dst - lo) + len))
+        tally_add(function, 0, len);
+}
+
+static void tally_configure(void)
+{
+    const char *mode = getenv("RECOMP_MEM_WATCH_TALLY");
+
+    if (!mode || strcmp(mode, "ring") != 0 || s_tally_ring)
+        return;
+    static int exit_hook;
+    tally_reset();
+    s_tally_ring = 1;
+    g_recomp_mem_watch_enabled = 1;
+    if (!exit_hook) {
+        exit_hook = 1;
+        atexit(tally_report_at_exit);
+    }
+    fprintf(stderr, "[RING-TALLY] armed: counting guest stores into the D3D ring by function\n");
+    fflush(stderr);
+}
+
 void recomp_mem_watch_init(size_t ram_span, uint32_t mirror_mask,
                            uint32_t tiled_base, size_t tiled_span)
 {
@@ -148,6 +325,7 @@ void recomp_mem_watch_init(size_t ram_span, uint32_t mirror_mask,
     s_tiled_base = tiled_base;
     s_tiled_span = tiled_span;
     s_heap_alias_span = 0;
+    tally_configure();
     configure(getenv("RECOMP_MEM_WATCH"));
 }
 
@@ -160,7 +338,7 @@ void recomp_mem_watch_add_ram_alias(uint32_t guest_base,
 
     /* A watch expressed through this dynamically enabled alias could not be
      * normalized during layout init. Retry it now that the view is real. */
-    if (!g_recomp_mem_watch_enabled && getenv("RECOMP_MEM_WATCH"))
+    if (!s_watch_length && getenv("RECOMP_MEM_WATCH"))
         configure(getenv("RECOMP_MEM_WATCH"));
 }
 
@@ -213,6 +391,7 @@ void recomp_mem_watch_shutdown(void)
     s_watch_ram_lo = 0;
     s_watch_length = 0;
     s_watch_raw_va = 0;
+    s_tally_ring = 0;
 }
 
 static uint64_t load_width(volatile void *ptr, unsigned width)
@@ -245,6 +424,15 @@ void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
     uint64_t access_hi, watch_hi;
     int match = 0;
     uint64_t old_value = 0;
+
+    if (s_tally_ring) {
+        tally_store(guest_function, guest_va, width);
+        if (!s_watch_length) {
+            if (host_ptr)
+                store_width(host_ptr, width, new_value);
+            return;
+        }
+    }
 
     if (host_ptr && (width == 1 || width == 2 || width == 4 || width == 8) &&
         (s_watch_raw_va || normalize_ram(guest_va, width, &ram))) {
@@ -297,6 +485,11 @@ void recomp_mem_watch_guest_block(uint32_t guest_function, uint32_t dst_va,
 
     if (!g_recomp_mem_watch_enabled || !len)
         return;
+    if (s_tally_ring) {
+        tally_block(guest_function, dst_va, len);
+        if (!s_watch_length)
+            return;
+    }
 
     /* Conservative span: [dst-len, dst+len). */
     lo = (uint64_t)dst_va > (uint64_t)len ? (uint64_t)dst_va - len : 0;

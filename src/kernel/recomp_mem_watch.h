@@ -34,4 +34,8 @@ void recomp_mem_watch_guest_store(uint32_t guest_pc, uint32_t guest_function,
 void recomp_mem_watch_guest_block(uint32_t guest_function, uint32_t dst_va,
                                   uint32_t len);
 
+/* RECOMP_MEM_WATCH_TALLY=ring: print the per-function count of guest stores
+ * into the live D3D push-buffer ring. Also runs periodically and at exit. */
+void recomp_mem_watch_tally_report(const char *why);
+
 #endif
