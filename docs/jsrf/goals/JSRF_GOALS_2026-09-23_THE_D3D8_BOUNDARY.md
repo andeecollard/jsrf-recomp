@@ -447,6 +447,48 @@ program: is `oD0.w` a constant register, an input attribute, or computed?
 provably above 0. That decides whether an exact early-Z for them is days of
 work or impossible.
 
+### G38 first answer, 23 Sep 2026: the final alpha is always a product
+
+**Every late, alpha-tested, depth-writing draw uses the combiners.** The
+G27b counters show 0 without them in both idle-host early-Z arms. So a
+fragment's fate is decided by the combiner alpha chain.
+
+`RECOMP_METAL_ALPHA_CENSUS=1` (read-only) counts those draws per distinct
+alpha configuration at the draw site. One silenced 150 s tutorial run with
+`RECOMP_METAL_HW_TEX=1` (live=61, 0 faults): **651,625 draws, only 10
+configurations.**
+
+How to read the words: in each input byte, bits 0–3 are the register
+(4 = diffuse, 8–11 = textures 0–3, 12 = spare0, 0 = zero), bit 4 selects
+alpha, and bits 5–7 are the mapping (1 = invert, so `0x20` is the constant
+1). In the output word, bits 8–11 are the sum destination and bits 4–7 the
+AB destination.
+
+| # | share | final alpha (spare0.a) |
+|---|---:|---|
+| 0 | 55.6% | tex0.a × diffuse.a × tex1.a |
+| 1 | 13.3% | diffuse.a × tex0.a (stages 1/3 compute c0.a × tex2/3.a into spare1, which the final alpha never reads) |
+| 2, 4, 5 | 18.3% | tex0.a × diffuse.a (4 and 5 add a `0 + 1 × spare0.a` pass-through) |
+| 3, 6, 7, 9 | 12.4% | diffuse.a |
+| 8 | 0.3% | tex1.a (stage 1 overwrites stage 0) |
+
+**Consequence.** Every factor is at least 0 and at most 1. Filtering and
+vertex interpolation only average, so a fragment's alpha is at least the
+product of each factor's minimum over the draw. The shader discards at
+reference 0 when alpha < 1/510. **A draw is exactly early-Z-safe when
+∏ min(factor) ≥ 1/255**, with a margin for the float product.
+- **Texture factors are cheap.** Record the minimum alpha of every level
+  when `nv2a_texture_decode_rgba8` decodes a texture, on the path G27
+  already runs.
+- **Diffuse is the open factor.** The guest vertex program writes `oD0.w`
+  on the GPU.
+
+**Next measurement (G38b).** For the vertex programs these draws run, where
+does `oD0.w` come from: a constant register, a vertex attribute (readable
+on the CPU when the draw is prepared), or a computed value? If the first
+two cover most of these draws, the exact early-Z is days of work. If
+lighting computes it, it is not reachable this way.
+
 ### Order
 
 1. **G36.** It waits on the player and costs nothing meanwhile.

@@ -1944,6 +1944,66 @@ static int hw_draw_writes_nothing_early(const NV2ATextureCopy *s)
     return !(s->depth_test && s->depth_write) && !(s->stencil_test && s->stencil_write);
 }
 
+/* G38 -- WHICH COMBINER ALPHA PROGRAMS DO THE LATE, ALPHA-TESTED, DEPTH-WRITING
+ * DRAWS RUN? RECOMP_METAL_ALPHA_CENSUS=1, opt-in, read-only.
+ *
+ * Every one of those draws uses the combiners (23 Sep 2026: 0 without), so
+ * whether a fragment can reach alpha 0 -- the only discard at alpha_ref 0 --
+ * is a property of the alpha chain: combiner_count, each stage's alpha input
+ * and output words, and the constant alphas it can read. Counted per distinct
+ * configuration at the draw, top entries printed by nv2a_metal_report. */
+static int alpha_census_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_ALPHA_CENSUS"); return on; }
+#define ALPHA_CENSUS_SLOTS 512
+static struct { uint64_t key; uint64_t draws; uint32_t cc, icw[8], ocw[8], k0a, k1a, tmask; } g_alpha_cfg[ALPHA_CENSUS_SLOTS];
+static uint64_t g_alpha_cfg_overflow;
+static void alpha_census_note(const NV2ATextureCopy *s)
+{
+    uint64_t h = 1469598103934665603ull; uint32_t k0a = 0, k1a = 0;
+    unsigned cc = s->combiner_count > 8 ? 8 : s->combiner_count;
+    for (unsigned i = 0; i < cc; ++i) {
+        h = (h ^ s->alpha_icw[i]) * 1099511628211ull; h = (h ^ s->alpha_ocw[i]) * 1099511628211ull;
+        k0a |= ((s->const0[i] >> 24) ? 1u : 0u) << i; k1a |= ((s->const1[i] >> 24) ? 1u : 0u) << i;
+    }
+    h = (h ^ cc) * 1099511628211ull; h = (h ^ k0a) * 1099511628211ull;
+    h = (h ^ k1a) * 1099511628211ull; h = (h ^ s->texture_mask) * 1099511628211ull;
+    for (unsigned n = 0; n < ALPHA_CENSUS_SLOTS; ++n) {
+        unsigned i = (unsigned)((h + n) % ALPHA_CENSUS_SLOTS);
+        if (g_alpha_cfg[i].draws && g_alpha_cfg[i].key != h) continue;
+        if (!g_alpha_cfg[i].draws) {
+            g_alpha_cfg[i].key = h; g_alpha_cfg[i].cc = cc; g_alpha_cfg[i].k0a = k0a;
+            g_alpha_cfg[i].k1a = k1a; g_alpha_cfg[i].tmask = s->texture_mask;
+            memcpy(g_alpha_cfg[i].icw, s->alpha_icw, sizeof g_alpha_cfg[i].icw);
+            memcpy(g_alpha_cfg[i].ocw, s->alpha_ocw, sizeof g_alpha_cfg[i].ocw);
+        }
+        ++g_alpha_cfg[i].draws; return;
+    }
+    ++g_alpha_cfg_overflow;
+}
+static void alpha_census_report(void)
+{
+    if (!alpha_census_on()) return;
+    uint64_t total = 0; unsigned used = 0;
+    for (unsigned i = 0; i < ALPHA_CENSUS_SLOTS; ++i) if (g_alpha_cfg[i].draws) { total += g_alpha_cfg[i].draws; ++used; }
+    fprintf(stderr, "[ALPHA-CENSUS] RECOMP_METAL_ALPHA_CENSUS=on late alpha-tested depth-writing draws=%llu configs=%u overflow=%llu\n",
+            (unsigned long long)total, used, (unsigned long long)g_alpha_cfg_overflow);
+    static unsigned char taken[ALPHA_CENSUS_SLOTS];
+    memset(taken, 0, sizeof taken);
+    for (unsigned r = 0; r < 24; ++r) {
+        unsigned best = ALPHA_CENSUS_SLOTS; uint64_t bd = 0;
+        for (unsigned i = 0; i < ALPHA_CENSUS_SLOTS; ++i)
+            if (!taken[i] && g_alpha_cfg[i].draws > bd) { bd = g_alpha_cfg[i].draws; best = i; }
+        if (best == ALPHA_CENSUS_SLOTS) break;
+        fprintf(stderr, "[ALPHA-CENSUS] #%u draws=%llu (%.1f%%) cc=%u tmask=%X k0a=%X k1a=%X",
+                r, (unsigned long long)bd, total ? 100.0 * bd / total : 0.0, g_alpha_cfg[best].cc,
+                g_alpha_cfg[best].tmask, g_alpha_cfg[best].k0a, g_alpha_cfg[best].k1a);
+        for (unsigned k = 0; k < g_alpha_cfg[best].cc; ++k)
+            fprintf(stderr, " [%u]icw=%08X ocw=%08X", k, g_alpha_cfg[best].icw[k], g_alpha_cfg[best].ocw[k]);
+        fprintf(stderr, "\n");
+        taken[best] = 1;               /* rank without disturbing the counts: this runs periodically */
+    }
+}
+
 /* 0: late tests. 1: early, the draw cannot discard (fs_hw_early).
  * 2: early, the draw may discard but writes no depth or stencil
  *    (fs_hw_early_nw). Both early variants are exact. */
@@ -3292,6 +3352,7 @@ void nv2a_metal_report(void)
                 " %llu without combiners, %llu with combiners\n",
                 (unsigned long long)g_ez_nowrite,(unsigned long long)g_ez_alpha_writes_cc0,
                 (unsigned long long)g_ez_alpha_writes_cc);
+    alpha_census_report();
     /* Defined beside nv2a_metal_draw, which is where it measures. */
     { extern void t0_census_report(void); t0_census_report(); }
     fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
@@ -5635,7 +5696,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
           * not run. */
          {int ez=hw_shader_blend(s)?hw_early_z(s):0;
           if(ez)++g_early_z_draws;else++g_late_z_draws;
-          if(ez==2)++g_early_nw_draws;}}   /* the positive control for fs_hw_early_nw */
+          if(ez==2)++g_early_nw_draws;
+          if(!ez&&alpha_census_on()&&s->alpha_test&&s->depth_test&&s->depth_write)alpha_census_note(s);}}
   else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];
   /* THE TWO PIPELINES HAVE INCOMPATIBLE VERTEX BINDINGS AND THE ENCODER MUST
    * NOT SET BOTH. The fixed `vs` reads Params at vertex 1 and the indices at
