@@ -29,7 +29,8 @@ static uint32_t size_pitch(uint32_t size) { return ((size >> 24) + 1u) * 64u; }
 static const uint32_t k_state_methods[11] = D3D8_HOST_STATE_METHODS;
 static _Atomic unsigned long long s_vp_cmp, s_vp_match, s_vp_win, s_vp_z;
 static _Atomic unsigned long long s_st_cmp[11], s_st_match[11], s_st_unseen[11];
-static _Atomic unsigned s_vp_printed, s_st_printed;
+static _Atomic unsigned s_vp_printed, s_st_printed, s_vc_printed;
+static _Atomic unsigned long long s_vc_cmp, s_vc_match, s_vc_all, s_vc_draws;
 static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
@@ -108,6 +109,22 @@ static void check_draw(const D3D8HostDrawCheck *c)
                             " | exec window=%u,%u..%u,%u clip=%u,%u %ux%u z=%g..%g\n", c->serial, why,
                     c->vp_x, c->vp_y, c->vp_w, c->vp_h, c->vp_minz, c->vp_maxz, c->ss_x, c->ss_y, x0, y0, x1, y1,
                     e.win_x0, e.win_y0, e.win_x1, e.win_y1, e.clip_x, e.clip_y, e.clip_w, e.clip_h, e.z_min, e.z_max);
+    }
+    /* Vertex shader constants: every slot D3D was asked to write, bit for bit. */
+    {
+        int all = 1; unsigned long long n = 0, ok = 0;
+        for (unsigned k = 0; k < 192; ++k) {
+            if (!(c->vc_written[k / 32] & (1u << (k % 32)))) continue;
+            ++n;
+            if (!memcmp(c->vc[k], e.vc[k], sizeof c->vc[k])) { ++ok; continue; }
+            all = 0;
+            if (atomic_fetch_add(&s_vc_printed, 1) < 10)
+                fprintf(stderr, "[D3D8-MIRROR] draw %u constant MISMATCH slot %u (c%d): d3d %g %g %g %g | exec %g %g %g %g\n",
+                        c->serial, k, (int)k - 96, c->vc[k][0], c->vc[k][1], c->vc[k][2], c->vc[k][3],
+                        e.vc[k][0], e.vc[k][1], e.vc[k][2], e.vc[k][3]);
+        }
+        atomic_fetch_add(&s_vc_cmp, n); atomic_fetch_add(&s_vc_match, ok);
+        atomic_fetch_add(&s_vc_draws, 1); if (all) atomic_fetch_add(&s_vc_all, 1);
     }
     /* Blend / alpha / depth / stencil registers: D3D's last Simple push against
      * the executor's register file at this draw. */
@@ -196,6 +213,8 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->zs_pitch = atomic_load(&s_zs_pitch);
     o->vp_compared = atomic_load(&s_vp_cmp); o->vp_match = atomic_load(&s_vp_match);
     o->vp_window = atomic_load(&s_vp_win); o->vp_z = atomic_load(&s_vp_z);
+    o->vc_slots_compared = atomic_load(&s_vc_cmp); o->vc_slots_match = atomic_load(&s_vc_match);
+    o->vc_draws_all_match = atomic_load(&s_vc_all); o->vc_draws = atomic_load(&s_vc_draws);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -220,6 +239,8 @@ void d3d8_host_report(const char *why)
     if (st.checks) {
         fprintf(stderr, "[D3D8-MIRROR] %s viewport: compared=%llu MATCH=%llu (window %llu, z range %llu)\n",
                 why, st.vp_compared, st.vp_match, st.vp_window, st.vp_z);
+        fprintf(stderr, "[D3D8-MIRROR] %s vertex constants: slots compared=%llu MATCH=%llu | draws %llu, all slots matching in %llu\n",
+                why, st.vc_slots_compared, st.vc_slots_match, st.vc_draws, st.vc_draws_all_match);
         for (unsigned k = 0; k < 11; ++k)
             fprintf(stderr, "[D3D8-MIRROR] %s state %04X: compared=%llu MATCH=%llu never-pushed-by-D3D=%llu\n",
                     why, k_state_methods[k], st.st_compared[k], st.st_match[k], st.st_unseen[k]);

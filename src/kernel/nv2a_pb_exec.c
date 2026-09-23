@@ -6669,6 +6669,7 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
     out->z_min = c->z_clip_min; out->z_max = c->z_clip_max;
     {   static const uint32_t m[11] = D3D8_HOST_STATE_METHODS;
         for (unsigned k = 0; k < 11; ++k) out->st_reg[k] = s_methods[m[k] / 4u]; }
+    memcpy(out->vc, s_vsh.constants, sizeof out->vc);
     for (unsigned u = 0; u < 4; ++u) {
         const NV2ATextureCopy *t = u ? &s_copy.extra_stages[u - 1] : c;
         if (!(out->mask & (1u << u))) continue;

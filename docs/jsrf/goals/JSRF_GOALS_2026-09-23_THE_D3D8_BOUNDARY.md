@@ -676,3 +676,25 @@ executor drew. Still to check: the vertex and pixel shaders (programs,
 constants and combiner setup), vertex streams and index data, and the
 texture-stage states (filter and wrap). That is everything else a Metal
 renderer fed at the D3D boundary needs.
+
+### G39, fourth slice: vertex shader constants, 23 Sep 2026
+
+`SetVertexShaderConstant(Register, pData, Count)` (0x1905F0, about 220 calls per
+frame) is hooked. The mirror copies what D3D was handed into a host constant
+file, at NV2A slot = Register + 96. At each draw, every slot D3D has written
+is compared bit for bit with the executor's `s_vsh.constants`.
+
+**150 s silenced tutorial:**
+- **Slots.** 52,480,084 compared, **52,480,084 match**.
+- **Draws.** All written slots matched in **559,967 of 559,967** draws.
+- **Viewport.** Still 559,967/559,967.
+- **Faults.** 0, live=61.
+
+**Positive control** (+1.0 on every constant): 23,924,519 slots compared and
+**0 match**. The only draws counted as "all matching" are the 5,431 before
+any constant was written.
+
+So the constant numbering (D3D register + 96) is confirmed, and every
+constant a draw reads through D3D's API reaches the GPU unchanged. Next: the
+pixel shader. In XDK 4134 its combiner setup lives in D3D's render-state
+array, which the engine writes inline, so the array's layout comes first.

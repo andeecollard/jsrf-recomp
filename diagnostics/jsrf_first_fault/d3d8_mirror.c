@@ -39,6 +39,20 @@ static void m_set_state(uint32_t method, uint32_t value)
     for (unsigned k = 0; k < 11; ++k)
         if (m_state_methods[k] == method) { m_state_val[k] = value; m_state_seen |= 1u << k; }
 }
+/* SetVertexShaderConstant(Register, pConstantData, ConstantCount): copy what
+ * D3D was handed, after the original ran. NV2A slot = Register + 96. */
+static float m_vc[192][4];
+static uint32_t m_vc_written[6];
+void d3d8m_vs_constant(uint32_t reg, uint32_t data, uint32_t count)
+{
+    int32_t first = (int32_t)reg + 96;
+    for (uint32_t i = 0; i < count && i < 192u; ++i) {
+        int32_t slot = first + (int32_t)i;
+        if (slot < 0 || slot >= 192) continue;
+        for (int k = 0; k < 4; ++k) { uint32_t u = MEM32(data + 16u * i + 4u * (uint32_t)k); memcpy(&m_vc[slot][k], &u, 4); }
+        m_vc_written[slot / 32] |= 1u << (slot % 32);
+    }
+}
 void d3d8m_zenable(uint32_t v)       { m_set_state(0x30Cu, v != 0); }
 void d3d8m_stencilenable(uint32_t v) { m_set_state(0x32Cu, v != 0); }
 
@@ -80,6 +94,7 @@ void d3d8m_after_draw(void)
         { uint32_t u; u = MEM32(d + 0x9E0u); memcpy(&c.vp_minz, &u, 4); u = MEM32(d + 0x9E4u); memcpy(&c.vp_maxz, &u, 4);
           u = MEM32(d + 0x454u); memcpy(&c.ss_x, &u, 4); u = MEM32(d + 0x458u); memcpy(&c.ss_y, &u, 4); } }
     memcpy(c.st_val, m_state_val, sizeof c.st_val); c.st_seen = m_state_seen;
+    memcpy(c.vc, m_vc, sizeof c.vc); memcpy(c.vc_written, m_vc_written, sizeof c.vc_written);
         {   /* Positive control for the surface check: RECOMP_D3D8_MIRROR_CONTROL=1
          * swaps the colour and depth addresses, so every draw MUST mismatch. */
         static int ctl = -1;
@@ -87,7 +102,8 @@ void d3d8m_after_draw(void)
                        if (ctl) fprintf(stderr, "[D3D8-MIRROR] POSITIVE CONTROL: colour/depth addresses swapped\n"); }
         if (ctl) { uint32_t t = c.rt_data; c.rt_data = c.zs_data; c.zs_data = t;
                    c.vp_x += 1; c.vp_minz += 0.5f;                      /* viewport must mismatch */
-                   for (unsigned k = 0; k < 11; ++k) c.st_val[k] ^= 1u; } }   /* every state too */
+                   for (unsigned k = 0; k < 11; ++k) c.st_val[k] ^= 1u;       /* every state too */
+                   for (unsigned k = 0; k < 192; ++k) c.vc[k][0] += 1.0f; } } /* and every constant */
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);
