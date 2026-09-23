@@ -28,6 +28,8 @@ typedef struct {
     unsigned long methods;      /* methods dispatched to PGRAPH */
     unsigned long unhandled;    /* methods PGRAPH did not implement */
     unsigned long bad_headers;  /* dwords that decoded as neither header form */
+    unsigned long host_tokens;  /* NV2A_HOST_TOKEN packets delivered to the host handler */
+    unsigned long subch7_other; /* anything else on subchannel 7: must stay 0 */
 } NV2APusherStats;
 
 /**
@@ -60,6 +62,32 @@ NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwor
  * must wait for its acknowledgement before returning. Zero remains padding. */
 typedef void (*NV2ASoftwareMethodHandler)(uint32_t subchannel, uint32_t parameter);
 void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler);
+
+/* HOST TOKENS -- ORDERED CALLBACKS THROUGH THE GUEST'S OWN RING (G35).
+ *
+ * A D3D entry point replaced by host code must not draw on the thread that
+ * called it: the ring still carries everything else the guest submitted, and
+ * this consumer executes it later, on its own thread. A host draw made at call
+ * time would land out of order with the draws around it.
+ *
+ * So a replacement writes one packet into the ring where the original would
+ * have written its commands: subchannel 7, method NV2A_HOST_TOKEN_METHOD, one
+ * parameter naming its queued work. When the consumer reaches it, in ring
+ * order, the handler runs the work. XDK 4134's D3D binds its only object to
+ * subchannel 0 and never uses 7; subch7_other counts any traffic there that is
+ * not a token, and must read 0.
+ *
+ * One parameter per packet, or a NON-INCREASING header (bit 30) for several:
+ * the method is the last one below 0x2000, so an increasing header with a
+ * count above 1 runs past it and the parser refuses the packet as invalid.
+ *
+ * Tokens are consumed here and never reach PGRAPH or the executor. With no
+ * handler installed they are still consumed, and counted, rather than handed
+ * to PGRAPH as an unknown method. */
+#define NV2A_HOST_TOKEN_SUBCHANNEL 7u
+#define NV2A_HOST_TOKEN_METHOD     0x1FFCu
+typedef void (*NV2AHostTokenHandler)(uint32_t parameter);
+void nv2a_pusher_set_host_token_handler(NV2AHostTokenHandler handler);
 
 /* Walk a segment exactly as run_segment does, but dispatch nothing and count
  * nothing. For asking "would this data have parsed?" of a buffer that has

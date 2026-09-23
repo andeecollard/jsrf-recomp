@@ -1137,6 +1137,13 @@ add_executable(jsrf_pusher_stream_test pusher_stream_test.c
 target_include_directories(jsrf_pusher_stream_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_pusher_stream COMMAND jsrf_pusher_stream_test)
 
+# G35: host tokens -- replaced D3D entry points queue host work behind a
+# subchannel-7 packet in the ring, and the consumer runs it in ring order.
+add_executable(jsrf_pusher_token_test pusher_token_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c")
+target_include_directories(jsrf_pusher_token_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_pusher_token COMMAND jsrf_pusher_token_test)
+
 # The backport checks below patch specific sites in the GENERATED tree, from
 # when that tree was preserved rather than regenerated. A backport is retired
 # the moment the lifter emits the fixed form by itself: the check then passes

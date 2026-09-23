@@ -1335,9 +1335,11 @@ static void jsrf_pusher_report(void)
          * published the counter verbatim -- the bug fixed in 5358eec. They
          * used to be labelled "idx put" and "get", which named neither. */
         fprintf(stderr, "  [PUSHER] runs=%lu dwords=%lu methods=%lu "
-                "unhandled=%lu bad_headers=%lu | clears=%u flips=%u draws=%u"
+                "unhandled=%lu bad_headers=%lu host_tokens=%lu subch7_other=%lu"
+                " | clears=%u flips=%u draws=%u"
                 " | put=0x%08X limit=0x%08X fence: counter=%u word=%u\n",
                 st.runs, st.dwords, st.methods, st.unhandled, st.bad_headers,
+                st.host_tokens, st.subch7_other,
                 ps.clears, ps.flips, ps.draw_calls,
                 MEM32(JSRF_PB_PUT_VA), MEM32(JSRF_PB_LIMIT_VA),
                 jsrf_pb_index(JSRF_D3D_FENCE_COUNTER_OFFSET),

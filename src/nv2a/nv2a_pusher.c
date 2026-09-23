@@ -49,6 +49,11 @@ void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler)
     g_software_method = handler;
 }
 static uint32_t g_unhandled[UNHANDLED_SLOTS];
+static NV2AHostTokenHandler g_host_token;
+void nv2a_pusher_set_host_token_handler(NV2AHostTokenHandler handler)
+{
+    g_host_token = handler;
+}
 
 /* Ring of the most recently dispatched methods.
  *
@@ -63,6 +68,16 @@ static unsigned long g_recent_idx;
 
 static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
 {
+    if (subchannel == NV2A_HOST_TOKEN_SUBCHANNEL) {
+        /* See nv2a_pusher.h: ours, in ring order, never PGRAPH's. */
+        if (method == NV2A_HOST_TOKEN_METHOD) {
+            g_stats.host_tokens++;
+            if (g_host_token) g_host_token(param);
+        } else {
+            g_stats.subch7_other++;
+        }
+        return;
+    }
     if (method == 0x100 && param && getenv("RECOMP_PB_NOTIFY_TRACE")) {
         static unsigned n;
         if (++n <= 16) fprintf(stderr, "[PB-NOP] subch=%u parameter=%08X\n", subchannel, param);

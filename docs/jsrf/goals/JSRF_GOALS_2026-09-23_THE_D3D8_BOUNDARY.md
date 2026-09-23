@@ -267,6 +267,40 @@ frames.
 
 Phases 3 and 4 of the spec are opened as goals when G35 passes, not before.
 
+### G35 design point, 23 Sep 2026: host work runs in ring order
+
+**The problem the spec glossed over.** Until the whole boundary is replaced,
+most of every frame still reaches the GPU through the ring, which the NV2A
+executor consumes on its own thread, behind the game. A replaced entry point
+that drew on the calling thread would land out of order with the ring's
+draws around it. It would draw too early, onto a target in the wrong state.
+
+**The mechanism.** A replacement queues its host work and writes one packet
+into the ring where the original wrote its commands: subchannel 7, method
+`NV2A_HOST_TOKEN_METHOD` (0x1FFC), with the queue slot as the parameter. The
+consumer (`nv2a_pusher.c: dispatch`) hands it to the registered handler in
+ring order, and it never reaches PGRAPH or the executor.
+- **Why not a nonzero NOP.** A nonzero `NO_OPERATION` is not usable: it is
+  a software method that raises a guest interrupt, which D3D uses for its own
+  notifications.
+- **Packet form.** Several tokens need a non-increasing header, because an
+  increasing header with a count above 1 runs past 0x2000 and the parser
+  refuses it.
+
+**Verified.** `jsrf_pusher_token_test`: tokens interleave correctly with
+PGRAPH methods, are consumed with or without a handler, are skipped by
+scans, and an increasing multi-token packet is refused. In the game, a
+silenced 120 s run (live=61, 0 faults) shows 253,361,901 methods with
+**`subch7_other=0`**, **`host_tokens=0`** and `bad_headers=0`, so the
+title never uses subchannel 7 and the channel is free.
+
+**Next for G35.** The first real replacement has to draw into the same
+Metal render target the NV2A path is drawing into at that point in the
+ring. So the host renderer's first dependency is the backend's current
+surface, not a surface of its own. The candidates, by the census, are
+`Clear` (2.5 per frame) and the font's immediate-mode `Begin`/`End`
+(1.5 per frame).
+
 ## The order
 
 1. **G32.** Reading only. It is needed by both G33 and G34. **DONE 23 Sep.**
