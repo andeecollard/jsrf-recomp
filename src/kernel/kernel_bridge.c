@@ -2134,6 +2134,16 @@ static void bridge_NtSetEvent(void)
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
 }
 
+/* NtSetEvent for host code holding a guest event HANDLE -- the XInput lift
+ * completes XInputSetState's hEvent this way, as the USB model's completion
+ * path would have. Returns the NTSTATUS. */
+uint32_t xbox_BridgeSetEventHandle(uint32_t token)
+{
+    HANDLE handle = bridge_resolve_handle(token);
+    if (!handle) return 0xC0000008u;   /* STATUS_INVALID_HANDLE */
+    return (uint32_t)xbox_NtSetEvent(handle, NULL);
+}
+
 /* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
 /* Signal-then-reset: releases threads currently waiting, then leaves the event
  * non-signalled. Same unbridged-no-op hazard as NtSetEvent in the map-load

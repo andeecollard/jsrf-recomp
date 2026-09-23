@@ -102,6 +102,13 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    # Milliseconds and a port number, not booleans: the XInput lift's pad
+    # enumeration delay and which port the host pad occupies (G49).
+    "RECOMP_XINPUT_ENUM_MS",
+    "RECOMP_XINPUT_PORT",
+    # A list of entry-point names, not a boolean: lifted functions whose
+    # original body runs anyway (G49 bisect tool, stage_dsound_census.py).
+    "RECOMP_LIFT_SKIP",
     # Milliseconds, not a boolean: how far ahead of consumption the DSOUND
     # lift reports a stream buffer's cursor (G46 intro garble, dsound_lift.c).
     "RECOMP_DSOUND_STREAM_LEAD_MS",

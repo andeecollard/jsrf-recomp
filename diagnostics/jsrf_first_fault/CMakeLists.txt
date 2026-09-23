@@ -156,10 +156,11 @@ elseif(JSRF_DSOUND_LIFT)
     find_program(JSRF_PYTHON3 NAMES python3 REQUIRED)
     set(_ds_overlay "${CMAKE_BINARY_DIR}/dsound_overlay")
     set(_ds_stage "${CMAKE_CURRENT_SOURCE_DIR}/stage_dsound_census.py")
-    set(_ds_entries "${XBOXRECOMP_DIR}/experiments/dsound_boundary/entry_points.json")
+    set(_ds_entries "${XBOXRECOMP_DIR}/experiments/dsound_boundary/entry_points.json"
+                    "${XBOXRECOMP_DIR}/experiments/xinput_boundary/entry_points.json")
     execute_process(
         COMMAND "${JSRF_PYTHON3}" "${_ds_stage}" "${RECOMP_GEN_DIR}" "${_ds_overlay}"
-                --entries "${_ds_entries}" --lift --overlay
+                --entries ${_ds_entries} --lift --overlay
         RESULT_VARIABLE _ds_rc OUTPUT_VARIABLE _ds_out ERROR_VARIABLE _ds_err)
     if(NOT _ds_rc EQUAL 0)
         message(FATAL_ERROR "DSOUND lift overlay failed (set -DJSRF_DSOUND_LIFT=OFF to build without it):\n${_ds_out}${_ds_err}")
@@ -177,7 +178,8 @@ elseif(JSRF_DSOUND_LIFT)
     endforeach()
     # Re-stage when any input changes, including the two generated files.
     file(STRINGS "${_ds_overlay}/DSOUND_CENSUS_MANIFEST.txt" _ds_manifest REGEX "^sub_.* file=")
-    set(_ds_deps "${_ds_stage}" "${_ds_entries}" "${CMAKE_CURRENT_SOURCE_DIR}/dsound_lift.c")
+    set(_ds_deps "${_ds_stage}" ${_ds_entries} "${CMAKE_CURRENT_SOURCE_DIR}/dsound_lift.c"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/xinput_lift.c")
     foreach(_l IN LISTS _ds_manifest)
         string(REGEX REPLACE ".* file=" "" _gf "${_l}")
         list(APPEND _ds_deps "${RECOMP_GEN_DIR}/${_gf}")

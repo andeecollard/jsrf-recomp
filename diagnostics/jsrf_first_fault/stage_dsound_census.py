@@ -17,6 +17,12 @@ from pathlib import Path
 
 DS_LO, DS_HI = 0x0019E340, 0x001BA8A0
 
+# Lifted libraries: prefix of the host bodies, their source file, the switch.
+LIFT = {
+    "dsound": ("dsl", "dsound_lift.c", "RECOMP_DSOUND_LIFT=1"),
+    "xinput": ("xil", "xinput_lift.c", "RECOMP_XINPUT_LIFT=1"),
+}
+
 # Argument logging: name -> (number of stack args to capture, post-call hook).
 # Captured before the original runs (the callee pops them), logged after it
 # returns, so out-parameters and eax are visible.
@@ -51,6 +57,9 @@ LOGGED = {
     "IDirectSound_SetEffectData": 6,
     "IDirectSound_SetI3DL2Listener": 3,
     "IDirectSound_SetAllParameters": 3,
+    # G49, the input boundary.
+    "XInitDevices": 2, "XGetDevices": 1, "XGetDeviceChanges": 3, "XInputOpen": 4,
+    "XInputClose": 1, "XInputGetCapabilities": 2, "XInputSetState": 2, "XInputPoll": 1,
 }
 # Entry points whose second argument points at a structure: log its first
 # dwords, so the question "set to what" has an answer.
@@ -108,6 +117,27 @@ static void dsc_print(const char *why)
     fflush(stderr);
 }
 static void dsc_exit(void) { dsc_print("exit"); }
+
+/* RECOMP_LIFT_SKIP=<name>[,<name>...]: run the ORIGINAL body of these lifted
+ * entry points even with their lift armed -- the bisect tool for a lift that
+ * breaks something (G49). Decided once per entry point. */
+int lift_skip(unsigned idx, const char *name)
+{
+    static signed char cache[DSC_N];
+    if (idx >= DSC_N) return 0;
+    if (!cache[idx]) {
+        const char *e = getenv("RECOMP_LIFT_SKIP");
+        int hit = 0;
+        if (e && *e) {
+            size_t n = strlen(name);
+            for (const char *p = e; (p = strstr(p, name)) != NULL; p += n)
+                if ((p == e || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) { hit = 1; break; }
+        }
+        cache[idx] = hit ? 1 : -1;
+        if (hit) fprintf(stderr, "[LIFT] %%s: skipped by RECOMP_LIFT_SKIP, original runs\n", name);
+    }
+    return cache[idx] > 0;
+}
 
 int dsc_arm(void)
 {
@@ -208,7 +238,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("source", type=Path)
     ap.add_argument("destination", type=Path)
-    ap.add_argument("--entries", type=Path, required=True)
+    ap.add_argument("--entries", type=Path, required=True, nargs="+",
+                    help="one or more entry_points.json; an entry's \"lib\" field (default dsound) picks its "
+                         "lift file and switch: dsound -> dsound_lift.c dsl_*, xinput -> xinput_lift.c xil_*")
     ap.add_argument("--shadow", action="store_true",
                     help="G48 phase 3: replay every logged call into the host model (dsound_shadow.c) and "
                          "compare its GetStatus/GetCurrentPosition with DSOUND's; RECOMP_DSOUND_SHADOW=1 arms it")
@@ -228,7 +260,9 @@ def main():
             shutil.rmtree(dst)
     elif dst.exists():
         raise SystemExit("destination exists: %s" % dst)
-    entries = json.load(open(a.entries))
+    entries = []
+    for ef in a.entries:
+        entries += json.load(open(ef))
     files = {p: p.read_text() for p in sorted(src.glob("recomp_*.c"))}
     plan = {}
     for idx, e in enumerate(entries):
@@ -237,12 +271,13 @@ def main():
         if len(found) != 1 or found[0][1] is None:
             raise SystemExit("expected exactly one body for %s, found %d" % (name, len(found)))
         plan[name] = (idx, e, found[0][0], found[0][1])
-    lift_text = Path(__file__).with_name("dsound_lift.c").read_text() if a.lift else ""
+    libs = sorted({e.get("lib", "dsound") for e in entries})
+    lift_text = {lib: Path(__file__).with_name(LIFT[lib][1]).read_text() for lib in libs} if a.lift else {}
     if a.lift:
-        missing = [e["name"] for e in entries if ("void dsl_%s(void)" % e["name"]) not in lift_text
-                   and ("NOOP(%s," % e["name"]) not in lift_text]
-        if missing:
-            raise SystemExit("dsound_lift.c has no body for: %s" % ", ".join(missing))
+        for e in entries:
+            lib = e.get("lib", "dsound"); pre = LIFT[lib][0]; t = lift_text[lib]
+            if ("void %s_%s(void)" % (pre, e["name"])) not in t and ("NOOP(%s," % e["name"]) not in t:
+                raise SystemExit("%s has no body for: %s" % (LIFT[lib][1], e["name"]))
     if a.overlay:
         dst.mkdir(parents=True)
     else:
@@ -265,9 +300,12 @@ def main():
             text = text[:start] + body.replace("void %s(void)" % name, "static void dsc_orig_%s(void)" % name, 1) + text[end:]
             run = "dsc_orig_%s" % name
             if a.lift:
+                pre = LIFT[e.get("lib", "dsound")][0]
                 run = "dsc_run_%s" % name
-                wrappers.append("int dsl_on(void); void dsl_%s(void);" % e["name"])
-                wrappers.append("static void %s(void) { if (dsl_on()) dsl_%s(); else dsc_orig_%s(); }" % (run, e["name"], name))
+                wrappers.append("int %s_on(void); void %s_%s(void); int lift_skip(unsigned idx, const char *name);"
+                                % (pre, pre, e["name"]))
+                wrappers.append("static void %s(void) { if (%s_on() && !lift_skip(%du, \"%s\")) %s_%s(); else dsc_orig_%s(); }"
+                                % (run, pre, idx, e["name"], pre, e["name"], name))
             nargs = LOGGED.get(e["name"], 0)
             cap = ""
             log = ""
@@ -297,8 +335,10 @@ def main():
         rets=", ".join("%du" % r for r in rets), lo=DS_LO, hi=DS_HI,
         struct_test=" || ".join('!strcmp(name, "%s")' % n for n in sorted(STRUCT_ARG1))))
     if a.lift:
-        shutil.copyfile(Path(__file__).with_name("dsound_lift.c"), dst / "recomp_zz_dsound_lift.c")
-        manifest.append("lift: recomp_zz_dsound_lift.c (RECOMP_DSOUND_LIFT=1)")
+        for lib in libs:
+            out = "recomp_zz_%s" % LIFT[lib][1]
+            shutil.copyfile(Path(__file__).with_name(LIFT[lib][1]), dst / out)
+            manifest.append("lift: %s (%s)" % (out, LIFT[lib][2]))
     if a.shadow:
         shutil.copyfile(Path(__file__).with_name("dsound_shadow.c"), dst / "recomp_zz_dsound_shadow.c")
         manifest.append("shadow: recomp_zz_dsound_shadow.c (RECOMP_DSOUND_SHADOW=1)")

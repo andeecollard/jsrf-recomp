@@ -178,6 +178,20 @@ void xbox_SetUsbPadRumbleHook(void (*fn)(uint16_t left, uint16_t right))
     g_pad_rumble = fn;
 }
 
+/* The same host pad, reached WITHOUT the USB model: the XInput lift (G49)
+ * answers XInputGetState/SetState from these directly, so no OHCI transfer,
+ * XID report or XPP DPC stands between the host controller and the title.
+ * Returns what the state hook returns (nonzero = a pad is present). */
+int xbox_UsbPadReadHost(uint8_t report[XBOX_USB_PAD_REPORT])
+{
+    return g_pad_state ? g_pad_state(report) : 0;
+}
+
+void xbox_UsbPadRumbleHost(uint16_t left, uint16_t right)
+{
+    if (g_pad_rumble) g_pad_rumble(left, right);
+}
+
 /* Consume one output report. Only the XID rumble report (id 0, length 6) is
  * known; anything else is accepted and dropped, because a device that stalls
  * an output it does not understand gets torn down by XPP -- see the

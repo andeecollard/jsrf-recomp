@@ -1,0 +1,156 @@
+[
+ {
+  "address": "0x001BCBCC",
+  "name": "XInitDevices",
+  "ret_bytes": [
+   8
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_001BD5FA"
+  ],
+  "caller_sections": [
+   "XPP"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001BD5FF",
+  "name": "XGetDevices",
+  "ret_bytes": [
+   4
+  ],
+  "call_sites": 10,
+  "callers": [
+   "sub_00046FD0",
+   "sub_0005F250",
+   "sub_00071090",
+   "sub_00071CB0",
+   "sub_00119800",
+   "sub_001274D0",
+   "sub_00134890",
+   "sub_00134970",
+   "sub_00139430",
+   "sub_001669A0"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001BD621",
+  "name": "XGetDeviceChanges",
+  "ret_bytes": [
+   12
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_001669A0"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001C3BA1",
+  "name": "XInputOpen",
+  "ret_bytes": [
+   16
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_00166CD0"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001C3C16",
+  "name": "XInputClose",
+  "ret_bytes": [
+   4
+  ],
+  "call_sites": 2,
+  "callers": [
+   "sub_00166CD0",
+   "sub_00167E20"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001C3C22",
+  "name": "XInputGetCapabilities",
+  "ret_bytes": [
+   8
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_00166CD0"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001C3E14",
+  "name": "XInputGetState",
+  "ret_bytes": [
+   8
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_00167180"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001C3E85",
+  "name": "XInputSetState",
+  "ret_bytes": [
+   8
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_00167180"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ },
+ {
+  "address": "0x001C3EBD",
+  "name": "XInputPoll",
+  "ret_bytes": [
+   4
+  ],
+  "call_sites": 1,
+  "callers": [
+   "sub_00167180"
+  ],
+  "caller_sections": [
+   ".text"
+  ],
+  "data_refs": 0,
+  "lib": "xinput"
+ }
+]

@@ -153,6 +153,10 @@ void xbox_SetUsbPadStateHook(int (*fn)(uint8_t report[XBOX_USB_PAD_REPORT]));
  * the host pad; without one the report is consumed and forgotten, which is
  * still a completed transfer rather than a stalled one. */
 void xbox_SetUsbPadRumbleHook(void (*fn)(uint16_t left, uint16_t right));
+
+/* The host pad without the USB model, for the XInput lift (G49). */
+int  xbox_UsbPadReadHost(uint8_t report[XBOX_USB_PAD_REPORT]);
+void xbox_UsbPadRumbleHost(uint16_t left, uint16_t right);
 int xbox_UsbOutputReport(const uint8_t *data, uint32_t len);
 
 /**
