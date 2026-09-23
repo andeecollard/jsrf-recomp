@@ -29,6 +29,7 @@
 #include "adx_guard.h"
 
 #include <pthread.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -348,6 +349,66 @@ static void run_unmatched_contended(int guarded)
     }
 }
 
+/* A HOLDER THAT BLOCKS STOPS EXCLUDING, AND RE-TAKES ITS NESTING ON WAKING.
+ * Priority elevation only excludes while the elevated thread runs: see
+ * adx_guard.h, THE GUARD IS PRIORITY. A holds the guard two deep and "blocks";
+ * B must then get in, and A's wake must wait for B to leave and come back two
+ * deep. The 23 Sep 17:13 session froze because this could not happen. */
+static volatile int blk_stage;
+static unsigned blk_saved;
+static void *blk_a(void *u)
+{
+    (void)u;
+    adx_guard_lock_enter(); adx_guard_lock_enter();      /* depth 2 */
+    blk_stage = 1;
+    while (blk_stage < 2) usleep(1000);
+    blk_saved = adx_guard_block_begin();                 /* A blocks in a kernel wait */
+    blk_stage = 3;
+    while (blk_stage < 4) usleep(1000);                  /* B is inside now */
+    adx_guard_block_end(blk_saved);                      /* must wait for B */
+    blk_stage = 6;
+    { struct adx_guard_stats st; adx_guard_read_stats(&st); blk_saved = st.depth; }
+    if (adx_guard_unlock_enter()) adx_guard_unlock_leave();
+    if (adx_guard_unlock_enter()) adx_guard_unlock_leave();
+    return NULL;
+}
+static void *blk_b(void *u)
+{
+    (void)u;
+    while (blk_stage < 1) usleep(1000);
+    blk_stage = 2;
+    adx_guard_lock_enter();                              /* blocks until A blocks */
+    blk_stage = 4;
+    usleep(150 * 1000);                                  /* A wakes meanwhile and must wait */
+    blk_stage = 5;
+    if (adx_guard_unlock_enter()) adx_guard_unlock_leave();
+    return NULL;
+}
+static void run_block_release(int guarded)
+{
+    pthread_t a, b; int i;
+    if (!guarded) return;
+    adx_guard_reset_for_test();
+    CHECK(adx_guard_block_begin() == 0, "a thread holding nothing must get 0 back");
+    adx_guard_block_end(0);
+    blk_stage = 0;
+    pthread_create(&a, NULL, blk_a, NULL);
+    pthread_create(&b, NULL, blk_b, NULL);
+    for (i = 0; i < 5000 && blk_stage < 4; ++i) usleep(1000);
+    CHECK(blk_stage >= 4, "B never got in while A was blocked (stage %d)", blk_stage);
+    CHECK(blk_saved == 2, "A's nesting at the block should be 2, saved %u", blk_saved);
+    for (i = 0; i < 100 && blk_stage < 5; ++i) {
+        CHECK(blk_stage != 6, "A re-took the guard while B was still inside");
+        usleep(1000);
+    }
+    pthread_join(a, NULL); pthread_join(b, NULL);
+    CHECK(blk_stage == 6, "A never woke (stage %d)", blk_stage);
+    CHECK(blk_saved == 2, "A should be two deep again after waking, is %u", blk_saved);
+    { struct adx_guard_stats st; adx_guard_read_stats(&st);
+      CHECK(st.depth == 0 && st.owner == 0, "guard not free at the end (depth %u owner %lu)", st.depth, st.owner);
+      CHECK(st.block_releases == 1, "block_releases should be 1, is %lu", st.block_releases); }
+}
+
 int main(int argc, char **argv)
 {
     int guarded = adx_guard_on();
@@ -371,6 +432,7 @@ int main(int argc, char **argv)
     run_recursive();
     run_unmatched();
     run_unmatched_contended(guarded);
+    run_block_release(guarded);
     adx_guard_report();
 
     fprintf(stderr, "%s\n", fail ? "FAILED" : "ok");

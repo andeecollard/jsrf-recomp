@@ -1751,6 +1751,20 @@ void xbox_SetWaitPollHook(void (*fn)(void))
     s_wait_poll_hook = fn;
 }
 
+/* Called around the part of a guest wait that really blocks: begin just
+ * before the first sleep of a wait that was not already satisfied, end on
+ * every return after that. The owner (main.c) uses them to model priority
+ * elevation, which stops excluding other threads while the elevated thread is
+ * blocked -- see adx_guard.h. Not called for a wait that returns without
+ * sleeping, because an elevated thread that never blocks never yields. */
+static unsigned (*s_block_begin)(void);
+static void (*s_block_end)(unsigned);
+void xbox_SetBlockingWaitHooks(unsigned (*begin)(void), void (*end)(unsigned))
+{
+    s_block_begin = begin;
+    s_block_end = end;
+}
+
 /* Defined with the scheduling bridges below; used here too. */
 static int sched_trace_on(void);
 /* These were file-scope, and shared by every guest thread in this function.
@@ -1776,6 +1790,8 @@ static void bridge_KeWaitForSingleObject(void)
     int infinite;
     /* Per-thread, deliberately: see the note where these used to be globals. */
     unsigned long *sched_woke = NULL, *sched_timeout = NULL;
+    int blocked = 0;              /* this wait has slept at least once */
+    unsigned block_saved = 0;     /* what s_block_begin handed back */
 
     if (alertable && bridge_deliver_pending_apcs()) {
         g_eax = 0x000000C0u;   /* STATUS_USER_APC */
@@ -1822,11 +1838,13 @@ static void bridge_KeWaitForSingleObject(void)
                 DISPATCHER_SIGNALSTATE(object) = 0;
             }
             if (sched_woke) ++*sched_woke;
+            if (blocked && s_block_end) s_block_end(block_saved);
             g_eax = 0;   /* STATUS_SUCCESS */
             return;
         }
         if (!infinite && (int32_t)(GetTickCount() - deadline) >= 0) {
             if (sched_timeout) ++*sched_timeout;
+            if (blocked && s_block_end) s_block_end(block_saved);
             g_eax = 0x00000102u;   /* STATUS_TIMEOUT */
             return;
         }
@@ -1852,6 +1870,10 @@ static void bridge_KeWaitForSingleObject(void)
 #if !defined(_WIN32)
         w32_thread_suspend_point();
 #endif
+        if (!blocked) {
+            blocked = 1;
+            if (s_block_begin) block_saved = s_block_begin();
+        }
         /* How long to wait before looking again.
          *
          * This was Sleep(1), and Sleep(1) is nanosleep(1 ms), which on macOS

@@ -216,6 +216,43 @@ static void guard_release(void)
     pthread_mutex_unlock(&g_m);
 }
 
+/* See adx_guard.h: a holder that blocks in a kernel wait stops excluding. */
+unsigned adx_guard_block_begin(void)
+{
+    unsigned saved = 0;
+    pthread_mutex_lock(&g_m);
+    if (t_depth > 0 && g_owner == my_id()) {
+        saved = t_depth;
+        t_depth = 0;
+        g_depth = 0;
+        g_owner = 0;
+        g_owner_tid = 0;
+        ++g_st.block_releases;
+        g_st.depth = 0;
+        g_st.owner = 0;
+        pthread_cond_broadcast(&g_cv);
+    }
+    pthread_mutex_unlock(&g_m);
+    return saved;
+}
+
+void adx_guard_block_end(unsigned saved_depth)
+{
+    int contended;
+    if (!saved_depth) return;
+    pthread_mutex_lock(&g_m);
+    contended = g_owner != 0 && g_owner != my_id();
+    if (contended) ++g_st.block_reacquires_contended;
+    pthread_mutex_unlock(&g_m);
+    guard_acquire();                       /* one level, waiting like any entrant */
+    pthread_mutex_lock(&g_m);
+    t_depth = saved_depth;                 /* the nesting the wait interrupted */
+    g_depth = saved_depth;
+    if (t_depth > g_st.max_depth) g_st.max_depth = t_depth;
+    g_st.depth = g_depth;
+    pthread_mutex_unlock(&g_m);
+}
+
 void adx_guard_lock_enter(void)
 {
     if (!adx_guard_on()) return;
@@ -286,6 +323,9 @@ void adx_guard_report(void)
             adx_guard_on() ? "on" : "OFF",
             s.locks, s.unlocks_matched, s.unlocks_unmatched,
             s.unlocks_skipped, s.contended, s.max_depth, s.depth);
+    fprintf(stderr, "  [ADX-GUARD] released while the holder blocked in a kernel wait: %lu"
+                    " (re-taken after waiting for another entrant: %lu)\n",
+            s.block_releases, s.block_reacquires_contended);
     if (s.depth)
         fprintf(stderr, "  [ADX-GUARD] held right now by t_id %lu, thread %llu"
                         " -- if this is the same thread every report, it is"

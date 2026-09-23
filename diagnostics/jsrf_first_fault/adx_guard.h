@@ -98,6 +98,8 @@ struct adx_guard_stats {
     unsigned      max_depth;         /* deepest nesting reached */
     unsigned      depth;             /* nesting held right now */
     unsigned long owner;             /* id of the holder, 0 when free */
+    unsigned long block_releases;    /* holder blocked in a kernel wait: guard let go */
+    unsigned long block_reacquires_contended; /* ...and on waking had to wait for it */
 };
 
 int  adx_guard_on(void);            /* RECOMP_ADX_SERIALIZE, value-aware */
@@ -124,6 +126,27 @@ int  adx_guard_unlock_enter(void);
 void adx_guard_unlock_leave(void);
 
 void adx_guard_read_stats(struct adx_guard_stats *out);
+
+/* THE GUARD IS PRIORITY, AND PRIORITY ENDS WHEN THE HOLDER BLOCKS.
+ *
+ * Priority elevation excludes other threads only while the elevated thread is
+ * RUNNING. When it blocks -- a kernel wait that is not already satisfied --
+ * the single CPU goes to whoever is runnable, and a normal-priority thread may
+ * then enter the region: its lock takes the `jne` path and changes no priority.
+ * The guard modelled elevation as a lock held from lock to unlock, so a holder
+ * that waited inside the region kept every other thread out for the whole
+ * wait. Player session of 23 Sep 2026 (17:13, 820 s): the ADX thread held the
+ * guard across a loop of D3DDevice_BlockUntilVerticalBlank waits
+ * (sub_0013B1C0), the main thread waited for the guard in sub_0013B0A0, and
+ * the picture froze at t=780 s with 8 stalls reported.
+ *
+ * So the kernel's blocking waits call these around the part that actually
+ * blocks: begin releases the guard completely if this thread holds it and
+ * returns the nesting to restore (0 if it held nothing); end re-takes it --
+ * waiting like any other entrant if someone else is inside now -- and restores
+ * the nesting. Installed as the kernel's blocking-wait hooks by main.c. */
+unsigned adx_guard_block_begin(void);
+void     adx_guard_block_end(unsigned saved_depth);
 void adx_guard_report(void);        /* one [ADX-GUARD] line on stderr */
 
 /* Tests only: forget every thread's nesting and free the guard. */

@@ -5019,6 +5019,14 @@ int main(int argc, char **argv)
     {
         extern void xbox_SetWaitPollHook(void (*)(void));
         xbox_SetWaitPollHook(jsrf_pump_host_events);
+        /* The ADX guard models priority elevation, which a blocked holder no
+         * longer exerts -- see adx_guard.h, THE GUARD IS PRIORITY. */
+        {   extern void xbox_SetBlockingWaitHooks(unsigned (*)(void), void (*)(unsigned));
+            if (adx_guard_on()) {
+                xbox_SetBlockingWaitHooks(adx_guard_block_begin, adx_guard_block_end);
+                fprintf(stderr, "  [ADX-GUARD] blocking-wait release installed: a holder that"
+                                " blocks in KeWaitForSingleObject lets the region go until it wakes\n");
+            } }
     }
 #endif
     /* Diagnostic only: RECOMP_TOTAL_RAM_MB maps more than a retail console has.
