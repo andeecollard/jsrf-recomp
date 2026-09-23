@@ -241,3 +241,12 @@ Also from upstream's open PRs, already equivalent in our tree: #102
 GET_REPORT, under the XInput lift) and #103/#108 (the software sampler and
 rasteriser; JSRF draws on Metal). Worth a look: #119 (KeQuerySystemTime
 resolution).
+
+**G56, first sample (24 Sep).** The first site, in `sub_0012D120`, is a `jp`
+at `loc_00100058`, the first instruction after an entry the recompiler split
+off. The flags it tests were set by code in the preceding function, and the
+lifter does not carry flags across a function boundary. So part of G56 is
+function splitting (flags live across a split point), not missing instruction
+support. The census must classify each site as "producer in this function"
+or "producer across a boundary"; the fixes differ: lifter semantics versus
+merging or carrying flags at split entries.
