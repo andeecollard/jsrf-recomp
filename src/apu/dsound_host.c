@@ -21,6 +21,8 @@ typedef struct voice {
     int      playing, looping;
     uint64_t pos;                   /* frames, 32.32 fixed point */
     float    mat[2][2];             /* [source channel][out L/R] */
+    uint32_t cursor_lead;           /* bytes reported ahead of consumption */
+    uint32_t mark;                  /* stream write mark, byte offset; UINT32_MAX = none */
     int      is3d;
     uint32_t mode3d;
     float    pos3d[3], min_d, max_d;
@@ -132,6 +134,7 @@ int dsh_buffer_create(uint32_t handle, const dsh_format *fmt, uint32_t data_va, 
     v->headroom = DSH_HEADROOM_DEFAULT;
     default_mat(v);
     v->min_d = 1.0f; v->max_d = 1e9f;
+    v->mark = UINT32_MAX;
     g_st.created++;
     unlock();
     return 0;
@@ -258,6 +261,15 @@ void dsh_set_mixbins(uint32_t handle, uint32_t n, const uint32_t *bins, const in
     unlock();
 }
 
+void dsh_set_cursor_lead(uint32_t handle, uint32_t bytes)
+{
+    lock(); voice *v = find(handle); if (v) v->cursor_lead = bytes; unlock();
+}
+void dsh_stream_mark(uint32_t handle, uint32_t end_offset)
+{
+    lock(); voice *v = find(handle); if (v) v->mark = v->bytes ? end_offset % v->bytes : UINT32_MAX; unlock();
+}
+
 void dsh_set_3d(uint32_t handle, int enabled)
 {
     lock(); voice *v = find(handle); if (v) v->is3d = enabled != 0; unlock();
@@ -346,6 +358,10 @@ void dsh_get_current_position(uint32_t handle, uint32_t *play, uint32_t *write)
         uint32_t f = (uint32_t)(v->pos >> FRAC_BITS);
         p = bytes_of(v, f);
         if (p >= v->bytes) p = 0;
+        if (v->cursor_lead) {
+            uint32_t a = v->fmt.block_align ? v->cursor_lead - v->cursor_lead % v->fmt.block_align : v->cursor_lead;
+            p = (p + a) % v->bytes;
+        }
         /* One mix quantum of source ahead: ~10 ms at the voice's rate, block
          * aligned. The title writes behind this, never between the two. */
         uint32_t rate = v->freq ? v->freq : v->fmt.rate;
@@ -465,6 +481,7 @@ void dsh_mix(int16_t *out, uint32_t frames)
             const uint32_t rate = v->freq ? v->freq : v->fmt.rate;
             const uint64_t step = ((uint64_t)rate << FRAC_BITS) / g_out_rate;
             const uint32_t tot = total_frames(v);
+            const uint32_t before = v->bytes ? bytes_of(v, (uint32_t)(v->pos >> FRAC_BITS)) % v->bytes : 0u;
             for (uint32_t i = 0; i < n; ++i) {
                 uint32_t f = (uint32_t)(v->pos >> FRAC_BITS);
                 if (v->looping) {
@@ -496,6 +513,12 @@ void dsh_mix(int16_t *out, uint32_t frames)
                     acc[2 * i + 1] += (int32_t)(g * g3r * (c0 * v->mat[0][1] + c1 * v->mat[1][1]));
                 }
                 v->pos += step;
+            }
+            if (v->mark != UINT32_MAX && v->playing && v->bytes) {
+                uint32_t after = bytes_of(v, (uint32_t)(v->pos >> FRAC_BITS)) % v->bytes;
+                uint32_t moved = (after + v->bytes - before) % v->bytes;
+                uint32_t to_mark = (v->mark + v->bytes - before) % v->bytes;
+                if (moved && to_mark && to_mark <= moved) { g_st.underruns++; v->mark = UINT32_MAX; }
             }
         }
         g_st.frames_mixed += n;

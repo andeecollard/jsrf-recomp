@@ -102,6 +102,9 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    # Milliseconds, not a boolean: how far ahead of consumption the DSOUND
+    # lift reports a stream buffer's cursor (G46 intro garble, dsound_lift.c).
+    "RECOMP_DSOUND_STREAM_LEAD_MS",
     # A path, not a boolean: where the DSOUND lift tees its mixed output as a
     # WAV (G48 §2a, src/apu/dsound_host_out.c).
     "RECOMP_DSOUND_LIFT_WAV",

@@ -104,15 +104,52 @@ static void owned_free(uint32_t va, uint32_t bytes)
     pthread_mutex_unlock(&g_m);
 }
 
+/* THE STREAM LEAD (G46, intro garble). For a buffer DSOUND owns -- the four
+ * CRI stream buffers -- every Lock is measured against the play cursor: how
+ * far AHEAD of it the title is writing, in ms. A healthy stream writes well
+ * ahead. A writer that has fallen behind writes a region the cursor is
+ * already inside ("overlap"), and what plays is half old, half new: garble.
+ * Histogram in the periodic report; the first 400 locks
+ * logged with their time, so the intro can be told from gameplay. */
+static _Atomic unsigned long g_lead_hist[8], g_lead_overlap, g_lead_n;
+static double g_t0;
+static double now_rel(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9 - g_t0;
+}
+static void lead_note(uint32_t h, uint32_t off, uint32_t n, uint32_t size)
+{
+    uint32_t play = 0, bps = MEM32(h + 24u);
+    if (!bps || !size || !(dsh_get_status(h) & DSH_STATUS_PLAYING)) return;
+    dsh_get_current_position(h, &play, NULL);
+    uint32_t lead = (off + size - play) % size;
+    int overlap = n && lead + n > size;                 /* the region covers the cursor */
+    double ms = (double)lead * 1000.0 / bps;
+    static const double edge[7] = { 5, 10, 20, 50, 100, 200, 300 };
+    unsigned b = 7;
+    for (unsigned i = 0; i < 7; ++i) if (ms < edge[i]) { b = i; break; }
+    atomic_fetch_add(&g_lead_hist[b], 1);
+    if (overlap) atomic_fetch_add(&g_lead_overlap, 1);
+    if (atomic_fetch_add(&g_lead_n, 1) < 400)
+        fprintf(stderr, "[DSOUND-LEAD] t=%.3f buf=%08X off=%u n=%u play=%u lead=%.1f ms%s\n",
+                now_rel(), h, off, n, play, ms, overlap ? "  <-- OVERLAP: writing under the cursor" : "");
+}
+
 static void report(const char *why)
 {
     dsh_stats s; dsh_get_stats(&s);
     fprintf(stderr, "[DSOUND-LIFT] %s calls=%lu buffers=%lu created=%lu released=%lu plays=%lu stops=%lu"
-            " playing=%lu frames_mixed=%lu missing_data=%lu refused=%lu formatless=%lu bad_handle=%lu"
+            " playing=%lu frames_mixed=%lu missing_data=%lu underruns=%lu refused=%lu formatless=%lu bad_handle=%lu"
             " effects=%u image_bad=%lu\n",
             why, (unsigned long)g_calls, s.buffers, s.created, s.released, s.plays, s.stops, s.playing,
-            s.frames_mixed, s.missing_data, (unsigned long)g_refused, (unsigned long)g_formatless,
+            s.frames_mixed, s.missing_data, s.underruns, (unsigned long)g_refused, (unsigned long)g_formatless,
             (unsigned long)g_bad_handle, g_img_count, (unsigned long)g_image_bad);
+    fprintf(stderr, "[DSOUND-LEAD] %s stream writes ahead of the cursor, ms: <5:%lu <10:%lu <20:%lu <50:%lu"
+            " <100:%lu <200:%lu <300:%lu >=300:%lu | overlapping the cursor: %lu\n", why,
+            (unsigned long)g_lead_hist[0], (unsigned long)g_lead_hist[1], (unsigned long)g_lead_hist[2],
+            (unsigned long)g_lead_hist[3], (unsigned long)g_lead_hist[4], (unsigned long)g_lead_hist[5],
+            (unsigned long)g_lead_hist[6], (unsigned long)g_lead_hist[7], (unsigned long)g_lead_overlap);
     fflush(stderr);
 }
 static void at_exit(void) { report("exit"); }
@@ -136,6 +173,7 @@ void dsl_DirectSoundCreate(void)
     if (!g_ds) {
         dsh_init(mem, 48000u);
         dsh_reset();
+        g_t0 = 0; g_t0 = now_rel();
         int out = dsh_output_start();
         g_ds = handle_alloc(MAGIC_DS);
         atexit(at_exit);
@@ -169,6 +207,24 @@ void dsl_IDirectSound_CreateSoundBuffer(void)
         dsh_format f = { MEM16(wf), MEM16(wf + 2u), MEM32(wf + 4u), MEM16(wf + 14u), MEM16(wf + 12u) };
         if (dsh_buffer_create(h, &f, owned, owned ? bytes : 0u) == 0) {
             set_mixbins_from(h, MEM32(d + 16u));
+            MEM32(h + 24u) = f.tag == 0x69u ? f.rate * f.block_align / 65u : f.rate * f.block_align;   /* bytes/s */
+            if (owned) {
+                /* A stream buffer: report its cursor ahead of consumption, as the
+                 * Xbox's fetch position is (dsound_host.h). */
+                static int lead_ms = -1;
+                if (lead_ms < 0) {
+                    const char *e = getenv("RECOMP_DSOUND_STREAM_LEAD_MS");
+                    /* Default 100: on the untouched intro, 90 s silenced, the
+                     * cursor overtook CRI's writer 680 times at 0 ms, 12 at
+                     * 100, 4 at 150. The cost is sync: anything the title
+                     * times off this cursor runs that much ahead of what is
+                     * heard, so keep it as small as does the job. */
+                    lead_ms = e && *e ? atoi(e) : 100;
+                    if (lead_ms < 0 || lead_ms > 300) lead_ms = 100;
+                    fprintf(stderr, "[DSOUND-LIFT] stream cursor lead %d ms\n", lead_ms);
+                }
+                dsh_set_cursor_lead(h, (uint32_t)((uint64_t)MEM32(h + 24u) * (uint32_t)lead_ms / 1000u));
+            }
             dsh_set_3d(h, (MEM32(d + 4u) & 0x10u) != 0);        /* DSBCAPS_CTRL3D */
         } else if (atomic_fetch_add(&g_refused, 1) < 20) {
             fprintf(stderr, "[DSOUND-LIFT] REFUSED format tag=%u ch=%u rate=%u bits=%u align=%u flags=%08X bytes=%u"
@@ -367,6 +423,7 @@ void dsl_IDirectSoundBuffer_Lock(void)
         p1 = base + off;
         n2 = n - n1;
         p2 = n2 ? base : 0u;
+        if (MEM32(h + 12u)) lead_note(h, off, n, size);
     }
     if (pp1) MEM32(pp1) = p1;
     if (pn1) MEM32(pn1) = n1;
@@ -374,7 +431,18 @@ void dsl_IDirectSoundBuffer_Lock(void)
     if (pn2) MEM32(pn2) = n2;
     ret_(32, 0);
 }
-void dsl_IDirectSoundBuffer_Unlock(void) { BUF_OR_BAIL(20); ret_(20, 0); }
+/* Unlock(pBuf, pv1, n1, pv2, n2): for a stream buffer, the end of what was
+ * just written is the mark the mixer's underrun count watches. */
+void dsl_IDirectSoundBuffer_Unlock(void)
+{
+    BUF_OR_BAIL(20);
+    uint32_t p1 = ARG(1), n1 = ARG(2), p2 = ARG(3), n2 = ARG(4), base = MEM32(h + 8u);
+    if (MEM32(h + 12u) && base) {
+        if (p2 && n2) dsh_stream_mark(h, p2 - base + n2);
+        else if (p1 && n1) dsh_stream_mark(h, p1 - base + n1);
+    }
+    ret_(20, 0);
+}
 
 /* Play(pBuf, dwReserved1, dwReserved2, dwFlags): LOOPING 1, FROMSTART 2. */
 void dsl_IDirectSoundBuffer_Play(void)

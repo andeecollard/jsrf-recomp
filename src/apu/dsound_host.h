@@ -91,6 +91,21 @@ void     dsh_set_listener_position(float x, float y, float z);
 void     dsh_set_listener_orientation(float fx, float fy, float fz, float tx, float ty, float tz);
 void     dsh_set_listener_factors(float distance_factor, float rolloff_factor);   /* <0 leaves one unchanged */
 
+/* STREAM BUFFERS (G46, the intro garble). A stream's writer -- CRI ADX --
+ * keeps only 10-60 ms written ahead of the play cursor, and refills once a
+ * frame; a frame gap longer than that lets the cursor overtake the writer and
+ * play a lap-old region. On the Xbox the cursor DSOUND reports is the APU's
+ * FETCH position, which runs ahead of what is heard, so the writer's real
+ * cushion is larger than it computes.
+ *   dsh_set_cursor_lead: report the cursor `bytes` ahead of what the mixer has
+ *     consumed (play and write both), so the writer keeps that much more
+ *     written. 0 = off.
+ *   dsh_stream_mark: the end of the region the writer just filled (byte offset
+ *     in the buffer). The mixer counts an UNDERRUN each time its cursor
+ *     crosses the latest mark -- playback overtaking the writer. */
+void     dsh_set_cursor_lead(uint32_t handle, uint32_t bytes);
+void     dsh_stream_mark(uint32_t handle, uint32_t end_offset);
+
 uint32_t dsh_get_status(uint32_t handle);
 /* The play cursor, and a write cursor one mix quantum ahead of it, both
  * wrapped into the buffer. Either pointer may be NULL. */
@@ -117,6 +132,7 @@ int      dsh_output_start(void);
 typedef struct dsh_stats {
     unsigned long buffers, playing, created, refused_format, released;
     unsigned long plays, stops, mixes, frames_mixed, missing_data;
+    unsigned long underruns;        /* cursor crossed a stream's write mark */
 } dsh_stats;
 void     dsh_get_stats(dsh_stats *s);
 
