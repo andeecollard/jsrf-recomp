@@ -3430,6 +3430,29 @@ static void jsrf_actman_report(void)
 
     for (i = 0; i < 12; ++i)
         now[i] = *(const uint32_t *)(base + root + 0x40u + 4u * i);
+    /* HOW THE TITLE KEEPS TIME (the "floaty" question, 24 Sep). CActMan's
+     * layout from the JSRF-Decompilation headers (Action.hpp): +0x87D0
+     * m_dwFrameCount_MAYBE, +0x87E0 m_dwAnimCount_MAYBE, +0x87E4
+     * m_dwAnimStep_MAYBE. Rates against wall time say which it is: an anim
+     * count advancing at ~60/s while frames run slower means the title
+     * catches up (steps more than one tick per frame); both at the frame
+     * rate means every late frame is lost simulation time. Every report, not
+     * on change, because the rates are the point. */
+    if (jsrf_va_ok(root + 0x87E4u + 3u)) {
+        static uint32_t pf, pa; static DWORD pt; static unsigned step_hist[5];
+        uint32_t f = *(const uint32_t *)(base + root + 0x87D0u);
+        uint32_t a = *(const uint32_t *)(base + root + 0x87E0u);
+        uint32_t st = *(const uint32_t *)(base + root + 0x87E4u);
+        DWORD t = GetTickCount();
+        step_hist[st < 4 ? st : 4]++;
+        if (pt && t != pt)
+            fprintf(stderr, "  [ACTMAN-TIME] frame=%u (%.1f/s) anim=%u (%.1f/s) anim_step=%u"
+                            " | steps sampled 0:%u 1:%u 2:%u 3:%u 4+:%u\n",
+                    f, (double)(uint32_t)(f - pf) * 1000.0 / (double)(t - pt),
+                    a, (double)(uint32_t)(a - pa) * 1000.0 / (double)(t - pt), st,
+                    step_hist[0], step_hist[1], step_hist[2], step_hist[3], step_hist[4]);
+        pf = f; pa = a; pt = t;
+    }
     if (primed && !memcmp(now, last, sizeof now)) return;
     primed = 1;
     memcpy(last, now, sizeof now);

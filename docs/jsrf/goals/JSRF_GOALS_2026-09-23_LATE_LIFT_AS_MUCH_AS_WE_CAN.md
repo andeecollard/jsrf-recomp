@@ -197,3 +197,15 @@ against a known-bad frame and not from memory.
   - The format word's bit 0 is set (DMA context B). The comparison ignores
     context bases, so a context base offset is the next suspect. The lift
     must reproduce whichever it is.
+- **"Floaty" gameplay, measured (24 Sep): the title is frame-stepped.**
+  - CActMan's anim counter (+0x87E0) advances exactly at the frame rate:
+    48.8/s at 48.8 fps in the tutorial (`[ACTMAN-TIME]`,
+    `RECOMP_ACTMAN_REPORT=1`).
+  - No catch-up step exists, and save-game timers are kept in frames
+    (`CSaveData::SetTimer(eTIMER, dwFrames)`).
+  - So game speed = fps / 59.94: the tutorial runs at 81%, and the player's
+    median 50 fps is 84%. Only a steady 60 fps fixes it, which makes G51/G52
+    the gameplay fix as well as the frame-rate one.
+- **Agents, 24 Sep:** G43's static transcription of D3D's fixed-function
+  combiner builder, and G41 (streams and indices in the mirror), each in its
+  own worktree. Neither runs the game; the lead runs their builds.
