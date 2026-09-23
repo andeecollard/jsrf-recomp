@@ -93,10 +93,29 @@ void d3d8m_after_draw(void)
     if (!d3d8m_on()) return;
     memset(&c, 0, sizeof c);
     c.serial = ++m_serial;
-    for (unsigned u = 0; u < 4; ++u) {
-        uint32_t t = m_tex[u];
-        c.tex[u] = t;
-        if (t) { c.data[u] = MEM32(t + 4u); c.format[u] = MEM32(t + 0xCu); c.size[u] = MEM32(t + 0x10u); }
+    /* G40: the bound textures come from the DEVICE, not from a SetTexture
+     * hook. XbSymbolDatabase's offset dump names m_Textures at device +0xA78,
+     * one pointer per stage. The hook mirror is kept beside it and every
+     * disagreement counted, which is what explains -- or removes -- the four
+     * texture mismatches G39 left open. */
+    {
+        static unsigned long long agree, differ, printed;
+        uint32_t d = MEM32(0x0019DCE0u);
+        for (unsigned u = 0; u < 4; ++u) {
+            uint32_t t = MEM32(d + 0xA78u + 4u * u);
+            if (t == m_tex[u]) agree++;
+            else {
+                differ++;
+                if (printed++ < 16)
+                    fprintf(stderr, "[D3D8-MIRROR] G40 draw %u stage %u: device m_Textures=%08X, SetTexture hook=%08X\n",
+                            m_serial, u, t, m_tex[u]);
+            }
+            c.tex[u] = t;
+            if (t) { c.data[u] = MEM32(t + 4u); c.format[u] = MEM32(t + 0xCu); c.size[u] = MEM32(t + 0x10u); }
+        }
+        if ((m_serial % 200000u) == 0)
+            fprintf(stderr, "[D3D8-MIRROR] G40 textures: device vs hook agree=%llu differ=%llu (stage-draws)\n",
+                    agree, differ);
     }
     {   uint32_t d = MEM32(0x0019DCE0u);            /* D3D_g_pDevice */
         c.rt = MEM32(d + 0x2070u); c.zs = MEM32(d + 0x2074u);

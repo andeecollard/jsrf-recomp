@@ -186,3 +186,14 @@ against a known-bad frame and not from memory.
   formats refused, 0 rejected draws, 0 software fallbacks. So the cutscene
   flicker and Poison Jam's missing elements are draws made wrongly or at the
   wrong moment, not draws dropped.
+- **G40: done, with one mismatch recorded, not yet explained.**
+  - The mirror now reads each stage's texture from the device's m_Textures
+    (+0xA78). Over a 150 s tutorial it agrees with the SetTexture hook on
+    2,400,000 of 2,400,000 stage-draws, so the device is the source.
+  - The 4 remaining address mismatches are one object, 0x0436B6C0, a 64x64
+    DXT1. D3D reads Data 0xF2F000; the GPU sampled 0xF2E000, 4 KB lower.
+  - It is not emission timing: latching at the first draw after a binding
+    change, and latching at SetTexture itself, both left all 4 in place.
+  - The format word's bit 0 is set (DMA context B). The comparison ignores
+    context bases, so a context base offset is the next suspect. The lift
+    must reproduce whichever it is.
