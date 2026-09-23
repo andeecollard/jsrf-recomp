@@ -214,3 +214,30 @@ against a known-bad frame and not from memory.
 - **Upstream:** PR #121 (ADPCM reserved byte and index clamp, with
   tests/adpcm_decode) opened. The KeSetEvent and OHCI fixes were checked
   and do not port.
+
+## G56 — the lifter's unresolved flags (found 24 Sep, reviewing upstream PRs)
+
+JSRF's generated C carries **326 `_flags` fallbacks** -- the lifter's "UNRESOLVED
+FLAGS, branch never taken" path, reading a variable nothing assigns:
+- **~200** are `sete` into edx/eax;
+- **many** are `jp`/`jnp` after FPU compares (MSVC's fnstsw/test ah/jp idiom for
+  float comparisons), so the comparison always goes one way;
+- **at least one** is `loop`, the case upstream PR #110
+  (NoRain211, open) fixes. Upstream PR #120 (open) fixes narrow result-sign
+  tests.
+
+Any of these can silently break game logic -- culling, physics, collision --
+and so they are a suspect for "buildings missing" at Rokkaku-dai Heights.
+
+1. **Census.** Each site's address, instruction, function, and whether that
+   function runs (func-hit trace).
+2. **Lifter fixes.** Take #110 and #120 into our lifter (MIT, same code base).
+   Resolve parity after `fnstsw`/`sahf`, and the `sete` producers.
+3. **Regenerate on a copied gen tree.** `regenerate.sh` overwrites in place; see
+   the memory note. Then A/B the tutorial and a replay.
+
+Also from upstream's open PRs, already equivalent in our tree: #102
+(primitive numbering) and #104 (rcl/rcr). Moot on our path: #118 (USB
+GET_REPORT, under the XInput lift) and #103/#108 (the software sampler and
+rasteriser; JSRF draws on Metal). Worth a look: #119 (KeQuerySystemTime
+resolution).
