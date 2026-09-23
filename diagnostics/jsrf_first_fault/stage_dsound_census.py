@@ -179,6 +179,9 @@ def main():
     ap.add_argument("source", type=Path)
     ap.add_argument("destination", type=Path)
     ap.add_argument("--entries", type=Path, required=True)
+    ap.add_argument("--shadow", action="store_true",
+                    help="G48 phase 3: replay every logged call into the host model (dsound_shadow.c) and "
+                         "compare its GetStatus/GetCurrentPosition with DSOUND's; RECOMP_DSOUND_SHADOW=1 arms it")
     a = ap.parse_args()
     src, dst = a.source.resolve(), a.destination.resolve()
     if dst == src or src in dst.parents:
@@ -205,7 +208,8 @@ def main():
                     "extern int g_dsound_census_on; int dsc_arm(void);",
                     "void dsound_census_hit(unsigned idx, uint32_t ret);",
                     "void dsound_census_abi(unsigned idx, uint32_t esp0, uint32_t esp1, const uint32_t b[3], const uint32_t a[3]);",
-                    "void dsound_census_log(unsigned idx, const char *name, const uint32_t *a, unsigned n, uint32_t r, uint32_t ret_va);"]
+                    "void dsound_census_log(unsigned idx, const char *name, const uint32_t *a, unsigned n, uint32_t r, uint32_t ret_va);",
+                    "void dss_after(const char *name, const uint32_t *a, uint32_t eax);"]
         for start, end, name, idx, e in sorted(items, key=lambda t: -t[0]):
             body = text[start:end]
             manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), path.name))
@@ -216,6 +220,8 @@ def main():
             if nargs:
                 cap = " uint32_t ar[%d]; for (unsigned k = 0; k < %du; ++k) ar[k] = MEM32(esp + 4u + 4u * k);" % (nargs, nargs)
                 log = ' dsound_census_log(%du, "%s", ar, %du, eax, ra);' % (idx, e["name"], nargs)
+                if a.shadow:
+                    log += ' dss_after("%s", ar, eax);' % e["name"]
             wrappers.append(
                 "void %s(void) { if (!g_dsound_census_on || (g_dsound_census_on < 0 && !dsc_arm())) { dsc_orig_%s(); return; }"
                 " uint32_t ra = MEM32(esp); dsound_census_hit(%du, ra);%s"
@@ -235,6 +241,9 @@ def main():
         addrs=", ".join("0x%08Xu" % int(e["address"], 16) for e in entries),
         names=", ".join('"%s"' % e["name"] for e in entries),
         rets=", ".join("%du" % r for r in rets), lo=DS_LO, hi=DS_HI))
+    if a.shadow:
+        shutil.copyfile(Path(__file__).with_name("dsound_shadow.c"), dst / "recomp_zz_dsound_shadow.c")
+        manifest.append("shadow: recomp_zz_dsound_shadow.c (RECOMP_DSOUND_SHADOW=1)")
     (dst / "DSOUND_CENSUS_MANIFEST.txt").write_text("\n".join(manifest) + "\n")
     print("staged %d wrappers in %d files -> %s" % (len(plan), len(by_file), dst))
 

@@ -189,9 +189,13 @@ supersedes G47a: with DSOUND replaced, its DPC no longer runs.
   - Static: 193 game call sites into 55 DSOUND entry points, all stdcall,
     none reached through data.
   - Runtime: 194,156 calls through the wrappers, 0 ABI mismatches, 0 faults.
-- **Phase 2, next:** the host model (`src/apu/dsound_host.c`) and its unit
-  tests.
-- **Then** shadow mode against the running DSOUND, then replacement.
+- **Phase 2, done:** the host model (`src/apu/dsound_host.c`) and
+  `dsound_host_test`.
+- **Phase 3, first run done:** shadow mode. It accepted 384 of 384 buffers.
+  88% of cursors agree within 10 ms. The GetStatus disagreement is DSOUND
+  never clearing PLAYING after Stop, which spins CRI's `mwSndStop`; the
+  23 Sep black-screen hang sat in that loop. See the plan's shadow section.
+- **Phase 4, next:** replacement, with `RECOMP_DSOUND_LIFT=1`.
 
 **Done when** the tutorial and the police chase play on the lift with
 correct audio, and the player confirms the G46 reports are gone.

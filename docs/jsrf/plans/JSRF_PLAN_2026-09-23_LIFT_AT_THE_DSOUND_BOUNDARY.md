@@ -142,3 +142,24 @@ title:
   steps, but it must never run backwards or jump.
 - **3D and reverb.** The Xbox HRTF and I3DL2 will not match at first.
   Positional volume and pan get most of the way; the rest is Phase 5+.
+
+## Shadow results, 23 Sep (phase 3, first run)
+
+`stage_dsound_census.py --shadow`, 150 s silenced tutorial, 0 guest faults:
+- **Buffers.** All 384 buffers the title created were accepted by the model;
+  0 refused.
+- **Cursors.** Of 4,235 GetCurrentPosition calls, 3,723 (88%) agree within
+  10 ms. 252 differ by 100 ms or more; not yet explained.
+- **GetStatus.** 2 of 19,382 calls agree. Every disagreement is DSOUND
+  saying PLAYING where the model says stopped, and every one is the same
+  pattern. CRI's `mwSndStop` (Stop at 0x141672, GetStatus at
+  0x14168E/0x1416D4) stops an ADX stream buffer, then polls GetStatus until
+  it reports stopped. On the APU model, DSOUND goes on reporting PLAYING long
+  after Stop, and the CRI thread spins. The host model answers "stopped" at
+  once, as a stop is meant to.
+- **The 23 Sep hang.** The black-screen hang after the cop fight has this
+  shape. `sample` of the hung process showed a game thread in
+  `sub_00141640 -> IDirectSoundBuffer_GetStatus`, inside this same loop. With
+  the lift, that loop ends on its first poll.
+- **The WAV.** It holds real audio from the moment the ADX music starts
+  (t≈15 s): RMS 1,900–5,900, peak under 30,100, no clipping. It needs a listen.
