@@ -1587,6 +1587,102 @@ static void bridge_NtCreateEvent(void)
 #define DISPATCHER_TYPE(va)         BRIDGE_MEM8((va) + 0)
 #define DISPATCHER_SIGNALSTATE(va)  BRIDGE_MEM32((va) + 4)
 #define DISPATCHER_SYNCHRONIZATION  1   /* auto-reset on acquisition */
+#define DISPATCHER_NOTIFICATION     0   /* stays set until reset */
+
+/* EVENT SETS ARE EDGES AS WELL AS LEVELS (G46, the intro music).
+ *
+ * KeSetEvent here only stores SignalState = 1, and a waiter finds it by
+ * polling. On a real kernel, setting a NOTIFICATION event satisfies every
+ * thread waiting on it at that instant, whatever happens to the state after.
+ * Polled, a waiter that has not looked yet loses the set if another thread
+ * clears the state first -- and D3D's BlockUntilVerticalBlank does exactly
+ * that: it writes 0 to SignalState and waits. JSRF runs two CRI sound pumps
+ * on that call, so whichever pump finishes its pass first clears the vblank
+ * event under the other. Measured at the intro: 56.4 vblanks/s delivered,
+ * ~39 CRI server passes/s, against CRI's break-even of 43.1 -- the music
+ * then plays at 0.8x speed with stale buffer between (compared against an
+ * independent decode of title.adx).
+ *
+ * 1. A per-event SET GENERATION: KeSetEvent bumps it, and a waiter on a
+ *    notification event is satisfied if it moved during the wait, even when
+ *    the state was cleared since. RECOMP_EVENT_SET_GEN=0 turns it off.
+ * 2. A real WAKEUP on set: waiters sleep on a condition KeSetEvent broadcasts,
+ *    for at most their poll period, instead of a blind sleep. The earlier
+ *    100 us poll experiment (see the poll note in KeWaitForSingleObject)
+ *    starved gameplay audio by multiplying the APU front end's method
+ *    traffic; this adds no polling at all. RECOMP_EVENT_WAKE=0 turns it off.
+ *
+ * The generation table is open-addressed by event VA with CAS insertion, so
+ * two events never share a counter -- a shared counter would satisfy a wait
+ * that was never signalled. */
+#define EVGEN_SLOTS 2048u
+static struct { volatile uint32_t va; volatile uint32_t gen; } g_evgen[EVGEN_SLOTS];
+static volatile unsigned long g_evgen_overflow, g_evgen_rescued;
+
+static volatile uint32_t *evgen_slot(uint32_t va, int create)
+{
+    uint32_t k = ((va >> 2) * 2654435761u) & (EVGEN_SLOTS - 1u);
+    for (uint32_t i = 0; i < EVGEN_SLOTS; ++i, k = (k + 1u) & (EVGEN_SLOTS - 1u)) {
+        uint32_t cur = g_evgen[k].va;
+        if (cur == va) return &g_evgen[k].gen;
+        if (cur == 0) {
+            if (!create) return NULL;
+            if (__sync_bool_compare_and_swap(&g_evgen[k].va, 0u, va)) return &g_evgen[k].gen;
+            if (g_evgen[k].va == va) return &g_evgen[k].gen;
+        }
+    }
+    g_evgen_overflow++;
+    return NULL;
+}
+
+void xbox_EventGenStats(unsigned long *rescued, unsigned long *overflow)
+{
+    if (rescued) *rescued = g_evgen_rescued;
+    if (overflow) *overflow = g_evgen_overflow;
+}
+
+static int evgen_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_EVENT_SET_GEN", 1);
+    return on;
+}
+static int evwake_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_EVENT_WAKE", 1);
+    return on;
+}
+
+#if !defined(_WIN32)
+#include <pthread.h>
+static pthread_mutex_t g_evwake_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_evwake_cv = PTHREAD_COND_INITIALIZER;
+static volatile unsigned long g_evwake_epoch;
+
+static void evwake_broadcast(void)
+{
+    pthread_mutex_lock(&g_evwake_m);
+    g_evwake_epoch++;
+    pthread_cond_broadcast(&g_evwake_cv);
+    pthread_mutex_unlock(&g_evwake_m);
+}
+
+/* Sleep up to `us`, or until any event is set after `seen` was read. */
+static void evwake_wait(unsigned long seen, long us)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += us * 1000L;
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    pthread_mutex_lock(&g_evwake_m);
+    while (g_evwake_epoch == seen) {
+        if (pthread_cond_timedwait(&g_evwake_cv, &g_evwake_m, &ts) != 0) break;
+    }
+    pthread_mutex_unlock(&g_evwake_m);
+}
+#endif
 
 static void bridge_vblank_poll(void);
 static void bridge_device_irq_poll(void);
@@ -1733,6 +1829,13 @@ static void bridge_KeSetEvent(void)
     event_trace_note("SET", event_ptr);
     previous = DISPATCHER_SIGNALSTATE(event_ptr);
     DISPATCHER_SIGNALSTATE(event_ptr) = 1;
+    if (evgen_on()) {
+        volatile uint32_t *g = evgen_slot(event_ptr, 1);
+        if (g) __atomic_add_fetch(g, 1u, __ATOMIC_SEQ_CST);
+    }
+#if !defined(_WIN32)
+    if (evwake_on()) evwake_broadcast();
+#endif
     g_eax = previous;
 }
 
@@ -1831,7 +1934,29 @@ static void bridge_KeWaitForSingleObject(void)
         }
     }
 
+    /* The set generation at entry: see "EVENT SETS ARE EDGES". Notification
+     * objects only -- a synchronization event is consumed by one waiter, and
+     * a set that another waiter already consumed must not satisfy this one. */
+    volatile uint32_t *gen = NULL;
+    uint32_t gen0 = 0;
+    if (evgen_on() && DISPATCHER_TYPE(object) == DISPATCHER_NOTIFICATION) {
+        gen = evgen_slot(object, 1);
+        if (gen) gen0 = __atomic_load_n(gen, __ATOMIC_SEQ_CST);
+    }
+
     for (;;) {
+#if !defined(_WIN32)
+        unsigned long wake_seen = g_evwake_epoch;
+#endif
+        if (!DISPATCHER_SIGNALSTATE(object) && gen && __atomic_load_n(gen, __ATOMIC_SEQ_CST) != gen0) {
+            /* Set and already cleared again while this thread was between
+             * polls: the set happened during the wait, so the wait is over. */
+            g_evgen_rescued++;
+            if (sched_woke) ++*sched_woke;
+            if (blocked && s_block_end) s_block_end(block_saved);
+            g_eax = 0;
+            return;
+        }
         if (DISPATCHER_SIGNALSTATE(object)) {
             /* A synchronization event is auto-reset: the waiter consumes it. */
             if (DISPATCHER_TYPE(object) == DISPATCHER_SYNCHRONIZATION) {
@@ -1943,6 +2068,11 @@ static void bridge_KeWaitForSingleObject(void)
                 if (poll_us < 0) poll_us = 0;
                 if (poll_us > 1000000) poll_us = 1000000;
             }
+#if !defined(_WIN32)
+            if (evwake_on() && poll_us > 0) {
+                evwake_wait(wake_seen, poll_us);
+            } else
+#endif
             if (poll_us >= 1000) {
                 Sleep((DWORD)(poll_us / 1000));
             } else if (poll_us > 0) {

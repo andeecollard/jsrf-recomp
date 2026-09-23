@@ -1642,13 +1642,16 @@ static void jsrf_adx_rate_report(void)
            + (double)(now.tv_nsec - prev.tv_nsec) / 1e9;
         if (dt > 1e-3) {
             double srv_hz = (double)(uint32_t)(srv - p_srv) / dt;
+            extern void xbox_EventGenStats(unsigned long *, unsigned long *);
+            unsigned long ev_rescued = 0, ev_overflow = 0;
+            xbox_EventGenStats(&ev_rescued, &ev_overflow);
             fprintf(stderr,
                 "  [ADX-RATE] server=%.1f/s (counted by two threads, so ~%.1f "
                 "true passes/s; >=43.1 needed) worker=%.1f/s spin=%.0f/s "
-                "underruns=%u%s\n",
+                "underruns=%u | event sets rescued=%lu table_overflow=%lu%s\n",
                 srv_hz, srv_hz / 2.0,
                 (double)(uint32_t)(wrk - p_wrk) / dt,
-                (double)(uint32_t)(spin - p_spin) / dt, under,
+                (double)(uint32_t)(spin - p_spin) / dt, under, ev_rescued, ev_overflow,
                 (srv_hz / 2.0 < 43.1)
                     ? "   <- below break-even: the ring cannot be kept full" : "");
             fflush(stderr);
