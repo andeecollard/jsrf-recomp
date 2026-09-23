@@ -160,7 +160,7 @@ glitches. None of this is explained yet.
   - EG, LFO, filter, effect data and mix bins are never called.
 
   3D distance falloff and pan are now modelled and tested. Its absence
-  explains the replay WAV's 21 clipped samples.
+  likely explains the replay WAV's 21 clipped samples (not yet re-measured).
 - **§2d: done.** Nearly all of the "outliers" were the comparison ignoring
   wrap-around in the circular stream buffers. Measured wrap-aware, 2,570 of
   2,570 cursor answers agree within 20 ms (96.6% within 10 ms), with the
