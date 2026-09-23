@@ -183,6 +183,44 @@ both 0 arms with 0 hardware units, and `=on` in both 1 arms. Logs:
 eligibility depends on the final fragment alpha, including the combiners
 and vertex alpha, not on texture alpha alone.
 
+## G27b outcome so far, 23 Sep 2026 (exact early-Z, first class)
+
+**Built, and the image check passes. Performance is unmeasured.**
+
+**The change.** `hw_early_z()` now returns 0, 1 or 2:
+- **2** is new. It covers a draw that may discard (alpha test or z-range
+  cull) but writes neither depth nor stencil. With nothing written, an early
+  test only decides which fragments get shaded, so it is exact.
+- **The variant.** `fs_hw_early_nw` is `fs_hw_blend` with
+  `[[early_fragment_tests]]`, and both discard branches kept verbatim.
+- **Not covered.** Alpha-tested draws that DO write depth stay late. They
+  are counted by combiner use for the next step. Vertex alpha comes from the
+  GPU vertex program, so texture alpha alone cannot decide them.
+
+**A bug, caught in review by the player before any result was used.** Both
+pipeline selectors read `sblend && hw_early_z(s)`, which folds 2 into 1. So
+the discarding draws got `fs_hw_early`, which removes the discard, and the
+new variant was unreachable. The first A/B (`g27bnw`) ran on that binary and
+was stopped unscored. It was also taken while Zoom held about 60% CPU. The
+selectors now read `sblend ? hw_early_z(s) : 0`. The report counts
+`fs_hw_early_nw` draws where the draw is encoded, so a run now proves
+selection rather than shader compilation.
+
+**Image check (`metal_earlyz_check.sh`, `jsrf_metal_earlyz_test`):**
+- **The scene.** A far opaque floor, then alpha-tested checkers with and
+  without depth writes, then an opaque quad behind the depth-writing checker
+  that shows through its alpha-0 texels. Then a draw behind the floor, and
+  z-culled draws with no writes.
+- **PASS.** Early-Z on draws 7 of 8 early, 4 of them through
+  `fs_hw_early_nw`; the depth-writing alpha draw stays late. The image is
+  byte-identical to early-Z off.
+- **Positive control.** The inexact `EARLY_Z_REF0` arm differs by 16,900
+  bytes, so the scene can see a wrong early test.
+
+**Still owed.** The scene-matched A/B of `RECOMP_METAL_EARLY_Z` with
+`RECOMP_METAL_HW_TEX=1` in both arms, on an idle host. Timings taken while
+Zoom or a build is running are preliminary.
+
 ## G34 — pass-through skeleton (spec Phase 1)
 
 The G33 wrappers become the seams. Each is a host function with the

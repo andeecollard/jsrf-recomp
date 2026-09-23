@@ -89,7 +89,7 @@ static inline unsigned long long mtl_now_ns(void)
  * first turns that deadlock into an ordinary wait. */
 /* Full clears that dropped the surface instead of syncing it. Each one is
  * a GPU drain and a 4.9 MB readback that did not happen. */
-static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend, hw_fs_early;
+static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend, hw_fs_early, hw_fs_early_nw;
 static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
@@ -946,6 +946,27 @@ static NSString *const shader =
  " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
  " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
  " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
+ /* G27b -- EARLY TESTS FOR A DRAW THAT WRITES NEITHER DEPTH NOR STENCIL.
+  *
+  * The objection to early tests is a write made for a fragment the shader
+  * then discards. A draw with depth writes off and no stencil write makes no
+  * such write: the early test only decides which fragments get shaded, and
+  * one that passes and is then discarded loses its colour exactly as it
+  * would have after a late test. So both discard branches stay, verbatim
+  * from fs_hw_blend, and the order is still exact. hw_early_z() returns 2
+  * for exactly these draws. */
+ "[[early_fragment_tests]] fragment float4 fs_hw_early_nw(Out i [[stage_in]], float4 dst [[color(0),raster_order_group(0)]],"
+ " const device uchar*t0 [[buffer(0)]],constant Params&s [[buffer(1)]],const device uchar*t1 [[buffer(2)]],const device uchar*t2 [[buffer(3)]],const device uchar*t3 [[buffer(4)]],"
+ " texture2d<float> h0 [[texture(0)]],texture2d<float> h1 [[texture(1)]],texture2d<float> h2 [[texture(2)]],texture2d<float> h3 [[texture(3)]],"
+ " sampler q0 [[sampler(0)]],sampler q1 [[sampler(1)]],sampler q2 [[sampler(2)]],sampler q3 [[sampler(3)]]){\n"
+ " float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);"
+ " float zg=i.p.z*16777215.0f;"
+ " if(s.z_cull&&(zg<s.z_lo||zg>s.z_hi)){discard_fragment();return c;}"
+ " if(s.alpha_test&&uint(clamp(c.a,0.0f,1.0f)*255+.5f)<=s.alpha_ref){discard_fragment();return c;}"
+ " if(s.blend){float3 d=dst.rgb;c.rgb=c.rgb*bfactor(s.blend_src,c,d)+d*bfactor(s.blend_dst,c,d);}"
+ " if(s.dither){constexpr uint b[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};int2 xy=int2(i.p.xy);"
+ " float bias=(float(b[(xy.y&3)*4+(xy.x&3)])+.5f)/16-.5f;c.rgb+=bias/float3(31,63,31);}"
+ " return float4(c.rgb,clamp(c.a,0.0f,1.0f));}\n"
 /* THE SAME FUNCTION WITH THE DEPTH TEST IN FRONT OF IT.
   *
   * WHY THERE HAS TO BE A SECOND ONE. fs_hw_blend can call discard_fragment(),
@@ -1306,6 +1327,7 @@ static int initialize(void)
         hw_vs=[library newFunctionWithName:@"vs"];hw_fs=[library newFunctionWithName:@"fs_hw"];
         hw_fs_blend=[library newFunctionWithName:@"fs_hw_blend"];
         hw_fs_early=[library newFunctionWithName:@"fs_hw_early"];
+        hw_fs_early_nw=[library newFunctionWithName:@"fs_hw_early_nw"];
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
         pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -1879,7 +1901,7 @@ static uint32_t frag_force_mode(void)
 static int early_z_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_EARLY_Z");
   return on; }
-static uint64_t g_early_z_draws, g_late_z_draws;
+static uint64_t g_early_z_draws, g_late_z_draws, g_early_nw_draws;
 /* Latin font pages seen by the text detector above: distinct texture
  * addresses whose cells match the 21x34 Latin grid, and how many character
  * quads each drew. Two is correct; one means page 1 is never bound. */
@@ -1913,10 +1935,30 @@ static int early_z_ref0_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_EARLY_Z_REF0");
   return on; }
 
+/* G27b: the draws that may still discard but write nothing an early test
+ * could get wrong -- see fs_hw_early_nw. Mirrors the Params build: depth is
+ * written only when the depth test is on, stencil only when its test is. */
+static uint64_t g_ez_nowrite, g_ez_alpha_writes_cc0, g_ez_alpha_writes_cc;
+static int hw_draw_writes_nothing_early(const NV2ATextureCopy *s)
+{
+    return !(s->depth_test && s->depth_write) && !(s->stencil_test && s->stencil_write);
+}
+
+/* 0: late tests. 1: early, the draw cannot discard (fs_hw_early).
+ * 2: early, the draw may discard but writes no depth or stencil
+ *    (fs_hw_early_nw). Both early variants are exact. */
 static int hw_early_z(const NV2ATextureCopy *s)
 {
     if (!early_z_on()) return 0;
+    int may_discard = (s->alpha_test && !no_alpha_test_on())
+                   || (s->z_cull && !legacy_zclamp_on());
+    if (may_discard && hw_draw_writes_nothing_early(s)) { ++g_ez_nowrite; ++g_ez_eligible; return 2; }
     if (s->alpha_test && !no_alpha_test_on()) {
+        /* What an exact version for the remaining draws would have to see
+         * through: with no combiners the fragment alpha is diffuse alpha times
+         * (at most) texture alpha; with combiners it is whatever the alpha
+         * chain computes. */
+        if (s->combiner_count) ++g_ez_alpha_writes_cc; else ++g_ez_alpha_writes_cc0;
         /* Split by the reference value. The shader discards on
          * alpha <= alpha_ref, so ref==0 rejects only a FULLY transparent
          * fragment: those draws are the ones where early-Z might be made
@@ -1978,7 +2020,7 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
      * with identical blend state and different discard state need different
      * pipelines, and a key that cannot tell them apart would hand an
      * alpha-tested draw the function whose depth write has already happened. */
-    uint32_t early = (uint32_t)(sblend && hw_early_z(s));
+    uint32_t early = sblend ? (uint32_t)hw_early_z(s) : 0u;   /* 0, 1 or 2: && would fold 2 into 1 */
     unsigned i;
     for (i = 0; i < vsh_pso_n; ++i)
         if (vsh_pso[i].fn == (__bridge const void *)prog->fn
@@ -2006,7 +2048,8 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
          * position rather than by name. Taking both halves from one library is
          * what makes the repacking wrapper sound. */
         d.fragmentFunction = [prog->library newFunctionWithName:
-                                early  ? @"fs_hw_early"
+                                early == 2 ? @"fs_hw_early_nw"
+                              : early  ? @"fs_hw_early"
                               : sblend ? @"fs_hw_blend" : @"fs_hw"];
         if (!d.fragmentFunction) return nil;
         d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
@@ -2037,7 +2080,7 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
 {
     unsigned i;
     uint32_t sblend = (uint32_t)hw_shader_blend(s);
-    uint32_t early = (uint32_t)(sblend && hw_early_z(s));
+    uint32_t early = sblend ? (uint32_t)hw_early_z(s) : 0u;   /* 0, 1 or 2: && would fold 2 into 1 */
     for (i = 0; i < hw_pso_n; ++i)
         if (hw_pso[i].blend == s->blend && hw_pso[i].src == s->blend_src
             && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend
@@ -2078,7 +2121,7 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = hw_vs;
-    d.fragmentFunction = early ? hw_fs_early : sblend ? hw_fs_blend : hw_fs;
+    d.fragmentFunction = early == 2 ? hw_fs_early_nw : early ? hw_fs_early : sblend ? hw_fs_blend : hw_fs;
     if (!d.fragmentFunction) { ++g_hw_state_refusals; return nil; }
     /* STILL RGBA32Float, AND THE REASON RECORDED HERE BEFORE WAS WRONG.
      *
@@ -3224,9 +3267,9 @@ void nv2a_metal_report(void)
       fprintf(stderr,"[METAL]   page texture %08X: %llu character quads\n",
               g_latin_tex[i],(unsigned long long)g_latin_tex_quads[i]);
     }
-    fprintf(stderr,"[METAL] depth test before the shader: %llu draws early,"
-            " %llu late (early_z %s)\n",
-            (unsigned long long)g_early_z_draws,
+    fprintf(stderr,"[METAL] depth test before the shader: %llu draws early"
+            " (%llu of them through fs_hw_early_nw, discard kept), %llu late (early_z %s)\n",
+            (unsigned long long)g_early_z_draws,(unsigned long long)g_early_nw_draws,
             (unsigned long long)g_late_z_draws,
             early_z_on()?"on":"OFF");
     if (early_z_on() && early_z_ref0_on())
@@ -3243,6 +3286,12 @@ void nv2a_metal_report(void)
                 (unsigned long long)g_ez_no_alpha,
                 (unsigned long long)g_ez_no_alpha_ref0,
                 (unsigned long long)g_ez_no_zcull);
+    if (early_z_on())
+        fprintf(stderr,"[METAL]   early-Z G27b: %llu eligible because they write neither depth nor"
+                " stencil (fs_hw_early_nw, exact with discard); alpha-tested draws that DO write:"
+                " %llu without combiners, %llu with combiners\n",
+                (unsigned long long)g_ez_nowrite,(unsigned long long)g_ez_alpha_writes_cc0,
+                (unsigned long long)g_ez_alpha_writes_cc);
     /* Defined beside nv2a_metal_draw, which is where it measures. */
     { extern void t0_census_report(void); t0_census_report(); }
     fprintf(stderr,"[METAL] vsh: %s (metal_vsh %s)\n",
@@ -5584,8 +5633,9 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
           * does not take every draw there is no early variant to select and
           * a counter that said otherwise would be counting an arm that did
           * not run. */
-         if(hw_shader_blend(s)&&hw_early_z(s))++g_early_z_draws;
-         else++g_late_z_draws;}
+         {int ez=hw_shader_blend(s)?hw_early_z(s):0;
+          if(ez)++g_early_z_draws;else++g_late_z_draws;
+          if(ez==2)++g_early_nw_draws;}}   /* the positive control for fs_hw_early_nw */
   else {if(hw_state_on())++g_hw_mixed;[encoder setRenderPipelineState:pipeline];}if(vb)[encoder setVertexBuffer:vb offset:vb_offset atIndex:0];else[encoder setVertexBytes:v length:vertex_bytes atIndex:0];
   /* THE TWO PIPELINES HAVE INCOMPATIBLE VERTEX BINDINGS AND THE ENCODER MUST
    * NOT SET BOTH. The fixed `vs` reads Params at vertex 1 and the indices at

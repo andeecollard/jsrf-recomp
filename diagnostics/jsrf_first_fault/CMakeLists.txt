@@ -1050,6 +1050,10 @@ if(APPLE)
     # metal_hwtex_check.sh runs both and scores them with hwtex_compare.py.
     add_executable(jsrf_metal_hwtex_test metal_hwtex_test.c)
     target_link_libraries(jsrf_metal_hwtex_test PRIVATE xbox_vsh)
+    # G27b: early-Z must leave the image byte-identical; metal_earlyz_check.sh
+    # runs it late, early, and with the inexact REF0 approximation as control.
+    add_executable(jsrf_metal_earlyz_test metal_earlyz_test.c)
+    target_link_libraries(jsrf_metal_earlyz_test PRIVATE xbox_vsh)
     # Staging-ring lifetime, including the pin-once-per-batch pattern batching
     # introduced. Carries its own positive control.
     add_executable(jsrf_metal_ring_test metal_ring_test.c)
