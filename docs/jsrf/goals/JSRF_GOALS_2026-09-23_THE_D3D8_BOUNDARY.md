@@ -770,3 +770,44 @@ sensitivity of the filter and bias tests is not separately shown.
 - the vertex program's identity;
 - vertex streams and index data;
 - the 4 texture address mismatches (one object).
+
+### G39, seventh slice: vertex program identity, 23 Sep 2026
+
+`SetVertexShader(handle)` (0x190490) keeps the object at device `+0x380` and
+the handle at `+0x384`.
+- **Handles.** An even handle is a fixed-function vertex format (the object
+  is D3D's built-in, at 0x19DDA8). An odd one is object + 1.
+- **Programmable objects.** Every programmable object this title binds
+  carries flag `0x10`. That sends SetVertexShader to `LoadVertexShader(h, 0)`
+  (0x190160), which copies a ready-made fragment from `object+0x114`
+  (`object+0xC` dwords of SET_TRANSFORM_PROGRAM packets) into the ring, at
+  slot 0. `SelectVertexShader` (0x1901C0) then selects program mode.
+
+The mirror extracts the program words from that fragment at each draw and
+compares them with the executor's program memory from slot 0. The first
+attempt classified by flag `0x2` and counted every draw as fixed-function.
+A handle census showed flag `0x10`.
+
+**150 s silenced tutorial:**
+- **Programmable draws.** **169,313**, all **identical** (20,729,976
+  program words).
+- **Fixed-function vertex draws.** **390,634** (70%).
+- **Faults.** 0, live=61.
+
+**Positive control** (first word flipped): 92,511 programmable draws, **0
+identical**.
+
+**The fixed-function share is now the whole remaining gap.** 70% of draws
+use D3D's fixed-function vertex path: transforms, lights, material and
+texture transforms, which D3D turns into NV2A FF registers. 88% use
+fixed-function combiners built from the texture-stage states. Everything
+programmable, and every other piece of per-draw state checked so far, a
+host renderer can take from D3D exactly.
+
+**G39 still open:**
+- fixed-function vertex: SetTransform (about 90 per frame),
+  SetLight/LightEnable/SetMaterial, texture transforms;
+- fixed-function combiners: COLOROP/ARG and the rest of the texture-stage
+  states;
+- vertex streams and index data;
+- the 4 texture address mismatches.

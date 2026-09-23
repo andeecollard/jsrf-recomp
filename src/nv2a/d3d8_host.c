@@ -35,6 +35,8 @@ static const uint32_t k_ps_pairs[D3D8_HOST_PS_N][2] = D3D8_HOST_PS_PAIRS;
 static _Atomic unsigned long long s_ps_draws, s_ps_fixed, s_ps_all, s_ps_cmp, s_ps_match, s_ps_word_mm[D3D8_HOST_PS_N];
 static _Atomic unsigned s_ps_printed, s_tss_printed;
 static _Atomic unsigned long long s_tss_cmp, s_tss_match, s_tss_addr, s_tss_mag, s_tss_min, s_tss_bias;
+static _Atomic unsigned long long s_vs_prog, s_vs_fixed, s_vs_unparsed, s_vs_match, s_vs_words;
+static _Atomic unsigned s_vs_printed;
 static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *)) { s_exec_source = get; }
 
@@ -170,6 +172,20 @@ static void check_draw(const D3D8HostDrawCheck *c)
                             " | nv2a address=%08X filter=%08X\n", c->serial, u, why, t[0], t[1], t[2], t[3], t[4], t[5],
                     bias, e.tex_address[u], f);
     }
+    /* Vertex program: the words D3D's shader object carries against the
+     * executor's program memory from slot 0. */
+    if (c->vs_kind == 0) atomic_fetch_add(&s_vs_fixed, 1);
+    else if (c->vs_kind == 2) atomic_fetch_add(&s_vs_unparsed, 1);
+    else {
+        atomic_fetch_add(&s_vs_prog, 1);
+        atomic_fetch_add(&s_vs_words, c->vs_nwords);
+        unsigned k;
+        for (k = 0; k < c->vs_nwords; ++k) if (c->vs_words[k] != e.vs_words[k]) break;
+        if (k == c->vs_nwords) atomic_fetch_add(&s_vs_match, 1);
+        else if (atomic_fetch_add(&s_vs_printed, 1) < 8)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u vertex program MISMATCH handle %08X at word %u of %u: d3d %08X | exec %08X\n",
+                    c->serial, c->vs_handle, k, c->vs_nwords, c->vs_words[k], e.vs_words[k]);
+    }
     /* Blend / alpha / depth / stencil registers: D3D's last Simple push against
      * the executor's register file at this draw. */
     for (unsigned k = 0; k < 11; ++k) {
@@ -266,6 +282,9 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->tss_compared = atomic_load(&s_tss_cmp); o->tss_match = atomic_load(&s_tss_match);
     o->tss_addr = atomic_load(&s_tss_addr); o->tss_mag = atomic_load(&s_tss_mag);
     o->tss_min = atomic_load(&s_tss_min); o->tss_bias = atomic_load(&s_tss_bias);
+    o->vs_draws_prog = atomic_load(&s_vs_prog); o->vs_draws_fixed = atomic_load(&s_vs_fixed);
+    o->vs_draws_unparsed = atomic_load(&s_vs_unparsed); o->vs_draws_match = atomic_load(&s_vs_match);
+    o->vs_words_compared = atomic_load(&s_vs_words);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -295,6 +314,8 @@ void d3d8_host_report(const char *why)
         fprintf(stderr, "[D3D8-MIRROR] %s pixel shader: draws %llu (fixed-function %llu), all registers matching in %llu;"
                         " words compared=%llu MATCH=%llu\n", why, st.ps_draws, st.ps_draws_fixed,
                 st.ps_draws_all_match, st.ps_words_compared, st.ps_words_match);
+        fprintf(stderr, "[D3D8-MIRROR] %s vertex program: programmable draws %llu, identical %llu (words %llu) | fixed-function %llu, unparsed %llu\n",
+                why, st.vs_draws_prog, st.vs_draws_match, st.vs_words_compared, st.vs_draws_fixed, st.vs_draws_unparsed);
         fprintf(stderr, "[D3D8-MIRROR] %s texture stages: units compared=%llu MATCH=%llu (address %llu, mag %llu, min/mip %llu, lod bias %llu)\n",
                 why, st.tss_compared, st.tss_match, st.tss_addr, st.tss_mag, st.tss_min, st.tss_bias);
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k)

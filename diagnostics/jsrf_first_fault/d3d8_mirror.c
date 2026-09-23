@@ -99,6 +99,24 @@ void d3d8m_after_draw(void)
     memcpy(c.vc, m_vc, sizeof c.vc); memcpy(c.vc_written, m_vc_written, sizeof c.vc_written);
     for (unsigned u = 0; u < 4; ++u)
         for (unsigned k = 0; k < 32; ++k) c.tss[u][k] = MEM32(0x0019DEE0u + 4u * (32u * u + k));
+    {   uint32_t d = MEM32(0x0019DCE0u), h = MEM32(d + 0x384u);
+        c.vs_handle = h;
+
+        /* Object flag 0x10 is SetVertexShader's LoadVertexShader(h, 0) +
+         * SelectVertexShader path, i.e. the program is loaded at slot 0. Measured
+         * 23 Sep: every programmable object this title binds carries it. */
+        if ((h & 1u) && (MEM32(h - 1u + 4u) & 0x10u)) {
+            uint32_t obj = h - 1u, n = MEM32(obj + 0xCu), at = 0;
+            c.vs_kind = 1;
+            while (at < n && n < 4096u) {
+                uint32_t hdr = MEM32(obj + 0x114u + 4u * at), cnt = (hdr >> 18) & 0x7FFu, meth = hdr & 0x1FFCu;
+                if ((hdr & 0xE0030003u) != 0 || !cnt || at + 1u + cnt > n) { c.vs_kind = 2; break; }
+                if (meth >= 0x0B00u && meth < 0x0B80u)
+                    for (uint32_t i = 0; i < cnt && c.vs_nwords < 136u * 4u; ++i)
+                        c.vs_words[c.vs_nwords++] = MEM32(obj + 0x114u + 4u * (at + 1u + i));
+                at += 1u + cnt;
+            }
+        } }
     if (m_ps_handle) {
         /* D3D's own current view of the pixel-shader registers: SetPixelShader
          * copies the 57-word definition into D3D_g_RenderState[0..56]
@@ -119,7 +137,8 @@ void d3d8m_after_draw(void)
                    for (unsigned k = 0; k < 11; ++k) c.st_val[k] ^= 1u;       /* every state too */
                    for (unsigned k = 0; k < 192; ++k) c.vc[k][0] += 1.0f;     /* and every constant */
                    for (unsigned k = 0; k < 57; ++k) c.ps[k] ^= 0x1u;          /* and every shader word */
-                   for (unsigned u = 0; u < 4; ++u) c.tss[u][0] ^= 0x2u; } }  /* and every stage's address */
+                   for (unsigned u = 0; u < 4; ++u) c.tss[u][0] ^= 0x2u;     /* and every stage's address */
+                   if (c.vs_nwords) c.vs_words[0] ^= 1u; } }                 /* and every program */
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);
