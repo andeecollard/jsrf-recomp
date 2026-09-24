@@ -57,8 +57,8 @@ static int d3d8m_on(void)
         const char *e = getenv("RECOMP_D3D8_MIRROR");
         m = e && e[0] && strcmp(e, "0") != 0;
         fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_MIRROR=%s\n", m ? "on" : "off");
-        /* G51.1: the host's 2D shadow is fed by the mirror's checks. */
-        if (!m && d3d8_host_2d_mode()) {
+        /* G51.1/G51.3: the host's 2D and FF shadows are fed by the mirror's checks. */
+        if (!m && (d3d8_host_2d_mode() || d3d8_host_ff_mode())) {
             m = 1;
             fprintf(stderr, "[D3D8-MIRROR] armed by RECOMP_D3D8_HOST_2D\n");
         }
@@ -450,12 +450,12 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
 
 void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
-    uint32_t d, rt, zs, tok;
+    uint32_t d, rt, zs, tok, h;
     int mode;
-    if (!d3d8m_on() || !(mode = d3d8_host_2d_mode())) return;
-    d = MEM32(0x0019DCE0u);
-    if (!d3d8_host_2d_is_fvf_xyzrhw(MEM32(d + 0x384u))) return;
-    if (mode == 2) {
+    if (!d3d8m_on()) return;
+    mode = d3d8_host_2d_mode();
+    d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
+    if (mode == 2 && d3d8_host_2d_is_fvf_xyzrhw(h)) {
         /* Draw mode: the whole description goes ahead of the draw's commands.
          * The host draws it there, in the executor's target, and tells the
          * executor to skip the batches that follow until the check token. */
@@ -470,6 +470,7 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
         d3d8m_put_token(tok);
         return;
     }
+    if (!d3d8_host_shadow_wants_handle(h)) return;
     rt = MEM32(d + 0x2070u); zs = MEM32(d + 0x2074u);
     tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
                                    rt ? MEM32(rt + 0x10u) : 0u, zs ? MEM32(zs + 4u) : 0u, zs ? MEM32(zs + 0x10u) : 0u);
@@ -496,7 +497,7 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long
      * before the token is reached. */
-    if (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_fvf_xyzrhw(MEM32(MEM32(0x0019DCE0u) + 0x384u)))
+    if (d3d8_host_shadow_wants_handle(MEM32(MEM32(0x0019DCE0u) + 0x384u)))
         d3d8m_snap_indices(&c, kind, a2, a3);
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */

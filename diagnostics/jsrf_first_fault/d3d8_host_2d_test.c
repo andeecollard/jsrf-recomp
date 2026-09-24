@@ -39,11 +39,17 @@
 #include "d3d8_ff_combiner.h"
 #include "nv2a_metal.h"
 #include "nv2a_texture_copy.h"
+#include "nv2a_ff.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* d3d8_host.c brings nv2a_pusher.c, whose dispatch names the executor and the
+ * D3D11 sink; neither is reached here (as in d3d8_streams_test.c). */
+int pgraph_d3d11_method(int subch, uint32_t m, uint32_t p) { (void)subch; (void)m; (void)p; return 1; }
+void nv2a_pb_exec_method(uint32_t s, uint32_t m, uint32_t p) { (void)s; (void)m; (void)p; }
 
 #define RAM_SIZE (4u << 20)
 static uint8_t *ram;
@@ -542,6 +548,122 @@ static void shadow_flow(D3D8HostDrawCheck *c, int control)
               after.exact - before.exact, after.within - before.within);
 }
 
+/* ---- G51.3: a fixed-function 3D draw ----
+ * FVF 0x142 (XYZ, DIFFUSE, TEX1), WORLD/VIEW/PROJECTION with a real
+ * perspective, lighting off, a textured MODULATE, LEQUAL with writes over
+ * cleared depth. The host builds the register file from D3D state
+ * (d3d8_host_ff_registers) and evaluates each vertex with nv2a_ff_vertex; the
+ * executor side here is nv2a_metal_draw fed the SAME unit's outputs from the
+ * same registers, so this checks the host's plumbing -- attribute fetch,
+ * z and w handling, primitive assembly, the pipeline -- not the transcription,
+ * which G42/G42b/G39 check against the executor in the game. */
+static void identity(float m[16]) { memset(m, 0, 64); m[0] = m[5] = m[10] = m[15] = 1.0f; }
+static void case_ff(D3D8HostDrawCheck *c)
+{
+    static const float P[4][3] = { { -0.7f, -0.6f, 2.0f }, { 0.8f, -0.5f, 3.0f }, { -0.6f, 0.7f, 2.5f }, { 0.75f, 0.8f, 4.0f } };
+    static const uint32_t C[4] = { 0xFFFF8040u, 0xFF40FF80u, 0xFF8040FFu, 0xFFFFFFFFu };
+    static const float UV[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+    base_check(c);
+    for (int i = 0; i < 4; ++i) {                        /* 12 + 4 + 8 = 24 bytes */
+        uint32_t v = VB + 24u * i;
+        putf(v, P[i][0]); putf(v + 4, P[i][1]); putf(v + 8, P[i][2]); put32(v + 12, C[i]);
+        putf(v + 16, UV[i][0]); putf(v + 20, UV[i][1]);
+    }
+    make_texture();
+    c->vs_handle = 0x142;
+    c->draw_kind = 1; c->prim = 6; c->start = 0; c->count = 4;
+    c->va_on = (1u << 0) | (1u << 3) | (1u << 9);
+    c->va_offset[0] = VB;      c->va_format[0] = (24u << 8) | 0x32u;
+    c->va_offset[3] = VB + 12; c->va_format[3] = (24u << 8) | 0x40u;
+    c->va_offset[9] = VB + 16; c->va_format[9] = (24u << 8) | 0x22u;
+    c->tex[0] = 0x5678; c->data[0] = TEX;
+    c->format[0] = 0x1u | 0x20u | (0x06u << 8) | (1u << 16) | (5u << 20) | (5u << 24);
+    c->ffc_cur.texture_bound_mask = 1;
+    c->ffc_cur.tss[0][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_MODULATE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_TEXTURE; c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG2] = D3D8FF_TA_DIFFUSE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
+    /* Transforms: world and view identity, a perspective projection (z/w in 0..1). */
+    identity(c->xf_world); identity(c->xf_view); identity(c->xf_proj);
+    c->xf_proj[10] = 1.2f; c->xf_proj[11] = 1.0f; c->xf_proj[14] = -1.2f; c->xf_proj[15] = 0.0f;
+    c->xf_seen = 7;
+    memcpy(c->imv_cur.world, c->xf_world, 64); memcpy(c->imv_cur.view, c->xf_view, 64);
+    c->zs = 0x2345; c->zs_data = ZS; c->zs_format = 0x1u | (0x2Eu << 8);
+    c->zs_size = (RTW - 1) | ((RTH - 1) << 12) | ((ZSPITCH / 64 - 1) << 24);
+    set_state(c, 0x30C, 1); set_state(c, 0x354, 0x203); set_state(c, 0x35C, 1);
+}
+/* The executor's side for a fixed-function draw: its own vertex unit on the
+ * same register file, outputs straight to nv2a_metal_draw (no snap). */
+static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, const uint32_t *ffm, uint16_t *target, uint8_t *depth)
+{
+    static float v[64][16][4];
+    static NV2ATextureCopy s;
+    memset(&s, 0, sizeof s);
+    s.clip_w = RTW; s.clip_h = RTH; s.target_pitch = RTPITCH; s.target_bpp = 2; s.depth_pitch = RTW * 4;
+    s.z_clip_min = 0.0f; s.z_clip_max = 16777215.0f; s.z_cull = 1;
+    s.combiner_count = d->cc;
+    memcpy(s.color_icw, d->ci, sizeof s.color_icw); memcpy(s.alpha_icw, d->ai, sizeof s.alpha_icw);
+    memcpy(s.color_ocw, d->co, sizeof s.color_ocw); memcpy(s.alpha_ocw, d->ao, sizeof s.alpha_ocw);
+    memcpy(s.const0, d->k0, sizeof s.const0); memcpy(s.const1, d->k1, sizeof s.const1);
+    s.texture_mask = d->tmask; s.untextured = !(d->tmask & 1); s.modulate = 1;
+    s.width = s.height = TW; s.pitch = TW * 4; s.levels = 1; s.rgba8 = 1; s.min_filter = 2; s.linear = 1;
+    s.depth_test = d->depth_test; s.depth_write = d->depth_write; s.depth_func = d->depth_func;
+    for (unsigned k = 0; k < c->count; ++k) {
+        float in[16][4];
+        for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0; in[a][3] = 1; }
+        memcpy(in[0], ram + VB + 24u * k, 12);
+        { uint32_t col; memcpy(&col, ram + VB + 24u * k + 12, 4);
+          in[3][0] = ((col >> 16) & 255) / 255.0f; in[3][1] = ((col >> 8) & 255) / 255.0f; in[3][2] = (col & 255) / 255.0f; in[3][3] = (col >> 24) / 255.0f; }
+        memcpy(in[9], ram + VB + 24u * k + 16, 8);
+        if (nv2a_ff_vertex(ffm, (const float (*)[4])in, v[k])) return 0;
+    }
+    nv2a_metal_invalidate(NULL);
+    if (nv2a_metal_draw(&s, ram + TEX, TW * TW * 4, (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
+                        (const float (*)[16][4])v, c->count, c->prim) < 0) {
+        printf("executor refused the FF draw: %s\n", nv2a_metal_last_reject()); return 0;
+    }
+    nv2a_metal_sync();
+    return 1;
+}
+static void compare_ff(int control)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH], ec[RTW * RTH];
+    static uint32_t ffm[2048];
+    const char *name = control ? "fixed-function quad CONTROL" : "fixed-function quad", *why;
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df; unsigned steps = 0;
+    case_ff(&c);
+    CHECK(d3d8_host_2d_class(&c) == 2, "%s: FVF 0x142 is the fixed-function class", name);
+    why = d3d8_host_ff_registers(&c, ffm);
+    CHECK(!why, "%s: register file from D3D state (%s)", name, why ? why : "built");
+    if (why) return;
+    { float x; memcpy(&x, &ffm[0x680 / 4], 4); CHECK(x != 0.0f, "%s: COMPOSITE written", name); }
+    for (unsigned y = 0; y < RTH; ++y)                     /* cleared depth */
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, control, NULL, ffm, nv2a_ff_vertex, &d);
+    CHECK(!why && d.nverts == 6, "%s: host builds it through nv2a_ff_vertex (%s)", name, why ? why : "built");
+    if (why) return;
+    background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) { ++fails; return; }
+    nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+    unsigned x0 = (unsigned)d.bb_x0, y0 = (unsigned)d.bb_y0, w = (unsigned)(d.bb_x1 - d.bb_x0 + 1), h = (unsigned)(d.bb_y1 - d.bb_y0 + 1);
+    for (unsigned k = 0; k < w * h; ++k) zhost[k] = 1.0f;
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho + y0 * (RTPITCH / 2) + x0, RTPITCH / 2, zhost, x0, y0, w, h) != 0) { ++fails; return; }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    for (unsigned y = 0; y < h; ++y) memcpy(ec + y * w, zexec + (y0 + y) * RTW + x0, w * sizeof(float));
+    unsigned long long zb = d3d8_host_2d_depth_diff(ec, zhost, (size_t)w * h, 1, &steps);
+    printf("  %s: executor changed %llu, host %llu, over tolerance %llu, max r%u g%u b%u | depth %llu px, worst %u\n",
+           name, df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1], df.max_err[2], zb, steps);
+    CHECK(df.exec_changed > 500, "%s: the executor drew it (%llu px; perspective shrinks the quad)", name, df.exec_changed);
+    if (!control) {
+        const char *hw = getenv("RECOMP_METAL_HW_TEX");
+        unsigned long long allowed = (hw && hw[0] == '1') ? 0 : 8;
+        CHECK(df.mismatch <= allowed && zb == 0, "%s: host and executor agree, colour (%llu px over, %llu allowed) and depth (%llu)",
+              name, df.mismatch, allowed, zb);
+    } else
+        CHECK(df.mismatch > 200, "%s: the perturbed host draw differs (%llu px)", name, df.mismatch);
+}
+
 /* ---- rhw 0: a zeroed vertex in a partly filled dynamic buffer ----
  * Tutorial run 5's one mismatch. Case B's list with vertex 3 zeroed: its
  * triangle has clip w = 1/0, so the executor drops it and the host must too. */
@@ -710,6 +832,8 @@ int main(int argc, char **argv)
     compare_fullscreen(0);
     compare_fullscreen(1);
     compare_rhw0();
+    compare_ff(0);
+    compare_ff(1);
     CHECK(d3d8_host_2d_snap(0.53125f) == 0.5f && d3d8_host_2d_snap(160.53125f) == 160.5f && d3d8_host_2d_snap(-0.53125f) == -0.5f,
           "snap: 0.53125 -> 0.5, 160.53125 -> 160.5, toward zero for negatives");
     /* The proof on its own. */

@@ -1220,7 +1220,9 @@ if(APPLE)
     # bookkeeping (pre token, post token, flip) through a fake backend. Under
     # both of the executor's samplers.
     add_executable(jsrf_d3d8_host_2d_test d3d8_host_2d_test.c
-        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c"
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c"
+        "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c")
     target_link_libraries(jsrf_d3d8_host_2d_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_d3d8_host_2d COMMAND jsrf_d3d8_host_2d_test)
     add_test(NAME jsrf_d3d8_host_2d_hwtex COMMAND jsrf_d3d8_host_2d_test)

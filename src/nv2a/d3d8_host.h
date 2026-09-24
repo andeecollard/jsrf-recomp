@@ -315,6 +315,15 @@ int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawText
  * 3D draws with lighting or an eye-normal texgen. Returns 1 if every compared
  * register agrees. */
 int d3d8_host_check_ff_vertex(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
+/* G51.3: the fixed-function vertex unit's register file, from D3D state at
+ * the draw alone -- the same transcriptions the G42/G42b checks verify
+ * (texgen, texture transforms, lighting and material, inverse model-view,
+ * fog), fed the inputs as read AT the draw, plus MODELVIEW from the same
+ * updater and the COMPOSITE from WORLD*VIEW*PROJECTION*VIEWPORT exactly as
+ * G39 checks it, and VIEWPORT_OFFSET (0x0A20) = the 0.53125 bias. Fills `m`
+ * (methods 0..0x1FFC, word index = method / 4; everything else zero) for
+ * nv2a_ff_vertex. Returns NULL, or why the host cannot describe the draw. */
+const char *d3d8_host_ff_registers(const D3D8HostDrawCheck *c, uint32_t m[2048]);
 /* Mismatch count of one method (0..0x1FFC) under the G42 check. */
 unsigned long long d3d8_host_ffv_reg_mismatches(uint32_t method);
 /* G43 discovery: the distinct (stage words, TFACTOR) -> register pairings seen

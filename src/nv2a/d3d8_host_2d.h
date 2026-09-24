@@ -140,6 +140,8 @@ typedef struct {
      * triangle, drawn by the host at w = 1 as a sliver from the corner. */
     uint32_t tris_dropped_w;
     uint32_t idx_min, idx_max;                 /* over the indices drawn */
+    uint32_t cls;                              /* d3d8_host_2d_class */
+    uint32_t tris_dropped_q;                   /* textured unit q <= 0: the executor drops those too */
 } D3D8Host2DDraw;
 
 /* Is this draw pre-transformed 2D? The vertex shader handle (device +0x384)
@@ -149,6 +151,16 @@ static inline int d3d8_host_2d_is_fvf_xyzrhw(uint32_t handle)
     return !(handle & 1u) && (handle & 0x00Eu) == 0x004u;
 }
 int d3d8_host_2d_is_2d(const D3D8HostDrawCheck *c);
+/* G51.3: an FVF whose position is XYZ or XYZ plus blend weights (0x002,
+ * 0x006..0x00E): the fixed-function transform, the executor's mode 4. */
+static inline int d3d8_host_2d_is_fvf_ff(uint32_t handle)
+{
+    return !(handle & 1u) && (handle & 0x00Eu) != 0x004u && (handle & 0x00Eu) != 0u;
+}
+/* 1 pre-transformed 2D, 2 fixed-function 3D, 0 neither (programmable, or no draw). */
+int d3d8_host_2d_class(const D3D8HostDrawCheck *c);
+/* The executor's fixed-function vertex unit (nv2a_ff_vertex), handed in. */
+typedef const char *(*D3D8H2DFFVertexFn)(const uint32_t m[2048], const float in[16][4], float out[16][4]);
 
 /* Build the host's description of a 2D draw from the mirror's snapshot and
  * guest memory (`ram` is guest physical 0; `ram_size` bounds every read).
@@ -163,6 +175,12 @@ const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, s
  * this with idx = NULL. */
 const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
                                   int control, const uint16_t *idx, D3D8Host2DDraw *out);
+/* G51.3: the same for either class. A fixed-function draw needs its register
+ * file `ffm` (d3d8_host_ff_registers) and the evaluator `ffv`; each vertex is
+ * assembled from the D3D arrays and transformed, lit and texgen'd by it. */
+const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
+                                 int control, const uint16_t *idx, const uint32_t *ffm,
+                                 D3D8H2DFFVertexFn ffv, D3D8Host2DDraw *out);
 
 /* ---- the index ring: indices captured at the draw call ----
  * One producer (the thread calling D3D, through the mirror), one consumer
@@ -214,12 +232,21 @@ typedef struct {
      * (1), or does nothing (0); exec_skip turns the executor's rasteriser off
      * and on; exec_skipped counts the batches it has skipped. */
     int (*external_draw)(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
+    /* G51.3: the executor's fixed-function vertex unit, for the FF shadow. */
+    D3D8H2DFFVertexFn ff_vertex;
     void (*exec_skip)(int on);
     unsigned long long (*exec_skipped)(void);
 } D3D8Host2DBackend;
 
 /* 0 off, 1 shadow, 2 draw. Reads RECOMP_D3D8_HOST_2D once. */
 int  d3d8_host_2d_mode(void);
+/* G51.3: 0 off, 1 shadow. RECOMP_D3D8_HOST_FF=shadow: fixed-function 3D
+ * draws are drawn by the host into the same kind of scratch crop and
+ * compared with the executor exactly as the 2D shadow does. */
+int  d3d8_host_ff_mode(void);
+/* Does the shadow take this draw (pre and post tokens)? */
+int  d3d8_host_shadow_wants(const D3D8HostDrawCheck *c);
+int  d3d8_host_shadow_wants_handle(uint32_t vs_handle);
 /* Draw mode: the token before a 2D draw's commands, and the check behind them. */
 void d3d8_host_2d_replace(const D3D8HostDrawCheck *c);
 void d3d8_host_2d_after(const D3D8HostDrawCheck *c);
@@ -241,6 +268,8 @@ typedef struct {
     unsigned long long idx_from_snapshot, idx_changed, vtx_changed, exec_outside_host_box;
     unsigned long long replace_tokens, replaced, replace_refused, replace_unbound, exec_batches_skipped,
                        replaced_without_skip;
+    /* G51.3, fixed-function 3D in shadow: the same per-draw verdicts. */
+    unsigned long long ff_draws, ff_built, ff_compared, ff_exact, ff_within, ff_mismatching, ff_px, ff_px_mismatch;
 } D3D8H2DStats;
 void d3d8_host_2d_get_stats(D3D8H2DStats *out);
 
