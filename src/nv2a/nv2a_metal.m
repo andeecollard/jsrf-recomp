@@ -90,6 +90,17 @@ static inline unsigned long long mtl_now_ns(void)
 /* Full clears that dropped the surface instead of syncing it. Each one is
  * a GPU drain and a 4.9 MB readback that did not happen. */
 static id<MTLFunction> hw_vs, hw_fs, hw_fs_blend, hw_fs_early, hw_fs_early_nw;
+/* The shared library the fragment tails above came out of, kept so the
+ * combiner-specialised variants can be fetched from it later. */
+static id<MTLLibrary> hw_library;
+/* A combiner program as a pipeline key: every word shade() branches on per
+ * draw, canonicalised so draws that shade identically share a pipeline. See
+ * COMBINER SPECIALISATION in the shader and spec_pipeline_for. */
+typedef struct CombKey {
+    uint32_t cc, tmask, hw, flags;
+    uint32_t ci[8], ai[8], co[8], ao[8];
+} CombKey;
+static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey *ck);
 static unsigned long long g_mtl_discards;
 static id<MTLCommandBuffer> batch_command;
 static id<MTLRenderCommandEncoder> batch_encoder;
@@ -684,6 +695,12 @@ static void clip_audit(const float(*v)[16][4],const unsigned*idx,unsigned n,
     }
 }
 
+/* One Metal function constant per combiner word; see COMBINER SPECIALISATION
+ * in the shader. Undefined reads as 0, which only the generic path ever sees
+ * and never reads. */
+#define FC_WORD(name, idx) \
+    "constant uint fc_" name "_ [[function_constant(" #idx ")]];" \
+    "constant uint FC_" name " = is_function_constant_defined(fc_" name "_) ? fc_" name "_ : 0u;\n"
 static NSString *const shader =
 @"#include <metal_stdlib>\n"
  "using namespace metal;\n"
@@ -774,20 +791,42 @@ static NSString *const shader =
   * tails. */
  "float cmap1(uint m,float x){switch(m){case 1:return x-0.5f;case 2:return x*2.0f;case 3:return (x-0.5f)*2.0f;case 4:return x*4.0f;case 6:return x*0.5f;default:return x;}}\n"
  "float3 cmap3(uint m,float3 v){return float3(cmap1(m,v.x),cmap1(m,v.y),cmap1(m,v.z));}\n"
- "float4 shade(Out i, const device uchar*t0, constant Params&s, const device uchar*t1, const device uchar*t2, const device uchar*t3,"
- " texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3, sampler q0, sampler q1, sampler q2, sampler q3){\n"
- " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
- " if(s.texture_mask&1)tex=s.hw[0]?hw_sample(h0,q0,i.t0,0,s):sample_lod(t0,i.t0,0,s);"
- " if(s.combiner_count){float4 r[14];for(uint n=0;n<14;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
- " if(s.texture_mask&2)r[9]=s.hw[1]?hw_sample(h1,q1,i.t1,1,s):sample_lod(t1,i.t1,1,s);if(s.texture_mask&4)r[10]=s.hw[2]?hw_sample(h2,q2,i.t2,2,s):sample_lod(t2,i.t2,2,s);if(s.texture_mask&8)r[11]=s.hw[3]?hw_sample(h3,q3,i.t3,3,s):sample_lod(t3,i.t3,3,s);"
- " r[12].a=(s.texture_mask&1)?r[8].a:1;for(uint stage=0;stage<s.combiner_count;stage++){float4 ab,cd;"
+ /* COMBINER SPECIALISATION: THE PROGRAM AS FUNCTION CONSTANTS.
+  *
+  * shade() interprets the combiners per pixel: a loop over a run-time stage
+  * count, four input switches per channel, and a float4 r[14] written at
+  * indices known only at run time, which forces r[] into memory. A title
+  * uses a handful of combiner programs -- JSRF's fixed-function draws, 13 in
+  * a whole tutorial -- so the host builds one pipeline per program with the
+  * words below set (see spec_pipeline_for), and the compiler unrolls the
+  * stages, folds every switch and keeps r[] in registers.
+  *
+  * FC_SPEC false, or undefined, is the generic interpreter, and every entry
+  * point is fetched with it set false (frag_fn), because a function that
+  * reads a function constant cannot be used unspecialised at all. The stage
+  * body is ONE function, comb_stage, called by both the interpreter loop and
+  * the unrolled calls, so the two cannot drift: the same float operations in
+  * the same order, which is what metal_combiner_spec_test holds byte-exact.
+  * Array constants are not allowed, hence one constant per word. const0 and
+  * const1 stay in Params: they change per draw. */
+ "constant bool fc_spec_ [[function_constant(0)]];\n"
+ "constant bool FC_SPEC = is_function_constant_defined(fc_spec_) && fc_spec_;\n"
+ FC_WORD("CC",1) FC_WORD("TMASK",2) FC_WORD("HW",3) FC_WORD("FLAGS",4)
+ FC_WORD("ci0",8) FC_WORD("ci1",9) FC_WORD("ci2",10) FC_WORD("ci3",11)
+ FC_WORD("ci4",12) FC_WORD("ci5",13) FC_WORD("ci6",14) FC_WORD("ci7",15)
+ FC_WORD("ai0",16) FC_WORD("ai1",17) FC_WORD("ai2",18) FC_WORD("ai3",19)
+ FC_WORD("ai4",20) FC_WORD("ai5",21) FC_WORD("ai6",22) FC_WORD("ai7",23)
+ FC_WORD("co0",24) FC_WORD("co1",25) FC_WORD("co2",26) FC_WORD("co3",27)
+ FC_WORD("co4",28) FC_WORD("co5",29) FC_WORD("co6",30) FC_WORD("co7",31)
+ FC_WORD("ao0",32) FC_WORD("ao1",33) FC_WORD("ao2",34) FC_WORD("ao3",35)
+ FC_WORD("ao4",36) FC_WORD("ao5",37) FC_WORD("ao6",38) FC_WORD("ao7",39)
+ "inline void comb_stage(thread float4 *r,uint stage,uint ciw,uint aiw,uint cw,uint aw,constant Params&s){"
  " uint k0=s.const0[stage],k1=s.const1[stage];"
  " r[1]=float4(float((k0>>16)&255),float((k0>>8)&255),float(k0&255),float((k0>>24)&255))/255.0f;"
  " r[2]=float4(float((k1>>16)&255),float((k1>>8)&255),float(k1&255),float((k1>>24)&255))/255.0f;"
- " for(uint k=0;k<4;k++){uint word=k==3?s.alpha_icw[stage]:s.color_icw[stage];uint ch=k==3?2:k;"
+ " float4 ab,cd;for(uint k=0;k<4;k++){uint word=k==3?aiw:ciw;uint ch=k==3?2:k;"
  " float a=input(word>>24,ch,r),b=input((word>>16)&255,ch,r),cc=input((word>>8)&255,ch,r),d=input(word&255,ch,r);"
  " ab[k]=a*b;cd[k]=cc*d;}"
- " uint cw=s.color_ocw[stage],aw=s.alpha_ocw[stage];"
  " float3 abr=((cw>>13)&1)?float3(ab.r+ab.g+ab.b):ab.rgb;"
  " float3 cdr=((cw>>12)&1)?float3(cd.r+cd.g+cd.b):cd.rgb;"
  " uint mx=(cw>>14)&1,mp=(cw>>15)&7;"
@@ -803,9 +842,35 @@ static NSString *const shader =
  " if(aab)r[aab].a=clamp(cmap1(amp,ab.a),-1.0f,1.0f);"
  " if(asum)r[asum].a=clamp(cmap1(amp,amx?((r[12].a>=0.5f)?ab.a:cd.a):(ab.a+cd.a)),-1.0f,1.0f);"
  " if(((cw>>19)&1)&&dab)r[dab].a=clamp(abr.b,-1.0f,1.0f);"
- " if(((cw>>18)&1)&&dcd)r[dcd].a=clamp(cdr.b,-1.0f,1.0f);}"
- " c=clamp(r[12]+(s.add_specular?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
- " else if(!s.untextured){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(s.modulate?c.a:1);if(s.modulate)c.rgb*=max(float3(0),d0.rgb);}"
+ " if(((cw>>18)&1)&&dcd)r[dcd].a=clamp(cdr.b,-1.0f,1.0f);}\n"
+ "float4 shade(Out i, const device uchar*t0, constant Params&s, const device uchar*t1, const device uchar*t2, const device uchar*t3,"
+ " texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3, sampler q0, sampler q1, sampler q2, sampler q3){\n"
+ /* Every per-draw branch shade() takes, from the constants when specialised
+  * and from Params otherwise. Under FC_SPEC == false each of these folds to
+  * exactly the Params read it replaced. */
+ " uint tmask=FC_SPEC?FC_TMASK:s.texture_mask,ncomb=FC_SPEC?FC_CC:s.combiner_count;"
+ " bool hw0=FC_SPEC?(FC_HW&1u)!=0:s.hw[0]!=0,hw1=FC_SPEC?(FC_HW&2u)!=0:s.hw[1]!=0,"
+ "hw2=FC_SPEC?(FC_HW&4u)!=0:s.hw[2]!=0,hw3=FC_SPEC?(FC_HW&8u)!=0:s.hw[3]!=0;"
+ " bool addspec=FC_SPEC?(FC_FLAGS&1u)!=0:s.add_specular!=0,untex=FC_SPEC?(FC_FLAGS&2u)!=0:s.untextured!=0,"
+ "modul=FC_SPEC?(FC_FLAGS&4u)!=0:s.modulate!=0;"
+ " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
+ " if(tmask&1)tex=hw0?hw_sample(h0,q0,i.t0,0,s):sample_lod(t0,i.t0,0,s);"
+ " if(ncomb){float4 r[14];for(uint n=0;n<14;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
+ " if(tmask&2)r[9]=hw1?hw_sample(h1,q1,i.t1,1,s):sample_lod(t1,i.t1,1,s);if(tmask&4)r[10]=hw2?hw_sample(h2,q2,i.t2,2,s):sample_lod(t2,i.t2,2,s);if(tmask&8)r[11]=hw3?hw_sample(h3,q3,i.t3,3,s):sample_lod(t3,i.t3,3,s);"
+ " r[12].a=(tmask&1)?r[8].a:1;"
+ " if(FC_SPEC){"
+ " if(FC_CC>0u)comb_stage(r,0u,FC_ci0,FC_ai0,FC_co0,FC_ao0,s);"
+ " if(FC_CC>1u)comb_stage(r,1u,FC_ci1,FC_ai1,FC_co1,FC_ao1,s);"
+ " if(FC_CC>2u)comb_stage(r,2u,FC_ci2,FC_ai2,FC_co2,FC_ao2,s);"
+ " if(FC_CC>3u)comb_stage(r,3u,FC_ci3,FC_ai3,FC_co3,FC_ao3,s);"
+ " if(FC_CC>4u)comb_stage(r,4u,FC_ci4,FC_ai4,FC_co4,FC_ao4,s);"
+ " if(FC_CC>5u)comb_stage(r,5u,FC_ci5,FC_ai5,FC_co5,FC_ao5,s);"
+ " if(FC_CC>6u)comb_stage(r,6u,FC_ci6,FC_ai6,FC_co6,FC_ao6,s);"
+ " if(FC_CC>7u)comb_stage(r,7u,FC_ci7,FC_ai7,FC_co7,FC_ao7,s);"
+ " }else for(uint stage=0;stage<s.combiner_count;stage++)"
+ "comb_stage(r,stage,s.color_icw[stage],s.alpha_icw[stage],s.color_ocw[stage],s.alpha_ocw[stage],s);"
+ " c=clamp(r[12]+(addspec?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
+ " else if(!untex){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(modul?c.a:1);if(modul)c.rgb*=max(float3(0),d0.rgb);}"
   /* RECOMP_FRAG_FORCE -- REPLACE THE FRAGMENT WITH ONE OF ITS OWN INPUTS.
   *
   * The intro attract camera draws a scene in which the distant city is
@@ -1473,13 +1538,18 @@ static int initialize(void)
 #pragma clang diagnostic pop
     id<MTLLibrary> library=[device newLibraryWithSource:shader options:options error:&error];
     if(library){MTLRenderPipelineDescriptor *desc=[MTLRenderPipelineDescriptor new];
-        desc.vertexFunction=[library newFunctionWithName:@"vs"];desc.fragmentFunction=[library newFunctionWithName:@"fs"];
+        /* Every fragment entry point reads the combiner-specialisation
+         * constants through shade(), so each is fetched through frag_fn with
+         * FC_SPEC false -- Metal refuses to build a pipeline from a function
+         * whose constants were never given values. */
+        hw_library=library;
+        desc.vertexFunction=[library newFunctionWithName:@"vs"];desc.fragmentFunction=frag_fn(library,@"fs",NULL);
         /* Retained for the hardware-state pipelines, which are built lazily
          * per distinct blend state rather than once here. */
-        hw_vs=[library newFunctionWithName:@"vs"];hw_fs=[library newFunctionWithName:@"fs_hw"];
-        hw_fs_blend=[library newFunctionWithName:@"fs_hw_blend"];
-        hw_fs_early=[library newFunctionWithName:@"fs_hw_early"];
-        hw_fs_early_nw=[library newFunctionWithName:@"fs_hw_early_nw"];
+        hw_vs=[library newFunctionWithName:@"vs"];hw_fs=frag_fn(library,@"fs_hw",NULL);
+        hw_fs_blend=frag_fn(library,@"fs_hw_blend",NULL);
+        hw_fs_early=frag_fn(library,@"fs_hw_early",NULL);
+        hw_fs_early_nw=frag_fn(library,@"fs_hw_early_nw",NULL);
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
         pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -2328,15 +2398,17 @@ static struct { const void *fn; uint32_t blend,src,dst,sblend,early;
 static unsigned vsh_pso_n;
 static uint64_t g_vsh_pso_full;
 
+/* sblend and early come from the caller, which asks hw_shader_blend and
+ * hw_early_z ONCE per draw: hw_early_z counts as it answers, and the
+ * specialised lookup in front of this one asks the same question. */
 static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
-                                                   VshSlot *prog)
+                                                   VshSlot *prog,
+                                                   uint32_t sblend, uint32_t early)
 {
-    uint32_t sblend = (uint32_t)hw_shader_blend(s);
     /* The variant is part of the key, not a property of the draw: two draws
      * with identical blend state and different discard state need different
      * pipelines, and a key that cannot tell them apart would hand an
      * alpha-tested draw the function whose depth write has already happened. */
-    uint32_t early = sblend ? (uint32_t)hw_early_z(s) : 0u;   /* 0, 1 or 2: && would fold 2 into 1 */
     unsigned i;
     for (i = 0; i < vsh_pso_n; ++i)
         if (vsh_pso[i].fn == (__bridge const void *)prog->fn
@@ -2363,10 +2435,10 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
          * library and a pipeline that straddles them matches its stage_in by
          * position rather than by name. Taking both halves from one library is
          * what makes the repacking wrapper sound. */
-        d.fragmentFunction = [prog->library newFunctionWithName:
+        d.fragmentFunction = frag_fn(prog->library,
                                 early == 2 ? @"fs_hw_early_nw"
                               : early  ? @"fs_hw_early"
-                              : sblend ? @"fs_hw_blend" : @"fs_hw"];
+                              : sblend ? @"fs_hw_blend" : @"fs_hw", NULL);
         if (!d.fragmentFunction) return nil;
         d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
                                                         : MTLPixelFormatRGBA32Float;
@@ -2392,11 +2464,10 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
     }
 }
 
-static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
+static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s,
+                                                  uint32_t sblend, uint32_t early)
 {
     unsigned i;
-    uint32_t sblend = (uint32_t)hw_shader_blend(s);
-    uint32_t early = sblend ? (uint32_t)hw_early_z(s) : 0u;   /* 0, 1 or 2: && would fold 2 into 1 */
     for (i = 0; i < hw_pso_n; ++i)
         if (hw_pso[i].blend == s->blend && hw_pso[i].src == s->blend_src
             && hw_pso[i].dst == s->blend_dst && hw_pso[i].sblend == sblend
@@ -2512,6 +2583,233 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s)
     hw_pso[hw_pso_n].pso = pso;
     ++hw_pso_n;
     return pso;
+}
+
+/* ===== COMBINER SPECIALISATION: A PIPELINE PER COMBINER PROGRAM ==========
+ *
+ * RECOMP_METAL_SPECIALISE_COMBINERS, default ON; =0 is the control arm and is
+ * the generic interpreter exactly as it ran before this existed.
+ *
+ * WHY. shade() interprets the register combiners for every pixel of every
+ * draw: a loop over a run-time stage count, four input switches per channel,
+ * and a float4 r[14] written at run-time indices, which puts the register
+ * file in memory. Measured 24 Sep 2026 with the player's configuration: the
+ * tutorial spends ~10.4 ms of a 17.7 ms frame executing on the GPU for ~71
+ * draws at 640x480, and over the whole tutorial the fixed-function draws use
+ * only 13 distinct combiner setups. A program known when the pipeline is
+ * built lets the compiler unroll the stages, resolve every switch, and keep
+ * r[] in registers -- and the whole cost is one compile per program.
+ *
+ * EXACT, NOT CLOSE. Both arms run the same comb_stage() on the same values in
+ * the same order, so specialising must not move a single bit;
+ * metal_combiner_spec_check.sh holds that byte-for-byte over the D3D
+ * fixed-function setups and a set of arbitrary programs, with a positive
+ * control (RECOMP_METAL_SPECIALISE_COMBINERS_CONTROL, below) that must differ.
+ *
+ * THE KEY is the combiner program (CombKey: stage count, texture mask, which
+ * units sample in hardware, add_specular/untextured/modulate, and the four
+ * words of each live stage -- dead stages' words are zeroed so they cannot
+ * split the cache), plus everything the generic pipeline caches key on: the
+ * vertex function (the fixed `vs` or the guest program's), the blend state,
+ * the shader-blend selector and the early-Z variant.
+ *
+ * BOUNDED, and the bound is a fallback, never a refusal: when the table is
+ * full or a compile fails, the draw takes the generic pipeline, which is
+ * always correct. A failed compile is remembered so it is not retried every
+ * draw. The compile is SYNCHRONOUS, on the draw thread, so the first draw of
+ * each new program stalls for it -- see [METAL] combiner specialisation's
+ * compile time and worst; asynchronous compilation is the follow-up if the
+ * worst case shows up as a hitch. */
+static int spec_combiners_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_METAL_SPECIALISE_COMBINERS",1); return on; }
+/* THE POSITIVE CONTROL. Specialises on deliberately WRONG words -- stage 0's
+ * colour input A with its mapping's low bit flipped, which turns
+ * UNSIGNED_IDENTITY into UNSIGNED_INVERT -- so a scene that cannot tell a
+ * wrong specialisation from a right one says so. Renders incorrectly by
+ * construction; the check script is its only user. */
+static int spec_control_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_SPECIALISE_COMBINERS_CONTROL"); return on; }
+
+#define SPEC_FN_CACHE  512
+#define SPEC_PSO_CACHE 512
+static struct { const void *lib; NSString *name; int generic; uint64_t h; CombKey ck;
+                id<MTLFunction> fn; } spec_fn[SPEC_FN_CACHE];
+static unsigned spec_fn_n;
+static struct { const void *vfn; uint32_t blend,src,dst,sblend,early; uint64_t h; CombKey ck;
+                id<MTLRenderPipelineState> pso; int failed; } spec_pso[SPEC_PSO_CACHE];
+static unsigned spec_pso_n;
+static uint64_t g_spec_built, g_spec_hits, g_spec_fns, g_spec_generic_fns;
+static uint64_t g_spec_fb_full, g_spec_fb_failed, g_spec_fb_wide, g_spec_compile_ns, g_spec_compile_max_ns;
+
+static uint64_t spec_hash(const void *p, size_t n, uint64_t h)
+{ const uint8_t *b = p; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; }
+
+/* Returns 0 for a program the shader cannot be specialised on: a stage count
+ * past the eight words it has constants for. */
+static int comb_key(const NV2ATextureCopy *s, unsigned hwmask, CombKey *k)
+{
+    if (s->combiner_count > 8) return 0;
+    memset(k, 0, sizeof *k);
+    k->cc = s->combiner_count;
+    k->tmask = s->texture_mask & 15u;
+    k->hw = hwmask & k->tmask;
+    if (k->cc) {
+        /* untextured and modulate are only read when there are no stages */
+        k->flags = s->add_specular ? 1u : 0u;
+        for (uint32_t i = 0; i < k->cc; ++i) {
+            k->ci[i] = s->color_icw[i]; k->ai[i] = s->alpha_icw[i];
+            k->co[i] = s->color_ocw[i]; k->ao[i] = s->alpha_ocw[i];
+        }
+    } else
+        k->flags = (s->untextured ? 2u : 0u) | (s->modulate ? 4u : 0u);
+    return 1;
+}
+
+/* A fragment entry point out of `lib`: specialised on `ck`, or with ck NULL
+ * the generic interpreter (FC_SPEC false). Cached per library, because the
+ * guest-program pipelines take their fragment function out of the program's
+ * own library (see vsh_pipeline_for) and asking Metal for a specialised
+ * function compiles it. nil on failure; a full table still answers the
+ * generic request, uncached, because the generic function is the fallback. */
+static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey *ck)
+{
+    const void *lp = (__bridge const void *)lib;
+    uint64_t h = spec_hash(&lp, sizeof lp, 1469598103934665603ull);
+    unsigned i;
+    h = spec_hash(name.UTF8String, strlen(name.UTF8String), h);
+    if (ck) h = spec_hash(ck, sizeof *ck, h);
+    for (i = 0; i < spec_fn_n; ++i)
+        if (spec_fn[i].h == h && spec_fn[i].lib == lp && spec_fn[i].generic == !ck
+            && [spec_fn[i].name isEqualToString:name]
+            && (!ck || !memcmp(&spec_fn[i].ck, ck, sizeof *ck)))
+            return spec_fn[i].fn;
+    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+    bool on = ck != NULL;
+    [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
+    if (ck) {
+        CombKey k = *ck;
+        if (spec_control_on()) k.ci[0] ^= 0x20000000u;
+        [cv setConstantValue:&k.cc type:MTLDataTypeUInt atIndex:1];
+        [cv setConstantValue:&k.tmask type:MTLDataTypeUInt atIndex:2];
+        [cv setConstantValue:&k.hw type:MTLDataTypeUInt atIndex:3];
+        [cv setConstantValue:&k.flags type:MTLDataTypeUInt atIndex:4];
+        [cv setConstantValues:k.ci type:MTLDataTypeUInt withRange:NSMakeRange(8, 8)];
+        [cv setConstantValues:k.ai type:MTLDataTypeUInt withRange:NSMakeRange(16, 8)];
+        [cv setConstantValues:k.co type:MTLDataTypeUInt withRange:NSMakeRange(24, 8)];
+        [cv setConstantValues:k.ao type:MTLDataTypeUInt withRange:NSMakeRange(32, 8)];
+    }
+    NSError *err = nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:name constantValues:cv error:&err];
+    if (!fn) {
+        static int told;
+        if (!told++) fprintf(stderr, "[METAL] %s fragment function %s failed: %s\n",
+                             ck ? "specialised" : "generic", name.UTF8String,
+                             err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    if (ck) ++g_spec_fns; else ++g_spec_generic_fns;
+    if (spec_fn_n < SPEC_FN_CACHE) {
+        spec_fn[spec_fn_n].lib = lp; spec_fn[spec_fn_n].name = name;
+        spec_fn[spec_fn_n].generic = !ck; spec_fn[spec_fn_n].h = h;
+        if (ck) spec_fn[spec_fn_n].ck = *ck; else memset(&spec_fn[spec_fn_n].ck, 0, sizeof(CombKey));
+        spec_fn[spec_fn_n].fn = fn; ++spec_fn_n;
+    }
+    return fn;
+}
+
+/* The specialised pipeline for this draw, or nil for "use the generic one".
+ * prog is the guest vertex program when one is active, else the fixed `vs`.
+ * Blend and attachment setup mirror hw_pipeline_for/vsh_pipeline_for; an
+ * untranslatable blend returns nil uncounted so the generic lookup refuses it
+ * with its own counter, exactly as before. */
+static id<MTLRenderPipelineState> spec_pipeline_for(const NV2ATextureCopy *s, unsigned hwmask,
+                                                    VshSlot *prog, uint32_t sblend, uint32_t early)
+{
+    CombKey ck;
+    const void *vfn;
+    uint64_t h;
+    unsigned i;
+    if (!spec_combiners_on()) return nil;
+    if (!comb_key(s, hwmask, &ck)) { ++g_spec_fb_wide; return nil; }
+    vfn = prog ? (__bridge const void *)prog->fn : (__bridge const void *)hw_vs;
+    h = spec_hash(&ck, sizeof ck, spec_hash(&vfn, sizeof vfn, 1469598103934665603ull));
+    {   uint32_t b[5] = { s->blend, s->blend_src, s->blend_dst, sblend, early };
+        h = spec_hash(b, sizeof b, h); }
+    for (i = 0; i < spec_pso_n; ++i)
+        if (spec_pso[i].h == h && spec_pso[i].vfn == vfn
+            && spec_pso[i].blend == s->blend && spec_pso[i].src == s->blend_src
+            && spec_pso[i].dst == s->blend_dst && spec_pso[i].sblend == sblend
+            && spec_pso[i].early == early && !memcmp(&spec_pso[i].ck, &ck, sizeof ck)) {
+            if (spec_pso[i].failed) { ++g_spec_fb_failed; return nil; }
+            ++g_spec_hits; return spec_pso[i].pso;
+        }
+    if (spec_pso_n >= SPEC_PSO_CACHE) { ++g_spec_fb_full; return nil; }
+    int sf = MTLBlendFactorOne, df = MTLBlendFactorZero;
+    if (s->blend) {
+        if (!nv2a_texture_copy_blend_factor_supported(s->blend_src)
+         || !nv2a_texture_copy_blend_factor_supported(s->blend_dst)) return nil;
+        sf = nv2a_metal_blend_factor(s->blend_src);
+        df = nv2a_metal_blend_factor(s->blend_dst);
+        if (sf < 0 || df < 0) return nil;
+    }
+    unsigned long long t0 = mtl_now_ns();
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    id<MTLRenderPipelineState> pso = nil;
+    NSError *err = nil;
+    d.vertexFunction = prog ? prog->fn : hw_vs;
+    d.fragmentFunction = frag_fn(prog ? prog->library : hw_library,
+                                 early == 2 ? @"fs_hw_early_nw"
+                               : early  ? @"fs_hw_early"
+                               : sblend ? @"fs_hw_blend" : @"fs_hw", &ck);
+    if (d.vertexFunction && d.fragmentFunction) {
+        d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
+                                                        : MTLPixelFormatRGBA32Float;
+        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+        if (s->blend && !sblend) {
+            d.colorAttachments[0].blendingEnabled = YES;
+            d.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            d.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+            d.colorAttachments[0].sourceRGBBlendFactor = (MTLBlendFactor)sf;
+            d.colorAttachments[0].destinationRGBBlendFactor = (MTLBlendFactor)df;
+            d.colorAttachments[0].sourceAlphaBlendFactor = (MTLBlendFactor)sf;
+            d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
+        }
+        pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!pso) {
+            static int told;
+            if (!told++) fprintf(stderr, "[METAL] specialised pipeline failed: %s\n",
+                                 err ? err.localizedDescription.UTF8String : "(no error)");
+        }
+    }
+    {   unsigned long long dt = mtl_now_ns() - t0;
+        g_spec_compile_ns += dt; if (dt > g_spec_compile_max_ns) g_spec_compile_max_ns = dt; }
+    spec_pso[spec_pso_n].vfn = vfn; spec_pso[spec_pso_n].h = h; spec_pso[spec_pso_n].ck = ck;
+    spec_pso[spec_pso_n].blend = s->blend; spec_pso[spec_pso_n].src = s->blend_src;
+    spec_pso[spec_pso_n].dst = s->blend_dst; spec_pso[spec_pso_n].sblend = sblend;
+    spec_pso[spec_pso_n].early = early;
+    spec_pso[spec_pso_n].pso = pso; spec_pso[spec_pso_n].failed = pso == nil;
+    ++spec_pso_n;
+    if (!pso) { ++g_spec_fb_failed; return nil; }
+    ++g_spec_built;
+    return pso;
+}
+
+static void spec_report(void)
+{
+    uint64_t fb = g_spec_fb_full + g_spec_fb_failed + g_spec_fb_wide;
+    fprintf(stderr, "[METAL] combiner specialisation: built=%llu hits=%llu fallbacks=%llu"
+            " (cache full %llu, compile failed %llu, >8 stages %llu); %llu specialised"
+            " functions, %llu generic; %.1f ms compiling, worst %.1f ms"
+            " (metal_specialise_combiners %s)%s\n",
+            (unsigned long long)g_spec_built, (unsigned long long)g_spec_hits,
+            (unsigned long long)fb, (unsigned long long)g_spec_fb_full,
+            (unsigned long long)g_spec_fb_failed, (unsigned long long)g_spec_fb_wide,
+            (unsigned long long)g_spec_fns, (unsigned long long)g_spec_generic_fns,
+            g_spec_compile_ns / 1e6, g_spec_compile_max_ns / 1e6,
+            spec_combiners_on() ? "on" : "OFF",
+            spec_control_on() ? " -- POSITIVE CONTROL: specialised on WRONG words,"
+                                " renders incorrectly" : "");
 }
 
 /* THE TWO BISECT SWITCHES, AS PREDICATES THAT CAN NAME THEMSELVES.
@@ -3494,6 +3792,7 @@ void nv2a_metal_report(void)
             (unsigned long long)g_hw_pipeline_misses,
             (unsigned long long)g_hw_state_refusals,
             hw_state_on()?"on":"OFF");
+    spec_report();
     /* THE BISECT ARMS NAME THEMSELVES, in both states and unconditionally.
      *
      * Each of these renders incorrectly by construction, so a run carrying one
@@ -5820,9 +6119,17 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * textures existed for all 311,949 of them. The repair is for the case
    * where they do not, which is an allocation failure away. */
   if (vsh_gpu_active && !hw) { vsh_active = NULL; return reject("hw-lost-under-program"); }
+  /* The fragment tail is asked for ONCE per draw -- hw_early_z counts as it
+   * answers -- and handed to both lookups. The combiner-specialised pipeline
+   * is tried first; nil from it (switch off, cache full, compile failed) is
+   * the generic interpreter, exactly as before. */
+  uint32_t hw_sblend = hw ? (uint32_t)hw_shader_blend(s) : 0u;
+  uint32_t hw_early = hw_sblend ? (uint32_t)hw_early_z(s) : 0u;   /* 0, 1 or 2: && would fold 2 into 1 */
   id<MTLRenderPipelineState> hw_pso_use =
-      vsh_gpu_active ? vsh_pipeline_for(s, vsh_active)
-                     : (hw ? hw_pipeline_for(s) : nil);
+      hw ? spec_pipeline_for(s, hwmask, vsh_gpu_active ? vsh_active : NULL, hw_sblend, hw_early) : nil;
+  if (!hw_pso_use)
+    hw_pso_use = vsh_gpu_active ? vsh_pipeline_for(s, vsh_active, hw_sblend, hw_early)
+                                : (hw ? hw_pipeline_for(s, hw_sblend, hw_early) : nil);
   id<MTLDepthStencilState> hw_dss_use = hw ? hw_depth_state_for(s) : nil;
   /* DEPTH OWNERSHIP IS EXCLUSIVE, so there is no "fall back for this draw".
    *
