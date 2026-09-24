@@ -467,3 +467,10 @@ merging or carrying flags at split entries.
   - FF + 2D draw: 100,345 replaced (FF 91,981), 0 drawn twice; the presented
     frames look right, and the control discolours the 3D world. But 18.2 fps
     against 82.7: ~50 ms per frame of host cost. Speed is next.
+- **FF draw speed, first pass** (`645a7e6`): FF+2D draw 18.2 → 50.9 fps
+  (reference 82.8), via a vertex cache, a texture cache hashed once per flip,
+  joining the executor's batch, and setVertexBytes. Now GPU sync is 9.3 ms
+  (reference 2.7), FF build 36 us per draw, and **684 replaced draws were not
+  skipped** (a double-draw regression). The stencil ALWAYS class is drawn and
+  agrees with the executor on 6,723 of 6,723; points, lines and polygons are
+  replaced with nothing, as the executor draws none of them. Refusals fell to 2.
