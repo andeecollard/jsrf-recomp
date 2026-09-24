@@ -526,7 +526,7 @@ void nv2a_texture_copy_census(void)
             && !s_rej_texmode && !s_rej_texstage && !s_rej_alpha && !approxed)
         return;
     fprintf(stderr, "[TEXFMT] gate refusals by texture format"
-            " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06/0x07 rgba8,"
+            " (accepted: 0x11/0x12/0x1E linear, 0x0C dxt1, 0x0E dxt3, 0x06/0x07 rgba8,"
             " 0x03 x1r5g5b5, 0x04 a4r4g4b4)\n");
     fprintf(stderr, "[TEXFMT]   header/mip-layout bits wrong=%lu  dma class wrong=%lu"
             "  combiner output=%lu\n",
@@ -643,10 +643,21 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
     if(!s->levels) return "texture mip levels";
     if(s->levels>1 && (control&0x3ffc0u)!=0x3ffc0u)
         return "texture maximum LOD clamp";
-    if(format==0x11) {
+    if(format==0x11 || format==0x12 || format==0x1e) {
+        /* LU_IMAGE_R5G6B5 (0x11), LU_IMAGE_A8R8G8B8 (0x12) and
+         * LU_IMAGE_X8R8G8B8 (0x1E): pitch-linear image rectangles, sized by
+         * the image-rectangle register and addressed in TEXELS, not 0..1 --
+         * xemu binds all three as rectangle textures. The two 32-bit ones were
+         * refused until 24 Sep 2026, and they are Roboy's graffiti studio: the
+         * canvas, brush preview and palette are 0x12 textures the game fills
+         * by CPU writes, and 894 of 14,911 editor batches were dropped, so
+         * nothing painted. 0x1E is 0x12 with the top byte undefined, forced
+         * opaque as the swizzled 0x07 is. */
         if(s->levels!=1) return "linear texture mip levels";
+        s->lin32=format==0x12 ? 1u : format==0x1e ? 2u : 0u;
         s->width=M(b+28)>>16; s->height=M(b+28)&65535; s->pitch=M(b+16)>>16;
-        if(!s->width || !s->height || s->pitch<s->width*2u) return "texture dimensions / pitch";
+        if(!s->width || !s->height || s->pitch<s->width*(s->lin32 ? 4u : 2u))
+            return "texture dimensions / pitch";
     } else if(format==0xc || format==0xe || format==6 || format==7 || format==3
               || format==4) {
         /* 0x07 SZ_X8R8G8B8, 0x03 SZ_X1R5G5B5 and 0x04 SZ_A4R4G4B4 are
@@ -668,7 +679,7 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
             s->sz16 ? s->width*2 : s->width*4;
     } else { s_fmt_rejected[format]++; return "texture format / mip layout"; }
     /* Repeat or clamp-to-edge; all three wrap components must agree. */
-    if(M(b+8)==0x10101 && format!=0x11) s->repeat=1;
+    if(M(b+8)==0x10101 && format!=0x11 && format!=0x12 && format!=0x1e) s->repeat=1;
     else if(M(b+8)!=0x10303 && M(b+8)!=0x30303) return "texture address mode";
     uint32_t filter=M(b+20), min=(filter>>16)&255, mag=(filter>>24)&15;
     if((filter&0xf000e000)!=0x2000 || min<1 || min>6 || (mag!=1 && mag!=2)) return "texture filter / channel sign";
@@ -862,6 +873,14 @@ static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, f
             (index==2 ? 2.0f/3.0f : 1.0f/3.0f);
         for (int k=0;k<3;++k) rgba[k]=a[k]*weight+b[k]*(1-weight);
         rgba[3]=alpha; return;
+    }
+    if(s->lin32) {
+        /* Linear A8R8G8B8 / X8R8G8B8: BGRA bytes at y*pitch + x*4, which is
+         * exactly how the graffiti editor writes its canvas. */
+        const uint8_t *p=data+(size_t)y*s->pitch+(size_t)x*4;
+        rgba[0]=p[2]/255.0f; rgba[1]=p[1]/255.0f; rgba[2]=p[0]/255.0f;
+        rgba[3]=s->lin32==2 ? 1.0f : p[3]/255.0f;
+        return;
     }
     const uint8_t *p=data+(size_t)y*s->pitch+x*2;
     uint32_t v=p[0] | (uint32_t)p[1]<<8;
@@ -1279,8 +1298,11 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
      * through, and the bounds test that incidentally covered this only did so
      * because an untextured state also leaves width and height zero.
      * !sz16 likewise: the row copy assumes LINEAR 565 bytes, and 0x03/0x04
-     * are swizzled and differently packed. */
-    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->sz16 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
+     * are swizzled and differently packed. !lin32 too: 0x12/0x1E are
+     * linear, so they pass every other test here, and the graffiti canvas is
+     * exactly the full-screen 1:1 quad this path is for -- it would have
+     * memcpy'd BGRA bytes into a 565 target. */
+    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->sz16 && !s->lin32 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
         && s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
     for (int i=0;i<3;++i)
         if (v[i][0][3]!=1 || v[i][NV2A_VSH_OUT_T0][3]!=1

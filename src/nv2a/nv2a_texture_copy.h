@@ -23,6 +23,12 @@ typedef struct NV2ATextureCopy {
      * here that carries REAL alpha, which is why it cannot simply reuse the
      * 555 path. */
     uint32_t xrgb8, sz16, argb4;
+    /* Pitch-linear 32-bit image rectangles: 1 = LU_IMAGE_A8R8G8B8 (0x12),
+     * 2 = LU_IMAGE_X8R8G8B8 (0x1E, alpha forced opaque). Linear like 0x11 --
+     * width/height from the image-rectangle register, coordinates in texels,
+     * one level -- but BGRA at four bytes a texel. Refused until 24 Sep 2026;
+     * the graffiti editor's canvas is one. */
+    uint32_t lin32;
     float lod_bias;
     uint32_t combiner_count, color_icw[8], alpha_icw[8];
     uint32_t color_ocw[8], alpha_ocw[8], add_specular;

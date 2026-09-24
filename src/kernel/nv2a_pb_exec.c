@@ -5534,7 +5534,7 @@ static void inv_collect(void)
         if ((double)counts[i] * 100.0 >= r->area) continue;
         ++s_inv_invisible;
         key[0] = r->st.final_cw0 ^ (r->st.combiner_count << 28); key[1] = r->st.color_icw[0] ^ r->st.alpha_icw[0];
-        key[2] = (r->st.rgba8 | r->st.dxt1 << 1 | r->st.dxt3 << 2 | r->st.sz16 << 3 | r->st.argb4 << 4 | r->st.untextured << 5)
+        key[2] = (r->st.rgba8 | r->st.dxt1 << 1 | r->st.dxt3 << 2 | r->st.sz16 << 3 | r->st.argb4 << 4 | r->st.untextured << 5 | r->st.lin32 << 6)
                ^ (r->st.alpha_test << 8) ^ (r->st.blend << 9) ^ (r->st.blend_src << 12) ^ (r->st.blend_dst << 20);
         key[3] = r->st.width << 16 | r->st.height;
         for (k = 0; k < s_inv_nkeys; ++k) if (!memcmp(s_inv_keys[k], key, sizeof key)) break;
@@ -5564,9 +5564,10 @@ static void inv_collect(void)
             float lo, hi, mean;
             if (!(r->st.texture_mask & (1u << u))) continue;
             inv_alpha(t, r->tex[u], r->texsize[u], &lo, &hi, &mean);
-            fprintf(stderr, "[INVISIBLE]   unit %u: %ux%u levels %u at %08X (%zu bytes) format%s%s%s%s%s%s%s | decoded alpha min %.3f max %.3f mean %.3f\n",
+            fprintf(stderr, "[INVISIBLE]   unit %u: %ux%u levels %u at %08X (%zu bytes) format%s%s%s%s%s%s%s%s | decoded alpha min %.3f max %.3f mean %.3f\n",
                     u, t->width, t->height, t->levels, r->texaddr[u], r->texsize[u], t->rgba8 ? " rgba8" : "", t->xrgb8 ? " xrgb8" : "",
                     t->dxt1 ? " dxt1" : "", t->dxt3 ? " dxt3" : "", t->sz16 ? " sz16" : "", t->argb4 ? " argb4" : "",
+                    t->lin32 ? (t->lin32 == 2 ? " lin-x8r8g8b8" : " lin-a8r8g8b8") : "",
                     t->linear ? " (mag linear)" : "", lo, hi, mean);
         }
     }
@@ -7433,6 +7434,7 @@ static uint32_t exec_fmt_byte(const NV2ATextureCopy *t)
     if (t->dxt3) return 0x0Eu;
     if (t->rgba8) return t->xrgb8 ? 0x07u : 0x06u;
     if (t->sz16) return t->argb4 ? 0x04u : 0x03u;
+    if (t->lin32) return t->lin32 == 2 ? 0x1Eu : 0x12u;
     return 0x11u;
 }
 void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)

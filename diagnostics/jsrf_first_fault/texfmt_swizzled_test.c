@@ -168,6 +168,40 @@ int main(int argc, char **argv)
                                                         out, sizeof out, &ow, &oh), 1);
         check("A8R8G8B8 alpha still read from the byte", out[3], 0x40);
 
+    } else if (!strcmp(mode, "lin-a8r8g8b8") || !strcmp(mode, "lin-x8r8g8b8")) {
+        /* LU_IMAGE_A8R8G8B8 (0x12) / X8R8G8B8 (0x1E): the graffiti canvas.
+         * ROW-MAJOR at y*pitch + x*4, not Morton, and the pitch is padded
+         * past width*4 here so a decoder that assumes w*4 reads the padding
+         * (0xEE) on every row after the first. A8 reads its alpha byte; X8
+         * forces it opaque exactly as the swizzled 0x07 does. */
+        enum { LP = W * 4 + 8 };
+        unsigned char lsrc[LP * H];
+        int x8 = !strcmp(mode, "lin-x8r8g8b8");
+        s.lin32 = x8 ? 2 : 1; s.pitch = LP;
+        memset(lsrc, 0xEE, sizeof lsrc);
+        for (y = 0; y < H; ++y) for (x = 0; x < W; ++x) {
+            unsigned char *p = lsrc + y * LP + x * 4;
+            p[0] = (unsigned char)(0x10 * x); p[1] = (unsigned char)(0x20 * y);
+            p[2] = 0x80; p[3] = (unsigned char)(0x11 * (x + 4 * y));
+        }
+        check("decoded", nv2a_texture_copy_decode_level(&s, lsrc, sizeof lsrc, 0,
+                                                        out, sizeof out, &ow, &oh), 1);
+        check("width", ow, W); check("height", oh, H);
+        for (y = 0; y < H; ++y) for (x = 0; x < W; ++x) {
+            const unsigned char *q = out + ((size_t)y * W + x) * 4;
+            unsigned want_a = x8 ? 255u : 0x11u * (x + 4 * y);
+            if (q[0] != 0x80 || q[1] != (unsigned char)(0x20 * y)
+                    || q[2] != (unsigned char)(0x10 * x) || q[3] != want_a) {
+                printf("  FAIL texel (%u,%u) rgba = %02X %02X %02X %02X\n",
+                       x, y, q[0], q[1], q[2], q[3]);
+                ++failures;
+            }
+        }
+        if (!failures) printf("  ok   %-46s\n", x8 ? "linear X8 texels by pitch, alpha opaque"
+                                                  : "linear A8 texels by pitch, alpha read");
+        check("texture bytes are pitch * height",
+              (long)nv2a_texture_copy_texture_bytes(&s), (long)(LP * H));
+
     } else {
         fprintf(stderr, "unknown case '%s'\n", mode);
         return 2;

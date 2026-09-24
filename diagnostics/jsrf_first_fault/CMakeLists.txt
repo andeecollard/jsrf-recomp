@@ -424,7 +424,8 @@ add_test(NAME jsrf_d3d8_ff_vertex_state COMMAND jsrf_d3d8_ff_vertex_state_test)
 add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_drop.c"
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c")
-foreach(case x8r8g8b8 x1r5g5b5 a4r4g4b4 a4r4g4b4-alpha alpha-regression)
+foreach(case x8r8g8b8 x1r5g5b5 a4r4g4b4 a4r4g4b4-alpha alpha-regression
+        lin-a8r8g8b8 lin-x8r8g8b8)
     add_test(NAME jsrf_texfmt_${case} COMMAND jsrf_texfmt_swizzled_test ${case})
 endforeach()
 
@@ -1211,6 +1212,13 @@ if(APPLE)
     add_test(NAME jsrf_metal_sz16 COMMAND jsrf_metal_sz16_test)
     add_test(NAME jsrf_metal_sz16_hwtex COMMAND jsrf_metal_sz16_test)
     set_tests_properties(jsrf_metal_sz16_hwtex PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    # LU_IMAGE_A8R8G8B8/X8R8G8B8 (0x12/0x1E): the graffiti canvas. The _hwtex
+    # arm proves the hardware-sampler switch leaves them on the software path.
+    add_executable(jsrf_metal_lin32_test metal_lin32_test.c)
+    target_link_libraries(jsrf_metal_lin32_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_lin32 COMMAND jsrf_metal_lin32_test)
+    add_test(NAME jsrf_metal_lin32_hwtex COMMAND jsrf_metal_lin32_test)
+    set_tests_properties(jsrf_metal_lin32_hwtex PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # Several draws into one encoder, compared against the software rasteriser.
     # Run it BOTH ways -- the switch is read once per process, so the batched
     # and per-draw cases are two invocations:
