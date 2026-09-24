@@ -141,6 +141,7 @@ typedef struct {
     uint32_t tris_dropped_w;
     uint32_t idx_min, idx_max;                 /* over the indices drawn */
     uint32_t cls;                              /* d3d8_host_2d_class */
+    uint32_t cull_face, front_cw;              /* as applied: 0 none, 0x404 front, 0x405 back */
     uint32_t tris_dropped_q;                   /* textured unit q <= 0: the executor drops those too */
 } D3D8Host2DDraw;
 
@@ -242,7 +243,13 @@ typedef struct {
 int  d3d8_host_2d_mode(void);
 /* G51.3: 0 off, 1 shadow. RECOMP_D3D8_HOST_FF=shadow: fixed-function 3D
  * draws are drawn by the host into the same kind of scratch crop and
- * compared with the executor exactly as the 2D shadow does. */
+ * compared with the executor exactly as the 2D shadow does.
+ *
+ * SAMPLED BY FLIP. Shadowing a draw drains the executor twice, and a 3D
+ * frame has ~550 fixed-function draws: shadowing every one ran the tutorial
+ * at 1 fps (run g51-ffshadow). So only every RECOMP_D3D8_HOST_FF_STRIDE-th
+ * flip (default 60; 1 = every flip) is shadowed -- all of its FF draws --
+ * and the flips between cost nothing but a token per draw. */
 int  d3d8_host_ff_mode(void);
 /* Does the shadow take this draw (pre and post tokens)? */
 int  d3d8_host_shadow_wants(const D3D8HostDrawCheck *c);
@@ -254,7 +261,7 @@ void d3d8_host_2d_after(const D3D8HostDrawCheck *c);
 int  d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);
 /* The token before a 2D draw's commands: snapshot the target it starts from. */
-void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
+void d3d8_host_2d_pre(uint32_t serial, uint32_t vs_handle, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
                       uint32_t zs_data, uint32_t zs_size);
 /* The mirror's token after it: build, capture the executor's result, render. */
 void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecDrawTextures *));

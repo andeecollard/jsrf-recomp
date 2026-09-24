@@ -527,7 +527,7 @@ static void shadow_flow(D3D8HostDrawCheck *c, int control)
     snapshot_at_call(c);
     if (g_stale && c->draw_kind == 2) { static const uint16_t next[6] = { 3, 3, 3, 1, 1, 1 }; memcpy(ram + c->idx_ptr, next, sizeof next); }
     d3d8_host_2d_get_stats(&before);
-    d3d8_host_2d_pre(c->serial, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
+    d3d8_host_2d_pre(c->serial, c->vs_handle, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
     d3d8_host_2d_post(c, NULL);
     d3d8_host_2d_flip();
     d3d8_host_2d_get_stats(&after);
@@ -834,6 +834,22 @@ int main(int argc, char **argv)
     compare_rhw0();
     compare_ff(0);
     compare_ff(1);
+    {   /* D3D's cull state (RS 128 CULLMODE, 127 FRONTFACE), as 0x18EBD0 emits it:
+         * enable = CullMode != 0, face = FRONT (0x404) when CullMode == FrontFace, else BACK. */
+        D3D8HostDrawCheck c; D3D8Host2DDraw d; static uint32_t ffm[2048];
+        case_ff(&c); c.rs_valid = 1; c.rs_cull = 0x900; c.rs_front = 0x900;
+        d3d8_host_ff_registers(&c, ffm); memset(&d, 0, sizeof d); d.verts = verts;
+        d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+        CHECK(d.cull_face == 0x404u && d.front_cw == 1, "cull: CULLMODE CW with FRONTFACE CW culls FRONT (%X)", d.cull_face);
+        case_ff(&c); c.rs_valid = 1; c.rs_cull = 0x901; c.rs_front = 0x900;
+        memset(&d, 0, sizeof d); d.verts = verts;
+        d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+        CHECK(d.cull_face == 0x405u, "cull: CULLMODE CCW with FRONTFACE CW culls BACK (%X)", d.cull_face);
+        case_ff(&c); c.rs_valid = 1; c.rs_cull = 0; c.rs_front = 0x900;
+        memset(&d, 0, sizeof d); d.verts = verts;
+        d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+        CHECK(d.cull_face == 0 && d.nverts == 6, "cull: CULLMODE NONE culls nothing");
+    }
     CHECK(d3d8_host_2d_snap(0.53125f) == 0.5f && d3d8_host_2d_snap(160.53125f) == 160.5f && d3d8_host_2d_snap(-0.53125f) == -0.5f,
           "snap: 0.53125 -> 0.5, 160.53125 -> 160.5, toward zero for negatives");
     /* The proof on its own. */
@@ -864,7 +880,7 @@ int main(int argc, char **argv)
               "stale index buffer: seen as changed, drawn from the snapshot");
         /* ...and without one the draw must be refused, not drawn from the stale buffer. */
         case_b(&c); c.idx_snap_n = 0;
-        d3d8_host_2d_pre(c.serial, c.rt_data, c.rt_format, c.rt_size, 0, 0);
+        d3d8_host_2d_pre(c.serial, c.vs_handle, c.rt_data, c.rt_format, c.rt_size, 0, 0);
         d3d8_host_2d_post(&c, NULL);
         d3d8_host_2d_get_stats(&a);
         CHECK(a.compared == b.compared, "no index snapshot: the draw is refused, not guessed");
