@@ -39,6 +39,8 @@
 #include "d3d8_host_2d.h"
 #include "d3d8_ff_combiner.h"
 #include "nv2a_metal.h"
+#include "nv2a_host_read.h"
+#include <pthread.h>
 #include "nv2a_texture_copy.h"
 #include "nv2a_ff.h"
 #include <math.h>
@@ -1593,6 +1595,73 @@ static int ff_arm(int control)
     return 1;
 }
 
+/* G56 DEFER-SAFE, the positive control. The executor (this thread, the
+ * service thread) draws into A without a sync and then into B, so under
+ * RECOMP_METAL_DEFER_SWAP A's pixels are on the GPU only; a "guest" thread
+ * then asks for A as a D3D LockRect would, and this thread services the
+ * mailbox the way the pusher loop does. The guest must get the drawn pixels.
+ * Then: the bound, dirty surface; its depth; and a request nobody serves,
+ * which must time out, not hang. */
+typedef struct { uint8_t *p; size_t n; unsigned timeout; int r; volatile int done; } HrArg;
+static void *hr_guest(void *v) { HrArg *a = v; a->r = nv2a_host_read_request(a->p, a->n, NV2A_HOST_READ_TEST, a->timeout); a->done = 1; return NULL; }
+static int hr_ask(uint8_t *p, size_t n, unsigned timeout, int serve)
+{
+    HrArg a = { p, n, timeout, 0, 0 };
+    pthread_t t;
+    pthread_create(&t, NULL, hr_guest, &a);
+    while (!a.done) { if (serve) nv2a_host_read_service(1); struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+    pthread_join(t, NULL);
+    return a.r;
+}
+static void hostread_tests(void)
+{
+    enum { RT2 = RT + 0x40000 };
+    static uint16_t bg[RTPITCH / 2 * RTH];
+    static uint8_t zbefore[RTW * 4 * RTH];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    uint16_t *a = (uint16_t *)(ram + RT), *b = (uint16_t *)(ram + RT2);
+    unsigned long long changed = 0;
+    int r;
+    nv2a_host_read_set_service_thread();
+    background(bg); background(a); background(b);
+    case_b(&c); memset(&d, 0, sizeof d); d.verts = verts;
+    CHECK(!d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d), "host read: built");
+    /* 1. A deferred slot. */
+    g_exec_keep_surfaces = 1; g_exec_no_sync = 1;
+    CHECK(exec_draw(&c, &d, a, ram + ZS) && exec_draw(&c, &d, b, ram + ZS), "host read: the executor drew into A, then B");
+    for (size_t k = 0; k < sizeof bg / 2; ++k) changed += a[k] != bg[k];
+    CHECK(changed == 0, "host read CONTROL: A's guest RAM is stale after the deferred swap");
+    r = hr_ask((uint8_t *)a, RTPITCH * RTH, 2000, 1);
+    changed = 0; for (size_t k = 0; k < sizeof bg / 2; ++k) changed += a[k] != bg[k];
+    printf("  host read, deferred A: result %d, %llu px of the drawing in guest RAM\n", r, changed);
+    CHECK(r > 0 && (r & 1) && changed > 1000, "host read: a guest-thread lock of a deferred render target gets the drawn pixels");
+    /* 2. The bound surface, dirty. B is bound now and was drawn without a sync. */
+    changed = 0; for (size_t k = 0; k < sizeof bg / 2; ++k) changed += b[k] != bg[k];
+    CHECK(changed == 0, "host read CONTROL: the bound surface's guest RAM is stale mid-frame");
+    r = hr_ask((uint8_t *)b, RTPITCH * RTH, 2000, 1);
+    changed = 0; for (size_t k = 0; k < sizeof bg / 2; ++k) changed += b[k] != bg[k];
+    CHECK(r > 0 && (r & 2) && changed > 1000, "host read: a lock of the bound, dirty target gets the drawn pixels (%llu px)", changed);
+    /* 3. Its depth. Draw with a depth write, then lock the depth surface. */
+    {   D3D8HostDrawCheck z = c;
+        z.zs = 0x2345; z.zs_data = ZS; z.zs_format = 0x1u | (0x2Eu << 8);
+        z.zs_size = (RTW - 1) | ((RTH - 1) << 12) | ((ZSPITCH / 64 - 1) << 24);
+        set_state(&z, 0x30C, 1); set_state(&z, 0x354, 0x207); set_state(&z, 0x35C, 1);
+        for (unsigned k = 0; k < RTW * RTH; ++k) memcpy(ram + ZS + 4 * k, &(uint32_t){ 0xFFFFFF00u }, 4);
+        memcpy(zbefore, ram + ZS, sizeof zbefore);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        CHECK(!d3d8_host_2d_build(&z, ram, RAM_SIZE, 0, &d) && exec_draw(&z, &d, b, ram + ZS), "host read: depth-writing draw");
+        r = hr_ask(ram + ZS, RTW * 4 * RTH, 2000, 1);
+        CHECK(r > 0 && (r & 4) && memcmp(zbefore, ram + ZS, sizeof zbefore) != 0,
+              "host read: a lock of the depth surface gets the depth the GPU wrote"); }
+    g_exec_keep_surfaces = 0; g_exec_no_sync = 0;
+    /* 4. Nobody serving: a bounded wait, counted. */
+    {   unsigned long long cnt[NV2A_HOST_READ_ENTRIES][3];
+        r = hr_ask((uint8_t *)a, RTPITCH * RTH, 50, 0);
+        nv2a_host_read_counts(cnt);
+        CHECK(r == -1 && cnt[NV2A_HOST_READ_TEST][2] == 1, "host read: an unserved request times out (and is counted), it does not hang"); }
+    nv2a_host_read_report();
+}
+
 int main(int argc, char **argv)
 {
     D3D8HostDrawCheck c;
@@ -1614,6 +1683,11 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         bench_tests();
         return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "hostread") == 0) {     /* G56: a guest-thread Lock gets the drawn pixels */
+        hostread_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "defer") == 0) {        /* RECOMP_METAL_DEFER_SWAP: the host pays a slot's debt */
         /* The executor draws into A without a sync, then into B: the swap

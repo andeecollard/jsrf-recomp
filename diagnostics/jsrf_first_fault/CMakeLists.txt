@@ -1242,6 +1242,9 @@ if(APPLE)
     # RECOMP_D3D8_HOST_BISECT arm that keeps the batch joined.
     add_test(NAME jsrf_d3d8_host_2d_seq COMMAND jsrf_d3d8_host_2d_test seq)
     set_tests_properties(jsrf_d3d8_host_2d_seq PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    # G56: a guest-thread D3D lock gets the drawn pixels, through the mailbox.
+    add_test(NAME jsrf_host_read COMMAND jsrf_d3d8_host_2d_test hostread)
+    set_tests_properties(jsrf_host_read PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1;RECOMP_METAL_DEFER_SWAP=1")
     # A deferred swap leaves a surface owing guest RAM; the host's texture read pays.
     add_test(NAME jsrf_d3d8_host_2d_defer COMMAND jsrf_d3d8_host_2d_test defer)
     set_tests_properties(jsrf_d3d8_host_2d_defer PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1;RECOMP_METAL_DEFER_SWAP=1")

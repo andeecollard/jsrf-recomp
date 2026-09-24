@@ -84,6 +84,23 @@ int nv2a_metal_slot_geometry(const uint8_t *target, const uint8_t *depth, size_t
  * own texture read does. Returns how many slots paid; four slot compares when
  * nothing is owed, which with the deferral off is always. */
 int nv2a_metal_pay_debt(const uint8_t *p, size_t bytes);
+/* G56 DEFER-SAFE: make guest RAM current for [p, p+bytes) before a CPU reader
+ * sees it -- a D3D Lock/CopyRects/GetBackBuffer on a render target, through
+ * nv2a_host_read_request. On the executor's thread only. In order:
+ *   1  a cached slot that OWES these bytes (deferred swap, unbound clear) is
+ *      written back, and dropped so a CPU write through the lock is not
+ *      shadowed by the slot's texture when it is rebound;
+ *   2  the BOUND colour surface, if the range overlaps it and the GPU is ahead
+ *      of guest RAM, is written back (nv2a_metal_sync);
+ *   4  the bound DEPTH surface, if it overlaps, is read back into guest RAM --
+ *      RECOMP_METAL_NO_DEPTH_SYNC never writes it otherwise.
+ * Returns the OR of those bits; 8 is set when the range overlaps the bound
+ * colour surface (a CPU write there mid-frame is not seen by the GPU copy). */
+int nv2a_metal_make_current(uint8_t *p, size_t bytes);
+/* Racy by design, for a diagnostic reader on another thread (the framebuffer
+ * probe): nonzero if [p, p+bytes) overlaps a slot that owes guest RAM or the
+ * bound colour surface while the GPU is ahead of it. */
+int nv2a_metal_range_owed(const uint8_t *p, size_t bytes);
 /* Read-only: surfaces uploaded (rebuilt from guest RAM), slot-cache rebinds, evictions. */
 void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions);
 int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,

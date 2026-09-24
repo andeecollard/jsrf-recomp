@@ -3721,6 +3721,42 @@ static void surface_pay_debt_for_range(const uint8_t *p, size_t bytes,
 }
 
 static uint64_t g_debt_paid_on_host_read;
+int nv2a_metal_make_current(uint8_t *p, size_t bytes)
+{
+    int did = 0;
+    draw_thread_check();
+    if (!p || !bytes) return 0;
+    for (unsigned i = 0; i < surface_slots_used(); ++i) {
+        if (!surf_slot[i].valid || !guest_ranges_overlap(p, bytes, surf_slot[i].target, surface_slot_bytes(i))) continue;
+        if (surf_slot[i].colour == surface && surface_target == surf_slot[i].target) continue;   /* the bound one, below */
+        if (surf_slot[i].owes_guest_ram) { surface_slot_writeback(i); ++g_debt_paid_on_host_read; did |= 1; }
+        /* Dropped whether or not it owed: a CPU write through the lock would
+         * otherwise be shadowed by this slot's texture at the next rebind. */
+        surf_slot[i].valid = 0; surf_slot[i].owes_guest_ram = 0;
+        surf_slot[i].colour = nil; surf_slot[i].stencil = nil;
+        surf_slot[i].hw_depth = nil; surf_slot[i].hw_stencil = nil;
+    }
+    if (surface_valid && surface_target && guest_ranges_overlap(p, bytes, surface_target, surface_target_size)) {
+        did |= 8;
+        if (surface_dirty) { nv2a_metal_sync(); did |= 2; }
+    }
+    if (depth_valid && depth_target && hw_depth_tex && guest_ranges_overlap(p, bytes, depth_target, depth_target_size)) {
+        batch_flush();
+        if (last_command) [last_command waitUntilCompleted];
+        nv2a_debt_watch_paid(depth_target, depth_target_size);
+        hw_depth_readback(depth_target, surface_width, surface_height, depth_pitch);
+        did |= 4;
+    }
+    return did;
+}
+int nv2a_metal_range_owed(const uint8_t *p, size_t bytes)
+{
+    if (!p || !bytes) return 0;
+    for (unsigned i = 0; i < surface_slots_used(); ++i)
+        if (surf_slot[i].valid && surf_slot[i].owes_guest_ram
+            && guest_ranges_overlap(p, bytes, surf_slot[i].target, surface_slot_bytes(i))) return 1;
+    return surface_valid && surface_dirty && surface_target && guest_ranges_overlap(p, bytes, surface_target, surface_target_size);
+}
 int nv2a_metal_pay_debt(const uint8_t *p, size_t bytes)
 {
     uint64_t before = g_debt_paid_on_host_read;
@@ -3746,6 +3782,7 @@ unsigned long long nv2a_metal_sync_ns(void)
 void nv2a_metal_report(void)
 {
     nv2a_debt_watch_report();
+    {   extern void nv2a_host_read_report(void); nv2a_host_read_report(); }
     fprintf(stderr,"[METAL] sync %llu calls (%llu already clean): %.1f ms draining"
             " the GPU, %.1f ms reading back and converting."
             "  A resident clear could remove the second only.\n",

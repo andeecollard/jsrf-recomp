@@ -3538,6 +3538,11 @@ static int s_nv2a_trace_print = 0;
  * from frame to frame. */
 static uint32_t s_fb_va, s_fb_pitch, s_fb_height = 480;
 
+/* G56: who says the GPU is ahead of these bytes (nv2a_metal_range_owed). */
+static int (*s_fb_owed)(const uint8_t *, size_t);
+static unsigned long s_fb_owed_skips;
+void xbox_SetFramebufferOwedQuery(int (*q)(const uint8_t *, size_t)) { s_fb_owed = q; }
+
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
 {
     s_fb_va = fb_va;
@@ -3577,6 +3582,18 @@ static void framebuffer_probe_tick(void)
         return;
     p = (const uint32_t *)((uintptr_t)s_fb_va + g_memory_offset);
     n = (s_fb_pitch * s_fb_height) / 4;
+    /* The surface being drawn is normally the one the GPU is ahead of: its
+     * guest bytes are last frame's, or older under a deferred swap. Reading
+     * them was this probe measuring stale memory (all 67 of the debt watch's
+     * "guest reads" in the tutorial were this line). Say so and skip. The
+     * query is racy -- it reads the executor's slot table from this thread --
+     * which a once-a-second diagnostic can afford. */
+    if (s_fb_owed && s_fb_owed((const uint8_t *)p, (size_t)n * 4u)) {
+        if (s_fb_owed_skips++ < 4)
+            fprintf(stderr, "  [FB] 0x%08X: the GPU is ahead of guest RAM here; not sampled (skip %lu)\n",
+                    s_fb_va, s_fb_owed_skips);
+        return;
+    }
     for (i = 0; i < n; i++) {
         sum = sum * 33u + p[i];
         if (p[i]) nonzero++;

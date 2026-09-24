@@ -1419,6 +1419,8 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
      * handler alone would have wedged this thread instead of dropping the
      * notify. The raise and the PGRAPH page guard it needs landed first. */
     nv2a_pusher_set_software_method_handler(jsrf_software_method);
+    /* G56: CPU readers of GPU memory (the D3D lock hooks) are made current here. */
+    {   extern void nv2a_host_read_set_service_thread(void); nv2a_host_read_set_service_thread(); }
     while (!g_pushbuf_ack_stop) {
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
         /* Snapshot the fence before consuming its commands. Reading PUT again
@@ -1427,6 +1429,10 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
         uint32_t getp = dev ? MEM32(dev + JSRF_D3D_GETPTR_OFFSET) : 0;
         uint32_t fence_counter = dev ? MEM32(dev + JSRF_D3D_FENCE_COUNTER_OFFSET) : 0;
         int consumed = jsrf_pb_poll();
+        /* A posted host read is served once every command the guest had
+         * published is executed: the cursor has reached PUT. */
+        {   extern void nv2a_host_read_service(int caught_up);
+            nv2a_host_read_service(!g_pb_subr_active && g_pb_last == MEM32(0xFD800040u)); }
         jsrf_pusher_report();
         /* Cheap and constant: the guest-clock anchor must not inherit the
          * report's interval, or the two hosts dump at different guest
@@ -5190,6 +5196,10 @@ int main(int argc, char **argv)
         free(xbe_data);
         return 1;
     }
+    /* G56: the framebuffer probe skips a surface whose bytes the GPU is ahead of. */
+    {   extern void xbox_SetFramebufferOwedQuery(int (*q)(const uint8_t *, size_t));
+        extern int nv2a_metal_range_owed(const uint8_t *, size_t);
+        xbox_SetFramebufferOwedQuery(nv2a_metal_range_owed); }
     /* RECOMP_METAL_DEBT_WATCH: both views of GPU memory, after the alias
      * exists and after the crash and MCPX handlers, so it runs first and
      * chains to them. No-op unless the switch is on. */
