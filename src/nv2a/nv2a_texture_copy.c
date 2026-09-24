@@ -54,6 +54,18 @@ static int texmode_approx_on(void)
     if (on < 0) on = recomp_switch_on("RECOMP_TEXMODE_APPROX");
     return on;
 }
+/* RECOMP_TEXMODE_BUMP, default ON: texture shader modes 6 and 7 are drawn
+ * with their displacement (see NV2ATextureCopy.bump). =0 puts back exactly
+ * the behaviour before it: approximated as plain 2D under
+ * RECOMP_TEXMODE_APPROX, refused without it -- which is the A/B arm. */
+static int texmode_bump_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_TEXMODE_BUMP", 1);
+    return on;
+}
+static unsigned long s_texmode_bump[32][4];
+static float f32_bits(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 static unsigned long s_rej_count_hist[10];
 #define VR_OCW_SLOTS 16
 static uint32_t s_bad_ocw[VR_OCW_SLOTS]; static unsigned long s_bad_ocw_n[VR_OCW_SLOTS];
@@ -327,7 +339,36 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
          *
          * Off by default like every other behaviour switch here: it changes
          * what reaches the screen and has to be measurable against its own
-         * absence. */
+         * absence.
+         *
+         * IMPLEMENTED SINCE 24 SEP 2026, under RECOMP_TEXMODE_BUMP (default
+         * on), for units 1..3 whose input unit is an earlier one -- xemu
+         * asserts the same (stage >= 1). Unit 1 always reads unit 0; units 2
+         * and 3 read the unit named in NV097_SET_SHADER_OTHER_STAGE_INPUT
+         * (0x1E78) bits 16..19 and 20..23. What falls outside that is still
+         * approximated or refused below, and bump_approx still means exactly
+         * "drawn WITHOUT its displacement" -- RECOMP_MARK_BUMP keeps marking
+         * only those. The implemented ones are marked by RECOMP_MARK_BUMP_ENV. */
+        if ((mode==6 || mode==7) && u>=1 && texmode_bump_on()) {
+            unsigned in = u==1 ? 0u : (M(0x1e78) >> (16 + 4*(u-2))) & 15u;
+            if (in < u) {
+                /* The method words are M00, M01, M11, M10: the XDK's
+                 * SetTextureState_BumpEnv (0x0018F180 in this title) writes
+                 * D3DTSS type t to 0x1AD0 + 64*stage + 4*t, and the Xbox
+                 * numbering is 00=22, 01=23, 11=24, 10=25 -- which is also
+                 * xemu's swizzle {00, 01, 11, 10} in SET_TEXTURE_SET_BUMP_ENV_MAT. */
+                unsigned b = 0x1b28 + 64*u;
+                s->bump[u] = mode; s->bump_input[u] = in;
+                s->bump_mat[u][0] = f32_bits(M(b));       /* M00 */
+                s->bump_mat[u][1] = f32_bits(M(b + 4));   /* M01 */
+                s->bump_mat[u][2] = f32_bits(M(b + 12));  /* M10 */
+                s->bump_mat[u][3] = f32_bits(M(b + 8));   /* M11 */
+                s->bump_scale[u] = f32_bits(M(0x1b38 + 64*u));
+                s->bump_offset[u] = f32_bits(M(0x1b3c + 64*u));
+                s_texmode_bump[mode][u]++;
+                mode = 1;
+            }
+        }
         if ((mode==6 || mode==7) && texmode_approx_on()) {
             s_texmode_approx[mode][u]++;
             s->bump_approx=1;
@@ -518,6 +559,17 @@ void nv2a_texture_copy_census(void)
      * table of zeroes the rule is about. */
     fprintf(stderr, "[COMBINER] RECOMP_TEXMODE_APPROX %s\n",
             texmode_approx_on() ? "on" : "OFF");
+    fprintf(stderr, "[COMBINER] RECOMP_TEXMODE_BUMP %s\n",
+            texmode_bump_on() ? "on" : "OFF");
+    {   /* Implemented is not approximated, so these are not in the table
+         * below; they are counted so an A/B can see the arm reached them. */
+        unsigned m, u;
+        for (m = 6; m < 8; ++m)
+            for (u = 1; u < 4; ++u)
+                if (s_texmode_bump[m][u])
+                    fprintf(stderr, "[COMBINER]   unit %u mode %u  x%lu   drawn WITH the"
+                            " displacement (RECOMP_TEXMODE_BUMP)\n", u, m, s_texmode_bump[m][u]);
+    }
 
     /* Silent when there is nothing to report: a clean run should not carry a
      * table of zeroes that a later reader has to check is a table of zeroes. */
@@ -939,6 +991,32 @@ static void sample_lod(const NV2ATextureCopy *s,const uint8_t *data,float u,floa
     for(unsigned k=0;k<4;++k) out[k]=a[k]*(1-f)+b[k]*f;
 }
 
+/* BUMPENVMAP (6) and BUMPENVMAP_LUMINANCE (7), xemu pgraph/glsl/psh.c op for
+ * op; the MSL bump_sample() in nv2a_metal.m is its twin and metal_bump_test
+ * holds the two together. sign3 is xemu's: the channel read back as the
+ * two's-complement byte it was stored as, over 127 -- applied to the FILTERED
+ * value, which is xemu's own FIXME and what hardware may not do. The channel
+ * sign bits in the filter word never reach here: prepare_image refuses any
+ * texture that sets them. The LOD is the unperturbed coordinate's. */
+static float bump_sign3(float x)
+{
+    x*=255.0f;
+    return x>=128.0f ? (x-256.0f)/127.0f : x/127.0f;
+}
+static void bump_sample(const NV2ATextureCopy *s, unsigned unit, const NV2ATextureCopy *t,
+                        const uint8_t *data, float u, float v, float lod, float regs[16][4])
+{
+    const float *in=regs[8+s->bump_input[unit]], *mm=s->bump_mat[unit];
+    float du=bump_sign3(in[2]), dv=bump_sign3(in[1]);
+    float pu=mm[0]*du+mm[2]*dv, pv=mm[1]*du+mm[3]*dv;
+    float *out=regs[8+unit];
+    sample_lod(t,data,u+pu,v+pv,lod,out);
+    if(s->bump[unit]==7) {
+        float k=s->bump_scale[unit]*in[0]+s->bump_offset[unit];
+        for(unsigned c=0;c<4;++c) out[c]*=k;
+    }
+}
+
 /* Unpack one mip level into tightly packed RGBA8, in R,G,B,A byte order.
  *
  * A hardware sampler cannot read the guest's Morton-swizzled ARGB8, its
@@ -1356,7 +1434,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                 const uint8_t *data=unit?s->extra_texture[unit-1]:texture;
                 float uv[3][2];
                 for(unsigned at=0;at<3;++at) {
-                    float sx=0,sy=0,sq=0;
+                    float sx=0,sy=0,sq=0,sw=0;
                     float px=x+.5f+(at==1),py=y+.5f+(at==2);
                     float weights[3]={edge(b[0],c[0],px,py),edge(c[0],a[0],px,py),edge(a[0],b[0],px,py)};
                     for(unsigned i=0;i<3;++i) {
@@ -1364,7 +1442,12 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                         sx+=w*v[i][NV2A_VSH_OUT_T0+unit][0];
                         sy+=w*v[i][NV2A_VSH_OUT_T0+unit][1];
                         sq+=w*v[i][NV2A_VSH_OUT_T0+unit][3];
+                        sw+=w;
                     }
+                    if(!isfinite(sq) || sq==0) return 0;
+                    /* BUMPENVMAP takes coord.xy as interpolated, with no
+                     * projective divide (xemu: pT.xy, not textureProj). */
+                    if(s->bump[unit]) sq=sw;
                     if(!isfinite(sq) || sq==0) return 0;
                     uv[at][0]=sx/sq;uv[at][1]=sy/sq;
                     if(!isfinite(uv[at][0]) || !isfinite(uv[at][1])) return 0;
@@ -1372,7 +1455,8 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                 float dx=hypotf((uv[1][0]-uv[0][0])*t->width,(uv[1][1]-uv[0][1])*t->height);
                 float dy=hypotf((uv[2][0]-uv[0][0])*t->width,(uv[2][1]-uv[0][1])*t->height);
                 float lod=log2f(fmaxf(0.000001f,fmaxf(dx,dy)));
-                sample_lod(t,data,uv[0][0],uv[0][1],lod,regs[8+unit]);
+                if(s->bump[unit]) bump_sample(s,unit,t,data,uv[0][0],uv[0][1],lod,regs);
+                else sample_lod(t,data,uv[0][0],uv[0][1],lod,regs[8+unit]);
             }
             combine(s,regs,fogd,rgb);
         } else {

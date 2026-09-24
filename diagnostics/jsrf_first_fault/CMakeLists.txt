@@ -1212,6 +1212,19 @@ if(APPLE)
     add_test(NAME jsrf_metal_sz16 COMMAND jsrf_metal_sz16_test)
     add_test(NAME jsrf_metal_sz16_hwtex COMMAND jsrf_metal_sz16_test)
     set_tests_properties(jsrf_metal_sz16_hwtex PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    # BUMPENVMAP (modes 6/7) on the CPU and Metal against a hand-computed
+    # displacement. _hwtex: unit 0 on the hardware sampler, the bump unit kept
+    # on the buffer sampler. _approx: THE NEGATIVE CONTROL -- the pre-bump
+    # approximation must fail the same expectation on both sinks.
+    add_executable(jsrf_metal_bump_test metal_bump_test.c)
+    target_link_libraries(jsrf_metal_bump_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_bump COMMAND jsrf_metal_bump_test)
+    add_test(NAME jsrf_metal_bump_hwtex COMMAND jsrf_metal_bump_test)
+    set_tests_properties(jsrf_metal_bump_hwtex PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    add_test(NAME jsrf_metal_bump_approx COMMAND jsrf_metal_bump_test)
+    set_tests_properties(jsrf_metal_bump_approx PROPERTIES
+        ENVIRONMENT "RECOMP_TEXMODE_BUMP=0;RECOMP_TEXMODE_APPROX=1"
+        PASS_REGULAR_EXPRESSION "mode 6: gate says bump\\[1\\]=0 bump_approx=1.*FAIL mode 6 CPU: [0-9]+ of 256.*FAIL mode 6 Metal: [0-9]+ of 256.*mode 7: gate says bump\\[1\\]=0 bump_approx=1.*FAIL mode 7 CPU: [0-9]+ of 256.*FAIL mode 7 Metal: [0-9]+ of 256")
     # LU_IMAGE_A8R8G8B8/X8R8G8B8 (0x12/0x1E): the graffiti canvas. The _hwtex
     # arm proves the hardware-sampler switch leaves them on the software path.
     add_executable(jsrf_metal_lin32_test metal_lin32_test.c)

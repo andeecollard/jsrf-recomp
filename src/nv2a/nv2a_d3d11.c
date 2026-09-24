@@ -1643,6 +1643,10 @@ static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t t
 
     if (!s) return reject("null-state");
     if ((s->texture_mask & 1) && !texture) return reject("missing-texture");
+    /* BUMPENVMAP is modelled by the CPU rasteriser and the Metal shader but
+     * not by this sink's HLSL; refusing hands the draw to the CPU fallback,
+     * which draws it with the displacement, rather than drawing it flat. */
+    if (s->bump[1] || s->bump[2] || s->bump[3]) return reject("bump-env-map");
     if (!target) return reject("missing-target");
     if (!vertices || count < 3 || count > NV2A_D3D11_MAX_VERTICES) return reject("vertex-count");
     if (s->target_bpp != 2) return reject("target-format");

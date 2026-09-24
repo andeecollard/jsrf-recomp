@@ -714,7 +714,8 @@ static NSString *const shader =
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],sz16[4],lin32[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
  " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8];"
  " uint const0[8]; uint const1[8]; uint frag_force; uint hw[4]; uint ez_proven;"
- " uint final_general,final_cw0,final_cw1,fog_enable,fog_mode,fog_color,sf0,sf1; float fog_p0,fog_p1; };\n"
+ " uint final_general,final_cw0,final_cw1,fog_enable,fog_mode,fog_color,sf0,sf1; float fog_p0,fog_p1;"
+ " uint bump[4],bump_in[4]; float bump_mat[16],bump_scale[4],bump_offset[4]; };\n"
  /* G53: `fog` is the fog COORDINATE (oFog.x), interpolated; the factor is
   * formed per pixel in fog_factor(), from the rasteriser's fog registers. */
  "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; float fog; };\n"
@@ -771,14 +772,31 @@ static NSString *const shader =
  " float2 p=uv-.5f,f=floor(p),fxy=p-f;int2 q=int2(f);"
  " return(texel(t,q,u,base,w,h,pitch,s)*(1-fxy.x)+texel(t,q+int2(1,0),u,base,w,h,pitch,s)*fxy.x)*(1-fxy.y)"
  " +(texel(t,q+int2(0,1),u,base,w,h,pitch,s)*(1-fxy.x)+texel(t,q+int2(1,1),u,base,w,h,pitch,s)*fxy.x)*fxy.y;}\n"
- "float4 sample_lod(const device uchar*t,float4 tc,uint u,constant Params&s){float2 uv=tc.xy/tc.w;"
- " float2 scale=float2(s.tw[u],s.th[u]);float lod=log2(max(0.000001f,max(length(dfdx(uv)*scale),length(dfdy(uv)*scale))));"
+ "float4 sample_at(const device uchar*t,float2 uv,float2 luv,uint u,constant Params&s){"
+ " float2 scale=float2(s.tw[u],s.th[u]);float lod=log2(max(0.000001f,max(length(dfdx(luv)*scale),length(dfdy(luv)*scale))));"
  " float l=max(0.0f,lod+s.lod_bias[u]);if(s.min_filter[u]<3||s.levels[u]<2)l=0;"
  " l=min(l,float(s.levels[u]-1));uint lo=s.min_filter[u]>=5?uint(floor(l)):uint(floor(l+.5f));"
  " uint hi=s.min_filter[u]>=5&&lo+1<s.levels[u]?lo+1:lo;bool linear=s.linear[u]!=0;"
  " if(lod+s.lod_bias[u]>0&&s.min_filter[u])linear=(s.min_filter[u]&1)==0;"
  " float4 a=sample_level(t,uv,u,lo,linear,s),b=hi==lo?a:sample_level(t,uv,u,hi,linear,s);"
  " return mix(a,b,hi==lo?0.0f:l-float(lo));}\n"
+ /* The ordinary fetch: the projective divide, and the LOD from the same
+  * coordinate it samples at. */
+ "float4 sample_lod(const device uchar*t,float4 tc,uint u,constant Params&s){float2 uv=tc.xy/tc.w;return sample_at(t,uv,uv,u,s);}\n"
+ /* BUMPENVMAP (6) / BUMPENVMAP_LUMINANCE (7): bump_sample() in
+  * nv2a_texture_copy.c op for op, which is xemu psh.c's -- (du,dv) are the
+  * input texel's blue and green read as two's-complement bytes (sign3),
+  * rotated by M00 M01 M10 M11, added to coord.xy with NO projective divide;
+  * mode 7 scales the result by scale*input.r + offset. The LOD is the
+  * unperturbed coordinate's, as on the CPU. Always the buffer sampler: a
+  * bump unit is never given a hardware texture (see hwmask). */
+ "float sign3(float x){x*=255.0f;return x>=128.0f?(x-256.0f)/127.0f:x/127.0f;}\n"
+ "float4 bump_sample(const device uchar*t,float4 tc,uint u,float4 src,constant Params&s){"
+ " float du=sign3(src.b),dv=sign3(src.g);"
+ " float pu=s.bump_mat[4*u]*du+s.bump_mat[4*u+2]*dv,pv=s.bump_mat[4*u+1]*du+s.bump_mat[4*u+3]*dv;"
+ " float4 c=sample_at(t,tc.xy+float2(pu,pv),tc.xy,u,s);"
+ " if(s.bump[u]==7u)c*=s.bump_scale[u]*src.r+s.bump_offset[u];return c;}\n"
+ "float4 bump_in(thread float4*r,uint u,constant Params&s){uint k=s.bump_in[u];return k==0u?r[8]:k==1u?r[9]:r[10];}\n"
  /* G27: THE SAME SAMPLE, BY THE SAMPLER HARDWARE. The texture holds exactly
   * what texel() would have returned for each texel (nv2a_texture_decode.c,
   * checked by texture_decode_test.c), with the mip chain present only when
@@ -901,7 +919,9 @@ static NSString *const shader =
  " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
  " if(tmask&1)tex=hw0?hw_sample(h0,q0,i.t0,0,s):sample_lod(t0,i.t0,0,s);"
  " if(ncomb){float4 r[16];for(uint n=0;n<16;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
- " if(tmask&2)r[9]=hw1?hw_sample(h1,q1,i.t1,1,s):sample_lod(t1,i.t1,1,s);if(tmask&4)r[10]=hw2?hw_sample(h2,q2,i.t2,2,s):sample_lod(t2,i.t2,2,s);if(tmask&8)r[11]=hw3?hw_sample(h3,q3,i.t3,3,s):sample_lod(t3,i.t3,3,s);"
+ " if(tmask&2)r[9]=s.bump[1]?bump_sample(t1,i.t1,1,bump_in(r,1,s),s):hw1?hw_sample(h1,q1,i.t1,1,s):sample_lod(t1,i.t1,1,s);"
+ " if(tmask&4)r[10]=s.bump[2]?bump_sample(t2,i.t2,2,bump_in(r,2,s),s):hw2?hw_sample(h2,q2,i.t2,2,s):sample_lod(t2,i.t2,2,s);"
+ " if(tmask&8)r[11]=s.bump[3]?bump_sample(t3,i.t3,3,bump_in(r,3,s),s):hw3?hw_sample(h3,q3,i.t3,3,s):sample_lod(t3,i.t3,3,s);"
  " r[12].a=(tmask&1)?r[8].a:1;"
  " if(FC_SPEC){"
  " if(FC_CC>0u)comb_stage(r,0u,FC_ci0,FC_ai0,FC_co0,FC_ao0,s);"
@@ -950,6 +970,7 @@ static NSString *const shader =
  " if(s.frag_force==1u)return float4(tex.rgb,1);"
  " if(s.frag_force==2u)return float4(clamp(d0.rgb,0.0f,1.0f),1);"
  " if(s.frag_force==5u)return float4(1,0,1,1);"
+ " if(s.frag_force==6u)return float4(0,1,1,1);"
  " if(s.frag_force==3u)return float4(1,1,1,1);"
   /* FRACT, NOT CLAMP, and the first version of this got it wrong.
   *
@@ -2088,6 +2109,13 @@ static int no_alpha_test_on(void)
  * wrong, no magenta means it never reaches those pixels. */
 static int mark_bump_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_MARK_BUMP"); return on; }
+/* RECOMP_MARK_BUMP_ENV=1 -- ITS COUNTERPART, ALSO RENDERS INCORRECTLY. Since
+ * BUMPENVMAP is implemented (RECOMP_TEXMODE_BUMP, default on) a bump draw is
+ * no longer approximated, so RECOMP_MARK_BUMP -- which still means exactly
+ * "drawn WITHOUT its displacement" -- paints nothing. This paints the draws
+ * drawn WITH it opaque cyan (frag_force mode 6): where the water is. */
+static int mark_bump_env_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_MARK_BUMP_ENV"); return on; }
 static int legacy_zclamp_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
   return on; }
@@ -4313,6 +4341,11 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     uint32_t ez_proven;  /* G38c audit: the alpha test was proven unable to fire */
     uint32_t final_general,final_cw0,final_cw1,fog_enable,fog_mode,fog_color,sf0,sf1;   /* G53 */
     float fog_p0,fog_p1;
+    /* BUMPENVMAP (NV2ATextureCopy.bump): per unit, mode 0/6/7, the input unit,
+     * M00 M01 M10 M11 at [4u..4u+3], and mode 7's scale and offset. All
+     * 4-byte scalars, so the MSL string's layout matches with no padding. */
+    uint32_t bump[4],bump_in[4];
+    float bump_mat[16],bump_scale[4],bump_offset[4];
 }Params;
 
 /* Does the ring actually protect staging memory from the GPU?
@@ -6472,10 +6505,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     ++g_feedback_draws;
     if(feedback_sync_on()&&surface_dirty){nv2a_metal_sync();++g_feedback_syncs;}}
    tb[u]=texture_buffer(data,bytes);if(!tb[u])return reject("buffer-allocation");
-   if(active&&bytes&&hw_tex_on()&&(t->rgba8||t->dxt1||t->dxt3)){
+   if(active&&bytes&&hw_tex_on()&&(t->rgba8||t->dxt1||t->dxt3)&&!s->bump[u]){
     ht[u]=texture_hw(t);
     if(ht[u]){hs[u]=hw_sampler(t);hwmask|=1u<<u;++hw_tex_units;tamin[u]=hw_last_min_a;tamax[u]=hw_last_max_a;}}}
-  if(early_z_exact_on()&&s->alpha_test&&s->combiner_count){
+  /* Mode 7 scales its texel by scale*L + offset, which can leave [0,1] in
+   * either direction, so no range for it can be claimed: no proof. */
+  if(early_z_exact_on()&&s->alpha_test&&s->combiner_count&&s->bump[1]!=7u&&s->bump[2]!=7u&&s->bump[3]!=7u){
    Rng tr[4];
    for(unsigned u=0;u<4;u++)tr[u]=(hwmask&(1u<<u))?rng_c(tamin[u]/255.0f,tamax[u]/255.0f):rng_c(0.0f,1.0f);
    Rng d0=vsh_gpu_active?vsh_out_alpha(vsh_active,0,vsh_constants):rng_c(0.0f,1.0f);
@@ -6633,8 +6668,9 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();if(mark_bump_on()&&s->bump_approx)p.frag_force=5u;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8?(t->xrgb8?2u:1u):0u;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.sz16[u]=t->sz16?(t->argb4?2u:1u):0u;p.lin32[u]=t->lin32;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
+  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();if(mark_bump_on()&&s->bump_approx)p.frag_force=5u;if(mark_bump_env_on()&&(s->bump[1]|s->bump[2]|s->bump[3]))p.frag_force=6u;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8?(t->xrgb8?2u:1u):0u;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.sz16[u]=t->sz16?(t->argb4?2u:1u):0u;p.lin32[u]=t->lin32;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
   p.final_general=s->final_general;p.final_cw0=s->final_cw0;p.final_cw1=s->final_cw1;p.fog_enable=s->fog_enable;p.fog_mode=s->fog_mode;p.fog_color=s->fog_color;p.sf0=s->spec_fog_c0;p.sf1=s->spec_fog_c1;p.fog_p0=s->fog_p0;p.fog_p1=s->fog_p1;
+  for(unsigned u=1;u<4;u++)if(s->bump[u]&&(s->texture_mask&(1u<<u))){p.bump[u]=s->bump[u];p.bump_in[u]=s->bump_input[u];memcpy(&p.bump_mat[4*u],s->bump_mat[u],16);p.bump_scale[u]=s->bump_scale[u];p.bump_offset[u]=s->bump_offset[u];}
   p.ez_proven=(uint32_t)(early_z_exact_mode()==2&&s->alpha_test&&s->alpha_ref==0&&hw_zcull_cannot_fire(s)
                          &&g_draw_alpha_floor>=1.0f/255.0f);
   if(early_z_exact_mode()==3)p.ez_proven=(uint32_t)(s->alpha_test!=0);   /* the audit's positive control */
