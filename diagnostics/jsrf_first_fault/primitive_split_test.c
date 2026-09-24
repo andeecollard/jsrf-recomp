@@ -38,6 +38,7 @@ void xbox_FramebufferWindowStart(void) {}
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 uint32_t nv2a_pb_exec_last_batch(uint32_t *prim);
+int nv2a_pb_exec_imm_vertex(uint32_t i, uint32_t attr, float out[4]);
 
 static int fails;
 #define CHECK(c, ...) do { if (c) { printf("ok: "); printf(__VA_ARGS__); printf("\n"); } \
@@ -84,12 +85,50 @@ int main(void)
     put(0x17FC, 0);
     CHECK(nv2a_drop_count(SHORT) == short0 + 1, "CONTROL: a genuine 2-index line batch IS counted as a short drop");
 
-    /* CONTROL: immediate-mode positions. */
-    put(0x17FC, 5);
-    for (unsigned v = 0; v < 3; ++v)
-        for (unsigned k = 0; k < 4; ++k) put(0x1A00 + 4 * k, 0x3F800000u);
-    put(0x17FC, 0);
-    CHECK(nv2a_drop_count(IMM) == 1, "an immediate-mode Begin/End is counted, not silent (%llu)", nv2a_drop_count(IMM));
+    /* IMMEDIATE MODE: D3D's Begin / SetVertexData / End, as xemu draws it.
+     * Per vertex: a diffuse (DATA4UB slot 3), a texcoord (DATA2F_M slot 9),
+     * then the position (DATA4F_M slot 0), whose w completes the vertex. */
+    {   static const float P[3][4] = { { 10, 20, 0.5f, 1 }, { 50, 22, 0.5f, 1 }, { 30, 44, 0.5f, 1 } };
+        static const uint32_t C[3] = { 0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u };
+        float o[4]; int ok = 1;
+        put(0x17FC, 5);
+        for (unsigned v = 0; v < 3; ++v) {
+            uint32_t w;
+            put(0x1940 + 4 * 3, C[v]);                           /* SET_VERTEX_DATA4UB, diffuse */
+            { float f = 0.25f * (float)v; memcpy(&w, &f, 4); put(0x1880 + 8 * 9, w); }
+            { float f = 1.0f - 0.25f * (float)v; memcpy(&w, &f, 4); put(0x1880 + 8 * 9 + 4, w); }
+            for (unsigned k = 0; k < 4; ++k) { memcpy(&w, &P[v][k], 4); put(0x1A00 + 4 * k, w); }
+        }
+        put(0x17FC, 0);
+        n = nv2a_pb_exec_last_batch(&prim);
+        CHECK(n == 3 && prim == 5, "an immediate-mode Begin/End is DRAWN: one batch of 3 vertices, TRIANGLES (%u, prim %u)", n, prim);
+        for (unsigned v = 0; v < 3 && ok; ++v) {
+            if (!nv2a_pb_exec_imm_vertex(v, 0, o) || memcmp(o, P[v], 16)) ok = 0;
+            if (!nv2a_pb_exec_imm_vertex(v, 3, o) || o[0] != (float)(C[v] & 255) / 255.0f || o[3] != 1.0f) ok = 0;
+            if (!nv2a_pb_exec_imm_vertex(v, 9, o) || o[0] != 0.25f * (float)v || o[1] != 1.0f - 0.25f * (float)v
+                || o[2] != 0.0f || o[3] != 1.0f) ok = 0;
+        }
+        CHECK(ok, "each emitted vertex carries its own position, diffuse (4UB) and texcoord (2F: z 0, w 1)");
+        CHECK(nv2a_drop_count(IMM) == 0, "and the old immediate-mode drop reads 0");
+    }
+    /* SET_VERTEX3F completes on z, with w = 1; 2S positions are signed shorts. */
+    {   float o[4]; uint32_t w; float f;
+        put(0x17FC, 1);                                          /* POINTS */
+        f = 7; memcpy(&w, &f, 4); put(0x1500, w); f = 8; memcpy(&w, &f, 4); put(0x1504, w);
+        f = 9; memcpy(&w, &f, 4); put(0x1508, w);
+        put(0x1900, 0xFFFE0005u);                                /* DATA2S slot 0: (5, -2) */
+        put(0x17FC, 0);
+        CHECK(nv2a_pb_exec_imm_vertex(0, 0, o) && o[0] == 7 && o[1] == 8 && o[2] == 9 && o[3] == 1,
+              "SET_VERTEX3F emits (7, 8, 9, 1)");
+        CHECK(nv2a_pb_exec_imm_vertex(1, 0, o) && o[0] == 5 && o[1] == -2 && o[2] == 0 && o[3] == 1,
+              "SET_VERTEX_DATA2S slot 0 emits (5, -2, 0, 1)");
+    }
+    /* CONTROL: outside Begin/End the same writes only latch. */
+    {   uint32_t before = nv2a_pb_exec_last_batch(NULL);
+        uint32_t w; float f = 3;
+        memcpy(&w, &f, 4);
+        for (unsigned k = 0; k < 4; ++k) put(0x1A00 + 4 * k, w);
+        CHECK(nv2a_pb_exec_last_batch(NULL) == before, "CONTROL: position writes outside Begin/End draw nothing"); }
 
     /* CONTROL: a Begin over an open batch. */
     put(0x17FC, 5);

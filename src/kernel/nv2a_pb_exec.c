@@ -3488,8 +3488,30 @@ unsigned long long nv2a_pb_exec_host_seen(void) { return s_host_seen; }
 static void (*s_flip_hook)(void);
 /* G54: immediate-mode positions in the open Begin/End, and the last drawn
  * batch's index count and primitive (for the primitive-split test). */
-static uint32_t s_imm_vertices, s_last_batch_indices, s_last_batch_prim;
+static uint32_t s_last_batch_indices, s_last_batch_prim;
 uint32_t nv2a_pb_exec_last_batch(uint32_t *prim) { if (prim) *prim = s_last_batch_prim; return s_last_batch_indices; }
+/* IMMEDIATE MODE (G54), as xemu's pgraph_finish_inline_buffer_vertex does it:
+ * inside Begin/End, completing a POSITION write (SET_VERTEX3F's z,
+ * SET_VERTEX4F's w, SET_VERTEX_DATA2F_M / 4F_M / 2S / 4UB / 4S_M on slot 0)
+ * emits a vertex made of EVERY attribute's current value. The vertices are
+ * drawn at END with the batch's primitive, all sixteen attributes as float4,
+ * through the same draw path as an indexed batch (fetch_vertex reads them). */
+#define NV_MAX_IMM 4096
+static float s_imm[NV_MAX_IMM][16][4];
+static uint32_t s_imm_count, s_imm_overflow;
+static int s_imm_active;
+static void imm_emit(void)
+{
+    if (!s_gpu.prim) return;
+    if (s_imm_count < NV_MAX_IMM) memcpy(s_imm[s_imm_count++], s_vsh.current, sizeof s_imm[0]);
+    else ++s_imm_overflow;
+}
+int nv2a_pb_exec_imm_vertex(uint32_t i, uint32_t attr, float out[4])
+{
+    if (i >= s_imm_count || attr >= 16) return 0;
+    memcpy(out, s_imm[i][attr], 16);
+    return 1;
+}
 void nv2a_pb_exec_set_flip_hook(void (*fn)(void)) { s_flip_hook = fn; }
 
 static void flip_trace(void)
@@ -4258,6 +4280,11 @@ static void raster_triangle(const float a[2], const float b[2],
  * it, anything else reads the arrays the title pointed at. */
 static int fetch_vertex(uint32_t a, uint32_t index, float out[4])
 {
+    if (s_imm_active) {
+        if (index < s_imm_count && a < 16) { memcpy(out, s_imm[index][a], 16); return 1; }
+        out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+        return 0;
+    }
     if (s_gpu.inline_count)
         return fetch_inline(a, index, out);
     return fetch_attr(&s_gpu.attr[a], index, out);
@@ -5569,18 +5596,6 @@ static void draw_primitive(void)
             ++s_gpu.batches_no_layout;
             nv2a_drop_batch();
             nv2a_drop(NV2A_DROP_DROPPED, "vertex", "inline batch with an underivable layout", s_gpu.inline_count);
-        } else if (s_imm_vertices) {
-            /* IMMEDIATE MODE. On the NV2A a position written with
-             * SET_VERTEX_DATA or SET_VERTEX4F inside Begin/End emits a vertex
-             * built from every attribute's current value (xemu:
-             * pgraph_finish_inline_buffer_vertex). This executor only
-             * latches the current values, so the whole Begin/End ends here
-             * with nothing -- before s_gpu.draws, so no other counter ever
-             * saw it. D3D's Begin/SetVertexData/End are how such draws are
-             * made (2 per frame in the tutorial's census). */
-            nv2a_drop_batch();
-            nv2a_drop(NV2A_DROP_DROPPED, "vertex", "immediate-mode vertices (SET_VERTEX_DATA inside Begin/End) are not emitted",
-                      s_imm_vertices);
         }
         return;
     }
@@ -5835,16 +5850,48 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         if (component == 3 && s_vsh.constant_load < NV2A_VS_MAX_CONSTANTS) s_vsh.constant_load++;
         return;
     }
-    /* G54: positions written inside Begin/End are immediate-mode vertices;
-     * counted so the Begin/End that carried them does not end silently.
-     * SET_VERTEX4F (0x1518..0x1524) and SET_VERTEX_DATA2F_M are the same
-     * emission through other methods; neither is decoded here. */
-    if (s_gpu.prim && (method == NV097_SET_VERTEX4F + 12
-                    || method == NV097_SET_VERTEX_DATA4F_M + 12 || method == NV097_SET_VERTEX_DATA2F_M + 4))
-        ++s_imm_vertices;
+    /* G54: THE CURRENT-VALUE METHODS, and the immediate-mode vertex their
+     * position forms complete (see imm_emit). SET_VERTEX3F, SET_VERTEX4F,
+     * SET_VERTEX_DATA2F_M, 2S and 4S_M were not decoded before: their values
+     * never latched, and a Begin/End built from them drew nothing. The
+     * conversions are xemu's: 2F and 2S set z = 0, w = 1; 2S and 4S are
+     * signed shorts, unnormalised. */
+    if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
+        unsigned i = (method - NV097_SET_VERTEX3F) / 4;
+        memcpy(&s_vsh.current[0][i], &param, sizeof(float));
+        if (i == 2) { s_vsh.current[0][3] = 1.0f; imm_emit(); }
+        return;
+    }
+    if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
+        unsigned i = (method - NV097_SET_VERTEX4F) / 4;
+        memcpy(&s_vsh.current[0][i], &param, sizeof(float));
+        if (i == 3) imm_emit();
+        return;
+    }
+    if (method >= NV097_SET_VERTEX_DATA2F_M && method < NV097_SET_VERTEX_DATA2F_M + 16*8) {
+        unsigned word = (method - NV097_SET_VERTEX_DATA2F_M) / 4, slot = word / 2, part = word % 2;
+        memcpy(&s_vsh.current[slot][part], &param, sizeof(float));
+        if (part == 1) { s_vsh.current[slot][2] = 0.0f; s_vsh.current[slot][3] = 1.0f; if (slot == 0) imm_emit(); }
+        return;
+    }
+    if (method >= NV097_SET_VERTEX_DATA2S && method < NV097_SET_VERTEX_DATA2S + 16*4) {
+        unsigned slot = (method - NV097_SET_VERTEX_DATA2S) / 4;
+        s_vsh.current[slot][0] = (float)(int16_t)(param & 0xFFFFu); s_vsh.current[slot][1] = (float)(int16_t)(param >> 16);
+        s_vsh.current[slot][2] = 0.0f; s_vsh.current[slot][3] = 1.0f;
+        if (slot == 0) imm_emit();
+        return;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4S_M && method < NV097_SET_VERTEX_DATA4S_M + 16*8) {
+        unsigned word = (method - NV097_SET_VERTEX_DATA4S_M) / 4, slot = word / 2, part = word % 2;
+        s_vsh.current[slot][part * 2] = (float)(int16_t)(param & 0xFFFFu);
+        s_vsh.current[slot][part * 2 + 1] = (float)(int16_t)(param >> 16);
+        if (part == 1 && slot == 0) imm_emit();
+        return;
+    }
     if (method >= NV097_SET_VERTEX_DATA4F_M && method < NV097_SET_VERTEX_DATA4F_M + 16*16) {
         unsigned word = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
         memcpy(&s_vsh.current[word / 4][word % 4], &param, sizeof(float));
+        if (word == 3) imm_emit();
         if (s_vsh_trace.enabled) {
             ++s_vsh_trace.current4f;
             s_vsh_trace.current_written[word/4] |= (uint8_t)(1u << (word%4));
@@ -5854,6 +5901,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
     if (method >= NV097_SET_VERTEX_DATA4UB && method < NV097_SET_VERTEX_DATA4UB + 16*4) {
         unsigned a = (method - NV097_SET_VERTEX_DATA4UB) / 4;
         for (int k = 0; k < 4; ++k) s_vsh.current[a][k] = ((param >> (8*k)) & 255) / 255.0f;
+        if (a == 0) imm_emit();
         if (s_vsh_trace.enabled) {
             ++s_vsh_trace.current4ub;
             s_vsh_trace.current_written[a] = 15;
@@ -5981,11 +6029,11 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.batch_wide = 0;
             /* G54: a Begin while a batch is still open loses the open one --
              * its indices are cleared two lines down without a draw. */
-            if (s_gpu.prim && (s_gpu.idx_count || s_gpu.inline_count)) {
+            if (s_gpu.prim && (s_gpu.idx_count || s_gpu.inline_count || s_imm_count)) {
                 nv2a_drop_batch();
                 nv2a_drop(NV2A_DROP_DROPPED, "vertex", "Begin while a batch was still open (the open batch is lost)", s_gpu.prim);
             }
-            s_imm_vertices = 0;
+            s_imm_count = 0; s_imm_overflow = 0;
             s_gpu.prim = param;
             {   uint32_t xm = s_methods[0x1E94u / 4u];
                 ++s_exec_mode_batches[xm == 4u ? 0 : xm == 6u ? 1 : 2]; }
@@ -6031,7 +6079,27 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
                     s_gpu.idx_count = nv;
                 }
             }
-            draw_primitive();
+            if (!s_gpu.idx_count && !s_gpu.inline_count && s_imm_count) {
+                /* Immediate mode: every attribute from the emitted vertices,
+                 * so each is declared float4 for the draw and fetch_vertex
+                 * serves them; the arrays' own declarations come back after. */
+                VertexAttr saved[NV_VERTEX_ATTRS];
+                uint32_t n = s_imm_count > NV_MAX_INDICES ? NV_MAX_INDICES : s_imm_count, k;
+                memcpy(saved, s_gpu.attr, sizeof saved);
+                for (k = 0; k < NV_VERTEX_ATTRS; ++k) {
+                    s_gpu.attr[k].type = 2; s_gpu.attr[k].size = 4; s_gpu.attr[k].stride = 64; s_gpu.attr[k].offset = 0;
+                }
+                for (k = 0; k < n; ++k) s_gpu.idx[k] = (uint16_t)k;
+                s_gpu.idx_count = n; s_imm_active = 1;
+                if (s_imm_overflow) nv2a_drop(NV2A_DROP_PARTIAL, "vertex", "immediate-mode vertices past the 4,096-vertex buffer", s_imm_overflow);
+                draw_primitive();
+                s_imm_active = 0; s_gpu.idx_count = 0;
+                memcpy(s_gpu.attr, saved, sizeof saved);
+            } else {
+                if (s_imm_count && (s_gpu.idx_count || s_gpu.inline_count))
+                    nv2a_drop(NV2A_DROP_SIMPLIFIED, "vertex", "immediate-mode vertices in a batch that also has indices (ignored)", s_imm_count);
+                draw_primitive();
+            }
             s_gpu.prim = 0;
             s_gpu.inline_count = 0;    /* after the draw: fetch_vertex reads it */
         }
