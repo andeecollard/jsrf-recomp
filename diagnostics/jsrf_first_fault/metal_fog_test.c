@@ -25,6 +25,8 @@
 #include "d3d8_ff_combiner.h"
 #include "d3d8_ff_vertex_state.h"
 #include "vsh_encode.h"
+#include "nv2a_ff.h"
+#include "texture_copy_state.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,9 +259,69 @@ static void metal_tests(void)
     CHECK(bad > (W * H) / 4, "CONTROL: with the fog colour changed the fogged quad differs (%u px)", bad);
 }
 
+/* ---- 4. THROUGH THE GATE, with Rokkaku-dai's own numbers ---------------
+ * The first three sections build NV2ATextureCopy by hand, which is how a
+ * second refusal (FOG_ENABLE, further down nv2a_texture_copy_prepare) hid
+ * from them. This goes through prepare with the state the player's
+ * FOG-TRACE recorded: CW0 130C0300 / 130E0300, CW1 1C80, FOG_ENABLE 1,
+ * LINEAR, GEN 2 (planar), COLOR 005E77A5, PARAMS 2 -0.00025 0, PLANE
+ * 0 0 1 0. Then the fog coordinate for eye z = 1000 through the
+ * fixed-function unit (model-view 0x480, FOG_PLANE) and its factor: 0.75. */
+static void put_f(uint32_t *m, unsigned byte, float f) { memcpy(&m[byte / 4], &f, 4); }
+static void gate_tests(void)
+{
+    static uint32_t m[2048];
+    NV2ATextureCopy s; const char *err; float regs[16][4], out[4];
+    copy_methods(m, 3, 2, 8, 20, 4);
+    modulate_methods(m);
+    CHECK(!nv2a_texture_copy_prepare(m, &s) && !s.final_general, "gate: the fog-off baseline is accepted");
+    m[0x288 / 4] = 0x130C0300u; m[0x28C / 4] = 0x1C80u;
+    m[0x2A4 / 4] = 1; m[0x29C / 4] = 0x2601u; m[0x2A0 / 4] = 2; m[0x2A8 / 4] = 0x005E77A5u;
+    put_f(m, 0x9C0, 2.0f); put_f(m, 0x9C4, -0.00025f); put_f(m, 0x9C8, 0.0f);
+    put_f(m, 0x9D0, 0.0f); put_f(m, 0x9D4, 0.0f); put_f(m, 0x9D8, 1.0f); put_f(m, 0x9DC, 0.0f);
+    err = nv2a_texture_copy_prepare(m, &s);
+    CHECK(!err, "gate: Rokkaku's fogged state is ACCEPTED by nv2a_texture_copy_prepare (%s)", err ? err : "accepted");
+    CHECK(!err && s.final_general && s.final_cw0 == 0x130C0300u && s.fog_enable && s.fog_mode == 0x2601u
+          && s.fog_p0 == 2.0f && s.fog_p1 == -0.00025f && s.fog_color == 0x005E77A5u,
+          "gate: the prepared state carries the final combiner, FOG_ENABLE, LINEAR and params 2, -0.00025");
+    m[0x288 / 4] = 0x130E0300u;
+    err = nv2a_texture_copy_prepare(m, &s);
+    CHECK(!err && s.final_general && !s.add_specular, "gate: the specular fog program too (%s)", err ? err : "accepted");
+    /* The colour: FOG_COLOR's parameter is ABGR (xemu, SET_FOG_COLOR: red is
+     * the low byte), so 0x005E77A5 is (165, 119, 94) -- the orange haze. A
+     * fully fogged pixel is exactly that. */
+    memset(regs, 0, sizeof regs); regs[12][0] = 1; regs[12][1] = 1; regs[12][2] = 1;
+    s.final_cw0 = 0x130C0300u;
+    nv2a_final_combine(&s, regs, 0.0f, out);
+    CHECK(fabsf(out[0] * 255 - 165) < 0.01f && fabsf(out[1] * 255 - 119) < 0.01f && fabsf(out[2] * 255 - 94) < 0.01f,
+          "fog colour 005E77A5 is (165,119,94): %.1f %.1f %.1f", out[0] * 255, out[1] * 255, out[2] * 255);
+    /* Eye z = 1000 through the fixed-function unit: identity model-view,
+     * PLANE (0,0,1,0), GEN PLANAR. d = 1000, f = 2 + 1000 * -0.00025 - 1. */
+    {   float in[16][4], ff_out[16][4], eye[4], d, f;
+        static const float I4[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        static const float T[16] = { 1,0,0,5, 0,1,0,-3, 0,0,1,400, 0,0,0,1 };   /* model-view with a z translation */
+        for (unsigned k = 0; k < 16; ++k) put_f(m, 0x480 + 4 * k, I4[k]);
+        for (unsigned k = 0; k < 16; ++k) put_f(m, 0x680 + 4 * k, I4[k]);
+        memset(in, 0, sizeof in); in[0][0] = 3; in[0][1] = -2; in[0][2] = 1000; in[0][3] = 1;
+        d = nv2a_ff_fog_coord(m, nv2a_ff_fog_source(m), (const float (*)[4])in, eye);
+        f = nv2a_fog_factor(0x2601u, 2.0f, -0.00025f, d);
+        CHECK(d == 1000.0f && fabsf(f - 0.75f) < 1e-6f, "eye z 1000, PLANAR, LINEAR (2, -0.00025): d %g, f %g (0.75)", d, f);
+        nv2a_ff_vertex(m, (const float (*)[4])in, ff_out);
+        CHECK(ff_out[5][0] == 1000.0f, "nv2a_ff_vertex writes that coordinate to output slot 5 (%g)", ff_out[5][0]);
+        for (unsigned k = 0; k < 16; ++k) put_f(m, 0x480 + 4 * k, T[k]);
+        in[0][2] = 600;
+        d = nv2a_ff_fog_coord(m, nv2a_ff_fog_source(m), (const float (*)[4])in, eye);
+        CHECK(d == 1000.0f && eye[2] == 1000.0f, "the model-view's z translation reaches the eye z (600 + 400 = %g)", d);
+        m[0x2A0 / 4] = 1;                                                       /* RADIAL */
+        d = nv2a_ff_fog_coord(m, nv2a_ff_fog_source(m), (const float (*)[4])in, eye);
+        CHECK(fabsf(d - sqrtf(8.0f * 8.0f + 5.0f * 5.0f + 1000.0f * 1000.0f)) < 1e-2f, "RADIAL: |eye| (%g)", d);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "vsh")) { use_vsh = 1; build_vsh(); }
+    gate_tests();
     factor_tests();
     final_cpu_tests();
     metal_tests();

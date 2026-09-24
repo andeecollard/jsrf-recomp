@@ -237,6 +237,8 @@ VALUE_CARRYING = {
     "RECOMP_D3D8_HOST_BISECT",
     # G51.2: a MODE ("shadow"), like RECOMP_D3D8_HOST_FF.
     "RECOMP_D3D8_HOST_VS",
+    # G53: a COUNT of fogged batches to trace (1 means 40).
+    "RECOMP_FOG_DRAW_TRACE",
     # A stride in flips: every Nth flip of a draw-mode run is verified.
     "RECOMP_D3D8_HOST_VERIFY",
 }

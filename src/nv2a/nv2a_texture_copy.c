@@ -431,7 +431,12 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
         s->stencil_func=M(0x364);s->stencil_ref=M(0x368);s->stencil_func_mask=M(0x36c);
         s->stencil_fail=op[0];s->stencil_zfail=op[1];s->stencil_zpass=op[2];
     }
-    if (M(0x2a4)) return "fog";
+    /* THE SECOND FOG GATE (G53). The final-combiner gate at the top was
+     * opened for fog and this one, further down, still refused every draw
+     * with FOG_ENABLE set: 465,058 draws in the player's Rokkaku session
+     * after the first fix. The unit tests had built NV2ATextureCopy by hand
+     * and never came through here; metal_fog_test now does. */
+    if (M(0x2a4) && !fog_model_on()) return "fog";
     if (M(0x324) || M(0x338)) return "polygon smoothing / offset";
     if (M(0x17bc)) return "logic op";
     if (M(0x37c)!=0x1d01 || M(0x38c)!=0x1b02 || M(0x390)!=0x1b02)

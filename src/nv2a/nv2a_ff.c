@@ -247,6 +247,11 @@ static float fog_coord(const uint32_t *m,int source,const float in[16][4],const 
     default: return 0;
     }
 }
+float nv2a_ff_fog_coord(const uint32_t m[2048],int source,const float in[16][4],float eye[4])
+{
+    if(eye) { eye[0]=eye[1]=eye[2]=eye[3]=0; if(source>=NV2A_FF_FOG_RADIAL&&source<=NV2A_FF_FOG_ABS_PLANAR) matrix(m,0x480,in[0],eye); }
+    return fog_coord(m,source,in,in[4]);
+}
 const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float out[16][4])
 {
     static const uint32_t normal_map=0x8511;
