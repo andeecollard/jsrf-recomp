@@ -1,0 +1,232 @@
+HANDOVER -- 24 September 2026
+THE HOST DRAWS THE TUTORIAL, AND DEFERRED SWAPS ARE 107 FPS
+
+FOLLOWS the 23 Sep work recorded in
+docs/jsrf/goals/JSRF_GOALS_2026-09-23_LATE_LIFT_AS_MUCH_AS_WE_CAN.md, which
+is the ACTIVE goals file. Its "Progress, 24 Sep" sections carry every number
+below with its commit, and they supersede this summary wherever the two
+differ. Read that file's tail before starting.
+
+Branch: jsrf/g2-text-clobber-and-the-symbol-layer, pushed to origin/main.
+Main at the time of writing: d2c013a plus this handover's commit.
+JSRF.app: /Users/andrewcollard/jsrf-build/JSRF.app, built from main at
+d2c013a (build-feav), signed, checked (launcher present, switches in
+`strings`, no source newer than the engine).
+
+
+====================================================================
+0. THE STATE, IN ONE PARAGRAPH
+====================================================================
+
+The player's build plays the tutorial at a steady 59.8 fps, and the game runs
+at correct speed: the animation counter advances 59.8 times a second. With
+pacing off it reaches 84-87 fps. DSOUND, XInput and CRI's idle spinner are
+lifted, and the old APU model is no longer started when the lift is on. D3D's
+per-draw state is mirrored exactly. Behind switches, the host can now draw
+all three classes of draw itself: 2D, fixed-function 3D and the title's own
+vertex programs. Each has been compared per draw with the executor, in game,
+with a positive control. The single biggest performance lever found today is
+an existing switch, RECOMP_METAL_DEFER_SWAP: 83 -> 107-112 fps in the
+tutorial. It is still off by default, pending one player session with the
+debt watch on.
+
+
+====================================================================
+1. WHAT LANDED TODAY (24 Sep), MOST PLAYER-VISIBLE FIRST
+====================================================================
+
+Every item was measured in the tutorial, player config (see section 6),
+130 s, with 0 guest faults, unless it says otherwise.
+
+1. G54.4: the APU model is not started when the DSOUND lift is on
+   (0a74ad2). RECOMP_APU_MODEL=1 forces it. It had been opening a second
+   audio device in the player's build. G54.3, retiring the ADX guard, is NOT
+   done, deliberately: the guard protects CRI's priority-elevation lock,
+   which has nothing to do with the APU model.
+
+2. D3D CPU readers pay first (658882b). This is ALWAYS ON. Lock and
+   CopyRects sources, GetBackBuffer and GetDepthStencilSurface post to the
+   executor thread, which makes the bytes current before the call returns.
+   The wait is bounded at 1 s and a timeout is counted. Measured: 1,933
+   requests, 0 with anything to pay, 0 timeouts; default fps unchanged.
+
+3. The D3D mirror is part of every macOS build (18d8343). It is a
+   configure-time overlay composed over the DSOUND overlay; recomp_0008.c
+   carries both. Unarmed it costs nothing (83.8 vs 84.6 fps).
+
+4. The host draws. One arming table (d3d8_host_2d.c) serves every class, and
+   jsrf_d3d8_host_arming asserts that each switch alone arms the mirror.
+
+   RECOMP_D3D8_HOST_2D = shadow | draw   (pre-transformed, D3D's pass-through)
+     Shadow: 13,980 of 13,981 exact. Draw: 26,325 of 26,325 replaced, 0
+     drawn twice, frames match. The keys were D3D's 0.53125 bias plus the
+     executor's 1/16-pixel truncation, and dropping triangles with rhw 0.
+
+   RECOMP_D3D8_HOST_FF = shadow | draw   (fixed function, MODE FIXED)
+     VERIFY=60: 1,000-1,120 of ~6-7k mismatching, ~95% of them 1-4 edge
+     pixels (CPU vs GPU transform float order), none over 512 px. Frames
+     clean at "Just get close to her" and "Find Gum". Cull comes from D3D's
+     RS 127/128. The stencil-ALWAYS class is drawn. Points, lines and
+     polygons are drawn by neither side, as the executor draws none.
+
+   RECOMP_D3D8_HOST_VS = shadow | draw   (the title's vertex programs)
+     Shadow: 2,151 of 2,153 exact, constants agree on all 2,153; control
+     1,440 mismatching. About 21 draws a frame, 18 programs, mostly the
+     characters. Draw mode exists in 58d0780 (see section 3); NOT RUN.
+
+   Speed (FLIP_PACE=0): FF+2D draw 84.2 fps against the 83.0 reference;
+   107.7 against 107.2 with DEFER_SWAP.
+
+   In-game correctness instruments that exist now:
+     RECOMP_D3D8_HOST_VERIFY=N  1 flip in N drawn by the executor, host shadowed
+     RECOMP_D3D8_HOST_BISECT=mask  reverts each speed change (bits in the
+                                   dff7a6c message / goals file)
+     RECOMP_D3D8_HOST_2D_CONTROL=1 positive control for every class
+     RECOMP_D3D8_HOST_FF_STRIDE=N  shadow stride for FF and VS (default 60)
+
+5. RECOMP_METAL_DEFER_SWAP, measured (36ad170, RECOMP_METAL_DEBT_WATCH).
+   13,279 colour debts armed, 13,277 paid before any access. 0 faults on the
+   high view the title uses, 0 early reads anywhere once framebuffer_probe_tick
+   was fixed (2a44507). Depth never written back: 1 armed, 0 read.
+     reference 83-87 fps -> 107-112 fps with DEFER_SWAP.
+   The default-on flip is READY on branch g56-defer-default-on (99f5f9c,
+   pushed, NOT merged). It is held for one player session.
+
+
+====================================================================
+2. WHAT IS WAITING ON THE PLAYER
+====================================================================
+
+A. DEFER_SWAP session. Add to paths.conf:
+       RECOMP_METAL_DEFER_SWAP=1
+       RECOMP_METAL_DEBT_WATCH=1
+   Play gameplay AND the graffiti editor. Afterwards, copy last-run.log and
+   read:
+       [DEBT-WATCH] ... FIRST GUEST ACCESS while owed: reads R, writes W
+       [DEBT-WATCH]   n x ... at pc 0x... (symbol)
+       [HOST-READ] ... something to pay N, TIMED OUT M
+   If R = W = 0 and TIMED OUT = 0: cherry-pick 99f5f9c onto main.
+   If not, the PC lines name the reader.
+
+B. Still open from 23 Sep:
+   - flicker (boost, police, DJ K cutscenes);
+   - Poison Jam cutscene missing elements;
+   - Rokkaku-dai Heights buildings missing;
+   - Roboy's graffiti studio cannot paint;
+   - police audio fades (3D falloff?).
+   None were worked on today. Host drawing may be a route to the graphics
+   ones (section 4). Nothing is known about them yet.
+
+
+====================================================================
+3. UNMERGED WORK
+====================================================================
+
+- worktree-agent-ac2142be51927d3a7 at 58d0780 (agent worktree
+  .claude/worktrees/agent-ac2142be51927d3a7). NOT merged, NOT run in game.
+  It contains:
+    - the 0x1E94 decode fix (MODE = bits 1:0: raw 4 = FIXED, raw 6 =
+      PROGRAM; the old "2D = mode 6, FF = mode 4" labels were wrong,
+      although the executor's own decode was always right);
+    - RECOMP_D3D8_HOST_VS=draw;
+    - a [D3D8-HOST] coverage line, the host's share of rasterised batches
+      per flip;
+    - an explanation of VS "built 2153 of shadowed 3614": 1,461 were
+      refused as "shader samples an unbound stage".
+  It also touches the executor's default path (one always-on batch counter
+  by MODE). Before merging: run an unarmed A/B, then the agent's run list
+  (VS draw + VERIFY, control, all three classes in draw mode with and
+  without DEFER). Scene-match frames by the dialogue line.
+
+- g56-defer-default-on (99f5f9c): see 2A.
+
+- .claude/worktrees/agent-aeed61e5b35971027: one unmerged commit (1c47e9f,
+  the APU stale-buffer census) and an untracked build-apu/. It predates
+  today; nobody has decided about it.
+
+- .claude/worktrees/agent-icall: merged, but has a local change to its
+  build-macos entry. Left alone.
+
+
+====================================================================
+4. NEXT, IN ORDER
+====================================================================
+
+1. The player's DEFER_SWAP session (2A), then flip the default.
+2. Merge 58d0780 after its A/B; run all three classes in draw mode, and read
+   the coverage line.
+3. G52, the host presents the frame. The agent's plan is in its 58d0780
+   report and the goals file:
+     a. refused draws, starting with the unbound-stage class, about 40% of
+        VS draws. First find out what the executor samples there.
+     b. immediate-mode Begin/End: 2 per frame, not hooked;
+     c. Clear, including depth; 0xFFFFFF00 in guest state = the depth clear
+        escaped;
+     d. render targets keyed on D3D surfaces;
+     e. Present (Swap, gamma, vblank);
+     f. a positive control: an executor that skips every batch but keeps
+        state, so the frame shows exactly what the host does not draw.
+4. The player's graphics reports (2B). With host drawing verified per draw,
+   compare a flicker frame per draw (VERIFY at stride 1 over the frames that
+   flicker). If both sides agree, the defect is in shared state or the guest,
+   and xemu is the oracle (see the memory notes).
+5. Heavy scenes: the player saw p10 = 42 fps. DEFER_SWAP is the first thing
+   to try there.
+
+
+====================================================================
+5. UPSTREAM (sp00nznet/xboxrecomp)
+====================================================================
+
+- Opened today: #124, "REPE CMPS/SCAS produce CF, and keep the incoming ZF
+  at a zero count" (contrib/rep-compare-cf on the fork). It also needed our
+  all-widths CMPS/SCAS flag-setter tracking. The new test fails 2 of 4 on
+  upstream main and passes 4 of 4; pytest tools/: 390 passed, 2 skipped.
+- Commented on #110 (NoRain211's LOOP fix, open): we ported it on 23 Sep
+  and its test goes 5 failed -> 5 passed. We did not re-submit it.
+- Still open from us: #89, #117, #121.
+- Upstream has had no commits since v0.11.0 (19 Sep).
+- Method, and what does not port: memory note jsrf-upstream-contributions.
+
+
+====================================================================
+6. HOW TO REPRODUCE THE NUMBERS
+====================================================================
+
+measure.sh does NOT read paths.conf. For the player's config:
+
+    set -a; . "$HOME/Library/Application Support/JSRF/paths.conf"; set +a
+    unset JSRF_HDD_ROOT JSRF_GAME_DIR
+    export JSRF_GAME_DIR="<iCloud>/Jet Set Radio Future/Jet Set Radio Future (US)"
+    export SDL_AUDIODRIVER=no_such_driver
+    export JSRF_BIN=<repo>/build-macos/jsrf-first-fault/build-feav/jsrf_first_fault
+    [RECOMP_FLIP_PACE=0] diagnostics/jsrf_first_fault/measure.sh <name> 130
+
+- Read [FRAME-WIN], [STAGE], [ACTMAN-TIME], and the [D3D8-HOST-*],
+  [DEBT-WATCH] and [HOST-READ] lines.
+- 130 s reaches "Just get close to her" at >= 60 fps. Slower arms do not,
+  and a frame from an earlier scene is not evidence (memory note
+  jsrf-match-the-dialogue-line-before-judging-frames).
+- Launch detached (nohup + disown). Wait with a pgrep pattern that cannot
+  match itself.
+
+The 23 Sep graffiti padrec is REFUSED since the G56 regeneration (it was
+recorded against the old gen). A new long recording is needed for
+unattended gameplay beyond the tutorial.
+
+
+====================================================================
+7. LESSONS PAID FOR TODAY
+====================================================================
+
+- Counters said clean while the picture was full of debris. Look at the
+  frames. VERIFY now makes the per-draw check in the same run.
+- A bisect judged from frames at different scenes named the wrong causes.
+  The rate from VERIFY is scene-independent, and it named the real one: the
+  specialised shader's stage loop.
+- A fuzz run that always set one control bit missed a defect that the
+  game's own setting exposed. Replay the game's state.
+- Three switches failed to arm because each consumer kept its own list.
+  There is one table now, plus a test that arms each switch alone.
+- A cumulative "not skipped" count mixed two causes (points drawn by
+  neither side, and real double draws). It is split three ways now.
