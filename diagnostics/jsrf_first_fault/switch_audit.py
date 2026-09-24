@@ -245,6 +245,9 @@ VALUE_CARRYING = {
     "RECOMP_INVISIBLE_DRAW",
     # A stride in flips: every Nth flip of a draw-mode run is verified.
     "RECOMP_D3D8_HOST_VERIFY",
+    # A draw INDEX, or "all": which draw of each frame the flight recorder
+    # snapshots the whole transform state at (nv2a_pb_exec.c).
+    "RECOMP_FLIGHT_XF_DRAW",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

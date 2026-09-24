@@ -2034,9 +2034,21 @@ typedef struct {
     uint32_t xf_hash, xf_bad;   /* transform state: hash, and how many non-finite floats */
 } FlightDraw;
 #define FLIGHT_MAX_DRAWS 1024
+/* The whole transform state at a draw -- every program constant, the
+ * composite matrix and the viewport -- so a frame whose camera or skeleton
+ * jumps can be read in numbers, not only as a hash that differs.
+ * RECOMP_FLIGHT_XF_DRAW=<k> takes it at the k-th draw of every frame,
+ * =all at every draw (the first FLIGHT_XF_MAX; ~3 KB each, so keep
+ * RECOMP_FLIGHT_FRAMES small). Written as xf-NNNN.txt beside draws-NNNN.txt. */
+#define FLIGHT_XF_MAX 128
+typedef struct FlightXf {
+    uint32_t index, draw;
+    float c[NV2A_VS_MAX_CONSTANTS][4], composite[16], viewport[8];
+} FlightXf;
 typedef struct {
     uint8_t *px; uint32_t w, h, bpp; unsigned long guest_frame; uint32_t seq;
     uint32_t ndraws, dropped; unsigned long long ctr[6]; FlightDraw d[FLIGHT_MAX_DRAWS];
+    uint32_t nxf; struct FlightXf *xf;   /* RECOMP_FLIGHT_XF_DRAW snapshots */
 } FlightFrame;
 static FlightFrame *s_flight; static unsigned s_flight_n, s_flight_head, s_flight_filled;
 static FlightFrame s_flight_cur;           /* draws of the frame being composed */
@@ -2113,6 +2125,24 @@ static void flight_note_draw(void)
         }
         d->xf_hash = h; d->xf_bad = bad;
     }
+    {
+        static int init; static long at = -2;   /* -2 off, -1 every draw */
+        if (!init) {
+            const char *e = getenv("RECOMP_FLIGHT_XF_DRAW");
+            init = 1;
+            if (e && *e) at = strcmp(e, "all") ? strtol(e, NULL, 10) : -1;
+        }
+        if (at != -2 && (at == -1 || s_flight_cur.ndraws - 1 == (uint32_t)at)) {
+            if (!s_flight_cur.xf) s_flight_cur.xf = malloc(sizeof(FlightXf) * FLIGHT_XF_MAX);
+            if (s_flight_cur.xf && s_flight_cur.nxf < FLIGHT_XF_MAX) {
+                FlightXf *x = &s_flight_cur.xf[s_flight_cur.nxf++];
+                x->index = s_flight_cur.ndraws - 1; x->draw = d->draw;
+                memcpy(x->c, s_vsh.constants, sizeof x->c);
+                memcpy(x->composite, &s_methods[0x680/4], sizeof x->composite);
+                memcpy(x->viewport, &s_methods[0x0a20/4], sizeof x->viewport);
+            }
+        }
+    }
 }
 static int write_bmp_path(const char *path, const uint8_t *base, uint32_t pitch,
                           uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t bpp);
@@ -2146,6 +2176,24 @@ static void flight_write(void)
                     d->blend, d->zfunc, d->xf_hash, d->xf_bad);
         }
         fclose(t);
+        if (f->nxf) {
+            snprintf(path, sizeof path, "%s/xf-%04u.txt", root, i);
+            if ((t = fopen(path, "w")) != NULL) {
+                unsigned x, c;
+                for (x = 0; x < f->nxf; ++x) {
+                    const FlightXf *sn = &f->xf[x];
+                    fprintf(t, "# index %u draw %u\ncomposite", sn->index, sn->draw);
+                    for (c = 0; c < 16; ++c) fprintf(t, " %.9g", sn->composite[c]);
+                    fprintf(t, "\nviewport");
+                    for (c = 0; c < 8; ++c) fprintf(t, " %.9g", sn->viewport[c]);
+                    fprintf(t, "\n");
+                    for (c = 0; c < NV2A_VS_MAX_CONSTANTS; ++c)
+                        fprintf(t, "c%u %.9g %.9g %.9g %.9g\n", c, sn->c[c][0], sn->c[c][1],
+                                sn->c[c][2], sn->c[c][3]);
+                }
+                fclose(t);
+            }
+        }
         ++written;
     }
     fprintf(stderr, "  [FLIGHT] mark %u: wrote %u frames to %s\n", s_flight_marks, written, root);
@@ -2162,6 +2210,11 @@ static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp,
     f->ndraws = s_flight_cur.ndraws; f->dropped = s_flight_cur.dropped;
     if (flight_counters) flight_counters(f->ctr); else memset(f->ctr, 0, sizeof f->ctr);
     memcpy(f->d, s_flight_cur.d, sizeof(FlightDraw) * s_flight_cur.ndraws);
+    {   /* the snapshots change hands: the slot's old buffer is reused */
+        struct FlightXf *x = f->xf;
+        f->xf = s_flight_cur.xf; f->nxf = s_flight_cur.nxf;
+        s_flight_cur.xf = x; s_flight_cur.nxf = 0;
+    }
     s_flight_cur.ndraws = 0; s_flight_cur.dropped = 0;
     s_flight_head = (s_flight_head + 1) % s_flight_n;
     if (s_flight_filled < s_flight_n) ++s_flight_filled;
