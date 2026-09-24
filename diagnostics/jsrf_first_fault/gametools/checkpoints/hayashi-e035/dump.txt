@@ -1,0 +1,39 @@
+preset hayashi-e035: [('chapter', 2), ('mission', 240), ('spawn', 0), ('set-chapter', 101), ('set-chapter', 102), ('clear-chapter', 103), ('set-chapter', 106), ('set-chapter', 107), ('clear-chapter', 108), ('unsee', 35)]
+
+==== slot 0 after preset hayashi-e035 ====
+return chapter/mission : chapter 2, mission 240 (mssn0240.bin)
+spawn position index   : 0
+playtime               : 260330 frames = 1:12:18
+unlocked characters    : 0x0000005f -> Beat, Corn, Gum, Combo, Rhyth, Yoyo
+chapter flags (  9) : [20, 22, 101, 102, 106, 107, 370, 371, 430]
+global  flags (  2) : [1, 10]
+special flags ( 20) : [384, 385, 386, 387, 388, 389, 390, 391, 450, 451, 452, 453, 455, 456, 458, 460, 465, 470, 499, 501]
+souls spawned/collected/held: 60/23/23
+  collected ids: [0, 1, 2, 3, 28, 29, 30, 31, 33, 56, 57, 58, 59, 60, 84, 85, 86, 87, 112, 113, 114, 115, 118]
+per-stage tags (stage index from g_stageIdToStageIndex; 'tag#:n' = n G-marks painted by P1; rival layer listed separately):
+  [ 0] (index 0: unmapped stage ids): 0 tags painted by player (0 marks)
+  [ 1] stg00 Garage: 4 tags painted by player (8 marks)
+        player: 3:3 10:1 11:3 12:1
+  [ 2] stg10 Shibuya Terminal: 36 tags painted by player (64 marks)
+        player: 0:3 3:1 4:1 5:1 6:1 7:1 8:1 9:1 10:1 11:1 12:3 13:1 14:3 15:3 16:3 21:1 22:1 23:1 24:1 25:1 26:1 27:1 28:1 29:1 30:1 31:1 32:1 33:1 34:1 35:1 36:3 37:3 38:6 39:3 40:3 41:6
+        rival layer covered:Poison Jam/P3: tags 3-16,21-41 (35)
+  [ 3] stg11 Chuo Street: 0 tags painted by player (0 marks)
+  [ 4] stg12 Dogenzaka Hill: 16 tags painted by player (46 marks)
+        player: 0:3 4:6 7:3 9:6 10:3 11:6 12:6 20:3 21:1 22:1 23:1 24:3 26:1 27:1 28:1 29:1
+        front layer, other owner: 25:10(covered:GGs/P1)
+  [ 5] stg13 Hikage Street: 0 tags painted by player (0 marks)
+  [ 6] stg20 Rokkaku-dai Heights: 17 tags painted by player (21 marks)
+        player: 0:3 3:1 4:1 5:1 6:1 7:1 8:1 9:1 10:1 15:1 16:1 17:1 18:1 19:1 20:3 21:1 22:1
+        rival layer covered:Poison Jam/P3: tags 3-34 (32)
+  [ 7] stg21 Tokyo Underground Sewage Facility: 0 tags painted by player (0 marks)
+  [ 8] stg22 Kibogaoka Hill: 0 tags painted by player (0 marks)
+  [ 9] stg23 Bottom Point of Sewage Facility: 0 tags painted by player (0 marks)
+  [10] stg24 Fortified Residential Zone: 0 tags painted by player (0 marks)
+  [11] stg30 99th Street: 0 tags painted by player (0 marks)
+  [12] stg31 Sky Dinosaurian Square: 0 tags painted by player (0 marks)
+  [13] stg32 Future Site of Rokkaku Expo Stadium: 0 tags painted by player (0 marks)
+  [14] stg33 Highway Zero: 0 tags painted by player (0 marks)
+  [15] stg34 Skyscraper District and Pharaoh Park: 0 tags painted by player (0 marks)
+misc objectives (0): []  (0-2 sewer switches, 3+ noise tanks per SaveData.hpp)
+events seen (30): e000 e001 e002 e003 e004 e010 e020 e021 e022 e023 e024 e025 e026 e032 e033 e200 e201 e202 e203 e204 e205 e206 e210 e211 e212 e213 e214  | ids >=300 (not event files; written by mission opcode 0xF9, e.g. 308 Combo, 310/311 Rhyth joins): 308 310 311
+settings: music 0.85 sfx 1.00 rumble 1; garage music 30; clutch timer 0

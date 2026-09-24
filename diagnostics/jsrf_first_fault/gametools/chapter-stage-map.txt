@@ -1,0 +1,113 @@
+chapter 1
+   stg00 Garage                 00 01 94 95 97
+   stg12 Dogenzaka              10(e001,e002,e003,e004) 11(e020) 12 13
+   stg10 Shibuya Terminal       20(e000,e010,e023,e021,e022) 21 22(e024,e025,e026) 23
+   stg08 custom?                96(e200,e201,e202,e203,e204,e205,e206)
+chapter 2
+   stg00 Garage                 00 94 95 97
+   stg10 Shibuya Terminal       10
+   stg12 Dogenzaka              20
+   stg11 Chuo St                30(e027,e030,e031) 31(e028,e029) 32
+   stg20 Rokkaku-dai            40(e032) 41(e035) 42(e034,e111) 43(e033)
+   stg30 99th St                50(e036,e039) 51(e118,e037,e038) 52
+   stg09 custom?                96(e210,e211,e212,e213,e214)
+chapter 3
+   stg00 Garage                 00 94 95 97
+   stg10 Shibuya Terminal       10
+   stg12 Dogenzaka              20
+   stg11 Chuo St                30
+   stg20 Rokkaku-dai            40 41(e033)
+   stg30 99th St                50
+   stg21 Sewage Facility        60(e040,e043,e044,e045) 61(e041,e042)
+   stg23 Bottom Point           70(e046,e047) 71
+   stg18 custom?                96(e220,e221,e222,e223)
+chapter 4
+   stg00 Garage                 00 94 95 97
+   stg10 Shibuya Terminal       10
+   stg12 Dogenzaka              15
+   stg11 Chuo St                20
+   stg20 Rokkaku-dai            25 26(e033)
+   stg21 Sewage Facility        30
+   stg23 Bottom Point           35
+   stg30 99th St                40
+   stg13 Hikage St              50(e048) 51(e049,e050,e051) 52
+   stg22 Kibogaoka              60(e052) 61(e053) 62(e054) 63
+   stg34 Skyscraper/Pharaoh     70(e055,e057,e058) 71(e056) 72
+   stg33 Highway Zero           80(e059,e060,e061) 81
+   stg19 custom?                96(e230,e231,e232,e233)
+chapter 5
+   stg32 Future Site            10(e063,e114,e065,e062,e113,e064,e066) 11 12 13(e067) 14(e068,e069) 15
+   stg00 Garage                 94 95 97
+   stg28 custom?                96(e240,e241)
+chapter 6
+   stg00 Garage                 00 94 95 97
+   stg10 Shibuya Terminal       10(e071)
+   stg11 Chuo St                15
+   stg12 Dogenzaka              20(e070)
+   stg13 Hikage St              25
+   stg20 Rokkaku-dai            30(e073) 31(e033)
+   stg21 Sewage Facility        35
+   stg22 Kibogaoka              40 41(e054) 42
+   stg23 Bottom Point           45
+   stg30 99th St                55(e072)
+   stg31 Sky Dino               60(e075,e077) 61(e076)
+   stg32 Future Site            65 66
+   stg33 Highway Zero           70 71
+   stg34 Skyscraper/Pharaoh     75
+   stg29 custom?                96(e250,e251,e252)
+chapter 7
+   stg00 Garage                 00 01 94 95 97
+   stg10 Shibuya Terminal       10
+   stg11 Chuo St                15 16 17
+   stg12 Dogenzaka              20(e078) 21
+   stg13 Hikage St              25(e079) 26
+   stg20 Rokkaku-dai            30 31(e033) 32
+   stg21 Sewage Facility        35
+   stg22 Kibogaoka              40 41(e054) 42 43
+   stg23 Bottom Point           45 46
+   stg24 Fortified Res. Zone    50(e082,e084,e083,e085) 51(e086) 52(e085)
+   stg30 99th St                55 56(e080)
+   stg31 Sky Dino               60
+   stg32 Future Site            65 66
+   stg33 Highway Zero           70 71 72
+   stg34 Skyscraper/Pharaoh     75 76 77
+   stg38 custom?                96(e260,e261,e262,e263,e264,e265,e266)
+chapter 8
+   stg00 Garage                 00 94 95 97 99(e291)
+   stg10 Shibuya Terminal       10
+   stg43 custom?                11(e098,e100) 13(e105)
+   stg42 Shibuya eclipse(custom) 12(e097,e119,e120,e100,e100)
+   stg11 Chuo St                15(e087) 16(e116,e088) 17
+   stg12 Dogenzaka              20 21
+   stg13 Hikage St              25
+   stg20 Rokkaku-dai            30 31(e033) 32
+   stg21 Sewage Facility        35
+   stg22 Kibogaoka              40 41(e054) 42
+   stg23 Bottom Point           45 46
+   stg24 Fortified Res. Zone    50
+   stg30 99th St                55 56
+   stg31 Sky Dino               60
+   stg32 Future Site            65 66
+   stg33 Highway Zero           70(e091) 71 72(e093)
+   stg34 Skyscraper/Pharaoh     75(e094) 76 77
+   stg41 Site of Tokyo Line(custom) 80(e095,e096)
+   stg40 Gouji Tower(custom)    90(e101,e102)
+   stg39 custom?                96(e270,e271,e272,e273,e274)
+   stg48 custom?                98(e280,e281)
+chapter 9
+   stg00 Garage                 00 94 95 97
+   stg10 Shibuya Terminal       10
+   stg11 Chuo St                15
+   stg12 Dogenzaka              20(e078) 21
+   stg13 Hikage St              25(e079) 26
+   stg20 Rokkaku-dai            30 31(e033)
+   stg21 Sewage Facility        35
+   stg22 Kibogaoka              40 41(e054) 42
+   stg23 Bottom Point           45 46
+   stg24 Fortified Res. Zone    50
+   stg30 99th St                55 56(e080)
+   stg31 Sky Dino               60
+   stg32 Future Site            65 66
+   stg33 Highway Zero           70 71
+   stg34 Skyscraper/Pharaoh     75
+   stg48 custom?                96(e290)
