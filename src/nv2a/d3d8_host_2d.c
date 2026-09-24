@@ -310,8 +310,8 @@ const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram
                 memset(&v[j], 0, sizeof v[j]);
                 if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
                 float rhw = pos[3];
-                v[j].p[0] = pos[0] * c->ss_x + D3D8H2D_SCREEN_OFFSET;
-                v[j].p[1] = pos[1] * c->ss_y + D3D8H2D_SCREEN_OFFSET; v[j].p[2] = pos[2];
+                v[j].p[0] = d3d8_host_2d_snap(pos[0] * c->ss_x + D3D8H2D_SCREEN_OFFSET);
+                v[j].p[1] = d3d8_host_2d_snap(pos[1] * c->ss_y + D3D8H2D_SCREEN_OFFSET); v[j].p[2] = pos[2];
                 v[j].p[3] = (rhw != 0.0f && isfinite(rhw)) ? 1.0f / rhw : 1.0f;
                 if ((c->va_on >> 3) & 1u) { if (!fetch(ram, ram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
                 else { v[j].d0[0] = v[j].d0[1] = v[j].d0[2] = v[j].d0[3] = 1.0f; }
@@ -448,7 +448,7 @@ static unsigned long long s_flips, s_draws, s_pre, s_pre_skipped, s_no_pre, s_no
 static unsigned s_max_err[3];
 static unsigned long long s_idx_snap, s_vtx_changed, s_exec_outside, s_pt_const_match, s_pt_const_differ;
 static uint16_t s_last_idx[6];
-static unsigned s_printed_mm, s_printed_consts, s_printed_frames, s_printed_z, s_printed_zmm;
+static unsigned s_printed_mm, s_printed_consts, s_printed_frames, s_printed_z, s_printed_zmm, s_printed_pt;
 #define NREASON 40
 static struct { const char *why; unsigned long long n; } s_reason[NREASON];
 static void count_reason(const char *why)
@@ -595,18 +595,26 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && (c->format[u] & 3u) == 2u) { ++s_ctx_b; break; }
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && c->tss[u][28] != u) { ++s_tss_ci_off; break; }
     if (!((c->va_on >> 3) & 1u)) ++s_diffuse_default;
-    /* The pass-through's own constants, c0 and c1 (NV2A slots 96, 97): the
-     * host assumes (1, 1, 16777215, 1) and (0.53125, 0.53125, 0, 0). */
+    /* The pass-through's constants as the executor holds them: the viewport
+     * pair c-38 (scale: W/2, -H/2, 16777215) and c-37 (offset: W/2 + b,
+     * H/2 + b), NV2A slots 58 and 59. Measured in tutorial run 4: c0/c1
+     * (slots 96, 97) are zero on these draws, so the bias b is read here as
+     * c-37.x - c-38.x and c-37.y + c-38.y, and must be the host's 0.53125,
+     * with the z scale 16777215. */
     if (e.regs_valid) {
-        if (e.vc[96][0] != c->ss_x || e.vc[96][1] != c->ss_y || e.vc[96][2] != 16777215.0f ||
-            e.vc[97][0] != D3D8H2D_SCREEN_OFFSET || e.vc[97][1] != D3D8H2D_SCREEN_OFFSET) ++s_pt_const_differ;
-        else ++s_pt_const_match;
+        float bx = e.vc[59][0] - e.vc[58][0], by = e.vc[59][1] + e.vc[58][1];
+        if (bx != D3D8H2D_SCREEN_OFFSET || by != D3D8H2D_SCREEN_OFFSET || e.vc[58][2] != 16777215.0f) {
+            ++s_pt_const_differ;
+            if (s_printed_pt++ < 4)
+                fprintf(stderr, "[D3D8-HOST-2D] draw %u pass-through bias %g,%g z scale %g -- NOT the host's %g\n",
+                        c->serial, bx, by, e.vc[58][2], D3D8H2D_SCREEN_OFFSET);
+        } else ++s_pt_const_match;
     }
     if (s_printed_consts < 4 && e.regs_valid) {
         ++s_printed_consts;
-        fprintf(stderr, "[D3D8-HOST-2D] draw %u fvf=%03X exec mode %u prog_start %u: pass-through constants"
-                        " c0 = %g %g %g %g, c1 = %g %g %g %g (c-38 = %g %g %g %g, c-37 = %g %g %g %g) | host scale"
-                        " ss=%g,%g offset %g,%g z as given\n",
+        fprintf(stderr, "[D3D8-HOST-2D] draw %u fvf=%03X exec mode %u prog_start %u: constants"
+                        " c0 = %g %g %g %g, c1 = %g %g %g %g, c-38 = %g %g %g %g, c-37 = %g %g %g %g | host scale"
+                        " ss=%g,%g offset %g,%g then 1/16 truncation, z as given\n",
                 c->serial, c->vs_handle, e.exec_mode, e.prog_start,
                 e.vc[96][0], e.vc[96][1], e.vc[96][2], e.vc[96][3], e.vc[97][0], e.vc[97][1], e.vc[97][2], e.vc[97][3],
                 e.vc[58][0], e.vc[58][1], e.vc[58][2], e.vc[58][3], e.vc[59][0], e.vc[59][1], e.vc[59][2], e.vc[59][3],
@@ -903,8 +911,8 @@ void d3d8_host_2d_report(const char *why)
                     " diffuse defaulted to white %llu, texture stage modes differ from the executor's 0x1E70 %llu |"
                     " indices from the draw-time snapshot %llu, of which pIndexData held different ones at the token"
                     " %llu | vertex bytes changed between the draw call and the token %llu | executor changed pixels"
-                    " outside the host's box %llu | executor pass-through c0/c1 as the host assumes %llu, different"
-                    " %llu\n",
+                    " outside the host's box %llu | executor pass-through bias (c-37 - c-38) and z scale as the host"
+                    " assumes %llu, different %llu\n",
             why, s_ctx_b, s_tss_ci_off, s_diffuse_default, s_modes_disagree, s_idx_snap, s_idx_changed,
             s_vtx_changed, s_exec_outside, s_pt_const_match, s_pt_const_differ);
     fprintf(stderr, "[D3D8-HOST-2D] %s depth: test off %llu | on: func NEVER %llu LESS %llu EQUAL %llu LEQUAL %llu"
