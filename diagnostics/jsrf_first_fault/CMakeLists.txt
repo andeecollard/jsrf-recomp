@@ -159,7 +159,8 @@ elseif(JSRF_DSOUND_LIFT)
     set(_ds_entries "${XBOXRECOMP_DIR}/experiments/dsound_boundary/entry_points.json"
                     "${XBOXRECOMP_DIR}/experiments/xinput_boundary/entry_points.json"
                     "${XBOXRECOMP_DIR}/experiments/cri_boundary/entry_points.json"
-                    "${XBOXRECOMP_DIR}/experiments/chapter_boundary/entry_points.json")
+                    "${XBOXRECOMP_DIR}/experiments/chapter_boundary/entry_points.json"
+                    "${XBOXRECOMP_DIR}/experiments/x87_boundary/entry_points.json")
     execute_process(
         COMMAND "${JSRF_PYTHON3}" "${_ds_stage}" "${RECOMP_GEN_DIR}" "${_ds_overlay}"
                 --entries ${_ds_entries} --lift --overlay
@@ -182,7 +183,7 @@ elseif(JSRF_DSOUND_LIFT)
     file(STRINGS "${_ds_overlay}/DSOUND_CENSUS_MANIFEST.txt" _ds_manifest REGEX "^sub_.* file=")
     set(_ds_deps "${_ds_stage}" ${_ds_entries} "${CMAKE_CURRENT_SOURCE_DIR}/dsound_lift.c"
                  "${CMAKE_CURRENT_SOURCE_DIR}/xinput_lift.c" "${CMAKE_CURRENT_SOURCE_DIR}/cri_lift.c"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/chapter_select.c")
+                 "${CMAKE_CURRENT_SOURCE_DIR}/chapter_select.c" "${CMAKE_CURRENT_SOURCE_DIR}/x87_lift.c")
     foreach(_l IN LISTS _ds_manifest)
         string(REGEX REPLACE ".* file=" "" _gf "${_l}")
         list(APPEND _ds_deps "${RECOMP_GEN_DIR}/${_gf}")
