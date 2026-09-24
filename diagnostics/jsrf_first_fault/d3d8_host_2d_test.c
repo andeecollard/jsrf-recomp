@@ -40,6 +40,8 @@
 #include "d3d8_ff_combiner.h"
 #include "nv2a_metal.h"
 #include "nv2a_host_read.h"
+#include "nv2a_vsh.h"
+#include "vsh_capture.h"
 #include <pthread.h>
 #include "nv2a_texture_copy.h"
 #include "nv2a_ff.h"
@@ -1595,6 +1597,95 @@ static int ff_arm(int control)
     return 1;
 }
 
+/* G51.2: A DRAW THROUGH THE TITLE'S OWN VERTEX PROGRAM. The first complete
+ * JSRF program captured (vsh_capture.h: position and texcoord in, oPos scaled
+ * by c0 and offset by c1, oD0 from the current diffuse), its constants as
+ * SetVertexShaderConstant would leave them, a quad of two triangles. The host
+ * draws it through the executor's own translation (nv2a_metal_vsh_function);
+ * the reference runs the same program on the CPU interpreter
+ * (nv2a_vsh_execute) and draws its outputs as pre-transformed vertices. They
+ * must agree; the control drops every other triangle and must not. */
+static void case_vs(D3D8HostDrawCheck *c)
+{
+    static const float P[4][2] = { { 12.0f, 10.0f }, { 110.0f, 14.0f }, { 16.0f, 84.0f }, { 104.0f, 88.0f } };
+    static const float UV[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+    static const uint16_t I[6] = { 0, 1, 2, 2, 1, 3 };
+    base_check(c);
+    for (int i = 0; i < 4; ++i) {
+        uint32_t v = VB + 16u * i;
+        putf(v, P[i][0]); putf(v + 4, P[i][1]); putf(v + 8, UV[i][0]); putf(v + 12, UV[i][1]);
+    }
+    memcpy(ram + IB, I, sizeof I);
+    c->vs_handle = 0x00ABCDE1u; c->vs_kind = 1; c->vs_nwords = (uint32_t)(sizeof jsrf_vsh_words / 4u);
+    memcpy(c->vs_words, jsrf_vsh_words, sizeof jsrf_vsh_words);
+    c->draw_kind = 2; c->prim = 5; c->count = 6; c->idx_ptr = IB; c->nidx = 6;
+    for (int k = 0; k < 6; ++k) c->idx[k] = I[k];
+    c->va_on = (1u << 0) | (1u << 9);
+    c->va_offset[0] = VB;     c->va_format[0] = (16u << 8) | 0x22u;
+    c->va_offset[9] = VB + 8; c->va_format[9] = (16u << 8) | 0x22u;
+    memset(c->vc, 0, sizeof c->vc); memset(c->vc_written, 0, sizeof c->vc_written);
+    c->vc[0][0] = 1; c->vc[0][1] = 1; c->vc[0][2] = 16777215.0f; c->vc[0][3] = 1;
+    c->vc[1][0] = 0.53125f; c->vc[1][1] = 0.53125f;
+    c->vc_written[0] = 3u;
+    c->ffc_cur.tss[0][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_DIFFUSE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
+}
+static void vs_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static D3D8H2DVertex rv[64];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d, r; NV2AVshProgram prog;
+    const char *why;
+    CHECK(d3d8_host_vs_mode() == 1, "RECOMP_D3D8_HOST_VS=shadow arms the programmable class");
+    case_vs(&c);
+    CHECK(d3d8_host_2d_class(&c) == 3, "an odd vertex-shader handle with a captured program is class 3");
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, (const uint16_t *)(ram + IB), NULL, NULL, &d);
+    CHECK(!why && d.vs_nidx == 6 && d.vs_nin == 4, "the host builds the programmable draw (%s; %u indices over %u vertices, %u attributes)",
+          why ? why : "built", d.vs_nidx, d.vs_nin, d.vs_nattrs);
+    if (why) return;
+    /* The reference: the program on the CPU interpreter, per corner. */
+    memset(&prog, 0, sizeof prog);
+    nv2a_vsh_parse(jsrf_vsh_words, (int)(sizeof jsrf_vsh_words / 16u), &prog);
+    r = d; r.cls = 1; r.verts = rv; r.nverts = d.vs_nidx;
+    for (unsigned k = 0; k < d.vs_nidx; ++k) {
+        float in[16][4]; NV2AVshResult o; unsigned slot = 0;
+        for (unsigned q = 0; q < 16; ++q) { in[q][0] = in[q][1] = in[q][2] = 0; in[q][3] = 1; }
+        in[3][0] = in[3][1] = in[3][2] = 1;
+        for (unsigned q = 0; q < 16; ++q) if (d.vs_inputs & (1u << q)) memcpy(in[q], d.vs_in[d.vs_idx[k] * d.vs_nattrs + slot++], 16);
+        memset(&o, 0, sizeof o);
+        nv2a_vsh_execute(&prog, (const float (*)[4])in, (const float (*)[4])d.vs_c, &o);
+        memset(&rv[k], 0, sizeof rv[k]);
+        /* The hardware's screen-space fixup, as the emitted program does it:
+         * x and y truncated to 1/16 pixel, colours saturated. */
+        rv[k].p[0] = fabsf(o.output[0][0]) < 1048576.0f ? truncf(o.output[0][0] * 16.0f) / 16.0f : o.output[0][0];
+        rv[k].p[1] = fabsf(o.output[0][1]) < 1048576.0f ? truncf(o.output[0][1] * 16.0f) / 16.0f : o.output[0][1];
+        rv[k].p[2] = o.output[0][2] / 16777215.0f; rv[k].p[3] = o.output[0][3];
+        for (unsigned ch = 0; ch < 4; ++ch) {
+            rv[k].d0[ch] = fminf(1.0f, fmaxf(0.0f, o.output[3][ch]));
+            rv[k].d1[ch] = fminf(1.0f, fmaxf(0.0f, o.output[4][ch]));
+        }
+        for (unsigned u = 0; u < 4; ++u) memcpy(rv[k].t[u], o.output[9 + u], 16);
+    }
+    background(bg); memcpy(a, bg, sizeof bg); memcpy(b, bg, sizeof bg);
+    CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0,
+          "the host drew it through the executor's translation (%s)", d3d8_host_2d_metal_last_error());
+    CHECK(d3d8_host_2d_metal_render(&r, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0, "the reference drew");
+    {   D3D8H2DDiff df;
+        d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
+        printf("  programmable VS: reference changed %llu px, host %llu, over tolerance %llu, max error r%u g%u b%u\n",
+               df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1], df.max_err[2]);
+        CHECK(df.exec_changed > 2000 && df.mismatch == 0, "programmable VS: the GPU program and the CPU interpreter draw the same"); }
+    /* CONTROL. */
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 1, (const uint16_t *)(ram + IB), NULL, NULL, &d);
+    memcpy(a, bg, sizeof bg);
+    if (!why) d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    {   D3D8H2DDiff df;
+        d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
+        CHECK(!why && df.mismatch > 500, "programmable VS CONTROL: with every other triangle dropped it differs (%llu px)", df.mismatch); }
+}
+
 /* G56 DEFER-SAFE, the positive control. The executor (this thread, the
  * service thread) draws into A without a sync and then into B, so under
  * RECOMP_METAL_DEFER_SWAP A's pixels are on the GPU only; a "guest" thread
@@ -1683,6 +1774,12 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         bench_tests();
         return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "vs") == 0) {           /* G51.2: the programmable class */
+        setenv("RECOMP_D3D8_HOST_VS", "shadow", 1);
+        vs_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "hostread") == 0) {     /* G56: a guest-thread Lock gets the drawn pixels */
         hostread_tests();

@@ -55,6 +55,7 @@
 #include "nv2a_texture_decode.h"
 #include "nv2a_metal_state.h"
 #include "nv2a_metal.h"
+#include "../recomp_switch.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -212,6 +213,7 @@ static id<MTLCommandQueue> s_queue;
 static id<MTLRenderPipelineState> s_pso, s_pso_st;
 static id<MTLLibrary> s_lib;
 static id<MTLFunction> s_vs;
+static id<MTLFunction> s_fs_generic;   /* h2d_fs with SPEC false: a programmable draw's generic pipeline */
 static int s_spec_on = 1;                   /* d3d8_host_2d_metal_set_spec: tests compare the two */
 static unsigned long long s_spec_built, s_spec_hits, s_spec_fallback, s_spec_compile_ns, s_early_refused_z;
 static id<MTLTexture> s_dummy;
@@ -292,6 +294,7 @@ static int init(void)
             bool off = false;
             [cv setConstantValue:&off type:MTLDataTypeBool atIndex:0];
             pd.fragmentFunction = [lib newFunctionWithName:@"h2d_fs" constantValues:cv error:&err];
+            s_fs_generic = pd.fragmentFunction;
         }
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -445,7 +448,8 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
 typedef struct {
     uint32_t cc, tmask, flags, control, afunc, bsrc, bdst, beq, cmask, lin;
     uint32_t ci[8], ai[8], co[8], ao[8];
-    uint32_t stencil, early;
+    uint32_t stencil, early, generic;
+    uint64_t vfn;              /* G51.2: the executor's vs_gpu for a programmable draw, or 0 for h2d_vs */
 } H2DSpecKey;
 #define SPEC_CACHE 1024
 static struct { H2DSpecKey k; uint64_t h; id<MTLRenderPipelineState> pso; _Atomic int state; } s_spec[SPEC_CACHE];
@@ -485,11 +489,14 @@ static int draw_early(const D3D8Host2DDraw *d)
     if (!(d->w_min > 0.0f && d->z_min >= 0.0f && d->z_max <= 1.0f)) { ++s_early_refused_z; return 0; }
     return !d->alpha_test || !writes;
 }
-static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with_stencil, uint32_t lin_mask)
+
+static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with_stencil, uint32_t lin_mask,
+                                               id<MTLFunction> vfn)
 {
     H2DSpecKey k;
     uint64_t h = 1469598103934665603ull;
-    if (!s_spec_on || (d3d8_host_2d_bisect() & 8u)) return with_stencil ? s_pso_st : s_pso;
+    int generic = !s_spec_on || (d3d8_host_2d_bisect() & 8u);
+    if (generic && !vfn) return with_stencil ? s_pso_st : s_pso;
     memset(&k, 0, sizeof k);
     k.cc = d->cc; k.tmask = d->tmask; k.control = d->control;
     k.flags = (d->alpha_test ? 1u : 0u) | (d->blend ? 2u : 0u) | (d->dither ? 4u : 0u) | (d->add_specular ? 8u : 0u);
@@ -498,20 +505,22 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
     k.cmask = d->color_mask;
     for (unsigned i = 0; i < 8 && i < d->cc; ++i) { k.ci[i] = d->ci[i]; k.ai[i] = d->ai[i]; k.co[i] = d->co[i]; k.ao[i] = d->ao[i]; }
     k.stencil = with_stencil != 0; k.early = (uint32_t)draw_early(d);
+    k.generic = (uint32_t)generic; k.vfn = (uint64_t)(uintptr_t)(__bridge void *)vfn;
     { const uint8_t *b = (const uint8_t *)&k; for (size_t i = 0; i < sizeof k; ++i) { h ^= b[i]; h *= 1099511628211ull; } }
     for (unsigned i = 0; i < s_spec_n; ++i)
         if (s_spec[i].h == h && !memcmp(&s_spec[i].k, &k, sizeof k)) {
             int st = atomic_load_explicit(&s_spec[i].state, memory_order_acquire);
             if (st == 1) { ++s_spec_hits; return s_spec[i].pso; }
             if (st == 0) ++s_spec_pending_draws; else ++s_spec_fallback;
+            if (vfn) return nil;                              /* no stand-in carries this vertex program */
             return with_stencil ? s_pso_st : s_pso;          /* compiling, or failed: the generic interpreter */
         }
-    if (s_spec_n >= SPEC_CACHE) { ++s_spec_fallback; return with_stencil ? s_pso_st : s_pso; }
+    if (s_spec_n >= SPEC_CACHE) { ++s_spec_fallback; return vfn ? nil : with_stencil ? s_pso_st : s_pso; }
     unsigned slot = s_spec_n++;
     s_spec[slot].k = k; s_spec[slot].h = h; s_spec[slot].pso = nil;
     atomic_store_explicit(&s_spec[slot].state, 0, memory_order_relaxed);
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
-    {   bool on = true;
+    {   bool on = !generic;
         [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
         [cv setConstantValue:&k.cc type:MTLDataTypeUInt atIndex:1];
         [cv setConstantValue:&k.tmask type:MTLDataTypeUInt atIndex:2];
@@ -536,7 +545,7 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
         NSError *err = ferr;
         if (fn) {
             MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-            pd.vertexFunction = s_vs; pd.fragmentFunction = fn;
+            pd.vertexFunction = vfn ? vfn : s_vs; pd.fragmentFunction = fn;
             pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
             pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
             if (stencil) pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
@@ -559,14 +568,15 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
      * VERIFY holds to the executor as it holds the specialised one. Bisect
      * bit 2048 compiles in line, as before; the unit tests do too, so they
      * test the specialised program and not its stand-in. */
-    if (s_spec_sync || (d3d8_host_2d_bisect() & 2048u)) {
+    /* A programmable draw compiles in line: nothing can stand in for its vertex program. */
+    if (s_spec_sync || vfn || (d3d8_host_2d_bisect() & 2048u)) {
         NSError *err = nil;
         id<MTLFunction> fn = nil;
         @autoreleasepool { fn = [s_lib newFunctionWithName:name constantValues:cv error:&err]; finish(fn, err); }
         s_spec_compile_ns = atomic_load(&s_spec_compile_ns_a); s_spec_built = atomic_load(&s_spec_built_a);
         if (atomic_load_explicit(&s_spec[slot].state, memory_order_acquire) == 1) return s_spec[slot].pso;
         ++s_spec_fallback;
-        return with_stencil ? s_pso_st : s_pso;
+        return vfn ? nil : with_stencil ? s_pso_st : s_pso;
     }
     [s_lib newFunctionWithName:name constantValues:cv completionHandler:^(id<MTLFunction> fn, NSError *err) { finish(fn, err); }];
     ++s_spec_pending_draws;
@@ -606,8 +616,18 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         if (t->linear) u.lin_mask |= 1u << s;
     }
     s_ns_texture += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    const void *vdata = d->verts;
     size_t vbytes = (size_t)d->nverts * sizeof(D3D8H2DVertex), voff = 0;
     id<MTLBuffer> vb = nil;
+    id<MTLFunction> vfn = nil;
+    if (d->cls == 3) {                       /* G51.2: the program's packed inputs, not host vertices */
+        unsigned nattrs = 0;
+        vfn = (__bridge id<MTLFunction>)nv2a_metal_vsh_function(d->vs_words, (int)d->vs_len, (uint16_t)d->vs_inputs, &nattrs);
+        if (!vfn) { s_err = "host vs: the executor's translator refused the program"; return 0; }
+        if (nattrs != d->vs_nattrs) { s_err = "host vs: attribute count disagrees with the translator's"; return 0; }
+        if (ox || oy) { s_err = "host vs: a programmable draw renders the whole target"; return 0; }
+        vdata = d->vs_in; vbytes = (size_t)d->vs_nin * (nattrs ? nattrs : 1u) * 16u;
+    }
     if (vbytes > 4096) {                     /* Metal's inline limit; below it, setVertexBytes */
         /* A BUMP ALLOCATOR, not a buffer per draw. An FF draw carries ~90 KB
          * of vertices, and allocating shared memory for each was most of the
@@ -621,17 +641,19 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         static size_t used;
         size_t need = (vbytes + 255u) & ~(size_t)255u;
         if (need > CHUNK || (d3d8_host_2d_bisect() & 2u)) {
-            vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
+            vb = [s_dev newBufferWithBytes:vdata length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
         } else {
             if (!chunk || used + need > CHUNK) {
                 chunk = [s_dev newBufferWithLength:CHUNK options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
                 used = 0; ++s_vb_chunks;
             }
-            if (chunk) { memcpy((uint8_t *)chunk.contents + used, d->verts, vbytes); vb = chunk; voff = used; used += need; }
+            if (chunk) { memcpy((uint8_t *)chunk.contents + used, vdata, vbytes); vb = chunk; voff = used; used += need; }
         }
         if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
     }
-    [enc setRenderPipelineState:pipeline_for(d, with_stencil, u.lin_mask)];
+    {   id<MTLRenderPipelineState> pso = pipeline_for(d, with_stencil, u.lin_mask, vfn);
+        if (!pso) { s_err = "host: no pipeline"; return 0; }
+        [enc setRenderPipelineState:pso]; }
     {   /* The stencil unit only where the pass has one (draw mode); the
          * shadow's colour comparison does not depend on it under ALWAYS. */
         id<MTLDepthStencilState> dss = depth_state(d, with_stencil);
@@ -645,14 +667,43 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
                           (NSUInteger)(sx1 - sx0 + 1), (NSUInteger)(sy1 - sy0 + 1) };
     [enc setScissorRect:sc];
     if (vb) [enc setVertexBuffer:vb offset:voff atIndex:0];
-    else [enc setVertexBytes:d->verts length:(NSUInteger)vbytes atIndex:0];
+    else [enc setVertexBytes:vdata length:(NSUInteger)vbytes atIndex:0];
+    if (d->cls == 3) {
+        /* vs_gpu's contract (nv2a_metal.m vsh_wrap): constants at 1, the
+         * viewport the emitted program converts to clip space with at 2 --
+         * the whole surface, as the executor passes it -- and the triangle
+         * list at 3. Facing and culling are the executor's GPU path's:
+         * FRONT_FACE's winding (RECOMP_METAL_VSH_WINDING flips it), CULL_FACE
+         * FRONT/BACK, FRONT_AND_BACK draws nothing. */
+        struct { float width, height, depth; } vp = { (float)W, (float)H, 16777215.0f };
+        size_t ib = (size_t)d->vs_nidx * 4u, ioff = 0;
+        id<MTLBuffer> ibuf = nil;
+        static int flip = -1;
+        int cw;
+        if (d->cull_face == 0x408u) return 1;
+        if (flip < 0) flip = recomp_switch_on("RECOMP_METAL_VSH_WINDING");
+        [enc setVertexBytes:d->vs_c length:sizeof d->vs_c atIndex:1];
+        [enc setVertexBytes:&vp length:sizeof vp atIndex:2];
+        if (ib > 4096) {
+            ibuf = [s_dev newBufferWithBytes:d->vs_idx length:(NSUInteger)ib options:MTLResourceStorageModeShared];
+            if (!ibuf) { s_err = "host vs: index buffer"; return 0; }
+            [enc setVertexBuffer:ibuf offset:ioff atIndex:3];
+        } else [enc setVertexBytes:d->vs_idx length:(NSUInteger)(ib ? ib : 4u) atIndex:3];
+        cw = d->front_cw ? 1 : 0; if (flip) cw = !cw;
+        [enc setFrontFacingWinding:cw ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [enc setCullMode:d->cull_face == 0x404u ? MTLCullModeFront : d->cull_face == 0x405u ? MTLCullModeBack : MTLCullModeNone];
+    } else
     [enc setVertexBytes:&u length:sizeof u atIndex:1];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
     for (unsigned s = 0; s < 4; ++s) {
         [enc setFragmentTexture:tex[s] ? tex[s] : s_dummy atIndex:s];
         [enc setFragmentSamplerState:smp[s] ? smp[s] : sampler_for(&(D3D8H2DTexture){ .mag = 1, .min_filter = 1, .wrap_u = 3, .wrap_v = 3 }) atIndex:s];
     }
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:d->nverts];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:d->cls == 3 ? d->vs_nidx : d->nverts];
+    if (d->cls == 3) {                       /* leave the encoder as the executor's CPU path assumes it */
+        [enc setCullMode:MTLCullModeNone];
+        [enc setFrontFacingWinding:MTLWindingClockwise];
+    }
     return 1;
 }
 
