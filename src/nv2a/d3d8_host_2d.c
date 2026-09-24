@@ -613,6 +613,8 @@ static unsigned long long s_ff_draws, s_ff_built, s_ff_compared, s_ff_exact, s_f
                           s_ff_exec_changed, s_ff_host_changed, s_ff_tris_q;
 static unsigned s_ff_max_err[3], s_printed_vpoff, s_printed_cull, s_printed_diffuse, s_printed_stencil, s_printed_stencil_x;
 static unsigned long long s_stencil_match, s_stencil_differ;
+static unsigned long long s_tx_units, s_tx_min, s_tx_mag, s_tx_bias, s_tx_wrap, s_tx_levels;
+static unsigned s_printed_tx;
 static unsigned long long s_ff_diffuse_white, s_ff_diffuse_other, s_ff_prim[16];
 /* Mismatching FF draws by size and kind, so a run classifies all of them. */
 static unsigned long long s_ff_mm_size[4], s_ff_mm_cov_exec, s_ff_mm_cov_host, s_ff_mm_cov_same,
@@ -687,12 +689,14 @@ int d3d8_host_replaces_handle(uint32_t h)
 }
 int d3d8_host_any_draw_mode(void) { return d3d8_host_2d_mode() == 2 || d3d8_host_ff_mode() == 2; }
 static unsigned s_verify;
-int d3d8_host_verify_now(void)
+static int s_verify_pending; static uint32_t s_verify_serial;
+int d3d8_host_verify_enabled(void) { return s_verify && d3d8_host_any_draw_mode(); }
+void d3d8_host_2d_set_verify(unsigned every) { s_verify = every; }
+int d3d8_host_2d_verify_take(uint32_t serial)
 {
-    unsigned long long f;
-    if (!s_verify || !d3d8_host_any_draw_mode()) return 0;
-    f = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
-    return (f % s_verify) == 0;
+    int hit = s_verify_pending && s_verify_serial == serial;
+    s_verify_pending = 0;
+    return hit;
 }
 
 /* Read once. The mirror (guest thread) and the ring consumer (pusher
@@ -889,6 +893,33 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
                 R[0x308u / 4u], R[0x39Cu / 4u], R[0x3A0u / 4u], R[0x304u / 4u], R[0x344u / 4u], R[0x348u / 4u]);
     }
     if (cls == 2 && (c->prim < 5u || c->prim > 9u)) ++s_ff_prim[c->prim & 15u];
+    /* SAMPLING AS THE HOST WOULD DO IT, against the executor's texture
+     * registers: TEXTURE_FILTER (min 16..19, mag 24..27, LOD bias 0..12),
+     * TEXTURE_ADDRESS (U 0..3, V 8..11), the level count. Distant, alpha-tested
+     * geometry is where a sampling difference shows, as holes. */
+    if (cls == 2 && e.regs_valid) {
+        static D3D8Host2DDraw td;
+        memset(&td, 0, sizeof td);
+        for (unsigned u = 0; u < 4; ++u) {
+            D3D8H2DTexture t;
+            uint32_t f = e.tex_filter[u], a = e.tex_address[u];
+            if (!c->tex[u] || !(e.mask & (1u << u)) || texture_from_d3d(c, u, &t)) continue;
+            unsigned emin = (f >> 16) & 0xFu, emag = (f >> 24) & 0xFu, eu = a & 0xFu, ev = (a >> 8) & 0xFu;
+            int32_t eb = (int32_t)(f << 19) >> 19;
+            int bad = 0;
+            ++s_tx_units;
+            if (emin != t.min_filter) { ++s_tx_min; bad = 1; }
+            if (emag != t.mag) { ++s_tx_mag; bad = 1; }
+            if ((float)eb / 256.0f != t.lod_bias) { ++s_tx_bias; bad = 1; }
+            if (eu != t.wrap_u || ev != t.wrap_v) { ++s_tx_wrap; bad = 1; }
+            if (e.levels[u] != t.levels) { ++s_tx_levels; bad = 1; }
+            if (bad && s_printed_tx++ < 8)
+                fprintf(stderr, "[D3D8-HOST-FF] draw %u unit %u sampling: host min %u mag %u bias %g wrap %u/%u levels %u |"
+                                " executor min %u mag %u bias %g wrap %u/%u levels %u (filter %08X address %08X control0 %08X)\n",
+                        c->serial, u, t.min_filter, t.mag, t.lod_bias, t.wrap_u, t.wrap_v, t.levels, emin, emag,
+                        (float)eb / 256.0f, eu, ev, e.levels[u], f, a, e.tex_control0[u]);
+        }
+    }
     if (e.regs_valid && st(c, 0x32C, 0)) {                 /* stencil as the host would draw it, against the executor */
         static D3D8Host2DDraw sd;
         const uint32_t *R = e.regs;
@@ -1149,12 +1180,12 @@ unsigned d3d8_host_2d_bisect(void)
         const char *e = getenv("RECOMP_D3D8_HOST_BISECT");
         s_bisect_read = 1;
         s_bisect = e && *e ? (unsigned)strtoul(e, NULL, 0) : 0u;
-        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
+        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
                               s_bisect & 1 ? " own-pass" : "", s_bisect & 2 ? " buffer-per-draw" : "",
                               s_bisect & 4 ? " no-early-tests" : "", s_bisect & 8 ? " generic-shader" : "",
                               s_bisect & 16 ? " hash-every-draw" : "", s_bisect & 32 ? " no-vertex-cache" : "",
                               s_bisect & 64 ? " wait-every-draw" : "", s_bisect & 128 ? " late-executor-skip" : "",
-                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "");
+                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "");
     }
     return s_bisect;
 }
@@ -1176,6 +1207,11 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
     int cls = d3d8_host_2d_class(c);
     if (!d3d8_host_replaces_handle(c->vs_handle) || !cls) return;
     ++s_rep_tokens;
+    if (s_verify && (s_flips % s_verify) == 0) {         /* a verify flip: the executor draws, the host shadows */
+        d3d8_host_2d_pre(c->serial, c->vs_handle, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
+        s_verify_pending = 1; s_verify_serial = c->serial;
+        return;
+    }
     if (s_skip_on) {                                      /* never left on across draws */
         s_be.exec_skip(0); s_skip_on = 0; count_reason("skip still on at the next draw");
     }
@@ -1436,10 +1472,11 @@ static void ff_report(const char *why)
                     " diffuse defaulted to white %llu | host COMPOSITE vs executor within 1e-3 %llu, beyond %llu |"
                     " VIEWPORT_OFFSET as the host assumes %llu, different %llu | cull state (D3D RS 127/128) as the"
                     " executor's %llu, different %llu (both classes) | stencil state as the executor's %llu, different %llu"
+                    " | texture units %llu, sampling differs: min %llu mag %llu LOD bias %llu wrap %llu levels %llu"
                     " | FF draws on unshadowed flips %llu (stride %u)\n",
             why, s_ff_mode4, s_ff_not_mode4, s_ff_exec_inactive, s_ff_diffuse_default, s_ff_composite_match,
             s_ff_composite_differ, s_ff_vpoff_match, s_ff_vpoff_differ, s_cull_match, s_cull_differ, s_stencil_match,
-            s_stencil_differ, s_ff_unsampled,
+            s_stencil_differ, s_tx_units, s_tx_min, s_tx_mag, s_tx_bias, s_tx_wrap, s_tx_levels, s_ff_unsampled,
             s_ff_stride);
     fprintf(stderr, "[D3D8-HOST-FF] %s mismatching draws by pixels over tolerance: 1-4 %llu, 5-32 %llu, 33-512 %llu,"
                     " >512 %llu | coverage: executor more %llu, host more %llu, same %llu | depth-mismatching draws by worst"
@@ -1482,6 +1519,12 @@ void d3d8_host_2d_report(const char *why)
                             " draws on the generic interpreter %llu | binding the target (a GPU drain each) %.1f ms over"
                             " %llu binds\n", why, b, ns / 1e6, h, f,
                     s_be.bind_ns ? s_be.bind_ns() / 1e6 : 0.0, s_be.external_binds ? s_be.external_binds() : 0ull);
+            if (s_be.geom_stats) {
+                unsigned long long gd = 0, gv = 0;
+                s_be.geom_stats(&gd, &gv);
+                fprintf(stderr, "[D3D8-HOST-2D] %s binds whose D3D geometry differed from the executor's slot %llu; binds that"
+                                " found the target held more than once %llu\n", why, gd, gv);
+            }
         }
         {   /* In-process timers: where a replaced draw's host time goes. */
             unsigned long long th = 0, tb = 0, thash = 0, nt = 0, ne = 0, r = s_replaced ? s_replaced : 1, rf = s_replaced_ff ? s_replaced_ff : 1;

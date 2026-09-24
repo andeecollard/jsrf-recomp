@@ -467,7 +467,7 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     mode = d3d8_host_2d_mode();
     d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
     (void)mode;
-    m_verify_draw = d3d8_host_replaces_handle(h) && d3d8_host_verify_now();
+    m_verify_draw = 0;     /* verify is decided on the executor's thread now; see d3d8_host_verify_enabled */
     if (d3d8_host_replaces_handle(h) && !m_verify_draw) {
         /* Draw mode: the whole description goes ahead of the draw's commands.
          * The host draws it there, in the executor's target, and tells the
@@ -511,8 +511,9 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long
      * before the token is reached. */
-    if (d3d8_host_shadow_wants_handle(MEM32(MEM32(0x0019DCE0u) + 0x384u)) || m_verify_draw)
-        d3d8m_snap_indices(&c, kind, a2, a3);
+    {   uint32_t hh = MEM32(MEM32(0x0019DCE0u) + 0x384u);
+        if (d3d8_host_shadow_wants_handle(hh) || (d3d8_host_replaces_handle(hh) && d3d8_host_verify_enabled()))
+            d3d8m_snap_indices(&c, kind, a2, a3); }
     c.verify = (uint32_t)m_verify_draw; m_verify_draw = 0;
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */
