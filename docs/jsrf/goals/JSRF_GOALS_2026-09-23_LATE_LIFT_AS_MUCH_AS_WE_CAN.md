@@ -436,3 +436,11 @@ merging or carrying flags at split entries.
   C the letterbox and text turn red, which proves the 2D layer on screen is the
   host's. Draw mode needs the staged mirror gen; it is not in the player's
   build yet.
+- **The D3D mirror is in every macOS build** (`18d8343`, overlay composed over
+  the DSOUND one; `recomp_0008.c` carries both). Unarmed it costs nothing:
+  83.8 fps without it, 84.6 with it (tutorial, player config, FLIP_PACE=0).
+  So `RECOMP_D3D8_HOST_2D=draw` now works in JSRF.app: 88.5 fps, 24,187
+  replaced, 0 drawn twice. All 2,123 left to the executor are "executor holds
+  another colour target" (a shared bind prologue is next).
+- **G51.3 FF shadow** (`9bd99e9`): the first run counted 0 draws and ran at
+  1 fps. Back with the agent.
