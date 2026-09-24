@@ -963,6 +963,11 @@ add_executable(jsrf_flip_sync_test flip_sync_test.c
 target_link_libraries(jsrf_flip_sync_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_flip_sync COMMAND jsrf_flip_sync_test)
 
+# RECOMP_METAL_DEBT_WATCH: guarded owed ranges, counted by view and thread.
+add_executable(jsrf_debt_watch_test debt_watch_test.c)
+target_link_libraries(jsrf_debt_watch_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_debt_watch COMMAND jsrf_debt_watch_test)
+
 add_executable(jsrf_guest_names_test guest_names_test.c guest_names.c)
 add_test(NAME jsrf_guest_names COMMAND jsrf_guest_names_test)
 

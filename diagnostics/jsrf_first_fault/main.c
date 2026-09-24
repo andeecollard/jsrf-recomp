@@ -5190,6 +5190,14 @@ int main(int argc, char **argv)
         free(xbe_data);
         return 1;
     }
+    /* RECOMP_METAL_DEBT_WATCH: both views of GPU memory, after the alias
+     * exists and after the crash and MCPX handlers, so it runs first and
+     * chains to them. No-op unless the switch is on. */
+    {   extern void nv2a_debt_watch_configure(uintptr_t, uintptr_t, uint32_t, uint32_t);
+        int aliased = !physical_alias || strcmp(physical_alias, "0");
+        nv2a_debt_watch_configure((uintptr_t)xbox_GetMemoryOffset(),
+                                  aliased ? (uintptr_t)xbox_GetMemoryOffset() + XBOX_CONTIG_BASE : 0,
+                                  XBOX_HEAP_BASE, XBOX_HEAP_TOP); }
 #endif
 
     /* Bring up the MCPX APU. JSRF's statically linked DSOUND drives the audio
