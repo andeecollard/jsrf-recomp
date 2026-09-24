@@ -275,3 +275,29 @@ merging or carrying flags at split entries.
   - Notes: `experiments/d3d8_boundary/ff_combiner_notes.md`.
   - Render-state indices in 4134 are 10 lower than Cxbx's 5933 numbering
     (SPECULARENABLE 93, POINTSPRITEENABLE 108, TEXTUREFACTOR 129).
+- **G43: done** (agents, merged). With the player's switches, over a 120 s
+  tutorial, every fixed-function draw's 51 combiner registers (CONTROL,
+  COLOR/ALPHA ICW/OCW x8, FACTOR0/1 x8, SPECULAR_FOG_CW0/1) follow from D3D
+  state through the host transcription.
+
+  | run | fixed-function draws | all registers match | distinct setups |
+  |---|---|---|---|
+  | normal | 478,622 | 478,622 | 13 |
+  | control | 459,543 | 0 | 13 |
+
+  - D3D's lazy rebuild (dirty bit 0x800, flusher 0x1964A0) never disagreed
+    with draw-time state.
+  - **Only 13 distinct combiner setups** cover 88% of draws: the host
+    renderer needs 13 pipeline variants for them.
+- **The destination read is not the GPU cost** (24 Sep, player switches,
+  tutorial). `RECOMP_METAL_SHADER_BLEND=0` read sync 10.68 ms and 56.2 fps;
+  mode 3 read 10.59 ms and 56.6 fps. The 16 Sep correctness fix is free. The
+  ~10.5 ms of GPU time per frame is still unexplained.
+- **Profile, tutorial (24 Sep `sample`).**
+  - CRI's counting spinner `sub_0013B180` burns a core.
+  - The main thread spins in D3D_BlockOnTime `sub_00191440`.
+  - `getenv` sat on hot paths; fixed in `68e9724`.
+- **Harness runs default to NOT the player's configuration.** `measure.sh`
+  does not read `paths.conf`, so HW_TEX and METAL_FF were off: 48.7 fps
+  against 57.1 fps with them. Source `paths.conf` (without the game/HDD paths)
+  when a number is meant to describe the player's build.
