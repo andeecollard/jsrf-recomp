@@ -50,10 +50,30 @@ static unsigned strip_triangles(unsigned n) { return n >= 3 ? n - 2 : 0; }
 #define IMM "immediate-mode vertices (SET_VERTEX_DATA inside Begin/End) are not emitted"
 #define OPEN "Begin while a batch was still open (the open batch is lost)"
 
-int main(void)
+/* RECOMP_PB_IMMEDIATE=0 RECOMP_PB_POINTS_LINES=0: both back to the pre-G54
+ * behaviour, in a process of its own (the switches are read once). */
+static int off_arm(void)
+{
+    float o[4]; uint32_t w; float f = 1.0f;
+    setenv("RECOMP_PB_IMMEDIATE", "0", 1); setenv("RECOMP_PB_POINTS_LINES", "0", 1);
+    memcpy(&w, &f, 4);
+    put(0x17FC, 5);
+    for (unsigned v = 0; v < 3; ++v) for (unsigned k = 0; k < 4; ++k) put(0x1A00 + 4 * k, w);
+    put(0x17FC, 0);
+    CHECK(!nv2a_pb_exec_imm_vertex(0, 0, o) && nv2a_pb_exec_last_batch(NULL) == 0,
+          "RECOMP_PB_IMMEDIATE=0: an immediate Begin/End emits and draws nothing");
+    put(0x17FC, 2); put(0x1800, 0x00010000u); put(0x17FC, 0);
+    CHECK(nv2a_drop_count("points and lines off (RECOMP_PB_POINTS_LINES=0)") == 1,
+          "RECOMP_PB_POINTS_LINES=0: a line batch is not drawn, and counted as such");
+    printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+    return fails ? 1 : 0;
+}
+
+int main(int argc, char **argv)
 {
     uint32_t prim = 0, n;
     unsigned long long short0;
+    if (argc > 1 && !strcmp(argv[1], "off")) return off_arm();
     put(NV097_SET_SURFACE_CLIP_HORIZONTAL, 64u << 16);
     put(NV097_SET_SURFACE_CLIP_VERTICAL, 48u << 16);
     put(NV097_SET_SURFACE_PITCH, 256);
