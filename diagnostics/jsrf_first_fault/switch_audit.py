@@ -270,6 +270,14 @@ VALUE_CARRYING = {
     # screen area in pixels below which a flat draw is not printed.
     "RECOMP_T0_CENSUS",
     "RECOMP_T0_CENSUS_MINAREA",
+    # chapter_select.c: a MISSION to enter, "<chapter>[:<mission>]" (unset,
+    # empty or "0" still mean off, as in the shared grammar), and a count of
+    # settled frames before the jump fires. A boolean can carry neither.
+    # Their boolean sibling, RECOMP_CHAPTER_JUMP_MARK, goes through
+    # recomp_switch_on.
+    "RECOMP_CHAPTER_SELECT",
+    "RECOMP_CHAPTER_JUMP",
+    "RECOMP_CHAPTER_JUMP_SETTLE",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

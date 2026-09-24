@@ -1,4 +1,6 @@
 [
-  {"address": "0x0007CAE0", "name": "CActSequence_PrepareTutorial", "lib": "chapter", "note": "CActSequence::PrepareTutorial; replaced by KeybadeBlox's JSRF-ChapterSelect mod, and by chapter_select.c here under RECOMP_CHAPTER_SELECT"},
-  {"address": "0x0007CA70", "name": "CActSequence_WaitEndStoryOrVsMission", "lib": "chapterjump", "note": "CActSequence::WaitEndStoryOrVsMission; reproduced by chapter_select.c, which also ends the story mission into the chapter redirect under RECOMP_CHAPTER_JUMP"}
+ {"address": "0x0007CAE0", "name": "tutorial_prepare", "lib": "chapter", "ret_bytes": [0],
+  "note": "Sequence state 0x20 handler (entry 0x20D338 of the state table 0x20D2B8; no direct callers): prepares a Roboy tutorial. thiscall this=SEQ, no arguments. chapter_select.c's chs_tutorial_prepare replaces it with a story-stage entry (state 0x1C) when RECOMP_CHAPTER_SELECT is set or a RECOMP_CHAPTER_JUMP is pending."},
+ {"address": "0x0007BDD0", "name": "sequence_frame", "lib": "chapterjump", "ret_bytes": [0],
+  "note": "The sequence object's per-frame update (vtable 0x1CCEB8 slot 1): dispatches SEQ+0x48 through 0x20D2B8 and ticks the play time (0x3A900). thiscall this=SEQ, no arguments. chapter_select.c's chj_sequence_frame watches the live mission for RECOMP_CHAPTER_JUMP, then does the same dispatch."}
 ]
