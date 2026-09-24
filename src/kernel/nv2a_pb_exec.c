@@ -76,6 +76,7 @@
  */
 #include "nv2a_vsh.h"
 #include "nv2a_texture_copy.h"
+#include "nv2a_drop.h"
 #include "nv2a_regs.h"
 #include <math.h>
 #include <stdio.h>
@@ -5178,10 +5179,19 @@ static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
     }
 }
 
+/* G54: the state a [DROP] line names. */
+static void drop_state(NV2ADropState *st)
+{
+    st->cw0 = s_methods[0x288/4]; st->texmodes = s_methods[0x1e70/4]; st->tex0_format = s_methods[0x1b04/4];
+    st->mode_prim = (s_methods[0x1e94/4] & 3u) | ((s_gpu.prim & 0xFFu) << 8); st->draw = s_gpu.draws;
+}
 static void raster_batch(void)
 {
     uint32_t i;
     uint32_t drawn_before = s_gpu.tris_drawn;
+    {   static int registered;
+        if (!registered) { registered = 1; nv2a_drop_set_state_source(drop_state); } }
+    nv2a_drop_batch();
 
     /* Stage-by-stage fate of a batch drawn under a multiply blend. Sampled
      * here rather than at the accept test, because everything below the
@@ -5191,6 +5201,7 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3) {
         if (fade_batch) ++s_blend_fade_fate.short_idx;
+        if (s_gpu.idx_count) nv2a_drop(NV2A_DROP_DROPPED, "raster", "fewer than three indices (a point or line batch)", s_gpu.idx_count);
         return;
     }
     if (s_host_skip && !s_host_skip_late) { s_copy.active = 0; ++s_host_skipped; return; }
@@ -5208,6 +5219,7 @@ static void raster_batch(void)
         }
         s_vsh.rejected++;
         note_vsh_reject();
+        nv2a_drop(NV2A_DROP_DROPPED, "vertex", s_vsh_reason ? s_vsh_reason : "vertex preparation failed", s_vsh_reason_detail);
         if (s_vsh.rejected <= 4)
             fprintf(stderr, "  [VSH] rejected batch mode=%u start=%u valid=%d final=%d: "
                             "%s (%u), lighting=%u skin=%u\n",
@@ -5292,6 +5304,7 @@ static void raster_batch(void)
     if (copy_error) {
         if (fade_batch) ++s_blend_fade_fate.prepare_rejected;
         if (++s_copy.rejected <= 8) fprintf(stderr, "[TEXTURE] rejected draw %u: %s (t=%.2f)\n", s_gpu.draws, copy_error, trace_seconds());
+        nv2a_drop(NV2A_DROP_DROPPED, "fragment", copy_error, 0);
         return;
     }
     if (fade_batch) ++s_blend_fade_fate.rasterised;
@@ -5364,6 +5377,7 @@ static void raster_batch(void)
     }
     if (s_vsh.mode == 0 && !(s_method_seen[0x680/4] && s_method_seen[0x6bc/4]) && !batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
+        nv2a_drop(NV2A_DROP_DROPPED, "vertex", "fixed-function batch before the composite matrix was ever written", 0);
         /* RECOMP_PB_EXEC_NOCLIPTEST: rasterise anyway, to tell "the vertices
          * were decoded but sit outside the clip rect" apart from "the vertices
          * are not usable at all". Diagnostic only -- the test exists because
@@ -5401,6 +5415,7 @@ static void raster_batch(void)
         }
         ++s_gpu.gpu_fallbacks;
         const char *reason=nv2a_gpu_last_reject();
+        nv2a_drop(NV2A_DROP_SIMPLIFIED, "Metal refused, CPU rasteriser drew it", reason, 0);
         int unique=1;
         for(unsigned i=0;i<unique_reports;i++)
             if(!strcmp(reason,seen_reasons[i]))unique=0;
@@ -5430,9 +5445,13 @@ static void raster_batch(void)
         ok = prepare_vertices();
         s_vsh_force_cpu = 0;
         s_vsh_gpu_batch = 0;
-        if (!ok) { ++s_vsh.rejected; return; }
+        if (!ok) { ++s_vsh.rejected; nv2a_drop(NV2A_DROP_DROPPED, "vertex", "CPU re-transform after a Metal refusal failed", 0); return; }
     }
 #endif
+    /* The flat CPU raster under a live Metal path draws into guest RAM that the
+     * GPU's copy of the surface then covers: the draw is, in effect, gone. */
+    if (!s_copy.active && nv2a_gpu_on())
+        nv2a_drop(NV2A_DROP_DROPPED, "fragment", "no fragment state: flat CPU raster under Metal", 0);
     ++s_gpu.cpu_batches;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -5459,8 +5478,9 @@ static void raster_batch(void)
             raster_indices(i, i+3, i+2);
         }
         break;
-    default:
-        break;                             /* points and lines: not yet */
+    default:                               /* points and lines: not yet */
+        nv2a_drop(NV2A_DROP_DROPPED, "raster", "points and lines (the CPU rasteriser draws none)", s_gpu.prim);
+        break;
     }
 batch_complete:
 #if NV2A_GPU_PATH
@@ -5541,8 +5561,11 @@ static void draw_primitive(void)
         return;
     if (s_host_skip) ++s_host_seen;
     if (!s_gpu.idx_count) {
-        if (s_gpu.inline_count)
+        if (s_gpu.inline_count) {
             ++s_gpu.batches_no_layout;
+            nv2a_drop_batch();
+            nv2a_drop(NV2A_DROP_DROPPED, "vertex", "inline batch with an underivable layout", s_gpu.inline_count);
+        }
         return;
     }
     /* An index that did not fit uint16_t means the indices we DO hold are a
@@ -5550,6 +5573,8 @@ static void draw_primitive(void)
      * than draw wrong topology; counted so the refusal is never silent. */
     if (s_gpu.batch_wide) {
         ++s_gpu.elem32_batches_dropped;
+        nv2a_drop_batch();
+        nv2a_drop(NV2A_DROP_DROPPED, "vertex", "32-bit index that does not fit 16 bits", s_gpu.idx_count);
         return;
     }
     s_gpu.draws++;
@@ -5918,6 +5943,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         /* G51.1: the host's 2D shadow compares its frame's draws here.
          * NULL unless RECOMP_D3D8_HOST_2D armed it (main.c). */
         if (s_flip_hook) s_flip_hook();
+        nv2a_drop_flip();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -6685,6 +6711,7 @@ void nv2a_pb_exec_report(void)
     }
     frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
+    nv2a_drop_report("report");
     nv2a_texture_copy_census();
     draw_mix_report();
     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)

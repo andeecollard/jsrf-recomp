@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include "../recomp_switch.h"   /* RECOMP_TEXMODE_APPROX */
 #include "../d3d/d3d8_combiner_bits.h"
+#include "nv2a_drop.h"
 
 #define M(a) m[(a)/4]
 
@@ -193,6 +194,7 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
         if (!why && fog_ignore_on() && (fw0==0x130C0300u || fw0==0x130E0300u) && fw1==0x1c80) {
             /* The control: D3D's fog program drawn as its fog-off twin. */
             fw0 = fw0==0x130E0300u ? 0xeu : 0xcu; fog_off_program = 1; ++s_final_ignored;
+            nv2a_drop(NV2A_DROP_SIMPLIFIED, "fragment", "fog program drawn unfogged (RECOMP_FOG_IGNORE)", fw0);
         } else if (why) {
             s_rej_final++; note_final_refused(fw0, fw1, why);
             return "combiner / texture program";
@@ -327,6 +329,8 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
          * absence. */
         if ((mode==6 || mode==7) && texmode_approx_on()) {
             s_texmode_approx[mode][u]++;
+            nv2a_drop(NV2A_DROP_SIMPLIFIED, "fragment", "bump-map texture mode drawn without its displacement",
+                      mode | (u << 8));
             mode=1;
         }
         if (mode>1) {

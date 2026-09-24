@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "nv2a_metal.h"
+#include "nv2a_drop.h"
 #include "nv2a_debt_watch.h"   /* RECOMP_METAL_DEBT_WATCH: no-ops unless armed */
 #include "nv2a_ff.h"
 #include "../recomp_switch.h"
@@ -5331,6 +5332,8 @@ static void triangle(const NV2ATextureCopy*s,const float(*v)[16][4],unsigned*out
     default:++audit_cull_other;}
     if(s->front_cw)++audit_front_cw;else++audit_front_ccw;}
  if(!vertex_valid(s,v,a)||!vertex_valid(s,v,b)||!vertex_valid(s,v,c)){
+    {int w=vertex_why(s,v,a);if(!w)w=vertex_why(s,v,b);if(!w)w=vertex_why(s,v,c);   /* G54: counted always */
+     nv2a_drop(NV2A_DROP_PARTIAL,"raster",w==2?"triangle dropped: texture coordinate q <= 0":"triangle dropped: non-finite vertex",0);}
     if(audit){int w=vertex_why(s,v,a);if(!w)w=vertex_why(s,v,b);if(!w)w=vertex_why(s,v,c);
               if(w==2)++audit_asm_texq;else++audit_asm_nonfinite;}
     return;}
