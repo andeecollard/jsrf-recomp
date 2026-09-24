@@ -84,6 +84,13 @@
 #include <string.h>
 #include <stddef.h>     /* ptrdiff_t; MSVC gets it via another header */
 #include <time.h>      /* clock_gettime, for the opt-in traces below */
+#if !defined(_WIN32)
+#include <sched.h>     /* sched_yield, for flip_pace */
+#define FLIP_PACE_YIELD() sched_yield()
+#else
+#include <windows.h>
+#define FLIP_PACE_YIELD() SwitchToThread()
+#endif
 
 /* Where a frame's time goes, by stage.
  *
@@ -1885,6 +1892,68 @@ static unsigned long s_snap_seq;    /* ++ on every copy actually performed */
  * nothing. The copy races the reader and can tear a frame; neither side may
  * block the other, and a torn frame is a far smaller artefact than the
  * flicker it replaces. */
+/* FLIPS ARE PACED TO THE DISPLAY (24 Sep 2026).
+ *
+ * On the Xbox a flip completes at a vertical blank, so a title can never
+ * present faster than 59.94 Hz. JSRF steps its simulation once per frame
+ * (CActMan's anim counter runs at the flip rate, [ACTMAN-TIME]), so the flip
+ * rate IS the game speed. Nothing here waited: while the GPU path was the
+ * bottleneck the title ran at or below 60 and it did not show, but light
+ * scenes already reached 110-147 fps (player session of 23 Sep), and with the
+ * combiner specialisation the tutorial ran at 87 fps -- the game at 145% of
+ * its real speed, anim ticks 87/s measured.
+ *
+ * A MINIMUM INTERVAL of one vblank period, not the vblank grid. Waiting for the
+ * next grid point is what double-buffered v-sync does, and it would turn every
+ * 17 ms frame into 33 ms; the minimum interval caps at 59.94 without punishing
+ * a frame that is merely late. The deadline is carried (next += period), so the
+ * average rate is exact rather than drifting with sleep overshoot; a frame
+ * later than a whole period resets it. Sleeps to 1 ms short and yields the
+ * rest, because nanosleep on macOS overshoots by that much under load.
+ * RECOMP_FLIP_PACE=0 restores free-running flips. */
+static unsigned long long g_flip_paced, g_flip_pace_wait_us;
+static void flip_pace(void)
+{
+    static int on = -1;
+    static double next;
+    const double period = 1001.0 / 60000.0;
+    struct timespec ts;
+    double now;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_FLIP_PACE", 1);
+    if (!on) return;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (next == 0.0 || now > next + period) {           /* first flip, or a long stall */
+        next = now + period;
+        return;
+    }
+    if (now < next) {
+        double wait = next - now;
+        g_flip_paced++;
+        g_flip_pace_wait_us += (unsigned long long)(wait * 1e6);
+        if (wait > 0.0015) {
+            struct timespec sl;
+            double s = wait - 0.001;
+            sl.tv_sec = (time_t)s; sl.tv_nsec = (long)((s - (double)sl.tv_sec) * 1e9);
+            nanosleep(&sl, NULL);
+        }
+        for (;;) {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+            if (now >= next) break;
+            FLIP_PACE_YIELD();
+        }
+    }
+    next += period;
+    if (next < now) next = now + period;
+}
+
+void nv2a_pb_exec_flip_pace_stats(unsigned long long *paced, unsigned long long *wait_us)
+{
+    if (paced) *paced = g_flip_paced;
+    if (wait_us) *wait_us = g_flip_pace_wait_us;
+}
+
 static void snapshot_surface(void)
 {
     uint32_t b = surface_bpp();
@@ -3303,6 +3372,13 @@ static void frame_stats_report(void)
     frame_hist_line("FRAME", &s_frame.run);
     if (s_frame.win.n) {
         frame_hist_line("FRAME-WIN", &s_frame.win);
+        {
+            extern void nv2a_pb_exec_flip_pace_stats(unsigned long long *, unsigned long long *);
+            unsigned long long paced = 0, wait_us = 0;
+            nv2a_pb_exec_flip_pace_stats(&paced, &wait_us);
+            fprintf(stderr, "  [FLIP-PACE] flips held to one vblank period: %llu, waiting %.1f ms total"
+                            " (RECOMP_FLIP_PACE=0 runs free)\n", paced, (double)wait_us / 1000.0);
+        }
         pb_stage_line(s_frame.win.n, s_frame.win.total_us);
     }
     sync_stats_line();
@@ -5638,6 +5714,9 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
 
     /* The title's own frame boundary: this frame is finished. */
     case NV097_FLIP_STALL:
+        /* Paced BEFORE the frame interval is taken, so [FRAME-WIN] measures
+         * what the title actually gets -- see flip_pace. */
+        flip_pace();
         /* First, so the interval covers the whole frame -- see frame_stats_flip. */
         frame_stats_flip();
         /* The FF watch keys on the draw's place in the frame, so the count
@@ -6403,8 +6482,12 @@ void nv2a_pb_exec_report(void)
 
             if (black && submitting) {
                 ++black_reports;
+#if defined(__APPLE__)
+                /* Metal only: the Windows build has no nv2a_metal.h (mingw
+                 * reported the implicit declaration, 24 Sep). */
                 if (on_black > 0 && black_reports == (unsigned)on_black)
                     nv2a_metal_frag_force_arm();
+#endif
                 if (dump_on_black > 0 && black_reports == (unsigned)dump_on_black
                         && !s_draw_dump_black_armed) {
                     s_draw_dump_black_armed = 1;
