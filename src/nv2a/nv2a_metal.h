@@ -69,6 +69,15 @@ int nv2a_metal_stencil_peek(const uint8_t *depth, unsigned w, unsigned h, uint8_
  * draw into it -- the same code, shared. Returns 0, or -1 (rejected). */
 int nv2a_metal_bind(uint8_t *target, size_t target_size, uint32_t w, uint32_t h, uint32_t pitch,
                     uint8_t *depth, uint32_t depth_pitch, size_t depth_size, int use_zeta);
+/* G51.3, read-only: the geometry the executor last bound `target` with --
+ * the seven fields surface_bind keys a slot on -- from the live binding or a
+ * cached slot, preferring one whose depth is `depth` when that is not NULL.
+ * Returns the number of valid bindings/slots naming `target` (0: none, and
+ * the outputs are untouched). More than one means the same guest surface is
+ * held twice under different geometry, each copy with its own textures. */
+int nv2a_metal_slot_geometry(const uint8_t *target, const uint8_t *depth, size_t *target_size, uint32_t *w,
+                             uint32_t *h, uint32_t *pitch, uint8_t **slot_depth, uint32_t *out_dpitch,
+                             size_t *depth_size);
 /* Read-only: surfaces uploaded (rebuilt from guest RAM), slot-cache rebinds, evictions. */
 void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions);
 int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,

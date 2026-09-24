@@ -258,6 +258,7 @@ typedef struct {
     unsigned long long (*exec_seen)(void);
     /* Optional: d3d8_host_2d_metal_bind_ns, time spent binding (mostly GPU drain). */
     unsigned long long (*bind_ns)(void);
+    void (*geom_stats)(unsigned long long *differ, unsigned long long *variants);
     /* Optional: d3d8_host_2d_metal_spec_stats, for the draw-mode report. */
     void (*spec_stats)(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
 } D3D8Host2DBackend;
@@ -278,11 +279,18 @@ int  d3d8_host_ff_mode(void);
  * RECOMP_D3D8_HOST_2D=draw, fixed-function with RECOMP_D3D8_HOST_FF=draw.) */
 int  d3d8_host_replaces_handle(uint32_t vs_handle);
 int  d3d8_host_any_draw_mode(void);
-/* RECOMP_D3D8_HOST_VERIFY=N, in draw mode: every Nth flip the draws the host
+/* RECOMP_D3D8_HOST_VERIFY=N, in draw mode: on 1 flip in N the draws the host
  * would replace are left to the executor and shadowed instead -- the host's
- * pipeline compared per draw against the executor IN THE SAME RUN, so a
- * draw-mode run carries its own positive check. Asked on the guest thread. */
-int  d3d8_host_verify_now(void);
+ * pipeline compared per draw against the executor IN THE SAME RUN. Decided on
+ * the executor's thread at the replace token, by the executor's own flip
+ * count, so a verify flip is a whole executor-drawn frame (the first version
+ * decided on the guest thread, a frame ahead, and verified mixed frames).
+ * d3d8_host_verify_enabled: the knob is set (the mirror snapshots indices for
+ * replaceable draws then). d3d8_host_2d_verify_take: the check token for
+ * `serial` closes a verify draw -- compare it. */
+int  d3d8_host_verify_enabled(void);
+int  d3d8_host_2d_verify_take(uint32_t serial);
+void d3d8_host_2d_set_verify(unsigned every);   /* tests: as RECOMP_D3D8_HOST_VERIFY */
 /* Does the shadow take this draw (pre and post tokens)? */
 int  d3d8_host_shadow_wants(const D3D8HostDrawCheck *c);
 int  d3d8_host_shadow_wants_handle(uint32_t vs_handle);
@@ -312,6 +320,7 @@ void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long
  *  128 the executor's skip after its vertex/fragment preparation (645a7e6)
  *  256 refuse the stencil class again (func ALWAYS; drawn by the host since 645a7e6)
  *  512 refuse points/lines again (replaced by nothing since 645a7e6)
+ * 1024 bind a target with D3D's geometry, not the executor's slot's
  * 0x3FF reverts all of it: draw mode as 688bea4 drew, whose frames were clean.
  * Read once; 0 or unset changes nothing. The test sets it directly. */
 unsigned d3d8_host_2d_bisect(void);
@@ -319,6 +328,9 @@ void d3d8_host_2d_set_bisect(unsigned mask);
 /* Flips seen by the shadow/draw bookkeeping (the texture cache revalidates once per flip). */
 unsigned long long d3d8_host_2d_flip_count(void);
 unsigned long long d3d8_host_2d_metal_bind_ns(void);
+/* Binds where D3D's geometry for the target differed from the executor's slot,
+ * and binds that found the target held more than once. */
+void d3d8_host_2d_metal_geom_stats(unsigned long long *differ, unsigned long long *variants);
 /* Draws for which the host bound the target first (nv2a_metal_bind). */
 unsigned long long d3d8_host_2d_metal_binds(void);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);

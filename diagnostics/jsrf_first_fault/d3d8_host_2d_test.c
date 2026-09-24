@@ -167,7 +167,8 @@ static void case_b(D3D8HostDrawCheck *c)
  * the logo case's control sets it to 0 to reproduce tutorial run 3. */
 static float g_exec_offset = 0.53125f;
 static int g_exec_keep_surfaces;     /* 1: do not invalidate first, so binding state carries across draws */
-static int g_exec_no_sync;           /* 1: exec_draw / exec_draw_ff leave the batch open, as the executor's own next draw finds it */
+static int g_exec_no_sync;
+static size_t g_exec_size_extra;     /* the executor's target size beyond D3D's: pitch * (clip_y + clip_h) vs pitch * height */           /* 1: exec_draw / exec_draw_ff leave the batch open, as the executor's own next draw finds it */
 static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
 static float exec_snap(float v) { return g_exec_snap ? truncf(v * 16.0f) / 16.0f : v; }
 static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16_t *target, uint8_t *depth)
@@ -211,7 +212,7 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
     if (!g_exec_keep_surfaces) nv2a_metal_invalidate(NULL);
     if (nv2a_metal_draw(&s, (d->tmask & 1) ? ram + d->tex[0].addr : ram + TEX,
                         (d->tmask & 1) ? nv2a_texture_copy_texture_bytes(&s) : TW * TW * 4,
-                        (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
+                        (uint8_t *)target, RTPITCH * RTH + g_exec_size_extra, depth, RTW * 4 * RTH,
                         (const float (*)[16][4])v, n, c->prim) < 0) {
         printf("executor refused the draw: %s\n", nv2a_metal_last_reject());
         return 0;
@@ -1180,9 +1181,121 @@ static void zrange_tests(void)
     CHECK(df.mismatch == 0 && zbad == 0, "z range: the host culls exactly the fragments the executor culls");
 }
 
+/* SPECIALISED AGAINST GENERIC, FUZZED: random combiner programs (1-8
+ * stages, random input/output words, SAME_FACTOR bits, alpha test, blend,
+ * dither, specular) on the logo's geometry and texture, rendered through
+ * the shadow path with specialisation on and off. The two must agree to the
+ * byte: the game's FF draws run four stages over two textures, which the
+ * fixed cases above never did. */
+static uint32_t fz_state = 0x12345678u;
+static unsigned s_fz_spec_vs_exec, s_fz_gen_vs_exec, s_fz_printed;
+static uint32_t fz(void) { fz_state ^= fz_state << 13; fz_state ^= fz_state >> 17; fz_state ^= fz_state << 5; return fz_state; }
+static void spec_fuzz_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    unsigned bad = 0, n = 300;
+    case_logo(&c); set_state(&c, 0x30C, 0);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) { CHECK(0, "fuzz: build"); return; }
+    for (unsigned it = 0; it < n; ++it) {
+        D3D8Host2DDraw e = d;
+        e.cc = 1u + fz() % 8u; if (getenv("H2D_FUZZ_CC")) e.cc = (unsigned)atoi(getenv("H2D_FUZZ_CC"));
+        for (unsigned i = 0; i < 8; ++i) {
+            /* inputs: register 0-13 (codes 14/15 unused), channel bit, mapping 0-7 */
+            uint32_t w = 0, x = 0;
+            for (unsigned k = 0; k < 4; ++k) { w = (w << 8) | ((fz() % 14u) | (fz() & 0x10u) | ((fz() % 8u) << 5)); x = (x << 8) | ((fz() % 14u) | (fz() & 0x10u) | ((fz() % 8u) << 5)); }
+            e.ci[i] = w; e.ai[i] = x;
+            e.co[i] = (fz() % 14u) | ((fz() % 14u) << 4) | ((fz() % 14u) << 8) | (fz() & 0x000FF000u);
+            e.ao[i] = (fz() % 14u) | ((fz() % 14u) << 4) | ((fz() % 14u) << 8) | (fz() & 0x0000F000u);
+            e.k0[i] = fz(); e.k1[i] = fz();
+        }
+        e.control = (e.cc) | (fz() & 0x11000u);
+        e.alpha_test = fz() & 1u; e.alpha_func = 0x200u + fz() % 8u; e.alpha_ref = fz() % 256u;
+        /* The executor's model, so it can be the referee: per-stage factors, GREATER. */
+        if (!getenv("H2D_FUZZ_FREE_CONTROL")) e.control = e.cc | 0x11000u;
+        if (!getenv("H2D_FUZZ_FREE_FUNC")) e.alpha_func = 0x204u;
+        e.blend = fz() & 1u; e.blend_src = 0x302; e.blend_dst = 0x303; e.blend_eq = 0x8006;
+        e.dither = fz() & 1u; e.add_specular = fz() & 1u;
+        background(a); background(b);
+        d3d8_host_2d_metal_set_spec(1);
+        int ok = d3d8_host_2d_metal_render(&e, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0;
+        d3d8_host_2d_metal_set_spec(0);
+        ok = ok && d3d8_host_2d_metal_render(&e, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0;
+        d3d8_host_2d_metal_set_spec(1);
+        {   /* the executor, the referee */
+            static uint16_t x[RTPITCH / 2 * RTH]; static uint8_t zd[RTW * 4 * RTH];
+            unsigned long long dsx = 0, dgx = 0, dsg = 0;
+            background(x);
+            if (exec_draw(&c, &e, x, zd)) {
+                for (size_t k = 0; k < sizeof a / 2; ++k) { dsx += a[k] != x[k]; dgx += b[k] != x[k]; dsg += a[k] != b[k]; }
+                if (dsx) ++s_fz_spec_vs_exec; if (dgx) ++s_fz_gen_vs_exec;
+                if ((dsx || dgx) && s_fz_printed++ < 6)
+                    printf("  fuzz %u cc %u: specialised vs executor %llu px, generic vs executor %llu px, specialised vs generic %llu\n",
+                           it, e.cc, dsx, dgx, dsg);
+            }
+        }
+        if (!ok || memcmp(a, b, sizeof a)) {
+            unsigned long long diff = 0;
+            for (size_t k = 0; k < sizeof a / 2; ++k) diff += a[k] != b[k];
+            if (bad++ < 5) printf("  fuzz %u: cc %u control %X atest %u func %X ref %u blend %u dither %u spec %u: %llu px differ%s\n",
+                                  it, e.cc, e.control, e.alpha_test, e.alpha_func, e.alpha_ref, e.blend, e.dither, e.add_specular,
+                                  diff, ok ? "" : " (render failed)");
+        }
+    }
+    printf("  fuzz: differ from the executor -- specialised %u, generic %u of %u\n", s_fz_spec_vs_exec, s_fz_gen_vs_exec, n);
+    CHECK(s_fz_spec_vs_exec == 0, "fuzz: specialised host == executor on every random combiner program (%u differ)", s_fz_spec_vs_exec);
+    CHECK(bad == 0, "fuzz: %u random combiner programs, specialised == generic on %u", n, n - bad);
+}
+
+/* THE SAME SURFACE HELD TWICE. The executor keys a slot on its registers'
+ * geometry; D3D's description of the same target can differ (here the size:
+ * pitch * (clip_y + clip_h) against pitch * height). A host bind with D3D's
+ * geometry then makes a second slot for the same guest surface -- its own
+ * colour and depth -- instead of rebinding the executor's. Executor draws into
+ * A, then B; the host then draws into A. With the executor's geometry the
+ * host's bind is a rebind of A's slot (no upload); with D3D's (bisect 1024)
+ * it rebuilds a second copy from guest RAM. */
+static int geom_arm(unsigned mask, unsigned long long *uploads, unsigned long long *copies)
+{
+    enum { RT2 = RT + 0x40000 };
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    unsigned long long u0, h0, e0, u1, h1, e1;
+    uint16_t *a = (uint16_t *)(ram + RT), *b = (uint16_t *)(ram + RT2);
+    static uint8_t depth[RTW * 4 * RTH];
+    background(a); background(b);
+    nv2a_metal_invalidate(NULL); nv2a_metal_sync();
+    d3d8_host_2d_set_bisect(mask);
+    g_exec_keep_surfaces = 1; g_exec_size_extra = RTPITCH;
+    case_b(&c); memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) return 0;
+    if (!exec_draw(&c, &d, a, depth) || !exec_draw(&c, &d, b, depth)) return 0;
+    nv2a_metal_bind_counters(&u0, &h0, &e0);
+    int ok = d3d8_host_2d_metal_external(&d, ram, RAM_SIZE);
+    nv2a_metal_sync();
+    nv2a_metal_bind_counters(&u1, &h1, &e1);
+    *uploads = (u1 - u0) - (h1 - h0);             /* rebuilds from guest RAM: swaps that were not rebinds */
+    *copies = (unsigned long long)nv2a_metal_slot_geometry((uint8_t *)a, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    g_exec_keep_surfaces = 0; g_exec_size_extra = 0;
+    d3d8_host_2d_set_bisect(0);
+    return ok;
+}
+static void geom_tests(void)
+{
+    unsigned long long up = 0, cp = 0, up2 = 0, cp2 = 0;
+    CHECK(geom_arm(0, &up, &cp), "bind geometry: the host drew into A");
+    printf("  bind geometry: executor's geometry -> %llu rebuilds, A held %llu time(s); D3D's (bisect 1024) ->", up, cp);
+    CHECK(geom_arm(1024, &up2, &cp2), "bind geometry CONTROL: the host drew into A");
+    printf(" %llu rebuilds, A held %llu time(s)\n", up2, cp2);
+    CHECK(up == 0 && cp == 1, "bind geometry: the host's bind rebinds the executor's slot for A (no upload, one copy)");
+    CHECK(up2 >= 1 && cp2 >= 2, "bind geometry CONTROL: with D3D's geometry A is held twice");
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
+    geom_tests();
+    spec_fuzz_tests();
     zrange_tests();
     spec_tests();
     ff_draw_tests();
@@ -1359,20 +1472,51 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "draw") == 0) {         /* the draw-mode arm, a process of its own */
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
-        setenv("RECOMP_D3D8_HOST_VERIFY", "1", 1);               /* every flip is a verify flip */
         CHECK(d3d8_host_2d_mode() == 2 && d3d8_host_ff_mode() == 2, "RECOMP_D3D8_HOST_2D=draw and RECOMP_D3D8_HOST_FF=draw arm draw mode");
         draw_mode_tests();
         /* THE IN-RUN CHECK: on a verify flip a draw draw mode would replace is
          * left to the executor and shadowed -- pre token, executor draw, post
          * token, compared at the flip -- although neither mode is "shadow". */
-        {   D3D8HostDrawCheck v;
-            CHECK(d3d8_host_verify_now() == 1, "verify: RECOMP_D3D8_HOST_VERIFY=1 makes every flip a verify flip");
-            case_b(&v); v.verify = 1; shadow_flow(&v, 0);
-            case_b(&v); v.verify = 0;
-            {   D3D8H2DStats a, b; d3d8_host_2d_get_stats(&a);
-                d3d8_host_2d_pre(v.serial, v.vs_handle, v.rt_data, v.rt_format, v.rt_size, 0, 0);
-                d3d8_host_2d_post(&v, NULL); d3d8_host_2d_flip(); d3d8_host_2d_get_stats(&b);
-                CHECK(b.compared == a.compared, "verify CONTROL: the same draw without the verify flag is not compared in draw mode"); }
+        {   /* The token sequence d3d8_host.c runs: replace token (kind 3), the
+             * executor's draw, check token (kind 1: after(), then verify_take()
+             * and post()). On a verify flip replace() takes the pre snapshot
+             * and leaves the draw to the executor -- no skip. */
+            static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH];
+            static uint8_t depth[RTW * 4 * RTH];
+            D3D8HostDrawCheck v; D3D8Host2DDraw vd; D3D8Host2DBackend be; D3D8H2DStats a, b;
+            case_b(&v); memset(&vd, 0, sizeof vd); vd.verts = verts;
+            CHECK(!d3d8_host_2d_build(&v, ram, RAM_SIZE, 0, &vd), "verify: built");
+            background(bg); memcpy(ex, bg, sizeof bg);
+            CHECK(exec_draw(&v, &vd, ex, depth), "verify: the executor drew it");
+            memset(&be, 0, sizeof be);
+            be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
+            be.last_error = d3d8_host_2d_metal_last_error; be.depth_peek = fake_peek;
+            be.external_draw = d3d8_host_2d_metal_external; be.exec_skip = fake_skip; be.exec_skipped = fake_skipped;
+            be.ff_vertex = nv2a_ff_vertex;
+            d3d8_host_2d_set_backend(&be);
+            memcpy(ram + RT, bg, sizeof bg); g_exec_result = ex;
+            snapshot_at_call(&v);
+            d3d8_host_2d_set_verify(1);
+            d3d8_host_2d_get_stats(&a);
+            d3d8_host_2d_replace(&v);
+            CHECK(g_fake_skip == 0, "verify: on a verify flip replace() leaves the draw to the executor (no skip)");
+            d3d8_host_2d_after(&v);
+            if (d3d8_host_2d_verify_take(v.serial)) { D3D8HostDrawCheck w = v; w.verify = 1; d3d8_host_2d_post(&w, NULL); }
+            d3d8_host_2d_flip();
+            d3d8_host_2d_get_stats(&b);
+            CHECK(b.compared == a.compared + 1 && b.mismatching == a.mismatching && b.replaced == a.replaced,
+                  "verify: the draw was compared against the executor, not replaced (compared +%llu, mismatching +%llu)",
+                  b.compared - a.compared, b.mismatching - a.mismatching);
+            d3d8_host_2d_set_verify(0);
+            d3d8_host_2d_get_stats(&a);
+            snapshot_at_call(&v);
+            d3d8_host_2d_replace(&v);
+            CHECK(g_fake_skip == 1, "verify CONTROL: off a verify flip the same draw is replaced (skip on)");
+            if (g_fake_skip) ++g_fake_skipped;
+            d3d8_host_2d_after(&v);
+            CHECK(!d3d8_host_2d_verify_take(v.serial), "verify CONTROL: nothing to compare");
+            d3d8_host_2d_get_stats(&b);
+            CHECK(b.replaced == a.replaced + 1, "verify CONTROL: replaced once");
         }
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;

@@ -5776,6 +5776,32 @@ int nv2a_metal_bind(uint8_t *target, size_t target_size, uint32_t w, uint32_t h,
   }
 }
 
+int nv2a_metal_slot_geometry(const uint8_t *target, const uint8_t *depth, size_t *target_size, uint32_t *w,
+                             uint32_t *h, uint32_t *pitch, uint8_t **slot_depth, uint32_t *out_dpitch,
+                             size_t *depth_size)
+{
+  int n=0,best=-2;   /* -1: the live binding, >=0: a slot */
+  if(!target)return 0;
+  if(surface_valid&&surface_target==target){++n;best=-1;}
+  for(unsigned i=0;i<surface_slots_used();i++){
+    if(!surf_slot[i].valid||surf_slot[i].target!=target)continue;
+    if(best==-1&&surf_slot[i].colour==surface)continue;   /* the live binding's own slot */
+    ++n;
+    if(best==-2||(depth&&surf_slot[i].depth==depth&&!(best==-1&&depth_target==depth)))best=(int)i;
+  }
+  if(best==-2)return 0;
+  if(best==-1){
+    if(target_size)*target_size=surface_target_size;if(w)*w=surface_width;if(h)*h=surface_height;
+    if(pitch)*pitch=surface_pitch;if(slot_depth)*slot_depth=depth_target;if(out_dpitch)*out_dpitch=depth_pitch;
+    if(depth_size)*depth_size=depth_target_size;
+  }else{
+    if(target_size)*target_size=surf_slot[best].target_size;if(w)*w=surf_slot[best].w;if(h)*h=surf_slot[best].h;
+    if(pitch)*pitch=surf_slot[best].pitch;if(slot_depth)*slot_depth=surf_slot[best].depth;
+    if(out_dpitch)*out_dpitch=surf_slot[best].depth_pitch;if(depth_size)*depth_size=surf_slot[best].depth_size;
+  }
+  return n;
+}
+
 /* The binding counters, read-only, for the unit test that holds the two
  * binding paths to the same sequence. */
 void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions)

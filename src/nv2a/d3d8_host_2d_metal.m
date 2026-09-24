@@ -649,7 +649,10 @@ void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *
     if (ns_texture) *ns_texture = s_ns_texture;
     if (ns_external) *ns_external = s_ns_external;
 }
-static unsigned long long s_binds, s_ns_bind;
+static unsigned long long s_binds, s_ns_bind, s_geom_differ, s_geom_variants;
+static unsigned s_geom_printed;
+void d3d8_host_2d_metal_geom_stats(unsigned long long *differ, unsigned long long *variants)
+{ if (differ) *differ = s_geom_differ; if (variants) *variants = s_geom_variants; }
 unsigned long long d3d8_host_2d_metal_binds(void) { return s_binds; }
 /* Time inside nv2a_metal_bind: a surface swap drains the GPU (nv2a_metal_sync),
  * so this is mostly waiting, and it lands in "whole host draw". */
@@ -679,9 +682,39 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
          * next draw into this target finds it bound, as after its own swap. */
         if (drawn == -2 || drawn == -3 || drawn == -4) {
             size_t tsz = (size_t)d->rt_pitch * d->rt_h, zsz = (size_t)d->zs_pitch * d->rt_h;
+            uint32_t bw = d->rt_w, bh = d->rt_h, bp = d->rt_pitch, bdp = d->zs_pitch;
+            /* BIND WITH THE EXECUTOR'S GEOMETRY, NOT D3D'S. surface_bind keys a
+             * slot on seven fields, and the executor fills them from its
+             * registers: size = pitch * (clip_y + clip_h), the clip rectangle
+             * as width and height. D3D's description of the same surface can
+             * differ in any of them, and then the host's bind does not rebind
+             * the executor's slot -- it makes a SECOND slot for the same guest
+             * surface, with its own colour and depth textures, and every swap
+             * between the two copies rebinds a copy that the other one's draws
+             * never reached. So the host asks what the executor holds for this
+             * target and binds that. */
+            {   size_t gts = 0, gds = 0; uint32_t gw = 0, gh = 0, gp = 0, gdp = 0; uint8_t *gd = NULL;
+                int nv = nv2a_metal_slot_geometry(ram + d->rt_addr, zs, &gts, &gw, &gh, &gp, &gd, &gdp, &gds);
+                if (nv > 1) ++s_geom_variants;
+                if (nv) {
+                    int differ = gts != tsz || gw != bw || gh != bh || gp != bp ||
+                                 (uses_zs && gd == zs && (gdp != bdp || gds != zsz));
+                    if (differ) {
+                        ++s_geom_differ;
+                        if (s_geom_printed++ < 6)
+                            fprintf(stderr, "[D3D8-HOST-2D] bind geometry: D3D says size %zu %ux%u pitch %u depth pitch %u size %zu;"
+                                            " the executor holds size %zu %ux%u pitch %u depth %s pitch %u size %zu (%d copies)%s\n",
+                                    tsz, bw, bh, bp, bdp, zsz, gts, gw, gh, gp, gd == zs ? "same" : "other", gdp, gds, nv,
+                                    (d3d8_host_2d_bisect() & 1024u) ? " -- BISECT 1024: binding D3D's" : "");
+                    }
+                    if (!(d3d8_host_2d_bisect() & 1024u)) {
+                        tsz = gts; bw = gw; bh = gh; bp = gp;
+                        if (uses_zs && gd == zs) { bdp = gdp; zsz = gds; }
+                    }
+                }
+            }
             uint64_t tb = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            int bound = nv2a_metal_bind((uint8_t *)ram + d->rt_addr, tsz, d->rt_w, d->rt_h, d->rt_pitch, zs, d->zs_pitch, zsz,
-                                        uses_zs);
+            int bound = nv2a_metal_bind((uint8_t *)ram + d->rt_addr, tsz, bw, bh, bp, zs, bdp, zsz, uses_zs);
             s_ns_bind += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb;
             if (bound == 0) {
                 ++s_binds;
