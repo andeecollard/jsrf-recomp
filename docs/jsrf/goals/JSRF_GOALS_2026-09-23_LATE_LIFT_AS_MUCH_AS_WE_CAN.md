@@ -538,3 +538,17 @@ merging or carrying flags at split entries.
   **DEFER_SWAP has been off by default since G3 A2** because a guest CPU read
   of a rendered surface (other than the flip) would see stale RAM. Whether
   JSRF ever does that is the question before the default flips.
+- **DEFER_SWAP safety, measured** (`36ad170`, `RECOMP_METAL_DEBT_WATCH`).
+  Tutorial, 130 s, 0 faults:
+  - With defer: 12,358 colour debts armed, 12,288 paid before any access.
+    **0 faults on the high view the title uses.** Every "guest" read (67)
+    is our own `framebuffer_probe_tick` (instrumentation) on the ack thread,
+    and it reads the same with defer off (68, from cleared surfaces).
+  - Depth never written back: 1 armed, 0 read.
+  - Refused deferrals: 0.
+  - fps: 106.6 with the watch (86.1 without defer).
+
+  The 23 Sep graffiti replay is refused (recorded against the pre-G56 gen), so
+  gameplay beyond the tutorial is untested. The graffiti editor is the likely
+  place for a CPU read-back. JSRF.app (`aa2e2aa`) carries both switches for a
+  player session with the watch on.
