@@ -14,7 +14,8 @@
  *   - vertices from D3D's stream table through G41's array derivation
  *     (va_offset/va_format per NV2A slot), fetched at the draw's indices;
  *   - positions already in screen space: x, y scaled by the supersample
- *     factors D3D keeps at device +0x454/+0x458, z as given, clip w = 1/rhw;
+ *     factors D3D keeps at device +0x454/+0x458 and moved by D3D's screen-space
+ *     offset D3D8H2D_SCREEN_OFFSET, z as given, clip w = 1/rhw;
  *   - textures from the device's m_Textures (Data/Format/Size), decoded by
  *     nv2a_texture_decode.c -- the same decoder the executor's G27 path uses;
  *   - combiners from d3d8_ff_combiners() (G43) for fixed-function draws, or
@@ -70,6 +71,15 @@ typedef struct {
 } D3D8H2DTexture;
 
 #define D3D8H2D_MAX_VERTS (3u * 16384u)
+/* D3D's pass-through program for XYZRHW adds c1.xy = (0.53125, 0.53125) to
+ * every screen position (it loads c0 = (1, 1, 16777215, 1) and c1 with it;
+ * docs/jsrf/handovers/CLAUDE_HANDOVER.txt section 11.2 records the upload).
+ * 0.53125 is the NV2A's pixel-centre bias: 1/2 plus one 1/32 subpixel step.
+ * The executor runs that program, so its positions carry the offset; without
+ * it the host's picture sat half a pixel left of the executor's at every edge
+ * (tutorial run 3, "Presented by SEGA"). The shadow prints the executor's c0/c1
+ * and counts any draw where they are not these values. */
+#define D3D8H2D_SCREEN_OFFSET 0.53125f
 
 typedef struct {
     uint32_t serial;
