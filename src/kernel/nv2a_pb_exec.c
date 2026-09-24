@@ -2060,15 +2060,18 @@ static unsigned s_flight_marks;
 static unsigned long (*flight_input_frame)(void);
 static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
 static void (*flight_counters)(unsigned long long *);
+static uint32_t (*flight_mission_state)(void);
 static void flight_resolve(void) {}
 #else
 #include <dlfcn.h>
 static unsigned long (*flight_input_frame)(void);
 static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
 static void (*flight_counters)(unsigned long long *);
+static uint32_t (*flight_mission_state)(void);   /* chapter_select.c, for [GLITCH] */
 static void flight_resolve(void)
 {
     flight_counters = (void (*)(unsigned long long *))dlsym(RTLD_DEFAULT, "nv2a_metal_flight_counters");
+    flight_mission_state = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "chj_mission_state");
     flight_input_frame = (unsigned long (*)(void))dlsym(RTLD_DEFAULT, "xbox_InputFrame");
     flight_set_mark_hook = (void (*)(void (*)(unsigned long, const char *)))
         dlsym(RTLD_DEFAULT, "xbox_PadRecordSetMarkHook");
@@ -2076,6 +2079,8 @@ static void flight_resolve(void)
 #endif
 static void flight_on_mark(unsigned long frame, const char *label)
 { (void)frame; (void)label; s_flight_mark = 1; }
+static int glitch_watch_on(void);
+#define GW_RING 16   /* the glitch watch reaches back 5 + 1 + 2 frames; see below */
 static unsigned flight_frames(void)
 {
     static int init; static unsigned n;
@@ -2083,6 +2088,7 @@ static unsigned flight_frames(void)
         const char *e = getenv("RECOMP_FLIGHT_FRAMES");
         init = 1; n = (e && *e) ? (unsigned)strtoul(e, NULL, 10) : 0u;
         if (n > 1200) n = 1200;
+        if (n < GW_RING && glitch_watch_on()) n = GW_RING;
         if (n) {
             s_flight = calloc(n, sizeof *s_flight);
             if (!s_flight) n = 0;
@@ -2146,58 +2152,212 @@ static void flight_note_draw(void)
 }
 static int write_bmp_path(const char *path, const uint8_t *base, uint32_t pitch,
                           uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t bpp);
-static void flight_write(void)
+/* One recorded frame as <root>/frame-<name>.bmp (if bmp), draws-<name>.txt
+ * and, with RECOMP_FLIGHT_XF_DRAW, xf-<name>.txt. */
+static void flight_write_frame(const char *root, const char *name, const FlightFrame *f, int bmp)
 {
-    const char *dir = getenv("RECOMP_FLIGHT_DIR");
-    char root[900], path[1024];
-    unsigned i, k, written = 0;
-    snprintf(root, sizeof root, "%s/flight-%u", (dir && *dir) ? dir : ".", ++s_flight_marks);
+    char path[1024];
+    unsigned k;
+    FILE *t;
+    snprintf(path, sizeof path, "%s/frame-%s.bmp", root, name);
+    if (bmp && f->px) write_bmp_path(path, f->px, f->w * f->bpp, 0, 0, f->w, f->h, f->bpp);
+    snprintf(path, sizeof path, "%s/draws-%s.txt", root, name);
+    if ((t = fopen(path, "w")) == NULL) return;
+    fprintf(t, "# metal cumulative: uploads %llu hits %llu evictions %llu feedback %llu drainless %llu sync_paid %llu\n",
+            f->ctr[0], f->ctr[1], f->ctr[2], f->ctr[3], f->ctr[4], f->ctr[5]);
+    fprintf(t, "# seq %u guest_frame %lu draws %u (+%u not recorded)\n"
+               "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc xf_hash xf_bad\n",
+            f->seq, f->guest_frame, f->ndraws, f->dropped);
+    for (k = 0; k < f->ndraws; ++k) {
+        const FlightDraw *d = &f->d[k];
+        fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x %08x %u\n", d->draw, d->prim,
+                d->count, d->mode, d->tex0, d->fmt0, d->tex1, d->fmt1, d->cw0, d->ctl,
+                d->blend, d->zfunc, d->xf_hash, d->xf_bad);
+    }
+    fclose(t);
+    if (f->nxf) {
+        snprintf(path, sizeof path, "%s/xf-%s.txt", root, name);
+        if ((t = fopen(path, "w")) != NULL) {
+            unsigned x, c;
+            for (x = 0; x < f->nxf; ++x) {
+                const FlightXf *sn = &f->xf[x];
+                fprintf(t, "# index %u draw %u\ncomposite", sn->index, sn->draw);
+                for (c = 0; c < 16; ++c) fprintf(t, " %.9g", sn->composite[c]);
+                fprintf(t, "\nviewport");
+                for (c = 0; c < 8; ++c) fprintf(t, " %.9g", sn->viewport[c]);
+                fprintf(t, "\n");
+                for (c = 0; c < NV2A_VS_MAX_CONSTANTS; ++c)
+                    fprintf(t, "c%u %.9g %.9g %.9g %.9g\n", c, sn->c[c][0], sn->c[c][1],
+                            sn->c[c][2], sn->c[c][3]);
+            }
+            fclose(t);
+        }
+    }
+}
+static void flight_mkdir(const char *root)
+{
 #if defined(_WIN32)
     CreateDirectoryA(root, NULL);
 #else
-    { char cmd[1000]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", root); if (system(cmd)) {} }
+    char cmd[1000]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", root); if (system(cmd)) {}
 #endif
+}
+static void flight_write(void)
+{
+    const char *dir = getenv("RECOMP_FLIGHT_DIR");
+    char root[900], name[16];
+    unsigned i, written = 0;
+    snprintf(root, sizeof root, "%s/flight-%u", (dir && *dir) ? dir : ".", ++s_flight_marks);
+    flight_mkdir(root);
     for (i = 0; i < s_flight_filled; ++i) {
-        FlightFrame *f = &s_flight[(s_flight_head + s_flight_n - s_flight_filled + i) % s_flight_n];
-        snprintf(path, sizeof path, "%s/frame-%04u.bmp", root, i);
-        if (f->px) write_bmp_path(path, f->px, f->w * f->bpp, 0, 0, f->w, f->h, f->bpp);
-        snprintf(path, sizeof path, "%s/draws-%04u.txt", root, i);
-        FILE *t = fopen(path, "w");
-        if (!t) continue;
-        fprintf(t, "# metal cumulative: uploads %llu hits %llu evictions %llu feedback %llu drainless %llu sync_paid %llu\n",
-                f->ctr[0], f->ctr[1], f->ctr[2], f->ctr[3], f->ctr[4], f->ctr[5]);
-        fprintf(t, "# seq %u guest_frame %lu draws %u (+%u not recorded)\n"
-                   "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc xf_hash xf_bad\n",
-                f->seq, f->guest_frame, f->ndraws, f->dropped);
-        for (k = 0; k < f->ndraws; ++k) {
-            const FlightDraw *d = &f->d[k];
-            fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x %08x %u\n", d->draw, d->prim,
-                    d->count, d->mode, d->tex0, d->fmt0, d->tex1, d->fmt1, d->cw0, d->ctl,
-                    d->blend, d->zfunc, d->xf_hash, d->xf_bad);
-        }
-        fclose(t);
-        if (f->nxf) {
-            snprintf(path, sizeof path, "%s/xf-%04u.txt", root, i);
-            if ((t = fopen(path, "w")) != NULL) {
-                unsigned x, c;
-                for (x = 0; x < f->nxf; ++x) {
-                    const FlightXf *sn = &f->xf[x];
-                    fprintf(t, "# index %u draw %u\ncomposite", sn->index, sn->draw);
-                    for (c = 0; c < 16; ++c) fprintf(t, " %.9g", sn->composite[c]);
-                    fprintf(t, "\nviewport");
-                    for (c = 0; c < 8; ++c) fprintf(t, " %.9g", sn->viewport[c]);
-                    fprintf(t, "\n");
-                    for (c = 0; c < NV2A_VS_MAX_CONSTANTS; ++c)
-                        fprintf(t, "c%u %.9g %.9g %.9g %.9g\n", c, sn->c[c][0], sn->c[c][1],
-                                sn->c[c][2], sn->c[c][3]);
-                }
-                fclose(t);
-            }
-        }
+        const FlightFrame *f = &s_flight[(s_flight_head + s_flight_n - s_flight_filled + i) % s_flight_n];
+        snprintf(name, sizeof name, "%04u", i);
+        flight_write_frame(root, name, f, 1);
         ++written;
     }
     fprintf(stderr, "  [FLIGHT] mark %u: wrote %u frames to %s\n", s_flight_marks, written, root);
     fflush(stderr);
+}
+/* THE GLITCH WATCH (24 Sep 2026). RECOMP_GLITCH_WATCH=1, off by default.
+ *
+ * The flight recorder needs a hand on M at the right second, and a whole
+ * cutscene written out is gigabytes, so it cannot sweep every event in the
+ * game. This watches every presented frame instead and writes only the ones
+ * that come and go. Each flip keeps a 160x120 luminance thumbnail; when frame
+ * n arrives, the run of L = 1..5 frames before it is a dropout if, with
+ * d = the mean absolute grey difference (0..255) and p = n-L-1,
+ *     every frame x of the run is far from both neighbours:
+ *         m = min over x of min(d(p,x), d(x,n)) > 3
+ *     and the two neighbours agree:
+ *         d(p,n) < m/2 and d(p,n) < 12.
+ * For L = 1 this is the offline rule that counted the DJ K skinning glitch --
+ * 11 single frames in chapter 2's intro, 0 after the frndint fix. The ceiling
+ * of 12 is new: the frames around a cut to black and then to "Now Loading"
+ * are 33 apart, which is half of nothing when the run is black, and not a
+ * dropout. A run must start after the last one reported.
+ *
+ * A hit logs one [GLITCH] line (guest frames, and the mission state when
+ * RECOMP_CHAPTER_JUMP's lift is watching one) and, for the first GW_WRITES
+ * hits, writes RECOMP_FLIGHT_DIR/glitch-<k>/: frame-<seq>.bmp for the run and
+ * one frame each side, draws-<seq>.txt for those AND the two frames before.
+ * The picture of frame-S is the scene of draws-(S-2) -- the swap copies the
+ * frame before last (see the flight recorder) -- so the draws that made a
+ * glitch frame S are in draws-(S-2), and its neighbours' in draws-(S-3) and
+ * draws-(S-1). RECOMP_FLIGHT_XF_DRAW adds the transform snapshots.
+ *
+ * Off, the cost is one cached test in the flight recorder's per-flip and
+ * per-draw paths. On: the flight ring (GW_RING frames unless RECOMP_FLIGHT_
+ * FRAMES asks for more), one pass over each presented frame, and the
+ * distances, which stop at the first frame that matches its neighbour. */
+#define GW_W 160
+#define GW_H 120
+#define GW_RUN 5
+#define GW_HIST (GW_RUN + 4)   /* the run, its two neighbours, two frames of draw lag */
+#define GW_WRITES 40
+#define GW_LOGS 2000
+static struct { uint8_t y[GW_W * GW_H]; } s_gw[GW_HIST];
+static unsigned long long s_gw_frames, s_gw_last_end;
+static unsigned s_gw_hits;
+static int glitch_watch_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = recomp_switch_on("RECOMP_GLITCH_WATCH");
+        if (on) {
+            s_snap_wanted = 1;
+            fprintf(stderr, "  [GLITCH] watch on: runs of 1..%d presented frames that differ from both"
+                    " neighbours while those agree; the first %d written to RECOMP_FLIGHT_DIR/glitch-<k>/\n",
+                    GW_RUN, GW_WRITES);
+        }
+    }
+    return on;
+}
+static void gw_thumb(uint8_t *out, const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp)
+{
+    uint32_t tx, ty, bw = w >= GW_W ? w / GW_W : 1, bh = h >= GW_H ? h / GW_H : 1;
+    for (ty = 0; ty < GW_H; ++ty)
+        for (tx = 0; tx < GW_W; ++tx) {
+            const uint32_t x0 = tx * w / GW_W, y0 = ty * h / GW_H;
+            uint32_t x, y, sum = 0, n = 0;
+            for (y = y0; y < y0 + bh && y < h; ++y)
+                for (x = x0; x < x0 + bw && x < w; ++x) {
+                    uint32_t r, g, b;
+                    if (bpp == 4) {
+                        uint32_t v; memcpy(&v, px + ((size_t)y * w + x) * 4, 4);
+                        b = v & 0xff; g = (v >> 8) & 0xff; r = (v >> 16) & 0xff;
+                    } else {
+                        uint16_t v; memcpy(&v, px + ((size_t)y * w + x) * 2, 2);
+                        b = (v & 0x1fu) << 3; g = ((v >> 5) & 0x3fu) << 2; r = ((v >> 11) & 0x1fu) << 3;
+                    }
+                    sum += (r * 77 + g * 150 + b * 29) >> 8; ++n;
+                }
+            out[ty * GW_W + tx] = (uint8_t)(n ? sum / n : 0);
+        }
+}
+static float gw_dist(unsigned long long i, unsigned long long j)
+{
+    const uint8_t *a = s_gw[i % GW_HIST].y, *b = s_gw[j % GW_HIST].y;
+    uint32_t k, sum = 0;
+    for (k = 0; k < GW_W * GW_H; ++k) sum += (uint32_t)(a[k] > b[k] ? a[k] - b[k] : b[k] - a[k]);
+    return (float)sum / (float)(GW_W * GW_H);
+}
+/* Frame `slot` of the flight ring has just been recorded. */
+static void glitch_watch_flip(unsigned slot)
+{
+    const FlightFrame *f = &s_flight[slot];
+    unsigned long long n;
+    unsigned L;
+    if (!glitch_watch_on()) return;
+    n = s_gw_frames++;          /* every flip, so frame j is always `slot` stepped back n-j */
+    if (f->px && (f->bpp == 2 || f->bpp == 4)) gw_thumb(s_gw[n % GW_HIST].y, f->px, f->w, f->h, f->bpp);
+    else memset(s_gw[n % GW_HIST].y, 0, sizeof s_gw[0].y);
+    for (L = 1; L <= GW_RUN; ++L) {
+        const unsigned long long p = n - L - 1;
+        unsigned long long x;
+        float m = 1e9f, dpn;
+        if (n < L + 3u || p + 1 <= s_gw_last_end) break;   /* p >= 2 until the first hit */
+        for (x = p + 1; x < n && m > 3.0f; ++x) {
+            float a = gw_dist(p, x), b = gw_dist(x, n);
+            if (a < m) m = a;
+            if (b < m) m = b;
+        }
+        if (m <= 3.0f) continue;
+        dpn = gw_dist(p, n);
+        if (!(dpn < 0.5f * m && dpn < 12.0f)) continue;
+        {
+            /* The ring slot of frame j (j <= n) is `slot` stepped back n-j. */
+            #define GW_SLOT(j) (&s_flight[(slot + s_flight_n - (unsigned)(n - (j))) % s_flight_n])
+            const FlightFrame *first = GW_SLOT(p + 1), *last = GW_SLOT(n - 1);
+            const uint32_t st = flight_mission_state ? flight_mission_state() : 0xFFFFFFFFu;
+            char stbuf[24];
+            s_gw_last_end = n - 1;
+            ++s_gw_hits;
+            if (st == 0xFFFFFFFFu) snprintf(stbuf, sizeof stbuf, "?");
+            else snprintf(stbuf, sizeof stbuf, "0x%02X", st);
+            if (s_gw_hits <= GW_LOGS)
+                fprintf(stderr, "[GLITCH] hit %u: %u frame%s, seq %u..%u guest frame %lu..%lu, mission state %s;"
+                        " run vs neighbours %.1f, neighbours %.1f%s\n", s_gw_hits, L, L == 1 ? "" : "s",
+                        first->seq, last->seq, first->guest_frame, last->guest_frame, stbuf, m, dpn,
+                        s_gw_hits <= GW_WRITES ? "" : " (not written: cap)");
+            if (s_gw_hits <= GW_WRITES && s_flight_filled >= L + 4u) {
+                const char *dir = getenv("RECOMP_FLIGHT_DIR");
+                char root[900], name[16];
+                unsigned long long j;
+                snprintf(root, sizeof root, "%s/glitch-%03u", (dir && *dir) ? dir : ".", s_gw_hits);
+                flight_mkdir(root);
+                for (j = p - 2; j <= n; ++j) {
+                    const FlightFrame *g = GW_SLOT(j);
+                    snprintf(name, sizeof name, "%u", g->seq);
+                    flight_write_frame(root, name, g, j >= p);
+                }
+                fprintf(stderr, "  [GLITCH] hit %u written to %s (frame-S pixels are the scene of draws-(S-2))\n",
+                        s_gw_hits, root);
+            }
+            fflush(stderr);
+            #undef GW_SLOT
+        }
+        break;
+    }
 }
 static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp, uint32_t seq)
 {
@@ -2216,8 +2376,9 @@ static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp,
         s_flight_cur.xf = x; s_flight_cur.nxf = 0;
     }
     s_flight_cur.ndraws = 0; s_flight_cur.dropped = 0;
-    s_flight_head = (s_flight_head + 1) % s_flight_n;
     if (s_flight_filled < s_flight_n) ++s_flight_filled;
+    glitch_watch_flip(s_flight_head);
+    s_flight_head = (s_flight_head + 1) % s_flight_n;
     {   /* RECOMP_FLIGHT_AT=<guest frame>: the same write without a keyboard,
          * for replays and for testing the recorder itself. */
         static int init; static unsigned long at;
