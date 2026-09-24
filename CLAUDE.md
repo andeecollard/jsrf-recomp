@@ -82,11 +82,15 @@ The generated C is **not** in git — it is hundreds of MB, rebuilt by
 ```sh
 cmake -S diagnostics/jsrf_first_fault -B <build> -DRECOMP_GEN_DIR=<gen dir>
 cmake --build <build> -j
-ctest --test-dir <build>            # all green, 70 of them on 19 Sep 2026.
+ctest --test-dir <build>            # 154 on 25 Sep 2026; two fail by
+                                   # design: jsrf_input_hotplug (needs no
+                                   # controller attached) and
+                                   # jsrf_gen_header_current (until the gen
+                                   # tree is regenerated after 4778f4e).
                                    # They are diagnostics/jsrf_first_fault's;
                                    # tests/ at the repo root is built by
                                    # nothing. The count grows -- what matters
-                                   # is that none fails, not that it reads 70
+                                   # is that nothing else fails
 ```
 
 ```sh
@@ -118,10 +122,14 @@ translator changes.
 
 ## Where the title has got to
 
-Boots, renders, presents, reaches gameplay, and produces audio. Known open
-items live in the newest file in `docs/jsrf/handovers/`; read that before
-starting, and trust it over anything older, including older handovers that
-describe the same subsystem.
+Playable into chapter 2, and every chapter can be entered unattended
+(`RECOMP_CHAPTER_JUMP`). The current plan is the newest file in
+`docs/jsrf/goals/` (by the date in its name); known open items and the last
+session's state live in the newest file in `docs/jsrf/handovers/`. Read both
+before starting, and trust them over anything older, including older
+handovers that describe the same subsystem. `docs/jsrf/TOOLS.md` says how to
+reach a scene and capture evidence without a person at the controller --
+reach the scene before theorising about it.
 
 Handovers are dated and **supersede each other**. An older one describing a bug
 as unexplained does not mean it is still unexplained.

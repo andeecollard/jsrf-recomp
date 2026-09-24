@@ -8,6 +8,31 @@ corrected on the night of 21 September against the 1167 s player session in
 Every number here came from a run; where something is believed rather than
 measured it says so.
 
+## Summary, 25 September 2026
+
+Newest first; the sections below it are the older measured record and remain
+true unless this summary says otherwise. The plan and the evidence behind
+each line are in `goals/JSRF_GOALS_2026-09-24_NIGHT_EVERY_SCENE_IS_REACHABLE.md`.
+**Measured** means a run or a player session produced the number;
+**observed** means seen on screen without a controlled comparison.
+
+| area | state | basis |
+|---|---|---|
+| story progression | playable into chapter 2; the save decodes to chapter 2 mission 240, 6 characters, 23 souls, Rokkaku-dai 16 Poison Jam tags still to cover | measured: save decoder, byte-for-byte round trip |
+| every chapter reachable | chapters 2 (missions 0, 10, 40, 96) and 5 (10) entered unattended with no fault | measured: `RECOMP_CHAPTER_JUMP` runs |
+| cutscene one-frame dropouts | fixed (G57, `frndint` rounding control); chapter-2 intro 11 transient frames → 0 | measured: flight recorder, before/after on one build |
+| Rokkaku-dai city | fixed (G54) | player session |
+| characters whited out in Rokkaku-dai | fixed (G58, 16-bit swizzled textures on the GPU) | player session |
+| stage music dying after ~2 min | fixed (DSOUND lift, 23 Sep); stage track read in real time to the end of a 1,370 s session; 14 small underruns in it | measured: ADX reads matched against the file; content not checked by ear |
+| graffiti studio cannot paint | fixed in code (G59, linear 32-bit textures), not yet confirmed | measured: the dropped draws were format 0x12 in the player's log |
+| Rokkaku-dai water looks like a void | bump mapping implemented (G60), not yet confirmed; whether it then looks right needs an xemu reference | measured: the water is rasterised where the void is (`RECOMP_MARK_BUMP`) |
+| cutscene sweep | in progress over the 74 cutscenes reachable by a jump | — |
+| corrupt glyphs in speech boxes / trick names (G2) | open, not re-measured since 21 Sep | — |
+| Poison Jam chase cutscene elements | open; needs the chase played to reach | — |
+| boost flicker | open, not re-tested since G57 | — |
+| frame time | tutorial ≈ 11.5 ms (86 fps uncapped) with combiner specialisation; heavy scenes last measured before it at a 50 fps median | measured 24 Sep / 23 Sep; heavy scenes need re-measuring |
+| fault rate | not re-measured since the 21 Sep figures below | — |
+
 ## Fixed 21 September 2026 — the Load screen, the light, and the character select
 
 Three menu screens that were black or wrong now match xemu, each confirmed

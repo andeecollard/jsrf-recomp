@@ -9,14 +9,11 @@ model and the MCPX audio model all come from that project; this repository is a
 fork specialised to get one title running, with the general fixes sent back
 upstream where they belong.
 
-> **This is a work in progress, not a release.** It boots, renders, plays music
-> and reaches gameplay, and as of 21 September 2026 the Load and character
-> select screens render as they do in xemu. It also runs at about half the frame rate it should,
-> faults in 46 of 390 recorded runs (11.8%) — with the hazard concentrated at
-> the title-menu-to-first-mission transition rather than spread through the
-> run — and gets the intro card transitions wrong. The honest state is in
-> [docs/jsrf/STATUS.md](docs/jsrf/STATUS.md) and it is kept current with
-> measurements rather than impressions.
+> **Work in progress, not a release.** As of 25 September 2026 the game is
+> playable into chapter 2: story missions, cutscenes, graffiti, music and the
+> controller all work, and every chapter can be entered. What is still wrong,
+> and what has not been checked yet, is listed below and in
+> [docs/jsrf/STATUS.md](docs/jsrf/STATUS.md).
 
 ## You need your own copy of the game
 
@@ -24,22 +21,90 @@ upstream where they belong.
 executable, not the assets, not the generated C — that last one is mechanically
 derived from the game's own code and is rebuilt locally by `regenerate.sh`,
 never committed. You supply a dump of a disc you own; the repository supplies
-the machinery that runs it.
+the machinery that runs it. Save files and pad recordings are yours too and
+stay out of the repository.
 
-## Build
+## Where it stands
+
+**Works** (each confirmed in a player session unless marked):
+
+- Boot, menus, Load and character select, the Garage and the tutorial.
+- Story progression through chapter 1 into chapter 2 (Shibuya Terminal,
+  Dogenzaka Hill, Rokkaku-dai Heights), with tags, graffiti souls and
+  characters joining; the save's progress decodes and round-trips exactly.
+- Stage music streams for whole sessions on the host audio path (the DSOUND
+  lift): 23-minute sessions with the track read in real time to the end.
+- Rokkaku-dai's city, fog and cel-shaded characters (fixed 24 Sep: the city
+  was discarded by an alpha test on a padding byte; characters were white
+  because two 16-bit texture formats were never decoded on the GPU).
+- Cutscenes no longer lose the whole scene for a frame once a second (fixed
+  25 Sep: the recompiler's `frndint` ignored the x87 rounding mode, so the
+  game's `floor()`/`ceil()` rounded to nearest and animation read past its key
+  table). Verified unattended on the chapter-2 intro: 11 dropped frames → 0.
+- Every chapter can be entered unattended (`RECOMP_CHAPTER_JUMP`); chapters 2
+  and 5 were entered and played without a fault.
+
+**Fixed in code, waiting for a player to confirm:** Roboy's graffiti studio
+(its canvas is a linear 32-bit texture that was refused), and the water in
+Rokkaku-dai (bump-environment mapping is now implemented rather than drawn
+flat).
+
+**Still wrong or unknown:**
+
+- Corrupt glyphs in some speech boxes and trick names.
+- Elements missing from the Poison Jam chase cutscenes.
+- Chapters 3–9 have been entered but not played through; a sweep of all 74
+  cutscenes that can be reached unattended is in progress.
+- Performance is measured only in some scenes: in the tutorial a frame takes
+  about 11.5 ms (86 fps uncapped) since combiner specialisation (24 Sep); the
+  last measurement of heavy scenes, before that change, was a 50 fps median
+  (23 Sep).
+- Rendering still goes through the NV2A model; a Direct3D-level lift exists and
+  is checked against it in shadow mode, but is not the default yet.
+
+## Build and play
+
+Requirements: macOS on Apple Silicon, CMake, a C toolchain, and a Python 3
+with `capstone` (`/usr/bin/python3 -c 'import capstone'`; pass `PYTHON=` to
+`regenerate.sh` if your first `python3` lacks it).
 
 ```sh
+# 1. translate the guest XBE to C (hundreds of MB, gitignored)
+PYTHON=/usr/bin/python3 diagnostics/jsrf_first_fault/regenerate.sh
+
+# 2. build and test
 cmake -S diagnostics/jsrf_first_fault -B build -DRECOMP_GEN_DIR=<gen dir>
 cmake --build build -j
 ctest --test-dir build
+
+# 3. a double-clickable app with its libraries bundled
+diagnostics/jsrf_first_fault/packaging/make_app.sh build/jsrf_first_fault <dest dir>
 ```
 
-```sh
-diagnostics/jsrf_first_fault/play.sh
-```
+`JSRF.app` reads `~/Library/Application Support/JSRF/paths.conf` for the game
+directory (`JSRF_GAME_DIR`, the folder holding `default.xbe`), the emulated
+HDD (`JSRF_HDD_ROOT`) and any `RECOMP_*` switches, and writes its log to
+`last-run.log` beside it (the previous one is kept as `last-run-previous.log`).
+Do not pipe `make_app.sh` into `head`: SIGPIPE leaves a truncated bundle.
 
-`JSRF_GAME_DIR` points at the directory holding `default.xbe`. There are around
-a hundred `RECOMP_*` switches for instrumentation; enumerate them rather than
+## Debugging it
+
+The work is driven by evidence from the running game, and most of the tooling
+exists to get that evidence without a person at the controller. See
+[docs/jsrf/TOOLS.md](docs/jsrf/TOOLS.md) for the full guide. In short:
+
+- **Reach any scene unattended:** `RECOMP_CHAPTER_JUMP=<chapter>:<mission>`
+  starts any story mission from the Garage; a catalogue of all 300 cutscene
+  files says which jump plays which (`diagnostics/jsrf_first_fault/gametools/`).
+- **Catch a glitch as it happens:** `RECOMP_FLIGHT_FRAMES=N` keeps the last N
+  presented frames and every draw in them, written out when you press **M**;
+  `RECOMP_GLITCH_WATCH=1` finds one-frame dropouts by itself.
+- **Read the game's own state:** a save decoder/editor, mission and event
+  parsers, and guest memory dumps at harness captures.
+- **Drive the game:** a stage harness (`diagnostics/jsrf_first_fault/stage_harness`)
+  boots, navigates, replays recorded pad input and captures frames.
+
+There are a few hundred `RECOMP_*` switches; enumerate them rather than
 guessing:
 
 ```sh
@@ -55,12 +120,21 @@ in [CLAUDE.md](CLAUDE.md) were each paid for with a wrong conclusion:
 - **Measure, don't infer.** Runtime behaviour is not deducible from reading
   generated C.
 - **Read a counter's trigger before trusting its value.** Several counters here
-  have lied, including two found lying this month.
+  have lied.
 - **Every absence-measurement needs a positive control.** `on=0` means "nothing
   happened" or "the instrument is dead", and only a control separates them.
+- **Reach the scene before theorising about it.** A night of guesses about
+  Rokkaku-dai ended the moment the harness could get there unattended.
 
-If you are looking for somewhere to start, the open items at the bottom of
-[STATUS.md](docs/jsrf/STATUS.md) are real and individually tractable.
+The current plan is the newest file in [docs/jsrf/goals/](docs/jsrf/goals/);
+[docs/jsrf/README.md](docs/jsrf/README.md) explains how the notes are laid out.
+
+## Upstream
+
+General fixes go back to xboxrecomp as pull requests from a fork: ten have
+been merged so far (lifter flag semantics, rotates, SHLD/SHRD, `movsd`
+dispatch, APU mix-down, an SVOD reader), others are open, and a fix for
+`frndint` rounding is prepared.
 
 ## Licence and credit
 
@@ -69,6 +143,13 @@ Upstream's own README is preserved at
 [docs/upstream/README.xboxrecomp.md](docs/upstream/README.xboxrecomp.md), and
 the [sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu) is where the
 wider project happens.
+
+Function and structure names for the title come from KeybadeBlox's
+[JSRF-Decompilation](https://codeberg.org/KeybadeBlox/JSRF-Decompilation)
+symbol table, and file formats from their
+[GG-Notebook](https://codeberg.org/KeybadeBlox/GG-Notebook) (WTFPL).
+[xemu](https://xemu.app) is the reference for NV2A behaviour and the oracle the
+renderer is checked against.
 
 Jet Set Radio Future is © SEGA. This project is not affiliated with or endorsed
 by SEGA, and distributes none of their material.

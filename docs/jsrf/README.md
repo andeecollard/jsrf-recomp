@@ -8,32 +8,35 @@ Notes are dated and supersede each other. When two describe the same subsystem,
 the newer one wins. A bug an old handover calls unexplained may well have been
 fixed since.
 
+## Start here
+
+| file | what it is |
+|---|---|
+| [STATUS.md](STATUS.md) | What works and what does not, with the measurements behind each claim. |
+| newest file in [goals/](goals/) | The current plan: goals (stable G-numbers), what was refuted, the order of work. Sort by the date in the name; each superseded file says so under its title. |
+| newest file in [handovers/](handovers/) | State at the end of the last session and its open items. |
+| [TOOLS.md](TOOLS.md) | How to reach a scene, catch a glitch and read the game's state, unattended. |
+| [ACCURACY_GAPS.md](ACCURACY_GAPS.md) | Known places the recompiled title differs from hardware. |
+| [EXPERIMENT_CONTROLS.md](EXPERIMENT_CONTROLS.md) | Positive and negative controls for the instruments. |
+
+Then `../../CLAUDE.md` for orientation and the rules learned the hard way.
+Anything older than the newest goals file and handover is background; don't
+read the whole pile, the handovers are cumulative by design.
+
 ## Layout
 
-| Directory | What's in it |
+| directory | what's in it |
 |---|---|
-| `handovers/` | Session-to-session state transfers between Claude and Codex. The most recent is the one to read first. |
-| `progress/` | Point-in-time findings on one subsystem (combiners, textures, heap, flags). |
-| `goals/` | Objective and plan documents for a phase of work. |
-| `plans/` | Longer-lived strategy: `ROUTE_B_PLAN.txt`, `QWEN_CONTEXT.md`. |
+| `goals/` | The plan for a phase: `JSRF_GOALS_<date>_<topic>.md`. G-numbers never change between files; priority lives in each file's "Order" section. |
+| `handovers/` | End-of-session state: `HANDOVER_<date>_<time of day>_<topic>.txt` (older ones are prefixed `CLAUDE_` or `CODEX_`, and `X_TO_Y_HANDOVER` for an explicit handoff between agents). |
+| `progress/` | Point-in-time findings on one subsystem: `PROGRESS_<date>_<topic>.md` (older: `CLAUDE_PROGRESS_…`, `CODEX_PROGRESS_…`). |
+| `plans/` | Longer-lived strategy documents. |
+| `artifacts/` | Raw evidence kept for reference (backtraces). |
+| `oracle-evidence/` | Material captured from xemu as the reference picture. |
+| `attic/` | Retired documents and reverted patches, kept for the record. |
 
-## Reading order for a cold start
+The game-data tools, the cutscene catalogue and the unattended launchers live
+in `../../diagnostics/jsrf_first_fault/gametools/`, with their own README.
 
-1. `../../CLAUDE.md` — orientation and the rules learned the hard way.
-2. The newest file in `handovers/` — current state and open items.
-3. The newest `goals/` file — what the phase was aiming at.
-
-Anything older is background. Don't read the whole pile; the handovers are
-cumulative by design.
-
-## Naming
-
-```
-{CLAUDE,CODEX}_HANDOVER_<date>_<topic>.txt      state at end of a session
-{CLAUDE,CODEX}_TO_{CODEX,CLAUDE}_HANDOVER_…     an explicit handoff
-{CLAUDE,CODEX}_PROGRESS_<date>_<topic>.md       one subsystem, one finding
-JSRF_GOALS_<date>_<topic>.md                    plan for a phase
-```
-
-New notes follow the same pattern and go in the matching directory — never in
-the repo root, which is kept identical to upstream's so merges stay clean.
+New notes follow the same patterns and go in the matching directory — never in
+the repository root, which is kept close to upstream's so merges stay clean.
