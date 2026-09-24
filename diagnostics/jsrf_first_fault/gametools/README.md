@@ -55,3 +55,7 @@ build-feav binary with audio silenced; one game instance at a time.
 
 Known flake: occasionally the harness's first input is not delivered at the
 title ("Input was not delivered before its lease expired"); retry.
+
+## Cutscene catalogue (`catalogue/`)
+
+`catalogue.json` / `catalogue.md`: all 300 event files -- length, cast, which mission plays each (opcode 0xE3 block and flag conditions), and a recipe class: A plays on `RECOMP_CHAPTER_JUMP=C:M` (74 events, covered by 37 jumps), B needs chapter flags (WriteStateFlag values listed), C needs player action, D unused. Ordering/timing is from a mission-command simulation (`sim.py`), not an engine trace. The scripts were written against the session scratchpad and may need their input paths adjusted.
