@@ -18,7 +18,14 @@
  * G43 adds the fixed-function combiners: hooks on the builder 0x197F90 and the
  * fog updater 0x195610 (both internal, both run lazily from the flusher
  * 0x1964A0) record their inputs as they emit, and each draw carries those and
- * the same inputs read at the draw, plus TEXTUREFACTOR (RenderState[129]). */
+ * the same inputs read at the draw, plus TEXTUREFACTOR (RenderState[129]).
+ *
+ * G42 adds the fixed-function vertex state: hooks on the texture-transform
+ * updater 0x1957F0 and the light updater 0x195F80 (internal, lazy, run from
+ * the flusher on dirty 0x400 / 0x1000), and the fog updater's own registers
+ * from the 0x195610 hook; texgen and fog colour are immediate and read at the
+ * draw. SPECULAR_ENABLE has two writers, so the builder and light hooks number
+ * their emissions. */
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include "d3d8_host.h"
@@ -188,6 +195,99 @@ static void d3d8m_fog_read(uint32_t f[4])
 }
 static D3D8FFCombinerIn m_ffc_emit;
 static uint32_t m_ffc_emit_seen, m_ffc_emits, m_ffc_emits_at_draw, m_fog_emit[4], m_fog_emit_seen;
+
+/* ---- G42: fixed-function vertex state (ff_lighting_fog_notes.md) ---- */
+static uint32_t m_seq, m_sp_seq, m_sp_val;
+static D3D8FFTexXformIn m_tx_emit;  static uint32_t m_tx_emit_seen, m_tx_emits, m_tx_emits_at_draw;
+static D3D8FFFogIn      m_fg_emit;  static uint32_t m_fg_emit_seen, m_fg_emits, m_fg_emits_at_draw;
+static D3D8FFLightIn    m_lt_emit;  static uint32_t m_lt_emit_seen, m_lt_emits, m_lt_emits_at_draw, m_lt_seq;
+#define RS(i) MEM32(0x0019E0E0u + 4u * (uint32_t)(i))
+static uint32_t d3d8m_vs_flags(uint32_t d)
+{
+    uint32_t o = MEM32(d + 0x380u);
+    return o ? MEM32(o + 4u) : 0;
+}
+/* 0x1957F0's inputs: the vertex shader object's flags (+4) and texcoord
+ * sizes (+0x10), TEXTURETRANSFORMFLAGS / TEXCOORDINDEX per stage, and the
+ * texture matrices as SetTransform stored them (device +0x750 + 0x40*state,
+ * TEXTURE0 = state 2). */
+static void d3d8m_tx_read(D3D8FFTexXformIn *in)
+{
+    uint32_t d = MEM32(0x0019DCE0u), o = MEM32(d + 0x380u);
+    memset(in, 0, sizeof *in);
+    in->vs_flags = o ? MEM32(o + 4u) : 0;
+    in->vs_tex_sizes = o ? MEM32(o + 0x10u) : 0;
+    for (unsigned s = 0; s < 4; ++s) {
+        in->ttf[s] = MEM32(0x0019DEE0u + 4u * (32u * s + D3D8FF_TSS_TEXTURETRANSFORMFLAGS));
+        in->tci[s] = MEM32(0x0019DEE0u + 4u * (32u * s + D3D8FF_TSS_TEXCOORDINDEX));
+        for (unsigned i = 0; i < 16; ++i) in->matrix[s][i] = MEM32(d + 0x7D0u + 0x40u * s + 4u * i);
+    }
+}
+/* 0x195610's fog inputs: RenderState[82..87] and the word at 0x19B0F4. */
+static void d3d8m_fg_read(D3D8FFFogIn *in)
+{
+    memset(in, 0, sizeof *in);
+    in->enable = RS(D3D8FF_RS_FOGENABLE); in->table_mode = RS(D3D8FF_RS_FOGTABLEMODE);
+    in->start = RS(D3D8FF_RS_FOGSTART); in->end = RS(D3D8FF_RS_FOGEND); in->density = RS(D3D8FF_RS_FOGDENSITY);
+    in->range_enable = RS(D3D8FF_RS_RANGEFOGENABLE);
+    in->equal_scale = MEM32(0x0019B0F4u);
+}
+/* 0x195F80's inputs: RenderState[92..105] and [122], device +8, the front
+ * and back materials (+0x9F0, +0xA34), VIEW (+0x750), the eye vector at
+ * 0x19B0F8, and the enabled-light list (head +0x398, next at record +0x8C,
+ * 0x90-byte records), at most eight as the guest takes them. */
+static void d3d8m_lt_read(D3D8FFLightIn *in)
+{
+    uint32_t d = MEM32(0x0019DCE0u), p;
+    memset(in, 0, sizeof *in);
+    in->vs_flags = d3d8m_vs_flags(d);
+    in->lighting = RS(D3D8FF_RS_LIGHTING); in->specular_enable = RS(D3D8FF_RS_SPECULARENABLE);
+    in->local_viewer = RS(D3D8FF_RS_LOCALVIEWER); in->color_vertex = RS(D3D8FF_RS_COLORVERTEX);
+    for (unsigned k = 0; k < 8; ++k) in->mat_source[k] = RS(D3D8FF_RS_BACKSPECULARMATERIALSOURCE + (int)k);
+    in->back_ambient = RS(D3D8FF_RS_BACKAMBIENT); in->ambient = RS(D3D8FF_RS_AMBIENT);
+    in->two_sided = RS(D3D8FF_RS_TWOSIDEDLIGHTING);
+    in->device_flags = MEM32(d + 8u);
+    for (unsigned i = 0; i < 17; ++i) { in->material[i] = MEM32(d + 0x9F0u + 4u * i); in->back_material[i] = MEM32(d + 0xA34u + 4u * i); }
+    for (unsigned i = 0; i < 16; ++i) in->view[i] = MEM32(d + 0x750u + 4u * i);
+    for (unsigned i = 0; i < 3; ++i) in->eye[i] = MEM32(0x0019B0F8u + 4u * i);
+    in->list_head = p = MEM32(d + 0x398u);
+    while (p && in->nlights < 8u) {
+        for (unsigned i = 0; i < D3D8FF_LIGHT_WORDS; ++i) in->light[in->nlights][i] = MEM32(p + 4u * i);
+        in->nlights++;
+        p = MEM32(p + 0x8Cu);
+    }
+}
+/* The transcription hard-codes the XBE's read-only constants; the two it
+ * takes from D3D's writable data (the rsqrt pair) are checked once here. */
+static void d3d8m_g42_constants(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    fprintf(stderr, "[D3D8-MIRROR] G42 constants: rsqrt %08X %08X (want 3EF0A3D7 3FBC28F6), fog equal-range scale %08X,"
+                    " eye %08X %08X %08X%s\n", MEM32(0x0022E574u), MEM32(0x0022E578u), MEM32(0x0019B0F4u),
+            MEM32(0x0019B0F8u), MEM32(0x0019B0FCu), MEM32(0x0019B100u),
+            MEM32(0x0022E574u) == 0x3EF0A3D7u && MEM32(0x0022E578u) == 0x3FBC28F6u ? "" : " -- RSQRT CONSTANTS DIFFER");
+}
+/* Hooked on entry to 0x1957F0. With a programmable or pass-through shader
+ * (object flags 0x12) it returns at once: not an emission. */
+void d3d8m_texxform_entry(void)
+{
+    D3D8FFTexXformIn in;
+    if (!d3d8m_on()) return;
+    d3d8m_tx_read(&in);
+    if (in.vs_flags & 0x12u) return;
+    m_tx_emit = in; m_tx_emit_seen = 1; ++m_tx_emits;
+}
+/* Hooked on entry to 0x195F80. It always writes (the unlit path is four
+ * registers), so every call is an emission. */
+void d3d8m_lights_entry(void)
+{
+    if (!d3d8m_on()) return;
+    d3d8m_g42_constants();
+    d3d8m_lt_read(&m_lt_emit);
+    m_lt_emit_seen = 1; ++m_lt_emits; m_lt_seq = ++m_seq;
+}
 /* Hooked on entry to 0x197F90, before it runs. With a pixel shader bound it
  * returns at once and writes nothing, so that call is not an emission and the
  * registers still hold the previous one's words. */
@@ -198,6 +298,11 @@ void d3d8m_ff_builder_entry(void)
     d3d8m_ffc_read(&in);
     if (in.pixel_shader) return;
     m_ffc_emit = in; m_ffc_emit_seen = 1; ++m_ffc_emits;
+    {   /* G42: the builder's own SPECULAR_ENABLE write, when it makes one. */
+        D3D8FFCombiners o;
+        d3d8_ff_combiners(&in, &o);
+        if (o.specular_enable_emitted) { m_sp_seq = ++m_seq; m_sp_val = o.specular_enable; }
+    }
 }
 /* Hooked on entry to 0x195610. It skips CW0/CW1 when device +0x370 and +0x374
  * are both nonzero; only a call that writes them is recorded. */
@@ -205,6 +310,9 @@ void d3d8m_fog_entry(void)
 {
     uint32_t f[4];
     if (!d3d8m_on()) return;
+    /* G42: the fog registers (FOG_ENABLE, and mode/params when on) are
+     * written on every call, CW or not. */
+    d3d8m_fg_read(&m_fg_emit); m_fg_emit_seen = 1; ++m_fg_emits;
     d3d8m_fog_read(f);
     if (f[2] && f[3]) return;
     memcpy(m_fog_emit, f, sizeof f); m_fog_emit_seen = 1;
@@ -228,6 +336,17 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     c.tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);
     d3d8m_fog_read(c.fog_cur);
     c.fog_emit_seen = m_fog_emit_seen; memcpy(c.fog_emit, m_fog_emit, sizeof c.fog_emit);
+    /* G42: the vertex-state updaters' inputs as last emitted, and now. */
+    c.ffv_valid = 1;
+    c.ffv_vs_flags = d3d8m_vs_flags(MEM32(0x0019DCE0u));
+    c.ffv_fog_color = RS(D3D8FF_RS_FOGCOLOR);
+    c.tx_emit_seen = m_tx_emit_seen; c.tx_emit = m_tx_emit; d3d8m_tx_read(&c.tx_cur);
+    c.tx_emit_fresh = m_tx_emits != m_tx_emits_at_draw; m_tx_emits_at_draw = m_tx_emits;
+    c.fg_emit_seen = m_fg_emit_seen; c.fg_emit = m_fg_emit; d3d8m_fg_read(&c.fg_cur);
+    c.fg_emit_fresh = m_fg_emits != m_fg_emits_at_draw; m_fg_emits_at_draw = m_fg_emits;
+    c.lt_emit_seen = m_lt_emit_seen; c.lt_emit = m_lt_emit; d3d8m_lt_read(&c.lt_cur);
+    c.lt_emit_fresh = m_lt_emits != m_lt_emits_at_draw; m_lt_emits_at_draw = m_lt_emits;
+    c.lt_emit_seq = m_lt_seq; c.sp_emit_seq = m_sp_seq; c.sp_emit_val = m_sp_val;
     /* G40: the bound textures come from the DEVICE, not from a SetTexture
      * hook. XbSymbolDatabase's offset dump names m_Textures at device +0xA78,
      * one pointer per stage. The hook mirror is kept beside it and every
@@ -317,7 +436,11 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
                    if (c.nidx) c.idx[0] ^= 1u;
                    /* G43: the check flips one transcribed word (COLOR_ICW[0]),
                     * so every fixed-function draw must mismatch. */
-                   c.ffc_control = 1; } }
+                   c.ffc_control = 1;
+                   /* G42: one word per group (texgen S0, TEXTURE_MATRIX_ENABLE0,
+                    * LIGHTING_ENABLE or LIGHT_CONTROL, FOG_ENABLE), so every
+                    * compared draw must mismatch. */
+                   c.ffv_control = 1; } }
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);
