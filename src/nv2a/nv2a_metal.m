@@ -943,6 +943,7 @@ static NSString *const shader =
   * Renders incorrectly by construction. Off unless set. */
  " if(s.frag_force==1u)return float4(tex.rgb,1);"
  " if(s.frag_force==2u)return float4(clamp(d0.rgb,0.0f,1.0f),1);"
+ " if(s.frag_force==5u)return float4(1,0,1,1);"
  " if(s.frag_force==3u)return float4(1,1,1,1);"
   /* FRACT, NOT CLAMP, and the first version of this got it wrong.
   *
@@ -2073,6 +2074,14 @@ static int hw_shader_blend_mode_env(void)
 static int no_alpha_test_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_NO_ALPHA_TEST");
   return on; }
+/* RECOMP_MARK_BUMP=1 -- A DIAGNOSTIC, RENDERS INCORRECTLY. Every draw whose
+ * BUMPENVMAP unit was approximated as plain 2D (s->bump_approx) is painted
+ * opaque magenta through frag_force mode 5, and nothing else changes. Rokkaku's
+ * water (24 Sep 2026: "the void is water") is a bump-mapped draw; magenta where
+ * the void is means the water is rasterised there and its colour or blend is
+ * wrong, no magenta means it never reaches those pixels. */
+static int mark_bump_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_MARK_BUMP"); return on; }
 static int legacy_zclamp_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_LEGACY_ZCLAMP");
   return on; }
@@ -6611,7 +6620,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8?(t->xrgb8?2u:1u):0u;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.sz16[u]=t->sz16?(t->argb4?2u:1u):0u;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
+  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();if(mark_bump_on()&&s->bump_approx)p.frag_force=5u;p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8?(t->xrgb8?2u:1u):0u;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.sz16[u]=t->sz16?(t->argb4?2u:1u):0u;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
   p.final_general=s->final_general;p.final_cw0=s->final_cw0;p.final_cw1=s->final_cw1;p.fog_enable=s->fog_enable;p.fog_mode=s->fog_mode;p.fog_color=s->fog_color;p.sf0=s->spec_fog_c0;p.sf1=s->spec_fog_c1;p.fog_p0=s->fog_p0;p.fog_p1=s->fog_p1;
   p.ez_proven=(uint32_t)(early_z_exact_mode()==2&&s->alpha_test&&s->alpha_ref==0&&hw_zcull_cannot_fire(s)
                          &&g_draw_alpha_floor>=1.0f/255.0f);

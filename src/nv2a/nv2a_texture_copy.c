@@ -330,6 +330,7 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
          * absence. */
         if ((mode==6 || mode==7) && texmode_approx_on()) {
             s_texmode_approx[mode][u]++;
+            s->bump_approx=1;
             nv2a_drop(NV2A_DROP_SIMPLIFIED, "fragment", "bump-map texture mode drawn without its displacement",
                       mode | (u << 8));
             mode=1;

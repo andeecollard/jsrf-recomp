@@ -33,6 +33,7 @@ typedef struct NV2ATextureCopy {
      * extraction -- so they are not incidental, they ARE the effect. */
     uint32_t const0[8], const1[8];
     uint32_t texture_mask;
+    uint32_t bump_approx;   /* a unit's BUMPENVMAP mode was drawn as plain 2D (RECOMP_TEXMODE_APPROX) */
     const struct NV2ATextureCopy *extra_stages;
     const uint8_t *extra_texture[3];
     size_t extra_size[3];
