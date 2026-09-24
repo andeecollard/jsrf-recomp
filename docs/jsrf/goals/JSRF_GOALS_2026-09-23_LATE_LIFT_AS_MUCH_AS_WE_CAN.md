@@ -444,3 +444,15 @@ merging or carrying flags at split entries.
   another colour target" (a shared bind prologue is next).
 - **G51.3 FF shadow** (`9bd99e9`): the first run counted 0 draws and ran at
   1 fps. Back with the agent.
+- **Shared bind prologue** (`e445df3`, `nv2a_metal_bind`): 2D draw mode now
+  replaces 26,325 of 26,325 2D draws (the host bound the target first on
+  2,123). The default path is unchanged at 84.9 fps.
+- **G51.3 FF shadow, first number** (`619c6dc`, stride 60, tutorial):
+  - 4,973 compared: EXACT 2,562, within tolerance 1,582, MISMATCHING 829.
+  - 2,874 px over tolerance out of 673M in boxes; host and executor coverage
+    agree within 370 px of 102.5M.
+  - Cull comes from D3D's RS 127/128 (`SetRenderState_CullMode`), not
+    Simple pushes, and agrees on 6,033 of 6,033.
+  - Open: the control does not perturb FF yet; "diffuse defaulted to white"
+    on 5,185 draws needs checking against the executor; 492 stencil draws
+    are refused.
