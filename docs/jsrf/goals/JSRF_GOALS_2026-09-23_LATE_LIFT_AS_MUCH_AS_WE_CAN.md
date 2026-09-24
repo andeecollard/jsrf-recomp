@@ -367,3 +367,11 @@ merging or carrying flags at split entries.
   - **Every per-draw input the host renderer needs now follows from D3D**,
     except the inverse model-view (0x580), which needs 0x190A30 transcribed.
     G50 is complete; G51 (host draws) is next.
+- **G42b: done** (agent, merged). The inverse model-view (0x580, guest
+  0x190A30, a cofactor inverse in x87 with D3D's approximate rsqrt) is
+  transcribed bit-exact: 0 mismatched words over 3,000,000 random matrices
+  against the recompiled guest.
+  - In the game (tutorial, player's switches): 23,223 draws needing it,
+    278,676 of 278,676 registers exact; control 0; laziness 0; singular 0.
+  - **Every per-draw input the host renderer needs now follows from D3D
+    alone, with nothing left unchecked** in the tutorial.
