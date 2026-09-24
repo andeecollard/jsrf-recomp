@@ -349,3 +349,21 @@ merging or carrying flags at split entries.
   - intro music matches `title.adx` in every second once playing;
   - the logo sequence now takes its real-time length (it had run fast).
 - The Windows cross-build compiles again (`nv2a_metal_frag_force_arm` guarded).
+- **G42: done** (agent, merged). Tutorial with the player's switches, exact
+  matches throughout:
+
+  | group | registers | exact | control |
+  |---|---|---|---|
+  | texgen | 3,871,776 | all | 0 draws |
+  | texture transforms | 1,605,568 | all | 0 |
+  | lighting | 1,299,042 | all | 0 |
+  | fog | 999,936 | all | 0 |
+
+  - 338 lit draws, all one directional light. Texgen NORMAL_MAP runs on
+    stages 0 and 1 (the cel-shading lookup). Texture-transform layouts are
+    A and E only. Fog is never on in the tutorial.
+  - All laziness cross-checks read 0, and the guest's rsqrt constants were
+    confirmed live.
+  - **Every per-draw input the host renderer needs now follows from D3D**,
+    except the inverse model-view (0x580), which needs 0x190A30 transcribed.
+    G50 is complete; G51 (host draws) is next.
