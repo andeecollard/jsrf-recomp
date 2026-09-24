@@ -1129,6 +1129,17 @@ if(APPLE)
     # runs it late, early, and with the inexact REF0 approximation as control.
     add_executable(jsrf_metal_earlyz_test metal_earlyz_test.c)
     target_link_libraries(jsrf_metal_earlyz_test PRIVATE xbox_vsh)
+    # Combiner specialisation (RECOMP_METAL_SPECIALISE_COMBINERS) must leave
+    # the image BYTE-IDENTICAL over a spread of combiner programs, and the
+    # deliberately wrong control arm must not. The check script runs all the
+    # arms, under both texture samplers; registered because it is fast.
+    add_executable(jsrf_metal_combiner_spec_test metal_combiner_spec_test.c
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+    target_link_libraries(jsrf_metal_combiner_spec_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_combiner_spec
+             COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/metal_combiner_spec_check.sh")
+    set_tests_properties(jsrf_metal_combiner_spec PROPERTIES
+                         ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}")
     # Staging-ring lifetime, including the pin-once-per-batch pattern batching
     # introduced. Carries its own positive control.
     add_executable(jsrf_metal_ring_test metal_ring_test.c)
