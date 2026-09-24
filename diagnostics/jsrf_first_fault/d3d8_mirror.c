@@ -13,7 +13,12 @@
  * G41 adds vertex streams and indices: each draw wrapper passes the draw's
  * three arguments, the snapshot derives every NV2A array slot's offset and
  * format from D3D's stream table and vertex shader object (d3d8m_streams),
- * and SetStreamSource / SetIndices hooks are carried along as a cross-check. */
+ * and SetStreamSource / SetIndices hooks are carried along as a cross-check.
+ *
+ * G43 adds the fixed-function combiners: hooks on the builder 0x197F90 and the
+ * fog updater 0x195610 (both internal, both run lazily from the flusher
+ * 0x1964A0) record their inputs as they emit, and each draw carries those and
+ * the same inputs read at the draw, plus TEXTUREFACTOR (RenderState[129]). */
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include "d3d8_host.h"
@@ -22,6 +27,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* G43: a final report and the combiner-setup tally at exit. Most runs here
+ * end in kill -9, so d3d8_host.c also prints the tally every 100,000
+ * fixed-function draws; this only catches a clean exit. */
+static void d3d8m_exit(void)
+{
+    d3d8_host_report("exit");
+    d3d8_host_ffc_tally_report("exit", 20);
+}
 static int d3d8m_on(void)
 {
     static int m = -1;
@@ -29,6 +42,7 @@ static int d3d8m_on(void)
         const char *e = getenv("RECOMP_D3D8_MIRROR");
         m = e && e[0] && strcmp(e, "0") != 0;
         fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_MIRROR=%s\n", m ? "on" : "off");
+        if (m) atexit(d3d8m_exit);
     }
     return m;
 }
@@ -147,6 +161,55 @@ static void d3d8m_streams(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     c->hk_stream_seen = m_hk_stream_seen; c->hk_ib = m_hk_ib; c->hk_base = m_hk_base; c->hk_ib_seen = m_hk_ib_seen;
 }
 
+/* G43: the fixed-function combiner builder's inputs (ff_combiner_notes.md):
+ * TSS words at 0x19DEE0 + 0x80*stage, RenderState[108] POINTSPRITEENABLE and
+ * [93] SPECULARENABLE (0x19E0E0 + 4*index, XDK 4134 numbering), m_Textures
+ * NULL-ness (device +0xA78), device +0x370 (pixel shader) and device +8. */
+static void d3d8m_ffc_read(D3D8FFCombinerIn *in)
+{
+    uint32_t d = MEM32(0x0019DCE0u);
+    memset(in, 0, sizeof *in);
+    for (unsigned s = 0; s < 4; ++s) {
+        for (unsigned k = 0; k < 32; ++k) in->tss[s][k] = MEM32(0x0019DEE0u + 4u * (32u * s + k));
+        if (MEM32(d + 0xA78u + 4u * s)) in->texture_bound_mask |= 1u << s;
+    }
+    in->point_sprite_enable = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_POINTSPRITEENABLE);
+    in->specular_enable     = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_SPECULARENABLE);
+    in->pixel_shader        = MEM32(d + 0x370u);
+    in->device_flags        = MEM32(d + 8u);
+}
+/* The fog updater's inputs: RenderState[82] FOGENABLE, [93], device +0x370/+0x374. */
+static void d3d8m_fog_read(uint32_t f[4])
+{
+    uint32_t d = MEM32(0x0019DCE0u);
+    f[0] = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_FOGENABLE);
+    f[1] = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_SPECULARENABLE);
+    f[2] = MEM32(d + 0x370u); f[3] = MEM32(d + 0x374u);
+}
+static D3D8FFCombinerIn m_ffc_emit;
+static uint32_t m_ffc_emit_seen, m_ffc_emits, m_ffc_emits_at_draw, m_fog_emit[4], m_fog_emit_seen;
+/* Hooked on entry to 0x197F90, before it runs. With a pixel shader bound it
+ * returns at once and writes nothing, so that call is not an emission and the
+ * registers still hold the previous one's words. */
+void d3d8m_ff_builder_entry(void)
+{
+    D3D8FFCombinerIn in;
+    if (!d3d8m_on()) return;
+    d3d8m_ffc_read(&in);
+    if (in.pixel_shader) return;
+    m_ffc_emit = in; m_ffc_emit_seen = 1; ++m_ffc_emits;
+}
+/* Hooked on entry to 0x195610. It skips CW0/CW1 when device +0x370 and +0x374
+ * are both nonzero; only a call that writes them is recorded. */
+void d3d8m_fog_entry(void)
+{
+    uint32_t f[4];
+    if (!d3d8m_on()) return;
+    d3d8m_fog_read(f);
+    if (f[2] && f[3]) return;
+    memcpy(m_fog_emit, f, sizeof f); m_fog_emit_seen = 1;
+}
+
 void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     D3D8HostDrawCheck c;
@@ -155,6 +218,16 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     memset(&c, 0, sizeof c);
     c.serial = ++m_serial;
     d3d8m_streams(&c, kind, a1, a2, a3);
+    /* G43: the combiner inputs now (after the draw, so after its flush), and
+     * as the builder and fog updater last saw them when they emitted. */
+    c.ffc_valid = 1;
+    d3d8m_ffc_read(&c.ffc_cur);
+    c.ffc_ps = c.ffc_cur.pixel_shader;
+    c.ffc_emit_seen = m_ffc_emit_seen; c.ffc_emit = m_ffc_emit;
+    c.ffc_emit_fresh = m_ffc_emits != m_ffc_emits_at_draw; m_ffc_emits_at_draw = m_ffc_emits;
+    c.tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);
+    d3d8m_fog_read(c.fog_cur);
+    c.fog_emit_seen = m_fog_emit_seen; memcpy(c.fog_emit, m_fog_emit, sizeof c.fog_emit);
     /* G40: the bound textures come from the DEVICE, not from a SetTexture
      * hook. XbSymbolDatabase's offset dump names m_Textures at device +0xA78,
      * one pointer per stage. The hook mirror is kept beside it and every
@@ -241,7 +314,10 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
                        unsigned s0 = c.va_stream[__builtin_ctz(c.va_on)] & 15u;
                        c.st_data[s0] += 0x100000u;
                        for (unsigned i = 0; i < 16; ++i) if ((c.va_stream[i] & 15u) == s0) c.va_offset[i] += 0x100000u; }
-                   if (c.nidx) c.idx[0] ^= 1u; } }
+                   if (c.nidx) c.idx[0] ^= 1u;
+                   /* G43: the check flips one transcribed word (COLOR_ICW[0]),
+                    * so every fixed-function draw must mismatch. */
+                   c.ffc_control = 1; } }
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
     dev = MEM32(0x0019DCE0u); put = MEM32(dev);

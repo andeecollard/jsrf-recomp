@@ -265,6 +265,33 @@ def main():
         text = text[:first] + decls + "\n" + text[first:] + "\n".join(wrappers) + "\n"
         (dst / path.name).write_text(text)
 
+    if a.mirror:
+        # G43: two INTERNAL D3D functions, not entry points, so they are
+        # wrapped here and not through the census table. Both are called only
+        # from the lazy flusher 0x1964A0 (dirty bits 0x800 and 0x2000); the
+        # hook runs BEFORE the original and records the inputs it is about to
+        # read, so the check can transcribe exactly what D3D last emitted.
+        for name, fn in (("sub_00197F90", "d3d8m_ff_builder_entry"),    # combiner builder
+                         ("sub_00195610", "d3d8m_fog_entry")):           # fog / final combiner
+            if name in plan:
+                raise SystemExit("%s is also a census entry; hook it through the entry path" % name)
+            found = [p for p in sorted(dst.glob("recomp_*.c")) if ("void %s(void)\n{" % name) in p.read_text()]
+            if len(found) != 1:
+                raise SystemExit("expected exactly one body for %s, found %d" % (name, len(found)))
+            text = found[0].read_text()
+            span = body_span(text, name)
+            if span is None:
+                raise SystemExit("could not delimit %s" % name)
+            body = text[span[0]:span[1]]
+            manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), found[0].name))
+            renamed = body.replace("void %s(void)" % name, "static void d3d8m_orig_%s(void)" % name, 1)
+            text = text[:span[0]] + renamed + text[span[1]:]
+            text += ("\n/* ---- G43 mirror hook (stage_d3d8_census.py) ---- */\n"
+                     "void %s(void);\n"
+                     "void %s(void) { %s(); d3d8m_orig_%s(); }\n" % (fn, name, fn, name))
+            found[0].write_text(text)
+            manifest.append("mirror: %s (G43, %s before the original)" % (name, fn))
+
     names = [(e["name"] or "sub_%08X" % int(e["address"], 16)).split(" (")[0].replace('"', "'") for e in entries]
     (dst / "recomp_zz_d3d8_census.c").write_text(RUNTIME % dict(
         n=len(entries),

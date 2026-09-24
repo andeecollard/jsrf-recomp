@@ -162,6 +162,47 @@ byte = reg | `((ctl|F|arg) >> 1) & 0x10` (ALPHAREPLICATE or alpha pass ->
 - Neither can happen with valid D3D input, but whether JSRF ever sets one is a
   runtime question.
 - The value of `device+0x374` (the second gate in the fog updater) was not
-  identified.
+  identified. Read since: SetPixelShader (0x199BE0) sets it to
+  `def[8] | def[9]` (def = `[handle+8]`, the words it later writes to
+  0x288/0x28C), i.e. "this shader has its own final combiner", and does not
+  clear it on SetPixelShader(NULL).
 - The transcription has not yet been compared against the executor's
-  combiner registers on real draws; that is G43's runtime half.
+  combiner registers on real draws; that is G43's runtime half (below). It
+  is built, not yet run.
+
+## Runtime half: the check in the D3D mirror
+
+`d3d8_host_check_combiners` (src/nv2a/d3d8_host.c), fed by
+`d3d8_mirror.c` and `nv2a_pb_exec_last_draw_textures`, compares at every
+draw with `device+0x370 == 0` the 51 words COMBINER_CONTROL, COLOR_ICW/OCW[8],
+ALPHA_ICW/OCW[8], FACTOR0/1[8] and SPECULAR_FOG_CW0/1 with the executor's
+method shadow. Unit test: `d3d8_combiner_check_test.c`.
+
+### Laziness, and which state is transcribed
+
+The flusher runs 0x197F90 on dirty 0x800 and 0x195610 on 0x2000, so the
+registers at a draw are what those two last EMITTED. `stage_d3d8_census.py
+--mirror` wraps both (they are internal, not entry points) with a hook that
+reads their inputs on entry; the check transcribes those. The same inputs read
+at the draw are transcribed beside them and every disagreement is counted.
+
+Static reading says the two never disagree. The dirty-flag writers for the
+builder's inputs, from a sweep of `0x19DED8` references in the D3D section:
+
+| writer | sets | when |
+|---|---|---|
+| SetTexture 0x18DF10 | 0x4800 | texture set to NULL |
+| SetTexture 0x18DF10 | 0x800 (with 0x4000) | the format class word changes and the old texture was NULL |
+| SetPixelShader 0x199BE0 | 0x4800, 0x2000 if `+0x374` | handle NULL; then calls 0x18ECC0 with RenderState[129] |
+| SetTextureStageState paths 0x18F27D / 0x18F2A7 / 0x18F2DC | per-state table 0x1C4160 | not decoded word by word |
+| SetRenderState 0x18E98E | per-state table 0x1C4070 | not decoded word by word |
+| device reset 0x192117 | 0x7F7F | |
+
+**FACTOR0/1 are not lazy.** 0x18ECC0 writes them immediately whenever no pixel
+shader is bound and otherwise only stores RenderState[129]; SetPixelShader(NULL)
+calls it after clearing `+0x370`. So they are compared against the current
+RenderState[129].
+
+A tally of distinct (stage words of the consumed stages, texture-bound bits,
+point sprite, TFACTOR, FOGENABLE, SPECULARENABLE) -> executor-register
+pairings prints every 100,000 fixed-function draws, top 20.
