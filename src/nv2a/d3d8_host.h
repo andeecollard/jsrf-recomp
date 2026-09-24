@@ -136,6 +136,15 @@ typedef struct {
      * last holds the register; the mirror numbers the emissions. */
     uint32_t lt_emit_seq, sp_emit_seq, sp_emit_val;
     uint32_t ffv_control;               /* RECOMP_D3D8_MIRROR_CONTROL: perturb one word per group */
+    /* The inverse model-view (INVERSE_MODELVIEW 0x0580, 12 words): written by
+     * the transform updater 0x1962B0 (dirty 0x200) only when lighting or a
+     * texgen needing eye normals was on at that flush, so the executor holds
+     * what the last WRITING emission computed. imv_emit = that emission's
+     * inputs (a hook in the staged gen), imv_cur = the same read at the draw.
+     * imv_emit_seq / imv_any_seq number the last writing emission and the last
+     * emission of any kind: equal means MODELVIEW 0x0480 came from it too. */
+    uint32_t imv_emit_seen, imv_emit_fresh, imv_emit_seq, imv_any_seq;
+    D3D8FFInvMVIn imv_emit, imv_cur;
 } D3D8HostDrawCheck;
 /* G43: the combiner registers compared, one word each, in this order. */
 #define D3D8_HOST_FFC_N 51u
@@ -200,6 +209,7 @@ typedef struct {
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
 
+#define D3D8_HOST_FFV_GROUPS 5u     /* G42's four and the inverse model-view */
 typedef struct {
     unsigned long long enqueued, replayed, methods_replayed, full, bad_token;
     unsigned long long checks, check_inactive, units_compared, units_match,
@@ -229,19 +239,28 @@ typedef struct {
     /* G42 fixed-function vertex state. Per group g (D3D8_HOST_FFV_*):
      * draws compared, draws with every register matching, words compared,
      * exact, within tolerance (floats only), and the laziness counters. */
-    unsigned long long ffv_draws[4], ffv_all[4], ffv_words[4], ffv_exact[4], ffv_tol[4],
-                       ffv_noemit[4], ffv_fresh[4], ffv_lazy[4], ffv_cur_only[4], ffv_emit_only[4],
-                       ffv_unres[4];
+    unsigned long long ffv_draws[D3D8_HOST_FFV_GROUPS], ffv_all[D3D8_HOST_FFV_GROUPS], ffv_words[D3D8_HOST_FFV_GROUPS],
+                       ffv_exact[D3D8_HOST_FFV_GROUPS], ffv_tol[D3D8_HOST_FFV_GROUPS], ffv_noemit[D3D8_HOST_FFV_GROUPS],
+                       ffv_fresh[D3D8_HOST_FFV_GROUPS], ffv_lazy[D3D8_HOST_FFV_GROUPS], ffv_cur_only[D3D8_HOST_FFV_GROUPS],
+                       ffv_emit_only[D3D8_HOST_FFV_GROUPS], ffv_unres[D3D8_HOST_FFV_GROUPS];
     /* What the title uses, counted at the draws compared. */
     unsigned long long lt_lit, lt_lights[9], lt_dir, lt_point, lt_spot, lt_colormat, lt_twosided,
                        lt_specular, lt_sp_from_builder;
     unsigned long long tg_mode[4][6];            /* per stage: off, EYE, OBJECT, SPHERE, NORMAL, REFLECTION */
     unsigned long long tx_enabled[4], tx_case[D3D8FF_TX_CASES];
     unsigned long long fg_on, fg_table[4], fg_range, fg_color_nonzero;
+    /* The inverse model-view group: draws that needed it (lighting or an
+     * eye-normal texgen at the draw), with NORMALIZENORMALS on, with vertex
+     * blending, where the emission's WORLD*VIEW was singular (the guest sent
+     * 12 stale stack words; not compared), and MODELVIEW 0x0480 checked
+     * exactly against the same emission's product. */
+    unsigned long long imv_needed, imv_normalize, imv_blend, imv_singular,
+                       imv_mv_draws, imv_mv_exact;
     unsigned long long ffv_reg_mismatch_total;
 } D3D8HostStats;
 /* G42 check groups. */
-enum { D3D8_HOST_FFV_TEXGEN = 0, D3D8_HOST_FFV_TEXXFORM = 1, D3D8_HOST_FFV_LIGHT = 2, D3D8_HOST_FFV_FOG = 3 };
+enum { D3D8_HOST_FFV_TEXGEN = 0, D3D8_HOST_FFV_TEXXFORM = 1, D3D8_HOST_FFV_LIGHT = 2, D3D8_HOST_FFV_FOG = 3,
+       D3D8_HOST_FFV_INVMV = 4 };
 /* G41's comparison on its own, for the unit test: counts into the stats and
  * returns 1 if every executor array and the indices agree with D3D. */
 int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
@@ -256,7 +275,10 @@ int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawText
  * their updaters last emitted with; all against the executor's latched
  * registers (e->regs). Fixed-function-only groups (texgen, texture
  * transforms, lighting) are compared only when ffv_vs_flags & 0x12 is 0; fog
- * at every draw. Returns 1 if every compared register agrees. */
+ * at every draw. G42b adds INVERSE_MODELVIEW (0x580, 12 words) from the
+ * inputs of the transform updater's last writing emission, at fixed-function
+ * 3D draws with lighting or an eye-normal texgen. Returns 1 if every compared
+ * register agrees. */
 int d3d8_host_check_ff_vertex(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
 /* Mismatch count of one method (0..0x1FFC) under the G42 check. */
 unsigned long long d3d8_host_ffv_reg_mismatches(uint32_t method);

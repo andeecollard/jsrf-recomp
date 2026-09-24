@@ -321,6 +321,131 @@ static void test_lights(void)
     EQ(o.lit, 0, "vs -> unlit path");
 }
 
+/* ---- the inverse model-view: 0x190750, 0x190A30, 0x1962B0 --------------- */
+static void mat(uint32_t m[16], const float f[16]) { for (unsigned i = 0; i < 16; ++i) m[i] = W(f[i]); }
+static void eq12(const uint32_t *got, const uint32_t want[12], const char *what)
+{
+    char b[96];
+    for (unsigned k = 0; k < 12; ++k) { snprintf(b, sizeof b, "%s [%u]", what, k); EQ(got[k], want[k], b); }
+}
+static void test_inverse(void)
+{
+    static const float I[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    uint32_t m[16], o[16];
+    /* 1. Identity, scaled (NORMALIZENORMALS off). Every cofactor slot is a
+     * difference of products of 0s and 1s, none negative, so the zeros are
+     * +0; det = 1, rsqrt(1) = 1 (test_helpers), out = the first 3 rows of I. */
+    { static const uint32_t want[12] = { 0x3F800000,0,0,0, 0,0x3F800000,0,0, 0,0,0x3F800000,0 };
+      mat(m, I);
+      EQ(d3d8_ff_inverse(o, m, 1), 0, "inverse I ok"); eq12(o, want, "inverse I"); }
+    /* 2. Scale diag(2, 4, .5) with a translation (3, 2, 8) in row 3 (row
+     * vectors): det = 2*4*.5 = 4 exactly; det^2 = 16, rsqrt: guess
+     * (0xBE800000 - 0x41800000) >> 1 = 0x3E800000 = .25, step 1
+     * .25 * (1.47f - .47f*16/16) = .25000000745 -> float .25, step 2
+     * .5*.25*(3 - 1) = .25. Cofactors C00 = 4*.5*1 = 2, C11 = 2*.5 = 1,
+     * C22 = 2*4 = 8, times .25: the inverse's rows .5, .25, 2. No entry is
+     * negative, so every zero is +0. The translation only reaches row 3,
+     * which the guest does not send. */
+    { static const float M[16] = { 2,0,0,0, 0,4,0,0, 0,0,.5f,0, 3,2,8,1 };
+      static const uint32_t want[12] = { 0x3F000000,0,0,0, 0,0x3E800000,0,0, 0,0,0x40000000,0 };
+      static const uint32_t adj[12]  = { 0x40000000,0,0,0, 0,0x3F800000,0,0, 0,0,0x41000000,0 };
+      mat(m, M);
+      EQ(d3d8_ff_inverse(o, m, 1), 0, "inverse S ok"); eq12(o, want, "inverse S");
+      /* NORMALIZENORMALS on: no scale, the cofactors with det's sign (+). */
+      EQ(d3d8_ff_inverse(o, m, 0), 0, "adjugate S ok"); eq12(o, adj, "adjugate S"); }
+    /* 3. diag(-2, 4, .5, 1): det = -4. Traced slot by slot (the names in
+     * d3d8_ff_inverse): t28 = 0*0 - .5*0 = +0, t2c = +0, s18 = .5, e1 = e2 =
+     * e3 = +0; s1c = .5*4 = 2; s04 = .5*-2 = -1; s44 = (+0 - (-0*0)) + -8*1 = -8;
+     * s00 = (0*-2 = -0) - 0 = -0, + 0 = +0; s08 = +0 - (0*-2 = -0) = +0;
+     * s3c = (-0*0) - (-0*1) = -0 - -0 = +0; s4c = (-0*0) - (-8*0) = +0; the
+     * rest +0. det = ((0 + 0) + 0) + 2*-2 = -4.
+     * Unscaled, every slot gets det's sign bit XORed in: +0 -> -0. Scaled,
+     * s = -(rsqrt(16) = .25): 2 -> -.5, -1 -> .25, -8 -> 2, +0 -> -0. */
+    { static const float M[16] = { -2,0,0,0, 0,4,0,0, 0,0,.5f,0, 0,0,0,1 };
+      static const uint32_t adj[12] = { 0xC0000000,0x80000000,0x80000000,0x80000000,
+                                        0x80000000,0x3F800000,0x80000000,0x80000000,
+                                        0x80000000,0x80000000,0x41000000,0x80000000 };
+      static const uint32_t inv[12] = { 0xBF000000,0x80000000,0x80000000,0x80000000,
+                                        0x80000000,0x3E800000,0x80000000,0x80000000,
+                                        0x80000000,0x80000000,0x40000000,0x80000000 };
+      mat(m, M);
+      EQ(d3d8_ff_inverse(o, m, 0), 0, "adjugate N ok"); eq12(o, adj, "adjugate N");
+      EQ(d3d8_ff_inverse(o, m, 1), 0, "inverse N ok"); eq12(o, inv, "inverse N"); }
+    /* 4. D3D's rsqrt is approximate, and the inverse inherits it: diag(3,3,3,1)
+     * has det 27, det^2 = 729 (0x44364000). Guess (0xBE800000 - 0x44364000) >> 1
+     * = 0x3D24E000 = .0402527; step 1 in double: .47f*729 = 342.6299991,
+     * times y0^2, 1.47f minus that, times y0 = .0368249 -> float 0x3D16D5BC;
+     * step 2: .5 * y1 * (3 - 729 y1^2) = .0370352184 -> float 0x3D17B23E.
+     * Cofactors 9, so the diagonal is float(9 * 0x3D17B23E) = 0x3EAAA886 =
+     * .33331698 -- not 1/3 (0x3EAAAAAB): 5e-5 relative, beyond the check's
+     * 1e-5 tolerance, which is why only an exact transcription will do. */
+    { static const float M[16] = { 3,0,0,0, 0,3,0,0, 0,0,3,0, 0,0,0,1 };
+      static const uint32_t want[12] = { 0x3EAAA886,0,0,0, 0,0x3EAAA886,0,0, 0,0,0x3EAAA886,0 };
+      mat(m, M);
+      EQ(d3d8_ff_inverse(o, m, 1), 0, "inverse 3 ok"); eq12(o, want, "inverse 3"); }
+    /* 5. Singular: rows 0 and 1 equal, integers throughout, so det is exactly
+     * 0 and fcomp finds it equal to [0x1C43D0] = +0: -1, output untouched. */
+    { static const float M[16] = { 1,2,3,0, 1,2,3,0, 0,0,1,0, 0,0,0,1 };
+      mat(m, M);
+      for (unsigned k = 0; k < 16; ++k) o[k] = 0xA5A5A5A5u;
+      EQ((uint32_t)d3d8_ff_inverse(o, m, 1), 0xFFFFFFFFu, "singular -> -1");
+      EQ(o[0], 0xA5A5A5A5u, "singular leaves out"); EQ(o[11], 0xA5A5A5A5u, "singular leaves out 11");
+      EQ((uint32_t)d3d8_ff_inverse(o, m, 0), 0xFFFFFFFFu, "singular unscaled -> -1"); }
+    /* 6. 0x190750: rows of a times b, in float. (1 2 3 4) against rows
+     * (1 0 0 0) (0 1 0 0) (0 0 1 0) (10 20 30 1) = (1 + 40, 2 + 80, 3 + 120, 4). */
+    { static const float A[16] = { 1,2,3,4, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      static const float B[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 10,20,30,1 };
+      uint32_t a[16], b[16];
+      mat(a, A); mat(b, B);
+      d3d8_ff_matmul(o, a, b);
+      EQ(o[0], W(41.0f), "matmul r0c0"); EQ(o[1], W(82.0f), "matmul r0c1");
+      EQ(o[2], W(123.0f), "matmul r0c2"); EQ(o[3], W(4.0f), "matmul r0c3"); }
+    /* ... and the order: row (1e8, 1, -1e8, 0) against b = rows (1 0 0 0) x3
+     * sums ((1e8 + 1) + -1e8) in float: 1e8 + 1 rounds back to 1e8 (ulp 8),
+     * so column 0 is 0, not 1. Summed (1e8 + -1e8) + 1 it would be 1. */
+    { static const float A[16] = { 1e8f,1,-1e8f,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      static const float B[16] = { 1,0,0,0, 1,0,0,0, 1,0,0,0, 0,0,0,1 };
+      uint32_t a[16], b[16];
+      mat(a, A); mat(b, B);
+      d3d8_ff_matmul(o, a, b);
+      EQ(o[0], 0, "matmul absorbs: ((1e8 + 1) - 1e8) = 0"); }
+    /* 7. The updater 0x1962B0: WORLD = 2I with translation (1, 2, 3), VIEW =
+     * I with translation (0, 0, 5): WORLD*VIEW rows (2 0 0 0) (0 2 0 0)
+     * (0 0 2 0) (1 2 8 1), all exact. det = 8, det^2 = 64, rsqrt(64) = .125
+     * exactly (as for 16: the guess 0x3E000000 is right and step 1 rounds
+     * back to it); cofactors 4, so rows .5 -- or 4 with NORMALIZENORMALS. */
+    {   static const float Wd[16] = { 2,0,0,0, 0,2,0,0, 0,0,2,0, 1,2,3,1 };
+        static const float Vw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,5,1 };
+        static const uint32_t want[12] = { 0x3F000000,0,0,0, 0,0x3F000000,0,0, 0,0,0x3F000000,0 };
+        static const uint32_t adj[12]  = { 0x40800000,0,0,0, 0,0x40800000,0,0, 0,0,0x40800000,0 };
+        D3D8FFInvMVIn in; D3D8FFInvMV io;
+        memset(&in, 0, sizeof in);
+        mat(in.world, Wd); mat(in.view, Vw);
+        in.lighting = 1; in.dirty = 0x200;
+        d3d8_ff_inverse_modelview(&in, &io);
+        EQ(io.emitted, 1, "imv emitted"); EQ(io.inverse_written, 1, "imv written"); EQ(io.singular, 0, "imv regular");
+        EQ(io.modelview[12], W(1.0f), "imv WV[3][0]"); EQ(io.modelview[14], W(8.0f), "imv WV[3][2]");
+        eq12(io.inverse, want, "imv");
+        in.normalize = 1;                                    /* NORMALIZENORMALS on */
+        d3d8_ff_inverse_modelview(&in, &io); eq12(io.inverse, adj, "imv normalised");
+        in.normalize = 0; in.lighting = 0;                   /* no user: MODELVIEW only */
+        d3d8_ff_inverse_modelview(&in, &io);
+        EQ(io.emitted, 1, "unlit emitted"); EQ(io.inverse_written, 0, "unlit no 0x580");
+        in.eye_normal_mask = 1;                              /* NORMAL_MAP texgen on stage 0 */
+        d3d8_ff_inverse_modelview(&in, &io);
+        EQ(io.inverse_written, 1, "texgen needs 0x580"); eq12(io.inverse, want, "imv texgen");
+        in.dirty = 0x80000200u;                              /* bit 31: nothing at all */
+        d3d8_ff_inverse_modelview(&in, &io);
+        EQ(io.emitted, 0, "dirty bit 31"); EQ(io.inverse_written, 0, "dirty bit 31 no 0x580");
+        in.dirty = 0x200; in.vs_flags = 0x10;                /* programmable: nothing */
+        d3d8_ff_inverse_modelview(&in, &io);
+        EQ(io.emitted, 0, "programmable");
+        in.vs_flags = 0; in.world[0] = 0;                    /* WORLD row 0 all zero: singular */
+        d3d8_ff_inverse_modelview(&in, &io);
+        EQ(io.inverse_written, 1, "singular written"); EQ(io.singular, 1, "singular flagged");
+    }
+}
+
 int main(void)
 {
     test_texgen();
@@ -328,6 +453,7 @@ int main(void)
     test_fog();
     test_helpers();
     test_lights();
+    test_inverse();
     printf("d3d8_ff_vertex_state: %d checks, %s\n", checks, fail ? "FAILED" : "all pass");
     return fail;
 }

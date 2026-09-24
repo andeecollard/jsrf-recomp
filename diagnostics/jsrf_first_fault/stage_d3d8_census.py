@@ -276,7 +276,8 @@ def main():
         for name, fn in (("sub_00197F90", "d3d8m_ff_builder_entry"),    # combiner builder
                          ("sub_00195610", "d3d8m_fog_entry"),            # fog / final combiner
                          ("sub_001957F0", "d3d8m_texxform_entry"),       # G42 texture transforms
-                         ("sub_00195F80", "d3d8m_lights_entry")):        # G42 lighting and material
+                         ("sub_00195F80", "d3d8m_lights_entry"),         # G42 lighting and material
+                         ("sub_001962B0", "d3d8m_xform_entry")):         # G42b transforms, inverse model-view
             if name in plan:
                 raise SystemExit("%s is also a census entry; hook it through the entry path" % name)
             found = [p for p in sorted(dst.glob("recomp_*.c")) if ("void %s(void)\n{" % name) in p.read_text()]

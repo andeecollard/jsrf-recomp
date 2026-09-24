@@ -347,3 +347,103 @@ int d3d8_ff_lights(const D3D8FFLightIn *in, D3D8FFLights *o)
     put(o, 0x03BCu, mask, 0);                                            /* 0x19624C */
     return o->unresolved ? -1 : 0;
 }
+
+/* ---- the inverse model-view: 0x001962B0 / 0x00190750 / 0x00190A30 ------- */
+/* 0x00190750: row i of out = a[i][0]*b.row0 + a[i][1]*b.row1 + a[i][2]*b.row2
+ * + a[i][3]*b.row3, mulps/addps in float, summed ((0 + 1) + 2) + 3. */
+void d3d8_ff_matmul(uint32_t out[16], const uint32_t a[16], const uint32_t b[16])
+{
+    for (unsigned i = 0; i < 4; ++i)
+        for (unsigned c = 0; c < 4; ++c) {
+            float t0, t1, t2, t3, acc;
+            t0 = f_of(a[4 * i + 0]) * f_of(b[0 + c]);
+            t1 = f_of(a[4 * i + 1]) * f_of(b[4 + c]);
+            t2 = f_of(a[4 * i + 2]) * f_of(b[8 + c]);
+            acc = t0 + t1;
+            t3 = f_of(a[4 * i + 3]) * f_of(b[12 + c]);
+            acc = acc + t2;
+            acc = acc + t3;
+            out[4 * i + c] = w_of(acc);
+        }
+}
+
+/* 0x00190A30, x87 throughout: every product and difference in double (the
+ * recompiled guest's x87 stack), rounded to float exactly where the guest
+ * stores a dword (R below); the unrounded 2x2 minors are the ones it keeps on
+ * the stack. The names are the guest's stack slots ([esp+N] after its
+ * `sub esp, 0x54`); the output word k is the slot listed in k_inv_slot. */
+static float R(double x) { return (float)x; }
+int d3d8_ff_inverse(uint32_t out[16], const uint32_t mw[16], int scale)
+{
+    double m[16], det, d03, d12, d13, d23, e1, e2, e3;
+    float s28, s2c, s50, s48, s40, s38, s4c, s44, s3c, s34;
+    float t28, t2c, s18, s14, s10, s0c, s1c, s00, s08, s04, detf, rs, sc;
+    for (unsigned i = 0; i < 16; ++i) m[i] = f_of(mw[i]);
+    /* 0x190A3A..0x190BE2: the cofactors of the last column pair. */
+    s28 = R(m[5] * m[0] - m[4] * m[1]);                             /* 0x190A74 */
+    s2c = R(m[9] * m[0] - m[8] * m[1]);                             /* 0x190AA9 */
+    d03 = m[0] * m[13] - m[12] * m[1];                              /* kept on the stack */
+    d12 = m[9] * m[4] - m[8] * m[5];
+    d13 = m[13] * m[4] - m[12] * m[5];
+    d23 = m[13] * m[8] - m[12] * m[9];
+    s50 = R(((m[2] * d12) - (m[6] * (double)s2c)) + (m[10] * (double)s28));    /* 0x190B22 */
+    s48 = R(((m[6] * d03) - (m[14] * (double)s28)) - (m[2] * d13));            /* 0x190B3E */
+    s40 = R(((m[2] * d23) - (m[10] * d03)) + (m[14] * (double)s2c));           /* 0x190B5A */
+    s38 = R(((m[10] * d13) - (m[14] * d12)) - (m[6] * d23));                   /* 0x190B74 */
+    s4c = R((((double)s2c * m[7]) - ((double)s28 * m[11])) - (d12 * m[3]));    /* 0x190B92 */
+    s44 = R(((d13 * m[3]) - (d03 * m[7])) + ((double)s28 * m[15]));            /* 0x190BAE */
+    s3c = R(((d03 * m[11]) - ((double)s2c * m[15])) - (d23 * m[3]));           /* 0x190BCA */
+    s34 = R(((d23 * m[7]) - (d13 * m[11])) + (d12 * m[15]));                   /* 0x190BE2 */
+    /* 0x190BE6..0x190D61: the first column pair. */
+    t28 = R(m[6] * m[11] - m[10] * m[7]);                           /* 0x190C2E */
+    t2c = R(m[6] * m[15] - m[14] * m[7]);                           /* 0x190C44 */
+    s18 = R(m[10] * m[15] - m[14] * m[11]);                         /* 0x190C75 */
+    e1 = m[2] * m[11] - m[10] * m[3];                               /* kept on the stack */
+    e2 = m[2] * m[7] - m[6] * m[3];
+    e3 = m[2] * m[15] - m[14] * m[3];
+    s14 = R(((e1 * m[5]) - (e2 * m[9])) - ((double)t28 * m[1]));               /* 0x190C9B */
+    s10 = R((((double)t2c * m[1]) - (e3 * m[5])) + (e2 * m[13]));              /* 0x190CB3 */
+    s0c = R(((e3 * m[9]) - (e1 * m[13])) - ((double)s18 * m[1]));              /* 0x190CCB */
+    s1c = R((((double)s18 * m[5]) - ((double)t2c * m[9])) + ((double)t28 * m[13]));   /* 0x190CE7 */
+    s00 = R((((double)t28 * m[0]) - (e1 * m[4])) + (e2 * m[8]));               /* 0x190D09 */
+    s08 = R(((m[4] * e3) - (e2 * m[12])) - ((double)t2c * m[0]));              /* 0x190D27 */
+    s04 = R((((double)s18 * m[0]) - (e3 * m[8])) + (e1 * m[12]));              /* 0x190D41 */
+    s18 = R((((double)t2c * m[8]) - ((double)t28 * m[12])) - ((double)s18 * m[4]));   /* 0x190D61 */
+    /* 0x190D65: det down column 0, in double; fst rounds a copy, fcomp tests
+     * the double against +0.0 ([0x1C43D0]). Equal: return -1, out untouched. */
+    det = (double)s14 * m[12];
+    det = det + (double)s10 * m[8];
+    det = det + (double)s0c * m[4];
+    det = det + (double)s1c * m[0];
+    detf = R(det);
+    if (det == 0.0) return -1;
+    {
+        const float slot[16] = { s1c, s0c, s10, s14,  s18, s04, s08, s00,
+                                 s34, s3c, s44, s4c,  s38, s40, s48, s50 };
+        uint32_t sign = w_of(detf) & 0x80000000u;
+        if (!scale) {                                               /* 0x190E9F: xor the sign */
+            for (unsigned k = 0; k < 16; ++k) out[k] = w_of(slot[k]) ^ sign;
+            return 0;
+        }
+        /* 0x190DB3: s = |rsqrt(det^2)| with det's sign, then each slot * s. */
+        rs = R(d3d8_ff_rsqrt(R((double)detf * (double)detf)));
+        sc = f_of(sign | w_of(rs));
+        for (unsigned k = 0; k < 16; ++k) out[k] = w_of(R((double)sc * (double)slot[k]));
+    }
+    return 0;
+}
+
+/* 0x001962B0, the part that reaches 0x0480 and 0x0580. */
+void d3d8_ff_inverse_modelview(const D3D8FFInvMVIn *in, D3D8FFInvMV *out)
+{
+    uint32_t inv[16];
+    memset(out, 0, sizeof *out);
+    if (in->dirty & 0x80000000u) return;                            /* 0x1962C6 js */
+    if (in->vs_flags & 0x12u) return;                               /* 0x1962D5 */
+    out->emitted = 1;
+    d3d8_ff_matmul(out->modelview, in->world, in->view);            /* 0x196300: WORLD * VIEW */
+    if (!in->eye_normal_mask && !in->lighting) return;              /* 0x19631E */
+    out->inverse_written = 1;
+    if (d3d8_ff_inverse(inv, out->modelview, in->normalize == 0) < 0) { out->singular = 1; return; }
+    memcpy(out->inverse, inv, sizeof out->inverse);                 /* 0x19635F rep movsd, 12 words */
+}
