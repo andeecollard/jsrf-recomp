@@ -146,15 +146,41 @@ static NSString *const k_src =
  " return float4(c.rgb, clamp(c.a, 0.0f, 1.0f)); }\n";
 
 static id<MTLDevice> s_dev;
+static unsigned long long s_ns_texture, s_ns_external;      /* in-process timers for draw mode's report */
 static id<MTLCommandQueue> s_queue;
 static id<MTLRenderPipelineState> s_pso, s_pso_st;
 static id<MTLTexture> s_dummy;
 static id<MTLDepthStencilState> s_dss[16];
-static id<MTLDepthStencilState> depth_state(const D3D8Host2DDraw *d)
+/* Stencil states, built as hw_depth_state_for builds them, keyed by its fields. */
+#define DSS_ST 32
+static struct { uint32_t k[9]; id<MTLDepthStencilState> dss; } s_dss_st[DSS_ST];
+static unsigned s_dss_st_n;
+static id<MTLDepthStencilState> depth_state(const D3D8Host2DDraw *d, int with_stencil)
 {
     int cmp = d->depth_test ? nv2a_metal_compare_func(d->depth_func) : NV2A_MTL_CMP_ALWAYS;
     unsigned wr = d->depth_test && d->depth_write, key;
     if (cmp < 0) cmp = NV2A_MTL_CMP_ALWAYS;           /* as the executor: unrecognised is ALWAYS */
+    if (with_stencil && d->stencil_test) {
+        uint32_t k[9] = { (uint32_t)cmp, wr, d->stencil_func, d->stencil_fail, d->stencil_zfail, d->stencil_zpass,
+                          d->stencil_func_mask & 255u, d->stencil_write ? (d->stencil_mask & 255u) : 0u, 1u };
+        for (unsigned i = 0; i < s_dss_st_n; ++i) if (!memcmp(s_dss_st[i].k, k, sizeof k)) return s_dss_st[i].dss;
+        int sc = nv2a_metal_compare_func(d->stencil_func), f = nv2a_metal_stencil_op(d->stencil_fail),
+            zf = nv2a_metal_stencil_op(d->stencil_zfail), zp = nv2a_metal_stencil_op(d->stencil_zpass);
+        if (sc < 0 || f < 0 || zf < 0 || zp < 0) return nil;            /* the build refused these already */
+        MTLDepthStencilDescriptor *ds = [MTLDepthStencilDescriptor new];
+        ds.depthCompareFunction = (MTLCompareFunction)cmp;
+        ds.depthWriteEnabled = wr ? YES : NO;
+        MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+        sd.stencilCompareFunction = (MTLCompareFunction)sc;
+        sd.stencilFailureOperation = (MTLStencilOperation)f;
+        sd.depthFailureOperation = (MTLStencilOperation)zf;
+        sd.depthStencilPassOperation = (MTLStencilOperation)zp;
+        sd.readMask = k[6]; sd.writeMask = k[7];
+        ds.frontFaceStencil = sd; ds.backFaceStencil = sd;
+        id<MTLDepthStencilState> dss = [s_dev newDepthStencilStateWithDescriptor:ds];
+        if (dss && s_dss_st_n < DSS_ST) { memcpy(s_dss_st[s_dss_st_n].k, k, sizeof k); s_dss_st[s_dss_st_n++].dss = dss; }
+        return dss;
+    }
     key = ((unsigned)cmp & 7u) | (wr << 3);
     if (!s_dss[key]) {
         MTLDepthStencilDescriptor *ds = [MTLDepthStencilDescriptor new];
@@ -239,54 +265,86 @@ static id<MTLSamplerState> sampler_for(const D3D8H2DTexture *t)
     return s_samplers[slot] = [s_dev newSamplerStateWithDescriptor:d];
 }
 
-/* Decoded textures, keyed by what D3D names plus a hash of the bytes: a 2D
- * pass reuses its font and HUD atlases every frame, but a render target used
- * as a texture changes under the same address. */
-#define TEX_CACHE 32
-static struct { uint32_t addr, fmt, size; uint64_t hash; unsigned long long used; id<MTLTexture> tex; } s_tc[TEX_CACHE];
-static unsigned long long s_tc_clock, s_tc_hits, s_tc_builds;
-static uint64_t fnv64(const uint8_t *p, size_t n)
+/* DECODED TEXTURES, keyed by what D3D names (Data, Format, Size) and
+ * validated by a hash of the bytes -- a render target used as a texture
+ * changes under the same address.
+ *
+ * SIZED FOR A 3D FRAME. The 2D shadow needed a handful; fixed-function draw
+ * mode touches every texture of the scene each frame, and a 32-entry LRU
+ * under that load re-decoded and re-uploaded textures on nearly every draw.
+ * So: up to TEX_CACHE entries within TEX_BUDGET bytes, and each entry's bytes
+ * are hashed at most ONCE PER FLIP (a word-wise hash, 8 bytes a step), not
+ * once per draw. A texture rewritten mid-frame after its first use that
+ * frame is the one case this misses, and the shadow comparison is where it
+ * would show. */
+#define TEX_CACHE 512
+#define TEX_BUDGET ((size_t)256u << 20)
+static struct { uint32_t addr, fmt, size; uint64_t hash; unsigned long long used, checked; size_t bytes; id<MTLTexture> tex; } s_tc[TEX_CACHE];
+static unsigned long long s_tc_clock, s_tc_hits, s_tc_builds, s_tc_hashes;
+static size_t s_tc_bytes;
+static uint64_t hash64(const uint8_t *p, size_t n)
 {
-    uint64_t h = 0xCBF29CE484222325ull;
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
+    uint64_t h = 0xCBF29CE484222325ull, w;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
     return h;
 }
+unsigned long long d3d8_host_2d_flip_count(void);
 static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, size_t ram_size)
 {
     unsigned mips = mip_levels(t), w = t->width, h = t->height, pitch = t->pitch;
     size_t total = 0;
+    unsigned long long flip = d3d8_host_2d_flip_count() + 1u;       /* 0 never matches a fresh entry */
     for (unsigned l = 0; l < mips; ++l) {
         total += nv2a_texture_level_bytes((int)t->fmt, w, h, pitch);
         pitch = nv2a_texture_next_pitch((int)t->fmt, w, pitch); w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
     }
     if (!total || (uint64_t)t->addr + total > ram_size) { s_err = "host 2d: texture bounds"; return nil; }
     const uint8_t *src = ram + t->addr;
-    uint64_t hash = fnv64(src, total);
-    unsigned victim = 0;
-    for (unsigned i = 0; i < TEX_CACHE; ++i) {
-        if (s_tc[i].tex && s_tc[i].addr == t->addr && s_tc[i].fmt == t->d3d_format && s_tc[i].size == t->d3d_size && s_tc[i].hash == hash) {
-            s_tc[i].used = ++s_tc_clock; ++s_tc_hits; return s_tc[i].tex;
+    int slot = -1;
+    uint64_t hash = 0;
+    for (unsigned i = 0; i < TEX_CACHE; ++i)
+        if (s_tc[i].tex && s_tc[i].addr == t->addr && s_tc[i].fmt == t->d3d_format && s_tc[i].size == t->d3d_size) { slot = (int)i; break; }
+    if (slot >= 0) {
+        if (s_tc[slot].checked == flip) { s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
+        hash = hash64(src, total); ++s_tc_hashes;
+        if (s_tc[slot].hash == hash) { s_tc[slot].checked = flip; s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
+        s_tc_bytes -= s_tc[slot].bytes; s_tc[slot].tex = nil;            /* rewritten: rebuild in place */
+    } else {
+        hash = hash64(src, total); ++s_tc_hashes;
+        size_t need = (size_t)t->width * t->height * 4u * (mips > 1 ? 2u : 1u);
+        for (;;) {                                                         /* a free entry within the budget */
+            int freei = -1, lru = -1;
+            for (unsigned i = 0; i < TEX_CACHE; ++i) {
+                if (!s_tc[i].tex) { if (freei < 0) freei = (int)i; continue; }
+                if (lru < 0 || s_tc[i].used < s_tc[lru].used) lru = (int)i;
+            }
+            if (freei >= 0 && s_tc_bytes + need <= TEX_BUDGET) { slot = freei; break; }
+            if (lru < 0) { slot = freei >= 0 ? freei : 0; break; }
+            s_tc_bytes -= s_tc[lru].bytes; s_tc[lru].tex = nil;
         }
-        if (s_tc[i].used < s_tc[victim].used) victim = i;
     }
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                   width:t->width height:t->height mipmapped:NO];
     d.mipmapLevelCount = mips; d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModeShared;
     id<MTLTexture> tex = [s_dev newTextureWithDescriptor:d];
     uint8_t *rgba = malloc((size_t)t->width * t->height * 4u);
-    size_t off = 0;
+    size_t off = 0, bytes = 0;
     w = t->width; h = t->height; pitch = t->pitch;
     int ok = tex && rgba;
     for (unsigned l = 0; ok && l < mips; ++l) {
         size_t level = nv2a_texture_level_bytes((int)t->fmt, w, h, pitch);
         if (!nv2a_texture_decode_rgba8(src + off, total - off, w, h, pitch, (int)t->fmt, rgba)) { ok = 0; break; }
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:l withBytes:rgba bytesPerRow:(NSUInteger)w * 4u];
+        bytes += (size_t)w * h * 4u;
         off += level; pitch = nv2a_texture_next_pitch((int)t->fmt, w, pitch); w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
     }
     free(rgba);
     if (!ok) { s_err = "host 2d: texture decode"; return nil; }
-    s_tc[victim].addr = t->addr; s_tc[victim].fmt = t->d3d_format; s_tc[victim].size = t->d3d_size;
-    s_tc[victim].hash = hash; s_tc[victim].used = ++s_tc_clock; s_tc[victim].tex = tex; ++s_tc_builds;
+    s_tc[slot].addr = t->addr; s_tc[slot].fmt = t->d3d_format; s_tc[slot].size = t->d3d_size; s_tc[slot].bytes = bytes;
+    s_tc[slot].hash = hash; s_tc[slot].checked = flip; s_tc[slot].used = ++s_tc_clock; s_tc[slot].tex = tex; ++s_tc_builds;
+    s_tc_bytes += bytes;
     return tex;
 }
 
@@ -313,6 +371,7 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineStat
     memcpy(u.ci, d->ci, sizeof u.ci); memcpy(u.ai, d->ai, sizeof u.ai);
     memcpy(u.co, d->co, sizeof u.co); memcpy(u.ao, d->ao, sizeof u.ao);
     memcpy(u.k0, d->k0, sizeof u.k0); memcpy(u.k1, d->k1, sizeof u.k1);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     for (unsigned s = 0; s < 4; ++s) {
         if (!(d->tmask & (1u << s))) continue;
         const D3D8H2DTexture *t = &d->tex[s];
@@ -321,17 +380,28 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineStat
         u.tw[s] = (float)t->width; u.th[s] = (float)t->height; u.lod_bias[s] = t->lod_bias;
         if (t->linear) u.lin_mask |= 1u << s;
     }
-    id<MTLBuffer> vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)d->nverts * sizeof(D3D8H2DVertex)
-                                         options:MTLResourceStorageModeShared];
-    if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
+    s_ns_texture += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    size_t vbytes = (size_t)d->nverts * sizeof(D3D8H2DVertex);
+    id<MTLBuffer> vb = nil;
+    if (vbytes > 4096) {                     /* Metal's inline limit; below it, setVertexBytes */
+        vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
+        if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
+    }
     [enc setRenderPipelineState:pso];
-    [enc setDepthStencilState:depth_state(d)];
+    {   /* The stencil unit only where the pass has one (draw mode); the
+         * shadow's colour comparison does not depend on it under ALWAYS. */
+        id<MTLDepthStencilState> dss = depth_state(d, pso == s_pso_st);
+        if (!dss) { s_err = "host 2d: depth-stencil state"; return 0; }
+        [enc setDepthStencilState:dss];
+        if (pso == s_pso_st && d->stencil_test) [enc setStencilReferenceValue:d->stencil_ref & 255u];
+    }
     [enc setDepthClipMode:MTLDepthClipModeClamp];
     [enc setCullMode:MTLCullModeNone];
     MTLScissorRect sc = { (NSUInteger)(sx0 - (int32_t)ox), (NSUInteger)(sy0 - (int32_t)oy),
                           (NSUInteger)(sx1 - sx0 + 1), (NSUInteger)(sy1 - sy0 + 1) };
     [enc setScissorRect:sc];
-    [enc setVertexBuffer:vb offset:0 atIndex:0];
+    if (vb) [enc setVertexBuffer:vb offset:0 atIndex:0];
+    else [enc setVertexBytes:d->verts length:(NSUInteger)vbytes atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:1];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
     for (unsigned s = 0; s < 4; ++s) {
@@ -386,6 +456,15 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
 }
 
 /* ---- draw mode: into the executor's bound surface ---- */
+void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *tex_builds, unsigned long long *tex_hashes,
+                              unsigned long long *ns_texture, unsigned long long *ns_external)
+{
+    if (tex_hits) *tex_hits = s_tc_hits;
+    if (tex_builds) *tex_builds = s_tc_builds;
+    if (tex_hashes) *tex_hashes = s_tc_hashes;
+    if (ns_texture) *ns_texture = s_ns_texture;
+    if (ns_external) *ns_external = s_ns_external;
+}
 static unsigned long long s_binds;
 unsigned long long d3d8_host_2d_metal_binds(void) { return s_binds; }
 typedef struct { const D3D8Host2DDraw *d; const uint8_t *ram; size_t ram_size; int ok; } ExtCtx;
@@ -400,19 +479,22 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
 {
     ExtCtx x = { d, ram, ram_size, 0 };
     int drawn;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (!init()) return 0;
     @autoreleasepool {
-        uint8_t *zs = d->depth_test ? (uint8_t *)ram + d->zs_addr : NULL;
-        drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, d->depth_test && d->depth_write, external_encode, &x);
+        int uses_zs = d->depth_test || d->stencil_test;
+        int writes_zs = (d->depth_test && d->depth_write) || (d->stencil_test && d->stencil_write && (d->stencil_mask & 255u));
+        uint8_t *zs = uses_zs ? (uint8_t *)ram + d->zs_addr : NULL;
+        drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, writes_zs, external_encode, &x);
         /* Not bound: bind it the way the executor's own draw into it would
          * (nv2a_metal_bind is that code, shared), then draw. The executor's
          * next draw into this target finds it bound, as after its own swap. */
         if (drawn == -2 || drawn == -3 || drawn == -4) {
             size_t tsz = (size_t)d->rt_pitch * d->rt_h, zsz = (size_t)d->zs_pitch * d->rt_h;
             if (nv2a_metal_bind((uint8_t *)ram + d->rt_addr, tsz, d->rt_w, d->rt_h, d->rt_pitch, zs, d->zs_pitch, zsz,
-                                d->depth_test) == 0) {
+                                uses_zs) == 0) {
                 ++s_binds;
-                drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, d->depth_test && d->depth_write, external_encode, &x);
+                drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, writes_zs, external_encode, &x);
             }
         }
     }
@@ -424,5 +506,6 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
     case -4: s_err = "target not bound: executor holds another depth surface"; break;
     default: if (x.ok) s_err = "host encode declined"; break;
     }
+    s_ns_external += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     return drawn == 1 && x.ok;
 }

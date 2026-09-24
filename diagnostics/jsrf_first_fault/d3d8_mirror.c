@@ -71,8 +71,8 @@ static uint32_t m_tex[4], m_serial;
 static const uint32_t m_state_methods[11] = D3D8_HOST_STATE_METHODS;
 static uint32_t m_state_val[11], m_state_seen;
 /* G51.1: the Simple pushes the host's 2D fragment stage needs beyond those. */
-static const uint32_t m_x_methods[8] = D3D8_HOST_2D_EXTRA_METHODS;
-static uint32_t m_x_val[8], m_x_seen;
+static const uint32_t m_x_methods[D3D8_HOST_2D_EXTRA_N] = D3D8_HOST_2D_EXTRA_METHODS;
+static uint32_t m_x_val[D3D8_HOST_2D_EXTRA_N], m_x_seen;
 
 /* SetRenderState_ZEnable / _StencilEnable(value): these reach the GPU through
  * their own setters, not Simple. What the renderer needs is "enabled or not",
@@ -122,7 +122,7 @@ void d3d8m_simple(uint32_t hdr, uint32_t value)
     if (!d3d8m_on() || ((hdr >> 18) & 0x7FFu) != 1u || ((hdr >> 13) & 7u)) return;
     for (unsigned k = 0; k < 11; ++k)
         if (m_state_methods[k] == method) { m_state_val[k] = value; m_state_seen |= 1u << k; }
-    for (unsigned k = 0; k < 8; ++k)
+    for (unsigned k = 0; k < D3D8_HOST_2D_EXTRA_N; ++k)
         if (m_x_methods[k] == method) { m_x_val[k] = value; m_x_seen |= 1u << k; }
 }
 static unsigned long long m_no_token;

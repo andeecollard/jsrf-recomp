@@ -5163,6 +5163,7 @@ int main(int argc, char **argv)
                  * executor's bound surface and the executor skips the batches. */
                 be.external_draw = d3d8_host_2d_metal_external;
                 be.external_binds = d3d8_host_2d_metal_binds;
+                be.external_stats = d3d8_host_2d_metal_stats;
                 be.exec_skip = nv2a_pb_exec_host_skip;
                 be.exec_skipped = nv2a_pb_exec_host_skipped;
                 /* G51.3: the FF shadow evaluates vertices with the executor's own unit. */

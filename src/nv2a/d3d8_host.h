@@ -39,6 +39,7 @@ void d3d8_host_install(void);
  * compared with what the executor reconstructed from the NV2A commands.
  * Agreement means the host can describe the draw from D3D alone -- which is
  * what a renderer fed at the D3D boundary needs. */
+#define D3D8_HOST_2D_EXTRA_N 15u   /* entries of D3D8_HOST_2D_EXTRA_METHODS, below */
 typedef struct {
     uint32_t serial;           /* D3D draw number, for the report */
     uint32_t tex[4];           /* D3DBaseTexture* per stage, 0 = none */
@@ -151,7 +152,7 @@ typedef struct {
      * D3D's last SetRenderState_Simple push of each method in
      * D3D8_HOST_2D_EXTRA_METHODS, and x_seen which of them it pushed at all. */
     uint32_t idx_ptr;
-    uint32_t x_val[8], x_seen;
+    uint32_t x_val[D3D8_HOST_2D_EXTRA_N], x_seen;
     /* G51.1: what the draw CALL saw, captured in d3d8m_after_draw while
      * D3D's pushbuffer copy of it is fresh. D3D copies a DrawIndexedVertices'
      * indices into the ring (ARRAY_ELEMENT16) as it is called, and the title
@@ -174,8 +175,12 @@ typedef struct {
 } D3D8HostDrawCheck;
 /* G51.1: the Simple-pushed methods the host's 2D draw needs beyond
  * D3D8_HOST_STATE_METHODS: CULL_FACE_ENABLE, DITHER_ENABLE, BLEND_COLOR,
- * COLOR_MASK, CULL_FACE, FRONT_FACE, ZMIN_MAX_CONTROL, FOG_ENABLE. */
-#define D3D8_HOST_2D_EXTRA_METHODS { 0x308, 0x310, 0x34C, 0x358, 0x39C, 0x3A0, 0x1D78, 0x2A4 }
+ * COLOR_MASK, CULL_FACE, FRONT_FACE, ZMIN_MAX_CONTROL, FOG_ENABLE, and the
+ * stencil unit's STENCIL_MASK (write mask), STENCIL_FUNC, _FUNC_REF,
+ * _FUNC_MASK, STENCIL_OP_FAIL, _ZFAIL, _ZPASS. */
+#define D3D8_HOST_2D_EXTRA_METHODS { 0x308, 0x310, 0x34C, 0x358, 0x39C, 0x3A0, 0x1D78, 0x2A4, \
+                                     0x360, 0x364, 0x368, 0x36C, 0x370, 0x374, 0x378 }
+
 /* G43: the combiner registers compared, one word each, in this order. */
 #define D3D8_HOST_FFC_N 51u
 typedef struct {

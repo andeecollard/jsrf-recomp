@@ -4562,6 +4562,21 @@ int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *o
     return 1;
 }
 
+int nv2a_metal_stencil_peek(const uint8_t *depth, unsigned w, unsigned h, uint8_t *out)
+{
+    id<MTLTexture> tex = nil;
+    if (!depth || !out || !w || !h) return 0;
+    if (depth_target == depth && hw_stencil_tex) tex = hw_stencil_tex;
+    for (unsigned i = 0; !tex && i < surface_slots_used(); i++)
+        if (surf_slot[i].valid && surf_slot[i].depth == depth && surf_slot[i].hw_stencil)
+            tex = surf_slot[i].hw_stencil;
+    if (!tex || tex.width < w || tex.height < h) return 0;
+    batch_flush();
+    if (last_command) [last_command waitUntilCompleted];
+    [tex getBytes:out bytesPerRow:(NSUInteger)w fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    return 1;
+}
+
 /* G51.1 draw mode. See nv2a_metal.h. Nothing on the executor's own path
  * calls it. It uses the executor's queue, so its pass is ordered after every
  * draw the executor has committed and before every one it commits next, and
@@ -4576,6 +4591,41 @@ int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int wr
     if (!surface || !surface_valid || !hw_depth_tex || !hw_stencil_tex) return -2;
     if (surface_target != target) return -3;
     if (depth && depth_target != depth) return -4;
+    /* JOIN THE EXECUTOR'S BATCH when batching is on. Its encoder is one pass
+     * over exactly these attachments (the hardware path's: surface,
+     * hw_depth_tex, hw_stencil_tex -- "an encoder already open is one whose
+     * pass descriptor still describes the live surface"), and every piece of
+     * encoder state a host draw sets -- pipeline, depth-stencil state, depth
+     * clip, vertex buffers 0/1, fragment buffer 0, textures and samplers 0-3,
+     * scissor, cull mode None -- is set again by the executor's next draw
+     * before it draws (cull None is its CPU-path default; its GPU-vertex path
+     * sets cull and winding itself). So a host draw is one more draw in the
+     * batch: no flush, no command buffer of its own, and the executor's
+     * batching is not broken in two around it. The per-draw pass below stays
+     * for RECOMP_METAL_BATCH=0. */
+    if (batch_on()) {
+        if (batch_encoder && !batch_encoder_hw) batch_flush();
+        if (!batch_encoder) {
+            MTLRenderPassDescriptor *bp = [MTLRenderPassDescriptor renderPassDescriptor];
+            bp.colorAttachments[0].texture = surface;
+            bp.colorAttachments[0].loadAction = MTLLoadActionLoad; bp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            bp.depthAttachment.texture = hw_depth_tex;
+            bp.depthAttachment.loadAction = MTLLoadActionLoad; bp.depthAttachment.storeAction = MTLStoreActionStore;
+            bp.stencilAttachment.texture = hw_stencil_tex;
+            bp.stencilAttachment.loadAction = MTLLoadActionLoad; bp.stencilAttachment.storeAction = MTLStoreActionStore;
+            batch_command = [queue commandBuffer];
+            batch_encoder = batch_command ? [batch_command renderCommandEncoderWithDescriptor:bp] : nil;
+            if (!batch_command || !batch_encoder) { batch_command = nil; batch_encoder = nil; return 0; }
+            if (pass_fence_on() && g_pass_fence) [batch_encoder waitForFence:g_pass_fence beforeStages:MTLRenderStageVertex];
+            if (mtl_cb_stats()) g_mtl_cbufs++;
+        }
+        batch_encoder_hw = 1;
+        int bok = encode((__bridge void *)batch_encoder, surface_width, surface_height, ctx);
+        ++batch_draws;
+        if (batch_cap() && batch_draws >= batch_cap()) batch_flush();
+        if (bok) { surface_dirty = 1; if (writes_depth) depth_dirty = 1; }
+        return bok != 0;
+    }
     batch_flush();
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = surface;
