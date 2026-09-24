@@ -23,6 +23,9 @@ LIFT = {
     "xinput": ("xil", "xinput_lift.c", "RECOMP_XINPUT_LIFT=1"),
     "cri":    ("crl", "cri_lift.c", "RECOMP_CRI_SPINNER_LIFT (default on)"),
     "chapter": ("chs", "chapter_select.c", "RECOMP_CHAPTER_SELECT=<chapter>[:<mission>]"),
+    # Same file, its own switch: a lib is one on/off gate, and the jump must be
+    # able to be on while the redirect's own switch is not.
+    "chapterjump": ("chj", "chapter_select.c", "RECOMP_CHAPTER_JUMP=<chapter>[:<mission>]"),
 }
 
 # Argument logging: name -> (number of stack args to capture, post-call hook).

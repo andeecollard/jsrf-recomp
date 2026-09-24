@@ -1,4 +1,4 @@
 [
-  {"address": "0x0007CAE0", "name": "CActSequence_PrepareTutorial", "lib": "chapter",
-   "note": "CActSequence::PrepareTutorial; replaced by KeybadeBlox's JSRF-ChapterSelect mod, and by chapter_select.c here under RECOMP_CHAPTER_SELECT"}
+  {"address": "0x0007CAE0", "name": "CActSequence_PrepareTutorial", "lib": "chapter", "note": "CActSequence::PrepareTutorial; replaced by KeybadeBlox's JSRF-ChapterSelect mod, and by chapter_select.c here under RECOMP_CHAPTER_SELECT"},
+  {"address": "0x0007CA70", "name": "CActSequence_WaitEndStoryOrVsMission", "lib": "chapterjump", "note": "CActSequence::WaitEndStoryOrVsMission; reproduced by chapter_select.c, which also ends the story mission into the chapter redirect under RECOMP_CHAPTER_JUMP"}
 ]
