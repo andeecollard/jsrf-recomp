@@ -306,6 +306,10 @@ void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *
  * interpreter, for tests that hold the two equal. Pipelines built, cache hits,
  * draws that fell back to the interpreter, and compile time in ns. */
 void d3d8_host_2d_metal_set_spec(int on);
+/* 1: compile a specialised pipeline in line on its first draw (the tests);
+ * 0 (the default): compile asynchronously, the generic interpreter drawing
+ * that key meanwhile. RECOMP_D3D8_HOST_BISECT bit 2048 forces in line. */
+void d3d8_host_2d_metal_set_spec_sync(int on);
 void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long *hits, unsigned long long *fallback,
                                    unsigned long long *compile_ns);
 /* RECOMP_D3D8_HOST_BISECT=<mask>: each bit turns one G51.3 speed change
@@ -321,6 +325,7 @@ void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long
  *  256 refuse the stencil class again (func ALWAYS; drawn by the host since 645a7e6)
  *  512 refuse points/lines again (replaced by nothing since 645a7e6)
  * 1024 bind a target with D3D's geometry, not the executor's slot's
+ * 2048 compile specialised pipelines in line (a first-use hitch), not asynchronously
  * 0x3FF reverts all of it: draw mode as 688bea4 drew, whose frames were clean.
  * Read once; 0 or unset changes nothing. The test sets it directly. */
 unsigned d3d8_host_2d_bisect(void);

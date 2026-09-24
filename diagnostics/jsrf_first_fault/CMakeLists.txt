@@ -1237,6 +1237,9 @@ if(APPLE)
     # RECOMP_D3D8_HOST_BISECT arm that keeps the batch joined.
     add_test(NAME jsrf_d3d8_host_2d_seq COMMAND jsrf_d3d8_host_2d_test seq)
     set_tests_properties(jsrf_d3d8_host_2d_seq PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    # A deferred swap leaves a surface owing guest RAM; the host's texture read pays.
+    add_test(NAME jsrf_d3d8_host_2d_defer COMMAND jsrf_d3d8_host_2d_test defer)
+    set_tests_properties(jsrf_d3d8_host_2d_defer PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1;RECOMP_METAL_DEFER_SWAP=1")
     # The same with the executor's batching off: host draws take their own pass.
     add_test(NAME jsrf_d3d8_host_2d_draw_nobatch COMMAND jsrf_d3d8_host_2d_test draw)
     set_tests_properties(jsrf_d3d8_host_2d_draw_nobatch PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1;RECOMP_METAL_BATCH=0")

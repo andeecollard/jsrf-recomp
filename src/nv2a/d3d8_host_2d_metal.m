@@ -56,6 +56,7 @@
 #include "nv2a_metal_state.h"
 #include "nv2a_metal.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -353,11 +354,22 @@ static id<MTLSamplerState> sampler_for(const D3D8H2DTexture *t)
 static struct { uint32_t addr, fmt, size; uint64_t hash; unsigned long long used, checked; size_t bytes; id<MTLTexture> tex; } s_tc[TEX_CACHE];
 static unsigned long long s_tc_clock, s_tc_hits, s_tc_builds, s_tc_hashes;
 static size_t s_tc_bytes;
+static unsigned s_tc_hw;          /* entries ever used: the lookup scans no further */
+/* Four independent lanes, 32 bytes a step: the dependency chain of a
+ * single-lane multiply hash was the texture cost's floor (27 first-use hashes
+ * of ~170 KB a frame, 14.8 us a replaced draw in g51fix). Same strength per
+ * lane; the lanes are folded at the end. */
 static uint64_t hash64(const uint8_t *p, size_t n)
 {
-    uint64_t h = 0xCBF29CE484222325ull, w;
+    uint64_t h0 = 0xCBF29CE484222325ull, h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full, h3 = 0x165667B19E3779F9ull, w0, w1, w2, w3;
     size_t i = 0;
-    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; i + 32 <= n; i += 32) {
+        memcpy(&w0, p + i, 8); memcpy(&w1, p + i + 8, 8); memcpy(&w2, p + i + 16, 8); memcpy(&w3, p + i + 24, 8);
+        h0 = (h0 ^ w0) * 0x100000001B3ull; h1 = (h1 ^ w1) * 0x100000001B3ull;
+        h2 = (h2 ^ w2) * 0x100000001B3ull; h3 = (h3 ^ w3) * 0x100000001B3ull;
+        h0 ^= h0 >> 29; h1 ^= h1 >> 29; h2 ^= h2 >> 29; h3 ^= h3 >> 29;
+    }
+    uint64_t h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ (h3 * 0x165667B19E3779F9ull) ^ (uint64_t)n;
     for (; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
     return h;
 }
@@ -375,10 +387,16 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
     const uint8_t *src = ram + t->addr;
     int slot = -1;
     uint64_t hash = 0;
-    for (unsigned i = 0; i < TEX_CACHE; ++i)
+    /* RENDER-TO-TEXTURE UNDER A DEFERRED SWAP. With RECOMP_METAL_DEFER_SWAP a
+     * surface the executor has swapped away from keeps its pixels on the GPU
+     * and owes guest RAM; the executor pays that debt when one of its own
+     * draws samples the bytes, and so must the host, which decodes from guest
+     * RAM. A payment means the bytes just changed: re-hash. */
+    int paid = nv2a_metal_pay_debt(src, total);
+    for (unsigned i = 0; i < s_tc_hw; ++i)
         if (s_tc[i].tex && s_tc[i].addr == t->addr && s_tc[i].fmt == t->d3d_format && s_tc[i].size == t->d3d_size) { slot = (int)i; break; }
     if (slot >= 0) {
-        if (s_tc[slot].checked == flip && !(d3d8_host_2d_bisect() & 16u)) { s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
+        if (s_tc[slot].checked == flip && !paid && !(d3d8_host_2d_bisect() & 16u)) { s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
         hash = hash64(src, total); ++s_tc_hashes;
         if (s_tc[slot].hash == hash) { s_tc[slot].checked = flip; s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
         s_tc_bytes -= s_tc[slot].bytes; s_tc[slot].tex = nil;            /* rewritten: rebuild in place */
@@ -413,6 +431,7 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
     }
     free(rgba);
     if (!ok) { s_err = "host 2d: texture decode"; return nil; }
+    if ((unsigned)slot >= s_tc_hw) s_tc_hw = (unsigned)slot + 1u;
     s_tc[slot].addr = t->addr; s_tc[slot].fmt = t->d3d_format; s_tc[slot].size = t->d3d_size; s_tc[slot].bytes = bytes;
     s_tc[slot].hash = hash; s_tc[slot].checked = flip; s_tc[slot].used = ++s_tc_clock; s_tc[slot].tex = tex; ++s_tc_builds;
     s_tc_bytes += bytes;
@@ -429,16 +448,20 @@ typedef struct {
     uint32_t stencil, early;
 } H2DSpecKey;
 #define SPEC_CACHE 1024
-static struct { H2DSpecKey k; uint64_t h; id<MTLRenderPipelineState> pso; } s_spec[SPEC_CACHE];
+static struct { H2DSpecKey k; uint64_t h; id<MTLRenderPipelineState> pso; _Atomic int state; } s_spec[SPEC_CACHE];
+static int s_spec_sync;            /* d3d8_host_2d_metal_set_spec_sync: compile in line (the tests) */
+static _Atomic unsigned long long s_spec_compile_ns_a, s_spec_built_a;
+static unsigned long long s_spec_pending_draws;
+void d3d8_host_2d_metal_set_spec_sync(int on) { s_spec_sync = on; }
 static unsigned s_spec_n;
 void d3d8_host_2d_metal_set_spec(int on) { s_spec_on = on; }
 void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long *hits, unsigned long long *fallback,
                                    unsigned long long *compile_ns)
 {
-    if (built) *built = s_spec_built;
+    if (built) *built = atomic_load(&s_spec_built_a);
     if (hits) *hits = s_spec_hits;
-    if (fallback) *fallback = s_spec_fallback;
-    if (compile_ns) *compile_ns = s_spec_compile_ns;
+    if (fallback) *fallback = s_spec_fallback + s_spec_pending_draws;
+    if (compile_ns) *compile_ns = atomic_load(&s_spec_compile_ns_a);
 }
 /* EARLY TESTS ARE EXACT ONLY WHERE THE z-RANGE CULL CANNOT FIRE.
  *
@@ -478,15 +501,17 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
     { const uint8_t *b = (const uint8_t *)&k; for (size_t i = 0; i < sizeof k; ++i) { h ^= b[i]; h *= 1099511628211ull; } }
     for (unsigned i = 0; i < s_spec_n; ++i)
         if (s_spec[i].h == h && !memcmp(&s_spec[i].k, &k, sizeof k)) {
-            if (!s_spec[i].pso) break;
-            ++s_spec_hits; return s_spec[i].pso;
+            int st = atomic_load_explicit(&s_spec[i].state, memory_order_acquire);
+            if (st == 1) { ++s_spec_hits; return s_spec[i].pso; }
+            if (st == 0) ++s_spec_pending_draws; else ++s_spec_fallback;
+            return with_stencil ? s_pso_st : s_pso;          /* compiling, or failed: the generic interpreter */
         }
     if (s_spec_n >= SPEC_CACHE) { ++s_spec_fallback; return with_stencil ? s_pso_st : s_pso; }
-    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    id<MTLRenderPipelineState> pso = nil;
-    @autoreleasepool {
-        MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
-        bool on = true;
+    unsigned slot = s_spec_n++;
+    s_spec[slot].k = k; s_spec[slot].h = h; s_spec[slot].pso = nil;
+    atomic_store_explicit(&s_spec[slot].state, 0, memory_order_relaxed);
+    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+    {   bool on = true;
         [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
         [cv setConstantValue:&k.cc type:MTLDataTypeUInt atIndex:1];
         [cv setConstantValue:&k.tmask type:MTLDataTypeUInt atIndex:2];
@@ -501,27 +526,51 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
         [cv setConstantValues:k.ao type:MTLDataTypeUInt withRange:NSMakeRange(32, 8)];
         [cv setConstantValue:&k.beq type:MTLDataTypeUInt atIndex:40];
         [cv setConstantValue:&k.cmask type:MTLDataTypeUInt atIndex:41];
-        [cv setConstantValue:&k.lin type:MTLDataTypeUInt atIndex:42];
-        NSError *err = nil;
-        id<MTLFunction> fn = [s_lib newFunctionWithName:k.early ? @"h2d_fs_early" : @"h2d_fs" constantValues:cv error:&err];
+        [cv setConstantValue:&k.lin type:MTLDataTypeUInt atIndex:42]; }
+    NSString *name = k.early ? @"h2d_fs_early" : @"h2d_fs";
+    int stencil = with_stencil;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    /* The pipeline, once there is a function: stored, then published. */
+    void (^finish)(id<MTLFunction>, NSError *) = ^(id<MTLFunction> fn, NSError *ferr) {
+        id<MTLRenderPipelineState> pso = nil;
+        NSError *err = ferr;
         if (fn) {
             MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
             pd.vertexFunction = s_vs; pd.fragmentFunction = fn;
             pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
             pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-            if (with_stencil) pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+            if (stencil) pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
             pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         }
         if (!pso) {
-            static int told;
-            if (!told++) fprintf(stderr, "[D3D8-HOST-2D] specialised pipeline failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
+            static _Atomic int told;
+            if (!atomic_fetch_add(&told, 1))
+                fprintf(stderr, "[D3D8-HOST-2D] specialised pipeline failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
         }
+        s_spec[slot].pso = pso;
+        atomic_fetch_add(&s_spec_compile_ns_a, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+        if (pso) atomic_fetch_add(&s_spec_built_a, 1);
+        atomic_store_explicit(&s_spec[slot].state, pso ? 1 : 2, memory_order_release);
+    };
+    /* ASYNCHRONOUS BY DEFAULT. A compile takes ~20-40 ms, and 23 of them in
+     * the tutorial were the frame-time tail (p99 128 ms, max 173 ms, g51fix).
+     * The draw that misses -- and every draw of that key until the compile
+     * lands, typically a frame or two -- uses the generic interpreter, which
+     * VERIFY holds to the executor as it holds the specialised one. Bisect
+     * bit 2048 compiles in line, as before; the unit tests do too, so they
+     * test the specialised program and not its stand-in. */
+    if (s_spec_sync || (d3d8_host_2d_bisect() & 2048u)) {
+        NSError *err = nil;
+        id<MTLFunction> fn = nil;
+        @autoreleasepool { fn = [s_lib newFunctionWithName:name constantValues:cv error:&err]; finish(fn, err); }
+        s_spec_compile_ns = atomic_load(&s_spec_compile_ns_a); s_spec_built = atomic_load(&s_spec_built_a);
+        if (atomic_load_explicit(&s_spec[slot].state, memory_order_acquire) == 1) return s_spec[slot].pso;
+        ++s_spec_fallback;
+        return with_stencil ? s_pso_st : s_pso;
     }
-    s_spec_compile_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-    s_spec[s_spec_n].k = k; s_spec[s_spec_n].h = h; s_spec[s_spec_n].pso = pso; ++s_spec_n;
-    if (!pso) { ++s_spec_fallback; return with_stencil ? s_pso_st : s_pso; }
-    ++s_spec_built;
-    return pso;
+    [s_lib newFunctionWithName:name constantValues:cv completionHandler:^(id<MTLFunction> fn, NSError *err) { finish(fn, err); }];
+    ++s_spec_pending_draws;
+    return with_stencil ? s_pso_st : s_pso;
 }
 
 /* Encode `d` into a pass whose attachments are W x H and whose top-left is

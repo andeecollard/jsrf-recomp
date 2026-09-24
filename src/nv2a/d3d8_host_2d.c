@@ -1180,12 +1180,12 @@ unsigned d3d8_host_2d_bisect(void)
         const char *e = getenv("RECOMP_D3D8_HOST_BISECT");
         s_bisect_read = 1;
         s_bisect = e && *e ? (unsigned)strtoul(e, NULL, 0) : 0u;
-        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
+        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
                               s_bisect & 1 ? " own-pass" : "", s_bisect & 2 ? " buffer-per-draw" : "",
                               s_bisect & 4 ? " no-early-tests" : "", s_bisect & 8 ? " generic-shader" : "",
                               s_bisect & 16 ? " hash-every-draw" : "", s_bisect & 32 ? " no-vertex-cache" : "",
                               s_bisect & 64 ? " wait-every-draw" : "", s_bisect & 128 ? " late-executor-skip" : "",
-                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "");
+                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "", s_bisect & 2048 ? " inline-compile" : "");
     }
     return s_bisect;
 }
@@ -1516,7 +1516,7 @@ void d3d8_host_2d_report(const char *why)
             unsigned long long b = 0, h = 0, f = 0, ns = 0;
             s_be.spec_stats(&b, &h, &f, &ns);
             fprintf(stderr, "[D3D8-HOST-2D] %s specialised fragment pipelines: built %llu (compile %.1f ms), hits %llu,"
-                            " draws on the generic interpreter %llu | binding the target (a GPU drain each) %.1f ms over"
+                            " draws on the generic interpreter (compiling, full or failed) %llu | binding the target (a GPU drain each) %.1f ms over"
                             " %llu binds\n", why, b, ns / 1e6, h, f,
                     s_be.bind_ns ? s_be.bind_ns() / 1e6 : 0.0, s_be.external_binds ? s_be.external_binds() : 0ull);
             if (s_be.geom_stats) {
