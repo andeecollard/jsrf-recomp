@@ -40,6 +40,11 @@ int nv2a_metal_clear_depth_stencil(uint8_t *target, size_t target_size,
 /* Read-only: what the backend currently retains, for RECOMP_SURFACE_AUDIT.
  * owed is -1 nothing retained, 0 retained and clean, 1 retained and dirty. */
 void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed);
+/* G51.1, read-only: copy the top-left w x h of the hardware depth attachment
+ * that belongs to the guest depth surface `depth` into `out`, as Depth32Float
+ * values (guest z / 16777215). Completes queued GPU work first. Returns 0 if
+ * no hardware depth texture of at least that size is held for it. */
+int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *out);
 
 /* RECOMP_SURFACE_CENSUS -- what every retained colour surface holds, on the
  * GPU and in guest RAM, side by side. `guest_base` is xbox_GetMemoryOffset(),

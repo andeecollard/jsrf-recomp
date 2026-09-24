@@ -151,10 +151,22 @@ const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, s
     /* Fragment state, as D3D pushed it. Depth and stencil: the shadow has no
      * depth buffer, so a draw that could be depth-occluded is not drawn;
      * ALWAYS with no stencil changes no colour and is. */
-    d->depth_test = st(c, 0x30C, 0); d->depth_func = st(c, 0x354, 0x201);
+    /* Depth: drawn against the executor's own depth (the shadow seeds a real
+     * attachment from it). An unwritten DEPTH_FUNC is LEQUAL, as the
+     * executor reads it (NV2A_GUEST_DEPTH_FUNC_DEFAULT); ZWRITEENABLE's
+     * default is on. Stencil is still refused. */
+    d->depth_test = st(c, 0x30C, 0) != 0; d->depth_func = st(c, 0x354, 0x203);
+    if (!d->depth_func) d->depth_func = 0x203;
+    d->depth_write = st(c, 0x35C, 1) != 0;
     d->stencil_test = st(c, 0x32C, 0);
     if (d->stencil_test) return "stencil test";
-    if (d->depth_test && d->depth_func != 0x207u) return "depth test";
+    if (d->depth_test && (d->depth_func < 0x200u || d->depth_func > 0x207u)) return "depth func";
+    if (d->depth_test) {
+        if (!c->zs) return "depth test without a depth surface";
+        d->zs_addr = c->zs_data & RAM_MASK; d->zs_pitch = ((c->zs_size >> 24) + 1u) * 64u;
+        if (d->zs_pitch < d->rt_w * 4u || (uint64_t)d->zs_addr + (uint64_t)d->zs_pitch * d->rt_h > ram_size)
+            return "depth surface bounds";
+    }
     if (c->ffv_valid && c->fg_cur.enable) return "fog";                 /* the executor refuses fog too */
     d->alpha_test = st(c, 0x300, 0); d->alpha_func = st(c, 0x33C, 0x207); d->alpha_ref = st(c, 0x340, 0);
     if (d->alpha_test && (d->alpha_func < 0x200u || d->alpha_func > 0x207u)) return "alpha func";
@@ -275,10 +287,12 @@ const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, s
     d->bb_x0 = 1; d->bb_x1 = 0;
     if (d->nverts) {
         float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+        d->z_min = INFINITY; d->z_max = -INFINITY;
         for (unsigned k = 0; k < d->nverts; ++k) {
             const float *p = d->verts[k].p;
             if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
             if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+            if (p[2] < d->z_min) d->z_min = p[2]; if (p[2] > d->z_max) d->z_max = p[2];
         }
         int32_t bx0 = (int32_t)floorf(x0) - 2, by0 = (int32_t)floorf(y0) - 2;
         int32_t bx1 = (int32_t)ceilf(x1) + 2, by1 = (int32_t)ceilf(y1) + 2;
@@ -311,6 +325,36 @@ void d3d8_host_2d_diff(const uint16_t *pre, const uint16_t *exec, const uint16_t
     }
 }
 
+unsigned long long d3d8_host_2d_depth_diff(const float *exec, const float *host, size_t n,
+                                           unsigned tol, unsigned *max_steps)
+{
+    unsigned long long bad = 0;
+    unsigned worst = 0;
+    for (size_t k = 0; k < n; ++k) {
+        uint32_t a = (uint32_t)((double)fminf(1.0f, fmaxf(0.0f, exec[k])) * 16777215.0 + 0.5);
+        uint32_t b = (uint32_t)((double)fminf(1.0f, fmaxf(0.0f, host[k])) * 16777215.0 + 0.5);
+        unsigned dd = a > b ? a - b : b - a;
+        if (dd > worst) worst = dd;
+        if (dd > tol) ++bad;
+    }
+    if (max_steps) *max_steps = worst;
+    return bad;
+}
+
+int d3d8_host_2d_depth_proof(uint32_t f, float zmin, float zmax, float smin, float smax)
+{
+    switch (f) {
+    case 0x200: return -1;
+    case 0x201: return zmax < smin ? 1 : zmin >= smax ? -1 : 0;     /* LESS */
+    case 0x202: return (zmin == zmax && smin == smax && zmin == smin) ? 1 : (zmax < smin || zmin > smax) ? -1 : 0;
+    case 0x203: return zmax <= smin ? 1 : zmin > smax ? -1 : 0;     /* LEQUAL */
+    case 0x204: return zmin > smax ? 1 : zmax <= smin ? -1 : 0;     /* GREATER */
+    case 0x205: return (zmax < smin || zmin > smax) ? 1 : (zmin == zmax && smin == smax && zmin == smin) ? -1 : 0;
+    case 0x206: return zmin >= smax ? 1 : zmax < smin ? -1 : 0;     /* GEQUAL */
+    default:    return 1;                                            /* ALWAYS */
+    }
+}
+
 /* ---- the shadow bookkeeping ----
  * Everything below runs on the pusher thread: the pre and post tokens and
  * FLIP_STALL are all dispatched there, in ring order. The atexit report reads
@@ -325,6 +369,7 @@ static char s_dump_dir[512];
 typedef struct {
     uint32_t serial, x0, y0, w, h, exec_active, exec_mode;
     uint16_t *pre, *exec, *host;
+    float *zexec, *zhost;                    /* depth after the draw, both sides; NULL without the test */
     D3D8Host2DDraw info;                     /* verts pointer cleared: summary only */
 } Rec;
 #define MAX_RECS 256u
@@ -334,6 +379,14 @@ static unsigned long long s_rec_dropped;
 
 static uint16_t *s_snap; static size_t s_snap_cap;
 static uint32_t s_snap_serial, s_snap_addr, s_snap_pitch, s_snap_h, s_snap_valid;
+/* The depth the draw starts from: rt_w x rt_h, rows rt_w apart. */
+static float *s_zsnap, *s_zpost; static size_t s_zsnap_cap;
+static uint32_t s_zsnap_valid, s_zsnap_addr, s_zsnap_w, s_zsnap_h, s_zsnap_src;   /* src 1 texture, 2 guest RAM */
+/* The depth histogram: every 2D draw, by what it asks of the depth unit. */
+static unsigned long long s_z_off, s_z_func[8], s_z_write, s_z_zbucket[5], s_z_from_tex, s_z_from_ram, s_z_none,
+                          s_z_proof_pass, s_z_proof_reject, s_z_proof_depends, s_z_draws, s_z_px, s_z_px_mm,
+                          s_z_draws_mm;
+static unsigned s_z_max_steps;
 
 static unsigned long long s_flips, s_draws, s_pre, s_pre_skipped, s_no_pre, s_no_backend, s_built, s_empty,
                           s_rendered, s_render_failed, s_compared, s_exact, s_within, s_mismatching,
@@ -341,7 +394,7 @@ static unsigned long long s_flips, s_draws, s_pre, s_pre_skipped, s_no_pre, s_no
                           s_vsflag_pass, s_idx_changed, s_sync_calls, s_ctx_b, s_diffuse_default,
                           s_tss_ci_off, s_modes_disagree;
 static unsigned s_max_err[3];
-static unsigned s_printed_mm, s_printed_consts, s_printed_frames;
+static unsigned s_printed_mm, s_printed_consts, s_printed_frames, s_printed_z, s_printed_zmm;
 #define NREASON 40
 static struct { const char *why; unsigned long long n; } s_reason[NREASON];
 static void count_reason(const char *why)
@@ -406,11 +459,30 @@ void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b)
     s_be = *b; s_have_be = b && b->render && b->sync_range && b->ram && b->ram_size;
 }
 
-void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size)
+/* The executor's depth for a surface: its hardware attachment when it holds
+ * one, else the guest's D24S8 bytes -- which is what it would upload on the
+ * next rebuild of that surface, so either way it is what the draw meets. */
+static int depth_read(uint32_t zaddr, uint32_t zpitch, uint32_t w, uint32_t h, float *out, uint32_t *src)
+{
+    if (s_be.depth_peek && s_be.depth_peek(s_be.ram + zaddr, w, h, out)) { *src = 1; return 1; }
+    if ((uint64_t)zaddr + (uint64_t)zpitch * h > s_be.ram_size || zpitch < w * 4u) return 0;
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t *z = s_be.ram + zaddr + (size_t)y * zpitch + 4u * x;
+            uint32_t q = (uint32_t)z[1] | (uint32_t)z[2] << 8 | (uint32_t)z[3] << 16;
+            out[(size_t)y * w + x] = (float)q / 16777215.0f;
+        }
+    *src = 2;
+    return 1;
+}
+
+void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
+                      uint32_t zs_data, uint32_t zs_size)
 {
     uint32_t addr = rt_data & RAM_MASK, h = ((rt_size >> 12) & 0xFFFu) + 1u, pitch = ((rt_size >> 24) + 1u) * 64u;
+    uint32_t w = (rt_size & 0xFFFu) + 1u;
     size_t bytes = (size_t)pitch * h;
-    s_snap_valid = 0;
+    s_snap_valid = 0; s_zsnap_valid = 0;
     if (!d3d8_host_2d_mode()) return;
     ++s_pre;
     if (!s_have_be || ((rt_format >> 8) & 0xFFu) != 0x11u || addr + bytes > s_be.ram_size) { ++s_pre_skipped; return; }
@@ -423,6 +495,21 @@ void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uin
     s_be.sync_range(s_be.ram + addr, bytes);
     memcpy(s_snap, s_be.ram + addr, bytes);
     s_snap_serial = serial; s_snap_addr = addr; s_snap_pitch = pitch; s_snap_h = h; s_snap_valid = 1;
+    /* And the depth it starts from, whenever D3D has a depth surface: the
+     * post token decides whether the draw tests against it. */
+    if (zs_data) {
+        size_t n = (size_t)w * h;
+        if (n > s_zsnap_cap) {
+            float *a = realloc(s_zsnap, n * sizeof *a), *b = a ? realloc(s_zpost, n * sizeof *b) : NULL;
+            if (a) s_zsnap = a;
+            if (b) s_zpost = b;
+            if (!a || !b) return;
+            s_zsnap_cap = n;
+        }
+        if (depth_read(zs_data & RAM_MASK, ((zs_size >> 24) + 1u) * 64u, w, h, s_zsnap, &s_zsnap_src)) {
+            s_zsnap_valid = 1; s_zsnap_addr = zs_data & RAM_MASK; s_zsnap_w = w; s_zsnap_h = h;
+        }
+    }
 }
 
 static uint16_t *crop(const uint8_t *base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
@@ -488,6 +575,38 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
         else ++s_empty;
         return;
     }
+    /* The depth histogram, over every built 2D draw: what the depth unit is
+     * asked, where the vertex z sit, and whether the stored depth under the
+     * draw's box PROVES the outcome (see d3d8_host_2d_depth_proof). The proof
+     * is reported, never used: the host draws against the real depth. */
+    if (!d.depth_test) ++s_z_off;
+    else {
+        ++s_z_func[d.depth_func & 7u];
+        if (d.depth_write) ++s_z_write;
+        ++s_z_zbucket[d.z_max < 0.0f || d.z_min > 1.0f ? 4 : d.z_max == 0.0f ? 0 : d.z_min == 1.0f ? 2
+                      : (d.z_min >= 0.0f && d.z_max <= 1.0f) ? 1 : 3];
+        if (!s_zsnap_valid || s_zsnap_addr != d.zs_addr || s_zsnap_w < d.rt_w || s_zsnap_h < d.rt_h) {
+            ++s_z_none; count_reason("no executor depth for the depth-tested draw"); return;
+        }
+        if (s_zsnap_src == 1) ++s_z_from_tex; else ++s_z_from_ram;
+        {
+            float smin = INFINITY, smax = -INFINITY;
+            for (int32_t y = d.bb_y0; y <= d.bb_y1; ++y)
+                for (int32_t x = d.bb_x0; x <= d.bb_x1; ++x) {
+                    float v = s_zsnap[(size_t)y * s_zsnap_w + (size_t)x];
+                    if (v < smin) smin = v; if (v > smax) smax = v;
+                }
+            int pr = d3d8_host_2d_depth_proof(d.depth_func, d.z_min, d.z_max, smin, smax);
+            if (pr > 0) ++s_z_proof_pass; else if (pr < 0) ++s_z_proof_reject; else ++s_z_proof_depends;
+            if (s_printed_z < 6) {
+                ++s_printed_z;
+                fprintf(stderr, "[D3D8-HOST-2D] draw %u depth: func %X write %u vertex z %.7g..%.7g stored %.7g..%.7g"
+                                " (%s) -> %s\n", c->serial, d.depth_func, d.depth_write, d.z_min, d.z_max, smin, smax,
+                        s_zsnap_src == 1 ? "executor texture" : "guest RAM",
+                        pr > 0 ? "every fragment passes" : pr < 0 ? "every fragment fails" : "depends per pixel");
+            }
+        }
+    }
     if (s_nrec >= MAX_RECS) { ++s_rec_dropped; return; }
     ++s_sync_calls;
     s_be.sync_range(s_be.ram + d.rt_addr, (size_t)d.rt_pitch * d.rt_h);
@@ -502,10 +621,24 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
         r->host = r->pre ? malloc((size_t)w * h * 2u) : NULL;
         if (!r->pre || !r->exec || !r->host) { free(r->pre); free(r->exec); free(r->host); count_reason("out of memory"); return; }
         memcpy(r->host, r->pre, (size_t)w * h * 2u);
-        if (s_be.render(&d, s_be.ram, s_be.ram_size, r->host, w, x0, y0, w, h) != 0) {
+        if (d.depth_test) {
+            /* The host's depth starts from the pre-draw snapshot; the
+             * executor's after the draw is read now, the same way. */
+            uint32_t src;
+            r->zhost = malloc((size_t)w * h * sizeof(float)); r->zexec = malloc((size_t)w * h * sizeof(float));
+            if (!r->zhost || !r->zexec || !depth_read(d.zs_addr, d.zs_pitch, d.rt_w, d.rt_h, s_zpost, &src)) {
+                free(r->pre); free(r->exec); free(r->host); free(r->zhost); free(r->zexec);
+                count_reason("executor depth after the draw unreadable"); return;
+            }
+            for (uint32_t y = 0; y < h; ++y) {
+                memcpy(r->zhost + (size_t)y * w, s_zsnap + (size_t)(y0 + y) * s_zsnap_w + x0, w * sizeof(float));
+                memcpy(r->zexec + (size_t)y * w, s_zpost + (size_t)(y0 + y) * d.rt_w + x0, w * sizeof(float));
+            }
+        }
+        if (s_be.render(&d, s_be.ram, s_be.ram_size, r->host, w, r->zhost, x0, y0, w, h) != 0) {
             ++s_render_failed;
             count_reason(s_be.last_error ? s_be.last_error() : "render failed");
-            free(r->pre); free(r->exec); free(r->host);
+            free(r->pre); free(r->exec); free(r->host); free(r->zhost); free(r->zexec);
             return;
         }
         ++s_rendered;
@@ -599,7 +732,22 @@ void d3d8_host_2d_flip(void)
             if (s_dump_dir[0] && s_dumped < s_dump_max) { ++s_dumped; dump(r, &df); }
         } else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_within;
         else ++s_exact;
-        free(r->pre); free(r->exec); free(r->host);
+        if (r->zhost && r->zexec) {
+            unsigned steps = 0;
+            unsigned long long zb = d3d8_host_2d_depth_diff(r->zexec, r->zhost, (size_t)r->w * r->h, 1, &steps);
+            ++s_z_draws; s_z_px += (unsigned long long)r->w * r->h; s_z_px_mm += zb;
+            if (steps > s_z_max_steps) s_z_max_steps = steps;
+            if (zb) {
+                ++s_z_draws_mm;
+                if (s_printed_zmm < 12) {
+                    ++s_printed_zmm;
+                    fprintf(stderr, "[D3D8-HOST-2D] flip %llu draw %u DEPTH MISMATCH bbox %u,%u %ux%u: %llu px differ"
+                                    " by more than one 24-bit step, worst %u steps (func %X write %u)\n",
+                            s_flips, r->serial, r->x0, r->y0, r->w, r->h, zb, steps, r->info.depth_func, r->info.depth_write);
+                }
+            }
+        }
+        free(r->pre); free(r->exec); free(r->host); free(r->zhost); free(r->zexec);
     }
     s_px += px; s_px_mm += mm; s_px_exec += fe; s_px_host += fh;
     s_nrec = 0;
@@ -617,6 +765,9 @@ void d3d8_host_2d_get_stats(D3D8H2DStats *o)
     o->draws = s_draws; o->built = s_built; o->rendered = s_rendered; o->compared = s_compared;
     o->exact = s_exact; o->within = s_within; o->mismatching = s_mismatching;
     o->px = s_px; o->px_mismatch = s_px_mm; o->dumped = s_dumped;
+    o->depth_draws = s_z_draws; o->depth_px = s_z_px; o->depth_px_mismatch = s_z_px_mm;
+    o->depth_draws_mismatching = s_z_draws_mm; o->z_from_texture = s_z_from_tex; o->z_from_ram = s_z_from_ram;
+    o->proof_pass = s_z_proof_pass; o->proof_reject = s_z_proof_reject; o->proof_depends = s_z_proof_depends;
 }
 
 void d3d8_host_2d_report(const char *why)
@@ -637,6 +788,16 @@ void d3d8_host_2d_report(const char *why)
                     " diffuse defaulted to white %llu, index data changed before the token %llu,"
                     " texture stage modes differ from the executor's 0x1E70 %llu\n",
             why, s_ctx_b, s_tss_ci_off, s_diffuse_default, s_idx_changed, s_modes_disagree);
+    fprintf(stderr, "[D3D8-HOST-2D] %s depth: test off %llu | on: func NEVER %llu LESS %llu EQUAL %llu LEQUAL %llu"
+                    " GREATER %llu NOTEQUAL %llu GEQUAL %llu ALWAYS %llu; write on %llu; vertex z all 0 %llu, inside"
+                    " (0,1) %llu, all 1 %llu, mixed %llu, outside [0,1] %llu | seeded from executor texture %llu,"
+                    " guest RAM %llu, none %llu | stored depth under the box proves: pass %llu, reject %llu,"
+                    " depends %llu\n", why, s_z_off, s_z_func[0], s_z_func[1], s_z_func[2], s_z_func[3], s_z_func[4],
+            s_z_func[5], s_z_func[6], s_z_func[7], s_z_write, s_z_zbucket[0], s_z_zbucket[1], s_z_zbucket[2],
+            s_z_zbucket[3], s_z_zbucket[4], s_z_from_tex, s_z_from_ram, s_z_none, s_z_proof_pass,
+            s_z_proof_reject, s_z_proof_depends);
+    fprintf(stderr, "[D3D8-HOST-2D] %s depth compared: draws=%llu mismatching=%llu | px=%llu over one 24-bit step=%llu,"
+                    " worst %u steps\n", why, s_z_draws, s_z_draws_mm, s_z_px, s_z_px_mm, s_z_max_steps);
     {
         int any = 0;
         for (unsigned i = 0; i < NREASON && s_reason[i].why; ++i) {

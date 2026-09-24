@@ -4535,6 +4535,33 @@ int nv2a_metal_sync(void)
  * from a run. `owed` is -1 when nothing is retained, 0 when the retained
  * surface matches guest RAM, and 1 when it holds rendering guest RAM has not
  * seen yet -- which is the only state in which losing it costs pixels. */
+/* G51.1: READ-ONLY -- the depth the hardware path holds for a depth surface.
+ *
+ * Under RECOMP_METAL_NO_DEPTH_SYNC (default on) depth never returns to guest
+ * RAM, so the only copy of the depth a draw is tested against is the
+ * Depth32Float attachment here. The host's 2D shadow needs exactly that copy.
+ * This finds the attachment belonging to `depth` (the bound one, or a cached
+ * slot's), completes queued work, and copies the top-left w x h values out.
+ * It writes nothing the executor reads: no dirty flag, no debt, no guest RAM.
+ * The one side effect is committing an open batch early, which changes how
+ * draws are grouped into command buffers and not what they draw. Only the
+ * shadow calls it; nothing on the default path does. */
+int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *out)
+{
+    id<MTLTexture> tex = nil;
+    if (!depth || !out || !w || !h) return 0;
+    if (depth_target == depth && hw_depth_tex) tex = hw_depth_tex;
+    for (unsigned i = 0; !tex && i < surface_slots_used(); i++)
+        if (surf_slot[i].valid && surf_slot[i].depth == depth && surf_slot[i].hw_depth)
+            tex = surf_slot[i].hw_depth;
+    if (!tex || tex.width < w || tex.height < h) return 0;
+    batch_flush();
+    if (last_command) [last_command waitUntilCompleted];
+    [tex getBytes:out bytesPerRow:(NSUInteger)w * sizeof *out
+        fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    return 1;
+}
+
 void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed)
 {
     if (color) *color = surface_target;

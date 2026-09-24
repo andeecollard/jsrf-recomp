@@ -894,9 +894,10 @@ uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c)
     return i + 1u;
 }
 
-/* G51.1: only the four words the before-draw handler reads are set; the rest
+/* G51.1: only the six words the before-draw handler reads are set; the rest
  * of the slot's check is stale and nothing reads it for kind 2. */
-uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size)
+uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
+                                  uint32_t zs_data, uint32_t zs_size)
 {
     uint32_t i, expect = 0;
     d3d8_host_install();
@@ -908,6 +909,7 @@ uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt
     s_slot[i].kind = 2; s_slot[i].n = 0;
     s_slot[i].check.serial = serial; s_slot[i].check.rt_data = rt_data;
     s_slot[i].check.rt_format = rt_format; s_slot[i].check.rt_size = rt_size;
+    s_slot[i].check.zs_data = zs_data; s_slot[i].check.zs_size = zs_size;
     atomic_store_explicit(&s_slot[i].state, 2u, memory_order_release);
     atomic_fetch_add(&s_enq, 1);
     return i + 1u;
@@ -930,7 +932,7 @@ static void on_token(uint32_t parameter)
             d3d8_host_2d_post(&s_slot[i].check, s_exec_source);
     } else if (s_slot[i].kind == 2) {
         const D3D8HostDrawCheck *p = &s_slot[i].check;
-        d3d8_host_2d_pre(p->serial, p->rt_data, p->rt_format, p->rt_size);
+        d3d8_host_2d_pre(p->serial, p->rt_data, p->rt_format, p->rt_size, p->zs_data, p->zs_size);
     }
     for (uint32_t k = 0; k < s_slot[i].n; ++k)
         nv2a_pusher_dispatch_host(0, s_slot[i].method[k], s_slot[i].param[k]);

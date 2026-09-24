@@ -224,7 +224,8 @@ uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
  * draw, so the render target holds what the draw starts from; the handler
  * (d3d8_host_2d_pre) snapshots it for the host's shadow. `serial` is the
  * serial the mirror's after-draw check of the same draw will carry. */
-uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size);
+uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
+                                  uint32_t zs_data, uint32_t zs_size);
 
 #define D3D8_HOST_FFV_GROUPS 5u     /* G42's four and the inverse model-view */
 typedef struct {

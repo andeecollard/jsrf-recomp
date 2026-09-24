@@ -21,12 +21,17 @@
  *   - blend factors DST_ALPHA/ONE_MINUS_DST_ALPHA (1 and 0 on a 565 target),
  *     SRC_ALPHA_SATURATE and the constant colour, and every blend equation;
  *   - colour write mask.
+ * DEPTH is a real Depth32Float attachment seeded with the executor's own
+ * values (guest z / 16777215, the representation nv2a_metal.m keeps), with
+ * the executor's compare mapping (nv2a_metal_compare_func) and its rule that
+ * depth is written only while the test is on.
  * The MUX rule (AB when R0.a >= 0.5) is the executor's, kept for agreement;
  * that it matches the NV2A is not established here. */
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "d3d8_host_2d.h"
 #include "nv2a_texture_decode.h"
+#include "nv2a_metal_state.h"
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
@@ -121,6 +126,21 @@ static id<MTLDevice> s_dev;
 static id<MTLCommandQueue> s_queue;
 static id<MTLRenderPipelineState> s_pso;
 static id<MTLTexture> s_dummy;
+static id<MTLDepthStencilState> s_dss[16];
+static id<MTLDepthStencilState> depth_state(const D3D8Host2DDraw *d)
+{
+    int cmp = d->depth_test ? nv2a_metal_compare_func(d->depth_func) : NV2A_MTL_CMP_ALWAYS;
+    unsigned wr = d->depth_test && d->depth_write, key;
+    if (cmp < 0) cmp = NV2A_MTL_CMP_ALWAYS;           /* as the executor: unrecognised is ALWAYS */
+    key = ((unsigned)cmp & 7u) | (wr << 3);
+    if (!s_dss[key]) {
+        MTLDepthStencilDescriptor *ds = [MTLDepthStencilDescriptor new];
+        ds.depthCompareFunction = (MTLCompareFunction)cmp;
+        ds.depthWriteEnabled = wr ? YES : NO;
+        s_dss[key] = [s_dev newDepthStencilStateWithDescriptor:ds];
+    }
+    return s_dss[key];
+}
 static id<MTLSamplerState> s_samplers[128];
 static const char *s_err;
 static pthread_mutex_t s_init_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -153,6 +173,7 @@ static int init(void)
         pd.vertexFunction = [lib newFunctionWithName:@"h2d_vs"];
         pd.fragmentFunction = [lib newFunctionWithName:@"h2d_fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!s_pso) {
             fprintf(stderr, "[D3D8-HOST-2D] pipeline failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
@@ -244,10 +265,11 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
 }
 
 int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size,
-                              uint16_t *pixels, unsigned pitch_px,
+                              uint16_t *pixels, unsigned pitch_px, float *depth,
                               unsigned x0, unsigned y0, unsigned w, unsigned h)
 {
     if (!d || !pixels || !w || !h || pitch_px < w) return fail("host 2d: bad arguments");
+    if (d->depth_test && !depth) return fail("host 2d: depth test without the depth it starts from");
     if (!init()) return -1;
     /* The scissor, in crop space. Nothing inside it: nothing drawn, pixels as they were. */
     int32_t sx0 = d->sc_x0 > (int32_t)x0 ? d->sc_x0 : (int32_t)x0, sy0 = d->sc_y0 > (int32_t)y0 ? d->sc_y0 : (int32_t)y0;
@@ -281,6 +303,12 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         id<MTLTexture> target = [s_dev newTextureWithDescriptor:td];
         if (!target) return fail("host 2d: target allocation");
         [target replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:pixels bytesPerRow:(NSUInteger)pitch_px * 2u];
+        MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                       width:w height:h mipmapped:NO];
+        zd.usage = MTLTextureUsageRenderTarget; zd.storageMode = MTLStorageModeShared;
+        id<MTLTexture> ztex = [s_dev newTextureWithDescriptor:zd];
+        if (!ztex) return fail("host 2d: depth allocation");
+        if (depth) [ztex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:depth bytesPerRow:(NSUInteger)w * 4u];
         id<MTLBuffer> vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)d->nverts * sizeof(D3D8H2DVertex)
                                              options:MTLResourceStorageModeShared];
         if (!vb) return fail("host 2d: vertex buffer");
@@ -288,10 +316,15 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         pass.colorAttachments[0].texture = target;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.depthAttachment.texture = ztex;
+        pass.depthAttachment.loadAction = depth ? MTLLoadActionLoad : MTLLoadActionClear;
+        pass.depthAttachment.clearDepth = 1.0;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
         if (!cb || !enc) return fail("host 2d: command encoder");
         [enc setRenderPipelineState:s_pso];
+        [enc setDepthStencilState:depth_state(d)];
         [enc setDepthClipMode:MTLDepthClipModeClamp];
         [enc setCullMode:MTLCullModeNone];
         MTLScissorRect sc = { (NSUInteger)(sx0 - (int32_t)x0), (NSUInteger)(sy0 - (int32_t)y0),
@@ -310,6 +343,7 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return fail("host 2d: GPU error");
         [target getBytes:pixels bytesPerRow:(NSUInteger)pitch_px * 2u fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        if (depth) [ztex getBytes:depth bytesPerRow:(NSUInteger)w * 4u fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
     }
     return 0;
 }

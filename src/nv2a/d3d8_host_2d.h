@@ -94,7 +94,13 @@ typedef struct {
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t blend, blend_src, blend_dst, blend_eq, blend_color;
     uint32_t dither, color_mask;
-    uint32_t depth_test, depth_func, stencil_test;
+    /* Depth, as D3D pushed it: test (0x30C), func (0x354, 0x200..0x207),
+     * write mask (0x35C). The executor writes depth only when the test is on
+     * (hw_depth_state_for), and so does the host. zs_* name D3D's depth
+     * surface (device +0x2074), whose contents the shadow seeds from. */
+    uint32_t depth_test, depth_func, depth_write, stencil_test;
+    uint32_t zs_addr, zs_pitch;
+    float    z_min, z_max;                     /* over the emitted vertices */
     uint32_t control_perturbed;                /* RECOMP_D3D8_HOST_2D_CONTROL applied */
 } D3D8Host2DDraw;
 
@@ -119,10 +125,13 @@ const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, s
  * Draw `d` over `pixels`, a w x h crop of an R5G6B5 target whose top-left is
  * (x0, y0) in target space, with rows `pitch_px` pixels apart. On entry
  * `pixels` holds the destination the draw starts from; on return, the result.
- * Synchronous. Returns 0 on success, or -1 (pixels untouched) on failure;
- * d3d8_host_2d_metal_last_error() names it. */
+ * `depth`, when not NULL, is the same crop of the depth surface as
+ * Depth32Float values (guest z / 16777215), rows w apart: it seeds a real
+ * depth attachment and receives what the draw left there. A draw with the
+ * depth test on and no `depth` fails. Synchronous. Returns 0 on success, or
+ * -1 (pixels untouched) on failure; d3d8_host_2d_metal_last_error() names it. */
 int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size,
-                              uint16_t *pixels, unsigned pitch_px,
+                              uint16_t *pixels, unsigned pitch_px, float *depth,
                               unsigned x0, unsigned y0, unsigned w, unsigned h);
 const char *d3d8_host_2d_metal_last_error(void);
 
@@ -130,13 +139,19 @@ const char *d3d8_host_2d_metal_last_error(void);
 typedef struct {
     /* Required. */
     int (*render)(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size,
-                  uint16_t *pixels, unsigned pitch_px, unsigned x0, unsigned y0, unsigned w, unsigned h);
+                  uint16_t *pixels, unsigned pitch_px, float *depth,
+                  unsigned x0, unsigned y0, unsigned w, unsigned h);
     /* Make guest RAM hold the executor's pixels for [p, p+bytes). */
     int (*sync_range)(uint8_t *p, size_t bytes);
     uint8_t *ram;
     size_t   ram_size;
     /* Optional: why the last render failed. */
     const char *(*last_error)(void);
+    /* Optional: the executor's depth for the depth surface at `depth` (a host
+     * pointer into `ram`), top-left w x h as guest z / 16777215. Returns 0 if
+     * it holds none; the shadow then reads the surface from guest RAM, which
+     * is what the executor itself would upload for it. nv2a_metal_depth_peek. */
+    int (*depth_peek)(const uint8_t *depth, unsigned w, unsigned h, float *out);
 } D3D8Host2DBackend;
 
 /* 0 off, 1 shadow (and `draw`, which runs as shadow for now). Reads
@@ -144,7 +159,8 @@ typedef struct {
 int  d3d8_host_2d_mode(void);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);
 /* The token before a 2D draw's commands: snapshot the target it starts from. */
-void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size);
+void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
+                      uint32_t zs_data, uint32_t zs_size);
 /* The mirror's token after it: build, capture the executor's result, render. */
 void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecDrawTextures *));
 /* NV097_FLIP_STALL: compare the frame's draws, report, dump. */
@@ -152,6 +168,8 @@ void d3d8_host_2d_flip(void);
 void d3d8_host_2d_report(const char *why);
 typedef struct {
     unsigned long long draws, built, rendered, compared, exact, within, mismatching, px, px_mismatch, dumped;
+    unsigned long long depth_draws, depth_px, depth_px_mismatch, depth_draws_mismatching;
+    unsigned long long z_from_texture, z_from_ram, proof_pass, proof_reject, proof_depends;
 } D3D8H2DStats;
 void d3d8_host_2d_get_stats(D3D8H2DStats *out);
 
@@ -163,6 +181,17 @@ typedef struct {
 } D3D8H2DDiff;
 void d3d8_host_2d_diff(const uint16_t *pre, const uint16_t *exec, const uint16_t *host,
                        unsigned w, unsigned h, unsigned tol, D3D8H2DDiff *out);
+/* Depth, like for like: both sides are Depth32Float holding guest z /
+ * 16777215; each is quantised back to the guest's 24 bits (as the executor's
+ * own readback does) and a pixel mismatches when they differ by more than
+ * `tol` of those steps. Returns the mismatching count; *max_steps the worst. */
+unsigned long long d3d8_host_2d_depth_diff(const float *exec, const float *host, size_t n,
+                                           unsigned tol, unsigned *max_steps);
+/* Can the depth test reject any fragment of a draw whose vertex z spans
+ * [zmin, zmax] against stored depth spanning [smin, smax]? 1 every fragment
+ * passes, -1 every fragment fails, 0 it depends. Fragment depth is the
+ * screen-linear interpolation of vertex z, so it stays inside [zmin, zmax]. */
+int d3d8_host_2d_depth_proof(uint32_t func, float zmin, float zmax, float smin, float smax);
 
 #ifdef __cplusplus
 }

@@ -386,14 +386,14 @@ static void d3d8m_put_token(uint32_t tok)
 static unsigned long long m_pre_no_token;
 void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
-    uint32_t d, rt, tok;
+    uint32_t d, rt, zs, tok;
     (void)kind; (void)a1; (void)a2; (void)a3;
     if (!d3d8m_on() || !d3d8_host_2d_mode()) return;
     d = MEM32(0x0019DCE0u);
     if (!d3d8_host_2d_is_fvf_xyzrhw(MEM32(d + 0x384u))) return;
-    rt = MEM32(d + 0x2070u);
+    rt = MEM32(d + 0x2070u); zs = MEM32(d + 0x2074u);
     tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
-                                   rt ? MEM32(rt + 0x10u) : 0u);
+                                   rt ? MEM32(rt + 0x10u) : 0u, zs ? MEM32(zs + 4u) : 0u, zs ? MEM32(zs + 0x10u) : 0u);
     if (!tok) {
         if (m_pre_no_token++ < 4)
             fprintf(stderr, "[D3D8-MIRROR] G51.1: host token queue full before draw %u; the host skips it\n", m_serial + 1u);
