@@ -604,3 +604,15 @@ fog-ignored positive control first.
 Lesson: "final-cw=301,981" was in the log from the first session and was set
 aside as probably inert, because metal hw refusals read 0. It was the defect.
 The host comparison named it in one player session, by class.
+
+**The police flicker is not fog.** The final-combiner gate has existed since
+3 Sep (9645601). Per report window, drawn against refused:
+- 22 Sep SESSION14 (crash after the cops): 0 refused of 20.1M drawn;
+- 23 Sep 20:14 (the "police flickering" session): 0 of 6.3M;
+- 21 Sep SESSION8 (flicker and freeze): 179 of 1.3M, in two windows;
+- positive control, Rokkaku-dai 08:35: 94–96% refused in every window once
+  the city loads (302k of 1.1M).
+
+So the police scenes never hit the fog gate; their flicker has another
+cause. Script: a scratch-pad fogtl.py, the per-window deltas of
+`[TEXTURE] prepared/rejected`.
