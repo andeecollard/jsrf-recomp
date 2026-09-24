@@ -45,10 +45,14 @@ static void jsrf_state_trace_flush(void);
 #include "apu/apu.h"
 #include "nv2a_pusher.h"
 #include "d3d8_host.h"
+#include "d3d8_host_2d.h"
 #include "nv2a_pb_scan.h"
 #include "recomp_icall_feedback.h"
 extern void nv2a_pb_exec_report(void);
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+#if defined(__APPLE__)
+extern int nv2a_metal_sync_range(uint8_t *target, size_t bytes);
+#endif
 static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
 static void jsrf_save_dump(void);
@@ -5057,6 +5061,24 @@ int main(int argc, char **argv)
                  * against; harmless when nothing writes a mirror token. */
                 extern void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *);
                 d3d8_host_set_exec_source(nv2a_pb_exec_last_draw_textures); }
+#if defined(__APPLE__)
+            /* G51.1: RECOMP_D3D8_HOST_2D=shadow -- the host draws the
+             * pre-transformed 2D class again with its own Metal pipeline and
+             * compares it with the executor at every flip. Unset, nothing is
+             * registered and the flip hook stays NULL. */
+            if (d3d8_host_2d_mode()) {
+                extern void nv2a_pb_exec_set_flip_hook(void (*)(void));
+                D3D8Host2DBackend be;
+                memset(&be, 0, sizeof be);
+                be.render = d3d8_host_2d_metal_render;
+                be.sync_range = nv2a_metal_sync_range;
+                be.ram = (uint8_t *)xbox_GetMemoryOffset();
+                be.ram_size = 0x04000000u;
+                be.last_error = d3d8_host_2d_metal_last_error;
+                d3d8_host_2d_set_backend(&be);
+                nv2a_pb_exec_set_flip_hook(d3d8_host_2d_flip);
+            }
+#endif
             if (adx_guard_on()) {
                 xbox_SetBlockingWaitHooks(adx_guard_block_begin, adx_guard_block_end);
                 fprintf(stderr, "  [ADX-GUARD] blocking-wait release installed: a holder that"

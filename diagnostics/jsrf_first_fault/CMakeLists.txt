@@ -1148,6 +1148,19 @@ if(APPLE)
              COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/metal_combiner_spec_check.sh")
     set_tests_properties(jsrf_metal_combiner_spec PROPERTIES
                          ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+    # G51.1: the host's own 2D pipeline, built from a D3D description alone,
+    # against the executor's Metal path fed the equivalent NV2A state; within
+    # one 565 step, with a perturbed control that must differ, and the shadow
+    # bookkeeping (pre token, post token, flip) through a fake backend. Under
+    # both of the executor's samplers.
+    add_executable(jsrf_d3d8_host_2d_test d3d8_host_2d_test.c
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+    target_link_libraries(jsrf_d3d8_host_2d_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_d3d8_host_2d COMMAND jsrf_d3d8_host_2d_test)
+    add_test(NAME jsrf_d3d8_host_2d_hwtex COMMAND jsrf_d3d8_host_2d_test)
+    set_tests_properties(jsrf_d3d8_host_2d_hwtex PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    add_test(NAME jsrf_d3d8_host_2d_control COMMAND jsrf_d3d8_host_2d_test control)
+    set_tests_properties(jsrf_d3d8_host_2d_control PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # Staging-ring lifetime, including the pin-once-per-batch pattern batching
     # introduced. Carries its own positive control.
     add_executable(jsrf_metal_ring_test metal_ring_test.c)
@@ -1242,12 +1255,14 @@ add_test(NAME jsrf_pusher_token COMMAND jsrf_pusher_token_test)
 # D3D entry point replay where the token sits, once, through ring dispatch.
 add_executable(jsrf_d3d8_host_test d3d8_host_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_host_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_host COMMAND jsrf_d3d8_host_test)
 # G41: the mirror's vertex-stream and index comparison, driven directly.
 add_executable(jsrf_d3d8_streams_test d3d8_streams_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_streams_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
@@ -1256,6 +1271,7 @@ add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
 # laziness counters, the positive control and the discovery tally.
 add_executable(jsrf_d3d8_combiner_check_test d3d8_combiner_check_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_combiner_check_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_combiner_check COMMAND jsrf_d3d8_combiner_check_test)
@@ -1264,6 +1280,7 @@ add_test(NAME jsrf_d3d8_combiner_check COMMAND jsrf_d3d8_combiner_check_test)
 # laziness counters, the SPECULAR_ENABLE writer order and the positive control.
 add_executable(jsrf_d3d8_ffv_check_test d3d8_ffv_check_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_ffv_check_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_ffv_check COMMAND jsrf_d3d8_ffv_check_test)

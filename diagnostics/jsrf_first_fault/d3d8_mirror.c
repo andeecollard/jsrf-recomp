@@ -25,10 +25,18 @@
  * the flusher on dirty 0x400 / 0x1000), and the fog updater's own registers
  * from the 0x195610 hook; texgen and fog colour are immediate and read at the
  * draw. SPECULAR_ENABLE has two writers, so the builder and light hooks number
- * their emissions. */
+ * their emissions.
+ *
+ * G51.1 adds the host's own 2D draws (d3d8_host_2d.c). With
+ * RECOMP_D3D8_HOST_2D=shadow (which arms the mirror too), each draw whose
+ * vertex shader handle is an XYZRHW FVF also gets a token BEFORE its commands
+ * (d3d8m_before_draw), so the host can snapshot the render target the draw
+ * starts from; the check behind the draw carries the index pointer and the
+ * few extra Simple-pushed states the host's fragment stage needs. */
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include "d3d8_host.h"
+#include "d3d8_host_2d.h"
 #include "nv2a_pusher.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +57,11 @@ static int d3d8m_on(void)
         const char *e = getenv("RECOMP_D3D8_MIRROR");
         m = e && e[0] && strcmp(e, "0") != 0;
         fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_MIRROR=%s\n", m ? "on" : "off");
+        /* G51.1: the host's 2D shadow is fed by the mirror's checks. */
+        if (!m && d3d8_host_2d_mode()) {
+            m = 1;
+            fprintf(stderr, "[D3D8-MIRROR] armed by RECOMP_D3D8_HOST_2D\n");
+        }
         if (m) atexit(d3d8m_exit);
     }
     return m;
@@ -56,6 +69,9 @@ static int d3d8m_on(void)
 static uint32_t m_tex[4], m_serial;
 static const uint32_t m_state_methods[11] = D3D8_HOST_STATE_METHODS;
 static uint32_t m_state_val[11], m_state_seen;
+/* G51.1: the Simple pushes the host's 2D fragment stage needs beyond those. */
+static const uint32_t m_x_methods[8] = D3D8_HOST_2D_EXTRA_METHODS;
+static uint32_t m_x_val[8], m_x_seen;
 
 /* SetRenderState_ZEnable / _StencilEnable(value): these reach the GPU through
  * their own setters, not Simple. What the renderer needs is "enabled or not",
@@ -104,6 +120,8 @@ void d3d8m_simple(uint32_t hdr, uint32_t value)
     if (((hdr >> 18) & 0x7FFu) != 1u || ((hdr >> 13) & 7u)) return;
     for (unsigned k = 0; k < 11; ++k)
         if (m_state_methods[k] == method) { m_state_val[k] = value; m_state_seen |= 1u << k; }
+    for (unsigned k = 0; k < 8; ++k)
+        if (m_x_methods[k] == method) { m_x_val[k] = value; m_x_seen |= 1u << k; }
 }
 static unsigned long long m_no_token;
 
@@ -318,14 +336,55 @@ void d3d8m_fog_entry(void)
     memcpy(m_fog_emit, f, sizeof f); m_fog_emit_seen = 1;
 }
 
+/* Write a host token into the guest ring at the current put pointer. */
+static void d3d8m_put_token(uint32_t tok)
+{
+    uint32_t dev = MEM32(0x0019DCE0u), put = MEM32(dev);
+    if (put >= MEM32(dev + 4u)) {                  /* the XDK's own reservation, as Clear uses it */
+        PUSH32(esp, 0x0019932Cu);
+        RECOMP_ABI_CALL(0x001916B0u, sub_001916B0);
+        put = eax;
+    }
+    RECOMP_MEM_WRITE32(0x0019932Eu, 0x001993A0u, put,
+                       (1u << 18) | (NV2A_HOST_TOKEN_SUBCHANNEL << 13) | NV2A_HOST_TOKEN_METHOD);
+    RECOMP_MEM_WRITE32(0x0019932Eu, 0x001993A0u, put + 4u, tok);
+    RECOMP_MEM_WRITE32(0x00199399u, 0x001993A0u, dev, put + 8u);
+}
+
+/* G51.1: before a pre-transformed 2D draw runs, a token that lets the host
+ * snapshot the render target the draw starts from. The vertex shader handle
+ * and render target are D3D's at this moment, which the draw does not change
+ * before it emits. The serial is the one d3d8m_after_draw will give it. */
+static unsigned long long m_pre_no_token;
+void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    uint32_t d, rt, tok;
+    (void)kind; (void)a1; (void)a2; (void)a3;
+    if (!d3d8m_on() || !d3d8_host_2d_mode()) return;
+    d = MEM32(0x0019DCE0u);
+    if (!d3d8_host_2d_is_fvf_xyzrhw(MEM32(d + 0x384u))) return;
+    rt = MEM32(d + 0x2070u);
+    tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
+                                   rt ? MEM32(rt + 0x10u) : 0u);
+    if (!tok) {
+        if (m_pre_no_token++ < 4)
+            fprintf(stderr, "[D3D8-MIRROR] G51.1: host token queue full before draw %u; the host skips it\n", m_serial + 1u);
+        return;
+    }
+    d3d8m_put_token(tok);
+}
+
 void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     D3D8HostDrawCheck c;
-    uint32_t tok, dev, put;
+    uint32_t tok;
     if (!d3d8m_on()) return;
     memset(&c, 0, sizeof c);
     c.serial = ++m_serial;
     d3d8m_streams(&c, kind, a1, a2, a3);
+    /* G51.1: every index, not only the first 16, and the extra states. */
+    c.idx_ptr = kind == 2 ? a3 : 0u;
+    memcpy(c.x_val, m_x_val, sizeof c.x_val); c.x_seen = m_x_seen;
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */
     c.ffc_valid = 1;
@@ -443,15 +502,6 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
                    c.ffv_control = 1; } }
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
-    dev = MEM32(0x0019DCE0u); put = MEM32(dev);
-    if (put >= MEM32(dev + 4u)) {                  /* the XDK's own reservation, as Clear uses it */
-        PUSH32(esp, 0x0019932Cu);
-        RECOMP_ABI_CALL(0x001916B0u, sub_001916B0);
-        put = eax;
-    }
-    RECOMP_MEM_WRITE32(0x0019932Eu, 0x001993A0u, put,
-                       (1u << 18) | (NV2A_HOST_TOKEN_SUBCHANNEL << 13) | NV2A_HOST_TOKEN_METHOD);
-    RECOMP_MEM_WRITE32(0x0019932Eu, 0x001993A0u, put + 4u, tok);
-    RECOMP_MEM_WRITE32(0x00199399u, 0x001993A0u, dev, put + 8u);
+    d3d8m_put_token(tok);
     if (m_serial % 20000u == 0) d3d8_host_report("mirror");
 }

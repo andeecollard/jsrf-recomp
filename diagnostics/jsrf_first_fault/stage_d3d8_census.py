@@ -240,6 +240,7 @@ def main():
             if a.mirror and name in ("sub_0018DF10", "sub_001993A0", "sub_00199300"):
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex);"
+                                " void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);"
                                 " void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);")
                 if name == "sub_0018DF10":
                     wrappers.append("static void %s(void) { uint32_t st = MEM32(esp + 4u), tx = MEM32(esp + 8u);"
@@ -248,9 +249,14 @@ def main():
                     # G41: the draw's three stdcall arguments, read before the
                     # original pops them. DrawIndexedVertices (kind 2) takes
                     # (prim, count, pIndexData); DrawVertices (kind 1) (prim, start, count).
+                    # G51.1: d3d8m_before_draw runs first -- it writes a token
+                    # ahead of the draw's commands for a pre-transformed 2D
+                    # draw when RECOMP_D3D8_HOST_2D is armed, and returns at
+                    # once otherwise.
                     kind = 2 if name == "sub_001993A0" else 1
                     wrappers.append("static void %s(void) { uint32_t a1 = MEM32(esp + 4u), a2 = MEM32(esp + 8u),"
-                                    " a3 = MEM32(esp + 12u); %s(); d3d8m_after_draw(%du, a1, a2, a3); }" % (hooked, body, kind))
+                                    " a3 = MEM32(esp + 12u); d3d8m_before_draw(%du, a1, a2, a3); %s();"
+                                    " d3d8m_after_draw(%du, a1, a2, a3); }" % (hooked, kind, body, kind))
                 body = hooked
                 manifest.append("mirror: %s" % name)
             wrappers.append(

@@ -1,0 +1,649 @@
+/* See d3d8_host_2d.h. Pure C: no device, no guest globals -- guest memory
+ * arrives as a pointer and a size, the renderer and the executor's sync as a
+ * backend. That is what lets jsrf_d3d8_host_2d_test drive all of it. */
+#include "d3d8_host_2d.h"
+#include "d3d8_ff_combiner.h"
+#include "../recomp_switch.h"
+#include <math.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#if defined(_WIN32)
+#include <direct.h>
+#define h2d_mkdir(p) _mkdir(p)
+#else
+#define h2d_mkdir(p) mkdir(p, 0755)
+#endif
+
+#define RAM_MASK 0x03FFFFFFu
+
+/* ---- classification ---- */
+int d3d8_host_2d_is_2d(const D3D8HostDrawCheck *c)
+{
+    return c->draw_kind != 0 && d3d8_host_2d_is_fvf_xyzrhw(c->vs_handle);
+}
+
+/* ---- building the draw from D3D state ---- */
+static const uint32_t k_st[11] = D3D8_HOST_STATE_METHODS;
+static const uint32_t k_x[8] = D3D8_HOST_2D_EXTRA_METHODS;
+/* D3D's last Simple push of `method`, or the NV2A reset value if it never pushed one. */
+static uint32_t st(const D3D8HostDrawCheck *c, uint32_t method, uint32_t dflt)
+{
+    for (unsigned k = 0; k < 11; ++k)
+        if (k_st[k] == method) return (c->st_seen & (1u << k)) ? c->st_val[k] : dflt;
+    for (unsigned k = 0; k < 8; ++k)
+        if (k_x[k] == method) return (c->x_seen & (1u << k)) ? c->x_val[k] : dflt;
+    return dflt;
+}
+static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
+static int blend_factor_ok(uint32_t f)
+{
+    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x308) || (f >= 0x8001 && f <= 0x8004);
+}
+static int blend_eq_ok(uint32_t e)
+{
+    return e == 0x8006 || e == 0x8007 || e == 0x8008 || e == 0x800A || e == 0x800B;
+}
+
+/* One attribute of one vertex, as the executor's fetch_attr decodes it:
+ * UB_D3D (a D3DCOLOR, stored B,G,R,A), F and UB_OGL. Anything else fails. */
+static int fetch(const uint8_t *ram, size_t ram_size, uint32_t offset, uint32_t format,
+                 uint32_t index, float out[4])
+{
+    uint32_t type = format & 0xFu, size = (format >> 4) & 0xFu, stride = format >> 8;
+    uint64_t at = (uint64_t)(offset & RAM_MASK) + (uint64_t)index * stride;
+    out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+    if (!size || !stride || at + 16u > ram_size) return 0;
+    const uint8_t *p = ram + at;
+    switch (type) {
+    case 0:  if (size != 4) return 0;
+             out[0] = p[2] / 255.0f; out[1] = p[1] / 255.0f; out[2] = p[0] / 255.0f; out[3] = p[3] / 255.0f;
+             return 1;
+    case 2:  for (uint32_t i = 0; i < size && i < 4; ++i) memcpy(&out[i], p + 4u * i, 4);
+             return 1;
+    case 4:  for (uint32_t i = 0; i < size && i < 4; ++i) out[i] = p[i] / 255.0f;
+             return 1;
+    default: return 0;
+    }
+}
+
+static const char *texture_from_d3d(const D3D8HostDrawCheck *c, unsigned u, D3D8H2DTexture *t)
+{
+    uint32_t f = c->format[u], fb = (f >> 8) & 0xFFu;
+    const uint32_t *tss = c->tss[u];
+    memset(t, 0, sizeof *t);
+    t->addr = c->data[u] & RAM_MASK; t->d3d_format = f; t->d3d_size = c->size[u]; t->fmt = fb;
+    t->levels = (f >> 16) & 0xFu;
+    if (fb == 0x11u) {                         /* LU_IMAGE_R5G6B5: pitch-linear */
+        t->linear = 1; t->levels = 1;
+        t->width = (c->size[u] & 0xFFFu) + 1u; t->height = ((c->size[u] >> 12) & 0xFFFu) + 1u;
+        t->pitch = ((c->size[u] >> 24) + 1u) * 64u;
+        if (t->pitch < t->width * 2u) return "texture pitch";
+    } else if (fb == 0x0Cu || fb == 0x0Eu || fb == 0x06u || fb == 0x07u || fb == 0x03u || fb == 0x04u) {
+        unsigned lw = (f >> 20) & 0xFu, lh = (f >> 24) & 0xFu;
+        if (lw > 12 || lh > 12) return "texture size";
+        t->width = 1u << lw; t->height = 1u << lh;
+        t->pitch = fb == 0x0Cu ? ((t->width + 3u) / 4u) * 8u : fb == 0x0Eu ? ((t->width + 3u) / 4u) * 16u
+                 : (fb == 0x03u || fb == 0x04u) ? t->width * 2u : t->width * 4u;
+        if (t->levels > 1u + (lw > lh ? lw : lh)) return "texture levels";
+    } else return "texture format";
+    if (!t->levels) return "texture levels";
+    /* D3DTADDRESS 1 wrap, 2 mirror, 3 clamp; a linear image never repeats
+     * (the executor's rule, and the hardware's: it has no wrap for them). */
+    t->wrap_u = tss[0]; t->wrap_v = tss[1];
+    if (t->wrap_u < 1 || t->wrap_u > 3 || t->wrap_v < 1 || t->wrap_v > 3) return "texture address mode";
+    if (t->linear) t->wrap_u = t->wrap_v = 3;
+    t->mag = tss[3] == 1u ? 1u : 2u;
+    {   uint32_t mn = tss[4] == 1u ? 1u : 2u, mip = tss[5] > 2u ? 2u : tss[5];
+        t->min_filter = mn + 2u * mip; }
+    {   float bias; memcpy(&bias, &tss[6], 4);
+        float scaled = (float)((double)bias * 256.0);
+        int32_t q = (scaled >= -2147483648.0f && scaled < 2147483648.0f) ? (int32_t)scaled : 0;
+        q = (int32_t)((uint32_t)q << 19) >> 19;              /* the register's 13 signed bits */
+        t->lod_bias = (float)q / 256.0f; }
+    return NULL;
+}
+
+/* Facing, by the rule nv2a_texture_copy_front_facing() applies (it lives in
+ * xbox_vsh, which this library must not depend on): screen-space area with y
+ * down, flipped when an odd number of the three w are negative. */
+static int culled(uint32_t cull_face, uint32_t front_cw, const float *a, const float *b, const float *cc)
+{
+    float ar = (b[0] - a[0]) * (cc[1] - a[1]) - (b[1] - a[1]) * (cc[0] - a[0]);
+    int flip = (((a[3] < 0) + (b[3] < 0) + (cc[3] < 0)) & 1) != 0;
+    int front = ((ar > 0) ^ flip) == (front_cw != 0);
+    return cull_face == 0x408u || (cull_face == 0x404u && front) || (cull_face == 0x405u && !front);
+}
+
+const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
+                               int control, D3D8Host2DDraw *d)
+{
+    D3D8H2DVertex *verts = d->verts;
+    memset(d, 0, sizeof *d);
+    d->verts = verts;
+    d->serial = c->serial; d->fvf = c->vs_handle; d->prim = c->prim; d->count = c->count;
+    d->draw_kind = c->draw_kind; d->ss_x = c->ss_x; d->ss_y = c->ss_y;
+    if (!verts) return "no vertex buffer";
+    if (!d3d8_host_2d_is_2d(c)) return "not pre-transformed";
+
+    /* Target. */
+    if (!c->rt) return "no render target";
+    d->rt_fmt = (c->rt_format >> 8) & 0xFFu;
+    if (d->rt_fmt != 0x11u) return "target format";            /* LU_IMAGE_R5G6B5 only */
+    d->rt_addr = c->rt_data & RAM_MASK;
+    d->rt_w = (c->rt_size & 0xFFFu) + 1u; d->rt_h = ((c->rt_size >> 12) & 0xFFFu) + 1u;
+    d->rt_pitch = ((c->rt_size >> 24) + 1u) * 64u;
+    if (d->rt_pitch < d->rt_w * 2u || (uint64_t)d->rt_addr + (uint64_t)d->rt_pitch * d->rt_h > ram_size)
+        return "target bounds";
+
+    /* Scissor: the viewport, supersample-scaled and cut to the target -- G39's derivation. */
+    d->sc_x0 = trunc_scaled(c->vp_x, c->ss_x); d->sc_y0 = trunc_scaled(c->vp_y, c->ss_y);
+    d->sc_x1 = trunc_scaled(c->vp_x + c->vp_w, c->ss_x) - 1; d->sc_y1 = trunc_scaled(c->vp_y + c->vp_h, c->ss_y) - 1;
+    if (d->sc_x0 < 0) d->sc_x0 = 0;
+    if (d->sc_y0 < 0) d->sc_y0 = 0;
+    if (d->sc_x1 > (int32_t)d->rt_w - 1) d->sc_x1 = (int32_t)d->rt_w - 1;
+    if (d->sc_y1 > (int32_t)d->rt_h - 1) d->sc_y1 = (int32_t)d->rt_h - 1;
+    if (d->sc_x1 < d->sc_x0 || d->sc_y1 < d->sc_y0) return "empty viewport";
+
+    /* Fragment state, as D3D pushed it. Depth and stencil: the shadow has no
+     * depth buffer, so a draw that could be depth-occluded is not drawn;
+     * ALWAYS with no stencil changes no colour and is. */
+    d->depth_test = st(c, 0x30C, 0); d->depth_func = st(c, 0x354, 0x201);
+    d->stencil_test = st(c, 0x32C, 0);
+    if (d->stencil_test) return "stencil test";
+    if (d->depth_test && d->depth_func != 0x207u) return "depth test";
+    if (c->ffv_valid && c->fg_cur.enable) return "fog";                 /* the executor refuses fog too */
+    d->alpha_test = st(c, 0x300, 0); d->alpha_func = st(c, 0x33C, 0x207); d->alpha_ref = st(c, 0x340, 0);
+    if (d->alpha_test && (d->alpha_func < 0x200u || d->alpha_func > 0x207u)) return "alpha func";
+    d->blend = st(c, 0x304, 0);
+    d->blend_src = st(c, 0x344, 1); d->blend_dst = st(c, 0x348, 0); d->blend_eq = st(c, 0x350, 0x8006);
+    d->blend_color = st(c, 0x34C, 0);
+    if (d->blend && (!blend_factor_ok(d->blend_src) || !blend_factor_ok(d->blend_dst) || !blend_eq_ok(d->blend_eq)))
+        return "blend";
+    d->dither = st(c, 0x310, 0) != 0;
+    d->color_mask = st(c, 0x358, 0x01010101u);
+
+    /* Combiners. */
+    d->pixel_shader = c->ffc_ps;
+    if (c->ffc_ps) {
+        const uint32_t *w = c->ps;
+        if (!c->ps_bound) return "pixel shader definition missing";
+        d->control = w[53]; d->cc = w[53] & 0xFu;
+        for (unsigned i = 0; i < 8; ++i) {
+            d->ai[i] = w[i]; d->k0[i] = w[10 + i]; d->k1[i] = w[18 + i]; d->ao[i] = w[26 + i];
+            d->ci[i] = w[34 + i]; d->co[i] = w[45 + i];
+        }
+        d->final_cw0 = w[8]; d->final_cw1 = w[9];
+        for (unsigned u = 0; u < 4; ++u) {
+            uint32_t mode = (w[54] >> (5u * u)) & 31u;
+            if (mode > 1u) return "texture shader mode";
+            if (mode == 1u) { if (!c->tex[u]) return "shader samples an unbound stage"; d->tmask |= 1u << u; }
+        }
+    } else {
+        D3D8FFCombiners o;
+        if (!c->ffc_valid) return "no combiner state";
+        if (d3d8_ff_combiners(&c->ffc_cur, &o) != 0 || !o.emitted) return "combiner unresolved";
+        d->control = o.combiner_control; d->cc = o.combiner_control & 0xFu;
+        memcpy(d->ci, o.color_icw, sizeof d->ci); memcpy(d->co, o.color_ocw, sizeof d->co);
+        memcpy(d->ai, o.alpha_icw, sizeof d->ai); memcpy(d->ao, o.alpha_ocw, sizeof d->ao);
+        d3d8_ff_texture_factor(c->tfactor, 0, d->k0, d->k1);
+        if (!d3d8_ff_final_combiner(c->fog_cur[0], c->fog_cur[1], c->fog_cur[2], c->fog_cur[3],
+                                    &d->final_cw0, &d->final_cw1))
+            return "final combiner not written";
+        for (unsigned u = 0; u < 4; ++u) if (c->tex[u]) d->tmask |= 1u << u;
+    }
+    if (!d->cc || d->cc > 8u) return "combiner count";
+    /* The final combiner as the executor models it: R0 (+ specular). */
+    if ((d->final_cw0 != 0xCu && d->final_cw0 != 0xEu) || d->final_cw1 != 0x1C80u) return "final combiner";
+    d->add_specular = d->final_cw0 == 0xEu;
+
+    for (unsigned u = 0; u < 4; ++u) {
+        const char *why;
+        if (!(d->tmask & (1u << u))) continue;
+        if ((why = texture_from_d3d(c, u, &d->tex[u]))) return why;
+        if ((uint64_t)d->tex[u].addr + d->tex[u].pitch > ram_size) return "texture bounds";
+    }
+
+    /* Vertices: G41's arrays at the draw's indices. */
+    if (!(c->va_on & 1u)) return "no position array";
+    if ((c->va_format[0] & 0xFFu) != 0x42u) return "position format";          /* float x 4 */
+    /* Triangles, strips, fans, quads and quad strips, triangulated exactly as
+     * nv2a_metal_draw does (the order decides facing). Points, lines and
+     * POLYGON (10) the executor refuses, so the host does not draw them. */
+    if (d->prim < 5u || d->prim > 9u) return "primitive";
+    if (c->count > 16384u) return "vertex count";
+    {
+        static uint32_t idx[16384 + 4];
+        uint32_t n = c->count, ntri = 0, t3[3], cull = st(c, 0x308, 0) ? st(c, 0x39C, 0x405) : 0;
+        uint32_t front_cw = st(c, 0x3A0, 0x901) == 0x900u;
+        for (uint32_t k = 0; k < n; ++k) {
+            if (c->draw_kind == 2) {
+                uint64_t at = (uint64_t)(c->idx_ptr & RAM_MASK) + 2u * k;
+                if (!c->idx_ptr || at + 2u > ram_size) return "index bounds";
+                idx[k] = (uint32_t)ram[at] | (uint32_t)ram[at + 1] << 8;
+            } else idx[k] = c->start + k;
+        }
+        for (uint32_t k = 0; ; ++k) {
+            /* Triangle k of the primitive, as the executor assembles it. */
+            if (d->prim == 5u)      { if (3u * k + 2u >= n) break; t3[0] = 3u*k; t3[1] = 3u*k+1u; t3[2] = 3u*k+2u; }
+            else if (d->prim == 6u) { if (k + 2u >= n) break;
+                                      if (k & 1u) { t3[0] = k + 1u; t3[1] = k; t3[2] = k + 2u; }
+                                      else        { t3[0] = k; t3[1] = k + 1u; t3[2] = k + 2u; } }
+            else if (d->prim == 7u) { if (k + 2u >= n) break; t3[0] = 0; t3[1] = k + 1u; t3[2] = k + 2u; }
+            else if (d->prim == 8u) { uint32_t q = k / 2u; if (4u * q + 3u >= n) break;
+                                      if (k & 1u) { t3[0] = 4u*q; t3[1] = 4u*q+2u; t3[2] = 4u*q+3u; }
+                                      else        { t3[0] = 4u*q; t3[1] = 4u*q+1u; t3[2] = 4u*q+2u; } }
+            else                    { uint32_t q = k / 2u; if (2u * q + 3u >= n) break;       /* quad strip */
+                                      if (k & 1u) { t3[0] = 2u*q; t3[1] = 2u*q+3u; t3[2] = 2u*q+2u; }
+                                      else        { t3[0] = 2u*q; t3[1] = 2u*q+1u; t3[2] = 2u*q+3u; } }
+            if (d->nverts + 3u > D3D8H2D_MAX_VERTS) return "vertex count";
+            D3D8H2DVertex *v = &d->verts[d->nverts];
+            int ok = 1;
+            for (unsigned j = 0; j < 3 && ok; ++j) {
+                uint32_t i = idx[t3[j]];
+                float pos[4];
+                memset(&v[j], 0, sizeof v[j]);
+                if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
+                float rhw = pos[3];
+                v[j].p[0] = pos[0] * c->ss_x; v[j].p[1] = pos[1] * c->ss_y; v[j].p[2] = pos[2];
+                v[j].p[3] = (rhw != 0.0f && isfinite(rhw)) ? 1.0f / rhw : 1.0f;
+                if ((c->va_on >> 3) & 1u) { if (!fetch(ram, ram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
+                else { v[j].d0[0] = v[j].d0[1] = v[j].d0[2] = v[j].d0[3] = 1.0f; }
+                if ((c->va_on >> 4) & 1u) { if (!fetch(ram, ram_size, c->va_offset[4], c->va_format[4], i, v[j].d1)) return "specular format"; }
+                for (unsigned u = 0; u < 4; ++u) {
+                    v[j].t[u][3] = 1.0f;
+                    if ((c->va_on >> (9u + u)) & 1u &&
+                        !fetch(ram, ram_size, c->va_offset[9 + u], c->va_format[9 + u], i, v[j].t[u])) return "texcoord format";
+                }
+                for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].p[q]) || !isfinite(v[j].d0[q]) || !isfinite(v[j].d1[q])) ok = 0;
+            }
+            if (!ok) continue;                                     /* the executor drops it too */
+            if (cull && culled(cull, front_cw, v[0].p, v[1].p, v[2].p)) continue;
+            d->nverts += 3u; ++ntri;
+        }
+        (void)ntri;
+    }
+    if (control) {
+        for (unsigned k = 0; k < d->nverts; ++k) { d->verts[k].p[0] += 2.0f; d->verts[k].d0[0] = 1.0f - d->verts[k].d0[0]; }
+        d->control_perturbed = 1;
+    }
+    /* Bounding box: every pixel either renderer could reach, with a margin so
+     * a half-pixel disagreement in placement lands inside the compared crop. */
+    d->bb_x0 = 1; d->bb_x1 = 0;
+    if (d->nverts) {
+        float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+        for (unsigned k = 0; k < d->nverts; ++k) {
+            const float *p = d->verts[k].p;
+            if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+            if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+        }
+        int32_t bx0 = (int32_t)floorf(x0) - 2, by0 = (int32_t)floorf(y0) - 2;
+        int32_t bx1 = (int32_t)ceilf(x1) + 2, by1 = (int32_t)ceilf(y1) + 2;
+        d->bb_x0 = bx0 < d->sc_x0 ? d->sc_x0 : bx0; d->bb_y0 = by0 < d->sc_y0 ? d->sc_y0 : by0;
+        d->bb_x1 = bx1 > d->sc_x1 ? d->sc_x1 : bx1; d->bb_y1 = by1 > d->sc_y1 ? d->sc_y1 : by1;
+    }
+    return NULL;
+}
+
+/* ---- the comparison ---- */
+void d3d8_host_2d_diff(const uint16_t *pre, const uint16_t *exec, const uint16_t *host,
+                       unsigned w, unsigned h, unsigned tol, D3D8H2DDiff *o)
+{
+    memset(o, 0, sizeof *o);
+    for (size_t k = 0, n = (size_t)w * h; k < n; ++k) {
+        uint16_t p = pre[k], e = exec[k], s = host[k];
+        ++o->pixels;
+        if (e != p) ++o->exec_changed;
+        if (s != p) ++o->host_changed;
+        if (e == s) continue;
+        int er[3] = { (int)(e >> 11) - (int)(s >> 11), (int)((e >> 5) & 63) - (int)((s >> 5) & 63),
+                      (int)(e & 31) - (int)(s & 31) };
+        unsigned worst = 0;
+        for (int ch = 0; ch < 3; ++ch) {
+            unsigned a = (unsigned)abs(er[ch]);
+            if (a > o->max_err[ch]) o->max_err[ch] = a;
+            if (a > worst) worst = a;
+        }
+        if (worst > tol) ++o->mismatch;
+    }
+}
+
+/* ---- the shadow bookkeeping ----
+ * Everything below runs on the pusher thread: the pre and post tokens and
+ * FLIP_STALL are all dispatched there, in ring order. The atexit report reads
+ * the counters from another thread; a torn read of a counter is acceptable
+ * there and nowhere else. */
+static D3D8Host2DBackend s_be;
+static int s_have_be;
+static int s_mode = -1, s_control, s_every = 600;
+static unsigned s_tol = 1, s_dump_max = 8, s_dumped;
+static char s_dump_dir[512];
+
+typedef struct {
+    uint32_t serial, x0, y0, w, h, exec_active, exec_mode;
+    uint16_t *pre, *exec, *host;
+    D3D8Host2DDraw info;                     /* verts pointer cleared: summary only */
+} Rec;
+#define MAX_RECS 256u
+static Rec s_rec[MAX_RECS];
+static unsigned s_nrec;
+static unsigned long long s_rec_dropped;
+
+static uint16_t *s_snap; static size_t s_snap_cap;
+static uint32_t s_snap_serial, s_snap_addr, s_snap_pitch, s_snap_h, s_snap_valid;
+
+static unsigned long long s_flips, s_draws, s_pre, s_pre_skipped, s_no_pre, s_no_backend, s_built, s_empty,
+                          s_rendered, s_render_failed, s_compared, s_exact, s_within, s_mismatching,
+                          s_px, s_px_exec, s_px_host, s_px_mm, s_mode6, s_not_mode6, s_exec_inactive,
+                          s_vsflag_pass, s_idx_changed, s_sync_calls, s_ctx_b, s_diffuse_default,
+                          s_tss_ci_off, s_modes_disagree;
+static unsigned s_max_err[3];
+static unsigned s_printed_mm, s_printed_consts, s_printed_frames;
+#define NREASON 40
+static struct { const char *why; unsigned long long n; } s_reason[NREASON];
+static void count_reason(const char *why)
+{
+    for (unsigned i = 0; i < NREASON; ++i) {
+        if (s_reason[i].why == why) { ++s_reason[i].n; return; }
+        if (!s_reason[i].why) { s_reason[i].why = why; s_reason[i].n = 1; return; }
+    }
+}
+
+static void h2d_exit(void) { d3d8_host_2d_report("exit"); }
+
+/* Read once. The mirror (guest thread) and the ring consumer (pusher
+ * thread) can both ask first; the flag makes exactly one of them read the
+ * environment, print and register the exit report, and the other spins the
+ * few microseconds that takes. */
+int d3d8_host_2d_mode(void)
+{
+    static atomic_flag s_init = ATOMIC_FLAG_INIT;
+    static _Atomic int s_ready;
+    if (atomic_load_explicit(&s_ready, memory_order_acquire)) return s_mode;
+    if (atomic_flag_test_and_set(&s_init)) {
+        while (!atomic_load_explicit(&s_ready, memory_order_acquire)) { }
+        return s_mode;
+    }
+    {
+        const char *e = getenv("RECOMP_D3D8_HOST_2D"), *v;
+        s_mode = 0;
+        if (e && (!strcmp(e, "shadow") || !strcmp(e, "1"))) s_mode = 1;
+        else if (e && !strcmp(e, "draw")) {
+            s_mode = 1;
+            fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_2D=draw is not implemented yet"
+                            " (the host would replace the executor's pixels); running as shadow\n");
+        } else if (e && e[0] && strcmp(e, "0") && strcmp(e, "off"))
+            fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_2D=%s not understood; off (shadow|draw)\n", e);
+        if (s_mode) {
+            if ((v = getenv("RECOMP_D3D8_HOST_2D_TOL")) && *v) s_tol = (unsigned)atoi(v);
+            if ((v = getenv("RECOMP_D3D8_HOST_2D_DUMP_MAX")) && *v) s_dump_max = (unsigned)atoi(v);
+            if ((v = getenv("RECOMP_D3D8_HOST_2D_EVERY")) && *v && atoi(v) > 0) s_every = atoi(v);
+            if ((v = getenv("RECOMP_D3D8_HOST_2D_DUMP")) && *v) {
+                snprintf(s_dump_dir, sizeof s_dump_dir, "%s", v);
+                if (h2d_mkdir(s_dump_dir) != 0 && errno != EEXIST) {
+                    fprintf(stderr, "[D3D8-HOST-2D] cannot create dump dir %s: %s\n", s_dump_dir, strerror(errno));
+                    s_dump_dir[0] = 0;
+                }
+            }
+            s_control = recomp_switch_on("RECOMP_D3D8_HOST_2D_CONTROL");
+            fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_2D=shadow: pre-transformed 2D draws are drawn again"
+                            " by the host from D3D state and compared with the executor (tolerance %u step%s in 565,"
+                            " dump %s, max %u)%s\n", s_tol, s_tol == 1 ? "" : "s",
+                    s_dump_dir[0] ? s_dump_dir : "off", s_dump_max,
+                    s_control ? " -- POSITIVE CONTROL: host geometry +2 px, diffuse red inverted; every covered draw MUST mismatch" : "");
+            atexit(h2d_exit);
+        }
+    }
+    atomic_store_explicit(&s_ready, 1, memory_order_release);
+    return s_mode;
+}
+
+void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b)
+{
+    s_be = *b; s_have_be = b && b->render && b->sync_range && b->ram && b->ram_size;
+}
+
+void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size)
+{
+    uint32_t addr = rt_data & RAM_MASK, h = ((rt_size >> 12) & 0xFFFu) + 1u, pitch = ((rt_size >> 24) + 1u) * 64u;
+    size_t bytes = (size_t)pitch * h;
+    s_snap_valid = 0;
+    if (!d3d8_host_2d_mode()) return;
+    ++s_pre;
+    if (!s_have_be || ((rt_format >> 8) & 0xFFu) != 0x11u || addr + bytes > s_be.ram_size) { ++s_pre_skipped; return; }
+    if (bytes > s_snap_cap) {
+        uint16_t *n = realloc(s_snap, bytes);
+        if (!n) { ++s_pre_skipped; return; }
+        s_snap = n; s_snap_cap = bytes;
+    }
+    ++s_sync_calls;
+    s_be.sync_range(s_be.ram + addr, bytes);
+    memcpy(s_snap, s_be.ram + addr, bytes);
+    s_snap_serial = serial; s_snap_addr = addr; s_snap_pitch = pitch; s_snap_h = h; s_snap_valid = 1;
+}
+
+static uint16_t *crop(const uint8_t *base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+{
+    uint16_t *o = malloc((size_t)w * h * 2u);
+    if (!o) return NULL;
+    for (uint32_t y = 0; y < h; ++y) memcpy(o + (size_t)y * w, base + (size_t)(y0 + y) * pitch + 2u * x0, 2u * w);
+    return o;
+}
+
+void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecDrawTextures *))
+{
+    static D3D8ExecDrawTextures e;
+    static D3D8H2DVertex *verts;
+    static D3D8Host2DDraw d;
+    const char *why;
+    if (!d3d8_host_2d_mode()) return;
+    ++s_draws;
+    memset(&e, 0, sizeof e);
+    if (exec_source) exec_source(&e);
+    /* Cross-checks, from the executor's side, never used to draw: is the class
+     * the executor's mode 6, did it draw at all, and what did D3D program as
+     * the pass-through's constants (c-38, c-37: slots 58, 59)? */
+    if (exec_source) {
+        if (e.exec_mode == 6u) ++s_mode6; else ++s_not_mode6;
+        if (!e.active) ++s_exec_inactive;
+    }
+    if (c->ffv_valid && (c->ffv_vs_flags & 0x2u)) ++s_vsflag_pass;
+    for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && (c->format[u] & 3u) == 2u) { ++s_ctx_b; break; }
+    for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && c->tss[u][28] != u) { ++s_tss_ci_off; break; }
+    if (!((c->va_on >> 3) & 1u)) ++s_diffuse_default;
+    if (s_printed_consts < 4 && e.regs_valid) {
+        ++s_printed_consts;
+        fprintf(stderr, "[D3D8-HOST-2D] draw %u fvf=%03X exec mode %u prog_start %u: pass-through constants"
+                        " c-38 = %g %g %g %g, c-37 = %g %g %g %g | host scale ss=%g,%g offset 0,0 z as given\n",
+                c->serial, c->vs_handle, e.exec_mode, e.prog_start,
+                e.vc[58][0], e.vc[58][1], e.vc[58][2], e.vc[58][3], e.vc[59][0], e.vc[59][1], e.vc[59][2], e.vc[59][3],
+                c->ss_x, c->ss_y);
+    }
+    if (!s_have_be) { ++s_no_backend; return; }
+    if (!s_snap_valid || s_snap_serial != c->serial) { ++s_no_pre; return; }
+    s_snap_valid = 0;
+    if (!verts && !(verts = malloc(sizeof *verts * D3D8H2D_MAX_VERTS))) { count_reason("out of memory"); return; }
+    d.verts = verts;
+    if ((why = d3d8_host_2d_build(c, s_be.ram, s_be.ram_size, s_control, &d))) { count_reason(why); return; }
+    ++s_built;
+    /* The texture shader stage modes the host implies (PROJECT2D per sampled
+     * stage) against the executor's 0x1E70. */
+    if (e.regs_valid) {
+        uint32_t want = 0;
+        for (unsigned u = 0; u < 4; ++u) if (d.tmask & (1u << u)) want |= 1u << (5u * u);
+        if (want != (e.regs[0x1E70u / 4u] & 0xFFFFFu)) ++s_modes_disagree;
+    }
+    /* Did the index data move between the draw and now? (G41 carries the first 16 as D3D was handed them.) */
+    if (c->draw_kind == 2 && c->idx_ptr) {
+        for (uint32_t k = 0; k < c->nidx && k < D3D8_HOST_IDX_N; ++k) {
+            uint64_t at = (uint64_t)(c->idx_ptr & RAM_MASK) + 2u * k;
+            if (at + 2u <= s_be.ram_size && (uint16_t)(s_be.ram[at] | s_be.ram[at + 1] << 8) != c->idx[k]) { ++s_idx_changed; break; }
+        }
+    }
+    if (d.bb_x1 < d.bb_x0 || d.bb_y1 < d.bb_y0 || d.rt_addr != s_snap_addr || d.rt_pitch != s_snap_pitch) {
+        if (d.rt_addr != s_snap_addr || d.rt_pitch != s_snap_pitch) count_reason("target moved between the tokens");
+        else ++s_empty;
+        return;
+    }
+    if (s_nrec >= MAX_RECS) { ++s_rec_dropped; return; }
+    ++s_sync_calls;
+    s_be.sync_range(s_be.ram + d.rt_addr, (size_t)d.rt_pitch * d.rt_h);
+    {
+        Rec *r = &s_rec[s_nrec];
+        uint32_t x0 = (uint32_t)d.bb_x0, y0 = (uint32_t)d.bb_y0, w = (uint32_t)(d.bb_x1 - d.bb_x0 + 1), h = (uint32_t)(d.bb_y1 - d.bb_y0 + 1);
+        memset(r, 0, sizeof *r);
+        r->serial = c->serial; r->x0 = x0; r->y0 = y0; r->w = w; r->h = h;
+        r->exec_active = exec_source ? (uint32_t)e.active : 1u; r->exec_mode = e.exec_mode;
+        r->pre = crop((const uint8_t *)s_snap, s_snap_pitch, x0, y0, w, h);
+        r->exec = crop(s_be.ram + d.rt_addr, d.rt_pitch, x0, y0, w, h);
+        r->host = r->pre ? malloc((size_t)w * h * 2u) : NULL;
+        if (!r->pre || !r->exec || !r->host) { free(r->pre); free(r->exec); free(r->host); count_reason("out of memory"); return; }
+        memcpy(r->host, r->pre, (size_t)w * h * 2u);
+        if (s_be.render(&d, s_be.ram, s_be.ram_size, r->host, w, x0, y0, w, h) != 0) {
+            ++s_render_failed;
+            count_reason(s_be.last_error ? s_be.last_error() : "render failed");
+            free(r->pre); free(r->exec); free(r->host);
+            return;
+        }
+        ++s_rendered;
+        r->info = d; r->info.verts = NULL;
+        ++s_nrec;
+    }
+}
+
+/* One PPM per mismatching draw: starting pixels | executor | host | difference
+ * (white over tolerance, grey within it, black equal), side by side with a
+ * magenta rule between panels. */
+static void rgb565(uint16_t v, uint8_t o[3])
+{
+    unsigned r = v >> 11, g = (v >> 5) & 63u, b = v & 31u;
+    o[0] = (uint8_t)((r << 3) | (r >> 2)); o[1] = (uint8_t)((g << 2) | (g >> 4)); o[2] = (uint8_t)((b << 3) | (b >> 2));
+}
+static void dump(const Rec *r, const D3D8H2DDiff *df)
+{
+    char path[640];
+    unsigned W = 4u * r->w + 3u;
+    FILE *f;
+    snprintf(path, sizeof path, "%s/h2d_f%06llu_d%08u.ppm", s_dump_dir, s_flips, r->serial);
+    if (!(f = fopen(path, "wb"))) { fprintf(stderr, "[D3D8-HOST-2D] dump %s: %s\n", path, strerror(errno)); return; }
+    fprintf(f, "P6\n%u %u\n255\n", W, r->h);
+    for (uint32_t y = 0; y < r->h; ++y) {
+        for (unsigned panel = 0; panel < 4; ++panel) {
+            for (uint32_t x = 0; x < r->w; ++x) {
+                size_t k = (size_t)y * r->w + x;
+                uint8_t px[3];
+                if (panel == 0) rgb565(r->pre[k], px);
+                else if (panel == 1) rgb565(r->exec[k], px);
+                else if (panel == 2) rgb565(r->host[k], px);
+                else {
+                    uint16_t e = r->exec[k], s = r->host[k];
+                    unsigned worst = 0;
+                    int d3[3] = { (int)(e >> 11) - (int)(s >> 11), (int)((e >> 5) & 63) - (int)((s >> 5) & 63), (int)(e & 31) - (int)(s & 31) };
+                    for (int ch = 0; ch < 3; ++ch) if ((unsigned)abs(d3[ch]) > worst) worst = (unsigned)abs(d3[ch]);
+                    px[0] = px[1] = px[2] = (uint8_t)(worst > s_tol ? 255 : worst ? 96 : 0);
+                }
+                fwrite(px, 1, 3, f);
+            }
+            if (panel < 3) { static const uint8_t m[3] = { 255, 0, 255 }; fwrite(m, 1, 3, f); }
+        }
+    }
+    fclose(f);
+    snprintf(path, sizeof path, "%s/h2d_index.txt", s_dump_dir);
+    if ((f = fopen(path, "a"))) {
+        const D3D8Host2DDraw *i = &r->info;
+        fprintf(f, "flip %llu draw %u bbox %u,%u %ux%u mismatch %llu of %llu max_err %u,%u,%u exec_changed %llu"
+                   " host_changed %llu | fvf %03X prim %u count %u tmask %X tex0 fmt %02X %ux%u cc %u ps %u"
+                   " blend %u %X/%X eq %X alpha %u func %X ref %u dither %u mask %08X exec_active %u mode %u\n",
+                s_flips, r->serial, r->x0, r->y0, r->w, r->h, df->mismatch, df->pixels, df->max_err[0], df->max_err[1],
+                df->max_err[2], df->exec_changed, df->host_changed, i->fvf, i->prim, i->count, i->tmask,
+                i->tex[0].fmt, i->tex[0].width, i->tex[0].height, i->cc, i->pixel_shader != 0, i->blend,
+                i->blend_src, i->blend_dst, i->blend_eq, i->alpha_test, i->alpha_func, i->alpha_ref, i->dither,
+                i->color_mask, r->exec_active, r->exec_mode);
+        fclose(f);
+    }
+}
+
+void d3d8_host_2d_flip(void)
+{
+    unsigned long long px = 0, mm = 0, fe = 0, fh = 0;
+    unsigned worst[3] = { 0, 0, 0 }, bad = 0, nrec = s_nrec;
+    if (!d3d8_host_2d_mode()) return;
+    ++s_flips;
+    for (unsigned k = 0; k < s_nrec; ++k) {
+        Rec *r = &s_rec[k];
+        D3D8H2DDiff df;
+        d3d8_host_2d_diff(r->pre, r->exec, r->host, r->w, r->h, s_tol, &df);
+        ++s_compared;
+        px += df.pixels; mm += df.mismatch; fe += df.exec_changed; fh += df.host_changed;
+        for (int ch = 0; ch < 3; ++ch) {
+            if (df.max_err[ch] > worst[ch]) worst[ch] = df.max_err[ch];
+            if (df.max_err[ch] > s_max_err[ch]) s_max_err[ch] = df.max_err[ch];
+        }
+        if (df.mismatch) {
+            ++s_mismatching; ++bad;
+            if (s_printed_mm < 24) {
+                const D3D8Host2DDraw *i = &r->info;
+                ++s_printed_mm;
+                fprintf(stderr, "[D3D8-HOST-2D] flip %llu draw %u MISMATCH bbox %u,%u %ux%u: %llu of %llu px over"
+                                " tolerance, max error r%u g%u b%u; executor changed %llu, host %llu%s | fvf %03X prim %u"
+                                " count %u tmask %X tex0 %02X %ux%u cc %u%s blend %u %X/%X alpha %u>%u dither %u\n",
+                        s_flips, r->serial, r->x0, r->y0, r->w, r->h, df.mismatch, df.pixels,
+                        df.max_err[0], df.max_err[1], df.max_err[2], df.exec_changed, df.host_changed,
+                        r->exec_active ? "" : " (EXECUTOR DID NOT DRAW IT)", i->fvf, i->prim, i->count, i->tmask,
+                        i->tex[0].fmt, i->tex[0].width, i->tex[0].height, i->cc, i->pixel_shader ? " ps" : "",
+                        i->blend, i->blend_src, i->blend_dst, i->alpha_test, i->alpha_ref, i->dither);
+            }
+            if (s_dump_dir[0] && s_dumped < s_dump_max) { ++s_dumped; dump(r, &df); }
+        } else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_within;
+        else ++s_exact;
+        free(r->pre); free(r->exec); free(r->host);
+    }
+    s_px += px; s_px_mm += mm; s_px_exec += fe; s_px_host += fh;
+    s_nrec = 0;
+    if (nrec && (s_printed_frames < 30 || (bad && s_printed_frames < 200))) {
+        ++s_printed_frames;
+        fprintf(stderr, "[D3D8-HOST-2D] flip %llu: %u 2D draws compared, %u mismatching | %llu px in their boxes,"
+                        " executor changed %llu, host %llu, %llu over tolerance, max error r%u g%u b%u\n",
+                s_flips, nrec, bad, px, fe, fh, mm, worst[0], worst[1], worst[2]);
+    }
+    if (s_flips % (unsigned long long)s_every == 0) d3d8_host_2d_report("periodic");
+}
+
+void d3d8_host_2d_get_stats(D3D8H2DStats *o)
+{
+    o->draws = s_draws; o->built = s_built; o->rendered = s_rendered; o->compared = s_compared;
+    o->exact = s_exact; o->within = s_within; o->mismatching = s_mismatching;
+    o->px = s_px; o->px_mismatch = s_px_mm; o->dumped = s_dumped;
+}
+
+void d3d8_host_2d_report(const char *why)
+{
+    if (s_mode <= 0) return;
+    fprintf(stderr, "[D3D8-HOST-2D] %s flips=%llu 2d_draws=%llu (executor mode 6: %llu, other %llu; executor did not"
+                    " draw %llu; D3D object pass-through flag %llu) pre_tokens=%llu (skipped %llu) no_pre=%llu"
+                    " no_backend=%llu built=%llu empty=%llu rendered=%llu render_failed=%llu frame_full=%llu"
+                    " executor_syncs=%llu\n",
+            why, s_flips, s_draws, s_mode6, s_not_mode6, s_exec_inactive, s_vsflag_pass, s_pre, s_pre_skipped,
+            s_no_pre, s_no_backend, s_built, s_empty, s_rendered, s_render_failed, s_rec_dropped, s_sync_calls);
+    fprintf(stderr, "[D3D8-HOST-2D] %s compared=%llu EXACT=%llu within_tolerance=%llu MISMATCHING=%llu | pixels in"
+                    " boxes=%llu executor_changed=%llu host_changed=%llu over_tolerance=%llu max_error r%u g%u b%u"
+                    " (565 steps, tolerance %u)\n",
+            why, s_compared, s_exact, s_within, s_mismatching, s_px, s_px_exec, s_px_host, s_px_mm,
+            s_max_err[0], s_max_err[1], s_max_err[2], s_tol);
+    fprintf(stderr, "[D3D8-HOST-2D] %s inputs: textures in DMA context B %llu, TEXCOORDINDEX != stage %llu,"
+                    " diffuse defaulted to white %llu, index data changed before the token %llu,"
+                    " texture stage modes differ from the executor's 0x1E70 %llu\n",
+            why, s_ctx_b, s_tss_ci_off, s_diffuse_default, s_idx_changed, s_modes_disagree);
+    {
+        int any = 0;
+        for (unsigned i = 0; i < NREASON && s_reason[i].why; ++i) {
+            if (!any) { fprintf(stderr, "[D3D8-HOST-2D] %s not drawn by the host:", why); any = 1; }
+            fprintf(stderr, " %s=%llu;", s_reason[i].why, s_reason[i].n);
+        }
+        if (any) fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}

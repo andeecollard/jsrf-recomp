@@ -215,6 +215,18 @@ VALUE_CARRYING = {
     "RECOMP_PAD_DEADZONE",
     # Which USB port to attach the pad to. A port number, and port 0 exists.
     "RECOMP_USB_PORT",
+    # G51.1, the host's own 2D draws (d3d8_host_2d.c). The switch names a MODE,
+    # not a state: "shadow" draws beside the executor and compares, and "draw"
+    # is reserved for replacing the executor's pixels -- a boolean cannot name
+    # the second arm. Its knobs are a tolerance in 565 steps, a dump directory,
+    # a cap on dumps and a report interval in flips; 0 is a meaningful
+    # tolerance. The positive control, RECOMP_D3D8_HOST_2D_CONTROL, is a plain
+    # boolean and goes through recomp_switch_on.
+    "RECOMP_D3D8_HOST_2D",
+    "RECOMP_D3D8_HOST_2D_TOL",
+    "RECOMP_D3D8_HOST_2D_DUMP",
+    "RECOMP_D3D8_HOST_2D_DUMP_MAX",
+    "RECOMP_D3D8_HOST_2D_EVERY",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

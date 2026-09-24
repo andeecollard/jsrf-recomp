@@ -136,7 +136,18 @@ typedef struct {
      * last holds the register; the mirror numbers the emissions. */
     uint32_t lt_emit_seq, sp_emit_seq, sp_emit_val;
     uint32_t ffv_control;               /* RECOMP_D3D8_MIRROR_CONTROL: perturb one word per group */
+    /* ---- G51.1: pre-transformed 2D, drawn by the host (d3d8_host_2d.c) ----
+     * idx_ptr is DrawIndexedVertices' pIndexData (0 for DrawVertices): the
+     * host fetches every index, not only the first D3D8_HOST_IDX_N. x_val is
+     * D3D's last SetRenderState_Simple push of each method in
+     * D3D8_HOST_2D_EXTRA_METHODS, and x_seen which of them it pushed at all. */
+    uint32_t idx_ptr;
+    uint32_t x_val[8], x_seen;
 } D3D8HostDrawCheck;
+/* G51.1: the Simple-pushed methods the host's 2D draw needs beyond
+ * D3D8_HOST_STATE_METHODS: CULL_FACE_ENABLE, DITHER_ENABLE, BLEND_COLOR,
+ * COLOR_MASK, CULL_FACE, FRONT_FACE, ZMIN_MAX_CONTROL, FOG_ENABLE. */
+#define D3D8_HOST_2D_EXTRA_METHODS { 0x308, 0x310, 0x34C, 0x358, 0x39C, 0x3A0, 0x1D78, 0x2A4 }
 /* G43: the combiner registers compared, one word each, in this order. */
 #define D3D8_HOST_FFC_N 51u
 typedef struct {
@@ -199,6 +210,12 @@ typedef struct {
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
+/* G51.1: a token written BEFORE a pre-transformed 2D draw's commands. When
+ * the ring consumer reaches it the executor has run everything before that
+ * draw, so the render target holds what the draw starts from; the handler
+ * (d3d8_host_2d_pre) snapshots it for the host's shadow. `serial` is the
+ * serial the mirror's after-draw check of the same draw will carry. */
+uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size);
 
 typedef struct {
     unsigned long long enqueued, replayed, methods_replayed, full, bad_token;
