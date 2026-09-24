@@ -1,0 +1,4 @@
+[
+  {"address": "0x0007CAE0", "name": "CActSequence_PrepareTutorial", "lib": "chapter",
+   "note": "CActSequence::PrepareTutorial; replaced by KeybadeBlox's JSRF-ChapterSelect mod, and by chapter_select.c here under RECOMP_CHAPTER_SELECT"}
+]
