@@ -56,6 +56,7 @@ extern int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, f
 extern void nv2a_pb_exec_host_skip(int on);
 extern const char *nv2a_ff_vertex(const uint32_t m[2048], const float in[16][4], float out[16][4]);
 extern unsigned long long nv2a_pb_exec_host_skipped(void);
+extern void nv2a_pb_exec_mode_counts(unsigned long long out[3]);
 extern unsigned long long nv2a_pb_exec_host_seen(void);
 #endif
 static int pad_sentinel(void);
@@ -5156,7 +5157,7 @@ int main(int argc, char **argv)
              * pre-transformed 2D class again with its own Metal pipeline and
              * compares it with the executor at every flip. Unset, nothing is
              * registered and the flip hook stays NULL. */
-            if (d3d8_host_2d_mode() || d3d8_host_ff_mode() || d3d8_host_vs_mode()) {   /* shadow or draw; 2D, FF or programmable */
+            if (d3d8_host_armed(NULL, 0)) {   /* any host class, shadow or draw: the one arming function */
                 extern void nv2a_pb_exec_set_flip_hook(void (*)(void));
                 D3D8Host2DBackend be;
                 memset(&be, 0, sizeof be);
@@ -5173,6 +5174,7 @@ int main(int argc, char **argv)
                 be.external_stats = d3d8_host_2d_metal_stats;
                 be.exec_skip = nv2a_pb_exec_host_skip;
                 be.exec_skipped = nv2a_pb_exec_host_skipped;
+                be.exec_mode_counts = nv2a_pb_exec_mode_counts;
                 be.exec_seen = nv2a_pb_exec_host_seen;
                 { extern void nv2a_pb_exec_host_skip_late(int);
                   nv2a_pb_exec_host_skip_late((d3d8_host_2d_bisect() & 128u) != 0); }

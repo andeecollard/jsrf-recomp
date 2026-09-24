@@ -711,7 +711,53 @@ static unsigned long long s_vs_seen, s_vs_draws, s_vs_built, s_vs_compared, s_vs
 static unsigned long long s_vs_px, s_vs_px_mm, s_vs_exec_changed, s_vs_host_changed, s_vs_mm_cov_exec, s_vs_mm_cov_host;
 static unsigned long long s_vs_const_match, s_vs_const_differ, s_vs_const_slot_differ[192];
 static unsigned s_vs_max_err[3], s_vs_printed_const;
+static unsigned long long s_vs_exec_prog, s_vs_exec_not_prog;
 static uint32_t s_vs_prog_hash[128]; static unsigned s_vs_progs; static unsigned long long s_vs_prog_overflow;
+/* THE CLASS SWITCHES, once. A new host class adds its row here and nowhere
+ * else; d3d8_host_armed is what every gate asks. The value-carrying knobs
+ * (RECOMP_D3D8_HOST_FF_STRIDE, _2D_TOL, _2D_CONTROL, _VERIFY, _BISECT,
+ * _2D_DUMP, _2D_EVERY) only modify an armed class; set without one they are
+ * reported, not silently ignored. */
+int d3d8_host_vs_mode(void);
+static const struct { const char *name; int (*mode)(void); } k_host_classes[] = {
+    { "RECOMP_D3D8_HOST_2D", d3d8_host_2d_mode },
+    { "RECOMP_D3D8_HOST_FF", d3d8_host_ff_mode },
+    { "RECOMP_D3D8_HOST_VS", d3d8_host_vs_mode },
+};
+unsigned d3d8_host_class_switches(void) { return (unsigned)(sizeof k_host_classes / sizeof k_host_classes[0]); }
+const char *d3d8_host_class_switch(unsigned i) { return i < d3d8_host_class_switches() ? k_host_classes[i].name : NULL; }
+unsigned d3d8_host_armed(char *why, size_t why_size)
+{
+    unsigned mask = 0, i;
+    size_t used = 0;
+    if (why && why_size) why[0] = 0;
+    for (i = 0; i < d3d8_host_class_switches(); ++i) {
+        if (k_host_classes[i].mode() <= 0) continue;
+        mask |= 1u << i;
+        if (why && used < why_size) used += (size_t)snprintf(why + used, why_size - used, "%s%s", used ? " " : "", k_host_classes[i].name);
+    }
+    return mask;
+}
+int d3d8_host_mirror_armed(char *why, size_t why_size)
+{
+    static const char *const knobs[] = { "RECOMP_D3D8_HOST_FF_STRIDE", "RECOMP_D3D8_HOST_2D_TOL", "RECOMP_D3D8_HOST_2D_CONTROL",
+                                         "RECOMP_D3D8_HOST_VERIFY", "RECOMP_D3D8_HOST_BISECT", "RECOMP_D3D8_HOST_2D_DUMP",
+                                         "RECOMP_D3D8_HOST_2D_EVERY", "RECOMP_D3D8_HOST_2D_DUMP_MAX" };
+    int m = recomp_switch_on("RECOMP_D3D8_MIRROR");
+    unsigned armed = d3d8_host_armed(why, why_size);
+    if (m && !armed && why && why_size) snprintf(why, why_size, "RECOMP_D3D8_MIRROR");
+    if (!armed) {
+        static int told;
+        for (unsigned k = 0; k < sizeof knobs / sizeof knobs[0]; ++k) {
+            const char *v = getenv(knobs[k]);
+            if (v && v[0] && !told++)
+                fprintf(stderr, "[D3D8-HOST] %s=%s is set but no host class is armed (%s, %s or %s): it does nothing\n",
+                        knobs[k], v, k_host_classes[0].name, k_host_classes[1].name, k_host_classes[2].name);
+        }
+    }
+    return m || armed != 0;
+}
+
 int d3d8_host_vs_mode(void)
 {
     if (s_vsmode < 0) {
@@ -901,7 +947,7 @@ void d3d8_host_2d_pre(uint32_t serial, uint32_t vs_handle, uint32_t rt_data, uin
     uint32_t w = (rt_size & 0xFFFu) + 1u;
     size_t bytes = (size_t)pitch * h;
     s_snap_valid = 0; s_zsnap_valid = 0;
-    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode() && d3d8_host_vs_mode() <= 0) return;
+    if (!d3d8_host_armed(NULL, 0)) return;
     /* this flip is not shadowed; in FF draw mode an FF pre token is a verify draw, always compared */
     if (d3d8_host_2d_is_fvf_ff(vs_handle) && d3d8_host_ff_mode() == 1 && !ff_sampled()) return;
     if ((vs_handle & 1u) && d3d8_host_vs_mode() == 1 && !ff_sampled()) return;
@@ -963,6 +1009,9 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     if (exec_source && cls == 1) {
         if (e.exec_mode == 6u) ++s_mode6; else ++s_not_mode6;
         if (!e.active) ++s_exec_inactive;
+    }
+    if (exec_source && cls == 3) {   /* the executor agrees this is a program: not 4, not 6 */
+        if (e.exec_mode != 4u && e.exec_mode != 6u) ++s_vs_exec_prog; else ++s_vs_exec_not_prog;
     }
     if (exec_source && cls == 2) {
         if (e.exec_mode == 4u) ++s_ff_mode4; else ++s_ff_not_mode4;
@@ -1464,7 +1513,7 @@ void d3d8_host_2d_flip(void)
 {
     unsigned long long px = 0, mm = 0, fe = 0, fh = 0;
     unsigned worst[3] = { 0, 0, 0 }, bad = 0, nrec = s_nrec;
-    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode() && d3d8_host_vs_mode() <= 0) return;
+    if (!d3d8_host_armed(NULL, 0)) return;
     ++s_flips;
     if (d3d8_host_any_draw_mode() && s_skip_on) { s_be.exec_skip(0); s_skip_on = 0; count_reason("skip still on at the flip"); }
     if (d3d8_host_any_draw_mode() && !s_nrec) {
@@ -1633,7 +1682,7 @@ static void ff_report(const char *why)
 
 void d3d8_host_2d_report(const char *why)
 {
-    if (s_mode <= 0 && s_ffmode <= 0 && s_vsmode <= 0) return;
+    if (!d3d8_host_armed(NULL, 0)) return;
     if (s_mode == 2 || s_ffmode == 2) {
         fprintf(stderr, "[D3D8-HOST-2D] %s draw mode: flips=%llu tokens=%llu REPLACED=%llu (2D %llu, fixed-function %llu; of which the host bound"
                         " the target first %llu; executor batches skipped %llu, replaced draws the executor did not skip"
@@ -1727,6 +1776,18 @@ void d3d8_host_2d_report(const char *why)
             for (unsigned t = 0; t < 3; ++t) if (s_vs_const_slot_differ[k] > top[t]) {
                 for (unsigned u = 2; u > t; --u) { top[u] = top[u - 1]; slot[u] = slot[u - 1]; }
                 top[t] = s_vs_const_slot_differ[k]; slot[t] = k; break; }
+        unsigned long long xm[3] = { 0, 0, 0 };
+        if (s_have_be && s_be.exec_mode_counts) s_be.exec_mode_counts(xm);
+        /* THE POSITIVE CONTROL: the executor's own count of program-mode
+         * batches, beside what the host classified. A draw can be several
+         * batches, so the executor's number is the larger; a zero beside a
+         * non-zero is the arming or the classifier failing. */
+        fprintf(stderr, "[D3D8-HOST-VS] %s control: executor program-mode batches %llu (%.1f a flip; mode 4 %llu, mode 6 %llu)"
+                        " vs host-classified programmable draws %llu (%.1f a flip; executor says program %llu, says 4/6 %llu)%s\n",
+                why, xm[2], s_flips ? (double)xm[2] / (double)s_flips : 0.0, xm[0], xm[1], s_vs_seen,
+                s_flips ? (double)s_vs_seen / (double)s_flips : 0.0, s_vs_exec_prog, s_vs_exec_not_prog,
+                !(s_have_be && s_be.exec_mode_counts) ? " (no executor count registered)"
+                : xm[2] && !s_vs_seen ? " -- HOST SEES NONE: arming or classifier broken" : "");
         fprintf(stderr, "[D3D8-HOST-VS] %s census: programmable-VS draws %llu over %llu flips (%.1f a flip), distinct programs"
                         " %u%s | shadowed %llu, built %llu, compared %llu: EXACT %llu within_tolerance %llu MISMATCHING %llu"
                         " (executor more %llu, host more %llu) | px %llu over tolerance %llu, max error r%u g%u b%u |"

@@ -3413,6 +3413,10 @@ static unsigned long long s_host_skipped, s_host_seen;
 void nv2a_pb_exec_host_skip_late(int on) { s_host_skip_late = on; }
 void nv2a_pb_exec_host_skip(int on) { s_host_skip = on; }
 unsigned long long nv2a_pb_exec_host_skipped(void) { return s_host_skipped; }
+/* G51.2 positive control: begin/end batches by transform mode, always counted
+ * (one increment a batch), read by the host's census. */
+static unsigned long long s_exec_mode_batches[3];
+void nv2a_pb_exec_mode_counts(unsigned long long out[3]) { memcpy(out, s_exec_mode_batches, sizeof s_exec_mode_batches); }
 /* Batches that ARRIVED while the skip was on, skipped or not: a batch the
  * executor stopped before its rasteriser (fewer than 3 indices, a refused
  * vertex or texture state) is seen and not skipped, and drew nothing. */
@@ -5799,6 +5803,8 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.inline_wanted = 0;
             s_gpu.batch_wide = 0;
             s_gpu.prim = param;
+            {   uint32_t xm = s_methods[0x1E94u / 4u];
+                ++s_exec_mode_batches[xm == 4u ? 0 : xm == 6u ? 1 : 2]; }
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;
         } else {

@@ -54,15 +54,12 @@ static int d3d8m_on(void)
 {
     static int m = -1;
     if (m < 0) {
-        const char *e = getenv("RECOMP_D3D8_MIRROR");
-        m = e && e[0] && strcmp(e, "0") != 0;
-        fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_MIRROR=%s\n", m ? "on" : "off");
-        /* G51.1/G51.3: the host's 2D and FF shadows are fed by the mirror's checks. */
-        if (!m && (d3d8_host_2d_mode() || d3d8_host_ff_mode())) {   /* shadow or draw, either class */
-            m = 1;
-            fprintf(stderr, "[D3D8-MIRROR] armed by%s%s\n", d3d8_host_2d_mode() ? " RECOMP_D3D8_HOST_2D" : "",
-                    d3d8_host_ff_mode() ? " RECOMP_D3D8_HOST_FF" : "");
-        }
+        /* One decision, d3d8_host_mirror_armed: RECOMP_D3D8_MIRROR, or any
+         * host class switch (G51.2: this used to list 2D and FF by hand, and
+         * RECOMP_D3D8_HOST_VS alone left the mirror off). */
+        char why[160];
+        m = d3d8_host_mirror_armed(why, sizeof why);
+        fprintf(stderr, "[D3D8-MIRROR] %s%s\n", m ? "armed by " : "off (RECOMP_D3D8_MIRROR unset, no RECOMP_D3D8_HOST_* class)", m ? why : "");
         if (m) atexit(d3d8m_exit);
     }
     return m;
@@ -485,11 +482,8 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
 void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     uint32_t d, rt, zs, tok, h;
-    int mode;
     if (!d3d8m_on()) return;
-    mode = d3d8_host_2d_mode();
     d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
-    (void)mode;
     m_verify_draw = 0;     /* verify is decided on the executor's thread now; see d3d8_host_verify_enabled */
     if (d3d8_host_replaces_handle(h) && !m_verify_draw) {
         /* Draw mode: the whole description goes ahead of the draw's commands.
