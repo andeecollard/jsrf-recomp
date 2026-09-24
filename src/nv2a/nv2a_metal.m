@@ -6766,3 +6766,17 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   }
   surface_dirty=1;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
 }
+
+/* For the executor's flight recorder (RECOMP_FLIGHT_FRAMES): cumulative
+ * surface-cache and sync counters, sampled once per recorded frame, so a frame
+ * that paints nothing can be matched against an eviction, a rebuild, a skipped
+ * sync or a feedback read in the same flip. */
+void nv2a_metal_flight_counters(unsigned long long out[6])
+{
+    out[0] = (unsigned long long)surface_uploads;
+    out[1] = (unsigned long long)surface_hits;
+    out[2] = (unsigned long long)surface_evictions;
+    out[3] = (unsigned long long)g_feedback_draws;
+    out[4] = (unsigned long long)g_sync_drainless;
+    out[5] = (unsigned long long)g_sync_range_paid;
+}

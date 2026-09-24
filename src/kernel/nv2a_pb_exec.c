@@ -2031,11 +2031,12 @@ void nv2a_pb_exec_flip_pace_stats(unsigned long long *paced, unsigned long long 
  * taken on request, never on a timer. */
 typedef struct {
     uint32_t draw, prim, count, mode, tex0, fmt0, tex1, fmt1, cw0, ctl, blend, zfunc;
+    uint32_t xf_hash, xf_bad;   /* transform state: hash, and how many non-finite floats */
 } FlightDraw;
 #define FLIGHT_MAX_DRAWS 1024
 typedef struct {
     uint8_t *px; uint32_t w, h, bpp; unsigned long guest_frame; uint32_t seq;
-    uint32_t ndraws, dropped; FlightDraw d[FLIGHT_MAX_DRAWS];
+    uint32_t ndraws, dropped; unsigned long long ctr[6]; FlightDraw d[FLIGHT_MAX_DRAWS];
 } FlightFrame;
 static FlightFrame *s_flight; static unsigned s_flight_n, s_flight_head, s_flight_filled;
 static FlightFrame s_flight_cur;           /* draws of the frame being composed */
@@ -2046,13 +2047,16 @@ static unsigned s_flight_marks;
 #if defined(_WIN32)
 static unsigned long (*flight_input_frame)(void);
 static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
+static void (*flight_counters)(unsigned long long *);
 static void flight_resolve(void) {}
 #else
 #include <dlfcn.h>
 static unsigned long (*flight_input_frame)(void);
 static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
+static void (*flight_counters)(unsigned long long *);
 static void flight_resolve(void)
 {
+    flight_counters = (void (*)(unsigned long long *))dlsym(RTLD_DEFAULT, "nv2a_metal_flight_counters");
     flight_input_frame = (unsigned long (*)(void))dlsym(RTLD_DEFAULT, "xbox_InputFrame");
     flight_set_mark_hook = (void (*)(void (*)(unsigned long, const char *)))
         dlsym(RTLD_DEFAULT, "xbox_PadRecordSetMarkHook");
@@ -2094,6 +2098,21 @@ static void flight_note_draw(void)
     d->cw0 = s_methods[0x288/4]; d->ctl = s_methods[0x1e60/4];
     d->blend = s_methods[0x304/4] ? (s_methods[0x344/4] << 16 | (s_methods[0x348/4] & 0xffff)) : 0;
     d->zfunc = s_methods[0x30c/4] ? s_methods[0x354/4] : 0;
+    {   /* The camera, as the draw will see it: the program's constants for a
+         * vertex-program draw, the composite matrix (0x0680) for a fixed-
+         * function one. A frame whose geometry all lands off screen shows up
+         * as a hash that differs from both neighbours, or as non-finite values. */
+        uint32_t h = 2166136261u, bad = 0, k, n;
+        const float *v;
+        if (d->mode == 2) { v = &s_vsh.constants[0][0]; n = NV2A_VS_MAX_CONSTANTS * 4; }
+        else { v = (const float *)&s_methods[0x680/4]; n = 16; }
+        for (k = 0; k < n; ++k) {
+            uint32_t bits; memcpy(&bits, &v[k], 4);
+            if (!isfinite(v[k])) ++bad;
+            h = (h ^ bits) * 16777619u;
+        }
+        d->xf_hash = h; d->xf_bad = bad;
+    }
 }
 static int write_bmp_path(const char *path, const uint8_t *base, uint32_t pitch,
                           uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t bpp);
@@ -2115,14 +2134,16 @@ static void flight_write(void)
         snprintf(path, sizeof path, "%s/draws-%04u.txt", root, i);
         FILE *t = fopen(path, "w");
         if (!t) continue;
+        fprintf(t, "# metal cumulative: uploads %llu hits %llu evictions %llu feedback %llu drainless %llu sync_paid %llu\n",
+                f->ctr[0], f->ctr[1], f->ctr[2], f->ctr[3], f->ctr[4], f->ctr[5]);
         fprintf(t, "# seq %u guest_frame %lu draws %u (+%u not recorded)\n"
-                   "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc\n",
+                   "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc xf_hash xf_bad\n",
                 f->seq, f->guest_frame, f->ndraws, f->dropped);
         for (k = 0; k < f->ndraws; ++k) {
             const FlightDraw *d = &f->d[k];
-            fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x\n", d->draw, d->prim,
+            fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x %08x %u\n", d->draw, d->prim,
                     d->count, d->mode, d->tex0, d->fmt0, d->tex1, d->fmt1, d->cw0, d->ctl,
-                    d->blend, d->zfunc);
+                    d->blend, d->zfunc, d->xf_hash, d->xf_bad);
         }
         fclose(t);
         ++written;
@@ -2139,6 +2160,7 @@ static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp,
     if (f->px && px) memcpy(f->px, px, bytes);
     f->w = w; f->h = h; f->bpp = bpp; f->seq = seq; f->guest_frame = flight_input_frame ? flight_input_frame() : 0;
     f->ndraws = s_flight_cur.ndraws; f->dropped = s_flight_cur.dropped;
+    if (flight_counters) flight_counters(f->ctr); else memset(f->ctr, 0, sizeof f->ctr);
     memcpy(f->d, s_flight_cur.d, sizeof(FlightDraw) * s_flight_cur.ndraws);
     s_flight_cur.ndraws = 0; s_flight_cur.dropped = 0;
     s_flight_head = (s_flight_head + 1) % s_flight_n;
