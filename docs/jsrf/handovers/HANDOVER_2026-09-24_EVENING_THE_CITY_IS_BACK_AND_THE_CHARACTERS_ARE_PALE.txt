@@ -1,0 +1,86 @@
+HANDOVER -- 24 September 2026 (evening)
+THE CITY IS BACK, AND THE CHARACTERS ARE PALE
+
+FOLLOWS HANDOVER_2026-09-24_LATE_THE_CITY_IS_DISCARDED_BY_ITS_OWN_ALPHA_TEST.txt.
+That file's section 1 (the fogged final combiner) and section 2 (the two
+quick player tests) are SUPERSEDED: the cause was not the combiner.
+
+Main: 4032e03 (merge of c8851f0) plus this handover's commit, pushed.
+JSRF.app: built from 4032e03, UUID 87694347-3A78-398B-919F-B6F1BA23A1FD.
+~/jsrf-build/ab-nofix/JSRF.app: the same tree with the two rendering files
+of c8851f0 reverted (UUID 9B7BA07B-...), for A/B only.
+
+
+====================================================================
+0. ROKKAKU-DAI'S CITY: FIXED AND CONFIRMED IN PLAY
+====================================================================
+
+Cause (c8851f0): X8R8G8B8 textures had their padding byte read as alpha by
+the hardware-sampler decoder (nv2a_texture_decode_rgba8), by hw_tex_format
+(mapped to plain RGBA8) and by the shader's own texel(). The CPU sampler had
+forced it opaque since 21 Sep. Rokkaku's building lightmaps are X8R8G8B8
+with padding 0 and are multiplied in alpha (stage 1: ci 090C0000,
+ai 191C0000), so R0.a = 0 and the title's alpha test (GREATER 0) discarded
+every fragment. The host renderer shares the decoder, so host and executor
+agreed. The instrument's "decoded alpha min 1.000" was its own bug: it
+decoded through the CPU sampler. Fixed in the same commit.
+
+The fogged general final combiner is CLEARED: jsrf_metal_invisible passes
+1,536/1,536 fragments in Rokkaku's exact state, specialised, generic and
+hardware-sampled.
+
+Player session 12:47 (log: jsrf-first-fault/measure/rokkaku-1249-x8fix/):
+buildings drawn. Big draws painting < 1% of their area: 75% -> ~45% per
+window. The remaining zero-pass draws sit at window z 0.91-1.0 with depth
+LEQUAL, i.e. read as far geometry behind near buildings. Not proven: the
+instrument cannot separate a depth fail from an alpha fail.
+
+RECOMP_INVISIBLE_DRAW is removed from paths.conf (backup
+paths.conf.bak-20260924-invisible).
+
+
+====================================================================
+1. OPEN: CHARACTER COLOURS ARE WHITED OUT
+====================================================================
+
+Beat's hair, goggles and roller boots draw near-white; the NPC on the bench
+at the Rokkaku start looks washed out too. Everything else on him (jacket,
+strap, gloves, shorts) is textured.
+
+  - PREDATES c8851f0: identical in ab-nofix (player, 12:5x).
+  - NOT bump-env: RECOMP_TEXMODE_APPROX=0 refused ~39,000 mode-6 draws per
+    window and the white parts still drew, still white (13:01). That arm
+    also leaves holes -- a street surface showed as flat salmon pink
+    ("fell off the map", 13:06); collision was unaffected.
+  - NEXT ARM, already set in paths.conf: RECOMP_METAL_HW_TEX=0 (line 719,
+    backup paths.conf.bak-20260924-texmode). Restore to 1 afterwards.
+      colours return -> the hardware sampler decodes those textures wrong;
+                        list their formats;
+      still white    -> lighting / material colour; get an xemu screenshot
+                        of Beat in Rokkaku as the reference.
+
+
+====================================================================
+2. HOUSEKEEPING DONE
+====================================================================
+
+Removed worktrees agent-ac2142be51927d3a7 (g54-drop-audit, merged),
+agent-icall (wt-icall, merged) and agent-aeed61e5b35971027. Branches kept.
+worktree-agent-aeed61e5b35971027 holds ONE UNMERGED COMMIT, 1c47e9f
+("The stale-buffer census cannot judge a voice that has barely played",
+src/apu/apu_vp.c, 19 Sep). The DSOUND lift may have made it moot; decide
+before deleting that branch.
+
+Unchanged from the afternoon handover: DEFER_SWAP held for a player
+session, the police/DJ K flicker check, Poison Jam, 58d0780 unmerged, and
+the tutorial A/B for X8R8G8B8 now sampling opaque everywhere.
+
+
+====================================================================
+3. LESSON
+====================================================================
+
+AN INSTRUMENT THAT DECODES THROUGH A DIFFERENT PATH DESCRIBES A DIFFERENT
+TEXTURE. The alpha histogram read the CPU sampler while the draw used the
+hardware decoder, and "alpha min 1.000" pointed a whole session at the
+combiner. Measure through the path the draw takes.
