@@ -238,6 +238,11 @@ uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
  * serial the mirror's after-draw check of the same draw will carry. */
 uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
                                   uint32_t zs_data, uint32_t zs_size);
+/* G51.1 draw mode: the whole description of a pre-transformed 2D draw, as a
+ * token written BEFORE its commands. The handler (d3d8_host_2d_replace) draws
+ * it into the executor's target and, if it did, makes the executor skip the
+ * draw's batches until the mirror's check token behind them. */
+uint32_t d3d8_host_enqueue_2d_replace(const D3D8HostDrawCheck *c);
 
 #define D3D8_HOST_FFV_GROUPS 5u     /* G42's four and the inverse model-view */
 typedef struct {

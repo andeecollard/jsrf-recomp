@@ -53,6 +53,8 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #if defined(__APPLE__)
 extern int nv2a_metal_sync_range(uint8_t *target, size_t bytes);
 extern int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *out);
+extern void nv2a_pb_exec_host_skip(int on);
+extern unsigned long long nv2a_pb_exec_host_skipped(void);
 #endif
 static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
@@ -5156,6 +5158,11 @@ int main(int argc, char **argv)
                 be.ram_size = 0x04000000u;
                 be.last_error = d3d8_host_2d_metal_last_error;
                 be.depth_peek = nv2a_metal_depth_peek;
+                /* Draw mode (RECOMP_D3D8_HOST_2D=draw): the host draws into the
+                 * executor's bound surface and the executor skips the batches. */
+                be.external_draw = d3d8_host_2d_metal_external;
+                be.exec_skip = nv2a_pb_exec_host_skip;
+                be.exec_skipped = nv2a_pb_exec_host_skipped;
                 d3d8_host_2d_set_backend(&be);
                 nv2a_pb_exec_set_flip_hook(d3d8_host_2d_flip);
             }

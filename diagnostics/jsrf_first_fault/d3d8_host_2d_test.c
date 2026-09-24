@@ -542,6 +542,121 @@ static void shadow_flow(D3D8HostDrawCheck *c, int control)
               after.exact - before.exact, after.within - before.within);
 }
 
+/* ---- rhw 0: a zeroed vertex in a partly filled dynamic buffer ----
+ * Tutorial run 5's one mismatch. Case B's list with vertex 3 zeroed: its
+ * triangle has clip w = 1/0, so the executor drops it and the host must too. */
+static void compare_rhw0(void)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    case_b(&c);
+    putf(VB + 60, 0.0f); putf(VB + 64, 0.0f); putf(VB + 68, 0.0f); putf(VB + 72, 0.0f); put32(VB + 76, 0);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    CHECK(!d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d) && d.tris_dropped_w == 1 && d.nverts == 3,
+          "rhw 0: the triangle reaching the zeroed vertex is dropped (%u dropped, %u vertices kept)", d.tris_dropped_w, d.nverts);
+    compare("indexed list with a zeroed vertex (rhw 0)", &c, 1);
+}
+
+/* ---- draw mode ----
+ * The host draws into the surface the EXECUTOR has bound, through the same
+ * nv2a_metal_external_draw the game uses; the reference is the executor
+ * drawing the same draw itself. A "binder" draw first makes the executor
+ * bind the target and its depth (depth test on, ALWAYS, no write, so it
+ * changes no depth), and is drawn identically in both arms. */
+static void draw_binder(uint16_t *rt)
+{
+    D3D8HostDrawCheck b; D3D8Host2DDraw bd;
+    case_b(&b);
+    b.zs = 0x2345; b.zs_data = ZS; b.zs_format = 0x1u | (0x2Eu << 8);
+    b.zs_size = (RTW - 1) | ((RTH - 1) << 12) | ((ZSPITCH / 64 - 1) << 24);
+    set_state(&b, 0x30C, 1); set_state(&b, 0x354, 0x207); set_state(&b, 0x35C, 0);
+    memset(&bd, 0, sizeof bd); bd.verts = verts;
+    if (d3d8_host_2d_build(&b, ram, RAM_SIZE, 0, &bd) || !exec_draw(&b, &bd, rt, ram + ZS)) { ++fails; printf("binder failed\n"); }
+}
+static void logo_depth(void)
+{
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+}
+/* Arm A: the executor draws the logo. Arm B: the host draws it into the
+ * executor's bound surface. Returns colour and depth over the whole target. */
+static int draw_arm(int host, int control, uint16_t *out, float *zout)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    background(rt); logo_depth();
+    draw_binder(rt);
+    case_logo(&c);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, control, &d)) return 0;
+    if (host) {
+        if (!d3d8_host_2d_metal_external(&d, ram, RAM_SIZE)) { printf("external: %s\n", d3d8_host_2d_metal_last_error()); return 0; }
+        nv2a_metal_sync();
+    } else if (!exec_draw(&c, &d, rt, ram + ZS)) return 0;
+    memcpy(out, rt, RTPITCH * RTH);
+    return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout);
+}
+static unsigned long long g_fake_skipped; static int g_fake_skip;
+static void fake_skip(int on) { g_fake_skip = on; }
+static unsigned long long fake_skipped(void) { return g_fake_skipped; }
+static void draw_mode_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
+    background(bg);
+    CHECK(draw_arm(0, 0, a, za) && draw_arm(1, 0, b, zb), "draw mode: both arms drew");
+    d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 0, &df);
+    zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
+    printf("  draw mode, logo: executor changed %llu, host (in the executor's surface) %llu, differing %llu, max r%u g%u b%u"
+           " | depth %llu px, worst %u\n", df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1],
+           df.max_err[2], zbad, steps);
+    CHECK(df.exec_changed > 2000 && df.host_changed == df.exec_changed, "draw mode: the host drew into the executor's surface");
+    CHECK(df.mismatch == 0 && df.max_err[0] + df.max_err[1] + df.max_err[2] == 0 && zbad == 0,
+          "draw mode: identical to the executor drawing it, colour and depth");
+    CHECK(draw_arm(1, 1, b, zb), "draw mode CONTROL: drew");
+    d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 1, &df);
+    CHECK(df.mismatch > 200, "draw mode CONTROL: the perturbed host draw is what the surface holds (%llu px differ)", df.mismatch);
+
+    /* The controller: replace() draws and turns the skip on, after() turns it
+     * off and checks the executor skipped something; a refused draw and an
+     * unbound target are left to the executor with the skip never on. */
+    {
+        D3D8Host2DBackend be; D3D8H2DStats s0, s1, s2, s3;
+        D3D8HostDrawCheck c;
+        memset(&be, 0, sizeof be);
+        be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
+        be.last_error = d3d8_host_2d_metal_last_error; be.external_draw = d3d8_host_2d_metal_external;
+        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped;
+        d3d8_host_2d_set_backend(&be);
+        background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
+        case_logo(&c); snapshot_at_call(&c);
+        d3d8_host_2d_get_stats(&s0);
+        d3d8_host_2d_replace(&c);
+        CHECK(g_fake_skip == 1, "draw mode: replace() drew and turned the executor's skip on");
+        if (g_fake_skip) ++g_fake_skipped;                       /* the executor's batch, skipped */
+        d3d8_host_2d_after(&c);
+        d3d8_host_2d_get_stats(&s1);
+        CHECK(g_fake_skip == 0 && s1.replaced == s0.replaced + 1 && s1.replaced_without_skip == s0.replaced_without_skip,
+              "draw mode: after() turned it off; replaced once, and the executor skipped");
+        case_logo(&c); snapshot_at_call(&c); set_state(&c, 0x32C, 1);
+        d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
+        d3d8_host_2d_get_stats(&s2);
+        CHECK(g_fake_skip == 0 && s2.replaced == s1.replaced && s2.replace_refused == s1.replace_refused + 1,
+              "draw mode: a draw the host refuses (stencil) is left to the executor");
+        case_logo(&c); c.rt_data = RT + 0x40000; snapshot_at_call(&c);
+        d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
+        d3d8_host_2d_get_stats(&s3);
+        CHECK(g_fake_skip == 0 && s3.replaced == s2.replaced && s3.replace_unbound == s2.replace_unbound + 1,
+              "draw mode: a target the executor has not bound is left to the executor");
+        /* And the control on the skip counter: a replaced draw whose batches were NOT skipped is counted. */
+        case_logo(&c); snapshot_at_call(&c);
+        d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
+        d3d8_host_2d_get_stats(&s0);
+        CHECK(s0.replaced_without_skip == s3.replaced_without_skip + 1, "draw mode CONTROL: a replaced draw the executor did not skip is caught");
+        d3d8_host_2d_report("test");
+    }
+}
+
 int main(int argc, char **argv)
 {
     D3D8HostDrawCheck c;
@@ -552,6 +667,13 @@ int main(int argc, char **argv)
     char dir[512];
     ram = calloc(1, RAM_SIZE);
     if (!ram) return 2;
+    if (argc > 1 && strcmp(argv[1], "draw") == 0) {         /* the draw-mode arm, a process of its own */
+        setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
+        CHECK(d3d8_host_2d_mode() == 2, "RECOMP_D3D8_HOST_2D=draw arms draw mode");
+        draw_mode_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
 
     /* Classification: XYZRHW FVFs only. */
     CHECK(d3d8_host_2d_is_fvf_xyzrhw(0x1C4) && d3d8_host_2d_is_fvf_xyzrhw(0x044), "XYZRHW FVFs 0x1C4, 0x044 are 2D");
@@ -587,6 +709,7 @@ int main(int argc, char **argv)
     compare_logo(1);
     compare_fullscreen(0);
     compare_fullscreen(1);
+    compare_rhw0();
     CHECK(d3d8_host_2d_snap(0.53125f) == 0.5f && d3d8_host_2d_snap(160.53125f) == 160.5f && d3d8_host_2d_snap(-0.53125f) == -0.5f,
           "snap: 0.53125 -> 0.5, 160.53125 -> 160.5, toward zero for negatives");
     /* The proof on its own. */

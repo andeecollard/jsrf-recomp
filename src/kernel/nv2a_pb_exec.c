@@ -3386,6 +3386,18 @@ static void frame_stats_report(void)
     memset(&s_stage_win, 0, sizeof s_stage_win);
 }
 
+/* G51.1 DRAW MODE: the host has already drawn this 2D draw into the target,
+ * so the batches that follow its token must not be drawn again. Set and
+ * cleared by the host's tokens on this same thread, around exactly one D3D
+ * draw's commands. Everything else a batch does still happens -- vertex
+ * fetch, state latching, the mirror's register checks -- only the
+ * rasteriser call is skipped, so no later draw can see a difference in
+ * executor state. Unset, it is one predictable branch per batch. */
+static int s_host_skip;
+static unsigned long long s_host_skipped;
+void nv2a_pb_exec_host_skip(int on) { s_host_skip = on; }
+unsigned long long nv2a_pb_exec_host_skipped(void) { return s_host_skipped; }
+
 /* G51.1: called at the end of every NV097_FLIP_STALL on the pusher thread,
  * after the snapshot. A pointer rather than a call so this file does not
  * depend on the host 2D module (some tests link the executor without it). */
@@ -5212,6 +5224,7 @@ static void raster_batch(void)
         }
     }
 
+    if (s_host_skip) { ++s_host_skipped; goto batch_complete; }
 #if NV2A_GPU_PATH
     if (s_copy.active && nv2a_gpu_on()) {
         static unsigned fallback_reports, unique_reports;
