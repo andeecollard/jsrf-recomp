@@ -552,3 +552,18 @@ merging or carrying flags at split entries.
   gameplay beyond the tutorial is untested. The graffiti editor is the likely
   place for a CPU read-back. JSRF.app (`aa2e2aa`) carries both switches for a
   player session with the watch on.
+- **D3D CPU readers pay first** (`658882b`, always on). Lock and CopyRects
+  sources, GetBackBuffer and GetDepthStencilSurface post to the executor
+  thread, which makes the bytes current before the call returns (bounded at
+  1 s, counted as stale if it times out). Tutorial, player config, 130 s,
+  0 faults:
+  - default paced: 59.8 fps, anim 59.8/s;
+  - default unpaced: 84.5 (was 84.1), so no cost;
+  - DEFER+WATCH unpaced: **112.3 fps**.
+
+  In every arm: 1,933 requests (D3DTexture_LockRect 1,927), 0 with anything
+  to pay, 0 timed out. The watch saw 0 high-view faults; its remaining 6
+  low-view reads are `framebuffer_probe_tick` (instrumentation).
+  **The default-on flip is ready** on branch `g56-defer-default-on`
+  (`99f5f9c`), held for a player session with
+  `RECOMP_METAL_DEFER_SWAP=1 RECOMP_METAL_DEBT_WATCH=1`.
