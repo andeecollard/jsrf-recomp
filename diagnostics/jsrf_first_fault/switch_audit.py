@@ -248,6 +248,28 @@ VALUE_CARRYING = {
     # A draw INDEX, or "all": which draw of each frame the flight recorder
     # snapshots the whole transform state at (nv2a_pb_exec.c).
     "RECOMP_FLIGHT_XF_DRAW",
+    # The flight recorder's other three: how many presented frames to keep (a
+    # count, capped at 1200), which guest frame writes them without a keypress
+    # (a frame number), and where they are written (a path).
+    "RECOMP_FLIGHT_FRAMES",
+    "RECOMP_FLIGHT_AT",
+    "RECOMP_FLIGHT_DIR",
+    # A colour, not a boolean: every colour clear is forced to this value to
+    # tell "never covered" from "shaded to black" (nv2a_pb_exec.c). 0x0000 is a
+    # legitimate force-to-black, so "0" must not read as off.
+    "RECOMP_CLEAR_COLOR_FORCE",
+    # The fragment force (nv2a_metal.m): a MODE number (1 texture0, 2 primary
+    # colour, 3 white, 4 texcoord0), a start time in seconds, and a count of
+    # black reports that arms it -- the same count RECOMP_FB_DUMP_DRAW_ON_BLACK
+    # carries, as the note above that switch already says.
+    "RECOMP_FRAG_FORCE",
+    "RECOMP_FRAG_FORCE_AFTER",
+    "RECOMP_FRAG_FORCE_ON_BLACK",
+    # The flat-TEXCOORD0 census (nv2a_metal.m): a cap on how many flat draws to
+    # print (set-but-non-numeric means 0 rows, still counting), and a minimum
+    # screen area in pixels below which a flat draw is not printed.
+    "RECOMP_T0_CENSUS",
+    "RECOMP_T0_CENSUS_MINAREA",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

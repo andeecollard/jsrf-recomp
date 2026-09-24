@@ -70,9 +70,28 @@ def _arg_bytes(src):
             re.findall(r"case\s+(\d+):\s*return\s+(-?\d+);", fn)}
 
 
+def _caller_cleans(src):
+    """Ordinals the table itself declares __cdecl, caller cleans.
+
+    Their entry is 0 because the CALLEE pops nothing -- the caller pushed the
+    arguments and removes them itself -- so reading them with STACK_ARG is
+    correct. The table used to be expected to say -1 for these, but -1 now
+    means "nobody has written this ordinal down" and draws the missing-bridge
+    warning, so 0 plus the stated convention is the only honest entry. The
+    exemption is by the table's own comment, not by name here, so a stdcall
+    export cannot be waved through by accident.
+    """
+    fn = src[src.index("static int stdcall_args_for_ordinal"):]
+    fn = fn[:fn.index("\n}\n")]
+    return {int(o) for o, c in
+            re.findall(r"case\s+(\d+):\s*return\s+0;\s*/\*([^*]*)\*/", fn)
+            if "__cdecl" in c and "caller cleans" in c}
+
+
 def _violations():
     src = _source()
     bodies, disp, argb = _bridge_bodies(src), _dispatch(src), _arg_bytes(src)
+    cdecl = _caller_cleans(src)
     out = []
     for ordinal, bridge in sorted(disp.items()):
         body = bodies.get(bridge)
@@ -82,12 +101,21 @@ def _violations():
         if not idxs:
             continue
         declared = argb[ordinal]
-        if declared < 0:          # caller-cleans (cdecl varargs, e.g. DbgPrint)
+        if declared < 0:          # not written down: a different warning's job
+            continue
+        if ordinal in cdecl:      # caller cleans (cdecl varargs, e.g. DbgPrint)
             continue
         needed = (max(idxs) + 1) * 4
         if declared < needed:
             out.append((ordinal, bridge, max(idxs), declared, needed))
     return out
+
+
+def test_the_cdecl_exemption_finds_dbgprint_and_nothing_else():
+    # Guards the exemption itself: if the comment it keys on is reworded, the
+    # set goes empty and DbgPrint fails above; if it starts matching stdcall
+    # entries, this fails here.
+    assert _caller_cleans(_source()) == {8}
 
 
 def test_no_bridge_reads_past_its_declared_stack_frame():

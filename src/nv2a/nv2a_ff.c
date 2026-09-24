@@ -6,6 +6,7 @@
  * decides a batch refusal). Both sides now round the same way. */
 #pragma clang fp contract(off)
 #include "nv2a_ff.h"
+#include "../recomp_switch.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -599,7 +600,7 @@ int nv2a_ff_clip_w_ok(const float pos[4])
  *   bit 2  specular disabled: D1 = (0,0,0,1), as xemu writes it.
  */
 static int ff_material_on(void)
-{ static int on=-1; if(on<0){ const char *e=getenv("RECOMP_FF_MATERIAL"); on=e&&*e&&strcmp(e,"0")!=0; } return on; }
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_FF_MATERIAL"); return on; }
 unsigned nv2a_ff_lit_material(const uint32_t m[2048])
 {
     unsigned bits=0;

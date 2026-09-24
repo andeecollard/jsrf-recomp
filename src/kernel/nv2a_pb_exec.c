@@ -582,8 +582,7 @@ static int vsh_hoist_inputs(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_VSH_HOIST_INPUTS");
-        on = e ? (atoi(e) != 0) : 0;
+        on = recomp_switch_on("RECOMP_VSH_HOIST_INPUTS");
     }
     return on;
 }
