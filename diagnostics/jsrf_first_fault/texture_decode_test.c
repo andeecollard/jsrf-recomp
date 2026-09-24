@@ -87,6 +87,12 @@ static void test_levels(void)
           "next rgba8 pitch at w=4");
     CHECK(nv2a_texture_next_pitch(NV2A_TEXFMT_LINEAR565, 8, 16) == 16,
           "linear pitch does not change");
+    /* The swizzled 16-bit formats follow their width, like RGBA8 at half the
+     * bytes -- NOT the linear rule above, which is what they used to get. */
+    CHECK(nv2a_texture_level_bytes(NV2A_TEXFMT_X1R5G5B5, 8, 4, 64) == 64,
+          "x1r5g5b5 8x4 is w*h*2, whatever pitch says");
+    CHECK(nv2a_texture_next_pitch(NV2A_TEXFMT_A4R4G4B4, 8, 16) == 8,
+          "next a4r4g4b4 pitch at w=4");
 }
 
 /* ── RGBA8: BGRA in guest order, Morton addressed ───────────────────────── */
@@ -108,6 +114,58 @@ static void test_rgba8(void)
     for (y = 0; y < 4; ++y) for (x = 0; x < 4; ++x)
         if (!(x == 1 && y == 1))
             px(dst, 4, x, y, 0, 0, 0, 0, "rgba8 untouched");
+}
+
+/* ── the swizzled 16-bit formats: Morton at two bytes, 555 and 4444 ──── */
+
+static void test_sz16(void)
+{
+    uint8_t src[4 * 4 * 2], dst[4 * 4 * 4];
+    unsigned x, y;
+
+    /* A4R4G4B4 0xF8C3 at the Morton slot for (1,1), index 3 = byte 6:
+     * a=F r=8 g=C b=3, each n/15, so 255,136,204,51 -- 0xF is 255, not 240.
+     * And 0x0F00 at (2,0), index 4 = byte 8: red with alpha ZERO, the value
+     * a forced-opaque decode gets wrong. */
+    memset(src, 0, sizeof src);
+    src[6] = 0xC3; src[7] = 0xF8;
+    src[8] = 0x00; src[9] = 0x0F;
+    CHECK(nv2a_texture_decode_rgba8(src, sizeof src, 4, 4, 8,
+                                    NV2A_TEXFMT_A4R4G4B4, dst), "4444 decode");
+    px(dst, 4, 1, 1, 136,204,51,255, "4444 swizzled, /15");
+    px(dst, 4, 2, 0, 255,0,0,0,      "4444 alpha is real");
+    for (y = 0; y < 4; ++y) for (x = 0; x < 4; ++x)
+        if (!(x == 1 && y == 1) && !(x == 2 && y == 0))
+            px(dst, 4, x, y, 0,0,0,0, "4444 untouched");
+
+    /* X1R5G5B5 0xC3E1 at (1,1): top bit SET but not alpha, r=16 g=31 b=1.
+     * 16/31 rounds to 132 (truncation would say 131); 1/31 to 8. 0x7C00 at
+     * (2,0) is red, top bit clear, and still opaque. */
+    memset(src, 0, sizeof src);
+    src[6] = 0xE1; src[7] = 0xC3;
+    src[8] = 0x00; src[9] = 0x7C;
+    CHECK(nv2a_texture_decode_rgba8(src, sizeof src, 4, 4, 8,
+                                    NV2A_TEXFMT_X1R5G5B5, dst), "555 decode");
+    px(dst, 4, 1, 1, 132,255,8,255, "555 swizzled, top bit ignored");
+    px(dst, 4, 2, 0, 255,0,0,255,   "555 opaque with top bit clear");
+    px(dst, 4, 0, 1, 0,0,0,255,     "555 zero is opaque black");
+
+    /* Non-square: 8x2 puts (7,1) at Morton 15, byte 30, which a row-major
+     * 16-byte pitch would put at byte 30 too -- so use (0,1) instead: Morton
+     * 2 (byte 4) against row-major byte 16. */
+    {
+        uint8_t n[8 * 2 * 2], out[8 * 2 * 4];
+        memset(n, 0, sizeof n);
+        n[4] = 0x00; n[5] = 0xFF;          /* opaque red */
+        CHECK(nv2a_texture_decode_rgba8(n, sizeof n, 8, 2, 16,
+                                        NV2A_TEXFMT_A4R4G4B4, out), "4444 8x2");
+        px(out, 8, 0, 1, 255,0,0,255, "4444 8x2 reads the Morton slot");
+    }
+
+    /* Bounds: a 4x4 level is 32 bytes; 31 must be refused. */
+    CHECK(!nv2a_texture_decode_rgba8(src, 31, 4, 4, 8,
+                                     NV2A_TEXFMT_X1R5G5B5, dst),
+          "short 555 buffer should be refused");
 }
 
 /* ── DXT1, including the branch that is easy to get wrong ───────────────── */
@@ -209,6 +267,7 @@ int main(void)
     test_morton();
     test_levels();
     test_rgba8();
+    test_sz16();
     test_dxt1();
     test_dxt3();
     test_fallback_and_bounds();

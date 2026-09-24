@@ -30,6 +30,11 @@
  *   - DXT3 colour is always the four-colour interpolation, never the
  *     punch-through variant, whatever c0 and c1 are. Alpha is the 4-bit
  *     nibble scaled by 1/15.
+ *   - SZ_X1R5G5B5 (0x03) and SZ_A4R4G4B4 (0x04) are Morton-swizzled at two
+ *     bytes a texel, like RGBA8 at four. 555 has alpha forced to 1 (its top
+ *     bit is undefined); 4444 has REAL alpha, and every channel is n/15, so
+ *     0xF is 255 -- not 0xF0. The shader decoded both as the linear fallback
+ *     below until 24 Sep 2026.
  *   - The 16-bit fallback is R5G6B5 with alpha forced to 1.
  *
  * texture_decode_test.c is the check, and it is written against these rules

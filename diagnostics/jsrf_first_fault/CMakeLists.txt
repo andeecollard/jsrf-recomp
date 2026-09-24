@@ -1201,6 +1201,14 @@ if(APPLE)
 
     add_executable(jsrf_metal_copy_test metal_copy_test.c)
     target_link_libraries(jsrf_metal_copy_test PRIVATE xbox_vsh)
+    # The swizzled 16-bit formats (0x03, 0x04) on the shader's software
+    # sampler, byte-equal to the CPU sampler. The hwtex arm proves they stay
+    # on the software sampler when G27 is on (hw_tex_format() names neither).
+    add_executable(jsrf_metal_sz16_test metal_sz16_test.c)
+    target_link_libraries(jsrf_metal_sz16_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_sz16 COMMAND jsrf_metal_sz16_test)
+    add_test(NAME jsrf_metal_sz16_hwtex COMMAND jsrf_metal_sz16_test)
+    set_tests_properties(jsrf_metal_sz16_hwtex PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # Several draws into one encoder, compared against the software rasteriser.
     # Run it BOTH ways -- the switch is read once per process, so the batched
     # and per-draw cases are two invocations:

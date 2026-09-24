@@ -775,9 +775,13 @@ size_t nv2a_texture_copy_texture_bytes(const NV2ATextureCopy *s)
     size_t bytes=0;
     unsigned w=s->width,h=s->height;
     for(unsigned l=0;l<(s->levels?s->levels:1);++l) {
+        /* sz16 is w*h*2 PER LEVEL: its pitch follows the level's width.
+         * s->pitch*h is level 0's pitch on every level, which over-asks by
+         * a third on a full chain and refused mipped 0x03/0x04 textures whose
+         * true extent fits the bytes given. */
         bytes+=s->dxt1 ? (size_t)((w+3)/4)*((h+3)/4)*8 :
             s->dxt3 ? (size_t)((w+3)/4)*((h+3)/4)*16 :
-            s->rgba8 ? (size_t)w*h*4 : (size_t)s->pitch*h;
+            s->rgba8 ? (size_t)w*h*4 : s->sz16 ? (size_t)w*h*2 : (size_t)s->pitch*h;
         w=w>1?w/2:1; h=h>1?h/2:1;
     }
     return bytes;
@@ -902,10 +906,14 @@ static void sample_lod(const NV2ATextureCopy *s,const uint8_t *data,float u,floa
             else sample(&t,p,u,v,b);
             break;
         }
+        /* The swizzled 16-bit formats are TWO bytes a texel. Walking them at
+         * the RGBA8 stride put level 1 at twice its offset -- reading level 2
+         * and beyond, or past the chain -- while level 0 looked right. */
         p+=t.dxt1?(size_t)((t.width+3)/4)*((t.height+3)/4)*8:
-            t.dxt3?(size_t)((t.width+3)/4)*((t.height+3)/4)*16:(size_t)t.width*t.height*4;
+            t.dxt3?(size_t)((t.width+3)/4)*((t.height+3)/4)*16:
+            (size_t)t.width*t.height*(t.sz16?2:4);
         t.width=t.width>1?t.width/2:1; t.height=t.height>1?t.height/2:1;
-        t.pitch=t.dxt1?((t.width+3)/4)*8:t.dxt3?((t.width+3)/4)*16:t.width*4;
+        t.pitch=t.dxt1?((t.width+3)/4)*8:t.dxt3?((t.width+3)/4)*16:t.width*(t.sz16?2:4);
     }
     float f=hi==lo?0:l-lo;
     for(unsigned k=0;k<4;++k) out[k]=a[k]*(1-f)+b[k]*f;
@@ -1268,8 +1276,10 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
     /* !untextured, because the copy below reads `texture`, and an untextured
      * batch is entitled to pass NULL for it -- every other guard above lets it
      * through, and the bounds test that incidentally covered this only did so
-     * because an untextured state also leaves width and height zero. */
-    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
+     * because an untextured state also leaves width and height zero.
+     * !sz16 likewise: the row copy assumes LINEAR 565 bytes, and 0x03/0x04
+     * are swizzled and differently packed. */
+    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->sz16 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
         && s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
     for (int i=0;i<3;++i)
         if (v[i][0][3]!=1 || v[i][NV2A_VSH_OUT_T0][3]!=1

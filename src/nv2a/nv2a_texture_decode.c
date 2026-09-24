@@ -30,6 +30,9 @@ size_t nv2a_texture_level_bytes(int fmt, unsigned w, unsigned h,
     case NV2A_TEXFMT_RGBA8:
     case NV2A_TEXFMT_RGBA8_ALT:
         return (size_t)w * h * 4u;
+    case NV2A_TEXFMT_X1R5G5B5:
+    case NV2A_TEXFMT_A4R4G4B4:
+        return (size_t)w * h * 2u;
     default:
         return (size_t)pitch * h;
     }
@@ -43,6 +46,8 @@ unsigned nv2a_texture_next_pitch(int fmt, unsigned w, unsigned pitch)
     case NV2A_TEXFMT_DXT3:            return blocks(nw) * 16u;
     case NV2A_TEXFMT_RGBA8:
     case NV2A_TEXFMT_RGBA8_ALT:       return nw * 4u;
+    case NV2A_TEXFMT_X1R5G5B5:
+    case NV2A_TEXFMT_A4R4G4B4:        return nw * 2u;
     default:                          return pitch;
     }
 }
@@ -56,6 +61,14 @@ static void unpack565(unsigned c, unsigned char *r, unsigned char *g,
     *r = (unsigned char)(((c >> 11) & 31u) * 255u / 31u);
     *g = (unsigned char)(((c >> 5)  & 63u) * 255u / 63u);
     *b = (unsigned char)(( c        & 31u) * 255u / 31u);
+}
+
+/* n/max as the shader's float would quantise it to a byte: ROUNDED. For
+ * max = 15 this is exactly n*17; for 31 it is not n*255/31 truncated, which
+ * reads 131 where the shader writes 132 for n = 16. */
+static unsigned char unorm(unsigned n, unsigned max)
+{
+    return (unsigned char)((n * 255u + max / 2u) / max);
 }
 
 static void put(uint8_t *dst, unsigned w, unsigned x, unsigned y,
@@ -84,6 +97,10 @@ int nv2a_texture_decode_rgba8(const uint8_t *src, size_t src_size,
             if (fmt == NV2A_TEXFMT_RGBA8 || fmt == NV2A_TEXFMT_RGBA8_ALT) {
                 at = (size_t)4u * nv2a_texture_morton(x, y, w, h);
                 bytes = 4u;
+            } else if (fmt == NV2A_TEXFMT_X1R5G5B5
+                       || fmt == NV2A_TEXFMT_A4R4G4B4) {
+                at = (size_t)2u * nv2a_texture_morton(x, y, w, h);
+                bytes = 2u;
             } else if (fmt == NV2A_TEXFMT_DXT1 || fmt == NV2A_TEXFMT_DXT3) {
                 bytes = fmt == NV2A_TEXFMT_DXT1 ? 8u : 16u;
                 at = (size_t)(y / 4u) * pitch + (size_t)(x / 4u) * bytes;
@@ -116,6 +133,26 @@ int nv2a_texture_decode_rgba8(const uint8_t *src, size_t src_size,
                 if (at + 3u >= src_size) return 0;
                 put(dst, w, x, y, src[at + 2], src[at + 1], src[at],
                     fmt == NV2A_TEXFMT_RGBA8_ALT ? 255u : src[at + 3]);
+            }
+        return 1;
+
+    case NV2A_TEXFMT_X1R5G5B5:
+    case NV2A_TEXFMT_A4R4G4B4:
+        /* Swizzled like RGBA8, two bytes a texel. The shader's sz16 branch
+         * returns 5:5:5 over 31 with alpha 1, or 4:4:4:4 over 15. */
+        for (y = 0; y < h; ++y)
+            for (x = 0; x < w; ++x) {
+                size_t at = (size_t)2u * nv2a_texture_morton(x, y, w, h);
+                unsigned c;
+                if (at + 1u >= src_size) return 0;
+                c = (unsigned)src[at] | ((unsigned)src[at + 1] << 8);
+                if (fmt == NV2A_TEXFMT_A4R4G4B4)
+                    put(dst, w, x, y, unorm((c >> 8) & 15u, 15u),
+                        unorm((c >> 4) & 15u, 15u), unorm(c & 15u, 15u),
+                        unorm((c >> 12) & 15u, 15u));
+                else
+                    put(dst, w, x, y, unorm((c >> 10) & 31u, 31u),
+                        unorm((c >> 5) & 31u, 31u), unorm(c & 31u, 31u), 255);
             }
         return 1;
 
