@@ -34,6 +34,9 @@ void xbox_FramebufferWindowStart(void) {}
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 void nv2a_pb_exec_report(void);
 int nv2a_pb_exec_vsh_constant(unsigned index, float out[4]);
+void nv2a_pb_exec_host_skip(int on);
+unsigned long long nv2a_pb_exec_host_skipped(void);
+unsigned long long nv2a_pb_exec_host_seen(void);
 static void put(uint32_t m,uint32_t p) { nv2a_pb_exec_method(0,m,p); }
 static void fp(uint32_t m,float f) { uint32_t u; memcpy(&u,&f,4); put(m,u); }
 static uint32_t *pixels(void) { return ram+0x1000/4; }
@@ -71,6 +74,25 @@ int main(void) {
     draw();
     for(int y=0;y<8;++y) for(int x=0;x<8;++x)
         CHECK(pixels()[y*8+x] == (x<4 ? 0 : 0xFF00FF00));
+    /* G51 DRAW MODE'S SKIP, taken before the batch's vertex and fragment
+     * preparation. A skipped batch draws nothing and is counted; state that
+     * arrived around it -- a constant, and a program re-selection whose parse
+     * is deferred behind s_vsh.dirty -- is what the NEXT batch draws with,
+     * exactly as if the skipped one had run. */
+    {
+        unsigned long long k0 = nv2a_pb_exec_host_skipped(), s0 = nv2a_pb_exec_host_seen();
+        put(NV097_CLEAR_SURFACE,0xF0);
+        put(NV097_SET_TRANSFORM_CONSTANT_LOAD,1);
+        fp(NV097_SET_TRANSFORM_CONSTANT,2.53125f);
+        put(NV097_SET_TRANSFORM_PROGRAM_START,4);
+        nv2a_pb_exec_host_skip(1); draw(); nv2a_pb_exec_host_skip(0);
+        for(int i=0;i<64;++i) CHECK(pixels()[i]==0);
+        CHECK(nv2a_pb_exec_host_skipped()==k0+1 && nv2a_pb_exec_host_seen()==s0+1);
+        draw();
+        for(int y=0;y<8;++y) for(int x=0;x<8;++x)
+            CHECK(pixels()[y*8+x] == (x<2 ? 0 : 0xFF00FF00));
+        CHECK(nv2a_pb_exec_host_skipped()==k0+1 && nv2a_pb_exec_host_seen()==s0+1);
+    }
     /* START changes invalidate the decoded program; uninitialised slots cannot draw. */
     put(NV097_CLEAR_SURFACE,0xF0);
     put(NV097_SET_TRANSFORM_PROGRAM_START,100);

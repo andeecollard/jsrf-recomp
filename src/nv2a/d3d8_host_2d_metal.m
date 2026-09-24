@@ -69,6 +69,9 @@ typedef struct {
     uint32_t ci[8], ai[8], co[8], ao[8], k0[8], k1[8];
 } H2DUniforms;
 
+#define H2D_FC(name, idx) \
+    "constant uint fc_" name "_ [[function_constant(" #idx ")]];" \
+    "constant uint FC_" name " = is_function_constant_defined(fc_" name "_) ? fc_" name "_ : 0u;\n"
 static NSString *const k_src =
 @"#include <metal_stdlib>\n"
  "using namespace metal;\n"
@@ -93,9 +96,45 @@ static NSString *const k_src =
  " case 3: return (x - 0.5f) * 2.0f; case 4: return x * 4.0f; case 6: return x * 0.5f; default: return x; } }\n"
  "float3 cmap3(uint m, float3 v) { return float3(cmap1(m, v.x), cmap1(m, v.y), cmap1(m, v.z)); }\n"
  "float4 unpack(uint k) { return float4(float((k >> 16) & 255), float((k >> 8) & 255), float(k & 255), float((k >> 24) & 255)) / 255.0f; }\n"
+ /* SPECIALISATION, as the executor's spec_pipeline_for does it: every
+  * word that decides the SHAPE of the fragment program -- the combiner
+  * words, the stage count, the texture mask, the fixed-function switches --
+  * is a function constant, so the stage loop unrolls, every r[] index is a
+  * constant and the register file lives in registers instead of on the
+  * stack. Measured before this (bench, 24 Sep 2026): the host's interpreter
+  * cost 3.4-5.2x the executor's GPU time on the logo. SPEC false is the
+  * interpreter, reading the same words from U, with the same arithmetic in
+  * the same order: one body, two sources for its words. */
+ "constant bool fc_spec_ [[function_constant(0)]];\n"
+ "constant bool SPEC = is_function_constant_defined(fc_spec_) && fc_spec_;\n"
+ H2D_FC("CC",1) H2D_FC("TMASK",2) H2D_FC("FLAGS",3) H2D_FC("CONTROL",4) H2D_FC("AFUNC",5)
+ H2D_FC("BSRC",6) H2D_FC("BDST",7) H2D_FC("BEQ",40) H2D_FC("CMASK",41) H2D_FC("LIN",42)
+ H2D_FC("ci0",8) H2D_FC("ci1",9) H2D_FC("ci2",10) H2D_FC("ci3",11) H2D_FC("ci4",12) H2D_FC("ci5",13) H2D_FC("ci6",14) H2D_FC("ci7",15)
+ H2D_FC("ai0",16) H2D_FC("ai1",17) H2D_FC("ai2",18) H2D_FC("ai3",19) H2D_FC("ai4",20) H2D_FC("ai5",21) H2D_FC("ai6",22) H2D_FC("ai7",23)
+ H2D_FC("co0",24) H2D_FC("co1",25) H2D_FC("co2",26) H2D_FC("co3",27) H2D_FC("co4",28) H2D_FC("co5",29) H2D_FC("co6",30) H2D_FC("co7",31)
+ H2D_FC("ao0",32) H2D_FC("ao1",33) H2D_FC("ao2",34) H2D_FC("ao3",35) H2D_FC("ao4",36) H2D_FC("ao5",37) H2D_FC("ao6",38) H2D_FC("ao7",39)
+ "#define PICK8(n, st) (st == 0 ? FC_##n##0 : st == 1 ? FC_##n##1 : st == 2 ? FC_##n##2 : st == 3 ? FC_##n##3 : st == 4 ? FC_##n##4 : st == 5 ? FC_##n##5 : st == 6 ? FC_##n##6 : FC_##n##7)\n"
+ "uint W_ci(uint st, constant U &u) { return SPEC ? PICK8(ci, st) : u.ci[st]; }\n"
+ "uint W_ai(uint st, constant U &u) { return SPEC ? PICK8(ai, st) : u.ai[st]; }\n"
+ "uint W_co(uint st, constant U &u) { return SPEC ? PICK8(co, st) : u.co[st]; }\n"
+ "uint W_ao(uint st, constant U &u) { return SPEC ? PICK8(ao, st) : u.ao[st]; }\n"
+ /* FLAGS: 1 alpha test, 2 blend, 4 dither, 8 add specular. */
+ "uint K_cc(constant U &u) { return SPEC ? FC_CC : u.cc; }\n"
+ "uint K_tmask(constant U &u) { return SPEC ? FC_TMASK : u.tmask; }\n"
+ "uint K_control(constant U &u) { return SPEC ? FC_CONTROL : u.control; }\n"
+ "bool K_atest(constant U &u) { return SPEC ? (FC_FLAGS & 1u) != 0 : u.alpha_test != 0; }\n"
+ "bool K_blend(constant U &u) { return SPEC ? (FC_FLAGS & 2u) != 0 : u.blend != 0; }\n"
+ "bool K_dither(constant U &u) { return SPEC ? (FC_FLAGS & 4u) != 0 : u.dither != 0; }\n"
+ "bool K_spec(constant U &u) { return SPEC ? (FC_FLAGS & 8u) != 0 : u.add_spec != 0; }\n"
+ "uint K_afunc(constant U &u) { return SPEC ? FC_AFUNC : u.alpha_func; }\n"
+ "uint K_bsrc(constant U &u) { return SPEC ? FC_BSRC : u.bsrc; }\n"
+ "uint K_bdst(constant U &u) { return SPEC ? FC_BDST : u.bdst; }\n"
+ "uint K_beq(constant U &u) { return SPEC ? FC_BEQ : u.beq; }\n"
+ "uint K_cmask(constant U &u) { return SPEC ? FC_CMASK : u.cmask; }\n"
+ "uint K_lin(constant U &u) { return SPEC ? FC_LIN : u.lin_mask; }\n"
  "void stage(thread float4 *r, uint st, constant U &u) {\n"
- " uint ciw = u.ci[st], aiw = u.ai[st], cw = u.co[st], aw = u.ao[st];\n"
- " r[1] = unpack((u.control & 0x1000u) ? u.k0[st] : u.k0[0]); r[2] = unpack((u.control & 0x10000u) ? u.k1[st] : u.k1[0]);\n"
+ " uint ciw = W_ci(st, u), aiw = W_ai(st, u), cw = W_co(st, u), aw = W_ao(st, u);\n"
+ " r[1] = unpack((K_control(u) & 0x1000u) ? u.k0[st] : u.k0[0]); r[2] = unpack((K_control(u) & 0x10000u) ? u.k1[st] : u.k1[0]);\n"
  " float4 ab, cd; for (uint k = 0; k < 4; k++) { uint word = k == 3 ? aiw : ciw; uint ch = k == 3 ? 2 : k;"
  " float a = inp(word >> 24, ch, r), b = inp((word >> 16) & 255, ch, r), c = inp((word >> 8) & 255, ch, r), d = inp(word & 255, ch, r);"
  " ab[k] = a * b; cd[k] = c * d; }\n"
@@ -113,7 +152,7 @@ static NSString *const k_src =
  " if (((cw >> 19) & 1) && dab) r[dab].a = clamp(abr.b, -1.0f, 1.0f);\n"
  " if (((cw >> 18) & 1) && dcd) r[dcd].a = clamp(cdr.b, -1.0f, 1.0f); }\n"
  "float4 samp(texture2d<float> h, sampler q, float4 tc, uint unit, constant U &u) {\n"
- " float2 uv = tc.xy / tc.w; if ((u.lin_mask >> unit) & 1) uv /= float2(u.tw[unit], u.th[unit]);\n"
+ " float2 uv = tc.xy / tc.w; if ((K_lin(u) >> unit) & 1) uv /= float2(u.tw[unit], u.th[unit]);\n"
  " return h.sample(q, uv, bias(u.lod_bias[unit])); }\n"
  "bool cmpf(uint f, uint a, uint b) { switch (f) { case 0x200: return false; case 0x201: return a < b; case 0x202: return a == b;"
  " case 0x203: return a <= b; case 0x204: return a > b; case 0x205: return a != b; case 0x206: return a >= b; default: return true; } }\n"
@@ -124,31 +163,45 @@ static NSString *const k_src =
  " case 0x306: return d; case 0x307: return 1 - d; case 0x308: return float3(min(s.a, 0.0f));\n"
  " case 0x8001: return k.rgb; case 0x8002: return 1 - k.rgb; case 0x8003: return float3(k.a); case 0x8004: return float3(1 - k.a);\n"
  " default: return float3(0); } }\n"
- "fragment float4 h2d_fs(O i [[stage_in]], float4 dst [[color(0), raster_order_group(0)]], constant U &u [[buffer(0)]],\n"
- " texture2d<float> h0 [[texture(0)]], texture2d<float> h1 [[texture(1)]], texture2d<float> h2 [[texture(2)]], texture2d<float> h3 [[texture(3)]],\n"
- " sampler q0 [[sampler(0)]], sampler q1 [[sampler(1)]], sampler q2 [[sampler(2)]], sampler q3 [[sampler(3)]]) {\n"
+ "#define H2D_FS_ARGS O i [[stage_in]], float4 dst [[color(0), raster_order_group(0)]], constant U &u [[buffer(0)]],"
+ " texture2d<float> h0 [[texture(0)]], texture2d<float> h1 [[texture(1)]], texture2d<float> h2 [[texture(2)]], texture2d<float> h3 [[texture(3)]],"
+ " sampler q0 [[sampler(0)]], sampler q1 [[sampler(1)]], sampler q2 [[sampler(2)]], sampler q3 [[sampler(3)]]\n"
+ "inline float4 h2d_body(O i, float4 dst, constant U &u, texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3,"
+ " sampler q0, sampler q1, sampler q2, sampler q3, bool zcull) {\n"
  " float4 r[14]; for (uint n = 0; n < 14; n++) r[n] = float4(0);\n"
- " r[4] = i.d0; r[5] = i.d1;\n"
- " if (u.tmask & 1) r[8] = samp(h0, q0, i.t0, 0, u); if (u.tmask & 2) r[9] = samp(h1, q1, i.t1, 1, u);\n"
- " if (u.tmask & 4) r[10] = samp(h2, q2, i.t2, 2, u); if (u.tmask & 8) r[11] = samp(h3, q3, i.t3, 3, u);\n"
- " r[12].a = (u.tmask & 1) ? r[8].a : 1;\n"
- " for (uint st = 0; st < u.cc; st++) stage(r, st, u);\n"
- " float4 c = clamp(r[12] + (u.add_spec ? float4(r[5].rgb, 0) : float4(0)), 0.0f, 1.0f);\n"
- /* The executor's z-range policy for JSRF (CULL over 0..16777215). */
- " if (i.p.z < 0.0f || i.p.z > 1.0f) { discard_fragment(); return c; }\n"
- " if (u.alpha_test && !cmpf(u.alpha_func, uint(clamp(c.a, 0.0f, 1.0f) * 255 + .5f), u.alpha_ref)) { discard_fragment(); return c; }\n"
- " if (u.blend) { float3 d = dst.rgb; float4 k = unpack(u.bcolor);\n"
- "  float3 sf = c.rgb * bf(u.bsrc, c, d, k), df = d * bf(u.bdst, c, d, k);\n"
- "  c.rgb = u.beq == 0x800Au ? sf - df : u.beq == 0x800Bu ? df - sf : u.beq == 0x8007u ? min(c.rgb, d) : u.beq == 0x8008u ? max(c.rgb, d) : sf + df; }\n"
- " if (u.dither) { constexpr uint b[16] = {0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5}; int2 xy = int2(i.p.xy) + int2(u.ox, u.oy);\n"
+ " uint tm = K_tmask(u); r[4] = i.d0; r[5] = i.d1;\n"
+ " if (tm & 1) r[8] = samp(h0, q0, i.t0, 0, u); if (tm & 2) r[9] = samp(h1, q1, i.t1, 1, u);\n"
+ " if (tm & 4) r[10] = samp(h2, q2, i.t2, 2, u); if (tm & 8) r[11] = samp(h3, q3, i.t3, 3, u);\n"
+ " r[12].a = (tm & 1) ? r[8].a : 1;\n"
+ " for (uint st = 0; st < K_cc(u); st++) stage(r, st, u);\n"
+ " float4 c = clamp(r[12] + (K_spec(u) ? float4(r[5].rgb, 0) : float4(0)), 0.0f, 1.0f);\n"
+ /* The executor's z-range policy for JSRF (CULL over 0..16777215). Under
+  * MTLDepthClipModeClamp it cannot fire, which is what lets the early entry
+  * drop it, as the executor's fs_hw_early does. */
+ " if (zcull && (i.p.z < 0.0f || i.p.z > 1.0f)) { discard_fragment(); return c; }\n"
+ " if (K_atest(u) && !cmpf(K_afunc(u), uint(clamp(c.a, 0.0f, 1.0f) * 255 + .5f), u.alpha_ref)) { discard_fragment(); return c; }\n"
+ " if (K_blend(u)) { float3 d = dst.rgb; float4 k = unpack(u.bcolor); uint beq = K_beq(u);\n"
+ "  float3 sf = c.rgb * bf(K_bsrc(u), c, d, k), df = d * bf(K_bdst(u), c, d, k);\n"
+ "  c.rgb = beq == 0x800Au ? sf - df : beq == 0x800Bu ? df - sf : beq == 0x8007u ? min(c.rgb, d) : beq == 0x8008u ? max(c.rgb, d) : sf + df; }\n"
+ " if (K_dither(u)) { constexpr uint b[16] = {0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5}; int2 xy = int2(i.p.xy) + int2(u.ox, u.oy);\n"
  "  float bias = (float(b[(xy.y & 3) * 4 + (xy.x & 3)]) + .5f) / 16 - .5f; c.rgb += bias / float3(31, 63, 31); }\n"
- " if (!(u.cmask & 0x00FF0000u)) c.r = dst.r; if (!(u.cmask & 0x0000FF00u)) c.g = dst.g; if (!(u.cmask & 0x000000FFu)) c.b = dst.b;\n"
- " return float4(c.rgb, clamp(c.a, 0.0f, 1.0f)); }\n";
+ " uint cm = K_cmask(u); if (!(cm & 0x00FF0000u)) c.r = dst.r; if (!(cm & 0x0000FF00u)) c.g = dst.g; if (!(cm & 0x000000FFu)) c.b = dst.b;\n"
+ " return float4(c.rgb, clamp(c.a, 0.0f, 1.0f)); }\n"
+ "fragment float4 h2d_fs(H2D_FS_ARGS) { return h2d_body(i, dst, u, h0, h1, h2, h3, q0, q1, q2, q3, true); }\n"
+ /* Early depth/stencil: chosen only for a draw that cannot discard (no
+  * alpha test), or that may discard but writes neither depth nor stencil --
+  * the executor's hw_early_z rule, exact in both cases. */
+ "[[early_fragment_tests]] fragment float4 h2d_fs_early(H2D_FS_ARGS) { return h2d_body(i, dst, u, h0, h1, h2, h3, q0, q1, q2, q3, false); }\n";
 
 static id<MTLDevice> s_dev;
 static unsigned long long s_ns_texture, s_ns_external;      /* in-process timers for draw mode's report */
+static unsigned long long s_vb_chunks;
 static id<MTLCommandQueue> s_queue;
 static id<MTLRenderPipelineState> s_pso, s_pso_st;
+static id<MTLLibrary> s_lib;
+static id<MTLFunction> s_vs;
+static int s_spec_on = 1;                   /* d3d8_host_2d_metal_set_spec: tests compare the two */
+static unsigned long long s_spec_built, s_spec_hits, s_spec_fallback, s_spec_compile_ns;
 static id<MTLTexture> s_dummy;
 static id<MTLDepthStencilState> s_dss[16];
 /* Stencil states, built as hw_depth_state_for builds them, keyed by its fields. */
@@ -218,9 +271,16 @@ static int init(void)
             fprintf(stderr, "[D3D8-HOST-2D] shader compile failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
             s_err = "host 2d: shader compile"; goto out;
         }
+        s_lib = lib; s_vs = [lib newFunctionWithName:@"h2d_vs"];
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-        pd.vertexFunction = [lib newFunctionWithName:@"h2d_vs"];
-        pd.fragmentFunction = [lib newFunctionWithName:@"h2d_fs"];
+        pd.vertexFunction = s_vs;
+        {   /* The generic interpreter: a function that reads function
+             * constants must be fetched with values, so SPEC is set false. */
+            MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+            bool off = false;
+            [cv setConstantValue:&off type:MTLDataTypeBool atIndex:0];
+            pd.fragmentFunction = [lib newFunctionWithName:@"h2d_fs" constantValues:cv error:&err];
+        }
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
@@ -348,11 +408,99 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
     return tex;
 }
 
+/* The pipeline for a draw: specialised on its fragment shape (see SPECIALISATION
+ * in the shader), with or without the Stencil8 attachment, early or late
+ * tests. Cached, never evicted; a full cache or a failed compile falls back to
+ * the generic interpreter, counted. */
+typedef struct {
+    uint32_t cc, tmask, flags, control, afunc, bsrc, bdst, beq, cmask, lin;
+    uint32_t ci[8], ai[8], co[8], ao[8];
+    uint32_t stencil, early;
+} H2DSpecKey;
+#define SPEC_CACHE 1024
+static struct { H2DSpecKey k; uint64_t h; id<MTLRenderPipelineState> pso; } s_spec[SPEC_CACHE];
+static unsigned s_spec_n;
+void d3d8_host_2d_metal_set_spec(int on) { s_spec_on = on; }
+void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long *hits, unsigned long long *fallback,
+                                   unsigned long long *compile_ns)
+{
+    if (built) *built = s_spec_built;
+    if (hits) *hits = s_spec_hits;
+    if (fallback) *fallback = s_spec_fallback;
+    if (compile_ns) *compile_ns = s_spec_compile_ns;
+}
+static int draw_early(const D3D8Host2DDraw *d)
+{
+    int writes = (d->depth_test && d->depth_write) || (d->stencil_test && d->stencil_write && (d->stencil_mask & 255u));
+    return !d->alpha_test || !writes;
+}
+static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with_stencil, uint32_t lin_mask)
+{
+    H2DSpecKey k;
+    uint64_t h = 1469598103934665603ull;
+    if (!s_spec_on) return with_stencil ? s_pso_st : s_pso;
+    memset(&k, 0, sizeof k);
+    k.cc = d->cc; k.tmask = d->tmask; k.control = d->control;
+    k.flags = (d->alpha_test ? 1u : 0u) | (d->blend ? 2u : 0u) | (d->dither ? 4u : 0u) | (d->add_specular ? 8u : 0u);
+    k.afunc = d->alpha_test ? d->alpha_func : 0; k.lin = lin_mask;
+    if (d->blend) { k.bsrc = d->blend_src; k.bdst = d->blend_dst; k.beq = d->blend_eq; }
+    k.cmask = d->color_mask;
+    for (unsigned i = 0; i < 8 && i < d->cc; ++i) { k.ci[i] = d->ci[i]; k.ai[i] = d->ai[i]; k.co[i] = d->co[i]; k.ao[i] = d->ao[i]; }
+    k.stencil = with_stencil != 0; k.early = (uint32_t)draw_early(d);
+    { const uint8_t *b = (const uint8_t *)&k; for (size_t i = 0; i < sizeof k; ++i) { h ^= b[i]; h *= 1099511628211ull; } }
+    for (unsigned i = 0; i < s_spec_n; ++i)
+        if (s_spec[i].h == h && !memcmp(&s_spec[i].k, &k, sizeof k)) {
+            if (!s_spec[i].pso) break;
+            ++s_spec_hits; return s_spec[i].pso;
+        }
+    if (s_spec_n >= SPEC_CACHE) { ++s_spec_fallback; return with_stencil ? s_pso_st : s_pso; }
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    id<MTLRenderPipelineState> pso = nil;
+    @autoreleasepool {
+        MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+        bool on = true;
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
+        [cv setConstantValue:&k.cc type:MTLDataTypeUInt atIndex:1];
+        [cv setConstantValue:&k.tmask type:MTLDataTypeUInt atIndex:2];
+        [cv setConstantValue:&k.flags type:MTLDataTypeUInt atIndex:3];
+        [cv setConstantValue:&k.control type:MTLDataTypeUInt atIndex:4];
+        [cv setConstantValue:&k.afunc type:MTLDataTypeUInt atIndex:5];
+        [cv setConstantValue:&k.bsrc type:MTLDataTypeUInt atIndex:6];
+        [cv setConstantValue:&k.bdst type:MTLDataTypeUInt atIndex:7];
+        [cv setConstantValues:k.ci type:MTLDataTypeUInt withRange:NSMakeRange(8, 8)];
+        [cv setConstantValues:k.ai type:MTLDataTypeUInt withRange:NSMakeRange(16, 8)];
+        [cv setConstantValues:k.co type:MTLDataTypeUInt withRange:NSMakeRange(24, 8)];
+        [cv setConstantValues:k.ao type:MTLDataTypeUInt withRange:NSMakeRange(32, 8)];
+        [cv setConstantValue:&k.beq type:MTLDataTypeUInt atIndex:40];
+        [cv setConstantValue:&k.cmask type:MTLDataTypeUInt atIndex:41];
+        [cv setConstantValue:&k.lin type:MTLDataTypeUInt atIndex:42];
+        NSError *err = nil;
+        id<MTLFunction> fn = [s_lib newFunctionWithName:k.early ? @"h2d_fs_early" : @"h2d_fs" constantValues:cv error:&err];
+        if (fn) {
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = s_vs; pd.fragmentFunction = fn;
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
+            pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+            if (with_stencil) pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+            pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        }
+        if (!pso) {
+            static int told;
+            if (!told++) fprintf(stderr, "[D3D8-HOST-2D] specialised pipeline failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
+        }
+    }
+    s_spec_compile_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    s_spec[s_spec_n].k = k; s_spec[s_spec_n].h = h; s_spec[s_spec_n].pso = pso; ++s_spec_n;
+    if (!pso) { ++s_spec_fallback; return with_stencil ? s_pso_st : s_pso; }
+    ++s_spec_built;
+    return pso;
+}
+
 /* Encode `d` into a pass whose attachments are W x H and whose top-left is
  * (ox, oy) in target space: the shadow's crop, or (0, 0) and the whole
  * surface in draw mode. Returns 1 if encoded (nothing inside the scissor is
  * encoded as nothing), 0 on failure with s_err set. */
-static int encode_draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> pso, const D3D8Host2DDraw *d,
+static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const D3D8Host2DDraw *d,
                        const uint8_t *ram, size_t ram_size, unsigned W, unsigned H, unsigned ox, unsigned oy)
 {
     int32_t sx0 = d->sc_x0 > (int32_t)ox ? d->sc_x0 : (int32_t)ox, sy0 = d->sc_y0 > (int32_t)oy ? d->sc_y0 : (int32_t)oy;
@@ -381,26 +529,45 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineStat
         if (t->linear) u.lin_mask |= 1u << s;
     }
     s_ns_texture += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-    size_t vbytes = (size_t)d->nverts * sizeof(D3D8H2DVertex);
+    size_t vbytes = (size_t)d->nverts * sizeof(D3D8H2DVertex), voff = 0;
     id<MTLBuffer> vb = nil;
     if (vbytes > 4096) {                     /* Metal's inline limit; below it, setVertexBytes */
-        vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
+        /* A BUMP ALLOCATOR, not a buffer per draw. An FF draw carries ~90 KB
+         * of vertices, and allocating shared memory for each was most of the
+         * ~40 us a replaced draw spent outside texture lookup (G51.3 run,
+         * 24 Sep 2026). Each draw takes the next slice of an 8 MB chunk; a
+         * full chunk is dropped for a fresh one, and the encoders that
+         * reference the old one keep it alive until their GPU work is done,
+         * so no slice is ever rewritten while in flight. */
+        enum { CHUNK = 8u << 20 };
+        static id<MTLBuffer> chunk;
+        static size_t used;
+        size_t need = (vbytes + 255u) & ~(size_t)255u;
+        if (need > CHUNK) {
+            vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
+        } else {
+            if (!chunk || used + need > CHUNK) {
+                chunk = [s_dev newBufferWithLength:CHUNK options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+                used = 0; ++s_vb_chunks;
+            }
+            if (chunk) { memcpy((uint8_t *)chunk.contents + used, d->verts, vbytes); vb = chunk; voff = used; used += need; }
+        }
         if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
     }
-    [enc setRenderPipelineState:pso];
+    [enc setRenderPipelineState:pipeline_for(d, with_stencil, u.lin_mask)];
     {   /* The stencil unit only where the pass has one (draw mode); the
          * shadow's colour comparison does not depend on it under ALWAYS. */
-        id<MTLDepthStencilState> dss = depth_state(d, pso == s_pso_st);
+        id<MTLDepthStencilState> dss = depth_state(d, with_stencil);
         if (!dss) { s_err = "host 2d: depth-stencil state"; return 0; }
         [enc setDepthStencilState:dss];
-        if (pso == s_pso_st && d->stencil_test) [enc setStencilReferenceValue:d->stencil_ref & 255u];
+        if (with_stencil && d->stencil_test) [enc setStencilReferenceValue:d->stencil_ref & 255u];
     }
     [enc setDepthClipMode:MTLDepthClipModeClamp];
     [enc setCullMode:MTLCullModeNone];
     MTLScissorRect sc = { (NSUInteger)(sx0 - (int32_t)ox), (NSUInteger)(sy0 - (int32_t)oy),
                           (NSUInteger)(sx1 - sx0 + 1), (NSUInteger)(sy1 - sy0 + 1) };
     [enc setScissorRect:sc];
-    if (vb) [enc setVertexBuffer:vb offset:0 atIndex:0];
+    if (vb) [enc setVertexBuffer:vb offset:voff atIndex:0];
     else [enc setVertexBytes:d->verts length:(NSUInteger)vbytes atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:1];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -443,7 +610,7 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
         if (!cb || !enc) return fail("host 2d: command encoder");
-        int ok = encode_draw(enc, s_pso, d, ram, ram_size, w, h, x0, y0);
+        int ok = encode_draw(enc, 0, d, ram, ram_size, w, h, x0, y0);
         [enc endEncoding];
         if (!ok) return -1;
         [cb commit];
@@ -473,7 +640,7 @@ static int external_encode(void *encoder, unsigned w, unsigned h, void *ctx)
     ExtCtx *x = ctx;
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
     if (w != x->d->rt_w || h != x->d->rt_h) { s_err = "executor surface is not the render target's size"; return 0; }
-    return x->ok = encode_draw(enc, s_pso_st, x->d, x->ram, x->ram_size, w, h, 0, 0);
+    return x->ok = encode_draw(enc, 1, x->d, x->ram, x->ram_size, w, h, 0, 0);
 }
 int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size)
 {

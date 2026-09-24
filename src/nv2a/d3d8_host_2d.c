@@ -1109,7 +1109,16 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
 /* ---- draw mode ---- */
 static unsigned long long s_rep_tokens, s_replaced, s_rep_refused, s_rep_unbound, s_rep_noskip, s_replaced_2d, s_replaced_ff;
 static unsigned long long s_replaced_empty, s_replaced_stencil;
-static uint32_t s_skip_serial; static int s_skip_on; static unsigned long long s_skip_base;
+static uint32_t s_skip_serial; static int s_skip_on; static unsigned long long s_skip_base, s_seen_base;
+static int s_skip_host_empty;
+static unsigned long long s_rep_stop_empty, s_rep_stop_drew;
+static unsigned s_printed_stop;
+static void skip_open(const D3D8HostDrawCheck *c, int host_empty)
+{
+    s_be.exec_skip(1); s_skip_on = 1; s_skip_serial = c->serial; s_skip_host_empty = host_empty;
+    s_skip_base = s_be.exec_skipped ? s_be.exec_skipped() : 0;
+    s_seen_base = s_be.exec_seen ? s_be.exec_seen() : 0;
+}
 
 unsigned long long d3d8_host_2d_flip_count(void) { return s_flips; }
 static unsigned long long s_rep_ns_regs, s_rep_ns_build, s_rep_ff_evals, s_rep_ff_indices;
@@ -1159,8 +1168,7 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
     if (d.tris_dropped_w) { ++s_draws_dropped_w; s_tris_dropped_w += d.tris_dropped_w; }
     if (d.prim_empty) {                                   /* nothing either renderer draws: no encoder, no bind */
         ++s_replaced; ++s_replaced_empty; if (cls == 2) ++s_replaced_ff; else ++s_replaced_2d;
-        s_be.exec_skip(1); s_skip_on = 1; s_skip_serial = c->serial;
-        s_skip_base = s_be.exec_skipped ? s_be.exec_skipped() : 0;
+        skip_open(c, 1);
         return;
     }
     if (d.stencil_test) ++s_replaced_stencil;
@@ -1171,8 +1179,7 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
         ++s_rep_unbound; count_reason(s_be.last_error ? s_be.last_error() : "executor target not bound"); return;
     }
     ++s_replaced; if (cls == 2) ++s_replaced_ff; else ++s_replaced_2d;
-    s_be.exec_skip(1); s_skip_on = 1; s_skip_serial = c->serial;
-    s_skip_base = s_be.exec_skipped ? s_be.exec_skipped() : 0;
+    skip_open(c, d.nverts == 0);
 }
 
 void d3d8_host_2d_after(const D3D8HostDrawCheck *c)
@@ -1180,9 +1187,24 @@ void d3d8_host_2d_after(const D3D8HostDrawCheck *c)
     if (!s_skip_on) return;
     s_be.exec_skip(0); s_skip_on = 0;
     if (c->serial != s_skip_serial) count_reason("skip closed by a different draw's check");
-    /* The positive control on the skip itself: a replaced draw whose batches
-     * the executor did not skip was drawn twice. */
-    if (s_be.exec_skipped && s_be.exec_skipped() == s_skip_base) ++s_rep_noskip;
+    /* The positive control on the skip itself. A replaced draw none of whose
+     * batches the executor skipped is one of two things. Either its batches
+     * reached the executor and it stopped each one before the rasteriser --
+     * a point draw's single index, a refused state -- and drew nothing; or no
+     * batch arrived between the tokens at all, and whatever the draw emitted
+     * falls outside the skip: the double draw. exec_seen tells them apart. */
+    if (s_be.exec_skipped && s_be.exec_skipped() == s_skip_base) {
+        ++s_rep_noskip;
+        if (s_be.exec_seen && s_be.exec_seen() != s_seen_base) {
+            if (s_skip_host_empty) ++s_rep_stop_empty;
+            else {
+                ++s_rep_stop_drew;
+                if (s_printed_stop++ < 6)
+                    fprintf(stderr, "[D3D8-HOST-2D] draw %u fvf %03X prim %u count %u: the host drew it and the executor"
+                                    " stopped it before its rasteriser\n", c->serial, c->vs_handle, c->prim, c->count);
+            }
+        }
+    }
 }
 
 /* One PPM per mismatching draw: starting pixels | executor | host | difference
@@ -1356,6 +1378,7 @@ void d3d8_host_2d_get_stats(D3D8H2DStats *o)
     o->exec_outside_host_box = s_exec_outside;
     o->replace_tokens = s_rep_tokens; o->replaced = s_replaced; o->replace_refused = s_rep_refused;
     o->replace_unbound = s_rep_unbound; o->replaced_without_skip = s_rep_noskip;
+    o->replaced_exec_stopped_host_empty = s_rep_stop_empty; o->replaced_exec_stopped_host_drew = s_rep_stop_drew;
     o->exec_batches_skipped = s_have_be && s_be.exec_skipped ? s_be.exec_skipped() : 0;
     o->ff_draws = s_ff_draws; o->ff_built = s_ff_built; o->ff_compared = s_ff_compared; o->ff_exact = s_ff_exact;
     o->ff_within = s_ff_within; o->ff_mismatching = s_ff_mm; o->ff_px = s_ff_px; o->ff_px_mismatch = s_ff_px_mm;
@@ -1409,8 +1432,17 @@ void d3d8_host_2d_report(const char *why)
                 s_have_be && s_be.external_binds ? s_be.external_binds() : 0ull,
                 s_have_be && s_be.exec_skipped ? s_be.exec_skipped() : 0ull, s_rep_noskip, s_rep_refused,
                 s_rep_unbound, s_no_backend, s_tris_dropped_w);
-        fprintf(stderr, "[D3D8-HOST-2D] %s draw mode classes: stencil (func ALWAYS) %llu, points/lines (nothing drawn) %llu\n",
-                why, s_replaced_stencil, s_replaced_empty);
+        fprintf(stderr, "[D3D8-HOST-2D] %s draw mode classes: stencil (func ALWAYS) %llu, points/lines (nothing drawn) %llu |"
+                        " not skipped %llu = executor stopped it before the rasteriser and the host drew nothing %llu +"
+                        " executor stopped it and the host drew it %llu + NO BATCH BETWEEN THE TOKENS (double draw) %llu\n",
+                why, s_replaced_stencil, s_replaced_empty, s_rep_noskip, s_rep_stop_empty, s_rep_stop_drew,
+                s_rep_noskip - s_rep_stop_empty - s_rep_stop_drew);
+        if (s_have_be && s_be.spec_stats) {
+            unsigned long long b = 0, h = 0, f = 0, ns = 0;
+            s_be.spec_stats(&b, &h, &f, &ns);
+            fprintf(stderr, "[D3D8-HOST-2D] %s specialised fragment pipelines: built %llu (compile %.1f ms), hits %llu,"
+                            " draws on the generic interpreter %llu\n", why, b, ns / 1e6, h, f);
+        }
         {   /* In-process timers: where a replaced draw's host time goes. */
             unsigned long long th = 0, tb = 0, thash = 0, nt = 0, ne = 0, r = s_replaced ? s_replaced : 1, rf = s_replaced_ff ? s_replaced_ff : 1;
             if (s_have_be && s_be.external_stats) s_be.external_stats(&th, &tb, &thash, &nt, &ne);

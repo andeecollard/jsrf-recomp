@@ -251,6 +251,12 @@ typedef struct {
     D3D8H2DFFVertexFn ff_vertex;
     void (*exec_skip)(int on);
     unsigned long long (*exec_skipped)(void);
+    /* Optional: batches that reached the executor while the skip was on,
+     * skipped or not (nv2a_pb_exec_host_seen). Tells "the executor stopped
+     * before its rasteriser" from "no batch arrived between the tokens". */
+    unsigned long long (*exec_seen)(void);
+    /* Optional: d3d8_host_2d_metal_spec_stats, for the draw-mode report. */
+    void (*spec_stats)(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
 } D3D8Host2DBackend;
 
 /* 0 off, 1 shadow, 2 draw. Reads RECOMP_D3D8_HOST_2D once. */
@@ -280,6 +286,12 @@ int  d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, si
 /* Draw mode's in-process timers and texture-cache counters (nanoseconds). */
 void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *tex_builds, unsigned long long *tex_hashes,
                               unsigned long long *ns_texture, unsigned long long *ns_external);
+/* Fragment-program specialisation (on by default): 0 selects the generic
+ * interpreter, for tests that hold the two equal. Pipelines built, cache hits,
+ * draws that fell back to the interpreter, and compile time in ns. */
+void d3d8_host_2d_metal_set_spec(int on);
+void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long *hits, unsigned long long *fallback,
+                                   unsigned long long *compile_ns);
 /* Flips seen by the shadow/draw bookkeeping (the texture cache revalidates once per flip). */
 unsigned long long d3d8_host_2d_flip_count(void);
 /* Draws for which the host bound the target first (nv2a_metal_bind). */
@@ -300,6 +312,11 @@ typedef struct {
     unsigned long long idx_from_snapshot, idx_changed, vtx_changed, exec_outside_host_box;
     unsigned long long replace_tokens, replaced, replace_refused, replace_unbound, exec_batches_skipped,
                        replaced_without_skip;
+    /* Of replaced_without_skip: the executor saw the batches and stopped
+     * before its rasteriser (it drew nothing), split by whether the host drew
+     * anything. replaced_without_skip minus both is no batch between the
+     * tokens -- the double-draw risk. */
+    unsigned long long replaced_exec_stopped_host_empty, replaced_exec_stopped_host_drew;
     /* G51.3, fixed-function 3D in shadow: the same per-draw verdicts. */
     unsigned long long ff_draws, ff_built, ff_compared, ff_exact, ff_within, ff_mismatching, ff_px, ff_px_mismatch;
     unsigned long long replaced_2d, replaced_ff;
