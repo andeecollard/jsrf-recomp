@@ -23,6 +23,12 @@ typedef struct NV2ATextureCopy {
      * here that carries REAL alpha, which is why it cannot simply reuse the
      * 555 path. */
     uint32_t xrgb8, sz16, argb4;
+    /* Pitch-linear 32-bit image rectangles: 1 = LU_IMAGE_A8R8G8B8 (0x12),
+     * 2 = LU_IMAGE_X8R8G8B8 (0x1E, alpha forced opaque). Linear like 0x11 --
+     * width/height from the image-rectangle register, coordinates in texels,
+     * one level -- but BGRA at four bytes a texel. Refused until 24 Sep 2026;
+     * the graffiti editor's canvas is one. */
+    uint32_t lin32;
     float lod_bias;
     uint32_t combiner_count, color_icw[8], alpha_icw[8];
     uint32_t color_ocw[8], alpha_ocw[8], add_specular;
@@ -34,6 +40,26 @@ typedef struct NV2ATextureCopy {
     uint32_t const0[8], const1[8];
     uint32_t texture_mask;
     uint32_t bump_approx;   /* a unit's BUMPENVMAP mode was drawn as plain 2D (RECOMP_TEXMODE_APPROX) */
+    /* BUMPENVMAP, IMPLEMENTED (RECOMP_TEXMODE_BUMP, default on). Per unit,
+     * indexed by the unit itself (bump[0] is always 0 -- the mode is not
+     * legal on stage 0). xemu pgraph/glsl/psh.c is the reference:
+     *
+     *   (du,dv) = (sign3(Tin.b), sign3(Tin.g))   Tin = bump_input[u]'s texel
+     *   (du',dv') = (M00 du + M10 dv, M01 du + M11 dv)
+     *   T[u] = texture_u(coord_u.xy + (du',dv'))   -- NO projective divide
+     *   mode 7 also: T[u] *= bump_scale * Tin.r + bump_offset
+     *
+     * sign3(x) reads the channel as a two's-complement byte over 127. The
+     * matrix is in D3D's sense (D3DTSS_BUMPENVMATij); the method words at
+     * NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 64*u arrive as M00, M01, M11, M10
+     * -- the XDK's own D3DTSS numbering (22, 23, 24, 25) and xemu's register
+     * swizzle agree -- and are put back in order at the gate. The offset is
+     * added in the unit's own coordinate space, so for the image-rectangle
+     * formats it is in texels, as xemu's normalize-after-add does. */
+    uint32_t bump[4];         /* 0, 6 BUMPENVMAP or 7 BUMPENVMAP_LUMINANCE */
+    uint32_t bump_input[4];   /* the unit whose texel supplies du, dv (and l) */
+    float bump_mat[4][4];     /* M00, M01, M10, M11 */
+    float bump_scale[4], bump_offset[4];
     const struct NV2ATextureCopy *extra_stages;
     const uint8_t *extra_texture[3];
     size_t extra_size[3];

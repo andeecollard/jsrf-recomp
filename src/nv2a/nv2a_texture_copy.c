@@ -54,6 +54,18 @@ static int texmode_approx_on(void)
     if (on < 0) on = recomp_switch_on("RECOMP_TEXMODE_APPROX");
     return on;
 }
+/* RECOMP_TEXMODE_BUMP, default ON: texture shader modes 6 and 7 are drawn
+ * with their displacement (see NV2ATextureCopy.bump). =0 puts back exactly
+ * the behaviour before it: approximated as plain 2D under
+ * RECOMP_TEXMODE_APPROX, refused without it -- which is the A/B arm. */
+static int texmode_bump_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_TEXMODE_BUMP", 1);
+    return on;
+}
+static unsigned long s_texmode_bump[32][4];
+static float f32_bits(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 static unsigned long s_rej_count_hist[10];
 #define VR_OCW_SLOTS 16
 static uint32_t s_bad_ocw[VR_OCW_SLOTS]; static unsigned long s_bad_ocw_n[VR_OCW_SLOTS];
@@ -327,7 +339,36 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
          *
          * Off by default like every other behaviour switch here: it changes
          * what reaches the screen and has to be measurable against its own
-         * absence. */
+         * absence.
+         *
+         * IMPLEMENTED SINCE 24 SEP 2026, under RECOMP_TEXMODE_BUMP (default
+         * on), for units 1..3 whose input unit is an earlier one -- xemu
+         * asserts the same (stage >= 1). Unit 1 always reads unit 0; units 2
+         * and 3 read the unit named in NV097_SET_SHADER_OTHER_STAGE_INPUT
+         * (0x1E78) bits 16..19 and 20..23. What falls outside that is still
+         * approximated or refused below, and bump_approx still means exactly
+         * "drawn WITHOUT its displacement" -- RECOMP_MARK_BUMP keeps marking
+         * only those. The implemented ones are marked by RECOMP_MARK_BUMP_ENV. */
+        if ((mode==6 || mode==7) && u>=1 && texmode_bump_on()) {
+            unsigned in = u==1 ? 0u : (M(0x1e78) >> (16 + 4*(u-2))) & 15u;
+            if (in < u) {
+                /* The method words are M00, M01, M11, M10: the XDK's
+                 * SetTextureState_BumpEnv (0x0018F180 in this title) writes
+                 * D3DTSS type t to 0x1AD0 + 64*stage + 4*t, and the Xbox
+                 * numbering is 00=22, 01=23, 11=24, 10=25 -- which is also
+                 * xemu's swizzle {00, 01, 11, 10} in SET_TEXTURE_SET_BUMP_ENV_MAT. */
+                unsigned b = 0x1b28 + 64*u;
+                s->bump[u] = mode; s->bump_input[u] = in;
+                s->bump_mat[u][0] = f32_bits(M(b));       /* M00 */
+                s->bump_mat[u][1] = f32_bits(M(b + 4));   /* M01 */
+                s->bump_mat[u][2] = f32_bits(M(b + 12));  /* M10 */
+                s->bump_mat[u][3] = f32_bits(M(b + 8));   /* M11 */
+                s->bump_scale[u] = f32_bits(M(0x1b38 + 64*u));
+                s->bump_offset[u] = f32_bits(M(0x1b3c + 64*u));
+                s_texmode_bump[mode][u]++;
+                mode = 1;
+            }
+        }
         if ((mode==6 || mode==7) && texmode_approx_on()) {
             s_texmode_approx[mode][u]++;
             s->bump_approx=1;
@@ -518,6 +559,17 @@ void nv2a_texture_copy_census(void)
      * table of zeroes the rule is about. */
     fprintf(stderr, "[COMBINER] RECOMP_TEXMODE_APPROX %s\n",
             texmode_approx_on() ? "on" : "OFF");
+    fprintf(stderr, "[COMBINER] RECOMP_TEXMODE_BUMP %s\n",
+            texmode_bump_on() ? "on" : "OFF");
+    {   /* Implemented is not approximated, so these are not in the table
+         * below; they are counted so an A/B can see the arm reached them. */
+        unsigned m, u;
+        for (m = 6; m < 8; ++m)
+            for (u = 1; u < 4; ++u)
+                if (s_texmode_bump[m][u])
+                    fprintf(stderr, "[COMBINER]   unit %u mode %u  x%lu   drawn WITH the"
+                            " displacement (RECOMP_TEXMODE_BUMP)\n", u, m, s_texmode_bump[m][u]);
+    }
 
     /* Silent when there is nothing to report: a clean run should not carry a
      * table of zeroes that a later reader has to check is a table of zeroes. */
@@ -526,7 +578,7 @@ void nv2a_texture_copy_census(void)
             && !s_rej_texmode && !s_rej_texstage && !s_rej_alpha && !approxed)
         return;
     fprintf(stderr, "[TEXFMT] gate refusals by texture format"
-            " (accepted: 0x11 linear, 0x0C dxt1, 0x0E dxt3, 0x06/0x07 rgba8,"
+            " (accepted: 0x11/0x12/0x1E linear, 0x0C dxt1, 0x0E dxt3, 0x06/0x07 rgba8,"
             " 0x03 x1r5g5b5, 0x04 a4r4g4b4)\n");
     fprintf(stderr, "[TEXFMT]   header/mip-layout bits wrong=%lu  dma class wrong=%lu"
             "  combiner output=%lu\n",
@@ -643,10 +695,21 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
     if(!s->levels) return "texture mip levels";
     if(s->levels>1 && (control&0x3ffc0u)!=0x3ffc0u)
         return "texture maximum LOD clamp";
-    if(format==0x11) {
+    if(format==0x11 || format==0x12 || format==0x1e) {
+        /* LU_IMAGE_R5G6B5 (0x11), LU_IMAGE_A8R8G8B8 (0x12) and
+         * LU_IMAGE_X8R8G8B8 (0x1E): pitch-linear image rectangles, sized by
+         * the image-rectangle register and addressed in TEXELS, not 0..1 --
+         * xemu binds all three as rectangle textures. The two 32-bit ones were
+         * refused until 24 Sep 2026, and they are Roboy's graffiti studio: the
+         * canvas, brush preview and palette are 0x12 textures the game fills
+         * by CPU writes, and 894 of 14,911 editor batches were dropped, so
+         * nothing painted. 0x1E is 0x12 with the top byte undefined, forced
+         * opaque as the swizzled 0x07 is. */
         if(s->levels!=1) return "linear texture mip levels";
+        s->lin32=format==0x12 ? 1u : format==0x1e ? 2u : 0u;
         s->width=M(b+28)>>16; s->height=M(b+28)&65535; s->pitch=M(b+16)>>16;
-        if(!s->width || !s->height || s->pitch<s->width*2u) return "texture dimensions / pitch";
+        if(!s->width || !s->height || s->pitch<s->width*(s->lin32 ? 4u : 2u))
+            return "texture dimensions / pitch";
     } else if(format==0xc || format==0xe || format==6 || format==7 || format==3
               || format==4) {
         /* 0x07 SZ_X8R8G8B8, 0x03 SZ_X1R5G5B5 and 0x04 SZ_A4R4G4B4 are
@@ -668,7 +731,7 @@ const char *nv2a_texture_copy_prepare_image(const uint32_t m[2048], unsigned uni
             s->sz16 ? s->width*2 : s->width*4;
     } else { s_fmt_rejected[format]++; return "texture format / mip layout"; }
     /* Repeat or clamp-to-edge; all three wrap components must agree. */
-    if(M(b+8)==0x10101 && format!=0x11) s->repeat=1;
+    if(M(b+8)==0x10101 && format!=0x11 && format!=0x12 && format!=0x1e) s->repeat=1;
     else if(M(b+8)!=0x10303 && M(b+8)!=0x30303) return "texture address mode";
     uint32_t filter=M(b+20), min=(filter>>16)&255, mag=(filter>>24)&15;
     if((filter&0xf000e000)!=0x2000 || min<1 || min>6 || (mag!=1 && mag!=2)) return "texture filter / channel sign";
@@ -863,6 +926,14 @@ static void texel(const NV2ATextureCopy *s, const uint8_t *data, int x, int y, f
         for (int k=0;k<3;++k) rgba[k]=a[k]*weight+b[k]*(1-weight);
         rgba[3]=alpha; return;
     }
+    if(s->lin32) {
+        /* Linear A8R8G8B8 / X8R8G8B8: BGRA bytes at y*pitch + x*4, which is
+         * exactly how the graffiti editor writes its canvas. */
+        const uint8_t *p=data+(size_t)y*s->pitch+(size_t)x*4;
+        rgba[0]=p[2]/255.0f; rgba[1]=p[1]/255.0f; rgba[2]=p[0]/255.0f;
+        rgba[3]=s->lin32==2 ? 1.0f : p[3]/255.0f;
+        return;
+    }
     const uint8_t *p=data+(size_t)y*s->pitch+x*2;
     uint32_t v=p[0] | (uint32_t)p[1]<<8;
     unpack565(v,rgba);
@@ -918,6 +989,32 @@ static void sample_lod(const NV2ATextureCopy *s,const uint8_t *data,float u,floa
     }
     float f=hi==lo?0:l-lo;
     for(unsigned k=0;k<4;++k) out[k]=a[k]*(1-f)+b[k]*f;
+}
+
+/* BUMPENVMAP (6) and BUMPENVMAP_LUMINANCE (7), xemu pgraph/glsl/psh.c op for
+ * op; the MSL bump_sample() in nv2a_metal.m is its twin and metal_bump_test
+ * holds the two together. sign3 is xemu's: the channel read back as the
+ * two's-complement byte it was stored as, over 127 -- applied to the FILTERED
+ * value, which is xemu's own FIXME and what hardware may not do. The channel
+ * sign bits in the filter word never reach here: prepare_image refuses any
+ * texture that sets them. The LOD is the unperturbed coordinate's. */
+static float bump_sign3(float x)
+{
+    x*=255.0f;
+    return x>=128.0f ? (x-256.0f)/127.0f : x/127.0f;
+}
+static void bump_sample(const NV2ATextureCopy *s, unsigned unit, const NV2ATextureCopy *t,
+                        const uint8_t *data, float u, float v, float lod, float regs[16][4])
+{
+    const float *in=regs[8+s->bump_input[unit]], *mm=s->bump_mat[unit];
+    float du=bump_sign3(in[2]), dv=bump_sign3(in[1]);
+    float pu=mm[0]*du+mm[2]*dv, pv=mm[1]*du+mm[3]*dv;
+    float *out=regs[8+unit];
+    sample_lod(t,data,u+pu,v+pv,lod,out);
+    if(s->bump[unit]==7) {
+        float k=s->bump_scale[unit]*in[0]+s->bump_offset[unit];
+        for(unsigned c=0;c<4;++c) out[c]*=k;
+    }
 }
 
 /* Unpack one mip level into tightly packed RGBA8, in R,G,B,A byte order.
@@ -1279,8 +1376,11 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
      * through, and the bounds test that incidentally covered this only did so
      * because an untextured state also leaves width and height zero.
      * !sz16 likewise: the row copy assumes LINEAR 565 bytes, and 0x03/0x04
-     * are swizzled and differently packed. */
-    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->sz16 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
+     * are swizzled and differently packed. !lin32 too: 0x12/0x1E are
+     * linear, so they pass every other test here, and the graffiti canvas is
+     * exactly the full-screen 1:1 quad this path is for -- it would have
+     * memcpy'd BGRA bytes into a 565 target. */
+    int direct=!s->combiner_count && !s->untextured && !s->rgba8 && !s->sz16 && !s->lin32 && !s->modulate && !s->dxt1 && !s->dxt3 && !s->alpha_test && !s->blend && !s->depth_test && !s->stencil_test
         && s->target_bpp==2 && x0>=0 && y0>=0 && (uint32_t)x1<=s->width && (uint32_t)y1<=s->height;
     for (int i=0;i<3;++i)
         if (v[i][0][3]!=1 || v[i][NV2A_VSH_OUT_T0][3]!=1
@@ -1334,7 +1434,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                 const uint8_t *data=unit?s->extra_texture[unit-1]:texture;
                 float uv[3][2];
                 for(unsigned at=0;at<3;++at) {
-                    float sx=0,sy=0,sq=0;
+                    float sx=0,sy=0,sq=0,sw=0;
                     float px=x+.5f+(at==1),py=y+.5f+(at==2);
                     float weights[3]={edge(b[0],c[0],px,py),edge(c[0],a[0],px,py),edge(a[0],b[0],px,py)};
                     for(unsigned i=0;i<3;++i) {
@@ -1342,7 +1442,12 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                         sx+=w*v[i][NV2A_VSH_OUT_T0+unit][0];
                         sy+=w*v[i][NV2A_VSH_OUT_T0+unit][1];
                         sq+=w*v[i][NV2A_VSH_OUT_T0+unit][3];
+                        sw+=w;
                     }
+                    if(!isfinite(sq) || sq==0) return 0;
+                    /* BUMPENVMAP takes coord.xy as interpolated, with no
+                     * projective divide (xemu: pT.xy, not textureProj). */
+                    if(s->bump[unit]) sq=sw;
                     if(!isfinite(sq) || sq==0) return 0;
                     uv[at][0]=sx/sq;uv[at][1]=sy/sq;
                     if(!isfinite(uv[at][0]) || !isfinite(uv[at][1])) return 0;
@@ -1350,7 +1455,8 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                 float dx=hypotf((uv[1][0]-uv[0][0])*t->width,(uv[1][1]-uv[0][1])*t->height);
                 float dy=hypotf((uv[2][0]-uv[0][0])*t->width,(uv[2][1]-uv[0][1])*t->height);
                 float lod=log2f(fmaxf(0.000001f,fmaxf(dx,dy)));
-                sample_lod(t,data,uv[0][0],uv[0][1],lod,regs[8+unit]);
+                if(s->bump[unit]) bump_sample(s,unit,t,data,uv[0][0],uv[0][1],lod,regs);
+                else sample_lod(t,data,uv[0][0],uv[0][1],lod,regs[8+unit]);
             }
             combine(s,regs,fogd,rgb);
         } else {
