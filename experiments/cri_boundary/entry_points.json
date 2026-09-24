@@ -1,0 +1,4 @@
+[
+ {"address": "0x0013B180", "name": "sub_0013B180", "lib": "cri", "ret_bytes": [],
+  "note": "CRI ADX's idle-priority counting spinner (thread entry, created suspended by sub_0013B330, resumed by the ADX lock 0x13B0A0). Increments 0x25EFA8, which nothing reads; exits when 0x25EFC0 is set."}
+]

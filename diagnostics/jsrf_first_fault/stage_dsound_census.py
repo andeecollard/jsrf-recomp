@@ -21,6 +21,7 @@ DS_LO, DS_HI = 0x0019E340, 0x001BA8A0
 LIFT = {
     "dsound": ("dsl", "dsound_lift.c", "RECOMP_DSOUND_LIFT=1"),
     "xinput": ("xil", "xinput_lift.c", "RECOMP_XINPUT_LIFT=1"),
+    "cri":    ("crl", "cri_lift.c", "RECOMP_CRI_SPINNER_LIFT (default on)"),
 }
 
 # Argument logging: name -> (number of stack args to capture, post-call hook).
