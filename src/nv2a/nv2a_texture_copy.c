@@ -211,6 +211,7 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
     s->fog_enable = M(0x2a4) != 0; s->fog_mode = M(0x29c); s->fog_color = M(0x2a8);
     memcpy(&s->fog_p0, &M(0x9c0), 4); memcpy(&s->fog_p1, &M(0x9c4), 4);
     s->spec_fog_c0 = M(0x1e20); s->spec_fog_c1 = M(0x1e24);
+    s->point_size = (float)(M(0x43c) & 0x1ffu) / 8.0f; s->point_sprite = M(0x31c) != 0; s->point_params = M(0x318) != 0;
     uint32_t control=M(0x1e60),count=control&0xf;
     /* Count occupies the low nibble. The three high flags select mux and
      * per-stage C0/C1; the captured six-stage program sets all three. */

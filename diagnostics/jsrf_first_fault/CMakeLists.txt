@@ -1233,6 +1233,10 @@ if(APPLE)
         "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
     target_link_libraries(jsrf_metal_fog_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_fog COMMAND jsrf_metal_fog_test)
+    # G54: a 2-index line and a 1-index point paint pixels on the Metal path.
+    add_executable(jsrf_metal_points_lines_test metal_points_lines_test.c)
+    target_link_libraries(jsrf_metal_points_lines_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_points_lines COMMAND jsrf_metal_points_lines_test)
     add_test(NAME jsrf_metal_fog_vsh COMMAND jsrf_metal_fog_test vsh)
     set_tests_properties(jsrf_metal_combiner_spec PROPERTIES
                          ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}")

@@ -85,6 +85,12 @@ typedef struct NV2ATextureCopy {
     uint32_t fog_enable, fog_mode, fog_color;   /* 0x02A4, 0x029C, 0x02A8 (ABGR: red is the low byte) */
     float fog_p0, fog_p1;                       /* FOG_PARAMS 0x09C0, 0x09C4 */
     uint32_t spec_fog_c0, spec_fog_c1;          /* SPECULAR_FOG_FACTOR0/1, A8R8G8B8 */
+    /* G54: points. NV097_SET_POINT_SIZE (0x43C) is in 1/8 pixel (xemu:
+     * glPointSize(size / 8)); SET_POINT_SMOOTH_ENABLE (0x31C) is the point
+     * sprite switch, whose texture coordinates run 0..1 over the sprite;
+     * SET_POINT_PARAMS_ENABLE (0x318) is distance attenuation, not modelled. */
+    float point_size;
+    uint32_t point_sprite, point_params;
 } NV2ATextureCopy;
 
 /* The fog factor for fog coordinate `d`, per NV097_SET_FOG_MODE (xemu

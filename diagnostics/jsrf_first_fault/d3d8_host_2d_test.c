@@ -1539,22 +1539,33 @@ static void draw_mode_tests(void)
               s0.replaced_exec_stopped_host_empty == s3.replaced_exec_stopped_host_empty &&
               s0.replaced_exec_stopped_host_drew == s3.replaced_exec_stopped_host_drew,
               "draw mode CONTROL: a replaced draw with no batch between its tokens is caught as the double-draw case");
-        /* The game's 684 (24 Sep 2026): a point list of one index. The host
-         * replaces it with nothing; the executor sees the batch and stops it
-         * before the rasteriser (fewer than 3 indices), so nothing is skipped
-         * -- and nothing is drawn by either. Counted, not called a double draw. */
+        /* G54: the executor now draws points and lines, so a point draw is no
+         * longer replaced with nothing -- it is left to the executor. */
+        {   D3D8H2DStats q0, q1;
+            d3d8_host_2d_get_stats(&q0);
+            case_ff(&c); c.prim = 1; c.count = 1; snapshot_at_call(&c);
+            d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
+            d3d8_host_2d_get_stats(&q1);
+            CHECK(g_fake_skip == 0 && q1.replaced == q0.replaced && q1.replace_refused == q0.replace_refused + 1,
+                  "point draw: left to the executor, which draws points now (not replaced, no skip)");
+        }
+        /* The game's 684 (24 Sep 2026) had this shape as a point list; with
+         * points drawn, the draw neither side draws is a one-index POLYGON. The
+         * host replaces it with nothing; the executor sees the batch and stops
+         * it before the rasteriser, so nothing is skipped -- and nothing is
+         * drawn by either. Counted, not called a double draw. */
         {   D3D8H2DStats p0, p1;
             d3d8_host_2d_get_stats(&p0);
-            case_ff(&c); c.prim = 1; c.count = 1; snapshot_at_call(&c);
+            case_ff(&c); c.prim = 10; c.count = 1; snapshot_at_call(&c);
             d3d8_host_2d_replace(&c);
-            CHECK(g_fake_skip == 1, "point draw: replaced, skip on");
+            CHECK(g_fake_skip == 1, "polygon of one index: replaced, skip on");
             if (g_fake_skip) ++g_fake_seen;                  /* executor: batch arrives, idx_count < 3, returns */
             d3d8_host_2d_after(&c);
             d3d8_host_2d_get_stats(&p1);
             CHECK(p1.replaced == p0.replaced + 1 && p1.replaced_without_skip == p0.replaced_without_skip + 1 &&
                   p1.replaced_exec_stopped_host_empty == p0.replaced_exec_stopped_host_empty + 1 &&
                   p1.replaced_exec_stopped_host_drew == p0.replaced_exec_stopped_host_drew,
-                  "point draw: seen and stopped by the executor, drawn by neither -- not a double draw");
+                  "polygon of one index: seen and stopped by the executor, drawn by neither -- not a double draw");
             /* A triangle draw the executor stops but the host drew: a divergence, counted apart. */
             background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
             case_logo(&c); snapshot_at_call(&c);

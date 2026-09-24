@@ -370,7 +370,12 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
      * lines: not yet"), so the executor's picture is unchanged by them. The
      * host describes that exactly: no vertices. */
     if (((d->prim >= 1u && d->prim <= 4u) || d->prim == 10u) && (d3d8_host_2d_bisect() & 512u)) return "primitive (bisect 512)";
-    if ((d->prim >= 1u && d->prim <= 4u) || d->prim == 10u) { d->prim_empty = 1; d->nverts = 0; d->bb_x0 = 1; d->bb_x1 = 0; return NULL; }
+    /* G54: the executor now DRAWS points and lines (screen-space quads in
+     * nv2a_metal.m), so describing them as "nothing" would make draw mode
+     * skip real geometry. The host does not draw them yet: left to the
+     * executor. POLYGON (10) is still drawn by nobody. */
+    if (d->prim >= 1u && d->prim <= 4u) return "points and lines (left to the executor)";
+    if (d->prim == 10u) { d->prim_empty = 1; d->nverts = 0; d->bb_x0 = 1; d->bb_x1 = 0; return NULL; }
     if (d->prim < 5u || d->prim > 9u) return "primitive";
     if (c->count > 16384u) return "vertex count";
     {
