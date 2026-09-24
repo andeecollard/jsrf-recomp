@@ -508,3 +508,16 @@ merging or carrying flags at split entries.
   **The specialised host fragment pipelines (`b3030e4`) drop pixels**, and the
   host covers less on the building draws. Sampling (10,756 units) and bind
   geometry agree exactly. Back with the agent.
+- **FF draw debris fixed** (`4305cdf`). The specialised shader looped over the
+  stages and picked each stage's words by loop index. With D3D's
+  per-stage-factor bits clear, about 1 program in 15 then disagreed with the
+  generic path (a minimised 4-stage program drew 4,663 px where every fragment
+  should be discarded). The stages are now unrolled, as the executor's own
+  specialisation does. FF+2D draw, VERIFY=60, 130 s, 0 faults, 65.6 fps:
+  - FF compared 6,051, MISMATCHING 1,000 (917 of them 1–4 px, none over 512);
+  - 5,543 px over tolerance;
+  - coverage balanced (executor more 272, host more 304).
+
+  Frames are clean at the matching scene and at the later "Find Gum" line.
+  Speed next: 65.6 against the reference's 83; binding drains the GPU at
+  ~1.6 ms per bind.
