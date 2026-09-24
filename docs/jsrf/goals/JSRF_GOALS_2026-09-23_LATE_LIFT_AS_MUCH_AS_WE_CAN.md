@@ -567,3 +567,15 @@ merging or carrying flags at split entries.
   **The default-on flip is ready** on branch `g56-defer-default-on`
   (`99f5f9c`), held for a player session with
   `RECOMP_METAL_DEFER_SWAP=1 RECOMP_METAL_DEBT_WATCH=1`.
+- **G51.2 VS shadow: exact** (`ef63b55`, `973c244`). The title's own vertex
+  programs are about 21 draws a frame (18 distinct programs), mostly
+  characters. The host takes program words from the shader object and
+  constants from SetVertexShaderConstant, and transforms with the executor's
+  VSH→MSL function. Tutorial, 130 s, 0 faults:
+  - compared 2,153: EXACT 2,151, within tolerance 2, MISMATCHING 0;
+  - constants agree on all 2,153;
+  - control: 1,440 mismatching.
+
+  One arming table now serves every RECOMP_D3D8_HOST_* class; the first VS run
+  had counted 0 because the mirror kept its own list. The probe race is
+  fixed: DEFER+WATCH now reads 0 early accesses.
