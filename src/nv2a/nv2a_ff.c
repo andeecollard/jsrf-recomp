@@ -217,6 +217,36 @@ static int texture_matrix_usable(const uint32_t *m,unsigned unit)
                 unit,nv2a_ff_method_seen?"says it was written":"absent",identity);
     return !identity;
 }
+unsigned long nv2a_ff_fog_vertices[6], nv2a_ff_fog_unknown;
+int nv2a_ff_fog_source(const uint32_t m[2048])
+{
+    if(!m[0x2a4/4]) return NV2A_FF_FOG_OFF;
+    switch(m[0x2a0/4]) {
+    case 0: return NV2A_FF_FOG_SPEC_ALPHA;
+    case 1: return NV2A_FF_FOG_RADIAL;
+    case 2: return NV2A_FF_FOG_PLANAR;
+    case 3: return NV2A_FF_FOG_ABS_PLANAR;
+    case 6: return NV2A_FF_FOG_X;
+    default: return -1;
+    }
+}
+static float fog_coord(const uint32_t *m,int source,const float in[16][4],const float spec[4])
+{
+    float eye[4];
+    switch(source) {
+    case NV2A_FF_FOG_SPEC_ALPHA: return clamp01(spec[3]);
+    case NV2A_FF_FOG_X: return in[5][0];
+    case NV2A_FF_FOG_RADIAL:
+        matrix(m,0x480,in[0],eye);
+        return sqrtf((eye[0]*eye[0]+eye[1]*eye[1])+eye[2]*eye[2]);
+    case NV2A_FF_FOG_PLANAR: case NV2A_FF_FOG_ABS_PLANAR: {
+        float d;
+        matrix(m,0x480,in[0],eye);
+        d=((value(m,0x9d0)*eye[0]+value(m,0x9d4)*eye[1])+value(m,0x9d8)*eye[2])+value(m,0x9dc);
+        return source==NV2A_FF_FOG_ABS_PLANAR?fabsf(d):d; }
+    default: return 0;
+    }
+}
 const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float out[16][4])
 {
     static const uint32_t normal_map=0x8511;
@@ -411,6 +441,9 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
         }
         else memcpy(out[9+u],generated,4*sizeof(float));
     }
+    {   int fs=nv2a_ff_fog_source(m);
+        if(fs<0) ++nv2a_ff_fog_unknown;
+        else if(fs) { ++nv2a_ff_fog_vertices[fs]; out[5][0]=fog_coord(m,fs,in,out[4]); } }
     return 0;
 }
 
@@ -628,7 +661,12 @@ int nv2a_ff_key(const uint32_t m[2048],NV2AFFKey *key)
      * struct nv2a_metal.m uploads for a CPU-transformed draw, so this path
      * costs the staging ring nothing extra. The normal is the eighth and is
      * included only when something reads it. */
-    key->inputs=(uint16_t)(0x1E19u | (key->normal_read?0x0004u:0u));
+    {   int fs=nv2a_ff_fog_source(m);
+        /* An unmodelled gen mode stays on the CPU, where it is counted. */
+        if(fs<0) { ++nv2a_ff_gpu_cpu_batches; return 0; }
+        key->fog=(uint8_t)fs; }
+    key->inputs=(uint16_t)(0x1E19u | (key->normal_read?0x0004u:0u)
+                           | (key->fog==NV2A_FF_FOG_X?0x0020u:0u));
     ++nv2a_ff_gpu_batches;
     return 1;
 }
@@ -647,6 +685,10 @@ void nv2a_ff_params(const uint32_t m[2048],const NV2AFFKey *key)
     nv2a_ff_constants[NV2A_FF_C_VIEWPORT][0]=value(m,0xa20);
     nv2a_ff_constants[NV2A_FF_C_VIEWPORT][1]=value(m,0xa24);
     if(key->normal_read) pack_matrix(NV2A_FF_C_NORMAL,m,0x580,0);
+    if(key->fog==NV2A_FF_FOG_RADIAL||key->fog==NV2A_FF_FOG_PLANAR||key->fog==NV2A_FF_FOG_ABS_PLANAR) {
+        pack_matrix(NV2A_FF_C_MODELVIEW,m,0x480,0);
+        for(unsigned k=0;k<4;++k) nv2a_ff_constants[NV2A_FF_C_FOGPLANE][k]=value(m,0x9d0+4*k);
+    }
     for(unsigned u=0;u<4;++u)
         if(key->texmat[u]) pack_matrix(NV2A_FF_C_TEXMAT+u*4,m,0x6c0+u*64,transpose);
     if(key->lighting) {

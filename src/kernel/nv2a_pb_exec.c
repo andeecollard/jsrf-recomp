@@ -518,7 +518,7 @@ static int vsh_reuse_on(void)
  * RECOMP_VSH_NARROW_OUTPUTS=1 enables it. Default OFF until an A/B says which
  * value is wrong: the argument above is a good one, and a good argument is
  * exactly what shipped a regression earlier today. */
-static const uint8_t s_live_outputs[] = { 0, 3, 4, 9, 10, 11, 12 };
+static const uint8_t s_live_outputs[] = { 0, 3, 4, 5, 9, 10, 11, 12 };   /* 5: oFog, read since G53 */
 
 /* A clear of BOTH halves overwrites every byte of the retained surface, so
  * reading that surface back first is pure waste -- see nv2a_metal_discard.
@@ -1522,6 +1522,65 @@ static void draw_mix_report(void)
                 (!s_draw_mix[i].untex && s_draw_mix[i].tex_addr == s_draw_mix[i].tgt_addr)
                     ? "  <<< SAMPLES ITS OWN TARGET" : "");
     s_draw_mix_rows = 0; s_draw_mix_overflow = 0;
+}
+
+/* RECOMP_FOG_TRACE=1 -- G53's census, read-only, opt-in.
+ *
+ * Every distinct fog-and-final-combiner state a batch draws with: the final
+ * combiner words (0x288/0x28C), FOG_ENABLE/MODE/GEN_MODE (0x2A4/0x29C/0x2A0),
+ * FOG_COLOR (0x2A8), FOG_PARAMS (0x9C0..), FOG_PLANE (0x9D0..), the transform
+ * MODE (0x1E94 bits 1:0), whether the bound program writes oFog, and
+ * SPECULAR_FOG_FACTOR0/1 (0x1E20/4). One line when a state is first seen, the
+ * table with counts every 30 s. */
+#define FOG_TRACE_MAX 48
+enum { FT_CW0, FT_CW1, FT_EN, FT_MODE, FT_GEN, FT_COLOR, FT_P0, FT_P1, FT_P2, FT_PL0, FT_PL1, FT_PL2, FT_PL3,
+       FT_XF, FT_OFOG, FT_SF0, FT_SF1, FT_N };
+static struct { uint32_t w[FT_N]; unsigned long n; } s_fog_trace[FOG_TRACE_MAX];
+static unsigned s_fog_trace_n; static unsigned long s_fog_trace_over;
+static void fog_trace_print(const char *why)
+{
+    fprintf(stderr, "[FOG-TRACE] %s: %u states%s\n", why, s_fog_trace_n, s_fog_trace_over ? " (table full; more not listed)" : "");
+    for (unsigned i = 0; i < s_fog_trace_n; ++i) {
+        const uint32_t *w = s_fog_trace[i].w; float p[3], pl[4];
+        memcpy(p, &w[FT_P0], 12); memcpy(pl, &w[FT_PL0], 16);
+        fprintf(stderr, "[FOG-TRACE]   %9lu batches: CW0 %08X CW1 %08X | FOG_ENABLE %u MODE %X GEN %u COLOR %08X |"
+                        " PARAMS %g %g %g | PLANE %g %g %g %g | xf MODE %u, program writes oFog %u | SPECFOG %08X %08X\n",
+                s_fog_trace[i].n, w[FT_CW0], w[FT_CW1], w[FT_EN], w[FT_MODE], w[FT_GEN], w[FT_COLOR], p[0], p[1], p[2],
+                pl[0], pl[1], pl[2], pl[3], w[FT_XF], w[FT_OFOG], w[FT_SF0], w[FT_SF1]);
+    }
+    fflush(stderr);
+}
+static void fog_trace(void)
+{
+    static int on = -1; static time_t last;
+    uint32_t w[FT_N]; unsigned i;
+    if (on < 0) on = recomp_switch_on("RECOMP_FOG_TRACE");
+    if (!on) return;
+    memset(w, 0, sizeof w);
+    w[FT_CW0] = s_methods[0x288/4]; w[FT_CW1] = s_methods[0x28c/4]; w[FT_EN] = s_methods[0x2a4/4];
+    w[FT_MODE] = s_methods[0x29c/4]; w[FT_GEN] = s_methods[0x2a0/4]; w[FT_COLOR] = s_methods[0x2a8/4];
+    for (i = 0; i < 3; ++i) w[FT_P0 + i] = s_methods[(0x9c0 + 4*i)/4];
+    for (i = 0; i < 4; ++i) w[FT_PL0 + i] = s_methods[(0x9d0 + 4*i)/4];
+    w[FT_XF] = s_methods[0x1e94/4] & 3u;
+    if (s_vsh.mode == 2 && s_vsh.decoded.valid)
+        for (int k = 0; k < s_vsh.decoded.length; ++k) {
+            const NV2AVshInstruction *in = &s_vsh.decoded.insns[k];
+            if ((in->mac_dst.output_mask && in->mac_dst.output_reg == NV2A_VSH_OUT_FOG)
+             || (in->ilu_dst.output_mask && in->ilu_dst.output_reg == NV2A_VSH_OUT_FOG)) { w[FT_OFOG] = 1; break; }
+        }
+    w[FT_SF0] = s_methods[0x1e20/4]; w[FT_SF1] = s_methods[0x1e24/4];
+    for (i = 0; i < s_fog_trace_n; ++i) if (!memcmp(s_fog_trace[i].w, w, sizeof w)) break;
+    if (i == s_fog_trace_n) {
+        if (s_fog_trace_n >= FOG_TRACE_MAX) { ++s_fog_trace_over; return; }
+        memcpy(s_fog_trace[s_fog_trace_n].w, w, sizeof w); s_fog_trace[s_fog_trace_n].n = 0; ++s_fog_trace_n;
+        fprintf(stderr, "[FOG-TRACE] new state %u at draw %u: CW0 %08X CW1 %08X FOG_ENABLE %u MODE %X GEN %u COLOR %08X"
+                        " xf MODE %u oFog %u\n", i, s_gpu.draws, w[FT_CW0], w[FT_CW1], w[FT_EN], w[FT_MODE], w[FT_GEN],
+                w[FT_COLOR], w[FT_XF], w[FT_OFOG]);
+    }
+    ++s_fog_trace[i].n;
+    {   time_t now = time(NULL);
+        if (!last) last = now;
+        if (now - last >= 30) { last = now; fog_trace_print("periodic"); } }
 }
 
 static const char *prepare_texture_copy(void)
@@ -5157,6 +5216,7 @@ static void raster_batch(void)
      * timing only the success path would hide the expensive half. `copy_error`
      * is taken first and the stage closed before anything looks at it, so the
      * reject bookkeeping below is not charged here. */
+    fog_trace();
     unsigned long long _t_prep = pb_now_us();
     const char *copy_error = prepare_texture_copy();
     pb_stage_add(PB_STAGE_PREPARE, _t_prep);
@@ -6617,6 +6677,13 @@ void nv2a_pb_exec_report(void)
                 nv2a_ff_gpu_backend_refused, nv2a_ff_gpu_clip_w,
                 nv2a_ff_gpu_texq_would_drop,
                 nv2a_ff_gpu_texmat_unset, nv2a_ff_gpu_texmat_zero);
+    if (nv2a_ff_fog_unknown || nv2a_ff_fog_vertices[1] || nv2a_ff_fog_vertices[2] || nv2a_ff_fog_vertices[3]
+        || nv2a_ff_fog_vertices[4] || nv2a_ff_fog_vertices[5])
+        fprintf(stderr, "[VSH] fixed-function fog coordinate on the CPU (vertices): spec alpha %lu, radial %lu,"
+                " planar %lu, abs planar %lu, fog attribute %lu, UNMODELLED gen mode %lu (coordinate 0)\n",
+                nv2a_ff_fog_vertices[1], nv2a_ff_fog_vertices[2], nv2a_ff_fog_vertices[3],
+                nv2a_ff_fog_vertices[4], nv2a_ff_fog_vertices[5], nv2a_ff_fog_unknown);
+    if (s_fog_trace_n) fog_trace_print("report");
     for (size_t i = 0; i < sizeof s_vsh_reject / sizeof s_vsh_reject[0]; ++i) {
         if (!s_vsh_reject[i].reason) break;
         fprintf(stderr, "[VSH]   %8u  %s (first detail %u)\n",

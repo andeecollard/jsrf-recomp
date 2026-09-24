@@ -100,6 +100,7 @@ static id<MTLLibrary> hw_library;
 typedef struct CombKey {
     uint32_t cc, tmask, hw, flags;
     uint32_t ci[8], ai[8], co[8], ao[8];
+    uint32_t fcw0, fcw1;   /* G53: the final combiner, when flags & 8 (else zero) */
 } CombKey;
 static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey *ck);
 static unsigned long long g_mtl_discards;
@@ -705,14 +706,17 @@ static void clip_audit(const float(*v)[16][4],const unsigned*idx,unsigned n,
 static NSString *const shader =
 @"#include <metal_stdlib>\n"
  "using namespace metal;\n"
- "struct Vertex { float4 p,d0,d1,t0,t1,t2,t3; };\n"
+ "struct Vertex { float4 p,d0,d1,t0,t1,t2,t3,f; };\n"
  "struct Params { uint width,height,dither,untextured,combiner_count,texture_mask,add_specular,alpha_test,alpha_ref,modulate,blend,blend_src,blend_dst,depth_test,depth_write,depth_func;"
  "  uint z_cull; float z_lo,z_hi;"
  " uint stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;"
  " uint tw[4],th[4],pitch[4],linear[4],rgba8[4],dxt1[4],dxt3[4],repeat[4],levels[4],min_filter[4]; float lod_bias[4];"
  " uint color_icw[8]; uint alpha_icw[8]; uint color_ocw[8]; uint alpha_ocw[8];"
- " uint const0[8]; uint const1[8]; uint frag_force; uint hw[4]; uint ez_proven; };\n"
- "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; };\n"
+ " uint const0[8]; uint const1[8]; uint frag_force; uint hw[4]; uint ez_proven;"
+ " uint final_general,final_cw0,final_cw1,fog_enable,fog_mode,fog_color,sf0,sf1; float fog_p0,fog_p1; };\n"
+ /* G53: `fog` is the fog COORDINATE (oFog.x), interpolated; the factor is
+  * formed per pixel in fog_factor(), from the rasteriser's fog registers. */
+ "struct Out { float4 p [[position]]; float4 d0,d1,t0,t1,t2,t3; float fog; };\n"
  "struct Frag { float4 color [[color(0)]]; uint stencil [[color(1)]]; };\n"
  "vertex Out vs(uint id [[vertex_id]], const device Vertex *v [[buffer(0)]], constant Params &s [[buffer(1)]],const device uint*indices [[buffer(2)]]) {\n"
  /* No clamp here. The guest's z range and its out-of-range policy belong to
@@ -722,7 +726,7 @@ static NSString *const shader =
   * their winding was fixed. xemu does the same: normalise, never clamp. */
  " Vertex x=v[indices[id]];Out o;float4 p=x.p;float z=p.z/16777215.0f;"
  " o.p=float4((p.x/s.width*2-1)*p.w,(1-p.y/s.height*2)*p.w,z*p.w,p.w);\n"
- " o.d0=x.d0;o.d1=x.d1;o.t0=x.t0;o.t1=x.t1;o.t2=x.t2;o.t3=x.t3;return o; }\n"
+ " o.d0=x.d0;o.d1=x.d1;o.t0=x.t0;o.t1=x.t1;o.t2=x.t2;o.t3=x.t3;o.fog=x.f.x;return o; }\n"
  "uint morton(uint x,uint y,uint w,uint h) { uint index=0,bit=0;"
  " for(uint b=1;b<w||b<h;b<<=1) { if(b<w){if(x&b)index|=1u<<bit;bit++;}"
  " if(b<h){if(y&b)index|=1u<<bit;bit++;}} return index; }\n"
@@ -821,6 +825,30 @@ static NSString *const shader =
  FC_WORD("co4",28) FC_WORD("co5",29) FC_WORD("co6",30) FC_WORD("co7",31)
  FC_WORD("ao0",32) FC_WORD("ao1",33) FC_WORD("ao2",34) FC_WORD("ao3",35)
  FC_WORD("ao4",36) FC_WORD("ao5",37) FC_WORD("ao6",38) FC_WORD("ao7",39)
+ FC_WORD("fcw0",40) FC_WORD("fcw1",41)
+ /* G53: THE FINAL COMBINER, nv2a_final_combine in nv2a_texture_copy.c
+  * operation for operation (that file is its reference and its unit test's).
+  * rgb = D + A*B + (1-A)*C, alpha = G; EF_PROD (15) = E*F, V1R0_SUM (14) =
+  * V1 + R0 with CW1's complement and clamp bits; FOG (3) = (fog colour, fog
+  * factor); C0/C1 = SPECULAR_FOG_FACTOR0/1. Inputs are unsigned: identity or
+  * invert, which input() already implements as mappings 0 and 1. */
+ "float fog_factor(uint mode,float p0,float p1,float d){float f;"
+ " if(mode==0x804u||mode==0x802u||mode==0x803u)d=fabs(d);"
+ " switch(mode){case 0x2601u:case 0x804u:if(!isfinite(d))d=0;f=p0+d*p1-1.0f;break;"
+ " case 0x800u:case 0x802u:if(!isfinite(d))d=0;f=p0+exp2(d*p1*16.0f)-1.5f;break;"
+ " case 0x801u:case 0x803u:f=p0+exp2(-d*d*p1*p1*32.0f)-1.5f;break;default:return 1.0f;}"
+ " return f<0?0:(f>1?1:(f>=0?f:0));}\n"
+ "float4 argb4(uint c){return float4(float((c>>16)&255),float((c>>8)&255),float(c&255),float((c>>24)&255))/255.0f;}\n"
+ "float4 final_comb(thread float4 *r,uint w0,uint w1,float fogf,constant Params&s){"
+ " r[1]=argb4(s.sf0);r[2]=argb4(s.sf1);"
+ " r[3]=float4(float(s.fog_color&255u),float((s.fog_color>>8)&255u),float((s.fog_color>>16)&255u),0)/255.0f;r[3].a=fogf;"
+ " for(uint k=0;k<3;k++){float v1=r[5][k],r0=r[12][k];"
+ " if(w1&0x40u)v1=1-min(1.0f,max(0.0f,v1));if(w1&0x20u)r0=1-min(1.0f,max(0.0f,r0));"
+ " float sm=v1+r0;if(w1&0x80u)sm=min(1.0f,max(0.0f,sm));r[14][k]=sm;}r[14].a=0;"
+ " for(uint k=0;k<3;k++)r[15][k]=input(w1>>24,k,r)*input((w1>>16)&255u,k,r);r[15].a=0;"
+ " float4 o;for(uint k=0;k<3;k++){float a=input(w0>>24,k,r),b=input((w0>>16)&255u,k,r),"
+ "c=input((w0>>8)&255u,k,r),d=input(w0&255u,k,r);o[k]=min(1.0f,max(0.0f,d+a*b+(1-a)*c));}"
+ " o.a=min(1.0f,max(0.0f,input((w1>>8)&255u,2,r)));return o;}\n"
  "inline void comb_stage(thread float4 *r,uint stage,uint ciw,uint aiw,uint cw,uint aw,constant Params&s){"
  " uint k0=s.const0[stage],k1=s.const1[stage];"
  " r[1]=float4(float((k0>>16)&255),float((k0>>8)&255),float(k0&255),float((k0>>24)&255))/255.0f;"
@@ -856,7 +884,7 @@ static NSString *const shader =
  "modul=FC_SPEC?(FC_FLAGS&4u)!=0:s.modulate!=0;"
  " float4 d0=i.d0,d1=i.d1,c=float4(1),tex=float4(0);"
  " if(tmask&1)tex=hw0?hw_sample(h0,q0,i.t0,0,s):sample_lod(t0,i.t0,0,s);"
- " if(ncomb){float4 r[14];for(uint n=0;n<14;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
+ " if(ncomb){float4 r[16];for(uint n=0;n<16;n++)r[n]=float4(0);r[4]=d0;r[5]=d1;r[8]=tex;"
  " if(tmask&2)r[9]=hw1?hw_sample(h1,q1,i.t1,1,s):sample_lod(t1,i.t1,1,s);if(tmask&4)r[10]=hw2?hw_sample(h2,q2,i.t2,2,s):sample_lod(t2,i.t2,2,s);if(tmask&8)r[11]=hw3?hw_sample(h3,q3,i.t3,3,s):sample_lod(t3,i.t3,3,s);"
  " r[12].a=(tmask&1)?r[8].a:1;"
  " if(FC_SPEC){"
@@ -870,7 +898,10 @@ static NSString *const shader =
  " if(FC_CC>7u)comb_stage(r,7u,FC_ci7,FC_ai7,FC_co7,FC_ao7,s);"
  " }else for(uint stage=0;stage<s.combiner_count;stage++)"
  "comb_stage(r,stage,s.color_icw[stage],s.alpha_icw[stage],s.color_ocw[stage],s.alpha_ocw[stage],s);"
- " c=clamp(r[12]+(addspec?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
+ " bool fgen=FC_SPEC?(FC_FLAGS&8u)!=0:s.final_general!=0;"
+ " if(fgen){float fogf=s.fog_enable?fog_factor(s.fog_mode,s.fog_p0,s.fog_p1,i.fog):1.0f;"
+ "c=final_comb(r,FC_SPEC?FC_fcw0:s.final_cw0,FC_SPEC?FC_fcw1:s.final_cw1,fogf,s);}"
+ " else c=clamp(r[12]+(addspec?float4(r[5].rgb,0):float4(0)),0.0f,1.0f);}"
  " else if(!untex){c=tex;c.a=clamp(d0.a,0.0f,1.0f)*(modul?c.a:1);if(modul)c.rgb*=max(float3(0),d0.rgb);}"
   /* RECOMP_FRAG_FORCE -- REPLACE THE FRAGMENT WITH ONE OF ITS OWN INPUTS.
   *
@@ -1387,7 +1418,7 @@ static int vsh_wrap(const char *src, uint16_t inputs, unsigned nattrs,
         "                  constant VSH_Viewport &vp [[buffer(2)]],\n"
         "                  const device uint *indices [[buffer(3)]]) {\n"
         "  VS_OUT o = vsh_body(raw, indices[id] * %uu, c, vp);\n"
-        "  Out r; r.p=o.oPos; r.d0=o.oD0; r.d1=o.oD1;\n"
+        "  Out r; r.p=o.oPos; r.d0=o.oD0; r.d1=o.oD1; r.fog=o.oFog;\n"
         "  r.t0=o.oT0; r.t1=o.oT1; r.t2=o.oT2; r.t3=o.oT3;\n"
         "  return r;\n}\n", nattrs ? nattrs : 1u);
     return used < outsize;
@@ -2672,6 +2703,7 @@ static int comb_key(const NV2ATextureCopy *s, unsigned hwmask, CombKey *k)
     if (k->cc) {
         /* untextured and modulate are only read when there are no stages */
         k->flags = s->add_specular ? 1u : 0u;
+        if (s->final_general) { k->flags |= 8u; k->fcw0 = s->final_cw0; k->fcw1 = s->final_cw1; }
         for (uint32_t i = 0; i < k->cc; ++i) {
             k->ci[i] = s->color_icw[i]; k->ai[i] = s->alpha_icw[i];
             k->co[i] = s->color_ocw[i]; k->ao[i] = s->alpha_ocw[i];
@@ -2713,6 +2745,8 @@ static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey
         [cv setConstantValues:k.ai type:MTLDataTypeUInt withRange:NSMakeRange(16, 8)];
         [cv setConstantValues:k.co type:MTLDataTypeUInt withRange:NSMakeRange(24, 8)];
         [cv setConstantValues:k.ao type:MTLDataTypeUInt withRange:NSMakeRange(32, 8)];
+        [cv setConstantValue:&k.fcw0 type:MTLDataTypeUInt atIndex:40];
+        [cv setConstantValue:&k.fcw1 type:MTLDataTypeUInt atIndex:41];
     }
     NSError *err = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:name constantValues:cv error:&err];
@@ -4195,7 +4229,7 @@ void nv2a_metal_report(void)
             (unsigned long long)audit_signflip,(unsigned long long)audit_signflip_culled);
 }
 
-typedef struct{float p[4],d0[4],d1[4],t[4][4];}Vertex;
+typedef struct{float p[4],d0[4],d1[4],t[4][4],f[4];}Vertex;   /* f: G53 fog coordinate in .x */
 typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_mask,add_specular,alpha_test,alpha_ref,modulate,blend,blend_src,blend_dst,depth_test,depth_write,depth_func;
     uint32_t z_cull; float z_lo,z_hi;
     uint32_t stencil_test,stencil_write,stencil_mask,stencil_ref,stencil_func_mask,stencil_func,stencil_fail,stencil_zfail,stencil_zpass;
@@ -4206,6 +4240,8 @@ typedef struct{uint32_t width,height,dither,untextured,combiner_count,texture_ma
     uint32_t frag_force;
     uint32_t hw[4];   /* G27: unit u samples texture(u) with sampler(u), not the buffer */
     uint32_t ez_proven;  /* G38c audit: the alpha test was proven unable to fire */
+    uint32_t final_general,final_cw0,final_cw1,fog_enable,fog_mode,fog_color,sf0,sf1;   /* G53 */
+    float fog_p0,fog_p1;
 }Params;
 
 /* Does the ring actually protect staging memory from the GPU?
@@ -6332,7 +6368,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     for(unsigned a=0;a<16;a++) if(vsh_active->inputs&(1u<<a))
      memcpy(raw[i*vsh_active->nattrs+slot++].f,vertices[i][a],16);}
   } else
-  for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
+  for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);memcpy(v[i].f,vertices[i][5],16);}
   if(mtl_cb_stats()){g_mtl_ns_pack+=mtl_now_ns()-_tf;_tf=mtl_now_ns();}
   /* G51.1: the binding is surface_bind(), shared with nv2a_metal_bind(). */
   if(surface_bind(target,target_size,s->clip_w,s->clip_h,s->target_pitch,next_depth,next_depth_pitch,next_depth_size)<0)return -1;
@@ -6467,6 +6503,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
   if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
+  p.final_general=s->final_general;p.final_cw0=s->final_cw0;p.final_cw1=s->final_cw1;p.fog_enable=s->fog_enable;p.fog_mode=s->fog_mode;p.fog_color=s->fog_color;p.sf0=s->spec_fog_c0;p.sf1=s->spec_fog_c1;p.fog_p0=s->fog_p0;p.fog_p1=s->fog_p1;
   p.ez_proven=(uint32_t)(early_z_exact_mode()==2&&s->alpha_test&&s->alpha_ref==0&&hw_zcull_cannot_fire(s)
                          &&g_draw_alpha_floor>=1.0f/255.0f);
   if(early_z_exact_mode()==3)p.ez_proven=(uint32_t)(s->alpha_test!=0);   /* the audit's positive control */

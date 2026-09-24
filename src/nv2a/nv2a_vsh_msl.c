@@ -1057,6 +1057,31 @@ int nv2a_ff_generate_msl(const NV2AFFKey *key, char *buf, int bufsize)
             NV2A_FF_C_MATERIAL);
     }
 
+    /* G53: the fog coordinate, as nv2a_ff.c's fog_coord() forms it,
+     * expression by expression (its sqrt and dot are the same left-to-right
+     * sums). The factor is the fragment's job. */
+    switch (key->fog) {
+    case NV2A_FF_FOG_SPEC_ALPHA:
+        sb_append(&sb, "    oFog.x = ff_clamp01(oD1.w);\n\n"); break;
+    case NV2A_FF_FOG_X:
+        sb_append(&sb, "    oFog.x = v5.x;\n\n"); break;
+    case NV2A_FF_FOG_RADIAL: case NV2A_FF_FOG_PLANAR: case NV2A_FF_FOG_ABS_PLANAR:
+        sb_append(&sb,
+            "    float4 eye = float4(ff_dot4(c[%d], v0), ff_dot4(c[%d], v0),\n"
+            "                        ff_dot4(c[%d], v0), ff_dot4(c[%d], v0));\n",
+            NV2A_FF_C_MODELVIEW + 0, NV2A_FF_C_MODELVIEW + 1,
+            NV2A_FF_C_MODELVIEW + 2, NV2A_FF_C_MODELVIEW + 3);
+        if (key->fog == NV2A_FF_FOG_RADIAL)
+            sb_append(&sb, "    oFog.x = sqrt((eye.x * eye.x + eye.y * eye.y) + eye.z * eye.z);\n\n");
+        else
+            sb_append(&sb,
+                "    oFog.x = ((c[%d].x * eye.x + c[%d].y * eye.y) + c[%d].z * eye.z) + c[%d].w;\n%s\n",
+                NV2A_FF_C_FOGPLANE, NV2A_FF_C_FOGPLANE, NV2A_FF_C_FOGPLANE, NV2A_FF_C_FOGPLANE,
+                key->fog == NV2A_FF_FOG_ABS_PLANAR ? "    oFog.x = fabs(oFog.x);\n" : "");
+        break;
+    default: break;
+    }
+
     /* Texgen, then the optional texture matrix, per unit. The transpose lives
      * in the packer, so there is one form here whatever
      * RECOMP_FF_TEXMAT_TRANSPOSE says. */

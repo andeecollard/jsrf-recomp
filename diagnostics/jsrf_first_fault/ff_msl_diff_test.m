@@ -255,6 +255,29 @@ static int build_corpus(FFState *out, int cap)
                    state_add_lighting(&out[n], 5u, 0);
                    state_add_texmat(&out[n], 0, 1, 0);
                    state_add_texmat(&out[n], 2, 1, 0);                        ++n; }
+    /* G53: the fog coordinate, one state per NV097_SET_FOG_GEN_MODE the key
+     * accepts. The model-view and plane are arbitrary but not degenerate, so
+     * the eye-space arithmetic is exercised rather than zeros. */
+    {   static const float mv[16] = { 0.9f,0.05f,-0.1f,3.0f, -0.2f,1.1f,0.3f,-7.5f,
+                                      0.15f,-0.25f,0.95f,120.0f, 0,0,0,1 };
+        static const struct { const char *name; unsigned gen; } fg[] = {
+            { "fog spec-alpha", 0 }, { "fog radial", 1 }, { "fog planar", 2 },
+            { "fog abs-planar", 3 }, { "fog attribute", 6 } };
+        for (unsigned f = 0; f < sizeof fg / sizeof fg[0] && n < cap; ++f) {
+            state_base(&out[n], fg[f].name);
+            put_u(&out[n], 0x02a4, 1); put_u(&out[n], 0x02a0, fg[f].gen); put_u(&out[n], 0x029c, 0x2601);
+            put_matrix(&out[n], 0x480, mv);
+            put_f(&out[n], 0x09d0, 0.1f); put_f(&out[n], 0x09d4, -0.2f);
+            put_f(&out[n], 0x09d8, 0.97f); put_f(&out[n], 0x09dc, -4.0f);
+            ++n;
+        }
+        if (n < cap) { state_base(&out[n], "fog-and-lit");
+                       put_u(&out[n], 0x02a4, 1); put_u(&out[n], 0x02a0, 2); put_matrix(&out[n], 0x480, mv);
+                       put_f(&out[n], 0x09d8, 1.0f);
+                       state_add_lighting(&out[n], 1u, 0);                    ++n; }
+        if (n < cap) { state_base(&out[n], "REFUSE fog gen mode 4");
+                       put_u(&out[n], 0x02a4, 1); put_u(&out[n], 0x02a0, 4); out[n].expect_key = 0; ++n; }
+    }
     /* Shapes the key MUST refuse. Each one is a case where the GPU could not
      * reproduce the CPU's answer, and a key that accepted it would be the bug.
      * They are in the corpus so a future change that loosens the key fails
@@ -619,7 +642,7 @@ static int run_state(Rig *rig, const FFState *st, const NV2AFFKey *key,
 
 int main(void)
 {
-    static FFState corpus[32];
+    static FFState corpus[48];
     Rig rig;
     int n, i, mode, parity_violations = 0, untested = 0, control_dead = 0;
 

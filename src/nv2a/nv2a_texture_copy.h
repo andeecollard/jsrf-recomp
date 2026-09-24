@@ -62,7 +62,58 @@ typedef struct NV2ATextureCopy {
      * 0 .. 16777215 with CULL. */
     float z_clip_min, z_clip_max;
     uint32_t z_cull;
+    /* THE FINAL COMBINER AND FOG (G53, Rokkaku-dai Heights, 24 Sep 2026).
+     *
+     * Until then the gate accepted only the two final-combiner programs
+     * D3D writes with fog OFF -- CW0 0xC (D = R0) or 0xE (D = V1+R0 sum),
+     * CW1 0x1C80 -- and refused every other one, which DROPPED THE DRAW: a
+     * fogged level (Rokkaku) lost its buildings, streets and characters to
+     * 926,734 refusals, the sky and the HUD being the only unfogged draws.
+     * D3D's fog program (d3d8_ff_final_combiner) is CW0 0x130C0300 or
+     * 0x130E0300: A = FOG.a, B = R0 (or V1+R0), C = FOG.rgb, D = 0, i.e.
+     * lerp(fog colour, colour, fog factor).
+     *
+     * final_general 0: the two fog-off programs, drawn exactly as before
+     * (R0, plus V1 when add_specular). 1: final_cw0/1 are evaluated in full
+     * by nv2a_final_combine (and its MSL twin): rgb = D + A*B + (1-A)*C,
+     * alpha = G, with EF_PROD (15) = E*F and V1R0_SUM (14) = V1 + R0
+     * (each optionally complemented, the sum optionally clamped -- CW1 bits
+     * 5, 6 and 7), FOG (3) = (fog colour, fog factor), C0/C1 (1, 2) =
+     * SPECULAR_FOG_FACTOR0/1 (0x1E20/0x1E24). The fog factor comes from the
+     * interpolated fog coordinate by nv2a_fog_factor. */
+    uint32_t final_general, final_cw0, final_cw1;
+    uint32_t fog_enable, fog_mode, fog_color;   /* 0x02A4, 0x029C, 0x02A8 (ABGR: red is the low byte) */
+    float fog_p0, fog_p1;                       /* FOG_PARAMS 0x09C0, 0x09C4 */
+    uint32_t spec_fog_c0, spec_fog_c1;          /* SPECULAR_FOG_FACTOR0/1, A8R8G8B8 */
 } NV2ATextureCopy;
+
+/* The fog factor for fog coordinate `d`, per NV097_SET_FOG_MODE (xemu
+ * pgraph/glsl/vsh.c, the reference this file already names; D3D's params per
+ * d3d8_ff_fog make LINEAR (end - d)/(end - start) and EXP/EXP2 e^-(d*density)
+ * and e^-(d*density)^2):
+ *   0x2601 LINEAR      p0 + d*p1 - 1           (d non-finite: 0)
+ *   0x800  EXP         p0 + 2^(16*d*p1) - 1.5  (d non-finite: 0)
+ *   0x801  EXP2        p0 + 2^(-32*d*d*p1*p1) - 1.5
+ *   0x804, 0x802, 0x803  the _ABS forms: the same on |d|
+ * clamped to [0,1]. Evaluated PER PIXEL from the interpolated coordinate: the
+ * mode and params are rasteriser registers (NV_PGRAPH_CONTROL_3, FOGPARAM0/1)
+ * and only the coordinate comes from the vertex unit. xemu evaluates per
+ * vertex; the two agree exactly for LINEAR and differ inside large triangles
+ * for EXP/EXP2 ([FOG] counts which modes a run uses). The _ABS forms take |d|
+ * here; xemu takes |factor|, which no reading of the name supports. Unknown
+ * modes: 1 (no fog). */
+float nv2a_fog_factor(uint32_t mode, float p0, float p1, float d);
+/* NULL if the final combiner program (CW0, CW1) is one nv2a_final_combine
+ * models, else the reason it is not. */
+const char *nv2a_final_combiner_supported(uint32_t cw0, uint32_t cw1);
+/* The final combiner on a register file whose 0..13 the stages left (R0 in
+ * 12, V0/V1 in 4/5, T0..T3 in 8..11). Writes 1, 2, 3, 14 and 15 itself.
+ * `fog` is the fog factor; out is clamped RGBA. The reference the Metal
+ * shader's final_comb() is tested against. */
+void nv2a_final_combine(const NV2ATextureCopy *s, float regs[16][4], float fog, float out[4]);
+/* Counts per reason, printed with the combiner census: every refused final
+ * combiner is a DROPPED draw, and says so. */
+void nv2a_fog_census(void);
 
 /* The rectangle the rasteriser may touch: the window clip when the state
  * carries one, the surface clip when it does not. A state built by hand --
