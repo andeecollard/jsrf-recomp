@@ -19,6 +19,7 @@
  * slot still busy gets 0 back and must fall back to the original. */
 #include <stdint.h>
 #include "d3d8_ff_combiner.h"
+#include "d3d8_ff_vertex_state.h"
 
 #define D3D8_HOST_MAX_METHODS 64u
 
@@ -113,6 +114,28 @@ typedef struct {
      * +0x370, device +0x374}: at the draw, and at its last CW-writing entry. */
     uint32_t fog_cur[4], fog_emit_seen, fog_emit[4];
     uint32_t ffc_control;               /* RECOMP_D3D8_MIRROR_CONTROL: perturb one transcribed word */
+    /* ---- G42: fixed-function vertex state ----
+     * Texgen (TexCoordIndex 0x18F060) and fog colour (0x18EB80) are written
+     * at once, so they are transcribed from the state at the draw (tss[][28]
+     * above, ffv_fog_color). Texture transforms (0x1957F0, dirty 0x400),
+     * lighting (0x195F80, dirty 0x1000) and fog (0x195610, dirty 0x2000) are
+     * lazy like the combiners: each is carried as its inputs at its last
+     * EMITTING entry (a hook in the staged gen) and as the same inputs read
+     * at the draw. ffv_valid = the mirror filled this block. */
+    uint32_t ffv_valid;
+    uint32_t ffv_vs_flags;              /* [device+0x380]+4 at the draw; & 0x12 = not fixed-function 3D */
+    uint32_t ffv_fog_color;             /* D3D_g_RenderState[119] FOGCOLOR at the draw */
+    uint32_t tx_emit_seen, tx_emit_fresh;
+    D3D8FFTexXformIn tx_emit, tx_cur;
+    uint32_t fg_emit_seen, fg_emit_fresh;
+    D3D8FFFogIn fg_emit, fg_cur;
+    uint32_t lt_emit_seen, lt_emit_fresh;
+    D3D8FFLightIn lt_emit, lt_cur;
+    /* SPECULAR_ENABLE (0x03B8) has two writers: the light updater and the
+     * combiner builder (G43, when device+8 bit 0x40 changes). Whichever wrote
+     * last holds the register; the mirror numbers the emissions. */
+    uint32_t lt_emit_seq, sp_emit_seq, sp_emit_val;
+    uint32_t ffv_control;               /* RECOMP_D3D8_MIRROR_CONTROL: perturb one word per group */
 } D3D8HostDrawCheck;
 /* G43: the combiner registers compared, one word each, in this order. */
 #define D3D8_HOST_FFC_N 51u
@@ -169,6 +192,10 @@ typedef struct {
      * combiner registers (method shadow) in D3D8CombinerRegs order. */
     int      ffc_valid;
     D3D8CombinerRegs ffc;
+    /* G42: filled whether or not `active` is set. The executor's whole method
+     * shadow for subchannel 0 (methods 0..0x1FFC), as latched at the token. */
+    int      regs_valid;
+    uint32_t regs[0x2000 / 4];
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
@@ -199,7 +226,22 @@ typedef struct {
     unsigned long long ffc_word_mismatch[D3D8_HOST_FFC_N];
     unsigned long long ffc_tally_overflow;
     unsigned ffc_tally_pairs;
+    /* G42 fixed-function vertex state. Per group g (D3D8_HOST_FFV_*):
+     * draws compared, draws with every register matching, words compared,
+     * exact, within tolerance (floats only), and the laziness counters. */
+    unsigned long long ffv_draws[4], ffv_all[4], ffv_words[4], ffv_exact[4], ffv_tol[4],
+                       ffv_noemit[4], ffv_fresh[4], ffv_lazy[4], ffv_cur_only[4], ffv_emit_only[4],
+                       ffv_unres[4];
+    /* What the title uses, counted at the draws compared. */
+    unsigned long long lt_lit, lt_lights[9], lt_dir, lt_point, lt_spot, lt_colormat, lt_twosided,
+                       lt_specular, lt_sp_from_builder;
+    unsigned long long tg_mode[4][6];            /* per stage: off, EYE, OBJECT, SPHERE, NORMAL, REFLECTION */
+    unsigned long long tx_enabled[4], tx_case[D3D8FF_TX_CASES];
+    unsigned long long fg_on, fg_table[4], fg_range, fg_color_nonzero;
+    unsigned long long ffv_reg_mismatch_total;
 } D3D8HostStats;
+/* G42 check groups. */
+enum { D3D8_HOST_FFV_TEXGEN = 0, D3D8_HOST_FFV_TEXXFORM = 1, D3D8_HOST_FFV_LIGHT = 2, D3D8_HOST_FFV_FOG = 3 };
 /* G41's comparison on its own, for the unit test: counts into the stats and
  * returns 1 if every executor array and the indices agree with D3D. */
 int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
@@ -209,6 +251,15 @@ int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextur
  * compared register agrees (or the draw is not compared), 0 otherwise.
  * `expect`, when not NULL, receives the transcribed register set. */
 int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e, D3D8CombinerRegs *expect);
+/* G42's comparison on its own, for the unit test: texgen and fog colour from
+ * the state at the draw; texture transforms, lighting and fog from the inputs
+ * their updaters last emitted with; all against the executor's latched
+ * registers (e->regs). Fixed-function-only groups (texgen, texture
+ * transforms, lighting) are compared only when ffv_vs_flags & 0x12 is 0; fog
+ * at every draw. Returns 1 if every compared register agrees. */
+int d3d8_host_check_ff_vertex(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e);
+/* Mismatch count of one method (0..0x1FFC) under the G42 check. */
+unsigned long long d3d8_host_ffv_reg_mismatches(uint32_t method);
 /* G43 discovery: the distinct (stage words, TFACTOR) -> register pairings seen
  * at fixed-function draws, the `top` most frequent printed. */
 void d3d8_host_ffc_tally_report(const char *why, unsigned top);

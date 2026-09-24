@@ -344,6 +344,14 @@ add_executable(jsrf_d3d8_ff_combiner_test d3d8_ff_combiner_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
 target_include_directories(jsrf_d3d8_ff_combiner_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_ff_combiner COMMAND jsrf_d3d8_ff_combiner_test)
+# G42: D3D's fixed-function vertex-state emitters -- texgen (0x18F060),
+# texture transforms (0x1957F0), lighting and material (0x195F80), fog
+# (0x195610) -- transcribed to pure host functions. Hand-derived vectors; see
+# experiments/d3d8_boundary/ff_lighting_fog_notes.md.
+add_executable(jsrf_d3d8_ff_vertex_state_test d3d8_ff_vertex_state_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
+target_include_directories(jsrf_d3d8_ff_vertex_state_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_d3d8_ff_vertex_state COMMAND jsrf_d3d8_ff_vertex_state_test)
 
 add_executable(jsrf_texfmt_swizzled_test texfmt_swizzled_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
@@ -1234,13 +1242,13 @@ add_test(NAME jsrf_pusher_token COMMAND jsrf_pusher_token_test)
 # D3D entry point replay where the token sits, once, through ring dispatch.
 add_executable(jsrf_d3d8_host_test d3d8_host_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_host_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_host COMMAND jsrf_d3d8_host_test)
 # G41: the mirror's vertex-stream and index comparison, driven directly.
 add_executable(jsrf_d3d8_streams_test d3d8_streams_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_streams_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
 # G43: the mirror's fixed-function combiner comparison -- the transcription on
@@ -1248,9 +1256,17 @@ add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
 # laziness counters, the positive control and the discovery tally.
 add_executable(jsrf_d3d8_combiner_check_test d3d8_combiner_check_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_combiner_check_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_combiner_check COMMAND jsrf_d3d8_combiner_check_test)
+# G42: the mirror's fixed-function vertex-state comparison -- texgen, texture
+# transforms, lighting and fog against the executor's latched registers, the
+# laziness counters, the SPECULAR_ENABLE writer order and the positive control.
+add_executable(jsrf_d3d8_ffv_check_test d3d8_ffv_check_test.c
+    "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
+target_include_directories(jsrf_d3d8_ffv_check_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
+add_test(NAME jsrf_d3d8_ffv_check COMMAND jsrf_d3d8_ffv_check_test)
 
 # The backport checks below patch specific sites in the GENERATED tree, from
 # when that tree was preserved rather than regenerated. A backport is retired

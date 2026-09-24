@@ -389,6 +389,242 @@ int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawText
     return all;
 }
 
+/* ---- G42: fixed-function vertex state ----
+ *
+ * Four groups, each a list of (method, value) the transcription says D3D
+ * wrote, compared with the executor's latched method shadow (e->regs):
+ *   texgen     TEXGEN_S/T/R[s], from TEXCOORDINDEX at the draw -- written
+ *              immediately by SetTextureState_TexCoordIndex (0x18F060);
+ *   texture    TEXTURE_MATRIX_ENABLE[s] and TEXTURE_MATRIX[s], from the inputs
+ *   transforms the lazy updater 0x1957F0 last emitted with (dirty 0x400);
+ *   lighting   everything 0x195F80 writes (dirty 0x1000): LIGHTING_ENABLE,
+ *              LIGHT_CONTROL, COLOR_MATERIAL, scene ambient, material
+ *              emission/alpha, per-light colours and geometry, the enable
+ *              mask -- SPECULAR_PARAMS excepted (0x195E40, not transcribed);
+ *   fog        FOG_ENABLE, and when fog is on FOG_GEN_MODE/FOG_MODE/FOG_PARAMS,
+ *              from the inputs 0x195610 last emitted with (dirty 0x2000);
+ *              FOG_COLOR from RenderState[119] at the draw (0x18EB80 is
+ *              immediate).
+ * The first three matter only to fixed-function 3D draws (the vertex shader
+ * object's flags & 0x12 clear) and are compared only there; fog at every draw.
+ * Floats are compared exactly and, failing that, within 1e-5 relative (or
+ * 1e-6 absolute); the two are counted apart. */
+static const char *const k_ffv_name[4] = { "texgen", "texture transforms", "lighting", "fog" };
+static _Atomic unsigned long long s_fv_draws[4], s_fv_all[4], s_fv_words[4], s_fv_exact[4], s_fv_tol[4],
+                                  s_fv_noemit[4], s_fv_fresh[4], s_fv_lazy[4], s_fv_cur_only[4],
+                                  s_fv_emit_only[4], s_fv_unres[4];
+static _Atomic unsigned long long s_lt_lit, s_lt_lights[9], s_lt_dir, s_lt_point, s_lt_spot, s_lt_cm,
+                                  s_lt_2s, s_lt_spec, s_lt_spb;
+static _Atomic unsigned long long s_tg_mode[4][6], s_tx_en[4], s_tx_case[D3D8FF_TX_CASES],
+                                  s_fg_on, s_fg_table[4], s_fg_range, s_fg_colnz;
+static _Atomic unsigned long long s_fv_reg_mm[0x2000 / 4], s_fv_mm_total;
+static _Atomic unsigned s_fv_printed[4];
+
+typedef struct { unsigned n; D3D8FFReg r[D3D8FF_LIGHT_REGS_MAX]; } FfvList;
+static void ffv_put(FfvList *l, uint32_t method, uint32_t value, int is_float)
+{
+    if (l->n >= D3D8FF_LIGHT_REGS_MAX) return;
+    l->r[l->n].method = (uint16_t)method; l->r[l->n].is_float = (uint8_t)is_float;
+    l->r[l->n].pad = 0; l->r[l->n].value = value; l->n++;
+}
+static void ffv_texgen_list(const D3D8HostDrawCheck *c, FfvList *l)
+{
+    l->n = 0;
+    for (unsigned s = 0; s < 4; ++s) {
+        uint32_t m = d3d8_ff_texgen(c->tss[s][D3D8FF_TSS_TEXCOORDINDEX], NULL);
+        for (unsigned k = 0; k < 3; ++k) ffv_put(l, 0x03C0u + 0x10u * s + 4u * k, m, 0);
+    }
+}
+static void ffv_tx_list(const D3D8FFTexXformIn *in, FfvList *l, D3D8FFTexXform *o)
+{
+    l->n = 0;
+    d3d8_ff_tex_transforms(in, o);
+    if (!o->emitted) return;
+    for (unsigned s = 0; s < 4; ++s) ffv_put(l, 0x0420u + 4u * s, o->enable[s], 0);
+    for (unsigned s = 0; s < 4; ++s)
+        if (o->matrix_written & (1u << s))
+            for (unsigned i = 0; i < 16; ++i) ffv_put(l, 0x06C0u + 0x40u * s + 4u * i, o->matrix[s][i], 1);
+}
+static void ffv_fog_list(const D3D8FFFogIn *in, FfvList *l)
+{
+    D3D8FFFog o;
+    l->n = 0;
+    d3d8_ff_fog(in, &o);
+    ffv_put(l, 0x02A4u, o.enable, 0);
+    if (o.params_written) {
+        ffv_put(l, 0x02A0u, o.gen_mode, 0);
+        ffv_put(l, 0x029Cu, o.mode, 0);
+        for (unsigned k = 0; k < 3; ++k) ffv_put(l, 0x09C0u + 4u * k, o.params[k], 1);
+    }
+}
+static void ffv_light_list(const D3D8FFLightIn *in, FfvList *l, D3D8FFLights *o)
+{
+    d3d8_ff_lights(in, o);
+    l->n = o->n;
+    memcpy(l->r, o->reg, o->n * sizeof o->reg[0]);
+}
+static int ffv_list_eq(const FfvList *a, const FfvList *b)
+{
+    if (a->n != b->n) return 0;
+    for (unsigned i = 0; i < a->n; ++i)
+        if (a->r[i].method != b->r[i].method || a->r[i].value != b->r[i].value) return 0;
+    return 1;
+}
+/* 0 mismatch, 1 exact, 2 within tolerance. */
+static int ffv_word_cmp(uint32_t want, uint32_t got, int is_float)
+{
+    float a, b; double d, m;
+    if (want == got) return 1;
+    if (!is_float) return 0;
+    memcpy(&a, &want, 4); memcpy(&b, &got, 4);
+    if (!isfinite(a) || !isfinite(b)) return 0;
+    d = fabs((double)a - (double)b);
+    m = fabs((double)a) > fabs((double)b) ? fabs((double)a) : fabs((double)b);
+    return (d <= 1e-5 * m || d <= 1e-6) ? 2 : 0;
+}
+/* The last write to each method wins; walk from the end with a stamp per
+ * method (the check runs on the pusher thread only). */
+static uint32_t s_fv_stamp[0x2000 / 4], s_fv_gen;
+static int ffv_list_matches(const FfvList *l, const uint32_t *regs)
+{
+    uint32_t gen = ++s_fv_gen;
+    for (unsigned i = l->n; i-- > 0;) {
+        uint32_t m = l->r[i].method / 4u;
+        if (s_fv_stamp[m] == gen) continue;
+        s_fv_stamp[m] = gen;
+        if (!ffv_word_cmp(l->r[i].value, regs[m], l->r[i].is_float)) return 0;
+    }
+    return 1;
+}
+/* Compare and count; returns the number of mismatching registers. */
+static unsigned ffv_compare(int g, const D3D8HostDrawCheck *c, const FfvList *l, const uint32_t *regs,
+                            const char *what)
+{
+    uint32_t gen = ++s_fv_gen;
+    unsigned bad = 0;
+    for (unsigned i = l->n; i-- > 0;) {
+        uint32_t m = l->r[i].method / 4u;
+        int r;
+        if (s_fv_stamp[m] == gen) continue;
+        s_fv_stamp[m] = gen;
+        atomic_fetch_add(&s_fv_words[g], 1);
+        r = ffv_word_cmp(l->r[i].value, regs[m], l->r[i].is_float);
+        if (r == 1) { atomic_fetch_add(&s_fv_exact[g], 1); continue; }
+        if (r == 2) { atomic_fetch_add(&s_fv_tol[g], 1); continue; }
+        ++bad;
+        atomic_fetch_add(&s_fv_reg_mm[m], 1);
+        atomic_fetch_add(&s_fv_mm_total, 1);
+        if (atomic_fetch_add(&s_fv_printed[g], 1) < 8)
+            fprintf(stderr, "[D3D8-MIRROR] draw %u ff %s MISMATCH%s (%s) reg %04X: d3d %08X | exec %08X\n",
+                    c->serial, k_ffv_name[g], c->ffv_control ? " [control]" : "", what,
+                    l->r[i].method, l->r[i].value, regs[m]);
+    }
+    atomic_fetch_add(&s_fv_draws[g], 1);
+    if (!bad) atomic_fetch_add(&s_fv_all[g], 1);
+    return bad;
+}
+/* Laziness, measured as in G43: would the state at the draw have given other
+ * registers, and which of the two does the executor hold? */
+static void ffv_lazy(int g, const FfvList *emit, const FfvList *cur, const uint32_t *regs)
+{
+    if (ffv_list_eq(emit, cur)) return;
+    int m_emit = ffv_list_matches(emit, regs), m_cur = ffv_list_matches(cur, regs);
+    atomic_fetch_add(&s_fv_lazy[g], 1);
+    if (m_cur && !m_emit) atomic_fetch_add(&s_fv_cur_only[g], 1);
+    if (m_emit && !m_cur) atomic_fetch_add(&s_fv_emit_only[g], 1);
+}
+
+int d3d8_host_check_ff_vertex(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e)
+{
+    static FfvList emit, cur;           /* big; the check runs on one thread */
+    static D3D8FFLights lo, lc;
+    D3D8FFTexXform to, tc;
+    unsigned bad = 0;
+    int ff3d;
+    if (!c->ffv_valid || !e->regs_valid) return 1;
+    ff3d = (c->ffv_vs_flags & 0x12u) == 0;
+    if (ff3d) {
+        /* texgen: immediate, so the state at the draw. */
+        ffv_texgen_list(c, &emit);
+        if (c->ffv_control) emit.r[0].value ^= 1u;
+        bad += ffv_compare(D3D8_HOST_FFV_TEXGEN, c, &emit, e->regs, "TEXCOORDINDEX at the draw");
+        for (unsigned s = 0; s < 4; ++s) {
+            uint32_t m = emit.r[3 * s].value ^ (c->ffv_control && s == 0 ? 1u : 0u), k;
+            k = m == 0 ? 0 : m == 0x2400u ? 1 : m == 0x2401u ? 2 : m == 0x2402u ? 3 : m == 0x8511u ? 4 : 5;
+            atomic_fetch_add(&s_tg_mode[s][k], 1);
+        }
+        /* texture transforms: as last emitted. */
+        {
+            const D3D8FFTexXformIn *in = c->tx_emit_seen ? &c->tx_emit : &c->tx_cur;
+            if (!c->tx_emit_seen) atomic_fetch_add(&s_fv_noemit[D3D8_HOST_FFV_TEXXFORM], 1);
+            if (c->tx_emit_fresh) atomic_fetch_add(&s_fv_fresh[D3D8_HOST_FFV_TEXXFORM], 1);
+            ffv_tx_list(in, &emit, &to);
+            if (to.unresolved) atomic_fetch_add(&s_fv_unres[D3D8_HOST_FFV_TEXXFORM], 1);
+            for (unsigned s = 0; s < 4; ++s)
+                if (to.enable[s]) { atomic_fetch_add(&s_tx_en[s], 1); atomic_fetch_add(&s_tx_case[to.tx_case[s]], 1); }
+            if (c->tx_emit_seen) { ffv_tx_list(&c->tx_cur, &cur, &tc); ffv_lazy(D3D8_HOST_FFV_TEXXFORM, &emit, &cur, e->regs); }
+            if (c->ffv_control && emit.n) emit.r[0].value ^= 1u;
+            if (emit.n)
+                bad += ffv_compare(D3D8_HOST_FFV_TEXXFORM, c, &emit, e->regs,
+                                   c->tx_emit_seen ? "as last emitted" : "at the draw, no emission seen");
+        }
+        /* lighting: as last emitted; SPECULAR_ENABLE from whichever writer was last. */
+        {
+            const D3D8FFLightIn *in = c->lt_emit_seen ? &c->lt_emit : &c->lt_cur;
+            int from_builder = c->sp_emit_seq > c->lt_emit_seq;
+            if (!c->lt_emit_seen) atomic_fetch_add(&s_fv_noemit[D3D8_HOST_FFV_LIGHT], 1);
+            if (c->lt_emit_fresh) atomic_fetch_add(&s_fv_fresh[D3D8_HOST_FFV_LIGHT], 1);
+            ffv_light_list(in, &emit, &lo);
+            if (from_builder) {
+                ffv_put(&emit, 0x03B8u, c->sp_emit_val, 0);
+                atomic_fetch_add(&s_lt_spb, 1);
+            }
+            if (lo.unresolved) { atomic_fetch_add(&s_fv_unres[D3D8_HOST_FFV_LIGHT], 1); atomic_fetch_add(&s_lt_spec, 1); }
+            if (lo.lit) {
+                atomic_fetch_add(&s_lt_lit, 1);
+                atomic_fetch_add(&s_lt_lights[in->nlights > 8 ? 8 : in->nlights], 1);
+                atomic_fetch_add(&s_lt_dir, lo.types & 0xFFu);
+                atomic_fetch_add(&s_lt_point, (lo.types >> 8) & 0xFFu);
+                atomic_fetch_add(&s_lt_spot, (lo.types >> 16) & 0xFFu);
+                if (lo.color_material) atomic_fetch_add(&s_lt_cm, 1);
+                if (in->two_sided) atomic_fetch_add(&s_lt_2s, 1);
+            }
+            if (c->lt_emit_seen) {
+                ffv_light_list(&c->lt_cur, &cur, &lc);
+                if (from_builder) ffv_put(&cur, 0x03B8u, c->sp_emit_val, 0);
+                ffv_lazy(D3D8_HOST_FFV_LIGHT, &emit, &cur, e->regs);
+            }
+            if (c->ffv_control) emit.r[0].value ^= 1u;
+            bad += ffv_compare(D3D8_HOST_FFV_LIGHT, c, &emit, e->regs,
+                               c->lt_emit_seen ? "as last emitted" : "at the draw, no emission seen");
+        }
+    }
+    /* fog, every draw: the updater's registers as last emitted, and FOG_COLOR now. */
+    {
+        const D3D8FFFogIn *in = c->fg_emit_seen ? &c->fg_emit : &c->fg_cur;
+        if (!c->fg_emit_seen) atomic_fetch_add(&s_fv_noemit[D3D8_HOST_FFV_FOG], 1);
+        if (c->fg_emit_fresh) atomic_fetch_add(&s_fv_fresh[D3D8_HOST_FFV_FOG], 1);
+        ffv_fog_list(in, &emit);
+        if (c->fg_emit_seen) { ffv_fog_list(&c->fg_cur, &cur); ffv_lazy(D3D8_HOST_FFV_FOG, &emit, &cur, e->regs); }
+        if (in->enable) {
+            atomic_fetch_add(&s_fg_on, 1);
+            atomic_fetch_add(&s_fg_table[in->table_mode < 4 ? in->table_mode : 2], 1);
+            if (in->range_enable) atomic_fetch_add(&s_fg_range, 1);
+        }
+        if (c->ffv_fog_color) atomic_fetch_add(&s_fg_colnz, 1);
+        ffv_put(&emit, 0x02A8u, d3d8_ff_fog_color(c->ffv_fog_color), 0);
+        if (c->ffv_control) emit.r[0].value ^= 1u;
+        bad += ffv_compare(D3D8_HOST_FFV_FOG, c, &emit, e->regs,
+                           c->fg_emit_seen ? "as last emitted, colour at the draw" : "at the draw, no emission seen");
+    }
+    return bad == 0;
+}
+
+unsigned long long d3d8_host_ffv_reg_mismatches(uint32_t method)
+{
+    return method < 0x2000u ? atomic_load(&s_fv_reg_mm[method / 4u]) : 0;
+}
+
 /* NV2A format byte from a D3D Format word, and the shape it implies. */
 static void check_draw(const D3D8HostDrawCheck *c)
 {
@@ -403,6 +639,8 @@ static void check_draw(const D3D8HostDrawCheck *c)
      * every 100,000 fixed-function draws, because runs here end in kill -9
      * and an atexit print alone would never be seen. */
     d3d8_host_check_combiners(c, &e, NULL);
+    /* G42: the fixed-function vertex state, the same latched-register way. */
+    d3d8_host_check_ff_vertex(c, &e);
     {
         unsigned long long n = atomic_load(&s_ffc_draws);
         if (n && n % 100000u == 0 && c->ffc_valid && !c->ffc_ps) d3d8_host_ffc_tally_report("periodic", 20);
@@ -704,6 +942,24 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k) o->ffc_word_mismatch[k] = atomic_load(&s_ffc_word_mm[k]);
     o->ffc_tally_overflow = atomic_load(&s_ffc_tally_overflow);
     ffc_lock(); o->ffc_tally_pairs = s_ffc_tally_used; ffc_unlock();
+    for (unsigned g = 0; g < 4; ++g) {
+        o->ffv_draws[g] = atomic_load(&s_fv_draws[g]); o->ffv_all[g] = atomic_load(&s_fv_all[g]);
+        o->ffv_words[g] = atomic_load(&s_fv_words[g]); o->ffv_exact[g] = atomic_load(&s_fv_exact[g]);
+        o->ffv_tol[g] = atomic_load(&s_fv_tol[g]); o->ffv_noemit[g] = atomic_load(&s_fv_noemit[g]);
+        o->ffv_fresh[g] = atomic_load(&s_fv_fresh[g]); o->ffv_lazy[g] = atomic_load(&s_fv_lazy[g]);
+        o->ffv_cur_only[g] = atomic_load(&s_fv_cur_only[g]); o->ffv_emit_only[g] = atomic_load(&s_fv_emit_only[g]);
+        o->ffv_unres[g] = atomic_load(&s_fv_unres[g]);
+        o->tx_enabled[g] = atomic_load(&s_tx_en[g]);
+        for (unsigned k = 0; k < 6; ++k) o->tg_mode[g][k] = atomic_load(&s_tg_mode[g][k]);
+        o->fg_table[g] = atomic_load(&s_fg_table[g]);
+    }
+    for (unsigned k = 0; k < D3D8FF_TX_CASES; ++k) o->tx_case[k] = atomic_load(&s_tx_case[k]);
+    for (unsigned k = 0; k < 9; ++k) o->lt_lights[k] = atomic_load(&s_lt_lights[k]);
+    o->lt_lit = atomic_load(&s_lt_lit); o->lt_dir = atomic_load(&s_lt_dir); o->lt_point = atomic_load(&s_lt_point);
+    o->lt_spot = atomic_load(&s_lt_spot); o->lt_colormat = atomic_load(&s_lt_cm); o->lt_twosided = atomic_load(&s_lt_2s);
+    o->lt_specular = atomic_load(&s_lt_spec); o->lt_sp_from_builder = atomic_load(&s_lt_spb);
+    o->fg_on = atomic_load(&s_fg_on); o->fg_range = atomic_load(&s_fg_range); o->fg_color_nonzero = atomic_load(&s_fg_colnz);
+    o->ffv_reg_mismatch_total = atomic_load(&s_fv_mm_total);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
         o->st_unseen[k] = atomic_load(&s_st_unseen[k]);
@@ -766,6 +1022,53 @@ void d3d8_host_report(const char *why)
                 fprintf(stderr, "[D3D8-MIRROR] %s ff combiner reg %04X %s: %llu mismatches\n", why,
                         d3d8_host_ffc_method(k), d3d8_host_ffc_name(k, nm, sizeof nm), st.ffc_word_mismatch[k]);
             }
+        /* G42 */
+        fprintf(stderr, "[D3D8-MIRROR] %s ff texgen: fixed-function 3D draws %llu, all registers matching in %llu"
+                        " | registers compared=%llu MATCH=%llu | modes (off/EYE/OBJECT/SPHERE/NORMAL/REFLECTION)"
+                        " stage0 %llu/%llu/%llu/%llu/%llu/%llu stage1 %llu/%llu/%llu/%llu/%llu/%llu"
+                        " stage2 %llu/%llu/%llu/%llu/%llu/%llu stage3 %llu/%llu/%llu/%llu/%llu/%llu\n", why,
+                st.ffv_draws[0], st.ffv_all[0], st.ffv_words[0], st.ffv_exact[0],
+                st.tg_mode[0][0], st.tg_mode[0][1], st.tg_mode[0][2], st.tg_mode[0][3], st.tg_mode[0][4], st.tg_mode[0][5],
+                st.tg_mode[1][0], st.tg_mode[1][1], st.tg_mode[1][2], st.tg_mode[1][3], st.tg_mode[1][4], st.tg_mode[1][5],
+                st.tg_mode[2][0], st.tg_mode[2][1], st.tg_mode[2][2], st.tg_mode[2][3], st.tg_mode[2][4], st.tg_mode[2][5],
+                st.tg_mode[3][0], st.tg_mode[3][1], st.tg_mode[3][2], st.tg_mode[3][3], st.tg_mode[3][4], st.tg_mode[3][5]);
+        fprintf(stderr, "[D3D8-MIRROR] %s ff texture transforms: fixed-function 3D draws %llu, all registers matching in %llu"
+                        " | registers compared=%llu EXACT=%llu within-tolerance=%llu | stages enabled %llu/%llu/%llu/%llu,"
+                        " layouts A-H %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu unresolved %llu | before any emission %llu\n", why,
+                st.ffv_draws[1], st.ffv_all[1], st.ffv_words[1], st.ffv_exact[1], st.ffv_tol[1],
+                st.tx_enabled[0], st.tx_enabled[1], st.tx_enabled[2], st.tx_enabled[3],
+                st.tx_case[0], st.tx_case[1], st.tx_case[2], st.tx_case[3], st.tx_case[4], st.tx_case[5], st.tx_case[6],
+                st.tx_case[7], st.tx_case[8], st.ffv_noemit[1]);
+        fprintf(stderr, "[D3D8-MIRROR] %s ff lighting: fixed-function 3D draws %llu, all registers matching in %llu"
+                        " | registers compared=%llu EXACT=%llu within-tolerance=%llu | lit %llu (by light count 0-8:"
+                        " %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu; lights directional %llu point %llu spot %llu),"
+                        " colour material %llu, two-sided %llu, specular (SPECULAR_PARAMS not transcribed) %llu,"
+                        " SPECULAR_ENABLE last written by the combiner builder %llu | before any emission %llu\n", why,
+                st.ffv_draws[2], st.ffv_all[2], st.ffv_words[2], st.ffv_exact[2], st.ffv_tol[2], st.lt_lit,
+                st.lt_lights[0], st.lt_lights[1], st.lt_lights[2], st.lt_lights[3], st.lt_lights[4], st.lt_lights[5],
+                st.lt_lights[6], st.lt_lights[7], st.lt_lights[8], st.lt_dir, st.lt_point, st.lt_spot,
+                st.lt_colormat, st.lt_twosided, st.lt_specular, st.lt_sp_from_builder, st.ffv_noemit[2]);
+        fprintf(stderr, "[D3D8-MIRROR] %s ff fog: draws %llu, all registers matching in %llu"
+                        " | registers compared=%llu EXACT=%llu within-tolerance=%llu | fog on %llu (table NONE/EXP/EXP2/LINEAR"
+                        " %llu/%llu/%llu/%llu, range %llu), fog colour nonzero %llu | before any emission %llu\n", why,
+                st.ffv_draws[3], st.ffv_all[3], st.ffv_words[3], st.ffv_exact[3], st.ffv_tol[3], st.fg_on,
+                st.fg_table[0], st.fg_table[1], st.fg_table[2], st.fg_table[3], st.fg_range, st.fg_color_nonzero,
+                st.ffv_noemit[3]);
+        for (unsigned g = 1; g < 4; ++g)
+            fprintf(stderr, "[D3D8-MIRROR] %s ff %s laziness: emitted in this draw's flush %llu of %llu;"
+                            " state at the draw transcribes differently from the last emission in %llu"
+                            " (executor matches the draw-time state only %llu, the last emission only %llu)\n",
+                    why, g == 1 ? "texture transform" : g == 2 ? "lighting" : "fog", st.ffv_fresh[g], st.ffv_draws[g],
+                    st.ffv_lazy[g], st.ffv_cur_only[g], st.ffv_emit_only[g]);
+        if (st.ffv_reg_mismatch_total) {
+            unsigned shown = 0;
+            for (uint32_t m = 0; m < 0x2000u && shown < 24; m += 4)
+                if (d3d8_host_ffv_reg_mismatches(m)) {
+                    fprintf(stderr, "[D3D8-MIRROR] %s ff vertex-state reg %04X: %llu mismatches\n", why, m,
+                            d3d8_host_ffv_reg_mismatches(m));
+                    ++shown;
+                }
+        }
         for (unsigned k = 0; k < D3D8_HOST_PS_N; ++k)
             if (st.ps_word_mismatch[k])
                 fprintf(stderr, "[D3D8-MIRROR] %s pixel shader reg %04X (def word %u): %llu mismatches\n",

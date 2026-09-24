@@ -6758,6 +6758,11 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
      * wrote to each, whichever it was. */
     out->ffc_valid = 1;
     for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k) out->ffc.w[k] = s_methods[d3d8_host_ffc_method(k) / 4u];
+    /* G42: the whole shadow -- lighting, texgen, texture matrices and fog are
+     * spread over most of it, and the check picks what it needs. */
+    _Static_assert(sizeof out->regs == sizeof s_methods, "G42: the exec source copies the whole method shadow");
+    out->regs_valid = 1;
+    memcpy(out->regs, s_methods, sizeof out->regs);
     out->active = s_copy.active;
     if (!s_copy.active) return;
     out->mask = c->untextured ? 0u : (c->texture_mask & 0xFu);
