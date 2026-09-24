@@ -78,7 +78,9 @@ static void dispatch(uint32_t subchannel, uint32_t method, uint32_t param)
         }
         return;
     }
-    if (method == 0x100 && param && getenv("RECOMP_PB_NOTIFY_TRACE")) {
+    static int notify_trace = -1;        /* per NOP method: read the env once */
+    if (notify_trace < 0) notify_trace = getenv("RECOMP_PB_NOTIFY_TRACE") != NULL;
+    if (method == 0x100 && param && notify_trace) {
         static unsigned n;
         if (++n <= 16) fprintf(stderr, "[PB-NOP] subch=%u parameter=%08X\n", subchannel, param);
     }

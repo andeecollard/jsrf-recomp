@@ -621,8 +621,17 @@ static void xbox_McpxHoldRegisters(void)
      * those two happens is the entire point. */
     {
         static int attached;
-        const char *attach = getenv("RECOMP_OHCI_ATTACH");
-        if (!attached && attach && attach[0] != '\0' && strcmp(attach, "0") != 0) {
+        /* Read ONCE. This runs on every PB-ACK pass, tens of thousands a
+         * second, and getenv takes libc's process-wide environment lock: a
+         * 24 Sep profile of the tutorial put 88 samples in 12 s under
+         * __findenv_locked from here alone, on a run where the variable is
+         * unset and so was never "attached" -- the check never stopped. */
+        static int want = -1;
+        if (want < 0) {
+            const char *attach = getenv("RECOMP_OHCI_ATTACH");
+            want = attach && attach[0] != '\0' && strcmp(attach, "0") != 0;
+        }
+        if (!attached && want) {
             volatile uint32_t *ps =
                 (volatile uint32_t *)((char *)g_mcpx_regs + 0x500054);
             volatile uint32_t *ctl =

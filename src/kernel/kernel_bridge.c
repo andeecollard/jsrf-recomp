@@ -4991,7 +4991,9 @@ static void bridge_KeInsertQueueDpc(void)
         g_pending_dpc = dpc_va;
         g_pending_dpc_sys1 = STACK_ARG(1);
         g_pending_dpc_sys2 = STACK_ARG(2);
-        if (getenv("RECOMP_PGRAPH_ISR_TRACE") && g_current_isr_handoff) {
+        static int isr_trace = -1;       /* per DPC queued from an ISR */
+        if (isr_trace < 0) isr_trace = getenv("RECOMP_PGRAPH_ISR_TRACE") != NULL;
+        if (isr_trace && g_current_isr_handoff) {
             fprintf(stderr,
                     "  [ISR-HANDOFF] #%d queue-dpc dpc=%08X sys1=%08X sys2=%08X\n",
                     (int)g_current_isr_handoff, dpc_va,

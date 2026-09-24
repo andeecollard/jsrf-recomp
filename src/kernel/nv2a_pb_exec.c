@@ -4354,8 +4354,12 @@ static int prepare_vertices(void)
     /* Wide copy whenever something reads the slots the narrow one leaves
      * stale: the reuse verifier compares all sixteen, and capture_draw writes
      * all sixteen to its JSON. Both are opt-in, so at gameplay this is 1. */
+    /* getenv read once: this runs per vertex batch, and getenv takes libc's
+     * process-wide environment lock (24 Sep profile). */
+    static int draw_capture = -1;
+    if (draw_capture < 0) draw_capture = getenv("RECOMP_DRAW_CAPTURE") != NULL;
     const int narrow_outputs = vsh_narrow_outputs() && !vsh_reuse_verify()
-                               && !getenv("RECOMP_DRAW_CAPTURE");
+                               && !draw_capture;
 
     const int hoist_inputs = vsh_hoist_inputs();
     if (hoist_inputs) memcpy(batch_inputs, s_vsh.current, sizeof batch_inputs);

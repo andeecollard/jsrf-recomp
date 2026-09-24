@@ -372,7 +372,9 @@ static NV2APusherResult jsrf_pb_feed(uint32_t from, uint32_t to)
     /* RECOMP_PB_REPLAY keeps a copy of every window as it is taken, purely so
      * that a parse failure can be re-walked against the bytes that were there
      * at the start. See jsrf_pb_replay. */
-    if (trace || getenv("RECOMP_PB_REPLAY")) {
+    static int pb_replay = -1;           /* per segment: read the env once */
+    if (pb_replay < 0) pb_replay = getenv("RECOMP_PB_REPLAY") != NULL;
+    if (trace || pb_replay) {
         memcpy(snapshot, live, to-from);
         g_pb_replay = snapshot;
         g_pb_replay_from = from;
