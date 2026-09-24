@@ -474,3 +474,12 @@ merging or carrying flags at split entries.
   skipped** (a double-draw regression). The stencil ALWAYS class is drawn and
   agrees with the executor on 6,723 of 6,723; points, lines and polygons are
   replaced with nothing, as the executor draws none of them. Refusals fell to 2.
+- **FF draw speed, second pass** (`b3030e4`): FF+2D draw 71.4 fps (reference
+  83.0) with specialised host fragment pipelines, shared vertex chunks and the
+  executor's prepare skipped on replaced draws. The 684 "not skipped" were
+  one-index point draws, drawn by neither side; the split counter shows 0
+  double draws. **But the presented FF+2D frames are corrupted** (blocky
+  debris over the scene in every snapshot) where 688bea4's were clean, and no
+  counter caught it. Do not enable `RECOMP_D3D8_HOST_FF=draw` for the player.
+  2D draw alone regressed from 85.5 to 81.3 fps. Back with the agent, with a
+  presented-frame check required.
