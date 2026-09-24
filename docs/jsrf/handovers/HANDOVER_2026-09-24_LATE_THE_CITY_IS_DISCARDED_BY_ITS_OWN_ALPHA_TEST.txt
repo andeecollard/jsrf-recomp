@@ -1,0 +1,117 @@
+HANDOVER -- 24 September 2026 (late)
+THE CITY IS DISCARDED BY ITS OWN ALPHA TEST
+
+FOLLOWS HANDOVER_2026-09-24_AFTERNOON_THE_CITY_DRAWS_NOTHING_AND_THE_GAME_HAS_SHADOWS.txt.
+Everything there stands. This file adds one player session, which narrowed
+Rokkaku-dai's missing buildings from "paints nothing" to "every fragment
+fails the alpha test". It SUPERSEDES that file's section 2 "Left" and
+section 4 step 1.
+
+Main: 44764bd plus this handover's commit, pushed.
+JSRF.app: built from 44764bd, signed, checked.
+The player's paths.conf still has `export RECOMP_INVISIBLE_DRAW=40` at the
+end (backup: paths.conf.bak-20260924-invisible). Remove it before normal
+play; it waits on the GPU every flip.
+
+
+====================================================================
+0. THE FINDING
+====================================================================
+
+RECOMP_INVISIBLE_DRAW (792bd69) counts, per large batch, the fragments that
+pass every test, using a Metal visibility counter.
+
+Player session in Rokkaku-dai, 12:27. Log:
+jsrf-build/jsrf-first-fault/measure/rokkaku-1227-invisible/last-run.log
+
+  Rokkaku-dai: 8,493 of 11,373 big draws per window paint < 1% of their area
+  tutorial:    ~1,200 of ~18,000 (about 6.5%, hidden and composite passes)
+
+The largest invisible draws (25,000-118,000 px of triangles on screen, e.g.
+draws 372507-372530, 410693) all share one state:
+
+  - textures OPAQUE: decoded alpha min 1.000 (dxt1, rgba8/xrgb8);
+  - ALPHA TEST ON: func 0x204 (GREATER), ref 0;
+  - blend off, colour mask 01010101, stencil off, depth LEQUAL write on;
+  - diffuse alpha of the first vertices 1;
+  - final combiner CW0 130E0300 (or 130C0300), CW1 00001C80: the fog
+    program, drawn through the GENERAL path (`general 1`), fog 1;
+  - 0 FRAGMENTS PASSED.
+
+With opaque textures and diffuse alpha 1, "alpha > 0" can only fail if the
+fragment's alpha reaching the alpha test is 0 or NaN. So the city is drawn,
+and every fragment is discarded by the title's own alpha test, because the
+output alpha of the fogged final-combiner path is wrong. That also explains
+why depth-off did not bring the city back.
+
+A few invisible states are fog-free (CW0 0xC/0xE, general 0) with stencil
+or blend states. Those are plausibly the normal shadow/composite passes
+seen in the tutorial too. Check them after the fix.
+
+
+====================================================================
+1. WHERE THE ALPHA COMES FROM (read, not yet proven)
+====================================================================
+
+src/nv2a/nv2a_metal.m, the fragment shader:
+  - fgen (general final combiner) -> c = final_comb(r, cw0, cw1, fogf, s)
+  - final_comb: o.a = input(G = (cw1 >> 8) & 255, ...). With CW1 0x1C80,
+    G = 0x1C = R0.alpha, mapping 0 (max(0,x)). That reads correctly as
+    written, and is the same value the fog-off path returns (r[12]).
+  - The specialised pipelines pass the words as function constants 40/41
+    (FC_fcw0/FC_fcw1, key flag 8). The key fill at ~2707 and the setter at
+    2750 look correct in source.
+
+So the reading does not yet show the defect. Candidates, most likely first:
+  a. The alpha actually compared is not o.a. The alpha test may read a
+     different variable in the general path, or run before `c` is assigned.
+     Look at where cmpf(alpha func) is applied relative to line ~904.
+  b. NaN in the alpha: fogf or d0 NaN propagating into R0.a (e.g. i.fog
+     undefined on a path that does not write it). NaN > 0 is false, so every
+     fragment is discarded.
+  c. The specialised-pipeline key: a stale or colliding cached pipeline for
+     this state.
+  d. R0.a from the combiner stages being 0 in this path (alpha stage
+     outputs 'ao 00000C00').
+
+The agent (id ac2142be51927d3a7) has these, and is asked for:
+  - a fix;
+  - a unit test: fogged general final combiner (130E0300 / 1C80), opaque
+    texture, alpha test GREATER 0, specialised AND generic, must pass all
+    fragments (visibility count), with output alpha = R0.a;
+  - the host's equivalent (constants 43/44) checked.
+
+
+====================================================================
+2. TWO QUICK PLAYER TESTS THAT SPLIT IT (switches already exist)
+====================================================================
+
+Rokkaku-dai, one at a time, each for ~30 s:
+  1. RECOMP_FOG_IGNORE=1. Fogged programs are drawn as their fog-off twins,
+     so the old alpha path is used. Buildings appear: the general final
+     combiner path is the cause (confirmed).
+  2. RECOMP_METAL_SPECIALISE_COMBINERS=0. The generic shader only.
+     Buildings appear: the specialised pipeline is the cause (candidate c).
+Nobody has run either in Rokkaku yet. Test 1 was planned this morning and
+superseded by the fog trace.
+
+
+====================================================================
+3. EVERYTHING ELSE
+====================================================================
+
+Unchanged from the afternoon handover:
+  - DEFER_SWAP held for a player session (branch g56-defer-default-on);
+  - the police/DJ K flicker check after the points/lines fix;
+  - Poison Jam;
+  - 58d0780 (VS draw) unmerged.
+
+
+====================================================================
+4. LESSON
+====================================================================
+
+AN INSTRUMENT THAT COUNTS WHAT PASSES BEATS FOUR THAT COUNT WHAT IS SENT.
+Fog, drop, depth-off and clip runs each ruled something out without
+naming the cause. One visibility count per draw named the failing test (the
+alpha test) and the state that fails it, in a single session.
