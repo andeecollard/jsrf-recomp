@@ -9,6 +9,12 @@ int nv2a_metal_draw(const NV2ATextureCopy *state, const uint8_t *texture,
     const float (*vertices)[16][4], unsigned count, unsigned primitive);
 /* Complete queued draws and copy the retained render surface to guest RAM. */
 int nv2a_metal_sync(void);
+/* G54 RECOMP_INVISIBLE_DRAW: count the fragments of the NEXT nv2a_metal_draw
+ * that pass every test into visibility slot `slot`; collect waits for the GPU
+ * and returns counts and a drawn-into flag per slot, then clears them. */
+int nv2a_metal_measure_arm(unsigned slot);
+void nv2a_metal_measure_disarm(void);
+unsigned nv2a_metal_measure_collect(unsigned long long *counts, uint8_t *used, unsigned n);
 /* Complete queued draws and make a NAMED RANGE of guest RAM correct: the bound
  * surface as nv2a_metal_sync does, plus any retained surface that owes guest
  * RAM and overlaps [target, target+bytes). A NULL target or zero length means

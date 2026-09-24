@@ -40,6 +40,12 @@ void nv2a_drop_batch(void);     /* every batch that reaches the rasteriser's ent
 void nv2a_drop_flip(void);
 void nv2a_drop_report(const char *why);
 
+/* G54 RECOMP_INVISIBLE_DRAW: the area, in pixels, of the part of the screen
+ * triangle a, b, c (x, y in pixels, [3] the clip w) that lies inside
+ * [0, w] x [0, h]. 0 when any w is not positive -- a triangle crossing the
+ * camera plane has no screen area this can state. */
+float nv2a_clipped_triangle_area(const float a[4], const float b[4], const float c[4], float w, float h);
+
 /* For the tests: the total for a reason (0 if never seen). */
 unsigned long long nv2a_drop_count(const char *reason);
 
