@@ -249,6 +249,35 @@ static void metal_tests(void)
     printf("  final combiner + fog, Metal (%s vertex path) against the CPU rasteriser: %u cases, worst %u step(s)\n",
            use_vsh ? "guest program" : "fixed", cases, worst);
     CHECK(worst <= 1 && cases == 36, "Metal final combiner and fog: every case within one 565 step of the CPU reference");
+    /* THE SPECULAR FOG PROGRAM AT NO FOG IS THE SPECULAR-ADD PROGRAM, BIT FOR
+     * BIT (the player's characters, washed pale in the first fog build):
+     * CW0 130E0300 CW1 1C80 with a non-zero specular and fog factor 1 --
+     * FOG_ENABLE, LINEAR (2, -0.00025), coordinate 0 everywhere -- against
+     * the fog-off program 0xE. The Metal images and the CPU images must each
+     * be byte-identical, and the Metal one within a step of the CPU one. */
+    {   static uint8_t fog_m[W * H * 2], fog_c[W * H * 2];
+        NV2ATextureCopy g, e;
+        state(&g, 0x130E0300u, 0x1C80u, 0x2601u, 2.0f, -0.00025f, 0x005E77A5u);
+        state(&e, 0xEu, 0x1C80u, 0x2601u, 2.0f, -0.00025f, 0x005E77A5u);
+        CHECK(g.final_general && !g.add_specular && !e.final_general && e.add_specular,
+              "130E0300 takes the general final combiner, 0xE the specular-add tail");
+        quad(v, 0.0f, 0.0f);
+        if (!draw_metal(&g, v)) ++fails;
+        memcpy(fog_m, tgt_m, sizeof tgt_m);
+        draw_cpu(&g, v); memcpy(fog_c, tgt_c, sizeof tgt_c);
+        if (!draw_metal(&e, v)) ++fails;
+        draw_cpu(&e, v);
+        {   unsigned spec_px = 0;
+            for (unsigned i = 0; i < W * H; ++i) if (tgt_m[2 * i] != 0x33 || tgt_m[2 * i + 1] != 0x33) ++spec_px;
+            CHECK(spec_px > W * H / 2, "the quad is drawn (%u px)", spec_px); }
+        CHECK(!memcmp(fog_m, tgt_m, sizeof tgt_m), "Metal: CW0 130E0300 CW1 1C80 at fog factor 1 == the 0xE program, bit for bit");
+        CHECK(!memcmp(fog_c, tgt_c, sizeof tgt_c), "CPU: CW0 130E0300 CW1 1C80 at fog factor 1 == the 0xE program, bit for bit");
+        /* And the specular is really in it: the same draw without specular differs. */
+        {   float v2[6][16][4]; memcpy(v2, v, sizeof v2);
+            for (int j = 0; j < 6; ++j) v2[j][4][0] = v2[j][4][1] = v2[j][4][2] = 0;
+            draw_metal(&g, (const float (*)[16][4])v2);
+            CHECK(memcmp(fog_m, tgt_m, sizeof tgt_m) != 0, "CONTROL: with the specular zeroed the image changes, so V1 is in the sum"); }
+    }
     /* CONTROL: the fog colour moved, the Metal image must move with it. */
     state(&s, 0x130C0300u, 0x1C80u, 0x2601, f_of(lin.params[0]), f_of(lin.params[1]), 0x00C08040u);
     quad(v, 0.0f, 250.0f);

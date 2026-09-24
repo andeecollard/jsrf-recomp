@@ -4421,7 +4421,7 @@ static void fog_draw_trace(int programmable)
                 mv[12], mv[13], mv[14], mv[15], cp[12], cp[13], cp[14], cp[15]);
     }
     for (n = 0; n < 3 && n < s_gpu.idx_count; ++n) {
-        float d = 0, eye[4] = { 0, 0, 0, 0 }, clipw = 0, pos[4] = { 0, 0, 0, 0 };
+        float d = 0, eye[4] = { 0, 0, 0, 0 }, clipw = 0, pos[4] = { 0, 0, 0, 0 }, d1[4] = { 0, 0, 0, 0 };
         int has_eye = 0;
         if (!programmable) {
             int src = nv2a_ff_fog_source(s_methods);
@@ -4437,13 +4437,14 @@ static void fog_draw_trace(int programmable)
             NV2AVshResult r;
             memset(&r, 0, sizeof r);
             nv2a_vsh_execute(&s_vsh.decoded, (const float (*)[4])s_outputs[n], s_vsh.constants, &r);
-            d = r.output[5][0]; clipw = r.output[0][3];
+            d = r.output[5][0]; clipw = r.output[0][3]; memcpy(d1, r.output[4], 16);
         } else {
-            d = s_outputs[n][5][0]; clipw = s_outputs[n][0][3];
+            d = s_outputs[n][5][0]; clipw = s_outputs[n][0][3]; memcpy(d1, s_outputs[n][4], 16);
         }
         fprintf(stderr, "[FOG-DRAW]   v%u: d %g -> f %g | clip w %g", n, d, nv2a_fog_factor(mode, p0, p1, d), clipw);
         if (has_eye) fprintf(stderr, " | object (%g %g %g %g) eye (%g %g %g %g)", pos[0], pos[1], pos[2], pos[3],
                              eye[0], eye[1], eye[2], eye[3]);
+        if (programmable) fprintf(stderr, " | oD1 (V1, summed by CW0 130E0300) %g %g %g %g", d1[0], d1[1], d1[2], d1[3]);
         fputc('\n', stderr);
     }
     fflush(stderr);
