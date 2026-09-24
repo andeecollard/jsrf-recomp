@@ -259,6 +259,28 @@ def main():
                                     " %s(); d3d8m_set_indices(ib, b); }" % (hooked, body))
                 body = hooked
                 manifest.append("mirror: %s (streams/indices)" % name)
+            if a.mirror and name in ("sub_0018E750", "sub_0018E630", "sub_0018D7C0", "sub_0018D620", "sub_0018DA70"):
+                # G56 DEFER-SAFE: every D3D entry that hands a render target's
+                # (or depth surface's) memory to the CPU makes it current first
+                # -- a deferred swap, NO_DEPTH_SYNC and the bound target all
+                # leave guest RAM behind the GPU. Unconditional: not gated on
+                # RECOMP_D3D8_MIRROR, because correctness does not get to be
+                # opt-in. See nv2a_host_read.c.
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_host_read_resource(uint32_t res, unsigned entry);"
+                                " void d3d8m_host_read_out(uint32_t pp, unsigned entry);")
+                if name == "sub_0018E750":      # D3DSurface_LockRect(pSurface, pLocked, pRect, Flags)
+                    wrappers.append("static void %s(void) { uint32_t r = MEM32(esp + 4u); %s(); d3d8m_host_read_resource(r, 0u); }" % (hooked, body))
+                elif name == "sub_0018E630":    # D3DTexture_LockRect(pTexture, Level, pLocked, pRect, Flags)
+                    wrappers.append("static void %s(void) { uint32_t r = MEM32(esp + 4u); %s(); d3d8m_host_read_resource(r, 1u); }" % (hooked, body))
+                elif name == "sub_0018D7C0":    # CopyRects(pSrc, pSrcRects, cRects, pDst, pDstPoints): the source, before
+                    wrappers.append("static void %s(void) { uint32_t r = MEM32(esp + 4u); d3d8m_host_read_resource(r, 2u); %s(); }" % (hooked, body))
+                elif name == "sub_0018D620":    # GetBackBuffer(BackBuffer, Type, ppBackBuffer)
+                    wrappers.append("static void %s(void) { uint32_t pp = MEM32(esp + 12u); %s(); d3d8m_host_read_out(pp, 3u); }" % (hooked, body))
+                else:                           # GetDepthStencilSurface(ppZStencilSurface)
+                    wrappers.append("static void %s(void) { uint32_t pp = MEM32(esp + 4u); %s(); d3d8m_host_read_out(pp, 4u); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (G56 host read)" % name)
             if a.mirror and name == "sub_0018E930":
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_simple(uint32_t hdr, uint32_t value);")

@@ -111,6 +111,29 @@ void d3d8m_set_transform(uint32_t state, uint32_t pm)
 }
 void d3d8m_set_pixel_shader(uint32_t handle) { if (d3d8m_on()) m_ps_handle = handle; }
 void d3d8m_zenable(uint32_t v)       { if (d3d8m_on()) m_set_state(0x30Cu, v != 0); }
+
+/* G56 DEFER-SAFE: a D3D resource whose memory the CPU is about to see. Its
+ * bytes from the resource header (Data +4, Format +0xC, Size +0x10): a linear
+ * surface's pitch x height from Size, a swizzled one's 2^lw x 2^lh at up to 4
+ * bytes a texel, doubled for its mips -- an overestimate is harmless, the
+ * payment is by overlap. */
+#include "nv2a_host_read.h"
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+void d3d8m_host_read_resource(uint32_t res, unsigned entry)
+{
+    uint32_t data, fmt, size, lw, lh;
+    size_t bytes;
+    if (!res) return;
+    data = MEM32(res + 4u) & 0x03FFFFFFu; fmt = MEM32(res + 0xCu); size = MEM32(res + 0x10u);
+    if (size) bytes = (size_t)(((size >> 24) + 1u) * 64u) * (((size >> 12) & 0xFFFu) + 1u);
+    else { lw = (fmt >> 20) & 0xFu; lh = (fmt >> 24) & 0xFu; bytes = ((size_t)1u << lw) * ((size_t)1u << lh) * 4u * 2u; }
+    if (!data || !bytes) return;
+    nv2a_host_read_request((uint8_t *)((uintptr_t)xbox_GetMemoryOffset() + data), bytes, entry, 1000u);
+}
+void d3d8m_host_read_out(uint32_t pp, unsigned entry)
+{
+    if (pp) d3d8m_host_read_resource(MEM32(pp), entry);
+}
 void d3d8m_stencilenable(uint32_t v) { if (d3d8m_on()) m_set_state(0x32Cu, v != 0); }
 
 /* SetRenderState_Simple(ecx = method header, edx = value): record each state
