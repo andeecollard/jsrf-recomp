@@ -735,7 +735,7 @@ static NSString *const shader =
  " if(s.repeat[u]){p.x=(p.x%int(w)+int(w))%int(w);p.y=(p.y%int(h)+int(h))%int(h);}"
  " else p=clamp(p,int2(0),int2(w-1,h-1));"
  " uint at=base+(s.rgba8[u]?4*morton(uint(p.x),uint(p.y),w,h):s.dxt1[u]?uint(p.y/4)*pitch+uint(p.x/4)*8:s.dxt3[u]?uint(p.y/4)*pitch+uint(p.x/4)*16:uint(p.y)*pitch+uint(p.x)*2);\n"
- " if(s.rgba8[u])return float4(float(t[at+2]),float(t[at+1]),float(t[at]),float(t[at+3]))/255;"
+ " if(s.rgba8[u])return float4(float(t[at+2]),float(t[at+1]),float(t[at]),s.rgba8[u]==2u?255.0f:float(t[at+3]))/255;"
  " if(s.dxt1[u]){uint c0=uint(t[at])|(uint(t[at+1])<<8),c1=uint(t[at+2])|(uint(t[at+3])<<8);"
  " uint pick=(uint(t[at+4])|(uint(t[at+5])<<8)|(uint(t[at+6])<<16)|(uint(t[at+7])<<24))>>(2*((p.y&3)*4+(p.x&3)))&3;"
  " uint c=pick?c1:c0;float4 a=float4(float(c>>11)/31,float((c>>5)&63)/63,float(c&31)/31,1);if(pick<2)return a;"
@@ -3215,7 +3215,9 @@ static id<MTLSamplerState> hw_samplers[64],hw_default_sampler;
 
 static int hw_tex_format(const NV2ATextureCopy *t)
 {
-    return t->dxt1?NV2A_TEXFMT_DXT1:t->dxt3?NV2A_TEXFMT_DXT3:t->rgba8?NV2A_TEXFMT_RGBA8:0;
+    /* X8R8G8B8 is its own format (0x07) so its undefined top byte is decoded
+     * as opaque, not as alpha -- see nv2a_texture_decode_rgba8. */
+    return t->dxt1?NV2A_TEXFMT_DXT1:t->dxt3?NV2A_TEXFMT_DXT3:t->rgba8?(t->xrgb8?NV2A_TEXFMT_RGBA8_ALT:NV2A_TEXFMT_RGBA8):0;
 }
 /* sample_lod() walks the mip chain only when min_filter selects a mip mode
  * (3..6) and there is more than one level; otherwise it always reads level 0. */
@@ -6598,7 +6600,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    *                                     bug is upstream in the coordinate
    *   fence STILL MISSING            -> the alpha test is not what hides it
    * Pair it with RECOMP_FB_DUMP=<prefix> and look at the frames. */
-  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
+  if(no_alpha_test_on())p.alpha_test=0;p.frag_force=frag_force_mode();p.modulate=s->modulate;p.blend=s->blend;p.blend_src=s->blend_src;p.blend_dst=s->blend_dst;p.depth_test=s->depth_test;p.depth_write=s->depth_test&&s->depth_write;p.depth_func=s->depth_func;p.z_cull=legacy_zclamp_on()?0u:s->z_cull;p.z_lo=s->z_clip_min;p.z_hi=s->z_clip_max;p.stencil_test=s->stencil_test;p.stencil_write=s->stencil_write;p.stencil_mask=s->stencil_mask;p.stencil_ref=s->stencil_ref;p.stencil_func_mask=s->stencil_func_mask;p.stencil_func=s->stencil_func;p.stencil_fail=s->stencil_fail;p.stencil_zfail=s->stencil_zfail;p.stencil_zpass=s->stencil_zpass;for(unsigned u=0;u<4;u++)if(s->texture_mask&(1u<<u)){const NV2ATextureCopy*t=u?&s->extra_stages[u-1]:s;p.tw[u]=t->width;p.th[u]=t->height;p.pitch[u]=t->pitch;p.linear[u]=t->linear;p.rgba8[u]=t->rgba8?(t->xrgb8?2u:1u):0u;p.dxt1[u]=t->dxt1;p.dxt3[u]=t->dxt3;p.repeat[u]=t->repeat;p.levels[u]=t->levels;p.min_filter[u]=t->min_filter;p.lod_bias[u]=t->lod_bias;}memcpy(p.color_icw,s->color_icw,sizeof(p.color_icw));memcpy(p.alpha_icw,s->alpha_icw,sizeof(p.alpha_icw));memcpy(p.color_ocw,s->color_ocw,sizeof(p.color_ocw));memcpy(p.alpha_ocw,s->alpha_ocw,sizeof(p.alpha_ocw));memcpy(p.const0,s->const0,sizeof(p.const0));memcpy(p.const1,s->const1,sizeof(p.const1));for(unsigned u=0;u<4;u++)p.hw[u]=(hwmask>>u)&1u;
   p.final_general=s->final_general;p.final_cw0=s->final_cw0;p.final_cw1=s->final_cw1;p.fog_enable=s->fog_enable;p.fog_mode=s->fog_mode;p.fog_color=s->fog_color;p.sf0=s->spec_fog_c0;p.sf1=s->spec_fog_c1;p.fog_p0=s->fog_p0;p.fog_p1=s->fog_p1;
   p.ez_proven=(uint32_t)(early_z_exact_mode()==2&&s->alpha_test&&s->alpha_ref==0&&hw_zcull_cannot_fire(s)
                          &&g_draw_alpha_floor>=1.0f/255.0f);

@@ -76,6 +76,7 @@
  */
 #include "nv2a_vsh.h"
 #include "nv2a_texture_copy.h"
+#include "nv2a_texture_decode.h"
 #include "nv2a_drop.h"
 #include "nv2a_regs.h"
 #include <math.h>
@@ -5263,6 +5264,12 @@ static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
 #define INV_SLOTS 4096
 typedef struct {
     float area; uint32_t draw, prim, xfmode, cmask, blend_eq, alpha_func;
+    /* What the rasteriser does to the geometry before any fragment test:
+     * the area the cull mode removes (by the CPU facing rule the executor's
+     * own sinks share), and the window-z and w ranges against the guest's
+     * z-cull range -- a fragment outside [clip min, clip max] is discarded
+     * in the shader under the CULL policy, and no depth switch changes that. */
+    float area_culled, zlo, zhi, wlo, whi;
     uint32_t stencil[8], depth[3];
     float d0a[3];
     NV2ATextureCopy st, ex[3];
@@ -5290,7 +5297,7 @@ static int inv_position(uint32_t i, float out[4])
 /* Before the Metal draw: the batch's clipped area; arms a slot when it is big. */
 static int inv_arm(void)
 {
-    float area = 0, p[3][4];
+    float area = 0, area_culled = 0, p[3][4], zlo = INFINITY, zhi = -INFINITY, wlo = INFINITY, whi = -INFINITY;
     uint32_t n = s_gpu.idx_count, t;
     if (invis_cap() <= 0 || s_inv_n >= INV_SLOTS || s_gpu.prim < 5 || s_gpu.prim > 9) return -1;
     for (t = 0; ; ++t) {
@@ -5300,7 +5307,18 @@ static int inv_arm(void)
         else if (s_gpu.prim == 8) { uint32_t q = t / 2; if (4*q + 3 >= n) break; a = 4*q; b = 4*q + 1 + (t & 1); c = 4*q + 2 + (t & 1); }
         else { uint32_t q = t / 2; if (2*q + 3 >= n) break; a = 2*q; b = 2*q + 1 + 2*(t & 1); c = 2*q + 3 - (t & 1); }
         if (!inv_position(a, p[0]) || !inv_position(b, p[1]) || !inv_position(c, p[2])) continue;
-        area += nv2a_clipped_triangle_area(p[0], p[1], p[2], (float)s_copy.state.clip_w, (float)s_copy.state.clip_h);
+        {   float ca = nv2a_clipped_triangle_area(p[0], p[1], p[2], (float)s_copy.state.clip_w, (float)s_copy.state.clip_h);
+            float sa = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+            int front;
+            /* Strip parity: odd triangles of a strip are assembled reversed. */
+            if (s_gpu.prim == 6 && (t & 1)) sa = -sa;
+            front = nv2a_texture_copy_front_facing(&s_copy.state, sa, p[0][3], p[1][3], p[2][3]);
+            area += ca;
+            if (nv2a_texture_copy_culled(&s_copy.state, front)) area_culled += ca;
+            if (ca > 0) for (unsigned k = 0; k < 3; ++k) {
+                if (p[k][2] < zlo) zlo = p[k][2]; if (p[k][2] > zhi) zhi = p[k][2];
+                if (p[k][3] < wlo) wlo = p[k][3]; if (p[k][3] > whi) whi = p[k][3];
+            } }
         if (t > 20000) break;
     }
     if (area < 2000.0f) return -1;
@@ -5308,6 +5326,7 @@ static int inv_arm(void)
         const uint32_t *m = s_methods;
         memset(r, 0, sizeof *r);
         r->area = area; r->draw = s_gpu.draws; r->prim = s_gpu.prim; r->xfmode = m[0x1e94/4] & 3u;
+        r->area_culled = area_culled; r->zlo = zlo; r->zhi = zhi; r->wlo = wlo; r->whi = whi;
         r->cmask = m[0x358/4]; r->blend_eq = m[0x350/4]; r->alpha_func = m[0x33c/4];
         r->stencil[0] = m[0x32c/4]; r->stencil[1] = m[0x364/4]; r->stencil[2] = m[0x368/4]; r->stencil[3] = m[0x36c/4];
         r->stencil[4] = m[0x360/4]; r->stencil[5] = m[0x370/4]; r->stencil[6] = m[0x374/4]; r->stencil[7] = m[0x378/4];
@@ -5326,8 +5345,15 @@ static void inv_alpha(const NV2ATextureCopy *t, const uint8_t *data, size_t size
 {
     static uint8_t buf[2048 * 2048 * 4];
     unsigned w = 0, h = 0; double sum = 0;
+    int fmt = t->dxt1 ? NV2A_TEXFMT_DXT1 : t->dxt3 ? NV2A_TEXFMT_DXT3 : t->rgba8 ? (t->xrgb8 ? NV2A_TEXFMT_RGBA8_ALT : NV2A_TEXFMT_RGBA8) : 0;
     *lo = *hi = *mean = -1;
-    if (!data || !size || !nv2a_texture_copy_decode_level(t, data, size, 0, buf, sizeof buf, &w, &h) || !w || !h) return;
+    /* As the GPU samples it: the hardware-texture decoder where it handles the
+     * format, the CPU sampler's decode otherwise. The first version decoded
+     * only the CPU way, which forced X8R8G8B8 opaque while the GPU read its
+     * padding as alpha 0 -- the instrument called the lightmap opaque. */
+    if (fmt && (size_t)t->width * t->height * 4 <= sizeof buf
+        && nv2a_texture_decode_rgba8(data, size, t->width, t->height, t->pitch, fmt, buf)) { w = t->width; h = t->height; }
+    else if (!data || !size || !nv2a_texture_copy_decode_level(t, data, size, 0, buf, sizeof buf, &w, &h) || !w || !h) return;
     *lo = 1; *hi = 0;
     for (size_t i = 0; i < (size_t)w * h; ++i) { float a = buf[4*i + 3] / 255.0f; if (a < *lo) *lo = a; if (a > *hi) *hi = a; sum += a; }
     *mean = (float)(sum / ((double)w * h));
@@ -5362,6 +5388,10 @@ static void inv_collect(void)
                 r->st.blend_src, r->st.blend_dst, r->blend_eq, r->cmask, r->stencil[0], r->stencil[1], r->stencil[2], r->stencil[3],
                 r->stencil[4], r->stencil[5], r->stencil[6], r->stencil[7], r->depth[0], r->depth[1], r->depth[2],
                 r->d0a[0], r->d0a[1], r->d0a[2]);
+        fprintf(stderr, "[INVISIBLE]   geometry: %.0f of the %.0f px culled by cull %X (front %s) | window z %.1f..%.1f of 16777215,"
+                        " z-cull %u range %.1f..%.1f | clip w %g..%g\n",
+                r->area_culled, r->area, r->st.cull_face, r->st.front_cw ? "CW" : "CCW", r->zlo, r->zhi, r->st.z_cull,
+                r->st.z_clip_min, r->st.z_clip_max, r->wlo, r->whi);
         fprintf(stderr, "[INVISIBLE]   combiners %u: final CW0 %08X CW1 %08X (general %u) | fog %u | stages:",
                 r->st.combiner_count, r->st.final_general ? r->st.final_cw0 : (r->st.add_specular ? 0xEu : 0xCu),
                 r->st.final_general ? r->st.final_cw1 : 0x1C80u, r->st.final_general, r->st.fog_enable);
@@ -5377,7 +5407,7 @@ static void inv_collect(void)
             fprintf(stderr, "[INVISIBLE]   unit %u: %ux%u levels %u at %08X (%zu bytes) format%s%s%s%s%s%s%s | decoded alpha min %.3f max %.3f mean %.3f\n",
                     u, t->width, t->height, t->levels, r->texaddr[u], r->texsize[u], t->rgba8 ? " rgba8" : "", t->xrgb8 ? " xrgb8" : "",
                     t->dxt1 ? " dxt1" : "", t->dxt3 ? " dxt3" : "", t->sz16 ? " sz16" : "", t->argb4 ? " argb4" : "",
-                    t->linear ? " linear565" : "", lo, hi, mean);
+                    t->linear ? " (mag linear)" : "", lo, hi, mean);
         }
     }
     s_inv_n = 0;
