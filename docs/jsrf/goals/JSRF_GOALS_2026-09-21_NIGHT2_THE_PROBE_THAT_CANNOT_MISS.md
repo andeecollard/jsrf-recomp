@@ -1,5 +1,9 @@
 # JSRF goals — the probe that cannot miss, 21 September 2026 (night, second)
 
+> Superseded for ordering, 22 September 2026, by
+> `JSRF_GOALS_2026-09-21_NIGHT5_THE_GPU_HAS_TEXTURE_HARDWARE_AND_WE_NEVER_USED_IT.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-19_EVENING_EVERY_EDGE_IS_COUNTED.md` for
 ORDERING ONLY. That file keeps the full evidence for G20–G25 and none of it
 is retracted here. This file records what the instrument error of 21 September

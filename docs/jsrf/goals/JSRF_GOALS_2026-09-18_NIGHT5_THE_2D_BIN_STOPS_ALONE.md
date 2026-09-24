@@ -1,5 +1,9 @@
 # JSRF goals — the 2D bin stops alone, 18 September 2026, night (5)
 
+> Superseded, 19 September 2026, by
+> `JSRF_GOALS_2026-09-19_ONE_ROOT_CAUSE_UNDER_TWO_ITEMS.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-17_NIGHT2_TRACK_A_AND_A_COMPILER_THAT_LIES.md`.
 The **target is unchanged** and is still the player's own words:
 

@@ -1,5 +1,9 @@
 # JSRF goals — towards the host renderer, 23 September 2026 (evening)
 
+> Superseded for ordering, 23 September 2026 (night), by
+> `JSRF_GOALS_2026-09-23_NIGHT_AFTER_THE_DSOUND_LIFT.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-23_THE_D3D8_BOUNDARY.md` for ORDERING. That file
 keeps the record of G32–G39: the boundary census, the calling conventions, the
 Clear lift, hardware texture sampling, exact early-Z, the ADX blocking-wait fix,

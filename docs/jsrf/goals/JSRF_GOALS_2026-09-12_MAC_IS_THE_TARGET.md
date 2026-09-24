@@ -1,5 +1,9 @@
 # Goals — 12 Sep 2026: the Mac is the target, Windows is an instrument
 
+> Superseded for ordering, 12 September 2026, by
+> `JSRF_GOALS_2026-09-12_CAN_WE_DO_IT.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Written after an upstream-parity comparison and a day of measurement on both
 hosts. It exists to answer one question that was about to send a lot of work in
 the wrong direction: *does a Mac decomp/recomp need the Windows build debugged

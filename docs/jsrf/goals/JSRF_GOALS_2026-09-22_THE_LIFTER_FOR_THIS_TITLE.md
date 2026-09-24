@@ -1,5 +1,9 @@
 # JSRF goals — the lifter, for this title, 22 September 2026
 
+> Superseded for ordering, 23 September 2026, by
+> `JSRF_GOALS_2026-09-23_THE_D3D8_BOUNDARY.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-21_NIGHT5_THE_GPU_HAS_TEXTURE_HARDWARE_AND_WE_NEVER_USED_IT.md`
 for ORDERING ONLY, and only on the translator track. G1–G27 carry forward,
 nothing there is retracted, and G27 remains the head of the renderer track.

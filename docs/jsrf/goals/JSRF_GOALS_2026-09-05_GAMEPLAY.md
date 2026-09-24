@@ -1,5 +1,8 @@
 # JSRF goals: from D3D event wait to interactive gameplay
 
+> Superseded by later goals files. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Updated 5 September 2026. These goals supersede the active ordering in
 JSRF_GOALS_2026-09-05_PUSHBUFFER_RATE.md. Historical findings remain evidence,
 not acceptance for the milestones below.

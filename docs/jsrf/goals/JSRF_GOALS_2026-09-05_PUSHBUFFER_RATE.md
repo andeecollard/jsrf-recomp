@@ -1,5 +1,8 @@
 # JSRF goals — the title runs; the pushbuffer handshake is the frontier, 5 September 2026
 
+> Superseded by later goals files. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes the active goals in `JSRF_GOALS_2026-09-04_AUDIO_STALL.md`, which
 stays as the record of how the audio stall and the memory corruption were
 found. Every claim below was measured in a running process.

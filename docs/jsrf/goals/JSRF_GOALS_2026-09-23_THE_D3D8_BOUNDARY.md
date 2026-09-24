@@ -1,5 +1,9 @@
 # JSRF goals — the D3D8 boundary, 23 September 2026
 
+> Superseded for ordering, 23 September 2026 (evening), by
+> `JSRF_GOALS_2026-09-23_EVENING_TOWARDS_THE_HOST_RENDERER.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-22_THE_LIFTER_FOR_THIS_TITLE.md` for ORDERING.
 That file's G28–G31 are all done and nothing there is retracted. G27
 (hardware texture sampling, in the night-5 file) is carried forward unchanged.

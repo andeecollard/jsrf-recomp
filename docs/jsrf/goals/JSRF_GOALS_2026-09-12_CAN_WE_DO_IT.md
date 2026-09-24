@@ -1,5 +1,9 @@
 # Goals — 12 Sep 2026: can this be decompiled and recompiled, and in what order
 
+> Superseded for ordering, 13 September 2026, by
+> `JSRF_GOALS_2026-09-13_THE_TUTORIAL_IS_THE_LAST_GATE.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-12_MAC_IS_THE_TARGET.md` on ordering; its finding
 that Windows is an instrument rather than a gate still stands.
 

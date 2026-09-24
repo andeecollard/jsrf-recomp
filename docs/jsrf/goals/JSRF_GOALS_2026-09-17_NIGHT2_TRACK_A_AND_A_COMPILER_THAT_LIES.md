@@ -1,5 +1,9 @@
 # JSRF goals — Track A, and a compiler that lies, 17 September 2026, night (2)
 
+> Superseded, 18 September 2026, by
+> `JSRF_GOALS_2026-09-18_NIGHT5_THE_2D_BIN_STOPS_ALONE.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-17_NIGHT_FINISH_TRACK_A_FIRST.md`. The
 **target is unchanged** and is still the player's own words:
 

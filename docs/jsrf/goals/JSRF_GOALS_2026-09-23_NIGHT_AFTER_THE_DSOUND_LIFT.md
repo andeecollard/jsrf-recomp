@@ -1,5 +1,9 @@
 # JSRF goals — after the DSOUND lift, 23 September 2026 (night)
 
+> Superseded for ordering, 23 September 2026 (late), by
+> `JSRF_GOALS_2026-09-23_LATE_LIFT_AS_MUCH_AS_WE_CAN.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-23_EVENING_TOWARDS_THE_HOST_RENDERER.md` for
 ORDERING. That file keeps the record of G40–G48, including the DSOUND lift's
 phases 1–4 and their numbers; nothing there is retracted.

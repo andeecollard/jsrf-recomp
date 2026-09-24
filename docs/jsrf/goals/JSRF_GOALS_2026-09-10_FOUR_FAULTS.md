@@ -1,5 +1,8 @@
 # JSRF macOS — the four visible faults, and how to attack them
 
+> Superseded by later goals files. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Date: 2026-09-10 (Europe/London)
 Supersedes the goal-setting in `JSRF_GOALS_2026-09-09_GAMEPLAY.md`, which
 predates the xemu reference rig.

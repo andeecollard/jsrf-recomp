@@ -1,5 +1,9 @@
 # JSRF goals — every edge is counted, 19 September 2026 (evening)
 
+> Superseded for ordering, 21 September 2026, by
+> `JSRF_GOALS_2026-09-21_NIGHT2_THE_PROBE_THAT_CANNOT_MISS.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-19_ONE_ROOT_CAUSE_UNDER_TWO_ITEMS.md`. That
 file keeps the full evidence for G20 (the switch arm) and G21 (the texture
 path); this one records what happened to G20, adds **G22**, and resets the

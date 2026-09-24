@@ -1,5 +1,9 @@
 # JSRF macOS — gameplay milestone review and roadmap
 
+> Superseded, 10 September 2026, by
+> `JSRF_GOALS_2026-09-10_FOUR_FAULTS.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Date: 2026-09-09 (Europe/London)
 Scope: bounded high-level review. No fixes implemented. Review only.
 

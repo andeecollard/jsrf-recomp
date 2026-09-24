@@ -1,5 +1,8 @@
 # Goals — 11 Sep 2026: id 45's animation, and the genuine input stop
 
+> Superseded by later goals files. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes the plan sections of `handovers/CLAUDE_HANDOVER_2026-09-10_ANIMATION.txt`
 (§18, §25) for sequencing. The rig those steps run on is documented in
 `plans/RIG_SETUP.txt`.
