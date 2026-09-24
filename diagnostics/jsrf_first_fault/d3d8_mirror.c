@@ -60,7 +60,8 @@ static int d3d8m_on(void)
         /* G51.1/G51.3: the host's 2D and FF shadows are fed by the mirror's checks. */
         if (!m && (d3d8_host_2d_mode() || d3d8_host_ff_mode())) {
             m = 1;
-            fprintf(stderr, "[D3D8-MIRROR] armed by RECOMP_D3D8_HOST_2D\n");
+            fprintf(stderr, "[D3D8-MIRROR] armed by%s%s\n", d3d8_host_2d_mode() ? " RECOMP_D3D8_HOST_2D" : "",
+                    d3d8_host_ff_mode() ? " RECOMP_D3D8_HOST_FF" : "");
         }
         if (m) atexit(d3d8m_exit);
     }
@@ -424,6 +425,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     d3d8m_streams(c, kind, a1, a2, a3);
     c->idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c->x_val, m_x_val, sizeof c->x_val); c->x_seen = m_x_seen;
+    c->rs_cull = MEM32(0x0019E2E0u); c->rs_front = MEM32(0x0019E2DCu); c->rs_valid = 1;
     d3d8m_snap_indices(c, kind, a2, a3);
     c->ffc_valid = 1; d3d8m_ffc_read(&c->ffc_cur); c->ffc_ps = c->ffc_cur.pixel_shader;
     c->tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);
@@ -472,7 +474,7 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     }
     if (!d3d8_host_shadow_wants_handle(h)) return;
     rt = MEM32(d + 0x2070u); zs = MEM32(d + 0x2074u);
-    tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
+    tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, h, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
                                    rt ? MEM32(rt + 0x10u) : 0u, zs ? MEM32(zs + 4u) : 0u, zs ? MEM32(zs + 0x10u) : 0u);
     if (!tok) {
         if (m_pre_no_token++ < 4)
@@ -493,6 +495,7 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     /* G51.1: every index, not only the first 16, and the extra states. */
     c.idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c.x_val, m_x_val, sizeof c.x_val); c.x_seen = m_x_seen;
+    c.rs_cull = MEM32(0x0019E2E0u); c.rs_front = MEM32(0x0019E2DCu); c.rs_valid = 1;
     /* G51.1: for a 2D draw the host will draw, the indices and a hash of the
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long

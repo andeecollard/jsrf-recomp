@@ -230,6 +230,8 @@ VALUE_CARRYING = {
     # G51.3: the fixed-function class's shadow. A mode like RECOMP_D3D8_HOST_2D
     # ("shadow", with "draw" to come), not a boolean.
     "RECOMP_D3D8_HOST_FF",
+    # A count of flips: only every Nth is shadowed (a shadowed 3D flip takes ~1 s).
+    "RECOMP_D3D8_HOST_FF_STRIDE",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

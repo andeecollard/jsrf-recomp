@@ -164,6 +164,13 @@ typedef struct {
      * hashes again at the token to see whether the vertices moved too. */
     uint64_t idx_snap_pos, vtx_hash;
     uint32_t idx_snap_n, idx_snap_over, vtx_hash_ok;
+    /* G51.3: D3D's own cull state, D3D_g_RenderState[128] CULLMODE (0x19E2E0)
+     * and [127] FRONTFACE (0x19E2DC). SetRenderState_CullMode (0x18EBD0), not
+     * Simple, emits it: CULL_FACE_ENABLE = CullMode != 0 and, when on,
+     * CULL_FACE = 0x404 (FRONT) if CullMode == FrontFace else 0x405 (BACK);
+     * SetRenderState_FrontFace (0x18EC40) writes FRONT_FACE and re-applies it.
+     * rs_valid = the mirror filled these. */
+    uint32_t rs_cull, rs_front, rs_valid;
 } D3D8HostDrawCheck;
 /* G51.1: the Simple-pushed methods the host's 2D draw needs beyond
  * D3D8_HOST_STATE_METHODS: CULL_FACE_ENABLE, DITHER_ENABLE, BLEND_COLOR,
@@ -236,8 +243,8 @@ uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);
  * draw, so the render target holds what the draw starts from; the handler
  * (d3d8_host_2d_pre) snapshots it for the host's shadow. `serial` is the
  * serial the mirror's after-draw check of the same draw will carry. */
-uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
-                                  uint32_t zs_data, uint32_t zs_size);
+uint32_t d3d8_host_enqueue_2d_pre(uint32_t serial, uint32_t vs_handle, uint32_t rt_data, uint32_t rt_format,
+                                  uint32_t rt_size, uint32_t zs_data, uint32_t zs_size);
 /* G51.1 draw mode: the whole description of a pre-transformed 2D draw, as a
  * token written BEFORE its commands. The handler (d3d8_host_2d_replace) draws
  * it into the executor's target and, if it did, makes the executor skip the

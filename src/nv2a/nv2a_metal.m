@@ -5560,6 +5560,176 @@ void t0_census_report(void)
     }
 }
 
+/* BIND A SURFACE: MAKE `target` (and its depth) THE ONE THE NEXT PASS DRAWS
+ * INTO. This is nv2a_metal_draw's own binding, moved here verbatim so a
+ * second caller -- the host's G51.1 draw mode, through nv2a_metal_bind() --
+ * gets exactly the executor's behaviour: the swap write-back and its
+ * deferral, the slot-cache rebind, the rebuild from guest RAM and the LRU
+ * eviction, in that order. Returns 0, or -1 through reject() as the inline
+ * code did. Called inside the caller's autorelease pool. */
+static int surface_bind(uint8_t*target,size_t target_size,uint32_t w,uint32_t h,uint32_t pitch,
+                        uint8_t*next_depth,uint32_t next_depth_pitch,size_t next_depth_size)
+{
+  if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=w||surface_height!=h||surface_pitch!=pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
+   /* Mark the debt before the sync, so the sync finds nothing to do and takes
+    * its already-clean early return. Identity on the texture, not on the guest
+    * pointer: two slots can name the same guest address at different sizes,
+    * and only the object we are actually holding is the one whose pixels this
+    * debt is about. */
+   /* THE DEPTH REFUSAL IS NARROWED, AND ONLY BY WHAT MAKES IT POINTLESS.
+    *
+    * `depth_dirty` refuses the deferral because surface_slot_writeback carries
+    * COLOUR only: defer the swap with depth outstanding and the depth is lost,
+    * because a cache MISS would re-upload stale depth from guest RAM.
+    *
+    * That reasoning holds exactly as long as the depth write-back happens at
+    * all. With RECOMP_METAL_NO_DEPTH_SYNC on it does not: the write-back is
+    * skipped and depth_dirty is cleared without the depth ever reaching guest
+    * RAM. Refusing to defer in order to protect a value nobody is going to
+    * write is the whole reason A2 was inert -- the refusal fired 5,747-12,656
+    * times against ONE successful deferral in a 240 s run.
+    *
+    * So the condition becomes "depth is dirty AND somebody is going to write
+    * it". It is not a relaxation of the safety argument; it is the same
+    * argument with its premise checked.
+    *
+    * Counted separately, because "deferred" and "deferred only because depth
+    * is being thrown away" are different facts and a future reader must not
+    * have to infer which one a number describes. */
+   if(defer_swap_on()&&surface_cache_on()&&surface_valid&&surface&&surface_dirty){
+    if(depth_dirty&&!no_depth_sync_on()){++g_swap_defer_depth;}
+    else{
+     if(depth_dirty)++g_swap_deferred_no_depth;
+     int owed=0;
+     for(unsigned i=0;i<surface_slots_used();i++)
+      if(surf_slot[i].valid&&surf_slot[i].colour==surface){
+       surf_slot[i].owes_guest_ram=1;surface_dirty=0;
+       owed=1;++g_swap_deferred;break;}
+     if(!owed)++g_swap_defer_noslot;}}
+   ++surface_uploads;++g_sync_by_swap;g_sync_who=SYNC_WHO_SWAP;
+   if(!nv2a_metal_sync())return reject("surface-sync");
+   /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
+    * The sync above has already written the outgoing surface out, so the
+    * incoming slot's textures still hold exactly what was drawn into them --
+    * and unlike a re-upload from guest RAM, rebinding cannot lose the early
+    * draws that made the round trip. */
+   int slot_hit=-1;
+   if(surface_cache_on())
+    for(unsigned i=0;i<surface_slots_used();i++)
+     if(surf_slot[i].valid&&surf_slot[i].target==target&&surf_slot[i].target_size==target_size
+        &&surf_slot[i].w==w&&surf_slot[i].h==h&&surf_slot[i].pitch==pitch
+        &&surf_slot[i].depth==next_depth&&surf_slot[i].depth_pitch==next_depth_pitch
+        &&surf_slot[i].depth_size==next_depth_size){slot_hit=(int)i;break;}
+   if(slot_hit>=0){
+    surface=surf_slot[slot_hit].colour;stencil_surface=surf_slot[slot_hit].stencil;
+    hw_depth_tex=surf_slot[slot_hit].hw_depth;hw_stencil_tex=surf_slot[slot_hit].hw_stencil;
+    surface_target=target;surface_target_size=target_size;surface_width=w;
+    surface_height=h;surface_pitch=pitch;
+    depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
+    surface_valid=depth_valid=1;
+    /* INHERIT THE SLOT'S DEBT. If this slot was cleared while another surface
+     * was bound, its texture holds pixels guest RAM has never seen; becoming
+     * the live surface transfers that debt to surface_dirty, which the flip's
+     * sync already knows how to pay. Clearing surface_dirty here instead --
+     * which is what "a swap back is a rebind" did before there was any way for
+     * a slot to be ahead of guest RAM -- would drop the clear on the floor. */
+    surface_dirty=surf_slot[slot_hit].owes_guest_ram?1:0;depth_dirty=0;
+    surf_slot[slot_hit].owes_guest_ram=0;
+    surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
+   }else{
+   /* This branch is about to re-upload the surface FROM GUEST RAM, so any
+    * slot still owing those bytes must hand them back first or the
+    * rebuild starts from pre-render contents. The lookup above is exact
+    * on seven fields, so a surface whose depth pointer merely moved lands
+    * here with its colour debt outstanding. */
+   surface_pay_debt_for_range(target,target_size,&g_debt_paid_on_rebuild);
+   MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:w height:h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:w height:h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
+   surface_target=target;surface_target_size=target_size;surface_width=w;surface_height=h;surface_pitch=pitch;size_t pixels=(size_t)surface_width*surface_height;
+   /* THE STENCIL BUFFER IS FILLED ONLY IN THE NON-565 BRANCH BELOW, and the
+    * replaceRegion that consumes it used to run unconditionally -- so under
+    * RECOMP_METAL_565 the R8Uint stencil surface was uploaded from
+    * uninitialised heap, 307 KB of it per rebuild. Harmless only because 565
+    * implies the hardware tail and stencil_surface is then never attached,
+    * which is a reason it was not VISIBLE, not a reason it was not wrong.
+    * calloc rather than malloc: the cost is a page-zero the allocator does
+    * anyway for a fresh 307 KB, and it makes the uninitialised read impossible
+    * rather than merely unreachable. */
+   float*rgba=malloc(pixels*(hw_565_on()?2:16));uint8_t*stencil=calloc(pixels,1);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
+   if(hw_565_on()){
+    /* The attachment is the guest's format, so there is nothing to convert:
+     * copy the rows in and let the shader's channel swap put each component
+     * where the hardware will pack it back. */
+    uint16_t*w16=(uint16_t*)rgba;
+    for(unsigned y=0;y<surface_height;y++)
+     memcpy(w16+(size_t)y*surface_width,target+(size_t)y*surface_pitch,(size_t)surface_width*2);
+    [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:w16 bytesPerRow:surface_width*2];
+   }else
+   for(unsigned y=0;y<surface_height;y++)for(unsigned x=0;x<surface_width;x++){const uint8_t*p=target+(size_t)y*surface_pitch+x*2;unsigned c=p[0]|(unsigned)p[1]<<8;size_t at=((size_t)y*surface_width+x)*4;rgba[at]=(float)(c>>11)/31;rgba[at+1]=(float)((c>>5)&63)/63;rgba[at+2]=(float)(c&31)/31;if(next_depth){const uint8_t*z=next_depth+(size_t)y*next_depth_pitch+x*4;uint32_t q=(uint32_t)z[1]|(uint32_t)z[2]<<8|(uint32_t)z[3]<<16;rgba[at+3]=(float)q/16777215;stencil[(size_t)y*surface_width+x]=z[0];}else{rgba[at+3]=1;stencil[(size_t)y*surface_width+x]=0;}}
+   if(!hw_565_on())[surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
+   /* The real attachments are built from the same guest bytes, at the same
+    * moment, so the two paths start from identical depth. If this fails the
+    * textures are left nil and every draw below falls back to the software
+    * path -- slower, and correct. */
+   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){++g_hw_upload_fail;hw_depth_tex=nil;hw_stencil_tex=nil;}
+   /* Remember it, so the next swap back is a rebind. Least-recently-used goes
+    * first; a dropped slot only costs the rebuild it would have saved. */
+   if(surface_cache_on()){
+    unsigned pick=0;
+    for(unsigned i=0;i<surface_slots_used();i++){
+     if(!surf_slot[i].valid){pick=i;break;}
+     if(surf_slot[i].stamp<surf_slot[pick].stamp)pick=i;}
+    /* EVICTION HAS TO PAY THE DEBT, AND DID NOT. defer_swap's header says
+     * "surface_cache_drop pays on eviction as it always has" -- but this
+     * is not surface_cache_drop, it is the LRU pick inside the rebuild,
+     * and it overwrote the slot without looking at owes_guest_ram. The
+     * texture is then released with the only copy of whatever was
+     * rendered or cleared into it while it was unbound. Latent today at
+     * one eviction a run, and the first thing deferring every swap would
+     * have turned into lost pixels. */
+    if(surf_slot[pick].valid&&surf_slot[pick].owes_guest_ram){
+     surface_slot_writeback(pick);++g_debt_paid_on_evict;}
+    if(surf_slot[pick].valid)++surface_evictions;
+    surf_slot[pick].target=target;surf_slot[pick].target_size=target_size;
+    surf_slot[pick].w=surface_width;surf_slot[pick].h=surface_height;
+    surf_slot[pick].pitch=surface_pitch;
+    surf_slot[pick].depth=next_depth;surf_slot[pick].depth_pitch=next_depth_pitch;
+    surf_slot[pick].depth_size=next_depth_size;
+    surf_slot[pick].colour=surface;surf_slot[pick].stencil=stencil_surface;
+    surf_slot[pick].hw_depth=hw_depth_tex;surf_slot[pick].hw_stencil=hw_stencil_tex;
+    surf_slot[pick].stamp=++surf_clock;surf_slot[pick].valid=1;}
+   }}
+  return 0;
+}
+
+/* G51.1 draw mode: bind a target the way the executor's next draw into it
+ * would, so a host draw into a surface the executor has not bound yet can
+ * go ahead. `use_zeta` is that draw's depth-or-stencil test: without it the
+ * current depth binding is kept, exactly as nv2a_metal_draw keeps it. The
+ * same checks nv2a_metal_draw makes before binding are made here. */
+int nv2a_metal_bind(uint8_t *target, size_t target_size, uint32_t w, uint32_t h, uint32_t pitch,
+                    uint8_t *depth, uint32_t depth_pitch, size_t depth_size, int use_zeta)
+{
+  draw_thread_check();
+  if(!target||!w||!h||w>4096||h>4096||pitch<(uint64_t)w*2||(uint64_t)pitch*h>target_size)return -1;
+  if(use_zeta&&(!depth||depth_pitch<(uint64_t)w*4||(uint64_t)depth_pitch*h>depth_size))return -1;
+  @autoreleasepool{
+    if(!initialize())return -1;
+    uint8_t*next_depth      =use_zeta?depth      :(depth_valid?depth_target      :NULL);
+    uint32_t next_depth_pitch=use_zeta?depth_pitch:(depth_valid?depth_pitch       :0);
+    size_t next_depth_size  =use_zeta?depth_size :(depth_valid?depth_target_size :0);
+    return surface_bind(target,target_size,w,h,pitch,next_depth,next_depth_pitch,next_depth_size);
+  }
+}
+
+/* The binding counters, read-only, for the unit test that holds the two
+ * binding paths to the same sequence. */
+void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions)
+{
+  if(uploads)*uploads=surface_uploads;
+  if(hits)*hits=surface_hits;
+  if(evictions)*evictions=surface_evictions;
+}
+
 int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
  uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
  const float(*vertices)[16][4],unsigned count,unsigned primitive)
@@ -6015,134 +6185,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   } else
   for(unsigned i=0;i<count;i++){memcpy(v[i].p,vertices[i][0],16);memcpy(v[i].d0,vertices[i][3],16);memcpy(v[i].d1,vertices[i][4],16);for(unsigned u=0;u<4;u++)memcpy(v[i].t[u],vertices[i][9+u],16);}
   if(mtl_cb_stats()){g_mtl_ns_pack+=mtl_now_ns()-_tf;_tf=mtl_now_ns();}
-  if(!surface_valid||!depth_valid||surface_target!=target||surface_width!=s->clip_w||surface_height!=s->clip_h||surface_pitch!=s->target_pitch||surface_target_size!=target_size||depth_target!=next_depth||depth_pitch!=next_depth_pitch||depth_target_size!=next_depth_size){
-   /* Mark the debt before the sync, so the sync finds nothing to do and takes
-    * its already-clean early return. Identity on the texture, not on the guest
-    * pointer: two slots can name the same guest address at different sizes,
-    * and only the object we are actually holding is the one whose pixels this
-    * debt is about. */
-   /* THE DEPTH REFUSAL IS NARROWED, AND ONLY BY WHAT MAKES IT POINTLESS.
-    *
-    * `depth_dirty` refuses the deferral because surface_slot_writeback carries
-    * COLOUR only: defer the swap with depth outstanding and the depth is lost,
-    * because a cache MISS would re-upload stale depth from guest RAM.
-    *
-    * That reasoning holds exactly as long as the depth write-back happens at
-    * all. With RECOMP_METAL_NO_DEPTH_SYNC on it does not: the write-back is
-    * skipped and depth_dirty is cleared without the depth ever reaching guest
-    * RAM. Refusing to defer in order to protect a value nobody is going to
-    * write is the whole reason A2 was inert -- the refusal fired 5,747-12,656
-    * times against ONE successful deferral in a 240 s run.
-    *
-    * So the condition becomes "depth is dirty AND somebody is going to write
-    * it". It is not a relaxation of the safety argument; it is the same
-    * argument with its premise checked.
-    *
-    * Counted separately, because "deferred" and "deferred only because depth
-    * is being thrown away" are different facts and a future reader must not
-    * have to infer which one a number describes. */
-   if(defer_swap_on()&&surface_cache_on()&&surface_valid&&surface&&surface_dirty){
-    if(depth_dirty&&!no_depth_sync_on()){++g_swap_defer_depth;}
-    else{
-     if(depth_dirty)++g_swap_deferred_no_depth;
-     int owed=0;
-     for(unsigned i=0;i<surface_slots_used();i++)
-      if(surf_slot[i].valid&&surf_slot[i].colour==surface){
-       surf_slot[i].owes_guest_ram=1;surface_dirty=0;
-       owed=1;++g_swap_deferred;break;}
-     if(!owed)++g_swap_defer_noslot;}}
-   ++surface_uploads;++g_sync_by_swap;g_sync_who=SYNC_WHO_SWAP;
-   if(!nv2a_metal_sync())return reject("surface-sync");
-   /* A SWAP BACK TO A SURFACE GUEST RAM CANNOT HAVE CHANGED IS A REBIND.
-    * The sync above has already written the outgoing surface out, so the
-    * incoming slot's textures still hold exactly what was drawn into them --
-    * and unlike a re-upload from guest RAM, rebinding cannot lose the early
-    * draws that made the round trip. */
-   int slot_hit=-1;
-   if(surface_cache_on())
-    for(unsigned i=0;i<surface_slots_used();i++)
-     if(surf_slot[i].valid&&surf_slot[i].target==target&&surf_slot[i].target_size==target_size
-        &&surf_slot[i].w==s->clip_w&&surf_slot[i].h==s->clip_h&&surf_slot[i].pitch==s->target_pitch
-        &&surf_slot[i].depth==next_depth&&surf_slot[i].depth_pitch==next_depth_pitch
-        &&surf_slot[i].depth_size==next_depth_size){slot_hit=(int)i;break;}
-   if(slot_hit>=0){
-    surface=surf_slot[slot_hit].colour;stencil_surface=surf_slot[slot_hit].stencil;
-    hw_depth_tex=surf_slot[slot_hit].hw_depth;hw_stencil_tex=surf_slot[slot_hit].hw_stencil;
-    surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;
-    surface_height=s->clip_h;surface_pitch=s->target_pitch;
-    depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
-    surface_valid=depth_valid=1;
-    /* INHERIT THE SLOT'S DEBT. If this slot was cleared while another surface
-     * was bound, its texture holds pixels guest RAM has never seen; becoming
-     * the live surface transfers that debt to surface_dirty, which the flip's
-     * sync already knows how to pay. Clearing surface_dirty here instead --
-     * which is what "a swap back is a rebind" did before there was any way for
-     * a slot to be ahead of guest RAM -- would drop the clear on the floor. */
-    surface_dirty=surf_slot[slot_hit].owes_guest_ram?1:0;depth_dirty=0;
-    surf_slot[slot_hit].owes_guest_ram=0;
-    surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
-   }else{
-   /* This branch is about to re-upload the surface FROM GUEST RAM, so any
-    * slot still owing those bytes must hand them back first or the
-    * rebuild starts from pre-render contents. The lookup above is exact
-    * on seven fields, so a surface whose depth pointer merely moved lands
-    * here with its colour debt outstanding. */
-   surface_pay_debt_for_range(target,target_size,&g_debt_paid_on_rebuild);
-   MTLTextureDescriptor*td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hw_565_on()?MTLPixelFormatB5G6R5Unorm:MTLPixelFormatRGBA32Float width:s->clip_w height:s->clip_h mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModeShared;surface=[device newTextureWithDescriptor:td];MTLTextureDescriptor*sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:s->clip_w height:s->clip_h mipmapped:NO];sd.usage=MTLTextureUsageRenderTarget;sd.storageMode=MTLStorageModeShared;stencil_surface=[device newTextureWithDescriptor:sd];if(!surface||!stencil_surface)return reject("surface-allocation");
-   surface_target=target;surface_target_size=target_size;surface_width=s->clip_w;surface_height=s->clip_h;surface_pitch=s->target_pitch;size_t pixels=(size_t)surface_width*surface_height;
-   /* THE STENCIL BUFFER IS FILLED ONLY IN THE NON-565 BRANCH BELOW, and the
-    * replaceRegion that consumes it used to run unconditionally -- so under
-    * RECOMP_METAL_565 the R8Uint stencil surface was uploaded from
-    * uninitialised heap, 307 KB of it per rebuild. Harmless only because 565
-    * implies the hardware tail and stencil_surface is then never attached,
-    * which is a reason it was not VISIBLE, not a reason it was not wrong.
-    * calloc rather than malloc: the cost is a page-zero the allocator does
-    * anyway for a fresh 307 KB, and it makes the uninitialised read impossible
-    * rather than merely unreachable. */
-   float*rgba=malloc(pixels*(hw_565_on()?2:16));uint8_t*stencil=calloc(pixels,1);if(!rgba||!stencil){free(rgba);free(stencil);return reject("upload-allocation");}
-   if(hw_565_on()){
-    /* The attachment is the guest's format, so there is nothing to convert:
-     * copy the rows in and let the shader's channel swap put each component
-     * where the hardware will pack it back. */
-    uint16_t*w16=(uint16_t*)rgba;
-    for(unsigned y=0;y<surface_height;y++)
-     memcpy(w16+(size_t)y*surface_width,target+(size_t)y*surface_pitch,(size_t)surface_width*2);
-    [surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:w16 bytesPerRow:surface_width*2];
-   }else
-   for(unsigned y=0;y<surface_height;y++)for(unsigned x=0;x<surface_width;x++){const uint8_t*p=target+(size_t)y*surface_pitch+x*2;unsigned c=p[0]|(unsigned)p[1]<<8;size_t at=((size_t)y*surface_width+x)*4;rgba[at]=(float)(c>>11)/31;rgba[at+1]=(float)((c>>5)&63)/63;rgba[at+2]=(float)(c&31)/31;if(next_depth){const uint8_t*z=next_depth+(size_t)y*next_depth_pitch+x*4;uint32_t q=(uint32_t)z[1]|(uint32_t)z[2]<<8|(uint32_t)z[3]<<16;rgba[at+3]=(float)q/16777215;stencil[(size_t)y*surface_width+x]=z[0];}else{rgba[at+3]=1;stencil[(size_t)y*surface_width+x]=0;}}
-   if(!hw_565_on())[surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:rgba bytesPerRow:surface_width*16];[stencil_surface replaceRegion:MTLRegionMake2D(0,0,surface_width,surface_height) mipmapLevel:0 withBytes:stencil bytesPerRow:surface_width];free(rgba);free(stencil);surface_valid=depth_valid=1;surface_dirty=depth_dirty=0;depth_target=next_depth;depth_target_size=next_depth_size;depth_pitch=next_depth_pitch;
-   /* The real attachments are built from the same guest bytes, at the same
-    * moment, so the two paths start from identical depth. If this fails the
-    * textures are left nil and every draw below falls back to the software
-    * path -- slower, and correct. */
-   if(hw_state_on()&&!hw_depth_upload(next_depth,surface_width,surface_height,next_depth_pitch)){++g_hw_upload_fail;hw_depth_tex=nil;hw_stencil_tex=nil;}
-   /* Remember it, so the next swap back is a rebind. Least-recently-used goes
-    * first; a dropped slot only costs the rebuild it would have saved. */
-   if(surface_cache_on()){
-    unsigned pick=0;
-    for(unsigned i=0;i<surface_slots_used();i++){
-     if(!surf_slot[i].valid){pick=i;break;}
-     if(surf_slot[i].stamp<surf_slot[pick].stamp)pick=i;}
-    /* EVICTION HAS TO PAY THE DEBT, AND DID NOT. defer_swap's header says
-     * "surface_cache_drop pays on eviction as it always has" -- but this
-     * is not surface_cache_drop, it is the LRU pick inside the rebuild,
-     * and it overwrote the slot without looking at owes_guest_ram. The
-     * texture is then released with the only copy of whatever was
-     * rendered or cleared into it while it was unbound. Latent today at
-     * one eviction a run, and the first thing deferring every swap would
-     * have turned into lost pixels. */
-    if(surf_slot[pick].valid&&surf_slot[pick].owes_guest_ram){
-     surface_slot_writeback(pick);++g_debt_paid_on_evict;}
-    if(surf_slot[pick].valid)++surface_evictions;
-    surf_slot[pick].target=target;surf_slot[pick].target_size=target_size;
-    surf_slot[pick].w=surface_width;surf_slot[pick].h=surface_height;
-    surf_slot[pick].pitch=surface_pitch;
-    surf_slot[pick].depth=next_depth;surf_slot[pick].depth_pitch=next_depth_pitch;
-    surf_slot[pick].depth_size=next_depth_size;
-    surf_slot[pick].colour=surface;surf_slot[pick].stencil=stencil_surface;
-    surf_slot[pick].hw_depth=hw_depth_tex;surf_slot[pick].hw_stencil=hw_stencil_tex;
-    surf_slot[pick].stamp=++surf_clock;surf_slot[pick].valid=1;}
-   }}
+  /* G51.1: the binding is surface_bind(), shared with nv2a_metal_bind(). */
+  if(surface_bind(target,target_size,s->clip_w,s->clip_h,s->target_pitch,next_depth,next_depth_pitch,next_depth_size)<0)return -1;
   /* The hardware-state path attaches real depth and stencil buffers and drops
    * the second colour attachment the software path used to carry stencil in.
    * Chosen per draw rather than per surface because a state this path cannot
