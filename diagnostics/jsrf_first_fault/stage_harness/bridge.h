@@ -89,6 +89,29 @@ static int stage_copy(const uint8_t *base, uint32_t va, void *out, size_t size)
 #endif
 }
 
+/* RECOMP_STAGE_MEM="va:size[,va:size...]" (hex): each capture also writes the
+ * raw guest bytes of those ranges to mem-<command>-<va>.bin. For state the
+ * decomp names at a fixed address -- e.g. CSaveData at 0x1EFFB0, whose tag
+ * states GetTagState (0x3A340) reads -- without a probe in the gen tree. */
+static void stage_memory(const char *dir, unsigned long long command)
+{
+    const char *spec = getenv("RECOMP_STAGE_MEM");
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    static uint8_t buf[0x10000];
+    while (spec && *spec) {
+        char *end;
+        unsigned long va = strtoul(spec, &end, 16), size = 0;
+        if (*end == ':') size = strtoul(end + 1, &end, 16);
+        if (size && size <= sizeof buf && stage_copy(base, (uint32_t)va, buf, size)) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s/mem-%llu-%06lx.bin", dir, command, va);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(buf, 1, size, f); fclose(f); }
+        }
+        spec = *end == ',' ? end + 1 : NULL;
+    }
+}
+
 static void stage_objects(const char *dir, unsigned long long command)
 {
     const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
@@ -124,6 +147,7 @@ static void stage_objects(const char *dir, unsigned long long command)
     }
     int ok = !ferror(out);
     if (!fclose(out) && ok) rename(temp, path);
+    stage_memory(dir, command);
 }
 
 static void stage_json_string(FILE *out, const char *text)
