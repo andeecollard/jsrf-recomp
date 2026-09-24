@@ -1718,6 +1718,31 @@ static void jsrf_pump_host_events(void)
 }
 #endif
 
+/* G54.4. With the DSOUND lift on, the title's DSOUND never reaches the APU:
+ * every run since the lift reads [APU-VOICE] guest_methods=0 and [APU-FRAME]
+ * total=0. Starting the model anyway opened a second audio device (a real one
+ * in the player's build, beside the lift's own) and parked a frame thread.
+ * The MMIO shims already tolerate a NULL state -- writes are dropped, reads
+ * return 0 -- so a stray access costs nothing. dsl_on() lives in the overlay,
+ * hence the weak reference: a build without it keeps the model. */
+#if !defined(_WIN32)
+extern int dsl_on(void) __attribute__((weak));
+#endif
+static int apu_model_wanted(void)
+{
+    static int want = -1;
+    if (want < 0) {
+        const char *v = getenv("RECOMP_APU_MODEL");
+        if (v && *v) want = strcmp(v, "0") != 0;
+#if !defined(_WIN32)
+        else want = !(dsl_on && dsl_on());
+#else
+        else want = 1;
+#endif
+    }
+    return want;
+}
+
 static void apu_mmio_write_shim(uint32_t offset, uint32_t value, unsigned width)
 {
     if (g_apu_state) {
@@ -5152,9 +5177,13 @@ int main(int argc, char **argv)
      * hardware directly -- it writes a command ring in guest RAM and spins on a
      * doorbell the APU is expected to clear -- so the emulated APU has to be
      * running for its init to complete. */
-    g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+    if (apu_model_wanted())
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
     if (!g_apu_state) {
-        fprintf(stderr, "APU: mcpx_apu_init_standalone failed\n");
+        if (!apu_model_wanted())
+            fprintf(stderr, "[APU] model not started: the DSOUND lift is on (RECOMP_APU_MODEL=1 starts it anyway)\n");
+        else
+            fprintf(stderr, "APU: mcpx_apu_init_standalone failed\n");
     } else if (getenv("RECOMP_AUDIO_TEST_TONE")) {
         /* Host-output diagnostic only; never enabled during normal play. */
         mcpx_apu_play_test_tone(g_apu_state);
