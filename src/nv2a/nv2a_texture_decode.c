@@ -99,13 +99,23 @@ int nv2a_texture_decode_rgba8(const uint8_t *src, size_t src_size,
     case NV2A_TEXFMT_RGBA8:
     case NV2A_TEXFMT_RGBA8_ALT:
         /* Stored BGRA and Morton-swizzled. The shader reads
-         * (t[at+2], t[at+1], t[at], t[at+3]) into RGBA. */
+         * (t[at+2], t[at+1], t[at], t[at+3]) into RGBA.
+         *
+         * 0x07 IS X8R8G8B8, AND ITS TOP BYTE IS NOT ALPHA (G54, Rokkaku-dai).
+         * The CPU sampler has forced it opaque since 21 Sep 2026
+         * (nv2a_texture_copy.c: "rgba[3] = s->xrgb8 ? 1 : ..."); this decoder,
+         * which feeds every hardware-sampled texture, passed the padding byte
+         * through as alpha. Rokkaku's buildings multiply their base texture by
+         * an X8R8G8B8 lightmap in stage 1, alpha included, and that texture's
+         * padding is zero: R0.a = 0, the alpha test GREATER 0 discarded every
+         * fragment, and the city drew nothing -- 0 fragments passed of 118k
+         * px, with the texture itself decoding "opaque" on the CPU. */
         for (y = 0; y < h; ++y)
             for (x = 0; x < w; ++x) {
                 size_t at = (size_t)4u * nv2a_texture_morton(x, y, w, h);
                 if (at + 3u >= src_size) return 0;
                 put(dst, w, x, y, src[at + 2], src[at + 1], src[at],
-                    src[at + 3]);
+                    fmt == NV2A_TEXFMT_RGBA8_ALT ? 255u : src[at + 3]);
             }
         return 1;
 

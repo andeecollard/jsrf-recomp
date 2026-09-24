@@ -87,6 +87,49 @@ int main(void)
     nv2a_metal_measure_collect(counts, used, 4);
     CHECK(counts[2] == 400 && counts[3] == 900, "two slots in one window stay apart (%llu, %llu)", counts[2], counts[3]);
 
+    /* ROKKAKU'S BUILDINGS: the fogged general final combiner (CW0 130E0300,
+     * CW1 1C80), LINEAR fog (2, -0.00025) at coordinate 1000 (f 0.75),
+     * opaque texture, diffuse alpha 1, alpha test GREATER 0. Every fragment
+     * must pass, specialised (the default) and generic
+     * (RECOMP_METAL_SPECIALISE_COMBINERS=0, the jsrf_metal_invisible_generic
+     * arm) alike -- G = R0.a = 1. CONTROL: the same draw with G reading the
+     * ZERO register (CW1 001C80 -> 00000080 | G 0) passes nothing. */
+    {   NV2ATextureCopy g;
+        state(&g);
+        g.color_icw[0] = 0x08040000u; g.alpha_icw[0] = 0x18140000u;      /* R0 = T0 * V0, alpha T0.a * V0.a */
+        g.final_general = 1; g.final_cw0 = 0x130E0300u; g.final_cw1 = 0x1C80u;
+        g.fog_enable = 1; g.fog_mode = 0x2601u; g.fog_p0 = 2.0f; g.fog_p1 = -0.00025f; g.fog_color = 0x005E77A5u;
+        quad(v, 8, 8, 56, 40);
+        for (int j = 0; j < 6; ++j) v[j][5][0] = 1000.0f;
+        nv2a_metal_invalidate(NULL);
+        draw(&g, v, 4);
+        g.final_cw1 = 0x0080u;
+        draw(&g, v, 5);
+        nv2a_metal_measure_collect(counts, used, 8);
+        printf("  fogged general final combiner under alpha test (%s): %llu of 1536 pass; with G = ZERO %llu\n",
+               getenv("RECOMP_METAL_SPECIALISE_COMBINERS") ? "generic" : "specialised", counts[4], counts[5]);
+        CHECK(used[4] && counts[4] == 48u * 32u, "Rokkaku's building state (130E0300/1C80, fog, alpha test GREATER 0) passes every fragment (%llu)", counts[4]);
+        CHECK(used[5] && counts[5] == 0, "CONTROL: with G reading ZERO the alpha test discards it all (%llu)", counts[5]); }
+
+    /* THE CAUSE (G54): X8R8G8B8's padding byte is not alpha. Rokkaku's
+     * buildings multiply by an X8R8G8B8 lightmap, alpha included; its padding
+     * is 0. As X8R8G8B8 (xrgb8) every fragment must pass the alpha test --
+     * through the hardware sampler (the _hwtex arm) and the shader's own
+     * sampler alike. CONTROL: the same bytes declared A8R8G8B8 pass none. */
+    {   NV2ATextureCopy x;
+        for (unsigned i = 0; i < TW * TW; ++i) { tex[4*i] = 0x30; tex[4*i+1] = 0x60; tex[4*i+2] = 0x90; tex[4*i+3] = 0x00; }
+        state(&x); x.xrgb8 = 1;
+        quad(v, 8, 8, 56, 40);
+        nv2a_metal_invalidate(NULL);
+        draw(&x, v, 6);
+        nv2a_metal_measure_collect(counts, used, 8);
+        CHECK(used[6] && counts[6] == 48u * 32u, "X8R8G8B8 with a zero padding byte is opaque: %llu of 1536 fragments pass the alpha test", counts[6]);
+        x.xrgb8 = 0;
+        nv2a_metal_invalidate(NULL);
+        draw(&x, v, 7);
+        nv2a_metal_measure_collect(counts, used, 8);
+        CHECK(used[7] && counts[7] == 0, "CONTROL: the same bytes as A8R8G8B8 have alpha 0 and pass none (%llu)", counts[7]); }
+
     {   const float a[4] = { 10, 10, 0, 1 }, b[4] = { 50, 10, 0, 1 }, c[4] = { 10, 30, 0, 1 };
         const float d[4] = { -40, 10, 0, 1 }, e[4] = { 40, 10, 0, 1 }, f[4] = { -40, 30, 0, 1 };
         const float g[4] = { 10, 10, 0, -1 };
