@@ -198,6 +198,8 @@ void nv2a_ff_count_texq(const NV2AFFKey *key, const float in[16][4],
 /* Per-vertex, for the GPU path: the composite w the shader will divide by.
  * 0 unless the vertex is safe to draw; see the definition. */
 int nv2a_ff_clip_w_ok(const float pos[4]);
+/* One [FF-LIT] line per lit-state combination seen (nv2a_ff.c). */
+void nv2a_ff_lit_census_report(void);
 extern unsigned long nv2a_ff_gpu_batches, nv2a_ff_gpu_cpu_batches,
     nv2a_ff_gpu_no_skin, nv2a_ff_gpu_no_texgen, nv2a_ff_gpu_no_light,
     nv2a_ff_gpu_no_normal, nv2a_ff_gpu_texmat_unset, nv2a_ff_gpu_texmat_zero;

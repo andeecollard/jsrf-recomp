@@ -7095,6 +7095,7 @@ void nv2a_pb_exec_report(void)
                 nv2a_ff_gpu_backend_refused, nv2a_ff_gpu_clip_w,
                 nv2a_ff_gpu_texq_would_drop,
                 nv2a_ff_gpu_texmat_unset, nv2a_ff_gpu_texmat_zero);
+    nv2a_ff_lit_census_report();
     if (nv2a_ff_fog_unknown || nv2a_ff_fog_vertices[1] || nv2a_ff_fog_vertices[2] || nv2a_ff_fog_vertices[3]
         || nv2a_ff_fog_vertices[4] || nv2a_ff_fog_vertices[5])
         fprintf(stderr, "[VSH] fixed-function fog coordinate on the CPU (vertices): spec alpha %lu, radial %lu,"

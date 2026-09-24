@@ -574,6 +574,49 @@ int nv2a_ff_clip_w_ok(const float pos[4])
     return 0;
 }
 
+/* THE LIT-BATCH CENSUS (24 Sep 2026, pale characters in Rokkaku-dai).
+ *
+ * The lighting above models D0 as emission + diffuse*(ambient + sum N.L) and
+ * passes D1 through raw. xemu's vsh-ff.c also reads NV097_SET_COLOR_MATERIAL
+ * (0x0298: emission/ambient/diffuse/specular source, 2 bits each, 0 material
+ * 1 vertex diffuse 2 vertex specular), NV097_SET_LIGHT_CONTROL (0x0294: bit 0
+ * separate specular) and NV097_SET_SPECULAR_ENABLE (0x03B8: off means D1 =
+ * (0,0,0,1)), none of which this file reads. Rokkaku is the first scene with
+ * lit batches at all, so which of those states the title actually uses is
+ * counted here before anything is modelled. Also counted: whether slot 4
+ * (specular) has a vertex array or arrives as a latched inline value. */
+#define LIT_CENSUS_SLOTS 16
+static struct { uint32_t cm, lc, se, spec_array; unsigned long n; } s_lit_census[LIT_CENSUS_SLOTS];
+static unsigned s_lit_census_used; static unsigned long s_lit_census_overflow;
+static void nv2a_ff_lit_census(const uint32_t m[2048])
+{
+    uint32_t cm=m[0x298/4]&0xff, lc=m[0x294/4], se=m[0x3b8/4];
+    uint32_t spec_array=((m[(0x1760+4*4)/4]>>4)&15)!=0;
+    for(unsigned i=0;i<s_lit_census_used;++i)
+        if(s_lit_census[i].cm==cm&&s_lit_census[i].lc==lc&&s_lit_census[i].se==se
+           &&s_lit_census[i].spec_array==spec_array) { ++s_lit_census[i].n; return; }
+    if(s_lit_census_used>=LIT_CENSUS_SLOTS) { ++s_lit_census_overflow; return; }
+    s_lit_census[s_lit_census_used].cm=cm; s_lit_census[s_lit_census_used].lc=lc;
+    s_lit_census[s_lit_census_used].se=se; s_lit_census[s_lit_census_used].spec_array=spec_array;
+    s_lit_census[s_lit_census_used++].n=1;
+}
+void nv2a_ff_lit_census_report(void)
+{
+    if(!s_lit_census_used) return;
+    for(unsigned i=0;i<s_lit_census_used;++i)
+        fprintf(stderr,"[FF-LIT] %lu batches: COLOR_MATERIAL 0x0298=0x%02X"
+                " (emission %u ambient %u diffuse %u specular %u; 0 material,"
+                " 1 vertex diffuse, 2 vertex specular) LIGHT_CONTROL 0x0294=0x%X"
+                " SPECULAR_ENABLE 0x03B8=%u specular %s\n",
+                s_lit_census[i].n,s_lit_census[i].cm,s_lit_census[i].cm&3,
+                (s_lit_census[i].cm>>2)&3,(s_lit_census[i].cm>>4)&3,(s_lit_census[i].cm>>6)&3,
+                s_lit_census[i].lc,s_lit_census[i].se,
+                s_lit_census[i].spec_array?"from a vertex array":"LATCHED (no array)");
+    if(s_lit_census_overflow)
+        fprintf(stderr,"[FF-LIT] %lu more batches in combinations past the %d slots\n",
+                s_lit_census_overflow,LIT_CENSUS_SLOTS);
+}
+
 int nv2a_ff_key(const uint32_t m[2048],NV2AFFKey *key)
 {
     static const uint32_t normal_map=0x8511;
@@ -588,6 +631,7 @@ int nv2a_ff_key(const uint32_t m[2048],NV2AFFKey *key)
      * space on the screen with no reject line anywhere. */
     if(seen(0x680)==0||seen(0x6bc)==0) { ++nv2a_ff_gpu_cpu_batches; return 0; }
     key->lighting =m[0x314/4]!=0;
+    if(key->lighting) nv2a_ff_lit_census(m);
     key->normalise=m[0x3a4/4]!=0;
     for(unsigned u=0;u<4;++u) for(unsigned k=0;k<4;++k) {
         uint32_t mode=m[(0x3c0+u*16+k*4)/4];
