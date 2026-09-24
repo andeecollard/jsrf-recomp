@@ -3386,6 +3386,12 @@ static void frame_stats_report(void)
     memset(&s_stage_win, 0, sizeof s_stage_win);
 }
 
+/* G51.1: called at the end of every NV097_FLIP_STALL on the pusher thread,
+ * after the snapshot. A pointer rather than a call so this file does not
+ * depend on the host 2D module (some tests link the executor without it). */
+static void (*s_flip_hook)(void);
+void nv2a_pb_exec_set_flip_hook(void (*fn)(void)) { s_flip_hook = fn; }
+
 static void flip_trace(void)
 {
     static long stride = -1;
@@ -5743,6 +5749,9 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
         snapshot_surface();
         fb_watch();
         flip_trace();
+        /* G51.1: the host's 2D shadow compares its frame's draws here.
+         * NULL unless RECOMP_D3D8_HOST_2D armed it (main.c). */
+        if (s_flip_hook) s_flip_hook();
         break;
 
     case NV097_SET_BEGIN_END:

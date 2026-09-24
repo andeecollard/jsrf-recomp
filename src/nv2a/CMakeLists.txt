@@ -11,6 +11,7 @@ add_library(xbox_nv2a STATIC
     nv2a_pb_replay.c
     nv2a_pusher.c
     d3d8_host.c
+    d3d8_host_2d.c
     d3d8_ff_combiner.c
     d3d8_ff_vertex_state.c
     nv2a_mmio_hook.c
@@ -50,6 +51,10 @@ if(APPLE)
     enable_language(OBJC)
     target_sources(xbox_vsh PRIVATE nv2a_metal.m)
     set_source_files_properties(nv2a_metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    # G51.1: the host's own pipeline for pre-transformed 2D draws. It uses
+    # nv2a_texture_decode.c, which is why it lives here and not in xbox_nv2a.
+    target_sources(xbox_vsh PRIVATE d3d8_host_2d_metal.m)
+    set_source_files_properties(d3d8_host_2d_metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(xbox_vsh PUBLIC "-framework Metal" "-framework Foundation")
     # nv2a_metal.m timestamps its traces with xbox_TraceSeconds, which lives in
     # platform. PUBLIC, not PRIVATE: xbox_vsh is a static library, so the symbol
