@@ -35,6 +35,7 @@
  * Run with RECOMP_METAL_HW_TEX=1 as well (ctest does both): the player's
  * executor samples through hardware textures, the default through its own
  * software sampler. */
+#include <time.h>
 #include "d3d8_host_2d.h"
 #include "d3d8_ff_combiner.h"
 #include "nv2a_metal.h"
@@ -166,7 +167,7 @@ static void case_b(D3D8HostDrawCheck *c)
  * the logo case's control sets it to 0 to reproduce tutorial run 3. */
 static float g_exec_offset = 0.53125f;
 static int g_exec_keep_surfaces;     /* 1: do not invalidate first, so binding state carries across draws */
-static int g_exec_no_sync;           /* 1: exec_draw_ff leaves its batch open, as the executor's own next draw finds it */
+static int g_exec_no_sync;           /* 1: exec_draw / exec_draw_ff leave the batch open, as the executor's own next draw finds it */
 static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
 static float exec_snap(float v) { return g_exec_snap ? truncf(v * 16.0f) / 16.0f : v; }
 static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16_t *target, uint8_t *depth)
@@ -215,7 +216,7 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
         printf("executor refused the draw: %s\n", nv2a_metal_last_reject());
         return 0;
     }
-    nv2a_metal_sync();
+    if (!g_exec_no_sync) nv2a_metal_sync();
     return 1;
 }
 
@@ -789,7 +790,8 @@ static int draw_arm(int host, int control, uint16_t *out, float *zout)
     memcpy(out, rt, RTPITCH * RTH);
     return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout);
 }
-static unsigned long long g_fake_skipped; static int g_fake_skip;
+static unsigned long long g_fake_skipped, g_fake_seen; static int g_fake_skip;
+static unsigned long long fake_seen(void) { return g_fake_seen; }
 static void fake_skip(int on) { g_fake_skip = on; }
 static unsigned long long fake_skipped(void) { return g_fake_skipped; }
 /* THE SAME BINDING SEQUENCE. Executor alone: draw into A, into B, into A.
@@ -1002,9 +1004,77 @@ static void stencil_tests(void)
     }
 }
 
+/* GPU COST, host against executor, in process: the same draw N times into
+ * the executor's bound surface, unsynced, then one sync. Wall time over N is
+ * GPU-bound once N is large (the CPU side of both is microseconds). Not a
+ * pass/fail test -- `jsrf_d3d8_host_2d_test bench` prints it. */
+static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static void bench_one(const char *name, void (*mk)(D3D8HostDrawCheck *), int ff, unsigned n)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; static uint32_t ffm[2048];
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    double t[2];
+    for (int host = 0; host < 2; ++host) {
+        background(rt); logo_depth(); draw_binder(rt);
+        mk(&c);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        if (ff) { if (d3d8_host_ff_registers(&c, ffm) || d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d)) return; }
+        else if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) return;
+        g_exec_keep_surfaces = 1; g_exec_no_sync = 1;
+        for (unsigned k = 0; k < 20; ++k) host ? d3d8_host_2d_metal_external(&d, ram, RAM_SIZE) : ff ? exec_draw_ff(&c, &d, ffm, rt, ram + ZS) : exec_draw(&c, &d, rt, ram + ZS);
+        nv2a_metal_sync();
+        unsigned long long ne0 = 0, ne1 = 0;
+        d3d8_host_2d_metal_stats(NULL, NULL, NULL, NULL, &ne0);
+        double t0 = now_ms(), tl;
+        for (unsigned k = 0; k < n; ++k) host ? d3d8_host_2d_metal_external(&d, ram, RAM_SIZE) : ff ? exec_draw_ff(&c, &d, ffm, rt, ram + ZS) : exec_draw(&c, &d, rt, ram + ZS);
+        tl = now_ms() - t0;
+        nv2a_metal_sync();
+        t[host] = now_ms() - t0;
+        d3d8_host_2d_metal_stats(NULL, NULL, NULL, NULL, &ne1);
+        printf("    %s: encode loop %.3f ms (host encode %.2f us/draw), then GPU drain %.3f ms\n", host ? "host" : "executor",
+               tl, host ? (ne1 - ne0) / 1e3 / n : 0.0, t[host] - tl);
+        g_exec_keep_surfaces = 0; g_exec_no_sync = 0;
+    }
+    printf("  bench %-28s x%u: executor %.3f ms (%.2f us/draw), host %.3f ms (%.2f us/draw), host/executor %.2f\n",
+           name, n, t[0], t[0] * 1e3 / n, t[1], t[1] * 1e3 / n, t[1] / t[0]);
+}
+static void mk_logo(D3D8HostDrawCheck *c) { case_logo(c); }
+static void mk_logo_noat(D3D8HostDrawCheck *c) { case_logo(c); set_state(c, 0x300, 0); }
+static void mk_ff(D3D8HostDrawCheck *c) { case_ff(c); }
+static void bench_tests(void)
+{
+    const char *e = getenv("H2D_BENCH_N");
+    unsigned n = e ? (unsigned)atoi(e) : 4000;
+    bench_one("logo (alpha test, blend, dither)", mk_logo, 0, n);
+    bench_one("logo without alpha test", mk_logo_noat, 0, n);
+    bench_one("FF quad", mk_ff, 1, n);
+}
+
+/* SPECIALISED AGAINST GENERIC: the host's specialised fragment programs
+ * (function constants) must write exactly what its interpreter writes, on
+ * the logo (alpha test, blend, dither, DXT1) and the FF quad. The executor
+ * comparisons above already run specialised; this holds the interpreter to
+ * it, and proves pipelines were actually specialised (built > 0). */
+static void spec_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    unsigned long long built = 0, hits = 0, fb = 0, ns = 0;
+    int ok;
+    d3d8_host_2d_metal_set_spec(1);
+    ok = draw_arm(1, 0, a, za); d3d8_host_2d_metal_set_spec(0); ok = ok && draw_arm(1, 0, b, zb); d3d8_host_2d_metal_set_spec(1);
+    CHECK(ok && !memcmp(a, b, sizeof a) && !memcmp(za, zb, sizeof za), "specialised logo == generic logo, colour and depth");
+    ok = ff_draw_arm(1, 0, a, za); d3d8_host_2d_metal_set_spec(0); ok = ok && ff_draw_arm(1, 0, b, zb); d3d8_host_2d_metal_set_spec(1);
+    CHECK(ok && !memcmp(a, b, sizeof a) && !memcmp(za, zb, sizeof za), "specialised FF quad == generic FF quad, colour and depth");
+    d3d8_host_2d_metal_spec_stats(&built, &hits, &fb, &ns);
+    printf("  specialised pipelines built %llu, hits %llu, fallbacks %llu, compile %.1f ms\n", built, hits, fb, ns / 1e6);
+    CHECK(built > 0 && fb == 0, "specialised pipelines were built and none fell back");
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
+    spec_tests();
     ff_draw_tests();
     join_tests();
     stencil_tests();
@@ -1034,7 +1104,7 @@ static void draw_mode_tests(void)
         memset(&be, 0, sizeof be);
         be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
         be.last_error = d3d8_host_2d_metal_last_error; be.external_draw = d3d8_host_2d_metal_external;
-        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped; be.external_binds = d3d8_host_2d_metal_binds; be.ff_vertex = nv2a_ff_vertex;
+        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped; be.exec_seen = fake_seen; be.external_binds = d3d8_host_2d_metal_binds; be.ff_vertex = nv2a_ff_vertex;
         d3d8_host_2d_set_backend(&be);
         background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
         case_logo(&c); snapshot_at_call(&c);
@@ -1071,7 +1141,34 @@ static void draw_mode_tests(void)
         case_logo(&c); snapshot_at_call(&c);
         d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
         d3d8_host_2d_get_stats(&s0);
-        CHECK(s0.replaced_without_skip == s3.replaced_without_skip + 1, "draw mode CONTROL: a replaced draw the executor did not skip is caught");
+        CHECK(s0.replaced_without_skip == s3.replaced_without_skip + 1 &&
+              s0.replaced_exec_stopped_host_empty == s3.replaced_exec_stopped_host_empty &&
+              s0.replaced_exec_stopped_host_drew == s3.replaced_exec_stopped_host_drew,
+              "draw mode CONTROL: a replaced draw with no batch between its tokens is caught as the double-draw case");
+        /* The game's 684 (24 Sep 2026): a point list of one index. The host
+         * replaces it with nothing; the executor sees the batch and stops it
+         * before the rasteriser (fewer than 3 indices), so nothing is skipped
+         * -- and nothing is drawn by either. Counted, not called a double draw. */
+        {   D3D8H2DStats p0, p1;
+            d3d8_host_2d_get_stats(&p0);
+            case_ff(&c); c.prim = 1; c.count = 1; snapshot_at_call(&c);
+            d3d8_host_2d_replace(&c);
+            CHECK(g_fake_skip == 1, "point draw: replaced, skip on");
+            if (g_fake_skip) ++g_fake_seen;                  /* executor: batch arrives, idx_count < 3, returns */
+            d3d8_host_2d_after(&c);
+            d3d8_host_2d_get_stats(&p1);
+            CHECK(p1.replaced == p0.replaced + 1 && p1.replaced_without_skip == p0.replaced_without_skip + 1 &&
+                  p1.replaced_exec_stopped_host_empty == p0.replaced_exec_stopped_host_empty + 1 &&
+                  p1.replaced_exec_stopped_host_drew == p0.replaced_exec_stopped_host_drew,
+                  "point draw: seen and stopped by the executor, drawn by neither -- not a double draw");
+            /* A triangle draw the executor stops but the host drew: a divergence, counted apart. */
+            background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
+            case_logo(&c); snapshot_at_call(&c);
+            d3d8_host_2d_replace(&c); if (g_fake_skip) ++g_fake_seen; d3d8_host_2d_after(&c);
+            d3d8_host_2d_get_stats(&p0);
+            CHECK(p0.replaced_exec_stopped_host_drew == p1.replaced_exec_stopped_host_drew + 1,
+                  "a draw the host drew and the executor stopped before its rasteriser is counted apart");
+        }
         d3d8_host_2d_report("test");
     }
 }
@@ -1135,6 +1232,12 @@ int main(int argc, char **argv)
         if (strcmp(argv[1], "ff") == 0) { ff_cache_tests(); tex_cache_tests(); }
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "bench") == 0) {        /* GPU cost, printed only */
+        setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
+        setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
+        bench_tests();
+        return 0;
     }
     if (argc > 1 && strcmp(argv[1], "draw") == 0) {         /* the draw-mode arm, a process of its own */
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);

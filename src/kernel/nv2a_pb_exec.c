@@ -3386,17 +3386,34 @@ static void frame_stats_report(void)
     memset(&s_stage_win, 0, sizeof s_stage_win);
 }
 
-/* G51.1 DRAW MODE: the host has already drawn this 2D draw into the target,
- * so the batches that follow its token must not be drawn again. Set and
- * cleared by the host's tokens on this same thread, around exactly one D3D
- * draw's commands. Everything else a batch does still happens -- vertex
- * fetch, state latching, the mirror's register checks -- only the
- * rasteriser call is skipped, so no later draw can see a difference in
- * executor state. Unset, it is one predictable branch per batch. */
+/* G51.1 DRAW MODE: the host has already drawn this draw into the target, so
+ * the batches that follow its token must not be drawn again. Set and cleared
+ * by the host's tokens on this same thread, around exactly one D3D draw's
+ * commands. Unset, it is one predictable branch per batch.
+ *
+ * WHAT A SKIPPED BATCH STILL DOES, and what it no longer does. Every method
+ * is still latched (s_methods, s_vsh.current, the program and constant
+ * uploads, the index list), because those arrive as methods, not in the
+ * batch. What a skipped batch no longer runs is the per-batch derivation:
+ * prepare_vertices (attribute fetch, the CPU program or the GPU program's
+ * selection) and prepare_texture_copy (the draw's fragment and surface
+ * state). Both are pure functions of the latched state, recomputed from
+ * scratch by the next batch that draws, so no later draw can see a
+ * difference: prepare_vertices only caches the program PARSE, lazily, behind
+ * s_vsh.dirty, which a skip leaves set; nv2a_metal_vsh_ready/clear select the
+ * program for the very next nv2a_metal_draw, which is re-selected before it.
+ * s_copy is marked inactive, so the mirror's check at this draw's token
+ * reads "the executor did not draw it" -- true -- instead of the previous
+ * draw's texture and surface. G51.3 measured the cost this removes: [STAGE]
+ * vsh 1.99 ms a frame unchanged by replacing 52 of 71 draws. */
 static int s_host_skip;
-static unsigned long long s_host_skipped;
+static unsigned long long s_host_skipped, s_host_seen;
 void nv2a_pb_exec_host_skip(int on) { s_host_skip = on; }
 unsigned long long nv2a_pb_exec_host_skipped(void) { return s_host_skipped; }
+/* Batches that ARRIVED while the skip was on, skipped or not: a batch the
+ * executor stopped before its rasteriser (fewer than 3 indices, a refused
+ * vertex or texture state) is seen and not skipped, and drew nothing. */
+unsigned long long nv2a_pb_exec_host_seen(void) { return s_host_seen; }
 
 /* G51.1: called at the end of every NV097_FLIP_STALL on the pusher thread,
  * after the snapshot. A pointer rather than a call so this file does not
@@ -5043,6 +5060,7 @@ static void raster_batch(void)
         if (fade_batch) ++s_blend_fade_fate.short_idx;
         return;
     }
+    if (s_host_skip) { s_copy.active = 0; ++s_host_skipped; return; }
     unsigned long long _t_vsh = pb_now_us();
     int _vsh_ok = prepare_vertices();
     pb_stage_add(PB_STAGE_VSH, _t_vsh);
@@ -5224,7 +5242,6 @@ static void raster_batch(void)
         }
     }
 
-    if (s_host_skip) { ++s_host_skipped; goto batch_complete; }
 #if NV2A_GPU_PATH
     if (s_copy.active && nv2a_gpu_on()) {
         static unsigned fallback_reports, unique_reports;
@@ -5387,6 +5404,7 @@ static void draw_primitive(void)
      * silence the `batch_wide` refusal below refuses to have. Count it. */
     if (!s_gpu.prim)
         return;
+    if (s_host_skip) ++s_host_seen;
     if (!s_gpu.idx_count) {
         if (s_gpu.inline_count)
             ++s_gpu.batches_no_layout;
