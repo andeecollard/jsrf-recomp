@@ -45,6 +45,8 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
  * values (guest z / 16777215). Completes queued GPU work first. Returns 0 if
  * no hardware depth texture of at least that size is held for it. */
 int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *out);
+/* G51.3, read-only: the same for the hardware stencil attachment (one byte a pixel). */
+int nv2a_metal_stencil_peek(const uint8_t *depth, unsigned w, unsigned h, uint8_t *out);
 /* G51.1 draw mode: let a host renderer draw into the surface the executor has
  * BOUND, in order with the executor's own work. Only when that surface is
  * `target` (and, when `depth` is not NULL, its depth is `depth`) and the
@@ -58,7 +60,10 @@ int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *o
  * over colour B5G6R5Unorm, depth Depth32Float and stencil Stencil8, all
  * loaded and stored, plus the surface size; it returns nonzero if it encoded
  * the draw. The executor marks the surface dirty afterwards (and depth, if
- * `writes_depth`), exactly as after one of its own draws. */
+ * `writes_depth`), exactly as after one of its own draws. With
+ * RECOMP_METAL_BATCH on (the default) the encoder is the executor's open
+ * batch encoder, so `encode` must leave no state the executor's next draw
+ * does not set again itself; with it off, a pass of its own. */
 /* G51.1: bind `target` (w x h, `pitch`, `target_size` bytes) and, when
  * `use_zeta`, its depth surface, exactly as nv2a_metal_draw binds before a
  * draw into it -- the same code, shared. Returns 0, or -1 (rejected). */

@@ -100,9 +100,9 @@ static void base_check(D3D8HostDrawCheck *c)
 }
 static void set_state(D3D8HostDrawCheck *c, uint32_t method, uint32_t v)
 {
-    static const uint32_t st[11] = D3D8_HOST_STATE_METHODS, x[8] = D3D8_HOST_2D_EXTRA_METHODS;
+    static const uint32_t st[11] = D3D8_HOST_STATE_METHODS, x[D3D8_HOST_2D_EXTRA_N] = D3D8_HOST_2D_EXTRA_METHODS;
     for (unsigned k = 0; k < 11; ++k) if (st[k] == method) { c->st_val[k] = v; c->st_seen |= 1u << k; return; }
-    for (unsigned k = 0; k < 8; ++k) if (x[k] == method) { c->x_val[k] = v; c->x_seen |= 1u << k; return; }
+    for (unsigned k = 0; k < D3D8_HOST_2D_EXTRA_N; ++k) if (x[k] == method) { c->x_val[k] = v; c->x_seen |= 1u << k; return; }
     printf("test bug: method %X\n", method); exit(2);
 }
 
@@ -166,6 +166,7 @@ static void case_b(D3D8HostDrawCheck *c)
  * the logo case's control sets it to 0 to reproduce tutorial run 3. */
 static float g_exec_offset = 0.53125f;
 static int g_exec_keep_surfaces;     /* 1: do not invalidate first, so binding state carries across draws */
+static int g_exec_no_sync;           /* 1: exec_draw_ff leaves its batch open, as the executor's own next draw finds it */
 static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
 static float exec_snap(float v) { return g_exec_snap ? truncf(v * 16.0f) / 16.0f : v; }
 static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16_t *target, uint8_t *depth)
@@ -608,6 +609,11 @@ static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, con
     s.texture_mask = d->tmask; s.untextured = !(d->tmask & 1); s.modulate = 1;
     s.width = s.height = TW; s.pitch = TW * 4; s.levels = 1; s.rgba8 = 1; s.min_filter = 2; s.linear = 1;
     s.depth_test = d->depth_test; s.depth_write = d->depth_write; s.depth_func = d->depth_func;
+    if (d->stencil_test) {
+        s.stencil_test = 1; s.stencil_write = d->stencil_write; s.stencil_mask = d->stencil_mask; s.stencil_func = d->stencil_func;
+        s.stencil_ref = d->stencil_ref; s.stencil_func_mask = d->stencil_func_mask;
+        s.stencil_fail = d->stencil_fail; s.stencil_zfail = d->stencil_zfail; s.stencil_zpass = d->stencil_zpass;
+    }
     for (unsigned k = 0; k < c->count; ++k) {
         float in[16][4];
         for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0; in[a][3] = 1; }
@@ -617,14 +623,79 @@ static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, con
         memcpy(in[9], ram + VB + 24u * k + 16, 8);
         if (nv2a_ff_vertex(ffm, (const float (*)[4])in, v[k])) return 0;
     }
-    nv2a_metal_invalidate(NULL);
+    if (!g_exec_keep_surfaces) nv2a_metal_invalidate(NULL);
     if (nv2a_metal_draw(&s, ram + TEX, TW * TW * 4, (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
                         (const float (*)[16][4])v, c->count, c->prim) < 0) {
         printf("executor refused the FF draw: %s\n", nv2a_metal_last_reject()); return 0;
     }
-    nv2a_metal_sync();
+    if (!g_exec_no_sync) nv2a_metal_sync();
     return 1;
 }
+/* THE PER-INDEX VERTEX CACHE: an indexed FF list naming 4 vertices 6 times
+ * is evaluated 4 times, and each emitted vertex is exactly nv2a_ff_vertex of
+ * its index. Then a second draw re-evaluates (the cache is per draw). */
+static void ff_cache_tests(void)
+{
+    static const uint16_t I[6] = { 0, 1, 2, 2, 1, 3 };
+    static uint32_t ffm[2048];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    const char *why;
+    case_ff(&c);
+    c.draw_kind = 2; c.prim = 5; c.count = 6; c.idx_ptr = IB; c.nidx = 6;
+    memcpy(ram + IB, I, sizeof I); for (int k = 0; k < 6; ++k) c.idx[k] = I[k];
+    set_state(&c, 0x30C, 0);
+    why = d3d8_host_ff_registers(&c, ffm);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (!why) why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, I, ffm, nv2a_ff_vertex, &d);
+    CHECK(!why && d.nverts == 6 && d.ff_evals == 4, "vertex cache: 6 indices over 4 vertices evaluated 4 times (%s, %u vertices, %u evaluations)",
+          why ? why : "built", d.nverts, d.ff_evals);
+    int same = 1;
+    for (unsigned k = 0; k < d.nverts && k < 6; ++k) {
+        float in[16][4], out[16][4];
+        uint32_t i = I[k];
+        for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0; in[a][3] = 1; }
+        memcpy(in[0], ram + VB + 24u * i, 12);
+        { uint32_t col; memcpy(&col, ram + VB + 24u * i + 12, 4);
+          in[3][0] = ((col >> 16) & 255) / 255.0f; in[3][1] = ((col >> 8) & 255) / 255.0f; in[3][2] = (col & 255) / 255.0f; in[3][3] = (col >> 24) / 255.0f; }
+        memcpy(in[9], ram + VB + 24u * i + 16, 8);
+        nv2a_ff_vertex(ffm, (const float (*)[4])in, out);
+        if (d.verts[k].p[0] != out[0][0] || d.verts[k].p[1] != out[0][1] || d.verts[k].p[3] != out[0][3] ||
+            memcmp(d.verts[k].d0, out[3], 16) || memcmp(d.verts[k].t[0], out[9], 16)) same = 0;
+    }
+    CHECK(same, "vertex cache: every emitted vertex is nv2a_ff_vertex of its own index");
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, I, ffm, nv2a_ff_vertex, &d);
+    CHECK(!why && d.ff_evals == 4, "vertex cache: the next draw evaluates afresh (%u)", d.ff_evals);
+}
+/* THE TEXTURE CACHE: the same texture drawn twice in a flip is decoded once
+ * and hashed once; rewritten and drawn after a flip it is re-hashed and
+ * re-decoded. */
+static void tex_cache_tests(void)
+{
+    static uint32_t ffm[2048];
+    static uint16_t px[RTPITCH / 2 * RTH];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    unsigned long long h0, b0, s0, h1, b1, s1, h2, b2, s2;
+    case_ff(&c); set_state(&c, 0x30C, 0);
+    d3d8_host_ff_registers(&c, ffm);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d)) { CHECK(0, "texture cache: build"); return; }
+    background(px);
+    d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, px, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_metal_stats(&h0, &b0, &s0, NULL, NULL);
+    d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, px, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_metal_stats(&h1, &b1, &s1, NULL, NULL);
+    CHECK(h1 == h0 + 1 && b1 == b0 && s1 == s0, "texture cache: a second draw in the flip is a hit, no decode, no hash");
+    ram[TEX] ^= 0xFF;                                   /* rewritten */
+    d3d8_host_2d_flip();                                /* the "ff" arm has the FF shadow armed */
+    d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, px, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_metal_stats(&h2, &b2, &s2, NULL, NULL);
+    CHECK(d3d8_host_2d_flip_count() > 0 && s2 == s1 + 1 && b2 == b1 + 1,
+          "texture cache: after a flip a rewritten texture is re-hashed and re-decoded (flips %llu, hashes +%llu, decodes +%llu)",
+          d3d8_host_2d_flip_count(), s2 - s1, b2 - b1);
+    ram[TEX] ^= 0xFF;
+}
+
 static void compare_ff(int control)
 {
     static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
@@ -803,10 +874,140 @@ static void ff_draw_tests(void)
     CHECK(df.mismatch > 200, "FF draw mode CONTROL: the perturbed host draw is what the surface holds (%llu px)", df.mismatch);
 }
 
+/* THE BATCH JOIN. With RECOMP_METAL_BATCH on (the default) a host draw is
+ * encoded into the executor's open encoder, so the executor's NEXT draw in
+ * that encoder inherits whatever state the host left. Arm A: the executor
+ * draws the FF quad and then the indexed list, both in one open batch. Arm B:
+ * the host draws the quad and the executor draws the list into the same,
+ * unflushed encoder. The two must match to the pixel -- the executor re-sets
+ * everything it uses.
+ *
+ * BOTH ARMS KEEP THE TWO DRAWS IN ONE ENCODER, and that matters: with a sync
+ * between them the list's DST_COLOR multiply differs by one 565 step on 268
+ * pixels, with or without the host (measured 24 Sep 2026). Within a pass the
+ * blend reads the destination at the tile's precision; across passes it reads
+ * the stored 565. The executor's own batches have always done the former, so
+ * a host draw that joins the batch reproduces the executor's picture more
+ * closely than one in a pass of its own. */
+static int join_arm(int host, uint16_t *out, float *zout)
+{
+    D3D8HostDrawCheck c, b; D3D8Host2DDraw d, bd; static uint32_t ffm[2048];
+    static D3D8H2DVertex bverts[64];
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    background(rt); logo_depth();
+    draw_binder(rt);
+    case_ff(&c);
+    if (d3d8_host_ff_registers(&c, ffm)) return 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d)) return 0;
+    g_exec_keep_surfaces = 1;
+    g_exec_no_sync = 1;
+    int ok = host ? d3d8_host_2d_metal_external(&d, ram, RAM_SIZE) : exec_draw_ff(&c, &d, ffm, rt, ram + ZS);
+    g_exec_no_sync = 0;
+    if (ok) {                                            /* no sync between: the list joins the host's encoder */
+        case_b(&b);
+        b.zs = 0x2345; b.zs_data = ZS; b.zs_format = 0x1u | (0x2Eu << 8);
+        b.zs_size = (RTW - 1) | ((RTH - 1) << 12) | ((ZSPITCH / 64 - 1) << 24);
+        set_state(&b, 0x30C, 1); set_state(&b, 0x354, 0x203); set_state(&b, 0x35C, 1);
+        memset(&bd, 0, sizeof bd); bd.verts = bverts;
+        ok = !d3d8_host_2d_build(&b, ram, RAM_SIZE, 0, &bd) && exec_draw(&b, &bd, rt, ram + ZS);
+    }
+    g_exec_keep_surfaces = 0;
+    if (!ok) return 0;
+    nv2a_metal_sync();
+    memcpy(out, rt, RTPITCH * RTH);
+    return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout);
+}
+static void join_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
+    const char *bt = getenv("RECOMP_METAL_BATCH");
+    background(bg);
+    CHECK(join_arm(0, a, za) && join_arm(1, b, zb), "batch join (RECOMP_METAL_BATCH=%s): both arms drew", bt ? bt : "default on");
+    d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 0, &df);
+    zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
+    printf("  batch join: executor-only changed %llu, host-then-executor %llu, differing %llu | depth %llu, worst %u\n",
+           df.exec_changed, df.host_changed, df.mismatch, zbad, steps);
+    CHECK(df.exec_changed > 2000 && df.mismatch == 0 && zbad == 0,
+          "batch join: an executor draw after a host draw in the same encoder is unchanged, colour and depth");
+}
+
+/* STENCIL, the game's class: func ALWAYS, zpass ZERO, colour on, over a
+ * D24S8 surface whose stencil starts at 0x5A. The host must write exactly the
+ * stencil the executor writes, as well as the colour and depth. */
+static void case_ff_stencil(D3D8HostDrawCheck *c, uint32_t zpass, uint32_t ref)
+{
+    case_ff(c);
+    set_state(c, 0x32C, 1);
+    set_state(c, 0x364, 0x207); set_state(c, 0x378, zpass); set_state(c, 0x374, 0x1E00); set_state(c, 0x370, 0x1E00);
+    set_state(c, 0x360, 0xFF); set_state(c, 0x36C, 0xFF); set_state(c, 0x368, ref);
+}
+static int stencil_arm(int host, uint32_t zpass, uint16_t *out, float *zout, uint8_t *sout)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; static uint32_t ffm[2048];
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    const char *why;
+    background(rt);
+    for (unsigned y = 0; y < RTH; ++y)                   /* cleared depth, stencil 0x5A */
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF5Au }, 4);
+    nv2a_metal_invalidate(NULL); nv2a_metal_sync();
+    draw_binder(rt);
+    case_ff_stencil(&c, zpass, 0x33);
+    if (d3d8_host_ff_registers(&c, ffm)) return 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if ((why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d))) { printf("stencil build: %s\n", why); return 0; }
+    if (!d.stencil_test || !d.stencil_write) return 0;
+    if (host) {
+        if (!d3d8_host_2d_metal_external(&d, ram, RAM_SIZE)) { printf("external: %s\n", d3d8_host_2d_metal_last_error()); return 0; }
+    } else {
+        g_exec_keep_surfaces = 1;
+        int ok = exec_draw_ff(&c, &d, ffm, rt, ram + ZS);
+        g_exec_keep_surfaces = 0;
+        if (!ok) return 0;
+    }
+    nv2a_metal_sync();
+    memcpy(out, rt, RTPITCH * RTH);
+    return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout) && nv2a_metal_stencil_peek(ram + ZS, RTW, RTH, sout);
+}
+static void stencil_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    static uint8_t sa[RTW * RTH], sb[RTW * RTH];
+    static const uint32_t ops[2] = { 0x0000u, 0x1E01u };            /* ZERO (the game's), REPLACE (ref 0x33) */
+    background(bg);
+    for (unsigned o = 0; o < 2; ++o) {
+        D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad, sdiff = 0, swritten = 0;
+        CHECK(stencil_arm(0, ops[o], a, za, sa) && stencil_arm(1, ops[o], b, zb, sb), "stencil zpass %X: both arms drew", ops[o]);
+        d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 0, &df);
+        zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
+        for (unsigned k = 0; k < RTW * RTH; ++k) { sdiff += sa[k] != sb[k]; swritten += sa[k] != 0x5A; }
+        printf("  stencil zpass %X: executor changed %llu px, differing %llu | depth %llu | stencil written %llu, differing %llu\n",
+               ops[o], df.exec_changed, df.mismatch, zbad, swritten, sdiff);
+        CHECK(df.exec_changed > 500 && df.mismatch == 0 && zbad == 0 && swritten > 500 && sdiff == 0,
+              "stencil zpass %X: host writes the executor's colour, depth and stencil", ops[o]);
+    }
+    {   /* Refusals: a func other than ALWAYS, and state D3D never pushed. */
+        D3D8HostDrawCheck c; D3D8Host2DDraw d; static uint32_t ffm[2048];
+        case_ff_stencil(&c, 0, 0); set_state(&c, 0x364, 0x202);
+        d3d8_host_ff_registers(&c, ffm); memset(&d, 0, sizeof d); d.verts = verts;
+        const char *why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+        CHECK(why && !strcmp(why, "stencil func not ALWAYS"), "stencil: func EQUAL is refused (%s)", why ? why : "built");
+        case_ff(&c); set_state(&c, 0x32C, 1); set_state(&c, 0x364, 0x207);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+        CHECK(why && !strcmp(why, "stencil state not pushed"), "stencil: ops never pushed are refused, not defaulted (%s)", why ? why : "built");
+    }
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
     ff_draw_tests();
+    join_tests();
+    stencil_tests();
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
     static float za[RTW * RTH], zb[RTW * RTH];
     D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
@@ -931,6 +1132,7 @@ int main(int argc, char **argv)
     if (!ram) return 2;
     if (argc > 1 && (strcmp(argv[1], "ff") == 0 || strcmp(argv[1], "ffcontrol") == 0)) {   /* FF shadow alone */
         CHECK(ff_arm(strcmp(argv[1], "ffcontrol") == 0), "FF arm ran");
+        if (strcmp(argv[1], "ff") == 0) { ff_cache_tests(); tex_cache_tests(); }
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }

@@ -36,15 +36,57 @@ int d3d8_host_2d_class(const D3D8HostDrawCheck *c)
 
 /* ---- building the draw from D3D state ---- */
 static const uint32_t k_st[11] = D3D8_HOST_STATE_METHODS;
-static const uint32_t k_x[8] = D3D8_HOST_2D_EXTRA_METHODS;
+static const uint32_t k_x[D3D8_HOST_2D_EXTRA_N] = D3D8_HOST_2D_EXTRA_METHODS;
 /* D3D's last Simple push of `method`, or the NV2A reset value if it never pushed one. */
 static uint32_t st(const D3D8HostDrawCheck *c, uint32_t method, uint32_t dflt)
 {
     for (unsigned k = 0; k < 11; ++k)
         if (k_st[k] == method) return (c->st_seen & (1u << k)) ? c->st_val[k] : dflt;
-    for (unsigned k = 0; k < 8; ++k)
+    for (unsigned k = 0; k < D3D8_HOST_2D_EXTRA_N; ++k)
         if (k_x[k] == method) return (c->x_seen & (1u << k)) ? c->x_val[k] : dflt;
     return dflt;
+}
+/* Whether D3D pushed `method` at all (Simple). */
+static int st_seen(const D3D8HostDrawCheck *c, uint32_t method)
+{
+    for (unsigned k = 0; k < 11; ++k) if (k_st[k] == method) return (c->st_seen >> k) & 1u;
+    for (unsigned k = 0; k < D3D8_HOST_2D_EXTRA_N; ++k) if (k_x[k] == method) return (c->x_seen >> k) & 1u;
+    return 0;
+}
+static int stencil_op_ok(uint32_t op)                 /* nv2a_texture_copy.c's list; nv2a_metal_stencil_op maps each */
+{
+    return op == 0u || op == 0x1E00u || op == 0x1E01u || op == 0x1E02u || op == 0x1E03u || op == 0x150Au ||
+           op == 0x8507u || op == 0x8508u;
+}
+/* A depth surface with stencil: D24S8 / F24S8, swizzled or linear (D3D
+ * formats 0x2A 0x2B 0x2E 0x2F in the format word's byte 1). */
+static int zs_has_stencil(const D3D8HostDrawCheck *c)
+{
+    uint32_t f = (c->zs_format >> 8) & 0xFFu;
+    return c->zs && (f == 0x2Au || f == 0x2Bu || f == 0x2Eu || f == 0x2Fu);
+}
+/* STENCIL, THE CLASS THE GAME DRAWS: func ALWAYS. Every value that decides
+ * what is written must have been pushed by D3D; a value it never pushed is
+ * refused, not taken from the NV2A's reset state, because D3D's device
+ * setup writes the registers by a path the mirror does not see. */
+static const char *stencil_from_d3d(const D3D8HostDrawCheck *c, D3D8Host2DDraw *d)
+{
+    int replace;
+    if (!st_seen(c, 0x364)) return "stencil state not pushed";
+    d->stencil_func = st(c, 0x364, 0x207);
+    if (d->stencil_func != 0x207u) return "stencil func not ALWAYS";
+    d->stencil_fail = st(c, 0x370, 0x1E00);               /* never applied under ALWAYS */
+    d->stencil_zfail = st(c, 0x374, 0x1E00); d->stencil_zpass = st(c, 0x378, 0x1E00);
+    d->stencil_mask = st(c, 0x360, 0xFF); d->stencil_ref = st(c, 0x368, 0); d->stencil_func_mask = st(c, 0x36C, 0xFF);
+    if (!c->zs) return "stencil test without a depth surface";
+    d->stencil_write = zs_has_stencil(c);
+    if (!d->stencil_write) return "stencil test on a depth surface without stencil";
+    if (!st_seen(c, 0x378) || !st_seen(c, 0x360) || (d->depth_test && !st_seen(c, 0x374))) return "stencil state not pushed";
+    if (!stencil_op_ok(d->stencil_zpass) || !stencil_op_ok(d->stencil_zfail) || !stencil_op_ok(d->stencil_fail))
+        return "stencil operation";
+    replace = d->stencil_zpass == 0x1E01u || (d->depth_test && d->stencil_zfail == 0x1E01u);
+    if (replace && !st_seen(c, 0x368)) return "stencil state not pushed";
+    return NULL;
 }
 static int32_t trunc_scaled(int32_t v, float s) { return (int32_t)((float)((double)v * (double)s + 0.5)); }
 static int blend_factor_ok(uint32_t f)
@@ -227,10 +269,10 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     d->depth_test = st(c, 0x30C, 0) != 0; d->depth_func = st(c, 0x354, 0x203);
     if (!d->depth_func) d->depth_func = 0x203;
     d->depth_write = st(c, 0x35C, 1) != 0;
-    d->stencil_test = st(c, 0x32C, 0);
-    if (d->stencil_test) return "stencil test";
+    d->stencil_test = st(c, 0x32C, 0) != 0;
+    if (d->stencil_test) { const char *sw = stencil_from_d3d(c, d); if (sw) return sw; }
     if (d->depth_test && (d->depth_func < 0x200u || d->depth_func > 0x207u)) return "depth func";
-    if (d->depth_test) {
+    if (d->depth_test || d->stencil_test) {
         if (!c->zs) return "depth test without a depth surface";
         d->zs_addr = c->zs_data & RAM_MASK; d->zs_pitch = ((c->zs_size >> 24) + 1u) * 64u;
         if (d->zs_pitch < d->rt_w * 4u || (uint64_t)d->zs_addr + (uint64_t)d->zs_pitch * d->rt_h > ram_size)
@@ -295,6 +337,11 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     /* Triangles, strips, fans, quads and quad strips, triangulated exactly as
      * nv2a_metal_draw does (the order decides facing). Points, lines and
      * POLYGON (10) the executor refuses, so the host does not draw them. */
+    /* Points (1) and lines (2-4) and POLYGON (10): nv2a_metal_draw rejects
+     * "primitive" and the CPU fallback's switch draws nothing ("points and
+     * lines: not yet"), so the executor's picture is unchanged by them. The
+     * host describes that exactly: no vertices. */
+    if ((d->prim >= 1u && d->prim <= 4u) || d->prim == 10u) { d->prim_empty = 1; d->nverts = 0; d->bb_x0 = 1; d->bb_x1 = 0; return NULL; }
     if (d->prim < 5u || d->prim > 9u) return "primitive";
     if (c->count > 16384u) return "vertex count";
     {
@@ -313,6 +360,30 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 if (!c->idx_ptr || at + 2u > ram_size) return "index bounds";
                 idx[k] = (uint32_t)ram[at] | (uint32_t)ram[at + 1] << 8;
             } else idx[k] = c->start + k;
+        }
+        /* FIXED-FUNCTION VERTICES ARE EVALUATED ONCE PER INDEX VALUE, not once
+         * per index: an indexed mesh names each vertex about six times, and
+         * nv2a_ff_vertex (fetch, transform, lighting, texgen) was the largest
+         * cost of FF draw mode (18 fps against 83). A generation stamp per
+         * index in the draw's range says whether this draw has evaluated it. */
+        static D3D8H2DVertex *vc; static uint8_t *vstat; static const char **verr; static uint32_t *vstamp;
+        static uint32_t vcap, vgen;
+        uint32_t vbase = 0;
+        if (cls == 2 && n) {
+            uint32_t lo = UINT32_MAX, hi = 0, range;
+            for (uint32_t k = 0; k < n; ++k) { if (idx[k] < lo) lo = idx[k]; if (idx[k] > hi) hi = idx[k]; }
+            range = hi - lo + 1u; vbase = lo;
+            if (range > 1u << 20) return "index range";
+            if (range > vcap) {
+                D3D8H2DVertex *a = realloc(vc, range * sizeof *a); uint8_t *b = a ? realloc(vstat, range) : NULL;
+                const char **e = b ? realloc(verr, range * sizeof *e) : NULL; uint32_t *st4 = e ? realloc(vstamp, range * 4u) : NULL;
+                if (a) vc = a;
+                if (b) vstat = b;
+                if (e) verr = e;
+                if (!st4) return "out of memory";
+                vstamp = st4; memset(vstamp + vcap, 0, (range - vcap) * 4u); vcap = range;
+            }
+            if (++vgen == 0) { memset(vstamp, 0, vcap * 4u); vgen = 1; }
         }
         for (uint32_t k = 0; ; ++k) {
             /* Triangle k of the primitive, as the executor assembles it. */
@@ -336,28 +407,40 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 memset(&v[j], 0, sizeof v[j]);
                 if (cls == 2) {
                     /* The executor's fixed-function vertex: every enabled
-                     * array fetched over defaults (w = 1; diffuse white as
-                     * for 2D, see s_diffuse_default), then its own unit. */
-                    float in[16][4], out[16][4];
-                    const char *why;
-                    for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0.0f; in[a][3] = 1.0f; }
-                    in[3][0] = in[3][1] = in[3][2] = 1.0f;
-                    for (unsigned a = 0; a < 16; ++a)
-                        if (((c->va_on >> a) & 1u) && !fetch(ram, ram_size, c->va_offset[a], c->va_format[a], i, in[a]))
-                            return "vertex format";
-                    if ((why = ffv(ffm, (const float (*)[4])in, out))) return why;
-                    if (i < d->idx_min) d->idx_min = i; if (i > d->idx_max) d->idx_max = i;
-                    v[j].p[0] = out[0][0]; v[j].p[1] = out[0][1]; v[j].p[2] = out[0][2] / 16777215.0f; v[j].p[3] = out[0][3];
-                    memcpy(v[j].d0, out[3], 16); memcpy(v[j].d1, out[4], 16);
-                    for (unsigned u = 0; u < 4; ++u) memcpy(v[j].t[u], out[9 + u], 16);
-                    for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].p[q]) || !isfinite(v[j].d0[q]) || !isfinite(v[j].d1[q])) ok = 0;
-                    if (!ok) break;
-                    for (unsigned u = 0; u < 4; ++u)             /* nv2a_metal.m vertex_valid(): q > 0 per textured unit */
-                        if ((d->tmask >> u) & 1u) {
-                            for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].t[u][q])) ok = 0;
-                            if (!(v[j].t[u][3] > 0.0f)) ok = 0;
+                     * array fetched over defaults (w = 1; diffuse white, which
+                     * the executor's current slot 3 was measured to hold),
+                     * then its own unit -- once per index value. */
+                    uint32_t slot = i - vbase;
+                    if (vstamp[slot] != vgen) {
+                        float in[16][4], out[16][4];
+                        D3D8H2DVertex *o = &vc[slot];
+                        uint8_t stt = 0;
+                        const char *why = NULL;
+                        vstamp[slot] = vgen; ++d->ff_evals;
+                        for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0.0f; in[a][3] = 1.0f; }
+                        in[3][0] = in[3][1] = in[3][2] = 1.0f;
+                        for (unsigned a = 0; a < 16 && !why; ++a)
+                            if (((c->va_on >> a) & 1u) && !fetch(ram, ram_size, c->va_offset[a], c->va_format[a], i, in[a]))
+                                why = "vertex format";
+                        if (!why) why = ffv(ffm, (const float (*)[4])in, out);
+                        if (!why) {
+                            o->p[0] = out[0][0]; o->p[1] = out[0][1]; o->p[2] = out[0][2] / 16777215.0f; o->p[3] = out[0][3];
+                            memcpy(o->d0, out[3], 16); memcpy(o->d1, out[4], 16);
+                            for (unsigned u = 0; u < 4; ++u) memcpy(o->t[u], out[9 + u], 16);
+                            for (unsigned q = 0; q < 4; ++q) if (!isfinite(o->p[q]) || !isfinite(o->d0[q]) || !isfinite(o->d1[q])) stt = 1;
+                            for (unsigned u = 0; u < 4 && !stt; ++u)   /* nv2a_metal.m vertex_valid(): q > 0 per textured unit */
+                                if ((d->tmask >> u) & 1u) {
+                                    for (unsigned q = 0; q < 4; ++q) if (!isfinite(o->t[u][q])) stt = 2;
+                                    if (!(o->t[u][3] > 0.0f)) stt = 2;
+                                }
                         }
-                    if (!ok) { ++d->tris_dropped_q; ok = -1; }
+                        vstat[slot] = stt; verr[slot] = why;
+                    }
+                    if (verr[slot]) return verr[slot];
+                    if (i < d->idx_min) d->idx_min = i; if (i > d->idx_max) d->idx_max = i;
+                    v[j] = vc[slot];
+                    if (vstat[slot] == 1) { ok = 0; break; }
+                    if (vstat[slot] == 2 && ok == 1) { ++d->tris_dropped_q; ok = -1; }
                     continue;
                 }
                 if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
@@ -524,7 +607,8 @@ static int s_exit_registered;
 static int s_ffmode = -1;
 static unsigned long long s_ff_draws, s_ff_built, s_ff_compared, s_ff_exact, s_ff_within, s_ff_mm, s_ff_px, s_ff_px_mm,
                           s_ff_exec_changed, s_ff_host_changed, s_ff_tris_q;
-static unsigned s_ff_max_err[3], s_printed_vpoff, s_printed_cull, s_printed_diffuse, s_printed_stencil;
+static unsigned s_ff_max_err[3], s_printed_vpoff, s_printed_cull, s_printed_diffuse, s_printed_stencil, s_printed_stencil_x;
+static unsigned long long s_stencil_match, s_stencil_differ;
 static unsigned long long s_ff_diffuse_white, s_ff_diffuse_other, s_ff_prim[16];
 /* Mismatching FF draws by size and kind, so a run classifies all of them. */
 static unsigned long long s_ff_mm_size[4], s_ff_mm_cov_exec, s_ff_mm_cov_host, s_ff_mm_cov_same,
@@ -784,6 +868,32 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
                 R[0x308u / 4u], R[0x39Cu / 4u], R[0x3A0u / 4u], R[0x304u / 4u], R[0x344u / 4u], R[0x348u / 4u]);
     }
     if (cls == 2 && (c->prim < 5u || c->prim > 9u)) ++s_ff_prim[c->prim & 15u];
+    if (e.regs_valid && st(c, 0x32C, 0)) {                 /* stencil as the host would draw it, against the executor */
+        static D3D8Host2DDraw sd;
+        const uint32_t *R = e.regs;
+        const char *sw;
+        memset(&sd, 0, sizeof sd);
+        sd.depth_test = st(c, 0x30C, 0) != 0; sd.stencil_test = 1;
+        if ((sw = stencil_from_d3d(c, &sd))) { if (s_printed_stencil_x < 4 && ++s_printed_stencil_x)
+                fprintf(stderr, "[D3D8-HOST] draw %u stencil refused (%s): executor func %X ops %X/%X/%X mask %X ref %X control0 %X\n",
+                        c->serial, sw, R[0x364u / 4u], R[0x370u / 4u], R[0x374u / 4u], R[0x378u / 4u], R[0x360u / 4u],
+                        R[0x368u / 4u], R[0x290u / 4u]);
+        } else {
+            int same = R[0x32Cu / 4u] == 1u && R[0x364u / 4u] == sd.stencil_func && R[0x378u / 4u] == sd.stencil_zpass &&
+                       (!sd.depth_test || R[0x374u / 4u] == sd.stencil_zfail) && (R[0x360u / 4u] & 0xFFu) == (sd.stencil_mask & 0xFFu) &&
+                       (R[0x290u / 4u] & 1u) == sd.stencil_write && (R[0x368u / 4u] & 0xFFu) == (sd.stencil_ref & 0xFFu);
+            if (same) ++s_stencil_match;
+            else {
+                ++s_stencil_differ;
+                if (s_printed_stencil_x++ < 8)
+                    fprintf(stderr, "[D3D8-HOST] draw %u stencil: D3D func %X zfail %X zpass %X mask %X ref %X write %u |"
+                                    " executor enable %X func %X zfail %X zpass %X mask %X ref %X control0 %X\n", c->serial,
+                            sd.stencil_func, sd.stencil_zfail, sd.stencil_zpass, sd.stencil_mask, sd.stencil_ref, sd.stencil_write,
+                            R[0x32Cu / 4u], R[0x364u / 4u], R[0x374u / 4u], R[0x378u / 4u], R[0x360u / 4u], R[0x368u / 4u],
+                            R[0x290u / 4u]);
+            }
+        }
+    }
     if (c->rs_valid && e.regs_valid) {                      /* D3D's cull state against the executor's registers */
         uint32_t en = c->rs_cull != 0, face = 0x404u + (c->rs_cull != c->rs_front);
         if (e.regs[0x308u / 4u] != en || (en && e.regs[0x39Cu / 4u] != face) || e.regs[0x3A0u / 4u] != c->rs_front) {
@@ -998,7 +1108,16 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
 
 /* ---- draw mode ---- */
 static unsigned long long s_rep_tokens, s_replaced, s_rep_refused, s_rep_unbound, s_rep_noskip, s_replaced_2d, s_replaced_ff;
+static unsigned long long s_replaced_empty, s_replaced_stencil;
 static uint32_t s_skip_serial; static int s_skip_on; static unsigned long long s_skip_base;
+
+unsigned long long d3d8_host_2d_flip_count(void) { return s_flips; }
+static unsigned long long s_rep_ns_regs, s_rep_ns_build, s_rep_ff_evals, s_rep_ff_indices;
+static inline unsigned long long h2d_now_ns(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
 
 void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
 {
@@ -1025,16 +1144,26 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
     }
     if (cls == 2) {
         static uint32_t ffm[2048];
+        unsigned long long t0 = h2d_now_ns(), t1;
         if (!s_be.ff_vertex) { ++s_rep_refused; count_reason("no fixed-function evaluator in the backend"); return; }
-        if ((why = d3d8_host_ff_registers(c, ffm)) ||
-            (why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d))) {
-            ++s_rep_refused; count_reason(why); return;
-        }
+        why = d3d8_host_ff_registers(c, ffm);
+        t1 = h2d_now_ns(); s_rep_ns_regs += t1 - t0;
+        if (!why) why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d);
+        s_rep_ns_build += h2d_now_ns() - t1;
+        if (why) { ++s_rep_refused; count_reason(why); return; }
+        s_rep_ff_evals += d.ff_evals; s_rep_ff_indices += c->count;
     } else if ((why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d))) {
         ++s_rep_refused; count_reason(why); return;
     }
     ++s_built;
     if (d.tris_dropped_w) { ++s_draws_dropped_w; s_tris_dropped_w += d.tris_dropped_w; }
+    if (d.prim_empty) {                                   /* nothing either renderer draws: no encoder, no bind */
+        ++s_replaced; ++s_replaced_empty; if (cls == 2) ++s_replaced_ff; else ++s_replaced_2d;
+        s_be.exec_skip(1); s_skip_on = 1; s_skip_serial = c->serial;
+        s_skip_base = s_be.exec_skipped ? s_be.exec_skipped() : 0;
+        return;
+    }
+    if (d.stencil_test) ++s_replaced_stencil;
     /* Nothing to draw is still a draw the host has fully described: the
      * executor would draw nothing either (every triangle it would keep is
      * one the host kept). Replace it like any other. */
@@ -1245,9 +1374,11 @@ static void ff_report(const char *why)
     fprintf(stderr, "[D3D8-HOST-FF] %s cross-checks: executor mode 4 %llu, other %llu; executor did not draw %llu;"
                     " diffuse defaulted to white %llu | host COMPOSITE vs executor within 1e-3 %llu, beyond %llu |"
                     " VIEWPORT_OFFSET as the host assumes %llu, different %llu | cull state (D3D RS 127/128) as the"
-                    " executor's %llu, different %llu (both classes) | FF draws on unshadowed flips %llu (stride %u)\n",
+                    " executor's %llu, different %llu (both classes) | stencil state as the executor's %llu, different %llu"
+                    " | FF draws on unshadowed flips %llu (stride %u)\n",
             why, s_ff_mode4, s_ff_not_mode4, s_ff_exec_inactive, s_ff_diffuse_default, s_ff_composite_match,
-            s_ff_composite_differ, s_ff_vpoff_match, s_ff_vpoff_differ, s_cull_match, s_cull_differ, s_ff_unsampled,
+            s_ff_composite_differ, s_ff_vpoff_match, s_ff_vpoff_differ, s_cull_match, s_cull_differ, s_stencil_match,
+            s_stencil_differ, s_ff_unsampled,
             s_ff_stride);
     fprintf(stderr, "[D3D8-HOST-FF] %s mismatching draws by pixels over tolerance: 1-4 %llu, 5-32 %llu, 33-512 %llu,"
                     " >512 %llu | coverage: executor more %llu, host more %llu, same %llu | depth-mismatching draws by worst"
@@ -1278,6 +1409,17 @@ void d3d8_host_2d_report(const char *why)
                 s_have_be && s_be.external_binds ? s_be.external_binds() : 0ull,
                 s_have_be && s_be.exec_skipped ? s_be.exec_skipped() : 0ull, s_rep_noskip, s_rep_refused,
                 s_rep_unbound, s_no_backend, s_tris_dropped_w);
+        fprintf(stderr, "[D3D8-HOST-2D] %s draw mode classes: stencil (func ALWAYS) %llu, points/lines (nothing drawn) %llu\n",
+                why, s_replaced_stencil, s_replaced_empty);
+        {   /* In-process timers: where a replaced draw's host time goes. */
+            unsigned long long th = 0, tb = 0, thash = 0, nt = 0, ne = 0, r = s_replaced ? s_replaced : 1, rf = s_replaced_ff ? s_replaced_ff : 1;
+            if (s_have_be && s_be.external_stats) s_be.external_stats(&th, &tb, &thash, &nt, &ne);
+            fprintf(stderr, "[D3D8-HOST-2D] %s draw mode cost per replaced draw: FF registers %.1f us, FF build %.1f us"
+                            " (vertex evaluations %llu for %llu indices), texture %.1f us, whole host draw %.1f us | texture"
+                            " cache hits %llu, decodes %llu, hashes %llu\n", why,
+                    s_rep_ns_regs / 1000.0 / rf, s_rep_ns_build / 1000.0 / rf, s_rep_ff_evals, s_rep_ff_indices,
+                    nt / 1000.0 / r, ne / 1000.0 / r, th, tb, thash);
+        }
         {
             int any = 0;
             for (unsigned i = 0; i < NREASON && s_reason[i].why; ++i) {

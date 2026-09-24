@@ -130,6 +130,16 @@ typedef struct {
      * (hw_depth_state_for), and so does the host. zs_* name D3D's depth
      * surface (device +0x2074), whose contents the shadow seeds from. */
     uint32_t depth_test, depth_func, depth_write, stencil_test;
+    /* Stencil, as D3D pushed it, in NV097's encoding: the executor's
+     * hw_depth_state_for fields. Only func ALWAYS is built (the class the
+     * game draws: ALWAYS, zpass ZERO, colour on), so the stencil contents
+     * never decide a fragment and the shadow's colour comparison holds.
+     * stencil_write is CONTROL0's STENCIL_WRITE_ENABLE, which D3D sets for a
+     * depth surface with stencil (D24S8 / F24S8); the shadow checks all of
+     * these against the executor's registers. */
+    uint32_t stencil_func, stencil_ref, stencil_func_mask, stencil_mask;
+    uint32_t stencil_fail, stencil_zfail, stencil_zpass, stencil_write;
+    uint32_t prim_empty;                       /* points / lines / polygon: neither renderer draws them */
     uint32_t zs_addr, zs_pitch;
     float    z_min, z_max;                     /* over the emitted vertices */
     uint32_t control_perturbed;                /* RECOMP_D3D8_HOST_2D_CONTROL applied */
@@ -142,6 +152,7 @@ typedef struct {
     uint32_t idx_min, idx_max;                 /* over the indices drawn */
     uint32_t cls;                              /* d3d8_host_2d_class */
     uint32_t cull_face, front_cw;              /* as applied: 0 none, 0x404 front, 0x405 back */
+    uint32_t ff_evals;                         /* nv2a_ff_vertex calls: unique indices, not indices */
     uint32_t tris_dropped_q;                   /* textured unit q <= 0: the executor drops those too */
 } D3D8Host2DDraw;
 
@@ -234,6 +245,8 @@ typedef struct {
      * and on; exec_skipped counts the batches it has skipped. */
     int (*external_draw)(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
     unsigned long long (*external_binds)(void);   /* optional: how many draws the host bound first */
+    void (*external_stats)(unsigned long long *, unsigned long long *, unsigned long long *,
+                           unsigned long long *, unsigned long long *);   /* optional: d3d8_host_2d_metal_stats */
     /* G51.3: the executor's fixed-function vertex unit, for the FF shadow. */
     D3D8H2DFFVertexFn ff_vertex;
     void (*exec_skip)(int on);
@@ -264,6 +277,11 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c);
 void d3d8_host_2d_after(const D3D8HostDrawCheck *c);
 /* The renderer's draw-mode half: `d` into the executor's bound surface. */
 int  d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
+/* Draw mode's in-process timers and texture-cache counters (nanoseconds). */
+void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *tex_builds, unsigned long long *tex_hashes,
+                              unsigned long long *ns_texture, unsigned long long *ns_external);
+/* Flips seen by the shadow/draw bookkeeping (the texture cache revalidates once per flip). */
+unsigned long long d3d8_host_2d_flip_count(void);
 /* Draws for which the host bound the target first (nv2a_metal_bind). */
 unsigned long long d3d8_host_2d_metal_binds(void);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);
