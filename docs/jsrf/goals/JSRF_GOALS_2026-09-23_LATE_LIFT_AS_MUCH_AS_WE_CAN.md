@@ -521,3 +521,20 @@ merging or carrying flags at split entries.
   Frames are clean at the matching scene and at the later "Find Gum" line.
   Speed next: 65.6 against the reference's 83; binding drains the GPU at
   ~1.6 ms per bind.
+- **Host drawing at parity, and a found lever** (`b623999`). Tutorial, player
+  config, FLIP_PACE=0, 130 s, 0 faults:
+
+  | arm | fps | p50 ms | max ms |
+  |---|---|---|---|
+  | reference (mirror) | 83.0 | 12.5 | 17.2 |
+  | reference + `RECOMP_METAL_DEFER_SWAP=1` | **107.2** | 9.5 | 15.2 |
+  | FF+2D host draw | 84.2 | 12.0 | 17.4 |
+  | FF+2D host draw + defer | **107.7** | 9.5 | 44.9 |
+
+  With defer, VERIFY=60 gives FF 1,120 of 7,156 mismatching (1,083 of them
+  1–4 px, none over 512). The frames are clean at "Just get close to her".
+  The host's binds are the executor's own swap moved, and deferral removes
+  their drain (24.6 s → 9.6 ms). Pipelines now compile asynchronously.
+  **DEFER_SWAP has been off by default since G3 A2** because a guest CPU read
+  of a rendered surface (other than the flip) would see stale RAM. Whether
+  JSRF ever does that is the question before the default flips.
