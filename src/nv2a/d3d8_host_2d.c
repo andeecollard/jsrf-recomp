@@ -25,6 +25,13 @@ int d3d8_host_2d_is_2d(const D3D8HostDrawCheck *c)
 {
     return c->draw_kind != 0 && d3d8_host_2d_is_fvf_xyzrhw(c->vs_handle);
 }
+int d3d8_host_2d_class(const D3D8HostDrawCheck *c)
+{
+    if (!c->draw_kind) return 0;
+    if (d3d8_host_2d_is_fvf_xyzrhw(c->vs_handle)) return 1;
+    if (d3d8_host_2d_is_fvf_ff(c->vs_handle)) return 2;
+    return 0;
+}
 
 /* ---- building the draw from D3D state ---- */
 static const uint32_t k_st[11] = D3D8_HOST_STATE_METHODS;
@@ -170,14 +177,25 @@ const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, s
 const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
                                   int control, const uint16_t *given_idx, D3D8Host2DDraw *d)
 {
+    if (!d3d8_host_2d_is_2d(c)) return "not pre-transformed";
+    return d3d8_host_draw_build(c, ram, ram_size, control, given_idx, NULL, NULL, d);
+}
+
+const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
+                                 int control, const uint16_t *given_idx, const uint32_t *ffm,
+                                 D3D8H2DFFVertexFn ffv, D3D8Host2DDraw *d)
+{
     D3D8H2DVertex *verts = d->verts;
+    int cls = d3d8_host_2d_class(c);
     memset(d, 0, sizeof *d);
     d->verts = verts;
     d->serial = c->serial; d->fvf = c->vs_handle; d->prim = c->prim; d->count = c->count;
     d->draw_kind = c->draw_kind; d->ss_x = c->ss_x; d->ss_y = c->ss_y;
     d->idx_min = UINT32_MAX; d->idx_max = 0;
+    d->cls = (uint32_t)cls;
     if (!verts) return "no vertex buffer";
-    if (!d3d8_host_2d_is_2d(c)) return "not pre-transformed";
+    if (!cls) return "not a host class";
+    if (cls == 2 && (!ffm || !ffv)) return "no fixed-function register file or evaluator";
 
     /* Target. */
     if (!c->rt) return "no render target";
@@ -271,7 +289,8 @@ const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram
 
     /* Vertices: G41's arrays at the draw's indices. */
     if (!(c->va_on & 1u)) return "no position array";
-    if ((c->va_format[0] & 0xFFu) != 0x42u) return "position format";          /* float x 4 */
+    if (cls == 1 && (c->va_format[0] & 0xFFu) != 0x42u) return "position format";          /* float x 4 */
+    if (cls == 2 && (c->va_format[0] & 0xFFu) != 0x32u && (c->va_format[0] & 0xFFu) != 0x42u) return "position format";
     /* Triangles, strips, fans, quads and quad strips, triangulated exactly as
      * nv2a_metal_draw does (the order decides facing). Points, lines and
      * POLYGON (10) the executor refuses, so the host does not draw them. */
@@ -309,6 +328,32 @@ const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram
                 uint32_t i = idx[t3[j]];
                 float pos[4];
                 memset(&v[j], 0, sizeof v[j]);
+                if (cls == 2) {
+                    /* The executor's fixed-function vertex: every enabled
+                     * array fetched over defaults (w = 1; diffuse white as
+                     * for 2D, see s_diffuse_default), then its own unit. */
+                    float in[16][4], out[16][4];
+                    const char *why;
+                    for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0.0f; in[a][3] = 1.0f; }
+                    in[3][0] = in[3][1] = in[3][2] = 1.0f;
+                    for (unsigned a = 0; a < 16; ++a)
+                        if (((c->va_on >> a) & 1u) && !fetch(ram, ram_size, c->va_offset[a], c->va_format[a], i, in[a]))
+                            return "vertex format";
+                    if ((why = ffv(ffm, (const float (*)[4])in, out))) return why;
+                    if (i < d->idx_min) d->idx_min = i; if (i > d->idx_max) d->idx_max = i;
+                    v[j].p[0] = out[0][0]; v[j].p[1] = out[0][1]; v[j].p[2] = out[0][2] / 16777215.0f; v[j].p[3] = out[0][3];
+                    memcpy(v[j].d0, out[3], 16); memcpy(v[j].d1, out[4], 16);
+                    for (unsigned u = 0; u < 4; ++u) memcpy(v[j].t[u], out[9 + u], 16);
+                    for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].p[q]) || !isfinite(v[j].d0[q]) || !isfinite(v[j].d1[q])) ok = 0;
+                    if (!ok) break;
+                    for (unsigned u = 0; u < 4; ++u)             /* nv2a_metal.m vertex_valid(): q > 0 per textured unit */
+                        if ((d->tmask >> u) & 1u) {
+                            for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].t[u][q])) ok = 0;
+                            if (!(v[j].t[u][3] > 0.0f)) ok = 0;
+                        }
+                    if (!ok) { ++d->tris_dropped_q; ok = -1; }
+                    continue;
+                }
                 if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
                 float rhw = pos[3];
                 v[j].p[0] = d3d8_host_2d_snap(pos[0] * c->ss_x + D3D8H2D_SCREEN_OFFSET);
@@ -326,6 +371,7 @@ const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram
                 for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].p[q]) || !isfinite(v[j].d0[q]) || !isfinite(v[j].d1[q])) ok = 0;
                 if (!isfinite(v[j].p[3])) ok = 0;
             }
+            if (ok == -1) continue;                                /* counted in tris_dropped_q */
             if (!ok) { ++d->tris_dropped_w; continue; }           /* the executor drops it too */
             if (cull && culled(cull, front_cw, v[0].p, v[1].p, v[2].p)) continue;
             d->nverts += 3u; ++ntri;
@@ -465,6 +511,57 @@ static void count_reason(const char *why)
 }
 
 static void h2d_exit(void) { d3d8_host_2d_report("exit"); }
+static int s_exit_registered;
+
+/* ---- G51.3: the fixed-function class's own verdicts and refusals ---- */
+static int s_ffmode = -1;
+static unsigned long long s_ff_draws, s_ff_built, s_ff_compared, s_ff_exact, s_ff_within, s_ff_mm, s_ff_px, s_ff_px_mm,
+                          s_ff_exec_changed, s_ff_host_changed, s_ff_tris_q;
+static unsigned s_ff_max_err[3], s_printed_vpoff;
+static unsigned long long s_ff_mode4, s_ff_not_mode4, s_ff_exec_inactive, s_ff_diffuse_default,
+                          s_ff_composite_match, s_ff_composite_differ, s_ff_vpoff_match, s_ff_vpoff_differ;
+static struct { const char *why; unsigned long long n; } s_ff_reason[NREASON];
+static void count_reason_ff(const char *why)
+{
+    for (unsigned i = 0; i < NREASON; ++i) {
+        if (s_ff_reason[i].why == why) { ++s_ff_reason[i].n; return; }
+        if (!s_ff_reason[i].why) { s_ff_reason[i].why = why; s_ff_reason[i].n = 1; return; }
+    }
+}
+int d3d8_host_ff_mode(void)
+{
+    static atomic_flag s_init = ATOMIC_FLAG_INIT;
+    static _Atomic int s_ready;
+    if (atomic_load_explicit(&s_ready, memory_order_acquire)) return s_ffmode;
+    if (atomic_flag_test_and_set(&s_init)) {
+        while (!atomic_load_explicit(&s_ready, memory_order_acquire)) { }
+        return s_ffmode;
+    }
+    {
+        const char *e = getenv("RECOMP_D3D8_HOST_FF");
+        s_ffmode = e && (!strcmp(e, "shadow") || !strcmp(e, "1"));
+        if (e && e[0] && !s_ffmode && strcmp(e, "0") && strcmp(e, "off"))
+            fprintf(stderr, "[D3D8-HOST-FF] RECOMP_D3D8_HOST_FF=%s not understood; off (shadow)\n", e);
+        if (s_ffmode) {
+            d3d8_host_2d_mode();                          /* the shared knobs (tolerance, dump, control) */
+            fprintf(stderr, "[D3D8-HOST-FF] RECOMP_D3D8_HOST_FF=shadow: fixed-function 3D draws are drawn again by the"
+                            " host from D3D state (G42/G42b/G43 registers, the executor's own vertex unit) and compared"
+                            " with the executor%s\n", s_control ? " -- POSITIVE CONTROL applies here too" : "");
+            if (!s_exit_registered) { s_exit_registered = 1; atexit(h2d_exit); }
+        }
+    }
+    atomic_store_explicit(&s_ready, 1, memory_order_release);
+    return s_ffmode;
+}
+int d3d8_host_shadow_wants_handle(uint32_t h)
+{
+    return (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_fvf_xyzrhw(h)) || (d3d8_host_ff_mode() && d3d8_host_2d_is_fvf_ff(h));
+}
+int d3d8_host_shadow_wants(const D3D8HostDrawCheck *c)
+{
+    int cls = d3d8_host_2d_class(c);
+    return (cls == 1 && d3d8_host_2d_mode() == 1) || (cls == 2 && d3d8_host_ff_mode());
+}
 
 /* Read once. The mirror (guest thread) and the ring consumer (pusher
  * thread) can both ask first; the flag makes exactly one of them read the
@@ -509,7 +606,7 @@ int d3d8_host_2d_mode(void)
                                 " are drawn by the host into the executor's target, and the executor skips them%s\n",
                         s_control ? " -- POSITIVE CONTROL: host geometry +2 px, diffuse red inverted; the 2D layer on"
                                     " screen MUST look wrong" : "");
-            atexit(h2d_exit);
+            if (!s_exit_registered) { s_exit_registered = 1; atexit(h2d_exit); }
         }
     }
     atomic_store_explicit(&s_ready, 1, memory_order_release);
@@ -545,7 +642,7 @@ void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uin
     uint32_t w = (rt_size & 0xFFFu) + 1u;
     size_t bytes = (size_t)pitch * h;
     s_snap_valid = 0; s_zsnap_valid = 0;
-    if (!d3d8_host_2d_mode()) return;
+    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode()) return;
     ++s_pre;
     if (!s_have_be || ((rt_format >> 8) & 0xFFu) != 0x11u || addr + bytes > s_be.ram_size) { ++s_pre_skipped; return; }
     if (bytes > s_snap_cap) {
@@ -588,28 +685,35 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     static D3D8H2DVertex *verts;
     static D3D8Host2DDraw d;
     const char *why;
-    if (!d3d8_host_2d_mode()) return;
+    int cls = d3d8_host_2d_class(c);
+    if (!d3d8_host_shadow_wants(c)) return;
     ++s_draws;
+    if (cls == 2) ++s_ff_draws;
     memset(&e, 0, sizeof e);
     if (exec_source) exec_source(&e);
     /* Cross-checks, from the executor's side, never used to draw: is the class
      * the executor's mode 6, did it draw at all, and what did D3D program as
      * the pass-through's constants (c-38, c-37: slots 58, 59)? */
-    if (exec_source) {
+    if (exec_source && cls == 1) {
         if (e.exec_mode == 6u) ++s_mode6; else ++s_not_mode6;
         if (!e.active) ++s_exec_inactive;
     }
-    if (c->ffv_valid && (c->ffv_vs_flags & 0x2u)) ++s_vsflag_pass;
+    if (exec_source && cls == 2) {
+        if (e.exec_mode == 4u) ++s_ff_mode4; else ++s_ff_not_mode4;
+        if (!e.active) ++s_ff_exec_inactive;
+    }
+    if (cls == 1 && c->ffv_valid && (c->ffv_vs_flags & 0x2u)) ++s_vsflag_pass;
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && (c->format[u] & 3u) == 2u) { ++s_ctx_b; break; }
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && c->tss[u][28] != u) { ++s_tss_ci_off; break; }
-    if (!((c->va_on >> 3) & 1u)) ++s_diffuse_default;
+    if (cls == 1 && !((c->va_on >> 3) & 1u)) ++s_diffuse_default;
+    if (cls == 2 && !((c->va_on >> 3) & 1u)) ++s_ff_diffuse_default;
     /* The pass-through's constants as the executor holds them: the viewport
      * pair c-38 (scale: W/2, -H/2, 16777215) and c-37 (offset: W/2 + b,
      * H/2 + b), NV2A slots 58 and 59. Measured in tutorial run 4: c0/c1
      * (slots 96, 97) are zero on these draws, so the bias b is read here as
      * c-37.x - c-38.x and c-37.y + c-38.y, and must be the host's 0.53125,
      * with the z scale 16777215. */
-    if (e.regs_valid) {
+    if (cls == 1 && e.regs_valid) {
         float bx = e.vc[59][0] - e.vc[58][0], by = e.vc[59][1] + e.vc[58][1];
         if (bx != D3D8H2D_SCREEN_OFFSET || by != D3D8H2D_SCREEN_OFFSET || e.vc[58][2] != 16777215.0f) {
             ++s_pt_const_differ;
@@ -618,7 +722,7 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
                         c->serial, bx, by, e.vc[58][2], D3D8H2D_SCREEN_OFFSET);
         } else ++s_pt_const_match;
     }
-    if (s_printed_consts < 4 && e.regs_valid) {
+    if (cls == 1 && s_printed_consts < 4 && e.regs_valid) {
         ++s_printed_consts;
         fprintf(stderr, "[D3D8-HOST-2D] draw %u fvf=%03X exec mode %u prog_start %u: constants"
                         " c0 = %g %g %g %g, c1 = %g %g %g %g, c-38 = %g %g %g %g, c-37 = %g %g %g %g | host scale"
@@ -649,7 +753,37 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
                 if (at + 2u > s_be.ram_size || (uint16_t)(s_be.ram[at] | s_be.ram[at + 1] << 8) != idx[k]) { ++s_idx_changed; break; }
             }
         }
-        if ((why = d3d8_host_2d_build_ex(c, s_be.ram, s_be.ram_size, s_control, use, &d))) { count_reason(why); return; }
+        if (cls == 2) {
+            /* G51.3: the vertex unit's registers from D3D, evaluated by the
+             * executor's own nv2a_ff_vertex (handed in by the backend). */
+            static uint32_t ffm[2048];
+            if (!s_be.ff_vertex) { count_reason_ff("no fixed-function evaluator in the backend"); return; }
+            /* Cross-check, never used to draw: the host's COMPOSITE and
+             * VIEWPORT_OFFSET against the executor's latched registers. */
+            if (!d3d8_host_ff_registers(c, ffm) && e.regs_valid) {
+                double worst = 0, scale = 1e-6;
+                for (unsigned k = 0; k < 16; ++k) { float a; memcpy(&a, &ffm[0x680u / 4u + k], 4); if (fabs(a) > scale) scale = fabs(a); }
+                for (unsigned k = 0; k < 16; ++k) {
+                    float a, b; memcpy(&a, &ffm[0x680u / 4u + k], 4); memcpy(&b, &e.regs[0x680u / 4u + k], 4);
+                    if (fabs((double)a - b) / scale > worst) worst = fabs((double)a - b) / scale;
+                }
+                if (worst > 1e-3) ++s_ff_composite_differ; else ++s_ff_composite_match;
+                if (ffm[0xA20u / 4u] != e.regs[0xA20u / 4u] || ffm[0xA24u / 4u] != e.regs[0xA24u / 4u]) {
+                    ++s_ff_vpoff_differ;
+                    if (s_printed_vpoff++ < 4) {
+                        float x, y; memcpy(&x, &e.regs[0xA20u / 4u], 4); memcpy(&y, &e.regs[0xA24u / 4u], 4);
+                        fprintf(stderr, "[D3D8-HOST-FF] draw %u VIEWPORT_OFFSET: executor %g,%g, host 0.53125,0.53125\n", c->serial, x, y);
+                    }
+                } else ++s_ff_vpoff_match;
+            }
+            if ((why = d3d8_host_ff_registers(c, ffm)) ||
+                (why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d))) {
+                count_reason_ff(why); return;
+            }
+            ++s_ff_built; s_ff_tris_q += d.tris_dropped_q;
+        } else if ((why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d))) {
+            count_reason(why); return;
+        }
         /* Vertices: did the bytes the draw reaches change between the call and now? */
         if (c->vtx_hash_ok) {
             uint32_t imin = UINT32_MAX, imax = 0;
@@ -884,12 +1018,14 @@ void d3d8_host_2d_flip(void)
 {
     unsigned long long px = 0, mm = 0, fe = 0, fh = 0;
     unsigned worst[3] = { 0, 0, 0 }, bad = 0, nrec = s_nrec;
-    if (!d3d8_host_2d_mode()) return;
+    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode()) return;
     ++s_flips;
     if (s_mode == 2) {
         if (s_skip_on) { s_be.exec_skip(0); s_skip_on = 0; count_reason("skip still on at the flip"); }
-        if (s_flips % (unsigned long long)s_every == 0) d3d8_host_2d_report("periodic");
-        return;
+        if (!d3d8_host_ff_mode()) {
+            if (s_flips % (unsigned long long)s_every == 0) d3d8_host_2d_report("periodic");
+            return;
+        }
     }
     for (unsigned k = 0; k < s_nrec; ++k) {
         Rec *r = &s_rec[k];
@@ -897,6 +1033,12 @@ void d3d8_host_2d_flip(void)
         d3d8_host_2d_diff(r->pre, r->exec, r->host, r->w, r->h, s_tol, &df);
         ++s_compared;
         px += df.pixels; mm += df.mismatch; fe += df.exec_changed; fh += df.host_changed;
+        if (r->info.cls == 2) {
+            ++s_ff_compared; s_ff_px += df.pixels; s_ff_px_mm += df.mismatch;
+            s_ff_exec_changed += df.exec_changed; s_ff_host_changed += df.host_changed;
+            if (df.mismatch) ++s_ff_mm; else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_ff_within; else ++s_ff_exact;
+            for (int ch = 0; ch < 3; ++ch) if (df.max_err[ch] > s_ff_max_err[ch]) s_ff_max_err[ch] = df.max_err[ch];
+        }
         for (int ch = 0; ch < 3; ++ch) {
             if (df.max_err[ch] > worst[ch]) worst[ch] = df.max_err[ch];
             if (df.max_err[ch] > s_max_err[ch]) s_max_err[ch] = df.max_err[ch];
@@ -906,10 +1048,10 @@ void d3d8_host_2d_flip(void)
             if (s_printed_mm < 24) {
                 const D3D8Host2DDraw *i = &r->info;
                 ++s_printed_mm;
-                fprintf(stderr, "[D3D8-HOST-2D] flip %llu draw %u MISMATCH bbox %u,%u %ux%u: %llu of %llu px over"
+                fprintf(stderr, "[D3D8-HOST-%s] flip %llu draw %u MISMATCH bbox %u,%u %ux%u: %llu of %llu px over"
                                 " tolerance, max error r%u g%u b%u; executor changed %llu, host %llu%s | fvf %03X prim %u"
                                 " count %u tmask %X tex0 %02X %ux%u cc %u%s blend %u %X/%X alpha %u>%u dither %u\n",
-                        s_flips, r->serial, r->x0, r->y0, r->w, r->h, df.mismatch, df.pixels,
+                        r->info.cls == 2 ? "FF" : "2D", s_flips, r->serial, r->x0, r->y0, r->w, r->h, df.mismatch, df.pixels,
                         df.max_err[0], df.max_err[1], df.max_err[2], df.exec_changed, df.host_changed,
                         r->exec_active ? "" : " (EXECUTOR DID NOT DRAW IT)", i->fvf, i->prim, i->count, i->tmask,
                         i->tex[0].fmt, i->tex[0].width, i->tex[0].height, i->cc, i->pixel_shader ? " ps" : "",
@@ -972,11 +1114,34 @@ void d3d8_host_2d_get_stats(D3D8H2DStats *o)
     o->replace_tokens = s_rep_tokens; o->replaced = s_replaced; o->replace_refused = s_rep_refused;
     o->replace_unbound = s_rep_unbound; o->replaced_without_skip = s_rep_noskip;
     o->exec_batches_skipped = s_have_be && s_be.exec_skipped ? s_be.exec_skipped() : 0;
+    o->ff_draws = s_ff_draws; o->ff_built = s_ff_built; o->ff_compared = s_ff_compared; o->ff_exact = s_ff_exact;
+    o->ff_within = s_ff_within; o->ff_mismatching = s_ff_mm; o->ff_px = s_ff_px; o->ff_px_mismatch = s_ff_px_mm;
+}
+
+static void ff_report(const char *why)
+{
+    int any = 0;
+    if (s_ffmode <= 0) return;
+    fprintf(stderr, "[D3D8-HOST-FF] %s fixed-function draws=%llu built=%llu compared=%llu EXACT=%llu within_tolerance=%llu"
+                    " MISMATCHING=%llu | pixels in boxes=%llu executor_changed=%llu host_changed=%llu over_tolerance=%llu"
+                    " max_error r%u g%u b%u | triangles dropped for q <= 0 %llu\n",
+            why, s_ff_draws, s_ff_built, s_ff_compared, s_ff_exact, s_ff_within, s_ff_mm, s_ff_px, s_ff_exec_changed,
+            s_ff_host_changed, s_ff_px_mm, s_ff_max_err[0], s_ff_max_err[1], s_ff_max_err[2], s_ff_tris_q);
+    fprintf(stderr, "[D3D8-HOST-FF] %s cross-checks: executor mode 4 %llu, other %llu; executor did not draw %llu;"
+                    " diffuse defaulted to white %llu | host COMPOSITE vs executor within 1e-3 %llu, beyond %llu |"
+                    " VIEWPORT_OFFSET as the host assumes %llu, different %llu\n",
+            why, s_ff_mode4, s_ff_not_mode4, s_ff_exec_inactive, s_ff_diffuse_default, s_ff_composite_match,
+            s_ff_composite_differ, s_ff_vpoff_match, s_ff_vpoff_differ);
+    for (unsigned i = 0; i < NREASON && s_ff_reason[i].why; ++i) {
+        if (!any) { fprintf(stderr, "[D3D8-HOST-FF] %s not drawn by the host:", why); any = 1; }
+        fprintf(stderr, " %s=%llu;", s_ff_reason[i].why, s_ff_reason[i].n);
+    }
+    if (any) fprintf(stderr, "\n");
 }
 
 void d3d8_host_2d_report(const char *why)
 {
-    if (s_mode <= 0) return;
+    if (s_mode <= 0 && s_ffmode <= 0) return;
     if (s_mode == 2) {
         fprintf(stderr, "[D3D8-HOST-2D] %s draw mode: flips=%llu 2D tokens=%llu REPLACED=%llu (executor batches skipped"
                         " %llu, replaced draws the executor did not skip %llu) | left to the executor: refused %llu,"
@@ -992,8 +1157,7 @@ void d3d8_host_2d_report(const char *why)
             }
             if (any) fprintf(stderr, "\n");
         }
-        fflush(stderr);
-        return;
+        if (s_ffmode <= 0) { fflush(stderr); return; }
     }
     fprintf(stderr, "[D3D8-HOST-2D] %s flips=%llu 2d_draws=%llu (executor mode 6: %llu, other %llu; executor did not"
                     " draw %llu; D3D object pass-through flag %llu) pre_tokens=%llu (skipped %llu) no_pre=%llu"
@@ -1032,5 +1196,6 @@ void d3d8_host_2d_report(const char *why)
         }
         if (any) fprintf(stderr, "\n");
     }
+    ff_report(why);
     fflush(stderr);
 }

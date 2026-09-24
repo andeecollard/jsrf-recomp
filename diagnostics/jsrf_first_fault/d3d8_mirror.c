@@ -57,8 +57,8 @@ static int d3d8m_on(void)
         const char *e = getenv("RECOMP_D3D8_MIRROR");
         m = e && e[0] && strcmp(e, "0") != 0;
         fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_MIRROR=%s\n", m ? "on" : "off");
-        /* G51.1: the host's 2D shadow is fed by the mirror's checks. */
-        if (!m && d3d8_host_2d_mode()) {
+        /* G51.1/G51.3: the host's 2D and FF shadows are fed by the mirror's checks. */
+        if (!m && (d3d8_host_2d_mode() || d3d8_host_ff_mode())) {
             m = 1;
             fprintf(stderr, "[D3D8-MIRROR] armed by RECOMP_D3D8_HOST_2D\n");
         }
@@ -88,6 +88,7 @@ static uint32_t m_vc_written[6];
 void d3d8m_vs_constant(uint32_t reg, uint32_t data, uint32_t count)
 {
     int32_t first = (int32_t)reg + 96;
+    if (!d3d8m_on()) return;              /* in every build since G51.1: unarmed costs a cached test */
     for (uint32_t i = 0; i < count && i < 192u; ++i) {
         int32_t slot = first + (int32_t)i;
         if (slot < 0 || slot >= 192) continue;
@@ -103,13 +104,13 @@ void d3d8m_set_transform(uint32_t state, uint32_t pm)
     /* XDK 4134 numbering, measured 23 Sep: 0 VIEW, 1 PROJECTION, 2-5 TEXTURE0-3,
      * 6 WORLD, 7-9 WORLD1-3. */
     int k = state == 6u ? 0 : state == 0u ? 1 : state == 1u ? 2 : -1;
-    if (k < 0) return;
+    if (k < 0 || !d3d8m_on()) return;
     for (unsigned i = 0; i < 16; ++i) { uint32_t u = MEM32(pm + 4u * i); memcpy(&m_xf[k][i], &u, 4); }
     m_xf_seen |= 1u << k;
 }
-void d3d8m_set_pixel_shader(uint32_t handle) { m_ps_handle = handle; }
-void d3d8m_zenable(uint32_t v)       { m_set_state(0x30Cu, v != 0); }
-void d3d8m_stencilenable(uint32_t v) { m_set_state(0x32Cu, v != 0); }
+void d3d8m_set_pixel_shader(uint32_t handle) { if (d3d8m_on()) m_ps_handle = handle; }
+void d3d8m_zenable(uint32_t v)       { if (d3d8m_on()) m_set_state(0x30Cu, v != 0); }
+void d3d8m_stencilenable(uint32_t v) { if (d3d8m_on()) m_set_state(0x32Cu, v != 0); }
 
 /* SetRenderState_Simple(ecx = method header, edx = value): record each state
  * method's last value -- the render state a host renderer would receive. A
@@ -117,7 +118,7 @@ void d3d8m_stencilenable(uint32_t v) { m_set_state(0x32Cu, v != 0); }
 void d3d8m_simple(uint32_t hdr, uint32_t value)
 {
     uint32_t method = hdr & 0x1FFCu;
-    if (((hdr >> 18) & 0x7FFu) != 1u || ((hdr >> 13) & 7u)) return;
+    if (!d3d8m_on() || ((hdr >> 18) & 0x7FFu) != 1u || ((hdr >> 13) & 7u)) return;
     for (unsigned k = 0; k < 11; ++k)
         if (m_state_methods[k] == method) { m_state_val[k] = value; m_state_seen |= 1u << k; }
     for (unsigned k = 0; k < 8; ++k)
@@ -127,7 +128,7 @@ static unsigned long long m_no_token;
 
 void d3d8m_set_texture(uint32_t stage, uint32_t tex)
 {
-    if (stage < 4) m_tex[stage] = tex;
+    if (stage < 4 && d3d8m_on()) m_tex[stage] = tex;
 }
 
 /* G41 cross-check: what SetStreamSource(StreamNumber, pStreamData, Stride)
@@ -136,9 +137,9 @@ void d3d8m_set_texture(uint32_t stage, uint32_t tex)
 static uint32_t m_hk_stride[16], m_hk_vb[16], m_hk_stream_seen, m_hk_ib, m_hk_base, m_hk_ib_seen;
 void d3d8m_set_stream_source(uint32_t stream, uint32_t vb, uint32_t stride)
 {
-    if (stream < 16) { m_hk_vb[stream] = vb; m_hk_stride[stream] = stride; m_hk_stream_seen |= 1u << stream; }
+    if (stream < 16 && d3d8m_on()) { m_hk_vb[stream] = vb; m_hk_stride[stream] = stride; m_hk_stream_seen |= 1u << stream; }
 }
-void d3d8m_set_indices(uint32_t ib, uint32_t base) { m_hk_ib = ib; m_hk_base = base; m_hk_ib_seen = 1; }
+void d3d8m_set_indices(uint32_t ib, uint32_t base) { if (!d3d8m_on()) return; m_hk_ib = ib; m_hk_base = base; m_hk_ib_seen = 1; }
 
 /* G41: D3D's own stream/index state at the draw, and what its array setup
  * (sub_00196520, called by both draws) derives from it per NV2A array slot:
@@ -449,12 +450,12 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
 
 void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
-    uint32_t d, rt, zs, tok;
+    uint32_t d, rt, zs, tok, h;
     int mode;
-    if (!d3d8m_on() || !(mode = d3d8_host_2d_mode())) return;
-    d = MEM32(0x0019DCE0u);
-    if (!d3d8_host_2d_is_fvf_xyzrhw(MEM32(d + 0x384u))) return;
-    if (mode == 2) {
+    if (!d3d8m_on()) return;
+    mode = d3d8_host_2d_mode();
+    d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
+    if (mode == 2 && d3d8_host_2d_is_fvf_xyzrhw(h)) {
         /* Draw mode: the whole description goes ahead of the draw's commands.
          * The host draws it there, in the executor's target, and tells the
          * executor to skip the batches that follow until the check token. */
@@ -469,6 +470,7 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
         d3d8m_put_token(tok);
         return;
     }
+    if (!d3d8_host_shadow_wants_handle(h)) return;
     rt = MEM32(d + 0x2070u); zs = MEM32(d + 0x2074u);
     tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
                                    rt ? MEM32(rt + 0x10u) : 0u, zs ? MEM32(zs + 4u) : 0u, zs ? MEM32(zs + 0x10u) : 0u);
@@ -495,7 +497,7 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long
      * before the token is reached. */
-    if (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_fvf_xyzrhw(MEM32(MEM32(0x0019DCE0u) + 0x384u)))
+    if (d3d8_host_shadow_wants_handle(MEM32(MEM32(0x0019DCE0u) + 0x384u)))
         d3d8m_snap_indices(&c, kind, a2, a3);
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */

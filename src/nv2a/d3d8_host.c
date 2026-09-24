@@ -553,6 +553,50 @@ static void ffv_lazy(int g, const FfvList *emit, const FfvList *cur, const uint3
     if (m_emit && !m_cur) atomic_fetch_add(&s_fv_emit_only[g], 1);
 }
 
+const char *d3d8_host_ff_registers(const D3D8HostDrawCheck *c, uint32_t m[2048])
+{
+    static FfvList l;
+    D3D8FFTexXform to; D3D8FFLights lo; D3D8FFInvMV io;
+    memset(m, 0, 2048 * sizeof m[0]);
+    if (!c->ffv_valid) return "no fixed-function state";
+    if (c->ffv_vs_flags & 0x12u) return "not fixed-function (object flags 0x12)";
+    if (c->imv_cur.vertex_blend) return "vertex blending (skinning)";
+    if ((c->xf_seen & 7u) != 7u) return "world/view/projection not all seen";
+    ffv_fog_list(&c->fg_cur, &l);
+    if (l.n && l.r[0].value) return "fog";                           /* the executor refuses fog too */
+    ffv_texgen_list(c, &l);
+    for (unsigned k = 0; k < l.n; ++k) m[l.r[k].method / 4u] = l.r[k].value;
+    ffv_tx_list(&c->tx_cur, &l, &to);
+    if (to.unresolved) return "texture transform unresolved";
+    for (unsigned k = 0; k < l.n; ++k) m[l.r[k].method / 4u] = l.r[k].value;
+    ffv_light_list(&c->lt_cur, &l, &lo);
+    if (lo.unresolved) return "lighting unresolved (specular parameters)";
+    for (unsigned k = 0; k < l.n; ++k) m[l.r[k].method / 4u] = l.r[k].value;
+    ffv_imv_list(&c->imv_cur, &l, &io);
+    for (unsigned k = 0; k < l.n; ++k) m[l.r[k].method / 4u] = l.r[k].value;
+    if (io.emitted)
+        for (unsigned k = 0; k < 16; ++k) m[(0x0480u + 4u * k) / 4u] = io.modelview[4u * (k % 4u) + k / 4u];
+    m[0x03A4u / 4u] = c->imv_cur.normalize != 0;                      /* NORMALIZATION_ENABLE */
+    {   /* COMPOSITE: transpose(WORLD*VIEW*PROJECTION*VIEWPORT), G39's formula. */
+        double wv[4][4], wvp[4][4], mm[4][4], vp[4][4] = {{0}};
+        const float *W = c->xf_world, *V = c->xf_view, *P = c->xf_proj;
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double a = 0; for (int k = 0; k < 4; ++k) a += (double)W[i*4+k] * V[k*4+j]; wv[i][j] = a; }
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double a = 0; for (int k = 0; k < 4; ++k) a += wv[i][k] * P[k*4+j]; wvp[i][j] = a; }
+        double sx = c->vp_w * 0.5 * c->ss_x, sy = c->vp_h * 0.5 * c->ss_y;
+        vp[0][0] = sx; vp[1][1] = -sy; vp[2][2] = 16777215.0 * (c->vp_maxz - c->vp_minz); vp[3][3] = 1;
+        vp[3][0] = c->vp_x * c->ss_x + sx; vp[3][1] = c->vp_y * c->ss_y + sy; vp[3][2] = 16777215.0 * c->vp_minz;
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double a = 0; for (int k = 0; k < 4; ++k) a += wvp[i][k] * vp[k][j]; mm[i][j] = a; }
+        for (int r = 0; r < 4; ++r) for (int q = 0; q < 4; ++q) {
+            float f = (float)mm[q][r]; memcpy(&m[(0x0680u + 4u * (4u * (unsigned)r + (unsigned)q)) / 4u], &f, 4);
+        }
+    }
+    {   float b = 0.53125f; memcpy(&m[0x0A20u / 4u], &b, 4); memcpy(&m[0x0A24u / 4u], &b, 4); }
+    return NULL;
+}
+
 int d3d8_host_check_ff_vertex(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextures *e)
 {
     static FfvList emit, cur;           /* big; the check runs on one thread */
@@ -944,10 +988,10 @@ static void on_token(uint32_t parameter)
         check_draw(&s_slot[i].check);
         /* G51.1: the host draws the same draw over the snapshot the kind-2
          * token took. Only pre-transformed 2D draws, only when armed. */
-        if (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_2d(&s_slot[i].check))
+        if (d3d8_host_2d_mode() == 2)
+            d3d8_host_2d_after(&s_slot[i].check);             /* closes draw mode's skip */
+        if (d3d8_host_shadow_wants(&s_slot[i].check))         /* 2D shadow, G51.3 FF shadow */
             d3d8_host_2d_post(&s_slot[i].check, s_exec_source);
-        else if (d3d8_host_2d_mode() == 2)
-            d3d8_host_2d_after(&s_slot[i].check);
     } else if (s_slot[i].kind == 3) {
         d3d8_host_2d_replace(&s_slot[i].check);
     } else if (s_slot[i].kind == 2) {

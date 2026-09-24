@@ -48,8 +48,12 @@ int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *o
 /* G51.1 draw mode: let a host renderer draw into the surface the executor has
  * BOUND, in order with the executor's own work. Only when that surface is
  * `target` (and, when `depth` is not NULL, its depth is `depth`) and the
- * hardware path with the 565 attachment holds it; otherwise returns 0 and
- * does nothing, and the caller must let the executor draw. `encode` receives
+ * hardware path with the 565 attachment holds it. Returns 1 when drawn;
+ * otherwise nothing is done, the caller must let the executor draw, and the
+ * value says why: 0 the encoder declined, -1 not the hardware 565 path,
+ * -2 no valid surface bound (none yet, or dropped by a sync/invalidate),
+ * -3 a different colour target is bound, -4 the same colour target with a
+ * different depth surface. `encode` receives
  * the render encoder (an id<MTLRenderCommandEncoder> as void *) of a pass
  * over colour B5G6R5Unorm, depth Depth32Float and stencil Stencil8, all
  * loaded and stored, plus the surface size; it returns nonzero if it encoded

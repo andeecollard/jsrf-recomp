@@ -227,6 +227,9 @@ VALUE_CARRYING = {
     "RECOMP_D3D8_HOST_2D_DUMP",
     "RECOMP_D3D8_HOST_2D_DUMP_MAX",
     "RECOMP_D3D8_HOST_2D_EVERY",
+    # G51.3: the fixed-function class's shadow. A mode like RECOMP_D3D8_HOST_2D
+    # ("shadow", with "draw" to come), not a boolean.
+    "RECOMP_D3D8_HOST_FF",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

@@ -4572,9 +4572,10 @@ int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int wr
                              int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx)
 {
     draw_thread_check();
-    if (!encode || !target || !hw_state_on() || !hw_565_on() || !surface || !surface_valid
-            || surface_target != target || !hw_depth_tex || !hw_stencil_tex) return 0;
-    if (depth && depth_target != depth) return 0;
+    if (!encode || !target || !hw_state_on() || !hw_565_on()) return -1;
+    if (!surface || !surface_valid || !hw_depth_tex || !hw_stencil_tex) return -2;
+    if (surface_target != target) return -3;
+    if (depth && depth_target != depth) return -4;
     batch_flush();
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = surface;

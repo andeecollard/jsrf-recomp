@@ -54,6 +54,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int nv2a_metal_sync_range(uint8_t *target, size_t bytes);
 extern int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *out);
 extern void nv2a_pb_exec_host_skip(int on);
+extern const char *nv2a_ff_vertex(const uint32_t m[2048], const float in[16][4], float out[16][4]);
 extern unsigned long long nv2a_pb_exec_host_skipped(void);
 #endif
 static int pad_sentinel(void);
@@ -5148,7 +5149,7 @@ int main(int argc, char **argv)
              * pre-transformed 2D class again with its own Metal pipeline and
              * compares it with the executor at every flip. Unset, nothing is
              * registered and the flip hook stays NULL. */
-            if (d3d8_host_2d_mode()) {
+            if (d3d8_host_2d_mode() || d3d8_host_ff_mode()) {
                 extern void nv2a_pb_exec_set_flip_hook(void (*)(void));
                 D3D8Host2DBackend be;
                 memset(&be, 0, sizeof be);
@@ -5163,6 +5164,8 @@ int main(int argc, char **argv)
                 be.external_draw = d3d8_host_2d_metal_external;
                 be.exec_skip = nv2a_pb_exec_host_skip;
                 be.exec_skipped = nv2a_pb_exec_host_skipped;
+                /* G51.3: the FF shadow evaluates vertices with the executor's own unit. */
+                be.ff_vertex = nv2a_ff_vertex;
                 d3d8_host_2d_set_backend(&be);
                 nv2a_pb_exec_set_flip_hook(d3d8_host_2d_flip);
             }

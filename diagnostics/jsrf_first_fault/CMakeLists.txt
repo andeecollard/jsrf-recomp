@@ -191,6 +191,72 @@ elseif(JSRF_DSOUND_LIFT)
     message(STATUS "DSOUND lift: ${_ds_n} overlay sources, ${_ds_replaced} replacing gen files (RECOMP_DSOUND_LIFT=1 arms it)")
 endif()
 
+# THE D3D8 MIRROR, IN EVERY BUILD (G51.1). The D3D census wrappers, the
+# mirror's hooks and d3d8_mirror.c -- what RECOMP_D3D8_MIRROR=1 and
+# RECOMP_D3D8_HOST_2D=shadow|draw need -- were only in a gen staged by hand,
+# so the player's JSRF.app could not run the host's 2D draws. Staged here at
+# configure time in --overlay mode, like the DSOUND lift. The two overlays
+# rewrite some of the same generated files (recomp_0008.c holds D3D and DSOUND
+# functions both), so this one takes the DSOUND overlay as its --base: a file
+# both change is edited from the DSOUND overlay's version and carries both
+# sets of wrappers, and it replaces that overlay's copy in the build.
+#
+# Compiled in is not switched on. With RECOMP_D3D8_MIRROR, RECOMP_D3D8_CENSUS
+# and RECOMP_D3D8_HOST_2D unset, every D3D entry point pays one predictable
+# branch and the mirror's hooks one cached test. macOS only: the host's 2D
+# renderer is Metal.
+if(APPLE)
+    set(_jsrf_d3d8_mirror_default ON)
+else()
+    set(_jsrf_d3d8_mirror_default OFF)
+endif()
+option(JSRF_D3D8_MIRROR "Compile the D3D census wrappers and the D3D mirror over the gen (RECOMP_D3D8_MIRROR / RECOMP_D3D8_HOST_2D arm them)"
+       ${_jsrf_d3d8_mirror_default})
+if(JSRF_D3D8_MIRROR AND EXISTS "${RECOMP_GEN_DIR}/D3D8_CENSUS_MANIFEST.txt")
+    message(STATUS "D3D8 mirror: gen is already staged (${RECOMP_GEN_DIR}); no overlay")
+elseif(JSRF_D3D8_MIRROR)
+    find_program(JSRF_PYTHON3 NAMES python3 REQUIRED)
+    set(_dm_overlay "${CMAKE_BINARY_DIR}/d3d8_overlay")
+    set(_dm_stage "${CMAKE_CURRENT_SOURCE_DIR}/stage_d3d8_census.py")
+    set(_dm_entries "${XBOXRECOMP_DIR}/experiments/d3d8_boundary/entry_points.json")
+    set(_dm_base)
+    if(DEFINED _ds_overlay AND EXISTS "${_ds_overlay}")
+        set(_dm_base --base "${_ds_overlay}")
+    endif()
+    execute_process(
+        COMMAND "${JSRF_PYTHON3}" "${_dm_stage}" "${RECOMP_GEN_DIR}" "${_dm_overlay}"
+                --entries "${_dm_entries}" --mirror --overlay ${_dm_base}
+        RESULT_VARIABLE _dm_rc OUTPUT_VARIABLE _dm_out ERROR_VARIABLE _dm_err)
+    if(NOT _dm_rc EQUAL 0)
+        message(FATAL_ERROR "D3D8 mirror overlay failed (set -DJSRF_D3D8_MIRROR=OFF to build without it):\n${_dm_out}${_dm_err}")
+    endif()
+    file(GLOB _dm_overlay_sources "${_dm_overlay}/*.c")
+    set(_dm_replaced 0)
+    foreach(_f IN LISTS _dm_overlay_sources)
+        get_filename_component(_n "${_f}" NAME)
+        # Replace whichever copy the build holds now: the gen's, or the
+        # DSOUND overlay's (which this one was built on).
+        foreach(_cand "${RECOMP_GEN_DIR}/${_n}" "${_ds_overlay}/${_n}")
+            list(FIND RECOMP_GEN_SOURCES "${_cand}" _i)
+            if(NOT _i EQUAL -1)
+                list(REMOVE_AT RECOMP_GEN_SOURCES ${_i})
+                math(EXPR _dm_replaced "${_dm_replaced} + 1")
+            endif()
+        endforeach()
+        list(APPEND RECOMP_GEN_SOURCES "${_f}")
+    endforeach()
+    file(STRINGS "${_dm_overlay}/D3D8_CENSUS_MANIFEST.txt" _dm_manifest REGEX "^sub_.* file=")
+    set(_dm_deps "${_dm_stage}" "${_dm_entries}" "${CMAKE_CURRENT_SOURCE_DIR}/d3d8_mirror.c")
+    foreach(_l IN LISTS _dm_manifest)
+        string(REGEX REPLACE ".* file=" "" _gf "${_l}")
+        list(APPEND _dm_deps "${RECOMP_GEN_DIR}/${_gf}")
+    endforeach()
+    list(REMOVE_DUPLICATES _dm_deps)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_dm_deps})
+    list(LENGTH _dm_overlay_sources _dm_n)
+    message(STATUS "D3D8 mirror: ${_dm_n} overlay sources, ${_dm_replaced} replacing gen/overlay files (RECOMP_D3D8_MIRROR=1 or RECOMP_D3D8_HOST_2D=shadow|draw arms it)")
+endif()
+
 # Optimisation.
 #
 # The recompiled title -- 1.3M lines of generated C, and the guest's own code,
@@ -1154,7 +1220,9 @@ if(APPLE)
     # bookkeeping (pre token, post token, flip) through a fake backend. Under
     # both of the executor's samplers.
     add_executable(jsrf_d3d8_host_2d_test d3d8_host_2d_test.c
-        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c")
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c"
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c"
+        "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c")
     target_link_libraries(jsrf_d3d8_host_2d_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_d3d8_host_2d COMMAND jsrf_d3d8_host_2d_test)
     add_test(NAME jsrf_d3d8_host_2d_hwtex COMMAND jsrf_d3d8_host_2d_test)
