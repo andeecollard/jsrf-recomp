@@ -242,7 +242,7 @@ typedef struct {
 
 /* 0 off, 1 shadow, 2 draw. Reads RECOMP_D3D8_HOST_2D once. */
 int  d3d8_host_2d_mode(void);
-/* G51.3: 0 off, 1 shadow. RECOMP_D3D8_HOST_FF=shadow: fixed-function 3D
+/* G51.3: 0 off, 1 shadow, 2 draw. RECOMP_D3D8_HOST_FF=shadow: fixed-function 3D
  * draws are drawn by the host into the same kind of scratch crop and
  * compared with the executor exactly as the 2D shadow does.
  *
@@ -252,6 +252,10 @@ int  d3d8_host_2d_mode(void);
  * flip (default 60; 1 = every flip) is shadowed -- all of its FF draws --
  * and the flips between cost nothing but a token per draw. */
 int  d3d8_host_ff_mode(void);
+/* Does draw mode replace a draw with this vertex shader handle? (2D with
+ * RECOMP_D3D8_HOST_2D=draw, fixed-function with RECOMP_D3D8_HOST_FF=draw.) */
+int  d3d8_host_replaces_handle(uint32_t vs_handle);
+int  d3d8_host_any_draw_mode(void);
 /* Does the shadow take this draw (pre and post tokens)? */
 int  d3d8_host_shadow_wants(const D3D8HostDrawCheck *c);
 int  d3d8_host_shadow_wants_handle(uint32_t vs_handle);
@@ -280,6 +284,7 @@ typedef struct {
                        replaced_without_skip;
     /* G51.3, fixed-function 3D in shadow: the same per-draw verdicts. */
     unsigned long long ff_draws, ff_built, ff_compared, ff_exact, ff_within, ff_mismatching, ff_px, ff_px_mismatch;
+    unsigned long long replaced_2d, replaced_ff;
 } D3D8H2DStats;
 void d3d8_host_2d_get_stats(D3D8H2DStats *out);
 

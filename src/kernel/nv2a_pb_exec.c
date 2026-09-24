@@ -6785,6 +6785,9 @@ void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *out)
     _Static_assert(sizeof out->regs == sizeof s_methods, "G42: the exec source copies the whole method shadow");
     out->regs_valid = 1;
     memcpy(out->regs, s_methods, sizeof out->regs);
+    /* G51.3: what an attribute slot without an array reads. */
+    out->cur_valid = 1;
+    memcpy(out->cur, s_vsh.current, sizeof out->cur);
     out->active = s_copy.active;
     if (!s_copy.active) return;
     out->mask = c->untextured ? 0u : (c->texture_mask & 0xFu);

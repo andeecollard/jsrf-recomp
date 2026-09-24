@@ -58,7 +58,7 @@ static int d3d8m_on(void)
         m = e && e[0] && strcmp(e, "0") != 0;
         fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_MIRROR=%s\n", m ? "on" : "off");
         /* G51.1/G51.3: the host's 2D and FF shadows are fed by the mirror's checks. */
-        if (!m && (d3d8_host_2d_mode() || d3d8_host_ff_mode())) {
+        if (!m && (d3d8_host_2d_mode() || d3d8_host_ff_mode())) {   /* shadow or draw, either class */
             m = 1;
             fprintf(stderr, "[D3D8-MIRROR] armed by%s%s\n", d3d8_host_2d_mode() ? " RECOMP_D3D8_HOST_2D" : "",
                     d3d8_host_ff_mode() ? " RECOMP_D3D8_HOST_FF" : "");
@@ -448,6 +448,14 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
         for (unsigned k = 0; k < 32; ++k) c->tss[u][k] = MEM32(0x0019DEE0u + 4u * (32u * u + k));
     c->vs_handle = MEM32(d + 0x384u);
     if (m_ps_handle) { c->ps_bound = 1; for (unsigned k = 0; k < 57; ++k) c->ps[k] = MEM32(0x0019E0E0u + 4u * k); }
+    /* G51.3: the fixed-function vertex unit's inputs, as read at the draw --
+     * what d3d8_host_ff_registers transcribes (G42/G42b verified them). */
+    if (d3d8_host_2d_is_fvf_ff(c->vs_handle)) {
+        d3d8m_tx_read(&c->tx_cur); d3d8m_lt_read(&c->lt_cur); d3d8m_imv_read(&c->imv_cur);
+        c->ffv_fog_color = RS(D3D8FF_RS_FOGCOLOR);
+        memcpy(c->xf_world, m_xf[0], sizeof c->xf_world); memcpy(c->xf_view, m_xf[1], sizeof c->xf_view);
+        memcpy(c->xf_proj, m_xf[2], sizeof c->xf_proj); c->xf_seen = m_xf_seen;
+    }
 }
 
 void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
@@ -457,7 +465,8 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     if (!d3d8m_on()) return;
     mode = d3d8_host_2d_mode();
     d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
-    if (mode == 2 && d3d8_host_2d_is_fvf_xyzrhw(h)) {
+    (void)mode;
+    if (d3d8_host_replaces_handle(h)) {
         /* Draw mode: the whole description goes ahead of the draw's commands.
          * The host draws it there, in the executor's target, and tells the
          * executor to skip the batches that follow until the check token. */

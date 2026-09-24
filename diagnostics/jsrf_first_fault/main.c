@@ -5149,7 +5149,7 @@ int main(int argc, char **argv)
              * pre-transformed 2D class again with its own Metal pipeline and
              * compares it with the executor at every flip. Unset, nothing is
              * registered and the flip hook stays NULL. */
-            if (d3d8_host_2d_mode() || d3d8_host_ff_mode()) {
+            if (d3d8_host_2d_mode() || d3d8_host_ff_mode()) {       /* shadow or draw, 2D or fixed-function */
                 extern void nv2a_pb_exec_set_flip_hook(void (*)(void));
                 D3D8Host2DBackend be;
                 memset(&be, 0, sizeof be);
