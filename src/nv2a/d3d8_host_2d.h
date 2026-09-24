@@ -3,8 +3,9 @@
 /* G51.1: THE FIRST HOST-DRAWN CLASS -- PRE-TRANSFORMED 2D, IN SHADOW.
  *
  * A draw whose vertex shader handle is an FVF with an XYZRHW position (the
- * HUD, text, fades and overlays; the executor sees them as transform
- * execution mode 6, D3D's pass-through program) is drawn a second time by the
+ * HUD, text, fades and overlays; the executor sees them in transform
+ * execution MODE PROGRAM, D3D's pass-through program -- raw 0x1E94 value 6,
+ * which is MODE 2 with RANGE_MODE PRIV, see NV2A_XF_MODE) is drawn a second time by the
  * host, from D3D state alone, with its own Metal pipeline, into a private
  * copy of the frame -- never into the executor's surfaces. The two results
  * are then compared pixel for pixel over the region the draw touched.
@@ -184,7 +185,7 @@ static inline int d3d8_host_2d_is_fvf_xyzrhw(uint32_t handle)
 }
 int d3d8_host_2d_is_2d(const D3D8HostDrawCheck *c);
 /* G51.3: an FVF whose position is XYZ or XYZ plus blend weights (0x002,
- * 0x006..0x00E): the fixed-function transform, the executor's mode 4. */
+ * 0x006..0x00E): the fixed-function transform, the executor's MODE FIXED (raw 4). */
 static inline int d3d8_host_2d_is_fvf_ff(uint32_t handle)
 {
     return !(handle & 1u) && (handle & 0x00Eu) != 0x004u && (handle & 0x00Eu) != 0u;
@@ -288,10 +289,10 @@ typedef struct {
     /* Optional: d3d8_host_2d_metal_spec_stats, for the draw-mode report. */
     void (*spec_stats)(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
     /* Optional (G51.2 positive control): the executor's own begin/end batches
-     * by transform mode (0x1E94) -- [0] mode 4 (FF), [1] mode 6
-     * (pass-through), [2] anything else (a program) -- counted whether or not
+     * by 0x1E94's MODE field -- [0] FIXED, [1] PROGRAM (the 2D pass-through
+     * and the title's shaders alike), [2] the reserved values -- counted whether or not
      * the mirror is armed, so a zero on the host's side is visibly wrong. */
-    void (*exec_mode_counts)(unsigned long long out[3]);
+    void (*exec_mode_counts)(unsigned long long out[9]);   /* [3..5] skipped, [6..8] drawn by the executor */
 } D3D8Host2DBackend;
 
 /* ONE ARMING FUNCTION (G51.2: RECOMP_D3D8_HOST_VS alone did not arm the
@@ -405,7 +406,7 @@ typedef struct {
     unsigned long long replaced_exec_stopped_host_empty, replaced_exec_stopped_host_drew;
     /* G51.3, fixed-function 3D in shadow: the same per-draw verdicts. */
     unsigned long long ff_draws, ff_built, ff_compared, ff_exact, ff_within, ff_mismatching, ff_px, ff_px_mismatch;
-    unsigned long long replaced_2d, replaced_ff;
+    unsigned long long replaced_2d, replaced_ff, replaced_vs;
 } D3D8H2DStats;
 void d3d8_host_2d_get_stats(D3D8H2DStats *out);
 

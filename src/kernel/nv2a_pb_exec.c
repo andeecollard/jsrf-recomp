@@ -3847,10 +3847,15 @@ static unsigned long long s_host_skipped, s_host_seen;
 void nv2a_pb_exec_host_skip_late(int on) { s_host_skip_late = on; }
 void nv2a_pb_exec_host_skip(int on) { s_host_skip = on; }
 unsigned long long nv2a_pb_exec_host_skipped(void) { return s_host_skipped; }
-/* G51.2 positive control: begin/end batches by transform mode, always counted
+/* G51.2 positive control: begin/end batches by 0x1E94's MODE field (FIXED,
+ * PROGRAM, reserved) -- the same field s_vsh.mode holds -- always counted
  * (one increment a batch), read by the host's census. */
-static unsigned long long s_exec_mode_batches[3];
-void nv2a_pb_exec_mode_counts(unsigned long long out[3]) { memcpy(out, s_exec_mode_batches, sizeof s_exec_mode_batches); }
+/* [0..2] begin/end batches, [3..5] of those that reached the rasteriser with
+ * the host's skip on (skipped), [6..8] that reached it and were drawn by the
+ * executor -- each by MODE: FIXED, PROGRAM, reserved. */
+static unsigned long long s_exec_mode_batches[9];
+void nv2a_pb_exec_mode_counts(unsigned long long out[9]) { memcpy(out, s_exec_mode_batches, sizeof s_exec_mode_batches); }
+static inline unsigned exec_mode_slot(void) { uint32_t m = s_methods[0x1E94u / 4u] & 3u; return m == 0u ? 0u : m == 2u ? 1u : 2u; }
 /* Batches that ARRIVED while the skip was on, skipped or not: a batch the
  * executor stopped before its rasteriser (fewer than 3 indices, a refused
  * vertex or texture state) is seen and not skipped, and drew nothing. */
@@ -5829,7 +5834,8 @@ static void raster_batch(void)
             return;
         }
     }
-    if (s_host_skip && !s_host_skip_late) { s_copy.active = 0; ++s_host_skipped; return; }
+    if (s_host_skip && !s_host_skip_late) { s_copy.active = 0; ++s_host_skipped; ++s_exec_mode_batches[3 + exec_mode_slot()]; return; }
+    ++s_exec_mode_batches[6 + exec_mode_slot()];
     unsigned long long _t_vsh = pb_now_us();
     int _vsh_ok = prepare_vertices();
     pb_stage_add(PB_STAGE_VSH, _t_vsh);
@@ -6633,8 +6639,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
             }
             s_imm_count = 0; s_imm_overflow = 0;
             s_gpu.prim = param;
-            {   uint32_t xm = s_methods[0x1E94u / 4u];
-                ++s_exec_mode_batches[xm == 4u ? 0 : xm == 6u ? 1 : 2]; }
+            ++s_exec_mode_batches[exec_mode_slot()];   /* MODE; bits 31:2 of 0x1E94 are RANGE_MODE */
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;
         } else {

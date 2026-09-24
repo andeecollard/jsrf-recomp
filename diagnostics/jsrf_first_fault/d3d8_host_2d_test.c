@@ -1761,11 +1761,119 @@ static void case_vs(D3D8HostDrawCheck *c)
     c->ffc_cur.tss[0][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_DIFFUSE;
     c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
 }
+/* The CPU interpreter's outputs for a built programmable draw, as a
+ * pre-transformed draw (class 1) with the hardware's 1/16 snap and colour
+ * saturation: the reference both the shadow and the draw-mode tests use. */
+static void vs_reference(const D3D8Host2DDraw *d, D3D8Host2DDraw *r, D3D8H2DVertex *rv)
+{
+    NV2AVshProgram prog;
+    memset(&prog, 0, sizeof prog);
+    nv2a_vsh_parse(jsrf_vsh_words, (int)(sizeof jsrf_vsh_words / 16u), &prog);
+    *r = *d; r->cls = 1; r->verts = rv; r->nverts = d->vs_nidx;
+    for (unsigned k = 0; k < d->vs_nidx; ++k) {
+        float in[16][4]; NV2AVshResult o; unsigned slot = 0;
+        for (unsigned q = 0; q < 16; ++q) { in[q][0] = in[q][1] = in[q][2] = 0; in[q][3] = 1; }
+        in[3][0] = in[3][1] = in[3][2] = 1;
+        for (unsigned q = 0; q < 16; ++q) if (d->vs_inputs & (1u << q)) memcpy(in[q], d->vs_in[d->vs_idx[k] * d->vs_nattrs + slot++], 16);
+        memset(&o, 0, sizeof o);
+        nv2a_vsh_execute(&prog, (const float (*)[4])in, (const float (*)[4])d->vs_c, &o);
+        memset(&rv[k], 0, sizeof rv[k]);
+        rv[k].p[0] = fabsf(o.output[0][0]) < 1048576.0f ? truncf(o.output[0][0] * 16.0f) / 16.0f : o.output[0][0];
+        rv[k].p[1] = fabsf(o.output[0][1]) < 1048576.0f ? truncf(o.output[0][1] * 16.0f) / 16.0f : o.output[0][1];
+        rv[k].p[2] = o.output[0][2] / 16777215.0f; rv[k].p[3] = o.output[0][3];
+        for (unsigned ch = 0; ch < 4; ++ch) {
+            rv[k].d0[ch] = fminf(1.0f, fmaxf(0.0f, o.output[3][ch]));
+            rv[k].d1[ch] = fminf(1.0f, fmaxf(0.0f, o.output[4][ch]));
+        }
+        for (unsigned u = 0; u < 4; ++u) memcpy(rv[k].t[u], o.output[9 + u], 16);
+    }
+}
+/* G51.2 DRAW MODE: the programmable draw into the executor's own bound
+ * surface (d3d8_host_2d_metal_external), against the CPU interpreter's
+ * outputs drawn the same way; then the controller: replace() draws it and
+ * turns the executor's skip on, after() turns it off. */
+static void vs_draw_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static D3D8H2DVertex rv[64];
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    D3D8HostDrawCheck c; D3D8Host2DDraw d, r;
+    D3D8H2DDiff df;
+    const char *why;
+    CHECK(d3d8_host_vs_mode() == 2 && d3d8_host_any_draw_mode(), "RECOMP_D3D8_HOST_VS=draw arms draw mode");
+    case_vs(&c);
+    CHECK(d3d8_host_replaces_handle(c.vs_handle), "draw mode replaces an odd (programmable) handle");
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, (const uint16_t *)(ram + IB), NULL, NULL, &d);
+    CHECK(!why, "built (%s)", why ? why : "ok");
+    if (why) return;
+    vs_reference(&d, &r, rv);
+    /* The binder's first draw into a fresh surface differs from its later
+     * ones (by up to 15 steps of green over ~860 px, the dither/rounding of a
+     * first upload); take the starting pixels after a warm-up, from the
+     * executor's surface itself, for each arm. */
+    background(rt); logo_depth(); draw_binder(rt); nv2a_metal_sync();
+    {   static uint16_t bg0[RTPITCH / 2 * RTH], base2[RTPITCH / 2 * RTH];
+        background(bg0);
+        memcpy(rt, bg0, sizeof bg0); logo_depth(); draw_binder(rt); nv2a_metal_sync(); memcpy(bg, rt, sizeof bg);
+        CHECK(d3d8_host_2d_metal_external(&d, ram, RAM_SIZE), "the host drew the program into the executor's surface (%s)",
+              d3d8_host_2d_metal_last_error());
+        nv2a_metal_sync(); memcpy(a, rt, sizeof a);
+        memcpy(rt, bg0, sizeof bg0); logo_depth(); draw_binder(rt); nv2a_metal_sync(); memcpy(base2, rt, sizeof base2);
+        CHECK(!memcmp(base2, bg, sizeof bg), "the executor's surface starts both arms the same");
+        CHECK(d3d8_host_2d_metal_external(&r, ram, RAM_SIZE), "the reference drew into the executor's surface");
+        nv2a_metal_sync(); memcpy(b, rt, sizeof b);
+        memcpy(bg, bg0, sizeof bg);                        /* what the later steps reset RAM to */
+        memcpy(bg0, base2, sizeof base2);
+        d3d8_host_2d_diff(bg0, b, a, RTPITCH / 2, RTH, 0, &df); }
+    printf("  programmable VS draw mode: reference changed %llu px, host %llu, differing %llu, max r%u g%u b%u\n",
+           df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1], df.max_err[2]);
+    CHECK(df.exec_changed > 2000 && df.mismatch == 0 && df.max_err[0] + df.max_err[1] + df.max_err[2] == 0,
+          "programmable VS draw mode: in the executor's surface, identical to the CPU interpreter's");
+    /* CONTROL: every other triangle dropped. */
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 1, (const uint16_t *)(ram + IB), NULL, NULL, &d);
+    memcpy(rt, bg, sizeof bg); logo_depth(); draw_binder(rt);
+    CHECK(!why && d3d8_host_2d_metal_external(&d, ram, RAM_SIZE), "programmable VS draw mode CONTROL: drew");
+    nv2a_metal_sync(); memcpy(a, rt, sizeof a);
+    d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
+    CHECK(df.mismatch > 500, "programmable VS draw mode CONTROL: the surface holds the perturbed draw (%llu px differ)", df.mismatch);
+    /* The controller. */
+    {   D3D8Host2DBackend be; D3D8H2DStats s0, s1;
+        memset(&be, 0, sizeof be);
+        be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
+        be.last_error = d3d8_host_2d_metal_last_error; be.external_draw = d3d8_host_2d_metal_external;
+        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped; be.exec_seen = fake_seen; be.external_binds = d3d8_host_2d_metal_binds;
+        be.ff_vertex = nv2a_ff_vertex;
+        d3d8_host_2d_set_backend(&be);
+        memcpy(rt, bg, sizeof bg); logo_depth(); draw_binder(rt);
+        case_vs(&c); snapshot_at_call(&c);
+        d3d8_host_2d_get_stats(&s0);
+        d3d8_host_2d_replace(&c);
+        CHECK(g_fake_skip == 1, "programmable VS draw mode: replace() drew and turned the executor's skip on (%s)",
+              d3d8_host_2d_metal_last_error());
+        if (g_fake_skip) ++g_fake_skipped;
+        d3d8_host_2d_after(&c);
+        d3d8_host_2d_get_stats(&s1);
+        CHECK(g_fake_skip == 0 && s1.replaced_vs == s0.replaced_vs + 1 && s1.replaced == s0.replaced + 1,
+              "programmable VS draw mode: after() turned it off; replaced once, counted as programmable");
+        nv2a_metal_sync();
+        d3d8_host_2d_diff(bg, b, rt, RTPITCH / 2, RTH, 0, &df);
+        CHECK(df.exec_changed > 2000 && df.mismatch == 0, "programmable VS draw mode: what replace() drew is the reference (%llu px differ)",
+              df.mismatch);
+        /* A program the translator cannot take is left to the executor. */
+        case_vs(&c); c.vs_nwords = 0; snapshot_at_call(&c);
+        d3d8_host_2d_get_stats(&s0);
+        d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
+        d3d8_host_2d_get_stats(&s1);
+        CHECK(g_fake_skip == 0 && s1.replaced == s0.replaced, "programmable VS draw mode: no captured program, left to the executor");
+    }
+}
 static void vs_tests(void)
 {
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
     static D3D8H2DVertex rv[64];
-    D3D8HostDrawCheck c; D3D8Host2DDraw d, r; NV2AVshProgram prog;
+    D3D8HostDrawCheck c; D3D8Host2DDraw d, r;
     const char *why;
     CHECK(d3d8_host_vs_mode() == 1, "RECOMP_D3D8_HOST_VS=shadow arms the programmable class");
     case_vs(&c);
@@ -1776,28 +1884,7 @@ static void vs_tests(void)
           why ? why : "built", d.vs_nidx, d.vs_nin, d.vs_nattrs);
     if (why) return;
     /* The reference: the program on the CPU interpreter, per corner. */
-    memset(&prog, 0, sizeof prog);
-    nv2a_vsh_parse(jsrf_vsh_words, (int)(sizeof jsrf_vsh_words / 16u), &prog);
-    r = d; r.cls = 1; r.verts = rv; r.nverts = d.vs_nidx;
-    for (unsigned k = 0; k < d.vs_nidx; ++k) {
-        float in[16][4]; NV2AVshResult o; unsigned slot = 0;
-        for (unsigned q = 0; q < 16; ++q) { in[q][0] = in[q][1] = in[q][2] = 0; in[q][3] = 1; }
-        in[3][0] = in[3][1] = in[3][2] = 1;
-        for (unsigned q = 0; q < 16; ++q) if (d.vs_inputs & (1u << q)) memcpy(in[q], d.vs_in[d.vs_idx[k] * d.vs_nattrs + slot++], 16);
-        memset(&o, 0, sizeof o);
-        nv2a_vsh_execute(&prog, (const float (*)[4])in, (const float (*)[4])d.vs_c, &o);
-        memset(&rv[k], 0, sizeof rv[k]);
-        /* The hardware's screen-space fixup, as the emitted program does it:
-         * x and y truncated to 1/16 pixel, colours saturated. */
-        rv[k].p[0] = fabsf(o.output[0][0]) < 1048576.0f ? truncf(o.output[0][0] * 16.0f) / 16.0f : o.output[0][0];
-        rv[k].p[1] = fabsf(o.output[0][1]) < 1048576.0f ? truncf(o.output[0][1] * 16.0f) / 16.0f : o.output[0][1];
-        rv[k].p[2] = o.output[0][2] / 16777215.0f; rv[k].p[3] = o.output[0][3];
-        for (unsigned ch = 0; ch < 4; ++ch) {
-            rv[k].d0[ch] = fminf(1.0f, fmaxf(0.0f, o.output[3][ch]));
-            rv[k].d1[ch] = fminf(1.0f, fmaxf(0.0f, o.output[4][ch]));
-        }
-        for (unsigned u = 0; u < 4; ++u) memcpy(rv[k].t[u], o.output[9 + u], 16);
-    }
+    vs_reference(&d, &r, rv);
     background(bg); memcpy(a, bg, sizeof bg); memcpy(b, bg, sizeof bg);
     CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0,
           "the host drew it through the executor's translation (%s)", d3d8_host_2d_metal_last_error());
@@ -1881,6 +1968,7 @@ static void arming_tests(void)
     }
     CHECK(armed_alone("RECOMP_D3D8_HOST_2D", "draw", &mask) == 1 && mask == 1u, "RECOMP_D3D8_HOST_2D=draw alone arms the mirror");
     CHECK(armed_alone("RECOMP_D3D8_HOST_FF", "draw", &mask) == 1 && mask == 2u, "RECOMP_D3D8_HOST_FF=draw alone arms the mirror");
+    CHECK(armed_alone("RECOMP_D3D8_HOST_VS", "draw", &mask) == 1 && mask == 4u, "RECOMP_D3D8_HOST_VS=draw alone arms the mirror");
 #ifdef JSRF_SRC_DIR
     {   static const char *const files[] = { JSRF_SRC_DIR "/diagnostics/jsrf_first_fault/d3d8_mirror.c",
                                              JSRF_SRC_DIR "/diagnostics/jsrf_first_fault/main.c" };
@@ -2066,6 +2154,13 @@ int main(int argc, char **argv)
     }
     if (argc > 1 && strcmp(argv[1], "arming") == 0) {       /* G51.2: one arming function */
         arming_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "vsdraw") == 0) {       /* G51.2: the programmable class, draw mode */
+        setenv("RECOMP_D3D8_HOST_VS", "draw", 1);
+        d3d8_host_2d_metal_set_spec_sync(1);
+        vs_draw_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }

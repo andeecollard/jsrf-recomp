@@ -884,13 +884,14 @@ static void check_draw(const D3D8HostDrawCheck *c)
             fprintf(stderr, "[D3D8-MIRROR] draw %u vertex program MISMATCH handle %08X at word %u of %u: d3d %08X | exec %08X\n",
                     c->serial, c->vs_handle, k, c->vs_nwords, c->vs_words[k], e.vs_words[k]);
     }
-    /* Fixed-function transform (execution mode 4). Measured 23 Sep: the NV2A
+    /* Fixed-function transform (execution MODE FIXED; the raw 0x1E94 word is 4
+     * with RANGE_MODE PRIV). Measured 23 Sep: the NV2A
      * model-view register block is transpose(WORLD*VIEW) and the composite is
      * transpose(WORLD*VIEW*PROJECTION*VIEWPORT), D3D's row-vector matrices, with
      * VIEWPORT scaling x by W/2 and y by -H/2 about the centre (supersample
      * scaled) and z by 16777215*(MaxZ-MinZ) from 16777215*MinZ. Checked with a
      * relative tolerance: D3D composes in single precision in its own order. */
-    if (c->vs_kind == 0 && e.exec_mode == 4u && (c->xf_seen & 7u) == 7u) {
+    if (c->vs_kind == 0 && NV2A_XF_IS_FIXED(e.exec_mode) && (c->xf_seen & 7u) == 7u) {
         double wv[4][4], wvp[4][4], m[4][4], vp[4][4] = {{0}};
         const float *W = c->xf_world, *V = c->xf_view, *P = c->xf_proj;
         for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {

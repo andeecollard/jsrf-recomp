@@ -1,5 +1,18 @@
 #ifndef D3D8_HOST_H
 #define D3D8_HOST_H
+/* NV097_SET_TRANSFORM_EXECUTION_MODE (0x1E94) is TWO fields (nv2a_regs.h):
+ * MODE in bits 1:0 (0 FIXED, 2 PROGRAM) and RANGE_MODE in bits 31:2 (0 USER,
+ * 1 PRIV). D3D writes both with RANGE_MODE PRIV, so the raw 4 is FIXED and
+ * the raw 6 is PROGRAM -- every program, D3D's own 2D pass-through and the
+ * title's shaders alike. Until G51.2's positive control the host's reports
+ * compared the raw word with 4 and 6 and called them "mode 4" and "mode 6";
+ * decode it here and nowhere else. */
+#define NV2A_XF_MODE(raw)      ((uint32_t)(raw) & 3u)
+#define NV2A_XF_RANGE(raw)     ((uint32_t)(raw) >> 2)
+#define NV2A_XF_MODE_FIXED     0u
+#define NV2A_XF_MODE_PROGRAM   2u
+#define NV2A_XF_IS_FIXED(raw)   (NV2A_XF_MODE(raw) == NV2A_XF_MODE_FIXED)
+#define NV2A_XF_IS_PROGRAM(raw) (NV2A_XF_MODE(raw) == NV2A_XF_MODE_PROGRAM)
 /* HOST WORK BEHIND A RING TOKEN (G37).
  *
  * A D3D entry point replaced by host code computes the NV2A commands its
@@ -229,7 +242,7 @@ typedef struct {
     uint32_t tex_address[4], tex_filter[4], tex_control0[4];   /* raw NV2A texture registers per unit */
     uint32_t vs_words[136 * 4];                /* the executor's program memory, slot 0 up */
     float    ff_modelview[16], ff_composite[16], ff_projection[16];   /* 0x480, 0x680, 0x440 */
-    uint32_t exec_mode, prog_start, composite_ever_written, vsh_mode_internal;
+    uint32_t exec_mode, prog_start, composite_ever_written, vsh_mode_internal;   /* exec_mode: 0x1E94 RAW, decode below */
     /* G41: filled whether or not `active` is set. The executor's raw vertex
      * array registers (0x1720/0x1760 + 4i) and the indices it drew last. */
     int      va_valid;

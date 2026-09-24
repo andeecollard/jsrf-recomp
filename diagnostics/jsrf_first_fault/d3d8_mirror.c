@@ -438,6 +438,28 @@ static void d3d8m_snap_indices(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a2,
  * the G39-G43 checks' emission tracking, which this must not disturb. Before
  * the call is correct for all of it: the title has set its state and bound
  * its buffers, and the draw changes none of what is read here. */
+/* G51.2: the bound program and the constant file, for both tokens -- the
+ * check behind the draw and, in RECOMP_D3D8_HOST_VS=draw, the replace token
+ * ahead of it. Object flag 0x10 is SetVertexShader's LoadVertexShader(h, 0) +
+ * SelectVertexShader path, i.e. the program is loaded at slot 0. Measured 23
+ * Sep: every programmable object this title binds carries it. */
+static void d3d8m_vs_capture(D3D8HostDrawCheck *c, uint32_t h)
+{
+    memcpy(c->vc, m_vc, sizeof c->vc); memcpy(c->vc_written, m_vc_written, sizeof c->vc_written);
+    c->vs_kind = 0; c->vs_nwords = 0;
+    if ((h & 1u) && (MEM32(h - 1u + 4u) & 0x10u)) {
+        uint32_t obj = h - 1u, n = MEM32(obj + 0xCu), at = 0;
+        c->vs_kind = 1;
+        while (at < n && n < 4096u) {
+            uint32_t hdr = MEM32(obj + 0x114u + 4u * at), cnt = (hdr >> 18) & 0x7FFu, meth = hdr & 0x1FFCu;
+            if ((hdr & 0xE0030003u) != 0 || !cnt || at + 1u + cnt > n) { c->vs_kind = 2; break; }
+            if (meth >= 0x0B00u && meth < 0x0B80u)
+                for (uint32_t i = 0; i < cnt && c->vs_nwords < 136u * 4u; ++i)
+                    c->vs_words[c->vs_nwords++] = MEM32(obj + 0x114u + 4u * (at + 1u + i));
+            at += 1u + cnt;
+        }
+    }
+}
 static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     uint32_t d = MEM32(0x0019DCE0u);
@@ -469,6 +491,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     for (unsigned u = 0; u < 4; ++u)
         for (unsigned k = 0; k < 32; ++k) c->tss[u][k] = MEM32(0x0019DEE0u + 4u * (32u * u + k));
     c->vs_handle = MEM32(d + 0x384u);
+    d3d8m_vs_capture(c, c->vs_handle);
     if (m_ps_handle) { c->ps_bound = 1; for (unsigned k = 0; k < 57; ++k) c->ps[k] = MEM32(0x0019E0E0u + 4u * k); }
     /* G51.3: the fixed-function vertex unit's inputs, as read at the draw --
      * what d3d8_host_ff_registers transcribes (G42/G42b verified them). */
@@ -590,29 +613,13 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
         { uint32_t u; u = MEM32(d + 0x9E0u); memcpy(&c.vp_minz, &u, 4); u = MEM32(d + 0x9E4u); memcpy(&c.vp_maxz, &u, 4);
           u = MEM32(d + 0x454u); memcpy(&c.ss_x, &u, 4); u = MEM32(d + 0x458u); memcpy(&c.ss_y, &u, 4); } }
     memcpy(c.st_val, m_state_val, sizeof c.st_val); c.st_seen = m_state_seen;
-    memcpy(c.vc, m_vc, sizeof c.vc); memcpy(c.vc_written, m_vc_written, sizeof c.vc_written);
     for (unsigned u = 0; u < 4; ++u)
         for (unsigned k = 0; k < 32; ++k) c.tss[u][k] = MEM32(0x0019DEE0u + 4u * (32u * u + k));
     memcpy(c.xf_world, m_xf[0], sizeof c.xf_world); memcpy(c.xf_view, m_xf[1], sizeof c.xf_view);
     memcpy(c.xf_proj, m_xf[2], sizeof c.xf_proj); c.xf_seen = m_xf_seen;
     {   uint32_t d = MEM32(0x0019DCE0u), h = MEM32(d + 0x384u);
         c.vs_handle = h;
-
-        /* Object flag 0x10 is SetVertexShader's LoadVertexShader(h, 0) +
-         * SelectVertexShader path, i.e. the program is loaded at slot 0. Measured
-         * 23 Sep: every programmable object this title binds carries it. */
-        if ((h & 1u) && (MEM32(h - 1u + 4u) & 0x10u)) {
-            uint32_t obj = h - 1u, n = MEM32(obj + 0xCu), at = 0;
-            c.vs_kind = 1;
-            while (at < n && n < 4096u) {
-                uint32_t hdr = MEM32(obj + 0x114u + 4u * at), cnt = (hdr >> 18) & 0x7FFu, meth = hdr & 0x1FFCu;
-                if ((hdr & 0xE0030003u) != 0 || !cnt || at + 1u + cnt > n) { c.vs_kind = 2; break; }
-                if (meth >= 0x0B00u && meth < 0x0B80u)
-                    for (uint32_t i = 0; i < cnt && c.vs_nwords < 136u * 4u; ++i)
-                        c.vs_words[c.vs_nwords++] = MEM32(obj + 0x114u + 4u * (at + 1u + i));
-                at += 1u + cnt;
-            }
-        } }
+        d3d8m_vs_capture(&c, h); }
     if (m_ps_handle) {
         /* D3D's own current view of the pixel-shader registers: SetPixelShader
          * copies the 57-word definition into D3D_g_RenderState[0..56]
