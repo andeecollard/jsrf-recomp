@@ -357,6 +357,7 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
         uint32_t light_mask=m[0x3bc/4];
         for(unsigned light=0;light<8;++light)
             if(((light_mask>>(2*light))&3)>1) return "fixed-function local / spot light";
+        unsigned material=nv2a_ff_lit_material(m);
         for(unsigned k=0;k<3;++k) {
             float illumination=value(m,0xa10+4*k);
             for(unsigned light=0;light<8;++light) if(((light_mask>>(2*light))&3)==1) {
@@ -375,7 +376,7 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
                 float ndotl=fmaxf(0,(normal[0]*direction[0]+normal[1]*direction[1]+normal[2]*direction[2]));
                 illumination+=value(m,base+4*k)+ndotl*value(m,base+0x0c+4*k);
             }
-            out[3][k]=clamp01(value(m,0x3a8+4*k)+in[3][k]*illumination);
+            out[3][k]=clamp01(value(m,0x3a8+4*k)+((material&1u)?1.0f:in[3][k])*illumination);
         }
         /* NV097_SET_MATERIAL_ALPHA is the composite-matrix problem again, one
          * register wide: zero-initialised state multiplies the vertex alpha by
@@ -396,7 +397,9 @@ const char *nv2a_ff_vertex(const uint32_t m[2048],const float in[16][4],float ou
                         " alpha by the zero-initialised register\n");
             material_alpha=1.0f;
         }
-        out[3][3]=clamp01(in[3][3]*material_alpha);
+        out[3][3]=clamp01(((material&1u)?1.0f:in[3][3])*material_alpha);
+        if(material&2u) out[4][0]=out[4][1]=out[4][2]=0;
+        if(material&4u) { out[4][0]=out[4][1]=out[4][2]=0; out[4][3]=1; }
     }
     for(unsigned u=0;u<4;++u) {
         float generated[4];
@@ -574,6 +577,39 @@ int nv2a_ff_clip_w_ok(const float pos[4])
     return 0;
 }
 
+/* RECOMP_FF_MATERIAL (24 Sep 2026, pale characters in Rokkaku-dai).
+ *
+ * The lighting below multiplies the lit sum by the VERTEX diffuse and leaves
+ * D1 as the raw vertex specular. xemu's vsh-ff.c does neither when the state
+ * says otherwise, and [FF-LIT] says every lit batch in Rokkaku has
+ * NV097_SET_COLOR_MATERIAL 0x0298 = 0 (every colour from the material),
+ * NV097_SET_LIGHT_CONTROL 0x0294 bit 0 (separate specular) and
+ * NV097_SET_SPECULAR_ENABLE 0x03B8 = 1, with NO specular array -- so D1 was
+ * whatever inline value an earlier draw latched, and the final combiner's
+ * specular add put it on Beat's hair, glasses, skates and face.
+ *
+ *   bit 0  diffuse source is the material (0x0298 bits 5:4 == 0): the light
+ *          sum is not multiplied by the vertex diffuse, and alpha is the
+ *          material alpha alone.
+ *   bit 1  specular enabled and separate: D1.rgb is the LIT specular. Not
+ *          modelled yet (it needs xemu's reconstruct_specular_power from
+ *          NV097_SET_SPECULAR_PARAMS), so it is 0 -- no highlights, which is
+ *          wrong by a highlight rather than by the whole surface. D1.a stays
+ *          the vertex specular alpha, as xemu keeps it.
+ *   bit 2  specular disabled: D1 = (0,0,0,1), as xemu writes it.
+ */
+static int ff_material_on(void)
+{ static int on=-1; if(on<0){ const char *e=getenv("RECOMP_FF_MATERIAL"); on=e&&*e&&strcmp(e,"0")!=0; } return on; }
+unsigned nv2a_ff_lit_material(const uint32_t m[2048])
+{
+    unsigned bits=0;
+    if(!m[0x314/4] || !ff_material_on()) return 0;
+    if(((m[0x298/4]>>4)&3)==0) bits|=1u;
+    if(!m[0x3b8/4]) bits|=4u;
+    else if(m[0x294/4]&1u) bits|=2u;
+    return bits;
+}
+
 /* THE LIT-BATCH CENSUS (24 Sep 2026, pale characters in Rokkaku-dai).
  *
  * The lighting above models D0 as emission + diffuse*(ambient + sum N.L) and
@@ -650,6 +686,7 @@ int nv2a_ff_key(const uint32_t m[2048],NV2AFFKey *key)
             if(mode>1) { ++nv2a_ff_gpu_no_light; ++nv2a_ff_gpu_cpu_batches; return 0; }
             if(mode==1) key->lights|=(uint8_t)(1u<<light);
         }
+        key->material=(uint8_t)nv2a_ff_lit_material(m);
     }
     /* A DEGENERATE NORMAL IS THE ONE THING A VERTEX FUNCTION CANNOT DO.
      *

@@ -1047,14 +1047,24 @@ int nv2a_ff_generate_msl(const NV2AFFKey *key, char *buf, int bufsize)
                 at + 0, at + 0, at + 0,
                 i, at + 1, at + 1, at + 1);
         }
-        sb_append(&sb,
-            "    oD0.x = ff_clamp01(c[%d].x + v3.x * illum.x);\n"
-            "    oD0.y = ff_clamp01(c[%d].y + v3.y * illum.y);\n"
-            "    oD0.z = ff_clamp01(c[%d].z + v3.z * illum.z);\n"
-            "    oD0.w = ff_clamp01(v3.w * c[%d].w);\n"
-            "\n",
-            NV2A_FF_C_MATERIAL, NV2A_FF_C_MATERIAL, NV2A_FF_C_MATERIAL,
-            NV2A_FF_C_MATERIAL);
+        /* key->material: see nv2a_ff_lit_material() in nv2a_ff.c. Bit 0 takes
+         * the diffuse from the material, so the vertex colour drops out. */
+        {   const char *dif = (key->material & 1u) ? "dmat" : "v3";
+            if (key->material & 1u)
+                sb_append(&sb, "    float4 dmat = float4(1.0f);\n");
+            sb_append(&sb,
+                "    oD0.x = ff_clamp01(c[%d].x + %s.x * illum.x);\n"
+                "    oD0.y = ff_clamp01(c[%d].y + %s.y * illum.y);\n"
+                "    oD0.z = ff_clamp01(c[%d].z + %s.z * illum.z);\n"
+                "    oD0.w = ff_clamp01(%s.w * c[%d].w);\n"
+                "\n",
+                NV2A_FF_C_MATERIAL, dif, NV2A_FF_C_MATERIAL, dif,
+                NV2A_FF_C_MATERIAL, dif, dif, NV2A_FF_C_MATERIAL);
+            if (key->material & 2u)
+                sb_append(&sb, "    oD1.x = 0.0f; oD1.y = 0.0f; oD1.z = 0.0f;\n\n");
+            if (key->material & 4u)
+                sb_append(&sb, "    oD1 = float4(0.0f, 0.0f, 0.0f, 1.0f);\n\n");
+        }
     }
 
     /* G53: the fog coordinate, as nv2a_ff.c's fog_coord() forms it,
@@ -1062,7 +1072,7 @@ int nv2a_ff_generate_msl(const NV2AFFKey *key, char *buf, int bufsize)
      * sums). The factor is the fragment's job. */
     switch (key->fog) {
     case NV2A_FF_FOG_SPEC_ALPHA:
-        sb_append(&sb, "    oFog.x = ff_clamp01(oD1.w);\n\n"); break;
+        sb_append(&sb, "    oFog.x = ff_clamp01(v4.w);\n\n"); break;   /* the INPUT specular alpha, as fog_coord() reads in[4] */
     case NV2A_FF_FOG_X:
         sb_append(&sb, "    oFog.x = v5.x;\n\n"); break;
     case NV2A_FF_FOG_RADIAL: case NV2A_FF_FOG_PLANAR: case NV2A_FF_FOG_ABS_PLANAR:

@@ -100,7 +100,7 @@ extern unsigned long nv2a_ff_texmat_unset, nv2a_ff_texmat_zero,
  * fixed-function epilogue must not either, even though the programmable
  * emitter's epilogue does. Two paths, two tails, and they are not the same.
  */
-#define NV2A_FF_KEY_VERSION 2u   /* 2: the fog byte (G53) */
+#define NV2A_FF_KEY_VERSION 3u   /* 2: the fog byte (G53); 3: the material byte */
 typedef struct {
     uint8_t  version;        /* NV2A_FF_KEY_VERSION: an old cached shader for a
                               * new emitter is a wrong picture with no error */
@@ -117,7 +117,11 @@ typedef struct {
     uint8_t  fog;            /* G53: 0 FOG_ENABLE off (oFog stays 0), else the
                               * fog coordinate's source, NV2A_FF_FOG_*. */
     uint16_t inputs;         /* attribute mask, ascending, for [[attribute(n)]] */
-    uint8_t  pad[4];         /* keep sizeof 32 and every byte defined */
+    uint8_t  material;       /* nv2a_ff_lit_material(): bit 0 diffuse and alpha
+                              * from the material, bit 1 D1 is the lit specular,
+                              * bit 2 specular disabled. 0 unless lit and
+                              * RECOMP_FF_MATERIAL is on. */
+    uint8_t  pad[3];         /* keep sizeof 32 and every byte defined */
 } NV2AFFKey;
 
 /* Where each piece of state lands in nv2a_ff_constants. Named here rather than
@@ -200,6 +204,9 @@ void nv2a_ff_count_texq(const NV2AFFKey *key, const float in[16][4],
 int nv2a_ff_clip_w_ok(const float pos[4]);
 /* One [FF-LIT] line per lit-state combination seen (nv2a_ff.c). */
 void nv2a_ff_lit_census_report(void);
+/* The colour-material and specular state of a LIT batch, as NV2AFFKey.material
+ * describes it; 0 when the batch is unlit or RECOMP_FF_MATERIAL is off. */
+unsigned nv2a_ff_lit_material(const uint32_t m[2048]);
 extern unsigned long nv2a_ff_gpu_batches, nv2a_ff_gpu_cpu_batches,
     nv2a_ff_gpu_no_skin, nv2a_ff_gpu_no_texgen, nv2a_ff_gpu_no_light,
     nv2a_ff_gpu_no_normal, nv2a_ff_gpu_texmat_unset, nv2a_ff_gpu_texmat_zero;

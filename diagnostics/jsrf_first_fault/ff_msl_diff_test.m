@@ -249,6 +249,18 @@ static int build_corpus(FFState *out, int cap)
                    put_u(&out[n], 0x03c8, 0x8511);                            ++n; }
     if (n < cap) { state_base(&out[n], "lit-one-infinite");
                    state_add_lighting(&out[n], 1u, 0);                        ++n; }
+    /* Rokkaku-dai's lit state ([FF-LIT], 24 Sep 2026): colour material 0,
+     * separate specular, specular on. RECOMP_FF_MATERIAL bits 0 and 1. */
+    if (n < cap) { state_base(&out[n], "lit-rokkaku-separate-specular");
+                   state_add_lighting(&out[n], 1u, 0);
+                   put_u(&out[n], 0x0298, 0);
+                   put_u(&out[n], 0x0294, 1);
+                   put_u(&out[n], 0x03b8, 1);                                 ++n; }
+    /* The same with the diffuse from the vertex (0x0298 bits 5:4 = 1). */
+    if (n < cap) { state_base(&out[n], "lit-vertex-diffuse");
+                   state_add_lighting(&out[n], 1u, 0);
+                   put_u(&out[n], 0x0298, 0x10);
+                   put_u(&out[n], 0x03b8, 1);                                 ++n; }
     if (n < cap) { state_base(&out[n], "lit-eight-infinite");
                    state_add_lighting(&out[n], 0x5555u, 0);                   ++n; }
     if (n < cap) { state_base(&out[n], "lit-and-texmat");
