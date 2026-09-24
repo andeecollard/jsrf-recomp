@@ -386,3 +386,26 @@ merging or carrying flags at split entries.
   - Likely main cause: "index data changed before the token" = 14,699. The
     host read indices from the dynamic index buffer after the game had reused
     it; the executor draws D3D's pushbuffer copy. With the agent.
+
+## Progress, 24 Sep (early morning)
+
+- **G54.4 done** (`0a74ad2`). With the lift on, the APU model is not started
+  (`RECOMP_APU_MODEL=1` forces it). Every lift run had read guest_methods=0 and
+  frames total=0, and the model still opened a second audio device in the
+  player's build. Tutorial, 110 s: 0 faults, anim 59.8/s, lift counters
+  identical to the previous run. JSRF.app rebuilt with it.
+- **G54.3 not done, on purpose.** The ADX guard serialises CRI's
+  priority-elevation lock (sub_0013B0A0/0E0). That is a single-CPU guarantee
+  and has nothing to do with the APU model's timing, so the lift does not
+  retire it. The premise in §G54 was wrong.
+- **G51.1, the 2D shadow:**
+  - Indices from the draw-time snapshot (`7b6a1a6`): vertex bytes stable,
+    12,974 of 12,974 index lists taken from the call.
+  - The half-pixel bias (`43b1dee`): D3D's pass-through adds 0.53125, the
+    NV2A pixel-centre bias, which the executor applies through c-37 =
+    (320.531, 240.531). The logo draw went from max r20 g40 b20 on 11,543 px
+    to max r2 g3 b2 on 2,058 px. Over-tolerance pixels fell from 71.6M to
+    25.3M.
+  - Open: EXACT collapsed from 4,430 to 604, and depth mismatches rose to
+    14,028 of 14,032. The c0/c1 self-check reads the wrong slots (it prints
+    0s). The agent is on these.
