@@ -485,12 +485,23 @@ static uint64_t surface_hits, surface_evictions;
  *     so deferring a dirty depth would lose it to anything that reads it --
  *     including the re-upload a cache MISS performs.
  *
- * THIS CHANGES WHEN GUEST RAM BECOMES CORRECT, which is why it ships off. A
- * guest CPU read of the surface range that is not the flip is not intercepted;
- * that is the same exposure the resident-clear deferral has always accepted,
- * but it is now on the hot path rather than on clears. */
+ * THIS CHANGES WHEN GUEST RAM BECOMES CORRECT, which is why it shipped off: a
+ * guest CPU read of the surface range that was not the flip was not
+ * intercepted. G56 closed that. Every D3D entry that hands a render target's
+ * or depth surface's memory to the CPU -- the surface and texture LockRects,
+ * CopyRects' source, GetBackBuffer, GetDepthStencilSurface -- now makes the
+ * range current on the executor's thread first (nv2a_host_read.c, the mirror
+ * overlay's hooks), and RECOMP_METAL_DEBT_WATCH measured the title's other
+ * accesses to owed ranges in the tutorial: none (12,358 debts, 12,288 paid
+ * before anyone looked, 0 guest faults on the title's view; the 67 low-view
+ * reads were our own framebuffer probe, which now skips owed ranges).
+ *
+ * DEFAULT ON, and it needs the mirror overlay: a build without it (the
+ * JSRF_D3D8_MIRROR CMake option off) has no lock hooks, so the deferral is
+ * exposed there exactly as before -- RECOMP_METAL_DEFER_SWAP=0 restores the
+ * old swap. +24 fps in the tutorial (83.0 -> 106.6, 24 Sep 2026). */
 static int defer_swap_on(void)
-{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DEFER_SWAP"); return on; }
+{ static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_METAL_DEFER_SWAP",1); return on; }
 static uint64_t g_swap_deferred, g_swap_defer_depth, g_swap_defer_noslot;
 
 static int surface_cache_on(void)

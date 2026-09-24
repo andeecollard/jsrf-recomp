@@ -1009,10 +1009,10 @@ if(APPLE)
     target_link_libraries(jsrf_metal_colour_sync_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_colour_sync_off COMMAND jsrf_metal_colour_sync_test)
     set_tests_properties(jsrf_metal_colour_sync_off PROPERTIES
-                         ENVIRONMENT "RECOMP_METAL_NO_COLOUR_SYNC=0;JSRF_EXPECT_COLOUR=1")
+                         ENVIRONMENT "RECOMP_METAL_NO_COLOUR_SYNC=0;RECOMP_METAL_DEFER_SWAP=0;JSRF_EXPECT_COLOUR=1")
     add_test(NAME jsrf_metal_colour_sync_on COMMAND jsrf_metal_colour_sync_test)
     set_tests_properties(jsrf_metal_colour_sync_on PROPERTIES
-                         ENVIRONMENT "RECOMP_METAL_NO_COLOUR_SYNC=1;JSRF_EXPECT_COLOUR=0")
+                         ENVIRONMENT "RECOMP_METAL_NO_COLOUR_SYNC=1;RECOMP_METAL_DEFER_SWAP=0;JSRF_EXPECT_COLOUR=0")
     add_test(NAME jsrf_metal_colour_sync_depth_alpha COMMAND jsrf_metal_colour_sync_test)
     set_tests_properties(jsrf_metal_colour_sync_depth_alpha PROPERTIES
                          ENVIRONMENT "RECOMP_METAL_HW=0;RECOMP_METAL_NO_COLOUR_SYNC=1;RECOMP_METAL_NO_DEPTH_SYNC=0;JSRF_EXPECT_COLOUR=0;JSRF_EXPECT_DEPTH=1")
@@ -1169,7 +1169,11 @@ if(APPLE)
     target_link_libraries(jsrf_metal_defer_swap_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_defer_swap_off COMMAND jsrf_metal_defer_swap_test)
     set_tests_properties(jsrf_metal_defer_swap_off PROPERTIES
-                         ENVIRONMENT "JSRF_EXPECT_DEFER=0")
+                         ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=0;JSRF_EXPECT_DEFER=0")
+    # G56: the default is on.
+    add_test(NAME jsrf_metal_defer_swap_default COMMAND jsrf_metal_defer_swap_test)
+    set_tests_properties(jsrf_metal_defer_swap_default PROPERTIES
+                         ENVIRONMENT "JSRF_EXPECT_DEFER=1")
     add_test(NAME jsrf_metal_defer_swap_on COMMAND jsrf_metal_defer_swap_test)
     set_tests_properties(jsrf_metal_defer_swap_on PROPERTIES
                          ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;JSRF_EXPECT_DEFER=1")
