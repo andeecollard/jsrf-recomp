@@ -496,3 +496,15 @@ merging or carrying flags at split entries.
   So joining the executor's batch encoder causes the debris, and skipping the
   executor's preparation early is wrong once the host draws in its own pass.
   2D draw alone is clean. Back with the agent.
+- **Correction to the bisect above:** its "clean" arms were slow and never
+  reached the broken scene. At the matching dialogue line, 0x081 is broken
+  too, so neither the batch join nor the early skip is implicated.
+  Re-bisected by VERIFY rate (scene-independent), FF+2D draw, VERIFY=60:
+  - generic shader (0x008): 728 mismatching, shadow-like;
+  - hash every draw (0x010): 2,634;
+  - no early tests (0x004): 3,034;
+  - no vertex cache (0x020): 2,889.
+
+  **The specialised host fragment pipelines (`b3030e4`) drop pixels**, and the
+  host covers less on the building draws. Sampling (10,756 units) and bind
+  geometry agree exactly. Back with the agent.
