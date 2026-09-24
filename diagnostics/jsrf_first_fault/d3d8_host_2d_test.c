@@ -155,7 +155,10 @@ static void case_b(D3D8HostDrawCheck *c)
     set_state(c, 0x304, 1); set_state(c, 0x344, 0x306); set_state(c, 0x348, 0x000); set_state(c, 0x350, 0x8006);
 }
 
-/* The executor's view of the same draw: NV2A-level state and post-transform vertices. */
+/* The executor's view of the same draw: NV2A-level state and post-transform
+ * vertices. g_exec_offset is what D3D's pass-through adds to x and y (c1.xy);
+ * the logo case's control sets it to 0 to reproduce tutorial run 3. */
+static float g_exec_offset = 0.53125f;
 static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16_t *target, uint8_t *depth)
 {
     static float v[16384][16][4];
@@ -171,8 +174,10 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
     s.add_specular = d->add_specular;
     s.texture_mask = d->tmask; s.untextured = !(d->tmask & 1); s.modulate = 1;
     if (d->tmask & 1) {
-        s.width = s.height = TW; s.pitch = TW * 4; s.levels = 1; s.rgba8 = 1;
-        s.min_filter = 2; s.linear = 1; s.repeat = 1;
+        const D3D8H2DTexture *t = &d->tex[0];
+        s.width = t->width; s.height = t->height; s.pitch = t->pitch; s.levels = t->levels;
+        s.rgba8 = t->fmt == 0x06 || t->fmt == 0x07; s.dxt1 = t->fmt == 0x0C; s.dxt3 = t->fmt == 0x0E;
+        s.min_filter = t->min_filter; s.linear = t->mag == 2; s.repeat = t->wrap_u == 1;
     }
     s.alpha_test = d->alpha_test; s.alpha_ref = d->alpha_ref;
     s.blend = d->blend; s.blend_src = d->blend_src; s.blend_dst = d->blend_dst;
@@ -184,14 +189,18 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
         float pos[4]; uint32_t col;
         memcpy(pos, ram + c->va_offset[0] + (c->va_format[0] >> 8) * i, 16);
         memcpy(&col, ram + c->va_offset[3] + (c->va_format[3] >> 8) * i, 4);
-        v[k][0][0] = pos[0]; v[k][0][1] = pos[1]; v[k][0][2] = pos[2] * 16777215.0f; v[k][0][3] = 1.0f / pos[3];
+        /* What D3D's pass-through program hands the executor: xy + c1.xy, z * c0.z. */
+        v[k][0][0] = pos[0] + g_exec_offset; v[k][0][1] = pos[1] + g_exec_offset;
+        v[k][0][2] = pos[2] * 16777215.0f; v[k][0][3] = 1.0f / pos[3];
         v[k][3][0] = ((col >> 16) & 255) / 255.0f; v[k][3][1] = ((col >> 8) & 255) / 255.0f;
         v[k][3][2] = (col & 255) / 255.0f; v[k][3][3] = (col >> 24) / 255.0f;
         v[k][9][3] = 1.0f;
         if ((c->va_on >> 9) & 1u) memcpy(v[k][9], ram + c->va_offset[9] + (c->va_format[9] >> 8) * i, 8);
     }
     nv2a_metal_invalidate(NULL);
-    if (nv2a_metal_draw(&s, ram + TEX, TW * TW * 4, (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
+    if (nv2a_metal_draw(&s, (d->tmask & 1) ? ram + d->tex[0].addr : ram + TEX,
+                        (d->tmask & 1) ? nv2a_texture_copy_texture_bytes(&s) : TW * TW * 4,
+                        (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
                         (const float (*)[16][4])v, n, c->prim) < 0) {
         printf("executor refused the draw: %s\n", nv2a_metal_last_reject());
         return 0;
@@ -309,6 +318,104 @@ static void compare_depth(const char *name, D3D8HostDrawCheck *c, int control)
     }
     /* The proof the shadow reports: vertex z 0.1..0.9 over stored 0.25..0.84 -- it depends. */
     CHECK(d3d8_host_2d_depth_proof(0x203, d.z_min, d.z_max, 0.25f, 0.84f) == 0, "%s: LEQUAL over overlapping ranges is 'depends'", name);
+}
+
+/* ---- the tutorial's "Presented by SEGA" logo (run 3's dominant mismatch) ----
+ * FVF 0x1C4, an indexed quad (0 1 2 1 3 2), rhw 0.653, z 0.500125 over a
+ * cleared depth buffer, a 512x512 DXT1 texture minified about fivefold,
+ * alpha test GREATER 0 against its punch-through texels, SRC_ALPHA blend,
+ * dither, LEQUAL with writes. The texture is synthetic: concentric rings of
+ * two opaque colours and transparent gaps, so edges fall everywhere. */
+enum { TEXD = 0x40000, TD = 512 };
+static void make_dxt1(void)
+{
+    for (unsigned by = 0; by < TD / 4; ++by)
+        for (unsigned bx = 0; bx < TD / 4; ++bx) {
+            uint8_t *b = ram + TEXD + 8u * (by * (TD / 4) + bx);
+            uint16_t c0 = 0x001F, c1 = 0xFFFF;             /* c0 <= c1: index 3 is transparent black */
+            uint32_t bits = 0;
+            for (unsigned i = 0; i < 16; ++i) {
+                int x = (int)(bx * 4 + i % 4) - 256, y = (int)(by * 4 + i / 4) - 256;
+                unsigned r = (unsigned)(x * x + y * y) / 700u;
+                unsigned idx = (r % 3 == 2) ? 3u : (r & 1u);
+                bits |= idx << (2 * i);
+            }
+            memcpy(b, &c0, 2); memcpy(b + 2, &c1, 2); memcpy(b + 4, &bits, 4);
+        }
+}
+static void case_logo(D3D8HostDrawCheck *c)
+{
+    static const float P[4][2] = { { 10.0f, 8.0f }, { 118.0f, 8.0f }, { 10.0f, 90.0f }, { 118.0f, 90.0f } };
+    static const float UV[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+    static const uint16_t I[6] = { 0, 1, 2, 1, 3, 2 };
+    base_check(c);
+    for (int i = 0; i < 4; ++i) {                        /* XYZRHW, DIFFUSE, SPECULAR, TEX1: 36 bytes */
+        uint32_t v = VB + 36u * i;
+        putf(v, P[i][0]); putf(v + 4, P[i][1]); putf(v + 8, 0.500125f); putf(v + 12, 0.65299f);
+        put32(v + 16, 0xFFFFFFFFu); put32(v + 20, 0); putf(v + 24, UV[i][0]); putf(v + 28, UV[i][1]);
+    }
+    memcpy(ram + IB, I, sizeof I);
+    make_dxt1();
+    c->vs_handle = 0x1C4;
+    c->draw_kind = 2; c->prim = 5; c->count = 6; c->idx_ptr = IB; c->nidx = 6;
+    for (int k = 0; k < 6; ++k) c->idx[k] = I[k];
+    c->va_on = (1u << 0) | (1u << 3) | (1u << 4) | (1u << 9);
+    c->va_offset[0] = VB;      c->va_format[0] = (36u << 8) | 0x42u;
+    c->va_offset[3] = VB + 16; c->va_format[3] = (36u << 8) | 0x40u;
+    c->va_offset[4] = VB + 20; c->va_format[4] = (36u << 8) | 0x40u;
+    c->va_offset[9] = VB + 24; c->va_format[9] = (36u << 8) | 0x22u;
+    c->tex[0] = 0x5678; c->data[0] = TEXD;
+    c->format[0] = 0x1u | 0x20u | (0x0Cu << 8) | (1u << 16) | (9u << 20) | (9u << 24);
+    c->ffc_cur.texture_bound_mask = 1;
+    c->ffc_cur.tss[0][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_MODULATE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_TEXTURE; c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG2] = D3D8FF_TA_DIFFUSE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_MODULATE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_TEXTURE; c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG2] = D3D8FF_TA_DIFFUSE;
+    set_state(c, 0x300, 1); set_state(c, 0x33C, 0x204); set_state(c, 0x340, 0);
+    set_state(c, 0x304, 1); set_state(c, 0x344, 0x302); set_state(c, 0x348, 0x303); set_state(c, 0x350, 0x8006);
+    set_state(c, 0x310, 1);
+    c->zs = 0x2345; c->zs_data = ZS; c->zs_format = 0x1u | (0x2Eu << 8);
+    c->zs_size = (RTW - 1) | ((RTH - 1) << 12) | ((ZSPITCH / 64 - 1) << 24);
+    set_state(c, 0x30C, 1); set_state(c, 0x354, 0x203); set_state(c, 0x35C, 1);
+}
+static void compare_logo(int control)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH], ec[RTW * RTH];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df;
+    const char *why, *name = control ? "SEGA logo CONTROL (executor without the pass-through offset)" : "SEGA logo";
+    unsigned steps = 0;
+    case_logo(&c);
+    for (unsigned y = 0; y < RTH; ++y)                     /* the cleared depth the logo is drawn over */
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why, "%s: host builds it (%s)", name, why ? why : "built");
+    if (why) return;
+    background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    g_exec_offset = control ? 0.0f : 0.53125f;
+    if (!exec_draw(&c, &d, ex, ram + ZS)) { ++fails; g_exec_offset = 0.53125f; return; }
+    g_exec_offset = 0.53125f;
+    nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+    unsigned x0 = (unsigned)d.bb_x0, y0 = (unsigned)d.bb_y0, w = (unsigned)(d.bb_x1 - d.bb_x0 + 1), h = (unsigned)(d.bb_y1 - d.bb_y0 + 1);
+    for (unsigned k = 0; k < w * h; ++k) zhost[k] = 1.0f;
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho + y0 * (RTPITCH / 2) + x0, RTPITCH / 2, zhost, x0, y0, w, h) != 0) {
+        printf("host render failed: %s\n", d3d8_host_2d_metal_last_error()); ++fails; return;
+    }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    for (unsigned y = 0; y < h; ++y) memcpy(ec + y * w, zexec + (y0 + y) * RTW + x0, w * sizeof(float));
+    unsigned long long zb = d3d8_host_2d_depth_diff(ec, zhost, (size_t)w * h, 1, &steps);
+    printf("  %s: executor changed %llu, host %llu, over tolerance %llu, max error r%u g%u b%u | depth %llu px, worst %u\n",
+           name, df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1], df.max_err[2], zb, steps);
+    CHECK(df.exec_changed > 2000, "%s: the executor drew the rings (%llu px)", name, df.exec_changed);
+    if (!control) {
+        const char *hw = getenv("RECOMP_METAL_HW_TEX");
+        unsigned long long allowed = (hw && hw[0] == '1') ? 0 : 40;   /* the executor's two DXT1 samplers differ at alpha edges */
+        CHECK(df.mismatch <= allowed, "%s: colour agrees (%llu px over, %llu allowed)", name, df.mismatch, allowed);
+        CHECK(zb <= allowed, "%s: depth agrees (%llu px over one step, %llu allowed)", name, zb, allowed);
+    } else
+        CHECK(df.mismatch > 200 && zb > 20, "%s: half a pixel is visible in colour (%llu px) and depth (%llu px)",
+              name, df.mismatch, zb);
 }
 
 /* The shadow bookkeeping end to end, through a fake backend whose "executor"
@@ -433,6 +540,8 @@ int main(int argc, char **argv)
     case_b(&c); compare("indexed DST_COLOR multiply list", &c, 0);
     case_d(&c); compare_depth("depth-tested LEQUAL list with writes", &c, 0);
     case_d(&c); compare_depth("depth-tested LEQUAL list with writes", &c, 1);
+    compare_logo(0);
+    compare_logo(1);
     /* The proof on its own. */
     CHECK(d3d8_host_2d_depth_proof(0x203, 0.0f, 0.0f, 0.0f, 1.0f) == 1, "proof: LEQUAL at z 0 passes over any stored depth");
     CHECK(d3d8_host_2d_depth_proof(0x201, 0.0f, 0.0f, 0.0f, 1.0f) == 0, "proof: LESS at z 0 depends (stored 0 rejects)");

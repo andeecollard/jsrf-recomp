@@ -26,7 +26,29 @@
  * the executor's compare mapping (nv2a_metal_compare_func) and its rule that
  * depth is written only while the test is on.
  * The MUX rule (AB when R0.a >= 0.5) is the executor's, kept for agreement;
- * that it matches the NV2A is not established here. */
+ * that it matches the NV2A is not established here.
+ *
+ * WHERE THE EXECUTOR ITSELF MAY DEPART FROM THE NV2A, as far as a 2D draw can
+ * see it (written down for G51.1; the host follows the executor unless noted):
+ *   - MUX: always "R0.a >= 0.5", ignoring COMBINER_CONTROL's MUX_SELECT
+ *     (bit 8, LSB vs MSB); and whether it picks AB or CD on that side is
+ *     unverified against hardware.
+ *   - FACTOR0/FACTOR1: always per stage (the host honours bits 12/16).
+ *   - Final combiner: only R0 or R0 + specular (SPECULAR_FOG_CW0 0xC/0xE,
+ *     CW1 0x1C80) is modelled; anything else is refused by both.
+ *   - Alpha test: only GREATER is accepted; blend: only 0/1/SRC/DST colour and
+ *     SRC alpha factors with ADD. Other states are refused by the executor
+ *     (not drawn at all), drawn by the host.
+ *   - Depth: the rasteriser clamps z (MTLDepthClipModeClamp) and the shader
+ *     discards outside SET_CLIP_MIN/MAX, where the NV2A clips.
+ *   - Pixel centres: D3D's pass-through adds 0.53125 (the NV2A's centre bias,
+ *     1/2 + 1/32) and Metal then samples at +0.5, so every edge decision is
+ *     1/32 pixel from where D3D's convention would put it. The host adds the
+ *     same 0.53125 and matches the executor, not the hardware.
+ *   - Clip w for XYZRHW: the host uses 1/rhw; what the pass-through writes to
+ *     oPos.w is not read here. Invisible while rhw is constant over a draw
+ *     (the tutorial's logo: 0.653 at all four corners); a draw with varying
+ *     rhw would show it as texture swimming. */
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "d3d8_host_2d.h"

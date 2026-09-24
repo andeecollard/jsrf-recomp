@@ -310,7 +310,8 @@ const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram
                 memset(&v[j], 0, sizeof v[j]);
                 if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
                 float rhw = pos[3];
-                v[j].p[0] = pos[0] * c->ss_x; v[j].p[1] = pos[1] * c->ss_y; v[j].p[2] = pos[2];
+                v[j].p[0] = pos[0] * c->ss_x + D3D8H2D_SCREEN_OFFSET;
+                v[j].p[1] = pos[1] * c->ss_y + D3D8H2D_SCREEN_OFFSET; v[j].p[2] = pos[2];
                 v[j].p[3] = (rhw != 0.0f && isfinite(rhw)) ? 1.0f / rhw : 1.0f;
                 if ((c->va_on >> 3) & 1u) { if (!fetch(ram, ram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
                 else { v[j].d0[0] = v[j].d0[1] = v[j].d0[2] = v[j].d0[3] = 1.0f; }
@@ -445,7 +446,7 @@ static unsigned long long s_flips, s_draws, s_pre, s_pre_skipped, s_no_pre, s_no
                           s_vsflag_pass, s_idx_changed, s_sync_calls, s_ctx_b, s_diffuse_default,
                           s_tss_ci_off, s_modes_disagree;
 static unsigned s_max_err[3];
-static unsigned long long s_idx_snap, s_vtx_changed, s_exec_outside;
+static unsigned long long s_idx_snap, s_vtx_changed, s_exec_outside, s_pt_const_match, s_pt_const_differ;
 static uint16_t s_last_idx[6];
 static unsigned s_printed_mm, s_printed_consts, s_printed_frames, s_printed_z, s_printed_zmm;
 #define NREASON 40
@@ -594,13 +595,22 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && (c->format[u] & 3u) == 2u) { ++s_ctx_b; break; }
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && c->tss[u][28] != u) { ++s_tss_ci_off; break; }
     if (!((c->va_on >> 3) & 1u)) ++s_diffuse_default;
+    /* The pass-through's own constants, c0 and c1 (NV2A slots 96, 97): the
+     * host assumes (1, 1, 16777215, 1) and (0.53125, 0.53125, 0, 0). */
+    if (e.regs_valid) {
+        if (e.vc[96][0] != c->ss_x || e.vc[96][1] != c->ss_y || e.vc[96][2] != 16777215.0f ||
+            e.vc[97][0] != D3D8H2D_SCREEN_OFFSET || e.vc[97][1] != D3D8H2D_SCREEN_OFFSET) ++s_pt_const_differ;
+        else ++s_pt_const_match;
+    }
     if (s_printed_consts < 4 && e.regs_valid) {
         ++s_printed_consts;
         fprintf(stderr, "[D3D8-HOST-2D] draw %u fvf=%03X exec mode %u prog_start %u: pass-through constants"
-                        " c-38 = %g %g %g %g, c-37 = %g %g %g %g | host scale ss=%g,%g offset 0,0 z as given\n",
+                        " c0 = %g %g %g %g, c1 = %g %g %g %g (c-38 = %g %g %g %g, c-37 = %g %g %g %g) | host scale"
+                        " ss=%g,%g offset %g,%g z as given\n",
                 c->serial, c->vs_handle, e.exec_mode, e.prog_start,
+                e.vc[96][0], e.vc[96][1], e.vc[96][2], e.vc[96][3], e.vc[97][0], e.vc[97][1], e.vc[97][2], e.vc[97][3],
                 e.vc[58][0], e.vc[58][1], e.vc[58][2], e.vc[58][3], e.vc[59][0], e.vc[59][1], e.vc[59][2], e.vc[59][3],
-                c->ss_x, c->ss_y);
+                c->ss_x, c->ss_y, D3D8H2D_SCREEN_OFFSET, D3D8H2D_SCREEN_OFFSET);
     }
     if (!s_have_be) { ++s_no_backend; return; }
     if (!s_snap_valid || s_snap_serial != c->serial) { ++s_no_pre; return; }
@@ -893,9 +903,10 @@ void d3d8_host_2d_report(const char *why)
                     " diffuse defaulted to white %llu, texture stage modes differ from the executor's 0x1E70 %llu |"
                     " indices from the draw-time snapshot %llu, of which pIndexData held different ones at the token"
                     " %llu | vertex bytes changed between the draw call and the token %llu | executor changed pixels"
-                    " outside the host's box %llu\n",
+                    " outside the host's box %llu | executor pass-through c0/c1 as the host assumes %llu, different"
+                    " %llu\n",
             why, s_ctx_b, s_tss_ci_off, s_diffuse_default, s_modes_disagree, s_idx_snap, s_idx_changed,
-            s_vtx_changed, s_exec_outside);
+            s_vtx_changed, s_exec_outside, s_pt_const_match, s_pt_const_differ);
     fprintf(stderr, "[D3D8-HOST-2D] %s depth: test off %llu | on: func NEVER %llu LESS %llu EQUAL %llu LEQUAL %llu"
                     " GREATER %llu NOTEQUAL %llu GEQUAL %llu ALWAYS %llu; write on %llu; vertex z all 0 %llu, inside"
                     " (0,1) %llu, all 1 %llu, mixed %llu, outside [0,1] %llu | seeded from executor texture %llu,"
