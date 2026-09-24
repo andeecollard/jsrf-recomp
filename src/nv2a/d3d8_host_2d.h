@@ -120,6 +120,26 @@ int d3d8_host_2d_is_2d(const D3D8HostDrawCheck *c);
  * geometry moves two pixels right and the diffuse colour's red is inverted. */
 const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
                                int control, D3D8Host2DDraw *out);
+/* The same, with the draw's indices supplied (`idx`, c->count of them) rather
+ * than read from guest memory at c->idx_ptr now. d3d8_host_2d_build(...) is
+ * this with idx = NULL. */
+const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
+                                  int control, const uint16_t *idx, D3D8Host2DDraw *out);
+
+/* ---- the index ring: indices captured at the draw call ----
+ * One producer (the thread calling D3D, through the mirror), one consumer
+ * (the ring consumer at the post token). The producer reserves n contiguous
+ * entries, fills them, and publishes; the consumer copies them out and then
+ * checks that the producer has not come round onto them meanwhile. */
+#define D3D8H2D_IDX_RING (1u << 20)
+#define D3D8H2D_IDX_PER_DRAW 16384u
+uint16_t *d3d8_host_2d_idx_reserve(uint32_t n, uint64_t *pos);
+void      d3d8_host_2d_idx_publish(uint64_t pos, uint32_t n);
+/* 1 and `out` filled, or 0 if the entries were never published or have been overwritten. */
+int       d3d8_host_2d_idx_copy(uint64_t pos, uint32_t n, uint16_t *out);
+/* FNV-1a over every enabled vertex array's bytes for indices imin..imax. */
+uint64_t  d3d8_host_2d_vertex_hash(const uint8_t *ram, size_t ram_size, const D3D8HostDrawCheck *c,
+                                   uint32_t imin, uint32_t imax);
 
 /* ---- the renderer (d3d8_host_2d_metal.m) ----
  * Draw `d` over `pixels`, a w x h crop of an R5G6B5 target whose top-left is
@@ -170,6 +190,7 @@ typedef struct {
     unsigned long long draws, built, rendered, compared, exact, within, mismatching, px, px_mismatch, dumped;
     unsigned long long depth_draws, depth_px, depth_px_mismatch, depth_draws_mismatching;
     unsigned long long z_from_texture, z_from_ram, proof_pass, proof_reject, proof_depends;
+    unsigned long long idx_from_snapshot, idx_changed, vtx_changed, exec_outside_host_box;
 } D3D8H2DStats;
 void d3d8_host_2d_get_stats(D3D8H2DStats *out);
 

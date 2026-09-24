@@ -152,6 +152,18 @@ typedef struct {
      * D3D8_HOST_2D_EXTRA_METHODS, and x_seen which of them it pushed at all. */
     uint32_t idx_ptr;
     uint32_t x_val[8], x_seen;
+    /* G51.1: what the draw CALL saw, captured in d3d8m_after_draw while
+     * D3D's pushbuffer copy of it is fresh. D3D copies a DrawIndexedVertices'
+     * indices into the ring (ARRAY_ELEMENT16) as it is called, and the title
+     * reuses its dynamic index buffer at once, so by the time the token is
+     * reached pIndexData holds the NEXT draw's indices. idx_snap_n indices
+     * sit in the host's index ring at idx_snap_pos (d3d8_host_2d_idx_*);
+     * idx_snap_n = 0 with idx_snap_over set means the draw had more than the
+     * ring takes per draw. vtx_hash is d3d8_host_2d_vertex_hash() over the
+     * vertex bytes the draw's index range reaches, at the call; the host
+     * hashes again at the token to see whether the vertices moved too. */
+    uint64_t idx_snap_pos, vtx_hash;
+    uint32_t idx_snap_n, idx_snap_over, vtx_hash_ok;
 } D3D8HostDrawCheck;
 /* G51.1: the Simple-pushed methods the host's 2D draw needs beyond
  * D3D8_HOST_STATE_METHODS: CULL_FACE_ENABLE, DITHER_ENABLE, BLEND_COLOR,

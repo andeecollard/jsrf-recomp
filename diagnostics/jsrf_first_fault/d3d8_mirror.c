@@ -413,6 +413,30 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     /* G51.1: every index, not only the first 16, and the extra states. */
     c.idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c.x_val, m_x_val, sizeof c.x_val); c.x_seen = m_x_seen;
+    /* G51.1: for a 2D draw the host will draw, the indices and a hash of the
+     * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
+     * into the ring; the title rewrites pIndexData for its next draw long
+     * before the token is reached. */
+    if (d3d8_host_2d_mode() && d3d8_host_2d_is_fvf_xyzrhw(MEM32(MEM32(0x0019DCE0u) + 0x384u))) {
+        extern ptrdiff_t xbox_GetMemoryOffset(void);
+        uint32_t imin = kind == 2 ? 0xFFFFFFFFu : a2, imax = kind == 2 ? 0u : a2 + (a3 ? a3 - 1u : 0u);
+        if (kind == 2 && a2) {
+            uint64_t pos; uint16_t *dst = d3d8_host_2d_idx_reserve(a2, &pos);
+            if (!dst) c.idx_snap_over = 1;
+            else {
+                for (uint32_t k = 0; k < a2; ++k) {
+                    uint16_t v = MEM16(a3 + 2u * k);
+                    dst[k] = v; if (v < imin) imin = v; if (v > imax) imax = v;
+                }
+                d3d8_host_2d_idx_publish(pos, a2);
+                c.idx_snap_pos = pos; c.idx_snap_n = a2;
+            }
+        }
+        if (imin <= imax) {
+            c.vtx_hash = d3d8_host_2d_vertex_hash((const uint8_t *)xbox_GetMemoryOffset(), 0x04000000u, &c, imin, imax);
+            c.vtx_hash_ok = 1;
+        }
+    }
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */
     c.ffc_valid = 1;
