@@ -279,7 +279,25 @@ typedef struct {
     void (*geom_stats)(unsigned long long *differ, unsigned long long *variants);
     /* Optional: d3d8_host_2d_metal_spec_stats, for the draw-mode report. */
     void (*spec_stats)(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
+    /* Optional (G51.2 positive control): the executor's own begin/end batches
+     * by transform mode (0x1E94) -- [0] mode 4 (FF), [1] mode 6
+     * (pass-through), [2] anything else (a program) -- counted whether or not
+     * the mirror is armed, so a zero on the host's side is visibly wrong. */
+    void (*exec_mode_counts)(unsigned long long out[3]);
 } D3D8Host2DBackend;
+
+/* ONE ARMING FUNCTION (G51.2: RECOMP_D3D8_HOST_VS alone did not arm the
+ * mirror, because the mirror and main.c each kept their own list of classes).
+ * Every class switch is in one table in d3d8_host_2d.c; everything that must
+ * be on when any class is on -- the mirror's hooks and tokens, the Metal
+ * backend, the flip hook, the pre token, the report -- asks this and nothing
+ * else. Returns a mask, bit i for class switch i; with `why`, the names of the
+ * switches that armed it. RECOMP_D3D8_MIRROR is not a class: it arms the
+ * mirror by itself, and d3d8_host_mirror_armed is the mirror's whole answer. */
+unsigned d3d8_host_armed(char *why, size_t why_size);
+int d3d8_host_mirror_armed(char *why, size_t why_size);
+unsigned d3d8_host_class_switches(void);          /* the table's length */
+const char *d3d8_host_class_switch(unsigned i);   /* its i-th name, or NULL */
 
 /* 0 off, 1 shadow, 2 draw. Reads RECOMP_D3D8_HOST_2D once. */
 int  d3d8_host_2d_mode(void);

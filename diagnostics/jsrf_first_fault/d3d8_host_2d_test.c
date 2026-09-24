@@ -50,6 +50,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 /* d3d8_host.c brings nv2a_pusher.c, whose dispatch names the executor and the
  * D3D11 sink; neither is reached here (as in d3d8_streams_test.c). */
@@ -1686,6 +1687,83 @@ static void vs_tests(void)
         CHECK(!why && df.mismatch > 500, "programmable VS CONTROL: with every other triangle dropped it differs (%llu px)", df.mismatch); }
 }
 
+/* G51.2 ARMING: each class switch ALONE must arm the mirror (the in-game
+ * bug: RECOMP_D3D8_HOST_VS=shadow printed its arming text and the mirror
+ * stayed off, so the census was 0). The modes are read once a process, so
+ * each case is a child with a clean environment. The cases come from the
+ * class table itself: a class added there is tested here without an edit.
+ * Then no gate outside d3d8_host_2d.c may keep its own list of classes. */
+static void clear_host_env(void)
+{
+    extern char **environ;
+    char name[128];
+    for (int again = 1; again; ) {
+        again = 0;
+        for (char **e = environ; *e; ++e)
+            if (!strncmp(*e, "RECOMP_D3D8_", 12)) {
+                size_t n = strcspn(*e, "=");
+                if (n >= sizeof name) continue;
+                memcpy(name, *e, n); name[n] = 0; unsetenv(name); again = 1; break;
+            }
+    }
+}
+/* 1 armed, 0 not, in a child with only `name`=`value` set (name NULL: none). */
+static int armed_alone(const char *name, const char *value, unsigned *mask)
+{
+    int fd[2], st = 0; pid_t pid; unsigned got[2] = { 0, 0 };
+    if (pipe(fd)) return -1;
+    pid = fork();
+    if (pid == 0) {
+        char why[160]; unsigned out[2];
+        close(fd[0]); clear_host_env();
+        if (name) setenv(name, value, 1);
+        out[1] = d3d8_host_armed(why, sizeof why);
+        out[0] = (unsigned)d3d8_host_mirror_armed(why, sizeof why);
+        if (write(fd[1], out, sizeof out) != (ssize_t)sizeof out) _exit(2);
+        _exit(0);
+    }
+    close(fd[1]);
+    if (read(fd[0], got, sizeof got) != (ssize_t)sizeof got) got[0] = 99;
+    close(fd[0]); waitpid(pid, &st, 0);
+    if (mask) *mask = got[1];
+    return (int)got[0];
+}
+static int source_mentions(const char *path, const char *needle, char *line_out, size_t n)
+{
+    FILE *f = fopen(path, "r"); char buf[4096]; int hit = 0, ln = 0;
+    if (!f) return -1;
+    while (fgets(buf, sizeof buf, f)) { ++ln; if (strstr(buf, needle)) { hit = ln; snprintf(line_out, n, "%.120s", buf); break; } }
+    fclose(f);
+    return hit;
+}
+static void arming_tests(void)
+{
+    unsigned mask = 0, n = d3d8_host_class_switches();
+    CHECK(n >= 3, "the class table has the 2D, FF and VS switches (%u rows)", n);
+    CHECK(armed_alone(NULL, NULL, &mask) == 0 && mask == 0, "nothing set: the mirror stays off");
+    CHECK(armed_alone("RECOMP_D3D8_HOST_FF_STRIDE", "4", &mask) == 0, "a knob alone (FF_STRIDE) arms nothing");
+    CHECK(armed_alone("RECOMP_D3D8_HOST_VERIFY", "8", &mask) == 0, "a knob alone (VERIFY) arms nothing");
+    CHECK(armed_alone("RECOMP_D3D8_MIRROR", "1", &mask) == 1 && mask == 0, "RECOMP_D3D8_MIRROR=1 arms the mirror, no class");
+    for (unsigned i = 0; i < n; ++i) {
+        const char *sw = d3d8_host_class_switch(i);
+        CHECK(armed_alone(sw, "shadow", &mask) == 1 && mask == (1u << i), "%s=shadow ALONE arms the mirror (class mask %X)", sw, mask);
+        CHECK(armed_alone(sw, "off", &mask) == 0, "%s=off arms nothing", sw);
+    }
+    CHECK(armed_alone("RECOMP_D3D8_HOST_2D", "draw", &mask) == 1 && mask == 1u, "RECOMP_D3D8_HOST_2D=draw alone arms the mirror");
+    CHECK(armed_alone("RECOMP_D3D8_HOST_FF", "draw", &mask) == 1 && mask == 2u, "RECOMP_D3D8_HOST_FF=draw alone arms the mirror");
+#ifdef JSRF_SRC_DIR
+    {   static const char *const files[] = { JSRF_SRC_DIR "/diagnostics/jsrf_first_fault/d3d8_mirror.c",
+                                             JSRF_SRC_DIR "/diagnostics/jsrf_first_fault/main.c" };
+        static const char *const gates[] = { "d3d8_host_2d_mode()", "d3d8_host_ff_mode()", "d3d8_host_vs_mode()" };
+        for (unsigned f = 0; f < 2; ++f)
+            for (unsigned g = 0; g < 3; ++g) {
+                char line[128] = ""; int at = source_mentions(files[f], gates[g], line, sizeof line);
+                CHECK(at == 0, "%s keeps no class list of its own: no %s (line %d: %s)", strrchr(files[f], '/') + 1, gates[g], at, line);
+            }
+    }
+#endif
+}
+
 /* G56 DEFER-SAFE, the positive control. The executor (this thread, the
  * service thread) draws into A without a sync and then into B, so under
  * RECOMP_METAL_DEFER_SWAP A's pixels are on the GPU only; a "guest" thread
@@ -1774,6 +1852,11 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         bench_tests();
         return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "arming") == 0) {       /* G51.2: one arming function */
+        arming_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "vs") == 0) {           /* G51.2: the programmable class */
         setenv("RECOMP_D3D8_HOST_VS", "shadow", 1);
