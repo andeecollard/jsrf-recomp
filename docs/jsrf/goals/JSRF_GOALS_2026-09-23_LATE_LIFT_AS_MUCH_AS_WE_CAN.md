@@ -456,3 +456,14 @@ merging or carrying flags at split entries.
   - Open: the control does not perturb FF yet; "diffuse defaulted to white"
     on 5,185 draws needs checking against the executor; 492 stencil draws
     are refused.
+- **G51.3 FF classified, and FF draw mode works but is slow** (`688bea4`):
+  - Shadow: of 799 mismatching, 752 are 1–4 px (edge float order, CPU against
+    GPU transform), none over 512 px. Depth ≤4 steps on 1,894. The executor's
+    current diffuse is white on every draw with no diffuse array (4,841 of
+    4,841), so defaulting to white is right.
+  - The control is now real: 4,288 of 5,280 mismatching, 94.7M px over.
+  - The refused stencil class is ALWAYS/ZERO with colour on (not shadow
+    volumes); the points are fvf 0x112, count 1.
+  - FF + 2D draw: 100,345 replaced (FF 91,981), 0 drawn twice; the presented
+    frames look right, and the control discolours the 3D world. But 18.2 fps
+    against 82.7: ~50 ms per frame of host cost. Speed is next.
