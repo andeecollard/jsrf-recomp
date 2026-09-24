@@ -400,9 +400,16 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
     int drawn;
     if (!init()) return 0;
     @autoreleasepool {
-        s_err = "executor target not bound";
         drawn = nv2a_metal_external_draw(ram + d->rt_addr, d->depth_test ? ram + d->zs_addr : NULL,
                                          d->depth_test && d->depth_write, external_encode, &x);
     }
-    return drawn && x.ok;
+    switch (drawn) {
+    case 1:  break;
+    case -1: s_err = "executor not on the hardware 565 path"; break;
+    case -2: s_err = "target not bound: no valid executor surface"; break;
+    case -3: s_err = "target not bound: executor holds another colour target"; break;
+    case -4: s_err = "target not bound: executor holds another depth surface"; break;
+    default: if (x.ok) s_err = "host encode declined"; break;
+    }
+    return drawn == 1 && x.ok;
 }

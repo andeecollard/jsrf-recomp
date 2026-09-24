@@ -149,15 +149,32 @@ def main():
     ap.add_argument("--lift-clear", action="store_true",
                     help="route D3DDevice_Clear through d3d8_lift_clear.h (G37); "
                          "RECOMP_D3D8_LIFT_CLEAR=shadow|1 selects the mode at run time")
+    ap.add_argument("--overlay", action="store_true",
+                    help="write ONLY the files this changes or adds into <destination> (replacing its "
+                         "contents), for a build to use in place of the gen's own; see CMakeLists.txt "
+                         "JSRF_D3D8_MIRROR")
+    ap.add_argument("--base", type=Path,
+                    help="an overlay directory whose recomp_*.c files replace the gen's as INPUT (the DSOUND "
+                         "overlay), so a file both overlays change carries both; with --overlay, a file only "
+                         "the base changed is not rewritten here")
     a = ap.parse_args()
 
     src, dst = a.source.resolve(), a.destination.resolve()
     if dst == src or src in dst.parents:
         raise SystemExit("destination must be separate from the source gen")
-    if dst.exists():
+    if a.overlay:
+        if dst.exists():
+            shutil.rmtree(dst)
+    elif dst.exists():
         raise SystemExit("destination exists: %s" % dst)
     entries = json.load(open(a.entries))
     files = {p: p.read_text() for p in sorted(src.glob("recomp_*.c"))}
+    if a.base:
+        # The base overlay's version of a file is the one this edits.
+        for bp in sorted(a.base.resolve().glob("recomp_*.c")):
+            gp = src / bp.name
+            if gp in files:
+                files[gp] = bp.read_text()
 
     plan = {}
     for idx, e in enumerate(entries):
@@ -167,8 +184,19 @@ def main():
             raise SystemExit("expected exactly one body for %s, found %d" % (name, len(found)))
         plan[name] = (idx, found[0][0], found[0][1])
 
-    shutil.copytree(src, dst)
+    if a.overlay:
+        dst.mkdir(parents=True)
+    else:
+        shutil.copytree(src, dst)
+        if a.base:
+            for gp, t in files.items():
+                (dst / gp.name).write_text(t)
+    # Every file's current text, by name; `changed` names what this rewrote.
+    cur = {gp.name: t for gp, t in files.items()}
+    changed = set()
     manifest = ["source=%s" % src, "switch=RECOMP_D3D8_CENSUS=1", "entries=%d" % len(entries)]
+    if a.base:
+        manifest.append("base=%s" % a.base.resolve())
     by_file = {}
     for name, (idx, path, span) in plan.items():
         by_file.setdefault(path, []).append((span[0], span[1], name, idx))
@@ -269,7 +297,7 @@ def main():
         decls = "\n".join("static void d3d8c_orig_%s(void);" % n for _, _, n, _ in items)
         first = min(s for s, _, _, _ in items)
         text = text[:first] + decls + "\n" + text[first:] + "\n".join(wrappers) + "\n"
-        (dst / path.name).write_text(text)
+        cur[path.name] = text; changed.add(path.name)
 
     if a.mirror:
         # G43: two INTERNAL D3D functions, not entry points, so they are
@@ -286,23 +314,25 @@ def main():
                          ("sub_001962B0", "d3d8m_xform_entry")):         # G42b transforms, inverse model-view
             if name in plan:
                 raise SystemExit("%s is also a census entry; hook it through the entry path" % name)
-            found = [p for p in sorted(dst.glob("recomp_*.c")) if ("void %s(void)\n{" % name) in p.read_text()]
+            found = [n for n in sorted(cur) if ("void %s(void)\n{" % name) in cur[n]]
             if len(found) != 1:
                 raise SystemExit("expected exactly one body for %s, found %d" % (name, len(found)))
-            text = found[0].read_text()
+            text = cur[found[0]]
             span = body_span(text, name)
             if span is None:
                 raise SystemExit("could not delimit %s" % name)
             body = text[span[0]:span[1]]
-            manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), found[0].name))
+            manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), found[0]))
             renamed = body.replace("void %s(void)" % name, "static void d3d8m_orig_%s(void)" % name, 1)
             text = text[:span[0]] + renamed + text[span[1]:]
             text += ("\n/* ---- G43/G42 mirror hook (stage_d3d8_census.py) ---- */\n"
                      "void %s(void);\n"
                      "void %s(void) { %s(); d3d8m_orig_%s(); }\n" % (fn, name, fn, name))
-            found[0].write_text(text)
+            cur[found[0]] = text; changed.add(found[0])
             manifest.append("mirror: %s (G43/G42, %s before the original)" % (name, fn))
 
+    for n in sorted(changed):
+        (dst / n).write_text(cur[n])
     names = [(e["name"] or "sub_%08X" % int(e["address"], 16)).split(" (")[0].replace('"', "'") for e in entries]
     (dst / "recomp_zz_d3d8_census.c").write_text(RUNTIME % dict(
         n=len(entries),
