@@ -159,6 +159,8 @@ static void case_b(D3D8HostDrawCheck *c)
  * vertices. g_exec_offset is what D3D's pass-through adds to x and y (c1.xy);
  * the logo case's control sets it to 0 to reproduce tutorial run 3. */
 static float g_exec_offset = 0.53125f;
+static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
+static float exec_snap(float v) { return g_exec_snap ? truncf(v * 16.0f) / 16.0f : v; }
 static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16_t *target, uint8_t *depth)
 {
     static float v[16384][16][4];
@@ -190,7 +192,7 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
         memcpy(pos, ram + c->va_offset[0] + (c->va_format[0] >> 8) * i, 16);
         memcpy(&col, ram + c->va_offset[3] + (c->va_format[3] >> 8) * i, 4);
         /* What D3D's pass-through program hands the executor: xy + c1.xy, z * c0.z. */
-        v[k][0][0] = pos[0] + g_exec_offset; v[k][0][1] = pos[1] + g_exec_offset;
+        v[k][0][0] = exec_snap(pos[0] + g_exec_offset); v[k][0][1] = exec_snap(pos[1] + g_exec_offset);
         v[k][0][2] = pos[2] * 16777215.0f; v[k][0][3] = 1.0f / pos[3];
         v[k][3][0] = ((col >> 16) & 255) / 255.0f; v[k][3][1] = ((col >> 8) & 255) / 255.0f;
         v[k][3][2] = (col & 255) / 255.0f; v[k][3][3] = (col >> 24) / 255.0f;
@@ -418,6 +420,47 @@ static void compare_logo(int control)
               name, df.mismatch, zb);
 }
 
+/* A full-screen quad at integer coordinates, z 0, over cleared depth: the
+ * tutorial's fade/clear quad. Row 0 and column 0 are covered only because the
+ * executor snaps 0.53125 down to 0.5. Its control turns the executor's snap
+ * off, which reproduces tutorial run 4 (row 0 + column 0 in depth). */
+static void compare_fullscreen(int control)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH];
+    static const float P[4][2] = { { 0, 0 }, { RTW, 0 }, { 0, RTH }, { RTW, RTH } };
+    const char *name = control ? "full-screen quad CONTROL (executor unsnapped)" : "full-screen quad";
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df;
+    unsigned steps = 0;
+    case_logo(&c);
+    for (int i = 0; i < 4; ++i) { putf(VB + 36u * i, P[i][0]); putf(VB + 36u * i + 4, P[i][1]); putf(VB + 36u * i + 8, 0.0f); putf(VB + 36u * i + 12, 1.0f); }
+    c.tex[0] = 0; c.ffc_cur.texture_bound_mask = 0; c.va_on &= ~(1u << 9);
+    c.ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_DIFFUSE; c.ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
+    c.st_seen &= ~1u;                                              /* no alpha test */
+    for (int i = 0; i < 4; ++i) put32(VB + 36u * i + 16, 0xC0204080u);
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) { ++fails; return; }
+    background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    g_exec_snap = !control;
+    int ok = exec_draw(&c, &d, ex, ram + ZS);
+    g_exec_snap = 1;
+    if (!ok) { ++fails; return; }
+    nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+    for (unsigned k = 0; k < RTW * RTH; ++k) zhost[k] = 1.0f;
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho, RTPITCH / 2, zhost, 0, 0, RTW, RTH) != 0) { ++fails; return; }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    unsigned long long zb = d3d8_host_2d_depth_diff(zexec, zhost, RTW * RTH, 1, &steps);
+    printf("  %s: executor changed %llu, host %llu, over tolerance %llu | depth %llu px, worst %u\n",
+           name, df.exec_changed, df.host_changed, df.mismatch, zb, steps);
+    if (!control) {
+        CHECK(df.mismatch == 0 && zb == 0 && zhost[0] == 0.0f && zhost[RTW - 1] == 0.0f && zhost[(RTH - 1) * RTW] == 0.0f,
+              "%s: colour and depth agree everywhere, and row 0 / column 0 were written (z 0)", name);
+    } else
+        CHECK(zb == RTW + RTH - 1, "%s: row 0 + column 0 differ in depth (%llu px, want %u)", name, zb, RTW + RTH - 1);
+}
+
 /* The shadow bookkeeping end to end, through a fake backend whose "executor"
  * result is placed in RAM between the two tokens. Case B, which both of the
  * executor's samplers draw identically. */
@@ -542,6 +585,10 @@ int main(int argc, char **argv)
     case_d(&c); compare_depth("depth-tested LEQUAL list with writes", &c, 1);
     compare_logo(0);
     compare_logo(1);
+    compare_fullscreen(0);
+    compare_fullscreen(1);
+    CHECK(d3d8_host_2d_snap(0.53125f) == 0.5f && d3d8_host_2d_snap(160.53125f) == 160.5f && d3d8_host_2d_snap(-0.53125f) == -0.5f,
+          "snap: 0.53125 -> 0.5, 160.53125 -> 160.5, toward zero for negatives");
     /* The proof on its own. */
     CHECK(d3d8_host_2d_depth_proof(0x203, 0.0f, 0.0f, 0.0f, 1.0f) == 1, "proof: LEQUAL at z 0 passes over any stored depth");
     CHECK(d3d8_host_2d_depth_proof(0x201, 0.0f, 0.0f, 0.0f, 1.0f) == 0, "proof: LESS at z 0 depends (stored 0 rejects)");

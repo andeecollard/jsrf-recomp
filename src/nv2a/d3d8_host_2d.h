@@ -42,6 +42,7 @@
  * device: d3d8_host_2d.c (pure C, xbox_nv2a) builds a D3D8Host2DDraw and runs
  * the shadow bookkeeping through a backend; d3d8_host_2d_metal.m (xbox_vsh,
  * Apple only) is the backend's renderer. main.c introduces the two. */
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "d3d8_host.h"
@@ -80,6 +81,18 @@ typedef struct {
  * (tutorial run 3, "Presented by SEGA"). The shadow prints the executor's c0/c1
  * and counts any draw where they are not these values. */
 #define D3D8H2D_SCREEN_OFFSET 0.53125f
+/* THEN THE EXECUTOR SNAPS: prepare_vertices (nv2a_pb_exec.c) and the GPU
+ * program epilogue (nv2a_vsh_msl.c) both truncate screen x and y toward zero
+ * to 1/16 pixel for |v| < 2^20, the NV2A's 4-bit subpixel grid. So a D3D
+ * coordinate k lands on k + 0.5, not k + 0.53125: a full-screen quad from 0
+ * covers column 0 and row 0 (their centres lie on its top-left edge), and the
+ * logo's edges fall 1/32 px left of where the unsnapped offset put them.
+ * Tutorial run 4 without it: 1,119 depth pixels (row 0 + column 0) on every
+ * full-screen quad and r2 g3 b2 on the logo. */
+static inline float d3d8_host_2d_snap(float v)
+{
+    return (v < 1048576.0f && v > -1048576.0f) ? truncf(v * 16.0f) / 16.0f : v;
+}
 
 typedef struct {
     uint32_t serial;
