@@ -233,6 +233,7 @@ typedef struct {
      * (1), or does nothing (0); exec_skip turns the executor's rasteriser off
      * and on; exec_skipped counts the batches it has skipped. */
     int (*external_draw)(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
+    unsigned long long (*external_binds)(void);   /* optional: how many draws the host bound first */
     /* G51.3: the executor's fixed-function vertex unit, for the FF shadow. */
     D3D8H2DFFVertexFn ff_vertex;
     void (*exec_skip)(int on);
@@ -259,6 +260,8 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c);
 void d3d8_host_2d_after(const D3D8HostDrawCheck *c);
 /* The renderer's draw-mode half: `d` into the executor's bound surface. */
 int  d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
+/* Draws for which the host bound the target first (nv2a_metal_bind). */
+unsigned long long d3d8_host_2d_metal_binds(void);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);
 /* The token before a 2D draw's commands: snapshot the target it starts from. */
 void d3d8_host_2d_pre(uint32_t serial, uint32_t vs_handle, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,

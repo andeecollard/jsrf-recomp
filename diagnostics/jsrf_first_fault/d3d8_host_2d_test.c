@@ -165,6 +165,7 @@ static void case_b(D3D8HostDrawCheck *c)
  * vertices. g_exec_offset is what D3D's pass-through adds to x and y (c1.xy);
  * the logo case's control sets it to 0 to reproduce tutorial run 3. */
 static float g_exec_offset = 0.53125f;
+static int g_exec_keep_surfaces;     /* 1: do not invalidate first, so binding state carries across draws */
 static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
 static float exec_snap(float v) { return g_exec_snap ? truncf(v * 16.0f) / 16.0f : v; }
 static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16_t *target, uint8_t *depth)
@@ -205,7 +206,7 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
         v[k][9][3] = 1.0f;
         if ((c->va_on >> 9) & 1u) memcpy(v[k][9], ram + c->va_offset[9] + (c->va_format[9] >> 8) * i, 8);
     }
-    nv2a_metal_invalidate(NULL);
+    if (!g_exec_keep_surfaces) nv2a_metal_invalidate(NULL);
     if (nv2a_metal_draw(&s, (d->tmask & 1) ? ram + d->tex[0].addr : ram + TEX,
                         (d->tmask & 1) ? nv2a_texture_copy_texture_bytes(&s) : TW * TW * 4,
                         (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
@@ -720,8 +721,50 @@ static int draw_arm(int host, int control, uint16_t *out, float *zout)
 static unsigned long long g_fake_skipped; static int g_fake_skip;
 static void fake_skip(int on) { g_fake_skip = on; }
 static unsigned long long fake_skipped(void) { return g_fake_skipped; }
+/* THE SAME BINDING SEQUENCE. Executor alone: draw into A, into B, into A.
+ * With the host: draw into A, the host binds B (nv2a_metal_bind), draw into
+ * B, into A. The swap B needs happens in the bind instead of in the draw, so
+ * the counters -- surfaces uploaded, rebinds, evictions -- and every pixel of
+ * both targets must come out the same. */
+static int bind_sequence(int host_binds, unsigned long long cnt[3], uint16_t *outA, uint16_t *outB)
+{
+    enum { RT2 = RT + 0x40000 };
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    unsigned long long u0, h0, e0, u1, h1, e1;
+    uint16_t *a = (uint16_t *)(ram + RT), *b = (uint16_t *)(ram + RT2);
+    static uint8_t depth[RTW * 4 * RTH];
+    background(a); background(b);
+    nv2a_metal_invalidate(NULL); nv2a_metal_sync();
+    g_exec_keep_surfaces = 1;
+    nv2a_metal_bind_counters(&u0, &h0, &e0);
+    case_b(&c); memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) return 0;
+    if (!exec_draw(&c, &d, a, depth)) return 0;
+    if (host_binds && nv2a_metal_bind((uint8_t *)b, RTPITCH * RTH, RTW, RTH, RTPITCH, NULL, 0, 0, 0) != 0) return 0;
+    if (!exec_draw(&c, &d, b, depth)) return 0;
+    if (!exec_draw(&c, &d, a, depth)) return 0;
+    nv2a_metal_sync();
+    g_exec_keep_surfaces = 0;
+    nv2a_metal_bind_counters(&u1, &h1, &e1);
+    cnt[0] = u1 - u0; cnt[1] = h1 - h0; cnt[2] = e1 - e0;
+    memcpy(outA, a, RTPITCH * RTH); memcpy(outB, b, RTPITCH * RTH);
+    return 1;
+}
+static void bind_tests(void)
+{
+    static uint16_t a1[RTPITCH / 2 * RTH], b1[RTPITCH / 2 * RTH], a2[RTPITCH / 2 * RTH], b2[RTPITCH / 2 * RTH];
+    unsigned long long c1[3], c2[3];
+    CHECK(bind_sequence(0, c1, a1, b1) && bind_sequence(1, c2, a2, b2), "bind: both sequences ran");
+    printf("  bind: executor alone uploads %llu rebinds %llu evictions %llu; with the host binding B: %llu %llu %llu\n",
+           c1[0], c1[1], c1[2], c2[0], c2[1], c2[2]);
+    CHECK(c1[0] == c2[0] && c1[1] == c2[1] && c1[2] == c2[2] && c1[0] >= 2,
+          "bind: the host's bind is the executor's swap -- same uploads, rebinds and evictions");
+    CHECK(!memcmp(a1, a2, sizeof a1) && !memcmp(b1, b2, sizeof b1), "bind: both targets identical, pixel for pixel");
+}
+
 static void draw_mode_tests(void)
 {
+    bind_tests();
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
     static float za[RTW * RTH], zb[RTW * RTH];
     D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
@@ -748,7 +791,7 @@ static void draw_mode_tests(void)
         memset(&be, 0, sizeof be);
         be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
         be.last_error = d3d8_host_2d_metal_last_error; be.external_draw = d3d8_host_2d_metal_external;
-        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped;
+        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped; be.external_binds = d3d8_host_2d_metal_binds;
         d3d8_host_2d_set_backend(&be);
         background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
         case_logo(&c); snapshot_at_call(&c);
@@ -765,11 +808,13 @@ static void draw_mode_tests(void)
         d3d8_host_2d_get_stats(&s2);
         CHECK(g_fake_skip == 0 && s2.replaced == s1.replaced && s2.replace_refused == s1.replace_refused + 1,
               "draw mode: a draw the host refuses (stencil) is left to the executor");
-        case_logo(&c); c.rt_data = RT + 0x40000; snapshot_at_call(&c);
-        d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
-        d3d8_host_2d_get_stats(&s3);
-        CHECK(g_fake_skip == 0 && s3.replaced == s2.replaced && s3.replace_unbound == s2.replace_unbound + 1,
-              "draw mode: a target the executor has not bound is left to the executor");
+        /* A target the executor has not bound: the host binds it (nv2a_metal_bind) and draws. */
+        {   unsigned long long b0 = d3d8_host_2d_metal_binds();
+            case_logo(&c); c.rt_data = RT + 0x40000; snapshot_at_call(&c);
+            d3d8_host_2d_replace(&c); if (g_fake_skip) ++g_fake_skipped; d3d8_host_2d_after(&c);
+            d3d8_host_2d_get_stats(&s3);
+            CHECK(s3.replaced == s2.replaced + 1 && s3.replace_unbound == s2.replace_unbound && d3d8_host_2d_metal_binds() == b0 + 1,
+                  "draw mode: a target the executor has not bound is bound by the host and drawn"); }
         /* And the control on the skip counter: a replaced draw whose batches were NOT skipped is counted. */
         case_logo(&c); snapshot_at_call(&c);
         d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);

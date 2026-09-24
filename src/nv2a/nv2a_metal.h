@@ -59,6 +59,13 @@ int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *o
  * loaded and stored, plus the surface size; it returns nonzero if it encoded
  * the draw. The executor marks the surface dirty afterwards (and depth, if
  * `writes_depth`), exactly as after one of its own draws. */
+/* G51.1: bind `target` (w x h, `pitch`, `target_size` bytes) and, when
+ * `use_zeta`, its depth surface, exactly as nv2a_metal_draw binds before a
+ * draw into it -- the same code, shared. Returns 0, or -1 (rejected). */
+int nv2a_metal_bind(uint8_t *target, size_t target_size, uint32_t w, uint32_t h, uint32_t pitch,
+                    uint8_t *depth, uint32_t depth_pitch, size_t depth_size, int use_zeta);
+/* Read-only: surfaces uploaded (rebuilt from guest RAM), slot-cache rebinds, evictions. */
+void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions);
 int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,
                              int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx);
 

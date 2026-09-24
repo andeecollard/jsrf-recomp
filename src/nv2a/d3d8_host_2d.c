@@ -1181,10 +1181,11 @@ void d3d8_host_2d_report(const char *why)
 {
     if (s_mode <= 0 && s_ffmode <= 0) return;
     if (s_mode == 2) {
-        fprintf(stderr, "[D3D8-HOST-2D] %s draw mode: flips=%llu 2D tokens=%llu REPLACED=%llu (executor batches skipped"
-                        " %llu, replaced draws the executor did not skip %llu) | left to the executor: refused %llu,"
-                        " target not bound %llu, no backend %llu | triangles dropped for non-finite w %llu\n",
-                why, s_flips, s_rep_tokens, s_replaced,
+        fprintf(stderr, "[D3D8-HOST-2D] %s draw mode: flips=%llu 2D tokens=%llu REPLACED=%llu (of which the host bound"
+                        " the target first %llu; executor batches skipped %llu, replaced draws the executor did not skip"
+                        " %llu) | left to the executor: refused %llu, target not bound %llu, no backend %llu | triangles"
+                        " dropped for non-finite w %llu\n",
+                why, s_flips, s_rep_tokens, s_replaced, s_have_be && s_be.external_binds ? s_be.external_binds() : 0ull,
                 s_have_be && s_be.exec_skipped ? s_be.exec_skipped() : 0ull, s_rep_noskip, s_rep_refused,
                 s_rep_unbound, s_no_backend, s_tris_dropped_w);
         {

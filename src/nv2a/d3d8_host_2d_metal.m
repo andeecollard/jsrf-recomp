@@ -386,6 +386,8 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
 }
 
 /* ---- draw mode: into the executor's bound surface ---- */
+static unsigned long long s_binds;
+unsigned long long d3d8_host_2d_metal_binds(void) { return s_binds; }
 typedef struct { const D3D8Host2DDraw *d; const uint8_t *ram; size_t ram_size; int ok; } ExtCtx;
 static int external_encode(void *encoder, unsigned w, unsigned h, void *ctx)
 {
@@ -400,8 +402,19 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
     int drawn;
     if (!init()) return 0;
     @autoreleasepool {
-        drawn = nv2a_metal_external_draw(ram + d->rt_addr, d->depth_test ? ram + d->zs_addr : NULL,
-                                         d->depth_test && d->depth_write, external_encode, &x);
+        uint8_t *zs = d->depth_test ? (uint8_t *)ram + d->zs_addr : NULL;
+        drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, d->depth_test && d->depth_write, external_encode, &x);
+        /* Not bound: bind it the way the executor's own draw into it would
+         * (nv2a_metal_bind is that code, shared), then draw. The executor's
+         * next draw into this target finds it bound, as after its own swap. */
+        if (drawn == -2 || drawn == -3 || drawn == -4) {
+            size_t tsz = (size_t)d->rt_pitch * d->rt_h, zsz = (size_t)d->zs_pitch * d->rt_h;
+            if (nv2a_metal_bind((uint8_t *)ram + d->rt_addr, tsz, d->rt_w, d->rt_h, d->rt_pitch, zs, d->zs_pitch, zsz,
+                                d->depth_test) == 0) {
+                ++s_binds;
+                drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, d->depth_test && d->depth_write, external_encode, &x);
+            }
+        }
     }
     switch (drawn) {
     case 1:  break;
