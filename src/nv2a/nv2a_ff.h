@@ -100,7 +100,7 @@ extern unsigned long nv2a_ff_texmat_unset, nv2a_ff_texmat_zero,
  * fixed-function epilogue must not either, even though the programmable
  * emitter's epilogue does. Two paths, two tails, and they are not the same.
  */
-#define NV2A_FF_KEY_VERSION 1u
+#define NV2A_FF_KEY_VERSION 2u   /* 2: the fog byte (G53) */
 typedef struct {
     uint8_t  version;        /* NV2A_FF_KEY_VERSION: an old cached shader for a
                               * new emitter is a wrong picture with no error */
@@ -114,7 +114,8 @@ typedef struct {
                               * table and RECOMP_FF_TEXMAT_IDENTITY together,
                               * exactly as texture_matrix_usable() does. */
     uint8_t  lights;         /* bit L set: light L is INFINITE and enabled */
-    uint8_t  reserved;
+    uint8_t  fog;            /* G53: 0 FOG_ENABLE off (oFog stays 0), else the
+                              * fog coordinate's source, NV2A_FF_FOG_*. */
     uint16_t inputs;         /* attribute mask, ascending, for [[attribute(n)]] */
     uint8_t  pad[4];         /* keep sizeof 32 and every byte defined */
 } NV2AFFKey;
@@ -131,11 +132,31 @@ enum {
     NV2A_FF_C_AMBIENT   = 25,  /*  1  scene ambient in .xyz,   0x0A10 */
     NV2A_FF_C_MATERIAL  = 26,  /*  1  emission in .xyz, material alpha in .w */
     NV2A_FF_C_LIGHT     = 27,  /* 24  per light L: ambient, diffuse, direction */
-    NV2A_FF_C_USED      = 51,
+    NV2A_FF_C_FOGPLANE  = 51,  /*  1  NV097_SET_FOG_PLANE, 0x09D0 */
+    NV2A_FF_C_MODELVIEW = 52,  /*  4  model-view rows, 0x0480 (eye position for fog) */
+    NV2A_FF_C_USED      = 56,
     NV2A_FF_C_SLOTS     = 192  /* the programmable constant file's size, so the
                                 * existing 3072-byte setVertexBytes binds it */
 };
 extern float nv2a_ff_constants[NV2A_FF_C_SLOTS][4];
+
+/* G53: THE FIXED-FUNCTION FOG COORDINATE, per NV097_SET_FOG_GEN_MODE (0x02A0),
+ * as xemu's fixed-function emitter forms it (pgraph/glsl/vsh-ff.c):
+ *   0 SPEC_ALPHA   clamp(specular.a, 0, 1)     -- D3D's FOGTABLEMODE NONE
+ *   1 RADIAL       |eye.xyz|                    -- D3D's RANGEFOGENABLE
+ *   2 PLANAR       dot(plane.xyz, eye.xyz) + plane.w
+ *   3 ABS_PLANAR   |PLANAR|
+ *   6 FOG_X        the fog attribute (v5.x)
+ * eye = the model-view matrix (0x0480) applied to the position, in matrix()'s
+ * convention, which is the composite's. Written to output[5].x; nv2a_fog_factor
+ * turns it into the factor per pixel. */
+enum { NV2A_FF_FOG_OFF = 0, NV2A_FF_FOG_SPEC_ALPHA = 1, NV2A_FF_FOG_RADIAL = 2,
+       NV2A_FF_FOG_PLANAR = 3, NV2A_FF_FOG_ABS_PLANAR = 4, NV2A_FF_FOG_X = 5 };
+/* The key's fog byte for this state; -1 for a gen mode nobody models. */
+int nv2a_ff_fog_source(const uint32_t methods[2048]);
+/* Fog-coordinate census: vertices by source, and those with an unmodelled gen
+ * mode (drawn with coordinate 0, i.e. the fog factor for distance zero). */
+extern unsigned long nv2a_ff_fog_vertices[6], nv2a_ff_fog_unknown;
 
 /* Can the GPU run this batch's fixed-function state, and what shape is it?
  *

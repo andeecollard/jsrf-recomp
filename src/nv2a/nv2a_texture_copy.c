@@ -81,13 +81,134 @@ static void note_bad_ocw(uint32_t w)
     }
 }
 
+/* ---- G53: the final combiner and fog ---------------------------------- */
+/* RECOMP_FOG, default ON: draw fogged draws with the final combiner in full.
+ * =0 is the old gate, which refuses (drops) every final combiner but the two
+ * fog-off ones. RECOMP_FOG_IGNORE=1 is the positive control: D3D's fog
+ * programs are drawn as their fog-off twins, so the geometry appears unfogged
+ * -- it proves the refused draws are the missing ones, and nothing else. */
+static int fog_model_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_FOG",1); return on; }
+static int fog_ignore_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_FOG_IGNORE"); return on; }
+#define FOG_WORDS 32
+static struct { uint32_t cw0, cw1; const char *why; unsigned long n; } s_final_refused[FOG_WORDS];
+static unsigned s_final_refused_n; static unsigned long s_final_refused_overflow;
+static unsigned long s_final_general, s_final_ignored, s_fog_modes[8], s_fog_mode_other;
+static void note_final_refused(uint32_t w0, uint32_t w1, const char *why)
+{
+    for (unsigned i = 0; i < s_final_refused_n; ++i)
+        if (s_final_refused[i].cw0 == w0 && s_final_refused[i].cw1 == w1) { ++s_final_refused[i].n; return; }
+    if (s_final_refused_n >= FOG_WORDS) { ++s_final_refused_overflow; return; }
+    s_final_refused[s_final_refused_n].cw0 = w0; s_final_refused[s_final_refused_n].cw1 = w1;
+    s_final_refused[s_final_refused_n].why = why; s_final_refused[s_final_refused_n++].n = 1;
+    /* LOUD, once per program: a refused final combiner is a dropped draw. */
+    fprintf(stderr, "[FOG] final combiner CW0 %08X CW1 %08X refused (%s): every draw using it is DROPPED\n",
+            w0, w1, why);
+}
+float nv2a_fog_factor(uint32_t mode, float p0, float p1, float d)
+{
+    float f;
+    if (mode == 0x804 || mode == 0x802 || mode == 0x803) d = fabsf(d);
+    switch (mode) {
+    case 0x2601: case 0x804:
+        if (!isfinite(d)) d = 0;
+        f = p0 + d * p1 - 1.0f; break;
+    case 0x800: case 0x802:
+        if (!isfinite(d)) d = 0;
+        f = p0 + exp2f(d * p1 * 16.0f) - 1.5f; break;
+    case 0x801: case 0x803:
+        f = p0 + exp2f(-d * d * p1 * p1 * 32.0f) - 1.5f; break;
+    default: return 1.0f;
+    }
+    return f < 0 ? 0 : f > 1 ? 1 : f;   /* NaN stays NaN, then clamps to 0 below */
+}
+static int final_input_ok(uint32_t code)
+{
+    unsigned reg = code & 15;
+    if (code & 0xC0u) return 0;               /* final inputs are unsigned: identity or invert only */
+    return reg != 6 && reg != 7;              /* 6, 7 name nothing */
+}
+const char *nv2a_final_combiner_supported(uint32_t cw0, uint32_t cw1)
+{
+    for (unsigned k = 0; k < 4; ++k) if (!final_input_ok((cw0 >> (8 * k)) & 255u)) return "final combiner input";
+    for (unsigned k = 1; k < 4; ++k) if (!final_input_ok((cw1 >> (8 * k)) & 255u)) return "final combiner input";
+    if (cw1 & 0x1Fu) return "final combiner setting bits";
+    /* E and F feed EF_PROD, which cannot read itself or the sum. */
+    for (unsigned k = 2; k < 4; ++k) { unsigned r = (cw1 >> (8 * k)) & 15u; if (r == 14 || r == 15) return "final combiner E/F source"; }
+    return NULL;
+}
+static float fin_in(uint32_t code, unsigned ch, float regs[16][4])
+{
+    float x = regs[code & 15][(code & 16) ? 3 : ch];
+    return (code & 32) ? 1 - fminf(1, fmaxf(0, x)) : fmaxf(0, x);
+}
+static void unpack_argb(uint32_t c, float o[4])
+{
+    o[0] = (float)((c >> 16) & 255) / 255.0f; o[1] = (float)((c >> 8) & 255) / 255.0f;
+    o[2] = (float)(c & 255) / 255.0f; o[3] = (float)((c >> 24) & 255) / 255.0f;
+}
+void nv2a_final_combine(const NV2ATextureCopy *s, float regs[16][4], float fog, float out[4])
+{
+    uint32_t w0 = s->final_cw0, w1 = s->final_cw1;
+    unpack_argb(s->spec_fog_c0, regs[1]); unpack_argb(s->spec_fog_c1, regs[2]);
+    regs[3][0] = (float)(s->fog_color & 255) / 255.0f; regs[3][1] = (float)((s->fog_color >> 8) & 255) / 255.0f;
+    regs[3][2] = (float)((s->fog_color >> 16) & 255) / 255.0f; regs[3][3] = fog;
+    for (unsigned k = 0; k < 3; ++k) {
+        float v1 = regs[5][k], r0 = regs[12][k];
+        if (w1 & 0x40) v1 = 1 - fminf(1, fmaxf(0, v1));
+        if (w1 & 0x20) r0 = 1 - fminf(1, fmaxf(0, r0));
+        regs[14][k] = v1 + r0;
+        if (w1 & 0x80) regs[14][k] = fminf(1, fmaxf(0, regs[14][k]));
+    }
+    regs[14][3] = 0;
+    for (unsigned k = 0; k < 3; ++k) regs[15][k] = fin_in(w1 >> 24, k, regs) * fin_in((w1 >> 16) & 255, k, regs);
+    regs[15][3] = 0;
+    for (unsigned k = 0; k < 3; ++k) {
+        float a = fin_in(w0 >> 24, k, regs), b = fin_in((w0 >> 16) & 255, k, regs);
+        float c = fin_in((w0 >> 8) & 255, k, regs), d = fin_in(w0 & 255, k, regs);
+        out[k] = fminf(1, fmaxf(0, d + a * b + (1 - a) * c));
+    }
+    out[3] = fminf(1, fmaxf(0, fin_in((w1 >> 8) & 255, 2, regs)));
+}
+void nv2a_fog_census(void)
+{
+    fprintf(stderr, "[FOG] final combiner: general programs drawn %lu, fog programs drawn unfogged (RECOMP_FOG_IGNORE) %lu,"
+                    " RECOMP_FOG=%s | fog modes: LINEAR %lu EXP %lu EXP2 %lu LINEAR_ABS %lu EXP_ABS %lu EXP2_ABS %lu other %lu\n",
+            s_final_general, s_final_ignored, fog_model_on() ? "on" : "OFF (refused, dropped)",
+            s_fog_modes[0], s_fog_modes[1], s_fog_modes[2], s_fog_modes[3], s_fog_modes[4], s_fog_modes[5], s_fog_mode_other);
+    for (unsigned i = 0; i < s_final_refused_n; ++i)
+        fprintf(stderr, "[FOG]   DROPPED %lu draws: final combiner CW0 %08X CW1 %08X (%s)\n",
+                s_final_refused[i].n, s_final_refused[i].cw0, s_final_refused[i].cw1, s_final_refused[i].why);
+    if (s_final_refused_overflow) fprintf(stderr, "[FOG]   DROPPED %lu more draws with other programs\n", s_final_refused_overflow);
+}
+
 const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s)
 {
+    uint32_t fw0 = M(0x288), fw1 = M(0x28c);
+    int fog_off_program = (fw0==0xc || fw0==0xe) && fw1==0x1c80;
     memset(s, 0, sizeof(*s));
-    if ((M(0x288)!=0xc && M(0x288)!=0xe) || M(0x28c)!=0x1c80) {
-        s_rej_final++;
-        return "combiner / texture program";
+    if (!fog_off_program) {
+        const char *why = fog_model_on() ? nv2a_final_combiner_supported(fw0, fw1) : "RECOMP_FOG=0";
+        if (!why && fog_ignore_on() && (fw0==0x130C0300u || fw0==0x130E0300u) && fw1==0x1c80) {
+            /* The control: D3D's fog program drawn as its fog-off twin. */
+            fw0 = fw0==0x130E0300u ? 0xeu : 0xcu; fog_off_program = 1; ++s_final_ignored;
+        } else if (why) {
+            s_rej_final++; note_final_refused(fw0, fw1, why);
+            return "combiner / texture program";
+        }
     }
+    if (!fog_off_program) {
+        uint32_t fm = M(0x29c);
+        s->final_general = 1; s->final_cw0 = fw0; s->final_cw1 = fw1; ++s_final_general;
+        switch (fm) { case 0x2601: ++s_fog_modes[0]; break; case 0x800: ++s_fog_modes[1]; break;
+                      case 0x801: ++s_fog_modes[2]; break; case 0x804: ++s_fog_modes[3]; break;
+                      case 0x802: ++s_fog_modes[4]; break; case 0x803: ++s_fog_modes[5]; break;
+                      default: ++s_fog_mode_other; break; }
+    }
+    s->fog_enable = M(0x2a4) != 0; s->fog_mode = M(0x29c); s->fog_color = M(0x2a8);
+    memcpy(&s->fog_p0, &M(0x9c0), 4); memcpy(&s->fog_p1, &M(0x9c4), 4);
+    s->spec_fog_c0 = M(0x1e20); s->spec_fog_c1 = M(0x1e24);
     uint32_t control=M(0x1e60),count=control&0xf;
     /* Count occupies the low nibble. The three high flags select mux and
      * per-stage C0/C1; the captured six-stage program sets all three. */
@@ -96,7 +217,7 @@ const char *nv2a_texture_copy_prepare(const uint32_t m[2048], NV2ATextureCopy *s
         if (count<10) s_rej_count_hist[count]++;
         return "combiner / texture program";
     }
-    s->combiner_count=count; s->add_specular=M(0x288)==0xe;
+    s->combiner_count=count; s->add_specular=!s->final_general && fw0==0xe;
     /* The measured programs use plain AB, CD, or AB+CD routing to R0/R1.
      * Keep dot, mux, bias and scale modes explicitly unsupported. */
     for (unsigned i=0;i<s->combiner_count;++i) {
@@ -408,6 +529,7 @@ void nv2a_texture_copy_census(void)
         if (s_dma_rejected[f])
             fprintf(stderr, "[TEXFMT]   dma class %u refused=%lu\n", f, s_dma_rejected[f]);
 
+    nv2a_fog_census();
     fprintf(stderr, "[COMBINER] refusals: final-cw=%lu control=%lu output-mode=%lu"
             " output-reg=%lu input-reg=%lu constant=%lu texmode=%lu texstage=%lu"
             " alpha-test=%lu\n",
@@ -830,7 +952,7 @@ int nv2a_texture_copy_decode_level(const NV2ATextureCopy *s, const uint8_t *data
     return 1;
 }
 
-static float combiner_input(unsigned input,unsigned channel,const float regs[14][4])
+static float combiner_input(unsigned input,unsigned channel,const float regs[16][4])
 {
     unsigned source=input&15;
     float x=regs[source][input&16?3:channel];
@@ -867,7 +989,7 @@ static float combiner_map(unsigned mode,float x)
     }
 }
 
-static void combiner_stage_output(float regs[14][4],uint32_t cw,uint32_t aw,
+static void combiner_stage_output(float regs[16][4],uint32_t cw,uint32_t aw,
                                   float ab[4],float cd[4],float r0_alpha)
 {
     /* THROUGH THE SHARED DECODER. These shifts were right and d3d8_combiners.c's
@@ -934,7 +1056,7 @@ static void combiner_stage_output(float regs[14][4],uint32_t cw,uint32_t aw,
 #undef WR
 }
 
-static void combine(const NV2ATextureCopy *s,float regs[14][4],float out[4])
+static void combine(const NV2ATextureCopy *s,float regs[16][4],float fogd,float out[4])
 {
     /* R0 alpha starts with texture zero's alpha on NV2A. */
     regs[12][3]=(s->texture_mask&1)?regs[8][3]:1;
@@ -960,6 +1082,12 @@ static void combine(const NV2ATextureCopy *s,float regs[14][4],float out[4])
         }
         combiner_stage_output(regs,s->color_ocw[stage],s->alpha_ocw[stage],
                               ab,cd,regs[12][3]);
+    }
+    if(s->final_general) {
+        float f = s->fog_enable ? nv2a_fog_factor(s->fog_mode, s->fog_p0, s->fog_p1, fogd) : 1.0f;
+        if (!(f >= 0)) f = 0;
+        nv2a_final_combine(s, regs, f, out);
+        return;
     }
     for(unsigned k=0;k<4;++k)
         out[k]=fmaxf(0,fminf(1,regs[12][k]+(s->add_specular && k<3?regs[5][k]:0)));
@@ -1171,13 +1299,14 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
         if (!(recip>0)) return 0;
         float rgb[4];
         if(s->combiner_count) {
-            float regs[14][4]={{0}};
+            float regs[16][4]={{0}}, fogd=0;
             for(unsigned i=0;i<3;++i) {
                 float w=e[i]/area/v[i][0][3]/recip;
                 for(unsigned k=0;k<4;++k) {
                     regs[4][k]+=w*v[i][NV2A_VSH_OUT_D0][k];
                     regs[5][k]+=w*v[i][NV2A_VSH_OUT_D1][k];
                 }
+                fogd+=w*v[i][NV2A_VSH_OUT_FOG][0];
             }
             for(unsigned unit=0;unit<4;++unit) if(s->texture_mask&(1u<<unit)) {
                 const NV2ATextureCopy *t=unit?&s->extra_stages[unit-1]:s;
@@ -1202,7 +1331,7 @@ int nv2a_texture_copy_triangle_depth(const NV2ATextureCopy *s,
                 float lod=log2f(fmaxf(0.000001f,fmaxf(dx,dy)));
                 sample_lod(t,data,uv[0][0],uv[0][1],lod,regs[8+unit]);
             }
-            combine(s,regs,rgb);
+            combine(s,regs,fogd,rgb);
         } else {
             if (s->untextured) { rgb[0]=rgb[1]=rgb[2]=rgb[3]=1; }
             else {

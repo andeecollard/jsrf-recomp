@@ -74,9 +74,10 @@ typedef struct {
     const char *name;
     uint32_t cc, ci[8], ai[8], co[8], ao[8], k0[8], k1[8];
     uint32_t tmask, add_specular, untextured, modulate;
+    uint32_t fcw0, fcw1, fog_mode;   /* G53: a final-combiner program other than the two fog-off ones */
 } Case;
 
-#define MAXCASES 40
+#define MAXCASES 48
 static Case cases[MAXCASES];
 static unsigned ncases;
 
@@ -176,6 +177,22 @@ static void build_cases(void)
     { Case *c = &cases[ncases++]; memset(c, 0, sizeof *c); c->name = "no combiner: texture"; c->tmask = 1; }
     { Case *c = &cases[ncases++]; memset(c, 0, sizeof *c); c->name = "no combiner: texture*diffuse"; c->tmask = 1; c->modulate = 1; }
 
+    /* G53: the final combiner, specialised on its two words. D3D's fog
+     * programs over a MODULATE stage, in LINEAR and EXP2, and two arbitrary
+     * programs that reach EF_PROD, V1R0_SUM, both complements and C0/C1. */
+    {   static const struct { const char *name; uint32_t w0, w1, mode; } fc[] = {
+            { "final: D3D fog LINEAR", 0x130C0300u, 0x1C80u, 0x2601 },
+            { "final: D3D fog + specular EXP2", 0x130E0300u, 0x1C80u, 0x801 },
+            { "final: arbitrary EF/V1R0/C0", 0x0F2E0103u, 0x0405ACE0u, 0x2601 },
+            { "final: arbitrary inverted", 0x33250E24u, 0x0C231B40u, 0x800 } };
+        for (unsigned f = 0; f < 4; ++f) {
+            ffinit(&in); ffstage(&in, 0, MOD, CUR, TEX, DIF, MOD, CUR, TEX, DIF);
+            in.texture_bound_mask = 1;
+            Case *c = add_ff(fc[f].name, &in, 0);
+            c->fcw0 = fc[f].w0; c->fcw1 = fc[f].w1; c->fog_mode = fc[f].mode;
+        }
+    }
+
     /* Arbitrary words. Inputs are masked to valid register numbers so the
      * programs read defined registers (1..5, 8..13) but every mapping, the
      * alpha-replicate bit, the dot products, the mux, blue-to-alpha and all
@@ -210,19 +227,19 @@ static void build_cases(void)
 
 static NV2ATextureCopy extra[3];
 
-/* MOV oPos,v0; MOV oD0,v3; MOV oD1,v4; MOV oT0..oT3,v9..v12. */
+/* MOV oPos,v0; MOV oD0,v3; MOV oD1,v4; MOV oT0..oT3,v9..v12; MOV oFog,v5. */
 static int use_vsh;
 static uint32_t vsh_words[8][4];
 static float vsh_consts[192][4];
 static void build_vsh(void)
 {
-    static const unsigned in[8]  = { 0, 3, 4, 9, 10, 11, 12, 0 };
-    static const unsigned out[8] = { 0, 3, 4, 9, 10, 11, 12, 0 };
-    for (int i = 0; i < 7; ++i) {
+    static const unsigned in[8]  = { 0, 3, 4, 9, 10, 11, 12, 5 };
+    static const unsigned out[8] = { 0, 3, 4, 9, 10, 11, 12, 5 };
+    for (int i = 0; i < 8; ++i) {
         VshIns x; memset(&x, 0, sizeof x);
         x.mac = 1; x.input_index = in[i];                 /* NV2A_VSH_MAC_MOV */
         x.a.mux = 2; x.a.swz = SWZ_ID; x.b.mux = 2; x.b.swz = SWZ_ID; x.c.mux = 2; x.c.swz = SWZ_ID;
-        x.out_mask = 0xF; x.out_reg = out[i]; x.final = i == 6;
+        x.out_mask = out[i] == 5 ? 0x8 : 0xF; x.out_reg = out[i]; x.final = i == 7;
         vsh_encode(vsh_words[i], &x);
     }
 }
@@ -239,6 +256,12 @@ static void setup(NV2ATextureCopy *s, const Case *c, unsigned w, unsigned h)
     memcpy(s->color_icw, c->ci, sizeof c->ci); memcpy(s->alpha_icw, c->ai, sizeof c->ai);
     memcpy(s->color_ocw, c->co, sizeof c->co); memcpy(s->alpha_ocw, c->ao, sizeof c->ao);
     memcpy(s->const0, c->k0, sizeof c->k0); memcpy(s->const1, c->k1, sizeof c->k1);
+    if (c->fcw0 || c->fcw1) {
+        s->final_general = 1; s->final_cw0 = c->fcw0; s->final_cw1 = c->fcw1; s->add_specular = 0;
+        s->fog_enable = 1; s->fog_mode = c->fog_mode; s->fog_color = 0x00306090u;
+        s->fog_p0 = c->fog_mode == 0x2601 ? 1.5f : 1.5f; s->fog_p1 = c->fog_mode == 0x2601 ? -0.004f : -0.02f;
+        s->spec_fog_c0 = 0x80C04020u; s->spec_fog_c1 = 0x20406080u;
+    }
     for (unsigned u = 0; u < 3; ++u) {
         extra[u] = *s; extra[u].min_filter = u == 1 ? 1 : 2; extra[u].linear = u != 1;
         s->extra_texture[u] = tex[u + 1]; s->extra_size[u] = sizeof tex[u + 1];
@@ -258,6 +281,7 @@ static void quad(float v[6][16][4], float x0, float y0, float x1, float y1, unsi
         v[j][0][2] = 0.5f * 16777215.0f; v[j][0][3] = 1.0f;
         v[j][3][0] = u; v[j][3][1] = t; v[j][3][2] = 1.0f - u * t; v[j][3][3] = 0.25f + 0.75f * t;
         v[j][4][0] = 0.5f * t; v[j][4][1] = u * 0.8f; v[j][4][2] = (float)(seed % 7) / 7.0f; v[j][4][3] = u;
+        v[j][5][0] = 300.0f * u - 20.0f * t;          /* G53: a fog coordinate across the quad */
         for (int k = 0; k < 4; ++k) {
             v[j][9 + k][0] = u * (1.5f + k); v[j][9 + k][1] = t * (2.0f - 0.25f * k);
             v[j][9 + k][3] = 1.0f;
@@ -271,8 +295,8 @@ static int draw(NV2ATextureCopy *s, uint8_t *tgt, size_t tsize, uint8_t *dep, si
     float v[6][16][4];
     quad(v, x0, y0, x1, y1, seed);
     if (use_vsh) {
-        if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 7,
-                                  (1u << 0) | (1u << 3) | (1u << 4) | (15u << 9))) {
+        if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 8,
+                                  (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5) | (15u << 9))) {
             fprintf(stderr, "FAIL: vertex program refused\n"); return 0;
         }
         nv2a_metal_vsh_constants((const float (*)[4])vsh_consts);

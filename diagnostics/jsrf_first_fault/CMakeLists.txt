@@ -1217,6 +1217,15 @@ if(APPLE)
     target_link_libraries(jsrf_metal_combiner_spec_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_combiner_spec
              COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/metal_combiner_spec_check.sh")
+    # G53: fog and the final combiner -- the factor against D3D's curves, the
+    # final combiner against D3D's fog program, and the Metal shader against
+    # the CPU rasteriser, through both vertex paths.
+    add_executable(jsrf_metal_fog_test metal_fog_test.c
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c"
+        "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
+    target_link_libraries(jsrf_metal_fog_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_fog COMMAND jsrf_metal_fog_test)
+    add_test(NAME jsrf_metal_fog_vsh COMMAND jsrf_metal_fog_test vsh)
     set_tests_properties(jsrf_metal_combiner_spec PROPERTIES
                          ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}")
     # G51.1: the host's own 2D pipeline, built from a D3D description alone,
