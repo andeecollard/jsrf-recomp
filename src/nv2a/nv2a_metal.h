@@ -45,6 +45,18 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
  * values (guest z / 16777215). Completes queued GPU work first. Returns 0 if
  * no hardware depth texture of at least that size is held for it. */
 int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *out);
+/* G51.1 draw mode: let a host renderer draw into the surface the executor has
+ * BOUND, in order with the executor's own work. Only when that surface is
+ * `target` (and, when `depth` is not NULL, its depth is `depth`) and the
+ * hardware path with the 565 attachment holds it; otherwise returns 0 and
+ * does nothing, and the caller must let the executor draw. `encode` receives
+ * the render encoder (an id<MTLRenderCommandEncoder> as void *) of a pass
+ * over colour B5G6R5Unorm, depth Depth32Float and stencil Stencil8, all
+ * loaded and stored, plus the surface size; it returns nonzero if it encoded
+ * the draw. The executor marks the surface dirty afterwards (and depth, if
+ * `writes_depth`), exactly as after one of its own draws. */
+int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,
+                             int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx);
 
 /* RECOMP_SURFACE_CENSUS -- what every retained colour surface holds, on the
  * GPU and in guest RAM, side by side. `guest_base` is xbox_GetMemoryOffset(),

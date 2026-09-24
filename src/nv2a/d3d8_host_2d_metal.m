@@ -54,6 +54,7 @@
 #include "d3d8_host_2d.h"
 #include "nv2a_texture_decode.h"
 #include "nv2a_metal_state.h"
+#include "nv2a_metal.h"
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
@@ -146,7 +147,7 @@ static NSString *const k_src =
 
 static id<MTLDevice> s_dev;
 static id<MTLCommandQueue> s_queue;
-static id<MTLRenderPipelineState> s_pso;
+static id<MTLRenderPipelineState> s_pso, s_pso_st;
 static id<MTLTexture> s_dummy;
 static id<MTLDepthStencilState> s_dss[16];
 static id<MTLDepthStencilState> depth_state(const D3D8Host2DDraw *d)
@@ -197,7 +198,10 @@ static int init(void)
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!s_pso) {
+        /* Draw mode's: the executor's hardware path attaches Stencil8 beside depth. */
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+        s_pso_st = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_pso || !s_pso_st) {
             fprintf(stderr, "[D3D8-HOST-2D] pipeline failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
             s_err = "host 2d: pipeline"; goto out;
         }
@@ -286,6 +290,58 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
     return tex;
 }
 
+/* Encode `d` into a pass whose attachments are W x H and whose top-left is
+ * (ox, oy) in target space: the shadow's crop, or (0, 0) and the whole
+ * surface in draw mode. Returns 1 if encoded (nothing inside the scissor is
+ * encoded as nothing), 0 on failure with s_err set. */
+static int encode_draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> pso, const D3D8Host2DDraw *d,
+                       const uint8_t *ram, size_t ram_size, unsigned W, unsigned H, unsigned ox, unsigned oy)
+{
+    int32_t sx0 = d->sc_x0 > (int32_t)ox ? d->sc_x0 : (int32_t)ox, sy0 = d->sc_y0 > (int32_t)oy ? d->sc_y0 : (int32_t)oy;
+    int32_t sx1 = d->sc_x1 < (int32_t)(ox + W - 1) ? d->sc_x1 : (int32_t)(ox + W - 1);
+    int32_t sy1 = d->sc_y1 < (int32_t)(oy + H - 1) ? d->sc_y1 : (int32_t)(oy + H - 1);
+    H2DUniforms u;
+    id<MTLTexture> tex[4] = { nil, nil, nil, nil };
+    id<MTLSamplerState> smp[4] = { nil, nil, nil, nil };
+    if (!d->nverts || sx1 < sx0 || sy1 < sy0) return 1;
+    memset(&u, 0, sizeof u);
+    u.W = (float)W; u.H = (float)H; u.ox = ox; u.oy = oy;
+    u.cc = d->cc; u.control = d->control; u.tmask = d->tmask; u.add_spec = d->add_specular;
+    u.alpha_test = d->alpha_test; u.alpha_func = d->alpha_func; u.alpha_ref = d->alpha_ref;
+    u.blend = d->blend; u.bsrc = d->blend_src; u.bdst = d->blend_dst; u.beq = d->blend_eq; u.bcolor = d->blend_color;
+    u.dither = d->dither; u.cmask = d->color_mask;
+    memcpy(u.ci, d->ci, sizeof u.ci); memcpy(u.ai, d->ai, sizeof u.ai);
+    memcpy(u.co, d->co, sizeof u.co); memcpy(u.ao, d->ao, sizeof u.ao);
+    memcpy(u.k0, d->k0, sizeof u.k0); memcpy(u.k1, d->k1, sizeof u.k1);
+    for (unsigned s = 0; s < 4; ++s) {
+        if (!(d->tmask & (1u << s))) continue;
+        const D3D8H2DTexture *t = &d->tex[s];
+        if (!(tex[s] = texture_for(t, ram, ram_size))) return 0;
+        smp[s] = sampler_for(t);
+        u.tw[s] = (float)t->width; u.th[s] = (float)t->height; u.lod_bias[s] = t->lod_bias;
+        if (t->linear) u.lin_mask |= 1u << s;
+    }
+    id<MTLBuffer> vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)d->nverts * sizeof(D3D8H2DVertex)
+                                         options:MTLResourceStorageModeShared];
+    if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
+    [enc setRenderPipelineState:pso];
+    [enc setDepthStencilState:depth_state(d)];
+    [enc setDepthClipMode:MTLDepthClipModeClamp];
+    [enc setCullMode:MTLCullModeNone];
+    MTLScissorRect sc = { (NSUInteger)(sx0 - (int32_t)ox), (NSUInteger)(sy0 - (int32_t)oy),
+                          (NSUInteger)(sx1 - sx0 + 1), (NSUInteger)(sy1 - sy0 + 1) };
+    [enc setScissorRect:sc];
+    [enc setVertexBuffer:vb offset:0 atIndex:0];
+    [enc setVertexBytes:&u length:sizeof u atIndex:1];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    for (unsigned s = 0; s < 4; ++s) {
+        [enc setFragmentTexture:tex[s] ? tex[s] : s_dummy atIndex:s];
+        [enc setFragmentSamplerState:smp[s] ? smp[s] : sampler_for(&(D3D8H2DTexture){ .mag = 1, .min_filter = 1, .wrap_u = 3, .wrap_v = 3 }) atIndex:s];
+    }
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:d->nverts];
+    return 1;
+}
+
 int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size,
                               uint16_t *pixels, unsigned pitch_px, float *depth,
                               unsigned x0, unsigned y0, unsigned w, unsigned h)
@@ -293,32 +349,7 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
     if (!d || !pixels || !w || !h || pitch_px < w) return fail("host 2d: bad arguments");
     if (d->depth_test && !depth) return fail("host 2d: depth test without the depth it starts from");
     if (!init()) return -1;
-    /* The scissor, in crop space. Nothing inside it: nothing drawn, pixels as they were. */
-    int32_t sx0 = d->sc_x0 > (int32_t)x0 ? d->sc_x0 : (int32_t)x0, sy0 = d->sc_y0 > (int32_t)y0 ? d->sc_y0 : (int32_t)y0;
-    int32_t sx1 = d->sc_x1 < (int32_t)(x0 + w - 1) ? d->sc_x1 : (int32_t)(x0 + w - 1);
-    int32_t sy1 = d->sc_y1 < (int32_t)(y0 + h - 1) ? d->sc_y1 : (int32_t)(y0 + h - 1);
-    if (!d->nverts || sx1 < sx0 || sy1 < sy0) return 0;
     @autoreleasepool {
-        H2DUniforms u;
-        id<MTLTexture> tex[4] = { nil, nil, nil, nil };
-        id<MTLSamplerState> smp[4] = { nil, nil, nil, nil };
-        memset(&u, 0, sizeof u);
-        u.W = (float)w; u.H = (float)h; u.ox = x0; u.oy = y0;
-        u.cc = d->cc; u.control = d->control; u.tmask = d->tmask; u.add_spec = d->add_specular;
-        u.alpha_test = d->alpha_test; u.alpha_func = d->alpha_func; u.alpha_ref = d->alpha_ref;
-        u.blend = d->blend; u.bsrc = d->blend_src; u.bdst = d->blend_dst; u.beq = d->blend_eq; u.bcolor = d->blend_color;
-        u.dither = d->dither; u.cmask = d->color_mask;
-        memcpy(u.ci, d->ci, sizeof u.ci); memcpy(u.ai, d->ai, sizeof u.ai);
-        memcpy(u.co, d->co, sizeof u.co); memcpy(u.ao, d->ao, sizeof u.ao);
-        memcpy(u.k0, d->k0, sizeof u.k0); memcpy(u.k1, d->k1, sizeof u.k1);
-        for (unsigned s = 0; s < 4; ++s) {
-            if (!(d->tmask & (1u << s))) continue;
-            const D3D8H2DTexture *t = &d->tex[s];
-            if (!(tex[s] = texture_for(t, ram, ram_size))) return -1;
-            smp[s] = sampler_for(t);
-            u.tw[s] = (float)t->width; u.th[s] = (float)t->height; u.lod_bias[s] = t->lod_bias;
-            if (t->linear) u.lin_mask |= 1u << s;
-        }
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatB5G6R5Unorm
                                                                                        width:w height:h mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
@@ -331,9 +362,6 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         id<MTLTexture> ztex = [s_dev newTextureWithDescriptor:zd];
         if (!ztex) return fail("host 2d: depth allocation");
         if (depth) [ztex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:depth bytesPerRow:(NSUInteger)w * 4u];
-        id<MTLBuffer> vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)d->nverts * sizeof(D3D8H2DVertex)
-                                             options:MTLResourceStorageModeShared];
-        if (!vb) return fail("host 2d: vertex buffer");
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = target;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -345,22 +373,9 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
         if (!cb || !enc) return fail("host 2d: command encoder");
-        [enc setRenderPipelineState:s_pso];
-        [enc setDepthStencilState:depth_state(d)];
-        [enc setDepthClipMode:MTLDepthClipModeClamp];
-        [enc setCullMode:MTLCullModeNone];
-        MTLScissorRect sc = { (NSUInteger)(sx0 - (int32_t)x0), (NSUInteger)(sy0 - (int32_t)y0),
-                              (NSUInteger)(sx1 - sx0 + 1), (NSUInteger)(sy1 - sy0 + 1) };
-        [enc setScissorRect:sc];
-        [enc setVertexBuffer:vb offset:0 atIndex:0];
-        [enc setVertexBytes:&u length:sizeof u atIndex:1];
-        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-        for (unsigned s = 0; s < 4; ++s) {
-            [enc setFragmentTexture:tex[s] ? tex[s] : s_dummy atIndex:s];
-            [enc setFragmentSamplerState:smp[s] ? smp[s] : sampler_for(&(D3D8H2DTexture){ .mag = 1, .min_filter = 1, .wrap_u = 3, .wrap_v = 3 }) atIndex:s];
-        }
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:d->nverts];
+        int ok = encode_draw(enc, s_pso, d, ram, ram_size, w, h, x0, y0);
         [enc endEncoding];
+        if (!ok) return -1;
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return fail("host 2d: GPU error");
@@ -368,4 +383,26 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
         if (depth) [ztex getBytes:depth bytesPerRow:(NSUInteger)w * 4u fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
     }
     return 0;
+}
+
+/* ---- draw mode: into the executor's bound surface ---- */
+typedef struct { const D3D8Host2DDraw *d; const uint8_t *ram; size_t ram_size; int ok; } ExtCtx;
+static int external_encode(void *encoder, unsigned w, unsigned h, void *ctx)
+{
+    ExtCtx *x = ctx;
+    id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder;
+    if (w != x->d->rt_w || h != x->d->rt_h) { s_err = "executor surface is not the render target's size"; return 0; }
+    return x->ok = encode_draw(enc, s_pso_st, x->d, x->ram, x->ram_size, w, h, 0, 0);
+}
+int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size)
+{
+    ExtCtx x = { d, ram, ram_size, 0 };
+    int drawn;
+    if (!init()) return 0;
+    @autoreleasepool {
+        s_err = "executor target not bound";
+        drawn = nv2a_metal_external_draw(ram + d->rt_addr, d->depth_test ? ram + d->zs_addr : NULL,
+                                         d->depth_test && d->depth_write, external_encode, &x);
+    }
+    return drawn && x.ok;
 }

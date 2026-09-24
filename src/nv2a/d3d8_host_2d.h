@@ -34,9 +34,17 @@
  * starting pixels, and an error in one cannot leak into the next. The pixel
  * comparison itself runs at the frame's FLIP_STALL.
  *
- * RECOMP_D3D8_HOST_2D=shadow arms it (and the mirror with it). `draw`, where
- * the host's output would REPLACE the executor's for this class, is reserved
- * and not implemented: it is read, named in the log, and run as shadow.
+ * RECOMP_D3D8_HOST_2D=shadow arms it (and the mirror with it).
+ *
+ * RECOMP_D3D8_HOST_2D=draw REPLACES the executor for this class. The mirror
+ * writes the whole description as a token BEFORE the draw's commands; at it
+ * the host builds the draw under exactly the shadow's eligibility rules and,
+ * if it can, encodes it into the surface the executor has bound
+ * (nv2a_metal_external_draw), then tells the executor to skip the draw's
+ * batches (nv2a_pb_exec_host_skip) until the check token behind them. Any
+ * draw the host refuses, or whose target the executor has not bound, is left
+ * to the executor untouched. RECOMP_D3D8_HOST_2D_CONTROL=1 perturbs the host's
+ * draws in this mode too, so what reaches the screen visibly is the host's.
  *
  * Split in two so the part that decides WHAT to draw can be tested with no
  * device: d3d8_host_2d.c (pure C, xbox_nv2a) builds a D3D8Host2DDraw and runs
@@ -125,6 +133,13 @@ typedef struct {
     uint32_t zs_addr, zs_pitch;
     float    z_min, z_max;                     /* over the emitted vertices */
     uint32_t control_perturbed;                /* RECOMP_D3D8_HOST_2D_CONTROL applied */
+    /* Triangles not drawn because a vertex's clip w = 1/rhw is not finite
+     * (rhw 0: a zeroed slot in a partly filled dynamic buffer). The executor
+     * loses them too: its CPU path's vertex_valid() rejects the triangle and
+     * its GPU path clips it away. Tutorial run 5's one mismatch was such a
+     * triangle, drawn by the host at w = 1 as a sliver from the corner. */
+    uint32_t tris_dropped_w;
+    uint32_t idx_min, idx_max;                 /* over the indices drawn */
 } D3D8Host2DDraw;
 
 /* Is this draw pre-transformed 2D? The vertex shader handle (device +0x384)
@@ -195,11 +210,21 @@ typedef struct {
      * it holds none; the shadow then reads the surface from guest RAM, which
      * is what the executor itself would upload for it. nv2a_metal_depth_peek. */
     int (*depth_peek)(const uint8_t *depth, unsigned w, unsigned h, float *out);
+    /* Draw mode. external_draw draws `d` into the executor's bound target
+     * (1), or does nothing (0); exec_skip turns the executor's rasteriser off
+     * and on; exec_skipped counts the batches it has skipped. */
+    int (*external_draw)(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
+    void (*exec_skip)(int on);
+    unsigned long long (*exec_skipped)(void);
 } D3D8Host2DBackend;
 
-/* 0 off, 1 shadow (and `draw`, which runs as shadow for now). Reads
- * RECOMP_D3D8_HOST_2D once. */
+/* 0 off, 1 shadow, 2 draw. Reads RECOMP_D3D8_HOST_2D once. */
 int  d3d8_host_2d_mode(void);
+/* Draw mode: the token before a 2D draw's commands, and the check behind them. */
+void d3d8_host_2d_replace(const D3D8HostDrawCheck *c);
+void d3d8_host_2d_after(const D3D8HostDrawCheck *c);
+/* The renderer's draw-mode half: `d` into the executor's bound surface. */
+int  d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);
 /* The token before a 2D draw's commands: snapshot the target it starts from. */
 void d3d8_host_2d_pre(uint32_t serial, uint32_t rt_data, uint32_t rt_format, uint32_t rt_size,
@@ -214,6 +239,8 @@ typedef struct {
     unsigned long long depth_draws, depth_px, depth_px_mismatch, depth_draws_mismatching;
     unsigned long long z_from_texture, z_from_ram, proof_pass, proof_reject, proof_depends;
     unsigned long long idx_from_snapshot, idx_changed, vtx_changed, exec_outside_host_box;
+    unsigned long long replace_tokens, replaced, replace_refused, replace_unbound, exec_batches_skipped,
+                       replaced_without_skip;
 } D3D8H2DStats;
 void d3d8_host_2d_get_stats(D3D8H2DStats *out);
 

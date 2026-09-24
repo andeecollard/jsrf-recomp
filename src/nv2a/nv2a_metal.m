@@ -4562,6 +4562,41 @@ int nv2a_metal_depth_peek(const uint8_t *depth, unsigned w, unsigned h, float *o
     return 1;
 }
 
+/* G51.1 draw mode. See nv2a_metal.h. Nothing on the executor's own path
+ * calls it. It uses the executor's queue, so its pass is ordered after every
+ * draw the executor has committed and before every one it commits next, and
+ * Metal's hazard tracking orders the attachment accesses. The fence pair
+ * mirrors a per-draw command buffer's, so RECOMP_METAL_PASS_FENCE sees it as
+ * one more draw. */
+int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,
+                             int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx)
+{
+    draw_thread_check();
+    if (!encode || !target || !hw_state_on() || !hw_565_on() || !surface || !surface_valid
+            || surface_target != target || !hw_depth_tex || !hw_stencil_tex) return 0;
+    if (depth && depth_target != depth) return 0;
+    batch_flush();
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = surface;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad; pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.depthAttachment.texture = hw_depth_tex;
+    pass.depthAttachment.loadAction = MTLLoadActionLoad; pass.depthAttachment.storeAction = MTLStoreActionStore;
+    pass.stencilAttachment.texture = hw_stencil_tex;
+    pass.stencilAttachment.loadAction = MTLLoadActionLoad; pass.stencilAttachment.storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = cb ? [cb renderCommandEncoderWithDescriptor:pass] : nil;
+    if (!cb || !enc) return 0;
+    if (pass_fence_on() && g_pass_fence) [enc waitForFence:g_pass_fence beforeStages:MTLRenderStageVertex];
+    int ok = encode((__bridge void *)enc, surface_width, surface_height, ctx);
+    if (pass_fence_on() && g_pass_fence) { [enc updateFence:g_pass_fence afterStages:MTLRenderStageFragment]; ++g_fence_waits; }
+    [enc endEncoding];
+    mtl_cb_gpu_watch(cb);
+    [cb commit];
+    last_command = cb;
+    if (ok) { surface_dirty = 1; if (writes_depth) depth_dirty = 1; }
+    return ok != 0;
+}
+
 void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed)
 {
     if (color) *color = surface_target;

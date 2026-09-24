@@ -384,13 +384,91 @@ static void d3d8m_put_token(uint32_t tok)
  * and render target are D3D's at this moment, which the draw does not change
  * before it emits. The serial is the one d3d8m_after_draw will give it. */
 static unsigned long long m_pre_no_token;
+/* The indices a 2D draw CALL is handed, into the host's ring, and a hash of
+ * the vertex bytes they reach. Shared by the shadow (after the call) and draw
+ * mode (before it): D3D copies these indices into the ring during the call,
+ * and the title rewrites pIndexData for its next draw long before a token is
+ * reached, so the call is the one moment they are right. */
+static void d3d8m_snap_indices(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a2, uint32_t a3)
+{
+    extern ptrdiff_t xbox_GetMemoryOffset(void);
+    uint32_t imin = kind == 2 ? 0xFFFFFFFFu : a2, imax = kind == 2 ? 0u : a2 + (a3 ? a3 - 1u : 0u);
+    if (kind == 2 && a2) {
+        uint64_t pos; uint16_t *dst = d3d8_host_2d_idx_reserve(a2, &pos);
+        if (!dst) c->idx_snap_over = 1;
+        else {
+            for (uint32_t k = 0; k < a2; ++k) {
+                uint16_t v = MEM16(a3 + 2u * k);
+                dst[k] = v; if (v < imin) imin = v; if (v > imax) imax = v;
+            }
+            d3d8_host_2d_idx_publish(pos, a2);
+            c->idx_snap_pos = pos; c->idx_snap_n = a2;
+        }
+    }
+    if (imin <= imax) {
+        c->vtx_hash = d3d8_host_2d_vertex_hash((const uint8_t *)xbox_GetMemoryOffset(), 0x04000000u, c, imin, imax);
+        c->vtx_hash_ok = 1;
+    }
+}
+/* G51.1 draw mode: everything d3d8_host_2d_build reads, from D3D's state as
+ * the call is about to use it -- the same reads d3d8m_after_draw makes, minus
+ * the G39-G43 checks' emission tracking, which this must not disturb. Before
+ * the call is correct for all of it: the title has set its state and bound
+ * its buffers, and the draw changes none of what is read here. */
+static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    uint32_t d = MEM32(0x0019DCE0u);
+    memset(c, 0, sizeof *c);
+    c->serial = m_serial + 1u;
+    d3d8m_streams(c, kind, a1, a2, a3);
+    c->idx_ptr = kind == 2 ? a3 : 0u;
+    memcpy(c->x_val, m_x_val, sizeof c->x_val); c->x_seen = m_x_seen;
+    d3d8m_snap_indices(c, kind, a2, a3);
+    c->ffc_valid = 1; d3d8m_ffc_read(&c->ffc_cur); c->ffc_ps = c->ffc_cur.pixel_shader;
+    c->tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);
+    d3d8m_fog_read(c->fog_cur);
+    c->ffv_valid = 1; c->ffv_vs_flags = d3d8m_vs_flags(d); d3d8m_fg_read(&c->fg_cur);
+    for (unsigned u = 0; u < 4; ++u) {
+        uint32_t t = MEM32(d + 0xA78u + 4u * u);
+        c->tex[u] = t;
+        if (t) { c->data[u] = MEM32(t + 4u); c->format[u] = MEM32(t + 0xCu); c->size[u] = MEM32(t + 0x10u); }
+    }
+    c->rt = MEM32(d + 0x2070u); c->zs = MEM32(d + 0x2074u);
+    if (c->rt) { c->rt_data = MEM32(c->rt + 4u); c->rt_format = MEM32(c->rt + 0xCu); c->rt_size = MEM32(c->rt + 0x10u); }
+    if (c->zs) { c->zs_data = MEM32(c->zs + 4u); c->zs_format = MEM32(c->zs + 0xCu); c->zs_size = MEM32(c->zs + 0x10u); }
+    c->vp_x = (int32_t)MEM32(d + 0x9D0u); c->vp_y = (int32_t)MEM32(d + 0x9D4u);
+    c->vp_w = (int32_t)MEM32(d + 0x9D8u); c->vp_h = (int32_t)MEM32(d + 0x9DCu);
+    { uint32_t u; u = MEM32(d + 0x9E0u); memcpy(&c->vp_minz, &u, 4); u = MEM32(d + 0x9E4u); memcpy(&c->vp_maxz, &u, 4);
+      u = MEM32(d + 0x454u); memcpy(&c->ss_x, &u, 4); u = MEM32(d + 0x458u); memcpy(&c->ss_y, &u, 4); }
+    memcpy(c->st_val, m_state_val, sizeof c->st_val); c->st_seen = m_state_seen;
+    for (unsigned u = 0; u < 4; ++u)
+        for (unsigned k = 0; k < 32; ++k) c->tss[u][k] = MEM32(0x0019DEE0u + 4u * (32u * u + k));
+    c->vs_handle = MEM32(d + 0x384u);
+    if (m_ps_handle) { c->ps_bound = 1; for (unsigned k = 0; k < 57; ++k) c->ps[k] = MEM32(0x0019E0E0u + 4u * k); }
+}
+
 void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     uint32_t d, rt, zs, tok;
-    (void)kind; (void)a1; (void)a2; (void)a3;
-    if (!d3d8m_on() || !d3d8_host_2d_mode()) return;
+    int mode;
+    if (!d3d8m_on() || !(mode = d3d8_host_2d_mode())) return;
     d = MEM32(0x0019DCE0u);
     if (!d3d8_host_2d_is_fvf_xyzrhw(MEM32(d + 0x384u))) return;
+    if (mode == 2) {
+        /* Draw mode: the whole description goes ahead of the draw's commands.
+         * The host draws it there, in the executor's target, and tells the
+         * executor to skip the batches that follow until the check token. */
+        static D3D8HostDrawCheck c;
+        d3d8m_fill_2d(&c, kind, a1, a2, a3);
+        tok = d3d8_host_enqueue_2d_replace(&c);
+        if (!tok) {
+            if (m_pre_no_token++ < 4)
+                fprintf(stderr, "[D3D8-MIRROR] G51.1: host token queue full before draw %u; the executor draws it\n", m_serial + 1u);
+            return;
+        }
+        d3d8m_put_token(tok);
+        return;
+    }
     rt = MEM32(d + 0x2070u); zs = MEM32(d + 0x2074u);
     tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
                                    rt ? MEM32(rt + 0x10u) : 0u, zs ? MEM32(zs + 4u) : 0u, zs ? MEM32(zs + 0x10u) : 0u);
@@ -417,26 +495,8 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long
      * before the token is reached. */
-    if (d3d8_host_2d_mode() && d3d8_host_2d_is_fvf_xyzrhw(MEM32(MEM32(0x0019DCE0u) + 0x384u))) {
-        extern ptrdiff_t xbox_GetMemoryOffset(void);
-        uint32_t imin = kind == 2 ? 0xFFFFFFFFu : a2, imax = kind == 2 ? 0u : a2 + (a3 ? a3 - 1u : 0u);
-        if (kind == 2 && a2) {
-            uint64_t pos; uint16_t *dst = d3d8_host_2d_idx_reserve(a2, &pos);
-            if (!dst) c.idx_snap_over = 1;
-            else {
-                for (uint32_t k = 0; k < a2; ++k) {
-                    uint16_t v = MEM16(a3 + 2u * k);
-                    dst[k] = v; if (v < imin) imin = v; if (v > imax) imax = v;
-                }
-                d3d8_host_2d_idx_publish(pos, a2);
-                c.idx_snap_pos = pos; c.idx_snap_n = a2;
-            }
-        }
-        if (imin <= imax) {
-            c.vtx_hash = d3d8_host_2d_vertex_hash((const uint8_t *)xbox_GetMemoryOffset(), 0x04000000u, &c, imin, imax);
-            c.vtx_hash_ok = 1;
-        }
-    }
+    if (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_fvf_xyzrhw(MEM32(MEM32(0x0019DCE0u) + 0x384u)))
+        d3d8m_snap_indices(&c, kind, a2, a3);
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */
     c.ffc_valid = 1;
