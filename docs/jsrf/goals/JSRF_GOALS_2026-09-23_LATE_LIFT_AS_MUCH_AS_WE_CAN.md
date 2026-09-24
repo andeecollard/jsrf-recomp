@@ -419,3 +419,20 @@ merging or carrying flags at split entries.
   - Over-tolerance pixels: 3,152 (was 25.3M). Depth: 1 draw mismatching.
   - The one left: flip 2078, a 306-vertex HUD text draw (fvf 1C4, 256x256
     tex 0E) where the host covered 6,818 px and the executor 3,682.
+- **G51.1 draw mode works** (`5054cf9`). The one-off was ours: a zeroed
+  vertex (rhw 0) in a partly filled dynamic buffer. The executor loses that
+  triangle (w = 1/rhw is infinite) and the host drew it; the host now drops it
+  too. `RECOMP_D3D8_HOST_2D=draw`: the host draws the 2D class into the
+  executor's bound surface, and the executor skips the rasteriser call.
+  Tutorial, player config, `RECOMP_FLIP_PACE=0`, 110 s per arm, 0 faults each:
+
+  | arm | replaced | not skipped | left to executor | fps | submit ms | sync ms |
+  |---|---|---|---|---|---|---|
+  | A mirror only | – | – | – | 83.4 | 3.63 | 2.66 |
+  | B draw | 24,196 | 0 | 2,123 (target not bound) | 86.5 | 3.00 | 2.45 |
+  | C draw + control | 24,277 | 0 | 2,123 | 86.8 | 3.00 | 2.46 |
+
+  Pictures: B's presented frames match A's (text, letterbox, name label). In
+  C the letterbox and text turn red, which proves the 2D layer on screen is the
+  host's. Draw mode needs the staged mirror gen; it is not in the player's
+  build yet.
