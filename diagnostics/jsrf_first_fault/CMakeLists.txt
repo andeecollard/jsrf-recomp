@@ -965,6 +965,7 @@ add_executable(jsrf_primitive_split_test primitive_split_test.c
     "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")
 target_link_libraries(jsrf_primitive_split_test PRIVATE xbox_vsh)
 add_test(NAME jsrf_primitive_split COMMAND jsrf_primitive_split_test)
+add_test(NAME jsrf_primitive_split_off COMMAND jsrf_primitive_split_test off)
 add_executable(jsrf_flip_sync_test flip_sync_test.c
     "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c"
     "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")

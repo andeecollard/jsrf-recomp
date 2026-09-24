@@ -239,6 +239,8 @@ VALUE_CARRYING = {
     "RECOMP_D3D8_HOST_VS",
     # G53: a COUNT of fogged batches to trace (1 means 40).
     "RECOMP_FOG_DRAW_TRACE",
+    # G54: a COUNT of immediate-mode batches to trace (1 means 8).
+    "RECOMP_PB_IMMEDIATE_TRACE",
     # A stride in flips: every Nth flip of a draw-mode run is verified.
     "RECOMP_D3D8_HOST_VERIFY",
 }

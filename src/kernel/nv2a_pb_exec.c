@@ -3500,9 +3500,15 @@ uint32_t nv2a_pb_exec_last_batch(uint32_t *prim) { if (prim) *prim = s_last_batc
 static float s_imm[NV_MAX_IMM][16][4];
 static uint32_t s_imm_count, s_imm_overflow;
 static int s_imm_active;
+/* RECOMP_PB_IMMEDIATE=0 and RECOMP_PB_POINTS_LINES=0: the pre-G54 behaviour
+ * of each, for an A/B inside one binary. Both default ON. */
+static int pb_immediate_on(void)
+{ static int on = -1; if (on < 0) on = recomp_switch_on_default("RECOMP_PB_IMMEDIATE", 1); return on; }
+static int pb_points_lines_on(void)
+{ static int on = -1; if (on < 0) on = recomp_switch_on_default("RECOMP_PB_POINTS_LINES", 1); return on; }
 static void imm_emit(void)
 {
-    if (!s_gpu.prim) return;
+    if (!s_gpu.prim || !pb_immediate_on()) return;
     if (s_imm_count < NV_MAX_IMM) memcpy(s_imm[s_imm_count++], s_vsh.current, sizeof s_imm[0]);
     else ++s_imm_overflow;
 }
@@ -4278,6 +4284,35 @@ static void raster_triangle(const float a[2], const float b[2],
 
 /* One vertex source for both paths: a batch that pushed inline data reads from
  * it, anything else reads the arrays the title pointed at. */
+/* RECOMP_PB_IMMEDIATE_TRACE=<n> -- G54, read-only: the first n immediate-mode
+ * batches (8 if n is 1), then one in every 1,000: primitive, vertex count,
+ * the first four vertices' position, diffuse, specular and texcoord 0, and the
+ * state they draw with -- blend, stencil, depth, transform MODE, program
+ * start, texture unit enables, colour mask. */
+static void imm_trace(void)
+{
+    static int cap = -1; static unsigned long seen, printed;
+    const uint32_t *m = s_methods;
+    if (cap < 0) { const char *e = getenv("RECOMP_PB_IMMEDIATE_TRACE"); cap = e && *e ? atoi(e) : 0; if (cap == 1) cap = 8; }
+    if (cap <= 0) return;
+    ++seen;
+    if (printed >= (unsigned long)cap && seen % 1000u) return;
+    ++printed;
+    fprintf(stderr, "[IMM] batch %lu draw %u: prim %u, %u vertices | xf MODE %u prog start %u | blend %u %X/%X eq %X |"
+                    " stencil %u func %X ref %u mask %X ops %X/%X/%X write mask %X | depth %u func %X write %u |"
+                    " textures %u%u%u%u (0x1B0C bit 30) | colour mask %08X | cull %u face %X\n",
+            seen, s_gpu.draws, s_gpu.prim, s_imm_count, m[0x1e94/4] & 3u, m[0x1ea0/4], m[0x304/4], m[0x344/4], m[0x348/4],
+            m[0x350/4], m[0x32c/4], m[0x364/4], m[0x368/4], m[0x36c/4], m[0x370/4], m[0x374/4], m[0x378/4], m[0x360/4],
+            m[0x30c/4], m[0x354/4], m[0x35c/4], (m[0x1b0c/4] >> 30) & 1u, (m[(0x1b0c + 64)/4] >> 30) & 1u,
+            (m[(0x1b0c + 128)/4] >> 30) & 1u, (m[(0x1b0c + 192)/4] >> 30) & 1u, m[0x358/4], m[0x308/4], m[0x39c/4]);
+    for (uint32_t v = 0; v < s_imm_count && v < 4; ++v) {
+        const float (*a)[4] = (const float (*)[4])s_imm[v];
+        fprintf(stderr, "[IMM]   v%u: pos (%g %g %g %g) diffuse (%g %g %g %g) specular (%g %g %g %g) tex0 (%g %g %g %g)\n", v,
+                a[0][0], a[0][1], a[0][2], a[0][3], a[3][0], a[3][1], a[3][2], a[3][3],
+                a[4][0], a[4][1], a[4][2], a[4][3], a[9][0], a[9][1], a[9][2], a[9][3]);
+    }
+    fflush(stderr);
+}
 static int fetch_vertex(uint32_t a, uint32_t index, float out[4])
 {
     if (s_imm_active) {
@@ -5237,6 +5272,10 @@ static void raster_batch(void)
      * primitives need three, and a triangle batch with fewer draws nothing on
      * the NV2A either, so that is not a drop. Points and lines are drawn by the
      * Metal path (nv2a_metal.m, draw_points_lines). */
+    if (s_gpu.prim >= 1 && s_gpu.prim <= 4 && !pb_points_lines_on()) {
+        nv2a_drop(NV2A_DROP_DROPPED, "raster", "points and lines off (RECOMP_PB_POINTS_LINES=0)", s_gpu.prim);
+        return;
+    }
     {   uint32_t need = s_gpu.prim == 1 ? 1u : (s_gpu.prim >= 2 && s_gpu.prim <= 4) ? 2u : 3u;
         if (s_gpu.idx_count < need) {
             if (fade_batch) ++s_blend_fade_fate.short_idx;
@@ -6088,6 +6127,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
                 }
             }
             if (!s_gpu.idx_count && !s_gpu.inline_count && s_imm_count) {
+                imm_trace();
                 /* Immediate mode: every attribute from the emitted vertices,
                  * so each is declared float4 for the draw and fetch_vertex
                  * serves them; the arrays' own declarations come back after. */
