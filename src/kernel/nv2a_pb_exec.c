@@ -5248,6 +5248,149 @@ static void raster_indices(uint32_t a, uint32_t b, uint32_t c)
     }
 }
 
+/* G54 RECOMP_INVISIBLE_DRAW=<n>: DRAWS THAT REACH THE RASTERISER AND PAINT
+ * NOTHING. Opt-in, read-only. For each batch drawn on the Metal path whose
+ * triangles cover >= 2,000 px of the surface (their clipped screen area,
+ * from the transformed positions -- the CPU transforms a GPU-path batch's
+ * vertices for this only), the draw's fragments that pass every test are
+ * counted by a Metal visibility slot. At the flip, a batch where fewer than
+ * 1% of its area's pixels passed is INVISIBLE: counted per window, and the
+ * first n distinct states (n = 16 for 1) printed with everything that can
+ * make a fragment vanish -- texture formats, addresses and a decoded alpha
+ * histogram per stage, alpha test, blend, colour mask, stencil, depth, the
+ * combiner and final-combiner words, the first vertices' diffuse alpha, the
+ * transform MODE. Off: one branch per batch. */
+#define INV_SLOTS 4096
+typedef struct {
+    float area; uint32_t draw, prim, xfmode, cmask, blend_eq, alpha_func;
+    uint32_t stencil[8], depth[3];
+    float d0a[3];
+    NV2ATextureCopy st, ex[3];
+    const uint8_t *tex[4]; size_t texsize[4]; uint32_t texaddr[4];
+} InvRec;
+static InvRec s_inv[INV_SLOTS];
+static unsigned s_inv_n, s_inv_printed;
+static unsigned long long s_inv_measured, s_inv_invisible, s_inv_measured_rep, s_inv_invisible_rep;
+static uint32_t s_inv_keys[256][4]; static unsigned s_inv_nkeys;
+static int invis_cap(void)
+{ static int cap = -1; if (cap < 0) { const char *e = getenv("RECOMP_INVISIBLE_DRAW"); cap = e && *e ? atoi(e) : 0; if (cap == 1) cap = 16; } return cap; }
+static int inv_position(uint32_t i, float out[4])
+{
+    if (!s_vsh_gpu_batch) { memcpy(out, s_outputs[i][0], 16); return 1; }
+    if (s_vsh.mode == 2) {
+        NV2AVshResult r; memset(&r, 0, sizeof r);
+        if (!nv2a_vsh_execute(&s_vsh.decoded, (const float (*)[4])s_outputs[i], s_vsh.constants, &r)) return 0;
+        memcpy(out, r.output[0], 16); return 1;
+    } else {
+        float o[16][4];
+        if (nv2a_ff_vertex(s_methods, (const float (*)[4])s_outputs[i], o)) return 0;
+        memcpy(out, o[0], 16); return 1;
+    }
+}
+/* Before the Metal draw: the batch's clipped area; arms a slot when it is big. */
+static int inv_arm(void)
+{
+    float area = 0, p[3][4];
+    uint32_t n = s_gpu.idx_count, t;
+    if (invis_cap() <= 0 || s_inv_n >= INV_SLOTS || s_gpu.prim < 5 || s_gpu.prim > 9) return -1;
+    for (t = 0; ; ++t) {
+        uint32_t a, b, c;
+        if (s_gpu.prim == 5) { if (3*t + 2 >= n) break; a = 3*t; b = 3*t+1; c = 3*t+2; }
+        else if (s_gpu.prim == 6 || s_gpu.prim == 7) { if (t + 2 >= n) break; a = s_gpu.prim == 7 ? 0 : t; b = t + 1; c = t + 2; }
+        else if (s_gpu.prim == 8) { uint32_t q = t / 2; if (4*q + 3 >= n) break; a = 4*q; b = 4*q + 1 + (t & 1); c = 4*q + 2 + (t & 1); }
+        else { uint32_t q = t / 2; if (2*q + 3 >= n) break; a = 2*q; b = 2*q + 1 + 2*(t & 1); c = 2*q + 3 - (t & 1); }
+        if (!inv_position(a, p[0]) || !inv_position(b, p[1]) || !inv_position(c, p[2])) continue;
+        area += nv2a_clipped_triangle_area(p[0], p[1], p[2], (float)s_copy.state.clip_w, (float)s_copy.state.clip_h);
+        if (t > 20000) break;
+    }
+    if (area < 2000.0f) return -1;
+    {   InvRec *r = &s_inv[s_inv_n];
+        const uint32_t *m = s_methods;
+        memset(r, 0, sizeof *r);
+        r->area = area; r->draw = s_gpu.draws; r->prim = s_gpu.prim; r->xfmode = m[0x1e94/4] & 3u;
+        r->cmask = m[0x358/4]; r->blend_eq = m[0x350/4]; r->alpha_func = m[0x33c/4];
+        r->stencil[0] = m[0x32c/4]; r->stencil[1] = m[0x364/4]; r->stencil[2] = m[0x368/4]; r->stencil[3] = m[0x36c/4];
+        r->stencil[4] = m[0x360/4]; r->stencil[5] = m[0x370/4]; r->stencil[6] = m[0x374/4]; r->stencil[7] = m[0x378/4];
+        r->depth[0] = m[0x30c/4]; r->depth[1] = m[0x354/4]; r->depth[2] = m[0x35c/4];
+        r->st = s_copy.state;
+        for (unsigned u = 0; u < 3; ++u) r->ex[u] = s_copy.extra_stages[u];
+        r->tex[0] = s_copy.texture; r->texsize[0] = s_copy.texture_bytes; r->texaddr[0] = s_copy.texture_address;
+        for (unsigned u = 1; u < 4; ++u) { r->tex[u] = s_copy.state.extra_texture[u-1]; r->texsize[u] = s_copy.state.extra_size[u-1];
+                                          r->texaddr[u] = s_copy.extra_address[u-1]; }
+        for (unsigned k = 0; k < 3 && k < n; ++k) r->d0a[k] = s_vsh_gpu_batch ? s_outputs[k][3][3] : s_outputs[k][NV2A_VSH_OUT_D0][3];
+    }
+    if (!nv2a_metal_measure_arm(s_inv_n)) return -1;
+    return (int)s_inv_n++;
+}
+static void inv_alpha(const NV2ATextureCopy *t, const uint8_t *data, size_t size, float *lo, float *hi, float *mean)
+{
+    static uint8_t buf[2048 * 2048 * 4];
+    unsigned w = 0, h = 0; double sum = 0;
+    *lo = *hi = *mean = -1;
+    if (!data || !size || !nv2a_texture_copy_decode_level(t, data, size, 0, buf, sizeof buf, &w, &h) || !w || !h) return;
+    *lo = 1; *hi = 0;
+    for (size_t i = 0; i < (size_t)w * h; ++i) { float a = buf[4*i + 3] / 255.0f; if (a < *lo) *lo = a; if (a > *hi) *hi = a; sum += a; }
+    *mean = (float)(sum / ((double)w * h));
+}
+/* At the flip: which measured draws painted (almost) nothing. */
+static void inv_collect(void)
+{
+    static unsigned long long counts[INV_SLOTS]; static uint8_t used[INV_SLOTS];
+    unsigned n = s_inv_n;
+    if (invis_cap() <= 0 || !n) return;
+    nv2a_metal_measure_collect(counts, used, n);
+    for (unsigned i = 0; i < n; ++i) {
+        InvRec *r = &s_inv[i];
+        uint32_t key[4];
+        unsigned k;
+        if (!used[i]) continue;
+        ++s_inv_measured;
+        if ((double)counts[i] * 100.0 >= r->area) continue;
+        ++s_inv_invisible;
+        key[0] = r->st.final_cw0 ^ (r->st.combiner_count << 28); key[1] = r->st.color_icw[0] ^ r->st.alpha_icw[0];
+        key[2] = (r->st.rgba8 | r->st.dxt1 << 1 | r->st.dxt3 << 2 | r->st.sz16 << 3 | r->st.argb4 << 4 | r->st.untextured << 5)
+               ^ (r->st.alpha_test << 8) ^ (r->st.blend << 9) ^ (r->st.blend_src << 12) ^ (r->st.blend_dst << 20);
+        key[3] = r->st.width << 16 | r->st.height;
+        for (k = 0; k < s_inv_nkeys; ++k) if (!memcmp(s_inv_keys[k], key, sizeof key)) break;
+        if (k < s_inv_nkeys || s_inv_printed >= (unsigned)invis_cap()) continue;
+        if (s_inv_nkeys < 256) memcpy(s_inv_keys[s_inv_nkeys++], key, sizeof key);
+        ++s_inv_printed;
+        fprintf(stderr, "[INVISIBLE] draw %u: %.0f px of triangles on screen, %llu fragments passed every test | prim %u, transform MODE %u |"
+                        " alpha test %u func %X ref %u | blend %u %X/%X eq %X | colour mask %08X | stencil %u func %X ref %u mask %X"
+                        " write %X ops %X/%X/%X | depth %u func %X write %u | diffuse alpha of v0..2 %g %g %g\n",
+                r->draw, r->area, counts[i], r->prim, r->xfmode, r->st.alpha_test, r->alpha_func, r->st.alpha_ref, r->st.blend,
+                r->st.blend_src, r->st.blend_dst, r->blend_eq, r->cmask, r->stencil[0], r->stencil[1], r->stencil[2], r->stencil[3],
+                r->stencil[4], r->stencil[5], r->stencil[6], r->stencil[7], r->depth[0], r->depth[1], r->depth[2],
+                r->d0a[0], r->d0a[1], r->d0a[2]);
+        fprintf(stderr, "[INVISIBLE]   combiners %u: final CW0 %08X CW1 %08X (general %u) | fog %u | stages:",
+                r->st.combiner_count, r->st.final_general ? r->st.final_cw0 : (r->st.add_specular ? 0xEu : 0xCu),
+                r->st.final_general ? r->st.final_cw1 : 0x1C80u, r->st.final_general, r->st.fog_enable);
+        for (unsigned s2 = 0; s2 < r->st.combiner_count && s2 < 8; ++s2)
+            fprintf(stderr, " [ci %08X ai %08X co %08X ao %08X k0 %08X k1 %08X]", r->st.color_icw[s2], r->st.alpha_icw[s2],
+                    r->st.color_ocw[s2], r->st.alpha_ocw[s2], r->st.const0[s2], r->st.const1[s2]);
+        fputc('\n', stderr);
+        for (unsigned u = 0; u < 4; ++u) {
+            const NV2ATextureCopy *t = u ? &r->ex[u-1] : &r->st;
+            float lo, hi, mean;
+            if (!(r->st.texture_mask & (1u << u))) continue;
+            inv_alpha(t, r->tex[u], r->texsize[u], &lo, &hi, &mean);
+            fprintf(stderr, "[INVISIBLE]   unit %u: %ux%u levels %u at %08X (%zu bytes) format%s%s%s%s%s%s%s | decoded alpha min %.3f max %.3f mean %.3f\n",
+                    u, t->width, t->height, t->levels, r->texaddr[u], r->texsize[u], t->rgba8 ? " rgba8" : "", t->xrgb8 ? " xrgb8" : "",
+                    t->dxt1 ? " dxt1" : "", t->dxt3 ? " dxt3" : "", t->sz16 ? " sz16" : "", t->argb4 ? " argb4" : "",
+                    t->linear ? " linear565" : "", lo, hi, mean);
+        }
+    }
+    s_inv_n = 0;
+    fflush(stderr);
+}
+static void inv_report(void)
+{
+    if (invis_cap() <= 0) return;
+    fprintf(stderr, "[INVISIBLE] window: %llu big draws measured, %llu painted under 1%% of their area (%llu distinct states printed)\n",
+            s_inv_measured - s_inv_measured_rep, s_inv_invisible - s_inv_invisible_rep, (unsigned long long)s_inv_printed);
+    s_inv_measured_rep = s_inv_measured; s_inv_invisible_rep = s_inv_invisible;
+}
+
 /* G54: the state a [DROP] line names. */
 static void drop_state(NV2ADropState *st)
 {
@@ -5478,11 +5621,13 @@ static void raster_batch(void)
             trace_fallbacks = getenv("RECOMP_GPU_FALLBACK_TRACE")
                 || getenv("RECOMP_METAL_FALLBACK_TRACE") ? 1 : 0;
         draw_mix_note();
+        int inv_slot = inv_arm();
         unsigned long long _t_sub = pb_now_us();
         int triangles=nv2a_gpu_draw(&s_copy.state,s_copy.texture,s_copy.texture_bytes,
             s_copy.target,s_copy.target_bytes,s_copy.depth,s_copy.depth_bytes,
             s_outputs,s_gpu.idx_count,s_gpu.prim);
         pb_stage_add(PB_STAGE_SUBMIT, _t_sub);
+        if (inv_slot >= 0) nv2a_metal_measure_disarm();
         draw_mix_result(triangles);
         if(triangles>=0) {
             static unsigned reported;
@@ -6063,6 +6208,7 @@ static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
          * NULL unless RECOMP_D3D8_HOST_2D armed it (main.c). */
         if (s_flip_hook) s_flip_hook();
         nv2a_drop_flip();
+        inv_collect();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -6859,6 +7005,7 @@ void nv2a_pb_exec_report(void)
     frame_stats_report();
     fprintf(stderr, "[TEXTURE] prepared=%u rejected=%u\n", s_copy.batches, s_copy.rejected);
     nv2a_drop_report("report");
+    inv_report();
     nv2a_texture_copy_census();
     draw_mix_report();
     for (unsigned i=0; i<32 && s_texture_reasons[i].reason; ++i)

@@ -1238,6 +1238,10 @@ if(APPLE)
     add_executable(jsrf_metal_points_lines_test metal_points_lines_test.c)
     target_link_libraries(jsrf_metal_points_lines_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_points_lines COMMAND jsrf_metal_points_lines_test)
+    # G54 RECOMP_INVISIBLE_DRAW: visibility counts per draw, and the clipped area.
+    add_executable(jsrf_metal_invisible_test metal_invisible_test.c)
+    target_link_libraries(jsrf_metal_invisible_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_invisible COMMAND jsrf_metal_invisible_test)
     add_test(NAME jsrf_metal_fog_vsh COMMAND jsrf_metal_fog_test vsh)
     set_tests_properties(jsrf_metal_combiner_spec PROPERTIES
                          ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}")

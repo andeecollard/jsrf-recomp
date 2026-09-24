@@ -3647,8 +3647,43 @@ static void ring_pin(id<MTLCommandBuffer>command,unsigned slab)
             pthread_mutex_unlock(&ring_mutex);}}];
 }
 
+/* G54 RECOMP_INVISIBLE_DRAW: FRAGMENTS THAT PASSED EVERY TEST, PER DRAW.
+ * A Metal visibility result buffer in counting mode, one 8-byte slot per
+ * measured draw. Off (no buffer, no branch taken) until the executor arms a
+ * slot. The pass descriptor carries the buffer only once it exists; a batch
+ * encoder opened without it is flushed before a measured draw joins it. */
+#define NV2A_VIS_SLOTS 4096
+static id<MTLBuffer> g_vis_buf;
+static int g_vis_armed = -1, g_batch_has_vis;
+static uint8_t g_vis_used[NV2A_VIS_SLOTS];
+int nv2a_metal_measure_arm(unsigned slot)
+{
+    if (slot >= NV2A_VIS_SLOTS || !initialize()) return 0;
+    if (!g_vis_buf) {
+        g_vis_buf = [device newBufferWithLength:NV2A_VIS_SLOTS * 8 options:MTLResourceStorageModeShared];
+        if (!g_vis_buf) return 0;
+        memset(g_vis_buf.contents, 0, NV2A_VIS_SLOTS * 8);
+    }
+    g_vis_armed = (int)slot;
+    return 1;
+}
+void nv2a_metal_measure_disarm(void) { g_vis_armed = -1; }
+/* Waits for every measured draw, then hands back the counts (and whether each
+ * slot was actually drawn into) and clears both for the next window. */
+unsigned nv2a_metal_measure_collect(unsigned long long *counts, uint8_t *used, unsigned n)
+{
+    if (!g_vis_buf) return 0;
+    if (n > NV2A_VIS_SLOTS) n = NV2A_VIS_SLOTS;
+    nv2a_metal_sync();
+    memcpy(counts, g_vis_buf.contents, n * 8);
+    memcpy(used, g_vis_used, n);
+    memset(g_vis_buf.contents, 0, NV2A_VIS_SLOTS * 8);
+    memset(g_vis_used, 0, sizeof g_vis_used);
+    return n;
+}
 static void batch_flush(void)
 {
+    g_batch_has_vis = 0;
     if(!batch_encoder)return;
     if(pass_fence_on()&&g_pass_fence){
         [batch_encoder updateFence:g_pass_fence afterStages:MTLRenderStageFragment];
@@ -6496,6 +6531,8 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
   if (hw && (!hw_pso_use || !hw_dss_use))
     return reject("hw-state-untranslatable");
   MTLRenderPassDescriptor*pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=surface;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+  int vis_slot=g_vis_armed;g_vis_armed=-1;
+  if(g_vis_buf)pass.visibilityResultBuffer=g_vis_buf;
   if(hw){pass.depthAttachment.texture=hw_depth_tex;pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;
          pass.stencilAttachment.texture=hw_stencil_tex;pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;}
   else{pass.colorAttachments[1].texture=stencil_surface;pass.colorAttachments[1].loadAction=MTLLoadActionLoad;pass.colorAttachments[1].storeAction=MTLStoreActionStore;}
@@ -6514,6 +6551,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    * draw therefore always takes this branch. Neither gate combined the two
    * switches, so nothing saw it. */
   if(batch_on()&&batch_encoder&&hw!=batch_encoder_hw){batch_flush();}
+  if(vis_slot>=0&&batch_on()&&batch_encoder&&!g_batch_has_vis){batch_flush();}
   batch_encoder_hw=hw;
   if(mtl_cb_stats())g_mtl_ns_state+=mtl_now_ns()-_tf;
   unsigned long long _t0=mtl_cb_stats()?mtl_now_ns():0;
@@ -6526,6 +6564,7 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     batch_command=[queue commandBuffer];
     batch_encoder=batch_command?[batch_command renderCommandEncoderWithDescriptor:pass]:nil;
     if(!batch_command||!batch_encoder){batch_command=nil;batch_encoder=nil;return reject("command-encoder");}
+    g_batch_has_vis=g_vis_buf!=nil;
     if(pass_fence_on()&&g_pass_fence)
      [batch_encoder waitForFence:g_pass_fence beforeStages:MTLRenderStageVertex];
     if(mtl_cb_stats())g_mtl_cbufs++;
@@ -6686,7 +6725,9 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    sc.width=(wc_x1<s->clip_w?wc_x1:s->clip_w-1)-wc_x0+1;
    sc.height=(wc_y1<s->clip_h?wc_y1:s->clip_h-1)-wc_y0+1;
    [encoder setScissorRect:sc];if(sc.width<s->clip_w||sc.height<s->clip_h)++g_scissored_draws;}
+  if(vis_slot>=0)[encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)vis_slot*8u];
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+  if(vis_slot>=0){[encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];g_vis_used[vis_slot]=1;}
   if(batch_on()){
    if(pinned_slab>=0)batch_pins|=1u<<(unsigned)pinned_slab;
    ++batch_draws;

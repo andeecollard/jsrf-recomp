@@ -241,6 +241,8 @@ VALUE_CARRYING = {
     "RECOMP_FOG_DRAW_TRACE",
     # G54: a COUNT of immediate-mode batches to trace (1 means 8).
     "RECOMP_PB_IMMEDIATE_TRACE",
+    # G54: a COUNT of distinct invisible-draw states to print (1 means 16).
+    "RECOMP_INVISIBLE_DRAW",
     # A stride in flips: every Nth flip of a draw-mode run is verified.
     "RECOMP_D3D8_HOST_VERIFY",
 }

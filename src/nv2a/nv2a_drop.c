@@ -2,6 +2,7 @@
 #include "nv2a_drop.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #define DROP_REASONS 64
 #define DROP_STATES 4
@@ -117,6 +118,36 @@ void nv2a_drop_report(const char *why)
     s_batches_rep = s_batches; s_flips_rep = s_flips;
     ++s_gen;
     fflush(stderr);
+}
+
+static unsigned clip_poly(float (*in)[2], unsigned n, float (*out)[2], int axis, float lim, int keep_below)
+{
+    unsigned m = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const float *p = in[i], *q = in[(i + 1) % n];
+        int pin = keep_below ? p[axis] <= lim : p[axis] >= lim, qin = keep_below ? q[axis] <= lim : q[axis] >= lim;
+        if (pin) { out[m][0] = p[0]; out[m][1] = p[1]; ++m; }
+        if (pin != qin) {
+            float t = (lim - p[axis]) / (q[axis] - p[axis]);
+            out[m][0] = p[0] + t * (q[0] - p[0]); out[m][1] = p[1] + t * (q[1] - p[1]); ++m;
+        }
+    }
+    return m;
+}
+float nv2a_clipped_triangle_area(const float a[4], const float b[4], const float c[4], float w, float h)
+{
+    float p0[8][2], p1[8][2];
+    unsigned n = 3;
+    double area = 0;
+    if (!(a[3] > 0 && b[3] > 0 && c[3] > 0)) return 0;
+    if (!isfinite(a[0]) || !isfinite(a[1]) || !isfinite(b[0]) || !isfinite(b[1]) || !isfinite(c[0]) || !isfinite(c[1])) return 0;
+    p0[0][0] = a[0]; p0[0][1] = a[1]; p0[1][0] = b[0]; p0[1][1] = b[1]; p0[2][0] = c[0]; p0[2][1] = c[1];
+    n = clip_poly(p0, n, p1, 0, 0.0f, 0); if (n < 3) return 0;
+    n = clip_poly(p1, n, p0, 0, w, 1);    if (n < 3) return 0;
+    n = clip_poly(p0, n, p1, 1, 0.0f, 0); if (n < 3) return 0;
+    n = clip_poly(p1, n, p0, 1, h, 1);    if (n < 3) return 0;
+    for (unsigned i = 0; i < n; ++i) area += (double)p0[i][0] * p0[(i + 1) % n][1] - (double)p0[(i + 1) % n][0] * p0[i][1];
+    return (float)fabs(area) * 0.5f;
 }
 
 unsigned long long nv2a_drop_count(const char *reason)
