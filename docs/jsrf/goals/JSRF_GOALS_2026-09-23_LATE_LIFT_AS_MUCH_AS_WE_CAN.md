@@ -616,3 +616,32 @@ The host comparison named it in one player session, by class.
 So the police scenes never hit the fog gate; their flicker has another
 cause. Script: a scratch-pad fogtl.py, the per-window deltas of
 `[TEXTURE] prepared/rejected`.
+
+## Fog in the player's sessions, and the drop audit (24 Sep, late morning)
+
+- **Two fog gates, both open now.** c8296c9 modelled fog's final combiner;
+  81f005e removed the second gate (`FOG_ENABLE` refused outright, 465,058
+  draws). Player session: 0 refused, 596,564 fogged draws drawn (all LINEAR
+  2 / −0.00025, planar, colour 0x5E77A5 = (165,119,94) read as ABGR).
+  Characters, scaffolding, graffiti and the ground appear. **The large
+  buildings still do not**; they look fully fogged into the haze. The
+  character renders partly washed white. The agent verified the colour
+  order, the eye-space fog distance (f = 0.75 at z = 1000), programs without
+  oFog, and the V1+R0 sum, all in unit tests. RECOMP_FOG_DRAW_TRACE (in the
+  player's paths.conf now) prints d, clip w and the model-view per fogged
+  draw for the next session.
+- **Fog's default-path cost:** tutorial, FLIP_PACE=0, pre-fog 83.8 against
+  fog 82.9 / 83.0 fps; vsh +0.2 ms from the larger CPU vertex. Within noise.
+  Host shadows stay exact (2D 18,396, VS 694 of 694).
+- **The drop audit** (`7f759e0`, `221013c`, nv2a_drop.c, drop_census.py):
+  every executor drop, skip or simplification reports itself, with a
+  WARNING above 1% of a window.
+  - Across the saved sessions, beyond fog: **unaccounted draws spiking to
+    3.7–10.4% of each window in the police scenes of 23 Sep 20:14.** These
+    are genuine 1–2 index batches (points or lines), dropped by raster_batch.
+  - **Immediate-mode Begin/End** (SetVertexData, 2 per frame even in the
+    tutorial) was never emitted at all.
+  - A primitive split across method calls is correctly one batch (disproved
+    by jsrf_primitive_split).
+  - Both fixes are with the agent: points and lines on Metal, and
+    immediate-mode vertex emission.
