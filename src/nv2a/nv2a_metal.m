@@ -3719,6 +3719,15 @@ static void surface_pay_debt_for_range(const uint8_t *p, size_t bytes,
     }
 }
 
+static uint64_t g_debt_paid_on_host_read;
+int nv2a_metal_pay_debt(const uint8_t *p, size_t bytes)
+{
+    uint64_t before = g_debt_paid_on_host_read;
+    draw_thread_check();
+    surface_pay_debt_for_range(p, bytes, &g_debt_paid_on_host_read);
+    return (int)(g_debt_paid_on_host_read - before);
+}
+
 /* THE ONE NUMBER THE CUMULATIVE TOTAL CANNOT GIVE.
  *
  * g_sync_drain_ns + g_sync_read_ns already says sync costs 7.9 ms per frame

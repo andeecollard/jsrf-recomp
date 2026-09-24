@@ -1128,8 +1128,9 @@ static void spec_tests(void)
 {
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH];
     static float za[RTW * RTH], zb[RTW * RTH];
-    unsigned long long built = 0, hits = 0, fb = 0, ns = 0;
+    unsigned long long built = 0, hits = 0, fb = 0, ns = 0, fb0 = 0;
     int ok;
+    d3d8_host_2d_metal_spec_stats(NULL, NULL, &fb0, NULL);
     d3d8_host_2d_metal_set_spec(1);
     ok = draw_arm(1, 0, a, za); d3d8_host_2d_metal_set_spec(0); ok = ok && draw_arm(1, 0, b, zb); d3d8_host_2d_metal_set_spec(1);
     CHECK(ok && !memcmp(a, b, sizeof a) && !memcmp(za, zb, sizeof za), "specialised logo == generic logo, colour and depth");
@@ -1137,7 +1138,7 @@ static void spec_tests(void)
     CHECK(ok && !memcmp(a, b, sizeof a) && !memcmp(za, zb, sizeof za), "specialised FF quad == generic FF quad, colour and depth");
     d3d8_host_2d_metal_spec_stats(&built, &hits, &fb, &ns);
     printf("  specialised pipelines built %llu, hits %llu, fallbacks %llu, compile %.1f ms\n", built, hits, fb, ns / 1e6);
-    CHECK(built > 0 && fb == 0, "specialised pipelines were built and none fell back");
+    CHECK(built > 0 && fb == fb0, "specialised pipelines were built and none fell back");
 }
 
 /* THE z-RANGE CULL UNDER EARLY TESTS -- the draw-mode debris of 24 Sep 2026.
@@ -1415,6 +1416,33 @@ static void game_state_tests(void)
     }
 }
 
+/* ASYNCHRONOUS COMPILE: the first draw of a new key returns promptly on the
+ * generic interpreter; once the compile lands, the same key is served by the
+ * specialised pipeline -- and the pixels are the same either way. */
+static void async_spec_test(void)
+{
+    static uint16_t first[RTPITCH / 2 * RTH], later[RTPITCH / 2 * RTH];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    unsigned long long b0 = 0, h0 = 0, f0 = 0, b1 = 0, h1 = 0, f1 = 0, n = 0;
+    case_logo(&c); set_state(&c, 0x30C, 0); set_state(&c, 0x340, 7);   /* a key no other test builds */
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) { CHECK(0, "async: build"); return; }
+    d.cc = 3; d.ci[2] = 0x0C200000u; d.ai[2] = 0x1C200000u; d.co[2] = 0x00000C00u; d.ao[2] = 0x00000C00u;
+    d3d8_host_2d_metal_set_spec_sync(0);
+    d3d8_host_2d_metal_spec_stats(&b0, &h0, &f0, NULL);
+    background(first);
+    CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, first, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0, "async: first draw rendered");
+    d3d8_host_2d_metal_spec_stats(&b1, &h1, &f1, NULL);
+    CHECK(f1 == f0 + 1 && h1 == h0, "async: the first draw of a new key used the generic interpreter (stand-ins +%llu)", f1 - f0);
+    do { d3d8_host_2d_metal_spec_stats(&b1, NULL, NULL, NULL); if (b1 > b0) break; struct timespec ts = { 0, 5000000 }; nanosleep(&ts, NULL); } while (++n < 400);
+    CHECK(b1 == b0 + 1, "async: the compile landed (%llu ms waited)", n * 5);
+    background(later);
+    CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, later, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0, "async: later draw rendered");
+    d3d8_host_2d_metal_spec_stats(NULL, &h1, NULL, NULL);
+    CHECK(h1 == h0 + 1, "async: the same key is now served by the specialised pipeline");
+    CHECK(!memcmp(first, later, sizeof first), "async: stand-in and specialised pipeline drew the same pixels");
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
@@ -1587,6 +1615,33 @@ int main(int argc, char **argv)
         bench_tests();
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "defer") == 0) {        /* RECOMP_METAL_DEFER_SWAP: the host pays a slot's debt */
+        /* The executor draws into A without a sync, then into B: the swap
+         * defers A's write-back, so A's guest RAM is behind its texture. A
+         * host texture read of A must pay first -- nv2a_metal_pay_debt, which
+         * texture_for calls -- and afterwards the bytes are the rendering. */
+        enum { RT2 = RT + 0x40000 };
+        static uint16_t bg[RTPITCH / 2 * RTH];
+        static uint8_t depth[RTW * 4 * RTH];
+        D3D8HostDrawCheck c; D3D8Host2DDraw d;
+        uint16_t *a = (uint16_t *)(ram + RT), *b = (uint16_t *)(ram + RT2);
+        unsigned long long before = 0, after = 0;
+        background(bg); background(a); background(b);
+        case_b(&c); memset(&d, 0, sizeof d); d.verts = verts;
+        CHECK(!d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d), "defer: built");
+        g_exec_keep_surfaces = 1; g_exec_no_sync = 1;
+        CHECK(exec_draw(&c, &d, a, depth) && exec_draw(&c, &d, b, depth), "defer: the executor drew into A, then B");
+        g_exec_keep_surfaces = 0; g_exec_no_sync = 0;
+        for (size_t k = 0; k < sizeof bg / 2; ++k) before += a[k] != bg[k];
+        int paid = nv2a_metal_pay_debt((uint8_t *)a, RTPITCH * RTH);
+        for (size_t k = 0; k < sizeof bg / 2; ++k) after += a[k] != bg[k];
+        printf("  defer: A's guest RAM changed %llu px before paying, %llu after (%d slot(s) paid)\n", before, after, paid);
+        CHECK(before == 0, "defer CONTROL: the swap deferred A's write-back (guest RAM still the background)");
+        CHECK(paid == 1 && after > 1000, "defer: paying the debt wrote A's rendering to guest RAM");
+        CHECK(nv2a_metal_pay_debt((uint8_t *)a, RTPITCH * RTH) == 0, "defer: a debt is paid once");
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "seq") == 0) {          /* many draws in one batch, every bisect arm */
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
@@ -1598,6 +1653,9 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         CHECK(d3d8_host_2d_mode() == 2 && d3d8_host_ff_mode() == 2, "RECOMP_D3D8_HOST_2D=draw and RECOMP_D3D8_HOST_FF=draw arm draw mode");
+        d3d8_host_2d_metal_set_spec_sync(1);                     /* test the specialised program, not its stand-in */
+        async_spec_test();
+        d3d8_host_2d_metal_set_spec_sync(1);
         draw_mode_tests();
         /* THE IN-RUN CHECK: on a verify flip a draw draw mode would replace is
          * left to the executor and shadowed -- pre token, executor draw, post

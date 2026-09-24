@@ -78,6 +78,12 @@ int nv2a_metal_bind(uint8_t *target, size_t target_size, uint32_t w, uint32_t h,
 int nv2a_metal_slot_geometry(const uint8_t *target, const uint8_t *depth, size_t *target_size, uint32_t *w,
                              uint32_t *h, uint32_t *pitch, uint8_t **slot_depth, uint32_t *out_dpitch,
                              size_t *depth_size);
+/* G51.3: a reader outside the executor -- the host decoding a texture from
+ * guest RAM -- is about to read [p, p+bytes). Any cached slot that owes those
+ * bytes (RECOMP_METAL_DEFER_SWAP) writes them back first, as the executor's
+ * own texture read does. Returns how many slots paid; four slot compares when
+ * nothing is owed, which with the deferral off is always. */
+int nv2a_metal_pay_debt(const uint8_t *p, size_t bytes);
 /* Read-only: surfaces uploaded (rebuilt from guest RAM), slot-cache rebinds, evictions. */
 void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions);
 int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,
