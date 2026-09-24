@@ -5168,7 +5168,10 @@ int main(int argc, char **argv)
                 be.exec_skip = nv2a_pb_exec_host_skip;
                 be.exec_skipped = nv2a_pb_exec_host_skipped;
                 be.exec_seen = nv2a_pb_exec_host_seen;
+                { extern void nv2a_pb_exec_host_skip_late(int);
+                  nv2a_pb_exec_host_skip_late((d3d8_host_2d_bisect() & 128u) != 0); }
                 be.spec_stats = d3d8_host_2d_metal_spec_stats;
+                be.bind_ns = d3d8_host_2d_metal_bind_ns;
                 /* G51.3: the FF shadow evaluates vertices with the executor's own unit. */
                 be.ff_vertex = nv2a_ff_vertex;
                 d3d8_host_2d_set_backend(&be);

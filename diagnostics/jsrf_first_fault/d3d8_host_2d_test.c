@@ -618,10 +618,11 @@ static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, con
     for (unsigned k = 0; k < c->count; ++k) {
         float in[16][4];
         for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0; in[a][3] = 1; }
-        memcpy(in[0], ram + VB + 24u * k, 12);
-        { uint32_t col; memcpy(&col, ram + VB + 24u * k + 12, 4);
+        uint32_t vb = c->va_offset[0];
+        memcpy(in[0], ram + vb + 24u * k, 12);
+        { uint32_t col; memcpy(&col, ram + vb + 24u * k + 12, 4);
           in[3][0] = ((col >> 16) & 255) / 255.0f; in[3][1] = ((col >> 8) & 255) / 255.0f; in[3][2] = (col & 255) / 255.0f; in[3][3] = (col >> 24) / 255.0f; }
-        memcpy(in[9], ram + VB + 24u * k + 16, 8);
+        memcpy(in[9], ram + vb + 24u * k + 16, 8);
         if (nv2a_ff_vertex(ffm, (const float (*)[4])in, v[k])) return 0;
     }
     if (!g_exec_keep_surfaces) nv2a_metal_invalidate(NULL);
@@ -1041,6 +1042,73 @@ static void bench_one(const char *name, void (*mk)(D3D8HostDrawCheck *), int ff,
 static void mk_logo(D3D8HostDrawCheck *c) { case_logo(c); }
 static void mk_logo_noat(D3D8HostDrawCheck *c) { case_logo(c); set_state(c, 0x300, 0); }
 static void mk_ff(D3D8HostDrawCheck *c) { case_ff(c); }
+/* A SEQUENCE, NOT A DRAW. The in-game defect of 24 Sep 2026 (blocky debris
+ * over the FF scene, every frame, in draw mode) did not show in any
+ * single-draw comparison. This interleaves N draws in one unflushed batch --
+ * the FF quad and the logo (host or executor) with the indexed list (always
+ * the executor) -- and compares the surface and depth after the lot, for
+ * each RECOMP_D3D8_HOST_BISECT arm, against the executor drawing everything. */
+static void relocate(D3D8HostDrawCheck *c, uint32_t to)
+{
+    memcpy(ram + to, ram + VB, 0x400);
+    for (unsigned a = 0; a < 16; ++a) if ((c->va_on >> a) & 1u) c->va_offset[a] = c->va_offset[a] - VB + to;
+    if (c->idx_ptr) { memcpy(ram + to + 0x400, ram + c->idx_ptr, 2u * c->count); c->idx_ptr = to + 0x400; }
+}
+static int seq_arm(int host, unsigned mask, unsigned n, uint16_t *out, float *zout)
+{
+    D3D8HostDrawCheck c[3]; D3D8Host2DDraw d[3]; static uint32_t ffm[2048];
+    static D3D8H2DVertex vv[3][64];
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    d3d8_host_2d_set_bisect(mask);
+    background(rt); logo_depth(); draw_binder(rt);
+    /* The cases share VB and IB, so each is moved to its own copy before the next is made. */
+    case_ff(&c[0]); relocate(&c[0], 0x12000);
+    case_logo(&c[1]); set_state(&c[1], 0x300, 0); relocate(&c[1], 0x13000);
+    case_b(&c[2]); relocate(&c[2], 0x14000);
+    c[2].zs = 0x2345; c[2].zs_data = ZS; c[2].zs_format = 0x1u | (0x2Eu << 8);
+    c[2].zs_size = (RTW - 1) | ((RTH - 1) << 12) | ((ZSPITCH / 64 - 1) << 24);
+    set_state(&c[2], 0x30C, 1); set_state(&c[2], 0x354, 0x203); set_state(&c[2], 0x35C, 1);
+    for (int k = 0; k < 3; ++k) { memset(&d[k], 0, sizeof d[k]); d[k].verts = vv[k]; }
+    if (d3d8_host_ff_registers(&c[0], ffm) || d3d8_host_draw_build(&c[0], ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d[0])) return 0;
+    if (d3d8_host_2d_build(&c[1], ram, RAM_SIZE, 0, &d[1]) || d3d8_host_2d_build(&c[2], ram, RAM_SIZE, 0, &d[2])) { printf("seq: build\n"); return 0; }
+    g_exec_keep_surfaces = 1; g_exec_no_sync = 1;
+    int ok = 1;
+    for (unsigned k = 0; k < n && ok; ++k) {
+        unsigned w = k % 3;
+        if (w == 2) ok = exec_draw(&c[2], &d[2], rt, ram + ZS);
+        else if (host) ok = d3d8_host_2d_metal_external(&d[w], ram, RAM_SIZE);
+        else ok = w == 0 ? exec_draw_ff(&c[0], &d[0], ffm, rt, ram + ZS) : exec_draw(&c[1], &d[1], rt, ram + ZS);
+    }
+    g_exec_keep_surfaces = 0; g_exec_no_sync = 0;
+    d3d8_host_2d_set_bisect(0);
+    if (!ok) { printf("seq: a draw failed: %s\n", d3d8_host_2d_metal_last_error()); return 0; }
+    nv2a_metal_sync();
+    memcpy(out, rt, RTPITCH * RTH);
+    return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout);
+}
+static void seq_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    /* Bits 1 (own pass) and 64 (wait every draw) are left out: splitting the
+     * batch changes blended pixels by one 565 step through tile precision
+     * (measured in join_tests), so they cannot be held to the joined arm. */
+    static const unsigned masks[] = { 0, 2, 4, 8, 16, 32, 2 | 4 | 8 | 16 | 32 };
+    const char *e = getenv("H2D_SEQ_N");
+    unsigned n = e ? (unsigned)atoi(e) : 3000;
+    background(bg);
+    CHECK(seq_arm(0, 0, n, a, za), "sequence: the executor drew %u draws", n);
+    for (unsigned m = 0; m < sizeof masks / sizeof masks[0]; ++m) {
+        D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
+        CHECK(seq_arm(1, masks[m], n, b, zb), "sequence, bisect 0x%X: the host arm drew", masks[m]);
+        d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 0, &df);
+        zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
+        printf("  sequence of %u, bisect 0x%02X: executor changed %llu, host arm %llu, differing %llu | depth %llu, worst %u\n",
+               n, masks[m], df.exec_changed, df.host_changed, df.mismatch, zbad, steps);
+        CHECK(df.mismatch == 0 && zbad == 0, "sequence of %u draws in one batch, bisect 0x%X: identical to the executor", n, masks[m]);
+    }
+}
+
 static void bench_tests(void)
 {
     const char *e = getenv("H2D_BENCH_N");
@@ -1071,9 +1139,51 @@ static void spec_tests(void)
     CHECK(built > 0 && fb == 0, "specialised pipelines were built and none fell back");
 }
 
+/* THE z-RANGE CULL UNDER EARLY TESTS -- the draw-mode debris of 24 Sep 2026.
+ * The executor discards every fragment whose z falls outside [0, 1] (JSRF's
+ * CULL policy), in the shader, with late tests. MTLDepthClipModeClamp clamps
+ * the depth that is TESTED, not the z the shader reads, so a fragment beyond
+ * the far plane (or in front of the near one) is still discarded by the
+ * executor. An early-tests entry with that discard removed drew them --
+ * geometry crossing the near plane painted over the scene. The logo without
+ * its alpha test (an early candidate) is tilted here from z 0.6 to 1.4:
+ * the host must discard exactly what the executor discards. */
+static int zrange_arm(int host, uint16_t *out, float *zout)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    background(rt); logo_depth(); draw_binder(rt);
+    case_logo(&c); set_state(&c, 0x300, 0);
+    putf(VB + 8, 0.6f); putf(VB + 36 + 8, 1.4f); putf(VB + 72 + 8, 0.6f); putf(VB + 108 + 8, 1.4f);
+    set_state(&c, 0x354, 0x207);                         /* ALWAYS: only the z-range cull decides */
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) return 0;
+    if (host) {
+        if (!d3d8_host_2d_metal_external(&d, ram, RAM_SIZE)) return 0;
+        nv2a_metal_sync();
+    } else if (!exec_draw(&c, &d, rt, ram + ZS)) return 0;
+    memcpy(out, rt, RTPITCH * RTH);
+    return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout);
+}
+static void zrange_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
+    background(bg);
+    CHECK(zrange_arm(0, a, za) && zrange_arm(1, b, zb), "z range: both arms drew");
+    d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 0, &df);
+    zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
+    printf("  z range 0.6..1.4: executor changed %llu, host %llu, differing %llu | depth %llu\n",
+           df.exec_changed, df.host_changed, df.mismatch, zbad);
+    CHECK(df.exec_changed > 1000 && df.exec_changed < 8000, "z range: the executor culled part of the draw (%llu px kept)", df.exec_changed);
+    CHECK(df.mismatch == 0 && zbad == 0, "z range: the host culls exactly the fragments the executor culls");
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
+    zrange_tests();
     spec_tests();
     ff_draw_tests();
     join_tests();
@@ -1239,11 +1349,31 @@ int main(int argc, char **argv)
         bench_tests();
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "seq") == 0) {          /* many draws in one batch, every bisect arm */
+        setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
+        setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
+        seq_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "draw") == 0) {         /* the draw-mode arm, a process of its own */
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
+        setenv("RECOMP_D3D8_HOST_VERIFY", "1", 1);               /* every flip is a verify flip */
         CHECK(d3d8_host_2d_mode() == 2 && d3d8_host_ff_mode() == 2, "RECOMP_D3D8_HOST_2D=draw and RECOMP_D3D8_HOST_FF=draw arm draw mode");
         draw_mode_tests();
+        /* THE IN-RUN CHECK: on a verify flip a draw draw mode would replace is
+         * left to the executor and shadowed -- pre token, executor draw, post
+         * token, compared at the flip -- although neither mode is "shadow". */
+        {   D3D8HostDrawCheck v;
+            CHECK(d3d8_host_verify_now() == 1, "verify: RECOMP_D3D8_HOST_VERIFY=1 makes every flip a verify flip");
+            case_b(&v); v.verify = 1; shadow_flow(&v, 0);
+            case_b(&v); v.verify = 0;
+            {   D3D8H2DStats a, b; d3d8_host_2d_get_stats(&a);
+                d3d8_host_2d_pre(v.serial, v.vs_handle, v.rt_data, v.rt_format, v.rt_size, 0, 0);
+                d3d8_host_2d_post(&v, NULL); d3d8_host_2d_flip(); d3d8_host_2d_get_stats(&b);
+                CHECK(b.compared == a.compared, "verify CONTROL: the same draw without the verify flag is not compared in draw mode"); }
+        }
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }

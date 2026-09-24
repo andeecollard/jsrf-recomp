@@ -270,6 +270,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     if (!d->depth_func) d->depth_func = 0x203;
     d->depth_write = st(c, 0x35C, 1) != 0;
     d->stencil_test = st(c, 0x32C, 0) != 0;
+    if (d->stencil_test && (d3d8_host_2d_bisect() & 256u)) return "stencil test (bisect 256)";
     if (d->stencil_test) { const char *sw = stencil_from_d3d(c, d); if (sw) return sw; }
     if (d->depth_test && (d->depth_func < 0x200u || d->depth_func > 0x207u)) return "depth func";
     if (d->depth_test || d->stencil_test) {
@@ -341,6 +342,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
      * "primitive" and the CPU fallback's switch draws nothing ("points and
      * lines: not yet"), so the executor's picture is unchanged by them. The
      * host describes that exactly: no vertices. */
+    if (((d->prim >= 1u && d->prim <= 4u) || d->prim == 10u) && (d3d8_host_2d_bisect() & 512u)) return "primitive (bisect 512)";
     if ((d->prim >= 1u && d->prim <= 4u) || d->prim == 10u) { d->prim_empty = 1; d->nverts = 0; d->bb_x0 = 1; d->bb_x1 = 0; return NULL; }
     if (d->prim < 5u || d->prim > 9u) return "primitive";
     if (c->count > 16384u) return "vertex count";
@@ -411,6 +413,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                      * the executor's current slot 3 was measured to hold),
                      * then its own unit -- once per index value. */
                     uint32_t slot = i - vbase;
+                    if ((d3d8_host_2d_bisect() & 32u) && vstamp[slot] == vgen) vstamp[slot] = vgen - 1u;
                     if (vstamp[slot] != vgen) {
                         float in[16][4], out[16][4];
                         D3D8H2DVertex *o = &vc[slot];
@@ -476,12 +479,13 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     d->bb_x0 = 1; d->bb_x1 = 0;
     if (d->nverts) {
         float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
-        d->z_min = INFINITY; d->z_max = -INFINITY;
+        d->z_min = INFINITY; d->z_max = -INFINITY; d->w_min = INFINITY;
         for (unsigned k = 0; k < d->nverts; ++k) {
             const float *p = d->verts[k].p;
             if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
             if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
             if (p[2] < d->z_min) d->z_min = p[2]; if (p[2] > d->z_max) d->z_max = p[2];
+            if (!(p[3] >= d->w_min)) d->w_min = p[3];
         }
         int32_t bx0 = (int32_t)floorf(x0) - 2, by0 = (int32_t)floorf(y0) - 2;
         int32_t bx1 = (int32_t)ceilf(x1) + 2, by1 = (int32_t)ceilf(y1) + 2;
@@ -626,6 +630,7 @@ static void count_reason_ff(const char *why)
 }
 static void read_knobs(void);
 static unsigned s_ff_stride = 60;
+static unsigned long long s_verified;
 static unsigned long long s_ff_unsampled;
 static int ff_sampled(void) { return s_ff_stride <= 1 || (s_flips % s_ff_stride) == 0; }
 int d3d8_host_ff_mode(void)
@@ -681,6 +686,14 @@ int d3d8_host_replaces_handle(uint32_t h)
     return (d3d8_host_2d_mode() == 2 && d3d8_host_2d_is_fvf_xyzrhw(h)) || (d3d8_host_ff_mode() == 2 && d3d8_host_2d_is_fvf_ff(h));
 }
 int d3d8_host_any_draw_mode(void) { return d3d8_host_2d_mode() == 2 || d3d8_host_ff_mode() == 2; }
+static unsigned s_verify;
+int d3d8_host_verify_now(void)
+{
+    unsigned long long f;
+    if (!s_verify || !d3d8_host_any_draw_mode()) return 0;
+    f = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+    return (f % s_verify) == 0;
+}
 
 /* Read once. The mirror (guest thread) and the ring consumer (pusher
  * thread) can both ask first; the flag makes exactly one of them read the
@@ -699,6 +712,12 @@ static void read_knobs(void)
     if ((v = getenv("RECOMP_D3D8_HOST_2D_TOL")) && *v) s_tol = (unsigned)atoi(v);
     if ((v = getenv("RECOMP_D3D8_HOST_2D_DUMP_MAX")) && *v) s_dump_max = (unsigned)atoi(v);
     if ((v = getenv("RECOMP_D3D8_HOST_2D_EVERY")) && *v && atoi(v) > 0) s_every = atoi(v);
+    if ((v = getenv("RECOMP_D3D8_HOST_VERIFY")) && *v && atoi(v) > 0) {
+        s_verify = (unsigned)atoi(v);
+        fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_VERIFY=%u: in draw mode, 1 flip in %u is drawn by the executor"
+                        " and the host's pipeline is compared against it per draw (the shadow's verdict lines)\n",
+                s_verify, s_verify);
+    }
     if ((v = getenv("RECOMP_D3D8_HOST_2D_DUMP")) && *v) {
         snprintf(s_dump_dir, sizeof s_dump_dir, "%s", v);
         if (h2d_mkdir(s_dump_dir) != 0 && errno != EEXIST) {
@@ -776,7 +795,8 @@ void d3d8_host_2d_pre(uint32_t serial, uint32_t vs_handle, uint32_t rt_data, uin
     size_t bytes = (size_t)pitch * h;
     s_snap_valid = 0; s_zsnap_valid = 0;
     if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode()) return;
-    if (d3d8_host_2d_is_fvf_ff(vs_handle) && !ff_sampled()) return;   /* this flip is not shadowed */
+    /* this flip is not shadowed; in FF draw mode an FF pre token is a verify draw, always compared */
+    if (d3d8_host_2d_is_fvf_ff(vs_handle) && d3d8_host_ff_mode() == 1 && !ff_sampled()) return;
     ++s_pre;
     if (!s_have_be || ((rt_format >> 8) & 0xFFu) != 0x11u || addr + bytes > s_be.ram_size) { ++s_pre_skipped; return; }
     if (bytes > s_snap_cap) {
@@ -820,8 +840,9 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     static D3D8Host2DDraw d;
     const char *why;
     int cls = d3d8_host_2d_class(c);
-    if (!d3d8_host_shadow_wants(c)) return;
-    if (cls == 2 && !ff_sampled()) { ++s_ff_unsampled; return; }
+    if (!d3d8_host_shadow_wants(c) && !c->verify) return;
+    if (cls == 2 && !c->verify && !ff_sampled()) { ++s_ff_unsampled; return; }
+    if (c->verify) ++s_verified;
     ++s_draws;
     if (cls == 2) ++s_ff_draws;
     memset(&e, 0, sizeof e);
@@ -1121,6 +1142,23 @@ static void skip_open(const D3D8HostDrawCheck *c, int host_empty)
 }
 
 unsigned long long d3d8_host_2d_flip_count(void) { return s_flips; }
+static unsigned s_bisect; static int s_bisect_read;
+unsigned d3d8_host_2d_bisect(void)
+{
+    if (!s_bisect_read) {
+        const char *e = getenv("RECOMP_D3D8_HOST_BISECT");
+        s_bisect_read = 1;
+        s_bisect = e && *e ? (unsigned)strtoul(e, NULL, 0) : 0u;
+        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
+                              s_bisect & 1 ? " own-pass" : "", s_bisect & 2 ? " buffer-per-draw" : "",
+                              s_bisect & 4 ? " no-early-tests" : "", s_bisect & 8 ? " generic-shader" : "",
+                              s_bisect & 16 ? " hash-every-draw" : "", s_bisect & 32 ? " no-vertex-cache" : "",
+                              s_bisect & 64 ? " wait-every-draw" : "", s_bisect & 128 ? " late-executor-skip" : "",
+                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "");
+    }
+    return s_bisect;
+}
+void d3d8_host_2d_set_bisect(unsigned mask) { s_bisect = mask; s_bisect_read = 1; }
 static unsigned long long s_rep_ns_regs, s_rep_ns_build, s_rep_ff_evals, s_rep_ff_indices;
 static inline unsigned long long h2d_now_ns(void)
 {
@@ -1441,7 +1479,9 @@ void d3d8_host_2d_report(const char *why)
             unsigned long long b = 0, h = 0, f = 0, ns = 0;
             s_be.spec_stats(&b, &h, &f, &ns);
             fprintf(stderr, "[D3D8-HOST-2D] %s specialised fragment pipelines: built %llu (compile %.1f ms), hits %llu,"
-                            " draws on the generic interpreter %llu\n", why, b, ns / 1e6, h, f);
+                            " draws on the generic interpreter %llu | binding the target (a GPU drain each) %.1f ms over"
+                            " %llu binds\n", why, b, ns / 1e6, h, f,
+                    s_be.bind_ns ? s_be.bind_ns() / 1e6 : 0.0, s_be.external_binds ? s_be.external_binds() : 0ull);
         }
         {   /* In-process timers: where a replaced draw's host time goes. */
             unsigned long long th = 0, tb = 0, thash = 0, nt = 0, ne = 0, r = s_replaced ? s_replaced : 1, rf = s_replaced_ff ? s_replaced_ff : 1;
@@ -1460,7 +1500,9 @@ void d3d8_host_2d_report(const char *why)
             }
             if (any) fprintf(stderr, "\n");
         }
-        if (s_ffmode != 1 && s_mode != 1) { fflush(stderr); return; }
+        if (s_verify) fprintf(stderr, "[D3D8-HOST-2D] %s VERIFY (1 flip in %u drawn by the executor, host shadowed):"
+                                      " %llu draws compared -- the verdicts are the shadow lines below\n", why, s_verify, s_verified);
+        if (s_ffmode != 1 && s_mode != 1 && !s_verify) { fflush(stderr); return; }
     }
     fprintf(stderr, "[D3D8-HOST-2D] %s flips=%llu 2d_draws=%llu (executor mode 6: %llu, other %llu; executor did not"
                     " draw %llu; D3D object pass-through flag %llu) pre_tokens=%llu (skipped %llu) no_pre=%llu"

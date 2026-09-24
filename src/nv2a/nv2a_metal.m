@@ -4586,6 +4586,11 @@ int nv2a_metal_stencil_peek(const uint8_t *depth, unsigned w, unsigned h, uint8_
 int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,
                              int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx)
 {
+    return nv2a_metal_external_draw_ex(target, depth, writes_depth, encode, ctx, 0);
+}
+int nv2a_metal_external_draw_ex(const uint8_t *target, const uint8_t *depth, int writes_depth,
+                                int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx, int own_pass)
+{
     draw_thread_check();
     if (!encode || !target || !hw_state_on() || !hw_565_on()) return -1;
     if (!surface || !surface_valid || !hw_depth_tex || !hw_stencil_tex) return -2;
@@ -4603,7 +4608,7 @@ int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int wr
      * batch: no flush, no command buffer of its own, and the executor's
      * batching is not broken in two around it. The per-draw pass below stays
      * for RECOMP_METAL_BATCH=0. */
-    if (batch_on()) {
+    if (batch_on() && !own_pass) {
         if (batch_encoder && !batch_encoder_hw) batch_flush();
         if (!batch_encoder) {
             MTLRenderPassDescriptor *bp = [MTLRenderPassDescriptor renderPassDescriptor];

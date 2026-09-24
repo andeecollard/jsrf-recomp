@@ -1233,6 +1233,10 @@ if(APPLE)
     # the executor drawing the same draw; replace/after drive the skip.
     add_test(NAME jsrf_d3d8_host_2d_draw COMMAND jsrf_d3d8_host_2d_test draw)
     set_tests_properties(jsrf_d3d8_host_2d_draw PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    # 3000 host and executor draws interleaved in one batch, for each
+    # RECOMP_D3D8_HOST_BISECT arm that keeps the batch joined.
+    add_test(NAME jsrf_d3d8_host_2d_seq COMMAND jsrf_d3d8_host_2d_test seq)
+    set_tests_properties(jsrf_d3d8_host_2d_seq PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # The same with the executor's batching off: host draws take their own pass.
     add_test(NAME jsrf_d3d8_host_2d_draw_nobatch COMMAND jsrf_d3d8_host_2d_test draw)
     set_tests_properties(jsrf_d3d8_host_2d_draw_nobatch PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1;RECOMP_METAL_BATCH=0")

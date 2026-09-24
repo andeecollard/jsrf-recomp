@@ -232,6 +232,11 @@ VALUE_CARRYING = {
     "RECOMP_D3D8_HOST_FF",
     # A count of flips: only every Nth is shadowed (a shadowed 3D flip takes ~1 s).
     "RECOMP_D3D8_HOST_FF_STRIDE",
+    # A BITMASK: each bit reverts one G51.3 speed change, to bisect a picture
+    # defect in draw mode in as few runs as there are bits. A boolean cannot.
+    "RECOMP_D3D8_HOST_BISECT",
+    # A stride in flips: every Nth flip of a draw-mode run is verified.
+    "RECOMP_D3D8_HOST_VERIFY",
 }
 
 ratcheted = set(handrolled) - VALUE_CARRYING

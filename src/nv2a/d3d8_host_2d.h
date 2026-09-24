@@ -142,6 +142,7 @@ typedef struct {
     uint32_t prim_empty;                       /* points / lines / polygon: neither renderer draws them */
     uint32_t zs_addr, zs_pitch;
     float    z_min, z_max;                     /* over the emitted vertices */
+    float    w_min;                            /* likewise: > 0 means no vertex is behind the eye */
     uint32_t control_perturbed;                /* RECOMP_D3D8_HOST_2D_CONTROL applied */
     /* Triangles not drawn because a vertex's clip w = 1/rhw is not finite
      * (rhw 0: a zeroed slot in a partly filled dynamic buffer). The executor
@@ -255,6 +256,8 @@ typedef struct {
      * skipped or not (nv2a_pb_exec_host_seen). Tells "the executor stopped
      * before its rasteriser" from "no batch arrived between the tokens". */
     unsigned long long (*exec_seen)(void);
+    /* Optional: d3d8_host_2d_metal_bind_ns, time spent binding (mostly GPU drain). */
+    unsigned long long (*bind_ns)(void);
     /* Optional: d3d8_host_2d_metal_spec_stats, for the draw-mode report. */
     void (*spec_stats)(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
 } D3D8Host2DBackend;
@@ -275,6 +278,11 @@ int  d3d8_host_ff_mode(void);
  * RECOMP_D3D8_HOST_2D=draw, fixed-function with RECOMP_D3D8_HOST_FF=draw.) */
 int  d3d8_host_replaces_handle(uint32_t vs_handle);
 int  d3d8_host_any_draw_mode(void);
+/* RECOMP_D3D8_HOST_VERIFY=N, in draw mode: every Nth flip the draws the host
+ * would replace are left to the executor and shadowed instead -- the host's
+ * pipeline compared per draw against the executor IN THE SAME RUN, so a
+ * draw-mode run carries its own positive check. Asked on the guest thread. */
+int  d3d8_host_verify_now(void);
 /* Does the shadow take this draw (pre and post tokens)? */
 int  d3d8_host_shadow_wants(const D3D8HostDrawCheck *c);
 int  d3d8_host_shadow_wants_handle(uint32_t vs_handle);
@@ -292,8 +300,25 @@ void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *
 void d3d8_host_2d_metal_set_spec(int on);
 void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long *hits, unsigned long long *fallback,
                                    unsigned long long *compile_ns);
+/* RECOMP_D3D8_HOST_BISECT=<mask>: each bit turns one G51.3 speed change
+ * back to what came before it, to bisect a picture defect in draw mode.
+ *    1 host draws in a pass of their own, not joined to the executor's batch
+ *    2 a vertex buffer per draw, not slices of a shared chunk
+ *    4 no early fragment tests (late for every draw)
+ *    8 the generic fragment interpreter, not specialised pipelines
+ *   16 hash every texture on every draw (no once-per-flip trust)
+ *   32 evaluate every index, no per-draw vertex cache
+ *   64 wait for the GPU after every host draw
+ *  128 the executor's skip after its vertex/fragment preparation (645a7e6)
+ *  256 refuse the stencil class again (func ALWAYS; drawn by the host since 645a7e6)
+ *  512 refuse points/lines again (replaced by nothing since 645a7e6)
+ * 0x3FF reverts all of it: draw mode as 688bea4 drew, whose frames were clean.
+ * Read once; 0 or unset changes nothing. The test sets it directly. */
+unsigned d3d8_host_2d_bisect(void);
+void d3d8_host_2d_set_bisect(unsigned mask);
 /* Flips seen by the shadow/draw bookkeeping (the texture cache revalidates once per flip). */
 unsigned long long d3d8_host_2d_flip_count(void);
+unsigned long long d3d8_host_2d_metal_bind_ns(void);
 /* Draws for which the host bound the target first (nv2a_metal_bind). */
 unsigned long long d3d8_host_2d_metal_binds(void);
 void d3d8_host_2d_set_backend(const D3D8Host2DBackend *b);
