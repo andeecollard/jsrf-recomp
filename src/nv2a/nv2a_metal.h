@@ -73,6 +73,11 @@ int nv2a_metal_bind(uint8_t *target, size_t target_size, uint32_t w, uint32_t h,
 void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *hits, unsigned long long *evictions);
 int nv2a_metal_external_draw(const uint8_t *target, const uint8_t *depth, int writes_depth,
                              int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx);
+/* The same, with own_pass 1 forcing a pass of its own (flush the executor's
+ * batch, draw, commit) even while RECOMP_METAL_BATCH is on: the host's
+ * RECOMP_D3D8_HOST_BISECT bit 1. */
+int nv2a_metal_external_draw_ex(const uint8_t *target, const uint8_t *depth, int writes_depth,
+                                int (*encode)(void *encoder, unsigned w, unsigned h, void *ctx), void *ctx, int own_pass);
 
 /* RECOMP_SURFACE_CENSUS -- what every retained colour surface holds, on the
  * GPU and in guest RAM, side by side. `guest_base` is xbox_GetMemoryOffset(),

@@ -201,7 +201,7 @@ static id<MTLRenderPipelineState> s_pso, s_pso_st;
 static id<MTLLibrary> s_lib;
 static id<MTLFunction> s_vs;
 static int s_spec_on = 1;                   /* d3d8_host_2d_metal_set_spec: tests compare the two */
-static unsigned long long s_spec_built, s_spec_hits, s_spec_fallback, s_spec_compile_ns;
+static unsigned long long s_spec_built, s_spec_hits, s_spec_fallback, s_spec_compile_ns, s_early_refused_z;
 static id<MTLTexture> s_dummy;
 static id<MTLDepthStencilState> s_dss[16];
 /* Stencil states, built as hw_depth_state_for builds them, keyed by its fields. */
@@ -367,7 +367,7 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
     for (unsigned i = 0; i < TEX_CACHE; ++i)
         if (s_tc[i].tex && s_tc[i].addr == t->addr && s_tc[i].fmt == t->d3d_format && s_tc[i].size == t->d3d_size) { slot = (int)i; break; }
     if (slot >= 0) {
-        if (s_tc[slot].checked == flip) { s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
+        if (s_tc[slot].checked == flip && !(d3d8_host_2d_bisect() & 16u)) { s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
         hash = hash64(src, total); ++s_tc_hashes;
         if (s_tc[slot].hash == hash) { s_tc[slot].checked = flip; s_tc[slot].used = ++s_tc_clock; ++s_tc_hits; return s_tc[slot].tex; }
         s_tc_bytes -= s_tc[slot].bytes; s_tc[slot].tex = nil;            /* rewritten: rebuild in place */
@@ -429,16 +429,33 @@ void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long
     if (fallback) *fallback = s_spec_fallback;
     if (compile_ns) *compile_ns = s_spec_compile_ns;
 }
+/* EARLY TESTS ARE EXACT ONLY WHERE THE z-RANGE CULL CANNOT FIRE.
+ *
+ * The shader discards fragments whose z falls outside [0, 1] -- the
+ * executor's CULL policy, which it applies late, in its shader, on every
+ * draw. MTLDepthClipModeClamp clamps the depth that is TESTED; it does not
+ * clamp the z the shader reads, so that discard is live for any triangle that
+ * crosses the near or far plane. b3030e4 said otherwise ("under clamp it
+ * cannot fire") and dropped the discard from the early entry: in the game
+ * every FF triangle crossing the near plane then painted over the scene --
+ * the blocky debris of 24 Sep 2026 -- and no single in-range test could see
+ * it. The early entry is now taken only when the draw PROVES the cull
+ * cannot fire: every emitted vertex has w > 0 (so the rasterised z is an
+ * interpolation of the vertices' z, never extrapolated through a clip) and
+ * z in [0, 1]. Everything else runs late with the discard, like the
+ * executor. zrange_tests is the case, with its failing arm measured. */
 static int draw_early(const D3D8Host2DDraw *d)
 {
     int writes = (d->depth_test && d->depth_write) || (d->stencil_test && d->stencil_write && (d->stencil_mask & 255u));
+    if (d3d8_host_2d_bisect() & 4u) return 0;
+    if (!(d->w_min > 0.0f && d->z_min >= 0.0f && d->z_max <= 1.0f)) { ++s_early_refused_z; return 0; }
     return !d->alpha_test || !writes;
 }
 static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with_stencil, uint32_t lin_mask)
 {
     H2DSpecKey k;
     uint64_t h = 1469598103934665603ull;
-    if (!s_spec_on) return with_stencil ? s_pso_st : s_pso;
+    if (!s_spec_on || (d3d8_host_2d_bisect() & 8u)) return with_stencil ? s_pso_st : s_pso;
     memset(&k, 0, sizeof k);
     k.cc = d->cc; k.tmask = d->tmask; k.control = d->control;
     k.flags = (d->alpha_test ? 1u : 0u) | (d->blend ? 2u : 0u) | (d->dither ? 4u : 0u) | (d->add_specular ? 8u : 0u);
@@ -543,7 +560,7 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         static id<MTLBuffer> chunk;
         static size_t used;
         size_t need = (vbytes + 255u) & ~(size_t)255u;
-        if (need > CHUNK) {
+        if (need > CHUNK || (d3d8_host_2d_bisect() & 2u)) {
             vb = [s_dev newBufferWithBytes:d->verts length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
         } else {
             if (!chunk || used + need > CHUNK) {
@@ -632,8 +649,11 @@ void d3d8_host_2d_metal_stats(unsigned long long *tex_hits, unsigned long long *
     if (ns_texture) *ns_texture = s_ns_texture;
     if (ns_external) *ns_external = s_ns_external;
 }
-static unsigned long long s_binds;
+static unsigned long long s_binds, s_ns_bind;
 unsigned long long d3d8_host_2d_metal_binds(void) { return s_binds; }
+/* Time inside nv2a_metal_bind: a surface swap drains the GPU (nv2a_metal_sync),
+ * so this is mostly waiting, and it lands in "whole host draw". */
+unsigned long long d3d8_host_2d_metal_bind_ns(void) { return s_ns_bind; }
 typedef struct { const D3D8Host2DDraw *d; const uint8_t *ram; size_t ram_size; int ok; } ExtCtx;
 static int external_encode(void *encoder, unsigned w, unsigned h, void *ctx)
 {
@@ -652,16 +672,20 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
         int uses_zs = d->depth_test || d->stencil_test;
         int writes_zs = (d->depth_test && d->depth_write) || (d->stencil_test && d->stencil_write && (d->stencil_mask & 255u));
         uint8_t *zs = uses_zs ? (uint8_t *)ram + d->zs_addr : NULL;
-        drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, writes_zs, external_encode, &x);
+        int own = (d3d8_host_2d_bisect() & 1u) != 0;
+        drawn = nv2a_metal_external_draw_ex(ram + d->rt_addr, zs, writes_zs, external_encode, &x, own);
         /* Not bound: bind it the way the executor's own draw into it would
          * (nv2a_metal_bind is that code, shared), then draw. The executor's
          * next draw into this target finds it bound, as after its own swap. */
         if (drawn == -2 || drawn == -3 || drawn == -4) {
             size_t tsz = (size_t)d->rt_pitch * d->rt_h, zsz = (size_t)d->zs_pitch * d->rt_h;
-            if (nv2a_metal_bind((uint8_t *)ram + d->rt_addr, tsz, d->rt_w, d->rt_h, d->rt_pitch, zs, d->zs_pitch, zsz,
-                                uses_zs) == 0) {
+            uint64_t tb = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            int bound = nv2a_metal_bind((uint8_t *)ram + d->rt_addr, tsz, d->rt_w, d->rt_h, d->rt_pitch, zs, d->zs_pitch, zsz,
+                                        uses_zs);
+            s_ns_bind += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tb;
+            if (bound == 0) {
                 ++s_binds;
-                drawn = nv2a_metal_external_draw(ram + d->rt_addr, zs, writes_zs, external_encode, &x);
+                drawn = nv2a_metal_external_draw_ex(ram + d->rt_addr, zs, writes_zs, external_encode, &x, own);
             }
         }
     }
@@ -673,6 +697,7 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
     case -4: s_err = "target not bound: executor holds another depth surface"; break;
     default: if (x.ok) s_err = "host encode declined"; break;
     }
+    if (drawn == 1 && (d3d8_host_2d_bisect() & 64u)) nv2a_metal_sync();
     s_ns_external += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     return drawn == 1 && x.ok;
 }

@@ -172,6 +172,9 @@ typedef struct {
      * SetRenderState_FrontFace (0x18EC40) writes FRONT_FACE and re-applies it.
      * rs_valid = the mirror filled these. */
     uint32_t rs_cull, rs_front, rs_valid;
+    /* G51.3 verify: a draw draw mode would replace, left to the executor on a
+     * RECOMP_D3D8_HOST_VERIFY flip and compared against the host's shadow. */
+    uint32_t verify;
 } D3D8HostDrawCheck;
 /* G51.1: the Simple-pushed methods the host's 2D draw needs beyond
  * D3D8_HOST_STATE_METHODS: CULL_FACE_ENABLE, DITHER_ENABLE, BLEND_COLOR,

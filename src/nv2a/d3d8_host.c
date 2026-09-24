@@ -990,7 +990,7 @@ static void on_token(uint32_t parameter)
          * token took. Only pre-transformed 2D draws, only when armed. */
         if (d3d8_host_any_draw_mode())
             d3d8_host_2d_after(&s_slot[i].check);             /* closes draw mode's skip */
-        if (d3d8_host_shadow_wants(&s_slot[i].check))         /* 2D shadow, G51.3 FF shadow */
+        if (d3d8_host_shadow_wants(&s_slot[i].check) || s_slot[i].check.verify)   /* 2D/FF shadow, draw-mode verify */
             d3d8_host_2d_post(&s_slot[i].check, s_exec_source);
     } else if (s_slot[i].kind == 3) {
         d3d8_host_2d_replace(&s_slot[i].check);

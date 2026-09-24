@@ -386,6 +386,7 @@ static void d3d8m_put_token(uint32_t tok)
  * and render target are D3D's at this moment, which the draw does not change
  * before it emits. The serial is the one d3d8m_after_draw will give it. */
 static unsigned long long m_pre_no_token;
+static int m_verify_draw;          /* before_draw's verify decision, for after_draw's check token */
 /* The indices a 2D draw CALL is handed, into the host's ring, and a hash of
  * the vertex bytes they reach. Shared by the shadow (after the call) and draw
  * mode (before it): D3D copies these indices into the ring during the call,
@@ -466,7 +467,8 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     mode = d3d8_host_2d_mode();
     d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
     (void)mode;
-    if (d3d8_host_replaces_handle(h)) {
+    m_verify_draw = d3d8_host_replaces_handle(h) && d3d8_host_verify_now();
+    if (d3d8_host_replaces_handle(h) && !m_verify_draw) {
         /* Draw mode: the whole description goes ahead of the draw's commands.
          * The host draws it there, in the executor's target, and tells the
          * executor to skip the batches that follow until the check token. */
@@ -481,7 +483,7 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
         d3d8m_put_token(tok);
         return;
     }
-    if (!d3d8_host_shadow_wants_handle(h)) return;
+    if (!d3d8_host_shadow_wants_handle(h) && !m_verify_draw) return;
     rt = MEM32(d + 0x2070u); zs = MEM32(d + 0x2074u);
     tok = d3d8_host_enqueue_2d_pre(m_serial + 1u, h, rt ? MEM32(rt + 4u) : 0u, rt ? MEM32(rt + 0xCu) : 0u,
                                    rt ? MEM32(rt + 0x10u) : 0u, zs ? MEM32(zs + 4u) : 0u, zs ? MEM32(zs + 0x10u) : 0u);
@@ -509,8 +511,9 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long
      * before the token is reached. */
-    if (d3d8_host_shadow_wants_handle(MEM32(MEM32(0x0019DCE0u) + 0x384u)))
+    if (d3d8_host_shadow_wants_handle(MEM32(MEM32(0x0019DCE0u) + 0x384u)) || m_verify_draw)
         d3d8m_snap_indices(&c, kind, a2, a3);
+    c.verify = (uint32_t)m_verify_draw; m_verify_draw = 0;
     /* G43: the combiner inputs now (after the draw, so after its flush), and
      * as the builder and fog updater last saw them when they emitted. */
     c.ffc_valid = 1;

@@ -3406,8 +3406,11 @@ static void frame_stats_report(void)
  * reads "the executor did not draw it" -- true -- instead of the previous
  * draw's texture and surface. G51.3 measured the cost this removes: [STAGE]
  * vsh 1.99 ms a frame unchanged by replacing 52 of 71 draws. */
-static int s_host_skip;
+static int s_host_skip, s_host_skip_late;
 static unsigned long long s_host_skipped, s_host_seen;
+/* RECOMP_D3D8_HOST_BISECT bit 128: skip where 645a7e6 did, after the batch's
+ * vertex and fragment preparation, instead of before it. */
+void nv2a_pb_exec_host_skip_late(int on) { s_host_skip_late = on; }
 void nv2a_pb_exec_host_skip(int on) { s_host_skip = on; }
 unsigned long long nv2a_pb_exec_host_skipped(void) { return s_host_skipped; }
 /* Batches that ARRIVED while the skip was on, skipped or not: a batch the
@@ -5060,7 +5063,7 @@ static void raster_batch(void)
         if (fade_batch) ++s_blend_fade_fate.short_idx;
         return;
     }
-    if (s_host_skip) { s_copy.active = 0; ++s_host_skipped; return; }
+    if (s_host_skip && !s_host_skip_late) { s_copy.active = 0; ++s_host_skipped; return; }
     unsigned long long _t_vsh = pb_now_us();
     int _vsh_ok = prepare_vertices();
     pb_stage_add(PB_STAGE_VSH, _t_vsh);
@@ -5242,6 +5245,7 @@ static void raster_batch(void)
         }
     }
 
+    if (s_host_skip) { ++s_host_skipped; goto batch_complete; }   /* late skip (bisect) */
 #if NV2A_GPU_PATH
     if (s_copy.active && nv2a_gpu_on()) {
         static unsigned fallback_reports, unique_reports;
