@@ -5156,7 +5156,7 @@ int main(int argc, char **argv)
              * pre-transformed 2D class again with its own Metal pipeline and
              * compares it with the executor at every flip. Unset, nothing is
              * registered and the flip hook stays NULL. */
-            if (d3d8_host_2d_mode() || d3d8_host_ff_mode()) {       /* shadow or draw, 2D or fixed-function */
+            if (d3d8_host_2d_mode() || d3d8_host_ff_mode() || d3d8_host_vs_mode()) {   /* shadow or draw; 2D, FF or programmable */
                 extern void nv2a_pb_exec_set_flip_hook(void (*)(void));
                 D3D8Host2DBackend be;
                 memset(&be, 0, sizeof be);
@@ -5199,7 +5199,10 @@ int main(int argc, char **argv)
     /* G56: the framebuffer probe skips a surface whose bytes the GPU is ahead of. */
     {   extern void xbox_SetFramebufferOwedQuery(int (*q)(const uint8_t *, size_t));
         extern int nv2a_metal_range_owed(const uint8_t *, size_t);
-        xbox_SetFramebufferOwedQuery(nv2a_metal_range_owed); }
+        xbox_SetFramebufferOwedQuery(nv2a_metal_range_owed);
+        extern void xbox_SetFramebufferGuardedRead(int (*)(const uint8_t *, size_t, void (*)(const uint8_t *, size_t, void *), void *));
+        extern int nv2a_debt_watch_guarded_read(const uint8_t *, size_t, void (*)(const uint8_t *, size_t, void *), void *);
+        xbox_SetFramebufferGuardedRead(nv2a_debt_watch_guarded_read); }
     /* RECOMP_METAL_DEBT_WATCH: both views of GPU memory, after the alias
      * exists and after the crash and MCPX handlers, so it runs first and
      * chains to them. No-op unless the switch is on. */

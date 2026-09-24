@@ -18,6 +18,9 @@ static volatile int g_sink;
 static void *guest_read_high(void *a) { (void)a; g_sink = g_high[HEAP_LO + 100]; return NULL; }
 static void *guest_write_high(void *a) { (void)a; g_high[HEAP_LO + 5] = 7; return NULL; }
 static void *guest_read_low(void *a) { (void)a; g_sink = g_low[HEAP_LO + 200]; return NULL; }
+static int g_ran;
+static void sum_fn(const uint8_t *p, size_t n, void *ctx) { (void)ctx; unsigned t = 0; for (size_t i = 0; i < n; ++i) t += p[i]; g_sink = (int)t; g_ran = 1; }
+static void *probe_guarded(void *a) { (void)a; g_ran = nv2a_debt_watch_guarded_read((const uint8_t *)g_low + HEAP_LO, 4096, sum_fn, NULL) ? g_ran : -1; return NULL; }
 static void run(void *(*f)(void *)) { pthread_t t; pthread_create(&t, NULL, f, NULL); pthread_join(t, NULL); }
 
 int main(void)
@@ -65,7 +68,19 @@ int main(void)
     nv2a_debt_watch_counts(d);
     CHECK(d[1] == c[1] + 1 && d[2] == c[2], "paid first: counted clean, and the later read is not guarded");
 
-    /* 5. CONTROL: an unwatched address still reaches the old handler -- here, none,
+    /* 5. A runtime reader on another thread (the framebuffer probe) reads under
+     *    the watch's lock: skipped while a debt is armed, run once it is paid,
+     *    and never a fault either way. */
+    nv2a_debt_watch_arm((const uint8_t *)g_low + HEAP_LO, RANGE, NV2A_DEBT_COLOUR);
+    nv2a_debt_watch_counts(c);
+    g_ran = 0; run(probe_guarded);
+    nv2a_debt_watch_counts(d);
+    CHECK(g_ran == -1 && d[2] == c[2], "guarded read: skipped while the range is owed, no fault counted");
+    nv2a_debt_watch_paid((const uint8_t *)g_low + HEAP_LO, RANGE);
+    g_ran = 0; run(probe_guarded);
+    CHECK(g_ran == 1, "guarded read: runs once the debt is paid");
+
+    /* 6. CONTROL: an unwatched address still reaches the old handler -- here, none,
      *    so only check that unarmed memory is untouched by the watch. */
     g_high[0] = 1; g_low[0] = 1;
     CHECK(g_high[0] == 1 && g_low[0] == 1, "memory outside every debt is never guarded");

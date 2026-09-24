@@ -216,6 +216,18 @@ void nv2a_debt_watch_arm(const uint8_t *p, size_t bytes, int kind)
     unlock();
 }
 
+int nv2a_debt_watch_guarded_read(const uint8_t *p, size_t bytes, void (*fn)(const uint8_t *, size_t, void *), void *ctx)
+{
+    uintptr_t lo = (uintptr_t)p, hi = lo + bytes;
+    if (!nv2a_debt_watch_on()) { fn(p, bytes, ctx); return 1; }
+    lock();
+    for (int i = 0; i < DW_REGIONS; ++i)
+        if (s_r[i].armed && pg_lo(s_r[i].lo) < pg_hi(hi) && pg_lo(lo) < pg_hi(s_r[i].hi)) { unlock(); return 0; }
+    fn(p, bytes, ctx);            /* arming takes this lock, so nothing is armed under the read */
+    unlock();
+    return 1;
+}
+
 void nv2a_debt_watch_paid(const uint8_t *p, size_t bytes)
 {
     uintptr_t lo = (uintptr_t)p, hi = lo + bytes;
@@ -267,5 +279,6 @@ void nv2a_debt_watch_configure(uintptr_t a, uintptr_t b, uint32_t c, uint32_t d)
 void nv2a_debt_watch_arm(const uint8_t *p, size_t bytes, int kind) { (void)p; (void)bytes; (void)kind; }
 void nv2a_debt_watch_paid(const uint8_t *p, size_t bytes) { (void)p; (void)bytes; }
 void nv2a_debt_watch_report(void) { }
+int nv2a_debt_watch_guarded_read(const uint8_t *p, size_t bytes, void (*fn)(const uint8_t *, size_t, void *), void *ctx) { fn(p, bytes, ctx); return 1; }
 void nv2a_debt_watch_counts(unsigned long long out[NV2A_DEBT_WATCH_COUNTS]) { memset(out, 0, sizeof(unsigned long long) * NV2A_DEBT_WATCH_COUNTS); }
 #endif

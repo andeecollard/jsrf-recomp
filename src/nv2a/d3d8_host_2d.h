@@ -154,6 +154,17 @@ typedef struct {
     uint32_t cls;                              /* d3d8_host_2d_class */
     uint32_t cull_face, front_cw;              /* as applied: 0 none, 0x404 front, 0x405 back */
     uint32_t ff_evals;                         /* nv2a_ff_vertex calls: unique indices, not indices */
+    /* G51.2, the title's own vertex programs (class 3). The program is D3D's
+     * (the shader object's SET_TRANSFORM_PROGRAM fragment, the mirror's
+     * vs_words), the transform is the executor's own VSH->MSL translation
+     * (nv2a_metal_vsh_function) run on the GPU, and the host fetches the
+     * inputs: vs_in holds vs_nin vertices of vs_nattrs float4 each, in
+     * ascending attribute order, and vs_idx the triangle list into them. */
+    const uint32_t *vs_words;
+    uint32_t vs_len, vs_inputs, vs_nattrs, vs_nin, vs_nidx;
+    const float (*vs_in)[4];
+    const uint32_t *vs_idx;
+    float vs_c[192][4];                        /* the constant file, from D3D */
     uint32_t tris_dropped_q;                   /* textured unit q <= 0: the executor drops those too */
 } D3D8Host2DDraw;
 
@@ -170,8 +181,15 @@ static inline int d3d8_host_2d_is_fvf_ff(uint32_t handle)
 {
     return !(handle & 1u) && (handle & 0x00Eu) != 0x004u && (handle & 0x00Eu) != 0u;
 }
-/* 1 pre-transformed 2D, 2 fixed-function 3D, 0 neither (programmable, or no draw). */
+/* 1 pre-transformed 2D, 2 fixed-function 3D, 3 a programmable vertex shader
+ * whose program the mirror captured (G51.2), 0 none of these. */
 int d3d8_host_2d_class(const D3D8HostDrawCheck *c);
+/* G51.2: RECOMP_D3D8_HOST_VS=shadow (1) -- programmable-VS draws shadowed. */
+int d3d8_host_vs_mode(void);
+/* The executor's compiled GPU program for these words (additive, nv2a_metal.m):
+ * its vs_gpu vertex function as an id<MTLFunction>, and its packed attribute
+ * count. NULL if the translator or compiler refused it. Executor thread. */
+void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs);
 /* The executor's fixed-function vertex unit (nv2a_ff_vertex), handed in. */
 typedef const char *(*D3D8H2DFFVertexFn)(const uint32_t m[2048], const float in[16][4], float out[16][4]);
 

@@ -1488,6 +1488,21 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
     }
 }
 
+/* G51.2, additive: the executor's compiled vs_gpu for a program, for the
+ * host's programmable-VS draw -- the same cache, the same translation, the
+ * same wrapper, so the host's transform IS the executor's. Its Out matches the
+ * host fragment's stage_in member for member (p, d0, d1, t0..t3). */
+void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs)
+{
+    VshSlot *v;
+    /* the executor thread: the host shadow and replace run there */
+    if (!words || length <= 0 || !initialize()) return NULL;
+    v = vsh_lookup_ex(words, length, 0, 0, inputs);
+    if (!v) return NULL;
+    if (nattrs) *nattrs = v->nattrs;
+    return (__bridge void *)v->fn;
+}
+
 int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
                          uint16_t inputs_read)
 {

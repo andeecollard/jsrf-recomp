@@ -3,6 +3,7 @@
  * backend. That is what lets jsrf_d3d8_host_2d_test drive all of it. */
 #include "d3d8_host_2d.h"
 #include "d3d8_ff_combiner.h"
+#include "nv2a_vsh.h"
 #include "../recomp_switch.h"
 #include <math.h>
 #include <stdatomic.h>
@@ -31,6 +32,7 @@ int d3d8_host_2d_class(const D3D8HostDrawCheck *c)
     if (!c->draw_kind) return 0;
     if (d3d8_host_2d_is_fvf_xyzrhw(c->vs_handle)) return 1;
     if (d3d8_host_2d_is_fvf_ff(c->vs_handle)) return 2;
+    if ((c->vs_handle & 1u) && c->vs_kind == 1u && c->vs_nwords) return 3;
     return 0;
 }
 
@@ -239,6 +241,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     if (!verts) return "no vertex buffer";
     if (!cls) return "not a host class";
     if (cls == 2 && (!ffm || !ffv)) return "no fixed-function register file or evaluator";
+    if (cls == 3 && d3d8_host_vs_mode() <= 0) return "programmable vertex shader (RECOMP_D3D8_HOST_VS off)";
 
     /* Target. */
     if (!c->rt) return "no render target";
@@ -362,6 +365,71 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 if (!c->idx_ptr || at + 2u > ram_size) return "index bounds";
                 idx[k] = (uint32_t)ram[at] | (uint32_t)ram[at + 1] << 8;
             } else idx[k] = c->start + k;
+        }
+        /* G51.2: THE TITLE'S OWN VERTEX PROGRAM. Program and constants come
+         * from D3D (the shader object's program fragment, SetVertexShaderConstant
+         * at slot = register + 96, and the viewport pair D3D keeps at slots 58
+         * and 59); the transform is the executor's own translation, run on the
+         * GPU by the host's draw. The host fetches each referenced vertex's
+         * inputs once, packed in ascending attribute order as vs_gpu reads them,
+         * and hands it the triangle list -- assembled here in the executor's
+         * order, which decides facing. Clipping and culling are the GPU's, as
+         * on the executor's GPU path. */
+        if (cls == 3) {
+            static float (*vin)[4]; static uint32_t vin_cap; static uint32_t *vidx; static uint32_t vidx_cap;
+            NV2AVshProgram prog;
+            uint32_t lo = UINT32_MAX, hi = 0, range, nattrs = 0, nt = 0, slot_of[16];
+            if (!n) return "empty";
+            memset(&prog, 0, sizeof prog);
+            nv2a_vsh_parse(c->vs_words, (int)(c->vs_nwords / 4u), &prog);
+            if (!prog.valid || !prog.has_final || prog.length <= 0) return "vertex program not translatable";
+            d->vs_words = c->vs_words; d->vs_len = (uint32_t)prog.length; d->vs_inputs = prog.inputs_read;
+            for (unsigned a = 0; a < 16; ++a) if (prog.inputs_read & (1u << a)) slot_of[a] = nattrs++;
+            d->vs_nattrs = nattrs;
+            for (uint32_t k = 0; k < n; ++k) { if (idx[k] < lo) lo = idx[k]; if (idx[k] > hi) hi = idx[k]; }
+            range = hi - lo + 1u;
+            if (range > 65536u) return "index range";
+            {   uint32_t need = range * (nattrs ? nattrs : 1u);
+                if (need > vin_cap) { float (*g)[4] = realloc(vin, need * sizeof *g); if (!g) return "out of memory"; vin = g; vin_cap = need; }
+                if (3u * n > vidx_cap) { uint32_t *g = realloc(vidx, 3u * n * sizeof *g); if (!g) return "out of memory"; vidx = g; vidx_cap = 3u * n; } }
+            for (uint32_t v = 0; v < range; ++v)
+                for (unsigned a = 0; a < 16; ++a) {
+                    float x[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    if (!(prog.inputs_read & (1u << a))) continue;
+                    if (a == 3u) x[0] = x[1] = x[2] = 1.0f;                 /* diffuse without an array: white */
+                    if ((c->va_on >> a) & 1u) (void)fetch(ram, ram_size, c->va_offset[a], c->va_format[a], lo + v, x);
+                    memcpy(vin[v * nattrs + slot_of[a]], x, 16);
+                }
+            for (uint32_t k = 0; ; ++k) {
+                uint32_t t[3];
+                if (d->prim == 5u)      { if (3u * k + 2u >= n) break; t[0] = 3u*k; t[1] = 3u*k+1u; t[2] = 3u*k+2u; }
+                else if (d->prim == 6u) { if (k + 2u >= n) break; t[0] = k + (k & 1u); t[1] = k + 1u - (k & 1u); t[2] = k + 2u; }
+                else if (d->prim == 7u) { if (k + 2u >= n) break; t[0] = 0; t[1] = k + 1u; t[2] = k + 2u; }
+                else if (d->prim == 8u) { uint32_t q = k / 2u; if (4u * q + 3u >= n) break;
+                                          if (k & 1u) { t[0] = 4u*q; t[1] = 4u*q+2u; t[2] = 4u*q+3u; } else { t[0] = 4u*q; t[1] = 4u*q+1u; t[2] = 4u*q+2u; } }
+                else                    { uint32_t q = k / 2u; if (2u * q + 3u >= n) break;
+                                          if (k & 1u) { t[0] = 2u*q; t[1] = 2u*q+3u; t[2] = 2u*q+2u; } else { t[0] = 2u*q; t[1] = 2u*q+1u; t[2] = 2u*q+3u; } }
+                if (control && (k & 1u)) continue;       /* the positive control: every other triangle missing */
+                for (unsigned j = 0; j < 3; ++j) vidx[3u * nt + j] = idx[t[j]] - lo;
+                ++nt;
+            }
+            d->vs_in = (const float (*)[4])vin; d->vs_nin = range; d->vs_idx = vidx; d->vs_nidx = 3u * nt;
+            d->nverts = 3u * nt; d->idx_min = lo; d->idx_max = hi;
+            if (control) d->control_perturbed = 1;
+            /* The constant file: what D3D was handed, and the viewport pair it
+             * keeps itself (c-38 scale, c-37 offset) where it was not written. */
+            memcpy(d->vs_c, c->vc, sizeof d->vs_c);
+            if (!((c->vc_written[58u / 32u] >> (58u % 32u)) & 1u)) {
+                float sx = (float)c->vp_w * c->ss_x * 0.5f, sy = (float)c->vp_h * c->ss_y * 0.5f;
+                d->vs_c[58][0] = sx; d->vs_c[58][1] = -sy; d->vs_c[58][2] = 16777215.0f * (c->vp_maxz - c->vp_minz); d->vs_c[58][3] = 0.0f;
+                d->vs_c[59][0] = (float)c->vp_x * c->ss_x + sx + D3D8H2D_SCREEN_OFFSET;
+                d->vs_c[59][1] = (float)c->vp_y * c->ss_y + sy + D3D8H2D_SCREEN_OFFSET;
+                d->vs_c[59][2] = 16777215.0f * c->vp_minz; d->vs_c[59][3] = 0.0f;
+            }
+            /* The whole target: the GPU decides where it lands. Never early. */
+            d->bb_x0 = 0; d->bb_y0 = 0; d->bb_x1 = (int32_t)d->rt_w - 1; d->bb_y1 = (int32_t)d->rt_h - 1;
+            d->z_min = -1.0f; d->z_max = 2.0f; d->w_min = -1.0f;
+            return NULL;
         }
         /* FIXED-FUNCTION VERTICES ARE EVALUATED ONCE PER INDEX VALUE, not once
          * per index: an indexed mesh names each vertex about six times, and
@@ -635,6 +703,39 @@ static unsigned s_ff_stride = 60;
 static unsigned long long s_verified;
 static unsigned long long s_ff_unsampled;
 static int ff_sampled(void) { return s_ff_stride <= 1 || (s_flips % s_ff_stride) == 0; }
+/* G51.2: RECOMP_D3D8_HOST_VS=shadow. Programmable-VS draws are shadowed on the
+ * same stride as the FF shadow (RECOMP_D3D8_HOST_FF_STRIDE): each one renders
+ * and reads back the whole target. */
+static int s_vsmode = -1;
+static unsigned long long s_vs_seen, s_vs_draws, s_vs_built, s_vs_compared, s_vs_exact, s_vs_within, s_vs_mm;
+static unsigned long long s_vs_px, s_vs_px_mm, s_vs_exec_changed, s_vs_host_changed, s_vs_mm_cov_exec, s_vs_mm_cov_host;
+static unsigned long long s_vs_const_match, s_vs_const_differ, s_vs_const_slot_differ[192];
+static unsigned s_vs_max_err[3], s_vs_printed_const;
+static uint32_t s_vs_prog_hash[128]; static unsigned s_vs_progs; static unsigned long long s_vs_prog_overflow;
+int d3d8_host_vs_mode(void)
+{
+    if (s_vsmode < 0) {
+        const char *e = getenv("RECOMP_D3D8_HOST_VS");
+        s_vsmode = e && (!strcmp(e, "shadow") || !strcmp(e, "1")) ? 1 : 0;
+        if (e && e[0] && !s_vsmode && strcmp(e, "0") && strcmp(e, "off"))
+            fprintf(stderr, "[D3D8-HOST-VS] RECOMP_D3D8_HOST_VS=%s not understood; off (shadow)\n", e);
+        if (s_vsmode == 1) {
+            read_knobs();
+            fprintf(stderr, "[D3D8-HOST-VS] RECOMP_D3D8_HOST_VS=shadow: draws through the title's own vertex programs are"
+                            " drawn beside the executor from D3D state (program from the shader object, constants from"
+                            " SetVertexShaderConstant and the viewport, the executor's VSH->MSL translation as the"
+                            " transform) and compared, 1 flip in %u\n", s_ff_stride);
+        }
+    }
+    return s_vsmode;
+}
+static void vs_note_program(const D3D8HostDrawCheck *c)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < c->vs_nwords; ++i) { h ^= c->vs_words[i]; h *= 16777619u; }
+    for (unsigned i = 0; i < s_vs_progs; ++i) if (s_vs_prog_hash[i] == h) return;
+    if (s_vs_progs < 128) s_vs_prog_hash[s_vs_progs++] = h; else ++s_vs_prog_overflow;
+}
 int d3d8_host_ff_mode(void)
 {
     static atomic_flag s_init = ATOMIC_FLAG_INIT;
@@ -676,12 +777,14 @@ int d3d8_host_ff_mode(void)
 }
 int d3d8_host_shadow_wants_handle(uint32_t h)
 {
-    return (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_fvf_xyzrhw(h)) || (d3d8_host_ff_mode() == 1 && d3d8_host_2d_is_fvf_ff(h));
+    return (d3d8_host_2d_mode() == 1 && d3d8_host_2d_is_fvf_xyzrhw(h)) || (d3d8_host_ff_mode() == 1 && d3d8_host_2d_is_fvf_ff(h))
+        || (d3d8_host_vs_mode() == 1 && (h & 1u));
 }
 int d3d8_host_shadow_wants(const D3D8HostDrawCheck *c)
 {
     int cls = d3d8_host_2d_class(c);
-    return (cls == 1 && d3d8_host_2d_mode() == 1) || (cls == 2 && d3d8_host_ff_mode() == 1);
+    return (cls == 1 && d3d8_host_2d_mode() == 1) || (cls == 2 && d3d8_host_ff_mode() == 1)
+        || (cls == 3 && d3d8_host_vs_mode() == 1);
 }
 int d3d8_host_replaces_handle(uint32_t h)
 {
@@ -798,9 +901,10 @@ void d3d8_host_2d_pre(uint32_t serial, uint32_t vs_handle, uint32_t rt_data, uin
     uint32_t w = (rt_size & 0xFFFu) + 1u;
     size_t bytes = (size_t)pitch * h;
     s_snap_valid = 0; s_zsnap_valid = 0;
-    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode()) return;
+    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode() && d3d8_host_vs_mode() <= 0) return;
     /* this flip is not shadowed; in FF draw mode an FF pre token is a verify draw, always compared */
     if (d3d8_host_2d_is_fvf_ff(vs_handle) && d3d8_host_ff_mode() == 1 && !ff_sampled()) return;
+    if ((vs_handle & 1u) && d3d8_host_vs_mode() == 1 && !ff_sampled()) return;
     ++s_pre;
     if (!s_have_be || ((rt_format >> 8) & 0xFFu) != 0x11u || addr + bytes > s_be.ram_size) { ++s_pre_skipped; return; }
     if (bytes > s_snap_cap) {
@@ -844,8 +948,10 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     static D3D8Host2DDraw d;
     const char *why;
     int cls = d3d8_host_2d_class(c);
+    if (cls == 3 && d3d8_host_vs_mode() == 1) { ++s_vs_seen; vs_note_program(c); }
     if (!d3d8_host_shadow_wants(c) && !c->verify) return;
-    if (cls == 2 && !c->verify && !ff_sampled()) { ++s_ff_unsampled; return; }
+    if ((cls == 2 || cls == 3) && !c->verify && !ff_sampled()) { ++s_ff_unsampled; return; }
+    if (cls == 3) ++s_vs_draws;
     if (c->verify) ++s_verified;
     ++s_draws;
     if (cls == 2) ++s_ff_draws;
@@ -1031,6 +1137,27 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
             ++s_ff_built; s_ff_tris_q += d.tris_dropped_q;
         } else if ((why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d))) {
             count_reason(why); return;
+        }
+        if (cls == 3) {
+            ++s_vs_built;
+            /* The constant file the host derived, against the executor's --
+             * every slot D3D wrote, and the viewport pair. Never used to draw. */
+            if (e.regs_valid) {
+                unsigned bad = 0, first = 999;
+                for (unsigned k = 0; k < 192; ++k) {
+                    int want = ((c->vc_written[k / 32u] >> (k % 32u)) & 1u) || k == 58u || k == 59u;
+                    if (!want) continue;
+                    if (memcmp(d.vs_c[k], e.vc[k], 16)) { ++bad; ++s_vs_const_slot_differ[k]; if (first == 999) first = k; }
+                }
+                if (bad) {
+                    ++s_vs_const_differ;
+                    if (s_vs_printed_const++ < 6)
+                        fprintf(stderr, "[D3D8-HOST-VS] draw %u: %u constant slot(s) differ from the executor's; first %u:"
+                                        " host %g %g %g %g, executor %g %g %g %g\n", c->serial, bad, first,
+                                d.vs_c[first][0], d.vs_c[first][1], d.vs_c[first][2], d.vs_c[first][3],
+                                e.vc[first][0], e.vc[first][1], e.vc[first][2], e.vc[first][3]);
+                } else ++s_vs_const_match;
+            }
         }
         /* Vertices: did the bytes the draw reaches change between the call and now? */
         if (c->vtx_hash_ok) {
@@ -1337,7 +1464,7 @@ void d3d8_host_2d_flip(void)
 {
     unsigned long long px = 0, mm = 0, fe = 0, fh = 0;
     unsigned worst[3] = { 0, 0, 0 }, bad = 0, nrec = s_nrec;
-    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode()) return;
+    if (!d3d8_host_2d_mode() && !d3d8_host_ff_mode() && d3d8_host_vs_mode() <= 0) return;
     ++s_flips;
     if (d3d8_host_any_draw_mode() && s_skip_on) { s_be.exec_skip(0); s_skip_on = 0; count_reason("skip still on at the flip"); }
     if (d3d8_host_any_draw_mode() && !s_nrec) {
@@ -1354,6 +1481,15 @@ void d3d8_host_2d_flip(void)
         s_rec_cls[k] = (uint8_t)r->info.cls; s_rec_bad[k] = df.mismatch != 0;
         ++s_compared;
         px += df.pixels; mm += df.mismatch; fe += df.exec_changed; fh += df.host_changed;
+        if (r->info.cls == 3) {
+            ++s_vs_compared; s_vs_px += df.pixels; s_vs_px_mm += df.mismatch;
+            s_vs_exec_changed += df.exec_changed; s_vs_host_changed += df.host_changed;
+            if (df.mismatch) {
+                ++s_vs_mm;
+                if (df.exec_changed > df.host_changed) ++s_vs_mm_cov_exec; else if (df.host_changed > df.exec_changed) ++s_vs_mm_cov_host;
+            } else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_vs_within; else ++s_vs_exact;
+            for (int ch = 0; ch < 3; ++ch) if (df.max_err[ch] > s_vs_max_err[ch]) s_vs_max_err[ch] = df.max_err[ch];
+        }
         if (r->info.cls == 2) {
             ++s_ff_compared; s_ff_px += df.pixels; s_ff_px_mm += df.mismatch;
             s_ff_exec_changed += df.exec_changed; s_ff_host_changed += df.host_changed;
@@ -1497,7 +1633,7 @@ static void ff_report(const char *why)
 
 void d3d8_host_2d_report(const char *why)
 {
-    if (s_mode <= 0 && s_ffmode <= 0) return;
+    if (s_mode <= 0 && s_ffmode <= 0 && s_vsmode <= 0) return;
     if (s_mode == 2 || s_ffmode == 2) {
         fprintf(stderr, "[D3D8-HOST-2D] %s draw mode: flips=%llu tokens=%llu REPLACED=%llu (2D %llu, fixed-function %llu; of which the host bound"
                         " the target first %llu; executor batches skipped %llu, replaced draws the executor did not skip"
@@ -1545,7 +1681,7 @@ void d3d8_host_2d_report(const char *why)
         }
         if (s_verify) fprintf(stderr, "[D3D8-HOST-2D] %s VERIFY (1 flip in %u drawn by the executor, host shadowed):"
                                       " %llu draws compared -- the verdicts are the shadow lines below\n", why, s_verify, s_verified);
-        if (s_ffmode != 1 && s_mode != 1 && !s_verify) { fflush(stderr); return; }
+        if (s_ffmode != 1 && s_mode != 1 && s_vsmode != 1 && !s_verify) { fflush(stderr); return; }
     }
     fprintf(stderr, "[D3D8-HOST-2D] %s flips=%llu 2d_draws=%llu (executor mode 6: %llu, other %llu; executor did not"
                     " draw %llu; D3D object pass-through flag %llu) pre_tokens=%llu (skipped %llu) no_pre=%llu"
@@ -1585,5 +1721,21 @@ void d3d8_host_2d_report(const char *why)
         if (any) fprintf(stderr, "\n");
     }
     ff_report(why);
+    if (s_vsmode == 1) {
+        unsigned long long top[3] = { 0, 0, 0 }; unsigned slot[3] = { 0, 0, 0 };
+        for (unsigned k = 0; k < 192; ++k)
+            for (unsigned t = 0; t < 3; ++t) if (s_vs_const_slot_differ[k] > top[t]) {
+                for (unsigned u = 2; u > t; --u) { top[u] = top[u - 1]; slot[u] = slot[u - 1]; }
+                top[t] = s_vs_const_slot_differ[k]; slot[t] = k; break; }
+        fprintf(stderr, "[D3D8-HOST-VS] %s census: programmable-VS draws %llu over %llu flips (%.1f a flip), distinct programs"
+                        " %u%s | shadowed %llu, built %llu, compared %llu: EXACT %llu within_tolerance %llu MISMATCHING %llu"
+                        " (executor more %llu, host more %llu) | px %llu over tolerance %llu, max error r%u g%u b%u |"
+                        " executor changed %llu, host %llu | constants as the executor's %llu, different %llu (slots most"
+                        " often different: %u x%llu, %u x%llu, %u x%llu)\n", why, s_vs_seen, s_flips,
+                s_flips ? (double)s_vs_seen / (double)s_flips : 0.0, s_vs_progs, s_vs_prog_overflow ? "+" : "",
+                s_vs_draws, s_vs_built, s_vs_compared, s_vs_exact, s_vs_within, s_vs_mm, s_vs_mm_cov_exec, s_vs_mm_cov_host,
+                s_vs_px, s_vs_px_mm, s_vs_max_err[0], s_vs_max_err[1], s_vs_max_err[2], s_vs_exec_changed, s_vs_host_changed,
+                s_vs_const_match, s_vs_const_differ, slot[0], top[0], slot[1], top[1], slot[2], top[2]);
+    }
     fflush(stderr);
 }

@@ -235,6 +235,8 @@ VALUE_CARRYING = {
     # A BITMASK: each bit reverts one G51.3 speed change, to bisect a picture
     # defect in draw mode in as few runs as there are bits. A boolean cannot.
     "RECOMP_D3D8_HOST_BISECT",
+    # G51.2: a MODE ("shadow"), like RECOMP_D3D8_HOST_FF.
+    "RECOMP_D3D8_HOST_VS",
     # A stride in flips: every Nth flip of a draw-mode run is verified.
     "RECOMP_D3D8_HOST_VERIFY",
 }
