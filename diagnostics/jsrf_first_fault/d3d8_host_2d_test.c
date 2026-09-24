@@ -333,7 +333,24 @@ static int fake_peek(const uint8_t *z, unsigned w, unsigned h, float *out)
     if (++g_peeks == 1) return 0;
     return nv2a_metal_depth_peek(z, w, h, out);
 }
-static void shadow_flow(const D3D8HostDrawCheck *c, int control)
+/* What the mirror does at the draw call: indices into the ring, and the
+ * vertex hash, while pIndexData still holds this draw's indices. */
+static void snapshot_at_call(D3D8HostDrawCheck *c)
+{
+    uint32_t imin = 0xFFFFFFFFu, imax = 0;
+    if (c->draw_kind == 2) {
+        uint64_t pos; uint16_t *dst = d3d8_host_2d_idx_reserve(c->count, &pos);
+        memcpy(dst, ram + c->idx_ptr, 2u * c->count);
+        for (uint32_t k = 0; k < c->count; ++k) { if (dst[k] < imin) imin = dst[k]; if (dst[k] > imax) imax = dst[k]; }
+        d3d8_host_2d_idx_publish(pos, c->count);
+        c->idx_snap_pos = pos; c->idx_snap_n = c->count;
+    } else { imin = c->start; imax = c->start + c->count - 1u; }
+    c->vtx_hash = d3d8_host_2d_vertex_hash(ram, RAM_SIZE, c, imin, imax); c->vtx_hash_ok = 1;
+}
+/* `stale`: after the call, overwrite pIndexData with the next draw's indices
+ * -- the tutorial's dynamic index buffer -- so only the snapshot is right. */
+static int g_stale;
+static void shadow_flow(D3D8HostDrawCheck *c, int control)
 {
     static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH];
     static uint8_t depth[RTW * 4 * RTH];
@@ -351,6 +368,8 @@ static void shadow_flow(const D3D8HostDrawCheck *c, int control)
     d3d8_host_2d_set_backend(&be);
     memcpy(ram + RT, bg, sizeof bg);
     g_exec_result = ex; g_sync_calls = 0;
+    snapshot_at_call(c);
+    if (g_stale && c->draw_kind == 2) { static const uint16_t next[6] = { 3, 3, 3, 1, 1, 1 }; memcpy(ram + c->idx_ptr, next, sizeof next); }
     d3d8_host_2d_get_stats(&before);
     d3d8_host_2d_pre(c->serial, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
     d3d8_host_2d_post(c, NULL);
@@ -430,7 +449,34 @@ int main(int argc, char **argv)
     }
     CHECK(d3d8_host_2d_mode() == 1, "RECOMP_D3D8_HOST_2D=shadow arms the shadow");
     case_b(&c); shadow_flow(&c, control);
-    if (!control) { case_d(&c); shadow_flow(&c, 0); }
+    if (!control) {
+        D3D8H2DStats a, b;
+        case_d(&c); shadow_flow(&c, 0);
+        /* The tutorial's failure: pIndexData rewritten between the call and
+         * the token. The snapshot must carry the draw through it... */
+        d3d8_host_2d_get_stats(&a);
+        g_stale = 1; case_b(&c); shadow_flow(&c, 0); g_stale = 0;
+        d3d8_host_2d_get_stats(&b);
+        CHECK(b.idx_changed == a.idx_changed + 1 && b.idx_from_snapshot == a.idx_from_snapshot + 1,
+              "stale index buffer: seen as changed, drawn from the snapshot");
+        /* ...and without one the draw must be refused, not drawn from the stale buffer. */
+        case_b(&c); c.idx_snap_n = 0;
+        d3d8_host_2d_pre(c.serial, c.rt_data, c.rt_format, c.rt_size, 0, 0);
+        d3d8_host_2d_post(&c, NULL);
+        d3d8_host_2d_get_stats(&a);
+        CHECK(a.compared == b.compared, "no index snapshot: the draw is refused, not guessed");
+        d3d8_host_2d_flip();
+    }
+    /* The ring on its own: round trip, and a producer that has come round is caught. */
+    {
+        uint64_t pos, p2; uint16_t *w = d3d8_host_2d_idx_reserve(4, &pos), out[4];
+        w[0] = 9; w[1] = 8; w[2] = 7; w[3] = 6; d3d8_host_2d_idx_publish(pos, 4);
+        CHECK(d3d8_host_2d_idx_copy(pos, 4, out) && out[0] == 9 && out[3] == 6, "index ring: round trip");
+        for (unsigned k = 0; k < 2u * D3D8H2D_IDX_RING / D3D8H2D_IDX_PER_DRAW; ++k) {
+            d3d8_host_2d_idx_reserve(D3D8H2D_IDX_PER_DRAW, &p2); d3d8_host_2d_idx_publish(p2, D3D8H2D_IDX_PER_DRAW);
+        }
+        CHECK(!d3d8_host_2d_idx_copy(pos, 4, out), "index ring CONTROL: overwritten entries are refused");
+    }
     d3d8_host_2d_report("test");
     if (control) {
         char path[640], head[32] = { 0 };

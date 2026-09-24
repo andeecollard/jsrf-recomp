@@ -118,8 +118,57 @@ static int culled(uint32_t cull_face, uint32_t front_cw, const float *a, const f
     return cull_face == 0x408u || (cull_face == 0x404u && front) || (cull_face == 0x405u && !front);
 }
 
+/* ---- the index ring ---- */
+#include <stdatomic.h>
+static uint16_t s_iring[D3D8H2D_IDX_RING];
+static uint64_t s_ireserve;                   /* producer only */
+static _Atomic uint64_t s_ihead;              /* published end */
+uint16_t *d3d8_host_2d_idx_reserve(uint32_t n, uint64_t *pos)
+{
+    uint64_t p = s_ireserve;
+    if (!n || n > D3D8H2D_IDX_PER_DRAW) return NULL;
+    if ((p % D3D8H2D_IDX_RING) + n > D3D8H2D_IDX_RING) p += D3D8H2D_IDX_RING - p % D3D8H2D_IDX_RING;
+    *pos = p; s_ireserve = p + n;
+    return &s_iring[p % D3D8H2D_IDX_RING];
+}
+void d3d8_host_2d_idx_publish(uint64_t pos, uint32_t n)
+{
+    atomic_store_explicit(&s_ihead, pos + n, memory_order_release);
+}
+int d3d8_host_2d_idx_copy(uint64_t pos, uint32_t n, uint16_t *out)
+{
+    uint64_t h = atomic_load_explicit(&s_ihead, memory_order_acquire);
+    if (!n || pos + n > h || h - pos > D3D8H2D_IDX_RING) return 0;
+    memcpy(out, &s_iring[pos % D3D8H2D_IDX_RING], (size_t)n * 2u);
+    /* The producer may have reserved further meanwhile; if it has come round
+     * onto these entries the copy is torn. Its reservation leads its publish,
+     * so check against the reservation as well as the head it has published. */
+    h = atomic_load_explicit(&s_ihead, memory_order_acquire);
+    return h - pos + 2u * D3D8H2D_IDX_PER_DRAW <= D3D8H2D_IDX_RING;
+}
+uint64_t d3d8_host_2d_vertex_hash(const uint8_t *ram, size_t ram_size, const D3D8HostDrawCheck *c,
+                                  uint32_t imin, uint32_t imax)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (unsigned i = 0; i < 16; ++i) {
+        uint32_t stride = c->va_format[i] >> 8;
+        if (!((c->va_on >> i) & 1u) || !stride) continue;
+        uint64_t a = (uint64_t)(c->va_offset[i] & RAM_MASK) + (uint64_t)imin * stride;
+        uint64_t b = (uint64_t)(c->va_offset[i] & RAM_MASK) + (uint64_t)(imax + 1u) * stride;
+        if (b > ram_size || b < a || b - a > (1u << 22)) { h ^= 0xFFu; h *= 0x100000001B3ull; continue; }
+        for (uint64_t k = a; k < b; ++k) { h ^= ram[k]; h *= 0x100000001B3ull; }
+    }
+    return h;
+}
+
 const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
                                int control, D3D8Host2DDraw *d)
+{
+    return d3d8_host_2d_build_ex(c, ram, ram_size, control, NULL, d);
+}
+
+const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
+                                  int control, const uint16_t *given_idx, D3D8Host2DDraw *d)
 {
     D3D8H2DVertex *verts = d->verts;
     memset(d, 0, sizeof *d);
@@ -232,7 +281,8 @@ const char *d3d8_host_2d_build(const D3D8HostDrawCheck *c, const uint8_t *ram, s
         uint32_t n = c->count, ntri = 0, t3[3], cull = st(c, 0x308, 0) ? st(c, 0x39C, 0x405) : 0;
         uint32_t front_cw = st(c, 0x3A0, 0x901) == 0x900u;
         for (uint32_t k = 0; k < n; ++k) {
-            if (c->draw_kind == 2) {
+            if (c->draw_kind == 2 && given_idx) idx[k] = given_idx[k];
+            else if (c->draw_kind == 2) {
                 uint64_t at = (uint64_t)(c->idx_ptr & RAM_MASK) + 2u * k;
                 if (!c->idx_ptr || at + 2u > ram_size) return "index bounds";
                 idx[k] = (uint32_t)ram[at] | (uint32_t)ram[at + 1] << 8;
@@ -370,6 +420,7 @@ typedef struct {
     uint32_t serial, x0, y0, w, h, exec_active, exec_mode;
     uint16_t *pre, *exec, *host;
     float *zexec, *zhost;                    /* depth after the draw, both sides; NULL without the test */
+    uint16_t idx6[6]; float pos3[3][4];      /* for the report: the indices and first vertices drawn */
     D3D8Host2DDraw info;                     /* verts pointer cleared: summary only */
 } Rec;
 #define MAX_RECS 256u
@@ -394,6 +445,8 @@ static unsigned long long s_flips, s_draws, s_pre, s_pre_skipped, s_no_pre, s_no
                           s_vsflag_pass, s_idx_changed, s_sync_calls, s_ctx_b, s_diffuse_default,
                           s_tss_ci_off, s_modes_disagree;
 static unsigned s_max_err[3];
+static unsigned long long s_idx_snap, s_vtx_changed, s_exec_outside;
+static uint16_t s_last_idx[6];
 static unsigned s_printed_mm, s_printed_consts, s_printed_frames, s_printed_z, s_printed_zmm;
 #define NREASON 40
 static struct { const char *why; unsigned long long n; } s_reason[NREASON];
@@ -554,7 +607,34 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     s_snap_valid = 0;
     if (!verts && !(verts = malloc(sizeof *verts * D3D8H2D_MAX_VERTS))) { count_reason("out of memory"); return; }
     d.verts = verts;
-    if ((why = d3d8_host_2d_build(c, s_be.ram, s_be.ram_size, s_control, &d))) { count_reason(why); return; }
+    /* The indices the draw CALL saw (see D3D8HostDrawCheck.idx_snap_*), which
+     * are the ones D3D copied into the ring and the executor drew. */
+    {
+        static uint16_t idx[D3D8H2D_IDX_PER_DRAW];
+        const uint16_t *use = NULL;
+        if (c->draw_kind == 2) {
+            if (c->idx_snap_over) { count_reason("more indices than the snapshot takes"); return; }
+            if (c->count && (c->idx_snap_n != c->count || !d3d8_host_2d_idx_copy(c->idx_snap_pos, c->count, idx))) {
+                count_reason("index snapshot missing or overwritten"); return;
+            }
+            use = idx; ++s_idx_snap;
+            for (uint32_t k = 0; k < c->count; ++k) {            /* and what pIndexData holds now */
+                uint64_t at = (uint64_t)(c->idx_ptr & RAM_MASK) + 2u * k;
+                if (at + 2u > s_be.ram_size || (uint16_t)(s_be.ram[at] | s_be.ram[at + 1] << 8) != idx[k]) { ++s_idx_changed; break; }
+            }
+        }
+        if ((why = d3d8_host_2d_build_ex(c, s_be.ram, s_be.ram_size, s_control, use, &d))) { count_reason(why); return; }
+        /* Vertices: did the bytes the draw reaches change between the call and now? */
+        if (c->vtx_hash_ok) {
+            uint32_t imin = UINT32_MAX, imax = 0;
+            for (uint32_t k = 0; k < c->count; ++k) {
+                uint32_t i = use ? use[k] : c->start + k;
+                if (i < imin) imin = i; if (i > imax) imax = i;
+            }
+            if (c->count && d3d8_host_2d_vertex_hash(s_be.ram, s_be.ram_size, c, imin, imax) != c->vtx_hash) ++s_vtx_changed;
+        }
+        for (unsigned k = 0; k < 6; ++k) s_last_idx[k] = (uint16_t)(k >= c->count ? 0 : use ? use[k] : c->start + k);
+    }
     ++s_built;
     /* The texture shader stage modes the host implies (PROJECT2D per sampled
      * stage) against the executor's 0x1E70. */
@@ -562,13 +642,6 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
         uint32_t want = 0;
         for (unsigned u = 0; u < 4; ++u) if (d.tmask & (1u << u)) want |= 1u << (5u * u);
         if (want != (e.regs[0x1E70u / 4u] & 0xFFFFFu)) ++s_modes_disagree;
-    }
-    /* Did the index data move between the draw and now? (G41 carries the first 16 as D3D was handed them.) */
-    if (c->draw_kind == 2 && c->idx_ptr) {
-        for (uint32_t k = 0; k < c->nidx && k < D3D8_HOST_IDX_N; ++k) {
-            uint64_t at = (uint64_t)(c->idx_ptr & RAM_MASK) + 2u * k;
-            if (at + 2u <= s_be.ram_size && (uint16_t)(s_be.ram[at] | s_be.ram[at + 1] << 8) != c->idx[k]) { ++s_idx_changed; break; }
-        }
     }
     if (d.bb_x1 < d.bb_x0 || d.bb_y1 < d.bb_y0 || d.rt_addr != s_snap_addr || d.rt_pitch != s_snap_pitch) {
         if (d.rt_addr != s_snap_addr || d.rt_pitch != s_snap_pitch) count_reason("target moved between the tokens");
@@ -610,6 +683,28 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     if (s_nrec >= MAX_RECS) { ++s_rec_dropped; return; }
     ++s_sync_calls;
     s_be.sync_range(s_be.ram + d.rt_addr, (size_t)d.rt_pitch * d.rt_h);
+    /* The compared box is the host's box UNION every pixel the executor
+     * changed. A box from the host's geometry alone cannot see the host
+     * drawing in the wrong place: the executor's pixels outside it would
+     * simply never be looked at. */
+    {
+        int32_t ex0 = INT32_MAX, ey0 = INT32_MAX, ex1 = -1, ey1 = -1;
+        for (uint32_t y = 0; y < d.rt_h; ++y) {
+            const uint16_t *a = (const uint16_t *)((const uint8_t *)s_snap + (size_t)y * s_snap_pitch);
+            const uint16_t *b = (const uint16_t *)(s_be.ram + d.rt_addr + (size_t)y * d.rt_pitch);
+            if (!memcmp(a, b, (size_t)d.rt_w * 2u)) continue;
+            for (uint32_t x = 0; x < d.rt_w; ++x)
+                if (a[x] != b[x]) {
+                    if ((int32_t)x < ex0) ex0 = (int32_t)x; if ((int32_t)x > ex1) ex1 = (int32_t)x;
+                    if ((int32_t)y < ey0) ey0 = (int32_t)y; ey1 = (int32_t)y;
+                }
+        }
+        if (ex1 >= 0) {
+            if (ex0 < d.bb_x0 || ey0 < d.bb_y0 || ex1 > d.bb_x1 || ey1 > d.bb_y1) ++s_exec_outside;
+            if (ex0 < d.bb_x0) d.bb_x0 = ex0; if (ey0 < d.bb_y0) d.bb_y0 = ey0;
+            if (ex1 > d.bb_x1) d.bb_x1 = ex1; if (ey1 > d.bb_y1) d.bb_y1 = ey1;
+        }
+    }
     {
         Rec *r = &s_rec[s_nrec];
         uint32_t x0 = (uint32_t)d.bb_x0, y0 = (uint32_t)d.bb_y0, w = (uint32_t)(d.bb_x1 - d.bb_x0 + 1), h = (uint32_t)(d.bb_y1 - d.bb_y0 + 1);
@@ -643,6 +738,8 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
         }
         ++s_rendered;
         r->info = d; r->info.verts = NULL;
+        memcpy(r->idx6, s_last_idx, sizeof r->idx6);
+        for (unsigned k = 0; k < 3 && k < d.nverts; ++k) memcpy(r->pos3[k], d.verts[k].p, sizeof r->pos3[k]);
         ++s_nrec;
     }
 }
@@ -728,6 +825,12 @@ void d3d8_host_2d_flip(void)
                         r->exec_active ? "" : " (EXECUTOR DID NOT DRAW IT)", i->fvf, i->prim, i->count, i->tmask,
                         i->tex[0].fmt, i->tex[0].width, i->tex[0].height, i->cc, i->pixel_shader ? " ps" : "",
                         i->blend, i->blend_src, i->blend_dst, i->alpha_test, i->alpha_ref, i->dither);
+                fprintf(stderr, "[D3D8-HOST-2D]   draw %u %s: indices %u %u %u %u %u %u; host vertices (%g,%g,%g,%g)"
+                                " (%g,%g,%g,%g) (%g,%g,%g,%g)\n", r->serial,
+                        i->draw_kind == 2 ? "DrawIndexedVertices" : "DrawVertices",
+                        r->idx6[0], r->idx6[1], r->idx6[2], r->idx6[3], r->idx6[4], r->idx6[5],
+                        r->pos3[0][0], r->pos3[0][1], r->pos3[0][2], r->pos3[0][3], r->pos3[1][0], r->pos3[1][1],
+                        r->pos3[1][2], r->pos3[1][3], r->pos3[2][0], r->pos3[2][1], r->pos3[2][2], r->pos3[2][3]);
             }
             if (s_dump_dir[0] && s_dumped < s_dump_max) { ++s_dumped; dump(r, &df); }
         } else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_within;
@@ -768,6 +871,8 @@ void d3d8_host_2d_get_stats(D3D8H2DStats *o)
     o->depth_draws = s_z_draws; o->depth_px = s_z_px; o->depth_px_mismatch = s_z_px_mm;
     o->depth_draws_mismatching = s_z_draws_mm; o->z_from_texture = s_z_from_tex; o->z_from_ram = s_z_from_ram;
     o->proof_pass = s_z_proof_pass; o->proof_reject = s_z_proof_reject; o->proof_depends = s_z_proof_depends;
+    o->idx_from_snapshot = s_idx_snap; o->idx_changed = s_idx_changed; o->vtx_changed = s_vtx_changed;
+    o->exec_outside_host_box = s_exec_outside;
 }
 
 void d3d8_host_2d_report(const char *why)
@@ -785,9 +890,12 @@ void d3d8_host_2d_report(const char *why)
             why, s_compared, s_exact, s_within, s_mismatching, s_px, s_px_exec, s_px_host, s_px_mm,
             s_max_err[0], s_max_err[1], s_max_err[2], s_tol);
     fprintf(stderr, "[D3D8-HOST-2D] %s inputs: textures in DMA context B %llu, TEXCOORDINDEX != stage %llu,"
-                    " diffuse defaulted to white %llu, index data changed before the token %llu,"
-                    " texture stage modes differ from the executor's 0x1E70 %llu\n",
-            why, s_ctx_b, s_tss_ci_off, s_diffuse_default, s_idx_changed, s_modes_disagree);
+                    " diffuse defaulted to white %llu, texture stage modes differ from the executor's 0x1E70 %llu |"
+                    " indices from the draw-time snapshot %llu, of which pIndexData held different ones at the token"
+                    " %llu | vertex bytes changed between the draw call and the token %llu | executor changed pixels"
+                    " outside the host's box %llu\n",
+            why, s_ctx_b, s_tss_ci_off, s_diffuse_default, s_modes_disagree, s_idx_snap, s_idx_changed,
+            s_vtx_changed, s_exec_outside);
     fprintf(stderr, "[D3D8-HOST-2D] %s depth: test off %llu | on: func NEVER %llu LESS %llu EQUAL %llu LEQUAL %llu"
                     " GREATER %llu NOTEQUAL %llu GEQUAL %llu ALWAYS %llu; write on %llu; vertex z all 0 %llu, inside"
                     " (0,1) %llu, all 1 %llu, mixed %llu, outside [0,1] %llu | seeded from executor texture %llu,"
