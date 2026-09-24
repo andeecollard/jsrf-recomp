@@ -321,3 +321,10 @@ merging or carrying flags at split entries.
   - Regeneration on 24 Sep (backup `gen-2026-09-24-PRE-G56-KEEP`) applies it:
     285 lines change.
 - **CRI idle spinner lifted** (`9f18d66`): process CPU 312% -> 221%.
+- **Regenerated, 24 Sep 01:18** (git_head 9066487; backup
+  `gen-2026-09-24-PRE-G56-KEEP`).
+  - 285 lines changed, as predicted.
+  - Tutorial with the player's switches: 0 faults, scene 61, 56.3 fps.
+  - JSRF.app rebuilt from it.
+  - `jsrf_apu_list_cycle_off` failed once under `ctest -j8` and passed 4 of 4
+    alone: a parallel-run flake, not a regression.
