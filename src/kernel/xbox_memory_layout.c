@@ -3540,8 +3540,19 @@ static uint32_t s_fb_va, s_fb_pitch, s_fb_height = 480;
 
 /* G56: who says the GPU is ahead of these bytes (nv2a_metal_range_owed). */
 static int (*s_fb_owed)(const uint8_t *, size_t);
+static int (*s_fb_guard)(const uint8_t *, size_t, void (*)(const uint8_t *, size_t, void *), void *);
 static unsigned long s_fb_owed_skips;
 void xbox_SetFramebufferOwedQuery(int (*q)(const uint8_t *, size_t)) { s_fb_owed = q; }
+/* The debt watch's guarded read: the owed test and the read under one lock. */
+void xbox_SetFramebufferGuardedRead(int (*g)(const uint8_t *, size_t, void (*)(const uint8_t *, size_t, void *), void *))
+{ s_fb_guard = g; }
+typedef struct { uint32_t sum, nonzero; } FbProbeSum;
+static void fb_probe_sum(const uint8_t *bytes, size_t n, void *ctx)
+{
+    const uint32_t *p = (const uint32_t *)bytes;
+    FbProbeSum *s = ctx;
+    for (size_t i = 0; i < n / 4u; i++) { s->sum = s->sum * 33u + p[i]; if (p[i]) s->nonzero++; }
+}
 
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
 {
@@ -3588,15 +3599,22 @@ static void framebuffer_probe_tick(void)
      * "guest reads" in the tutorial were this line). Say so and skip. The
      * query is racy -- it reads the executor's slot table from this thread --
      * which a once-a-second diagnostic can afford. */
-    if (s_fb_owed && s_fb_owed((const uint8_t *)p, (size_t)n * 4u)) {
-        if (s_fb_owed_skips++ < 4)
-            fprintf(stderr, "  [FB] 0x%08X: the GPU is ahead of guest RAM here; not sampled (skip %lu)\n",
-                    s_fb_va, s_fb_owed_skips);
-        return;
-    }
-    for (i = 0; i < n; i++) {
-        sum = sum * 33u + p[i];
-        if (p[i]) nonzero++;
+    {   FbProbeSum ps = { 0, 0 };
+        int skipped = s_fb_owed && s_fb_owed((const uint8_t *)p, (size_t)n * 4u);
+        /* The racy owed test first; then, when the debt watch is armed, the
+         * read itself under the watch's lock, which no new debt can cross --
+         * the check and the read were racing (6 low-view reads of 2c267d7). */
+        if (!skipped) {
+            if (s_fb_guard) skipped = !s_fb_guard((const uint8_t *)p, (size_t)n * 4u, fb_probe_sum, &ps);
+            else fb_probe_sum((const uint8_t *)p, (size_t)n * 4u, &ps);
+        }
+        if (skipped) {
+            if (s_fb_owed_skips++ < 4)
+                fprintf(stderr, "  [FB] 0x%08X: the GPU is ahead of guest RAM here; not sampled (skip %lu)\n",
+                        s_fb_va, s_fb_owed_skips);
+            return;
+        }
+        sum = ps.sum; nonzero = ps.nonzero; (void)i;
     }
     /* Two numbers, because they answer different questions. The first is the
      * surface being composed right now, which is legitimately mid-clear as

@@ -20,6 +20,11 @@ void nv2a_debt_watch_arm(const uint8_t *p, size_t bytes, int kind);
 /* It is about to be made current (written back): stop watching it. */
 void nv2a_debt_watch_paid(const uint8_t *p, size_t bytes);
 void nv2a_debt_watch_report(void);
+/* For a runtime reader on another thread (the framebuffer probe): run fn over
+ * [p, p+bytes) only if no armed debt overlaps it, holding the watch's lock for
+ * the duration, so no debt can be armed under the read. Returns 1 if fn ran, 0
+ * if skipped. With the watch off it just runs fn. */
+int nv2a_debt_watch_guarded_read(const uint8_t *p, size_t bytes, void (*fn)(const uint8_t *, size_t, void *), void *ctx);
 /* Per kind (colour, then depth): armed, paid clean, guest reads, guest writes,
  * runtime reads, runtime writes. For the unit test. */
 #define NV2A_DEBT_WATCH_COUNTS 12
