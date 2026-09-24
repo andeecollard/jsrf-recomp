@@ -579,3 +579,28 @@ merging or carrying flags at split entries.
   One arming table now serves every RECOMP_D3D8_HOST_* class; the first VS run
   had counted 0 because the mirror kept its own list. The probe race is
   fixed: DEFER+WATCH now reads 0 early accesses.
+
+## Rokkaku-dai Heights: the missing city is fog (24 Sep, morning)
+
+Player sessions at 08:35 and 08:48 (logs preserved in
+jsrf-build/jsrf-first-fault/measure/rokkaku-0835 and rokkaku-0848). The scene
+shows only sky, ground colour, the HUD and text.
+
+With FF and VS shadow at stride 600:
+- 1,089 of 1,321 fixed-function draws on the sampled flips were **never
+  drawn by the executor**, and all 1,089 have fog enabled. The tutorial's
+  count was 0.
+- `[COMBINER] refusals: final-cw=926,734`.
+
+`nv2a_texture_copy_prepare` refuses any final combiner other than the
+fog-less default (0x288 ∈ {0xC, 0xE}, 0x28C = 0x1C80). A refused batch
+skips the Metal path and goes to the flat CPU rasteriser, whose output the GPU
+surface covers. So every fogged draw is dropped, and the city is drawn with
+distance fog. The same class may explain other "missing elements" reports
+(the Poison Jam cutscene). Fix under way: fog in the executor (vertex fog
+coordinate, fog modes, the final combiner's general form), with a
+fog-ignored positive control first.
+
+Lesson: "final-cw=301,981" was in the log from the first session and was set
+aside as probably inert, because metal hw refusals read 0. It was the defect.
+The host comparison named it in one player session, by class.
