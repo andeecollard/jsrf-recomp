@@ -5918,11 +5918,65 @@ void nv2a_metal_bind_counters(unsigned long long *uploads, unsigned long long *h
   if(evictions)*evictions=surface_evictions;
 }
 
+/* G54: POINTS AND LINES, as screen-space quads drawn by the triangle path.
+ *
+ * NV2A draws POINTS (1), LINES (2), LINE_LOOP (3) and LINE_STRIP (4); this
+ * backend rejected them ("primitive") and the CPU fallback draws none, so a
+ * single line or point -- a batch of 1 or 2 indices, 3-10% of the police
+ * scenes' draws -- was lost. Each point becomes a size x size quad (size from
+ * SET_POINT_SIZE, 1/8 pixel, at least one pixel; a point sprite's texture
+ * coordinates run 0..1 over it), each line a one-pixel-wide quad along the
+ * segment (xemu draws GL lines at the default width), every corner carrying
+ * its endpoint's sixteen attributes. They go through the triangle path
+ * unchanged, never culled -- the NV2A does not cull points or lines -- so no
+ * new pipeline or shader exists for them. The vertices must be SCREEN-SPACE:
+ * the executor keeps point and line batches off the GPU vertex paths.
+ * Attenuated point size (SET_POINT_PARAMS_ENABLE) is not modelled; the
+ * constant size is used and the draw counted as SIMPLIFIED. */
+int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
+ uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
+ const float(*vertices)[16][4],unsigned count,unsigned primitive);
+static int draw_points_lines(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
+ uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
+ const float(*v)[16][4],unsigned count,unsigned primitive)
+{
+ static float ex[NV2A_METAL_MAX_VERTICES][16][4];
+ NV2ATextureCopy q=*s; unsigned m=0,prims=0,segs,i;int drawn=0,r;
+ if(vsh_active)return reject("points/lines: vertices are program inputs, not screen positions");
+ q.cull_face=0;
+ if(primitive==1&&s->point_params)nv2a_drop(NV2A_DROP_SIMPLIFIED,"raster","attenuated point size drawn at the constant size",count);
+ if(primitive==1)segs=count;else if(primitive==2)segs=count/2;else if(primitive==4)segs=count>=2?count-1:0;else segs=count>=2?count:0;
+ if(primitive==3&&count==2)segs=1;                   /* a two-vertex loop is one segment */
+ for(i=0;i<segs;++i){
+  const float*A,*B;float c[4][2];unsigned src[4],k;
+  if(primitive==1){float h=(s->point_size>1.0f?s->point_size:1.0f)*0.5f;const float*p=v[i][0];
+   A=B=p;src[0]=src[1]=src[2]=src[3]=i;
+   c[0][0]=p[0]-h;c[0][1]=p[1]-h;c[1][0]=p[0]+h;c[1][1]=p[1]-h;c[2][0]=p[0]+h;c[2][1]=p[1]+h;c[3][0]=p[0]-h;c[3][1]=p[1]+h;}
+  else{unsigned a=primitive==2?2*i:i,b=primitive==2?2*i+1:(i+1<count?i+1:0);float dx,dy,len,nx,ny;
+   A=v[a][0];B=v[b][0];dx=B[0]-A[0];dy=B[1]-A[1];len=sqrtf(dx*dx+dy*dy);
+   if(!(len>0.0f)||!isfinite(len))continue;
+   nx=-dy/len*0.5f;ny=dx/len*0.5f;src[0]=src[1]=a;src[2]=src[3]=b;
+   c[0][0]=A[0]+nx;c[0][1]=A[1]+ny;c[1][0]=A[0]-nx;c[1][1]=A[1]-ny;c[2][0]=B[0]-nx;c[2][1]=B[1]-ny;c[3][0]=B[0]+nx;c[3][1]=B[1]+ny;}
+  (void)A;(void)B;
+  if(m+6>NV2A_METAL_MAX_VERTICES){r=nv2a_metal_draw(&q,texture,texture_size,target,target_size,depth,depth_size,(const float(*)[16][4])ex,m,5);
+   if(r<0)return r;drawn+=r;m=0;}
+  {static const unsigned tri[6]={0,1,2,0,2,3};
+   for(k=0;k<6;++k){unsigned cn=tri[k];memcpy(ex[m],v[src[cn]],sizeof ex[m]);ex[m][0][0]=c[cn][0];ex[m][0][1]=c[cn][1];
+    if(primitive==1&&s->point_sprite)for(unsigned u=0;u<4;++u){ex[m][9+u][0]=(cn==1||cn==2)?1.0f:0.0f;ex[m][9+u][1]=(cn>=2)?1.0f:0.0f;
+     ex[m][9+u][2]=0.0f;ex[m][9+u][3]=1.0f;}
+    ++m;}}
+  ++prims;}
+ if(m){r=nv2a_metal_draw(&q,texture,texture_size,target,target_size,depth,depth_size,(const float(*)[16][4])ex,m,5);if(r<0)return r;drawn+=r;}
+ (void)drawn;
+ return (int)prims;
+}
 int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture_size,
  uint8_t*target,size_t target_size,uint8_t*depth,size_t depth_size,
  const float(*vertices)[16][4],unsigned count,unsigned primitive)
 {
  draw_thread_check();
+ if(primitive>=1&&primitive<=4&&s&&vertices&&count>=(primitive==1?1u:2u)&&count<=NV2A_METAL_MAX_VERTICES)
+  return draw_points_lines(s,texture,texture_size,target,target_size,depth,depth_size,vertices,count,primitive);
  unsigned long long _tf=mtl_cb_stats()?mtl_now_ns():0;
  if(!s)return reject("null-state");
  if((s->texture_mask&1)&&!texture)return reject("missing-texture");

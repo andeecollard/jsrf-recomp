@@ -4540,11 +4540,14 @@ static int prepare_vertices(void)
     NV2AFFKey ff_key;
     memset(&ff_key, 0, sizeof ff_key);
 #if defined(__APPLE__) && NV2A_GPU_PATH
-    if (s_vsh_force_cpu) {
+    if (s_vsh_force_cpu || (s_gpu.prim >= 1 && s_gpu.prim <= 4)) {
         /* The Metal draw rejected this batch and it is about to be handed to
          * the CPU rasteriser, which reads s_outputs as SCREEN positions. This
-         * pass re-runs the interpreter so that is what it finds. */
+         * pass re-runs the interpreter so that is what it finds. G54: points
+         * and lines too -- the Metal path expands them into screen-space
+         * quads, so their vertices are transformed here, on the CPU. */
         nv2a_metal_vsh_clear();
+        s_vsh_gpu_batch = 0;
     } else
     if (programmable && s_vsh.decoded.valid && s_vsh.decoded.length > 0) {
         gpu_vsh = nv2a_metal_vsh_ready(
@@ -5230,10 +5233,15 @@ static void raster_batch(void)
     const int fade_batch = blend_is_multiply();
     if (fade_batch) ++s_blend_fade_fate.batches;
 
-    if (s_gpu.idx_count < 3) {
-        if (fade_batch) ++s_blend_fade_fate.short_idx;
-        if (s_gpu.idx_count) nv2a_drop(NV2A_DROP_DROPPED, "raster", "fewer than three indices (a point or line batch)", s_gpu.idx_count);
-        return;
+    /* G54: a point needs one index and a line two; only the triangle-type
+     * primitives need three, and a triangle batch with fewer draws nothing on
+     * the NV2A either, so that is not a drop. Points and lines are drawn by the
+     * Metal path (nv2a_metal.m, draw_points_lines). */
+    {   uint32_t need = s_gpu.prim == 1 ? 1u : (s_gpu.prim >= 2 && s_gpu.prim <= 4) ? 2u : 3u;
+        if (s_gpu.idx_count < need) {
+            if (fade_batch) ++s_blend_fade_fate.short_idx;
+            return;
+        }
     }
     if (s_host_skip && !s_host_skip_late) { s_copy.active = 0; ++s_host_skipped; return; }
     unsigned long long _t_vsh = pb_now_us();

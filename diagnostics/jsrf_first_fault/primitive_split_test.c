@@ -78,12 +78,19 @@ int main(void)
     CHECK(n == 6 && prim == 5, "two DRAW_ARRAYS runs are ONE batch of 6 (%u)", n);
     CHECK(nv2a_drop_count(SHORT) == 0, "no short remnant from a split DRAW_ARRAYS either");
 
-    /* CONTROL: a real two-index line batch. */
+    /* A real two-index line batch reaches the rasteriser (points and lines
+     * are drawn since G54), and a two-index TRIANGLES batch -- which the
+     * NV2A draws nothing for either -- is not counted as a drop. */
     short0 = nv2a_drop_count(SHORT);
     put(0x17FC, 2);                                          /* BEGIN LINES */
     put(0x1800, 0x00010000u);
     put(0x17FC, 0);
-    CHECK(nv2a_drop_count(SHORT) == short0 + 1, "CONTROL: a genuine 2-index line batch IS counted as a short drop");
+    n = nv2a_pb_exec_last_batch(&prim);
+    CHECK(n == 2 && prim == 2, "a 2-index line batch is a batch of 2, LINES (%u, prim %u)", n, prim);
+    put(0x17FC, 5);
+    put(0x1800, 0x00010000u);
+    put(0x17FC, 0);
+    CHECK(nv2a_drop_count(SHORT) == short0, "no short-batch drop for either (%llu)", nv2a_drop_count(SHORT) - short0);
 
     /* IMMEDIATE MODE: D3D's Begin / SetVertexData / End, as xemu draws it.
      * Per vertex: a diffuse (DATA4UB slot 3), a texcoord (DATA2F_M slot 9),
