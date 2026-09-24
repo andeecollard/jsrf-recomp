@@ -4,6 +4,8 @@
 #include "d3d8_host_2d.h"
 #include "d3d8_ff_combiner.h"
 #include "nv2a_vsh.h"
+#include "nv2a_texture_copy.h"
+#include "d3d8_ff_vertex_state.h"
 #include "../recomp_switch.h"
 #include <math.h>
 #include <stdatomic.h>
@@ -282,7 +284,24 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         if (d->zs_pitch < d->rt_w * 4u || (uint64_t)d->zs_addr + (uint64_t)d->zs_pitch * d->rt_h > ram_size)
             return "depth surface bounds";
     }
-    if (c->ffv_valid && c->fg_cur.enable) return "fog";                 /* the executor refuses fog too */
+    /* G53: FOG, as the executor now draws it. D3D's fog updater's registers
+     * from its inputs (d3d8_ff_fog): FOG_MODE and FOG_PARAMS here, the gen
+     * mode in the vertex unit's registers for the fixed-function class; the
+     * colour as SetRenderState_FogColor writes it. The factor is formed per
+     * pixel from the vertex's fog coordinate, the executor's formula. */
+    d->fog_enable = 0;
+    if (c->ffv_valid && c->fg_cur.enable) {
+        D3D8FFFog fo;
+        d3d8_ff_fog(&c->fg_cur, &fo);
+        d->fog_enable = 1; d->fog_mode = fo.mode;
+        memcpy(&d->fog_p0, &fo.params[0], 4); memcpy(&d->fog_p1, &fo.params[1], 4);
+        d->fog_color = d3d8_ff_fog_color(c->ffv_fog_color);
+        /* The 2D class runs D3D's pass-through program, which D3D picks by
+         * FOGTABLEMODE (0x1903A0): only the vertex-fog one (NONE: the
+         * coordinate is the specular alpha) is modelled here. */
+        if (cls == 1 && fo.gen_mode != 0) return "2D fog from a fog table";
+        if (cls == 1 && !((c->va_on >> 4) & 1u)) return "2D fog without a specular array";
+    }
     d->alpha_test = st(c, 0x300, 0); d->alpha_func = st(c, 0x33C, 0x207); d->alpha_ref = st(c, 0x340, 0);
     if (d->alpha_test && (d->alpha_func < 0x200u || d->alpha_func > 0x207u)) return "alpha func";
     d->blend = st(c, 0x304, 0);
@@ -303,7 +322,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             d->ai[i] = w[i]; d->k0[i] = w[10 + i]; d->k1[i] = w[18 + i]; d->ao[i] = w[26 + i];
             d->ci[i] = w[34 + i]; d->co[i] = w[45 + i];
         }
-        d->final_cw0 = w[8]; d->final_cw1 = w[9];
+        d->final_cw0 = w[8]; d->final_cw1 = w[9]; d->sf0 = w[43]; d->sf1 = w[44];
         for (unsigned u = 0; u < 4; ++u) {
             uint32_t mode = (w[54] >> (5u * u)) & 31u;
             if (mode > 1u) return "texture shader mode";
@@ -323,9 +342,14 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         for (unsigned u = 0; u < 4; ++u) if (c->tex[u]) d->tmask |= 1u << u;
     }
     if (!d->cc || d->cc > 8u) return "combiner count";
-    /* The final combiner as the executor models it: R0 (+ specular). */
-    if ((d->final_cw0 != 0xCu && d->final_cw0 != 0xEu) || d->final_cw1 != 0x1C80u) return "final combiner";
-    d->add_specular = d->final_cw0 == 0xEu;
+    /* The final combiner as the executor models it (G53): the two fog-off
+     * programs as R0 (+ specular), anything else nv2a_final_combine accepts
+     * in full. */
+    if ((d->final_cw0 != 0xCu && d->final_cw0 != 0xEu) || d->final_cw1 != 0x1C80u) {
+        if (nv2a_final_combiner_supported(d->final_cw0, d->final_cw1)) return "final combiner";
+        d->final_general = 1;
+    }
+    d->add_specular = !d->final_general && d->final_cw0 == 0xEu;
 
     for (unsigned u = 0; u < 4; ++u) {
         const char *why;
@@ -498,6 +522,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                             o->p[0] = out[0][0]; o->p[1] = out[0][1]; o->p[2] = out[0][2] / 16777215.0f; o->p[3] = out[0][3];
                             memcpy(o->d0, out[3], 16); memcpy(o->d1, out[4], 16);
                             for (unsigned u = 0; u < 4; ++u) memcpy(o->t[u], out[9 + u], 16);
+                            memcpy(o->f, out[5], 16);             /* G53: the fog coordinate */
                             for (unsigned q = 0; q < 4; ++q) if (!isfinite(o->p[q]) || !isfinite(o->d0[q]) || !isfinite(o->d1[q])) stt = 1;
                             for (unsigned u = 0; u < 4 && !stt; ++u)   /* nv2a_metal.m vertex_valid(): q > 0 per textured unit */
                                 if ((d->tmask >> u) & 1u) {
@@ -523,6 +548,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 if ((c->va_on >> 3) & 1u) { if (!fetch(ram, ram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
                 else { v[j].d0[0] = v[j].d0[1] = v[j].d0[2] = v[j].d0[3] = 1.0f; }
                 if ((c->va_on >> 4) & 1u) { if (!fetch(ram, ram_size, c->va_offset[4], c->va_format[4], i, v[j].d1)) return "specular format"; }
+                /* G53: D3D's vertex-fog pass-through: the coordinate is the specular alpha. */
+                if (d->fog_enable) v[j].f[0] = v[j].d1[3] < 0.0f ? 0.0f : v[j].d1[3] > 1.0f ? 1.0f : v[j].d1[3];
                 for (unsigned u = 0; u < 4; ++u) {
                     v[j].t[u][3] = 1.0f;
                     if ((c->va_on >> (9u + u)) & 1u &&

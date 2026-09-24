@@ -1365,14 +1365,14 @@ add_test(NAME jsrf_pusher_token COMMAND jsrf_pusher_token_test)
 # D3D entry point replay where the token sits, once, through ring dispatch.
 add_executable(jsrf_d3d8_host_test d3d8_host_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_host_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_host COMMAND jsrf_d3d8_host_test)
 # G41: the mirror's vertex-stream and index comparison, driven directly.
 add_executable(jsrf_d3d8_streams_test d3d8_streams_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_streams_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
@@ -1381,7 +1381,7 @@ add_test(NAME jsrf_d3d8_streams COMMAND jsrf_d3d8_streams_test)
 # laziness counters, the positive control and the discovery tally.
 add_executable(jsrf_d3d8_combiner_check_test d3d8_combiner_check_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_combiner_check_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_combiner_check COMMAND jsrf_d3d8_combiner_check_test)
@@ -1390,7 +1390,7 @@ add_test(NAME jsrf_d3d8_combiner_check COMMAND jsrf_d3d8_combiner_check_test)
 # laziness counters, the SPECULAR_ENABLE writer order and the positive control.
 add_executable(jsrf_d3d8_ffv_check_test d3d8_ffv_check_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_pusher.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host.c"
-    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c"
+    "${XBOXRECOMP_DIR}/src/nv2a/d3d8_host_2d.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_vsh.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c"
     "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_combiner.c" "${XBOXRECOMP_DIR}/src/nv2a/d3d8_ff_vertex_state.c")
 target_include_directories(jsrf_d3d8_ffv_check_test PRIVATE "${XBOXRECOMP_DIR}/src/nv2a")
 add_test(NAME jsrf_d3d8_ffv_check COMMAND jsrf_d3d8_ffv_check_test)

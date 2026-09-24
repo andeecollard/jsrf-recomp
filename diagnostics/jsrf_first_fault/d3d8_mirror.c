@@ -452,6 +452,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     c->tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);
     d3d8m_fog_read(c->fog_cur);
     c->ffv_valid = 1; c->ffv_vs_flags = d3d8m_vs_flags(d); d3d8m_fg_read(&c->fg_cur);
+    c->ffv_fog_color = RS(D3D8FF_RS_FOGCOLOR);          /* G53: every class may fog */
     for (unsigned u = 0; u < 4; ++u) {
         uint32_t t = MEM32(d + 0xA78u + 4u * u);
         c->tex[u] = t;

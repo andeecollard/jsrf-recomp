@@ -562,8 +562,15 @@ const char *d3d8_host_ff_registers(const D3D8HostDrawCheck *c, uint32_t m[2048])
     if (c->ffv_vs_flags & 0x12u) return "not fixed-function (object flags 0x12)";
     if (c->imv_cur.vertex_blend) return "vertex blending (skinning)";
     if ((c->xf_seen & 7u) != 7u) return "world/view/projection not all seen";
+    /* G53: fog, as the updater writes it -- FOG_ENABLE, and with it
+     * FOG_GEN_MODE, FOG_MODE and FOG_PARAMS -- plus the two registers the
+     * vertex unit's fog coordinate reads for the radial and planar gen modes:
+     * the model-view (0x0480, transpose(WORLD*VIEW), written below from the
+     * same product the composite uses) and FOG_PLANE, which D3D writes only
+     * in SetShaderConstantMode (0x190240), as (0, 0, 1, 0). */
     ffv_fog_list(&c->fg_cur, &l);
-    if (l.n && l.r[0].value) return "fog";                           /* the executor refuses fog too */
+    for (unsigned k = 0; k < l.n; ++k) m[l.r[k].method / 4u] = l.r[k].value;
+    { float one = 1.0f; memcpy(&m[0x09D8u / 4u], &one, 4); }
     ffv_texgen_list(c, &l);
     for (unsigned k = 0; k < l.n; ++k) m[l.r[k].method / 4u] = l.r[k].value;
     ffv_tx_list(&c->tx_cur, &l, &to);
@@ -592,6 +599,9 @@ const char *d3d8_host_ff_registers(const D3D8HostDrawCheck *c, uint32_t m[2048])
         for (int r = 0; r < 4; ++r) for (int q = 0; q < 4; ++q) {
             float f = (float)mm[q][r]; memcpy(&m[(0x0680u + 4u * (4u * (unsigned)r + (unsigned)q)) / 4u], &f, 4);
         }
+        if (!io.emitted)                    /* G53: the model-view, for the fog coordinate */
+            for (int r = 0; r < 4; ++r) for (int q = 0; q < 4; ++q) {
+                float f = (float)wv[q][r]; memcpy(&m[(0x0480u + 4u * (4u * (unsigned)r + (unsigned)q)) / 4u], &f, 4); }
     }
     {   float b = 0.53125f; memcpy(&m[0x0A20u / 4u], &b, 4); memcpy(&m[0x0A24u / 4u], &b, 4); }
     return NULL;

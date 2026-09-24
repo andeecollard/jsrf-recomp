@@ -64,6 +64,7 @@ typedef struct {
     float p[4];        /* screen x, y (pixels, target space), z (0..1), clip w */
     float d0[4], d1[4];
     float t[4][4];
+    float f[4];        /* G53: the fog coordinate in .x (the executor's oFog / output slot 5) */
 } D3D8H2DVertex;
 
 typedef struct {
@@ -121,6 +122,13 @@ typedef struct {
     uint32_t cc, control;
     uint32_t ci[8], ai[8], co[8], ao[8], k0[8], k1[8];
     uint32_t final_cw0, final_cw1, add_specular;
+    /* G53: the final combiner in full (final_general) and fog, as the
+     * executor now draws them: D3D's fog state through d3d8_ff_fog (mode and
+     * params), FOGCOLOR through d3d8_ff_fog_color, the final-combiner
+     * constants from the pixel shader definition (words 43/44) or zero. The
+     * fog coordinate rides in each vertex's f.x. */
+    uint32_t final_general, fog_enable, fog_mode, fog_color, sf0, sf1;
+    float    fog_p0, fog_p1;
     /* Fragment state, NV2A method values as D3D pushed them. */
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t blend, blend_src, blend_dst, blend_eq, blend_color;

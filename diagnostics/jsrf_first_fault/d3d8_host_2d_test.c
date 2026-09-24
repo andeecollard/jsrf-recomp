@@ -42,6 +42,8 @@
 #include "nv2a_host_read.h"
 #include "nv2a_vsh.h"
 #include "vsh_capture.h"
+#include "vsh_encode.h"
+#include "d3d8_ff_vertex_state.h"
 #include <pthread.h>
 #include "nv2a_texture_copy.h"
 #include "nv2a_ff.h"
@@ -172,6 +174,9 @@ static void case_b(D3D8HostDrawCheck *c)
  * the logo case's control sets it to 0 to reproduce tutorial run 3. */
 static float g_exec_offset = 0.53125f;
 static int g_exec_keep_surfaces;     /* 1: do not invalidate first, so binding state carries across draws */
+/* G53: exec_draw_ff draws with fog -- D3D's fog final combiner, and the fog
+ * mode, params and enable from the register file it is handed -- when set. */
+static int g_exec_fog; static uint32_t g_exec_fog_color;
 static int g_exec_no_sync;
 static size_t g_exec_size_extra;     /* the executor's target size beyond D3D's: pitch * (clip_y + clip_h) vs pitch * height */           /* 1: exec_draw / exec_draw_ff leave the batch open, as the executor's own next draw finds it */
 static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
@@ -620,6 +625,14 @@ static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, con
         s.stencil_test = 1; s.stencil_write = d->stencil_write; s.stencil_mask = d->stencil_mask; s.stencil_func = d->stencil_func;
         s.stencil_ref = d->stencil_ref; s.stencil_func_mask = d->stencil_func_mask;
         s.stencil_fail = d->stencil_fail; s.stencil_zfail = d->stencil_zfail; s.stencil_zpass = d->stencil_zpass;
+    }
+    if (g_exec_fog) {
+        uint32_t w0, w1;
+        d3d8_ff_final_combiner(1, 0, 0, 0, &w0, &w1);
+        s.final_general = 1; s.final_cw0 = w0; s.final_cw1 = w1;
+        s.fog_enable = ffm[0x2A4u / 4u]; s.fog_mode = ffm[0x29Cu / 4u];
+        memcpy(&s.fog_p0, &ffm[0x9C0u / 4u], 4); memcpy(&s.fog_p1, &ffm[0x9C4u / 4u], 4);
+        s.fog_color = d3d8_ff_fog_color(g_exec_fog_color);
     }
     for (unsigned k = 0; k < c->count; ++k) {
         float in[16][4];
@@ -1598,6 +1611,112 @@ static int ff_arm(int control)
     return 1;
 }
 
+/* G53: HOST FOG, AGAINST THE EXECUTOR'S FOG.
+ *
+ * D3D's fog state as the mirror carries it (FOGENABLE, FOGTABLEMODE,
+ * start/end/density, RANGEFOGENABLE, FOGCOLOR) and the fog final combiner the
+ * fog updater writes. The host draws it through its own transcription
+ * (d3d8_host_ff_registers: FOG_ENABLE, GEN_MODE, MODE, PARAMS, the
+ * model-view and D3D's (0,0,1,0) FOG_PLANE) and its own shader; the executor
+ * draws the same register file with nv2a_ff_vertex's fog coordinate and its
+ * own final combiner. Within one 565 step; the fog must be VISIBLE (the
+ * executor's unfogged draw differs); and the host with the fog colour moved
+ * must differ from the executor (the control). Then the whole shadow flow,
+ * pre token to flip, for one fogged draw: compared, not refused. */
+static void set_fog(D3D8HostDrawCheck *c, unsigned table, unsigned range, uint32_t color)
+{
+    float f;
+    memset(&c->fg_cur, 0, sizeof c->fg_cur);
+    c->fg_cur.enable = 1; c->fg_cur.table_mode = table; c->fg_cur.range_enable = range;
+    f = 1.8f; memcpy(&c->fg_cur.start, &f, 4); f = 4.2f; memcpy(&c->fg_cur.end, &f, 4);
+    f = 0.45f; memcpy(&c->fg_cur.density, &f, 4); f = 8192.0f; memcpy(&c->fg_cur.equal_scale, &f, 4);
+    c->ffv_fog_color = color;
+    c->fog_cur[0] = 1; c->fog_cur[1] = 0; c->fog_cur[2] = 0; c->fog_cur[3] = 0;
+}
+/* One fogged FF draw through the whole shadow flow -- pre token, post, flip
+ * -- against an executor image; returns the flip's verdict (1 compared and
+ * matching, 0 compared and MISMATCHING, -1 not compared). */
+static int ff_fog_flow(D3D8HostDrawCheck *c, const uint16_t *bg, uint16_t *exec_img)
+{
+    D3D8H2DStats a, b; D3D8Host2DBackend be;
+    memset(&be, 0, sizeof be);
+    be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
+    be.last_error = d3d8_host_2d_metal_last_error; be.depth_peek = fake_peek; be.ff_vertex = nv2a_ff_vertex;
+    d3d8_host_2d_set_backend(&be);
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memcpy(ram + RT, bg, RTPITCH * RTH);
+    g_exec_result = exec_img; g_sync_calls = 0; g_peeks = 0;
+    snapshot_at_call(c);
+    d3d8_host_2d_get_stats(&a);
+    d3d8_host_2d_pre(c->serial, c->vs_handle, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
+    d3d8_host_2d_post(c, NULL);
+    d3d8_host_2d_flip();
+    d3d8_host_2d_get_stats(&b);
+    if (b.ff_compared != a.ff_compared + 1) return -1;
+    return b.ff_mismatching == a.ff_mismatching;
+}
+static void ff_fog_tests(void)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], nf[RTPITCH / 2 * RTH];
+    static uint16_t exc[RTPITCH / 2 * RTH], nfc[RTPITCH / 2 * RTH];   /* copies: the executor's surfaces move on */
+    static uint32_t ffm[2048];
+    static const struct { const char *name; unsigned table, range; } fc[] = {
+        { "LINEAR planar", 3, 0 }, { "EXP radial", 1, 1 }, { "EXP2 planar", 2, 0 } };
+    for (unsigned i = 0; i < sizeof fc / sizeof fc[0]; ++i) {
+        D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df;
+        const char *why; int v;
+        case_ff(&c); c.serial = 30 + i;
+        set_fog(&c, fc[i].table, fc[i].range, 0xFF3060A0u);
+        for (unsigned y = 0; y < RTH; ++y)
+            for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+        why = d3d8_host_ff_registers(&c, ffm);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        if (!why) why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+        CHECK(!why && d.fog_enable && d.final_general, "FF fog %s: the host builds it (%s)", fc[i].name, why ? why : "built");
+        if (why) continue;
+        background(bg); memcpy(ex, bg, sizeof bg); memcpy(nf, bg, sizeof bg);
+        g_exec_fog = 1; g_exec_fog_color = c.ffv_fog_color;
+        CHECK(exec_draw_ff(&c, &d, ffm, ex, ram + ZS), "FF fog %s: the executor drew it fogged", fc[i].name);
+        memcpy(exc, ex, sizeof ex);
+        g_exec_fog = 0;
+        for (unsigned y = 0; y < RTH; ++y)
+            for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+        CHECK(exec_draw_ff(&c, &d, ffm, nf, ram + ZS), "FF fog %s: the executor drew it unfogged", fc[i].name);
+        memcpy(nfc, nf, sizeof nf);
+        d3d8_host_2d_diff(bg, exc, nfc, RTPITCH / 2, RTH, 1, &df);
+        CHECK(df.exec_changed > 500 && df.mismatch > 500, "FF fog %s: the fog is visible in the executor's image (%llu of %llu px)",
+              fc[i].name, df.mismatch, df.exec_changed);
+        v = ff_fog_flow(&c, bg, exc);
+        CHECK(v == 1, "FF fog %s: the shadow compares the fogged draw at the flip and it MATCHES the executor's (%d)", fc[i].name, v);
+        v = ff_fog_flow(&c, bg, nfc);
+        CHECK(v == 0, "FF fog %s CONTROL: against the executor's UNFOGGED image the shadow says MISMATCHING (%d)", fc[i].name, v);
+    }
+}
+
+/* G53: THE 2D CLASS'S FOG. D3D's vertex-fog pass-through (FOGTABLEMODE NONE)
+ * takes the coordinate from the specular alpha; a fog table on
+ * pre-transformed vertices runs a program the host does not model and is
+ * refused by name. */
+static void fog_2d_tests(void)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; const char *why;
+    static const float SPA[4] = { 0.0f, 0.25f, 0.75f, 1.0f };
+    case_b(&c);
+    for (int i = 0; i < 4; ++i) put32(VB + 0x400 + 4u * i, (uint32_t)(SPA[i] * 255.0f + 0.5f) << 24 | 0x00102030u);
+    c.va_on |= 1u << 4; c.va_offset[4] = VB + 0x400; c.va_format[4] = (4u << 8) | 0x40u;
+    c.ffv_valid = 1; set_fog(&c, 0, 0, 0xFF808080u);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    {   int ok = !why && d.fog_enable && d.final_general && d.nverts == 6;
+        for (unsigned k = 0; ok && k < d.nverts; ++k) if (d.verts[k].f[0] != d.verts[k].d1[3]) ok = 0;
+        CHECK(ok, "2D fog, FOGTABLEMODE NONE: built, the coordinate is each vertex's specular alpha (%s)", why ? why : "built"); }
+    set_fog(&c, 3, 0, 0xFF808080u);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(why && !strcmp(why, "2D fog from a fog table"), "2D fog from a fog table: refused by name (%s)", why ? why : "built");
+}
+
 /* G51.2: A DRAW THROUGH THE TITLE'S OWN VERTEX PROGRAM. The first complete
  * JSRF program captured (vsh_capture.h: position and texcoord in, oPos scaled
  * by c0 and offset by c1, oD0 from the current diffuse), its constants as
@@ -1764,6 +1883,87 @@ static void arming_tests(void)
 #endif
 }
 
+/* G53: THE PROGRAMMABLE CLASS'S FOG. A program that writes oFog from its
+ * fog attribute (MOV oPos,v0; MOV oD0,v3; MOV oFog,v5), D3D's LINEAR fog
+ * table and fog final combiner. The host draws it through the executor's
+ * translation (vs_gpu hands Out.fog to the host's fragment); the reference
+ * runs the program on the CPU interpreter and draws its outputs, fog
+ * coordinate included, as pre-transformed vertices. Exact; the fog visible
+ * against the same draw unfogged; the control (fog colour moved) differs. */
+static void vs_fog_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static D3D8H2DVertex rv[64];
+    static uint32_t words[3][4];
+    static const float P[4][3] = { { 8.0f, 6.0f, 0.0f }, { 120.0f, 10.0f, 60.0f }, { 12.0f, 90.0f, 20.0f }, { 116.0f, 92.0f, 100.0f } };
+    static const uint16_t I[6] = { 0, 1, 2, 2, 1, 3 };
+    static const unsigned io[3] = { 0, 3, 5 };
+    D3D8HostDrawCheck c; D3D8Host2DDraw d, r; D3D8H2DDiff df; NV2AVshProgram prog;
+    const char *why;
+    for (int i = 0; i < 3; ++i) {
+        VshIns x; memset(&x, 0, sizeof x);
+        x.mac = 1; x.input_index = io[i];
+        x.a.mux = 2; x.a.swz = SWZ_ID; x.b.mux = 2; x.b.swz = SWZ_ID; x.c.mux = 2; x.c.swz = SWZ_ID;
+        x.out_mask = io[i] == 5 ? 0x8 : 0xF; x.out_reg = io[i]; x.final = i == 2;
+        vsh_encode(words[i], &x);
+    }
+    base_check(&c);
+    for (int i = 0; i < 4; ++i) {                           /* x, y, fog: 12 bytes */
+        uint32_t v = VB + 12u * i;
+        putf(v, P[i][0]); putf(v + 4, P[i][1]); putf(v + 8, P[i][2]);
+    }
+    memcpy(ram + IB, I, sizeof I);
+    c.vs_handle = 0x00ABCDF1u; c.vs_kind = 1; c.vs_nwords = 12; memcpy(c.vs_words, words, sizeof words);
+    c.draw_kind = 2; c.prim = 5; c.count = 6; c.idx_ptr = IB; c.nidx = 6;
+    for (int k = 0; k < 6; ++k) c.idx[k] = I[k];
+    c.va_on = (1u << 0) | (1u << 5);
+    c.va_offset[0] = VB; c.va_format[0] = (12u << 8) | 0x22u;
+    c.va_offset[5] = VB + 8; c.va_format[5] = (12u << 8) | 0x12u;
+    c.ffc_cur.tss[0][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_SELECTARG1; c.ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_DIFFUSE;
+    c.ffc_cur.tss[0][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_SELECTARG1; c.ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
+    set_fog(&c, 3, 0, 0xFF2080C0u);
+    {   float f = 0.0f; memcpy(&c.fg_cur.start, &f, 4); f = 110.0f; memcpy(&c.fg_cur.end, &f, 4); }
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, (const uint16_t *)(ram + IB), NULL, NULL, &d);
+    CHECK(!why && d.fog_enable && d.final_general && d.vs_nidx == 6, "VS fog: the host builds a programmable fogged draw (%s)",
+          why ? why : "built");
+    if (why) return;
+    memset(&prog, 0, sizeof prog);
+    nv2a_vsh_parse((const uint32_t *)words, 3, &prog);
+    r = d; r.cls = 1; r.verts = rv; r.nverts = d.vs_nidx;
+    for (unsigned k = 0; k < d.vs_nidx; ++k) {
+        float in[16][4]; NV2AVshResult o; unsigned slot = 0;
+        for (unsigned q = 0; q < 16; ++q) { in[q][0] = in[q][1] = in[q][2] = 0; in[q][3] = 1; }
+        in[3][0] = in[3][1] = in[3][2] = 1;
+        for (unsigned q = 0; q < 16; ++q) if (d.vs_inputs & (1u << q)) memcpy(in[q], d.vs_in[d.vs_idx[k] * d.vs_nattrs + slot++], 16);
+        memset(&o, 0, sizeof o);
+        nv2a_vsh_execute(&prog, (const float (*)[4])in, (const float (*)[4])d.vs_c, &o);
+        memset(&rv[k], 0, sizeof rv[k]);
+        rv[k].p[0] = fabsf(o.output[0][0]) < 1048576.0f ? truncf(o.output[0][0] * 16.0f) / 16.0f : o.output[0][0];
+        rv[k].p[1] = fabsf(o.output[0][1]) < 1048576.0f ? truncf(o.output[0][1] * 16.0f) / 16.0f : o.output[0][1];
+        rv[k].p[2] = o.output[0][2] / 16777215.0f; rv[k].p[3] = o.output[0][3];
+        for (unsigned ch = 0; ch < 4; ++ch) rv[k].d0[ch] = fminf(1.0f, fmaxf(0.0f, o.output[3][ch]));
+        rv[k].f[0] = o.output[5][0];
+    }
+    background(bg); memcpy(a, bg, sizeof bg); memcpy(b, bg, sizeof bg);
+    CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0,
+          "VS fog: the host drew it through the executor's translation (%s)", d3d8_host_2d_metal_last_error());
+    d3d8_host_2d_metal_render(&r, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
+    printf("  VS fog: reference changed %llu px, host %llu, over tolerance %llu, max error r%u g%u b%u\n",
+           df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1], df.max_err[2]);
+    CHECK(df.exec_changed > 2000 && df.mismatch == 0, "VS fog: the program's oFog reaches the host's fog as the interpreter's does");
+    {   D3D8Host2DDraw u = d; u.fog_enable = 0; u.final_general = 0; u.add_specular = 0;
+        memcpy(a, bg, sizeof bg);
+        d3d8_host_2d_metal_render(&u, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+        d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
+        CHECK(df.mismatch > 1000, "VS fog: the fog is visible (%llu px differ from the unfogged draw)", df.mismatch); }
+    d.fog_color ^= 0x00FF00FFu; memcpy(a, bg, sizeof bg);
+    d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
+    CHECK(df.mismatch > 1000, "VS fog CONTROL: the fog colour moved, the host differs (%llu px)", df.mismatch);
+}
+
 /* G56 DEFER-SAFE, the positive control. The executor (this thread, the
  * service thread) draws into A without a sync and then into B, so under
  * RECOMP_METAL_DEFER_SWAP A's pixels are on the GPU only; a "guest" thread
@@ -1843,7 +2043,7 @@ int main(int argc, char **argv)
     if (!ram) return 2;
     if (argc > 1 && (strcmp(argv[1], "ff") == 0 || strcmp(argv[1], "ffcontrol") == 0)) {   /* FF shadow alone */
         CHECK(ff_arm(strcmp(argv[1], "ffcontrol") == 0), "FF arm ran");
-        if (strcmp(argv[1], "ff") == 0) { ff_cache_tests(); tex_cache_tests(); }
+        if (strcmp(argv[1], "ff") == 0) { ff_cache_tests(); ff_fog_tests(); fog_2d_tests(); tex_cache_tests(); }
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }
@@ -1861,6 +2061,7 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "vs") == 0) {           /* G51.2: the programmable class */
         setenv("RECOMP_D3D8_HOST_VS", "shadow", 1);
         vs_tests();
+        vs_fog_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }

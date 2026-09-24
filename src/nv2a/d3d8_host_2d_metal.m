@@ -69,6 +69,8 @@ typedef struct {
     uint32_t dither, cmask, lin_mask, pad;
     float tw[4], th[4], lod_bias[4];
     uint32_t ci[8], ai[8], co[8], ao[8], k0[8], k1[8];
+    uint32_t fin, fcw0, fcw1, fog_en, fog_mode, fog_color, sf0, sf1;   /* G53 */
+    float fog_p0, fog_p1;
 } H2DUniforms;
 
 #define H2D_FC(name, idx) \
@@ -77,19 +79,22 @@ typedef struct {
 static NSString *const k_src =
 @"#include <metal_stdlib>\n"
  "using namespace metal;\n"
- "struct V { float4 p, d0, d1, t0, t1, t2, t3; };\n"
+ "struct V { float4 p, d0, d1, t0, t1, t2, t3, f; };\n"
  "struct U { float W, H; uint ox, oy; uint cc, control, tmask, add_spec;"
  " uint alpha_test, alpha_func, alpha_ref, blend; uint bsrc, bdst, beq, bcolor;"
  " uint dither, cmask, lin_mask, pad; float tw[4], th[4], lod_bias[4];"
- " uint ci[8], ai[8], co[8], ao[8], k0[8], k1[8]; };\n"
- "struct O { float4 p [[position]]; float4 d0, d1, t0, t1, t2, t3; };\n"
+ " uint ci[8], ai[8], co[8], ao[8], k0[8], k1[8];"
+ " uint fin, fcw0, fcw1, fog_en, fog_mode, fog_color, sf0, sf1; float fog_p0, fog_p1; };\n"
+ /* G53: `fog` is the fog coordinate, member for member the executor's Out
+  * (whose vs_gpu the programmable class draws through). */
+ "struct O { float4 p [[position]]; float4 d0, d1, t0, t1, t2, t3; float fog; };\n"
  /* Target-space pixels to clip space over the crop. The same expression as
   * nv2a_metal.m's vs(), with the crop origin taken off first -- an integer,
   * so the subtraction is exact. */
  "vertex O h2d_vs(uint id [[vertex_id]], const device V *v [[buffer(0)]], constant U &u [[buffer(1)]]) {\n"
  " V x = v[id]; O o; float w = x.p.w;\n"
  " o.p = float4(((x.p.x - float(u.ox)) / u.W * 2 - 1) * w, (1 - (x.p.y - float(u.oy)) / u.H * 2) * w, x.p.z * w, w);\n"
- " o.d0 = x.d0; o.d1 = x.d1; o.t0 = x.t0; o.t1 = x.t1; o.t2 = x.t2; o.t3 = x.t3; return o; }\n"
+ " o.d0 = x.d0; o.d1 = x.d1; o.t0 = x.t0; o.t1 = x.t1; o.t2 = x.t2; o.t3 = x.t3; o.fog = x.f.x; return o; }\n"
  "float inp(uint code, uint ch, thread float4 *r) { uint s = code & 15; float x = r[s][(code & 16) ? 3 : ch];"
  " switch (code >> 5) { case 0: return max(0.0f, x); case 1: return 1 - min(1.0f, max(0.0f, x));"
  " case 2: return 2 * max(0.0f, x) - 1; case 3: return 1 - 2 * max(0.0f, x);"
@@ -98,6 +103,25 @@ static NSString *const k_src =
  " case 3: return (x - 0.5f) * 2.0f; case 4: return x * 4.0f; case 6: return x * 0.5f; default: return x; } }\n"
  "float3 cmap3(uint m, float3 v) { return float3(cmap1(m, v.x), cmap1(m, v.y), cmap1(m, v.z)); }\n"
  "float4 unpack(uint k) { return float4(float((k >> 16) & 255), float((k >> 8) & 255), float(k & 255), float((k >> 24) & 255)) / 255.0f; }\n"
+ /* G53: fog and the final combiner, operation for operation the executor's
+  * fog_factor/final_comb (nv2a_metal.m), whose reference is
+  * nv2a_final_combine in nv2a_texture_copy.c. */
+ "float fog_factor(uint mode, float p0, float p1, float d) { float f;"
+ " if (mode == 0x804u || mode == 0x802u || mode == 0x803u) d = fabs(d);"
+ " switch (mode) { case 0x2601u: case 0x804u: if (!isfinite(d)) d = 0; f = p0 + d * p1 - 1.0f; break;"
+ " case 0x800u: case 0x802u: if (!isfinite(d)) d = 0; f = p0 + exp2(d * p1 * 16.0f) - 1.5f; break;"
+ " case 0x801u: case 0x803u: f = p0 + exp2(-d * d * p1 * p1 * 32.0f) - 1.5f; break; default: return 1.0f; }"
+ " return f < 0 ? 0 : (f > 1 ? 1 : (f >= 0 ? f : 0)); }\n"
+ "float4 final_comb(thread float4 *r, uint w0, uint w1, float fogf, constant U &u) {"
+ " r[1] = unpack(u.sf0); r[2] = unpack(u.sf1);"
+ " r[3] = float4(float(u.fog_color & 255u), float((u.fog_color >> 8) & 255u), float((u.fog_color >> 16) & 255u), 0) / 255.0f; r[3].a = fogf;"
+ " for (uint k = 0; k < 3; k++) { float v1 = r[5][k], r0 = r[12][k];"
+ " if (w1 & 0x40u) v1 = 1 - min(1.0f, max(0.0f, v1)); if (w1 & 0x20u) r0 = 1 - min(1.0f, max(0.0f, r0));"
+ " float sm = v1 + r0; if (w1 & 0x80u) sm = min(1.0f, max(0.0f, sm)); r[14][k] = sm; } r[14].a = 0;"
+ " for (uint k = 0; k < 3; k++) r[15][k] = inp(w1 >> 24, k, r) * inp((w1 >> 16) & 255u, k, r); r[15].a = 0;"
+ " float4 o; for (uint k = 0; k < 3; k++) { float a = inp(w0 >> 24, k, r), b = inp((w0 >> 16) & 255u, k, r),"
+ " c = inp((w0 >> 8) & 255u, k, r), d = inp(w0 & 255u, k, r); o[k] = min(1.0f, max(0.0f, d + a * b + (1 - a) * c)); }"
+ " o.a = min(1.0f, max(0.0f, inp((w1 >> 8) & 255u, 2, r))); return o; }\n"
  /* SPECIALISATION, as the executor's spec_pipeline_for does it: every
   * word that decides the SHAPE of the fragment program -- the combiner
   * words, the stage count, the texture mask, the fixed-function switches --
@@ -115,6 +139,7 @@ static NSString *const k_src =
  H2D_FC("ai0",16) H2D_FC("ai1",17) H2D_FC("ai2",18) H2D_FC("ai3",19) H2D_FC("ai4",20) H2D_FC("ai5",21) H2D_FC("ai6",22) H2D_FC("ai7",23)
  H2D_FC("co0",24) H2D_FC("co1",25) H2D_FC("co2",26) H2D_FC("co3",27) H2D_FC("co4",28) H2D_FC("co5",29) H2D_FC("co6",30) H2D_FC("co7",31)
  H2D_FC("ao0",32) H2D_FC("ao1",33) H2D_FC("ao2",34) H2D_FC("ao3",35) H2D_FC("ao4",36) H2D_FC("ao5",37) H2D_FC("ao6",38) H2D_FC("ao7",39)
+ H2D_FC("FCW0",43) H2D_FC("FCW1",44)
  "#define PICK8(n, st) (st == 0 ? FC_##n##0 : st == 1 ? FC_##n##1 : st == 2 ? FC_##n##2 : st == 3 ? FC_##n##3 : st == 4 ? FC_##n##4 : st == 5 ? FC_##n##5 : st == 6 ? FC_##n##6 : FC_##n##7)\n"
  "uint W_ci(uint st, constant U &u) { return SPEC ? PICK8(ci, st) : u.ci[st]; }\n"
  "uint W_ai(uint st, constant U &u) { return SPEC ? PICK8(ai, st) : u.ai[st]; }\n"
@@ -128,6 +153,7 @@ static NSString *const k_src =
  "bool K_blend(constant U &u) { return SPEC ? (FC_FLAGS & 2u) != 0 : u.blend != 0; }\n"
  "bool K_dither(constant U &u) { return SPEC ? (FC_FLAGS & 4u) != 0 : u.dither != 0; }\n"
  "bool K_spec(constant U &u) { return SPEC ? (FC_FLAGS & 8u) != 0 : u.add_spec != 0; }\n"
+ "bool K_fin(constant U &u) { return SPEC ? (FC_FLAGS & 16u) != 0 : u.fin != 0; }\n"
  "uint K_afunc(constant U &u) { return SPEC ? FC_AFUNC : u.alpha_func; }\n"
  "uint K_bsrc(constant U &u) { return SPEC ? FC_BSRC : u.bsrc; }\n"
  "uint K_bdst(constant U &u) { return SPEC ? FC_BDST : u.bdst; }\n"
@@ -169,7 +195,7 @@ static NSString *const k_src =
  " sampler q0 [[sampler(0)]], sampler q1 [[sampler(1)]], sampler q2 [[sampler(2)]], sampler q3 [[sampler(3)]]\n"
  "inline float4 h2d_body(O i, float4 dst, constant U &u, texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3,"
  " sampler q0, sampler q1, sampler q2, sampler q3, bool zcull) {\n"
- " float4 r[14]; for (uint n = 0; n < 14; n++) r[n] = float4(0);\n"
+ " float4 r[16]; for (uint n = 0; n < 16; n++) r[n] = float4(0);\n"
  " uint tm = K_tmask(u); r[4] = i.d0; r[5] = i.d1;\n"
  " if (tm & 1) r[8] = samp(h0, q0, i.t0, 0, u); if (tm & 2) r[9] = samp(h1, q1, i.t1, 1, u);\n"
  " if (tm & 4) r[10] = samp(h2, q2, i.t2, 2, u); if (tm & 8) r[11] = samp(h3, q3, i.t3, 3, u);\n"
@@ -187,7 +213,10 @@ static NSString *const k_src =
  "  if (FC_CC > 4) stage(r, 4, FC_ci4, FC_ai4, FC_co4, FC_ao4, u); if (FC_CC > 5) stage(r, 5, FC_ci5, FC_ai5, FC_co5, FC_ao5, u);\n"
  "  if (FC_CC > 6) stage(r, 6, FC_ci6, FC_ai6, FC_co6, FC_ao6, u); if (FC_CC > 7) stage(r, 7, FC_ci7, FC_ai7, FC_co7, FC_ao7, u);\n"
  " } else for (uint st = 0; st < u.cc; st++) stage(r, st, u.ci[st], u.ai[st], u.co[st], u.ao[st], u);\n"
- " float4 c = clamp(r[12] + (K_spec(u) ? float4(r[5].rgb, 0) : float4(0)), 0.0f, 1.0f);\n"
+ " float4 c;\n"
+ " if (K_fin(u)) c = final_comb(r, SPEC ? FC_FCW0 : u.fcw0, SPEC ? FC_FCW1 : u.fcw1,"
+ " u.fog_en ? fog_factor(u.fog_mode, u.fog_p0, u.fog_p1, i.fog) : 1.0f, u);\n"
+ " else c = clamp(r[12] + (K_spec(u) ? float4(r[5].rgb, 0) : float4(0)), 0.0f, 1.0f);\n"
  /* The executor's z-range policy for JSRF (CULL over 0..16777215). Under
   * MTLDepthClipModeClamp it cannot fire, which is what lets the early entry
   * drop it, as the executor's fs_hw_early does. */
@@ -448,6 +477,7 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
 typedef struct {
     uint32_t cc, tmask, flags, control, afunc, bsrc, bdst, beq, cmask, lin;
     uint32_t ci[8], ai[8], co[8], ao[8];
+    uint32_t fcw0, fcw1;       /* G53: when flags & 16 */
     uint32_t stencil, early, generic;
     uint64_t vfn;              /* G51.2: the executor's vs_gpu for a programmable draw, or 0 for h2d_vs */
 } H2DSpecKey;
@@ -499,7 +529,9 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
     if (generic && !vfn) return with_stencil ? s_pso_st : s_pso;
     memset(&k, 0, sizeof k);
     k.cc = d->cc; k.tmask = d->tmask; k.control = d->control;
-    k.flags = (d->alpha_test ? 1u : 0u) | (d->blend ? 2u : 0u) | (d->dither ? 4u : 0u) | (d->add_specular ? 8u : 0u);
+    k.flags = (d->alpha_test ? 1u : 0u) | (d->blend ? 2u : 0u) | (d->dither ? 4u : 0u) | (d->add_specular ? 8u : 0u)
+            | (d->final_general ? 16u : 0u);
+    if (d->final_general) { k.fcw0 = d->final_cw0; k.fcw1 = d->final_cw1; }
     k.afunc = d->alpha_test ? d->alpha_func : 0; k.lin = lin_mask;
     if (d->blend) { k.bsrc = d->blend_src; k.bdst = d->blend_dst; k.beq = d->blend_eq; }
     k.cmask = d->color_mask;
@@ -535,7 +567,9 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
         [cv setConstantValues:k.ao type:MTLDataTypeUInt withRange:NSMakeRange(32, 8)];
         [cv setConstantValue:&k.beq type:MTLDataTypeUInt atIndex:40];
         [cv setConstantValue:&k.cmask type:MTLDataTypeUInt atIndex:41];
-        [cv setConstantValue:&k.lin type:MTLDataTypeUInt atIndex:42]; }
+        [cv setConstantValue:&k.lin type:MTLDataTypeUInt atIndex:42];
+        [cv setConstantValue:&k.fcw0 type:MTLDataTypeUInt atIndex:43];
+        [cv setConstantValue:&k.fcw1 type:MTLDataTypeUInt atIndex:44]; }
     NSString *name = k.early ? @"h2d_fs_early" : @"h2d_fs";
     int stencil = with_stencil;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -606,6 +640,9 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
     memcpy(u.ci, d->ci, sizeof u.ci); memcpy(u.ai, d->ai, sizeof u.ai);
     memcpy(u.co, d->co, sizeof u.co); memcpy(u.ao, d->ao, sizeof u.ao);
     memcpy(u.k0, d->k0, sizeof u.k0); memcpy(u.k1, d->k1, sizeof u.k1);
+    u.fin = d->final_general; u.fcw0 = d->final_cw0; u.fcw1 = d->final_cw1;
+    u.fog_en = d->fog_enable; u.fog_mode = d->fog_mode; u.fog_color = d->fog_color;
+    u.sf0 = d->sf0; u.sf1 = d->sf1; u.fog_p0 = d->fog_p0; u.fog_p1 = d->fog_p1;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     for (unsigned s = 0; s < 4; ++s) {
         if (!(d->tmask & (1u << s))) continue;
