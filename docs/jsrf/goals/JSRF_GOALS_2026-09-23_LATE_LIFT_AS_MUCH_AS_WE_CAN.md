@@ -328,3 +328,24 @@ merging or carrying flags at split entries.
   - JSRF.app rebuilt from it.
   - `jsrf_apu_list_cycle_off` failed once under `ctest -j8` and passed 4 of 4
     alone: a parallel-run flake, not a regression.
+
+## The frame rate, 24 Sep (late): 60 at correct speed in the tutorial
+
+- **Combiner specialisation** (agent, `e2aee7b`, merged). Fragment pipelines are
+  specialised per combiner program with Metal function constants. Tutorial,
+  player's switches, 2 trials per arm, idle host:
+
+  | arm | GPU wait | frame | fps |
+  |---|---|---|---|
+  | generic | 9.9 ms | 17.0-17.2 ms | 58.2-58.9 |
+  | specialised | 2.6 ms | 11.5-11.6 ms | 86.0-86.9 |
+
+  45 pipelines, 8 ms of compiling in all (worst 0.4 ms).
+- **...which exposed that flips were never paced.** The game is frame-stepped,
+  so 87 fps meant 145% game speed (anim 87 ticks/s). Light scenes had already
+  reached 110-147 fps in the player's session. Flips are now held to one
+  vblank period (`e4acb21`, `RECOMP_FLIP_PACE`):
+  - tutorial 59.8 fps, anim 59.8/s, GPU wait 1.06 ms;
+  - intro music matches `title.adx` in every second once playing;
+  - the logo sequence now takes its real-time length (it had run fast).
+- The Windows cross-build compiles again (`nv2a_metal_frag_force_arm` guarded).
