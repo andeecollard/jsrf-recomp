@@ -1190,8 +1190,72 @@ static void zrange_tests(void)
 static uint32_t fz_state = 0x12345678u;
 static unsigned s_fz_spec_vs_exec, s_fz_gen_vs_exec, s_fz_printed;
 static uint32_t fz(void) { fz_state ^= fz_state << 13; fz_state ^= fz_state >> 17; fz_state ^= fz_state << 5; return fz_state; }
+static unsigned long long g_sg_a, g_sg_b;
+static unsigned long long spec_gen_diff(const D3D8Host2DDraw *e)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH];
+    unsigned long long diff = 0;
+    background(a); background(b);
+    d3d8_host_2d_metal_set_spec(1);
+    d3d8_host_2d_metal_render(e, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_metal_set_spec(0);
+    d3d8_host_2d_metal_render(e, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
+    d3d8_host_2d_metal_set_spec(1);
+    {   static uint16_t bg[RTPITCH / 2 * RTH]; background(bg); g_sg_a = g_sg_b = 0;
+        for (size_t k = 0; k < sizeof a / 2; ++k) { diff += a[k] != b[k]; g_sg_a += a[k] != bg[k]; g_sg_b += b[k] != bg[k]; } }
+    return diff;
+}
+/* Shrink a specialised-vs-generic disagreement: drop stages, zero words and
+ * fields one at a time while the disagreement survives; print what is left. */
+static void spec_minimize(D3D8Host2DDraw e)
+{
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        if (e.cc > 1) { D3D8Host2DDraw f = e; f.cc--; f.control = (f.control & ~0xFu) | f.cc; if (spec_gen_diff(&f)) { e = f; changed = 1; continue; } }
+        uint32_t *w[4] = { e.ci, e.ai, e.co, e.ao };
+        for (unsigned a = 0; a < 4 && !changed; ++a)
+            for (unsigned i = 0; i < e.cc && !changed; ++i)
+                for (unsigned byte = 0; byte < 4 && !changed; ++byte) {
+                    uint32_t m = 0xFFu << (8 * byte);
+                    if (!(w[a][i] & m)) continue;
+                    D3D8Host2DDraw f = e; uint32_t *fw[4] = { f.ci, f.ai, f.co, f.ao };
+                    fw[a][i] &= ~m;
+                    if (spec_gen_diff(&f)) { e = f; changed = 1; }
+                }
+        if (!changed && e.alpha_test) { D3D8Host2DDraw f = e; f.alpha_test = 0; if (spec_gen_diff(&f)) { e = f; changed = 1; } }
+        if (!changed && e.blend) { D3D8Host2DDraw f = e; f.blend = 0; if (spec_gen_diff(&f)) { e = f; changed = 1; } }
+        if (!changed && e.dither) { D3D8Host2DDraw f = e; f.dither = 0; if (spec_gen_diff(&f)) { e = f; changed = 1; } }
+        if (!changed && e.add_specular) { D3D8Host2DDraw f = e; f.add_specular = 0; if (spec_gen_diff(&f)) { e = f; changed = 1; } }
+    }
+    printf("  MINIMAL: cc %u control %X atest %u blend %u dither %u spec %u | %llu px\n", e.cc, e.control, e.alpha_test, e.blend,
+           e.dither, e.add_specular, spec_gen_diff(&e));
+    printf("    specialised drew %llu px, generic %llu px\n", g_sg_a, g_sg_b);
+    for (unsigned i = 0; i < e.cc; ++i)
+        printf("    stage %u: ci %08X ai %08X co %08X ao %08X k0 %08X k1 %08X\n", i, e.ci[i], e.ai[i], e.co[i], e.ao[i], e.k0[i], e.k1[i]);
+}
+/* THE MINIMISED CASE, fixed so it cannot drift with the fuzz's generator:
+ * four stages, COMBINER_CONTROL 4 (SAME_FACTOR_ALL, as D3D's fixed function
+ * sets it), stage 2 writing R0.a = 0, stage 3 reading registers and writing
+ * nothing, alpha test GREATER 215. Every fragment must be discarded. The
+ * looped specialisation drew 4,663 of them. */
+static void spec_min_case(void)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw e;
+    case_logo(&c); set_state(&c, 0x30C, 0);
+    memset(&e, 0, sizeof e); e.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &e)) { CHECK(0, "minimal case: build"); return; }
+    e.cc = 4; e.control = 4;
+    for (unsigned i = 0; i < 8; ++i) { e.ci[i] = e.ai[i] = e.co[i] = e.ao[i] = 0; e.k0[i] = 0x80C04020u; e.k1[i] = 0x40206080u; }
+    e.ao[0] = 0x00001100u; e.ao[2] = 0x000000DCu; e.ai[3] = 0xE300E900u;
+    e.alpha_test = 1; e.alpha_func = 0x204u; e.alpha_ref = 215; e.blend = 0; e.dither = 0; e.add_specular = 0;
+    unsigned long long diff = spec_gen_diff(&e);
+    printf("  minimal case: specialised drew %llu px, generic %llu px\n", g_sg_a, g_sg_b);
+    CHECK(diff == 0 && g_sg_a == 0 && g_sg_b == 0, "minimal case: both discard every fragment (R0.a = 0 fails GREATER 215)");
+}
 static void spec_fuzz_tests(void)
 {
+    spec_min_case();
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH];
     D3D8HostDrawCheck c; D3D8Host2DDraw d;
     unsigned bad = 0, n = 300;
@@ -1213,10 +1277,21 @@ static void spec_fuzz_tests(void)
         e.control = (e.cc) | (fz() & 0x11000u);
         e.alpha_test = fz() & 1u; e.alpha_func = 0x200u + fz() % 8u; e.alpha_ref = fz() % 256u;
         /* The executor's model, so it can be the referee: per-stage factors, GREATER. */
-        if (!getenv("H2D_FUZZ_FREE_CONTROL")) e.control = e.cc | 0x11000u;
-        if (!getenv("H2D_FUZZ_FREE_FUNC")) e.alpha_func = 0x204u;
+        /* Every COMBINER_CONTROL factor mode -- D3D's fixed function clears
+         * both bits, which is how the looped specialisation's defect hid from
+         * a fuzz that always set them. With SAME_FACTOR_ALL the per-stage
+         * factors are made equal, as D3D writes them, so the executor (always
+         * per stage) stays a valid referee. It is consulted only for GREATER,
+         * the one alpha test it models; every draw is held spec == generic. */
+        if (!(e.control & 0x1000u)) for (unsigned i = 1; i < 8; ++i) e.k0[i] = e.k0[0];
+        if (!(e.control & 0x10000u)) for (unsigned i = 1; i < 8; ++i) e.k1[i] = e.k1[0];
+        if (fz() & 1u) e.alpha_func = 0x204u;
         e.blend = fz() & 1u; e.blend_src = 0x302; e.blend_dst = 0x303; e.blend_eq = 0x8006;
         e.dither = fz() & 1u; e.add_specular = fz() & 1u;
+        if (getenv("H2D_FUZZ_NOSPEC")) e.add_specular = 0;
+        if (getenv("H2D_FUZZ_NOAT")) e.alpha_test = 0;
+        if (getenv("H2D_FUZZ_NOBLEND")) e.blend = 0;
+        if (getenv("H2D_FUZZ_NODITHER")) e.dither = 0;
         background(a); background(b);
         d3d8_host_2d_metal_set_spec(1);
         int ok = d3d8_host_2d_metal_render(&e, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0;
@@ -1227,7 +1302,7 @@ static void spec_fuzz_tests(void)
             static uint16_t x[RTPITCH / 2 * RTH]; static uint8_t zd[RTW * 4 * RTH];
             unsigned long long dsx = 0, dgx = 0, dsg = 0;
             background(x);
-            if (exec_draw(&c, &e, x, zd)) {
+            if (e.alpha_func == 0x204u && exec_draw(&c, &e, x, zd)) {
                 for (size_t k = 0; k < sizeof a / 2; ++k) { dsx += a[k] != x[k]; dgx += b[k] != x[k]; dsg += a[k] != b[k]; }
                 if (dsx) ++s_fz_spec_vs_exec; if (dgx) ++s_fz_gen_vs_exec;
                 if ((dsx || dgx) && s_fz_printed++ < 6)
@@ -1238,6 +1313,7 @@ static void spec_fuzz_tests(void)
         if (!ok || memcmp(a, b, sizeof a)) {
             unsigned long long diff = 0;
             for (size_t k = 0; k < sizeof a / 2; ++k) diff += a[k] != b[k];
+            if (bad == 0 && getenv("H2D_FUZZ_MIN")) spec_minimize(e);
             if (bad++ < 5) printf("  fuzz %u: cc %u control %X atest %u func %X ref %u blend %u dither %u spec %u: %llu px differ%s\n",
                                   it, e.cc, e.control, e.alpha_test, e.alpha_func, e.alpha_ref, e.blend, e.dither, e.add_specular,
                                   diff, ok ? "" : " (render failed)");
@@ -1291,9 +1367,58 @@ static void geom_tests(void)
     CHECK(up2 >= 1 && cp2 >= 2, "bind geometry CONTROL: with D3D's geometry A is held twice");
 }
 
+/* THE GAME'S STATE, replayed: the combiner setups the mirror logged for the
+ * building draws that VERIFY found the specialised pipelines dropping pixels
+ * on (key run g51key, 24 Sep 2026: fvf 202, two DXT1 textures, four stages,
+ * COMBINER_CONTROL 4, alpha test GREATER 0, dither, depth write).
+ * Specialised and generic must agree on each. On this test's texture they
+ * agreed even under the looped specialisation -- the defect needed texel
+ * alpha this texture does not have -- so spec_min_case, minimised from the
+ * fuzz, is the case that fails without the fix; this one keeps the game's
+ * words under test. */
+static const uint32_t k_game[][9] = {
+    /* ci0, ai0, ci1, ai1, co, ao, final cw0, tmask, add_spec */
+    { 0x08040000u, 0x00002014u, 0x0C200000u, 0x1C200000u, 0x00000C00u, 0x00000C00u, 0xEu, 3u, 1u },
+    { 0x08040000u, 0x18140000u, 0x090C0000u, 0x0000201Cu, 0x00000C00u, 0x00000C00u, 0xCu, 3u, 0u },
+    { 0x08040000u, 0x18140000u, 0x0919390Cu, 0x0000201Cu, 0x00000C00u, 0x00000C00u, 0xCu, 3u, 0u },
+    { 0x08040000u, 0x18140000u, 0x09200000u, 0x19200000u, 0x00000C00u, 0x00000C00u, 0xCu, 3u, 0u },
+    { 0x08040000u, 0x18140000u, 0x090C0000u, 0x191C0000u, 0x00000C00u, 0x00000C00u, 0xEu, 3u, 1u },
+};
+static void game_state_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    case_logo(&c); set_state(&c, 0x30C, 0);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d)) { CHECK(0, "game state: build"); return; }
+    for (unsigned g = 0; g < sizeof k_game / sizeof k_game[0]; ++g) {
+        D3D8Host2DDraw e = d;
+        e.cc = 4; e.control = 4;
+        for (unsigned i = 0; i < 8; ++i) { e.ci[i] = e.ai[i] = e.co[i] = e.ao[i] = 0; e.k0[i] = e.k1[i] = 0xFFFFFFFFu; }
+        e.ci[0] = k_game[g][0]; e.ai[0] = k_game[g][1];
+        for (unsigned i = 1; i < 4; ++i) { e.ci[i] = i == 1 ? k_game[g][2] : 0x0C200000u; e.ai[i] = i == 1 ? k_game[g][3] : 0x1C200000u; }
+        for (unsigned i = 0; i < 4; ++i) { e.co[i] = k_game[g][4]; e.ao[i] = k_game[g][5]; }
+        e.final_cw0 = k_game[g][6]; e.add_specular = k_game[g][8];
+        e.tmask = k_game[g][7]; e.tex[1] = e.tex[0];
+        e.alpha_test = 1; e.alpha_func = 0x204; e.alpha_ref = 0; e.dither = 1; e.blend = 0;
+        background(a); background(b);
+        d3d8_host_2d_metal_set_spec(1);
+        int ok = d3d8_host_2d_metal_render(&e, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0;
+        d3d8_host_2d_metal_set_spec(0);
+        ok = ok && d3d8_host_2d_metal_render(&e, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0;
+        d3d8_host_2d_metal_set_spec(1);
+        unsigned long long diff = 0, ca = 0, cb = 0;
+        static uint16_t bg[RTPITCH / 2 * RTH]; background(bg);
+        for (size_t k = 0; k < sizeof a / 2; ++k) { diff += a[k] != b[k]; ca += a[k] != bg[k]; cb += b[k] != bg[k]; }
+        printf("  game state %u: specialised drew %llu px, generic %llu px, differing %llu\n", g, ca, cb, diff);
+        CHECK(ok && diff == 0, "game state %u: specialised == generic", g);
+    }
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
+    game_state_tests();
     geom_tests();
     spec_fuzz_tests();
     zrange_tests();
