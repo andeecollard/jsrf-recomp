@@ -132,8 +132,7 @@ static NSString *const k_src =
  "uint K_beq(constant U &u) { return SPEC ? FC_BEQ : u.beq; }\n"
  "uint K_cmask(constant U &u) { return SPEC ? FC_CMASK : u.cmask; }\n"
  "uint K_lin(constant U &u) { return SPEC ? FC_LIN : u.lin_mask; }\n"
- "void stage(thread float4 *r, uint st, constant U &u) {\n"
- " uint ciw = W_ci(st, u), aiw = W_ai(st, u), cw = W_co(st, u), aw = W_ao(st, u);\n"
+ "inline void stage(thread float4 *r, uint st, uint ciw, uint aiw, uint cw, uint aw, constant U &u) {\n"
  " r[1] = unpack((K_control(u) & 0x1000u) ? u.k0[st] : u.k0[0]); r[2] = unpack((K_control(u) & 0x10000u) ? u.k1[st] : u.k1[0]);\n"
  " float4 ab, cd; for (uint k = 0; k < 4; k++) { uint word = k == 3 ? aiw : ciw; uint ch = k == 3 ? 2 : k;"
  " float a = inp(word >> 24, ch, r), b = inp((word >> 16) & 255, ch, r), c = inp((word >> 8) & 255, ch, r), d = inp(word & 255, ch, r);"
@@ -173,7 +172,19 @@ static NSString *const k_src =
  " if (tm & 1) r[8] = samp(h0, q0, i.t0, 0, u); if (tm & 2) r[9] = samp(h1, q1, i.t1, 1, u);\n"
  " if (tm & 4) r[10] = samp(h2, q2, i.t2, 2, u); if (tm & 8) r[11] = samp(h3, q3, i.t3, 3, u);\n"
  " r[12].a = (tm & 1) ? r[8].a : 1;\n"
- " for (uint st = 0; st < K_cc(u); st++) stage(r, st, u);\n"
+ /* SPECIALISED: eight explicit calls, each guarded by the constant stage
+  * count and handed its words as arguments -- the executor's shape
+  * (comb_stage called unrolled). The first version looped and picked each
+  * word out of a select chain on the loop index; Metal's compiler produced
+  * wrong alpha from that for some programs (a four-stage program whose last
+  * stage writes nothing changed the result; minimised by spec_minimize,
+  * 24 Sep 2026), and the game's building draws were among them. */
+ " if (SPEC) {\n"
+ "  if (FC_CC > 0) stage(r, 0, FC_ci0, FC_ai0, FC_co0, FC_ao0, u); if (FC_CC > 1) stage(r, 1, FC_ci1, FC_ai1, FC_co1, FC_ao1, u);\n"
+ "  if (FC_CC > 2) stage(r, 2, FC_ci2, FC_ai2, FC_co2, FC_ao2, u); if (FC_CC > 3) stage(r, 3, FC_ci3, FC_ai3, FC_co3, FC_ao3, u);\n"
+ "  if (FC_CC > 4) stage(r, 4, FC_ci4, FC_ai4, FC_co4, FC_ao4, u); if (FC_CC > 5) stage(r, 5, FC_ci5, FC_ai5, FC_co5, FC_ao5, u);\n"
+ "  if (FC_CC > 6) stage(r, 6, FC_ci6, FC_ai6, FC_co6, FC_ao6, u); if (FC_CC > 7) stage(r, 7, FC_ci7, FC_ai7, FC_co7, FC_ao7, u);\n"
+ " } else for (uint st = 0; st < u.cc; st++) stage(r, st, u.ci[st], u.ai[st], u.co[st], u.ao[st], u);\n"
  " float4 c = clamp(r[12] + (K_spec(u) ? float4(r[5].rgb, 0) : float4(0)), 0.0f, 1.0f);\n"
  /* The executor's z-range policy for JSRF (CULL over 0..16777215). Under
   * MTLDepthClipModeClamp it cannot fire, which is what lets the early entry
