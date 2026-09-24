@@ -409,3 +409,13 @@ merging or carrying flags at split entries.
   - Open: EXACT collapsed from 4,430 to 604, and depth mismatches rose to
     14,028 of 14,032. The c0/c1 self-check reads the wrong slots (it prints
     0s). The agent is on these.
+- **G51.1 shadow: 13,980 of 13,981 exact** (`c39afeb`, run h2d-shadow5, tutorial,
+  player config). The executor truncates screen x/y toward zero to 1/16 px
+  (`prepare_vertices`, and the VSH epilogue), so D3D's k + 0.53125 lands on
+  k + 0.5. The host now snaps the same way. That single rule explains the EXACT
+  collapse, the depth failures (every full-screen quad's first row plus first
+  column: 640 + 480 − 1 = 1,119 px) and the logo's residue. The self-check
+  now reads the bias from c-37 − c-38: 13,981 as assumed, 0 different.
+  - Over-tolerance pixels: 3,152 (was 25.3M). Depth: 1 draw mismatching.
+  - The one left: flip 2078, a 306-vertex HUD text draw (fvf 1C4, 256x256
+    tex 0E) where the host covered 6,818 px and the executor 3,682.
