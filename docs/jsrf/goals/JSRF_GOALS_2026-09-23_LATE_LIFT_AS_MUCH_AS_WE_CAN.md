@@ -375,3 +375,14 @@ merging or carrying flags at split entries.
     278,676 of 278,676 registers exact; control 0; laziness 0; singular 0.
   - **Every per-draw input the host renderer needs now follows from D3D
     alone, with nothing left unchecked** in the tutorial.
+- **G51.1, first in-game comparison** (agent, `b3c0f15`; registration fix
+  `56d526d`). The host draws the pre-transformed 2D class from D3D state in
+  shadow, against the executor's own depth (read-only peek). Tutorial,
+  player's switches:
+  - 15,773 draws compared: 11,696 EXACT, 156 within tolerance, 3,921
+    mismatching. Pixels over tolerance: 10.0M of 342.7M.
+  - Control: 324.5M over tolerance, so the comparison bites.
+  - All 2D draws are LEQUAL with depth write on.
+  - Likely main cause: "index data changed before the token" = 14,699. The
+    host read indices from the dynamic index buffer after the game had reused
+    it; the executor draws D3D's pushbuffer copy. With the agent.
