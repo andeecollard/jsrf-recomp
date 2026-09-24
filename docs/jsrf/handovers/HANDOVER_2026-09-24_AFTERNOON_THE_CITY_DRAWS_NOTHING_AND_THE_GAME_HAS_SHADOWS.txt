@@ -1,0 +1,179 @@
+HANDOVER -- 24 September 2026 (afternoon)
+THE CITY DRAWS NOTHING, AND THE GAME HAS SHADOWS
+
+FOLLOWS HANDOVER_2026-09-24_THE_HOST_DRAWS_THE_TUTORIAL_AND_DEFERRED_SWAPS_ARE_107_FPS.txt
+(this morning). Everything in that file still stands. This one adds the
+day's player-driven hunt and SUPERSEDES its section 4 ("Next").
+
+Goals file (active): docs/jsrf/goals/JSRF_GOALS_2026-09-23_LATE_LIFT_AS_MUCH_AS_WE_CAN.md
+-- its tail ("Rokkaku-dai Heights", "Fog in the player's sessions, and the
+drop audit") carries every number below with its commit.
+
+Branch jsrf/g2-text-clobber-and-the-symbol-layer, pushed to origin/main.
+Main at the time of writing: 557f037 plus this handover's commit.
+JSRF.app: built from 557f037 (build-feav), signed, checked. The player's
+paths.conf is back to its pre-test state (no RECOMP_FOG_*, RECOMP_D3D8_HOST_*,
+DEPTH_ALWAYS or CLIP_AUDIT lines). Backups beside it: paths.conf.bak-20260924-*.
+
+
+====================================================================
+0. THE STATE, IN ONE PARAGRAPH
+====================================================================
+
+Rokkaku-dai Heights still shows sky, ground colour, HUD, characters and
+scaffolding, BUT NO BUILDINGS. That has been narrowed to one statement: the
+city's triangles reach the rasteriser and paint nothing.
+Ruled out, each by a player session:
+  - fog;
+  - dropped draws;
+  - the depth test;
+  - clipping.
+Along the way three real classes of silently dropped drawing were found and
+fixed:
+  - every fogged draw (two gates);
+  - points and lines of 1-2 indices;
+  - immediate-mode Begin/End.
+The last one is the game's full-screen stencil-shadow quad, so JSRF has
+had no shadows until today. The player confirmed the tutorial shadows look
+right.
+
+
+====================================================================
+1. WHAT LANDED THIS AFTERNOON
+====================================================================
+
+In the player's app, and verified in the tutorial with FLIP_PACE=0 and 0
+faults. The total cost is about 2-3% fps (86 -> 84), within noise per step.
+
+1. FOG IS DRAWN, NOT DROPPED (c8296c9, 81f005e, 0494f76, c295bb3, f78134d).
+   - Gate 1: nv2a_texture_copy_prepare accepted only the fog-off final
+     combiner (CW0 0xC/0xE, CW1 0x1C80). It now models the general final
+     combiner, fog factor and fog coordinate, following xemu's formulas.
+   - Gate 2: `if (M(0x2a4)) return "fog"` refused any FOG_ENABLE draw. The
+     unit tests went around the gate; one now goes through it.
+   - The host draws fog too (FF, VS, vertex-fog 2D).
+   - Switches:
+       RECOMP_FOG=0            restores the old refusal
+       RECOMP_FOG_IGNORE=1     control arm
+       RECOMP_FOG_TRACE=1      census of fog states
+       RECOMP_FOG_DRAW_TRACE=n per-draw d, f, clip w, model-view
+   - Rokkaku's state: LINEAR, params 2 / -0.00025, planar gen,
+     colour 0x5E77A5 (ABGR = (165,119,94), the orange haze).
+
+2. THE DROP AUDIT (7f759e0, 221013c; nv2a_drop.c,
+   diagnostics/jsrf_first_fault/drop_census.py).
+   - Every executor drop, skip or simplification reports:
+       [DROP] first ...        on the first occurrence;
+       [DROP] report window    every window;
+       [DROP] WARNING          above 1% of a window's batches.
+   - drop_census.py reads any session log and tabulates drawn against
+     dropped by reason, per window.
+   - Findings on old logs: fog, and in the 23 Sep 20:14 police session up to
+     10.4% of a window's draws were 1-2 index batches, dropped.
+
+3. POINTS AND LINES DRAW (fd29a52), as screen-space quads through the
+   triangle path:
+   - point size = SET_POINT_SIZE/8 px, sprites supported;
+   - lines are 1 px wide;
+   - RECOMP_PB_POINTS_LINES=0 turns it off.
+   Whether this cures the police flicker is UNTESTED: no police session has
+   run since.
+
+4. IMMEDIATE MODE EMITS VERTICES (ca03718, 5ea49ce), following xemu's
+   pgraph_finish_inline_buffer_vertex. SET_VERTEX3F/4F/DATA2F/2S/4S are now
+   decoded.
+   - The only in-game caller is CMGameGL's stencil-shadow quad (sub_001512E0,
+     tail 0x151330): a full-screen TRIANGLEFAN at diffuse (0,0,0,0.5),
+     stencil LEQUAL ref 1.
+   - The player: "Shadows look good in the tutorial".
+   - RECOMP_PB_IMMEDIATE=0 turns it off; RECOMP_PB_IMMEDIATE_TRACE=n traces
+     it.
+
+5. A primitive split across method calls was proved to be ONE batch
+   (jsrf_primitive_split). That hypothesis is closed.
+
+
+====================================================================
+2. ROKKAKU-DAI: WHAT IS RULED OUT, AND THE ONE STEP LEFT
+====================================================================
+
+Player sessions, logs preserved under
+jsrf-build/jsrf-first-fault/measure/:
+  rokkaku-0835, rokkaku-0848          the original: fog gate refusals
+  rokkaku-0930-fog1, rokkaku-0936-fog2 gate 2 found and opened
+  rokkaku-1041-trace                  fog trace + drop audit
+  rokkaku-1203-depthoff               depth test off + clip audit
+
+Ruled out:
+  - FOG: [FOG-DRAW] f = 0.85-0.97 on the traced fogged draws; d sane;
+    model-view and fog plane written.
+  - DROPS: [DROP] shows only 4/flip bump-map approximations. ~285 batches
+    per flip are all rasterised.
+  - DEPTH: with RECOMP_METAL_HW_DEPTH_ALWAYS=1, other areas show their
+    buildings in jumbled order. Rokkaku shows none.
+  - CLIPPING: the per-window clip audit in Rokkaku reads side 58%,
+    near ~380, far 0. That is the same shape as the Garage and tutorial.
+  - A RENDERER DIFFERENCE: host FF 52,343 exact of 55,298. Both sides
+    agree, so the fault is in shared input.
+
+Left: THE TRIANGLES PAINT NOTHING. Suspects, most likely first:
+  - texture alpha 0 under the alpha test: wrong bytes, format, address, DMA
+    context or swizzle for the city textures;
+  - a blend or final-combiner alpha of 0;
+  - colour mask.
+  The scaffolding (different textures) survives, which fits the first.
+  The agent is building RECOMP_INVISIBLE_DRAW=<n>. It flags batches with
+  large on-screen area and ~0 fragments passed, and prints why:
+    - each stage's texture format/address and decoded alpha stats;
+    - alpha test, blend, colour mask;
+    - the final combiner;
+    - diffuse alpha.
+  One player visit to Rokkaku with it should name the cause.
+
+
+====================================================================
+3. UNMERGED / HELD
+====================================================================
+
+- g56-defer-default-on (99f5f9c, pushed): RECOMP_METAL_DEFER_SWAP default
+  on, +24 fps. Held for one player session with RECOMP_METAL_DEFER_SWAP=1 and
+  RECOMP_METAL_DEBT_WATCH=1 (gameplay plus the graffiti editor). Not done yet.
+- worktree-agent-ac2142be51927d3a7: 58d0780 (VS draw mode, 0x1E94 decode,
+  coverage line) and db5590d, NOT merged. The rest of its work is merged via
+  the g53-*/g54-* branches.
+- build-preG56 (jsrf-build/jsrf-first-fault/build-preG56) is today's code
+  on the pre-G56 gen, for replaying 23 Sep padrecs. It builds and runs.
+
+
+====================================================================
+4. NEXT, IN ORDER
+====================================================================
+
+1. The invisible-draw instrument, then one player run through Rokkaku-dai.
+   Fix what it names.
+2. A police scene and the DJ K cutscene: does the flicker survive the
+   points/lines fix? Run the drop census on that log.
+3. The DEFER_SWAP player session, then cherry-pick 99f5f9c.
+4. Poison Jam cutscene: re-check with fog and shadows in.
+5. Merge 58d0780 (VS draw) after its A/B; then G52 (host presents).
+
+
+====================================================================
+5. LESSONS PAID FOR TODAY
+====================================================================
+
+- A COUNTER SET ASIDE AS "PROBABLY INERT" WAS THE BUG. final-cw=301,981 sat
+  in the first Rokkaku log. Read every refusal counter's trigger before
+  dismissing it.
+- UNIT TESTS THAT GO AROUND A GATE PROVE NOTHING ABOUT THE GATE. The fog tests
+  passed while a second refusal dropped every fogged draw in game.
+- REPLAYS DRIFT. The padrecs (22:50, 08:35) never reached their scenes, even
+  from the same save. "72 checkpoints ok" is input-only. For a specific
+  scene, a player session beats a replay.
+- A TOOL'S COPY OF THE APP ENGINE NEEDS THE BUNDLE'S Frameworks.
+  /Users/andrewcollard/jsrf-build/Frameworks now holds a copy, so a copied
+  engine runs from jsrf-build/jsrf-first-fault/. The harness refuses an
+  older binary unless JSRF_ALLOW_STALE=1.
+- A HYPOTHESIS THAT FITS THE PICTURE IS NOT A FINDING. "Fully fogged into the
+  haze" matched the screenshot exactly, and the per-draw trace refuted it in
+  one session.
