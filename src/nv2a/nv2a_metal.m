@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "nv2a_metal.h"
+#include "nv2a_debt_watch.h"   /* RECOMP_METAL_DEBT_WATCH: no-ops unless armed */
 #include "nv2a_ff.h"
 #include "../recomp_switch.h"
 #include "nv2a_metal_state.h"
@@ -3744,6 +3745,7 @@ unsigned long long nv2a_metal_sync_ns(void)
 
 void nv2a_metal_report(void)
 {
+    nv2a_debt_watch_report();
     fprintf(stderr,"[METAL] sync %llu calls (%llu already clean): %.1f ms draining"
             " the GPU, %.1f ms reading back and converting."
             "  A resident clear could remove the second only.\n",
@@ -4327,6 +4329,7 @@ int nv2a_metal_sync(void)
                 }
                 if (depth_dirty && depth_target) {
                     ++g_depth_syncs_skipped; depth_dirty = 0;
+                    nv2a_debt_watch_arm(depth_target, depth_target_size, NV2A_DEBT_DEPTH);
                 }
                 ++g_sync_drainless;
                 g_sync_drain_ns += mtl_now_ns()-_t_sync;
@@ -4478,6 +4481,7 @@ int nv2a_metal_sync(void)
             /* Counted, and the flag is cleared: leaving it set would make the
              * next sync try again and the switch would measure nothing. */
             ++g_depth_syncs_skipped;
+            nv2a_debt_watch_arm(depth_target,depth_target_size,NV2A_DEBT_DEPTH);
             depth_dirty=0;
         } else if(depth_dirty&&depth_target&&hw_state_on()&&hw_depth_tex) {
             ++sync_depth; ++g_depth_syncs_taken;
@@ -4721,6 +4725,7 @@ static void surface_slot_writeback(unsigned i)
     id<MTLTexture> tex = surf_slot[i].colour;
     uint32_t w = surf_slot[i].w, h = surf_slot[i].h, pitch = surf_slot[i].pitch;
     if (!dst || !tex || !w || !h) { ++g_slot_writeback_skipped; return; }
+    nv2a_debt_watch_paid(dst, (size_t)pitch * h);   /* the payment: guest RAM is about to be current */
     @autoreleasepool {
         size_t px = (size_t)w * h;
         int fmt565 = hw_565_on();
@@ -4916,6 +4921,7 @@ static int clear_unbound_slot(uint8_t *target, uint32_t pitch,
         /* The CPU clear is now skipped, so guest RAM for this surface is behind
          * the texture until the slot is rebound or dropped. */
         surf_slot[i].owes_guest_ram = 1;
+        nv2a_debt_watch_arm(surf_slot[i].target, surface_slot_bytes(i), NV2A_DEBT_COLOUR);
         ++g_resident_unbound_clears;
     }
     return 1;
@@ -5668,6 +5674,7 @@ static int surface_bind(uint8_t*target,size_t target_size,uint32_t w,uint32_t h,
      for(unsigned i=0;i<surface_slots_used();i++)
       if(surf_slot[i].valid&&surf_slot[i].colour==surface){
        surf_slot[i].owes_guest_ram=1;surface_dirty=0;
+       nv2a_debt_watch_arm(surf_slot[i].target,surface_slot_bytes(i),NV2A_DEBT_COLOUR);
        owed=1;++g_swap_deferred;break;}
      if(!owed)++g_swap_defer_noslot;}}
    ++surface_uploads;++g_sync_by_swap;g_sync_who=SYNC_WHO_SWAP;

@@ -45,7 +45,8 @@ endif()
 # engine binary's mtime tracks it -- run_common.sh's staleness check compares
 # the binary against every source under src/, and a file the engine does not
 # compile makes that check refuse every run forever.
-add_library(xbox_vsh STATIC nv2a_vsh.c nv2a_vsh_hlsl.c nv2a_vsh_msl.c nv2a_texture_copy.c nv2a_ff.c nv2a_metal_state.c nv2a_texture_decode.c)
+add_library(xbox_vsh STATIC nv2a_vsh.c nv2a_vsh_hlsl.c nv2a_vsh_msl.c nv2a_texture_copy.c nv2a_ff.c nv2a_metal_state.c nv2a_texture_decode.c
+            nv2a_debt_watch.c)
 target_include_directories(xbox_vsh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(APPLE)
     enable_language(OBJC)
