@@ -404,21 +404,29 @@ int d3d8_host_check_combiners(const D3D8HostDrawCheck *c, const D3D8ExecDrawText
  *   fog        FOG_ENABLE, and when fog is on FOG_GEN_MODE/FOG_MODE/FOG_PARAMS,
  *              from the inputs 0x195610 last emitted with (dirty 0x2000);
  *              FOG_COLOR from RenderState[119] at the draw (0x18EB80 is
- *              immediate).
+ *              immediate);
+ *   inverse    INVERSE_MODELVIEW 0x580..0x5AC (G42b), from the inputs the
+ *   model-view transform updater 0x1962B0 had the last time it WROTE them
+ *              (dirty 0x200, and lighting or a texgen needing eye normals);
+ *              compared where the draw uses them, not where WORLD*VIEW was
+ *              singular (the guest then sends stale stack).
  * The first three matter only to fixed-function 3D draws (the vertex shader
  * object's flags & 0x12 clear) and are compared only there; fog at every draw.
  * Floats are compared exactly and, failing that, within 1e-5 relative (or
  * 1e-6 absolute); the two are counted apart. */
-static const char *const k_ffv_name[4] = { "texgen", "texture transforms", "lighting", "fog" };
-static _Atomic unsigned long long s_fv_draws[4], s_fv_all[4], s_fv_words[4], s_fv_exact[4], s_fv_tol[4],
-                                  s_fv_noemit[4], s_fv_fresh[4], s_fv_lazy[4], s_fv_cur_only[4],
-                                  s_fv_emit_only[4], s_fv_unres[4];
+static const char *const k_ffv_name[D3D8_HOST_FFV_GROUPS] = { "texgen", "texture transforms", "lighting", "fog",
+                                                               "inverse model-view" };
+#define NG D3D8_HOST_FFV_GROUPS
+static _Atomic unsigned long long s_fv_draws[NG], s_fv_all[NG], s_fv_words[NG], s_fv_exact[NG], s_fv_tol[NG],
+                                  s_fv_noemit[NG], s_fv_fresh[NG], s_fv_lazy[NG], s_fv_cur_only[NG],
+                                  s_fv_emit_only[NG], s_fv_unres[NG];
+static _Atomic unsigned long long s_imv_needed, s_imv_norm, s_imv_blend, s_imv_sing, s_imv_mv_draws, s_imv_mv_exact;
 static _Atomic unsigned long long s_lt_lit, s_lt_lights[9], s_lt_dir, s_lt_point, s_lt_spot, s_lt_cm,
                                   s_lt_2s, s_lt_spec, s_lt_spb;
 static _Atomic unsigned long long s_tg_mode[4][6], s_tx_en[4], s_tx_case[D3D8FF_TX_CASES],
                                   s_fg_on, s_fg_table[4], s_fg_range, s_fg_colnz;
 static _Atomic unsigned long long s_fv_reg_mm[0x2000 / 4], s_fv_mm_total;
-static _Atomic unsigned s_fv_printed[4];
+static _Atomic unsigned s_fv_printed[NG];
 
 typedef struct { unsigned n; D3D8FFReg r[D3D8FF_LIGHT_REGS_MAX]; } FfvList;
 static void ffv_put(FfvList *l, uint32_t method, uint32_t value, int is_float)
@@ -456,6 +464,15 @@ static void ffv_fog_list(const D3D8FFFogIn *in, FfvList *l)
         ffv_put(l, 0x029Cu, o.mode, 0);
         for (unsigned k = 0; k < 3; ++k) ffv_put(l, 0x09C0u + 4u * k, o.params[k], 1);
     }
+}
+/* The 12 INVERSE_MODELVIEW words the transform updater wrote; none when it
+ * would not have written them, or the product was singular (stale stack). */
+static void ffv_imv_list(const D3D8FFInvMVIn *in, FfvList *l, D3D8FFInvMV *o)
+{
+    l->n = 0;
+    d3d8_ff_inverse_modelview(in, o);
+    if (!o->inverse_written || o->singular) return;
+    for (unsigned k = 0; k < 12; ++k) ffv_put(l, 0x0580u + 4u * k, o->inverse[k], 1);
 }
 static void ffv_light_list(const D3D8FFLightIn *in, FfvList *l, D3D8FFLights *o)
 {
@@ -597,6 +614,34 @@ int d3d8_host_check_ff_vertex(const D3D8HostDrawCheck *c, const D3D8ExecDrawText
             if (c->ffv_control) emit.r[0].value ^= 1u;
             bad += ffv_compare(D3D8_HOST_FFV_LIGHT, c, &emit, e->regs,
                                c->lt_emit_seen ? "as last emitted" : "at the draw, no emission seen");
+        }
+        /* inverse model-view: as last WRITTEN by 0x1962B0 (0x190A30), at
+         * draws that use it -- lighting, or a texgen needing eye normals. */
+        if (c->imv_cur.lighting || c->imv_cur.eye_normal_mask) {
+            const D3D8FFInvMVIn *in = c->imv_emit_seen ? &c->imv_emit : &c->imv_cur;
+            D3D8FFInvMV io, ic;
+            atomic_fetch_add(&s_imv_needed, 1);
+            if (!c->imv_emit_seen) atomic_fetch_add(&s_fv_noemit[D3D8_HOST_FFV_INVMV], 1);
+            if (c->imv_emit_fresh) atomic_fetch_add(&s_fv_fresh[D3D8_HOST_FFV_INVMV], 1);
+            if (in->normalize) atomic_fetch_add(&s_imv_norm, 1);
+            if (in->vertex_blend) atomic_fetch_add(&s_imv_blend, 1);
+            ffv_imv_list(in, &emit, &io);
+            if (io.singular) atomic_fetch_add(&s_imv_sing, 1);
+            else if (!io.inverse_written) atomic_fetch_add(&s_fv_unres[D3D8_HOST_FFV_INVMV], 1);
+            if (c->imv_emit_seen) { ffv_imv_list(&c->imv_cur, &cur, &ic); ffv_lazy(D3D8_HOST_FFV_INVMV, &emit, &cur, e->regs); }
+            /* MODELVIEW from the same emission, exactly: localises a 0x580
+             * mismatch to the product or to the inverse. */
+            if (c->imv_emit_seen && c->imv_emit_seq == c->imv_any_seq && io.emitted) {
+                unsigned k;
+                atomic_fetch_add(&s_imv_mv_draws, 1);
+                for (k = 0; k < 16; ++k) if (io.modelview[4u * (k % 4u) + k / 4u] != e->regs[(0x0480u + 4u * k) / 4u]) break;
+                if (k == 16) atomic_fetch_add(&s_imv_mv_exact, 1);
+            }
+            /* control: an exponent bit, so no value (a zero, one ulp) survives the tolerance */
+            if (c->ffv_control && emit.n) emit.r[0].value ^= 0x40000000u;
+            if (emit.n)
+                bad += ffv_compare(D3D8_HOST_FFV_INVMV, c, &emit, e->regs,
+                                   c->imv_emit_seen ? "as last written" : "at the draw, no emission seen");
         }
     }
     /* fog, every draw: the updater's registers as last emitted, and FOG_COLOR now. */
@@ -942,13 +987,15 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     for (unsigned k = 0; k < D3D8_HOST_FFC_N; ++k) o->ffc_word_mismatch[k] = atomic_load(&s_ffc_word_mm[k]);
     o->ffc_tally_overflow = atomic_load(&s_ffc_tally_overflow);
     ffc_lock(); o->ffc_tally_pairs = s_ffc_tally_used; ffc_unlock();
-    for (unsigned g = 0; g < 4; ++g) {
+    for (unsigned g = 0; g < NG; ++g) {
         o->ffv_draws[g] = atomic_load(&s_fv_draws[g]); o->ffv_all[g] = atomic_load(&s_fv_all[g]);
         o->ffv_words[g] = atomic_load(&s_fv_words[g]); o->ffv_exact[g] = atomic_load(&s_fv_exact[g]);
         o->ffv_tol[g] = atomic_load(&s_fv_tol[g]); o->ffv_noemit[g] = atomic_load(&s_fv_noemit[g]);
         o->ffv_fresh[g] = atomic_load(&s_fv_fresh[g]); o->ffv_lazy[g] = atomic_load(&s_fv_lazy[g]);
         o->ffv_cur_only[g] = atomic_load(&s_fv_cur_only[g]); o->ffv_emit_only[g] = atomic_load(&s_fv_emit_only[g]);
         o->ffv_unres[g] = atomic_load(&s_fv_unres[g]);
+    }
+    for (unsigned g = 0; g < 4; ++g) {
         o->tx_enabled[g] = atomic_load(&s_tx_en[g]);
         for (unsigned k = 0; k < 6; ++k) o->tg_mode[g][k] = atomic_load(&s_tg_mode[g][k]);
         o->fg_table[g] = atomic_load(&s_fg_table[g]);
@@ -959,6 +1006,9 @@ void d3d8_host_get_stats(D3D8HostStats *o)
     o->lt_spot = atomic_load(&s_lt_spot); o->lt_colormat = atomic_load(&s_lt_cm); o->lt_twosided = atomic_load(&s_lt_2s);
     o->lt_specular = atomic_load(&s_lt_spec); o->lt_sp_from_builder = atomic_load(&s_lt_spb);
     o->fg_on = atomic_load(&s_fg_on); o->fg_range = atomic_load(&s_fg_range); o->fg_color_nonzero = atomic_load(&s_fg_colnz);
+    o->imv_needed = atomic_load(&s_imv_needed); o->imv_normalize = atomic_load(&s_imv_norm);
+    o->imv_blend = atomic_load(&s_imv_blend); o->imv_singular = atomic_load(&s_imv_sing);
+    o->imv_mv_draws = atomic_load(&s_imv_mv_draws); o->imv_mv_exact = atomic_load(&s_imv_mv_exact);
     o->ffv_reg_mismatch_total = atomic_load(&s_fv_mm_total);
     for (unsigned k = 0; k < 11; ++k) {
         o->st_compared[k] = atomic_load(&s_st_cmp[k]); o->st_match[k] = atomic_load(&s_st_match[k]);
@@ -1054,11 +1104,20 @@ void d3d8_host_report(const char *why)
                 st.ffv_draws[3], st.ffv_all[3], st.ffv_words[3], st.ffv_exact[3], st.ffv_tol[3], st.fg_on,
                 st.fg_table[0], st.fg_table[1], st.fg_table[2], st.fg_table[3], st.fg_range, st.fg_color_nonzero,
                 st.ffv_noemit[3]);
-        for (unsigned g = 1; g < 4; ++g)
+        fprintf(stderr, "[D3D8-MIRROR] %s ff inverse model-view: fixed-function 3D draws needing it %llu, compared %llu,"
+                        " all 12 registers matching in %llu | registers compared=%llu EXACT=%llu within-tolerance=%llu"
+                        " | NORMALIZENORMALS on %llu, vertex blend %llu, singular (stale stack sent, not compared) %llu,"
+                        " not written %llu | MODELVIEW from the same emission: draws %llu, all 16 words exact %llu"
+                        " | before any emission %llu\n", why,
+                st.imv_needed, st.ffv_draws[4], st.ffv_all[4], st.ffv_words[4], st.ffv_exact[4], st.ffv_tol[4],
+                st.imv_normalize, st.imv_blend, st.imv_singular, st.ffv_unres[4], st.imv_mv_draws, st.imv_mv_exact,
+                st.ffv_noemit[4]);
+        for (unsigned g = 1; g < NG; ++g)
             fprintf(stderr, "[D3D8-MIRROR] %s ff %s laziness: emitted in this draw's flush %llu of %llu;"
                             " state at the draw transcribes differently from the last emission in %llu"
                             " (executor matches the draw-time state only %llu, the last emission only %llu)\n",
-                    why, g == 1 ? "texture transform" : g == 2 ? "lighting" : "fog", st.ffv_fresh[g], st.ffv_draws[g],
+                    why, g == 1 ? "texture transform" : g == 2 ? "lighting" : g == 3 ? "fog" : "inverse model-view",
+                    st.ffv_fresh[g], st.ffv_draws[g],
                     st.ffv_lazy[g], st.ffv_cur_only[g], st.ffv_emit_only[g]);
         if (st.ffv_reg_mismatch_total) {
             unsigned shown = 0;

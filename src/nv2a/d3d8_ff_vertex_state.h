@@ -9,6 +9,8 @@
  *   fog                the lazy updater 0x00195610 (dirty bit 0x2000), the
  *                      part before the final-combiner tail G43 transcribed
  *   fog colour         SetRenderState_FogColor 0x0018EB80 (immediate)
+ *   inverse model-view the lazy transform updater 0x001962B0 (dirty bit 0x200)
+ *                      with 0x00190750 (WORLD*VIEW) and 0x00190A30 (G42b)
  *
  * See experiments/d3d8_boundary/ff_lighting_fog_notes.md for the full read.
  *
@@ -43,9 +45,10 @@ enum {
     D3D8FF_RS_EMISSIVEMATERIALSOURCE     = 103,  /* BACKSPECULAR .. EMISSIVE [106..113] */
     D3D8FF_RS_BACKAMBIENT       = 104,  /* 0x19E280 [114] */
     D3D8FF_RS_AMBIENT           = 105,  /* 0x19E284 [115] */
+    D3D8FF_RS_VERTEXBLEND       = 118,  /* 0x19E2B8 [137] dirty 0x200 (0x18F010) */
     D3D8FF_RS_FOGCOLOR          = 119,  /* 0x19E2BC [138] */
     D3D8FF_RS_TWOSIDEDLIGHTING  = 122,  /* 0x19E2C8 [141] */
-    D3D8FF_RS_NORMALIZENORMALS  = 123   /* 0x19E2CC [142] */
+    D3D8FF_RS_NORMALIZENORMALS  = 123   /* 0x19E2CC [142] dirty 0x200 (0x18EC80) */
 };
 /* XDK D3DTSS word indices read here (per stage, 32 words at 0x19DEE0). */
 enum {
@@ -143,6 +146,45 @@ typedef struct {
     D3D8FFReg reg[D3D8FF_LIGHT_REGS_MAX];  /* in emission order */
 } D3D8FFLights;
 int d3d8_ff_lights(const D3D8FFLightIn *in, D3D8FFLights *out);
+
+/* ---- the inverse model-view: 0x001962B0 (dirty 0x200) and 0x00190A30 ----
+ * The transform updater 0x1962B0 forms WORLD*VIEW with 0x190750 (SSE,
+ * float), writes its transpose to MODELVIEW 0x0480, and -- when lighting is
+ * on or a texgen mode needs eye-space normals (device+0x450) -- inverts it
+ * with 0x190A30 and writes the first 12 words of the result to
+ * INVERSE_MODELVIEW 0x0580 (one packet, header 0x300580). Nothing at all is
+ * written when bit 31 of the dirty word 0x19DED8 is set or the vertex shader
+ * object has flags 0x12. RS[123] NORMALIZENORMALS, RS[118] VERTEXBLEND and
+ * SetTransform(WORLD) set dirty 0x200, LIGHTING and SetTransform(VIEW) 0x1200;
+ * SetTextureState_TexCoordIndex, which sets device+0x450, does NOT (0x47F). */
+typedef struct {
+    uint32_t dirty;             /* [0x19DED8] at the updater's entry; bit 31 set: nothing written */
+    uint32_t vs_flags;          /* [device+0x380]+4; 0x12 set: nothing written */
+    uint32_t eye_normal_mask;   /* device+0x450 (texgen stages needing eye normals) */
+    uint32_t lighting;          /* RS[92] */
+    uint32_t normalize;         /* RS[123] NORMALIZENORMALS */
+    uint32_t vertex_blend;      /* RS[118]: 0x5C0.. for WORLD1-3 (not transcribed); 0x580 is the same */
+    uint32_t world[16];         /* device+0x8D0: D3DTS_WORLD as SetTransform stored it */
+    uint32_t view[16];          /* device+0x750: D3DTS_VIEW */
+} D3D8FFInvMVIn;
+typedef struct {
+    int      emitted;           /* 0x1962B0 wrote MODELVIEW (and the rest) */
+    int      inverse_written;   /* ... and INVERSE_MODELVIEW 0x0580 */
+    int      singular;          /* WORLD*VIEW has det == 0: 0x190A30 returned -1 without writing and
+                                 * the guest sent 12 stale stack words; inverse[] is not meaningful */
+    uint32_t modelview[16];     /* WORLD*VIEW row-major, float words; MODELVIEW 0x0480 + 4k = modelview[4(k%4) + k/4] */
+    uint32_t inverse[12];       /* INVERSE_MODELVIEW 0x0580 + 4k, float words */
+} D3D8FFInvMV;
+void d3d8_ff_inverse_modelview(const D3D8FFInvMVIn *in, D3D8FFInvMV *out);
+/* 0x00190750: out = a * b, 4x4 row-major, SSE float in the guest's order. */
+void d3d8_ff_matmul(uint32_t out[16], const uint32_t a[16], const uint32_t b[16]);
+/* 0x00190A30: out (16 float words, row-major) = the inverse of m, by
+ * cofactors, x87. With `scale` (the caller passes NORMALIZENORMALS == 0) the
+ * cofactors are multiplied by copysign(rsqrt(det^2), det) using D3D's own
+ * rsqrt (0x190930), i.e. an approximate 1/det; without, only det's sign is
+ * applied (the adjugate, up to sign), since the normals are renormalised.
+ * Returns -1, leaving out untouched, when det == 0 exactly; else 0. */
+int d3d8_ff_inverse(uint32_t out[16], const uint32_t m[16], int scale);
 
 /* The guest's float helpers, exposed for the unit test. */
 double d3d8_ff_rsqrt(float x);                         /* 0x00190930 */

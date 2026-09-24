@@ -4,8 +4,8 @@ XDK 4134, read from the XBE with capstone under `/usr/bin/python3` (D3D
 section VA 0x0018CB40, raw 0x0017D000). Host transcription:
 `src/nv2a/d3d8_ff_vertex_state.{h,c}`; hand-derived vectors:
 `diagnostics/jsrf_first_fault/d3d8_ff_vertex_state_test.c` (ctest
-`jsrf_d3d8_ff_vertex_state`, 259 checks). The per-draw check is
-`d3d8_host_check_ff_vertex` (`src/nv2a/d3d8_host.c`), unit test
+`jsrf_d3d8_ff_vertex_state`, 259 checks; 395 with G42b's inverse
+model-view). The per-draw check is `d3d8_host_check_ff_vertex` (`src/nv2a/d3d8_host.c`), unit test
 `d3d8_ffv_check_test.c` (ctest `jsrf_d3d8_ffv_check`). Companion to
 `ff_combiner_notes.md` (G43).
 
@@ -58,7 +58,7 @@ updater, and all bits but 0xC0000070 are then cleared:
 | 0x2000 | **0x195610** | **fog**, then the final combiner (G43's tail) |
 | 0x400 | **0x1957F0** | **texture matrices** |
 | 0x1000 | **0x195F80** | **lighting and material** |
-| 0x200 | 0x1962B0 | model-view 0x480, inverse model-view 0x580, composite 0x680 (G39 checks 0x480/0x680) |
+| 0x200 | **0x1962B0** | model-view 0x480, **inverse model-view 0x580** (G42b), composite 0x680 (G39 checks 0x480/0x680) |
 
 Who sets them, for the state here:
 - SetRenderState (0x18E960), deferred states through the table at 0x1C4070:
@@ -70,7 +70,11 @@ Who sets them, for the state here:
   0x200, TEXTURE0-3 0x400, WORLD0-3 0x200.
 - SetMaterial (0x18CDA0): copies 17 words to device+0x9F0, 0x1000.
 - SetLight (0x18DC00), LightEnable (0x18DDE0): 0x1000.
-- SetTextureState_TexCoordIndex (0x18F060): 0x47F.
+- SetTextureState_TexCoordIndex (0x18F060): 0x47F -- not 0x200, although it
+  sets the device+0x450 bit that makes 0x1962B0 write the inverse model-view.
+- NORMALIZENORMALS (RS 123, 0x18EC80: NORMALIZE_ENABLE 0x03A4 at once) and
+  VERTEXBLEND (RS 118, 0x18F010: 0x0328 at once): 0x200. States from 117 on
+  go through the per-state function table 0x199FDC, not 0x1C4070.
 
 ## Render-state indices (4134), each checked by its dirty bit and its reader
 
@@ -252,14 +256,72 @@ float one operation per statement, with FP contraction off. So it should
 match the recompiled guest bit for bit; the check counts exact matches and
 matches within 1e-5 relative apart, so any residual shows up as a number.
 
+## The inverse model-view: 0x1962B0 and 0x190A30 (G42b, lazy, dirty 0x200)
+
+**0x1962B0** (called last by the flusher, argument the device):
+
+1. Returns at once when bit 31 of the dirty word 0x19DED8 is set (`js` at
+   0x1962C6; the flusher has not yet rewritten the word) or the vertex shader
+   object has flags 0x12. Who sets bit 31 is not identified; it survives the
+   flusher's `and 0xC0000070`.
+2. WV = 0x190750(WORLD at device+0x8D0, VIEW at device+0x750); MODELVIEW
+   0x0480 (16 words) via 0x190FB0, which writes the transpose.
+3. **Only if device+0x450 != 0 or LIGHTING (RS 92)**: 0x190A30(out, WV,
+   NORMALIZENORMALS == 0) into a stack buffer, then INVERSE_MODELVIEW 0x0580
+   = its first 12 words, header 0x300580, `rep movsd` -- the return value is
+   ignored.
+4. VERTEXBLEND 0: COMPOSITE 0x0680 = transpose(WV * device+0x470). Otherwise
+   COMPOSITE = device+0x470 alone and, for WORLD1-3 (device+0x910..), the
+   same pair into MODELVIEW1-3 (0x04C0 + 0x40i) and INVERSE_MODELVIEW1-3
+   (0x05C0 + 0x40i, header 0x4004C0 + 0xFFF00100). 0x580 itself is the same
+   either way; the blend matrices are not transcribed.
+
+**0x190750** (SSE, float): row i of out = a[i][0] b.row0 + a[i][1] b.row1 +
+a[i][2] b.row2 + a[i][3] b.row3, summed ((0 + 1) + 2) + 3, one `mulps` /
+`addps` each.
+
+**0x190A30** (x87 throughout; stdcall, `ret 0xC`): the inverse of M (row-major
+m0..m15) by cofactors. Phase one (to 0x190BE2) forms the 2x2 minors of
+columns 0-1 and from them output rows 2-3; phase two the minors of columns
+2-3 and output rows 0-1; each 3x3 cofactor is three products summed left to
+right. Some minors are rounded to float (`fstp dword` to a stack slot) and
+some stay on the x87 stack in double -- the transcription keeps each exactly
+where the guest does. The output is the inverse
+**row-major, not transposed**: word 4r + c = cofactor C(c,r) / det, so the 12
+words at 0x0580 are rows 0-2 of M^-1 (the normal transform needs (M^-1)^T,
+and the NV2A takes its rows as dot-product vectors, so no transpose is
+needed).
+
+- det = C00 m0 + ... down column 0, in double: `s14 m12 + s10 m8 + s0c m4 +
+  s1c m0`, the four cofactors already rounded to float.
+- `fst` rounds a copy to float, `fcomp [0x1C43D0]` (+0.0) tests the DOUBLE:
+  **det == 0 exactly returns -1 and writes nothing** (C3 set, `test ah,
+  0x44; jp` not taken). The caller then sends 12 words of stale stack. A NaN
+  det (C3 C2 C0) is computed through.
+- **Scale (NORMALIZENORMALS off)**: s = |rsqrt(float(detf * detf))| with
+  det's sign bit (`and 0x80000000; or`), rsqrt being D3D's 0x190930; each word
+  = float(s * slot). The rsqrt's one Newton step from a bit-trick guess makes
+  1/det approximate: diag(3,3,3,1) gives 0x3EAAA886 (0.3333170) for 1/3,
+  5e-5 relative -- beyond the check's tolerance, so only exactness will do.
+- **No scale (NORMALIZENORMALS on)**: each word = slot XOR det's sign bit:
+  the adjugate up to sign; the NV2A renormalises the normals. (The note that
+  stood here before G42b had the sense of this flag reversed.)
+
+Transcribed as `d3d8_ff_matmul`, `d3d8_ff_inverse` and
+`d3d8_ff_inverse_modelview`. Checked three ways: hand-derived vectors in
+`d3d8_ff_vertex_state_test.c` (identity; a scale with translation, scaled and
+unscaled; a negative determinant, with the sign of every zero traced; det 27,
+where the approximate rsqrt shows; a singular matrix; the product's
+summation order); and **the recompiled guest's own code run beside it**:
+`imv_gen_crosscheck.c` extracts sub_00190A30 / 00190930 / 00190750 from the
+gen tree and compares word for word -- 3,000,000 random matrices (dense,
+sparse, wide exponents; both flag senses), 0 mismatches in the inverse or the
+product, 512,362 singular on both sides, and the flipped-flag control
+differing in 2,487,408 of 2,487,638.
+
 ## Not transcribed
 
 - SPECULAR_PARAMS (0x195E40/0x190850): not reached by JSRF in the captures.
-- INVERSE_MODELVIEW 0x0580 (0x190A30, from 0x1962B0 when lighting or a
-  texgen needs eye normals): a 4x4 cofactor inverse scaled by rsqrt(det^2)
-  (or only det's sign without NORMALIZENORMALS). Written 61,841 times in the
-  load-menu trace; it is the one lighting input G39's transform check does
-  not cover.
 - The pass-through program selection in 0x1903A0 (fog table mode), for G51.1.
 
 ## The check in the D3D mirror
@@ -284,6 +346,7 @@ latched at the token):
 | texture transforms | fixed-function 3D | MATRIX_ENABLE[0..3]; MATRIX[s] where enabled and resolved |
 | lighting | fixed-function 3D | everything the updater wrote (4 unlit, 29 with one directional light) |
 | fog | every draw | FOG_ENABLE; GEN_MODE, MODE, PARAMS when on; FOG_COLOR |
+| inverse model-view | fixed-function 3D draws with LIGHTING or device+0x450 set at the draw | INVERSE_MODELVIEW 0x0580..0x05AC, from the last emission that WROTE them |
 
 Report lines (every 20,000 draws and at exit):
 
@@ -292,16 +355,30 @@ Report lines (every 20,000 draws and at exit):
 [D3D8-MIRROR] <why> ff texture transforms: ... registers compared=N EXACT=N within-tolerance=N | stages enabled a/b/c/d, layouts A-H ... unresolved N | before any emission N
 [D3D8-MIRROR] <why> ff lighting: ... | lit N (by light count 0-8: ...; lights directional N point N spot N), colour material N, two-sided N, specular (SPECULAR_PARAMS not transcribed) N, SPECULAR_ENABLE last written by the combiner builder N | before any emission N
 [D3D8-MIRROR] <why> ff fog: draws N, all registers matching in N | ... | fog on N (table NONE/EXP/EXP2/LINEAR a/b/c/d, range N), fog colour nonzero N | before any emission N
-[D3D8-MIRROR] <why> ff {texture transform,lighting,fog} laziness: emitted in this draw's flush N of N; state at the draw transcribes differently from the last emission in N (executor matches the draw-time state only N, the last emission only N)
+[D3D8-MIRROR] <why> ff inverse model-view: fixed-function 3D draws needing it N, compared N, all 12 registers matching in N | registers compared=N EXACT=N within-tolerance=N | NORMALIZENORMALS on N, vertex blend N, singular (stale stack sent, not compared) N, not written N | MODELVIEW from the same emission: draws N, all 16 words exact N | before any emission N
+[D3D8-MIRROR] <why> ff {texture transform,lighting,fog,inverse model-view} laziness: emitted in this draw's flush N of N; state at the draw transcribes differently from the last emission in N (executor matches the draw-time state only N, the last emission only N)
 [D3D8-MIRROR] <why> ff vertex-state reg XXXX: N mismatches          (only when nonzero)
 [D3D8-MIRROR] draw N ff <group> MISMATCH (...) reg XXXX: d3d ... | exec ...   (first 8 per group)
 [D3D8-MIRROR] G42 constants: rsqrt ... fog equal-range scale ..., eye ...
 ```
 
 `RECOMP_D3D8_MIRROR_CONTROL=1` flips one expected word per group (texgen S0,
-TEXTURE_MATRIX_ENABLE0, the first lighting register, FOG_ENABLE), so every
-compared draw must fail in every group; the census counters still count the
-real values.
+TEXTURE_MATRIX_ENABLE0, the first lighting register, FOG_ENABLE, and an
+exponent bit of INVERSE_MODELVIEW[0] -- a low bit would pass the tolerance),
+so every compared draw must fail in every group; the census counters still
+count the real values.
+
+The inverse model-view's hook is on 0x1962B0's entry (`d3d8m_xform_entry`):
+it drops calls that return at once, numbers every other call (all write
+MODELVIEW), and records the inputs of those that also write 0x580. Because
+TexCoordIndex does not dirty 0x200, a NORMAL_MAP texgen switched on under
+lighting-off can leave 0x580 older than the draw's WORLD/VIEW until
+something else sets 0x200; comparing against the last WRITING emission is
+what the executor holds, and the laziness line counts where the draw-time
+state would have differed. "MODELVIEW from the same emission" compares the
+16 words at 0x480 exactly with the transposed product whenever the last
+emission of any kind was the writing one: a 0x580 mismatch with 0x480 exact
+is in the inverse; with 0x480 wrong, in the product or its inputs.
 
 Cost: each check item now carries the lighting inputs twice (1.4 KB each),
 ~11.8 KB per slot, so the 8,192-slot queue is ~96 MB once the ring has cycled

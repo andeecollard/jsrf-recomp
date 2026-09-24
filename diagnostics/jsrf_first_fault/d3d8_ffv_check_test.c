@@ -8,7 +8,9 @@
  * state would transcribe differently is counted as a laziness disagreement
  * with the side the executor matched; SPECULAR_ENABLE follows whichever of
  * the light updater and the combiner builder wrote last; and the positive
- * control fails every group on every draw it compares. */
+ * control fails every group on every draw it compares. G42b's inverse
+ * model-view (cases 11-18) follows the same pattern, compared only at draws
+ * that light or use an eye-normal texgen, and never from a singular product. */
 #include "d3d8_host.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +85,26 @@ static void exec_from(const D3D8FFTexXformIn *tx, const D3D8FFLightIn *lt, const
         for (unsigned k = 0; k < 3; ++k) e.regs[(0x9C0u + 4u * k) / 4u] = fo.params[k];
     }
     e.regs[0x2A8u / 4u] = d3d8_ff_fog_color(c.ffv_fog_color);
+}
+/* G42b: a lit draw with a WORLD*VIEW that inverts cleanly (WORLD a scale
+ * and translation, VIEW a translation), last written in this draw's flush. */
+static void imv_setup(void)
+{
+    static const float Wd[16] = { 2,0,0,0, 0,3,0,0, 0,0,.5f,0, 1,2,3,1 };
+    static const float Vw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,5,1 };
+    setup();
+    for (unsigned i = 0; i < 16; ++i) { c.imv_emit.world[i] = W(Wd[i]); c.imv_emit.view[i] = W(Vw[i]); }
+    c.imv_emit.lighting = 1; c.imv_emit.dirty = 0x1200;
+    c.imv_cur = c.imv_emit;
+    c.imv_emit_seen = 1; c.imv_emit_fresh = 1; c.imv_emit_seq = c.imv_any_seq = 7;
+}
+/* The executor's MODELVIEW and INVERSE_MODELVIEW as the transcription says
+ * 0x1962B0 wrote them from `in`. */
+static void exec_imv(const D3D8FFInvMVIn *in, D3D8FFInvMV *o)
+{
+    d3d8_ff_inverse_modelview(in, o);
+    for (unsigned k = 0; k < 16; ++k) e.regs[(0x480u + 4u * k) / 4u] = o->modelview[4u * (k % 4u) + k / 4u];
+    for (unsigned k = 0; k < 12; ++k) e.regs[(0x580u + 4u * k) / 4u] = o->inverse[k];
 }
 #define D(f, g) (st.f[g] - before.f[g])
 #define D1(f) (st.f - before.f)
@@ -195,6 +217,86 @@ int main(void)
     setup(); c.ffv_valid = 0; exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1);
     run();
     for (int g = 0; g < 4; ++g) CHECK(D(ffv_draws, g) == 0);
+
+    /* 11. The inverse model-view: the 12 words 0x190A30 wrote at the last
+     * writing emission of 0x1962B0, at a draw that lights. */
+    {
+        enum { IV = D3D8_HOST_FFV_INVMV };
+        D3D8FFInvMV io;
+        imv_setup(); exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1); exec_imv(&c.imv_emit, &io);
+        d3d8_host_get_stats(&before);
+        CHECK(d3d8_host_check_ff_vertex(&c, &e) == 1);
+        d3d8_host_get_stats(&st);
+        CHECK(D(ffv_draws, IV) == 1 && D(ffv_all, IV) == 1);
+        CHECK(D(ffv_words, IV) == 12 && D(ffv_exact, IV) == 12 && D(ffv_tol, IV) == 0);
+        CHECK(D1(imv_needed) == 1 && D1(imv_singular) == 0 && D1(imv_normalize) == 0);
+        CHECK(D1(imv_mv_draws) == 1 && D1(imv_mv_exact) == 1);   /* MODELVIEW from the same emission */
+        CHECK(D(ffv_lazy, IV) == 0 && D(ffv_fresh, IV) == 1 && D(ffv_noemit, IV) == 0);
+        /* the other four groups are unaffected */
+        for (int g = 0; g < 4; ++g) CHECK(D(ffv_all, g) == 1);
+
+        /* 12. One word wrong: a mismatch, in that register's counter; one ulp
+         * off is within tolerance and counted apart. */
+        { unsigned long long r0 = d3d8_host_ffv_reg_mismatches(0x5A8);
+          e.regs[0x5A8u / 4u] ^= 0x00400000u;
+          run();
+          CHECK(D(ffv_all, IV) == 0 && d3d8_host_ffv_reg_mismatches(0x5A8) == r0 + 1);
+          e.regs[0x5A8u / 4u] ^= 0x00400000u; e.regs[0x5A8u / 4u] += 1u;
+          run();
+          CHECK(D(ffv_all, IV) == 1 && D(ffv_tol, IV) == 1); }
+
+        /* 13. Neither lighting nor an eye-normal texgen at the draw: 0x580 is
+         * not used, and not compared, however stale. */
+        imv_setup(); c.imv_cur.lighting = 0; exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1);
+        run();
+        CHECK(D(ffv_draws, IV) == 0 && D1(imv_needed) == 0);
+        /* ... but an eye-normal texgen alone needs it. */
+        c.imv_cur.eye_normal_mask = 1; exec_imv(&c.imv_emit, &io);
+        run();
+        CHECK(D(ffv_draws, IV) == 1 && D(ffv_all, IV) == 1);
+
+        /* 14. A singular WORLD*VIEW: the guest sent 12 stale stack words.
+         * Counted, not compared. */
+        imv_setup(); c.imv_emit.world[0] = c.imv_emit.world[5] = c.imv_emit.world[10] = 0;
+        c.imv_cur = c.imv_emit;
+        exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1);
+        run();
+        CHECK(D1(imv_needed) == 1 && D1(imv_singular) == 1 && D(ffv_draws, IV) == 0);
+
+        /* 15. Laziness: WORLD changed after the last writing emission. The
+         * executor holds the emission, so the check passes and the counter
+         * names the side; holding the draw-time state instead fails. */
+        imv_setup(); exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1); exec_imv(&c.imv_emit, &io);
+        c.imv_cur.world[0] = W(3.0f);
+        run();
+        CHECK(D(ffv_all, IV) == 1 && D(ffv_lazy, IV) == 1 && D(ffv_emit_only, IV) == 1);
+        exec_imv(&c.imv_cur, &io);
+        run();
+        CHECK(D(ffv_all, IV) == 0 && D(ffv_cur_only, IV) == 1);
+
+        /* 16. MODELVIEW last came from a later emission that did not write
+         * 0x580 (lighting was off then): the 0x480 cross-check is skipped. */
+        imv_setup(); exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1); exec_imv(&c.imv_emit, &io);
+        c.imv_any_seq = c.imv_emit_seq + 1;
+        run();
+        CHECK(D(ffv_all, IV) == 1 && D1(imv_mv_draws) == 0);
+        /* and a wrong MODELVIEW word from the same emission is seen. */
+        c.imv_any_seq = c.imv_emit_seq; e.regs[0x484u / 4u] ^= 1u;
+        run();
+        CHECK(D1(imv_mv_draws) == 1 && D1(imv_mv_exact) == 0 && D(ffv_all, IV) == 1);
+
+        /* 17. NORMALIZENORMALS on: the adjugate, counted. */
+        imv_setup(); c.imv_emit.normalize = c.imv_cur.normalize = 1;
+        exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1); exec_imv(&c.imv_emit, &io);
+        run();
+        CHECK(D(ffv_all, IV) == 1 && D1(imv_normalize) == 1);
+
+        /* 18. Positive control: the inverse model-view fails too. */
+        imv_setup(); exec_from(&c.tx_emit, &c.lt_emit, &c.fg_emit, -1); exec_imv(&c.imv_emit, &io);
+        c.ffv_control = 1;
+        run();
+        for (int g = 0; g < 5; ++g) { CHECK(D(ffv_draws, g) == 1); CHECK(D(ffv_all, g) == 0); }
+    }
 
     d3d8_host_report("test");
     printf("d3d8_ffv_check: all pass\n");

@@ -288,6 +288,34 @@ void d3d8m_lights_entry(void)
     d3d8m_lt_read(&m_lt_emit);
     m_lt_emit_seen = 1; ++m_lt_emits; m_lt_seq = ++m_seq;
 }
+/* G42b: hooked on entry to the transform updater 0x1962B0 (dirty 0x200).
+ * Every call that gets past its two early-outs writes MODELVIEW; only those
+ * with lighting or an eye-normal texgen also write INVERSE_MODELVIEW 0x0580,
+ * and those are the emissions the executor's 0x580 comes from. Both are
+ * numbered, so the check knows when MODELVIEW came from the same one. */
+static D3D8FFInvMVIn m_imv_emit;
+static uint32_t m_imv_emit_seen, m_imv_emits, m_imv_emits_at_draw, m_imv_seq, m_imv_any_seq;
+static void d3d8m_imv_read(D3D8FFInvMVIn *in)
+{
+    uint32_t d = MEM32(0x0019DCE0u);
+    memset(in, 0, sizeof *in);
+    in->dirty = MEM32(0x0019DED8u);
+    in->vs_flags = d3d8m_vs_flags(d);
+    in->eye_normal_mask = MEM32(d + 0x450u);
+    in->lighting = RS(D3D8FF_RS_LIGHTING); in->normalize = RS(D3D8FF_RS_NORMALIZENORMALS);
+    in->vertex_blend = RS(D3D8FF_RS_VERTEXBLEND);
+    for (unsigned i = 0; i < 16; ++i) { in->world[i] = MEM32(d + 0x8D0u + 4u * i); in->view[i] = MEM32(d + 0x750u + 4u * i); }
+}
+void d3d8m_xform_entry(void)
+{
+    D3D8FFInvMVIn in;
+    if (!d3d8m_on()) return;
+    d3d8m_imv_read(&in);
+    if ((in.dirty & 0x80000000u) || (in.vs_flags & 0x12u)) return;       /* 0x1962C6, 0x1962D5 */
+    m_imv_any_seq = ++m_seq;
+    if (!in.eye_normal_mask && !in.lighting) return;                     /* 0x19631E: no 0x580 */
+    m_imv_emit = in; m_imv_emit_seen = 1; ++m_imv_emits; m_imv_seq = m_imv_any_seq;
+}
 /* Hooked on entry to 0x197F90, before it runs. With a pixel shader bound it
  * returns at once and writes nothing, so that call is not an emission and the
  * registers still hold the previous one's words. */
@@ -347,6 +375,9 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     c.lt_emit_seen = m_lt_emit_seen; c.lt_emit = m_lt_emit; d3d8m_lt_read(&c.lt_cur);
     c.lt_emit_fresh = m_lt_emits != m_lt_emits_at_draw; m_lt_emits_at_draw = m_lt_emits;
     c.lt_emit_seq = m_lt_seq; c.sp_emit_seq = m_sp_seq; c.sp_emit_val = m_sp_val;
+    c.imv_emit_seen = m_imv_emit_seen; c.imv_emit = m_imv_emit; d3d8m_imv_read(&c.imv_cur);
+    c.imv_emit_fresh = m_imv_emits != m_imv_emits_at_draw; m_imv_emits_at_draw = m_imv_emits;
+    c.imv_emit_seq = m_imv_seq; c.imv_any_seq = m_imv_any_seq;
     /* G40: the bound textures come from the DEVICE, not from a SetTexture
      * hook. XbSymbolDatabase's offset dump names m_Textures at device +0xA78,
      * one pointer per stage. The hook mirror is kept beside it and every
@@ -438,8 +469,8 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
                     * so every fixed-function draw must mismatch. */
                    c.ffc_control = 1;
                    /* G42: one word per group (texgen S0, TEXTURE_MATRIX_ENABLE0,
-                    * LIGHTING_ENABLE or LIGHT_CONTROL, FOG_ENABLE), so every
-                    * compared draw must mismatch. */
+                    * LIGHTING_ENABLE or LIGHT_CONTROL, FOG_ENABLE, and
+                    * INVERSE_MODELVIEW[0]), so every compared draw must mismatch. */
                    c.ffv_control = 1; } }
         tok = d3d8_host_enqueue_check(&c);
     if (!tok) { ++m_no_token; return; }
