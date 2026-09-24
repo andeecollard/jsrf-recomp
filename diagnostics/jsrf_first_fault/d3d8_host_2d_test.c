@@ -762,9 +762,51 @@ static void bind_tests(void)
     CHECK(!memcmp(a1, a2, sizeof a1) && !memcmp(b1, b2, sizeof b1), "bind: both targets identical, pixel for pixel");
 }
 
+/* FF draw mode: the fixed-function quad drawn by the host into the
+ * executor's bound surface, against the executor drawing it itself. */
+static int ff_draw_arm(int host, int control, uint16_t *out, float *zout)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; static uint32_t ffm[2048];
+    uint16_t *rt = (uint16_t *)(ram + RT);
+    background(rt); logo_depth();
+    draw_binder(rt);
+    case_ff(&c);
+    if (d3d8_host_ff_registers(&c, ffm)) return 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_draw_build(&c, ram, RAM_SIZE, control, NULL, ffm, nv2a_ff_vertex, &d)) return 0;
+    if (host) {
+        if (!d3d8_host_2d_metal_external(&d, ram, RAM_SIZE)) { printf("external: %s\n", d3d8_host_2d_metal_last_error()); return 0; }
+        nv2a_metal_sync();
+    } else {
+        g_exec_keep_surfaces = 1;
+        int ok = exec_draw_ff(&c, &d, ffm, rt, ram + ZS);
+        g_exec_keep_surfaces = 0;
+        if (!ok) return 0;
+    }
+    memcpy(out, rt, RTPITCH * RTH);
+    return nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zout);
+}
+static void ff_draw_tests(void)
+{
+    static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
+    static float za[RTW * RTH], zb[RTW * RTH];
+    D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
+    background(bg);
+    CHECK(ff_draw_arm(0, 0, a, za) && ff_draw_arm(1, 0, b, zb), "FF draw mode: both arms drew");
+    d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 0, &df);
+    zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
+    printf("  FF draw mode: executor changed %llu, host (in the executor's surface) %llu, differing %llu | depth %llu, worst %u\n",
+           df.exec_changed, df.host_changed, df.mismatch, zbad, steps);
+    CHECK(df.exec_changed > 500 && df.mismatch == 0 && zbad == 0, "FF draw mode: identical to the executor drawing it, colour and depth");
+    CHECK(ff_draw_arm(1, 1, b, zb), "FF draw mode CONTROL: drew");
+    d3d8_host_2d_diff(bg, a, b, RTPITCH / 2, RTH, 1, &df);
+    CHECK(df.mismatch > 200, "FF draw mode CONTROL: the perturbed host draw is what the surface holds (%llu px)", df.mismatch);
+}
+
 static void draw_mode_tests(void)
 {
     bind_tests();
+    ff_draw_tests();
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
     static float za[RTW * RTH], zb[RTW * RTH];
     D3D8H2DDiff df; unsigned steps = 0; unsigned long long zbad;
@@ -791,7 +833,7 @@ static void draw_mode_tests(void)
         memset(&be, 0, sizeof be);
         be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
         be.last_error = d3d8_host_2d_metal_last_error; be.external_draw = d3d8_host_2d_metal_external;
-        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped; be.external_binds = d3d8_host_2d_metal_binds;
+        be.exec_skip = fake_skip; be.exec_skipped = fake_skipped; be.external_binds = d3d8_host_2d_metal_binds; be.ff_vertex = nv2a_ff_vertex;
         d3d8_host_2d_set_backend(&be);
         background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
         case_logo(&c); snapshot_at_call(&c);
@@ -815,6 +857,15 @@ static void draw_mode_tests(void)
             d3d8_host_2d_get_stats(&s3);
             CHECK(s3.replaced == s2.replaced + 1 && s3.replace_unbound == s2.replace_unbound && d3d8_host_2d_metal_binds() == b0 + 1,
                   "draw mode: a target the executor has not bound is bound by the host and drawn"); }
+        /* A fixed-function draw goes through replace() the same way. */
+        {   D3D8H2DStats f0, f1;
+            d3d8_host_2d_get_stats(&f0);
+            background((uint16_t *)(ram + RT)); logo_depth(); draw_binder((uint16_t *)(ram + RT));
+            case_ff(&c); snapshot_at_call(&c);
+            d3d8_host_2d_replace(&c); if (g_fake_skip) ++g_fake_skipped; d3d8_host_2d_after(&c);
+            d3d8_host_2d_get_stats(&f1);
+            CHECK(f1.replaced_ff == f0.replaced_ff + 1 && g_fake_skip == 0, "FF draw mode: replace() drew a fixed-function draw and skipped the executor's");
+            d3d8_host_2d_get_stats(&s3); }
         /* And the control on the skip counter: a replaced draw whose batches were NOT skipped is counted. */
         case_logo(&c); snapshot_at_call(&c);
         d3d8_host_2d_replace(&c); d3d8_host_2d_after(&c);
@@ -822,6 +873,50 @@ static void draw_mode_tests(void)
         CHECK(s0.replaced_without_skip == s3.replaced_without_skip + 1, "draw mode CONTROL: a replaced draw the executor did not skip is caught");
         d3d8_host_2d_report("test");
     }
+}
+
+/* The FF shadow end to end with ONLY RECOMP_D3D8_HOST_FF armed, as the game
+ * run armed it: pre token, post token, flip. With the control on, the FF
+ * draw must come out MISMATCHING -- the arm that caught the shared knobs
+ * never being read when the 2D shadow was off. */
+static int ff_arm(int control)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH];
+    static uint32_t ffm[2048];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DStats a, b; D3D8Host2DBackend be;
+    setenv("RECOMP_D3D8_HOST_FF", "shadow", 1);
+    setenv("RECOMP_D3D8_HOST_FF_STRIDE", "1", 1);
+    if (control) setenv("RECOMP_D3D8_HOST_2D_CONTROL", "1", 1);
+    CHECK(d3d8_host_ff_mode() == 1 && d3d8_host_2d_mode() == 0, "FF shadow armed alone");
+    case_ff(&c); c.serial = 11;
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    if (d3d8_host_ff_registers(&c, ffm)) return 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    if (d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d)) return 0;
+    background(bg); memcpy(ex, bg, sizeof bg);
+    if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) return 0;
+    memset(&be, 0, sizeof be);
+    be.render = d3d8_host_2d_metal_render; be.sync_range = fake_sync; be.ram = ram; be.ram_size = RAM_SIZE;
+    be.last_error = d3d8_host_2d_metal_last_error; be.depth_peek = fake_peek; be.ff_vertex = nv2a_ff_vertex;
+    d3d8_host_2d_set_backend(&be);
+    /* The executor's depth after the draw is its attachment; before it, the guest's cleared bytes. */
+    memcpy(ram + RT, bg, sizeof bg);
+    g_exec_result = ex; g_sync_calls = 0; g_peeks = 0;
+    snapshot_at_call(&c);
+    d3d8_host_2d_get_stats(&a);
+    d3d8_host_2d_pre(c.serial, c.vs_handle, c.rt_data, c.rt_format, c.rt_size, c.zs_data, c.zs_size);
+    d3d8_host_2d_post(&c, NULL);
+    d3d8_host_2d_flip();
+    d3d8_host_2d_get_stats(&b);
+    CHECK(b.ff_compared == a.ff_compared + 1, "FF shadow%s: the draw was compared at the flip", control ? " CONTROL" : "");
+    if (control)
+        CHECK(b.ff_mismatching == a.ff_mismatching + 1, "FF shadow CONTROL: the perturbed FF draw is MISMATCHING");
+    else
+        CHECK(b.ff_mismatching == a.ff_mismatching, "FF shadow: no mismatch (exact %llu, within %llu)",
+              b.ff_exact - a.ff_exact, b.ff_within - a.ff_within);
+    d3d8_host_2d_report("test");
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -834,9 +929,15 @@ int main(int argc, char **argv)
     char dir[512];
     ram = calloc(1, RAM_SIZE);
     if (!ram) return 2;
+    if (argc > 1 && (strcmp(argv[1], "ff") == 0 || strcmp(argv[1], "ffcontrol") == 0)) {   /* FF shadow alone */
+        CHECK(ff_arm(strcmp(argv[1], "ffcontrol") == 0), "FF arm ran");
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "draw") == 0) {         /* the draw-mode arm, a process of its own */
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
-        CHECK(d3d8_host_2d_mode() == 2, "RECOMP_D3D8_HOST_2D=draw arms draw mode");
+        setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
+        CHECK(d3d8_host_2d_mode() == 2 && d3d8_host_ff_mode() == 2, "RECOMP_D3D8_HOST_2D=draw and RECOMP_D3D8_HOST_FF=draw arm draw mode");
         draw_mode_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;

@@ -1233,6 +1233,11 @@ if(APPLE)
     # the executor drawing the same draw; replace/after drive the skip.
     add_test(NAME jsrf_d3d8_host_2d_draw COMMAND jsrf_d3d8_host_2d_test draw)
     set_tests_properties(jsrf_d3d8_host_2d_draw PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    # G51.3: the FF shadow armed alone, and its positive control.
+    add_test(NAME jsrf_d3d8_host_ff COMMAND jsrf_d3d8_host_2d_test ff)
+    set_tests_properties(jsrf_d3d8_host_ff PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
+    add_test(NAME jsrf_d3d8_host_ff_control COMMAND jsrf_d3d8_host_2d_test ffcontrol)
+    set_tests_properties(jsrf_d3d8_host_ff_control PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # Staging-ring lifetime, including the pin-once-per-batch pattern batching
     # introduced. Carries its own positive control.
     add_executable(jsrf_metal_ring_test metal_ring_test.c)

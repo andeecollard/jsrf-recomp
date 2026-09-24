@@ -235,6 +235,10 @@ typedef struct {
      * shadow for subchannel 0 (methods 0..0x1FFC), as latched at the token. */
     int      regs_valid;
     uint32_t regs[0x2000 / 4];
+    /* G51.3: the executor's CURRENT vertex attributes (SET_VERTEX_DATA*), what
+     * a slot with no array reads -- e.g. diffuse for an FVF without one. */
+    int      cur_valid;
+    float    cur[16][4];
 } D3D8ExecDrawTextures;
 void d3d8_host_set_exec_source(void (*get)(D3D8ExecDrawTextures *out));
 uint32_t d3d8_host_enqueue_check(const D3D8HostDrawCheck *c);

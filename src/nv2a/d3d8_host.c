@@ -988,7 +988,7 @@ static void on_token(uint32_t parameter)
         check_draw(&s_slot[i].check);
         /* G51.1: the host draws the same draw over the snapshot the kind-2
          * token took. Only pre-transformed 2D draws, only when armed. */
-        if (d3d8_host_2d_mode() == 2)
+        if (d3d8_host_any_draw_mode())
             d3d8_host_2d_after(&s_slot[i].check);             /* closes draw mode's skip */
         if (d3d8_host_shadow_wants(&s_slot[i].check))         /* 2D shadow, G51.3 FF shadow */
             d3d8_host_2d_post(&s_slot[i].check, s_exec_source);
