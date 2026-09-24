@@ -95,6 +95,17 @@ C_RUNTIME_TEST = r"""
 #include <stdint.h>
 #include <string.h>
 #include "recomp_mem_watch.h"
+#include "d3d8_ring.h"
+
+/* recomp_mem_watch.c links against d3d8_ring's accessor for the
+   RECOMP_MEM_WATCH_TALLY=ring mode (1d1b1ea). That mode is off here, and the
+   real accessor dereferences guest memory through xbox_GetMemoryOffset, so
+   stand in the answer it gives before the device global is populated. */
+int d3d8_ring_read_target(D3D8RingTarget *out)
+{
+    memset(out, 0, sizeof *out);
+    return 0;
+}
 
 int main(void)
 {
