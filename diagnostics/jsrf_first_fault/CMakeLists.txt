@@ -957,6 +957,14 @@ add_test(NAME jsrf_fb_watch_still COMMAND jsrf_fb_watch_still_test)
 # is what the A/B hangs off, so pin the two things that have silently broken an
 # A/B here before: the ab_score token must be visible in BOTH arms, and the
 # gate must be recomp_switch_on rather than a bare getenv that reads =0 as on.
+# G54: a primitive split over several index / run method calls inside one
+# Begin/End is one batch, as xemu has it; genuine short, immediate-mode and
+# overlapping-Begin batches are counted by the drop registry.
+add_executable(jsrf_primitive_split_test primitive_split_test.c
+    "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c"
+    "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")
+target_link_libraries(jsrf_primitive_split_test PRIVATE xbox_vsh)
+add_test(NAME jsrf_primitive_split COMMAND jsrf_primitive_split_test)
 add_executable(jsrf_flip_sync_test flip_sync_test.c
     "${XBOXRECOMP_DIR}/src/kernel/nv2a_pb_exec.c"
     "${XBOXRECOMP_DIR}/src/kernel/d3d8_ring.c")
