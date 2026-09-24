@@ -4384,6 +4384,72 @@ static unsigned long long vsh_now_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
   return (unsigned long long)t.tv_sec*1000000000ull + (unsigned long long)t.tv_nsec; }
 
+/* RECOMP_FOG_DRAW_TRACE=<n> -- G53, read-only, opt-in: n fogged batches (40
+ * if n is 1), then one in every 2,000, each with three of its vertices' fog
+ * coordinate d and factor f, beside what they came from:
+ *   fixed-function: the object position, the eye position through the
+ *   model-view (0x480) and whether 0x480 and FOG_PLANE were ever written,
+ *   and the composite's clip w -- which for a D3D perspective projection IS
+ *   eye z, so d and w disagreeing says which matrix is not what it should be;
+ *   programmable: the program's oFog, run on the CPU interpreter for the GPU
+ *   path, and whether the program writes oFog at all.
+ * The factor is nv2a_fog_factor on the batch's FOG_MODE and FOG_PARAMS. */
+static void fog_draw_trace(int programmable)
+{
+    static int cap = -1; static unsigned long seen_batches, printed;
+    float p0, p1;
+    uint32_t mode = s_methods[0x29c/4], gen = s_methods[0x2a0/4];
+    unsigned n;
+    if (cap < 0) { const char *e = getenv("RECOMP_FOG_DRAW_TRACE"); cap = e && *e ? atoi(e) : 0; if (cap == 1) cap = 40; }
+    if (cap <= 0 || !s_methods[0x2a4/4] || !s_gpu.idx_count) return;
+    ++seen_batches;
+    if (printed >= (unsigned long)cap && seen_batches % 2000u) return;
+    ++printed;
+    memcpy(&p0, &s_methods[0x9c0/4], 4); memcpy(&p1, &s_methods[0x9c4/4], 4);
+    fprintf(stderr, "[FOG-DRAW] batch %lu draw %u: xf MODE %u (%s), GEN %u, FOG_MODE %X, params %g %g, colour %08X, %s"
+                    " | 0x480 written %u, FOG_PLANE written %u (%g %g %g %g)\n",
+            seen_batches, s_gpu.draws, s_methods[0x1e94/4] & 3u, s_vsh_gpu_batch ? "GPU" : "CPU", gen, mode, p0, p1,
+            s_methods[0x2a8/4], programmable ? "programmable" : "fixed-function",
+            s_method_seen[0x480/4] && s_method_seen[0x4bc/4], s_method_seen[0x9d0/4],
+            *(const float *)&s_methods[0x9d0/4], *(const float *)&s_methods[0x9d4/4],
+            *(const float *)&s_methods[0x9d8/4], *(const float *)&s_methods[0x9dc/4]);
+    if (!programmable) {
+        const float *mv = (const float *)&s_methods[0x480/4], *cp = (const float *)&s_methods[0x680/4];
+        fprintf(stderr, "[FOG-DRAW]   model-view rows: (%g %g %g %g) (%g %g %g %g) (%g %g %g %g) (%g %g %g %g)"
+                        " | composite w row (%g %g %g %g)\n",
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11],
+                mv[12], mv[13], mv[14], mv[15], cp[12], cp[13], cp[14], cp[15]);
+    }
+    for (n = 0; n < 3 && n < s_gpu.idx_count; ++n) {
+        float d = 0, eye[4] = { 0, 0, 0, 0 }, clipw = 0, pos[4] = { 0, 0, 0, 0 }, d1[4] = { 0, 0, 0, 0 };
+        int has_eye = 0;
+        if (!programmable) {
+            int src = nv2a_ff_fog_source(s_methods);
+            if (s_vsh_gpu_batch) {                          /* s_outputs holds the INPUTS */
+                memcpy(pos, s_outputs[n][0], 16);
+                d = nv2a_ff_fog_coord(s_methods, src, (const float (*)[4])s_outputs[n], eye); has_eye = 1;
+                {   const float *cp = (const float *)&s_methods[0x680/4];
+                    clipw = cp[12] * pos[0] + cp[13] * pos[1] + cp[14] * pos[2] + cp[15] * pos[3]; }
+            } else {
+                d = s_outputs[n][5][0]; clipw = s_outputs[n][0][3];
+            }
+        } else if (s_vsh_gpu_batch && s_vsh.decoded.valid) {
+            NV2AVshResult r;
+            memset(&r, 0, sizeof r);
+            nv2a_vsh_execute(&s_vsh.decoded, (const float (*)[4])s_outputs[n], s_vsh.constants, &r);
+            d = r.output[5][0]; clipw = r.output[0][3]; memcpy(d1, r.output[4], 16);
+        } else {
+            d = s_outputs[n][5][0]; clipw = s_outputs[n][0][3]; memcpy(d1, s_outputs[n][4], 16);
+        }
+        fprintf(stderr, "[FOG-DRAW]   v%u: d %g -> f %g | clip w %g", n, d, nv2a_fog_factor(mode, p0, p1, d), clipw);
+        if (has_eye) fprintf(stderr, " | object (%g %g %g %g) eye (%g %g %g %g)", pos[0], pos[1], pos[2], pos[3],
+                             eye[0], eye[1], eye[2], eye[3]);
+        if (programmable) fprintf(stderr, " | oD1 (V1, summed by CW0 130E0300) %g %g %g %g", d1[0], d1[1], d1[2], d1[3]);
+        fputc('\n', stderr);
+    }
+    fflush(stderr);
+}
+
 static int prepare_vertices(void)
 {
     int programmable = s_vsh.mode == 2;
@@ -4928,6 +4994,7 @@ static int prepare_vertices(void)
         }
     }
     if (programmable) s_vsh.batches++;
+    fog_draw_trace(programmable);
     return 1;
 }
 

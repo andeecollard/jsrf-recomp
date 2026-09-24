@@ -154,6 +154,11 @@ enum { NV2A_FF_FOG_OFF = 0, NV2A_FF_FOG_SPEC_ALPHA = 1, NV2A_FF_FOG_RADIAL = 2,
        NV2A_FF_FOG_PLANAR = 3, NV2A_FF_FOG_ABS_PLANAR = 4, NV2A_FF_FOG_X = 5 };
 /* The key's fog byte for this state; -1 for a gen mode nobody models. */
 int nv2a_ff_fog_source(const uint32_t methods[2048]);
+/* The fog coordinate nv2a_ff_vertex writes to output[5].x, for the given
+ * source, from the vertex's INPUTS (spec alpha from input 4, which the unlit
+ * unit passes through unchanged). The eye position is returned in eye[4]
+ * when the source forms one. For RECOMP_FOG_TRACE and the tests. */
+float nv2a_ff_fog_coord(const uint32_t methods[2048], int source, const float in[16][4], float eye[4]);
 /* Fog-coordinate census: vertices by source, and those with an unmodelled gen
  * mode (drawn with coordinate 0, i.e. the fog factor for distance zero). */
 extern unsigned long nv2a_ff_fog_vertices[6], nv2a_ff_fog_unknown;
