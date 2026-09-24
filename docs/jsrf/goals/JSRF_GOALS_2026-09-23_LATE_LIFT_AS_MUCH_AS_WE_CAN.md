@@ -301,3 +301,23 @@ merging or carrying flags at split entries.
   does not read `paths.conf`, so HW_TEX and METAL_FF were off: 48.7 fps
   against 57.1 fps with them. Source `paths.conf` (without the game/HDD paths)
   when a number is meant to describe the player's build.
+- **G56: resolved, with one live bug found** (agent, merged `ae6d32b`; census in
+  `experiments/lifter_flags/census.md`).
+  - 279 of the 326 `(_flags` reads are real: rep compares, `lock xadd`,
+    `cmpxchg`. The ~200 `sete` are correct IID compares.
+  - The 47 unresolved sites are all dead:
+    - 17 are in `tail_jump_alias` copies with no static caller (this includes
+      0x00100058, the sample);
+    - 29 are jump tables disassembled as code;
+    - 1 follows a `ret`.
+  - Fixed:
+    - upstream #110 (LOOP) ported;
+    - #120's test taken; the lifter half was already in our tree;
+    - rep compares now set CF and keep ZF on a zero count. That was a live
+      bug in `std::string::compare` (sub_00179AE0): every mismatch returned
+      +1, and "" compared wrongly.
+  - pytest: 635 passed, 2 pre-existing failures (test_mem_watch,
+    test_bridge_stack_args).
+  - Regeneration on 24 Sep (backup `gen-2026-09-24-PRE-G56-KEEP`) applies it:
+    285 lines change.
+- **CRI idle spinner lifted** (`9f18d66`): process CPU 312% -> 221%.
