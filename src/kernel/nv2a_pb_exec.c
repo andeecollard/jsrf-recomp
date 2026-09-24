@@ -2015,6 +2015,143 @@ void nv2a_pb_exec_flip_pace_stats(unsigned long long *paced, unsigned long long 
     if (wait_us) *wait_us = g_flip_pace_wait_us;
 }
 
+/* THE FLIGHT RECORDER (24 Sep 2026). RECOMP_FLIGHT_FRAMES=<n>, off by default.
+ *
+ * A cutscene flicker lasts a frame or two and a drifting replay cannot be
+ * steered back to it, so the evidence has to be taken while the player is
+ * watching it. The last n presented frames stay in a ring together with a
+ * one-line record of every draw submitted in each; pressing M in the game
+ * window (the existing pad mark, xbox_PadRecordMark) writes the ring out at
+ * the next flip, to RECOMP_FLIGHT_DIR (default: the working directory) as
+ * flight-<mark>/frame-NNNN.bmp + draws-NNNN.txt, oldest first. A flicker is
+ * then the diff of two neighbouring draw lists: the draw that is present in
+ * one and missing, or different, in the next.
+ *
+ * Writing stalls the pusher for as long as the disk takes -- a diagnostic,
+ * taken on request, never on a timer. */
+typedef struct {
+    uint32_t draw, prim, count, mode, tex0, fmt0, tex1, fmt1, cw0, ctl, blend, zfunc;
+} FlightDraw;
+#define FLIGHT_MAX_DRAWS 1024
+typedef struct {
+    uint8_t *px; uint32_t w, h, bpp; unsigned long guest_frame; uint32_t seq;
+    uint32_t ndraws, dropped; FlightDraw d[FLIGHT_MAX_DRAWS];
+} FlightFrame;
+static FlightFrame *s_flight; static unsigned s_flight_n, s_flight_head, s_flight_filled;
+static FlightFrame s_flight_cur;           /* draws of the frame being composed */
+static volatile int s_flight_mark;         /* set by the input thread, served at the flip */
+static unsigned s_flight_marks;
+/* Looked up at run time, not linked: the executor's unit tests link it without
+ * the input module, and Mach-O will not leave a static reference undefined. */
+#if defined(_WIN32)
+static unsigned long (*flight_input_frame)(void);
+static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
+static void flight_resolve(void) {}
+#else
+#include <dlfcn.h>
+static unsigned long (*flight_input_frame)(void);
+static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
+static void flight_resolve(void)
+{
+    flight_input_frame = (unsigned long (*)(void))dlsym(RTLD_DEFAULT, "xbox_InputFrame");
+    flight_set_mark_hook = (void (*)(void (*)(unsigned long, const char *)))
+        dlsym(RTLD_DEFAULT, "xbox_PadRecordSetMarkHook");
+}
+#endif
+static void flight_on_mark(unsigned long frame, const char *label)
+{ (void)frame; (void)label; s_flight_mark = 1; }
+static unsigned flight_frames(void)
+{
+    static int init; static unsigned n;
+    if (!init) {
+        const char *e = getenv("RECOMP_FLIGHT_FRAMES");
+        init = 1; n = (e && *e) ? (unsigned)strtoul(e, NULL, 10) : 0u;
+        if (n > 1200) n = 1200;
+        if (n) {
+            s_flight = calloc(n, sizeof *s_flight);
+            if (!s_flight) n = 0;
+            else {
+                s_flight_n = n;
+                flight_resolve();
+                if (flight_set_mark_hook) flight_set_mark_hook(flight_on_mark);
+                else fprintf(stderr, "  [FLIGHT] no pad mark hook in this binary: M cannot trigger a write\n");
+                fprintf(stderr, "  [FLIGHT] recording the last %u presented frames and their draws;"
+                        " press M in the game window to write them out\n", n);
+            }
+        }
+    }
+    return n;
+}
+static void flight_note_draw(void)
+{
+    if (!flight_frames()) return;
+    if (s_flight_cur.ndraws >= FLIGHT_MAX_DRAWS) { ++s_flight_cur.dropped; return; }
+    FlightDraw *d = &s_flight_cur.d[s_flight_cur.ndraws++];
+    d->draw = s_gpu.draws; d->prim = s_gpu.prim; d->count = s_gpu.idx_count;
+    d->mode = s_methods[0x1e94/4] & 3;
+    d->tex0 = s_methods[0x1b00/4]; d->fmt0 = s_methods[0x1b04/4];
+    d->tex1 = s_methods[0x1b40/4]; d->fmt1 = s_methods[0x1b44/4];
+    d->cw0 = s_methods[0x288/4]; d->ctl = s_methods[0x1e60/4];
+    d->blend = s_methods[0x304/4] ? (s_methods[0x344/4] << 16 | (s_methods[0x348/4] & 0xffff)) : 0;
+    d->zfunc = s_methods[0x30c/4] ? s_methods[0x354/4] : 0;
+}
+static int write_bmp_path(const char *path, const uint8_t *base, uint32_t pitch,
+                          uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t bpp);
+static void flight_write(void)
+{
+    const char *dir = getenv("RECOMP_FLIGHT_DIR");
+    char root[900], path[1024];
+    unsigned i, k, written = 0;
+    snprintf(root, sizeof root, "%s/flight-%u", (dir && *dir) ? dir : ".", ++s_flight_marks);
+#if defined(_WIN32)
+    CreateDirectoryA(root, NULL);
+#else
+    { char cmd[1000]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", root); if (system(cmd)) {} }
+#endif
+    for (i = 0; i < s_flight_filled; ++i) {
+        FlightFrame *f = &s_flight[(s_flight_head + s_flight_n - s_flight_filled + i) % s_flight_n];
+        snprintf(path, sizeof path, "%s/frame-%04u.bmp", root, i);
+        if (f->px) write_bmp_path(path, f->px, f->w * f->bpp, 0, 0, f->w, f->h, f->bpp);
+        snprintf(path, sizeof path, "%s/draws-%04u.txt", root, i);
+        FILE *t = fopen(path, "w");
+        if (!t) continue;
+        fprintf(t, "# seq %u guest_frame %lu draws %u (+%u not recorded)\n"
+                   "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc\n",
+                f->seq, f->guest_frame, f->ndraws, f->dropped);
+        for (k = 0; k < f->ndraws; ++k) {
+            const FlightDraw *d = &f->d[k];
+            fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x\n", d->draw, d->prim,
+                    d->count, d->mode, d->tex0, d->fmt0, d->tex1, d->fmt1, d->cw0, d->ctl,
+                    d->blend, d->zfunc);
+        }
+        fclose(t);
+        ++written;
+    }
+    fprintf(stderr, "  [FLIGHT] mark %u: wrote %u frames to %s\n", s_flight_marks, written, root);
+    fflush(stderr);
+}
+static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp, uint32_t seq)
+{
+    if (!flight_frames()) return;
+    FlightFrame *f = &s_flight[s_flight_head];
+    size_t bytes = (size_t)w * h * bpp;
+    if (!f->px || f->w * f->h * f->bpp != bytes) { free(f->px); f->px = malloc(bytes); }
+    if (f->px && px) memcpy(f->px, px, bytes);
+    f->w = w; f->h = h; f->bpp = bpp; f->seq = seq; f->guest_frame = flight_input_frame ? flight_input_frame() : 0;
+    f->ndraws = s_flight_cur.ndraws; f->dropped = s_flight_cur.dropped;
+    memcpy(f->d, s_flight_cur.d, sizeof(FlightDraw) * s_flight_cur.ndraws);
+    s_flight_cur.ndraws = 0; s_flight_cur.dropped = 0;
+    s_flight_head = (s_flight_head + 1) % s_flight_n;
+    if (s_flight_filled < s_flight_n) ++s_flight_filled;
+    {   /* RECOMP_FLIGHT_AT=<guest frame>: the same write without a keyboard,
+         * for replays and for testing the recorder itself. */
+        static int init; static unsigned long at;
+        if (!init) { const char *e = getenv("RECOMP_FLIGHT_AT"); init = 1; at = (e && *e) ? strtoul(e, NULL, 10) : 0; }
+        if (at && f->guest_frame >= at) { at = 0; s_flight_mark = 1; }
+    }
+    if (s_flight_mark) { s_flight_mark = 0; flight_write(); }
+}
+
 static void snapshot_surface(void)
 {
     uint32_t b = surface_bpp();
@@ -2068,6 +2205,7 @@ static void snapshot_surface(void)
          * which is how a reader still tells "a new frame arrived" from "the
          * old one is still sitting here". */
         frame_pool_publish(&s_snap_pool, f, w, h, b, s_gpu.color_offset);
+        flight_flip(f->px, w, h, b, f->seq);
 
         /* Hold it on the producer's behalf, and only then drop the frame
          * before it: fb_watch() runs next, on this thread, off the pointers
@@ -5831,6 +5969,7 @@ static void draw_primitive(void)
         return;
     }
     s_gpu.draws++;
+    flight_note_draw();
     s_last_batch_indices = s_gpu.idx_count; s_last_batch_prim = s_gpu.prim;
     if ((s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
