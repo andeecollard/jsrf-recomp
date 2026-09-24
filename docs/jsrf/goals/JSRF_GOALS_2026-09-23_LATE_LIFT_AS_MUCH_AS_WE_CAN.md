@@ -483,3 +483,16 @@ merging or carrying flags at split entries.
   counter caught it. Do not enable `RECOMP_D3D8_HOST_FF=draw` for the player.
   2D draw alone regressed from 85.5 to 81.3 fps. Back with the agent, with a
   presented-frame check required.
+- **The FF draw debris, bisected in game** (`dff7a6c` adds
+  `RECOMP_D3D8_HOST_VERIFY` and `RECOMP_D3D8_HOST_BISECT`). The early-tests fix
+  was real but not the cause in game. VERIFY=60 caught the defect (FF
+  mismatching 2,164 of 4,165, the host covering less). Frames per mask:
+  - 0x3FF: clean, 11 fps;
+  - 0x300: debris;
+  - **0x081: clean, 81.2 fps**;
+  - 0x001: no debris, but depth/occlusion errors, 89.3 fps;
+  - 0x080: debris.
+
+  So joining the executor's batch encoder causes the debris, and skipping the
+  executor's preparation early is wrong once the host draws in its own pass.
+  2D draw alone is clean. Back with the agent.
