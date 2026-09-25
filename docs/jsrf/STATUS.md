@@ -24,15 +24,16 @@ each line are in the newest file in `goals/` (25 Sep: `JSRF_GOALS_2026-09-25_DAY
 | Rokkaku-dai city | fixed (G54) | player session |
 | characters whited out in Rokkaku-dai | fixed (G58, 16-bit swizzled textures on the GPU) | player session |
 | stage music dying after ~2 min | fixed (DSOUND lift, 23 Sep); stage track read in real time to the end of a 1,370 s session; 14 small underruns in it | measured: ADX reads matched against the file; content not checked by ear |
-| graffiti studio cannot paint | fixed in code (G59, linear 32-bit textures), not yet confirmed | measured: the dropped draws were format 0x12 in the player's log |
-| Rokkaku-dai water looks like a void | bump mapping implemented (G60), not yet confirmed; whether it then looks right needs an xemu reference | measured: the water is rasterised where the void is (`RECOMP_MARK_BUMP`) |
+| graffiti studio cannot paint | fixed (G59, linear 32-bit textures) | player session 25 Sep: "works" |
+| Rokkaku-dai water looks like a void | fixed (G60, bump-environment mapping) | player session 25 Sep: "water present" |
 | cutscene sweep | in progress over the 74 cutscenes reachable by a jump | — |
 | corrupt glyphs in speech boxes / trick names (G2) | open, not re-measured since 21 Sep | — |
 | Poison Jam chase cutscene elements | open; needs the chase played to reach | — |
 | boost flicker | open, not re-tested since G57 | — |
 | frame time | capped at 60 Hz: most stages 18–31 ms, Skyscraper 33–37, Sky Dino 34 after the texture-cache fix (was 99–110) | measured: 25 Sep game map (68 runs) and a same-binary A/B; the player reports performance better |
-| occasional hitches | shader pipelines compiled on first use: 114 in one session, 5.66 s total, worst 883 ms; frames of 1–2 s mid-play | measured in the player's 25 Sep log; fix in progress (G70) |
-| thin line above text, tutorial boost | open (G71, G72) | player report 25 Sep |
+| occasional hitches | fixed (G70): pipelines compile off the draw thread and persist; 28 ms of compile wait in a whole session (was 5.66 s), worst frame 189 ms (was 6.3 s) | player session 25 Sep, measured |
+| tutorial boost | looks right now (G72 closed) | player session 25 Sep |
+| thin line above text | open (G71) | player report 25 Sep |
 | whole game | every chapter hub and all 20 free-play stages load and play with no fault; 74 jump-reachable cutscenes with no fault; two intermittent hangs mitigated/instrumented (G66, G69) | measured: game map and cutscene sweep, 25 Sep |
 
 ## Fixed 21 September 2026 — the Load screen, the light, and the character select

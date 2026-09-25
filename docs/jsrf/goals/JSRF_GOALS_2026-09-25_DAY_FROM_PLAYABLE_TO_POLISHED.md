@@ -94,3 +94,21 @@ unattended runs while the player plays.
   blobs replaced by the clean-room file in all unpushed commits; tip tree
   unchanged) and pushed to origin main; upstream PR #126 opened; 7 worktrees
   and 15 branches removed (branches with unique commits kept).
+
+## Player session on the 10:36 JSRF.app (25 Sep, late morning)
+
+> 1. works 2. water present, boost working properly!
+
+- **G59 confirmed**: the graffiti studio paints.
+- **G60 confirmed**: the Rokkaku-dai water is present.
+- **G72 closed**: the tutorial boost looks right (no longer strange; most
+  likely G57 or G60 — not bisected).
+- **G70 confirmed in play**: draw thread waited 28.4 ms in total for pipeline
+  compiles (worst 18.1 ms) against 5.66 s (worst 883 ms) this morning; worst
+  frame 189 ms against 6.3 s; mean 17.7 ms. Log
+  `~/jsrf-build/jsrf-first-fault/measure/player-2026-09-25-1036build.log`.
+
+**Open, in order:** G71 thin line above text; G65 one-frame camera pop
+(xemu); performance beyond 60 fps in heavy stages (the D3D lift); G63 Poison
+Jam chase cutscenes (needs the chase); G69 pushbuffer desync (post-mortem
+armed).
