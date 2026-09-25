@@ -149,7 +149,106 @@ unsigned adx_guard_block_begin(void);
 void     adx_guard_block_end(unsigned saved_depth);
 void adx_guard_report(void);        /* one [ADX-GUARD] line on stderr */
 
+/* ── WHOSE PRIORITY THE ONE SLOT HOLDS (G66) ─────────────────────────────
+ *
+ * 0x0027D0F8 is ONE slot, written by the lock that takes the count 0 -> 1 and
+ * read back by the unlock that takes it 1 -> 0 -- onto whichever thread made
+ * that unlock. The block-release rule above lets a second thread M into the
+ * region while the raiser A waits in a kernel wait, and then the unlock that
+ * reaches zero can be M's:
+ *
+ *     A locks    count 0->1, slot := A's real priority (1), A raised to 16
+ *     A blocks   the guard lets go (THE GUARD IS PRIORITY)
+ *     M locks    count 1->2, the `jne` skips, M untouched
+ *     A unlocks  count 2->1, the `jne` skips -- A IS STILL AT 16
+ *     M unlocks  count 1->0, restores A's 1 ONTO M
+ *
+ * That is the "A16 M1" run in every poisoned KeSetBasePriority trace of G66
+ * (s4m96 s8m13 s6m30 s6m61): A is never lowered, every later A lock saves 15,
+ * the 15 migrates to main, and CRI's drop-all-nesting loop at sub_001437B0
+ * (`while GetThreadPriority(self) == 15: unlock`) spins with unmatched
+ * unlocks driving the count negative.
+ *
+ * PER-THREAD RESTORE (RECOMP_ADX_PER_THREAD_RESTORE, default ON). The lock
+ * still writes the guest's slot exactly as the guest does; the ledger below
+ * ALSO records, per raising thread, its own pre-raise priority. When the
+ * count reaches 0 on a thread that is not the raiser, the unlocking thread's
+ * priority is left alone and the raiser is OWED its own saved priority. The
+ * raiser collects it at its next entry to the lock or the unlock, on its own
+ * thread, through the guest's own SetThreadPriority(NtCurrentThread) -- the
+ * only priority path this runtime can aim at a thread, since a thread-id
+ * token only resolves on the thread it names (kernel_bridge.c). Off, the
+ * unlock restores the slot onto whoever unlocks, as the guest does.
+ *
+ * UNMATCHED-SAFE (RECOMP_ADX_UNMATCHED_SAFE, default ON). An unlock that finds
+ * the count already <= 0 never decrements it: on hardware no unlock can run
+ * there, and a negative count turns both routines into permanent no-ops (both
+ * open with a `jne` on it). If the caller holds no lock and still reads
+ * GetThreadPriority == 15, its own last pre-raise priority is restored (0,
+ * THREAD_PRIORITY_NORMAL, if it never raised -- counted as a fallback) so
+ * sub_001437B0's loop sees something other than 15 and exits.
+ *
+ * Both are decisions only: the bodies in jsrf_manual_overrides.c ask, and do
+ * the guest calls themselves. adx_guard_test drives the exact interleave
+ * above through the same calls. */
+int  adx_per_thread_restore_on(void);   /* RECOMP_ADX_PER_THREAD_RESTORE, default ON */
+int  adx_unmatched_safe_on(void);       /* RECOMP_ADX_UNMATCHED_SAFE, default ON */
+
+/* The lock body, after its `jne`: raised=1 when this lock took the count 0->1
+ * and saved `pre_raise` (what GetThreadPriority returned) into the slot. */
+void adx_prio_note_lock(int raised, int pre_raise);
+/* The unlock body, once admitted: 1 if this thread holds a lock by the
+ * ledger's count (and drops one level of it), 0 if it holds none. */
+int  adx_prio_note_unlock(void);
+/* The unlock took the count to 0. 1: restore the slot onto THIS thread, as
+ * the guest does. 0: do not -- the raiser was another thread and is now owed
+ * its own priority. Always 1 with the switch off. */
+int  adx_prio_restore_here(void);
+/* At entry to either routine: 1 and *prio if this thread is owed a restore
+ * (consumed). Never 1 with the switch off. */
+int  adx_prio_take_owed(int *prio);
+/* The unmatched-safe rescue: this thread's own last pre-raise priority. 1 if
+ * it ever raised, 0 (and *prio = 0, NORMAL) if not. Counts a rescue. */
+int  adx_prio_rescue(int *prio);
+void adx_prio_note_clamp(void);         /* an unlock at count <= 0 was not applied */
+
+/* ── THE TRACE (RECOMP_ADX_TRACE, default OFF) ───────────────────────────
+ *
+ * A ring of the last 256 events -- lock, unlock, block_begin, block_end, plus
+ * the owed-restore and clamp decisions above -- each with the host thread id,
+ * the guest return address MEM32(esp) at entry, the refcount before and after,
+ * the guard nesting (this thread / holder), the unlock admission result and
+ * the priority handed to SetThreadPriority (or none). Dumped as [ADX-TRACE]
+ * lines on stderr ONCE per reason:
+ *
+ *     leak       locks - matched unlocks - live nesting (held + parked by a
+ *                blocking wait) moved off zero: the ~25% lock leak G66 could
+ *                not explain, with the events that made it
+ *     unmatched  the first unlock from a thread that holds nothing
+ *     skipped    the first unlock refused because another thread was inside
+ *     cross      the first count-to-zero on a thread that was not the raiser
+ *     clamp      the first unlock at count <= 0
+ *     drift      the guest refcount first disagreed with the ledger's
+ *                sum of held locks
+ */
+enum adx_trace_type {
+    ADX_EV_LOCK = 1, ADX_EV_UNLOCK, ADX_EV_BLOCK_BEGIN, ADX_EV_BLOCK_END,
+    ADX_EV_OWED, ADX_EV_CLAMP
+};
+#define ADX_PRIO_NONE (-1000)           /* "no SetThreadPriority in this event" */
+#define ADX_COUNT_NA  (-2147483647 - 1) /* the count was not readable here */
+int  adx_trace_on(void);
+/* Where block_begin/end read the guest refcount from; set by the overrides. */
+void adx_trace_set_count_source(int (*read_count)(void));
+void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
+                    int unlock_result, int prio_set);
+void adx_trace_dump(const char *reason);  /* unconditional; tests and reports */
+/* Which reasons have dumped so far, one bit each in the order listed above
+ * (leak 1, unmatched 2, skipped 4, cross 8, clamp 16, drift 32). Tests. */
+unsigned adx_trace_fired(void);
+
 /* Tests only: forget every thread's nesting and free the guard. */
 void adx_guard_reset_for_test(void);
+void adx_prio_reset_for_test(void);  /* the ledger, owed restores and trace */
 
 #endif /* JSRF_ADX_GUARD_H */

@@ -377,17 +377,48 @@ find_package(Threads REQUIRED)
 target_link_libraries(jsrf_adx_guard_test PRIVATE Threads::Threads)
 target_include_directories(jsrf_adx_guard_test PRIVATE .)
 
-add_test(NAME jsrf_adx_guard_off COMMAND jsrf_adx_guard_test off)
+#
+# G66 adds the per-thread restore and unmatched-safe fixes (adx_guard.h, WHOSE
+# PRIORITY THE ONE SLOT HOLDS), both default ON. The second word names their
+# expected state. The three arms above run with them at their default -- set
+# EMPTY, which must read as the default -- so `off` now shows the per-thread
+# restore closing the original 21 Sep interleave without the guard. The
+# `nofix` arms are the positive controls for both defects: the poison, A16 M1
+# and the endless drop-all-nesting spin must all still form with the fixes at
+# 0. The `negctl` arm expects the fix but runs without it and MUST FAIL: that is
+# the proof the fix assertions can see the defect. `trace` checks that each
+# dump reason the fixes depend on fires.
+set(_adx_fix_default "RECOMP_ADX_PER_THREAD_RESTORE=;RECOMP_ADX_UNMATCHED_SAFE=")
+set(_adx_fix_off "RECOMP_ADX_PER_THREAD_RESTORE=0;RECOMP_ADX_UNMATCHED_SAFE=0")
+
+add_test(NAME jsrf_adx_guard_off COMMAND jsrf_adx_guard_test off fix)
 set_tests_properties(jsrf_adx_guard_off PROPERTIES
-    ENVIRONMENT "RECOMP_ADX_SERIALIZE=")
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=;${_adx_fix_default};RECOMP_ADX_TRACE=")
 
-add_test(NAME jsrf_adx_guard_zero COMMAND jsrf_adx_guard_test off)
+add_test(NAME jsrf_adx_guard_zero COMMAND jsrf_adx_guard_test off fix)
 set_tests_properties(jsrf_adx_guard_zero PROPERTIES
-    ENVIRONMENT "RECOMP_ADX_SERIALIZE=0")
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=0;${_adx_fix_default};RECOMP_ADX_TRACE=")
 
-add_test(NAME jsrf_adx_guard_on COMMAND jsrf_adx_guard_test on)
+add_test(NAME jsrf_adx_guard_on COMMAND jsrf_adx_guard_test on fix)
 set_tests_properties(jsrf_adx_guard_on PROPERTIES
-    ENVIRONMENT "RECOMP_ADX_SERIALIZE=1")
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=1;${_adx_fix_default};RECOMP_ADX_TRACE=")
+
+add_test(NAME jsrf_adx_guard_off_nofix COMMAND jsrf_adx_guard_test off nofix)
+set_tests_properties(jsrf_adx_guard_off_nofix PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=0;${_adx_fix_off};RECOMP_ADX_TRACE=")
+
+add_test(NAME jsrf_adx_guard_on_nofix COMMAND jsrf_adx_guard_test on nofix)
+set_tests_properties(jsrf_adx_guard_on_nofix PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=1;${_adx_fix_off};RECOMP_ADX_TRACE=")
+
+add_test(NAME jsrf_adx_guard_on_negctl COMMAND jsrf_adx_guard_test on fix force)
+set_tests_properties(jsrf_adx_guard_on_negctl PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=1;${_adx_fix_off};RECOMP_ADX_TRACE="
+    WILL_FAIL TRUE)
+
+add_test(NAME jsrf_adx_guard_on_trace COMMAND jsrf_adx_guard_test on fix)
+set_tests_properties(jsrf_adx_guard_on_trace PROPERTIES
+    ENVIRONMENT "RECOMP_ADX_SERIALIZE=1;${_adx_fix_default};RECOMP_ADX_TRACE=1")
 
 add_executable(jsrf_combiner_graffiti_test combiner_graffiti_test.c
     "${XBOXRECOMP_DIR}/src/nv2a/nv2a_texture_copy.c" "${XBOXRECOMP_DIR}/src/nv2a/nv2a_drop.c"

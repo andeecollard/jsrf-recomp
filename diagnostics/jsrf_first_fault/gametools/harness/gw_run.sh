@@ -7,13 +7,15 @@
 S=${JSRF_RUNS:-$HOME/jsrf-build/runs}
 R=/Users/andrewcollard/jsrf/xboxrecomp_upstream_integration
 H=$R/diagnostics/jsrf_first_fault/stage_harness
+# JSRF_BIN points a run at a private build (e.g. a worktree's) instead of the live one.
+BIN=${JSRF_BIN:-$R/build-macos/jsrf-first-fault/build-feav/jsrf_first_fault}
 ICL="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Jet Set Radio Future"
 name=$1 budget=$2 quiet=$3 gap=$4; shift 4
 for attempt in 1 2; do
   O=$S/runs/$name; [[ $attempt = 2 ]] && O=$S/runs/$name.retry
   rm -rf $O; mkdir -p $S/runs
   /usr/bin/python3 $H/run.py --scenario $H/garage.json --debug-seconds $((budget + 400)) \
-    --binary $R/build-macos/jsrf-first-fault/build-feav/jsrf_first_fault \
+    --binary $BIN \
     --game "$ICL/Jet Set Radio Future (US)" --hdd "$HOME/Library/Application Support/JSRF/hdd" \
     --out $O --env SDL_AUDIODRIVER=no_such_driver --env RECOMP_GLITCH_WATCH=1 \
     --env RECOMP_FLIGHT_DIR=$O/glitch "$@" > $O.console 2>&1 &
@@ -40,7 +42,7 @@ for attempt in 1 2; do
     /usr/bin/python3 $H/debug.py $O capture > $O.capturelast 2>&1
   fi
   /usr/bin/python3 $H/debug.py $O stop >/dev/null 2>&1
-  sleep 8; kill $PY 2>/dev/null; sleep 2; pkill -f "build-feav/jsrf_first_fault"
+  sleep 8; kill $PY 2>/dev/null; sleep 2; pkill -f "$BIN"
   wait $PY
   echo "$name attempt $attempt fired=$fired done $(date +%T)" >> $S/runs.done
   (( fired )) && break
