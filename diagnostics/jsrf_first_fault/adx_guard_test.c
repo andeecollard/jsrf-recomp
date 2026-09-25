@@ -46,26 +46,68 @@ static int g_base[2];        /* each thread's base priority */
 static int xapi_get(int t)          { return g_base[t] == 16 ? 15 : g_base[t]; }
 static void xapi_set(int t, int v)  { g_base[t] = (v == 15) ? 16 : v; }
 
+/* Both mirror jsrf_manual_overrides.c call for call, including the G66
+ * ledger's decisions (adx_guard.h, WHOSE PRIORITY THE ONE SLOT HOLDS): an owed
+ * restore is collected at entry, the lock tells the ledger whether it raised,
+ * and the unlock asks it whether the slot is this thread's to restore. */
 static void guest_lock(int t)
 {
+    int p, raised = 0, pre = 0;
+    if (adx_prio_take_owed(&p)) xapi_set(t, p);
     adx_guard_lock_enter();
     if (g_count == 0) {                 /* the `jne` */
-        g_saved = xapi_get(t);
+        pre = xapi_get(t);
+        g_saved = pre;
         xapi_set(t, 15);
+        raised = 1;
     }
     ++g_count;
+    adx_prio_note_lock(raised, pre);
+    adx_trace_note(ADX_EV_LOCK, 0, g_count - 1, g_count, 0,
+                   raised ? 15 : ADX_PRIO_NONE);
 }
 
-static void guest_unlock(int t)
+/* Returns what adx_guard_unlock_enter() said. */
+static int guest_unlock(int t)
 {
+    int p, r, matched, prio_set = ADX_PRIO_NONE;
+    if (adx_prio_take_owed(&p)) xapi_set(t, p);
     /* Mirrors sub_0013B0E0: a refused pass returns without touching either
      * shared word and without a leave, because nothing was taken. */
-    if (adx_guard_unlock_enter() < 0) return;
+    r = adx_guard_unlock_enter();
+    if (r < 0) return r;
+    matched = adx_prio_note_unlock();
+    if (g_count <= 0 && adx_unmatched_safe_on()) {
+        adx_prio_note_clamp();
+        if (!matched && xapi_get(t) == 15) {
+            adx_prio_rescue(&p);
+            xapi_set(t, p);
+            prio_set = p;
+        }
+        adx_trace_note(ADX_EV_UNLOCK, 0, g_count, g_count, r, prio_set);
+        adx_trace_note(ADX_EV_CLAMP, 0, g_count, g_count, r, prio_set);
+        adx_guard_unlock_leave();
+        return r;
+    }
     --g_count;
-    if (g_count == 0)                   /* the `jne` */
+    if (g_count == 0 && adx_prio_restore_here()) {  /* the `jne` */
         xapi_set(t, g_saved);
+        prio_set = g_saved;
+    }
+    adx_trace_note(ADX_EV_UNLOCK, 0, g_count + 1, g_count, r, prio_set);
     adx_guard_unlock_leave();
+    return r;
 }
+
+/* WHAT THE ASSERTIONS EXPECT, kept apart from what the model DOES. The model
+ * (guest_lock/guest_unlock) always follows the real switches, as the
+ * overrides do. The assertions follow the arm named on the command line when
+ * there is one, so the negative-control ctest can name "fix", run with both
+ * switches at 0, and must FAIL -- which is the proof that the fix assertions
+ * can see the defect at all. */
+static int want_fix = -1;
+static int expect_ptr(void)  { return want_fix >= 0 ? want_fix : adx_per_thread_restore_on(); }
+static int expect_safe(void) { return want_fix >= 0 ? want_fix : adx_unmatched_safe_on(); }
 
 /* ── a step gate, so the interleave is driven and not raced ──────────────── */
 
@@ -200,9 +242,22 @@ static int run_interleave(int guarded)
         release_step(4); CHECK(done_within(4, 5000), "B's unlock stalled");
         release_step(5); CHECK(done_within(5, 5000), "A's relock stalled");
 
-        CHECK(g_saved == 15,
-              "the poison did NOT form unguarded (saved=%d) -- the model no"
-              " longer reproduces the defect it is guarding", g_saved);
+        /* Unguarded, B's unlock takes the count to 0 and B is not the
+         * raiser. Guest behaviour restores A's 8 onto B and A saves 15 at
+         * step 5 -- the positive control. The per-thread restore leaves B
+         * alone and owes A its 8, which A collects at step 5 before it
+         * saves: the same fix closes the original 21 Sep interleave. */
+        if (expect_ptr()) {
+            CHECK(g_saved == 8,
+                  "per-thread restore: A should save its own 8, saved=%d",
+                  g_saved);
+            CHECK(g_base[1] == 9, "B should keep its own 9, has %d",
+                  g_base[1]);
+        } else {
+            CHECK(g_saved == 15,
+                  "the poison did NOT form unguarded (saved=%d) -- the model"
+                  " no longer reproduces the defect it is guarding", g_saved);
+        }
     }
 
     pthread_join(a, NULL);
@@ -285,12 +340,7 @@ static void *contended_unmatched(void *unused)
     /* B never locked, and A is inside its region. Under the guard this must
      * be refused outright. The old code waited adx_guard_timeout_ms() and
      * then STOLE, which let this body run underneath A -- the whole defect. */
-    r_contended = adx_guard_unlock_enter();
-    if (r_contended >= 0) {             /* let in: run the body it would run */
-        --g_count;
-        if (g_count == 0) xapi_set(1, g_saved);
-        adx_guard_unlock_leave();
-    }
+    r_contended = guest_unlock(1);
     mark_done(6);
     return NULL;
 }
@@ -339,6 +389,14 @@ static void run_unmatched_contended(int guarded)
         guest_unlock(0);
         guest_unlock(0);
         CHECK(g_base[0] == 1, "A was not restored, base=%d", g_base[0]);
+    } else if (expect_ptr()) {
+        /* B's unmatched unlock took the count 1 -> 0 but B did not raise, so
+         * B is left alone and A is owed its 1 -- collected before A's nested
+         * lock saves, so the slot holds 1 and not 15. */
+        CHECK(g_saved == 1,
+              "per-thread restore: A should save its own 1, saved=%d", g_saved);
+        CHECK(g_base[1] == 1, "B was given a priority it never had (%d)",
+              g_base[1]);
     } else {
         /* The positive control. Without the guard this exact sequence is the
          * one the log recorded, and it must still reach 15 -- otherwise the
@@ -409,6 +467,188 @@ static void run_block_release(int guarded)
       CHECK(st.block_releases == 1, "block_releases should be 1, is %lu", st.block_releases); }
 }
 
+/* ── G66: the block-release window hands A's priority to M ───────────────
+ *
+ * The interleave behind "A16 M1" in every poisoned KeSetBasePriority trace
+ * (adx_guard.h, WHOSE PRIORITY THE ONE SLOT HOLDS), driven step by step. The
+ * blocking waits are the kernel's hooks, called exactly where
+ * bridge_KeWaitForSingleObject calls them. Guard on, each step is admitted by
+ * the block-release rule; guard off, the steps are simply serial -- the guest
+ * words see the same sequence either way, which is why this runs in every
+ * arm.
+ *
+ *     1 A locks        count 0->1, slot := A's 8, A raised to 16
+ *     2 A blocks       the guard lets go
+ *     3 M locks        count 1->2, the `jne` skips
+ *     4 M blocks       the guard lets go
+ *     5 A wakes
+ *     6 A unlocks      count 2->1, the `jne` skips -- A still at 16
+ *     7 M wakes
+ *     8 M unlocks      count 1->0: guest restores A's 8 ONTO M
+ *     9 A locks again  guest: A still at 16, saves 15.  POISONED.
+ */
+static unsigned w_saved_a, w_saved_m;
+static int w_base_a_after8, w_base_m_after8, w_saved_after8;
+
+static void *win_a(void *u)
+{
+    (void)u;
+    await_step(1); guest_lock(0);                         mark_done(1);
+    await_step(2); w_saved_a = adx_guard_block_begin();   mark_done(2);
+    await_step(5); adx_guard_block_end(w_saved_a);        mark_done(5);
+    await_step(6); guest_unlock(0);                       mark_done(6);
+    await_step(9); guest_lock(0);                         mark_done(9);
+    await_step(10); guest_unlock(0);                      mark_done(10);
+    return NULL;
+}
+
+static void *win_m(void *u)
+{
+    (void)u;
+    await_step(3); guest_lock(1);                         mark_done(3);
+    await_step(4); w_saved_m = adx_guard_block_begin();   mark_done(4);
+    await_step(7); adx_guard_block_end(w_saved_m);        mark_done(7);
+    await_step(8); guest_unlock(1);
+    w_base_a_after8 = g_base[0];
+    w_base_m_after8 = g_base[1];
+    w_saved_after8  = g_saved;                            mark_done(8);
+    return NULL;
+}
+
+static void run_block_window(int guarded)
+{
+    pthread_t a, mt;
+    int n;
+
+    g_count = 0; g_saved = 0;
+    g_base[0] = 8; g_base[1] = 9;       /* A (the ADX thread), M (main) */
+    step = 0; done = 0;
+    adx_guard_reset_for_test();
+
+    pthread_create(&a, NULL, win_a, NULL);
+    pthread_create(&mt, NULL, win_m, NULL);
+    for (n = 1; n <= 10; ++n) {
+        release_step(n);
+        CHECK(done_within(n, 3000), "block window: step %d never completed"
+              " (guard %s)", n, guarded ? "on" : "off");
+        if (n == 1) {
+            CHECK(g_saved == 8 && g_base[0] == 16,
+                  "step 1: A should save 8 and sit at 16 (saved=%d base=%d)",
+                  g_saved, g_base[0]);
+        }
+        if (n == 3)
+            CHECK(g_count == 2, "step 3: M should be in, count=%d", g_count);
+    }
+    pthread_join(a, NULL);
+    pthread_join(mt, NULL);
+
+    if (guarded)
+        CHECK(w_saved_a == 1 && w_saved_m == 1,
+              "both holders should have parked depth 1 (A %u, M %u)",
+              w_saved_a, w_saved_m);
+
+    if (expect_ptr()) {
+        CHECK(w_base_m_after8 == 9,
+              "FIX: M's unlock to 0 must leave M's own 9, M has %d",
+              w_base_m_after8);
+        CHECK(w_saved_after8 == 8, "the guest slot must still hold what A's"
+              " lock wrote (8), holds %d", w_saved_after8);
+        CHECK(g_saved == 8,
+              "FIX: A's relock must save A's own 8 (owed restore collected"
+              " first), saved=%d", g_saved);
+        CHECK(g_base[0] == 8, "A should be back at 8 after its own unlock,"
+              " is %d", g_base[0]);
+        if (adx_trace_on())
+            CHECK(adx_trace_fired() & 8, "the trace did not dump 'cross'");
+    } else {
+        /* THE NEGATIVE CONTROL: the defect as the logs recorded it. */
+        CHECK(w_base_m_after8 == 8,
+              "CONTROL: without the fix M should receive A's 8, has %d"
+              " -- the model no longer reproduces A16 M1", w_base_m_after8);
+        CHECK(w_base_a_after8 == 16,
+              "CONTROL: A should be left at 16, is %d", w_base_a_after8);
+        CHECK(g_saved == 15,
+              "CONTROL: A's relock should save 15 (poisoned), saved=%d",
+              g_saved);
+    }
+}
+
+/* ── G66: CRI's drop-all-nesting loop must terminate ─────────────────────
+ *
+ * sub_001437B0: `while (GetThreadPriority(self) == 15) unlock();`. The thread
+ * got 15 from a poisoned slot, holds nothing, and the count is 0. Without the
+ * fix every pass decrements, the count runs negative, no pass ever restores,
+ * and the loop never ends (bounded here at 1000 passes). */
+static void run_spin_breaker(void)
+{
+    int passes;
+
+    g_count = 0; g_saved = 0; g_base[1] = 0;     /* M: NORMAL */
+    adx_guard_reset_for_test();
+
+    guest_lock(1);                     /* M's own raise: saves 0 */
+    guest_unlock(1);
+    CHECK(g_base[1] == 0 && g_count == 0, "setup: M should be back at 0");
+
+    g_base[1] = 16;                    /* 15 handed to M by a poisoned slot */
+    for (passes = 0; passes < 1000 && xapi_get(1) == 15; ++passes)
+        guest_unlock(1);
+
+    if (expect_safe()) {
+        CHECK(passes == 1, "FIX: the loop should exit after one pass, took"
+              " %d", passes);
+        CHECK(g_count == 0, "FIX: the count must not go below 0, is %d",
+              g_count);
+        CHECK(g_base[1] == 0, "FIX: M should get its own 0 back, has %d",
+              g_base[1]);
+        if (adx_trace_on())
+            CHECK(adx_trace_fired() & 16, "the trace did not dump 'clamp'");
+    } else {
+        CHECK(passes == 1000, "CONTROL: without the fix the loop should spin"
+              " (bounded at 1000), exited after %d", passes);
+        CHECK(g_count == -1000, "CONTROL: the count should run to -1000, is"
+              " %d", g_count);
+    }
+
+    /* A thread that never raised has no saved priority of its own: NORMAL. */
+    if (expect_safe()) {
+        adx_guard_reset_for_test();
+        g_count = 0; g_base[1] = 16;
+        for (passes = 0; passes < 1000 && xapi_get(1) == 15; ++passes)
+            guest_unlock(1);
+        CHECK(passes == 1 && g_base[1] == 0 && g_count == 0,
+              "FIX, no own raise: should fall back to NORMAL in one pass"
+              " (passes %d base %d count %d)", passes, g_base[1], g_count);
+    }
+}
+
+/* ── the trace's leak test sees a nesting lost across a blocking wait ─────
+ *
+ * Guest code run from inside a blocking wait (a DPC from the wait loop, on the
+ * same host thread) that locks and has not unlocked when the wait ends: the
+ * wait's block_end overwrites t_depth with the depth parked at block_begin,
+ * and the inner level is gone. One candidate for G66's lock leak; this proves
+ * only that the trace would name it, not that it happens in the title. */
+static void run_leak_detector(int guarded)
+{
+    unsigned parked;
+    if (!guarded || !adx_trace_on()) return;
+    adx_guard_reset_for_test();
+    g_count = 0; g_base[0] = 1;
+
+    guest_lock(0);
+    CHECK(!(adx_trace_fired() & 1), "leak dumped with nothing lost");
+    parked = adx_guard_block_begin();
+    guest_lock(0);                     /* inside the wait */
+    CHECK(!(adx_trace_fired() & 1), "leak dumped before anything was lost");
+    adx_guard_block_end(parked);       /* the inner level is overwritten */
+    CHECK(adx_trace_fired() & 1,
+          "a nesting lost across block_end was not reported as a leak");
+    guest_unlock(0);
+    guest_unlock(0);
+    adx_guard_reset_for_test();
+}
+
 int main(int argc, char **argv)
 {
     int guarded = adx_guard_on();
@@ -426,13 +666,39 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    fprintf(stderr, "arm: guard %s\n", guarded ? "ON" : "off");
+    /* The second word names the G66 fixes' expected state the same way:
+     * "fix" = both on (their default), "nofix" = both off, the negative
+     * control. Without it an arm meant to be the control could quietly run
+     * the fix and pass. */
+    if (argc > 2) {
+        int expect = strcmp(argv[2], "fix") == 0;
+        want_fix = expect;
+        /* "force" skips the agreement check: the negative control. */
+        int force = argc > 3 && strcmp(argv[3], "force") == 0;
+        if (!force && (adx_per_thread_restore_on() != expect
+                       || adx_unmatched_safe_on() != expect)) {
+            fprintf(stderr,
+                    "FAIL: arm '%s' but RECOMP_ADX_PER_THREAD_RESTORE reads %s"
+                    " and RECOMP_ADX_UNMATCHED_SAFE reads %s\n", argv[2],
+                    adx_per_thread_restore_on() ? "on" : "off",
+                    adx_unmatched_safe_on() ? "on" : "off");
+            return 1;
+        }
+    }
+    fprintf(stderr, "arm: guard %s, per-thread restore %s, unmatched-safe %s,"
+                    " trace %s\n", guarded ? "ON" : "off",
+            adx_per_thread_restore_on() ? "ON" : "off",
+            adx_unmatched_safe_on() ? "ON" : "off",
+            adx_trace_on() ? "ON" : "off");
 
     run_interleave(guarded);
     run_recursive();
     run_unmatched();
     run_unmatched_contended(guarded);
     run_block_release(guarded);
+    run_block_window(guarded);
+    run_spin_breaker();
+    run_leak_detector(guarded);
     adx_guard_report();
 
     fprintf(stderr, "%s\n", fail ? "FAILED" : "ok");

@@ -126,7 +126,19 @@ void sub_001A308E(void)
  *
  * Both are cdecl with no arguments, so the epilogue is `g_esp += 4`. The
  * bodies below are transcribed instruction-for-instruction from the generated
- * ones; the only additions are the guard calls.
+ * ones; the additions are the guard calls and, since G66, the per-thread
+ * ledger's three decisions (adx_guard.h, WHOSE PRIORITY THE ONE SLOT HOLDS):
+ *
+ *   entry           a thread OWED its own pre-raise priority collects it
+ *                   (RECOMP_ADX_PER_THREAD_RESTORE)
+ *   unlock at <= 0  not applied; a caller that holds nothing and reads 15 is
+ *                   given its own last pre-raise priority back
+ *                   (RECOMP_ADX_UNMATCHED_SAFE)
+ *   unlock to 0     the slot is restored onto the unlocking thread only if it
+ *                   is the thread that raised (RECOMP_ADX_PER_THREAD_RESTORE)
+ *
+ * The lock's write of 0x0027D0F8 is untouched: the guest reads that slot and
+ * must go on finding what it wrote there. RECOMP_ADX_TRACE records each call.
  */
 #include "adx_guard.h"
 
@@ -138,10 +150,54 @@ void sub_00147D12(void);     /* XAPILIB::GetThreadPriority */
 void sub_00147DAC(void);     /* XAPILIB::SuspendThread     */
 void sub_00147DD2(void);     /* XAPILIB::ResumeThread      */
 
+static int adx_read_count(void) { return (int)(int32_t)MEM32(0x25EFA0); }
+
+/* SetThreadPriority(NtCurrentThread, prio) / GetThreadPriority(NtCurrentThread)
+ * through the guest's own XAPI, exactly as the bodies call them. `site` is
+ * pushed as the return address: the routine's own entry, so a KeSetBasePriority
+ * trace names the call as ours rather than inventing a guest call site. Both
+ * are stdcall and pop their arguments; eax/ecx/edx are the cdecl caller's to
+ * lose, as they are to the bodies. */
+static void adx_set_own_priority(uint32_t site, int prio)
+{
+    PUSH32(g_esp, (uint32_t)prio);
+    PUSH32(g_esp, 0xFFFFFFFEu);
+    PUSH32(g_esp, site); RECOMP_ABI_CALL(0x00147CC0u, sub_00147CC0);
+}
+
+static int adx_get_own_priority(uint32_t site)
+{
+    PUSH32(g_esp, 0xFFFFFFFEu);
+    PUSH32(g_esp, site); RECOMP_ABI_CALL(0x00147D12u, sub_00147D12);
+    return (int)(int32_t)g_eax;
+}
+
+/* A raiser whose count reached zero on another thread collects its own
+ * priority here, on its own thread, before the body can read or save it. */
+static void adx_pay_owed(uint32_t site, uint32_t ra)
+{
+    int p;
+    static int count_source_set;
+    if (!count_source_set) {
+        adx_trace_set_count_source(adx_read_count);
+        count_source_set = 1;
+    }
+    if (adx_prio_take_owed(&p)) {
+        adx_set_own_priority(site, p);
+        adx_trace_note(ADX_EV_OWED, ra, adx_read_count(), adx_read_count(),
+                       0, p);
+    }
+}
+
 void sub_0013B0A0(void)
 {
+    uint32_t ra = MEM32(g_esp);     /* the guest caller, for the trace */
+    int before, pre_raise = 0, raised = 0, raise_to = ADX_PRIO_NONE;
+
+    adx_pay_owed(0x0013B0A0u, ra);
     adx_guard_lock_enter();     /* held past this body, to the matching unlock */
 
+    before = adx_read_count();
     g_eax = MEM32(0x25EFA0);
     if (g_eax != 0) goto loc_0013B0D3;      /* jne */
 
@@ -150,7 +206,10 @@ void sub_0013B0A0(void)
     PUSH32(g_esp, 0x0013B0B1u); RECOMP_ABI_CALL(0x00147D12u, sub_00147D12);
 
     g_esi = g_eax;
+    pre_raise = (int)(int32_t)g_eax;
+    raised = 1;
     g_eax = MEM32(0x25EF8C);
+    raise_to = (int)(int32_t)g_eax;
     PUSH32(g_esp, g_eax);
     PUSH32(g_esp, 0xFFFFFFFEu);
     PUSH32(g_esp, 0x0013B0C0u); RECOMP_ABI_CALL(0x00147CC0u, sub_00147CC0);
@@ -164,20 +223,54 @@ void sub_0013B0A0(void)
 
 loc_0013B0D3:
     RECOMP_MEM_WRITE32(0x0013B0D3u, 0x0013B0A0u, 0x25EFA0, MEM32(0x25EFA0) + 1);
+    adx_prio_note_lock(raised, pre_raise);
+    adx_trace_note(ADX_EV_LOCK, ra, before, adx_read_count(), 0, raise_to);
 
     g_esp += 4;         /* ret -- the guard stays held on purpose */
 }
 
 void sub_0013B0E0(void)
 {
+    uint32_t ra = MEM32(g_esp);
+    int before, admitted, matched, prio_set = ADX_PRIO_NONE;
+
+    adx_pay_owed(0x0013B0E0u, ra);
+    before = adx_read_count();
+
     /* An unlock from a thread that never locked, arriving while another
      * thread is inside the region, is a spin pass that an elevated holder
      * would have prevented from running at all. Drop it: the body would
      * decrement the refcount and rewrite the one saved-priority slot
      * underneath the holder, which is how 0x0027D0F8 came to hold 15 on
      * 21 Sep 2026. CRI's guard at sub_001437B0 calls this again next pass. */
-    if (adx_guard_unlock_enter() < 0) {
+    admitted = adx_guard_unlock_enter();
+    if (admitted < 0) {
+        adx_trace_note(ADX_EV_UNLOCK, ra, before, before, admitted,
+                       ADX_PRIO_NONE);
         g_esp += 4;     /* ret, with the guest's words untouched */
+        return;
+    }
+    matched = adx_prio_note_unlock();
+
+    /* UNMATCHED-SAFE. At count <= 0 there is nothing to unlock: on hardware
+     * no unlock runs here, and the decrement is what drove 0x0025EFA0 to
+     * -32,680,066 on 21 Sep and negative again in every poisoned G66 run. The
+     * caller is sub_001437B0's `while (GetThreadPriority(self) == 15) unlock`;
+     * if it holds nothing and still reads 15, nothing the unlock can do will
+     * ever lower it, so hand it back its own pre-raise priority and let the
+     * loop exit. */
+    if ((int32_t)MEM32(0x25EFA0) <= 0 && adx_unmatched_safe_on()) {
+        adx_prio_note_clamp();
+        if (!matched && adx_get_own_priority(0x0013B0E0u) == 15) {
+            int p;
+            adx_prio_rescue(&p);
+            adx_set_own_priority(0x0013B0E0u, p);
+            prio_set = p;
+        }
+        adx_trace_note(ADX_EV_UNLOCK, ra, before, before, admitted, prio_set);
+        adx_trace_note(ADX_EV_CLAMP, ra, before, before, admitted, prio_set);
+        adx_guard_unlock_leave();
+        g_esp += 4;
         return;
     }
 
@@ -188,12 +281,20 @@ void sub_0013B0E0(void)
     PUSH32(g_esp, g_eax);
     PUSH32(g_esp, 0x0013B0F3u); RECOMP_ABI_CALL(0x00147DACu, sub_00147DAC);
 
+    /* PER-THREAD RESTORE: the slot belongs to the thread that raised. When
+     * that is not this thread, this thread was never raised by this region
+     * and keeps its priority; the raiser is owed its own (adx_pay_owed). */
+    if (!adx_prio_restore_here()) goto loc_0013B101;
+
     g_ecx = MEM32(0x27D0F8);
+    prio_set = (int)(int32_t)g_ecx;
     PUSH32(g_esp, g_ecx);
     PUSH32(g_esp, 0xFFFFFFFEu);
     PUSH32(g_esp, 0x0013B101u); RECOMP_ABI_CALL(0x00147CC0u, sub_00147CC0);
 
 loc_0013B101:
+    adx_trace_note(ADX_EV_UNLOCK, ra, before, adx_read_count(), admitted,
+                   prio_set);
     adx_guard_unlock_leave();   /* releases what the matching lock took */
     g_esp += 4;         /* ret */
 }
