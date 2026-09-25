@@ -8,11 +8,11 @@ corrected on the night of 21 September against the 1167 s player session in
 Every number here came from a run; where something is believed rather than
 measured it says so.
 
-## Summary, 25 September 2026
+## Summary, 25 September 2026 (updated after the player's morning session)
 
 Newest first; the sections below it are the older measured record and remain
 true unless this summary says otherwise. The plan and the evidence behind
-each line are in `goals/JSRF_GOALS_2026-09-24_NIGHT_EVERY_SCENE_IS_REACHABLE.md`.
+each line are in the newest file in `goals/` (25 Sep: `JSRF_GOALS_2026-09-25_DAY_FROM_PLAYABLE_TO_POLISHED.md`).
 **Measured** means a run or a player session produced the number;
 **observed** means seen on screen without a controlled comparison.
 
@@ -20,7 +20,7 @@ each line are in `goals/JSRF_GOALS_2026-09-24_NIGHT_EVERY_SCENE_IS_REACHABLE.md`
 |---|---|---|
 | story progression | playable into chapter 2; the save decodes to chapter 2 mission 240, 6 characters, 23 souls, Rokkaku-dai 16 Poison Jam tags still to cover | measured: save decoder, byte-for-byte round trip |
 | every chapter reachable | chapters 2 (missions 0, 10, 40, 96) and 5 (10) entered unattended with no fault | measured: `RECOMP_CHAPTER_JUMP` runs |
-| cutscene one-frame dropouts | fixed (G57, `frndint` rounding control); chapter-2 intro 11 transient frames → 0 | measured: flight recorder, before/after on one build |
+| cutscene one-frame dropouts | fixed (G57, `frndint` rounding control); every police and DJ K dropout gone in a 37-jump sweep | measured, and confirmed by the player 25 Sep ("the disappearing police seems to have disappeared") |
 | Rokkaku-dai city | fixed (G54) | player session |
 | characters whited out in Rokkaku-dai | fixed (G58, 16-bit swizzled textures on the GPU) | player session |
 | stage music dying after ~2 min | fixed (DSOUND lift, 23 Sep); stage track read in real time to the end of a 1,370 s session; 14 small underruns in it | measured: ADX reads matched against the file; content not checked by ear |
@@ -30,8 +30,10 @@ each line are in `goals/JSRF_GOALS_2026-09-24_NIGHT_EVERY_SCENE_IS_REACHABLE.md`
 | corrupt glyphs in speech boxes / trick names (G2) | open, not re-measured since 21 Sep | — |
 | Poison Jam chase cutscene elements | open; needs the chase played to reach | — |
 | boost flicker | open, not re-tested since G57 | — |
-| frame time | tutorial ≈ 11.5 ms (86 fps uncapped) with combiner specialisation; heavy scenes last measured before it at a 50 fps median | measured 24 Sep / 23 Sep; heavy scenes need re-measuring |
-| fault rate | not re-measured since the 21 Sep figures below | — |
+| frame time | capped at 60 Hz: most stages 18–31 ms, Skyscraper 33–37, Sky Dino 34 after the texture-cache fix (was 99–110) | measured: 25 Sep game map (68 runs) and a same-binary A/B; the player reports performance better |
+| occasional hitches | shader pipelines compiled on first use: 114 in one session, 5.66 s total, worst 883 ms; frames of 1–2 s mid-play | measured in the player's 25 Sep log; fix in progress (G70) |
+| thin line above text, tutorial boost | open (G71, G72) | player report 25 Sep |
+| whole game | every chapter hub and all 20 free-play stages load and play with no fault; 74 jump-reachable cutscenes with no fault; two intermittent hangs mitigated/instrumented (G66, G69) | measured: game map and cutscene sweep, 25 Sep |
 
 ## Fixed 21 September 2026 — the Load screen, the light, and the character select
 
