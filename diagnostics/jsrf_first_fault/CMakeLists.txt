@@ -388,8 +388,8 @@ target_include_directories(jsrf_adx_guard_test PRIVATE .)
 # 0. The `negctl` arm expects the fix but runs without it and MUST FAIL: that is
 # the proof the fix assertions can see the defect. `trace` checks that each
 # dump reason the fixes depend on fires.
-set(_adx_fix_default "RECOMP_ADX_PER_THREAD_RESTORE=;RECOMP_ADX_UNMATCHED_SAFE=")
-set(_adx_fix_off "RECOMP_ADX_PER_THREAD_RESTORE=0;RECOMP_ADX_UNMATCHED_SAFE=0")
+set(_adx_fix_default "RECOMP_ADX_PER_THREAD_RESTORE=;RECOMP_ADX_UNMATCHED_SAFE=;RECOMP_ADX_OUTER_REGION=")
+set(_adx_fix_off "RECOMP_ADX_PER_THREAD_RESTORE=0;RECOMP_ADX_UNMATCHED_SAFE=0;RECOMP_ADX_OUTER_REGION=0")
 
 add_test(NAME jsrf_adx_guard_off COMMAND jsrf_adx_guard_test off fix)
 set_tests_properties(jsrf_adx_guard_off PROPERTIES
@@ -764,6 +764,10 @@ target_compile_definitions(jsrf_first_fault PRIVATE
 # gen tree in build-macos predates that commit by two hours, so the shipped
 # binary still has all 440. A regeneration is what actually clears them --
 # this flag is what stops the next one going unnoticed.
+# The one translation unit whose guest bodies are strong over the gen tree's
+# (guest_trace.h, HAND-WRITTEN BODIES ADDED AFTER THE GEN TREE WAS MADE).
+set_source_files_properties(jsrf_manual_overrides.c PROPERTIES
+    COMPILE_DEFINITIONS JSRF_MANUAL_OVERRIDES_TU)
 target_compile_options(jsrf_first_fault PRIVATE
     ${JSRF_OPT_LEVEL} -g -fno-omit-frame-pointer
     -fwrapv

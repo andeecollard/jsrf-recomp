@@ -115,4 +115,19 @@ void jsrf_corn_note(uint32_t id, uint32_t self, uint32_t flags,
                     uint32_t r2d0, uint32_t r38);
 extern unsigned long long g_exec_dispatches;
 
+/* HAND-WRITTEN BODIES ADDED AFTER THE GEN TREE WAS MADE.
+ *
+ * jsrf_manual_overrides.c normally replaces a guest function through the
+ * recompiler's --exclude-manual, which needs a regeneration. These two were
+ * added later (G66: CRI's outer nesting word, adx_guard.h), so the generated
+ * bodies still exist; declaring them weak here -- this header is force-included
+ * into every translation unit of the game -- lets the strong definitions in
+ * jsrf_manual_overrides.c (compiled with JSRF_MANUAL_OVERRIDES_TU) win at link
+ * time, and every direct call and the dispatch table resolve to them. Once a
+ * regeneration excludes them, the weak generated bodies simply disappear. */
+#ifndef JSRF_MANUAL_OVERRIDES_TU
+void sub_0013C460(void) __attribute__((weak));
+void sub_0013C480(void) __attribute__((weak));
+#endif
+
 #endif

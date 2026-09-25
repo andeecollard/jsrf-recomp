@@ -20,6 +20,7 @@ static __thread unsigned long t_id;
  * hooks), the depth that wait parked, and -- set by block_end for its own
  * trace note -- the guard levels it overwrote. */
 static __thread int           t_in_wait;
+static __thread unsigned      t_region;  /* of t_depth, outer-region levels */
 static __thread unsigned      t_parked;
 static __thread long          t_lost;
 static long g_lost_total;            /* levels overwritten by block_end, ever */
@@ -58,6 +59,7 @@ static struct adx_guard_stats g_st;
  * missing -- which is the G66 lock leak. Maintained under g_m. */
 static long g_tsum;
 static long g_parked;
+static long g_regions;               /* outer-region levels held or parked */
 static void prio_report(void);         /* the ledger's report line, below */
 
 int adx_guard_on(void)
@@ -291,6 +293,34 @@ void adx_guard_block_end(unsigned saved_depth)
     t_lost = 0;
 }
 
+int adx_outer_region_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_ADX_OUTER_REGION", 1);
+    return on;
+}
+
+/* See adx_guard.h, CRI'S OUTER NESTING WORD IS PART OF THE REGION. */
+void adx_guard_region_enter(void)
+{
+    if (!adx_guard_on() || !adx_outer_region_on()) return;
+    guard_acquire();
+    ++t_region;
+    pthread_mutex_lock(&g_m);
+    ++g_regions;
+    pthread_mutex_unlock(&g_m);
+}
+
+void adx_guard_region_leave(void)
+{
+    if (!adx_guard_on() || !adx_outer_region_on()) return;
+    guard_release();
+    if (t_region) --t_region;
+    pthread_mutex_lock(&g_m);
+    --g_regions;
+    pthread_mutex_unlock(&g_m);
+}
+
 void adx_guard_lock_enter(void)
 {
     if (!adx_guard_on()) return;
@@ -308,7 +338,9 @@ int adx_guard_unlock_enter(void)
      * else writes it. A thread that was stolen from still reads > 0 here and
      * is still a matched unlock -- guard_release() sorts that out and counts
      * it as stolen_from. */
-    if (t_depth > 0) {
+    /* A level held only for an outer-region body (sub_0013C480 around this
+     * unlock) is not a lock: the unlock is matched only above those. */
+    if (t_depth > t_region) {
         pthread_mutex_lock(&g_m);
         ++g_st.unlocks_matched;
         pthread_mutex_unlock(&g_m);
@@ -405,9 +437,11 @@ void adx_guard_reset_for_test(void)
     g_depth = 0;
     g_tsum = 0;
     g_parked = 0;
+    g_regions = 0;
     g_lost_total = 0;
     pthread_mutex_unlock(&g_m);
     t_depth = 0;
+    t_region = 0;
     t_in_wait = 0;
     t_parked = 0;
     t_lost = 0;
@@ -680,7 +714,8 @@ static void dump_locked(const char *reason, unsigned long tail)
                     " passed to SetThreadPriority, lmm=locks-matched,"
                     " leak=lmm-live nesting, live=guard nesting summed,"
                     " held=ledger sum/self, w=in a blocking wait, irq=isr|dpc|"
-                    "depth<<2, esp/tib=guest, from=caller chain, lost=levels"
+                    "depth<<2, esp/tib=guest, oc=CRI outer nesting 0x25EFEC,"
+                    " from=caller chain, lost=levels"
                     " a wait's end overwrote (lost total %ld)\n",
             reason, g_seq - first, g_seq, g_lost_total);
     for (s = first; s < g_seq; ++s) {
@@ -695,13 +730,13 @@ static void dump_locked(const char *reason, unsigned long tail)
         fprintf(stderr, "  [ADX-TRACE] %s #%lu t=%.3fms tid=%llu %-12s"
                         " ra=0x%08X count=%s->%s depth=%u/%u+%u res=%d mt=%d"
                         " prio=%s lmm=%ld leak=%ld live=%ld held=%ld/%ld w=%d"
-                        " irq=%u esp=0x%08X tib=0x%08X from=%08X<%08X<%08X<%08X"
+                        " irq=%u esp=0x%08X tib=0x%08X oc=%d from=%08X<%08X<%08X<%08X"
                         " lost=%ld\n",
                 reason, e->seq, e->t_ms, e->tid, ev_name(e->type), e->ra,
                 cb, ca, e->self_depth, e->holder_depth, e->parked_self,
                 e->res, e->matched, pr, e->locks_minus_matched, e->leak,
                 e->live, e->held_sum, e->self_held, e->in_wait, e->ctx.irq,
-                e->ctx.esp, e->ctx.tib, e->ctx.stack[0], e->ctx.stack[1],
+                e->ctx.esp, e->ctx.tib, e->ctx.outer, e->ctx.stack[0], e->ctx.stack[1],
                 e->ctx.stack[2], e->ctx.stack[3], e->lost);
     }
     if (!tail) {
@@ -767,7 +802,7 @@ void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
     e.holder_depth = g_depth;
     e.parked_self = t_parked;
     e.locks_minus_matched = (long)g_st.locks - (long)g_st.unlocks_matched;
-    e.live = g_tsum + g_parked;
+    e.live = g_tsum + g_parked - g_regions;   /* region levels are not locks */
     e.leak = e.locks_minus_matched - e.live;
     /* An admitted unlock is noted before its leave(): the level it took
      * (matched: the lock's; unmatched: its own) is still in g_tsum, and a

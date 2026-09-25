@@ -166,6 +166,7 @@ static void adx_fill_ctx(struct adx_guest_ctx *c)
     c->esp = esp;
     c->tib = g_fs_base;
     c->irq = xbox_IrqContextBits();
+    c->outer = (int)(int32_t)MEM32(0x25EFEC);
     if (!esp) return;
     a = esp + 8;                     /* skip the wrapper and its argument */
     for (; n < ADX_CTX_STACK && a < esp + 0x400u; a += 4) {
@@ -251,6 +252,48 @@ loc_0013B0D3:
     adx_trace_note(ADX_EV_LOCK, ra, before, adx_read_count(), 0, raise_to);
 
     g_esp += 4;         /* ret -- the guard stays held on purpose */
+}
+
+/* CRI'S OUTER NESTING WORD (G66's lock leak). Transcribed from the generated
+ * bodies:
+ *
+ *   sub_0013C460   mov eax,[0x25EFEC] / test / jne +5 / call 0x141B60 /
+ *                  inc [0x25EFEC] / ret
+ *   sub_0013C480   dec [0x25EFEC] / jne +5 / jmp 0x141B80 / ret
+ *
+ * The only addition is the guard around each body (adx_guard.h, CRI'S OUTER
+ * NESTING WORD IS PART OF THE REGION): the word was read outside the lock, so
+ * the main thread could see the ADX thread's 1, skip its own lock, and later
+ * take the word to zero and unlock the ADX thread's level. Traced in
+ * ~/jsrf-build/runs/g66b/runs/leak1 (#58858-#58868) and leak3 (#79632-#79646).
+ * The `dec` sets ZF from its own result, which the body now keeps in a local
+ * rather than re-reading shared memory. */
+void sub_00141B60(void);     /* CRI lock wrapper:   call [0x2615E8] */
+void sub_00141B80(void);     /* CRI unlock wrapper: call [0x2615F0] */
+
+void sub_0013C460(void)
+{
+    adx_guard_region_enter();
+    g_eax = MEM32(0x25EFEC);
+    if (g_eax == 0) {
+        PUSH32(g_esp, 0x0013C46Eu); RECOMP_ABI_CALL(0x00141B60u, sub_00141B60);
+    }
+    RECOMP_MEM_WRITE32(0x0013C46Eu, 0x0013C460u, 0x25EFEC, MEM32(0x25EFEC) + 1);
+    adx_guard_region_leave();
+    g_esp += 4;         /* ret */
+}
+
+void sub_0013C480(void)
+{
+    uint32_t word;
+    adx_guard_region_enter();
+    word = MEM32(0x25EFEC) - 1;
+    RECOMP_MEM_WRITE32(0x0013C480u, 0x0013C480u, 0x25EFEC, word);
+    if (word == 0)
+        sub_00141B80();  /* tail jmp: its ret pops our return address */
+    else
+        g_esp += 4;      /* ret */
+    adx_guard_region_leave();
 }
 
 void sub_0013B0E0(void)

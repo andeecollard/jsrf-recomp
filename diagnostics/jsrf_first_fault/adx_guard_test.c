@@ -622,6 +622,122 @@ static void run_spin_breaker(void)
     }
 }
 
+/* ── G66's lock leak: CRI's outer nesting word read outside the lock ─────
+ *
+ * sub_0013C460 is `if (word == 0) lock(); ++word;`, sub_0013C480 is
+ * `if (--word == 0) unlock();`, and the word (0x0025EFEC) is shared by every
+ * thread. Traced in game (g66b leak1, leak3): the ADX thread A is inside
+ * (word 1, count 1, running, not blocked); main M's sub_0013C460 reads the
+ * word as 1 and SKIPS its lock; A's sub_0013C480 takes the word to 0 and
+ * unlocks; M's increment takes it back to 1 with no lock behind it; M's
+ * sub_0013C480 then unlocks a count of 0 -- or, when A holds a level again,
+ * unlocks A's level under it: the leak.
+ *
+ * The model splits M's sub_0013C460 between the read and the increment, which
+ * is the window the host's parallel threads open; M waits there long enough
+ * for A's sub_0013C480 to run if nothing stops it. With the fix both bodies
+ * run under the guard, so M's read waits for A to leave and then sees 0. */
+static int g_word;                    /* 0x0025EFEC */
+static int ow_m_read = -1, ow_m_locked, ow_count_before_m_unlock = -99;
+
+static void outer_lock(int t, int pause_ms)
+{
+    int w;
+    adx_guard_region_enter();
+    w = g_word;
+    if (t == 1) { ow_m_read = w; mark_done(10); }
+    if (pause_ms) usleep((useconds_t)pause_ms * 1000);
+    if (w == 0) {
+        guest_lock(t);
+        if (t == 1) ow_m_locked = 1;
+    }
+    g_word = g_word + 1;              /* re-read, as the lifted `inc` does */
+    adx_guard_region_leave();
+}
+
+static void outer_unlock(int t)
+{
+    adx_guard_region_enter();
+    if (--g_word == 0) {
+        if (t == 1) ow_count_before_m_unlock = g_count;
+        guest_unlock(t);
+    }
+    adx_guard_region_leave();
+}
+
+static void *ow_a(void *unused)
+{
+    (void)unused;
+    await_step(1); outer_lock(0, 0);  mark_done(1);
+    await_step(3); outer_unlock(0);   mark_done(3);
+    return NULL;
+}
+
+static void *ow_m(void *unused)
+{
+    (void)unused;
+    await_step(2); outer_lock(1, 300); mark_done(2);
+    await_step(4); outer_unlock(1);    mark_done(4);
+    return NULL;
+}
+
+static int expect_region(void)
+{
+    return want_fix >= 0 ? want_fix : adx_outer_region_on();
+}
+
+static void run_outer_word(int guarded)
+{
+    pthread_t a, mt;
+    int m_read_early;
+
+    if (!guarded) return;             /* the region is part of the guard */
+    g_count = 0; g_saved = 0; g_word = 0;
+    g_base[0] = 1; g_base[1] = 0;     /* A (ADX thread) 1, M (main) NORMAL */
+    ow_m_read = -1; ow_m_locked = 0; ow_count_before_m_unlock = -99;
+    step = 0; done = 0;
+    adx_guard_reset_for_test();
+
+    pthread_create(&a, NULL, ow_a, NULL);
+    pthread_create(&mt, NULL, ow_m, NULL);
+    release_step(1);
+    CHECK(done_within(1, 3000), "outer word: A's sub_0013C460 never completed");
+    CHECK(g_word == 1 && g_count == 1, "outer word: A should be inside (word"
+          " %d count %d)", g_word, g_count);
+    release_step(2);                  /* M reaches its sub_0013C460 */
+    m_read_early = done_within(10, 300);
+    release_step(3);                  /* A's sub_0013C480 */
+    CHECK(done_within(3, 3000), "outer word: A's sub_0013C480 never completed");
+    CHECK(done_within(2, 3000), "outer word: M's sub_0013C460 never completed");
+    release_step(4);
+    CHECK(done_within(4, 3000), "outer word: M's sub_0013C480 never completed");
+    pthread_join(a, NULL);
+    pthread_join(mt, NULL);
+
+    if (expect_region()) {
+        CHECK(!m_read_early, "FIX: M read the word while A was inside and"
+              " running -- the outer word is not under the guard");
+        CHECK(ow_m_read == 0 && ow_m_locked, "FIX: M should read 0 after A"
+              " left and take its own lock (read %d, locked %d)", ow_m_read,
+              ow_m_locked);
+        CHECK(ow_count_before_m_unlock == 1, "FIX: M's unlock should release"
+              " its own lock (count before %d)", ow_count_before_m_unlock);
+        CHECK(g_count == 0 && g_word == 0, "FIX: word %d count %d should both"
+              " end at 0", g_word, g_count);
+        if (adx_trace_on())
+            CHECK(!(adx_trace_fired() & (1 | 2 | 16 | 32 | 64)), "FIX: the"
+                  " trace dumped (fired 0x%X)", adx_trace_fired());
+    } else {
+        /* THE POSITIVE CONTROL: the sequence as leak1 recorded it. */
+        CHECK(m_read_early && ow_m_read == 1 && !ow_m_locked,
+              "CONTROL: M should read A's 1 and skip its lock (early %d read"
+              " %d locked %d)", m_read_early, ow_m_read, ow_m_locked);
+        CHECK(ow_count_before_m_unlock == 0, "CONTROL: M's unlock should find"
+              " the count already 0 (found %d)", ow_count_before_m_unlock);
+    }
+    adx_guard_reset_for_test();
+}
+
 /* ── the trace's leak test sees a nesting lost across a blocking wait ─────
  *
  * Guest code run from inside a blocking wait (a DPC from the wait loop, on the
@@ -676,7 +792,8 @@ int main(int argc, char **argv)
         /* "force" skips the agreement check: the negative control. */
         int force = argc > 3 && strcmp(argv[3], "force") == 0;
         if (!force && (adx_per_thread_restore_on() != expect
-                       || adx_unmatched_safe_on() != expect)) {
+                       || adx_unmatched_safe_on() != expect
+                       || adx_outer_region_on() != expect)) {
             fprintf(stderr,
                     "FAIL: arm '%s' but RECOMP_ADX_PER_THREAD_RESTORE reads %s"
                     " and RECOMP_ADX_UNMATCHED_SAFE reads %s\n", argv[2],
@@ -686,9 +803,10 @@ int main(int argc, char **argv)
         }
     }
     fprintf(stderr, "arm: guard %s, per-thread restore %s, unmatched-safe %s,"
-                    " trace %s\n", guarded ? "ON" : "off",
+                    " outer region %s, trace %s\n", guarded ? "ON" : "off",
             adx_per_thread_restore_on() ? "ON" : "off",
             adx_unmatched_safe_on() ? "ON" : "off",
+            adx_outer_region_on() ? "ON" : "off",
             adx_trace_on() ? "ON" : "off");
 
     run_interleave(guarded);
@@ -699,6 +817,7 @@ int main(int argc, char **argv)
     run_block_window(guarded);
     run_spin_breaker();
     run_leak_detector(guarded);
+    run_outer_word(guarded);
     adx_guard_report();
 
     fprintf(stderr, "%s\n", fail ? "FAILED" : "ok");

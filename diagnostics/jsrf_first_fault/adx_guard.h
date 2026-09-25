@@ -266,6 +266,8 @@ void adx_trace_dump(const char *reason);  /* unconditional; tests and reports */
 #define ADX_CTX_STACK 4
 struct adx_guest_ctx {
     unsigned esp, tib, irq;
+    int      outer;                  /* CRI's outer nesting word 0x0025EFEC,
+                                      * kept by sub_0013C460/sub_0013C480 */
     unsigned stack[ADX_CTX_STACK];   /* caller chain, nearest first; 0 = none */
 };
 void adx_trace_set_ctx_source(void (*fill)(struct adx_guest_ctx *out));
@@ -273,6 +275,42 @@ void adx_trace_set_ctx_source(void (*fill)(struct adx_guest_ctx *out));
  * (leak 1, unmatched 2, skipped 4, cross 8, clamp 16, drift 32, gap 64,
  * lost 128). Tests. */
 unsigned adx_trace_fired(void);
+
+/* ── CRI'S OUTER NESTING WORD IS PART OF THE REGION (G66 lock leak) ──────
+ *
+ * The lock is not called directly. sub_0013C460 is
+ *
+ *     if (MEM32(0x25EFEC) == 0) lock();      MEM32(0x25EFEC) += 1;
+ *
+ * and sub_0013C480 is `if (--MEM32(0x25EFEC) == 0) unlock();` -- one GLOBAL
+ * nesting word in front of the refcount, read and written OUTSIDE the lock.
+ * On the Xbox that is safe for the same reason the lock is: `inc`/`dec` on
+ * memory are single instructions on one CPU, and a thread that reads the word
+ * nonzero is one the elevated holder let run by blocking. Here the check runs
+ * on a host thread in parallel with the holder, so the RE_ENTRY window is
+ * wide open (G66, leak1 of 25 Sep 2026, events #58858-#58868):
+ *
+ *     A  sub_0013C460   word 0 -> lock (count 0->1) -> word 1
+ *     M  sub_0013C460   reads word 1: SKIPS the lock
+ *     A  sub_0013C480   word 1 -> 0 -> unlock (count 1->0)
+ *     M                 word 0 -> 1: M is "inside" with no lock taken
+ *     M  sub_0013C480   word 1 -> 0 -> unlock: UNMATCHED, count 0 (clamped),
+ *                       or, when A holds a level again, A's level is
+ *                       unlocked under it -- the leak that opens G66.
+ *
+ * So each of the two BODIES runs under the guard (RECOMP_ADX_OUTER_REGION,
+ * default ON, and only with RECOMP_ADX_SERIALIZE): enter takes one guard level
+ * before the word is read, leave drops it once the word -- and the lock or
+ * unlock it led to -- is done. A thread whose sub_0013C460 read the word
+ * nonzero therefore did so while the lock's holder was either inside it (and
+ * the read waited) or blocked in a kernel wait (and could not release in the
+ * window), which is what elevation guaranteed. The level is per body, not held
+ * from sub_0013C460 to sub_0013C480: the lock the word leads to already spans
+ * that. Region levels are not locks: the trace's leak and gap tests leave
+ * them out. */
+int  adx_outer_region_on(void);
+void adx_guard_region_enter(void);
+void adx_guard_region_leave(void);
 
 /* Tests only: forget every thread's nesting and free the guard. */
 void adx_guard_reset_for_test(void);
