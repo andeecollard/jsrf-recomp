@@ -182,6 +182,13 @@ typedef struct {
     uint32_t ff_gpu;                           /* 1: a fixed-function draw transformed on the GPU */
     uint32_t vs_in_unfetched, vs_in_noarray;   /* read inputs the host could not decode / that have no array */
     char     vs_fmt_text[96];                  /* read inputs as slot:format (FF = no array) */
+    /* G74: points (1) and lines (2-4), drawn as the executor draws them
+     * (G54, nv2a_metal.m draw_points_lines): every point a size x size quad,
+     * every line segment a quad one pixel wide, each corner carrying its
+     * endpoint's attributes, never culled. pl_segs = points or segments
+     * expanded; point_reg = SET_POINT_SIZE (1/8 pixel) as D3D's updater
+     * derives it; point_sprite = texture coordinates run 0..1 over the quad. */
+    uint32_t pl_segs, point_reg, point_sprite;
 } D3D8Host2DDraw;
 
 /* Is this draw pre-transformed 2D? The vertex shader handle (device +0x384)
@@ -228,6 +235,15 @@ void d3d8_host_2d_metal_pipe_stats(char *buf, size_t n);
 typedef int (*D3D8H2DFFGpuFn)(const uint32_t ffm[2048], D3D8Host2DDraw *d);
 void d3d8_host_2d_set_ff_gpu(D3D8H2DFFGpuFn fn);
 int  d3d8_host_ff_gpu_mode(void);                 /* RECOMP_D3D8_HOST_FF_GPU, read once */
+/* G74: RECOMP_D3D8_HOST_POINTS=1 lets draw mode draw fixed-function points
+ * and lines itself (read once, executor thread). Off: they stay with the
+ * executor, as before. */
+int  d3d8_host_points_mode(void);                 /* 2: =mark, points drawn 12 px wide (an instrument) */
+/* SET_POINT_SIZE as D3D's point updater (0x195140) computes it from
+ * RenderState[106..113] (pt_rs) and the device's point scale (+0x45C) when
+ * POINTSCALEENABLE is off: POINTSIZE * scale, raised to POINTSIZE_MIN, cut to
+ * POINTSIZE_MAX and to 64, times 8 plus 1/2, truncated, at most 0x1FF. */
+uint32_t d3d8_host_point_size_reg(const uint32_t pt_rs[8], uint32_t dev_scale);
 int  d3d8_host_2d_metal_ff_gpu(const uint32_t ffm[2048], D3D8Host2DDraw *d);
 /* The executor's fixed-function vertex unit (nv2a_ff_vertex), handed in. */
 typedef const char *(*D3D8H2DFFVertexFn)(const uint32_t m[2048], const float in[16][4], float out[16][4]);

@@ -103,6 +103,12 @@ HANDROLLED_BASELINE = 125
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
     'RECOMP_METAL_TEXTURE_SLOTS',   # a slot count, clamped 16..1024
+    # Points and lines on the host (G74): a boolean read by the helper, plus a
+    # third arm "mark" (every point drawn 12 px wide, an instrument) that a
+    # boolean cannot name. And the flip before which VERIFY never runs: a
+    # count, because a verify flip at the title lost the harness's START.
+    "RECOMP_D3D8_HOST_POINTS",
+    "RECOMP_D3D8_HOST_VERIFY_AFTER",
     # Milliseconds and a port number, not booleans: the XInput lift's pad
     # enumeration delay and which port the host pad occupies (G49).
     "RECOMP_XINPUT_ENUM_MS",

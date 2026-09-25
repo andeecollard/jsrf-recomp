@@ -191,6 +191,14 @@ typedef struct {
      * SetRenderState_FrontFace (0x18EC40) writes FRONT_FACE and re-applies it.
      * rs_valid = the mirror filled these. */
     uint32_t rs_cull, rs_front, rs_valid;
+    /* G74: the point state D3D's lazy updater 0x195140 turns into
+     * SET_POINT_SIZE (0x043C), POINT_PARAMS_ENABLE (0x0318) and
+     * POINT_SMOOTH_ENABLE (0x031C, the sprite switch): D3D_g_RenderState[106]
+     * POINTSIZE, [107] POINTSIZE_MIN, [108] POINTSPRITEENABLE, [109]
+     * POINTSCALEENABLE, [110..112] POINTSCALE_A/B/C, [113] POINTSIZE_MAX, and
+     * the device's point scale at +0x45C, read at the draw.
+     * pt_valid = the mirror filled these. */
+    uint32_t pt_rs[8], pt_dev_scale, pt_valid;
     /* G51.3 verify: a draw draw mode would replace, left to the executor on a
      * RECOMP_D3D8_HOST_VERIFY flip and compared against the host's shadow. */
     uint32_t verify;

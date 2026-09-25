@@ -290,6 +290,40 @@ int d3d8_host_ff_gpu_mode(void)
     }
     return m;
 }
+int d3d8_host_points_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char *v = getenv("RECOMP_D3D8_HOST_POINTS");
+        m = recomp_switch_on("RECOMP_D3D8_HOST_POINTS");
+        /* =mark: an instrument, not a fix -- every point is drawn 12 pixels
+         * wide, so a presented frame shows where the title puts them. */
+        if (m && v && strcmp(v, "mark") == 0) m = 2;
+        if (m == 2) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_POINTS=mark: points drawn 12 px wide (an instrument)\n");
+        if (m) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_POINTS=1: fixed-function points and lines are drawn by"
+                               " the host in draw mode, as the executor's quads (G74)\n");
+    }
+    return m;
+}
+/* D3D's point updater 0x195140, POINTSCALEENABLE off (loc_0019517F onward):
+ * the x87 works in double (the recompiled FPU stack does too), the sum is
+ * stored as a float and cvttss2si truncates it; a result above 0x1FF, or
+ * negative (compared unsigned), is 0x1FF. Constants from the XBE: 64.0 at
+ * 0x19B0F0, 8.0 at 0x1CEED0, 0.5 at 0x1C4550. */
+static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+uint32_t d3d8_host_point_size_reg(const uint32_t pt_rs[8], uint32_t dev_scale)
+{
+    double s = (double)u2f(pt_rs[0]) * (double)u2f(dev_scale);
+    double mn = u2f(pt_rs[1]), mx = u2f(pt_rs[7]);
+    float f;
+    if (s < mn) s = mn;                  /* fcom; jp: kept when >= or unordered */
+    if (s > mx) s = mx;                  /* fcom; test ah,0x41; jne: kept when <= or unordered */
+    if (s > 64.0) s = 64.0;
+    f = (float)(s * 8.0 + 0.5);
+    if (!(f > -1.0f) || !(f < 2147483648.0f)) return 0x1FFu;   /* cvttss2si: negative or 0x80000000 */
+    {   uint32_t v = (uint32_t)(int32_t)f;
+        return v > 0x1FFu ? 0x1FFu : v; }
+}
 const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
                                  int control, const uint16_t *given_idx, const uint32_t *ffm,
                                  D3D8H2DFFVertexFn ffv, D3D8Host2DDraw *d)
@@ -460,11 +494,28 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     if (((d->prim >= 1u && d->prim <= 4u) || d->prim == 10u) && (d3d8_host_2d_bisect() & 512u)) return "primitive (bisect 512)";
     /* G54: the executor now DRAWS points and lines (screen-space quads in
      * nv2a_metal.m), so describing them as "nothing" would make draw mode
-     * skip real geometry. The host does not draw them yet: left to the
-     * executor. POLYGON (10) is still drawn by nobody. */
-    if (d->prim >= 1u && d->prim <= 4u) return "points and lines (left to the executor)";
+     * skip real geometry. POLYGON (10) is still drawn by nobody.
+     * G74: with RECOMP_D3D8_HOST_POINTS the host draws the fixed-function
+     * ones the same way. The class the title draws is one kind: a POINTLIST
+     * of ONE vertex in a model's own format (FVF 0x102/0x112/0x152/0x212/0x252),
+     * textured, depth-tested, 1 pixel, no sprite and no attenuation -- one
+     * pixel per draw. The executor keeps them off its GPU vertex paths and expands
+     * the CPU unit's screen positions; so does the host. Pre-transformed and
+     * programmable points, and attenuated point size, which the executor
+     * only approximates, stay with the executor. */
+    const int pl = d->prim >= 1u && d->prim <= 4u;
+    if (pl) {
+        if (d3d8_host_points_mode() <= 0) return "points and lines (left to the executor)";
+        if (cls != 2) return cls == 1 ? "points and lines, pre-transformed (left to the executor)"
+                                      : "points and lines, vertex program (left to the executor)";
+        if (!c->pt_valid) return "points and lines: no point state";
+        if (d->prim == 1u && c->pt_rs[3]) return "points with POINTSCALEENABLE (left to the executor)";
+        d->point_reg = d3d8_host_point_size_reg(c->pt_rs, c->pt_dev_scale);
+        if (d3d8_host_points_mode() == 2) d->point_reg = 96u;
+        d->point_sprite = d->prim == 1u && c->pt_rs[2] != 0;
+    }
     if (d->prim == 10u) { d->prim_empty = 1; d->nverts = 0; d->bb_x0 = 1; d->bb_x1 = 0; return NULL; }
-    if (d->prim < 5u || d->prim > 9u) return "primitive";
+    if (!pl && (d->prim < 5u || d->prim > 9u)) return "primitive";
     if (c->count > 16384u) return "vertex count";
     {
         static uint32_t idx[16384 + 4];
@@ -474,6 +525,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             cull = c->rs_cull ? 0x404u + (c->rs_cull != c->rs_front) : 0u;
             front_cw = c->rs_front == 0x900u;
         }
+        if (pl) cull = 0;                          /* the NV2A culls neither */
         d->cull_face = cull; d->front_cw = front_cw;
         for (uint32_t k = 0; k < n; ++k) {
             if (c->draw_kind == 2 && given_idx) idx[k] = given_idx[k];
@@ -495,7 +547,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         /* G52: a fixed-function draw the executor's GPU unit accepts goes the
          * same way, with the FF vertex function and nv2a_ff_constants in place
          * of the program and its constants (RECOMP_D3D8_HOST_FF_GPU). */
-        int ffg = cls == 2 && n && ffm && s_ff_gpu_fn && d3d8_host_ff_gpu_mode() > 0 && s_ff_gpu_fn(ffm, d);
+        int ffg = cls == 2 && !pl && n && ffm && s_ff_gpu_fn && d3d8_host_ff_gpu_mode() > 0 && s_ff_gpu_fn(ffm, d);
         if (cls == 3 || ffg) {
             static float (*vin)[4]; static uint32_t vin_cap; static uint32_t *vidx; static uint32_t vidx_cap;
             NV2AVshProgram prog;
@@ -587,9 +639,19 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             }
             if (++vgen == 0) { memset(vstamp, 0, vcap * 4u); vgen = 1; }
         }
+        uint32_t pl_segs = 0;
+        if (pl) {                                  /* draw_points_lines' segment count */
+            pl_segs = d->prim == 1u ? n : d->prim == 2u ? n / 2u : n >= 2u ? (d->prim == 4u ? n - 1u : n) : 0u;
+            if (d->prim == 3u && n == 2u) pl_segs = 1u;   /* a two-vertex loop is one segment */
+        }
         for (uint32_t k = 0; ; ++k) {
-            /* Triangle k of the primitive, as the executor assembles it. */
-            if (d->prim == 5u)      { if (3u * k + 2u >= n) break; t3[0] = 3u*k; t3[1] = 3u*k+1u; t3[2] = 3u*k+2u; }
+            /* Triangle k of the primitive, as the executor assembles it; for
+             * points and lines, point or segment k as (A, B, B). */
+            if (pl)                 { if (k >= pl_segs) break;
+                                      if (d->prim == 1u) t3[0] = t3[1] = t3[2] = k;
+                                      else { t3[0] = d->prim == 2u ? 2u*k : k;
+                                             t3[1] = t3[2] = d->prim == 2u ? 2u*k+1u : (k + 1u < n ? k + 1u : 0u); } }
+            else if (d->prim == 5u) { if (3u * k + 2u >= n) break; t3[0] = 3u*k; t3[1] = 3u*k+1u; t3[2] = 3u*k+2u; }
             else if (d->prim == 6u) { if (k + 2u >= n) break;
                                       if (k & 1u) { t3[0] = k + 1u; t3[1] = k; t3[2] = k + 2u; }
                                       else        { t3[0] = k; t3[1] = k + 1u; t3[2] = k + 2u; } }
@@ -600,7 +662,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             else                    { uint32_t q = k / 2u; if (2u * q + 3u >= n) break;       /* quad strip */
                                       if (k & 1u) { t3[0] = 2u*q; t3[1] = 2u*q+3u; t3[2] = 2u*q+2u; }
                                       else        { t3[0] = 2u*q; t3[1] = 2u*q+1u; t3[2] = 2u*q+3u; } }
-            if (d->nverts + 3u > D3D8H2D_MAX_VERTS) return "vertex count";
+            if (d->nverts + (pl ? 6u : 3u) > D3D8H2D_MAX_VERTS) return "vertex count";
             D3D8H2DVertex *v = &d->verts[d->nverts];
             int ok = 1;
             for (unsigned j = 0; j < 3 && ok; ++j) {
@@ -644,7 +706,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                     if (i < d->idx_min) d->idx_min = i; if (i > d->idx_max) d->idx_max = i;
                     v[j] = vc[slot];
                     if (vstat[slot] == 1) { ok = 0; break; }
-                    if (vstat[slot] == 2 && ok == 1) { ++d->tris_dropped_q; ok = -1; }
+                    /* A point sprite's coordinates are replaced (q = 1): the q test passes. */
+                    if (vstat[slot] == 2 && ok == 1 && !d->point_sprite) { ++d->tris_dropped_q; ok = -1; }
                     continue;
                 }
                 if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
@@ -668,6 +731,39 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             }
             if (ok == -1) continue;                                /* counted in tris_dropped_q */
             if (!ok) { ++d->tris_dropped_w; continue; }           /* the executor drops it too */
+            if (pl) {
+                /* nv2a_metal.m draw_points_lines, in its float arithmetic:
+                 * corners 0..3 around the point, or A+n, A-n, B-n, B+n with n
+                 * half a pixel along the segment's normal; triangles (0,1,2)
+                 * and (0,2,3); corners 0 and 1 carry A, 2 and 3 carry B. */
+                static const unsigned tri[6] = { 0, 1, 2, 0, 2, 3 };
+                D3D8H2DVertex A = v[0], B = v[1];
+                float cn[4][2];
+                if (d->prim == 1u) {
+                    float size = (float)(d->point_reg & 0x1FFu) / 8.0f, h = (size > 1.0f ? size : 1.0f) * 0.5f;
+                    const float *p = A.p;
+                    cn[0][0] = p[0]-h; cn[0][1] = p[1]-h; cn[1][0] = p[0]+h; cn[1][1] = p[1]-h;
+                    cn[2][0] = p[0]+h; cn[2][1] = p[1]+h; cn[3][0] = p[0]-h; cn[3][1] = p[1]+h;
+                } else {
+                    float dx = B.p[0]-A.p[0], dy = B.p[1]-A.p[1], len = sqrtf(dx*dx+dy*dy), nx, ny;
+                    if (!(len > 0.0f) || !isfinite(len)) continue;
+                    nx = -dy/len*0.5f; ny = dx/len*0.5f;
+                    cn[0][0] = A.p[0]+nx; cn[0][1] = A.p[1]+ny; cn[1][0] = A.p[0]-nx; cn[1][1] = A.p[1]-ny;
+                    cn[2][0] = B.p[0]-nx; cn[2][1] = B.p[1]-ny; cn[3][0] = B.p[0]+nx; cn[3][1] = B.p[1]+ny;
+                }
+                for (unsigned m = 0; m < 6; ++m) {
+                    unsigned q = tri[m];
+                    v[m] = q < 2u ? A : B;
+                    v[m].p[0] = cn[q][0]; v[m].p[1] = cn[q][1];
+                    if (d->point_sprite)
+                        for (unsigned u = 0; u < 4; ++u) {
+                            v[m].t[u][0] = (q == 1u || q == 2u) ? 1.0f : 0.0f; v[m].t[u][1] = q >= 2u ? 1.0f : 0.0f;
+                            v[m].t[u][2] = 0.0f; v[m].t[u][3] = 1.0f;
+                        }
+                }
+                d->nverts += 6u; ntri += 2u; ++d->pl_segs;
+                continue;
+            }
             if (cull && culled(cull, front_cw, v[0].p, v[1].p, v[2].p)) continue;
             d->nverts += 3u; ++ntri;
         }
@@ -799,6 +895,47 @@ static unsigned long long s_tris_dropped_w, s_draws_dropped_w;
 static unsigned s_printed_mm, s_printed_consts, s_printed_frames, s_printed_z, s_printed_zmm, s_printed_pt;
 #define NREASON 40
 static struct { const char *why; unsigned long long n; } s_reason[NREASON];
+/* G74: WHAT THE POINTS AND LINES ARE. Every draw-mode token with a point
+ * or line primitive, by class, primitive, count, FVF, sprite, point size
+ * (RS[106] and the device scale, and the SET_POINT_SIZE they give), the
+ * bound stages and blend/depth, with how many the host drew. Printed with
+ * the draw mode report; the table keeps the first 24 kinds. */
+typedef struct {
+    uint32_t cls, prim, count, fvf, sprite, scale_en, size_rs, dev_scale, reg, tmask, fmt0, fmt3, blend, zfunc;
+    unsigned long long n, drawn;
+} PlKind;
+static PlKind s_pl_kind[24];
+/* ... and their VERIFY verdicts: compared, exact, within tolerance,
+ * mismatching, pixels either side changed; the first few are dumped
+ * (RECOMP_D3D8_HOST_2D_DUMP) whether they match or not, for a zoomed look. */
+static unsigned long long s_pl_cmp, s_pl_exact, s_pl_within, s_pl_mm, s_pl_exec_px, s_pl_host_px;
+static unsigned s_pl_dumped;
+static unsigned s_pl_nkind;
+static unsigned long long s_pl_tokens, s_pl_drawn, s_pl_segs, s_pl_other;
+static void pl_census(const D3D8HostDrawCheck *c, int cls, const D3D8Host2DDraw *d, int drawn)
+{
+    PlKind k;
+    memset(&k, 0, sizeof k);
+    k.cls = (uint32_t)cls; k.prim = c->prim; k.count = c->count > 64u ? 64u : c->count; k.fvf = c->vs_handle;
+    if (c->pt_valid) {
+        k.sprite = c->pt_rs[2]; k.scale_en = c->pt_rs[3]; k.size_rs = c->pt_rs[0]; k.dev_scale = c->pt_dev_scale;
+        k.reg = d3d8_host_point_size_reg(c->pt_rs, c->pt_dev_scale);
+    }
+    for (unsigned u = 0; u < 4; ++u) if (c->tex[u]) k.tmask |= 1u << u;
+    k.fmt0 = c->tex[0] ? (c->format[0] >> 8) & 0xFFu : 0xFFu; k.fmt3 = c->tex[3] ? (c->format[3] >> 8) & 0xFFu : 0xFFu;
+    k.blend = st(c, 0x304, 0) ? (st(c, 0x344, 1) << 16 | st(c, 0x348, 0)) : 0u; k.zfunc = st(c, 0x30C, 0) ? st(c, 0x354, 0x203) : 0u;
+    ++s_pl_tokens; if (drawn) { ++s_pl_drawn; s_pl_segs += d->pl_segs; }
+    for (unsigned i = 0; i < s_pl_nkind; ++i) {
+        PlKind *e = &s_pl_kind[i];
+        if (e->cls == k.cls && e->prim == k.prim && e->count == k.count && e->fvf == k.fvf && e->sprite == k.sprite &&
+            e->scale_en == k.scale_en && e->size_rs == k.size_rs && e->dev_scale == k.dev_scale && e->tmask == k.tmask &&
+            e->fmt0 == k.fmt0 && e->fmt3 == k.fmt3 && e->blend == k.blend && e->zfunc == k.zfunc) {
+            ++e->n; if (drawn) ++e->drawn; return;
+        }
+    }
+    if (s_pl_nkind < 24u) { k.n = 1; k.drawn = drawn != 0; s_pl_kind[s_pl_nkind++] = k; }
+    else ++s_pl_other;
+}
 static void count_reason(const char *why)
 {
     for (unsigned i = 0; i < NREASON; ++i) {
@@ -880,7 +1017,8 @@ int d3d8_host_mirror_armed(char *why, size_t why_size)
 {
     static const char *const knobs[] = { "RECOMP_D3D8_HOST_FF_STRIDE", "RECOMP_D3D8_HOST_2D_TOL", "RECOMP_D3D8_HOST_2D_CONTROL",
                                          "RECOMP_D3D8_HOST_VERIFY", "RECOMP_D3D8_HOST_BISECT", "RECOMP_D3D8_HOST_2D_DUMP",
-                                         "RECOMP_D3D8_HOST_2D_EVERY", "RECOMP_D3D8_HOST_2D_DUMP_MAX" };
+                                         "RECOMP_D3D8_HOST_2D_EVERY", "RECOMP_D3D8_HOST_2D_DUMP_MAX",
+                                         "RECOMP_D3D8_HOST_POINTS", "RECOMP_D3D8_HOST_VERIFY_AFTER" };
     int m = recomp_switch_on("RECOMP_D3D8_MIRROR");
     unsigned armed = d3d8_host_armed(why, why_size);
     if (m && !armed && why && why_size) snprintf(why, why_size, "RECOMP_D3D8_MIRROR");
@@ -1002,6 +1140,10 @@ int d3d8_host_replaces_handle(uint32_t h)
 }
 int d3d8_host_any_draw_mode(void) { return d3d8_host_2d_mode() == 2 || d3d8_host_ff_mode() == 2 || d3d8_host_vs_mode() == 2; }
 static unsigned s_verify;
+/* G74: RECOMP_D3D8_HOST_VERIFY_AFTER=<flips>: no verify flip before it. A
+ * verify flip at the title slowed it enough that the stage harness's START
+ * pulse went undelivered in six of six arms; the stage is what is verified. */
+static unsigned long long s_verify_after;
 static int s_verify_pending; static uint32_t s_verify_serial;
 int d3d8_host_verify_enabled(void) { return s_verify && d3d8_host_any_draw_mode(); }
 void d3d8_host_2d_set_verify(unsigned every) { s_verify = every; }
@@ -1034,6 +1176,11 @@ static void read_knobs(void)
         fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_VERIFY=%u: in draw mode, 1 flip in %u is drawn by the executor"
                         " and the host's pipeline is compared against it per draw (the shadow's verdict lines)\n",
                 s_verify, s_verify);
+        if ((v = getenv("RECOMP_D3D8_HOST_VERIFY_AFTER")) && *v && atoll(v) > 0) {
+            s_verify_after = (unsigned long long)atoll(v);
+            fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_VERIFY_AFTER=%llu: no verify flip before flip %llu\n",
+                    s_verify_after, s_verify_after);
+        }
     }
     if ((v = getenv("RECOMP_D3D8_HOST_2D_DUMP")) && *v) {
         snprintf(s_dump_dir, sizeof s_dump_dir, "%s", v);
@@ -1601,7 +1748,7 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
     int cls = d3d8_host_2d_class(c);
     if (!d3d8_host_replaces_handle(c->vs_handle) || !cls) return;
     ++s_rep_tokens; if (cls == 3) ++s_rep_vs_tokens;
-    if (s_verify && (s_flips % s_verify) == 0) {         /* a verify flip: the executor draws, the host shadows */
+    if (s_verify && s_flips >= s_verify_after && (s_flips % s_verify) == 0) {   /* a verify flip: the executor draws, the host shadows */
         d3d8_host_2d_pre(c->serial, c->vs_handle, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
         s_verify_pending = 1; s_verify_serial = c->serial;
         return;
@@ -1627,9 +1774,11 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
         t1 = h2d_now_ns(); s_rep_ns_regs += t1 - t0;
         if (!why) why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d);
         s_rep_ns_build += h2d_now_ns() - t1;
+        if (c->prim >= 1u && c->prim <= 4u) pl_census(c, cls, &d, !why);
         if (why) { ++s_rep_refused; count_reason(why); return; }
         s_rep_ff_evals += d.ff_evals; s_rep_ff_indices += c->count; if (d.ff_gpu) ++s_rep_ff_gpu;
     } else if ((why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d))) {
+        if (c->prim >= 1u && c->prim <= 4u) pl_census(c, cls, &d, 0);
         ++s_rep_refused; if (cls == 3) ++s_rep_vs_refused; count_reason(why); return;
     }
     ++s_built;
@@ -1747,6 +1896,27 @@ void d3d8_host_2d_flip(void)
         d3d8_host_2d_diff(r->pre, r->exec, r->host, r->w, r->h, s_tol, &df);
         s_rec_cls[k] = (uint8_t)r->info.cls; s_rec_bad[k] = df.mismatch != 0;
         ++s_compared;
+        if (r->info.prim >= 1u && r->info.prim <= 4u) {
+            ++s_pl_cmp; s_pl_exec_px += df.exec_changed; s_pl_host_px += df.host_changed;
+            if (df.mismatch) ++s_pl_mm; else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_pl_within; else ++s_pl_exact;
+            if (s_dump_dir[0] && s_pl_dumped < 6 && df.exec_changed) {
+                ++s_pl_dumped; dump(r, &df);
+                fprintf(stderr, "[D3D8-HOST-2D] points/lines dump: flip %llu draw %u prim %u count %u bbox %u,%u %ux%u reg %u"
+                                " sprite %u: %llu px over tolerance, executor changed %llu, host %llu, max r%u g%u b%u\n",
+                        s_flips, r->serial, r->info.prim, r->info.count, r->x0, r->y0, r->w, r->h, r->info.point_reg,
+                        r->info.point_sprite, df.mismatch, df.exec_changed, df.host_changed,
+                        df.max_err[0], df.max_err[1], df.max_err[2]);
+                if (r->zexec && r->zhost)       /* where the executor drew: its depth after, the host's (the seed if it failed) */
+                    for (size_t q = 0; q < (size_t)r->w * r->h; ++q)
+                        if (r->exec[q] != r->pre[q]) {
+                            fprintf(stderr, "[D3D8-HOST-2D]   at %u,%u: depth executor %.9g host %.9g | host point z %.9g w %.9g,"
+                                            " func %X write %u\n", r->x0 + (unsigned)(q % r->w), r->y0 + (unsigned)(q / r->w),
+                                    r->zexec[q], r->zhost[q], r->info.z_min, r->info.w_min, r->info.depth_func,
+                                    r->info.depth_write);
+                            break;
+                        }
+            }
+        }
         px += df.pixels; mm += df.mismatch; fe += df.exec_changed; fh += df.host_changed;
         if (r->info.cls == 3) {
             ++s_vs_compared; s_vs_px += df.pixels; s_vs_px_mm += df.mismatch;
@@ -1992,6 +2162,21 @@ void d3d8_host_2d_report(const char *why)
                 fprintf(stderr, " %s=%llu;", s_reason[i].why, s_reason[i].n);
             }
             if (any) fprintf(stderr, "\n");
+        }
+        if (s_pl_tokens) {
+            fprintf(stderr, "[D3D8-HOST-2D] %s points and lines: tokens %llu, host drew %llu (%llu points or segments),"
+                            " left to the executor %llu, kinds past the table %llu | VERIFY compared %llu: EXACT %llu"
+                            " within_tolerance %llu MISMATCHING %llu, px changed executor %llu host %llu\n", why, s_pl_tokens,
+                    s_pl_drawn, s_pl_segs, s_pl_tokens - s_pl_drawn, s_pl_other, s_pl_cmp, s_pl_exact, s_pl_within, s_pl_mm,
+                    s_pl_exec_px, s_pl_host_px);
+            for (unsigned i = 0; i < s_pl_nkind; ++i) {
+                const PlKind *e = &s_pl_kind[i];
+                fprintf(stderr, "[D3D8-HOST-2D] %s   points/lines kind %u: n %llu drawn %llu | class %u prim %u count %u%s fvf %03X |"
+                                " sprite %u scale %u size %g x dev %g -> reg %u (%.3f px) | stages %X fmt0 %02X fmt3 %02X |"
+                                " blend %X zfunc %X\n", why, i, e->n, e->drawn, e->cls, e->prim, e->count, e->count >= 64u ? "+" : "",
+                        e->fvf, e->sprite, e->scale_en, u2f(e->size_rs), u2f(e->dev_scale), e->reg, e->reg / 8.0, e->tmask,
+                        e->fmt0, e->fmt3, e->blend, e->zfunc);
+            }
         }
         if (s_verify) fprintf(stderr, "[D3D8-HOST-2D] %s VERIFY (1 flip in %u drawn by the executor, host shadowed):"
                                       " %llu draws compared -- the verdicts are the shadow lines below\n", why, s_verify, s_verified);

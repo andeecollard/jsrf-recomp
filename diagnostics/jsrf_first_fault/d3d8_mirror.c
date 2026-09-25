@@ -225,6 +225,14 @@ static void d3d8m_ffc_read(D3D8FFCombinerIn *in)
     in->pixel_shader        = MEM32(d + 0x370u);
     in->device_flags        = MEM32(d + 8u);
 }
+/* G74: the point updater's inputs (0x195140): RenderState[106..113] and
+ * device +0x45C. */
+static void d3d8m_point_read(D3D8HostDrawCheck *c)
+{
+    uint32_t d = MEM32(0x0019DCE0u);
+    for (unsigned k = 0; k < 8; ++k) c->pt_rs[k] = MEM32(0x0019E0E0u + 4u * (106u + k));
+    c->pt_dev_scale = MEM32(d + 0x45Cu); c->pt_valid = 1;
+}
 /* The fog updater's inputs: RenderState[82] FOGENABLE, [93], device +0x370/+0x374. */
 static void d3d8m_fog_read(uint32_t f[4])
 {
@@ -469,6 +477,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     c->idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c->x_val, m_x_val, sizeof c->x_val); c->x_seen = m_x_seen;
     c->rs_cull = MEM32(0x0019E2E0u); c->rs_front = MEM32(0x0019E2DCu); c->rs_valid = 1;
+    d3d8m_point_read(c);
     d3d8m_snap_indices(c, kind, a2, a3);
     c->ffc_valid = 1; d3d8m_ffc_read(&c->ffc_cur); c->ffc_ps = c->ffc_cur.pixel_shader;
     c->stage_prog_in[0] = MEM32(d + 0x378u); c->stage_prog_in[1] = MEM32(d + 0x37Cu);
@@ -549,6 +558,7 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     c.idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c.x_val, m_x_val, sizeof c.x_val); c.x_seen = m_x_seen;
     c.rs_cull = MEM32(0x0019E2E0u); c.rs_front = MEM32(0x0019E2DCu); c.rs_valid = 1;
+    d3d8m_point_read(&c);
     /* G51.1: for a 2D draw the host will draw, the indices and a hash of the
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices
      * into the ring; the title rewrites pIndexData for its next draw long

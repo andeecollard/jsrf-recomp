@@ -178,6 +178,10 @@ static int g_exec_keep_surfaces;     /* 1: do not invalidate first, so binding s
  * mode, params and enable from the register file it is handed -- when set. */
 static int g_exec_fog; static uint32_t g_exec_fog_color;
 static int g_exec_no_sync;
+/* G74: screen positions forced onto the executor's first vertices (x, y), so
+ * a point can be put exactly where pixel centres fall on its quad's edges. */
+static int g_exec_pos_n; static float g_exec_pos[8][2];
+static int g_exec_zw; static float g_exec_z, g_exec_w;   /* force z (guest units) and w on those vertices */
 static size_t g_exec_size_extra;     /* the executor's target size beyond D3D's: pitch * (clip_y + clip_h) vs pitch * height */           /* 1: exec_draw / exec_draw_ff leave the batch open, as the executor's own next draw finds it */
 static int g_exec_snap = 1;          /* prepare_vertices' 1/16 truncation, as the executor does it */
 static float exec_snap(float v) { return g_exec_snap ? truncf(v * 16.0f) / 16.0f : v; }
@@ -621,6 +625,9 @@ static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, con
     s.texture_mask = d->tmask; s.untextured = !(d->tmask & 1); s.modulate = 1;
     s.width = s.height = TW; s.pitch = TW * 4; s.levels = 1; s.rgba8 = 1; s.min_filter = 2; s.linear = 1;
     s.depth_test = d->depth_test; s.depth_write = d->depth_write; s.depth_func = d->depth_func;
+    /* G74: the point state D3D's updater writes, as the executor reads it
+     * (SET_POINT_SIZE / 8, POINT_SMOOTH_ENABLE). */
+    s.point_size = (float)(d->point_reg & 0x1FFu) / 8.0f; s.point_sprite = d->point_sprite != 0;
     if (d->stencil_test) {
         s.stencil_test = 1; s.stencil_write = d->stencil_write; s.stencil_mask = d->stencil_mask; s.stencil_func = d->stencil_func;
         s.stencil_ref = d->stencil_ref; s.stencil_func_mask = d->stencil_func_mask;
@@ -643,6 +650,8 @@ static int exec_draw_ff(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, con
           in[3][0] = ((col >> 16) & 255) / 255.0f; in[3][1] = ((col >> 8) & 255) / 255.0f; in[3][2] = (col & 255) / 255.0f; in[3][3] = (col >> 24) / 255.0f; }
         memcpy(in[9], ram + vb + 24u * k + 16, 8);
         if (nv2a_ff_vertex(ffm, (const float (*)[4])in, v[k])) return 0;
+        if (k < (unsigned)g_exec_pos_n) { v[k][0][0] = g_exec_pos[k][0]; v[k][0][1] = g_exec_pos[k][1];
+                                          if (g_exec_zw) { v[k][0][2] = g_exec_z; v[k][0][3] = g_exec_w; } }
     }
     if (!g_exec_keep_surfaces) nv2a_metal_invalidate(NULL);
     if (nv2a_metal_draw(&s, ram + TEX, TW * TW * 4, (uint8_t *)target, RTPITCH * RTH, depth, RTW * 4 * RTH,
@@ -755,6 +764,226 @@ static void compare_ff(int control)
               name, df.mismatch, allowed, zb);
     } else
         CHECK(df.mismatch > 200, "%s: the perturbed host draw differs (%llu px)", name, df.mismatch);
+}
+
+/* G74: POINTS AND LINES ON THE HOST (RECOMP_D3D8_HOST_POINTS=1). The
+ * fixed-function vertices of case_ff drawn as a point list (sprites, or not),
+ * a line list, a line loop and a line strip, by the host and by the
+ * executor's own draw_points_lines from the same vertex unit's outputs; they
+ * must agree. The control shifts the host's quads and must differ. */
+static float f_of(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+static uint32_t u_of(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static void set_points(D3D8HostDrawCheck *c, float size, float scale, int sprite)
+{
+    c->pt_valid = 1;
+    c->pt_rs[0] = u_of(size); c->pt_rs[1] = u_of(0.0f); c->pt_rs[2] = sprite ? 1u : 0u; c->pt_rs[3] = 0;
+    c->pt_rs[4] = u_of(1.0f); c->pt_rs[5] = u_of(0.0f); c->pt_rs[6] = u_of(0.0f); c->pt_rs[7] = u_of(64.0f);
+    c->pt_dev_scale = u_of(scale);
+}
+static void compare_points(unsigned prim, unsigned count, float size, int sprite, int control, unsigned long long min_px)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH], ec[RTW * RTH];
+    static uint32_t ffm[2048];
+    char name[160];
+    const char *why;
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df; unsigned steps = 0;
+    snprintf(name, sizeof name, "prim %u count %u%s%s%s", prim, count, prim == 1 ? (sprite ? " sprites" : " points") : " lines",
+             prim == 1 ? "" : "", control ? " CONTROL" : "");
+    case_ff(&c); c.prim = prim; c.count = count; set_points(&c, size, 1.0f, sprite);
+    c.rs_valid = 1; c.rs_cull = 0x900; c.rs_front = 0x900;          /* culling on: points and lines ignore it */
+    why = d3d8_host_ff_registers(&c, ffm);
+    if (why) { CHECK(0, "%s: register file (%s)", name, why); return; }
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, control, NULL, ffm, nv2a_ff_vertex, &d);
+    CHECK(!why && d.cull_face == 0 && !d.ff_gpu, "%s: host builds it, uncull, on the CPU unit (%s)", name, why ? why : "built");
+    if (why) return;
+    background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) { ++fails; return; }
+    nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+    unsigned x0 = (unsigned)d.bb_x0, y0 = (unsigned)d.bb_y0, w = (unsigned)(d.bb_x1 - d.bb_x0 + 1), h = (unsigned)(d.bb_y1 - d.bb_y0 + 1);
+    for (unsigned k = 0; k < w * h; ++k) zhost[k] = 1.0f;
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho + y0 * (RTPITCH / 2) + x0, RTPITCH / 2, zhost, x0, y0, w, h) != 0) { ++fails; return; }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    for (unsigned y = 0; y < h; ++y) memcpy(ec + y * w, zexec + (y0 + y) * RTW + x0, w * sizeof(float));
+    unsigned long long zb = d3d8_host_2d_depth_diff(ec, zhost, (size_t)w * h, 1, &steps);
+    printf("  %s: %u quads, %u vertices, reg %u | executor changed %llu, host %llu, over tolerance %llu, max r%u g%u b%u |"
+           " depth %llu px, worst %u\n", name, d.pl_segs, d.nverts, d.point_reg, df.exec_changed, df.host_changed, df.mismatch,
+           df.max_err[0], df.max_err[1], df.max_err[2], zb, steps);
+    CHECK(df.exec_changed >= min_px, "%s: the executor drew it (%llu px)", name, df.exec_changed);
+    if (!control)
+        CHECK(df.mismatch == 0 && zb == 0, "%s: host and executor agree, colour (%llu px over) and depth (%llu)", name, df.mismatch, zb);
+    else
+        CHECK(df.mismatch > 8, "%s: the perturbed host draw differs (%llu px)", name, df.mismatch);
+}
+/* Points placed exactly on the pixel grid: a 1-pixel quad whose edges pass
+ * through pixel centres. Both renderers must pick the same pixel (or none). */
+static void point_edge_case(float X, float Y, int depth)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zhost[RTW * RTH];
+    static uint32_t ffm[2048];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df;
+    const char *why;
+    case_ff(&c); c.prim = 1; c.count = 1; set_points(&c, 1.0f, 1.0f, 0);
+    if (!depth) set_state(&c, 0x30C, 0);
+    d3d8_host_ff_registers(&c, ffm);
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+    if (why || d.nverts != 6) { CHECK(0, "edge point %g,%g: build (%s)", X, Y, why ? why : "count"); return; }
+    {   static const unsigned tri[6] = { 0, 1, 2, 0, 2, 3 };
+        static const float sx[4] = { -0.5f, 0.5f, 0.5f, -0.5f }, sy[4] = { -0.5f, -0.5f, 0.5f, 0.5f };
+        for (unsigned m = 0; m < 6; ++m) { d.verts[m].p[0] = X + sx[tri[m]]; d.verts[m].p[1] = Y + sy[tri[m]]; }
+        d.bb_x0 = (int32_t)floorf(X - 0.5f) - 2; d.bb_x1 = (int32_t)ceilf(X + 0.5f) + 2;
+        d.bb_y0 = (int32_t)floorf(Y - 0.5f) - 2; d.bb_y1 = (int32_t)ceilf(Y + 0.5f) + 2; }
+    g_exec_pos_n = 1; g_exec_pos[0][0] = X; g_exec_pos[0][1] = Y;
+    background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) { ++fails; g_exec_pos_n = 0; return; }
+    g_exec_pos_n = 0;
+    unsigned x0 = (unsigned)d.bb_x0, y0 = (unsigned)d.bb_y0, w = (unsigned)(d.bb_x1 - d.bb_x0 + 1), h = (unsigned)(d.bb_y1 - d.bb_y0 + 1);
+    for (unsigned k = 0; k < w * h; ++k) zhost[k] = 1.0f;
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho + y0 * (RTPITCH / 2) + x0, RTPITCH / 2, zhost, x0, y0, w, h) != 0) { ++fails; return; }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    printf("  edge point at %g,%g%s: executor changed %llu, host %llu, over tolerance %llu\n", X, Y, depth ? " (depth)" : "",
+           df.exec_changed, df.host_changed, df.mismatch);
+    CHECK(df.mismatch == 0 && df.exec_changed == df.host_changed, "edge point at %g,%g: same pixel on both sides", X, Y);
+}
+/* THE DEPTH TIE. A point drawn again at its own depth (LEQUAL): the
+ * executor passes its second draw against the depth its first wrote. The
+ * host, seeded with that depth, must pass it too -- its z must be the bits
+ * the executor's vertex stage produces, not a neighbour. */
+static void point_depth_tie(float X, float Y)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH];
+    static uint32_t ffm[2048];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df;
+    const char *why;
+    case_ff(&c); c.prim = 1; c.count = 1; set_points(&c, 1.0f, 1.0f, 0);
+    d3d8_host_ff_registers(&c, ffm);
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+    if (why || d.nverts != 6) { CHECK(0, "depth tie: build (%s)", why ? why : "count"); return; }
+    {   static const unsigned tri[6] = { 0, 1, 2, 0, 2, 3 };
+        static const float sx[4] = { -0.5f, 0.5f, 0.5f, -0.5f }, sy[4] = { -0.5f, -0.5f, 0.5f, 0.5f };
+        for (unsigned m = 0; m < 6; ++m) { d.verts[m].p[0] = X + sx[tri[m]]; d.verts[m].p[1] = Y + sy[tri[m]]; }
+        d.bb_x0 = (int32_t)floorf(X - 0.5f) - 2; d.bb_x1 = (int32_t)ceilf(X + 0.5f) + 2;
+        d.bb_y0 = (int32_t)floorf(Y - 0.5f) - 2; d.bb_y1 = (int32_t)ceilf(Y + 0.5f) + 2; }
+    g_exec_pos_n = 1; g_exec_pos[0][0] = X; g_exec_pos[0][1] = Y;
+    background(bg); memcpy(ex, bg, sizeof bg);
+    if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) { ++fails; g_exec_pos_n = 0; return; }   /* first: writes its depth */
+    nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+    memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    g_exec_keep_surfaces = 1;
+    if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) { ++fails; g_exec_pos_n = 0; g_exec_keep_surfaces = 0; return; }
+    g_exec_keep_surfaces = 0; g_exec_pos_n = 0;
+    unsigned x0 = (unsigned)d.bb_x0, y0 = (unsigned)d.bb_y0, w = (unsigned)(d.bb_x1 - d.bb_x0 + 1), h = (unsigned)(d.bb_y1 - d.bb_y0 + 1);
+    for (unsigned y = 0; y < h; ++y) memcpy(zhost + y * w, zexec + (y0 + y) * RTW + x0, w * sizeof(float));
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho + y0 * (RTPITCH / 2) + x0, RTPITCH / 2, zhost, x0, y0, w, h) != 0) { ++fails; return; }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    printf("  depth tie at %g,%g: executor changed %llu, host %llu, over tolerance %llu\n", X, Y, df.exec_changed, df.host_changed, df.mismatch);
+    CHECK(df.exec_changed == 1 && df.host_changed == 1 && df.mismatch == 0, "depth tie at %g,%g: both draw it again", X, Y);
+}
+/* SWEEP: host point depth vs executor point depth, bit for bit, over random
+ * z and w. The host divides z by 16777215 on the CPU, the executor in its
+ * vertex shader; the GPU's divide is correctly rounded, so they agree (a
+ * reciprocal multiply on the CPU was measured to differ in 109 of 300). */
+static unsigned point_depth_sweep(unsigned n)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH];
+    static uint32_t ffm[2048];
+    unsigned bad = 0, seed = 12345;
+    for (unsigned it = 0; it < n; ++it) {
+        D3D8HostDrawCheck c; D3D8Host2DDraw d;
+        float X = 40.5f, Y = 50.5f, z, w;
+        seed = seed * 1103515245u + 12345u; z = (float)(seed >> 8);           /* 0 .. 2^24 */
+        if (z > 16777215.0f) z = 16777215.0f;
+        seed = seed * 1103515245u + 12345u; w = 0.05f + (float)(seed >> 8) / 16777216.0f * 200.0f;
+        case_ff(&c); c.prim = 1; c.count = 1; set_points(&c, 1.0f, 1.0f, 0);
+        set_state(&c, 0x354, 0x207);                                           /* ALWAYS, writes on */
+        d3d8_host_ff_registers(&c, ffm);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        if (d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d) || d.nverts != 6) { ++bad; continue; }
+        {   static const unsigned tri[6] = { 0, 1, 2, 0, 2, 3 };
+            static const float sx[4] = { -0.5f, 0.5f, 0.5f, -0.5f }, sy[4] = { -0.5f, -0.5f, 0.5f, 0.5f };
+            for (unsigned m = 0; m < 6; ++m) {
+                d.verts[m].p[0] = X + sx[tri[m]]; d.verts[m].p[1] = Y + sy[tri[m]];
+                d.verts[m].p[2] = z / 16777215.0f; d.verts[m].p[3] = w;
+            }
+            d.bb_x0 = 38; d.bb_x1 = 43; d.bb_y0 = 48; d.bb_y1 = 53; d.z_min = d.z_max = d.verts[0].p[2]; d.w_min = w; }
+        for (unsigned y = 0; y < RTH; ++y)
+            for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+        g_exec_pos_n = 1; g_exec_pos[0][0] = X; g_exec_pos[0][1] = Y; g_exec_zw = 1; g_exec_z = z; g_exec_w = w;
+        background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+        if (!exec_draw_ff(&c, &d, ffm, ex, ram + ZS)) { ++bad; g_exec_pos_n = 0; g_exec_zw = 0; continue; }
+        g_exec_pos_n = 0; g_exec_zw = 0;
+        nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+        for (unsigned k = 0; k < 36; ++k) zhost[k] = 1.0f;
+        if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho + 48 * (RTPITCH / 2) + 38, RTPITCH / 2, zhost, 38, 48, 6, 6) != 0) { ++bad; continue; }
+        {   float a = zexec[50 * RTW + 40], b = zhost[2 * 6 + 2];
+            if (memcmp(&a, &b, 4)) { if (bad < 6) printf("    z %.1f w %g: executor %.9g host %.9g\n", z, w, a, b); ++bad; } }
+    }
+    return bad;
+}
+static void points_tests(void)
+{
+    {   unsigned n = getenv("H2D_ZSWEEP") ? (unsigned)atoi(getenv("H2D_ZSWEEP")) : 64u, bad = point_depth_sweep(n);
+        CHECK(bad == 0, "point depth: host and executor write the same bits (%u of %u differ)", bad, n); }
+    uint32_t rs[8] = { 0 };
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; static uint32_t ffm[2048];
+    const char *why;
+    /* SET_POINT_SIZE from D3D's render states, 0x195140's arithmetic. */
+    rs[0] = u_of(4.0f); rs[1] = u_of(0.0f); rs[7] = u_of(64.0f);
+    CHECK(d3d8_host_point_size_reg(rs, u_of(1.0f)) == 32u, "point size: 4 px -> 32 (1/8 px, +1/2 truncated)");
+    CHECK(d3d8_host_point_size_reg(rs, u_of(2.0f)) == 64u, "point size: the device scale multiplies it (8 px -> 64)");
+    rs[0] = u_of(100.0f);
+    CHECK(d3d8_host_point_size_reg(rs, u_of(1.0f)) == 0x1FFu, "point size: cut to 64 px, and 512 to 0x1FF");
+    rs[0] = u_of(0.5f); rs[1] = u_of(1.0f);
+    CHECK(d3d8_host_point_size_reg(rs, u_of(1.0f)) == 8u, "point size: raised to POINTSIZE_MIN (1 px -> 8)");
+    rs[0] = u_of(10.0f); rs[1] = u_of(0.0f); rs[7] = u_of(3.0f);
+    CHECK(d3d8_host_point_size_reg(rs, u_of(1.0f)) == 24u, "point size: cut to POINTSIZE_MAX (3 px -> 24)");
+    rs[0] = u_of(-1.0f); rs[1] = u_of(-5.0f); rs[7] = u_of(64.0f);
+    CHECK(d3d8_host_point_size_reg(rs, u_of(1.0f)) == 0x1FFu, "point size: negative compares unsigned -> 0x1FF");
+    rs[0] = u_of(1.3f); rs[1] = u_of(0.0f);
+    CHECK(d3d8_host_point_size_reg(rs, u_of(1.0f)) == 10u && f_of(rs[0]) == 1.3f, "point size: 1.3 px -> 10.9 -> 10");
+
+    /* Pixels against the executor's draw_points_lines. */
+    compare_points(1, 4, 16.0f, 1, 0, 400);         /* sprites: texture 0..1 over each quad */
+    compare_points(1, 4, 16.0f, 1, 1, 400);
+    compare_points(1, 4, 6.0f, 0, 0, 60);           /* plain points: the vertex's own coordinates */
+    compare_points(1, 4, 0.0f, 0, 0, 2);            /* size 0: one pixel */
+    compare_points(2, 4, 1.0f, 0, 0, 50);           /* two segments */
+    compare_points(2, 4, 1.0f, 0, 1, 50);
+    compare_points(3, 4, 1.0f, 0, 0, 100);          /* loop: four */
+    compare_points(3, 2, 1.0f, 0, 0, 25);           /* two-vertex loop: one */
+    compare_points(4, 4, 1.0f, 0, 0, 70);           /* strip: three */
+
+    {   static const float P[] = { 40.0f, 40.5f, 41.0f, 40.25f, 40.75f, 40.03125f, 40.96875f, 40.5078125f };
+        for (unsigned i = 0; i < sizeof P / sizeof P[0]; ++i)
+            for (unsigned j = 0; j < sizeof P / sizeof P[0]; j += 3) point_edge_case(P[i], P[j] + 10.0f, 0);
+        point_edge_case(40.0f, 51.0f, 1); point_edge_case(40.5f, 50.5f, 1);
+        point_depth_tie(40.5f, 50.5f); point_depth_tie(60.25f, 70.75f); point_depth_tie(33.0f, 21.0f);
+    }
+    /* What stays with the executor. */
+    case_ff(&c); c.prim = 1; c.count = 4; set_points(&c, 4.0f, 1.0f, 1); c.pt_rs[3] = 1;
+    d3d8_host_ff_registers(&c, ffm); memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+    CHECK(why && strstr(why, "POINTSCALEENABLE"), "attenuated points: left to the executor (%s)", why ? why : "built");
+    case_ff(&c); c.prim = 2; c.count = 4; c.pt_valid = 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d);
+    CHECK(why && strstr(why, "no point state"), "no point state from the mirror: left to the executor (%s)", why ? why : "built");
+    case_a(&c); c.prim = 1; c.count = 4; set_points(&c, 4.0f, 1.0f, 1);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, NULL, NULL, &d);
+    CHECK(why && strstr(why, "pre-transformed"), "pre-transformed points: left to the executor (%s)", why ? why : "built");
 }
 
 /* G52: RECOMP_D3D8_HOST_FF_GPU. The same fixed-function quad, transformed by
@@ -2317,6 +2546,14 @@ int main(int argc, char **argv)
         d3d8_host_2d_metal_set_spec_sync(1);
         compare_ff_gpu(0);
         compare_ff_gpu(1);
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "points") == 0) {       /* G74: points and lines on the host */
+        setenv("RECOMP_D3D8_HOST_POINTS", "1", 1);
+        setenv("RECOMP_D3D8_HOST_FF_GPU", "1", 1);          /* the GPU unit is armed; points still take the CPU one */
+        d3d8_host_2d_metal_set_spec_sync(1);
+        points_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }
