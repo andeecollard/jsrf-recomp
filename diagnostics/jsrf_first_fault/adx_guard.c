@@ -103,7 +103,7 @@ static unsigned long my_id(void)
 
 /* Take one level of the guard. Recursion is free; a first acquisition waits
  * for the current holder, and gives up waiting rather than wedging the run. */
-static void guard_acquire(void)
+static void guard_acquire_r(int region)
 {
     pthread_mutex_lock(&g_m);
     {
@@ -175,6 +175,7 @@ static void guard_acquire(void)
         if (t_depth > g_st.max_depth) g_st.max_depth = t_depth;
         g_st.depth = g_depth;
         g_st.owner = g_owner;
+        g_regions += region;   /* with the level, under g_m: see region_enter */
     }
     pthread_mutex_unlock(&g_m);
 }
@@ -214,9 +215,10 @@ static int guard_try_acquire(void)
 
 /* Give one level back. A thread that was stolen from drops its own nesting and
  * touches nothing global: the guard belongs to somebody else now. */
-static void guard_release(void)
+static void guard_release_r(int region)
 {
     pthread_mutex_lock(&g_m);
+    g_regions -= region;
     if (t_depth > 0) {
         --t_depth; --g_tsum;
         if (g_owner == t_id) {
@@ -233,6 +235,9 @@ static void guard_release(void)
     g_st.owner = g_owner;
     pthread_mutex_unlock(&g_m);
 }
+
+static void guard_acquire(void) { guard_acquire_r(0); }
+static void guard_release(void) { guard_release_r(0); }
 
 /* See adx_guard.h: a holder that blocks in a kernel wait stops excluding. */
 unsigned adx_guard_block_begin(void)
@@ -304,21 +309,18 @@ int adx_outer_region_on(void)
 void adx_guard_region_enter(void)
 {
     if (!adx_guard_on() || !adx_outer_region_on()) return;
-    guard_acquire();
+    /* The region count moves in the same critical section as the level, or
+     * another thread's trace note can see one without the other (it did:
+     * g66b fix2 dumped a false leak=1 in that window). */
+    guard_acquire_r(1);
     ++t_region;
-    pthread_mutex_lock(&g_m);
-    ++g_regions;
-    pthread_mutex_unlock(&g_m);
 }
 
 void adx_guard_region_leave(void)
 {
     if (!adx_guard_on() || !adx_outer_region_on()) return;
-    guard_release();
+    guard_release_r(1);
     if (t_region) --t_region;
-    pthread_mutex_lock(&g_m);
-    --g_regions;
-    pthread_mutex_unlock(&g_m);
 }
 
 void adx_guard_lock_enter(void)
