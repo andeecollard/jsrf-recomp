@@ -248,17 +248,56 @@ int d3d8_host_2d_idx_copy(uint64_t pos, uint32_t n, uint16_t *out)
     h = atomic_load_explicit(&s_ihead, memory_order_acquire);
     return h - pos + 2u * D3D8H2D_IDX_PER_DRAW <= D3D8H2D_IDX_RING;
 }
+/* G73: THE HASH RUNS ON THE TITLE'S THREAD, before every replaced draw, and
+ * it was most of the title's frame. Measured 25 Sep 2026 in Rokkaku-dai free
+ * play with the lift on: the mirror's draw hooks cost 15.45 ms a flip on the
+ * guest thread, 14.33 ms of it this function -- one byte per multiply, over
+ * every enabled array's range, so an interleaved stream (position, normal,
+ * texture coordinates in one buffer) was hashed once per attribute. With the
+ * pusher's GPU waits removed (RECOMP_METAL_ASYNC_WRITEBACK) the frame is the
+ * guest thread's, and this is what it was spending.
+ *
+ * Same question, same bytes: the enabled arrays' ranges are merged first, so
+ * each byte is read once, and the bytes are folded eight at a time in four
+ * independent lanes (the texture cache's hash64 shape). Both sides -- the
+ * call (d3d8_mirror.c) and the token (d3d8_host_2d_post) -- use this one
+ * function, so "did the bytes change between the two" is answered exactly as
+ * before; only the value of the hash differs. */
+static uint64_t vhash_bytes(uint64_t h, const uint8_t *p, size_t n)
+{
+    uint64_t h0 = h, h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full, h3 = 0x165667B19E3779F9ull, w0, w1, w2, w3;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        memcpy(&w0, p + i, 8); memcpy(&w1, p + i + 8, 8); memcpy(&w2, p + i + 16, 8); memcpy(&w3, p + i + 24, 8);
+        h0 = (h0 ^ w0) * 0x100000001B3ull; h1 = (h1 ^ w1) * 0x100000001B3ull;
+        h2 = (h2 ^ w2) * 0x100000001B3ull; h3 = (h3 ^ w3) * 0x100000001B3ull;
+        h0 ^= h0 >> 29; h1 ^= h1 >> 29; h2 ^= h2 >> 29; h3 ^= h3 >> 29;
+    }
+    h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ (h3 * 0x165667B19E3779F9ull) ^ (uint64_t)n;
+    for (; i < n; ++i) { h ^= p[i]; h *= 0x100000001B3ull; }
+    return h;
+}
 uint64_t d3d8_host_2d_vertex_hash(const uint8_t *ram, size_t ram_size, const D3D8HostDrawCheck *c,
                                   uint32_t imin, uint32_t imax)
 {
-    uint64_t h = 0xCBF29CE484222325ull;
+    uint64_t h = 0xCBF29CE484222325ull, lo[16], hi[16];
+    unsigned n = 0;
     for (unsigned i = 0; i < 16; ++i) {
         uint32_t stride = c->va_format[i] >> 8;
         if (!((c->va_on >> i) & 1u) || !stride) continue;
         uint64_t a = (uint64_t)(c->va_offset[i] & RAM_MASK) + (uint64_t)imin * stride;
         uint64_t b = (uint64_t)(c->va_offset[i] & RAM_MASK) + (uint64_t)(imax + 1u) * stride;
         if (b > ram_size || b < a || b - a > (1u << 22)) { h ^= 0xFFu; h *= 0x100000001B3ull; continue; }
-        for (uint64_t k = a; k < b; ++k) { h ^= ram[k]; h *= 0x100000001B3ull; }
+        {   /* insertion by start, then merged below */
+            unsigned k = n++;
+            while (k && lo[k - 1] > a) { lo[k] = lo[k - 1]; hi[k] = hi[k - 1]; --k; }
+            lo[k] = a; hi[k] = b;
+        }
+    }
+    for (unsigned k = 0; k < n;) {
+        uint64_t a = lo[k], b = hi[k];
+        for (++k; k < n && lo[k] <= b; ++k) if (hi[k] > b) b = hi[k];
+        h = vhash_bytes(h, ram + a, (size_t)(b - a));
     }
     return h;
 }

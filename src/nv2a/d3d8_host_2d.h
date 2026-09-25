@@ -279,7 +279,8 @@ uint16_t *d3d8_host_2d_idx_reserve(uint32_t n, uint64_t *pos);
 void      d3d8_host_2d_idx_publish(uint64_t pos, uint32_t n);
 /* 1 and `out` filled, or 0 if the entries were never published or have been overwritten. */
 int       d3d8_host_2d_idx_copy(uint64_t pos, uint32_t n, uint16_t *out);
-/* FNV-1a over every enabled vertex array's bytes for indices imin..imax. */
+/* A hash of every enabled vertex array's bytes for indices imin..imax (the
+ * arrays' ranges merged, so interleaved streams are read once). */
 uint64_t  d3d8_host_2d_vertex_hash(const uint8_t *ram, size_t ram_size, const D3D8HostDrawCheck *c,
                                    uint32_t imin, uint32_t imax);
 
