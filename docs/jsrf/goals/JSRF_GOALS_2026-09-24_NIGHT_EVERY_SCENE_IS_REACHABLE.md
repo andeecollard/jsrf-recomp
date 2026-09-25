@@ -193,3 +193,20 @@ smaller than its working set. `RECOMP_METAL_TEXTURE_SLOTS`, default now 512:
 **G66 fix merged** (f15924e: per-thread priority restore, unmatched-unlock
 safety — both default on — and `RECOMP_ADX_TRACE`); unit tests incl. the exact
 poisoning interleave pass; 10 in-game runs of 4:96 with the trace running.
+
+## Progress, 25 Sep (late morning): G66 verified, G69 instrumented
+
+**G66 in game** (merged fix, trace on, 10 × RECOMP_CHAPTER_JUMP=4:96): **10/10
+reached free play with frames advancing; no hang.** The poisoning step (count
+to zero on a non-raiser) occurred in runs 3, 4 and 8 and was corrected each
+time ("owed restores applied" = occurrences). The trace shows the leaked
+levels (thread holds guard depth 2 while the guest count cycles 0↔1) but not
+their origin: the 256-event ring starts after the leak. Next: dump at the
+first locks-minus-matched change. Runs: `~/jsrf-build/runs/g66/runs/on1..on10`.
+
+**G69 instrumented** (139ff0a): a CALL word is a desync in this title
+(`RECOMP_PB_CALL_IS_DESYNC`, default on) — the parse stops there with the
+recheck, replay, ring and segment history. 6-run 3:60 batch with
+`RECOMP_PB_REPLAY` and `RECOMP_PB_NOTIFY_TRACE`: `~/jsrf-build/runs/g69`.
+
+Handover: `handovers/HANDOVER_2026-09-25_MORNING_EVERY_SCENE_REACHABLE_THE_GAME_MAPPED.txt`.

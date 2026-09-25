@@ -1,0 +1,95 @@
+HANDOVER -- 25 September 2026 (morning)
+EVERY SCENE IS REACHABLE, THE WHOLE GAME IS MAPPED
+
+Covers the night of 24 Sep and the morning of 25 Sep, most of it unattended
+while the player was away. The plan and the full evidence are in
+docs/jsrf/goals/JSRF_GOALS_2026-09-24_NIGHT_EVERY_SCENE_IS_REACHABLE.md
+(G57-G69). Branch jsrf/g2-text-clobber-and-the-symbol-layer; NOTHING PUSHED.
+JSRF.app: rebuilt during the night; rebuild it again from HEAD (see 3).
+
+
+====================================================================
+0. WHAT CHANGED FOR THE PLAYER
+====================================================================
+
+Fixed, player-confirmed: Beat's colours in Rokkaku-dai (G58, 16-bit
+swizzled textures), the city (G54).
+Fixed, measured unattended:
+  - cutscene objects "disappearing temporarily" (DJ K, police, crows): G57,
+    frndint ignored the x87 rounding mode so floor/ceil rounded to nearest;
+    run-time lift of _frnd until the gen is regenerated. Every police and
+    DJ K dropout gone with the fix, back without it (37-jump sweep).
+  - Sky Dino 99 ms -> 34 ms a frame (G68, texture cache 128 -> 512 slots).
+  - the intermittent ADX hang (G66): 10/10 runs of 4:96 play through with the
+    fix; the poisoning step occurred in 3 of them and was corrected.
+Fixed in code, player to confirm: graffiti studio (G59), water (G60).
+Music: confirmed fixed (DSOUND lift, 23 Sep).
+
+
+====================================================================
+1. HOW TO WORK NOW
+====================================================================
+
+Read docs/jsrf/TOOLS.md. In short: RECOMP_CHAPTER_JUMP=C:M reaches any
+mission unattended (clean-room implementation, G64); the catalogue in
+diagnostics/jsrf_first_fault/gametools/catalogue/ says which jump plays
+which cutscene; RECOMP_FLIGHT_FRAMES + M and RECOMP_GLITCH_WATCH record a
+glitch frame by frame; gametools/harness/ has the launchers (jump_run,
+gw_run, map_run/map_batch). One game instance at a time.
+
+
+====================================================================
+2. OPEN, IN ORDER
+====================================================================
+
+1. G69 -- Sewage Facility (3:60) free-play hang, ~1 in 2: the pushbuffer
+   parser loses sync, reads a data word as CALL, stream_fault is permanent.
+   139ff0a stops at the CALL with the full post-mortem
+   (RECOMP_PB_CALL_IS_DESYNC, default on). A 6-run batch was running at
+   hand-off: ~/jsrf-build/runs/g69/runs/s1..s6 -- grep "treated as a desync",
+   then read the replay verdict (SAME vs DIFFERENT offset, [PB-PATCH-RACE]).
+   Analysis: docs/jsrf/goals (G69) and the 25 Sep goals Progress section.
+2. G66 leak origin -- the fix is a mitigation; the lock leak that opens the
+   window is still there (~25% of runs). The 256-event trace ring is too short
+   to reach the leak's origin; dump at the first locks-minus-matched change
+   instead. docs/jsrf/progress/PROGRESS_2026-09-25_G66_*.md.
+3. G65 -- one-frame camera pop in e200, e221, 4:62: compare with xemu.
+4. Performance: most stages 18-31 ms (capped at 60 Hz). Cost spread over
+   vertex shading, submit and guest time; the D3D lift (G50-G52) is the lever.
+   Re-measure Skyscraper after G68. A hashed texture lookup would remove the
+   0.3 ms the bigger cache costs on normal stages.
+5. G2 corrupt text -- not worked; G63 Poison Jam chase cutscenes (need play).
+
+
+====================================================================
+3. DECISIONS WAITING FOR THE PLAYER
+====================================================================
+
+- PUSH: ~40 local commits are unpushed. The public repo would receive the
+  old ChapterSelect port in HISTORY (a987c6c, be48155, and e3a4907's edit of
+  it) even though the file is now the clean-room version. Either rewrite
+  those commits out before the first push, or ask KeybadeBlox (their
+  ChapterSelect has no licence; it also has a wrong ClearStateFlags address,
+  0x128C0 is CActMan::GetAction, the real one is 0x3AE20 -- a friendly
+  reason to write, as the player: their decomp refuses LLM contributions).
+- REGENERATE the gen tree with the G57 lifter fix (copy the tree aside
+  first); then delete x87_lift.c; jsrf_gen_header_current goes green.
+- UPSTREAM frndint PR: branch contrib/frndint-rounding-control (824bfff),
+  text docs/upstream/PR_DRAFT_frndint_rounding_control.md. Review, then push
+  to `fork` and gh pr create.
+- CLEANUP: merged branches from 24 Sep; agent worktrees under
+  .claude/worktrees/ (all merged or superseded).
+- CHECK IN GAME: graffiti studio, water, cutscenes, Sky Dino.
+- JSRF.app: rebuild from HEAD (make_app.sh; never piped into head).
+
+
+====================================================================
+4. LESSONS
+====================================================================
+
+- REACH THE SCENE BEFORE THEORISING. Three guess-then-play loops on Beat's
+  colour cost the player an evening; one unattended replay plus a per-draw
+  capture found it in minutes.
+- A LAUNCHER THAT NEVER MATCHES ITS TRIGGER LOOKS LIKE IT WORKS. jump_run.sh
+  waited for a log string the old implementation never printed, so every run
+  ran to its timeout; the day it matched, recordings were cut off mid-write.
