@@ -75,6 +75,12 @@ typedef struct {
     /* The pixel shader definition D3D was given (SetPixelShader's handle +8),
      * 57 words; ps_bound = 0 means fixed-function combiners. */
     uint32_t ps_bound, ps[57];
+    /* The texture shader stage modes (0x1E70) are D3D's, not the definition's:
+     * LazySetShaderStageProgram (0x1952B0) derives them at the draw's flush
+     * from the bound textures, and for a pixel shader from device +0x37C
+     * (the shader's modes) adjusted per bound texture when device +0x378 is
+     * set. stage_prog_in = {+0x378, +0x37C}; see d3d8_host_stage_program. */
+    uint32_t stage_prog_in[2];
     /* D3D's deferred texture-stage state (0x19DEE0): 4 stages x 32 words. */
     uint32_t tss[4][32];
     /* The current vertex shader (device +0x384 handle). Programmable shaders

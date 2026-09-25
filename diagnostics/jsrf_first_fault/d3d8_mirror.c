@@ -471,6 +471,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     c->rs_cull = MEM32(0x0019E2E0u); c->rs_front = MEM32(0x0019E2DCu); c->rs_valid = 1;
     d3d8m_snap_indices(c, kind, a2, a3);
     c->ffc_valid = 1; d3d8m_ffc_read(&c->ffc_cur); c->ffc_ps = c->ffc_cur.pixel_shader;
+    c->stage_prog_in[0] = MEM32(d + 0x378u); c->stage_prog_in[1] = MEM32(d + 0x37Cu);
     c->tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);
     d3d8m_fog_read(c->fog_cur);
     c->ffv_valid = 1; c->ffv_vs_flags = d3d8m_vs_flags(d); d3d8m_fg_read(&c->fg_cur);
@@ -561,6 +562,8 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     c.ffc_valid = 1;
     d3d8m_ffc_read(&c.ffc_cur);
     c.ffc_ps = c.ffc_cur.pixel_shader;
+    {   uint32_t d = MEM32(0x0019DCE0u);           /* LazySetShaderStageProgram's device inputs */
+        c.stage_prog_in[0] = MEM32(d + 0x378u); c.stage_prog_in[1] = MEM32(d + 0x37Cu); }
     c.ffc_emit_seen = m_ffc_emit_seen; c.ffc_emit = m_ffc_emit;
     c.ffc_emit_fresh = m_ffc_emits != m_ffc_emits_at_draw; m_ffc_emits_at_draw = m_ffc_emits;
     c.tfactor = MEM32(0x0019E0E0u + 4u * D3D8FF_RS_TEXTUREFACTOR);

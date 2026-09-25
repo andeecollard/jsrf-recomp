@@ -175,6 +175,11 @@ typedef struct {
     const uint32_t *vs_idx;
     float vs_c[192][4];                        /* the constant file, from D3D */
     uint32_t tris_dropped_q;                   /* textured unit q <= 0: the executor drops those too */
+    /* G51.2 diagnostics: the stage modes the draw was built with, and whether
+     * D3D's derivation turned off a stage the pixel shader's word 54 names. */
+    uint32_t stage_modes, modes_adjusted, ps_word54;
+    uint32_t vs_in_unfetched, vs_in_noarray;   /* read inputs the host could not decode / that have no array */
+    char     vs_fmt_text[96];                  /* read inputs as slot:format (FF = no array) */
 } D3D8Host2DDraw;
 
 /* Is this draw pre-transformed 2D? The vertex shader handle (device +0x384)
@@ -371,9 +376,14 @@ void d3d8_host_2d_metal_spec_stats(unsigned long long *built, unsigned long long
  *  512 refuse points/lines again (replaced by nothing since 645a7e6)
  * 1024 bind a target with D3D's geometry, not the executor's slot's
  * 2048 compile specialised pipelines in line (a first-use hitch), not asynchronously
+ * 4096 a pixel shader's stage modes and final combiner from its definition words (54, 8/9) and
+ *      a fixed-function draw's modes from its bound textures, not D3D's derivations (0x1952B0,
+ *      d3d8_host_stage_program; 0x195610, d3d8_ff_final_combiner): unbound stages refused again
  * 0x3FF reverts all of it: draw mode as 688bea4 drew, whose frames were clean.
  * Read once; 0 or unset changes nothing. The test sets it directly. */
 unsigned d3d8_host_2d_bisect(void);
+/* The 0x1E70 word D3D's LazySetShaderStageProgram (0x1952B0) writes for this draw. */
+uint32_t d3d8_host_stage_program(const D3D8HostDrawCheck *c);
 void d3d8_host_2d_set_bisect(unsigned mask);
 /* Flips seen by the shadow/draw bookkeeping (the texture cache revalidates once per flip). */
 unsigned long long d3d8_host_2d_flip_count(void);

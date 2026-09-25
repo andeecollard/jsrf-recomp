@@ -2130,6 +2130,106 @@ static void hostread_tests(void)
     nv2a_host_read_report();
 }
 
+/* G51.2: the texture shader stage modes are D3D's 0x1952B0 derivation.
+ * The title's pixel shaders leave PROJECT2D on stages with no texture; D3D
+ * writes NONE there, so the host must not refuse ("shader samples an unbound
+ * stage", ~40% of the class) and must not sample. A fixed-function stage after
+ * a BUMPENVMAP COLOROP is BUMPENVMAP, which the host does not draw: refused.
+ * Each rule is checked against the old one (BISECT 4096) as its control. */
+static void stage_mode_tests(void)
+{
+    D3D8HostDrawCheck c; D3D8Host2DDraw d; const char *why;
+    const uint32_t F2D = 0x1u | 0x20u | (0x06u << 8) | (1u << 16) | (5u << 20) | (5u << 24);
+    /* The derivation alone. */
+    base_check(&c);
+    c.tex[0] = 1; c.format[0] = F2D;
+    CHECK(d3d8_host_stage_program(&c) == 0x00001u, "modes: FF, one 2D texture -> %05X", d3d8_host_stage_program(&c));
+    c.tex[1] = 2; c.format[1] = F2D; c.tss[0][12] = 0x19u;
+    CHECK(d3d8_host_stage_program(&c) == 0x000C1u, "modes: FF, BUMPENVMAP on stage 0 -> stage 1 mode 6 (%05X)", d3d8_host_stage_program(&c));
+    c.tss[0][12] = 0x1Au;
+    CHECK(d3d8_host_stage_program(&c) == 0x000E1u, "modes: FF, BUMPENVMAPLUMINANCE -> mode 7 (%05X)", d3d8_host_stage_program(&c));
+    c.tss[0][12] = 4u; c.format[1] = F2D | 4u;
+    CHECK(d3d8_host_stage_program(&c) == 0x00061u, "modes: FF, a cube texture -> CUBEMAP (%05X)", d3d8_host_stage_program(&c));
+    c.format[1] = (F2D & ~0xF0u) | 0x30u;
+    CHECK(d3d8_host_stage_program(&c) == 0x00041u, "modes: FF, a volume -> PROJECT3D (%05X)", d3d8_host_stage_program(&c));
+    c.tex[1] = 0;
+    c.ffc_ps = 0x80001000u; c.stage_prog_in[0] = 0; c.stage_prog_in[1] = 0x00021u;
+    CHECK(d3d8_host_stage_program(&c) == 0x00021u, "modes: pixel shader, +0x378 clear -> +0x37C as it is");
+    c.stage_prog_in[0] = 1;
+    CHECK(d3d8_host_stage_program(&c) == 0x00001u, "modes: pixel shader, PROJECT2D on an unbound stage -> NONE (%05X)", d3d8_host_stage_program(&c));
+    c.stage_prog_in[1] = 0x00081u | (5u << 10) | (0x11u << 15);
+    CHECK(d3d8_host_stage_program(&c) == (0x00081u | (5u << 10) | (0x11u << 15)),
+          "modes: pixel shader, PASSTHRU/CLIPPLANE/DOTPRODUCT kept with no texture (%05X)", d3d8_host_stage_program(&c));
+    c.stage_prog_in[1] = 0x00001u; c.format[0] = (F2D & ~0xFF00u) | (0x2Cu << 8);
+    CHECK(d3d8_host_stage_program(&c) == 0x00002u, "modes: pixel shader, a depth format -> PROJECT3D (%05X)", d3d8_host_stage_program(&c));
+    c.stage_prog_in[1] = 0x0000Du; c.format[0] = F2D | 4u;
+    CHECK(d3d8_host_stage_program(&c) == 0x0000Eu, "modes: pixel shader, DOT_STR_3D on a cube -> DOT_STR_CUBE (%05X)", d3d8_host_stage_program(&c));
+
+    /* A pixel-shader 2D draw sampling T0 and naming PROJECT2D on stage 1 with nothing bound. */
+    case_a(&c);
+    c.ffc_ps = 0x80001000u; c.ps_bound = 1;
+    c.ps[53] = 1u;                                   /* one combiner stage */
+    c.ps[34] = 0x08200000u; c.ps[0] = 0x18200000u;   /* colour T0 * 1, alpha T0.a * 1 */
+    c.ps[45] = 0x00000C00u; c.ps[26] = 0x00000C00u;  /* -> R0 */
+    c.ps[8] = 0xCu; c.ps[9] = 0x1C80u;
+    c.ps[54] = 0x00021u; c.stage_prog_in[0] = 1; c.stage_prog_in[1] = 0x00021u;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why && d.tmask == 1u, "pixel shader, unbound PROJECT2D stage: built, samples stage 0 only (%s, tmask %X)",
+          why ? why : "built", d.tmask);
+    d3d8_host_2d_set_bisect(4096u);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(why && !strcmp(why, "shader samples an unbound stage"), "control, BISECT 4096 (word 54): refused (%s)", why ? why : "built");
+    d3d8_host_2d_set_bisect(0);
+    c.stage_prog_in[0] = 0;                          /* D3D keeps the shader's modes: the executor has mode 1 on a disabled unit */
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(why && !strcmp(why, "shader samples an unbound stage"), "pixel shader, D3D does not adjust: still refused (%s)", why ? why : "built");
+
+    /* The same shader with no final combiner of its own (words 8/9 zero,
+     * device +0x374 zero, as the characters' shaders): D3D's fog updater
+     * writes the default program, so the host must use it, not 0/0. */
+    c.stage_prog_in[0] = 1; c.ps[8] = 0; c.ps[9] = 0;
+    c.fog_cur[0] = 0; c.fog_cur[1] = 0; c.fog_cur[2] = c.ffc_ps; c.fog_cur[3] = 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why && d.final_cw0 == 0xCu && d.final_cw1 == 0x1C80u && !d.final_general,
+          "pixel shader without a final combiner: D3D's default R0 program (%s, %08X/%08X)", why ? why : "built", d.final_cw0, d.final_cw1);
+    c.fog_cur[1] = 1;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why && d.final_cw0 == 0xEu && d.add_specular, "... with SPECULARENABLE: the specular-add program (%s, %08X)", why ? why : "built", d.final_cw0);
+    c.fog_cur[1] = 0; c.fog_cur[3] = 1; c.ps[8] = 0xEu; c.ps[9] = 0x1C80u;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why && d.final_cw0 == 0xEu, "pixel shader with its own final combiner (+0x374 set): its words (%s, %08X)", why ? why : "built", d.final_cw0);
+    c.fog_cur[3] = 0; c.ps[8] = 0; c.ps[9] = 0;
+    d3d8_host_2d_set_bisect(4096u); c.ps[54] = 0x00001u;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(why || (d.final_cw0 == 0u && d.final_cw1 == 0u), "control, BISECT 4096: words 8/9 as they stand, 0/0 (%s, %08X/%08X)",
+          why ? why : "built", d.final_cw0, d.final_cw1);
+    d3d8_host_2d_set_bisect(0);
+
+    /* Fixed function: stage 1 after a BUMPENVMAP COLOROP. */
+    case_a(&c);
+    c.tex[1] = 0x9ABC; c.data[1] = TEX; c.format[1] = c.format[0]; c.tss[1][0] = c.tss[1][1] = 1;
+    c.ffc_cur.texture_bound_mask = 3; c.tss[0][12] = 0x19u;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(why && !strcmp(why, "texture shader mode (fixed function)"), "FF, stage 1 BUMPENVMAP: left to the executor (%s)", why ? why : "built");
+    d3d8_host_2d_set_bisect(4096u);
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why && d.tmask == 3u, "control, BISECT 4096: the old rule draws it as plain 2D (%s, tmask %X)", why ? why : "built", d.tmask);
+    d3d8_host_2d_set_bisect(0);
+    c.tss[0][12] = D3D8FF_TOP_MODULATE;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(!why && d.tmask == 3u, "FF, two plain 2D stages: built, both sampled (%s, tmask %X)", why ? why : "built", d.tmask);
+}
+
 int main(int argc, char **argv)
 {
     D3D8HostDrawCheck c;
@@ -2151,6 +2251,11 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         bench_tests();
         return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "stagemodes") == 0) {   /* G51.2: D3D's texture stage modes */
+        stage_mode_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "arming") == 0) {       /* G51.2: one arming function */
         arming_tests();

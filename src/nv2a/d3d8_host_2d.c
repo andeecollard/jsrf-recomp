@@ -161,6 +161,54 @@ static const char *texture_from_d3d(const D3D8HostDrawCheck *c, unsigned u, D3D8
     return NULL;
 }
 
+/* G51.2: THE TEXTURE SHADER STAGE MODES D3D WRITES TO 0x1E70, transcribed
+ * from LazySetShaderStageProgram (0x1952B0, XDK 4134), which runs at the
+ * draw's flush. Stage 3 down to 0, five bits each:
+ *   fixed function (device +0x370 == 0): no texture -> NONE (0); else
+ *     BUMPENVMAP (6) / _LUMINANCE (7) when the PREVIOUS stage's COLOROP
+ *     (TSS word 12) is 0x19 / 0x1A (stage 0 never), else CUBEMAP (3) for a
+ *     cube texture (Format bit 2), PROJECT3D (2) for a volume (Format
+ *     dimension 3), else PROJECT2D (1);
+ *   pixel shader: device +0x37C's modes, as they are when device +0x378 is
+ *     0; otherwise per stage: with no texture a mode that samples becomes
+ *     NONE (PASSTHRU 4, CLIPPLANE 5, DOT_ZW 0xA and DOTPRODUCT 0x11 do not
+ *     sample and are kept); with one, PROJECT2D/3D/CUBEMAP become CUBEMAP for
+ *     a cube, PROJECT3D for a volume or a depth format (colour format
+ *     0x2A..0x31), else PROJECT2D; DOT_STR_3D/_CUBE follow the cube bit.
+ * The title's shaders leave PROJECT2D on stages they bind nothing to, and
+ * D3D turns those off: the executor's unit is disabled and 0x1E70 says NONE
+ * there (22 Sep-25 Sep: "shader samples an unbound stage", 40% of the
+ * programmable class, every one with the executor's unit disabled). */
+uint32_t d3d8_host_stage_program(const D3D8HostDrawCheck *c)
+{
+    uint32_t w = 0;
+    for (int s = 3; s >= 0; --s) {
+        uint32_t m, f = c->format[s];
+        if (!c->ffc_ps) {
+            if (!c->tex[s]) m = 0;
+            else if (s > 0 && c->tss[s - 1][12] == 0x19u) m = 6;
+            else if (s > 0 && c->tss[s - 1][12] == 0x1Au) m = 7;
+            else if (f & 4u) m = 3;
+            else if ((f & 0xF0u) == 0x30u) m = 2;
+            else m = 1;
+        } else if (!c->stage_prog_in[0]) {
+            return c->stage_prog_in[1];
+        } else {
+            m = (c->stage_prog_in[1] >> (5u * (unsigned)s)) & 31u;
+            if (!c->tex[s]) {
+                if (m != 4u && m != 5u && m != 0xAu && m != 0x11u) m = 0;
+            } else if (m >= 1u && m <= 3u) {
+                uint32_t cf = f & 0xFF00u;
+                m = (f & 4u) ? 3u : (f & 0xF0u) == 0x30u ? 2u : (cf >= 0x2A00u && cf <= 0x3100u) ? 2u : 1u;
+            } else if (m == 0xDu || m == 0xEu) {
+                m = (f & 4u) ? 0xEu : 0xDu;
+            }
+        }
+        w = (w << 5) | m;
+    }
+    return w;
+}
+
 /* Facing, by the rule nv2a_texture_copy_front_facing() applies (it lives in
  * xbox_vsh, which this library must not depend on): screen-space area with y
  * down, flipped when an odd number of the three w are negative. */
@@ -323,8 +371,22 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             d->ci[i] = w[34 + i]; d->co[i] = w[45 + i];
         }
         d->final_cw0 = w[8]; d->final_cw1 = w[9]; d->sf0 = w[43]; d->sf1 = w[44];
+        /* The final combiner registers are D3D's too: its fog updater
+         * (0x195610) writes CW0/CW1 unless a pixel shader with its own final
+         * combiner is set (device +0x370 and +0x374 both nonzero). The
+         * characters' shaders have none -- words 8/9 are 0, which would draw
+         * nothing -- and D3D gives them the fog/specular program, as it does
+         * a fixed-function draw. BISECT 4096 reads words 8/9 again. */
+        if (!(d3d8_host_2d_bisect() & 4096u) && !(c->fog_cur[2] && c->fog_cur[3]) &&
+            !d3d8_ff_final_combiner(c->fog_cur[0], c->fog_cur[1], c->fog_cur[2], c->fog_cur[3],
+                                    &d->final_cw0, &d->final_cw1))
+            return "final combiner not written";
+        /* The stage modes are D3D's derivation (d3d8_host_stage_program),
+         * not the definition's word 54; BISECT 4096 reads word 54 again. */
+        uint32_t modes = (d3d8_host_2d_bisect() & 4096u) ? w[54] : d3d8_host_stage_program(c);
+        d->stage_modes = modes; d->ps_word54 = w[54]; d->modes_adjusted = (modes & 0xFFFFFu) != (w[54] & 0xFFFFFu);
         for (unsigned u = 0; u < 4; ++u) {
-            uint32_t mode = (w[54] >> (5u * u)) & 31u;
+            uint32_t mode = (modes >> (5u * u)) & 31u;
             if (mode > 1u) return "texture shader mode";
             if (mode == 1u) { if (!c->tex[u]) return "shader samples an unbound stage"; d->tmask |= 1u << u; }
         }
@@ -339,7 +401,19 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         if (!d3d8_ff_final_combiner(c->fog_cur[0], c->fog_cur[1], c->fog_cur[2], c->fog_cur[3],
                                     &d->final_cw0, &d->final_cw1))
             return "final combiner not written";
-        for (unsigned u = 0; u < 4; ++u) if (c->tex[u]) d->tmask |= 1u << u;
+        if (d3d8_host_2d_bisect() & 4096u) {
+            for (unsigned u = 0; u < 4; ++u) if (c->tex[u]) d->tmask |= 1u << u;
+        } else {
+            /* A bound stage is sampled in 2D unless D3D gives it another mode:
+             * BUMPENVMAP after a BUMPENVMAP COLOROP (the executor displaces it,
+             * G60), a cube map or a volume. Those stay with the executor. */
+            uint32_t modes = d3d8_host_stage_program(c);
+            for (unsigned u = 0; u < 4; ++u) {
+                uint32_t mode = (modes >> (5u * u)) & 31u;
+                if (mode > 1u) return "texture shader mode (fixed function)";
+                if (mode == 1u) d->tmask |= 1u << u;
+            }
+        }
     }
     if (!d->cc || d->cc > 8u) return "combiner count";
     /* The final combiner as the executor models it (G53): the two fog-off
@@ -426,7 +500,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                     float x[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
                     if (!(prog.inputs_read & (1u << a))) continue;
                     if (a == 3u) x[0] = x[1] = x[2] = 1.0f;                 /* diffuse without an array: white */
-                    if ((c->va_on >> a) & 1u) (void)fetch(ram, ram_size, c->va_offset[a], c->va_format[a], lo + v, x);
+                    if ((c->va_on >> a) & 1u) { if (!fetch(ram, ram_size, c->va_offset[a], c->va_format[a], lo + v, x)) d->vs_in_unfetched |= 1u << a; }
+                    else d->vs_in_noarray |= 1u << a;
                     memcpy(vin[v * nattrs + slot_of[a]], x, 16);
                 }
             for (uint32_t k = 0; ; ++k) {
@@ -442,6 +517,11 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 for (unsigned j = 0; j < 3; ++j) vidx[3u * nt + j] = idx[t[j]] - lo;
                 ++nt;
             }
+            {   size_t at = 0; d->vs_fmt_text[0] = 0;
+                for (unsigned a = 0; a < 16 && at + 12 < sizeof d->vs_fmt_text; ++a)
+                    if ((prog.inputs_read >> a) & 1u)
+                        at += (size_t)snprintf(d->vs_fmt_text + at, sizeof d->vs_fmt_text - at, "%s%u:%02X", at ? " " : "", a,
+                                               ((c->va_on >> a) & 1u) ? c->va_format[a] & 0xFFu : 0xFFu); }
             d->vs_in = (const float (*)[4])vin; d->vs_nin = range; d->vs_idx = vidx; d->vs_nidx = 3u * nt;
             d->nverts = 3u * nt; d->idx_min = lo; d->idx_max = hi;
             if (control) d->control_perturbed = 1;
@@ -741,6 +821,7 @@ static int ff_sampled(void) { return s_ff_stride <= 1 || (s_flips % s_ff_stride)
 static int s_vsmode = -1;
 static unsigned long long s_vs_seen, s_vs_draws, s_vs_built, s_vs_compared, s_vs_exact, s_vs_within, s_vs_mm;
 static unsigned long long s_vs_px, s_vs_px_mm, s_vs_exec_changed, s_vs_host_changed, s_vs_mm_cov_exec, s_vs_mm_cov_host;
+static unsigned long long s_vs_cmp_adj[2], s_vs_mm_adj[2], s_vs_printed_mm;
 static unsigned long long s_vs_const_match, s_vs_const_differ, s_vs_const_slot_differ[192];
 static unsigned s_vs_max_err[3], s_vs_printed_const;
 static unsigned long long s_vs_exec_prog, s_vs_exec_not_prog;
@@ -1047,6 +1128,8 @@ static uint16_t *crop(const uint8_t *base, uint32_t pitch, uint32_t x0, uint32_t
     return o;
 }
 
+static unsigned long long s_sp_match[4], s_sp_differ[4], s_sp_old_match, s_sp_old_differ, s_sp_printed;
+static unsigned long long s_fc_match, s_fc_differ, s_fc_old_match, s_fc_old_differ, s_fc_printed;
 void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecDrawTextures *))
 {
     static D3D8ExecDrawTextures e;
@@ -1077,6 +1160,41 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     if (exec_source && cls == 2) {
         if (NV2A_XF_IS_FIXED(e.exec_mode)) ++s_ff_fixed; else ++s_ff_not_fixed;
         if (!e.active) ++s_ff_exec_inactive;
+    }
+    /* G51.2: the texture shader stage modes the host derives
+     * (d3d8_host_stage_program, D3D's 0x1952B0) against the executor's
+     * latched 0x1E70; the rule it replaced (word 54 for a pixel shader,
+     * PROJECT2D on every bound stage otherwise) is tallied beside it as the
+     * negative control. */
+    if (e.regs_valid && cls) {
+        uint32_t ex = e.regs[0x1E70u / 4u] & 0xFFFFFu, mine = d3d8_host_stage_program(c) & 0xFFFFFu, old = 0;
+        if (c->ffc_ps) old = c->ps_bound ? c->ps[54] & 0xFFFFFu : 0xFFFFFFFFu;
+        else for (unsigned u = 0; u < 4; ++u) if (c->tex[u]) old |= 1u << (5u * u);
+        if (mine == ex) ++s_sp_match[cls & 3];
+        else {
+            ++s_sp_differ[cls & 3];
+            if (s_sp_printed++ < 8)
+                fprintf(stderr, "[D3D8-HOST] draw %u class %d: stage modes derived %05X, executor 0x1E70 %05X"
+                                " (pixel shader %08X, +0x378 %08X, +0x37C %08X, word 54 %08X, textures %X)\n",
+                        c->serial, cls, mine, ex, c->ffc_ps, c->stage_prog_in[0], c->stage_prog_in[1], c->ps[54],
+                        (c->tex[0] ? 1u : 0u) | (c->tex[1] ? 2u : 0u) | (c->tex[2] ? 4u : 0u) | (c->tex[3] ? 8u : 0u));
+        }
+        if (old == ex) ++s_sp_old_match; else ++s_sp_old_differ;
+    }
+    /* ... and the final combiner words D3D leaves in 0x288/0x28C, derived the
+     * same way the host builds them, against the executor's latched pair; the
+     * pixel shader's words 8/9 as they stand are the control. */
+    if (e.regs_valid && cls && c->ffc_ps && c->ps_bound) {
+        uint32_t w0 = c->ps[8], w1 = c->ps[9];
+        if (!(c->fog_cur[2] && c->fog_cur[3])) (void)d3d8_ff_final_combiner(c->fog_cur[0], c->fog_cur[1], c->fog_cur[2], c->fog_cur[3], &w0, &w1);
+        if (w0 == e.regs[0x288u / 4u] && w1 == e.regs[0x28Cu / 4u]) ++s_fc_match; else {
+            ++s_fc_differ;
+            if (s_fc_printed++ < 6)
+                fprintf(stderr, "[D3D8-HOST] draw %u: final combiner derived %08X/%08X, executor %08X/%08X (words 8/9 %08X/%08X,"
+                                " fog inputs %X %X %08X %08X)\n", c->serial, w0, w1, e.regs[0x288u / 4u], e.regs[0x28Cu / 4u],
+                        c->ps[8], c->ps[9], c->fog_cur[0], c->fog_cur[1], c->fog_cur[2], c->fog_cur[3]);
+        }
+        if (c->ps[8] == e.regs[0x288u / 4u] && c->ps[9] == e.regs[0x28Cu / 4u]) ++s_fc_old_match; else ++s_fc_old_differ;
     }
     if (cls == 1 && c->ffv_valid && (c->ffv_vs_flags & 0x2u)) ++s_vsflag_pass;
     for (unsigned u = 0; u < 4; ++u) if (c->tex[u] && (c->format[u] & 3u) == 2u) { ++s_ctx_b; break; }
@@ -1433,12 +1551,12 @@ unsigned d3d8_host_2d_bisect(void)
         const char *e = getenv("RECOMP_D3D8_HOST_BISECT");
         s_bisect_read = 1;
         s_bisect = e && *e ? (unsigned)strtoul(e, NULL, 0) : 0u;
-        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
+        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
                               s_bisect & 1 ? " own-pass" : "", s_bisect & 2 ? " buffer-per-draw" : "",
                               s_bisect & 4 ? " no-early-tests" : "", s_bisect & 8 ? " generic-shader" : "",
                               s_bisect & 16 ? " hash-every-draw" : "", s_bisect & 32 ? " no-vertex-cache" : "",
                               s_bisect & 64 ? " wait-every-draw" : "", s_bisect & 128 ? " late-executor-skip" : "",
-                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "", s_bisect & 2048 ? " inline-compile" : "");
+                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "", s_bisect & 2048 ? " inline-compile" : "", s_bisect & 4096 ? " old-stage-modes" : "");
     }
     return s_bisect;
 }
@@ -1610,9 +1728,23 @@ void d3d8_host_2d_flip(void)
         if (r->info.cls == 3) {
             ++s_vs_compared; s_vs_px += df.pixels; s_vs_px_mm += df.mismatch;
             s_vs_exec_changed += df.exec_changed; s_vs_host_changed += df.host_changed;
+            ++s_vs_cmp_adj[r->info.modes_adjusted != 0];
             if (df.mismatch) {
-                ++s_vs_mm;
+                const D3D8Host2DDraw *i = &r->info;
+                ++s_vs_mm; ++s_vs_mm_adj[i->modes_adjusted != 0];
                 if (df.exec_changed > df.host_changed) ++s_vs_mm_cov_exec; else if (df.host_changed > df.exec_changed) ++s_vs_mm_cov_host;
+                if (s_vs_printed_mm++ < 12)
+                    fprintf(stderr, "[D3D8-HOST-VS] flip %llu draw %u MISMATCH bbox %u,%u %ux%u: %llu px over, executor changed %llu,"
+                                    " host %llu, max r%u g%u b%u | program len %u inputs %04X, stage modes %05X (word 54 %05X%s),"
+                                    " tmask %X, cc %u, final %08X/%08X, alpha test %u func %X ref %u, blend %u %X/%X,"
+                                    " depth %u func %X write %u, stencil %u, cull %X, fog %u, tris %u | inputs not decoded %04X"
+                                    " (formats %s), without an array %04X\n",
+                            s_flips, r->serial, r->x0, r->y0, r->w, r->h, df.mismatch, df.exec_changed, df.host_changed,
+                            df.max_err[0], df.max_err[1], df.max_err[2], i->vs_len, i->vs_inputs, i->stage_modes & 0xFFFFFu,
+                            i->ps_word54 & 0xFFFFFu, i->modes_adjusted ? ", ADJUSTED" : "", i->tmask, i->cc,
+                            i->final_cw0, i->final_cw1, i->alpha_test, i->alpha_func, i->alpha_ref, i->blend, i->blend_src,
+                            i->blend_dst, i->depth_test, i->depth_func, i->depth_write, i->stencil_test, i->cull_face,
+                            i->fog_enable, i->vs_nidx / 3u, i->vs_in_unfetched, i->vs_fmt_text, i->vs_in_noarray);
             } else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_vs_within; else ++s_vs_exact;
             for (int ch = 0; ch < 3; ++ch) if (df.max_err[ch] > s_vs_max_err[ch]) s_vs_max_err[ch] = df.max_err[ch];
         }
@@ -1760,6 +1892,16 @@ static void ff_report(const char *why)
 void d3d8_host_2d_report(const char *why)
 {
     if (!d3d8_host_armed(NULL, 0)) return;
+    if (s_sp_match[1] + s_sp_match[2] + s_sp_match[3] + s_sp_differ[1] + s_sp_differ[2] + s_sp_differ[3])
+        fprintf(stderr, "[D3D8-HOST] %s stage modes (0x1E70), derived as D3D's 0x1952B0 vs the executor's: 2D %llu/%llu,"
+                        " fixed-function %llu/%llu, programmable %llu/%llu agree | the old rule (word 54 / every bound"
+                        " stage PROJECT2D): %llu agree, %llu differ\n", why,
+                s_sp_match[1], s_sp_match[1] + s_sp_differ[1], s_sp_match[2], s_sp_match[2] + s_sp_differ[2],
+                s_sp_match[3], s_sp_match[3] + s_sp_differ[3], s_sp_old_match, s_sp_old_differ);
+    if (s_fc_match + s_fc_differ)
+        fprintf(stderr, "[D3D8-HOST] %s pixel-shader final combiner (0x288/0x28C), derived as D3D's 0x195610 vs the executor's:"
+                        " %llu agree, %llu differ | the definition's words 8/9 as they stand: %llu agree, %llu differ\n",
+                why, s_fc_match, s_fc_differ, s_fc_old_match, s_fc_old_differ);
     if (s_mode == 2 || s_ffmode == 2 || s_vsmode == 2) {
         if (s_vsmode == 2)
             fprintf(stderr, "[D3D8-HOST-VS] %s draw mode: programmable tokens %llu, REPLACED %llu, refused %llu (reasons in the"
@@ -1893,12 +2035,14 @@ void d3d8_host_2d_report(const char *why)
                         " (executor more %llu, host more %llu) | px %llu over tolerance %llu, max error r%u g%u b%u |"
                         " executor changed %llu, host %llu | constants as the executor's %llu, different %llu (slots most"
                         " often different: %u x%llu, %u x%llu, %u x%llu) | refused for an unbound sampled stage: executor"
-                        " unit enabled %llu, disabled %llu, unknown %llu\n", why, s_vs_seen, s_flips,
+                        " unit enabled %llu, disabled %llu, unknown %llu | compared with a stage D3D turned off %llu"
+                        " (mismatching %llu), without %llu (mismatching %llu)\n", why, s_vs_seen, s_flips,
                 s_flips ? (double)s_vs_seen / (double)s_flips : 0.0, s_vs_progs, s_vs_prog_overflow ? "+" : "",
                 s_vs_draws, s_vs_built, s_vs_compared, s_vs_exact, s_vs_within, s_vs_mm, s_vs_mm_cov_exec, s_vs_mm_cov_host,
                 s_vs_px, s_vs_px_mm, s_vs_max_err[0], s_vs_max_err[1], s_vs_max_err[2], s_vs_exec_changed, s_vs_host_changed,
                 s_vs_const_match, s_vs_const_differ, slot[0], top[0], slot[1], top[1], slot[2], top[2],
-                s_vs_unbound_exec_on, s_vs_unbound_exec_off, s_vs_unbound_unknown);
+                s_vs_unbound_exec_on, s_vs_unbound_exec_off, s_vs_unbound_unknown,
+                s_vs_cmp_adj[1], s_vs_mm_adj[1], s_vs_cmp_adj[0], s_vs_mm_adj[0]);
     }
     fflush(stderr);
 }
