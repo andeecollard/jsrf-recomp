@@ -184,5 +184,16 @@ void nv2a_metal_frame_bench_flip(void);
  * overwritten. See the comment on nv2a_metal_ring_selftest. */
 int nv2a_metal_ring_selftest(unsigned slabs, int pin_mode, unsigned iters,
                              unsigned per_batch, unsigned *corrupt_out);
+/* Texture-cache lookup test hooks (texture_cache_index_test.c). reset empties
+ * the cache and picks the lookup: 0 linear scan, 1 hashed index, 2 a
+ * deliberately broken index (negative control). request returns the slot the
+ * texture landed in, -1 on failure, -2 without a Metal device. frame advances
+ * the once-per-frame full-compare clock as nv2a_metal_sync does. counters:
+ * requests, hits, uploads, evictions, full compares, partial compares,
+ * partial-caught, changed. Test-only; not thread-safe. */
+void nv2a_metal_texture_cache_test_reset(int mode);
+int nv2a_metal_texture_cache_test_request(const uint8_t *data, size_t size);
+void nv2a_metal_texture_cache_test_frame(void);
+void nv2a_metal_texture_cache_counters(unsigned long long out[8]);
 extern unsigned long long g_mtl_frames;
 #endif

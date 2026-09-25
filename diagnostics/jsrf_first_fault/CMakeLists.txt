@@ -1239,6 +1239,15 @@ if(APPLE)
     # The swizzled 16-bit formats (0x03, 0x04) on the shader's software
     # sampler, byte-equal to the CPU sampler. The hwtex arm proves they stay
     # on the software sampler when G27 is on (hw_tex_format() names neither).
+    # RECOMP_METAL_TEXTURE_HASH: the hashed lookup against the linear scan,
+    # slot for slot and counter for counter, with a broken index as the
+    # negative control. Two slot counts: the default, and a small cache that
+    # evicts on most cold requests.
+    add_executable(jsrf_metal_texture_cache_index_test texture_cache_index_test.c)
+    target_link_libraries(jsrf_metal_texture_cache_index_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_texture_cache_index COMMAND jsrf_metal_texture_cache_index_test)
+    add_test(NAME jsrf_metal_texture_cache_index_small COMMAND jsrf_metal_texture_cache_index_test)
+    set_tests_properties(jsrf_metal_texture_cache_index_small PROPERTIES ENVIRONMENT "RECOMP_METAL_TEXTURE_SLOTS=64")
     add_executable(jsrf_metal_sz16_test metal_sz16_test.c)
     target_link_libraries(jsrf_metal_sz16_test PRIVATE xbox_vsh)
     add_test(NAME jsrf_metal_sz16 COMMAND jsrf_metal_sz16_test)
