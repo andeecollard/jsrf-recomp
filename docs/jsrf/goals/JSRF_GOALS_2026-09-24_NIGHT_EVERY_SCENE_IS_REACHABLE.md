@@ -20,7 +20,7 @@ and a glitch can be recorded frame by frame while it happens.
 |---|---|
 | characters whited out in Rokkaku-dai (hair, glasses, skates, face) | **fixed**, confirmed by the player (G58) |
 | Rokkaku-dai city missing | fixed earlier today (G54, c8851f0) |
-| cutscene objects "disappearing temporarily" (DJ K, police, crows) | **root cause fixed** for the DJ K scene (G57); sweep of all cutscenes running (G61) |
+| cutscene objects "disappearing temporarily" (DJ K, police, crows) | **fixed** (G57): the 37-jump sweep shows every police and DJ K dropout gone with the fix and back without it (G61); a separate one-frame camera pop remains in 4 scenes (G65) |
 | music dies after ~2 minutes | **fixed**, player + logs: stage track streams in real time to the end of 23-minute sessions (DSOUND lift, 23 Sep) |
 | Roboy's graffiti studio cannot paint | **fixed in code** (G59), awaiting the player |
 | Rokkaku-dai water is a see-through void | **bump mapping implemented** (G60), awaiting the player; may need an xemu reference |
@@ -88,9 +88,8 @@ draws magenta / cyan.
 
 ## Open, in order
 
-1. **G61 — sweep every cutscene** with `RECOMP_GLITCH_WATCH` (in-engine
-   transient detector) across the chapter intros N:96 and every event the
-   catalogue says plays on a jump; triage each hit. In progress.
+1. **G61 — cutscene sweep: done** (see Progress, 25 Sep). Follow-ups: G65
+   camera pop (xemu), G66 intermittent hangs.
 2. **Player checks:** graffiti studio (G59), water (G60), cutscenes (G57).
 3. **Regenerate** the gen tree with the G57 lifter (player's decision), after
    copying the current tree aside (memory: the gen tree is overwritten in
