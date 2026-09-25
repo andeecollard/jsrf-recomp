@@ -1194,6 +1194,14 @@ static unsigned s_verify;
  * verify flip at the title slowed it enough that the stage harness's START
  * pulse went undelivered in six of six arms; the stage is what is verified. */
 static unsigned long long s_verify_after;
+/* The two agents added the same guard under two names; both are honoured. */
+/* RECOMP_D3D8_HOST_VERIFY_FROM=<flip> (G73): no verify flip before this one.
+ * A verify flip can stall for ~1.8 s, and at the title that loses the
+ * harness's first input: map_run arms with VERIFY on missed the chapter
+ * jump on 13 of 15 first attempts (every lift arm with the async write-back
+ * and VERIFY, whose unpaced title reaches a verify flip every 0.4 s).
+ * Starting after the title keeps VERIFY for the stage. */
+static unsigned long long s_verify_from;
 static int s_verify_pending; static uint32_t s_verify_serial;
 int d3d8_host_verify_enabled(void) { return s_verify && d3d8_host_any_draw_mode(); }
 void d3d8_host_2d_set_verify(unsigned every) { s_verify = every; }
@@ -1221,6 +1229,7 @@ static void read_knobs(void)
     if ((v = getenv("RECOMP_D3D8_HOST_2D_TOL")) && *v) s_tol = (unsigned)atoi(v);
     if ((v = getenv("RECOMP_D3D8_HOST_2D_DUMP_MAX")) && *v) s_dump_max = (unsigned)atoi(v);
     if ((v = getenv("RECOMP_D3D8_HOST_2D_EVERY")) && *v && atoi(v) > 0) s_every = atoi(v);
+    if ((v = getenv("RECOMP_D3D8_HOST_VERIFY_FROM")) && *v) s_verify_from = strtoull(v, NULL, 10);
     if ((v = getenv("RECOMP_D3D8_HOST_VERIFY")) && *v && atoi(v) > 0) {
         s_verify = (unsigned)atoi(v);
         fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_VERIFY=%u: in draw mode, 1 flip in %u is drawn by the executor"
@@ -1798,7 +1807,7 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
     int cls = d3d8_host_2d_class(c);
     if (!d3d8_host_replaces_handle(c->vs_handle) || !cls) return;
     ++s_rep_tokens; if (cls == 3) ++s_rep_vs_tokens;
-    if (s_verify && s_flips >= s_verify_after && (s_flips % s_verify) == 0) {   /* a verify flip: the executor draws, the host shadows */
+    if (s_verify && s_flips >= s_verify_after && s_flips >= s_verify_from && (s_flips % s_verify) == 0) {   /* a verify flip: the executor draws, the host shadows */
         d3d8_host_2d_pre(c->serial, c->vs_handle, c->rt_data, c->rt_format, c->rt_size, c->zs_data, c->zs_size);
         s_verify_pending = 1; s_verify_serial = c->serial;
         return;
