@@ -261,6 +261,8 @@ VALUE_CARRYING = {
     "RECOMP_INVISIBLE_DRAW",
     # A stride in flips: every Nth flip of a draw-mode run is verified.
     "RECOMP_D3D8_HOST_VERIFY",
+    # G73: a flip number; no verify flip before it (d3d8_host_2d.c).
+    "RECOMP_D3D8_HOST_VERIFY_FROM",
     # A draw INDEX, or "all": which draw of each frame the flight recorder
     # snapshots the whole transform state at (nv2a_pb_exec.c).
     "RECOMP_FLIGHT_XF_DRAW",
@@ -270,6 +272,9 @@ VALUE_CARRYING = {
     "RECOMP_FLIGHT_FRAMES",
     "RECOMP_FLIGHT_AT",
     "RECOMP_FLIGHT_DIR",
+    # G73: a count of consecutive flips in free play before the flight
+    # recorder writes (nv2a_pb_exec.c).
+    "RECOMP_FLIGHT_AT_FREEPLAY",
     # A colour, not a boolean: every colour clear is forced to this value to
     # tell "never covered" from "shaded to black" (nv2a_pb_exec.c). 0x0000 is a
     # legitimate force-to-black, so "0" must not read as off.
