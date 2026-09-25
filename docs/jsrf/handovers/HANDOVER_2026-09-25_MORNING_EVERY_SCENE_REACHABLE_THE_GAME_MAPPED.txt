@@ -5,7 +5,7 @@ Covers the night of 24 Sep and the morning of 25 Sep, most of it unattended
 while the player was away. The plan and the full evidence are in
 docs/jsrf/goals/JSRF_GOALS_2026-09-24_NIGHT_EVERY_SCENE_IS_REACHABLE.md
 (G57-G69). Branch jsrf/g2-text-clobber-and-the-symbol-layer; NOTHING PUSHED.
-JSRF.app: rebuilt during the night; rebuild it again from HEAD (see 3).
+JSRF.app: rebuilt 25 Sep 07:24 from ffc094b (G57, G58-G60, G66, G68, G69 post-mortem).
 
 
 ====================================================================
@@ -45,9 +45,11 @@ gw_run, map_run/map_batch). One game instance at a time.
 1. G69 -- Sewage Facility (3:60) free-play hang, ~1 in 2: the pushbuffer
    parser loses sync, reads a data word as CALL, stream_fault is permanent.
    139ff0a stops at the CALL with the full post-mortem
-   (RECOMP_PB_CALL_IS_DESYNC, default on). A 6-run batch was running at
-   hand-off: ~/jsrf-build/runs/g69/runs/s1..s6 -- grep "treated as a desync",
-   then read the replay verdict (SAME vs DIFFERENT offset, [PB-PATCH-RACE]).
+   (RECOMP_PB_CALL_IS_DESYNC, default on). A 6-run batch
+   (~/jsrf-build/runs/g69) did NOT reproduce it (0/6): rarer than the map's
+   one hit suggested, or timing moved. The post-mortem stays armed by default,
+   so the next occurrence anywhere logs "treated as a desync" with the replay
+   verdict (SAME vs DIFFERENT offset, [PB-PATCH-RACE]).
    Analysis: docs/jsrf/goals (G69) and the 25 Sep goals Progress section.
 2. G66 leak origin -- the fix is a mitigation; the lock leak that opens the
    window is still there (~25% of runs). The 256-event trace ring is too short
@@ -80,7 +82,6 @@ gw_run, map_run/map_batch). One game instance at a time.
 - CLEANUP: merged branches from 24 Sep; agent worktrees under
   .claude/worktrees/ (all merged or superseded).
 - CHECK IN GAME: graffiti studio, water, cutscenes, Sky Dino.
-- JSRF.app: rebuild from HEAD (make_app.sh; never piped into head).
 
 
 ====================================================================

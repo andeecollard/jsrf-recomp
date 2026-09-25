@@ -210,3 +210,10 @@ recheck, replay, ring and segment history. 6-run 3:60 batch with
 `RECOMP_PB_REPLAY` and `RECOMP_PB_NOTIFY_TRACE`: `~/jsrf-build/runs/g69`.
 
 Handover: `handovers/HANDOVER_2026-09-25_MORNING_EVERY_SCENE_REACHABLE_THE_GAME_MAPPED.txt`.
+
+**G69 batch result:** 0 of 6 runs of 3:60 desynced (all reached free play and
+stayed; `~/jsrf-build/runs/g69`). The map's 1-in-2 was one hit in two runs;
+the true rate is lower, or the timing moved (the runs had G68's larger
+texture cache and `RECOMP_PB_NOTIFY_TRACE`). The CALL post-mortem is on by
+default everywhere, including JSRF.app (rebuilt 07:24 from ffc094b), so the
+next occurrence — in any stage — logs "treated as a desync" with the evidence.
