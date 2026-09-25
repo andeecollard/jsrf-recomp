@@ -544,10 +544,11 @@ static const char *reject_reason;
  * texture-change counter flat -- the working set is larger than 128, so the
  * LRU below evicts and re-decodes the same textures each frame, 98-110 ms a
  * frame; Skyscraper (4:70) the same at 71 per frame. A value, so an A/B can
- * measure it without a rebuild. The lookup is a linear scan, which is why
+ * measure it without a rebuild. The lookup was a linear scan, which is why
  * the default is not simply the maximum. Measured 25 Sep, 50 s free play
  * each: Sky Dino 6:60 99.0 -> 34.0 ms p50 (rebuilds 53,514 -> 341) at 512;
- * Rokkaku-dai 2:40 19.4 -> 19.7 ms mean, the scan's cost. */
+ * Rokkaku-dai 2:40 19.4 -> 19.7 ms mean, the scan's cost. The hashed index
+ * below (RECOMP_METAL_TEXTURE_HASH) takes that scan off the hit path. */
 #define TEXTURE_CACHE_MAX 1024
 static unsigned texture_slots(void)
 {
@@ -577,10 +578,93 @@ typedef struct {
 } TextureBuffer;
 static TextureBuffer texture_cache[TEXTURE_CACHE_MAX];
 static id<MTLBuffer> dummy_buffer;
-static uint64_t texture_clock,texture_requests,texture_hits,texture_uploads;
+static uint64_t texture_clock,texture_requests,texture_hits,texture_uploads,
+                texture_evictions;   /* uploads that displaced another texture */
 /* The entry texture_buffer() last returned, so texture_hw() can attach its
  * MTLTexture to the same cache slot. Single pushbuffer thread; see ring. */
 static TextureBuffer *texture_last_slot;
+
+/* RECOMP_METAL_TEXTURE_HASH (default on; =0 is the linear scan): WHERE IS
+ * (source, size) IN texture_cache[]?
+ *
+ * The linear scan walked every slot on every request -- 512 of them since the
+ * slot count was raised for Sky Dino, which cost a normal stage ~0.3 ms a
+ * frame (see texture_slots). This is an open-addressing index, linear probing
+ * with backward-shift deletion (no tombstones), from the key to the slot that
+ * holds it. It is only an INDEX: the slots, stamps, verification and eviction
+ * choice are exactly the linear scan's, and texture_cache_index_test.c runs
+ * one request sequence through both and requires identical slots and
+ * counters.
+ *
+ * Why the behaviour is identical: a slot matches the scan only when it holds
+ * a buffer (an empty slot has size 0, and size 0 never gets that far), and no
+ * key is ever held by two slots (a changed texture is re-uploaded into its
+ * own slot). So "the first slot whose key matches" is "THE slot with that
+ * key", which is what the index returns. Slots never empty once filled, so the
+ * scan's "first empty slot" is always texture_used, and only a miss with
+ * every slot full still walks the array for the oldest stamp -- the same walk
+ * the scan did, on the rare path.
+ *
+ * Mode 2 exists only for the test's negative control: it forgets to index a
+ * texture that EVICTS another, so the test can prove it sees a broken index. */
+#define TEXTURE_INDEX_BITS 11                       /* 2048 >= 2 * TEXTURE_CACHE_MAX */
+#define TEXTURE_INDEX_SIZE (1u << TEXTURE_INDEX_BITS)
+static int16_t texture_index[TEXTURE_INDEX_SIZE];   /* slot number, or -1 */
+static unsigned texture_used;                       /* slots [0, texture_used) hold buffers */
+static int texture_hash_mode=-1;                    /* 0 scan, 1 index, 2 broken index (test only) */
+static uint64_t texture_index_probes;               /* index entries examined by lookups */
+static int texture_hash_on(void)
+{
+    if(texture_hash_mode<0){
+        texture_hash_mode=recomp_switch_on_default("RECOMP_METAL_TEXTURE_HASH",1);
+        memset(texture_index,0xff,sizeof texture_index);
+        fprintf(stderr,"[METAL] RECOMP_METAL_TEXTURE_HASH=%s (texture cache lookup: %s)\n",
+            texture_hash_mode?"on":"off",texture_hash_mode?"hashed index":"linear scan");
+    }
+    return texture_hash_mode;
+}
+static unsigned texture_index_home(const uint8_t *source,size_t size)
+{
+    uint64_t k=(uint64_t)(uintptr_t)source^((uint64_t)size*0xff51afd7ed558ccdull);
+    return (unsigned)((k*0x9e3779b97f4a7c15ull)>>(64-TEXTURE_INDEX_BITS));
+}
+static int texture_index_find(const uint8_t *source,size_t size)
+{
+    for(unsigned h=texture_index_home(source,size);;h=(h+1)&(TEXTURE_INDEX_SIZE-1)){
+        int i=texture_index[h];
+        ++texture_index_probes;
+        if(i<0) return -1;
+        if(texture_cache[i].source==source&&texture_cache[i].size==size) return i;
+    }
+}
+static void texture_index_insert(int slot)
+{
+    unsigned h=texture_index_home(texture_cache[slot].source,texture_cache[slot].size);
+    while(texture_index[h]>=0) h=(h+1)&(TEXTURE_INDEX_SIZE-1);
+    texture_index[h]=(int16_t)slot;
+}
+/* Remove the entry for `slot` (keyed by what the slot holds NOW), shifting
+ * later members of the probe run back so no lookup stops short. */
+static void texture_index_remove(int slot)
+{
+    unsigned h=texture_index_home(texture_cache[slot].source,texture_cache[slot].size);
+    while(texture_index[h]!=slot){
+        if(texture_index[h]<0) return;              /* not indexed (mode 2 only) */
+        h=(h+1)&(TEXTURE_INDEX_SIZE-1);
+    }
+    for(unsigned j=h;;){
+        texture_index[h]=-1;
+        for(;;){
+            j=(j+1)&(TEXTURE_INDEX_SIZE-1);
+            int i=texture_index[j];
+            if(i<0) return;
+            unsigned home=texture_index_home(texture_cache[i].source,texture_cache[i].size);
+            /* i may move back to h unless its home lies cyclically in (h, j]. */
+            if(h<=j ? (home<=h||home>j) : (home<=h&&home>j)) break;
+        }
+        texture_index[h]=texture_index[j];h=j;
+    }
+}
 /* The cache used to memcmp the whole texture against guest RAM on EVERY
  * request, and a frame requests the same textures hundreds of times: a 5 s
  * sample of the combo trick stage (23 Sep 2026) put that memcmp at 28% of the
@@ -3213,6 +3297,29 @@ no_stencil:
     return dss;
 }
 
+/* A request that found (source,size) in `entry`: the linear scan's hit
+ * semantics, shared by both lookups. Returns the buffer on a verified hit,
+ * nil when the bytes changed (the caller re-uploads into the same slot). */
+static id<MTLBuffer> texture_verify(TextureBuffer *entry,const uint8_t *data,size_t size)
+{
+    const uint8_t *have=entry->buffer.contents;
+    if(entry->verified_frame==texture_frame) {
+        ++texture_partial_compares;
+        if(!texture_probe_differs(have,data,size)) {
+            entry->stamp=++texture_clock;++texture_hits;texture_last_slot=entry;return entry->buffer;
+        }
+        ++texture_partial_caught;
+    } else {
+        ++texture_full_compares;
+        if(!memcmp(have,data,size)) {
+            entry->verified_frame=texture_frame;
+            entry->stamp=++texture_clock;++texture_hits;texture_last_slot=entry;return entry->buffer;
+        }
+    }
+    ++texture_changed;
+    return nil;
+}
+
 static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
 {
     if(!size) {
@@ -3220,42 +3327,82 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
         return dummy_buffer;
     }
     ++texture_requests;
-    TextureBuffer *slot=NULL,*oldest=&texture_cache[0];
+    TextureBuffer *slot=NULL;
     const unsigned nslots=TEXTURE_CACHE_SIZE;
-    for(unsigned i=0;i<nslots;i++) {
-        TextureBuffer *entry=&texture_cache[i];
-        if(entry->source==data&&entry->size==size) {
-            slot=entry;
-            if(entry->buffer) {
-                const uint8_t *have=entry->buffer.contents;
-                if(entry->verified_frame==texture_frame) {
-                    ++texture_partial_compares;
-                    if(!texture_probe_differs(have,data,size)) {
-                        entry->stamp=++texture_clock;++texture_hits;texture_last_slot=entry;return entry->buffer;
-                    }
-                    ++texture_partial_caught;
-                } else {
-                    ++texture_full_compares;
-                    if(!memcmp(have,data,size)) {
-                        entry->verified_frame=texture_frame;
-                        entry->stamp=++texture_clock;++texture_hits;texture_last_slot=entry;return entry->buffer;
-                    }
-                }
-                ++texture_changed;
-            }
-            break;
+    const int hashed=texture_hash_on();
+    if(hashed) {
+        int i=texture_index_find(data,size);
+        if(i>=0) {
+            id<MTLBuffer> hit=texture_verify(&texture_cache[i],data,size);
+            if(hit) return hit;
+            slot=&texture_cache[i];
+        } else if(texture_used<nslots) {
+            slot=&texture_cache[texture_used];
+        } else {
+            TextureBuffer *oldest=&texture_cache[0];
+            for(unsigned k=1;k<nslots;k++)
+                if(texture_cache[k].stamp<oldest->stamp) oldest=&texture_cache[k];
+            slot=oldest;
         }
-        if(!entry->buffer){if(!slot)slot=entry;}
-        else if(entry->stamp<oldest->stamp)oldest=entry;
+    } else {
+        TextureBuffer *oldest=&texture_cache[0];
+        for(unsigned i=0;i<nslots;i++) {
+            TextureBuffer *entry=&texture_cache[i];
+            if(entry->source==data&&entry->size==size) {
+                slot=entry;
+                if(entry->buffer) {
+                    id<MTLBuffer> hit=texture_verify(entry,data,size);
+                    if(hit) return hit;
+                }
+                break;
+            }
+            if(!entry->buffer){if(!slot)slot=entry;}
+            else if(entry->stamp<oldest->stamp)oldest=entry;
+        }
+        if(!slot)slot=oldest;
     }
-    if(!slot)slot=oldest;
     id<MTLBuffer> buffer=[device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
     if(!buffer)return nil;
+    const int filled=slot->buffer!=nil;
+    const int same_key=filled&&slot->source==data&&slot->size==size;
+    const int slot_no=(int)(slot-texture_cache);
+    if(filled&&!same_key) ++texture_evictions;
+    if(!filled) ++texture_used;   /* slots fill in index order: see texture_index */
+    if(hashed&&filled&&!same_key) texture_index_remove(slot_no);
     slot->source=data;slot->size=size;slot->buffer=buffer;slot->stamp=++texture_clock;++texture_uploads;
     slot->verified_frame=texture_frame;   /* just copied from data: equal by construction */
     slot->hw=nil;                         /* built from the old bytes */
+    if(hashed&&!same_key&&!(hashed==2&&filled)) texture_index_insert(slot_no);
     texture_last_slot=slot;
     return buffer;
+}
+
+/* texture_cache_index_test.c: drive texture_buffer() directly. mode 0 scan,
+ * 1 index, 2 broken index (negative control). Test-only; not thread-safe. */
+void nv2a_metal_texture_cache_test_reset(int mode)
+{
+    for(unsigned i=0;i<TEXTURE_CACHE_MAX;i++){
+        TextureBuffer *e=&texture_cache[i];
+        e->source=NULL;e->size=0;e->buffer=nil;e->stamp=0;e->verified_frame=0;e->hw=nil;
+    }
+    texture_hash_mode=mode;
+    memset(texture_index,0xff,sizeof texture_index);
+    texture_used=0;texture_last_slot=NULL;texture_clock=0;texture_frame=1;
+    texture_requests=texture_hits=texture_uploads=texture_evictions=texture_index_probes=0;
+    texture_full_compares=texture_partial_compares=texture_partial_caught=texture_changed=0;
+}
+int nv2a_metal_texture_cache_test_request(const uint8_t *data,size_t size)
+{
+    if(!initialize()) return -2;
+    if(!texture_buffer(data,size)) return -1;
+    return texture_last_slot?(int)(texture_last_slot-texture_cache):-1;
+}
+void nv2a_metal_texture_cache_test_frame(void){++texture_frame;}
+void nv2a_metal_texture_cache_counters(unsigned long long out[8])
+{
+    out[0]=texture_requests;out[1]=texture_hits;out[2]=texture_uploads;out[3]=texture_evictions;
+    out[4]=texture_full_compares;out[5]=texture_partial_compares;out[6]=texture_partial_caught;
+    out[7]=texture_changed;
 }
 
 /* G27 -- SAMPLE TEXTURES IN HARDWARE. RECOMP_METAL_HW_TEX=1, OFF BY DEFAULT.
@@ -4256,6 +4403,9 @@ void nv2a_metal_report(void)
         " partial-caught=%llu (a mid-frame rewrite the once-per-frame rule alone would have missed)\n",
         (unsigned long long)texture_full_compares,(unsigned long long)texture_partial_compares,
         (unsigned long long)texture_changed,(unsigned long long)texture_partial_caught);
+    fprintf(stderr,"[METAL] texture cache: %u of %u slots used, %llu evictions; lookup %s (%llu index probes)\n",
+        texture_used,TEXTURE_CACHE_SIZE,(unsigned long long)texture_evictions,
+        texture_hash_on()?"hashed index":"linear scan",(unsigned long long)texture_index_probes);
     fprintf(stderr,"[METAL] hw textures (RECOMP_METAL_HW_TEX=%s): %llu built, %llu reused, %llu units sampled in hardware,"
         " %llu decode failures (fell back to software), %.1f MiB decoded\n",
         hw_tex_on()?"on":"off",(unsigned long long)hw_tex_builds,(unsigned long long)hw_tex_reuses,
