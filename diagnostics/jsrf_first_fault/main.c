@@ -1454,6 +1454,12 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
     /* G56: CPU readers of GPU memory (the D3D lock hooks) are made current here. */
     {   extern void nv2a_host_read_set_service_thread(void); nv2a_host_read_set_service_thread(); }
     while (!g_pushbuf_ack_stop) {
+        extern void nv2a_pb_exec_idle_begin(void);
+        extern void nv2a_pb_exec_idle_end(int worked);
+        nv2a_pb_exec_idle_begin();
+        /* A turn is idle when the parser cursor did not move: `consumed`
+         * below means "caught up with PUT", which an idle turn also is. */
+        uint32_t pb_last_at_top = g_pb_last;
         uint32_t dev = MEM32(JSRF_D3D_CHANNEL_PTR);
         /* Snapshot the fence before consuming its commands. Reading PUT again
          * afterwards acknowledged newer, unconsumed work and allowed the
@@ -1578,6 +1584,7 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
          * trusting each pump to remember it. */
         d3d8_ring_publish_fence(getp, consumed, fence_counter);
         Sleep(0);
+        nv2a_pb_exec_idle_end(g_pb_last != pb_last_at_top || g_pb_subr_active);
     }
     return 0;
 }

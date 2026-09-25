@@ -420,6 +420,8 @@ static int m_verify_draw;          /* before_draw's verify decision, for after_d
  * mode (before it): D3D copies these indices into the ring during the call,
  * and the title rewrites pIndexData for its next draw long before a token is
  * reached, so the call is the one moment they are right. */
+static unsigned long long m_now_ns(void);
+static unsigned long long m_vh_ns;   /* G73: of the hooks' time, the vertex hash's */
 static void d3d8m_snap_indices(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a2, uint32_t a3)
 {
     extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -437,8 +439,10 @@ static void d3d8m_snap_indices(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a2,
         }
     }
     if (imin <= imax) {
+        unsigned long long t0 = m_now_ns();
         c->vtx_hash = d3d8_host_2d_vertex_hash((const uint8_t *)xbox_GetMemoryOffset(), 0x04000000u, c, imin, imax);
         c->vtx_hash_ok = 1;
+        m_vh_ns += m_now_ns() - t0;
     }
 }
 /* G51.1 draw mode: everything d3d8_host_2d_build reads, from D3D's state as
@@ -513,7 +517,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     }
 }
 
-void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+static void before_draw_body(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     uint32_t d, rt, zs, tok, h;
     if (!d3d8m_on()) return;
@@ -546,7 +550,7 @@ void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     d3d8m_put_token(tok);
 }
 
-void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+static void after_draw_body(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     D3D8HostDrawCheck c;
     uint32_t tok;
@@ -675,4 +679,47 @@ void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
     if (!tok) { ++m_no_token; return; }
     d3d8m_put_token(tok);
     if (m_serial % 20000u == 0) d3d8_host_report("mirror");
+}
+
+/* G73: WHAT THE MIRROR COSTS THE TITLE'S OWN THREAD. With the lift's GPU
+ * waits removed the pusher waits for the guest (the [STAGE] idle figure), so
+ * the frame is the guest thread's -- and these two hooks run on it, around
+ * every draw, filling a ~7 KB check record each. Timed here, printed every
+ * 600 flips as a window: microseconds a draw and milliseconds a flip. */
+#if defined(_WIN32)
+static unsigned long long m_now_ns(void) { return 0; }
+#else
+#include <time.h>
+static unsigned long long m_now_ns(void)
+{ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec; }
+#endif
+static unsigned long long m_hook_ns, m_hook_n, m_hook_flip0;
+static void m_hook_account(unsigned long long t0, int draw)
+{
+    unsigned long long f;
+    if (!t0) return;
+    m_hook_ns += m_now_ns() - t0;
+    if (!draw) return;
+    ++m_hook_n;
+    f = d3d8_host_2d_flip_count();
+    if (!m_hook_flip0) m_hook_flip0 = f ? f : 1;
+    if (f >= m_hook_flip0 + 600) {
+        fprintf(stderr, "[D3D8-MIRROR] guest-thread hooks (before+after draw): %.1f us a draw, %.2f ms a flip"
+                        " (%llu draws over %llu flips), of which the vertex hash %.2f ms a flip\n",
+                m_hook_n ? m_hook_ns / 1e3 / (double)m_hook_n : 0.0, m_hook_ns / 1e6 / (double)(f - m_hook_flip0),
+                m_hook_n, f - m_hook_flip0, m_vh_ns / 1e6 / (double)(f - m_hook_flip0));
+        m_hook_ns = 0; m_hook_n = 0; m_hook_flip0 = f; m_vh_ns = 0;
+    }
+}
+void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    unsigned long long t0 = d3d8m_on() ? m_now_ns() : 0;
+    before_draw_body(kind, a1, a2, a3);
+    m_hook_account(t0, 0);
+}
+void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    unsigned long long t0 = d3d8m_on() ? m_now_ns() : 0;
+    after_draw_body(kind, a1, a2, a3);
+    m_hook_account(t0, 1);
 }

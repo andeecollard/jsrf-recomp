@@ -206,13 +206,19 @@
  * directly -- the fix that keeps getting proposed for this -- removes the
  * readback and the snap and keeps the drain. Which of the three dominates
  * decides whether that is worth a week, so measure it before claiming it. */
+/* IDLE (G73) is the pusher loop's turns that found nothing to consume: the
+ * pusher waiting for the guest. Without it `rest` mixed the pusher's own work
+ * with waiting for the title, and when the GPU waits were removed the frame
+ * did not fall by as much -- `rest` grew instead, and only this says whether
+ * that is work or the title setting the pace. Timed by the loop in main.c
+ * (nv2a_pb_exec_idle_begin/end); disjoint from every other stage. */
 typedef enum { PB_STAGE_VSH, PB_STAGE_PREPARE, PB_STAGE_SUBMIT, PB_STAGE_SYNC,
-               PB_STAGE_SNAP, PB_STAGE_CLEAR, PB_STAGE_WALK,
+               PB_STAGE_SNAP, PB_STAGE_CLEAR, PB_STAGE_IDLE, PB_STAGE_WALK,
                PB_STAGE_N } PbStage;
 static const char *const pb_stage_name[PB_STAGE_N] = { "vsh", "prepare",
                                                        "submit", "sync",
                                                        "snap", "clear",
-                                                       "walk" };
+                                                       "idle", "walk" };
 static struct { unsigned long long us[PB_STAGE_N], n[PB_STAGE_N]; }
     s_stage_run, s_stage_win;
 
@@ -229,6 +235,17 @@ static void pb_stage_add(PbStage s, unsigned long long t0)
     unsigned long long d = pb_now_us() - t0;
     s_stage_run.us[s] += d; s_stage_run.n[s]++;
     s_stage_win.us[s] += d; s_stage_win.n[s]++;
+}
+
+/* The pusher loop's turn: begin at its top, end at its bottom with whether
+ * the turn did any work (the parser cursor moved). Only an empty turn
+ * counts, as IDLE. */
+static unsigned long long s_idle_t0;
+void nv2a_pb_exec_idle_begin(void) { s_idle_t0 = pb_now_us(); }
+void nv2a_pb_exec_idle_end(int worked)
+{
+    if (!worked && s_idle_t0) pb_stage_add(PB_STAGE_IDLE, s_idle_t0);
+    s_idle_t0 = 0;
 }
 
 /* RECOMP_PB_STAGE_WALK=1: time nv2a_pb_exec_method itself, so `rest` stops
@@ -2028,9 +2045,16 @@ void nv2a_pb_exec_flip_pace_stats(unsigned long long *paced, unsigned long long 
  *
  * Writing stalls the pusher for as long as the disk takes -- a diagnostic,
  * taken on request, never on a timer. */
+static int s_host_skip;   /* G51.1: the host drew this draw; defined with its setters below */
 typedef struct {
     uint32_t draw, prim, count, mode, tex0, fmt0, tex1, fmt1, cw0, ctl, blend, zfunc;
     uint32_t xf_hash, xf_bad;   /* transform state: hash, and how many non-finite floats */
+    /* G73: where the draw lands -- the colour and zeta offsets -- whether the
+     * host drew it (the executor skipped it), and for texture 0 and 1 whether
+     * those bytes were BEHIND THE GPU at the draw (nv2a_metal_gpu_ahead: 1 the
+     * bound surface is dirty over them, 2 a slot owes them). A draw sampling
+     * stale guest RAM shows up as a nonzero ahead column. */
+    uint32_t target, zeta, host, ahead0, ahead1;
 } FlightDraw;
 #define FLIGHT_MAX_DRAWS 1024
 /* The whole transform state at a draw -- every program constant, the
@@ -2047,6 +2071,7 @@ typedef struct FlightXf {
 typedef struct {
     uint8_t *px; uint32_t w, h, bpp; unsigned long guest_frame; uint32_t seq;
     uint32_t ndraws, dropped; unsigned long long ctr[6]; FlightDraw d[FLIGHT_MAX_DRAWS];
+    uint32_t flip_target;   /* G73: the colour surface bound at the FLIP_STALL, the one snapshotted */
     uint32_t nxf; struct FlightXf *xf;   /* RECOMP_FLIGHT_XF_DRAW snapshots */
 } FlightFrame;
 static FlightFrame *s_flight; static unsigned s_flight_n, s_flight_head, s_flight_filled;
@@ -2060,6 +2085,7 @@ static unsigned long (*flight_input_frame)(void);
 static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
 static void (*flight_counters)(unsigned long long *);
 static uint32_t (*flight_mission_state)(void);
+static int (*flight_gpu_ahead)(const uint8_t *, size_t);
 static void flight_resolve(void) {}
 #else
 #include <dlfcn.h>
@@ -2067,8 +2093,10 @@ static unsigned long (*flight_input_frame)(void);
 static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
 static void (*flight_counters)(unsigned long long *);
 static uint32_t (*flight_mission_state)(void);   /* chapter_select.c, for [GLITCH] */
+static int (*flight_gpu_ahead)(const uint8_t *, size_t);
 static void flight_resolve(void)
 {
+    flight_gpu_ahead = (int (*)(const uint8_t *, size_t))dlsym(RTLD_DEFAULT, "nv2a_metal_gpu_ahead");
     flight_counters = (void (*)(unsigned long long *))dlsym(RTLD_DEFAULT, "nv2a_metal_flight_counters");
     flight_mission_state = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "chj_mission_state");
     flight_input_frame = (unsigned long (*)(void))dlsym(RTLD_DEFAULT, "xbox_InputFrame");
@@ -2115,6 +2143,13 @@ static void flight_note_draw(void)
     d->cw0 = s_methods[0x288/4]; d->ctl = s_methods[0x1e60/4];
     d->blend = s_methods[0x304/4] ? (s_methods[0x344/4] << 16 | (s_methods[0x348/4] & 0xffff)) : 0;
     d->zfunc = s_methods[0x30c/4] ? s_methods[0x354/4] : 0;
+    d->target = s_gpu.color_offset; d->zeta = s_methods[0x0214/4]; d->host = s_host_skip ? 1u : 0u;
+    d->ahead0 = d->ahead1 = 0;
+    if (flight_gpu_ahead) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        if (mem && d->tex0) d->ahead0 = (uint32_t)flight_gpu_ahead(mem + d->tex0, 1);
+        if (mem && d->tex1) d->ahead1 = (uint32_t)flight_gpu_ahead(mem + d->tex1, 1);
+    }
     {   /* The camera, as the draw will see it: the program's constants for a
          * vertex-program draw, the composite matrix (0x0680) for a fixed-
          * function one. A frame whose geometry all lands off screen shows up
@@ -2164,14 +2199,15 @@ static void flight_write_frame(const char *root, const char *name, const FlightF
     if ((t = fopen(path, "w")) == NULL) return;
     fprintf(t, "# metal cumulative: uploads %llu hits %llu evictions %llu feedback %llu drainless %llu sync_paid %llu\n",
             f->ctr[0], f->ctr[1], f->ctr[2], f->ctr[3], f->ctr[4], f->ctr[5]);
+    fprintf(t, "# flip bound %08x\n", f->flip_target);
     fprintf(t, "# seq %u guest_frame %lu draws %u (+%u not recorded)\n"
-               "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc xf_hash xf_bad\n",
+               "# draw prim count mode tex0 fmt0 tex1 fmt1 cw0 ctl blend zfunc xf_hash xf_bad target zeta host ahead0 ahead1\n",
             f->seq, f->guest_frame, f->ndraws, f->dropped);
     for (k = 0; k < f->ndraws; ++k) {
         const FlightDraw *d = &f->d[k];
-        fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x %08x %u\n", d->draw, d->prim,
+        fprintf(t, "%u %u %u %u %08x %08x %08x %08x %08x %08x %08x %x %08x %u %08x %08x %u %u %u\n", d->draw, d->prim,
                 d->count, d->mode, d->tex0, d->fmt0, d->tex1, d->fmt1, d->cw0, d->ctl,
-                d->blend, d->zfunc, d->xf_hash, d->xf_bad);
+                d->blend, d->zfunc, d->xf_hash, d->xf_bad, d->target, d->zeta, d->host, d->ahead0, d->ahead1);
     }
     fclose(t);
     if (f->nxf) {
@@ -2366,7 +2402,7 @@ static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp,
     if (!f->px || f->w * f->h * f->bpp != bytes) { free(f->px); f->px = malloc(bytes); }
     if (f->px && px) memcpy(f->px, px, bytes);
     f->w = w; f->h = h; f->bpp = bpp; f->seq = seq; f->guest_frame = flight_input_frame ? flight_input_frame() : 0;
-    f->ndraws = s_flight_cur.ndraws; f->dropped = s_flight_cur.dropped;
+    f->ndraws = s_flight_cur.ndraws; f->dropped = s_flight_cur.dropped; f->flip_target = s_gpu.color_offset;
     if (flight_counters) flight_counters(f->ctr); else memset(f->ctr, 0, sizeof f->ctr);
     memcpy(f->d, s_flight_cur.d, sizeof(FlightDraw) * s_flight_cur.ndraws);
     {   /* the snapshots change hands: the slot's old buffer is reused */
@@ -3840,7 +3876,7 @@ static void frame_stats_report(void)
  * reads "the executor did not draw it" -- true -- instead of the previous
  * draw's texture and surface. G51.3 measured the cost this removes: [STAGE]
  * vsh 1.99 ms a frame unchanged by replacing 52 of 71 draws. */
-static int s_host_skip, s_host_skip_late;
+static int s_host_skip_late;
 static unsigned long long s_host_skipped, s_host_seen;
 /* RECOMP_D3D8_HOST_BISECT bit 128: skip where 645a7e6 did, after the batch's
  * vertex and fragment preparation, instead of before it. */
