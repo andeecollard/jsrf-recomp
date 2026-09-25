@@ -59,3 +59,9 @@ title ("Input was not delivered before its lease expired"); retry.
 ## Cutscene catalogue (`catalogue/`)
 
 `catalogue.json` / `catalogue.md`: all 300 event files -- length, cast, which mission plays each (opcode 0xE3 block and flag conditions), and a recipe class: A plays on `RECOMP_CHAPTER_JUMP=C:M` (74 events, covered by 37 jumps), B needs chapter flags (WriteStateFlag values listed), C needs player action, D unused. Ordering/timing is from a mission-command simulation (`sim.py`), not an engine trace. The scripts were written against the session scratchpad and may need their input paths adjusted.
+
+### Cutscene sweep (`harness/gw_run.sh`, `sweep.sh`, `glitch_*.py`)
+
+`gw_run.sh NAME BUDGET_S QUIET_S GAP_S [--env ...]`: Garage boot with `RECOMP_GLITCH_WATCH=1`; after `[CHAPTER-JUMP] fired` it keeps the game running until the new mission has sat in free play (state 0x0F) for QUIET_S, or BUDGET_S, capturing every GAP_S. `sweep.sh` runs a list of jumps; `glitch_summary.py` / `glitch_triage.py` / `glitch_offline.py` summarise and triage the `[GLITCH]` hits. First sweep (25 Sep): all 37 jumps of the catalogue's class-A list, no fault; results in the 25 Sep goals file.
+
+Note: `jump_run.sh` stops the game GAP x CAPTURES seconds after the jump fires; leave enough time for a flight recording to be written (900 frames takes a few seconds), or the BMPs are truncated.
