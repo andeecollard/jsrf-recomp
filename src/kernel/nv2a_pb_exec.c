@@ -2420,6 +2420,30 @@ static void flight_flip(const uint8_t *px, uint32_t w, uint32_t h, uint32_t bpp,
         if (!init) { const char *e = getenv("RECOMP_FLIGHT_AT"); init = 1; at = (e && *e) ? strtoul(e, NULL, 10) : 0; }
         if (at && f->guest_frame >= at) { at = 0; s_flight_mark = 1; }
     }
+    {   /* RECOMP_FLIGHT_AT_FREEPLAY=n (G73): the same write, once the mission
+         * has been in free play (state 0x0F) for n consecutive presented
+         * frames. A fixed guest frame lands at a different moment of the
+         * stage in every arm, because the jump fires when the Garage has
+         * settled, which varies by seconds; frames into free play are the
+         * same moment in the title's own (per-flip) clock. Consecutive,
+         * because the Garage's own free play before a jump lasts only the
+         * jump's settle, and a stage can leave 0x0F for a scripted scene
+         * whose length follows the wall clock, not the flip count (Rokkaku-
+         * dai's intro ran 946 flips in one arm and 1,095 in another). Needs
+         * RECOMP_CHAPTER_JUMP, which is what publishes the state. */
+        static int init, done; static long n = -1; static uint32_t prev = 0xFFFFFFFFu, start_seq;
+        if (!init) {
+            const char *e = getenv("RECOMP_FLIGHT_AT_FREEPLAY");
+            init = 1;
+            if (e && *e) n = strtol(e, NULL, 10);
+        }
+        if (n >= 0 && !done && flight_mission_state) {
+            uint32_t st = flight_mission_state();
+            if (st == 0x0Fu && prev != 0x0Fu) start_seq = seq;
+            if (st == 0x0Fu && seq - start_seq >= (uint32_t)n) { done = 1; s_flight_mark = 1; }
+            prev = st;
+        }
+    }
     if (s_flight_mark) { s_flight_mark = 0; flight_write(); }
 }
 

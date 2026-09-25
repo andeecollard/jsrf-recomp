@@ -282,6 +282,17 @@ uint64_t d3d8_host_2d_vertex_hash(const uint8_t *ram, size_t ram_size, const D3D
 {
     uint64_t h = 0xCBF29CE484222325ull, lo[16], hi[16];
     unsigned n = 0;
+    if (d3d8_host_2d_bisect() & 8192u) {         /* BISECT 8192: the byte-wise hash, per array (before G73) */
+        for (unsigned i = 0; i < 16; ++i) {
+            uint32_t stride = c->va_format[i] >> 8;
+            if (!((c->va_on >> i) & 1u) || !stride) continue;
+            uint64_t a = (uint64_t)(c->va_offset[i] & RAM_MASK) + (uint64_t)imin * stride;
+            uint64_t b = (uint64_t)(c->va_offset[i] & RAM_MASK) + (uint64_t)(imax + 1u) * stride;
+            if (b > ram_size || b < a || b - a > (1u << 22)) { h ^= 0xFFu; h *= 0x100000001B3ull; continue; }
+            for (uint64_t k = a; k < b; ++k) { h ^= ram[k]; h *= 0x100000001B3ull; }
+        }
+        return h;
+    }
     for (unsigned i = 0; i < 16; ++i) {
         uint32_t stride = c->va_format[i] >> 8;
         if (!((c->va_on >> i) & 1u) || !stride) continue;
@@ -1760,12 +1771,12 @@ unsigned d3d8_host_2d_bisect(void)
         const char *e = getenv("RECOMP_D3D8_HOST_BISECT");
         s_bisect_read = 1;
         s_bisect = e && *e ? (unsigned)strtoul(e, NULL, 0) : 0u;
-        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
+        if (s_bisect) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BISECT=0x%X:%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n", s_bisect,
                               s_bisect & 1 ? " own-pass" : "", s_bisect & 2 ? " buffer-per-draw" : "",
                               s_bisect & 4 ? " no-early-tests" : "", s_bisect & 8 ? " generic-shader" : "",
                               s_bisect & 16 ? " hash-every-draw" : "", s_bisect & 32 ? " no-vertex-cache" : "",
                               s_bisect & 64 ? " wait-every-draw" : "", s_bisect & 128 ? " late-executor-skip" : "",
-                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "", s_bisect & 2048 ? " inline-compile" : "", s_bisect & 4096 ? " old-stage-modes" : "");
+                              s_bisect & 256 ? " no-stencil-class" : "", s_bisect & 512 ? " no-points" : "", s_bisect & 1024 ? " d3d-bind-geometry" : "", s_bisect & 2048 ? " inline-compile" : "", s_bisect & 4096 ? " old-stage-modes" : "", s_bisect & 8192 ? " byte-wise-vertex-hash" : "");
     }
     return s_bisect;
 }
