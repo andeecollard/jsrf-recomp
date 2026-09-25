@@ -633,6 +633,37 @@ static int jsrf_pb_poll(void)
                 stream_fault=1;
                 break;
             }
+            /* G69 (25 Sep 2026): THIS TITLE NEVER ISSUES A CALL (G25). A CALL
+             * word is proof that the parse has lost sync -- the 3:60 hang
+             * followed one to 0x04010400, above the 64 MB of RAM, walked 5 MB
+             * of zeros as NOPs and only faulted on float data far downstream,
+             * by which time the segment history held nothing but the walk.
+             * So stop HERE, with the evidence: the recheck, the replay, the
+             * ring around the word, and the segment history. The outcome is
+             * the same stream_fault as before; only where it is diagnosed
+             * moves. RECOMP_PB_CALL_IS_DESYNC=0 follows the call as before. */
+            if (recomp_switch_on_default("RECOMP_PB_CALL_IS_DESYNC", 1)) {
+                stream_fault=1;
+                fprintf(stderr,"[PUSHER] CALL %08X at %08X treated as a desync"
+                        " (this title never calls); window end %08X ring %08X..%08X\n",
+                        result.jump_address, g_pb_last-4, end,
+                        g_pb_ring_lo, g_pb_ring_hi);
+                pb_recheck("call", g_pb_last-4);
+                jsrf_pb_replay("call", g_pb_last-4);
+                fprintf(stderr,"[PUSHER]   ring:");
+                for (int k=-8;k<=8;++k)
+                    fprintf(stderr," %s%08X", k ? "" : ">",
+                            jsrf_pb_word(g_pb_last - 4 + k * 4));
+                fprintf(stderr,"\n");
+                for (unsigned k = g_pb_hist_n>16?g_pb_hist_n-16:0; k<g_pb_hist_n; ++k)
+                    fprintf(stderr,"[PUSHER]   seg %u: from=%08X end=%08X"
+                            " put=%08X stop=%u consumed=%u\n", k,
+                            g_pb_hist[k&15].from, g_pb_hist[k&15].end,
+                            g_pb_hist[k&15].put, g_pb_hist[k&15].stop,
+                            g_pb_hist[k&15].consumed);
+                fflush(stderr);
+                break;
+            }
             /* Hardware saves DMA_GET as it stands after the call word, which
              * is exactly the cursor the parser has just left us. */
             if (g_pb_subr_active) {
