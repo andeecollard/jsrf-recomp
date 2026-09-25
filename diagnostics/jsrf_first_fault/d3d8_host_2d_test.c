@@ -757,6 +757,66 @@ static void compare_ff(int control)
         CHECK(df.mismatch > 200, "%s: the perturbed host draw differs (%llu px)", name, df.mismatch);
 }
 
+/* G52: RECOMP_D3D8_HOST_FF_GPU. The same fixed-function quad, transformed by
+ * the executor's GPU unit (nv2a_ff_key + its RECOMP_METAL_FF vertex function)
+ * instead of nv2a_ff_vertex per vertex on the CPU, against the executor's
+ * draw. The control drops every other triangle and must differ. */
+static void compare_ff_gpu(int control)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH];
+    static float zexec[RTW * RTH], zhost[RTW * RTH];
+    static uint32_t ffm[2048];
+    const char *name = control ? "FF on the GPU CONTROL" : "FF on the GPU", *why;
+    D3D8HostDrawCheck c; D3D8Host2DDraw d, dc; D3D8H2DDiff df; unsigned steps = 0;
+    case_ff(&c);
+    why = d3d8_host_ff_registers(&c, ffm);
+    CHECK(!why, "%s: register file (%s)", name, why ? why : "built");
+    if (why) return;
+    for (unsigned y = 0; y < RTH; ++y)
+        for (unsigned x = 0; x < RTW; ++x) memcpy(ram + ZS + y * ZSPITCH + 4 * x, &(uint32_t){ 0xFFFFFF00u }, 4);
+    d3d8_host_2d_set_ff_gpu(NULL);
+    memset(&dc, 0, sizeof dc); dc.verts = verts;           /* the CPU build, for the executor's draw */
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &dc);
+    CHECK(!why && !dc.ff_gpu, "%s: without the hook the draw is built on the CPU (%s)", name, why ? why : "built");
+    if (why) return;
+    background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg);
+    if (!exec_draw_ff(&c, &dc, ffm, ex, ram + ZS)) { ++fails; return; }
+    nv2a_metal_depth_peek(ram + ZS, RTW, RTH, zexec);
+    d3d8_host_2d_set_ff_gpu(d3d8_host_2d_metal_ff_gpu);
+    static D3D8H2DVertex gv[D3D8H2D_MAX_VERTS];
+    memset(&d, 0, sizeof d); d.verts = gv;
+    why = d3d8_host_draw_build(&c, ram, RAM_SIZE, control, NULL, ffm, nv2a_ff_vertex, &d);
+    if (!why && !d.ff_gpu) {
+        /* The first ask starts the compile in the background (the hook never
+         * waits: that draw is evaluated on the CPU, as the executor's batch
+         * is); once it has finished the same draw goes to the GPU. */
+        CHECK(d.nverts == 6 || (control && d.nverts == 3), "%s: while the unit compiles, built on the CPU (%u vertices)", name, d.nverts);
+        nv2a_metal_pipelines_settle();
+        memset(&d, 0, sizeof d); d.verts = gv;
+        why = d3d8_host_draw_build(&c, ram, RAM_SIZE, control, NULL, ffm, nv2a_ff_vertex, &d);
+    }
+    CHECK(!why && d.ff_gpu && d.vs_fn && d.vs_nidx == (control ? 3u : 6u),
+          "%s: built for the GPU unit (%s, ff_gpu %u, %u indices)", name, why ? why : "built", d.ff_gpu, d.vs_nidx);
+    if (why || !d.ff_gpu) {
+        unsigned long long ok, nokey, nofn; extern void d3d8_host_2d_metal_ff_gpu_stats(unsigned long long *, unsigned long long *, unsigned long long *);
+        d3d8_host_2d_metal_ff_gpu_stats(&ok, &nokey, &nofn);
+        printf("  hook: accepted %llu, no key %llu, no function %llu\n", ok, nokey, nofn);
+        return;
+    }
+    for (unsigned k = 0; k < RTW * RTH; ++k) zhost[k] = 1.0f;
+    if (d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, ho, RTPITCH / 2, zhost, 0, 0, RTW, RTH) != 0) {
+        CHECK(0, "%s: render (%s)", name, d3d8_host_2d_metal_last_error()); return; }
+    d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+    unsigned long long zb = d3d8_host_2d_depth_diff(zexec, zhost, (size_t)RTW * RTH, 1, &steps);
+    printf("  %s: executor changed %llu, host %llu, over tolerance %llu, max r%u g%u b%u | depth %llu px, worst %u\n",
+           name, df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1], df.max_err[2], zb, steps);
+    if (!control)
+        CHECK(df.exec_changed > 500 && df.mismatch <= 8 && steps <= 4,
+              "%s: host and executor agree (%llu px over, depth worst %u steps)", name, df.mismatch, steps);
+    else
+        CHECK(df.mismatch > 200, "%s: the perturbed host draw differs (%llu px)", name, df.mismatch);
+}
+
 /* ---- rhw 0: a zeroed vertex in a partly filled dynamic buffer ----
  * Tutorial run 5's one mismatch. Case B's list with vertex 3 zeroed: its
  * triangle has clip w = 1/0, so the executor drops it and the host must too. */
@@ -2251,6 +2311,14 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         bench_tests();
         return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "ffgpu") == 0) {        /* G52: host FF vertices on the GPU unit */
+        setenv("RECOMP_D3D8_HOST_FF_GPU", "1", 1);
+        d3d8_host_2d_metal_set_spec_sync(1);
+        compare_ff_gpu(0);
+        compare_ff_gpu(1);
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "stagemodes") == 0) {   /* G51.2: D3D's texture stage modes */
         stage_mode_tests();

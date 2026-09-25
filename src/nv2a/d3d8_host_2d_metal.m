@@ -53,6 +53,7 @@
 #import <Foundation/Foundation.h>
 #include "d3d8_host_2d.h"
 #include "nv2a_texture_decode.h"
+#include "nv2a_ff.h"
 #include "nv2a_metal_state.h"
 #include "nv2a_metal.h"
 #include "../recomp_switch.h"
@@ -657,9 +658,10 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
     size_t vbytes = (size_t)d->nverts * sizeof(D3D8H2DVertex), voff = 0;
     id<MTLBuffer> vb = nil;
     id<MTLFunction> vfn = nil;
-    if (d->cls == 3) {                       /* G51.2: the program's packed inputs, not host vertices */
-        unsigned nattrs = 0;
-        vfn = (__bridge id<MTLFunction>)nv2a_metal_vsh_function(d->vs_words, (int)d->vs_len, (uint16_t)d->vs_inputs, &nattrs);
+    if (d->cls == 3 || d->ff_gpu) {          /* G51.2: the program's packed inputs, not host vertices */
+        unsigned nattrs = d->vs_nattrs;
+        vfn = d->ff_gpu ? (__bridge id<MTLFunction>)d->vs_fn
+                        : (__bridge id<MTLFunction>)nv2a_metal_vsh_function(d->vs_words, (int)d->vs_len, (uint16_t)d->vs_inputs, &nattrs);
         if (!vfn) { s_err = "host vs: the executor's translator refused the program"; return 0; }
         if (nattrs != d->vs_nattrs) { s_err = "host vs: attribute count disagrees with the translator's"; return 0; }
         if (ox || oy) { s_err = "host vs: a programmable draw renders the whole target"; return 0; }
@@ -705,7 +707,7 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
     [enc setScissorRect:sc];
     if (vb) [enc setVertexBuffer:vb offset:voff atIndex:0];
     else [enc setVertexBytes:vdata length:(NSUInteger)vbytes atIndex:0];
-    if (d->cls == 3) {
+    if (d->cls == 3 || d->ff_gpu) {
         /* vs_gpu's contract (nv2a_metal.m vsh_wrap): constants at 1, the
          * viewport the emitted program converts to clip space with at 2 --
          * the whole surface, as the executor passes it -- and the triangle
@@ -736,8 +738,8 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         [enc setFragmentTexture:tex[s] ? tex[s] : s_dummy atIndex:s];
         [enc setFragmentSamplerState:smp[s] ? smp[s] : sampler_for(&(D3D8H2DTexture){ .mag = 1, .min_filter = 1, .wrap_u = 3, .wrap_v = 3 }) atIndex:s];
     }
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:d->cls == 3 ? d->vs_nidx : d->nverts];
-    if (d->cls == 3) {                       /* leave the encoder as the executor's CPU path assumes it */
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(d->cls == 3 || d->ff_gpu) ? d->vs_nidx : d->nverts];
+    if (d->cls == 3 || d->ff_gpu) {          /* leave the encoder as the executor's CPU path assumes it */
         [enc setCullMode:MTLCullModeNone];
         [enc setFrontFacingWinding:MTLWindingClockwise];
     }
@@ -882,3 +884,25 @@ int d3d8_host_2d_metal_external(const D3D8Host2DDraw *d, const uint8_t *ram, siz
     s_ns_external += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     return drawn == 1 && x.ok;
 }
+
+/* G52: RECOMP_D3D8_HOST_FF_GPU. The executor's fixed-function unit on the GPU
+ * (nv2a_ff_key / nv2a_ff_params / its RECOMP_METAL_FF vertex function), asked
+ * about the host's register file for the draw. 0 = evaluate on the CPU. */
+static unsigned long long s_ffg_ok, s_ffg_nokey, s_ffg_nofn;
+int d3d8_host_2d_metal_ff_gpu(const uint32_t ffm[2048], D3D8Host2DDraw *d)
+{
+    static NV2AFFKey key;
+    unsigned nattrs = 0;
+    void *fn;
+    memset(&key, 0, sizeof key);
+    if (!nv2a_ff_key(ffm, &key)) { ++s_ffg_nokey; return 0; }
+    fn = nv2a_metal_ff_function(&key, (unsigned)sizeof key, key.inputs, &nattrs);
+    if (!fn) { ++s_ffg_nofn; return 0; }
+    nv2a_ff_params(ffm, &key);
+    memcpy(d->vs_c, nv2a_ff_constants, sizeof d->vs_c);
+    d->vs_fn = fn; d->vs_inputs = key.inputs; d->vs_nattrs = nattrs;
+    ++s_ffg_ok;
+    return 1;
+}
+void d3d8_host_2d_metal_ff_gpu_stats(unsigned long long *ok, unsigned long long *nokey, unsigned long long *nofn)
+{ if (ok) *ok = s_ffg_ok; if (nokey) *nokey = s_ffg_nokey; if (nofn) *nofn = s_ffg_nofn; }

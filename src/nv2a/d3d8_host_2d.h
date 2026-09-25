@@ -178,6 +178,8 @@ typedef struct {
     /* G51.2 diagnostics: the stage modes the draw was built with, and whether
      * D3D's derivation turned off a stage the pixel shader's word 54 names. */
     uint32_t stage_modes, modes_adjusted, ps_word54;
+    void    *vs_fn;                            /* G52: the GPU vertex function for a fixed-function draw (ff_gpu) */
+    uint32_t ff_gpu;                           /* 1: a fixed-function draw transformed on the GPU */
     uint32_t vs_in_unfetched, vs_in_noarray;   /* read inputs the host could not decode / that have no array */
     char     vs_fmt_text[96];                  /* read inputs as slot:format (FF = no array) */
 } D3D8Host2DDraw;
@@ -204,6 +206,22 @@ int d3d8_host_vs_mode(void);
  * its vs_gpu vertex function as an id<MTLFunction>, and its packed attribute
  * count. NULL if the translator or compiler refused it. Executor thread. */
 void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs);
+void *nv2a_metal_ff_function(const void *key, unsigned keysize, uint16_t inputs, unsigned *nattrs);
+/* G52: FIXED-FUNCTION VERTICES ON THE GPU (RECOMP_D3D8_HOST_FF_GPU=1). The
+ * host's fixed-function draws evaluated every vertex on the CPU through
+ * nv2a_ff_vertex -- 23-31 us a draw, 3.5-4.8 ms a frame in Shibuya Terminal
+ * and Sky Dino, the largest host cost once the executor had left the draw.
+ * With this on, a fixed-function draw whose register file (d3d8_host_ff_registers)
+ * the executor's GPU unit accepts (nv2a_ff_key) is drawn exactly as a
+ * programmable one is: the inputs packed, nv2a_ff_constants as the constant
+ * file, the executor's RECOMP_METAL_FF vertex function. The hook fills
+ * vs_fn/vs_inputs/vs_nattrs/vs_c and returns 1, or returns 0 and the draw is
+ * evaluated on the CPU as before. Set by the Metal backend; NULL in tests
+ * that do not install it. */
+typedef int (*D3D8H2DFFGpuFn)(const uint32_t ffm[2048], D3D8Host2DDraw *d);
+void d3d8_host_2d_set_ff_gpu(D3D8H2DFFGpuFn fn);
+int  d3d8_host_ff_gpu_mode(void);                 /* RECOMP_D3D8_HOST_FF_GPU, read once */
+int  d3d8_host_2d_metal_ff_gpu(const uint32_t ffm[2048], D3D8Host2DDraw *d);
 /* The executor's fixed-function vertex unit (nv2a_ff_vertex), handed in. */
 typedef const char *(*D3D8H2DFFVertexFn)(const uint32_t m[2048], const float in[16][4], float out[16][4]);
 

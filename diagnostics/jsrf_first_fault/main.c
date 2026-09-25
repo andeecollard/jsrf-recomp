@@ -5214,6 +5214,8 @@ int main(int argc, char **argv)
                 be.geom_stats = d3d8_host_2d_metal_geom_stats;
                 /* G51.3: the FF shadow evaluates vertices with the executor's own unit. */
                 be.ff_vertex = nv2a_ff_vertex;
+                /* G52: ... or on the GPU, with its RECOMP_METAL_FF unit (RECOMP_D3D8_HOST_FF_GPU). */
+                d3d8_host_2d_set_ff_gpu(d3d8_host_2d_metal_ff_gpu);
                 d3d8_host_2d_set_backend(&be);
                 nv2a_pb_exec_set_flip_hook(d3d8_host_2d_flip);
             }

@@ -276,6 +276,20 @@ const char *d3d8_host_2d_build_ex(const D3D8HostDrawCheck *c, const uint8_t *ram
     return d3d8_host_draw_build(c, ram, ram_size, control, given_idx, NULL, NULL, d);
 }
 
+static D3D8H2DFFGpuFn s_ff_gpu_fn;
+void d3d8_host_2d_set_ff_gpu(D3D8H2DFFGpuFn fn) { s_ff_gpu_fn = fn; }
+int d3d8_host_ff_gpu_mode(void)
+{
+    /* Read once, on the executor thread (the only caller: build). */
+    static int m = -1;
+    if (m < 0) {
+        m = recomp_switch_on("RECOMP_D3D8_HOST_FF_GPU");
+        if (m) fprintf(stderr, "[D3D8-HOST-FF] RECOMP_D3D8_HOST_FF_GPU=1: fixed-function draws the executor's GPU unit"
+                               " accepts are transformed on the GPU (its RECOMP_METAL_FF vertex function), not per vertex"
+                               " on the CPU\n");
+    }
+    return m;
+}
 const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram, size_t ram_size,
                                  int control, const uint16_t *given_idx, const uint32_t *ffm,
                                  D3D8H2DFFVertexFn ffv, D3D8Host2DDraw *d)
@@ -478,16 +492,25 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
          * and hands it the triangle list -- assembled here in the executor's
          * order, which decides facing. Clipping and culling are the GPU's, as
          * on the executor's GPU path. */
-        if (cls == 3) {
+        /* G52: a fixed-function draw the executor's GPU unit accepts goes the
+         * same way, with the FF vertex function and nv2a_ff_constants in place
+         * of the program and its constants (RECOMP_D3D8_HOST_FF_GPU). */
+        int ffg = cls == 2 && n && ffm && s_ff_gpu_fn && d3d8_host_ff_gpu_mode() > 0 && s_ff_gpu_fn(ffm, d);
+        if (cls == 3 || ffg) {
             static float (*vin)[4]; static uint32_t vin_cap; static uint32_t *vidx; static uint32_t vidx_cap;
             NV2AVshProgram prog;
             uint32_t lo = UINT32_MAX, hi = 0, range, nattrs = 0, nt = 0, slot_of[16];
             if (!n) return "empty";
             memset(&prog, 0, sizeof prog);
-            nv2a_vsh_parse(c->vs_words, (int)(c->vs_nwords / 4u), &prog);
-            if (!prog.valid || !prog.has_final || prog.length <= 0) return "vertex program not translatable";
-            d->vs_words = c->vs_words; d->vs_len = (uint32_t)prog.length; d->vs_inputs = prog.inputs_read;
+            if (ffg) {
+                d->ff_gpu = 1; prog.inputs_read = (uint16_t)d->vs_inputs;
+            } else {
+                nv2a_vsh_parse(c->vs_words, (int)(c->vs_nwords / 4u), &prog);
+                if (!prog.valid || !prog.has_final || prog.length <= 0) return "vertex program not translatable";
+                d->vs_words = c->vs_words; d->vs_len = (uint32_t)prog.length; d->vs_inputs = prog.inputs_read;
+            }
             for (unsigned a = 0; a < 16; ++a) if (prog.inputs_read & (1u << a)) slot_of[a] = nattrs++;
+            if (ffg && nattrs != d->vs_nattrs) return "host ff gpu: attribute count disagrees with the unit's";
             d->vs_nattrs = nattrs;
             for (uint32_t k = 0; k < n; ++k) { if (idx[k] < lo) lo = idx[k]; if (idx[k] > hi) hi = idx[k]; }
             range = hi - lo + 1u;
@@ -527,8 +550,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             if (control) d->control_perturbed = 1;
             /* The constant file: what D3D was handed, and the viewport pair it
              * keeps itself (c-38 scale, c-37 offset) where it was not written. */
-            memcpy(d->vs_c, c->vc, sizeof d->vs_c);
-            if (!((c->vc_written[58u / 32u] >> (58u % 32u)) & 1u)) {
+            if (!ffg) memcpy(d->vs_c, c->vc, sizeof d->vs_c);
+            if (!ffg && !((c->vc_written[58u / 32u] >> (58u % 32u)) & 1u)) {
                 float sx = (float)c->vp_w * c->ss_x * 0.5f, sy = (float)c->vp_h * c->ss_y * 0.5f;
                 d->vs_c[58][0] = sx; d->vs_c[58][1] = -sy; d->vs_c[58][2] = 16777215.0f * (c->vp_maxz - c->vp_minz); d->vs_c[58][3] = 0.0f;
                 d->vs_c[59][0] = (float)c->vp_x * c->ss_x + sx + D3D8H2D_SCREEN_OFFSET;
@@ -1561,7 +1584,7 @@ unsigned d3d8_host_2d_bisect(void)
     return s_bisect;
 }
 void d3d8_host_2d_set_bisect(unsigned mask) { s_bisect = mask; s_bisect_read = 1; }
-static unsigned long long s_rep_ns_regs, s_rep_ns_build, s_rep_ff_evals, s_rep_ff_indices;
+static unsigned long long s_rep_ns_regs, s_rep_ns_build, s_rep_ff_evals, s_rep_ff_indices, s_rep_ff_gpu;
 static inline unsigned long long h2d_now_ns(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1605,7 +1628,7 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
         if (!why) why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d);
         s_rep_ns_build += h2d_now_ns() - t1;
         if (why) { ++s_rep_refused; count_reason(why); return; }
-        s_rep_ff_evals += d.ff_evals; s_rep_ff_indices += c->count;
+        s_rep_ff_evals += d.ff_evals; s_rep_ff_indices += c->count; if (d.ff_gpu) ++s_rep_ff_gpu;
     } else if ((why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d))) {
         ++s_rep_refused; if (cls == 3) ++s_rep_vs_refused; count_reason(why); return;
     }
@@ -1952,9 +1975,10 @@ void d3d8_host_2d_report(const char *why)
             if (s_have_be && s_be.external_stats) s_be.external_stats(&th, &tb, &thash, &nt, &ne);
             fprintf(stderr, "[D3D8-HOST-2D] %s draw mode cost per replaced draw: FF registers %.1f us, FF build %.1f us"
                             " (vertex evaluations %llu for %llu indices), texture %.1f us, whole host draw %.1f us | texture"
-                            " cache hits %llu, decodes %llu, hashes %llu\n", why,
+                            " cache hits %llu, decodes %llu, hashes %llu | fixed-function draws built for the GPU unit"
+                            " (RECOMP_D3D8_HOST_FF_GPU) %llu\n", why,
                     s_rep_ns_regs / 1000.0 / rf, s_rep_ns_build / 1000.0 / rf, s_rep_ff_evals, s_rep_ff_indices,
-                    nt / 1000.0 / r, ne / 1000.0 / r, th, tb, thash);
+                    nt / 1000.0 / r, ne / 1000.0 / r, th, tb, thash, s_rep_ff_gpu);
         }
         {
             int any = 0;

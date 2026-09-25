@@ -2165,6 +2165,21 @@ void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs
     return (__bridge void *)v->fn;
 }
 
+/* G52: the fixed-function unit's GPU vertex function for a key, for the
+ * host's fixed-function draws (d3d8_host_2d_metal.m) -- the same function the
+ * executor's RECOMP_METAL_FF batch runs. Unlike nv2a_metal_vsh_function this
+ * never waits: a key still compiling returns NULL, and the host evaluates
+ * that draw on the CPU as before, as the executor does its batch. */
+void *nv2a_metal_ff_function(const void *key, unsigned keysize, uint16_t inputs, unsigned *nattrs)
+{
+    VshSlot *v;
+    if (!key || !keysize || !vsh_gpu_on() || !hw_state_on() || !initialize()) return NULL;
+    v = vsh_lookup_ex(key, 0, keysize, 1, inputs);
+    if (!v) return NULL;
+    if (nattrs) *nattrs = v->nattrs;
+    return (__bridge void *)v->fn;
+}
+
 int nv2a_metal_vsh_ready(const uint32_t (*words)[4], int length,
                          uint16_t inputs_read)
 {

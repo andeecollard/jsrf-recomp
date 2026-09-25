@@ -1362,6 +1362,8 @@ if(APPLE)
     # G51.2: every RECOMP_D3D8_HOST_* class switch, alone, arms the mirror.
     add_test(NAME jsrf_d3d8_host_arming COMMAND jsrf_d3d8_host_2d_test arming)
     add_test(NAME jsrf_d3d8_host_stage_modes COMMAND jsrf_d3d8_host_2d_test stagemodes)
+    add_test(NAME jsrf_d3d8_host_ff_gpu COMMAND jsrf_d3d8_host_2d_test ffgpu)
+    set_tests_properties(jsrf_d3d8_host_ff_gpu PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     target_compile_definitions(jsrf_d3d8_host_2d_test PRIVATE JSRF_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../..")
     set_tests_properties(jsrf_d3d8_host_vs PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # G56: a guest-thread D3D lock gets the drawn pixels, through the mailbox.
