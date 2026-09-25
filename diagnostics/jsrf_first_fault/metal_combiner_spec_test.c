@@ -34,6 +34,16 @@
  *
  * `bench` as the second argument instead times a synthetic full-screen
  * 640x480 workload (see bench()), for the generic-vs-specialised GPU cost.
+ *
+ * `twice` as the third argument (or the second, for the fixed `vs`) renders the
+ * whole case list twice in one process, both passes into the dump, with
+ * nv2a_metal_pipelines_settle() between them. Under RECOMP_METAL_ASYNC_PIPELINES
+ * with RECOMP_METAL_PIPELINE_HOLD every pass-1 draw finds its specialised
+ * pipeline still compiling and takes the generic one, and every pass-2 draw
+ * takes the specialised one -- so a dump equal to the generic arm's says the
+ * fallback on a miss and the pipeline swapped in afterwards both render the
+ * same pixels. metal_pipeline_archive_check.sh uses the same binary to show a
+ * second process loading its pipelines from the archive instead of compiling.
  * Needs a real GPU.
  */
 #include "nv2a_metal.h"
@@ -295,9 +305,16 @@ static int draw(NV2ATextureCopy *s, uint8_t *tgt, size_t tsize, uint8_t *dep, si
     float v[6][16][4];
     quad(v, x0, y0, x1, y1, seed);
     if (use_vsh) {
-        if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 8,
-                                  (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5) | (15u << 9))) {
-            fprintf(stderr, "FAIL: vertex program refused\n"); return 0;
+        const uint16_t in = (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5) | (15u << 9);
+        /* A program whose library is compiling in the background
+         * (RECOMP_METAL_ASYNC_VSH) is refused until it is published; the game
+         * draws that batch on the CPU. This test is about the fragment stage,
+         * so it waits for the program instead. */
+        if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 8, in)) {
+            nv2a_metal_pipelines_settle();
+            if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 8, in)) {
+                fprintf(stderr, "FAIL: vertex program refused\n"); return 0;
+            }
         }
         nv2a_metal_vsh_constants((const float (*)[4])vsh_consts);
     }
@@ -352,13 +369,16 @@ static int bench(void)
 int main(int argc, char **argv)
 {
     FILE *dump;
-    int ok = 1;
+    int ok = 1, passes = 1;
     make_textures();
     if (argc > 2 && strcmp(argv[2], "vsh") == 0) { use_vsh = 1; build_vsh(); }
     if (argc > 2 && strcmp(argv[2], "bench") == 0) return bench();
+    for (int a = 2; a < argc; ++a) if (strcmp(argv[a], "twice") == 0) passes = 2;
     dump = argc > 1 ? fopen(argv[1], "wb") : NULL;
     if (argc > 1 && !dump) { perror(argv[1]); return 1; }
     build_cases();
+    for (int pass = 0; pass < passes; ++pass) {
+    if (pass) { nv2a_metal_pipelines_settle(); printf("pass 2, after settle:\n"); }
     for (unsigned i = 0; i < ncases; ++i) {
         NV2ATextureCopy s;
         uint32_t h = 2166136261u;
@@ -375,7 +395,11 @@ int main(int argc, char **argv)
                cases[i].tmask, h);
         if (dump) fwrite(target, 1, sizeof target, dump);
     }
+    }
     if (dump) fclose(dump);
+    /* Everything queued has finished and the archive is written, so the
+     * report's counters are final and a second process finds the shard. */
+    nv2a_metal_pipelines_settle();
     nv2a_metal_report();
     return ok ? 0 : 1;
 }

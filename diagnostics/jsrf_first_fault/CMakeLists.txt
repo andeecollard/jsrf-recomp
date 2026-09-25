@@ -1325,6 +1325,14 @@ if(APPLE)
     add_test(NAME jsrf_metal_fog_vsh COMMAND jsrf_metal_fog_test vsh)
     set_tests_properties(jsrf_metal_combiner_spec PROPERTIES
                          ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+    # The pipeline archive (RECOMP_METAL_PIPELINE_ARCHIVE): a second process
+    # finds every pipeline the first compiled, with the archive off, a changed
+    # shader and a corrupt shard as controls. Same binary as the check above.
+    add_test(NAME jsrf_metal_pipeline_archive
+             COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/metal_pipeline_archive_check.sh")
+    set_tests_properties(jsrf_metal_pipeline_archive PROPERTIES
+                         ENVIRONMENT "JSRF_BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                         TIMEOUT 600)
     # G51.1: the host's own 2D pipeline, built from a D3D description alone,
     # against the executor's Metal path fed the equivalent NV2A state; within
     # one 565 step, with a perturbed control that must differ, and the shadow
@@ -1688,3 +1696,16 @@ add_test(NAME jsrf_texture_decode COMMAND jsrf_texture_decode_test)
 add_executable(jsrf_sched_priority_test sched_priority_test.c)
 target_link_libraries(jsrf_sched_priority_test PRIVATE Threads::Threads)
 add_test(NAME jsrf_sched_priority COMMAND jsrf_sched_priority_test)
+
+# EVERY TEST'S PIPELINE ARCHIVE IS THE BUILD DIRECTORY'S, NEVER THE PLAYER'S.
+# nv2a_metal.m records compiled pipelines under ~/Library/Caches/JSRF by
+# default, keyed on the shader, so a test process would add a shard to the very
+# set the game loads -- and a ctest run starts dozens of them, enough to push
+# the game's set past its shard bound and have it discard everything. This is
+# last in the file so it appends to every test's ENVIRONMENT, including those
+# set above; the archive check scripts point at a private directory of their own.
+get_property(_jsrf_all_tests DIRECTORY PROPERTY TESTS)
+foreach(_t IN LISTS _jsrf_all_tests)
+    set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+                 "RECOMP_METAL_PIPELINE_ARCHIVE_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-pipeline-archive")
+endforeach()

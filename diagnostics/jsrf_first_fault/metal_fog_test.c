@@ -168,8 +168,14 @@ static int draw_metal(NV2ATextureCopy *s, const float v[6][16][4])
     memset(tgt_m, 0x33, sizeof tgt_m); memset(dep, 0, sizeof dep);
     nv2a_metal_invalidate(NULL);
     if (use_vsh) {
-        if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 4, (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5))) {
-            printf("vertex program refused\n"); return 0;
+        const uint16_t in = (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5);
+        /* A program still compiling in the background (RECOMP_METAL_ASYNC_VSH)
+         * is refused until published; this test waits for it instead. */
+        if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 4, in)) {
+            nv2a_metal_pipelines_settle();
+            if (!nv2a_metal_vsh_ready((const uint32_t (*)[4])vsh_words, 4, in)) {
+                printf("vertex program refused\n"); return 0;
+            }
         }
         nv2a_metal_vsh_constants((const float (*)[4])vsh_consts);
     }

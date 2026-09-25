@@ -8,11 +8,13 @@
 #include "nv2a_metal_state.h"
 #include "nv2a_vsh.h"
 #include "nv2a_texture_decode.h"
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Native raster path for the fragment states already understood by the CPU
  * renderer. Surfaces stay on the GPU across compatible batches. Guest RAM is
@@ -1315,6 +1317,448 @@ static int vsh_gpu_on(void)
  * has to be declared before nv2a_metal_draw, which is above them too. */
 static int hw_state_on(void);
 static int initialize(void);
+static int hw_565_on(void);
+static int spec_control_on(void);
+static int early_z_on(void);
+
+/* ===== PIPELINE COMPILATION: OFF THE DRAW THREAD, AND KEPT ACROSS SESSIONS =====
+ *
+ * THE HITCH. Every pipeline this file builds used to be compiled on the draw
+ * thread, on first use: the combiner-specialised pipelines (one per combiner
+ * program, blend state and vertex function), the generic ones they fall back
+ * to, and a whole library per guest vertex program. The player's session of
+ * 25 Sep 2026 reported `built=114 ... 5664.0 ms compiling, worst 883.4 ms`
+ * for the specialised ones alone, and single frames of 1061 ms and 1908 ms in
+ * the middle of play -- the game stops while Metal's compiler runs.
+ *
+ * THREE SWITCHES, so each remedy can be taken away alone.
+ *
+ * RECOMP_METAL_ASYNC_PIPELINES (default on). A draw whose specialised pipeline
+ * does not exist yet takes the GENERIC pipeline for the same state -- the one
+ * it took before specialisation existed, and which metal_combiner_spec_check.sh
+ * holds byte-identical to the specialised one -- and the specialised pipeline
+ * is compiled on a background queue and used from the first draw after it is
+ * published. =0 compiles on the draw thread, exactly as before.
+ *
+ * RECOMP_METAL_ASYNC_VSH (default on). A guest vertex program whose library is
+ * still compiling is refused, which the executor already turns into a clean
+ * CPU batch (the interpreter: the path RECOMP_METAL_VSH=0 runs, and the oracle
+ * the GPU emitter was verified against); the library compiles in the
+ * background together with its generic fragment functions. =0 compiles on
+ * the draw thread as before.
+ *
+ * RECOMP_METAL_PIPELINE_ARCHIVE (default on). Compiled pipelines are recorded
+ * in MTLBinaryArchive files and the next session looks them up before
+ * compiling -- with MTLPipelineOptionFailOnBinaryArchiveMiss first, so a hit
+ * is a counted fact rather than an inference from timing. They live in
+ *     $RECOMP_METAL_PIPELINE_ARCHIVE_DIR, else ~/Library/Caches/JSRF/metal-pipelines
+ * under a directory named for a hash of the MSL source, the device and the OS
+ * build, so a shader change, another GPU or an OS update starts a fresh set
+ * rather than feeding Metal an archive it cannot use.
+ *
+ * SHARDS, NOT ONE FILE, so no archive is ever read and written at once. A
+ * session opens every shard already present READ-ONLY for lookups, and records
+ * what it compiles into a NEW archive of its own, written on a serial queue to
+ * its own file (tmp + rename, so a kill mid-write leaves no half file under the
+ * real name). A shard Metal will not open is deleted and counted; past
+ * PIPE_SHARDS_MAX shards or PIPE_ARCHIVE_MAX_MB the set is discarded and
+ * rebuilt, which costs one session of background compiles.
+ *
+ * THREADS. The draw path is single-threaded (the pusher). A background job
+ * publishes a finished pipeline or library by storing it and THEN releasing an
+ * atomic state word; the draw thread reads the object only after an acquire
+ * load of that word says it is there. Everything else a job touches is either
+ * its own or the fragment-function cache, which has a mutex.
+ *
+ * RECOMP_METAL_PIPELINE_HOLD, a test hook: background jobs wait until
+ * nv2a_metal_pipelines_settle(), so a test can prove every draw before that
+ * point took the fallback. RECOMP_METAL_SHADER_NONCE=<n> appends an unused
+ * constant to the MSL, which makes Metal's own system shader cache miss -- the
+ * only way to measure a COLD compile on a machine that has run the game. */
+static int async_pipelines_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_METAL_ASYNC_PIPELINES",1); return on; }
+static int async_vsh_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_METAL_ASYNC_VSH",1); return on; }
+static int pipe_archive_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_METAL_PIPELINE_ARCHIVE",1); return on; }
+static int pipe_hold_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_PIPELINE_HOLD"); return on; }
+
+/* The MSL every library is compiled from: the shared source, plus the nonce
+ * when one is asked for. Set once in initialize(), before any compile. */
+static NSString *msl_source;
+
+enum { PK_INIT, PK_SPEC, PK_HW, PK_VSHP, PK_VSHLIB, PK_N };
+static const char *const pk_name[PK_N] = {
+    "startup", "specialised", "generic", "program generic", "program library" };
+static uint64_t g_pk_sync[PK_N], g_pk_async[PK_N];
+static uint64_t g_pipe_wait_ns, g_pipe_wait_max_ns;   /* the draw thread, compiling */
+static uint64_t g_pipe_bg_ns, g_pipe_bg_max_ns;       /* the background queues */
+static uint64_t g_pipe_spec_pending_draws, g_pipe_vsh_pending_batches;
+static uint64_t g_arch_hits, g_arch_misses, g_arch_adds, g_arch_add_fail, g_arch_saves, g_arch_save_fail;
+static unsigned g_arch_shards, g_arch_discarded;
+static const char *g_arch_state = "off";
+static char g_arch_dir[1024], g_arch_shard_path[1100];
+
+static void pipe_max(uint64_t *p, uint64_t v)
+{
+    uint64_t o = __atomic_load_n(p, __ATOMIC_RELAXED);
+    while (v > o && !__atomic_compare_exchange_n(p, &o, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+static void pipe_account(int kind, int draw_thread, uint64_t ns)
+{
+    if (draw_thread) {
+        ++g_pk_sync[kind]; g_pipe_wait_ns += ns; pipe_max(&g_pipe_wait_max_ns, ns);
+    } else {
+        __atomic_fetch_add(&g_pk_async[kind], 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_pipe_bg_ns, ns, __ATOMIC_RELAXED);
+        pipe_max(&g_pipe_bg_max_ns, ns);
+    }
+}
+
+/* ---- the background queues ---- */
+#define PIPE_THREADS_MAX 8
+static dispatch_queue_t g_pipe_q[PIPE_THREADS_MAX];
+static unsigned g_pipe_nq, g_pipe_rr;
+static dispatch_group_t g_pipe_group;
+static pthread_mutex_t g_pipe_hold_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pipe_hold_cv = PTHREAD_COND_INITIALIZER;
+static int g_pipe_held;
+
+static void pipe_queues_init(void)
+{
+    const char *e = getenv("RECOMP_METAL_PIPELINE_THREADS");
+    int n = (e && *e) ? atoi(e) : 2;
+    if (n < 1) n = 1;
+    if (n > PIPE_THREADS_MAX) n = PIPE_THREADS_MAX;
+    g_pipe_group = dispatch_group_create();
+    for (int i = 0; i < n; ++i)
+        g_pipe_q[i] = dispatch_queue_create("jsrf.metal.pipeline",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_DEFAULT, 0));
+    g_pipe_nq = (unsigned)n;
+    g_pipe_held = pipe_hold_on();
+}
+
+/* Run `job` in the background, timed and counted under `kind`. */
+static void pipe_submit(int kind, void (^job)(void))
+{
+    dispatch_group_async(g_pipe_group, g_pipe_q[g_pipe_rr++ % g_pipe_nq], ^{
+        pthread_mutex_lock(&g_pipe_hold_mu);
+        while (g_pipe_held) pthread_cond_wait(&g_pipe_hold_cv, &g_pipe_hold_mu);
+        pthread_mutex_unlock(&g_pipe_hold_mu);
+        uint64_t t0 = mtl_now_ns();
+        @autoreleasepool { job(); }
+        pipe_account(kind, 0, mtl_now_ns() - t0);
+    });
+}
+
+/* ---- the archive ---- */
+#define PIPE_SHARDS_MAX 12
+#define PIPE_ARCHIVE_MAX_MB 256
+static NSArray *g_arch_read;          /* of id<MTLBinaryArchive>; immutable once open */
+static id g_arch_write;               /* id<MTLBinaryArchive>; touched on g_arch_q only */
+static dispatch_queue_t g_arch_q;
+static unsigned g_arch_queued;        /* g_arch_q only */
+static int g_arch_dirty, g_arch_save_scheduled;   /* g_arch_q only */
+static NSMutableArray *g_arch_descs;  /* every descriptor recorded; g_arch_q only */
+
+static uint64_t pipe_fnv64(const void *p, size_t n, uint64_t h)
+{ const uint8_t *b = p; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; }
+
+static void pipe_archive_open(void) API_AVAILABLE(macos(11.0))
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *base, *dir;
+    NSMutableArray *read = [NSMutableArray array];
+    const char *e = getenv("RECOMP_METAL_PIPELINE_ARCHIVE_DIR");
+    uint64_t h = 1469598103934665603ull;
+    unsigned long long bytes = 0;
+    if (e && *e) base = [NSString stringWithUTF8String:e];
+    else {
+        NSArray *c = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+        if (!c.count) { g_arch_state = "unavailable (no caches directory)"; return; }
+        base = [[c[0] stringByAppendingPathComponent:@"JSRF"] stringByAppendingPathComponent:@"metal-pipelines"];
+    }
+    /* THE KEY: what makes an archive usable. The MSL (so a shader edit is a
+     * fresh set), the device and the OS build (Metal's binaries are both), and
+     * a format number for this code's own layout. The emitted vertex programs
+     * are not in it: a changed emitter changes their functions, which then
+     * miss and are added, because the archive keys each pipeline on its
+     * functions and not on anything this file names. */
+    {   const char *s = msl_source.UTF8String;
+        const char *dev = device.name.UTF8String;
+        const char *os = [NSProcessInfo processInfo].operatingSystemVersionString.UTF8String;
+        static const char fmt[] = "jsrf-pipeline-archive-1";
+        h = pipe_fnv64(s, strlen(s), h); h = pipe_fnv64(dev, strlen(dev), h);
+        h = pipe_fnv64(os, strlen(os), h); h = pipe_fnv64(fmt, sizeof fmt, h); }
+    dir = [base stringByAppendingPathComponent:[NSString stringWithFormat:@"%016llx", (unsigned long long)h]];
+    if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil]) {
+        g_arch_state = "unavailable (cannot create the directory)"; return;
+    }
+    snprintf(g_arch_dir, sizeof g_arch_dir, "%s", dir.UTF8String);
+    /* OLD KEYS ARE PRUNED. Every shader edit starts a new key directory and
+     * nothing would ever read the old one again, so a key directory untouched
+     * for a week is deleted; this one is touched first so a key that is in
+     * use but compiles nothing new never ages out. A week, not "anything
+     * else", because another build of the tree may be using its own key from
+     * the same base today. */
+    [fm setAttributes:@{ NSFileModificationDate: [NSDate date] } ofItemAtPath:dir error:nil];
+    for (NSString *k in [fm contentsOfDirectoryAtPath:base error:nil]) {
+        NSString *kp = [base stringByAppendingPathComponent:k];
+        NSDictionary *at = [fm attributesOfItemAtPath:kp error:nil];
+        BOOL isdir = [at[NSFileType] isEqualToString:NSFileTypeDirectory];
+        BOOL hex = [k rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:
+                       @"0123456789abcdef"] invertedSet]].location == NSNotFound;
+        if (isdir && hex && k.length == 16 && ![kp isEqualToString:dir]
+            && -[at fileModificationDate].timeIntervalSinceNow > 7 * 86400.0)
+            [fm removeItemAtPath:kp error:nil];
+    }
+    NSArray *names = [[fm contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(compare:)];
+    NSMutableArray *shards = [NSMutableArray array];
+    for (NSString *n in names) {
+        NSString *p = [dir stringByAppendingPathComponent:n];
+        if ([n hasSuffix:@".bin"]) {
+            [shards addObject:p];
+            bytes += [[fm attributesOfItemAtPath:p error:nil] fileSize];
+        } else {
+            /* Anything else is a save killed mid-write -- ours (.bin.tmp.<pid>)
+             * or Metal's own scratch file beside it (<UUID>.metallib) --
+             * never renamed, so never read. An old one is garbage; a young
+             * one may be another process's save in flight. */
+            NSDate *m = [[fm attributesOfItemAtPath:p error:nil] fileModificationDate];
+            if (m && -m.timeIntervalSinceNow > 600) [fm removeItemAtPath:p error:nil];
+        }
+    }
+    if (shards.count > PIPE_SHARDS_MAX || bytes > ((unsigned long long)PIPE_ARCHIVE_MAX_MB << 20)) {
+        for (NSString *p in shards) [fm removeItemAtPath:p error:nil];
+        g_arch_discarded += (unsigned)shards.count;
+        fprintf(stderr, "[METAL] pipeline archive: %u shards, %.1f MB -- past the bound, discarded;"
+                " this session rebuilds it\n", (unsigned)shards.count, bytes / 1048576.0);
+        [shards removeAllObjects];
+    }
+    for (NSString *p in shards) {
+        MTLBinaryArchiveDescriptor *ad = [MTLBinaryArchiveDescriptor new];
+        NSError *err = nil;
+        id<MTLBinaryArchive> a;
+        ad.url = [NSURL fileURLWithPath:p];
+        a = [device newBinaryArchiveWithDescriptor:ad error:&err];
+        if (a) { [read addObject:a]; continue; }
+        /* CORRUPT OR STALE: Metal will not open it, so all it can ever do is
+         * cost a failed open per session. Delete it and say so. */
+        fprintf(stderr, "[METAL] pipeline archive: discarding %s: %s\n", p.UTF8String,
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        [fm removeItemAtPath:p error:nil];
+        ++g_arch_discarded;
+    }
+    g_arch_write = [device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:nil];
+    g_arch_descs = [NSMutableArray array];
+    g_arch_read = [read copy];
+    g_arch_shards = (unsigned)read.count;
+    snprintf(g_arch_shard_path, sizeof g_arch_shard_path, "%s/shard-%010ld-%d.bin",
+             g_arch_dir, (long)time(NULL), (int)getpid());
+    g_arch_q = dispatch_queue_create("jsrf.metal.pipeline-archive",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    g_arch_state = !g_arch_write ? "read-only (cannot create an archive to record into)"
+                 : g_arch_shards ? "on" : "on, empty";
+}
+
+/* g_arch_q only. Write this session's shard: tmp, then rename.
+ *
+ * A FAILED SAVE EMPTIES THE ARCHIVE, so the descriptors are the record and the
+ * archive is rebuilt from them. Measured on cold compiles: serializeToURL
+ * fails now and then with "Failed to generate machO ... expecting 'fragment'
+ * stage in pipeline no. 8", and every attempt after that on the SAME archive
+ * reports "Nothing to serialize" -- the entries added so far are gone, and a
+ * second session missed exactly those 21 of 63 pipelines. So a failure throws
+ * the archive away, re-adds every descriptor recorded (warm by now, so it
+ * costs little, and it is this queue's time, not the game's) and tries again;
+ * if all attempts fail the shard is left dirty for the next save.
+ * save_failed counts failed attempts, not lost pipelines. */
+static void pipe_archive_save_now(void) API_AVAILABLE(macos(11.0))
+{
+    char tmp[1200];
+    if (!g_arch_dirty) return;
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", g_arch_shard_path, (int)getpid());
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        NSError *err = nil;
+        int wrote, renamed = 0;
+        if (attempt) {
+            id<MTLBinaryArchive> a = [device newBinaryArchiveWithDescriptor:
+                                        [MTLBinaryArchiveDescriptor new] error:nil];
+            if (!a) break;
+            for (MTLRenderPipelineDescriptor *d in g_arch_descs)
+                [a addRenderPipelineFunctionsWithDescriptor:d error:nil];
+            g_arch_write = a;
+        }
+        wrote = [(id<MTLBinaryArchive>)g_arch_write
+                    serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:tmp]] error:&err];
+        if (wrote) renamed = rename(tmp, g_arch_shard_path) == 0;
+        if (wrote && renamed) {
+            g_arch_dirty = 0;
+            __atomic_fetch_add(&g_arch_saves, 1, __ATOMIC_RELAXED);
+            return;
+        }
+        unlink(tmp);
+        __atomic_fetch_add(&g_arch_save_fail, 1, __ATOMIC_RELAXED);
+        if (attempt == 2) {
+            static int told;
+            if (!told++) fprintf(stderr, "[METAL] pipeline archive: save to %s failed 3 times, left"
+                                 " for the next save: %s\n", g_arch_shard_path,
+                                 !wrote ? (err ? err.localizedDescription.UTF8String : "serialize, no error")
+                                        : strerror(errno));
+        }
+    }
+}
+
+/* Record a pipeline this session compiled, from a descriptor nobody else
+ * holds. The add runs on g_arch_q, and the shard is written when the queue has
+ * nothing more to add -- once per burst of compiles, not once per pipeline. */
+static void pipe_archive_add(MTLRenderPipelineDescriptor *d) API_AVAILABLE(macos(11.0))
+{
+    d.binaryArchives = nil;
+    dispatch_async(g_arch_q, ^{ ++g_arch_queued; });
+    dispatch_async(g_arch_q, ^{
+        NSError *err = nil;
+        if ([(id<MTLBinaryArchive>)g_arch_write addRenderPipelineFunctionsWithDescriptor:d error:&err]) {
+            [g_arch_descs addObject:d];
+            __atomic_fetch_add(&g_arch_adds, 1, __ATOMIC_RELAXED);
+        }
+        else {
+            static int told;
+            __atomic_fetch_add(&g_arch_add_fail, 1, __ATOMIC_RELAXED);
+            if (!told++) fprintf(stderr, "[METAL] pipeline archive: add failed: %s\n",
+                                 err ? err.localizedDescription.UTF8String : "(no error)");
+        }
+        g_arch_dirty = 1;
+        /* Written when the queue has had nothing to add for a second: once per
+         * burst of compiles, not once per pipeline -- each save rewrites the
+         * whole shard. */
+        if (--g_arch_queued == 0 && !g_arch_save_scheduled) {
+            g_arch_save_scheduled = 1;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), g_arch_q, ^{
+                g_arch_save_scheduled = 0;
+                if (g_arch_queued == 0) pipe_archive_save_now();
+            });
+        }
+    });
+}
+
+/* THE ONE PLACE A PIPELINE IS BUILT. The archive first, with a miss being a
+ * failure rather than a compile, so a hit is counted and not guessed at; then
+ * an ordinary compile, recorded for the next session. Callable from any
+ * thread: the read archives are immutable, the write archive is g_arch_q's. */
+static id<MTLRenderPipelineState> pipe_create(MTLRenderPipelineDescriptor *d, NSError **err)
+{
+    id<MTLRenderPipelineState> pso;
+    if (@available(macOS 11.0, *)) {
+        if (g_arch_read.count) {
+            /* One lookup at a time. Metal does not document MTLBinaryArchive
+             * as safe to search from several threads at once, one cold run
+             * here did miss 20 pipelines a second session should have found,
+             * and a hit costs well under a millisecond -- so the lock is
+             * cheap insurance, and a miss still compiles outside it. */
+            static pthread_mutex_t lookup_mu = PTHREAD_MUTEX_INITIALIZER;
+            d.binaryArchives = g_arch_read;
+            pthread_mutex_lock(&lookup_mu);
+            pso = [device newRenderPipelineStateWithDescriptor:d
+                                                       options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                    reflection:nil error:nil];
+            pthread_mutex_unlock(&lookup_mu);
+            if (pso) { __atomic_fetch_add(&g_arch_hits, 1, __ATOMIC_RELAXED); return pso; }
+        }
+        if (g_arch_write) __atomic_fetch_add(&g_arch_misses, 1, __ATOMIC_RELAXED);
+    }
+    pso = [device newRenderPipelineStateWithDescriptor:d error:err];
+    if (@available(macOS 11.0, *))
+        if (pso && g_arch_write) pipe_archive_add([d copy]);
+    return pso;
+}
+
+/* THE FALLBACK HAS TO BE WARM TOO. A draw whose specialised pipeline is still
+ * compiling takes the generic one -- but on a program's first draw that is a
+ * cold compile of its own, on the draw thread: measured with a nonce'd shader
+ * (RECOMP_METAL_SHADER_NONCE), 1.8-2.0 s for the first generic pipeline of a
+ * guest program, against ~0 for a second pipeline of the same two functions
+ * with different blend state. The cost is the (vertex, fragment) pair, not the
+ * blend. So each pair a program can use is compiled once in the background,
+ * blend off, before the program is published; the draw thread's own generic
+ * pipeline is then a blend variant of a pair Metal already has. Background
+ * only -- the caller is a job. The early-Z tails only when early-Z is on,
+ * since nothing else selects them. */
+static void pipe_prewarm(id<MTLFunction> vfn, id<MTLLibrary> lib)
+{
+    NSString *names[4] = { @"fs_hw", @"fs_hw_blend", @"fs_hw_early", @"fs_hw_early_nw" };
+    int n = early_z_on() ? 4 : 2;
+    for (int i = 0; i < n; ++i) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = vfn;
+        d.fragmentFunction = frag_fn(lib, names[i], NULL);
+        if (!vfn || !d.fragmentFunction) continue;
+        d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
+                                                        : MTLPixelFormatRGBA32Float;
+        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+        (void)pipe_create(d, NULL);
+    }
+}
+
+/* Wait for every background compile, releasing the test hold first, and then
+ * for the archive to be written. For tests, and for the one caller that cannot
+ * take a fallback (nv2a_metal_vsh_function). */
+void nv2a_metal_pipelines_settle(void)
+{
+    if (!g_pipe_group) return;
+    pthread_mutex_lock(&g_pipe_hold_mu);
+    g_pipe_held = 0;
+    pthread_cond_broadcast(&g_pipe_hold_cv);
+    pthread_mutex_unlock(&g_pipe_hold_mu);
+    dispatch_group_wait(g_pipe_group, DISPATCH_TIME_FOREVER);
+    if (g_arch_q) dispatch_sync(g_arch_q, ^{ if (@available(macOS 11.0, *)) pipe_archive_save_now(); });
+    /* Re-armed, so a test can hold, settle and hold again: jobs submitted
+     * after this wait for the NEXT settle. */
+    if (pipe_hold_on()) {
+        pthread_mutex_lock(&g_pipe_hold_mu);
+        g_pipe_held = 1;
+        pthread_mutex_unlock(&g_pipe_hold_mu);
+    }
+}
+
+static void pipe_report(void)
+{
+    uint64_t as = 0, sy = 0;
+    char by[256]; size_t u = 0;
+    by[0] = 0;
+    for (int k = 0; k < PK_N && u < sizeof by; ++k) {
+        uint64_t a = __atomic_load_n(&g_pk_async[k], __ATOMIC_RELAXED);
+        as += a; sy += g_pk_sync[k];
+        if (a || g_pk_sync[k])
+            u += (size_t)snprintf(by + u, sizeof by - u, "%s%s %llu/%llu", u ? ", " : "",
+                                  pk_name[k], (unsigned long long)a, (unsigned long long)g_pk_sync[k]);
+    }
+    fprintf(stderr, "[METAL] pipeline compiles: async=%llu sync=%llu (async/sync: %s);"
+            " draw thread waited %.1f ms, worst %.1f ms; background %.1f ms, worst %.1f ms;"
+            " pending: %llu draws took the generic pipeline, %llu batches the CPU vertex path"
+            " (metal_async_pipelines %s, metal_async_vsh %s%s)\n",
+            (unsigned long long)as, (unsigned long long)sy, by[0] ? by : "none",
+            g_pipe_wait_ns / 1e6, g_pipe_wait_max_ns / 1e6,
+            __atomic_load_n(&g_pipe_bg_ns, __ATOMIC_RELAXED) / 1e6,
+            __atomic_load_n(&g_pipe_bg_max_ns, __ATOMIC_RELAXED) / 1e6,
+            (unsigned long long)g_pipe_spec_pending_draws,
+            (unsigned long long)g_pipe_vsh_pending_batches,
+            async_pipelines_on() ? "on" : "OFF", async_vsh_on() ? "on" : "OFF",
+            pipe_hold_on() ? ", HELD for a test" : "");
+    fprintf(stderr, "[METAL] pipeline archive: %s%s%s; shards=%u discarded=%u hits=%llu"
+            " misses=%llu added=%llu add_failed=%llu saves=%llu save_failed=%llu"
+            " (metal_pipeline_archive %s)\n",
+            g_arch_state, g_arch_dir[0] ? " " : "", g_arch_dir, g_arch_shards, g_arch_discarded,
+            (unsigned long long)__atomic_load_n(&g_arch_hits, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_arch_misses, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_arch_adds, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_arch_add_fail, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_arch_saves, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_arch_save_fail, __ATOMIC_RELAXED),
+            pipe_archive_on() ? "on" : "OFF");
+}
 
 typedef struct { float f[4]; } float4v;
 #define VSH_CACHE 192
@@ -1327,6 +1771,10 @@ typedef struct {
     id<MTLLibrary> library;
     id<MTLFunction> fn;
     int refused;            /* the emitter or the compiler said no; never retry */
+    /* 1 while the library compiles in the background (RECOMP_METAL_ASYNC_VSH):
+     * library, fn and refused are the job's until it stores 0 with release,
+     * and the draw thread reads them only after an acquire load of 0. */
+    int pending;
     /* words[] holds an NV2AFFKey rather than a vertex program. The array is
      * NV2A_VS_MAX_INSTRUCTIONS*16 bytes and the key is 32, so it fits with
      * room to spare and the cache stays one table. This file never looks
@@ -1594,6 +2042,12 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
         if (v->is_ff != is_ff) continue;
         if (is_ff ? (v->keysize != keysize) : (v->length != length)) continue;
         if (memcmp(v->words, blob, bytes)) continue;   /* full compare */
+        if (__atomic_load_n(&v->pending, __ATOMIC_ACQUIRE)) {
+            /* STILL COMPILING: a CPU batch, exactly as a refusal is, and
+             * asked again next batch. Counted, so a run can say how many. */
+            ++g_pipe_vsh_pending_batches;
+            return NULL;
+        }
         ++g_vsh_hits;
         return v->refused ? NULL : v;
     }
@@ -1626,37 +2080,62 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
             || !vsh_wrap(emitted, inputs, v->nattrs, wrapped, 524288)) {
             ++g_vsh_refused_emit; free(emitted); free(wrapped); return NULL;
         }
-        @autoreleasepool {
+        {
             /* The program is appended to the SHARED source, so vs_gpu and the
              * fragment tails come out of one library and Out means the same
              * type on both sides of the stage boundary. */
-            NSString *whole = [shader stringByAppendingString:
+            NSString *whole = [msl_source stringByAppendingString:
                                  [NSString stringWithUTF8String:wrapped]];
-            NSError *err = nil;
-            MTLCompileOptions *opt = [MTLCompileOptions new];
+            int async = async_vsh_on();
+            void (^build)(void) = ^{
+                NSError *err = nil;
+                MTLCompileOptions *opt = [MTLCompileOptions new];
+                id<MTLLibrary> lib;
+                id<MTLFunction> fn = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            /* SAFE MATH, not the default, and not a style preference: the
-             * differential test measured this emitter against the interpreter
-             * under safe math only. Under fast math rsqrt, pow and the
-             * reciprocals are different functions and that result does not
-             * transfer. */
-            if (@available(macOS 15.0,*)) opt.mathMode = MTLMathModeSafe;
-            else opt.fastMathEnabled = NO;
+                /* SAFE MATH, not the default, and not a style preference: the
+                 * differential test measured this emitter against the interpreter
+                 * under safe math only. Under fast math rsqrt, pow and the
+                 * reciprocals are different functions and that result does not
+                 * transfer. */
+                if (@available(macOS 15.0,*)) opt.mathMode = MTLMathModeSafe;
+                else opt.fastMathEnabled = NO;
 #pragma clang diagnostic pop
-            v->library = [device newLibraryWithSource:whole
-                          options:opt error:&err];
-            if (!v->library) {
-                static int told;
-                if (!told++) fprintf(stderr,
-                    "[METAL] vsh compile failed: %s\n",
-                    err ? err.localizedDescription.UTF8String : "(no error)");
-                ++g_vsh_refused_compile;
-            } else {
-                v->fn = [v->library newFunctionWithName:@"vs_gpu"];
-                if (v->fn) { v->refused = 0; ++g_vsh_compiles; }
-                else ++g_vsh_refused_compile;
+                lib = [device newLibraryWithSource:whole options:opt error:&err];
+                if (!lib) {
+                    static int told;
+                    if (!told++) fprintf(stderr,
+                        "[METAL] vsh compile failed: %s\n",
+                        err ? err.localizedDescription.UTF8String : "(no error)");
+                    __atomic_fetch_add(&g_vsh_refused_compile, 1, __ATOMIC_RELAXED);
+                } else {
+                    fn = [lib newFunctionWithName:@"vs_gpu"];
+                    if (fn) {
+                        __atomic_fetch_add(&g_vsh_compiles, 1, __ATOMIC_RELAXED);
+                        /* The generic fragment tails out of THIS library,
+                         * and their pipelines with vs_gpu, are what
+                         * vsh_pipeline_for builds on the program's first draw;
+                         * each is a cold compile, so they are made here, off
+                         * the draw thread, before the program is published. */
+                        if (async) pipe_prewarm(fn, lib);
+                    } else __atomic_fetch_add(&g_vsh_refused_compile, 1, __ATOMIC_RELAXED);
+                }
+                v->library = lib; v->fn = fn; v->refused = fn == nil;
+                __atomic_store_n(&v->pending, 0, __ATOMIC_RELEASE);
+            };
+            if (async) {
+                /* Refused until published. The CPU batch this returns is the
+                 * interpreter's, which is what a refusal already means. */
+                v->pending = 1;
+                pipe_submit(PK_VSHLIB, build);
+                ++g_pipe_vsh_pending_batches;
+                free(emitted); free(wrapped);
+                return NULL;
             }
+            {   uint64_t t0 = mtl_now_ns();
+                @autoreleasepool { build(); }
+                pipe_account(PK_VSHLIB, 1, mtl_now_ns() - t0); }
         }
         free(emitted); free(wrapped);
         return v->refused ? NULL : v;
@@ -1673,6 +2152,14 @@ void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs
     /* the executor thread: the host shadow and replace run there */
     if (!words || length <= 0 || !initialize()) return NULL;
     v = vsh_lookup_ex(words, length, 0, 0, inputs);
+    /* This caller has no CPU batch to fall back to, so a program still
+     * compiling in the background is waited for rather than refused. */
+    if (!v && async_vsh_on()) {
+        uint64_t t0 = mtl_now_ns();
+        nv2a_metal_pipelines_settle();
+        pipe_account(PK_VSHLIB, 1, mtl_now_ns() - t0);
+        v = vsh_lookup_ex(words, length, 0, 0, inputs);
+    }
     if (!v) return NULL;
     if (nattrs) *nattrs = v->nattrs;
     return (__bridge void *)v->fn;
@@ -1722,12 +2209,32 @@ static int initialize(void)
     if(attempted){int ready=pipeline!=nil;pthread_mutex_unlock(&initialization_mutex);return ready;}
     device=MTLCreateSystemDefaultDevice();if(!device){attempted=1;pthread_mutex_unlock(&initialization_mutex);return 0;}
     if(pass_fence_on())g_pass_fence=[device newFence];
+    uint64_t init_t0=mtl_now_ns();
+    {   /* Every lazily read switch the background jobs consult is read here,
+         * on this thread, before a job can exist. */
+        const char *nonce=getenv("RECOMP_METAL_SHADER_NONCE");
+        msl_source=shader;
+        if(nonce&&*nonce){
+            /* A branch no draw can take (no target is a billion pixels wide)
+             * after every shade() call, so each fragment entry point's code
+             * differs per nonce and Metal's system cache misses all the way
+             * down to the GPU binary; an unused constant would only defeat
+             * the front end. Measurement only: the pixels are unchanged. */
+            unsigned long n=(strtoul(nonce,NULL,0)&0x3FFFFFFFul)|0x40000000ul;   /* a 32-bit uint, or the compiler folds the compare away */
+            NSString *call=@" float4 c=shade(i,t0,s,t1,t2,t3,h0,h1,h2,h3,q0,q1,q2,q3);";
+            msl_source=[shader stringByReplacingOccurrencesOfString:call withString:
+                        [call stringByAppendingFormat:@"if(s.width==%luu)c.x+=1.0f;",n]];
+        }
+        (void)async_pipelines_on();(void)async_vsh_on();(void)spec_control_on();(void)hw_565_on();(void)early_z_on();
+        pipe_queues_init();
+        if(pipe_archive_on()){if(@available(macOS 11.0,*))pipe_archive_open();else g_arch_state="unavailable (needs macOS 11)";}
+    }
     NSError *error=nil;MTLCompileOptions *options=[MTLCompileOptions new];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if(@available(macOS 15.0,*)) options.mathMode=MTLMathModeSafe; else options.fastMathEnabled=NO;
 #pragma clang diagnostic pop
-    id<MTLLibrary> library=[device newLibraryWithSource:shader options:options error:&error];
+    id<MTLLibrary> library=[device newLibraryWithSource:msl_source options:options error:&error];
     if(library){MTLRenderPipelineDescriptor *desc=[MTLRenderPipelineDescriptor new];
         /* Every fragment entry point reads the combiner-specialisation
          * constants through shade(), so each is fetched through frag_fn with
@@ -1743,9 +2250,15 @@ static int initialize(void)
         hw_fs_early_nw=frag_fn(library,@"fs_hw_early_nw",NULL);
         desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;
         desc.colorAttachments[1].pixelFormat=MTLPixelFormatR8Uint;
-        pipeline=[device newRenderPipelineStateWithDescriptor:desc error:&error];
+        pipeline=pipe_create(desc,&error);
         queue=[device newCommandQueue];}
     attempted=1;
+    pipe_account(PK_INIT,1,mtl_now_ns()-init_t0);
+    /* The fixed `vs`'s generic pairs, which the first hardware draws need;
+     * compiled in the background from here, so what the draw thread builds
+     * for them is a blend variant (see pipe_prewarm). */
+    if(pipeline&&async_pipelines_on()){id<MTLFunction> v=hw_vs;id<MTLLibrary> l=hw_library;
+        pipe_submit(PK_HW,^{pipe_prewarm(v,l);});}
     if(!pipeline||!queue){pipeline=nil;fprintf(stderr,"[METAL] initialization failed: %s\n",error.description.UTF8String);pthread_mutex_unlock(&initialization_mutex);return 0;}
     fprintf(stderr,"[METAL] native raster pipeline ready: %s\n",device.name.UTF8String);pthread_mutex_unlock(&initialization_mutex);return 1;
 }
@@ -2659,7 +3172,9 @@ static id<MTLRenderPipelineState> vsh_pipeline_for(const NV2ATextureCopy *s,
             d.colorAttachments[0].sourceAlphaBlendFactor = (MTLBlendFactor)sf;
             d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
         }
-        pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        {   uint64_t t0 = mtl_now_ns();
+            pso = pipe_create(d, &err);
+            pipe_account(PK_VSHP, 1, mtl_now_ns() - t0); }
         if (!pso) { ++g_hw_state_refusals; return nil; }
         vsh_pso[vsh_pso_n].fn = (__bridge const void *)prog->fn;
         vsh_pso[vsh_pso_n].blend = s->blend; vsh_pso[vsh_pso_n].src = s->blend_src;
@@ -2779,8 +3294,9 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s,
         d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
     }
     NSError *err = nil;
-    id<MTLRenderPipelineState> pso =
-        [device newRenderPipelineStateWithDescriptor:d error:&err];
+    uint64_t t0 = mtl_now_ns();
+    id<MTLRenderPipelineState> pso = pipe_create(d, &err);
+    pipe_account(PK_HW, 1, mtl_now_ns() - t0);
     if (!pso) { ++g_hw_state_refusals; return nil; }
     ++g_hw_pipeline_misses;
     hw_pso[hw_pso_n].blend = s->blend; hw_pso[hw_pso_n].src = s->blend_src;
@@ -2822,10 +3338,11 @@ static id<MTLRenderPipelineState> hw_pipeline_for(const NV2ATextureCopy *s,
  * BOUNDED, and the bound is a fallback, never a refusal: when the table is
  * full or a compile fails, the draw takes the generic pipeline, which is
  * always correct. A failed compile is remembered so it is not retried every
- * draw. The compile is SYNCHRONOUS, on the draw thread, so the first draw of
- * each new program stalls for it -- see [METAL] combiner specialisation's
- * compile time and worst; asynchronous compilation is the follow-up if the
- * worst case shows up as a hitch. */
+ * draw. The compile WAS synchronous, on the draw thread, and the worst case did
+ * show up as a hitch: 114 pipelines, 5.7 s, worst 883 ms in the player's
+ * session of 25 Sep 2026. It is now compiled in the background and the draw
+ * takes the generic pipeline until it is published -- see PIPELINE
+ * COMPILATION above; RECOMP_METAL_ASYNC_PIPELINES=0 is the old behaviour. */
 static int spec_combiners_on(void)
 { static int on=-1; if(on<0) on=recomp_switch_on_default("RECOMP_METAL_SPECIALISE_COMBINERS",1); return on; }
 /* THE POSITIVE CONTROL. Specialises on deliberately WRONG words -- stage 0's
@@ -2842,7 +3359,9 @@ static struct { const void *lib; NSString *name; int generic; uint64_t h; CombKe
                 id<MTLFunction> fn; } spec_fn[SPEC_FN_CACHE];
 static unsigned spec_fn_n;
 static struct { const void *vfn; uint32_t blend,src,dst,sblend,early; uint64_t h; CombKey ck;
-                id<MTLRenderPipelineState> pso; int failed; } spec_pso[SPEC_PSO_CACHE];
+                id<MTLRenderPipelineState> pso; int failed;
+                int pending;   /* 1 while compiling in the background; see pipe_submit */
+              } spec_pso[SPEC_PSO_CACHE];
 static unsigned spec_pso_n;
 static uint64_t g_spec_built, g_spec_hits, g_spec_fns, g_spec_generic_fns;
 static uint64_t g_spec_fb_full, g_spec_fb_failed, g_spec_fb_wide, g_spec_compile_ns, g_spec_compile_max_ns;
@@ -2878,6 +3397,12 @@ static int comb_key(const NV2ATextureCopy *s, unsigned hwmask, CombKey *k)
  * own library (see vsh_pipeline_for) and asking Metal for a specialised
  * function compiles it. nil on failure; a full table still answers the
  * generic request, uncached, because the generic function is the fallback. */
+/* THREADS: the background pipeline jobs call this too (the specialised
+ * functions, and a new program library's generic ones), so the table is under
+ * a mutex -- held for the scan and the insert, never across a compile. Two
+ * threads asking for the same function at once may both compile it; the
+ * second insert is then a harmless duplicate. */
+static pthread_mutex_t spec_fn_mu = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey *ck)
 {
     const void *lp = (__bridge const void *)lib;
@@ -2885,11 +3410,16 @@ static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey
     unsigned i;
     h = spec_hash(name.UTF8String, strlen(name.UTF8String), h);
     if (ck) h = spec_hash(ck, sizeof *ck, h);
+    pthread_mutex_lock(&spec_fn_mu);
     for (i = 0; i < spec_fn_n; ++i)
         if (spec_fn[i].h == h && spec_fn[i].lib == lp && spec_fn[i].generic == !ck
             && [spec_fn[i].name isEqualToString:name]
-            && (!ck || !memcmp(&spec_fn[i].ck, ck, sizeof *ck)))
-            return spec_fn[i].fn;
+            && (!ck || !memcmp(&spec_fn[i].ck, ck, sizeof *ck))) {
+            id<MTLFunction> hit = spec_fn[i].fn;
+            pthread_mutex_unlock(&spec_fn_mu);
+            return hit;
+        }
+    pthread_mutex_unlock(&spec_fn_mu);
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
     bool on = ck != NULL;
     [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
@@ -2916,6 +3446,7 @@ static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey
                              err ? err.localizedDescription.UTF8String : "(no error)");
         return nil;
     }
+    pthread_mutex_lock(&spec_fn_mu);
     if (ck) ++g_spec_fns; else ++g_spec_generic_fns;
     if (spec_fn_n < SPEC_FN_CACHE) {
         spec_fn[spec_fn_n].lib = lp; spec_fn[spec_fn_n].name = name;
@@ -2923,6 +3454,7 @@ static id<MTLFunction> frag_fn(id<MTLLibrary> lib, NSString *name, const CombKey
         if (ck) spec_fn[spec_fn_n].ck = *ck; else memset(&spec_fn[spec_fn_n].ck, 0, sizeof(CombKey));
         spec_fn[spec_fn_n].fn = fn; ++spec_fn_n;
     }
+    pthread_mutex_unlock(&spec_fn_mu);
     return fn;
 }
 
@@ -2949,6 +3481,11 @@ static id<MTLRenderPipelineState> spec_pipeline_for(const NV2ATextureCopy *s, un
             && spec_pso[i].blend == s->blend && spec_pso[i].src == s->blend_src
             && spec_pso[i].dst == s->blend_dst && spec_pso[i].sblend == sblend
             && spec_pso[i].early == early && !memcmp(&spec_pso[i].ck, &ck, sizeof ck)) {
+            /* Still compiling: the generic pipeline, which renders the same
+             * pixels, and not a fallback -- nothing was refused. */
+            if (__atomic_load_n(&spec_pso[i].pending, __ATOMIC_ACQUIRE)) {
+                ++g_pipe_spec_pending_draws; return nil;
+            }
             if (spec_pso[i].failed) { ++g_spec_fb_failed; return nil; }
             ++g_spec_hits; return spec_pso[i].pso;
         }
@@ -2961,47 +3498,68 @@ static id<MTLRenderPipelineState> spec_pipeline_for(const NV2ATextureCopy *s, un
         df = nv2a_metal_blend_factor(s->blend_dst);
         if (sf < 0 || df < 0) return nil;
     }
-    unsigned long long t0 = mtl_now_ns();
+    /* The descriptor is built HERE, on the draw thread, so every lazily read
+     * switch it consults (hw_565_on, spec_control_on via frag_fn) has been read
+     * before a job exists; the job only adds the fragment function and asks
+     * Metal. */
+    (void)spec_control_on();
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    id<MTLRenderPipelineState> pso = nil;
-    NSError *err = nil;
     d.vertexFunction = prog ? prog->fn : hw_vs;
-    d.fragmentFunction = frag_fn(prog ? prog->library : hw_library,
-                                 early == 2 ? @"fs_hw_early_nw"
-                               : early  ? @"fs_hw_early"
-                               : sblend ? @"fs_hw_blend" : @"fs_hw", &ck);
-    if (d.vertexFunction && d.fragmentFunction) {
-        d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
-                                                        : MTLPixelFormatRGBA32Float;
-        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-        d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
-        if (s->blend && !sblend) {
-            d.colorAttachments[0].blendingEnabled = YES;
-            d.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-            d.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-            d.colorAttachments[0].sourceRGBBlendFactor = (MTLBlendFactor)sf;
-            d.colorAttachments[0].destinationRGBBlendFactor = (MTLBlendFactor)df;
-            d.colorAttachments[0].sourceAlphaBlendFactor = (MTLBlendFactor)sf;
-            d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
-        }
-        pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
-        if (!pso) {
-            static int told;
-            if (!told++) fprintf(stderr, "[METAL] specialised pipeline failed: %s\n",
-                                 err ? err.localizedDescription.UTF8String : "(no error)");
-        }
+    d.colorAttachments[0].pixelFormat = hw_565_on() ? MTLPixelFormatB5G6R5Unorm
+                                                    : MTLPixelFormatRGBA32Float;
+    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    d.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+    if (s->blend && !sblend) {
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        d.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        d.colorAttachments[0].sourceRGBBlendFactor = (MTLBlendFactor)sf;
+        d.colorAttachments[0].destinationRGBBlendFactor = (MTLBlendFactor)df;
+        d.colorAttachments[0].sourceAlphaBlendFactor = (MTLBlendFactor)sf;
+        d.colorAttachments[0].destinationAlphaBlendFactor = (MTLBlendFactor)df;
     }
-    {   unsigned long long dt = mtl_now_ns() - t0;
-        g_spec_compile_ns += dt; if (dt > g_spec_compile_max_ns) g_spec_compile_max_ns = dt; }
-    spec_pso[spec_pso_n].vfn = vfn; spec_pso[spec_pso_n].h = h; spec_pso[spec_pso_n].ck = ck;
-    spec_pso[spec_pso_n].blend = s->blend; spec_pso[spec_pso_n].src = s->blend_src;
-    spec_pso[spec_pso_n].dst = s->blend_dst; spec_pso[spec_pso_n].sblend = sblend;
-    spec_pso[spec_pso_n].early = early;
-    spec_pso[spec_pso_n].pso = pso; spec_pso[spec_pso_n].failed = pso == nil;
-    ++spec_pso_n;
-    if (!pso) { ++g_spec_fb_failed; return nil; }
-    ++g_spec_built;
-    return pso;
+    unsigned slot = spec_pso_n++;
+    spec_pso[slot].vfn = vfn; spec_pso[slot].h = h; spec_pso[slot].ck = ck;
+    spec_pso[slot].blend = s->blend; spec_pso[slot].src = s->blend_src;
+    spec_pso[slot].dst = s->blend_dst; spec_pso[slot].sblend = sblend;
+    spec_pso[slot].early = early;
+    spec_pso[slot].pso = nil; spec_pso[slot].failed = 0;
+    {
+        id<MTLLibrary> lib = prog ? prog->library : hw_library;
+        NSString *fname = early == 2 ? @"fs_hw_early_nw"
+                        : early      ? @"fs_hw_early"
+                        : sblend     ? @"fs_hw_blend" : @"fs_hw";
+        CombKey kc = ck;
+        void (^build)(void) = ^{
+            id<MTLRenderPipelineState> pso = nil;
+            NSError *err = nil;
+            d.fragmentFunction = frag_fn(lib, fname, &kc);
+            if (d.vertexFunction && d.fragmentFunction) {
+                pso = pipe_create(d, &err);
+                if (!pso) {
+                    static int told;
+                    if (!told++) fprintf(stderr, "[METAL] specialised pipeline failed: %s\n",
+                                         err ? err.localizedDescription.UTF8String : "(no error)");
+                }
+            }
+            spec_pso[slot].pso = pso; spec_pso[slot].failed = pso == nil;
+            if (pso) __atomic_fetch_add(&g_spec_built, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&spec_pso[slot].pending, 0, __ATOMIC_RELEASE);
+        };
+        if (async_pipelines_on()) {
+            spec_pso[slot].pending = 1;
+            pipe_submit(PK_SPEC, build);
+            ++g_pipe_spec_pending_draws;
+            return nil;
+        }
+        {   uint64_t t0 = mtl_now_ns(), dt;
+            @autoreleasepool { build(); }
+            dt = mtl_now_ns() - t0;
+            pipe_account(PK_SPEC, 1, dt);
+            g_spec_compile_ns += dt; if (dt > g_spec_compile_max_ns) g_spec_compile_max_ns = dt; }
+    }
+    if (spec_pso[slot].failed) { ++g_spec_fb_failed; return nil; }
+    return spec_pso[slot].pso;
 }
 
 static void spec_report(void)
@@ -3009,7 +3567,7 @@ static void spec_report(void)
     uint64_t fb = g_spec_fb_full + g_spec_fb_failed + g_spec_fb_wide;
     fprintf(stderr, "[METAL] combiner specialisation: built=%llu hits=%llu fallbacks=%llu"
             " (cache full %llu, compile failed %llu, >8 stages %llu); %llu specialised"
-            " functions, %llu generic; %.1f ms compiling, worst %.1f ms"
+            " functions, %llu generic; %.1f ms compiling on the draw thread, worst %.1f ms"
             " (metal_specialise_combiners %s)%s\n",
             (unsigned long long)g_spec_built, (unsigned long long)g_spec_hits,
             (unsigned long long)fb, (unsigned long long)g_spec_fb_full,
@@ -4155,6 +4713,7 @@ void nv2a_metal_report(void)
             (unsigned long long)g_hw_state_refusals,
             hw_state_on()?"on":"OFF");
     spec_report();
+    pipe_report();
     /* THE BISECT ARMS NAME THEMSELVES, in both states and unconditionally.
      *
      * Each of these renders incorrectly by construction, so a run carrying one

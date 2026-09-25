@@ -209,6 +209,15 @@ VALUE_CARRYING = {
     # commit where raising it rendered black, because eviction is the
     # writeback, so the number is the experiment and a boolean would delete it.
     "RECOMP_METAL_SURFACE_SLOTS",
+    # The Metal pipeline archive's directory (a path), how many background
+    # queues compile pipelines (a count), and a number mixed into the MSL so
+    # Metal's own shader cache misses and a COLD compile can be measured on a
+    # machine that has run the game -- all value-carrying. The booleans of the
+    # set (RECOMP_METAL_ASYNC_PIPELINES, _ASYNC_VSH, _PIPELINE_ARCHIVE,
+    # _PIPELINE_HOLD) go through the helpers.
+    "RECOMP_METAL_PIPELINE_ARCHIVE_DIR",
+    "RECOMP_METAL_PIPELINE_THREADS",
+    "RECOMP_METAL_SHADER_NONCE",
     # The analogue stick dead zone, as a number. Zero is a meaningful setting
     # -- it is the arm that asks whether the dead zone is what is eating small
     # stick deflections -- so presence is the right test and "0" must not mean

@@ -171,6 +171,11 @@ const char *nv2a_metal_last_reject(void);
 unsigned long long nv2a_metal_sync_ns(void);
 /* Compact cumulative counters for live performance validation. */
 void nv2a_metal_report(void);
+/* Wait for every pipeline and vertex-program library compiling in the
+ * background (RECOMP_METAL_ASYNC_PIPELINES / RECOMP_METAL_ASYNC_VSH), and for
+ * the pipeline archive to be written; releases RECOMP_METAL_PIPELINE_HOLD for
+ * the jobs already queued. For tests; the game never needs to call it. */
+void nv2a_metal_pipelines_settle(void);
 /* Command-buffer accounting (RECOMP_METAL_CB_STATS=1). The frame count is
  * bumped by the pushbuffer executor at the guest's own frame boundary,
  * NV097_FLIP_STALL, because this file has no notion of a frame. */
