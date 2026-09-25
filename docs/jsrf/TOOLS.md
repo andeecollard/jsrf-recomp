@@ -20,7 +20,7 @@ asking someone to play to it. Every switch below is read from the environment
 
 | tool | what it does |
 |---|---|
-| `RECOMP_FLIGHT_FRAMES=N` + **M** | Keeps the last N presented frames and a one-line record of every draw in each. Pressing M in the game window (the pad mark) writes them to `RECOMP_FLIGHT_DIR` as `flight-K/frame-NNNN.bmp` + `draws-NNNN.txt`. `RECOMP_FLIGHT_AT=<guest frame>` triggers the same write without a keyboard. |
+| `RECOMP_FLIGHT_FRAMES=N` + **M** | Keeps the last N presented frames and a one-line record of every draw in each. Pressing M in the game window (the pad mark) writes them to `RECOMP_FLIGHT_DIR` as `flight-K/frame-NNNN.bmp` + `draws-NNNN.txt`. `RECOMP_FLIGHT_AT=<guest frame>` triggers the same write without a keyboard. Each draw line ends with its colour and zeta target, whether the host drew it, and whether texture 0/1 were behind the GPU at the draw (1 bound surface dirty, 2 a slot owes guest RAM); each file names the surface bound at the flip (G73). |
 | `gametools/frame_match.py <run A> <run B>` | Pairs every presented frame of one run with the closest frame of another and scores the pixels that differ. Use it to A/B a renderer change against the executor arm on the same scene: motion scores ~2-15%, a broken picture ~80% (25 Sep: it caught a frozen-frame bug that VERIFY and the glitch watch both passed). |
 | `flight_diff.py <flight dir>` | Names the draw states that come and go between neighbouring frames, and the largest picture changes. |
 | `RECOMP_FLIGHT_XF_DRAW` | Adds the full vertex-program constant file per draw to the flight record (how the G57 bone-matrix blow-up was found). |
@@ -34,6 +34,20 @@ asking someone to play to it. Every switch below is read from the environment
 **Presentation lag.** The presented frame is snapshotted at the swap's
 FLIP_STALL, before the swap's copy quad runs, so `frame-N.bmp` shows the scene
 drawn in `draws-(N-2).txt`. Pair frames and draw lists with that offset.
+The copy quad is the first draw of each list: the executor samples the back
+buffer 0x5F0000 (linear R5G6B5) into one of the two front buffers, 0x688000
+or 0x71E000, and the flip names the other one.
+
+**Scene-match before frame_match (G73).** `RECOMP_FLIGHT_AT` names a guest
+frame, and a chapter jump fires at a different one in every arm, so the same
+guest frame is a different moment of the stage. The score then counts a
+radio line or a crowd as picture error (12-24% in arms that render
+identically). For free play use `RECOMP_FLIGHT_AT_FREEPLAY=<n>`: n
+consecutive flips into free play, the same moment in every arm (0.0-0.8%
+between host and executor). For a cutscene use `RECOMP_CHAPTER_JUMP_MARK=1`
+with `RECOMP_FLIP_PACE=1`: the write lands at the event's end. Dialogue that
+the harness advances by pressing A (the Garage's Corn scene) follows the
+wall clock, so it cannot be matched by frame at all.
 
 ## Read the game's own state
 
