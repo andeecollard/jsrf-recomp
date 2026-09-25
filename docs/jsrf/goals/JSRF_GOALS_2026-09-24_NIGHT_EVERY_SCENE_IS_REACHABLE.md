@@ -159,3 +159,37 @@ documentation refreshed (ab41d8e), upstream frndint PR prepared and not sent
 
 **Running:** a whole-game map (one mission per chapter/stage, ~60 targets):
 loads, faults, hangs, picture, frame time.
+
+## Progress, 25 Sep (morning): the whole-game map, and Sky Dino 3× faster
+
+**G67 — the game map** (9a7f3b8, `gametools/GAME_MAP_2026-09-25.md` + contact
+sheet; launchers `map_run.sh`/`map_batch.sh`/`map_report.py`). 64 targets —
+every chapter hub and all 20 stages with free play — plus 4 follow-ups, ~50 s
+of free play each, glitch watch armed. **No fault, no crash in 68 runs; every
+stage reached free play; every picture sane; no texture-format refusals.**
+Frame time (capped at 60 Hz by `RECOMP_FLIP_PACE`, the compiled default):
+Garage 18 ms, Rokkaku-dai 18–22, Dogenzaka 22–24, Shibuya Terminal 27–30,
+99th St 30–31, Skyscraper 33–37 (4:70 75–81), Sky Dino 98–110.
+
+**G68 — texture cache thrash: fixed** (1d71f78). Sky Dino rebuilt ~110
+hardware textures every frame with none changing: the 128-slot LRU was
+smaller than its working set. `RECOMP_METAL_TEXTURE_SLOTS`, default now 512:
+6:60 p50 **99.0 → 34.0 ms**, texture builds 53,514 → 341; Rokkaku-dai 19.4 →
+19.7 ms (the linear lookup's cost; a hashed lookup would remove it).
+
+**Open from the map:**
+- **G69 — free-play hang in Sewage Facility (3:60)**, 1 of 2 runs, ~10 s in:
+  frames stop, the report keeps printing, kernel calls grow slowly, pushbuffer
+  not consumed, ADX lock not held — a wait, not the G66 spin. Log
+  `~/jsrf-build/runs/map/runs/m0360/runtime.log` from l.51730.
+- **Performance below 60 fps** in most stages: the cost is spread over vertex
+  shading, submit and guest time (~8–9 ms each) plus 2–4 ms GPU sync — the
+  D3D lift (G50–G52) is the lever. Skyscraper re-measure after G68.
+- Shibuya 2:10 slowed to 48–158 ms late in one run (guest "rest" time); not
+  reproduced in five other Shibuya runs.
+- 8:90 (Gouji Tower) looks like 8:11 (stg43); check against xemu.
+- Cosmetic: the jump log names briefing-card follow-ons as `mssn04481` etc.
+
+**G66 fix merged** (f15924e: per-thread priority restore, unmatched-unlock
+safety — both default on — and `RECOMP_ADX_TRACE`); unit tests incl. the exact
+poisoning interleave pass; 10 in-game runs of 4:96 with the trace running.
