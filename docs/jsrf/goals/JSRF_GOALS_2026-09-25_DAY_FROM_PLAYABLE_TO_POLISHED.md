@@ -112,3 +112,22 @@ unattended runs while the player plays.
 (xemu); performance beyond 60 fps in heavy stages (the D3D lift); G63 Poison
 Jam chase cutscenes (needs the chase); G69 pushbuffer desync (post-mortem
 armed).
+
+## G71 — the thin line above text: probably authentic (25 Sep, midday)
+
+A 50 % bilinear blend of the atlas row above the glyph cell. In Corn's
+"This is the GG's Garage. / Hey, where's our pizza?" only the four 's' glyphs
+show it: a ~9 px grey dash on the quad's top pixel row. The cell above 's' is
+'g', whose descender reaches the cell's last row (alpha 4/15) in the SHIPPED
+font (the atlas page in guest RAM is byte-for-byte jetfont.dat at 1048832).
+The text vertex program's 0.53125 bias, truncated to 1/16, puts the quad's top
+edge at exactly a pixel centre; the top-left rule includes the row, and v there
+is exactly the cell boundary, so bilinear weights the two rows 50/50 (measured
+≈0.54). Hardware coverage (abaire's nxdk_pgraph_tests goldens,
+Vertex_shader_rounding) and xemu (trunc(pos*16)/16, GL bilinear, passes those
+tests) make the same choices; filter, wrap, texel centre and DXT3 decode all
+check out. So our pixels should match xemu and the console. **Not changed.**
+To close: an xemu capture of that line, zoomed above each 's' (x 143–151 and
+174–182, y 60 at 640×480). An opt-in "clamp bilinear to the glyph cell" switch
+is possible as a documented enhancement, not a correctness fix. Evidence in the
+25 Sep session scratchpad (G71-*.png, run-before, run-glyph, cap1).

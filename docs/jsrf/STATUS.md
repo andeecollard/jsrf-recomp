@@ -33,7 +33,7 @@ each line are in the newest file in `goals/` (25 Sep: `JSRF_GOALS_2026-09-25_DAY
 | frame time | capped at 60 Hz: most stages 18–31 ms, Skyscraper 33–37, Sky Dino 34 after the texture-cache fix (was 99–110) | measured: 25 Sep game map (68 runs) and a same-binary A/B; the player reports performance better |
 | occasional hitches | fixed (G70): pipelines compile off the draw thread and persist; 28 ms of compile wait in a whole session (was 5.66 s), worst frame 189 ms (was 6.3 s) | player session 25 Sep, measured |
 | tutorial boost | looks right now (G72 closed) | player session 25 Sep |
-| thin line above text | open (G71) | player report 25 Sep |
+| thin line above text | probably authentic (G71): bilinear blend of a descender in the shipped font atlas at a cell boundary, with hardware-exact edge rules; pending an xemu capture | measured 25 Sep |
 | whole game | every chapter hub and all 20 free-play stages load and play with no fault; 74 jump-reachable cutscenes with no fault; two intermittent hangs mitigated/instrumented (G66, G69) | measured: game map and cutscene sweep, 25 Sep |
 
 ## Fixed 21 September 2026 — the Load screen, the light, and the character select
