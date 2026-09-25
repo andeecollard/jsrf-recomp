@@ -21,6 +21,7 @@ asking someone to play to it. Every switch below is read from the environment
 | tool | what it does |
 |---|---|
 | `RECOMP_FLIGHT_FRAMES=N` + **M** | Keeps the last N presented frames and a one-line record of every draw in each. Pressing M in the game window (the pad mark) writes them to `RECOMP_FLIGHT_DIR` as `flight-K/frame-NNNN.bmp` + `draws-NNNN.txt`. `RECOMP_FLIGHT_AT=<guest frame>` triggers the same write without a keyboard. |
+| `gametools/frame_match.py <run A> <run B>` | Pairs every presented frame of one run with the closest frame of another and scores the pixels that differ. Use it to A/B a renderer change against the executor arm on the same scene: motion scores ~2-15%, a broken picture ~80% (25 Sep: it caught a frozen-frame bug that VERIFY and the glitch watch both passed). |
 | `flight_diff.py <flight dir>` | Names the draw states that come and go between neighbouring frames, and the largest picture changes. |
 | `RECOMP_FLIGHT_XF_DRAW` | Adds the full vertex-program constant file per draw to the flight record (how the G57 bone-matrix blow-up was found). |
 | `RECOMP_GLITCH_WATCH=1` | Detects frames that differ from both neighbours while the neighbours match (one-frame dropouts and short runs) live, and writes only those frames and their draws. |
