@@ -102,6 +102,7 @@ HANDROLLED_BASELINE = 125
 # 128 and are not enumerated here; migrating them out is a separate pass that
 # would lower the baseline. This list is for NEW ones.
 VALUE_CARRYING = {
+    'RECOMP_METAL_TEXTURE_SLOTS',   # a slot count, clamped 16..1024
     # Milliseconds and a port number, not booleans: the XInput lift's pad
     # enumeration delay and which port the host pad occupies (G49).
     "RECOMP_XINPUT_ENUM_MS",

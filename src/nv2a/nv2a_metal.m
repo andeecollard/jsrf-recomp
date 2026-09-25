@@ -538,7 +538,29 @@ static int surface_valid,surface_dirty,depth_valid,depth_dirty,attempted;
 static pthread_mutex_t initialization_mutex=PTHREAD_MUTEX_INITIALIZER;
 static const char *reject_reason;
 
-#define TEXTURE_CACHE_SIZE 128
+/* RECOMP_METAL_TEXTURE_SLOTS=<n> (default 512, max TEXTURE_CACHE_MAX): how
+ * many guest textures stay resident. 25 Sep 2026 game map: Sky Dino (6:60,
+ * 7:60, 9:60) rebuilt 107-110 hardware textures EVERY frame with the
+ * texture-change counter flat -- the working set is larger than 128, so the
+ * LRU below evicts and re-decodes the same textures each frame, 98-110 ms a
+ * frame; Skyscraper (4:70) the same at 71 per frame. A value, so an A/B can
+ * measure it without a rebuild. The lookup is a linear scan, which is why
+ * the default is not simply the maximum. Measured 25 Sep, 50 s free play
+ * each: Sky Dino 6:60 99.0 -> 34.0 ms p50 (rebuilds 53,514 -> 341) at 512;
+ * Rokkaku-dai 2:40 19.4 -> 19.7 ms mean, the scan's cost. */
+#define TEXTURE_CACHE_MAX 1024
+static unsigned texture_slots(void)
+{
+    static unsigned n;
+    if (!n) {
+        const char *e = getenv("RECOMP_METAL_TEXTURE_SLOTS");
+        unsigned long v = (e && *e) ? strtoul(e, NULL, 10) : 512;
+        n = v < 16 ? 16 : v > TEXTURE_CACHE_MAX ? TEXTURE_CACHE_MAX : (unsigned)v;
+        fprintf(stderr, "[METAL] texture cache: %u slots (RECOMP_METAL_TEXTURE_SLOTS)\n", n);
+    }
+    return n;
+}
+#define TEXTURE_CACHE_SIZE (texture_slots())
 typedef struct {
     const uint8_t *source;
     size_t size;
@@ -553,7 +575,7 @@ typedef struct {
     uint32_t hw_key[5];
     uint8_t hw_min_a, hw_max_a;   /* G38c: alpha range over every uploaded level */
 } TextureBuffer;
-static TextureBuffer texture_cache[TEXTURE_CACHE_SIZE];
+static TextureBuffer texture_cache[TEXTURE_CACHE_MAX];
 static id<MTLBuffer> dummy_buffer;
 static uint64_t texture_clock,texture_requests,texture_hits,texture_uploads;
 /* The entry texture_buffer() last returned, so texture_hw() can attach its
@@ -3199,7 +3221,8 @@ static id<MTLBuffer> texture_buffer(const uint8_t *data,size_t size)
     }
     ++texture_requests;
     TextureBuffer *slot=NULL,*oldest=&texture_cache[0];
-    for(unsigned i=0;i<TEXTURE_CACHE_SIZE;i++) {
+    const unsigned nslots=TEXTURE_CACHE_SIZE;
+    for(unsigned i=0;i<nslots;i++) {
         TextureBuffer *entry=&texture_cache[i];
         if(entry->source==data&&entry->size==size) {
             slot=entry;
