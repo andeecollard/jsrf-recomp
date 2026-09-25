@@ -1646,10 +1646,12 @@ static void pipe_archive_add(MTLRenderPipelineDescriptor *d) API_AVAILABLE(macos
 /* THE ONE PLACE A PIPELINE IS BUILT. The archive first, with a miss being a
  * failure rather than a compile, so a hit is counted and not guessed at; then
  * an ordinary compile, recorded for the next session. Callable from any
- * thread: the read archives are immutable, the write archive is g_arch_q's. */
-static id<MTLRenderPipelineState> pipe_create(MTLRenderPipelineDescriptor *d, NSError **err)
+ * thread: the read archives are immutable, the write archive is g_arch_q's.
+ * *hit (optional) is 1 for an archive hit, 0 for a compile. */
+static id<MTLRenderPipelineState> pipe_build(MTLRenderPipelineDescriptor *d, NSError **err, int *hit)
 {
     id<MTLRenderPipelineState> pso;
+    if (hit) *hit = 0;
     if (@available(macOS 11.0, *)) {
         if (g_arch_read.count) {
             /* One lookup at a time. Metal does not document MTLBinaryArchive
@@ -1664,14 +1666,50 @@ static id<MTLRenderPipelineState> pipe_create(MTLRenderPipelineDescriptor *d, NS
                                                        options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                     reflection:nil error:nil];
             pthread_mutex_unlock(&lookup_mu);
-            if (pso) { __atomic_fetch_add(&g_arch_hits, 1, __ATOMIC_RELAXED); return pso; }
+            d.binaryArchives = nil;
+            if (pso) { if (hit) *hit = 1; return pso; }
         }
-        if (g_arch_write) __atomic_fetch_add(&g_arch_misses, 1, __ATOMIC_RELAXED);
     }
     pso = [device newRenderPipelineStateWithDescriptor:d error:err];
     if (@available(macOS 11.0, *))
         if (pso && g_arch_write) pipe_archive_add([d copy]);
     return pso;
+}
+static id<MTLRenderPipelineState> pipe_create(MTLRenderPipelineDescriptor *d, NSError **err)
+{
+    int hit = 0;
+    id<MTLRenderPipelineState> pso = pipe_build(d, err, &hit);
+    if (hit) __atomic_fetch_add(&g_arch_hits, 1, __ATOMIC_RELAXED);
+    else if (g_arch_write) __atomic_fetch_add(&g_arch_misses, 1, __ATOMIC_RELAXED);
+    return pso;
+}
+
+/* THE HOST'S PIPELINES GO IN THE SAME ARCHIVE (G70 for d3d8_host_2d_metal.m).
+ * Its specialised fragment pipelines, and above all its programmable and
+ * GPU fixed-function ones (G51.2, G52), which compile on the draw thread
+ * because nothing can stand in for their vertex function, were compiled
+ * afresh every session. They are looked up and recorded exactly as the
+ * executor's are, in this session's shard, so the shard's `added` counts
+ * both; the executor's hits and misses above count only its own, and the
+ * host counts its own from *hit. A device other than the executor's (the
+ * host's unit tests run without one) compiles plainly: an archive belongs
+ * to one device. Returns a +1 reference (the caller takes it with
+ * __bridge_transfer), or NULL with the error in *err_out when given. */
+void *nv2a_metal_pipeline_create(void *descriptor, void *dev, int *hit, char *err_out, size_t err_size)
+{
+    MTLRenderPipelineDescriptor *d = (__bridge MTLRenderPipelineDescriptor *)descriptor;
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pso;
+    if (hit) *hit = -1;
+    if (!d || !dev) return NULL;
+    if (initialize() && (__bridge id<MTLDevice>)dev == device && pipe_archive_on()) {
+        pso = pipe_build(d, &err, hit);
+        if (hit && *hit == 0 && !g_arch_write && !g_arch_read.count) *hit = -1;
+    } else {
+        pso = [(__bridge id<MTLDevice>)dev newRenderPipelineStateWithDescriptor:d error:&err];
+    }
+    if (!pso && err_out && err_size) snprintf(err_out, err_size, "%s", err ? err.localizedDescription.UTF8String : "?");
+    return pso ? (__bridge_retained void *)pso : NULL;
 }
 
 /* THE FALLBACK HAS TO BE WARM TOO. A draw whose specialised pipeline is still

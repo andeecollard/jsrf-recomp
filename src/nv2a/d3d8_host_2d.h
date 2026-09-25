@@ -207,6 +207,13 @@ int d3d8_host_vs_mode(void);
  * count. NULL if the translator or compiler refused it. Executor thread. */
 void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs);
 void *nv2a_metal_ff_function(const void *key, unsigned keysize, uint16_t inputs, unsigned *nattrs);
+/* G70 for the host: build a pipeline (an MTLRenderPipelineDescriptor) through
+ * the executor's pipeline archive, when `dev` is the executor's device and the
+ * archive is on; plainly otherwise. *hit: 1 archive hit, 0 compiled and
+ * recorded, -1 no archive. Returns a +1 id<MTLRenderPipelineState>, or NULL
+ * with the reason in err_out. Any thread. */
+void *nv2a_metal_pipeline_create(void *descriptor, void *dev, int *hit, char *err_out, size_t err_size);
+void d3d8_host_2d_metal_pipe_stats(char *buf, size_t n);
 /* G52: FIXED-FUNCTION VERTICES ON THE GPU (RECOMP_D3D8_HOST_FF_GPU=1). The
  * host's fixed-function draws evaluated every vertex on the CPU through
  * nv2a_ff_vertex -- 23-31 us a draw, 3.5-4.8 ms a frame in Shibuya Terminal
@@ -311,6 +318,8 @@ typedef struct {
     void (*geom_stats)(unsigned long long *differ, unsigned long long *variants);
     /* Optional: d3d8_host_2d_metal_spec_stats, for the draw-mode report. */
     void (*spec_stats)(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
+    /* Optional: d3d8_host_2d_metal_pipe_stats, the host's pipeline-archive line (G70). */
+    void (*pipe_stats)(char *buf, size_t n);
     /* Optional (G51.2 positive control): the executor's own begin/end batches
      * by 0x1E94's MODE field -- [0] FIXED, [1] PROGRAM (the 2D pass-through
      * and the title's shaders alike), [2] the reserved values -- counted whether or not

@@ -5210,6 +5210,7 @@ int main(int argc, char **argv)
                 { extern void nv2a_pb_exec_host_skip_late(int);
                   nv2a_pb_exec_host_skip_late((d3d8_host_2d_bisect() & 128u) != 0); }
                 be.spec_stats = d3d8_host_2d_metal_spec_stats;
+                be.pipe_stats = d3d8_host_2d_metal_pipe_stats;
                 be.bind_ns = d3d8_host_2d_metal_bind_ns;
                 be.geom_stats = d3d8_host_2d_metal_geom_stats;
                 /* G51.3: the FF shadow evaluates vertices with the executor's own unit. */

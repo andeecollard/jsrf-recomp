@@ -295,6 +295,36 @@ static int s_init_done;
 const char *d3d8_host_2d_metal_last_error(void) { return s_err ? s_err : "none"; }
 static int fail(const char *why) { s_err = why; return -1; }
 
+/* G70 FOR THE HOST: every pipeline this file builds goes through the
+ * executor's pipeline archive (nv2a_metal_pipeline_create), so a second
+ * session finds it instead of compiling it. The counts are the host's own:
+ * archive hits, compiles (misses while the archive is on), and the time the
+ * DRAW thread spent building pipelines -- the in-line compiles a programmable
+ * or GPU fixed-function draw cannot avoid (nothing stands in for its vertex
+ * function), which were the host's share of the G70 hitches. */
+static _Atomic unsigned long long s_pa_hits, s_pa_compiles, s_pa_plain;
+static unsigned long long s_pa_wait_ns, s_pa_wait_max_ns, s_pa_wait_n;   /* the draw thread only */
+static id<MTLRenderPipelineState> make_pipeline(MTLRenderPipelineDescriptor *pd, NSError **err)
+{
+    char why[256] = "";
+    int hit = -1;
+    void *p = nv2a_metal_pipeline_create((__bridge void *)pd, (__bridge void *)s_dev, &hit, why, sizeof why);
+    if (hit == 1) atomic_fetch_add(&s_pa_hits, 1);
+    else if (hit == 0) atomic_fetch_add(&s_pa_compiles, 1);
+    else atomic_fetch_add(&s_pa_plain, 1);
+    if (!p && err)
+        *err = [NSError errorWithDomain:@"jsrf.host" code:1
+                               userInfo:@{ NSLocalizedDescriptionKey: [NSString stringWithUTF8String:why] }];
+    return p ? (__bridge_transfer id<MTLRenderPipelineState>)p : nil;
+}
+void d3d8_host_2d_metal_pipe_stats(char *buf, size_t n)
+{
+    snprintf(buf, n, "pipeline archive: hits %llu, compiled %llu, compiled without the archive %llu | draw thread"
+             " built pipelines for %.1f ms over %llu in-line builds, worst %.1f ms",
+             (unsigned long long)atomic_load(&s_pa_hits), (unsigned long long)atomic_load(&s_pa_compiles),
+             (unsigned long long)atomic_load(&s_pa_plain), s_pa_wait_ns / 1e6, s_pa_wait_n, s_pa_wait_max_ns / 1e6);
+}
+
 static int init(void)
 {
     pthread_mutex_lock(&s_init_mu);
@@ -328,10 +358,10 @@ static int init(void)
         }
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-        s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        s_pso = make_pipeline(pd, &err);
         /* Draw mode's: the executor's hardware path attaches Stencil8 beside depth. */
         pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
-        s_pso_st = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        s_pso_st = make_pipeline(pd, &err);
         if (!s_pso || !s_pso_st) {
             fprintf(stderr, "[D3D8-HOST-2D] pipeline failed: %s\n", err ? err.localizedDescription.UTF8String : "?");
             s_err = "host 2d: pipeline"; goto out;
@@ -584,7 +614,7 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
             pd.colorAttachments[0].pixelFormat = MTLPixelFormatB5G6R5Unorm;
             pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
             if (stencil) pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
-            pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            pso = make_pipeline(pd, &err);
         }
         if (!pso) {
             static _Atomic int told;
@@ -608,6 +638,8 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
         NSError *err = nil;
         id<MTLFunction> fn = nil;
         @autoreleasepool { fn = [s_lib newFunctionWithName:name constantValues:cv error:&err]; finish(fn, err); }
+        {   uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+            s_pa_wait_ns += w; ++s_pa_wait_n; if (w > s_pa_wait_max_ns) s_pa_wait_max_ns = w; }
         s_spec_compile_ns = atomic_load(&s_spec_compile_ns_a); s_spec_built = atomic_load(&s_spec_built_a);
         if (atomic_load_explicit(&s_spec[slot].state, memory_order_acquire) == 1) return s_spec[slot].pso;
         ++s_spec_fallback;

@@ -1963,6 +1963,11 @@ void d3d8_host_2d_report(const char *why)
                             " draws on the generic interpreter (compiling, full or failed) %llu | binding the target (a GPU drain each) %.1f ms over"
                             " %llu binds\n", why, b, ns / 1e6, h, f,
                     s_be.bind_ns ? s_be.bind_ns() / 1e6 : 0.0, s_be.external_binds ? s_be.external_binds() : 0ull);
+            if (s_be.pipe_stats) {
+                char pb[320];
+                s_be.pipe_stats(pb, sizeof pb);
+                fprintf(stderr, "[D3D8-HOST-2D] %s %s\n", why, pb);
+            }
             if (s_be.geom_stats) {
                 unsigned long long gd = 0, gv = 0;
                 s_be.geom_stats(&gd, &gv);
