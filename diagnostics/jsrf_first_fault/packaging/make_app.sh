@@ -176,6 +176,7 @@ die() {
 }
 
 if [ -f "$CONF" ]; then . "$CONF"; fi
+#@LIFT_DEFAULTS@
 
 probe_readable() {
     # READ A BYTE, do not just stat. A GUI-launched app has its own TCC
@@ -252,6 +253,21 @@ RECOMP_HDD_ROOT="$JSRF_HDD_ROOT" \
 RECOMP_PB_EXEC=1 RECOMP_METAL=1 RECOMP_OHCI_ATTACH=1 \
 exec "$HERE/jsrf-engine" >"$LOG" 2>&1
 LAUNCH
+# JSRF_APP_LIFT=1 bakes the D3D lift (G50-G52) on as the launcher's default.
+# The defaults apply AFTER paths.conf, and only to names it left unset, so a
+# player can still turn a class off there (RECOMP_D3D8_HOST_FF=off). Without
+# JSRF_APP_LIFT the placeholder is removed and nothing changes.
+if [ "${JSRF_APP_LIFT:-0}" = 1 ]; then
+    LIFT='# D3D lift on by default (built with JSRF_APP_LIFT=1); override in paths.conf\
+export RECOMP_D3D8_HOST_2D="${RECOMP_D3D8_HOST_2D:-draw}"\
+export RECOMP_D3D8_HOST_FF="${RECOMP_D3D8_HOST_FF:-draw}"\
+export RECOMP_D3D8_HOST_VS="${RECOMP_D3D8_HOST_VS:-draw}"\
+export RECOMP_D3D8_HOST_FF_GPU="${RECOMP_D3D8_HOST_FF_GPU:-1}"'
+    sed -i '' "s|^#@LIFT_DEFAULTS@\$|$LIFT|" "$APP/Contents/MacOS/JSRF"
+    echo "  lift:    on by default (JSRF_APP_LIFT=1)"
+else
+    sed -i '' '/^#@LIFT_DEFAULTS@$/d' "$APP/Contents/MacOS/JSRF"
+fi
 chmod +x "$APP/Contents/MacOS/JSRF"
 
 # --- Info.plist -------------------------------------------------------------
