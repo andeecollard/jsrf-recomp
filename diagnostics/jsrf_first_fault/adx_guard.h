@@ -214,7 +214,7 @@ void adx_prio_note_clamp(void);         /* an unlock at count <= 0 was not appli
 
 /* ── THE TRACE (RECOMP_ADX_TRACE, default OFF) ───────────────────────────
  *
- * A ring of the last 256 events -- lock, unlock, block_begin, block_end, plus
+ * A ring of the last 4096 events (RECOMP_ADX_TRACE_RING overrides, 64..65536) -- lock, unlock, block_begin, block_end, plus
  * the owed-restore and clamp decisions above -- each with the host thread id,
  * the guest return address MEM32(esp) at entry, the refcount before and after,
  * the guard nesting (this thread / holder), the unlock admission result and
@@ -230,7 +230,17 @@ void adx_prio_note_clamp(void);         /* an unlock at count <= 0 was not appli
  *     clamp      the first unlock at count <= 0
  *     drift      the guest refcount first disagreed with the ledger's
  *                sum of held locks
- */
+ *     gap        the guest refcount first disagreed with the GUARD's live
+ *                nesting (every thread's depth plus what waits have parked)
+ *     lost       a blocking wait's end overwrote guard levels this thread
+ *                took DURING the wait (a DPC run from the wait loop)
+ *
+ * The FIRST dump of a run prints the whole ring and a per-thread table (host
+ * tid, guard depth, parked depth, ledger held, in-wait); later reasons print
+ * only the last 64 events, since the first already holds the origin. Each
+ * event also carries the guest context above, the ledger's matched verdict
+ * for an unlock (mt=), and for block events the depth parked and the levels
+ * lost. */
 enum adx_trace_type {
     ADX_EV_LOCK = 1, ADX_EV_UNLOCK, ADX_EV_BLOCK_BEGIN, ADX_EV_BLOCK_END,
     ADX_EV_OWED, ADX_EV_CLAMP
@@ -243,8 +253,25 @@ void adx_trace_set_count_source(int (*read_count)(void));
 void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
                     int unlock_result, int prio_set);
 void adx_trace_dump(const char *reason);  /* unconditional; tests and reports */
+
+/* WHO, BEYOND THE HOST THREAD (G66 origin hunt). The ring used to name only the
+ * host thread and MEM32(esp) -- which for every lock and unlock is the CRI
+ * wrapper (0x00141B72 / 0x00141B92), never the code that asked. The owner
+ * (jsrf_manual_overrides.c) fills this at each event: the guest esp, the
+ * guest TIB (g_fs_base), the wrapper's own caller and the next code-looking
+ * return addresses on the guest stack, and the interrupt context the host
+ * thread is in (bit 0 ISR, bit 1 DPC, bits 2+ dispatch depth) -- so a lock
+ * taken by a DPC run from inside a wait loop is told apart from the thread's
+ * own. */
+#define ADX_CTX_STACK 4
+struct adx_guest_ctx {
+    unsigned esp, tib, irq;
+    unsigned stack[ADX_CTX_STACK];   /* caller chain, nearest first; 0 = none */
+};
+void adx_trace_set_ctx_source(void (*fill)(struct adx_guest_ctx *out));
 /* Which reasons have dumped so far, one bit each in the order listed above
- * (leak 1, unmatched 2, skipped 4, cross 8, clamp 16, drift 32). Tests. */
+ * (leak 1, unmatched 2, skipped 4, cross 8, clamp 16, drift 32, gap 64,
+ * lost 128). Tests. */
 unsigned adx_trace_fired(void);
 
 /* Tests only: forget every thread's nesting and free the guard. */

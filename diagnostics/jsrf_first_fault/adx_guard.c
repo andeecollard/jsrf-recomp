@@ -16,6 +16,13 @@
  * owner. */
 static __thread unsigned      t_depth;
 static __thread unsigned long t_id;
+/* For the trace: inside a blocking wait (between the kernel's begin and end
+ * hooks), the depth that wait parked, and -- set by block_end for its own
+ * trace note -- the guard levels it overwrote. */
+static __thread int           t_in_wait;
+static __thread unsigned      t_parked;
+static __thread long          t_lost;
+static long g_lost_total;            /* levels overwritten by block_end, ever */
 
 static pthread_mutex_t g_m  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
@@ -229,6 +236,7 @@ static void guard_release(void)
 unsigned adx_guard_block_begin(void)
 {
     unsigned saved = 0;
+    t_in_wait = 1;
     pthread_mutex_lock(&g_m);
     if (t_depth > 0 && g_owner == my_id()) {
         saved = t_depth;
@@ -243,16 +251,20 @@ unsigned adx_guard_block_begin(void)
         g_st.owner = 0;
         pthread_cond_broadcast(&g_cv);
     }
+    t_parked = saved;
     pthread_mutex_unlock(&g_m);
     if (saved && adx_trace_on())
-        adx_trace_note(ADX_EV_BLOCK_BEGIN, 0, ADX_COUNT_NA, ADX_COUNT_NA, 0,
-                       ADX_PRIO_NONE);
+        adx_trace_note(ADX_EV_BLOCK_BEGIN, 0, ADX_COUNT_NA, ADX_COUNT_NA,
+                       (int)saved, ADX_PRIO_NONE);
     return saved;
 }
 
 void adx_guard_block_end(unsigned saved_depth)
 {
     int contended;
+    long lost;
+    t_in_wait = 0;
+    t_parked = 0;
     if (!saved_depth) return;
     pthread_mutex_lock(&g_m);
     contended = g_owner != 0 && g_owner != my_id();
@@ -263,6 +275,8 @@ void adx_guard_block_end(unsigned saved_depth)
     /* Anything taken DURING the wait (a DPC run from the wait loop that locked
      * and has not unlocked) is overwritten here and lost from t_depth; the sum
      * follows t_depth faithfully so the trace's leak test sees it. */
+    lost = (long)t_depth - 1;              /* guard_acquire added exactly one */
+    if (lost > 0) g_lost_total += lost;
     g_tsum += (long)saved_depth - (long)t_depth;
     g_parked -= saved_depth;
     t_depth = saved_depth;                 /* the nesting the wait interrupted */
@@ -270,9 +284,11 @@ void adx_guard_block_end(unsigned saved_depth)
     if (t_depth > g_st.max_depth) g_st.max_depth = t_depth;
     g_st.depth = g_depth;
     pthread_mutex_unlock(&g_m);
+    t_lost = lost;
     if (adx_trace_on())
-        adx_trace_note(ADX_EV_BLOCK_END, 0, ADX_COUNT_NA, ADX_COUNT_NA, 0,
-                       ADX_PRIO_NONE);
+        adx_trace_note(ADX_EV_BLOCK_END, 0, ADX_COUNT_NA, ADX_COUNT_NA,
+                       (int)saved_depth, ADX_PRIO_NONE);
+    t_lost = 0;
 }
 
 void adx_guard_lock_enter(void)
@@ -389,8 +405,12 @@ void adx_guard_reset_for_test(void)
     g_depth = 0;
     g_tsum = 0;
     g_parked = 0;
+    g_lost_total = 0;
     pthread_mutex_unlock(&g_m);
     t_depth = 0;
+    t_in_wait = 0;
+    t_parked = 0;
+    t_lost = 0;
     adx_prio_reset_for_test();
 }
 
@@ -565,7 +585,9 @@ void adx_prio_note_clamp(void)
 
 /* ── the trace ring ──────────────────────────────────────────────────────── */
 
-#define ADX_TRACE_N 256
+#define ADX_TRACE_MAX 65536u
+#define ADX_TRACE_DEF 4096u
+#define ADX_TRACE_TAIL 64ul          /* events printed by every dump after the first */
 
 struct adx_ev {
     unsigned long seq;
@@ -573,17 +595,51 @@ struct adx_ev {
     unsigned long long tid;
     unsigned ra;
     int      type, count_before, count_after, res, prio;
-    unsigned self_depth, holder_depth;
-    long     locks_minus_matched, leak, held_sum;
+    int      matched;                /* ledger verdict for an unlock; -1 n/a */
+    int      in_wait;                /* host thread inside a blocking wait */
+    long     lost;                   /* block_end: guard levels overwritten */
+    unsigned self_depth, holder_depth, parked_self;
+    long     locks_minus_matched, leak, held_sum, live, self_held;
+    struct adx_guest_ctx ctx;
 };
 
 static pthread_mutex_t g_tm = PTHREAD_MUTEX_INITIALIZER;
-static struct adx_ev   g_ring[ADX_TRACE_N];
+static struct adx_ev  *g_ring;
+static unsigned long   g_ring_n;
 static unsigned long   g_seq;
 static unsigned        g_dumped;     /* one bit per reason */
 static int           (*g_count_src)(void);
+static void          (*g_ctx_src)(struct adx_guest_ctx *);
 
 void adx_trace_set_count_source(int (*read_count)(void)) { g_count_src = read_count; }
+void adx_trace_set_ctx_source(void (*fill)(struct adx_guest_ctx *)) { g_ctx_src = fill; }
+
+/* Called with g_tm held. NULL only if the allocation failed. */
+static struct adx_ev *ring_get(void)
+{
+    if (!g_ring) {
+        const char *v = getenv("RECOMP_ADX_TRACE_RING");
+        long n = (v && *v) ? strtol(v, NULL, 10) : 0;
+        if (n < 64 || n > (long)ADX_TRACE_MAX) n = ADX_TRACE_DEF;
+        g_ring = calloc((size_t)n, sizeof *g_ring);
+        g_ring_n = g_ring ? (unsigned long)n : 0;
+    }
+    return g_ring;
+}
+
+/* THE PER-THREAD TABLE, for the first dump: every host thread that ever made
+ * a trace event, with its guard and wait state as of its own last event --
+ * t_depth and friends are thread-local and cannot be read from the dumping
+ * thread, so each thread publishes them here. */
+#define ADX_TT_MAX 32
+static struct {
+    unsigned long long tid;
+    unsigned depth, parked, tib;
+    int in_wait;
+    long held;
+    unsigned long last_seq;
+} g_tt[ADX_TT_MAX];
+static int g_tt_n;
 
 static double now_ms(void)
 {
@@ -608,19 +664,27 @@ static const char *ev_name(int type)
     return "?";
 }
 
-/* Called with g_tm held. */
-static void dump_locked(const char *reason)
+/* Called with g_tm held. `tail` 0 prints the whole ring. */
+static void dump_locked(const char *reason, unsigned long tail)
 {
-    unsigned long first = g_seq > ADX_TRACE_N ? g_seq - ADX_TRACE_N : 0, s;
+    unsigned long n = g_ring_n, first, s;
+    int i;
+    if (!g_ring) return;
+    first = g_seq > n ? g_seq - n : 0;
+    if (tail && g_seq - first > tail) first = g_seq - tail;
     fprintf(stderr, "  [ADX-TRACE] dump (%s): last %lu of %lu events, oldest"
                     " first. count=refcount 0x25EFA0 before->after, depth=guard"
-                    " nesting self/holder, res=unlock admission (1 matched,"
-                    " 0 unmatched-free, -1 refused), prio=value passed to"
-                    " SetThreadPriority, lmm=locks-matched, leak=lmm-live"
-                    " nesting, held=ledger sum\n",
-            reason, g_seq - first, g_seq);
+                    " nesting self/holder (+parked by a wait), res=unlock"
+                    " admission (1 matched, 0 unmatched-free, -1 refused; block"
+                    " events: depth parked), mt=ledger matched, prio=value"
+                    " passed to SetThreadPriority, lmm=locks-matched,"
+                    " leak=lmm-live nesting, live=guard nesting summed,"
+                    " held=ledger sum/self, w=in a blocking wait, irq=isr|dpc|"
+                    "depth<<2, esp/tib=guest, from=caller chain, lost=levels"
+                    " a wait's end overwrote (lost total %ld)\n",
+            reason, g_seq - first, g_seq, g_lost_total);
     for (s = first; s < g_seq; ++s) {
-        const struct adx_ev *e = &g_ring[s % ADX_TRACE_N];
+        const struct adx_ev *e = &g_ring[s % n];
         char cb[16], ca[16], pr[16];
         if (e->count_before == ADX_COUNT_NA) strcpy(cb, "?");
         else snprintf(cb, sizeof cb, "%d", e->count_before);
@@ -629,11 +693,25 @@ static void dump_locked(const char *reason)
         if (e->prio == ADX_PRIO_NONE) strcpy(pr, "-");
         else snprintf(pr, sizeof pr, "%d", e->prio);
         fprintf(stderr, "  [ADX-TRACE] %s #%lu t=%.3fms tid=%llu %-12s"
-                        " ra=0x%08X count=%s->%s depth=%u/%u res=%d prio=%s"
-                        " lmm=%ld leak=%ld held=%ld\n",
+                        " ra=0x%08X count=%s->%s depth=%u/%u+%u res=%d mt=%d"
+                        " prio=%s lmm=%ld leak=%ld live=%ld held=%ld/%ld w=%d"
+                        " irq=%u esp=0x%08X tib=0x%08X from=%08X<%08X<%08X<%08X"
+                        " lost=%ld\n",
                 reason, e->seq, e->t_ms, e->tid, ev_name(e->type), e->ra,
-                cb, ca, e->self_depth, e->holder_depth, e->res, pr,
-                e->locks_minus_matched, e->leak, e->held_sum);
+                cb, ca, e->self_depth, e->holder_depth, e->parked_self,
+                e->res, e->matched, pr, e->locks_minus_matched, e->leak,
+                e->live, e->held_sum, e->self_held, e->in_wait, e->ctx.irq,
+                e->ctx.esp, e->ctx.tib, e->ctx.stack[0], e->ctx.stack[1],
+                e->ctx.stack[2], e->ctx.stack[3], e->lost);
+    }
+    if (!tail) {
+        for (i = 0; i < g_tt_n; ++i)
+            fprintf(stderr, "  [ADX-TRACE] %s thread tid=%llu tib=0x%08X"
+                            " depth=%u parked=%u held=%ld in_wait=%d"
+                            " last_event=#%lu\n",
+                    reason, g_tt[i].tid, g_tt[i].tib, g_tt[i].depth,
+                    g_tt[i].parked, g_tt[i].held, g_tt[i].in_wait,
+                    g_tt[i].last_seq);
     }
     fflush(stderr);
 }
@@ -650,18 +728,22 @@ unsigned adx_trace_fired(void)
 void adx_trace_dump(const char *reason)
 {
     pthread_mutex_lock(&g_tm);
-    dump_locked(reason);
+    ring_get();
+    dump_locked(reason, 0);
     pthread_mutex_unlock(&g_tm);
 }
 
 enum { R_LEAK = 1, R_UNMATCHED = 2, R_SKIPPED = 4, R_CROSS = 8, R_CLAMP = 16,
-       R_DRIFT = 32 };
+       R_DRIFT = 32, R_GAP = 64, R_LOST = 128 };
 
 void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
                     int unlock_result, int prio_set)
 {
     struct adx_ev e;
     unsigned fire = 0;
+    int ti;
+    static const char *const names[] = { "leak", "unmatched", "skipped",
+        "cross", "clamp", "drift", "gap", "lost" };
 
     if (!adx_trace_on()) { t_cross_now = 0; return; }
     memset(&e, 0, sizeof e);
@@ -671,6 +753,10 @@ void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
     e.type = type;
     e.res = unlock_result;
     e.prio = prio_set;
+    e.matched = type == ADX_EV_UNLOCK ? t_unlock_matched : -1;
+    e.in_wait = t_in_wait;
+    e.lost = type == ADX_EV_BLOCK_END ? t_lost : 0;
+    if (g_ctx_src) g_ctx_src(&e.ctx);
     if ((type == ADX_EV_BLOCK_BEGIN || type == ADX_EV_BLOCK_END) && g_count_src)
         count_before = count_after = g_count_src();
     e.count_before = count_before;
@@ -679,25 +765,41 @@ void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
     pthread_mutex_lock(&g_m);
     e.self_depth = t_depth;
     e.holder_depth = g_depth;
+    e.parked_self = t_parked;
     e.locks_minus_matched = (long)g_st.locks - (long)g_st.unlocks_matched;
-    e.leak = e.locks_minus_matched - (g_tsum + g_parked);
+    e.live = g_tsum + g_parked;
+    e.leak = e.locks_minus_matched - e.live;
     /* An admitted unlock is noted before its leave(): the level it took
      * (matched: the lock's; unmatched: its own) is still in g_tsum, and a
      * matched one is already counted. Count it as gone, or every unlock
      * reads as a leak of -1. */
     if ((type == ADX_EV_UNLOCK || type == ADX_EV_CLAMP) && unlock_result >= 0
-        && adx_guard_on())
+        && adx_guard_on()) {
         e.leak += 1;
+        e.live -= 1;
+    }
     pthread_mutex_unlock(&g_m);
 
     pthread_mutex_lock(&g_pm);
     e.held_sum = g_held_sum;
+    e.self_held = (t_rec >= 0 && t_rec_gen == g_tr_gen) ? g_tr[t_rec].held : 0;
     pthread_mutex_unlock(&g_pm);
 
     pthread_mutex_lock(&g_tm);
+    if (!ring_get()) { pthread_mutex_unlock(&g_tm); t_cross_now = 0; return; }
     e.seq = g_seq;
-    g_ring[g_seq % ADX_TRACE_N] = e;
+    g_ring[g_seq % g_ring_n] = e;
     ++g_seq;
+    for (ti = 0; ti < g_tt_n; ++ti) if (g_tt[ti].tid == e.tid) break;
+    if (ti == g_tt_n && g_tt_n < ADX_TT_MAX) g_tt[g_tt_n++].tid = e.tid;
+    if (ti < ADX_TT_MAX) {
+        g_tt[ti].depth = e.self_depth;
+        g_tt[ti].parked = e.parked_self;
+        g_tt[ti].held = e.self_held;
+        g_tt[ti].in_wait = e.in_wait;
+        g_tt[ti].tib = e.ctx.tib;
+        g_tt[ti].last_seq = e.seq;
+    }
 
     /* The leak is measured by the guard, so only while the guard runs. */
     if (adx_guard_on() && e.leak != 0) fire |= R_LEAK;
@@ -710,16 +812,28 @@ void adx_trace_note(int type, unsigned ra, int count_before, int count_after,
     if ((type == ADX_EV_LOCK || type == ADX_EV_UNLOCK)
         && count_after != ADX_COUNT_NA && (long)count_after != e.held_sum)
         fire |= R_DRIFT;
+    /* The guard's nesting against the guest's count. An unmatched unlock that
+     * was admitted took a level for its own body only, so it is not part of
+     * the region the count describes; a refused one took nothing. */
+    if (adx_guard_on() && (type == ADX_EV_LOCK || type == ADX_EV_UNLOCK)
+        && count_after != ADX_COUNT_NA
+        && !(type == ADX_EV_UNLOCK && !t_unlock_matched)
+        && (long)count_after != e.live)
+        fire |= R_GAP;
+    if (e.lost > 0) fire |= R_LOST;
     t_cross_now = 0;
 
     fire &= ~g_dumped;
-    g_dumped |= fire;
-    if (fire & R_LEAK)      dump_locked("leak");
-    if (fire & R_UNMATCHED) dump_locked("unmatched");
-    if (fire & R_SKIPPED)   dump_locked("skipped");
-    if (fire & R_CROSS)     dump_locked("cross");
-    if (fire & R_CLAMP)     dump_locked("clamp");
-    if (fire & R_DRIFT)     dump_locked("drift");
+    if (fire) {
+        unsigned b;
+        int first = g_dumped == 0;
+        g_dumped |= fire;
+        for (b = 0; b < 8; ++b)
+            if (fire & (1u << b)) {
+                dump_locked(names[b], first ? 0 : ADX_TRACE_TAIL);
+                first = 0;
+            }
+    }
     pthread_mutex_unlock(&g_tm);
 }
 
@@ -755,6 +869,7 @@ void adx_prio_reset_for_test(void)
     pthread_mutex_lock(&g_tm);
     g_seq = 0;
     g_dumped = 0;
+    g_tt_n = 0;
     pthread_mutex_unlock(&g_tm);
     t_unlock_matched = 1;
     t_cross_now = 0;

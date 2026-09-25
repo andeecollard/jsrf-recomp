@@ -152,6 +152,29 @@ void sub_00147DD2(void);     /* XAPILIB::ResumeThread      */
 
 static int adx_read_count(void) { return (int)(int32_t)MEM32(0x25EFA0); }
 
+/* The trace's guest context (adx_guard.h, WHO, BEYOND THE HOST THREAD). Every
+ * lock and unlock arrives through CRI's wrappers sub_00141B60/sub_00141B80,
+ * which push one argument before the call, so MEM32(esp) is the wrapper and
+ * MEM32(esp+8) the wrapper's caller; beyond that there is no frame chain in
+ * this code, so the rest of the chain is the next code-looking dwords on the
+ * guest stack -- a scan, good enough to name a caller, not a backtrace. */
+unsigned xbox_IrqContextBits(void);
+static void adx_fill_ctx(struct adx_guest_ctx *c)
+{
+    uint32_t esp = g_esp, a, v;
+    int n = 0;
+    c->esp = esp;
+    c->tib = g_fs_base;
+    c->irq = xbox_IrqContextBits();
+    if (!esp) return;
+    a = esp + 8;                     /* skip the wrapper and its argument */
+    for (; n < ADX_CTX_STACK && a < esp + 0x400u; a += 4) {
+        v = MEM32(a);
+        if (g_xbox_code_hi && v >= g_xbox_code_lo && v < g_xbox_code_hi)
+            c->stack[n++] = v;
+    }
+}
+
 /* SetThreadPriority(NtCurrentThread, prio) / GetThreadPriority(NtCurrentThread)
  * through the guest's own XAPI, exactly as the bodies call them. `site` is
  * pushed as the return address: the routine's own entry, so a KeSetBasePriority
@@ -179,6 +202,7 @@ static void adx_pay_owed(uint32_t site, uint32_t ra)
     int p;
     static int count_source_set;
     if (!count_source_set) {
+        adx_trace_set_ctx_source(adx_fill_ctx);
         adx_trace_set_count_source(adx_read_count);
         count_source_set = 1;
     }

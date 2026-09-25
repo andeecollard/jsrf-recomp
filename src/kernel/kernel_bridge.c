@@ -3547,6 +3547,15 @@ void xbox_IrqTestSetPending(uint32_t v, int on)
 }
 void xbox_IrqTestEnterIsr(int on) { g_in_isr = on ? 1 : 0; g_dispatch_depth = on ? 1 : 0; }
 void xbox_IrqTestEnterDpc(int on) { g_in_dpc = on ? 1 : 0; g_dispatch_depth = on ? 1 : 0; }
+/* The calling host thread's interrupt context, for diagnostics that need to
+ * tell a DPC or ISR run from a wait loop apart from the thread's own code
+ * (adx_guard's trace): bit 0 in an ISR, bit 1 in a DPC, bits 2+ the dispatch
+ * depth. Read-only. */
+unsigned xbox_IrqContextBits(void)
+{
+    return (g_in_isr ? 1u : 0u) | (g_in_dpc ? 2u : 0u)
+         | ((unsigned)(g_dispatch_depth > 0 ? g_dispatch_depth : 0) << 2);
+}
 void xbox_IrqTestReset(void)
 {
     int k;
