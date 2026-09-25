@@ -1,4 +1,0 @@
-[
- {"address": "0x0017EED5", "name": "sub_0017EED5", "lib": "x87", "ret_bytes": [],
-  "note": "MSVC CRT _frnd: fld qword [esp+4]; frndint; return st0. floor() (0x17C61D) and ceil() (0x17C54F) call it between _ctrlfp RC=down/up and the restore, so it must round under the guest control word. The gen tree lifted its frndint as rint(), which is host-nearest; x87_lift.c answers it until the tree is regenerated with the fixed lifter."}
-]

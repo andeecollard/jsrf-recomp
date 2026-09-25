@@ -26,7 +26,6 @@ LIFT = {
     # Same file, its own switch: a lib is one on/off gate, and the jump must be
     # able to be on while the redirect's own switch is not.
     "chapterjump": ("chj", "chapter_select.c", "RECOMP_CHAPTER_JUMP=<chapter>[:<mission>]"),
-    "x87":    ("x8l", "x87_lift.c", "RECOMP_FRND_LIFT (default on)"),
 }
 
 # Argument logging: name -> (number of stack args to capture, post-call hook).
