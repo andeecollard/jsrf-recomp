@@ -131,3 +131,27 @@ To close: an xemu capture of that line, zoomed above each 's' (x 143–151 and
 174–182, y 60 at 640×480). An opt-in "clamp bilinear to the glyph cell" switch
 is possible as a documented enhancement, not a correctness fix. Evidence in the
 25 Sep session scratchpad (G71-*.png, run-before, run-glyph, cap1).
+
+## The D3D lift (G50–G52), 25 Sep afternoon
+
+Pushed to main at e560be4 (793635e, 568ca7d, e560be4); defaults unchanged.
+The host arm is `RECOMP_D3D8_HOST_2D=draw RECOMP_D3D8_HOST_FF=draw
+RECOMP_D3D8_HOST_VS=draw RECOMP_D3D8_HOST_FF_GPU=1`. It draws 97–98.5% of
+rasterised batches. Stage modes and the PS final combiner agree with the
+executor on every draw checked; VS draws match; FF keeps 1–4 px edge
+differences. Frame means, FLIP_PACE=0, map_run free play:
+
+| stage | executor | host arm |
+|---|---|---|
+| Garage 1:00 | 17.70 | 16.22 |
+| Rokkaku-dai 2:40 | 19.36 | 15.25 |
+| Shibuya Terminal 2:10 | 27.17 | 24.78 |
+| Sky Dino 6:60 | 33.57 | 26.91 |
+
+Player baseline, same afternoon, executor only (the switches were not yet in
+paths.conf): mean 18.3 ms, p50 17.0, p90 22.5, 121 frames over 33 ms in 27k
+(`measure/player-2026-09-25-lift.log`).
+
+Before a default change: host pipelines in the binary archive (e9f097d, being
+measured), no GPU drain on the host's first bind each frame (~2 ms), a player
+session with the arm on. Then host draw encode (~4 ms/frame in Sky Dino).
