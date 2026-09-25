@@ -152,6 +152,25 @@ Player baseline, same afternoon, executor only (the switches were not yet in
 paths.conf): mean 18.3 ms, p50 17.0, p90 22.5, 121 frames over 33 ms in 27k
 (`measure/player-2026-09-25-lift.log`).
 
-Before a default change: host pipelines in the binary archive (e9f097d, being
-measured), no GPU drain on the host's first bind each frame (~2 ms), a player
+Before a default change: host pipelines in the binary archive (e9f097d, done:
+warm session 70 hits, 0 compiled, worst build 0.3 ms), no GPU drain on the host's first bind each frame (~2 ms), a player
 session with the arm on. Then host draw encode (~4 ms/frame in Sky Dino).
+
+### Evening: the "visual bugs" were an experiment, not the lift
+
+The player watched harness windows (Corn's hat "knocked out", "a lot of
+visual bugs"). Those were step-2 arms with an uncommitted
+`RECOMP_METAL_ASYNC_FLIP`: the flip stopped writing the bound surface back to
+guest RAM, and the window showed stale, half-drawn frames in both arms. Parked
+on branch `parked/step2-async-flip`, not in any build. The pushed host arm,
+compared whole-frame with the executor (`gametools/frame_match.py`), differs
+only by motion and 1-LSB rounding in five scenes; Corn's hat is solid in both.
+
+Step 2 (bind drain): `RECOMP_METAL_DEFER_SWAP` removes the bind drain
+(16.6 s -> 5.8 ms over 8.2k binds) but the flip drain grows by the same
+amount: Rokkaku 15.25 -> 14.69 ms, Sky Dino unchanged. Something unaccounted
+absorbs the saved time; find it before any presentation work.
+
+Player sessions of 25 Sep (15:53, 17:36) ran WITHOUT the lift: paths.conf
+has no `RECOMP_D3D8_HOST_*` lines, and the log says `[D3D8-MIRROR] off`.
+Check that line before calling a session a lift session.
