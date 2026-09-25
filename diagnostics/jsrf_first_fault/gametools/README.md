@@ -65,3 +65,7 @@ title ("Input was not delivered before its lease expired"); retry.
 `gw_run.sh NAME BUDGET_S QUIET_S GAP_S [--env ...]`: Garage boot with `RECOMP_GLITCH_WATCH=1`; after `[CHAPTER-JUMP] fired` it keeps the game running until the new mission has sat in free play (state 0x0F) for QUIET_S, or BUDGET_S, capturing every GAP_S. `sweep.sh` runs a list of jumps; `glitch_summary.py` / `glitch_triage.py` / `glitch_offline.py` summarise and triage the `[GLITCH]` hits. First sweep (25 Sep): all 37 jumps of the catalogue's class-A list, no fault; results in the 25 Sep goals file.
 
 Note: `jump_run.sh` stops the game GAP x CAPTURES seconds after the jump fires; leave enough time for a flight recording to be written (900 frames takes a few seconds), or the BMPs are truncated.
+
+### Game map (`harness/map_run.sh`, `map_batch.sh`, `map_report.py`)
+
+`map_batch.sh map_targets.txt 50 360` jumps to each `C:MM` in the list, holds ~50 s of free play (state 0x0F), captures at +12 s / +32 s / end, flags hangs (`[FRAME] flips` frozen 20 s) and crashes, and reruns either once; `MAP_PRESS_A=1 map_run.sh ...` gets past briefing cards. `map_report.py runs map_targets.txt report.json sheet.png` extracts free-play frame times, stage split, drops, glitches, texture rebuild rate and a contact sheet. First full pass: `GAME_MAP_2026-09-25.md`.
