@@ -458,6 +458,14 @@ static struct {
      * reading it back; the difference is that this one is written down and
      * counted before it can happen. */
     int owes_guest_ram;
+    /* G73 RECOMP_METAL_ASYNC_WRITEBACK: the write-back in flight. wb_cb is
+     * a blit of this slot's colour texture into wb_buf (the guest's own rows,
+     * at the slot's pitch), committed behind the draws that made it; while it
+     * is set and owes_guest_ram is set, paying the debt is "wait for wb_cb
+     * (normally long finished) and copy wb_buf out" instead of a drain and a
+     * read-back. nil when nothing is in flight. */
+    id<MTLBuffer> wb_buf;
+    id<MTLCommandBuffer> wb_cb;
 } surf_slot[SURFACE_SLOTS];
 static uint64_t surf_clock;
 static uint64_t surface_hits, surface_evictions;
@@ -493,8 +501,48 @@ static uint64_t surface_hits, surface_evictions;
  * guest CPU read of the surface range that is not the flip is not intercepted;
  * that is the same exposure the resident-clear deferral has always accepted,
  * but it is now on the hot path rather than on clears. */
+/* G73: THE WRITE-BACK WITHOUT THE WAIT. RECOMP_METAL_ASYNC_WRITEBACK, default OFF.
+ *
+ * WHAT THE WAITS WERE. With the D3D lift on, a frame of this title is: the
+ * swap's copy quad (D3D's own, drawn by the executor) samples the back buffer
+ * 0x5F0000 as a linear R5G6B5 texture and draws it into one of two front
+ * buffers (0x688000 / 0x71E000); the scene then draws into 0x5F0000; the
+ * FLIP_STALL names the OTHER front buffer, which the presenter copies out of
+ * guest RAM. Two GPU drains a frame follow from "guest RAM must be current":
+ *   - the host's first draw swaps away from the front buffer the copy quad
+ *     just drew, and the swap drains and reads it back (the "bind drain");
+ *   - the flip syncs the bound back buffer (drain + read-back), because the
+ *     next frame's copy quad samples it OUT OF GUEST RAM.
+ * RECOMP_METAL_DEFER_SWAP removes the first and the second grows by as much:
+ * the batch is committed only at a sync, so the scene's command buffer is
+ * committed at the flip and the flip then waits for all of it on the GPU. The
+ * CPU and the GPU never overlap across a frame; whichever sync comes first
+ * pays the frame's GPU time. That is what absorbed the saving.
+ *
+ * WHAT THIS DOES INSTEAD (hardware 565 path only; implies DEFER_SWAP):
+ *   - a deferred swap BLITS the outgoing surface into a shared buffer, in
+ *     guest layout, and commits it behind the surface's draws. The debt stays
+ *     (owes_guest_ram); paying it becomes "copy that buffer out", waiting only
+ *     if the blit has not run yet.
+ *   - a texture read of the bound, dirty surface (the copy quad) samples a
+ *     GPU blit of it instead of stale guest RAM, and a texture read of a slot
+ *     with a write-back in flight samples the write-back's buffer. Neither
+ *     waits.
+ *   - the flip commits the frame and makes only the range it names current:
+ *     the bound surface is synced only if the flip names it. The front
+ *     buffer's write-back was committed at the start of the frame (a frame
+ *     ago on the GPU), so the flip normally waits for nothing.
+ * The GPU then renders frame N while the CPU runs frame N+1.
+ *
+ * WHAT IT CHANGES. Guest RAM for the back buffer becomes current when a
+ * reader asks for it (a texture, a Lock through G56, the debt watch's
+ * payers, a CPU clear, an eviction), not at every flip. A guest CPU read of
+ * it that goes through none of those sees an older frame -- DEFER_SWAP's
+ * exposure, which this inherits; hence default off. */
+static int async_wb_on(void)
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_ASYNC_WRITEBACK"); return on; }
 static int defer_swap_on(void)
-{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DEFER_SWAP"); return on; }
+{ static int on=-1; if(on<0) on=recomp_switch_on("RECOMP_METAL_DEFER_SWAP")||async_wb_on(); return on; }
 static uint64_t g_swap_deferred, g_swap_defer_depth, g_swap_defer_noslot;
 
 static int surface_cache_on(void)
@@ -520,6 +568,7 @@ static void surface_cache_drop(const uint8_t *target)
          * wrote while this surface was unbound -- is simply gone. */
         if (surf_slot[i].owes_guest_ram) surface_slot_writeback(i);
         surf_slot[i].valid = 0; surf_slot[i].owes_guest_ram = 0;
+        surf_slot[i].wb_cb = nil; surf_slot[i].wb_buf = nil;
         surf_slot[i].colour = nil; surf_slot[i].stencil = nil;
         surf_slot[i].hw_depth = nil; surf_slot[i].hw_stencil = nil;
     }
@@ -4582,6 +4631,137 @@ static int guest_ranges_overlap(const uint8_t *a, size_t a_size,
  * whole run is the expected reading until the swap starts deferring; it is
  * also the positive control that says this walked and found nothing, rather
  * than that it never ran. */
+/* ---- G73 RECOMP_METAL_ASYNC_WRITEBACK: the helpers (see async_wb_on) ---- */
+static uint64_t g_awb_issued, g_awb_reused, g_awb_paid, g_awb_waited, g_awb_wait_ns, g_awb_wait_max_ns,
+                g_awb_dropped, g_awb_tex_blits, g_awb_tex_blit_reused, g_awb_tex_from_slot, g_awb_tex_refused,
+                g_awb_flip_bound_syncs, g_awb_flip_slot_drains, g_awb_host_bound_syncs, g_awb_collected,
+                g_awb_flips, g_awb_flip_wait_ns, g_awb_flip_wait_max_ns;
+/* ++ whenever the bound surface is drawn into or cleared: a texture blit of
+ * it is reusable as its write-back only while this has not moved. */
+static uint64_t g_surface_gen;
+static id<MTLTexture> g_tex_blit_src;
+static uint64_t g_tex_blit_gen;
+static id<MTLBuffer> g_tex_blit_buf, g_tex_blit_scratch;
+static id<MTLCommandBuffer> g_tex_blit_cb;
+static int awb_usable(void) { return async_wb_on() && hw_565_on() && hw_state_on(); }
+static void mtl_cb_gpu_watch(id<MTLCommandBuffer> command);
+/* Blit `tex` (the guest's own R5G6B5 bits) into *buf, rows at `pitch`, as a
+ * command buffer of its own behind everything encoded so far. Returns it, or
+ * nil when it cannot (and the caller takes the old path). */
+static id<MTLCommandBuffer> awb_blit(id<MTLTexture> tex, uint32_t w, uint32_t h, uint32_t pitch,
+                                     id<MTLBuffer> __strong *buf)
+{
+    size_t need = (size_t)pitch * h;
+    if (!tex || tex.pixelFormat != MTLPixelFormatB5G6R5Unorm || !w || !h || pitch < w * 2u
+        || w > tex.width || h > tex.height) return nil;
+    if (!*buf || (*buf).length < need)
+        *buf = [device newBufferWithLength:need options:MTLResourceStorageModeShared];
+    if (!*buf) return nil;
+    batch_flush();
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> bl = cb ? [cb blitCommandEncoder] : nil;
+    if (!bl) return nil;
+    [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(w, h, 1) toBuffer:*buf destinationOffset:0
+ destinationBytesPerRow:pitch destinationBytesPerImage:need];
+    [bl endEncoding];
+    mtl_cb_gpu_watch(cb);
+    [cb commit];
+    last_command = cb;
+    return cb;
+}
+/* Pay slot i's debt from its write-back in flight: wait for it only when
+ * `wait` (and it has not run), then copy the rows out. Returns 1 when guest
+ * RAM was brought current. Always clears the in-flight record once looked
+ * at; a failed blit leaves owes_guest_ram set for the old path. */
+static int awb_collect(unsigned i, int wait)
+{
+    id<MTLCommandBuffer> cb = surf_slot[i].wb_cb;
+    if (!cb) return 0;
+    if (cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError) {
+        uint64_t t0, dt;
+        if (!wait) return 0;
+        t0 = mtl_now_ns();
+        [cb waitUntilCompleted];
+        dt = mtl_now_ns() - t0;
+        ++g_awb_waited; g_awb_wait_ns += dt; if (dt > g_awb_wait_max_ns) g_awb_wait_max_ns = dt;
+    }
+    surf_slot[i].wb_cb = nil;
+    if (cb.status != MTLCommandBufferStatusCompleted || !surf_slot[i].owes_guest_ram || !surf_slot[i].wb_buf) return 0;
+    {
+        uint8_t *dst = surf_slot[i].target;
+        const uint8_t *src = (const uint8_t *)surf_slot[i].wb_buf.contents;
+        uint32_t w = surf_slot[i].w, h = surf_slot[i].h, pitch = surf_slot[i].pitch;
+        nv2a_debt_watch_paid(dst, (size_t)pitch * h);
+        if (pitch == w * 2u) memcpy(dst, src, (size_t)pitch * h);
+        else for (uint32_t y = 0; y < h; ++y) memcpy(dst + (size_t)y * pitch, src + (size_t)y * pitch, (size_t)w * 2u);
+    }
+    surf_slot[i].owes_guest_ram = 0;
+    ++g_awb_paid;
+    return 1;
+}
+/* The deferred swap of the bound surface into slot i: its write-back goes in
+ * flight. A texture blit taken since the last draw into it is that write-back
+ * already. */
+static void awb_issue_for_bound(unsigned i)
+{
+    if (g_tex_blit_cb && g_tex_blit_src == surface && g_tex_blit_gen == g_surface_gen
+        && g_tex_blit_buf == surf_slot[i].wb_buf) {
+        if (surf_slot[i].wb_cb) ++g_awb_dropped;
+        surf_slot[i].wb_cb = g_tex_blit_cb; ++g_awb_reused;
+    } else {
+        id<MTLBuffer> b = surf_slot[i].wb_buf;
+        id<MTLCommandBuffer> cb = awb_blit(surface, surface_width, surface_height, surface_pitch, &b);
+        if (surf_slot[i].wb_cb) ++g_awb_dropped;
+        surf_slot[i].wb_cb = nil;
+        if (cb) { surf_slot[i].wb_buf = b; surf_slot[i].wb_cb = cb; ++g_awb_issued; }
+    }
+    g_tex_blit_cb = nil; g_tex_blit_src = nil; g_tex_blit_buf = nil;
+}
+/* A texture read of guest bytes the GPU is ahead of, served from the GPU.
+ * Returns the buffer to sample (guest layout, from `data`), or nil for the
+ * old path. `hwfmt`: the draw would take the hardware-texture path, which
+ * reads guest RAM itself -- then the bound surface is synced instead. */
+static id<MTLBuffer> awb_texture(const uint8_t *data, size_t bytes, int hwfmt)
+{
+    if (!awb_usable() || !data || !bytes) return nil;
+    if (surface_valid && surface && surface_dirty && surface_target
+        && guest_ranges_overlap(data, bytes, surface_target, surface_target_size)) {
+        unsigned j;
+        if (hwfmt || data != surface_target || bytes > (size_t)surface_pitch * surface_height
+            || surface.pixelFormat != MTLPixelFormatB5G6R5Unorm) {
+            ++g_awb_tex_refused; nv2a_metal_sync(); return nil;
+        }
+        if (g_tex_blit_cb && g_tex_blit_src == surface && g_tex_blit_gen == g_surface_gen) {
+            ++g_awb_tex_blit_reused; return g_tex_blit_buf;
+        }
+        for (j = 0; j < surface_slots_used(); ++j)
+            if (surf_slot[j].valid && surf_slot[j].colour == surface) break;
+        {
+            id<MTLBuffer> b = j < surface_slots_used() ? surf_slot[j].wb_buf : g_tex_blit_scratch;
+            id<MTLCommandBuffer> cb = awb_blit(surface, surface_width, surface_height, surface_pitch, &b);
+            if (!cb) { ++g_awb_tex_refused; nv2a_metal_sync(); return nil; }
+            if (j < surface_slots_used()) {
+                /* The slot's buffer now holds this; an older write-back of the
+                 * slot that pointed at it is superseded. */
+                if (surf_slot[j].wb_cb) { surf_slot[j].wb_cb = nil; ++g_awb_dropped; }
+                surf_slot[j].wb_buf = b;
+            } else g_tex_blit_scratch = b;
+            g_tex_blit_cb = cb; g_tex_blit_src = surface; g_tex_blit_gen = g_surface_gen; g_tex_blit_buf = b;
+            ++g_awb_tex_blits;
+            return b;
+        }
+    }
+    if (hwfmt) return nil;
+    for (unsigned i = 0; i < surface_slots_used(); ++i)
+        if (surf_slot[i].valid && surf_slot[i].owes_guest_ram && surf_slot[i].wb_cb && surf_slot[i].wb_buf
+            && surf_slot[i].target == data && bytes <= (size_t)surf_slot[i].pitch * surf_slot[i].h) {
+            ++g_awb_tex_from_slot;
+            return surf_slot[i].wb_buf;
+        }
+    return nil;
+}
+
 static uint64_t g_sync_range_calls, g_sync_range_paid;
 
 int nv2a_metal_sync_range(uint8_t *target, size_t bytes)
@@ -4590,6 +4770,32 @@ int nv2a_metal_sync_range(uint8_t *target, size_t bytes)
     /* No range named means "all of it", which is what a full invalidate and
      * every internal caller wants. */
     if (!target || !bytes) return nv2a_metal_sync();
+
+    /* G73: commit the frame and make only the named range current. */
+    if (awb_usable()) {
+        uint64_t t0 = mtl_now_ns(), dt;
+        ++g_awb_flips;
+        batch_flush();
+        if (surface_valid && surface_target && surface_dirty
+            && guest_ranges_overlap(target, bytes, surface_target, surface_target_size)) {
+            ++g_awb_flip_bound_syncs;
+            if (!nv2a_metal_sync()) return 0;
+        }
+        for (unsigned i = 0; i < surface_slots_used(); ++i) {
+            if (!surf_slot[i].valid || !surf_slot[i].owes_guest_ram) continue;
+            if (!guest_ranges_overlap(target, bytes, surf_slot[i].target, surface_slot_bytes(i))) continue;
+            if (!surf_slot[i].wb_cb) ++g_awb_flip_slot_drains;
+            surface_slot_writeback(i);
+            ++g_sync_range_paid;
+        }
+        dt = mtl_now_ns() - t0;
+        g_awb_flip_wait_ns += dt; if (dt > g_awb_flip_wait_max_ns) g_awb_flip_wait_max_ns = dt;
+        /* Everything else that has finished is paid now, for free, so guest
+         * RAM trails the GPU by a frame at most for readers nobody intercepts. */
+        for (unsigned i = 0; i < surface_slots_used(); ++i)
+            if (surf_slot[i].valid && surf_slot[i].wb_cb && awb_collect(i, 0)) ++g_awb_collected;
+        return 1;
+    }
 
     /* The bound surface first. It is the only one whose DEPTH can be dirty,
      * and nv2a_metal_sync is the only path that writes depth back. */
@@ -4658,6 +4864,7 @@ int nv2a_metal_make_current(uint8_t *p, size_t bytes)
         /* Dropped whether or not it owed: a CPU write through the lock would
          * otherwise be shadowed by this slot's texture at the next rebind. */
         surf_slot[i].valid = 0; surf_slot[i].owes_guest_ram = 0;
+        surf_slot[i].wb_cb = nil; surf_slot[i].wb_buf = nil;
         surf_slot[i].colour = nil; surf_slot[i].stencil = nil;
         surf_slot[i].hw_depth = nil; surf_slot[i].hw_stencil = nil;
     }
@@ -4686,6 +4893,12 @@ int nv2a_metal_pay_debt(const uint8_t *p, size_t bytes)
 {
     uint64_t before = g_debt_paid_on_host_read;
     draw_thread_check();
+    /* G73: under the async write-back the flip no longer brings the bound
+     * surface's guest RAM current, so a host texture read of it must. */
+    if (awb_usable() && p && bytes && surface_valid && surface_dirty && surface_target
+        && guest_ranges_overlap(p, bytes, surface_target, surface_target_size)) {
+        ++g_awb_host_bound_syncs; nv2a_metal_sync(); ++g_debt_paid_on_host_read;
+    }
     surface_pay_debt_for_range(p, bytes, &g_debt_paid_on_host_read);
     return (int)(g_debt_paid_on_host_read - before);
 }
@@ -4708,6 +4921,20 @@ void nv2a_metal_report(void)
 {
     nv2a_debt_watch_report();
     {   extern void nv2a_host_read_report(void); nv2a_host_read_report(); }
+    fprintf(stderr,"[METAL] async write-back: %llu issued, %llu from a texture blit, %llu paid from the buffer"
+            " (%llu waited, %.1f ms, worst %.2f ms), %llu collected free at a flip, %llu superseded |"
+            " texture reads served on the GPU: %llu blits of the bound surface (+%llu reused), %llu from a"
+            " write-back in flight, %llu synced instead | flips %llu: %.1f ms in all, worst %.2f ms; bound"
+            " surface named %llu, slot debt with nothing in flight %llu | host reads of the bound surface"
+            " synced %llu (metal_async_writeback %s)\n",
+            (unsigned long long)g_awb_issued,(unsigned long long)g_awb_reused,(unsigned long long)g_awb_paid,
+            (unsigned long long)g_awb_waited,g_awb_wait_ns/1e6,g_awb_wait_max_ns/1e6,
+            (unsigned long long)g_awb_collected,(unsigned long long)g_awb_dropped,
+            (unsigned long long)g_awb_tex_blits,(unsigned long long)g_awb_tex_blit_reused,
+            (unsigned long long)g_awb_tex_from_slot,(unsigned long long)g_awb_tex_refused,
+            (unsigned long long)g_awb_flips,g_awb_flip_wait_ns/1e6,g_awb_flip_wait_max_ns/1e6,
+            (unsigned long long)g_awb_flip_bound_syncs,(unsigned long long)g_awb_flip_slot_drains,
+            (unsigned long long)g_awb_host_bound_syncs,awb_usable()?"on":"OFF");
     fprintf(stderr,"[METAL] sync %llu calls (%llu already clean): %.1f ms draining"
             " the GPU, %.1f ms reading back and converting."
             "  A resident clear could remove the second only.\n",
@@ -5618,7 +5845,7 @@ int nv2a_metal_external_draw_ex(const uint8_t *target, const uint8_t *depth, int
         int bok = encode((__bridge void *)batch_encoder, surface_width, surface_height, ctx);
         ++batch_draws;
         if (batch_cap() && batch_draws >= batch_cap()) batch_flush();
-        if (bok) { surface_dirty = 1; if (writes_depth) depth_dirty = 1; }
+        if (bok) { surface_dirty = 1; ++g_surface_gen; if (writes_depth) depth_dirty = 1; }
         return bok != 0;
     }
     batch_flush();
@@ -5639,7 +5866,7 @@ int nv2a_metal_external_draw_ex(const uint8_t *target, const uint8_t *depth, int
     mtl_cb_gpu_watch(cb);
     [cb commit];
     last_command = cb;
-    if (ok) { surface_dirty = 1; if (writes_depth) depth_dirty = 1; }
+    if (ok) { surface_dirty = 1; ++g_surface_gen; if (writes_depth) depth_dirty = 1; }
     return ok != 0;
 }
 
@@ -5698,6 +5925,8 @@ void nv2a_metal_retained(const uint8_t **color, const uint8_t **depth, int *owed
  * ever looks. */
 static void surface_slot_writeback(unsigned i)
 {
+    /* G73: a write-back in flight pays it without the drain. */
+    if (surf_slot[i].wb_cb) { awb_collect(i, 1); if (!surf_slot[i].owes_guest_ram) return; }
     uint8_t *dst = surf_slot[i].target;
     id<MTLTexture> tex = surf_slot[i].colour;
     uint32_t w = surf_slot[i].w, h = surf_slot[i].h, pitch = surf_slot[i].pitch;
@@ -5894,6 +6123,9 @@ static int clear_unbound_slot(uint8_t *target, uint32_t pitch,
          * whatever geometry last used it and the colour clear must not disturb
          * them. A pass with a colour attachment alone is legal and clears
          * exactly what it names. */
+        /* G73: a write-back in flight predates this clear: pay it if it has
+         * run (the debt below stands either way), else forget it. */
+        if (surf_slot[i].wb_cb) { awb_collect(i, 0); surf_slot[i].wb_cb = nil; }
         if (!clear_encode(pass)) return 0;
         /* The CPU clear is now skipped, so guest RAM for this surface is behind
          * the texture until the slot is rebound or dropped. */
@@ -5979,7 +6211,7 @@ int nv2a_metal_clear_color(uint8_t *target, size_t target_size, uint32_t pitch,
         ++g_resident_color_clears;
         /* Guest RAM no longer matches the attachment. The flip's sync carries
          * it across; nothing else reads it in between. */
-        surface_dirty = 1;
+        surface_dirty = 1; ++g_surface_gen;
     }
     return 1;
 }
@@ -6652,6 +6884,7 @@ static int surface_bind(uint8_t*target,size_t target_size,uint32_t w,uint32_t h,
      int owed=0;
      for(unsigned i=0;i<surface_slots_used();i++)
       if(surf_slot[i].valid&&surf_slot[i].colour==surface){
+       if(awb_usable())awb_issue_for_bound(i);
        surf_slot[i].owes_guest_ram=1;surface_dirty=0;
        nv2a_debt_watch_arm(surf_slot[i].target,surface_slot_bytes(i),NV2A_DEBT_COLOUR);
        owed=1;++g_swap_deferred;break;}
@@ -6683,6 +6916,9 @@ static int surface_bind(uint8_t*target,size_t target_size,uint32_t w,uint32_t h,
      * sync already knows how to pay. Clearing surface_dirty here instead --
      * which is what "a swap back is a rebind" did before there was any way for
      * a slot to be ahead of guest RAM -- would drop the clear on the floor. */
+    /* G73: a write-back in flight is of pixels about to be drawn over; pay
+     * it if it has already run (free), else let the debt ride on surface_dirty. */
+    if(surf_slot[slot_hit].wb_cb){awb_collect((unsigned)slot_hit,0);surf_slot[slot_hit].wb_cb=nil;}
     surface_dirty=surf_slot[slot_hit].owes_guest_ram?1:0;depth_dirty=0;
     surf_slot[slot_hit].owes_guest_ram=0;
     surf_slot[slot_hit].stamp=++surf_clock;++surface_hits;
@@ -6739,6 +6975,7 @@ static int surface_bind(uint8_t*target,size_t target_size,uint32_t w,uint32_t h,
     if(surf_slot[pick].valid&&surf_slot[pick].owes_guest_ram){
      surface_slot_writeback(pick);++g_debt_paid_on_evict;}
     if(surf_slot[pick].valid)++surface_evictions;
+    surf_slot[pick].wb_cb=nil;surf_slot[pick].wb_buf=nil;
     surf_slot[pick].target=target;surf_slot[pick].target_size=target_size;
     surf_slot[pick].w=surface_width;surf_slot[pick].h=surface_height;
     surf_slot[pick].pitch=surface_pitch;
@@ -7282,6 +7519,12 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
     * read straight past. texture_buffer uploads these bytes out of guest
     * RAM; if a slot is still holding them on the GPU it has to hand them
     * over first. Four slots and a pointer compare when nothing is owed. */
+   /* G73: bytes the GPU is ahead of are sampled from the GPU (see
+    * awb_texture); nil takes the path below unchanged. */
+   id<MTLBuffer> gpu_tb=active?awb_texture(data,bytes,hw_tex_on()&&(t->rgba8||t->dxt1||t->dxt3)&&!s->bump[u]):nil;
+   if(gpu_tb){
+    if(data&&surface_valid&&surface_target&&guest_ranges_overlap(data,bytes,surface_target,surface_target_size))++g_feedback_draws;
+    tb[u]=gpu_tb;continue;}
    surface_pay_debt_for_range(data,bytes,&g_debt_paid_on_read);
    /* The bound surface itself: see feedback_sync_on. Counted always, paid
     * only when asked. The sync flushes the open batch, so the sample sees
@@ -7598,13 +7841,31 @@ int nv2a_metal_draw(const NV2ATextureCopy*s,const uint8_t*texture,size_t texture
    mtl_cb_gpu_watch(command);
    [command commit];if(mtl_cb_stats())g_mtl_ns_commit+=mtl_now_ns()-_t0;last_command=command;
   }
-  surface_dirty=1;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
+  surface_dirty=1;++g_surface_gen;if((s->depth_test&&s->depth_write)||(s->stencil_test&&s->stencil_write))depth_dirty=1;reject_reason=NULL;return(int)(n/3);}
 }
 
 /* For the executor's flight recorder (RECOMP_FLIGHT_FRAMES): cumulative
  * surface-cache and sync counters, sampled once per recorded frame, so a frame
  * that paints nothing can be matched against an eviction, a rebuild, a skipped
  * sync or a feedback read in the same flip. */
+/* G73: WHICH GUEST BYTES ARE BEHIND THE GPU, for the flight recorder's
+ * per-draw record. Bit 0: `p` lies in the bound surface and that surface is
+ * dirty (drawn since its last write-back); bit 1: it lies in a slot that owes
+ * guest RAM (a deferred swap or a resident clear). A texture read of such
+ * bytes out of guest RAM samples what was there before those draws. Read-only
+ * and draw-thread only, like the counters below. */
+int nv2a_metal_gpu_ahead(const uint8_t *p, size_t bytes)
+{
+    int r = 0;
+    if (!p || !bytes) return 0;
+    if (surface_valid && surface_target && surface_dirty
+        && guest_ranges_overlap(p, bytes, surface_target, surface_target_size)) r |= 1;
+    for (unsigned i = 0; i < surface_slots_used(); ++i)
+        if (surf_slot[i].valid && surf_slot[i].owes_guest_ram
+            && guest_ranges_overlap(p, bytes, surf_slot[i].target, surface_slot_bytes(i))) r |= 2;
+    return r;
+}
+
 void nv2a_metal_flight_counters(unsigned long long out[6])
 {
     out[0] = (unsigned long long)surface_uploads;

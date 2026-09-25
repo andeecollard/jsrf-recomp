@@ -1221,6 +1221,19 @@ if(APPLE)
     set_tests_properties(jsrf_metal_defer_swap_on PROPERTIES
                          ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;JSRF_EXPECT_DEFER=1")
 
+    # G73: the asynchronous write-back. Naming a range pays it with the right
+    # bytes, naming one range leaves the bound surface alone, and a draw
+    # sampling the bound dirty surface sees the GPU's pixels. DEFER_SWAP alone
+    # is the control for the last two. Registered twice -- cached getenv.
+    add_executable(jsrf_metal_async_writeback_test metal_async_writeback_test.c)
+    target_link_libraries(jsrf_metal_async_writeback_test PRIVATE xbox_vsh)
+    add_test(NAME jsrf_metal_async_writeback_off COMMAND jsrf_metal_async_writeback_test)
+    set_tests_properties(jsrf_metal_async_writeback_off PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_DEFER_SWAP=1;JSRF_EXPECT_ASYNC=0")
+    add_test(NAME jsrf_metal_async_writeback_on COMMAND jsrf_metal_async_writeback_test)
+    set_tests_properties(jsrf_metal_async_writeback_on PROPERTIES
+                         ENVIRONMENT "RECOMP_METAL_ASYNC_WRITEBACK=1;JSRF_EXPECT_ASYNC=1")
+
     # G3 A1 (18 Sep): the depth refusal is narrowed by no_depth_sync, and
     # ONLY by it. The OFF arm is the control -- it must still refuse, or the
     # narrowing removed a real guard rather than a pointless one.
