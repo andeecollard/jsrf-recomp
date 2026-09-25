@@ -42,7 +42,7 @@ gw_run, map_run/map_batch). One game instance at a time.
 2. OPEN, IN ORDER
 ====================================================================
 
-1. G69 -- Sewage Facility (3:60) free-play hang, ~1 in 2: the pushbuffer
+1. G69 -- Sewage Facility (3:60) free-play hang, 1 of 8 runs so far: the pushbuffer
    parser loses sync, reads a data word as CALL, stream_fault is permanent.
    139ff0a stops at the CALL with the full post-mortem
    (RECOMP_PB_CALL_IS_DESYNC, default on). A 6-run batch
