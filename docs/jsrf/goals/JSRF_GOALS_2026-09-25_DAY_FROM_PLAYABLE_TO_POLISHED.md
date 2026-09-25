@@ -74,3 +74,23 @@ game map); the 74 cutscenes reachable by a jump play with no fault.
 `docs/jsrf/TOOLS.md`. Reach the scene unattended before theorising; press M
 (or `RECOMP_FLIGHT_AT`) to record it; one game instance at a time, and pause
 unattended runs while the player plays.
+
+## Progress, 25 Sep (midday)
+
+- **G70 shader hitches: fixed** (167bc1e): pipelines compile off the draw
+  thread and persist in a Metal binary archive. Rokkaku-dai cold session: draw
+  thread waited 7.7 ms total (worst 6.3 ms) for compilation, against 5.66 s
+  (worst 883 ms) in the player's morning session; warm session 205 archive
+  hits, 0 misses. No CPU/GPU vertex-split flicker seen (glitch watch).
+- **G66 leak: fixed at the root** (9074ea0): CRI's outer nesting word
+  (0x25EFEC, sub_0013C460/C480) was read and written outside the lock; both
+  bodies now run under the ADX guard. 8/8 runs of 4:96 with no dump of any kind.
+- **G2 re-measure:** 0 clobbers in 813 opportunities (4 Garage runs); the
+  21 Sep fence fix holds. G71 (the thin line above text) is separate.
+- **Texture hash:** within noise in game (2:40 19.6 vs 19.9 ms); kept on.
+- **G57 regenerated** and the run-time lift removed; the gen alone gives 0
+  transients on the DJ K intro.
+- **Decisions carried out:** history rewritten (the ChapterSelect port's
+  blobs replaced by the clean-room file in all unpushed commits; tip tree
+  unchanged) and pushed to origin main; upstream PR #126 opened; 7 worktrees
+  and 15 branches removed (branches with unique commits kept).
