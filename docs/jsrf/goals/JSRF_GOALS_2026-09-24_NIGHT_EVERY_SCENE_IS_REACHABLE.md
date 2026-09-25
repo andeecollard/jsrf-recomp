@@ -1,5 +1,9 @@
 # JSRF goals — every scene is reachable, 24 September 2026 (night)
 
+> Superseded for ordering, 25 September 2026 (day), by
+> `JSRF_GOALS_2026-09-25_DAY_FROM_PLAYABLE_TO_POLISHED.md`. Kept for the record; the active list is
+> the newest goals file in this folder.
+
 Supersedes `JSRF_GOALS_2026-09-23_LATE_LIFT_AS_MUCH_AS_WE_CAN.md` for
 ORDERING. That file keeps the record of G49–G56 and the 24 Sep daytime work
 (fog, the city, the drop audit, the frame rate); nothing here renumbers it.
