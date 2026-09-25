@@ -112,3 +112,51 @@ draws magenta / cyan.
 - Merged branches from this morning and three agent worktrees under
   `.claude/worktrees/` can be deleted.
 - `docs/jsrf/STATUS.md` was last measured on 14 Sep.
+
+## Progress, 25 Sep (early morning)
+
+**G61 — the cutscene sweep is done** (e3a4907 `RECOMP_GLITCH_WATCH`; launcher
+and triage scripts in `gametools/harness/`, 807bb0b). All 37 jumps of the
+catalogue's class-A list, rounding fix on: **no fault, no crash**.
+- **The player's "disappearing" is G57 everywhere.** Controls with
+  `RECOMP_FRND_LIFT=0` → on: 2:96 e210 11→0, e213 (police) 1→0, e214 11→0;
+  1:96 e200 19→1, e201 (police) 7→0, e206 15→0. With the lift off, Hayashi
+  and the officers vanish for a frame; with it on, e213 and e025 recorded in
+  full show every model the event file lists.
+- **Left with the fix on:**
+  - **G65 — one-frame camera pop** (open): e200 ≈ guest frame 3792 in five
+    runs, e221, and 4:62 (twice in cutscenes, once in gameplay). The world is
+    drawn from another view for one frame; draw list unchanged, transforms
+    finite and unchanged in the recorded frames. It sits near camera-path
+    boundaries in the event data, so it may be authored; xemu decides.
+  - **G66 — intermittent hangs** in 4:96 e231 and 8:13 e291 (the ending): the
+    game thread spins ~1e9 kernel calls with no draws, ADX guard ~1e9
+    unmatched unlocks (the known sub_001437B0 spin). 4:96 rerun played
+    through. Harness runs silence audio, which may matter.
+  - Authored effects, not defects: 7:96 sparks, 2:50 fade dips, 6:60 camera
+    shake, 6:61 flash. Garage idle sway (3–5 frames, diff ≈ 5) before every
+    jump: benign, low confidence.
+- Not covered: 8:13's later events (hung), class B/C events, e054/e080 via
+  6:41/7:41/8:41/9:41/9:56.
+
+**G64 — clean-room chapter select** (fc628e2 spec, 7a89ce3 implementation,
+merged). `chapter_select.c` was a port of KeybadeBlox's unlicensed
+JSRF-ChapterSelect; it is replaced by an implementation written from a spec
+derived only from `default.xbe` and the mission files
+(`docs/jsrf/cleanroom/`), by an author with no access to the third-party code
+or the old file. Interface unchanged except: default mission when omitted is
+now 96 (the chapter opening, what the game itself loads after a chapter), the
+mission file is checked before redirecting, and `RECOMP_CHAPTER_JUMP_MARK`
+marks the first event only. Verified in game: 2:96 jump + intro recorded,
+0 transients; 5:10 reaches Future Site. **Still owed before publishing:** the
+old port is in the history (a987c6c, be48155 and the sweep's e3a4907 edit of
+it) — rewrite those out before the first push, or get KeybadeBlox's
+permission. Player's decision.
+
+**G59/G60 merged** (6dbb270), test health merged (9978a70: switch audit back
+at baseline, two stale tools tests fixed; ctest 152/154, the two expected),
+documentation refreshed (ab41d8e), upstream frndint PR prepared and not sent
+(c4be904). JSRF.app rebuilt from 807bb0b.
+
+**Running:** a whole-game map (one mission per chapter/stage, ~60 targets):
+loads, faults, hangs, picture, frame time.
