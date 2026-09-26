@@ -6,6 +6,7 @@
 #include "nv2a_debt_watch.h"   /* RECOMP_METAL_DEBT_WATCH: no-ops unless armed */
 #include "nv2a_ff.h"
 #include "../recomp_switch.h"
+#include "../platform/recomp_frame_split.h"
 #include "nv2a_metal_state.h"
 #include "nv2a_vsh.h"
 #include "nv2a_texture_decode.h"
@@ -254,7 +255,8 @@ static int mtl_cb_gpu(void)
 {
     static int on = -1;
     if (mtl_cb_gpu_force) return mtl_cb_gpu_force > 0;
-    if (on < 0) on = getenv("RECOMP_METAL_CB_GPU") ? 1 : 0;
+    /* G76: RECOMP_FRAME_SPLIT wants the coverage too, per window. */
+    if (on < 0) on = getenv("RECOMP_METAL_CB_GPU") || recomp_fs_on() ? 1 : 0;
     return on;
 }
 static _Atomic unsigned long long g_mtl_sched_ns, g_mtl_gpu_n;
@@ -323,7 +325,8 @@ static void mtl_cb_gpu_watch(id<MTLCommandBuffer> command)
             if (start < gpu_last_end) atomic_fetch_add(&g_mtl_overlapped, 1);
             else                      gpu_coverage += start - gpu_last_end > 0 ? 0.0 : 0.0;
             {   double from = start < gpu_last_end ? gpu_last_end : start;
-                if (end > from) gpu_coverage += end - from; }
+                if (end > from) { gpu_coverage += end - from;
+                                  recomp_fs_add(RFS_GPU, (unsigned long long)((end - from) * 1e9)); } }
             if (end > gpu_last_end) gpu_last_end = end;
             atomic_fetch_add(&g_mtl_span_ns, (unsigned long long)((end - start) * 1e9));
         }

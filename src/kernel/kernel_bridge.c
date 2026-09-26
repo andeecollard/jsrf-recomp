@@ -30,6 +30,7 @@
 #include "../recomp_switch.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "../platform/recomp_frame_split.h"
 #include <stdio.h>
 #include <string.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -9337,7 +9338,13 @@ static void kernel_thunk_dispatch(void)
     g_bridge_current_slot = slot;
 
     if (bridge) {
-        bridge();
+        /* G76: RECOMP_FRAME_SPLIT times the title thread's kernel calls. */
+        if (recomp_fs_on() && recomp_fs_is_title()) {
+            unsigned long long t0 = recomp_fs_now();
+            bridge();
+            recomp_fs_kernel((unsigned)ordinal, recomp_fs_now() - t0);
+        } else
+            bridge();
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
          * gating on g_kernel_call_count: a missing bridge is rare and is

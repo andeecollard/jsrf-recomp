@@ -2,6 +2,7 @@
 #include "d3d8_host.h"
 #include "d3d8_host_2d.h"
 #include "nv2a_pusher.h"
+#include "../platform/recomp_frame_split.h"
 #include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
@@ -988,7 +989,21 @@ uint32_t d3d8_host_enqueue_2d_replace(const D3D8HostDrawCheck *c)
 }
 
 /* Token parameter = slot index + 1, so 0 never names a slot. */
+static void on_token_body(uint32_t parameter);
+/* G76: RECOMP_FRAME_SPLIT times each token by kind, on the pusher. */
 static void on_token(uint32_t parameter)
+{
+    uint32_t i = parameter - 1u;
+    if (recomp_fs_on() && parameter && i < SLOTS) {
+        uint32_t kind = s_slot[i].kind;
+        unsigned long long t0 = recomp_fs_now();
+        on_token_body(parameter);
+        recomp_fs_add(kind == 3 ? RFS_P_REPLACE : kind == 2 ? RFS_P_PRE : RFS_P_CHECK, recomp_fs_now() - t0);
+        return;
+    }
+    on_token_body(parameter);
+}
+static void on_token_body(uint32_t parameter)
 {
     uint32_t i = parameter - 1u;
     if (!parameter || i >= SLOTS ||

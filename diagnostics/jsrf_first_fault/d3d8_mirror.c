@@ -38,6 +38,7 @@
 #include "d3d8_host.h"
 #include "d3d8_host_2d.h"
 #include "nv2a_pusher.h"
+#include "../../src/platform/recomp_frame_split.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -787,9 +788,11 @@ static unsigned long long m_now_ns(void)
 static unsigned long long m_hook_ns, m_hook_n, m_hook_flip0;
 static void m_hook_account(unsigned long long t0, int draw)
 {
-    unsigned long long f;
+    unsigned long long f, dt;
     if (!t0) return;
-    m_hook_ns += m_now_ns() - t0;
+    dt = m_now_ns() - t0;
+    m_hook_ns += dt;
+    if (recomp_fs_on()) recomp_fs_add(RFS_T_HOOKS, dt);   /* G76 */
     if (!draw) return;
     ++m_hook_n;
     f = d3d8_host_2d_flip_count();

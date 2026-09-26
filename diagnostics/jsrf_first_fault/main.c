@@ -37,6 +37,7 @@ static void jsrf_state_trace_flush(void);
 #endif
 #include "../../src/recomp_switch.h"
 #include "../../src/kernel/d3d8_ring.h"
+#include "../../src/platform/recomp_frame_split.h"
 #include "adx_guard.h"
 #include "guest_trace.h"
 #include "guest_names.h"
@@ -1409,6 +1410,7 @@ static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
 {
     static unsigned n;
     DWORD start = GetTickCount();
+    unsigned long long fs_t0 = recomp_fs_on() ? recomp_fs_now() : 0;   /* G76 */
     int raised = xbox_Nv2aRaiseSoftwareMethod(subchannel, parameter);
     if (++n <= 16 || parameter == 5)
         fprintf(stderr, "[PB-NOTIFY] #%u parameter=%u raised=%d\n", n, parameter, raised);
@@ -1426,6 +1428,7 @@ static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
         }
         Sleep(0);
     }
+    if (fs_t0) recomp_fs_add(RFS_P_SWM, recomp_fs_now() - fs_t0);
     if (n <= 16 || parameter == 5)
         fprintf(stderr, "[PB-NOTIFY] completed parameter=%u\n", parameter);
 }

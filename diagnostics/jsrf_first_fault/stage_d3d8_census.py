@@ -95,6 +95,11 @@ void d3d8_census_abi(unsigned idx, uint32_t esp0, uint32_t esp1, const uint32_t 
 
 static void d3d8c_exit(void) { d3d8c_print("exit"); d3d8c_abi_print("exit"); }
 
+/* G76: RECOMP_FRAME_SPLIT=1 without the census makes the wrappers time the
+ * game's D3D calls instead (g_d3d8_census_on = 2; see recomp_frame_split.h). */
+int recomp_fs_read(void);
+void recomp_fs_d3d_names(const char *const *names, const uint32_t *addrs, unsigned n, unsigned swap_idx);
+
 void d3d8_census_hit(unsigned idx, uint32_t ret)
 {
     if (g_d3d8_census_on < 0) {
@@ -107,11 +112,15 @@ void d3d8_census_hit(unsigned idx, uint32_t ret)
             atexit(d3d8c_exit);
             fprintf(stderr, "[D3D8-CENSUS] armed: %%d entry points, report every %%u swaps\n",
                     D3D8C_N, d3d8c_every);
+        } else if (recomp_fs_read()) {
+            unsigned swap = D3D8C_N;
+            for (unsigned i = 0; i < D3D8C_N; ++i) if (d3d8c_addr[i] == 0x%(swap)08Xu) swap = i;
+            recomp_fs_d3d_names(d3d8c_name, d3d8c_addr, D3D8C_N, swap);
+            g_d3d8_census_on = 2;
         }
-        if (!g_d3d8_census_on)
-            return;
+        return;
     }
-    if (idx >= D3D8C_N)
+    if (g_d3d8_census_on != 1 || idx >= D3D8C_N)
         return;
     if (ret >= 0x%(lo)08Xu && ret < 0x%(hi)08Xu) {
         atomic_fetch_add_explicit(&d3d8c_internal[idx], 1, memory_order_relaxed);
@@ -205,7 +214,8 @@ def main():
         wrappers = ["", "/* ---- D3D8 census wrappers (stage_d3d8_census.py) ---- */",
                     "extern int g_d3d8_census_on;",
                     "void d3d8_census_hit(unsigned idx, uint32_t ret);",
-                    "void d3d8_census_abi(unsigned idx, uint32_t esp0, uint32_t esp1, const uint32_t before[3], const uint32_t after[3]);"]
+                    "void d3d8_census_abi(unsigned idx, uint32_t esp0, uint32_t esp1, const uint32_t before[3], const uint32_t after[3]);",
+                    "unsigned long long recomp_fs_d3d_enter(unsigned idx); void recomp_fs_d3d_exit(unsigned idx, unsigned long long t0);"]
         for start, end, name, idx in sorted(items, reverse=True):
             body = text[start:end]
             manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), path.name))
@@ -349,12 +359,15 @@ def main():
                                     " d3d8m_after_draw(%du, a1, a2, a3); }" % (hooked, kind, body, kind))
                 body = hooked
                 manifest.append("mirror: %s" % name)
+            # G76: census_on 2 is RECOMP_FRAME_SPLIT's timing (outermost call only).
             wrappers.append(
                 "void %s(void) { if (!g_d3d8_census_on) { %s(); return; }"
                 " d3d8_census_hit(%du, MEM32(esp)); if (g_d3d8_census_on <= 0) { %s(); return; }"
+                " if (g_d3d8_census_on == 2) { unsigned long long t0 = recomp_fs_d3d_enter(%du); %s();"
+                " recomp_fs_d3d_exit(%du, t0); return; }"
                 " uint32_t e0 = esp, b0[3] = { ebx, esi, edi }; %s();"
                 " uint32_t b1[3] = { ebx, esi, edi }; d3d8_census_abi(%du, e0, esp, b0, b1); }"
-                % (name, body, idx, body, body, idx))
+                % (name, body, idx, body, idx, body, idx, body, idx))
         # the renamed statics must be declared before any earlier use in this file
         decls = "\n".join("static void d3d8c_orig_%s(void);" % n for _, _, n, _ in items)
         first = min(s for s, _, _, _ in items)
@@ -392,6 +405,36 @@ def main():
                      "void %s(void) { %s(); d3d8m_orig_%s(); }\n" % (fn, name, fn, name))
             cur[found[0]] = text; changed.add(found[0])
             manifest.append("mirror: %s (G43/G42, %s before the original)" % (name, fn))
+
+    # G76: D3D's internal waits and state flush, timed under RECOMP_FRAME_SPLIT
+    # (census_on 2). Internal functions, not entry points: wrapped here, like
+    # the G43 hooks. Off, each costs one compare.
+    for name, bucket in (("sub_00191440", 1),     # D3D_BlockOnTime: the fence spin (RFS_T_WAIT)
+                         ("sub_00191530", 2),     # D3D_MakeRequestedSpace_8: the ring full (RFS_T_SPACE)
+                         ("sub_00196520", 3),     # CDevice_SetStateVB: the lazy state flush (RFS_T_STATE)
+                         ("sub_001966C0", 3),     # CDevice_SetStateUP
+                         ("sub_001912A0", 4)):    # CDevice_KickOff (RFS_T_KICK)
+        if name in plan:
+            raise SystemExit("%s is also a census entry; time it through the entry path" % name)
+        found = [n for n in sorted(cur) if ("void %s(void)\n{" % name) in cur[n]]
+        if len(found) != 1:
+            raise SystemExit("expected exactly one body for %s, found %d" % (name, len(found)))
+        text = cur[found[0]]
+        span = body_span(text, name)
+        if span is None:
+            raise SystemExit("could not delimit %s" % name)
+        body = text[span[0]:span[1]]
+        manifest.append("%s sha256=%s file=%s" % (name, hashlib.sha256(body.encode()).hexdigest(), found[0]))
+        renamed = body.replace("void %s(void)" % name, "static void d3d8t_orig_%s(void)" % name, 1)
+        text = text[:span[0]] + ("static void d3d8t_orig_%s(void);\n" % name) + renamed + text[span[1]:]
+        text += ("\n/* ---- G76 frame-split timer (stage_d3d8_census.py) ---- */\n"
+                 "extern int g_d3d8_census_on; unsigned long long recomp_fs_now(void);"
+                 " void recomp_fs_add_t(unsigned bucket, unsigned long long ns);\n"
+                 "void %s(void) { if (g_d3d8_census_on != 2) { d3d8t_orig_%s(); return; }"
+                 " unsigned long long t0 = recomp_fs_now(); d3d8t_orig_%s(); recomp_fs_add_t(%du, recomp_fs_now() - t0); }\n"
+                 % (name, name, name, bucket))
+        cur[found[0]] = text; changed.add(found[0])
+        manifest.append("timer: %s (G76 RECOMP_FRAME_SPLIT bucket %d)" % (name, bucket))
 
     for n in sorted(changed):
         (dst / n).write_text(cur[n])

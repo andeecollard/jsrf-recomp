@@ -7,6 +7,7 @@
 #include "nv2a_texture_copy.h"
 #include "d3d8_ff_vertex_state.h"
 #include "../recomp_switch.h"
+#include "../platform/recomp_frame_split.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -818,6 +819,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             {   uint32_t need = range * (nattrs ? nattrs : 1u);
                 if (need > vin_cap) { float (*g)[4] = realloc(vin, need * sizeof *g); if (!g) return "out of memory"; vin = g; vin_cap = need; }
                 if (3u * n > vidx_cap) { uint32_t *g = realloc(vidx, 3u * n * sizeof *g); if (!g) return "out of memory"; vidx = g; vidx_cap = 3u * n; } }
+            unsigned long long tf = recomp_fs_on() ? recomp_fs_now() : 0;   /* G76 */
             for (uint32_t v = 0; v < range; ++v)
                 for (unsigned a = 0; a < 16; ++a) {
                     float x[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -827,6 +829,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                     else d->vs_in_noarray |= 1u << a;
                     memcpy(vin[v * nattrs + slot_of[a]], x, 16);
                 }
+            if (tf) recomp_fs_add(RFS_P_FETCH, recomp_fs_now() - tf);
             for (uint32_t k = 0; ; ++k) {
                 uint32_t t[3];
                 if (d->prim == 5u)      { if (3u * k + 2u >= n) break; t[0] = 3u*k; t[1] = 3u*k+1u; t[2] = 3u*k+2u; }
@@ -2051,7 +2054,9 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
         s_in_replace = 1;
         if (!why) why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d);
         s_in_replace = 0;
-        s_rep_ns_build += h2d_now_ns() - t1;
+        {   unsigned long long t2 = h2d_now_ns();
+            s_rep_ns_build += t2 - t1;
+            if (recomp_fs_on()) { recomp_fs_add(RFS_P_REGS, t1 - t0); recomp_fs_add(RFS_P_BUILD, t2 - t1); } }
         if (c->prim >= 1u && c->prim <= 4u) pl_census(c, cls, &d, !why);
         if (why) { ++s_rep_refused; count_reason(why); return; }
         s_rep_ff_evals += d.ff_evals; s_rep_ff_indices += c->count; if (d.ff_gpu) ++s_rep_ff_gpu;
@@ -2071,9 +2076,12 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
     /* Nothing to draw is still a draw the host has fully described: the
      * executor would draw nothing either (every triangle it would keep is
      * one the host kept). Replace it like any other. */
-    if (!s_be.external_draw(&d, s_be.ram, s_be.ram_size)) {
-        ++s_rep_unbound; count_reason(s_be.last_error ? s_be.last_error() : "executor target not bound"); return;
-    }
+    {   unsigned long long te = recomp_fs_on() ? h2d_now_ns() : 0;
+        int drew = s_be.external_draw(&d, s_be.ram, s_be.ram_size);
+        if (te) recomp_fs_add(RFS_P_ENCODE, h2d_now_ns() - te);
+        if (!drew) {
+            ++s_rep_unbound; count_reason(s_be.last_error ? s_be.last_error() : "executor target not bound"); return;
+        } }
     ++s_replaced; if (cls == 2) ++s_replaced_ff; else if (cls == 3) ++s_replaced_vs; else ++s_replaced_2d;
     skip_open(c, d.nverts == 0);
 }

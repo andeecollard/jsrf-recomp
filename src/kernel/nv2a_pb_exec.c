@@ -1,6 +1,7 @@
 #include "nv2a_ff.h"
 #include "d3d8_ring.h"
 #include "../recomp_switch.h"
+#include "../platform/recomp_frame_split.h"
 #include "frame_pool.h"
 /* The accelerated raster path, under one set of names.
  *
@@ -3768,6 +3769,7 @@ static void pb_stage_line(unsigned long long frames, unsigned long long frame_us
                 (double)s_stage_win.n[PB_STAGE_WALK] / (double)frames
                     * 42.0 / 1e6);
     fprintf(stderr, "\n");
+    recomp_fs_report(frames, frame_us);                  /* G76: RECOMP_FRAME_SPLIT, same window */
 
     /* What the `prepare` figure above is actually made of.
      *
