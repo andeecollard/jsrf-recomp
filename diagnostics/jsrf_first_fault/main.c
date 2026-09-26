@@ -2170,12 +2170,16 @@ static int autopilot_pad(XBOX_INPUT_STATE *st)
     int start = 0, a = 0;
     if (on < 0) {
         const char *e = getenv("RECOMP_AUTOPILOT");
-        on = e && !strcmp(e, "garage");
-        if (on) fprintf(stderr, "  [AUTOPILOT] garage: START/A at the title, A at the load menu, A through the"
-                                " Garage's introduction until free play, then hands off\n");
+        on = !e ? 0 : !strcmp(e, "garage") ? 1 : !strcmp(e, "idle") ? 2 : 0;
+        if (on == 1) fprintf(stderr, "  [AUTOPILOT] garage: START/A at the title, A at the load menu, A through the"
+                                     " Garage's introduction until free play, then hands off\n");
+        /* =idle: a connected pad that presses nothing, so the title runs its
+         * attract demo -- the game's own playback, the same in every arm. */
+        if (on == 2) fprintf(stderr, "  [AUTOPILOT] idle: a connected pad that presses nothing\n");
     }
     if (!on) return 0;
     memset(st, 0, sizeof *st);
+    if (on == 2) return 1;
     if (!base) return 1;
     now = autopilot_now();
     if (done) {
