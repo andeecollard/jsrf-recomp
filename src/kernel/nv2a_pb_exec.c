@@ -1989,16 +1989,30 @@ static unsigned long s_snap_seq;    /* ++ on every copy actually performed */
  * later than a whole period resets it. Sleeps to 1 ms short and yields the
  * rest, because nanosleep on macOS overshoots by that much under load.
  * RECOMP_FLIP_PACE=0 restores free-running flips. */
+/* G76: RECOMP_FLIP_PACE_TILL_JUMP=1 paces the flips, as the default does,
+ * only until RECOMP_CHAPTER_JUMP fires (chapter_select.c calls
+ * nv2a_pb_exec_flip_pace_release), and free afterwards: a FLIP_PACE=0
+ * measurement of the stage, with the title at the speed the harness drives
+ * it at. JSRF's title times out into its attract loop by frames, so a title
+ * running at 110 fps (the arms with G76's pusher levers; 51 without) went
+ * to the attract loop before the harness's START was taken, three runs of
+ * three. */
+static int s_flip_pace_released;
+void nv2a_pb_exec_flip_pace_release(void) { s_flip_pace_released = 1; }
 static unsigned long long g_flip_paced, g_flip_pace_wait_us;
 static void flip_pace(void)
 {
-    static int on = -1;
+    static int on = -1, till = -1;
     static double next;
     const double period = 1001.0 / 60000.0;
     struct timespec ts;
     double now;
     if (on < 0) on = recomp_switch_on_default("RECOMP_FLIP_PACE", 1);
-    if (!on) return;
+    if (till < 0) {
+        till = recomp_switch_on("RECOMP_FLIP_PACE_TILL_JUMP");
+        if (till) fprintf(stderr, "[FLIP-PACE] RECOMP_FLIP_PACE_TILL_JUMP=1: flips paced until the chapter jump fires (G76)\n");
+    }
+    if (!on && !(till && !s_flip_pace_released)) return;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     if (next == 0.0 || now > next + period) {           /* first flip, or a long stall */

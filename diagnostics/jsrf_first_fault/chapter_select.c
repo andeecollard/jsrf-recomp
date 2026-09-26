@@ -307,6 +307,8 @@ static void jump_step(uint32_t seq)
         var_set(VAR_AFTER_STAGE, SEQ_ST_TUTORIAL_PREP);
         MEM32(m + MSN_STATE) = MSN_ST_EXIT_TO_SEQ;
         s_fired = 1;
+        {   extern void nv2a_pb_exec_flip_pace_release(void);   /* G76: RECOMP_FLIP_PACE_TILL_JUMP */
+            nv2a_pb_exec_flip_pace_release(); }
         fprintf(stderr, "[CHAPTER-JUMP] fired at frame %lu: mssn%02u%02u settled in free play for %u frames;"
                 " ending it through mission state 0x63, next sequence state 0x20 -> mssn%02u%02u%s\n",
                 s_frames, (key >> 16) & 0xFFFFu, key & 0xFFFFu, s_settled, s_jump.c, s_jump.m,
