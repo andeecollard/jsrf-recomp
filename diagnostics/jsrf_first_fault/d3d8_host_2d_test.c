@@ -2985,6 +2985,7 @@ int main(int argc, char **argv)
     }
     if (argc > 1 && strcmp(argv[1], "vs") == 0) {           /* G51.2: the programmable class */
         setenv("RECOMP_D3D8_HOST_VS", "shadow", 1);
+        setenv("RECOMP_METAL_ASYNC_HOST_VSH", "1", 1);   /* the no-wait path (default off) */
         vs_tests();
         vs_fog_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");

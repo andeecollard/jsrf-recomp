@@ -330,7 +330,7 @@ static int fail(const char *why) { s_err = why; return -1; }
 static _Atomic unsigned long long s_pa_hits, s_pa_compiles, s_pa_plain;
 static unsigned long long s_pa_wait_ns, s_pa_wait_max_ns, s_pa_wait_n;   /* the draw thread only */
 
-/* RECOMP_METAL_ASYNC_HOST_VSH (default on): A PROGRAMMABLE OR GPU-UNIT DRAW
+/* RECOMP_METAL_ASYNC_HOST_VSH (default OFF): A PROGRAMMABLE OR GPU-UNIT DRAW
  * NEVER WAITS FOR A COMPILE. Nothing in the host can stand in for such a
  * draw's vertex function, so it used to wait: for the executor's library of
  * the program (nv2a_metal_vsh_function, which settled EVERY background job and
@@ -341,13 +341,24 @@ static unsigned long long s_pa_wait_ns, s_pa_wait_max_ns, s_pa_wait_n;   /* the 
  * draw is the executor's, as every other refusal is -- its CPU vertex path
  * while the program's library compiles, its GPU one after. The frames that
  * differ are the one or two a compile takes, and only by what separates the
- * executor's draw from the host's. =0 waits and compiles in line, as before;
- * the unit tests' in-line mode (d3d8_host_2d_metal_set_spec_sync) waits too. */
+ * executor's draw from the host's. Off (the default) waits and compiles in
+ * line, as before; the unit tests' in-line mode (d3d8_host_2d_metal_set_spec_sync)
+ * waits either way.
+ *
+ * OFF BY DEFAULT because it is not exact by construction -- for the frames a
+ * compile takes, the executor draws what the host would have -- and because
+ * the scene it was written for was not reached by a run. Measured (26 Sep,
+ * scratch archive): Garage and Rokkaku-dai free play, frame_match against the
+ * same arm without it 0.00% and 0.53% (the latter the arm's own cold-vs-warm
+ * level); a replay of the player's recording that stayed in the Garage, draw
+ * thread 8.2 s -> 0.37 s cold. Not measured: the graffiti studio, Shibuya, a
+ * player session. A cold session takes more frames over 33 ms (20 -> 52 in
+ * the replay) while libraries compile and their draws take the CPU path. */
 static unsigned long long s_vs_nowait_lib, s_vs_nowait_pso;   /* the draw thread only */
 static int async_host_vsh_on(void)
 {
     static int on = -1;
-    if (on < 0) on = recomp_switch_on_default("RECOMP_METAL_ASYNC_HOST_VSH", 1);
+    if (on < 0) on = recomp_switch_on_default("RECOMP_METAL_ASYNC_HOST_VSH", 0);
     return on;
 }
 static id<MTLRenderPipelineState> make_pipeline(MTLRenderPipelineDescriptor *pd, NSError **err)
@@ -813,8 +824,8 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
      * bit 2048 compiles in line, as before; the unit tests do too, so they
      * test the specialised program and not its stand-in. */
     /* A programmable draw compiled in line -- nothing in the host can stand
-     * in for its vertex program -- until RECOMP_METAL_ASYNC_HOST_VSH: now it
-     * compiles in the background like the rest, and the draw is refused to
+     * in for its vertex program -- unless RECOMP_METAL_ASYNC_HOST_VSH=1: then
+     * it compiles in the background like the rest, and the draw is refused to
      * the executor until the pipeline is published. */
     if (s_spec_sync || (vfn && !async_host_vsh_on()) || (d3d8_host_2d_bisect() & 2048u)) {
         NSError *err = nil;

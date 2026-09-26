@@ -1754,7 +1754,7 @@ static void pipe_prewarm(id<MTLFunction> vfn, id<MTLLibrary> lib)
 
 /* Wait for every background compile, releasing the test hold first, and then
  * for the archive to be written. For tests, and for nv2a_metal_vsh_function
- * when its caller asks to wait (RECOMP_METAL_ASYNC_HOST_VSH=0, or the tests). */
+ * when its caller asks to wait (RECOMP_METAL_ASYNC_HOST_VSH off, or the tests). */
 void nv2a_metal_pipelines_settle(void)
 {
     if (!g_pipe_group) return;
@@ -2215,8 +2215,8 @@ void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs
     /* the executor thread: the host shadow and replace run there */
     if (!words || length <= 0 || !initialize()) return NULL;
     v = vsh_lookup_ex(words, length, 0, 0, inputs);
-    /* A PROGRAM STILL COMPILING IS NOT WAITED FOR (RECOMP_METAL_ASYNC_HOST_VSH,
-     * d3d8_host_2d_metal.m). The host refuses the draw and the executor draws
+    /* A PROGRAM STILL COMPILING IS NOT WAITED FOR under RECOMP_METAL_ASYNC_HOST_VSH=1
+     * (d3d8_host_2d_metal.m; default off). The host refuses the draw and the executor draws
      * it, which for a program still compiling is its CPU batch -- the same
      * fallback RECOMP_METAL_ASYNC_VSH gives the executor's own draws.
      *

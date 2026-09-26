@@ -223,9 +223,9 @@ int d3d8_host_vs_mode(void);
  * its vs_gpu vertex function as an id<MTLFunction>, and its packed attribute
  * count. NULL if the translator or compiler refused it, or -- when `wait` is
  * 0 -- if its library is still compiling in the background, which the caller
- * leaves to the executor (RECOMP_METAL_ASYNC_HOST_VSH). `wait` 1 waits for
- * every background compile first, as the host did before that switch, and as
- * the unit tests still do. *pending (optional) is 1 when NULL means "still
+ * leaves to the executor (RECOMP_METAL_ASYNC_HOST_VSH=1). `wait` 1 waits for
+ * every background compile first, as the host does with that switch off (the
+ * default), and as the unit tests do. *pending (optional) is 1 when NULL means "still
  * compiling" rather than "refused". Executor thread. */
 void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs, int wait,
                               int *pending);
