@@ -370,3 +370,17 @@ paths.conf or the `JSRF_APP_LIFT` block (not rebuilt here). What a harness
 cannot show: RECOMP_SWM_WAKE wakes every waiting guest thread 3-4 times a
 frame, and the CRI sound pumps are among them -- audio (silenced in every
 run) wants a listen, and the paths.conf RECOMP_APU_* set was in every run.
+
+## Player session on the full lift bundle (26 Sep, morning; b4b263f)
+
+> sound is good, water is there, graffiti got stuck for a moment, pressed M,
+> painting works
+
+Log `measure/player-2026-09-26-fullift.log`, flight `measure/player-2026-09-26-flight-1`.
+Mean 17.13 ms (paced), p90 18.0, p99 19.5. The one stall: a synchronous
+guest vertex-program library compile in the graffiti studio, 4,170.8 ms on
+the draw thread ("program library 35/23" -- 23 of 58 compiled in line). Not
+the lift. The studio is reached by talking to Roboy in the Garage. Being fixed
+(vertex libraries off the draw thread and into the archive). Confirmed in
+play: RECOMP_SWM_WAKE leaves the sound unchanged, G75's bump water draws,
+G59's studio paints on the host's LIN32 path.
