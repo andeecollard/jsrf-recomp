@@ -254,3 +254,119 @@ look at.
 **Ready for the player?** As an opt-in, yes -- the five switches in
 paths.conf or the `JSRF_APP_LIFT` block. The water and the graffiti studio
 are the two things only a player session will show.
+
+## G76 result (26 Sep, early morning)
+
+Branch commits 85cb1c0, 2b8ae67, 60dd0e4, b95d83f, 4d81b35, 8ab8271,
+b70fb43 and this one. Runs: `~/jsrf-build/runs/g76/` (G75's map_run
+method: FLIP_PACE=0, 50 s free play, flight at free play +900).
+
+**Where the frame goes.** `RECOMP_FRAME_SPLIT=1` (2b8ae67, read-only) times
+the title's thread through the census wrappers (every game-called D3D entry
+point at its outermost call, D3D_BlockOnTime, MakeRequestedSpace, the state
+flush, the mirror's hooks, its kernel calls), the pusher's host tokens and
+waits, and the GPU's command-buffer coverage, per frame over [STAGE]'s
+window. `gametools/frame_split.py` averages a run. The full arm, ms a frame
+(one run each, free play; the instrument's own cost was inside the spread:
+18.42 against 18.68 without it):
+
+| | Shibuya 2:10 before | after | Sky Dino 6:60 before | after |
+|---|---|---|---|---|
+| **frame** | **18.55** | **11.85** | **21.24** | **12.50** |
+| title: game logic | 2.85 | 2.83 | 2.31 | 2.28 |
+| title: D3D, not waiting (of it mirror hooks) | 3.75 (2.18) | 3.53 (2.11) | 3.74 (2.33) | 3.69 (2.27) |
+| title: waiting on D3D's fence (the pusher) | 11.94 | 5.49 | 15.15 | 6.49 |
+| pusher: host draws (replace) | 9.94 | 7.24 | 11.50 | 8.23 |
+| -- FF registers / build (of it vertex fetch) | 0.24 / 3.64 (3.13) | 0.25 / 2.07 (1.07) | 0.32 / 5.23 (3.93) | 0.33 / 3.05 (1.49) |
+| -- host encode | 4.69 | 4.04 | 5.13 | 4.31 |
+| pusher: mirror cross-checks | 0.98 | 0.10 | 1.06 | 0.10 |
+| pusher: waiting for a software method's ack | 1.74 | 0.13 | 2.03 | 0.16 |
+| pusher: [STAGE] stages / idle | 0.28 / 0.05 | 0.24 / 0.03 | 0.25 / 0.00 | 0.24 / 0.00 |
+| pusher: push-buffer walk and the rest | 5.56 | 4.12 | 6.41 | 3.77 |
+| GPU: command buffers covered | 2.67 | 2.83 | 3.54 | 3.44 |
+
+**The pusher sets the frame**, before and after: its idle is 0, and the
+title's thread spends the difference waiting in D3D_BlockOnTime (through
+MakeRequestedSpace: the ring is full) -- 11.9 and 15.2 ms of an 18.6 and
+21.2 ms frame before, 5.5 and 6.5 after. The title's own work is ~6 ms a
+frame (game ~2.3-2.9, D3D ~3.7 of which the mirror's hooks ~2.2); the GPU
+is covered for ~3 ms. Other threads' D3D time is CRI's two sound pumps in
+BlockUntilVerticalBlank (~40 ms a frame between them), off the frame's path.
+D3D's own bookkeeping is small: DrawIndexedVertices is the only entry point
+over 0.4 ms a frame once the fence wait is taken out, and the state flush
+(SetStateVB) is 0.6. Lifting D3D's functions would not move the frame.
+
+**The FF build's rise (G75's open item).** Built at four commits in one
+process (`jsrf_d3d8_host_2d_test ffbench 384`): 562dd62 10.30, 67fbaa7
+10.27, b355b06 10.84, f2fac38 11.18 us a 384-vertex strip, a quad 1.15 us
+at every one. Per vertex, from b355b06 on. b355b06's one change on that
+path (fetch(ram) -> fetch(vram), for DrawVerticesUP's copy) put back makes
+it slower (11.43). fetch() is out of line at every commit, called per
+attribute per vertex, and the loop's speed moved with the code generated
+around it as G75 grew the builder -- not with anything G75 does per vertex.
+The fix is the loop itself (fetch_run, below): 10.8 -> 4.5 us.
+
+**jsrf_d3d8_host_2d_seq (85cb1c0).** Not a race in the lift and not new.
+Every host arm of a failing run differed from the executor's reference by
+the same 9 pixels, one green step. The executor compiles a specialised
+pipeline in the background and draws with the generic stand-in until it
+lands (167bc1e, before 042b2a4); the stand-in is not bit-exact under 1,000
+blended draws (RECOMP_METAL_PIPELINE_HOLD=1 fails every run). How many
+draws beat the compile was up to the machine's load: 3 of 15 under ctest
+-j8, 0 of 50 alone. The seq arm now compiles in line on both sides; 15 of
+15 under -j8.
+
+**The levers**, each behind its own switch, default off:
+
+| switch | what it removes | Shibuya | Sky Dino |
+|---|---|---|---|
+| `RECOMP_D3D8_HOST_FAST_FETCH` | the GPU-unit build's per-vertex fetch(): one loop per attribute over the range, the same floats (jsrf_d3d8_host_fast_fetch, bit for bit) | fetch 3.13 -> 1.07 | 3.93 -> 1.49 |
+| `RECOMP_D3D8_HOST_IB_CHUNK` | a newBufferWithBytes per FF draw for its triangle list | encode 4.69 -> 4.23 | 5.13 -> 4.94 |
+| `RECOMP_D3D8_HOST_TEX_INDEX` | a scan of the host's texture cache per sampled unit | encode -> 4.04 | -> 4.31 |
+| `RECOMP_D3D8_HOST_NO_CHECK` | the mirror's per-draw cross-checks in draw mode | 0.98 -> 0.10 | 1.06 -> 0.10 |
+| `RECOMP_SWM_WAKE` | ~0.5 ms per software method: the GPU interrupt waited for a waiting guest thread's 1 ms poll | 1.74 -> 0.13 | 2.03 -> 0.16 |
+| `RECOMP_PB_ELEM16_RUN` | one dispatch per inline index word (187,000 of 270,000 words a frame in Sky Dino) | walk 5.56 -> 4.12 | 6.41 -> 3.77 |
+
+Frame means, all six against the full arm, two rounds each, no instrument,
+same binary (snap-f5), FLIP_PACE=0 free play:
+
+| stage | full arm (G75's switches) | + G76's six | p50 / p90 after | frame_match after vs before, median / worst (before vs before) |
+|---|---|---|---|---|
+| Shibuya 2:10 | 18.56, 18.61 | **11.49, 11.49** | 11.0 / 13.5 | 0.29 / 0.31%, 0.28 / 0.30% (0.28 / 0.30%) |
+| Sky Dino 6:60 | 21.37, 21.44 | **12.67, 12.72** | 12.5, 12.0 / 14.0, 14.5 | 0.27 / 0.32%, 0.48 / 0.52% (0.47 / 0.53%) |
+| Garage 1:00 | 10.0 (G75) | 8.47 | 8.5 / 9.0 | 0.00 / 0.00% against G75's full arm |
+| Rokkaku-dai 2:40 | 11.8 (G75) | 8.46 | 8.5 / 9.0 | 0.52 / 0.55% against G75's full arm |
+
+Every flight frame pairs with a distinct frame of the other arm (48 of 48).
+Garage and Rokkaku are one arm each against G75's session, not a same-day
+A/B. All four stages are under 16.7 ms at the mean and at p90.
+
+**The harness's title.** With all six switches the harness lost the title
+three runs of three: the title ran at ~110 fps (51 without), and it falls
+into its attract loop by frames before START is taken. Each switch alone
+passed. `RECOMP_FLIP_PACE_TILL_JUMP=1` (b70fb43) paces until the chapter
+jump and runs free after it; every G76 A/B arm above ran with it, before
+and after alike. The player's app always paces, so it never sees this.
+
+**Next lever.** The pusher still sets the frame (idle 0; the title waits
+5.5-6.5 ms). What is left on it in Sky Dino: host encode 4.3 ms (7.4 us a
+draw: a 3 KB constant file set per FF draw, a byte-wise FNV over the ~250-
+byte pipeline key and a scan of the specialised pipelines, depth-state and
+sampler lookups, eight texture/sampler binds), the build's non-fetch 1.6 ms
+(a 4 KB memset of the draw, an snprintf of the attribute text, the 3 KB
+constant copy in the FF-GPU hook, triangle assembly), the walk 3.8 ms (the
+~82,000 words a frame that are not inline indices, of ~269,000). Two ways on, in order of cost:
+- trim encode and build in place (constants uploaded once per change, the
+  pipeline key hashed as words and the last key remembered, the text built
+  only when a flight record asks): ~2 ms a frame, Sky Dino ~10.5 ms;
+- build the draw on the title's thread, in the mirror's hook, where the
+  vertex data is current by construction and 5.5-6.5 ms a frame is spent
+  waiting: moves regs+build (~3.4 ms) off the pusher; the title would then
+  be ~9.5 ms busy and set the frame (~10 ms).
+Lifting D3D's own functions is not a lever for the frame (above).
+
+**Ready for the player?** As an opt-in: the six switches plus G75's five in
+paths.conf or the `JSRF_APP_LIFT` block (not rebuilt here). What a harness
+cannot show: RECOMP_SWM_WAKE wakes every waiting guest thread 3-4 times a
+frame, and the CRI sound pumps are among them -- audio (silenced in every
+run) wants a listen, and the paths.conf RECOMP_APU_* set was in every run.
