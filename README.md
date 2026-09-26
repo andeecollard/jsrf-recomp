@@ -9,9 +9,10 @@ model and the MCPX audio model all come from that project; this repository is a
 fork specialised to get one title running, with the general fixes sent back
 upstream where they belong.
 
-> **Work in progress, not a release.** As of 25 September 2026 the game is
-> playable into chapter 2: story missions, cutscenes, graffiti, music and the
-> controller all work, and every chapter can be entered. What is still wrong,
+> **Work in progress, not a release.** As of 26 September 2026 the game is
+> playable into chapter 2 at a steady **60 fps** on Apple Silicon: story
+> missions, cutscenes, graffiti, music and the controller all work, and every
+> chapter can be entered. What is still wrong,
 > and what has not been checked yet, is listed below and in
 > [docs/jsrf/STATUS.md](docs/jsrf/STATUS.md).
 
@@ -44,23 +45,49 @@ stay out of the repository.
 - Every chapter can be entered unattended (`RECOMP_CHAPTER_JUMP`); chapters 2
   and 5 were entered and played without a fault.
 
-**Fixed in code, waiting for a player to confirm:** Roboy's graffiti studio
-(its canvas is a linear 32-bit texture that was refused), and the water in
-Rokkaku-dai (bump-environment mapping is now implemented rather than drawn
-flat).
+- Roboy's graffiti studio paints, and Rokkaku-dai's water is drawn with its
+  bump-environment mapping (both confirmed 26 Sep).
+- **60 fps.** With the Direct3D lift (below) a player session on 26 Sep ran at
+  17.1 ms a frame against the 16.7 ms vsync cap, p99 19.5 ms. Uncapped, in
+  free play:
+
+  | stage | NV2A model | Direct3D lift |
+  |---|---|---|
+  | Garage | 18.2 ms | 8.5 ms |
+  | Rokkaku-dai Heights | 21–23 ms | 8.5 ms |
+  | Shibuya Terminal | 29.0 ms | 11.5 ms |
+  | Sky Dinosaurs | 35–37 ms | 12.7 ms |
+
+## The Direct3D lift
+
+The game talks to the Xbox GPU only through Direct3D 8. Instead of decoding
+the push buffer Direct3D writes and modelling the NV2A register by register,
+the lift follows Direct3D's own calls and draws them on the host GPU, from
+Direct3D's own derivations (texture stage modes, the pixel shader's final
+combiner, point sizes, bump matrices). It now draws 99.3–99.6% of every frame;
+the one draw left to the NV2A model is Direct3D's own swap-copy quad. Every
+change is checked against the NV2A model per draw (`RECOMP_D3D8_HOST_VERIFY`)
+and per whole frame at the same moment of a stage
+(`gametools/frame_match.py`): the lift and the model differ by under 1% of
+pixels, which is lighting rounding and animation phase.
+
+It is opt-in in the engine, and on in a bundle built with
+`JSRF_APP_LIFT=1 packaging/make_app.sh …`; `paths.conf` can turn any part
+off. The plan and the measurements are in
+[docs/jsrf/goals/JSRF_GOALS_2026-09-25_EVENING_FINISH_THE_LIFT.md](docs/jsrf/goals/JSRF_GOALS_2026-09-25_EVENING_FINISH_THE_LIFT.md).
 
 **Still wrong or unknown:**
 
-- Corrupt glyphs in some speech boxes and trick names.
+- One 4-second stall the first time the graffiti studio opens: a vertex
+  program compiled on the draw thread (being moved off it, 26 Sep).
+- A thin grey line above some speech-box letters; measured to be the shipped
+  font's bilinear bleed, so probably authentic, pending an xemu comparison.
 - Elements missing from the Poison Jam chase cutscenes.
 - Chapters 3–9 have been entered but not played through; a sweep of all 74
   cutscenes that can be reached unattended is in progress.
-- Performance is measured only in some scenes: in the tutorial a frame takes
-  about 11.5 ms (86 fps uncapped) since combiner specialisation (24 Sep); the
-  last measurement of heavy scenes, before that change, was a 50 fps median
-  (23 Sep).
-- Rendering still goes through the NV2A model; a Direct3D-level lift exists and
-  is checked against it in shadow mode, but is not the default yet.
+- The lift is not yet the engine's default, only the app bundle's.
+- Windows: the MinGW cross-build runs (tested under CrossOver); porting the
+  lift's host renderer to Direct3D 11 is in progress.
 
 ## Build and play
 
@@ -77,8 +104,9 @@ cmake -S diagnostics/jsrf_first_fault -B build -DRECOMP_GEN_DIR=<gen dir>
 cmake --build build -j
 ctest --test-dir build
 
-# 3. a double-clickable app with its libraries bundled
-diagnostics/jsrf_first_fault/packaging/make_app.sh build/jsrf_first_fault <dest dir>
+# 3. a double-clickable app with its libraries bundled (JSRF_APP_LIFT=1: the
+#    Direct3D lift on, which is what reaches 60 fps)
+JSRF_APP_LIFT=1 diagnostics/jsrf_first_fault/packaging/make_app.sh build/jsrf_first_fault <dest dir>
 ```
 
 `JSRF.app` reads `~/Library/Application Support/JSRF/paths.conf` for the game
@@ -133,8 +161,9 @@ The current plan is the newest file in [docs/jsrf/goals/](docs/jsrf/goals/);
 
 General fixes go back to xboxrecomp as pull requests from a fork: ten have
 been merged so far (lifter flag semantics, rotates, SHLD/SHRD, `movsd`
-dispatch, APU mix-down, an SVOD reader), others are open, and a fix for
-`frndint` rounding is prepared.
+dispatch, APU mix-down, an SVOD reader), and others are open, among them
+`frndint` honouring the x87 rounding mode (the cutscene dropouts above) and
+REPE CMPS/SCAS flags.
 
 ## Licence and credit
 

@@ -8,6 +8,20 @@ corrected on the night of 21 September against the 1167 s player session in
 Every number here came from a run; where something is believed rather than
 measured it says so.
 
+## Summary, 26 September 2026
+
+| area | state | basis |
+|---|---|---|
+| frame rate | 60 fps with the Direct3D lift (the app bundle's default, `JSRF_APP_LIFT=1`): player session 17.1 ms mean against the 16.7 ms cap, p99 19.5; uncapped free play Garage 8.5, Rokkaku 8.5, Shibuya 11.5, Sky Dino 12.7 ms (NV2A model: 18.2, 21–23, 29.0, 35–37) | measured: player session 26 Sep, scene-matched harness arms (G73–G76) |
+| Direct3D lift coverage | 99.3–99.6% of draws on four stages; frame_match against the NV2A model under 1% | measured (G75, G76) |
+| sound on the lift bundle | unchanged by `RECOMP_SWM_WAKE` | player session 26 Sep: "sound is good" |
+| graffiti studio / Rokkaku water on the lift | draw and paint | player session 26 Sep |
+| graffiti studio first open | one 4.17 s stall: a vertex-program library compiled on the draw thread | measured in the player log; fix in progress |
+| G2 corrupt glyphs | 0 clobbers in 813 opportunities (25 Sep re-measure); the thin line above text (G71) is the shipped font's bilinear bleed, pending xemu | measured |
+| Windows | cross-build runs under CrossOver (20 Sep); the lift's D3D11 backend in progress | measured 20 Sep |
+
+The 25 September summary below stands except where this one supersedes it.
+
 ## Summary, 25 September 2026 (updated after the player's morning session)
 
 Newest first; the sections below it are the older measured record and remain
