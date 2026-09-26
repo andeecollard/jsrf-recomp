@@ -2428,6 +2428,27 @@ static void vs_draw_tests(void)
         CHECK(g_fake_skip == 0 && s1.replaced == s0.replaced, "programmable VS draw mode: no captured program, left to the executor");
     }
 }
+/* RECOMP_METAL_ASYNC_HOST_VSH: a programmable draw never waits for a compile.
+ * The host refuses it while the program's library, and then its pipeline,
+ * compile in the background (the game's executor draws it meanwhile); this
+ * draws `d` into `px` (reset from `bg` before each try) once both are
+ * published. *first gets the first try's refusal, or "" if it drew. */
+static int vs_render_published(const D3D8Host2DDraw *d, uint16_t *px, const uint16_t *bg, size_t bytes, const char **first)
+{
+    *first = NULL;
+    for (int k = 0; k < 400; ++k) {
+        memcpy(px, bg, bytes);
+        if (d3d8_host_2d_metal_render(d, ram, RAM_SIZE, px, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0) {
+            if (!*first) *first = "";
+            return 0;
+        }
+        if (!*first) *first = d3d8_host_2d_metal_last_error();
+        if (!strstr(d3d8_host_2d_metal_last_error(), "still compiling")) return -1;
+        nv2a_metal_pipelines_settle();
+        usleep(5000);
+    }
+    return -1;
+}
 static void vs_tests(void)
 {
     static uint16_t a[RTPITCH / 2 * RTH], b[RTPITCH / 2 * RTH], bg[RTPITCH / 2 * RTH];
@@ -2445,8 +2466,11 @@ static void vs_tests(void)
     /* The reference: the program on the CPU interpreter, per corner. */
     vs_reference(&d, &r, rv);
     background(bg); memcpy(a, bg, sizeof bg); memcpy(b, bg, sizeof bg);
-    CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0,
-          "the host drew it through the executor's translation (%s)", d3d8_host_2d_metal_last_error());
+    {   const char *first;
+        int ok = vs_render_published(&d, a, bg, sizeof bg, &first) == 0;
+        CHECK(first && strstr(first, "library is still compiling"),
+              "the first draw of a new program is refused while its library compiles, not waited for (%s)", first ? first : "?");
+        CHECK(ok, "the host drew it through the executor's translation once published (%s)", d3d8_host_2d_metal_last_error()); }
     CHECK(d3d8_host_2d_metal_render(&r, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0, "the reference drew");
     {   D3D8H2DDiff df;
         d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
@@ -2604,8 +2628,9 @@ static void vs_fog_tests(void)
         rv[k].f[0] = o.output[5][0];
     }
     background(bg); memcpy(a, bg, sizeof bg); memcpy(b, bg, sizeof bg);
-    CHECK(d3d8_host_2d_metal_render(&d, ram, RAM_SIZE, a, RTPITCH / 2, NULL, 0, 0, RTW, RTH) == 0,
-          "VS fog: the host drew it through the executor's translation (%s)", d3d8_host_2d_metal_last_error());
+    {   const char *first;
+        CHECK(vs_render_published(&d, a, bg, sizeof bg, &first) == 0,
+              "VS fog: the host drew it through the executor's translation (%s)", d3d8_host_2d_metal_last_error()); }
     d3d8_host_2d_metal_render(&r, ram, RAM_SIZE, b, RTPITCH / 2, NULL, 0, 0, RTW, RTH);
     d3d8_host_2d_diff(bg, b, a, RTPITCH / 2, RTH, 1, &df);
     printf("  VS fog: reference changed %llu px, host %llu, over tolerance %llu, max error r%u g%u b%u\n",

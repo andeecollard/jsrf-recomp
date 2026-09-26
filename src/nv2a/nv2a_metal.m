@@ -1406,6 +1406,7 @@ static uint64_t g_pk_sync[PK_N], g_pk_async[PK_N];
 static uint64_t g_pipe_wait_ns, g_pipe_wait_max_ns;   /* the draw thread, compiling */
 static uint64_t g_pipe_bg_ns, g_pipe_bg_max_ns;       /* the background queues */
 static uint64_t g_pipe_spec_pending_draws, g_pipe_vsh_pending_batches;
+static uint64_t g_settle_n, g_settle_jobs_ns, g_settle_arch_ns, g_settle_arch_max_ns;   /* nv2a_metal_pipelines_settle's caller */
 static uint64_t g_arch_hits, g_arch_misses, g_arch_adds, g_arch_add_fail, g_arch_saves, g_arch_save_fail;
 static unsigned g_arch_shards, g_arch_discarded;
 static const char *g_arch_state = "off";
@@ -1752,17 +1753,21 @@ static void pipe_prewarm(id<MTLFunction> vfn, id<MTLLibrary> lib)
 }
 
 /* Wait for every background compile, releasing the test hold first, and then
- * for the archive to be written. For tests, and for the one caller that cannot
- * take a fallback (nv2a_metal_vsh_function). */
+ * for the archive to be written. For tests, and for nv2a_metal_vsh_function
+ * when its caller asks to wait (RECOMP_METAL_ASYNC_HOST_VSH=0, or the tests). */
 void nv2a_metal_pipelines_settle(void)
 {
     if (!g_pipe_group) return;
+    uint64_t t0 = mtl_now_ns(), t1;
     pthread_mutex_lock(&g_pipe_hold_mu);
     g_pipe_held = 0;
     pthread_cond_broadcast(&g_pipe_hold_cv);
     pthread_mutex_unlock(&g_pipe_hold_mu);
     dispatch_group_wait(g_pipe_group, DISPATCH_TIME_FOREVER);
+    t1 = mtl_now_ns();
     if (g_arch_q) dispatch_sync(g_arch_q, ^{ if (@available(macOS 11.0, *)) pipe_archive_save_now(); });
+    ++g_settle_n; g_settle_jobs_ns += t1 - t0; g_settle_arch_ns += mtl_now_ns() - t1;
+    pipe_max(&g_settle_arch_max_ns, mtl_now_ns() - t1);
     /* Re-armed, so a test can hold, settle and hold again: jobs submitted
      * after this wait for the NEXT settle. */
     if (pipe_hold_on()) {
@@ -1786,7 +1791,8 @@ static void pipe_report(void)
     }
     fprintf(stderr, "[METAL] pipeline compiles: async=%llu sync=%llu (async/sync: %s);"
             " draw thread waited %.1f ms, worst %.1f ms; background %.1f ms, worst %.1f ms;"
-            " pending: %llu draws took the generic pipeline, %llu batches the CPU vertex path"
+            " pending: %llu draws took the generic pipeline, %llu batches the CPU vertex path;"
+            " settle: %llu waits, %.1f ms for the queues, %.1f ms for the archive, worst %.1f ms"
             " (metal_async_pipelines %s, metal_async_vsh %s%s)\n",
             (unsigned long long)as, (unsigned long long)sy, by[0] ? by : "none",
             g_pipe_wait_ns / 1e6, g_pipe_wait_max_ns / 1e6,
@@ -1794,6 +1800,8 @@ static void pipe_report(void)
             __atomic_load_n(&g_pipe_bg_max_ns, __ATOMIC_RELAXED) / 1e6,
             (unsigned long long)g_pipe_spec_pending_draws,
             (unsigned long long)g_pipe_vsh_pending_batches,
+            (unsigned long long)g_settle_n, g_settle_jobs_ns / 1e6, g_settle_arch_ns / 1e6,
+            g_settle_arch_max_ns / 1e6,
             async_pipelines_on() ? "on" : "OFF", async_vsh_on() ? "on" : "OFF",
             pipe_hold_on() ? ", HELD for a test" : "");
     fprintf(stderr, "[METAL] pipeline archive: %s%s%s; shards=%u discarded=%u hits=%llu"
@@ -1842,6 +1850,7 @@ typedef struct {
 static VshSlot vsh_slot[VSH_CACHE];
 static unsigned vsh_slot_n;
 static VshSlot *vsh_active;          /* the program this draw will use, or NULL */
+static int g_vsh_last_pending;       /* vsh_lookup_ex's last NULL was "still compiling"; the draw thread */
 
 /* ---- G38c: the diffuse/specular alpha a guest vertex program writes, as a range ----
  *
@@ -2083,6 +2092,7 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
 {
     uint32_t h = is_ff ? vsh_hash((const uint32_t (*)[4])blob, (int)(keysize / 16))
                        : vsh_hash((const uint32_t (*)[4])blob, length);
+    g_vsh_last_pending = 0;
     size_t bytes = is_ff ? (size_t)keysize : (size_t)length * 16;
     unsigned i, n;
     for (i = 0; i < vsh_slot_n; ++i) {
@@ -2095,6 +2105,7 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
             /* STILL COMPILING: a CPU batch, exactly as a refusal is, and
              * asked again next batch. Counted, so a run can say how many. */
             ++g_pipe_vsh_pending_batches;
+            g_vsh_last_pending = 1;
             return NULL;
         }
         ++g_vsh_hits;
@@ -2179,6 +2190,7 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
                 v->pending = 1;
                 pipe_submit(PK_VSHLIB, build);
                 ++g_pipe_vsh_pending_batches;
+                g_vsh_last_pending = 1;
                 free(emitted); free(wrapped);
                 return NULL;
             }
@@ -2195,20 +2207,34 @@ static VshSlot *vsh_lookup_ex(const void *blob, int length, unsigned keysize,
  * host's programmable-VS draw -- the same cache, the same translation, the
  * same wrapper, so the host's transform IS the executor's. Its Out matches the
  * host fragment's stage_in member for member (p, d0, d1, t0..t3). */
-void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs)
+void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs, int wait,
+                              int *pending)
 {
     VshSlot *v;
+    if (pending) *pending = 0;
     /* the executor thread: the host shadow and replace run there */
     if (!words || length <= 0 || !initialize()) return NULL;
     v = vsh_lookup_ex(words, length, 0, 0, inputs);
-    /* This caller has no CPU batch to fall back to, so a program still
-     * compiling in the background is waited for rather than refused. */
-    if (!v && async_vsh_on()) {
+    /* A PROGRAM STILL COMPILING IS NOT WAITED FOR (RECOMP_METAL_ASYNC_HOST_VSH,
+     * d3d8_host_2d_metal.m). The host refuses the draw and the executor draws
+     * it, which for a program still compiling is its CPU batch -- the same
+     * fallback RECOMP_METAL_ASYNC_VSH gives the executor's own draws.
+     *
+     * It used to wait here, and the wait was not for this program: settle
+     * waits for EVERY job on the background queues and then writes the
+     * pipeline archive on the draw thread's behalf. The player's session of
+     * 26 Sep 2026 froze 4.17 s entering the graffiti studio in one such wait,
+     * while the background queues' own worst job took 3.9 ms and one job ran
+     * in the window: the time was the archive queue's -- six adds, each a
+     * compile of its own for the archive, and a save -- not the program's.
+     * [METAL] pipeline compiles' "settle" figures split a wait in two. */
+    if (!v && wait && async_vsh_on()) {
         uint64_t t0 = mtl_now_ns();
         nv2a_metal_pipelines_settle();
         pipe_account(PK_VSHLIB, 1, mtl_now_ns() - t0);
         v = vsh_lookup_ex(words, length, 0, 0, inputs);
     }
+    if (!v && pending) *pending = g_vsh_last_pending;
     if (!v) return NULL;
     if (nattrs) *nattrs = v->nattrs;
     return (__bridge void *)v->fn;

@@ -221,8 +221,14 @@ int d3d8_host_2d_class(const D3D8HostDrawCheck *c);
 int d3d8_host_vs_mode(void);
 /* The executor's compiled GPU program for these words (additive, nv2a_metal.m):
  * its vs_gpu vertex function as an id<MTLFunction>, and its packed attribute
- * count. NULL if the translator or compiler refused it. Executor thread. */
-void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs);
+ * count. NULL if the translator or compiler refused it, or -- when `wait` is
+ * 0 -- if its library is still compiling in the background, which the caller
+ * leaves to the executor (RECOMP_METAL_ASYNC_HOST_VSH). `wait` 1 waits for
+ * every background compile first, as the host did before that switch, and as
+ * the unit tests still do. *pending (optional) is 1 when NULL means "still
+ * compiling" rather than "refused". Executor thread. */
+void *nv2a_metal_vsh_function(const uint32_t *words, int length, uint16_t inputs, unsigned *nattrs, int wait,
+                              int *pending);
 void *nv2a_metal_ff_function(const void *key, unsigned keysize, uint16_t inputs, unsigned *nattrs);
 /* G70 for the host: build a pipeline (an MTLRenderPipelineDescriptor) through
  * the executor's pipeline archive, when `dev` is the executor's device and the

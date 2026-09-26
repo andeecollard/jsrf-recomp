@@ -329,6 +329,27 @@ static int fail(const char *why) { s_err = why; return -1; }
  * function), which were the host's share of the G70 hitches. */
 static _Atomic unsigned long long s_pa_hits, s_pa_compiles, s_pa_plain;
 static unsigned long long s_pa_wait_ns, s_pa_wait_max_ns, s_pa_wait_n;   /* the draw thread only */
+
+/* RECOMP_METAL_ASYNC_HOST_VSH (default on): A PROGRAMMABLE OR GPU-UNIT DRAW
+ * NEVER WAITS FOR A COMPILE. Nothing in the host can stand in for such a
+ * draw's vertex function, so it used to wait: for the executor's library of
+ * the program (nv2a_metal_vsh_function, which settled EVERY background job and
+ * the pipeline archive's save -- 4.17 s once, entering the graffiti studio in
+ * the player's session of 26 Sep 2026) and for its own pipeline, compiled in
+ * line (82 in-line builds, 734 ms, in the same session). Now both compile in
+ * the background and the draw is refused until they are published; a refused
+ * draw is the executor's, as every other refusal is -- its CPU vertex path
+ * while the program's library compiles, its GPU one after. The frames that
+ * differ are the one or two a compile takes, and only by what separates the
+ * executor's draw from the host's. =0 waits and compiles in line, as before;
+ * the unit tests' in-line mode (d3d8_host_2d_metal_set_spec_sync) waits too. */
+static unsigned long long s_vs_nowait_lib, s_vs_nowait_pso;   /* the draw thread only */
+static int async_host_vsh_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = recomp_switch_on_default("RECOMP_METAL_ASYNC_HOST_VSH", 1);
+    return on;
+}
 static id<MTLRenderPipelineState> make_pipeline(MTLRenderPipelineDescriptor *pd, NSError **err)
 {
     char why[256] = "";
@@ -345,9 +366,11 @@ static id<MTLRenderPipelineState> make_pipeline(MTLRenderPipelineDescriptor *pd,
 void d3d8_host_2d_metal_pipe_stats(char *buf, size_t n)
 {
     snprintf(buf, n, "pipeline archive: hits %llu, compiled %llu, compiled without the archive %llu | draw thread"
-             " built pipelines for %.1f ms over %llu in-line builds, worst %.1f ms",
+             " built pipelines for %.1f ms over %llu in-line builds, worst %.1f ms | left to the executor while"
+             " compiling: %llu draws for the program's library, %llu for the pipeline (metal_async_host_vsh %s)",
              (unsigned long long)atomic_load(&s_pa_hits), (unsigned long long)atomic_load(&s_pa_compiles),
-             (unsigned long long)atomic_load(&s_pa_plain), s_pa_wait_ns / 1e6, s_pa_wait_n, s_pa_wait_max_ns / 1e6);
+             (unsigned long long)atomic_load(&s_pa_plain), s_pa_wait_ns / 1e6, s_pa_wait_n, s_pa_wait_max_ns / 1e6,
+             s_vs_nowait_lib, s_vs_nowait_pso, async_host_vsh_on() ? "on" : "OFF");
 }
 
 static int init(void)
@@ -704,6 +727,7 @@ static int draw_early(const D3D8Host2DDraw *d)
     return !d->alpha_test || !writes;
 }
 
+static int s_pso_pending;   /* pipeline_for returned nil for a pipeline still compiling; the draw thread only */
 static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with_stencil, uint32_t lin_mask,
                                                uint32_t bump_mask, id<MTLFunction> vfn)
 {
@@ -728,6 +752,7 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
             int st = atomic_load_explicit(&s_spec[i].state, memory_order_acquire);
             if (st == 1) { ++s_spec_hits; return s_spec[i].pso; }
             if (st == 0) ++s_spec_pending_draws; else ++s_spec_fallback;
+            if (vfn && st == 0) s_pso_pending = 1;
             if (vfn) return nil;                              /* no stand-in carries this vertex program */
             return with_stencil ? s_pso_st : s_pso;          /* compiling, or failed: the generic interpreter */
         }
@@ -787,8 +812,11 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
      * VERIFY holds to the executor as it holds the specialised one. Bisect
      * bit 2048 compiles in line, as before; the unit tests do too, so they
      * test the specialised program and not its stand-in. */
-    /* A programmable draw compiles in line: nothing can stand in for its vertex program. */
-    if (s_spec_sync || vfn || (d3d8_host_2d_bisect() & 2048u)) {
+    /* A programmable draw compiled in line -- nothing in the host can stand
+     * in for its vertex program -- until RECOMP_METAL_ASYNC_HOST_VSH: now it
+     * compiles in the background like the rest, and the draw is refused to
+     * the executor until the pipeline is published. */
+    if (s_spec_sync || (vfn && !async_host_vsh_on()) || (d3d8_host_2d_bisect() & 2048u)) {
         NSError *err = nil;
         id<MTLFunction> fn = nil;
         @autoreleasepool { fn = [s_lib newFunctionWithName:name constantValues:cv error:&err]; finish(fn, err); }
@@ -801,6 +829,7 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
     }
     [s_lib newFunctionWithName:name constantValues:cv completionHandler:^(id<MTLFunction> fn, NSError *err) { finish(fn, err); }];
     ++s_spec_pending_draws;
+    if (vfn) { s_pso_pending = 1; return nil; }
     return with_stencil ? s_pso_st : s_pso;
 }
 
@@ -898,8 +927,13 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
     id<MTLFunction> vfn = nil;
     if (d->cls == 3 || d->ff_gpu) {          /* G51.2: the program's packed inputs, not host vertices */
         unsigned nattrs = d->vs_nattrs;
+        int wait = s_spec_sync || !async_host_vsh_on(), pending = 0;
         vfn = d->ff_gpu ? (__bridge id<MTLFunction>)d->vs_fn
-                        : (__bridge id<MTLFunction>)nv2a_metal_vsh_function(d->vs_words, (int)d->vs_len, (uint16_t)d->vs_inputs, &nattrs);
+                        : (__bridge id<MTLFunction>)nv2a_metal_vsh_function(d->vs_words, (int)d->vs_len, (uint16_t)d->vs_inputs,
+                                                                             &nattrs, wait, &pending);
+        if (!vfn && pending) {
+            ++s_vs_nowait_lib; s_err = "host vs: the program's library is still compiling (the executor draws it)"; return 0;
+        }
         if (!vfn) { s_err = "host vs: the executor's translator refused the program"; return 0; }
         if (nattrs != d->vs_nattrs) { s_err = "host vs: attribute count disagrees with the translator's"; return 0; }
         if (ox || oy) { s_err = "host vs: a programmable draw renders the whole target"; return 0; }
@@ -911,7 +945,12 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         if (!vb) vb = [s_dev newBufferWithBytes:vdata length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
         if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
     }
-    {   id<MTLRenderPipelineState> pso = pipeline_for(d, with_stencil, u.lin_mask, u.bump_mask, vfn);
+    {   id<MTLRenderPipelineState> pso;
+        s_pso_pending = 0;
+        pso = pipeline_for(d, with_stencil, u.lin_mask, u.bump_mask, vfn);
+        if (!pso && s_pso_pending) {
+            ++s_vs_nowait_pso; s_err = "host vs: its pipeline is still compiling (the executor draws it)"; return 0;
+        }
         if (!pso) { s_err = "host: no pipeline"; return 0; }
         [enc setRenderPipelineState:pso]; }
     {   /* The stencil unit only where the pass has one (draw mode); the
