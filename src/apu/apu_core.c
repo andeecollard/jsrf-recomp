@@ -669,12 +669,10 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     /* The harness silences a run with SDL_AUDIODRIVER=no_such_driver, which
      * on macOS makes SDL open no device. This host has no SDL, so any value
      * of the variable means the same thing here: the device gets zeros. It
-     * still opens and still pulls frames, because on this host it is the
-     * device that clocks the APU -- with no device at all nothing was
-     * processed (APU-VOICE on=0) and the title sat in its logos, waiting on
-     * audio, for five minutes. Not g_audio_muted: that also stops the
-     * software mixer's voices starting, which the guest can see. Unset --
-     * every ordinary launch -- nothing changes. */
+     * still opens and still pulls frames, so a silenced run is timed as an
+     * ordinary one. Not g_audio_muted: that also stops the software mixer's
+     * voices starting, which the guest can see. Unset -- every ordinary
+     * launch -- nothing changes. */
     if (getenv("SDL_AUDIODRIVER")) {
         g_output_silent = 1;
         fprintf(stderr, "[APU] SDL_AUDIODRIVER is set: the device plays zeros (a silenced run; it still clocks the APU)\n");
