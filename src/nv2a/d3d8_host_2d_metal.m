@@ -740,6 +740,47 @@ static id<MTLRenderPipelineState> pipeline_for(const D3D8Host2DDraw *d, int with
  * (ox, oy) in target space: the shadow's crop, or (0, 0) and the whole
  * surface in draw mode. Returns 1 if encoded (nothing inside the scissor is
  * encoded as nothing), 0 on failure with s_err set. */
+/* G76: RECOMP_D3D8_HOST_IB_CHUNK=1 -- a GPU-unit draw's triangle list, when
+ * it is past setVertexBytes' 4 KB, takes a slice of the vertex chunk below
+ * instead of a buffer of its own. It was a newBufferWithBytes per draw: the
+ * title's FF meshes average ~700 indices, ~2,000 list entries, 8 KB, so
+ * nearly every replaced FF draw allocated shared memory on the pusher --
+ * the cost the vertex chunk was written (G51.3) to remove for vertices. */
+static int ib_chunk_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = recomp_switch_on("RECOMP_D3D8_HOST_IB_CHUNK");
+        if (on) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_IB_CHUNK=1: a GPU-unit draw's triangle list past 4 KB takes a"
+                                " slice of the vertex chunk, not a buffer of its own (G76)\n");
+    }
+    return on;
+}
+static unsigned long long s_ib_alloc, s_ib_slice;
+/* A BUMP ALLOCATOR, not a buffer per draw. An FF draw carries ~90 KB of
+ * vertices, and allocating shared memory for each was most of the ~40 us a
+ * replaced draw spent outside texture lookup (G51.3 run, 24 Sep 2026). Each
+ * draw takes the next slice of an 8 MB chunk; a full chunk is dropped for a
+ * fresh one, and the encoders that reference the old one keep it alive until
+ * their GPU work is done, so no slice is ever rewritten while in flight.
+ * Returns nil when the bytes do not fit a chunk (the caller allocates). */
+static id<MTLBuffer> chunk_slice(const void *src, size_t bytes, size_t *off)
+{
+    enum { CHUNK = 8u << 20 };
+    static id<MTLBuffer> chunk;
+    static size_t used;
+    size_t need = (bytes + 255u) & ~(size_t)255u;
+    if (need > CHUNK) return nil;
+    if (!chunk || used + need > CHUNK) {
+        chunk = [s_dev newBufferWithLength:CHUNK options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+        used = 0; ++s_vb_chunks;
+    }
+    if (!chunk) return nil;
+    memcpy((uint8_t *)chunk.contents + used, src, bytes);
+    *off = used; used += need;
+    return chunk;
+}
+
 static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const D3D8Host2DDraw *d,
                        const uint8_t *ram, size_t ram_size, unsigned W, unsigned H, unsigned ox, unsigned oy)
 {
@@ -797,26 +838,9 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         vdata = d->vs_in; vbytes = (size_t)d->vs_nin * (nattrs ? nattrs : 1u) * 16u;
     }
     if (vbytes > 4096) {                     /* Metal's inline limit; below it, setVertexBytes */
-        /* A BUMP ALLOCATOR, not a buffer per draw. An FF draw carries ~90 KB
-         * of vertices, and allocating shared memory for each was most of the
-         * ~40 us a replaced draw spent outside texture lookup (G51.3 run,
-         * 24 Sep 2026). Each draw takes the next slice of an 8 MB chunk; a
-         * full chunk is dropped for a fresh one, and the encoders that
-         * reference the old one keep it alive until their GPU work is done,
-         * so no slice is ever rewritten while in flight. */
-        enum { CHUNK = 8u << 20 };
-        static id<MTLBuffer> chunk;
-        static size_t used;
-        size_t need = (vbytes + 255u) & ~(size_t)255u;
-        if (need > CHUNK || (d3d8_host_2d_bisect() & 2u)) {
-            vb = [s_dev newBufferWithBytes:vdata length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
-        } else {
-            if (!chunk || used + need > CHUNK) {
-                chunk = [s_dev newBufferWithLength:CHUNK options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
-                used = 0; ++s_vb_chunks;
-            }
-            if (chunk) { memcpy((uint8_t *)chunk.contents + used, vdata, vbytes); vb = chunk; voff = used; used += need; }
-        }
+        /* The chunk (chunk_slice above); bisect 2 allocates per draw, as before it. */
+        if (!(d3d8_host_2d_bisect() & 2u)) vb = chunk_slice(vdata, vbytes, &voff);
+        if (!vb) vb = [s_dev newBufferWithBytes:vdata length:(NSUInteger)vbytes options:MTLResourceStorageModeShared];
         if (!vb) { s_err = "host 2d: vertex buffer"; return 0; }
     }
     {   id<MTLRenderPipelineState> pso = pipeline_for(d, with_stencil, u.lin_mask, u.bump_mask, vfn);
@@ -853,7 +877,11 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
         [enc setVertexBytes:d->vs_c length:sizeof d->vs_c atIndex:1];
         [enc setVertexBytes:&vp length:sizeof vp atIndex:2];
         if (ib > 4096) {
-            ibuf = [s_dev newBufferWithBytes:d->vs_idx length:(NSUInteger)ib options:MTLResourceStorageModeShared];
+            if (ib_chunk_on() && !(d3d8_host_2d_bisect() & 2u) && (ibuf = chunk_slice(d->vs_idx, ib, &ioff))) ++s_ib_slice;
+            else { ibuf = [s_dev newBufferWithBytes:d->vs_idx length:(NSUInteger)ib options:MTLResourceStorageModeShared]; ++s_ib_alloc; }
+            if (((s_ib_slice + s_ib_alloc) & 0x3FFFFu) == 0)
+                fprintf(stderr, "[D3D8-HOST-2D] triangle lists past 4 KB: %llu in a chunk slice, %llu in a buffer of their own"
+                                " (RECOMP_D3D8_HOST_IB_CHUNK %s)\n", s_ib_slice, s_ib_alloc, ib_chunk_on() ? "on" : "off");
             if (!ibuf) { s_err = "host vs: index buffer"; return 0; }
             [enc setVertexBuffer:ibuf offset:ioff atIndex:3];
         } else [enc setVertexBytes:d->vs_idx length:(NSUInteger)(ib ? ib : 4u) atIndex:3];
