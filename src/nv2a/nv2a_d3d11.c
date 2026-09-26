@@ -1609,6 +1609,90 @@ static int write_dynamic(ID3D11Buffer *buffer, const void *data, size_t bytes)
     return 1;
 }
 
+/* Pick the retained surface for a target and make it the bound one: the
+ * executor's own draw (draw_inner) and the D3D lift's host draw
+ * (nv2a_d3d11_external_draw) both come through here, so a host draw into a
+ * target lands in the very slot the executor's next draw into it finds.
+ *
+ * A hit is a bind and nothing more -- no upload, no read-back -- which is
+ * what makes the guest's per-batch target ping-pong affordable. Returns 0
+ * with *why set when the caller must reject. */
+static int bind_slot(uint8_t *target, size_t target_size, uint32_t w, uint32_t h, uint32_t pitch,
+                     uint8_t *next_depth, uint32_t next_depth_pitch, size_t next_depth_size,
+                     int *reused, const char **why)
+{
+    Surface *slot = NULL, *oldest = &surfaces[0];
+    unsigned i;
+    int reuse;
+    for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+        Surface *sf = &surfaces[i];
+        if (sf->tex && sf->ram == target && sf->ram_size == target_size
+                && sf->w == w && sf->h == h
+                && sf->row == pitch
+                && sf->zram == next_depth && sf->zrow == next_depth_pitch
+                && sf->zram_size == next_depth_size) { slot = sf; break; }
+        if (!sf->tex) { if (!slot) slot = sf; }
+        else if (sf->stamp < oldest->stamp) oldest = sf;
+    }
+    if (!slot) {
+        /* Evicting means flushing, because that surface holds pixels the
+         * guest has not been given back yet. */
+        slot = oldest;
+        ++surface_evictions;
+        if (!sync_surface(slot)) { *why = "surface-sync"; return 0; }
+        slot->colour_ready = 0;
+        slot->depth_ready = 0;
+    }
+    reuse = slot->tex && slot->colour_ready
+          && (!next_depth || slot->depth_ready);
+    if (reused) *reused = reuse;
+    bound = slot;
+    slot->stamp = ++surface_clock;
+
+    /* RECOMP_D3D11_TRACE=<n>: why the retained surface was thrown away, for
+     * the first n batches. One re-upload per batch means the surface is not
+     * being retained at all, and the reason decides whether that is the
+     * guest's doing or ours. */
+    {
+        static long trace = -1;
+        static unsigned traced;
+        if (trace < 0) {
+            const char *e = getenv("RECOMP_D3D11_TRACE");
+            trace = e ? strtol(e, NULL, 0) : 0;
+        }
+        trace_surfaces = traced < (unsigned)trace;
+        if (trace_surfaces) {
+            ++traced;
+            fprintf(stderr, "[D3D11-TRACE] batch %llu target=%p clip=%ux%u"
+                    " pitch=%u zeta=%d depth=%p slot=%u %s\n",
+                    (unsigned long long)draw_batches, (void *)target,
+                    w, h, pitch, next_depth != NULL,
+                    (void *)next_depth, (unsigned)(slot - surfaces),
+                    reuse ? "retained" : "upload");
+        }
+    }
+
+    if (!reuse) {
+        if (!color_surface || surface_width != w
+                || surface_height != h) {
+            if (!create_surfaces(w, h)) { *why = "surface-allocation"; return 0; }
+        }
+        surface_target = target;
+        surface_target_size = target_size;
+        surface_width = w;
+        surface_height = h;
+        surface_pitch = pitch;
+        depth_target = next_depth;
+        depth_target_size = next_depth_size;
+        surface_depth_pitch = next_depth_pitch;
+        if (!upload_surface(target, next_depth, next_depth_pitch)) { *why = "surface-upload"; return 0; }
+        surface_valid = 1;
+        depth_valid = next_depth ? 1 : 0;
+        surface_dirty = depth_dirty = 0;
+    }
+    return 1;
+}
+
 /* Vertices in one batch. Must match NV_MAX_INDICES in nv2a_pb_exec.c: the
  * executor assembles up to that many and hands them here, and a smaller limit
  * here refuses every large batch back to the CPU rasteriser. */
@@ -1701,77 +1785,13 @@ static int draw_inner(const NV2ATextureCopy *s, const uint8_t *texture, size_t t
      * the first n batches. One re-upload per batch means the surface is not
      * being retained at all, and the reason decides whether that is the
      * guest's doing or ours. */
-    /* Pick the retained surface for THIS target. A hit is a bind and nothing
-     * more -- no upload, no read-back -- which is what makes the guest's
-     * per-batch target ping-pong affordable. */
+    /* Pick the retained surface for THIS target (bind_slot, shared with the
+     * D3D lift's host draws, nv2a_d3d11_external_draw). */
     {
-        Surface *slot = NULL, *oldest = &surfaces[0];
-        unsigned i;
-        int reuse;
-        for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
-            Surface *sf = &surfaces[i];
-            if (sf->tex && sf->ram == target && sf->ram_size == target_size
-                    && sf->w == s->clip_w && sf->h == s->clip_h
-                    && sf->row == s->target_pitch
-                    && sf->zram == next_depth && sf->zrow == next_depth_pitch
-                    && sf->zram_size == next_depth_size) { slot = sf; break; }
-            if (!sf->tex) { if (!slot) slot = sf; }
-            else if (sf->stamp < oldest->stamp) oldest = sf;
-        }
-        if (!slot) {
-            /* Evicting means flushing, because that surface holds pixels the
-             * guest has not been given back yet. */
-            slot = oldest;
-            ++surface_evictions;
-            if (!sync_surface(slot)) return reject("surface-sync");
-            slot->colour_ready = 0;
-            slot->depth_ready = 0;
-        }
-        reuse = slot->tex && slot->colour_ready
-              && (!next_depth || slot->depth_ready);
-        reuse_for_trace = reuse;
-        bound = slot;
-        slot->stamp = ++surface_clock;
-
-        {
-            static long trace = -1;
-            static unsigned traced;
-            if (trace < 0) {
-                const char *e = getenv("RECOMP_D3D11_TRACE");
-                trace = e ? strtol(e, NULL, 0) : 0;
-            }
-            trace_surfaces = traced < (unsigned)trace;
-            if (trace_surfaces) {
-                ++traced;
-                fprintf(stderr, "[D3D11-TRACE] batch %llu target=%p clip=%ux%u"
-                        " pitch=%u zeta=%d depth=%p slot=%u %s\n",
-                        (unsigned long long)draw_batches, (void *)target,
-                        s->clip_w, s->clip_h, s->target_pitch, use_zeta,
-                        (void *)next_depth, (unsigned)(slot - surfaces),
-                        reuse ? "retained" : "upload");
-            }
-        }
-
-        if (!reuse) {
-            if (!color_surface || surface_width != s->clip_w
-                    || surface_height != s->clip_h) {
-                if (!create_surfaces(s->clip_w, s->clip_h))
-                    return reject("surface-allocation");
-            }
-            surface_target = target;
-            surface_target_size = target_size;
-            surface_width = s->clip_w;
-            surface_height = s->clip_h;
-            surface_pitch = s->target_pitch;
-            depth_target = next_depth;
-            depth_target_size = next_depth_size;
-            surface_depth_pitch = next_depth_pitch;
-            if (!upload_surface(target, next_depth, next_depth_pitch))
-                return reject("surface-upload");
-            surface_valid = 1;
-            depth_valid = next_depth ? 1 : 0;
-            surface_dirty = depth_dirty = 0;
-        }
+        const char *why = NULL;
+        if (!bind_slot(target, target_size, s->clip_w, s->clip_h, s->target_pitch,
+                       next_depth, next_depth_pitch, next_depth_size, &reuse_for_trace, &why))
+            return reject(why);
     }
 
     memset(&vsp, 0, sizeof(vsp));
@@ -1902,4 +1922,90 @@ int nv2a_d3d11_draw(const NV2ATextureCopy *s, const uint8_t *texture, size_t tex
     publish_ownership();
     device_release();
     return result;
+}
+
+/* ================================================================
+ * The D3D lift's host draws (d3d8_host_2d_d3d11.c)
+ * ================================================================
+ *
+ * The Windows twin of nv2a_metal_external_draw + nv2a_metal_bind: the host
+ * draws INTO THE EXECUTOR'S retained surface for the target, bound exactly
+ * as the executor's own draw into it would bind it (bind_slot), and marks
+ * it dirty so the flip's read-back, a range sync and the ownership map all
+ * treat the host's pixels as the executor's. `depth` is NULL unless the draw
+ * tests depth or stencil -- the executor's own keying (draw_inner's
+ * use_zeta) -- so both find the same slot.
+ *
+ * GEOMETRY. The executor keys a slot on its registers' clip rectangle and
+ * sizes (pitch * clip height); D3D's description of the same surface can
+ * differ, and a second slot for one guest surface would split its pixels
+ * between two textures. So when the executor already holds a slot for this
+ * colour (and depth) address, its geometry is used, as the Metal host does
+ * with nv2a_metal_slot_geometry.
+ *
+ * Returns 1 drawn, 0 the encoder declined (nothing bound is marked), -1 no
+ * device or no pipeline, -2 the bind failed (the executor's reject path ran). */
+static unsigned long long ext_draws, ext_geometry_adopted, ext_geometry_d3d, ext_declined;
+int nv2a_d3d11_external_draw(uint8_t *target, size_t target_size, uint32_t w, uint32_t h, uint32_t pitch,
+        uint8_t *depth, size_t depth_size, uint32_t depth_pitch, int writes_zs,
+        int (*encode)(void *ctx, void *context, void *rtv, void *dsv, unsigned w, unsigned h), void *ctx)
+{
+    const char *why = NULL;
+    int result, adopted = 0;
+    unsigned i;
+    device_acquire();
+    if (!initialize()) { device_release(); return -1; }
+    for (i = 0; i < SURFACE_CACHE_SIZE; i++) {
+        Surface *sf = &surfaces[i];
+        if (sf->tex && sf->ram == target && sf->zram == depth) {
+            target_size = sf->ram_size; w = sf->w; h = sf->h; pitch = sf->row;
+            if (depth) { depth_size = sf->zram_size; depth_pitch = sf->zrow; }
+            adopted = 1;
+            break;
+        }
+    }
+    if (adopted) ++ext_geometry_adopted; else ++ext_geometry_d3d;
+    if (!w || !h || w > 4096 || h > 4096 || (uint64_t)pitch * h > target_size
+            || (depth && (uint64_t)depth_pitch * h > depth_size)) {
+        reject_reason = "host: target geometry";
+        device_release();
+        return -2;
+    }
+    if (!bind_slot(target, target_size, w, h, pitch, depth, depth ? depth_pitch : 0,
+                   depth ? depth_size : 0, NULL, &why)) {
+        (void)reject(why);
+        publish_ownership();
+        device_release();
+        return -2;
+    }
+    result = encode(ctx, context, color_view, depth ? depth_view : NULL, surface_width, surface_height) ? 1 : 0;
+    if (result) {
+        surface_dirty = 1;
+        if (writes_zs && depth) depth_dirty = 1;
+        ++ext_draws;
+    } else ++ext_declined;
+    publish_ownership();
+    device_release();
+    return result;
+}
+
+/* The host's own work on the device (its shadow render for VERIFY) takes the
+ * executor's lock: one immediate context, one writer at a time. */
+void nv2a_d3d11_lock(void) { device_acquire(); }
+void nv2a_d3d11_unlock(void) { device_release(); }
+int nv2a_d3d11_ready(void)
+{
+    int ok;
+    device_acquire();
+    ok = initialize();
+    device_release();
+    return ok;
+}
+void nv2a_d3d11_external_stats(unsigned long long *draws, unsigned long long *adopted,
+                               unsigned long long *d3d_geometry, unsigned long long *declined)
+{
+    if (draws) *draws = ext_draws;
+    if (adopted) *adopted = ext_geometry_adopted;
+    if (d3d_geometry) *d3d_geometry = ext_geometry_d3d;
+    if (declined) *declined = ext_declined;
 }

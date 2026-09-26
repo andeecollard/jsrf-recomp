@@ -37,6 +37,13 @@ endif()
 target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
+    # The D3D lift's host renderer on Windows, d3d8_host_2d_metal.m's
+    # counterpart. It draws into nv2a_d3d11.c's retained surfaces through the
+    # D3D8 layer's device, so it links xbox_d3d8 (which brings xbox_vsh: the
+    # texture decoder and the vertex-program interpreter).
+    target_sources(xbox_nv2a PRIVATE d3d8_host_2d_d3d11.c)
+    target_include_directories(xbox_nv2a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../d3d)
+    target_link_libraries(xbox_nv2a PRIVATE xbox_d3d8)
 endif()
 
 # Platform-independent shader semantics shared by D3D11 and CPU rendering.

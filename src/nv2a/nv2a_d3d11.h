@@ -39,4 +39,20 @@ void nv2a_d3d11_surface_report(void);
  * so the ORDER of them can be read rather than inferred from counters. */
 int nv2a_d3d11_event_trace(void);
 uint32_t nv2a_d3d11_guest_offset(const void *host);
+/* The D3D lift (d3d8_host_2d_d3d11.c): draw into the executor's retained
+ * surface for `target`, bound as the executor's own draw binds it. `depth` is
+ * NULL unless the draw tests depth or stencil. `encode` gets the immediate
+ * context and the slot's views (ID3D11DeviceContext *, ID3D11RenderTargetView
+ * *, ID3D11DepthStencilView * or NULL) and the surface size, under the
+ * device lock. Returns 1 drawn, 0 declined, -1 no device, -2 bind failed. */
+int nv2a_d3d11_external_draw(uint8_t *target, size_t target_size, uint32_t w, uint32_t h, uint32_t pitch,
+        uint8_t *depth, size_t depth_size, uint32_t depth_pitch, int writes_zs,
+        int (*encode)(void *ctx, void *context, void *rtv, void *dsv, unsigned w, unsigned h), void *ctx);
+void nv2a_d3d11_external_stats(unsigned long long *draws, unsigned long long *adopted,
+                               unsigned long long *d3d_geometry, unsigned long long *declined);
+/* The device lock the executor's entry points take, for the host's own use of
+ * the immediate context; recursive. And whether the pipeline came up. */
+void nv2a_d3d11_lock(void);
+void nv2a_d3d11_unlock(void);
+int nv2a_d3d11_ready(void);
 #endif

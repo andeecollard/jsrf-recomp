@@ -341,6 +341,20 @@ int d3d8_host_2d_metal_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_
                               uint16_t *pixels, unsigned pitch_px, float *depth,
                               unsigned x0, unsigned y0, unsigned w, unsigned h);
 const char *d3d8_host_2d_metal_last_error(void);
+/* ---- the Windows renderer (d3d8_host_2d_d3d11.c), the same contract ----
+ * render and external as the Metal pair; external draws into the D3D11
+ * executor's retained surface (nv2a_d3d11_external_draw). */
+int d3d8_host_2d_d3d11_render(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size,
+                              uint16_t *pixels, unsigned pitch_px, float *depth,
+                              unsigned x0, unsigned y0, unsigned w, unsigned h);
+const char *d3d8_host_2d_d3d11_last_error(void);
+int d3d8_host_2d_d3d11_external(const D3D8Host2DDraw *d, const uint8_t *ram, size_t ram_size);
+void d3d8_host_2d_d3d11_stats(unsigned long long *tex_hits, unsigned long long *tex_builds, unsigned long long *tex_hashes,
+                              unsigned long long *ns_texture, unsigned long long *ns_external);
+unsigned long long d3d8_host_2d_d3d11_binds(void);
+void d3d8_host_2d_d3d11_spec_stats(unsigned long long *built, unsigned long long *hits, unsigned long long *fallback,
+                                   unsigned long long *compile_ns);
+void d3d8_host_2d_d3d11_pipe_stats(char *buf, size_t n);
 
 /* ---- the shadow bookkeeping (d3d8_host_2d.c) ---- */
 typedef struct {

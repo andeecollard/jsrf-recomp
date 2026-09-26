@@ -59,6 +59,14 @@ extern const char *nv2a_ff_vertex(const uint32_t m[2048], const float in[16][4],
 extern unsigned long long nv2a_pb_exec_host_skipped(void);
 extern void nv2a_pb_exec_mode_counts(unsigned long long out[9]);
 extern unsigned long long nv2a_pb_exec_host_seen(void);
+#elif defined(_WIN32)
+/* The same hooks for the lift's D3D11 host (d3d8_host_2d_d3d11.c). */
+extern int nv2a_d3d11_sync_range(uint8_t *target, size_t bytes);
+extern void nv2a_pb_exec_host_skip(int on);
+extern const char *nv2a_ff_vertex(const uint32_t m[2048], const float in[16][4], float out[16][4]);
+extern unsigned long long nv2a_pb_exec_host_skipped(void);
+extern void nv2a_pb_exec_mode_counts(unsigned long long out[9]);
+extern unsigned long long nv2a_pb_exec_host_seen(void);
 #endif
 static int pad_sentinel(void);
 static void pad_sentinel_scan(void);
@@ -5360,6 +5368,45 @@ int main(int argc, char **argv)
                 d3d8_host_2d_set_ff_gpu(d3d8_host_2d_metal_ff_gpu);
                 d3d8_host_2d_set_backend(&be);
                 nv2a_pb_exec_set_flip_hook(d3d8_host_2d_flip);
+            }
+#elif defined(_WIN32)
+            /* The lift on Windows: the same shared classes, drawn by the D3D11
+             * host (d3d8_host_2d_d3d11.c) into the D3D11 executor's retained
+             * surfaces. Its device comes up with RECOMP_D3D11 further down;
+             * the renderer initialises on its first draw. No GPU
+             * fixed-function unit is registered: RECOMP_D3D8_HOST_FF_GPU
+             * leaves the class on the executor's CPU unit here. */
+            if (d3d8_host_armed(NULL, 0)) {
+                extern void nv2a_pb_exec_set_flip_hook(void (*)(void));
+                extern void nv2a_pb_exec_last_draw_textures(D3D8ExecDrawTextures *);
+                D3D8Host2DBackend be;
+                memset(&be, 0, sizeof be);
+                be.render = d3d8_host_2d_d3d11_render;
+                be.sync_range = nv2a_d3d11_sync_range;
+                be.ram = (uint8_t *)xbox_GetMemoryOffset();
+                be.ram_size = 0x04000000u;
+                be.last_error = d3d8_host_2d_d3d11_last_error;
+                be.external_draw = d3d8_host_2d_d3d11_external;
+                be.external_binds = d3d8_host_2d_d3d11_binds;
+                be.external_stats = d3d8_host_2d_d3d11_stats;
+                be.exec_skip = nv2a_pb_exec_host_skip;
+                be.exec_skipped = nv2a_pb_exec_host_skipped;
+                be.exec_mode_counts = nv2a_pb_exec_mode_counts;
+                be.exec_seen = nv2a_pb_exec_host_seen;
+                { extern void nv2a_pb_exec_host_skip_late(int);
+                  nv2a_pb_exec_host_skip_late((d3d8_host_2d_bisect() & 128u) != 0); }
+                be.spec_stats = d3d8_host_2d_d3d11_spec_stats;
+                be.pipe_stats = d3d8_host_2d_d3d11_pipe_stats;
+                be.ff_vertex = nv2a_ff_vertex;
+                d3d8_host_set_exec_source(nv2a_pb_exec_last_draw_textures);
+                d3d8_host_2d_set_backend(&be);
+                nv2a_pb_exec_set_flip_hook(d3d8_host_2d_flip);
+                if (!getenv("RECOMP_D3D11"))
+                    fprintf(stderr, "  [D3D8-HOST-2D] the lift is armed but RECOMP_D3D11 is not: every draw stays"
+                                    " with the executor (no D3D11 device)\n");
+                if (d3d8_host_ff_gpu_mode() > 0)
+                    fprintf(stderr, "  [D3D8-HOST-2D] RECOMP_D3D8_HOST_FF_GPU: no D3D11 fixed-function unit on this"
+                                    " host; the class keeps the CPU unit\n");
             }
 #endif
     }
