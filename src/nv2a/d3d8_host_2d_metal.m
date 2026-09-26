@@ -462,6 +462,56 @@ static uint64_t hash64(const uint8_t *p, size_t n)
     return h;
 }
 unsigned long long d3d8_host_2d_flip_count(void);
+/* G76: RECOMP_D3D8_HOST_TEX_INDEX=1 -- the cache is found through a hashed
+ * index on (Data, Format, Size) instead of a scan of every entry. The scan
+ * ran for each sampled unit of every replaced draw, over up to 512 entries
+ * of ~56 bytes: "texture" in the per-draw cost line, 2.1 us a draw, most of
+ * a millisecond a frame on the pusher. The index holds slot numbers; an
+ * entry whose slot now holds another texture (or none) is stale, fails the
+ * key check and is probed past, and is reused by the next insertion that
+ * meets it. It is rebuilt from the live entries when it fills. The slot a
+ * lookup returns is the one the scan returns: a key is live in one slot at
+ * most. */
+#define TEX_INDEX 2048u
+static uint16_t s_tix[TEX_INDEX];          /* slot + 1; 0 empty */
+static unsigned s_tix_used;
+static unsigned long long s_tix_rebuilds;
+static int tex_index_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = recomp_switch_on("RECOMP_D3D8_HOST_TEX_INDEX");
+        if (on) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_TEX_INDEX=1: the texture cache is found through a hashed"
+                                " index, not a scan (G76)\n");
+    }
+    return on;
+}
+static unsigned tix_home(uint32_t addr, uint32_t fmt, uint32_t size)
+{
+    uint64_t k = ((uint64_t)addr * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)fmt * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t)size * 0x165667B19E3779F9ull);
+    return (unsigned)(k >> 40) & (TEX_INDEX - 1u);
+}
+static int tix_is(unsigned slot, uint32_t addr, uint32_t fmt, uint32_t size);
+static int tix_find(uint32_t addr, uint32_t fmt, uint32_t size)
+{
+    for (unsigned i = 0, h = tix_home(addr, fmt, size); i < TEX_INDEX; ++i, h = (h + 1u) & (TEX_INDEX - 1u)) {
+        if (!s_tix[h]) return -1;
+        if (tix_is(s_tix[h] - 1u, addr, fmt, size)) return (int)s_tix[h] - 1;
+    }
+    return -1;
+}
+static void tix_rebuild(void);
+static void tix_insert(unsigned slot, uint32_t addr, uint32_t fmt, uint32_t size)
+{
+    if (s_tix_used >= TEX_INDEX - TEX_INDEX / 4u) tix_rebuild();
+    for (unsigned i = 0, h = tix_home(addr, fmt, size); i < TEX_INDEX; ++i, h = (h + 1u) & (TEX_INDEX - 1u)) {
+        if (!s_tix[h]) { s_tix[h] = (uint16_t)(slot + 1u); ++s_tix_used; return; }
+        if (s_tix[h] - 1u == slot || !tix_is(s_tix[h] - 1u, 0, 0, 0)) {   /* this slot's old key, or a slot now empty */
+            s_tix[h] = (uint16_t)(slot + 1u); return;
+        }
+    }
+}
+
 static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, size_t ram_size)
 {
     unsigned mips = mip_levels(t), w = t->width, h = t->height, pitch = t->pitch;
@@ -481,6 +531,8 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
      * draws samples the bytes, and so must the host, which decodes from guest
      * RAM. A payment means the bytes just changed: re-hash. */
     int paid = nv2a_metal_pay_debt(src, total);
+    if (tex_index_on()) slot = tix_find(t->addr, t->d3d_format, t->d3d_size);
+    else
     for (unsigned i = 0; i < s_tc_hw; ++i)
         if (s_tc[i].tex && s_tc[i].addr == t->addr && s_tc[i].fmt == t->d3d_format && s_tc[i].size == t->d3d_size) { slot = (int)i; break; }
     if (slot >= 0) {
@@ -523,7 +575,23 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
     s_tc[slot].addr = t->addr; s_tc[slot].fmt = t->d3d_format; s_tc[slot].size = t->d3d_size; s_tc[slot].bytes = bytes;
     s_tc[slot].hash = hash; s_tc[slot].checked = flip; s_tc[slot].used = ++s_tc_clock; s_tc[slot].tex = tex; ++s_tc_builds;
     s_tc_bytes += bytes;
+    if (tex_index_on()) tix_insert((unsigned)slot, t->addr, t->d3d_format, t->d3d_size);
     return tex;
+}
+/* A live entry with this key? (addr, fmt, size all 0: is the slot live at all.) */
+static int tix_is(unsigned slot, uint32_t addr, uint32_t fmt, uint32_t size)
+{
+    if (slot >= TEX_CACHE || !s_tc[slot].tex) return 0;
+    if (!addr && !fmt && !size) return 1;
+    return s_tc[slot].addr == addr && s_tc[slot].fmt == fmt && s_tc[slot].size == size;
+}
+static void tix_rebuild(void)
+{
+    memset(s_tix, 0, sizeof s_tix); s_tix_used = 0; ++s_tix_rebuilds;
+    for (unsigned i = 0; i < s_tc_hw; ++i)
+        if (s_tc[i].tex)
+            for (unsigned k = 0, h = tix_home(s_tc[i].addr, s_tc[i].fmt, s_tc[i].size); k < TEX_INDEX; ++k, h = (h + 1u) & (TEX_INDEX - 1u))
+                if (!s_tix[h]) { s_tix[h] = (uint16_t)(i + 1u); ++s_tix_used; break; }
 }
 
 /* G75: A BUMPENVMAP UNIT'S GUEST BYTES, as a buffer the executor's
