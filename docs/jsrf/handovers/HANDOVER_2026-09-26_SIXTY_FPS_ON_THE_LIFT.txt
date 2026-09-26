@@ -1,0 +1,78 @@
+HANDOVER -- 26 September 2026 (afternoon)
+SIXTY FPS ON THE DIRECT3D LIFT
+
+Covers 25 Sep evening to 26 Sep afternoon. The plan and all evidence:
+docs/jsrf/goals/JSRF_GOALS_2026-09-25_EVENING_FINISH_THE_LIFT.md (G73-G77 and
+their result sections). Everything is on origin main.
+
+
+====================================================================
+0. WHAT CHANGED FOR THE PLAYER
+====================================================================
+
+JSRF.app is built with JSRF_APP_LIFT=1: the launcher exports the lift's
+switches (18 RECOMP_* defaults; paths.conf overrides any of them). The player's
+26 Sep session on it: 60 fps (17.1 ms against the 16.7 ms cap, p99 19.5),
+"sound is good", "water is there", the graffiti studio paints. One 4.17 s
+freeze on opening the studio, fixed since (RECOMP_METAL_ASYNC_HOST_VSH, now in
+the bundle; the studio itself not yet re-tested).
+
+Uncapped free play, NV2A model -> lift: Garage 18.2 -> 8.5 ms, Rokkaku 21-23
+-> 8.5, Shibuya 29.0 -> 11.5, Sky Dino 35-37 -> 12.7.
+
+
+====================================================================
+1. WHAT THE LIFT IS NOW
+====================================================================
+
+G73  RECOMP_METAL_ASYNC_WRITEBACK: no GPU drain at bind or flip; the back
+     buffer is written to guest RAM behind its draws (the swap's copy quad
+     reads it from there -- dropping that write was the frozen-frame bug).
+     The mirror's vertex hash had been 11-22 ms of the title's frame.
+G74  RECOMP_D3D8_HOST_POINTS: one-vertex point lists inside meshes.
+G75  BUMP, LIN32, INLINE (HUD Begin/End), STENCIL, FOGTABLE: coverage
+     99.3-99.6%; only D3D's swap copy quad stays on the executor.
+G76  the pusher set the frame; FAST_FETCH, IB_CHUNK, TEX_INDEX, NO_CHECK,
+     SWM_WAKE, PB_ELEM16_RUN; RECOMP_FRAME_SPLIT instrument; the flaky
+     host_2d_seq test was the pipeline race in the test, fixed.
+     ASYNC_HOST_VSH: the host never waits for a vertex-program compile.
+
+Engine defaults are unchanged: every lift switch is off unless set.
+
+
+====================================================================
+2. OPEN, IN ORDER
+====================================================================
+
+1. G77 -- make the lift the engine default. Before it: a player session in
+   the graffiti studio with the current bundle; the executor's own vertex-
+   program pipelines still build on the draw thread (33-43 builds, worst
+   ~25 ms warm; a missing one drops the draw, so not trivially async);
+   pipeline-archive save failures (up to 33 in a cold session).
+2. Windows. The cross-build links again (81257f3). A D3D11 host renderer
+   (56de283, src/nv2a/d3d8_host_2d_d3d11.c) draws 99.4% of the attract demo in
+   CrossOver (bottle jsrf-cx26), picture correct by eye, NOT yet compared: the
+   executor comparison arm hung at boot twice (flips=3; once ADX tick stuck
+   at 1), and the guest often stops re-enabling OHCI interrupts in CrossOver
+   (ien 80000000), so the autopilot rarely reaches the Garage. Unsupported
+   there: FF_GPU, BUMP, LIN32, ASYNC_WRITEBACK. Runs: ~/jsrf-build/runs/win/
+   (win_arm.sh has a no-progress watchdog; q3.txt is the next queue).
+3. Upstream: #129, #130 opened 26 Sep; #89, #117, #121, #124, #126 open,
+   mergeable, unreviewed.
+4. G71 (thin line above text, probably authentic) and G65 (e200 camera pop)
+   need xemu captures from the player; G63 Poison Jam chase needs play.
+
+
+====================================================================
+3. LESSONS
+====================================================================
+
+- WHOLE-FRAME A/B, SCENE-MATCHED. VERIFY and the glitch watch both passed a
+  frozen picture; frame_match with RECOMP_FLIGHT_AT_FREEPLAY caught it, and
+  without scene matching it scored crowds and radio lines as defects.
+- THE PLAYER WATCHES HARNESS WINDOWS. "A lot of visual bugs" was an agent's
+  uncommitted experiment on screen. Check what is running before chasing.
+- CHECK THE SESSION'S SWITCH LINE. Two "lift sessions" ran without the lift
+  (paths.conf lacked the switches; [D3D8-MIRROR] off). Hence JSRF_APP_LIFT.
+- A "COMPILE" STALL MAY BE A QUEUE. The 4.17 s was a settle that drained both
+  compile queues and saved the archive, not one slow compile.
