@@ -86,8 +86,9 @@ off. The plan and the measurements are in
 - Chapters 3–9 have been entered but not played through; a sweep of all 74
   cutscenes that can be reached unattended is in progress.
 - The lift is not yet the engine's default, only the app bundle's.
-- Windows: the MinGW cross-build runs (tested under CrossOver); porting the
-  lift's host renderer to Direct3D 11 is in progress.
+- Windows: the MinGW cross-build links again at the current tree (26 Sep) and
+  runs under CrossOver; porting the lift's host renderer to Direct3D 11 is in
+  progress. CrossOver can judge its picture, not its speed.
 
 ## Build and play
 
@@ -161,9 +162,21 @@ The current plan is the newest file in [docs/jsrf/goals/](docs/jsrf/goals/);
 
 General fixes go back to xboxrecomp as pull requests from a fork: ten have
 been merged so far (lifter flag semantics, rotates, SHLD/SHRD, `movsd`
-dispatch, APU mix-down, an SVOD reader), and others are open, among them
-`frndint` honouring the x87 rounding mode (the cutscene dropouts above) and
-REPE CMPS/SCAS flags.
+dispatch, APU mix-down, an SVOD reader). Open as of 26 Sep:
+
+| PR | what |
+|---|---|
+| [#130](https://github.com/sp00nznet/xboxrecomp/pull/130) | indirect calls name their site; sites with a small recorded target set become guarded direct calls |
+| [#129](https://github.com/sp00nznet/xboxrecomp/pull/129) | function detection follows a switch through a measured jump table |
+| [#126](https://github.com/sp00nznet/xboxrecomp/pull/126) | `frndint` honours the x87 rounding mode (the cutscene dropouts above) |
+| [#124](https://github.com/sp00nznet/xboxrecomp/pull/124) | REPE CMPS/SCAS carry flag, and ZF at a zero count |
+| [#121](https://github.com/sp00nznet/xboxrecomp/pull/121) | ADPCM's reserved header byte and step-index clamp |
+| [#117](https://github.com/sp00nznet/xboxrecomp/pull/117) | an untranslated instruction reports itself at run time |
+| [#89](https://github.com/sp00nznet/xboxrecomp/pull/89) | bounds checks on guest buffers |
+
+The Direct3D lift is not upstream: it is tied to this title's XDK build
+(4134). The method -- follow the title's Direct3D calls, draw them on the host,
+check every draw and frame against the NV2A model -- is general.
 
 ## Licence and credit
 

@@ -384,3 +384,17 @@ the lift. The studio is reached by talking to Roboy in the Garage. Being fixed
 (vertex libraries off the draw thread and into the archive). Confirmed in
 play: RECOMP_SWM_WAKE leaves the sound unchanged, G75's bump water draws,
 G59's studio paints on the host's LIN32 path.
+
+## 26 Sep, late morning: in flight
+
+- **Graffiti-studio stall** (4.17 s vertex-library compile on the draw thread):
+  an agent is moving vertex libraries off the draw thread and into the
+  binary archive; cold/warm A/B running.
+- **Windows lift (D3D11)**: the cross-build links again (a6c56fe, merged);
+  `d3d8_host_2d_d3d11.c`, the counterpart of `d3d8_host_2d_metal.m`, is being
+  written and checked under CrossOver (bottle `jsrf-cx26`). Picture only:
+  CrossOver's D3D11 translation and Rosetta make its frame times meaningless.
+- **Upstream**: #129 and #130 opened; #89, #117, #121, #124, #126 mergeable,
+  unreviewed.
+- **Housekeeping**: 65 GB of finished runs deleted (g66, cr296, cr510,
+  regen296); the pre-clean-room backup branch deleted (never pushed).
