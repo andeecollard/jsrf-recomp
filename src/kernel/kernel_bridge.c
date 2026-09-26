@@ -1688,6 +1688,22 @@ static void evwake_wait(unsigned long seen, long us)
 static void bridge_vblank_poll(void);
 static void bridge_device_irq_poll(void);
 static void bridge_timers_poll(void);
+
+/* G76: wake every guest thread sleeping in a wait, as KeSetEvent does, so
+ * one of them pumps the device interrupts now rather than at its next poll
+ * (up to RECOMP_WAIT_POLL_US, 1 ms). The GPU's interrupts are delivered only
+ * from a waiting guest thread (see RECOMP_IRQ_THREAD), so a software method
+ * the pusher raised sat undelivered until a waiter's poll came round: the
+ * pusher waited ~0.5 ms a notify for its acknowledgement, 1.4-2.0 ms a frame
+ * in Shibuya and Sky Dino ([FRAME-SPLIT]). A spurious wakeup costs a waiter
+ * one more look. Called by the harness's software-method handler under
+ * RECOMP_SWM_WAKE. */
+void xbox_bridge_wake_waiters(void)
+{
+#if !defined(_WIN32)
+    if (evwake_on()) evwake_broadcast();
+#endif
+}
 static void bridge_run_dpc(uint32_t dpc_va, uint32_t sys1, uint32_t sys2);
 
 /* Guest register file, saved across a nested call into guest code.

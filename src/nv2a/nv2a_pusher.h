@@ -88,6 +88,13 @@ void nv2a_pusher_set_software_method_handler(NV2ASoftwareMethodHandler handler);
 #define NV2A_HOST_TOKEN_METHOD     0x1FFCu
 typedef void (*NV2AHostTokenHandler)(uint32_t parameter);
 void nv2a_pusher_set_host_token_handler(NV2AHostTokenHandler handler);
+/* G76: a run of ARRAY_ELEMENT16 (0x1800, non-increasing, subchannel 0)
+ * words taken in one call instead of one dispatch a word. The handler does
+ * what every consumer would have done with each word and returns 1, or 0
+ * to have them dispatched one at a time as before; the pusher keeps its own
+ * counters as if it had. NULL (the default) is the old path. */
+typedef int (*NV2AElem16RunHandler)(const uint32_t *words, uint32_t count);
+void nv2a_pusher_set_elem16_run_handler(NV2AElem16RunHandler handler);
 /* Dispatch one command as if it had come from the ring (d3d8_host.c's replay). */
 void nv2a_pusher_dispatch_host(uint32_t subchannel, uint32_t method, uint32_t param);
 

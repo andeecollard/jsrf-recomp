@@ -6371,6 +6371,37 @@ static void draw_primitive(void)
  * timer that will eventually miss one -- silently, as an understated stage. */
 static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param);
 
+/* G76: ARRAY_ELEMENT16 words, n of them, exactly as n calls of
+ * nv2a_pb_exec_method(0, 0x1800, w[i]) would leave the executor: the latched
+ * word, and the indices stored until the batch is full, the rest counted as
+ * overflow. The first word goes through the ordinary path (it initialises
+ * the executor on its first method, and keeps the trace counters honest);
+ * the switches that want every method one at a time -- the walk timer,
+ * the verbose trace, the vsh trace -- take the ordinary path for all. */
+static void pb_exec_method_body(uint32_t subch, uint32_t method, uint32_t param);
+int nv2a_pb_exec_elem16_run(const uint32_t *w, uint32_t n)
+{
+    if (!n || pb_walk_on() || pb_verbose() || s_vsh_trace.enabled) return 0;
+    pb_exec_method_body(0, NV097_ARRAY_ELEMENT16, w[0]);
+    if (n == 1u) return 1;
+    s_methods[NV097_ARRAY_ELEMENT16 / 4] = w[n - 1u];
+    s_method_seen[NV097_ARRAY_ELEMENT16 / 4] = 1;
+    if (s_gpu.prim) {
+        uint32_t rest = n - 1u, room = s_gpu.idx_count + 2 <= NV_MAX_INDICES ? (NV_MAX_INDICES - s_gpu.idx_count) / 2u : 0u;
+        uint32_t k = rest < room ? rest : room;
+        uint16_t *out = &s_gpu.idx[s_gpu.idx_count];
+        for (uint32_t i = 0; i < k; ++i) {
+            uint32_t p = w[1u + i];
+            out[2u * i] = (uint16_t)(p & 0xFFFFu); out[2u * i + 1u] = (uint16_t)(p >> 16);
+        }
+        s_gpu.idx_count += 2u * k;
+        s_gpu.idx_overflow += 2u * (rest - k);
+        s_gpu.idx_overflow_e16 += 2u * (rest - k);
+        s_gpu.idx_wanted += 2u * rest;
+    }
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     /* One predicted branch per method when the switch is off. The alternative

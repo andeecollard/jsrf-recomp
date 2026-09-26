@@ -54,6 +54,11 @@ void nv2a_pusher_set_host_token_handler(NV2AHostTokenHandler handler)
 {
     g_host_token = handler;
 }
+static NV2AElem16RunHandler g_elem16_run;
+void nv2a_pusher_set_elem16_run_handler(NV2AElem16RunHandler handler)
+{
+    g_elem16_run = handler;
+}
 
 /* Ring of the most recently dispatched methods.
  *
@@ -203,6 +208,24 @@ NV2APusherResult nv2a_pusher_run_segment(const uint32_t *data, uint32_t num_dwor
             break;
         }
 
+        /* G76: inline indices, the bulk of a lifted frame's words (187,000 of
+         * 270,000 a frame in Sky Dino), in one call. The counters and the
+         * recent-method ring end as dispatch() would have left them: 0x1800
+         * is unhandled by the D3D11 sink, which the handler tells in bulk. */
+        if (!g_scan_only && g_elem16_run && !increasing && method == 0x1800u && subchannel == 0u && count > 1u
+                && g_elem16_run(&data[pos + 1], count)) {
+            uint32_t k0 = count > RECENT_SLOTS ? count - RECENT_SLOTS : 0u;
+            g_recent_idx += k0;                       /* the words the ring would have overwritten */
+            for (uint32_t k = k0; k < count; ++k) {
+                g_recent[g_recent_idx % RECENT_SLOTS].method = method;
+                g_recent[g_recent_idx % RECENT_SLOTS].param = data[pos + 1 + k];
+                g_recent_idx++;
+            }
+            g_stats.methods += count;
+            g_stats.unhandled += count;
+            g_unhandled[method / 4u] += count;
+            result.methods += count;
+        } else
         if (!g_scan_only) {
             for (uint32_t i = 0; i < count; i++) {
                 dispatch(subchannel, increasing ? method + i * 4u : method,

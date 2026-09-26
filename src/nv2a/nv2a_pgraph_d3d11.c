@@ -239,6 +239,15 @@ void pgraph_d3d11_init(void)
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
 }
 
+/* G76: what n calls of pgraph_d3d11_method with an ignored method count
+ * (ARRAY_ELEMENT16 reaches the default case and is not handled). */
+void pgraph_d3d11_note_ignored(uint32_t n)
+{
+    if (!g_pg.initialized) return;
+    g_pg.stats.methods_handled += n;
+    g_pg.stats.methods_ignored += n;
+}
+
 void pgraph_d3d11_shutdown(void)
 {
     g_pg.initialized = 0;

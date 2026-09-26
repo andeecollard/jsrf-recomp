@@ -1412,6 +1412,17 @@ static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
     DWORD start = GetTickCount();
     unsigned long long fs_t0 = recomp_fs_on() ? recomp_fs_now() : 0;   /* G76 */
     int raised = xbox_Nv2aRaiseSoftwareMethod(subchannel, parameter);
+    {   /* G76: RECOMP_SWM_WAKE=1 -- a waiting guest thread delivers the
+         * interrupt now, not at its next 1 ms poll (xbox_bridge_wake_waiters). */
+        static int wake = -1;
+        extern void xbox_bridge_wake_waiters(void);
+        if (wake < 0) {
+            wake = recomp_switch_on("RECOMP_SWM_WAKE");
+            if (wake) fprintf(stderr, "[PB-NOTIFY] RECOMP_SWM_WAKE=1: a raised software method wakes the waiting guest"
+                                      " threads to deliver it (G76)\n");
+        }
+        if (raised && wake) xbox_bridge_wake_waiters();
+    }
     if (++n <= 16 || parameter == 5)
         fprintf(stderr, "[PB-NOTIFY] #%u parameter=%u raised=%d\n", n, parameter, raised);
     /* The parser must not execute a later software method until this one is
@@ -1431,6 +1442,17 @@ static void jsrf_software_method(uint32_t subchannel, uint32_t parameter)
     if (fs_t0) recomp_fs_add(RFS_P_SWM, recomp_fs_now() - fs_t0);
     if (n <= 16 || parameter == 5)
         fprintf(stderr, "[PB-NOTIFY] completed parameter=%u\n", parameter);
+}
+
+/* G76: the executor's and the D3D11 sink's side of an ARRAY_ELEMENT16 run
+ * (nv2a_pusher_set_elem16_run_handler). */
+static int jsrf_elem16_run(const uint32_t *w, uint32_t n)
+{
+    extern int nv2a_pb_exec_elem16_run(const uint32_t *w, uint32_t n);
+    extern void pgraph_d3d11_note_ignored(uint32_t n);
+    if (!nv2a_pb_exec_elem16_run(w, n)) return 0;
+    pgraph_d3d11_note_ignored(n);
+    return 1;
 }
 
 static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
@@ -1454,6 +1476,13 @@ static DWORD WINAPI jsrf_pushbuffer_ack(LPVOID unused)
      * handler alone would have wedged this thread instead of dropping the
      * notify. The raise and the PGRAPH page guard it needs landed first. */
     nv2a_pusher_set_software_method_handler(jsrf_software_method);
+    /* G76: RECOMP_PB_ELEM16_RUN=1 -- inline index runs in one call each. */
+    if (recomp_switch_on("RECOMP_PB_ELEM16_RUN") && recomp_switch_on("RECOMP_PB_EXEC")) {
+        extern void nv2a_pusher_set_elem16_run_handler(int (*)(const uint32_t *, uint32_t));
+        nv2a_pusher_set_elem16_run_handler(jsrf_elem16_run);
+        fprintf(stderr, "[PUSHER] RECOMP_PB_ELEM16_RUN=1: ARRAY_ELEMENT16 runs are taken in one call, not one dispatch"
+                        " a word (G76)\n");
+    }
     /* G56: CPU readers of GPU memory (the D3D lock hooks) are made current here. */
     {   extern void nv2a_host_read_set_service_thread(void); nv2a_host_read_set_service_thread(); }
     while (!g_pushbuf_ack_stop) {

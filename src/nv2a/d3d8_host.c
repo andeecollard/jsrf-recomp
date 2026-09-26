@@ -3,6 +3,7 @@
 #include "d3d8_host_2d.h"
 #include "nv2a_pusher.h"
 #include "../platform/recomp_frame_split.h"
+#include "../recomp_switch.h"
 #include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
@@ -990,6 +991,22 @@ uint32_t d3d8_host_enqueue_2d_replace(const D3D8HostDrawCheck *c)
 
 /* Token parameter = slot index + 1, so 0 never names a slot. */
 static void on_token_body(uint32_t parameter);
+/* G76: RECOMP_D3D8_HOST_NO_CHECK=1 -- in draw mode, the mirror's per-draw
+ * cross-checks (check_draw: D3D's streams, indices, combiners and FF vertex
+ * state against the executor's latched registers) are not run. They are
+ * diagnostics -- they draw nothing and decide nothing -- and in draw mode
+ * they ran on the pusher for every draw, 0.96 ms a frame in Shibuya and
+ * 1.07 in Sky Dino ([FRAME-SPLIT] check). VERIFY's comparison, the skip's
+ * close and the shadow are kept. */
+static int no_check_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = recomp_switch_on("RECOMP_D3D8_HOST_NO_CHECK");
+        if (on) fprintf(stderr, "[D3D8-MIRROR] RECOMP_D3D8_HOST_NO_CHECK=1: the per-draw cross-checks are off in draw mode (G76)\n");
+    }
+    return on;
+}
 /* G76: RECOMP_FRAME_SPLIT times each token by kind, on the pusher. */
 static void on_token(uint32_t parameter)
 {
@@ -1012,7 +1029,7 @@ static void on_token_body(uint32_t parameter)
         return;
     }
     if (s_slot[i].kind == 1) {
-        check_draw(&s_slot[i].check);
+        if (!(no_check_on() && d3d8_host_any_draw_mode())) check_draw(&s_slot[i].check);
         /* G51.1: the host draws the same draw over the snapshot the kind-2
          * token took. Only pre-transformed 2D draws, only when armed. */
         if (d3d8_host_any_draw_mode()) {
