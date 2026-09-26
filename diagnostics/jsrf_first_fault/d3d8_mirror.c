@@ -171,11 +171,41 @@ void d3d8m_set_indices(uint32_t ib, uint32_t base) { if (!d3d8m_on()) return; m_
  *   0x1720+4i = pVB->Data + attr.offset + Stream.Offset + base*Stride
  *   0x1760+4i = Stride << 8 | attr.format      (format 0x02 = disabled)
  * base is device +0x1C for DrawIndexedVertices and 0 for DrawVertices. */
+/* G75: DrawVerticesUP's fourth argument, set by its wrapper before each hook. */
+static uint32_t m_up_stride;
+void d3d8m_up_stride(uint32_t stride) { m_up_stride = stride; }
 static void d3d8m_streams(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     uint32_t d = MEM32(0x0019DCE0u), obj, tbl;
     c->draw_kind = kind; c->prim = a1;
     c->base_vertex = MEM32(d + 0x1Cu); c->ib = MEM32(d + 0x38Cu); c->ib_data = MEM32(0x0019DED4u);
+    if (kind == 3) {                 /* G75: DrawVerticesUP(prim, count, pData, stride) */
+        uint32_t stride = m_up_stride, bytes = a2 * stride;
+        c->start = 0; c->count = a2; c->up_stride = stride;
+        c->nidx = a2 < D3D8_HOST_IDX_N ? a2 : D3D8_HOST_IDX_N;
+        for (uint32_t k = 0; k < c->nidx; ++k) c->idx[k] = (uint16_t)k;
+        /* The caller's vertices, while they are still the caller's. */
+        {   uint64_t pos; uint8_t *dst = (bytes && a2 <= 0xFFFFu && stride <= 256u) ? d3d8_host_2d_up_reserve(bytes, &pos) : NULL;
+            if (!dst) c->up_over = 1;
+            else {
+                for (uint32_t k = 0; k < bytes; ++k) dst[k] = MEM8(a3 + k);
+                d3d8_host_2d_up_publish(pos, bytes);
+                c->up_pos = pos; c->up_bytes = bytes;
+            } }
+        obj = MEM32(d + 0x380u);
+        if (obj) {                   /* stream 0 is the caller's buffer: offsets into the copy */
+            tbl = 0x0022E554u + (MEM32(obj + 4u) & 0x10u);
+            for (unsigned i = 0; i < 16; ++i) {
+                uint32_t at = obj + 16u * MEM8(tbl + i), s = MEM32(at + 0x14u) & 15u, fmt = MEM32(at + 0x1Cu);
+                c->va_stream[i] = MEM32(at + 0x14u);
+                c->va_format[i] = (stride << 8) + fmt;
+                if (fmt == 2u || s != 0u) continue;
+                c->va_offset[i] = MEM32(at + 0x18u);
+                if ((fmt >> 4) & 0xFu) c->va_on |= 1u << i;
+            }
+        }
+        return;
+    }
     if (kind == 2) {                 /* DrawIndexedVertices(prim, count, pIndexData) */
         c->count = a2;
         c->nidx = a2 < D3D8_HOST_IDX_N ? a2 : D3D8_HOST_IDX_N;
@@ -426,6 +456,7 @@ static void d3d8m_snap_indices(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a2,
 {
     extern ptrdiff_t xbox_GetMemoryOffset(void);
     uint32_t imin = kind == 2 ? 0xFFFFFFFFu : a2, imax = kind == 2 ? 0u : a2 + (a3 ? a3 - 1u : 0u);
+    if (kind == 3) return;           /* G75: UP vertices are copied whole (d3d8m_streams); nothing to hash */
     if (kind == 2 && a2) {
         uint64_t pos; uint16_t *dst = d3d8_host_2d_idx_reserve(a2, &pos);
         if (!dst) c->idx_snap_over = 1;
@@ -521,6 +552,7 @@ static void before_draw_body(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a
 {
     uint32_t d, rt, zs, tok, h;
     if (!d3d8m_on()) return;
+    if (kind == 3u && d3d8_host_up_mode() <= 0) return;      /* G75: DrawVerticesUP only when RECOMP_D3D8_HOST_UP */
     d = MEM32(0x0019DCE0u); h = MEM32(d + 0x384u);
     m_verify_draw = 0;     /* verify is decided on the executor's thread now; see d3d8_host_verify_enabled */
     if (d3d8_host_replaces_handle(h) && !m_verify_draw) {
@@ -555,6 +587,7 @@ static void after_draw_body(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3
     D3D8HostDrawCheck c;
     uint32_t tok;
     if (!d3d8m_on()) return;
+    if (kind == 3u && d3d8_host_up_mode() <= 0) return;      /* G75: DrawVerticesUP only when RECOMP_D3D8_HOST_UP */
     memset(&c, 0, sizeof c);
     c.serial = ++m_serial;
     d3d8m_streams(&c, kind, a1, a2, a3);

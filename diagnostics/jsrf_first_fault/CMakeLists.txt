@@ -1380,7 +1380,8 @@ if(APPLE)
     # the executor's draw_points_lines, with a positive control.
     add_test(NAME jsrf_d3d8_host_points COMMAND jsrf_d3d8_host_2d_test points)
     # G75: BUMPENVMAP drawn by the host (RECOMP_D3D8_HOST_BUMP) against the
-    # executor's displacement, with the undisplaced draw as the control.
+    # executor's displacement, with the undisplaced draw as the control; and
+    # linear 32-bit textures (RECOMP_D3D8_HOST_LIN32) against its lin32 path.
     add_test(NAME jsrf_d3d8_host_bump COMMAND jsrf_d3d8_host_2d_test bump)
     set_tests_properties(jsrf_d3d8_host_bump PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     set_tests_properties(jsrf_d3d8_host_ff_gpu PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")

@@ -93,7 +93,7 @@ typedef struct {
     float    xf_world[16], xf_view[16], xf_proj[16];
     uint32_t xf_seen;          /* bit0 world, bit1 view, bit2 proj */
     /* ---- G41: vertex streams and indices ----
-     * draw_kind: 0 unknown, 1 DrawVertices(prim, start, count), 2
+     * draw_kind: 0 unknown, 3 DrawVerticesUP (G75; see up_pos), 1 DrawVertices(prim, start, count), 2
      * DrawIndexedVertices(prim, count, pIndexData). idx[] holds the first
      * nidx (<= D3D8_HOST_IDX_N) indices D3D was handed; for DrawVertices the
      * implied run start..start+count-1. */
@@ -184,6 +184,12 @@ typedef struct {
      * hashes again at the token to see whether the vertices moved too. */
     uint64_t idx_snap_pos, vtx_hash;
     uint32_t idx_snap_n, idx_snap_over, vtx_hash_ok;
+    /* G75: DrawVerticesUP (draw_kind 3). The caller's vertices are copied at
+     * the call into the host's UP ring (d3d8_host_2d_up_*): up_bytes of them
+     * at up_pos, up_stride apart; the arrays' va_offset are offsets into that
+     * copy, not guest addresses. up_over: they did not fit. */
+    uint64_t up_pos;
+    uint32_t up_bytes, up_stride, up_over;
     /* G51.3: D3D's own cull state, D3D_g_RenderState[128] CULLMODE (0x19E2E0)
      * and [127] FRONTFACE (0x19E2DC). SetRenderState_CullMode (0x18EBD0), not
      * Simple, emits it: CULL_FACE_ENABLE = CullMode != 0 and, when on,

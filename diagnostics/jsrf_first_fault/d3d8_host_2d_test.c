@@ -190,6 +190,9 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
     static float v[16384][16][4];
     static NV2ATextureCopy s;
     unsigned n = c->count;
+    static uint8_t upcopy[4096];
+    const uint8_t *vb = ram;
+    if (c->draw_kind == 3 && c->up_bytes <= sizeof upcopy && d3d8_host_2d_up_copy(c->up_pos, c->up_bytes, upcopy)) vb = upcopy;   /* G75 */
     memset(&s, 0, sizeof s);
     s.clip_w = RTW; s.clip_h = RTH; s.target_pitch = RTPITCH; s.target_bpp = 2; s.depth_pitch = RTW * 4;
     s.z_clip_min = 0.0f; s.z_clip_max = 16777215.0f; s.z_cull = 1;
@@ -203,6 +206,7 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
         const D3D8H2DTexture *t = &d->tex[0];
         s.width = t->width; s.height = t->height; s.pitch = t->pitch; s.levels = t->levels;
         s.rgba8 = t->fmt == 0x06 || t->fmt == 0x07; s.dxt1 = t->fmt == 0x0C; s.dxt3 = t->fmt == 0x0E;
+        s.lin32 = t->fmt == 0x12 ? 1u : t->fmt == 0x1E ? 2u : 0u;       /* G75 */
         s.min_filter = t->min_filter; s.linear = t->mag == 2; s.repeat = t->wrap_u == 1;
     }
     s.alpha_test = d->alpha_test; s.alpha_ref = d->alpha_ref;
@@ -213,15 +217,15 @@ static int exec_draw(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, uint16
     for (unsigned k = 0; k < n; ++k) {
         uint32_t i = c->draw_kind == 2 ? c->idx[k] : c->start + k;
         float pos[4]; uint32_t col;
-        memcpy(pos, ram + c->va_offset[0] + (c->va_format[0] >> 8) * i, 16);
-        memcpy(&col, ram + c->va_offset[3] + (c->va_format[3] >> 8) * i, 4);
+        memcpy(pos, vb + c->va_offset[0] + (c->va_format[0] >> 8) * i, 16);
+        memcpy(&col, vb + c->va_offset[3] + (c->va_format[3] >> 8) * i, 4);
         /* What D3D's pass-through program hands the executor: xy + c1.xy, z * c0.z. */
         v[k][0][0] = exec_snap(pos[0] + g_exec_offset); v[k][0][1] = exec_snap(pos[1] + g_exec_offset);
         v[k][0][2] = pos[2] * 16777215.0f; v[k][0][3] = 1.0f / pos[3];
         v[k][3][0] = ((col >> 16) & 255) / 255.0f; v[k][3][1] = ((col >> 8) & 255) / 255.0f;
         v[k][3][2] = (col & 255) / 255.0f; v[k][3][3] = (col >> 24) / 255.0f;
         v[k][9][3] = 1.0f;
-        if ((c->va_on >> 9) & 1u) memcpy(v[k][9], ram + c->va_offset[9] + (c->va_format[9] >> 8) * i, 8);
+        if ((c->va_on >> 9) & 1u) memcpy(v[k][9], vb + c->va_offset[9] + (c->va_format[9] >> 8) * i, 8);
     }
     if (!g_exec_keep_surfaces) nv2a_metal_invalidate(NULL);
     if (nv2a_metal_draw(&s, (d->tmask & 1) ? ram + d->tex[0].addr : ram + TEX,
@@ -1065,6 +1069,68 @@ static void bump_tests(void)
         CHECK(why && strstr(why, "bump env unit's address mode"), "%s, mirrored bump unit: refused (%s)", name, why ? why : "built");
     }
     d3d8_host_2d_set_bump(0);
+}
+/* G75: LINEAR 32-BIT (0x12 A8R8G8B8, 0x1E X8R8G8B8) ON THE HOST
+ * (RECOMP_D3D8_HOST_LIN32=1): case A's strip over a 32x32 image rectangle,
+ * coordinates in texels, host against the executor's lin32 path. Off, the
+ * format is refused by name. The control is case A's perturbation. */
+static void lin32_tests(void)
+{
+    for (unsigned k = 0; k < 2; ++k) {
+        uint32_t fb = k ? 0x1Eu : 0x12u;
+        D3D8HostDrawCheck c;
+        D3D8Host2DDraw d;
+        const char *why;
+        char name[64];
+        case_a(&c);
+        for (unsigned y = 0; y < TW; ++y)
+            for (unsigned x = 0; x < TW; ++x) {
+                uint8_t *p = ram + TEX + y * 256u + 4u * x;               /* pitch 256: wider than the row */
+                p[0] = (uint8_t)(x * 8); p[1] = (uint8_t)(y * 8); p[2] = (uint8_t)((x ^ y) * 8);
+                p[3] = (uint8_t)(((x / 4 + y / 4) & 1) ? 255 - x * 4 : 8 + y * 6);
+            }
+        for (int i = 0; i < 4; ++i) { putf(VB + 28u * i + 20, A_UV[i][0] * 24.0f); putf(VB + 28u * i + 24, A_UV[i][1] * 24.0f); }
+        c.format[0] = 0x1u | 0x20u | (fb << 8) | (1u << 16);
+        c.size[0] = (TW - 1u) | ((TW - 1u) << 12) | ((256u / 64u - 1u) << 24);
+        snprintf(name, sizeof name, "linear 32-bit 0x%02X", fb);
+        d3d8_host_2d_set_lin32(0);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+        CHECK(why && strstr(why, k ? "texture format 0x1E" : "texture format 0x12"), "%s, switch off: refused by name (%s)",
+              name, why ? why : "built");
+        d3d8_host_2d_set_lin32(1);
+        compare(name, &c, 1);
+        compare(name, &c, 0);
+        d3d8_host_2d_set_lin32(0);
+    }
+}
+/* G75: DRAWVERTICESUP. Case A's strip as a DrawVerticesUP draw: its
+ * vertices in the UP ring (as the mirror copies them at the call), its arrays
+ * offsets into that copy. Then the guest's vertex buffer is overwritten, so a
+ * host that read guest RAM instead of the copy would draw garbage. */
+static void up_tests(void)
+{
+    D3D8HostDrawCheck c;
+    uint64_t pos;
+    uint8_t *dst;
+    case_a(&c);
+    d3d8_host_2d_set_up(1);
+    d3d8_host_2d_set_bisect(16u);    /* the bump tests left other bytes under case A's texture key: hash every draw */
+    dst = d3d8_host_2d_up_reserve(4u * 28u, &pos);
+    CHECK(dst != NULL, "UP ring: reserve");
+    if (!dst) return;
+    memcpy(dst, ram + VB, 4u * 28u);
+    d3d8_host_2d_up_publish(pos, 4u * 28u);
+    c.draw_kind = 3; c.start = 0; c.up_pos = pos; c.up_bytes = 4u * 28u; c.up_stride = 28;
+    c.va_offset[0] = 0; c.va_offset[3] = 16; c.va_offset[9] = 20;
+    compare("DrawVerticesUP strip", &c, 1);
+    {   D3D8Host2DDraw d; const char *why;
+        c.up_over = 1;
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+        CHECK(why && strstr(why, "DrawVerticesUP"), "DrawVerticesUP whose copy did not fit: refused (%s)", why ? why : "built");
+        c.up_over = 0; }
+    d3d8_host_2d_set_bisect(0);
 }
 static void points_tests(void)
 {
@@ -2694,6 +2760,8 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "bump") == 0) {         /* G75: BUMPENVMAP on the host */
         d3d8_host_2d_metal_set_spec_sync(1);
         bump_tests();
+        lin32_tests();
+        up_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }

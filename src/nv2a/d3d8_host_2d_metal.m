@@ -68,7 +68,7 @@ typedef struct {
     uint32_t cc, control, tmask, add_spec;
     uint32_t alpha_test, alpha_func, alpha_ref, blend;
     uint32_t bsrc, bdst, beq, bcolor;
-    uint32_t dither, cmask, lin_mask, bump_mask;   /* G75: bump_mask, bit u = unit u is BUMPENVMAP */
+    uint32_t dither, cmask, lin_mask, bump_mask;   /* G75: bit u = unit u sampled from its bytes, bit 4+u = as BUMPENVMAP */
     float tw[4], th[4], lod_bias[4];
     uint32_t ci[8], ai[8], co[8], ao[8], k0[8], k1[8];
     uint32_t fin, fcw0, fcw1, fog_en, fog_mode, fog_color, sf0, sf1;   /* G53 */
@@ -211,19 +211,20 @@ static NSString *const k_src =
  "#define H2D_FS_ARGS O i [[stage_in]], float4 dst [[color(0), raster_order_group(0)]], constant U &u [[buffer(0)]],"
  " texture2d<float> h0 [[texture(0)]], texture2d<float> h1 [[texture(1)]], texture2d<float> h2 [[texture(2)]], texture2d<float> h3 [[texture(3)]],"
  " sampler q0 [[sampler(0)]], sampler q1 [[sampler(1)]], sampler q2 [[sampler(2)]], sampler q3 [[sampler(3)]],"
- " constant BP &bp [[buffer(1)]], const device uchar *b1 [[buffer(2)]], const device uchar *b2 [[buffer(3)]], const device uchar *b3 [[buffer(4)]]\n"
+ " constant BP &bp [[buffer(1)]], const device uchar *b1 [[buffer(2)]], const device uchar *b2 [[buffer(3)]], const device uchar *b3 [[buffer(4)]],"
+ " const device uchar *b0 [[buffer(5)]]\n"
  "inline float4 h2d_body(O i, float4 dst, constant U &u, texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3,"
- " sampler q0, sampler q1, sampler q2, sampler q3, constant BP &bp, const device uchar *b1, const device uchar *b2, const device uchar *b3, bool zcull) {\n"
+ " sampler q0, sampler q1, sampler q2, sampler q3, constant BP &bp, const device uchar *b0, const device uchar *b1, const device uchar *b2, const device uchar *b3, bool zcull) {\n"
  " float4 r[16]; for (uint n = 0; n < 16; n++) r[n] = float4(0);\n"
  " uint tm = K_tmask(u); r[4] = i.d0; r[5] = i.d1;\n"
  " uint bm = K_bump(u);\n"
  /* G75: a BUMPENVMAP unit is the executor's: bump_sample() from the unit's
   * guest bytes, displaced by the input unit's texel, in unit order as the
   * executor's shade() runs them. */
- " if (tm & 1) r[8] = samp(h0, q0, i.t0, 0, u);\n"
- " if (tm & 2) r[9] = (bm & 2) ? bump_sample(b1, i.t1, 1, bin(r, bp.bump_in[1]), bp) : samp(h1, q1, i.t1, 1, u);\n"
- " if (tm & 4) r[10] = (bm & 4) ? bump_sample(b2, i.t2, 2, bin(r, bp.bump_in[2]), bp) : samp(h2, q2, i.t2, 2, u);\n"
- " if (tm & 8) r[11] = (bm & 8) ? bump_sample(b3, i.t3, 3, bin(r, bp.bump_in[3]), bp) : samp(h3, q3, i.t3, 3, u);\n"
+ " if (tm & 1) r[8] = (bm & 1) ? sample_lod(b0, i.t0, 0, bp) : samp(h0, q0, i.t0, 0, u);\n"
+ " if (tm & 2) r[9] = (bm & 2) ? ((bm & 32) ? bump_sample(b1, i.t1, 1, bin(r, bp.bump_in[1]), bp) : sample_lod(b1, i.t1, 1, bp)) : samp(h1, q1, i.t1, 1, u);\n"
+ " if (tm & 4) r[10] = (bm & 4) ? ((bm & 64) ? bump_sample(b2, i.t2, 2, bin(r, bp.bump_in[2]), bp) : sample_lod(b2, i.t2, 2, bp)) : samp(h2, q2, i.t2, 2, u);\n"
+ " if (tm & 8) r[11] = (bm & 8) ? ((bm & 128) ? bump_sample(b3, i.t3, 3, bin(r, bp.bump_in[3]), bp) : sample_lod(b3, i.t3, 3, bp)) : samp(h3, q3, i.t3, 3, u);\n"
  " r[12].a = (tm & 1) ? r[8].a : 1;\n"
  /* SPECIALISED: eight explicit calls, each guarded by the constant stage
   * count and handed its words as arguments -- the executor's shape
@@ -254,11 +255,11 @@ static NSString *const k_src =
  "  float bias = (float(b[(xy.y & 3) * 4 + (xy.x & 3)]) + .5f) / 16 - .5f; c.rgb += bias / float3(31, 63, 31); }\n"
  " uint cm = K_cmask(u); if (!(cm & 0x00FF0000u)) c.r = dst.r; if (!(cm & 0x0000FF00u)) c.g = dst.g; if (!(cm & 0x000000FFu)) c.b = dst.b;\n"
  " return float4(c.rgb, clamp(c.a, 0.0f, 1.0f)); }\n"
- "fragment float4 h2d_fs(H2D_FS_ARGS) { return h2d_body(i, dst, u, h0, h1, h2, h3, q0, q1, q2, q3, bp, b1, b2, b3, true); }\n"
+ "fragment float4 h2d_fs(H2D_FS_ARGS) { return h2d_body(i, dst, u, h0, h1, h2, h3, q0, q1, q2, q3, bp, b0, b1, b2, b3, true); }\n"
  /* Early depth/stencil: chosen only for a draw that cannot discard (no
   * alpha test), or that may discard but writes neither depth nor stencil --
   * the executor's hw_early_z rule, exact in both cases. */
- "[[early_fragment_tests]] fragment float4 h2d_fs_early(H2D_FS_ARGS) { return h2d_body(i, dst, u, h0, h1, h2, h3, q0, q1, q2, q3, bp, b1, b2, b3, false); }\n";
+ "[[early_fragment_tests]] fragment float4 h2d_fs_early(H2D_FS_ARGS) { return h2d_body(i, dst, u, h0, h1, h2, h3, q0, q1, q2, q3, bp, b0, b1, b2, b3, false); }\n";
 
 static id<MTLDevice> s_dev;
 static unsigned long long s_ns_texture, s_ns_external;      /* in-process timers for draw mode's report */
@@ -530,7 +531,8 @@ static id<MTLTexture> texture_for(const D3D8H2DTexture *t, const uint8_t *ram, s
  * nv2a_texture_copy_texture_bytes() gives the executor. Keyed and validated
  * as texture_for keys and validates (Data/Format/Size, a hash at most once
  * a flip, a deferred write-back paid first). Few textures are bump units --
- * Rokkaku-dai's water is one or two -- so a short LRU. */
+ * Rokkaku-dai's water is one or two -- so a short LRU. Linear 32-bit
+ * textures (RECOMP_D3D8_HOST_LIN32, the graffiti studio) take it too. */
 #define BUMP_CACHE 16
 static struct { uint32_t addr, fmt, size; uint64_t hash; unsigned long long used, checked; id<MTLBuffer> buf; } s_bc[BUMP_CACHE];
 static unsigned long long s_bc_clock, s_bc_builds;
@@ -575,7 +577,7 @@ static void bump_params(const D3D8Host2DDraw *d, unsigned s, H2DBumpParams *bp)
     bp->rgba8[s] = t->fmt == 0x06u ? 1u : t->fmt == 0x07u ? 2u : 0u;
     bp->dxt1[s] = t->fmt == 0x0Cu; bp->dxt3[s] = t->fmt == 0x0Eu;
     bp->sz16[s] = t->fmt == 0x03u ? 1u : t->fmt == 0x04u ? 2u : 0u;
-    bp->lin32[s] = 0;                                  /* 0x12/0x1E: texture_from_d3d refuses them */
+    bp->lin32[s] = t->fmt == 0x12u ? 1u : t->fmt == 0x1Eu ? 2u : 0u;   /* G59's linear 32-bit, RECOMP_D3D8_HOST_LIN32 */
     bp->repeat[s] = !t->linear && t->wrap_u == 1u;
     bp->levels[s] = t->levels; bp->min_filter[s] = t->min_filter; bp->lod_bias[s] = t->lod_bias;
     bp->bump[s] = d->bump[s]; bp->bump_in[s] = d->bump_in[s];
@@ -766,10 +768,13 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
     for (unsigned s = 0; s < 4; ++s) {
         if (!(d->tmask & (1u << s))) continue;
         const D3D8H2DTexture *t = &d->tex[s];
-        if (d->bump[s]) {                    /* G75: the executor's buffer sampler, never a hardware texture */
+        if (d->bump[s] || t->fmt == 0x12u || t->fmt == 0x1Eu) {
+            /* G75: the executor's buffer sampler, never a hardware texture --
+             * a bump unit, and linear 32-bit, which the executor also
+             * samples from its bytes (hw_tex takes only rgba8 and DXT). */
             if (!u.bump_mask) memset(&bp, 0, sizeof bp);
             if (!(bbuf[s] = bump_buffer_for(t, ram, ram_size))) return 0;
-            bump_params(d, s, &bp); u.bump_mask |= 1u << s;
+            bump_params(d, s, &bp); u.bump_mask |= (1u << s) | (d->bump[s] ? 16u << s : 0u);
             continue;
         }
         if (!(tex[s] = texture_for(t, ram, ram_size))) return 0;
@@ -860,7 +865,7 @@ static int encode_draw(id<MTLRenderCommandEncoder> enc, int with_stencil, const 
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
     if (u.bump_mask) {                       /* G75: only a bump draw reads these; the executor rebinds its own per draw */
         [enc setFragmentBytes:&bp length:sizeof bp atIndex:1];
-        for (unsigned s = 1; s < 4; ++s) if (bbuf[s]) [enc setFragmentBuffer:bbuf[s] offset:0 atIndex:1 + s];
+        for (unsigned s = 0; s < 4; ++s) if (bbuf[s]) [enc setFragmentBuffer:bbuf[s] offset:0 atIndex:s ? 1 + s : 5];
     }
     for (unsigned s = 0; s < 4; ++s) {
         [enc setFragmentTexture:tex[s] ? tex[s] : s_dummy atIndex:s];

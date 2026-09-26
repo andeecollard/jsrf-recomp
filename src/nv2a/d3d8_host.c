@@ -70,6 +70,7 @@ int d3d8_host_check_streams(const D3D8HostDrawCheck *c, const D3D8ExecDrawTextur
 {
     int all = 1, ix_ok = 1;
     if (!c->draw_kind || !e->va_valid) return 1;
+    if (c->draw_kind == 3u) return 1;     /* G75: DrawVerticesUP -- inline, the executor has no arrays to compare */
     /* Streams: every array the executor enabled, against D3D's derivation. */
     atomic_fetch_add(&s_va_draws, 1);
     for (unsigned i = 0; i < 16; ++i) {

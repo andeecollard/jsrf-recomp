@@ -163,6 +163,16 @@ static const char *texture_from_d3d(const D3D8HostDrawCheck *c, unsigned u, D3D8
         t->width = (c->size[u] & 0xFFFu) + 1u; t->height = ((c->size[u] >> 12) & 0xFFFu) + 1u;
         t->pitch = ((c->size[u] >> 24) + 1u) * 64u;
         if (t->pitch < t->width * 2u) return "texture pitch";
+    } else if ((fb == 0x12u || fb == 0x1Eu) && d3d8_host_lin32_mode() > 0) {
+        /* G75: LU_IMAGE_A8R8G8B8 / X8R8G8B8, G59's graffiti canvas: image
+         * rectangles like 0x11, four bytes a texel, one level (the executor
+         * refuses more), sampled by the renderer from their bytes with the
+         * executor's own sampler, as the executor samples them. */
+        if (t->levels != 1u) return "linear 32-bit texture mip levels";
+        t->linear = 1;
+        t->width = (c->size[u] & 0xFFFu) + 1u; t->height = ((c->size[u] >> 12) & 0xFFFu) + 1u;
+        t->pitch = ((c->size[u] >> 24) + 1u) * 64u;
+        if (t->pitch < t->width * 4u) return "texture pitch";
     } else if (fb == 0x0Cu || fb == 0x0Eu || fb == 0x06u || fb == 0x07u || fb == 0x03u || fb == 0x04u) {
         unsigned lw = (f >> 20) & 0xFu, lh = (f >> 24) & 0xFu;
         if (lw > 12 || lh > 12) return "texture size";
@@ -275,6 +285,30 @@ int d3d8_host_2d_idx_copy(uint64_t pos, uint32_t n, uint16_t *out)
     h = atomic_load_explicit(&s_ihead, memory_order_acquire);
     return h - pos + 2u * D3D8H2D_IDX_PER_DRAW <= D3D8H2D_IDX_RING;
 }
+/* ---- G75: the UP ring, the index ring's shape for DrawVerticesUP's bytes ---- */
+static uint8_t s_upring[D3D8H2D_UP_RING];
+static uint64_t s_upreserve;
+static _Atomic uint64_t s_uphead;
+uint8_t *d3d8_host_2d_up_reserve(uint32_t n, uint64_t *pos)
+{
+    uint64_t p = s_upreserve;
+    if (!n || n > D3D8H2D_UP_PER_DRAW) return NULL;
+    if ((p % D3D8H2D_UP_RING) + n > D3D8H2D_UP_RING) p += D3D8H2D_UP_RING - p % D3D8H2D_UP_RING;
+    *pos = p; s_upreserve = p + n;
+    return &s_upring[p % D3D8H2D_UP_RING];
+}
+void d3d8_host_2d_up_publish(uint64_t pos, uint32_t n)
+{
+    atomic_store_explicit(&s_uphead, pos + n, memory_order_release);
+}
+int d3d8_host_2d_up_copy(uint64_t pos, uint32_t n, uint8_t *out)
+{
+    uint64_t h = atomic_load_explicit(&s_uphead, memory_order_acquire);
+    if (!n || pos + n > h || h - pos > D3D8H2D_UP_RING) return 0;
+    memcpy(out, &s_upring[pos % D3D8H2D_UP_RING], n);
+    h = atomic_load_explicit(&s_uphead, memory_order_acquire);
+    return h - pos + 2u * D3D8H2D_UP_PER_DRAW <= D3D8H2D_UP_RING;
+}
 /* G73: THE HASH RUNS ON THE TITLE'S THREAD, before every replaced draw, and
  * it was most of the title's frame. Measured 25 Sep 2026 in Rokkaku-dai free
  * play with the lift on: the mirror's draw hooks cost 15.45 ms a flip on the
@@ -367,6 +401,29 @@ int d3d8_host_ff_gpu_mode(void)
     }
     return m;
 }
+static int s_up_mode = -1;
+void d3d8_host_2d_set_up(int on) { s_up_mode = on ? 1 : 0; }
+int d3d8_host_up_mode(void)
+{
+    if (s_up_mode < 0) {
+        s_up_mode = recomp_switch_on("RECOMP_D3D8_HOST_UP");
+        if (s_up_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_UP=1: DrawVerticesUP draws are mirrored, their vertices"
+                                       " copied at the call, and drawn by the host in draw mode (G75)\n");
+    }
+    return s_up_mode;
+}
+static int s_lin32_mode = -1;
+void d3d8_host_2d_set_lin32(int on) { s_lin32_mode = on ? 1 : 0; }
+int d3d8_host_lin32_mode(void)
+{
+    if (s_lin32_mode < 0) {
+        s_lin32_mode = recomp_switch_on("RECOMP_D3D8_HOST_LIN32");
+        if (s_lin32_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_LIN32=1: linear 32-bit textures (0x12/0x1E)"
+                                          " are drawn by the host, sampled from their bytes as the executor samples"
+                                          " them (G75)\n");
+    }
+    return s_lin32_mode;
+}
 static int s_bump_mode = -1;
 void d3d8_host_2d_set_bump(int on) { s_bump_mode = on ? 1 : 0; }
 int d3d8_host_bump_mode(void)
@@ -450,6 +507,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
 {
     D3D8H2DVertex *verts = d->verts;
     int cls = d3d8_host_2d_class(c);
+    const uint8_t *vram = ram;
+    size_t vram_size = ram_size;
     memset(d, 0, sizeof *d);
     d->verts = verts;
     d->serial = c->serial; d->fvf = c->vs_handle; d->prim = c->prim; d->count = c->count;
@@ -458,6 +517,16 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     d->cls = (uint32_t)cls;
     if (!verts) return "no vertex buffer";
     if (!cls) return "not a host class";
+    /* G75: a DrawVerticesUP draw's vertices are the mirror's copy of the
+     * caller's, and its arrays are offsets into that copy. */
+    if (c->draw_kind == 3u) {
+        static uint8_t upbuf[D3D8H2D_UP_PER_DRAW + 16u];
+        if (d3d8_host_up_mode() <= 0) return "DrawVerticesUP (RECOMP_D3D8_HOST_UP off)";
+        if (c->up_over || !c->up_bytes) return "DrawVerticesUP: vertices not copied";
+        if (!d3d8_host_2d_up_copy(c->up_pos, c->up_bytes, upbuf)) return "DrawVerticesUP: vertex copy overwritten";
+        memset(upbuf + c->up_bytes, 0, 16u);
+        vram = upbuf; vram_size = c->up_bytes + 16u;   /* fetch reads 16 bytes at a time */
+    }
     if (cls == 2 && (!ffm || !ffv)) return "no fixed-function register file or evaluator";
     if (cls == 3 && d3d8_host_vs_mode() <= 0) return "programmable vertex shader (RECOMP_D3D8_HOST_VS off)";
 
@@ -701,7 +770,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                     float x[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
                     if (!(prog.inputs_read & (1u << a))) continue;
                     if (a == 3u) x[0] = x[1] = x[2] = 1.0f;                 /* diffuse without an array: white */
-                    if ((c->va_on >> a) & 1u) { if (!fetch(ram, ram_size, c->va_offset[a], c->va_format[a], lo + v, x)) d->vs_in_unfetched |= 1u << a; }
+                    if ((c->va_on >> a) & 1u) { if (!fetch(vram, vram_size, c->va_offset[a], c->va_format[a], lo + v, x)) d->vs_in_unfetched |= 1u << a; }
                     else d->vs_in_noarray |= 1u << a;
                     memcpy(vin[v * nattrs + slot_of[a]], x, 16);
                 }
@@ -811,7 +880,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                         for (unsigned a = 0; a < 16; ++a) { in[a][0] = in[a][1] = in[a][2] = 0.0f; in[a][3] = 1.0f; }
                         in[3][0] = in[3][1] = in[3][2] = 1.0f;
                         for (unsigned a = 0; a < 16 && !why; ++a)
-                            if (((c->va_on >> a) & 1u) && !fetch(ram, ram_size, c->va_offset[a], c->va_format[a], i, in[a]))
+                            if (((c->va_on >> a) & 1u) && !fetch(vram, vram_size, c->va_offset[a], c->va_format[a], i, in[a]))
                                 why = "vertex format";
                         if (!why) why = ffv(ffm, (const float (*)[4])in, out);
                         if (!why) {
@@ -836,21 +905,21 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                     if (vstat[slot] == 2 && ok == 1 && !d->point_sprite) { ++d->tris_dropped_q; ok = -1; }
                     continue;
                 }
-                if (!fetch(ram, ram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
+                if (!fetch(vram, vram_size, c->va_offset[0], c->va_format[0], i, pos)) return "vertex bounds";
                 float rhw = pos[3];
                 v[j].p[0] = d3d8_host_2d_snap(pos[0] * c->ss_x + D3D8H2D_SCREEN_OFFSET);
                 v[j].p[1] = d3d8_host_2d_snap(pos[1] * c->ss_y + D3D8H2D_SCREEN_OFFSET); v[j].p[2] = pos[2];
                 v[j].p[3] = 1.0f / rhw;                         /* inf for rhw 0: dropped below */
                 if (i < d->idx_min) d->idx_min = i; if (i > d->idx_max) d->idx_max = i;
-                if ((c->va_on >> 3) & 1u) { if (!fetch(ram, ram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
+                if ((c->va_on >> 3) & 1u) { if (!fetch(vram, vram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
                 else { v[j].d0[0] = v[j].d0[1] = v[j].d0[2] = v[j].d0[3] = 1.0f; }
-                if ((c->va_on >> 4) & 1u) { if (!fetch(ram, ram_size, c->va_offset[4], c->va_format[4], i, v[j].d1)) return "specular format"; }
+                if ((c->va_on >> 4) & 1u) { if (!fetch(vram, vram_size, c->va_offset[4], c->va_format[4], i, v[j].d1)) return "specular format"; }
                 /* G53: D3D's vertex-fog pass-through: the coordinate is the specular alpha. */
                 if (d->fog_enable) v[j].f[0] = v[j].d1[3] < 0.0f ? 0.0f : v[j].d1[3] > 1.0f ? 1.0f : v[j].d1[3];
                 for (unsigned u = 0; u < 4; ++u) {
                     v[j].t[u][3] = 1.0f;
                     if ((c->va_on >> (9u + u)) & 1u &&
-                        !fetch(ram, ram_size, c->va_offset[9 + u], c->va_format[9 + u], i, v[j].t[u])) return "texcoord format";
+                        !fetch(vram, vram_size, c->va_offset[9 + u], c->va_format[9 + u], i, v[j].t[u])) return "texcoord format";
                 }
                 for (unsigned q = 0; q < 4; ++q) if (!isfinite(v[j].p[q]) || !isfinite(v[j].d0[q]) || !isfinite(v[j].d1[q])) ok = 0;
                 if (!isfinite(v[j].p[3])) ok = 0;
@@ -1036,6 +1105,9 @@ static PlKind s_pl_kind[24];
  * (RECOMP_D3D8_HOST_2D_DUMP) whether they match or not, for a zoomed look. */
 static unsigned long long s_pl_cmp, s_pl_exact, s_pl_within, s_pl_mm, s_pl_exec_px, s_pl_host_px;
 static unsigned s_pl_dumped;
+/* G75: the same for BUMPENVMAP draws. */
+static unsigned long long s_bump_cmp, s_bump_exact, s_bump_within, s_bump_mm, s_bump_exec_px, s_bump_host_px;
+static unsigned s_bump_dumped;
 static unsigned s_pl_nkind;
 static unsigned long long s_pl_tokens, s_pl_drawn, s_pl_segs, s_pl_other;
 static void pl_census(const D3D8HostDrawCheck *c, int cls, const D3D8Host2DDraw *d, int drawn)
@@ -2052,6 +2124,21 @@ void d3d8_host_2d_flip(void)
                         }
             }
         }
+        /* G75: BUMPENVMAP draws get their own verdicts, and the first few
+         * are dumped whether they match or not, for a zoomed look. */
+        if (r->info.bump[1] | r->info.bump[2] | r->info.bump[3]) {
+            ++s_bump_cmp; s_bump_exec_px += df.exec_changed; s_bump_host_px += df.host_changed;
+            if (df.mismatch) ++s_bump_mm; else if (df.max_err[0] | df.max_err[1] | df.max_err[2]) ++s_bump_within; else ++s_bump_exact;
+            if (s_dump_dir[0] && s_bump_dumped < 6 && df.exec_changed > 64) {
+                ++s_bump_dumped; dump(r, &df);
+                fprintf(stderr, "[D3D8-HOST-2D] bump dump: flip %llu draw %u class %u prim %u count %u bbox %u,%u %ux%u modes %X"
+                                " (unit 1 input %u, M %g %g %g %g): %llu px over tolerance, executor changed %llu, host %llu,"
+                                " max r%u g%u b%u\n", s_flips, r->serial, r->info.cls, r->info.prim, r->info.count, r->x0, r->y0,
+                        r->w, r->h, r->info.stage_modes, r->info.bump_in[1], r->info.bump_mat[1][0], r->info.bump_mat[1][1],
+                        r->info.bump_mat[1][2], r->info.bump_mat[1][3], df.mismatch, df.exec_changed, df.host_changed,
+                        df.max_err[0], df.max_err[1], df.max_err[2]);
+            }
+        }
         px += df.pixels; mm += df.mismatch; fe += df.exec_changed; fh += df.host_changed;
         if (r->info.cls == 3) {
             ++s_vs_compared; s_vs_px += df.pixels; s_vs_px_mm += df.mismatch;
@@ -2313,6 +2400,10 @@ void d3d8_host_2d_report(const char *why)
                         e->fmt0, e->fmt3, e->blend, e->zfunc);
             }
         }
+        if (s_bump_cmp)
+            fprintf(stderr, "[D3D8-HOST-2D] %s bump env: VERIFY compared %llu: EXACT %llu within_tolerance %llu MISMATCHING %llu,"
+                            " px changed executor %llu host %llu\n", why, s_bump_cmp, s_bump_exact, s_bump_within, s_bump_mm,
+                    s_bump_exec_px, s_bump_host_px);
         if (s_verify) fprintf(stderr, "[D3D8-HOST-2D] %s VERIFY (1 flip in %u drawn by the executor, host shadowed):"
                                       " %llu draws compared -- the verdicts are the shadow lines below\n", why, s_verify, s_verified);
         if (s_ffmode != 1 && s_mode != 1 && s_vsmode != 1 && !s_verify) { fflush(stderr); return; }

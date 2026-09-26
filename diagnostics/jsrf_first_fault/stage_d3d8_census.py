@@ -287,6 +287,21 @@ def main():
                 wrappers.append("static void %s(void) { uint32_t h = ecx, v = edx; %s(); d3d8m_simple(h, v); }" % (hooked, body))
                 body = hooked
                 manifest.append("mirror: %s (render state)" % name)
+            if a.mirror and name == "sub_00199060":
+                # G75: DrawVerticesUP(prim, count, pVertexStreamZeroData,
+                # VertexStreamZeroStride) -- kind 3. The stride goes ahead of
+                # the common hooks, which take three arguments; the mirror
+                # copies the caller's vertices while they are still there.
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_up_stride(uint32_t stride);"
+                                " void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);"
+                                " void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);")
+                wrappers.append("static void %s(void) { uint32_t a1 = MEM32(esp + 4u), a2 = MEM32(esp + 8u),"
+                                " a3 = MEM32(esp + 12u), a4 = MEM32(esp + 16u); d3d8m_up_stride(a4);"
+                                " d3d8m_before_draw(3u, a1, a2, a3); %s(); d3d8m_up_stride(a4);"
+                                " d3d8m_after_draw(3u, a1, a2, a3); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (G75 DrawVerticesUP)" % name)
             if a.mirror and name in ("sub_0018DF10", "sub_001993A0", "sub_00199300"):
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex);"

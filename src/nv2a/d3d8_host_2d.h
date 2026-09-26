@@ -253,6 +253,15 @@ int  d3d8_host_points_mode(void);                 /* 2: =mark, points drawn 12 p
  * (read once, executor thread). Off: those draws stay with the executor. */
 int  d3d8_host_bump_mode(void);
 void d3d8_host_2d_set_bump(int on);               /* tests: as RECOMP_D3D8_HOST_BUMP */
+/* G75: RECOMP_D3D8_HOST_LIN32=1 lets draw mode draw linear 32-bit textures
+ * (0x12/0x1E, G59), sampled from their bytes by the executor's sampler. */
+int  d3d8_host_lin32_mode(void);
+void d3d8_host_2d_set_lin32(int on);              /* tests: as RECOMP_D3D8_HOST_LIN32 */
+/* G75: RECOMP_D3D8_HOST_UP=1 mirrors DrawVerticesUP (the HUD's quads, two a
+ * frame on every stage) and lets draw mode draw them. Off: the mirror does
+ * not see them at all, as before. */
+int  d3d8_host_up_mode(void);
+void d3d8_host_2d_set_up(int on);                 /* tests: as RECOMP_D3D8_HOST_UP */
 /* SET_POINT_SIZE as D3D's point updater (0x195140) computes it from
  * RenderState[106..113] (pt_rs) and the device's point scale (+0x45C) when
  * POINTSCALEENABLE is off: POINTSIZE * scale, raised to POINTSIZE_MIN, cut to
@@ -293,6 +302,13 @@ uint16_t *d3d8_host_2d_idx_reserve(uint32_t n, uint64_t *pos);
 void      d3d8_host_2d_idx_publish(uint64_t pos, uint32_t n);
 /* 1 and `out` filled, or 0 if the entries were never published or have been overwritten. */
 int       d3d8_host_2d_idx_copy(uint64_t pos, uint32_t n, uint16_t *out);
+/* G75: the UP ring -- DrawVerticesUP's vertices, copied at the call, as the
+ * index ring holds indices. Same single producer and consumer. */
+#define D3D8H2D_UP_RING (4u << 20)
+#define D3D8H2D_UP_PER_DRAW (256u << 10)
+uint8_t  *d3d8_host_2d_up_reserve(uint32_t n, uint64_t *pos);
+void      d3d8_host_2d_up_publish(uint64_t pos, uint32_t n);
+int       d3d8_host_2d_up_copy(uint64_t pos, uint32_t n, uint8_t *out);
 /* A hash of every enabled vertex array's bytes for indices imin..imax (the
  * arrays' ranges merged, so interleaved streams are read once). */
 uint64_t  d3d8_host_2d_vertex_hash(const uint8_t *ram, size_t ram_size, const D3D8HostDrawCheck *c,
