@@ -203,6 +203,9 @@ static _Atomic uint32_t s_mission_state = 0xFFFFFFFFu;
 
 /* The glitch watch's hook: REG[9]'s mission state, or ~0 when there is none
  * (or when RECOMP_CHAPTER_JUMP is unset, since only the jump updates it). */
+#if defined(_WIN32)
+__declspec(dllexport)   /* found by name (GetProcAddress) on this host */
+#endif
 uint32_t chj_mission_state(void) { return atomic_load(&s_mission_state); }
 
 /* A mission object that is alive: section 2's vtable, not dying (bit 31 of

@@ -52,6 +52,7 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
 
 /* Global audio mute — disables all AWD/mixer sound playback */
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
+static int g_output_silent;       /* SDL_AUDIODRIVER set on Windows: zeros to the device */
 
 /* ============================================================
  * Debug frame markers (minimal stubs)
@@ -664,6 +665,21 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
+#if defined(_WIN32)
+    /* The harness silences a run with SDL_AUDIODRIVER=no_such_driver, which
+     * on macOS makes SDL open no device. This host has no SDL, so any value
+     * of the variable means the same thing here: the device gets zeros. It
+     * still opens and still pulls frames, because on this host it is the
+     * device that clocks the APU -- with no device at all nothing was
+     * processed (APU-VOICE on=0) and the title sat in its logos, waiting on
+     * audio, for five minutes. Not g_audio_muted: that also stops the
+     * software mixer's voices starting, which the guest can see. Unset --
+     * every ordinary launch -- nothing changes. */
+    if (getenv("SDL_AUDIODRIVER")) {
+        g_output_silent = 1;
+        fprintf(stderr, "[APU] SDL_AUDIODRIVER is set: the device plays zeros (a silenced run; it still clocks the APU)\n");
+    }
+#endif
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
@@ -766,6 +782,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     g_apu_out_frames += (unsigned long long)output_samples;
     apu_wav_write((const int16_t *)d->monitor.frame_buf, output_samples);
 
+    if (g_output_silent)                   /* a silenced run: the device gets zeros */
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
     if (xa2_is_active())
         xa2_submit_samples((const int16_t *)d->monitor.frame_buf, output_samples);
     else if (apu_sdl2_is_active())

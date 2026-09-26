@@ -48,6 +48,9 @@
 static volatile unsigned long g_pad_guest_frame;
 
 void xbox_InputFrameAdvance(void) { g_pad_guest_frame++; }
+#if defined(_WIN32)
+__declspec(dllexport)   /* found by name: nv2a_pb_exec.c's flight recorder (GetProcAddress) */
+#endif
 unsigned long xbox_InputFrame(void) { return g_pad_guest_frame; }
 
 /* ======================================================================== */

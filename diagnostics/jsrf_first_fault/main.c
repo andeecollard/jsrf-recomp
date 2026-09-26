@@ -2112,6 +2112,107 @@ static void usb_pad_rumble_shim(uint16_t left, uint16_t right)
     (void)xbox_InputSetState(0, &vib);
 }
 
+/* RECOMP_AUTOPILOT=garage: the stage harness's garage.json without the harness.
+ *
+ * The harness (stage_harness/run.py) drives the pad through JSRF_STAGE_DIR,
+ * which exists on POSIX only, so the Windows build had no unattended way to
+ * the Garage -- and RECOMP_CHAPTER_JUMP starts from there. This does what that
+ * scenario does, keyed on the same CActSequence index it waits on: at the
+ * title (12) START and then A, at the load menu (16) A, and in the stage (30)
+ * A through Corn's introduction until the mission has sat in free play (0x0F,
+ * chj_mission_state) for three seconds -- 60 s of A without the chapter
+ * lift's state, as the scenario's talk step. Then it lets go, so the jump's
+ * settle and everything after it run with a neutral pad -- except that, as
+ * map_run.sh's MAP_PRESS_A, a mission that has sat outside free play for 40 s
+ * (a briefing card waiting for A) gets A at most every 20 s. A press is 0.2 s
+ * held. While it is on the host pad is not read at all. */
+static uint32_t jsrf_seq_index(const uint8_t *base);
+static uint32_t autopilot_mission_state(void)
+{
+    static uint32_t (*fn)(void);
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+#if defined(_WIN32)
+        fn = (uint32_t (*)(void))(void (*)(void))GetProcAddress(GetModuleHandleA(NULL), "chj_mission_state");
+#else
+        fn = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "chj_mission_state");
+#endif
+    }
+    return fn ? fn() : 0xFFFFFFFFu;
+}
+static double autopilot_now(void)
+{
+#if defined(_WIN32)
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+#endif
+}
+static int autopilot_pad(XBOX_INPUT_STATE *st)
+{
+    static int on = -1, done;
+    static uint32_t last_seq = 0xFFFFFFFFu;
+    static double t_state, t_stage, t_free;
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t seq;
+    double now, t;
+    int start = 0, a = 0;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_AUTOPILOT");
+        on = e && !strcmp(e, "garage");
+        if (on) fprintf(stderr, "  [AUTOPILOT] garage: START/A at the title, A at the load menu, A through the"
+                                " Garage's introduction until free play, then hands off\n");
+    }
+    if (!on) return 0;
+    memset(st, 0, sizeof *st);
+    if (!base) return 1;
+    now = autopilot_now();
+    if (done) {
+        static double t_out, t_press;
+        uint32_t ms = autopilot_mission_state();
+        if (ms == 0x0Fu || ms == 0xFFFFFFFFu) t_out = 0.0;
+        else if (t_out == 0.0) t_out = now;
+        if (t_out != 0.0 && now - t_out >= 40.0 && now - t_press >= 20.0) {
+            t_press = now;
+            fprintf(stderr, "  [AUTOPILOT] mission state 0x%02X for %.0f s outside free play: A\n",
+                    (unsigned)ms, now - t_out);
+        }
+        if (t_press != 0.0 && now - t_press < 0.2) st->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+        return 1;
+    }
+    seq = jsrf_seq_index(base);
+    if (seq != last_seq) {
+        fprintf(stderr, "  [AUTOPILOT] sequence %u -> %u\n", (unsigned)last_seq, (unsigned)seq);
+        last_seq = seq; t_state = now;
+        if (seq == 30u && t_stage == 0.0) t_stage = now;
+    }
+    t = now - t_state;
+    if (seq == 12u) {                          /* title: START, A 1.2 s later, every 3.2 s */
+        double c = t - 3.2 * (double)(long)(t / 3.2);
+        start = c >= 1.0 && c < 1.2; a = c >= 2.2 && c < 2.4;
+    } else if (seq == 16u) {                   /* load menu: A every 2 s */
+        double c = t - 2.0 * (double)(long)(t / 2.0);
+        a = c >= 1.0 && c < 1.2;
+    } else if (seq == 30u) {                   /* the stage: A every 0.6 s until free play holds */
+        uint32_t ms = autopilot_mission_state();
+        double c = t - 0.6 * (double)(long)(t / 0.6);
+        if (ms == 0x0Fu) { if (t_free == 0.0) t_free = now; } else t_free = 0.0;
+        if ((t_free != 0.0 && now - t_free >= 3.0) || (ms == 0xFFFFFFFFu && now - t_stage >= 60.0)) {
+            done = 1;
+            fprintf(stderr, "  [AUTOPILOT] %s after %.1f s in the stage: hands off\n",
+                    ms == 0x0Fu ? "free play" : "no mission state", now - t_stage);
+            return 1;
+        }
+        a = c >= 0.3 && c < 0.5;
+    }
+    if (start) st->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+    if (a) st->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    return 1;
+}
+
 static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
 {
     XBOX_INPUT_STATE state;
@@ -2121,6 +2222,7 @@ static int usb_pad_state_shim(uint8_t report[XBOX_USB_PAD_REPORT])
     const SHORT *thumb;
     int i;
 
+    if (!autopilot_pad(&state))
 #if !defined(_WIN32)
     if (!jsrf_stage_pad(&state))
 #endif

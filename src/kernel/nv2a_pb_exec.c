@@ -2108,7 +2108,21 @@ static void (*flight_set_mark_hook)(void (*)(unsigned long, const char *));
 static void (*flight_counters)(unsigned long long *);
 static uint32_t (*flight_mission_state)(void);
 static int (*flight_gpu_ahead)(const uint8_t *, size_t);
-static void flight_resolve(void) {}
+/* dlsym(RTLD_DEFAULT) has no Windows twin for an executable's own symbols,
+ * but GetProcAddress on the exe finds the ones it exports: chj_mission_state
+ * (chapter_select.c) and xbox_InputFrame (xinput_device.c) are exported for
+ * this, so RECOMP_FLIGHT_AT_FREEPLAY and the guest-frame stamp work here too.
+ * The Metal counters and the pad-record mark hook do not exist on Windows and
+ * resolve to NULL, as they would on POSIX without them. */
+static void flight_resolve(void)
+{
+    HMODULE self = GetModuleHandleA(NULL);
+    if (!self) return;
+    flight_mission_state = (uint32_t (*)(void))(void (*)(void))GetProcAddress(self, "chj_mission_state");
+    flight_input_frame = (unsigned long (*)(void))(void (*)(void))GetProcAddress(self, "xbox_InputFrame");
+    flight_set_mark_hook = (void (*)(void (*)(unsigned long, const char *)))(void (*)(void))
+        GetProcAddress(self, "xbox_PadRecordSetMarkHook");
+}
 #else
 #include <dlfcn.h>
 static unsigned long (*flight_input_frame)(void);
