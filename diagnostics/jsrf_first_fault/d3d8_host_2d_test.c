@@ -1114,7 +1114,7 @@ static void up_tests(void)
     uint64_t pos;
     uint8_t *dst;
     case_a(&c);
-    d3d8_host_2d_set_up(1);
+    d3d8_host_2d_set_inline(1);
     d3d8_host_2d_set_bisect(16u);    /* the bump tests left other bytes under case A's texture key: hash every draw */
     dst = d3d8_host_2d_up_reserve(4u * 28u, &pos);
     CHECK(dst != NULL, "UP ring: reserve");
@@ -1130,6 +1130,36 @@ static void up_tests(void)
         why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
         CHECK(why && strstr(why, "DrawVerticesUP"), "DrawVerticesUP whose copy did not fit: refused (%s)", why ? why : "built");
         c.up_over = 0; }
+    /* Begin/End (kind 4): the same strip as the mirror assembles it from
+     * SetVertexData4f -- 16 float4 a vertex, diffuse as floats -- must build
+     * the same vertices as the strip from its vertex buffer. */
+    {   static float iv[4][16][4];
+        D3D8HostDrawCheck c4, c1; D3D8Host2DDraw d4, d1; static D3D8H2DVertex v1[64];
+        const char *why4, *why1;
+        unsigned same = 1;
+        case_a(&c1);
+        memset(iv, 0, sizeof iv);
+        for (unsigned k = 0; k < 4; ++k) {
+            uint32_t col; memcpy(iv[k][0], ram + VB + 28u * k, 16); memcpy(&col, ram + VB + 28u * k + 16, 4);
+            iv[k][3][0] = ((col >> 16) & 255) / 255.0f; iv[k][3][1] = ((col >> 8) & 255) / 255.0f;
+            iv[k][3][2] = (col & 255) / 255.0f; iv[k][3][3] = (col >> 24) / 255.0f;
+            memcpy(iv[k][9], ram + VB + 28u * k + 20, 8); iv[k][9][3] = 1.0f;
+        }
+        c4 = c1; c4.draw_kind = 4; c4.start = 0;
+        dst = d3d8_host_2d_up_reserve(sizeof iv, &pos);
+        memcpy(dst, iv, sizeof iv); d3d8_host_2d_up_publish(pos, sizeof iv);
+        c4.up_pos = pos; c4.up_bytes = sizeof iv; c4.up_stride = 256;
+        for (unsigned i = 0; i < 16; ++i) { c4.va_format[i] = (256u << 8) | 0x42u; c4.va_offset[i] = 16u * i; }
+        memset(&d1, 0, sizeof d1); d1.verts = v1; why1 = d3d8_host_2d_build(&c1, ram, RAM_SIZE, 0, &d1);
+        memset(&d4, 0, sizeof d4); d4.verts = verts; why4 = d3d8_host_2d_build(&c4, ram, RAM_SIZE, 0, &d4);
+        if (!why1 && !why4 && d1.nverts == d4.nverts)
+            for (unsigned k = 0; k < d1.nverts; ++k)
+                for (unsigned j = 0; j < 4; ++j)
+                    if (fabsf(v1[k].p[j] - verts[k].p[j]) > 0 || fabsf(v1[k].d0[j] - verts[k].d0[j]) > 1e-6f ||
+                        fabsf(v1[k].t[0][j] - verts[k].t[0][j]) > 0) same = 0;
+        CHECK(!why1 && !why4 && d1.nverts == d4.nverts && same, "Begin/End strip: the same vertices as the strip from"
+              " its buffer (%s / %s, %u / %u)", why1 ? why1 : "built", why4 ? why4 : "built", d1.nverts, d4.nverts);
+    }
     d3d8_host_2d_set_bisect(0);
 }
 static void points_tests(void)

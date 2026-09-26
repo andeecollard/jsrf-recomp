@@ -93,7 +93,7 @@ typedef struct {
     float    xf_world[16], xf_view[16], xf_proj[16];
     uint32_t xf_seen;          /* bit0 world, bit1 view, bit2 proj */
     /* ---- G41: vertex streams and indices ----
-     * draw_kind: 0 unknown, 3 DrawVerticesUP (G75; see up_pos), 1 DrawVertices(prim, start, count), 2
+     * draw_kind: 0 unknown, 3 DrawVerticesUP, 4 Begin/End (G75; see up_pos), 1 DrawVertices(prim, start, count), 2
      * DrawIndexedVertices(prim, count, pIndexData). idx[] holds the first
      * nidx (<= D3D8_HOST_IDX_N) indices D3D was handed; for DrawVertices the
      * implied run start..start+count-1. */

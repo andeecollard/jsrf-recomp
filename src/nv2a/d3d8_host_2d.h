@@ -257,11 +257,12 @@ void d3d8_host_2d_set_bump(int on);               /* tests: as RECOMP_D3D8_HOST_
  * (0x12/0x1E, G59), sampled from their bytes by the executor's sampler. */
 int  d3d8_host_lin32_mode(void);
 void d3d8_host_2d_set_lin32(int on);              /* tests: as RECOMP_D3D8_HOST_LIN32 */
-/* G75: RECOMP_D3D8_HOST_UP=1 mirrors DrawVerticesUP (the HUD's quads, two a
- * frame on every stage) and lets draw mode draw them. Off: the mirror does
- * not see them at all, as before. */
-int  d3d8_host_up_mode(void);
-void d3d8_host_2d_set_up(int on);                 /* tests: as RECOMP_D3D8_HOST_UP */
+/* G75: RECOMP_D3D8_HOST_INLINE=1 mirrors the draws whose vertices are given
+ * inline -- DrawVerticesUP, and Begin / SetVertexData2f/4f / End, which is
+ * how the HUD draws its two quads a frame on every stage -- and lets draw
+ * mode draw them. Off: the mirror does not see them at all, as before. */
+int  d3d8_host_inline_mode(void);
+void d3d8_host_2d_set_inline(int on);                 /* tests: as RECOMP_D3D8_HOST_INLINE */
 /* SET_POINT_SIZE as D3D's point updater (0x195140) computes it from
  * RenderState[106..113] (pt_rs) and the device's point scale (+0x45C) when
  * POINTSCALEENABLE is off: POINTSIZE * scale, raised to POINTSIZE_MIN, cut to

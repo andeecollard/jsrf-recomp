@@ -401,16 +401,17 @@ int d3d8_host_ff_gpu_mode(void)
     }
     return m;
 }
-static int s_up_mode = -1;
-void d3d8_host_2d_set_up(int on) { s_up_mode = on ? 1 : 0; }
-int d3d8_host_up_mode(void)
+static int s_inline_mode = -1;
+void d3d8_host_2d_set_inline(int on) { s_inline_mode = on ? 1 : 0; }
+int d3d8_host_inline_mode(void)
 {
-    if (s_up_mode < 0) {
-        s_up_mode = recomp_switch_on("RECOMP_D3D8_HOST_UP");
-        if (s_up_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_UP=1: DrawVerticesUP draws are mirrored, their vertices"
-                                       " copied at the call, and drawn by the host in draw mode (G75)\n");
+    if (s_inline_mode < 0) {
+        s_inline_mode = recomp_switch_on("RECOMP_D3D8_HOST_INLINE");
+        if (s_inline_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_INLINE=1: DrawVerticesUP and Begin/End draws are"
+                                           " mirrored, their vertices copied as the title gives them, and drawn by the host"
+                                           " in draw mode (G75)\n");
     }
-    return s_up_mode;
+    return s_inline_mode;
 }
 static int s_lin32_mode = -1;
 void d3d8_host_2d_set_lin32(int on) { s_lin32_mode = on ? 1 : 0; }
@@ -518,12 +519,14 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
     if (!verts) return "no vertex buffer";
     if (!cls) return "not a host class";
     /* G75: a DrawVerticesUP draw's vertices are the mirror's copy of the
-     * caller's, and its arrays are offsets into that copy. */
-    if (c->draw_kind == 3u) {
+     * caller's (kind 3), a Begin/End draw's the vertices the mirror
+     * assembled from SetVertexData (kind 4); the arrays are offsets into the
+     * copy. */
+    if (c->draw_kind == 3u || c->draw_kind == 4u) {
         static uint8_t upbuf[D3D8H2D_UP_PER_DRAW + 16u];
-        if (d3d8_host_up_mode() <= 0) return "DrawVerticesUP (RECOMP_D3D8_HOST_UP off)";
-        if (c->up_over || !c->up_bytes) return "DrawVerticesUP: vertices not copied";
-        if (!d3d8_host_2d_up_copy(c->up_pos, c->up_bytes, upbuf)) return "DrawVerticesUP: vertex copy overwritten";
+        if (d3d8_host_inline_mode() <= 0) return "inline vertices (RECOMP_D3D8_HOST_INLINE off)";
+        if (c->up_over || !c->up_bytes) return c->draw_kind == 4u ? "Begin/End: vertices not assembled" : "DrawVerticesUP: vertices not copied";
+        if (!d3d8_host_2d_up_copy(c->up_pos, c->up_bytes, upbuf)) return "inline vertices: copy overwritten";
         memset(upbuf + c->up_bytes, 0, 16u);
         vram = upbuf; vram_size = c->up_bytes + 16u;   /* fetch reads 16 bytes at a time */
     }

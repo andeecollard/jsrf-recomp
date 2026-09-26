@@ -302,6 +302,31 @@ def main():
                                 " d3d8m_after_draw(3u, a1, a2, a3); }" % (hooked, body))
                 body = hooked
                 manifest.append("mirror: %s (G75 DrawVerticesUP)" % name)
+            if a.mirror and name in ("sub_001996A0", "sub_00199600", "sub_00199640", "sub_001996E0"):
+                # G75: Begin(prim), SetVertexData2f(reg, a, b), SetVertexData4f(reg,
+                # a, b, c, d), End() -- the HUD's immediate-mode quads. The mirror
+                # keeps the attributes' current values and assembles the vertices
+                # (d3d8m_imm_*); End is kind 4, its host token written BEFORE End's
+                # commands, so the executor's END finds the skip already on.
+                hooked = "d3d8c_hooked_%s" % name
+                wrappers.append("void d3d8m_imm_begin(uint32_t prim);"
+                                " void d3d8m_imm_data(uint32_t reg, uint32_t n, uint32_t a, uint32_t b, uint32_t c, uint32_t d);"
+                                " void d3d8m_imm_end_done(void);"
+                                " void d3d8m_before_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);"
+                                " void d3d8m_after_draw(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3);")
+                if name == "sub_001996A0":
+                    wrappers.append("static void %s(void) { uint32_t p = MEM32(esp + 4u); %s(); d3d8m_imm_begin(p); }" % (hooked, body))
+                elif name == "sub_00199600":
+                    wrappers.append("static void %s(void) { uint32_t r = MEM32(esp + 4u), x = MEM32(esp + 8u), y = MEM32(esp + 12u);"
+                                    " %s(); d3d8m_imm_data(r, 2u, x, y, 0u, 0u); }" % (hooked, body))
+                elif name == "sub_00199640":
+                    wrappers.append("static void %s(void) { uint32_t r = MEM32(esp + 4u), x = MEM32(esp + 8u), y = MEM32(esp + 12u),"
+                                    " z = MEM32(esp + 16u), w = MEM32(esp + 20u); %s(); d3d8m_imm_data(r, 4u, x, y, z, w); }" % (hooked, body))
+                else:
+                    wrappers.append("static void %s(void) { d3d8m_before_draw(4u, 0u, 0u, 0u); %s();"
+                                    " d3d8m_after_draw(4u, 0u, 0u, 0u); d3d8m_imm_end_done(); }" % (hooked, body))
+                body = hooked
+                manifest.append("mirror: %s (G75 Begin/End)" % name)
             if a.mirror and name in ("sub_0018DF10", "sub_001993A0", "sub_00199300"):
                 hooked = "d3d8c_hooked_%s" % name
                 wrappers.append("void d3d8m_set_texture(uint32_t stage, uint32_t tex);"
