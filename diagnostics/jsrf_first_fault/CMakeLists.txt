@@ -1366,6 +1366,8 @@ if(APPLE)
     set_tests_properties(jsrf_d3d8_host_2d_draw PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # 3000 host and executor draws interleaved in one batch, for each
     # RECOMP_D3D8_HOST_BISECT arm that keeps the batch joined.
+    # G76: RECOMP_D3D8_HOST_FAST_FETCH's fetch_run gives the GPU unit the same inputs as fetch().
+    add_test(NAME jsrf_d3d8_host_fast_fetch COMMAND jsrf_d3d8_host_2d_test fastfetch)
     add_test(NAME jsrf_d3d8_host_2d_seq COMMAND jsrf_d3d8_host_2d_test seq)
     set_tests_properties(jsrf_d3d8_host_2d_seq PROPERTIES ENVIRONMENT "RECOMP_METAL_HW_TEX=1")
     # G51.2: a draw through the title's own vertex program, host against the CPU interpreter.

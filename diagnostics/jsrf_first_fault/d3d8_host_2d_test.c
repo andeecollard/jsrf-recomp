@@ -2789,6 +2789,99 @@ static void stage_mode_tests(void)
     CHECK(!why && d.tmask == 3u, "FF, two plain 2D stages: built, both sampled (%s, tmask %X)", why ? why : "built", d.tmask);
 }
 
+/* G76: RECOMP_D3D8_HOST_FAST_FETCH. The GPU unit's build with fetch_run
+ * against fetch() per vertex: the same inputs, bit for bit, over the
+ * formats the title's FF draws use and the ones fetch() refuses, a range
+ * that runs past the end of RAM, and an attribute with no array. `ffbench N`
+ * prints what one build of an N-vertex strip costs each way. */
+static D3D8H2DVertex s_ffb_gv[D3D8H2D_MAX_VERTS];
+static const char *ffb_build(D3D8HostDrawCheck *c, uint32_t *ffm, D3D8Host2DDraw *d)
+{
+    const char *why = NULL;
+    for (int k = 0; k < 20; ++k) {
+        memset(d, 0, sizeof *d); d->verts = s_ffb_gv;
+        why = d3d8_host_draw_build(c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, d);
+        if (why || d->ff_gpu) break;
+        nv2a_metal_pipelines_settle();
+    }
+    return why;
+}
+static void ffb_strip(D3D8HostDrawCheck *c, int nv)
+{
+    case_ff(c);
+    for (int i = 4; i < nv; ++i) {             /* the quad's vertices, varied so every word differs */
+        memcpy(ram + VB + 24u * i, ram + VB + 24u * (i % 4), 24);
+        ram[VB + 24u * i + 12] = (uint8_t)(i * 7); ram[VB + 24u * i + 13] = (uint8_t)(i * 13);
+        float f; memcpy(&f, ram + VB + 24u * i, 4); f += (float)i * 0.001f; memcpy(ram + VB + 24u * i, &f, 4);
+    }
+    c->count = (uint32_t)nv;
+}
+static void fast_fetch_tests(void)
+{
+    static uint32_t ffm[2048];
+    static float slow[4096][4];
+    struct { const char *name; uint32_t diffuse_fmt; uint32_t tex_fmt; int oob, noarray; } k[] = {
+        { "D3DCOLOR diffuse, float2 texcoord", (24u << 8) | 0x40u, (24u << 8) | 0x22u, 0, 0 },
+        { "UB_OGL diffuse", (24u << 8) | 0x44u, (24u << 8) | 0x22u, 0, 0 },
+        { "float1 texcoord", (24u << 8) | 0x40u, (24u << 8) | 0x12u, 0, 0 },
+        { "D3DCOLOR of size 3 (fetch refuses it)", (24u << 8) | 0x30u, (24u << 8) | 0x22u, 0, 0 },
+        { "a texcoord run past the end of RAM", (24u << 8) | 0x40u, (24u << 8) | 0x22u, 1, 0 },
+        { "no diffuse array", (24u << 8) | 0x40u, (24u << 8) | 0x22u, 0, 1 },
+    };
+    compare_ff_gpu(0);                          /* Metal and the FF unit, warmed */
+    d3d8_host_2d_set_ff_gpu(d3d8_host_2d_metal_ff_gpu);
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; ++i) {
+        D3D8HostDrawCheck c; D3D8Host2DDraw d; const char *why; uint32_t n = 0, unf = 0, noa = 0;
+        ffb_strip(&c, 96);
+        c.va_format[3] = k[i].diffuse_fmt; c.va_format[9] = k[i].tex_fmt;
+        if (k[i].oob) c.va_offset[9] = RAM_SIZE - 24u * 40u;
+        if (k[i].noarray) c.va_on &= ~(1u << 3);
+        d3d8_host_ff_registers(&c, ffm);
+        d3d8_host_2d_set_fast_fetch(0);
+        why = ffb_build(&c, ffm, &d);
+        CHECK(!why && d.ff_gpu, "fast fetch, %s: built for the GPU unit per vertex (%s)", k[i].name, why ? why : "built");
+        if (why || !d.ff_gpu) continue;
+        n = d.vs_nin * d.vs_nattrs; unf = d.vs_in_unfetched; noa = d.vs_in_noarray;
+        memcpy(slow, d.vs_in, n * 16u);
+        d3d8_host_2d_set_fast_fetch(1);
+        why = ffb_build(&c, ffm, &d);
+        d3d8_host_2d_set_fast_fetch(0);
+        CHECK(!why && d.ff_gpu && d.vs_nin * d.vs_nattrs == n && d.vs_in_unfetched == unf && d.vs_in_noarray == noa
+              && !memcmp(slow, d.vs_in, n * 16u),
+              "fast fetch, %s: %u inputs identical to fetch() per vertex (unfetched %X noarray %X)", k[i].name, n,
+              d.vs_in_unfetched, d.vs_in_noarray);
+    }
+    {   /* The control: a perturbed input must be seen. */
+        D3D8HostDrawCheck c; D3D8Host2DDraw d; uint32_t n;
+        ffb_strip(&c, 96);
+        d3d8_host_ff_registers(&c, ffm);
+        ffb_build(&c, ffm, &d); n = d.vs_nin * d.vs_nattrs; memcpy(slow, d.vs_in, n * 16u);
+        ram[VB + 24u * 50 + 12] ^= 1u;
+        d3d8_host_2d_set_fast_fetch(1); ffb_build(&c, ffm, &d); d3d8_host_2d_set_fast_fetch(0);
+        CHECK(d.ff_gpu && memcmp(slow, d.vs_in, n * 16u) != 0, "fast fetch CONTROL: one changed colour byte differs");
+    }
+}
+static void ffbench(int nv, int iters)
+{
+    static uint32_t ffm[2048];
+    D3D8HostDrawCheck c; D3D8Host2DDraw d;
+    compare_ff_gpu(0);
+    d3d8_host_2d_set_ff_gpu(d3d8_host_2d_metal_ff_gpu);
+    ffb_strip(&c, nv);
+    d3d8_host_ff_registers(&c, ffm);
+    for (int fast = 0; fast < 2; ++fast) {
+        struct timespec t0, t1; const char *why;
+        d3d8_host_2d_set_fast_fetch(fast);
+        why = ffb_build(&c, ffm, &d);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int k = 0; k < iters; ++k) { d.verts = s_ffb_gv; why = d3d8_host_draw_build(&c, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &d); }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        printf("  ffbench %d vertices, %s: %.3f us a build (ff_gpu %u, %s)\n", nv, fast ? "fetch_run" : "fetch() per vertex",
+               ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / 1e3 / iters, d.ff_gpu, why ? why : "built");
+    }
+    d3d8_host_2d_set_fast_fetch(0);
+}
+
 int main(int argc, char **argv)
 {
     D3D8HostDrawCheck c;
@@ -2809,6 +2902,19 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
         bench_tests();
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "fastfetch") == 0) {    /* G76: fetch_run against fetch() */
+        setenv("RECOMP_D3D8_HOST_FF_GPU", "1", 1);
+        d3d8_host_2d_metal_set_spec_sync(1);
+        fast_fetch_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
+    if (argc > 2 && strcmp(argv[1], "ffbench") == 0) {      /* G76: the GPU-unit build's cost, printed only */
+        setenv("RECOMP_D3D8_HOST_FF_GPU", "1", 1);
+        d3d8_host_2d_metal_set_spec_sync(1);
+        ffbench(atoi(argv[2]), argc > 3 ? atoi(argv[3]) : 20000);
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "ffgpu") == 0) {        /* G52: host FF vertices on the GPU unit */

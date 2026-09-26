@@ -155,6 +155,73 @@ static int fetch(const uint8_t *ram, size_t ram_size, uint32_t offset, uint32_t 
     }
 }
 
+/* G76: ONE ATTRIBUTE OVER A RUN OF VERTICES, fetch()'s conversion hoisted.
+ * The GPU unit's build (below) fetched every attribute of every vertex in
+ * the draw's index range through fetch(), out of line: a call, the format
+ * decoded, a bounds check and four stores per attribute per vertex. It was
+ * 88% of the FF build (G76's [FRAME-SPLIT]: 3.3 of 3.7 ms a frame in
+ * Shibuya, 4.1 of 5.4 in Sky Dino), and the build is the pusher's.
+ * Here the format is decoded once and the range bounds-checked once (the
+ * addresses rise with the index, so the last vertex is the only one that
+ * can run past the end); the conversions are fetch()'s own expressions, so
+ * the floats are the same bits. Returns 0 -- and the caller takes fetch()
+ * per vertex, as before -- for anything else: a format fetch() refuses, or
+ * a range that is not in bounds throughout. RECOMP_D3D8_HOST_FAST_FETCH. */
+static int fetch_run(const uint8_t *ram, size_t ram_size, uint32_t offset, uint32_t format,
+                     uint32_t first, uint32_t count, float (*out)[4], uint32_t out_step)
+{
+    uint32_t type = format & 0xFu, size = (format >> 4) & 0xFu, stride = format >> 8;
+    uint32_t n = size < 4u ? size : 4u;
+    uint64_t at = (uint64_t)(offset & RAM_MASK) + (uint64_t)first * stride;
+    if (!count || !size || !stride) return 0;
+    if (at + (uint64_t)(count - 1u) * stride + 16u > ram_size) return 0;
+    if (type == 0u ? size != 4u : (type != 2u && type != 4u)) return 0;
+    const uint8_t *p = ram + at;
+    float (*o)[4] = out;
+    switch (type) {
+    case 0:
+#if defined(__clang__)
+        /* Four lanes divided at once: IEEE division rounds each lane exactly
+         * as the scalar p[i] / 255.0f does, so the bits are fetch()'s. */
+        for (uint32_t k = 0; k < count; ++k, p += stride, o += out_step) {
+            typedef float h2d_f4 __attribute__((ext_vector_type(4)));
+            h2d_f4 v = { (float)p[2], (float)p[1], (float)p[0], (float)p[3] };
+            v = v / 255.0f;
+            memcpy(*o, &v, 16);
+        }
+#else
+        for (uint32_t k = 0; k < count; ++k, p += stride, o += out_step) {
+            (*o)[0] = p[2] / 255.0f; (*o)[1] = p[1] / 255.0f; (*o)[2] = p[0] / 255.0f; (*o)[3] = p[3] / 255.0f;
+        }
+#endif
+        break;
+    case 2:                        /* a constant size per loop, so each copy is a load and a store */
+#define FETCH_RUN_F(N) for (uint32_t k = 0; k < count; ++k, p += stride, o += out_step) { \
+            (*o)[0] = (*o)[1] = (*o)[2] = 0.0f; (*o)[3] = 1.0f; memcpy(*o, p, 4u * (N)); }
+        if (n == 1u) FETCH_RUN_F(1) else if (n == 2u) FETCH_RUN_F(2) else if (n == 3u) FETCH_RUN_F(3) else FETCH_RUN_F(4)
+#undef FETCH_RUN_F
+        break;
+    default:
+        for (uint32_t k = 0; k < count; ++k, p += stride, o += out_step) {
+            (*o)[0] = (*o)[1] = (*o)[2] = 0.0f; (*o)[3] = 1.0f;
+            for (uint32_t i = 0; i < n; ++i) (*o)[i] = p[i] / 255.0f;
+        }
+        break;
+    }
+    return 1;
+}
+static int s_fast_fetch = -1;
+void d3d8_host_2d_set_fast_fetch(int on) { s_fast_fetch = on ? 1 : 0; }
+int d3d8_host_fast_fetch_mode(void)
+{
+    if (s_fast_fetch < 0) {
+        s_fast_fetch = recomp_switch_on("RECOMP_D3D8_HOST_FAST_FETCH");
+        if (s_fast_fetch) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_FAST_FETCH=1: the GPU-unit build converts each"
+                                          " attribute over the draw's vertex range in one loop (G76)\n");
+    }
+    return s_fast_fetch;
+}
+
 /* G75: THE REFUSALS NAME WHAT THEY REFUSED. "texture shader mode" and
  * "texture format" were one count each, so a census could not tell a
  * bump-mapped mesh from a cube map or a 16-bit swizzled format from a
@@ -820,6 +887,24 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 if (need > vin_cap) { float (*g)[4] = realloc(vin, need * sizeof *g); if (!g) return "out of memory"; vin = g; vin_cap = need; }
                 if (3u * n > vidx_cap) { uint32_t *g = realloc(vidx, 3u * n * sizeof *g); if (!g) return "out of memory"; vidx = g; vidx_cap = 3u * n; } }
             unsigned long long tf = recomp_fs_on() ? recomp_fs_now() : 0;   /* G76 */
+            if (d3d8_host_fast_fetch_mode() > 0) {
+                /* G76: attribute by attribute, fetch_run's one loop each;
+                 * the same values as the per-vertex loop below. */
+                for (unsigned a = 0; a < 16; ++a) {
+                    if (!(prog.inputs_read & (1u << a))) continue;
+                    if (((c->va_on >> a) & 1u) &&
+                        fetch_run(vram, vram_size, c->va_offset[a], c->va_format[a], lo, range, &vin[slot_of[a]], nattrs))
+                        continue;
+                    if (!((c->va_on >> a) & 1u)) d->vs_in_noarray |= 1u << a;
+                    for (uint32_t v = 0; v < range; ++v) {
+                        float x[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                        if (a == 3u) x[0] = x[1] = x[2] = 1.0f;             /* diffuse without an array: white */
+                        if (((c->va_on >> a) & 1u) && !fetch(vram, vram_size, c->va_offset[a], c->va_format[a], lo + v, x))
+                            d->vs_in_unfetched |= 1u << a;
+                        memcpy(vin[v * nattrs + slot_of[a]], x, 16);
+                    }
+                }
+            } else
             for (uint32_t v = 0; v < range; ++v)
                 for (unsigned a = 0; a < 16; ++a) {
                     float x[4] = { 0.0f, 0.0f, 0.0f, 1.0f };

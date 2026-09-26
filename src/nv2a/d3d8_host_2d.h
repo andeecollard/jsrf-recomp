@@ -269,6 +269,11 @@ int  d3d8_host_stencil_mode(void);
 /* G75: RECOMP_D3D8_HOST_FOGTABLE=1 lets pre-transformed draws fog from a
  * fog table (D3D's Z- and W-fog pass-through programs). */
 int  d3d8_host_fogtable_mode(void);
+/* G76: RECOMP_D3D8_HOST_FAST_FETCH=1 converts the GPU-unit build's vertex
+ * attributes one attribute over the whole range at a time (fetch_run), the
+ * same floats as fetch() per vertex. */
+int  d3d8_host_fast_fetch_mode(void);
+void d3d8_host_2d_set_fast_fetch(int on);         /* tests: as RECOMP_D3D8_HOST_FAST_FETCH */
 void d3d8_host_2d_set_fogtable(int on);           /* tests: as RECOMP_D3D8_HOST_FOGTABLE */
 void d3d8_host_2d_set_stencil(int on);            /* tests: as RECOMP_D3D8_HOST_STENCIL */
 /* SET_POINT_SIZE as D3D's point updater (0x195140) computes it from
