@@ -9,7 +9,8 @@ A static recompiler for original-Xbox titles, derived from
 [`sp00nznet/xboxrecomp`](https://github.com/sp00nznet/xboxrecomp) and
 specialised to bring up **Jet Set Radio Future (US)** on macOS ARM64.
 
-`origin` is a standalone private repo — *not* a GitHub fork. `upstream` is a
+`origin` is a standalone public repo (andeecollard/jsrf-recomp) — *not* a
+GitHub fork. `upstream` is a
 plain remote we fetch from and merge, currently a few hundred commits behind us.
 
 The recompiler translates the guest XBE to C, which is compiled against a
@@ -82,11 +83,9 @@ The generated C is **not** in git — it is hundreds of MB, rebuilt by
 ```sh
 cmake -S diagnostics/jsrf_first_fault -B <build> -DRECOMP_GEN_DIR=<gen dir>
 cmake --build <build> -j
-ctest --test-dir <build>            # 154 on 25 Sep 2026; two fail by
+ctest --test-dir <build>            # 169 on 26 Sep 2026; one fails by
                                    # design: jsrf_input_hotplug (needs no
-                                   # controller attached) and
-                                   # jsrf_gen_header_current (until the gen
-                                   # tree is regenerated after 4778f4e).
+                                   # controller attached).
                                    # They are diagnostics/jsrf_first_fault's;
                                    # tests/ at the repo root is built by
                                    # nothing. The count grows -- what matters
