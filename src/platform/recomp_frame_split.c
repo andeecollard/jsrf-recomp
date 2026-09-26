@@ -134,4 +134,18 @@ void recomp_fs_report(unsigned long long frames, unsigned long long frame_us)
         fprintf(stderr, "\n");
     }
 }
+#else /* _WIN32 */
+/* RECOMP_FRAME_SPLIT is POSIX-only (G76), and the header's inline stubs keep
+ * it off on Windows. The D3D census overlay and the lifted gen declare these
+ * entry points themselves rather than include the header, so this host needs
+ * them as functions too: every one a no-op, the instrument reading off. This
+ * branch does not include the header, whose inline stubs would collide. */
+#include <stdint.h>
+int recomp_fs_read(void) { return 0; }
+unsigned long long recomp_fs_now(void) { return 0; }
+void recomp_fs_add_t(unsigned bucket, unsigned long long ns) { (void)bucket; (void)ns; }
+void recomp_fs_d3d_names(const char *const *names, const uint32_t *addrs, unsigned n, unsigned swap_idx)
+{ (void)names; (void)addrs; (void)n; (void)swap_idx; }
+unsigned long long recomp_fs_d3d_enter(unsigned idx) { (void)idx; return 0; }
+void recomp_fs_d3d_exit(unsigned idx, unsigned long long t0) { (void)idx; (void)t0; }
 #endif

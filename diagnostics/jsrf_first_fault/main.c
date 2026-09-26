@@ -313,7 +313,7 @@ void jsrf_render_probe(uint32_t pc)
     fprintf(stderr, "[RENDER-PROBE] t=%u pc=%08X root=%08X stop=%u "
             "loops=%u renders=%u put=%08X eax=%08X ecx=%08X esi=%08X "
             "esp=%08X ret=%08X args=%08X,%08X,%08X,%08X\n",
-            GetTickCount(), pc, root, root ? MEM32(root + 0x24) : 0,
+            (unsigned)GetTickCount(), pc, root, root ? MEM32(root + 0x24) : 0,
             loops, renders, MEM32(JSRF_PB_PUT_VA), g_eax, g_ecx, g_esi,
             g_esp, MEM32(g_esp), MEM32(g_esp+4), MEM32(g_esp+8),
             MEM32(g_esp+12), MEM32(g_esp+16));
@@ -3575,7 +3575,7 @@ static void jsrf_actman_report(void)
      * CoveredPause > Event > FreezeCam > UncoveredPause > Default. */
     fprintf(stderr, "  [ACTMAN] t=%u root=%08X mode: CoveredPause=%u Event=%u"
             " FreezeCam=%u UncoveredPause=%u\n",
-            GetTickCount(), root, now[0], now[1], now[2], now[3]);
+            (unsigned)GetTickCount(), root, now[0], now[1], now[2], now[3]);
     fprintf(stderr, "  [ACTMAN]   requests: CoveredPause set=%u no=%u |"
             " Event set=%u no=%u | FreezeCam set=%u no=%u |"
             " UncoveredPause set=%u no=%u\n",

@@ -34,7 +34,7 @@
  * for it, so it would show as a failure elsewhere, not here. Off by default;
  * zero cost unless armed. */
 #include "nv2a_debt_watch.h"
-#include "recomp_switch.h"
+#include "../recomp_switch.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

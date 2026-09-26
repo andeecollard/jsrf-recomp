@@ -29,7 +29,16 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(_WIN32)
+/* The D3D11 executor keeps its retained surfaces' pixels on the GPU until a
+ * flip or an overlapping read syncs them; a sync of the range is its whole
+ * "make current". It does not say whether anything was owed, so a payment is
+ * never counted here (0), only a failure (-1). */
+extern int nv2a_d3d11_sync_range(uint8_t *target, size_t bytes);
+static int nv2a_metal_make_current(uint8_t *p, size_t bytes) { return nv2a_d3d11_sync_range(p, bytes) ? 0 : -1; }
+#else
 extern int nv2a_metal_make_current(uint8_t *p, size_t bytes);
+#endif
 
 static pthread_t s_service; static _Atomic int s_have_service;
 static pthread_mutex_t s_one = PTHREAD_MUTEX_INITIALIZER;

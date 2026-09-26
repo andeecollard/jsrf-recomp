@@ -39,7 +39,9 @@ void crl_sub_0013B180(void)
 {
     while (!MEM32(0x0025EFC0u)) {
         MEM32(0x0025EFA8u) += 1u;
-        w32_thread_suspend_point();
+#if !defined(_WIN32)
+        w32_thread_suspend_point();   /* POSIX's cooperative suspend; Windows suspends threads itself */
+#endif
         usleep(1000);
     }
     /* The original's exit path: push 0xF0000001; [0x25EFC4] = 1; call

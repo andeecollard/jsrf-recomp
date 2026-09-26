@@ -23,6 +23,11 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 if(WIN32)
     add_library(platform INTERFACE)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
+    # recomp_frame_split.c's Windows branch: the no-op entry points the D3D
+    # census overlay and the lifted gen call by their own declarations.
+    add_library(platform_fs STATIC recomp_frame_split.c)
+    target_include_directories(platform_fs PRIVATE ${XBOXRECOMP_SRC_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(platform INTERFACE platform_fs)
 else()
     add_library(platform STATIC win32_compat.c recomp_frame_split.c)
     target_include_directories(platform PUBLIC

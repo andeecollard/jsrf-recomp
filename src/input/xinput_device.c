@@ -119,6 +119,22 @@ void xbox_InputPollReport(void)
     fflush(stderr);
 }
 
+/* The pad record's marks, without the recording. RECOMP_PAD_RECORD is the
+ * POSIX branch's; what a mark also does -- tell whoever registered for it,
+ * the flight recorder (nv2a_pb_exec.c, found by GetProcAddress) -- is wanted
+ * here too, for RECOMP_CHAPTER_JUMP_MARK (chapter_select.c). */
+static void (*g_pad_mark_hook)(unsigned long, const char *);
+__declspec(dllexport)
+void xbox_PadRecordSetMarkHook(void (*fn)(unsigned long, const char *))
+{ g_pad_mark_hook = fn; }
+void xbox_PadRecordMark(const char *label)
+{
+    const char *lab = (label && *label) ? label : "mark";
+    fprintf(stderr, "  [PAD-REC] mark at guest frame %lu: %s\n", g_pad_guest_frame, lab);
+    fflush(stderr);
+    if (g_pad_mark_hook) g_pad_mark_hook(g_pad_guest_frame, lab);
+}
+
 /* DirectInput fallback, for the pads XInput was never going to report.
  *
  * XInput only ever supported Xbox-family controllers. A DualShock 4 is not an

@@ -44,6 +44,13 @@
 #define nv2a_gpu_last_reject nv2a_d3d11_last_reject
 #define nv2a_gpu_report      nv2a_d3d11_report
 #define nv2a_gpu_surface_report nv2a_d3d11_surface_report
+/* RECOMP_INVISIBLE_DRAW (G54) counts fragments with a Metal visibility
+ * buffer; D3D11 has no counterpart here. Arming fails, so inv_arm() returns
+ * -1 and the instrument records nothing on this host. */
+static inline int nv2a_metal_measure_arm(unsigned slot) { (void)slot; return 0; }
+static inline void nv2a_metal_measure_disarm(void) {}
+static inline unsigned nv2a_metal_measure_collect(unsigned long long *counts, uint8_t *used, unsigned n)
+{ unsigned i; for (i = 0; i < n; ++i) { counts[i] = 0; used[i] = 0; } return 0; }
 #else
 #define NV2A_GPU_PATH        0
 #endif
