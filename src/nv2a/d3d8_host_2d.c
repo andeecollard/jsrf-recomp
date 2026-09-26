@@ -73,12 +73,36 @@ static int zs_has_stencil(const D3D8HostDrawCheck *c)
  * what is written must have been pushed by D3D; a value it never pushed is
  * refused, not taken from the NV2A's reset state, because D3D's device
  * setup writes the registers by a path the mirror does not see. */
+/* G75: RECOMP_D3D8_HOST_STENCIL=1 lets DRAW MODE take any stencil function
+ * too. There the host draws into the executor's own Stencil8 attachment,
+ * which holds every stencil value the frame has written (the host's draws
+ * and the executor's alike), so the test is the executor's test. The
+ * shadow's crop has no stencil, so a shadowed draw (VERIFY) still takes
+ * ALWAYS only. The HUD's two Begin/End quads a frame are LEQUAL ref 1:
+ * JSRF's shadow darkening, drawn where the shadow volumes left a count. */
+static int s_in_replace;          /* the builder is running for draw mode, not the shadow */
+static int s_stencil_mode = -1;
+void d3d8_host_2d_set_stencil(int on) { s_stencil_mode = on ? 1 : 0; }
+int d3d8_host_stencil_mode(void)
+{
+    if (s_stencil_mode < 0) {
+        s_stencil_mode = recomp_switch_on("RECOMP_D3D8_HOST_STENCIL");
+        if (s_stencil_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_STENCIL=1: draw mode takes every stencil function,"
+                                            " tested in the executor's own stencil attachment (G75)\n");
+    }
+    return s_stencil_mode;
+}
 static const char *stencil_from_d3d(const D3D8HostDrawCheck *c, D3D8Host2DDraw *d)
 {
     int replace;
     if (!st_seen(c, 0x364)) return "stencil state not pushed";
     d->stencil_func = st(c, 0x364, 0x207);
-    if (d->stencil_func != 0x207u) return "stencil func not ALWAYS";
+    if (d->stencil_func < 0x200u || d->stencil_func > 0x207u) return "stencil func";
+    if (d->stencil_func != 0x207u) {
+        if (!s_in_replace || d3d8_host_stencil_mode() <= 0) return "stencil func not ALWAYS";
+        /* Every word the test reads, and the fail operation it now applies. */
+        if (!st_seen(c, 0x368) || !st_seen(c, 0x36C) || !st_seen(c, 0x370)) return "stencil state not pushed";
+    }
     d->stencil_fail = st(c, 0x370, 0x1E00);               /* never applied under ALWAYS */
     d->stencil_zfail = st(c, 0x374, 0x1E00); d->stencil_zpass = st(c, 0x378, 0x1E00);
     d->stencil_mask = st(c, 0x360, 0xFF); d->stencil_ref = st(c, 0x368, 0); d->stencil_func_mask = st(c, 0x36C, 0xFF);
@@ -1982,12 +2006,15 @@ void d3d8_host_2d_replace(const D3D8HostDrawCheck *c)
         if (!s_be.ff_vertex) { ++s_rep_refused; count_reason("no fixed-function evaluator in the backend"); return; }
         why = d3d8_host_ff_registers(c, ffm);
         t1 = h2d_now_ns(); s_rep_ns_regs += t1 - t0;
+        s_in_replace = 1;
         if (!why) why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, ffm, s_be.ff_vertex, &d);
+        s_in_replace = 0;
         s_rep_ns_build += h2d_now_ns() - t1;
         if (c->prim >= 1u && c->prim <= 4u) pl_census(c, cls, &d, !why);
         if (why) { ++s_rep_refused; count_reason(why); return; }
         s_rep_ff_evals += d.ff_evals; s_rep_ff_indices += c->count; if (d.ff_gpu) ++s_rep_ff_gpu;
-    } else if ((why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d))) {
+    } else if ((s_in_replace = 1, why = d3d8_host_draw_build(c, s_be.ram, s_be.ram_size, s_control, use, NULL, NULL, &d),
+                s_in_replace = 0, why)) {
         if (c->prim >= 1u && c->prim <= 4u) pl_census(c, cls, &d, 0);
         ++s_rep_refused; if (cls == 3) ++s_rep_vs_refused; count_reason(why); return;
     }

@@ -263,6 +263,10 @@ void d3d8_host_2d_set_lin32(int on);              /* tests: as RECOMP_D3D8_HOST_
  * mode draw them. Off: the mirror does not see them at all, as before. */
 int  d3d8_host_inline_mode(void);
 void d3d8_host_2d_set_inline(int on);                 /* tests: as RECOMP_D3D8_HOST_INLINE */
+/* G75: RECOMP_D3D8_HOST_STENCIL=1 lets draw mode take any stencil function
+ * (the shadow still takes ALWAYS only). */
+int  d3d8_host_stencil_mode(void);
+void d3d8_host_2d_set_stencil(int on);            /* tests: as RECOMP_D3D8_HOST_STENCIL */
 /* SET_POINT_SIZE as D3D's point updater (0x195140) computes it from
  * RenderState[106..113] (pt_rs) and the device's point scale (+0x45C) when
  * POINTSCALEENABLE is off: POINTSIZE * scale, raised to POINTSIZE_MIN, cut to

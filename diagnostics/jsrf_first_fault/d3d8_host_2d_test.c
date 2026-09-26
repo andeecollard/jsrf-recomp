@@ -946,6 +946,7 @@ static unsigned point_depth_sweep(unsigned n)
  * here as M00 M01 M10 M11, not read from the host's description -- and the
  * two must agree. The negative control is the executor drawing it WITHOUT
  * the displacement, which must not. */
+static void case_ff_stencil(D3D8HostDrawCheck *c, uint32_t zpass, uint32_t ref);
 enum { TEX2 = 0x30000, BVB = 0x14000 };
 static void bump_case(D3D8HostDrawCheck *c, unsigned op, const float mat[4], float ls, float lo)
 {
@@ -1161,6 +1162,22 @@ static void up_tests(void)
               " its buffer (%s / %s, %u / %u)", why1 ? why1 : "built", why4 ? why4 : "built", d1.nverts, d4.nverts);
     }
     d3d8_host_2d_set_bisect(0);
+    /* G75: a LEQUAL stencil test (the HUD's shadow quads) outside draw mode
+     * -- the shadow's crop has no stencil -- is refused with or without
+     * RECOMP_D3D8_HOST_STENCIL. */
+    {   static uint32_t ffm[2048];
+        D3D8HostDrawCheck cs; D3D8Host2DDraw ds; const char *why;
+        case_ff_stencil(&cs, 0x1E00, 1); set_state(&cs, 0x364, 0x203);
+        d3d8_host_ff_registers(&cs, ffm);
+        for (int on = 0; on < 2; ++on) {
+            d3d8_host_2d_set_stencil(on);
+            memset(&ds, 0, sizeof ds); ds.verts = verts;
+            why = d3d8_host_draw_build(&cs, ram, RAM_SIZE, 0, NULL, ffm, nv2a_ff_vertex, &ds);
+            CHECK(why && !strcmp(why, "stencil func not ALWAYS"), "stencil LEQUAL in the shadow, switch %s: refused (%s)",
+                  on ? "on" : "off", why ? why : "built");
+        }
+        d3d8_host_2d_set_stencil(0);
+    }
 }
 static void points_tests(void)
 {
