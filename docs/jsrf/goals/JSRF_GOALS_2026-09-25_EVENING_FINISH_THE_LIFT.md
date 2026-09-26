@@ -172,3 +172,85 @@ this branch with `RECOMP_METAL_ASYNC_WRITEBACK=1` added to paths.conf, or to
 the `JSRF_APP_LIFT` block in make_app.sh. aae7be1 (the hash) is lift-only
 and safe on its own. It reaches the app with the next bundle build either
 way.
+
+## G75 result (26 Sep, small hours)
+
+Branch commits 67fbaa7, b355b06, 3c027b8, 1e7b11d, 6f53f71, 6782346 and
+this one. Every new behaviour is behind its own switch, default off:
+`RECOMP_D3D8_HOST_BUMP`, `_LIN32`, `_INLINE`, `_STENCIL`, `_FOGTABLE`.
+Runs: `~/jsrf-build/runs/g75/` (G73's map_run method: FLIP_PACE=0,
+50 s free play, `RECOMP_FLIGHT_AT_FREEPLAY=900`, 48 flight frames).
+
+**The refusals, before** (the full lift arm as the brief gives it, one free-play run each):
+
+| stage | refused by the host | coverage | what else the executor drew |
+|---|---|---|---|
+| Garage 1:00 | none | 98.2% | 2.4 batches a flip: D3D's swap copy quad and two HUD quads the mirror never saw |
+| Rokkaku-dai 2:40 | texture shader mode 6 (bump env) unit 1: 18,116 (9,058 of them points); 2D fog from a fog table: 835 | 97.4% | the same three |
+| Shibuya 2:10 | none | 99.2% | the same three |
+| Sky Dino 6:60 | none | 99.1% | the same three |
+
+No cube map, volume, or refused texture format (0x02/0x05/0x12/0x1E) appears
+on any of the four; the player's 25,650 "texture shader mode" draws were all
+unit 1 mode 6 too (their `[COMBINER]` census). The two HUD quads are not
+DrawVerticesUP (a D3D call census, `RECOMP_D3D8_CENSUS=1`, counts 0 UP calls
+in free play) but Begin/End from the HUD layer (0x151330), two a frame:
+JSRF's stencil-shadow darkening, SRCALPHA blend, stencil LEQUAL ref 1.
+
+**What was done, in the order the census asked for it:**
+- BUMPENVMAP on the host, sampled by the executor's own buffer sampler,
+  whose MSL now lives in `nv2a_metal_sample_msl.h` (the executor compiles
+  the same text, byte for byte). Linear 32-bit textures take the same path.
+- Begin/End assembled in the mirror (the NV2A's current-attribute rule; the
+  host token goes in ahead of END). DrawVerticesUP as well, tested, unused
+  in these scenes.
+- Draw mode takes any stencil function (the executor's Stencil8 attachment
+  holds every value the frame wrote). The mask and fail words come from
+  D3D's render state (RenderState[72], 0x19E2D8); VERIFY agreed with the
+  executor's registers on every compared draw (e.g. 4,276 of 4,276).
+- D3D's fog-table pass-throughs, read from a guest memory dump: Z fog
+  (oFog = v0.z) when device +8 bit 1 is set, else W fog (oFog = 1/v0.w).
+
+**After** (all five switches on): refused 0 on all four stages; the executor
+draws one batch a flip, D3D's swap copy quad, and nothing else.
+
+| stage | coverage | executor mean/p50/p90 | lift before (2 rounds) | lift after (2 rounds) | frame_match after vs executor, median/worst (before) |
+|---|---|---|---|---|---|
+| Garage | 99.3% | 19.03 / 18.5 / 21.5 | 9.77, 9.76 / 9.5 / 12.5, 12.0 | 10.21, 10.01 / 9.5 / 13.0, 12.5 | 0.00 / 0.00% (0.00 / 0.00%) |
+| Rokkaku-dai | 99.4% | 21.41 / 21.2 / 24.8 | 11.60, 11.48 / 11.0 / 13.8, 13.5 | 11.73, 11.83 / 11.0 / 13.8, 14.0 | 0.78 / 1.55%, 0.78 / 1.42% (0.58 / 1.54%) |
+| Shibuya | 99.6% | 29.40 / 29.0 / 32.2 | 18.10, 18.00 / 17.5 / 19.5, 19.0 | 18.63, 18.57 / 18.0 / 20.5, 20.5 | 0.42 / 0.43%, 0.42 / 0.44% (0.42 / 0.45%) |
+| Sky Dino | 99.6% | 36.56 / 36.0 / 39.5 | 23.20, 20.31 / 21.2, 20.0 / 24.0, 21.5 | 21.17, 21.25 / 21.0 / 22.8, 23.0 | 0.50 / 0.59%, 0.22 / 0.57% (0.48 / 0.54%) |
+
+Every after frame pairs with a distinct executor frame (47-48 of 48).
+Garage and Rokkaku stay under 99.5% because the copy quad is 0.6-0.7% of
+their batches; the host drawing it would have to sample the back buffer on
+the GPU (under the async write-back it is not in guest RAM), which is past
+this goal.
+
+**The cost.** The after arms are 0.1-0.9 ms a frame slower, and not
+because of the switches: in Shibuya, INLINE+STENCIL on against off in the
+same binary is 18.30/18.27 and 18.52/18.54 ms. What moved is the builder:
+"FF build" per replaced draw is 9.3 us in the census binary and 10.2 us in
+this one (Sky Dino 9.8 -> 11.0), switches or not. Not isolated yet.
+
+**VERIFY=120, VERIFY_FROM=6000** (free play; before / after): Garage
+2,975 compared, 68 mismatching (2.3%) / 14,380, 209 (1.5%); Rokkaku 4,433,
+55 (1.2%) / 4,164, 44 (1.1%); Shibuya 1,792, 231 (12.9%) / 1,792, 231;
+Sky Dino 2,560, 208 (8.1%) / 2,560, 218 (8.5%). Every mismatching draw is
+fixed-function, as in G73; VS 0 everywhere; the glitch watch wrote 12 in
+Sky Dino in both arms, none elsewhere. No new class. VERIFY_FROM=3500 lost
+the title input in 3 attempts of 3 (the harness started a new game);
+6000 is past the jump.
+
+**Not shown by a run.** The water: 152 bump draws VERIFY-compared in
+Rokkaku, free play and the stage intro, all EXACT and every one covering
+0 pixels, and an executor arm with `RECOMP_MARK_BUMP_ENV` paints nothing
+in the flight frames -- the water is not in view from the harness. The
+displacement is checked by jsrf_d3d8_host_bump (0 of 5,321 pixels differ,
+modes 6 and 7). The graffiti studio (0x12) is not reachable by a jump and
+was not run; it has the same unit test. No cube or volume draw exists to
+look at.
+
+**Ready for the player?** As an opt-in, yes -- the five switches in
+paths.conf or the `JSRF_APP_LIFT` block. The water and the graffiti studio
+are the two things only a player session will show.
