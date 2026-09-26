@@ -78,8 +78,10 @@ off. The plan and the measurements are in
 
 **Still wrong or unknown:**
 
-- One 4-second stall the first time the graffiti studio opens: a vertex
-  program compiled on the draw thread (being moved off it, 26 Sep).
+- A 4-second freeze on first opening the graffiti studio (the host waiting
+  on the pipeline-archive queue) is fixed in the lift bundle
+  (`RECOMP_METAL_ASYNC_HOST_VSH`, 26 Sep); the studio itself is to be
+  re-tested in play.
 - A thin grey line above some speech-box letters; measured to be the shipped
   font's bilinear bleed, so probably authentic, pending an xemu comparison.
 - Elements missing from the Poison Jam chase cutscenes.
@@ -87,8 +89,10 @@ off. The plan and the measurements are in
   cutscenes that can be reached unattended is in progress.
 - The lift is not yet the engine's default, only the app bundle's.
 - Windows: the MinGW cross-build links again at the current tree (26 Sep) and
-  runs under CrossOver; porting the lift's host renderer to Direct3D 11 is in
-  progress. CrossOver can judge its picture, not its speed.
+  runs under CrossOver. A Direct3D 11 host renderer for the lift draws 99.4%
+  of the attract demo there; it has not yet been compared frame by frame,
+  because the Windows NV2A-model arm hangs at boot in CrossOver. CrossOver can
+  judge its picture, not its speed.
 
 ## Build and play
 
