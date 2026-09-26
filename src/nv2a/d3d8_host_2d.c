@@ -124,6 +124,33 @@ static int fetch(const uint8_t *ram, size_t ram_size, uint32_t offset, uint32_t 
     }
 }
 
+/* G75: THE REFUSALS NAME WHAT THEY REFUSED. "texture shader mode" and
+ * "texture format" were one count each, so a census could not tell a
+ * bump-mapped mesh from a cube map or a 16-bit swizzled format from a
+ * 32-bit linear one. The reasons are counted by pointer, so each (mode,
+ * unit) and each format byte gets one stable string, written on first use
+ * (the builder runs on the executor's thread alone). */
+static const char *mode_reason(int ff, unsigned mode, unsigned unit)
+{
+    static char txt[2][32][4][72];
+    static const char *const k_name[32] = { "none", "2D", "3D/volume", "cube map", "pass-through", "clip plane",
+                                            "bump env", "bump env luminance", "BRDF", "dot ST", "dot ZW",
+                                            "dot reflect diffuse", "dot reflect specular", "dot STR 3D",
+                                            "dot STR cube", "dependent AR", "dependent GB", "dot product",
+                                            "dot reflect specular const" };
+    char *t = txt[ff != 0][mode & 31u][unit & 3u];
+    if (!t[0]) snprintf(t, sizeof txt[0][0][0], "texture shader mode%s %u (%s) unit %u", ff ? " (fixed function)" : "",
+                        mode & 31u, k_name[mode & 31u] ? k_name[mode & 31u] : "?", unit & 3u);
+    return t;
+}
+static const char *format_reason(uint32_t fb)
+{
+    static char txt[256][32];
+    char *t = txt[fb & 0xFFu];
+    if (!t[0]) snprintf(t, sizeof txt[0], "texture format 0x%02X", fb & 0xFFu);
+    return t;
+}
+
 static const char *texture_from_d3d(const D3D8HostDrawCheck *c, unsigned u, D3D8H2DTexture *t)
 {
     uint32_t f = c->format[u], fb = (f >> 8) & 0xFFu;
@@ -143,7 +170,7 @@ static const char *texture_from_d3d(const D3D8HostDrawCheck *c, unsigned u, D3D8
         t->pitch = fb == 0x0Cu ? ((t->width + 3u) / 4u) * 8u : fb == 0x0Eu ? ((t->width + 3u) / 4u) * 16u
                  : (fb == 0x03u || fb == 0x04u) ? t->width * 2u : t->width * 4u;
         if (t->levels > 1u + (lw > lh ? lw : lh)) return "texture levels";
-    } else return "texture format";
+    } else return format_reason(fb);
     if (!t->levels) return "texture levels";
     /* D3DTADDRESS 1 wrap, 2 mirror, 3 clamp; a linear image never repeats
      * (the executor's rule, and the hardware's: it has no wrap for them). */
@@ -340,6 +367,49 @@ int d3d8_host_ff_gpu_mode(void)
     }
     return m;
 }
+static int s_bump_mode = -1;
+void d3d8_host_2d_set_bump(int on) { s_bump_mode = on ? 1 : 0; }
+int d3d8_host_bump_mode(void)
+{
+    if (s_bump_mode < 0) {
+        s_bump_mode = recomp_switch_on("RECOMP_D3D8_HOST_BUMP");
+        if (s_bump_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_BUMP=1: BUMPENVMAP units (texture shader modes"
+                                         " 6 and 7) are drawn by the host in draw mode, displaced as the executor"
+                                         " displaces them (G75)\n");
+    }
+    return s_bump_mode;
+}
+/* G75: a BUMPENVMAP unit, taken as the executor takes it
+ * (nv2a_texture_copy_prepare): units 1..3 whose input unit is an earlier
+ * one. Unit 1 reads unit 0; units 2 and 3 read the unit NV097's
+ * SHADER_OTHER_STAGE_INPUT (0x1E78) names, which is a pixel shader's
+ * PSInputTexture (definition word 56); a fixed-function draw is only taken
+ * on unit 1. The matrix and luminance words are D3D's texture-stage state
+ * 22..27 (BUMPENVMAT00, 01, 11, 10, LSCALE, LOFFSET). SetTextureState_BumpEnv
+ * (0x18F180) pushes stage s's to unit s under a pixel shader (device +0x370
+ * set) and to unit s+1 without one, so unit u reads D3D stage u or u-1.
+ * The texture must be one the executor's buffer sampler reads the way D3D
+ * describes it: repeat (all wrap) or clamp, never mirror or mixed. */
+static const char *bump_from_d3d(const D3D8HostDrawCheck *c, unsigned u, uint32_t mode, int ps, D3D8Host2DDraw *d)
+{
+    unsigned in, s;
+    const uint32_t *t;
+    if (d3d8_host_bump_mode() <= 0) return mode_reason(!ps, mode, u);
+    if (u < 1u) return "bump env on unit 0";
+    if (ps) in = u == 1u ? 0u : (c->ps[56] >> (16u + 4u * (u - 2u))) & 15u;
+    else { if (u != 1u) return "bump env (fixed function) past unit 1"; in = 0u; }
+    if (in >= u) return "bump env reads a later unit";
+    if (!c->tex[u]) return "bump env on an unbound stage";
+    s = ps ? u : u - 1u; t = c->tss[s];
+    d->bump[u] = mode; d->bump_in[u] = in;
+    memcpy(&d->bump_mat[u][0], &t[22], 4);     /* M00 */
+    memcpy(&d->bump_mat[u][1], &t[23], 4);     /* M01 */
+    memcpy(&d->bump_mat[u][2], &t[25], 4);     /* M10 */
+    memcpy(&d->bump_mat[u][3], &t[24], 4);     /* M11 */
+    memcpy(&d->bump_scale[u], &t[26], 4); memcpy(&d->bump_offset[u], &t[27], 4);
+    d->tmask |= 1u << u;
+    return NULL;
+}
 int d3d8_host_points_mode(void)
 {
     static int m = -1;
@@ -485,7 +555,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         d->stage_modes = modes; d->ps_word54 = w[54]; d->modes_adjusted = (modes & 0xFFFFFu) != (w[54] & 0xFFFFFu);
         for (unsigned u = 0; u < 4; ++u) {
             uint32_t mode = (modes >> (5u * u)) & 31u;
-            if (mode > 1u) return "texture shader mode";
+            if (mode == 6u || mode == 7u) { const char *why = bump_from_d3d(c, u, mode, 1, d); if (why) return why; continue; }
+            if (mode > 1u) return mode_reason(0, mode, u);
             if (mode == 1u) { if (!c->tex[u]) return "shader samples an unbound stage"; d->tmask |= 1u << u; }
         }
     } else {
@@ -508,7 +579,8 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
             uint32_t modes = d3d8_host_stage_program(c);
             for (unsigned u = 0; u < 4; ++u) {
                 uint32_t mode = (modes >> (5u * u)) & 31u;
-                if (mode > 1u) return "texture shader mode (fixed function)";
+                if (mode == 6u || mode == 7u) { const char *why = bump_from_d3d(c, u, mode, 0, d); if (why) return why; continue; }
+                if (mode > 1u) return mode_reason(1, mode, u);
                 if (mode == 1u) d->tmask |= 1u << u;
             }
         }
@@ -528,6 +600,10 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         if (!(d->tmask & (1u << u))) continue;
         if ((why = texture_from_d3d(c, u, &d->tex[u]))) return why;
         if ((uint64_t)d->tex[u].addr + d->tex[u].pitch > ram_size) return "texture bounds";
+        /* The executor's buffer sampler repeats or clamps both axes alike. */
+        if (d->bump[u] && (d->tex[u].wrap_u != d->tex[u].wrap_v || d->tex[u].wrap_u == 2u ||
+                           (d->tex[u].wrap_u == 1u && c->tss[u][2] != 1u)))
+            return "bump env unit's address mode (mirror or mixed)";
     }
 
     /* Vertices: G41's arrays at the draw's indices. */

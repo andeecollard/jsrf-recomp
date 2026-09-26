@@ -189,6 +189,16 @@ typedef struct {
      * expanded; point_reg = SET_POINT_SIZE (1/8 pixel) as D3D's updater
      * derives it; point_sprite = texture coordinates run 0..1 over the quad. */
     uint32_t pl_segs, point_reg, point_sprite;
+    /* G75: BUMPENVMAP (texture shader modes 6 and 7) on the host, as the
+     * executor draws it (NV2ATextureCopy.bump, G60): unit u (1..3) samples
+     * its texture at its coordinates plus the (du, dv) of unit bump_in[u]'s
+     * texel, rotated by bump_mat[u] = M00 M01 M10 M11; mode 7 scales the
+     * result by bump_scale*L + bump_offset. The unit is sampled from its
+     * guest bytes by the executor's own buffer sampler
+     * (nv2a_metal_sample_msl.h), never by a hardware texture, as the
+     * executor samples it. bump[u] = 0 for an ordinary unit. */
+    uint32_t bump[4], bump_in[4];
+    float    bump_mat[4][4], bump_scale[4], bump_offset[4];
 } D3D8Host2DDraw;
 
 /* Is this draw pre-transformed 2D? The vertex shader handle (device +0x384)
@@ -239,6 +249,10 @@ int  d3d8_host_ff_gpu_mode(void);                 /* RECOMP_D3D8_HOST_FF_GPU, re
  * and lines itself (read once, executor thread). Off: they stay with the
  * executor, as before. */
 int  d3d8_host_points_mode(void);                 /* 2: =mark, points drawn 12 px wide (an instrument) */
+/* G75: RECOMP_D3D8_HOST_BUMP=1 lets draw mode draw BUMPENVMAP units itself
+ * (read once, executor thread). Off: those draws stay with the executor. */
+int  d3d8_host_bump_mode(void);
+void d3d8_host_2d_set_bump(int on);               /* tests: as RECOMP_D3D8_HOST_BUMP */
 /* SET_POINT_SIZE as D3D's point updater (0x195140) computes it from
  * RenderState[106..113] (pt_rs) and the device's point scale (+0x45C) when
  * POINTSCALEENABLE is off: POINTSIZE * scale, raised to POINTSIZE_MIN, cut to

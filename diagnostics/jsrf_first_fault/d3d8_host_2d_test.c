@@ -932,6 +932,140 @@ static unsigned point_depth_sweep(unsigned n)
     }
     return bad;
 }
+/* G75: BUMPENVMAP ON THE HOST (RECOMP_D3D8_HOST_BUMP=1). A pre-transformed
+ * strip whose unit 0 is a du/dv map and unit 1 an environment map, with
+ * D3D's BUMPENVMAP (0x19) or BUMPENVMAPLUMINANCE (0x1A) colour op on stage
+ * 0: the stage program gives unit 1 mode 6 or 7. The matrix sits in D3D's
+ * texture-stage state 22..27 of stage 0, the stage a fixed-function draw's
+ * SetTextureState_BumpEnv pushes to unit 1. The executor draws the same
+ * strip from the NV2A state the XDK would have pushed -- the matrix given
+ * here as M00 M01 M10 M11, not read from the host's description -- and the
+ * two must agree. The negative control is the executor drawing it WITHOUT
+ * the displacement, which must not. */
+enum { TEX2 = 0x30000, BVB = 0x14000 };
+static void bump_case(D3D8HostDrawCheck *c, unsigned op, const float mat[4], float ls, float lo)
+{
+    static const float UV[4][2] = { { -0.2f, 0.05f }, { 1.3f, 0.0f }, { 0.1f, 1.2f }, { 1.4f, 1.35f } };
+    base_check(c);
+    for (int i = 0; i < 4; ++i) {
+        uint32_t v = BVB + 36u * i;
+        putf(v, A_POS[i][0]); putf(v + 4, A_POS[i][1]); putf(v + 8, 0.25f); putf(v + 12, 1.0f);
+        put32(v + 16, 0xFFFFFFFFu);
+        putf(v + 20, UV[i][0] * 0.5f); putf(v + 24, UV[i][1] * 0.5f);     /* du/dv: 2x magnified */
+        putf(v + 28, UV[i][0]); putf(v + 32, UV[i][1]);
+    }
+    for (unsigned y = 0; y < TW; ++y)
+        for (unsigned x = 0; x < TW; ++x) {
+            uint8_t *p = ram + TEX + 4 * morton(x, y), *e = ram + TEX2 + 4 * morton(x, y);
+            p[0] = (uint8_t)((x * 37 + y * 11) & 0xFF); p[1] = (uint8_t)((y * 29 + x * 5 + 0x80) & 0xFF);   /* du, dv */
+            p[2] = (uint8_t)(x * 8); p[3] = 0xFF;                                                          /* L */
+            e[0] = (uint8_t)(x * 8); e[1] = (uint8_t)(y * 8); e[2] = (uint8_t)((x ^ y) * 8); e[3] = 0xFF;
+        }
+    c->vs_handle = 0x244;                                      /* XYZRHW | DIFFUSE | TEX2 */
+    c->draw_kind = 1; c->prim = 6; c->start = 0; c->count = 4;
+    c->va_on = (1u << 0) | (1u << 3) | (1u << 9) | (1u << 10);
+    c->va_offset[0] = BVB;      c->va_format[0] = (36u << 8) | 0x42u;
+    c->va_offset[3] = BVB + 16; c->va_format[3] = (36u << 8) | 0x40u;
+    c->va_offset[9] = BVB + 20; c->va_format[9] = (36u << 8) | 0x22u;
+    c->va_offset[10] = BVB + 28; c->va_format[10] = (36u << 8) | 0x22u;
+    for (unsigned s = 0; s < 2; ++s) {
+        c->tex[s] = 0x5678 + s; c->data[s] = s ? TEX2 : TEX;
+        c->format[s] = 0x1u | 0x20u | (0x06u << 8) | (1u << 16) | (5u << 20) | (5u << 24);
+        c->tss[s][0] = c->tss[s][1] = c->tss[s][2] = 1;       /* wrap */
+        c->tss[s][3] = s ? 2u : 1u; c->tss[s][4] = s ? 2u : 1u;   /* du/dv point, environment linear */
+    }
+    c->tss[0][12] = op;
+    memcpy(&c->tss[0][22], &mat[0], 4); memcpy(&c->tss[0][23], &mat[1], 4);   /* M00, M01 */
+    memcpy(&c->tss[0][25], &mat[2], 4); memcpy(&c->tss[0][24], &mat[3], 4);   /* M10 is word 25, M11 word 24 */
+    memcpy(&c->tss[0][26], &ls, 4); memcpy(&c->tss[0][27], &lo, 4);
+    /* Stage 1: SELECTARG1 TEXTURE -- the output is unit 1's bumped texel. */
+    c->ffc_cur.texture_bound_mask = 3;
+    c->ffc_cur.tss[0][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_DIFFUSE;
+    c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[0][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
+    c->ffc_cur.tss[1][D3D8FF_TSS_COLOROP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[1][D3D8FF_TSS_COLORARG1] = D3D8FF_TA_TEXTURE;
+    c->ffc_cur.tss[1][D3D8FF_TSS_ALPHAOP] = D3D8FF_TOP_SELECTARG1; c->ffc_cur.tss[1][D3D8FF_TSS_ALPHAARG1] = D3D8FF_TA_DIFFUSE;
+}
+static int exec_draw_bump(const D3D8HostDrawCheck *c, const D3D8Host2DDraw *d, unsigned mode, const float mat[4],
+                          float ls, float lo, uint16_t *target)
+{
+    static float v[4][16][4];
+    static NV2ATextureCopy s, extra[3];
+    memset(&s, 0, sizeof s); memset(extra, 0, sizeof extra); memset(v, 0, sizeof v);
+    s.clip_w = RTW; s.clip_h = RTH; s.target_pitch = RTPITCH; s.target_bpp = 2; s.depth_pitch = RTW * 4;
+    s.z_clip_min = 0.0f; s.z_clip_max = 16777215.0f; s.z_cull = 1;
+    s.combiner_count = d->cc;
+    memcpy(s.color_icw, d->ci, sizeof s.color_icw); memcpy(s.alpha_icw, d->ai, sizeof s.alpha_icw);
+    memcpy(s.color_ocw, d->co, sizeof s.color_ocw); memcpy(s.alpha_ocw, d->ao, sizeof s.alpha_ocw);
+    memcpy(s.const0, d->k0, sizeof s.const0); memcpy(s.const1, d->k1, sizeof s.const1);
+    s.texture_mask = 3; s.untextured = 0; s.modulate = 1;
+    s.width = s.height = TW; s.pitch = TW * 4; s.levels = 1; s.rgba8 = 1; s.min_filter = 1; s.linear = 0; s.repeat = 1;
+    extra[0].width = extra[0].height = TW; extra[0].pitch = TW * 4; extra[0].levels = 1; extra[0].rgba8 = 1;
+    extra[0].min_filter = 2; extra[0].linear = 1; extra[0].repeat = 1;
+    s.extra_stages = extra; s.extra_texture[0] = ram + TEX2; s.extra_size[0] = TW * TW * 4;
+    if (mode) {
+        s.bump[1] = mode; s.bump_input[1] = 0;
+        memcpy(s.bump_mat[1], mat, 16); s.bump_scale[1] = ls; s.bump_offset[1] = lo;
+    }
+    for (unsigned k = 0; k < 4; ++k) {
+        float pos[4];
+        memcpy(pos, ram + BVB + 36u * k, 16);
+        v[k][0][0] = exec_snap(pos[0] + g_exec_offset); v[k][0][1] = exec_snap(pos[1] + g_exec_offset);
+        v[k][0][2] = pos[2] * 16777215.0f; v[k][0][3] = 1.0f / pos[3];
+        v[k][3][0] = v[k][3][1] = v[k][3][2] = v[k][3][3] = 1.0f;
+        v[k][9][3] = v[k][10][3] = 1.0f;
+        memcpy(v[k][9], ram + BVB + 36u * k + 20, 8); memcpy(v[k][10], ram + BVB + 36u * k + 28, 8);
+    }
+    nv2a_metal_invalidate(NULL);
+    if (nv2a_metal_draw(&s, ram + TEX, TW * TW * 4, (uint8_t *)target, RTPITCH * RTH, NULL, 0,
+                        (const float (*)[16][4])v, 4, c->prim) < 0) {
+        printf("executor refused the bump draw: %s\n", nv2a_metal_last_reject()); return 0;
+    }
+    nv2a_metal_sync();
+    return 1;
+}
+static void bump_tests(void)
+{
+    static uint16_t bg[RTPITCH / 2 * RTH], ex[RTPITCH / 2 * RTH], ho[RTPITCH / 2 * RTH], fl[RTPITCH / 2 * RTH];
+    const float mat[4] = { 0.09f, -0.03f, 0.05f, 0.11f };          /* M00 M01 M10 M11: asymmetric */
+    const float ls = 0.75f, lo = 0.2f;
+    for (unsigned mode = 6; mode <= 7; ++mode) {
+        D3D8HostDrawCheck c; D3D8Host2DDraw d; D3D8H2DDiff df, dfl;
+        const char *why;
+        char name[64];
+        snprintf(name, sizeof name, "BUMPENVMAP%s (mode %u)", mode == 7 ? "LUMINANCE" : "", mode);
+        bump_case(&c, mode == 6 ? 0x19u : 0x1Au, mat, ls, lo);
+        d3d8_host_2d_set_bump(0);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+        CHECK(why && strstr(why, "texture shader mode (fixed function)") && strstr(why, mode == 6 ? " 6 " : " 7 "),
+              "%s, switch off: left to the executor (%s)", name, why ? why : "built");
+        d3d8_host_2d_set_bump(1);
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+        CHECK(!why && d.tmask == 3u && d.bump[1] == mode && d.bump_in[1] == 0u, "%s: the host builds it (%s)", name, why ? why : "built");
+        if (why) continue;
+        CHECK(d.bump_mat[1][0] == mat[0] && d.bump_mat[1][1] == mat[1] && d.bump_mat[1][2] == mat[2] && d.bump_mat[1][3] == mat[3]
+              && d.bump_scale[1] == ls && d.bump_offset[1] == lo, "%s: matrix M00 M01 M10 M11 and luminance from stage 0's words", name);
+        background(bg); memcpy(ex, bg, sizeof bg); memcpy(ho, bg, sizeof bg); memcpy(fl, bg, sizeof bg);
+        if (!exec_draw_bump(&c, &d, mode, mat, ls, lo, ex) || !exec_draw_bump(&c, &d, 0, mat, ls, lo, fl) || !host_draw(&d, ho)) {
+            ++fails; continue;
+        }
+        d3d8_host_2d_diff(bg, ex, ho, RTPITCH / 2, RTH, 1, &df);
+        d3d8_host_2d_diff(bg, ex, fl, RTPITCH / 2, RTH, 1, &dfl);
+        printf("  %s: executor changed %llu, host %llu, over tolerance %llu, max error r%u g%u b%u | executor without the"
+               " displacement: %llu px over\n", name, df.exec_changed, df.host_changed, df.mismatch, df.max_err[0], df.max_err[1],
+               df.max_err[2], dfl.mismatch);
+        CHECK(df.exec_changed > 3000, "%s: the executor drew it (%llu px)", name, df.exec_changed);
+        CHECK(df.mismatch == 0, "%s: host and executor agree within one 565 step (%llu px over)", name, df.mismatch);
+        CHECK(dfl.mismatch > 1000, "%s CONTROL: the undisplaced draw differs (%llu px)", name, dfl.mismatch);
+        /* Mirror addressing on the bump unit is not the executor's: refused. */
+        c.tss[1][0] = c.tss[1][1] = 2;
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+        CHECK(why && strstr(why, "bump env unit's address mode"), "%s, mirrored bump unit: refused (%s)", name, why ? why : "built");
+    }
+    d3d8_host_2d_set_bump(0);
+}
 static void points_tests(void)
 {
     {   unsigned n = getenv("H2D_ZSWEEP") ? (unsigned)atoi(getenv("H2D_ZSWEEP")) : 64u, bad = point_depth_sweep(n);
@@ -2507,7 +2641,7 @@ static void stage_mode_tests(void)
     c.ffc_cur.texture_bound_mask = 3; c.tss[0][12] = 0x19u;
     memset(&d, 0, sizeof d); d.verts = verts;
     why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
-    CHECK(why && !strcmp(why, "texture shader mode (fixed function)"), "FF, stage 1 BUMPENVMAP: left to the executor (%s)", why ? why : "built");
+    CHECK(why && !strncmp(why, "texture shader mode (fixed function) 6", 38), "FF, stage 1 BUMPENVMAP: left to the executor (%s)", why ? why : "built");
     d3d8_host_2d_set_bisect(4096u);
     memset(&d, 0, sizeof d); d.verts = verts;
     why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
@@ -2554,6 +2688,12 @@ int main(int argc, char **argv)
         setenv("RECOMP_D3D8_HOST_FF_GPU", "1", 1);          /* the GPU unit is armed; points still take the CPU one */
         d3d8_host_2d_metal_set_spec_sync(1);
         points_tests();
+        printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
+        return fails ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "bump") == 0) {         /* G75: BUMPENVMAP on the host */
+        d3d8_host_2d_metal_set_spec_sync(1);
+        bump_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
     }
