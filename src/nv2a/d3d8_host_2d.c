@@ -100,12 +100,18 @@ static const char *stencil_from_d3d(const D3D8HostDrawCheck *c, D3D8Host2DDraw *
     if (d->stencil_func < 0x200u || d->stencil_func > 0x207u) return "stencil func";
     if (d->stencil_func != 0x207u) {
         if (!s_in_replace || d3d8_host_stencil_mode() <= 0) return "stencil func not ALWAYS";
-        /* Every word the test reads, and the fail operation it now applies. */
-        if (!st_seen(c, 0x368) || !st_seen(c, 0x36C) || !st_seen(c, 0x370)) return "stencil state not pushed";
+        /* Every word the test reads, and the fail operation it now applies.
+         * The func mask and the fail operation are pushed at device setup
+         * and by their own setter, which the mirror does not see: D3D's
+         * render-state array holds them (rs_stencil_*), and VERIFY checks
+         * them against the executor's registers. */
+        if (!st_seen(c, 0x368)) return "stencil state not pushed";
+        if ((!st_seen(c, 0x36C) || !st_seen(c, 0x370)) && !c->rs_stencil_valid) return "stencil state not pushed";
     }
-    d->stencil_fail = st(c, 0x370, 0x1E00);               /* never applied under ALWAYS */
+    d->stencil_fail = st(c, 0x370, c->rs_stencil_valid ? c->rs_stencil_fail : 0x1E00);   /* applied only off ALWAYS */
     d->stencil_zfail = st(c, 0x374, 0x1E00); d->stencil_zpass = st(c, 0x378, 0x1E00);
-    d->stencil_mask = st(c, 0x360, 0xFF); d->stencil_ref = st(c, 0x368, 0); d->stencil_func_mask = st(c, 0x36C, 0xFF);
+    d->stencil_mask = st(c, 0x360, 0xFF); d->stencil_ref = st(c, 0x368, 0);
+    d->stencil_func_mask = st(c, 0x36C, c->rs_stencil_valid ? c->rs_stencil_mask & 0xFFu : 0xFF);
     if (!c->zs) return "stencil test without a depth surface";
     d->stencil_write = zs_has_stencil(c);
     if (!d->stencil_write) return "stencil test on a depth surface without stencil";
@@ -1135,6 +1141,9 @@ static unsigned s_pl_dumped;
 /* G75: the same for BUMPENVMAP draws. */
 static unsigned long long s_bump_cmp, s_bump_exact, s_bump_within, s_bump_mm, s_bump_exec_px, s_bump_host_px;
 static unsigned s_bump_dumped;
+/* G75: D3D's render-state stencil words against the executor's registers (VERIFY). */
+static unsigned long long s_rs_stencil_mask_ok, s_rs_stencil_mask_differ, s_rs_stencil_fail_ok, s_rs_stencil_fail_differ;
+static unsigned s_rs_stencil_printed;
 static unsigned s_pl_nkind;
 static unsigned long long s_pl_tokens, s_pl_drawn, s_pl_segs, s_pl_other;
 static void pl_census(const D3D8HostDrawCheck *c, int cls, const D3D8Host2DDraw *d, int drawn)
@@ -1551,6 +1560,17 @@ void d3d8_host_2d_post(const D3D8HostDrawCheck *c, void (*exec_source)(D3D8ExecD
     if (cls == 2) ++s_ff_draws;
     memset(&e, 0, sizeof e);
     if (exec_source) exec_source(&e);
+    /* G75: the render-state array's stencil func mask and fail operation
+     * (used when D3D never pushed them through Simple) against the
+     * executor's registers. */
+    if (exec_source && e.regs_valid && c->rs_stencil_valid) {
+        uint32_t m = st(c, 0x36C, c->rs_stencil_mask & 0xFFu) & 0xFFu, f = st(c, 0x370, c->rs_stencil_fail);
+        if (m == (e.regs[0x36Cu / 4u] & 0xFFu)) ++s_rs_stencil_mask_ok; else ++s_rs_stencil_mask_differ;
+        if (f == e.regs[0x370u / 4u]) ++s_rs_stencil_fail_ok; else ++s_rs_stencil_fail_differ;
+        if ((m != (e.regs[0x36Cu / 4u] & 0xFFu) || f != e.regs[0x370u / 4u]) && s_rs_stencil_printed++ < 4)
+            fprintf(stderr, "[D3D8-HOST-2D] draw %u: stencil func mask %X fail %X from D3D, executor %X %X\n", c->serial, m, f,
+                    e.regs[0x36Cu / 4u], e.regs[0x370u / 4u]);
+    }
     /* Cross-checks, from the executor's side, never used to draw: is the class
      * in the executor's PROGRAM mode (D3D's pass-through program), did it draw at all, and what did D3D program as
      * the pass-through's constants (c-38, c-37: slots 58, 59)? */
@@ -2430,6 +2450,10 @@ void d3d8_host_2d_report(const char *why)
                         e->fmt0, e->fmt3, e->blend, e->zfunc);
             }
         }
+        if (s_rs_stencil_mask_ok + s_rs_stencil_mask_differ)
+            fprintf(stderr, "[D3D8-HOST-2D] %s stencil words from D3D's render state against the executor: func mask agree %llu"
+                            " differ %llu, fail agree %llu differ %llu\n", why, s_rs_stencil_mask_ok, s_rs_stencil_mask_differ,
+                    s_rs_stencil_fail_ok, s_rs_stencil_fail_differ);
         if (s_bump_cmp)
             fprintf(stderr, "[D3D8-HOST-2D] %s bump env: VERIFY compared %llu: EXACT %llu within_tolerance %llu MISMATCHING %llu,"
                             " px changed executor %llu host %llu\n", why, s_bump_cmp, s_bump_exact, s_bump_within, s_bump_mm,

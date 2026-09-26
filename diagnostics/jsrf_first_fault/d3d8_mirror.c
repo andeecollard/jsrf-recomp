@@ -566,6 +566,7 @@ static void d3d8m_fill_2d(D3D8HostDrawCheck *c, uint32_t kind, uint32_t a1, uint
     c->idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c->x_val, m_x_val, sizeof c->x_val); c->x_seen = m_x_seen;
     c->rs_cull = MEM32(0x0019E2E0u); c->rs_front = MEM32(0x0019E2DCu); c->rs_valid = 1;
+    c->rs_stencil_mask = MEM32(0x0019E200u); c->rs_stencil_fail = MEM32(0x0019E2D8u); c->rs_stencil_valid = 1;   /* G75 */
     d3d8m_point_read(c);
     d3d8m_snap_indices(c, kind, a2, a3);
     c->ffc_valid = 1; d3d8m_ffc_read(&c->ffc_cur); c->ffc_ps = c->ffc_cur.pixel_shader;
@@ -649,6 +650,7 @@ static void after_draw_body(uint32_t kind, uint32_t a1, uint32_t a2, uint32_t a3
     c.idx_ptr = kind == 2 ? a3 : 0u;
     memcpy(c.x_val, m_x_val, sizeof c.x_val); c.x_seen = m_x_seen;
     c.rs_cull = MEM32(0x0019E2E0u); c.rs_front = MEM32(0x0019E2DCu); c.rs_valid = 1;
+    c.rs_stencil_mask = MEM32(0x0019E200u); c.rs_stencil_fail = MEM32(0x0019E2D8u); c.rs_stencil_valid = 1;   /* G75 */
     d3d8m_point_read(&c);
     /* G51.1: for a 2D draw the host will draw, the indices and a hash of the
      * vertex bytes AS THE CALL SAW THEM. D3D has just copied these indices

@@ -190,6 +190,12 @@ typedef struct {
      * copy, not guest addresses. up_over: they did not fit. */
     uint64_t up_pos;
     uint32_t up_bytes, up_stride, up_over;
+    /* G75: two stencil words D3D never sends through SetRenderState_Simple
+     * after device setup, read from its render-state array at the draw:
+     * STENCILMASK (RenderState[72], 0x19E200 -- the func mask, NV097 0x36C)
+     * and STENCILFAIL (0x19E2D8, which SetRenderState_StencilFail 0x18F7F0
+     * stores beside pushing 0x370 itself). rs_stencil_valid: the mirror read them. */
+    uint32_t rs_stencil_valid, rs_stencil_mask, rs_stencil_fail;
     /* G51.3: D3D's own cull state, D3D_g_RenderState[128] CULLMODE (0x19E2E0)
      * and [127] FRONTFACE (0x19E2DC). SetRenderState_CullMode (0x18EBD0), not
      * Simple, emits it: CULL_FACE_ENABLE = CullMode != 0 and, when on,
