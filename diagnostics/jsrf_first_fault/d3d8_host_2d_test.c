@@ -1660,6 +1660,9 @@ static void seq_tests(void)
         zbad = d3d8_host_2d_depth_diff(za, zb, RTW * RTH, 1, &steps);
         printf("  sequence of %u, bisect 0x%02X: executor changed %llu, host arm %llu, differing %llu | depth %llu, worst %u\n",
                n, masks[m], df.exec_changed, df.host_changed, df.mismatch, zbad, steps);
+        if (df.mismatch && getenv("H2D_SEQ_PRINT"))
+            for (unsigned k = 0, shown = 0; k < RTPITCH / 2 * RTH && shown < 24; ++k)
+                if (a[k] != b[k]) { ++shown; printf("    px %u,%u: before %04X executor %04X host %04X\n", k % (RTPITCH / 2), k / (RTPITCH / 2), bg[k], a[k], b[k]); }
         CHECK(df.mismatch == 0 && zbad == 0, "sequence of %u draws in one batch, bisect 0x%X: identical to the executor", n, masks[m]);
     }
 }
@@ -2891,6 +2894,17 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "seq") == 0) {          /* many draws in one batch, every bisect arm */
         setenv("RECOMP_D3D8_HOST_2D", "draw", 1);
         setenv("RECOMP_D3D8_HOST_FF", "draw", 1);
+        /* Both renderers compile their specialised pipelines in line here.
+         * Asynchronously, a draw issued before its pipeline lands takes the
+         * generic stand-in, and the stand-in is not bit-exact under blending:
+         * 1,000 blended draws in one batch leave 5-19 pixels one green step
+         * apart (RECOMP_METAL_PIPELINE_HOLD=1 forces it every run). How many
+         * draws land before the compile was up to the machine's load, which
+         * is why this failed about one run in three under ctest -j8 and
+         * almost never alone. The arms must compare the programs, not the
+         * race. */
+        setenv("RECOMP_METAL_ASYNC_PIPELINES", "0", 1);
+        d3d8_host_2d_metal_set_spec_sync(1);
         seq_tests();
         printf("%s: %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
         return fails ? 1 : 0;
