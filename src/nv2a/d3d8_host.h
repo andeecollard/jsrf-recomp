@@ -196,6 +196,11 @@ typedef struct {
      * and STENCILFAIL (0x19E2D8, which SetRenderState_StencilFail 0x18F7F0
      * stores beside pushing 0x370 itself). rs_stencil_valid: the mirror read them. */
     uint32_t rs_stencil_valid, rs_stencil_mask, rs_stencil_fail;
+    /* G75: the device's flags word (device +8) at the draw. Bit 1 picks
+     * which fog-table pass-through program D3D's 0x1903A0 loads for a
+     * pre-transformed FVF: set, Z fog (0x19A318, oFog = v0.z); clear, W fog
+     * (0x19A258, oFog = 1/v0.w). dev_flags_valid: the mirror read it. */
+    uint32_t dev_flags_valid, dev_flags;
     /* G51.3: D3D's own cull state, D3D_g_RenderState[128] CULLMODE (0x19E2E0)
      * and [127] FRONTFACE (0x19E2DC). SetRenderState_CullMode (0x18EBD0), not
      * Simple, emits it: CULL_FACE_ENABLE = CullMode != 0 and, when on,

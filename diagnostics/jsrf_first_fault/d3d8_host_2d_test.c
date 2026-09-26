@@ -2262,6 +2262,26 @@ static void fog_2d_tests(void)
     memset(&d, 0, sizeof d); d.verts = verts;
     why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
     CHECK(why && !strcmp(why, "2D fog from a fog table"), "2D fog from a fog table: refused by name (%s)", why ? why : "built");
+    /* G75: RECOMP_D3D8_HOST_FOGTABLE -- D3D's two fog-table programs. Device
+     * +8 bit 1 set: Z fog, oFog = v0.z; clear: W fog, oFog = 1/v0.w. */
+    for (int i = 0; i < 4; ++i) { putf(VB + 20u * i + 8, 0.1f + 0.2f * (float)i); putf(VB + 20u * i + 12, 0.5f + (float)i); }
+    d3d8_host_2d_set_fogtable(1);
+    for (int zf = 0; zf < 2; ++zf) {
+        int ok;
+        c.dev_flags_valid = 1; c.dev_flags = zf ? 0x2u : 0x0u;
+        memset(&d, 0, sizeof d); d.verts = verts;
+        why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+        ok = !why && d.fog_enable && d.nverts == 6;
+        for (unsigned k = 0; ok && k < d.nverts; ++k)
+            if (d.verts[k].f[0] != (zf ? d.verts[k].p[2] : d.verts[k].p[3])) ok = 0;
+        CHECK(ok, "2D fog from a fog table, %s fog: the coordinate is %s (%s)", zf ? "Z" : "W", zf ? "v0.z" : "1/v0.w",
+              why ? why : "built");
+    }
+    c.dev_flags_valid = 0;
+    memset(&d, 0, sizeof d); d.verts = verts;
+    why = d3d8_host_2d_build(&c, ram, RAM_SIZE, 0, &d);
+    CHECK(why && strstr(why, "device flags"), "2D fog from a fog table, no device flags: refused (%s)", why ? why : "built");
+    d3d8_host_2d_set_fogtable(0);
 }
 
 /* G51.2: A DRAW THROUGH THE TITLE'S OWN VERTEX PROGRAM. The first complete

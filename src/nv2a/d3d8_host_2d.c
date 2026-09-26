@@ -443,6 +443,17 @@ int d3d8_host_inline_mode(void)
     }
     return s_inline_mode;
 }
+static int s_fogtable_mode = -1;
+void d3d8_host_2d_set_fogtable(int on) { s_fogtable_mode = on ? 1 : 0; }
+int d3d8_host_fogtable_mode(void)
+{
+    if (s_fogtable_mode < 0) {
+        s_fogtable_mode = recomp_switch_on("RECOMP_D3D8_HOST_FOGTABLE");
+        if (s_fogtable_mode) fprintf(stderr, "[D3D8-HOST-2D] RECOMP_D3D8_HOST_FOGTABLE=1: pre-transformed draws under a fog"
+                                             " table take their coordinate as D3D's Z- or W-fog pass-through writes it (G75)\n");
+    }
+    return s_fogtable_mode;
+}
 static int s_lin32_mode = -1;
 void d3d8_host_2d_set_lin32(int on) { s_lin32_mode = on ? 1 : 0; }
 int d3d8_host_lin32_mode(void)
@@ -538,6 +549,7 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
 {
     D3D8H2DVertex *verts = d->verts;
     int cls = d3d8_host_2d_class(c);
+    int fog2d = 0;                     /* G75: 2D fog coordinate: 0 specular alpha, 1 v0.z, 2 1/v0.w */
     const uint8_t *vram = ram;
     size_t vram_size = ram_size;
     memset(d, 0, sizeof *d);
@@ -617,8 +629,16 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
         /* The 2D class runs D3D's pass-through program, which D3D picks by
          * FOGTABLEMODE (0x1903A0): only the vertex-fog one (NONE: the
          * coordinate is the specular alpha) is modelled here. */
-        if (cls == 1 && fo.gen_mode != 0) return "2D fog from a fog table";
-        if (cls == 1 && !((c->va_on >> 4) & 1u)) return "2D fog without a specular array";
+        if (cls == 1 && fo.gen_mode != 0) {
+            /* G75: A FOG TABLE. D3D loads one of two other pass-through
+             * programs (read from guest memory, 26 Sep 2026): Z fog,
+             * oFog = v0.z, when device +8 bit 1 is set, else W fog,
+             * oFog = 1/v0.w. The factor is then the table's own mode and
+             * parameters, as for any draw. RECOMP_D3D8_HOST_FOGTABLE. */
+            if (d3d8_host_fogtable_mode() <= 0) return "2D fog from a fog table";
+            if (!c->dev_flags_valid) return "2D fog from a fog table: device flags not read";
+            fog2d = (c->dev_flags & 2u) ? 1 : 2;
+        } else if (cls == 1 && !((c->va_on >> 4) & 1u)) return "2D fog without a specular array";
     }
     d->alpha_test = st(c, 0x300, 0); d->alpha_func = st(c, 0x33C, 0x207); d->alpha_ref = st(c, 0x340, 0);
     if (d->alpha_test && (d->alpha_func < 0x200u || d->alpha_func > 0x207u)) return "alpha func";
@@ -947,8 +967,10 @@ const char *d3d8_host_draw_build(const D3D8HostDrawCheck *c, const uint8_t *ram,
                 if ((c->va_on >> 3) & 1u) { if (!fetch(vram, vram_size, c->va_offset[3], c->va_format[3], i, v[j].d0)) return "diffuse format"; }
                 else { v[j].d0[0] = v[j].d0[1] = v[j].d0[2] = v[j].d0[3] = 1.0f; }
                 if ((c->va_on >> 4) & 1u) { if (!fetch(vram, vram_size, c->va_offset[4], c->va_format[4], i, v[j].d1)) return "specular format"; }
-                /* G53: D3D's vertex-fog pass-through: the coordinate is the specular alpha. */
-                if (d->fog_enable) v[j].f[0] = v[j].d1[3] < 0.0f ? 0.0f : v[j].d1[3] > 1.0f ? 1.0f : v[j].d1[3];
+                /* G53: D3D's vertex-fog pass-through: the coordinate is the specular alpha.
+                 * G75: its fog-table programs: v0.z, or 1/v0.w (an ILU RCP). */
+                if (d->fog_enable) v[j].f[0] = fog2d == 1 ? pos[2] : fog2d == 2 ? 1.0f / rhw
+                                             : v[j].d1[3] < 0.0f ? 0.0f : v[j].d1[3] > 1.0f ? 1.0f : v[j].d1[3];
                 for (unsigned u = 0; u < 4; ++u) {
                     v[j].t[u][3] = 1.0f;
                     if ((c->va_on >> (9u + u)) & 1u &&
