@@ -44,13 +44,12 @@ def _store(mnemonic, size):
 
 
 class FistHelperSelectionTest(unittest.TestCase):
-    def test_each_destination_width_gets_its_own_helper(self):
+    def test_each_destination_width_uses_the_guest_control_word(self):
         for mnemonic in ("fist", "fistp"):
-            for size, helper in ((2, "RECOMP_F2I16_ROUND"),
-                                 (4, "RECOMP_F2I_ROUND"),
-                                 (8, "RECOMP_F2I64_ROUND")):
+            for size in (2, 4, 8):
                 with self.subTest(mnemonic=mnemonic, size=size):
-                    self.assertIn(helper + "(fp_top())", _store(mnemonic, size))
+                    self.assertIn(f"recomp_fist(fp_top(), g_fp_control_word, {size * 8})",
+                                  _store(mnemonic, size))
 
     def test_no_llrint_and_no_bare_narrowing_cast_survives(self):
         # Both halves of the old emission, guarded directly.
@@ -93,48 +92,48 @@ int main(void) {
     const double inf_v = (double)INFINITY;
 
     /* 16-bit: the indefinite is 0x8000, not int32's 0x80000000 narrowed. */
-    if (RECOMP_F2I16_ROUND(nan_v)  != (int16_t)0x8000) return __LINE__;
-    if (RECOMP_F2I16_ROUND(inf_v)  != (int16_t)0x8000) return __LINE__;
-    if (RECOMP_F2I16_ROUND(-inf_v) != (int16_t)0x8000) return __LINE__;
-    if (RECOMP_F2I16_ROUND(40000.0)  != (int16_t)0x8000) return __LINE__;
-    if (RECOMP_F2I16_ROUND(-40000.0) != (int16_t)0x8000) return __LINE__;
-    if (RECOMP_F2I16_ROUND(32767.0) != 32767)  return __LINE__;
-    if (RECOMP_F2I16_ROUND(-32768.0) != -32768) return __LINE__;
+    if (recomp_fist(nan_v, 0x037Fu, 16)  != (int16_t)0x8000) return __LINE__;
+    if (recomp_fist(inf_v, 0x037Fu, 16)  != (int16_t)0x8000) return __LINE__;
+    if (recomp_fist(-inf_v, 0x037Fu, 16) != (int16_t)0x8000) return __LINE__;
+    if (recomp_fist(40000.0, 0x037Fu, 16)  != (int16_t)0x8000) return __LINE__;
+    if (recomp_fist(-40000.0, 0x037Fu, 16) != (int16_t)0x8000) return __LINE__;
+    if (recomp_fist(32767.0, 0x037Fu, 16) != 32767)  return __LINE__;
+    if (recomp_fist(-32768.0, 0x037Fu, 16) != -32768) return __LINE__;
     /* 32767.5 rounds to 32768, which the destination cannot hold. */
-    if (RECOMP_F2I16_ROUND(32767.5) != (int16_t)0x8000) return __LINE__;
-    if (RECOMP_F2I16_ROUND(-1.5) != -2) return __LINE__;  /* nearest-EVEN */
-    if (RECOMP_F2I16_ROUND(2.5)  !=  2) return __LINE__;
-    if (RECOMP_F2I16_ROUND(3.5)  !=  4) return __LINE__;
-    if (RECOMP_F2I16_ROUND(1234.0) != 1234) return __LINE__;
+    if (recomp_fist(32767.5, 0x037Fu, 16) != (int16_t)0x8000) return __LINE__;
+    if (recomp_fist(-1.5, 0x037Fu, 16) != -2) return __LINE__;  /* nearest-EVEN */
+    if (recomp_fist(2.5, 0x037Fu, 16)  !=  2) return __LINE__;
+    if (recomp_fist(3.5, 0x037Fu, 16)  !=  4) return __LINE__;
+    if (recomp_fist(1234.0, 0x037Fu, 16) != 1234) return __LINE__;
 
     /* 32-bit: the existing helper, exercised here for the first time. */
-    if (RECOMP_F2I_ROUND(nan_v)  != RECOMP_INT_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I_ROUND(inf_v)  != RECOMP_INT_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I_ROUND(-inf_v) != RECOMP_INT_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I_ROUND(3000000000.0)  != RECOMP_INT_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I_ROUND(-3000000000.0) != RECOMP_INT_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I_ROUND(2147483647.0) != 2147483647) return __LINE__;
-    if (RECOMP_F2I_ROUND(-2147483648.0) != (-2147483647 - 1)) return __LINE__;
-    if (RECOMP_F2I_ROUND(-1.5) != -2) return __LINE__;
-    if (RECOMP_F2I_ROUND(2.5)  !=  2) return __LINE__;
+    if (recomp_fist(nan_v, 0x037Fu, 32)  != RECOMP_INT_INDEFINITE) return __LINE__;
+    if (recomp_fist(inf_v, 0x037Fu, 32)  != RECOMP_INT_INDEFINITE) return __LINE__;
+    if (recomp_fist(-inf_v, 0x037Fu, 32) != RECOMP_INT_INDEFINITE) return __LINE__;
+    if (recomp_fist(3000000000.0, 0x037Fu, 32)  != RECOMP_INT_INDEFINITE) return __LINE__;
+    if (recomp_fist(-3000000000.0, 0x037Fu, 32) != RECOMP_INT_INDEFINITE) return __LINE__;
+    if (recomp_fist(2147483647.0, 0x037Fu, 32) != 2147483647) return __LINE__;
+    if (recomp_fist(-2147483648.0, 0x037Fu, 32) != (-2147483647 - 1)) return __LINE__;
+    if (recomp_fist(-1.5, 0x037Fu, 32) != -2) return __LINE__;
+    if (recomp_fist(2.5, 0x037Fu, 32)  !=  2) return __LINE__;
 
     /* 64-bit, where the bound is the interesting part: 2^63 is exact as a
        double and is the correct EXCLUSIVE upper bound, and 2^63 - 1024 is the
        largest double below it. A bound that rounded would admit 2^63 and then
        convert it, which is undefined behaviour. */
-    if (RECOMP_F2I64_ROUND(nan_v)  != RECOMP_INT64_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I64_ROUND(inf_v)  != RECOMP_INT64_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I64_ROUND(-inf_v) != RECOMP_INT64_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I64_ROUND(9223372036854775808.0) != RECOMP_INT64_INDEFINITE)
+    if (recomp_fist(nan_v, 0x037Fu, 64)  != RECOMP_INT64_INDEFINITE) return __LINE__;
+    if (recomp_fist(inf_v, 0x037Fu, 64)  != RECOMP_INT64_INDEFINITE) return __LINE__;
+    if (recomp_fist(-inf_v, 0x037Fu, 64) != RECOMP_INT64_INDEFINITE) return __LINE__;
+    if (recomp_fist(9223372036854775808.0, 0x037Fu, 64) != RECOMP_INT64_INDEFINITE)
         return __LINE__;
-    if (RECOMP_F2I64_ROUND(-9223372036854775808.0) != RECOMP_INT64_INDEFINITE)
+    if (recomp_fist(-9223372036854775808.0, 0x037Fu, 64) != RECOMP_INT64_INDEFINITE)
         return __LINE__;   /* -2^63 IS representable, and is also the sentinel */
-    if (RECOMP_F2I64_ROUND(9223372036854774784.0) != 9223372036854774784LL)
+    if (recomp_fist(9223372036854774784.0, 0x037Fu, 64) != 9223372036854774784LL)
         return __LINE__;
-    if (RECOMP_F2I64_ROUND(1e30) != RECOMP_INT64_INDEFINITE) return __LINE__;
-    if (RECOMP_F2I64_ROUND(-1.5) != -2) return __LINE__;
-    if (RECOMP_F2I64_ROUND(2.5)  !=  2) return __LINE__;
-    if (RECOMP_F2I64_ROUND(4294967296.0) != 4294967296LL) return __LINE__;
+    if (recomp_fist(1e30, 0x037Fu, 64) != RECOMP_INT64_INDEFINITE) return __LINE__;
+    if (recomp_fist(-1.5, 0x037Fu, 64) != -2) return __LINE__;
+    if (recomp_fist(2.5, 0x037Fu, 64)  !=  2) return __LINE__;
+    if (recomp_fist(4294967296.0, 0x037Fu, 64) != 4294967296LL) return __LINE__;
     return 0;
 }
 '''

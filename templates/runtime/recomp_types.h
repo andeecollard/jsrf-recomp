@@ -361,6 +361,40 @@ extern RECOMP_TLS int g_fp_cmp;
  * against everything, falls into the indefinite case rather than past it. */
 #define RECOMP_INT_INDEFINITE ((int32_t)0x80000000)
 
+/* x87 rounding to an integral value under the guest RC bits (control word
+ * bits 10-11: 0 nearest-even, 1 down, 2 up, 3 toward zero). FRNDINT rounds
+ * this way, and so does FIST before its store; neither may follow the HOST's
+ * rounding mode, which the guest's fldcw never reaches. MSVC's CRT floor() and
+ * ceil() are `fldcw RC=down/up` (via _ctrlfp) around _frnd, a bare frndint,
+ * so a frndint lifted as rint() made both of them round to nearest.
+ * NaN, the infinities and values already integral come back unchanged, and a
+ * zero result keeps the operand's sign, as FRNDINT's does. */
+static inline double recomp_frndint(double value, uint16_t control) {
+    double rounded;
+    if (!isfinite(value)) return value;
+    switch((control>>10)&3) {
+    case 1: rounded=floor(value); break;
+    case 2: rounded=ceil(value); break;
+    case 3: rounded=trunc(value); break;
+    default: {
+        double lo=floor(value), fraction=value-lo;
+        rounded=lo;
+        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
+        break;
+    }
+    }
+    return rounded == 0.0 ? copysign(0.0, value) : rounded;
+}
+/* x87 integer stores use the guest RC bits, independently of host rounding.
+ * Masked invalid conversions store the signed integer-indefinite value. */
+static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+    double rounded = recomp_frndint(value, control);
+    double limit=ldexp(1.0,(int)bits-1);
+    if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+        return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
+    return (int64_t)rounded;
+}
+
 static inline int32_t RECOMP_F2I_TRUNC(double v) {
     if (!(v >= -2147483648.0 && v < 2147483648.0)) return RECOMP_INT_INDEFINITE;
     return (int32_t)v;
@@ -1105,8 +1139,9 @@ static inline uint32_t recomp_add_eflags(uint32_t lhs, uint32_t rhs,
 
 /** Pop a 32-bit value from the simulated stack. */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pv = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pv; \
 } while(0)
 
 /* ================================================================

@@ -201,6 +201,16 @@ def _fmt_operand_read(op):
     return "/* unknown operand */"
 
 
+_WORD_REGS = frozenset(("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"))
+
+
+def _is_word_operand(op):
+    """A 16-bit push/pop operand: a word register or a word memory slot."""
+    if op.type == "reg":
+        return op.reg in _WORD_REGS
+    return op.type == "mem" and op.mem_size == 2
+
+
 def _fmt_operand_write(op, value_expr):
     """Format writing to any operand type. Returns a C statement."""
     if op.type == "reg":
@@ -1720,7 +1730,10 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp too: without them `movsx eax, bp` read LO16(ebp)
+            # zero-extended, so a negative 16-bit value read as a large
+            # positive one.
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
@@ -1871,11 +1884,21 @@ class Lifter:
         if len(ops) < 1:
             return ["/* push: no operand */"]
         val = _fmt_operand_read(ops[0])
+        if _is_word_operand(ops[0]):
+            # A 66-prefixed push moves esp by 2, not 4.
+            return [f"{{ uint16_t _tmp = (uint16_t)({val}); "
+                    f"esp -= 2; MEM16(esp) = _tmp; }}"]
         return [f"PUSH32(esp, {val});"]
 
     def _lift_pop(self, insn, ops):
         if len(ops) < 1:
             return ["/* pop: no operand */"]
+        if _is_word_operand(ops[0]):
+            # `pop cx` used to emit POP32(esp, cx), which names no C variable.
+            # esp moves first: x86 computes a pop's memory destination after
+            # the increment.
+            return [f"{{ uint16_t _tmp = MEM16(esp); esp += 2; "
+                    f"{_fmt_operand_write(ops[0], '_tmp')} }}"]
         if ops[0].type == "reg":
             r = ops[0].reg
             # Segment register pop → discard from stack
@@ -3349,30 +3372,12 @@ class Lifter:
                 function = getattr(op, "function_address", self.func_start)
                 addr = _fmt_store_address(op)
                 pop = " fp_pop();" if m == "fistp" else ""
-                # The same float -> int rule the SSE path already uses, which
-                # this one was simply missed by. `(int_type)llrint(x)` is wrong
-                # twice over: llrint saturates on AArch64 where x86 stores the
-                # integer indefinite (NaN reads back as 0, not 0x80000000), and
-                # narrowing its long long result is undefined behaviour for
-                # exactly the out-of-range values the sentinel is about.
-                # FIST/FISTP rounds -- under the x87 control word rather than
-                # MXCSR, but with the same nearest-even default -- so it is the
-                # ROUND helper at the destination's own width, never TRUNC.
-                #
-                # Not a corner of the title: sub_0017C3E8 is MSVC's _ftol2 --
-                # 432 call sites across 129 functions in JSRF, i.e. it is *the*
-                # (int)float conversion for the whole image -- and its
-                # `fistp qword ptr [esp+0x10]` lands here. That routine does
-                # NOT reprogram the control word: it converts nearest-even,
-                # reloads with fild, and corrects toward zero with the residue
-                # (fsubp / add 0x7FFFFFFF / adc-sbb), all of which is ordinary
-                # arithmetic we already lift. So nearest-even is the right mode
-                # to hand it, and the truncation falls out of the guest's code.
-                helper = {16: "RECOMP_F2I16_ROUND",
-                          64: "RECOMP_F2I64_ROUND"}.get(bits, "RECOMP_F2I_ROUND")
+                # FIST/FISTP round under the guest x87 control word and
+                # return integer-indefinite at the destination's own width.
+                # Retain the monitored-store PC/function metadata.
                 return [f"RECOMP_MEM_WRITE{bits}(0x{pc:08X}u, "
                         f"0x{function:08X}u, {addr}, "
-                        f"{helper}(fp_top()));{pop} /* {m} */"]
+                        f"recomp_fist(fp_top(), g_fp_control_word, {bits}));{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
@@ -3497,7 +3502,14 @@ class Lifter:
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":
-            return [f"fp_top() = rint(fp_top()); /* frndint */"]
+            # Rounds under the guest's x87 RC bits, like FIST. rint() used the
+            # host's rounding mode, which the guest's fldcw never reaches, so
+            # MSVC's floor() and ceil() -- fldcw RC=down/up around a frndint --
+            # both rounded to nearest: floor(2.7) returned 3. Code that indexes
+            # a table with floor() then reads one entry past it (in one title,
+            # a skeletal animation drew a frame of garbage bones per loop).
+            return [f"fp_top() = recomp_frndint(fp_top(), g_fp_control_word);"
+                    f" /* frndint */"]
         if m == "fldpi":
             return [f"fp_push(3.14159265358979323846); /* fldpi */"]
         if m == "fldl2e":
