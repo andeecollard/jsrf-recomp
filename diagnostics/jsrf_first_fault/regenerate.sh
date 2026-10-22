@@ -14,16 +14,18 @@ PYTHON="${PYTHON:-python3}"
 RECOMP_SEED_INTERIOR="${RECOMP_SEED_INTERIOR:-1}"
 export RECOMP_SEED_INTERIOR
 
-XBE="../Jet Set Radio Future (US)/default.xbe"
-OUT=build-macos/jsrf-first-fault
+XBE="${XBE:-../Jet Set Radio Future (US)/default.xbe}"
+OUT="${OUT:-build-macos/jsrf-first-fault}"
 ACCUM="$OUT/vtable_seeds_accum.json"
+mkdir -p "$OUT"
+"$PYTHON" -m tools.xbe_parser "$XBE" --json "$OUT/jsrf_analysis.json"
 
 # Indirect-call targets observed at runtime. icall_feedback.py maintains this
 # cumulatively; without it discovery sees only the 22 hand-curated entries in
 # icall_seed.json, and a target the title actually calls -- but that static
 # analysis cannot see -- is never translated. The call then fails to resolve at
 # runtime and the caller proceeds on uninitialised registers.
-ICALL_DB="tools/recomp/output/icall_targets.json"
+ICALL_DB="${ICALL_DB:-tools/recomp/output/icall_targets.json}"
 
 # Close the loop here, rather than leaving it to whoever remembers. The feedback
 # loop has four steps -- run, merge, seed, regenerate -- and the runtime already
@@ -176,7 +178,7 @@ fi
 "$PYTHON" -m tools.recomp \
     "$XBE" \
     --all \
-    --split 1000 \
+    --split 250 \
     --disasm-dir "$OUT/disasm" \
     --func-id-dir "$OUT/func-id" \
     --gen-dir "$OUT/gen" \
@@ -194,7 +196,7 @@ cp templates/runtime/recomp_types.h "$OUT/gen/recomp_types.h"
 # so the caller restores callee-saved registers from the wrong stack slots.
 # Skipping this leaves ~200 such stubs and the title faults during stage load.
 "$PYTHON" diagnostics/jsrf_first_fault/recover_midfunction_entries.py \
-    --output "$OUT"
+    --output "$OUT" --xbe "$XBE"
 
 # ── Generation manifest ───────────────────────────────────────────────────
 #
