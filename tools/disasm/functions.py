@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import config
 from .engine import DisasmEngine, Instruction
-from .loader import BinaryImage, SectionInfo
+from .loader import DATA_SECTION_NAMES, MAX_INSN_LEN, BinaryImage, SectionInfo
 from .xrefs import XRefTracker, XRefType
 from .labels import LabelManager, Label, LabelType
 
@@ -70,8 +70,11 @@ class FunctionDetector:
     """
 
     def __init__(self, engine: DisasmEngine, image: BinaryImage,
-                 xrefs: XRefTracker, labels: LabelManager):
+                 xrefs: XRefTracker, labels: LabelManager,
+                 skip_library_immediates: bool = False):
         self.engine = engine
+        # Off by default. See _pass_imm_ref_targets.
+        self.skip_library_immediates = skip_library_immediates
         self.image = image
         self.xrefs = xrefs
         self.labels = labels
@@ -89,6 +92,7 @@ class FunctionDetector:
         # [(start, end)] extents no pass may split. Populated from
         # --function-bounds; see _pass_demote_interior_seeds.
         self._forced_bounds: List[Tuple[int, int]] = []
+        self._callback_code: Set[int] = set()
 
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
@@ -146,20 +150,21 @@ class FunctionDetector:
         # Needs the bodies from pass 5 to tell a tail jump from an ordinary
         # intra-function branch, so it runs after and rebuilds. Iterate: a newly
         # found function can itself tail-jump somewhere new.
-        for _round in range(8):
-            before = len(self._candidates)
-            if not self._pass_tail_jump_targets(sections):
-                break
-            print(f"  tail-jump pass {_round}: "
-                  f"+{len(self._candidates) - before} standalone, "
-                  f"{len(self._alias_entries)} aliases")
-            self.functions.clear()
-            self._build_functions(sections)
+        self._close_tail_jump_targets(sections)
+
+        # Establish table callback ownership before weak immediates can split
+        # a long body at a constant that happens to name an instruction suffix.
+        self._pass_data_ptr_targets(sections)
 
         # Function addresses taken as an immediate. Runs once, after the
         # bodies exist: the test is whether the target lands in a gap, which
         # needs the gaps to be known. One rebuild picks up what it finds.
         if self._pass_imm_ref_targets(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
+        # A function that begins immediately after an embedded switch table.
+        if self._pass_jump_table_followers(sections):
             self.functions.clear()
             self._build_functions(sections)
 
@@ -203,12 +208,258 @@ class FunctionDetector:
             self._build_functions(sections)
         self._pass_seed_aliases()
 
+        # Late discoveries can introduce new tail chains, including jumps
+        # from table/seed aliases that were absent from the earlier bodies.
+        self._close_tail_jump_targets(sections)
+
+        # Branches out of alias bodies into unclaimed bytes. Runs last, once
+        # every alias is known, because those bodies exist only from here on.
+        self._pass_alias_branch_orphans()
+
         self._build_alias_entries()
 
         # Populate call graph
         self._build_call_graph()
 
         return len(self.functions)
+
+    def _close_tail_jump_targets(self, sections: List[SectionInfo]) -> None:
+        """Follow tail jumps from every entry until no new entry is found."""
+        while True:
+            self._build_alias_entries()
+            before = len(self._candidates)
+            if not self._pass_tail_jump_targets(sections):
+                return
+            # A realigned tail can hold direct calls the first pass never saw.
+            self._pass_call_targets(sections)
+            print(f"  tail-jump pass: "
+                  f"+{len(self._candidates) - before} standalone, "
+                  f"{len(self._alias_entries)} aliases")
+            self.functions.clear()
+            self._build_functions(sections)
+
+    # MSVC's alignment fillers: int3, nop, `mov edi, edi`, and `lea r, [r]`
+    # in its 3-, 4-, 6- and 7-byte encodings.
+    _PADDING = (bytes.fromhex("8da42400000000"), bytes.fromhex("8d9b00000000"),
+                bytes.fromhex("8d642400"), bytes.fromhex("8d4900"),
+                bytes.fromhex("8bff"), b"\xcc", b"\x90")
+
+    def _skip_padding(self, addr: int, limit: int = 16) -> int:
+        """First address at or after `addr` that is not alignment padding.
+
+        Reads bytes rather than decoded instructions: after a table the
+        sweep's decode is often out of phase, and an instruction that starts
+        inside the table can swallow the padding."""
+        data = self.image.read_bytes_at_va(addr, limit + 7) or b""
+        off = 0
+        while off < limit:
+            for pad in self._PADDING:
+                # `mov edi, edi` is also the first instruction of a hot-patch
+                # function. As table padding it fills exactly two bytes up to
+                # a dword boundary, so it only sits 2 bytes past one. A
+                # function start is aligned, so the two never coincide.
+                if pad == b"\x8b\xff" and (addr + off) % 4 != 2:
+                    continue
+                if data.startswith(pad, off):
+                    off += len(pad)
+                    break
+            else:
+                break
+        return addr + off
+
+    # Frame setups that end an index-table walk early: `push ebp; mov ebp,
+    # esp`, with or without the hot-patch pad in front.
+    _FRAME_STARTS = (bytes.fromhex("558bec"), bytes.fromhex("8bff558bec"))
+
+    def _index_table_end(self, addr: int, arms: int) -> Optional[int]:
+        """End of the byte index table at `addr` feeding `arms` dword entries,
+        or None when it cannot be sized safely.
+
+        The bound check in front of the load gives the length exactly; see
+        engine.index_table_length. Without it, the entries are known only to
+        be below `arms`, and the first byte that is not marks the end. That is
+        safe only when no opcode that starts a function is below `arms`. For a
+        switch of 16 arms or fewer it is: such bytes are `add` and `or`. For a
+        larger one a walk can run into the next function. A 96-arm switch
+        walks over `push ebp` (0x55) and starts the function one byte late,
+        without its frame. So a large walk also stops at a frame setup or a
+        known start, and otherwise is trusted only when padding or another
+        dword table follows it.
+        """
+        data = self.image.read_bytes_at_va(addr, 1024) or b""
+        length = self.engine.index_table_length(addr)
+        if length is not None:
+            if length == 0 or length > len(data):
+                return None
+            if any(b >= arms for b in data[:length]):
+                return None                 # not the table the bound guards
+            return addr + length
+        off = 0
+        stopped = False
+        while off < len(data) and data[off] < arms:
+            if arms > 0x0F and off and (
+                    any(data.startswith(f, off) for f in self._FRAME_STARTS)
+                    or addr + off in self._candidates):
+                stopped = True
+                break
+            off += 1
+        if off == 0:
+            return None
+        end = addr + off
+        if arms <= 0x0F or stopped:
+            return end
+        if self._skip_padding(end) != end:
+            return end
+        if end % 4 == 0 and (end in self.engine.jump_tables
+                             or self.engine.is_jump_table_ref(end)):
+            return end
+        return None
+
+    def _past_switch_data(self, addr: int, arms: int) -> Optional[int]:
+        """Skip the padding and switch tables that follow a measured table.
+
+        The tables of several switches in one function sit together after
+        its last ret. Each dword table may have a byte index table after it,
+        and padding goes between them. Some dword tables have fewer than 3
+        entries, so resync_jump_tables did not measure them, but a
+        `jmp [reg*4 + disp]` still names them. Returns the first address past
+        all of that, or None when the bytes cannot be sized.
+        """
+        for _ in range(16):
+            addr = self._skip_padding(addr)
+            if addr in self.engine.jump_tables:
+                end = self.engine.jump_tables[addr]
+                arms = (end - addr) // 4
+                addr = end
+                continue
+            if self.engine.is_jump_table_ref(addr):
+                section = self.image.get_section_at_va(addr)
+                if section is None:
+                    return None
+                lo = section.virtual_addr
+                hi = lo + section.virtual_size
+                arms = 0
+                while arms < 512:
+                    value = self.image.read_u32_at_va(addr + arms * 4)
+                    if value is None or not (lo <= value < hi):
+                        break
+                    arms += 1
+                if arms == 0:
+                    return None
+                addr += arms * 4
+                continue
+            data = self.image.read_bytes_at_va(addr, 2) or b""
+            # An index table: one a load names, or two bytes below `arms`
+            # when nothing does. Those are a table even when no instruction
+            # names them: a switch whose lowest case is not 0 folds
+            # the bias into the displacement, so the reference points a few
+            # bytes before the table instead of at it.
+            #
+            # Only for a small switch, though: a byte below `arms` has to be
+            # implausible as the start of a function, and 0x0F and 0x33
+            # (`movzx`, `xor eax, eax`) are not.
+            if addr in self.engine.byte_tables or (
+                    arms <= 0x0F and len(data) >= 2
+                    and data[0] < arms and data[1] < arms):
+                end = self._index_table_end(addr, arms)
+                if end is None:
+                    return None
+                addr = end
+                continue
+            return addr
+        return None
+
+    def _tail_calls_known_function(self, addr: int) -> bool:
+        """Does the straight-line body at `addr` end in a direct jmp to the
+        exact start of a function already built?"""
+        target = self.engine.probe_tail_call(addr)
+        return (target is not None and target != addr
+                and target in self.functions)
+
+    def _pass_jump_table_followers(self, sections: List[SectionInfo]) -> bool:
+        """A function that starts right after an embedded switch table.
+
+        MSVC parks a function's jump table after its last ret, aligned with
+        int3 or `mov edi, edi`, and the linker packs the next function straight
+        after the table. Nothing marks that start. _pass_cc_boundaries wants
+        a ret or jmp in front of an int3 run, and finds a table instead;
+        _pass_gap_prologues looks only after a ret. A function whose address
+        is only ever stored into a callback slot is reached by no call or jmp
+        either. A frameless callback packed after a four-entry table is that
+        shape, and it needed a hand seed before this pass.
+
+        The address is the first byte past the table and anything packed
+        after it: padding, further dword tables, and byte index tables. It
+        becomes a start when it is in a gap, is not a switch arm, and decodes
+        to a terminator, the same test a realigned call target gets. The gap
+        is the important test. A table in the middle of a function is followed
+        by more of that function, and that function's body already covers the
+        address. The data is the main risk: index tables decode as `add` and
+        reach a `retf` soon enough. They are stepped over or refused, never
+        probed.
+
+        On one title this finds 37 starts. 35 were reachable before only as
+        aliases inside a false function that _pass_gap_prologues had started
+        on the `mov edi, edi` in front of a table.
+
+        Returns whether anything was added, so the caller can rebuild.
+        """
+        if not self.engine.jump_tables:
+            return False
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        # A switch arm is code of the function that dispatches to it, and
+        # MSVC's memcpy keeps arms straight after a table. A start there
+        # clamps the function it belongs to, so arms are never followers.
+        arms = set()
+        for tbl in self.engine.jump_tables:
+            arms.update(self.engine.jump_table_entries(tbl))
+
+        found = 0
+        for tbl, end in sorted(self.engine.jump_tables.items()):
+            addr = self._past_switch_data(end, (end - tbl) // 4)
+            if addr is None or addr in arms:
+                continue
+            # Opcodes 0x00-0x0E are `add`, `or` and segment pushes. No function
+            # starts with one, but every index table does, because its bytes
+            # are small arm numbers. This catches the ones the walk above could
+            # not size.
+            first = self.image.read_bytes_at_va(addr, 1)
+            if not first or first[0] < 0x0F:
+                continue
+            if addr in self._candidates or addr in self.functions:
+                continue
+            if not any(lo <= addr < hi for lo, hi in code_ranges):
+                continue
+            if not in_a_gap(addr):
+                continue
+            # The sweep may have decoded the tables as code and run across
+            # this address. A decode that starts inside the tables says
+            # nothing. One that starts before them does, as it does for an
+            # immediate.
+            covering = self.engine.instruction_covering(addr)
+            if (covering is not None and covering.address < tbl
+                    and not self.engine.probes_as_prologue(addr)):
+                continue
+            if not self.engine.probes_as_function_body(addr):
+                continue
+            if addr not in self.engine.instructions \
+                    and not self.engine.decode_at(addr):
+                continue
+            self._add_candidate(addr, config.CONFIDENCE_CC_BOUNDARY,
+                                "jump_table_follower")
+            found += 1
+
+        if found:
+            print(f"  {found} function(s) found right after a switch table")
+        return found > 0
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
@@ -236,21 +487,27 @@ class FunctionDetector:
         than made, so eax kept a stale value that the caller then used as a
         string pointer.
         """
-        # Alias entries count as covered. They are recorded by the tail-jump
-        # and data-table passes above but only become Functions in
-        # _build_alias_entries, which runs last -- so a body reached solely
-        # through an alias is claimed territory that self.functions does not
-        # yet describe, and testing self.functions alone calls it a gap.
-        #
-        # JSRF's 0x00154D70 is one: a switch dispatcher whose cases end in
-        # "ret 12" and are followed immediately by the next case, reached only
-        # by a tail jump. Splitting it at the case boundary 0x00154D82 left
-        # 0x00154DAA -- another case of the same switch -- covered by nothing,
-        # so it was emitted as an unresolved stub that popped 4 bytes where the
-        # real block returns 12, and the guest faulted a long way downstream.
-        bounds = sorted(
-            [(f.start, f.end) for f in self.functions.values()]
-            + list(self._alias_entries.items()))
+        # Past nop padding first, then straight after a ret, with the bodies
+        # rebuilt in between. _pass_cc_boundaries knows only int3, and Panzer
+        # Dragoon Orta pads with nop, so its vtable-only COM forwarders sat in
+        # gaps unfound. Found in one sweep with the ret case, a forwarder's own
+        # `mov eax, 0x80070057; ret 0xc` error return still looked like a gap
+        # and was split off as a constant stub, orphaning the branch past it:
+        # that became an unresolved stub, and the forwarder's caller lost 12
+        # bytes of stack.
+        added = self._gap_prologue_sweep(past_padding_only=True)
+        if added:
+            self.functions.clear()
+            self._build_functions(sections)
+        if self._gap_prologue_sweep(past_padding_only=False):
+            added = True
+        if added:
+            print("  functions recovered that follow a ret with no padding")
+        return added
+
+    def _gap_prologue_sweep(self, past_padding_only: bool) -> bool:
+        bounds = sorted([(f.start, f.end) for f in self.functions.values()]
+                        + list(self._alias_entries.items()))
         starts = [b[0] for b in bounds]
 
         # Ranges can overlap: an alias body runs to the end of the function it
@@ -272,6 +529,13 @@ class FunctionDetector:
             if not insn.is_ret:
                 continue
             nxt = insn.end_address
+            # A start past padding is aligned.
+            past_padding = False
+            if past_padding_only:
+                padded = self._skip_padding(nxt)
+                if padded == nxt or padded % 16:
+                    continue
+                nxt, past_padding = padded, True
             if nxt in self._candidates or nxt in self.functions:
                 continue
             section = self.image.get_section_at_va(nxt)
@@ -279,6 +543,9 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
+            first = self.engine.get_instruction(nxt)
+            if first and first.end_address in self.engine.jump_tables:
+                continue                    # alignment before a table, not a prologue
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,
@@ -293,14 +560,12 @@ class FunctionDetector:
             # return path, and splitting one of those would cut a function in
             # half -- but those are covered, so they are not in a gap.
             if not (self.engine.probes_as_prologue(nxt)
-                    or self.engine.probes_as_constant_stub(nxt)):
+                    or self.engine.probes_as_constant_stub(nxt)
+                    or (past_padding and self._closed_body_in_gap(nxt, starts))):
                 continue
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")
             added = True
-
-        if added:
-            print("  functions recovered that follow a ret with no padding")
         return added
 
     # Reference classes for an interior seed, worst-evidence-last. The first
@@ -582,6 +847,14 @@ class FunctionDetector:
                 print(f"    kept by class: {dict(keep_kinds)} -- these need a "
                       f"secondary-entry representation, not a carve")
         return bool(self.dropped_seeds)
+    def _closed_body_in_gap(self, addr: int, starts) -> bool:
+        """ret, padding, then a closed CFG: the evidence _pass_cc_boundaries
+        takes after int3. A forwarder ending `jmp [ecx+0x18]` has no prologue."""
+        i = bisect.bisect_right(starts, addr)
+        section = self.image.get_section_at_va(addr)
+        upper = starts[i] if i < len(starts) else (section.virtual_addr + section.virtual_size)
+        return self.engine.probes_as_callback_body(
+            addr, upper, tail_targets=self._candidates, allow_indirect_tails=True)
 
     def _pass_seed_aliases(self) -> None:
         """
@@ -727,7 +1000,12 @@ class FunctionDetector:
 
                     if found_ret:
                         next_addr = va_start + i
-                        if next_addr in self.engine.instructions:
+                        if (next_addr in self.engine.instructions
+                                and (self.engine.probes_as_prologue(next_addr)
+                                     or self.engine.probes_as_callback_body(
+                                         next_addr, va_start + len(data),
+                                         tail_targets=self._candidates,
+                                         allow_indirect_tails=True))):
                             self._add_candidate(
                                 next_addr,
                                 config.CONFIDENCE_CC_BOUNDARY,
@@ -749,10 +1027,23 @@ class FunctionDetector:
 
         call_targets = self.engine.get_call_targets()
         realigned = unaligned = 0
+        swept = {sec.name for sec in sections}
+        unswept: Dict[str, List[int]] = {}
         for target in call_targets:
             section = self.image.get_section_at_va(target)
             if not (section and section.executable):
                 continue
+            # A call into a code section the sweep skipped (an XDK library
+            # under --text-only without --extra-sections) still becomes a
+            # function below, but only down to decode_at's first terminator,
+            # and the calls inside it are never collected: every callee is a
+            # stub that returns without running. Spartan's XGAssembleShader
+            # was one, and its caller crashed on the out-buffer it never
+            # wrote. Nothing else reports the gap, so count it.
+            # Mirrors loader.get_code_sections(); keep the two in step.
+            if (section.name not in swept and section.raw_size > 0
+                    and section.name not in DATA_SECTION_NAMES):
+                unswept.setdefault(section.name, []).append(target)
             # A direct call to an executable address is the strongest evidence
             # of a function start there is -- stronger than a prologue match,
             # which is a guess about bytes. It used to be discarded whenever the
@@ -791,6 +1082,10 @@ class FunctionDetector:
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
                   f" ({unaligned} rejected: bytes do not decode as a function)")
+        for name, targets in sorted(unswept.items()):
+            print(f"  Warning: {len(targets)} call target(s) into unswept code"
+                  f" section {name} (e.g. 0x{min(targets):08X}); their callees"
+                  f" will be stubs. Add it with --extra-sections {name}.")
 
     def _pass_indirect_call_slots(self) -> None:
         """
@@ -841,6 +1136,111 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
+    def _is_byte_table(self, addr: int) -> bool:
+        """Is the word at `addr` a byte index table, not code?
+
+        MSVC's two-level switch maps a sparse case value to a dense arm
+        number through a byte table, `movzx eax, byte ptr [eax + table]`,
+        parked right after the dword table. Its bytes are small arm numbers,
+        and they decode: `00 02 02 00` is `add [edx], al ; add al, [edx] ;
+        ...`, a run of adds that can wander into a proven exit. Two signs
+        say data. A movzx names the address as a byte table, which the
+        sweep recorded. And the first byte is below 0x0F: `add`, `or` and
+        the segment pushes, which no function starts with (the rule
+        _pass_jump_table_followers uses).
+
+        The word that names such a table is the movzx's own displacement,
+        scanned as a table word while the function holding it is still an
+        unclaimed gap. Jet Set Radio Future had eleven of these accepted as
+        entries once indirect tails could close a body, and v0.15.0 itself
+        accepts eight.
+        """
+        if addr in self.engine.byte_tables:
+            return True
+        first = self.image.read_bytes_at_va(addr, 1)
+        return bool(first) and first[0] < 0x0F
+
+    def _probes_as_escaping_body(self, target, starts, bounds, sections,
+                                 tails, depth: int = 8) -> bool:
+        """A table word's body that closes only through code outside its gap.
+
+        A virtual method compiled as `test eax, eax; je done; ...; jmp [eax+N]`
+        (a guarded vcall tail) or `mov eax, [ecx+N]; jmp [eax*4+table]` (a
+        dispatcher whose arms are other methods) never reaches a ret inside
+        its own gap, and a method whose error path is a direct `jmp` to a
+        helper nobody has found yet leaves the gap by a branch. Jet Set Radio
+        Future's vtables name 103 such methods, every one 16-byte aligned
+        behind padding; three of them stopped its attract demo. They are
+        proven as a closed CFG whose exits are indirect tails through memory,
+        proven entries, or direct destinations that are themselves proven
+        the same way, in their own gaps, to a bounded depth. A destination
+        inside a known body is not this shape and refuses.
+        """
+        proven = set()
+        pending = [target]
+        while pending:
+            entry = pending.pop()
+            if entry in proven or entry in tails:
+                continue
+            if depth <= 0:
+                return False
+            depth -= 1
+            section = next((sec for sec in sections if sec.virtual_addr <= entry
+                            < sec.virtual_addr + sec.virtual_size), None)
+            if section is None or entry not in self.engine.instructions:
+                return False
+            if self._is_byte_table(entry):
+                return False
+            j = bisect.bisect_right(starts, entry) - 1
+            if j >= 0 and bounds[j][0] < entry < bounds[j][1]:
+                return False        # inside a body: not this shape
+            upper = section.virtual_addr + section.virtual_size
+            i = bisect.bisect_right(starts, entry)
+            if i < len(starts):
+                upper = min(upper, starts[i])
+            lower = bounds[j][1] if j >= 0 else section.virtual_addr
+            escapes = set()
+            if not self.engine.probes_as_callback_body(
+                    entry, upper, lower, tail_targets=tails | proven,
+                    allow_indirect_tails="mem", escapes=escapes):
+                return False
+            proven.add(entry)
+            pending.extend(escapes - proven)
+        return target in proven
+
+    def _probes_as_tail_body(self, target, starts, sections, *, entry_frame=False) -> bool:
+        """Prove a callback's direct tail dependencies in their bounded gaps."""
+        proven = set(self.functions) | self._alias_entries.keys()
+        pending = [target]
+        visiting = set()
+        while pending:
+            entry = pending[-1]
+            if entry in proven:
+                pending.pop()
+                continue
+            section = next((sec for sec in sections if sec.virtual_addr <= entry
+                            < sec.virtual_addr + sec.virtual_size), None)
+            if section is None:
+                return False
+            upper = section.virtual_addr + section.virtual_size
+            index = bisect.bisect_right(starts, entry)
+            if index < len(starts):
+                upper = min(upper, starts[index])
+            if self.engine.probes_as_callback_body(
+                    entry, upper, tail_targets=proven,
+                    require_entry_frame=entry_frame and entry == target):
+                proven.add(entry)
+                pending.pop()
+                continue
+            if entry in visiting:
+                return False
+            visiting.add(entry)
+            tail = self.engine.block_tail_jump(entry, max_insns=upper - entry)
+            if tail is None or tail in visiting or tail in proven:
+                return False
+            pending.append(tail)
+        return target in proven
+
     def _pass_imm_ref_targets(self, sections: List[SectionInfo]) -> bool:
         """
         An immediate that points into unclaimed executable bytes and decodes as
@@ -873,6 +1273,9 @@ class FunctionDetector:
         """
         bounds = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bounds]
+        claimed = set(self._callback_code)
+        for entry, end in self._alias_entries.items():
+            claimed.update(self.engine.recursive_descent([entry], [(entry, end)]))
 
         def inside_a_function(addr: int) -> bool:
             i = bisect.bisect_right(starts, addr) - 1
@@ -893,40 +1296,87 @@ class FunctionDetector:
         def in_code_section(addr: int) -> bool:
             return any(lo <= addr < hi for lo, hi in code_ranges)
 
+        # Optional (skip_library_immediates): an immediate that sits in a
+        # library section (D3D, DSOUND, XPP...) never names a function of the
+        # title's own .text. The XDK's D3D code is full of NV2A register
+        # constants that happen to equal .text addresses. Each one becomes a
+        # function start and cuts the real function it lands in (NFSU1: two D3D
+        # immediates start a function at 0x100A20 inside sub_001009C0, a
+        # jump-table switch, and the alias passes then add two more starts).
+        # Library to library references stay, as DSOUND storing a DOLBY
+        # function pointer.
+        def section_name(addr: int) -> str:
+            for sec in sections:
+                if sec.virtual_addr <= addr < sec.virtual_addr + sec.virtual_size:
+                    return sec.name
+            return ""
+
         targets = set()
         for insn in self.engine.instructions.values():
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
-            if inside_a_function(target) or not in_code_section(target):
+            if (target in claimed or target in self._alias_entries
+                    or inside_a_function(target) or not in_code_section(target)):
+                continue
+            if (self.skip_library_immediates
+                    and section_name(target) == ".text"
+                    and section_name(insn.address) != ".text"):
                 continue
             targets.add(target)
 
         found = 0
         for target in sorted(targets):
-            # Apply the same realignment guard as explicit seeds. A numeric
-            # immediate can point into a decoded instruction: JSRF's
-            # 0x1600CA is the C9 byte of `test ecx, ecx`, which also decodes as
-            # `leave`. Promoting it split QueryInterface and lost its stack
-            # cleanup. Only a recognisable prologue can override the sweep.
-            if (self.engine.instruction_covering(target) is not None
-                    and not self.engine.probes_as_prologue(target)):
+            if target in claimed:
                 continue
-            # A ret, not merely a terminator: an immediate is weak evidence,
-            # so the probe has to reject data that happens to disassemble. The
-            # cap also keeps a wrong guess from walking the rest of the section.
+            # An immediate alone cannot justify splitting an instruction the
+            # sweep already decoded. It may be an integer constant that happens
+            # to fall in an as-yet unclaimed code gap. Keep the same prologue
+            # exceptions for recognized entry shapes to recover a drifted sweep.
+            if (self.engine.instruction_covering(target) is not None
+                    and not (self.engine.probes_as_prologue(target)
+                             or self.engine.probes_as_constant_stub(target)
+                             or self.engine.probes_as_vcall_thunk(target))):
+                continue
+            # Weak references must close their CFG within the unclaimed gap.
             # ...or a virtual-call thunk, which never reaches a ret: it
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
-            if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+            #
+            # ...or a body that ends by tail-jumping to the exact start of a
+            # known function when its first instruction is not the jmp:
+            # every C++ EH handler thunk, `mov eax, <FuncInfo>; jmp
+            # __CxxFrameHandler`, whose address the function's SEH prologue
+            # pushes as an immediate. A stray jmp decoded out of data almost
+            # never lands precisely on a function start, so the destination is
+            # the corroboration the missing ret would have been. One title lost
+            # three such thunks this way.
+            # An address-taken direct thunk is also callable when its
+            # destination supplies the return; tail closure finds that body.
+            section = self.image.get_section_at_va(target)
+            i = bisect.bisect_right(starts, target)
+            upper = section.virtual_addr + section.virtual_size
+            if i < len(starts):
+                upper = min(upper, starts[i])
+            if not (self.engine.probes_as_callback_body(target, upper)
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or (self.engine.get_instruction(target) is not None
+                        and self.engine.get_instruction(target).is_jump
+                        and self._probes_as_tail_body(target, starts, sections))
+                    or self._tail_calls_known_function(target)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
                     continue
             self._add_candidate(target, config.CONFIDENCE_IMM_REF,
                                 "imm_ref_target")
+            # Later immediates in this same pass must not split this body,
+            # including at operand bytes that also decode as a prologue.
+            for address in self.engine.recursive_descent(
+                    [target], [(target, upper)]):
+                insn = self.engine.get_instruction(address)
+                claimed.update(range(address, insn.end_address))
             found += 1
 
         if found:
@@ -1030,15 +1480,24 @@ class FunctionDetector:
         """
         bodies = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bodies]
+        # Measured ranges can include padding and inline data. Only follow
+        # branches reachable from an entry or a decoded switch-table arm.
+        entries = list(self.functions)
+        for table in self.engine.jump_tables:
+            entries.extend(self.engine.jump_table_entries(table))
+        reachable = self.engine.recursive_descent(entries, [
+            (sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+            for sec in sections])
         added = False
 
-        for insn in self.engine.instructions.values():
+        for insn in list(self.engine.instructions.values()):
+            if insn.address not in reachable:
+                continue
             if not insn.is_jump or insn.is_cond_jump:
                 continue
             target = insn.jump_target
-            if target is None or target in self._candidates:
-                continue
-            if target not in self.engine.instructions:
+            if (target is None or target in self._candidates
+                    or target in self._alias_entries):
                 continue
 
             # The jump is a tail jump only if it leaves its own function.
@@ -1063,16 +1522,26 @@ class FunctionDetector:
             # an alias entry instead: same end address, translated separately.
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] < target < bodies[j][1]:
+                if target not in self.engine.instructions:
+                    continue
                 if target not in self._alias_entries:
                     self._alias_entries[target] = bodies[j][1]
                     added = True
                 continue
 
+            # A reachable tail is strong evidence, but only unclaimed bytes
+            # may replace a drifted sweep. Never realign inside another body.
+            if target not in self.engine.instructions:
+                if not self.engine.probes_as_function_body(target):
+                    continue
+                if not self.engine.decode_at(target, replace_overlaps=True):
+                    continue
+
             self._add_candidate(target, config.CONFIDENCE_TAIL_JUMP,
                                 "tail_jump_target")
             added = True
 
-        added = self._pass_cond_branch_orphans(bodies, starts) or added
+        added = self._pass_cond_branch_orphans(bodies, starts, reachable) or added
         return added
 
     def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
@@ -1123,14 +1592,34 @@ class FunctionDetector:
         # 2's static initialisers are addresses inside another function and
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
+        # Code sections are scanned too, but only the words no function body
+        # covers. XDK libraries link their data into their own executable
+        # section: Fallout: Brotherhood of Steel's D3D keeps its 30-entry
+        # render-state handler table at 0x000B39F0, inside D3D, between two
+        # functions. Three of those handlers have no direct caller, so
+        # skipping code sections left them with no body and every SetRenderState
+        # that deferred to one was an unresolved indirect call. Inside a body
+        # a word is an operand or an instruction, not a table.
+        # A switch's jump table also sits between functions, right after its
+        # own; its words are case labels, not callables.
+        tables = sorted(self.engine.jump_tables.items())
+        table_starts = [t for t, _ in tables]
+
+        def in_jump_table(addr: int) -> bool:
+            i = bisect.bisect_right(table_starts, addr) - 1
+            return i >= 0 and addr < tables[i][1]
+
         targets = set()
         for sec in self.image.sections:
-            if sec.name in code_names:
-                continue                    # scan data, not code
             data = self.image.get_section_data(sec)
             if not data:
                 continue
+            is_code = sec.name in code_names
             for off in range(0, len(data) - 3, 4):
+                va = sec.virtual_addr + off
+                if is_code and (inside_a_function(va) or
+                                inside_a_function(va + 3) or in_jump_table(va)):
+                    continue
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):
                     targets.add(value)
@@ -1152,19 +1641,28 @@ class FunctionDetector:
         for sec in sections:
             section_end[sec.name] = sec.virtual_addr + sec.virtual_size
 
+        # Preserve shared tails into already-proven callback aliases. Only
+        # reachable instruction boundaries count as destinations.
+        tails = set(self.functions)
+        for entry, alias_end in self._alias_entries.items():
+            tails.update(self.engine.recursive_descent(
+                [entry], [(entry, alias_end)]))
+        claimed = self._callback_code
         found = 0
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
                 continue
+            # A table word can name an instruction suffix in any known body.
+            # Require the same callable-entry proof as for recovered callbacks;
+            # an instruction boundary alone does not establish an entry.
+            if ((target in claimed or inside_a_function(target))
+                    and not self._probes_as_tail_body(
+                    target, starts, sections, entry_frame=True)):
+                continue
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
-                # Inside a function, so the bytes are known to be code and the
-                # only real question is whether the address is an instruction
-                # boundary rather than the middle of one. Requiring a ret here
-                # would be wrong: MSVC's constructor thunks are
-                # `mov ecx, <this>; jmp <ctor>` and end in a tail jump, which
-                # is exactly what the strict probe rejects. Share the enclosing
-                # end, as the tail-jump pass does.
+                # The entry proof above permits shared bodies and constructor
+                # tail thunks. Keep the enclosing function's extent intact.
                 if target not in self.engine.instructions:
                     continue
                 end = bounds[j][1]
@@ -1190,23 +1688,38 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
-                if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                if self._is_byte_table(target):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
-                end = starts[i] if i < len(starts) else section_end.get(
+                end = section_end.get(
                     sec.name if sec else "", target + 4)
+                if i < len(starts):
+                    end = min(end, starts[i])
+                lower = bounds[j][1] if j >= 0 else sec.virtual_addr
+                if not (self.engine.probes_as_callback_body(
+                            target, end, lower, tail_targets=tails)
+                        or self.engine.probes_as_vcall_thunk(target)
+                        or self._probes_as_escaping_body(
+                            target, starts, bounds, sections, tails)):
+                    if not self._probes_as_tail_body(target, starts, sections):
+                        continue
             if end <= target:
                 continue
             self._alias_entries[target] = end
+            reachable = self.engine.recursive_descent([target], [(target, end)])
+            tails.update(reachable)
+            # Every byte, as for immediate callbacks: a later immediate into
+            # an operand byte must not split this body.
+            for address in reachable:
+                claimed.update(range(address, self.engine.get_instruction(address).end_address))
             found += 1
 
         if found:
             print(f"  {found} function address(es) found in data tables")
         return found > 0
 
-    def _pass_cond_branch_orphans(self, bodies, starts) -> bool:
+    def _pass_cond_branch_orphans(self, bodies, starts, reachable) -> bool:
         """
         A conditional branch out of its function into unclaimed bytes.
 
@@ -1229,13 +1742,14 @@ class FunctionDetector:
         Registering an alias rather than a candidate is what makes this safe:
         aliases are built after the bodies are measured, so they cannot clamp
         anyone's end, which is precisely the failure the jcc exclusion was
-        protecting against. The target must also land in a gap -- inside
-        another function is the alias case the pass above already handles --
-        and must decode to a ret, so a mis-measured body's interior does not
-        qualify on the strength of one branch.
+        protecting against. A target inside another function shares its end.
+        A target in a gap must decode to a ret or a tail jump before it can
+        become an alias.
         """
         added = False
         for insn in self.engine.instructions.values():
+            if insn.address not in reachable:
+                continue
             if not insn.is_cond_jump:
                 continue
             target = insn.jump_target
@@ -1255,7 +1769,12 @@ class FunctionDetector:
 
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] <= target < bodies[j][1]:
-                continue                    # inside a function: handled above
+                # A conditional tail can share another body's return just as
+                # an unconditional tail can. Keep the enclosing body intact.
+                if target in self.engine.instructions:
+                    self._alias_entries[target] = bodies[j][1]
+                    added = True
+                continue
 
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
@@ -1384,6 +1903,73 @@ class FunctionDetector:
         sec_end = (section.virtual_addr + section.virtual_size
                    if section else None)
         return max(end, self._find_function_end(addr, nxt, sec_end))
+    def _pass_alias_branch_orphans(self) -> bool:
+        """
+        A jump out of an alias body into bytes no body claims.
+
+        _pass_cond_branch_orphans does this for function bodies, but alias
+        bodies are only known after the passes that register them, so their
+        own branches were never looked at. When such a branch leaves the alias
+        for a block in a gap, the translator lowers it to a call to an
+        unresolved-target stub that pops only a return address -- the block
+        never runs and esp comes back short by whatever the block's own ret N
+        would have removed.
+
+        The shape that exposed it: a dispatcher reached only through a vtable
+        (so it became a tail-jump alias) that branches on its argument to two
+        blocks after its own `ret 0xc`. _pass_gap_prologues had already made
+        the first of them a function, which cut the alias short, and the
+        second fell in the gap between. Jet Set Radio Future's graphics device
+        wrapper (0x00154D70 -> 0x00154DAA) took exactly that path on every
+        Init, came back 12 bytes low, and the imbalance travelled up through
+        every lifted caller until a constructor wrote its result to the wrong
+        stack slot.
+
+        Same acceptance test as the function-body pass: the target must be
+        executable, in no body, and decode to a returning body or a block that
+        ends in a tail jump. Repeats until nothing new turns up, since a new
+        alias can branch onward itself.
+        """
+        added_any = False
+        while True:
+            bodies = sorted((f.start, f.end) for f in self.functions.values())
+            starts = [b[0] for b in bodies]
+            all_starts = sorted(set(starts) | set(self._alias_entries))
+
+            def claimed(addr: int) -> bool:
+                i = bisect.bisect_right(starts, addr) - 1
+                return i >= 0 and addr < bodies[i][1]
+
+            added = False
+            for alias, end in sorted(self._alias_entries.items()):
+                if alias in self.functions:
+                    continue
+                for insn in self.engine.get_instructions_in_range(alias, end):
+                    if not (insn.is_cond_jump or insn.is_jump):
+                        continue
+                    target = insn.jump_target
+                    if target is None or alias <= target < end:
+                        continue
+                    if (target in self._alias_entries or target in self.functions
+                            or target in self._candidates or claimed(target)):
+                        continue
+                    section = self.image.get_section_at_va(target)
+                    if section is None or not section.executable:
+                        continue
+                    if not (self.engine.probes_as_returning_body(target, max_insns=256)
+                            or self.engine.block_tail_jump(target) is not None):
+                        continue
+                    k = bisect.bisect_right(all_starts, target)
+                    stop = all_starts[k] if k < len(all_starts) else (section.virtual_addr
+                                                                     + section.virtual_size)
+                    self._alias_entries[target] = stop
+                    added = True
+            if not added:
+                break
+            added_any = True
+        if added_any:
+            print("  blocks recovered that alias bodies branch to")
+        return added_any
 
     def _build_alias_entries(self) -> None:
         """
@@ -1394,17 +1980,57 @@ class FunctionDetector:
         shared tail, which costs a little code size and makes the entry point
         callable. The alternative -- a stub that returns immediately -- silently
         skips the epilogue and leaks the caller's frame.
+
+        An alias in a gap has no enclosing body; its end was "the next known
+        function start", measured before the other aliases existed. A run of
+        gap aliases -- DOA3's C++ dynamic initialisers -- then each spanned the
+        whole run, ~100 KB lifted 25 times, and one alias ran past its section
+        end into data. Measure each one as its own body, then run on to the
+        next function or alias start past that, within its section. Measuring
+        alone stops short at an inline jump table it does not recognise (the
+        CRT's backward memmove); cutting at the very next alias start splits a
+        real gap function at a data-table hit inside it, turning its own
+        branches into calls to stubs.
         """
-        # Real starts only, and fixed before the loop begins: see _alias_end.
         self._alias_walk_starts = sorted(self.functions)
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        body_starts = [b[0] for b in bodies]
+        starts = sorted(set(body_starts) | set(self._alias_entries))
         for addr, end in sorted(self._alias_entries.items()):
             if addr in self.functions:
                 continue
+            recorded_end = end
             end = self._alias_end(addr, end)
+            section = self.image.get_section_at_va(addr)
+            i = bisect.bisect_right(body_starts, addr) - 1
+            if (end == recorded_end and section is not None
+                    and not (i >= 0 and addr < bodies[i][1])):
+                # Only the backed bytes are code; a virtual tail past them
+                # is zero-filled, and reading on reaches the next section.
+                # The section data carries just enough of that fill to finish
+                # an instruction cut by raw_size (Spartan's D3DX `ret 0x10`),
+                # and none starts in it, so its length is the bound.
+                # The file bytes that are also inside the virtual range.
+                backed_end = section.virtual_addr + min(section.virtual_size,
+                                                        section.raw_size)
+                end = min(end, section.virtual_addr
+                          + len(self.image.get_section_data(section)))
+                body_end = self._find_function_end(addr, end, end)
+                k = bisect.bisect_left(starts, max(body_end, addr + 1))
+                if k < len(starts):
+                    end = min(end, starts[k])
+                # An alias that runs to the section bound owns the fill only
+                # as far as the instruction it finishes, not all 14 bytes.
+                # Only an instruction starting within one instruction length
+                # of the cut can cross it.
+                if end > backed_end:
+                    lo = max(addr, backed_end - (MAX_INSN_LEN - 1))
+                    end = min(end, max([backed_end] + [
+                        insn.end_address for insn in
+                        self.engine.get_instructions_in_range(lo, backed_end)]))
             insns = self.engine.get_instructions_in_range(addr, end)
             if not insns:
                 continue
-            section = self.image.get_section_at_va(addr)
             sec_name = section.name if section else ""
             label = self.labels.get(addr)
             name = label.name if label else f"sub_{addr:08X}"

@@ -104,6 +104,15 @@ def main():
              "into each other.",
     )
 
+    parser.add_argument(
+        "--skip-library-immediates",
+        action="store_true",
+        help="An immediate in a library section (D3D, DSOUND, XPP, ...) never "
+             "starts a function in .text. For titles whose XDK code holds "
+             "register constants equal to .text addresses (NFSU1). Off by "
+             "default.",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -120,8 +129,9 @@ def main():
         # dropping the second loses a real entry point, so the difference has
         # to survive as far as the drop decision.
         seed_provenance = {}
+        observed = set()
         for _seed_path in (args.seed_functions or []):
-            _got = _load_seed_functions(_seed_path)
+            _got = _load_seed_functions(_seed_path, observed)
             seed_funcs.extend(_got)
             _tag = os.path.basename(_seed_path)
             for _a in _got:
@@ -147,6 +157,8 @@ def main():
             seed_functions=seed_funcs,
             function_bounds=forced_bounds,
             seed_provenance=seed_provenance,
+            observed_seeds=observed,
+            skip_library_immediates=args.skip_library_immediates,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)
@@ -195,15 +207,26 @@ def _load_function_bounds(path):
     return bounds
 
 
-def _load_seed_functions(path):
-    """Load seed function addresses from a JSON file."""
+def _load_seed_functions(path, observed=None):
+    """Load seed function addresses from a JSON file.
+
+    Entries marked "observed" (tools.seed_from_log writes them: a run
+    actually called or started a thread there) are also added to `observed`.
+    Entries written by seed_from_log before it set the field say so in their
+    note, and count too.
+    """
     import json
     with open(path) as f:
         data = json.load(f)
     addrs = []
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
-            addrs.append(int(entry["start"], 16))
+            addr = int(entry["start"], 16)
+            addrs.append(addr)
+            if observed is not None and (
+                    entry.get("observed")
+                    or "observed at runtime" in entry.get("note", "")):
+                observed.add(addr)
         elif isinstance(entry, int):
             addrs.append(entry)
     return addrs

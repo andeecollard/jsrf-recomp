@@ -158,7 +158,9 @@ def test_seeding_path_calls_decode_at_for_undecoded_addresses():
         "seeding no longer realigns the sweep; seeds that land in an "
         "out-of-phase run will be silently dropped again")
     assert "instruction_covering" in seed_block
-    assert "probes_as_prologue" in seed_block
+    assert "_trust_mid_instruction_seed" in seed_block
+    assert "probes_as_prologue" in inspect.getsource(
+        disasm_mod.Disassembler._trust_mid_instruction_seed)
 
 
 def _run():

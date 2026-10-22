@@ -59,7 +59,8 @@ class AnalysisCache:
         return sha256.hexdigest()
 
     @staticmethod
-    def _opts_key(text_only, extra_sections=None, seed_functions=None):
+    def _opts_key(text_only, extra_sections=None, seed_functions=None,
+                  skip_library_immediates=False):
         """Fingerprint every input that changes the result.
 
         Not just the files: --seed-functions and --extra-sections change what
@@ -72,6 +73,8 @@ class AnalysisCache:
         h.update(repr(bool(text_only)).encode())
         h.update(repr(sorted(extra_sections or [])).encode())
         h.update(repr(sorted(seed_functions or [])).encode())
+        if skip_library_immediates:     # adds nothing to the key when off
+            h.update(b"skip_library_immediates")
         # The disassembler's own source is an input. Without this a change to a
         # detection pass hands back the previous run's functions.json and reads
         # as "the change did nothing" -- the same silent wrong answer the option
@@ -83,7 +86,7 @@ class AnalysisCache:
 
     def is_valid(self, xbe_path: str, analysis_json_path: str,
                  text_only: bool = False, extra_sections=None,
-                 seed_functions=None) -> bool:
+                 seed_functions=None, skip_library_immediates=False) -> bool:
         """
         Check if cached results are still valid.
 
@@ -106,7 +109,8 @@ class AnalysisCache:
 
         # Check every option that affects the output, not just text_only
         if cache.get("opts_key") != self._opts_key(text_only, extra_sections,
-                                                   seed_functions):
+                                                   seed_functions,
+                                                   skip_library_immediates):
             return False
 
         # Verify output files exist
@@ -122,7 +126,8 @@ class AnalysisCache:
 
     def save(self, xbe_path: str, analysis_json_path: str,
              text_only: bool, elapsed_seconds: float,
-             extra_sections=None, seed_functions=None) -> None:
+             extra_sections=None, seed_functions=None,
+             skip_library_immediates=False) -> None:
         """
         Save cache metadata after a successful analysis run.
         """
@@ -134,7 +139,8 @@ class AnalysisCache:
             "json_hash": self._hash_file(analysis_json_path),
             "text_only": text_only,
             "opts_key": self._opts_key(text_only, extra_sections,
-                                       seed_functions),
+                                       seed_functions,
+                                       skip_library_immediates),
             "timestamp": time.time(),
             "elapsed_seconds": elapsed_seconds,
         }

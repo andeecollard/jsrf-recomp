@@ -10,13 +10,16 @@ from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM
 
 
+# LOOP family: ECX is the counter, not a flag. They branch, so they end a
+# block like any other conditional jump, but they need their own lifting.
+LOOP_JUMPS = frozenset({"loop", "loope", "loopne"})
+
 # x86 conditional jump mnemonics
 COND_JUMPS = frozenset({
     "jo", "jno", "jb", "jnb", "jae", "je", "jz", "jne", "jnz",
     "jbe", "ja", "jnae", "jna", "js", "jns", "jp", "jnp",
     "jl", "jge", "jle", "jg", "jcxz", "jecxz",
-    "loop", "loope", "loopne",
-})
+}) | LOOP_JUMPS
 
 
 @dataclass
@@ -27,6 +30,7 @@ class Instruction:
     mnemonic: str
     op_str: str
     bytes_hex: str
+    groups: tuple = ()
 
     # Operand details (populated from Capstone)
     operands: list = field(default_factory=list)
@@ -36,6 +40,7 @@ class Instruction:
     jump_target: Optional[int] = None
     memory_refs: list = field(default_factory=list)
     imm_values: list = field(default_factory=list)
+    regs_written: list = field(default_factory=list)
 
     @property
     def is_call(self):
@@ -80,12 +85,7 @@ class Operand:
     mem_scale: int = 1
     mem_disp: int = 0
     mem_size: int = 0  # operand size in bytes
-    # Original instruction address.  Store lowering needs this at the point
-    # where an operand becomes a C memory operation; retaining it here avoids
-    # reconstructing a guest PC from a generated host address later.
     insn_address: int = 0
-    # Containing translated function. The translator fills this from its
-    # already-known function boundary, so watch records need no runtime lookup.
     function_address: int = 0
     # Segment override, when the instruction carries one. Only fs matters on
     # Xbox -- it is how a title reaches the TIB -- but dropping the prefix put
@@ -134,8 +134,6 @@ def _parse_operand(cs, cs_op, insn_obj):
     elif cs_op.type == CS_OP_MEM:
         base = _reg_names.get(cs_op.mem.base) if cs_op.mem.base else None
         index = _reg_names.get(cs_op.mem.index) if cs_op.mem.index else None
-        segment = (_reg_names.get(cs_op.mem.segment)
-                   if cs_op.mem.segment else None)
         return Operand(
             type="mem",
             mem_base=base,
@@ -168,12 +166,22 @@ class Disassembler:
             mnemonic=cs_insn.mnemonic,
             op_str=cs_insn.op_str,
             bytes_hex=cs_insn.bytes.hex(),
+            groups=tuple(cs_insn.groups),
         )
 
         try:
             ops = cs_insn.operands
         except Exception:
             ops = []
+        try:
+            _, written = cs_insn.regs_access()
+            insn.regs_written = [
+                _reg_names.get(reg, self._cs.reg_name(reg))
+                for reg in written
+                if _reg_names.get(reg, self._cs.reg_name(reg))
+            ]
+        except Exception:
+            insn.regs_written = []
         for cs_op in ops:
             op = _parse_operand(self._cs, cs_op, cs_insn)
             insn.operands.append(op)
@@ -230,12 +238,22 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                # The misaligned stream did not only straddle `point`: until
+                # it rejoins, every instruction it decoded starts *inside* one
+                # of the real ones being decoded here. Those are gone too, or
+                # they are lifted beside the real ones. In MechAssault's CRT
+                # memcpy the `44` inside `mov [edi+ecx*4-0x1C], eax` survived
+                # as `inc esp`, so every short copy returned with esp one byte
+                # off and popped garbage into the caller's esi and edi.
+                for inner in range(cs_insn.address + 1,
+                                   cs_insn.address + cs_insn.size):
+                    decoded.pop(inner, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
-                        stop_addresses=None):
+                        stop_addresses=None, stop_mnemonics=()):
         """Decode reachable instruction streams from an explicit worklist."""
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
@@ -265,13 +283,13 @@ class Disassembler:
                             and start_va <= insn.jump_target < end_va):
                         worklist.append(insn.jump_target)
                     break
-                if insn.is_ret:
+                if insn.is_ret or insn.mnemonic in stop_mnemonics:
                     break
 
         return [decoded[addr] for addr in sorted(decoded)]
 
     def build_basic_blocks(self, instructions, func_start, func_end,
-                           extra_leaders=None):
+                           extra_leaders=None, stop_mnemonics=()):
         """
         Partition instructions into basic blocks.
         A new block starts at:
@@ -293,7 +311,7 @@ class Disassembler:
                     leaders.add(insn.jump_target)
                 # Instruction after the branch is also a leader
                 leaders.add(insn.end_address)
-            elif insn.is_call:
+            elif insn.is_call or insn.mnemonic in stop_mnemonics:
                 # Instruction after call is a leader (call might not return)
                 leaders.add(insn.end_address)
 
@@ -319,7 +337,7 @@ class Disassembler:
                 idx += 1
 
                 # Block ends at terminators
-                if insn.is_ret or insn.is_jump:
+                if insn.is_ret or insn.is_jump or insn.mnemonic in stop_mnemonics:
                     break
                 if insn.is_cond_jump:
                     break
@@ -327,7 +345,7 @@ class Disassembler:
             # Determine successors
             if bb.instructions:
                 last = bb.last_insn
-                if last.is_ret:
+                if last.is_ret or last.mnemonic in stop_mnemonics:
                     pass  # No successors
                 elif last.is_jump:
                     if last.jump_target and func_start <= last.jump_target < func_end:

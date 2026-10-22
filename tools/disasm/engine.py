@@ -11,7 +11,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
-from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
+from capstone import (CS_OP_IMM, CS_OP_MEM, CS_OP_REG,
+                      CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE)
+from capstone.x86_const import (
+    X86_REG_EFLAGS,
+)
+from capstone import x86_const
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -71,6 +76,32 @@ class Instruction:
         return d
 
 
+def _file_end(section, data) -> int:
+    """VA where a section's file bytes end.
+
+    get_section_data appends a little of the loader's zero fill so that an
+    instruction starting in the file bytes can finish (BinaryImage
+    .get_section_data says why). No instruction may start in that fill:
+    decoding it would hand every title zeros dressed up as code.
+
+    linear_sweep and decode_at are the only places that insert into
+    `instructions`, so they are the only ones that need this bound. The
+    other readers of get_section_data only test bytes: the prologue-shape
+    and terminator helpers here decode zeros as `add [eax], al`, which is
+    neither; the prologue and CC-padding passes in functions.py match
+    nothing in zeros and only add candidates at addresses already decoded.
+    labels.py's string scan reads .rdata, which XBEs flag executable, so it
+    gets the fill too: a string running up to .rdata's raw end now finds
+    its terminator in the fill and gets a label, as the loaded image would
+    have it. The gap-alias clamp in functions.py ends an alias past raw_size
+    only at the end of the instruction that crosses it, or at raw_size.
+    """
+    raw = getattr(section, "raw_size", None)
+    if raw is None:
+        raw = len(data)
+    return section.virtual_addr + min(raw, len(data))
+
+
 class DisasmEngine:
     """
     x86-32 disassembly engine backed by Capstone.
@@ -95,11 +126,17 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
-        # Table VA -> the addresses of the `jmp [reg*4 + table]` instructions
-        # that dispatch through it. A table entry is a switch arm of whatever
-        # function contains the dispatch, which is how a seeded arm can be told
-        # from a function that merely happens to sit at that address.
-        self._jt_sites: Dict[int, Set[int]] = {}
+        # Indexed-jump displacement -> the (start, end) of each instruction
+        # that dispatches through it, and -> the table start it resolves to
+        # when the displacement is not the table's first slot.
+        self._jt_sites: Dict[int, List[Tuple[int, int]]] = {}
+        self._jt_base: Dict[int, int] = {}
+        # Byte-sized tables read through an index, `movzx eax, byte ptr
+        # [eax + disp]`. MSVC's two-level switch maps a sparse case value to a
+        # dense arm number this way and parks the byte table straight after
+        # the dword table it feeds. disp -> addresses of the reads, so that
+        # index_table_length() can find the bound check in front of one.
+        self.byte_tables: Dict[int, List[int]] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -149,7 +186,21 @@ class DisasmEngine:
                             self.image.base_address + self.image.image_size):
                         insn.jump_table = disp
                         self._jt_candidates.add(disp)
-                        self._jt_sites.setdefault(disp, set()).add(insn.address)
+                        self._jt_sites.setdefault(disp, []).append(
+                            (insn.address, insn.end_address))
+
+            # Only the widening loads. `cmp byte ptr [esi + disp], 0` reads a
+            # byte field of a static struct, not an index table.
+            if mnemonic in ("movzx", "movsx") and len(operands) == 2:
+                src = operands[1]
+                if (src.type == CS_OP_MEM and src.size == 1
+                        and (src.mem.index != 0 or src.mem.base != 0)):
+                    disp = src.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address
+                            + self.image.image_size):
+                        self.byte_tables.setdefault(disp, []).append(
+                            insn.address)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -194,7 +245,8 @@ class DisasmEngine:
             return 0
 
         va_start = section.virtual_addr
-        total = len(data)
+        file_end = _file_end(section, data)
+        total = file_end - va_start
         count = 0
         offset = 0
 
@@ -205,6 +257,8 @@ class DisasmEngine:
             last_end_offset = offset
 
             for cs_insn in self._cs.disasm(chunk, chunk_va):
+                if cs_insn.address >= file_end:
+                    break  # the loader's zero fill finishes, never starts, code
                 insn = self._classify_instruction(cs_insn)
                 self.instructions[insn.address] = insn
                 count += 1
@@ -275,10 +329,54 @@ class DisasmEngine:
             hi = lo + home.virtual_size
             entries = 0
             while entries < max_entries:
+                # MSVC's two-level switch parks the byte index table straight
+                # after the dword table. Its first bytes, small arm numbers
+                # such as `00 02 02 00`, read as a dword are an address low
+                # in the section, so the walk would take them as one more
+                # arm. A `movzx` names that byte table; stop in front of it.
+                if tbl + entries * 4 in self.byte_tables:
+                    break
                 target = self.image.read_u32_at_va(tbl + entries * 4)
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
+            # The displacement need not be the first slot. MSVC's memmove
+            # dispatches its backward tail through `jmp [ecx*4 + LAST]`, the
+            # table's last entry, with the index counting down from there --
+            # measured forward that is a one-entry table, dropped as too short,
+            # so the function ended at it and lost every arm and its epilogue.
+            # Walk down as well, stopping before the bytes of any instruction
+            # that dispatches through this table: a table parked right after
+            # its jmp would otherwise read the jmp's own displacement, which is
+            # an in-section address, as a slot.
+            #
+            # "Points into the section" is far too weak going down: the bytes
+            # before a table are usually the function's last instruction, and
+            # `ret N` (c2 NN 00) plus the byte before it reads as a small
+            # in-section address -- Wreckless lost three epilogues that way.
+            # A real slot points at the same arms, so the walk only accepts
+            # targets within ARM_WINDOW of the slot the displacement names --
+            # the one entry known to be real. Not of the whole forward run:
+            # that can over-read into a following byte-index table, whose
+            # `00 01 02 00` is itself an in-section address, and a window that
+            # wide let HL2's `leave; ret 4` in as a slot.
+            ARM_WINDOW = 0x400
+            sites = self._jt_sites.get(tbl, ())
+            anchor = self.image.read_u32_at_va(tbl) if entries else None
+            back = 0
+            while anchor is not None and entries + back < max_entries:
+                slot = tbl - (back + 1) * 4
+                if any(a < slot + 4 and slot < e for a, e in sites):
+                    break
+                target = self.image.read_u32_at_va(slot)
+                if (target is None or not (lo <= target < hi)
+                        or abs(target - anchor) > ARM_WINDOW):
+                    break
+                back += 1
+            entries += back
+            if back:
+                self._jt_base[tbl] = tbl - back * 4
+                tbl -= back * 4
             if entries < min_entries:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
@@ -300,17 +398,63 @@ class DisasmEngine:
 
     def jump_table_sites(self, tbl: int) -> List[int]:
         """Addresses of the indexed indirect jumps that dispatch through tbl."""
-        return sorted(self._jt_sites.get(tbl, ()))
+        return sorted({site for disp, sites in self._jt_sites.items()
+                       if self._jt_base.get(disp, disp) == tbl
+                       for site, _end in sites})
+    def index_table_length(self, table: int) -> Optional[int]:
+        """Entries in the byte index table at `table`, read from the bound
+        check in front of a load from it, or None when there is none.
+
+        MSVC guards the load with the switch range:
+
+            cmp  eax, N
+            ja   default
+            movzx eax, byte ptr [eax + table]
+            jmp  dword ptr [eax*4 + arms]
+
+        so the index is 0..N and the table holds N + 1 bytes.
+        """
+        for site in self.byte_tables.get(table, ()):
+            ja = self._instruction_ending_at(site)
+            if ja is None or ja.mnemonic.lower() not in ("ja", "jae"):
+                continue
+            cmp = self._instruction_ending_at(ja.address)
+            if cmp is None or cmp.mnemonic.lower() != "cmp":
+                continue
+            _, _, imm = cmp.op_str.replace(" ", "").partition(",")
+            try:
+                bound = int(imm, 0)
+            except ValueError:
+                continue
+            if bound < 0:
+                continue
+            return bound + 1 if ja.mnemonic.lower() == "ja" else bound
+        return None
+
+    def _instruction_ending_at(self, addr: int) -> Optional[Instruction]:
+        for back in range(1, 16):
+            insn = self.instructions.get(addr - back)
+            if insn is not None and insn.end_address == addr:
+                return insn
+        return None
+
+    def is_jump_table_ref(self, addr: int) -> bool:
+        """Does some `jmp [reg*4 + disp]` name `addr` as its table, measured
+        or not? resync_jump_tables skips tables shorter than min_entries, but
+        they are still tables."""
+        return addr in self._jt_candidates
 
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
+        tbl = self._jt_base.get(tbl, tbl)
         end = self.jump_tables.get(tbl)
         if end is None:
             return []
         return [self.image.read_u32_at_va(a) or 0
                 for a in range(tbl, end, 4)]
 
-    def decode_at(self, addr: int, max_insns: int = 4096) -> int:
+    def decode_at(self, addr: int, max_insns: int = 4096,
+                  replace_overlaps: bool = False) -> int:
         """
         Decode a stream starting exactly at `addr`, realigning the sweep.
 
@@ -337,7 +481,8 @@ class DisasmEngine:
         valid instruction streams really can share bytes, and the callers that
         matter walk forward by end_address from a known start, so each follows
         its own chain. Evicting the old one would corrupt whichever function
-        was already using it.
+        was already using it. With replace_overlaps, the caller has verified
+        that the old stream is unclaimed, so its overlapping instructions go.
 
         Returns the number of instructions newly decoded.
         """
@@ -349,13 +494,24 @@ class DisasmEngine:
             return 0
 
         offset = addr - section.virtual_addr
-        if offset < 0 or offset >= len(data):
+        file_end = _file_end(section, data)
+        if offset < 0 or addr >= file_end:
             return 0
 
         added = 0
+        overlaps = set()
         for cs_insn in self._cs.disasm(data[offset:], addr):
+            if cs_insn.address >= file_end:
+                break
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
+            if replace_overlaps:
+                overlaps.update(old.address for old in
+                                self.get_instructions_in_range(
+                                    cs_insn.address - 15,
+                                    cs_insn.address + cs_insn.size)
+                                if old.address != cs_insn.address
+                                and old.end_address > cs_insn.address)
             if cs_insn.address not in self.instructions:
                 self.instructions[cs_insn.address] = \
                     self._classify_instruction(cs_insn)
@@ -366,7 +522,9 @@ class DisasmEngine:
             if added >= max_insns:
                 break
 
-        if added:
+        for old_addr in overlaps:
+            del self.instructions[old_addr]
+        if added or overlaps:
             self._sorted_addrs = None
         return added
 
@@ -389,7 +547,10 @@ class DisasmEngine:
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
             return None
-        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        # Stay inside the section's file bytes: a long bound past the end of
+        # the image would otherwise read nothing at all.
+        data = self.image.get_section_data(section)
+        data = data[addr - section.virtual_addr:][:max_insns * 8]
         if not data:
             return None
 
@@ -423,43 +584,276 @@ class DisasmEngine:
         that happens to disassemble, and stopping at an unconditional jmp keeps
         this out of tail-call territory, which _pass_tail_jump_targets already
         covers with better evidence. Conditional branches are fine: a real
-        function has them.
+        function has them. So is a switch dispatch through a table that
+        resync_jump_tables has measured: the probe continues in its arms.
         """
+        return self._probe_straight_line(addr, max_insns) == ("ret", None)
+
+    def probe_tail_call(self, addr: int,
+                        max_insns: int = 64) -> Optional[int]:
+        """
+        Where the body at `addr` tail-jumps, when the walk
+        probes_as_returning_body makes ends in a direct `jmp` out of the window
+        rather than a ret. None otherwise.
+
+        The tail jump on its own is not evidence -- data disassembles into a
+        stray `jmp` readily -- so this only reports the destination. A caller
+        that finds it is the exact start of a known function has a body that
+        ends in "return f(...)", which is how MSVC emits frameless wrappers and
+        the `mov eax, <FuncInfo>; jmp __CxxFrameHandler` handler thunks.
+        """
+        kind, target = self._probe_straight_line(addr, max_insns)
+        return target if kind == "tail" else None
+
+    def _probe_straight_line(self, addr: int, max_insns: int):
+        """Shared walk for the two probes above.
+
+        Returns ("ret", None), ("tail", target) for a direct jmp that leaves
+        the window or goes backwards, or (None, None) for anything else.
+
+        A walk that crossed int3 never counts as a tail call: it started in
+        alignment padding and ran into the function after it. One title has
+        an immediate naming the last int3 before a function that tail-jumps.
+        """
+        crossed_padding = False
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return None, None
+        count = 0
+        resume = addr
+        # One pass per straight-line segment. A segment ends at a ret (yes),
+        # at anything tail-call shaped (no), or at a switch dispatch through
+        # a table this engine has already measured -- which is neither: the
+        # function continues in its arms, so the probe resumes at the first
+        # arm past the jump and keeps its instruction budget. A function
+        # reached only as an immediate, with no prologue, that opens with
+        # exactly that dispatch was otherwise refused, and the switch tables
+        # it owns were translated nowhere.
+        while resume is not None and count < max_insns:
+            data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
+            if not data:
+                return None, None
+            limit = resume + len(data)
+            start = resume
+            resume = None
+            for decoded in self._cs.disasm(data, start):
+                count += 1
+                mnemonic = decoded.mnemonic.lower()
+                if mnemonic == "int3":
+                    crossed_padding = True
+                if mnemonic in config.RET_MNEMONICS:
+                    return "ret", None
+                if mnemonic in config.JMP_MNEMONICS:
+                    # An unconditional jump forward, still inside the window
+                    # being probed, is ordinary control flow -- MSVC emits it
+                    # constantly to skip an else-branch. Only a jump that
+                    # leaves the window, or goes backwards, is tail-call
+                    # shaped and ends the probe.
+                    #
+                    # Rejecting every jmp cost Half-Life 2 its
+                    # CreateInterface list walk (0x00427F80): a clean 90-byte
+                    # function that happens to contain one `jmp` over four
+                    # instructions.
+                    try:
+                        ops = decoded.operands
+                    except Exception:
+                        return None, None
+                    if not ops:
+                        return None, None
+                    if ops[0].type == CS_OP_MEM and ops[0].mem.index != 0:
+                        arm = self._first_arm_after(
+                            ops[0].mem.disp & 0xFFFFFFFF, decoded.address)
+                        if arm is None:
+                            return None, None
+                        resume = arm
+                        break
+                    if ops[0].type != CS_OP_IMM:
+                        return None, None
+                    target = ops[0].imm & 0xFFFFFFFF
+                    if not (decoded.address < target < limit):
+                        if crossed_padding:
+                            return None, None
+                        return "tail", target
+                if count >= max_insns:
+                    return None, None
+        return None, None
+
+    def probes_as_callback_body(self, addr: int, upper: int,
+                                lower: Optional[int] = None,
+                                tail_targets=(), *, require_entry_frame=False,
+                                allow_indirect_tails=False,
+                                escapes: Optional[Set[int]] = None) -> bool:
+        """Read-only proof of a closed callback CFG inside an unclaimed gap.
+
+        Calls may return from other functions; branches and fallthrough must
+        stay on decoded instruction boundaries. Reuse the translator's CFG
+        decoder and the sweep's measured switch tables, without a size cap.
+
+        allow_indirect_tails: an indirect jmp that is not a measured table is
+        an exit. True takes any form; "mem" takes a memory operand
+        (`jmp [reg + N]`, a vtable slot or a function-pointer field), or a
+        register the body itself wrote, never a bare `jmp reg`.
+
+        escapes: when given, a direct jmp or jcc out of [lower, upper) to an
+        address nobody has proven is not a refusal: the destination is added
+        to the set and the edge counts as an exit. The body is closed only
+        once the caller proves every destination itself, in its own gap.
+        A switch arm outside the gap counts as an exit when it is in
+        tail_targets, whether or not escapes is given.
+        """
+        from ..recomp.disasm import Disassembler
+
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
             return False
-        data = self.image.read_bytes_at_va(addr, max_insns * 8)
-        if not data:
-            return False
+        data = self.image.get_section_data(section)
+        lower = addr if lower is None else max(lower, section.virtual_addr)
+        upper = min(upper, section.virtual_addr + len(data))
+        raw = data[lower - section.virtual_addr:upper - section.virtual_addr]
+        if require_entry_frame:
+            # A weak table word may name a suffix after its owner's cmp.
+            # Reject an entry prefix that reads arithmetic flags before
+            # producing them. String operations may read the ABI's DF. A
+            # writer defines only its own flags: inc and dec leave CF.
+            pending = {"AF", "CF", "OF", "PF", "SF", "ZF"}
+            flag = lambda kind, name: getattr(x86_const, f"X86_EFLAGS_{kind}_{name}")
+            for insn in self._cs.disasm(raw[addr - lower:], addr):
+                if (X86_REG_EFLAGS in insn.regs_read
+                        and (not insn.eflags or any(
+                            insn.eflags & flag("TEST", f) for f in pending))):
+                    return False
+                if X86_REG_EFLAGS in insn.regs_write:
+                    pending = {f for f in pending if insn.eflags and not any(
+                        insn.eflags & flag(kind, f)
+                        for kind in ("MODIFY", "SET", "RESET", "UNDEFINED"))}
+                if not pending or insn.mnemonic in ("call", "jmp", "ret", "retn"):
+                    break
+        decoder = Disassembler()
+        entries = {addr}
+        tables = {}
+        indirect_tails = set()
+        while True:
+            decoded = decoder.disassemble_cfg(
+                raw, lower, upper, entries,
+                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"))
+            arms = set()
+            for insn in decoded:
+                if not insn.is_jump or insn.jump_target is not None:
+                    continue
+                if not insn.operands:
+                    return False
+                op = insn.operands[0]
+                if (allow_indirect_tails
+                        and (op.type != "mem" or not op.mem_index
+                             or not self.jump_table_entries(op.mem_disp))):
+                    # "mem": `jmp reg` only when the body loaded that
+                    # register itself, a handler fetched from a table
+                    # (`mov eax, [eax*4+T] ; ... ; jmp eax`). A lone `ff e0`
+                    # decoded from a stray word has no such load.
+                    if (allow_indirect_tails == "mem" and op.type != "mem"
+                            and not (op.type == "reg" and any(
+                                op.reg in other.regs_written
+                                for other in decoded if other is not insn))):
+                        return False
+                    indirect_tails.add(insn.address)
+                    continue
+                if (op.type != "mem" or not op.mem_index or op.mem_base
+                        or op.mem_scale != 4 or op.mem_seg):
+                    return False
+                targets = self.jump_table_entries(op.mem_disp)
+                # An arm outside the gap is fine when it is a proven entry: a
+                # dispatcher whose arms are other functions (a two-instruction
+                # `mov eax, [ecx+N]; jmp [eax*4+table]` method) exits into
+                # them as a tail call does.
+                if not targets or any(not lower <= t < upper
+                                      and t not in tail_targets for t in targets):
+                    return False
+                tables[insn.address] = targets
+                arms.update(t for t in targets if lower <= t < upper)
+            if arms <= entries:
+                break
+            entries.update(arms)
 
-        limit = addr + len(data)
-        count = 0
-        for decoded in self._cs.disasm(data, addr):
-            count += 1
-            mnemonic = decoded.mnemonic.lower()
-            if mnemonic in config.RET_MNEMONICS:
-                return True
-            if mnemonic in config.JMP_MNEMONICS:
-                # An unconditional jump forward, still inside the window being
-                # probed, is ordinary control flow -- MSVC emits it constantly
-                # to skip an else-branch. Only a jump that leaves the window,
-                # or goes backwards, is tail-call shaped and ends the probe.
-                #
-                # Rejecting every jmp cost Half-Life 2 its CreateInterface list
-                # walk (0x00427F80): a clean 90-byte function that happens to
-                # contain one `jmp` over four instructions.
-                try:
-                    ops = decoded.operands
-                except Exception:
-                    return False
-                if not ops or ops[0].type != CS_OP_IMM:
-                    return False
-                target = ops[0].imm & 0xFFFFFFFF
-                if not (decoded.address < target < limit):
-                    return False
-            if count >= max_insns:
+        starts = {insn.address for insn in decoded}
+        call_ends = {insn.end_address for insn in decoded if insn.is_call}
+        branch_targets = {insn.jump_target for insn in decoded if insn.is_branch}
+        branch_targets.update(arms)
+        end = lower
+        exits = backward = False
+        for insn in decoded:
+            if insn.address < end or insn.end_address > upper:
+                return False  # two reachable streams overlap
+            end = insn.end_address
+            # Same no-return shape as static callback recovery. A branch into
+            # the padding is a trap, not evidence that the call never returns.
+            if (insn.mnemonic == "int3" and insn.address in call_ends
+                    and insn.address not in branch_targets):
+                exits = True
+                continue
+            if (set(insn.groups) & {CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE}
+                    or insn.mnemonic.split()[-1] in (
+                        "ud2", "ud0", "ud1", "retf", "in", "out",
+                        "insb", "insw", "insd", "outsb", "outsw", "outsd")):
                 return False
-        return False
+            if insn.is_ret or insn.address in indirect_tails:
+                exits = True
+                continue
+            edges = []
+            if insn.is_branch:
+                edges = ([insn.jump_target] if insn.jump_target is not None
+                         else tables.get(insn.address, []))
+                if not edges:
+                    return False
+            if not insn.is_jump:
+                edges = [*edges, insn.end_address]
+            for edge in edges:
+                if edge in starts:
+                    continue
+                if edge in tail_targets and (edge == insn.jump_target
+                                             or insn.address in tables):
+                    exits = True  # preserve proven tails to existing bodies
+                    continue
+                # A direct jump or branch out of the gap to code nobody has
+                # proven yet. The caller may prove that destination on its
+                # own (escapes); until it does, this body is not closed.
+                if (escapes is not None and edge == insn.jump_target
+                        and not lower <= edge < upper):
+                    escapes.add(edge)
+                    exits = True
+                    continue
+                return False
+            backward |= any(edge in starts and edge <= insn.address for edge in edges)
+        if require_entry_frame:
+            saved = {insn.op_str for insn in decoded if insn.mnemonic == "push"}
+            restored = {insn.op_str for insn in decoded if insn.mnemonic == "pop"}
+            restored &= {"ebx", "esi", "edi", "ebp"}
+            # A callable shared body must supply its own saved registers. An
+            # epilogue suffix that consumes its owner's saves is not an entry.
+            if restored - saved:
+                return False
+            # Nor may it free a frame or stack it never built.
+            # shortcut: checks which instructions appear, not stack depth;
+            # walk the depth per path if a suffix ever frees more than it built.
+            esp = lambda insn, m: insn.mnemonic == m and insn.op_str.startswith("esp,")
+            if any(insn.mnemonic == "leave" for insn in decoded) and "ebp" not in saved:
+                return False
+            if (any(esp(insn, "add") for insn in decoded)
+                    and not any(insn.mnemonic in ("push", "enter") or esp(insn, "sub")
+                                for insn in decoded)):
+                return False
+            if not (backward or restored or any(insn.is_ret for insn in decoded)
+                    or any(insn.mnemonic == "int3" and insn.address in call_ends
+                           for insn in decoded)
+                    or all("esp" not in insn.regs_written for insn in decoded)):
+                return False
+        return bool(decoded) and (exits or backward)
+
+    def _first_arm_after(self, table: int, site: int) -> Optional[int]:
+        """The lowest entry of a measured jump table that lies past `site`,
+        or None when `table` is not one this engine has measured."""
+        entries = self.jump_table_entries(table)
+        later = [a for a in entries if a > site]
+        return min(later) if later else None
 
     def probes_as_vcall_thunk(self, addr: int) -> bool:
         """Is this MSVC's virtual-call thunk?
@@ -490,11 +884,22 @@ class DisasmEngine:
         if not data:
             return False
 
-        insns = list(self._cs.disasm(data, addr, count=2))
-        if len(insns) != 2:
+        insns = list(self._cs.disasm(data, addr, count=3))
+        # A thunk into a member subobject adjusts `this` first:
+        #
+        #     mov ecx, [ecx + 8]          ; or add/sub ecx, imm
+        #     mov eax, [ecx]
+        #     jmp dword ptr [eax + 0x80]
+        #
+        # Half-Life 2's 0x00452AC0 is one, named only by a vtable without
+        # RTTI. Missing it skipped the call and the boot crashed a few
+        # million calls later.
+        if len(insns) == 3 and self._is_this_adjust(insns[0]):
+            insns = insns[1:]
+        if len(insns) < 2:
             return False
 
-        load, dispatch = insns
+        load, dispatch = insns[:2]
         if load.mnemonic.lower() != "mov":
             return False
         try:
@@ -517,6 +922,25 @@ class DisasmEngine:
             return False
         # ...through the register the load just filled.
         return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
+
+    @staticmethod
+    def _is_this_adjust(insn) -> bool:
+        """mov ecx, [ecx + N] / mov ecx, [N] / add ecx, imm / sub ecx, imm."""
+        m = insn.mnemonic.lower()
+        try:
+            ops = insn.operands
+        except Exception:
+            return False
+        if len(ops) != 2 or ops[0].type != CS_OP_REG or ops[0].reg != x86_const.X86_REG_ECX:
+            return False
+        if m == "mov":
+            # [ecx + N] for a member subobject, or [N] for a global object
+            # (Half-Life 2's 0x00457420: mov ecx, [0x0080C1F0]).
+            src = ops[1]
+            return (src.type == CS_OP_MEM and src.mem.index == 0
+                    and src.mem.disp != 0
+                    and src.mem.base in (x86_const.X86_REG_ECX, 0))
+        return m in ("add", "sub") and ops[1].type == CS_OP_IMM
 
     def probes_as_prologue(self, addr: int) -> bool:
         """
@@ -603,6 +1027,20 @@ class DisasmEngine:
                     data[offset:offset + 24], addr, count=3))
                 if len(third) > 2 and third[2].mnemonic == "call":
                     return True
+
+        # A frame larger than a page, which MSVC opens with a stack probe:
+        #
+        #     mov eax, <frame size>
+        #     call __chkstk            (_alloca_probe)
+        #
+        # Same reason as __SEH_prolog: the helper moves esp, so there is no
+        # push/sub to find. Half-Life 2's 0x00426370 (mov eax, 0x8028) is
+        # reached only through a vtable without RTTI; once code after int3
+        # padding had to probe as code, it and every function like it
+        # vanished, and the vtable call went to nothing.
+        if (m == "mov" and ops.startswith("eax, 0x") and len(insns) > 1
+                and insns[1].mnemonic == "call"):
+            return True
 
         return False
 

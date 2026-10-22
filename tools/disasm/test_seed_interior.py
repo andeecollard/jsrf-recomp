@@ -34,6 +34,7 @@ class _Func:
 class _Section:
     virtual_addr = 0
     virtual_size = 0x01000000
+    raw_size = virtual_size
     name = ".text"
 
 
@@ -42,6 +43,9 @@ class _Image:
 
     def get_section_at_va(self, addr):
         return _Section()
+
+    def get_section_data(self, section):
+        return bytes(section.raw_size)
 
 
 class _Ref:

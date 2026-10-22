@@ -41,7 +41,10 @@ class Disassembler:
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
                  function_bounds: Optional[list] = None,
-                 seed_provenance: Optional[dict] = None):
+                 seed_provenance: Optional[dict] = None,
+
+                 observed_seeds: Optional[set] = None,
+                 skip_library_immediates: bool = False):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -53,6 +56,10 @@ class Disassembler:
         self.seed_functions = seed_functions or []
         self.function_bounds = function_bounds or []
         self.seed_provenance = seed_provenance or {}
+        self.skip_library_immediates = skip_library_immediates
+        # Seeds a run actually reached (see _load_seed_functions). They are
+        # not guesses, so the mid-instruction guard below does not apply.
+        self.observed_seeds = observed_seeds or set()
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -61,6 +68,17 @@ class Disassembler:
         self.xrefs: Optional[XRefTracker] = None
         self.func_detector: Optional[FunctionDetector] = None
         self.strings: List[dict] = []
+
+    def _trust_mid_instruction_seed(self, addr: int) -> bool:
+        """A seed inside an instruction the sweep decoded: keep it anyway?
+
+        Yes when a run reached it (observed_seeds; Halo's XPP init at
+        0x001CF6AC), or when it decodes as a prologue, which means the sweep
+        is the one out of phase (default.xbe's push ebp at 0x00069538). An
+        RTTI guess six bytes into a mov (HL2's 0x00202C2E) is neither.
+        """
+        return (addr in self.observed_seeds
+                or self.engine.probes_as_prologue(addr))
 
     def run(self) -> bool:
         """
@@ -77,7 +95,8 @@ class Disassembler:
             if json_path and cache.is_valid(self.xbe_path, json_path,
                                              self.text_only,
                                              self.extra_sections,
-                                             self.seed_functions):
+                                             self.seed_functions,
+                                             self.skip_library_immediates):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -163,88 +182,47 @@ class Disassembler:
         if self.verbose:
             print("\nPhase 5: Detecting functions...")
         self.func_detector = FunctionDetector(
-            self.engine, self.image, self.xrefs, self.labels)
-        # Declared extents, before any pass runs: they are what the seed
-        # demotion tests against as well as being unsplittable themselves.
+            self.engine, self.image, self.xrefs, self.labels,
+            skip_library_immediates=self.skip_library_immediates)
+
         self.func_detector._forced_bounds = list(self.function_bounds)
         self.func_detector._seed_provenance = dict(self.seed_provenance)
 
-        # Add seed functions from vtable scanner or other sources.
-        #
-        # A candidate with no decoded instruction at its address is dropped by
-        # _build_functions (num_insns == 0), so a seed that lands where the
-        # linear sweep came out of phase is silently discarded -- the exact
-        # failure Engine.decode_at was written for, but until now only wired
-        # into _pass_call_targets and the tail-jump pass. Measured on JSRF:
-        # 0x0007BE30 is 16-aligned, preceded by four nop padding bytes, opens
-        # with the MSVC SEH prologue (push -1; push <handler>; mov eax, fs:[0];
-        # push eax; mov fs:[0], esp), was discovered by the vtable scanner AND
-        # observed as an unresolved indirect call 100 times at runtime -- and
-        # was thrown away because the data run before it put the sweep out of
-        # step. Realign there instead, exactly as the call-target pass does.
+        # Measure bodies before accepting a seed inside a sweep instruction.
         if self.seed_functions:
+            self.func_detector.detect_all(sections)
             realigned = undecodable = 0
             mid_instruction = 0
+            accepted = []
             for addr in self.seed_functions:
-                # Decode there first if the sweep stepped over it. A seed is an
-                # explicit claim that a function starts at this address, and it
-                # is usually the only evidence available -- seeds exist for
-                # entry points that nothing in the image references. But
-                # _build_functions needs instructions at the address to build a
-                # body from, and where the sweep came out of phase there are
-                # none, so the seed was dropped silently.
-                #
-                # Same treatment _pass_call_targets already gives a call target
-                # it has to realign, and for the same reason.
-                # A seed landing *inside* an instruction the sweep already
-                # decoded is not a stream out of phase -- it is a bad seed.
-                # Accepting it manufactures a boundary mid-instruction, and the
-                # new "function" then clamps the end of the real one it sits
-                # in, which loses that function its epilogue.
-                #
-                # Checked before the realign test, not inside it: an earlier
-                # seed's decode_at can already have laid a chain through this
-                # address, which made the address look like a legitimate
-                # boundary and skipped the guard entirely.
-                #
-                # Half-Life 2 has two such slots out of 12,288, and one
-                # (0x00202C2E, six bytes into a 9-byte mov) cut sub_00202BB9
-                # short at 0x00202C31 instead of 0x00202D4F. That function has
-                # 250 callers, and every one got back an unrestored
-                # ebx/esi/ebp/edi and a leaked frame -- which drifts esp until
-                # some later `pop esi` lifts a float off the stack and it gets
-                # used as a `this` pointer.
                 covering = self.engine.instruction_covering(addr)
                 if covering is not None:
-                    # ...unless the seed decodes as a function prologue, in
-                    # which case the sweep is the one out of phase. It drifts
-                    # whenever it walks zero padding or a data table as
-                    # instructions and runs off the end into real code:
-                    # default.xbe's XPP section decodes 001C950600558D at
-                    # 0x00069533, which swallows the `push ebp` at 0x00069538
-                    # that a tail jump targets. Rejecting that seed left the
-                    # target stubbed, and the stub returned without the
-                    # callee's `ret 8` -- which walked esp off by 4 and moved
-                    # the loader's object pointer out from under its own
-                    # vtable.
-                    #
-                    # A prologue is the evidence that separates the two cases:
-                    # the bad HL2 seed at 0x00202C2E is six bytes into a mov
-                    # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
-                        if self.engine.decode_at(addr):
-                            realigned += 1
-                            self.func_detector._add_candidate(
-                                addr, 0.95, "seed_vtable_thunk")
-                            continue
-                    mid_instruction += 1
-                    continue
-                if addr not in self.engine.instructions:
+                    # Unclaimed sweep bytes may be replaced by the seed's
+                    # decode; a detected body only yields to trusted seeds.
+                    unclaimed = self.func_detector.get_function_at(addr) is None
+                    if not (unclaimed or self._trust_mid_instruction_seed(addr)):
+                        mid_instruction += 1
+                        continue
+                    if not self.engine.decode_at(addr, replace_overlaps=unclaimed):
+                        continue
+                    realigned += 1
+                elif addr not in self.engine.instructions:
                     if self.engine.decode_at(addr):
                         realigned += 1
                     else:
                         undecodable += 1
                         continue
+                accepted.append(addr)
+
+            # Rebuild from the corrected stream, without candidates or xrefs
+            # left over from the discarded sweep instructions.
+            self.xrefs = build_xrefs(self.engine, self.image)
+            self.func_detector = FunctionDetector(
+                self.engine, self.image, self.xrefs, self.labels,
+                skip_library_immediates=self.skip_library_immediates)
+            self.func_detector._forced_bounds = list(self.function_bounds)
+            self.func_detector._seed_provenance = dict(self.seed_provenance)
+            for addr in accepted:
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if realigned:
                 print(f"  Realigned {realigned} seeded address(es) the sweep "
@@ -273,6 +251,8 @@ class Disassembler:
                 _json.dump({"dropped": dropped or [], "kept": kept or []},
                            _f, indent=2)
             print(f"  Wrote {_path}")
+        # Detection can realign the stream (tail targets); export its xrefs.
+        self.xrefs = build_xrefs(self.engine, self.image)
         if self.verbose:
             summary = self.func_detector.summary()
             print(f"  Total functions: {num_funcs:,d}")
@@ -316,7 +296,8 @@ class Disassembler:
             json_path = self._find_analysis_json()
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
-                           self.extra_sections, self.seed_functions)
+                           self.extra_sections, self.seed_functions,
+                           self.skip_library_immediates)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")
